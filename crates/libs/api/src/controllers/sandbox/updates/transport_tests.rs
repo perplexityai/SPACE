@@ -447,7 +447,8 @@ async fn a_blackholed_worker_redial_is_untransmitted_and_replayed_once() -> Test
     let front_addr = front.addr;
     let client = crate::controllers::substrate::connect_worker(
         tonic::transport::Endpoint::from_shared(format!("http://{front_addr}"))?
-            .connect_timeout(Duration::from_millis(500)),
+            // The blackhole never answers, so any bound times the redial out.
+            .connect_timeout(Duration::from_millis(150)),
     )
     .await?;
     front.stop().await;

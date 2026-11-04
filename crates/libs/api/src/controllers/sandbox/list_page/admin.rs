@@ -23,9 +23,7 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 use super::super::org::{ScopedPageRow, scoped_page_sql};
-use super::{
-    ListPage, MAX_SANDBOX_LIST_PAGE_BYTES, PageWalkParams, SANDBOX_LIST_ROW_OVERHEAD_BYTES,
-};
+use super::{ListPage, PageWalkParams, SANDBOX_LIST_ROW_OVERHEAD_BYTES};
 use crate::controllers::sandbox::{SandboxController, SandboxPageCursor, sandbox_query};
 use crate::controllers::substrate::direct::reported_node::{reported_on_a_node, reported_on_node};
 use crate::controllers::{ControllerError, db_contention_error};
@@ -260,8 +258,8 @@ static ADMIN_LIST_SQL: LazyLock<String> = LazyLock::new(|| {
 /// Whether a page stops at the list byte budget.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PageBudget {
-    /// [`MAX_SANDBOX_LIST_PAGE_BYTES`], for a page a cursor continues: the
-    /// page walk.
+    /// The list byte budget, [`super::MAX_SANDBOX_LIST_PAGE_BYTES`], for a
+    /// page a cursor continues: the page walk.
     Bounded,
     /// No byte budget and no size walk: the legacy unpaged array, which has
     /// no cursor to continue from and answered up to its limit before paging
@@ -360,7 +358,7 @@ impl SandboxController {
                 .bind(cursor.map(|cursor| cursor.created_at))
                 .bind(cursor.map(|cursor| cursor.id))
                 .bind(i64::from(limit.saturating_add(1)))
-                .bind(MAX_SANDBOX_LIST_PAGE_BYTES)
+                .bind(self.list_page_max_bytes)
                 .bind(SANDBOX_LIST_ROW_OVERHEAD_BYTES)
                 .fetch_all(pool)
                 .await?;

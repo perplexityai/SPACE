@@ -430,7 +430,7 @@ async fn a_changed_request_is_refused_before_the_runtime_is_reached() -> TestDbR
         let request = write();
         tokio::spawn(async move { prepare(&service, request, &fingerprint(b"first")).await })
     };
-    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    crate::test_support::wait_until_blocked_by(&mut held).await?;
     assert!(
         !retry.is_finished(),
         "the bound request did not wait on runtime acquisition, so the lock proves nothing"

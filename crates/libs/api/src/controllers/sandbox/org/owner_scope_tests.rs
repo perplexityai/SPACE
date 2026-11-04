@@ -6,6 +6,7 @@ use pplx_space_db_test_fixtures::{
 };
 
 use super::*;
+use crate::controllers::sandbox::list_page::TEST_SANDBOX_LIST_PAGE_BYTES;
 
 use pplx_space_test_env::TestResult;
 
@@ -337,7 +338,7 @@ async fn walk_scoped_pages(
             .sum::<usize>();
         if page.rows.len() > 1 {
             assert!(
-                row_bytes <= MAX_SANDBOX_LIST_PAGE_BYTES as usize,
+                row_bytes <= usize::try_from(fixture.controller.list_page_max_bytes)?,
                 "{row_bytes}"
             );
         }
@@ -356,15 +357,17 @@ async fn walk_scoped_pages(
 
 #[tokio::test]
 async fn scoped_sandbox_page_bounds_the_bytes_it_returns() -> TestResult {
-    const MIB: usize = 1024 * 1024;
-    let fixture = scope_fixture().await?;
+    // An eighth of the budget, as 1 MiB is of the production one.
+    const UNIT: usize = TEST_SANDBOX_LIST_PAGE_BYTES as usize / 8;
+    let mut fixture = scope_fixture().await?;
+    fixture.controller.list_page_max_bytes = TEST_SANDBOX_LIST_PAGE_BYTES;
     let newest = time::OffsetDateTime::from_unix_timestamp(1_800_000_000)?;
-    // Newest first: one row over the whole budget, twelve 1 MiB rows, then
+    // Newest first: one row over the whole budget, twelve one-unit rows, then
     // three small ones, alternating between a legacy local row and the
     // federated subject's own row so the federated walk crosses both arms.
     // The federated rows carry their bytes in env, which the page holds too.
-    let sizes = std::iter::once(9 * MIB)
-        .chain(std::iter::repeat_n(MIB, 12))
+    let sizes = std::iter::once(9 * UNIT)
+        .chain(std::iter::repeat_n(UNIT, 12))
         .chain(std::iter::repeat_n(16, 3));
     let mut all = Vec::new();
     let mut local = Vec::new();
@@ -388,14 +391,14 @@ async fn scoped_sandbox_page_bounds_the_bytes_it_returns() -> TestResult {
         all.push(sandbox_id);
     }
 
-    // The oversized row comes back alone; 1 MiB rows fit seven to a page.
+    // The oversized row comes back alone; one-unit rows fit seven to a page.
     let federated = walk_scoped_pages(&fixture, &federated_scope(UPSTREAM_SUBJECT_ID)).await?;
     assert_eq!(
         federated.iter().map(Vec::len).collect::<Vec<_>>(),
         vec![1, 7, 8]
     );
     assert_eq!(federated.concat(), all);
-    // The local rows are the oversized one, six 1 MiB rows and one small.
+    // The local rows are the oversized one, six one-unit rows and one small.
     let local_pages = walk_scoped_pages(&fixture, &local_scope()).await?;
     assert_eq!(
         local_pages.iter().map(Vec::len).collect::<Vec<_>>(),

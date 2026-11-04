@@ -781,160 +781,160 @@ async fn operation_state_and_attempts(
 
 /// Admission claims the operation it records only when nothing else for its
 /// sandbox is queued or running; otherwise it is queued behind that work.
+#[rstest::rstest]
+#[case::nothing(SandboxAhead::Nothing, true)]
+#[case::finished(SandboxAhead::Finished, true)]
+#[case::another_sandbox_busy(SandboxAhead::AnotherSandboxBusy, true)]
+#[case::queued(SandboxAhead::Queued, false)]
+#[case::queued_in_backoff(SandboxAhead::QueuedInBackoff, false)]
+#[case::live_claim(SandboxAhead::LiveClaim, false)]
+#[case::stale_claim(SandboxAhead::StaleClaim, false)]
 #[tokio::test]
-async fn admission_claims_a_new_operation_only_on_an_otherwise_idle_sandbox() -> TestResult {
-    for (ahead, claimed) in [
-        (SandboxAhead::Nothing, true),
-        (SandboxAhead::Finished, true),
-        (SandboxAhead::AnotherSandboxBusy, true),
-        (SandboxAhead::Queued, false),
-        (SandboxAhead::QueuedInBackoff, false),
-        (SandboxAhead::LiveClaim, false),
-        (SandboxAhead::StaleClaim, false),
-    ] {
-        let Some(db) = try_pg_test_db().await? else {
-            return Ok(());
-        };
-        let org_id = OrgId::from_uuid(seed_org(&db.pool).await?);
-        let store = PublicOperationStore::new(db.pool.clone());
-        let target_id = PublicSandboxId::new().to_string();
-        let ahead_target = match ahead {
-            SandboxAhead::AnotherSandboxBusy => PublicSandboxId::new().to_string(),
-            _ => target_id.clone(),
-        };
-        if !matches!(ahead, SandboxAhead::Nothing) {
-            let earlier = create_test_operation_for_target(
-                &store,
-                org_id,
-                OperationKind::WakeSandbox,
-                &ahead_target,
-            )
-            .await?
-            .expect_created();
-            match ahead {
-                SandboxAhead::QueuedInBackoff => {
+async fn admission_claims_a_new_operation_only_on_an_otherwise_idle_sandbox(
+    #[case] ahead: SandboxAhead,
+    #[case] claimed: bool,
+) -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let org_id = OrgId::from_uuid(seed_org(&db.pool).await?);
+    let store = PublicOperationStore::new(db.pool.clone());
+    let target_id = PublicSandboxId::new().to_string();
+    let ahead_target = match ahead {
+        SandboxAhead::AnotherSandboxBusy => PublicSandboxId::new().to_string(),
+        _ => target_id.clone(),
+    };
+    if !matches!(ahead, SandboxAhead::Nothing) {
+        let earlier = create_test_operation_for_target(
+            &store,
+            org_id,
+            OperationKind::WakeSandbox,
+            &ahead_target,
+        )
+        .await?
+        .expect_created();
+        match ahead {
+            SandboxAhead::QueuedInBackoff => {
+                sqlx::query(sql!(
+                    "UPDATE public_operations
+                     SET next_attempt_at = NOW() + INTERVAL '5 minutes'
+                     WHERE operation_id = $1"
+                ))
+                .bind(earlier.as_uuid())
+                .execute(&db.pool)
+                .await?;
+            }
+            SandboxAhead::Finished | SandboxAhead::LiveClaim | SandboxAhead::StaleClaim => {
+                let claim = claim_wakes(&store).await?;
+                assert_eq!(claim.operations.len(), 1, "{ahead:?}");
+                if matches!(ahead, SandboxAhead::Finished) {
+                    assert!(
+                        store
+                            .complete_claimed_operation(CompleteClaimedPublicOperation {
+                                claim_token: claim.claim_token,
+                                operation_id: earlier,
+                                progress_message: "woken".to_string(),
+                                result_json: serde_json::json!({}),
+                            })
+                            .await?
+                    );
+                }
+                if matches!(ahead, SandboxAhead::StaleClaim) {
                     sqlx::query(sql!(
                         "UPDATE public_operations
-                         SET next_attempt_at = NOW() + INTERVAL '5 minutes'
+                         SET claimed_at = NOW() - INTERVAL '10 minutes'
                          WHERE operation_id = $1"
                     ))
                     .bind(earlier.as_uuid())
                     .execute(&db.pool)
                     .await?;
                 }
-                SandboxAhead::Finished | SandboxAhead::LiveClaim | SandboxAhead::StaleClaim => {
-                    let claim = claim_wakes(&store).await?;
-                    assert_eq!(claim.operations.len(), 1, "{ahead:?}");
-                    if matches!(ahead, SandboxAhead::Finished) {
-                        assert!(
-                            store
-                                .complete_claimed_operation(CompleteClaimedPublicOperation {
-                                    claim_token: claim.claim_token,
-                                    operation_id: earlier,
-                                    progress_message: "woken".to_string(),
-                                    result_json: serde_json::json!({}),
-                                })
-                                .await?
-                        );
-                    }
-                    if matches!(ahead, SandboxAhead::StaleClaim) {
-                        sqlx::query(sql!(
-                            "UPDATE public_operations
-                             SET claimed_at = NOW() - INTERVAL '10 minutes'
-                             WHERE operation_id = $1"
-                        ))
-                        .bind(earlier.as_uuid())
-                        .execute(&db.pool)
-                        .await?;
-                    }
-                }
-                SandboxAhead::Nothing | SandboxAhead::AnotherSandboxBusy | SandboxAhead::Queued => {
-                }
             }
+            SandboxAhead::Nothing | SandboxAhead::AnotherSandboxBusy | SandboxAhead::Queued => {}
         }
-
-        let key = IdempotencyKey::parse("stop-if-idle")?;
-        let fingerprint = RequestFingerprint::parse("f".repeat(64))?;
-        let idempotency = CreatePublicOperationIdempotency {
-            method: HttpOperationMethod::Post,
-            path_template: OperationPathTemplate::new("/v1/sandboxes/{sandbox_id}:stop"),
-            key: &key,
-            request_fingerprint: &fingerprint,
-        };
-        let input = || CreatePublicOperation {
-            org_id,
-            actor_user_id: None,
-            api_product: ApiProduct::Native,
-            kind: OperationKind::StopSandbox,
-            target_type: Some(OperationTargetType::Sandbox),
-            target_id: Some(&target_id),
-            payload_json: serde_json::json!({}),
-            idempotency: Some(idempotency.clone()),
-            traceparent: None,
-        };
-        let recorded = store
-            .begin_operation_admission(org_id, ApiProduct::Native, &idempotency)
-            .await?
-            .create_claimed_if_sole_active(input(), offer(None))
-            .await?;
-        let operation_id = match (claimed, recorded) {
-            (true, CreateInlinePublicOperationResult::Claimed(claim)) => {
-                let InlineClaimed {
-                    claim_token,
-                    operation,
-                    ..
-                } = claim.commit().await?;
-                assert!(claim_token.starts_with(ADMISSION_CLAIM_TOKEN_PREFIX));
-                assert_eq!(operation.kind, OperationKind::StopSandbox);
-                assert_eq!(
-                    operation_state_and_attempts(&db.pool, operation.id).await?,
-                    ("running".to_string(), 1),
-                    "{ahead:?}"
-                );
-                // Live, so the dispatcher leaves it to its claimant.
-                assert!(
-                    store
-                        .claim_operations(ClaimPublicOperations {
-                            limits: ClaimLimits::any(16),
-                            claim_stale_after: Duration::from_secs(60),
-                            claimable_kinds: &[OperationKind::StopSandbox],
-                        })
-                        .await?
-                        .operations
-                        .is_empty()
-                );
-                operation.id
-            }
-            (
-                false,
-                CreateInlinePublicOperationResult::Queued(operation_id, InlineQueueReason::Busy),
-            ) => {
-                assert_eq!(
-                    operation_state_and_attempts(&db.pool, operation_id).await?,
-                    ("queued".to_string(), 0),
-                    "{ahead:?}"
-                );
-                operation_id
-            }
-            (_, other) => panic!("{ahead:?}: unexpected {other:?}"),
-        };
-
-        // A replay neither records nor claims anything.
-        let replay = store
-            .begin_operation_admission(org_id, ApiProduct::Native, &idempotency)
-            .await?
-            .create_claimed_if_sole_active(input(), offer(None))
-            .await?;
-        assert!(
-            matches!(
-                replay,
-                CreateInlinePublicOperationResult::NotCreated(
-                    CreatePublicOperationResult::Existing(id)
-                ) if id == operation_id
-            ),
-            "{ahead:?}: {replay:?}"
-        );
     }
+
+    let key = IdempotencyKey::parse("stop-if-idle")?;
+    let fingerprint = RequestFingerprint::parse("f".repeat(64))?;
+    let idempotency = CreatePublicOperationIdempotency {
+        method: HttpOperationMethod::Post,
+        path_template: OperationPathTemplate::new("/v1/sandboxes/{sandbox_id}:stop"),
+        key: &key,
+        request_fingerprint: &fingerprint,
+    };
+    let input = || CreatePublicOperation {
+        org_id,
+        actor_user_id: None,
+        api_product: ApiProduct::Native,
+        kind: OperationKind::StopSandbox,
+        target_type: Some(OperationTargetType::Sandbox),
+        target_id: Some(&target_id),
+        payload_json: serde_json::json!({}),
+        idempotency: Some(idempotency.clone()),
+        traceparent: None,
+    };
+    let recorded = store
+        .begin_operation_admission(org_id, ApiProduct::Native, &idempotency)
+        .await?
+        .create_claimed_if_sole_active(input(), offer(None))
+        .await?;
+    let operation_id = match (claimed, recorded) {
+        (true, CreateInlinePublicOperationResult::Claimed(claim)) => {
+            let InlineClaimed {
+                claim_token,
+                operation,
+                ..
+            } = claim.commit().await?;
+            assert!(claim_token.starts_with(ADMISSION_CLAIM_TOKEN_PREFIX));
+            assert_eq!(operation.kind, OperationKind::StopSandbox);
+            assert_eq!(
+                operation_state_and_attempts(&db.pool, operation.id).await?,
+                ("running".to_string(), 1),
+                "{ahead:?}"
+            );
+            // Live, so the dispatcher leaves it to its claimant.
+            assert!(
+                store
+                    .claim_operations(ClaimPublicOperations {
+                        limits: ClaimLimits::any(16),
+                        claim_stale_after: Duration::from_secs(60),
+                        claimable_kinds: &[OperationKind::StopSandbox],
+                    })
+                    .await?
+                    .operations
+                    .is_empty()
+            );
+            operation.id
+        }
+        (
+            false,
+            CreateInlinePublicOperationResult::Queued(operation_id, InlineQueueReason::Busy),
+        ) => {
+            assert_eq!(
+                operation_state_and_attempts(&db.pool, operation_id).await?,
+                ("queued".to_string(), 0),
+                "{ahead:?}"
+            );
+            operation_id
+        }
+        (_, other) => panic!("{ahead:?}: unexpected {other:?}"),
+    };
+
+    // A replay neither records nor claims anything.
+    let replay = store
+        .begin_operation_admission(org_id, ApiProduct::Native, &idempotency)
+        .await?
+        .create_claimed_if_sole_active(input(), offer(None))
+        .await?;
+    assert!(
+        matches!(
+            replay,
+            CreateInlinePublicOperationResult::NotCreated(
+                CreatePublicOperationResult::Existing(id)
+            ) if id == operation_id
+        ),
+        "{ahead:?}: {replay:?}"
+    );
     Ok(())
 }
 

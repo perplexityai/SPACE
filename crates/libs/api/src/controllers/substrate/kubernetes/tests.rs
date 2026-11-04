@@ -2715,7 +2715,7 @@ mod kubernetes_tests {
                     // The deadline also covers the Postgres work before the
                     // first capability probe. A budget that expires first
                     // fails through the generic no-send path instead.
-                    ready_timeout: Duration::from_secs(2),
+                    ready_timeout: Duration::from_millis(800),
                 },
                 None,
                 SandboxLifecycle::Paused,
@@ -5327,7 +5327,7 @@ mod kubernetes_tests {
     }
 
     /// Under the dispatcher's retry deferral the same fence-blocked re-drive
-    /// retries in place for the 2 s grace, then returns its retryable error
+    /// retries in place for its grace, then returns its retryable error
     /// instead of pacing laps through a long readiness budget, so the caller
     /// can hand back its slot.
     #[tokio::test(flavor = "current_thread")]
@@ -5349,7 +5349,11 @@ mod kubernetes_tests {
         let sandbox = fetch_sandbox(&pool, sandbox_id)
             .await?
             .expect("inserted sandbox must be visible");
-        let (substrate, request_count) = substrate_with_failed_pod_creates(pool);
+        let (mut substrate, request_count) = substrate_with_failed_pod_creates(pool);
+        // The first two backoff laps (100 ms, then 200 ms) end inside the
+        // grace, and the third lap's 400 ms would end at 700 ms uncut.
+        let grace = Duration::from_millis(400);
+        substrate.budgets.retry_deferral_grace = grace;
 
         let deferral = crate::retry_deferral::RetryDeferral::new();
 
@@ -5373,14 +5377,13 @@ mod kubernetes_tests {
 
         // Assert: the caller kept retrying in place through the grace, then
         // handed the wait back and recorded that it did.
-        let grace = crate::controllers::substrate::kubernetes::execution::RETRY_DEFERRAL_GRACE;
         assert!(
             elapsed >= grace,
             "the grace keeps fast retries in place: {elapsed:?}"
         );
         // The last in-place sleep is cut to the grace instead of doubling
-        // past it to ~3.1 s.
-        assert!(elapsed < grace + Duration::from_secs(1), "{elapsed:?}");
+        // past it to ~700 ms.
+        assert!(elapsed < grace + Duration::from_millis(250), "{elapsed:?}");
         assert!(deferral.deferred());
         let error = match result {
             Ok(_) => panic!("a fence-blocked wake cannot win the claim"),
@@ -5405,7 +5408,7 @@ mod kubernetes_tests {
         let db = pplx_space_db_test_fixtures::pg_test_db_with_max_connections(8).await?;
         let pool = db.pool.clone();
         let sandbox_id = SandboxId::new();
-        seed_restoring_sandbox_with_active_lease(&pool, sandbox_id, Duration::from_millis(400))
+        seed_restoring_sandbox_with_active_lease(&pool, sandbox_id, Duration::from_millis(150))
             .await?;
         let sandbox = fetch_sandbox(&pool, sandbox_id)
             .await?
@@ -5432,7 +5435,7 @@ mod kubernetes_tests {
         let first_sandbox = Arc::clone(&sandbox);
         // The first caller becomes the coalesced-run owner; give it a budget
         // that comfortably outlives the deliberately-late pod-create release
-        // below (which waits on the second caller's ~1.3s expiry first) so
+        // below (which waits on the second caller's ~0.9s expiry first) so
         // the test can assert its owned completion even on slow CI hardware.
         // The second caller keeps the short budget whose expiry this test is
         // about.
@@ -5452,7 +5455,7 @@ mod kubernetes_tests {
             second_substrate
                 .wake_execution_with_metric_identity(
                     &second_sandbox,
-                    Duration::from_millis(800),
+                    Duration::from_millis(400),
                     SandboxApiMetricIdentity::ecw("connect"),
                     crate::controllers::substrate::RecoveryCharge::Exempt,
                 )
@@ -5473,10 +5476,10 @@ mod kubernetes_tests {
             (second.await?, first)
         };
 
-        // Assert. The joiner's wait is bounded by its own 800ms readiness
+        // Assert. The joiner's wait is bounded by its own 400ms readiness
         // budget plus the coalescer's publish grace — never a fresh budget.
         assert!(
-            race_started.elapsed() < Duration::from_secs(2),
+            race_started.elapsed() < Duration::from_millis(1_600),
             "the reclaim loser received a fresh readiness budget"
         );
         let error = match loser {
@@ -5687,17 +5690,20 @@ mod kubernetes_tests {
             .await?
             .expect("inserted sandbox must be visible");
         let sim_worker = start_sim_worker().await?;
+        // A short join backoff re-checks the unstarted restore often enough
+        // that the shorter deadline still covers the redrive and its waits.
         let substrate = substrate_with_store_client_and_proxy_port(
             pool.clone(),
             running_pod_kubernetes_client(Arc::new(Mutex::new(Vec::new())), "127.0.0.1"),
             sim_worker.port(),
-        );
+        )
+        .with_recovery_join_backoff(Duration::from_millis(20), Duration::from_millis(100));
 
         let binding = substrate
             .redrive_suspended_recovery_for_access(
                 &sandbox,
                 Some(1),
-                tokio::time::Instant::now() + Duration::from_secs(3),
+                tokio::time::Instant::now() + Duration::from_millis(1_200),
                 SandboxApiMetricIdentity::native("restoring_access"),
                 crate::controllers::substrate::RecoveryCharge::Exempt,
             )
@@ -6158,13 +6164,16 @@ mod kubernetes_tests {
              each holding a pool connection"
         );
 
-        // Release the row lock and let the herd settle; outcomes are errors
-        // here (the fixture fails Pod creates) — this test asserts admission
-        // concurrency, not wake success.
-        claim_block.rollback().await?;
-        for caller in herd {
-            let _ = caller.await?;
+        // The herd's outcomes are errors here (the fixture fails Pod
+        // creates) and this test asserts admission concurrency, not wake
+        // success, so stop the herd rather than wait out its budgets.
+        for caller in &herd {
+            caller.abort();
         }
+        for caller in herd {
+            let _ = caller.await;
+        }
+        claim_block.rollback().await?;
         Ok(())
     }
 
@@ -11324,16 +11333,6 @@ mod kubernetes_tests {
     }
 
     impl CreateEnd {
-        const ALL: [Self; 7] = [
-            Self::AutoLifecycleReloadFails,
-            Self::NetworkPolicyAnnotationTooLarge,
-            Self::ForkRestoreWithoutArtifactUri,
-            Self::CancelledDuringAutoLifecycleReload,
-            Self::CancelledDuringClaimRelease,
-            Self::CancelledDuringPodCreate,
-            Self::CancelledDuringReadinessWait,
-        ];
-
         const fn claim_after_end(self) -> ClaimAfterEnd {
             match self {
                 Self::AutoLifecycleReloadFails
@@ -11404,8 +11403,18 @@ mod kubernetes_tests {
     /// claim before it returns its error. Once a pod create is in flight the
     /// claim stays for reconciliation, and once the pod exists cancellation
     /// deletes it by UID and retires the claim.
+    #[rstest::rstest]
+    #[case::auto_lifecycle_reload_fails(CreateEnd::AutoLifecycleReloadFails)]
+    #[case::network_policy_annotation_too_large(CreateEnd::NetworkPolicyAnnotationTooLarge)]
+    #[case::fork_restore_without_artifact_uri(CreateEnd::ForkRestoreWithoutArtifactUri)]
+    #[case::cancelled_during_auto_lifecycle_reload(CreateEnd::CancelledDuringAutoLifecycleReload)]
+    #[case::cancelled_during_claim_release(CreateEnd::CancelledDuringClaimRelease)]
+    #[case::cancelled_during_pod_create(CreateEnd::CancelledDuringPodCreate)]
+    #[case::cancelled_during_readiness_wait(CreateEnd::CancelledDuringReadinessWait)]
     #[tokio::test(flavor = "current_thread")]
-    async fn create_ending_early_gives_back_exactly_what_it_claimed() -> Result<(), BoxError> {
+    async fn create_ending_early_gives_back_exactly_what_it_claimed(
+        #[case] end: CreateEnd,
+    ) -> Result<(), BoxError> {
         if !crate::test_support::enter_sim_worker_process() {
             return Ok(());
         }
@@ -11598,271 +11607,268 @@ mod kubernetes_tests {
             }
         };
 
-        for end in CreateEnd::ALL {
-            let sandbox_id = SandboxId::new();
-            insert_test_sandbox_row(&pool, sandbox_id, "creating").await?;
-            let pod_creates_before = pod_creates();
-            let pod_creates_sent_before = pod_creates_sent();
-            let pod_deletes_before = pod_deletes().len();
+        let sandbox_id = SandboxId::new();
+        insert_test_sandbox_row(&pool, sandbox_id, "creating").await?;
+        let pod_creates_before = pod_creates();
+        let pod_creates_sent_before = pod_creates_sent();
+        let pod_deletes_before = pod_deletes().len();
 
-            match end {
-                CreateEnd::AutoLifecycleReloadFails
-                | CreateEnd::NetworkPolicyAnnotationTooLarge
-                | CreateEnd::ForkRestoreWithoutArtifactUri => {
-                    let reload_fails = matches!(end, CreateEnd::AutoLifecycleReloadFails);
-                    // The column is unreadable only for this one create; the
-                    // retry below sees the database healthy again.
-                    if reload_fails {
-                        rename_auto_lifecycle_column(
-                            "auto_lifecycle_json",
-                            "auto_lifecycle_json_unreadable",
-                        )
-                        .await?;
-                    }
-                    let failed = tokio::time::timeout(
-                        Duration::from_secs(30),
-                        substrate.create_execution(request(sandbox_id, Some(end))),
-                    )
-                    .await
-                    .map_err(|_| format!("{end:?}: the create must fail, not wait"))?;
-                    // Checked before anything else awaits: a release spawned
-                    // into the background instead of awaited would still be
-                    // tracked here, whatever the database does next.
-                    assert!(
-                        substrate.task_tracker.is_empty(),
-                        "{end:?}: the claim must be released by the create itself, not in \
-                         the background"
-                    );
-                    if reload_fails {
-                        rename_auto_lifecycle_column(
-                            "auto_lifecycle_json_unreadable",
-                            "auto_lifecycle_json",
-                        )
-                        .await?;
-                    }
-                    if let Ok(outcome) = failed {
-                        panic!(
-                            "{end:?}: the create must fail, got {:?}",
-                            outcome.sandbox_id
-                        );
-                    }
-                    assert_eq!(
-                        executions(sandbox_id).await?,
-                        vec![(1, false)],
-                        "{end:?}: the claim must be released before the error is returned"
-                    );
-                }
-                CreateEnd::CancelledDuringAutoLifecycleReload => {
-                    // The reload only takes an ACCESS SHARE lock, which the
-                    // claim's own transaction would block on first. So hold
-                    // the claim at its sandbox row lock, queue an exclusive
-                    // table lock behind it, and let the claim commit: the
-                    // exclusive lock is granted, and the reload waits on it.
-                    let mut row_lock = pool.begin().await?;
-                    sqlx::query(sql!("SELECT id FROM sandboxes WHERE id = $1 FOR UPDATE"))
-                        .bind(sandbox_id)
-                        .execute(&mut *row_lock)
-                        .await?;
-                    let mut create =
-                        Box::pin(substrate.create_execution(request(sandbox_id, Some(end))));
-                    drive_create_until(
-                        &mut create,
-                        "the claim",
-                        lock_waiter("FROM sandboxes WHERE id = $1 FOR UPDATE"),
-                    )
-                    .await?;
-                    let (unlock_table, table_unlocked) = tokio::sync::oneshot::channel::<()>();
-                    let table_lock = tokio::spawn({
-                        let pool = pool.clone();
-                        async move {
-                            let mut table_lock = pool.begin().await?;
-                            sqlx::query(sql!("LOCK TABLE sandboxes IN ACCESS EXCLUSIVE MODE"))
-                                .execute(&mut *table_lock)
-                                .await?;
-                            table_unlocked.await?;
-                            table_lock.rollback().await?;
-                            Ok::<_, BoxError>(())
-                        }
-                    });
-                    drive_create_until(
-                        &mut create,
-                        "the queued table lock",
-                        lock_waiter("LOCK TABLE sandboxes"),
-                    )
-                    .await?;
-                    row_lock.commit().await?;
-                    drive_create_until(
-                        &mut create,
-                        "the auto-lifecycle reload",
-                        lock_waiter("SELECT auto_lifecycle_json FROM sandboxes"),
-                    )
-                    .await?;
-                    drop(create);
-                    assert_eq!(
-                        substrate.cancel_tracker.current_count(),
-                        0,
-                        "{end:?}: releasing a claim is not a pod cleanup"
-                    );
-                    unlock_table
-                        .send(())
-                        .map_err(|()| "the table lock holder exited early")?;
-                    table_lock.await??;
-                }
-                CreateEnd::CancelledDuringClaimRelease => {
-                    // The claim takes the sandbox row lock too, so hold a lock
-                    // only the release needs: its port-exposure invalidation
-                    // waits on this one, inside the release transaction.
+        match end {
+            CreateEnd::AutoLifecycleReloadFails
+            | CreateEnd::NetworkPolicyAnnotationTooLarge
+            | CreateEnd::ForkRestoreWithoutArtifactUri => {
+                let reload_fails = matches!(end, CreateEnd::AutoLifecycleReloadFails);
+                // The column is unreadable only for this one create; the
+                // retry below sees the database healthy again.
+                if reload_fails {
                     rename_auto_lifecycle_column(
                         "auto_lifecycle_json",
                         "auto_lifecycle_json_unreadable",
                     )
                     .await?;
-                    let mut exposure_lock = pool.begin().await?;
-                    sqlx::query(sql!("LOCK TABLE sandbox_port_exposures IN SHARE MODE"))
-                        .execute(&mut *exposure_lock)
-                        .await?;
-                    let mut create =
-                        Box::pin(substrate.create_execution(request(sandbox_id, Some(end))));
-                    drive_create_until(
-                        &mut create,
-                        "the claim release",
-                        lock_waiter("UPDATE sandbox_port_exposures"),
-                    )
-                    .await?;
-                    drop(create);
-                    assert_eq!(
-                        substrate.cancel_tracker.current_count(),
-                        0,
-                        "{end:?}: releasing a claim is not a pod cleanup"
-                    );
-                    exposure_lock.commit().await?;
-                    background_work_finished(&substrate).await?;
+                }
+                let failed = tokio::time::timeout(
+                    Duration::from_secs(30),
+                    substrate.create_execution(request(sandbox_id, Some(end))),
+                )
+                .await
+                .map_err(|_| format!("{end:?}: the create must fail, not wait"))?;
+                // Checked before anything else awaits: a release spawned
+                // into the background instead of awaited would still be
+                // tracked here, whatever the database does next.
+                assert!(
+                    substrate.task_tracker.is_empty(),
+                    "{end:?}: the claim must be released by the create itself, not in \
+                     the background"
+                );
+                if reload_fails {
                     rename_auto_lifecycle_column(
                         "auto_lifecycle_json_unreadable",
                         "auto_lifecycle_json",
                     )
                     .await?;
                 }
-                CreateEnd::CancelledDuringPodCreate => {
-                    let mut create =
-                        Box::pin(substrate.create_execution(request(sandbox_id, Some(end))));
-                    drive_create_until(&mut create, "its pod create", async {
-                        pod_create_started.acquire().await?.forget();
-                        Ok(())
-                    })
-                    .await?;
-                    drop(create);
-                }
-                CreateEnd::CancelledDuringReadinessWait => {
-                    let mut create = Box::pin(
-                        unreachable_substrate.create_execution(request(sandbox_id, Some(end))),
+                if let Ok(outcome) = failed {
+                    panic!(
+                        "{end:?}: the create must fail, got {:?}",
+                        outcome.sandbox_id
                     );
-                    drive_create_until(&mut create, "its readiness wait", async {
-                        loop {
-                            let pod_recorded: bool = sqlx::query_scalar(sql!(
-                                "SELECT EXISTS (
-                                     SELECT 1 FROM sandbox_k8s_executions
-                                      WHERE sandbox_id = $1 AND active
-                                        AND pod_uid IS NOT NULL
-                                 )"
-                            ))
-                            .bind(sandbox_id)
-                            .fetch_one(&pool)
-                            .await?;
-                            if pod_recorded {
-                                return Ok(());
-                            }
-                            tokio::task::yield_now().await;
-                        }
-                    })
-                    .await?;
-                    drop(create);
-                    assert_eq!(
-                        unreachable_substrate.cancel_tracker.current_count(),
-                        1,
-                        "{end:?}: the pod cleanup counts as a cancel"
-                    );
-                    background_work_finished(&unreachable_substrate).await?;
                 }
+                assert_eq!(
+                    executions(sandbox_id).await?,
+                    vec![(1, false)],
+                    "{end:?}: the claim must be released before the error is returned"
+                );
             }
-            background_work_finished(&substrate).await?;
-
-            let expected = end.claim_after_end();
-            assert_eq!(
-                executions(sandbox_id).await?,
-                vec![(1, expected == ClaimAfterEnd::Retained)],
-                "{end:?}: the claim must be {expected:?}"
-            );
-            let new_pod_deletes = pod_deletes().split_off(pod_deletes_before);
-            match expected {
-                ClaimAfterEnd::Released => {
-                    assert_eq!(
-                        pod_creates_sent(),
-                        pod_creates_sent_before,
-                        "{end:?}: no pod create may be sent"
-                    );
-                    assert_eq!(
-                        new_pod_deletes,
-                        Vec::new(),
-                        "{end:?}: no pod may be deleted"
-                    );
-                }
-                ClaimAfterEnd::Retained => {
-                    // The `[(1, true)]` row check above is what protects this
-                    // case: a guard that released during the POST fails it.
-                    // That no pod is created and no cancel is counted holds by
-                    // construction, since the barrier never grants this POST a
-                    // permit, so neither is checked. A POST the apiserver
-                    // keeps while its response is lost is not modelled.
-                    assert_eq!(
-                        new_pod_deletes,
-                        Vec::new(),
-                        "{end:?}: no pod may be deleted"
-                    );
-                }
-                ClaimAfterEnd::RetiredWithItsPod => {
-                    let pod_name: String = sqlx::query_scalar(sql!(
-                        "SELECT pod_name FROM sandbox_k8s_executions WHERE sandbox_id = $1"
-                    ))
+            CreateEnd::CancelledDuringAutoLifecycleReload => {
+                // The reload only takes an ACCESS SHARE lock, which the
+                // claim's own transaction would block on first. So hold
+                // the claim at its sandbox row lock, queue an exclusive
+                // table lock behind it, and let the claim commit: the
+                // exclusive lock is granted, and the reload waits on it.
+                let mut row_lock = pool.begin().await?;
+                sqlx::query(sql!("SELECT id FROM sandboxes WHERE id = $1 FOR UPDATE"))
                     .bind(sandbox_id)
-                    .fetch_one(&pool)
+                    .execute(&mut *row_lock)
                     .await?;
-                    let [(path, body)] = new_pod_deletes.as_slice() else {
-                        panic!("{end:?}: expected one pod delete, got {new_pod_deletes:?}");
-                    };
-                    assert_eq!(path, &format!("/api/v1/namespaces/space/pods/{pod_name}"));
-                    let body: serde_json::Value = serde_json::from_str(body)?;
-                    assert_eq!(
-                        body.pointer("/preconditions/uid"),
-                        Some(&serde_json::Value::String(format!("{pod_name}-uid"))),
-                        "{end:?}: the delete must be fenced on the created pod's UID"
-                    );
-                }
-            }
-            if expected != ClaimAfterEnd::Released {
-                continue;
-            }
-
-            pod_create_released.add_permits(1);
-            let retried = substrate
-                .create_execution(request(sandbox_id, None))
+                let mut create =
+                    Box::pin(substrate.create_execution(request(sandbox_id, Some(end))));
+                drive_create_until(
+                    &mut create,
+                    "the claim",
+                    lock_waiter("FROM sandboxes WHERE id = $1 FOR UPDATE"),
+                )
                 .await?;
-            // Consume the retry's own start signal, so the next case waits on
-            // its own pod create.
-            pod_create_started.acquire().await?.forget();
-
-            assert_eq!(retried.sandbox_id, sandbox_id);
-            assert_eq!(
-                pod_creates(),
-                pod_creates_before + 1,
-                "{end:?}: the retry must create its own pod"
-            );
-            assert_eq!(
-                executions(sandbox_id).await?,
-                vec![(1, false), (2, true)],
-                "{end:?}: the retry must claim a fresh execution"
-            );
+                let (unlock_table, table_unlocked) = tokio::sync::oneshot::channel::<()>();
+                let table_lock = tokio::spawn({
+                    let pool = pool.clone();
+                    async move {
+                        let mut table_lock = pool.begin().await?;
+                        sqlx::query(sql!("LOCK TABLE sandboxes IN ACCESS EXCLUSIVE MODE"))
+                            .execute(&mut *table_lock)
+                            .await?;
+                        table_unlocked.await?;
+                        table_lock.rollback().await?;
+                        Ok::<_, BoxError>(())
+                    }
+                });
+                drive_create_until(
+                    &mut create,
+                    "the queued table lock",
+                    lock_waiter("LOCK TABLE sandboxes"),
+                )
+                .await?;
+                row_lock.commit().await?;
+                drive_create_until(
+                    &mut create,
+                    "the auto-lifecycle reload",
+                    lock_waiter("SELECT auto_lifecycle_json FROM sandboxes"),
+                )
+                .await?;
+                drop(create);
+                assert_eq!(
+                    substrate.cancel_tracker.current_count(),
+                    0,
+                    "{end:?}: releasing a claim is not a pod cleanup"
+                );
+                unlock_table
+                    .send(())
+                    .map_err(|()| "the table lock holder exited early")?;
+                table_lock.await??;
+            }
+            CreateEnd::CancelledDuringClaimRelease => {
+                // The claim takes the sandbox row lock too, so hold a lock
+                // only the release needs: its port-exposure invalidation
+                // waits on this one, inside the release transaction.
+                rename_auto_lifecycle_column(
+                    "auto_lifecycle_json",
+                    "auto_lifecycle_json_unreadable",
+                )
+                .await?;
+                let mut exposure_lock = pool.begin().await?;
+                sqlx::query(sql!("LOCK TABLE sandbox_port_exposures IN SHARE MODE"))
+                    .execute(&mut *exposure_lock)
+                    .await?;
+                let mut create =
+                    Box::pin(substrate.create_execution(request(sandbox_id, Some(end))));
+                drive_create_until(
+                    &mut create,
+                    "the claim release",
+                    lock_waiter("UPDATE sandbox_port_exposures"),
+                )
+                .await?;
+                drop(create);
+                assert_eq!(
+                    substrate.cancel_tracker.current_count(),
+                    0,
+                    "{end:?}: releasing a claim is not a pod cleanup"
+                );
+                exposure_lock.commit().await?;
+                background_work_finished(&substrate).await?;
+                rename_auto_lifecycle_column(
+                    "auto_lifecycle_json_unreadable",
+                    "auto_lifecycle_json",
+                )
+                .await?;
+            }
+            CreateEnd::CancelledDuringPodCreate => {
+                let mut create =
+                    Box::pin(substrate.create_execution(request(sandbox_id, Some(end))));
+                drive_create_until(&mut create, "its pod create", async {
+                    pod_create_started.acquire().await?.forget();
+                    Ok(())
+                })
+                .await?;
+                drop(create);
+            }
+            CreateEnd::CancelledDuringReadinessWait => {
+                let mut create = Box::pin(
+                    unreachable_substrate.create_execution(request(sandbox_id, Some(end))),
+                );
+                drive_create_until(&mut create, "its readiness wait", async {
+                    loop {
+                        let pod_recorded: bool = sqlx::query_scalar(sql!(
+                            "SELECT EXISTS (
+                                 SELECT 1 FROM sandbox_k8s_executions
+                                  WHERE sandbox_id = $1 AND active
+                                    AND pod_uid IS NOT NULL
+                             )"
+                        ))
+                        .bind(sandbox_id)
+                        .fetch_one(&pool)
+                        .await?;
+                        if pod_recorded {
+                            return Ok(());
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await?;
+                drop(create);
+                assert_eq!(
+                    unreachable_substrate.cancel_tracker.current_count(),
+                    1,
+                    "{end:?}: the pod cleanup counts as a cancel"
+                );
+                background_work_finished(&unreachable_substrate).await?;
+            }
         }
+        background_work_finished(&substrate).await?;
+
+        let expected = end.claim_after_end();
+        assert_eq!(
+            executions(sandbox_id).await?,
+            vec![(1, expected == ClaimAfterEnd::Retained)],
+            "{end:?}: the claim must be {expected:?}"
+        );
+        let new_pod_deletes = pod_deletes().split_off(pod_deletes_before);
+        match expected {
+            ClaimAfterEnd::Released => {
+                assert_eq!(
+                    pod_creates_sent(),
+                    pod_creates_sent_before,
+                    "{end:?}: no pod create may be sent"
+                );
+                assert_eq!(
+                    new_pod_deletes,
+                    Vec::new(),
+                    "{end:?}: no pod may be deleted"
+                );
+            }
+            ClaimAfterEnd::Retained => {
+                // The `[(1, true)]` row check above is what protects this
+                // case: a guard that released during the POST fails it.
+                // That no pod is created and no cancel is counted holds by
+                // construction, since the barrier never grants this POST a
+                // permit, so neither is checked. A POST the apiserver
+                // keeps while its response is lost is not modelled.
+                assert_eq!(
+                    new_pod_deletes,
+                    Vec::new(),
+                    "{end:?}: no pod may be deleted"
+                );
+            }
+            ClaimAfterEnd::RetiredWithItsPod => {
+                let pod_name: String = sqlx::query_scalar(sql!(
+                    "SELECT pod_name FROM sandbox_k8s_executions WHERE sandbox_id = $1"
+                ))
+                .bind(sandbox_id)
+                .fetch_one(&pool)
+                .await?;
+                let [(path, body)] = new_pod_deletes.as_slice() else {
+                    panic!("{end:?}: expected one pod delete, got {new_pod_deletes:?}");
+                };
+                assert_eq!(path, &format!("/api/v1/namespaces/space/pods/{pod_name}"));
+                let body: serde_json::Value = serde_json::from_str(body)?;
+                assert_eq!(
+                    body.pointer("/preconditions/uid"),
+                    Some(&serde_json::Value::String(format!("{pod_name}-uid"))),
+                    "{end:?}: the delete must be fenced on the created pod's UID"
+                );
+            }
+        }
+        if expected != ClaimAfterEnd::Released {
+            return Ok(());
+        }
+
+        pod_create_released.add_permits(1);
+        let retried = substrate
+            .create_execution(request(sandbox_id, None))
+            .await?;
+        // The retry's own start signal: its pod create was sent.
+        pod_create_started.acquire().await?.forget();
+
+        assert_eq!(retried.sandbox_id, sandbox_id);
+        assert_eq!(
+            pod_creates(),
+            pod_creates_before + 1,
+            "{end:?}: the retry must create its own pod"
+        );
+        assert_eq!(
+            executions(sandbox_id).await?,
+            vec![(1, false), (2, true)],
+            "{end:?}: the retry must claim a fresh execution"
+        );
 
         Ok(())
     }

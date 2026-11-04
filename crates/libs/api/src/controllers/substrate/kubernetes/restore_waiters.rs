@@ -33,6 +33,9 @@ struct RestoreWaitersInner {
     poller_started: AtomicBool,
     poller_wakeup: Arc<Notify>,
     max_pending_sandboxes: usize,
+    /// The longest the poller sleeps between observations while a restore is
+    /// in flight: [`RESTORE_POLL_INTERVAL`] in production.
+    max_poll_interval: Duration,
     shutdown_token: CancellationToken,
     task_tracker: TaskTracker,
 }
@@ -63,11 +66,45 @@ impl RestoreWaiters {
         )
     }
 
+    /// [`Self::new`] whose poller re-observes an in-flight restore at least
+    /// every `max_poll_interval` instead of every [`RESTORE_POLL_INTERVAL`].
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(super) fn with_max_poll_interval(
+        store: K8sStore,
+        shutdown_token: CancellationToken,
+        task_tracker: TaskTracker,
+        max_poll_interval: Duration,
+    ) -> Self {
+        Self::with_limits(
+            store,
+            shutdown_token,
+            task_tracker,
+            MAX_PENDING_RESTORE_SANDBOXES,
+            max_poll_interval,
+        )
+    }
+
     fn with_capacity(
         store: K8sStore,
         shutdown_token: CancellationToken,
         task_tracker: TaskTracker,
         max_pending_sandboxes: usize,
+    ) -> Self {
+        Self::with_limits(
+            store,
+            shutdown_token,
+            task_tracker,
+            max_pending_sandboxes,
+            RESTORE_POLL_INTERVAL,
+        )
+    }
+
+    fn with_limits(
+        store: K8sStore,
+        shutdown_token: CancellationToken,
+        task_tracker: TaskTracker,
+        max_pending_sandboxes: usize,
+        max_poll_interval: Duration,
     ) -> Self {
         Self {
             inner: Arc::new(RestoreWaitersInner {
@@ -76,6 +113,7 @@ impl RestoreWaiters {
                 poller_started: AtomicBool::new(false),
                 poller_wakeup: Arc::new(Notify::new()),
                 max_pending_sandboxes,
+                max_poll_interval: max_poll_interval.max(MIN_RESTORE_POLL_INTERVAL),
                 shutdown_token,
                 task_tracker,
             }),
@@ -185,7 +223,7 @@ async fn poll_restores(
                         })
                         .min()
                         .map(|interval| {
-                            interval.clamp(MIN_RESTORE_POLL_INTERVAL, RESTORE_POLL_INTERVAL)
+                            interval.clamp(MIN_RESTORE_POLL_INTERVAL, current.max_poll_interval)
                         });
                     publish_poll_results(&current, &sandbox_ids, |sandbox_id| {
                         observations

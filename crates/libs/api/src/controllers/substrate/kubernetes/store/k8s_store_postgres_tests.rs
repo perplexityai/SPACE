@@ -1355,113 +1355,133 @@ async fn selected_route_pod_ip_refresh_is_fenced_by_complete_route(
     Ok(())
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn k8s_store_postgres_behaviors() -> TestResult {
-    let fixture = postgres_store().await?;
+/// Each behavior runs against a store of its own, so none can depend on
+/// rows another left behind.
+mod k8s_store_postgres_behaviors {
+    use super::*;
 
-    ensure_active_execution_row_is_idempotent(&fixture).await?;
-    pod_materialization_claim_publishes_fresh_lease(&fixture).await?;
-    started_recovery_claim_is_bounded_and_preserves_its_marker(&fixture).await?;
-    failed_started_recovery_converges_unplaced_sandbox_with_current_snapshot(&fixture).await?;
-    failed_started_recovery_converges_after_authoritative_pod_absence(&fixture).await?;
-    failed_started_recovery_after_pod_absence_refuses_stale_snapshot(&fixture).await?;
-    started_recovery_claim_on_lost_sandbox_mints_no_execution(&fixture).await?;
-    failed_started_recovery_pod_absence_is_fenced_against_late_materialization(&fixture).await?;
-    failed_started_recovery_without_current_snapshot_stays_started(&fixture).await?;
-    failed_started_recovery_with_orphaned_snapshot_stays_started(&fixture).await?;
-    stale_failed_started_recovery_does_not_converge_newer_execution(&fixture).await?;
-    failed_started_recovery_without_attempt_does_not_steal_owned_generation(&fixture).await?;
-    failed_started_recovery_follows_owned_successor_generation(&fixture).await?;
-    failed_started_recovery_with_materialized_pod_stays_started(&fixture).await?;
-    failed_started_recovery_with_node_placement_stays_started(&fixture).await?;
-    failed_started_recovery_with_routable_pod_stays_started(&fixture).await?;
-    started_recovery_follows_superseding_execution(&fixture).await?;
-    stale_creating_started_recovery_claim_is_reclaimed(&fixture).await?;
-    finish_active_execution_if_generation_guards_against_chained_bumps(&fixture).await?;
-    abandon_created_unmaterialized_create_claim_preserves_observed_or_materialized_claim(&fixture)
-        .await?;
-    abandon_unmaterialized_create_claim_retires_foreign_creating_claim(&fixture).await?;
-    abandon_unmaterialized_create_claim_is_fenced_by_restore_lease_token(&fixture).await?;
-    reset_active_execution_to_creating_reopens_a_scheduled_pinned_claim(&fixture).await?;
-    transient_create_dodge_handoff_yields_fresh_claim(&fixture).await?;
-    concurrent_handler_does_not_claim_g7_while_g6_create_is_in_flight(&fixture).await?;
-    activation_attempt_assignment_is_monotonic_after_lease_expiry(&fixture).await?;
-    route_less_activation_retains_completion_fence(&fixture).await?;
-    completed_activation_cannot_release_a_later_clock_skewed_allocation(&fixture).await?;
-    activation_attempt_assignment_adopts_route_less_legacy_resident_after_ack(&fixture).await?;
-    suspend_superseded_activation_abandons_only_the_canonical_attempt(&fixture).await?;
-    stale_generation_cannot_complete_or_abandon_reused_attempt(&fixture).await?;
-    selected_route_pod_ip_refresh_is_fenced_by_complete_route(&fixture).await?;
-    replacement_handler_claims_g7_after_lagging_g6_is_replaced(&fixture).await?;
-    stale_generation_pod_metadata_does_not_update_new_active_execution(&fixture).await?;
-    blank_pod_uid_decodes_as_absent_for_active_execution(&fixture).await?;
-    persist_pod_metadata_normalizes_blank_pod_uid_to_null(&fixture).await?;
-    persist_pod_metadata_reports_noop_when_retirement_commits_mid_write(&fixture).await?;
-    persist_pod_metadata_reports_recovering_state_unchanged(&fixture).await?;
-    forget_pod_tracking_if_generation_does_not_forget_newer_active_execution(&fixture).await?;
-    forget_pod_tracking_if_generation_does_not_forget_successor_attempt(&fixture).await?;
-    forget_pod_tracking_defers_to_suspend_finalization(&fixture).await?;
-    explicit_teardown_forget_retires_execution_while_suspending(&fixture).await?;
-    forget_pod_tracking_recovers_markerless_restoring_with_ready_snapshot(&fixture).await?;
-    forget_pod_tracking_keeps_restoring_when_recovery_is_not_safe(&fixture).await?;
-    forget_pod_tracking_recovers_started_suspended_by_node_after_current_backup(&fixture).await?;
-    forget_pod_tracking_keeps_started_without_current_suspend_backup(&fixture).await?;
-    unchanged_pod_metadata_does_not_touch_execution_row(&fixture).await?;
-    unchanged_pod_node_placement_does_not_touch_current_rows(&fixture).await?;
-    finishing_active_execution_preserves_active_node_for_replacement(&fixture).await?;
-    finishing_active_execution_rolls_back_port_observation_failure(&fixture).await?;
-    finish_suspended_execution_rejects_uncommitted_running_execution(&fixture).await?;
-    suspend_commit_rejects_artifact_claimed_for_prune(&fixture).await?;
-    finish_suspended_execution_rejects_mismatched_artifact(&fixture).await?;
-    suspend_commit_finishes_after_exact_execution_is_forgotten(&fixture).await?;
-    finish_suspended_execution_accepts_matching_projection_race(&fixture).await?;
-    finish_suspended_execution_clears_active_node_but_preserves_target_node(&fixture).await?;
-    finish_suspended_execution_deletes_bound_claimed_pool_slot(&fixture).await?;
-    committed_suspend_artifact_belongs_to_the_active_execution(&fixture).await?;
-    durable_suspend_snapshot_artifact_requires_this_suspends_snapshot(&fixture).await?;
-    finish_suspended_execution_keeps_fresh_snapshot_portable(&fixture).await?;
-    creating_snapshot_does_not_select_stale_remote_uri_until_ready(&fixture).await?;
-    suspend_restore_selector_ignores_orphaned_storage_locations(&fixture).await?;
-    stopped_disk_selector_requires_the_pinned_ready_disk_artifact(&fixture).await?;
-    stopped_disk_selector_ignores_a_full_artifact_and_a_foreign_disk_artifact(&fixture).await?;
-    stopped_disk_selector_agrees_with_the_retention_never_prune_guard(&fixture).await?;
-    restoring_retry_uses_pre_restore_snapshot_when_late_branch_publishes_artifact(&fixture).await?;
-    restoring_retry_refuses_prior_placement_snapshot_after_late_branch_artifact(&fixture).await?;
-    restoring_retry_refuses_markerless_snapshot_after_late_branch_artifact(&fixture).await?;
-    restoring_sandbox_selects_newest_ready_snapshot_after_placement_bump(&fixture).await?;
-    forget_pod_tracking_keeps_restoring_with_late_branch_artifact(&fixture).await?;
-    forget_pod_tracking_preserves_execution_history(&fixture).await?;
-    forget_pod_tracking_deletes_bound_claimed_pool_slot(&fixture).await?;
-    forget_pod_tracking_recovers_started_with_current_suspend_backup(&fixture).await?;
-    forget_pod_tracking_clears_stale_marker_for_newest_current_suspend_backup(&fixture).await?;
-    forget_pod_tracking_keeps_started_when_suspend_backup_is_unsafe(&fixture).await?;
-    forget_pod_tracking_preserve_keeps_markerless_snapshot_selectable(&fixture).await?;
-    begin_restore_lifecycle_preserves_retry_and_marker_claim_rules(&fixture).await?;
-    evacuation_claim_takes_only_a_released_stopped_evacuation(&fixture).await?;
-    a_fresh_stopped_claim_is_not_rolled_back_on_a_clean_failure(&fixture).await?;
-    user_restore_lease_blocks_concurrent_redrive_until_expiry(&fixture).await?;
-    expired_restore_lease_with_live_execution_stays_in_flight(&fixture).await?;
-    clean_redrive_failure_releases_restore_lease_for_immediate_retry(&fixture).await?;
-    stale_restore_rollback_is_guarded_by_lease_token(&fixture).await?;
-    restore_rollback_requires_fresh_claim_and_clean_failure(&fixture).await?;
-    failed_restore_revert_retires_only_its_own_proven_execution(&fixture).await?;
-    without_retirement_a_failed_restore_revert_moves_only_the_lifecycle(&fixture).await?;
-    owned_restore_completion_requires_its_lease_and_a_routable_execution(&fixture).await?;
-    started_recovery_followers_succeed_only_on_a_started_sandbox(&fixture).await?;
-    prepare_wake_preserves_restore_source_boundary(&fixture).await?;
-    prepare_wake_sandbox_restores_suspended_lifecycle(&fixture).await?;
-    restored_generation_accepts_late_pod_metadata(&fixture).await?;
-    persist_k8s_node_inventory_stores_canonical_role(&fixture).await?;
-    upsert_clears_drain_state_when_k8s_node_uid_changes(&fixture).await?;
-    upsert_preserves_drain_state_when_k8s_node_uid_unchanged(&fixture).await?;
-    persist_k8s_node_inventory_repairs_missing_and_stale_address(&fixture).await?;
-    azrebalance_variant_uid_change_does_not_leak_stale_drain_state_or_drain_started_at(&fixture)
-        .await?;
-    persist_k8s_node_inventory_refuses_when_tombstoned(&fixture).await?;
-    clear_command_ready_pending_is_a_cas_against_the_reaper(&fixture).await?;
-    wake_signal_classifies_post_wake_flip_by_recency_not_lease(&fixture).await?;
-    post_wake_update_does_not_resurrect_quarantined_sandbox(&fixture).await?;
-    Ok(())
+    macro_rules! behaviors {
+        ($($behavior:ident),+ $(,)?) => {
+            $(
+                #[tokio::test(flavor = "current_thread")]
+                async fn $behavior() -> TestResult {
+                    super::$behavior(&postgres_store().await?).await
+                }
+            )+
+        };
+    }
+
+    behaviors! {
+        ensure_active_execution_row_is_idempotent,
+        pod_materialization_claim_publishes_fresh_lease,
+        started_recovery_claim_is_bounded_and_preserves_its_marker,
+        failed_started_recovery_converges_unplaced_sandbox_with_current_snapshot,
+        failed_started_recovery_converges_after_authoritative_pod_absence,
+        failed_started_recovery_after_pod_absence_refuses_stale_snapshot,
+        started_recovery_claim_on_lost_sandbox_mints_no_execution,
+        failed_started_recovery_pod_absence_is_fenced_against_late_materialization,
+        failed_started_recovery_without_current_snapshot_stays_started,
+        failed_started_recovery_with_orphaned_snapshot_stays_started,
+        stale_failed_started_recovery_does_not_converge_newer_execution,
+        failed_started_recovery_without_attempt_does_not_steal_owned_generation,
+        failed_started_recovery_follows_owned_successor_generation,
+        failed_started_recovery_with_materialized_pod_stays_started,
+        failed_started_recovery_with_node_placement_stays_started,
+        failed_started_recovery_with_routable_pod_stays_started,
+        started_recovery_follows_superseding_execution,
+        stale_creating_started_recovery_claim_is_reclaimed,
+        finish_active_execution_if_generation_guards_against_chained_bumps,
+        abandon_created_unmaterialized_create_claim_preserves_observed_or_materialized_claim,
+        abandon_unmaterialized_create_claim_retires_foreign_creating_claim,
+        abandon_unmaterialized_create_claim_is_fenced_by_restore_lease_token,
+        reset_active_execution_to_creating_reopens_a_scheduled_pinned_claim,
+        transient_create_dodge_handoff_yields_fresh_claim,
+        concurrent_handler_does_not_claim_g7_while_g6_create_is_in_flight,
+        activation_attempt_assignment_is_monotonic_after_lease_expiry,
+        route_less_activation_retains_completion_fence,
+        completed_activation_cannot_release_a_later_clock_skewed_allocation,
+        activation_attempt_assignment_adopts_route_less_legacy_resident_after_ack,
+        suspend_superseded_activation_abandons_only_the_canonical_attempt,
+        stale_generation_cannot_complete_or_abandon_reused_attempt,
+        selected_route_pod_ip_refresh_is_fenced_by_complete_route,
+        replacement_handler_claims_g7_after_lagging_g6_is_replaced,
+        stale_generation_pod_metadata_does_not_update_new_active_execution,
+        blank_pod_uid_decodes_as_absent_for_active_execution,
+        persist_pod_metadata_normalizes_blank_pod_uid_to_null,
+        persist_pod_metadata_reports_recovering_state_unchanged,
+        forget_pod_tracking_if_generation_does_not_forget_newer_active_execution,
+        forget_pod_tracking_if_generation_does_not_forget_successor_attempt,
+        forget_pod_tracking_defers_to_suspend_finalization,
+        explicit_teardown_forget_retires_execution_while_suspending,
+        forget_pod_tracking_recovers_markerless_restoring_with_ready_snapshot,
+        forget_pod_tracking_keeps_restoring_when_recovery_is_not_safe,
+        forget_pod_tracking_recovers_started_suspended_by_node_after_current_backup,
+        forget_pod_tracking_keeps_started_without_current_suspend_backup,
+        unchanged_pod_metadata_does_not_touch_execution_row,
+        unchanged_pod_node_placement_does_not_touch_current_rows,
+        finishing_active_execution_preserves_active_node_for_replacement,
+        finishing_active_execution_rolls_back_port_observation_failure,
+        finish_suspended_execution_rejects_uncommitted_running_execution,
+        suspend_commit_rejects_artifact_claimed_for_prune,
+        finish_suspended_execution_rejects_mismatched_artifact,
+        suspend_commit_finishes_after_exact_execution_is_forgotten,
+        finish_suspended_execution_accepts_matching_projection_race,
+        finish_suspended_execution_clears_active_node_but_preserves_target_node,
+        finish_suspended_execution_deletes_bound_claimed_pool_slot,
+        committed_suspend_artifact_belongs_to_the_active_execution,
+        durable_suspend_snapshot_artifact_requires_this_suspends_snapshot,
+        finish_suspended_execution_keeps_fresh_snapshot_portable,
+        creating_snapshot_does_not_select_stale_remote_uri_until_ready,
+        suspend_restore_selector_ignores_orphaned_storage_locations,
+        stopped_disk_selector_requires_the_pinned_ready_disk_artifact,
+        stopped_disk_selector_ignores_a_full_artifact_and_a_foreign_disk_artifact,
+        stopped_disk_selector_agrees_with_the_retention_never_prune_guard,
+        restoring_retry_uses_pre_restore_snapshot_when_late_branch_publishes_artifact,
+        restoring_retry_refuses_prior_placement_snapshot_after_late_branch_artifact,
+        restoring_retry_refuses_markerless_snapshot_after_late_branch_artifact,
+        restoring_sandbox_selects_newest_ready_snapshot_after_placement_bump,
+        forget_pod_tracking_keeps_restoring_with_late_branch_artifact,
+        forget_pod_tracking_preserves_execution_history,
+        forget_pod_tracking_deletes_bound_claimed_pool_slot,
+        forget_pod_tracking_recovers_started_with_current_suspend_backup,
+        forget_pod_tracking_clears_stale_marker_for_newest_current_suspend_backup,
+        forget_pod_tracking_keeps_started_when_suspend_backup_is_unsafe,
+        forget_pod_tracking_preserve_keeps_markerless_snapshot_selectable,
+        begin_restore_lifecycle_preserves_retry_and_marker_claim_rules,
+        evacuation_claim_takes_only_a_released_stopped_evacuation,
+        a_fresh_stopped_claim_is_not_rolled_back_on_a_clean_failure,
+        user_restore_lease_blocks_concurrent_redrive_until_expiry,
+        expired_restore_lease_with_live_execution_stays_in_flight,
+        clean_redrive_failure_releases_restore_lease_for_immediate_retry,
+        stale_restore_rollback_is_guarded_by_lease_token,
+        restore_rollback_requires_fresh_claim_and_clean_failure,
+        failed_restore_revert_retires_only_its_own_proven_execution,
+        without_retirement_a_failed_restore_revert_moves_only_the_lifecycle,
+        owned_restore_completion_requires_its_lease_and_a_routable_execution,
+        started_recovery_followers_succeed_only_on_a_started_sandbox,
+        prepare_wake_preserves_restore_source_boundary,
+        prepare_wake_sandbox_restores_suspended_lifecycle,
+        restored_generation_accepts_late_pod_metadata,
+        persist_k8s_node_inventory_stores_canonical_role,
+        upsert_clears_drain_state_when_k8s_node_uid_changes,
+        upsert_preserves_drain_state_when_k8s_node_uid_unchanged,
+        persist_k8s_node_inventory_repairs_missing_and_stale_address,
+        azrebalance_variant_uid_change_does_not_leak_stale_drain_state_or_drain_started_at,
+        persist_k8s_node_inventory_refuses_when_tombstoned,
+        clear_command_ready_pending_is_a_cas_against_the_reaper,
+        wake_signal_classifies_post_wake_flip_by_recency_not_lease,
+        post_wake_update_does_not_resurrect_quarantined_sandbox,
+    }
+
+    /// A third connection beside the held retirement and the blocked
+    /// persist, for the probe that sees the persist wait on the row lock.
+    #[tokio::test(flavor = "current_thread")]
+    async fn persist_pod_metadata_reports_noop_when_retirement_commits_mid_write() -> TestResult {
+        super::persist_pod_metadata_reports_noop_when_retirement_commits_mid_write(
+            &postgres_store_with_max_connections(3).await?,
+        )
+        .await
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -4841,9 +4861,14 @@ async fn persist_pod_metadata_reports_noop_when_retirement_commits_mid_write(
             .persist_pod_metadata(sandbox_id, generation, Some("pod-uid"), Some("10.90.0.12"))
             .await
     });
-    // Give the persist time to reach (and block on) the locked row, then
-    // commit the retirement out from under it.
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    // Once the persist is blocked on the locked row, commit the retirement
+    // out from under it.
+    wait_for_blocked_query(
+        &fixture.pool,
+        "%FROM sandbox_k8s_executions%FOR UPDATE%",
+        None,
+    )
+    .await?;
     retiring_tx.commit().await?;
 
     let persisted = persist.await??;

@@ -23,6 +23,7 @@ use pplx_space_test_env::TestResult;
 
 use super::*;
 use crate::controllers::sandbox::wake_completion::wake_completion_redrive;
+use crate::public_sandbox_operations::ImplicitWakeActivity;
 use crate::test_support::direct_substrate;
 
 #[cfg(feature = "kubernetes")]
@@ -472,8 +473,11 @@ async fn unreachable_runtime_fails_actions_without_writing_lifecycle() -> TestRe
 /// `suspended` for the CAS to advance, so it reaches `started` only because
 /// the handler takes its fence from Direct's capabilities, which do not fence
 /// `suspended`.
+#[rstest::rstest]
 #[tokio::test(flavor = "current_thread")]
-async fn wake_completion_outcome_maps_to_the_wake_response() -> TestResult {
+async fn wake_completion_outcome_maps_to_the_wake_response(
+    #[values("paused", "suspended")] prior: &str,
+) -> TestResult {
     if !crate::test_support::enter_sim_worker_process() {
         return Ok(());
     }
@@ -482,18 +486,15 @@ async fn wake_completion_outcome_maps_to_the_wake_response() -> TestResult {
     let controller = direct_controller(pool);
     let (worker, node_id) = start_sim_worker(pool).await?;
 
-    for (prior, moved_to) in ["paused", "suspended"].into_iter().flat_map(|prior| {
-        [
-            None,
-            Some("suspending"),
-            Some("stopping"),
-            Some("stopped"),
-            Some("deleting"),
-            Some("quarantined"),
-            Some("failed"),
-        ]
-        .map(|moved_to| (prior, moved_to))
-    }) {
+    for moved_to in [
+        None,
+        Some("suspending"),
+        Some("stopping"),
+        Some("stopped"),
+        Some("deleting"),
+        Some("quarantined"),
+        Some("failed"),
+    ] {
         let sandbox_id = SandboxId::new();
         insert_sandbox(pool, sandbox_id, prior, "space").await?;
         place_on_node(pool, sandbox_id, node_id).await?;
@@ -576,8 +577,20 @@ async fn wake_completion_outcome_maps_to_the_wake_response() -> TestResult {
 /// kept, together with the placement, while the action itself still reports
 /// success. Only start also writes the placement (`on_node`), so the row is
 /// seeded `unplaced` with its active node still assigned.
+#[rstest::rstest]
+#[case::start(SandboxAction::Start, "stopped", "stopped", "started")]
+#[case::resume(SandboxAction::Resume, "paused", "paused", "started")]
+#[case::pause(SandboxAction::Pause, "started", "running", "paused")]
+#[case::stop(SandboxAction::Stop, "started", "running", "stopped")]
+#[case::kill(SandboxAction::Kill, "started", "running", "stopped")]
+#[case::suspend(SandboxAction::Suspend, "started", "running", "suspended")]
 #[tokio::test(flavor = "current_thread")]
-async fn completed_actions_keep_a_terminal_lifecycle_that_landed_mid_flight() -> TestResult {
+async fn completed_actions_keep_a_terminal_lifecycle_that_landed_mid_flight(
+    #[case] action: SandboxAction,
+    #[case] prior: &str,
+    #[case] resident: &str,
+    #[case] completed: &str,
+) -> TestResult {
     if !crate::test_support::enter_sim_worker_process() {
         return Ok(());
     }
@@ -586,60 +599,50 @@ async fn completed_actions_keep_a_terminal_lifecycle_that_landed_mid_flight() ->
     let controller = direct_controller(pool);
     let (worker, node_id) = start_sim_worker(pool).await?;
 
-    for (action, prior, resident, completed) in [
-        (SandboxAction::Start, "stopped", "stopped", "started"),
-        (SandboxAction::Resume, "paused", "paused", "started"),
-        (SandboxAction::Pause, "started", "running", "paused"),
-        (SandboxAction::Stop, "started", "running", "stopped"),
-        (SandboxAction::Kill, "started", "running", "stopped"),
-        (SandboxAction::Suspend, "started", "running", "suspended"),
-    ] {
-        let completed_placement = if action == SandboxAction::Start {
-            "on_node"
-        } else {
-            "unplaced"
-        };
-        // Only the lifecycles both guard families treat as terminal. The
-        // cross-intent lifecycles `deleting`, `stopping`, `suspending` and
-        // `suspended` are deliberately excluded: this post-result write
-        // currently replaces them with the action's own lifecycle, which is
-        // an open bug and is not encoded here.
-        let terminal = ["failed", "quarantined"]
-            .into_iter()
-            .chain(StoredSandboxLifecycle::tombstones_as_str())
-            .map(Some);
-        for landed in [None].into_iter().chain(terminal) {
-            let sandbox_id = SandboxId::new();
-            insert_sandbox(pool, sandbox_id, prior, "space").await?;
-            place_on_node(pool, sandbox_id, node_id).await?;
-            set_placement(pool, sandbox_id, "unplaced").await?;
-            insert_resident(worker.state(), sandbox_id, resident).await?;
-            let sandbox = tracked(pool, sandbox_id).await?;
-            if let Some(lifecycle) = landed {
-                set_lifecycle(pool, sandbox_id, lifecycle).await?;
-            }
-
-            let body =
-                run_action(&controller, pool, sandbox_id, Some(&sandbox), action, None).await?;
-
-            assert_eq!(
-                body,
-                serde_json::json!({
-                    "ok": true,
-                    "action": action.as_str(),
-                    "sandbox_id": sandbox_id.to_string(),
-                }),
-            );
-            let expected = match landed {
-                None => Row::new(completed, completed_placement),
-                Some(lifecycle) => Row::new(lifecycle, "unplaced"),
-            };
-            assert_eq!(
-                row(pool, sandbox_id).await?,
-                Some(expected),
-                "{action:?} with {landed:?}"
-            );
+    let completed_placement = if action == SandboxAction::Start {
+        "on_node"
+    } else {
+        "unplaced"
+    };
+    // Only the lifecycles both guard families treat as terminal. The
+    // cross-intent lifecycles `deleting`, `stopping`, `suspending` and
+    // `suspended` are deliberately excluded: this post-result write
+    // currently replaces them with the action's own lifecycle, which is
+    // an open bug and is not encoded here.
+    let terminal = ["failed", "quarantined"]
+        .into_iter()
+        .chain(StoredSandboxLifecycle::tombstones_as_str())
+        .map(Some);
+    for landed in [None].into_iter().chain(terminal) {
+        let sandbox_id = SandboxId::new();
+        insert_sandbox(pool, sandbox_id, prior, "space").await?;
+        place_on_node(pool, sandbox_id, node_id).await?;
+        set_placement(pool, sandbox_id, "unplaced").await?;
+        insert_resident(worker.state(), sandbox_id, resident).await?;
+        let sandbox = tracked(pool, sandbox_id).await?;
+        if let Some(lifecycle) = landed {
+            set_lifecycle(pool, sandbox_id, lifecycle).await?;
         }
+
+        let body = run_action(&controller, pool, sandbox_id, Some(&sandbox), action, None).await?;
+
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "ok": true,
+                "action": action.as_str(),
+                "sandbox_id": sandbox_id.to_string(),
+            }),
+        );
+        let expected = match landed {
+            None => Row::new(completed, completed_placement),
+            Some(lifecycle) => Row::new(lifecycle, "unplaced"),
+        };
+        assert_eq!(
+            row(pool, sandbox_id).await?,
+            Some(expected),
+            "{action:?} with {landed:?}"
+        );
     }
     Ok(())
 }
@@ -1136,6 +1139,14 @@ async fn untracked_runtime_actions_without_placement_are_unavailable() -> TestRe
     Ok(())
 }
 
+/// The caller of [`a_system_wake_operation_runs_only_while_the_policy_allows_its_activity`]'s
+/// `:wake` cases.
+fn system_wake_caller() -> UserId {
+    "00000000-0000-0000-0000-000000000010"
+        .parse()
+        .expect("a valid user id")
+}
+
 /// The wake a session queues (a native wake with no actor) runs through the
 /// lifecycle executor like a `:wake`, but only while the sandbox's wake
 /// policy, read when it executes, still lets the session's activity wake it:
@@ -1145,11 +1156,47 @@ async fn untracked_runtime_actions_without_placement_are_unavailable() -> TestRe
 /// as an older API or one with the record switched off queues every wake, is
 /// judged as a command, as an older executor judges it. A caller's `:wake`
 /// is not policy-gated.
+// (the caller is the actor, wake.on if not the access policy placing it
+// sets, recorded activity, wakes)
+#[rstest::rstest]
+#[case::sessions_wake_under_the_default_policy(false, None, None, true)]
+#[case::an_empty_policy_refuses_a_session(false, Some(&[][..]), None, false)]
+#[case::a_caller_wake_is_not_policy_gated(true, Some(&[][..]), None, true)]
+#[case::a_caller_wake_recording_access_is_not_policy_gated(
+    true,
+    Some(&["command"][..]),
+    Some(ImplicitWakeActivity::Access),
+    true
+)]
+#[case::access_wakes_under_the_default_policy(
+    false,
+    None,
+    Some(ImplicitWakeActivity::Access),
+    true
+)]
+#[case::command_wakes_under_a_command_policy(
+    false,
+    Some(&["command"][..]),
+    Some(ImplicitWakeActivity::Command),
+    true
+)]
+#[case::access_is_refused_by_a_command_policy(
+    false,
+    Some(&["command"][..]),
+    Some(ImplicitWakeActivity::Access),
+    false
+)]
+// Recording none: queued by an older API, or with the record off.
+#[case::no_recorded_activity_is_judged_as_a_command(false, Some(&["command"][..]), None, true)]
 #[tokio::test(flavor = "current_thread")]
-async fn a_system_wake_operation_runs_only_while_the_policy_allows_its_activity() -> TestResult {
+async fn a_system_wake_operation_runs_only_while_the_policy_allows_its_activity(
+    #[case] actor: bool,
+    #[case] wake_on: Option<&[&str]>,
+    #[case] recorded: Option<ImplicitWakeActivity>,
+    #[case] wakes: bool,
+) -> TestResult {
     use crate::public_operations::{ApiProduct, ClaimedPublicOperation};
     use crate::public_sandbox_operations::{
-        ImplicitWakeActivity::{Access, Command},
         SandboxLifecycleOperationExecutor, SandboxLifecycleOperationPayload,
     };
     use pplx_space_public_api::{
@@ -1165,89 +1212,72 @@ async fn a_system_wake_operation_runs_only_while_the_policy_allows_its_activity(
     let (worker, node_id) = start_sim_worker(pool).await?;
     let executor = SandboxLifecycleOperationExecutor::new(pool.clone(), direct_controller(pool));
 
-    let caller: UserId = "00000000-0000-0000-0000-000000000010".parse()?;
     let org_id = "00000000-0000-0000-0000-000000000001".parse()?;
-    let access = Some(Access);
-    let command = Some(Command);
-    // (actor, wake.on, if not the access policy placing it sets, recorded
-    // activity, wakes)
-    for (actor, wake_on, recorded, wakes) in [
-        (None, None, None, true),
-        (None, Some(&[][..]), None, false),
-        (Some(caller), Some(&[]), None, true),
-        (Some(caller), Some(&["command"]), access, true),
-        (None, None, access, true),
-        (None, Some(&["command"]), command, true),
-        (None, Some(&["command"]), access, false),
-        // Recording none: queued by an older API, or with the record off.
-        (None, Some(&["command"]), None, true),
-    ] {
-        let sandbox_id = SandboxId::new();
-        insert_sandbox(pool, sandbox_id, "paused", "space").await?;
-        // Places it with an access-wake policy.
-        place_on_node(pool, sandbox_id, node_id).await?;
-        insert_resident(worker.state(), sandbox_id, "paused").await?;
-        if let Some(wake_on) = wake_on {
-            sqlx::query(sql!(
-                "UPDATE sandboxes SET auto_lifecycle_json = $2 WHERE id = $1"
-            ))
-            .bind(sandbox_id)
-            .bind(serde_json::json!({ "wake": { "on": wake_on } }))
-            .execute(pool)
-            .await?;
-        }
-        let payload = SandboxLifecycleOperationPayload {
-            sandbox_id: PublicSandboxId::from(sandbox_id),
-            action: SandboxLifecycleAction::Wake,
-            rollback: None,
-            wake_activity: recorded,
-        }
-        .into_json();
-        let case = format!("{actor:?} {wake_on:?} {recorded:?}");
-        let operation = ClaimedPublicOperation {
-            id: OperationId::new(),
-            org_id,
-            actor_user_id: actor,
-            api_product: ApiProduct::Native,
-            kind: OperationKind::WakeSandbox,
-            target_type: None,
-            target_id: Some(PublicSandboxId::from(sandbox_id).to_string()),
-            payload,
-            attempts: 1,
-            claim_generation: 1,
-            traceparent: None,
-            age_at_first_claim_secs: None,
-        };
+    let sandbox_id = SandboxId::new();
+    insert_sandbox(pool, sandbox_id, "paused", "space").await?;
+    // Places it with an access-wake policy.
+    place_on_node(pool, sandbox_id, node_id).await?;
+    insert_resident(worker.state(), sandbox_id, "paused").await?;
+    if let Some(wake_on) = wake_on {
+        sqlx::query(sql!(
+            "UPDATE sandboxes SET auto_lifecycle_json = $2 WHERE id = $1"
+        ))
+        .bind(sandbox_id)
+        .bind(serde_json::json!({ "wake": { "on": wake_on } }))
+        .execute(pool)
+        .await?;
+    }
+    let payload = SandboxLifecycleOperationPayload {
+        sandbox_id: PublicSandboxId::from(sandbox_id),
+        action: SandboxLifecycleAction::Wake,
+        rollback: None,
+        wake_activity: recorded,
+    }
+    .into_json();
+    let case = format!("{actor:?} {wake_on:?} {recorded:?}");
+    let operation = ClaimedPublicOperation {
+        id: OperationId::new(),
+        org_id,
+        actor_user_id: actor.then(system_wake_caller),
+        api_product: ApiProduct::Native,
+        kind: OperationKind::WakeSandbox,
+        target_type: None,
+        target_id: Some(PublicSandboxId::from(sandbox_id).to_string()),
+        payload,
+        attempts: 1,
+        claim_generation: 1,
+        traceparent: None,
+        age_at_first_claim_secs: None,
+    };
 
-        let result = executor.execute(&operation).await;
+    let result = executor.execute(&operation).await;
 
-        let resident = worker.state().get(&sandbox_id.to_string()).await?.status;
-        if wakes {
-            assert_eq!(
-                result.state,
-                OperationState::Succeeded,
-                "{case}: {result:?}"
-            );
-            assert_eq!(resident, "running");
-            assert_eq!(
-                row(pool, sandbox_id).await?,
-                Some(Row::new("started", "on_node"))
-            );
-        } else {
-            assert_eq!(result.state, OperationState::Failed, "{case}: {result:?}");
-            assert_eq!(result.terminal_error_code, Some(PublicErrorCode::Conflict));
-            // Refused by the executor before any node call: a sandbox with no
-            // node to ask (a suspended Kubernetes one) has no other check.
-            assert_eq!(
-                result.progress_message, "sandbox wake policy no longer allows this wake",
-                "{result:?}"
-            );
-            assert_eq!(resident, "paused");
-            assert_eq!(
-                row(pool, sandbox_id).await?,
-                Some(Row::new("paused", "on_node"))
-            );
-        }
+    let resident = worker.state().get(&sandbox_id.to_string()).await?.status;
+    if wakes {
+        assert_eq!(
+            result.state,
+            OperationState::Succeeded,
+            "{case}: {result:?}"
+        );
+        assert_eq!(resident, "running");
+        assert_eq!(
+            row(pool, sandbox_id).await?,
+            Some(Row::new("started", "on_node"))
+        );
+    } else {
+        assert_eq!(result.state, OperationState::Failed, "{case}: {result:?}");
+        assert_eq!(result.terminal_error_code, Some(PublicErrorCode::Conflict));
+        // Refused by the executor before any node call: a sandbox with no
+        // node to ask (a suspended Kubernetes one) has no other check.
+        assert_eq!(
+            result.progress_message, "sandbox wake policy no longer allows this wake",
+            "{result:?}"
+        );
+        assert_eq!(resident, "paused");
+        assert_eq!(
+            row(pool, sandbox_id).await?,
+            Some(Row::new("paused", "on_node"))
+        );
     }
     Ok(())
 }

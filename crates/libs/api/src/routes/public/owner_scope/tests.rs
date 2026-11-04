@@ -66,6 +66,23 @@ fn owner_headers(org: &str, subject: &str) -> HeaderMap {
     headers
 }
 
+/// Whose scope a request runs in: the API key's own org, or a federated
+/// owner it asserts.
+#[derive(Clone, Copy, Debug)]
+enum Owner {
+    Local,
+    Federated,
+}
+
+impl Owner {
+    fn headers(self) -> HeaderMap {
+        match self {
+            Self::Local => HeaderMap::new(),
+            Self::Federated => owner_headers(ORG, "101"),
+        }
+    }
+}
+
 fn grant_headers(mut headers: HeaderMap) -> HeaderMap {
     headers.insert(FEDERATED_SERVICE_GRANT_HEADER, GRANT.parse().unwrap());
     let now = time::OffsetDateTime::now_utc().unix_timestamp();
@@ -189,8 +206,11 @@ async fn native_admission_records_effective_owner_and_scopes_replay_and_polling(
     Ok(())
 }
 
+#[rstest::rstest]
 #[tokio::test]
-async fn deleted_sandbox_replay_is_authorized_by_its_retained_operation() -> TestDbResult<()> {
+async fn deleted_sandbox_replay_is_authorized_by_its_retained_operation(
+    #[values(Owner::Local, Owner::Federated)] owner: Owner,
+) -> TestDbResult<()> {
     use crate::public_operations::{
         ClaimLimits, ClaimPublicOperations, CompleteClaimedPublicOperation,
     };
@@ -200,112 +220,110 @@ async fn deleted_sandbox_replay_is_authorized_by_its_retained_operation() -> Tes
     };
     use std::time::Duration;
 
-    for owner in [HeaderMap::new(), owner_headers(ORG, "101")] {
-        let fixture = fixture().await?;
-        let (status, created) = send(
-            &fixture.app,
-            Method::POST,
-            "/v1/sandboxes",
-            grant_headers(owner.clone()),
-            json!({"template":"seed:latest"}),
-        )
+    let owner = owner.headers();
+    let fixture = fixture().await?;
+    let (status, created) = send(
+        &fixture.app,
+        Method::POST,
+        "/v1/sandboxes",
+        grant_headers(owner.clone()),
+        json!({"template":"seed:latest"}),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::ACCEPTED, "{created}");
+    let sandbox_id = seed_target(&fixture, &created).await?;
+    let path = format!("/v1/sandboxes/{sandbox_id}");
+    let (status, deleted) = send(
+        &fixture.app,
+        Method::DELETE,
+        &path,
+        owner.clone(),
+        Value::Null,
+    )
+    .await?;
+    assert_eq!(status, StatusCode::ACCEPTED, "{deleted}");
+    let operation_id: OperationId = deleted["operation_id"].as_str().unwrap().parse()?;
+    let store = PublicOperationStore::new(fixture.db.pool.clone());
+    let claim = store
+        .claim_operations(ClaimPublicOperations {
+            limits: ClaimLimits::any(1),
+            claim_stale_after: Duration::from_secs(60),
+            claimable_kinds: &[OperationKind::DeleteSandbox],
+        })
         .await?;
-        assert_eq!(status, StatusCode::ACCEPTED, "{created}");
-        let sandbox_id = seed_target(&fixture, &created).await?;
-        let path = format!("/v1/sandboxes/{sandbox_id}");
-        let (status, deleted) = send(
-            &fixture.app,
-            Method::DELETE,
-            &path,
-            owner.clone(),
-            Value::Null,
-        )
+    assert_eq!(claim.operations[0].id, operation_id);
+    sqlx::query(sql!("DELETE FROM sandboxes WHERE id = $1"))
+        .bind(sandbox_id.as_uuid())
+        .execute(&fixture.db.pool)
         .await?;
-        assert_eq!(status, StatusCode::ACCEPTED, "{deleted}");
-        let operation_id: OperationId = deleted["operation_id"].as_str().unwrap().parse()?;
-        let store = PublicOperationStore::new(fixture.db.pool.clone());
-        let claim = store
-            .claim_operations(ClaimPublicOperations {
-                limits: ClaimLimits::any(1),
-                claim_stale_after: Duration::from_secs(60),
-                claimable_kinds: &[OperationKind::DeleteSandbox],
+    assert!(
+        store
+            .complete_claimed_operation(CompleteClaimedPublicOperation {
+                claim_token: claim.claim_token,
+                operation_id,
+                progress_message: "deleted".into(),
+                result_json: serde_json::to_value(PublicOperationResult::Sandbox(
+                    PublicSandboxOperationResult {
+                        sandbox_id,
+                        state: SandboxLifecycleState::Deleted,
+                        action: Some(SandboxLifecycleAction::Delete),
+                        controller_response: None
+                    }
+                ))?,
             })
-            .await?;
-        assert_eq!(claim.operations[0].id, operation_id);
-        sqlx::query(sql!("DELETE FROM sandboxes WHERE id = $1"))
-            .bind(sandbox_id.as_uuid())
-            .execute(&fixture.db.pool)
-            .await?;
-        assert!(
-            store
-                .complete_claimed_operation(CompleteClaimedPublicOperation {
-                    claim_token: claim.claim_token,
-                    operation_id,
-                    progress_message: "deleted".into(),
-                    result_json: serde_json::to_value(PublicOperationResult::Sandbox(
-                        PublicSandboxOperationResult {
-                            sandbox_id,
-                            state: SandboxLifecycleState::Deleted,
-                            action: Some(SandboxLifecycleAction::Delete),
-                            controller_response: None
-                        }
-                    ))?,
-                })
-                .await?
-        );
+            .await?
+    );
 
-        let (status, replay) = send(
-            &fixture.app,
+    let (status, replay) = send(
+        &fixture.app,
+        Method::DELETE,
+        &path,
+        owner.clone(),
+        Value::Null,
+    )
+    .await?;
+    assert_eq!(status, StatusCode::ACCEPTED, "{replay}");
+    assert_eq!(replay["operation_id"], deleted["operation_id"]);
+    for headers in [owner.clone(), owner_headers(OTHER_ORG, "101")] {
+        let mut request = Request::builder()
+            .method(Method::DELETE)
+            .uri(&path)
+            .header("authorization", format!("Bearer {KEY}"));
+        request.headers_mut().unwrap().extend(headers);
+        let response = fixture
+            .app
+            .clone()
+            .oneshot(request.body(Body::empty())?)
+            .await?;
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "an absent key cannot authorize replay"
+        );
+    }
+    let mut fresh = owner.clone();
+    fresh.insert("idempotency-key", "new-delete".parse()?);
+    for (method, target, headers) in [
+        (Method::DELETE, path.clone(), fresh),
+        (Method::DELETE, path.clone(), owner_headers(ORG, "102")),
+        (
             Method::DELETE,
-            &path,
+            path.clone(),
+            owner_headers(OTHER_ORG, "101"),
+        ),
+        (Method::GET, path.clone(), owner.clone()),
+        (Method::POST, format!("{path}:wake"), owner.clone()),
+        (
+            Method::DELETE,
+            format!(
+                "/v1/sandboxes/{}",
+                PublicSandboxId::from(pplx_space_common_core::types::SandboxId::new())
+            ),
             owner.clone(),
-            Value::Null,
-        )
-        .await?;
-        assert_eq!(status, StatusCode::ACCEPTED, "{replay}");
-        assert_eq!(replay["operation_id"], deleted["operation_id"]);
-        for headers in [owner.clone(), owner_headers(OTHER_ORG, "101")] {
-            let mut request = Request::builder()
-                .method(Method::DELETE)
-                .uri(&path)
-                .header("authorization", format!("Bearer {KEY}"));
-            request.headers_mut().unwrap().extend(headers);
-            let response = fixture
-                .app
-                .clone()
-                .oneshot(request.body(Body::empty())?)
-                .await?;
-            assert_eq!(
-                response.status(),
-                StatusCode::NOT_FOUND,
-                "an absent key cannot authorize replay"
-            );
-        }
-        let mut fresh = owner.clone();
-        fresh.insert("idempotency-key", "new-delete".parse()?);
-        for (method, target, headers) in [
-            (Method::DELETE, path.clone(), fresh),
-            (Method::DELETE, path.clone(), owner_headers(ORG, "102")),
-            (
-                Method::DELETE,
-                path.clone(),
-                owner_headers(OTHER_ORG, "101"),
-            ),
-            (Method::GET, path.clone(), owner.clone()),
-            (Method::POST, format!("{path}:wake"), owner.clone()),
-            (
-                Method::DELETE,
-                format!(
-                    "/v1/sandboxes/{}",
-                    PublicSandboxId::from(pplx_space_common_core::types::SandboxId::new())
-                ),
-                owner.clone(),
-            ),
-        ] {
-            let (status, response) =
-                send(&fixture.app, method, &target, headers, Value::Null).await?;
-            assert_eq!(status, StatusCode::NOT_FOUND, "{response}");
-        }
+        ),
+    ] {
+        let (status, response) = send(&fixture.app, method, &target, headers, Value::Null).await?;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{response}");
     }
     Ok(())
 }
@@ -887,8 +905,12 @@ fn concrete_path(template: &str, id_param: &str, id: &str) -> String {
     path
 }
 
+#[rstest::rstest]
 #[tokio::test]
-async fn every_path_id_route_rejects_a_malformed_id_and_hides_an_unknown_one() -> TestDbResult<()> {
+async fn every_path_id_route_rejects_a_malformed_id_and_hides_an_unknown_one(
+    #[values(Owner::Local, Owner::Federated)] owner: Owner,
+) -> TestDbResult<()> {
+    let headers = owner.headers();
     let fixture = fixture().await?;
     let spec = crate::routes::public_docs::full_openapi_json().await.0;
     let mut swept = BTreeSet::new();
@@ -921,32 +943,30 @@ async fn every_path_id_route_rejects_a_malformed_id_and_hides_an_unknown_one() -
             "{method} {} does not document its malformed-id 400 envelope",
             operation.path()
         );
-        for headers in [HeaderMap::new(), owner_headers(ORG, "101")] {
-            for (id, expected_status, expected_body) in [
-                // The same answer the handler gives an unparseable id.
-                (
-                    malformed,
-                    StatusCode::BAD_REQUEST,
-                    error_body("invalid_request", invalid),
-                ),
-                (
-                    unknown,
-                    StatusCode::NOT_FOUND,
-                    error_body("not_found", not_found),
-                ),
-            ] {
-                let path = concrete_path(operation.path(), id_param, id);
-                let (status, body) = send(
-                    &fixture.app,
-                    Method::from_bytes(method.to_ascii_uppercase().as_bytes())?,
-                    &path,
-                    request_id_headers(headers.clone()),
-                    json!({}),
-                )
-                .await?;
-                assert_eq!(status, expected_status, "{method} {path}: {body}");
-                assert_eq!(body, expected_body, "{method} {path}");
-            }
+        for (id, expected_status, expected_body) in [
+            // The same answer the handler gives an unparseable id.
+            (
+                malformed,
+                StatusCode::BAD_REQUEST,
+                error_body("invalid_request", invalid),
+            ),
+            (
+                unknown,
+                StatusCode::NOT_FOUND,
+                error_body("not_found", not_found),
+            ),
+        ] {
+            let path = concrete_path(operation.path(), id_param, id);
+            let (status, body) = send(
+                &fixture.app,
+                Method::from_bytes(method.to_ascii_uppercase().as_bytes())?,
+                &path,
+                request_id_headers(headers.clone()),
+                json!({}),
+            )
+            .await?;
+            assert_eq!(status, expected_status, "{method} {path}: {body}");
+            assert_eq!(body, expected_body, "{method} {path}");
         }
         swept.insert(operation.path());
     }
@@ -1145,8 +1165,11 @@ async fn operation_outcome(
 /// the create, which never runs, and then succeeds with nothing to delete.
 /// Its key replays it before and after it runs; once the create is gone, a
 /// new delete is unknown again.
+#[rstest::rstest]
 #[tokio::test]
-async fn a_delete_before_its_sandboxs_row_exists_cancels_the_create() -> TestDbResult<()> {
+async fn a_delete_before_its_sandboxs_row_exists_cancels_the_create(
+    #[values(Owner::Local, Owner::Federated)] owner: Owner,
+) -> TestDbResult<()> {
     use crate::controllers::sandbox::SandboxController;
     use crate::public_operation_driver::{
         OperationExecutionConfig, OperationExecutor, drive_claimed_operation,
@@ -1156,96 +1179,94 @@ async fn a_delete_before_its_sandboxs_row_exists_cancels_the_create() -> TestDbR
     use pplx_space_public_api::OperationKind;
     use std::time::Duration;
 
-    for owner in [HeaderMap::new(), owner_headers(ORG, "101")] {
-        let fixture = fixture().await?;
-        let pool = &fixture.db.pool;
-        let (status, created) = send(
-            &fixture.app,
-            Method::POST,
-            "/v1/sandboxes",
-            grant_headers(owner.clone()),
-            json!({"template":"seed:latest"}),
-        )
-        .await?;
-        assert_eq!(status, StatusCode::ACCEPTED, "{created}");
-        let path = format!("/v1/sandboxes/{}", created["sandbox_id"].as_str().unwrap());
-        let (status, deleted) = send(
-            &fixture.app,
-            Method::DELETE,
-            &path,
-            owner.clone(),
-            Value::Null,
-        )
-        .await?;
-        assert_eq!(status, StatusCode::ACCEPTED, "{deleted}");
-        assert_eq!(deleted["sandbox_id"], created["sandbox_id"]);
-        assert_ne!(deleted["operation_id"], created["operation_id"]);
-        let (state, error) = operation_outcome(pool, &created["operation_id"]).await?;
-        assert_eq!(state, "canceled");
-        let error = error.expect("a canceled create carries its error");
-        assert_eq!(error["reason"], "superseded_by_delete");
-        assert_eq!(error["delete_operation_id"], deleted["operation_id"]);
-        let (status, replay) = send(
-            &fixture.app,
-            Method::DELETE,
-            &path,
-            owner.clone(),
-            Value::Null,
-        )
-        .await?;
-        assert_eq!(status, StatusCode::ACCEPTED, "{replay}");
-        assert_eq!(replay["operation_id"], deleted["operation_id"]);
+    let owner = owner.headers();
+    let fixture = fixture().await?;
+    let pool = &fixture.db.pool;
+    let (status, created) = send(
+        &fixture.app,
+        Method::POST,
+        "/v1/sandboxes",
+        grant_headers(owner.clone()),
+        json!({"template":"seed:latest"}),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::ACCEPTED, "{created}");
+    let path = format!("/v1/sandboxes/{}", created["sandbox_id"].as_str().unwrap());
+    let (status, deleted) = send(
+        &fixture.app,
+        Method::DELETE,
+        &path,
+        owner.clone(),
+        Value::Null,
+    )
+    .await?;
+    assert_eq!(status, StatusCode::ACCEPTED, "{deleted}");
+    assert_eq!(deleted["sandbox_id"], created["sandbox_id"]);
+    assert_ne!(deleted["operation_id"], created["operation_id"]);
+    let (state, error) = operation_outcome(pool, &created["operation_id"]).await?;
+    assert_eq!(state, "canceled");
+    let error = error.expect("a canceled create carries its error");
+    assert_eq!(error["reason"], "superseded_by_delete");
+    assert_eq!(error["delete_operation_id"], deleted["operation_id"]);
+    let (status, replay) = send(
+        &fixture.app,
+        Method::DELETE,
+        &path,
+        owner.clone(),
+        Value::Null,
+    )
+    .await?;
+    assert_eq!(status, StatusCode::ACCEPTED, "{replay}");
+    assert_eq!(replay["operation_id"], deleted["operation_id"]);
 
-        let store = PublicOperationStore::new(pool.clone());
-        let mut claim = store
-            .claim_operations(ClaimPublicOperations {
-                limits: ClaimLimits::any(8),
-                claim_stale_after: Duration::from_secs(60),
-                claimable_kinds: &[OperationKind::CreateSandbox, OperationKind::DeleteSandbox],
-            })
-            .await?;
-        let operation = claim.operations.pop().expect("the delete is claimable");
-        assert!(
-            claim.operations.is_empty(),
-            "the canceled create never runs"
-        );
-        assert_eq!(json!(operation.id), deleted["operation_id"]);
-        let executor = SandboxLifecycleOperationExecutor::new(
-            pool.clone(),
-            SandboxController::new(crate::test_support::direct_substrate(pool)),
-        );
-        drive_claimed_operation(
-            store,
-            claim.claim_token,
-            OperationExecutionConfig::default(),
-            operation.clone(),
-            OperationExecutor::Dispatcher,
-            async move { executor.execute(&operation).await.into() },
-        )
+    let store = PublicOperationStore::new(pool.clone());
+    let mut claim = store
+        .claim_operations(ClaimPublicOperations {
+            limits: ClaimLimits::any(8),
+            claim_stale_after: Duration::from_secs(60),
+            claimable_kinds: &[OperationKind::CreateSandbox, OperationKind::DeleteSandbox],
+        })
         .await?;
-        let (state, _) = operation_outcome(pool, &deleted["operation_id"]).await?;
-        assert_eq!(state, "succeeded");
-        let rows: i64 = sqlx::query_scalar(sql!("SELECT COUNT(*) FROM sandboxes"))
-            .fetch_one(pool)
-            .await?;
-        assert_eq!(rows, 0);
+    let operation = claim.operations.pop().expect("the delete is claimable");
+    assert!(
+        claim.operations.is_empty(),
+        "the canceled create never runs"
+    );
+    assert_eq!(json!(operation.id), deleted["operation_id"]);
+    let executor = SandboxLifecycleOperationExecutor::new(
+        pool.clone(),
+        SandboxController::new(crate::test_support::direct_substrate(pool)),
+    );
+    drive_claimed_operation(
+        store,
+        claim.claim_token,
+        OperationExecutionConfig::default(),
+        operation.clone(),
+        OperationExecutor::Dispatcher,
+        async move { executor.execute(&operation).await.into() },
+    )
+    .await?;
+    let (state, _) = operation_outcome(pool, &deleted["operation_id"]).await?;
+    assert_eq!(state, "succeeded");
+    let rows: i64 = sqlx::query_scalar(sql!("SELECT COUNT(*) FROM sandboxes"))
+        .fetch_one(pool)
+        .await?;
+    assert_eq!(rows, 0);
 
-        let (status, replay) = send(
-            &fixture.app,
-            Method::DELETE,
-            &path,
-            owner.clone(),
-            Value::Null,
-        )
-        .await?;
-        assert_eq!(status, StatusCode::ACCEPTED, "{replay}");
-        assert_eq!(replay["operation_id"], deleted["operation_id"]);
-        let mut fresh = owner.clone();
-        fresh.insert("idempotency-key", "new-delete".parse()?);
-        let (status, response) =
-            send(&fixture.app, Method::DELETE, &path, fresh, Value::Null).await?;
-        assert_eq!(status, StatusCode::NOT_FOUND, "{response}");
-    }
+    let (status, replay) = send(
+        &fixture.app,
+        Method::DELETE,
+        &path,
+        owner.clone(),
+        Value::Null,
+    )
+    .await?;
+    assert_eq!(status, StatusCode::ACCEPTED, "{replay}");
+    assert_eq!(replay["operation_id"], deleted["operation_id"]);
+    let mut fresh = owner.clone();
+    fresh.insert("idempotency-key", "new-delete".parse()?);
+    let (status, response) = send(&fixture.app, Method::DELETE, &path, fresh, Value::Null).await?;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{response}");
     Ok(())
 }
 

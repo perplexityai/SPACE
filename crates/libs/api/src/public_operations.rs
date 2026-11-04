@@ -908,7 +908,11 @@ impl PublicOperationStore {
             find_idempotency_record(&mut tx, org_id, api_product, idempotency).await?,
             idempotency,
         );
-        Ok(PublicOperationAdmission { tx, observation })
+        Ok(PublicOperationAdmission {
+            tx,
+            observation,
+            quota_lock_timeout: sandbox_quota::QUOTA_LOCK_TIMEOUT,
+        })
     }
 
     pub async fn observe_operation_idempotency(
@@ -1593,6 +1597,9 @@ pub enum CreateInlinePublicOperationResult<P = ()> {
 pub struct PublicOperationAdmission {
     tx: Transaction<'static, Postgres>,
     observation: ObservePublicOperationIdempotency,
+    /// The longest a create waits for one quota lock:
+    /// [`sandbox_quota::QUOTA_LOCK_TIMEOUT`]. Tests wait less.
+    quota_lock_timeout: Duration,
 }
 
 impl PublicOperationAdmission {

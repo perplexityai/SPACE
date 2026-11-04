@@ -115,6 +115,34 @@ pub(crate) async fn start_a_request_blocked_on_operations<T: Send + 'static>(
     }
 }
 
+/// Wait until some backend is blocked on a lock `holder` holds: proof that
+/// the request under test queued behind it.
+pub(crate) async fn wait_until_blocked_by(
+    holder: &mut sqlx::PgConnection,
+) -> pplx_space_db_test_fixtures::TestDbResult<()> {
+    use pplx_space_common_core::sql;
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let blocked: bool = sqlx::query_scalar(sql!(
+            "SELECT EXISTS (
+                 SELECT 1 FROM pg_stat_activity
+                  WHERE datname = current_database()
+                    AND pg_backend_pid() = ANY(pg_blocking_pids(pid))
+             )"
+        ))
+        .fetch_one(&mut *holder)
+        .await?;
+        if blocked {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err("nothing waited for the holder's lock".into());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
 /// Insert `sandbox_id`'s row for `create`, a native create of it, and mark
 /// `create` `succeeded`, as an execution that builds the sandbox does.
 pub(crate) async fn record_the_row_and_succeed(

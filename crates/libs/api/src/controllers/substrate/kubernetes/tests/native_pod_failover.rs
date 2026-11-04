@@ -226,6 +226,12 @@ async fn a_native_request_to_a_removed_pod_returns_after_its_first_dial() -> Tes
 /// kept-channel dial is the one every caller had: the old address gets the
 /// full connect budget and is not re-resolved, so the caller sees its
 /// failure and recovers as before.
+///
+/// The dial runs on paused time. Its retries, backoff and attempt timeouts
+/// all run on tokio's clock, and the silent address never answers in real
+/// time either, so the clock skipping ahead while the runtime is idle spends
+/// the same budget at once. Postgres is done with by then: this caller never
+/// re-resolves the pod.
 #[tokio::test(flavor = "current_thread")]
 async fn any_other_caller_waits_out_the_full_budget_on_the_old_address() -> TestResult {
     if !crate::test_support::enter_sim_worker_process() {
@@ -233,7 +239,8 @@ async fn any_other_caller_waits_out_the_full_budget_on_the_old_address() -> Test
     }
     let moved = moved_pod("started").await?;
 
-    let started = Instant::now();
+    tokio::time::pause();
+    let started = tokio::time::Instant::now();
     let result = moved
         .substrate
         .access_kept_worker_client(moved.sandbox_id, &stale_instance())

@@ -142,12 +142,19 @@ async fn current_failure_reads_the_execution_record_of_the_sandbox_substrate() -
     }
     assert_eq!(by_id, expected, "sandbox read");
 
-    let mut listed = fetch_sandboxes_page(&db.pool, OrgId::from_uuid(SEED_ORG_ID), None, None, 100)
-        .await?
-        .into_iter()
-        .map(|row| (row.id, row.has_current_failure))
-        .filter(|(id, _)| expected.iter().any(|(expected_id, _)| expected_id == id))
-        .collect::<Vec<_>>();
+    let mut listed = fetch_sandboxes_page(
+        &db.pool,
+        OrgId::from_uuid(SEED_ORG_ID),
+        None,
+        None,
+        100,
+        MAX_SANDBOX_LIST_PAGE_BYTES,
+    )
+    .await?
+    .into_iter()
+    .map(|row| (row.id, row.has_current_failure))
+    .filter(|(id, _)| expected.iter().any(|(expected_id, _)| expected_id == id))
+    .collect::<Vec<_>>();
     listed.sort();
     assert_eq!(listed, expected, "sandbox list");
     Ok(())

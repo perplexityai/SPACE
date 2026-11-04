@@ -78,8 +78,18 @@ fn direct_sandbox_controller(pool: &PgPool) -> SandboxController {
 }
 
 #[cfg(feature = "kubernetes")]
+#[rstest::rstest]
+#[case::unconfigured(false, false, false)]
+#[case::configured(true, false, false)]
+// Legacy federated payload: no saved selection.
+#[case::configured_legacy_federated(true, true, false)]
+#[case::configured_federated_with_selection(true, true, true)]
 #[tokio::test(flavor = "current_thread")]
-async fn native_create_executor_preserves_operator_policy_across_replacements() -> TestResult {
+async fn native_create_executor_preserves_operator_policy_across_replacements(
+    #[case] configured: bool,
+    #[case] federated: bool,
+    #[case] selected: bool,
+) -> TestResult {
     use std::sync::{Arc, Mutex};
 
     use crate::controllers::substrate::kubernetes::tests::{
@@ -151,162 +161,156 @@ async fn native_create_executor_preserves_operator_policy_across_replacements() 
     let captured_pods = Arc::new(Mutex::new(Vec::new()));
     // Native create probes the pod's TCP listener even with command readiness disabled.
     let pod_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-    for (configured, federated, selected) in [
-        (false, false, false),
-        (true, false, false),
-        (true, true, false), // Legacy federated payload: no saved selection.
-        (true, true, true),
-    ] {
-        let substrate = crate::controllers::substrate::Substrate::from_kubernetes(
-            substrate_with_store_client_proxy_port_and_pod(
-                db.pool.clone(),
-                running_pod_kubernetes_client(Arc::clone(&captured_pods), "127.0.0.1"),
-                pod_listener.local_addr()?.port(),
-                None,
-            ),
+    let substrate = crate::controllers::substrate::Substrate::from_kubernetes(
+        substrate_with_store_client_proxy_port_and_pod(
+            db.pool.clone(),
+            running_pod_kubernetes_client(Arc::clone(&captured_pods), "127.0.0.1"),
+            pod_listener.local_addr()?.port(),
+            None,
+        ),
+    );
+    let controller = SandboxController::new(substrate)
+        .with_egress_profiles(profiles.clone())
+        .with_tls_interception_exemptions(configured.then(|| exemptions.clone()));
+    let executor = CreateSandboxOperationExecutor::new(db.pool.clone(), controller);
+    for inherit_template in [false, true] {
+        let sandbox_id = SandboxId::new();
+        let (org_id, user_id) = if federated {
+            (effective_owner.org_id, effective_owner.user_id)
+        } else {
+            (org_id, user_id)
+        };
+        let mut operation = claimed_create_operation_for(sandbox_id, org_id, user_id);
+        let mut context =
+            crate::fork_operations::ForkFederatedCreateContext::from_request(&owner, &grant);
+        // The payload freezes names, while execution uses current destinations.
+        let admission = direct_sandbox_controller(&db.pool).with_egress_profiles(
+            crate::egress_profiles::EgressProfiles::from_config(
+                r#"{"sensor":{"allow":[{"domain":"retired.example.test"}]}}"#,
+            )?,
         );
-        let controller = SandboxController::new(substrate)
-            .with_egress_profiles(profiles.clone())
-            .with_tls_interception_exemptions(configured.then(|| exemptions.clone()));
-        let executor = CreateSandboxOperationExecutor::new(db.pool.clone(), controller);
-        for inherit_template in [false, true] {
-            let sandbox_id = SandboxId::new();
-            let (org_id, user_id) = if federated {
-                (effective_owner.org_id, effective_owner.user_id)
-            } else {
-                (org_id, user_id)
-            };
-            let mut operation = claimed_create_operation_for(sandbox_id, org_id, user_id);
-            let mut context =
-                crate::fork_operations::ForkFederatedCreateContext::from_request(&owner, &grant);
-            // The payload freezes names, while execution uses current destinations.
-            let admission = direct_sandbox_controller(&db.pool).with_egress_profiles(
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(crate::egress_profiles::HEADER, "+sensor".parse()?);
+        context.egress_profiles = if selected {
+            Some(admission.select_egress_profiles(&headers, true)?)
+        } else {
+            None
+        };
+        let mut request = public_create_request();
+        request.network_policy = (!inherit_template).then(|| policy.clone());
+        operation.payload = CreateSandboxOperationPayload {
+            sandbox_id: sandbox_id.into(),
+            request,
+            node_pool: None,
+            federated_create: federated.then_some(context),
+            pool_claim: None,
+            requested_by_user_id: None,
+        }
+        .into_json();
+
+        if selected {
+            let unconfigured = CreateSandboxOperationExecutor::new(
+                db.pool.clone(),
+                executor
+                    .controller
+                    .clone()
+                    .with_egress_profiles(Default::default()),
+            );
+            let result = Box::pin(unconfigured.execute(&operation)).await;
+            assert_eq!(result.state, OperationState::Queued, "{result:?}");
+            assert_eq!(result.retry_after, Some(CREATE_RETRY_AFTER));
+            assert!(fetch_sandbox(&db.pool, sandbox_id).await?.is_none());
+        }
+        let result = Box::pin(executor.execute(&operation)).await;
+        assert_eq!(result.state, OperationState::Succeeded, "{result:?}");
+        assert_eq!(
+            crate::egress_profiles::load(&db.pool, sandbox_id)
+                .await?
+                .as_names(),
+            if selected { vec!["sensor"] } else { vec![] },
+        );
+        let persisted: Option<sqlx::types::Json<NetworkPolicyV1>> = sqlx::query_scalar(sql!(
+            "SELECT network_policy_override_json FROM sandboxes WHERE id = $1"
+        ))
+        .bind(sandbox_id)
+        .fetch_one(&db.pool)
+        .await?;
+        assert_eq!(persisted.is_some(), configured || !inherit_template);
+        let effective = persisted.as_ref().map(|value| &value.0).unwrap_or(&policy);
+        let mut expected = policy.clone();
+        if configured {
+            expected.tls_interception_exemptions = serde_json::from_value(serde_json::json!([
+                {"wildcard_domain": "*.relay.example.test"}
+            ]))?;
+        }
+        if selected {
+            assert!(effective.allows_domain("sensor.example.test"));
+            assert!(!effective.allows_domain("retired.example.test"));
+            assert!(!effective.allows_domain("blocked.example.test"));
+            let updated_controller = executor.controller.clone().with_egress_profiles(
                 crate::egress_profiles::EgressProfiles::from_config(
-                    r#"{"sensor":{"allow":[{"domain":"retired.example.test"}]}}"#,
+                    r#"{"sensor":{"allow":[{"domain":"updated.example.test"}]}}"#,
                 )?,
             );
-            let mut headers = axum::http::HeaderMap::new();
-            headers.insert(crate::egress_profiles::HEADER, "+sensor".parse()?);
-            context.egress_profiles = if selected {
-                Some(admission.select_egress_profiles(&headers, true)?)
-            } else {
-                None
-            };
-            let mut request = public_create_request();
-            request.network_policy = (!inherit_template).then(|| policy.clone());
-            operation.payload = CreateSandboxOperationPayload {
-                sandbox_id: sandbox_id.into(),
-                request,
-                node_pool: None,
-                federated_create: federated.then_some(context),
-                pool_claim: None,
-                requested_by_user_id: None,
-            }
-            .into_json();
-
-            if selected {
-                let unconfigured = CreateSandboxOperationExecutor::new(
-                    db.pool.clone(),
-                    executor
-                        .controller
-                        .clone()
-                        .with_egress_profiles(Default::default()),
-                );
-                let result = Box::pin(unconfigured.execute(&operation)).await;
-                assert_eq!(result.state, OperationState::Queued, "{result:?}");
-                assert_eq!(result.retry_after, Some(CREATE_RETRY_AFTER));
-                assert!(fetch_sandbox(&db.pool, sandbox_id).await?.is_none());
-            }
-            let result = Box::pin(executor.execute(&operation)).await;
-            assert_eq!(result.state, OperationState::Succeeded, "{result:?}");
-            assert_eq!(
-                crate::egress_profiles::load(&db.pool, sandbox_id)
+            assert!(!effective.allows_domain("unlisted.example.test"));
+            for patch in [
+                ControllerSandboxNetworkPolicyPatch::Set {
+                    policy: NetworkPolicyV1::deny_all(),
+                },
+                ControllerSandboxNetworkPolicyPatch::InheritTemplateDefault,
+            ] {
+                let sandbox = fetch_sandbox(&db.pool, sandbox_id)
                     .await?
-                    .as_names(),
-                if selected { vec!["sensor"] } else { vec![] },
-            );
-            let persisted: Option<sqlx::types::Json<NetworkPolicyV1>> = sqlx::query_scalar(sql!(
-                "SELECT network_policy_override_json FROM sandboxes WHERE id = $1"
-            ))
-            .bind(sandbox_id)
-            .fetch_one(&db.pool)
-            .await?;
-            assert_eq!(persisted.is_some(), configured || !inherit_template);
-            let effective = persisted.as_ref().map(|value| &value.0).unwrap_or(&policy);
-            let mut expected = policy.clone();
-            if configured {
-                expected.tls_interception_exemptions = serde_json::from_value(serde_json::json!([
-                    {"wildcard_domain": "*.relay.example.test"}
-                ]))?;
-            }
-            if selected {
-                assert!(effective.allows_domain("sensor.example.test"));
+                    .expect("created sandbox");
+                updated_controller
+                    .set_network_policy(&db.pool, &sandbox, patch, None)
+                    .await?;
+                let updated = fetch_sandbox(&db.pool, sandbox_id)
+                    .await?
+                    .expect("updated sandbox");
+                let effective = updated.network_policy.expect("profile remains composed").0;
+                assert!(effective.allows_domain("updated.example.test"));
+                assert!(!effective.allows_domain("sensor.example.test"));
                 assert!(!effective.allows_domain("retired.example.test"));
-                assert!(!effective.allows_domain("blocked.example.test"));
-                let updated_controller = executor.controller.clone().with_egress_profiles(
-                    crate::egress_profiles::EgressProfiles::from_config(
-                        r#"{"sensor":{"allow":[{"domain":"updated.example.test"}]}}"#,
-                    )?,
-                );
                 assert!(!effective.allows_domain("unlisted.example.test"));
-                for patch in [
-                    ControllerSandboxNetworkPolicyPatch::Set {
-                        policy: NetworkPolicyV1::deny_all(),
-                    },
-                    ControllerSandboxNetworkPolicyPatch::InheritTemplateDefault,
-                ] {
-                    let sandbox = fetch_sandbox(&db.pool, sandbox_id)
+                assert!(!effective.tls_interception_exemptions.contains(
+                    &pplx_space_net_common::EgressDestinationV1::Domain(
+                        "sensor.example.test".parse()?,
+                    ),
+                ));
+                let sandbox = fetch_sandbox(&db.pool, sandbox_id).await?.unwrap();
+                let error = executor
+                    .controller
+                    .clone()
+                    .with_egress_profiles(Default::default())
+                    .set_network_policy(
+                        &db.pool,
+                        &sandbox,
+                        ControllerSandboxNetworkPolicyPatch::Set {
+                            policy: NetworkPolicyV1::deny_all(),
+                        },
+                        None,
+                    )
+                    .await
+                    .expect_err("missing selected profile must fail composition");
+                assert_eq!(error.status(), StatusCode::SERVICE_UNAVAILABLE);
+                assert_eq!(
+                    fetch_sandbox(&db.pool, sandbox_id)
                         .await?
-                        .expect("created sandbox");
-                    updated_controller
-                        .set_network_policy(&db.pool, &sandbox, patch, None)
-                        .await?;
-                    let updated = fetch_sandbox(&db.pool, sandbox_id)
-                        .await?
-                        .expect("updated sandbox");
-                    let effective = updated.network_policy.expect("profile remains composed").0;
-                    assert!(effective.allows_domain("updated.example.test"));
-                    assert!(!effective.allows_domain("sensor.example.test"));
-                    assert!(!effective.allows_domain("retired.example.test"));
-                    assert!(!effective.allows_domain("unlisted.example.test"));
-                    assert!(!effective.tls_interception_exemptions.contains(
-                        &pplx_space_net_common::EgressDestinationV1::Domain(
-                            "sensor.example.test".parse()?,
-                        ),
-                    ));
-                    let sandbox = fetch_sandbox(&db.pool, sandbox_id).await?.unwrap();
-                    let error = executor
-                        .controller
-                        .clone()
-                        .with_egress_profiles(Default::default())
-                        .set_network_policy(
-                            &db.pool,
-                            &sandbox,
-                            ControllerSandboxNetworkPolicyPatch::Set {
-                                policy: NetworkPolicyV1::deny_all(),
-                            },
-                            None,
-                        )
-                        .await
-                        .expect_err("missing selected profile must fail composition");
-                    assert_eq!(error.status(), StatusCode::SERVICE_UNAVAILABLE);
-                    assert_eq!(
-                        fetch_sandbox(&db.pool, sandbox_id)
-                            .await?
-                            .unwrap()
-                            .network_policy,
-                        sandbox.network_policy,
-                        "failed composition must preserve the saved policy"
-                    );
-                }
-            } else {
-                assert_eq!(effective, &expected);
+                        .unwrap()
+                        .network_policy,
+                    sandbox.network_policy,
+                    "failed composition must preserve the saved policy"
+                );
             }
+        } else {
+            assert_eq!(effective, &expected);
         }
     }
     assert_eq!(
         captured_pods.lock().expect("capture mutex poisoned").len(),
-        8
+        2,
+        "one pod for each of the two creates"
     );
     Ok(())
 }
