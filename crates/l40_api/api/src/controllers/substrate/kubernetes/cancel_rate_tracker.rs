@@ -28,7 +28,7 @@ use std::time::Instant;
 const NUM_BUCKETS: usize = 10;
 const NUM_BUCKETS_U64: u64 = 10;
 const BUCKET_MS: u64 = 100;
-const DEFAULT_BUDGET_PER_SEC: u64 = 64;
+const DEFAULT_BUDGET_PER_SEC: u64 = 256;
 
 /// Bucketed sliding-window counter of `create_execution` cancellations.
 #[derive(Debug)]
