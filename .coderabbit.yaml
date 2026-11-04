@@ -177,8 +177,9 @@ reviews:
 
     At least high:
     - a change to a contract docs/versioning.md promises to keep compatible
-      (native HTTP API, node-api, spaced-bridge): a field, status, error, or
-      endpoint;
+      (native HTTP API, node-api, spaced-bridge): documented behavior, request
+      and response shapes, errors, streaming, authentication requirements,
+      lifecycle semantics, or an endpoint;
     - a breaking protobuf or storage contract change;
     - a privilege or tenant-isolation change;
     - a change to what a statement writing sandboxes.lifecycle does, or to a
