@@ -452,11 +452,10 @@ fn resolve_sandbox_cgroup_config(
         return Err(RunNodeMgrError::SandboxCgroupVcpuCountZero);
     }
     if let Some(memory_mib) = config.memory_mib {
-        let headroom_mib = crate::cgroup::DEFAULT_SANDBOX_MEMORY_HEADROOM_MIB;
-        if memory_mib <= headroom_mib {
+        if crate::cgroup::sandbox_guest_memory_max_mib(memory_mib).unwrap_or(0) == 0 {
             return Err(RunNodeMgrError::SandboxCgroupMemoryBelowHeadroom {
                 memory_mib,
-                headroom_mib,
+                headroom_mib: crate::cgroup::sandbox_memory_headroom_mib(1),
             });
         }
     }
@@ -812,7 +811,7 @@ pub async fn run(
             .memory_mib
             .map_or_else(|| "-".to_string(), |value| value.to_string());
         let sandbox_guest_memory_max_mib = sandbox_cgroup_config.guest_memory_max_mib();
-        let sandbox_memory_headroom_mib = crate::cgroup::DEFAULT_SANDBOX_MEMORY_HEADROOM_MIB;
+        let sandbox_memory_headroom_mib = sandbox_cgroup_config.memory_headroom_mib();
 
         let listener = pplx_space_common_svc::bind_unix_socket(
             &cli.socket_path,

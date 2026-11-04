@@ -296,3 +296,30 @@ fn legacy_cpu_updates_only_reduce_the_current_rate() {
     std::fs::remove_file(path).unwrap();
     cpu_quota_is_nonincreasing_at(directory.path(), 1).unwrap_err();
 }
+
+#[test]
+fn sandbox_memory_headroom_scales_with_guest_memory() {
+    assert_eq!(sandbox_memory_headroom_mib(8192), 224);
+    assert_eq!(sandbox_memory_headroom_mib(16384), 256);
+    assert_eq!(DEFAULT_MEMORY_MAX_MIB, 8416);
+    assert_eq!(sandbox_guest_memory_max_mib(8416), Some(8192));
+    assert_eq!(sandbox_guest_memory_max_mib(16640), Some(16384));
+    assert_eq!(sandbox_memory_headroom_for_cgroup_mib(16640), Some(256));
+    assert_eq!(
+        sandbox_guest_memory_max_mib(SANDBOX_MEMORY_FIXED_HEADROOM_MIB),
+        Some(0)
+    );
+    assert_eq!(
+        sandbox_guest_memory_max_mib(SANDBOX_MEMORY_FIXED_HEADROOM_MIB - 1),
+        None
+    );
+}
+
+#[test]
+fn sandbox_guest_memory_max_is_largest_guest_that_fits() {
+    for cgroup_mib in SANDBOX_MEMORY_FIXED_HEADROOM_MIB..20_000 {
+        let guest_mib = sandbox_guest_memory_max_mib(cgroup_mib).unwrap();
+        assert!(guest_mib + sandbox_memory_headroom_mib(guest_mib) <= cgroup_mib);
+        assert!(guest_mib + 1 + sandbox_memory_headroom_mib(guest_mib + 1) > cgroup_mib);
+    }
+}

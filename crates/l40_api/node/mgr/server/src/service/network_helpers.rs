@@ -94,7 +94,7 @@ pub(super) fn network_pool_status_response(
         network_pool_retained_ready: config.retained_ready_slots,
         sandbox_cgroup_memory_mib: sandbox_cgroup_config.memory_mib_or_default(),
         sandbox_guest_memory_max_mib: sandbox_cgroup_config.guest_memory_max_mib(),
-        sandbox_memory_headroom_mib: crate::cgroup::DEFAULT_SANDBOX_MEMORY_HEADROOM_MIB,
+        sandbox_memory_headroom_mib: sandbox_cgroup_config.memory_headroom_mib(),
         sandbox_cgroup_total_memory_mib: sandbox_cgroup_config.total_memory_mib(config.max_slots),
     }
 }
