@@ -486,6 +486,68 @@ mod delete {
         Ok(())
     }
 
+    /// With no dispatcher the delete stays queued, so a waiting DELETE would
+    /// poll for the full budget; `Prefer: respond-async` answers once the
+    /// operation is recorded.
+    #[tokio::test]
+    async fn respond_async_delete_is_accepted_once_recorded() -> TestResult {
+        use axum::extract::{Path, State};
+        use pplx_space_common_core::types::UserId;
+        use pplx_space_db_test_fixtures::{SEED_USER_ID, insert_suspended_sandbox};
+
+        use crate::{middleware::auth::AuthOrg, models::Organization, routes::AppState};
+
+        let db = pg_test_db().await?;
+        let org_id = OrgId::from_uuid(SEED_ORG_ID);
+        let sandbox =
+            insert_suspended_sandbox(&db.pool, org_id, UserId::from_uuid(SEED_USER_ID)).await?;
+        let sandbox_id = PublicSandboxId::from(sandbox);
+        let now = time::OffsetDateTime::now_utc();
+        let org = Organization {
+            id: org_id,
+            name: "ECW delete test".to_string(),
+            slug: "ecw-delete-test".to_string(),
+            parent_id: None,
+            theme_primary: None,
+            theme_secondary: None,
+            logo_url: None,
+            byok_enabled: false,
+            snapshot_base_object_storage_uri: None,
+            created_at: now,
+            updated_at: now,
+        };
+
+        let started = std::time::Instant::now();
+        let status = delete_sandbox(
+            State(AppState::from_pool(db.pool.clone()).await?),
+            Extension(AuthOrg(org)),
+            None,
+            Path(sandbox.to_string()),
+            headers(&[("prefer", "respond-async")]),
+        )
+        .await
+        .map_err(|error| error.status);
+        assert_eq!(status, Ok(StatusCode::ACCEPTED));
+        assert!(started.elapsed() < DELETE_OPERATION_WAIT / 2);
+
+        let store = PublicOperationStore::new(db.pool.clone());
+        let payload = SandboxLifecycleOperationPayload {
+            sandbox_id,
+            action: PublicSandboxLifecycleAction::Delete,
+            rollback: None,
+            wake_activity: None,
+        }
+        .into_json();
+        let rejoined = store
+            .create_or_join_active_sandbox_delete(org_id, &sandbox_id.to_string(), payload, None)
+            .await?;
+        assert!(
+            matches!(rejoined, CreatePublicOperationResult::Existing(_)),
+            "the delete was recorded: {rejoined:?}"
+        );
+        Ok(())
+    }
+
     #[test]
     fn respond_async_preference_skips_the_wait() {
         let prefers = |values: &[&str]| {
