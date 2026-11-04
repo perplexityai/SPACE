@@ -176,10 +176,12 @@ reviews:
     - deleted or weakened tests, assertions, CI checks, or guards.
 
     At least high:
-    - a change to a contract docs/versioning.md promises to keep compatible
-      (native HTTP API, node-api, spaced-bridge): documented behavior, request
-      and response shapes, errors, streaming, authentication requirements,
-      lifecycle semantics, or an endpoint;
+    - a change to anything docs/versioning.md promises to keep compatible:
+      the native HTTP API, node-api, and spaced-bridge (documented behavior,
+      request and response shapes, errors, streaming, authentication
+      requirements, lifecycle semantics, endpoints); which guests the host
+      admits and how it checks their readiness; and whether existing
+      templates, sandboxes, and snapshots stay runnable and restorable;
     - a breaking protobuf or storage contract change;
     - a privilege or tenant-isolation change;
     - a change to what a statement writing sandboxes.lifecycle does, or to a
