@@ -48,9 +48,10 @@ use super::{
     file_upload_capability_org, file_upload_signing_secret, mint_file_upload_query,
     parse_metadata_query, parse_state_filter, path_root_router_with_ecw_hosts, request_client_id,
     sandbox_metadata, sandbox_template_id, should_ensure_usable_pod_on_connect,
-    should_touch_on_connect, should_wake_on_connect, terminal_sandbox_error,
-    translate_create_request, translate_sandbox_state, validate_connect_request,
-    validate_list_query, validate_pause_request, validate_refresh_request, validate_resume_request,
+    should_touch_on_connect, should_wake_on_connect, teardown_lifecycle_connect_error,
+    terminal_sandbox_error, translate_create_request, translate_sandbox_state,
+    validate_connect_request, validate_list_query, validate_pause_request,
+    validate_refresh_request, validate_resume_request,
 };
 use crate::{
     controllers::sandbox::AutoLifecycleTouchOutcome,
@@ -3267,6 +3268,25 @@ fn connect_touch_recovery_does_not_wake_teardown_state() {
     }
 }
 
+/// Connect re-reads the row before a retried touch: both delete tombstones
+/// are gone there too, while a teardown still in flight is not ready yet.
+#[test]
+fn connect_teardown_check_answers_tombstones_not_found() {
+    for (lifecycle, expected) in [
+        ("deleted", StatusCode::NOT_FOUND),
+        ("cleanup_required", StatusCode::NOT_FOUND),
+        ("stopping", StatusCode::CONFLICT),
+        ("deleting", StatusCode::CONFLICT),
+    ] {
+        let mut sandbox = test_sandbox();
+        sandbox.lifecycle = lifecycle.to_string();
+
+        let error = teardown_lifecycle_connect_error(&sandbox)
+            .unwrap_or_else(|| panic!("{lifecycle} must refuse connect"));
+        assert_eq!(error.status, expected, "{lifecycle}");
+    }
+}
+
 #[test]
 fn not_started_connect_touch_can_wake_refetched_paused_state() {
     let mut sandbox = test_sandbox();
@@ -3969,7 +3989,7 @@ async fn connect_route_extends_deadline_without_replacing_policy(
     "cleanup_required",
     "unplaced",
     ConnectRouteActiveNode::None,
-    StatusCode::CONFLICT,
+    StatusCode::NOT_FOUND,
 ))]
 #[case::deleted_teardown_row(ConnectRouteDbShape::error(
     "deleted teardown row",
