@@ -591,6 +591,10 @@ local_resource(
         TELEMETRY_MODE,
     ),
     deps = [TELEMETRY_SCRIPT, "infra/space/kind/scripts/install-shim.sh"] + ([OBSERVABILITY_CONFIG] if OBSERVABILITY_CONFIG else []),
+    # Parallel: as a serial resource it held every other resource for its
+    # 19 s (2026-11-03 Kind CI timelines). Only the first sandbox create needs
+    # it, which space-api's dependency on it still orders.
+    allow_parallel = True,
     labels = ["bootstrap"],
 )
 
@@ -622,9 +626,10 @@ local_resource(
 # find its lock held and wait, or find the build up to date. allow_parallel is
 # required: Tilt runs nothing else beside a serial local resource, and this one
 # runs for minutes. It waits for the serial bootstrap resources because Tilt
-# holds those while anything else is building.
+# holds those while anything else is building; install-space-shim runs in
+# parallel, so it is not one of them.
 RUST_ARTIFACTS_AFTER = ["label-kind-workers", "label-kind-infra", "sandbox-ssh-secret",
-                        "internal-rpc-tls", "check-kind-node-image", "install-space-shim"]
+                        "internal-rpc-tls", "check-kind-node-image"]
 local_resource(
     "rust-artifacts",
     cmd = RUST_ARTIFACT_BUILD,
