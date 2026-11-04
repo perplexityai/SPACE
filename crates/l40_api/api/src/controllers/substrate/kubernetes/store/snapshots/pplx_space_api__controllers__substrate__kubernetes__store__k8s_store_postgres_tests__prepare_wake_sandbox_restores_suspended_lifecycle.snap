@@ -1,0 +1,7 @@
+---
+source: crates/l40_api/api/src/controllers/substrate/kubernetes/store/k8s_store_postgres_tests.rs
+expression: "sandbox_lease_row(&fixture.pool, suspended_id).await?"
+---
+lifecycle: restoring
+evacuation_restore_target: ~
+restore_lease_token: "[lease_token]"

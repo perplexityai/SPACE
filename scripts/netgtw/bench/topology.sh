@@ -12,7 +12,7 @@
 # leave it alone.
 #
 # The nft table and the policy routing mirror `setup_netgtw_tproxy_rules` and
-# `setup_tproxy` in crates/libs/node/mgr/server (same table, chains, priorities,
+# `setup_tproxy` in crates/l40_api/node/mgr/server (same table, chains, priorities,
 # marks, and rule order), with one deliberate omission: the pre-TPROXY guardrail
 # chain that drops platform hard-deny CIDRs before the gateway sees them. This
 # harness wants the gateway to make that decision so the deny path is what gets

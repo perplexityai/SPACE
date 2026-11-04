@@ -107,7 +107,7 @@ local(["bash", "infra/space/kind/lib/substrate.sh", "check", KIND_CLUSTER], quie
 DIRECT = SUBSTRATE == "direct"
 # The exchange mode's credential-manager authority admits a node service by its
 # pod's Kubernetes node registration (`node_k8s`; check_node_registration in
-# crates/libs/credential/mgr/server/src/k8s_identity.rs), which a Direct node
+# crates/l40_api/credmgr/server/src/k8s_identity.rs), which a Direct node
 # does not have, so every template pull would be refused.
 if DIRECT and STORAGE_CREDENTIALS != "static":
     fail("SPACE_KIND_SUBSTRATE=direct needs SPACE_KIND_STORAGE_CREDENTIALS=static; see \"Direct substrate lane\" in infra/space/kind/README.md")

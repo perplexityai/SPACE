@@ -32,7 +32,7 @@ A warm pool is for one **template release** and one VM size (vCPU and memory).
 
 ### With `space-admin-cli`
 
-[Install and log in](../crates/apps/admin/cli/README.md), then run:
+[Install and log in](../crates/l50_app/admin/cli/README.md), then run:
 
 ```bash
 space-admin-cli warm-pool create \
@@ -186,7 +186,7 @@ Upgrade every `space-cluster-controller` replica before turning this on; see
 
 ## Learn more
 
-- [Operator CLI](../crates/apps/admin/cli/README.md): `warm-pool update`,
+- [Operator CLI](../crates/l50_app/admin/cli/README.md): `warm-pool update`,
   `get` and `--disabled`.
 - [Observability](observability.md): the `warm_pool.slots` and
   `warm_pool.create_path.duration_ms` metrics show pool size and hits.

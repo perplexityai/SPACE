@@ -69,7 +69,7 @@ Read only the references that match the task:
 - Delete dead code instead of adding `#[allow(dead_code)]`.
 - The common service initializer (`init_service` in
   `crates/libs/common/svc/src/lib.rs`, which installs the notifier from
-  `crates/libs/systemd-watchdog`) arms the systemd watchdog before slow
+  `crates/l10_foundation/systemd/watchdog`) arms the systemd watchdog before slow
   startup work and sends an initial notification immediately. Keep that
   ordering when refactoring startup code; direct deployments run
   `WatchdogSec=30s` (also noted in the `$space-validation` local-development

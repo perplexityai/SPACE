@@ -3530,7 +3530,7 @@ class TemplateCacheAssertions:
 # once it has, and gives up well inside one prefetch interval.
 # template-manager's pull latency as the bench's Prometheus names it, and the
 # results that leave the build on disk (`outcome_label` in
-# crates/libs/template/mgr/src/volume.rs).
+# crates/l40_api/template/mgr/server/src/volume.rs).
 TEMPLATE_PULL_DURATION_METRIC = "space_template_pull_duration_milliseconds"
 ON_DEMAND_PULL_RESULTS = "materialized|coalesced|recovered"
 # A count read back from the bench's Prometheus has settled once it holds
@@ -4214,7 +4214,7 @@ class SuspendCodecAssertions:
     ) -> RestoreFailure:
         """sbx-manager's `snapshot_restore_failed` event names the stage and cause the scenario forced.
 
-        The event is a documented contract (`crates/libs/events/README.md`:
+        The event is a documented contract (`crates/l20_domain/events/README.md`:
         consumers match `error_kind`), and the cause is what these scenarios
         exist to prove: the client sees only that the restore failed, and the
         node-local row's `failure_reason` is free text. Polled until a
@@ -4743,7 +4743,7 @@ def _expect_snapshot_restore_from_object_storage(
     runs on another node. The annotation says what the API planned, not
     where the bytes came from, so the provenance is read from sbx-manager's
     `runtime_activated` event for the landed generation — a documented
-    contract (`crates/libs/events/README.md`): polled for, judged on its
+    contract (`crates/l20_domain/events/README.md`): polled for, judged on its
     fields, never on its absence or count. The caller proves the bytes by
     reading back the state the sandbox wrote before it was suspended.
     """

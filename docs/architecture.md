@@ -48,7 +48,7 @@ compatible with these requests and replies.
 
 The API records desired state in PostgreSQL. Controllers and worker services reconcile the running system with that state, so an accepted request is not a readiness signal.
 
-SPACE can manage workers directly or through Kubernetes. The [direct adapter](../crates/libs/api/src/controllers/substrate/direct.rs) calls worker services without creating Kubernetes sandbox pods. The [Kubernetes adapter](../crates/libs/api/src/controllers/substrate/kubernetes/mod.rs) is used by the local Kind installation in these guides.
+SPACE can manage workers directly or through Kubernetes. The [direct adapter](../crates/l40_api/api/src/controllers/substrate/direct.rs) calls worker services without creating Kubernetes sandbox pods. The [Kubernetes adapter](../crates/l40_api/api/src/controllers/substrate/kubernetes/mod.rs) is used by the local Kind installation in these guides.
 
 ### Local Kind topology
 

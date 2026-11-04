@@ -16,7 +16,7 @@
 #
 # The status's `stale` flag is not the test. It says only that the node
 # published something recently, within a window derived from node-ctl's poll
-# interval (crates/libs/node/api/client/src/node_status_freshness.rs), not that
+# interval (crates/l40_api/node/api/client/src/node_status_freshness.rs), not that
 # it sent a census. Freshness here is
 # the window the API itself trusts a node's census for
 # (CENSUS_INVENTORY_MAX_AGE, five minutes, which is five default polls;

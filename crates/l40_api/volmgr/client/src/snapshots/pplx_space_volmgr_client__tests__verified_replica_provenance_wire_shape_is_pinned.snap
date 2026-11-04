@@ -1,0 +1,16 @@
+---
+source: crates/l40_api/volmgr/client/src/lib.rs
+assertion_line: 576
+expression: "serde_json::to_string_pretty(&provenance).unwrap()"
+---
+{
+  "version": 1,
+  "subject_id": "sandbox:019d84bd-280d-7331-99c6-b63377f3a3a2",
+  "s3_uri": "s3://bucket/snapshots/a/memfile?region=us-east-2",
+  "raw": false,
+  "file_mode": 384,
+  "snapshot_artifact": "memory",
+  "object_size": 17,
+  "object_etag": "\"etag-a\"",
+  "local_size": 4096
+}

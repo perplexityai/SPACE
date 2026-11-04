@@ -13,8 +13,8 @@ telemetry: {}
 node: {}
 
 # node-ctl waits up to 25 s for its worker on SIGTERM, then exits holding its
-# service mutex if it overran (crates/libs/node/ctl/server/src/lib.rs); the
-# shared lifecycle default grace (crates/libs/service-lifecycle/src/lib.rs).
+# service mutex if it overran (crates/l40_api/node/ctl/server/src/lib.rs); the
+# shared lifecycle default grace (crates/l10_foundation/service/lifecycle/src/lib.rs).
 terminationGracePeriodSeconds: 60
 
 # Kind sizing: requests only (see space-node-manager-local/values.yaml).

@@ -78,7 +78,7 @@ LABELS=()
 if ((${#REVS[@]} == 0)); then
   note "building the working tree"
   as_builder cargo build --manifest-path "$REPO/Cargo.toml" --release \
-    -p pplx-space-netgtw-bench >&2
+    -p pplx-space-net-gateway-bench >&2
   BINARIES+=("$REPO/target/release/netgtw-bench")
   LABELS+=("working-tree")
 else

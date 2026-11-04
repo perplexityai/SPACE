@@ -1,0 +1,8 @@
+---
+source: crates/l40_api/api/src/controllers/substrate/kubernetes/store/k8s_store_postgres_tests.rs
+expression: "execution_by_generation_row(&fixture.pool, sandbox_id, generation).await?"
+---
+lifecycle: started
+state: recovery_failed
+active: true
+pod_uid: late-pod-uid

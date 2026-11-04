@@ -262,7 +262,7 @@ sbxmgr_assert_direct_dependents() {
     local allowed=" $* "
     local graph dependent
     local unexpected=()
-    graph="$(cargo tree --locked -p pplx-space-sbx-mgr -p pplx-space-sbxmgr-svc \
+    graph="$(cargo tree --locked -p pplx-space-sbx-mgr -p pplx-space-sbx-mgr-svc \
         "${feature_args[@]}" -e normal -i "${package}" --depth 1 --prefix none)"
     while read -r dependent; do
         if [[ "${allowed}" != *" ${dependent} "* ]]; then
@@ -288,8 +288,8 @@ run_sbxmgr_production_checks() {
     local target_dir="$1"
     local sbxmgr_feature_sets=(
         ""
-        "pplx-space-sbxmgr-svc/otel,pplx-space-sbxmgr-svc/datadog"
-        "pplx-space-sbxmgr-svc/otel,pplx-space-sbxmgr-svc/datadog,pplx-space-sbxmgr-svc/test-hooks"
+        "pplx-space-sbx-mgr-svc/otel,pplx-space-sbx-mgr-svc/datadog"
+        "pplx-space-sbx-mgr-svc/otel,pplx-space-sbx-mgr-svc/datadog,pplx-space-sbx-mgr-svc/test-hooks"
     )
     local sbxmgr_features sbxmgr_feature_args sbxmgr_graph
     for sbxmgr_features in "${sbxmgr_feature_sets[@]}"; do
@@ -302,7 +302,7 @@ run_sbxmgr_production_checks() {
             --locked \
             -p pplx-space-sbx-mgr-store \
             -p pplx-space-sbx-mgr \
-            -p pplx-space-sbxmgr-svc \
+            -p pplx-space-sbx-mgr-svc \
             -p pplx-space-db-migrate \
             -p pplx-space-db-migrator \
             "${sbxmgr_feature_args[@]}" \
@@ -310,7 +310,7 @@ run_sbxmgr_production_checks() {
             -- \
             -D warnings
         sbxmgr_graph="$(cargo tree --locked \
-            -p pplx-space-sbx-mgr -p pplx-space-sbxmgr-svc \
+            -p pplx-space-sbx-mgr -p pplx-space-sbx-mgr-svc \
             -p pplx-space-db-migrate -p pplx-space-db-migrator \
             "${sbxmgr_feature_args[@]}" \
             -e normal,features --prefix none)"

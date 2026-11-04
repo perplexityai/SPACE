@@ -20,7 +20,7 @@ spec.loader.exec_module(audit)
 def broad_reply_bypasses():
     # Real nft output exercises the same input normalization as reconciliation.
     fixture = (
-        ROOT / "crates/libs/node/mgr/server/src/fixtures/live_inbound_reply_chain.json"
+        ROOT / "crates/l40_api/node/mgr/server/src/fixtures/live_inbound_reply_chain.json"
     )
     forward = json.loads(fixture.read_text())["nftables"]
     rule = next(entry["rule"] for entry in forward if "rule" in entry)

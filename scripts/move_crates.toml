@@ -7,7 +7,7 @@
 # reviewed reason.
 
 [crates]
-# l10_foundation (48)
+# l10_foundation (49)
 "pplx-space-aws-client" = { to = "crates/l10_foundation/aws/client" }
 "pplx-space-bearer-token" = { to = "crates/l10_foundation/bearer/token" }
 "pplx-space-btrfs" = { to = "crates/l10_foundation/btrfs" }
@@ -29,6 +29,7 @@
 "pplx-space-feature-flags" = { to = "crates/l10_foundation/feature/flags" }
 "pplx-space-grpc-metrics" = { to = "crates/l10_foundation/grpc/metrics" }
 "pplx-space-grpc-rate-limiter" = { to = "crates/l10_foundation/grpc/rate/limiter" }
+"pplx-space-guest-capability" = { to = "crates/l10_foundation/guest/capability" }
 "pplx-space-http-server" = { to = "crates/l10_foundation/http/server" }
 "pplx-space-k8s-ids" = { to = "crates/l10_foundation/k8s/ids" }
 "pplx-space-kube-client" = { to = "crates/l10_foundation/kube/client" }
@@ -101,7 +102,7 @@
 "pplx-space-sbx-mgr-store" = { to = "crates/l30_storage/sbx/mgr/store" }
 "pplx-space-snapshot-storage" = { to = "crates/l30_storage/snapshot/storage" }
 "pplx-space-snapshot-store" = { to = "crates/l30_storage/snapshot/store" }
-# l40_api (39)
+# l40_api (42)
 "pplx-space-api" = { to = "crates/l40_api/api" }
 "pplx-space-build-mgr-client" = { to = "crates/l40_api/build/mgr/client" }
 "pplx-space-build-mgr" = { to = "crates/l40_api/build/mgr/engine" }  # leaf: pplx-space-build-mgr-client, pplx-space-build-mgr-server nest in l40_api/build/mgr
@@ -115,6 +116,7 @@
 "pplx-space-execution-catalog" = { to = "crates/l40_api/execution/catalog" }
 "pplx-space-ingress-admission" = { to = "crates/l40_api/ingress/admission" }
 "pplx-space-internal-api-server" = { to = "crates/l40_api/internal/api/server" }
+"pplx-space-native-files" = { to = "crates/l40_api/native/files" }
 "pplx-space-net-gateway-client" = { to = "crates/l40_api/net/gateway/client" }
 "pplx-space-net-gateway" = { to = "crates/l40_api/net/gateway/server" }  # leaf: pplx-space-net-gateway-client nest in l40_api/net/gateway
 "pplx-space-node-api-client" = { to = "crates/l40_api/node/api/client" }
@@ -128,12 +130,14 @@
 "pplx-space-node-runtime-manager" = { to = "crates/l40_api/node/runtime/manager/server" }  # leaf: pplx-space-node-runtime-manager-client nest in l40_api/node/runtime/manager
 "pplx-space-node-runtime-supervisor" = { to = "crates/l40_api/node/runtime/supervisor" }
 "pplx-space-placement-executor" = { to = "crates/l40_api/placement/executor" }
+"pplx-space-public-api-http" = { to = "crates/l40_api/public/api/http" }
 "pplx-space-sbx-mgr-client" = { to = "crates/l40_api/sbx/mgr/client" }
 "pplx-space-sbx-mgr" = { to = "crates/l40_api/sbx/mgr/server" }  # leaf: pplx-space-sbx-mgr-client nest in l40_api/sbx/mgr
 "pplx-space-snapshot-retention" = { to = "crates/l40_api/snapshot/retention" }
 "pplx-space-spaced-guest-client" = { to = "crates/l40_api/spaced/guest/client" }
 "pplx-space-spaced-guest-execution" = { to = "crates/l40_api/spaced/guest/execution" }
 "pplx-space-spaced-guest-server" = { to = "crates/l40_api/spaced/guest/server" }
+"pplx-space-spaced-guest-windows" = { to = "crates/l40_api/spaced/guest/windows" }
 "pplx-space-spaced-host-client" = { to = "crates/l40_api/spaced/host/client" }
 "pplx-space-spaced-host-server" = { to = "crates/l40_api/spaced/host/server" }
 "pplx-space-template-mgr-client" = { to = "crates/l40_api/template/mgr/client" }

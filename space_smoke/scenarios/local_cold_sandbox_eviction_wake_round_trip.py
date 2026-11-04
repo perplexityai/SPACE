@@ -35,7 +35,7 @@ MARKER = "space-smoke-cold-eviction-ok"
 # What this does not reach, and where it lives instead: the never-evict
 # decision table (no ready backup; local bytes newer than the backup; an
 # unproven pin) and the disk-gate refusal need constructed node-local rows
-# and are covered by `crates/libs/sbx/mgr/server/src/sandbox_eviction/tests.rs`.
+# and are covered by `crates/l40_api/sbx/mgr/server/src/sandbox_eviction/tests.rs`.
 @smoke.scenario(
     "local.cold_sandbox_eviction_wake_round_trip",
     # The rendered minimum idle plus upload, ticks and a remote restore; the

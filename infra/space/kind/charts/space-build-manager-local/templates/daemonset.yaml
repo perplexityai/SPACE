@@ -38,7 +38,7 @@ spec:
       {{- include "space-node-service.selectorLabels" $ctx | nindent 6 }}
   # Delete first. build-manager has no service mutex: it recovers the node's
   # jobs from its SQLite database under /space/run and starts its queue
-  # before binding its listener (crates/libs/build/mgr/server/src/run.rs), so
+  # before binding its listener (crates/l40_api/build/mgr/server/src/run.rs), so
   # a second instance on the node, binding its own pod address, would run
   # the same jobs beside the first.
   {{- include "space-node-service.updateStrategy" (dict "strategy" "deleteFirst") | nindent 2 }}
@@ -58,14 +58,14 @@ spec:
       serviceAccountName: {{ include "space-node-service.name" $ctx }}
       # TokenReview needs the pod's own API credentials (the in-cluster
       # config of traced_kube_client_from_env,
-      # crates/libs/kube-client/src/lib.rs), and the allowlists name
+      # crates/l10_foundation/kube/client/src/lib.rs), and the allowlists name
       # accounts in the namespace read from the same mount (auth_namespace,
       # crates/libs/common/svc/src/auth/k8s.rs). The account may only
       # create TokenReviews (RBAC above).
       automountServiceAccountToken: true
       # Pod network: build-manager needs nothing from the node's network
       # namespace. SSH into build VMs runs inside `nsenter --net` on the VM's
-      # namespace handle (crates/libs/build/mgr/src/ssh.rs); its other peers
+      # namespace handle (crates/l40_api/build/mgr/engine/src/ssh.rs); its other peers
       # are Unix sockets, ClusterApi, the object store and registries. Its
       # one ClusterApi read that internal-api scopes by source address
       # (FindTemplateReleaseByHash, publish.rs) only checks for an existing
@@ -74,14 +74,14 @@ spec:
       # below.
       # Host PID: after asking the guest to exit, build-manager waits for the
       # Firecracker pid sandbox-manager reports, a host-namespace pid, by
-      # checking /proc/<pid> (is_process_alive, crates/libs/build/mgr/src/vm.rs;
+      # checking /proc/<pid> (is_process_alive, crates/l40_api/build/mgr/engine/src/vm.rs;
       # the shutdown wait in lib.rs). In its own PID namespace the pid is
       # never there and the wait ends at once.
       hostPID: true
       terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds | int }}
       initContainers:
         # build-manager does not migrate its SQLite database itself
-        # (crates/libs/build/mgr/server/src/lib.rs), so its schema is applied
+        # (crates/l40_api/build/mgr/server/src/lib.rs), so its schema is applied
         # here, as root like the service, in its root-only state directory.
         - name: migrate-sqlite
           {{- include "space-node-service.image" . | nindent 10 }}
@@ -110,9 +110,9 @@ spec:
             - --listen={{ .Values.listen }}
           # Privileged root: build-manager loop-mounts the seed and target
           # images and bind-mounts containerd snapshots to assemble OCI
-          # rootfs (crates/libs/build/mgr/src/oci/{assembly,containerd}.rs),
+          # rootfs (crates/l40_api/build/mgr/engine/src/oci/{assembly,containerd}.rs),
           # drives the node's containerd, and enters build VMs' network
-          # namespaces to SSH in (crates/libs/build/mgr/src/ssh.rs).
+          # namespaces to SSH in (crates/l40_api/build/mgr/engine/src/ssh.rs).
           securityContext:
             privileged: true
           env:
@@ -125,7 +125,7 @@ spec:
             # The BuildManager listener's TLS identity
             # (space-builder-build-manager, docs/internal-rpc-tls.md).
             {{- include "space-node-service.env.rpcIdentity" . | nindent 12 }}
-            # Still required at startup (run, crates/libs/build/mgr/server/src/run.rs),
+            # Still required at startup (run, crates/l40_api/build/mgr/server/src/run.rs),
             # but with Kubernetes auth on it admits no caller (BuildAuthenticator,
             # auth/build.rs).
             {{- include "space-node-service.env.internalToken" . | nindent 12 }}
@@ -148,10 +148,10 @@ spec:
             # No object-store keys: template publication and build-input
             # transfers exchange a session scoped to their release prefix or
             # input object (object_store_credentials,
-            # crates/libs/build/mgr/src/object_store.rs) with the authority
+            # crates/l40_api/build/mgr/engine/src/object_store.rs) with the authority
             # itself, as deployed. Not through the node agent: its sockets
             # admit only volume-manager and template-manager to ExchangeToken
-            # (effective_actor, crates/libs/credential/mgr/server/src/storage_exchange.rs),
+            # (effective_actor, crates/l40_api/credmgr/server/src/storage_exchange.rs),
             # and the authority admits build-manager directly
             # (ALLOW_EXCHANGE_TOKEN_SERVICES, service.rs) under the
             # ServiceAccount its chart maps (space-credmgr-authority-local).
@@ -196,7 +196,7 @@ spec:
           volumeMounts:
             {{- include "space-node-service.mount.run" . | nindent 12 }}
             # Registers each built template and release through ClusterApi
-            # (crates/libs/build/mgr/src/publish.rs).
+            # (crates/l40_api/build/mgr/engine/src/publish.rs).
             {{- include "space-node-service.mount.clusterApiToken" . | nindent 12 }}
             {{- include "space-node-service.mount.rpcCa" . | nindent 12 }}
             {{- include "space-node-service.mount.rpcIdentity" . | nindent 12 }}
@@ -206,7 +206,7 @@ spec:
             # HostToContainer: build-manager's OCI-rootfs, assembly and
             # snapshot-view mounts under /space/cache/firecracker/builds must
             # stay in this pod's mount namespace, never in the node's mount
-            # table (crates/libs/build/mgr/src/oci/{assembly,containerd}.rs),
+            # table (crates/l40_api/build/mgr/engine/src/oci/{assembly,containerd}.rs),
             # and a slave mount never propagates outward. It must not be None:
             # that gives the pod a private copy of every mount under
             # /space/cache when it starts, encrypted snapshot volumes
@@ -215,14 +215,14 @@ spec:
             {{- include "space-node-service.mount.cache" (dict) | nindent 12 }}
             # HostToContainer: each build VM's network-namespace handle is a
             # bind mount node-manager makes on the node after build-manager
-            # started (crates/libs/node/mgr/server/src/net/linux.rs); without
+            # started (crates/l40_api/node/mgr/server/src/net/linux.rs); without
             # propagation the pod would see only the empty placeholder file and
             # `nsenter --net` into the VM would fail (build/mgr/src/ssh.rs).
             - name: netns
               mountPath: /var/run/netns
               mountPropagation: HostToContainer
             # The node's containerd: image pulls and snapshot views for OCI
-            # builds, and the scratch-build container (crates/libs/build/mgr/src/oci/containerd.rs).
+            # builds, and the scratch-build container (crates/l40_api/build/mgr/engine/src/oci/containerd.rs).
             - name: containerd-run
               mountPath: /run/containerd
             - name: containerd-lib
@@ -264,7 +264,7 @@ spec:
 # carries (space-builder-build-manager, internal-rpc-tls.sh). Local: jobs live
 # in the node's SQLite under /space/run, and node-api stamps its own node as
 # the builder, so a call must never reach another node's build-manager
-# (crates/libs/node/api/server/src/builder.rs).
+# (crates/l40_api/node/api/server/src/builder.rs).
 apiVersion: v1
 kind: Service
 metadata:

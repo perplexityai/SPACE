@@ -1,0 +1,39 @@
+[package]
+name = "pplx-space-template-mgr-svc"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "space-tmplmgr-svc"
+path = "src/main.rs"
+
+[features]
+default = []
+otel = [
+    "pplx-space-common-svc/otel",
+    "pplx-space-template-mgr/otel",
+]
+datadog = [
+    "otel",
+    "pplx-space-common-svc/datadog",
+    "pplx-space-template-mgr/datadog",
+]
+# Deprecated for one release; use otel and datadog.
+datadog-otel = ["otel", "datadog"]
+# Compiles in the test-only environment hooks; never enabled for release builds.
+test-hooks = ["pplx-space-template-mgr/test-hooks"]
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true, features = ["derive"] }
+
+# internal
+pplx-space-common-svc = { workspace = true }
+pplx-space-template-mgr = { workspace = true }

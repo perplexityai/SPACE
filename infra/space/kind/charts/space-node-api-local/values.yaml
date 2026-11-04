@@ -15,7 +15,7 @@ node: {}
 
 # A stable DNS name for "some" node-api of this role. The builder's
 # `space-builder-node-api:9800` is the API's build dispatch target
-# (crates/libs/api/src/controllers/substrate/kubernetes/pod_ops/worker_clients.rs);
+# (crates/l40_api/api/src/controllers/substrate/kubernetes/pod_ops/worker_clients.rs);
 # sandbox traffic goes to each pod's host_ip:9800 instead.
 serviceName: space-worker-node-api
 
@@ -28,13 +28,13 @@ auth:
   # WorkerApi and NodeInfo (audience space-node-api). The api's substrate,
   # which the shared and admin api surfaces and the cluster-controller's
   # operation dispatcher, warm-pool probe and trigger fan-out all run
-  # (crates/libs/api/src/controllers/substrate/mod.rs, substrate/kubernetes/,
-  # crates/libs/cluster/reconciler/src/trigger_fanout.rs); the data plane's
-  # guest calls (crates/libs/data/plane/server/src/native/protocol.rs);
+  # (crates/l40_api/api/src/controllers/substrate/mod.rs, substrate/kubernetes/,
+  # crates/l40_api/cluster/reconciler/src/trigger_fanout.rs); the data plane's
+  # guest calls (crates/l40_api/data/plane/server/src/native/protocol.rs);
   # internal-api's service-port routes
-  # (crates/libs/internal/api/server/src/sandbox_service_ports.rs); and
+  # (crates/l40_api/internal/api/server/src/sandbox_service_ports.rs); and
   # either role's node-api pulling a template it exports (connect_remote,
-  # crates/libs/node/api/server/src/transfer.rs).
+  # crates/l40_api/node/api/server/src/transfer.rs).
   SPACE_NODE_API_AUTH_ALLOWED_SERVICE_ACCOUNTS:
     - space-api
     - space-cluster-controller
@@ -76,7 +76,7 @@ auth:
   # auth/k8s.rs), and an empty list refuses every transfer. A pull is started
   # on the target as the api's account: its only in-tree caller, admin-api's
   # pull_node_template
-  # (crates/libs/api/src/routes/admin/node_maintenance/node_templates.rs),
+  # (crates/l40_api/api/src/routes/admin/node_maintenance/node_templates.rs),
   # answers 501 on the Kubernetes substrate (require_admin_node_registry,
   # node_maintenance.rs), so here a pull is an operator's direct PullTemplate
   # call with a space-api token. The target's node-api, of either role, then
@@ -101,12 +101,12 @@ buildManagerTokenExpirationSeconds: 7200
 
 # Builder role only: build-manager's node-local Service
 # (space-build-manager-local), whose name is the one its TLS leaf carries
-# (crates/libs/build/mgr/client/src/lib.rs).
+# (crates/l40_api/build/mgr/client/src/lib.rs).
 buildManagerEndpoint: ""
 
 # On SIGTERM node-api stops accepting connections and gives in-flight
 # requests --shutdown-grace-secs (150 s by default) to finish
-# (crates/libs/node/api/server/src/run.rs). The grace covers that budget, the
+# (crates/l40_api/node/api/server/src/run.rs). The grace covers that budget, the
 # builders' preStop delay below and exit.
 terminationGracePeriodSeconds: 180
 
@@ -117,7 +117,7 @@ terminationGracePeriodSeconds: 180
 # from the space-builder-node-api Service's endpoints concurrently. The API
 # reaches builders through that Service and does not retry a draining
 # StartBuild (start_template_build_with_retry,
-# crates/libs/api/src/controllers/template.rs), so without the delay a build
+# crates/l40_api/api/src/controllers/template.rs), so without the delay a build
 # submitted in that window fails. Workers are dialled by node IP, where a delay
 # changes nothing. A Kind value long enough for endpoint removal to propagate.
 builderPreStopSleepSeconds: 5

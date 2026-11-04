@@ -155,7 +155,7 @@ probes accept `ECONNREFUSED` or a timeout when the ICMP reply is rate-limited.
 Every sent datagram must increment the guardrail counter and none may reach
 upstream. The reply-boundary regression separately requires an isolated attempt
 to receive an explicit refusal and checks a 20-attempt burst.
-The [established-connection bypass](../../../crates/libs/node/mgr/server/src/firewall.rs)
+The [established-connection bypass](../../../crates/l40_api/node/mgr/server/src/firewall.rs)
 is restricted to reply-direction traffic so later outbound datagrams still
 reach the gateway proxy.
 

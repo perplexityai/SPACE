@@ -8,48 +8,48 @@
 # cap is reported.
 
 [pattern_ratchet.direct_tables]
-"crates/libs/api/src/controllers/sandbox/responses.rs" = 4
-"crates/libs/api/src/controllers/sandbox/spaced.rs" = 1
-"crates/libs/api/src/public_template_operations.rs" = 1
-"crates/libs/api/src/routes/admin/node_maintenance.rs" = 7
-"crates/libs/api/src/routes/admin/node_store.rs" = 1
-"crates/libs/api/src/routes/admin/templates.rs" = 1
-"crates/libs/api/src/routes/public/sandboxes.rs" = 1
-"crates/libs/cluster/controller/server/src/tombstone_retention.rs" = 2
-"crates/libs/cluster/trigger-queue/src/lib.rs" = 1
-"crates/libs/internal/api/server/src/data_plane_sessions/route_rows.rs" = 7
-"crates/libs/internal/api/server/src/data_plane_sessions/service_route_reset.rs" = 1
-"crates/libs/internal/api/server/src/lib.rs" = 1
-"crates/libs/internal/api/server/src/published_state.rs" = 4
-"crates/libs/sandbox/store/src/lib.rs" = 2
+"crates/l30_storage/cluster/trigger/queue/src/lib.rs" = 1
+"crates/l30_storage/sandbox/store/src/lib.rs" = 2
+"crates/l40_api/api/src/controllers/sandbox/responses.rs" = 4
+"crates/l40_api/api/src/controllers/sandbox/spaced.rs" = 1
+"crates/l40_api/api/src/public_template_operations.rs" = 1
+"crates/l40_api/api/src/routes/admin/node_maintenance.rs" = 7
+"crates/l40_api/api/src/routes/admin/node_store.rs" = 1
+"crates/l40_api/api/src/routes/admin/templates.rs" = 1
+"crates/l40_api/api/src/routes/public/sandboxes.rs" = 1
+"crates/l40_api/cluster/controller/server/src/tombstone_retention.rs" = 2
+"crates/l40_api/internal/api/server/src/data_plane_sessions/route_rows.rs" = 7
+"crates/l40_api/internal/api/server/src/data_plane_sessions/service_route_reset.rs" = 1
+"crates/l40_api/internal/api/server/src/lib.rs" = 1
+"crates/l40_api/internal/api/server/src/published_state.rs" = 4
 
 [pattern_ratchet.kubernetes_access]
 # Spawns the Kubernetes-only reconcilers from the bound `KubernetesSubstrate`.
-"crates/libs/cluster/controller/server/src/reconcilers.rs" = 1
+"crates/l40_api/cluster/controller/server/src/reconcilers.rs" = 1
 [pattern_ratchet.rootfs_copy]
 # Privileged builder copies are deferred; builders stay CoW.
-"crates/libs/build/mgr/src/lib.rs" = 1
-# Network configuration and process-snapshot payloads are not rootfs images.
-"crates/libs/sbx/mgr/server/src/service/grpc_spaced_process_snapshots.rs" = 1
+"crates/l40_api/build/mgr/engine/src/lib.rs" = 1
 # Non-Linux fallbacks; Linux paths use common-io's reflink helper.
-"crates/libs/node/runtime/core/src/lib.rs" = 2
-"crates/libs/template/mgr/src/service.rs" = 3
-"crates/libs/vol/mgr/server/src/staging.rs" = 2
+"crates/l40_api/node/runtime/core/src/lib.rs" = 2
+"crates/l40_api/template/mgr/server/src/service.rs" = 3
+"crates/l40_api/volmgr/server/src/staging.rs" = 2
+# Network configuration and process-snapshot payloads are not rootfs images.
+"crates/l40_api/sbx/mgr/server/src/service/grpc_spaced_process_snapshots.rs" = 1
 
 [pattern_ratchet.node_manager_commands]
 # The namespace runner's std::Command parameter is the bounded fork exception.
-"crates/libs/node/mgr/server/src/host_command.rs" = 1
-"crates/libs/node/mgr/server/src/host_command/spawn.rs" = 2
-"crates/libs/node/mgr/server/src/service/artifact_fs/receive.rs" = 4
-"crates/libs/node/mgr/server/src/net/fallback.rs" = 1
+"crates/l40_api/node/mgr/server/src/host_command.rs" = 1
+"crates/l40_api/node/mgr/server/src/host_command/spawn.rs" = 2
+"crates/l40_api/node/mgr/server/src/net/fallback.rs" = 1
+"crates/l40_api/node/mgr/server/src/service/artifact_fs/receive.rs" = 4
 
 # Writers of the control-plane Postgres `sandboxes` row outside sandbox-store,
 # and their calls to sandbox-portability's assignment renderers. They move into
 # the store; lower each cap as they go.
 [pattern_ratchet.sandbox_writes]
-"crates/libs/api/src/controllers/sandbox/responses.rs" = 1
-"crates/libs/api/src/controllers/substrate/direct.rs" = 1
-"crates/libs/placement/machine/src/postgres.rs" = 1
+"crates/l30_storage/placement/src/postgres.rs" = 1
+"crates/l40_api/api/src/controllers/sandbox/responses.rs" = 1
+"crates/l40_api/api/src/controllers/substrate/direct.rs" = 1
 
 # No code outside the store names sbx-mgr's migrations or database path; the
 # database migrator takes them from the store.
@@ -356,19 +356,19 @@ postgres = [
 # as `common`, `utils` or `core`) to its member path. Only remove entries: a pull
 # request that adds one is reported, and fails the check.
 [crate_names]
-pplx-space-common-cli = "crates/libs/common/cli"
-pplx-space-common-connection-admission = "crates/libs/common/connection/admission"
+pplx-space-common-cli = "crates/l10_foundation/common/cli"
+pplx-space-common-connection-admission = "crates/l10_foundation/common/connection/admission"
 pplx-space-common-core = "crates/libs/common/core"
-pplx-space-common-grpc = "crates/libs/common/grpc"
-pplx-space-common-grpc-lb = "crates/libs/common/grpc-lb"
-pplx-space-common-io = "crates/libs/common/io"
-pplx-space-common-jobs = "crates/libs/common/jobs"
-pplx-space-common-lru-reaper = "crates/libs/common/lru-reaper"
-pplx-space-common-proto-build = "crates/libs/common/proto-build"
+pplx-space-common-grpc = "crates/l10_foundation/common/grpc/transport"
+pplx-space-common-grpc-lb = "crates/l10_foundation/common/grpc/lb"
+pplx-space-common-io = "crates/l10_foundation/common/io"
+pplx-space-common-jobs = "crates/l10_foundation/common/jobs"
+pplx-space-common-lru-reaper = "crates/l10_foundation/common/lru/reaper"
+pplx-space-common-proto-build = "crates/l10_foundation/common/proto/build"
 pplx-space-common-svc = "crates/libs/common/svc"
-pplx-space-common-work-coalescer = "crates/libs/common/work-coalescer"
-pplx-space-credential-injection-core = "crates/libs/credential/injection/core"
-pplx-space-execution-common = "crates/libs/execution/common"
-pplx-space-net-common = "crates/libs/net/common"
-pplx-space-node-runtime-core = "crates/libs/node/runtime/core"
-pplx-space-spaced-common = "crates/libs/spaced/common"
+pplx-space-common-work-coalescer = "crates/l10_foundation/common/work/coalescer"
+pplx-space-credential-injection-core = "crates/l20_domain/credential/injection/core"
+pplx-space-execution-common = "crates/l20_domain/execution/common"
+pplx-space-net-common = "crates/l20_domain/net/common"
+pplx-space-node-runtime-core = "crates/l40_api/node/runtime/core"
+pplx-space-spaced-common = "crates/l20_domain/spaced/common"

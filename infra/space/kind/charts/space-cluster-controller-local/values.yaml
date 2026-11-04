@@ -125,7 +125,7 @@ reconcilers:
   # smoke deployments independent of that default; setting it to false leaves
   # CreateSandbox returning 202 with the operation `queued` forever. The tick,
   # claim limit and claim staleness are test hooks
-  # (crates/libs/cluster/controller/server/src/public_operation_dispatcher.rs)
+  # (crates/l40_api/cluster/controller/server/src/public_operation_dispatcher.rs)
   # left at their release values, so Kind picks up queued operations on the
   # deployed 25 ms tick. Execution concurrency is a deployment setting.
   publicOperationDispatcher:
@@ -136,7 +136,7 @@ reconcilers:
   # them so. Each moves a sandbox row back to `suspended` only when no
   # execution or pod is left and a restorable snapshot is ready, after a
   # minimum age: 180 s for failed rows (MIN_AGE_SECS,
-  # crates/libs/cluster/controller/server/src/failed_restorable_repair/mod.rs),
+  # crates/l40_api/cluster/controller/server/src/failed_restorable_repair/mod.rs),
   # 300 s for started ones (DEFAULT_MIN_AGE_SECS, started_sandbox_repair/mod.rs).
   # Rendered explicitly so the chart says what runs.
   failedRestorableRepair:
@@ -183,7 +183,7 @@ reconcilers:
       SPACE_KUBE_NODE_SYNC_ENABLED: "true"
   # Transient-lifecycle sweeper: cluster-wide backstop for sandbox rows
   # wedged in a transient lifecycle (ReconcilerConfig::from_env,
-  # crates/libs/cluster/controller/server/src/transient_lifecycle_sweeper/mod.rs).
+  # crates/l40_api/cluster/controller/server/src/transient_lifecycle_sweeper/mod.rs).
   # The binary ships it off; deployments run it on with minutes-scale ages,
   # and so does Kind:
   # - `restoring` rows are failed after 600 s, the binary's default age, sized
@@ -277,7 +277,7 @@ testHookEnv: {}
 # in this process (all off on Kind): the Kind-only fake EC2 endpoint
 # (charts/space-kind-fake-ec2), reached through the SDK's service endpoint
 # setting AWS_ENDPOINT_URL_EC2 (configured_endpoint_url,
-# crates/libs/aws/client/src/query.rs), which no S3 client reads, unlike the
+# crates/l10_foundation/aws/client/src/query.rs), which no S3 client reads, unlike the
 # global AWS_ENDPOINT_URL. `fakeEndpoint.enabled` renders that setting, the
 # internal RPC CA trust (SSL_CERT_DIR) and the pod's loopback alias for the
 # public EC2 name together: on for Kind, where a bench must not call AWS; the

@@ -1,0 +1,196 @@
+---
+source: crates/l40_api/api/src/routes/admin/docs/tests.rs
+expression: paths_by_method
+---
+{
+  "/audit-events": [
+    "get"
+  ],
+  "/cluster": [
+    "get",
+    "patch"
+  ],
+  "/debug/sandbox/{sandbox_id}": [
+    "get"
+  ],
+  "/nodes": [
+    "get",
+    "post"
+  ],
+  "/nodes/templates": [
+    "get"
+  ],
+  "/nodes/{node_id}": [
+    "delete",
+    "get",
+    "patch"
+  ],
+  "/nodes/{node_id}/health": [
+    "get"
+  ],
+  "/nodes/{node_id}/network-policy:reconcile": [
+    "post"
+  ],
+  "/nodes/{node_id}/sandboxes": [
+    "get"
+  ],
+  "/nodes/{node_id}/template-pulls": [
+    "post"
+  ],
+  "/nodes/{node_id}/templates/{template_name}": [
+    "delete"
+  ],
+  "/nodes/{node_id}:cordon": [
+    "post"
+  ],
+  "/nodes/{node_id}:drain": [
+    "post"
+  ],
+  "/nodes/{node_id}:force-upload-local-snapshots": [
+    "post"
+  ],
+  "/nodes/{node_id}:terminate": [
+    "post"
+  ],
+  "/nodes/{node_id}:uncordon": [
+    "post"
+  ],
+  "/nodes/{node_id}:undrain": [
+    "post"
+  ],
+  "/nodes:reconcile": [
+    "post"
+  ],
+  "/nodes:refresh-status": [
+    "post"
+  ],
+  "/operations": [
+    "get"
+  ],
+  "/operations/{operation_id}": [
+    "get"
+  ],
+  "/orgs": [
+    "get",
+    "post"
+  ],
+  "/orgs/{org_id}": [
+    "delete",
+    "get",
+    "patch"
+  ],
+  "/orgs/{org_id}/api-keys": [
+    "get",
+    "post"
+  ],
+  "/orgs/{org_id}/api-keys/{api_key_id}": [
+    "delete"
+  ],
+  "/orgs/{org_id}/master-key": [
+    "get"
+  ],
+  "/orgs/{org_id}/users": [
+    "get",
+    "post"
+  ],
+  "/runtime-environments": [
+    "get"
+  ],
+  "/runtime-environments/default": [
+    "put"
+  ],
+  "/runtime-environments/nodes": [
+    "get"
+  ],
+  "/runtime-environments/population": [
+    "get"
+  ],
+  "/runtime-environments/{environment_ref}/state": [
+    "put"
+  ],
+  "/sandboxes": [
+    "get",
+    "post"
+  ],
+  "/sandboxes/spaced-versions": [
+    "get"
+  ],
+  "/sandboxes/{sandbox_id}": [
+    "get",
+    "patch"
+  ],
+  "/sandboxes/{sandbox_id}/snapshots": [
+    "get"
+  ],
+  "/sandboxes/{sandbox_id}/terminal-sessions": [
+    "post"
+  ],
+  "/sandboxes/{sandbox_id}:force-{action}": [
+    "post"
+  ],
+  "/system-templates/{template}/builds": [
+    "post"
+  ],
+  "/template-releases": [
+    "get"
+  ],
+  "/template-releases/{release_id}": [
+    "delete"
+  ],
+  "/template-releases/{release_id}/tag": [
+    "put"
+  ],
+  "/template-releases/{release_id}/tags/{tag}": [
+    "delete"
+  ],
+  "/templates": [
+    "get",
+    "post"
+  ],
+  "/templates/{template_name}": [
+    "delete",
+    "get",
+    "patch"
+  ],
+  "/templates/{template_name}/base-snapshot-policy": [
+    "get",
+    "patch"
+  ],
+  "/templates/{template_name}/base-snapshot-policy:reconcile": [
+    "post"
+  ],
+  "/templates/{template_name}/builds": [
+    "get",
+    "post"
+  ],
+  "/templates/{template_name}/builds/{job_id}": [
+    "get"
+  ],
+  "/templates/{template_name}/pool": [
+    "delete",
+    "get",
+    "post"
+  ],
+  "/users/{user_id}": [
+    "delete",
+    "get",
+    "patch"
+  ],
+  "/users/{user_id}/role": [
+    "put"
+  ],
+  "/warm-pool-policies": [
+    "get",
+    "put"
+  ],
+  "/warm-pool-policy-capabilities": [
+    "get"
+  ],
+  "/warm-pools": [
+    "get",
+    "put"
+  ],
+  "/warm-pools/{pool_id}": [
+    "delete"
+  ]
+}

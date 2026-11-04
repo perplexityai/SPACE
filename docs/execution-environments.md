@@ -137,7 +137,7 @@ cold boot, even if another VMM can read the memory-state format.
 
 Today, bound snapshots require their exact qualified environment. The legacy
 Firecracker loader predicate in
-[`runtime_inventory.rs`](../crates/libs/node/runtime/core/src/runtime_inventory.rs)
+[`runtime_inventory.rs`](../crates/l40_api/node/runtime/core/src/runtime_inventory.rs)
 requires the same format name and major version, with the snapshot's minor
 version no greater than the loader's; patch versions do not affect that check.
 Passing this predicate alone does not authorize cross-environment restore.
@@ -303,7 +303,7 @@ work. Keeping this publication separate isolates protocol errors from censuses.
 ## Canonical identity and stored representation
 
 The schema-1 canonical encoding is defined by
-[`canonical_descriptor`](../crates/libs/execution/common/src/environment.rs)
+[`canonical_descriptor`](../crates/l20_domain/execution/common/src/environment.rs)
 and the independent [E0 golden vector](../proto/execution/v1/fixtures/e0.canonical).
 It uses UTF-8 ASCII text, a domain separator, schema version, fixed field order,
 canonical scalar spellings, and a final LF. Identifiers exclude delimiters and
@@ -441,7 +441,7 @@ of existing data.
 Schema anchors:
 [`PostgreSQL baseline`](../db/postgres/20261002070625_baseline.up.sql),
 [`runtime-manager artifact operations`](../db/runtime-manager/20261012064915_artifact_operations.up.sql),
-[`durable operation payloads`](../crates/libs/node/runtime/manager/server/src/installs/operations.rs),
+[`durable operation payloads`](../crates/l40_api/node/runtime/manager/server/src/installs/operations.rs),
 [`execution protocol`](../proto/execution/v1/execution.proto), and
 [`artifact diagnostics protocol`](../proto/node/runtime/manager/v1/manager.proto).
 
@@ -1149,7 +1149,7 @@ discards its memory, so it needs everything above whether or not the state
 format changes; E0 → Firecracker 1.17.0 / Linux 6.1.155 also changes it, from
 9.0.0 to 12.0.0. The compiled catalog records which of these same-kernel
 cold-boot moves are certified, as upgrade edges. `CERTIFIED_UPGRADE_EDGES` in
-`crates/libs/execution/catalog/src/catalog/environment.rs` lists them, and
+`crates/l40_api/execution/catalog/src/catalog/environment.rs` lists them, and
 `CompiledEnvironment::upgrade_targets` exposes each environment's targets.
 Listing a pair is the certification decision. An edge must change the runtime,
 and its target must pass the environment-level cold-boot source check
@@ -1275,7 +1275,7 @@ On Kubernetes, the control plane can decide a runtime upgrade when a stopped
 sandbox starts or a suspended one resumes, before it dispatches the activation.
 `SPACE_RUNTIME_UPGRADE_AT_ACTIVATION_ENABLED` turns it on; it's off by default,
 and off, every start and restore proceeds as recorded. The decision lives in
-`crates/libs/api/src/controllers/substrate/runtime_upgrade.rs`, and the
+`crates/l40_api/api/src/controllers/substrate/runtime_upgrade.rs`, and the
 Kubernetes substrate runs it from its stopped-start path and from every
 restore into the started lifecycle: user resumes, connect-time wakes and
 started recovery. A drain's evacuation restore keeps the sandbox's
@@ -1380,7 +1380,7 @@ While `SPACE_INTERNAL_API_RUNTIME_PROVISIONING_RECIPE_ENABLED` is on, the cluste
 API assigns workers and builders in the provisioning cohort a recipe of every
 environment in the `runtime_environments` catalog that isn't retired, read
 through the catalog store in
-`crates/libs/execution/runtime-environment-catalog-store`. Each row is an
+`crates/l30_storage/runtime/environment/catalog/store`. Each row is an
 environment a node build has published as certified, and an operator retires
 one by setting `retired_at`. Nothing records node publishes in the catalog yet,
 so until that writer lands an enabled cohort receives an empty recipe and

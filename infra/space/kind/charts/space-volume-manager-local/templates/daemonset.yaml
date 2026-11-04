@@ -32,7 +32,7 @@ spec:
       # The volume-manager account: space-volmgr (UID 964) with
       # SPACE_VOLUME_MANAGER_GROUPS, the production shape. node-manager's
       # btrfs send-lease RPCs authorize this principal and no other
-      # (crates/libs/node/mgr/server/src/service/btrfs_send_transport.rs), so
+      # (crates/l40_api/node/mgr/server/src/service/btrfs_send_transport.rs), so
       # deferred btrfs-send capture depends on it. Credentials come through
       # credential-manager's volume socket, the only listener that admits this
       # identity (docs/installation.md, "Volume-manager identity and
@@ -43,7 +43,7 @@ spec:
         {{- include "space-node-service.runAs" (dict "ctx" . "user" "SPACE_VOLMGR" "groups" "SPACE_VOLUME_MANAGER_GROUPS") | nindent 8 }}
       initContainers:
         # sandbox-manager and template-manager reach the socket through
-        # space-sbxclients (crates/libs/vol/mgr/server/src/run.rs).
+        # space-sbxclients (crates/l40_api/volmgr/server/src/run.rs).
         {{- include "space-node-service.prepareRunDir" (dict "ctx" . "path" "/space/run/volume-manager" "mode" "0750"
             "uid" (include "space-node-service.identityNumber" (dict "ctx" . "name" "SPACE_VOLMGR_UID"))
             "gid" (include "space-node-service.groupId" (dict "ctx" . "name" "space-sbxclients"))) | nindent 8 }}
@@ -54,26 +54,26 @@ spec:
             - /opt/space/bin/space-volmgr-svc
             - --health-socket={{ include "space-node-service.healthSocket" $ctx }}
           # File transfers only: no mounts, devices or ownership changes in
-          # the service path (crates/libs/vol/mgr/server/src/{executor,staging}.rs).
+          # the service path (crates/l40_api/volmgr/server/src/{executor,staging}.rs).
           {{- include "space-node-service.restrictedContainer" . | nindent 10 }}
           env:
             {{- include "space-node-service.env.identity" . | nindent 12 }}
             {{- include "space-node-service.env.diskAdmission" . | nindent 12 }}
             # The volume-manager identity is denied the standard credential
             # listener; it uses the volume socket credential-manager binds for
-            # it (crates/libs/credential/mgr/server/src/run/volume_socket.rs).
+            # it (crates/l40_api/credmgr/server/src/run/volume_socket.rs).
             - name: SPACE_CREDMGR_ENDPOINT
               value: unix:///space/run/volume-credentials/credmgr.sock
             {{- if eq .Values.storageCredentials "exchange" }}
             # No object-store keys, on sandbox workers and builders alike:
             # every transfer exchanges a session scoped to its one object
             # through its node's credential-manager agent
-            # (exchange_credentials, crates/libs/vol/mgr/server/src/credentials.rs),
+            # (exchange_credentials, crates/l40_api/volmgr/server/src/credentials.rs),
             # which the authority vends through STS, as deployed.
             {{- else }}
             # Static object-store credentials instead of credential-manager's
             # token exchange (the local escape hatch,
-            # crates/libs/vol/mgr/server/src/run.rs).
+            # crates/l40_api/volmgr/server/src/run.rs).
             {{- include "space-node-service.env.objectStoreCredentials" . | nindent 12 }}
             {{- end }}
             {{- $budget := .Values.streamPushBufferBudgetBytes }}

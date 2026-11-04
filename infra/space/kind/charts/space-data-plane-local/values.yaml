@@ -44,7 +44,7 @@ nodeApiTokenExpirationSeconds: 600
 # On SIGTERM the listener stops accepting and new streams are refused with a
 # retryable 503 (a native WebSocket that has not attached yet gets close 1012),
 # while streams that were already attached keep running; the process exits as
-# soon as none remain (serve_and_drain, crates/libs/data/plane/server/src/drain.rs).
+# soon as none remain (serve_and_drain, crates/l40_api/data/plane/server/src/drain.rs).
 # Streams still open after --shutdown-grace-secs are cancelled, each in the form
 # docs/architecture.md describes, and then get 5 s (STREAM_CANCEL_GRACE) before
 # the process exits regardless. Sized like the API's 150 s shutdown grace, for

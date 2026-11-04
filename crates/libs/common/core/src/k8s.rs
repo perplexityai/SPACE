@@ -264,7 +264,7 @@ pub const DEFAULT_SANDBOX_NODE_SERVICES_READY_AFFINITY: bool = false;
 /// emptiest nodes; collapsing the whole low-utilization range into a single
 /// tie-ing tier spreads them across the healthy fleet instead. Resolution is
 /// spent only in the high-usage danger zone, where the disk-gated reclaim loops
-/// (`crates/libs/sbx/mgr/server/src/disk_usage.rs`: snapshot reaper engages at
+/// (`crates/l40_api/sbx/mgr/server/src/disk_usage.rs`: snapshot reaper engages at
 /// `0.50` usage, cold-sandbox eviction at `0.55`) are already firing and the
 /// difference between a 90%- and a 96%-full node actually matters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]

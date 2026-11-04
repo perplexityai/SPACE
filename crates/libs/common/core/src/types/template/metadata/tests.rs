@@ -3,7 +3,7 @@ use super::*;
 #[test]
 fn parses_build_manager_shape() {
     // Mirrors the on-disk layout that
-    // `crates/libs/build/mgr/src/lib.rs`'s recipe-build path writes.
+    // `crates/l40_api/build/mgr/engine/src/lib.rs`'s recipe-build path writes.
     let raw = r#"{
             "id": "py-3.12",
             "name": "py-3.12",

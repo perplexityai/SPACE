@@ -45,8 +45,8 @@ roleRef:
 # The node-api pods the substrate's reflector discovers nodes from (and
 # cluster-controller's node-service readiness lists) run in the release
 # namespace, not the sandbox namespace the Role above covers: read-only there
-# (K8sCaches in crates/libs/api/src/controllers/substrate/kubernetes/caches.rs;
-# node_service_readiness/backend.rs in crates/libs/cluster/controller/server).
+# (K8sCaches in crates/l40_api/api/src/controllers/substrate/kubernetes/caches.rs;
+# node_service_readiness/backend.rs in crates/l40_api/cluster/controller/server).
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:

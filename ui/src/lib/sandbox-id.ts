@@ -133,7 +133,7 @@ export function matchesSandboxQuery(query: SandboxQuery, sandbox: { id: string; 
 }
 
 // The longest sandbox name (`MAX_SANDBOX_NAME_BYTES` in
-// crates/libs/public/api/src/limits.rs): a longer prefix starts no name.
+// crates/l20_domain/public/api/src/limits.rs): a longer prefix starts no name.
 const MAX_SANDBOX_NAME_BYTES = 256;
 const UUID_DASH_POSITIONS = [8, 13, 18, 23];
 

@@ -11,7 +11,7 @@ CONTENT = bytes(range(256)) * 16
 
 
 # Forks are Kubernetes-only: the Direct substrate answers them Unsupported
-# (crates/libs/api/src/controllers/substrate/direct.rs).
+# (crates/l40_api/api/src/controllers/substrate/direct.rs).
 @smoke.scenario(
     "ecw.fork_isolation", sandbox=smoke.SandboxConfig(timeout=600), substrates=("kubernetes",)
 )

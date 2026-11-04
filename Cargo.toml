@@ -1,179 +1,179 @@
 [workspace]
 resolver = "3"
 members = [
-    "crates/apps/api/svc",
-    "crates/apps/builder/cli",
-    "crates/apps/internal/api/svc",
-    "crates/apps/cluster/controller/svc",
-    "crates/apps/builder/svc",
-    "crates/apps/db/migrator",
-    "crates/apps/credential/mgr/svc",
-    "crates/apps/data/plane/svc",
-    "crates/apps/net/gateway/bench",
-    "crates/apps/net/gateway/svc",
-    "crates/apps/node/api/svc",
-    "crates/apps/node/ctl/cli",
-    "crates/apps/node/ctl/svc",
-    "crates/apps/node/mgr/cli",
-    "crates/apps/node/mgr/svc",
-    "crates/apps/node/runtime/manager/cli",
+    "crates/l50_app/api/svc",
+    "crates/l50_app/build/mgr/cli",
+    "crates/l50_app/internal/api/svc",
+    "crates/l50_app/cluster/controller/svc",
+    "crates/l50_app/build/mgr/svc",
+    "crates/l50_app/db/migrator",
+    "crates/l50_app/credmgr/svc",
+    "crates/l50_app/data/plane/svc",
+    "crates/tools/net/gateway/bench",
+    "crates/l50_app/net/gateway/svc",
+    "crates/l50_app/node/api/svc",
+    "crates/l50_app/node/ctl/cli",
+    "crates/l50_app/node/ctl/svc",
+    "crates/l50_app/node/mgr/cli",
+    "crates/l50_app/node/mgr/svc",
+    "crates/l50_app/node/runtime/manager/cli",
     "crates/apps/node/runtime/manager/svc",
-    "crates/apps/node/runtime/supervisor/svc",
-    "crates/apps/sbx/mgr/cli",
-    "crates/apps/sbx/mgr/svc",
-    "crates/apps/admin/cli",
-    "crates/apps/spaced/guest/svc",
-    "crates/apps/spaced/guest/worker",
-    "crates/apps/spaced/guest/cli",
-    "crates/apps/spaced/guest/loopback-test",
-    "crates/apps/spaced/host/svc",
-    "crates/apps/spaced/host/cli",
-    "crates/apps/ssh/cli",
-    "crates/apps/template/mgr/svc",
-    "crates/apps/template/mgr/cli",
-    "crates/apps/template/publish",
-    "crates/apps/vol/mgr/cli",
-    "crates/apps/mock/branching-key-provider/svc",
-    "crates/libs/spaced/build",
-    "crates/libs/spaced/guest/execution",
-    "crates/libs/spaced/guest/protocol",
-    "crates/libs/spaced/common",
-    "crates/libs/spaced/guest/client",
-    "crates/libs/spaced/guest/server",
+    "crates/l50_app/node/runtime/supervisor/svc",
+    "crates/l50_app/sbx/mgr/cli",
+    "crates/l50_app/sbx/mgr/svc",
+    "crates/l50_app/admin/cli",
+    "crates/l50_app/spaced/guest/svc",
+    "crates/l50_app/spaced/guest/worker",
+    "crates/l50_app/spaced/guest/cli",
+    "crates/tools/spaced/loopback/test",
+    "crates/l50_app/spaced/host/svc",
+    "crates/l50_app/spaced/host/cli",
+    "crates/l50_app/ssh/cli",
+    "crates/l50_app/template/mgr/svc",
+    "crates/l50_app/template/mgr/cli",
+    "crates/l50_app/template/publish",
+    "crates/l50_app/volmgr/cli",
+    "crates/test_support/mock/branching/key/provider/svc",
+    "crates/l10_foundation/spaced/build",
+    "crates/l40_api/spaced/guest/execution",
+    "crates/l20_domain/spaced/guest/protocol",
+    "crates/l20_domain/spaced/common",
+    "crates/l40_api/spaced/guest/client",
+    "crates/l40_api/spaced/guest/server",
     "crates/l40_api/spaced/guest/windows",
-    "crates/libs/spaced/host/client",
-    "crates/libs/spaced/host/server",
-    "crates/libs/test-env",
-    "crates/libs/bearer-token",
-    "crates/libs/tokio-runtime",
-    "crates/libs/sandbox/store",
-    "crates/libs/sandbox/quarantine-store",
-    "crates/libs/sandbox/teardown",
-    "crates/libs/sandbox/portability",
-    "crates/libs/sandbox/auto-lifecycle-receipt",
-    "crates/libs/sandbox/routability",
-    "crates/libs/snapshot/store",
-    "crates/libs/snapshot/storage",
-    "crates/libs/snapshot/retention",
-    "crates/libs/sbx/mgr/client",
-    "crates/libs/sbx/mgr/migrations",
-    "crates/libs/sbx/mgr/protocol",
-    "crates/libs/sbx/mgr/server",
-    "crates/libs/sbx/mgr/store",
-    "crates/libs/rustls-provider",
-    "crates/libs/sql-locator",
-    "crates/libs/service-lifecycle",
-    "crates/libs/service-mutex",
-    "crates/libs/sqlite",
-    "crates/libs/unix-socket-path",
-    "crates/libs/uds-peer-auth",
-    "crates/libs/unix-socket-bind",
-    "crates/libs/valkey",
-    "crates/libs/grpc-rate-limiter",
-    "crates/libs/systemd-watchdog",
-    "crates/libs/node/api/client",
-    "crates/libs/node/api/server",
-    "crates/libs/node/ctl/server",
-    "crates/libs/node/ctl/client",
-    "crates/libs/node/k8s-node-id",
-    "crates/libs/node/api/sim",
-    "crates/libs/node/mgr/client",
-    "crates/libs/node/mgr/protocol",
-    "crates/libs/node/mgr/server",
-    "crates/libs/node/registration-store",
-    "crates/libs/node/runtime/core",
-    "crates/libs/node/runtime/manager/client",
-    "crates/libs/node/runtime/manager/server",
-    "crates/libs/node/runtime/supervisor",
-    "crates/libs/execution/common",
-    "crates/libs/execution/catalog",
-    "crates/libs/execution/runtime-environment-catalog-store",
-    "crates/libs/execution/runtime-environment-policy-store",
-    "crates/libs/net/common",
-    "crates/libs/net/gateway/client",
-    "crates/libs/net/gateway/protocol",
-    "crates/libs/net/gateway/server",
-    "crates/libs/build/mgr",
-    "crates/libs/build/mgr/client",
-    "crates/libs/build/mgr/server",
-    "crates/libs/object-store",
-    "crates/libs/page-cache",
-    "crates/libs/postgres-contention",
-    "crates/libs/placement/executor",
-    "crates/libs/placement/machine",
-    "crates/libs/public/api",
+    "crates/l40_api/spaced/host/client",
+    "crates/l40_api/spaced/host/server",
+    "crates/test_support/test/env",
+    "crates/l10_foundation/bearer/token",
+    "crates/l10_foundation/tokio/runtime",
+    "crates/l30_storage/sandbox/store",
+    "crates/l30_storage/sandbox/quarantine/store",
+    "crates/l30_storage/sandbox/teardown",
+    "crates/l30_storage/sandbox/portability",
+    "crates/l20_domain/auto/lifecycle/receipt",
+    "crates/l30_storage/sandbox/routability",
+    "crates/l30_storage/snapshot/store",
+    "crates/l30_storage/snapshot/storage",
+    "crates/l40_api/snapshot/retention",
+    "crates/l40_api/sbx/mgr/client",
+    "crates/l30_storage/sbx/mgr/migrations",
+    "crates/l20_domain/sbx/mgr/protocol",
+    "crates/l40_api/sbx/mgr/server",
+    "crates/l30_storage/sbx/mgr/store",
+    "crates/l10_foundation/rustls/provider",
+    "crates/l10_foundation/sql/locator",
+    "crates/l10_foundation/service/lifecycle",
+    "crates/l10_foundation/service/mutex",
+    "crates/l10_foundation/sqlite",
+    "crates/l10_foundation/unix/socket/path",
+    "crates/l10_foundation/uds/peer/auth",
+    "crates/l10_foundation/unix/socket/bind",
+    "crates/l10_foundation/valkey",
+    "crates/l10_foundation/grpc/rate/limiter",
+    "crates/l10_foundation/systemd/watchdog",
+    "crates/l40_api/node/api/client",
+    "crates/l40_api/node/api/server",
+    "crates/l40_api/node/ctl/server",
+    "crates/l40_api/node/ctl/client",
+    "crates/l20_domain/k8s/node/id",
+    "crates/test_support/node/api/sim",
+    "crates/l40_api/node/mgr/client",
+    "crates/l20_domain/node/mgr/protocol",
+    "crates/l40_api/node/mgr/server",
+    "crates/l30_storage/node/registration/store",
+    "crates/l40_api/node/runtime/core",
+    "crates/l40_api/node/runtime/manager/client",
+    "crates/l40_api/node/runtime/manager/server",
+    "crates/l40_api/node/runtime/supervisor",
+    "crates/l20_domain/execution/common",
+    "crates/l40_api/execution/catalog",
+    "crates/l30_storage/runtime/environment/catalog/store",
+    "crates/l30_storage/runtime/environment/policy/store",
+    "crates/l20_domain/net/common",
+    "crates/l40_api/net/gateway/client",
+    "crates/l20_domain/net/gateway/protocol",
+    "crates/l40_api/net/gateway/server",
+    "crates/l40_api/build/mgr/engine",
+    "crates/l40_api/build/mgr/client",
+    "crates/l40_api/build/mgr/server",
+    "crates/l10_foundation/object/store",
+    "crates/l10_foundation/page/cache",
+    "crates/l10_foundation/postgres/contention",
+    "crates/l40_api/placement/executor",
+    "crates/l30_storage/placement",
+    "crates/l20_domain/public/api",
     "crates/l40_api/native/files",
     "crates/l40_api/public/api/http",
-    "crates/libs/api",
-    "crates/libs/api-route",
-    "crates/libs/byte-size",
+    "crates/l40_api/api",
+    "crates/l20_domain/api/route",
+    "crates/l10_foundation/byte/size",
     "crates/libs/common/core",
-    "crates/libs/semver",
-    "crates/libs/durations",
-    "crates/libs/stopwatch",
-    "crates/libs/common/cli",
-    "crates/libs/common/connection/admission",
-    "crates/libs/common/grpc",
-    "crates/libs/common/grpc-lb",
-    "crates/libs/common/io",
-    "crates/libs/common/jobs",
-    "crates/libs/common/lru-reaper",
-    "crates/libs/common/proto-build",
-    "crates/libs/common/work-coalescer",
+    "crates/l10_foundation/semver",
+    "crates/l10_foundation/durations",
+    "crates/l10_foundation/stopwatch",
+    "crates/l10_foundation/common/cli",
+    "crates/l10_foundation/common/connection/admission",
+    "crates/l10_foundation/common/grpc/transport",
+    "crates/l10_foundation/common/grpc/lb",
+    "crates/l10_foundation/common/io",
+    "crates/l10_foundation/common/jobs",
+    "crates/l10_foundation/common/lru/reaper",
+    "crates/l10_foundation/common/proto/build",
+    "crates/l10_foundation/common/work/coalescer",
     "crates/libs/common/svc",
-    "crates/libs/content-digest",
-    "crates/libs/cpu-arch",
-    "crates/libs/data/plane/server",
-    "crates/libs/db-test-fixtures",
-    "crates/libs/db/migrator",
-    "crates/libs/dependency-drain",
-    "crates/libs/ecw-credential",
-    "crates/libs/migration-checksums",
-    "crates/libs/aws/client",
-    "crates/libs/aws/s3-http-client",
-    "crates/libs/env-vars",
-    "crates/libs/feature-flags",
-    "crates/libs/events",
-    "crates/libs/federated-grant-store",
-    "crates/libs/ingress-admission",
+    "crates/l10_foundation/content/digest",
+    "crates/l10_foundation/cpu/arch",
+    "crates/l40_api/data/plane/server",
+    "crates/test_support/db/test/fixtures",
+    "crates/l30_storage/db/migrate",
+    "crates/l10_foundation/dependency/drain",
+    "crates/l20_domain/ecw/credential",
+    "crates/l10_foundation/migration/checksums",
+    "crates/l10_foundation/aws/client",
+    "crates/l10_foundation/s3/http/client",
+    "crates/l10_foundation/env/vars",
+    "crates/l10_foundation/feature/flags",
+    "crates/l20_domain/events",
+    "crates/l30_storage/federated/grant/store",
+    "crates/l40_api/ingress/admission",
     "crates/libs/metrics",
-    "crates/libs/metrics-emit",
-    "crates/libs/grpc-metrics",
-    "crates/libs/observability",
-    "crates/libs/internal/api/server",
-    "crates/libs/k8s-ids",
-    "crates/libs/kube-client",
-    "crates/libs/state-reconciliation",
-    "crates/libs/cluster-id",
-    "crates/libs/accounts",
-    "crates/libs/federated-identity",
-    "crates/libs/guest-process",
+    "crates/l10_foundation/metrics/emit",
+    "crates/l10_foundation/grpc/metrics",
+    "crates/l10_foundation/observability",
+    "crates/l40_api/internal/api/server",
+    "crates/l10_foundation/k8s/ids",
+    "crates/l10_foundation/kube/client",
+    "crates/l20_domain/state/reconciliation",
+    "crates/l20_domain/cluster/id",
+    "crates/l20_domain/accounts",
+    "crates/l20_domain/federated/identity",
+    "crates/l20_domain/guest/process",
     "crates/l10_foundation/guest/capability",
-    "crates/libs/request-id",
-    "crates/libs/execution-spec",
-    "crates/libs/linux-ids",
-    "crates/libs/network-roles",
-    "crates/libs/auto-lifecycle",
-    "crates/libs/pii",
-    "crates/libs/rpc-contracts",
-    "crates/libs/btrfs",
-    "crates/libs/db-identity",
-    "crates/libs/http-server",
-    "crates/libs/cluster/controller/server",
-    "crates/libs/cluster/pool",
-    "crates/libs/cluster/reconciler",
-    "crates/libs/cluster/trigger-queue",
-    "crates/libs/template/mgr",
-    "crates/libs/template/mgr-client",
-    "crates/libs/template/publish",
-    "crates/libs/credential/mgr/client",
-    "crates/libs/credential/mgr/server",
-    "crates/libs/credential/injection/core",
-    "crates/libs/credential/provider/client",
-    "crates/libs/credential/provider/proto",
-    "crates/apps/vol/mgr/svc",
-    "crates/libs/vol/mgr/client",
-    "crates/libs/vol/mgr/server",
+    "crates/l10_foundation/request/id",
+    "crates/l20_domain/execution/spec",
+    "crates/l10_foundation/linux/ids",
+    "crates/l20_domain/network/roles",
+    "crates/l20_domain/auto/lifecycle/policy",
+    "crates/l10_foundation/pii",
+    "crates/l20_domain/rpc/contracts",
+    "crates/l10_foundation/btrfs",
+    "crates/l20_domain/db/identity",
+    "crates/l10_foundation/http/server",
+    "crates/l40_api/cluster/controller/server",
+    "crates/l30_storage/cluster/pool",
+    "crates/l40_api/cluster/reconciler",
+    "crates/l30_storage/cluster/trigger/queue",
+    "crates/l40_api/template/mgr/server",
+    "crates/l40_api/template/mgr/client",
+    "crates/l40_api/template/publisher",
+    "crates/l40_api/credmgr/client",
+    "crates/l40_api/credmgr/server",
+    "crates/l20_domain/credential/injection/core",
+    "crates/l40_api/credential/provider/client",
+    "crates/l20_domain/credential/provider/proto",
+    "crates/l50_app/volmgr/svc",
+    "crates/l40_api/volmgr/client",
+    "crates/l40_api/volmgr/server",
     "crates/tools/archcheck",
 ]
 
@@ -347,146 +347,146 @@ zeroize = "1"
 zstd = { version = "0.14.3", features = ["zstdmt"] }
 
 # internal
-pplx-space-api = { path = "crates/libs/api" }
-pplx-space-api-route = { path = "crates/libs/api-route" }
-pplx-space-aws-client = { path = "crates/libs/aws/client" }
-pplx-space-s3-http-client = { path = "crates/libs/aws/s3-http-client" }
-pplx-space-bearer-token = { path = "crates/libs/bearer-token" }
-pplx-space-build-mgr = { path = "crates/libs/build/mgr" }
-pplx-space-build-mgr-client = { path = "crates/libs/build/mgr/client" }
-pplx-space-build-mgr-server = { path = "crates/libs/build/mgr/server" }
-pplx-space-byte-size = { path = "crates/libs/byte-size" }
+pplx-space-api = { path = "crates/l40_api/api" }
+pplx-space-api-route = { path = "crates/l20_domain/api/route" }
+pplx-space-aws-client = { path = "crates/l10_foundation/aws/client" }
+pplx-space-s3-http-client = { path = "crates/l10_foundation/s3/http/client" }
+pplx-space-bearer-token = { path = "crates/l10_foundation/bearer/token" }
+pplx-space-build-mgr = { path = "crates/l40_api/build/mgr/engine" }
+pplx-space-build-mgr-client = { path = "crates/l40_api/build/mgr/client" }
+pplx-space-build-mgr-server = { path = "crates/l40_api/build/mgr/server" }
+pplx-space-byte-size = { path = "crates/l10_foundation/byte/size" }
 pplx-space-common-core = { path = "crates/libs/common/core" }
-pplx-space-durations = { path = "crates/libs/durations" }
-pplx-space-stopwatch = { path = "crates/libs/stopwatch" }
-pplx-space-common-cli = { path = "crates/libs/common/cli" }
-pplx-space-common-connection-admission = { path = "crates/libs/common/connection/admission" }
-pplx-space-common-grpc = { path = "crates/libs/common/grpc" }
-pplx-space-common-grpc-lb = { path = "crates/libs/common/grpc-lb" }
-pplx-space-common-io = { path = "crates/libs/common/io" }
-pplx-space-common-jobs = { path = "crates/libs/common/jobs" }
-pplx-space-common-lru-reaper = { path = "crates/libs/common/lru-reaper" }
-pplx-space-common-proto-build = { path = "crates/libs/common/proto-build" }
+pplx-space-durations = { path = "crates/l10_foundation/durations" }
+pplx-space-stopwatch = { path = "crates/l10_foundation/stopwatch" }
+pplx-space-common-cli = { path = "crates/l10_foundation/common/cli" }
+pplx-space-common-connection-admission = { path = "crates/l10_foundation/common/connection/admission" }
+pplx-space-common-grpc = { path = "crates/l10_foundation/common/grpc/transport" }
+pplx-space-common-grpc-lb = { path = "crates/l10_foundation/common/grpc/lb" }
+pplx-space-common-io = { path = "crates/l10_foundation/common/io" }
+pplx-space-common-jobs = { path = "crates/l10_foundation/common/jobs" }
+pplx-space-common-lru-reaper = { path = "crates/l10_foundation/common/lru/reaper" }
+pplx-space-common-proto-build = { path = "crates/l10_foundation/common/proto/build" }
 pplx-space-common-svc = { path = "crates/libs/common/svc", default-features = false }
-pplx-space-common-work-coalescer = { path = "crates/libs/common/work-coalescer" }
-pplx-space-content-digest = { path = "crates/libs/content-digest" }
-pplx-space-cpu-arch = { path = "crates/libs/cpu-arch" }
-pplx-space-data-plane-server = { path = "crates/libs/data/plane/server" }
-pplx-space-db-migrate = { path = "crates/libs/db/migrator" }
-pplx-space-db-test-fixtures = { path = "crates/libs/db-test-fixtures" }
-pplx-space-dependency-drain = { path = "crates/libs/dependency-drain" }
-pplx-space-ecw-credential = { path = "crates/libs/ecw-credential" }
-pplx-space-env-vars = { path = "crates/libs/env-vars" }
-pplx-space-migration-checksums = { path = "crates/libs/migration-checksums" }
-pplx-space-execution-catalog = { path = "crates/libs/execution/catalog" }
-pplx-space-execution-common = { path = "crates/libs/execution/common" }
-pplx-space-runtime-environment-catalog-store = { path = "crates/libs/execution/runtime-environment-catalog-store" }
-pplx-space-runtime-environment-policy-store = { path = "crates/libs/execution/runtime-environment-policy-store" }
-pplx-space-feature-flags = { path = "crates/libs/feature-flags" }
-pplx-space-events = { path = "crates/libs/events" }
-pplx-space-federated-grant-store = { path = "crates/libs/federated-grant-store" }
-pplx-space-ingress-admission = { path = "crates/libs/ingress-admission" }
-pplx-space-credmgr = { path = "crates/libs/credential/mgr/server" }
-pplx-space-credmgr-client = { path = "crates/libs/credential/mgr/client" }
-pplx-space-credential-injection-core = { path = "crates/libs/credential/injection/core" }
-pplx-space-credential-injection-store = { path = "crates/libs/credential/injection/store" }
-pplx-space-credential-provider-client = { path = "crates/libs/credential/provider/client" }
-pplx-space-credential-provider-proto = { path = "crates/libs/credential/provider/proto" }
-pplx-space-volmgr = { path = "crates/libs/vol/mgr/server" }
-pplx-space-volmgr-client = { path = "crates/libs/vol/mgr/client" }
-pplx-space-net-gateway = { path = "crates/libs/net/gateway/server" }
-pplx-space-net-gateway-client = { path = "crates/libs/net/gateway/client" }
-pplx-space-net-gateway-protocol = { path = "crates/libs/net/gateway/protocol" }
-pplx-space-node-api-client = { path = "crates/libs/node/api/client" }
-pplx-space-node-ctl-client = { path = "crates/libs/node/ctl/client" }
-pplx-space-node-api-server = { path = "crates/libs/node/api/server" }
-pplx-space-node-ctl-server = { path = "crates/libs/node/ctl/server" }
-pplx-space-k8s-node-id = { path = "crates/libs/node/k8s-node-id" }
-pplx-space-node-api-sim = { path = "crates/libs/node/api/sim" }
-pplx-space-node-mgr = { path = "crates/libs/node/mgr/server" }
-pplx-space-node-mgr-client = { path = "crates/libs/node/mgr/client" }
-pplx-space-node-mgr-protocol = { path = "crates/libs/node/mgr/protocol" }
-pplx-space-node-registration-store = { path = "crates/libs/node/registration-store" }
-pplx-space-node-runtime-core = { path = "crates/libs/node/runtime/core" }
-pplx-space-node-runtime-manager = { path = "crates/libs/node/runtime/manager/server" }
-pplx-space-node-runtime-manager-client = { path = "crates/libs/node/runtime/manager/client" }
-pplx-space-node-runtime-supervisor = { path = "crates/libs/node/runtime/supervisor" }
-pplx-space-net-common = { path = "crates/libs/net/common" }
-pplx-space-object-store = { path = "crates/libs/object-store" }
-pplx-space-page-cache = { path = "crates/libs/page-cache" }
-pplx-space-postgres-contention = { path = "crates/libs/postgres-contention" }
-pplx-space-public-api = { path = "crates/libs/public/api" }
+pplx-space-common-work-coalescer = { path = "crates/l10_foundation/common/work/coalescer" }
+pplx-space-content-digest = { path = "crates/l10_foundation/content/digest" }
+pplx-space-cpu-arch = { path = "crates/l10_foundation/cpu/arch" }
+pplx-space-data-plane-server = { path = "crates/l40_api/data/plane/server" }
+pplx-space-db-migrate = { path = "crates/l30_storage/db/migrate" }
+pplx-space-db-test-fixtures = { path = "crates/test_support/db/test/fixtures" }
+pplx-space-dependency-drain = { path = "crates/l10_foundation/dependency/drain" }
+pplx-space-ecw-credential = { path = "crates/l20_domain/ecw/credential" }
+pplx-space-env-vars = { path = "crates/l10_foundation/env/vars" }
+pplx-space-migration-checksums = { path = "crates/l10_foundation/migration/checksums" }
+pplx-space-execution-catalog = { path = "crates/l40_api/execution/catalog" }
+pplx-space-execution-common = { path = "crates/l20_domain/execution/common" }
+pplx-space-runtime-environment-catalog-store = { path = "crates/l30_storage/runtime/environment/catalog/store" }
+pplx-space-runtime-environment-policy-store = { path = "crates/l30_storage/runtime/environment/policy/store" }
+pplx-space-feature-flags = { path = "crates/l10_foundation/feature/flags" }
+pplx-space-events = { path = "crates/l20_domain/events" }
+pplx-space-federated-grant-store = { path = "crates/l30_storage/federated/grant/store" }
+pplx-space-ingress-admission = { path = "crates/l40_api/ingress/admission" }
+pplx-space-credmgr = { path = "crates/l40_api/credmgr/server" }
+pplx-space-credmgr-client = { path = "crates/l40_api/credmgr/client" }
+pplx-space-credential-injection-core = { path = "crates/l20_domain/credential/injection/core" }
+pplx-space-credential-injection-store = { path = "crates/l30_storage/credential/injection/store" }
+pplx-space-credential-provider-client = { path = "crates/l40_api/credential/provider/client" }
+pplx-space-credential-provider-proto = { path = "crates/l20_domain/credential/provider/proto" }
+pplx-space-volmgr = { path = "crates/l40_api/volmgr/server" }
+pplx-space-volmgr-client = { path = "crates/l40_api/volmgr/client" }
+pplx-space-net-gateway = { path = "crates/l40_api/net/gateway/server" }
+pplx-space-net-gateway-client = { path = "crates/l40_api/net/gateway/client" }
+pplx-space-net-gateway-protocol = { path = "crates/l20_domain/net/gateway/protocol" }
+pplx-space-node-api-client = { path = "crates/l40_api/node/api/client" }
+pplx-space-node-ctl-client = { path = "crates/l40_api/node/ctl/client" }
+pplx-space-node-api-server = { path = "crates/l40_api/node/api/server" }
+pplx-space-node-ctl-server = { path = "crates/l40_api/node/ctl/server" }
+pplx-space-k8s-node-id = { path = "crates/l20_domain/k8s/node/id" }
+pplx-space-node-api-sim = { path = "crates/test_support/node/api/sim" }
+pplx-space-node-mgr = { path = "crates/l40_api/node/mgr/server" }
+pplx-space-node-mgr-client = { path = "crates/l40_api/node/mgr/client" }
+pplx-space-node-mgr-protocol = { path = "crates/l20_domain/node/mgr/protocol" }
+pplx-space-node-registration-store = { path = "crates/l30_storage/node/registration/store" }
+pplx-space-node-runtime-core = { path = "crates/l40_api/node/runtime/core" }
+pplx-space-node-runtime-manager = { path = "crates/l40_api/node/runtime/manager/server" }
+pplx-space-node-runtime-manager-client = { path = "crates/l40_api/node/runtime/manager/client" }
+pplx-space-node-runtime-supervisor = { path = "crates/l40_api/node/runtime/supervisor" }
+pplx-space-net-common = { path = "crates/l20_domain/net/common" }
+pplx-space-object-store = { path = "crates/l10_foundation/object/store" }
+pplx-space-page-cache = { path = "crates/l10_foundation/page/cache" }
+pplx-space-postgres-contention = { path = "crates/l10_foundation/postgres/contention" }
+pplx-space-public-api = { path = "crates/l20_domain/public/api" }
 pplx-space-native-files = { path = "crates/l40_api/native/files" }
 pplx-space-public-api-http = { path = "crates/l40_api/public/api/http" }
 pplx-space-metrics = { path = "crates/libs/metrics" }
-pplx-space-metrics-emit = { path = "crates/libs/metrics-emit" }
-pplx-space-grpc-metrics = { path = "crates/libs/grpc-metrics" }
-pplx-space-observability = { path = "crates/libs/observability", default-features = false }
-pplx-space-placement = { path = "crates/libs/placement/machine" }
-pplx-space-internal-api-server = { path = "crates/libs/internal/api/server" }
-pplx-space-internal-api-svc = { path = "crates/apps/internal/api/svc" }
-pplx-space-k8s-ids = { path = "crates/libs/k8s-ids" }
-pplx-space-kube-client = { path = "crates/libs/kube-client" }
-pplx-space-cluster-id = { path = "crates/libs/cluster-id" }
-pplx-space-accounts = { path = "crates/libs/accounts" }
-pplx-space-federated-identity = { path = "crates/libs/federated-identity" }
-pplx-space-guest-process = { path = "crates/libs/guest-process" }
+pplx-space-metrics-emit = { path = "crates/l10_foundation/metrics/emit" }
+pplx-space-grpc-metrics = { path = "crates/l10_foundation/grpc/metrics" }
+pplx-space-observability = { path = "crates/l10_foundation/observability", default-features = false }
+pplx-space-placement = { path = "crates/l30_storage/placement" }
+pplx-space-internal-api-server = { path = "crates/l40_api/internal/api/server" }
+pplx-space-internal-api-svc = { path = "crates/l50_app/internal/api/svc" }
+pplx-space-k8s-ids = { path = "crates/l10_foundation/k8s/ids" }
+pplx-space-kube-client = { path = "crates/l10_foundation/kube/client" }
+pplx-space-cluster-id = { path = "crates/l20_domain/cluster/id" }
+pplx-space-accounts = { path = "crates/l20_domain/accounts" }
+pplx-space-federated-identity = { path = "crates/l20_domain/federated/identity" }
+pplx-space-guest-process = { path = "crates/l20_domain/guest/process" }
 pplx-space-guest-capability = { path = "crates/l10_foundation/guest/capability" }
-pplx-space-request-id = { path = "crates/libs/request-id" }
-pplx-space-execution-spec = { path = "crates/libs/execution-spec" }
-pplx-space-linux-ids = { path = "crates/libs/linux-ids" }
-pplx-space-network-roles = { path = "crates/libs/network-roles" }
-pplx-space-auto-lifecycle = { path = "crates/libs/auto-lifecycle" }
-pplx-space-pii = { path = "crates/libs/pii" }
-pplx-space-rpc-contracts = { path = "crates/libs/rpc-contracts" }
-pplx-space-btrfs = { path = "crates/libs/btrfs" }
-pplx-space-db-identity = { path = "crates/libs/db-identity" }
-pplx-space-http-server = { path = "crates/libs/http-server" }
-pplx-space-cluster-controller-server = { path = "crates/libs/cluster/controller/server" }
-pplx-space-cluster-pool = { path = "crates/libs/cluster/pool" }
-pplx-space-cluster-reconciler = { path = "crates/libs/cluster/reconciler" }
-pplx-space-cluster-trigger-queue = { path = "crates/libs/cluster/trigger-queue" }
-pplx-space-sandbox-portability = { path = "crates/libs/sandbox/portability" }
-pplx-space-sandbox-quarantine-store = { path = "crates/libs/sandbox/quarantine-store" }
-pplx-space-sandbox-routability = { path = "crates/libs/sandbox/routability" }
-pplx-space-sandbox-store = { path = "crates/libs/sandbox/store" }
-pplx-space-sandbox-teardown = { path = "crates/libs/sandbox/teardown" }
-pplx-space-auto-lifecycle-receipt = { path = "crates/libs/sandbox/auto-lifecycle-receipt" }
-pplx-space-snapshot-storage = { path = "crates/libs/snapshot/storage" }
-pplx-space-snapshot-retention = { path = "crates/libs/snapshot/retention" }
-pplx-space-snapshot-store = { path = "crates/libs/snapshot/store" }
-pplx-space-sbxmgr-migrations = { path = "crates/libs/sbx/mgr/migrations" }
-pplx-space-sbx-mgr = { path = "crates/libs/sbx/mgr/server" }
-pplx-space-sbx-mgr-client = { path = "crates/libs/sbx/mgr/client" }
-pplx-space-sbx-mgr-protocol = { path = "crates/libs/sbx/mgr/protocol" }
-pplx-space-sbx-mgr-store = { path = "crates/libs/sbx/mgr/store" }
-pplx-space-rustls-provider = { path = "crates/libs/rustls-provider" }
-pplx-space-semver = { path = "crates/libs/semver" }
-pplx-space-sql-locator = { path = "crates/libs/sql-locator" }
-pplx-space-service-lifecycle = { path = "crates/libs/service-lifecycle" }
-pplx-space-state-reconciliation = { path = "crates/libs/state-reconciliation" }
-pplx-space-service-mutex = { path = "crates/libs/service-mutex" }
-pplx-space-sqlite = { path = "crates/libs/sqlite" }
-pplx-space-systemd-watchdog = { path = "crates/libs/systemd-watchdog" }
-pplx-space-spaced-build = { path = "crates/libs/spaced/build" }
-pplx-space-spaced-guest-protocol = { path = "crates/libs/spaced/guest/protocol" }
-pplx-space-spaced-guest-execution = { path = "crates/libs/spaced/guest/execution" }
-pplx-space-spaced-common = { path = "crates/libs/spaced/common" }
-pplx-space-spaced-guest-client = { path = "crates/libs/spaced/guest/client" }
-pplx-space-spaced-guest-server = { path = "crates/libs/spaced/guest/server" }
+pplx-space-request-id = { path = "crates/l10_foundation/request/id" }
+pplx-space-execution-spec = { path = "crates/l20_domain/execution/spec" }
+pplx-space-linux-ids = { path = "crates/l10_foundation/linux/ids" }
+pplx-space-network-roles = { path = "crates/l20_domain/network/roles" }
+pplx-space-auto-lifecycle = { path = "crates/l20_domain/auto/lifecycle/policy" }
+pplx-space-pii = { path = "crates/l10_foundation/pii" }
+pplx-space-rpc-contracts = { path = "crates/l20_domain/rpc/contracts" }
+pplx-space-btrfs = { path = "crates/l10_foundation/btrfs" }
+pplx-space-db-identity = { path = "crates/l20_domain/db/identity" }
+pplx-space-http-server = { path = "crates/l10_foundation/http/server" }
+pplx-space-cluster-controller-server = { path = "crates/l40_api/cluster/controller/server" }
+pplx-space-cluster-pool = { path = "crates/l30_storage/cluster/pool" }
+pplx-space-cluster-reconciler = { path = "crates/l40_api/cluster/reconciler" }
+pplx-space-cluster-trigger-queue = { path = "crates/l30_storage/cluster/trigger/queue" }
+pplx-space-sandbox-portability = { path = "crates/l30_storage/sandbox/portability" }
+pplx-space-sandbox-quarantine-store = { path = "crates/l30_storage/sandbox/quarantine/store" }
+pplx-space-sandbox-routability = { path = "crates/l30_storage/sandbox/routability" }
+pplx-space-sandbox-store = { path = "crates/l30_storage/sandbox/store" }
+pplx-space-sandbox-teardown = { path = "crates/l30_storage/sandbox/teardown" }
+pplx-space-auto-lifecycle-receipt = { path = "crates/l20_domain/auto/lifecycle/receipt" }
+pplx-space-snapshot-storage = { path = "crates/l30_storage/snapshot/storage" }
+pplx-space-snapshot-retention = { path = "crates/l40_api/snapshot/retention" }
+pplx-space-snapshot-store = { path = "crates/l30_storage/snapshot/store" }
+pplx-space-sbx-mgr-migrations = { path = "crates/l30_storage/sbx/mgr/migrations" }
+pplx-space-sbx-mgr = { path = "crates/l40_api/sbx/mgr/server" }
+pplx-space-sbx-mgr-client = { path = "crates/l40_api/sbx/mgr/client" }
+pplx-space-sbx-mgr-protocol = { path = "crates/l20_domain/sbx/mgr/protocol" }
+pplx-space-sbx-mgr-store = { path = "crates/l30_storage/sbx/mgr/store" }
+pplx-space-rustls-provider = { path = "crates/l10_foundation/rustls/provider" }
+pplx-space-semver = { path = "crates/l10_foundation/semver" }
+pplx-space-sql-locator = { path = "crates/l10_foundation/sql/locator" }
+pplx-space-service-lifecycle = { path = "crates/l10_foundation/service/lifecycle" }
+pplx-space-state-reconciliation = { path = "crates/l20_domain/state/reconciliation" }
+pplx-space-service-mutex = { path = "crates/l10_foundation/service/mutex" }
+pplx-space-sqlite = { path = "crates/l10_foundation/sqlite" }
+pplx-space-systemd-watchdog = { path = "crates/l10_foundation/systemd/watchdog" }
+pplx-space-spaced-build = { path = "crates/l10_foundation/spaced/build" }
+pplx-space-spaced-guest-protocol = { path = "crates/l20_domain/spaced/guest/protocol" }
+pplx-space-spaced-guest-execution = { path = "crates/l40_api/spaced/guest/execution" }
+pplx-space-spaced-common = { path = "crates/l20_domain/spaced/common" }
+pplx-space-spaced-guest-client = { path = "crates/l40_api/spaced/guest/client" }
+pplx-space-spaced-guest-server = { path = "crates/l40_api/spaced/guest/server" }
 pplx-space-spaced-guest-windows = { path = "crates/l40_api/spaced/guest/windows" }
-pplx-space-spaced-host-client = { path = "crates/libs/spaced/host/client" }
-pplx-space-spaced-host-server = { path = "crates/libs/spaced/host/server" }
-pplx-space-template-mgr = { path = "crates/libs/template/mgr" }
-pplx-space-template-mgr-client = { path = "crates/libs/template/mgr-client" }
-pplx-space-template-publisher = { path = "crates/libs/template/publish" }
-pplx-space-test-env = { path = "crates/libs/test-env" }
-pplx-space-unix-socket-path = { path = "crates/libs/unix-socket-path" }
-pplx-space-uds-peer-auth = { path = "crates/libs/uds-peer-auth" }
-pplx-space-unix-socket-bind = { path = "crates/libs/unix-socket-bind" }
-pplx-space-valkey = { path = "crates/libs/valkey" }
-pplx-space-grpc-rate-limiter = { path = "crates/libs/grpc-rate-limiter" }
-pplx-space-tokio-runtime = { path = "crates/libs/tokio-runtime" }
+pplx-space-spaced-host-client = { path = "crates/l40_api/spaced/host/client" }
+pplx-space-spaced-host-server = { path = "crates/l40_api/spaced/host/server" }
+pplx-space-template-mgr = { path = "crates/l40_api/template/mgr/server" }
+pplx-space-template-mgr-client = { path = "crates/l40_api/template/mgr/client" }
+pplx-space-template-publisher = { path = "crates/l40_api/template/publisher" }
+pplx-space-test-env = { path = "crates/test_support/test/env" }
+pplx-space-unix-socket-path = { path = "crates/l10_foundation/unix/socket/path" }
+pplx-space-uds-peer-auth = { path = "crates/l10_foundation/uds/peer/auth" }
+pplx-space-unix-socket-bind = { path = "crates/l10_foundation/unix/socket/bind" }
+pplx-space-valkey = { path = "crates/l10_foundation/valkey" }
+pplx-space-grpc-rate-limiter = { path = "crates/l10_foundation/grpc/rate/limiter" }
+pplx-space-tokio-runtime = { path = "crates/l10_foundation/tokio/runtime" }
 [profile.release]
 lto = "thin"
 strip = true

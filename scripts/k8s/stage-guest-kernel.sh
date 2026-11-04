@@ -495,7 +495,7 @@ stage_remote_kernel() {
 }
 
 # Re-derive what the runtime inventory will find, using the same branch
-# `RuntimeInventory::discover` takes (crates/libs/node/runtime/core/src/
+# `RuntimeInventory::discover` takes (crates/l40_api/node/runtime/core/src/
 # runtime_inventory.rs): a `kernels/` directory selects the versioned tree
 # outright, and the flat asset path is consulted only in its absence.
 # Asserting the post-state rather than the steps catches a half-populated

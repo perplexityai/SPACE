@@ -394,7 +394,7 @@ The harness normally runs the Kubernetes substrate: a pod per sandbox, placed
 by kube-scheduler. `SPACE_KIND_SUBSTRATE=direct` (`lib/substrate.sh`; the
 default is `kubernetes`) runs the same cluster and images with the API and
 cluster controller on the Direct substrate
-(`crates/libs/api/src/controllers/substrate/direct.rs`): they place node-local
+(`crates/l40_api/api/src/controllers/substrate/direct.rs`): they place node-local
 VMs on the nodes in the Direct node registry and create no sandbox pods. The
 selection is per cluster, for its lifetime. Its database holds one substrate's
 node and sandbox rows, so the bring-up refuses a cluster running the other one
@@ -435,7 +435,7 @@ and names the teardown that switches it.
   otherwise. In `exchange` mode the credential-manager authority admits a
   node service by its pod's Kubernetes node registration (`node_k8s`,
   `check_node_registration` in
-  `crates/libs/credential/mgr/server/src/k8s_identity.rs`). A Direct node has
+  `crates/l40_api/credmgr/server/src/k8s_identity.rs`). A Direct node has
   none, so the authority refuses every template pull with
   `node_identity_mismatch` and no worker ever holds a template. The same check
   guards the authority's other node calls, such as volume keys and network
@@ -1632,7 +1632,7 @@ load-balanced entry, scaled on load.
   ahead of its application releases; the replicas no longer each run them.
   The migrator asks for this: it serializes on a session advisory lock, but a
   competing runner can turn a retried lock race into a failed run
-  (`crates/libs/db/migrator/src/migration_retry.rs`). Tilt makes `space-api`
+  (`crates/l30_storage/db/migrate/src/migration_retry.rs`). Tilt makes `space-api`
   wait for the Job.
 - **cluster-controller** runs two replicas with leader election on, on either
   substrate: the Lease holder runs every reconciler and the other stands by,
@@ -1768,16 +1768,16 @@ reflector use) and `app.kubernetes.io/part-of=space-node`.
 
 | Service | Identity | Pod shape | Why (public code) |
 |---|---|---|---|
-| node-manager | root | privileged, hostNetwork, hostPID; `/space/cache` and `/var/run/netns` Bidirectional; `/sys/fs/cgroup`, `/space/bin`, `/space/etc`, `/dev/kvm`; `/space/vendor` writable; projected token for the credential-manager authority | mounts jail rootfs and late snapshot-memory binds that must reach the host jailer, netns binds the host jailer and sidecar launcher open, loop and device-mapper devices, cgroup limits, root-namespace veth/nft/ip_forward, pidfds on host processes (`crates/libs/node/mgr/server`); creates the managed store `/space/vendor/artifacts` and publishes the runtime manager's staged releases and kernels into it (`node_artifacts.rs`); init container `node-manager-init.sh` writes the node's systemd unit via `nsenter --target 1` |
+| node-manager | root | privileged, hostNetwork, hostPID; `/space/cache` and `/var/run/netns` Bidirectional; `/sys/fs/cgroup`, `/space/bin`, `/space/etc`, `/dev/kvm`; `/space/vendor` writable; projected token for the credential-manager authority | mounts jail rootfs and late snapshot-memory binds that must reach the host jailer, netns binds the host jailer and sidecar launcher open, loop and device-mapper devices, cgroup limits, root-namespace veth/nft/ip_forward, pidfds on host processes (`crates/l40_api/node/mgr/server`); creates the managed store `/space/vendor/artifacts` and publishes the runtime manager's staged releases and kernels into it (`node_artifacts.rs`); init container `node-manager-init.sh` writes the node's systemd unit via `nsenter --target 1` |
 | runtime-supervisor | root | host systemd unit, no pod; environment from `/space/config/space.env`, which node-manager's Kind-only `kind-node-env` init container writes | `scripts/k8s/node-manager-init.sh`, `node-manager-runtime-supervisor.sh` |
-| runtime-manager | space-rtmgr + SPACE_RUNTIME_MANAGER_GROUPS | non-root, no capabilities, read-only rootfs; `/space/vendor` and `/space/bin` read-only, `/space/cache` HostToContainer | lists runtimes and kernels, and installs the catalog's: downloads them from the compiled sources over the pod network into its private `/space/cache/.rtmgr-staging`, then asks node-manager over its socket to publish them (`crates/libs/node/runtime/manager/server`); the account writes nothing else in the cache or the store |
-| volume-manager | space-volmgr + SPACE_VOLUME_MANAGER_GROUPS | non-root, no capabilities, read-only rootfs; `/space/cache` HostToContainer | file transfers only (`crates/libs/vol/mgr/server`); the account `docs/installation.md` describes: node-manager's btrfs send-lease RPCs authorize it and credential-manager serves it on the volume socket |
+| runtime-manager | space-rtmgr + SPACE_RUNTIME_MANAGER_GROUPS | non-root, no capabilities, read-only rootfs; `/space/vendor` and `/space/bin` read-only, `/space/cache` HostToContainer | lists runtimes and kernels, and installs the catalog's: downloads them from the compiled sources over the pod network into its private `/space/cache/.rtmgr-staging`, then asks node-manager over its socket to publish them (`crates/l40_api/node/runtime/manager/server`); the account writes nothing else in the cache or the store |
+| volume-manager | space-volmgr + SPACE_VOLUME_MANAGER_GROUPS | non-root, no capabilities, read-only rootfs; `/space/cache` HostToContainer | file transfers only (`crates/l40_api/volmgr/server`); the account `docs/installation.md` describes: node-manager's btrfs send-lease RPCs authorize it and credential-manager serves it on the volume socket |
 | credential-manager | space-sbxmgr + SPACE_CREDENTIAL_MANAGER_GROUPS | non-root, no capabilities, read-only rootfs; `/space/run` only; projected token for the authority | the node credential agent (`--role=agent`): sockets only, forwarding to `space-credmgr-authority`; no database, KEK or AWS credential; its peer-process check (`SPACE_UDS_PEER_PROCESS_CHECK`) is off, so no host PID namespace |
 | template-manager | space-tmplmgr + SPACE_TEMPLATE_MANAGER_GROUPS | non-root, no capabilities, read-only rootfs, pod network; `/space/cache` HostToContainer | btrfs work delegated to node-manager (`btrfs_via_nodemgr.rs`); template-release reads bind the reviewed token's node name/UID |
 | sandbox-manager | space-sbxmgr + SPACE_SANDBOX_MANAGER_GROUPS | non-root, no capabilities, read-only rootfs, hostPID, hostNetwork; `/space/cache` HostToContainer, `/space/etc` read-only, the node's `/sys/fs/cgroup/space` read-only at `/space/cgroup` | gateway callers are authorized by their host pid, and Firecracker pids go to the node's shim (`service/gateway_identity.rs`, `network_runtime.rs`); host network for its node-bound ClusterApi RPCs; a health transition's evidence samples the VM's jailer cgroup, which its private cgroup namespace hides from its own `/sys/fs/cgroup` (`watchdog/diagnostics.rs`) |
 | node-ctl | space-nodectl + SPACE_NODECTL_GROUPS | non-root, no capabilities, read-only rootfs, hostNetwork; its own ServiceAccount with Node RBAC, fenced by `node-fence.yaml` | the Kubernetes node-local controller; host network for its node-bound ClusterApi RPCs |
 | node-api | space-nodeapi + worker/builder groups | non-root, no capabilities, read-only rootfs, hostNetwork, port `grpc` 9800; its ServiceAccount's API credentials (TokenReview only) and projected node-api and, on builders, build-manager tokens | reviews callers' tokens; the API dials `host_ip:9800` and reads the `grpc` port; on builders it reaches build-manager through the node-local `space-builder-build-manager` Service and sleeps 5 s in preStop (below) |
-| build-manager | root | privileged, hostPID, pod network behind the node-local `space-builder-build-manager` Service (`internalTrafficPolicy: Local`); `/var/run/netns` and `/space/cache` HostToContainer, the node's containerd; its ServiceAccount's API credentials (TokenReview only) | reviews the builder node-api's token; loop and bind mounts for OCI assembly, `nsenter --net` into build VMs through netns handles node-manager mounts after it starts, `ctr` against the node's containerd (`crates/libs/build/mgr/src`); host PID to watch the build VM's host Firecracker pid exit (`vm.rs`); no host network: SSH into build VMs runs inside `nsenter --net` |
+| build-manager | root | privileged, hostPID, pod network behind the node-local `space-builder-build-manager` Service (`internalTrafficPolicy: Local`); `/var/run/netns` and `/space/cache` HostToContainer, the node's containerd; its ServiceAccount's API credentials (TokenReview only) | reviews the builder node-api's token; loop and bind mounts for OCI assembly, `nsenter --net` into build VMs through netns handles node-manager mounts after it starts, `ctr` against the node's containerd (`crates/l40_api/build/mgr/engine/src`); host PID to watch the build VM's host Firecracker pid exit (`vm.rs`); no host network: SSH into build VMs runs inside `nsenter --net` |
 | space-node-debug (Kind only) | root | privileged; `/space/run`, `/space/cache` HostToContainer, `/space/bin`, `/space/vendor`, `/run/containerd`, `/var/run/netns` HostToContainer read-only | the operator shell; see below |
 
 internal-api binds every node-bound ClusterApi RPC — `PublishNodeState`, the
@@ -1785,14 +1785,14 @@ node desired-state and reconcile calls (node-ctl), quarantine recovery plans and
 artifact backups (sandbox-manager) — to the node's registered address, the
 Kubernetes Node's InternalIP that cluster-controller's node sync writes, and
 refuses a call from any other source address
-(`validate_origin_remote_addr` in `crates/libs/internal/api/server/src/lib.rs`).
+(`validate_origin_remote_addr` in `crates/l40_api/internal/api/server/src/lib.rs`).
 The check reads neither the credential nor the transport: it applies alike to
 the static token and to TokenReview-authenticated projected tokens, and internal
 RPC TLS, being server-auth only, does not change it. So node-ctl and
 sandbox-manager run in the node's network namespace. template-manager makes no
 node-bound call. Its template-release reads use the reviewed token's node name
 and UID to match live inventory (`template_read_scope`,
-`crates/libs/internal/api/server/src/adapter.rs`), so it runs on the pod network.
+`crates/l40_api/internal/api/server/src/adapter.rs`), so it runs on the pod network.
 This makes `local.ecw_template_build_from_oci_boots` and
 `local.private_template_build_isolation` exercise private-template resolution
 when the caller's pod IP differs from the registered node IP. Missing claims
@@ -1966,7 +1966,7 @@ Role lists and watches the namespace's pods for this. internal-api never
 registers a node; it resolves a published name only to an existing row. The
 node inventory sync records each node, with its UID, for the sandbox-selector
 nodes and for every node running a node-api pod, builders
-included (`crates/libs/api/src/controllers/substrate/kubernetes/node_sync.rs`);
+included (`crates/l40_api/api/src/controllers/substrate/kubernetes/node_sync.rs`);
 a sandbox pod placed on a node records it too, and so does an admin node
 listing (node-status refresh, reconcile or template listing), which upserts
 every node-api pod's node. Until one of these records a new or replaced
@@ -2122,7 +2122,7 @@ asks of the hosting deployment.
 | S3 for snapshots + template artifacts                     | In-cluster versitygw (real S3 protocol, sigv4, path-style)                    |
 | volume-manager gets each transfer's credentials from its node's credential-manager agent; the authority authorizes the subject and object and assumes the S3 vend role through STS with a session policy for that one object, which S3 enforces on every request | the same path on sandbox workers and builders ([Object-store credentials](#object-store-credentials)): the authority's unchanged `AssumeRole` reaches the Kind-only STS bridge (`space-kind-sts-bridge`), which exchanges it at versitygw's IAM service; that service checks the vend role's trust and maximum duration and stores the session, whose policy the gateway enforces. What stays different: the authority signs `AssumeRole` with the bridge's static vend keys (a Secret `sts-bridge-secret.sh` issues per cluster) where a deployment uses its workload identity, so those keys replace `space-aws-creds` and the authority's AWS Secrets Manager integration is off in this mode; and STS runs beside the store: the IAM service is its own Deployment, so an outage refuses every session-signed request while the gateway stays Ready and root keys keep working, but no AWS account boundary separates STS from S3. `SPACE_KIND_STORAGE_CREDENTIALS=static` opts out: volume-manager and build-manager then read static `SPACE_OBJECT_STORE_STATIC_*` creds (the documented local escape hatch) and no vend role is configured |
 | Rate limiters (cluster activation admission at the binary defaults, per-client concurrency in `observe`) on a Redis-compatible store reached over TLS (`rediss://`), its URL delivered through the `space-redis` Secret (`app_deploy.tf`) | the same limiters, modes and defaults on the in-cluster `space-redis` Deployment (one in-memory replica on the infra node), reached over plaintext `redis://space-redis:6379` rendered as a literal: the workspace's Redis clients trust only the webpki roots (`tls-rustls-webpki-roots` in `Cargo.toml`), so they would refuse a CA `internal-rpc-tls.sh` could issue, and the `#insecure` URL fragment would be an environment-only switch. `local.rate_limiters_enforce_and_fail_open` shrinks the caps and scales the store to zero for its fail-open half |
-| `SPACE_REDIS_URL` on api, admin-api, cluster-controller and internal-api | on api, admin-api and cluster-controller only: the limiters that read it live in `crates/libs/api` (api and admin-api build both, the cluster-controller's public-operation dispatcher builds the activation limiter), and nothing `space-internal-api-svc` links reads it |
+| `SPACE_REDIS_URL` on api, admin-api, cluster-controller and internal-api | on api, admin-api and cluster-controller only: the limiters that read it live in `crates/l40_api/api` (api and admin-api build both, the cluster-controller's public-operation dispatcher builds the activation limiter), and nothing `space-internal-api-svc` links reads it |
 | `space-credmgr-authority` Deployment whose platform KEK comes from an external intermediate-key broker, with TLS from its own certificate (`credmgr_authority_tls.tf`; the direct KMS backend is gone, `credmgr_authority_kms.tf`) | two replicas on the same broker path against the in-repo broker fixture (`space-kind-key-broker`), which derives keys instead of protecting them; TLS from a self-signed certificate `internal-rpc-tls.sh` issues per cluster |
 | Internal RPC CA and listener leaves issued by Terraform and synced by External Secrets (`internal_rpc_tls.tf`) | the same Secrets issued per cluster by `scripts/internal-rpc-tls.sh`; the ingress activation leaf names `space-api` rather than `space-ingress-activation` |
 | Builder volume-manager and build-manager exchange their credentials through credential-manager | the same in the default `exchange` mode, with no store keys: builder volume-manager through its node's agent, and build-manager directly with the authority over TLS, under its projected ServiceAccount token (audience `space-credential-manager`), which the authority maps to `space-build-manager` ([Object-store credentials](#object-store-credentials)). The authority admits a builder's callers once the node inventory sync has recorded the builder's Kubernetes UID ([Service identities](#service-identities)). In `static` mode both read the store's static keys, like worker volume-manager |
@@ -2179,7 +2179,7 @@ there.
 Each sandbox pod requests `space.pplx.net/network-slots: 1`. As on a deployed
 node, each sandbox worker's node-ctl advertises that extended resource on its
 Node's `status.capacity`, from its node-manager's `network_pool_max_slots`
-(`crates/libs/node/ctl/server/src/kubernetes_controller/network_slots.rs`), and
+(`crates/l40_api/node/ctl/server/src/kubernetes_controller/network_slots.rs`), and
 re-advertises it on every periodic tick, including after the Node object is
 recreated. node-manager keeps no warm pool of slots, as deployed nodes do not
 (`SPACE_NODEMGR_NETWORK_POOL_TARGET`, `_RETAIN_READY` and `_MIN_READY` are `0`
@@ -2572,7 +2572,7 @@ API is port-forwarded to [localhost:8333](http://localhost:8333).
 suspend/restore snapshot artifacts (`snapshots` bucket) and template pulls
 (`templates` bucket, populated by the `space-seed-publish` Job) — with the
 credentials the storage credentials mode gives it (below). See
-`crates/libs/vol/mgr/server/src/run.rs`.
+`crates/l40_api/volmgr/server/src/run.rs`.
 
 Verify the round-trips with the object-store port-forward:
 
@@ -2591,14 +2591,14 @@ build-manager, authenticate to the object store
 - `exchange` (the default): as deployed, volume-manager holds no keys. For
   each transfer it asks its node's credential-manager agent, on the volume
   socket, for a session scoped to the transfer's one object
-  (`exchange_credentials`, `crates/libs/vol/mgr/server/src/credentials.rs`):
+  (`exchange_credentials`, `crates/l40_api/volmgr/server/src/credentials.rs`):
   scope `space.storage.read` for a pull and `space.storage.read
   space.storage.write` for a push (which verifies its upload with HeadObject),
   the SPACE subject (`sandbox:<id>` or `template:<name>`) and a one-hour
   lifetime. The agent forwards the request as itself, with the caller's UDS
   identity as the actor. The authority checks the caller's pod and node, then
   the subject against the object (`authorize_exchange`,
-  `crates/libs/credential/mgr/server/src/storage_exchange.rs`): a sandbox may
+  `crates/l40_api/credmgr/server/src/storage_exchange.rs`): a sandbox may
   reach only its own `suspend_snapshots/<shard>/<sandbox>/…` keys inside its
   org's snapshot storage, with writes fenced to the nodes that own it, and a
   template only `templates/<name>/<hash>/…`, with published releases
@@ -2608,7 +2608,7 @@ build-manager, authenticate to the object store
   `credential_security_audit` event per decision. build-manager holds no keys
   either, and asks the authority itself, not its node's agent, whose sockets
   admit only volume-manager and template-manager to the exchange
-  (`object_store_credentials`, `crates/libs/build/mgr/src/object_store.rs`):
+  (`object_store_credentials`, `crates/l40_api/build/mgr/engine/src/object_store.rs`):
   at `https://space-credmgr-authority:9810`, trusting the authority's
   certificate, with its projected ServiceAccount token, which the authority
   maps from `space-builder-build-manager` to `space-build-manager`. It asks

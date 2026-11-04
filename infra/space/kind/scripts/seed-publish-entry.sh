@@ -68,7 +68,7 @@ EXECUTION_PROTO_JSON=$(python3 /opt/space/bin/manifest_execution_to_proto.py "$S
 S3_PREFIX="templates/${TEMPLATE_NAME}/${CONTENT_HASH}"
 # Self-describing storage URI — carries everything volume-manager needs to
 # issue the GET (see the storage-URI format doc in
-# crates/libs/template/mgr/src/volume.rs).
+# crates/l40_api/template/mgr/server/src/volume.rs).
 STORAGE_URI="s3://${SPACE_OBJECT_STORE_BUCKET}/${S3_PREFIX}/?region=${SPACE_OBJECT_STORE_REGION}&endpoint=${SPACE_OBJECT_STORE_ENDPOINT}&path_style=true"
 
 cluster_api() {

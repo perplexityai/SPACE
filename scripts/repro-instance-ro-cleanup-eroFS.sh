@@ -10,7 +10,7 @@
 # no EROFS and no leaked subvolume, while preserving the live `instance/`.
 #
 # Mirrors the exact command sequences emitted by:
-#   crates/libs/node/mgr/server/src/service/cleanup_helpers.rs
+#   crates/l40_api/node/mgr/server/src/service/cleanup_helpers.rs
 #     - remove_subvolume_or_dir_with_runner  (clear RO `-ts -f`, then delete)
 #     - remove_instance_ro_snapshots         (instance.ro + snapshot/instance.ro)
 #     - neutralize_retained_cache_dir*        (prune snapshots/*, rewrite owner)

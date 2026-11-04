@@ -36,27 +36,27 @@ templates/firecracker/recipes/seed.toml
 # The cluster-controller's binary and library:
 # leader election, the retention sweeper, the orphaned-restore-pod GC and
 # node groups each have Kind scenarios.
-crates/apps/cluster/controller/**
-crates/libs/api/src/controllers/template.rs
-crates/libs/api/src/controllers/template/**
-crates/libs/api/src/template_build_jobs_store.rs
-crates/libs/api/src/controllers/substrate/kubernetes/node_sync.rs
-crates/libs/api/src/controllers/substrate/kubernetes/node_sync/**
-crates/libs/api/src/controllers/substrate/kubernetes/store/node_inventory.rs
-crates/libs/build/mgr/**
-crates/libs/cluster/controller/**
+crates/l50_app/cluster/controller/**
+crates/l40_api/api/src/controllers/template.rs
+crates/l40_api/api/src/controllers/template/**
+crates/l40_api/api/src/template_build_jobs_store.rs
+crates/l40_api/api/src/controllers/substrate/kubernetes/node_sync.rs
+crates/l40_api/api/src/controllers/substrate/kubernetes/node_sync/**
+crates/l40_api/api/src/controllers/substrate/kubernetes/store/node_inventory.rs
+crates/l40_api/build/mgr/**
+crates/l40_api/cluster/controller/**
 crates/libs/common/svc/src/auth/build.rs
 crates/libs/common/svc/src/auth/build/**
-crates/libs/internal/api/server/src/adapter.rs
-crates/libs/internal/api/server/src/metadata.rs
-crates/libs/internal/api/server/src/template_*.rs
-crates/libs/sbx/mgr/server/src/service/activation_support.rs
+crates/l40_api/internal/api/server/src/adapter.rs
+crates/l40_api/internal/api/server/src/metadata.rs
+crates/l40_api/internal/api/server/src/template_*.rs
+crates/l40_api/sbx/mgr/server/src/service/activation_support.rs
 # Emit the template pull metrics that the Kind restore scenarios assert
 # on, and choose the selector and pull path behind them.
-crates/libs/template/mgr/src/volume.rs
-crates/libs/template/mgr/src/service/lookup.rs
+crates/l40_api/template/mgr/server/src/volume.rs
+crates/l40_api/template/mgr/server/src/service/lookup.rs
 infra/space/observability/**
-crates/libs/observability/**
+crates/l10_foundation/observability/**
 shim/otlp.go
 shim/identity.go
 shim/telemetry*.go
@@ -66,29 +66,38 @@ ci/mirrored-images.txt
 scripts/check-m1-sdk-generation.sh
 # The public-operation claim, driver and dispatcher decide the order and
 # concurrency of every lifecycle operation the Kind scenarios drive.
-crates/libs/api/src/public_operations.rs
-crates/libs/api/src/public_operations/**
-crates/libs/api/src/public_operation_driver.rs
-crates/libs/api/src/retry_deferral.rs
-crates/libs/api/src/retry_deferral/**
-crates/libs/cluster/controller/server/src/public_operation_dispatcher.rs
-crates/libs/cluster/controller/server/src/public_operation_dispatcher/**
+crates/l40_api/api/src/public_operations.rs
+crates/l40_api/api/src/public_operations/**
+crates/l40_api/api/src/public_operation_driver.rs
+crates/l40_api/api/src/retry_deferral.rs
+crates/l40_api/api/src/retry_deferral/**
+crates/l40_api/cluster/controller/server/src/public_operation_dispatcher.rs
+crates/l40_api/cluster/controller/server/src/public_operation_dispatcher/**
 # The native /v1 surface: its contract crate, route handlers, session and
 # sandbox-operation services, and the data plane. native.m1_generated_sdk_conformance
 # exercises them end to end.
-crates/libs/public/api/**
-crates/libs/api/src/routes/public*
-crates/libs/api/src/routes/public/**
-crates/libs/api/src/routes/public_docs/**
-crates/libs/api/src/public_sessions*
-crates/libs/api/src/public_sessions/**
-crates/libs/api/src/public_sandbox_operations*
-crates/libs/api/src/public_sandbox_operations/**
-crates/libs/api/src/public_sandbox_projection.rs
-crates/libs/data/plane/**
-crates/apps/data/plane/svc/**
+crates/l20_domain/public/api/**
+crates/l40_api/api/src/routes/public*
+crates/l40_api/api/src/routes/public/**
+crates/l40_api/api/src/routes/public_docs/**
+crates/l40_api/api/src/public_sessions*
+crates/l40_api/api/src/public_sessions/**
+crates/l40_api/api/src/public_sandbox_operations*
+crates/l40_api/api/src/public_sandbox_operations/**
+crates/l40_api/api/src/public_sandbox_projection.rs
+crates/l40_api/data/plane/**
+crates/l50_app/data/plane/svc/**
 
 # Guest execution and shared gRPC admission run in every sandbox.
-crates/libs/spaced/**
-crates/apps/spaced/**
-crates/libs/common/grpc/**
+crates/l10_foundation/spaced/**
+crates/l20_domain/spaced/**
+crates/l40_api/spaced/guest/client/**
+crates/l40_api/spaced/guest/execution/**
+crates/l40_api/spaced/guest/server/**
+crates/l40_api/spaced/host/client/**
+crates/l40_api/spaced/host/server/**
+crates/l40_api/spaced/AGENTS.md
+crates/l40_api/spaced/CLAUDE.md
+crates/l50_app/spaced/**
+crates/tools/spaced/**
+crates/l10_foundation/common/grpc/transport/**

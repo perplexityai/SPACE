@@ -1,0 +1,42 @@
+---
+source: crates/l40_api/credmgr/server/src/node_ca/tests.rs
+expression: "(gateway.version(), gateway.subject().to_string(),\ngateway.issuer().to_string(),\ngateway.signature_algorithm.algorithm.to_id_string(),\ngateway.public_key().algorithm.algorithm.to_id_string(),\ngateway.public_key().algorithm.parameters.as_ref().unwrap().as_oid().unwrap().to_id_string(),\ngateway.validity().not_after.timestamp() -\nnode.validity().not_after.timestamp(), extensions,)"
+---
+(
+    X509Version(
+        2,
+    ),
+    "CN=space-gateway-intermediate-ca",
+    "CN=node intermediate CA",
+    "1.2.840.10045.4.3.2",
+    "1.2.840.10045.2.1",
+    "1.2.840.10045.3.1.7",
+    0,
+    [
+        (
+            "2.5.29.35",
+            false,
+            "derived issuer key identifier",
+        ),
+        (
+            "2.5.29.15",
+            true,
+            "KeyUsage(KeyUsage { flags: 96 })",
+        ),
+        (
+            "2.5.29.37",
+            false,
+            "ExtendedKeyUsage(ExtendedKeyUsage { any: false, server_auth: true, client_auth: false, code_signing: false, email_protection: false, time_stamping: false, ocsp_signing: false, other: [] })",
+        ),
+        (
+            "2.5.29.14",
+            false,
+            "derived subject key identifier",
+        ),
+        (
+            "2.5.29.19",
+            true,
+            "BasicConstraints(BasicConstraints { ca: true, path_len_constraint: Some(0) })",
+        ),
+    ],
+)

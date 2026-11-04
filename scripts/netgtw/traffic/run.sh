@@ -88,7 +88,7 @@ if [[ ${NETGTW_TRAFFIC_SKIP_BUILD:-0} != 1 ]]; then
   # One invocation compiles the shared graph once. Unifying with the fixture
   # adds only net-common/serde and rcgen/pem to the gateway's graph; the
   # production worker image already builds the gateway with both.
-  cargo build --locked -p pplx-space-net-gateway-svc -p pplx-space-netgtw-bench \
+  cargo build --locked -p pplx-space-net-gateway-svc -p pplx-space-net-gateway-bench \
     --bin space-netgtw-svc --bin netgtw-traffic-control
   if [[ ${RUSTC_WRAPPER:-} == sccache ]]; then
     sccache --show-stats || true

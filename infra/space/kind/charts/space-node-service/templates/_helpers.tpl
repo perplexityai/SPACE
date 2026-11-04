@@ -3,7 +3,7 @@ Shared pod shape for the Kind node-service charts. Each chart renders one
 DaemonSet for one node service and calls these with
 `(dict "ctx" . "component" "<component>")`, where the component is the
 `app.kubernetes.io/component` value production's node DaemonSets carry
-(crates/libs/cluster/controller/server/src/node_service_readiness/mod.rs
+(crates/l40_api/cluster/controller/server/src/node_service_readiness/mod.rs
 names node-ctl, volume-manager, sandbox-manager, node-manager, node-api and
 template-manager).
 */}}
@@ -56,7 +56,7 @@ app.kubernetes.io/component: {{ .component }}
 `app.kubernetes.io/name` is the node role (space-worker / space-builder) on
 every node-service pod. The API's pod reflector maps that label to a SPACE
 node role but watches only `app.kubernetes.io/component=node-api`
-(crates/libs/api/src/controllers/substrate/kubernetes/caches.rs), so only the
+(crates/l40_api/api/src/controllers/substrate/kubernetes/caches.rs), so only the
 node-api pods become node endpoints. `space.pplx.net/node-service` lets the
 harness and diagnostics select every node-service pod at once.
 `space.pplx.net/kind-rust-build`, set when a Kind bring-up names `rustBuild`,
@@ -101,13 +101,13 @@ Identity every node service reports. SPACE_NODE_ID is the raw kube node name
 (fieldRef spec.nodeName); services and the cluster API derive the node UUID
 from (name, role) via space_k8s_node_id, so nothing hand-rolls an id. The
 node and pod names are the observability identity
-(crates/libs/observability/src/identity.rs).
+(crates/l10_foundation/observability/src/identity.rs).
 
 On the `direct` substrate SPACE_NODE_ID is left unset: a Direct node is
 registered under the UUID its node-api reports (verify_node_endpoint,
-crates/libs/api/src/routes/admin/node_maintenance/node_api.rs), and ClusterApi
+crates/l40_api/api/src/routes/admin/node_maintenance/node_api.rs), and ClusterApi
 resolves a kube node name only to a Kubernetes registration
-(resolve_origin_node_id, crates/libs/internal/api/server/src/lib.rs). node-api
+(resolve_origin_node_id, crates/l40_api/internal/api/server/src/lib.rs). node-api
 and node-ctl then read the UUID the bring-up seeds in /space/etc/node-id
 (scripts/register-direct-nodes.sh) through mount.nodeId. sandbox-manager reads
 it through its own /space/etc mount for its activation identity only; its
@@ -186,7 +186,7 @@ Secret, mounted where the EKS module mounts it). Pair with volume.rpcIdentity.
 {{/*
 The control-plane credential-manager authority, for the node credential
 agent and node-manager's direct sandbox volume DEK calls: its HTTPS endpoint
-(SPACE_CREDMGR_ENDPOINT, crates/libs/credential/mgr/client/src/endpoint.rs),
+(SPACE_CREDMGR_ENDPOINT, crates/l40_api/credmgr/client/src/endpoint.rs),
 whose host must be one of the certificate's names (the client has no
 server-name override); the authority's self-signed certificate as the trust
 anchor (SPACE_CREDMGR_TLS_CA, as on EKS: credmgr_authority_tls.tf); and the
@@ -305,7 +305,7 @@ pod's own mounts back to the node.
 {{/*
 The node UUID the bring-up seeds on a `direct` Kind node, read-only, at the
 path node-api and node-ctl read when SPACE_NODE_ID is unset (NODE_ID_PATH in
-crates/libs/node/api/server/src/run.rs and crates/libs/node/ctl/server/src/lib.rs).
+crates/l40_api/node/api/server/src/run.rs and crates/l40_api/node/ctl/server/src/lib.rs).
 Mounted only on that substrate, with volume.nodeId.
 */}}
 {{- define "space-node-service.mount.nodeId" -}}
@@ -418,7 +418,7 @@ a root listener reads it as owner.
 {{/*
 The 600 s lifetime is the node services' deployed one; the kubelet refreshes
 the file at 80% of it and the client rereads it (TOKEN_FILE_CACHE_TTL,
-crates/libs/bearer-token/src/lib.rs).
+crates/l10_foundation/bearer/token/src/lib.rs).
 */}}
 {{- define "space-node-service.volume.clusterApiToken" -}}
 - name: cluster-api-token
@@ -445,8 +445,8 @@ crates/libs/bearer-token/src/lib.rs).
 An unprivileged, read-only container: no capabilities, no escalation. Every
 service that only needs file access and Unix sockets runs this way, as the
 service crates describe their production shape (e.g. "runAsNonRoot with no
-added capabilities" in crates/libs/template/mgr/src/btrfs_via_nodemgr.rs and
-crates/libs/sbx/mgr/server/src/btrfs_via_nodemgr.rs).
+added capabilities" in crates/l40_api/template/mgr/server/src/btrfs_via_nodemgr.rs and
+crates/l40_api/sbx/mgr/server/src/btrfs_via_nodemgr.rs).
 */}}
 {{- define "space-node-service.restrictedContainer" -}}
 securityContext:
@@ -495,8 +495,8 @@ Rolling-update strategy. `surge` starts the replacement beside the old pod:
 for services that hold a node-wide service mutex (/space/run/<svc>/service.mutex)
 the successor waits passively, reports ready while passive, and takes over
 when the predecessor drains and releases the lock, with its sockets replaced
-by rename (crates/libs/service-mutex/src/lib.rs,
-crates/libs/unix-socket-bind/src/unix_socket.rs).
+by rename (crates/l10_foundation/service/mutex/src/lib.rs,
+crates/l10_foundation/unix/socket/bind/src/unix_socket.rs).
 `deleteFirst` stops the old pod before the new one starts, for services that
 cannot run twice on a node.
 */}}
@@ -522,7 +522,7 @@ node_id-carrying calls, quarantine recovery plans, artifact backups) to the
 node's registered address — the Kubernetes Node's InternalIP, which
 cluster-controller's node sync writes — and refuses a call from any other
 source address whatever the credential or transport
-(validate_origin_remote_addr in crates/libs/internal/api/server/src/lib.rs;
+(validate_origin_remote_addr in crates/l40_api/internal/api/server/src/lib.rs;
 internal RPC TLS is server-auth only). So each such caller must reach it from
 the node's own IP. ClusterFirstWithHostNet keeps in-cluster DNS.
 */}}

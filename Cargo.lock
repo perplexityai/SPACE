@@ -5149,17 +5149,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "pplx-space-cluster-controller"
-version = "0.8.1"
-dependencies = [
- "anyhow",
- "clap",
- "pplx-space-cluster-controller-server",
- "pplx-space-common-svc",
- "tokio",
-]
-
-[[package]]
 name = "pplx-space-cluster-controller-server"
 version = "0.8.1"
 dependencies = [
@@ -5215,6 +5204,17 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+]
+
+[[package]]
+name = "pplx-space-cluster-controller-svc"
+version = "0.8.1"
+dependencies = [
+ "anyhow",
+ "clap",
+ "pplx-space-cluster-controller-server",
+ "pplx-space-common-svc",
+ "tokio",
 ]
 
 [[package]]
@@ -6272,6 +6272,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "pplx-space-net-gateway-bench"
+version = "0.8.1"
+dependencies = [
+ "anyhow",
+ "aws-lc-rs",
+ "clap",
+ "jiff",
+ "pplx-space-common-core",
+ "pplx-space-common-svc",
+ "pplx-space-credential-injection-core",
+ "pplx-space-net-common",
+ "pplx-space-net-gateway",
+ "pplx-space-net-gateway-client",
+ "pplx-space-spaced-common",
+ "rcgen",
+ "serde",
+ "serde_json",
+ "socket2",
+ "thiserror 2.0.20",
+ "time",
+ "tokio",
+ "tokio-stream",
+ "tokio-util",
+ "tonic",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "pplx-space-net-gateway-client"
 version = "0.8.1"
 dependencies = [
@@ -6311,35 +6340,6 @@ dependencies = [
  "pplx-space-net-common",
  "pplx-space-net-gateway",
  "tokio",
-]
-
-[[package]]
-name = "pplx-space-netgtw-bench"
-version = "0.8.1"
-dependencies = [
- "anyhow",
- "aws-lc-rs",
- "clap",
- "jiff",
- "pplx-space-common-core",
- "pplx-space-common-svc",
- "pplx-space-credential-injection-core",
- "pplx-space-net-common",
- "pplx-space-net-gateway",
- "pplx-space-net-gateway-client",
- "pplx-space-spaced-common",
- "rcgen",
- "serde",
- "serde_json",
- "socket2",
- "thiserror 2.0.20",
- "time",
- "tokio",
- "tokio-stream",
- "tokio-util",
- "tonic",
- "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
@@ -6765,6 +6765,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "pplx-space-node-runtime-manager-cli"
+version = "0.8.1"
+dependencies = [
+ "clap",
+ "comfy-table",
+ "pplx-space-common-cli",
+ "pplx-space-common-core",
+ "pplx-space-node-runtime-manager-client",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tonic",
+]
+
+[[package]]
 name = "pplx-space-node-runtime-manager-client"
 version = "0.8.1"
 dependencies = [
@@ -6806,6 +6821,16 @@ dependencies = [
  "tokio-util",
  "tonic",
  "tracing",
+]
+
+[[package]]
+name = "pplx-space-node-runtime-supervisor-svc"
+version = "0.8.1"
+dependencies = [
+ "anyhow",
+ "clap",
+ "pplx-space-common-core",
+ "pplx-space-node-runtime-supervisor",
 ]
 
 [[package]]
@@ -6988,21 +7013,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "pplx-space-runtime-manager-cli"
-version = "0.8.1"
-dependencies = [
- "clap",
- "comfy-table",
- "pplx-space-common-cli",
- "pplx-space-common-core",
- "pplx-space-node-runtime-manager-client",
- "serde",
- "serde_json",
- "tokio",
- "tonic",
-]
-
-[[package]]
 name = "pplx-space-runtime-manager-svc"
 version = "0.8.1"
 dependencies = [
@@ -7012,16 +7022,6 @@ dependencies = [
  "pplx-space-common-svc",
  "pplx-space-node-runtime-core",
  "pplx-space-node-runtime-manager",
-]
-
-[[package]]
-name = "pplx-space-runtime-supervisor-svc"
-version = "0.8.1"
-dependencies = [
- "anyhow",
- "clap",
- "pplx-space-common-core",
- "pplx-space-node-runtime-supervisor",
 ]
 
 [[package]]
@@ -7205,6 +7205,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "pplx-space-sbx-mgr-migrations"
+version = "0.8.1"
+dependencies = [
+ "sqlx",
+]
+
+[[package]]
 name = "pplx-space-sbx-mgr-protocol"
 version = "0.8.1"
 dependencies = [
@@ -7241,8 +7248,8 @@ dependencies = [
  "pplx-space-node-mgr-protocol",
  "pplx-space-node-runtime-core",
  "pplx-space-observability",
+ "pplx-space-sbx-mgr-migrations",
  "pplx-space-sbx-mgr-protocol",
- "pplx-space-sbxmgr-migrations",
  "pplx-space-sqlite",
  "prost-types",
  "ref-cast",
@@ -7260,14 +7267,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "pplx-space-sbxmgr-migrations"
-version = "0.8.1"
-dependencies = [
- "sqlx",
-]
-
-[[package]]
-name = "pplx-space-sbxmgr-svc"
+name = "pplx-space-sbx-mgr-svc"
 version = "0.8.1"
 dependencies = [
  "anyhow",
@@ -7769,6 +7769,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "pplx-space-template-mgr-cli"
+version = "0.8.1"
+dependencies = [
+ "anyhow",
+ "clap",
+ "comfy-table",
+ "pplx-space-common-cli",
+ "pplx-space-common-core",
+ "pplx-space-net-common",
+ "pplx-space-node-api-client",
+ "pplx-space-sbx-mgr-client",
+ "pplx-space-template-mgr-client",
+ "tokio",
+]
+
+[[package]]
 name = "pplx-space-template-mgr-client"
 version = "0.8.1"
 dependencies = [
@@ -7785,6 +7801,16 @@ dependencies = [
  "tonic",
  "tonic-prost",
  "tonic-prost-build",
+]
+
+[[package]]
+name = "pplx-space-template-mgr-svc"
+version = "0.8.1"
+dependencies = [
+ "anyhow",
+ "clap",
+ "pplx-space-common-svc",
+ "pplx-space-template-mgr",
 ]
 
 [[package]]
@@ -7822,32 +7848,6 @@ dependencies = [
  "nix 0.31.3",
  "pplx-space-env-vars",
  "tempfile",
-]
-
-[[package]]
-name = "pplx-space-tmplmgr-cli"
-version = "0.8.1"
-dependencies = [
- "anyhow",
- "clap",
- "comfy-table",
- "pplx-space-common-cli",
- "pplx-space-common-core",
- "pplx-space-net-common",
- "pplx-space-node-api-client",
- "pplx-space-sbx-mgr-client",
- "pplx-space-template-mgr-client",
- "tokio",
-]
-
-[[package]]
-name = "pplx-space-tmplmgr-svc"
-version = "0.8.1"
-dependencies = [
- "anyhow",
- "clap",
- "pplx-space-common-svc",
- "pplx-space-template-mgr",
 ]
 
 [[package]]

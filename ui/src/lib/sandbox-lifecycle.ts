@@ -10,12 +10,12 @@ export const SANDBOX_LIFECYCLE_STATES = [
 
 // What the list's status filter offers. The list shows a node's reported
 // state when a node reports one (`sandbox_to_cached_response` in
-// crates/libs/api/src/controllers/sandbox/responses.rs), so it adds the
+// crates/l40_api/api/src/controllers/sandbox/responses.rs), so it adds the
 // node-only states (`SandboxLifecycleState` in
-// crates/libs/sbx/mgr/protocol/src/lifecycle.rs), and `deleted`. A delete
-// through the API removes the row (crates/libs/sandbox/teardown); a `deleted`
+// crates/l20_domain/sbx/mgr/protocol/src/lifecycle.rs), and `deleted`. A delete
+// through the API removes the row (crates/l30_storage/sandbox/teardown); a `deleted`
 // row is one a Direct node's complete census no longer includes
-// (crates/libs/internal/api/server/src/status.rs), kept for a retention
+// (crates/l40_api/internal/api/server/src/status.rs), kept for a retention
 // period, and the admin list, which does not filter by lifecycle, returns it.
 export const SANDBOX_STATUS_FILTER_STATES = [
   ...SANDBOX_LIFECYCLE_STATES, 'unspecified', 'cleanup_required', 'cleanup_failed', 'deleted',

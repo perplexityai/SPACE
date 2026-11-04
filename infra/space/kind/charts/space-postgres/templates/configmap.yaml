@@ -22,7 +22,7 @@ data:
   # Run once by the image's entrypoint when it initializes an empty data
   # directory, as the image superuser. It provides what a managed service gives
   # its master user, which bootstrap-roles' managed-service branch relies on
-  # (crates/libs/db/migrator/src/bootstrap_roles.rs):
+  # (crates/l30_storage/db/migrate/src/bootstrap_roles.rs):
   # - rds_superuser exists, so converge_superadmin_attributes grants it to
   #   space_superadmin instead of making that role a real superuser. The master
   #   holds it WITH ADMIN OPTION, which that GRANT needs.
