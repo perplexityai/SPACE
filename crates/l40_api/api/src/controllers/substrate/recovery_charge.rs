@@ -11,21 +11,62 @@ pub enum ActivationAdmissionClass {
     Restore,
 }
 
+/// Why activation admission refused, which decides the status a caller sees
+/// and how the async dispatcher retries it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActivationRejectionKind {
+    /// The shared token bucket is empty: a 429 the async dispatcher waits out
+    /// as backpressure, without spending its transient-error budget.
+    RateLimited,
+    /// No start-eligible node: a 429 retried against the transient-error
+    /// budget, so a durable outage ends the create.
+    EmptyCluster,
+    /// No start-eligible node has a free network slot: a 503, since it isn't
+    /// the client's doing, retried against the same bounded budget.
+    NoFreeSlot,
+}
+
+impl ActivationRejectionKind {
+    /// The controller error every path answers this rejection with. The
+    /// `Retry-After` is header-only: it doesn't mark the response as an ECW
+    /// convergence wait.
+    pub(crate) fn controller_error(
+        self,
+        message: String,
+        retry_after: Option<Duration>,
+    ) -> ControllerError {
+        let mut error = match self {
+            Self::RateLimited => ControllerError::rate_limited(message)
+                .with_retry_after_cause(ControllerRetryAfterCause::ClusterActivationAdmission),
+            Self::EmptyCluster => ControllerError::rate_limited(message),
+            Self::NoFreeSlot => ControllerError::service_unavailable(message),
+        };
+        if let Some(retry_after) = retry_after {
+            error = error.with_retry_after_header(retry_after);
+        }
+        error.with_activation_rejection(self)
+    }
+}
+
 /// Adapter-neutral rejection returned by activation admission.
 #[derive(Debug, thiserror::Error)]
 #[error("{message}")]
 pub struct ActivationAdmissionRejection {
     pub(super) message: String,
     pub(super) retry_after: Option<Duration>,
-    pub(super) rate_limited: bool,
+    pub(super) kind: ActivationRejectionKind,
 }
 
 impl ActivationAdmissionRejection {
-    pub(crate) fn new(message: String, retry_after: Option<Duration>, rate_limited: bool) -> Self {
+    pub(crate) fn new(
+        message: String,
+        retry_after: Option<Duration>,
+        kind: ActivationRejectionKind,
+    ) -> Self {
         Self {
             message,
             retry_after,
-            rate_limited,
+            kind,
         }
     }
 }
@@ -86,7 +127,7 @@ impl RecoveryCharge {
             .await
             .map_err(|error| SubstrateError::AdmissionRejected {
                 retry_after: error.retry_after,
-                rate_limited: error.rate_limited,
+                kind: error.kind,
                 message: error.to_string(),
             })
     }
