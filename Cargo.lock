@@ -7812,6 +7812,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "pplx-space-template-mgr-store"
+version = "0.8.1"
+
+[[package]]
 name = "pplx-space-template-mgr-svc"
 version = "0.8.1"
 dependencies = [
