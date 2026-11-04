@@ -7246,6 +7246,7 @@ dependencies = [
  "pplx-space-sqlite",
  "prost-types",
  "ref-cast",
+ "rstest",
  "rusqlite",
  "rustix",
  "serde",

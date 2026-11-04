@@ -71,6 +71,7 @@ futures-util = { workspace = true }
 pplx-space-common-core = { workspace = true, features = ["serde", "test-hooks"] }
 pplx-space-node-runtime-core = { workspace = true }
 prost-types = { workspace = true }
+rstest = { workspace = true }
 rusqlite = { workspace = true, features = ["serialize"] }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "sync", "test-util", "time"] }
