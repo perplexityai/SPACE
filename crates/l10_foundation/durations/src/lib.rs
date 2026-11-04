@@ -92,6 +92,13 @@ pub fn parse_simple_duration(value: &str) -> Result<Duration, SimpleDurationPars
         return Err(SimpleDurationParseError::Empty);
     }
 
+    if value.chars().all(|c| c.is_ascii_digit()) {
+        return value
+            .parse::<u64>()
+            .map(Duration::from_secs)
+            .map_err(|_| SimpleDurationParseError::Invalid(value.to_string()));
+    }
+
     let unit = value
         .chars()
         .last()

@@ -5,6 +5,11 @@ use super::{
 use std::time::Duration;
 
 #[test]
+fn bare_number_reads_as_seconds() {
+    assert_eq!(parse_simple_duration("90").unwrap(), Duration::from_secs(90));
+}
+
+#[test]
 fn simple_duration_parser_supports_suffixes_and_decimals() {
     assert_eq!(
         parse_simple_duration("30s").unwrap(),
