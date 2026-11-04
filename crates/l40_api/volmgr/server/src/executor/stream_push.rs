@@ -21,6 +21,8 @@ mod btrfs;
 const MIB: usize = 1024 * 1024;
 const PART_BYTES: usize = 64 * MIB;
 const PIPE_BYTES: usize = 8 * MIB;
+/// Consumed staged input between page-cache release hints.
+const ADVICE_WINDOW_BYTES: u64 = 64 * MIB as u64;
 /// Service part budget when no deployment sets one: sixteen parts shared by
 /// every upload on the node. Zero selects file uploads.
 pub const DEFAULT_STREAM_PUSH_BUFFER_BUDGET_BYTES: usize = 16 * PART_BYTES;
@@ -71,6 +73,7 @@ pub(super) struct StreamPushConfig {
     producers: Arc<tokio::sync::Semaphore>,
     part_bytes: usize,
     min_source_bytes: u64,
+    advice_window_bytes: u64,
 }
 
 impl StreamPushConfig {
@@ -83,6 +86,7 @@ impl StreamPushConfig {
             producers: Arc::new(tokio::sync::Semaphore::new(max_producers)),
             part_bytes: PART_BYTES,
             min_source_bytes: CODEC_ADMISSION_MIN_INPUT_BYTES,
+            advice_window_bytes: ADVICE_WINDOW_BYTES,
         })
     }
 
@@ -184,6 +188,7 @@ impl TransferExecutor {
             },
             cancellation,
             artifact,
+            config.advice_window_bytes,
         );
         let wire_bytes = uploader
             .put_stream(creds, target, source, config.budget.clone(), options)
@@ -245,6 +250,7 @@ fn compression_source(
     admission: ProducerAdmission,
     cancellation: CancellationToken,
     artifact: &'static str,
+    advice_window_bytes: u64,
 ) -> UploadSource {
     let (reader, writer) = tokio::io::duplex(PIPE_BYTES);
     let producer_token = cancellation.clone();
@@ -258,6 +264,7 @@ fn compression_source(
             cancellation: producer_token.clone(),
             consumed: 0,
             advised_through: 0,
+            advice_window_bytes,
         };
         let mut output = PipeWriter {
             writer,
@@ -314,6 +321,7 @@ struct SourceReader {
     cancellation: CancellationToken,
     consumed: u64,
     advised_through: u64,
+    advice_window_bytes: u64,
 }
 
 impl Read for SourceReader {
@@ -326,8 +334,8 @@ impl Read for SourceReader {
         // This immutable staged inode is read once per attempt. Release clean
         // pages behind the encoder without evicting its unread input. Retrying
         // still reads the durable file; the hint changes cache residency only.
-        const ADVICE_WINDOW: u64 = 64 * MIB as u64;
-        let through = self.consumed / ADVICE_WINDOW * ADVICE_WINDOW;
+        let window = self.advice_window_bytes;
+        let through = self.consumed / window * window;
         if through > self.advised_through {
             if let Err(error) = page_cache::advise_range_dontneed(
                 &self.file,

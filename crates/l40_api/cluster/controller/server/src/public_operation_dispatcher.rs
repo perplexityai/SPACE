@@ -110,6 +110,10 @@ pub struct ReconcilerConfig {
     pub org_slot_headroom: usize,
     /// Kill switch for the keyed work queue: off restores the unkeyed claim.
     pub keyed_claim_enabled: bool,
+    /// How long the loop waits after a claim that took nothing because work
+    /// was held back; see [`HELD_BACK_CLAIM_BACKOFF`]. Not read from the
+    /// environment: only tests shorten it.
+    pub held_back_claim_backoff: Duration,
     /// How each claimed operation is renewed, retried and bounded: the same
     /// settings, read from the same variables, as inline execution in the
     /// API. Its `defer_retry_waits` is the retry-deferral kill switch,
@@ -130,6 +134,7 @@ impl Default for ReconcilerConfig {
             org_slot_limit: NonZeroU32::new(DEFAULT_ORG_SLOT_LIMIT),
             org_slot_headroom: DEFAULT_ORG_SLOT_HEADROOM as usize,
             keyed_claim_enabled: true,
+            held_back_claim_backoff: HELD_BACK_CLAIM_BACKOFF,
             execution: OperationExecutionConfig::default(),
         }
     }
@@ -185,6 +190,7 @@ impl ReconcilerConfig {
             ) as usize,
             keyed_claim_enabled: config
                 .truthy_default(KEYED_CLAIM_ENABLED_ENV, default.keyed_claim_enabled),
+            held_back_claim_backoff: default.held_back_claim_backoff,
             // Shared with inline execution in the API, which must renew,
             // retry and bound an operation as this loop does.
             execution: OperationExecutionConfig::from_environment(env),
@@ -457,7 +463,10 @@ pub async fn run<E>(
                 #[cfg(test)]
                 tests::before_claim().await;
                 let started = Instant::now();
-                match claim_up_to(&config, &store, &executor, claim_slots).await {
+                let claim = claim_up_to(&config, &store, &executor, claim_slots).await;
+                #[cfg(test)]
+                tests::after_claim().await;
+                match claim {
                     Ok(claim) => {
                         // An execution that committed while the claim ran
                         // must not make its successor look busy.
@@ -472,7 +481,7 @@ pub async fn run<E>(
                         claim_backoff_until = (claimed == 0
                             && (claim.org_limit_held_back || claim_slots.free_other == 0)
                             && !finished_meanwhile)
-                            .then(|| Instant::now() + HELD_BACK_CLAIM_BACKOFF);
+                            .then(|| Instant::now() + config.held_back_claim_backoff);
                         for operation in claim.operations {
                             let key = config
                                 .keyed_claim_enabled

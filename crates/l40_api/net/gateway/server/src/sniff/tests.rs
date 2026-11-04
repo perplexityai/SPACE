@@ -117,7 +117,9 @@ async fn a_late_client_hello_is_seen_only_when_its_absence_would_be_denied() {
                 let _ = client.write_all(&hello).await;
                 tokio::time::sleep(Duration::from_millis(100)).await;
             },
-            move |server| async move { client_hello_with_detail(&server, missing).await },
+            move |server| async move {
+                client_hello_with_detail(&server, missing, PeekBudget::DEFAULT).await
+            },
         )
         .await;
 
@@ -157,7 +159,9 @@ async fn the_completion_budget_starts_with_the_first_handshake_bytes() {
             client.write_all(&tail).await.unwrap();
             tokio::time::sleep(Duration::from_millis(100)).await;
         },
-        |server| async move { client_hello_with_detail(&server, MissingClientHello::Denied).await },
+        |server| async move {
+            client_hello_with_detail(&server, MissingClientHello::Denied, PeekBudget::DEFAULT).await
+        },
     )
     .await;
 
@@ -172,12 +176,22 @@ async fn the_completion_budget_starts_with_the_first_handshake_bytes() {
 
 #[tokio::test]
 async fn a_client_that_never_writes_still_times_out_under_the_fail_closed_budget() {
+    // Shortened from the production bound so the test does not wait it out,
+    // yet still several times FIRST_BYTES_TIMEOUT, so reaching it shows the
+    // denied path waited for its own bound rather than the proceeding one.
+    let budget = PeekBudget {
+        fail_closed_first_bytes: Duration::from_millis(250),
+        ..PeekBudget::DEFAULT
+    };
+    assert!(budget.fail_closed_first_bytes > 4 * FIRST_BYTES_TIMEOUT);
     let observation = with_loopback_pair(
-        |client| async move {
-            tokio::time::sleep(FAIL_CLOSED_FIRST_BYTES_TIMEOUT + Duration::from_millis(200)).await;
+        move |client| async move {
+            tokio::time::sleep(budget.fail_closed_first_bytes + Duration::from_millis(200)).await;
             drop(client);
         },
-        |server| async move { client_hello_with_detail(&server, MissingClientHello::Denied).await },
+        |server| async move {
+            client_hello_with_detail(&server, MissingClientHello::Denied, budget).await
+        },
     )
     .await;
 
@@ -187,7 +201,7 @@ async fn a_client_that_never_writes_still_times_out_under_the_fail_closed_budget
         Some(MissingSniDetail::FirstByteTimeout)
     );
     assert!(
-        observation.elapsed >= FAIL_CLOSED_FIRST_BYTES_TIMEOUT,
+        observation.elapsed >= budget.fail_closed_first_bytes,
         "waited only {:?}",
         observation.elapsed
     );

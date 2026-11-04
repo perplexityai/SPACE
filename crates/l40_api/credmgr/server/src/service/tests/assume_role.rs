@@ -11,6 +11,7 @@ use aws_config::web_identity_token::{StaticConfiguration, WebIdentityTokenCreden
 use aws_credential_types::Credentials;
 use aws_credential_types::credential_fn::provide_credentials_fn;
 use aws_credential_types::provider::SharedCredentialsProvider;
+use aws_sdk_sts::config::{AsyncSleep, Sleep};
 use aws_sdk_sts::error::ConnectorError;
 use aws_smithy_http_client::tls;
 use aws_smithy_runtime_api::client::http::{
@@ -31,7 +32,7 @@ const SESSION_POLICY: &str = r#"{"Version":"2012-10-17","Statement":[]}"#;
 /// Bounds the silent-endpoint case only. Every other case runs without an
 /// attempt timeout, as production does, so a slow runner cannot turn a
 /// rejection into a timeout.
-const ATTEMPT_TIMEOUT: Duration = Duration::from_millis(500);
+const ATTEMPT_TIMEOUT: Duration = Duration::from_millis(250);
 
 /// How the fake STS endpoint answers. The container credential endpoint
 /// reuses the transport failures.
@@ -182,6 +183,23 @@ fn static_credentials() -> SharedCredentialsProvider {
     ))
 }
 
+/// The SDK's own HTTPS client, trusting no roots. Every fake endpoint here is
+/// plain HTTP, so no root is ever consulted, and loading the platform's roots
+/// costs seconds per test process on macOS.
+fn http_client() -> SharedHttpClient {
+    aws_smithy_http_client::Builder::new()
+        .tls_provider(tls::Provider::Rustls(
+            tls::rustls_provider::CryptoMode::AwsLc,
+        ))
+        .tls_context(
+            tls::TlsContext::builder()
+                .with_trust_store(tls::TrustStore::empty())
+                .build()
+                .unwrap(),
+        )
+        .build_https()
+}
+
 async fn sts_config(
     endpoint: String,
     base: SharedCredentialsProvider,
@@ -190,6 +208,7 @@ async fn sts_config(
     let mut loader = aws_config::defaults(aws_config::BehaviorVersion::latest())
         .region(aws_config::Region::new("us-east-1"))
         .endpoint_url(endpoint)
+        .http_client(http_client())
         .credentials_provider(base)
         .retry_config(RetryConfig::disabled());
     if let Some(timeout) = attempt_timeout {
@@ -205,11 +224,6 @@ async fn sts_config(
 /// Web-identity base credentials, as an IRSA deployment gives the authority,
 /// whose `AssumeRoleWithWebIdentity` call goes to `endpoint`.
 fn web_identity(endpoint: String, token_file: PathBuf) -> SharedCredentialsProvider {
-    let http_client = aws_smithy_http_client::Builder::new()
-        .tls_provider(tls::Provider::Rustls(
-            tls::rustls_provider::CryptoMode::AwsLc,
-        ))
-        .build_https();
     SharedCredentialsProvider::new(
         WebIdentityTokenCredentialsProvider::builder()
             .static_configuration(StaticConfiguration {
@@ -220,11 +234,29 @@ fn web_identity(endpoint: String, token_file: PathBuf) -> SharedCredentialsProvi
             .configure(
                 &ProviderConfig::without_region()
                     .with_region(Some(aws_config::Region::new("us-east-1")))
-                    .with_http_client(redirect(http_client, endpoint))
+                    .with_http_client(redirect(http_client(), endpoint))
                     .with_retry_config(RetryConfig::disabled()),
             )
             .build(),
     )
+}
+
+/// Runs every SDK sleep at a tenth of its length.
+///
+/// The container credential provider retries a transient failure with the
+/// standard jittered backoff, up to a few seconds in all, whenever its config
+/// carries a sleep, and the loader always supplies one. Shortened, the same
+/// retries still run. The provider's connect and read timeouts and the
+/// credentials cache's load timeout shrink with them, to a fifth of a second
+/// and more, which a loopback endpoint that refuses or answers at once never
+/// reaches, and the cache's bound keeps its margin over the whole backoff.
+#[derive(Debug)]
+struct ScaledSleep;
+
+impl AsyncSleep for ScaledSleep {
+    fn sleep(&self, duration: Duration) -> Sleep {
+        Sleep::new(tokio::time::sleep(duration / 10))
+    }
 }
 
 /// The default credentials chain with only the container credential
@@ -232,6 +264,7 @@ fn web_identity(endpoint: String, token_file: PathBuf) -> SharedCredentialsProvi
 async fn container_config(endpoint: String) -> aws_config::SdkConfig {
     let full_uri = format!("{endpoint}/credentials");
     aws_config::defaults(aws_config::BehaviorVersion::latest())
+        .sleep_impl(ScaledSleep)
         .env(Env::from_slice(&[(
             "AWS_CONTAINER_CREDENTIALS_FULL_URI",
             full_uri.as_str(),
@@ -239,6 +272,7 @@ async fn container_config(endpoint: String) -> aws_config::SdkConfig {
         .fs(Fs::from_slice(&[]))
         .region(aws_config::Region::new("us-east-1"))
         .endpoint_url(endpoint)
+        .http_client(http_client())
         .retry_config(RetryConfig::disabled())
         .load()
         .await
@@ -319,146 +353,42 @@ impl Case {
 
 /// Transient STS and base-identity failures must stay retryable;
 /// authorization and configuration rejections must not.
+#[rstest::rstest]
+#[case::connection_refused(Case::AssumeRole(FakeSts::Refused), Code::Unavailable)]
+#[case::attempt_timeout(Case::AssumeRole(FakeSts::Silent), Code::Unavailable)]
+#[case::connect_timeout(Case::Sdk(|| SdkError::dispatch_failure(ConnectorError::timeout("connect timed out".into()))), Code::Unavailable)]
+#[case::connection_closed(Case::AssumeRole(FakeSts::Hangup), Code::Unavailable)]
+#[case::truncated_response(Case::AssumeRole(FakeSts::Truncated), Code::Unavailable)]
+#[case::service_unavailable(Case::AssumeRole(FakeSts::Error { status: 503, code: "ServiceUnavailable" }), Code::Unavailable)]
+#[case::throttling(Case::AssumeRole(FakeSts::Error { status: 400, code: "Throttling" }), Code::Unavailable)]
+#[case::request_timeout(Case::AssumeRole(FakeSts::Error { status: 400, code: "RequestTimeout" }), Code::Unavailable)]
+#[case::not_implemented(Case::AssumeRole(FakeSts::Error { status: 501, code: "NotImplemented" }), Code::FailedPrecondition)]
+#[case::unparseable_response(Case::AssumeRole(FakeSts::Unparseable), Code::FailedPrecondition)]
+#[case::access_denied(Case::AssumeRole(FakeSts::Error { status: 403, code: "AccessDenied" }), Code::FailedPrecondition)]
+#[case::invalid_client_credentials(Case::AssumeRole(FakeSts::Error { status: 403, code: "InvalidClientTokenId" }), Code::FailedPrecondition)]
+#[case::malformed_session_policy(Case::AssumeRole(FakeSts::Error { status: 400, code: "MalformedPolicyDocument" }), Code::FailedPrecondition)]
+#[case::base_connection_refused(Case::WebIdentity(FakeSts::Refused), Code::Unavailable)]
+#[case::base_service_unavailable(Case::WebIdentity(FakeSts::Error { status: 503, code: "ServiceUnavailable" }), Code::Unavailable)]
+#[case::base_identity_provider_unreachable(Case::WebIdentity(FakeSts::Error { status: 400, code: "IDPCommunicationError" }), Code::Unavailable)]
+#[case::base_access_denied(Case::WebIdentity(FakeSts::Error { status: 403, code: "AccessDenied" }), Code::FailedPrecondition)]
+#[case::base_missing_token_file(Case::MissingTokenFile, Code::FailedPrecondition)]
+#[case::base_source_role_throttled(Case::SourceRole(FakeSts::Error { status: 400, code: "Throttling" }), Code::Unavailable)]
+#[case::base_provider_timed_out(Case::BaseProvider(|| CredentialsError::provider_timed_out(Duration::from_secs(5))), Code::Unavailable)]
+#[case::base_container_endpoint_refused(Case::Container(FakeSts::Refused), Code::Unavailable)]
+#[case::base_container_endpoint_truncated_response(
+    Case::Container(FakeSts::Truncated),
+    Code::Unavailable
+)]
+#[case::base_no_credentials_configured(Case::BaseProvider(|| CredentialsError::not_loaded("no providers in chain")), Code::FailedPrecondition)]
 #[tokio::test]
-async fn sts_failures_are_unavailable_only_when_transient() {
-    let error = |status, code| FakeSts::Error { status, code };
-    let cases = [
-        (
-            "connection refused",
-            Case::AssumeRole(FakeSts::Refused),
-            Code::Unavailable,
-        ),
-        (
-            "attempt timeout",
-            Case::AssumeRole(FakeSts::Silent),
-            Code::Unavailable,
-        ),
-        (
-            "connect timeout",
-            Case::Sdk(|| {
-                SdkError::dispatch_failure(ConnectorError::timeout("connect timed out".into()))
-            }),
-            Code::Unavailable,
-        ),
-        (
-            "connection closed",
-            Case::AssumeRole(FakeSts::Hangup),
-            Code::Unavailable,
-        ),
-        (
-            "truncated response",
-            Case::AssumeRole(FakeSts::Truncated),
-            Code::Unavailable,
-        ),
-        (
-            "service unavailable",
-            Case::AssumeRole(error(503, "ServiceUnavailable")),
-            Code::Unavailable,
-        ),
-        (
-            "throttling",
-            Case::AssumeRole(error(400, "Throttling")),
-            Code::Unavailable,
-        ),
-        (
-            "request timeout",
-            Case::AssumeRole(error(400, "RequestTimeout")),
-            Code::Unavailable,
-        ),
-        (
-            "not implemented",
-            Case::AssumeRole(error(501, "NotImplemented")),
-            Code::FailedPrecondition,
-        ),
-        (
-            "unparseable response",
-            Case::AssumeRole(FakeSts::Unparseable),
-            Code::FailedPrecondition,
-        ),
-        (
-            "access denied",
-            Case::AssumeRole(error(403, "AccessDenied")),
-            Code::FailedPrecondition,
-        ),
-        (
-            "invalid client credentials",
-            Case::AssumeRole(error(403, "InvalidClientTokenId")),
-            Code::FailedPrecondition,
-        ),
-        (
-            "malformed session policy",
-            Case::AssumeRole(error(400, "MalformedPolicyDocument")),
-            Code::FailedPrecondition,
-        ),
-        (
-            "base: connection refused",
-            Case::WebIdentity(FakeSts::Refused),
-            Code::Unavailable,
-        ),
-        (
-            "base: service unavailable",
-            Case::WebIdentity(error(503, "ServiceUnavailable")),
-            Code::Unavailable,
-        ),
-        (
-            "base: identity provider unreachable",
-            Case::WebIdentity(error(400, "IDPCommunicationError")),
-            Code::Unavailable,
-        ),
-        (
-            "base: access denied",
-            Case::WebIdentity(error(403, "AccessDenied")),
-            Code::FailedPrecondition,
-        ),
-        (
-            "base: missing token file",
-            Case::MissingTokenFile,
-            Code::FailedPrecondition,
-        ),
-        (
-            "base: source role throttled",
-            Case::SourceRole(error(400, "Throttling")),
-            Code::Unavailable,
-        ),
-        (
-            "base: provider timed out",
-            Case::BaseProvider(|| CredentialsError::provider_timed_out(Duration::from_secs(5))),
-            Code::Unavailable,
-        ),
-        (
-            "base: container endpoint refused",
-            Case::Container(FakeSts::Refused),
-            Code::Unavailable,
-        ),
-        (
-            "base: container endpoint truncated response",
-            Case::Container(FakeSts::Truncated),
-            Code::Unavailable,
-        ),
-        (
-            "base: no credentials configured",
-            Case::BaseProvider(|| CredentialsError::not_loaded("no providers in chain")),
-            Code::FailedPrecondition,
-        ),
-    ];
-
-    let mut expected = Vec::new();
-    let mut actual = Vec::new();
-    let mut statuses = Vec::new();
-    for (name, case, code) in cases {
-        let status = case.status().await;
-        expected.push((name, code));
-        actual.push((name, status.code()));
-        statuses.push((name, status));
-    }
-    assert_eq!(actual, expected);
+async fn sts_failures_are_unavailable_only_when_transient(#[case] case: Case, #[case] code: Code) {
+    let status = case.status().await;
+    assert_eq!(status.code(), code, "{status:?}");
     // The node agent relays only a reason-carrying `Unavailable` as the
     // authority's answer rather than a lost link.
-    for (name, status) in statuses {
-        assert_eq!(
-            pplx_space_credmgr_client::status_is_sts_unavailable(&status),
-            status.code() == Code::Unavailable,
-            "{name}: only a transient failure carries the STS reason"
-        );
-    }
+    assert_eq!(
+        pplx_space_credmgr_client::status_is_sts_unavailable(&status),
+        code == Code::Unavailable,
+        "only a transient failure carries the STS reason"
+    );
 }

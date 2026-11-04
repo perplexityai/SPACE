@@ -608,12 +608,14 @@ struct NodeLocalHandoff {
 }
 
 /// Suspend `sandbox_id` up to its backup handoff. The runtime probe reads the
-/// scratch run directory, where nothing runs, unless `runtime_live`.
+/// scratch run directory, where nothing runs, unless `runtime_live`. Uploads
+/// retry after `upload_retry_secs`, or after the production backoff.
 async fn node_local_handoff(
     sandbox_id: SandboxId,
     volume_manager: &FakeVolumeManager,
     scratch: &std::path::Path,
     runtime_live: bool,
+    upload_retry_secs: Option<u64>,
 ) -> NodeLocalHandoff {
     use crate::service::tests::service_tests::{insert_test_sandbox, runtime_fields};
     use pplx_space_common_core::types::ExecutionGeneration;
@@ -633,6 +635,7 @@ async fn node_local_handoff(
     if runtime_live {
         options.sandbox_runtime_live = std::sync::Arc::new(|_| true);
     }
+    options.snapshot_upload_retry_backoff_secs = upload_retry_secs.map(|secs| vec![secs]);
     let service = SandboxManagerService::new_with_options(conn, options);
     let artifact_id = LocalArtifactId::new();
     let snapshot_dir = scratch.join("suspend");
@@ -679,7 +682,7 @@ async fn suspended_after_node_local_upload(
         artifact_id,
         snapshot_dir,
         handoff,
-    } = node_local_handoff(sandbox_id, volume_manager, scratch, false).await;
+    } = node_local_handoff(sandbox_id, volume_manager, scratch, false, None).await;
     match upload {
         // The refusal would roll a real suspend back when the handoff meets
         // it; one only the worker meets leaves the suspend published, which
@@ -1098,7 +1101,18 @@ async fn upload_after_refused_handoff(after: AfterRefusedHandoff) -> String {
         artifact_id,
         handoff,
         ..
-    } = node_local_handoff(sandbox_id, &volume_manager, scratch.path(), runtime_live).await;
+    } = node_local_handoff(
+        sandbox_id,
+        &volume_manager,
+        scratch.path(),
+        runtime_live,
+        // The retry must find vol-mgr taking pushes again, which the test
+        // arranges within milliseconds of the refusal. An immediate retry
+        // could spend every attempt before then; the queue's whole-second
+        // granularity makes one second the shortest delay that can't.
+        Some(1),
+    )
+    .await;
     if matches!(after, AfterRefusedHandoff::QuarantinedLive) {
         // The quarantine the failure falls back to when the rollback's write
         // fails; the test can't fail that write.

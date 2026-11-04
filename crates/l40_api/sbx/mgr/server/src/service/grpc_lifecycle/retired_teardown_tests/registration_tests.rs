@@ -379,14 +379,17 @@ async fn a_restart_suspended_teardown_capture_never_registers_unfenced() {
             };
             let result = tokio::time::timeout(
                 Duration::from_secs(3),
-                service.ensure_teardown_suspend_backup(
-                    &row,
-                    TeardownSuspendBackup {
-                        execution_generation: generation(GENERATION),
-                        artifact: &artifact,
-                        format: SuspendSnapshotFormat::Full,
-                        origin: super::super::TeardownBackupOrigin::PreviouslySuspended,
-                    },
+                answered_or_admitted(
+                    refused.staged,
+                    service.ensure_teardown_suspend_backup(
+                        &row,
+                        TeardownSuspendBackup {
+                            execution_generation: generation(GENERATION),
+                            artifact: &artifact,
+                            format: SuspendSnapshotFormat::Full,
+                            origin: super::super::TeardownBackupOrigin::PreviouslySuspended,
+                        },
+                    ),
                 ),
             )
             .await;
@@ -394,14 +397,15 @@ async fn a_restart_suspended_teardown_capture_never_registers_unfenced() {
             let admitted = admitted_registrations()
                 .iter()
                 .any(|line| line.contains(&staged));
-            assert_eq!(
-                admitted, !fenced,
-                "recorded {recorded}, upload retained {upload_retained}: {result:?}"
-            );
+            let case = format!("recorded {recorded}, upload retained {upload_retained}");
+            assert_eq!(admitted, !fenced, "{case}");
             if fenced {
-                result
-                    .expect("a refused registration answers at once")
-                    .expect_err("a refused registration can't make the suspend durable");
+                let Drive::Answered(result) =
+                    result.expect("a refused registration answers at once")
+                else {
+                    panic!("{case}: a refused registration was admitted");
+                };
+                result.expect_err("a refused registration can't make the suspend durable");
             }
             drain(service).await;
         }
@@ -641,8 +645,9 @@ async fn first_request_of_a_staged_capture_carries_the_teardown_generation() {
                 .unwrap();
                 let (service, _dispatched) = service_recording_cleanup(conn);
 
-                let result = service
-                    .enqueue_artifact_backup(internal_request(
+                let drive = answered_or_admitted(
+                    staged,
+                    service.enqueue_artifact_backup(internal_request(
                         crate::proto::EnqueueArtifactBackupRequest {
                             sandbox_id: sandbox_id_string.clone(),
                             expected_artifact_kind: crate::proto::ArtifactKind::Full as i32,
@@ -652,12 +657,21 @@ async fn first_request_of_a_staged_capture_carries_the_teardown_generation() {
                                 ),
                             ),
                         },
-                    ))
-                    .await;
-                let verdict = result.as_ref().err().and_then(|error| {
-                    pplx_space_node_api_client::cluster::backup_execution_superseded_generation(error)
-                });
-                assert_eq!(verdict, carried, "{state}, recorded {recorded}: {result:?}");
+                    )),
+                )
+                .await;
+                // The stub admits only a registration that names no
+                // generation, so an admitted one carried none.
+                let (verdict, result) = match drive {
+                    Drive::Answered(result) => (
+                        result.as_ref().err().and_then(|error| {
+                            pplx_space_node_api_client::cluster::backup_execution_superseded_generation(error)
+                        }),
+                        format!("{result:?}"),
+                    ),
+                    Drive::Admitted => (None, "admitted".to_string()),
+                };
+                assert_eq!(verdict, carried, "{state}, recorded {recorded}: {result}");
                 drain(&service).await;
             }
         },

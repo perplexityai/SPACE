@@ -186,68 +186,69 @@ fn extract_tar_payload_rejects_corrupt_or_truncated_archives() {
     assert_eq!(fs::read_dir(staging.path()).unwrap().count(), 0);
 }
 
-#[test]
-fn extract_tar_payload_generated_link_orders_cannot_modify_outside_staging() {
+/// The link targets each generated archive's two symlinks take.
+const LINK_TARGETS: [&str; 8] = [
+    "..",
+    "../..",
+    "../../outside",
+    "up/../outside",
+    "./up/../../outside",
+    "real",
+    "link",
+    "missing",
+];
+
+/// One case per source and `up` target; each tries every `link` target, entry
+/// order and kind.
+#[rstest::rstest]
+fn extract_tar_payload_generated_link_orders_cannot_modify_outside_staging(
+    #[values(None, Some("prefix/tree"))] source: Option<&str>,
+    #[values(0, 1, 2, 3, 4, 5, 6, 7)] up: usize,
+) {
     use std::os::unix::fs::PermissionsExt;
 
-    let targets = [
-        "..",
-        "../..",
-        "../../outside",
-        "up/../outside",
-        "./up/../../outside",
-        "real",
-        "link",
-        "missing",
-    ];
-    for source in [None, Some("prefix/tree")] {
-        for up in targets {
-            for link in targets {
-                for order in [
-                    [0, 1, 2],
-                    [0, 2, 1],
-                    [1, 0, 2],
-                    [1, 2, 0],
-                    [2, 0, 1],
-                    [2, 1, 0],
-                ] {
-                    for kind in [tar::EntryType::Regular, tar::EntryType::Directory] {
-                        let temp = tempfile::tempdir().unwrap();
-                        let staging = temp.path().join("staging");
-                        let outside = temp.path().join("outside");
-                        fs::create_dir(&staging).unwrap();
-                        fs::create_dir(&outside).unwrap();
-                        fs::write(outside.join("canary"), b"untouched").unwrap();
-                        fs::set_permissions(
-                            outside.join("canary"),
-                            fs::Permissions::from_mode(0o600),
-                        )
-                        .unwrap();
-                        let entries = [
-                            (tar::EntryType::Symlink, "prefix/tree/up", up),
-                            (tar::EntryType::Symlink, "prefix/tree/link", link),
-                            (kind, "prefix/tree/link/new", "payload"),
-                        ];
-                        let archive = tar_archive(&order.map(|index| entries[index]));
+    let up = LINK_TARGETS[up];
+    for link in LINK_TARGETS {
+        for order in [
+            [0, 1, 2],
+            [0, 2, 1],
+            [1, 0, 2],
+            [1, 2, 0],
+            [2, 0, 1],
+            [2, 1, 0],
+        ] {
+            for kind in [tar::EntryType::Regular, tar::EntryType::Directory] {
+                let temp = tempfile::tempdir().unwrap();
+                let staging = temp.path().join("staging");
+                let outside = temp.path().join("outside");
+                fs::create_dir(&staging).unwrap();
+                fs::create_dir(&outside).unwrap();
+                fs::write(outside.join("canary"), b"untouched").unwrap();
+                fs::set_permissions(outside.join("canary"), fs::Permissions::from_mode(0o600))
+                    .unwrap();
+                let entries = [
+                    (tar::EntryType::Symlink, "prefix/tree/up", up),
+                    (tar::EntryType::Symlink, "prefix/tree/link", link),
+                    (kind, "prefix/tree/link/new", "payload"),
+                ];
+                let archive = tar_archive(&order.map(|index| entries[index]));
 
-                        let _result = extract_tar_payload(archive.path(), &staging, source);
+                let _result = extract_tar_payload(archive.path(), &staging, source);
 
-                        assert_eq!(
-                            fs::read(outside.join("canary")).unwrap(),
-                            b"untouched",
-                            "{source:?} {up} {link} {order:?} {kind:?}"
-                        );
-                        assert_eq!(
-                            fs::metadata(outside.join("canary"))
-                                .unwrap()
-                                .permissions()
-                                .mode()
-                                & 0o777,
-                            0o600
-                        );
-                        assert_eq!(fs::read_dir(&outside).unwrap().count(), 1);
-                    }
-                }
+                assert_eq!(
+                    fs::read(outside.join("canary")).unwrap(),
+                    b"untouched",
+                    "{source:?} {up} {link} {order:?} {kind:?}"
+                );
+                assert_eq!(
+                    fs::metadata(outside.join("canary"))
+                        .unwrap()
+                        .permissions()
+                        .mode()
+                        & 0o777,
+                    0o600
+                );
+                assert_eq!(fs::read_dir(&outside).unwrap().count(), 1);
             }
         }
     }

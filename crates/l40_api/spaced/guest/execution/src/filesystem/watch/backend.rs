@@ -36,14 +36,22 @@ const RAW_EVENT_BUFFER_CAPACITY: usize = 4_096;
 // Discovery candidates are coalesced while the single per-root scan is in
 // flight. Keeping a separate bound prevents rename-heavy workloads from
 // moving unbounded path storage behind an otherwise bounded raw-event queue.
+#[cfg(not(test))]
 const DIRECTORY_DISCOVERY_CANDIDATE_CAPACITY: usize = 4_096;
+// Tests overflow these bounds with real directories. Scaled together, the
+// recheck bound stays below discovery's, as it is in production.
+#[cfg(test)]
+const DIRECTORY_DISCOVERY_CANDIDATE_CAPACITY: usize = 256;
 // Rescans of skipped directories after a permission change are recovery, not
 // completeness, so they are bounded apart from discovery candidates. What does
 // not fit waits as due, while the skipped-directory bound has room, and is
 // queued as scans free room. Verifying what a rescan brought back is
 // completeness: it takes one discovery candidate per rescan that found
 // something.
+#[cfg(not(test))]
 const DIRECTORY_RECHECK_CAPACITY: usize = 2_048;
+#[cfg(test)]
+const DIRECTORY_RECHECK_CAPACITY: usize = 128;
 
 type DirectoryScanSpawner = Arc<
     dyn Fn(

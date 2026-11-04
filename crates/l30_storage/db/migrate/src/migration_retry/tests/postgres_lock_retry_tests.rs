@@ -18,13 +18,14 @@ use super::super::*;
 use super::PROBE_VERSION;
 use crate::pg_test_support::TestResult;
 
-/// Long enough that the first attempt cannot win the lock even on a badly
-/// loaded machine, and short enough to keep the suite quick.
-const BLOCKER_HOLD: Duration = Duration::from_secs(2);
-
 /// Per-attempt bound every probe migration imposes, standing in for the `1s`
 /// or `5s` a real migration file sets.
 const PROBE_LOCK_TIMEOUT: &str = "250ms";
+
+/// [`PROBE_LOCK_TIMEOUT`] for the tests whose length is mostly lock waits and
+/// whose margins don't rest on the wait's length: the blocker never releases,
+/// so each attempt fails at its bound however short.
+const SHORT_PROBE_LOCK_TIMEOUT: &str = "50ms";
 
 /// Millisecond-scale schedule so a test spans the same number of attempts a
 /// real deploy would, in a fraction of the wall clock. The window is left
@@ -57,7 +58,7 @@ fn slow_then_bounded_migrator() -> Migrator {
             PROBE_VERSION - 1,
             Cow::Borrowed("slow but fine"),
             MigrationType::Simple,
-            sqlx::AssertSqlSafe("SELECT pg_sleep(1.2)".to_owned()).into_sql_str(),
+            sqlx::AssertSqlSafe("SELECT pg_sleep(0.5)".to_owned()).into_sql_str(),
             false,
         ),
         Migration::new(
@@ -65,7 +66,7 @@ fn slow_then_bounded_migrator() -> Migrator {
             Cow::Borrowed("probe"),
             MigrationType::Simple,
             sqlx::AssertSqlSafe(format!(
-                "SET LOCAL lock_timeout = '{PROBE_LOCK_TIMEOUT}';
+                "SET LOCAL lock_timeout = '{SHORT_PROBE_LOCK_TIMEOUT}';
                  ALTER TABLE lock_probe ADD COLUMN observed_at TIMESTAMPTZ;"
             ))
             .into_sql_str(),
@@ -152,7 +153,7 @@ async fn count_idle_in_transaction(conn: &mut PgConnection, ignore: i32) -> Test
     .await?)
 }
 
-/// Samples every 50ms until `deadline`, counting how many samples catch a
+/// Samples every 20ms until `deadline`, counting how many samples catch a
 /// backend other than `blocker` holding a transaction open.
 ///
 /// Returns the hit count and the sample count, so a caller cannot pass a
@@ -160,7 +161,7 @@ async fn count_idle_in_transaction(conn: &mut PgConnection, ignore: i32) -> Test
 async fn count_idle_in_transaction_samples(
     url: &str,
     blocker: i32,
-    deadline: Duration,
+    deadline: Instant,
 ) -> TestResult<(u32, u32)> {
     let mut conn = PgConnection::connect(url).await?;
 
@@ -175,18 +176,44 @@ async fn count_idle_in_transaction_samples(
          count below would prove nothing"
     );
 
-    let started = Instant::now();
     let mut caught = 0;
     let mut taken = 0;
-    while started.elapsed() < deadline {
+    while Instant::now() < deadline {
         if count_idle_in_transaction(&mut conn, blocker).await? > 0 {
             caught += 1;
         }
         taken += 1;
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
     conn.close().await?;
     Ok((caught, taken))
+}
+
+/// Waits until a migration attempt has given up its wait on the blocker and
+/// the next attempt has started one, failing after a few seconds otherwise.
+/// A blocker released then has outlived an attempt.
+async fn wait_for_a_retried_lock_wait(observer: &mut PgConnection) -> TestResult {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    // Waiting (attempt 1), not waiting (its backoff), waiting (attempt 2).
+    let mut changes = 0;
+    let mut waiting = false;
+    while changes < 3 {
+        if Instant::now() >= deadline {
+            return Err("no migration attempt retried its lock wait".into());
+        }
+        let waiters: i64 = sqlx::query_scalar(sql!(
+            "SELECT count(*) FROM pg_stat_activity
+              WHERE datname = current_database() AND wait_event_type = 'Lock'"
+        ))
+        .fetch_one(&mut *observer)
+        .await?;
+        if (waiters > 0) != waiting {
+            waiting = !waiting;
+            changes += 1;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    Ok(())
 }
 
 async fn probe_column_exists(pool: &PgPool) -> TestResult<bool> {
@@ -235,11 +262,15 @@ async fn lock_timeout_retries_until_the_blocker_releases() -> TestResult {
 
     let mut holder = PgConnection::connect(&fixture.database_url).await?;
     let blocker = lock_probe_table(&mut holder).await?;
+    let mut observer = PgConnection::connect(&fixture.database_url).await?;
 
+    // The blocker is released while the second attempt waits on it, however
+    // long the first took to start and fail.
     let migrator = bounded_alter_migrator();
     let (run, release) = tokio::join!(run_up(&fixture.pool, &migrator, fast_policy(12)), async {
-        tokio::time::sleep(BLOCKER_HOLD).await;
-        blocker.rollback().await
+        wait_for_a_retried_lock_wait(&mut observer).await?;
+        blocker.rollback().await?;
+        TestResult::Ok(())
     });
     release?;
     let attempt = run?;
@@ -417,7 +448,7 @@ async fn the_backoff_does_not_hold_the_failed_transaction_open() -> TestResult {
     // backoff.
     let migrator = probe_migrator(
         format!(
-            "SET LOCAL lock_timeout = '{PROBE_LOCK_TIMEOUT}';
+            "SET LOCAL lock_timeout = '{SHORT_PROBE_LOCK_TIMEOUT}';
              ALTER TABLE lock_probe_second ADD COLUMN observed_at TIMESTAMPTZ;
              ALTER TABLE lock_probe ADD COLUMN observed_at TIMESTAMPTZ;"
         ),
@@ -432,36 +463,36 @@ async fn the_backoff_does_not_hold_the_failed_transaction_open() -> TestResult {
     // would be visible across most of the sampling window.
     let policy = LockRetryPolicy {
         attempts: NonZeroU32::new(2).expect("two attempts is non-zero"),
-        initial_backoff: Duration::from_secs(3),
-        max_backoff: Duration::from_secs(3),
+        initial_backoff: Duration::from_millis(600),
+        max_backoff: Duration::from_millis(600),
         max_total_wait: Duration::from_secs(60),
     };
-    // Stop sampling well before attempt 2 fails at ~3.5s (250ms + 3s backoff +
-    // 250ms), so the count can only be reporting on the backoff itself. An
-    // unflushed rollback is visible from ~250ms onward, so this window still
-    // carries ~37 samples of signal — the figure the mutation actually measures.
+    // Stop sampling well before attempt 2 fails, no earlier than 700ms (50ms +
+    // 600ms backoff + 50ms) after the run starts, so the count can only be
+    // reporting on the backoff itself. The deadline is fixed before either
+    // side starts, so a slow sampler connection shortens the window rather
+    // than pushing it past that failure. An unflushed rollback is visible
+    // from ~50ms onward, so this window carries ~20 samples of signal.
+    let sample_until = Instant::now() + Duration::from_millis(500);
     let (run, sampled) = tokio::join!(
         run_up(&fixture.pool, &migrator, policy),
-        count_idle_in_transaction_samples(
-            &fixture.database_url,
-            blocker_pid,
-            Duration::from_millis(2200)
-        )
+        count_idle_in_transaction_samples(&fixture.database_url, blocker_pid, sample_until)
     );
 
     let failure = run.expect_err("the blocker never releases, so every attempt must lose");
     assert_eq!(failure.attempt, 2);
     let (caught, taken) = sampled?;
     assert!(
-        taken > 20,
+        taken >= 10,
         "only {taken} samples taken; the window collapsed"
     );
     // Not zero-tolerance: the failed transaction legitimately exists for the
     // moment between the statement failing and the flush, and a scheduler stall
-    // can stretch that past a 50ms sample. The discrimination is not 0-vs-1 — an
-    // unflushed rollback spans the whole backoff and shows up in most samples
-    // (measured: 37 of 42), so a handful of transient hits still reads clean and
-    // a real regression sits an order of magnitude above this threshold.
+    // can stretch that past a 20ms sample. The discrimination is not 0-vs-1 — an
+    // unflushed rollback spans the whole backoff and shows up in nearly every
+    // sample after the first attempt fails (measured: 18 of 21), so a handful
+    // of transient hits still reads clean and a real regression sits well
+    // above this threshold.
     assert!(
         caught <= 4,
         "the rolled-back migration transaction was left open during the backoff \
@@ -484,19 +515,21 @@ async fn migrations_that_applied_do_not_spend_the_retry_window() -> TestResult {
     let blocker = lock_probe_table(&mut holder).await?;
 
     // The window is smaller than the successful migration's own runtime, so a
-    // clock started at run start would stand at ~1450ms by the first failure
-    // (1.2s sleep + the 250ms lock wait) and deny every retry. Measured from
-    // the failure it reads zero, and the run gets its full budget: attempt 2
-    // lands at ~300ms of retry time. Both margins are wide on purpose — 650ms
-    // of slack before the window would cut attempt 3 short, 500ms before a
-    // run-start clock would stop failing — because this is the tightest-timed
-    // test in the file and it must not become a flake. This is the batch case
-    // the retry matters most for: the biggest release has the most contention.
+    // clock started at run start would stand at ~550ms by the first failure
+    // (0.5s sleep + the 50ms lock wait) and, with the 25ms backoff ahead,
+    // deny every retry. Measured from the failure it reads zero, and the run
+    // gets its full budget: the check before attempt 3 reads ~100ms of retry
+    // time. The margins: 300ms of slack before the window would cut attempt 3
+    // short, which only scheduling delay eats into, and 175ms before a
+    // run-start clock would stop failing, which no delay can shrink because
+    // the sleep and the lock waits are timed by the server. This is the batch
+    // case the retry matters most for: the biggest release has the most
+    // contention.
     let policy = LockRetryPolicy {
         attempts: NonZeroU32::new(3).expect("three attempts is non-zero"),
-        initial_backoff: Duration::from_millis(50),
-        max_backoff: Duration::from_millis(50),
-        max_total_wait: Duration::from_millis(1000),
+        initial_backoff: Duration::from_millis(25),
+        max_backoff: Duration::from_millis(25),
+        max_total_wait: Duration::from_millis(400),
     };
     let failure = run_up(&fixture.pool, &slow_then_bounded_migrator(), policy)
         .await
@@ -504,7 +537,7 @@ async fn migrations_that_applied_do_not_spend_the_retry_window() -> TestResult {
 
     assert_eq!(
         failure.attempt, 3,
-        "a 1.2s migration that applied cleanly must not consume the retry window"
+        "a 0.5s migration that applied cleanly must not consume the retry window"
     );
     assert_lock_timeout_on_probe(&failure);
     // The slow migration committed on the first attempt and was skipped after.

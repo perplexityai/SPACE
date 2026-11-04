@@ -1344,12 +1344,66 @@ mod cross_org_routes {
         Ok(())
     }
 
+    /// A route this module mirrors: its method, path suffix and body, and the
+    /// answer field that names what a replay replays.
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum MirrorRoute {
+        TerminalSessions,
+        Commands,
+        ForceRollback,
+        Snapshots,
+    }
+
+    impl MirrorRoute {
+        fn request(
+            self,
+        ) -> (
+            Method,
+            &'static str,
+            Option<serde_json::Value>,
+            &'static str,
+        ) {
+            match self {
+                Self::TerminalSessions => (
+                    Method::POST,
+                    "/terminal-sessions",
+                    Some(json!({"size": {"rows": 24, "cols": 80}})),
+                    "/id",
+                ),
+                Self::Commands => (
+                    Method::POST,
+                    "/commands",
+                    Some(
+                        json!({"command": ["true"], "cwd": null, "env": {}, "pty": null, "stdin": false, "timeout": null}),
+                    ),
+                    "/session_id",
+                ),
+                Self::ForceRollback => (
+                    Method::POST,
+                    ":force-rollback",
+                    Some(json!({"snapshot_name": "checkpoint-1"})),
+                    "/operation_id",
+                ),
+                Self::Snapshots => (Method::GET, "/snapshots", None, "/data/0/id"),
+            }
+        }
+    }
+
     /// The routes this module mirrors take every sandbox ID form the other
     /// admin sandbox routes take, and record the canonical `sbx_` ID: one
     /// idempotency key sent under different forms replays one request, the
     /// operation targets the canonical ID, and so does every audit event.
+    #[rstest::rstest]
     #[tokio::test]
-    async fn the_mirror_routes_accept_every_admin_sandbox_id_form() -> TestResult {
+    async fn the_mirror_routes_accept_every_admin_sandbox_id_form(
+        #[values(
+            MirrorRoute::TerminalSessions,
+            MirrorRoute::Commands,
+            MirrorRoute::ForceRollback,
+            MirrorRoute::Snapshots
+        )]
+        route: MirrorRoute,
+    ) -> TestResult {
         let Some(harness) = admin_router_harness_with(|state| {
             state.native_hidden_operations = HiddenOperationsGate::all_orgs();
         })
@@ -1381,68 +1435,49 @@ mod cross_org_routes {
             format!("space-sbx-{undashed}-g3"),
             format!("%20{dashed}%09"),
         ];
-        let command = json!({"command": ["true"], "cwd": null, "env": {}, "pty": null, "stdin": false, "timeout": null});
-        let routes = [
-            (
-                Method::POST,
-                "/terminal-sessions",
-                Some(json!({"size": {"rows": 24, "cols": 80}})),
-                "/id",
-            ),
-            (Method::POST, "/commands", Some(command), "/session_id"),
-            (
-                Method::POST,
-                ":force-rollback",
-                Some(json!({"snapshot_name": "checkpoint-1"})),
-                "/operation_id",
-            ),
-            (Method::GET, "/snapshots", None, "/data/0/id"),
-        ];
-        for (method, suffix, body, replayed) in routes.clone() {
-            let key = [("idempotency-key", suffix)];
-            let mut answers = Vec::new();
-            for form in &forms {
-                let path = format!("/sandboxes/{form}{suffix}");
-                let (status, answer) = harness
-                    .as_operator(method.clone(), &path, &key, body.clone())
-                    .await;
-                assert!(status.is_success(), "{method} {path}: {status} {answer}");
-                let replayed = answer.pointer(replayed).cloned();
-                assert!(replayed.is_some(), "{method} {path}: {answer}");
-                answers.push(replayed);
-                let events = harness.audit_events(&path).await;
-                assert_eq!(events.len(), 1, "{method} {path}: {events:?}");
-                assert_names_sandbox(&events[0], &harness, sandbox);
-            }
-            assert!(
-                answers.iter().all(|answer| *answer == answers[0]),
-                "{method} {suffix}: every form answers as the first, replaying its request or naming its snapshot: {answers:?}"
-            );
+        let (method, suffix, body, replayed) = route.request();
+        let key = [("idempotency-key", suffix)];
+        let mut answers = Vec::new();
+        for form in &forms {
+            let path = format!("/sandboxes/{form}{suffix}");
+            let (status, answer) = harness
+                .as_operator(method.clone(), &path, &key, body.clone())
+                .await;
+            assert!(status.is_success(), "{method} {path}: {status} {answer}");
+            let replayed = answer.pointer(replayed).cloned();
+            assert!(replayed.is_some(), "{method} {path}: {answer}");
+            answers.push(replayed);
+            let events = harness.audit_events(&path).await;
+            assert_eq!(events.len(), 1, "{method} {path}: {events:?}");
+            assert_names_sandbox(&events[0], &harness, sandbox);
         }
-        let (_, page) = harness
-            .as_operator(
-                Method::GET,
-                &format!("/sandboxes/{sandbox}/snapshots"),
-                &[],
-                None,
-            )
-            .await;
-        assert_eq!(
-            page["data"][0]["id"],
-            pplx_space_public_api::PublicSnapshotId::from(
-                pplx_space_common_core::types::SnapshotId::from_uuid(snapshot_id)
-            )
-            .to_string(),
-            "every form's page names the seeded snapshot"
+        assert!(
+            answers.iter().all(|answer| *answer == answers[0]),
+            "{method} {suffix}: every form answers as the first, replaying its request or naming its snapshot: {answers:?}"
         );
-        let targets: Vec<Option<String>> = sqlx::query_scalar(sql!(
-            "SELECT target_id FROM public_operations WHERE org_id = $1 AND kind = $2"
-        ))
-        .bind(harness.tenant_org.as_uuid())
-        .bind(OperationKind::RollbackSandbox.as_str())
-        .fetch_all(&harness.db.pool)
-        .await?;
-        assert_eq!(targets, vec![Some(sandbox.to_string())]);
+        match route {
+            MirrorRoute::Snapshots => assert_eq!(
+                answers[0],
+                Some(serde_json::Value::String(
+                    pplx_space_public_api::PublicSnapshotId::from(
+                        pplx_space_common_core::types::SnapshotId::from_uuid(snapshot_id)
+                    )
+                    .to_string()
+                )),
+                "every form's page names the seeded snapshot"
+            ),
+            MirrorRoute::ForceRollback => {
+                let targets: Vec<Option<String>> = sqlx::query_scalar(sql!(
+                    "SELECT target_id FROM public_operations WHERE org_id = $1 AND kind = $2"
+                ))
+                .bind(harness.tenant_org.as_uuid())
+                .bind(OperationKind::RollbackSandbox.as_str())
+                .fetch_all(&harness.db.pool)
+                .await?;
+                assert_eq!(targets, vec![Some(sandbox.to_string())]);
+            }
+            MirrorRoute::TerminalSessions | MirrorRoute::Commands => {}
+        }
 
         for form in [
             format!("SBX_{dashed}"),
@@ -1450,17 +1485,20 @@ mod cross_org_routes {
             format!("sandbox-{dashed}"),
             format!("space-sbx-{dashed}"),
         ] {
-            for (method, suffix, body, _) in routes.clone() {
-                let path = format!("/sandboxes/{form}{suffix}");
-                let (status, error) = harness
-                    .as_operator(method, &path, &[("idempotency-key", "refused")], body)
-                    .await;
-                assert_eq!(status, StatusCode::BAD_REQUEST, "{path}: {error}");
-                assert!(
-                    error.to_string().contains("sandbox id must be sbx_<uuid>"),
-                    "{path}: {error}"
-                );
-            }
+            let path = format!("/sandboxes/{form}{suffix}");
+            let (status, error) = harness
+                .as_operator(
+                    method.clone(),
+                    &path,
+                    &[("idempotency-key", "refused")],
+                    body.clone(),
+                )
+                .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{path}: {error}");
+            assert!(
+                error.to_string().contains("sandbox id must be sbx_<uuid>"),
+                "{path}: {error}"
+            );
         }
         Ok(())
     }

@@ -193,6 +193,7 @@ impl DirectRestoreCandidate {
 pub struct DirectSubstrate {
     pool: PgPool,
     worker_channels: std::sync::Arc<super::worker_channels::WorkerChannels>,
+    builder_connect_retry_policy: pplx_space_common_grpc::GrpcRetryPolicy,
 }
 
 const DIRECT_NODE_CREATE_FAILURE_TTL_SECS: i64 = 10;
@@ -932,7 +933,21 @@ impl DirectSubstrate {
                 DIRECT_NODE_CONNECT_TIMEOUT,
                 DIRECT_NODE_RPC_TIMEOUT,
             )),
+            builder_connect_retry_policy:
+                pplx_space_common_grpc::DEFAULT_TCP_GRPC_CONNECT_RETRY_POLICY,
         }
+    }
+
+    /// Dial builders under `policy`. A test whose builder refuses every
+    /// connection sets a short one, so the dial gives up in milliseconds
+    /// rather than after the default policy's ten seconds of retries.
+    #[cfg(test)]
+    pub(crate) fn with_builder_connect_retry_policy(
+        mut self,
+        policy: pplx_space_common_grpc::GrpcRetryPolicy,
+    ) -> Self {
+        self.builder_connect_retry_policy = policy;
+        self
     }
 
     async fn persist_route_identity_receipt(
@@ -3787,7 +3802,7 @@ impl DirectSubstrate {
                     continue;
                 }
             };
-            match connect_builder(endpoint).await {
+            match connect_builder(endpoint, self.builder_connect_retry_policy).await {
                 Ok(client) => return Ok(client),
                 Err(error) => {
                     tracing::warn!(
@@ -4921,11 +4936,13 @@ impl SubstrateAdapter for DirectSubstrate {
             ))
         })?;
         let endpoint = Self::endpoint(&node.node_api_endpoint).map_err(ControllerError::from)?;
-        connect_builder(endpoint).await.map_err(|error| {
-            ControllerError::service_unavailable(format!(
-                "builder node {node_id} is not reachable: {error}"
-            ))
-        })
+        connect_builder(endpoint, self.builder_connect_retry_policy)
+            .await
+            .map_err(|error| {
+                ControllerError::service_unavailable(format!(
+                    "builder node {node_id} is not reachable: {error}"
+                ))
+            })
     }
 
     async fn resolve_node_api_endpoint(

@@ -248,8 +248,15 @@ enum WakeRefusal {
 /// create: the
 /// [`unavailable_apiserver`] refuses the create with a 503 and its read then
 /// finds no pod, which is a 500.
+#[rstest::rstest]
 #[tokio::test(flavor = "current_thread")]
-async fn wake_refuses_teardown_and_terminal_lifecycles_before_admission() -> TestResult {
+async fn wake_refuses_teardown_and_terminal_lifecycles_before_admission(
+    #[values(
+        SandboxAction::Wake,
+        SandboxAction::ImplicitWake(ExecutionActivityKind::Access)
+    )]
+    action: SandboxAction,
+) -> TestResult {
     let db = pg_test_db_with_max_connections(3).await?;
     let pool = &db.pool;
     let controller = kubernetes_controller_with_empty_cluster_admission(pool);
@@ -286,68 +293,63 @@ async fn wake_refuses_teardown_and_terminal_lifecycles_before_admission() -> Tes
         (stored.as_str(), refusal)
     });
     for (lifecycle, refusal) in stored {
-        for action in [
-            SandboxAction::Wake,
-            SandboxAction::ImplicitWake(ExecutionActivityKind::Access),
-        ] {
-            let case = format!("{action:?} on {lifecycle}");
-            let sandbox_id = SandboxId::new();
-            insert_sandbox(pool, sandbox_id, lifecycle, "k8s").await?;
-            let sandbox = tracked(pool, sandbox_id).await?;
+        let case = format!("{action:?} on {lifecycle}");
+        let sandbox_id = SandboxId::new();
+        insert_sandbox(pool, sandbox_id, lifecycle, "k8s").await?;
+        let sandbox = tracked(pool, sandbox_id).await?;
 
-            let error = bounded(
-                &case,
-                run_action(&controller, pool, sandbox_id, Some(&sandbox), action, None),
-            )
-            .await?
-            .expect_err("the empty cluster admits no wake");
+        let error = bounded(
+            &case,
+            run_action(&controller, pool, sandbox_id, Some(&sandbox), action, None),
+        )
+        .await?
+        .expect_err("the empty cluster admits no wake");
 
-            let message = error.to_string();
-            match refusal {
-                WakeRefusal::EntryGuard => {
-                    assert_eq!(error.status(), StatusCode::CONFLICT, "{case}");
-                    assert_eq!(
-                        message,
-                        format!("sandbox cannot be woken while lifecycle is {lifecycle}"),
-                    );
-                    assert_eq!(
-                        row(pool, sandbox_id).await?,
-                        Some(Row::new(lifecycle, "unplaced"))
-                    );
-                }
-                WakeRefusal::Admission => {
-                    assert_eq!(
-                        error.status(),
-                        StatusCode::TOO_MANY_REQUESTS,
-                        "{case}: {message}"
-                    );
-                    assert_eq!(
-                        row(pool, sandbox_id).await?,
-                        Some(Row::new(lifecycle, "unplaced")),
-                        "{case}"
-                    );
-                }
-                WakeRefusal::SuspendInFlight => {
-                    assert_eq!(error.status(), StatusCode::SERVICE_UNAVAILABLE, "{case}");
-                    assert_eq!(
-                        message,
-                        format!(
-                            "sandbox {sandbox_id} suspend finalization is in flight; retry \
-                             activation after the current execution is retired"
-                        ),
-                    );
-                }
-                WakeRefusal::PodCreate => {
-                    assert_eq!(
-                        error.status(),
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "{case}: {message}"
-                    );
-                    assert!(
-                        message.starts_with("failed to create sandbox pod"),
-                        "{case}: {message}"
-                    );
-                }
+        let message = error.to_string();
+        match refusal {
+            WakeRefusal::EntryGuard => {
+                assert_eq!(error.status(), StatusCode::CONFLICT, "{case}");
+                assert_eq!(
+                    message,
+                    format!("sandbox cannot be woken while lifecycle is {lifecycle}"),
+                );
+                assert_eq!(
+                    row(pool, sandbox_id).await?,
+                    Some(Row::new(lifecycle, "unplaced"))
+                );
+            }
+            WakeRefusal::Admission => {
+                assert_eq!(
+                    error.status(),
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "{case}: {message}"
+                );
+                assert_eq!(
+                    row(pool, sandbox_id).await?,
+                    Some(Row::new(lifecycle, "unplaced")),
+                    "{case}"
+                );
+            }
+            WakeRefusal::SuspendInFlight => {
+                assert_eq!(error.status(), StatusCode::SERVICE_UNAVAILABLE, "{case}");
+                assert_eq!(
+                    message,
+                    format!(
+                        "sandbox {sandbox_id} suspend finalization is in flight; retry \
+                         activation after the current execution is retired"
+                    ),
+                );
+            }
+            WakeRefusal::PodCreate => {
+                assert_eq!(
+                    error.status(),
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "{case}: {message}"
+                );
+                assert!(
+                    message.starts_with("failed to create sandbox pod"),
+                    "{case}: {message}"
+                );
             }
         }
     }
@@ -464,10 +466,14 @@ async fn unreachable_runtime_fails_actions_without_writing_lifecycle() -> TestRe
 /// there and the CAS never runs: a newer suspend claim is a retryable 503
 /// (suspend finalization in flight) and a teardown or terminal lifecycle a
 /// 409, where direct answers success and a 500. Both keep the row as moved.
-/// The second pass moves the row from the route-publication hook instead,
-/// after the node acknowledged the Wake, and pins the CAS's own mapping.
+/// The `after_node_wake` case moves the row from the route-publication hook
+/// instead, after the node acknowledged the Wake, and pins the CAS's own
+/// mapping.
+#[rstest::rstest]
 #[tokio::test(flavor = "current_thread")]
-async fn wake_completion_outcome_maps_to_the_wake_response() -> TestResult {
+async fn wake_completion_outcome_maps_to_the_wake_response(
+    #[values(false, true)] after_node_wake: bool,
+) -> TestResult {
     if !crate::test_support::enter_sim_worker_process() {
         return Ok(());
     }
@@ -476,123 +482,121 @@ async fn wake_completion_outcome_maps_to_the_wake_response() -> TestResult {
     let (worker, node_id) = start_kubernetes_sim_worker(pool).await?;
     install_lifecycle_write_on_route_publication(pool).await?;
 
-    for after_node_wake in [false, true] {
-        for moved_to in [
-            None,
-            Some("suspending"),
-            Some("stopping"),
-            Some("stopped"),
-            Some("deleting"),
-            Some("quarantined"),
-            Some("failed"),
-        ] {
-            let sandbox_id = SandboxId::new();
-            insert_sandbox(pool, sandbox_id, "paused", "k8s").await?;
-            place_on_node(pool, sandbox_id, node_id).await?;
-            let LiveExecution {
-                pod,
-                route_activation_id,
-            } = insert_live_execution(pool, sandbox_id, RouteIdentity::Legacy).await?;
-            insert_kubernetes_resident(worker.state(), sandbox_id, "paused", route_activation_id)
-                .await?;
-            let (controller, _) = controller_over_pods(pool, &worker, vec![pod])?;
-            let sandbox = tracked(pool, sandbox_id).await?;
-            if let Some(lifecycle) = moved_to {
-                if after_node_wake {
-                    write_lifecycle_on_route_publication(pool, sandbox_id, lifecycle).await?;
-                } else {
-                    set_lifecycle(pool, sandbox_id, lifecycle).await?;
-                }
-            }
-
-            let result = bounded(
-                (after_node_wake, moved_to),
-                run_action(
-                    &controller,
-                    pool,
-                    sandbox_id,
-                    Some(&sandbox),
-                    SandboxAction::Wake,
-                    None,
-                ),
-            )
+    for moved_to in [
+        None,
+        Some("suspending"),
+        Some("stopping"),
+        Some("stopped"),
+        Some("deleting"),
+        Some("quarantined"),
+        Some("failed"),
+    ] {
+        let sandbox_id = SandboxId::new();
+        insert_sandbox(pool, sandbox_id, "paused", "k8s").await?;
+        place_on_node(pool, sandbox_id, node_id).await?;
+        let LiveExecution {
+            pod,
+            route_activation_id,
+        } = insert_live_execution(pool, sandbox_id, RouteIdentity::Legacy).await?;
+        insert_kubernetes_resident(worker.state(), sandbox_id, "paused", route_activation_id)
             .await?;
+        let (controller, _) = controller_over_pods(pool, &worker, vec![pod])?;
+        let sandbox = tracked(pool, sandbox_id).await?;
+        if let Some(lifecycle) = moved_to {
+            if after_node_wake {
+                write_lifecycle_on_route_publication(pool, sandbox_id, lifecycle).await?;
+            } else {
+                set_lifecycle(pool, sandbox_id, lifecycle).await?;
+            }
+        }
 
-            let ok_body = serde_json::json!({
-                "ok": true,
-                "action": "wake",
-                "sandbox_id": sandbox_id.to_string(),
-            });
-            let case = format!("{moved_to:?} (after node wake: {after_node_wake})");
-            if moved_to.is_some() && after_node_wake {
+        let result = bounded(
+            (after_node_wake, moved_to),
+            run_action(
+                &controller,
+                pool,
+                sandbox_id,
+                Some(&sandbox),
+                SandboxAction::Wake,
+                None,
+            ),
+        )
+        .await?;
+
+        let ok_body = serde_json::json!({
+            "ok": true,
+            "action": "wake",
+            "sandbox_id": sandbox_id.to_string(),
+        });
+        let case = format!("{moved_to:?} (after node wake: {after_node_wake})");
+        if moved_to.is_some() && after_node_wake {
+            assert_eq!(
+                route_publications(pool, sandbox_id).await?,
+                1,
+                "{case}: the hook's write never landed"
+            );
+        }
+        match (moved_to, after_node_wake) {
+            (None, _) => {
+                assert_eq!(result?, ok_body, "{case}");
                 assert_eq!(
-                    route_publications(pool, sandbox_id).await?,
-                    1,
-                    "{case}: the hook's write never landed"
+                    row(pool, sandbox_id).await?,
+                    Some(Row::new("started", "on_node"))
                 );
             }
-            match (moved_to, after_node_wake) {
-                (None, _) => {
-                    assert_eq!(result?, ok_body, "{case}");
-                    assert_eq!(
-                        row(pool, sandbox_id).await?,
-                        Some(Row::new("started", "on_node"))
-                    );
-                }
-                (Some("suspending"), true) => {
-                    assert_eq!(
-                        result?, ok_body,
-                        "a newer suspend claim is not a wake failure"
-                    );
-                    assert_eq!(
-                        row(pool, sandbox_id).await?,
-                        Some(Row::new("suspending", "on_node"))
-                    );
-                }
-                (Some("suspending"), false) => {
-                    let error = result.expect_err("a suspend claim refuses materialization");
-                    assert_eq!(error.status(), StatusCode::SERVICE_UNAVAILABLE, "{case}");
-                    assert_eq!(
-                        error.to_string(),
-                        format!(
-                            "sandbox {sandbox_id} suspend finalization is in flight; retry \
-                             activation after the current execution is retired"
-                        ),
-                    );
-                    assert_eq!(
-                        row(pool, sandbox_id).await?,
-                        Some(Row::new("suspending", "on_node"))
-                    );
-                }
-                (Some(lifecycle), true) => {
-                    let error = result.expect_err("a lost completion CAS fails the wake");
-                    assert_eq!(error.status(), StatusCode::INTERNAL_SERVER_ERROR, "{case}");
-                    assert!(
-                        error
-                            .to_string()
-                            .starts_with("sandbox wake lost the lifecycle CAS"),
-                        "{case}: {error}"
-                    );
-                    assert_eq!(
-                        row(pool, sandbox_id).await?,
-                        Some(Row::new(lifecycle, "on_node"))
-                    );
-                }
-                (Some(lifecycle), false) => {
-                    let error = result.expect_err("a moved row refuses materialization");
-                    assert_eq!(error.status(), StatusCode::CONFLICT, "{case}");
-                    assert_eq!(
-                        error.to_string(),
-                        format!(
-                            "sandbox cannot materialize an execution after lifecycle changed \
-                             from paused to {lifecycle}"
-                        ),
-                    );
-                    assert_eq!(
-                        row(pool, sandbox_id).await?,
-                        Some(Row::new(lifecycle, "on_node"))
-                    );
-                }
+            (Some("suspending"), true) => {
+                assert_eq!(
+                    result?, ok_body,
+                    "a newer suspend claim is not a wake failure"
+                );
+                assert_eq!(
+                    row(pool, sandbox_id).await?,
+                    Some(Row::new("suspending", "on_node"))
+                );
+            }
+            (Some("suspending"), false) => {
+                let error = result.expect_err("a suspend claim refuses materialization");
+                assert_eq!(error.status(), StatusCode::SERVICE_UNAVAILABLE, "{case}");
+                assert_eq!(
+                    error.to_string(),
+                    format!(
+                        "sandbox {sandbox_id} suspend finalization is in flight; retry \
+                         activation after the current execution is retired"
+                    ),
+                );
+                assert_eq!(
+                    row(pool, sandbox_id).await?,
+                    Some(Row::new("suspending", "on_node"))
+                );
+            }
+            (Some(lifecycle), true) => {
+                let error = result.expect_err("a lost completion CAS fails the wake");
+                assert_eq!(error.status(), StatusCode::INTERNAL_SERVER_ERROR, "{case}");
+                assert!(
+                    error
+                        .to_string()
+                        .starts_with("sandbox wake lost the lifecycle CAS"),
+                    "{case}: {error}"
+                );
+                assert_eq!(
+                    row(pool, sandbox_id).await?,
+                    Some(Row::new(lifecycle, "on_node"))
+                );
+            }
+            (Some(lifecycle), false) => {
+                let error = result.expect_err("a moved row refuses materialization");
+                assert_eq!(error.status(), StatusCode::CONFLICT, "{case}");
+                assert_eq!(
+                    error.to_string(),
+                    format!(
+                        "sandbox cannot materialize an execution after lifecycle changed \
+                         from paused to {lifecycle}"
+                    ),
+                );
+                assert_eq!(
+                    row(pool, sandbox_id).await?,
+                    Some(Row::new(lifecycle, "on_node"))
+                );
             }
         }
     }
@@ -635,8 +639,71 @@ enum Landing {
 /// The row keeps the terminal lifecycle in every case. Its placement is kept
 /// too, except after start's Wake: the substrate itself records the pod's
 /// node placement (`persist_pod_node_placement`), so that row ends `on_node`.
+#[rstest::rstest]
+#[case::start_before_action(
+    SandboxAction::Start,
+    "stopped",
+    "stopped",
+    "started",
+    Landing::BeforeAction
+)]
+#[case::start_after_wake_ack(
+    SandboxAction::Start,
+    "stopped",
+    "stopped",
+    "started",
+    Landing::AfterWakeAck
+)]
+#[case::resume_before_action(
+    SandboxAction::Resume,
+    "paused",
+    "paused",
+    "started",
+    Landing::BeforeAction
+)]
+#[case::pause_before_action(
+    SandboxAction::Pause,
+    "started",
+    "running",
+    "paused",
+    Landing::BeforeAction
+)]
+#[case::stop_before_action(
+    SandboxAction::Stop,
+    "started",
+    "running",
+    "stopped",
+    Landing::BeforeAction
+)]
+#[case::kill_before_action(
+    SandboxAction::Kill,
+    "started",
+    "running",
+    "stopped",
+    Landing::BeforeAction
+)]
+#[case::suspend_before_action(
+    SandboxAction::Suspend,
+    "started",
+    "running",
+    "suspended",
+    Landing::BeforeAction
+)]
+#[case::suspend_with_suspend_finalization(
+    SandboxAction::Suspend,
+    "started",
+    "running",
+    "suspended",
+    Landing::WithSuspendFinalization
+)]
 #[tokio::test(flavor = "current_thread")]
-async fn completed_actions_keep_a_terminal_lifecycle_that_landed_mid_flight() -> TestResult {
+async fn completed_actions_keep_a_terminal_lifecycle_that_landed_mid_flight(
+    #[case] action: SandboxAction,
+    #[case] prior: &str,
+    #[case] resident: &str,
+    #[case] completed: &str,
+    #[case] landing: Landing,
+) -> TestResult {
     if !crate::test_support::enter_sim_worker_process() {
         return Ok(());
     }
@@ -646,161 +713,99 @@ async fn completed_actions_keep_a_terminal_lifecycle_that_landed_mid_flight() ->
     install_lifecycle_write_on_route_publication(pool).await?;
     install_lifecycle_write_on_suspend_finalization(pool).await?;
 
-    for (action, prior, resident, completed, landing) in [
-        (
-            SandboxAction::Start,
-            "stopped",
-            "stopped",
-            "started",
-            Landing::BeforeAction,
-        ),
-        (
-            SandboxAction::Start,
-            "stopped",
-            "stopped",
-            "started",
-            Landing::AfterWakeAck,
-        ),
-        (
-            SandboxAction::Resume,
-            "paused",
-            "paused",
-            "started",
-            Landing::BeforeAction,
-        ),
-        (
-            SandboxAction::Pause,
-            "started",
-            "running",
-            "paused",
-            Landing::BeforeAction,
-        ),
-        (
-            SandboxAction::Stop,
-            "started",
-            "running",
-            "stopped",
-            Landing::BeforeAction,
-        ),
-        (
-            SandboxAction::Kill,
-            "started",
-            "running",
-            "stopped",
-            Landing::BeforeAction,
-        ),
-        (
-            SandboxAction::Suspend,
-            "started",
-            "running",
-            "suspended",
-            Landing::BeforeAction,
-        ),
-        (
-            SandboxAction::Suspend,
-            "started",
-            "running",
-            "suspended",
-            Landing::WithSuspendFinalization,
-        ),
-    ] {
-        let completed_placement = if action == SandboxAction::Start {
-            "on_node"
-        } else {
-            "unplaced"
-        };
-        let route = if landing == Landing::AfterWakeAck {
-            RouteIdentity::Legacy
-        } else {
-            RouteIdentity::Published
-        };
-        // The same exclusion as the direct test: only the lifecycles both
-        // guard families treat as terminal.
-        let terminal = ["failed", "quarantined"]
-            .into_iter()
-            .chain(StoredSandboxLifecycle::tombstones_as_str())
-            .map(Some);
-        for landed in [None].into_iter().chain(terminal) {
-            let case = format!("{action:?} with {landed:?} landed {landing:?}");
-            let sandbox_id = SandboxId::new();
-            insert_sandbox(pool, sandbox_id, prior, "k8s").await?;
-            place_on_node(pool, sandbox_id, node_id).await?;
-            set_placement(pool, sandbox_id, "unplaced").await?;
-            let LiveExecution {
-                pod,
-                route_activation_id,
-            } = insert_live_execution(pool, sandbox_id, route).await?;
-            insert_kubernetes_resident(worker.state(), sandbox_id, resident, route_activation_id)
-                .await?;
-            let (controller, _) = controller_over_pods(pool, &worker, vec![pod])?;
-            let sandbox = tracked(pool, sandbox_id).await?;
-            if let Some(lifecycle) = landed {
-                match landing {
-                    Landing::BeforeAction => set_lifecycle(pool, sandbox_id, lifecycle).await?,
-                    Landing::AfterWakeAck => {
-                        write_lifecycle_on_route_publication(pool, sandbox_id, lifecycle).await?;
-                    }
-                    Landing::WithSuspendFinalization => {
-                        write_lifecycle_on_suspend_finalization(pool, sandbox_id, lifecycle)
-                            .await?;
-                    }
+    let completed_placement = if action == SandboxAction::Start {
+        "on_node"
+    } else {
+        "unplaced"
+    };
+    let route = if landing == Landing::AfterWakeAck {
+        RouteIdentity::Legacy
+    } else {
+        RouteIdentity::Published
+    };
+    // The same exclusion as the direct test: only the lifecycles both
+    // guard families treat as terminal.
+    let terminal = ["failed", "quarantined"]
+        .into_iter()
+        .chain(StoredSandboxLifecycle::tombstones_as_str())
+        .map(Some);
+    for landed in [None].into_iter().chain(terminal) {
+        let case = format!("{action:?} with {landed:?} landed {landing:?}");
+        let sandbox_id = SandboxId::new();
+        insert_sandbox(pool, sandbox_id, prior, "k8s").await?;
+        place_on_node(pool, sandbox_id, node_id).await?;
+        set_placement(pool, sandbox_id, "unplaced").await?;
+        let LiveExecution {
+            pod,
+            route_activation_id,
+        } = insert_live_execution(pool, sandbox_id, route).await?;
+        insert_kubernetes_resident(worker.state(), sandbox_id, resident, route_activation_id)
+            .await?;
+        let (controller, _) = controller_over_pods(pool, &worker, vec![pod])?;
+        let sandbox = tracked(pool, sandbox_id).await?;
+        if let Some(lifecycle) = landed {
+            match landing {
+                Landing::BeforeAction => set_lifecycle(pool, sandbox_id, lifecycle).await?,
+                Landing::AfterWakeAck => {
+                    write_lifecycle_on_route_publication(pool, sandbox_id, lifecycle).await?;
+                }
+                Landing::WithSuspendFinalization => {
+                    write_lifecycle_on_suspend_finalization(pool, sandbox_id, lifecycle).await?;
                 }
             }
-
-            // Boxed for stack margin, as in the untracked-actions twin: at
-            // opt-level 0, as CI builds it, this test needs 1.375-1.5 MiB of
-            // libtest's 2 MiB stack.
-            let run = Box::pin(run_action(
-                &controller,
-                pool,
-                sandbox_id,
-                Some(&sandbox),
-                action,
-                None,
-            ));
-            let result = bounded(&case, run).await?;
-
-            let ok_body = serde_json::json!({
-                "ok": true,
-                "action": action.as_str(),
-                "sandbox_id": sandbox_id.to_string(),
-            });
-            if landed.is_some() {
-                let landed_writes = match landing {
-                    Landing::BeforeAction => 1,
-                    Landing::AfterWakeAck => route_publications(pool, sandbox_id).await?,
-                    Landing::WithSuspendFinalization => {
-                        suspend_finalizations(pool, sandbox_id).await?
-                    }
-                };
-                assert_eq!(landed_writes, 1, "{case}: the hook's write never landed");
-            }
-            match (landed, action, landing) {
-                (Some(lifecycle), SandboxAction::Start, Landing::BeforeAction) => {
-                    let error = result.expect_err("start refuses a terminal lifecycle");
-                    assert_eq!(error.status(), StatusCode::CONFLICT, "{case}");
-                    assert_eq!(
-                        error.to_string(),
-                        format!("sandbox cannot be started while lifecycle is {lifecycle}"),
-                    );
-                }
-                (Some(_), SandboxAction::Suspend, Landing::BeforeAction) => {
-                    let error = result.expect_err("suspend cannot claim a terminal lifecycle");
-                    assert_eq!(error.status(), StatusCode::SERVICE_UNAVAILABLE, "{case}");
-                    assert_eq!(
-                        error.to_string(),
-                        "sandbox execution changed before suspend ownership was claimed"
-                    );
-                }
-                _ => assert_eq!(result?, ok_body, "{case}"),
-            }
-            let expected = match (landed, landing) {
-                (None, _) => Row::new(completed, completed_placement),
-                (Some(lifecycle), Landing::AfterWakeAck) => Row::new(lifecycle, "on_node"),
-                (Some(lifecycle), _) => Row::new(lifecycle, "unplaced"),
-            };
-            assert_eq!(row(pool, sandbox_id).await?, Some(expected), "{case}");
         }
+
+        // Boxed for stack margin, as in the untracked-actions twin: at
+        // opt-level 0, as CI builds it, this test needs 1.375-1.5 MiB of
+        // libtest's 2 MiB stack.
+        let run = Box::pin(run_action(
+            &controller,
+            pool,
+            sandbox_id,
+            Some(&sandbox),
+            action,
+            None,
+        ));
+        let result = bounded(&case, run).await?;
+
+        let ok_body = serde_json::json!({
+            "ok": true,
+            "action": action.as_str(),
+            "sandbox_id": sandbox_id.to_string(),
+        });
+        if landed.is_some() {
+            let landed_writes = match landing {
+                Landing::BeforeAction => 1,
+                Landing::AfterWakeAck => route_publications(pool, sandbox_id).await?,
+                Landing::WithSuspendFinalization => suspend_finalizations(pool, sandbox_id).await?,
+            };
+            assert_eq!(landed_writes, 1, "{case}: the hook's write never landed");
+        }
+        match (landed, action, landing) {
+            (Some(lifecycle), SandboxAction::Start, Landing::BeforeAction) => {
+                let error = result.expect_err("start refuses a terminal lifecycle");
+                assert_eq!(error.status(), StatusCode::CONFLICT, "{case}");
+                assert_eq!(
+                    error.to_string(),
+                    format!("sandbox cannot be started while lifecycle is {lifecycle}"),
+                );
+            }
+            (Some(_), SandboxAction::Suspend, Landing::BeforeAction) => {
+                let error = result.expect_err("suspend cannot claim a terminal lifecycle");
+                assert_eq!(error.status(), StatusCode::SERVICE_UNAVAILABLE, "{case}");
+                assert_eq!(
+                    error.to_string(),
+                    "sandbox execution changed before suspend ownership was claimed"
+                );
+            }
+            _ => assert_eq!(result?, ok_body, "{case}"),
+        }
+        let expected = match (landed, landing) {
+            (None, _) => Row::new(completed, completed_placement),
+            (Some(lifecycle), Landing::AfterWakeAck) => Row::new(lifecycle, "on_node"),
+            (Some(lifecycle), _) => Row::new(lifecycle, "unplaced"),
+        };
+        assert_eq!(row(pool, sandbox_id).await?, Some(expected), "{case}");
     }
     Ok(())
 }

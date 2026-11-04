@@ -2662,7 +2662,9 @@ fn create_translation_rejects_unsupported_fields() {
 /// metadata without size limits.
 #[tokio::test]
 async fn sandbox_list_pages_stop_at_the_byte_budget() -> TestResult {
-    const MIB: usize = 1024 * 1024;
+    use crate::controllers::sandbox::list_page::TEST_SANDBOX_LIST_PAGE_BYTES;
+    // An eighth of the budget, as 1 MiB is of the production one.
+    const UNIT: usize = TEST_SANDBOX_LIST_PAGE_BYTES as usize / 8;
     let db = pg_test_db().await?;
     let org = sqlx::query_as::<_, Organization>(sql!(
         "SELECT id, name, slug, parent_id, theme_primary, theme_secondary, logo_url,
@@ -2673,11 +2675,11 @@ async fn sandbox_list_pages_stop_at_the_byte_budget() -> TestResult {
     .bind(SEED_ORG_ID)
     .fetch_one(&db.pool)
     .await?;
-    // Newest first: one row over the whole budget, four 3 MiB rows, then two
-    // small ones. They are suspended, which ECW lists as paused.
+    // Newest first: one row over the whole budget, four three-unit rows, then
+    // two small ones. They are suspended, which ECW lists as paused.
     let newest = OffsetDateTime::from_unix_timestamp(1_800_000_000)?;
-    let sizes = std::iter::once(9 * MIB)
-        .chain(std::iter::repeat_n(3 * MIB, 4))
+    let sizes = std::iter::once(9 * UNIT)
+        .chain(std::iter::repeat_n(3 * UNIT, 4))
         .chain(std::iter::repeat_n(16, 2));
     let mut expected = Vec::new();
     for (offset, size) in sizes.enumerate() {
@@ -2700,10 +2702,12 @@ async fn sandbox_list_pages_stop_at_the_byte_budget() -> TestResult {
         .await?;
         expected.push(sandbox_id.to_string());
     }
+    let mut state = AppState::from_pool(db.pool.clone()).await?;
+    state.sandbox_controller.list_page_max_bytes = TEST_SANDBOX_LIST_PAGE_BYTES;
     let app = e2b_api_routes()
         .layer(Extension(AuthOrg(org)))
         .layer(Extension(test_ecw_host_config()))
-        .with_state(AppState::from_pool(db.pool.clone()).await?);
+        .with_state(state);
 
     let mut pages = Vec::new();
     let mut next_token: Option<String> = None;
@@ -2743,8 +2747,8 @@ async fn sandbox_list_pages_stop_at_the_byte_budget() -> TestResult {
         }
     }
 
-    // The oversized row comes back alone; 3 MiB rows fit two to a page, and
-    // the small rows fit beside the last two.
+    // The oversized row comes back alone; three-unit rows fit two to a page,
+    // and the small rows fit beside the last two.
     assert_eq!(
         pages.iter().map(Vec::len).collect::<Vec<_>>(),
         vec![1, 2, 4]
@@ -3647,17 +3651,77 @@ struct ConnectRouteRequestShape {
     body: Option<&'static str>,
 }
 
+/// A connect request's shape, and the deadline extension it asks for.
+#[derive(Debug)]
+struct ConnectDeadlineCase {
+    label: &'static str,
+    path_prefix: &'static str,
+    body: Option<&'static str>,
+    requested_timeout_secs: Option<u32>,
+}
+
+#[rstest::rstest]
+#[case::legacy_empty_body(ConnectDeadlineCase {
+    label: "legacy empty body",
+    path_prefix: "",
+    body: None,
+    requested_timeout_secs: None,
+})]
+#[case::legacy_empty_object(ConnectDeadlineCase {
+    label: "legacy empty object",
+    path_prefix: "",
+    body: Some("{}"),
+    requested_timeout_secs: None,
+})]
+#[case::v2_empty_body(ConnectDeadlineCase {
+    label: "v2 empty body",
+    path_prefix: "/v2",
+    body: None,
+    requested_timeout_secs: Some(300),
+})]
+#[case::v2_empty_object(ConnectDeadlineCase {
+    label: "v2 empty object",
+    path_prefix: "/v2",
+    body: Some("{}"),
+    requested_timeout_secs: Some(300),
+})]
+#[case::v2_explicit_default(ConnectDeadlineCase {
+    label: "v2 explicit default",
+    path_prefix: "/v2",
+    body: Some(r#"{"timeout":300}"#),
+    requested_timeout_secs: Some(300),
+})]
+#[case::v2_explicit_shorter_timeout(ConnectDeadlineCase {
+    label: "v2 explicit shorter timeout",
+    path_prefix: "/v2",
+    body: Some(r#"{"timeout":60}"#),
+    requested_timeout_secs: Some(60),
+})]
+#[case::legacy_explicit_default(ConnectDeadlineCase {
+    label: "legacy explicit default",
+    path_prefix: "",
+    body: Some(r#"{"timeout":300}"#),
+    requested_timeout_secs: Some(300),
+})]
+#[case::legacy_explicit_longer_timeout(ConnectDeadlineCase {
+    label: "legacy explicit longer timeout",
+    path_prefix: "",
+    body: Some(r#"{"timeout":900}"#),
+    requested_timeout_secs: Some(900),
+})]
+#[case::v2_explicit_longer_timeout(ConnectDeadlineCase {
+    label: "v2 explicit longer timeout",
+    path_prefix: "/v2",
+    body: Some(r#"{"timeout":1200}"#),
+    requested_timeout_secs: Some(1_200),
+})]
 #[tokio::test(flavor = "current_thread")]
-async fn connect_route_extends_deadline_without_replacing_policy() -> TestResult {
+async fn connect_route_extends_deadline_without_replacing_policy(
+    #[case] case: ConnectDeadlineCase,
+    #[values("started", "suspended")] lifecycle: &str,
+) -> TestResult {
     if !crate::test_support::enter_sim_worker_process() {
         return Ok(());
-    }
-
-    struct Case {
-        label: &'static str,
-        path_prefix: &'static str,
-        body: Option<&'static str>,
-        requested_timeout_secs: Option<u32>,
     }
 
     let db = pg_test_db().await?;
@@ -3672,200 +3736,305 @@ async fn connect_route_extends_deadline_without_replacing_policy() -> TestResult
         .layer(Extension(test_ecw_host_config()))
         .with_state(state);
 
-    let cases = [
-        Case {
-            label: "legacy empty body",
-            path_prefix: "",
-            body: None,
-            requested_timeout_secs: None,
-        },
-        Case {
-            label: "legacy empty object",
-            path_prefix: "",
-            body: Some("{}"),
-            requested_timeout_secs: None,
-        },
-        Case {
-            label: "v2 empty body",
-            path_prefix: "/v2",
-            body: None,
-            requested_timeout_secs: Some(300),
-        },
-        Case {
-            label: "v2 empty object",
-            path_prefix: "/v2",
-            body: Some("{}"),
-            requested_timeout_secs: Some(300),
-        },
-        Case {
-            label: "v2 explicit default",
-            path_prefix: "/v2",
-            body: Some(r#"{"timeout":300}"#),
-            requested_timeout_secs: Some(300),
-        },
-        Case {
-            label: "v2 explicit shorter timeout",
-            path_prefix: "/v2",
-            body: Some(r#"{"timeout":60}"#),
-            requested_timeout_secs: Some(60),
-        },
-        Case {
-            label: "legacy explicit default",
-            path_prefix: "",
-            body: Some(r#"{"timeout":300}"#),
-            requested_timeout_secs: Some(300),
-        },
-        Case {
-            label: "legacy explicit longer timeout",
-            path_prefix: "",
-            body: Some(r#"{"timeout":900}"#),
-            requested_timeout_secs: Some(900),
-        },
-        Case {
-            label: "v2 explicit longer timeout",
-            path_prefix: "/v2",
-            body: Some(r#"{"timeout":1200}"#),
-            requested_timeout_secs: Some(1_200),
-        },
-    ];
-
-    for (lifecycle, policy_timeout) in [
-        ("started", 120),
-        ("suspended", 120),
-        ("started", 300),
-        ("suspended", 300),
-        ("started", 900),
-        ("suspended", 900),
-    ] {
-        for case in &cases {
-            let sandbox_id = SandboxId::new();
-            insert_connect_route_sandbox(
-                &db.pool,
-                sandbox_id,
-                lifecycle,
-                "on_node",
-                Some(worker_node_id),
-            )
-            .await?;
-            let policy = e2b_auto_lifecycle_policy(policy_timeout, true, false);
+    for policy_timeout in [120, 300, 900] {
+        let sandbox_id = SandboxId::new();
+        insert_connect_route_sandbox(
+            &db.pool,
+            sandbox_id,
+            lifecycle,
+            "on_node",
+            Some(worker_node_id),
+        )
+        .await?;
+        let policy = e2b_auto_lifecycle_policy(policy_timeout, true, false);
+        sqlx::query(sql!(
+            "UPDATE sandboxes
+             SET auto_lifecycle_json = $1
+             WHERE id = $2"
+        ))
+        .bind(sqlx::types::Json(&policy))
+        .bind(sandbox_id)
+        .execute(&db.pool)
+        .await?;
+        if lifecycle == "suspended" {
             sqlx::query(sql!(
-                "UPDATE sandboxes
-                 SET auto_lifecycle_json = $1
-                 WHERE id = $2"
+                "INSERT INTO sandbox_direct_route_provenance (
+                     sandbox_id,
+                     last_route_generation,
+                     last_execution_generation,
+                     updated_at
+                 )
+                 VALUES ($1, 1, 1, NOW())"
             ))
-            .bind(sqlx::types::Json(&policy))
             .bind(sandbox_id)
             .execute(&db.pool)
             .await?;
-            if lifecycle == "suspended" {
-                sqlx::query(sql!(
-                    "INSERT INTO sandbox_direct_route_provenance (
-                         sandbox_id,
-                         last_route_generation,
-                         last_execution_generation,
-                         updated_at
-                     )
-                     VALUES ($1, 1, 1, NOW())"
-                ))
-                .bind(sandbox_id)
-                .execute(&db.pool)
+        } else {
+            // Deadline mutations require the resident execution's published identity.
+            sqlx::query(sql!(
+                "INSERT INTO sandbox_direct_route_identities
+                (sandbox_id, route_generation, current_node_id, substrate_kind,
+                 execution_generation, activation_attempt_id)
+                VALUES ($1, 1, $2, 'space', 1, $3)"
+            ))
+            .bind(sandbox_id)
+            .bind(worker_node_id)
+            .bind(Uuid::now_v7())
+            .execute(&db.pool)
+            .await?;
+            worker
+                .state()
+                .ensure_default_running(&sandbox_id.to_string())
                 .await?;
-            } else {
-                // Deadline mutations require the resident execution's published identity.
-                sqlx::query(sql!(
-                    "INSERT INTO sandbox_direct_route_identities
-                    (sandbox_id, route_generation, current_node_id, substrate_kind,
-                     execution_generation, activation_attempt_id)
-                    VALUES ($1, 1, $2, 'space', 1, $3)"
-                ))
-                .bind(sandbox_id)
-                .bind(worker_node_id)
-                .bind(Uuid::now_v7())
-                .execute(&db.pool)
-                .await?;
-                worker
-                    .state()
-                    .ensure_default_running(&sandbox_id.to_string())
-                    .await?;
-            }
+        }
 
-            let accepted_at = jiff::Timestamp::now().as_second();
-            // A pre-existing extension must also survive a shorter reconnect request.
-            let previous_floor =
-                (lifecycle == "started" && policy_timeout == 900).then_some(accepted_at + 1_800);
-            if previous_floor.is_some() {
-                worker
-                    .state()
-                    .apply_access_deadline(&sandbox_id.to_string(), previous_floor, None)
-                    .await?;
-            }
-            let mut request = connect_route_request(
-                sandbox_id,
-                ConnectRouteRequestShape {
-                    label: case.label,
-                    body: case.body,
-                },
-            )?;
-            *request.uri_mut() =
-                format!("{}/sandboxes/{sandbox_id}/connect", case.path_prefix).parse()?;
-            let response = app.clone().oneshot(request).await?;
-            let completed_at = jiff::Timestamp::now().as_second();
-            let status = response.status();
-            let body = to_bytes(response.into_body(), usize::MAX).await?;
-            assert_eq!(
-                status,
-                StatusCode::OK,
-                "{lifecycle} / {policy_timeout}s / {}: {}",
-                case.label,
-                String::from_utf8_lossy(&body)
-            );
-
-            let sqlx::types::Json(stored_policy): sqlx::types::Json<AutoLifecyclePolicy> =
-                sqlx::query_scalar(sql!(
-                    "SELECT auto_lifecycle_json
-                     FROM sandboxes
-                     WHERE id = $1"
-                ))
-                .bind(sandbox_id)
-                .fetch_one(&db.pool)
+        let accepted_at = jiff::Timestamp::now().as_second();
+        // A pre-existing extension must also survive a shorter reconnect request.
+        let previous_floor =
+            (lifecycle == "started" && policy_timeout == 900).then_some(accepted_at + 1_800);
+        if previous_floor.is_some() {
+            worker
+                .state()
+                .apply_access_deadline(&sandbox_id.to_string(), previous_floor, None)
                 .await?;
-            let config = e2b_lifecycle_config_from_policy(&stored_policy)
-                .expect("connect must leave an E2B-compatible policy");
-            assert_eq!(
-                config.timeout_secs, policy_timeout,
+        }
+        let mut request = connect_route_request(
+            sandbox_id,
+            ConnectRouteRequestShape {
+                label: case.label,
+                body: case.body,
+            },
+        )?;
+        *request.uri_mut() =
+            format!("{}/sandboxes/{sandbox_id}/connect", case.path_prefix).parse()?;
+        let response = app.clone().oneshot(request).await?;
+        let completed_at = jiff::Timestamp::now().as_second();
+        let status = response.status();
+        let body = to_bytes(response.into_body(), usize::MAX).await?;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{lifecycle} / {policy_timeout}s / {}: {}",
+            case.label,
+            String::from_utf8_lossy(&body)
+        );
+
+        let sqlx::types::Json(stored_policy): sqlx::types::Json<AutoLifecyclePolicy> =
+            sqlx::query_scalar(sql!(
+                "SELECT auto_lifecycle_json
+                 FROM sandboxes
+                 WHERE id = $1"
+            ))
+            .bind(sandbox_id)
+            .fetch_one(&db.pool)
+            .await?;
+        let config = e2b_lifecycle_config_from_policy(&stored_policy)
+            .expect("connect must leave an E2B-compatible policy");
+        assert_eq!(
+            config.timeout_secs, policy_timeout,
+            "{lifecycle} / {policy_timeout}s / {}",
+            case.label
+        );
+        let record = worker.state().get(&sandbox_id.to_string()).await?;
+        if let Some(timeout) = case.requested_timeout_secs {
+            assert!(
+                record.access_extended_until.is_some_and(|deadline| {
+                    let earliest =
+                        (accepted_at + i64::from(timeout)).max(previous_floor.unwrap_or(0));
+                    let latest =
+                        (completed_at + i64::from(timeout)).max(previous_floor.unwrap_or(0));
+                    (earliest..=latest).contains(&deadline)
+                }),
                 "{lifecycle} / {policy_timeout}s / {}",
                 case.label
             );
-            let record = worker.state().get(&sandbox_id.to_string()).await?;
-            if let Some(timeout) = case.requested_timeout_secs {
-                assert!(
-                    record.access_extended_until.is_some_and(|deadline| {
-                        let earliest =
-                            (accepted_at + i64::from(timeout)).max(previous_floor.unwrap_or(0));
-                        let latest =
-                            (completed_at + i64::from(timeout)).max(previous_floor.unwrap_or(0));
-                        (earliest..=latest).contains(&deadline)
-                    }),
-                    "{lifecycle} / {policy_timeout}s / {}",
-                    case.label
-                );
-            } else {
-                assert_eq!(
-                    record.access_extended_until, previous_floor,
-                    "{lifecycle} / {policy_timeout}s / {} must retain legacy omission semantics",
-                    case.label
-                );
-            }
-            assert!(config.auto_pause, "{lifecycle} / {}", case.label);
-            assert!(!config.auto_resume, "{lifecycle} / {}", case.label);
+        } else {
+            assert_eq!(
+                record.access_extended_until, previous_floor,
+                "{lifecycle} / {policy_timeout}s / {} must retain legacy omission semantics",
+                case.label
+            );
         }
+        assert!(config.auto_pause, "{lifecycle} / {}", case.label);
+        assert!(!config.auto_resume, "{lifecycle} / {}", case.label);
     }
 
     Ok(())
 }
 
+#[rstest::rstest]
+#[case::started_active_worker_runtime_already_present(
+    ConnectRouteDbShape::ok(
+        "started active worker, runtime already present",
+        "started",
+        "on_node",
+        ConnectRouteActiveNode::ReadyWorker,
+    )
+    .with_preloaded_runtime()
+)]
+#[case::started_active_worker_runtime_missing(ConnectRouteDbShape::ok(
+    "started active worker, runtime missing",
+    "started",
+    "on_node",
+    ConnectRouteActiveNode::ReadyWorker,
+))]
+#[case::creating_active_worker_runtime_missing(ConnectRouteDbShape::ok(
+    "creating active worker, runtime missing",
+    "creating",
+    "on_node",
+    ConnectRouteActiveNode::ReadyWorker,
+))]
+#[case::starting_active_worker_runtime_missing(ConnectRouteDbShape::ok(
+    "starting active worker, runtime missing",
+    "starting",
+    "on_node",
+    ConnectRouteActiveNode::ReadyWorker,
+))]
+#[case::restoring_active_worker_runtime_missing(ConnectRouteDbShape::ok(
+    "restoring active worker, runtime missing",
+    "restoring",
+    "on_node",
+    ConnectRouteActiveNode::ReadyWorker,
+))]
+#[case::paused_active_worker_runtime_missing(ConnectRouteDbShape::ok(
+    "paused active worker, runtime missing",
+    "paused",
+    "on_node",
+    ConnectRouteActiveNode::ReadyWorker,
+))]
+#[case::suspended_active_worker_runtime_missing(ConnectRouteDbShape::ok(
+    "suspended active worker, runtime missing",
+    "suspended",
+    "on_node",
+    ConnectRouteActiveNode::ReadyWorker,
+))]
+#[case::pausing_active_worker_runtime_missing(ConnectRouteDbShape::ok(
+    "pausing active worker, runtime missing",
+    "pausing",
+    "on_node",
+    ConnectRouteActiveNode::ReadyWorker,
+))]
+#[case::resuming_active_worker_runtime_missing(ConnectRouteDbShape::ok(
+    "resuming active worker, runtime missing",
+    "resuming",
+    "on_node",
+    ConnectRouteActiveNode::ReadyWorker,
+))]
+#[case::suspending_active_worker_runtime_missing(ConnectRouteDbShape::ok(
+    "suspending active worker, runtime missing",
+    "suspending",
+    "on_node",
+    ConnectRouteActiveNode::ReadyWorker,
+))]
+#[case::started_unplaced_without_active_worker(ConnectRouteDbShape::service_unavailable(
+    "started unplaced without active worker",
+    "started",
+    "unplaced",
+    ConnectRouteActiveNode::None,
+))]
+#[case::started_on_node_without_active_worker(ConnectRouteDbShape::service_unavailable(
+    "started on_node without active worker",
+    "started",
+    "on_node",
+    ConnectRouteActiveNode::None,
+))]
+#[case::started_active_worker_id_missing(ConnectRouteDbShape::service_unavailable(
+    "started active worker id missing",
+    "started",
+    "on_node",
+    ConnectRouteActiveNode::MissingWorker,
+))]
+#[case::creating_unplaced_without_active_worker(ConnectRouteDbShape::service_unavailable(
+    "creating unplaced without active worker",
+    "creating",
+    "unplaced",
+    ConnectRouteActiveNode::None,
+))]
+#[case::stopping_teardown_row(ConnectRouteDbShape::error(
+    "stopping teardown row",
+    "stopping",
+    "on_node",
+    ConnectRouteActiveNode::ReadyWorker,
+    StatusCode::CONFLICT,
+))]
+#[case::deleting_teardown_row(ConnectRouteDbShape::error(
+    "deleting teardown row",
+    "deleting",
+    "on_node",
+    ConnectRouteActiveNode::ReadyWorker,
+    StatusCode::CONFLICT,
+))]
+#[case::cleanup_required_teardown_row(ConnectRouteDbShape::error(
+    "cleanup_required teardown row",
+    "cleanup_required",
+    "unplaced",
+    ConnectRouteActiveNode::None,
+    StatusCode::CONFLICT,
+))]
+#[case::deleted_teardown_row(ConnectRouteDbShape::error(
+    "deleted teardown row",
+    "deleted",
+    "unplaced",
+    ConnectRouteActiveNode::None,
+    StatusCode::NOT_FOUND,
+))]
+#[case::failed_terminal_row(ConnectRouteDbShape::error(
+    "failed terminal row",
+    "failed",
+    "unplaced",
+    ConnectRouteActiveNode::None,
+    StatusCode::INTERNAL_SERVER_ERROR,
+))]
+#[case::stopped_terminal_row(ConnectRouteDbShape::error(
+    "stopped terminal row",
+    "stopped",
+    "unplaced",
+    ConnectRouteActiveNode::None,
+    StatusCode::NOT_FOUND,
+))]
+#[case::started_row_with_failed_observation(
+    ConnectRouteDbShape::error(
+        "started row with failed observation",
+        "started",
+        "on_node",
+        ConnectRouteActiveNode::ReadyWorker,
+        StatusCode::INTERNAL_SERVER_ERROR,
+    )
+    .with_observed_status("failed")
+)]
+#[case::started_row_with_stopped_observation(
+    ConnectRouteDbShape::error(
+        "started row with stopped observation",
+        "started",
+        "on_node",
+        ConnectRouteActiveNode::ReadyWorker,
+        StatusCode::NOT_FOUND,
+    )
+    .with_observed_status("stopped")
+)]
+#[case::started_row_with_paused_observation(
+    ConnectRouteDbShape::ok(
+        "started row with paused observation",
+        "started",
+        "on_node",
+        ConnectRouteActiveNode::ReadyWorker,
+    )
+    .with_observed_status("paused")
+)]
+#[case::failed_row_with_running_observation(
+    ConnectRouteDbShape::error(
+        "failed row with running observation",
+        "failed",
+        "on_node",
+        ConnectRouteActiveNode::ReadyWorker,
+        StatusCode::INTERNAL_SERVER_ERROR,
+    )
+    .with_observed_status("running")
+)]
 #[tokio::test(flavor = "current_thread")]
-async fn connect_route_never_bad_gateways_for_db_state_shapes() -> TestResult {
+async fn connect_route_never_bad_gateways_for_db_state_shapes(
+    #[case] db_shape: ConnectRouteDbShape,
+) -> TestResult {
     if !crate::test_support::enter_sim_worker_process() {
         return Ok(());
     }
@@ -3892,265 +4061,102 @@ async fn connect_route_never_bad_gateways_for_db_state_shapes() -> TestResult {
             body: Some(r#"{"timeout":120}"#),
         },
     ];
-    let db_shapes = [
-        ConnectRouteDbShape::ok(
-            "started active worker, runtime already present",
-            "started",
-            "on_node",
-            ConnectRouteActiveNode::ReadyWorker,
-        )
-        .with_preloaded_runtime(),
-        ConnectRouteDbShape::ok(
-            "started active worker, runtime missing",
-            "started",
-            "on_node",
-            ConnectRouteActiveNode::ReadyWorker,
-        ),
-        ConnectRouteDbShape::ok(
-            "creating active worker, runtime missing",
-            "creating",
-            "on_node",
-            ConnectRouteActiveNode::ReadyWorker,
-        ),
-        ConnectRouteDbShape::ok(
-            "starting active worker, runtime missing",
-            "starting",
-            "on_node",
-            ConnectRouteActiveNode::ReadyWorker,
-        ),
-        ConnectRouteDbShape::ok(
-            "restoring active worker, runtime missing",
-            "restoring",
-            "on_node",
-            ConnectRouteActiveNode::ReadyWorker,
-        ),
-        ConnectRouteDbShape::ok(
-            "paused active worker, runtime missing",
-            "paused",
-            "on_node",
-            ConnectRouteActiveNode::ReadyWorker,
-        ),
-        ConnectRouteDbShape::ok(
-            "suspended active worker, runtime missing",
-            "suspended",
-            "on_node",
-            ConnectRouteActiveNode::ReadyWorker,
-        ),
-        ConnectRouteDbShape::ok(
-            "pausing active worker, runtime missing",
-            "pausing",
-            "on_node",
-            ConnectRouteActiveNode::ReadyWorker,
-        ),
-        ConnectRouteDbShape::ok(
-            "resuming active worker, runtime missing",
-            "resuming",
-            "on_node",
-            ConnectRouteActiveNode::ReadyWorker,
-        ),
-        ConnectRouteDbShape::ok(
-            "suspending active worker, runtime missing",
-            "suspending",
-            "on_node",
-            ConnectRouteActiveNode::ReadyWorker,
-        ),
-        ConnectRouteDbShape::service_unavailable(
-            "started unplaced without active worker",
-            "started",
-            "unplaced",
-            ConnectRouteActiveNode::None,
-        ),
-        ConnectRouteDbShape::service_unavailable(
-            "started on_node without active worker",
-            "started",
-            "on_node",
-            ConnectRouteActiveNode::None,
-        ),
-        ConnectRouteDbShape::service_unavailable(
-            "started active worker id missing",
-            "started",
-            "on_node",
-            ConnectRouteActiveNode::MissingWorker,
-        ),
-        ConnectRouteDbShape::service_unavailable(
-            "creating unplaced without active worker",
-            "creating",
-            "unplaced",
-            ConnectRouteActiveNode::None,
-        ),
-        ConnectRouteDbShape::error(
-            "stopping teardown row",
-            "stopping",
-            "on_node",
-            ConnectRouteActiveNode::ReadyWorker,
-            StatusCode::CONFLICT,
-        ),
-        ConnectRouteDbShape::error(
-            "deleting teardown row",
-            "deleting",
-            "on_node",
-            ConnectRouteActiveNode::ReadyWorker,
-            StatusCode::CONFLICT,
-        ),
-        ConnectRouteDbShape::error(
-            "cleanup_required teardown row",
-            "cleanup_required",
-            "unplaced",
-            ConnectRouteActiveNode::None,
-            StatusCode::CONFLICT,
-        ),
-        ConnectRouteDbShape::error(
-            "deleted teardown row",
-            "deleted",
-            "unplaced",
-            ConnectRouteActiveNode::None,
-            StatusCode::NOT_FOUND,
-        ),
-        ConnectRouteDbShape::error(
-            "failed terminal row",
-            "failed",
-            "unplaced",
-            ConnectRouteActiveNode::None,
-            StatusCode::INTERNAL_SERVER_ERROR,
-        ),
-        ConnectRouteDbShape::error(
-            "stopped terminal row",
-            "stopped",
-            "unplaced",
-            ConnectRouteActiveNode::None,
-            StatusCode::NOT_FOUND,
-        ),
-        ConnectRouteDbShape::error(
-            "started row with failed observation",
-            "started",
-            "on_node",
-            ConnectRouteActiveNode::ReadyWorker,
-            StatusCode::INTERNAL_SERVER_ERROR,
-        )
-        .with_observed_status("failed"),
-        ConnectRouteDbShape::error(
-            "started row with stopped observation",
-            "started",
-            "on_node",
-            ConnectRouteActiveNode::ReadyWorker,
-            StatusCode::NOT_FOUND,
-        )
-        .with_observed_status("stopped"),
-        ConnectRouteDbShape::ok(
-            "started row with paused observation",
-            "started",
-            "on_node",
-            ConnectRouteActiveNode::ReadyWorker,
-        )
-        .with_observed_status("paused"),
-        ConnectRouteDbShape::error(
-            "failed row with running observation",
-            "failed",
-            "on_node",
-            ConnectRouteActiveNode::ReadyWorker,
-            StatusCode::INTERNAL_SERVER_ERROR,
-        )
-        .with_observed_status("running"),
-    ];
-
     for request_shape in request_shapes {
-        for db_shape in db_shapes {
-            let sandbox_id = SandboxId::new();
-            let active_node_id = match db_shape.active_node {
-                ConnectRouteActiveNode::None => None,
-                ConnectRouteActiveNode::ReadyWorker => Some(worker_node_id),
-                ConnectRouteActiveNode::MissingWorker => Some(NodeId::new()),
-            };
-            insert_connect_route_sandbox(
+        let sandbox_id = SandboxId::new();
+        let active_node_id = match db_shape.active_node {
+            ConnectRouteActiveNode::None => None,
+            ConnectRouteActiveNode::ReadyWorker => Some(worker_node_id),
+            ConnectRouteActiveNode::MissingWorker => Some(NodeId::new()),
+        };
+        insert_connect_route_sandbox(
+            &db.pool,
+            sandbox_id,
+            db_shape.lifecycle,
+            db_shape.placement,
+            active_node_id,
+        )
+        .await?;
+        if db_shape.lifecycle == "suspended" {
+            sqlx::query(
+                "INSERT INTO sandbox_direct_route_provenance (
+                     sandbox_id,
+                     last_route_generation,
+                     last_execution_generation,
+                     updated_at
+                 )
+                 VALUES ($1, 1, 1, NOW())",
+            )
+            .bind(sandbox_id)
+            .execute(&db.pool)
+            .await?;
+        }
+        if let Some(observed_status) = db_shape.observed_status {
+            insert_connect_route_observed_state(
                 &db.pool,
                 sandbox_id,
-                db_shape.lifecycle,
-                db_shape.placement,
-                active_node_id,
+                worker_node_id,
+                observed_status,
             )
             .await?;
-            if db_shape.lifecycle == "suspended" {
-                sqlx::query(
-                    "INSERT INTO sandbox_direct_route_provenance (
-                         sandbox_id,
-                         last_route_generation,
-                         last_execution_generation,
-                         updated_at
-                     )
-                     VALUES ($1, 1, 1, NOW())",
-                )
-                .bind(sandbox_id)
-                .execute(&db.pool)
+        }
+        if db_shape.preload_runtime {
+            // A resident runtime has a published execution identity. Deadline
+            // mutations are fenced by that generation, not just active_node_id.
+            sqlx::query(sql!(
+                "INSERT INTO sandbox_direct_route_identities
+                (sandbox_id, route_generation, current_node_id, substrate_kind,
+                 execution_generation, activation_attempt_id)
+                VALUES ($1, 1, $2, 'space', 1, $3)"
+            ))
+            .bind(sandbox_id)
+            .bind(worker_node_id)
+            .bind(Uuid::now_v7())
+            .execute(&db.pool)
+            .await?;
+            worker
+                .state()
+                .ensure_default_running(&sandbox_id.to_string())
                 .await?;
-            }
-            if let Some(observed_status) = db_shape.observed_status {
-                insert_connect_route_observed_state(
-                    &db.pool,
+        }
+
+        let response = app
+            .clone()
+            .oneshot(connect_route_request(sandbox_id, request_shape)?)
+            .await?;
+        let response_status = response.status();
+        assert_ne!(
+            response_status,
+            StatusCode::BAD_GATEWAY,
+            "{} / {} returned 502",
+            request_shape.label,
+            db_shape.label
+        );
+
+        match db_shape.expectation {
+            ConnectRouteExpectation::Success(expected) => {
+                assert_connect_success_response(
+                    response,
+                    expected,
                     sandbox_id,
-                    worker_node_id,
-                    observed_status,
+                    request_shape.label,
+                    db_shape.label,
                 )
                 .await?;
+                let record = worker.state().get(&sandbox_id.to_string()).await?;
+                assert_eq!(
+                    record.status,
+                    status::RUNNING,
+                    "{} / {} did not leave a running local runtime",
+                    request_shape.label,
+                    db_shape.label
+                );
             }
-            if db_shape.preload_runtime {
-                // A resident runtime has a published execution identity. Deadline
-                // mutations are fenced by that generation, not just active_node_id.
-                sqlx::query(sql!(
-                    "INSERT INTO sandbox_direct_route_identities
-                    (sandbox_id, route_generation, current_node_id, substrate_kind,
-                     execution_generation, activation_attempt_id)
-                    VALUES ($1, 1, $2, 'space', 1, $3)"
-                ))
-                .bind(sandbox_id)
-                .bind(worker_node_id)
-                .bind(Uuid::now_v7())
-                .execute(&db.pool)
-                .await?;
-                worker
-                    .state()
-                    .ensure_default_running(&sandbox_id.to_string())
-                    .await?;
-            }
-
-            let response = app
-                .clone()
-                .oneshot(connect_route_request(sandbox_id, request_shape)?)
-                .await?;
-            let response_status = response.status();
-            assert_ne!(
-                response_status,
-                StatusCode::BAD_GATEWAY,
-                "{} / {} returned 502",
-                request_shape.label,
-                db_shape.label
-            );
-
-            match db_shape.expectation {
-                ConnectRouteExpectation::Success(expected) => {
-                    assert_connect_success_response(
-                        response,
-                        expected,
-                        sandbox_id,
-                        request_shape.label,
-                        db_shape.label,
-                    )
-                    .await?;
-                    let record = worker.state().get(&sandbox_id.to_string()).await?;
-                    assert_eq!(
-                        record.status,
-                        status::RUNNING,
-                        "{} / {} did not leave a running local runtime",
-                        request_shape.label,
-                        db_shape.label
-                    );
-                }
-                ConnectRouteExpectation::Error(expected) => {
-                    assert_eq!(
-                        response_status, expected,
-                        "{} / {} returned an unexpected status",
-                        request_shape.label, db_shape.label
-                    );
-                }
+            ConnectRouteExpectation::Error(expected) => {
+                assert_eq!(
+                    response_status, expected,
+                    "{} / {} returned an unexpected status",
+                    request_shape.label, db_shape.label
+                );
             }
         }
     }

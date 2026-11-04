@@ -84,7 +84,7 @@ const MIN_LOCK_HEADROOM: i64 = 64;
 /// [`SandboxQuotaOutcome::Contended`]. Set transaction-locally around the
 /// lock statements only, so the rest of the admission keeps the role's own
 /// `lock_timeout`, and never raises a shorter one.
-const QUOTA_LOCK_TIMEOUT: Duration = Duration::from_secs(2);
+pub(super) const QUOTA_LOCK_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// The limits one native create in `org_id` is held to. Build one only when
 /// at least one is set.
@@ -268,7 +268,7 @@ impl PublicOperationAdmission {
             plan.org
                 .map(|(_, mode)| (plan.org_id.as_uuid(), ORG_LOCK_SEED, mode)),
         ];
-        let lock_timeout = bound_lock_timeout_tx(&mut self.tx, QUOTA_LOCK_TIMEOUT).await?;
+        let lock_timeout = bound_lock_timeout_tx(&mut self.tx, self.quota_lock_timeout).await?;
         for (id, seed, mode) in locks.into_iter().flatten() {
             match lock_tx(&mut self.tx, id, seed, mode).await {
                 Ok(()) => {}

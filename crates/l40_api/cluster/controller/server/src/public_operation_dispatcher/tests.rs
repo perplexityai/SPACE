@@ -1572,3 +1572,16 @@ pub(super) async fn before_claim() {
         hook().await;
     }
 }
+
+tokio::task_local! {
+    /// Runs in the run loop as soon as a claim returns, before it decides
+    /// whether to back off, so a test can time the loop apart from the
+    /// claim's own database work.
+    static AFTER_CLAIM: BeforeClaimHook;
+}
+
+pub(super) async fn after_claim() {
+    if let Ok(hook) = AFTER_CLAIM.try_with(Arc::clone) {
+        hook().await;
+    }
+}

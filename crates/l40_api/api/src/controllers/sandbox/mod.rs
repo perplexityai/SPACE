@@ -1075,6 +1075,10 @@ pub struct SandboxController {
             pplx_space_common_svc::space_api_route_ed25519::SpaceApiRouteEd25519Authority,
         >,
     >,
+    /// Estimated bytes after which a sandbox list page stops:
+    /// [`list_page::MAX_SANDBOX_LIST_PAGE_BYTES`]. Tests shrink it to page
+    /// KiB rows, as the walk only compares running sizes against it.
+    pub(crate) list_page_max_bytes: i64,
 }
 
 pub type SpacedFileInfoStream = tonic::Streaming<SpacedFileInfo>;
@@ -1127,6 +1131,7 @@ impl SandboxController {
             feature_flags: pplx_space_feature_flags::FeatureFlagClient::disabled(),
             cluster_admission: None,
             route_ed25519_authority: None,
+            list_page_max_bytes: list_page::MAX_SANDBOX_LIST_PAGE_BYTES,
         }
     }
 
@@ -1143,6 +1148,7 @@ impl SandboxController {
             feature_flags: pplx_space_feature_flags::FeatureFlagClient::disabled(),
             cluster_admission: Some(std::sync::Arc::new(cluster_admission)),
             route_ed25519_authority: None,
+            list_page_max_bytes: list_page::MAX_SANDBOX_LIST_PAGE_BYTES,
         }
     }
 

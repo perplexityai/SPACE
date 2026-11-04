@@ -1120,7 +1120,10 @@ async fn small_frame_upload(frame: usize, total: usize, stall: Duration) -> bool
     read == total.to_string().as_bytes()
 }
 
-#[tokio::test]
+// Paused time skips the handler's stall: every part of the exchange runs over
+// an in-memory duplex on tokio timers, so the clock advances only once the
+// client is blocked on a full window.
+#[tokio::test(start_paused = true)]
 async fn guest_http2_accepts_backpressured_small_frame_uploads() {
     // git's pkt-lines are ~50 bytes, and curl sends each as its own frame.
     assert!(small_frame_upload(50, 5_000_000, Duration::from_secs(2)).await);

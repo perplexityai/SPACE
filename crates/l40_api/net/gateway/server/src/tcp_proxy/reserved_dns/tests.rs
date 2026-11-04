@@ -295,6 +295,7 @@ fn proxy(
         debug_state: GatewayDebugState::default(),
         shutdown_token,
         refusal_warnings: Arc::default(),
+        peek_budget: crate::sniff::PeekBudget::DEFAULT,
     }
 }
 

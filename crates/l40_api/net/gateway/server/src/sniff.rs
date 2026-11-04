@@ -62,12 +62,31 @@ pub(crate) enum MissingClientHello {
 }
 
 impl MissingClientHello {
-    const fn first_bytes_timeout(self) -> Duration {
+    const fn first_bytes_timeout(self, budget: PeekBudget) -> Duration {
         match self {
             Self::Proceeds => FIRST_BYTES_TIMEOUT,
-            Self::Denied => FAIL_CLOSED_FIRST_BYTES_TIMEOUT,
+            Self::Denied => budget.fail_closed_first_bytes,
         }
     }
+}
+
+/// The bounds a peek on a denied path waits out before giving up on a
+/// ClientHello. Production peeks always use [`PeekBudget::DEFAULT`]; a test
+/// that waits a bound out shortens it, since which bound ran out, not its
+/// length, decides the outcome.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PeekBudget {
+    /// [`FAIL_CLOSED_FIRST_BYTES_TIMEOUT`] in production.
+    pub(crate) fail_closed_first_bytes: Duration,
+    /// [`COMPLETION_DEADLINE`] in production.
+    pub(crate) completion: Duration,
+}
+
+impl PeekBudget {
+    pub(crate) const DEFAULT: Self = Self {
+        fail_closed_first_bytes: FAIL_CLOSED_FIRST_BYTES_TIMEOUT,
+        completion: COMPLETION_DEADLINE,
+    };
 }
 const PEEK_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 
@@ -123,14 +142,24 @@ impl ClientHelloObservation {
 pub(crate) async fn client_hello_with_detail(
     client: &TcpStream,
     missing: MissingClientHello,
+    budget: PeekBudget,
 ) -> ClientHelloObservation {
     let started_at = Instant::now();
-    let mut observation = scan_stream(client, missing.first_bytes_timeout()).await;
+    let mut observation = scan_stream(
+        client,
+        missing.first_bytes_timeout(budget),
+        budget.completion,
+    )
+    .await;
     observation.elapsed = started_at.elapsed();
     observation
 }
 
-async fn scan_stream(client: &TcpStream, first_bytes_timeout: Duration) -> ClientHelloObservation {
+async fn scan_stream(
+    client: &TcpStream,
+    first_bytes_timeout: Duration,
+    completion_budget: Duration,
+) -> ClientHelloObservation {
     let mut buf = vec![0_u8; PEEK_MAX_BYTES];
     // Set by the first handshake bytes, so a late first segment does not also
     // spend the budget for the rest of the ClientHello.
@@ -170,8 +199,8 @@ async fn scan_stream(client: &TcpStream, first_bytes_timeout: Duration) -> Clien
             // Confirmed handshake bytes, ClientHello still arriving. `peek` is
             // cumulative, so re-peek until it completes or a budget runs out.
             (ClientHelloScan::Incomplete, _, _) if peeked < buf.len() => {
-                let deadline = *completion_deadline
-                    .get_or_insert_with(|| Instant::now() + COMPLETION_DEADLINE);
+                let deadline =
+                    *completion_deadline.get_or_insert_with(|| Instant::now() + completion_budget);
                 let nap =
                     PEEK_RETRY_INTERVAL.min(deadline.saturating_duration_since(Instant::now()));
                 if nap.is_zero() {
@@ -205,7 +234,8 @@ async fn scan_stream(client: &TcpStream, first_bytes_timeout: Duration) -> Clien
 
 #[cfg(test)]
 pub(crate) async fn client_hello(client: &TcpStream) -> (ClientHelloScan, ClientAlpnOffer) {
-    let observation = client_hello_with_detail(client, MissingClientHello::Proceeds).await;
+    let observation =
+        client_hello_with_detail(client, MissingClientHello::Proceeds, PeekBudget::DEFAULT).await;
     (observation.scan, observation.client_alpn)
 }
 

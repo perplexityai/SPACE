@@ -1219,9 +1219,11 @@ enum FakeRevocation {
 /// How long [`FakeRevocation::Slow`] takes to answer.
 const FAKE_SLOW_ANSWER: Duration = Duration::from_millis(300);
 /// The check timeout for [`FakeRevocation::SlowOrgThenHungSession`], and how
-/// long its org read takes.
-const SPLIT_CHECK_TIMEOUT: Duration = Duration::from_millis(2_000);
-const SPLIT_CHECK_ORG_READ: Duration = Duration::from_millis(1_200);
+/// long its org read takes. The read leaves 400ms of the timeout for its own
+/// RPC, so the check reaches the hung session read, and the test's halfway
+/// bound leaves 300ms on either side.
+const SPLIT_CHECK_TIMEOUT: Duration = Duration::from_millis(1_000);
+const SPLIT_CHECK_ORG_READ: Duration = Duration::from_millis(600);
 
 /// A fake cluster API and worker for one running process. The test sets how
 /// revocation checks are answered and sends stdout chunks down the open
@@ -3082,8 +3084,10 @@ async fn window_miss_reopen_refreshes_a_refused_route() {
     );
 }
 
-/// Backend reconnects and client resumes before a process's next output.
-const IDLE_ROUNDS: usize = 300;
+/// Backend reconnects and client resumes before a process's next output:
+/// enough to exhaust the frame field at one position twice over, so a round
+/// that spent an id would move the next output's id.
+const IDLE_ROUNDS: usize = 2 * (PROCESS_EVENT_ID_MAX_FRAME as usize + 1) + 1;
 
 /// The id of the output after the two lines the idle fakes start with.
 fn third_line_id() -> u64 {

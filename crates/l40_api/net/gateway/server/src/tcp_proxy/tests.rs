@@ -109,6 +109,7 @@ async fn failed_plaintext_connect() -> FailedPlaintextConnect {
         debug_state: GatewayDebugState::default(),
         shutdown_token: CancellationToken::new(),
         refusal_warnings: Arc::default(),
+        peek_budget: sniff::PeekBudget::DEFAULT,
     };
     let guest_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let (guest, accepted) = tokio::join!(
@@ -198,6 +199,7 @@ async fn dns_attributed_pypi_proxy() -> (TcpProxy, Arc<NetworkPolicyV1>) {
         debug_state: GatewayDebugState::default(),
         shutdown_token: CancellationToken::new(),
         refusal_warnings: Arc::default(),
+        peek_budget: sniff::PeekBudget::DEFAULT,
     };
     (proxy, policy)
 }
@@ -327,7 +329,10 @@ async fn tls_interception_waits_for_a_late_client_hello_on_an_allowed_destinatio
 async fn a_flow_refused_before_its_client_hello_arrives_is_reset_not_ended() {
     use tokio::io::AsyncReadExt as _;
 
-    let (proxy, _) = dns_attributed_pypi_proxy().await;
+    let (mut proxy, _) = dns_attributed_pypi_proxy().await;
+    // The refusal, not how long the peek waited for it, decides how the guest
+    // connection ends, so the test need not wait out the production bound.
+    proxy.peek_budget.fail_closed_first_bytes = Duration::from_millis(100);
     let destination: SocketAddr = "93.184.216.34:443".parse().unwrap();
     let guest_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let (guest, accepted) = tokio::join!(
@@ -528,6 +533,7 @@ async fn tcp_admission_returns_the_authorized_route_or_deny() {
         debug_state: GatewayDebugState::default(),
         shutdown_token: CancellationToken::new(),
         refusal_warnings: Arc::default(),
+        peek_budget: sniff::PeekBudget::DEFAULT,
     };
 
     struct Case<'a> {
@@ -682,6 +688,7 @@ async fn tcp_handoff_allows_current_and_rejects_replaced_policy() {
         debug_state: GatewayDebugState::default(),
         shutdown_token: CancellationToken::new(),
         refusal_warnings: Arc::default(),
+        peek_budget: sniff::PeekBudget::DEFAULT,
     };
     let destination = "192.0.2.44:443".parse().unwrap();
     let admitted = proxy
@@ -732,6 +739,7 @@ async fn record_emits_one_connection_metric_and_reports_every_failure_outcome() 
         debug_state: GatewayDebugState::default(),
         shutdown_token: CancellationToken::new(),
         refusal_warnings: Arc::default(),
+        peek_budget: sniff::PeekBudget::DEFAULT,
     };
     let destination = "93.184.216.34:443".parse().unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

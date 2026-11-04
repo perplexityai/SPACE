@@ -532,21 +532,29 @@ async fn apply_mirror(
     .await
 }
 
-/// The write's two client-side bounds. Only tests pass anything but
-/// [`Self::DEFAULT`]: Postgres's own bounds fire well before these on a live
-/// connection, so a test makes one fire first by shortening it.
+/// The write's two client-side bounds and the two server-side ones its
+/// transaction sets. Only tests pass anything but [`Self::DEFAULT`]: Postgres's
+/// own bounds fire well before the client-side ones on a live connection, so a
+/// test makes one fire first by shortening it, or shortens a server-side one
+/// so as not to sit out the production bound.
 #[derive(Debug, Clone, Copy)]
 struct WriteBounds {
     /// Pool acquire plus [`store::begin_mirror_write`].
     setup: Duration,
     /// The UPDATE and COMMIT, once setup has returned.
     backstop: Duration,
+    /// The transaction's `statement_timeout`.
+    statement: Duration,
+    /// The transaction's `idle_in_transaction_session_timeout`.
+    idle: Duration,
 }
 
 impl WriteBounds {
     const DEFAULT: Self = Self {
         setup: QUERY_TIMEOUT,
         backstop: WRITE_BACKSTOP,
+        statement: WRITE_STATEMENT_TIMEOUT,
+        idle: WRITE_IDLE_TIMEOUT,
     };
 }
 
@@ -576,7 +584,7 @@ async fn apply_mirror_within(
         node_names,
         group_ids,
         setup_left(),
-        bounds.backstop,
+        bounds,
         shutdown_token,
     )
     .await;
@@ -592,24 +600,19 @@ async fn apply_mirror_within(
 
 /// [`apply_mirror`] on an acquired connection: [`store::begin_mirror_write`]
 /// within `setup_budget`, abandoned on shutdown, then the UPDATE and COMMIT
-/// under `backstop`, not abandoned.
+/// under `bounds.backstop`, not abandoned.
 async fn write_mirror(
     conn: &mut sqlx::PgConnection,
     node_names: &[String],
     group_ids: &[Option<NodeGroupId>],
     setup_budget: Duration,
-    backstop: Duration,
+    bounds: WriteBounds,
     shutdown_token: &CancellationToken,
 ) -> Option<Result<u64, MirrorError>> {
     let setup = bounded(
         setup_budget,
         MirrorError::QueryTimedOut("bulk update setup"),
-        async {
-            Ok(
-                store::begin_mirror_write(conn, WRITE_STATEMENT_TIMEOUT, WRITE_IDLE_TIMEOUT)
-                    .await?,
-            )
-        },
+        async { Ok(store::begin_mirror_write(conn, bounds.statement, bounds.idle).await?) },
     );
     let mut tx = match shutdown_token.run_until_cancelled(setup).await? {
         Ok(tx) => tx,
@@ -620,7 +623,14 @@ async fn write_mirror(
         tx.commit().await?;
         Ok(updated)
     };
-    Some(bounded(backstop, MirrorError::QueryTimedOut("bulk update"), write).await)
+    Some(
+        bounded(
+            bounds.backstop,
+            MirrorError::QueryTimedOut("bulk update"),
+            write,
+        )
+        .await,
+    )
 }
 
 /// Read `node_groups` as `name -> id`.

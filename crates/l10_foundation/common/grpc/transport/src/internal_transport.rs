@@ -284,7 +284,12 @@ pub struct ConnectEndpoint {
 impl ConnectEndpoint {
     /// [`crate::connect_tcp_channel`] with this endpoint's handshake bound.
     pub async fn connect(self) -> Result<tonic::transport::Channel, tonic::transport::Error> {
-        crate::connect::dial_tcp_channel(self.endpoint, self.tls_handshake_timeout).await
+        crate::connect::dial_tcp_channel(
+            self.endpoint,
+            self.tls_handshake_timeout,
+            crate::connect::ConnectAllowances::DEFAULT,
+        )
+        .await
     }
 
     /// [`crate::connect_tcp_channel_lazy`] with this endpoint's handshake
@@ -317,12 +322,31 @@ impl ConnectEndpoint {
         target: impl AsRef<str>,
         retry_policy: crate::GrpcRetryPolicy,
     ) -> Result<tonic::transport::Channel, crate::TcpConnectError> {
-        crate::connect_tcp_channel_with_retry(
+        self.connect_with_retry_within(
+            crate::connect::ConnectAllowances::DEFAULT,
+            service_name,
+            target,
+            retry_policy,
+        )
+        .await
+    }
+
+    /// [`Self::connect_with_retry`] with its bounds sized from `allowances`.
+    pub(crate) async fn connect_with_retry_within(
+        self,
+        allowances: crate::connect::ConnectAllowances,
+        service_name: &'static str,
+        target: impl AsRef<str>,
+        retry_policy: crate::GrpcRetryPolicy,
+    ) -> Result<tonic::transport::Channel, crate::TcpConnectError> {
+        crate::connect::retry_tcp_channel(
             service_name,
             target,
             self.endpoint,
             self.tls_handshake_timeout,
             retry_policy,
+            allowances,
+            |_| {},
         )
         .await
     }
@@ -335,12 +359,31 @@ impl ConnectEndpoint {
         target: impl AsRef<str>,
         retry_policy: crate::GrpcRetryPolicy,
     ) -> Result<(tonic::transport::Channel, crate::ConnectionWatch), crate::TcpConnectError> {
-        crate::connect_tcp_channel_with_retry_watched(
+        self.connect_with_retry_watched_within(
+            crate::connect::ConnectAllowances::DEFAULT,
+            service_name,
+            target,
+            retry_policy,
+        )
+        .await
+    }
+
+    /// [`Self::connect_with_retry_watched`] with its bounds sized from
+    /// `allowances`.
+    pub(crate) async fn connect_with_retry_watched_within(
+        self,
+        allowances: crate::connect::ConnectAllowances,
+        service_name: &'static str,
+        target: impl AsRef<str>,
+        retry_policy: crate::GrpcRetryPolicy,
+    ) -> Result<(tonic::transport::Channel, crate::ConnectionWatch), crate::TcpConnectError> {
+        crate::connect::retry_watched_tcp_channel(
             service_name,
             target,
             self.endpoint,
             self.tls_handshake_timeout,
             retry_policy,
+            allowances,
         )
         .await
     }

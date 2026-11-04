@@ -266,6 +266,9 @@ async fn check_pause(exit: Exit, interleave: Interleave, found: SandboxState) {
     let scratch = tempfile::tempdir().unwrap();
     let node_manager = exit.node_manager();
     let mut options = SandboxManagerServiceOptions::for_test_in(scratch.path());
+    // Every fake answers each attempt alike, so the delay between
+    // reconciliation attempts separates nothing a case observes.
+    options.pause_reconciliation_backoff = Some(Duration::from_millis(1));
     if let Some(node_manager) = &node_manager {
         options.node_manager = node_manager.connector();
     }
@@ -389,11 +392,20 @@ async fn pause_leaves_a_row_a_concurrent_stop_settled() {
 
 /// Every state the row can be in at each of pause's writes. Only `pausing`
 /// is written; it is the accepting control for each exit.
+#[rstest::rstest]
 #[tokio::test]
-async fn pause_writes_only_over_its_own_pausing_row() {
-    for exit in EXITS {
-        for state in SandboxState::all() {
-            check_pause(exit, Interleave::Force(state), state).await;
-        }
+async fn pause_writes_only_over_its_own_pausing_row(
+    #[values(
+        Exit::PreparationFails,
+        Exit::NodeUnreachable,
+        Exit::NodeConfirms,
+        Exit::RetryPreparationFails,
+        Exit::VmStaysRunning,
+        Exit::VmUnobservable
+    )]
+    exit: Exit,
+) {
+    for state in SandboxState::all() {
+        check_pause(exit, Interleave::Force(state), state).await;
     }
 }

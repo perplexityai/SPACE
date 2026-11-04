@@ -7,6 +7,9 @@ use pplx_space_common_core::types::{OrgId, UserId};
 use uuid::Uuid;
 
 use super::*;
+use crate::controllers::sandbox::list_page::{
+    MAX_SANDBOX_LIST_PAGE_BYTES, TEST_SANDBOX_LIST_PAGE_BYTES,
+};
 use crate::public_operations::SubjectSandboxQuota;
 use pplx_space_db_test_fixtures::{
     SEED_ORG_ID, SEED_USER_ID, TestDbResult, insert_ready_worker_node, pg_test_db,
@@ -417,8 +420,20 @@ async fn a_native_create_that_waits_out_its_quota_lock_is_retryable() -> TestDbR
     let db = pg_test_db_with_max_connections(3).await?;
     let (org_id, user_id) = seed_quota_org(&db.pool).await?;
     let holder = hold_org_quota_lock(&db.pool, org_id).await?;
+    // The quota lock's bound keeps a shorter `lock_timeout` already in force,
+    // so the create waits out this one instead of the full bound.
+    let bounded = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(2)
+        .connect_with(
+            db.pool
+                .connect_options()
+                .as_ref()
+                .clone()
+                .options([("lock_timeout", "150ms")]),
+        )
+        .await?;
     let refused = create_native_sandbox_operation(
-        &db.pool,
+        &bounded,
         org_id,
         user_id,
         &IdempotencyKey::parse("quota-contended").expect("test key parses"),
@@ -962,7 +977,15 @@ async fn sandbox_reads_exclude_deleted_tombstones_before_pagination() -> TestDbR
     }
     visible.reverse();
 
-    let rows = fetch_sandboxes_page(&db.pool, OrgId::from_uuid(SEED_ORG_ID), None, None, 1).await?;
+    let rows = fetch_sandboxes_page(
+        &db.pool,
+        OrgId::from_uuid(SEED_ORG_ID),
+        None,
+        None,
+        1,
+        MAX_SANDBOX_LIST_PAGE_BYTES,
+    )
+    .await?;
     assert_eq!(
         rows.iter().map(|row| row.id).collect::<Vec<_>>(),
         vec![visible[0].1, visible[1].1],
@@ -984,6 +1007,7 @@ async fn sandbox_reads_exclude_deleted_tombstones_before_pagination() -> TestDbR
         None,
         Some(visible[0]),
         1,
+        MAX_SANDBOX_LIST_PAGE_BYTES,
     )
     .await?;
     assert_eq!(
@@ -1214,16 +1238,30 @@ async fn sandbox_reads_expose_only_the_current_failure_episode() -> TestDbResult
     .bind(CURRENT_POD_UID)
     .execute(&db.pool)
     .await?;
-    let listed =
-        fetch_sandboxes_page(&db.pool, OrgId::from_uuid(SEED_ORG_ID), None, None, 100).await?;
+    let listed = fetch_sandboxes_page(
+        &db.pool,
+        OrgId::from_uuid(SEED_ORG_ID),
+        None,
+        None,
+        100,
+        MAX_SANDBOX_LIST_PAGE_BYTES,
+    )
+    .await?;
     assert_eq!(listed.len(), 1);
     let cursor = (listed[0].created_at, listed[0].id);
     let listed = sandboxes_page(listed, 100).expect("valid sandbox page");
     assert_eq!(listed.data, vec![current]);
     assert!(
-        fetch_sandboxes_page(&db.pool, OrgId::new(), None, None, 100)
-            .await?
-            .is_empty()
+        fetch_sandboxes_page(
+            &db.pool,
+            OrgId::new(),
+            None,
+            None,
+            100,
+            MAX_SANDBOX_LIST_PAGE_BYTES
+        )
+        .await?
+        .is_empty()
     );
     assert!(
         fetch_sandboxes_page(
@@ -1231,7 +1269,8 @@ async fn sandbox_reads_expose_only_the_current_failure_episode() -> TestDbResult
             OrgId::from_uuid(SEED_ORG_ID),
             None,
             Some(cursor),
-            100
+            100,
+            MAX_SANDBOX_LIST_PAGE_BYTES
         )
         .await?
         .is_empty()
@@ -2134,14 +2173,16 @@ async fn insert_legacy_sandbox(
 /// and following the cursor visits every row once.
 #[tokio::test]
 async fn sandbox_list_query_bounds_the_bytes_it_returns() -> TestDbResult<()> {
-    const MIB: usize = 1024 * 1024;
+    const BUDGET: i64 = TEST_SANDBOX_LIST_PAGE_BYTES;
+    // An eighth of the budget, as 1 MiB is of the production one.
+    const UNIT: usize = BUDGET as usize / 8;
     let db = pg_test_db().await?;
     let org_id = OrgId::from_uuid(SEED_ORG_ID);
     let newest = OffsetDateTime::from_unix_timestamp(1_800_000_000)?;
-    // Newest first: one row over the whole budget, twelve 1 MiB rows, then
+    // Newest first: one row over the whole budget, twelve one-unit rows, then
     // three small ones.
-    let sizes = std::iter::once(9 * MIB)
-        .chain(std::iter::repeat_n(MIB, 12))
+    let sizes = std::iter::once(9 * UNIT)
+        .chain(std::iter::repeat_n(UNIT, 12))
         .chain(std::iter::repeat_n(16, 3));
     let mut expected = Vec::new();
     for (offset, size) in sizes.enumerate() {
@@ -2152,17 +2193,21 @@ async fn sandbox_list_query_bounds_the_bytes_it_returns() -> TestDbResult<()> {
     let mut pages = Vec::new();
     let mut cursor = None;
     loop {
-        let rows =
-            fetch_sandboxes_page(&db.pool, org_id, None, cursor, MAX_SANDBOX_LIST_LIMIT).await?;
+        let rows = fetch_sandboxes_page(
+            &db.pool,
+            org_id,
+            None,
+            cursor,
+            MAX_SANDBOX_LIST_LIMIT,
+            BUDGET,
+        )
+        .await?;
         let metadata_bytes = rows
             .iter()
             .map(|row| serde_json::to_vec(&row.metadata.0).unwrap().len())
             .sum::<usize>();
         if rows.len() > 1 {
-            assert!(
-                metadata_bytes <= MAX_SANDBOX_LIST_PAGE_BYTES as usize,
-                "{metadata_bytes}"
-            );
+            assert!(metadata_bytes <= BUDGET as usize, "{metadata_bytes}");
         }
         let ids = rows.iter().map(|row| row.id).collect::<Vec<_>>();
         let page = sandboxes_page(rows, MAX_SANDBOX_LIST_LIMIT).unwrap();
@@ -2176,7 +2221,7 @@ async fn sandbox_list_query_bounds_the_bytes_it_returns() -> TestDbResult<()> {
         );
     }
 
-    // The oversized row comes back alone; 1 MiB rows fit seven to a page.
+    // The oversized row comes back alone; one-unit rows fit seven to a page.
     assert_eq!(
         pages.iter().map(Vec::len).collect::<Vec<_>>(),
         vec![1, 7, 8]
@@ -2185,7 +2230,7 @@ async fn sandbox_list_query_bounds_the_bytes_it_returns() -> TestDbResult<()> {
 
     // Within the budget, the walk stops at the limit's lookahead row.
     let after_oversized = Some((newest, expected[0]));
-    let rows = fetch_sandboxes_page(&db.pool, org_id, None, after_oversized, 2).await?;
+    let rows = fetch_sandboxes_page(&db.pool, org_id, None, after_oversized, 2, BUDGET).await?;
     assert_eq!(
         rows.iter().map(|row| row.id).collect::<Vec<_>>(),
         expected[1..4]
@@ -2203,13 +2248,14 @@ async fn sandbox_list_budget_ignores_env() -> TestDbResult<()> {
     for offset in 0..3 {
         let created_at = newest - time::Duration::seconds(offset);
         let id = insert_legacy_sandbox(&db.pool, created_at, 16).await?;
+        // Were env counted, the three would pass the budget.
         sqlx::query(pplx_space_common_core::sql!(
             "UPDATE sandboxes SET env = $2 WHERE id = $1"
         ))
         .bind(id)
-        .bind(SqlJson(
-            serde_json::json!({ "LARGE": "e".repeat(3 * 1024 * 1024) }),
-        ))
+        .bind(SqlJson(serde_json::json!({
+            "LARGE": "e".repeat(3 * TEST_SANDBOX_LIST_PAGE_BYTES as usize / 8)
+        })))
         .execute(&db.pool)
         .await?;
         expected.push(id);
@@ -2221,6 +2267,7 @@ async fn sandbox_list_budget_ignores_env() -> TestDbResult<()> {
         None,
         None,
         MAX_SANDBOX_LIST_LIMIT,
+        TEST_SANDBOX_LIST_PAGE_BYTES,
     )
     .await?;
     assert_eq!(rows.iter().map(|row| row.id).collect::<Vec<_>>(), expected);

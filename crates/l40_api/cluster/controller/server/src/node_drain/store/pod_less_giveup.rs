@@ -104,6 +104,7 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::time::Duration;
 
 use futures_util::StreamExt;
 
@@ -127,7 +128,7 @@ use sqlx::PgPool;
 use crate::orphaned_sandboxes::{PodPresenceStatus, classify_pod_presence};
 
 use super::super::PHASE_DRAINING;
-use super::{DRAIN_COMPLETION_LOCK_TIMEOUT, is_lock_timeout};
+use super::is_lock_timeout;
 
 /// What [`super::NodeDrainSink::recover_pod_less_sandbox`] did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -566,12 +567,16 @@ pub(crate) async fn node_vouches<O: GenerationTeardownObserver>(
 /// watcher persisting pod metadata locks the execution row, so it either
 /// committed first (the row then shows a pod UID or fresh `updated_at`, and
 /// this backs out) or waits for this commit and finds its execution retired.
+///
+/// `lock_timeout` bounds each lock wait; the reconciler passes
+/// [`super::DRAIN_COMPLETION_LOCK_TIMEOUT`].
 pub(crate) async fn recover_pod_less_sandbox_tx(
     pool: &PgPool,
     candidate: PodLessCandidate,
     expected: ExecutionGeneration,
+    lock_timeout: Duration,
 ) -> Result<PodLessRecovery, sqlx::Error> {
-    match recover_pod_less_sandbox_locked(pool, candidate, expected).await {
+    match recover_pod_less_sandbox_locked(pool, candidate, expected, lock_timeout).await {
         // A lock wait past the bound is contention, not a fault: the next tick
         // retries without a warning.
         // So is losing a deadlock. A node's publish can lock the observed row
@@ -589,16 +594,18 @@ async fn recover_pod_less_sandbox_locked(
     pool: &PgPool,
     candidate: PodLessCandidate,
     expected: ExecutionGeneration,
+    lock_timeout: Duration,
 ) -> Result<PodLessRecovery, sqlx::Error> {
     let mut tx = pool.begin().await?;
     // Each lock wait is bounded like drain completion's lock on the same row.
     // Once it holds the node row shared, every writer of that row (pod
     // placement, inventory, bootstrap) waits on this transaction. The bound
     // applies to each lock acquisition, the node row's included, so the worst
-    // case is 5s for every contended row it locks: the sandbox, its
-    // executions, and the rows its writes touch (slot, exposures, observed).
+    // case is `lock_timeout` for every contended row it locks: the sandbox,
+    // its executions, and the rows its writes touch (slot, exposures,
+    // observed).
     sqlx::query(sql!("SELECT set_config('lock_timeout', $1, TRUE)"))
-        .bind(DRAIN_COMPLETION_LOCK_TIMEOUT.as_millis().to_string())
+        .bind(lock_timeout.as_millis().to_string())
         .execute(&mut *tx)
         .await?;
     // The guards' drain-phase and mode test is a plain read, which can't

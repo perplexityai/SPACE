@@ -8,6 +8,10 @@ use pplx_space_node_runtime_core::catalog::CompiledEnvironment;
 use pplx_space_node_runtime_core::runtime_inventory::ExecutionSelectionMode;
 
 const BOTH: &str = "e0,fc-1.17.0-linux-6.1.155,legacy";
+/// Each test holding the inventory refresh lock waits out this bound. It
+/// stays above the 100 ms an earlier application gets to start before a
+/// later one, so the earlier one is still checking when the later enforces.
+const TEST_USABILITY_BUDGET: std::time::Duration = std::time::Duration::from_millis(250);
 
 fn catalog() -> Vec<CompiledEnvironment> {
     CompiledEnvironment::for_architecture(Arch::X86_64).unwrap()
@@ -55,7 +59,8 @@ fn apply_request(
 }
 
 /// A test service enforcing `allowed` at startup, with its policy record in a
-/// directory the test owns and its node-status marks counted.
+/// directory the test owns, its default checks bounded by
+/// `TEST_USABILITY_BUDGET` and its node-status marks counted.
 async fn policy_service(
     allowed: &str,
 ) -> (
@@ -70,10 +75,10 @@ async fn policy_service(
         crate::slot_pool::NetworkPoolConfig::new(1),
         marks.clone(),
     );
-    service.execution_policy = Arc::new(ExecutionPolicyState::load(
-        startup(allowed),
-        root.path().join("execution-policy.json"),
-    ));
+    service.execution_policy = Arc::new(
+        ExecutionPolicyState::load(startup(allowed), root.path().join("execution-policy.json"))
+            .with_usability_budget(TEST_USABILITY_BUDGET),
+    );
     marks.take();
     (root, service, marks)
 }
@@ -526,9 +531,12 @@ async fn long_accepted_policy_survives_restart() {
 
 #[test]
 fn record_a_restart_would_refuse_is_never_written() {
+    // The guard compares against the limit it's given, so a small one stands
+    // in for `MAX_RECORD_BYTES` without encoding an 8 MiB record.
+    const MAX_BYTES: u64 = 4 * 1024;
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("execution-policy.json");
-    let executing = (0..MAX_RECORD_BYTES / 64)
+    let executing = (0..MAX_BYTES / 64)
         .map(|index| format!("sha256:{index:064x}").parse().unwrap())
         .collect();
     let record = PolicyRecord {
@@ -541,7 +549,7 @@ fn record_a_restart_would_refuse_is_never_written() {
         },
         default_verified: false,
     };
-    let error = write_record(&path, Some(&record)).unwrap_err();
+    let error = write_record_within(&path, Some(&record), MAX_BYTES).unwrap_err();
     assert_eq!(error.code(), tonic::Code::InvalidArgument);
     assert!(!path.exists());
 }
@@ -654,95 +662,88 @@ async fn failed_persistence_still_enforces_the_policy_and_retries() {
     assert!(missing.exists(), "the next application persists it");
 }
 
+/// What the node holds about the cluster default when a check of it stalls.
+#[derive(Clone, Copy, Debug)]
+enum PriorVerdict {
+    /// This process verified it.
+    Adopted,
+    /// Nothing verified it.
+    Unverified,
+    /// It matches the startup default, which was never verified.
+    StartupDefault,
+    /// The record a previous process wrote says it was verified.
+    Restored,
+}
+
+#[rstest::rstest]
+#[case::adopted(PriorVerdict::Adopted)]
+#[case::unverified(PriorVerdict::Unverified)]
+#[case::startup_default(PriorVerdict::StartupDefault)]
+#[case::restored(PriorVerdict::Restored)]
 #[tokio::test]
-async fn a_slow_check_keeps_an_adopted_default_but_adopts_nothing_new() {
+async fn a_slow_check_keeps_an_adopted_default_but_adopts_nothing_new(#[case] prior: PriorVerdict) {
     let cluster = ClusterExecutionPolicy {
         generation: 7,
         default: Some(ClusterDefault::Environment(e1())),
         executing: [e1()].into(),
         legacy_unbound_allowed: None,
     };
-    for adopted in [true, false] {
-        let (_root, mut service, _) = policy_service(BOTH).await;
-        if adopted {
-            service.narrow_execution_for_test(&cluster);
+    let (root, mut service, _) = policy_service(BOTH).await;
+    match prior {
+        PriorVerdict::Adopted => service.narrow_execution_for_test(&cluster),
+        PriorVerdict::Unverified | PriorVerdict::StartupDefault => {}
+        // A verdict restored from the record does count, until a check this
+        // process completes says otherwise, so a slow first discovery after
+        // a restart can't flap the default.
+        PriorVerdict::Restored => {
+            let path = root.path().join("execution-policy.json");
+            write_record(
+                &path,
+                Some(&PolicyRecord {
+                    schema_version: RECORD_SCHEMA_VERSION,
+                    cluster: cluster.clone(),
+                    default_verified: true,
+                }),
+            )
+            .unwrap();
+            service.execution_policy = Arc::new(
+                ExecutionPolicyState::load(startup(BOTH), path)
+                    .with_usability_budget(TEST_USABILITY_BUDGET),
+            );
+            assert_eq!(service.execution_policy().default_reference(), Some(e1()));
         }
-        let (_fixture, paths) = crate::service::tests::service_tests::installed_runtime();
-        service.runtime_paths = paths;
-        let _discovery = service
-            .runtime_inventory_refresh_lock
-            .clone()
-            .lock_owned()
-            .await;
-        let response = service
-            .apply_execution_policy(apply_request(Some(wire(7, Some(e1()), &[e1()], None))))
-            .await
-            .unwrap()
-            .into_inner();
-        let expected = if adopted {
-            crate::proto::ClusterDefaultOutcome::Adopted
-        } else {
-            crate::proto::ClusterDefaultOutcome::Unusable
-        };
-        assert_eq!(response.default_outcome(), expected);
-        assert_eq!(
-            service.execution_policy().default_reference(),
-            adopted.then(e1)
-        );
     }
+    let (_fixture, paths) = crate::service::tests::service_tests::installed_runtime();
+    service.runtime_paths = paths;
+    let _discovery = service
+        .runtime_inventory_refresh_lock
+        .clone()
+        .lock_owned()
+        .await;
     // A startup default matching the cluster's was never verified, so a slow
     // check doesn't count as an adoption.
-    let (_root, mut service, _) = policy_service(BOTH).await;
-    let (_fixture, paths) = crate::service::tests::service_tests::installed_runtime();
-    service.runtime_paths = paths;
-    let _discovery = service
-        .runtime_inventory_refresh_lock
-        .clone()
-        .lock_owned()
-        .await;
+    let applied = match prior {
+        PriorVerdict::StartupDefault => wire(8, Some(e0()), &[e0()], None),
+        _ => wire(7, Some(e1()), &[e1()], None),
+    };
     let response = service
-        .apply_execution_policy(apply_request(Some(wire(8, Some(e0()), &[e0()], None))))
+        .apply_execution_policy(apply_request(Some(applied)))
         .await
         .unwrap()
         .into_inner();
-    assert_eq!(
-        response.default_outcome(),
-        crate::proto::ClusterDefaultOutcome::Unusable
-    );
-
-    // A verdict restored from the record does count, until a check this
-    // process completes says otherwise, so a slow first discovery after a
-    // restart can't flap the default.
-    let (root, mut service, _) = policy_service(BOTH).await;
-    let path = root.path().join("execution-policy.json");
-    write_record(
-        &path,
-        Some(&PolicyRecord {
-            schema_version: RECORD_SCHEMA_VERSION,
-            cluster: cluster.clone(),
-            default_verified: true,
-        }),
-    )
-    .unwrap();
-    service.execution_policy = Arc::new(ExecutionPolicyState::load(startup(BOTH), path));
-    assert_eq!(service.execution_policy().default_reference(), Some(e1()));
-    let (_fixture, paths) = crate::service::tests::service_tests::installed_runtime();
-    service.runtime_paths = paths;
-    let _discovery = service
-        .runtime_inventory_refresh_lock
-        .clone()
-        .lock_owned()
-        .await;
-    let response = service
-        .apply_execution_policy(apply_request(Some(wire(7, Some(e1()), &[e1()], None))))
-        .await
-        .unwrap()
-        .into_inner();
-    assert_eq!(
-        response.default_outcome(),
+    let kept = matches!(prior, PriorVerdict::Adopted | PriorVerdict::Restored);
+    let expected = if kept {
         crate::proto::ClusterDefaultOutcome::Adopted
-    );
-    assert_eq!(service.execution_policy().default_reference(), Some(e1()));
+    } else {
+        crate::proto::ClusterDefaultOutcome::Unusable
+    };
+    assert_eq!(response.default_outcome(), expected);
+    if !matches!(prior, PriorVerdict::StartupDefault) {
+        assert_eq!(
+            service.execution_policy().default_reference(),
+            kept.then(e1)
+        );
+    }
 }
 
 #[tokio::test]
@@ -757,7 +758,7 @@ async fn slow_default_verification_refuses_the_default_but_still_narrows() {
         .lock_owned()
         .await;
     let applied = tokio::time::timeout(
-        USABILITY_BUDGET + std::time::Duration::from_secs(5),
+        TEST_USABILITY_BUDGET + std::time::Duration::from_secs(5),
         service.apply_execution_policy(apply_request(Some(wire(3, Some(e1()), &[e1()], None)))),
     )
     .await
@@ -803,18 +804,33 @@ fn a_superseded_application_changes_neither_policy_nor_verdict() {
     assert_eq!(*state.verified_default.lock().unwrap(), Some(e1()));
 }
 
+/// What the cluster served between verifying E1 and checking it again.
+#[derive(Clone, Copy, Debug)]
+enum Interlude {
+    /// A policy with no default: the default moved away and back.
+    AnotherDefault,
+    /// No policy at all.
+    NoPolicy,
+}
+
+#[rstest::rstest]
+#[case::another_default(Interlude::AnotherDefault)]
+#[case::no_policy(Interlude::NoPolicy)]
 #[tokio::test]
-async fn a_verdict_on_another_default_is_stale() {
+async fn a_verdict_on_another_default_is_stale(#[case] interlude: Interlude) {
     let (_root, mut service, _) = policy_service(BOTH).await;
-    // E1 was verified, then the cluster moved its default away and back.
     service.narrow_execution_for_test(&ClusterExecutionPolicy {
         generation: 1,
         default: Some(ClusterDefault::Environment(e1())),
         executing: [e1()].into(),
         legacy_unbound_allowed: None,
     });
+    let served = match interlude {
+        Interlude::AnotherDefault => Some(wire(2, None, &[], None)),
+        Interlude::NoPolicy => None,
+    };
     service
-        .apply_execution_policy(apply_request(Some(wire(2, None, &[], None))))
+        .apply_execution_policy(apply_request(served))
         .await
         .unwrap();
     let (_fixture, paths) = crate::service::tests::service_tests::installed_runtime();
@@ -826,36 +842,6 @@ async fn a_verdict_on_another_default_is_stale() {
         .await;
     let response = service
         .apply_execution_policy(apply_request(Some(wire(3, Some(e1()), &[e1()], None))))
-        .await
-        .unwrap()
-        .into_inner();
-    assert_eq!(
-        response.default_outcome(),
-        crate::proto::ClusterDefaultOutcome::Unusable
-    );
-    drop(_discovery);
-
-    // Nor does it survive the cluster serving no policy at all.
-    let (_root, mut service, _) = policy_service(BOTH).await;
-    service.narrow_execution_for_test(&ClusterExecutionPolicy {
-        generation: 1,
-        default: Some(ClusterDefault::Environment(e1())),
-        executing: [e1()].into(),
-        legacy_unbound_allowed: None,
-    });
-    service
-        .apply_execution_policy(apply_request(None))
-        .await
-        .unwrap();
-    let (_fixture, paths) = crate::service::tests::service_tests::installed_runtime();
-    service.runtime_paths = paths;
-    let _discovery = service
-        .runtime_inventory_refresh_lock
-        .clone()
-        .lock_owned()
-        .await;
-    let response = service
-        .apply_execution_policy(apply_request(Some(wire(4, Some(e1()), &[e1()], None))))
         .await
         .unwrap()
         .into_inner();

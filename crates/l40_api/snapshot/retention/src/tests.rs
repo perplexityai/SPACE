@@ -1204,13 +1204,18 @@ mod postgres {
         let Some(db) = try_pg_test_db().await? else {
             return Ok(());
         };
+        // A raw page and candidate cap a hundredth of production's 10,000 and
+        // 2,000, in the same proportion, so the cap still binds several times
+        // inside each raw page.
+        const RAW_PAGE: usize = 100;
+        const CAP: i64 = 20;
         let history = insert_sandbox(&db.pool).await?;
-        // One long history spanning the 10,000-row raw ID page, with ages
-        // increasing by id so every sibling probe finds its keeper on the
-        // first index row it reads. The two newest rows deliberately tie: the
-        // keep floor then has to break the tie on the higher UUID for id
-        // 10000 to be a candidate at all, which is what pins the tuple
-        // comparison in the probe.
+        // One long history spanning the raw ID page, with ages increasing by
+        // id so every sibling probe finds its keeper on the first index row it
+        // reads. The two newest rows deliberately tie: the keep floor then has
+        // to break the tie on the higher UUID for id `RAW_PAGE` to be a
+        // candidate at all, which is what pins the tuple comparison in the
+        // probe.
         //
         // Ties are the expensive shape here — with every row tied, the probe
         // for candidate g filters g rows before it finds one that sorts
@@ -1220,10 +1225,11 @@ mod postgres {
             "INSERT INTO snapshots (id,sandbox_id,type,state,timestamp)
              SELECT ('20000000-0000-7000-8000-' || lpad(to_hex(g),12,'0'))::uuid,
                     $1,'full','ready',
-                    NOW() - INTERVAL '14 days' + (LEAST(g,10000) * INTERVAL '1 second')
-               FROM generate_series(1,10001) g"
+                    NOW() - INTERVAL '14 days' + (LEAST(g,$2) * INTERVAL '1 second')
+               FROM generate_series(1,$2 + 1) g"
         ))
         .bind(history)
+        .bind(RAW_PAGE as i32)
         .execute(&db.pool)
         .await?;
         // The row that makes this test's name true. Its keeper's id sorts
@@ -1254,19 +1260,14 @@ mod postgres {
         ))
         .execute(&db.pool)
         .await?;
-        let store = SnapshotRetentionDbStore::new(db.pool.clone());
+        let store = SnapshotRetentionDbStore::with_raw_page_size(db.pool.clone(), RAW_PAGE);
         let mut cursor = None;
         let mut discovered = Vec::new();
         loop {
             let page = store
-                .list_candidates(
-                    1,
-                    2000,
-                    cursor,
-                    Some(std::time::Duration::from_secs(604800)),
-                )
+                .list_candidates(1, CAP, cursor, Some(std::time::Duration::from_secs(604800)))
                 .await?;
-            assert!(page.candidates.len() <= 2000);
+            assert!(page.candidates.len() as i64 <= CAP);
             if !page.exhausted {
                 assert!(page.scanned_through > cursor);
             }
@@ -1277,12 +1278,12 @@ mod postgres {
             }
         }
         let expected: Vec<SnapshotId> = std::iter::once(crossing_candidate)
-            .chain((1..=10000).map(|n| {
+            .chain((1..=RAW_PAGE as u128).map(|n| {
                 SnapshotId::from_uuid(Uuid::from_u128(0x20000000000070008000000000000000 + n))
             }))
             .collect();
         assert_eq!(discovered, expected);
-        let empty = store.list_candidates(1, 2000, cursor, None).await?;
+        let empty = store.list_candidates(1, CAP, cursor, None).await?;
         assert!(empty.candidates.is_empty() && empty.exhausted);
         assert_eq!(empty.scanned_through, None);
         Ok(())
@@ -1406,15 +1407,19 @@ mod postgres {
             return Ok(());
         };
         let pool = &db.pool;
+        // Pages a hundredth of production's, so crossing two of them needs a
+        // hundredth of the rows.
+        const RAW_PAGE: usize = 100;
         // Singleton histories are keepers even though every snapshot is older
         // than TTL. The eligible tail starts beyond two raw discovery pages.
         sqlx::query(sql!(
             "INSERT INTO sandboxes (id, user_id, org_id, network_policy_generation)
              SELECT ('10000000-0000-7000-8000-' || lpad(to_hex(g),12,'0'))::uuid,
-                    $1::uuid, $2::uuid, 1 FROM generate_series(1,20001) g"
+                    $1::uuid, $2::uuid, 1 FROM generate_series(1,$3) g"
         ))
         .bind(SEEDED_USER_ID)
         .bind(SEEDED_ORG_ID)
+        .bind(2 * RAW_PAGE as i32 + 1)
         .execute(pool)
         .await?;
         sqlx::query(sql!(
@@ -1422,8 +1427,9 @@ mod postgres {
              SELECT ('20000000-0000-7000-8000-' || lpad(to_hex(g),12,'0'))::uuid,
                     ('10000000-0000-7000-8000-' || lpad(to_hex(g),12,'0'))::uuid,
                     'full','ready',NOW()-INTERVAL '14 days'
-               FROM generate_series(1,20001) g"
+               FROM generate_series(1,$1) g"
         ))
+        .bind(2 * RAW_PAGE as i32 + 1)
         .execute(pool)
         .await?;
         sqlx::query(sql!(
@@ -1453,7 +1459,7 @@ mod postgres {
                 .bind(mode)
                 .execute(pool)
                 .await?;
-            let store = SnapshotRetentionDbStore::new(pool.clone());
+            let store = SnapshotRetentionDbStore::with_raw_page_size(pool.clone(), RAW_PAGE);
             let first = store.list_candidates(1, 2, None, ttl).await?;
             assert!(
                 first.candidates.is_empty(),

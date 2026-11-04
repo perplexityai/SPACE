@@ -162,6 +162,38 @@ async fn poll_outcome(
     TeardownSuspendOutcome::try_from(response.outcome).unwrap()
 }
 
+/// How [`answered_or_admitted`] ended.
+enum Drive<T> {
+    /// The drive answered first.
+    Answered(T),
+    /// The stub admitted a registration of the artifact first.
+    Admitted,
+}
+
+/// `drive`'s answer, or [`Drive::Admitted`] once the stub has admitted a
+/// registration of `staged`. An admitted registration starts an upload that
+/// dials vol-mgr, which these tests don't serve, so after it the drive only
+/// waits out that dial's connect retries.
+async fn answered_or_admitted<T>(
+    staged: LocalArtifactId,
+    drive: impl std::future::Future<Output = T>,
+) -> Drive<T> {
+    let staged = staged.to_string();
+    let admitted = async {
+        while !admitted_registrations()
+            .iter()
+            .any(|line| line.contains(&staged))
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    };
+    tokio::select! {
+        biased;
+        answer = drive => Drive::Answered(answer),
+        () = admitted => Drive::Admitted,
+    }
+}
+
 pub(super) async fn drain(service: &SandboxManagerService) {
     service.shutdown_token.cancel();
     service.task_tracker.close();

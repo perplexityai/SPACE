@@ -225,14 +225,18 @@ async fn set_node_columns(
 /// The fail CAS moves a row to `failed` only out of the lifecycle the sweep
 /// listed it under, for every sweepable lifecycle: an aged row stored in any
 /// other value, including the stored non-variants, is left alone.
+#[rstest::rstest]
 #[tokio::test(flavor = "current_thread")]
-async fn fail_cas_claims_only_the_lifecycle_it_was_listed_under() -> TestResult {
+async fn fail_cas_claims_only_the_lifecycle_it_was_listed_under(
+    #[values(0, 1)] shard: usize,
+) -> TestResult {
     let db = pg_test_db().await?;
     let pool = &db.pool;
     let sink = direct_sink(pool);
 
     let mut mismatches = Vec::new();
-    for stored in StoredSandboxLifecycle::all_as_str() {
+    // Every other stored value, so the sweep's two halves run side by side.
+    for stored in StoredSandboxLifecycle::all_as_str().skip(shard).step_by(2) {
         for listed in SWEEPABLE_LIFECYCLES.iter().copied() {
             let sandbox_id = SandboxId::new();
             insert_row(pool, sandbox_id, &Row::bare(stored)).await?;

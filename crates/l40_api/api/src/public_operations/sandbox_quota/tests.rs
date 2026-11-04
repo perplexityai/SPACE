@@ -7,13 +7,14 @@ use pplx_space_public_api::{
     OperationKind, OperationTargetType, PublicSandboxId, RequestFingerprint,
 };
 use pplx_space_test_env::TestResult;
-use sqlx::{PgConnection, PgPool};
+use sqlx::PgPool;
 
 use super::*;
 use crate::public_operations::{
     CreatePublicOperation, CreatePublicOperationIdempotency, CreatePublicOperationResult,
     HttpOperationMethod, OperationPathTemplate, PublicOperationStore, create_operation_tx,
 };
+use crate::test_support::wait_until_blocked_by;
 
 #[test]
 fn creates_lock_shared_well_under_a_limit_and_exclusively_near_it() {
@@ -446,12 +447,21 @@ async fn shared_creates_do_not_wait_for_each_other_and_refusals_take_no_lock() -
 /// create's transaction keeps the session's own `lock_timeout`.
 #[tokio::test]
 async fn a_long_quota_lock_wait_ends_contended() -> TestResult {
+    // The bound under test, set on each waiting admission: a fifth of
+    // `QUOTA_LOCK_TIMEOUT`, and eight times the shorter bounds below, whose
+    // waits so end well inside half of it.
+    const BOUND: Duration = Duration::from_millis(400);
     let Some(db) = try_pg_test_db_with_max_connections(3).await? else {
         return Ok(());
     };
     let org_id = seed_org(&db.pool).await?;
     let store = PublicOperationStore::new(db.pool.clone());
     let quota = org_quota(org_id, 1);
+    let bounded = async |key| {
+        let mut admission = begin(&store, org_id, key).await?;
+        admission.quota_lock_timeout = BOUND;
+        TestResult::Ok(admission)
+    };
 
     let mut holder = db.pool.begin().await?;
     lock_tx(
@@ -462,31 +472,31 @@ async fn a_long_quota_lock_wait_ends_contended() -> TestResult {
     )
     .await?;
 
-    let mut waiting = begin(&store, org_id, "lock-timeout").await?;
+    let mut waiting = bounded("lock-timeout").await?;
     let started = Instant::now();
-    let outcome = tokio::time::timeout(3 * QUOTA_LOCK_TIMEOUT, waiting.admit_new_create(quota))
+    let outcome = tokio::time::timeout(3 * BOUND, waiting.admit_new_create(quota))
         .await
         .map_err(|_| "the lock wait was not bounded")??;
     assert_eq!(outcome, SandboxQuotaOutcome::Contended);
-    assert!(started.elapsed() >= QUOTA_LOCK_TIMEOUT);
+    assert!(started.elapsed() >= BOUND);
     drop(waiting);
 
-    let mut waiting = begin(&store, org_id, "statement-timeout").await?;
-    sqlx::query(sql!("SET LOCAL statement_timeout = '100ms'"))
+    let mut waiting = bounded("statement-timeout").await?;
+    sqlx::query(sql!("SET LOCAL statement_timeout = '50ms'"))
         .execute(&mut *waiting.tx)
         .await?;
-    let outcome = tokio::time::timeout(QUOTA_LOCK_TIMEOUT / 2, waiting.admit_new_create(quota))
+    let outcome = tokio::time::timeout(BOUND / 2, waiting.admit_new_create(quota))
         .await
         .map_err(|_| "the statement timeout did not end the wait")??;
     assert_eq!(outcome, SandboxQuotaOutcome::Contended);
     drop(waiting);
 
     // A shorter bound already in force is kept, not raised.
-    let mut waiting = begin(&store, org_id, "shorter-lock-timeout").await?;
-    sqlx::query(sql!("SET LOCAL lock_timeout = '100ms'"))
+    let mut waiting = bounded("shorter-lock-timeout").await?;
+    sqlx::query(sql!("SET LOCAL lock_timeout = '50ms'"))
         .execute(&mut *waiting.tx)
         .await?;
-    let outcome = tokio::time::timeout(QUOTA_LOCK_TIMEOUT / 2, waiting.admit_new_create(quota))
+    let outcome = tokio::time::timeout(BOUND / 2, waiting.admit_new_create(quota))
         .await
         .map_err(|_| "the shorter lock timeout was raised")??;
     assert_eq!(outcome, SandboxQuotaOutcome::Contended);
@@ -544,30 +554,6 @@ async fn planned(
         .plan_sandbox_quota(quota)
         .await?
         .map_err(|refusal| format!("refused at the lock-free count: {refusal:?}").into())
-}
-
-/// Wait until some backend is blocked on a lock `holder` holds: proof that
-/// the create under test queued behind it.
-async fn wait_until_blocked_by(holder: &mut PgConnection) -> TestResult {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        let blocked: bool = sqlx::query_scalar(sql!(
-            "SELECT EXISTS (
-                 SELECT 1 FROM pg_stat_activity
-                  WHERE datname = current_database()
-                    AND pg_backend_pid() = ANY(pg_blocking_pids(pid))
-             )"
-        ))
-        .fetch_one(&mut *holder)
-        .await?;
-        if blocked {
-            return Ok(());
-        }
-        if Instant::now() >= deadline {
-            return Err("the create never waited for the holder's lock".into());
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
 }
 
 async fn begin(

@@ -441,9 +441,9 @@ async fn lock_row(
     Ok(blocker)
 }
 
-/// A write that can't finish is cancelled by Postgres itself at
-/// [`WRITE_STATEMENT_TIMEOUT`], before the client-side backstop, so its
-/// outcome is known: rolled back.
+/// A write that can't finish is cancelled by Postgres itself at its
+/// statement bound ([`WRITE_STATEMENT_TIMEOUT`] in production), before the
+/// client-side backstop, so its outcome is known: rolled back.
 #[tokio::test(flavor = "current_thread")]
 async fn blocked_write_is_cancelled_server_side_and_rolled_back() -> TestResult {
     let Some(fixture) = two_connection_db().await? else {
@@ -453,14 +453,21 @@ async fn blocked_write_is_cancelled_server_side_and_rolled_back() -> TestResult 
     let group = insert_group(pool, "org-a-dedicated").await?;
     let host = "ip-10-0-0-4.ec2.internal";
     let node = insert_node(pool, host).await?;
+    // Shortened so the test doesn't sit out the production bound, which still
+    // separates it: a write cancelled by any other bound takes longer.
+    let bounds = WriteBounds {
+        statement: Duration::from_millis(250),
+        ..WriteBounds::DEFAULT
+    };
 
     let blocker = lock_row(pool, node).await?;
     let started = std::time::Instant::now();
-    let written = apply_mirror(
+    let written = apply_mirror_within(
         pool,
         &[host.to_string()],
         &[Some(group)],
         &CancellationToken::new(),
+        bounds,
     )
     .await;
     let elapsed = started.elapsed();
@@ -490,7 +497,7 @@ async fn blocked_write_is_cancelled_server_side_and_rolled_back() -> TestResult 
         "Postgres cancelled the statement: {db_err}"
     );
     assert!(
-        elapsed >= WRITE_STATEMENT_TIMEOUT && elapsed < WRITE_STATEMENT_TIMEOUT * 2,
+        elapsed >= bounds.statement && elapsed < WRITE_STATEMENT_TIMEOUT,
         "cancelled by the write's own server-side bound: {elapsed:?}"
     );
     assert_eq!(mirrored_group(pool, node).await?, None, "rolled back");
@@ -513,22 +520,27 @@ async fn idle_write_transaction_is_ended_server_side() -> TestResult {
     let host = "ip-10-0-0-6.ec2.internal";
     let node = insert_node(pool, host).await?;
     // Bounded real-time waits: the behavior under test is Postgres's own timer,
-    // shortened here so the test doesn't sit out the production bound.
-    let idle_timeout = Duration::from_secs(1);
-    let gap = idle_timeout + Duration::from_millis(500);
+    // shortened here so the test doesn't sit out the production bound. Each
+    // gap lasts until Postgres has ended the session, as an observer outside
+    // the pool sees, so it is past the bound however late the timer fires.
+    let idle_timeout = Duration::from_millis(200);
+    let mut observer = sqlx::PgConnection::connect(&fixture.database_url).await?;
 
     for idle_before_commit in [false, true] {
         let mut conn = pool.acquire().await?;
+        let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut *conn)
+            .await?;
         let mut tx =
             store::begin_mirror_write(&mut conn, WRITE_STATEMENT_TIMEOUT, idle_timeout).await?;
         if !idle_before_commit {
-            tokio::time::sleep(gap).await;
+            wait_for_session_end(&mut observer, pid).await?;
         }
         let update =
             store::mirror_worker_groups(&mut tx, &[host.to_string()], &[Some(group)]).await;
         let committed = if idle_before_commit {
             assert!(update.is_ok(), "a prompt UPDATE runs: {update:?}");
-            tokio::time::sleep(gap).await;
+            wait_for_session_end(&mut observer, pid).await?;
             tx.commit().await
         } else {
             assert!(session_ended(&update), "the session was ended: {update:?}");
@@ -541,6 +553,25 @@ async fn idle_write_transaction_is_ended_server_side() -> TestResult {
     }
     assert_eq!(mirrored_group(pool, node).await?, None, "nothing committed");
     Ok(())
+}
+
+/// Wait until backend `pid` has exited, failing after a few seconds if it
+/// never does.
+async fn wait_for_session_end(observer: &mut sqlx::PgConnection, pid: i32) -> TestResult {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if std::time::Instant::now() >= deadline {
+            return Err(format!("backend {pid} was never ended").into());
+        }
+        let alive: i64 = sqlx::query_scalar("SELECT count(*) FROM pg_stat_activity WHERE pid = $1")
+            .bind(pid)
+            .fetch_one(&mut *observer)
+            .await?;
+        if alive == 0 {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }
 
 /// Whether `result` failed because Postgres ended the session for idling in

@@ -264,8 +264,9 @@ struct RedrivenRefusal {
     refused: JobId,
     /// The newest upload under the artifact's key after the drive.
     newest: JobId,
-    /// The drive's result, or `None` while its new upload still runs after
-    /// a few seconds: the test serves no vol-mgr.
+    /// The drive's result, or `None` while its new upload still runs, once
+    /// its registration is admitted or after a few seconds: the test serves
+    /// no vol-mgr.
     result: Option<Result<(), tonic::Status>>,
     dispatched: Dispatched,
     /// The refused capture and the directory holding its files.
@@ -359,20 +360,26 @@ async fn redrive_refusal_of(shape: RefusedRow) -> RedrivenRefusal {
         snapshot_name: None,
         local_path: snapshot_dir.to_str().unwrap().to_string(),
     };
-    let result = tokio::time::timeout(
+    let result = match tokio::time::timeout(
         Duration::from_secs(3),
-        service.ensure_teardown_suspend_backup(
-            &row,
-            TeardownSuspendBackup {
-                execution_generation: generation(GENERATION),
-                artifact: &artifact,
-                format: SuspendSnapshotFormat::Full,
-                origin,
-            },
+        answered_or_admitted(
+            staged,
+            service.ensure_teardown_suspend_backup(
+                &row,
+                TeardownSuspendBackup {
+                    execution_generation: generation(GENERATION),
+                    artifact: &artifact,
+                    format: SuspendSnapshotFormat::Full,
+                    origin,
+                },
+            ),
         ),
     )
     .await
-    .ok();
+    {
+        Ok(Drive::Answered(result)) => Some(result),
+        Ok(Drive::Admitted) | Err(_) => None,
+    };
     let newest = service
         .snapshot_upload_worker
         .find_job_by_dedup_key(

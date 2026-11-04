@@ -2,9 +2,9 @@ use super::super::*;
 use crate::pg_test_support::{PostgresFixture, TestResult, postgres_fixture};
 
 const TEST_TIMEOUTS: SessionTimeouts<'static> = SessionTimeouts {
-    app_statement: "750ms",
+    app_statement: "400ms",
     app_idle_in_transaction: "2500ms",
-    app_lock: Some("250ms"),
+    app_lock: Some("100ms"),
     migrator_statement: "5min",
     migrator_lock: "2min",
 };
@@ -281,7 +281,7 @@ async fn fresh_database_bootstraps_migrates_as_migrator_and_fences() -> TestResu
     for role in [USER_ROLE, RO_ROLE, CREDS_ROLE] {
         let settings = role_settings(&fixture, role).await?;
         assert!(
-            settings.contains(&"statement_timeout=750ms".to_string()),
+            settings.contains(&"statement_timeout=400ms".to_string()),
             "{role} settings: {settings:?}"
         );
         assert!(
@@ -296,7 +296,7 @@ async fn fresh_database_bootstraps_migrates_as_migrator_and_fences() -> TestResu
     for role in [USER_ROLE, RO_ROLE, CREDS_ROLE] {
         let settings = role_settings(&fixture, role).await?;
         assert!(
-            settings.contains(&"lock_timeout=250ms".to_string()),
+            settings.contains(&"lock_timeout=100ms".to_string()),
             "{role} settings: {settings:?}"
         );
     }
@@ -704,7 +704,7 @@ async fn app_lock_timeout_converges_across_its_provisioning_lifecycle() -> TestR
         );
         // The always-written app timeouts are unaffected by the omission.
         assert!(
-            settings.contains(&"statement_timeout=750ms".to_string()),
+            settings.contains(&"statement_timeout=400ms".to_string()),
             "{role} settings: {settings:?}"
         );
     }
@@ -714,7 +714,7 @@ async fn app_lock_timeout_converges_across_its_provisioning_lifecycle() -> TestR
     for role in [USER_ROLE, RO_ROLE] {
         let settings = role_settings(&fixture, role).await?;
         assert!(
-            settings.contains(&"lock_timeout=250ms".to_string()),
+            settings.contains(&"lock_timeout=100ms".to_string()),
             "{role} settings: {settings:?}"
         );
     }
@@ -762,7 +762,7 @@ async fn app_lock_timeout_converges_across_its_provisioning_lifecycle() -> TestR
     for role in [USER_ROLE, RO_ROLE] {
         let settings = role_settings(&fixture, role).await?;
         assert!(
-            settings.contains(&"lock_timeout=250ms".to_string()),
+            settings.contains(&"lock_timeout=100ms".to_string()),
             "{role} kept no lock_timeout across a config-less re-provision: {settings:?}"
         );
     }
@@ -796,7 +796,7 @@ async fn app_lock_timeout_converges_across_its_provisioning_lifecycle() -> TestR
         );
         // The other app timeouts are untouched by the flip.
         assert!(
-            settings.contains(&"statement_timeout=750ms".to_string()),
+            settings.contains(&"statement_timeout=400ms".to_string()),
             "{role} settings: {settings:?}"
         );
     }

@@ -1117,99 +1117,97 @@ mod postgres {
     /// recorded and runs here, answering as a queued create does; refused,
     /// it is recorded queued for the dispatcher at attempt 0, as with
     /// inline execution off.
+    #[rstest::rstest]
+    #[case::none(ColdFallback::None)]
+    #[case::kind_not_listed(ColdFallback::KindNotListed)]
+    #[case::saturated(ColdFallback::Saturated)]
+    #[case::org_limit(ColdFallback::OrgLimit)]
     #[tokio::test(flavor = "current_thread")]
-    async fn a_cold_create_runs_inline_or_is_queued_for_the_dispatcher() -> TestDbResult<()> {
+    async fn a_cold_create_runs_inline_or_is_queued_for_the_dispatcher(
+        #[case] case: ColdFallback,
+    ) -> TestDbResult<()> {
         let creates = &[OperationKind::CreateSandbox][..];
-        for case in [
-            ColdFallback::None,
-            ColdFallback::KindNotListed,
-            ColdFallback::Saturated,
-            ColdFallback::OrgLimit,
-        ] {
-            let fixture = AdmissionPoolFixture::new(1).await?;
-            let script = ScriptedCreate::gated(Script::Succeed);
-            let inline = match case {
-                ColdFallback::None | ColdFallback::Saturated => {
-                    cold_inline(&script, creates, 1, None)
-                }
-                ColdFallback::KindNotListed => {
-                    cold_inline(&script, &[OperationKind::WakeSandbox], 4, None)
-                }
-                ColdFallback::OrgLimit => cold_inline(&script, creates, 4, Some(1)),
-            };
-            let holder = match case {
-                ColdFallback::Saturated => Some(
-                    create_cold(&fixture, &inline, "cold-holder", None)
+        let fixture = AdmissionPoolFixture::new(1).await?;
+        let script = ScriptedCreate::gated(Script::Succeed);
+        let inline = match case {
+            ColdFallback::None | ColdFallback::Saturated => cold_inline(&script, creates, 1, None),
+            ColdFallback::KindNotListed => {
+                cold_inline(&script, &[OperationKind::WakeSandbox], 4, None)
+            }
+            ColdFallback::OrgLimit => cold_inline(&script, creates, 4, Some(1)),
+        };
+        let holder = match case {
+            ColdFallback::Saturated => Some(
+                create_cold(&fixture, &inline, "cold-holder", None)
+                    .await
+                    .expect("create is recorded"),
+            ),
+            ColdFallback::OrgLimit => {
+                let other_process = cold_inline(&script, creates, 4, Some(1));
+                Some(
+                    create_cold(&fixture, &other_process, "cold-holder", None)
                         .await
                         .expect("create is recorded"),
-                ),
-                ColdFallback::OrgLimit => {
-                    let other_process = cold_inline(&script, creates, 4, Some(1));
-                    Some(
-                        create_cold(&fixture, &other_process, "cold-holder", None)
-                            .await
-                            .expect("create is recorded"),
-                    )
-                }
-                ColdFallback::None | ColdFallback::KindNotListed => None,
-            };
-            if holder.is_some() {
-                started(&script).await;
+                )
             }
+            ColdFallback::None | ColdFallback::KindNotListed => None,
+        };
+        if holder.is_some() {
+            started(&script).await;
+        }
 
-            let response = create_cold(&fixture, &inline, "cold-create", None)
-                .await
-                .expect("create is recorded");
-            assert_eq!(
-                response.operation, None,
-                "{case:?}: answers without waiting"
-            );
-            let row = operation_row(&fixture, response.operation_id).await?;
-            let payload = fixture.payload(response.operation_id).await?;
-            assert!(payload.pool_claim.is_none(), "{case:?}: a cold create");
-            match case {
-                ColdFallback::None => {
-                    assert_eq!((row.state.as_str(), row.attempts), ("running", 1));
-                    started(&script).await;
-                    script.open_gate();
-                    let row = wait_for_state(&fixture, response.operation_id, "succeeded").await?;
-                    assert_eq!((row.attempts, row.claim_generation), (1, 1));
-                    assert_eq!(
-                        event_types(&fixture, response.operation_id).await?,
-                        vec![
-                            "operation.created",
-                            "operation.claimed",
-                            "operation.completed"
-                        ]
-                    );
-                    assert_eq!(script.calls(), 1);
-                }
-                ColdFallback::KindNotListed | ColdFallback::Saturated | ColdFallback::OrgLimit => {
-                    assert_eq!(
-                        (row.state.as_str(), row.attempts),
-                        ("queued", 0),
-                        "{case:?}"
-                    );
-                    let claim = dispatcher_claim(&fixture).await?;
-                    assert_eq!(
-                        claim
-                            .operations
-                            .iter()
-                            .map(|operation| operation.id)
-                            .collect::<Vec<_>>(),
-                        vec![response.operation_id],
-                        "{case:?}: the dispatcher takes it"
-                    );
-                    assert_eq!(
-                        script.calls(),
-                        usize::from(holder.is_some()),
-                        "{case:?}: it never ran inline"
-                    );
-                }
-            }
-            if holder.is_some() {
+        let response = create_cold(&fixture, &inline, "cold-create", None)
+            .await
+            .expect("create is recorded");
+        assert_eq!(
+            response.operation, None,
+            "{case:?}: answers without waiting"
+        );
+        let row = operation_row(&fixture, response.operation_id).await?;
+        let payload = fixture.payload(response.operation_id).await?;
+        assert!(payload.pool_claim.is_none(), "{case:?}: a cold create");
+        match case {
+            ColdFallback::None => {
+                assert_eq!((row.state.as_str(), row.attempts), ("running", 1));
+                started(&script).await;
                 script.open_gate();
+                let row = wait_for_state(&fixture, response.operation_id, "succeeded").await?;
+                assert_eq!((row.attempts, row.claim_generation), (1, 1));
+                assert_eq!(
+                    event_types(&fixture, response.operation_id).await?,
+                    vec![
+                        "operation.created",
+                        "operation.claimed",
+                        "operation.completed"
+                    ]
+                );
+                assert_eq!(script.calls(), 1);
             }
+            ColdFallback::KindNotListed | ColdFallback::Saturated | ColdFallback::OrgLimit => {
+                assert_eq!(
+                    (row.state.as_str(), row.attempts),
+                    ("queued", 0),
+                    "{case:?}"
+                );
+                let claim = dispatcher_claim(&fixture).await?;
+                assert_eq!(
+                    claim
+                        .operations
+                        .iter()
+                        .map(|operation| operation.id)
+                        .collect::<Vec<_>>(),
+                    vec![response.operation_id],
+                    "{case:?}: the dispatcher takes it"
+                );
+                assert_eq!(
+                    script.calls(),
+                    usize::from(holder.is_some()),
+                    "{case:?}: it never ran inline"
+                );
+            }
+        }
+        if holder.is_some() {
+            script.open_gate();
         }
         Ok(())
     }
@@ -1221,7 +1219,9 @@ mod postgres {
     async fn a_held_inline_create_renews_its_claim_and_starts_after_the_hold() -> TestDbResult<()> {
         let fixture = AdmissionPoolFixture::new(1).await?;
         let script = ScriptedCreate::new(Script::Succeed);
-        let hold = Duration::from_secs(1);
+        // Long beside the 60 ms claim staleness, so the claim renews several
+        // times within its first third.
+        let hold = Duration::from_millis(300);
         let inline = crate::inline_operations::InlineLifecycle::new(
             InlineOperations::new(
                 InlineOperationsConfig {

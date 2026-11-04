@@ -6,6 +6,98 @@
 
 use super::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Instant;
+
+/// The held-back claim backoff in the tests that measure it: several 20 ms
+/// ticks long, so a loop that ignored it would claim more than once inside it.
+const HELD_BACK_BACKOFF: Duration = Duration::from_millis(100);
+
+/// When one claim started and when it returned.
+#[derive(Clone, Copy, Debug)]
+struct Claim {
+    started: Instant,
+    returned: Instant,
+}
+
+/// The claims the loop has made, in order. A claim is recorded when it
+/// returns; `started` waits there for it.
+#[derive(Default)]
+struct ClaimLog {
+    started: Vec<Instant>,
+    claims: Vec<Claim>,
+}
+
+/// Hooks that record when each claim starts and returns, to install with
+/// [`super::BEFORE_CLAIM`] and [`super::AFTER_CLAIM`].
+fn claim_times() -> (BeforeClaimHook, BeforeClaimHook, Arc<Mutex<ClaimLog>>) {
+    let log = Arc::new(Mutex::new(ClaimLog::default()));
+    let before: BeforeClaimHook = {
+        let log = log.clone();
+        Arc::new(move || {
+            log.lock().expect("claim log").started.push(Instant::now());
+            Box::pin(async {})
+        })
+    };
+    let after: BeforeClaimHook = {
+        let log = log.clone();
+        Arc::new(move || {
+            let mut log = log.lock().expect("claim log");
+            let started = log.started.pop().expect("a claim returns after it starts");
+            log.claims.push(Claim {
+                started,
+                returned: Instant::now(),
+            });
+            Box::pin(async {})
+        })
+    };
+    (before, after, log)
+}
+
+/// The next `count` claims to return from now. Waits for them rather than for
+/// a fixed window, so a slow runner yields later claims, not fewer.
+async fn next_claims(log: &Mutex<ClaimLog>, count: usize) -> Vec<Claim> {
+    let before = log.lock().expect("claim log").claims.len();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        {
+            let log = log.lock().expect("claim log");
+            if log.claims.len() >= before + count {
+                return log.claims[before..before + count].to_vec();
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "fewer than {count} claims returned within 10 s"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// How long the loop waited after each claim in `claims` returned before it
+/// started the next: the backoff, the tick or both, without either claim's
+/// own database work.
+fn gaps(claims: &[Claim]) -> Vec<Duration> {
+    claims
+        .windows(2)
+        .map(|pair| pair[1].started.duration_since(pair[0].returned))
+        .collect()
+}
+
+/// The middle of `gaps`, so one slow or fast claim does not decide a test.
+fn median(mut gaps: Vec<Duration>) -> Duration {
+    gaps.sort();
+    gaps[gaps.len() / 2]
+}
+
+/// Asserts that after every claim in `claims` the loop waited out
+/// [`HELD_BACK_BACKOFF`] before it claimed again.
+fn assert_backed_off(claims: &[Claim]) {
+    let gaps = gaps(claims);
+    assert!(
+        gaps.iter().all(|gap| *gap >= HELD_BACK_BACKOFF),
+        "the loop claimed again inside the backoff: {gaps:?}"
+    );
+}
 
 /// Holds the operations it holds until `release` is cancelled, and
 /// completes the others at once: it holds everything but teardowns, or with
@@ -540,36 +632,30 @@ async fn a_claim_only_teardowns_could_use_waits_before_the_next() -> TestResult 
     )
     .await?;
     let executor = HeldWork::default();
-    let claims = Arc::new(AtomicUsize::new(0));
-    let hook: BeforeClaimHook = {
-        let claims = claims.clone();
-        Arc::new(move || {
-            claims.fetch_add(1, Ordering::SeqCst);
-            Box::pin(async {})
-        })
-    };
+    let (before_claim, after_claim, claims) = claim_times();
     let shutdown = CancellationToken::new();
     let dispatcher = tokio::spawn(super::BEFORE_CLAIM.scope(
-        hook,
-        run(
-            ReconcilerConfig {
-                teardown_reserved_slots: 1,
-                other_reserved_slots: 0,
-                ..fast_loop_config(3)
-            },
-            store.clone(),
-            executor.clone(),
-            shutdown.clone(),
+        before_claim,
+        super::AFTER_CLAIM.scope(
+            after_claim,
+            run(
+                ReconcilerConfig {
+                    teardown_reserved_slots: 1,
+                    other_reserved_slots: 0,
+                    held_back_claim_backoff: HELD_BACK_BACKOFF,
+                    ..fast_loop_config(3)
+                },
+                store.clone(),
+                executor.clone(),
+                shutdown.clone(),
+            ),
         ),
     ));
     // Other work holds every slot open to it, so only the slot kept for
     // teardowns is free, and the third create is due but cannot start.
     wait_for_running(&executor, 2).await?;
-    let before = claims.load(Ordering::SeqCst);
-    tokio::time::sleep(Duration::from_secs(1)).await;
-    // About four claims a second, not one every 20 ms tick.
-    let during = claims.load(Ordering::SeqCst) - before;
-    assert!((1..=8).contains(&during), "{during} claims in a second");
+    // One claim per backoff, not one every 20 ms tick.
+    assert_backed_off(&next_claims(&claims, 4).await);
 
     // A teardown requested meanwhile still starts in its slot.
     let delete = queue_all(
@@ -1199,37 +1285,32 @@ async fn a_claim_that_finds_its_work_held_back_waits_before_the_next() -> TestRe
     )
     .await?;
     let executor = HeldWork::default();
-    let claims = Arc::new(AtomicUsize::new(0));
-    let hook: BeforeClaimHook = {
-        let claims = claims.clone();
-        Arc::new(move || {
-            claims.fetch_add(1, Ordering::SeqCst);
-            Box::pin(async {})
-        })
-    };
+    let (before_claim, after_claim, claims) = claim_times();
     let shutdown = CancellationToken::new();
     // One slot for the organization, the others free but closed to it.
     let dispatcher = tokio::spawn(super::BEFORE_CLAIM.scope(
-        hook,
-        run(
-            ReconcilerConfig {
-                teardown_reserved_slots: 0,
-                other_reserved_slots: 0,
-                org_slot_limit: NonZeroU32::new(1),
-                org_slot_headroom: 3,
-                ..fast_loop_config(4)
-            },
-            store.clone(),
-            executor.clone(),
-            shutdown.clone(),
+        before_claim,
+        super::AFTER_CLAIM.scope(
+            after_claim,
+            run(
+                ReconcilerConfig {
+                    teardown_reserved_slots: 0,
+                    other_reserved_slots: 0,
+                    org_slot_limit: NonZeroU32::new(1),
+                    org_slot_headroom: 3,
+                    held_back_claim_backoff: HELD_BACK_BACKOFF,
+                    ..fast_loop_config(4)
+                },
+                store.clone(),
+                executor.clone(),
+                shutdown.clone(),
+            ),
         ),
     ));
     wait_for_running(&executor, 1).await?;
-    let before = claims.load(Ordering::SeqCst);
-    tokio::time::sleep(Duration::from_secs(1)).await;
-    // About four claims a second, not one every 20 ms tick.
-    let during = claims.load(Ordering::SeqCst) - before;
-    assert!((1..=8).contains(&during), "{during} claims in a second");
+    // One claim per backoff, not one every 20 ms tick.
+    let held_back = next_claims(&claims, 4).await;
+    assert_backed_off(&held_back);
 
     // A finished execution frees a slot, and the next claim follows at once.
     executor.release.cancel();
@@ -1251,10 +1332,15 @@ async fn a_claim_that_finds_its_work_held_back_waits_before_the_next() -> TestRe
     .bind(later.as_uuid())
     .execute(&db.pool)
     .await?;
-    let before = claims.load(Ordering::SeqCst);
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    let idle = claims.load(Ordering::SeqCst) - before;
-    assert!(idle >= 10, "{idle} claims in half a second");
+    // Claims now follow the 20 ms tick: a typical wait after a claim is a
+    // fraction of the backoff the held-back claims waited out.
+    let held_back = median(gaps(&held_back));
+    let idle = median(gaps(&next_claims(&claims, 8).await));
+    assert!(
+        idle < HELD_BACK_BACKOFF / 2,
+        "idle claims still wait out the backoff: median wait {idle:?} idle, \
+         {held_back:?} held back"
+    );
     shutdown.cancel();
     tokio::time::timeout(Duration::from_secs(5), dispatcher).await??;
     Ok(())

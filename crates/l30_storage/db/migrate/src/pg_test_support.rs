@@ -7,7 +7,7 @@
 
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{Connection as _, PgConnection, PgPool};
-use testcontainers::{ContainerAsync, ImageExt, runners::AsyncRunner};
+use testcontainers::{ContainerAsync, ImageExt, core::Mount, runners::AsyncRunner};
 use testcontainers_modules::postgres::Postgres as PostgresImage;
 
 pub(crate) use pplx_space_test_env::TestResult;
@@ -39,10 +39,24 @@ pub(crate) async fn postgres_fixture() -> TestResult<Option<PostgresFixture>> {
         "TESTCONTAINERS_POSTGRES_IMAGE",
         "public.ecr.aws/docker/library/postgres:16-alpine",
     )?;
+    // Durability settings as the shared server's (`space_start_test_postgres`
+    // in ci/scripts/lib/test-deps.sh): a throwaway server needs none, and
+    // each test here starts its own, initdb included.
     let container = match PostgresImage::default()
         .with_host_auth()
         .with_name(image_name)
         .with_tag(image_tag)
+        .with_env_var("POSTGRES_INITDB_ARGS", "--no-sync")
+        .with_env_var("PGDATA", "/var/lib/postgresql/data")
+        .with_mount(Mount::tmpfs_mount("/var/lib/postgresql/data"))
+        .with_cmd([
+            "-c",
+            "fsync=off",
+            "-c",
+            "synchronous_commit=off",
+            "-c",
+            "full_page_writes=off",
+        ])
         .start()
         .await
     {
@@ -54,12 +68,19 @@ pub(crate) async fn postgres_fixture() -> TestResult<Option<PostgresFixture>> {
     };
     let host = container.get_host().await?.to_string();
     let port = container.get_host_port_ipv4(5432).await?;
-    let pool = PgPoolOptions::new()
-        .max_connections(2)
-        .connect(&format!(
-            "postgres://postgres@{host}:{port}/postgres?sslmode=disable"
-        ))
-        .await?;
+    let url = format!("postgres://postgres@{host}:{port}/postgres?sslmode=disable");
+    // The image's readiness line also comes from the entrypoint's temporary
+    // initdb server, which listens on no TCP port, so a connection can land
+    // in the moment before the real server starts and be reset.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let pool = loop {
+        match PgPoolOptions::new().max_connections(2).connect(&url).await {
+            Err(sqlx::Error::Io(_)) if std::time::Instant::now() < deadline => {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            connected => break connected?,
+        }
+    };
     Ok(Some(PostgresFixture {
         pool,
         host,

@@ -56,9 +56,13 @@ async fn idle_closed_connection_reconnects_once_for_concurrent_sends() {
 // connections Hickory has given up on must close, not pile up.
 #[tokio::test]
 async fn failed_connection_moves_every_pooled_connection_off_it() {
+    // The test waits out three stalled requests. A loopback answer, even
+    // over a fresh connection, arrives far sooner than this, so it still
+    // separates a stalled request from an answered one.
+    const TIMEOUT: Duration = Duration::from_millis(250);
     let upstream = TestUpstream::start(false).await;
-    let first = upstream.connection().await;
-    let mut second = upstream.connection().await;
+    let first = upstream.connection_timing_out_after(TIMEOUT).await;
+    let mut second = upstream.connection_timing_out_after(TIMEOUT).await;
     tokio::time::timeout(Duration::from_secs(10), async {
         for (handle, name) in [(&first, "first.example."), (&second, "second.example.")] {
             handle.send(request(name)).first_answer().await.unwrap();
@@ -93,7 +97,7 @@ async fn failed_connection_moves_every_pooled_connection_off_it() {
                     .await,
                 Err(NetError::Timeout)
             ));
-            second = upstream.connection().await;
+            second = upstream.connection_timing_out_after(TIMEOUT).await;
             second
                 .send(request(&format!("redialed-{round}.example.")))
                 .first_answer()
@@ -347,8 +351,14 @@ impl TestUpstream {
 
     // A new pooled connection, with only the self-signed root trusted.
     async fn connection(&self) -> upstream::LoggingDnsHandle {
+        self.connection_timing_out_after(Duration::from_secs(1))
+            .await
+    }
+
+    // [`Self::connection`] whose requests time out after `timeout`.
+    async fn connection_timing_out_after(&self, timeout: Duration) -> upstream::LoggingDnsHandle {
         let mut options = ResolverOpts::default();
-        options.timeout = Duration::from_secs(1);
+        options.timeout = timeout;
         self.provider
             .new_connection(
                 self.addr.ip(),

@@ -141,74 +141,72 @@ fn expected(guard: Guard, lifecycle: &str, recoverable: bool) -> Expected {
 /// clear both node columns and retire an active execution into the new
 /// lifecycle. Every other stored lifecycle, including the stored
 /// non-variants, is left as it was.
+#[rstest::rstest]
 #[tokio::test(flavor = "current_thread")]
-async fn classification_moves_only_the_lifecycles_its_guard_owns() -> TestResult {
+async fn classification_moves_only_the_lifecycles_its_guard_owns(
+    #[values(Guard::PodName, Guard::Forgotten, Guard::LegacyDeleting)] guard: Guard,
+    #[values(false, true)] recoverable: bool,
+) -> TestResult {
     let db = pg_test_db().await?;
     let pool = &db.pool;
     let sink = SubstrateActionSink::new_without_substrate(pool.clone());
     let node_id = insert_node(pool, None, None).await?;
 
     let mut mismatches = Vec::new();
-    for guard in [Guard::PodName, Guard::Forgotten, Guard::LegacyDeleting] {
-        for stored in StoredSandboxLifecycle::all_as_str() {
-            for recoverable in [false, true] {
-                let sandbox_id = SandboxId::new();
-                insert_orphan(pool, sandbox_id, node_id, stored, guard).await?;
-                if recoverable {
-                    insert_snapshot(pool, sandbox_id, "ready", 60).await?;
-                }
-                let before = row(pool, sandbox_id).await?;
+    for stored in StoredSandboxLifecycle::all_as_str() {
+        let sandbox_id = SandboxId::new();
+        insert_orphan(pool, sandbox_id, node_id, stored, guard).await?;
+        if recoverable {
+            insert_snapshot(pool, sandbox_id, "ready", 60).await?;
+        }
+        let before = row(pool, sandbox_id).await?;
 
-                let outcome = sink
-                    .classify_orphan(sandbox_id, classify_guard(guard, sandbox_id)?)
-                    .await?;
+        let outcome = sink
+            .classify_orphan(sandbox_id, classify_guard(guard, sandbox_id)?)
+            .await?;
 
-                let expectation = expected(guard, stored, recoverable);
-                let retired = |lifecycle: &str| {
-                    let execution_state = if guard == Guard::PodName {
-                        lifecycle.to_owned()
-                    } else {
-                        "forgotten".to_owned()
-                    };
-                    Some(Row {
-                        lifecycle: lifecycle.to_owned(),
-                        placement: "unplaced".to_owned(),
-                        active_node_id: None,
-                        target_node_id: None,
-                        execution_state,
-                        execution_active: false,
-                        quarantined_from: (lifecycle == "quarantined").then(|| stored.to_owned()),
-                        quarantine_history: i64::from(lifecycle == "quarantined"),
-                    })
-                };
-                let (outcome_matches, expected_row) = match expectation {
-                    Expected::Skipped => {
-                        (outcome == ClassifyOutcome::SkippedTerminal, before.clone())
-                    }
-                    Expected::Quarantined => (
-                        matches!(outcome, ClassifyOutcome::Quarantined { from_lifecycle }
-                            if from_lifecycle.as_str() == stored),
-                        retired("quarantined"),
-                    ),
-                    Expected::Recovered => (
-                        matches!(outcome, ClassifyOutcome::RecoveredSuspended { from_lifecycle }
-                            if from_lifecycle.as_str() == stored),
-                        retired("suspended"),
-                    ),
-                    Expected::Deleted => (
-                        matches!(outcome, ClassifyOutcome::Deleted { from_lifecycle, .. }
-                            if from_lifecycle.as_str() == stored),
-                        None,
-                    ),
-                };
-                let actual = row(pool, sandbox_id).await?;
-                if !outcome_matches || actual != expected_row {
-                    mismatches.push(format!(
-                        "{guard:?}, stored {stored}, recoverable {recoverable}: \
-                         expected {expectation:?}, got {outcome:?} and {actual:?}"
-                    ));
-                }
-            }
+        let expectation = expected(guard, stored, recoverable);
+        let retired = |lifecycle: &str| {
+            let execution_state = if guard == Guard::PodName {
+                lifecycle.to_owned()
+            } else {
+                "forgotten".to_owned()
+            };
+            Some(Row {
+                lifecycle: lifecycle.to_owned(),
+                placement: "unplaced".to_owned(),
+                active_node_id: None,
+                target_node_id: None,
+                execution_state,
+                execution_active: false,
+                quarantined_from: (lifecycle == "quarantined").then(|| stored.to_owned()),
+                quarantine_history: i64::from(lifecycle == "quarantined"),
+            })
+        };
+        let (outcome_matches, expected_row) = match expectation {
+            Expected::Skipped => (outcome == ClassifyOutcome::SkippedTerminal, before.clone()),
+            Expected::Quarantined => (
+                matches!(outcome, ClassifyOutcome::Quarantined { from_lifecycle }
+                    if from_lifecycle.as_str() == stored),
+                retired("quarantined"),
+            ),
+            Expected::Recovered => (
+                matches!(outcome, ClassifyOutcome::RecoveredSuspended { from_lifecycle }
+                    if from_lifecycle.as_str() == stored),
+                retired("suspended"),
+            ),
+            Expected::Deleted => (
+                matches!(outcome, ClassifyOutcome::Deleted { from_lifecycle, .. }
+                    if from_lifecycle.as_str() == stored),
+                None,
+            ),
+        };
+        let actual = row(pool, sandbox_id).await?;
+        if !outcome_matches || actual != expected_row {
+            mismatches.push(format!(
+                "{guard:?}, stored {stored}, recoverable {recoverable}: \
+                 expected {expectation:?}, got {outcome:?} and {actual:?}"
+            ));
         }
     }
     assert!(mismatches.is_empty(), "{mismatches:#?}");

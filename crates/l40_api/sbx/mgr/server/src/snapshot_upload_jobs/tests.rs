@@ -462,6 +462,7 @@ async fn maintenance_retries_failed_pruning_on_the_next_tick() {
         std::sync::Arc::clone(&drain),
         crate::node_manager_transport::fake::unbound_in_absent_dir(),
         absent_volume_manager_socket(),
+        worker_config(),
     );
     let shutdown = tokio_util::sync::CancellationToken::new();
     let maintenance = tokio::spawn(run_maintenance(db.clone(), worker, drain, shutdown.clone()));

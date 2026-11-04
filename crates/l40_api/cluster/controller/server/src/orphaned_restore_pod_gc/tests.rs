@@ -1648,7 +1648,9 @@ async fn stale_cache_teardown_is_confirmed_by_the_authoritative_read() {
     assert_eq!(report.reaped, 1);
 }
 
-#[tokio::test]
+// Paused time: the fakes answer in memory, so the hung GET's minimum budget
+// elapses as soon as nothing else can run.
+#[tokio::test(start_paused = true)]
 async fn a_hung_stuck_check_does_not_starve_reaping() {
     // A teardown due for its stuck check whose authoritative GET hangs must not
     // eat the tick: orphan work runs first, the check gets the leftover budget.

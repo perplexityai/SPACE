@@ -50,8 +50,6 @@ enum Exit {
     Complete,
 }
 
-const EXITS: [Exit; 3] = [Exit::Begin, Exit::Rollback, Exit::Complete];
-
 /// A node-manager transport whose `connect` holds until the test releases it.
 /// Suspend's auto-pause connects after it reads the row as `started` and
 /// before it writes `pausing`, so a write the test makes while `connect` holds
@@ -319,11 +317,12 @@ async fn check_suspend(exit: Exit, state: SandboxState) {
 /// Every state the row can be in at each auto-pause write. Only the state
 /// the auto-pause expects there is written: `started` at the begin and
 /// `pausing` at the rollback and the completion are the accepting controls.
+#[rstest::rstest]
 #[tokio::test]
-async fn suspend_auto_pause_writes_only_over_the_state_it_expects() {
-    for exit in EXITS {
-        for state in SandboxState::all() {
-            check_suspend(exit, state).await;
-        }
+async fn suspend_auto_pause_writes_only_over_the_state_it_expects(
+    #[values(Exit::Begin, Exit::Rollback, Exit::Complete)] exit: Exit,
+) {
+    for state in SandboxState::all() {
+        check_suspend(exit, state).await;
     }
 }

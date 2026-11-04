@@ -10,10 +10,12 @@
 //! handler's scoped fetch would refuse first.
 
 use std::fmt::Write as _;
+use std::sync::Arc;
 
 use axum::response::IntoResponse;
+use futures_util::StreamExt as _;
 use pplx_space_common_core::types::{NodeId, OrgId, SandboxId};
-use pplx_space_db_test_fixtures::{SEED_ORG_ID, SEED_USER_ID, pg_test_db};
+use pplx_space_db_test_fixtures::{SEED_ORG_ID, SEED_USER_ID, pg_test_db_with_max_connections};
 use pplx_space_placement::{StoredSandboxLifecycle, test_support::NON_CANONICAL_ROWS};
 use pplx_space_public_api::SandboxConditionType;
 use pplx_space_test_env::TestResult;
@@ -238,31 +240,72 @@ async fn render_row(
     ))
 }
 
+/// The tables [`each_surface_renders_stored_lifecycle_and_observed_status`]
+/// deals its rows into: one per `shard` value it runs. Each holds about 25
+/// rows, under a second on a loaded CI runner.
+const SHARDS: usize = 24;
+
 /// Pins today's outputs so a change to how a surface reads the stored
-/// lifecycle and the observed status shows up here as a table diff.
-#[tokio::test(flavor = "current_thread")]
-async fn each_surface_renders_stored_lifecycle_and_observed_status() -> TestResult {
+/// lifecycle and the observed status shows up here as a table diff. The
+/// (stored lifecycle, observation) rows are dealt into [`SHARDS`] tables by
+/// position, each its own test and snapshot, so every row the lists
+/// generate, a new one included, lands in exactly one of them.
+#[rstest::rstest]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn each_surface_renders_stored_lifecycle_and_observed_status(
+    #[values(
+        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23
+    )]
+    shard: usize,
+) -> TestResult {
+    // Each row is its own sandbox, so rows render concurrently, each on its
+    // own connection; `buffered` keeps the table in row order. Four at a time:
+    // nextest runs up to one shard per core against the run's shared Postgres
+    // server, and more connections per shard slowed every shard down.
+    const CONCURRENT_ROWS: usize = 4;
     Box::pin(async {
-        let db = pg_test_db().await?;
+        let db = pg_test_db_with_max_connections(CONCURRENT_ROWS as u32 + 2).await?;
         let state = AppState::from_pool(db.pool.clone()).await?;
-        let keyring = EcwCredentialKeyring::from_current_key_for_test(b"state-render-table-key");
+        let keyring = Arc::new(EcwCredentialKeyring::from_current_key_for_test(
+            b"state-render-table-key",
+        ));
         let node_id = NodeId::new();
         insert_node(&db.pool, node_id).await?;
 
+        let rows = stored_lifecycles()
+            .into_iter()
+            .flat_map(|stored| {
+                observations()
+                    .into_iter()
+                    .map(move |observed| (stored.clone(), observed))
+            })
+            .skip(shard)
+            .step_by(SHARDS);
+        let rendered: Vec<_> = futures_util::stream::iter(rows)
+            .map(|(stored, observed)| {
+                let state = state.clone();
+                let keyring = keyring.clone();
+                tokio::spawn(async move {
+                    let sandbox_id = SandboxId::new();
+                    insert_row(&state.pool, sandbox_id, node_id, &stored, observed).await?;
+                    let rendered = render_row(&state, &keyring, sandbox_id).await?;
+                    TestResult::Ok(format!(
+                        "stored={stored:<16} observed={:<20} {rendered}",
+                        observed.label()
+                    ))
+                })
+            })
+            .buffered(CONCURRENT_ROWS)
+            .collect()
+            .await;
         let mut table = String::new();
-        for stored in stored_lifecycles() {
-            for observed in observations() {
-                let sandbox_id = SandboxId::new();
-                insert_row(&db.pool, sandbox_id, node_id, &stored, observed).await?;
-                let rendered = render_row(&state, &keyring, sandbox_id).await?;
-                writeln!(
-                    table,
-                    "stored={stored:<16} observed={:<20} {rendered}",
-                    observed.label()
-                )?;
-            }
+        for row in rendered {
+            writeln!(table, "{}", row??)?;
         }
-        insta::assert_snapshot!(table);
+        insta::assert_snapshot!(
+            format!("each_surface_renders_stored_lifecycle_and_observed_status_{shard}"),
+            table
+        );
         Ok(())
     })
     .await

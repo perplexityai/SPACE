@@ -13,6 +13,11 @@ use tokio::sync::{Notify, Semaphore};
 use super::super::tests::{MockObjectStore, push_payload, test_creds, test_job};
 use super::*;
 
+/// Page-cache release window for the test producers. Release hints change
+/// only cache residency, so a window a few parts wide crosses the same
+/// boundaries as production's with a fraction of the input.
+const TEST_ADVICE_WINDOW_BYTES: u64 = 4 * MIB as u64;
+
 #[derive(Default)]
 struct Recorded {
     parts: BTreeMap<(String, usize), Bytes>,
@@ -210,20 +215,22 @@ fn executor() -> TransferExecutor {
         producers: Arc::new(Semaphore::new(2)),
         part_bytes: 5 * MIB,
         min_source_bytes: 5 * MIB as u64,
+        advice_window_bytes: TEST_ADVICE_WINDOW_BYTES,
     });
     executor
 }
 
 fn synthetic_bytes(size: usize) -> Vec<u8> {
     let mut state = 1u64;
-    (0..size)
-        .map(|_| {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            state as u8
-        })
-        .collect()
+    let mut bytes = Vec::with_capacity(size.next_multiple_of(8));
+    while bytes.len() < size {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        bytes.extend_from_slice(&state.to_le_bytes());
+    }
+    bytes.truncate(size);
+    bytes
 }
 
 fn staged(dir: &Path, artifact: SnapshotArtifact, contents: &[u8]) -> TransferPayload {
@@ -264,91 +271,99 @@ async fn push(
         .await
 }
 
+#[rstest::rstest]
 #[tokio::test]
-async fn ordinary_and_luks_retry_from_staging_and_verify_actual_wire_size() {
-    let server = Server::start().await;
-    for artifact in [
+async fn ordinary_and_luks_retry_from_staging_and_verify_actual_wire_size(
+    #[values(
         SnapshotArtifact::Memory,
         SnapshotArtifact::Rootfs,
         SnapshotArtifact::RootfsBtrfsSend,
         SnapshotArtifact::EncryptedSnapshotVolume,
-        SnapshotArtifact::EncryptedRootfsCow,
-    ] {
-        let dir = tempfile::tempdir().unwrap();
-        // Ciphertext-like allocated data surrounded by zero/sparse space. No
-        // crypto transform is selected by volume-manager for a LUKS artifact.
-        // Cross two consumed-input eviction windows, with allocated data
-        // straddling the first boundary and a final partial window of holes.
-        let mut bytes = vec![0; 130 * MIB];
-        bytes[60 * MIB..68 * MIB].copy_from_slice(&synthetic_bytes(8 * MIB));
-        let payload = staged(dir.path(), artifact, &bytes);
-        // Exercise actual holes as well as allocated ciphertext-like bytes.
-        let mut source = std::fs::OpenOptions::new()
-            .write(true)
-            .truncate(true)
-            .open(payload.upload_source())
-            .unwrap();
-        source.set_len(bytes.len() as u64).unwrap();
-        source
-            .seek(std::io::SeekFrom::Start(60 * MIB as u64))
-            .unwrap();
-        source.write_all(&bytes[60 * MIB..68 * MIB]).unwrap();
-        drop(source);
-        let (temp, logical_size) = compress_to_temp(Path::new(payload.upload_source()), None)
+        SnapshotArtifact::EncryptedRootfsCow
+    )]
+    artifact: SnapshotArtifact,
+) {
+    let server = Server::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    // Ciphertext-like allocated data surrounded by zero/sparse space. No
+    // crypto transform is selected by volume-manager for a LUKS artifact.
+    // Cross two consumed-input eviction windows, with allocated data
+    // straddling the first boundary and a final partial window of holes.
+    // The allocated data alone encodes past one part, so every attempt is
+    // a multipart upload.
+    let window = TEST_ADVICE_WINDOW_BYTES as usize;
+    let (data_start, data_end) = (window - 3 * MIB, window + 3 * MIB);
+    let mut bytes = vec![0; 2 * window + MIB];
+    bytes[data_start..data_end].copy_from_slice(&synthetic_bytes(data_end - data_start));
+    let payload = staged(dir.path(), artifact, &bytes);
+    // Exercise actual holes as well as allocated ciphertext-like bytes.
+    let mut source = std::fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(payload.upload_source())
+        .unwrap();
+    source.set_len(bytes.len() as u64).unwrap();
+    source
+        .seek(std::io::SeekFrom::Start(data_start as u64))
+        .unwrap();
+    source.write_all(&bytes[data_start..data_end]).unwrap();
+    drop(source);
+    let (temp, logical_size) = compress_to_temp(Path::new(payload.upload_source()), None)
+        .await
+        .unwrap();
+    assert_eq!(logical_size, bytes.len() as u64);
+    let file_encoded = tokio::fs::read(&temp).await.unwrap();
+    tokio::fs::remove_file(temp).await.unwrap();
+    let persisted = payload.to_json();
+    server.short_head.store(true, Ordering::SeqCst);
+    // As when the artifacts shared one server, one of them covers a replayed
+    // part; every SDK retry first sleeps up to a second of jittered backoff.
+    server
+        .retry_part
+        .store(artifact == SnapshotArtifact::Memory, Ordering::SeqCst);
+    let first = push(&executor(), &server, &payload, CancellationToken::new()).await;
+    assert!(matches!(first, Err(JobError::Retriable(_))));
+    assert!(
+        Path::new(payload.upload_source()).exists(),
+        "verification failure retains retry source"
+    );
+    assert!(
+        !Path::new(payload.upload_source())
+            .with_extension("zst.tmp")
+            .exists()
+    );
+    // A new executor and persisted payload model the restart boundary: no
+    // in-memory multipart/codec state is required to retry the whole object.
+    server.short_head.store(false, Ordering::SeqCst);
+    let restored = TransferPayload::from_json(&persisted).unwrap();
+    assert_eq!(
+        push(&executor(), &server, &restored, CancellationToken::new())
             .await
-            .unwrap();
-        assert_eq!(logical_size, bytes.len() as u64);
-        let file_encoded = tokio::fs::read(&temp).await.unwrap();
-        tokio::fs::remove_file(temp).await.unwrap();
-        let persisted = payload.to_json();
-        let creates_before = server.recorded.lock().unwrap().creates;
-        server.short_head.store(true, Ordering::SeqCst);
-        server.retry_part.store(true, Ordering::SeqCst);
-        let first = push(&executor(), &server, &payload, CancellationToken::new()).await;
-        assert!(matches!(first, Err(JobError::Retriable(_))));
-        assert!(
-            Path::new(payload.upload_source()).exists(),
-            "verification failure retains retry source"
-        );
-        assert!(
-            !Path::new(payload.upload_source())
-                .with_extension("zst.tmp")
-                .exists()
-        );
-        // A new executor and persisted payload model the restart boundary: no
-        // in-memory multipart/codec state is required to retry the whole object.
-        server.short_head.store(false, Ordering::SeqCst);
-        let restored = TransferPayload::from_json(&persisted).unwrap();
-        assert_eq!(
-            push(&executor(), &server, &restored, CancellationToken::new())
-                .await
-                .unwrap(),
-            bytes.len() as i64
-        );
-        assert!(
-            !Path::new(payload.upload_source()).exists(),
-            "only verified terminal success cleans staging"
-        );
-        let state = server.recorded.lock().unwrap();
-        assert_eq!(
-            state.creates,
-            creates_before + 2,
-            "each attempt starts a fresh multipart upload"
-        );
-        assert!(state.parts.values().all(|part| part.len() <= 5 * MIB));
-        let object = state.object.clone();
-        drop(state);
-        assert!(object.len() < bytes.len());
-        assert_eq!(
-            object, file_encoded,
-            "streaming preserves the file encoder output for {artifact:?}"
-        );
-        assert_eq!(zstd::decode_all(object.as_slice()).unwrap(), bytes);
-        assert_eq!(
-            std::fs::read(&payload.local_path).unwrap(),
-            b"caller path is no longer the snapshot"
-        );
-    }
+            .unwrap(),
+        bytes.len() as i64
+    );
+    assert!(
+        !Path::new(payload.upload_source()).exists(),
+        "only verified terminal success cleans staging"
+    );
+    let state = server.recorded.lock().unwrap();
+    assert_eq!(
+        state.creates, 2,
+        "each attempt starts a fresh multipart upload"
+    );
+    assert!(state.parts.values().all(|part| part.len() <= 5 * MIB));
+    let object = state.object.clone();
+    drop(state);
+    assert!(object.len() < bytes.len());
+    assert_eq!(
+        object, file_encoded,
+        "streaming preserves the file encoder output for {artifact:?}"
+    );
+    assert_eq!(zstd::decode_all(object.as_slice()).unwrap(), bytes);
+    assert_eq!(
+        std::fs::read(&payload.local_path).unwrap(),
+        b"caller path is no longer the snapshot"
+    );
 }
 
 #[tokio::test]
@@ -395,92 +410,93 @@ async fn deterministic_stream_failures_are_permanent_and_join_the_producer() {
     }
 }
 
+#[rstest::rstest]
 #[tokio::test]
-async fn cancel_and_drop_under_backpressure_release_codec_and_abort_without_completion() {
-    for drop_future in [false, true] {
-        let server = Server::start().await;
-        server.hold_parts.store(true, Ordering::SeqCst);
-        let dir = tempfile::tempdir().unwrap();
-        let payload = staged(
-            dir.path(),
-            SnapshotArtifact::Memory,
-            &synthetic_bytes(20 * MIB),
-        );
-        let executor = Arc::new(executor());
-        let cancellation = CancellationToken::new();
-        let task = tokio::spawn({
-            let executor = executor.clone();
-            let server = server.clone();
-            let payload = payload.clone();
-            let cancellation = cancellation.clone();
-            async move { push(&executor, &server, &payload, cancellation).await }
-        });
-        server.wait_for(|s| s.puts > 0).await;
-        assert!(
-            !Path::new(payload.upload_source())
-                .with_extension("zst.tmp")
-                .exists(),
-            "streaming must never create a compressed temporary file"
-        );
-        let cancelled_waiter = CancellationToken::new();
-        cancelled_waiter.cancel();
-        tokio::time::timeout(
-            Duration::from_secs(1),
-            push(&executor, &server, &payload, cancelled_waiter),
-        )
-        .await
-        .expect("cancelled admission exits promptly")
-        .expect_err("cancelled admission cannot upload");
-        assert_eq!(
-            server.recorded.lock().unwrap().creates,
-            1,
-            "cancelled admission must not open an upload"
-        );
-        assert_eq!(
-            executor
-                .stream_push
-                .as_ref()
-                .unwrap()
-                .producers
-                .available_permits(),
-            1,
-            "the live producer remains bounded while its codec slot is lent"
-        );
-        let borrowed_codec = tokio::time::timeout(
-            Duration::from_secs(5),
-            executor.codec.acquire(CodecPriority::Normal),
-        )
-        .await
-        .expect("a backpressured encoder must lend its idle codec slot")
-        .unwrap();
-        assert_eq!(
-            executor.codec.reserve_available(),
-            1,
-            "protected restore admission is untouched"
-        );
-        if drop_future {
-            task.abort();
-        } else {
-            cancellation.cancel();
-        }
-        let outcome = tokio::time::timeout(Duration::from_secs(10), task)
-            .await
-            .unwrap();
-        assert!(outcome.is_err() || outcome.unwrap().is_err());
-        drop(borrowed_codec);
-        let permit = tokio::time::timeout(
-            Duration::from_secs(10),
-            executor.codec.acquire(CodecPriority::Normal),
-        )
-        .await
-        .unwrap()
-        .unwrap();
-        drop(permit);
-        server.wait_for(|s| s.aborts > 0).await;
-        assert_eq!(server.recorded.lock().unwrap().completes, 0);
-        assert!(Path::new(payload.upload_source()).exists());
-        server.shutdown.cancel();
+async fn cancel_and_drop_under_backpressure_release_codec_and_abort_without_completion(
+    #[values(false, true)] drop_future: bool,
+) {
+    let server = Server::start().await;
+    server.hold_parts.store(true, Ordering::SeqCst);
+    let dir = tempfile::tempdir().unwrap();
+    let payload = staged(
+        dir.path(),
+        SnapshotArtifact::Memory,
+        &synthetic_bytes(20 * MIB),
+    );
+    let executor = Arc::new(executor());
+    let cancellation = CancellationToken::new();
+    let task = tokio::spawn({
+        let executor = executor.clone();
+        let server = server.clone();
+        let payload = payload.clone();
+        let cancellation = cancellation.clone();
+        async move { push(&executor, &server, &payload, cancellation).await }
+    });
+    server.wait_for(|s| s.puts > 0).await;
+    assert!(
+        !Path::new(payload.upload_source())
+            .with_extension("zst.tmp")
+            .exists(),
+        "streaming must never create a compressed temporary file"
+    );
+    let cancelled_waiter = CancellationToken::new();
+    cancelled_waiter.cancel();
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        push(&executor, &server, &payload, cancelled_waiter),
+    )
+    .await
+    .expect("cancelled admission exits promptly")
+    .expect_err("cancelled admission cannot upload");
+    assert_eq!(
+        server.recorded.lock().unwrap().creates,
+        1,
+        "cancelled admission must not open an upload"
+    );
+    assert_eq!(
+        executor
+            .stream_push
+            .as_ref()
+            .unwrap()
+            .producers
+            .available_permits(),
+        1,
+        "the live producer remains bounded while its codec slot is lent"
+    );
+    let borrowed_codec = tokio::time::timeout(
+        Duration::from_secs(5),
+        executor.codec.acquire(CodecPriority::Normal),
+    )
+    .await
+    .expect("a backpressured encoder must lend its idle codec slot")
+    .unwrap();
+    assert_eq!(
+        executor.codec.reserve_available(),
+        1,
+        "protected restore admission is untouched"
+    );
+    if drop_future {
+        task.abort();
+    } else {
+        cancellation.cancel();
     }
+    let outcome = tokio::time::timeout(Duration::from_secs(10), task)
+        .await
+        .unwrap();
+    assert!(outcome.is_err() || outcome.unwrap().is_err());
+    drop(borrowed_codec);
+    let permit = tokio::time::timeout(
+        Duration::from_secs(10),
+        executor.codec.acquire(CodecPriority::Normal),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    drop(permit);
+    server.wait_for(|s| s.aborts > 0).await;
+    assert_eq!(server.recorded.lock().unwrap().completes, 0);
+    assert!(Path::new(payload.upload_source()).exists());
+    server.shutdown.cancel();
 }
 
 #[tokio::test]
@@ -558,6 +574,7 @@ async fn producer_error_after_eof_never_completes_an_object() {
         },
         CancellationToken::new(),
         "memory",
+        TEST_ADVICE_WINDOW_BYTES,
     );
     let store = S3ObjectStore::new();
     let error = store
@@ -604,6 +621,7 @@ async fn compatibility_paths_keep_file_uploads_and_small_sources_bypass_codec_qu
         producers: Arc::new(Semaphore::new(2)),
         part_bytes: 5 * MIB,
         min_source_bytes: 5 * MIB as u64,
+        advice_window_bytes: TEST_ADVICE_WINDOW_BYTES,
     });
     assert!(
         executor

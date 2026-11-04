@@ -9,7 +9,9 @@ use tokio::time::Instant;
 
 /// The budgets of `create_execution`'s readiness wait and preserve decision,
 /// `suspend_execution`'s durability wait, started warm-pool adoption's
-/// split-receipt and command-readiness waits and teardown's worker connect.
+/// split-receipt and command-readiness waits, teardown's worker connect, the
+/// pod reads' reflector-event wait and a deferring restore claim's in-place
+/// retry grace.
 ///
 /// Production uses [`Default`], which is exactly the constants each field
 /// names, so production deadlines, error messages and logs are unchanged.
@@ -39,6 +41,14 @@ pub(super) struct SubstrateBudgets {
     /// [`super::POD_WORKER_CONNECT_TIMEOUT`], as teardown's connect bound for
     /// the pod's worker.
     pub(super) teardown_worker_connect: Duration,
+    /// [`super::REFLECTOR_WAIT_BUDGET`]: how long a pod read waits for a
+    /// reflector event before it falls back to an apiserver GET, and the
+    /// re-check interval of a scheduling-outcome wait.
+    pub(super) reflector_wait: Duration,
+    /// [`super::execution::RETRY_DEFERRAL_GRACE`]: how long a caller under
+    /// the dispatcher's retry deferral keeps retrying a fenced restore claim
+    /// in place before it hands the wait back.
+    pub(super) retry_deferral_grace: Duration,
 }
 
 impl SubstrateBudgets {
@@ -50,6 +60,8 @@ impl SubstrateBudgets {
         pooled_split_receipt_wait: super::adapter::WARM_POOL_SETUP_RPC_TIMEOUT,
         pooled_command_ready: super::adapter::POOLED_COMMAND_READY_BUDGET,
         teardown_worker_connect: super::POD_WORKER_CONNECT_TIMEOUT,
+        reflector_wait: super::REFLECTOR_WAIT_BUDGET,
+        retry_deferral_grace: super::execution::RETRY_DEFERRAL_GRACE,
     };
 
     /// [`super::support::ready_wait_bounds`] within these budgets: the outer

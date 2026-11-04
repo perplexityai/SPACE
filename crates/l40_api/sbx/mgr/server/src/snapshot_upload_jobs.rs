@@ -57,7 +57,15 @@ const JOB_TIMEOUT: Duration = Duration::from_secs(7200);
 const MAX_ATTEMPTS: i32 = 5;
 const TRANSFER_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Build a `BackgroundWorker` configured for the snapshot-upload pipeline.
+/// The snapshot-upload worker's production configuration.
+pub(crate) fn worker_config() -> WorkerConfig {
+    WorkerConfig::new(DEFAULT_CONCURRENCY, JOB_TIMEOUT, MAX_ATTEMPTS)
+        .with_kind_concurrency(SNAPSHOT_UPLOAD_JOB_KIND, DEFAULT_CONCURRENCY)
+        .with_recovery_job_kind(SNAPSHOT_UPLOAD_JOB_KIND)
+}
+
+/// Build a `BackgroundWorker` for the snapshot-upload pipeline from `config`,
+/// [`worker_config`] in production.
 /// Caller owns the `crate::db::Connection` (it lives alongside the rest of
 /// sbx-mgr's SQLite state) and is responsible for calling
 /// [`BackgroundWorker::recover_and_log`] at startup and
@@ -71,10 +79,8 @@ pub(crate) fn build_worker(
     drain_state: std::sync::Arc<crate::service::drain::DrainState>,
     node_manager: crate::node_manager_transport::NodeManagerConnector,
     volume_manager_socket: std::path::PathBuf,
+    config: WorkerConfig,
 ) -> BackgroundWorker<SnapshotUploadExecutor> {
-    let config = WorkerConfig::new(DEFAULT_CONCURRENCY, JOB_TIMEOUT, MAX_ATTEMPTS)
-        .with_kind_concurrency(SNAPSHOT_UPLOAD_JOB_KIND, DEFAULT_CONCURRENCY)
-        .with_recovery_job_kind(SNAPSHOT_UPLOAD_JOB_KIND);
     let executor = SnapshotUploadExecutor {
         db: db.clone(),
         drain_state,

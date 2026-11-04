@@ -306,191 +306,149 @@ fn otlp_process_fixture_child() {
 }
 
 #[cfg(feature = "otel")]
+const INFO: (&str, &str) = ("INFO", "visible info");
+#[cfg(feature = "otel")]
+const WARN: (&str, &str) = ("WARN", "visible warn");
+#[cfg(feature = "otel")]
+const DEBUG: (&str, &str) = ("DEBUG", "visible debug");
+// The acquire span is emitted by the SQL bridge under its own target, so
+// it follows the filter's base level rather than the acquire directive
+// that keeps the pool-acquire metric enabled.
+#[cfg(feature = "otel")]
+const ACQUIRE: &str = "db.pool.acquire";
+
+// An unset trace filter keeps the filter RUST_LOG produced before trace
+// selection was separated, so quieting logs still quiets spans. Setting
+// the trace filter opts into an independent selection in either direction.
+#[cfg(feature = "otel")]
+#[rstest::rstest]
+#[case(None, None, &[INFO, WARN], &[ACQUIRE, "filter_info", "filter_warn"])]
+#[case(Some("warn"), None, &[WARN], &["filter_warn"])]
+#[case(Some("error"), None, &[], &[])]
+#[case(Some("debug"), None, &[INFO, WARN, DEBUG], &[ACQUIRE, "filter_debug", "filter_info", "filter_warn"])]
+// The shared layout has to honour an acquire rule too. `RUST_LOG` is
+// the trace selection when no trace filter is set, so a refusal there
+// is a refusal of the span — while the metric below still counts both
+// waits, and the slow-acquire warning still reaches logs.
+#[case(Some("info,sqlx::pool::acquire=off"), None, &[INFO, WARN], &["filter_info", "filter_warn"])]
+// A rule on a parent module reaches the target here as well.
+#[case(Some("info,sqlx::pool=off"), None, &[INFO, WARN], &["filter_info", "filter_warn"])]
+#[case(None, Some("warn"), &[INFO, WARN], &["filter_warn"])]
+#[case(Some("error"), Some("info"), &[], &[ACQUIRE, "filter_info", "filter_warn"])]
+#[case(Some("error"), Some("off"), &[], &[])]
+// The forced acquire directive keeps the metric enabled; it must not
+// override an explicit refusal of the span.
+#[case(Some("error"), Some("info,sqlx::pool::acquire=off"), &[], &["filter_info", "filter_warn"])]
+// A dynamic directive alongside the refusal must not re-enable the
+// span. The span rule never names the acquire target, and one
+// unparsable-as-static rule used to discard the whole selection. The
+// rule stays at info so this row tests that and not EnvFilter's
+// separate habit of raising level interest for a dynamic directive.
+#[case(Some("error"), Some("info,sqlx::pool::acquire=off,[unrelated_span]=info"), &[], &["filter_info", "filter_warn"])]
+// And the refusal must not leak into an unrelated dynamic selection:
+// with no acquire rule the span is still wanted.
+#[case(Some("error"), Some("info,[unrelated_span]=info"), &[], &[ACQUIRE, "filter_info", "filter_warn"])]
+// A rule on a parent module reaches this target, as it does in the
+// filter itself, so the span is refused without naming it directly.
+#[case(Some("error"), Some("info,sqlx::pool=off"), &[], &["filter_info", "filter_warn"])]
+// A dynamic directive that *enables* a span must keep the pool wait
+// inside it. The filter's default excludes everything, so vetoing on
+// that default would hide the acquire span in exactly the spans the
+// operator selected by name. `filter_warn` rides along because a span
+// directive enables what is recorded within its scope too.
+#[case(Some("error"), Some("off,[filter_info]=info"), &[], &[ACQUIRE, "filter_info", "filter_warn"])]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn trace_filter_defaults_to_log_verbosity_until_it_is_set() {
-    const INFO: (&str, &str) = ("INFO", "visible info");
-    const WARN: (&str, &str) = ("WARN", "visible warn");
-    const DEBUG: (&str, &str) = ("DEBUG", "visible debug");
-    // The acquire span is emitted by the SQL bridge under its own target, so
-    // it follows the filter's base level rather than the acquire directive
-    // that keeps the pool-acquire metric enabled.
-    const ACQUIRE: &str = "db.pool.acquire";
-    // An unset trace filter keeps the filter RUST_LOG produced before trace
-    // selection was separated, so quieting logs still quiets spans. Setting
-    // the trace filter opts into an independent selection in either direction.
-    for (log_filter, trace_filter, expected_logs, expected_spans) in [
-        (
-            None,
-            None,
-            vec![INFO, WARN],
-            vec![ACQUIRE, "filter_info", "filter_warn"],
-        ),
-        (Some("warn"), None, vec![WARN], vec!["filter_warn"]),
-        (Some("error"), None, vec![], vec![]),
-        (
-            Some("debug"),
-            None,
-            vec![INFO, WARN, DEBUG],
-            vec![ACQUIRE, "filter_debug", "filter_info", "filter_warn"],
-        ),
-        // The shared layout has to honour an acquire rule too. `RUST_LOG` is
-        // the trace selection when no trace filter is set, so a refusal there
-        // is a refusal of the span — while the metric below still counts both
-        // waits, and the slow-acquire warning still reaches logs.
-        (
-            Some("info,sqlx::pool::acquire=off"),
-            None,
-            vec![INFO, WARN],
-            vec!["filter_info", "filter_warn"],
-        ),
-        // A rule on a parent module reaches the target here as well.
-        (
-            Some("info,sqlx::pool=off"),
-            None,
-            vec![INFO, WARN],
-            vec!["filter_info", "filter_warn"],
-        ),
-        (None, Some("warn"), vec![INFO, WARN], vec!["filter_warn"]),
-        (
-            Some("error"),
-            Some("info"),
-            vec![],
-            vec![ACQUIRE, "filter_info", "filter_warn"],
-        ),
-        (Some("error"), Some("off"), vec![], vec![]),
-        // The forced acquire directive keeps the metric enabled; it must not
-        // override an explicit refusal of the span.
-        (
-            Some("error"),
-            Some("info,sqlx::pool::acquire=off"),
-            vec![],
-            vec!["filter_info", "filter_warn"],
-        ),
-        // A dynamic directive alongside the refusal must not re-enable the
-        // span. The span rule never names the acquire target, and one
-        // unparsable-as-static rule used to discard the whole selection. The
-        // rule stays at info so this row tests that and not EnvFilter's
-        // separate habit of raising level interest for a dynamic directive.
-        (
-            Some("error"),
-            Some("info,sqlx::pool::acquire=off,[unrelated_span]=info"),
-            vec![],
-            vec!["filter_info", "filter_warn"],
-        ),
-        // And the refusal must not leak into an unrelated dynamic selection:
-        // with no acquire rule the span is still wanted.
-        (
-            Some("error"),
-            Some("info,[unrelated_span]=info"),
-            vec![],
-            vec![ACQUIRE, "filter_info", "filter_warn"],
-        ),
-        // A rule on a parent module reaches this target, as it does in the
-        // filter itself, so the span is refused without naming it directly.
-        (
-            Some("error"),
-            Some("info,sqlx::pool=off"),
-            vec![],
-            vec!["filter_info", "filter_warn"],
-        ),
-        // A dynamic directive that *enables* a span must keep the pool wait
-        // inside it. The filter's default excludes everything, so vetoing on
-        // that default would hide the acquire span in exactly the spans the
-        // operator selected by name. `filter_warn` rides along because a span
-        // directive enables what is recorded within its scope too.
-        (
-            Some("error"),
-            Some("off,[filter_info]=info"),
-            vec![],
-            vec![ACQUIRE, "filter_info", "filter_warn"],
-        ),
-    ] {
-        let receiver = Receiver::start().await;
-        let mut command = child_command(
-            "filters",
-            &receiver.endpoint,
-            "filter-fixture",
-            Some("otlp"),
-        );
-        command
-            .env_remove("RUST_LOG")
-            .env("SPACE_TRACE_EXPORTER", "otlp")
-            .env("OTEL_TRACES_SAMPLER", "always_on");
-        if let Some(filter) = log_filter {
-            command.env("RUST_LOG", filter);
-        }
-        if let Some(filter) = trace_filter {
-            command.env("SPACE_TRACE_FILTER", filter);
-        }
-        // Fields evaluate when DEBUG is enabled, and also when a span or field
-        // directive is present: EnvFilter then cannot statically exclude a
-        // callsite, so it asks about every one. That is the cost of a dynamic
-        // directive, not a defect in the selection.
-        if expected_spans.contains(&"filter_debug")
-            || trace_filter.is_some_and(|filter| filter.contains('['))
-        {
-            command.env("SPACE_TRACE_FIXTURE_DEBUG", "1");
-        }
-        let output = tokio::task::spawn_blocking(move || command.output().unwrap())
-            .await
-            .unwrap();
-        assert!(output.status.success(), "{output:?}");
-        let stdout = String::from_utf8(output.stdout).unwrap();
-        let logs: Vec<serde_json::Value> = stdout
-            .lines()
-            .filter_map(|line| serde_json::from_str(line).ok())
-            .filter(|record: &serde_json::Value| record.get("fixture").is_some())
-            .collect();
-        let actual: Vec<_> = logs
-            .iter()
-            .map(|record| {
-                (
-                    record["level"].as_str().unwrap(),
-                    record["message"].as_str().unwrap(),
-                )
-            })
-            .collect();
-        assert_eq!(
-            actual, expected_logs,
-            "log={log_filter:?}, trace={trace_filter:?}"
-        );
-        assert!(
-            stdout.contains("fixture_slow_acquire"),
-            "the slow-acquire warning must reach logs at log={log_filter:?}, \
-             trace={trace_filter:?}:\n{stdout}"
-        );
-        let received = receiver.count.received.lock().unwrap();
-        let mut names: Vec<_> = received
-            .spans
-            .iter()
-            .map(|span| span.name.as_str())
-            // A RUST_LOG threshold of debug enables dependency spans too, so
-            // assert the fixture's own spans rather than its libraries'.
-            .filter(|name| *name == ACQUIRE || name.starts_with("filter_"))
-            .collect();
-        names.sort_unstable();
-        assert_eq!(
-            names, expected_spans,
-            "log={log_filter:?}, trace={trace_filter:?}"
-        );
-        let acquire = received
-            .metrics
-            .iter()
-            .find(|metric| metric.name == "space.db.pool.acquire_total")
-            .expect("pool acquire metric regardless of filters");
-        let Some(metric::Data::ExponentialHistogram(histogram)) = &acquire.data else {
-            panic!("acquire histogram");
-        };
-        // Both the routine record and the slow-acquire warning feed it.
-        assert_eq!(
-            histogram
-                .data_points
-                .iter()
-                .map(|point| point.count)
-                .sum::<u64>(),
-            2
-        );
+async fn trace_filter_defaults_to_log_verbosity_until_it_is_set(
+    #[case] log_filter: Option<&str>,
+    #[case] trace_filter: Option<&str>,
+    #[case] expected_logs: &[(&str, &str)],
+    #[case] expected_spans: &[&str],
+) {
+    let receiver = Receiver::start().await;
+    let mut command = child_command(
+        "filters",
+        &receiver.endpoint,
+        "filter-fixture",
+        Some("otlp"),
+    );
+    command
+        .env_remove("RUST_LOG")
+        .env("SPACE_TRACE_EXPORTER", "otlp")
+        .env("OTEL_TRACES_SAMPLER", "always_on");
+    if let Some(filter) = log_filter {
+        command.env("RUST_LOG", filter);
     }
+    if let Some(filter) = trace_filter {
+        command.env("SPACE_TRACE_FILTER", filter);
+    }
+    // Fields evaluate when DEBUG is enabled, and also when a span or field
+    // directive is present: EnvFilter then cannot statically exclude a
+    // callsite, so it asks about every one. That is the cost of a dynamic
+    // directive, not a defect in the selection.
+    if expected_spans.contains(&"filter_debug")
+        || trace_filter.is_some_and(|filter| filter.contains('['))
+    {
+        command.env("SPACE_TRACE_FIXTURE_DEBUG", "1");
+    }
+    let output = tokio::task::spawn_blocking(move || command.output().unwrap())
+        .await
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let logs: Vec<serde_json::Value> = stdout
+        .lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .filter(|record: &serde_json::Value| record.get("fixture").is_some())
+        .collect();
+    let actual: Vec<_> = logs
+        .iter()
+        .map(|record| {
+            (
+                record["level"].as_str().unwrap(),
+                record["message"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        actual, expected_logs,
+        "log={log_filter:?}, trace={trace_filter:?}"
+    );
+    assert!(
+        stdout.contains("fixture_slow_acquire"),
+        "the slow-acquire warning must reach logs at log={log_filter:?}, \
+         trace={trace_filter:?}:\n{stdout}"
+    );
+    let received = receiver.count.received.lock().unwrap();
+    let mut names: Vec<_> = received
+        .spans
+        .iter()
+        .map(|span| span.name.as_str())
+        // A RUST_LOG threshold of debug enables dependency spans too, so
+        // assert the fixture's own spans rather than its libraries'.
+        .filter(|name| *name == ACQUIRE || name.starts_with("filter_"))
+        .collect();
+    names.sort_unstable();
+    assert_eq!(
+        names, expected_spans,
+        "log={log_filter:?}, trace={trace_filter:?}"
+    );
+    let acquire = received
+        .metrics
+        .iter()
+        .find(|metric| metric.name == "space.db.pool.acquire_total")
+        .expect("pool acquire metric regardless of filters");
+    let Some(metric::Data::ExponentialHistogram(histogram)) = &acquire.data else {
+        panic!("acquire histogram");
+    };
+    // Both the routine record and the slow-acquire warning feed it.
+    assert_eq!(
+        histogram
+            .data_points
+            .iter()
+            .map(|point| point.count)
+            .sum::<u64>(),
+        2
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

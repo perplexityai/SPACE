@@ -143,7 +143,8 @@ async fn seed_timeout_sandbox(
 
 /// Runs one timeout update while another transaction holds the sandbox row
 /// lock. Returns the result, whether the call waited on that lock, and the
-/// lock decision the call recorded.
+/// lock decision the call recorded. The lock is held throughout, so a call
+/// that finished never waited on it, and the observer stops there.
 async fn timeout_update_under_row_lock(
     pool: &PgPool,
     controller: &SandboxController,
@@ -167,20 +168,29 @@ async fn timeout_update_under_row_lock(
     let mut observer = pool.acquire().await?;
     let capture = pplx_space_metrics::test_capture::capture_counters_guard();
     let deadline = tokio::time::Instant::now() + budget;
+    let finished = std::sync::atomic::AtomicBool::new(false);
     let (result, waited) = tokio::join!(
-        controller.set_access_idle_timeout(
-            pool,
-            sandbox,
-            timeout_secs,
-            prost_types::Timestamp {
-                seconds: 1_800_000_000,
-                nanos: 0,
-            },
-            deadline,
-            Some(expected),
-        ),
         async {
-            while tokio::time::Instant::now() < deadline {
+            let result = controller
+                .set_access_idle_timeout(
+                    pool,
+                    sandbox,
+                    timeout_secs,
+                    prost_types::Timestamp {
+                        seconds: 1_800_000_000,
+                        nanos: 0,
+                    },
+                    deadline,
+                    Some(expected),
+                )
+                .await;
+            finished.store(true, std::sync::atomic::Ordering::Relaxed);
+            result
+        },
+        async {
+            while !finished.load(std::sync::atomic::Ordering::Relaxed)
+                && tokio::time::Instant::now() < deadline
+            {
                 let waiting: bool = sqlx::query_scalar(sql!(
                     "SELECT EXISTS (SELECT 1 FROM pg_stat_activity
                      WHERE wait_event_type = 'Lock'
@@ -208,12 +218,22 @@ async fn timeout_update_under_row_lock(
     Ok((result, waited?, decisions))
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn unchanged_timeout_does_not_wait_for_an_unrelated_row_lock() -> TestResult {
+/// One simulated worker registered as a Direct node, an actor, and the
+/// timeout lock-bypass flag in each state the rows below read.
+struct TimeoutLockFixture {
+    db: pplx_space_db_test_fixtures::TestDb,
+    actor: User,
+    enabled: FeatureFlagClient,
+    disabled: FeatureFlagClient,
+    absent: FeatureFlagClient,
+    controller: SandboxController,
+    policy: AutoLifecyclePolicy,
+    node: pplx_space_common_core::types::NodeId,
+    worker: pplx_space_node_api_sim::SimWorkerHarness,
+}
+
+async fn timeout_lock_fixture() -> TestResult<TimeoutLockFixture> {
     use pplx_space_common_core::types::SubstrateKind;
-    if !crate::test_support::enter_sim_worker_process() {
-        return Ok(());
-    }
     // The lock holder, the lock-wait observer and the update each need a
     // connection.
     let db = pplx_space_db_test_fixtures::pg_test_db_with_max_connections(3).await?;
@@ -245,263 +265,226 @@ async fn unchanged_timeout_does_not_wait_for_an_unrelated_row_lock() -> TestResu
     .bind(worker.endpoint())
     .execute(&db.pool)
     .await?;
+    Ok(TimeoutLockFixture {
+        db,
+        actor,
+        enabled,
+        disabled,
+        absent,
+        controller,
+        policy,
+        node,
+        worker,
+    })
+}
 
-    for (lifecycle, decision) in [
-        ("created", "skipped_absent"),
-        ("paused", "skipped_absent"),
-        ("suspended", "skipped_absent"),
-        ("started", "skipped_present"),
-    ] {
-        let started = lifecycle == "started";
-        let sandbox = seed_timeout_sandbox(
-            &db.pool,
-            &actor,
-            lifecycle,
-            &policy,
-            SubstrateKind::Space,
-            started.then_some((node, &worker)),
-        )
-        .await?;
-        let before: serde_json::Value =
-            sqlx::query_scalar(sql!("SELECT to_jsonb(s) FROM sandboxes s WHERE id = $1"))
-                .bind(sandbox.id)
-                .fetch_one(&db.pool)
-                .await?;
-        // Runtime requests encode whole seconds; keep their budget above one
-        // second while the stored-only lock check uses 500ms.
-        let budget = if started {
-            Duration::from_secs(2)
-        } else {
-            Duration::from_millis(500)
-        };
-        let (result, waited, decisions) =
-            timeout_update_under_row_lock(&db.pool, &controller, &sandbox, 90, &policy, budget)
-                .await?;
-        assert!(
-            result.is_ok() && !waited,
-            "{lifecycle}: unchanged timeout must not wait for the row lock: {result:?}"
-        );
-        assert_eq!(decisions, [format!("decision:{decision}")], "{lifecycle}");
+#[rstest::rstest]
+#[case::created("created", "skipped_absent")]
+#[case::paused("paused", "skipped_absent")]
+#[case::suspended("suspended", "skipped_absent")]
+#[case::started("started", "skipped_present")]
+#[tokio::test(flavor = "current_thread")]
+async fn unchanged_timeout_does_not_wait_for_an_unrelated_row_lock(
+    #[case] lifecycle: &str,
+    #[case] decision: &str,
+) -> TestResult {
+    use pplx_space_common_core::types::SubstrateKind;
+    if !crate::test_support::enter_sim_worker_process() {
+        return Ok(());
+    }
+    let TimeoutLockFixture {
+        db,
+        actor,
+        controller,
+        policy,
+        node,
+        worker,
+        ..
+    } = timeout_lock_fixture().await?;
+    let started = lifecycle == "started";
+    let sandbox = seed_timeout_sandbox(
+        &db.pool,
+        &actor,
+        lifecycle,
+        &policy,
+        SubstrateKind::Space,
+        started.then_some((node, &worker)),
+    )
+    .await?;
+    let before: serde_json::Value =
+        sqlx::query_scalar(sql!("SELECT to_jsonb(s) FROM sandboxes s WHERE id = $1"))
+            .bind(sandbox.id)
+            .fetch_one(&db.pool)
+            .await?;
+    // Runtime requests encode whole seconds; keep their budget above one
+    // second while the stored-only lock check uses 500ms.
+    let budget = if started {
+        Duration::from_secs(2)
+    } else {
+        Duration::from_millis(500)
+    };
+    let (result, waited, decisions) =
+        timeout_update_under_row_lock(&db.pool, &controller, &sandbox, 90, &policy, budget).await?;
+    assert!(
+        result.is_ok() && !waited,
+        "{lifecycle}: unchanged timeout must not wait for the row lock: {result:?}"
+    );
+    assert_eq!(decisions, [format!("decision:{decision}")], "{lifecycle}");
+    assert_eq!(
+        matches!(result?, AccessIdleTimeoutOutcome::Applied),
+        started
+    );
+    let after: serde_json::Value =
+        sqlx::query_scalar(sql!("SELECT to_jsonb(s) FROM sandboxes s WHERE id = $1"))
+            .bind(sandbox.id)
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(after, before);
+    if started {
+        let record = worker.state().get(&sandbox.id.to_string()).await?;
         assert_eq!(
-            matches!(result?, AccessIdleTimeoutOutcome::Applied),
-            started
+            record.access_extended_until, None,
+            "ResetPolicy clears the floor"
         );
-        let after: serde_json::Value =
-            sqlx::query_scalar(sql!("SELECT to_jsonb(s) FROM sandboxes s WHERE id = $1"))
-                .bind(sandbox.id)
-                .fetch_one(&db.pool)
-                .await?;
-        assert_eq!(after, before);
-        if started {
-            let record = worker.state().get(&sandbox.id.to_string()).await?;
-            assert_eq!(
-                record.access_extended_until, None,
-                "ResetPolicy clears the floor"
-            );
-        }
     }
-    // Ineligible requests retain locking even with unchanged intent. Gate
-    // rollback and missing configuration must also restore that behavior.
-    // `Running` rows carry execution evidence; the others carry none, and
-    // Direct proves nothing from missing evidence.
-    #[derive(Clone, Copy, Debug, PartialEq)]
-    enum Seed {
-        K8s,
-        Direct,
-        Running,
+    Ok(())
+}
+
+/// What an ineligible row carries. `Running` rows carry execution evidence;
+/// the others carry none, and Direct proves nothing from missing evidence.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Seed {
+    K8s,
+    Direct,
+    Running,
+}
+
+/// What an ineligible request asks, and with the gate in which state.
+#[derive(Clone, Copy, Debug)]
+enum Call {
+    Unchanged,
+    FlagOff,
+    FlagAbsent,
+    Changed,
+    Conflicting,
+}
+
+/// Ineligible requests retain locking even with unchanged intent. Gate
+/// rollback and missing configuration must also restore that behavior.
+#[rstest::rstest]
+#[case::flag_off("created", Seed::K8s, Call::FlagOff, "locked_flag_off")]
+#[case::flag_absent("created", Seed::K8s, Call::FlagAbsent, "locked_flag_off")]
+#[case::changed("created", Seed::K8s, Call::Changed, "locked_policy_changed")]
+#[case::conflicting("created", Seed::K8s, Call::Conflicting, "locked_expected_mismatch")]
+#[case::started_k8s("started", Seed::K8s, Call::Unchanged, "locked_presence_unknown")]
+#[case::started_direct("started", Seed::Direct, Call::Unchanged, "locked_presence_unknown")]
+#[case::running_changed("started", Seed::Running, Call::Changed, "locked_policy_changed")]
+#[case::running_conflicting(
+    "started",
+    Seed::Running,
+    Call::Conflicting,
+    "locked_expected_mismatch"
+)]
+#[case::restoring_running("restoring", Seed::Running, Call::Unchanged, "locked_presence_unknown")]
+#[case::creating("creating", Seed::K8s, Call::Unchanged, "locked_presence_unknown")]
+#[case::starting("starting", Seed::K8s, Call::Unchanged, "locked_presence_unknown")]
+#[case::restoring("restoring", Seed::K8s, Call::Unchanged, "locked_presence_unknown")]
+#[case::resuming("resuming", Seed::K8s, Call::Unchanged, "locked_presence_unknown")]
+#[case::pausing("pausing", Seed::K8s, Call::Unchanged, "locked_presence_unknown")]
+#[case::suspending("suspending", Seed::K8s, Call::Unchanged, "locked_presence_unknown")]
+#[case::checkpointing("checkpointing", Seed::K8s, Call::Unchanged, "locked_presence_unknown")]
+#[case::stopping("stopping", Seed::K8s, Call::Unchanged, "locked_presence_unknown")]
+#[case::stopped("stopped", Seed::K8s, Call::Unchanged, "locked_presence_unknown")]
+#[case::deleting("deleting", Seed::K8s, Call::Unchanged, "locked_presence_unknown")]
+#[case::quarantined("quarantined", Seed::K8s, Call::Unchanged, "locked_presence_unknown")]
+#[case::failed("failed", Seed::K8s, Call::Unchanged, "locked_presence_unknown")]
+#[case::deleted("deleted", Seed::K8s, Call::Unchanged, "locked_presence_unknown")]
+#[tokio::test(flavor = "current_thread")]
+async fn an_ineligible_timeout_update_waits_for_the_row_lock(
+    #[case] lifecycle: &str,
+    #[case] seed: Seed,
+    #[case] call: Call,
+    #[case] decision: &str,
+) -> TestResult {
+    use pplx_space_common_core::types::SubstrateKind;
+    if !crate::test_support::enter_sim_worker_process() {
+        return Ok(());
     }
-    #[derive(Clone, Copy, Debug)]
-    enum Call {
-        Unchanged,
-        FlagOff,
-        FlagAbsent,
-        Changed,
-        Conflicting,
-    }
+    let fixture = timeout_lock_fixture().await?;
+    let TimeoutLockFixture {
+        db,
+        actor,
+        policy,
+        node,
+        worker,
+        ..
+    } = &fixture;
     let conflicting = crate::e2b::auto_lifecycle_policy(120, true, false);
-    for (lifecycle, seed, call, decision) in [
-        ("created", Seed::K8s, Call::FlagOff, "locked_flag_off"),
-        ("created", Seed::K8s, Call::FlagAbsent, "locked_flag_off"),
-        ("created", Seed::K8s, Call::Changed, "locked_policy_changed"),
-        (
-            "created",
-            Seed::K8s,
-            Call::Conflicting,
-            "locked_expected_mismatch",
-        ),
-        (
-            "started",
-            Seed::K8s,
-            Call::Unchanged,
-            "locked_presence_unknown",
-        ),
-        (
-            "started",
-            Seed::Direct,
-            Call::Unchanged,
-            "locked_presence_unknown",
-        ),
-        (
-            "started",
-            Seed::Running,
-            Call::Changed,
-            "locked_policy_changed",
-        ),
-        (
-            "started",
-            Seed::Running,
-            Call::Conflicting,
-            "locked_expected_mismatch",
-        ),
-        (
-            "restoring",
-            Seed::Running,
-            Call::Unchanged,
-            "locked_presence_unknown",
-        ),
-        (
-            "creating",
-            Seed::K8s,
-            Call::Unchanged,
-            "locked_presence_unknown",
-        ),
-        (
-            "starting",
-            Seed::K8s,
-            Call::Unchanged,
-            "locked_presence_unknown",
-        ),
-        (
-            "restoring",
-            Seed::K8s,
-            Call::Unchanged,
-            "locked_presence_unknown",
-        ),
-        (
-            "resuming",
-            Seed::K8s,
-            Call::Unchanged,
-            "locked_presence_unknown",
-        ),
-        (
-            "pausing",
-            Seed::K8s,
-            Call::Unchanged,
-            "locked_presence_unknown",
-        ),
-        (
-            "suspending",
-            Seed::K8s,
-            Call::Unchanged,
-            "locked_presence_unknown",
-        ),
-        (
-            "checkpointing",
-            Seed::K8s,
-            Call::Unchanged,
-            "locked_presence_unknown",
-        ),
-        (
-            "stopping",
-            Seed::K8s,
-            Call::Unchanged,
-            "locked_presence_unknown",
-        ),
-        (
-            "stopped",
-            Seed::K8s,
-            Call::Unchanged,
-            "locked_presence_unknown",
-        ),
-        (
-            "deleting",
-            Seed::K8s,
-            Call::Unchanged,
-            "locked_presence_unknown",
-        ),
-        (
-            "quarantined",
-            Seed::K8s,
-            Call::Unchanged,
-            "locked_presence_unknown",
-        ),
-        (
-            "failed",
-            Seed::K8s,
-            Call::Unchanged,
-            "locked_presence_unknown",
-        ),
-        (
-            "deleted",
-            Seed::K8s,
-            Call::Unchanged,
-            "locked_presence_unknown",
-        ),
-    ] {
-        let case = format!("{lifecycle} {seed:?} {call:?}");
-        let flags = match call {
-            Call::FlagOff => &disabled,
-            Call::FlagAbsent => &absent,
-            Call::Unchanged | Call::Changed | Call::Conflicting => &enabled,
-        };
-        let (timeout, expected) = match call {
-            Call::Changed => (120, &policy),
-            Call::Conflicting => (90, &conflicting),
-            Call::Unchanged | Call::FlagOff | Call::FlagAbsent => (90, &policy),
-        };
-        let controller = controller.clone().with_feature_flags(flags.clone());
-        let sandbox = seed_timeout_sandbox(
-            &db.pool,
-            &actor,
-            lifecycle,
-            &policy,
-            if seed == Seed::K8s {
-                SubstrateKind::Kubernetes
-            } else {
-                SubstrateKind::Space
-            },
-            (seed == Seed::Running).then_some((node, &worker)),
-        )
-        .await?;
-        let ownership = pplx_space_sandbox_store::auto_lifecycle_execution(&db.pool, sandbox.id)
-            .await?
-            .ok_or("seeded sandbox missing")?;
-        assert_eq!(ownership.proves_no_execution(), seed == Seed::K8s, "{case}");
-        let (result, waited, decisions) = timeout_update_under_row_lock(
-            &db.pool,
-            &controller,
-            &sandbox,
-            timeout,
-            expected,
-            Duration::from_millis(200),
-        )
-        .await?;
-        let error = match result {
-            Ok(outcome) => {
-                return Err(format!(
-                    "{case}: ineligible timeout must still wait for the row lock, got {outcome:?}"
-                )
-                .into());
-            }
-            Err(error) => error,
-        };
-        assert!(waited, "{case}: never waited on the row lock: {error}");
-        assert_eq!(error.status().as_u16(), 503, "{case}");
-        assert!(
-            error
-                .to_string()
-                .contains("sandbox deadline update expired"),
-            "{case}: {error}"
-        );
-        assert_eq!(decisions, [format!("decision:{decision}")], "{case}");
-        if seed == Seed::Running {
-            let record = worker.state().get(&sandbox.id.to_string()).await?;
-            assert_eq!(
-                record.access_extended_until,
-                Some(1_900_000_000),
-                "{case}: the worker must not be reached"
-            );
+    let case = format!("{lifecycle} {seed:?} {call:?}");
+    let flags = match call {
+        Call::FlagOff => &fixture.disabled,
+        Call::FlagAbsent => &fixture.absent,
+        Call::Unchanged | Call::Changed | Call::Conflicting => &fixture.enabled,
+    };
+    let (timeout, expected) = match call {
+        Call::Changed => (120, policy),
+        Call::Conflicting => (90, &conflicting),
+        Call::Unchanged | Call::FlagOff | Call::FlagAbsent => (90, policy),
+    };
+    let controller = fixture.controller.clone().with_feature_flags(flags.clone());
+    let sandbox = seed_timeout_sandbox(
+        &db.pool,
+        actor,
+        lifecycle,
+        policy,
+        if seed == Seed::K8s {
+            SubstrateKind::Kubernetes
+        } else {
+            SubstrateKind::Space
+        },
+        (seed == Seed::Running).then_some((*node, worker)),
+    )
+    .await?;
+    let ownership = pplx_space_sandbox_store::auto_lifecycle_execution(&db.pool, sandbox.id)
+        .await?
+        .ok_or("seeded sandbox missing")?;
+    assert_eq!(ownership.proves_no_execution(), seed == Seed::K8s, "{case}");
+    let (result, waited, decisions) = timeout_update_under_row_lock(
+        &db.pool,
+        &controller,
+        &sandbox,
+        timeout,
+        expected,
+        // Long enough for the observer to see the update block on the row lock
+        // when every case of this test starts at once on a loaded runner.
+        Duration::from_millis(500),
+    )
+    .await?;
+    let error = match result {
+        Ok(outcome) => {
+            return Err(format!(
+                "{case}: ineligible timeout must still wait for the row lock, got {outcome:?}"
+            )
+            .into());
         }
+        Err(error) => error,
+    };
+    assert!(waited, "{case}: never waited on the row lock: {error}");
+    assert_eq!(error.status().as_u16(), 503, "{case}");
+    assert!(
+        error
+            .to_string()
+            .contains("sandbox deadline update expired"),
+        "{case}: {error}"
+    );
+    assert_eq!(decisions, [format!("decision:{decision}")], "{case}");
+    if seed == Seed::Running {
+        let record = worker.state().get(&sandbox.id.to_string()).await?;
+        assert_eq!(
+            record.access_extended_until,
+            Some(1_900_000_000),
+            "{case}: the worker must not be reached"
+        );
     }
     Ok(())
 }

@@ -103,7 +103,7 @@ impl Default for RetryBackoffSchedule {
 impl RetryBackoffSchedule {
     /// Shorten the backoff for a test that has to observe a scheduled retry
     /// arrive. Production keeps [`Default`](Self::default).
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn from_secs(delays: impl IntoIterator<Item = u64>) -> Self {
         let delays: Arc<[u64]> = delays.into_iter().collect();
         assert!(
@@ -206,9 +206,9 @@ impl WorkerConfig {
 
     /// Shorten the retry backoff so a test can wait for a scheduled retry
     /// instead of sitting out the production schedule. Production workers
-    /// never call this and keep [`RetryBackoffSchedule::default`].
-    #[cfg(test)]
-    pub(crate) fn with_retry_backoff_secs(mut self, delays: impl IntoIterator<Item = u64>) -> Self {
+    /// never call this and keep the default schedule.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn with_retry_backoff_secs(mut self, delays: impl IntoIterator<Item = u64>) -> Self {
         self.retry_backoff = RetryBackoffSchedule::from_secs(delays);
         self
     }

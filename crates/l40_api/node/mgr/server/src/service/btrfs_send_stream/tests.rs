@@ -21,12 +21,26 @@ fn crc_matches_the_kernel_send_parameters() {
 #[test]
 fn a_kernel_stream_passes_however_it_is_chunked() {
     assert_eq!(check(&[STREAM]), Ok(()));
-    for split in 0..=STREAM.len() {
+    let bytes: Vec<&[u8]> = STREAM.chunks(1).collect();
+    assert_eq!(check(&bytes), Ok(()));
+}
+
+/// Every split point, dealt round-robin across one case per shard, since
+/// each split re-checks the whole stream.
+const SPLIT_SHARDS: usize = 32;
+
+#[rstest::rstest]
+fn a_kernel_stream_passes_split_anywhere(
+    #[values(
+        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
+        25, 26, 27, 28, 29, 30, 31
+    )]
+    shard: usize,
+) {
+    for split in (shard..=STREAM.len()).step_by(SPLIT_SHARDS) {
         let (head, tail) = STREAM.split_at(split);
         assert_eq!(check(&[head, tail]), Ok(()), "split at {split}");
     }
-    let bytes: Vec<&[u8]> = STREAM.chunks(1).collect();
-    assert_eq!(check(&bytes), Ok(()));
 }
 
 /// A restarted send: the partial first stream stops inside a command, and the
