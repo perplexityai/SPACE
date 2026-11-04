@@ -1511,10 +1511,7 @@ impl DeadGatewayFixture {
         Self {
             sandbox_id,
             db: crate::db::SharedConnection::new(conn),
-            sidecars: Arc::new(Mutex::new(HashMap::from([(
-                sandbox_id.to_owned(),
-                info,
-            )]))),
+            sidecars: Arc::new(Mutex::new(HashMap::from([(sandbox_id.to_owned(), info)]))),
             state: Arc::new(Mutex::new(HashMap::from([(
                 sandbox_id.to_owned(),
                 test_health(),
