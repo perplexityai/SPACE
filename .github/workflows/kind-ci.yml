@@ -43,6 +43,10 @@ jobs:
     name: Build shared Kind Rust artifacts
     runs-on: ubuntu-24.04-16core
     timeout-minutes: 60
+    # Main's kind_rust_state builds the state with rustc's incremental data;
+    # the key and the build here read the same setting (main-ci.yml).
+    env:
+      SPACE_KIND_RUST_INCREMENTAL_CODEGEN: "1"
     steps:
       - name: Check out SPACE
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

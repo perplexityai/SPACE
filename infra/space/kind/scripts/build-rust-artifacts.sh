@@ -69,6 +69,18 @@
 #                                   (default, LTO off — the Docker path's shape)
 #                                   or dev-release (incremental codegen, debug=1;
 #                                   refused for the release lane)
+#   SPACE_KIND_RUST_INCREMENTAL_CODEGEN
+#                                   incremental mode: 1 turns on rustc's
+#                                   incremental compilation for the release
+#                                   profile, so a crate rebuilt because a
+#                                   dependency changed reuses its unchanged code
+#                                   generation, and pins 16 codegen units, which
+#                                   incremental builds would otherwise raise to
+#                                   256, so the binaries are split as the Docker
+#                                   path splits them; 0 (default) leaves the
+#                                   profile as the Docker path builds it. Kind CI
+#                                   sets 1 for its build state
+#                                   (rust-state-cache.sh key)
 #   SPACE_KIND_RUST_TARGET_DIR      incremental mode target dir
 #                                   (default: ~/.space-devbox/kind/rust-target)
 #   SPACE_KIND_CARGO_HOME           incremental mode cargo home (registry + git
@@ -108,6 +120,7 @@ SRC_DIR="${SPACE_KIND_RUST_SRC_DIR:-$STATE_DIR/rust-src}"
 LOCK_FILE="$STATE_DIR/rust-artifacts.lock"
 MODE_REQUEST="${SPACE_KIND_RUST_ARTIFACTS:-auto}"
 PROFILE="${SPACE_KIND_RUST_PROFILE:-release}"
+INCREMENTAL_CODEGEN="${SPACE_KIND_RUST_INCREMENTAL_CODEGEN:-0}"
 # The libc generation the runtime images run on. Three of the four runtime
 # Dockerfiles are debian:bookworm-slim (glibc 2.36); the worker is ubuntu:24.04
 # (2.39), so bookworm is the binding constraint for the shared artifact set.
@@ -122,6 +135,8 @@ source "$REPO_ROOT/infra/space/kind/lib/rust-build.sh"
 
 log() { printf '[rust-artifacts] %s\n' "$*"; }
 die() { printf '[rust-artifacts] ERROR: %s\n' "$*" >&2; exit 1; }
+[[ "$INCREMENTAL_CODEGEN" == 0 || "$INCREMENTAL_CODEGEN" == 1 ]] \
+  || die "SPACE_KIND_RUST_INCREMENTAL_CODEGEN must be 0 or 1 (got '$INCREMENTAL_CODEGEN')"
 
 RUST_BUILD="$(space_kind_rust_build)" || die "invalid SPACE_KIND_RUST_BUILD"
 # The release lane links with thin LTO (SPACE_CARGO_RELEASE_LTO in
@@ -447,6 +462,8 @@ in_builder() {
     -e CARGO_HOME=/cargo-home \
     -e CARGO_TARGET_DIR=/workspace/target \
     -e CARGO_PROFILE_RELEASE_LTO="$RELEASE_LTO" \
+    -e CARGO_PROFILE_RELEASE_INCREMENTAL="$([[ "$INCREMENTAL_CODEGEN" == 1 ]] && echo true || echo false)" \
+    -e CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16 \
     -e CARGO_TERM_COLOR=never \
     -w /workspace \
     "$CHEF_IMAGE" "$@"
@@ -597,14 +614,14 @@ build_incremental() {
 }
 
 # What an assembly depends on besides the synced sources, by content: the
-# profile and Rust build, the Dockerfiles that define the builder, the build lists, the
+# profile, incremental codegen and Rust build, the Dockerfiles that define the builder, the build lists, the
 # packaging and the health probe, the wrapper the builder image carries, the
 # scripts that drive the build, and the libc image the glibc guard checked
 # against. File identity (inode, mtime) is deliberately not part of it: the
 # supervisor helper rewrites its compatibility file on every run.
 assembly_key() {
   {
-    echo "$PROFILE $RUST_BUILD $RUNTIME_LIBC_IMAGE"
+    echo "$PROFILE $RUST_BUILD $RUNTIME_LIBC_IMAGE incremental-codegen=$INCREMENTAL_CODEGEN"
     sha256sum "$KIND_DOCKERFILE" "$COMMON_DOCKERFILE" "$HOST_DOCKERFILE" \
       docker/run-cargo-with-sccache.sh infra/space/kind/scripts/build-rust-artifacts.sh \
       infra/space/kind/scripts/sync-rust-sources.py
