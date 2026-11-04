@@ -3,6 +3,14 @@ mount_space_cache_nvme_if_available() {
     return 0
   fi
 
+  # The AMI's unit also formats the cache at boot and isn't ordered against
+  # user data. Starting it waits for a run in progress and is a no-op once it
+  # has succeeded, so the devices are formatted once.
+  if [[ -f /etc/systemd/system/space-cache-nvme.service ]]; then
+    systemctl start space-cache-nvme.service
+    return 0
+  fi
+
   if [[ -x /usr/local/sbin/mount-space-cache-nvme.sh ]]; then
     /usr/local/sbin/mount-space-cache-nvme.sh
     return 0
