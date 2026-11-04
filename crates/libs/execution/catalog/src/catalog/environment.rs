@@ -189,6 +189,13 @@ enum QualifiedGuestImage {
 }
 
 impl CompiledEnvironment {
+    pub fn guest_agent_protocol(&self) -> crate::guest::QualifiedGuestAgent {
+        match self.guest_image {
+            QualifiedGuestImage::LinuxDirect => crate::guest::QualifiedGuestAgent::LinuxV1,
+            QualifiedGuestImage::AgentlessDhcpDisk => crate::guest::QualifiedGuestAgent::Absent,
+        }
+    }
+
     pub fn guest_shutdown(&self) -> crate::guest::GuestShutdown {
         match self.guest_image {
             QualifiedGuestImage::LinuxDirect => crate::guest::GuestShutdown::AgentFlush,

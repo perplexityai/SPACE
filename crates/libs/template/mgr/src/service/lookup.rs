@@ -340,12 +340,12 @@ impl TemplateManagerService {
         if let Some(policy) = auto_lifecycle.as_ref()
             && policy.requires_memory_lifecycle()
             && self
-                .template_guest_image(&req.template)
+                .template_guest_profile(&req.template)
                 .await?
-                .is_some_and(|image| !image.supports_auto_memory_lifecycle())
+                .is_some_and(|image| !image.supports_memory_lifecycle())
         {
             return Err(Status::failed_precondition(
-                "agentless firmware guests do not support automatic pause or suspend",
+                "guest profile is not qualified for automatic pause or suspend",
             ));
         }
         let network_policy = req
@@ -451,9 +451,14 @@ impl TemplateManagerService {
         let template = req.template.trim().to_string();
         validate_template_name(&template)?;
         let ensure_base_snapshot = req.ensure_base_snapshot;
-        if ensure_base_snapshot && self.template_guest_image(&template).await?.is_some() {
+        if ensure_base_snapshot
+            && self
+                .template_guest_profile(&template)
+                .await?
+                .is_some_and(|profile| !profile.supports_memory_lifecycle())
+        {
             return Err(Status::failed_precondition(
-                "firmware guests do not support snapshots",
+                "guest profile is not qualified for snapshots",
             ));
         }
         let snapshot_vcpu = optional_positive_or_default("snapshot_vcpu", req.snapshot_vcpu, 2)?;

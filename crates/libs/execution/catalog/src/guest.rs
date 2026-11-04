@@ -70,8 +70,58 @@ pub enum GuestShutdown {
 pub struct GuestProfile {
     shutdown: GuestShutdown,
     image: pplx_space_common_core::types::guest_image::GuestImageContract,
+    agent_protocol: QualifiedGuestAgent,
+}
+
+/// Agent presence alone does not qualify any operations or memory lifecycle.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QualifiedGuestAgent {
+    Absent,
+    LinuxV1,
 }
 impl GuestProfile {
+    /// Recover established image semantics without re-admitting an execution.
+    /// Historical Linux images remain manageable after catalog retirement;
+    /// launch and restore must continue to use `resolve`.
+    pub fn for_existing(
+        execution: Option<&ExecutionMetadata>,
+        image: pplx_space_common_core::types::guest_image::GuestImageContract,
+    ) -> Result<Self, GuestProfileError> {
+        image
+            .validate()
+            .map_err(|_| GuestProfileError("inconsistent guest agent/readiness contract"))?;
+        if image.legacy_transport() {
+            if execution.is_some_and(|e| e.guest().os != GuestOperatingSystem::Linux) {
+                return Err(GuestProfileError(
+                    "Linux image has non-Linux execution metadata",
+                ));
+            }
+            return Ok(Self {
+                image,
+                shutdown: GuestShutdown::AgentFlush,
+                agent_protocol: QualifiedGuestAgent::LinuxV1,
+            });
+        }
+        Self::resolve_optional(execution, image)
+    }
+
+    pub fn resolve_optional(
+        execution: Option<&ExecutionMetadata>,
+        image: pplx_space_common_core::types::guest_image::GuestImageContract,
+    ) -> Result<Self, GuestProfileError> {
+        match execution {
+            Some(execution) => Self::resolve(execution, image),
+            None if image.legacy_transport() => Ok(Self {
+                image,
+                shutdown: GuestShutdown::AgentFlush,
+                agent_protocol: QualifiedGuestAgent::LinuxV1,
+            }),
+            None => Err(GuestProfileError(
+                "non-legacy image requires bound execution metadata",
+            )),
+        }
+    }
+
     pub fn resolve(
         execution: &ExecutionMetadata,
         image: pplx_space_common_core::types::guest_image::GuestImageContract,
@@ -95,8 +145,32 @@ impl GuestProfile {
             Some(environment) => environment.guest_shutdown(),
             None => GuestShutdown::AgentFlush,
         };
-        Ok(Self { image, shutdown })
+        let agent_protocol = match environment {
+            Some(environment) => environment.guest_agent_protocol(),
+            None => QualifiedGuestAgent::LinuxV1,
+        };
+        Ok(Self {
+            image,
+            shutdown,
+            agent_protocol,
+        })
     }
+    /// Guest-side lifecycle support; the VMM's memory-state qualification is
+    /// an additional independent requirement at capture/restore admission.
+    pub fn supports_memory_lifecycle(self) -> bool {
+        match self.agent_protocol {
+            QualifiedGuestAgent::Absent => false,
+            QualifiedGuestAgent::LinuxV1 => true,
+        }
+    }
+
+    pub fn supports_process_environment(self) -> bool {
+        match self.agent_protocol {
+            QualifiedGuestAgent::Absent => false,
+            QualifiedGuestAgent::LinuxV1 => true,
+        }
+    }
+
     pub fn shutdown(self) -> GuestShutdown {
         self.shutdown
     }

@@ -97,12 +97,6 @@ impl GuestImageContract {
     pub fn expects_agent(self) -> bool {
         self.agent == GuestAgent::Spaced
     }
-    /// Automatic pause/suspend requires the agent activity contract. Runtime
-    /// memory-state qualification remains an independent admission check.
-    pub fn supports_auto_memory_lifecycle(self) -> bool {
-        self.expects_agent()
-    }
-
     /// The legacy transport cannot represent other image semantics.
     pub fn legacy_transport(self) -> bool {
         self.disk == GuestDiskLayout::Ext4Filesystem

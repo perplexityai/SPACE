@@ -971,7 +971,12 @@ impl SandboxManagerService {
         let _guard = wake_lock.lock().await;
 
         let sandbox = self.lookup_sandbox(&sandbox.id)?;
-        super::guest_image::validate_policy(sandbox.guest_image, &policy)?;
+        super::guest_image::validate_policy(
+            sandbox.guest_image,
+            sandbox.execution_metadata.as_ref(),
+            &policy,
+        )
+        .map_err(pplx_space_common_grpc::mark_desired_state_apply_terminal)?;
         if !Self::stable_policy_update_state(sandbox.state) {
             let status = Status::failed_precondition(format!(
                 "cannot update auto lifecycle while sandbox is {}",
@@ -1006,7 +1011,12 @@ impl SandboxManagerService {
             policy = resolved_template.default_auto_lifecycle;
         }
 
-        super::guest_image::validate_policy(sandbox.guest_image, &policy)?;
+        super::guest_image::validate_policy(
+            sandbox.guest_image,
+            sandbox.execution_metadata.as_ref(),
+            &policy,
+        )
+        .map_err(pplx_space_common_grpc::mark_desired_state_apply_terminal)?;
         validate_v1_policy(&policy).map_err(Status::invalid_argument)?;
         let runtime = sandbox
             .runtime
