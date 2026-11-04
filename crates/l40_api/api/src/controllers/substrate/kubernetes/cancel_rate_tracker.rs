@@ -106,7 +106,7 @@ impl CancelRateTracker {
     /// True if cancellations over the last `NUM_BUCKETS * BUCKET_MS`
     /// have exceeded the configured per-second budget.
     pub fn is_over_budget(&self) -> bool {
-        self.current_count() > self.budget_per_sec
+        self.current_count() >= self.budget_per_sec
     }
 
     /// Sum cancellations whose bucket falls within the last `NUM_BUCKETS`
