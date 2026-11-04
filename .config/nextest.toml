@@ -80,7 +80,8 @@ max-threads = 8
 # and the spaced worker binaries switch between real service uids. The
 # router's descriptor reads use pidfd_getfd,
 # which Docker's default seccomp profile allows only with CAP_SYS_PTRACE. The
-# bootstrap-role tests each start a virgin Postgres container.
+# bootstrap-role tests and the execution-record view pins each start a
+# virgin Postgres container.
 #
 # Root halves of split tests, whose unprivileged halves run outside the group:
 # encrypted_volumes reads the published copy as uid 65534; permission_tree
@@ -147,5 +148,6 @@ or (package(pplx-space-build-mgr) and test(/^oci::containerd::tests::real_contai
 or (package(pplx-space-net-gateway) and test(=tcp_proxy::tests::tls_interception::interception_exemptions_relay_original_tls_only_after_admission))
 or (package(pplx-space-net-gateway-client) and test(=tests::sandbox_connections_ignore_replaced_alias_and_reject_legacy_only_gateway))
 or (package(pplx-space-db-migrate) and test(/^bootstrap_roles::tests::postgres_bootstrap_tests::/))
+or (package(pplx-space-db-migrate) and test(/^bootstrap_roles::tests::execution_record_view_tests::/))
 '''
 test-group = "privileged"

@@ -46,6 +46,7 @@ fn missing_password_envs_lists_unset_roles() {
     assert!(BootstrapPasswords::default().missing_password_envs().len() == 5);
 }
 
+mod execution_record_view_tests;
 mod postgres_bootstrap_tests;
 
 /// `SPACE_DB_APP_LOCK_TIMEOUT` is the provisioning wrappers' input: an explicit

@@ -440,6 +440,11 @@ rather than an opt-out to use: the NoCoW host-fixture tests treat any value of
 it as CI. Don't print the marker for a skip that is not a missing service, such
 as a main-CI-only test.
 
+To run the Postgres suites against a candidate schema change before it is
+written as a migration, set `SPACE_TEST_POSTGRES_SCHEMA_VARIANT`; the fixtures
+crate's README ("Schema variants") lists the variants and how to write test
+DDL that works under them.
+
 ## Privileged tests and the CI host
 
 The GitHub Rust test job runs the whole workspace, ignored tests included

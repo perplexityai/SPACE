@@ -9237,13 +9237,17 @@ mod kubernetes_tests {
         )
         .execute(pool)
         .await?;
-        sqlx::query(
+        // A row trigger needs the table, which a schema variant may have
+        // renamed out from under a compatibility view.
+        let create_trigger = format!(
             "CREATE TRIGGER fail_test_pod_metadata_persist
-             BEFORE UPDATE OF pod_uid ON sandbox_k8s_executions
+             BEFORE UPDATE OF pod_uid ON {}
              FOR EACH ROW EXECUTE FUNCTION fail_test_pod_metadata_persist()",
-        )
-        .execute(pool)
-        .await?;
+            pplx_space_db_test_fixtures::physical_table("sandbox_k8s_executions")?
+        );
+        sqlx::query(sqlx::AssertSqlSafe(sql!(create_trigger.as_str())))
+            .execute(pool)
+            .await?;
         Ok(())
     }
 
