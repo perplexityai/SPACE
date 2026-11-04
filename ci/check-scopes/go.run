@@ -1,0 +1,4 @@
+# The Go shim check builds shim/ and generates its protobuf code from
+# proto/ (shim/proto/gen.go); it reads nothing else.
+shim/*
+proto/*

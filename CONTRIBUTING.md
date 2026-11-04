@@ -129,6 +129,12 @@ stays ready; converting it back to a draft defers it again. To run it on a
 draft, someone with triage access adds the `kind-smoke` label, and it runs
 from the next push.
 
+Pull CI and the merge queue also skip any other check the change cannot
+affect: a console-only change runs no Rust or Python checks, and a
+documentation change no Rust checks. Each check's scope in
+[ci/check-scopes/](ci/check-scopes/README.md) lists what it reads; a skipped
+check passes, and its log says why. Main CI runs every check after the merge.
+
 Run `cargo arch` to check the repository structure rules in
 [ARCHITECTURE.toml](ARCHITECTURE.toml); [archcheck](crates/tools/archcheck/README.md)
 explains each rule and its baseline.

@@ -2,6 +2,15 @@ name: Rust Static CI
 
 on:
   workflow_call:
+    inputs:
+      scope_base:
+        description: >-
+          Base commit for skipping a check the change cannot affect
+          (ci/check-scopes/README.md). Empty, as Main CI passes it, runs every
+          check.
+        required: false
+        default: ''
+        type: string
 
 permissions:
   contents: read
@@ -23,11 +32,13 @@ jobs:
       matrix:
         include:
           - name: Rust format
+            scope: rust
             command: bash ci/scripts/run-rust-checks.sh fmt
             runner: ubuntu-24.04
             rust_cache: false
             timeout: 15
           - name: Rust clippy
+            scope: rust
             command: bash ci/scripts/run-rust-checks.sh clippy
             runner: ubuntu-24.04-16core
             rust_cache: true
@@ -43,6 +54,7 @@ jobs:
           # other feature sets than the workspace pass, and two jobs saving one
           # family would replace and trim each other's snapshots.
           - name: Rust isolated crates
+            scope: rust
             command: bash ci/scripts/run-rust-checks.sh isolated-crates
             runner: ubuntu-24.04-16core
             rust_cache: true
@@ -59,10 +71,20 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      # Pull CI and the merge queue skip a check the change cannot affect,
+      # and Main CI, which passes no base, runs it (ci/check-scopes/README.md).
+      - name: Decide whether this change needs the check
+        id: scope
+        shell: bash
+        env:
+          SCOPE: ${{ matrix.scope }}
+          SCOPE_BASE: ${{ inputs.scope_base }}
+        run: bash ci/scripts/check-needed.sh "${SCOPE}" "${SCOPE_BASE}" >>"${GITHUB_OUTPUT}"
+
       # The report after Clippy runs this copy of the package cache helper,
       # taken before Clippy starts, as in common-ci.yml.
       - name: Copy the package cache helper
-        if: matrix.cargo_registry
+        if: ${{ steps.scope.outputs.needed == 'true' && (matrix.cargo_registry) }}
         run: |
           set -euo pipefail
           install -d "${RUNNER_TEMP}/space-ci-helpers"
@@ -70,6 +92,7 @@ jobs:
           chmod 0555 "${RUNNER_TEMP}/space-ci-helpers"
 
       - name: Get the CI image
+        if: steps.scope.outputs.needed == 'true'
         id: ci-image
         env:
           GHCR_TOKEN: ${{ github.token }}
@@ -80,12 +103,12 @@ jobs:
       # version includes.
       - name: Name the Cargo registry cache
         id: cargo-registry-key
-        if: matrix.cargo_registry
+        if: ${{ steps.scope.outputs.needed == 'true' && (matrix.cargo_registry) }}
         run: python3 ci/scripts/package-cache.py key cargo
 
       - name: Restore the Cargo registry
         id: restore-cargo-registry
-        if: matrix.cargo_registry
+        if: ${{ steps.scope.outputs.needed == 'true' && (matrix.cargo_registry) }}
         continue-on-error: true
         timeout-minutes: 5
         env:
@@ -101,7 +124,7 @@ jobs:
             ${{ steps.cargo-registry-key.outputs.family }}
 
       - name: Prepare the Cargo registry
-        if: matrix.cargo_registry
+        if: ${{ steps.scope.outputs.needed == 'true' && (matrix.cargo_registry) }}
         env:
           MATCHED_KEY: ${{ steps.restore-cargo-registry.outputs.cache-matched-key }}
         run: >-
@@ -113,7 +136,7 @@ jobs:
       # The snapshot lifecycle matches common-ci.yml.
       - name: Name the Rust compiler cache
         id: rust-cache-key
-        if: matrix.rust_cache == true
+        if: ${{ steps.scope.outputs.needed == 'true' && (matrix.rust_cache == true) }}
         env:
           FAMILY: space-sccache-v1-${{ runner.os }}-${{ runner.arch }}-${{ matrix.rust_cache_key }}
           INPUTS: >-
@@ -128,7 +151,7 @@ jobs:
 
       - name: Restore the Rust compiler cache
         id: restore-rust-cache
-        if: matrix.rust_cache == true
+        if: ${{ steps.scope.outputs.needed == 'true' && (matrix.rust_cache == true) }}
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/space-sccache
@@ -138,6 +161,7 @@ jobs:
             ${{ steps.rust-cache-key.outputs.family }}
 
       - name: Run ${{ matrix.name }}
+        if: steps.scope.outputs.needed == 'true'
         env:
           SPACE_CI_COMMAND: ${{ matrix.command }}
           SPACE_CI_RUST_CACHE: ${{ matrix.rust_cache }}
@@ -200,8 +224,7 @@ jobs:
       - name: Check repository structure
         id: archcheck
         if: >-
-          ${{ !cancelled() && steps.ci-image.outcome == 'success' && matrix.archcheck == true &&
-          (github.event_name == 'pull_request' || github.event_name == 'merge_group') }}
+          ${{ steps.scope.outputs.needed == 'true' && (!cancelled() && steps.ci-image.outcome == 'success' && matrix.archcheck == true && (github.event_name == 'pull_request' || github.event_name == 'merge_group')) }}
         env:
           CARGO_DIR: ${{ runner.temp }}/cargo-home
           SCCACHE_DIR: ${{ runner.temp }}/space-sccache
@@ -229,7 +252,7 @@ jobs:
           if ((status > 1)); then echo "::error title=archcheck::cargo arch exited ${status}; see above."; exit 1; fi
 
       - name: Set up reviewdog
-        if: ${{ !cancelled() && steps.archcheck.outcome == 'success' && github.event_name == 'pull_request' }}
+        if: ${{ steps.scope.outputs.needed == 'true' && (!cancelled() && steps.archcheck.outcome == 'success' && github.event_name == 'pull_request') }}
         uses: reviewdog/action-setup@d8a7baabd7f3e8544ee4dbde3ee41d0011c3a93f # v1.5.0
         with:
           reviewdog_version: v0.21.2
@@ -246,7 +269,7 @@ jobs:
       # shows a step's first 10 warnings, so that run puts the pull request's
       # own findings first (see order-archcheck-findings.sh).
       - name: Annotate repository structure findings
-        if: ${{ !cancelled() && steps.archcheck.outcome == 'success' && github.event_name == 'pull_request' }}
+        if: ${{ steps.scope.outputs.needed == 'true' && (!cancelled() && steps.archcheck.outcome == 'success' && github.event_name == 'pull_request') }}
         env:
           GH_TOKEN: ${{ github.token }}
           REVIEWDOG_GITHUB_API_TOKEN: ${{ github.token }}
@@ -286,14 +309,14 @@ jobs:
           annotate '.severity == "ERROR"' error nofilter target/archcheck.rdjson
 
       - name: Report the Cargo registry
-        if: always() && matrix.cargo_registry
+        if: ${{ steps.scope.outputs.needed == 'true' && (always() && matrix.cargo_registry) }}
         env:
           PACKAGE_CACHE: ${{ runner.temp }}/space-ci-helpers/package-cache.py
         run: python3 -I "${PACKAGE_CACHE}" report cargo "${RUNNER_TEMP}/cargo-home/registry"
 
       - name: Decide whether to refresh the Rust compiler cache
         id: refresh-rust-cache
-        if: success() && matrix.rust_cache == true
+        if: ${{ steps.scope.outputs.needed == 'true' && (success() && matrix.rust_cache == true) }}
         env:
           KEY: ${{ steps.rust-cache-key.outputs.key }}
           INPUTS_PREFIX: ${{ steps.rust-cache-key.outputs.inputs }}
@@ -306,8 +329,7 @@ jobs:
 
       - name: Prepare the Rust compiler cache for upload
         if: >-
-          github.event_name == 'push' && github.ref == 'refs/heads/main' &&
-          steps.refresh-rust-cache.outputs.save == 'true'
+          ${{ steps.scope.outputs.needed == 'true' && (github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.refresh-rust-cache.outputs.save == 'true') }}
         env:
           SPACE_CI_SCCACHE_DIR: ${{ runner.temp }}/space-sccache
           SPACE_CI_SCCACHE_RUN_DIR: ${{ runner.temp }}/space-sccache-run
@@ -323,8 +345,7 @@ jobs:
 
       - name: Save the Rust compiler cache
         if: >-
-          github.event_name == 'push' && github.ref == 'refs/heads/main' &&
-          steps.refresh-rust-cache.outputs.save == 'true'
+          ${{ steps.scope.outputs.needed == 'true' && (github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.refresh-rust-cache.outputs.save == 'true') }}
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/space-sccache
@@ -340,7 +361,17 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      # Pull CI and the merge queue skip a check the change cannot affect,
+      # and Main CI, which passes no base, runs it (ci/check-scopes/README.md).
+      - name: Decide whether this change needs the check
+        id: scope
+        shell: bash
+        env:
+          SCOPE: rust
+          SCOPE_BASE: ${{ inputs.scope_base }}
+        run: bash ci/scripts/check-needed.sh "${SCOPE}" "${SCOPE_BASE}" >>"${GITHUB_OUTPUT}"
       - name: Install protobuf compiler
+        if: steps.scope.outputs.needed == 'true'
         run: |
           $archive = Join-Path $env:RUNNER_TEMP "protoc.zip"
           $destination = Join-Path $env:RUNNER_TEMP "protoc"
@@ -354,11 +385,13 @@ jobs:
           & "$destination\bin\protoc.exe" --version
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Compile and lint native Windows code and tests
+        if: steps.scope.outputs.needed == 'true'
         run: >-
           cargo clippy --locked --target x86_64-pc-windows-msvc --all-targets
           -p pplx-space-spaced-guest-windows -p pplx-space-spaced-guest-svc
           -- -D warnings
       - name: Run native Windows unit tests
+        if: steps.scope.outputs.needed == 'true'
         run: >-
           cargo test --locked --target x86_64-pc-windows-msvc
           -p pplx-space-spaced-guest-windows --lib

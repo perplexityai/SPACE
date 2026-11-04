@@ -12,6 +12,14 @@ on:
         required: false
         default: false
         type: boolean
+      scope_base:
+        description: >-
+          Base commit for skipping a check the change cannot affect
+          (ci/check-scopes/README.md). Empty, as Main CI passes it, runs every
+          check.
+        required: false
+        default: ''
+        type: string
       main_only_tests:
         description: >-
           Also run the tests whose cost only the post-merge pipeline pays for.
@@ -40,11 +48,22 @@ jobs:
         with:
           persist-credentials: false
 
+      # Pull CI and the merge queue skip a check the change cannot affect,
+      # and Main CI, which passes no base, runs it (ci/check-scopes/README.md).
+      - name: Decide whether this change needs the check
+        id: scope
+        shell: bash
+        env:
+          SCOPE: always
+          SCOPE_BASE: ${{ inputs.scope_base }}
+        run: bash ci/scripts/check-needed.sh "${SCOPE}" "${SCOPE_BASE}" >>"${GITHUB_OUTPUT}"
+
       # The steps after the workload run this copy of the package cache
       # helper, taken before the workload starts, so they always run the
       # reviewed helper. It imports only Python's standard library.
       - &copy-package-cache-helper
         name: Copy the package cache helper
+        if: steps.scope.outputs.needed == 'true'
         run: |
           set -euo pipefail
           install -d "${RUNNER_TEMP}/space-ci-helpers"
@@ -57,6 +76,7 @@ jobs:
       # connection.
       - &install-mdbook
         name: Install pinned mdBook
+        if: steps.scope.outputs.needed == 'true'
         run: |
           version="$(cat docs/book/mdbook.version)"
           archive="mdbook-v${version}-x86_64-unknown-linux-musl.tar.gz"
@@ -67,6 +87,7 @@ jobs:
           echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
 
       - name: Set up guide diagram tooling
+        if: steps.scope.outputs.needed == 'true'
         # Mermaid's offline browser bundle comes from the shared docs lockfile.
         # Keep the standalone guide on the same Node version as the API build.
         uses: actions/setup-node@6044e13b5dc448c55e2357c09f80417699197238 # v6.2.0
@@ -87,11 +108,13 @@ jobs:
       # save. This job saves npm's.
       - &name-npm-cache
         name: Name the npm cache
+        if: steps.scope.outputs.needed == 'true'
         id: npm-cache-key
         run: python3 ci/scripts/package-cache.py key npm
 
       - &restore-npm-cache
         name: Restore the npm cache
+        if: steps.scope.outputs.needed == 'true'
         id: restore-npm-cache
         continue-on-error: true
         timeout-minutes: 5
@@ -107,11 +130,13 @@ jobs:
 
       - &prepare-npm-cache
         name: Prepare the npm cache
+        if: steps.scope.outputs.needed == 'true'
         env:
           MATCHED_KEY: ${{ steps.restore-npm-cache.outputs.cache-matched-key }}
         run: python3 ci/scripts/package-cache.py restored npm "${HOME}/.npm" "${MATCHED_KEY}"
 
       - name: Build and check the guide
+        if: steps.scope.outputs.needed == 'true'
         run: |
           bash scripts/build-guide-docs.sh
           python3 docs/book/test.py
@@ -120,6 +145,7 @@ jobs:
       # its type check and unit tests need none. Its lockfile is one of the
       # npm cache's inputs, so this installs from the restored cache.
       - name: Check the console loop
+        if: steps.scope.outputs.needed == 'true'
         working-directory: scripts/console-loop
         run: |
           npm ci --ignore-scripts --no-fund --no-audit
@@ -128,7 +154,7 @@ jobs:
 
       - name: Report the npm cache
         id: report-npm-cache
-        if: always()
+        if: ${{ steps.scope.outputs.needed == 'true' && (always()) }}
         env:
           PACKAGE_CACHE: ${{ runner.temp }}/space-ci-helpers/package-cache.py
           KEY: ${{ steps.npm-cache-key.outputs.key }}
@@ -141,8 +167,7 @@ jobs:
         id: prepare-npm-upload
         continue-on-error: true
         if: >-
-          success() && github.event_name == 'push' && github.ref == 'refs/heads/main' &&
-          steps.report-npm-cache.outputs.npm-save == 'true'
+          ${{ steps.scope.outputs.needed == 'true' && (success() && github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.report-npm-cache.outputs.npm-save == 'true') }}
         env:
           PACKAGE_CACHE: ${{ runner.temp }}/space-ci-helpers/package-cache.py
         run: >-
@@ -150,7 +175,7 @@ jobs:
           docs/api/package-lock.json scripts/console-loop/package-lock.json
 
       - name: Save the npm cache
-        if: steps.prepare-npm-upload.outcome == 'success'
+        if: ${{ steps.scope.outputs.needed == 'true' && (steps.prepare-npm-upload.outcome == 'success') }}
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.npm
@@ -167,11 +192,22 @@ jobs:
         with:
           persist-credentials: false
 
+      # Pull CI and the merge queue skip a check the change cannot affect,
+      # and Main CI, which passes no base, runs it (ci/check-scopes/README.md).
+      - name: Decide whether this change needs the check
+        id: scope
+        shell: bash
+        env:
+          SCOPE: always
+          SCOPE_BASE: ${{ inputs.scope_base }}
+        run: bash ci/scripts/check-needed.sh "${SCOPE}" "${SCOPE_BASE}" >>"${GITHUB_OUTPUT}"
+
       - *copy-package-cache-helper
 
       # The SPACE Guide saves the npm cache, which the two jobs' identical
       # `npm ci` share, and Rust tests the Cargo registry.
       - name: Set up documentation tooling
+        if: steps.scope.outputs.needed == 'true'
         uses: actions/setup-node@6044e13b5dc448c55e2357c09f80417699197238 # v6.2.0
         with:
           node-version: '22.23.3'
@@ -184,11 +220,13 @@ jobs:
 
       - &name-cargo-registry
         name: Name the Cargo registry cache
+        if: steps.scope.outputs.needed == 'true'
         id: cargo-registry-key
         run: python3 ci/scripts/package-cache.py key cargo
 
       - &restore-cargo-registry
         name: Restore the Cargo registry
+        if: steps.scope.outputs.needed == 'true'
         id: restore-cargo-registry
         continue-on-error: true
         timeout-minutes: 5
@@ -210,6 +248,7 @@ jobs:
       # would fail every build; one whose checksum is not Cargo.lock's goes.
       - &prepare-cargo-registry
         name: Prepare the Cargo registry
+        if: steps.scope.outputs.needed == 'true'
         env:
           MATCHED_KEY: ${{ steps.restore-cargo-registry.outputs.cache-matched-key }}
         run: >-
@@ -219,14 +258,17 @@ jobs:
       - *install-mdbook
 
       - name: Get the CI image
+        if: steps.scope.outputs.needed == 'true'
         env:
           GHCR_TOKEN: ${{ github.token }}
         run: bash ci/scripts/ci-image.sh ensure "space-ci:${GITHUB_SHA}"
 
       - name: Install documentation dependencies
+        if: steps.scope.outputs.needed == 'true'
         run: npm ci --prefix docs/api --ignore-scripts --no-fund --no-audit
 
       - name: Build guide and API
+        if: steps.scope.outputs.needed == 'true'
         env:
           SPACE_API_DOCS_RUST_IMAGE: space-ci:${{ github.sha }}
           SPACE_API_DOCS_CARGO_REGISTRY: ${{ runner.temp }}/cargo-home/registry
@@ -234,24 +276,26 @@ jobs:
         run: bash scripts/build-docs.sh
 
       - name: Report the npm cache
-        if: always()
+        if: ${{ steps.scope.outputs.needed == 'true' && (always()) }}
         env:
           PACKAGE_CACHE: ${{ runner.temp }}/space-ci-helpers/package-cache.py
         run: python3 -I "${PACKAGE_CACHE}" report npm "${HOME}/.npm"
 
       - &report-cargo-registry
         name: Report the Cargo registry
-        if: always()
+        if: ${{ steps.scope.outputs.needed == 'true' && (always()) }}
         env:
           PACKAGE_CACHE: ${{ runner.temp }}/space-ci-helpers/package-cache.py
         run: python3 -I "${PACKAGE_CACHE}" report cargo "${RUNNER_TEMP}/cargo-home/registry"
 
       - name: Check standalone outputs and the combined site
+        if: steps.scope.outputs.needed == 'true'
         run: |
           python3 docs/book/test.py
           python3 docs/site/test_build.py
 
       - name: Retain private preview assets
+        if: steps.scope.outputs.needed == 'true'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: space-docs-${{ github.event.pull_request.head.sha || github.sha }}
@@ -274,6 +318,16 @@ jobs:
         with:
           persist-credentials: false
 
+      # Pull CI and the merge queue skip a check the change cannot affect,
+      # and Main CI, which passes no base, runs it (ci/check-scopes/README.md).
+      - name: Decide whether this change needs the check
+        id: scope
+        shell: bash
+        env:
+          SCOPE: rust
+          SCOPE_BASE: ${{ inputs.scope_base }}
+        run: bash ci/scripts/check-needed.sh "${SCOPE}" "${SCOPE_BASE}" >>"${GITHUB_OUTPUT}"
+
       - *copy-package-cache-helper
 
       # Both tools read every package's manifest through `cargo metadata`,
@@ -287,17 +341,20 @@ jobs:
       # cargo-vet and cargo-deny are pinned in ci/Dockerfile.ci and ship in the
       # CI image, so this job no longer compiles them on every run.
       - name: Get the CI image
+        if: steps.scope.outputs.needed == 'true'
         env:
           GHCR_TOKEN: ${{ github.token }}
         run: bash ci/scripts/ci-image.sh ensure "space-ci:${GITHUB_SHA}"
 
       - name: Verify third-party Rust dependencies
+        if: steps.scope.outputs.needed == 'true'
         run: >-
           docker run --rm --volume "${GITHUB_WORKSPACE}:/workspace" --workdir /workspace
           --volume "${RUNNER_TEMP}/cargo-home/registry:/usr/local/cargo/registry"
           "space-ci:${GITHUB_SHA}" cargo vet --locked
 
       - name: Check Rust advisories, licenses, and sources
+        if: steps.scope.outputs.needed == 'true'
         run: >-
           docker run --rm --volume "${GITHUB_WORKSPACE}:/workspace" --workdir /workspace
           --volume "${RUNNER_TEMP}/cargo-home/registry:/usr/local/cargo/registry"
@@ -321,6 +378,7 @@ jobs:
           # privileged group then runs as root from the same build, in the
           # "Run the privileged Rust tests" step. See .config/nextest.toml.
           - name: Rust tests
+            scope: rust
             command: bash ci/scripts/run-rust-checks.sh tests-unprivileged
             # The full all-targets/all-features graph exhausts the standard
             # runner's 14 GB disk before linking the workspace test binaries.
@@ -342,6 +400,7 @@ jobs:
             prefetch_crates: true
             timeout: 120
           - name: Go shim
+            scope: go
             command: bash ci/scripts/run-shim-checks.sh
             runner: ubuntu-24.04
             docker_access: false
@@ -350,6 +409,7 @@ jobs:
             go_modules: save
             timeout: 30
           - name: Python tests
+            scope: python
             command: bash ci/scripts/run-python-tests.sh
             runner: ubuntu-24.04
             docker_access: true
@@ -359,6 +419,7 @@ jobs:
             uv_cache_save: true
             timeout: 30
           - name: Shell tests
+            scope: shell
             command: bash ci/scripts/run-shell-tests.sh
             runner: ubuntu-24.04
             docker_access: false
@@ -368,6 +429,7 @@ jobs:
             uv_cache_save: true
             timeout: 30
           - name: Migration guards
+            scope: migrations
             command: >-
               migration_base="$(bash ci/scripts/resolve-migration-base.sh "$SPACE_CI_BASE_SHA" "$SPACE_CI_PULL_REQUEST_HEAD_SHA")" &&
               export BUILDKITE_BUILD_ID=github-actions &&
@@ -386,6 +448,7 @@ jobs:
             uv_cache: shell
             timeout: 15
           - name: Gateway traffic
+            scope: rust
             command: >-
               bash scripts/netgtw/traffic/run.sh &&
               NETGTW_TRAFFIC_SKIP_BUILD=1 python3 scripts/netgtw/traffic/tls-authority/run.py
@@ -412,6 +475,16 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      # Pull CI and the merge queue skip a check the change cannot affect,
+      # and Main CI, which passes no base, runs it (ci/check-scopes/README.md).
+      - name: Decide whether this change needs the check
+        id: scope
+        shell: bash
+        env:
+          SCOPE: ${{ matrix.scope }}
+          SCOPE_BASE: ${{ inputs.scope_base }}
+        run: bash ci/scripts/check-needed.sh "${SCOPE}" "${SCOPE_BASE}" >>"${GITHUB_OUTPUT}"
+
       - *copy-package-cache-helper
 
       # The repository-owned image pins the same toolchain used by the source
@@ -421,6 +494,7 @@ jobs:
       # runs in the background while the next steps fetch the test containers'
       # images and the compiler cache; "Wait for the CI image" reports it.
       - name: Start getting the CI image
+        if: steps.scope.outputs.needed == 'true'
         env:
           GHCR_TOKEN: ${{ github.token }}
         run: >-
@@ -436,7 +510,7 @@ jobs:
       # checkers', and use it only for a changed migration.
       - name: Name the package caches
         id: package-cache-keys
-        if: matrix.cargo_registry || matrix.go_modules || matrix.uv_cache
+        if: ${{ steps.scope.outputs.needed == 'true' && (matrix.cargo_registry || matrix.go_modules || matrix.uv_cache) }}
         env:
           UV_CACHE: ${{ matrix.uv_cache }}
         run: |
@@ -449,7 +523,7 @@ jobs:
 
       - name: Restore the Cargo registry
         id: restore-cargo-registry
-        if: matrix.cargo_registry
+        if: ${{ steps.scope.outputs.needed == 'true' && (matrix.cargo_registry) }}
         continue-on-error: true
         timeout-minutes: 5
         env:
@@ -466,7 +540,7 @@ jobs:
 
       - name: Restore the Go module cache
         id: restore-go-modules
-        if: matrix.go_modules
+        if: ${{ steps.scope.outputs.needed == 'true' && (matrix.go_modules) }}
         continue-on-error: true
         timeout-minutes: 5
         env:
@@ -483,7 +557,7 @@ jobs:
 
       - name: Restore the uv cache
         id: restore-uv-cache
-        if: matrix.uv_cache
+        if: ${{ steps.scope.outputs.needed == 'true' && (matrix.uv_cache) }}
         continue-on-error: true
         timeout-minutes: 5
         env:
@@ -500,7 +574,7 @@ jobs:
       # one would fail every build; one whose checksum is not the lockfile's
       # goes.
       - name: Prepare the package caches
-        if: matrix.cargo_registry || matrix.go_modules || matrix.uv_cache
+        if: ${{ steps.scope.outputs.needed == 'true' && (matrix.cargo_registry || matrix.go_modules || matrix.uv_cache) }}
         env:
           CARGO_REGISTRY: ${{ matrix.cargo_registry }}
           CARGO_KEY: ${{ steps.restore-cargo-registry.outputs.cache-matched-key }}
@@ -529,7 +603,7 @@ jobs:
       # saves time: if it fails, the container's fetch downloads them, as
       # before.
       - name: Start fetching the Rust dependencies
-        if: matrix.prefetch_crates == true
+        if: ${{ steps.scope.outputs.needed == 'true' && (matrix.prefetch_crates == true) }}
         run: >-
           bash ci/scripts/background-step.sh start cargo-fetch
           env RUSTUP_TOOLCHAIN=stable RUSTUP_AUTO_INSTALL=0 CARGO_HOME="${RUNNER_TEMP}/cargo-home"
@@ -543,7 +617,7 @@ jobs:
       # back to the source and never fails the job. Like the CI image, the pull
       # overlaps the cache restores below and is waited for before the run.
       - name: Start pulling the test containers' images
-        if: matrix.docker_access == true || matrix.test_services == true
+        if: ${{ steps.scope.outputs.needed == 'true' && (matrix.docker_access == true || matrix.test_services == true) }}
         env:
           GHCR_TOKEN: ${{ github.token }}
         run: |
@@ -559,7 +633,7 @@ jobs:
       # tries the mirror itself and then Docker Hub; see
       # scripts/check-m1-sdk-generation.sh.
       - name: Start pulling the M1 SDK generator's image
-        if: matrix.name == 'Rust tests'
+        if: ${{ steps.scope.outputs.needed == 'true' && (matrix.name == 'Rust tests') }}
         env:
           GHCR_TOKEN: ${{ github.token }}
         run: >-
@@ -583,7 +657,7 @@ jobs:
       # disables it.
       - name: Name the Cargo target directory
         id: target-key
-        if: matrix.rust_target_cache == true && vars.SPACE_RUST_TARGET_CACHE != 'off'
+        if: ${{ steps.scope.outputs.needed == 'true' && (matrix.rust_target_cache == true && vars.SPACE_RUST_TARGET_CACHE != 'off') }}
         env:
           FAMILY: space-target-v2-${{ runner.os }}-${{ runner.arch }}-${{ matrix.rust_cache_key }}
           HARD: >-
@@ -600,7 +674,7 @@ jobs:
       # Main never restores one: its cold build is what catches an input Cargo
       # was never told about.
       - name: Restore the Cargo target directory
-        if: steps.target-key.outcome == 'success' && github.event_name != 'push'
+        if: ${{ steps.scope.outputs.needed == 'true' && (steps.target-key.outcome == 'success' && github.event_name != 'push') }}
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/space-target-parts
@@ -612,7 +686,7 @@ jobs:
       # Unpacking takes the CPU and disk while the compiler cache's restore
       # below mostly downloads, so the two overlap.
       - name: Start hydrating the Cargo target directory
-        if: steps.target-key.outcome == 'success'
+        if: ${{ steps.scope.outputs.needed == 'true' && (steps.target-key.outcome == 'success') }}
         run: >-
           bash ci/scripts/background-step.sh start target-hydrate
           bash ci/scripts/rust-target-cache.sh hydrate target/buildkite-tests "${RUNNER_TEMP}/space-target-parts"
@@ -624,7 +698,7 @@ jobs:
       # else the newest for any inputs.
       - name: Name the Rust compiler cache
         id: rust-cache-key
-        if: matrix.rust_cache == true
+        if: ${{ steps.scope.outputs.needed == 'true' && (matrix.rust_cache == true) }}
         env:
           FAMILY: space-sccache-v1-${{ runner.os }}-${{ runner.arch }}-${{ matrix.rust_cache_key }}
           INPUTS: >-
@@ -639,7 +713,7 @@ jobs:
 
       - name: Restore the Rust compiler cache
         id: restore-rust-cache
-        if: matrix.rust_cache == true
+        if: ${{ steps.scope.outputs.needed == 'true' && (matrix.rust_cache == true) }}
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/space-sccache
@@ -649,22 +723,23 @@ jobs:
             ${{ steps.rust-cache-key.outputs.family }}
 
       - name: Wait for the Cargo target directory
-        if: steps.target-key.outcome == 'success'
+        if: ${{ steps.scope.outputs.needed == 'true' && (steps.target-key.outcome == 'success') }}
         run: bash ci/scripts/background-step.sh wait target-hydrate
 
       - name: Wait for the CI image
+        if: steps.scope.outputs.needed == 'true'
         run: bash ci/scripts/background-step.sh wait ci-image
 
       # Also when it failed: the two Cargos do not share a lock, so the
       # container's must not start while this one still writes.
       - name: Wait for the Rust dependencies
-        if: matrix.prefetch_crates == true
+        if: ${{ steps.scope.outputs.needed == 'true' && (matrix.prefetch_crates == true) }}
         run: >-
           bash ci/scripts/background-step.sh wait cargo-fetch ||
           echo "::warning::The runner could not fetch the Rust dependencies; the job container fetches them itself"
 
       - name: Wait for the test containers' images
-        if: matrix.docker_access == true || matrix.test_services == true
+        if: ${{ steps.scope.outputs.needed == 'true' && (matrix.docker_access == true || matrix.test_services == true) }}
         run: bash ci/scripts/background-step.sh wait test-images
 
       # The job container has no Docker socket, so its nextest setup scripts
@@ -672,7 +747,7 @@ jobs:
       # this job's, so the stop step removes only what this step created.
       - name: Start the test services
         id: test-services
-        if: matrix.test_services == true
+        if: ${{ steps.scope.outputs.needed == 'true' && (matrix.test_services == true) }}
         env:
           SPACE_CI_TEST_SERVICES_OWNER: ${{ github.run_id }}-${{ github.run_attempt }}-${{ strategy.job-index }}
         run: |
@@ -681,10 +756,11 @@ jobs:
           printf 'env<<EOF\n%s\nEOF\n' "${services}" >>"${GITHUB_OUTPUT}"
 
       - name: Wait for the M1 SDK generator's image
-        if: matrix.name == 'Rust tests'
+        if: ${{ steps.scope.outputs.needed == 'true' && (matrix.name == 'Rust tests') }}
         run: bash ci/scripts/background-step.sh wait m1-generator
 
       - name: Run ${{ matrix.name }}
+        if: steps.scope.outputs.needed == 'true'
         id: run
         env:
           SPACE_CI_COMMAND: ${{ matrix.command }}
@@ -788,8 +864,7 @@ jobs:
 
       - name: Test seed ext4 population
         if: >-
-          !cancelled() && matrix.privileged_tests == true &&
-          (steps.run.outcome == 'success' || steps.run.outcome == 'failure')
+          ${{ steps.scope.outputs.needed == 'true' && (!cancelled() && matrix.privileged_tests == true && (steps.run.outcome == 'success' || steps.run.outcome == 'failure')) }}
         run: |
           docker run --rm --user root --privileged \
             --volume "${GITHUB_WORKSPACE}:/workspace:ro" \
@@ -806,8 +881,7 @@ jobs:
       # reach their containers on the bridge network.
       - name: Run the privileged Rust tests
         if: >-
-          !cancelled() && matrix.privileged_tests == true &&
-          (steps.run.outcome == 'success' || steps.run.outcome == 'failure')
+          ${{ steps.scope.outputs.needed == 'true' && (!cancelled() && matrix.privileged_tests == true && (steps.run.outcome == 'success' || steps.run.outcome == 'failure')) }}
         env:
           SPACE_CI_MAIN_ONLY_TESTS: ${{ inputs.main_only_tests }}
           SPACE_CI_CARGO_REGISTRY: ${{ runner.temp }}/cargo-home/registry
@@ -839,7 +913,7 @@ jobs:
       # Their logs print on every run: a test that fails and then passes on
       # nextest's retry leaves the job green.
       - name: Stop the test services
-        if: always() && matrix.test_services == true
+        if: ${{ steps.scope.outputs.needed == 'true' && (always() && matrix.test_services == true) }}
         env:
           SPACE_CI_TEST_SERVICES_OWNER: ${{ github.run_id }}-${{ github.run_attempt }}-${{ strategy.job-index }}
         run: |
@@ -851,7 +925,7 @@ jobs:
       # Keep the full test-build report: later nextest and doctest invocations
       # reuse its artifacts and would otherwise hide the expensive compilation.
       - name: Upload Rust test build timings
-        if: ${{ !cancelled() && matrix.name == 'Rust tests' }}
+        if: ${{ steps.scope.outputs.needed == 'true' && (!cancelled() && matrix.name == 'Rust tests') }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: rust-test-timings-${{ github.run_attempt }}
@@ -863,7 +937,7 @@ jobs:
       # vanish with the runner. The container writes them as root in 0700
       # directories, so hand them to the runner user first.
       - name: Prepare the Gateway traffic logs for upload
-        if: failure() && matrix.name == 'Gateway traffic'
+        if: ${{ steps.scope.outputs.needed == 'true' && (failure() && matrix.name == 'Gateway traffic') }}
         run: |
           [[ -d target/gateway-traffic ]] || exit 0
           sudo chown -R "$(id -u):$(id -g)" target/gateway-traffic
@@ -871,7 +945,7 @@ jobs:
       # runtime/ holds the fixtures' keys and the test credential; the harness
       # deletes it on a normal exit, and it is never uploaded.
       - name: Upload the Gateway traffic logs
-        if: failure() && matrix.name == 'Gateway traffic'
+        if: ${{ steps.scope.outputs.needed == 'true' && (failure() && matrix.name == 'Gateway traffic') }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: gateway-traffic-${{ github.run_attempt }}
@@ -887,7 +961,7 @@ jobs:
       # deletes superseded snapshots.
       - name: Decide whether to refresh the Rust compiler cache
         id: refresh-rust-cache
-        if: success() && matrix.rust_cache == true
+        if: ${{ steps.scope.outputs.needed == 'true' && (success() && matrix.rust_cache == true) }}
         env:
           KEY: ${{ steps.rust-cache-key.outputs.key }}
           INPUTS_PREFIX: ${{ steps.rust-cache-key.outputs.inputs }}
@@ -902,8 +976,7 @@ jobs:
       # run are ones this commit no longer uses.
       - name: Prepare the Rust compiler cache for upload
         if: >-
-          github.event_name == 'push' && github.ref == 'refs/heads/main' &&
-          steps.refresh-rust-cache.outputs.save == 'true'
+          ${{ steps.scope.outputs.needed == 'true' && (github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.refresh-rust-cache.outputs.save == 'true') }}
         env:
           SPACE_CI_SCCACHE_DIR: ${{ runner.temp }}/space-sccache
           SPACE_CI_SCCACHE_RUN_DIR: ${{ runner.temp }}/space-sccache-run
@@ -919,8 +992,7 @@ jobs:
 
       - name: Save the Rust compiler cache
         if: >-
-          github.event_name == 'push' && github.ref == 'refs/heads/main' &&
-          steps.refresh-rust-cache.outputs.save == 'true'
+          ${{ steps.scope.outputs.needed == 'true' && (github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.refresh-rust-cache.outputs.save == 'true') }}
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/space-sccache
@@ -931,12 +1003,11 @@ jobs:
       - name: Pack the Cargo target directory for upload
         id: pack-target
         if: >-
-          success() && steps.target-key.outcome == 'success' &&
-          github.event_name == 'push' && github.ref == 'refs/heads/main'
+          ${{ steps.scope.outputs.needed == 'true' && (success() && steps.target-key.outcome == 'success' && github.event_name == 'push' && github.ref == 'refs/heads/main') }}
         run: bash ci/scripts/rust-target-cache.sh prepare target/buildkite-tests "${RUNNER_TEMP}/space-target-parts"
 
       - name: Save the Cargo target directory
-        if: steps.pack-target.outputs.save == 'true'
+        if: ${{ steps.scope.outputs.needed == 'true' && (steps.pack-target.outputs.save == 'true') }}
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/space-target-parts
@@ -944,7 +1015,7 @@ jobs:
 
       - name: Report the package caches
         id: report-package-caches
-        if: always() && (matrix.cargo_registry || matrix.go_modules || matrix.uv_cache)
+        if: ${{ steps.scope.outputs.needed == 'true' && (always() && (matrix.cargo_registry || matrix.go_modules || matrix.uv_cache)) }}
         env:
           PACKAGE_CACHE: ${{ runner.temp }}/space-ci-helpers/package-cache.py
           CARGO_REGISTRY: ${{ matrix.cargo_registry }}
@@ -990,10 +1061,7 @@ jobs:
         id: prepare-package-upload
         continue-on-error: true
         if: >-
-          success() && github.event_name == 'push' && github.ref == 'refs/heads/main' &&
-          (steps.report-package-caches.outputs.cargo-save == 'true' ||
-          steps.report-package-caches.outputs.go-save == 'true' ||
-          steps.report-package-caches.outputs.uv-save == 'true')
+          ${{ steps.scope.outputs.needed == 'true' && (success() && github.event_name == 'push' && github.ref == 'refs/heads/main' && (steps.report-package-caches.outputs.cargo-save == 'true' || steps.report-package-caches.outputs.go-save == 'true' || steps.report-package-caches.outputs.uv-save == 'true')) }}
         env:
           PACKAGE_CACHE: ${{ runner.temp }}/space-ci-helpers/package-cache.py
           CARGO_SAVE: ${{ steps.report-package-caches.outputs.cargo-save }}
@@ -1018,8 +1086,7 @@ jobs:
 
       - name: Save the Cargo registry
         if: >-
-          steps.prepare-package-upload.outcome == 'success' &&
-          steps.report-package-caches.outputs.cargo-save == 'true'
+          ${{ steps.scope.outputs.needed == 'true' && (steps.prepare-package-upload.outcome == 'success' && steps.report-package-caches.outputs.cargo-save == 'true') }}
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
@@ -1029,8 +1096,7 @@ jobs:
 
       - name: Save the Go module cache
         if: >-
-          steps.prepare-package-upload.outcome == 'success' &&
-          steps.report-package-caches.outputs.go-save == 'true'
+          ${{ steps.scope.outputs.needed == 'true' && (steps.prepare-package-upload.outcome == 'success' && steps.report-package-caches.outputs.go-save == 'true') }}
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/go-mod/cache/download
@@ -1038,8 +1104,7 @@ jobs:
 
       - name: Save the uv cache
         if: >-
-          steps.prepare-package-upload.outcome == 'success' &&
-          steps.report-package-caches.outputs.uv-save == 'true'
+          ${{ steps.scope.outputs.needed == 'true' && (steps.prepare-package-upload.outcome == 'success' && steps.report-package-caches.outputs.uv-save == 'true') }}
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/uv-cache

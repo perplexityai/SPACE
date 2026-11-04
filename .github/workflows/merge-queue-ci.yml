@@ -69,6 +69,10 @@ jobs:
       contents: read
       packages: read
       pull-requests: read
+    # A merge group's change set is cumulative: it holds every entry ahead of
+    # this one, so a check skips only when none of them touches its inputs.
+    with:
+      scope_base: ${{ github.event.merge_group.base_sha }}
 
   common:
     needs: reuse
@@ -80,6 +84,7 @@ jobs:
       packages: read
     with:
       base_sha: ${{ github.event.merge_group.base_sha }}
+      scope_base: ${{ github.event.merge_group.base_sha }}
 
   space-pull-ci:
     if: always() && github.repository == 'perplexityai/SPACE'
