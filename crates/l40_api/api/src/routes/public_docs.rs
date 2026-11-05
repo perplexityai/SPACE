@@ -564,7 +564,7 @@ fn insert_snapshot_paths(paths: &mut Map<String, Value>) {
         json!({
             "get": {
                 "summary": "List snapshots for a sandbox",
-                "description": "Lists, newest first, the sandbox's snapshot catalog: a backup record for each upload of one of its snapshots to object storage that has begun. A record is listed from the start of its upload, as `creating`, then `ready` or `failed`, so a listed snapshot is not necessarily stored. On the Kubernetes substrate, suspending the sandbox, including an automatic idle suspend, uploads its snapshot, and so do an operator's drain of its node and an operator's upload of the node's local snapshots. On the Direct substrate, a suspend uploads only when the sandbox's node has a snapshot upload destination configured, and nothing else uploads. On either substrate, stopping or checkpointing the sandbox, and periodic snapshots, upload nothing. A checkpoint stays on the sandbox's node and is not listed here, and neither are the copies a fork makes.",
+                "description": "Lists, newest first, the sandbox's snapshots recorded for upload to object storage, including pending (`creating`) and `failed` uploads, so a listed snapshot is not necessarily stored. A checkpoint stays on the sandbox's node and is not listed here.",
                 "parameters": [
                     { "name": "cursor", "in": "query", "required": false, "schema": { "type": "string" } },
                     { "name": "limit", "in": "query", "required": false, "schema": { "type": "integer", "minimum": 1, "maximum": 1000 } }
