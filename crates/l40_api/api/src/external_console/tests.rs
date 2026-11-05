@@ -1240,6 +1240,102 @@ async fn machine_credentials_keep_working_in_external_mode() -> TestResult {
 }
 
 #[tokio::test]
+async fn an_empty_list_allows_no_password_session() -> TestResult {
+    let fixture = fixture().await?;
+    let seeded = &fixture.seeded;
+    let accounts = [
+        (seeded.admin_email.as_str(), seeded.admin_password.as_str()),
+        (
+            seeded.member_email.as_str(),
+            seeded.member_password.as_str(),
+        ),
+        ("nobody@example.test", "any-password"),
+    ];
+
+    // Every way a deployment can end up with no listed account: the variable
+    // unset, empty, or only separators, and the builder given nothing. None
+    // may mean "every account".
+    let mut states = Vec::new();
+    for value in [None, Some(""), Some(" "), Some(" , ,")] {
+        let settings = ExternalConsoleSettings::from_vars(
+            var(CONSOLE_ORIGIN),
+            unset(),
+            unset(),
+            value.map_or_else(unset, var),
+        )?;
+        assert!(settings.password_session_emails().is_empty(), "{value:?}");
+        for (email, _) in accounts {
+            assert!(
+                !settings.allows_password_session(email),
+                "{value:?}: {email}"
+            );
+        }
+        for probe in ["", "*", "@", ","] {
+            assert!(
+                !settings.allows_password_session(probe),
+                "{value:?}: {probe:?}"
+            );
+        }
+        let mut state = fixture.password_state.clone();
+        state.external_console = Some(console(settings));
+        states.push(state);
+    }
+    states.push(fixture.listing(&[])?);
+    states.push(fixture.listing(&["", " "])?);
+
+    for state in states {
+        assert!(!state.password_sessions_possible());
+        let routers = [
+            crate::routes::router(state.clone()),
+            crate::routes::dedicated_admin_router(state.clone()),
+            crate::routes::shared_host_router(state.clone()),
+        ];
+        // Login is refused for every account, right password or not.
+        for app in &routers {
+            for (email, password) in accounts {
+                let (status, body) = Call::new(Method::POST, "/auth/v1/sessions")
+                    .json(serde_json::json!({ "email": email, "password": password }))
+                    .send(app.clone())
+                    .await?;
+                assert_eq!(status, StatusCode::FORBIDDEN, "{email}: {body}");
+                assert!(body.get("token").is_none(), "{body}");
+            }
+        }
+        // Existing sessions of every account authenticate nothing.
+        for (app, uri) in [
+            (&routers[0], "/auth/v1/me"),
+            (&routers[0], "/auth/v1/cluster"),
+            (&routers[0], "/api/v1/sandboxes"),
+            (&routers[1], "/auth/v1/me"),
+            (&routers[1], "/admin/api/v1/orgs"),
+            (&routers[2], "/api/v1/sandboxes"),
+            (&routers[2], "/admin/api/v1/orgs"),
+        ] {
+            for token in [&seeded.admin_session, &seeded.member_session] {
+                let (status, body) = Call::get(uri).bearer(token).send(app.clone()).await?;
+                assert_eq!(status, StatusCode::UNAUTHORIZED, "{uri}: {body}");
+            }
+        }
+        // Logout with a session revokes nothing.
+        let (status, _) = Call::new(Method::DELETE, "/auth/v1/session")
+            .bearer(&seeded.admin_session)
+            .send(routers[0].clone())
+            .await?;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+    assert_eq!(
+        session_count(&fixture.password_state.pool, seeded.admin_id).await?,
+        1
+    );
+    assert_eq!(
+        session_count(&fixture.password_state.pool, seeded.member_id).await?,
+        1
+    );
+    assert!(session_exists(&fixture.password_state.pool, &seeded.admin_session).await?);
+    Ok(())
+}
+
+#[tokio::test]
 async fn listed_password_sessions_work_beside_external_sign_in() -> TestResult {
     let fixture = fixture().await?;
     let seeded = &fixture.seeded;
