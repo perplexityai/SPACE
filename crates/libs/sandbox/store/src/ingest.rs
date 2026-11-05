@@ -34,11 +34,7 @@ use pplx_space_common_core::types::{
 use std::sync::LazyLock;
 
 use pplx_space_common_core::sql;
-use pplx_space_sandbox_portability::{
-    SuspendedTargetNodeAssignment, node_published_execution_identity_matches,
-    publish_clear_or_preserve_current_local_artifact_marker_assignments,
-    suspended_k8s_finalization_sql,
-};
+use pplx_space_sandbox_portability::node_published_execution_identity_matches;
 use sqlx::types::{Json, JsonValue};
 use uuid::Uuid;
 
@@ -183,8 +179,8 @@ pub struct SuspendedFinalizationCandidate {
 /// sandbox suspended, or reported its suspend backup ready.
 ///
 /// One statement retires the active execution, resets open port exposures
-/// to pending and writes the suspended assignments
-/// ([`suspended_k8s_finalization_sql`]) with the artifact marker published,
+/// to pending and leaves the row `suspended` and unplaced, backfilling its
+/// target node from its active node, with the artifact marker published,
 /// cleared or kept. A candidate with a published artifact finalizes only
 /// when its active execution is the exact one the node published from
 /// ([`node_published_execution_identity_matches`]); one without finalizes
@@ -197,20 +193,6 @@ pub async fn finalize_suspended(
     executor: impl sqlx::PgExecutor<'_>,
     candidates: &[SuspendedFinalizationCandidate],
 ) -> Result<Vec<(SandboxId, bool)>, sqlx::Error> {
-    let artifact_marker_assignments =
-        publish_clear_or_preserve_current_local_artifact_marker_assignments(
-            "s",
-            "candidate.published_artifact_id",
-            "candidate.published_artifact_kind",
-            "candidate.published_artifact_origin",
-            "candidate.clear_marker",
-        );
-    let finalization = suspended_k8s_finalization_sql(
-        "s",
-        "candidate",
-        &artifact_marker_assignments,
-        SuspendedTargetNodeAssignment::PreserveOrBackfillActive,
-    );
     let candidate_ids = candidates
         .iter()
         .map(|candidate| candidate.sandbox_id)
@@ -273,7 +255,16 @@ pub async fn finalize_suspended(
                 .map(|identity| identity.pod_uid_was_missing)
         })
         .collect::<Vec<_>>();
-    let candidate_cte = "candidate AS (
+    /// Built once: every input is a literal or a bind placeholder.
+    static FINALIZATION_QUERY: LazyLock<String> = LazyLock::new(|| {
+        let exact_execution_identity = node_published_execution_identity_matches(
+            "e",
+            "candidate.published_execution_generation",
+            "candidate.published_pod_uid",
+            "candidate.published_pod_uid_was_missing",
+        );
+        sql!(format!(
+            "WITH candidate AS (
              SELECT *
                FROM UNNEST(
                    $1::UUID[], $2::BOOL[], $3::UUID[], $4::TEXT[], $5::TEXT[],
@@ -284,18 +275,14 @@ pub async fn finalize_suspended(
                    published_execution_generation, published_pod_uid,
                    published_pod_uid_was_missing
                )
-         )";
-    let exact_execution_identity = node_published_execution_identity_matches(
-        "e",
-        "candidate.published_execution_generation",
-        "candidate.published_pod_uid",
-        "candidate.published_pod_uid_was_missing",
-    );
-    let finalization_query = format!(
-        "WITH {candidate_cte},
+         ),
          retired_execution AS (
              UPDATE sandbox_k8s_executions e
-                SET {active_execution_assignments}
+                SET active = FALSE,\n\
+                    state = 'suspended',\n\
+                    pod_ip = NULL,\n\
+                    terminated_at = COALESCE(e.terminated_at, NOW()),\n\
+                    updated_at = NOW()
                FROM candidate
               WHERE e.sandbox_id = candidate.id
                 AND e.active
@@ -317,22 +304,45 @@ pub async fn finalize_suspended(
          ),
          reset_port_exposures AS (
              UPDATE sandbox_port_exposures spe
-                SET {open_port_exposure_assignments}
+                SET apply_state = 'pending',\n\
+                    last_applied_node_id = NULL,\n\
+                    last_error = NULL,\n\
+                    last_bridge_status = NULL,\n\
+                    last_applied_bridge_generation = NULL,\n\
+                    last_observed_at = NULL,\n\
+                    updated_at = NOW()
                FROM eligible_candidate candidate
               WHERE spe.sandbox_id = candidate.id
                 AND spe.desired_state = 'open'
              RETURNING spe.sandbox_id
          )
          UPDATE sandboxes s
-            SET {sandbox_assignments}
+            SET lifecycle = 'suspended',
+                    placement = 'unplaced',
+                    active_node_id = NULL,
+                    command_ready_pending = FALSE,
+                    target_node_id = COALESCE(s.target_node_id, s.active_node_id),
+                    current_local_artifact_id = CASE
+             WHEN candidate.published_artifact_id IS NOT NULL THEN candidate.published_artifact_id
+             WHEN candidate.clear_marker THEN NULL
+             ELSE s.current_local_artifact_id
+         END,
+         current_local_artifact_kind = CASE
+             WHEN candidate.published_artifact_id IS NOT NULL THEN candidate.published_artifact_kind
+             WHEN candidate.clear_marker THEN NULL
+             ELSE s.current_local_artifact_kind
+         END,
+         current_local_artifact_origin = CASE
+             WHEN candidate.published_artifact_id IS NOT NULL THEN candidate.published_artifact_origin
+             WHEN candidate.clear_marker THEN NULL
+             ELSE s.current_local_artifact_origin
+         END
            FROM eligible_candidate candidate
           WHERE s.id = candidate.id
-          RETURNING s.id, candidate.clear_marker",
-        active_execution_assignments = finalization.active_execution_assignments("e"),
-        open_port_exposure_assignments = finalization.open_port_exposure_assignments(),
-        sandbox_assignments = finalization.sandbox_assignments(),
-    );
-    sqlx::query_as(sqlx::AssertSqlSafe(sql!(finalization_query.as_str())))
+          RETURNING s.id, candidate.clear_marker"
+        ))
+    });
+    sqlx::query_as(sqlx::AssertSqlSafe(FINALIZATION_QUERY.as_str()))
         .bind(&candidate_ids)
         .bind(&clear_markers)
         .bind(&published_artifact_ids)

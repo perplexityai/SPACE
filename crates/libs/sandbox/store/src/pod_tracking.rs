@@ -12,10 +12,12 @@
 
 use pplx_space_common_core::types::{ExecutionGeneration, SandboxId};
 
+use std::sync::LazyLock;
+
 use pplx_space_common_core::sql;
 use pplx_space_sandbox_portability::{
-    clear_current_local_artifact_marker_assignments, failed_repair_revert_eligibility,
-    restore_retry_suspended_revert_snapshot_exists, started_suspend_revert_eligibility,
+    failed_repair_revert_eligibility, restore_retry_suspended_revert_snapshot_exists,
+    started_suspend_revert_eligibility,
 };
 use sqlx::{Postgres, Transaction};
 
@@ -169,10 +171,35 @@ async fn recover_started_with_current_suspend_snapshot(
     sandbox_id: SandboxId,
     proof: StartedSuspendRecoveryProof,
 ) -> Result<bool, sqlx::Error> {
-    let (generation, execution_proof) = match proof {
-        StartedSuspendRecoveryProof::ExecutionRetired => (
-            None,
-            "NOT EXISTS (
+    /// Built once: every input is a literal or a bind placeholder.
+    static EXECUTION_RETIRED_QUERY: LazyLock<String> = LazyLock::new(|| {
+        let eligibility = started_suspend_revert_eligibility("s");
+        sql!(format!(
+            "WITH args AS (
+                 SELECT $2::BIGINT AS generation
+             ),
+             pre AS (
+                 SELECT id,
+                        {clear_marker} AS clear_marker
+                   FROM sandboxes s
+                  WHERE s.id = $1
+             )
+             UPDATE sandboxes s
+                SET lifecycle = 'suspended',
+                    placement = 'unplaced',
+                    active_node_id = NULL,
+                    target_node_id = NULL,
+                    placement_changed_at = NULL,
+                    command_ready_pending = FALSE,
+                    current_local_artifact_id = CASE WHEN pre.clear_marker THEN NULL ELSE s.current_local_artifact_id END,\n\
+                    current_local_artifact_kind = CASE WHEN pre.clear_marker THEN NULL ELSE s.current_local_artifact_kind END,\n\
+                    current_local_artifact_origin = CASE WHEN pre.clear_marker THEN NULL ELSE s.current_local_artifact_origin END
+               FROM pre, args
+              WHERE s.id = pre.id
+                AND s.lifecycle = 'started'
+                AND s.placement = 'unplaced'
+                AND s.active_node_id IS NULL
+                AND NOT EXISTS (
                     SELECT 1
                       FROM sandbox_k8s_executions e
                      WHERE e.sandbox_id = s.id
@@ -183,11 +210,41 @@ async fn recover_started_with_current_suspend_snapshot(
                       FROM sandbox_k8s_executions e
                      WHERE e.sandbox_id = s.id
                        AND e.pod_ip IS NOT NULL
-                 )",
-        ),
-        StartedSuspendRecoveryProof::FailedRecovery { generation } => (
-            Some(generation.get()),
-            "EXISTS (
+                 )
+                AND {eligible}",
+            clear_marker = eligibility.clear_marker,
+            eligible = eligibility.eligible,
+        ))
+    });
+    /// Built once: every input is a literal or a bind placeholder.
+    static FAILED_RECOVERY_QUERY: LazyLock<String> = LazyLock::new(|| {
+        let eligibility = failed_repair_revert_eligibility("s");
+        sql!(format!(
+            "WITH args AS (
+                 SELECT $2::BIGINT AS generation
+             ),
+             pre AS (
+                 SELECT id,
+                        {clear_marker} AS clear_marker
+                   FROM sandboxes s
+                  WHERE s.id = $1
+             )
+             UPDATE sandboxes s
+                SET lifecycle = 'suspended',
+                    placement = 'unplaced',
+                    active_node_id = NULL,
+                    target_node_id = NULL,
+                    placement_changed_at = NULL,
+                    command_ready_pending = FALSE,
+                    current_local_artifact_id = CASE WHEN pre.clear_marker THEN NULL ELSE s.current_local_artifact_id END,\n\
+                    current_local_artifact_kind = CASE WHEN pre.clear_marker THEN NULL ELSE s.current_local_artifact_kind END,\n\
+                    current_local_artifact_origin = CASE WHEN pre.clear_marker THEN NULL ELSE s.current_local_artifact_origin END
+               FROM pre, args
+              WHERE s.id = pre.id
+                AND s.lifecycle = 'started'
+                AND s.placement = 'unplaced'
+                AND s.active_node_id IS NULL
+                AND EXISTS (
                     SELECT 1
                       FROM sandbox_k8s_executions e
                      WHERE e.sandbox_id = s.id
@@ -204,44 +261,19 @@ async fn recover_started_with_current_suspend_snapshot(
                      WHERE newer.sandbox_id = s.id
                        AND newer.active
                        AND newer.generation > args.generation
-                 )",
-        ),
+                 )
+                AND {eligible}",
+            clear_marker = eligibility.clear_marker,
+            eligible = eligibility.eligible,
+        ))
+    });
+    let (generation, query) = match proof {
+        StartedSuspendRecoveryProof::ExecutionRetired => (None, &*EXECUTION_RETIRED_QUERY),
+        StartedSuspendRecoveryProof::FailedRecovery { generation } => {
+            (Some(generation.get()), &*FAILED_RECOVERY_QUERY)
+        }
     };
-    let eligibility = match proof {
-        StartedSuspendRecoveryProof::ExecutionRetired => started_suspend_revert_eligibility("s"),
-        StartedSuspendRecoveryProof::FailedRecovery { .. } => failed_repair_revert_eligibility("s"),
-    };
-    let clear_marker = eligibility.clear_marker;
-    let eligible = eligibility.eligible;
-    let artifact_marker_assignments =
-        clear_current_local_artifact_marker_assignments("s", "pre.clear_marker");
-    let query = format!(
-        "WITH args AS (
-                 SELECT $2::BIGINT AS generation
-             ),
-             pre AS (
-                 SELECT id,
-                        {clear_marker} AS clear_marker
-                   FROM sandboxes s
-                  WHERE s.id = $1
-             )
-             UPDATE sandboxes s
-                SET lifecycle = 'suspended',
-                    placement = 'unplaced',
-                    active_node_id = NULL,
-                    target_node_id = NULL,
-                    placement_changed_at = NULL,
-                    command_ready_pending = FALSE,
-                    {artifact_marker_assignments}
-               FROM pre, args
-              WHERE s.id = pre.id
-                AND s.lifecycle = 'started'
-                AND s.placement = 'unplaced'
-                AND s.active_node_id IS NULL
-                AND {execution_proof}
-                AND {eligible}"
-    );
-    let result = sqlx::query(sqlx::AssertSqlSafe(sql!(query.as_str())))
+    let result = sqlx::query(sqlx::AssertSqlSafe(query.as_str()))
         .bind(sandbox_id)
         .bind(generation)
         .execute(&mut **tx)
