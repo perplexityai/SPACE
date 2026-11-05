@@ -798,10 +798,14 @@ fn remove_cgroup_path(cgroup_path: &Path) -> Result<CgroupPathCleanupReport, Cgr
         Err(error) => return Err(fail(error)),
         Ok(_) => {}
     }
+    // Read before any removal: the counters go with the directory.
+    let oom_events = read_memory_oom_events(&cgroup_path.join("memory.events"));
     // Killing tasks does not remove descendant cgroup directories.
     let child_cgroups_removed = remove_child_cgroups(cgroup_path);
     match fs::remove_dir(cgroup_path) {
-        Ok(()) => {}
+        // Only the removal that succeeds reports, so a retried removal
+        // never counts the same kills twice.
+        Ok(()) => record_sandbox_oom_kills(cgroup_path, oom_events),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(fail(error)),
     }
@@ -812,6 +816,87 @@ fn remove_cgroup_path(cgroup_path: &Path) -> Result<CgroupPathCleanupReport, Cgr
         child_cgroups_removed,
         ..Default::default()
     })
+}
+
+/// OOM counters from a cgroup v2 `memory.events`, which include the
+/// cgroup's descendants.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct MemoryOomEvents {
+    /// Times the cgroup or a descendant reached its `memory.max`.
+    oom: u64,
+    /// Processes any OOM killer ended in the cgroup or a descendant.
+    oom_kill: u64,
+}
+
+impl MemoryOomEvents {
+    /// Whose limit forced the kills, judged from a sandbox cgroup's
+    /// hierarchical `memory.events`. Kills with no limit hit in the sandbox's
+    /// own tree came from above it: the sandbox parent or the host.
+    fn sandbox_cause(self) -> Option<pplx_space_metrics::node_memory::SandboxOomCause> {
+        use pplx_space_metrics::node_memory::SandboxOomCause;
+        (self.oom_kill > 0).then_some(if self.oom > 0 {
+            SandboxOomCause::SandboxLimit
+        } else {
+            SandboxOomCause::NodePressure
+        })
+    }
+}
+
+fn read_memory_oom_events(path: &Path) -> std::io::Result<MemoryOomEvents> {
+    parse_memory_oom_events(&fs::read_to_string(path)?).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "missing or invalid oom or oom_kill field",
+        )
+    })
+}
+
+fn parse_memory_oom_events(contents: &str) -> Option<MemoryOomEvents> {
+    let field = |name: &str| {
+        contents.lines().find_map(|line| {
+            let mut fields = line.split_whitespace();
+            (fields.next() == Some(name))
+                .then(|| fields.next()?.parse::<u64>().ok())
+                .flatten()
+        })
+    };
+    Some(MemoryOomEvents {
+        oom: field("oom")?,
+        oom_kill: field("oom_kill")?,
+    })
+}
+
+/// Reports OOM kills in a sandbox cgroup that has just been removed, once
+/// per cgroup, with the sandbox id in the log line rather than the metric.
+fn record_sandbox_oom_kills(cgroup_path: &Path, events: std::io::Result<MemoryOomEvents>) {
+    use pplx_space_metrics::node_memory::{SandboxOomCgroup, sandbox_oom_kills};
+    let events = match events {
+        Ok(events) => events,
+        Err(error) => {
+            tracing::debug!(cgroup = %cgroup_path.display(), %error, "cannot read sandbox cgroup OOM events");
+            return;
+        }
+    };
+    let Some(cause) = events.sandbox_cause() else {
+        return;
+    };
+    let name = cgroup_path
+        .file_name()
+        .map(|name| name.to_string_lossy())
+        .unwrap_or_default();
+    let (cgroup, sandbox_id) = match name.strip_prefix("sbx-") {
+        Some(sandbox_id) => (SandboxOomCgroup::Sidecar, sandbox_id),
+        None => (SandboxOomCgroup::Vm, name.as_ref()),
+    };
+    sandbox_oom_kills(cgroup, cause, events.oom_kill);
+    tracing::warn!(
+        sandbox_id,
+        cgroup = %cgroup,
+        cause = %cause,
+        oom_kills = events.oom_kill,
+        limit_hits = events.oom,
+        "sandbox cgroup had OOM kills"
+    );
 }
 
 fn request_cgroup_kill(cgroup_path: &Path) -> bool {

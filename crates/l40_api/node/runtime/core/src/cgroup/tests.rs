@@ -363,3 +363,62 @@ fn legacy_cpu_updates_only_reduce_the_current_rate() {
     std::fs::remove_file(path).unwrap();
     cpu_quota_is_nonincreasing_at(directory.path(), 1).unwrap_err();
 }
+
+#[test]
+fn oom_events_parse_from_kernel_memory_events() {
+    let events =
+        parse_memory_oom_events("low 0\nhigh 4\nmax 9\noom 2\noom_kill 3\noom_group_kill 0\n");
+
+    assert_eq!(
+        events,
+        Some(MemoryOomEvents {
+            oom: 2,
+            oom_kill: 3
+        })
+    );
+    assert_eq!(parse_memory_oom_events("low 0\noom 1\n"), None);
+}
+
+#[test]
+fn oom_cause_separates_sandbox_limit_from_node_pressure() {
+    use pplx_space_metrics::node_memory::SandboxOomCause;
+
+    let cause = |oom, oom_kill| MemoryOomEvents { oom, oom_kill }.sandbox_cause();
+
+    assert_eq!(cause(1, 1), Some(SandboxOomCause::SandboxLimit));
+    assert_eq!(cause(0, 1), Some(SandboxOomCause::NodePressure));
+    assert_eq!(cause(1, 0), None);
+}
+
+#[test]
+fn removed_sandbox_cgroups_report_oom_kills_by_cgroup_and_cause() {
+    let events = |oom, oom_kill| Ok(MemoryOomEvents { oom, oom_kill });
+    let capture = pplx_space_metrics::test_capture::capture_counters_guard();
+    record_sandbox_oom_kills(Path::new("/sys/fs/cgroup/space/sbx-a"), events(0, 0));
+    record_sandbox_oom_kills(Path::new("/sys/fs/cgroup/space/a"), events(1, 1));
+    record_sandbox_oom_kills(Path::new("/sys/fs/cgroup/space/sbx-b"), events(0, 2));
+    let counters = capture.finish();
+
+    let reported: Vec<_> = counters
+        .iter()
+        .map(|counter| (counter.name.as_str(), counter.value, counter.tags.clone()))
+        .collect();
+    assert_eq!(
+        reported,
+        [
+            (
+                "node_memory.sandbox_oom_kills",
+                1,
+                vec!["cgroup:vm".to_string(), "cause:sandbox_limit".to_string()]
+            ),
+            (
+                "node_memory.sandbox_oom_kills",
+                2,
+                vec![
+                    "cgroup:sidecar".to_string(),
+                    "cause:node_pressure".to_string()
+                ]
+            ),
+        ]
+    );
+}
