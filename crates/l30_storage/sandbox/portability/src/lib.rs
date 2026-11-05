@@ -1268,18 +1268,14 @@ pub fn missing_suspending_pod_revert_eligibility(sandbox_alias: &str) -> Suspend
     suspend_revert_eligibility(sandbox_alias, marker_current, newest_current)
 }
 
-/// Repair-loop variant of [`started_suspend_revert_eligibility`]: the marker
-/// branch trusts an exact durable backup even when the snapshot predates
-/// `lifecycle_changed_at` (see [`exact_marker_snapshot_backup_current`]).
-///
-/// Only for the orphaned-sandbox reconciler: its disposition read
-/// (`plan_orphan_in_tx` in the cluster controller), whose answer also decides
-/// whether an abandoned create is deleted, and its recovery and quarantine
-/// writes (`pplx_space_sandbox_store::orphan`). It acts on the answer only
-/// after its grace period, for a row whose active execution's pod is missing,
-/// terminal or unready (being deleted included), or whose latest execution is
-/// `forgotten`. Always-on projections must use the default variant.
-pub fn started_repair_revert_eligibility(sandbox_alias: &str) -> SuspendRevertEligibility {
+/// Orphaned-sandbox variant of [`started_suspend_revert_eligibility`]: the
+/// marker branch trusts an exact durable backup even when the snapshot
+/// predates `lifecycle_changed_at` (see
+/// [`exact_marker_snapshot_backup_current`]). Use it only for a row whose pod
+/// is confirmed missing, terminal or unready past a grace period, or whose
+/// latest execution is `forgotten`. Always-on projections must use the default
+/// variant.
+pub fn orphan_recovery_revert_eligibility(sandbox_alias: &str) -> SuspendRevertEligibility {
     let marker_current = exact_marker_snapshot_backup_current(sandbox_alias);
     let newest_current = newest_suspend_snapshot_current(sandbox_alias);
     suspend_revert_eligibility(sandbox_alias, marker_current, newest_current)

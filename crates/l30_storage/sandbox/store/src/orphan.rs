@@ -16,7 +16,7 @@
 use pplx_space_common_core::types::{NodeId, PodUid, SandboxId, SandboxLifecycle};
 
 use pplx_space_common_core::sql;
-use pplx_space_sandbox_portability::started_repair_revert_eligibility;
+use pplx_space_sandbox_portability::orphan_recovery_revert_eligibility;
 use sqlx::{Postgres, Transaction};
 
 /// The classification guard a statement here re-checks, with the values it
@@ -85,7 +85,7 @@ pub async fn recover_orphan_to_suspended(
     stop_lifecycles: &[&str],
     guard: &OrphanGuard<'_>,
 ) -> Result<Option<OrphanResolution>, sqlx::Error> {
-    let eligibility = started_repair_revert_eligibility("s");
+    let eligibility = orphan_recovery_revert_eligibility("s");
     let clear_marker = eligibility.clear_marker;
     let eligible = eligibility.eligible;
     let guard_sql = classify_guard_sql(guard);
@@ -175,7 +175,7 @@ pub async fn quarantine_orphan(
     stop_lifecycles: &[&str],
     guard: &OrphanGuard<'_>,
 ) -> Result<Option<OrphanResolution>, sqlx::Error> {
-    let eligibility = started_repair_revert_eligibility("s");
+    let eligibility = orphan_recovery_revert_eligibility("s");
     let eligible = eligibility.eligible;
     let artifact_predicate = if matches!(guard, OrphanGuard::LegacyDeleting) {
         "TRUE".to_string()

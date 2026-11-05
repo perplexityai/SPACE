@@ -67,7 +67,7 @@ use pplx_space_events::{
 use pplx_space_metrics::sandbox::api::reconciler::{
     self as reconciler_metrics, ClassificationOutcome, ClassificationReason, PodEvidence,
 };
-use pplx_space_sandbox_portability::started_repair_revert_eligibility;
+use pplx_space_sandbox_portability::orphan_recovery_revert_eligibility;
 use pplx_space_sandbox_store::orphan::{
     self, OrphanGuard, classify_guard_from_sql, classify_guard_lock_sql, classify_guard_sql,
 };
@@ -1561,7 +1561,7 @@ async fn plan_orphan_in_tx(
     guard: &ClassifyGuard,
     lock: bool,
 ) -> Result<Option<OrphanPlan>, sqlx::Error> {
-    let eligibility = started_repair_revert_eligibility("s");
+    let eligibility = orphan_recovery_revert_eligibility("s");
     let recoverable = eligibility.eligible;
     let store_guard = guard.store_guard();
     let guard_sql = classify_guard_sql(&store_guard);
