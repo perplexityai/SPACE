@@ -598,6 +598,16 @@ pub async fn converge_published_stopped(
 /// runs it after [`converge_published_stopped`], so a row that convergence
 /// just moved out of `started` takes its attribution in the same publication.
 /// A node that publishes no attribution leaves the stored one alone.
+///
+/// The order is the publishing nodes' wall clocks, which this assumes are
+/// NTP-synced. Where they aren't, a newer attribution can lose to an older
+/// one: a crash stores `vm_exited`, the stopped sandbox moves to a node whose
+/// clock is behind, and a requested stop interrupts a start there before it
+/// reaches `started`; that "none" is older by its node's clock and is
+/// rejected, so the old crash stays shown. A backward clock step on one node
+/// does the same. It takes the crash, the move and the interrupted start
+/// within the nodes' skew, and a start that does reach `started` clears the
+/// cause through the trigger.
 pub async fn record_published_stop_attributions(
     executor: impl sqlx::PgExecutor<'_>,
     node_id: NodeId,

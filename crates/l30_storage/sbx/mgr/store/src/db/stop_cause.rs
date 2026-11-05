@@ -5,8 +5,10 @@
 //! a requested stop, with this node's time of that stop. A stop that
 //! re-admits a row another stop already owns keeps that stop's. The
 //! `clear_stop_attribution_when_running` trigger drops it when any writer
-//! moves the row to `started` or `paused`. A `stopped` row publishes it, and
-//! the control plane applies a newer one whatever its own lifecycle says.
+//! moves the row to `started` or `paused`. A `stopped` row publishes it. The
+//! control plane applies a newer one to its row for the sandbox when that row
+//! is on the publishing node and isn't `started` or `paused`, whatever else
+//! its lifecycle says; it ignores the attribution otherwise.
 
 use super::*;
 
