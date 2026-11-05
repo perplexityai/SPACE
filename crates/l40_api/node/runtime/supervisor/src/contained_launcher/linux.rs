@@ -347,6 +347,8 @@ fn prepare_and_exec(config: &Config, stream: &mut Option<UnixStream>) -> Result<
 
 fn drop_privileges(uid: u32, gid: u32) -> Result<(), Error> {
     use nix::sys::resource::{Resource, setrlimit};
+    pplx_space_common_core::host::linux::prefer_for_oom_kill()
+        .map_err(io("prefer runtime for OOM kill"))?;
     setrlimit(Resource::RLIMIT_CORE, 0, 0).map_err(sys("disable core dumps"))?;
     setrlimit(
         Resource::RLIMIT_NOFILE,

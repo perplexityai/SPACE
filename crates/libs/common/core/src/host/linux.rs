@@ -33,6 +33,38 @@ pub fn signal_pidfd(
 /// File-descriptor limit applied to Firecracker and sandbox sidecar processes.
 pub const SANDBOX_PROCESS_NOFILE_LIMIT: u64 = 4096;
 
+/// Mark the calling process as the host OOM killer's first choice by setting
+/// its `oom_score_adj` to the maximum, 1000. Firecracker and sandbox sidecars
+/// run with this score so host memory pressure kills sandboxes before node
+/// services. Raising the score needs no privilege.
+///
+/// Async-signal-safe: it calls only `open`, `write` and `close` on a static
+/// path and buffer, so it may run in a `pre_exec` hook.
+#[cfg(target_os = "linux")]
+pub fn prefer_for_oom_kill() -> std::io::Result<()> {
+    const SCORE: &[u8] = b"1000";
+    // SAFETY: the path is a static NUL-terminated string.
+    let fd = unsafe {
+        libc::open(
+            c"/proc/self/oom_score_adj".as_ptr(),
+            libc::O_WRONLY | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `fd` is open and the buffer is a static slice.
+    let written = unsafe { libc::write(fd, SCORE.as_ptr().cast(), SCORE.len()) };
+    let result = match usize::try_from(written) {
+        Ok(len) if len == SCORE.len() => Ok(()),
+        Ok(_) => Err(std::io::ErrorKind::WriteZero.into()),
+        Err(_) => Err(std::io::Error::last_os_error()),
+    };
+    // SAFETY: `fd` is open and owned here; nothing uses it after close.
+    unsafe { libc::close(fd) };
+    result
+}
+
 /// SPACE node Linux filesystem paths.
 pub mod paths {
     use std::path::{Path, PathBuf};
