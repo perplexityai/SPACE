@@ -231,4 +231,25 @@ runtime_action="$RUNTIME_SUPERVISOR_ACTION"
 log_init "runtime-supervisor action=${runtime_action} binary_changed=${runtime_supervisor_binary_changed} unit_changed=${runtime_supervisor_unit_changed} elapsed_ms=$(elapsed_ms "$runtime_action_started_ms")"
 log_init "runtime-supervisor health action=ready"
 
+# Node-manager caps the sandbox parent cgroup at host memory less a reserve
+# (1/16 of host memory, at least 8 GiB; see cgroup::host_memory_reserve_mib).
+# Protect half of that reserve from reclaim, split between the host services
+# (kubelet, containerd, SSM, the runtime supervisor) and the node pods, so
+# sandbox memory pressure cannot evict their working sets.
+memory_protection_started_ms="$(now_ms)"
+host_memory_mib=$(( $(awk '/^MemTotal:/ {print $2}' /proc/meminfo) / 1024 ))
+host_memory_reserve_mib=$(( host_memory_mib / 16 > 8192 ? host_memory_mib / 16 : 8192 ))
+node_service_memory_min_mib=$(( host_memory_reserve_mib / 4 ))
+for slice in system.slice kubepods.slice; do
+  # kubepods.slice exists only under kubelet's systemd cgroup driver.
+  if nsenter --target 1 --mount --uts --ipc --net --pid -- systemctl is-active --quiet "$slice"; then
+    nsenter --target 1 --mount --uts --ipc --net --pid -- \
+      systemctl set-property "$slice" "MemoryMin=${node_service_memory_min_mib}M"
+    log_init "memory-min slice=${slice} mib=${node_service_memory_min_mib} action=set"
+  else
+    log_init "memory-min slice=${slice} action=skipped reason=inactive"
+  fi
+done
+log_init "memory-min elapsed_ms=$(elapsed_ms "$memory_protection_started_ms")"
+
 log_init "complete elapsed_ms=$(elapsed_ms "$init_started_ms") installed=${installed_count} reused=${reused_count} skipped=${skipped_count}"
