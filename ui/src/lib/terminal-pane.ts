@@ -118,6 +118,26 @@ export class TerminalInputGate {
   }
 }
 
+// A terminal that becomes unavailable (the sandbox stopped, say) ends its
+// session, including one whose open is still pending: ending it supersedes
+// the open, which then closes the connection it gets.
+export function shouldEndSessionOnDisable(enabled: boolean, hasConnection: boolean, connecting: boolean): boolean {
+  return !enabled && (hasConnection || connecting);
+}
+
+// Each Connect opens at a generation, and ending the session advances it. A
+// connection that opens after its generation was superseded is closed, and
+// null is returned; the current generation's connection is returned to keep.
+export function keepCurrentConnection<C extends { close(): void }>(
+  connection: C,
+  generation: number,
+  currentGeneration: number,
+): C | null {
+  if (generation === currentGeneration) return connection;
+  connection.close();
+  return null;
+}
+
 // xterm hands some reports (X10 mouse coordinates past column 95) as a binary
 // string, one byte per UTF-16 unit; UTF-8 encoding them would change them.
 export function binaryStringToBytes(data: string): Uint8Array {

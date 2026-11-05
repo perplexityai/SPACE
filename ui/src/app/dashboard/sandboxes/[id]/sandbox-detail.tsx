@@ -52,6 +52,8 @@ import {
   binaryStringToBytes,
   debounce,
   isMacPlatform,
+  keepCurrentConnection,
+  shouldEndSessionOnDisable,
   TERMINAL_ENV,
   TERMINAL_RESIZE_DEBOUNCE_MS,
   TERMINAL_SHELL_COMMAND,
@@ -1025,7 +1027,7 @@ function TerminalCard({ sandbox, ownOrg }: { sandbox: Sandbox; ownOrg: boolean }
   }, [loadAttempt]);
 
   useEffect(() => {
-    if (!terminalEnabled && connectionRef.current) {
+    if (shouldEndSessionOnDisable(terminalEnabled, connectionRef.current !== null, connecting)) {
       endSession();
       setStatus('closed');
     }
@@ -1080,12 +1082,10 @@ function TerminalCard({ sandbox, ownOrg }: { sandbox: Sandbox; ownOrg: boolean }
           ownOrg,
         },
       );
-      if (generation !== generationRef.current) {
-        connection.close();
-        return;
-      }
-      connectionRef.current = connection;
-      setSessionId(connection.sessionId);
+      const current = keepCurrentConnection(connection, generation, generationRef.current);
+      if (!current) return;
+      connectionRef.current = current;
+      setSessionId(current.sessionId);
     } catch (err: any) {
       if (generation !== generationRef.current) return;
       endSession();

@@ -10,6 +10,8 @@ import {
   binaryStringToBytes,
   debounce,
   isMacPlatform,
+  keepCurrentConnection,
+  shouldEndSessionOnDisable,
   terminalEventText,
   terminalKeyAction,
   terminalLinkUrl,
@@ -212,6 +214,28 @@ function runShellCommand(env, input) {
     env, input, encoding: 'utf8', timeout: 3000,
   });
 }
+
+test('a terminal that becomes unavailable ends a session that is attached or still connecting', () => {
+  // A Connect still waiting on its open has no connection yet; ending it
+  // supersedes the open, which then closes what it opened.
+  assert.equal(shouldEndSessionOnDisable(false, false, true), true);
+  assert.equal(shouldEndSessionOnDisable(false, true, false), true);
+  assert.equal(shouldEndSessionOnDisable(false, false, false), false);
+  assert.equal(shouldEndSessionOnDisable(true, true, false), false);
+  assert.equal(shouldEndSessionOnDisable(true, false, true), false);
+});
+
+test('a connection that opens after its session was superseded is closed, not kept', () => {
+  const opened = () => ({ closed: 0, close() { this.closed += 1; } });
+
+  const current = opened();
+  assert.equal(keepCurrentConnection(current, 3, 3), current);
+  assert.equal(current.closed, 0);
+
+  const late = opened();
+  assert.equal(keepCurrentConnection(late, 3, 4), null);
+  assert.equal(late.closed, 1);
+});
 
 test('the shell command finds bash on PATH first, and keeps PATH', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'terminal-shell-'));
