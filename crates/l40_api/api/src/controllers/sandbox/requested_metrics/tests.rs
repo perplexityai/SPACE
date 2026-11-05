@@ -15,8 +15,7 @@ fn only_a_request_shape_is_not_defaulted() {
 
 #[test]
 fn effective_size_needs_both_values_positive() {
-    assert_eq!(effective(Some(2_u32), Some(1024_u32)), Some((2, 1024)));
-    assert_eq!(effective(Some(2_i32), Some(1024_i32)), Some((2, 1024)));
+    assert_eq!(effective(Some(2), Some(1024)), Some((2, 1024)));
     for (vcpu, memory_mib) in [
         (None, Some(1024)),
         (Some(2), None),
@@ -27,6 +26,25 @@ fn effective_size_needs_both_values_positive() {
     ] {
         assert_eq!(effective(vcpu, memory_mib), None, "{vcpu:?} {memory_mib:?}");
     }
+}
+
+/// A create refuses a size its row cannot store, after admission; that size
+/// is not a requested one.
+#[test]
+fn create_size_is_limited_to_what_the_create_stores() {
+    let resources = |vcpu, memory_mib| SandboxResources {
+        vcpu: Some(vcpu),
+        memory_mib: Some(memory_mib),
+        disk_mib: None,
+    };
+    // i32::MAX, the largest size a sandbox row stores.
+    let largest = 2_147_483_647_u32;
+    assert_eq!(
+        create_size(&resources(largest, largest)),
+        Some((largest, largest))
+    );
+    assert_eq!(create_size(&resources(largest + 1, 1024)), None);
+    assert_eq!(create_size(&resources(2, largest + 1)), None);
 }
 
 /// Which errors count as admission refusals is pinned where they are built
