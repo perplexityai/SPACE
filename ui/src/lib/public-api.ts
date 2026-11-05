@@ -59,14 +59,23 @@ export function getSpacedVersionCounts(): Promise<unknown> {
   return adminApi.get<unknown>('/v1/sandboxes/spaced-versions');
 }
 
+// The bound on one read of `getConsoleSandbox` by the sandbox page. The route
+// runs a few database statements, each cut off by the application roles'
+// server-side `statement_timeout` (10 s by default), so a healthy API answers
+// in well under a second and a struggling one answers with its own error long
+// before this. Past it the request is not getting an answer: the page has
+// skipped about seven of its 4 s poll ticks, and the read fails so the next
+// tick reads again.
+export const SANDBOX_READ_TIMEOUT_MS = 30_000;
+
 // `id` may be any form `parseSandboxRef` accepts; the admin route takes only
 // the `sbx_` form.
-export async function getConsoleSandbox(id: string): Promise<Sandbox> {
+export async function getConsoleSandbox(id: string, signal?: AbortSignal): Promise<Sandbox> {
   const ref = parseSandboxRef(id);
   if (!ref) {
     throw new ApiError(400, 'Not a sandbox ID, UUID or sandbox pod name');
   }
-  return adminSandboxToConsoleSandbox(await adminApi.get<Sandbox>(`/v1/sandboxes/${ref.publicId}`));
+  return adminSandboxToConsoleSandbox(await adminApi.get<Sandbox>(`/v1/sandboxes/${ref.publicId}`, { signal }));
 }
 
 export interface AdminOperationRecord extends PublicOperationRecord {

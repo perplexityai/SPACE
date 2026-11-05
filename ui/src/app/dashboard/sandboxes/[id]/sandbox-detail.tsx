@@ -57,6 +57,7 @@ import {
   getSandboxOperations,
   type AdminOperationRecord,
   publicTemplateToConsoleTemplate,
+  SANDBOX_READ_TIMEOUT_MS,
   updateConsoleSandbox,
   waitForAdminOperation,
 } from '@/lib/public-api';
@@ -70,7 +71,7 @@ import type {
 import { tablePagination } from '@/lib/table-pagination';
 import { useAuth } from '@/lib/auth';
 import { isOwnOrg } from '@/lib/own-org';
-import { serialReads } from '@/lib/serial-reads';
+import { serialReads, withTimeout } from '@/lib/serial-reads';
 import { listsSnapshotsOn } from '@/lib/admin-fallback';
 import { RollbackButton, RollbackRefusalNote, useSnapshotRollback, type SnapshotRollback } from '@/components/snapshot-rollback';
 import { rollbackRoute, rollbackTargets, snapshotTimeMs, type RollbackTarget } from '@/lib/rollback-targets';
@@ -1313,7 +1314,9 @@ export default function SandboxDetailPage({ dashboardUrl }: { dashboardUrl: stri
   // Reads the sandbox row and writes what it found; true when it found it.
   const readSandbox = async (showSpinner: boolean): Promise<boolean> => {
     try {
-      const loaded = await getConsoleSandbox(safeDecodeURIComponent(id));
+      // A read with no answer fails, so it cannot hold the serialized reads.
+      const target = safeDecodeURIComponent(id);
+      const loaded = await withTimeout(SANDBOX_READ_TIMEOUT_MS, (signal) => getConsoleSandbox(target, signal));
       // The insight reads that follow use the org before the next render.
       sandboxRef.current = loaded;
       setSandbox(loaded);
