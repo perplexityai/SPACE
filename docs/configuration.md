@@ -530,8 +530,8 @@ With an authenticator installed:
   sessions, those sessions authenticate the console-gated, admin and native
   routes as in password mode, and `DELETE /auth/v1/session` revokes the
   caller's session. Console requests are unchanged and still authenticate with
-  the assertion alone; a missing or rejected assertion never falls back to a
-  session. This reopens password sign-in for every local user with a
+  the assertion alone: password login with the console header is refused with
+  403, and a missing or rejected assertion never falls back to a session. This reopens password sign-in for every local user with a
   password, so enable it only where that is acceptable, such as a test
   deployment whose smoke tests sign in with a password.
 - Each console decision increments `auth.external_console.decision` with

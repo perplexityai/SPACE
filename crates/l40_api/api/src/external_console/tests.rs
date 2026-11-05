@@ -1389,6 +1389,25 @@ async fn allowed_password_sessions_leave_console_requests_assertion_only() -> Te
         .await?;
     assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
 
+    // A console request never obtains a password session, with or without
+    // an assertion.
+    for call in [
+        Call::new(Method::POST, "/auth/v1/sessions").console(),
+        Call::new(Method::POST, "/auth/v1/sessions")
+            .signed_in_as(&seeded.member_email)
+            .console_origin(),
+    ] {
+        let (status, body) = call
+            .json(serde_json::json!({
+                "email": seeded.member_email,
+                "password": seeded.member_password,
+            }))
+            .send(fixture.mixed_public())
+            .await?;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert!(body.get("token").is_none(), "{body}");
+    }
+
     // A console logout still revokes nothing.
     let (status, _) = Call::new(Method::DELETE, "/auth/v1/session")
         .signed_in_as(&seeded.member_email)

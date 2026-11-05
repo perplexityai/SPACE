@@ -149,9 +149,15 @@ async fn auth_config(State(state): State<AppState>) -> Response {
 
 async fn create_session(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(request): Json<LoginRequest>,
 ) -> Result<Json<LoginResponse>, AuthRouteError> {
-    if !state.password_sessions_enabled() {
+    // A console request in external mode authenticates with its assertion
+    // alone, so it never obtains a password session, even where password
+    // sessions are allowed for requests without the console header.
+    if !state.password_sessions_enabled()
+        || (state.external_console.is_some() && is_console_request(&headers))
+    {
         return Err(AuthRouteError::PasswordLoginDisabled);
     }
     Ok(Json(
