@@ -505,8 +505,8 @@ async fn port_exposures(pool: &PgPool, sandbox_id: SandboxId) -> TestResult<Vec<
 /// resets the observation of open port exposures only. The candidate query
 /// compares the lifecycle trimmed and lower-cased, so a padded `quarantined`
 /// is refused like the canonical one. It also reads the normalized lifecycle
-/// back as a `SandboxLifecycle`, so an unknown value fails the whole
-/// publication, which rolls back and leaves the row as it was.
+/// back as a `SandboxLifecycle`, so an unknown value skips that receipt: the
+/// publication commits and leaves the row as it was.
 #[tokio::test(flavor = "current_thread")]
 async fn activation_rollback_receipt_converges_its_target_out_of_every_live_lifecycle() -> TestResult
 {
@@ -545,12 +545,15 @@ async fn activation_rollback_receipt_converges_its_target_out_of_every_live_life
             );
             let published = publish(pool, node_id, report).await;
 
-            let fails_publication = stored == "bogus";
-            let converges = !fails_publication
-                && !matches!(
-                    stored,
-                    "quarantined" | "deleting" | "deleted" | "cleanup_required" | " Quarantined "
-                );
+            let converges = !matches!(
+                stored,
+                "quarantined"
+                    | "deleting"
+                    | "deleted"
+                    | "cleanup_required"
+                    | " Quarantined "
+                    | "bogus"
+            );
             let mut expected = before.clone();
             let mut expected_exposures = exposures_before.clone();
             if converges {
@@ -571,10 +574,7 @@ async fn activation_rollback_receipt_converges_its_target_out_of_every_live_life
             }
             let actual = row(pool, sandbox_id).await?;
             let actual_exposures = port_exposures(pool, sandbox_id).await?;
-            if published.is_err() != fails_publication
-                || actual != expected
-                || actual_exposures != expected_exposures
-            {
+            if published.is_err() || actual != expected || actual_exposures != expected_exposures {
                 mismatches.push(format!(
                     "target {target}, stored {stored:?}: published {:?}, {actual:?}, \
                      {actual_exposures:?}",
@@ -881,8 +881,8 @@ async fn recovery_receipt_suspends_only_a_still_quarantined_row() -> TestResult 
 /// the history. A row in any other lifecycle keeps its quarantine state. An
 /// unknown value is not a candidate. A padded `quarantined` is: the candidate
 /// query compares the lifecycle trimmed and lower-cased, but the recovery's
-/// CAS compares it exactly, misses, and fails the whole publication, which
-/// rolls back and leaves the row as it was.
+/// CAS compares it exactly, so the recovery skips that row: the publication
+/// commits and leaves the row and its quarantine as they were.
 #[tokio::test(flavor = "current_thread")]
 async fn healthy_report_recovers_only_a_pause_failed_quarantine() -> TestResult {
     let db = pg_test_db().await?;
@@ -911,7 +911,6 @@ async fn healthy_report_recovers_only_a_pause_failed_quarantine() -> TestResult 
             let published =
                 publish(pool, node_id, published_sandbox_state(sandbox_id, reported)).await;
 
-            let fails_publication = stored == " Quarantined ";
             let mut expected = before.clone();
             if stored == "quarantined" {
                 expected.lifecycle = reported.to_owned();
@@ -922,7 +921,7 @@ async fn healthy_report_recovers_only_a_pause_failed_quarantine() -> TestResult 
                 expected.lifecycle = "started".to_owned();
             }
             let actual = row(pool, sandbox_id).await?;
-            if published.is_err() != fails_publication || actual != expected {
+            if published.is_err() || actual != expected {
                 mismatches.push(format!(
                     "reported {reported}, stored {stored:?}: published {:?}, {actual:?}",
                     published.as_ref().map(|_| ())
