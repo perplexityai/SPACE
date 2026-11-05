@@ -1243,13 +1243,19 @@ async fn machine_credentials_keep_working_in_external_mode() -> TestResult {
 async fn an_empty_list_allows_no_password_session() -> TestResult {
     let fixture = fixture().await?;
     let seeded = &fixture.seeded;
+    // Failure messages name the case by label, never by its credentials.
     let accounts = [
-        (seeded.admin_email.as_str(), seeded.admin_password.as_str()),
         (
+            "admin",
+            seeded.admin_email.as_str(),
+            seeded.admin_password.as_str(),
+        ),
+        (
+            "member",
             seeded.member_email.as_str(),
             seeded.member_password.as_str(),
         ),
-        ("nobody@example.test", "any-password"),
+        ("unknown", "nobody@example.test", "any-password"),
     ];
 
     // Every way a deployment can end up with no listed account: the variable
@@ -1264,10 +1270,10 @@ async fn an_empty_list_allows_no_password_session() -> TestResult {
             value.map_or_else(unset, var),
         )?;
         assert!(settings.password_session_emails().is_empty(), "{value:?}");
-        for (email, _) in accounts {
+        for (label, email, _) in accounts {
             assert!(
                 !settings.allows_password_session(email),
-                "{value:?}: {email}"
+                "{value:?}: {label}"
             );
         }
         for probe in ["", "*", "@", ","] {
@@ -1292,12 +1298,12 @@ async fn an_empty_list_allows_no_password_session() -> TestResult {
         ];
         // Login is refused for every account, right password or not.
         for app in &routers {
-            for (email, password) in accounts {
+            for (label, email, password) in accounts {
                 let (status, body) = Call::new(Method::POST, "/auth/v1/sessions")
                     .json(serde_json::json!({ "email": email, "password": password }))
                     .send(app.clone())
                     .await?;
-                assert_eq!(status, StatusCode::FORBIDDEN, "{email}: {body}");
+                assert_eq!(status, StatusCode::FORBIDDEN, "{label}: {body}");
                 assert!(body.get("token").is_none(), "{body}");
             }
         }
@@ -1488,10 +1494,19 @@ async fn unlisted_accounts_get_no_password_sessions() -> TestResult {
     // same way whether the password is right, wrong, or the account does
     // not exist, and with or without an assertion beside it.
     let mut refusals = Vec::new();
-    for (email, password) in [
-        (seeded.admin_email.as_str(), seeded.admin_password.as_str()),
-        (seeded.admin_email.as_str(), "wrong-password"),
-        ("nobody@example.test", "wrong-password"),
+    // Failure messages name the case by label, never by its credentials.
+    for (label, email, password) in [
+        (
+            "admin, right password",
+            seeded.admin_email.as_str(),
+            seeded.admin_password.as_str(),
+        ),
+        (
+            "admin, wrong password",
+            seeded.admin_email.as_str(),
+            "wrong-password",
+        ),
+        ("unknown", "nobody@example.test", "wrong-password"),
     ] {
         for assertion in [None, Some("forbidden")] {
             for app in [
@@ -1507,7 +1522,7 @@ async fn unlisted_accounts_get_no_password_sessions() -> TestResult {
                     .json(serde_json::json!({ "email": email, "password": password }))
                     .send(app)
                     .await?;
-                assert_eq!(status, StatusCode::FORBIDDEN, "{email}: {body}");
+                assert_eq!(status, StatusCode::FORBIDDEN, "{label}: {body}");
                 assert!(body.get("token").is_none(), "{body}");
                 refusals.push(body);
             }
