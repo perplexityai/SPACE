@@ -364,6 +364,14 @@ step('sandbox-checkpoint-snapshots', ['sandboxes', 'flows', 'lifecycle'], async 
     }
     return `unfinished (${state})`;
   };
+  // What follows reads the node against each operation, so one that does not
+  // succeed is recorded and ends the step; the `finally` below still turns
+  // periodic snapshots off.
+  const succeeds = async (action: string, what: string) => {
+    const state = await operation(action);
+    c.rec.check(state === 'succeeded', `${what} (${state})`);
+    if (state !== 'succeeded') throw new Error(`${what}: the operation ended ${state}, so the step stops`);
+  };
   // The node's observed periodic state, which decides what On the node can
   // say; the card is read only once it is the one wanted.
   const observedPeriodic = async (want: boolean) => {
@@ -412,8 +420,7 @@ step('sandbox-checkpoint-snapshots', ['sandboxes', 'flows', 'lifecycle'], async 
   const POINTS = /No snapshot records\. The node reports \d+ snapshots?, listed under On the node below\.|No snapshots recorded for upload\. The node reports \d+ snapshots?, listed under On the node below\./;
   const escape = (name: string) => name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
-  const checkpointed = await operation('force-checkpoint');
-  c.rec.check(checkpointed === 'succeeded', `the checkpoint succeeds (${checkpointed})`);
+  await succeeds('force-checkpoint', 'the checkpoint succeeds');
   c.rec.check(await observedPeriodic(false), 'the node reports periodic snapshots off');
   await visit(c, `/dashboard/sandboxes/${id}`, 2000);
   c.rec.check(/A checkpoint stays on the node and is not listed here/.test(await card().innerText({ timeout: 30_000 }).catch(() => '')), 'the card says a checkpoint is not in the catalog');
@@ -422,8 +429,7 @@ step('sandbox-checkpoint-snapshots', ['sandboxes', 'flows', 'lifecycle'], async 
 
   let off = false;
   try {
-    const enabled = await operation('force-enable_snapshots');
-    c.rec.check(enabled === 'succeeded', `periodic snapshots turn on (${enabled})`);
+    await succeeds('force-enable_snapshots', 'periodic snapshots turn on');
     c.rec.check(await observedPeriodic(true), 'the node reports periodic snapshots on');
     const reported = await reportedCheckpoints();
     const checkpoint = reported[0];
@@ -432,25 +438,22 @@ step('sandbox-checkpoint-snapshots', ['sandboxes', 'flows', 'lifecycle'], async 
     c.rec.check(await shows('node', new RegExp(escape(checkpoint ?? 'f-manual-'))), 'On the node lists the checkpoint');
     c.rec.check(await shows('catalog', POINTS), 'the empty catalog points at On the node');
 
-    const disabled = await operation('force-disable_snapshots');
-    c.rec.check(disabled === 'succeeded', `periodic snapshots turn off (${disabled})`);
+    await succeeds('force-disable_snapshots', 'periodic snapshots turn off');
     c.rec.check(await observedPeriodic(false), 'the node reports periodic snapshots off again');
     await visit(c, `/dashboard/sandboxes/${id}`, 2000);
     c.rec.check(await shows('node', PERIODIC_OFF), 'turning periodic snapshots off empties On the node');
 
     // Hidden, not deleted: with them on again the node reports the same
     // checkpoint.
-    const again = await operation('force-enable_snapshots');
-    c.rec.check(again === 'succeeded', `periodic snapshots turn on again (${again})`);
+    await succeeds('force-enable_snapshots', 'periodic snapshots turn on again');
     c.rec.check(await observedPeriodic(true), 'the node reports periodic snapshots on again');
     const reportedAgain = await reportedCheckpoints();
     c.rec.check(!!checkpoint && reportedAgain.includes(checkpoint), `the node reports the same checkpoint again (${reportedAgain.join(', ') || 'none'})`);
     await visit(c, `/dashboard/sandboxes/${id}`, 2000);
     c.rec.check(await shows('node', new RegExp(escape(checkpoint ?? 'f-manual-'))), 'On the node lists the same checkpoint again');
 
-    const last = await operation('force-disable_snapshots');
-    off = last === 'succeeded';
-    c.rec.check(off, `periodic snapshots turn off again (${last})`);
+    await succeeds('force-disable_snapshots', 'periodic snapshots turn off again');
+    off = true;
   } finally {
     if (!off) {
       const disabled = await operation('force-disable_snapshots');
