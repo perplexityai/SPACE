@@ -24,7 +24,7 @@ use pplx_space_cluster_pool::PoolConfigOwner;
 pub use pplx_space_sandbox_store::{SandboxMetadata, SandboxMetadataValue};
 
 mod sandbox_state;
-pub use sandbox_state::SandboxStateInput;
+pub use sandbox_state::{SandboxStateInput, is_tombstone};
 
 // --- Database models ---
 

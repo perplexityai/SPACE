@@ -46,12 +46,14 @@ pub(super) struct ScopedPageRow {
 }
 
 /// The local org's sandboxes ($1) after the cursor, matching the metadata
-/// filter $5.
+/// filter $5. ECW reads both delete tombstones as not found, so they are left
+/// out before the page and its lookahead, as the native list leaves them out.
 const LOCAL_ORG_CANDIDATE_ROWS: &str = "SELECT s.id, s.created_at
     FROM sandboxes s
     JOIN users owner_user ON owner_user.id = s.user_id
     WHERE owner_user.owner_source = 'local'
       AND s.org_id = $1
+      AND s.lifecycle NOT IN ('deleted', 'cleanup_required')
       AND {after_cursor}
       AND ($5::jsonb IS NULL OR s.metadata @> $5::jsonb)
     ORDER BY s.created_at DESC, s.id DESC
@@ -74,7 +76,8 @@ static LOCAL_ORG_PAGE_SQL: LazyLock<String> = LazyLock::new(|| {
 /// The federated subject's sandboxes ($1-$3) and the key org's legacy local
 /// sandboxes ($8) after the cursor, matching the metadata filter $7. Each
 /// arm keeps its own index-backed `ORDER BY` / `LIMIT`; the outer sort merges
-/// the two candidate lists.
+/// the two candidate lists. Both arms leave out the delete tombstones, as
+/// `LOCAL_ORG_CANDIDATE_ROWS` does.
 const FEDERATED_SUBJECT_CANDIDATE_ROWS: &str = "SELECT candidate.id, candidate.created_at
     FROM (
         (SELECT s.id, s.created_at
@@ -86,6 +89,7 @@ const FEDERATED_SUBJECT_CANDIDATE_ROWS: &str = "SELECT candidate.id, candidate.c
            AND owner_org.upstream_issuer = $1
            AND owner_org.upstream_org_id = $2
            AND owner_user.upstream_subject_id = $3
+           AND s.lifecycle NOT IN ('deleted', 'cleanup_required')
            AND {after_cursor}
            AND ($7::jsonb IS NULL OR s.metadata @> $7::jsonb)
          ORDER BY s.created_at DESC, s.id DESC
@@ -96,6 +100,7 @@ const FEDERATED_SUBJECT_CANDIDATE_ROWS: &str = "SELECT candidate.id, candidate.c
          JOIN users owner_user ON owner_user.id = s.user_id
          WHERE owner_user.owner_source = 'local'
            AND s.org_id = $8
+           AND s.lifecycle NOT IN ('deleted', 'cleanup_required')
            AND {after_cursor}
            AND ($7::jsonb IS NULL OR s.metadata @> $7::jsonb)
          ORDER BY s.created_at DESC, s.id DESC

@@ -324,16 +324,10 @@ fn post_wake_lifecycle_allows_started_update(lifecycle: SandboxLifecycle) -> boo
 }
 
 fn wake_lifecycle_allows_started_update(lifecycle: &str) -> bool {
-    match lifecycle
-        .trim()
-        .to_ascii_lowercase()
-        .parse::<SandboxLifecycle>()
-    {
+    let lifecycle = lifecycle.trim().to_ascii_lowercase();
+    match lifecycle.parse::<SandboxLifecycle>() {
         Ok(lifecycle) => post_wake_lifecycle_allows_started_update(lifecycle),
-        Err(_) => !matches!(
-            lifecycle.trim().to_ascii_lowercase().as_str(),
-            "deleted" | "cleanup_required"
-        ),
+        Err(_) => !crate::models::is_tombstone(&lifecycle),
     }
 }
 

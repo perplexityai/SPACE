@@ -2,7 +2,8 @@
 //! lifecycle and every status a node can publish for it.
 //!
 //! Each row inserts a sandbox row and, unless the observation is absent, its
-//! `sandbox_observed_states` record, then reads it the way each surface does:
+//! `sandbox_observed_states` record, published by the row's route node or by
+//! another node, then reads it the way each surface does:
 //! the admin response and the ECW get, connect, timeout and refresh paths
 //! through `tracked_response`, the ECW list through `cached_sandbox_response`,
 //! and the native `GET /v1/sandboxes/{id}` through `read_public_sandbox`. The
@@ -71,6 +72,10 @@ const ODD_STATUSES: &[&str] = &[
     "   ",
 ];
 
+/// Statuses a node other than the row's route node still reports, such as
+/// the node a sandbox left or was lost on.
+const OTHER_NODE_STATUSES: &[&str] = &["started", "paused", "failed"];
+
 #[derive(Clone, Copy)]
 enum Observed {
     /// No `sandbox_observed_states` record.
@@ -78,6 +83,8 @@ enum Observed {
     /// A record whose `status` is NULL.
     NullStatus,
     Status(&'static str),
+    /// A record published by a node other than the row's route node.
+    OtherNode(&'static str),
 }
 
 impl Observed {
@@ -86,6 +93,7 @@ impl Observed {
             Self::Absent => "absent".to_string(),
             Self::NullStatus => "null".to_string(),
             Self::Status(status) => format!("{status:?}"),
+            Self::OtherNode(status) => format!("other {status:?}"),
         }
     }
 }
@@ -104,6 +112,7 @@ fn observations() -> Vec<Observed> {
         .into_iter()
         .chain(NODE_STATUSES.iter().copied().map(Observed::Status))
         .chain(ODD_STATUSES.iter().copied().map(Observed::Status))
+        .chain(OTHER_NODE_STATUSES.iter().copied().map(Observed::OtherNode))
         .collect()
 }
 
@@ -132,7 +141,7 @@ async fn insert_node(pool: &PgPool, node_id: NodeId) -> TestResult {
 async fn insert_row(
     pool: &PgPool,
     sandbox_id: SandboxId,
-    node_id: NodeId,
+    [node_id, other_node_id]: [NodeId; 2],
     stored: &str,
     observed: Observed,
 ) -> TestResult {
@@ -150,17 +159,18 @@ async fn insert_row(
     .bind(node_id)
     .execute(pool)
     .await?;
-    let status = match observed {
+    let (observed_node_id, status) = match observed {
         Observed::Absent => return Ok(()),
-        Observed::NullStatus => None,
-        Observed::Status(status) => Some(status),
+        Observed::NullStatus => (node_id, None),
+        Observed::Status(status) => (node_id, Some(status)),
+        Observed::OtherNode(status) => (other_node_id, Some(status)),
     };
     sqlx::query(
         "INSERT INTO sandbox_observed_states (sandbox_id, node_id, status, template)
          VALUES ($1, $2, $3, 'seed')",
     )
     .bind(sandbox_id)
-    .bind(node_id)
+    .bind(observed_node_id)
     .bind(status)
     .execute(pool)
     .await?;
@@ -269,8 +279,10 @@ async fn each_surface_renders_stored_lifecycle_and_observed_status(
         let keyring = Arc::new(EcwCredentialKeyring::from_current_key_for_test(
             b"state-render-table-key",
         ));
-        let node_id = NodeId::new();
-        insert_node(&db.pool, node_id).await?;
+        let nodes = [NodeId::new(), NodeId::new()];
+        for node_id in nodes {
+            insert_node(&db.pool, node_id).await?;
+        }
 
         let rows = stored_lifecycles()
             .into_iter()
@@ -287,7 +299,7 @@ async fn each_surface_renders_stored_lifecycle_and_observed_status(
                 let keyring = keyring.clone();
                 tokio::spawn(async move {
                     let sandbox_id = SandboxId::new();
-                    insert_row(&state.pool, sandbox_id, node_id, &stored, observed).await?;
+                    insert_row(&state.pool, sandbox_id, nodes, &stored, observed).await?;
                     let rendered = render_row(&state, &keyring, sandbox_id).await?;
                     TestResult::Ok(format!(
                         "stored={stored:<16} observed={:<20} {rendered}",
