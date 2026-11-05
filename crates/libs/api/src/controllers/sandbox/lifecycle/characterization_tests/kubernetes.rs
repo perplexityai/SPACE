@@ -714,8 +714,10 @@ async fn completed_actions_keep_a_terminal_lifecycle_that_landed_mid_flight() ->
         } else {
             RouteIdentity::Published
         };
-        // The same exclusion as the direct test: only the lifecycles both
-        // guard families treat as terminal.
+        // Only the lifecycles both guard families treat as terminal. The
+        // direct test also lands the cross-intent ones; the stamp's guard
+        // is the same on both substrates, and on this one several of them
+        // are refused before the stamp by the action's own checks.
         let terminal = ["failed", "quarantined"]
             .into_iter()
             .chain(StoredSandboxLifecycle::tombstones_as_str())
@@ -810,9 +812,9 @@ async fn completed_actions_keep_a_terminal_lifecycle_that_landed_mid_flight() ->
 /// route-receipt trigger: the native start operation writes `started` over
 /// it and succeeds without a retry. A Kubernetes start of a `created` row
 /// publishes the route once the node acknowledged its Wake, then the shared
-/// `maybe_mark_started_after_start` runs unguarded, so
-/// the activation-receipt path the direct test's doc mentions is not what
-/// writes `started` here.
+/// `maybe_mark_started_after_start` runs with only its in-flight guard,
+/// which admits `stopped`, so the activation-receipt path the direct test's
+/// doc mentions is not what writes `started` here.
 #[tokio::test(flavor = "current_thread")]
 async fn native_start_overwrites_a_stopped_written_mid_flight_without_a_retry() -> TestResult {
     use crate::public_operations::{ApiProduct, ClaimedPublicOperation};
