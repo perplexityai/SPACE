@@ -130,7 +130,7 @@ export default function TemplatesList({ data, actions, state, onChange, orgs, on
     {
       title: 'Name',
       ...sortable('name'),
-      width: 220,
+      width: 190,
       fixed: 'left',
       render: (_, row) => (
         <Space orientation="vertical" size={0}>
@@ -147,7 +147,7 @@ export default function TemplatesList({ data, actions, state, onChange, orgs, on
     {
       title: 'Organization',
       ...sortable('org'),
-      width: 150,
+      width: 120,
       render: (_, row) => (row.orgId === null ? <Text type="secondary">System</Text> : (
         <Tooltip title={row.orgId}><span>{orgLabel(row.orgId)}</span></Tooltip>
       )),
@@ -155,7 +155,7 @@ export default function TemplatesList({ data, actions, state, onChange, orgs, on
     {
       title: 'Current release',
       ...sortable('release'),
-      width: 280,
+      width: 262,
       render: (_, row) => {
         if (row.published === null) return <Text type="secondary">…</Text>;
         if (!row.newest) {
@@ -215,13 +215,13 @@ export default function TemplatesList({ data, actions, state, onChange, orgs, on
     {
       title: 'Latest build',
       ...sortable('build'),
-      width: 190,
+      width: 140,
       render: (_, row) => <LatestBuildCell latest={builds.get(row.name)} now={Date.now()} />,
     },
     {
       title: 'Pool',
       ...sortable('pool'),
-      width: 140,
+      width: 100,
       render: (_, row) => {
         const { pool } = row;
         if (!pool.active) {
@@ -247,7 +247,7 @@ export default function TemplatesList({ data, actions, state, onChange, orgs, on
     {
       // The policy and whether nodes applied its newest generation.
       title: 'Network',
-      width: 150,
+      width: 124,
       render: (_, row) => {
         const label = compactNetworkPolicyLabel(row.template.network_policy);
         return (
@@ -263,7 +263,7 @@ export default function TemplatesList({ data, actions, state, onChange, orgs, on
     },
     {
       title: 'Snap',
-      width: 56,
+      width: 50,
       align: 'center',
       render: (_, row) => (
         <Tooltip title={row.template.has_base_snapshot ? 'Base snapshot observed' : 'No base snapshot observed'}>
@@ -278,7 +278,7 @@ export default function TemplatesList({ data, actions, state, onChange, orgs, on
     {
       title: 'Nodes',
       ...sortable('nodes'),
-      width: 80,
+      width: 76,
       align: 'right',
       render: (_, row) => {
         if (row.nodeCount === null) {
@@ -298,7 +298,7 @@ export default function TemplatesList({ data, actions, state, onChange, orgs, on
     {
       title: 'Actions',
       fixed: 'right',
-      width: 110,
+      width: 100,
       render: (_, row) => (
         <Space size={2}>
           {SYSTEM_TEMPLATES.has(row.name) && data.canAdminTemplates ? (
@@ -427,7 +427,7 @@ export default function TemplatesList({ data, actions, state, onChange, orgs, on
         rowKey="name"
         loading={loadingTemplates}
         size="small"
-        scroll={{ x: 1360 }}
+        scroll={{ x: 1160 }}
         pagination={{
           current: page,
           pageSize: state.size,

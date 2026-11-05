@@ -1,8 +1,7 @@
 'use client';
 
 import { Space, Tag, Tooltip, Typography, theme } from 'antd';
-import { shortHash } from '@/lib/template-format';
-import { buildBucket, type LatestBuild } from '@/lib/template-list';
+import type { LatestBuild } from '@/lib/template-list';
 import { formatAge, formatBytes } from '@/lib/sandbox-debug';
 import type { NodeRole, SpaceNode, Template, TemplateBuildListEntry, TemplateReleaseWarmPool } from '@/lib/types';
 import type { TemplateNodeAvailability } from './use-templates-data';
@@ -235,9 +234,6 @@ export function LatestBuildCell({ latest, now }: { latest: LatestBuild | undefin
           <Tooltip title={new Date(latest.build.created_at).toLocaleString()}>
             <Text type="secondary" style={{ fontSize: 12, whiteSpace: 'nowrap' }}>{formatAge(latest.build.created_at, now)} ago</Text>
           </Tooltip>
-          {buildBucket(latest) === 'succeeded' && latest.build.content_hash ? (
-            <Text code style={{ fontSize: 11 }}>{shortHash(latest.build.content_hash)}</Text>
-          ) : null}
         </Space>
       );
   }
