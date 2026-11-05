@@ -14,10 +14,10 @@ use std::collections::HashMap;
 use pplx_space_common_core::sql;
 use pplx_space_common_core::types::NodeGroupId;
 use pplx_space_common_core::types::{NodeGroupName, NodeGroupTemplatePolicy, TemplateVisibility};
-use pplx_space_common_svc::sql::sandbox_residency::non_resident_lifecycle_exclusion;
 use pplx_space_sandbox_portability::{
     inflight_suspend_upload_from_node_exists, snapshot_durable_for_source_release,
 };
+use pplx_space_sandbox_residency::non_resident_lifecycle_exclusion;
 use sqlx::{FromRow, PgPool, Postgres, Transaction};
 use time::OffsetDateTime;
 

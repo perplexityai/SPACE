@@ -11,7 +11,7 @@ use pplx_space_common_core::sql;
 /// * **Forget the observation.** `sandbox_observed_states` and the
 ///   network-policy facet rows for sandboxes the node no longer reports are
 ///   deleted. This is what lets a drain discount a phantom `active_node_id` —
-///   see `pplx_space_common_svc::sql::sandbox_residency`.
+///   see `pplx_space_sandbox_residency`.
 /// * **Tombstone the sandbox** (`marked_deleted`). Absence from a *complete*
 ///   census is read as proof the sandbox is unrecoverable, so the central row
 ///   is moved to `lifecycle = 'deleted'`.
@@ -153,7 +153,7 @@ impl LocalBackupInventoryReport {
 /// `sandbox_inventory_pruned_at` is the census-freshness signal, and it moves
 /// only when `inventory_prune` says a prune ran — see
 /// [`SandboxInventoryPrune`], and
-/// `pplx_space_common_svc::sql::sandbox_residency` for the gates that read it.
+/// `pplx_space_sandbox_residency` for the gates that read it.
 /// `local_backup_inventory_reported_at` is the same shape one column over, for
 /// the pending-backup mirror — see [`LocalBackupInventoryReport`].
 /// Execution collection has its own receipt time: only a supplied outcome

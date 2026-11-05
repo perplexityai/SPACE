@@ -469,7 +469,7 @@ pub async fn require_e2b_api_key(
         // race on the api-key/org lookup 500s the request before any of the
         // handler-level contention mappings can be reached.
         Err(error) => {
-            if pplx_space_common_svc::sql::contention::is_lock_contention(&error) {
+            if pplx_space_postgres_pool::contention::is_lock_contention(&error) {
                 tracing::warn!(%error, "ecw api-key lookup lost a lock race; retryable");
                 return E2bApiError::lock_contention().into_response();
             }

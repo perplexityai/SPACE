@@ -44,7 +44,7 @@ use pplx_space_metrics::sandbox::api::SandboxApiMetricIdentity;
 use pplx_space_node_api_client::NodeApiClient;
 use sqlx::PgPool;
 
-use pplx_space_common_svc::sql::sandbox_residency::{
+use pplx_space_sandbox_residency::{
     active_resident_predicate, node_backup_inventory_fresh, occupies_node_predicate,
     resident_lifecycle, resident_lifecycle_strs,
 };
@@ -1416,9 +1416,9 @@ pub enum PinnedLocalSource {
 /// that already joins `nodes n` — as the stall gauge does — without shadowing
 /// it.
 ///
-/// Local rather than in `common/svc/src/sql/`: only this file interpolates it,
-/// unlike the residency predicates, which live in the shared crate precisely
-/// because several crates must count the same rows.
+/// Local rather than in `pplx-space-sandbox-residency`: only this file
+/// interpolates it, unlike the residency predicates, which live in that crate
+/// precisely because several crates must count the same rows.
 fn node_is_force_draining(node_ref: &str) -> String {
     format!(
         "EXISTS (

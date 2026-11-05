@@ -34,7 +34,7 @@ pub struct AppState {
     /// credential-fenced tables (`user_credentials`, `org_credentials`,
     /// `org_master_keys`). Fenced statements — and any transaction that
     /// mixes them with unfenced ones — must run here instead of `pool`.
-    pub credentials_pool: pplx_space_common_svc::sql::CredentialsPool,
+    pub credentials_pool: pplx_space_postgres_pool::CredentialsPool,
     pub sandbox_controller: crate::controllers::sandbox::SandboxController,
     pub template_controller: crate::controllers::template::TemplateController,
     pub client_classification: crate::client_classification::ClientClassification,
@@ -111,7 +111,7 @@ impl AppState {
                 .map(std::sync::Arc::new);
         Self::from_pools_with_lifecycle(
             pool.clone(),
-            pplx_space_common_svc::sql::CredentialsPool::shared(pool),
+            pplx_space_postgres_pool::CredentialsPool::shared(pool),
             pplx_space_common_svc::DrainSignal::new(),
             CancellationToken::new(),
             TaskTracker::new(),
@@ -122,7 +122,7 @@ impl AppState {
 
     pub async fn from_pools_with_lifecycle(
         pool: PgPool,
-        credentials_pool: pplx_space_common_svc::sql::CredentialsPool,
+        credentials_pool: pplx_space_postgres_pool::CredentialsPool,
         drain_signal: pplx_space_common_svc::DrainSignal,
         shutdown_token: CancellationToken,
         task_tracker: TaskTracker,

@@ -1,0 +1,34 @@
+[package]
+name = "pplx-space-postgres-pool"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# Opens pools on the control-plane database and owns none of its tables.
+[package.metadata.space.state]
+postgres = []
+
+[lints]
+workspace = true
+
+[dependencies]
+log = { workspace = true }
+rand = { workspace = true }
+sqlx = { workspace = true, features = ["derive", "postgres", "runtime-tokio", "time", "tls-rustls-aws-lc-rs", "uuid"] }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["rt", "time"] }
+tracing = { workspace = true }
+
+# internal
+pplx-space-db-identity = { workspace = true }
+pplx-space-metrics = { workspace = true }
+pplx-space-postgres-contention = { workspace = true }
+pplx-space-sql-locator = { workspace = true }
+pplx-space-state-reconciliation = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }
+pplx-space-test-env = { workspace = true }

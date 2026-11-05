@@ -6,7 +6,7 @@
 //! the managed login replaces its username/password. There is no fallback to
 //! the connecting admin — a missing password projection fails startup.
 
-use pplx_space_common_core::types::DatabaseIdentity;
+use pplx_space_db_identity::DatabaseIdentity;
 use sqlx::PgPool;
 
 use super::{
@@ -74,7 +74,7 @@ pub fn connect_space_user_pool_lazy(
 ///
 /// Use this when a query shares the database with a service's load-bearing
 /// traffic but must never be able to starve it — see
-/// [`crate::sql::connect_postgres_lazy_as_capped`] for why sharing the general
+/// [`crate::connect_postgres_lazy_as_capped`] for why sharing the general
 /// pool lets a blocked sideline fail unrelated queries.
 ///
 /// Deliberately does **not** spawn the pool metrics reporter, unlike
@@ -105,7 +105,7 @@ pub fn connect_space_user_sideline_pool_lazy(
 ) -> Result<PgPool, DatabaseConnectOptionsError> {
     let identity = DatabaseIdentity::SpaceUser;
     let password = managed_database_password(identity)?;
-    crate::sql::connect_postgres_lazy_as_capped(
+    crate::connect_postgres_lazy_as_capped(
         database_url,
         application_name,
         identity,

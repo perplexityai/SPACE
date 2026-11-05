@@ -7,7 +7,7 @@ use axum::{
 use pplx_space_common_core::sql;
 use pplx_space_common_core::types::{EcwCredentialEpoch, SandboxId};
 use pplx_space_common_svc::bearer_token::SPACE_INTERNAL_TOKEN_ENV;
-use pplx_space_common_svc::sql::contention;
+use pplx_space_postgres_pool::contention;
 use subtle::ConstantTimeEq;
 
 use crate::{auth::hash_token, routes::AppState};

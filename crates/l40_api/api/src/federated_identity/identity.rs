@@ -44,7 +44,7 @@ impl MaterializeOwnerError {
     }
 
     pub(crate) fn is_lock_contention(&self) -> bool {
-        pplx_space_common_svc::sql::contention::is_lock_contention(self.database_error())
+        pplx_space_postgres_pool::contention::is_lock_contention(self.database_error())
     }
 }
 

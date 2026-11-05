@@ -48,7 +48,7 @@ use crate::suspended_execution_reaper;
 use crate::tombstone_retention;
 use crate::transient_lifecycle_census;
 use crate::transient_lifecycle_sweeper;
-use pplx_space_common_svc::sql::sandbox_residency::{NODE_CENSUS_RESIDENCY_ENV, ResidencyEvidence};
+use pplx_space_sandbox_residency::{NODE_CENSUS_RESIDENCY_ENV, ResidencyEvidence};
 
 /// Bounded grace period for in-flight reconciler ticks to drain after the
 /// shutdown token fires. Keeps the cluster-controller pod from getting stuck
@@ -191,7 +191,7 @@ fn build_if_enabled<T, E>(
 
 pub async fn run_reconcilers(
     pool: PgPool,
-    credentials_pool: pplx_space_common_svc::sql::CredentialsPool,
+    credentials_pool: pplx_space_postgres_pool::CredentialsPool,
     substrate: Substrate,
     tls_interception_exemptions: Option<TlsInterceptionExemptions>,
     egress_profiles: EgressProfiles,

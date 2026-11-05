@@ -373,7 +373,7 @@ pub(super) fn fork_admission_error_for_test(
 /// `SELECT` waits on `ACCESS EXCLUSIVE` from DDL on the table it reads, and
 /// under the role-level bound that wait aborts with `55P03`.
 fn fork_sql_error(context: &'static str, error: &sqlx::Error) -> E2bApiError {
-    if pplx_space_common_svc::sql::contention::is_lock_contention(error) {
+    if pplx_space_postgres_pool::contention::is_lock_contention(error) {
         tracing::warn!(context, error = %error, "fork statement lost a lock race; retryable");
         return E2bApiError::lock_contention();
     }
@@ -384,7 +384,7 @@ fn fork_sql_error(context: &'static str, error: &sqlx::Error) -> E2bApiError {
 /// error directly.
 fn fork_store_error(context: &'static str, error: PublicOperationStoreError) -> E2bApiError {
     if let PublicOperationStoreError::Sql(sql) = &error
-        && pplx_space_common_svc::sql::contention::is_lock_contention(sql)
+        && pplx_space_postgres_pool::contention::is_lock_contention(sql)
     {
         tracing::warn!(context, error = %error, "fork admission lost a lock race; retryable");
         return E2bApiError::lock_contention();

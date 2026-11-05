@@ -12,9 +12,8 @@
 //! accept any listed historical checksum without replaying an applied migration.
 //!
 //! It is its own crate because it depends only on serde, hex, toml and SQLx's
-//! `migrate` support, so a migration runner such as `pplx-space-sqlite` can use
-//! it without depending on `pplx-space-common-svc`, which re-exports it as
-//! `sql::migration_checksums` under its `migration-checksums` feature.
+//! `migrate` support, so a migration runner such as `pplx-space-sqlite` or
+//! `pplx-space-db-migrate` can use it directly.
 
 use std::collections::BTreeSet;
 

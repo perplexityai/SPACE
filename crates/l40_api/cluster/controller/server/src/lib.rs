@@ -80,9 +80,9 @@ pub enum RunClusterControllerError {
     #[error("invalid TLS interception exemptions: {0}")]
     TlsInterceptionExemptions(#[from] TlsInterceptionExemptionsConfigError),
     #[error("failed to initialize the cluster-controller space_user pool: {0}")]
-    SpaceUserPool(#[source] pplx_space_common_svc::sql::DatabaseConnectOptionsError),
+    SpaceUserPool(#[source] pplx_space_postgres_pool::DatabaseConnectOptionsError),
     #[error("failed to initialize the cluster-controller space_creds pool: {0}")]
-    CredentialsPool(#[source] pplx_space_common_svc::sql::DatabaseConnectOptionsError),
+    CredentialsPool(#[source] pplx_space_postgres_pool::DatabaseConnectOptionsError),
     #[error("substrate init failed: {0}")]
     Substrate(#[source] pplx_space_api::controllers::substrate::SubstrateError),
     #[error("failed to build the leadership lease client: {0}")]
@@ -110,16 +110,12 @@ pub async fn run(
     // Validate on standbys too, before leader election can mark a replica Ready.
     let tls_interception_exemptions = TlsInterceptionExemptions::from_env()?;
     let egress_profiles = EgressProfiles::from_env()?;
-    let pool = pplx_space_common_svc::sql::connect_space_user_pool_lazy(
-        &config.database_url,
-        SERVICE_NAME,
-    )
-    .map_err(RunClusterControllerError::SpaceUserPool)?;
-    let credentials_pool = pplx_space_common_svc::sql::CredentialsPool::connect_lazy(
-        &config.database_url,
-        SERVICE_NAME,
-    )
-    .map_err(RunClusterControllerError::CredentialsPool)?;
+    let pool =
+        pplx_space_postgres_pool::connect_space_user_pool_lazy(&config.database_url, SERVICE_NAME)
+            .map_err(RunClusterControllerError::SpaceUserPool)?;
+    let credentials_pool =
+        pplx_space_postgres_pool::CredentialsPool::connect_lazy(&config.database_url, SERVICE_NAME)
+            .map_err(RunClusterControllerError::CredentialsPool)?;
     tracing::info!("prepared lazy space_user and space_creds cluster-controller database pools");
 
     // Initialize the substrate up front, in every replica — leader and standby

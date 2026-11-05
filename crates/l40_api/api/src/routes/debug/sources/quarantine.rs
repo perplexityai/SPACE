@@ -1,5 +1,5 @@
 use pplx_space_common_core::types::SandboxId;
-use pplx_space_common_svc::sql::sandbox_quarantine;
+use pplx_space_sandbox_quarantine_store as sandbox_quarantine;
 use sqlx::PgPool;
 
 use crate::routes::debug::{

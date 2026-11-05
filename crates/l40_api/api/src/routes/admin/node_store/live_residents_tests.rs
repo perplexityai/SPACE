@@ -17,7 +17,7 @@ use sqlx::PgPool;
 use std::time::Duration;
 use uuid::Uuid;
 
-use pplx_space_common_svc::sql::sandbox_residency::ResidencyEvidence;
+use pplx_space_sandbox_residency::ResidencyEvidence;
 
 use super::{AdminNodeStore, NodeLiveResidents};
 

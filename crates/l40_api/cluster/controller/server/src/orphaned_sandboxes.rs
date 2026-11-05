@@ -57,10 +57,6 @@ use pplx_space_common_core::types::{
     SandboxQuarantineNextAction, SandboxQuarantineReasonCode, SandboxQuarantineSource,
     SubstrateKind,
 };
-use pplx_space_common_svc::sql::sandbox_quarantine::{
-    quarantine_history_insert_columns, quarantine_state_conflict_assignments,
-    quarantine_state_insert_columns,
-};
 use pplx_space_events::{
     SandboxEvent, SandboxEventDetails, SandboxEventSource, SandboxEventTrigger, SandboxEventType,
 };
@@ -68,6 +64,10 @@ use pplx_space_metrics::sandbox::api::reconciler::{
     self as reconciler_metrics, ClassificationOutcome, ClassificationReason, PodEvidence,
 };
 use pplx_space_sandbox_portability::orphan_recovery_revert_eligibility;
+use pplx_space_sandbox_quarantine_store::{
+    quarantine_history_insert_columns, quarantine_state_conflict_assignments,
+    quarantine_state_insert_columns,
+};
 use pplx_space_sandbox_store::orphan::{
     self, OrphanGuard, classify_guard_from_sql, classify_guard_lock_sql, classify_guard_sql,
 };

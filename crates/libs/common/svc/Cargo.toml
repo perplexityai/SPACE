@@ -16,9 +16,6 @@ otel = ["pplx-space-observability/otel"]
 datadog = ["otel", "pplx-space-observability/datadog"]
 # Deprecated for one release; use otel and datadog.
 datadog-otel = ["otel", "datadog"]
-# Exposes `sql::migration_checksums`, the accepted-checksums adapter every
-# migration runner embeds.
-migration-checksums = ["dep:pplx-space-migration-checksums"]
 
 [dependencies]
 bytes = { workspace = true }
@@ -28,10 +25,8 @@ libc = { workspace = true }
 log = { workspace = true }
 nix = { workspace = true, features = ["fs", "user"] }
 pin-project-lite = { workspace = true }
-rand = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
-sqlx = { workspace = true, features = ["derive", "postgres", "runtime-tokio", "time", "tls-rustls-aws-lc-rs", "uuid"] }
 thiserror = { workspace = true }
 time = { workspace = true }
 tokio = { workspace = true, features = ["macros", "net", "rt", "signal", "time"] }
@@ -48,26 +43,20 @@ uuid = { workspace = true, features = ["v5", "v7"] }
 pplx-space-api-route = { workspace = true }
 pplx-space-auto-lifecycle-receipt = { workspace = true }
 pplx-space-bearer-token = { workspace = true }
-pplx-space-common-core = { workspace = true, features = ["serde", "sqlx"] }
+pplx-space-common-core = { workspace = true, features = ["serde"] }
 pplx-space-common-grpc = { workspace = true }
 pplx-space-dependency-drain = { workspace = true }
 pplx-space-ecw-credential = { workspace = true }
-pplx-space-federated-grant-store = { workspace = true }
 pplx-space-federated-identity = { workspace = true }
 pplx-space-grpc-rate-limiter = { workspace = true }
 pplx-space-http-server = { workspace = true }
 pplx-space-ingress-admission = { workspace = true }
 pplx-space-k8s-node-id = { workspace = true }
 pplx-space-metrics = { workspace = true }
-pplx-space-migration-checksums = { workspace = true, optional = true }
-pplx-space-node-registration-store = { workspace = true }
 pplx-space-observability = { workspace = true }
 pplx-space-page-cache = { workspace = true }
-pplx-space-postgres-contention = { workspace = true }
 pplx-space-request-id = { workspace = true }
 pplx-space-rustls-provider = { workspace = true }
-pplx-space-sandbox-quarantine-store = { workspace = true }
-pplx-space-sandbox-routability = { workspace = true }
 pplx-space-service-lifecycle = { workspace = true }
 pplx-space-service-mutex = { workspace = true }
 pplx-space-state-reconciliation = { workspace = true }
@@ -88,4 +77,3 @@ tempfile = { workspace = true }
 tracing-subscriber = { workspace = true }
 pplx-space-db-test-fixtures = { workspace = true }
 pplx-space-observability = { workspace = true, features = ["test-capture"] }
-pplx-space-test-env = { workspace = true }

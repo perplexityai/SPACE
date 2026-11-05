@@ -20,7 +20,7 @@
 # it sent a census. Freshness here is
 # the window the API itself trusts a node's census for
 # (CENSUS_INVENTORY_MAX_AGE, five minutes, which is five default polls;
-# crates/libs/common/svc/src/sql/sandbox_residency.rs).
+# crates/l30_storage/sandbox/residency/src/lib.rs).
 #
 # Usage:
 #   bash infra/space/kind/scripts/wait-node-publication.sh [timeout-seconds]

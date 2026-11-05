@@ -81,7 +81,7 @@
 //! and otherwise takes a btrfs snapshot of the stopped sandbox.
 
 use pplx_space_common_core::sql;
-use pplx_space_common_svc::sql::contention;
+use pplx_space_postgres_pool::contention;
 use std::{fmt, time::Duration};
 
 use pplx_space_common_core::types::{

@@ -212,7 +212,7 @@ async fn active_master_key_provider_is_loaded_for_byok_policy() -> pplx_space_te
     .execute(&db.pool)
     .await?;
 
-    let credentials_pool = pplx_space_common_svc::sql::CredentialsPool::shared(db.pool.clone());
+    let credentials_pool = pplx_space_postgres_pool::CredentialsPool::shared(db.pool.clone());
     assert_eq!(
         active_kek_provider(&credentials_pool, OrgId::from_uuid(org_id)).await?,
         Some(KekProvider::AwsKms),

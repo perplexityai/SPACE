@@ -247,7 +247,7 @@ async fn native_build_fixture() -> TestResult<NativeBuildFixture> {
     });
     let mut state = AppState::from_pools_with_lifecycle(
         db.pool.clone(),
-        pplx_space_common_svc::sql::CredentialsPool::shared(db.pool.clone()),
+        pplx_space_postgres_pool::CredentialsPool::shared(db.pool.clone()),
         pplx_space_common_svc::DrainSignal::new(),
         shutdown.clone(),
         tasks.clone(),

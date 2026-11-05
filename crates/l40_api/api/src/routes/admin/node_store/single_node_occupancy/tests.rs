@@ -3,8 +3,8 @@ use std::time::Duration;
 use std::time::Instant;
 
 use pplx_space_common_core::sql;
-use pplx_space_common_svc::sql::sandbox_residency::ResidencyEvidence;
 use pplx_space_db_test_fixtures::try_pg_test_db_with_max_connections;
+use pplx_space_sandbox_residency::ResidencyEvidence;
 use pplx_space_test_env::TestResult;
 use serde::Deserialize;
 use sqlx::PgPool;

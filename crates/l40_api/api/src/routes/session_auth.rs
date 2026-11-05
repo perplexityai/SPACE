@@ -75,7 +75,7 @@ enum AuthRouteError {
 /// to `Internal`, and a lost lock race is not an internal failure.
 impl From<sqlx::Error> for AuthRouteError {
     fn from(error: sqlx::Error) -> Self {
-        if pplx_space_common_svc::sql::contention::is_lock_contention(&error) {
+        if pplx_space_postgres_pool::contention::is_lock_contention(&error) {
             tracing::warn!(%error, "session auth statement lost a lock race; retryable");
             return Self::Contended;
         }

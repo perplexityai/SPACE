@@ -11,7 +11,7 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
 use crate::routes::AppState;
-use pplx_space_common_svc::sql::{CredentialsPool, connect_space_user_pool_lazy};
+use pplx_space_postgres_pool::{CredentialsPool, connect_space_user_pool_lazy};
 
 /// Telemetry and log name for a process serving the public API, on either the
 /// dedicated public host or the shared host.
@@ -151,9 +151,9 @@ pub enum RunApiError {
         source: std::io::Error,
     },
     #[error("failed to initialize the API space_user pool: {0}")]
-    SpaceUserPool(#[source] pplx_space_common_svc::sql::DatabaseConnectOptionsError),
+    SpaceUserPool(#[source] pplx_space_postgres_pool::DatabaseConnectOptionsError),
     #[error("failed to initialize the API space_creds pool: {0}")]
-    CredentialsPool(#[source] pplx_space_common_svc::sql::DatabaseConnectOptionsError),
+    CredentialsPool(#[source] pplx_space_postgres_pool::DatabaseConnectOptionsError),
     #[error(transparent)]
     AppState(#[from] crate::routes::AppStateError),
     #[error("ingress activation service: {0}")]

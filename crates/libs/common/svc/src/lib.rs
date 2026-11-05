@@ -29,12 +29,11 @@ pub use pplx_space_api_route::ed25519 as space_api_route_ed25519;
 pub use pplx_space_grpc_rate_limiter as rate_limiter;
 pub use pplx_space_page_cache as page_cache;
 pub use pplx_space_service_mutex as service_mutex;
+pub use pplx_space_systemd_watchdog as systemd;
+pub use pplx_space_tokio_runtime as tokio_runtime;
 pub use pplx_space_uds_peer_auth as peer_auth;
 pub use pplx_space_valkey::redis;
 pub use pplx_space_valkey::shared_valkey;
-pub mod sql;
-pub use pplx_space_systemd_watchdog as systemd;
-pub use pplx_space_tokio_runtime as tokio_runtime;
 pub mod types;
 
 pub use dependency_drain::{

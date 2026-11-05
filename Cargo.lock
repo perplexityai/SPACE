@@ -4857,6 +4857,7 @@ dependencies = [
  "pplx-space-events",
  "pplx-space-execution-catalog",
  "pplx-space-feature-flags",
+ "pplx-space-federated-grant-store",
  "pplx-space-internal-api-server",
  "pplx-space-kube-client",
  "pplx-space-metrics",
@@ -4865,14 +4866,18 @@ dependencies = [
  "pplx-space-node-api-client",
  "pplx-space-node-api-sim",
  "pplx-space-node-mgr-client",
+ "pplx-space-node-registration-store",
  "pplx-space-observability",
  "pplx-space-placement",
+ "pplx-space-postgres-pool",
  "pplx-space-public-api",
  "pplx-space-public-api-http",
  "pplx-space-rpc-auth",
  "pplx-space-runtime-environment-policy-store",
  "pplx-space-sandbox-grpc",
  "pplx-space-sandbox-portability",
+ "pplx-space-sandbox-quarantine-store",
+ "pplx-space-sandbox-residency",
  "pplx-space-sandbox-store",
  "pplx-space-sandbox-teardown",
  "pplx-space-sbx-mgr-client",
@@ -5190,9 +5195,13 @@ dependencies = [
  "pplx-space-node-api-sim",
  "pplx-space-observability",
  "pplx-space-placement",
+ "pplx-space-postgres-pool",
  "pplx-space-public-api",
  "pplx-space-runtime-environment-catalog-store",
  "pplx-space-sandbox-portability",
+ "pplx-space-sandbox-quarantine-store",
+ "pplx-space-sandbox-residency",
+ "pplx-space-sandbox-routability",
  "pplx-space-sandbox-store",
  "pplx-space-sandbox-teardown",
  "pplx-space-sbx-mgr-client",
@@ -5480,36 +5489,27 @@ dependencies = [
  "pplx-space-db-test-fixtures",
  "pplx-space-dependency-drain",
  "pplx-space-ecw-credential",
- "pplx-space-federated-grant-store",
  "pplx-space-federated-identity",
  "pplx-space-grpc-rate-limiter",
  "pplx-space-http-server",
  "pplx-space-ingress-admission",
  "pplx-space-k8s-node-id",
  "pplx-space-metrics",
- "pplx-space-migration-checksums",
- "pplx-space-node-registration-store",
  "pplx-space-observability",
  "pplx-space-page-cache",
- "pplx-space-postgres-contention",
  "pplx-space-request-id",
  "pplx-space-rustls-provider",
- "pplx-space-sandbox-quarantine-store",
- "pplx-space-sandbox-routability",
  "pplx-space-service-lifecycle",
  "pplx-space-service-mutex",
  "pplx-space-state-reconciliation",
  "pplx-space-systemd-watchdog",
- "pplx-space-test-env",
  "pplx-space-tokio-runtime",
  "pplx-space-uds-peer-auth",
  "pplx-space-unix-socket-bind",
  "pplx-space-unix-socket-path",
  "pplx-space-valkey",
- "rand 0.10.2",
  "serde",
  "serde_json",
- "sqlx",
  "tempfile",
  "thiserror 2.0.20",
  "time",
@@ -5648,9 +5648,12 @@ dependencies = [
  "pplx-space-credential-provider-client",
  "pplx-space-credmgr-client",
  "pplx-space-db-test-fixtures",
+ "pplx-space-federated-grant-store",
  "pplx-space-kube-client",
  "pplx-space-metrics",
  "pplx-space-net-common",
+ "pplx-space-node-registration-store",
+ "pplx-space-postgres-pool",
  "pplx-space-rpc-auth",
  "pplx-space-test-env",
  "prost",
@@ -5792,6 +5795,7 @@ dependencies = [
  "pplx-space-common-jobs",
  "pplx-space-common-svc",
  "pplx-space-db-test-fixtures",
+ "pplx-space-migration-checksums",
  "pplx-space-sbx-mgr-store",
  "pplx-space-sqlite",
  "pplx-space-test-env",
@@ -6059,12 +6063,15 @@ dependencies = [
  "pplx-space-node-mgr-client",
  "pplx-space-observability",
  "pplx-space-placement",
+ "pplx-space-postgres-pool",
  "pplx-space-public-api",
  "pplx-space-rpc-auth",
  "pplx-space-runtime-environment-catalog-store",
  "pplx-space-runtime-environment-policy-store",
  "pplx-space-sandbox-grpc",
  "pplx-space-sandbox-portability",
+ "pplx-space-sandbox-quarantine-store",
+ "pplx-space-sandbox-residency",
  "pplx-space-sandbox-store",
  "pplx-space-sbx-mgr-client",
  "pplx-space-snapshot-store",
@@ -6994,6 +7001,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "pplx-space-postgres-pool"
+version = "0.8.1"
+dependencies = [
+ "log",
+ "pplx-space-db-identity",
+ "pplx-space-metrics",
+ "pplx-space-postgres-contention",
+ "pplx-space-sql-locator",
+ "pplx-space-state-reconciliation",
+ "pplx-space-test-env",
+ "rand 0.10.2",
+ "sqlx",
+ "thiserror 2.0.20",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "pplx-space-public-api"
 version = "0.8.1"
 dependencies = [
@@ -7151,6 +7176,13 @@ dependencies = [
  "time",
  "tokio",
  "uuid",
+]
+
+[[package]]
+name = "pplx-space-sandbox-residency"
+version = "0.8.1"
+dependencies = [
+ "pplx-space-common-core",
 ]
 
 [[package]]

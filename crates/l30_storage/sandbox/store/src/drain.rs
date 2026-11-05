@@ -22,7 +22,7 @@
 //! [`mark_sandbox_failed_on_node_query`], `$2` of
 //! [`fail_resident_sandboxes_on_gone_node_query`]). The caller chooses the
 //! set (the drain's non-evacuable and suspend-evacuable sets, and
-//! `pplx-space-common-svc`'s resident set) and passes its wire strings.
+//! `pplx-space-sandbox-residency`'s resident set) and passes its wire strings.
 //!
 //! [`gone_node_identity_guards`] is also interpolated by the drain's
 //! in-flight snapshot give-up, a `snapshots` write that stays with the drain,

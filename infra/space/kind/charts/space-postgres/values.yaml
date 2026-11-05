@@ -31,7 +31,7 @@ credentials:
   # (converge_superadmin_attributes and converge_role_attributes in
   # crates/l30_storage/db/migrate/src/bootstrap_roles.rs), and the services replace
   # it with their managed identity (database_connect_options,
-  # crates/libs/common/svc/src/sql/mod.rs). Deployments name it space_admin,
+  # crates/l30_storage/postgres/pool/src/lib.rs). Deployments name it space_admin,
   # which bootstrap-roles never manages (ensure_no_session_collision).
   masterUser: space_admin
   masterPassword: masterpassword
@@ -41,7 +41,7 @@ server:
   # Every client pool's maximum must fit, so that a service is limited by its
   # own pool, as deployed, and never by the server refusing a connection.
   # Per process, from the pools each one opens and POSTGRES_POOL_MAX_CONNECTIONS
-  # (default 25, crates/libs/common/svc/src/sql/mod.rs) in its chart:
+  # (default 25, crates/l30_storage/postgres/pool/src/lib.rs) in its chart:
   #   space-api        2 pools x 100 (space_user + space_creds,
   #                    crates/l40_api/api/src/run.rs) x 4 pods (HPA maximum 3,
   #                    plus 1 rolling-update surge)                       800

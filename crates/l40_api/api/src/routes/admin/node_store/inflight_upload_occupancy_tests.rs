@@ -2,8 +2,8 @@ use pplx_space_common_core::types::NodeId;
 use pplx_space_common_core::types::SandboxId;
 
 use pplx_space_common_core::sql;
-use pplx_space_common_svc::sql::sandbox_residency::ResidencyEvidence;
 use pplx_space_db_test_fixtures::try_pg_test_db;
+use pplx_space_sandbox_residency::ResidencyEvidence;
 use sqlx::PgPool;
 use std::num::NonZeroUsize;
 use uuid::Uuid;

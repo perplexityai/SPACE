@@ -1,6 +1,6 @@
 use super::managed_password;
-use crate::core::types::DatabaseIdentity;
-use crate::sql::{SPACE_DB_CREDS_PASSWORD_ENV, SPACE_DB_USER_PASSWORD_ENV};
+use crate::{SPACE_DB_CREDS_PASSWORD_ENV, SPACE_DB_USER_PASSWORD_ENV};
+use pplx_space_db_identity::DatabaseIdentity;
 
 #[test]
 fn projected_passwords_pass_through() {

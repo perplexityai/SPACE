@@ -17,11 +17,11 @@ use pplx_space_common_svc::core::host::linux::paths;
 use pplx_space_common_svc::core::types::{
     KekProvider, MasterKeyIdentifier, OrgId, SandboxId, volume_wrap_aad,
 };
-use pplx_space_common_svc::sql::contention;
 use pplx_space_common_svc::{
     ContentAddressedInstalls, PeerProcessCheckMode, UdsPeerAccount, UdsPeerAuthorizer,
     UdsPeerPrincipal, capability,
 };
+use pplx_space_postgres_pool::contention;
 use tonic::{Request, Response, Status};
 
 use crate::auth::{CallerResolver, ClientService, ResolvedCaller};

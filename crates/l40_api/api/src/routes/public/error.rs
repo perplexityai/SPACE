@@ -64,7 +64,7 @@ impl From<crate::public_sessions::PublicSessionStoreError> for PublicApiError {
 /// this one does not) and so branch on this rather than going through
 /// [`database_error`].
 pub(crate) fn lock_contention_error(error: &sqlx::Error) -> Option<PublicApiError> {
-    if !pplx_space_common_svc::sql::contention::is_lock_contention(error) {
+    if !pplx_space_postgres_pool::contention::is_lock_contention(error) {
         return None;
     }
     tracing::warn!(error = %error, "public api statement lost a lock race; retryable");

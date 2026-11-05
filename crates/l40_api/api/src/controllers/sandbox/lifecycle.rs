@@ -5,10 +5,10 @@ use super::*;
 use crate::controllers::db_contention_error;
 use pplx_space_common_core::sql;
 use pplx_space_common_core::types::{NodeDrainPhase, NodeDrainState, NodeManagedBy, NodeRole};
-use pplx_space_common_svc::sql::contention;
 use pplx_space_events::{
     SandboxEvent, SandboxEventDetails, SandboxEventSource, SandboxEventTrigger, SandboxEventType,
 };
+use pplx_space_postgres_pool::contention;
 use pplx_space_sandbox_portability::portable_for_restore_affinity;
 use pplx_space_sandbox_store as sandbox_store;
 use pplx_space_sandbox_store::delete::{mark_deleting, restore_lifecycle_from_deleting};

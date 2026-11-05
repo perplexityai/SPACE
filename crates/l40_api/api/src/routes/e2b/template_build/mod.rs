@@ -99,7 +99,7 @@ fn template_build_store_error(
 /// [`template_build_store_error`] for the statements whose helper returns a
 /// bare `sqlx::Error`.
 fn template_build_sql_error(what: &'static str, error: &sqlx::Error) -> E2bApiError {
-    if pplx_space_common_svc::sql::contention::is_lock_contention(error) {
+    if pplx_space_postgres_pool::contention::is_lock_contention(error) {
         tracing::warn!(
             what,
             error = %error,

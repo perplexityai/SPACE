@@ -635,7 +635,7 @@ fn wrap_resolve_error(error: ResolveError) -> WrapError {
     // lock on that table would otherwise become a fast permanent-looking
     // credential failure instead of the slow success it used to be.
     if let ResolveError::Store(WrappedKeyStoreError::Lookup(sql)) = &error
-        && pplx_space_common_svc::sql::contention::is_lock_contention(sql)
+        && pplx_space_postgres_pool::contention::is_lock_contention(sql)
     {
         return WrapError::Unavailable(error.to_string());
     }
@@ -655,7 +655,7 @@ fn wrap_resolve_error(error: ResolveError) -> WrapError {
 fn unwrap_resolve_error(error: ResolveError) -> UnwrapError {
     // As in `wrap_resolve_error`: contention is retryable, not a backend fault.
     if let ResolveError::Store(WrappedKeyStoreError::Lookup(sql)) = &error
-        && pplx_space_common_svc::sql::contention::is_lock_contention(sql)
+        && pplx_space_postgres_pool::contention::is_lock_contention(sql)
     {
         return UnwrapError::Unavailable(error.to_string());
     }

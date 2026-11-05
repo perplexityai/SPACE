@@ -12,7 +12,6 @@ use pplx_space_common_core::{
         SandboxQuarantineSource,
     },
 };
-use pplx_space_common_svc::sql::contention::{self, is_lock_not_available};
 use pplx_space_common_svc::types::{
     AUTO_LIFECYCLE_DELETE_COMPLETION_BATCH_SIZE, AUTO_LIFECYCLE_DELETE_COMPLETION_LOCK_TIMEOUT,
     AUTO_LIFECYCLE_DELETE_COMPLETION_OWNERSHIP_GRACE,
@@ -23,6 +22,7 @@ use pplx_space_metrics::sandbox::publication::{
     AutoLifecycleDeleteCompletionDisposition, AutoLifecycleDeleteCompletionReason,
 };
 use pplx_space_placement::StoredSandboxLifecycle;
+use pplx_space_postgres_pool::contention::{self, is_lock_not_available};
 use pplx_space_sandbox_store::delete::delete_with_dependents;
 use sqlx::{Acquire as _, FromRow, Postgres, Transaction, types::Json};
 use tonic::Status;

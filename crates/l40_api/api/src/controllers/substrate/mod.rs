@@ -715,7 +715,7 @@ pub(crate) fn durable_snapshot_rpc_error(error: tonic::Status) -> DurableSnapsho
 /// wait is the expected outcome of enabling the bound, not a page.
 pub(crate) fn substrate_db_error(what: &str, error: &sqlx::Error) -> SubstrateError {
     let message = format!("{what}: {error}");
-    if pplx_space_common_svc::sql::contention::is_lock_contention(error) {
+    if pplx_space_postgres_pool::contention::is_lock_contention(error) {
         // `what` rather than `message`, which already interpolates `error`.
         tracing::warn!(%error, what, "substrate statement lost a lock race; retryable");
         return SubstrateError::LockContention { message };
@@ -982,7 +982,7 @@ impl From<crate::node_group_placement::NodeGroupPlacementResolveError> for Subst
             // the pod-build path that reports a bounded lock wait as
             // permanent, which is what the rest of this change removed.
             ResolveError::Catalog(NodeGroupCatalogError::Database(ref sql))
-                if pplx_space_common_svc::sql::contention::is_lock_contention(sql) =>
+                if pplx_space_postgres_pool::contention::is_lock_contention(sql) =>
             {
                 Self::LockContention { message }
             }

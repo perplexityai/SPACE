@@ -19,8 +19,8 @@
 //!    because on legacy rows the marker is NULL and naming it is what sends a
 //!    backup down the sandbox-id-only route.
 
-use pplx_space_common_svc::sql::sandbox_residency::CENSUS_INVENTORY_MAX_AGE;
 use pplx_space_db_test_fixtures::try_pg_test_db;
+use pplx_space_sandbox_residency::CENSUS_INVENTORY_MAX_AGE;
 use pplx_space_test_env::TestResult;
 use uuid::Uuid;
 

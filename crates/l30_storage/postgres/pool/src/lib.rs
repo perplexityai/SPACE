@@ -1,24 +1,23 @@
-//! Shared SQL helpers for service startup.
+//! Postgres connection pools for SPACE's managed database identities: the
+//! shared pool configuration, per-connection setup and pool-occupancy
+//! metrics every control-plane service uses, and the lock-contention
+//! classification for errors those pools return.
 
-use pplx_space_common_core::sql;
+use pplx_space_sql_locator::sql;
 use std::num::NonZeroU32;
 use std::time::Duration;
 
 use log::LevelFilter;
-use pplx_space_common_core::types::DatabaseIdentity;
+use pplx_space_db_identity::DatabaseIdentity;
 use sqlx::ConnectOptions as _;
 use sqlx::PgPool;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 
-pub use pplx_space_federated_grant_store as federated_service_grants;
+/// Classification of the SQLSTATEs a query on these pools returns when it
+/// lost a race and can succeed on retry. Part of this crate's API: callers
+/// write `pplx_space_postgres_pool::contention::…`.
 pub use pplx_space_postgres_contention as contention;
 pub mod identity;
-#[cfg(feature = "migration-checksums")]
-pub use pplx_space_migration_checksums as migration_checksums;
-pub use pplx_space_node_registration_store as node_registration;
-pub use pplx_space_sandbox_quarantine_store as sandbox_quarantine;
-pub mod sandbox_residency;
-pub use pplx_space_sandbox_routability as sandbox_routability;
 
 const POOL_METRICS_INTERVAL: Duration = Duration::from_secs(10);
 
@@ -280,7 +279,7 @@ async fn per_connection_setup(conn: &mut sqlx::PgConnection) -> Result<(), sqlx:
 }
 
 async fn warm_type_cache(conn: &mut sqlx::PgConnection) -> Result<(), sqlx::Error> {
-    sqlx::query_scalar::<_, Vec<crate::types::ReconcileReason>>(sql!(
+    sqlx::query_scalar::<_, Vec<pplx_space_state_reconciliation::ReconcileReason>>(sql!(
         "SELECT ARRAY['sandbox_network_policy_updated'::state_reconciliation_reason]"
     ))
     .fetch_one(conn)

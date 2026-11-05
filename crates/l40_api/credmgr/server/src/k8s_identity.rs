@@ -45,7 +45,7 @@ use tokio_util::sync::CancellationToken;
 use tonic::Status;
 
 use pplx_space_common_core::types::{PodName, PodUid};
-use pplx_space_common_svc::sql::node_registration::registered_node;
+use pplx_space_node_registration_store::registered_node;
 
 use crate::auth::{ClientService, K8sIdentity, K8sNodeIdentity};
 

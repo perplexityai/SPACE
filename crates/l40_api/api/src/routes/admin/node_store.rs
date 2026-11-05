@@ -13,18 +13,18 @@ use pplx_space_common_core::types::{
     NodeRole, SandboxId,
     admin::{AdminNodeCtlStatus, AdminNodeServiceHealth, ListAdminNodesFilters},
 };
-use pplx_space_common_svc::sql::sandbox_residency::{
-    ResidencyEvidence, active_resident_predicate, non_resident_lifecycle_exclusion,
-};
-#[cfg(test)]
-use pplx_space_common_svc::sql::sandbox_residency::{
-    node_heartbeat_fresh, occupies_node_predicate, resident_lifecycle,
-};
 #[cfg(test)]
 use pplx_space_sandbox_portability::drain_gate_blocker_pairs;
 use pplx_space_sandbox_portability::{
     drain_gate_blockers_for_node, inflight_suspend_upload_exists,
     snapshot_durable_for_source_release,
+};
+use pplx_space_sandbox_residency::{
+    ResidencyEvidence, active_resident_predicate, non_resident_lifecycle_exclusion,
+};
+#[cfg(test)]
+use pplx_space_sandbox_residency::{
+    node_heartbeat_fresh, occupies_node_predicate, resident_lifecycle,
 };
 use serde::Serialize;
 use sqlx::{FromRow, PgPool, Postgres, Transaction};

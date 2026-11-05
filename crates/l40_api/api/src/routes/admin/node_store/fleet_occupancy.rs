@@ -1,8 +1,8 @@
-use pplx_space_common_svc::sql::sandbox_residency::{
-    ResidencyEvidence, node_heartbeat_fresh, occupies_node_predicate, resident_lifecycle,
-};
 use pplx_space_sandbox_portability::{
     snapshot_durable_for_source_release, snapshot_is_current_local_artifact,
+};
+use pplx_space_sandbox_residency::{
+    ResidencyEvidence, node_heartbeat_fresh, occupies_node_predicate, resident_lifecycle,
 };
 
 use super::active_occupancy_lifecycles;

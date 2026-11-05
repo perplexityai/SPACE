@@ -180,8 +180,8 @@ RUST_ARTIFACT_COMMON_INPUTS = (
     Path("docker/Dockerfile.rust-build-common"),
     Path("docker/run-cargo-with-sccache.sh"),
     Path("infra/space/identity/node-identities.sh"),
-    # Embedded under common-svc's migration-checksums feature, which feature
-    # unification across all members turns on in every lane.
+    # Embedded by pplx-space-migration-checksums, which pplx-space-sqlite and
+    # pplx-space-db-migrate depend on.
     Path("db/accepted-checksums.toml"),
 )
 RUST_ARTIFACT_TEMPLATE_RECIPES = (
