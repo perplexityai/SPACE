@@ -944,6 +944,17 @@ impl SandboxTransitionTargetState {
             Self::Suspended => "suspended",
         }
     }
+
+    /// The lifecycle the transition leaves the sandbox in.
+    pub const fn lifecycle(self) -> SandboxLifecycle {
+        match self {
+            Self::Created => SandboxLifecycle::Created,
+            Self::Started => SandboxLifecycle::Started,
+            Self::Paused => SandboxLifecycle::Paused,
+            Self::Stopped => SandboxLifecycle::Stopped,
+            Self::Suspended => SandboxLifecycle::Suspended,
+        }
+    }
 }
 
 impl fmt::Display for SandboxTransitionTargetState {
