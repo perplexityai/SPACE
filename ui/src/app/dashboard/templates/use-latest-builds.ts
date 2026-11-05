@@ -6,7 +6,7 @@ import { isMissingRoute, pageRows } from '@/lib/admin-fallback';
 import { errorMessage } from '@/lib/template-format';
 import { ReadQueue } from '@/lib/read-queue';
 import { READ_TIMEOUT_MS } from '@/lib/template-reads';
-import type { LatestBuild } from '@/lib/template-list';
+import { buildsToRetry, type LatestBuild } from '@/lib/template-list';
 import type { TemplateBuildListEntry } from '@/lib/types';
 import { encodedPathSegment } from './use-templates-data';
 
@@ -140,5 +140,21 @@ export function useLatestBuilds(wanted: string[], reloadKey: number) {
     for (const [name, entry] of entries) values.set(name, entry.value);
     return values;
   }, [entries]);
-  return { builds, unsupported };
+
+  // The operator's Retry of failed reads (`buildsToRetry`): each template at
+  // most once a minute, through the queue.
+  const [retriedAt, setRetriedAt] = useState<ReadonlyMap<string, number>>(() => new Map());
+  const retryable = (names: string[]) => buildsToRetry(names, builds, retriedAt, Date.now());
+  const retry = (names: string[]) => {
+    const due = retryable(names);
+    if (due.length === 0) return;
+    const now = Date.now();
+    setRetriedAt((current) => {
+      const next = new Map(current);
+      for (const name of due) next.set(name, now);
+      return next;
+    });
+    enqueue(due);
+  };
+  return { builds, unsupported, retryable, retry };
 }

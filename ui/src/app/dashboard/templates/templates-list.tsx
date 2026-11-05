@@ -15,6 +15,7 @@ import {
   buildsToRead,
   clampPage,
   filterTemplateRows,
+  listEmptyText,
   needsEveryBuild,
   releaseMatches,
   sortTemplateRows,
@@ -95,7 +96,7 @@ export default function TemplatesList({ data, actions, state, onChange, orgs, on
     return list.slice((page - 1) * state.size, page * state.size);
   };
   const wanted = buildsToRead(pageOf(sortedCandidates), candidates, state);
-  const { builds, unsupported: buildsUnsupported } = useLatestBuilds(wanted, refreshGeneration);
+  const { builds, unsupported: buildsUnsupported, retryable, retry } = useLatestBuilds(wanted, refreshGeneration);
 
   const filtered = useMemo(
     () => (everyBuild ? filterTemplateRows(rows, state, builds, matches) : { rows: sortedCandidates, pendingBuilds: 0, unreadBuilds: 0 }),
@@ -106,6 +107,10 @@ export default function TemplatesList({ data, actions, state, onChange, orgs, on
     [everyBuild, filtered, state.sort, state.order, builds, orgNames],
   );
   const page = clampPage(state.page, state.size, shown.length);
+  // The build filter's rows whose latest-build read failed, and those its
+  // Retry may read again now.
+  const buildReadsFailed = everyBuild && candidates.some((row) => builds.get(row.name)?.kind === 'error');
+  const unreadRetryable = buildReadsFailed ? retryable(candidates.map((row) => row.name)).length : 0;
   const buildsPending = everyBuild ? candidates.filter((row) => !builds.has(row.name)).length : 0;
 
   const orgOptions = useMemo(() => {
@@ -427,9 +432,18 @@ export default function TemplatesList({ data, actions, state, onChange, orgs, on
       {templatesReadError ? <ReadErrorAlert what="the templates" error={templatesReadError} data={data} /> : null}
       {releasesReadError ? <ReadErrorAlert what="the releases" error={releasesReadError} data={data} /> : null}
       {filtered.unreadBuilds > 0 ? (
-        <Text type="warning">
-          {filtered.unreadBuilds} template{filtered.unreadBuilds === 1 ? '' : 's'} left out: the latest build could not be read.
-        </Text>
+        <Space size={8}>
+          <Text type="warning">
+            {filtered.unreadBuilds} template{filtered.unreadBuilds === 1 ? '' : 's'} left out: the latest build could not be read.
+          </Text>
+          {buildReadsFailed ? (
+            <Tooltip title={unreadRetryable > 0 ? undefined : "Each template's latest build is read again at most once a minute."}>
+              <Button size="small" disabled={unreadRetryable === 0} onClick={() => retry(candidates.map((row) => row.name))}>
+                Retry
+              </Button>
+            </Tooltip>
+          ) : null}
+        </Space>
       ) : null}
       {buildsPending > 0 ? (
         <Text type="secondary">
@@ -461,7 +475,12 @@ export default function TemplatesList({ data, actions, state, onChange, orgs, on
           change({ page: pagination.current ?? 1, size: pagination.pageSize ?? state.size });
         }}
         locale={{
-          emptyText: templatesReadError ? 'Not read' : filtersSet ? 'No template matches the search and filters' : undefined,
+          emptyText: listEmptyText({
+            readFailed: Boolean(templatesReadError),
+            filtersSet: Boolean(filtersSet),
+            pendingBuilds: filtered.pendingBuilds,
+            unreadBuilds: filtered.unreadBuilds,
+          }),
         }}
       />
     </Space>

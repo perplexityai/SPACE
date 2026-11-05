@@ -458,3 +458,35 @@ export function clampPage(page: number, size: number, total: number): number {
 export function buildsToRead(pageRows: TemplateListRow[], candidates: TemplateListRow[], state: TemplateListState): string[] {
   return (needsEveryBuild(state) ? candidates : pageRows).map((row) => row.name);
 }
+
+// The build filter's Retry re-reads the rows whose latest-build read failed
+// (an API without the route would refuse again), each at most once a minute
+// however often it is pressed. The reads go through the list's read queue.
+export const BUILD_RETRY_MS = 60_000;
+
+export function buildsToRetry(
+  names: string[],
+  latestBuilds: ReadonlyMap<string, LatestBuild>,
+  retriedAt: ReadonlyMap<string, number>,
+  now: number,
+): string[] {
+  return names.filter((name) => {
+    if (latestBuilds.get(name)?.kind !== 'error') return false;
+    const last = retriedAt.get(name);
+    return last === undefined || now - last >= BUILD_RETRY_MS;
+  });
+}
+
+// What an empty list says. It claims that no template matches only when
+// every row's latest build was read.
+export function listEmptyText(view: {
+  readFailed: boolean;
+  filtersSet: boolean;
+  pendingBuilds: number;
+  unreadBuilds: number;
+}): string | undefined {
+  if (view.readFailed) return 'Not read';
+  if (view.unreadBuilds > 0) return `No match among the templates read; ${view.unreadBuilds} could not be read`;
+  if (view.pendingBuilds > 0) return 'Reading the latest builds…';
+  return view.filtersSet ? 'No template matches the search and filters' : undefined;
+}

@@ -4,8 +4,10 @@ import {
   DEFAULT_LIST_STATE,
   buildBucket,
   buildsToRead,
+  buildsToRetry,
   clampPage,
   filterTemplateRows,
+  listEmptyText,
   listStateParams,
   parseListState,
   releaseMatches,
@@ -214,4 +216,26 @@ test('the releases search matches a template substring, a tag substring, a hash 
   assert.equal(matches(latest, 'sha256'), false, 'not by the digest tag the release carries');
   assert.equal(matches(latest, 'aaaaaaaa-0000'), true);
   assert.equal(matches({ template_name: 'seed', content_hash: null, tags: [] }, 'a1'), false, 'a node copy without a hash');
+});
+
+test("the build filter's Retry re-reads only rows whose read failed, each at most once a minute", () => {
+  const builds = new Map([
+    ['a', { kind: 'error', message: '503 Service Unavailable' }],
+    // An API without the route refuses again: not retried.
+    ['b', { kind: 'unsupported' }],
+    ['c', build('failed', '2026-11-04T00:00:00Z')],
+    ['d', { kind: 'error', message: '503 Service Unavailable' }],
+  ]);
+  const now = 10_000_000;
+  assert.deepEqual(buildsToRetry(['a', 'b', 'c', 'd', 'e'], builds, new Map(), now), ['a', 'd']);
+  assert.deepEqual(buildsToRetry(['a', 'd'], builds, new Map([['a', now - 59_000], ['d', now - 60_000]]), now), ['d']);
+});
+
+test('the empty list never claims that no template matches while a row is unread', () => {
+  const empty = (change) => listEmptyText({ readFailed: false, filtersSet: true, pendingBuilds: 0, unreadBuilds: 0, ...change });
+  assert.equal(empty({}), 'No template matches the search and filters');
+  assert.equal(empty({ unreadBuilds: 2 }), 'No match among the templates read; 2 could not be read');
+  assert.equal(empty({ pendingBuilds: 3 }), 'Reading the latest builds…');
+  assert.equal(empty({ readFailed: true, unreadBuilds: 2 }), 'Not read');
+  assert.equal(empty({ filtersSet: false }), undefined);
 });
