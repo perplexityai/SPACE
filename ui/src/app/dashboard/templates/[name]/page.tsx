@@ -9,10 +9,11 @@ import { adminApi } from '@/lib/api';
 import { LATEST_TAG, shortHash } from '@/lib/template-format';
 import { linkableTemplates } from '@/lib/system-template-rebuild';
 import { templateListRows } from '@/lib/template-list';
+import { firstReadError } from '@/lib/template-reads';
 import type { Organization } from '@/lib/types';
 import { useTemplatesData } from '../use-templates-data';
 import { useTemplateActions } from '../template-actions';
-import { COMPACT_TABLE_STYLE } from '../template-cells';
+import { COMPACT_TABLE_STYLE, ReadErrorAlert } from '../template-cells';
 import { TemplateBuildsPanel } from '../template-builds';
 import TemplateOverview from '../template-overview';
 import TemplatePool from '../template-pool';
@@ -113,24 +114,13 @@ function TemplateDetailPage() {
     );
   }
   if (!template) {
-    if (data.templatesError) {
+    const readError = firstReadError([{ loaded: data.templatesLoaded, error: data.templatesError }]);
+    if (readError) {
       return (
-        <Result
-          status="error"
-          title={`Template ${name} could not be loaded`}
-          subTitle={data.templatesError}
-          extra={(
-            <Space>
-              {back}
-              <Button
-                type="primary"
-                onClick={() => void data.refresh({ includeBaseSnapshotPolicies: true }).catch(() => undefined)}
-              >
-                Retry
-              </Button>
-            </Space>
-          )}
-        />
+        <div>
+          <div style={{ marginBottom: 8 }}>{back}</div>
+          <ReadErrorAlert what={`template ${name}`} error={readError} data={data} style={{ maxWidth: 720 }} />
+        </div>
       );
     }
     return <div style={{ padding: 48, textAlign: 'center' }}><Spin /></div>;

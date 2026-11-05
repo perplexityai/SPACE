@@ -7,10 +7,11 @@ import { DeleteOutlined } from '@ant-design/icons';
 import type { ColumnsType } from 'antd/es/table';
 import { shortHash } from '@/lib/template-format';
 import { releaseRowMatches, visibleTemplateTags } from '@/lib/template-list';
+import { firstReadError } from '@/lib/template-reads';
 import { tablePagination } from '@/lib/table-pagination';
 import type { TemplateRelease, TemplateReleaseWarmPool } from '@/lib/types';
 import {
-  formatShortDateTime, matchesWarmPoolFilter, tableFilterOptions, warmPoolLabel, warmPoolTooltip,
+  ReadErrorAlert, formatShortDateTime, matchesWarmPoolFilter, tableFilterOptions, warmPoolLabel, warmPoolTooltip,
 } from './template-cells';
 import type { TemplateActions } from './template-actions';
 import type { TemplatesData } from './use-templates-data';
@@ -42,7 +43,7 @@ export default function ReleasesTable({ data, actions, templateName, search, onS
   );
   const focused = Boolean(highlight && onClearHighlight);
   // The first read failed: nothing is known about the releases yet.
-  const readError = !data.releasesLoaded ? data.releasesError : null;
+  const readError = firstReadError([{ loaded: data.releasesLoaded, error: data.releasesError }]);
   const shown = useMemo(
     () => (focused
       ? scoped.filter((release) => release.id === highlight)
@@ -214,13 +215,7 @@ export default function ReleasesTable({ data, actions, templateName, search, onS
   return (
     <>
       {readError ? (
-        <Alert
-          type="error"
-          showIcon
-          style={{ marginBottom: 8 }}
-          title={`Could not read the releases: ${readError}`}
-          action={<Button size="small" onClick={data.handleManualRefresh} disabled={data.refreshCooldown}>Retry</Button>}
-        />
+        <ReadErrorAlert what="the releases" error={readError} data={data} style={{ marginBottom: 8 }} />
       ) : null}
       {focused && !readError ? (
         <Alert

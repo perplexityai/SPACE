@@ -1,10 +1,11 @@
 'use client';
 
-import { Space, Tag, Tooltip, Typography, theme } from 'antd';
+import type { CSSProperties } from 'react';
+import { Alert, Button, Space, Tag, Tooltip, Typography, theme } from 'antd';
 import type { LatestBuild } from '@/lib/template-list';
 import { formatAge, formatBytes } from '@/lib/sandbox-debug';
 import type { NodeRole, SpaceNode, Template, TemplateBuildListEntry, TemplateReleaseWarmPool } from '@/lib/types';
-import type { TemplateNodeAvailability } from './use-templates-data';
+import type { TemplateNodeAvailability, TemplatesData } from './use-templates-data';
 
 const { Text } = Typography;
 
@@ -237,4 +238,23 @@ export function LatestBuildCell({ latest, now }: { latest: LatestBuild | undefin
         </Space>
       );
   }
+}
+
+// A read that failed before it ever answered (`firstReadError`): the view says
+// so, with Retry, rather than loading forever or showing an empty table.
+export function ReadErrorAlert({ what, error, data, style }: {
+  what: string;
+  error: string;
+  data: Pick<TemplatesData, 'handleManualRefresh' | 'refreshCooldown'>;
+  style?: CSSProperties;
+}) {
+  return (
+    <Alert
+      type="error"
+      showIcon
+      style={style}
+      title={`Could not read ${what}: ${error}`}
+      action={<Button size="small" onClick={data.handleManualRefresh} disabled={data.refreshCooldown}>Retry</Button>}
+    />
+  );
 }

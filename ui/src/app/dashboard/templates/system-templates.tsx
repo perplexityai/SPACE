@@ -1,9 +1,11 @@
 'use client';
 
 import Link from 'next/link';
-import { Alert, Button, Space, Table, Tag, Tooltip, Typography } from 'antd';
+import { Space, Table, Tag, Tooltip, Typography } from 'antd';
 import { LATEST_TAG, shortHash } from '@/lib/template-format';
 import { linkableTemplates } from '@/lib/system-template-rebuild';
+import { firstReadError } from '@/lib/template-reads';
+import { ReadErrorAlert } from './template-cells';
 import SystemTemplateRebuild from './system-template-rebuild';
 import type { TemplatesData } from './use-templates-data';
 import { templateHref } from './links';
@@ -21,19 +23,15 @@ export default function SystemTemplates({ data }: { data: TemplatesData }) {
     return { name, template, latest };
   });
 
-  // A read that failed before any answer is an error, not loading.
-  const readError = (!data.templatesLoaded && data.templatesError) || (!data.releasesLoaded && data.releasesError) || null;
+  const readError = firstReadError([
+    { loaded: data.templatesLoaded, error: data.templatesError },
+    { loaded: data.releasesLoaded, error: data.releasesError },
+  ]);
 
   return (
     <Space orientation="vertical" size={8} style={{ width: '100%' }}>
       {readError ? (
-        <Alert
-          type="error"
-          showIcon
-          style={{ maxWidth: 720 }}
-          title={`Could not read the system templates: ${readError}`}
-          action={<Button size="small" onClick={data.handleManualRefresh} disabled={data.refreshCooldown}>Retry</Button>}
-        />
+        <ReadErrorAlert what="the system templates" error={readError} data={data} style={{ maxWidth: 720 }} />
       ) : null}
       <Table
         size="small"

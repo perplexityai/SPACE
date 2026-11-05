@@ -26,8 +26,9 @@ import {
   type TemplateListState,
 } from '@/lib/template-list';
 import { orgOptionLabels } from '@/lib/org-filter';
+import { firstReadError } from '@/lib/template-reads';
 import type { Organization } from '@/lib/types';
-import { LatestBuildCell } from './template-cells';
+import { LatestBuildCell, ReadErrorAlert } from './template-cells';
 import type { TemplateActions } from './template-actions';
 import type { TemplatesData } from './use-templates-data';
 import { useLatestBuilds } from './use-latest-builds';
@@ -54,8 +55,11 @@ interface Props {
 export default function TemplatesList({ data, actions, state, onChange, orgs, onRebuild }: Props) {
   const {
     templates, templateReleases, releasesLoaded, inventory, inventoryLoaded, warmPoolPolicies, supportsClusterPools,
-    loadingTemplates, refreshGeneration,
+    loadingTemplates, refreshGeneration, templatesLoaded, templatesError, releasesError,
   } = data;
+  // A first read that failed shows its error, not an empty list or "…".
+  const templatesReadError = firstReadError([{ loaded: templatesLoaded, error: templatesError }]);
+  const releasesReadError = firstReadError([{ loaded: releasesLoaded, error: releasesError }]);
   const { handleDelete, templateOperationRunning } = actions;
   const { token } = theme.useToken();
   const change = (next: Partial<TemplateListState>) => onChange(withListChange(state, next));
@@ -157,7 +161,11 @@ export default function TemplatesList({ data, actions, state, onChange, orgs, on
       ...sortable('release'),
       width: 262,
       render: (_, row) => {
-        if (row.published === null) return <Text type="secondary">…</Text>;
+        if (row.published === null) {
+          return releasesReadError
+            ? <Tooltip title={releasesReadError}><Text type="warning">not read</Text></Tooltip>
+            : <Text type="secondary">…</Text>;
+        }
         if (!row.newest) {
           return (
             <Tooltip title="No release has been published for this template: it may never have been built, every build may have failed, or its releases were unpublished.">
@@ -416,6 +424,8 @@ export default function TemplatesList({ data, actions, state, onChange, orgs, on
           )}
         />
       ) : null}
+      {templatesReadError ? <ReadErrorAlert what="the templates" error={templatesReadError} data={data} /> : null}
+      {releasesReadError ? <ReadErrorAlert what="the releases" error={releasesReadError} data={data} /> : null}
       {filtered.unreadBuilds > 0 ? (
         <Text type="warning">
           {filtered.unreadBuilds} template{filtered.unreadBuilds === 1 ? '' : 's'} left out: the latest build could not be read.
@@ -450,7 +460,9 @@ export default function TemplatesList({ data, actions, state, onChange, orgs, on
           }
           change({ page: pagination.current ?? 1, size: pagination.pageSize ?? state.size });
         }}
-        locale={{ emptyText: filtersSet ? 'No template matches the search and filters' : undefined }}
+        locale={{
+          emptyText: templatesReadError ? 'Not read' : filtersSet ? 'No template matches the search and filters' : undefined,
+        }}
       />
     </Space>
   );
