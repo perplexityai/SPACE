@@ -120,7 +120,28 @@ pub fn init_service_subprocess_with_log_context(
     install_default_rustls_crypto_provider();
     bootstrap::set_current_service_name(service_name);
     bootstrap::initialize_failed_grpc_request_logging();
-    pplx_space_observability::init_with_log_context(service_name, log_context)
+    // A malformed process cluster id is dropped by its owner. Its warning is
+    // emitted on the first read, normally this one, before the subscriber
+    // below is installed, so it is not logged.
+    let log_context = with_process_cluster_id(
+        log_context,
+        pplx_space_common_core::types::cluster::process_cluster_id(),
+    );
+    pplx_space_observability::init(service_name, log_context)
+}
+
+/// `log_context` with the process-global cluster id as its only cluster id,
+/// replacing or clearing any the caller set. That id has one owner, which the
+/// sandbox-event stream also reads, so logs, metrics and events never
+/// disagree about it.
+fn with_process_cluster_id(
+    log_context: LogContext,
+    cluster_id: Option<&pplx_space_common_core::types::cluster::ClusterId>,
+) -> LogContext {
+    match cluster_id {
+        Some(cluster_id) => log_context.with_cluster_id(cluster_id.as_str()),
+        None => log_context.without_cluster_id(),
+    }
 }
 
 pub use pplx_space_rustls_provider::install_default_rustls_crypto_provider;
@@ -148,10 +169,13 @@ pub use rate_limiter::{
 };
 
 pub use peer_auth::{
-    AuthorizedUdsPeer, LocalRole, PEER_PROCESS_CHECK_ENV, ParsePeerProcessCheckModeError,
-    PeerIdentity, PeerProcessCheckMode, PeerProcessCheckModeEnvError, UdsPeerAccount,
-    UdsPeerAuthorizer, UdsPeerPrincipal, capability, peer_identity_from_tonic_request,
-    peer_may_set_local_authority, require_local_authority_peer,
+    AuthorizedUdsPeer, ContentAddressedInstalls, LocalRole, PEER_PROCESS_CHECK_ENV,
+    ParsePeerProcessCheckModeError, PeerIdentity, PeerProcessCheckMode,
+    PeerProcessCheckModeEnvError, UdsPeerAccount, UdsPeerAuthorizer, UdsPeerPrincipal, capability,
+    peer_identity_from_tonic_request, peer_may_set_local_authority, require_local_authority_peer,
 };
 
 pub use pplx_space_ingress_admission as ingress_admission;
+
+#[cfg(test)]
+mod tests;

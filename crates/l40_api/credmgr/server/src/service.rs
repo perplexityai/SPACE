@@ -19,7 +19,8 @@ use pplx_space_common_svc::core::types::{
 };
 use pplx_space_common_svc::sql::contention;
 use pplx_space_common_svc::{
-    PeerProcessCheckMode, UdsPeerAccount, UdsPeerAuthorizer, UdsPeerPrincipal, capability,
+    ContentAddressedInstalls, PeerProcessCheckMode, UdsPeerAccount, UdsPeerAuthorizer,
+    UdsPeerPrincipal, capability,
 };
 use tonic::{Request, Response, Status};
 
@@ -195,7 +196,8 @@ impl CredentialManagerService {
         //    socket — e.g., if `space-sbxmgr` were ever made to spawn
         //    a helper, or if a developer runs an ad-hoc tool as
         //    `space-sbxmgr`. The allowlists cover both `/opt/space/bin`
-        //    (Helm) and `/space/bin` (systemd) install layouts.
+        //    (Helm) and `/space/bin` (systemd) install layouts, and the
+        //    systemd layout's content-addressed `/space/apps` builds.
         // 2. **Forbidden capabilities** (`forbid_capabilities`): the
         //    peer must NOT hold `CAP_SYS_PTRACE`. sandbox-manager and
         //    template-manager have no legitimate need for ptrace, and
@@ -218,17 +220,30 @@ impl CredentialManagerService {
                 UdsPeerAuthorizer::new(
                     "space-credential-manager",
                     [
-                        UdsPeerAccount::with_linux_user(users::SPACE_SBXMGR)
-                            .require_binary(paths::SPACE_SBXMGR_UID_BINARIES)
-                            .forbid_capabilities(capability::CAP_SYS_PTRACE),
-                        UdsPeerAccount::with_linux_user(users::SPACE_VOLMGR)
-                            .require_binary(paths::SPACE_VOLMGR_SVC_BINARIES)
-                            .forbid_capabilities(capability::CAP_SYS_PTRACE),
-                        UdsPeerAccount::with_linux_user(users::SPACE_TMPLMGR)
-                            .require_binary(paths::SPACE_TMPLMGR_SVC_BINARIES)
-                            .forbid_capabilities(capability::CAP_SYS_PTRACE),
+                        UdsPeerAccount::with_fallback_uid(
+                            users::SPACE_SBXMGR.name,
+                            users::SPACE_SBXMGR.uid,
+                        )
+                        .require_binary(paths::SPACE_SBXMGR_UID_BINARIES)
+                        .forbid_capabilities(capability::CAP_SYS_PTRACE),
+                        UdsPeerAccount::with_fallback_uid(
+                            users::SPACE_VOLMGR.name,
+                            users::SPACE_VOLMGR.uid,
+                        )
+                        .require_binary(paths::SPACE_VOLMGR_SVC_BINARIES)
+                        .forbid_capabilities(capability::CAP_SYS_PTRACE),
+                        UdsPeerAccount::with_fallback_uid(
+                            users::SPACE_TMPLMGR.name,
+                            users::SPACE_TMPLMGR.uid,
+                        )
+                        .require_binary(paths::SPACE_TMPLMGR_SVC_BINARIES)
+                        .forbid_capabilities(capability::CAP_SYS_PTRACE),
                     ],
                 )
+                .with_content_addressed_installs(ContentAddressedInstalls {
+                    bin_dir: paths::SPACE_SYSTEMD_BIN_DIR,
+                    apps_dir: paths::SPACE_SYSTEMD_APPS_DIR,
+                })
                 .with_process_check_mode(peer_process_check_mode),
             ),
             storage_vend_role: None,

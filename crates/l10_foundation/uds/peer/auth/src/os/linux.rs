@@ -8,7 +8,7 @@
 //! stripped (`strip_exe_deleted_marker`) before being stored, so a
 //! replaced-but-running peer doesn't poison the allowlist comparison.
 
-use pplx_space_common_core::host::linux::paths::{exe_link_was_deleted, strip_exe_deleted_marker};
+use crate::exe::{exe_link_was_deleted, strip_exe_deleted_marker};
 
 use super::super::PeerProcessSnapshot;
 

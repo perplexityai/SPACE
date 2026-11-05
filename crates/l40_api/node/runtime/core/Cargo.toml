@@ -12,7 +12,7 @@ workspace = true
 
 [features]
 default = []
-host-runtime = ["dep:aws-lc-rs", "dep:nix", "dep:rustix", "dep:subtle", "dep:zeroize", "dep:pplx-space-net-common", "dep:pplx-space-metrics"]
+host-runtime = ["dep:aws-lc-rs", "dep:nix", "dep:rustix", "dep:subtle", "dep:zeroize", "dep:pplx-space-net-common", "dep:pplx-space-metrics", "dep:pplx-space-uds-peer-auth"]
 # The node's root-owned store of runtime releases and guest kernels, which
 # node-manager publishes into.
 artifact-store = ["dep:rustix", "rustix/fs"]
@@ -48,6 +48,7 @@ pplx-space-common-io = { workspace = true, features = ["reflink"] }
 pplx-space-execution-common = { workspace = true }
 pplx-space-metrics = { workspace = true, optional = true }
 pplx-space-net-common = { workspace = true, features = ["host-sockets"], optional = true }
+pplx-space-uds-peer-auth = { workspace = true, optional = true }
 
 [build-dependencies]
 anyhow = { workspace = true }

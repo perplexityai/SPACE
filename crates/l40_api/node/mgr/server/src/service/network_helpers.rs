@@ -166,13 +166,13 @@ pub(super) fn node_peer_authorizer() -> UdsPeerAuthorizer {
     UdsPeerAuthorizer::new_with_default_local_roles(
         "space-node-manager",
         [
-            UdsPeerAccount::with_linux_user(users::SPACE_SBXMGR),
-            UdsPeerAccount::with_linux_user(users::SPACE_NODEAPI),
-            UdsPeerAccount::with_linux_user(users::SPACE_NODECTL),
-            UdsPeerAccount::with_linux_user(users::SPACE_TMPLMGR),
-            UdsPeerAccount::with_linux_user(users::SPACE_VOLMGR),
+            UdsPeerAccount::with_fallback_uid(users::SPACE_SBXMGR.name, users::SPACE_SBXMGR.uid),
+            UdsPeerAccount::with_fallback_uid(users::SPACE_NODEAPI.name, users::SPACE_NODEAPI.uid),
+            UdsPeerAccount::with_fallback_uid(users::SPACE_NODECTL.name, users::SPACE_NODECTL.uid),
+            UdsPeerAccount::with_fallback_uid(users::SPACE_TMPLMGR.name, users::SPACE_TMPLMGR.uid),
+            UdsPeerAccount::with_fallback_uid(users::SPACE_VOLMGR.name, users::SPACE_VOLMGR.uid),
             // Publishes into and removes from the node's artifact store only.
-            UdsPeerAccount::with_linux_user(users::SPACE_RTMGR),
+            UdsPeerAccount::with_fallback_uid(users::SPACE_RTMGR.name, users::SPACE_RTMGR.uid),
         ],
     )
 }

@@ -1028,10 +1028,13 @@ fn template_peer_authorizer() -> UdsPeerAuthorizer {
     UdsPeerAuthorizer::new_with_default_local_roles(
         "space-template-manager",
         [
-            UdsPeerAccount::with_linux_user(users::SPACE_NODEAPI),
-            UdsPeerAccount::with_linux_user(users::SPACE_SBXMGR),
-            UdsPeerAccount::with_linux_user(users::SPACE_K8S_NODE_CONTROLLER),
-            UdsPeerAccount::with_linux_user(users::SPACE_NODECTL),
+            UdsPeerAccount::with_fallback_uid(users::SPACE_NODEAPI.name, users::SPACE_NODEAPI.uid),
+            UdsPeerAccount::with_fallback_uid(users::SPACE_SBXMGR.name, users::SPACE_SBXMGR.uid),
+            UdsPeerAccount::with_fallback_uid(
+                users::SPACE_K8S_NODE_CONTROLLER.name,
+                users::SPACE_K8S_NODE_CONTROLLER.uid,
+            ),
+            UdsPeerAccount::with_fallback_uid(users::SPACE_NODECTL.name, users::SPACE_NODECTL.uid),
         ],
     )
 }

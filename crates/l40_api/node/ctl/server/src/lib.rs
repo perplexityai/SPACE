@@ -683,10 +683,22 @@ pub async fn run(
             peer_authorizer: UdsPeerAuthorizer::new_with_default_local_roles(
                 SERVICE_NAME,
                 [
-                    UdsPeerAccount::with_linux_user(users::SPACE_NODEAPI),
-                    UdsPeerAccount::with_linux_user(users::SPACE_SBXMGR),
-                    UdsPeerAccount::with_linux_user(users::SPACE_TMPLMGR),
-                    UdsPeerAccount::with_linux_user(users::SPACE_NODECTL),
+                    UdsPeerAccount::with_fallback_uid(
+                        users::SPACE_NODEAPI.name,
+                        users::SPACE_NODEAPI.uid,
+                    ),
+                    UdsPeerAccount::with_fallback_uid(
+                        users::SPACE_SBXMGR.name,
+                        users::SPACE_SBXMGR.uid,
+                    ),
+                    UdsPeerAccount::with_fallback_uid(
+                        users::SPACE_TMPLMGR.name,
+                        users::SPACE_TMPLMGR.uid,
+                    ),
+                    UdsPeerAccount::with_fallback_uid(
+                        users::SPACE_NODECTL.name,
+                        users::SPACE_NODECTL.uid,
+                    ),
                 ],
             ),
         }))

@@ -230,8 +230,14 @@ impl VolumeManagerService {
             peer_authorizer: UdsPeerAuthorizer::new(
                 crate::SERVICE_NAME,
                 [
-                    UdsPeerAccount::with_linux_user(users::SPACE_SBXMGR),
-                    UdsPeerAccount::with_linux_user(users::SPACE_TMPLMGR),
+                    UdsPeerAccount::with_fallback_uid(
+                        users::SPACE_SBXMGR.name,
+                        users::SPACE_SBXMGR.uid,
+                    ),
+                    UdsPeerAccount::with_fallback_uid(
+                        users::SPACE_TMPLMGR.name,
+                        users::SPACE_TMPLMGR.uid,
+                    ),
                 ],
             ),
         })

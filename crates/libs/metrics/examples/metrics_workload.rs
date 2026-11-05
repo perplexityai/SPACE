@@ -6,7 +6,13 @@ use pplx_space_metrics::{node_manager, sandbox};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let guard = pplx_space_observability::init("space-oss-workload")?;
+    let log_context = match pplx_space_common_core::types::cluster::process_cluster_id() {
+        Some(cluster_id) => {
+            pplx_space_observability::LogContext::default().with_cluster_id(cluster_id.as_str())
+        }
+        None => pplx_space_observability::LogContext::default(),
+    };
+    let guard = pplx_space_observability::init("space-oss-workload", log_context)?;
     let start = tokio::time::Instant::now();
     let mut increments = 0_u64;
     let mut active_ticks = 0_u64;

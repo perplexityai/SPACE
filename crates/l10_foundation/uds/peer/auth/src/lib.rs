@@ -73,9 +73,9 @@ use http::Request as HttpRequest;
 use tonic::transport::server::UdsConnectInfo;
 use tonic::{Request as TonicRequest, Status};
 
-use pplx_space_common_core::host::linux::paths::{
-    SPACE_SYSTEMD_APPS_DIR, SPACE_SYSTEMD_BIN_DIR, is_content_addressed_binary_file_name,
-};
+pub mod exe;
+
+use exe::is_content_addressed_binary_file_name;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct PeerIdentity {
@@ -214,17 +214,6 @@ impl UdsPeerAccount {
         }
     }
 
-    pub const fn with_linux_user(
-        user: pplx_space_common_core::host::linux::identities::LinuxUser,
-    ) -> Self {
-        Self {
-            name: user.name,
-            fallback_uid: Some(user.uid),
-            principal: UdsPeerPrincipal::Service(user.name),
-            process_checks: PeerProcessChecks::EMPTY,
-        }
-    }
-
     pub const fn role(name: &'static str, role: LocalRole) -> Self {
         Self {
             name,
@@ -253,7 +242,8 @@ impl UdsPeerAccount {
     /// peer's effective uid in `/proc/<pid>/status` to detect pid
     /// reuse. An entry admits the observed exe literally, as the
     /// entry's current symlink target (resolved at check time), or as
-    /// the entry's content-addressed systemd install — the kernel
+    /// the entry's content-addressed install when the authorizer is
+    /// configured with [`ContentAddressedInstalls`] — the kernel
     /// resolves `/proc/<pid>/exe` fully, so a peer execed through an
     /// install symlink never reports the stable link path itself.
     ///
@@ -281,8 +271,8 @@ pub struct PeerProcessChecks {
     /// Allowlist of stable install paths for the peer's binary. The
     /// observed `/proc/<pid>/exe` matches an entry literally, as the
     /// entry's current symlink target (resolved at check time), or as
-    /// the entry's content-addressed systemd install under
-    /// `/space/apps`. Empty disables the check.
+    /// the entry's content-addressed install (see
+    /// [`ContentAddressedInstalls`]). Empty disables the check.
     binary_paths: &'static [&'static str],
     /// Bits that MUST be absent from the peer's effective capability
     /// set. `0` disables this half of the capability check.
@@ -305,6 +295,22 @@ impl Default for PeerProcessChecks {
     fn default() -> Self {
         Self::EMPTY
     }
+}
+
+/// A deployment layout that installs each build of a binary as an
+/// immutable `<apps_dir>/<name>-<sha256[:8]>` file and repoints the stable
+/// `<bin_dir>/<name>` symlink at the current one. An exec through the
+/// symlink makes `/proc/<pid>/exe` report the digest target, so with this
+/// layout configured an allowlist entry under `bin_dir` also admits its
+/// content-addressed install. Writing under `apps_dir` must require the
+/// same privilege as writing `bin_dir`, so this admits no one the literal
+/// check would have kept out.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ContentAddressedInstalls {
+    /// Directory of the stable per-binary symlinks.
+    pub bin_dir: &'static str,
+    /// Directory of the immutable per-build files the symlinks point at.
+    pub apps_dir: &'static str,
 }
 
 /// Bitmask helpers for selected Linux capabilities.
@@ -458,6 +464,7 @@ pub struct UdsPeerAuthorizer {
     service_name: Arc<str>,
     accounts: Vec<ResolvedUdsPeerAccount>,
     process_check_mode: PeerProcessCheckMode,
+    content_addressed_installs: Option<ContentAddressedInstalls>,
 }
 
 impl UdsPeerAuthorizer {
@@ -475,7 +482,22 @@ impl UdsPeerAuthorizer {
             service_name: service_name.into(),
             accounts: accounts.into_iter().map(resolve_account).collect(),
             process_check_mode: PeerProcessCheckMode::Off,
+            content_addressed_installs: None,
         }
+    }
+
+    /// Admits the content-addressed install of each `require_binary` entry
+    /// under `layout.bin_dir`. Without it, only the literal entry and its
+    /// current symlink target match.
+    pub fn with_content_addressed_installs(mut self, layout: ContentAddressedInstalls) -> Self {
+        self.content_addressed_installs = Some(layout);
+        self
+    }
+
+    /// The layout set by
+    /// [`with_content_addressed_installs`](Self::with_content_addressed_installs).
+    pub fn content_addressed_installs(&self) -> Option<ContentAddressedInstalls> {
+        self.content_addressed_installs
     }
 
     /// Sets the [`PeerProcessCheckMode`].
@@ -496,6 +518,24 @@ impl UdsPeerAuthorizer {
         Self::new(
             service_name,
             accounts.into_iter().chain(default_local_role_accounts()),
+        )
+    }
+
+    /// `account`'s process-level checks against `snapshot`, under this
+    /// authorizer's install layout.
+    fn evaluate_account_checks(
+        &self,
+        account: &ResolvedUdsPeerAccount,
+        expected_uid: u32,
+        snapshot: &PeerProcessSnapshot,
+        resolve_binary_targets: impl FnOnce(&'static [&'static str]) -> Vec<PathBuf>,
+    ) -> Result<(), ProcessCheckFailure> {
+        evaluate_process_checks(
+            &account.process_checks,
+            self.content_addressed_installs,
+            expected_uid,
+            snapshot,
+            resolve_binary_targets,
         )
     }
 
@@ -699,8 +739,8 @@ impl UdsPeerAuthorizer {
             pplx_space_metrics::auth::uds_peer_exe_deleted(&self.service_name, principal);
         }
 
-        if let Err(err) = evaluate_process_checks(
-            &account.process_checks,
+        if let Err(err) = self.evaluate_account_checks(
+            account,
             identity.uid(),
             &snapshot,
             resolve_binary_allowlist_targets,
@@ -916,7 +956,7 @@ impl ProcessCheckFailure {
 /// check time*, yielding the canonical file its symlink chain currently
 /// points at. Entries that don't exist on this host (the other layout's
 /// path) resolve to nothing. Check-time rather than startup so a deploy
-/// repointing a `/space/bin` symlink is seen by the next RPC instead of
+/// repointing an install symlink is seen by the next RPC instead of
 /// going stale with the process.
 fn resolve_binary_allowlist_targets(paths: &[&str]) -> Vec<PathBuf> {
     paths
@@ -926,40 +966,43 @@ fn resolve_binary_allowlist_targets(paths: &[&str]) -> Vec<PathBuf> {
 }
 
 /// Which filesystem-free form of `entry` the observed `/proc/<pid>/exe`
-/// satisfies: the entry itself (`literal`) or the content-addressed install
-/// the systemd deploy script produces for it (`content_addressed`). The
+/// satisfies: the entry itself (`literal`) or, under a configured `layout`,
+/// the entry's content-addressed install (`content_addressed`). The
 /// third admitted form — the entry's current symlink target — needs a
 /// filesystem read and is supplied by the caller via
 /// [`resolve_binary_allowlist_targets`].
-fn exe_allowlist_match_form(entry: &Path, exe: &Path) -> Option<&'static str> {
+fn exe_allowlist_match_form(
+    entry: &Path,
+    exe: &Path,
+    layout: Option<ContentAddressedInstalls>,
+) -> Option<&'static str> {
     if exe == entry {
         Some("literal")
-    } else if is_content_addressed_install(exe, entry) {
+    } else if layout.is_some_and(|layout| is_content_addressed_install(exe, entry, layout)) {
         Some("content_addressed")
     } else {
         None
     }
 }
 
-/// The supported systemd deployment layout installs each service build at
-/// `/space/apps/<name>-<sha256[:8]>` and repoints the stable
-/// `/space/bin/<name>` symlink; execs through the symlink make
-/// `/proc/<pid>/exe` report the digest target. Admitting the shape keeps
-/// a peer still running the pre-swap build authorized during the window
-/// between `ln -sfn` and its service restart, which check-time symlink
-/// resolution alone would deny. Writing under `/space/apps` requires the
-/// same privilege as writing `/space/bin`, so this admits no one the
-/// literal check would have kept out.
+/// Admitting the content-addressed shape keeps a peer still running the
+/// pre-swap build authorized during the window between the symlink swap and
+/// its service restart, which check-time symlink resolution alone would
+/// deny.
 ///
-/// Applies only to entries under the systemd bin dir: that layout is the
-/// sole producer of the digest shape, and letting it satisfy a Helm-layout
-/// entry (a real file under `/opt/space/bin`) would widen that entry for
+/// Applies only to entries under `layout.bin_dir`: that layout is the sole
+/// producer of the digest shape, and letting it satisfy an entry elsewhere
+/// (a real file in another install directory) would widen that entry for
 /// no reachable install.
-fn is_content_addressed_install(exe: &Path, entry: &Path) -> bool {
-    if entry.parent() != Some(Path::new(SPACE_SYSTEMD_BIN_DIR)) {
+fn is_content_addressed_install(
+    exe: &Path,
+    entry: &Path,
+    layout: ContentAddressedInstalls,
+) -> bool {
+    if entry.parent() != Some(Path::new(layout.bin_dir)) {
         return false;
     }
-    if exe.parent() != Some(Path::new(SPACE_SYSTEMD_APPS_DIR)) {
+    if exe.parent() != Some(Path::new(layout.apps_dir)) {
         return false;
     }
     let (Some(exe_name), Some(entry_name)) = (
@@ -979,6 +1022,7 @@ fn is_content_addressed_install(exe: &Path, entry: &Path) -> bool {
 /// forms of the binary check both miss.
 fn evaluate_process_checks(
     checks: &PeerProcessChecks,
+    layout: Option<ContentAddressedInstalls>,
     expected_uid: u32,
     snapshot: &PeerProcessSnapshot,
     resolve_binary_targets: impl FnOnce(&'static [&'static str]) -> Vec<PathBuf>,
@@ -1002,7 +1046,7 @@ fn evaluate_process_checks(
         let form = checks
             .binary_paths
             .iter()
-            .find_map(|entry| exe_allowlist_match_form(Path::new(entry), &snapshot.exe))
+            .find_map(|entry| exe_allowlist_match_form(Path::new(entry), &snapshot.exe, layout))
             .or_else(|| {
                 resolve_binary_targets(checks.binary_paths)
                     .contains(&snapshot.exe)

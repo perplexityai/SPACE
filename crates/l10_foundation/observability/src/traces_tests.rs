@@ -232,7 +232,8 @@ fn disabling_traces_preserves_pool_metrics() {
         }
     }
     assert!(crate::METRICS.set(Box::new(CaptureSink)).is_ok());
-    let guard = crate::init("trace-off-metrics").expect("off initializer");
+    let guard =
+        crate::init("trace-off-metrics", crate::LogContext::default()).expect("off initializer");
     tracing::info!(target: "sqlx::pool::acquire", acquired_after_secs = 0.001_f64);
     assert_eq!(
         ACQUIRES.load(Ordering::Relaxed),
