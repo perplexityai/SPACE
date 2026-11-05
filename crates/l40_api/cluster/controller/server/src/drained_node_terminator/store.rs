@@ -669,6 +669,11 @@ mod substrate_scope_tests;
 #[cfg(test)]
 mod stored_lifecycle_matrix_tests;
 
+/// Postgres-backed coverage for what the give-up's write-off finalizes and
+/// keeps, and for its lock on the kube uid.
+#[cfg(test)]
+mod gone_node_scope_tests;
+
 /// Plan regression for the give-up claim on a node with a large, durable
 /// pinned history.
 #[cfg(test)]

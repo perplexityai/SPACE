@@ -5273,6 +5273,12 @@ mod tombstone_tests;
 #[cfg(test)]
 mod durable_upload_gate_tests;
 
+/// Postgres-backed coverage for what the gone-node give-ups leave alone, which
+/// uploads the upload flip finalizes, and the per-sandbox adopt and mark-lost
+/// vetoes the gate tests leave open.
+#[cfg(test)]
+mod gone_node_scope_tests;
+
 /// Postgres-backed coverage for the per-node backup queue read: the flag, the
 /// per-node gate, the fallback, and the differential against the statement
 /// this replaces. The branch between the two statements lives here because it

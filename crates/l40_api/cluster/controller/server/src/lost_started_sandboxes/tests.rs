@@ -30,6 +30,9 @@
 //! - P9 `p9_only_recovery_failed_started_kubernetes_rows_are_listed`
 //! - P10 `p10_flip_rechecks_restore_sources_and_generation`
 //! - P11 `p11_flip_rechecks_placement_drain_lifecycle_and_substrate`
+//! - P12 `p12_only_a_started_row_flips`
+//! - P13 `p13_write_off_keeps_other_nodes_rows_and_retired_executions`
+//! - P14 `p14_concurrent_node_change_refuses_the_flip`
 
 use pplx_space_common_core::types::{NodeId, SandboxId};
 
@@ -544,12 +547,14 @@ async fn t12_absence_must_last_the_grace_and_restarts_on_return() {
 
 mod postgres_backed {
     use pplx_space_common_core::sql;
-    use pplx_space_common_core::types::SnapshotId;
+    use pplx_space_common_core::types::{SandboxLifecycle, SnapshotId};
     use pplx_space_db_test_fixtures::{SEED_ORG_ID, SEED_USER_ID, try_pg_test_db};
+    use pplx_space_sandbox_store::lost::mark_started_lost;
     use pplx_space_test_env::TestResult;
     use sqlx::PgPool;
 
     use super::*;
+    use crate::drained_node_terminator::store::DEAD_UPLOAD_SETTLE;
     use crate::lifecycle_writer_test_support::{ExecutionSeed, insert_execution};
     use crate::lost_started_sandboxes::store::LostStartedDbStore;
 
@@ -1119,6 +1124,202 @@ mod postgres_backed {
                 .await?;
         }
         assert_eq!(listed(&store).await?.len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn p12_only_a_started_row_flips() -> TestResult {
+        let Some(db) = try_pg_test_db().await? else {
+            return Ok(());
+        };
+        let store = LostStartedDbStore::new(db.pool.clone());
+
+        let mut mismatches = Vec::new();
+        for lifecycle in SandboxLifecycle::all() {
+            let seeded = seed_stuck(&db.pool, true).await?;
+            let candidate = listed(&store)
+                .await?
+                .into_iter()
+                .find(|candidate| candidate.sandbox_id == seeded.sandbox_id)
+                .expect("the stuck row is listed");
+            sqlx::query(sql!("UPDATE sandboxes SET lifecycle = $2 WHERE id = $1"))
+                .bind(seeded.sandbox_id)
+                .bind(lifecycle.as_str())
+                .execute(&db.pool)
+                .await?;
+
+            // The statement alone, then the sink around it.
+            let mut tx = db.pool.begin().await?;
+            let statement_flipped = mark_started_lost(
+                &mut tx,
+                seeded.sandbox_id,
+                seeded.node_id,
+                candidate.generation,
+                DEAD_UPLOAD_SETTLE,
+            )
+            .await?;
+            tx.rollback().await?;
+            let sink_flipped = store.mark_lost(&candidate).await?;
+
+            let accepts = *lifecycle == SandboxLifecycle::Started;
+            let expected = if accepts {
+                ("failed".to_string(), None, 0)
+            } else {
+                (lifecycle.as_str().to_string(), Some(seeded.node_id), 1)
+            };
+            let actual = sandbox_state(&db.pool, seeded.sandbox_id).await?;
+            if statement_flipped != accepts || sink_flipped != accepts || actual != expected {
+                mismatches.push(format!(
+                    "{lifecycle:?}: statement {statement_flipped}, sink {sink_flipped}, \
+                     row {actual:?}"
+                ));
+            }
+        }
+        assert!(mismatches.is_empty(), "{mismatches:#?}");
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn p13_write_off_keeps_other_nodes_rows_and_retired_executions() -> TestResult {
+        let Some(db) = try_pg_test_db().await? else {
+            return Ok(());
+        };
+        let seeded = seed_stuck(&db.pool, true).await?;
+        let other_node = NodeId::new();
+        for node_id in [seeded.node_id, other_node] {
+            sqlx::query(sql!(
+                "INSERT INTO node_local_backup_pending
+                     (node_id, sandbox_id, artifact_id, artifact_kind)
+                 VALUES ($1, $2, $3, 'full')"
+            ))
+            .bind(node_id)
+            .bind(seeded.sandbox_id)
+            .bind(uuid::Uuid::now_v7())
+            .execute(&db.pool)
+            .await?;
+        }
+        insert_execution(
+            &db.pool,
+            seeded.sandbox_id,
+            ExecutionSeed {
+                generation: 6,
+                state: "suspended",
+                active: false,
+            },
+        )
+        .await?;
+        sqlx::query(sql!(
+            "UPDATE sandbox_k8s_executions SET terminated_at = NOW() - INTERVAL '1 day'
+              WHERE sandbox_id = $1 AND generation = 6"
+        ))
+        .bind(seeded.sandbox_id)
+        .execute(&db.pool)
+        .await?;
+        let full = insert_snapshot(
+            &db.pool,
+            seeded.sandbox_id,
+            "creating",
+            "1 hour",
+            Some(seeded.node_id),
+        )
+        .await?;
+        let disk = insert_snapshot(
+            &db.pool,
+            seeded.sandbox_id,
+            "creating",
+            "1 hour",
+            Some(seeded.node_id),
+        )
+        .await?;
+        sqlx::query(sql!("UPDATE snapshots SET type = 'disk' WHERE id = $1"))
+            .bind(disk)
+            .execute(&db.pool)
+            .await?;
+
+        let store = LostStartedDbStore::new(db.pool.clone());
+        let candidate = listed(&store).await?.remove(0);
+        assert!(store.mark_lost(&candidate).await?);
+
+        let placement: (String, Option<NodeId>, Option<NodeId>) = sqlx::query_as(sql!(
+            "SELECT placement, active_node_id, target_node_id FROM sandboxes WHERE id = $1"
+        ))
+        .bind(seeded.sandbox_id)
+        .fetch_one(&db.pool)
+        .await?;
+        assert_eq!(
+            placement,
+            ("unplaced".to_string(), None, Some(seeded.node_id))
+        );
+        let queued_on: Vec<NodeId> = sqlx::query_scalar(sql!(
+            "SELECT node_id FROM node_local_backup_pending WHERE sandbox_id = $1"
+        ))
+        .bind(seeded.sandbox_id)
+        .fetch_all(&db.pool)
+        .await?;
+        assert_eq!(queued_on, vec![other_node]);
+        let executions: Vec<(i64, String, bool, bool)> = sqlx::query_as(sql!(
+            "SELECT generation, state, active, terminated_at < NOW() - INTERVAL '1 hour'
+               FROM sandbox_k8s_executions WHERE sandbox_id = $1 ORDER BY generation"
+        ))
+        .bind(seeded.sandbox_id)
+        .fetch_all(&db.pool)
+        .await?;
+        assert_eq!(
+            executions,
+            vec![
+                (6, "suspended".to_string(), false, true),
+                (7, "forgotten".to_string(), false, false),
+            ]
+        );
+        let uploads: Vec<(SnapshotId, String, Option<String>)> = sqlx::query_as(sql!(
+            "SELECT id, state, failure_reason FROM snapshots
+              WHERE sandbox_id = $1 AND state <> 'ready' ORDER BY id"
+        ))
+        .bind(seeded.sandbox_id)
+        .fetch_all(&db.pool)
+        .await?;
+        let mut expected = vec![
+            (full, "failed".to_string(), None),
+            (disk, "creating".to_string(), None),
+        ];
+        expected.sort();
+        assert_eq!(uploads, expected);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn p14_concurrent_node_change_refuses_the_flip() -> TestResult {
+        let Some(db) = try_pg_test_db().await? else {
+            return Ok(());
+        };
+        for change in [
+            "UPDATE node_k8s SET k8s_node_uid = 'replacement-uid' WHERE node_id = $1",
+            "UPDATE nodes SET drain_phase = 'draining' WHERE id = $1",
+        ] {
+            let seeded = seed_stuck(&db.pool, true).await?;
+            let store = LostStartedDbStore::new(db.pool.clone());
+            let candidate = listed(&store)
+                .await?
+                .into_iter()
+                .find(|candidate| candidate.sandbox_id == seeded.sandbox_id)
+                .expect("the stuck row is listed");
+
+            let mut concurrent = db.pool.begin().await?;
+            sqlx::query(sqlx::AssertSqlSafe(change))
+                .bind(seeded.node_id)
+                .execute(&mut *concurrent)
+                .await?;
+            let racer = tokio::spawn(async move { store.mark_lost(&candidate).await });
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            concurrent.commit().await?;
+
+            assert!(!racer.await.expect("the flip must not panic")?, "{change}");
+            assert_eq!(
+                sandbox_state(&db.pool, seeded.sandbox_id).await?.0,
+                "started",
+                "{change}"
+            );
+        }
         Ok(())
     }
 }
