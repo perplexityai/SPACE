@@ -1065,14 +1065,162 @@ fn sandbox_lifecycle_counts_groups_durable_rows() {
         vec![
             SandboxLifecycleCount {
                 state: SandboxState::CleanupFailed,
+                runtime: Some(RuntimeKind::Firecracker),
+                runtime_version: None,
                 count: 2,
             },
             SandboxLifecycleCount {
                 state: SandboxState::Started,
+                runtime: Some(RuntimeKind::Firecracker),
+                runtime_version: None,
                 count: 2,
             },
         ]
     );
+}
+
+#[test]
+fn sandbox_lifecycle_counts_preserve_rows_across_runtime_versions_and_legacy_metadata() {
+    let conn = test_conn();
+    let variants = [
+        (
+            "old-a",
+            "abc00101",
+            SandboxState::Started,
+            "fc",
+            Some(r#"{"runtime":{"kind":"firecracker","version":"1.15.1"}}"#),
+        ),
+        (
+            "old-b",
+            "abc00102",
+            SandboxState::Started,
+            "firecracker",
+            Some(r#"{"runtime":{"version":"1.15.1","kind":"fc"}}"#),
+        ),
+        (
+            "new",
+            "abc00103",
+            SandboxState::Started,
+            "fc",
+            Some(r#"{"runtime":{"kind":"firecracker","version":"1.17.0"}}"#),
+        ),
+        (
+            "stored",
+            "abc00104",
+            SandboxState::Suspended,
+            "fc",
+            Some(r#"{"runtime":{"kind":"firecracker","version":"1.17.0"}}"#),
+        ),
+        ("missing", "abc00105", SandboxState::Started, "fc", None),
+        (
+            "corrupt",
+            "abc00106",
+            SandboxState::Started,
+            "fc",
+            Some("{"),
+        ),
+        (
+            "scalar",
+            "abc00107",
+            SandboxState::Started,
+            "fc",
+            Some(r#"{"runtime":42}"#),
+        ),
+        (
+            "invalid",
+            "abc00108",
+            SandboxState::Started,
+            "fc",
+            Some(r#"{"runtime":{"kind":"firecracker","version":""}}"#),
+        ),
+        (
+            "unknown",
+            "abc00109",
+            SandboxState::Started,
+            "unrecognized",
+            None,
+        ),
+        (
+            "other",
+            "abc00110",
+            SandboxState::Started,
+            "ch",
+            Some(r#"{"runtime":{"kind":"cloud-hypervisor","version":"49.0"}}"#),
+        ),
+    ];
+    for (id, uuid8, state, runtime, execution) in variants {
+        insert_test_sandbox(&conn, TestSandboxInsert::new(id, uuid8, state));
+        conn.execute(
+            sql!("UPDATE sandboxes SET runtime = ?2, execution_metadata_json = ?3 WHERE id = ?1"),
+            params![id, runtime, execution],
+        )
+        .unwrap();
+    }
+
+    let counts = sandbox_lifecycle_counts(&conn).unwrap();
+    assert_eq!(counts.iter().map(|count| count.count).sum::<u64>(), 10);
+    let actual: Vec<_> = counts
+        .iter()
+        .map(|count| {
+            (
+                count.state,
+                count.runtime,
+                count
+                    .runtime_version
+                    .as_ref()
+                    .map(|version| version.as_str()),
+                count.count,
+            )
+        })
+        .collect();
+    assert_eq!(
+        actual,
+        vec![
+            (SandboxState::Started, None, None, 1),
+            (
+                SandboxState::Started,
+                Some(RuntimeKind::Firecracker),
+                None,
+                4
+            ),
+            (
+                SandboxState::Started,
+                Some(RuntimeKind::Firecracker),
+                Some("1.15.1"),
+                2
+            ),
+            (
+                SandboxState::Started,
+                Some(RuntimeKind::Firecracker),
+                Some("1.17.0"),
+                1
+            ),
+            (
+                SandboxState::Started,
+                Some(RuntimeKind::CloudHypervisor),
+                Some("49.0"),
+                1
+            ),
+            (
+                SandboxState::Suspended,
+                Some(RuntimeKind::Firecracker),
+                Some("1.17.0"),
+                1
+            ),
+        ]
+    );
+
+    conn.execute(sql!("DELETE FROM sandboxes WHERE id = ?1"), ["new"])
+        .unwrap();
+    let counts = sandbox_lifecycle_counts(&conn).unwrap();
+    assert_eq!(counts.iter().map(|count| count.count).sum::<u64>(), 9);
+    assert!(!counts.iter().any(|count| {
+        count.state == SandboxState::Started
+            && count
+                .runtime_version
+                .as_ref()
+                .is_some_and(|version| version.as_str() == "1.17.0")
+    }));
 }
 
 #[test]

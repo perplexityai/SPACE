@@ -1,6 +1,7 @@
 use std::collections::BTreeSet;
 use std::time::Duration;
 
+use pplx_space_common_core::types::{RuntimeKind, RuntimeVersion};
 use tokio_util::sync::CancellationToken;
 
 use crate::db::SandboxLifecycleCount;
@@ -10,12 +11,16 @@ const SAMPLE_INTERVAL: Duration = Duration::from_secs(60);
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct LifecycleBucket {
     state: String,
+    runtime: Option<RuntimeKind>,
+    runtime_version: Option<RuntimeVersion>,
 }
 
 impl From<&SandboxLifecycleCount> for LifecycleBucket {
     fn from(count: &SandboxLifecycleCount) -> Self {
         Self {
             state: count.state.as_str().to_owned(),
+            runtime: count.runtime,
+            runtime_version: count.runtime_version.clone(),
         }
     }
 }
@@ -76,7 +81,12 @@ pub(crate) async fn run(db: crate::db::SharedConnection, shutdown_token: Cancell
             }
         };
         sampler.emit_sample(&counts, |bucket, count| {
-            pplx_space_metrics::sandbox::worker::lifecycle_count(count, &bucket.state);
+            pplx_space_metrics::sandbox::worker::lifecycle_count(
+                count,
+                &bucket.state,
+                bucket.runtime,
+                bucket.runtime_version.as_ref(),
+            );
         });
     }
 }
