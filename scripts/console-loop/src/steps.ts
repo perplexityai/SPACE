@@ -420,6 +420,8 @@ step('templates-search-hash', ['templates'], async (c) => {
   c.rec.check(urlParam(c, 'tab') === 'releases' && urlParam(c, 'release') === release.id, "the match opens the template's releases with it marked");
   const rows = content(c.page).locator('.ant-tabs-tabpane-active tbody tr.ant-table-row');
   c.rec.check(await rows.count() === 1 && await content(c.page).locator('tr.template-release-highlight').count() === 1, 'the searched release is the one row shown, marked');
+  const seedReleases = ((await adminFetch(c.page, 'GET', '/admin/api/v1/template-releases')).json ?? []).filter((r: { template_name: string }) => r.template_name === 'seed');
+  if (seedReleases.length < 2) c.rec.note(`seed has ${seedReleases.length} release: one row shows with or without the focus, so this cannot show the focus applied`);
   await content(c.page).getByRole('button', { name: 'Show all releases' }).click();
   await settle(c.page, 1000);
   c.rec.check(urlParam(c, 'release') === null && urlParam(c, 'tab') === 'releases', 'Show all releases drops the release from the URL and stays on the tab');
@@ -479,9 +481,15 @@ for (const [query, label, expected, cell] of [
     const [param, value] = query.split('=');
     c.rec.check(urlParam(c, param) === value, `the ${param} filter from the link is kept in the URL`);
     const catalog = await readCatalog(c);
-    const want = expected(catalog).length;
+    const names = expected(catalog);
+    const want = names.length;
     const listed = await listedCount(c);
     c.rec.check(listed === want, `filtering by ${label} lists the ${want} template(s) the API's records give (listed ${listed})`);
+    // The first page, sorted by name, is the first of those names: the
+    // right count of the wrong templates fails here.
+    const page = await templateNames(c);
+    const first = [...names].sort((a, b) => a.localeCompare(b)).slice(0, page.length || 1);
+    c.rec.check(page.length > 0 === want > 0 && page.every((name, i) => name === first[i]), `the first page lists the expected templates (${page.slice(0, 3).join(', ')}${page.length > 3 ? ', …' : ''})`);
     if (want === catalog.templates.length) c.rec.note(`every template on this stack matches ${query}: the count cannot show whether the filter applied`);
     if (cell) {
       const [column, pattern] = cell;
@@ -565,7 +573,8 @@ step('templates-releases-search', ['templates'], async (c) => {
 for (const [tab, expect] of [
   ['overview', /Default auto lifecycle/],
   ['releases', /template releases/],
-  ['builds', /System template rebuild/],
+  // The rebuild panel and the build history: its table, or its empty state.
+  ['builds', /System template rebuild.*(Content hash|No builds recorded|does not list a template's builds)/],
   ['pool', /Release pools|Manage pool|Create pool|This substrate has no warm pools/],
   ['nodes', /template builds|No reachable node/],
   ['sandboxes', /Open the sandboxes of seed/],
