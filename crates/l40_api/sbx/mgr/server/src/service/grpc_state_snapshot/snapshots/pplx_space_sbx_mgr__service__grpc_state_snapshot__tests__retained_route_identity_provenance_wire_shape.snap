@@ -61,4 +61,5 @@ SandboxInfo {
         Suspended,
     ),
     current_local_artifact_created_at: None,
+    cleanup: None,
 }

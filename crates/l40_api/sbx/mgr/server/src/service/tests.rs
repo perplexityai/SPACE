@@ -13469,7 +13469,10 @@ pub(crate) mod service_tests {
                 .unwrap();
             crate::db::seed_historical_lifecycle_rows(&db, |db| {
                 db.execute(
-                    "UPDATE sandboxes SET state = 'state_from_newer_worker' WHERE id = ?1",
+                    "UPDATE sandboxes
+                        SET state = 'state_from_newer_worker',
+                            cleanup_completion = 'mark_stopped'
+                      WHERE id = ?1",
                     [&malformed_core_id],
                 )
                 .unwrap();
@@ -13539,6 +13542,11 @@ pub(crate) mod service_tests {
             .expect("a malformed local row must still report its node lifecycle");
         malformed_core.observed_lifecycle().unwrap_err();
         assert!(malformed_core.state_degraded);
+        assert_eq!(
+            malformed_core.cleanup.map(|cleanup| cleanup.completion),
+            Some(crate::proto::SandboxCleanupCompletion::MarkStopped as i32),
+            "a degraded row must still report its recorded cleanup completion"
+        );
         assert_eq!(malformed_core.route_provenance_generation, Some(9));
         assert_eq!(
             malformed_core.route_provenance_execution_generation,
@@ -15909,6 +15917,40 @@ pub(crate) mod service_tests {
             info.health_status,
             crate::proto::SandboxHealthStatus::Unspecified as i32
         );
+    }
+
+    #[tokio::test]
+    async fn build_sandbox_info_publishes_the_failed_cleanup_completion() {
+        let conn = crate::db::test_conn();
+        let sandbox_id = SandboxId::new().to_string();
+        insert_test_sandbox(&conn, &sandbox_id, SandboxState::Stopped);
+        let service = service_with_runtime_probe(conn, false);
+        for (completion, expected) in [
+            (None, None),
+            (
+                Some(crate::db::CleanupCompletion::MarkStopped),
+                Some(crate::proto::SandboxCleanupCompletion::MarkStopped),
+            ),
+            (
+                Some(crate::db::CleanupCompletion::DeleteRow),
+                Some(crate::proto::SandboxCleanupCompletion::DeleteRow),
+            ),
+        ] {
+            let mut sandbox = service.lookup_sandbox(&sandbox_id).unwrap();
+            sandbox.state = SandboxState::CleanupFailed;
+            sandbox.cleanup_completion = completion;
+
+            let info = service
+                .build_sandbox_info(sandbox, None, None, None, None)
+                .await
+                .unwrap();
+
+            assert_eq!(
+                info.cleanup.map(|cleanup| cleanup.completion),
+                expected.map(|completion| completion as i32),
+                "{completion:?}"
+            );
+        }
     }
 
     #[tokio::test]

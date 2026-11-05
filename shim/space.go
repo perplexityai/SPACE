@@ -921,6 +921,13 @@ func releaseTaskAfterGenerationTeardown(ctx context.Context, client pb.SandboxMa
 	}
 }
 
+// stopOutcomeUnknown reports whether a failed Stop may still have been
+// admitted: its context ended, or the connection failed (Unavailable), which
+// a transport drop after admission and a few sbx-manager refusals share.
+func stopOutcomeUnknown(err error) bool {
+	return endedByContext(err) || status.Code(err) == codes.Unavailable
+}
+
 // endedByContext reports whether an RPC failed because its context ended
 // rather than because the server answered.
 func endedByContext(err error) bool {
@@ -1004,9 +1011,13 @@ func sandboxStateWithRetry(ctx context.Context, client pb.SandboxManagerClient, 
 // the durable-teardown marker was rolled out. Their controller first
 // stops and backs up retirements, so the shim must not invoke the new suspend
 // protocol against an already-stopped row. It returns true when the observed
-// lifecycle proves the sandbox is gone or this task belongs to a suspend/restore
-// handoff and must not issue a later destructive teardown against the sandbox.
-func releaseLegacyTaskTeardown(ctx context.Context, client pb.SandboxManagerClient, operation string, identity taskTeardownIdentity) (bool, error) {
+// row shows the sandbox is gone, belongs to a stop this task didn't issue, or
+// belongs to a suspend/restore handoff, so the task must not issue a later
+// destructive teardown against the sandbox. recordStopIssued, when set,
+// records on the task whether this task's Kill owns a stop: true just before
+// Kill sends Stop, so a lost reply keeps the ownership, and the prior value
+// again when sbx-manager answers with a refusal.
+func releaseLegacyTaskTeardown(ctx context.Context, client pb.SandboxManagerClient, operation string, identity taskTeardownIdentity, recordStopIssued func(bool)) (bool, error) {
 	if identity.sandboxDetached {
 		return true, nil
 	}
@@ -1025,12 +1036,23 @@ func releaseLegacyTaskTeardown(ctx context.Context, client pb.SandboxManagerClie
 	if err != nil {
 		return false, err
 	}
+	stop := false
 	switch lifecycle {
-	case pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_STOPPED:
-		// A user STOP parks the rootfs for a later START. Releasing its pod
-		// must not turn that intent into DELETE. A stop issued by this task's
-		// own Kill remains part of intentional legacy pod deletion.
-		if !identity.legacyStopIssued {
+	case pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_STOPPED,
+		pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_STOPPING:
+		stop = true
+	case pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_CLEANUP_REQUIRED,
+		pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_CLEANUP_FAILED:
+		// The recorded completion says what the cleanup returns the row to.
+		// MARK_SUSPENDED releases the task, and MARK_STOPPED does unless this
+		// task's own Kill issued the stop. Every other completion, and a node
+		// too old to report one, still falls through to the destructive call.
+		// Only these states read it: on other rows a completion can be an
+		// armed activation's rollback target, published while the start runs.
+		switch sandbox.GetCleanup().GetCompletion() {
+		case pb.SandboxCleanupCompletion_SANDBOX_CLEANUP_COMPLETION_MARK_STOPPED:
+			stop = true
+		case pb.SandboxCleanupCompletion_SANDBOX_CLEANUP_COMPLETION_MARK_SUSPENDED:
 			return true, nil
 		}
 	case pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_SUSPENDING,
@@ -1038,10 +1060,29 @@ func releaseLegacyTaskTeardown(ctx context.Context, client pb.SandboxManagerClie
 		pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_RESTORING:
 		return true, nil
 	}
+	// Any cleanup that returns the row to STOPPED (a user's STOP, an
+	// sbx-manager stop, a failed start of a stopped sandbox, or a recovery)
+	// keeps the rootfs for a later START. Releasing the pod must not turn that
+	// into DELETE, including when the guest exits before sbx-manager finishes
+	// the stop or when the stop's cleanup fails. A stop issued by this task's
+	// own Kill remains part of intentional legacy pod deletion.
+	if stop && !identity.legacyStopIssued {
+		return true, nil
+	}
 
 	switch operation {
 	case "kill":
+		if recordStopIssued != nil {
+			recordStopIssued(true)
+		}
 		_, err = client.Stop(ctx, &pb.StopRequest{SandboxId: identity.sandboxID})
+		// A call that ended on this side, or a dropped connection, may have
+		// been admitted unseen, so it keeps the ownership. Any other answer is
+		// sbx-manager refusing the stop, and treating a refused Stop as this
+		// task's would turn a later user STOP into DELETE.
+		if err != nil && !stopOutcomeUnknown(err) && recordStopIssued != nil {
+			recordStopIssued(identity.legacyStopIssued)
+		}
 	case "delete":
 		_, err = client.Delete(ctx, &pb.DeleteRequest{SandboxId: identity.sandboxID})
 		// Durable deletion may finish after State observed the live sandbox.
@@ -1190,7 +1231,16 @@ func (s *spaceTaskService) waitForTaskTeardownRelease(
 		err = releaseTaskAfterGenerationTeardown(ctx, client, identity)
 		detach = err == nil
 	} else {
-		detach, err = releaseLegacyTaskTeardown(ctx, client, operation, identity)
+		// A Stop whose reply is lost may still have been admitted, so the
+		// marker is recorded before the call rather than after it succeeds.
+		recordStopIssued := func(issued bool) {
+			s.mu.Lock()
+			defer s.mu.Unlock()
+			if current, ok := s.tasks[taskID]; ok && current == expected {
+				current.legacyStopIssued = issued
+			}
+		}
+		detach, err = releaseLegacyTaskTeardown(ctx, client, operation, identity, recordStopIssued)
 	}
 	// The task stays running until sbx-manager releases it, and each retry
 	// otherwise leaves only a metric; this line is what names the refusal
@@ -1291,9 +1341,6 @@ func (s *spaceTaskService) mutateTaskAfterTeardownRelease(
 	}
 	if detachSandbox {
 		current.sandboxDetached = true
-	}
-	if needsTeardown && operation == "kill" && !detachSandbox && !current.generationTeardown {
-		current.legacyStopIssued = true
 	}
 	mutate(current)
 	return true, nil

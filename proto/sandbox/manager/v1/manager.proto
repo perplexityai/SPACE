@@ -710,6 +710,46 @@ message SandboxInfo {
   // artifact matches the disk. A time from any other machine isn't
   // comparable. Absent means unknown, not old: older nodes never set it.
   optional google.protobuf.Timestamp current_local_artifact_created_at = 58;
+  // The row's recorded node-local cleanup. Absent when none is recorded, or
+  // from an older node that never set it.
+  optional SandboxCleanup cleanup = 59;
+}
+
+// A node-local cleanup recorded on a sandbox row. An activation records one,
+// as does a stop, suspend or delete admitted with a persisted intent. A
+// CLEANUP_REQUIRED or CLEANUP_FAILED row keeps the one it was admitted with,
+// but such a row can also have none, for example one that sbx-manager's
+// cleanup recovery will quarantine, so an absent cleanup there doesn't mean
+// an older node.
+message SandboxCleanup {
+  // What the cleanup does to the row when it finishes. Every writer of
+  // MARK_STOPPED keeps the rootfs: a stop, whether a user's or sbx-manager's
+  // own (runtime exit, runtime upgrade, snapshot restore); a failed start of a
+  // stopped sandbox; and sbx-manager's recovery of an interrupted stop or
+  // start, a first start included. This is what tells those rows from a
+  // failed delete.
+  SandboxCleanupCompletion completion = 1;
+}
+
+// What an admitted node-local cleanup does to the row when it finishes. For a
+// CLEANUP_REQUIRED or CLEANUP_FAILED row, the shim's legacy pod teardown stops
+// the sandbox on Kill and deletes it on Delete for any value it doesn't
+// recognize, so a new value that keeps the rootfs needs a shim that releases
+// it to deploy first.
+enum SandboxCleanupCompletion {
+  SANDBOX_CLEANUP_COMPLETION_UNSPECIFIED = 0;
+  // Marks the row CREATED.
+  SANDBOX_CLEANUP_COMPLETION_MARK_CREATED = 1;
+  // Marks the row STOPPED.
+  SANDBOX_CLEANUP_COMPLETION_MARK_STOPPED = 2;
+  // Marks the row SUSPENDED.
+  SANDBOX_CLEANUP_COMPLETION_MARK_SUSPENDED = 3;
+  // Marks the row QUARANTINED.
+  SANDBOX_CLEANUP_COMPLETION_QUARANTINE = 4;
+  // Deletes the row.
+  SANDBOX_CLEANUP_COMPLETION_DELETE_ROW = 5;
+  // Deletes a pool clone's row.
+  SANDBOX_CLEANUP_COMPLETION_DELETE_POOL_CLONE = 6;
 }
 
 enum SandboxHealthStatus {
