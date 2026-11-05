@@ -346,6 +346,9 @@ export interface FilterResult {
   rows: FilteredRow[];
   // Rows left out only because their latest build is not known yet.
   pendingBuilds: number;
+  // Rows left out because their latest build could not be read (a failed
+  // read, or an API without the builds route).
+  unreadBuilds: number;
 }
 
 // The rows the search and filters keep, before sorting. A row matches the
@@ -366,6 +369,7 @@ export function filterTemplateRows(
   }
   const kept: FilteredRow[] = [];
   let pendingBuilds = 0;
+  let unreadBuilds = 0;
   for (const row of rows) {
     let matched: ReleaseMatch[] = [];
     if (query && !row.name.toLowerCase().includes(query)) {
@@ -385,11 +389,15 @@ export function filterTemplateRows(
         pendingBuilds += 1;
         continue;
       }
+      if (latest.kind === 'error' || latest.kind === 'unsupported') {
+        unreadBuilds += 1;
+        continue;
+      }
       if (buildBucket(latest) !== state.build) continue;
     }
     kept.push({ ...row, matched });
   }
-  return { rows: kept, pendingBuilds };
+  return { rows: kept, pendingBuilds, unreadBuilds };
 }
 
 // ---------------------------------------------------------------- sorting

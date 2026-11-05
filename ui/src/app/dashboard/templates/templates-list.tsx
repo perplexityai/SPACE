@@ -94,7 +94,7 @@ export default function TemplatesList({ data, actions, state, onChange, orgs, on
   const { builds, unsupported: buildsUnsupported } = useLatestBuilds(wanted, refreshGeneration);
 
   const filtered = useMemo(
-    () => (everyBuild ? filterTemplateRows(rows, state, builds, matches) : { rows: sortedCandidates, pendingBuilds: 0 }),
+    () => (everyBuild ? filterTemplateRows(rows, state, builds, matches) : { rows: sortedCandidates, pendingBuilds: 0, unreadBuilds: 0 }),
     [everyBuild, rows, state, builds, matches, sortedCandidates],
   );
   const shown = useMemo(
@@ -415,6 +415,11 @@ export default function TemplatesList({ data, actions, state, onChange, orgs, on
             </Space>
           )}
         />
+      ) : null}
+      {filtered.unreadBuilds > 0 ? (
+        <Text type="warning">
+          {filtered.unreadBuilds} template{filtered.unreadBuilds === 1 ? '' : 's'} left out: the latest build could not be read.
+        </Text>
       ) : null}
       {buildsPending > 0 ? (
         <Text type="secondary">

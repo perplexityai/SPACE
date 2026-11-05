@@ -139,6 +139,16 @@ test('every filter narrows the rows', () => {
   assert.deepEqual(kept({ build: 'running' }, builds), ['north-worker']);
   const partial = filterTemplateRows(all, state({ build: 'succeeded' }), builds);
   assert.deepEqual([names(partial.rows), partial.pendingBuilds], [['seed'], 1], 'a template whose build is unread is pending, not dropped silently');
+  const unread = filterTemplateRows(all, state({ build: 'succeeded' }), new Map([
+    ['seed', build('succeeded', '2026-11-04T00:00:00Z')],
+    ['north-web', { kind: 'error', message: '503 Service Unavailable' }],
+    ['north-worker', { kind: 'unsupported' }],
+  ]));
+  assert.deepEqual(
+    [names(unread.rows), unread.pendingBuilds, unread.unreadBuilds],
+    [['seed'], 1, 2],
+    'a template whose build read failed is counted, not dropped silently',
+  );
 });
 
 test('a build the builder cannot report is in no build bucket', () => {
