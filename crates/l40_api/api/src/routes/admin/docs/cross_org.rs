@@ -29,7 +29,7 @@ pub(super) fn insert_admin_sandbox_session_paths(paths: &mut Map<String, Value>)
         json!({
             "get": {
                 "summary": "List any organization's sandbox snapshots",
-                "description": "Same page as the public GET /v1/sandboxes/{sandbox_id}/snapshots, read under the sandbox's owning organization whether or not that organization can see the public route. The read is audited with the sandbox and its organization.",
+                "description": "Same page as the public GET /v1/sandboxes/{sandbox_id}/snapshots, read under the sandbox's owning organization whether or not that organization can see the public route. Like the public list, it holds only snapshots stored in object storage: a checkpoint kept on the sandbox's node is not listed. The read is audited with the sandbox and its organization.",
                 "parameters": [
                     sandbox_id,
                     { "name": "cursor", "in": "query", "required": false, "schema": { "type": "string" } },

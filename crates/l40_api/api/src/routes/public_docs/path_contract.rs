@@ -684,7 +684,7 @@ fn lifecycle_action(action: SandboxLifecycleAction) -> Option<LifecycleAction> {
         SandboxLifecycleAction::Checkpoint => (
             CHECKPOINT_SANDBOX,
             "Checkpoint a sandbox",
-            "Captures a snapshot of the running sandbox.",
+            "Captures a snapshot of the running sandbox and keeps it on the sandbox's node. The snapshot list (`GET /v1/sandboxes/{sandbox_id}/snapshots`) does not show it: that list holds only snapshots stored in object storage.",
         ),
         SandboxLifecycleAction::EnableSnapshots => (
             ENABLE_SANDBOX_SNAPSHOTS,
