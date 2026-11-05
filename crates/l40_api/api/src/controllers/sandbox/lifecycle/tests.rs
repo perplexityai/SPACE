@@ -73,6 +73,55 @@ fn cluster_delete_miss_reason_classifies_by_substrate_error() {
 /// rate-limited refusal carries the backpressure cause the async dispatcher
 /// re-queues behind; an empty cluster keeps its bounded retry.
 #[test]
+fn requested_size_kind_classifies_by_action_and_entry_lifecycle() {
+    let access = SandboxAction::ImplicitWake(ExecutionActivityKind::Access);
+    for (action, lifecycle, expected) in [
+        (
+            SandboxAction::Start,
+            SandboxLifecycle::Stopped,
+            Some(RequestedKind::Activate),
+        ),
+        (
+            SandboxAction::Wake,
+            SandboxLifecycle::Suspended,
+            Some(RequestedKind::Activate),
+        ),
+        (
+            SandboxAction::Restore,
+            SandboxLifecycle::Suspended,
+            Some(RequestedKind::Activate),
+        ),
+        (
+            SandboxAction::Resume,
+            SandboxLifecycle::Paused,
+            Some(RequestedKind::Resume),
+        ),
+        // An ECW connect wakes, so un-pausing through it counts as a resume.
+        (
+            SandboxAction::Wake,
+            SandboxLifecycle::Paused,
+            Some(RequestedKind::Resume),
+        ),
+        (
+            access,
+            SandboxLifecycle::Paused,
+            Some(RequestedKind::Resume),
+        ),
+        (SandboxAction::Wake, SandboxLifecycle::Started, None),
+        (SandboxAction::Resume, SandboxLifecycle::Started, None),
+        (SandboxAction::Restore, SandboxLifecycle::Started, None),
+        (SandboxAction::Stop, SandboxLifecycle::Started, None),
+        (SandboxAction::Pause, SandboxLifecycle::Started, None),
+    ] {
+        assert_eq!(
+            action.requested_size_kind(Some(lifecycle)),
+            expected,
+            "{action:?} from {lifecycle:?}"
+        );
+    }
+}
+
+#[test]
 fn admission_refusals_keep_their_dispatcher_retry_causes() {
     use crate::cluster_admission::ClusterAdmissionError;
 

@@ -1193,7 +1193,7 @@ tags:
 
 | Tag | Values |
 | --- | --- |
-| `kind` | `create` for a cold or warm-pool create; `activate` for a lifecycle action that activates a dormant sandbox: a start from `created`, `stopped` or `suspended`, a wake from `created` or `suspended`, or a restore from `suspended`; `resume` for a resume of a `paused` sandbox |
+| `kind` | `create` for a cold or warm-pool create; `activate` for a lifecycle action that activates a dormant sandbox: a start from `created`, `stopped` or `suspended`, a wake from `created` or `suspended`, or a restore from `suspended`; `resume` for a resume or wake of a `paused` sandbox, including an ECW connect |
 | `surface` | `native` or `ecw`, the API the call arrived on |
 | `admission` | `accepted`, or `rejected` when cluster activation admission refused the call, whether at request entry or when the substrate charged a restore claim |
 | `template` | The resolved template for a create; otherwise the sandbox's template (`unknown` if the row names none) |
@@ -1221,9 +1221,9 @@ action controller are included; data-plane paths that bypass it are not.
 
 Nothing is recorded for a fork; a create whose size the API did not resolve (a
 Direct create, or a Kubernetes create left to the node's default shape); a
-wake of a running or `paused` sandbox; a lifecycle action on a `restoring`
-sandbox, including a restore-lease takeover the substrate charges. Disk size is
-not recorded.
+wake of a running sandbox; a lifecycle action on a `restoring` sandbox,
+including a restore-lease takeover the substrate charges. Disk size is not
+recorded.
 
 ## Sandboxes in a transient lifecycle
 

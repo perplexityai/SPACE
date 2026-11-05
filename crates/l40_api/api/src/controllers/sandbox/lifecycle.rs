@@ -533,10 +533,18 @@ impl SandboxAction {
         }
     }
 
-    fn requested_kind(self, lifecycle: Option<SandboxLifecycle>) -> Option<RequestedKind> {
+    /// Which requested-size sample this action records from the sandbox's
+    /// lifecycle at entry, if any. An action that activates a dormant
+    /// sandbox records `Activate`; resuming a `paused` sandbox, which is
+    /// still resident in memory, records `Resume`, whether the caller asked
+    /// to resume or to wake (an ECW connect wakes). Anything else, such as an
+    /// action on a running sandbox, records nothing.
+    fn requested_size_kind(self, lifecycle: Option<SandboxLifecycle>) -> Option<RequestedKind> {
         if self.activation_class(lifecycle).is_some() {
             Some(RequestedKind::Activate)
-        } else if self == Self::Resume && lifecycle == Some(SandboxLifecycle::Paused) {
+        } else if lifecycle == Some(SandboxLifecycle::Paused)
+            && matches!(self, Self::Resume | Self::Wake | Self::ImplicitWake(_))
+        {
             Some(RequestedKind::Resume)
         } else {
             None
@@ -1459,7 +1467,7 @@ impl SandboxController {
 
         // Classify at entry; callers that join another activation clear this.
         let entry_lifecycle = sandbox.lifecycle.parse::<SandboxLifecycle>().ok();
-        let mut requested_kind = action.requested_kind(entry_lifecycle);
+        let mut requested_kind = action.requested_size_kind(entry_lifecycle);
         // The body's early returns leave this block, so the sample below sees
         // every outcome.
         let result: Result<serde_json::Value, ControllerError> = async {
