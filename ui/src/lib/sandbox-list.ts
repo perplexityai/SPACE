@@ -274,10 +274,12 @@ export class ListRequests {
 // filters with the search as `prefix`, read from the first page at the page
 // size. The list itself is read without it, so the search still matches ID
 // suffixes, such as the ID column's label, within the page on screen. Null on
-// a sampled list, which sends no prefix.
+// a sampled list, which sends no prefix. It never sends `search`: it is how a
+// server without it is searched, and the selected filters can still carry the
+// search that server refused until the search box's pause has passed.
 export function fragmentSearchScope(selected: ListScope, prefix: string): ListScope | null {
   if (selected.mode !== 'paged') return null;
-  return listScope('paged', { ...selected.filters, prefix }, { limit: selected.limit, cursor: '' });
+  return listScope('paged', { ...selected.filters, prefix, search: '' }, { limit: selected.limit, cursor: '' });
 }
 
 // After the selection changes: the rows on screen are kept when they are the

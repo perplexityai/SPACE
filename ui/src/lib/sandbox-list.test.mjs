@@ -210,6 +210,10 @@ test('a fragment search reads the first page of the selected filters with it as 
   // The list itself is read without it.
   assert.equal(parse(listRequestQuery(selected, NOW)).prefix, undefined);
   assert.equal(fragmentSearchScope(listScope('sampled', NO_FILTERS, { limit: 1000, cursor: '' }), 'e2e-1'), null);
+  // A fragment search is how a server without `search` is searched, so it
+  // never sends one, even before the list's own filters drop it.
+  const unsupported = scopeOf({ search: 'e2e-1' });
+  assert.equal(parse(listRequestQuery(fragmentSearchScope(unsupported, 'e2e-1'), NOW)).search, undefined);
 });
 
 test('an answer for a filter undone before it arrived is dropped, and the rows on screen are kept', () => {
