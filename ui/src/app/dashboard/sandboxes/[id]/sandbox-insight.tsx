@@ -59,6 +59,9 @@ function SectionError({ error, what }: { error: string | null; what?: string }) 
 export interface DebugView {
   debug: SandboxDebug | null;
   error: string | null;
+  // The inventory generation the read that produced this view started in
+  // (`observePeriodic`), or null before the first.
+  generation: number | null;
 }
 
 function sectionState(view: DebugView, section: DebugSection<unknown> | undefined) {

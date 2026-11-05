@@ -83,6 +83,7 @@ import {
   Template,
 } from '@/lib/types';
 import { formatBytes } from '@/lib/sandbox-debug';
+import { CATALOG_NOTE, CATALOG_TITLE, catalogEmptyText } from '@/lib/snapshot-catalog';
 import { tablePagination } from '@/lib/table-pagination';
 import {
   markViewRefreshed,
@@ -558,6 +559,8 @@ function SnapshotsPanel({ sandboxId, ownOrg }: { sandboxId: string; ownOrg: bool
   const [more, setMore] = useState(false);
   const [loading, setLoading] = useState(true);
   const [snapshotsOff, setSnapshotsOff] = useState<string | null>(null);
+  // The last listing failed, so an empty table is not an empty catalog.
+  const [listFailed, setListFailed] = useState(false);
   // Only the newest listing may write: the row's sandbox or organization can
   // change while a listing is in flight.
   const listingRequest = useRef(0);
@@ -573,6 +576,7 @@ function SnapshotsPanel({ sandboxId, ownOrg }: { sandboxId: string; ownOrg: bool
           return;
         }
         setSnapshotsOff(null);
+        setListFailed(false);
         setSnapshots(listing.rows);
         setMore(listing.via === 'admin' && listing.more);
       })
@@ -582,6 +586,7 @@ function SnapshotsPanel({ sandboxId, ownOrg }: { sandboxId: string; ownOrg: bool
           setSnapshotsOff(SNAPSHOTS_NOT_ENABLED);
           return;
         }
+        setListFailed(true);
         message.error(err.message || 'failed to load snapshots');
       })
       .finally(() => {
@@ -609,6 +614,7 @@ function SnapshotsPanel({ sandboxId, ownOrg }: { sandboxId: string; ownOrg: bool
   const snapshotColumns: ColumnsType<SnapshotInfo> = [
     { title: 'Name', dataIndex: 'id', width: 220, ellipsis: true },
     { title: 'Type', dataIndex: 'type', width: 60 },
+    { title: 'State', dataIndex: 'state', width: 90 },
     {
       title: 'Timestamp', dataIndex: 'timestamp', width: 200,
       render: (v: string | null) => {
@@ -659,6 +665,10 @@ function SnapshotsPanel({ sandboxId, ownOrg }: { sandboxId: string; ownOrg: bool
           <Text type="secondary" style={{ fontSize: 12 }}>Roll back from the sandbox page</Text>
         </Link>
       </Space>
+      <div style={{ marginTop: 8 }}>
+        <Text strong style={{ fontSize: 12 }}>{CATALOG_TITLE}</Text>{' '}
+        <Text type="secondary" style={{ fontSize: 12 }}>{CATALOG_NOTE}</Text>
+      </div>
       <Table
         columns={snapshotColumns}
         dataSource={snapshots}
@@ -667,7 +677,7 @@ function SnapshotsPanel({ sandboxId, ownOrg }: { sandboxId: string; ownOrg: bool
         size="small"
         pagination={tablePagination('snapshots', 10)}
         style={{ marginTop: 8 }}
-        locale={{ emptyText: 'No snapshots' }}
+        locale={{ emptyText: catalogEmptyText(listFailed, null) }}
         footer={more ? () => <Text type="secondary" style={{ fontSize: 12 }}>The newest {snapshots.length} snapshots; older ones are not listed.</Text> : undefined}
       />
     </div>

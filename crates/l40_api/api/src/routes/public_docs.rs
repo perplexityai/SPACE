@@ -564,6 +564,7 @@ fn insert_snapshot_paths(paths: &mut Map<String, Value>) {
         json!({
             "get": {
                 "summary": "List snapshots for a sandbox",
+                "description": "Lists, newest first, the sandbox's snapshots recorded for upload to object storage, including pending (`creating`) and `failed` uploads, so a listed snapshot is not necessarily stored. A checkpoint stays on the sandbox's node and is not listed here.",
                 "parameters": [
                     { "name": "cursor", "in": "query", "required": false, "schema": { "type": "string" } },
                     { "name": "limit", "in": "query", "required": false, "schema": { "type": "integer", "minimum": 1, "maximum": 1000 } }

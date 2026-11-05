@@ -57,6 +57,7 @@ import {
   getSandboxOperations,
   type AdminOperationRecord,
   publicTemplateToConsoleTemplate,
+  SANDBOX_READ_TIMEOUT_MS,
   updateConsoleSandbox,
   waitForAdminOperation,
 } from '@/lib/public-api';
@@ -70,10 +71,15 @@ import type {
 import { tablePagination } from '@/lib/table-pagination';
 import { useAuth } from '@/lib/auth';
 import { isOwnOrg } from '@/lib/own-org';
+import { serialReads, withTimeout } from '@/lib/serial-reads';
 import { listsSnapshotsOn } from '@/lib/admin-fallback';
 import { RollbackButton, RollbackRefusalNote, useSnapshotRollback, type SnapshotRollback } from '@/components/snapshot-rollback';
 import { rollbackRoute, rollbackTargets, snapshotTimeMs, type RollbackTarget } from '@/lib/rollback-targets';
 import { formatAge, formatBytes, sectionData, sectionError, snapshotKey, snapshotStorageById, snapshotStorageLabel, type DebugSnapshot } from '@/lib/sandbox-debug';
+import {
+  CATALOG_NOTE, CATALOG_TITLE, NODE_NOTE, RECORDS_NOTE, catalogEmptyText, currentInventory, nodeEmptyText, nodeListing, observePeriodic,
+  type InventoryGeneration, type NodeListing,
+} from '@/lib/snapshot-catalog';
 import { OperationsCard, OrgLink, PlacementCard, QuarantineCard, ResourcesCard, TimelineCard, UserLink, type DebugView } from './sandbox-insight';
 import NetworkPolicyDesigner, {
   compactNetworkPolicyLabel,
@@ -384,17 +390,19 @@ function snapshotCodec(type: string): { label: string; color: string } {
 
 // When no snapshot API serves the sandbox (snapshot operations not enabled for
 // the operator's organization, or another organization's sandbox on a release
-// without the admin snapshot list), list the catalog snapshots the admin debug
-// route reports.
+// without the admin snapshot list), list every snapshot record the admin
+// debug route reports, which the snapshot lists filter (`RECORDS_NOTE`).
 function AdminSnapshotsTable({
   snapshots,
   error,
   pending,
+  nodeListing,
   nowMs,
 }: {
   snapshots: DebugSnapshot[];
   error: string | null;
   pending: boolean;
+  nodeListing: NodeListing;
   nowMs: number;
 }) {
   const { token } = theme.useToken();
@@ -423,7 +431,7 @@ function AdminSnapshotsTable({
       size="small"
       pagination={tablePagination('snapshots', 10)}
       loading={pending}
-      locale={{ emptyText: error ? 'Could not load snapshots' : 'No snapshots' }}
+      locale={{ emptyText: catalogEmptyText(!!error, nodeListing, 'records') }}
       footer={() =>
         snapshots.length === 0 ? null : (
           <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 12, color: token.colorTextSecondary }}>
@@ -436,28 +444,28 @@ function AdminSnapshotsTable({
   );
 }
 
-// The snapshots the sandbox's node keeps, from the debug view the page
+// The snapshots the sandbox's node reports keeping, from the debug view the page
 // already reads on its cadence (no read of its own, and no audit event), with
 // Rollback: the node rolls back only to one of these names
 // (`rollbackTargets`). Each catalog row above is a `snap_` ID the node does
 // not know.
 function NodeSnapshotsTable({
   debugView,
-  sandboxStatus,
+  targets,
+  listing,
   route,
   rollback,
   nowMs,
 }: {
   debugView: DebugView;
-  sandboxStatus: string | null;
+  targets: RollbackTarget[];
+  listing: NodeListing;
   route: ReturnType<typeof rollbackRoute>;
   rollback: SnapshotRollback;
   nowMs: number;
 }) {
   const debug = debugView.debug;
-  const section = sectionData(debug?.snapshots);
   const error = debugView.error ?? (debug ? sectionError(debug.snapshots) : null);
-  const targets = rollbackTargets(section?.inventory ?? [], sandboxStatus);
   const columns: ColumnsType<RollbackTarget> = [
     { title: 'Name', key: 'name', ellipsis: true, render: (_, target) => <Text code copyable={{ text: target.snapshotName }}>{target.snapshotName}</Text> },
     {
@@ -488,7 +496,7 @@ function NodeSnapshotsTable({
       <Space size={8} wrap style={{ marginBottom: 8 }}>
         <Text strong>On the node</Text>
         <Text type="secondary" style={{ fontSize: 12 }}>
-          Rollback restores one of the snapshots the sandbox&apos;s node keeps.
+          {NODE_NOTE}
         </Text>
         <RollbackRefusalNote state={rollback} />
       </Space>
@@ -502,7 +510,7 @@ function NodeSnapshotsTable({
         size="small"
         pagination={tablePagination('node-snapshots', 10)}
         loading={!debug && !debugView.error}
-        locale={{ emptyText: error ? "Could not load the node's snapshots" : 'The node keeps no snapshots for this sandbox' }}
+        locale={{ emptyText: nodeEmptyText(!!error, listing) }}
       />
     </div>
   );
@@ -512,6 +520,8 @@ function SnapshotsCard({
   sandboxId,
   orgId,
   sandboxStatus,
+  periodicSnapshots,
+  inventoryGeneration,
   ownOrg,
   debugView,
   onRollbackSettled,
@@ -521,6 +531,12 @@ function SnapshotsCard({
   sandboxId: string;
   orgId: string | null;
   sandboxStatus: string | null;
+  // Whether the node runs the sandbox with periodic snapshots on (its
+  // observed `snapshots_enabled`), or null when the API does not say.
+  periodicSnapshots: boolean | null;
+  // The inventory generation `periodicSnapshots` was observed in: a debug
+  // view read in an older one shows no node rows (`currentInventory`).
+  inventoryGeneration: number;
   // `isOwnOrg`: the operator's own organization lists through the public
   // routes; another lists through the admin list (see `listSnapshots`).
   ownOrg: boolean;
@@ -624,8 +640,22 @@ function SnapshotsCard({
   // listing is display-only.
   const route = rollbackRoute(ownOrg, adminList);
   const rollback = useSnapshotRollback({ sandboxId, orgId, via: route.via, onSettled: onRollbackSettled });
+  // The node's list, which the empty catalog points at. An inventory the
+  // debug view does not carry is unknown, not empty, and so is one read in an
+  // older generation than the periodic state shown; the page reads it again
+  // as soon as that state changes. An unknown inventory shows no rows, so it
+  // offers no Rollback either.
+  const inventory = currentInventory(sectionData(debug?.snapshots), debugView.generation, inventoryGeneration);
+  const targets = inventory ? rollbackTargets(inventory, sandboxStatus) : [];
+  const listing = nodeListing(inventory ? targets.length : null, periodicSnapshots);
   const nodeSnapshots = (
-    <NodeSnapshotsTable debugView={debugView} sandboxStatus={sandboxStatus} route={route} rollback={rollback} nowMs={nowMs} />
+    <NodeSnapshotsTable debugView={debugView} targets={targets} listing={listing} route={route} rollback={rollback} nowMs={nowMs} />
+  );
+  const catalogHeader = (note: string) => (
+    <Space size={8} wrap style={{ marginBottom: 8 }}>
+      <Text strong>{CATALOG_TITLE}</Text>
+      <Text type="secondary" style={{ fontSize: 12 }}>{note}</Text>
+    </Space>
   );
   // Refresh and Retry. In a view that showed the control plane's records
   // instead (no listing yet, or a release without the admin list), the
@@ -649,6 +679,7 @@ function SnapshotsCard({
         return <Tag color={codec.color}>{codec.label}</Tag>;
       },
     },
+    { title: 'State', dataIndex: 'state', width: 100, render: (v: string) => <Tag color={v === 'ready' ? 'green' : v === 'failed' ? 'red' : 'default'}>{v}</Tag> },
     { title: 'Timestamp', dataIndex: 'timestamp', width: 200, render: (v: string | null) => v ?? '—' },
     { title: 'Size', dataIndex: 'size_bytes', width: 100, render: (v: number) => formatBytes(v) },
     {
@@ -690,7 +721,8 @@ function SnapshotsCard({
         {adminError ? (
           <Alert type="warning" showIcon style={{ marginBottom: 8 }} title={`Could not load the control plane's snapshot records: ${adminError}`} />
         ) : null}
-        <AdminSnapshotsTable snapshots={adminSnapshots} error={adminError} pending={!debug && !debugView.error} nowMs={nowMs} />
+        {catalogHeader(RECORDS_NOTE)}
+        <AdminSnapshotsTable snapshots={adminSnapshots} error={adminError} pending={!debug && !debugView.error} nodeListing={listing} nowMs={nowMs} />
         {nodeSnapshots}
       </Card>
     );
@@ -720,6 +752,7 @@ function SnapshotsCard({
           action={<Button size="small" onClick={relist}>Retry</Button>}
         />
       ) : null}
+      {catalogHeader(CATALOG_NOTE)}
       <Table
         columns={columns}
         dataSource={snapshots}
@@ -727,7 +760,7 @@ function SnapshotsCard({
         loading={loading}
         size="small"
         pagination={tablePagination('snapshots', 10)}
-        locale={{ emptyText: 'No snapshots' }}
+        locale={{ emptyText: catalogEmptyText(false, listing) }}
         footer={() =>
           snapshots.length === 0 ? null : (
             <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 12, color: token.colorTextSecondary }}>
@@ -1220,7 +1253,12 @@ export default function SandboxDetailPage({ dashboardUrl }: { dashboardUrl: stri
   const [editingNetwork, setEditingNetwork] = useState(false);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const [errorStatus, setErrorStatus] = useState<number | null>(null);
-  const [debugView, setDebugView] = useState<DebugView>({ debug: null, error: null });
+  const [debugView, setDebugView] = useState<DebugView>({ debug: null, error: null, generation: null });
+  // The periodic state last observed and the node inventory's generation,
+  // which each change of that state bumps. The ref is what a debug read starts
+  // in; the state is what renders.
+  const periodicRef = useRef<InventoryGeneration | null>(null);
+  const [periodic, setPeriodic] = useState<InventoryGeneration | null>(null);
   const debug = debugView.debug;
   const [operations, setOperations] = useState<AdminOperationRecord[]>([]);
   const [operationsMore, setOperationsMore] = useState(false);
@@ -1230,6 +1268,9 @@ export default function SandboxDetailPage({ dashboardUrl }: { dashboardUrl: stri
   const [insightGeneration, setInsightGeneration] = useState(0);
   // Only the newest insight request may write its answers.
   const insightRequest = useRef(0);
+  // Sandbox reads run one at a time, so an older answer never lands after a
+  // newer one.
+  const sandboxReads = useRef(serialReads()).current;
   const [nowMs, setNowMs] = useState(() => Date.now());
   const sandboxRef = useRef<Sandbox | null>(null);
   sandboxRef.current = sandbox;
@@ -1244,11 +1285,12 @@ export default function SandboxDetailPage({ dashboardUrl }: { dashboardUrl: stri
     const target = safeDecodeURIComponent(id);
     setNowMs(Date.now());
     setInsightGeneration((n) => n + 1);
+    const generation = periodicRef.current?.generation ?? 0;
     await Promise.all([
       withDebug
         ? getSandboxDebug(target)
-            .then((loaded) => { if (current()) setDebugView({ debug: loaded, error: null }); })
-            .catch((err: any) => { if (current()) setDebugView({ debug: null, error: err.message || 'failed to load debug data' }); })
+            .then((loaded) => { if (current()) setDebugView({ debug: loaded, error: null, generation }); })
+            .catch((err: any) => { if (current()) setDebugView({ debug: null, error: err.message || 'failed to load debug data', generation }); })
         : null,
       getSandboxOperations(target, { orgId: sandboxRef.current?.org_id ?? null })
         .then(({ operations: ops, more }) => {
@@ -1269,15 +1311,24 @@ export default function SandboxDetailPage({ dashboardUrl }: { dashboardUrl: stri
     }
   };
 
-  const refresh = async (showSpinner = false): Promise<boolean> => {
-    if (showSpinner) setLoading(true);
+  // Reads the sandbox row and writes what it found; true when it found it.
+  const readSandbox = async (showSpinner: boolean): Promise<boolean> => {
     try {
-      const loaded = await getConsoleSandbox(safeDecodeURIComponent(id));
+      // A read with no answer fails, so it cannot hold the serialized reads.
+      const target = safeDecodeURIComponent(id);
+      const loaded = await withTimeout(SANDBOX_READ_TIMEOUT_MS, (signal) => getConsoleSandbox(target, signal));
       // The insight reads that follow use the org before the next render.
       sandboxRef.current = loaded;
       setSandbox(loaded);
       setError(null);
       setErrorStatus(null);
+      // A change of the periodic state makes the node inventory unknown until
+      // a debug read started after it lands, so start one now.
+      const prev = periodicRef.current;
+      const next = observePeriodic(prev, loaded.snapshots_enabled ?? null);
+      periodicRef.current = next;
+      setPeriodic(next);
+      if (prev && next !== prev) void loadInsight(true);
       return true;
     } catch (err: any) {
       const status = typeof err?.status === 'number' ? err.status : null;
@@ -1295,6 +1346,13 @@ export default function SandboxDetailPage({ dashboardUrl }: { dashboardUrl: stri
     } finally {
       if (showSpinner) setLoading(false);
     }
+  };
+
+  // Refresh, and the read after an action: once a pending read finishes, so
+  // it still sees what the action changed.
+  const refresh = (showSpinner = false): Promise<boolean> => {
+    if (showSpinner) setLoading(true);
+    return sandboxReads.next(() => readSandbox(showSpinner));
   };
 
   useEffect(() => {
@@ -1316,8 +1374,9 @@ export default function SandboxDetailPage({ dashboardUrl }: { dashboardUrl: stri
       if (typeof document !== 'undefined' && document.hidden) return;
       // A sandbox that was missing (still being created) loads its debug and
       // operations as soon as it appears, not at the next insight tick.
+      // A tick whose read would overlap a pending one skips it.
       const wasMissing = !sandboxRef.current;
-      void refresh(false).then((found) => {
+      void sandboxReads.poll(() => readSandbox(false))?.then((found) => {
         if (found && wasMissing) void loadInsight(true);
       });
       ticks += 1;
@@ -1598,6 +1657,8 @@ export default function SandboxDetailPage({ dashboardUrl }: { dashboardUrl: stri
             sandboxId={sandbox.id}
             orgId={sandbox.org_id ?? null}
             sandboxStatus={sandbox.status}
+            periodicSnapshots={periodic?.periodic ?? null}
+            inventoryGeneration={periodic?.generation ?? 0}
             ownOrg={ownOrg}
             debugView={debugView}
             onRollbackSettled={() => { void Promise.all([refresh(false), loadInsight()]); }}

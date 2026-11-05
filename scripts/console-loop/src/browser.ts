@@ -102,25 +102,35 @@ export async function confirmPopover(page: Page, okName?: RegExp): Promise<void>
   await button.click();
 }
 
-// An admin API call from the page, with the console's own session.
-export async function adminFetch(page: Page, method: string, apiPath: string, body?: unknown): Promise<{ status: number; json: any }> {
-  return page.evaluate(async ({ method, apiPath, body }) => {
+// An admin API call from the page, with the console's own session. With
+// `timeoutMs`, a call that has not answered by then is aborted and reads as
+// status 0, so a poll's deadline holds.
+export async function adminFetch(
+  page: Page, method: string, apiPath: string, body?: unknown, { timeoutMs }: { timeoutMs?: number } = {},
+): Promise<{ status: number; json: any }> {
+  return page.evaluate(async ({ method, apiPath, body, timeoutMs }) => {
     const token = localStorage.getItem('token');
-    const response = await fetch(apiPath, {
-      method,
-      headers: {
-        'content-type': 'application/json',
-        ...(token ? { authorization: `Bearer ${token}` } : {}),
-        ...(method !== 'GET' ? { 'idempotency-key': crypto.randomUUID() } : {}),
-      },
-      body: body === undefined ? undefined : JSON.stringify(body),
-      redirect: 'error',
-    });
-    const raw = await response.text();
-    let json: unknown = null;
-    try { json = JSON.parse(raw); } catch { /* not JSON */ }
-    return { status: response.status, json };
-  }, { method, apiPath, body });
+    try {
+      const response = await fetch(apiPath, {
+        method,
+        headers: {
+          'content-type': 'application/json',
+          ...(token ? { authorization: `Bearer ${token}` } : {}),
+          ...(method !== 'GET' ? { 'idempotency-key': crypto.randomUUID() } : {}),
+        },
+        body: body === undefined ? undefined : JSON.stringify(body),
+        redirect: 'error',
+        signal: timeoutMs === undefined ? undefined : AbortSignal.timeout(Math.max(1, timeoutMs)),
+      });
+      const raw = await response.text();
+      let json: unknown = null;
+      try { json = JSON.parse(raw); } catch { /* not JSON */ }
+      return { status: response.status, json };
+    } catch (err) {
+      if (timeoutMs !== undefined && err instanceof DOMException && err.name === 'TimeoutError') return { status: 0, json: null };
+      throw err;
+    }
+  }, { method, apiPath, body, timeoutMs });
 }
 
 export async function signIn(c: Ctx, email: string, password: string): Promise<void> {
@@ -137,7 +147,7 @@ export async function waitForStatus(c: Ctx, id: string, want: string[], timeoutM
   const deadline = Date.now() + timeoutMs;
   let last = '';
   while (Date.now() < deadline) {
-    const response = await adminFetch(c.page, 'GET', `/admin/api/v1/sandboxes/${id}`);
+    const response = await adminFetch(c.page, 'GET', `/admin/api/v1/sandboxes/${id}`, undefined, { timeoutMs: Math.min(15_000, deadline - Date.now()) });
     last = response.json?.status ?? `http ${response.status}`;
     if (want.includes(last)) return last;
     await c.page.waitForTimeout(2000);
