@@ -39,6 +39,8 @@ db_private_outside_tests! {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SandboxLifecycleCount {
     pub state: SandboxState,
+    pub runtime: Option<RuntimeKind>,
+    pub runtime_version: Option<RuntimeVersion>,
     pub count: u64,
 }
 
@@ -99,16 +101,35 @@ pub enum InsertRecoveredSuspendedSandboxError {
 }
 
 db_private_outside_tests! {
-    /// Count every durable sandbox-manager row by its bounded lifecycle. This stays
-    /// in SQL so the sampler's memory use is independent of the number of sandboxes
-    /// on the node.
+    /// Aggregate durable rows in SQLite, retaining only lifecycle/runtime buckets
+    /// rather than collecting each sandbox's complete execution metadata.
     fn sandbox_lifecycle_counts(conn: &Connection) -> Result<Vec<SandboxLifecycleCount>> {
-        let mut statement = conn.prepare(
-            "SELECT state, COUNT(*)
-           FROM sandboxes
-       GROUP BY state
-       ORDER BY state",
+        // Use the row reader's full serde decoder, not a second description of
+        // its wire format in SQL. Only the validated runtime enters GROUP BY;
+        // complete metadata is decoded one row at a time and then discarded.
+        conn.raw().create_scalar_function(
+            "sandbox_execution_runtime",
+            1,
+            rusqlite::functions::FunctionFlags::SQLITE_UTF8
+                | rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC,
+            |context| {
+                let json: Option<String> = context.get(0)?;
+                json.as_deref()
+                    .and_then(|value| serde_json::from_str::<ExecutionMetadata>(value).ok())
+                    .map(|metadata| {
+                        serde_json::to_string(metadata.runtime())
+                            .map_err(|error| rusqlite::Error::UserFunctionError(Box::new(error)))
+                    })
+                    .transpose()
+            },
         )?;
+        let mut statement = conn.prepare(sql!(
+            "SELECT state, runtime,
+                    sandbox_execution_runtime(execution_metadata_json) AS execution_runtime,
+                    COUNT(*)
+             FROM sandboxes
+             GROUP BY state, runtime, execution_runtime"
+        ))?;
         let rows = statement.query_map([], |row| {
             let state_label: String = row.get(0)?;
             let state = state_label.parse::<SandboxState>().map_err(|_| {
@@ -118,10 +139,43 @@ db_private_outside_tests! {
                     format!("unknown sandbox state '{state_label}'").into(),
                 )
             })?;
-            let count = row.get::<_, SqliteU64>(1)?.0;
-            Ok(SandboxLifecycleCount { state, count })
+            let runtime_label: String = row.get(1)?;
+            let execution_runtime: Option<String> = row.get(2)?;
+            let identity = execution_runtime
+                .as_deref()
+                .and_then(|value| serde_json::from_str::<RuntimeIdentity>(value).ok());
+            let runtime = identity
+                .as_ref()
+                .map(|identity| identity.kind)
+                .or_else(|| runtime_label.parse().ok());
+            let runtime_version = identity.map(|identity| identity.version);
+            let count = row.get::<_, SqliteU64>(3)?.0;
+            Ok(((state, runtime, runtime_version), count))
         })?;
-        Ok(rows.collect::<rusqlite::Result<_>>()?)
+        // Runtime aliases must share a bucket; absent or malformed metadata must
+        // not drop durable rows or invent a legacy runtime version.
+        let mut grouped = HashMap::new();
+        for row in rows {
+            let (key, count) = row?;
+            *grouped.entry(key).or_insert(0_u64) += count;
+        }
+        let mut counts: Vec<_> = grouped
+            .into_iter()
+            .map(|((state, runtime, runtime_version), count)| SandboxLifecycleCount {
+                state,
+                runtime,
+                runtime_version,
+                count,
+            })
+            .collect();
+        counts.sort_by(|left, right| {
+            (left.state.as_str(), left.runtime, &left.runtime_version).cmp(&(
+                right.state.as_str(),
+                right.runtime,
+                &right.runtime_version,
+            ))
+        });
+        Ok(counts)
     }
 }
 

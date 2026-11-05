@@ -13,10 +13,11 @@ pub use pplx_space_common_core::types::PolicyAuthority;
 use pplx_space_common_core::types::{
     ArtifactKind, ArtifactOrigin, AutoLifecyclePolicy, AutoLifecycleRuntimeState,
     ExecutionGeneration, ExecutionMetadata, LocalArtifactId, NodeManagedBy, ORPHANED_SANDBOX_OWNER,
-    ORPHANED_SANDBOX_TEMPLATE, RuntimeKind, SandboxActivationAttemptId, SandboxCleanupEpisodeId,
-    SandboxId, SandboxOwner, SandboxQuarantineHistoryAction, SandboxQuarantineNextAction,
-    SandboxQuarantineReasonCode, SandboxQuarantineSource, SandboxRuntimeLabel,
-    SandboxTransitionReceipt, SandboxTransitionReceiptInvariantError, SandboxTransitionReceiptKind,
+    ORPHANED_SANDBOX_TEMPLATE, RuntimeIdentity, RuntimeKind, RuntimeVersion,
+    SandboxActivationAttemptId, SandboxCleanupEpisodeId, SandboxId, SandboxOwner,
+    SandboxQuarantineHistoryAction, SandboxQuarantineNextAction, SandboxQuarantineReasonCode,
+    SandboxQuarantineSource, SandboxRuntimeLabel, SandboxTransitionReceipt,
+    SandboxTransitionReceiptInvariantError, SandboxTransitionReceiptKind,
     SandboxTransitionTargetState, SnapshotName,
 };
 use pplx_space_events::{

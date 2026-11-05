@@ -44,7 +44,7 @@ dashmap = { workspace = true }
 jiff = { workspace = true }
 ref-cast = { workspace = true }
 rustix = { workspace = true, features = ["fs"] }
-rusqlite = { workspace = true }
+rusqlite = { workspace = true, features = ["functions"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 sqlx = { workspace = true, features = ["migrate"] }

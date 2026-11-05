@@ -12,14 +12,29 @@ pub fn unary_list_budget_exceeded(rpc: &'static str, limit: &'static str) {
     );
 }
 
-/// Current node-local durable sandbox rows in one lifecycle bucket. The caller
+/// Current node-local durable sandbox rows in one lifecycle/runtime bucket. The caller
 /// supplies a value decoded through the sandbox-manager's bounded state enum;
 /// do not attach sandbox, pod, node, or execution identifiers.
-pub fn lifecycle_count(value: u64, state: &str) {
+pub fn lifecycle_count(
+    value: u64,
+    state: &str,
+    runtime: Option<pplx_space_common_core::types::RuntimeKind>,
+    runtime_version: Option<&pplx_space_common_core::types::RuntimeVersion>,
+) {
     gauge(
         "sandbox.worker.lifecycle.count",
         value as f64,
-        &[tag("state", state)],
+        &[
+            tag("state", state),
+            tag(
+                "runtime",
+                runtime.map_or("unknown", |runtime| runtime.as_str()),
+            ),
+            tag(
+                "runtime_version",
+                runtime_version.map_or("unknown", |version| version.as_str()),
+            ),
+        ],
     );
 }
 

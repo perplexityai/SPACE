@@ -7,10 +7,14 @@ fn disappeared_lifecycle_buckets_are_zeroed_once() {
     let initial = [
         SandboxLifecycleCount {
             state: SandboxState::CleanupFailed,
+            runtime: None,
+            runtime_version: None,
             count: 2,
         },
         SandboxLifecycleCount {
             state: SandboxState::Started,
+            runtime: None,
+            runtime_version: None,
             count: 4,
         },
     ];
@@ -31,30 +35,40 @@ fn disappeared_lifecycle_buckets_are_zeroed_once() {
             (
                 LifecycleBucket {
                     state: "cleanup_failed".to_owned(),
+                    runtime: None,
+                    runtime_version: None,
                 },
                 2,
             ),
             (
                 LifecycleBucket {
                     state: "started".to_owned(),
+                    runtime: None,
+                    runtime_version: None,
                 },
                 4,
             ),
             (
                 LifecycleBucket {
                     state: "started".to_owned(),
+                    runtime: None,
+                    runtime_version: None,
                 },
                 4,
             ),
             (
                 LifecycleBucket {
                     state: "cleanup_failed".to_owned(),
+                    runtime: None,
+                    runtime_version: None,
                 },
                 0,
             ),
             (
                 LifecycleBucket {
                     state: "started".to_owned(),
+                    runtime: None,
+                    runtime_version: None,
                 },
                 4,
             ),
