@@ -71,8 +71,12 @@ const exclusive = <T,>(name: string, work: () => T): Promise<T> => exclusiveWith
 
 const digest = (hash: string | null | undefined) => <code>{shortHash(hash, 'none')}</code>;
 
-// Where a build's outcome shows: the template's releases and its builds.
-function ReleasesAndBuilds({ template }: { template: SystemTemplate }) {
+// Where a build's outcome shows: the template's releases and its builds. The
+// builder creates a template's record when it starts the first build's job,
+// so a build still queued, or one whose outcome is unknown, can name a
+// template without a page yet: it is linked only once the template is listed.
+function ReleasesAndBuilds({ template, listed }: { template: SystemTemplate; listed: boolean }) {
+  if (!listed) return <>the {template} releases and builds, once the template is listed</>;
   return (
     <>
       the <Link href={templateHref(template, 'releases')}>{template} releases</Link> and{' '}
@@ -84,11 +88,11 @@ function ReleasesAndBuilds({ template }: { template: SystemTemplate }) {
 // A build attempt "Start a new build" replaced, which may still publish a
 // release of its own. Later answers of its key are listed, never read as its
 // outcome.
-function RetiredAttempt({ template, attempt }: { template: SystemTemplate; attempt: RetiredBuild }) {
+function RetiredAttempt({ template, attempt, listed }: { template: SystemTemplate; attempt: RetiredBuild; listed: boolean }) {
   return (
     <Text type="warning">
       Earlier attempt {attempt.generation + 1}{attempt.jobId ? <>, job <Text code copyable>{attempt.jobId}</Text>,</> : null} has an
-      unknown outcome: it may still be running and publish a release of its own; see <ReleasesAndBuilds template={template} />.
+      unknown outcome: it may still be running and publish a release of its own; see <ReleasesAndBuilds template={template} listed={listed} />.
       {attempt.notes.length ? ` Since then, ${attempt.notes.join('; ')}.` : ''}
     </Text>
   );
@@ -126,13 +130,15 @@ interface Props {
   releasesLoaded: boolean;
   // The title this component's header row carries.
   title: ReactNode;
+  // The templates the console has a page for; others are named, not linked.
+  listedTemplates: ReadonlySet<string>;
 }
 
 // Rebuilding seed and code-runtime, one explicit step per click. The run is
 // stored per cluster and user, for at most a day, so a reload or another tab
 // can show it and keep polling its builds; nothing is sent from storage.
 // Whether a promotion is done is read from the tags, not stored.
-export default function SystemTemplateRebuild({ refreshReleases, releases, releasesLoaded, title }: Props) {
+export default function SystemTemplateRebuild({ refreshReleases, releases, releasesLoaded, title, listedTemplates }: Props) {
   const { message } = App.useApp();
   const { user, cluster } = useAuth();
   const key = user && cluster ? storageKey(cluster.id, user.id) : null;
@@ -625,10 +631,10 @@ export default function SystemTemplateRebuild({ refreshReleases, releases, relea
           {closed ? (
             <Text type="secondary">
               {closed.jobId ? <>Job <Text code copyable>{closed.jobId}</Text>: </> : null}
-              see <ReleasesAndBuilds template={template} />.
+              see <ReleasesAndBuilds template={template} listed={listedTemplates.has(template)} />.
             </Text>
           ) : null}
-          {retiredBuilds(run, template).map((attempt) => <RetiredAttempt key={attempt.generation} template={template} attempt={attempt} />)}
+          {retiredBuilds(run, template).map((attempt) => <RetiredAttempt key={attempt.generation} template={template} attempt={attempt} listed={listedTemplates.has(template)} />)}
           {trouble[template] ? <Text type="warning">{trouble[template]!.text.replace(/\.$/, '')}. Retrying in {Math.round(pollDelayMs(trouble[template]!.failures) / 1000)} s.</Text> : null}
           {test ? (
             <Text>

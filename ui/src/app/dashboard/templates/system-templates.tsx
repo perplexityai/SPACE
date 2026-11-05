@@ -1,7 +1,7 @@
 'use client';
 
 import Link from 'next/link';
-import { Space, Table, Tag, Tooltip, Typography } from 'antd';
+import { Alert, Button, Space, Table, Tag, Tooltip, Typography } from 'antd';
 import { LATEST_TAG, shortHash } from '@/lib/template-format';
 import SystemTemplateRebuild from './system-template-rebuild';
 import type { TemplatesData } from './use-templates-data';
@@ -20,8 +20,20 @@ export default function SystemTemplates({ data }: { data: TemplatesData }) {
     return { name, template, latest };
   });
 
+  // A read that failed before any answer is an error, not loading.
+  const readError = (!data.templatesLoaded && data.templatesError) || (!data.releasesLoaded && data.releasesError) || null;
+
   return (
     <Space orientation="vertical" size={8} style={{ width: '100%' }}>
+      {readError ? (
+        <Alert
+          type="error"
+          showIcon
+          style={{ maxWidth: 720 }}
+          title={`Could not read the system templates: ${readError}`}
+          action={<Button size="small" onClick={data.handleManualRefresh} disabled={data.refreshCooldown}>Retry</Button>}
+        />
+      ) : null}
       <Table
         size="small"
         rowKey="name"
@@ -39,6 +51,7 @@ export default function SystemTemplates({ data }: { data: TemplatesData }) {
           {
             title: LATEST_TAG,
             render: (_, row) => {
+              if (readError) return <Text type="warning">not read</Text>;
               if (!data.templatesLoaded || !data.releasesLoaded) return <Text type="secondary">…</Text>;
               if (!row.template) return <Tag style={{ marginInlineEnd: 0 }}>not built yet</Tag>;
               if (!row.latest) return <Tag color="warning" style={{ marginInlineEnd: 0 }}>no {LATEST_TAG}</Tag>;
@@ -58,6 +71,7 @@ export default function SystemTemplates({ data }: { data: TemplatesData }) {
         releasesLoaded={data.releasesLoaded}
         refreshReleases={() => data.refreshTemplateReleases({ showLoading: false })}
         title={<Title level={5} style={{ margin: 0 }}>System template rebuild</Title>}
+        listedTemplates={new Set(data.templates.map((template) => template.name))}
       />
     </Space>
   );

@@ -41,6 +41,8 @@ export default function ReleasesTable({ data, actions, templateName, search, onS
     [templateReleases, templateName],
   );
   const focused = Boolean(highlight && onClearHighlight);
+  // The first read failed: nothing is known about the releases yet.
+  const readError = !data.releasesLoaded ? data.releasesError : null;
   const shown = useMemo(
     () => (focused
       ? scoped.filter((release) => release.id === highlight)
@@ -211,7 +213,16 @@ export default function ReleasesTable({ data, actions, templateName, search, onS
 
   return (
     <>
-      {focused ? (
+      {readError ? (
+        <Alert
+          type="error"
+          showIcon
+          style={{ marginBottom: 8 }}
+          title={`Could not read the releases: ${readError}`}
+          action={<Button size="small" onClick={data.handleManualRefresh} disabled={data.refreshCooldown}>Retry</Button>}
+        />
+      ) : null}
+      {focused && !readError ? (
         <Alert
           type={shown.length || !data.releasesLoaded ? 'info' : 'warning'}
           showIcon

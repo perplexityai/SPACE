@@ -4,6 +4,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { adminApi } from '@/lib/api';
 import { isMissingRoute, pageRows } from '@/lib/admin-fallback';
 import { errorMessage } from '@/lib/template-format';
+import { ReadQueue } from '@/lib/read-queue';
 import type { LatestBuild } from '@/lib/template-list';
 import type { TemplateBuildListEntry } from '@/lib/types';
 import { encodedPathSegment } from './use-templates-data';
@@ -19,31 +20,33 @@ interface Entry {
 }
 
 // The newest build of each template in `wanted`, read with
-// `GET /templates/{name}/builds?limit=1` as the view asks for them. An API
+// `GET /templates/{name}/builds?limit=1` as the view asks for them. While the
+// view stays open, each template is read at most once a minute. An API
 // release without the route answers 405: every template then reads as
-// `unsupported` without a request, until a later refresh (`reloadKey`) asks
-// again.
+// `unsupported` without a request, until a refresh (`reloadKey`) a minute
+// later asks again.
 export function useLatestBuilds(wanted: string[], reloadKey: number) {
   const [entries, setEntries] = useState<ReadonlyMap<string, Entry>>(() => new Map());
   const [unsupported, setUnsupported] = useState(false);
   const entriesRef = useRef(entries);
   entriesRef.current = entries;
   const unsupportedRef = useRef(false);
-  const queue = useRef<string[]>([]);
-  const queued = useRef(new Set<string>());
-  const running = useRef(0);
+  // When the API last answered that it has no builds route.
+  const unsupportedAt = useRef(0);
+  const queue = useRef(new ReadQueue(CONCURRENCY));
   const mounted = useRef(false);
   const wantedRef = useRef(new Set(wanted));
   wantedRef.current = new Set(wanted);
 
   // Set in the effect, not at first render: Strict Mode runs the cleanup and
-  // the setup again on a mounted component. Unmounting drops what is queued.
+  // the setup again on a mounted component. The cleanup drops the reads not
+  // sent yet; one in flight stays queued until it ends, so the second setup
+  // does not send it again.
   useEffect(() => {
     mounted.current = true;
     return () => {
       mounted.current = false;
-      queue.current = [];
-      queued.current.clear();
+      queue.current.dropWaiting();
     };
   }, []);
 
@@ -62,6 +65,7 @@ export function useLatestBuilds(wanted: string[], reloadKey: number) {
     } catch (err: unknown) {
       if (isMissingRoute(err)) {
         unsupportedRef.current = true;
+        unsupportedAt.current = Date.now();
         if (mounted.current) setUnsupported(true);
         store(name, { kind: 'unsupported' });
       } else {
@@ -71,28 +75,25 @@ export function useLatestBuilds(wanted: string[], reloadKey: number) {
   };
 
   const pump = () => {
-    while (mounted.current && running.current < CONCURRENCY && queue.current.length > 0) {
-      const name = queue.current.shift()!;
-      if (unsupportedRef.current) {
-        queued.current.delete(name);
-        store(name, { kind: 'unsupported' });
-        continue;
+    while (mounted.current) {
+      const names = queue.current.take();
+      if (names.length === 0) return;
+      for (const name of names) {
+        if (unsupportedRef.current) {
+          queue.current.finish(name);
+          store(name, { kind: 'unsupported' });
+          continue;
+        }
+        void read(name).finally(() => {
+          queue.current.finish(name);
+          pump();
+        });
       }
-      running.current += 1;
-      void read(name).finally(() => {
-        running.current -= 1;
-        queued.current.delete(name);
-        pump();
-      });
     }
   };
 
   const enqueue = (names: string[]) => {
-    for (const name of names) {
-      if (queued.current.has(name)) continue;
-      queued.current.add(name);
-      queue.current.push(name);
-    }
+    queue.current.add(names);
     pump();
   };
 
@@ -100,26 +101,25 @@ export function useLatestBuilds(wanted: string[], reloadKey: number) {
   // each read asks a builder.
   const wantedKey = wanted.join('\n');
   useEffect(() => {
-    const dropped = queue.current.filter((name) => !wantedRef.current.has(name));
-    queue.current = queue.current.filter((name) => wantedRef.current.has(name));
-    for (const name of dropped) queued.current.delete(name);
+    queue.current.dropWaiting((name) => wantedRef.current.has(name));
     enqueue(wanted.filter((name) => !entriesRef.current.has(name)));
   }, [wantedKey]);
 
   // A refresh reads again what is shown and older than STALE_MS; on an API
-  // without the route, the reads ask again.
+  // without the route, the reads ask again once STALE_MS has passed.
   const lastReload = useRef(reloadKey);
   useEffect(() => {
     if (lastReload.current === reloadKey) return;
     lastReload.current = reloadKey;
+    const now = Date.now();
     if (unsupportedRef.current) {
+      if (now - unsupportedAt.current < STALE_MS) return;
       // The first reads go out; if they are refused again, the rest are
       // marked without a request.
       unsupportedRef.current = false;
       enqueue(wanted.filter((name) => entriesRef.current.get(name)?.value.kind === 'unsupported'));
       return;
     }
-    const now = Date.now();
     enqueue(wanted.filter((name) => {
       const entry = entriesRef.current.get(name);
       return !entry || now - entry.readAt >= STALE_MS;

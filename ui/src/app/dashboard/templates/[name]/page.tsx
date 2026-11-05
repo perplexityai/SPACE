@@ -171,6 +171,7 @@ function TemplateDetailPage() {
               releasesLoaded={data.releasesLoaded}
               refreshReleases={() => data.refreshTemplateReleases({ showLoading: false })}
               title={<Title level={5} style={{ margin: 0 }}>System template rebuild</Title>}
+              listedTemplates={new Set(data.templates.map((listed) => listed.name))}
             />
           ) : null}
           <TemplateBuildsPanel templateName={template.name} open={tab === 'builds'} reloadKey={data.refreshGeneration} />
