@@ -791,3 +791,5 @@ async fn post_selection_execution_identity_change_blocks_exact_finalization() ->
 mod first_seen_enqueue;
 #[path = "published_state_tests/lifecycle_writers.rs"]
 mod lifecycle_writers;
+#[path = "published_state_tests/published_status.rs"]
+mod published_status;
