@@ -527,6 +527,17 @@ message StopRequest {
   optional SandboxStopCause stop_cause = 5;
 }
 
+// A node's attribution of a sandbox's last stop. Its presence is the
+// attribution: a requested stop has one too, with no cause.
+message SandboxStopAttribution {
+  // Why the sandbox stopped when nobody asked it to. Absent or UNSPECIFIED for
+  // a requested stop; a reader treats a value it can't name the same way.
+  optional SandboxStopCause cause = 1;
+  // When the node admitted the stop, by its own clock. Unlike
+  // SandboxInfo.state_changed_at, a later failed start doesn't move it.
+  google.protobuf.Timestamp stopped_at = 2;
+}
+
 // Why a sandbox stopped when nobody asked it to.
 enum SandboxStopCause {
   SANDBOX_STOP_CAUSE_UNSPECIFIED = 0;
@@ -730,11 +741,11 @@ message SandboxInfo {
   // The row's recorded node-local cleanup. Absent when none is recorded, or
   // from an older node that never set it.
   optional SandboxCleanup cleanup = 59;
-  // Why a STOPPED sandbox stopped, when no one asked for the stop. Set only on
-  // a STOPPED row whose stop sbx-manager admitted for that cause, until the
-  // sandbox runs again; absent for a requested stop and from older nodes. The
-  // control plane takes state_changed_at as the stop's time.
-  optional SandboxStopCause stop_cause = 60;
+  // This node's attribution of the STOPPED sandbox's last stop: its cause, or
+  // none for a requested stop, with its time. Set only on a STOPPED row whose
+  // stop this sbx-manager admitted, until the sandbox runs again; absent from
+  // older nodes, and for a stop an older sbx-manager admitted.
+  optional SandboxStopAttribution stop_attribution = 60;
 }
 
 // A node-local cleanup recorded on a sandbox row. An activation records one,

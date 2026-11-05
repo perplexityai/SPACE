@@ -61,5 +61,5 @@ PublishedSandboxState {
     state_changed_at: None,
     quarantine_recovery: None,
     activation_attempt_id: None,
-    stop_cause: None,
+    stop_attribution: None,
 }

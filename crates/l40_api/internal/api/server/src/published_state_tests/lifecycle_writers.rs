@@ -221,33 +221,69 @@ async fn stopped_report_leaves_a_stopped_re_placement_to_the_drain() -> TestResu
     Ok(())
 }
 
-/// A `stopped` report carries why the node stopped the sandbox, and the row
-/// it converges keeps that cause with the node's stop time; a report without
-/// one, from a requested stop or an older node, records none, and an
-/// unspecified cause reads the same. The store's `stop_cause_tests` pin when a
-/// cause ends.
+/// A `stopped` report carries the node's attribution of the stop, and the
+/// row takes it with the attribution's own time, not the report's state change
+/// time (which a later failed start moves). A requested stop's attribution
+/// (no cause, or an unspecified one) writes a NULL cause with its time. A
+/// report without an attribution, from an older node, leaves what the row
+/// holds. The store's `stop_cause_tests` pin the ordering and lifecycle rules.
 #[tokio::test(flavor = "current_thread")]
-async fn stopped_report_records_why_the_node_stopped_the_sandbox() -> TestResult {
-    use pplx_space_sbx_mgr_client::proto::SandboxStopCause;
+async fn stopped_report_applies_the_nodes_stop_attribution() -> TestResult {
+    use pplx_space_sbx_mgr_client::proto::{SandboxStopAttribution, SandboxStopCause};
     let db = pg_test_db().await?;
     let pool = &db.pool;
     let node_id = ready_node(pool).await?;
-    let stopped_at = time::macros::datetime!(2026-11-05 12:00:00 UTC);
+    let stopped_at = time::macros::datetime!(2026-11-05 12:00:00.250 UTC);
+    let earlier = time::macros::datetime!(2026-11-05 11:00:00 UTC);
+    let attribution = |cause: Option<SandboxStopCause>| SandboxStopAttribution {
+        cause: cause.map(|cause| cause as i32),
+        stopped_at: Some(prost_types::Timestamp {
+            seconds: stopped_at.unix_timestamp(),
+            nanos: 250_000_000,
+        }),
+    };
 
-    for (cause, expected) in [
+    for (case, published, expected) in [
         (
-            Some(SandboxStopCause::PodTerminated),
-            Some("pod_terminated"),
+            "pod terminated",
+            Some(attribution(Some(SandboxStopCause::PodTerminated))),
+            (Some("pod_terminated"), Some(stopped_at)),
         ),
-        (Some(SandboxStopCause::VmExited), Some("vm_exited")),
-        (Some(SandboxStopCause::Unspecified), None),
-        (None, None),
+        (
+            "vm exited",
+            Some(attribution(Some(SandboxStopCause::VmExited))),
+            (Some("vm_exited"), Some(stopped_at)),
+        ),
+        (
+            "requested",
+            Some(attribution(None)),
+            (None, Some(stopped_at)),
+        ),
+        (
+            "unspecified",
+            Some(attribution(Some(SandboxStopCause::Unspecified))),
+            (None, Some(stopped_at)),
+        ),
+        // An older node: the row keeps the cause it was stopped with.
+        ("no attribution", None, (Some("vm_exited"), Some(earlier))),
     ] {
         let (sandbox_id, _) = insert_running(pool, node_id, "started").await?;
+        if published.is_none() {
+            sqlx::query(sql!(
+                "UPDATE sandboxes
+                    SET lifecycle = 'stopped', stop_cause = 'vm_exited', stop_cause_at = $2
+                  WHERE id = $1"
+            ))
+            .bind(sandbox_id)
+            .bind(earlier)
+            .execute(pool)
+            .await?;
+        }
         let mut state = published_sandbox_state(sandbox_id, "stopped");
-        state.stop_cause = cause.map(|cause| cause as i32);
+        state.stop_attribution = published;
+        // A failed start after the stop moved the node's state change time.
         state.state_changed_at = Some(prost_types::Timestamp {
-            seconds: stopped_at.unix_timestamp(),
+            seconds: stopped_at.unix_timestamp() + 600,
             nanos: 0,
         });
         publish(pool, node_id, state).await?;
@@ -259,9 +295,8 @@ async fn stopped_report_records_why_the_node_stopped_the_sandbox() -> TestResult
             .bind(sandbox_id)
             .fetch_one(pool)
             .await?;
-        assert_eq!(lifecycle, "stopped", "{cause:?}");
-        assert_eq!(stop_cause.as_deref(), expected, "{cause:?}");
-        assert_eq!(stop_cause_at, expected.map(|_| stopped_at), "{cause:?}");
+        assert_eq!(lifecycle, "stopped", "{case}");
+        assert_eq!((stop_cause.as_deref(), stop_cause_at), expected, "{case}");
     }
     Ok(())
 }

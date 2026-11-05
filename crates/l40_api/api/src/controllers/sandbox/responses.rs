@@ -649,6 +649,11 @@ pub(super) fn sandbox_to_cached_response(
             observed.status.clone(),
             observed.node_id,
         ));
+        // Only the lifecycle this response finally renders decides whether the
+        // stored cause explains it: a stored `restoring` row its node reports
+        // `stopped` shows its cause, and a stored `stopped` row its node
+        // reports running doesn't.
+        response.stop_cause = stop_cause_response(sandbox, response.lifecycle.as_deref());
         response.spaced_version = observed.spaced_version.clone();
         response.pid = observed.pid.and_then(|value| u32::try_from(value).ok());
         response.namespace = observed.namespace.clone();
@@ -809,12 +814,12 @@ pub fn sandbox_to_response(sandbox: &Sandbox, live: Option<&SandboxInfo>) -> San
     }
 }
 
-/// The row's stored stop cause, when the response renders the sandbox
-/// `stopped`. The row keeps a cause until the sandbox runs again, through
-/// lifecycles such as an evacuation's `restoring`, so only the rendered
-/// lifecycle decides whether it explains what the caller sees;
-/// [`SandboxResponse::set_state`] applies the same rule when an observation
-/// replaces it.
+/// The row's stored stop cause, when it has one and the response renders
+/// the sandbox `stopped`. The row keeps its node's attribution until the
+/// sandbox runs again, through lifecycles such as an evacuation's
+/// `restoring`, so only the rendered lifecycle decides whether it explains
+/// what the caller sees. A response that replaces its lifecycle with a node's
+/// observation computes it again afterwards.
 fn stop_cause_response(
     sandbox: &Sandbox,
     rendered_lifecycle: Option<&str>,

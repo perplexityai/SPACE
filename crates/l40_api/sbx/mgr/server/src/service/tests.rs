@@ -15954,43 +15954,65 @@ pub(crate) mod service_tests {
         }
     }
 
+    /// A `stopped` row publishes its attribution with the attribution's own
+    /// time, not the row's state change time, which a later failed start
+    /// moves; a stop still in flight publishes none.
     #[tokio::test]
-    async fn build_sandbox_info_publishes_the_stop_cause_only_when_stopped() {
-        use crate::db::StopCause;
+    async fn build_sandbox_info_publishes_the_stop_attribution_only_when_stopped() {
+        use crate::db::{StopAttribution, StopCause};
         use crate::proto::SandboxStopCause as Proto;
         let conn = crate::db::test_conn();
         let sandbox_id = SandboxId::new().to_string();
         insert_test_sandbox(&conn, &sandbox_id, SandboxState::Stopped);
         let service = service_with_runtime_probe(conn, false);
-        for (state, cause, expected) in [
+        let at = |cause| StopAttribution {
+            cause,
+            stopped_at_ms: 1_793_900_000_123,
+        };
+        for (state, attribution, expected) in [
             (SandboxState::Stopped, None, None),
+            (SandboxState::Stopped, Some(at(None)), Some(None)),
             (
                 SandboxState::Stopped,
-                Some(StopCause::PodTerminated),
-                Some(Proto::PodTerminated),
+                Some(at(Some(StopCause::PodTerminated))),
+                Some(Some(Proto::PodTerminated)),
             ),
             (
                 SandboxState::Stopped,
-                Some(StopCause::VmExited),
-                Some(Proto::VmExited),
+                Some(at(Some(StopCause::VmExited))),
+                Some(Some(Proto::VmExited)),
             ),
-            // A stop still in flight hasn't stopped the sandbox yet.
-            (SandboxState::Stopping, Some(StopCause::VmExited), None),
+            (
+                SandboxState::Stopping,
+                Some(at(Some(StopCause::VmExited))),
+                None,
+            ),
         ] {
             let mut sandbox = service.lookup_sandbox(&sandbox_id).unwrap();
             sandbox.state = state;
-            sandbox.stop_cause = cause;
+            sandbox.stop_attribution = attribution;
 
             let info = service
                 .build_sandbox_info(sandbox, None, None, None, None)
                 .await
                 .unwrap();
 
+            let published = info.stop_attribution;
             assert_eq!(
-                info.stop_cause,
-                expected.map(|cause| cause as i32),
-                "{state} {cause:?}"
+                published.as_ref().map(|attribution| attribution.cause),
+                expected.map(|cause: Option<Proto>| cause.map(|cause| cause as i32)),
+                "{state} {attribution:?}"
             );
+            if expected.is_some() {
+                assert_eq!(
+                    published.and_then(|attribution| attribution.stopped_at),
+                    Some(prost_types::Timestamp {
+                        seconds: 1_793_900_000,
+                        nanos: 123_000_000
+                    }),
+                    "{state}"
+                );
+            }
         }
     }
 

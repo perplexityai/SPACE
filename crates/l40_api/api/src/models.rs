@@ -454,11 +454,6 @@ impl SandboxResponse {
         self.lifecycle = state.reported_lifecycle();
         self.status = state.reported_lifecycle();
         self.state_input = state;
-        // An observation that renders the sandbox running shows no cause of
-        // the stop the stored row still describes.
-        if !renders_stopped(self.lifecycle.as_deref()) {
-            self.stop_cause = None;
-        }
     }
 }
 

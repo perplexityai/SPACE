@@ -1818,7 +1818,7 @@ pub async fn publish_sandbox_states_with_retirement(
                     .transpose()?,
                 execution_generation: execution_generation.map(|generation| generation.get()),
                 pod_uid: pod_uid.map(|pod_uid| pod_uid.to_string()),
-                stop_cause: published_stop_cause(state.stop_cause),
+                stop_attribution: published_stop_attribution(state.stop_attribution.as_ref()),
             };
             rows.push(row);
             for snapshot in &state.snapshots {
@@ -2237,6 +2237,9 @@ pub async fn publish_sandbox_states_with_retirement(
     ));
 
     let stopped_ids = converge_stopped_sandboxes(conn, node_id, &rows).await?;
+    // After the convergence, so a row it just moved out of `started` takes
+    // its attribution in the same publication.
+    record_stop_attributions(conn, node_id, &rows).await?;
     emit_lifecycle_convergence_events(
         node_id,
         &stopped_ids,
@@ -3574,16 +3577,60 @@ async fn converge_restored_sandboxes(
     Ok(restored_ids)
 }
 
-/// The cause a node published with its `stopped` status. An unspecified or
-/// unknown value, such as one a newer node names, records no cause.
-fn published_stop_cause(value: Option<i32>) -> Option<pplx_space_sandbox_store::SandboxStopCause> {
+/// The attribution a node published for the sandbox's last stop. A cause
+/// that is unspecified, or that a newer node names, is no cause: the stop
+/// still has an attribution, so it replaces an older stored one. An
+/// attribution without a readable time is dropped, which leaves the stored
+/// one alone.
+fn published_stop_attribution(
+    attribution: Option<&pplx_space_sbx_mgr_client::proto::SandboxStopAttribution>,
+) -> Option<input::PublishedStopAttribution> {
     use pplx_space_sandbox_store::SandboxStopCause;
     use pplx_space_sbx_mgr_client::proto::SandboxStopCause as Proto;
-    match value.and_then(|value| Proto::try_from(value).ok())? {
-        Proto::PodTerminated => Some(SandboxStopCause::PodTerminated),
-        Proto::VmExited => Some(SandboxStopCause::VmExited),
-        Proto::Unspecified => None,
+    let attribution = attribution?;
+    let stopped_at = attribution
+        .stopped_at
+        .as_ref()
+        .and_then(|at| proto_timestamp_to_rfc3339(at, "stop_attribution.stopped_at").ok())?;
+    let cause = match attribution
+        .cause
+        .and_then(|value| Proto::try_from(value).ok())
+    {
+        Some(Proto::PodTerminated) => Some(SandboxStopCause::PodTerminated),
+        Some(Proto::VmExited) => Some(SandboxStopCause::VmExited),
+        Some(Proto::Unspecified) | None => None,
+    };
+    Some(input::PublishedStopAttribution { cause, stopped_at })
+}
+
+/// Apply the attributions the node published with a `stopped` status, after
+/// the lifecycle convergence: see
+/// [`pplx_space_sandbox_store::ingest::record_published_stop_attributions`].
+async fn record_stop_attributions(
+    conn: &mut sqlx::PgConnection,
+    node_id: NodeId,
+    rows: &[PublishedSandboxRow],
+) -> Result<(), Status> {
+    let attribution_rows = rows
+        .iter()
+        .filter(|row| row.reports_lifecycle(SandboxLifecycle::Stopped))
+        .filter_map(PublishedSandboxRow::stop_attribution_projection)
+        .collect::<Vec<_>>();
+    if attribution_rows.is_empty() {
+        return Ok(());
     }
+    let attribution_rows =
+        Json(serde_json::to_value(attribution_rows).map_err(|error| {
+            Status::internal(format!("serialize stop attribution rows: {error}"))
+        })?);
+    pplx_space_sandbox_store::ingest::record_published_stop_attributions(
+        &mut *conn,
+        node_id,
+        attribution_rows,
+    )
+    .await
+    .map_err(|err| Status::internal(format!("record stop attributions: {err}")))?;
+    Ok(())
 }
 
 async fn converge_stopped_sandboxes(
@@ -3594,7 +3641,7 @@ async fn converge_stopped_sandboxes(
     let stopped_rows = rows
         .iter()
         .filter(|row| row.reports_lifecycle(SandboxLifecycle::Stopped))
-        .map(PublishedSandboxRow::stopped_projection)
+        .map(PublishedSandboxRow::lifecycle_projection)
         .collect::<Vec<_>>();
     let stopped_ids = if stopped_rows.is_empty() {
         Vec::new()

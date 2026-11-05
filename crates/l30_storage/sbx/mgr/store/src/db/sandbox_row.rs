@@ -74,10 +74,10 @@ pub struct SandboxRow {
     pub execution_metadata: Option<ExecutionMetadata>,
     pub space_api_route_identity: SpaceApiRouteIdentity,
     pub spaced_endpoint_proof: Option<SpacedEndpointProof>,
-    /// Why the row's last stop happened when no one asked for it, until the
-    /// sandbox runs again (see [`super::StopCause`]). Only a `stopped` row
-    /// publishes it.
-    pub stop_cause: Option<super::StopCause>,
+    /// The node's attribution of the row's last stop, until the sandbox runs
+    /// again (see [`super::StopAttribution`]). Only a `stopped` row publishes
+    /// it; none from a stop an older sbx-manager admitted.
+    pub stop_attribution: Option<super::StopAttribution>,
 }
 
 impl SandboxRow {
@@ -415,9 +415,16 @@ pub(super) fn row_to_sandbox(row: &rusqlite::Row) -> rusqlite::Result<SandboxRow
         spaced_endpoint_proof,
         // A label a newer sbx-manager wrote reads as no cause, so a rollback
         // past it keeps the row, and the node's list, readable.
-        stop_cause: row
-            .get::<_, Option<String>>("stop_cause")?
-            .and_then(|value| value.parse().ok()),
+        stop_attribution: row
+            .get::<_, Option<i64>>("stop_cause_at")?
+            .map(|stopped_at_ms| super::StopAttribution {
+                cause: row
+                    .get::<_, Option<String>>("stop_cause")
+                    .ok()
+                    .flatten()
+                    .and_then(|value| value.parse().ok()),
+                stopped_at_ms,
+            }),
     })
 }
 

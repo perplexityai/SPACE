@@ -186,15 +186,16 @@ impl Cleanup {
         }
     }
 
-    /// The cause the row holds after the sweep's admission from a plain row
-    /// in `state`. A row a stop already owns keeps that stop's attribution
-    /// (none, on these rows) instead of taking the re-admitting stop's.
-    fn recorded_cause(self, state: SandboxState) -> Option<crate::db::StopCause> {
-        match state {
+    /// The attribution's cause the row holds after the sweep's admission from
+    /// a plain row in `state`: `Some` when the admission newly owns a stop,
+    /// `None` when there is no attribution. A row a stop already owns keeps
+    /// that stop's (none, on these rows); a delete records none.
+    fn recorded_cause(self, state: SandboxState) -> Option<Option<crate::db::StopCause>> {
+        let newly_owned = match state {
             SandboxState::Stopping
             | SandboxState::Stopped
             | SandboxState::CleanupRequired
-            | SandboxState::CleanupFailed => None,
+            | SandboxState::CleanupFailed => false,
             SandboxState::Creating
             | SandboxState::Created
             | SandboxState::Starting
@@ -208,8 +209,9 @@ impl Cleanup {
             | SandboxState::Suspended
             | SandboxState::Restoring
             | SandboxState::Quarantined
-            | SandboxState::Failed => self.stop_cause(),
-        }
+            | SandboxState::Failed => true,
+        };
+        (newly_owned && matches!(self, Self::Stop)).then(|| self.stop_cause())
     }
 
     fn keep_filesystem(self) -> bool {
@@ -317,7 +319,11 @@ async fn sweep_every_source_state(cleanup: Cleanup) {
                     );
                     let row = crate::db::get_sandbox(&db, &id).unwrap().unwrap();
                     assert_eq!(row.state, cleanup.target(), "{case}");
-                    assert_eq!(row.stop_cause, cleanup.recorded_cause(state), "{case}");
+                    assert_eq!(
+                        row.stop_attribution.map(|attribution| attribution.cause),
+                        cleanup.recorded_cause(state),
+                        "{case}"
+                    );
                     assert_eq!(
                         (row.cleanup_completion, row.cleanup_keep_filesystem),
                         if persist_intent {
@@ -459,7 +465,7 @@ async fn a_readmitted_stop_keeps_the_first_stops_attribution() {
         let sandbox_id = insert_row(&conn, state);
         let id = sandbox_id.to_string();
         conn.execute(
-            "UPDATE sandboxes SET stop_cause = ?2, cleanup_completion = CASE
+            "UPDATE sandboxes SET stop_cause = ?2, stop_cause_at = 1000, cleanup_completion = CASE
                  WHEN state = 'cleanup_failed' THEN 'mark_stopped' ELSE cleanup_completion END
               WHERE id = ?1",
             crate::db::fixture::params![&id, seeded],
@@ -498,7 +504,15 @@ async fn a_readmitted_stop_keeps_the_first_stops_attribution() {
             .unwrap()
             .unwrap();
         assert_eq!(row.state, SandboxState::Stopping, "{case}");
-        assert_eq!(row.stop_cause, expected, "{case}");
+        let attribution = row.stop_attribution.expect("every case is attributed");
+        assert_eq!(attribution.cause, expected, "{case}");
+        // A re-admission keeps the first stop's time; a newly owning stop
+        // records its own.
+        assert_eq!(
+            attribution.stopped_at_ms == 1000,
+            state != SandboxState::Starting,
+            "{case}"
+        );
         shutdown(service).await;
     }
 }
@@ -592,8 +606,12 @@ async fn exited_runtime_recovery_requires_death_and_the_current_execution() {
         );
         // Nobody asked for this stop: the row says why it happened.
         assert_eq!(
-            service.lookup_sandbox(&id.to_string()).unwrap().stop_cause,
-            (exited && !stale && !busy).then_some(crate::db::StopCause::VmExited)
+            service
+                .lookup_sandbox(&id.to_string())
+                .unwrap()
+                .stop_attribution
+                .map(|attribution| attribution.cause),
+            (exited && !stale && !busy).then_some(Some(crate::db::StopCause::VmExited))
         );
         drop(admission);
         if !exited {

@@ -1522,21 +1522,21 @@ impl SandboxManagerService {
                 fence,
             ));
         }
-        // A stop this admission newly owns records its attribution, its cause
-        // or none for a requested stop, replacing any an earlier stop left. One
-        // that re-admits a row another stop already owns (a second Stop on a
-        // `stopping` row, or a retry of a stop's failed cleanup) keeps that
-        // stop's attribution: an operator's Stop that the shim's pod-teardown
-        // Stop re-admits stays a requested stop. Written in the admission's
-        // transaction, so the stop can't reach `stopped` and be published
-        // first. A cause explains a stop and must never block one: a failed
-        // write only loses it.
+        // A stop this admission newly owns records its attribution: its cause,
+        // or none for a requested stop, with this node's time of the stop,
+        // replacing any an earlier stop left. One that re-admits a row another
+        // stop already owns (a second Stop on a `stopping` row, or a retry of
+        // a stop's failed cleanup) keeps that stop's: an operator's Stop that
+        // the shim's pod-teardown Stop re-admits stays a requested stop.
+        // Written in the admission's transaction, so the stop can't reach
+        // `stopped` and be published first. An attribution explains a stop
+        // and must never block one: a failed write only loses it.
         if target_state == SandboxState::Stopping
             && newly_owns_stop(superseded_state)
             && let Err(error) =
-                crate::db::record_stop_cause(&transaction, &sandbox_id_string, stop_cause)
+                crate::db::record_stop_attribution(&transaction, &sandbox_id_string, stop_cause)
         {
-            tracing::warn!(sandbox_id = %sandbox_id, cause = ?stop_cause, %error, "recording the stop cause failed");
+            tracing::warn!(sandbox_id = %sandbox_id, cause = ?stop_cause, %error, "recording the stop attribution failed");
         }
         let (auto_lifecycle_delete_receipt, admission_metric) =
             match auto_lifecycle_delete_admission {

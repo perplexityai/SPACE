@@ -276,7 +276,7 @@ fn decoded_policy(encoded: &[u8]) -> Option<sbx::AutoLifecyclePolicy> {
 
 fn sandbox_info_from_record(rec: &crate::state::SandboxRecord) -> sbx::SandboxInfo {
     sbx::SandboxInfo {
-        stop_cause: None,
+        stop_attribution: None,
         lifecycle: Some(sim_lifecycle(&rec.status) as i32),
         sandbox_id: rec.sandbox_id.clone(),
         template: Some(rec.template.clone()),

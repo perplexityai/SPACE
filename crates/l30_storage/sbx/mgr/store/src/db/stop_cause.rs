@@ -1,13 +1,16 @@
-//! Why a sandbox stopped when no one asked it to.
+//! The node's attribution of a sandbox's last stop.
+//!
+//! Every stop admission that newly owns a row (moves it to `stopping` from a
+//! state no stop owns) records an attribution: the stop's cause, or none for
+//! a requested stop, with this node's time of that stop. A stop that
+//! re-admits a row another stop already owns keeps that stop's. The
+//! `clear_stop_attribution_when_running` trigger drops it when any writer
+//! moves the row to `started` or `paused`. A `stopped` row publishes it, and
+//! the control plane applies a newer one whatever its own lifecycle says.
 
 use super::*;
 
-/// The cause of a stop no caller requested, recorded on the row the stop
-/// admission newly moves to `stopping`. It lasts until the sandbox runs
-/// again: the `clear_stop_cause_when_running` trigger drops it when any writer
-/// moves the row to `started` or `paused`, and nothing else does, so the
-/// stop's cleanup states, a failed start back to `stopped` and a delete keep
-/// it.
+/// Why a stop no caller requested happened.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StopCause {
     /// The shim tore the sandbox's Kubernetes pod down while it ran.
@@ -47,19 +50,40 @@ impl FromStr for StopCause {
 #[error("stop cause must be pod_terminated or vm_exited")]
 pub struct StopCauseParseError;
 
+/// The node's attribution of a row's last stop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StopAttribution {
+    /// Why the stop happened when no one asked for it; none for a requested
+    /// stop, and for a label a newer sbx-manager wrote.
+    pub cause: Option<StopCause>,
+    /// When this node admitted the stop, in epoch milliseconds of its clock.
+    /// Unlike `state_changed_at`, a later failed start doesn't move it.
+    pub stopped_at_ms: i64,
+}
+
 /// Record the attribution of the stop that just moved the row to
-/// `stopping`: `cause`, or none for a requested stop, replacing whatever an
-/// earlier stop left. Returns whether the row was `stopping`. The caller
-/// decides that this stop newly owns the row; a stop that re-admits a row
-/// another stop owns must not call it.
-pub fn record_stop_cause(conn: &Connection, id: &str, cause: Option<StopCause>) -> Result<bool> {
+/// `stopping`: `cause`, or none for a requested stop, at this node's current
+/// time, replacing whatever an earlier stop left. Returns whether the row was
+/// `stopping`. The caller decides that this stop newly owns the row; a stop
+/// that re-admits a row another stop owns must not call it.
+pub fn record_stop_attribution(
+    conn: &Connection,
+    id: &str,
+    cause: Option<StopCause>,
+) -> Result<bool> {
     let changed = conn.execute(
         "UPDATE sandboxes
          SET stop_cause = ?1,
-             updated_at = ?2
-         WHERE id = ?3
+             stop_cause_at = ?2,
+             updated_at = ?3
+         WHERE id = ?4
            AND state = 'stopping'",
-        params![cause.map(StopCause::as_str), now()?, id],
+        params![
+            cause.map(StopCause::as_str),
+            jiff::Timestamp::now().as_millisecond(),
+            now()?,
+            id
+        ],
     )?;
     Ok(changed == 1)
 }

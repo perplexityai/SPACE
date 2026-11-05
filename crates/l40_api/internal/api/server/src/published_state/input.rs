@@ -63,7 +63,9 @@ pub(super) struct PublishedSandboxRow {
     pub(super) state_changed_at: Option<String>,
     pub(super) execution_generation: Option<i64>,
     pub(super) pod_uid: Option<String>,
-    pub(super) stop_cause: Option<pplx_space_sandbox_store::SandboxStopCause>,
+    /// Applied by its own statement, through [`Self::stop_attribution_projection`].
+    #[serde(skip)]
+    pub(super) stop_attribution: Option<PublishedStopAttribution>,
 }
 
 /// A narrow SQL projection of the published lifecycle.
@@ -87,25 +89,36 @@ impl PublishedSandboxRow {
     }
 }
 
-/// The lifecycle projection plus why the node stopped the sandbox, for the
-/// `stopped` convergence. The cause's time is the node's state change time.
+/// A node's attribution of a sandbox's last stop: its cause, none for a
+/// requested stop (or a cause this reader can't name), and the node's time of
+/// that stop in RFC3339.
+pub(super) struct PublishedStopAttribution {
+    pub(super) cause: Option<pplx_space_sandbox_store::SandboxStopCause>,
+    pub(super) stopped_at: String,
+}
+
+/// One row of the stop-attribution statement: a sandbox the node published
+/// with an attribution.
 #[derive(serde::Serialize)]
-pub(super) struct PublishedStoppedRow<'a> {
+pub(super) struct PublishedStopAttributionRow<'a> {
     sandbox_id: SandboxId,
     #[serde(serialize_with = "serialize_published_lifecycle")]
     published_lifecycle: Option<StoredSandboxLifecycle>,
     stop_cause: Option<pplx_space_sandbox_store::SandboxStopCause>,
-    stop_cause_at: Option<&'a str>,
+    stop_cause_at: &'a str,
 }
 
 impl PublishedSandboxRow {
-    pub(super) fn stopped_projection(&self) -> PublishedStoppedRow<'_> {
-        PublishedStoppedRow {
+    /// `None` for a row published without an attribution, which leaves the
+    /// stored one alone.
+    pub(super) fn stop_attribution_projection(&self) -> Option<PublishedStopAttributionRow<'_>> {
+        let attribution = self.stop_attribution.as_ref()?;
+        Some(PublishedStopAttributionRow {
             sandbox_id: self.sandbox_id,
             published_lifecycle: self.published_lifecycle,
-            stop_cause: self.stop_cause,
-            stop_cause_at: self.stop_cause.and(self.state_changed_at.as_deref()),
-        }
+            stop_cause: attribution.cause,
+            stop_cause_at: &attribution.stopped_at,
+        })
     }
 }
 

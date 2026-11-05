@@ -421,7 +421,7 @@ pub(super) fn published_sandbox_state(
         execution_generation: sandbox.execution_generation,
         pod_uid: sandbox.pod_uid.clone(),
         activation_attempt_id: sandbox.activation_attempt_id.clone(),
-        stop_cause: sandbox.stop_cause,
+        stop_attribution: sandbox.stop_attribution,
         snapshots,
         pid: sandbox.pid,
         namespace: sandbox.namespace.clone(),

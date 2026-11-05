@@ -1574,25 +1574,33 @@ mod response_tests {
         }
     }
 
-    /// A row whose node already observes it running again renders `started`,
-    /// so the stored cause of its last stop isn't shown with it.
+    /// The cached response decides on the lifecycle it finally renders: a
+    /// stored `stopped` row its node reports running shows no cause, and a
+    /// stored `restoring` row (a stopped sandbox's evacuation) its node reports
+    /// `stopped` shows the cause it kept. A stored requested stop (a time with
+    /// no cause) shows none.
     #[test]
-    fn cached_response_shows_no_stop_cause_once_the_node_reports_it_running() {
-        let mut sandbox = sandbox_with_network_policy(None, 1, None, None);
-        sandbox.lifecycle = "stopped".to_string();
-        sandbox.stop_cause = Some("vm_exited".to_string());
-        sandbox.stop_cause_at = Some(time::macros::datetime!(2026-11-05 12:00:00 UTC));
-        for (status, lifecycle, shown) in
-            [("stopped", "stopped", true), ("started", "started", false)]
-        {
+    fn cached_response_shows_the_stop_cause_for_the_lifecycle_it_renders() {
+        let at = Some(time::macros::datetime!(2026-11-05 12:00:00 UTC));
+        for (stored, cause, status, lifecycle, shown) in [
+            ("stopped", Some("vm_exited"), "stopped", "stopped", true),
+            ("stopped", Some("vm_exited"), "started", "started", false),
+            ("restoring", Some("vm_exited"), "stopped", "stopped", true),
+            ("stopped", None, "stopped", "stopped", false),
+        ] {
+            let mut sandbox = sandbox_with_network_policy(None, 1, None, None);
+            sandbox.lifecycle = stored.to_string();
+            sandbox.stop_cause = cause.map(str::to_string);
+            sandbox.stop_cause_at = at;
             let mut observed = observed_network_policy("template", 1);
             observed.node_id = sandbox.active_node_id;
             observed.status = Some(status.to_string());
 
             let response = sandbox_to_cached_response(&sandbox, Some(&observed));
 
-            assert_eq!(response.lifecycle.as_deref(), Some(lifecycle), "{status}");
-            assert_eq!(response.stop_cause.is_some(), shown, "{status}");
+            let case = format!("stored {stored} {cause:?}, observed {status}");
+            assert_eq!(response.lifecycle.as_deref(), Some(lifecycle), "{case}");
+            assert_eq!(response.stop_cause.is_some(), shown, "{case}");
         }
     }
 

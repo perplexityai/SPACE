@@ -969,10 +969,11 @@ message PublishedSandboxState {
   // Exact activation attempt observed with this state. Generations may be
   // reused by placement retries, so attempt-scoped evidence must carry both.
   optional string activation_attempt_id = 41;
-  // Why the sandbox stopped when no one asked it to, published with a
-  // `stopped` status (see SandboxInfo.stop_cause). The control plane records
-  // it on the sandbox it converges to stopped; older nodes never set it.
-  optional space.sandbox.manager.v1.SandboxStopCause stop_cause = 42;
+  // The node's attribution of the sandbox's last stop, published with a
+  // `stopped` status (see SandboxInfo.stop_attribution). The control plane
+  // applies it when it is newer than the one it holds; older nodes never set
+  // it, which leaves the stored attribution alone.
+  optional space.sandbox.manager.v1.SandboxStopAttribution stop_attribution = 42;
 }
 
 message PublishedTemplateState {

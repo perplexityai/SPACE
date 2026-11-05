@@ -1131,10 +1131,10 @@ impl SandboxManagerService {
                 .map(|attempt| attempt.to_string()),
             state_changed_at: state_changed_at.as_deref().and_then(sqlite_timestamp),
             cleanup: sandbox.cleanup_completion.map(cleanup_to_proto),
-            stop_cause: sandbox
-                .stop_cause
+            stop_attribution: sandbox
+                .stop_attribution
                 .filter(|_| sandbox.state == SandboxState::Stopped)
-                .map(stop_cause_to_proto),
+                .map(stop_attribution_to_proto),
             state_degraded: false,
             health_status,
             health_observed_at,
@@ -2072,14 +2072,24 @@ fn cleanup_to_proto(completion: crate::db::CleanupCompletion) -> crate::proto::S
     }
 }
 
-fn stop_cause_to_proto(cause: crate::db::StopCause) -> i32 {
+fn stop_attribution_to_proto(
+    attribution: crate::db::StopAttribution,
+) -> crate::proto::SandboxStopAttribution {
     use crate::db::StopCause;
     use crate::proto::SandboxStopCause as Proto;
-    let cause = match cause {
-        StopCause::PodTerminated => Proto::PodTerminated,
-        StopCause::VmExited => Proto::VmExited,
-    };
-    cause as i32
+    let millis = attribution.stopped_at_ms;
+    crate::proto::SandboxStopAttribution {
+        cause: attribution.cause.map(|cause| {
+            (match cause {
+                StopCause::PodTerminated => Proto::PodTerminated,
+                StopCause::VmExited => Proto::VmExited,
+            }) as i32
+        }),
+        stopped_at: Some(prost_types::Timestamp {
+            seconds: millis.div_euclid(1000),
+            nanos: (millis.rem_euclid(1000) * 1_000_000) as i32,
+        }),
+    }
 }
 
 #[cfg(test)]
