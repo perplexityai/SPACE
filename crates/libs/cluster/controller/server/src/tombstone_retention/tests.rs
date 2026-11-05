@@ -1,10 +1,10 @@
-use pplx_space_common_core::types::{NodeId, SandboxId};
+use pplx_space_common_core::types::{LocalArtifactId, NodeId, SandboxId};
 
 use std::sync::{Arc, Mutex};
 
 use pplx_space_db_test_fixtures::{
     SEED_ORG_ID, SEED_USER_ID, insert_pool_slot_receipt, pg_test_db, pool_slot_receipt_state,
-    try_pg_test_db,
+    publish_ready_disk_artifact, try_pg_test_db,
 };
 use pplx_space_placement::test_support::stored_lifecycle_matrix;
 use uuid::Uuid;
@@ -219,6 +219,142 @@ async fn store_prunes_expired_deleted_sandbox_and_its_warm_pool_receipt() -> Tes
     assert_eq!(
         pool_slot_receipt_state(&db.pool, recent_sandbox).await?,
         Some("bound".to_string())
+    );
+    Ok(())
+}
+
+/// A census tombstone keeps its snapshots and their attached storage
+/// locations, whose foreign key to `snapshots` is `ON DELETE RESTRICT`. Its
+/// prune detaches them for the snapshot-storage sweeper instead of failing the
+/// batch it shares with an ordinary tombstone.
+#[tokio::test(flavor = "current_thread")]
+async fn store_prunes_deleted_sandbox_with_attached_storage_location_in_same_batch() -> TestResult {
+    let db = pg_test_db().await?;
+    let mut sandboxes = Vec::new();
+    for _ in 0..2 {
+        let sandbox_id = SandboxId::new();
+        sqlx::query(sql!(
+            "INSERT INTO sandboxes (
+                 id, user_id, org_id, managed_by, lifecycle, placement,
+                 network_policy_generation, created_at, updated_at
+             )
+             VALUES (
+                 $1, $2, $3, 'space', 'deleted', 'unplaced', 1,
+                 NOW() - INTERVAL '8 days', NOW() - INTERVAL '8 days'
+             )"
+        ))
+        .bind(sandbox_id)
+        .bind(SEED_USER_ID)
+        .bind(SEED_ORG_ID)
+        .execute(&db.pool)
+        .await?;
+        sandboxes.push(sandbox_id);
+    }
+    publish_ready_disk_artifact(
+        &db.pool,
+        sandboxes[0],
+        LocalArtifactId::new(),
+        "s3://snapshots/tombstone-with-location",
+    )
+    .await?;
+    // The fixture's pin update touched `updated_at`; age the row past
+    // retention again.
+    sqlx::query(sql!(
+        "UPDATE sandboxes SET updated_at = NOW() - INTERVAL '8 days' WHERE id = $1"
+    ))
+    .bind(sandboxes[0])
+    .execute(&db.pool)
+    .await?;
+    // Rows outside the candidate set keep their attached locations: a
+    // tombstone still inside retention and an aged row in another lifecycle.
+    let mut kept = Vec::new();
+    for (lifecycle, age, storage_uri) in [
+        (
+            "deleted",
+            "1 day",
+            "s3://snapshots/tombstone-inside-retention",
+        ),
+        ("stopped", "8 days", "s3://snapshots/stopped-past-retention"),
+    ] {
+        let sandbox_id = SandboxId::new();
+        sqlx::query(sql!(
+            "INSERT INTO sandboxes (
+                 id, user_id, org_id, managed_by, lifecycle, placement,
+                 network_policy_generation
+             )
+             VALUES ($1, $2, $3, 'space', $4, 'unplaced', 1)"
+        ))
+        .bind(sandbox_id)
+        .bind(SEED_USER_ID)
+        .bind(SEED_ORG_ID)
+        .bind(lifecycle)
+        .execute(&db.pool)
+        .await?;
+        publish_ready_disk_artifact(&db.pool, sandbox_id, LocalArtifactId::new(), storage_uri)
+            .await?;
+        sqlx::query(sql!(
+            "UPDATE sandboxes SET updated_at = NOW() - $2::INTERVAL WHERE id = $1"
+        ))
+        .bind(sandbox_id)
+        .bind(age)
+        .execute(&db.pool)
+        .await?;
+        kept.push((lifecycle, sandbox_id, storage_uri));
+    }
+
+    let report = TombstoneRetentionStore::new(db.pool.clone())
+        .prune_tombstones(Duration::from_secs(7 * 24 * 60 * 60), 100)
+        .await;
+
+    let remaining: Vec<SandboxId> = sqlx::query_scalar(sql!(
+        "SELECT id FROM sandboxes WHERE id = ANY($1) ORDER BY id"
+    ))
+    .bind(&sandboxes)
+    .fetch_all(&db.pool)
+    .await?;
+    let location: (Option<Uuid>, bool) = sqlx::query_as(sql!(
+        "SELECT snapshot_id, orphaned_at IS NOT NULL
+           FROM snapshot_storage_locations
+          WHERE storage_connection_string = 's3://snapshots/tombstone-with-location'"
+    ))
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(
+        remaining,
+        Vec::<SandboxId>::new(),
+        "both expired tombstones are pruned; prune returned {report:?}"
+    );
+    assert_eq!(report?.deleted_sandboxes_deleted, 2);
+    assert_eq!(
+        location,
+        (None, true),
+        "the location is detached and stamped for the sweeper"
+    );
+    // (lifecycle, row exists, location attached, location orphaned)
+    let mut kept_states = Vec::new();
+    for (lifecycle, sandbox_id, storage_uri) in kept {
+        let exists: bool =
+            sqlx::query_scalar(sql!("SELECT EXISTS(SELECT 1 FROM sandboxes WHERE id = $1)"))
+                .bind(sandbox_id)
+                .fetch_one(&db.pool)
+                .await?;
+        let (snapshot_id, orphaned): (Option<Uuid>, bool) = sqlx::query_as(sql!(
+            "SELECT snapshot_id, orphaned_at IS NOT NULL
+               FROM snapshot_storage_locations
+              WHERE storage_connection_string = $1"
+        ))
+        .bind(storage_uri)
+        .fetch_one(&db.pool)
+        .await?;
+        kept_states.push((lifecycle, exists, snapshot_id.is_some(), orphaned));
+    }
+    assert_eq!(
+        kept_states,
+        [
+            ("deleted", true, true, false),
+            ("stopped", true, true, false)
+        ],
+        "rows outside the candidates remain, their locations attached and unstamped"
     );
     Ok(())
 }
