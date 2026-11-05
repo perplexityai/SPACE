@@ -123,8 +123,10 @@ reviews:
           - "shim/**"
           # What ships to production nodes and guests. The rest of the Kind
           # test environment is left out, because Pull CI runs the Kind smoke
-          # on it. Its charts stay in: the cluster chart links to them.
+          # on it; that includes the Kind-only Rust build. Its charts stay in:
+          # the cluster chart links to them.
           - "docker/**"
+          - "!docker/Dockerfile.rust-build-kind"
           - "templates/**"
           - "infra/space/aws/**"
           - "infra/space/cluster/**"
