@@ -285,7 +285,7 @@ async fn do_pull_treats_empty_storage_locations_as_local_only_uncached() {
 async fn pull_flight_publishes_result_to_waiters_and_cleans_map() {
     let puller = VolumePuller::new();
     let key = PullKey::new("app-runtime", "sha256:test");
-    let flight = Arc::new(InFlightPull::new());
+    let flight = Arc::new(InFlightPull::default());
     puller
         .in_flight
         .lock()
@@ -319,7 +319,7 @@ async fn pull_flight_publishes_result_to_waiters_and_cleans_map() {
 async fn pull_flight_drop_notifies_waiters_without_result() {
     let puller = VolumePuller::new();
     let key = PullKey::new("app-runtime", "sha256:test");
-    let flight = Arc::new(InFlightPull::new());
+    let flight = Arc::new(InFlightPull::default());
     puller
         .in_flight
         .lock()
@@ -1415,4 +1415,87 @@ async fn materialize_blake3_release(#[case] compressed: bool) {
             compression: None,
         }
     );
+}
+
+/// A pull that arrives while the digest is claimed waits for the claim to go
+/// and then runs as the owner.
+#[tokio::test]
+async fn a_pull_waits_for_a_digest_claim_then_runs() {
+    let puller = VolumePuller::new();
+    let content_hash = format!("sha256:{}", "d".repeat(64));
+    let claim = puller
+        .try_claim_digest("claim-wait-test", &content_hash)
+        .unwrap();
+    let pull = tokio::spawn({
+        let puller = puller.clone();
+        let content_hash = content_hash.clone();
+        async move {
+            puller
+                .pull_resolved(
+                    Arc::new(Mutex::new(crate::db::test_conn())),
+                    "claim-wait-test".to_string(),
+                    content_hash,
+                    Vec::new(),
+                    &[],
+                )
+                .await
+        }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert!(!pull.is_finished(), "the pull must wait for the claim");
+    assert!(
+        puller
+            .try_claim_digest("claim-wait-test", &content_hash)
+            .is_none()
+    );
+
+    drop(claim);
+    let result = tokio::time::timeout(std::time::Duration::from_secs(5), pull)
+        .await
+        .expect("the pull runs once the claim goes")
+        .unwrap();
+
+    // It ran as the owner: with no storage locations it fails, rather than
+    // reporting a result it waited on.
+    assert!(!result.outcome.is_materialized());
+    assert!(!puller.is_claimed("claim-wait-test", &content_hash));
+}
+
+/// A template's claim holds every digest of the template, including ones
+/// nothing has claimed yet, and waits for none: it's refused while any digest
+/// of the template is held. Other templates are unaffected.
+#[tokio::test]
+async fn a_template_claim_holds_every_digest_of_the_template() {
+    let puller = VolumePuller::new();
+    let hash = format!("sha256:{}", "e".repeat(64));
+    let other_hash = format!("sha256:{}", "f".repeat(64));
+
+    let digest = puller.try_claim_digest("seed", &hash).unwrap();
+    assert!(puller.try_claim_template("seed").is_none());
+    assert!(puller.try_claim_template("other").is_some());
+    drop(digest);
+
+    let template = puller.try_claim_template("seed").unwrap();
+    assert!(puller.try_claim_digest("seed", &other_hash).is_none());
+    assert!(puller.try_claim_template("seed").is_none());
+    assert!(puller.try_claim_digest("other", &hash).is_some());
+    let waiter = tokio::spawn({
+        let puller = puller.clone();
+        let hash = hash.clone();
+        async move { puller.claim_digest("seed", &hash).await }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert!(
+        !waiter.is_finished(),
+        "a digest claim must wait for its template's"
+    );
+
+    drop(template);
+    let claim = tokio::time::timeout(std::time::Duration::from_secs(5), waiter)
+        .await
+        .expect("the digest claim goes through once the template's goes")
+        .unwrap();
+    assert!(puller.is_claimed("seed", &hash));
+    drop(claim);
+    assert!(puller.try_claim_template("seed").is_some());
 }

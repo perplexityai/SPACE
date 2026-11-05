@@ -519,6 +519,9 @@ impl TemplateManagerService {
         }
         validate_template_name(&name)?;
         validate_content_hash(&content_hash)?;
+        // Held until the delete returns: no pull, import, registration or
+        // startup recovery's per-dir check of the digest runs alongside it.
+        let _claim = self.claim_digest_for_delete(&name, &content_hash)?;
 
         // Check that no pools or local sandboxes reference this build before
         // deleting its master rootfs.
@@ -564,6 +567,25 @@ impl TemplateManagerService {
             crate::node_state_sync::mark_template_dirty(&self.db, &name);
         }
         Ok(Response::new(crate::proto::DeleteTemplateBuildResponse {}))
+    }
+
+    /// Claim a digest for `DeleteTemplateBuild`, so no pull, import,
+    /// registration, compression, other delete or startup recovery's per-dir
+    /// check is writing a dir or row the delete removes. Refuses retryably while one holds it; the claim goes
+    /// when dropped.
+    pub(super) fn claim_digest_for_delete(
+        &self,
+        name: &str,
+        content_hash: &str,
+    ) -> Result<crate::volume::DigestClaim, Status> {
+        self.volume_puller
+            .try_claim_digest(name, content_hash)
+            .ok_or_else(|| {
+                Status::aborted(format!(
+                    "{name}@{content_hash} is busy (a pull, import, registration, compression, \
+                     delete or startup check holds it); retry the delete"
+                ))
+            })
     }
 
     pub(super) async fn delete_template_build_after_dependency_checks(

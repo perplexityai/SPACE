@@ -27,7 +27,11 @@ impl TemplateManager for TemplateManagerService {
         &self,
         request: Request<DeleteTemplateRequest>,
     ) -> Result<Response<DeleteTemplateResponse>, Status> {
-        TemplateManagerService::delete_template(self, request).await
+        let service = self.clone();
+        run_to_completion("delete_template", async move {
+            TemplateManagerService::delete_template(&service, request).await
+        })
+        .await
     }
 
     async fn delete_idle_template(
@@ -48,7 +52,11 @@ impl TemplateManager for TemplateManagerService {
         &self,
         request: Request<RegisterTemplateRequest>,
     ) -> Result<Response<RegisterTemplateResponse>, Status> {
-        TemplateManagerService::register_template(self, request).await
+        let service = self.clone();
+        run_to_completion("register_template", async move {
+            TemplateManagerService::register_template(&service, request).await
+        })
+        .await
     }
 
     type ExportTemplateStream = TemplateExportStream;
@@ -64,7 +72,11 @@ impl TemplateManager for TemplateManagerService {
         &self,
         request: Request<tonic::Streaming<crate::proto::ImportTemplateRequest>>,
     ) -> Result<Response<crate::proto::ImportTemplateResponse>, Status> {
-        TemplateManagerService::import_template(self, request).await
+        let service = self.clone();
+        run_to_completion("import_template", async move {
+            TemplateManagerService::import_template(&service, request).await
+        })
+        .await
     }
 
     async fn get_template(
@@ -92,6 +104,23 @@ impl TemplateManager for TemplateManagerService {
         &self,
         request: Request<crate::proto::DeleteTemplateBuildRequest>,
     ) -> Result<Response<crate::proto::DeleteTemplateBuildResponse>, Status> {
-        TemplateManagerService::delete_template_build(self, request).await
+        let service = self.clone();
+        run_to_completion("delete_template_build", async move {
+            TemplateManagerService::delete_template_build(&service, request).await
+        })
+        .await
     }
+}
+
+/// Run an RPC that holds a template build's claim as its own task, so a
+/// caller that cancels or times out can't drop the claim while the blocking
+/// disk or DB work it guards keeps running.
+async fn run_to_completion<T: Send + 'static>(
+    operation: &'static str,
+    rpc: impl std::future::Future<Output = Result<T, Status>> + Send + 'static,
+) -> Result<T, Status> {
+    use tracing::Instrument as _;
+    tokio::spawn(rpc.in_current_span())
+        .await
+        .map_err(|error| Status::internal(format!("{operation} task: {error}")))?
 }

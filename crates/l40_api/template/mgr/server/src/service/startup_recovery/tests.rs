@@ -423,3 +423,101 @@ async fn recovery_adopts_blake3_bytes_and_rejects_corruption_without_a_catalog_r
     );
     assert!(!fixture.dir.path().exists());
 }
+
+fn place_build_dir(root: &Path, template: &str, rootfs: &[u8]) -> (String, std::path::PathBuf) {
+    let fixture = write_digest_fixture(rootfs, b"zst-bytes");
+    write_manifest_json(fixture.dir.path(), &canonical_manifest(&fixture));
+    let dir = root.join(template).join(&fixture.rootfs_hash);
+    std::fs::create_dir_all(dir.parent().unwrap()).unwrap();
+    std::fs::rename(fixture.dir.path(), &dir).unwrap();
+    (fixture.rootfs_hash.clone(), dir)
+}
+
+fn row_exists(service: &TemplateManagerService, template: &str, hash: &str) -> bool {
+    crate::db::get_build(&service.db.lock().unwrap(), template, hash)
+        .unwrap()
+        .is_some()
+}
+
+/// DeleteTemplateBuild takes the digest's pull claim first: while a pull
+/// holds it, the delete refuses retryably and the dir, and the row the pull
+/// then writes, survive. Once the pull lets go, the delete goes through.
+#[tokio::test]
+async fn delete_template_build_waits_for_a_pull_of_the_digest() {
+    let root = tempfile::tempdir().unwrap();
+    let (hash, dir) = place_build_dir(root.path(), "seed", b"claimed-rootfs");
+    let service =
+        TemplateManagerService::new_with_template_root(crate::db::test_conn(), root.path())
+            .unwrap();
+    let pull = service
+        .volume_puller
+        .try_claim_digest("seed", &hash)
+        .unwrap();
+
+    let error = service
+        .delete_template_build(crate::service::internal_request(
+            crate::proto::DeleteTemplateBuildRequest {
+                template: Some(crate::proto::TemplateRef {
+                    name: "seed".into(),
+                    content_hash: Some(hash.clone()),
+                    tag: None,
+                }),
+            },
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::Aborted, "{error}");
+    // The pull finishes and registers its build.
+    crate::db::upsert_build(
+        &service.db.lock().unwrap(),
+        &crate::db::BuildUpsert {
+            name: "seed",
+            content_hash: &hash,
+            build_date: "2026-05-13T00:00:00Z",
+            manifest_json: "{}",
+            runtime: RUNTIME_FIRECRACKER_ALIAS,
+            arch: "x86_64",
+            artifact_size_bytes: 0,
+            state: "ready",
+        },
+    )
+    .unwrap();
+    assert!(dir.join(TEMPLATE_ROOTFS_FILE).exists());
+    assert!(row_exists(&service, "seed", &hash));
+    drop(pull);
+
+    let claim = service.claim_digest_for_delete("seed", &hash).unwrap();
+    service
+        .delete_template_build_after_dependency_checks("seed", &hash)
+        .await
+        .unwrap();
+    drop(claim);
+
+    assert!(!dir.exists());
+    assert!(!row_exists(&service, "seed", &hash));
+}
+
+/// Startup recovery runs once requests flow, so it skips a build whose digest
+/// a pull, import, registration or delete holds, rather than verifying it
+/// alongside them; once the claim goes, the next pass registers it.
+#[tokio::test]
+async fn startup_recovery_skips_a_build_someone_else_claims() {
+    let root = tempfile::tempdir().unwrap();
+    let (hash, dir) = place_build_dir(root.path(), "seed", b"claimed-at-startup-rootfs");
+    let service =
+        TemplateManagerService::new_with_template_root(crate::db::test_conn(), root.path())
+            .unwrap();
+    *service.pool_handle.lock().unwrap() = Some(tokio::spawn(async {}));
+    let held = service
+        .volume_puller
+        .try_claim_digest("seed", &hash)
+        .unwrap();
+
+    service.run_startup_recovery().await;
+
+    assert!(!row_exists(&service, "seed", &hash));
+    assert!(dir.join(TEMPLATE_ROOTFS_FILE).exists());
+    drop(held);
+    service.run_startup_recovery().await;
+    assert!(row_exists(&service, "seed", &hash));
+}

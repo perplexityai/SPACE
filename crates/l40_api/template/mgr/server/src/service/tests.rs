@@ -7,8 +7,10 @@ use pplx_space_observability::test_capture::{CapturedEventsLayer, field_value};
 use std::{path::Path, sync::Arc};
 use tracing_subscriber::layer::SubscriberExt as _;
 
+mod digest_claim;
 mod export;
 mod lookup_rpc;
+mod register_race;
 mod schema_guards;
 
 #[tokio::test(flavor = "current_thread")]
@@ -2375,8 +2377,8 @@ fn finish_register_with_existing_digest_preserves_staging_for_retry() {
         .build()
         .unwrap();
     let response = runtime
-        .block_on(service.finish_register_with_existing_digest(
-            templates::ExistingDigestRegistration {
+        .block_on(
+            service.finish_register_with_existing_digest(templates::ExistingDigestRegistration {
                 template_id: "register-refresh-test",
                 content_hash: &content_hash,
                 digest_dir: &digest_dir,
@@ -2384,8 +2386,12 @@ fn finish_register_with_existing_digest_preserves_staging_for_retry() {
                 requested_network_policy: None,
                 publish_node_state: false,
                 register_source: &source,
-            },
-        ))
+                claim: service
+                    .volume_puller
+                    .try_claim_digest("register-refresh-test", &content_hash)
+                    .unwrap(),
+            }),
+        )
         .expect("registration must converge on the existing digest")
         .into_inner();
 
