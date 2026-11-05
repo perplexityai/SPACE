@@ -41,8 +41,8 @@ impl AuthParseError {
 }
 
 /// Error returned when an auth/account UUID cannot be parsed. Defined in
-/// `pplx-space-job-id`, which [`JobId`] moved to, so every identifier here
-/// keeps one parse error.
+/// `pplx-space-job-id` beside the `uuid_id!` macro, so the job ID and every
+/// identifier here share one parse error.
 pub use pplx_space_job_id::AuthIdParseError;
 
 /// The owner principal stored on a sandbox-manager sandbox row.
