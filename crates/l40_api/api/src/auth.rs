@@ -75,10 +75,19 @@ pub(crate) async fn verify_password_blocking(
     hash: String,
     slot: tokio::sync::SemaphorePermit<'static>,
 ) -> Result<Result<bool, bcrypt::BcryptError>, VerifierUnavailable> {
+    run_in_slot(slot, move || verify_password(&password, &hash)).await
+}
+
+/// Runs `work` on the blocking pool while it holds `slot`, releasing the slot
+/// only when `work` returns.
+async fn run_in_slot<T: Send + 'static>(
+    slot: tokio::sync::SemaphorePermit<'static>,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, VerifierUnavailable> {
     tokio::task::spawn_blocking(move || {
-        let verified = verify_password(&password, &hash);
+        let output = work();
         drop(slot);
-        verified
+        output
     })
     .await
     .map_err(|_| VerifierUnavailable)
