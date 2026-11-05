@@ -23,7 +23,7 @@ jiff = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
-tonic = { workspace = true }
+tonic = { workspace = true, default-features = false }
 
 # internal
 pplx-space-common-core = { workspace = true, features = ["serde"] }
