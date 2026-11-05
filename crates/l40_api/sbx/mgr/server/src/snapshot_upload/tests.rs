@@ -1153,7 +1153,8 @@ async fn imported_artifact_is_superseded_only_by_a_newer_publication() {
 /// uploaded metadata and left the sidecar naming the exporter's id, which is
 /// no evidence of a newer publication, so the upload submits. That sidecar
 /// still names the retained source the upload was prepared from; a newer
-/// suspend's names its own, and supersedes the upload.
+/// suspend's names its own, and supersedes the upload. A source id missing
+/// from either side proves nothing, so the newer id supersedes the upload.
 #[tokio::test]
 async fn staged_import_an_earlier_binary_prepared_is_superseded_only_by_a_newer_capture() {
     /// Publish a btrfs-send artifact with a fresh retained source.
@@ -1171,7 +1172,7 @@ async fn staged_import_an_earlier_binary_prepared_is_superseded_only_by_a_newer_
         )
         .unwrap()
     }
-    for republished in [false, true] {
+    for (republished, source_ids) in [(false, true), (true, true), (true, false)] {
         let tmp = tempfile::tempdir().unwrap();
         let canonical = tmp.path().join("snapshot");
         let mut meta = publish_btrfs_send_artifact(&canonical, LocalArtifactId::new());
@@ -1188,12 +1189,22 @@ async fn staged_import_an_earlier_binary_prepared_is_superseded_only_by_a_newer_
         .unwrap();
         let mut json = serde_json::to_value(&prepared).unwrap();
         json.as_object_mut().unwrap().remove("sidecar_artifact_id");
+        if !source_ids {
+            json["meta"]
+                .as_object_mut()
+                .unwrap()
+                .remove("rootfs_send_source_id");
+        }
         let earlier: SnapshotUploadJobs = serde_json::from_value(json).unwrap();
         assert!(earlier.metadata_staging_dir.is_some());
         let newer = LocalArtifactId::new();
         if republished {
             std::fs::rename(&canonical, tmp.path().join("retired")).unwrap();
-            publish_btrfs_send_artifact(&canonical, newer);
+            if source_ids {
+                publish_btrfs_send_artifact(&canonical, newer);
+            } else {
+                publish_full_artifact(&canonical, newer);
+            }
         }
         let volume_manager = RecordingVolumeManager::serve(false);
 
@@ -1204,7 +1215,7 @@ async fn staged_import_an_earlier_binary_prepared_is_superseded_only_by_a_newer_
         )
         .await;
 
-        let case = format!("republished={republished}: {result:?}");
+        let case = format!("republished={republished} source_ids={source_ids}: {result:?}");
         if republished {
             assert!(
                 matches!(&result, Err(SubmitPreparedError::Superseded(superseded)) if superseded.found == newer),

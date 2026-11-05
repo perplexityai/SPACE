@@ -1320,10 +1320,16 @@ async fn check_prepared_artifact(
         // An earlier binary recorded no identity, and a sidecar its
         // preparation left in place can name an id it never saw, such as an
         // import's exporter id. That sidecar still names the retained source
-        // the upload was prepared from; a newer suspend's names its own.
+        // the upload was prepared from; a newer suspend's names its own. A
+        // source id missing from either side proves nothing, so only the
+        // upload's own id holds then. A staged import always carries its
+        // source id, so this refuses no legitimate import.
         (None, Some(_)) => {
             found == upload_id
-                || identity.rootfs_send_source_id == prepared.meta.rootfs_send_source_id
+                || matches!(
+                    (identity.rootfs_send_source_id, prepared.meta.rootfs_send_source_id),
+                    (Some(found_source), Some(prepared_source)) if found_source == prepared_source
+                )
         }
     };
     if !holds_this_artifact {
