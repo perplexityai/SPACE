@@ -710,6 +710,7 @@ fn nondefault_inventory_preserves_e0_and_recovers_only_the_exact_pair() {
     assert!(
         reported.runtimes.iter().any(|runtime| {
             runtime.runtime == reported_identity
+                && runtime.requires_environment
                 && runtime.state_formats.iter().any(|state| {
                     state.identity.as_ref().is_some_and(|state| {
                         state.format == "firecracker-snapshot" && state.version == "12.0.0"
@@ -717,6 +718,14 @@ fn nondefault_inventory_preserves_e0_and_recovers_only_the_exact_pair() {
                 })
         }),
         "an admitted verified managed release must be reported without an external copy"
+    );
+    assert!(
+        ready
+            .to_proto()
+            .runtimes
+            .iter()
+            .all(|runtime| !runtime.requires_environment),
+        "an external copy must preserve unbound availability when a managed copy coexists"
     );
     assert_eq!(
         ready

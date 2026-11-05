@@ -191,6 +191,7 @@ async fn publish_inventory(
         runtime_rows.push(serde_json::json!({
             "runtime": runtime.kind.alias(),
             "runtime_version": runtime.version.as_str(),
+            "requires_environment": installation.requires_environment,
             "guests": guests,
             "state_formats": state_formats,
         }));
@@ -253,15 +254,24 @@ async fn publish_inventory(
     .await
     .map_err(|error| Status::internal(format!("replace node component inventory: {error}")))?;
 
+    // A legacy copy keeps the runtime/version available to unbound requests
+    // even when the report also contains an environment-bound copy.
     sqlx::query(sql!(
         "WITH input AS (
              SELECT * FROM jsonb_to_recordset($2::jsonb) AS input(
-                 runtime TEXT, runtime_version TEXT, guests JSONB, state_formats JSONB
+                 runtime TEXT, runtime_version TEXT, requires_environment BOOLEAN,
+                 guests JSONB, state_formats JSONB
              )
          )
-         INSERT INTO node_runtime_installations (node_id, runtime, runtime_version, observed_at)
-         SELECT DISTINCT $1, runtime, runtime_version, NOW() FROM input WHERE TRUE
-         ON CONFLICT (node_id, runtime, runtime_version) DO NOTHING"
+         INSERT INTO node_runtime_installations (
+             node_id, runtime, runtime_version, requires_environment, observed_at
+         )
+         SELECT $1, runtime, runtime_version, bool_and(requires_environment), NOW()
+         FROM input GROUP BY runtime, runtime_version
+         ON CONFLICT (node_id, runtime, runtime_version) DO UPDATE
+         SET requires_environment = EXCLUDED.requires_environment, observed_at = NOW()
+         WHERE node_runtime_installations.requires_environment
+             IS DISTINCT FROM EXCLUDED.requires_environment"
     ))
     .bind(node_id)
     .bind(runtime_rows.clone())

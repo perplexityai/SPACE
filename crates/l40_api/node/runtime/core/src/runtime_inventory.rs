@@ -1339,6 +1339,11 @@ impl RuntimeInventory {
                     .filter_map(|environment| environment.runtime.as_ref().ok()),
             )
             .map(|installation| proto::RuntimeInstallation {
+                requires_environment: !self.runtimes.iter().any(|legacy| {
+                    legacy.runtime == installation.runtime
+                        && legacy.guest == installation.guest
+                        && legacy.state_format == installation.state_format
+                }),
                 runtime: Some((&installation.runtime).into()),
                 supported_guests: vec![installation.guest.into()],
                 state_formats: installation

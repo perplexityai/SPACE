@@ -249,6 +249,7 @@ fn runtime_installation(version: &str, sort_key: Vec<u32>) -> proto::RuntimeInst
             can_load: true,
         }],
         version_sort_key: sort_key,
+        requires_environment: false,
     }
 }
 

@@ -88,6 +88,10 @@ message RuntimeInstallation {
   // and only within one runtime kind. Empty when the driver defines no order
   // for the version, or the node predates this field.
   repeated uint32 version_sort_key = 4;
+  // True when this installation is available only through an explicit
+  // environment binding, not the legacy/unbound runtime projection. Older
+  // producers report only legacy installations and leave this false.
+  bool requires_environment = 5;
 }
 
 message ArtifactComponentInstallation {
