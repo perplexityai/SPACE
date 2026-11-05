@@ -40,20 +40,10 @@ impl AuthParseError {
     }
 }
 
-/// Error returned when an auth/account UUID cannot be parsed.
-///
-/// # Examples
-///
-/// ```rust
-/// # use std::str::FromStr;
-/// # use pplx_space_accounts::UserId;
-/// assert!(UserId::from_str("not-a-uuid").is_err());
-/// ```
-#[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
-pub enum AuthIdParseError {
-    #[error("invalid auth UUID: {0}")]
-    InvalidUuid(#[from] uuid::Error),
-}
+/// Error returned when an auth/account UUID cannot be parsed. Defined in
+/// `pplx-space-job-id`, which [`JobId`] moved to, so every identifier here
+/// keeps one parse error.
+pub use pplx_space_job_id::AuthIdParseError;
 
 /// The owner principal stored on a sandbox-manager sandbox row.
 ///
@@ -470,10 +460,9 @@ uuid_id!(
     TenantPublicationGrantId
 );
 
-uuid_id!(
-    /// Identity of a persisted background job, retained across retries and recovery.
-    JobId
-);
+/// Identity of a persisted background job, defined in `pplx-space-job-id` so
+/// the job queue can name it without this crate.
+pub use pplx_space_job_id::JobId;
 
 uuid_id!(
     /// Stable identifier for a platform user.

@@ -4789,6 +4789,7 @@ checksum = "439ee305def115ba05938db6eb1644ff94165c5ab5e9420d1c1bcedbba909391"
 name = "pplx-space-accounts"
 version = "0.8.1"
 dependencies = [
+ "pplx-space-job-id",
  "rusqlite",
  "serde",
  "sqlx",
@@ -5416,9 +5417,10 @@ name = "pplx-space-common-jobs"
 version = "0.8.1"
 dependencies = [
  "async-trait",
- "pplx-space-common-core",
+ "pplx-space-job-id",
  "pplx-space-metrics",
  "pplx-space-observability",
+ "pplx-space-sql-locator",
  "rusqlite",
  "serde",
  "serde_json",
@@ -6078,6 +6080,17 @@ dependencies = [
  "pplx-space-common-svc",
  "pplx-space-internal-api-server",
  "tikv-jemallocator",
+]
+
+[[package]]
+name = "pplx-space-job-id"
+version = "0.8.1"
+dependencies = [
+ "rusqlite",
+ "serde",
+ "sqlx",
+ "thiserror 2.0.20",
+ "uuid",
 ]
 
 [[package]]

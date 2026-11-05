@@ -332,13 +332,13 @@ run_sbxmgr_production_checks() {
         sbxmgr_assert_direct_dependents pplx-space-sqlite "${sbxmgr_feature_args[@]}" -- \
             pplx-space-sbx-mgr-store
         # rusqlite enters only through the store, the helpers it depends on,
-        # and three shared crates whose rusqlite use hands no connection out:
-        # common-jobs' functions take a connection in, and common-core and
-        # accounts only implement rusqlite's value conversion traits for
-        # their types.
+        # and four shared crates whose rusqlite use hands no connection out:
+        # common-jobs' functions take a connection in, and common-core,
+        # accounts and job-id only implement rusqlite's value conversion
+        # traits for their types.
         sbxmgr_assert_direct_dependents rusqlite "${sbxmgr_feature_args[@]}" -- \
             pplx-space-sbx-mgr-store pplx-space-sqlite pplx-space-common-jobs pplx-space-common-core \
-            pplx-space-accounts
+            pplx-space-accounts pplx-space-job-id
     done
 }
 

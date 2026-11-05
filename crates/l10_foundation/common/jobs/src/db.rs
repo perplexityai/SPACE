@@ -1,5 +1,5 @@
-use pplx_space_common_core::sql;
-use pplx_space_common_core::types::JobId;
+use pplx_space_job_id::JobId;
+use pplx_space_sql_locator::sql;
 use std::time::Duration;
 
 use rusqlite::{Connection, OptionalExtension, params};

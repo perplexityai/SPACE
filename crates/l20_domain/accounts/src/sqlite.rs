@@ -1,6 +1,6 @@
 //! SQLite encodes domain UUIDs as text to preserve existing node-local schemas.
 
-use super::{JobId, NodeId};
+use super::NodeId;
 
 macro_rules! sqlite_uuid {
     ($($name:ty),+ $(,)?) => {$(
@@ -18,4 +18,4 @@ macro_rules! sqlite_uuid {
     )+};
 }
 
-sqlite_uuid!(JobId, NodeId);
+sqlite_uuid!(NodeId);

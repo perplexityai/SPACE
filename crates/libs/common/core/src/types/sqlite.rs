@@ -1,8 +1,8 @@
 //! SQLite encodes domain UUIDs as text to preserve existing node-local schemas.
 
-use super::SandboxId;
 #[cfg(test)]
-use super::{JobId, NodeId};
+use super::NodeId;
+use super::SandboxId;
 
 macro_rules! sqlite_uuid {
     ($($name:ty),+ $(,)?) => {$(

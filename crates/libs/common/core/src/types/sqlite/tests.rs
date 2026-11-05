@@ -25,7 +25,6 @@ where
 
 #[test]
 fn uuid_identities_use_canonical_sqlite_text_and_reject_invalid_values() {
-    assert_text_identity_round_trip(JobId::new());
     assert_text_identity_round_trip(NodeId::new());
     assert_text_identity_round_trip(SandboxId::new());
 }
