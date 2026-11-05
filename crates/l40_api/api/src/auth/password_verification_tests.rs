@@ -86,11 +86,16 @@ async fn verification_does_not_block_the_async_worker() -> TestResult {
         let mut ticks = 0_u32;
         while !done.load(Ordering::SeqCst) {
             tokio::time::sleep(Duration::from_millis(1)).await;
+            if done.load(Ordering::SeqCst) {
+                break;
+            }
             ticks += 1;
         }
         ticks
     };
-    let (verified, ticks) = tokio::join!(verify, ticker);
+    // Biased, so `verify` is always polled first: an inline verification
+    // would finish and set `done` before the ticker ever checks it.
+    let (verified, ticks) = tokio::join!(biased; verify, ticker);
     assert!(verified??);
     assert!(
         ticks >= 1,
