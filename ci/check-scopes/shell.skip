@@ -1,0 +1,8 @@
+# Paths the shell regression tests (ci/scripts/test-*.sh,
+# scripts/tests/test-*.sh) do not read. They test repository scripts and
+# build synthetic repositories for everything else.
+
+# The Next.js console, built only by docker/Dockerfile.ui.
+ui/**
+docs/**
+.agents/**

@@ -1,0 +1,7 @@
+# Paths the migration guards do not read: they compare db/ migrations with
+# the base, using scripts/check-*migration* and scripts/check-postgres-*.
+ui/**
+docs/**
+.agents/**
+space_smoke/**
+shim/**
