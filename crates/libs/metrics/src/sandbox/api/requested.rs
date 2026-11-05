@@ -1,37 +1,13 @@
-//! The vCPU and guest memory a sandbox is requested to run with, after
-//! template and warm-pool defaults are applied.
+//! Requested vCPU and guest-memory distributions after defaults, with memory
+//! emitted in bytes. Each recorded call adds one sample to each distribution.
 //!
-//! | Metric | Type | Value |
-//! | --- | --- | --- |
-//! | `sandbox.api.requested.vcpu` | distribution | vCPUs the sandbox will run with |
-//! | `sandbox.api.requested.memory_bytes` | distribution | Guest memory in bytes (`memory_mib * 1048576`) |
+//! Tags: `kind` (create/activate/resume), `surface`, `admission`, `template` and
+//! request-scoped `client_id`. Creates also carry `defaulted`, false only when
+//! the request supplied both sizes; warm-pool claims are always true.
 //!
-//! Both carry the same tags:
-//!
-//! - `kind`: `create` (cold and warm-pool creates), `activate` (a lifecycle
-//!   action that activates a `created`, `stopped` or `suspended` sandbox) or
-//!   `resume` (a resume requested from the `paused` lifecycle). Resuming an
-//!   existing resident runtime spends no cluster admission; runtime recovery
-//!   may require admission and can be rejected. Not `op`, which on other
-//!   `sandbox.api.*` metrics names the API route.
-//! - `surface`: `native` or `ecw`, the API the call arrived on.
-//! - `admission`: `accepted`, or `rejected` when cluster activation admission
-//!   refused the call ([`AdmissionDecision`], the cluster limiter's own
-//!   vocabulary). Other failures emit nothing.
-//! - `template`: the resolved template name for a create, the sandbox row's
-//!   template otherwise (`unknown` when the row names none).
-//! - `defaulted`: creates only. `false` when the request named both sizes;
-//!   `true` when a build shape, the platform default, a warm-pool config or a
-//!   warm-pool policy filled them. Warm-pool claims are always `true`.
-//! - `client_id`: the request's bounded caller ([`request_client_id`]).
-//!
-//! One sample per create, activation or resume call, so a caller that
-//! retries or several callers that wake the same sandbox each add one; a
-//! caller that joins another's in-flight activation adds none. A cold create
-//! records at its admission decision; an activation or resume records only
-//! when it succeeds or admission refuses it. A call whose size is unknown
-//! emits nothing, as do forks. `count:` on either distribution is the call
-//! count.
+//! Callers record cold creates at admission, and activations/resumes on success
+//! or admission rejection. Skip forks, unknown sizes and joined activations.
+//! Resident resumes need no admission; runtime recovery may require it.
 
 use crate::emit::{distribution, tag};
 
