@@ -287,8 +287,11 @@ pub fn apply_parent_cpu_reservation(reserved_count: u32) -> Result<ParentCpuLimi
     })
 }
 
-pub fn sandbox_guest_memory_max_mib(sandbox_cgroup_memory_mib: u64) -> Option<u64> {
-    sandbox_cgroup_memory_mib.checked_sub(DEFAULT_SANDBOX_MEMORY_HEADROOM_MIB)
+pub fn sandbox_guest_memory_max_mib(
+    sandbox_cgroup_memory_mib: u64,
+    sandbox_memory_headroom_mib: u64,
+) -> Option<u64> {
+    sandbox_cgroup_memory_mib.checked_sub(sandbox_memory_headroom_mib)
 }
 
 pub fn sandbox_cgroup_total_memory_mib(
@@ -302,13 +305,6 @@ pub fn apply_parent_memory_limit(
     sandbox_cgroup_memory_mib: u64,
     max_slots: u32,
 ) -> Result<ParentMemoryLimit, String> {
-    if sandbox_cgroup_memory_mib <= DEFAULT_SANDBOX_MEMORY_HEADROOM_MIB {
-        return Err(format!(
-            "sandbox cgroup memory must be greater than {} MiB",
-            DEFAULT_SANDBOX_MEMORY_HEADROOM_MIB
-        ));
-    }
-
     let total_memory_mib =
         sandbox_cgroup_total_memory_mib(sandbox_cgroup_memory_mib, max_slots).ok_or_else(|| {
             format!(

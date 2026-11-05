@@ -71,6 +71,11 @@ struct Cli {
     #[arg(long)]
     sandbox_cgroup_memory_mib: Option<u64>,
 
+    /// Sandbox cgroup memory above guest RAM, in MiB: the VMM and the host
+    /// page cache of the sandbox's disk writes.
+    #[arg(long)]
+    sandbox_cgroup_memory_headroom_mib: Option<u64>,
+
     /// Firecracker cgroup cpu.max vCPU count for launched sandboxes.
     #[arg(long)]
     sandbox_cgroup_vcpu_count: Option<u32>,
@@ -94,6 +99,7 @@ impl From<Cli> for NodeMgrRunConfig {
             pod_netns_path: cli.pod_netns_path,
             service_port_ingress_isolation: cli.service_port_ingress_isolation,
             sandbox_cgroup_memory_mib: cli.sandbox_cgroup_memory_mib,
+            sandbox_cgroup_memory_headroom_mib: cli.sandbox_cgroup_memory_headroom_mib,
             sandbox_cgroup_vcpu_count: cli.sandbox_cgroup_vcpu_count,
             memory_admission_reserve_mib: cli.memory_admission_reserve_mib,
         }

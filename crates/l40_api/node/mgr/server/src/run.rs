@@ -122,6 +122,8 @@ pub struct NodeMgrRunConfig {
     pub service_port_ingress_isolation: Option<String>,
     /// Firecracker host cgroup memory.max in MiB for launched sandboxes.
     pub sandbox_cgroup_memory_mib: Option<u64>,
+    /// Sandbox cgroup memory above guest RAM, in MiB.
+    pub sandbox_cgroup_memory_headroom_mib: Option<u64>,
     /// Firecracker cgroup cpu.max vCPU count for launched sandboxes.
     pub sandbox_cgroup_vcpu_count: Option<u32>,
     /// Node memory kept available in addition to a new sandbox cgroup demand,
@@ -252,6 +254,7 @@ struct NetworkPoolFileConfig {
 struct SandboxCgroupFileConfig {
     vcpu_count: Option<u32>,
     memory_mib: Option<u64>,
+    memory_headroom_mib: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -448,11 +451,18 @@ fn resolve_sandbox_cgroup_config(
         file.memory_mib.map(Some),
         config.memory_mib,
     );
+    config.memory_headroom_mib = setting(
+        "sandbox_cgroup.memory_headroom_mib",
+        cli.sandbox_cgroup_memory_headroom_mib,
+        None,
+        file.memory_headroom_mib,
+        config.memory_headroom_mib,
+    );
     if config.vcpu_count == Some(0) {
         return Err(RunNodeMgrError::SandboxCgroupVcpuCountZero);
     }
     if let Some(memory_mib) = config.memory_mib {
-        let headroom_mib = crate::cgroup::DEFAULT_SANDBOX_MEMORY_HEADROOM_MIB;
+        let headroom_mib = config.memory_headroom_mib;
         if memory_mib <= headroom_mib {
             return Err(RunNodeMgrError::SandboxCgroupMemoryBelowHeadroom {
                 memory_mib,
@@ -812,7 +822,7 @@ pub async fn run(
             .memory_mib
             .map_or_else(|| "-".to_string(), |value| value.to_string());
         let sandbox_guest_memory_max_mib = sandbox_cgroup_config.guest_memory_max_mib();
-        let sandbox_memory_headroom_mib = crate::cgroup::DEFAULT_SANDBOX_MEMORY_HEADROOM_MIB;
+        let sandbox_memory_headroom_mib = sandbox_cgroup_config.memory_headroom_mib;
 
         let listener = pplx_space_common_svc::bind_unix_socket(
             &cli.socket_path,

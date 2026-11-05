@@ -163,3 +163,42 @@ fn service_port_ingress_isolation_explicit_values_override_auto() {
     );
     resolve_service_port_ingress_isolation(Some("k8s"), true).unwrap_err();
 }
+
+#[test]
+fn sandbox_memory_headroom_sizes_guest_and_cgroup_memory() {
+    let cli = |headroom_mib| NodeMgrRunConfig {
+        socket_path: PathBuf::new(),
+        health_socket_path: None,
+        service_mutex_timeout: Duration::ZERO,
+        config_path: PathBuf::new(),
+        network_pool_max_slots: None,
+        network_pool_target: None,
+        network_pool_retain_ready: None,
+        network_pool_min_ready: None,
+        pod_netns_path: None,
+        service_port_ingress_isolation: None,
+        sandbox_cgroup_memory_mib: None,
+        sandbox_cgroup_memory_headroom_mib: headroom_mib,
+        sandbox_cgroup_vcpu_count: None,
+        memory_admission_reserve_mib: None,
+    };
+    let file: NodeConfig =
+        toml::from_str("[sandbox_cgroup]\nmemory_mib = 17408\nmemory_headroom_mib = 1024").unwrap();
+
+    let config = resolve_sandbox_cgroup_config(&cli(None), &file.sandbox_cgroup).unwrap();
+    assert_eq!(config.guest_memory_max_mib(), 16384);
+    assert_eq!(config.memory_headroom_mib, 1024);
+
+    let config = resolve_sandbox_cgroup_config(&cli(Some(17408)), &file.sandbox_cgroup);
+    assert!(matches!(
+        config,
+        Err(RunNodeMgrError::SandboxCgroupMemoryBelowHeadroom {
+            memory_mib: 17408,
+            headroom_mib: 17408
+        })
+    ));
+
+    let unset: NodeConfig = toml::from_str("[sandbox_cgroup]\nmemory_mib = 16512").unwrap();
+    let config = resolve_sandbox_cgroup_config(&cli(None), &unset.sandbox_cgroup).unwrap();
+    assert_eq!(config.guest_memory_max_mib(), 16384);
+}

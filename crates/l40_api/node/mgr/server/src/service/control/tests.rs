@@ -102,6 +102,7 @@ async fn update_cgroup_forwards_current_execution_with_clamped_memory() {
     service.sandbox_cgroup_config = SandboxCgroupConfig {
         vcpu_count: Some(2),
         memory_mib: Some(4096),
+        ..SandboxCgroupConfig::default()
     };
     service.runtime_supervisor = scripted_in_process_client(SupervisorScript {
         update_cgroup: Some(std::sync::Arc::new(move |request| {
