@@ -733,6 +733,13 @@ ExecStartPre=-/bin/mknod -m 666 /dev/vsock c 10 241
 # helper. Set at boot, never from the seed build: its chroot shares the
 # builder kernel's /sys.
 ExecStartPre=/bin/sh -c 'test -d /sys/kernel/mm/transparent_hugepage || exit 0; echo madvise > /sys/kernel/mm/transparent_hugepage/enabled && echo never > /sys/kernel/mm/transparent_hugepage/defrag && echo 0 > /sys/kernel/mm/transparent_hugepage/khugepaged/defrag'
+# Report free base pages even when larger buddy extents are fragmented (order
+# 0 is 4 KiB on the supported 4 KiB-page guests). Bake the policy into the seed
+# unit, not spaced's code or environment. Apply it only inside the booted guest:
+# the seed-build chroot shares the builder's /sys. Kernels without reporting
+# keep working; an exposed control that cannot be set/read back fails startup.
+# This selects a reporting threshold; the VM still needs a reporting device.
+ExecStartPre=/bin/sh -c 'test ! -e /sys/module/page_reporting/parameters/page_reporting_order || { echo 0 > /sys/module/page_reporting/parameters/page_reporting_order && grep -qx 0 /sys/module/page_reporting/parameters/page_reporting_order; }'
 ExecStart=/usr/local/bin/spaced-svc
 Restart=always
 RestartSec=2

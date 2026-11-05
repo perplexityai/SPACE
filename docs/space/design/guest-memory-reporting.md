@@ -19,32 +19,31 @@ the recipe:
 The API preserves this explicit policy. Omitting `balloon` preserves the
 existing build default; setting the guest order alone does not create a device.
 
-## Opt-in configuration
+## Seed-baked configuration
 
-Set `SPACE_FREE_PAGE_REPORTING_ORDER` in the guest daemon's environment before
-starting `spaced-svc`. Values are integers from `0` through `9`. On a supported
-4 KiB-page guest, order `0` permits 4 KiB extents, order `4` permits 64 KiB
-extents, order `6` permits 256 KiB extents, and order `9` permits 2 MiB extents.
-Lower orders return more fragmented free memory, but can increase reporting
-and subsequent allocation costs.
+The seed builder writes order `0` into the guest's `spaced.service`
+`ExecStartPre` configuration. At guest boot, systemd applies the setting to
+`/sys/module/page_reporting/parameters/page_reporting_order` and verifies its
+readback before starting the unchanged daemon. There is no new `spaced-svc`
+flag, Rust configuration, environment variable, or maintenance API.
 
-An unset variable leaves the kernel or restored snapshot setting unchanged.
-This patch does not change existing template defaults, enable a balloon policy,
-publish a template, or deploy a new guest binary. An explicit invalid value,
-missing kernel parameter, or failed write/readback fails daemon startup rather
-than silently running with a different policy.
+On a supported 4 KiB-page guest, order `0` permits 4 KiB extents, order `4`
+permits 64 KiB extents, order `6` permits 256 KiB extents, and order `9` permits
+2 MiB extents. Lower orders return more fragmented free memory, but can
+increase reporting and subsequent allocation costs.
 
-For an already-running guest, the same validation is available as a one-shot
-operation:
+The seed-build container must not write this sysfs parameter directly: its
+chroot shares the builder's kernel. Instead, the rootfs carries the startup
+configuration, just as it carries the adjacent transparent-hugepage policy.
+Kernels without the reporting parameter skip the setting; an exposed parameter
+that cannot be written or does not read back as `0` fails service startup.
+The setting does not itself attach a reporting device or change guest capacity.
 
-```sh
-SPACE_FREE_PAGE_REPORTING_ORDER=0 spaced-svc --configure-memory-reporting
-```
-
-The setting is guest-side, not a host environment toggle. A template can bake
-the environment into its guest service before the daemon starts, or a caller
-can use the explicit maintenance command inside a running guest. Restored
-guests need their selected setting applied before the measured workload.
+Rebuild the seed and the derived template chain to adopt this configuration.
+Previously captured snapshots do not rerun boot commands on restore and are
+not changed by rebuilding a seed. Rebuild their lineage rather than assuming
+an old snapshot acquired the setting. This patch does not publish or promote
+templates, modify existing sandboxes, or deploy a new guest binary.
 
 ## Explicit post-setup cache release
 
@@ -52,14 +51,15 @@ After setup has finished and the application is healthy, a caller may explicitly
 release clean guest setup cache:
 
 ```sh
-spaced-svc --reclaim-setup-cache
+sync && echo 3 > /proc/sys/vm/drop_caches
 ```
 
-This command synchronizes guest filesystems, writes `3` to the guest kernel's
-`drop_caches`, and exits. If the order environment variable is also present, it
-applies and verifies that setting first. Both maintenance operations require a
-local VSOCK CID that identifies a guest; host, local, hypervisor, and wildcard
-CIDs are rejected before changing the kernel setting or releasing cache.
+Run this ordinary command as root inside the guest, through an existing
+guest-execution path, never on the worker host or in the seed-build chroot.
+It synchronizes guest filesystems and writes `3` to the guest kernel's
+`drop_caches`; no new guest-daemon command is needed. Keep it at the workload's
+build/setup finalization boundary. A seed-build-time flush cannot clear cache
+created by later Docker imports or workload setup.
 
 Cache release is not scheduled or invoked automatically by daemon startup.
 It affects all clean cache in that guest kernel, not just one application's
@@ -82,8 +82,8 @@ reporting or drop guest cache. No host cache release was used in these setup
 measurements.
 
 The workload-specific images are not included in this change, so these
-aggregate observations are not a self-contained public benchmark. The unit
-tests validate policy and safety behavior, not the reported memory reduction.
+aggregate observations are not a self-contained public benchmark. These
+measurements do not constitute validation of every rebuilt seed lineage.
 
 The following are descriptive ranges, not fleet percentiles or a memory cap.
 Charged RAM is the sandbox's host cgroup `memory.current` after setup and health
@@ -115,10 +115,11 @@ Fleet CPU effects, cold-cache latency, sustained pressure, and end-to-end
 application throughput require a separate load test before selecting a broad
 rollout policy.
 
-## Fresh compiled-CLI confirmation
+## Fresh confirmation before the seed-only revision
 
-A subsequent rerun used the statically built guest service from this change,
-not shell-equivalent sysfs/cache writes. Six new control guests and six new
+A subsequent rerun used an experimental statically built guest CLI to perform
+the same sysfs write and explicit guest cache release. That CLI is not part
+of this seed-only change. Six new control guests and six new
 order-0 guests repeated the same two application setup workloads three times
 each. The reporting-enabled templates had been built through an isolated
 native-build API canary implementing the explicit-policy mapping; the current
@@ -145,6 +146,11 @@ before the subsequent application health check; CPU excludes that health check.
 | --- | ---: | ---: | ---: | ---: | ---: |
 | Control | 16.125 | 12.96 | 12.78 | 1.23 | 10.85 |
 | Order 0 plus guest cache release | 4.757–4.881 | 16.63 | 14.56 | 4.57 | 13.23 |
+
+These results establish the tested kernel-policy/cache-release behavior, not
+an end-to-end boot or rebuild validation of the revised seed configuration.
+Validate guest readback and workload health on the rebuilt lineage before
+promoting it; existing snapshots are not retroactively modified.
 
 The candidate used 28.3% more inclusive CPU and 22.0% more allocation/touch
 time in this rerun. These are descriptive microbenchmark medians, not
