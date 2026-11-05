@@ -166,10 +166,10 @@ test('sorting puts unknown values last in either order, then by name', () => {
 });
 
 test('the list state round-trips through the URL and drops what it cannot apply', () => {
-  const shared = state({ q: 'acme', org: ORG, release: 'published', pool: 'with', build: 'failed', tag: 'prod', sort: 'nodes', order: 'descend', page: 3, size: 50 });
+  const shared = state({ q: 'north', org: ORG, release: 'published', pool: 'with', build: 'failed', tag: 'prod', sort: 'nodes', order: 'descend', page: 3, size: 50 });
   assert.deepEqual(parseListState(listStateParams(shared)), shared);
   assert.equal(listStateParams(DEFAULT_LIST_STATE).toString(), '', 'the default view has a bare URL');
-  const odd = parseListState(new URLSearchParams('org=acme&release=maybe&build=queued&sort=size&order=up&page=-2&size=7'));
+  const odd = parseListState(new URLSearchParams('org=north&release=maybe&build=queued&sort=size&order=up&page=-2&size=7'));
   assert.deepEqual(odd, DEFAULT_LIST_STATE);
   assert.equal(parseListState(new URLSearchParams('org=system')).org, 'system');
 });
