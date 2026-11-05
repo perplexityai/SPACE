@@ -1078,6 +1078,19 @@ if [ "${needs_build_dependencies}" = true ]; then
     fi
 fi
 
+# The workspace's own crates compile with rustc's parallel front end, in
+# front of sccache; see rustc-parallel-front-end.sh. Main, pull requests and
+# the merge queue all pass the same arguments, so they share compiler-cache
+# entries. SPACE_RUST_FRONTEND_THREADS=1 turns it off; CI reads it from the
+# repository variable of the same name.
+if [ "${needs_build_dependencies}" = true ]; then
+    export SPACE_RUST_FRONTEND_THREADS="${SPACE_RUST_FRONTEND_THREADS:-8}"
+    export SPACE_RUSTC_INNER_WRAPPER="${RUSTC_WRAPPER:-}"
+    export SPACE_RUSTC_WORKSPACE_ROOT="${REPO_ROOT}"
+    export RUSTC_WRAPPER="${SCRIPT_DIR}/rustc-parallel-front-end.sh"
+    echo "rustc front-end threads for workspace crates: ${SPACE_RUST_FRONTEND_THREADS}"
+fi
+
 if [ "${needs_build_dependencies}" = true ]; then
     echo "--- :rust: Fetching Cargo dependencies"
     cargo fetch --locked

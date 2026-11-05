@@ -821,6 +821,9 @@ jobs:
           SPACE_CI_SCCACHE_DIR: ${{ runner.temp }}/space-sccache
           SPACE_CI_SCCACHE_RUN_DIR: ${{ runner.temp }}/space-sccache-run
           SPACE_CI_SCCACHE_SIZE: ${{ matrix.rust_cache_size }}
+          # Unset, run-rust-checks.sh uses its default; 1 turns the parallel
+          # front end off.
+          SPACE_RUST_FRONTEND_THREADS: ${{ vars.SPACE_RUST_FRONTEND_THREADS }}
           SPACE_CI_CARGO_REGISTRY: ${{ runner.temp }}/cargo-home/registry
           SPACE_CI_GO_MOD_CACHE: ${{ runner.temp }}/go-mod
           SPACE_CI_UV_CACHE: ${{ runner.temp }}/uv-cache
@@ -851,6 +854,7 @@ jobs:
             --env SPACE_CI_PULL_REQUEST_HEAD_SHA
             --env SPACE_CI_COMMAND
             --env SPACE_CI_PER_COMMIT_MIGRATION_ISOLATION
+            --env SPACE_RUST_FRONTEND_THREADS
             --env SPACE_CI_REQUIRE_TEST_DEPS=1
             --env SPACE_CI_REQUIRE_TEST_PRIVILEGE=1
             --env SPACE_M1_GENERATOR_MIRROR=ghcr.io/perplexityai/space-ci-mirror
