@@ -2,7 +2,7 @@
 
 import { useMemo } from 'react';
 import { Button, Space, Table, Tag, Tooltip, Typography } from 'antd';
-import { shortHash } from '@/lib/template-format';
+import { LATEST_TAG, shortHash } from '@/lib/template-format';
 import { visibleTemplateTags } from '@/lib/template-list';
 import type { Template, TemplateRelease, TemplateReleaseWarmPool } from '@/lib/types';
 import { hasObservedPoolSandboxes, warmPoolLabel, warmPoolTooltip } from './template-cells';
@@ -21,7 +21,8 @@ interface PoolRow {
 
 interface Props {
   template: Template;
-  // The release new sandboxes get by name, where a new pool goes.
+  // The release new sandboxes get by name (the `latest` holder), where a
+  // new pool goes.
   current: TemplateRelease | null;
   data: TemplatesData;
   actions: TemplateActions;
@@ -66,9 +67,13 @@ export default function TemplatePool({ template, current, data, actions }: Props
       <div>
         <Space align="center" style={{ width: '100%', justifyContent: 'space-between' }}>
           <Title level={5} style={{ margin: 0 }}>Release pools</Title>
-          {canAdminTemplates && current ? (
+          {/* As in the Releases table, Create is offered only on a release
+              with no pool: the API's create updates a pool of the same
+              release and shape and makes it manual, which would reset its
+              target and detach it from its rolling policy without asking. */}
+          {canAdminTemplates && current && current.warm_pools.length === 0 ? (
             <Button onClick={() => actions.openClusterPoolModal(current)}>
-              Create pool on {shortHash(current.content_hash)}
+              Create pool on {shortHash(current.content_hash)} ({LATEST_TAG})
             </Button>
           ) : null}
         </Space>

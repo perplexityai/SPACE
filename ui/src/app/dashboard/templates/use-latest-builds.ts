@@ -32,10 +32,19 @@ export function useLatestBuilds(wanted: string[], reloadKey: number) {
   const queue = useRef<string[]>([]);
   const queued = useRef(new Set<string>());
   const running = useRef(0);
-  const mounted = useRef(true);
+  const mounted = useRef(false);
+  const wantedRef = useRef(new Set(wanted));
+  wantedRef.current = new Set(wanted);
 
-  useEffect(() => () => {
-    mounted.current = false;
+  // Set in the effect, not at first render: Strict Mode runs the cleanup and
+  // the setup again on a mounted component. Unmounting drops what is queued.
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+      queue.current = [];
+      queued.current.clear();
+    };
   }, []);
 
   const store = (name: string, value: LatestBuild) => {
@@ -62,7 +71,7 @@ export function useLatestBuilds(wanted: string[], reloadKey: number) {
   };
 
   const pump = () => {
-    while (running.current < CONCURRENCY && queue.current.length > 0) {
+    while (mounted.current && running.current < CONCURRENCY && queue.current.length > 0) {
       const name = queue.current.shift()!;
       if (unsupportedRef.current) {
         queued.current.delete(name);
@@ -87,8 +96,13 @@ export function useLatestBuilds(wanted: string[], reloadKey: number) {
     pump();
   };
 
+  // A read not sent yet for a template the view no longer shows is dropped:
+  // each read asks a builder.
   const wantedKey = wanted.join('\n');
   useEffect(() => {
+    const dropped = queue.current.filter((name) => !wantedRef.current.has(name));
+    queue.current = queue.current.filter((name) => wantedRef.current.has(name));
+    for (const name of dropped) queued.current.delete(name);
     enqueue(wanted.filter((name) => !entriesRef.current.has(name)));
   }, [wantedKey]);
 

@@ -31,8 +31,10 @@ function baseSnapshotTooltip(template: Template, desired: boolean) {
 
 interface Props {
   template: Template;
-  // The release new sandboxes get by name, and how many releases it has.
+  // The release new sandboxes get by name (the `latest` holder), the newest
+  // release, and how many releases it has.
   current: TemplateRelease | null;
+  newest: TemplateRelease | null;
   releaseCount: number;
   orgLabel: string;
   data: TemplatesData;
@@ -41,13 +43,22 @@ interface Props {
 
 // A template's settings: what its builder reports, its default auto
 // lifecycle, network policy and base snapshot policy.
-export default function TemplateOverview({ template, current, releaseCount, orgLabel, data, actions }: Props) {
+export default function TemplateOverview({ template, current, newest, releaseCount, orgLabel, data, actions }: Props) {
   const { token } = theme.useToken();
   const policy = data.baseSnapshotPolicies[template.name];
   const desired = policy?.ensure_base_snapshot ?? false;
   const customLifecycle = hasAutoLifecyclePolicy(template.default_auto_lifecycle);
   const networkLabel = compactNetworkPolicyLabel(template.network_policy);
+  // Until the releases are read, nothing is said about them; a failed first
+  // read says so.
+  const releases = data.releasesLoaded ? 'loaded' : data.releasesError ? 'error' : 'loading';
   const published = releaseCount > 0;
+  const releasesLink = (
+    <Link href={templateHref(template.name, 'releases')}>{releaseCount} release{releaseCount === 1 ? '' : 's'}</Link>
+  );
+  const releasesNotRead = (
+    <Tooltip title={data.releasesError ?? undefined}><Text type="warning">releases not read</Text></Tooltip>
+  );
 
   return (
     <Descriptions size="small" bordered column={{ xs: 1, sm: 1, md: 2, lg: 2, xl: 2, xxl: 2 }} styles={{ label: { width: 180 } }}>
@@ -57,21 +68,35 @@ export default function TemplateOverview({ template, current, releaseCount, orgL
         {template.description || <Text type="secondary">—</Text>}
       </Descriptions.Item>
       <Descriptions.Item label="Current release" span={2}>
-        {current ? (
+        {releases === 'loading' ? <Text type="secondary">…</Text> : null}
+        {releases === 'error' ? releasesNotRead : null}
+        {releases === 'loaded' && current ? (
           <Space size={4} wrap>
             <Tooltip title={current.content_hash}><code>{shortHash(current.content_hash)}</code></Tooltip>
             {visibleTemplateTags(current.tags, current.content_hash).map((tag) => (
               <Tag key={tag} color={tag === LATEST_TAG ? 'green' : 'blue'} style={{ marginInlineEnd: 0 }}>{tag}</Tag>
             ))}
             <Text type="secondary">created {formatShortDateTime(current.created_at)};</Text>
-            <Link href={templateHref(template.name, 'releases')}>{releaseCount} release{releaseCount === 1 ? '' : 's'}</Link>
+            {releasesLink}
           </Space>
-        ) : <Text type="secondary">{data.releasesLoaded ? 'No release has been published' : '…'}</Text>}
+        ) : null}
+        {releases === 'loaded' && !current && newest ? (
+          <Space size={4} wrap>
+            <Tag color="warning" style={{ marginInlineEnd: 0 }}>no {LATEST_TAG}</Tag>
+            <Text type="secondary">
+              No release holds {LATEST_TAG}, so creating a sandbox by this template&apos;s name fails. The newest is
+            </Text>
+            <Tooltip title={newest.content_hash}><code>{shortHash(newest.content_hash)}</code></Tooltip>
+            <Text type="secondary">({formatShortDateTime(newest.created_at)});</Text>
+            {releasesLink}
+          </Space>
+        ) : null}
+        {releases === 'loaded' && !newest ? <Text type="secondary">No release has been published</Text> : null}
       </Descriptions.Item>
       <Descriptions.Item label="Builder hash">
         {template.content_hash ? (
           <Tooltip title={template.content_hash}><code>{shortHash(template.content_hash)}</code></Tooltip>
-        ) : (
+        ) : releases === 'loading' ? <Text type="secondary">…</Text> : releases === 'error' ? releasesNotRead : (
           <Tooltip title={published ? 'Published; no builder node reports a build hash for it.' : 'No release has been published for this template.'}>
             <Text type="secondary">{published ? '—' : 'no release'}</Text>
           </Tooltip>

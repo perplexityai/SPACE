@@ -14,13 +14,41 @@ import ReleasesTable from './releases-table';
 import NodeAvailabilityTable from './node-availability-table';
 import WarmPoolPoliciesTable from './warm-pool-policies-table';
 import SpacedVersions from './spaced-versions';
+import SystemTemplates from './system-templates';
 import { COMPACT_TABLE_STYLE } from './template-cells';
+import { useUrlView } from './use-url-view';
 
 const { Title } = Typography;
 const TEMPLATES_VIEW_REFRESH_KEY = 'dashboard:templates';
 
-type Tab = 'templates' | 'releases' | 'policies' | 'nodes' | 'spaced';
-const TABS: readonly Tab[] = ['templates', 'releases', 'policies', 'nodes', 'spaced'];
+type Tab = 'templates' | 'releases' | 'policies' | 'nodes' | 'spaced' | 'system';
+const TABS: readonly Tab[] = ['templates', 'releases', 'policies', 'nodes', 'spaced', 'system'];
+
+interface View {
+  tab: Tab;
+  list: TemplateListState;
+  // The All releases and Node availability searches.
+  rq: string;
+  nq: string;
+}
+
+function parseView(params: URLSearchParams): View {
+  const raw = params.get('tab');
+  return {
+    tab: (TABS as readonly string[]).includes(raw ?? '') ? (raw as Tab) : 'templates',
+    list: parseListState(params),
+    rq: params.get('rq') ?? '',
+    nq: params.get('nq') ?? '',
+  };
+}
+
+function viewParams(view: View): URLSearchParams {
+  const params = listStateParams(view.list);
+  if (view.tab !== 'templates') params.set('tab', view.tab);
+  if (view.rq) params.set('rq', view.rq);
+  if (view.nq) params.set('nq', view.nq);
+  return params;
+}
 
 // `useSearchParams` needs a Suspense boundary for `next build`; the state is
 // read from the URL synchronously on mount, so the fallback never shows.
@@ -32,48 +60,42 @@ export default function TemplatesPageRoute() {
   );
 }
 
-// The Templates page: the searchable template list, and the views across
+// The Templates page: the searchable template list, the views across
 // templates (every release, warm pool policies, node copies, spaced
-// versions) as tabs. The search, filters, sort, page and tab are in the URL,
-// written with `replaceState` so a view can be shared and survives a reload
-// without adding history entries.
+// versions) and the system-template rebuild, as tabs. The URL holds the tab,
+// search, filters, sort and page (`useUrlView`), so a view can be shared,
+// survives a reload, and follows links and Back.
 function TemplatesPage() {
   const searchParams = useSearchParams();
   const pathname = usePathname();
   const data = useTemplatesData({ viewKey: TEMPLATES_VIEW_REFRESH_KEY });
   const actions = useTemplateActions(data);
-  const [tab, setTab] = useState<Tab>(() => {
-    const raw = searchParams.get('tab');
-    return (TABS as readonly string[]).includes(raw ?? '') ? (raw as Tab) : 'templates';
-  });
-  const [listState, setListState] = useState<TemplateListState>(() => parseListState(searchParams));
-  const [releaseSearch, setReleaseSearch] = useState(() => searchParams.get('rq') ?? '');
-  const [nodeSearch, setNodeSearch] = useState(() => searchParams.get('nq') ?? '');
+  const [view, update] = useUrlView(searchParams, pathname, parseView, viewParams);
   const [orgs, setOrgs] = useState<Organization[] | null>(null);
 
   useEffect(() => {
     adminApi.get<Organization[]>('/v1/orgs').then(setOrgs).catch(() => setOrgs(null));
   }, []);
 
-  useEffect(() => {
-    const params = listStateParams(listState);
-    if (tab !== 'templates') params.set('tab', tab);
-    if (releaseSearch) params.set('rq', releaseSearch);
-    if (nodeSearch) params.set('nq', nodeSearch);
-    const query = params.toString();
-    window.history.replaceState(null, '', query ? `${pathname}?${query}` : pathname);
-  }, [listState, tab, releaseSearch, nodeSearch, pathname]);
-
   const items = [
     {
       key: 'templates',
       label: `Templates${data.templatesLoaded ? ` (${data.templates.length})` : ''}`,
-      children: <TemplatesList data={data} actions={actions} state={listState} onChange={setListState} orgs={orgs} />,
+      children: (
+        <TemplatesList
+          data={data}
+          actions={actions}
+          state={view.list}
+          onChange={(list) => update({ list })}
+          orgs={orgs}
+          onRebuild={() => update({ tab: 'system' }, 'push')}
+        />
+      ),
     },
     {
       key: 'releases',
       label: `All releases${data.releasesLoaded ? ` (${data.templateReleases.length})` : ''}`,
-      children: <ReleasesTable data={data} actions={actions} search={releaseSearch} onSearch={setReleaseSearch} />,
+      children: <ReleasesTable data={data} actions={actions} search={view.rq} onSearch={(rq) => update({ rq })} />,
     },
     ...(data.supportsClusterPools ? [{
       key: 'policies',
@@ -83,12 +105,16 @@ function TemplatesPage() {
     {
       key: 'nodes',
       label: 'Node availability',
-      children: <NodeAvailabilityTable data={data} actions={actions} search={nodeSearch} onSearch={setNodeSearch} />,
+      children: <NodeAvailabilityTable data={data} actions={actions} search={view.nq} onSearch={(nq) => update({ nq })} />,
     },
     ...(data.canAdminTemplates ? [{
       key: 'spaced',
       label: 'spaced versions',
       children: <SpacedVersions data={data} />,
+    }, {
+      key: 'system',
+      label: 'System templates',
+      children: <SystemTemplates data={data} />,
     }] : []),
   ];
 
@@ -107,8 +133,8 @@ function TemplatesPage() {
         </Button>
       </Space>
       <Tabs
-        activeKey={items.some((item) => item.key === tab) ? tab : 'templates'}
-        onChange={(key) => setTab(key as Tab)}
+        activeKey={items.some((item) => item.key === view.tab) ? view.tab : 'templates'}
+        onChange={(key) => update({ tab: key as Tab }, 'push')}
         items={items}
       />
       {actions.modals}

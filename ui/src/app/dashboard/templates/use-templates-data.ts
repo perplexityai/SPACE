@@ -110,6 +110,10 @@ export function useTemplatesData({ viewKey, templateName }: Options) {
   // The template page's template is missing (404).
   const [templateMissing, setTemplateMissing] = useState(false);
   const [templatesLoaded, setTemplatesLoaded] = useState(false);
+  // The last template and release reads' failures, cleared by a read that
+  // answers; a view shows them instead of loading forever.
+  const [templatesError, setTemplatesError] = useState<string | null>(null);
+  const [releasesError, setReleasesError] = useState<string | null>(null);
   const [baseSnapshotPolicies, setBaseSnapshotPolicies] = useState<Record<string, BaseSnapshotPolicy>>({});
   const [inventory, setInventory] = useState<NodeTemplateInventory[]>([]);
   const [inventoryLoaded, setInventoryLoaded] = useState(false);
@@ -161,10 +165,12 @@ export function useTemplatesData({ viewKey, templateName }: Options) {
       if (request === releasesRequestRef.current) {
         setTemplateReleases(items);
         setReleasesLoaded(true);
+        setReleasesError(null);
       }
       return items;
     } catch (err: unknown) {
       console.warn(errorMessage(err));
+      setReleasesError(errorMessage(err));
       throw new Error('failed to refresh template releases');
     } finally {
       if (showLoading) setLoadingReleases(false);
@@ -263,12 +269,14 @@ export function useTemplatesData({ viewKey, templateName }: Options) {
       const items = await hydrateDirectTemplatePools(await readTemplates());
       setTemplates(items);
       setTemplatesLoaded(true);
+      setTemplatesError(null);
       if (includeBaseSnapshotPolicies) {
         await refreshBaseSnapshotPolicies(items);
       }
       return items;
     } catch (err: unknown) {
       console.warn(errorMessage(err));
+      setTemplatesError(errorMessage(err));
       throw new Error('failed to refresh templates');
     } finally {
       if (showLoading) setLoadingTemplates(false);
@@ -494,9 +502,11 @@ export function useTemplatesData({ viewKey, templateName }: Options) {
   return {
     templates,
     templatesLoaded,
+    templatesError,
     templateMissing,
     templateReleases,
     releasesLoaded,
+    releasesError,
     loadingReleases,
     loadingTemplates,
     loadingInventory,

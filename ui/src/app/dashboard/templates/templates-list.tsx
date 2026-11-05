@@ -2,9 +2,10 @@
 
 import { useMemo } from 'react';
 import Link from 'next/link';
-import { useRouter } from 'next/navigation';
-import { Alert, Button, Input, Popconfirm, Select, Space, Table, Tag, Tooltip, Typography } from 'antd';
-import { DeleteOutlined, SyncOutlined } from '@ant-design/icons';
+import { Alert, Button, Input, Popconfirm, Select, Space, Table, Tag, Tooltip, Typography, theme } from 'antd';
+import { CheckCircleFilled, ClockCircleOutlined, DeleteOutlined, SyncOutlined } from '@ant-design/icons';
+import { compactNetworkPolicyLabel } from '@/components/network-policy-designer';
+import NetworkPolicyGenerationTag from '@/components/network-policy-generation-tag';
 import type { ColumnsType, SorterResult } from 'antd/es/table/interface';
 import { LATEST_TAG, shortHash } from '@/lib/template-format';
 import {
@@ -24,6 +25,7 @@ import {
   type SortKey,
   type TemplateListState,
 } from '@/lib/template-list';
+import { orgOptionLabels } from '@/lib/org-filter';
 import type { Organization } from '@/lib/types';
 import { LatestBuildCell } from './template-cells';
 import type { TemplateActions } from './template-actions';
@@ -37,6 +39,8 @@ const SYSTEM_TEMPLATES = new Set(['seed', 'code-runtime']);
 const RELEASE_MATCHES_SHOWN = 5;
 
 interface Props {
+  // Opens the system-template rebuild.
+  onRebuild: () => void;
   data: TemplatesData;
   actions: TemplateActions;
   state: TemplateListState;
@@ -47,16 +51,17 @@ interface Props {
 
 // Every template, one compact row each, searched, filtered, sorted and paged
 // in the browser. The row links to the template's page.
-export default function TemplatesList({ data, actions, state, onChange, orgs }: Props) {
+export default function TemplatesList({ data, actions, state, onChange, orgs, onRebuild }: Props) {
   const {
     templates, templateReleases, releasesLoaded, inventory, inventoryLoaded, warmPoolPolicies, supportsClusterPools,
     loadingTemplates, refreshGeneration,
   } = data;
   const { handleDelete, templateOperationRunning } = actions;
-  const router = useRouter();
+  const { token } = theme.useToken();
   const change = (next: Partial<TemplateListState>) => onChange(withListChange(state, next));
 
-  const orgNames = useMemo(() => new Map((orgs ?? []).map((org) => [org.id, org.name])), [orgs]);
+  // Organization names need not be unique: a repeated one carries its slug.
+  const orgNames = useMemo(() => new Map(orgOptionLabels(orgs ?? []).map((option) => [option.value, option.label])), [orgs]);
   const orgLabel = (orgId: string | null) => (orgId === null ? 'System' : orgNames.get(orgId) ?? orgId.slice(0, 8));
 
   const rows = useMemo(() => templateListRows({
@@ -153,11 +158,30 @@ export default function TemplatesList({ data, actions, state, onChange, orgs }: 
       width: 280,
       render: (_, row) => {
         if (row.published === null) return <Text type="secondary">…</Text>;
-        if (!row.current) {
+        if (!row.newest) {
           return (
             <Tooltip title="No release has been published for this template: it may never have been built, every build may have failed, or its releases were unpublished.">
               <Tag style={{ marginInlineEnd: 0 }}>no release</Tag>
             </Tooltip>
+          );
+        }
+        if (!row.current) {
+          return (
+            <Space size={4} wrap={false}>
+              <Tooltip title={`No release holds ${LATEST_TAG}, so creating a sandbox by the template's name fails.`}>
+                <Tag color="warning" style={{ marginInlineEnd: 0 }}>no {LATEST_TAG}</Tag>
+              </Tooltip>
+              <Tooltip title={row.newest.content_hash}>
+                <Text type="secondary" style={{ fontSize: 12, whiteSpace: 'nowrap' }}>
+                  newest <code>{shortHash(row.newest.content_hash)}</code>
+                </Text>
+              </Tooltip>
+              {row.tagged.length > 0 ? (
+                <Link href={templateHref(row.name, 'releases')} style={{ fontSize: 12, whiteSpace: 'nowrap' }}>
+                  {row.tagged.length} tagged
+                </Link>
+              ) : null}
+            </Space>
           );
         }
         // One line: the current release with its tags, and how many other
@@ -166,7 +190,6 @@ export default function TemplatesList({ data, actions, state, onChange, orgs }: 
         const others = row.tagged.filter((entry) => entry.release.id !== row.current!.id);
         return (
           <Space size={4} wrap={false}>
-            {currentTags.length === 0 ? <Text type="secondary" style={{ fontSize: 12 }}>untagged</Text> : null}
             {currentTags.slice(0, 3).map((tag) => (
               <Tag key={tag} color={tag === LATEST_TAG ? 'green' : 'blue'} style={{ marginInlineEnd: 0 }}>{tag}</Tag>
             ))}
@@ -222,12 +245,49 @@ export default function TemplatesList({ data, actions, state, onChange, orgs }: 
       },
     },
     {
+      // The policy and whether nodes applied its newest generation.
+      title: 'Network',
+      width: 150,
+      render: (_, row) => {
+        const label = compactNetworkPolicyLabel(row.template.network_policy);
+        return (
+          <NetworkPolicyGenerationTag
+            desired={row.template.network_policy_generation}
+            applied={row.template.network_policy_status?.observed_generation}
+            policyLabel={label}
+            desiredSource="template"
+            observedSource={row.template.network_policy_status?.observed_source}
+          />
+        );
+      },
+    },
+    {
+      title: 'Snap',
+      width: 56,
+      align: 'center',
+      render: (_, row) => (
+        <Tooltip title={row.template.has_base_snapshot ? 'Base snapshot observed' : 'No base snapshot observed'}>
+          {row.template.has_base_snapshot ? (
+            <CheckCircleFilled style={{ color: token.colorSuccess, fontSize: 13 }} aria-label="Base snapshot observed" />
+          ) : (
+            <ClockCircleOutlined style={{ color: token.colorTextTertiary, fontSize: 13 }} aria-label="No base snapshot observed" />
+          )}
+        </Tooltip>
+      ),
+    },
+    {
       title: 'Nodes',
       ...sortable('nodes'),
       width: 80,
       align: 'right',
       render: (_, row) => {
-        if (row.nodeCount === null) return <Text type="secondary">—</Text>;
+        if (row.nodeCount === null) {
+          return (
+            <Tooltip title={row.current ? 'The node inventory has not loaded' : `No release holds ${LATEST_TAG}`}>
+              <Text type="secondary">—</Text>
+            </Tooltip>
+          );
+        }
         return (
           <Tooltip title={`Reachable nodes holding ${row.name}@${shortHash(row.current?.content_hash)}`}>
             <Link href={templateHref(row.name, 'nodes')}>{row.nodeCount}</Link>
@@ -243,7 +303,7 @@ export default function TemplatesList({ data, actions, state, onChange, orgs }: 
         <Space size={2}>
           {SYSTEM_TEMPLATES.has(row.name) && data.canAdminTemplates ? (
             <Tooltip title="Rebuild seed and code-runtime from this API release's recipe">
-              <Button type="text" size="small" onClick={() => router.push(templateHref(row.name, 'builds'))}>
+              <Button type="text" size="small" onClick={onRebuild}>
                 Rebuild
               </Button>
             </Tooltip>
@@ -367,7 +427,7 @@ export default function TemplatesList({ data, actions, state, onChange, orgs }: 
         rowKey="name"
         loading={loadingTemplates}
         size="small"
-        scroll={{ x: 1150 }}
+        scroll={{ x: 1360 }}
         pagination={{
           current: page,
           pageSize: state.size,

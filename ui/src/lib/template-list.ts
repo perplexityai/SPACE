@@ -94,9 +94,11 @@ export interface TemplateListRow {
   published: boolean | null;
   // Releases with an operator-named tag; the one holding `latest` first.
   tagged: TaggedRelease[];
-  // The release new sandboxes get by name: the `latest` holder, else the
-  // newest release.
+  // The release new sandboxes get by name: the one holding `latest`. A
+  // template without it has no current release, and a create by name fails.
   current: TemplateRelease | null;
+  // The newest release, which may not be the current one.
+  newest: TemplateRelease | null;
   pool: PoolSummary;
   // Reachable nodes holding the current release; null until the node
   // inventory has loaded, or when there is no current release.
@@ -151,7 +153,7 @@ export function templateListRows(inputs: RowInputs): TemplateListRow[] {
       tagged.push({ release, tags });
     }
     tagged.sort((a, b) => Number(b.release === latestHolder) - Number(a.release === latestHolder));
-    const current = latestHolder ?? releases[0] ?? null;
+    const current = latestHolder;
     const nodeCount = current && inputs.inventoryLoaded
       ? holders.get(`${template.name}\u0000${current.content_hash}`)?.size ?? 0
       : null;
@@ -163,6 +165,7 @@ export function templateListRows(inputs: RowInputs): TemplateListRow[] {
       published: inputs.releasesLoaded ? releases.length > 0 : null,
       tagged,
       current,
+      newest: releases[0] ?? null,
       pool: inputs.clusterPools
         ? clusterPoolSummary(releases, policiesByTemplate.get(template.name) ?? 0)
         : directPoolSummary(template),
@@ -446,19 +449,4 @@ export function clampPage(page: number, size: number, total: number): number {
 // build.
 export function buildsToRead(pageRows: TemplateListRow[], candidates: TemplateListRow[], state: TemplateListState): string[] {
   return (needsEveryBuild(state) ? candidates : pageRows).map((row) => row.name);
-}
-
-// -------------------------------------------------------------------- age
-
-// "3h ago": how long before `now` an ISO time was, in its largest whole unit.
-export function ageText(iso: string, now: number): string {
-  const ms = now - Date.parse(iso);
-  if (Number.isNaN(ms)) return '—';
-  const seconds = Math.max(0, Math.floor(ms / 1000));
-  if (seconds < 60) return 'just now';
-  const minutes = Math.floor(seconds / 60);
-  if (minutes < 60) return `${minutes}m ago`;
-  const hours = Math.floor(minutes / 60);
-  if (hours < 48) return `${hours}h ago`;
-  return `${Math.floor(hours / 24)}d ago`;
 }

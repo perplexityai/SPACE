@@ -20,17 +20,36 @@ import NodeAvailabilityTable from '../node-availability-table';
 import SpacedVersions from '../spaced-versions';
 import SystemTemplateRebuild from '../system-template-rebuild';
 import { TEMPLATE_SECTIONS, templateSandboxesHref, type TemplateSection } from '../links';
+import { useUrlView } from '../use-url-view';
 
 const { Title, Text } = Typography;
 const SYSTEM_TEMPLATES = new Set(['seed', 'code-runtime']);
 
-function decodedName(raw: string | string[] | undefined): string {
-  const value = Array.isArray(raw) ? raw[0] : raw ?? '';
-  try {
-    return decodeURIComponent(value);
-  } catch {
-    return value;
-  }
+interface View {
+  tab: TemplateSection;
+  // The release a search named, marked in the Releases tab.
+  release: string | null;
+  rq: string;
+  nq: string;
+}
+
+function parseView(params: URLSearchParams): View {
+  const raw = params.get('tab');
+  return {
+    tab: (TEMPLATE_SECTIONS as readonly string[]).includes(raw ?? '') ? (raw as TemplateSection) : 'overview',
+    release: params.get('release') || null,
+    rq: params.get('rq') ?? '',
+    nq: params.get('nq') ?? '',
+  };
+}
+
+function viewParams(view: View): URLSearchParams {
+  const params = new URLSearchParams();
+  if (view.tab !== 'overview') params.set('tab', view.tab);
+  if (view.release) params.set('release', view.release);
+  if (view.rq) params.set('rq', view.rq);
+  if (view.nq) params.set('nq', view.nq);
+  return params;
 }
 
 export default function TemplateDetailRoute() {
@@ -44,32 +63,22 @@ export default function TemplateDetailRoute() {
 // One template: its settings, releases, builds, warm pool, node copies and
 // sandboxes, as tabs whose choice is in the URL.
 function TemplateDetailPage() {
-  const params = useParams<{ name: string }>();
-  const name = decodedName(params.name);
+  // Template names are URL-safe (`[A-Za-z0-9._-]`), so the segment is the name.
+  const { name } = useParams<{ name: string }>();
   const router = useRouter();
   const pathname = usePathname();
   const searchParams = useSearchParams();
   const data = useTemplatesData({ viewKey: `dashboard:templates:${name}`, templateName: name });
-  const actions = useTemplateActions(data, { onTemplateDeleted: () => router.push('/dashboard/templates') });
-  const [tab, setTab] = useState<TemplateSection>(() => {
-    const raw = searchParams.get('tab');
-    return (TEMPLATE_SECTIONS as readonly string[]).includes(raw ?? '') ? (raw as TemplateSection) : 'overview';
+  // A delete waits for its operation; by then the operator may have left.
+  const actions = useTemplateActions(data, {
+    onTemplateDeleted: () => {
+      if (window.location.pathname === pathname) router.push('/dashboard/templates');
+    },
   });
-  const [highlight] = useState(() => searchParams.get('release'));
-  const [releaseSearch, setReleaseSearch] = useState(() => searchParams.get('rq') ?? '');
-  const [nodeSearch, setNodeSearch] = useState(() => searchParams.get('nq') ?? '');
+  const [view, update] = useUrlView(searchParams, pathname, parseView, viewParams);
+  const { tab } = view;
   const [orgName, setOrgName] = useState<string | null>(null);
   const template = data.templates.find((candidate) => candidate.name === name) ?? null;
-
-  useEffect(() => {
-    const next = new URLSearchParams();
-    if (tab !== 'overview') next.set('tab', tab);
-    if (highlight) next.set('release', highlight);
-    if (releaseSearch) next.set('rq', releaseSearch);
-    if (nodeSearch) next.set('nq', nodeSearch);
-    const query = next.toString();
-    window.history.replaceState(null, '', query ? `${pathname}?${query}` : pathname);
-  }, [tab, highlight, releaseSearch, nodeSearch, pathname]);
 
   const orgId = template?.org_id ?? null;
   useEffect(() => {
@@ -103,11 +112,27 @@ function TemplateDetailPage() {
     );
   }
   if (!template) {
-    return (
-      <div style={{ padding: 48, textAlign: 'center' }}>
-        {data.templatesLoaded ? <Text type="secondary">Template {name} could not be loaded.</Text> : <Spin />}
-      </div>
-    );
+    if (data.templatesError) {
+      return (
+        <Result
+          status="error"
+          title={`Template ${name} could not be loaded`}
+          subTitle={data.templatesError}
+          extra={(
+            <Space>
+              {back}
+              <Button
+                type="primary"
+                onClick={() => void data.refresh({ includeBaseSnapshotPolicies: true }).catch(() => undefined)}
+              >
+                Retry
+              </Button>
+            </Space>
+          )}
+        />
+      );
+    }
+    return <div style={{ padding: 48, textAlign: 'center' }}><Spin /></div>;
   }
 
   const orgLabel = template.org_id === null ? 'System' : orgName ?? template.org_id;
@@ -118,7 +143,7 @@ function TemplateDetailPage() {
     {
       key: 'overview',
       label: 'Overview',
-      children: <TemplateOverview template={template} current={row?.current ?? null} releaseCount={releaseCount} orgLabel={orgLabel} data={data} actions={actions} />,
+      children: <TemplateOverview template={template} current={row?.current ?? null} newest={row?.newest ?? null} releaseCount={releaseCount} orgLabel={orgLabel} data={data} actions={actions} />,
     },
     {
       key: 'releases',
@@ -128,9 +153,10 @@ function TemplateDetailPage() {
           data={data}
           actions={actions}
           templateName={template.name}
-          search={releaseSearch}
-          onSearch={setReleaseSearch}
-          highlight={highlight}
+          search={view.rq}
+          onSearch={(rq) => update({ rq })}
+          highlight={view.release}
+          onClearHighlight={() => update({ release: null })}
         />
       ),
     },
@@ -164,8 +190,8 @@ function TemplateDetailPage() {
           data={data}
           actions={actions}
           templateName={template.name}
-          search={nodeSearch}
-          onSearch={setNodeSearch}
+          search={view.nq}
+          onSearch={(nq) => update({ nq })}
         />
       ),
     },
@@ -196,6 +222,10 @@ function TemplateDetailPage() {
             <Tooltip title={row.current.content_hash}>
               <Text type="secondary">current <code>{shortHash(row.current.content_hash)}</code></Text>
             </Tooltip>
+          ) : row?.newest ? (
+            <Tooltip title={`No release holds ${LATEST_TAG}, so creating a sandbox by the template's name fails.`}>
+              <Tag color="warning" style={{ marginInlineEnd: 0 }}>no {LATEST_TAG}</Tag>
+            </Tooltip>
           ) : data.releasesLoaded ? <Tag style={{ marginInlineEnd: 0 }}>no release</Tag> : null}
         </Space>
         <Space>
@@ -223,7 +253,7 @@ function TemplateDetailPage() {
           </Popconfirm>
         </Space>
       </Space>
-      <Tabs activeKey={tab} onChange={(key) => setTab(key as TemplateSection)} items={items} />
+      <Tabs activeKey={tab} onChange={(key) => update({ tab: key as TemplateSection }, 'push')} items={items} />
       {actions.modals}
     </div>
   );

@@ -2,7 +2,6 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import {
   DEFAULT_LIST_STATE,
-  ageText,
   buildBucket,
   buildsToRead,
   clampPage,
@@ -32,18 +31,18 @@ const node = (id, builds, reachable = true) => ({ node: { id }, reachable, error
 
 const TEMPLATES = [
   template('seed'),
-  template('acme-web', { org_id: ORG }),
-  template('acme-worker', { org_id: ORG }),
+  template('north-web', { org_id: ORG }),
+  template('north-worker', { org_id: ORG }),
   template('empty'),
 ];
 const RELEASES = [
   release('aaaaaaaa-0000-0000-0000-000000000001', 'seed', HASH_A, ['latest', HASH_A], '2026-11-01T00:00:00Z'),
   release('bbbbbbbb-0000-0000-0000-000000000002', 'seed', HASH_B, ['canary'], '2026-11-03T00:00:00Z'),
-  release('cccccccc-0000-0000-0000-000000000003', 'acme-web', HASH_C, [], '2026-11-02T00:00:00Z', [pool(true, 2, 3)]),
-  release('dddddddd-0000-0000-0000-000000000004', 'acme-worker', HASH_B, ['prod'], '2026-11-02T00:00:00Z', [pool(false, 0, 1)]),
+  release('cccccccc-0000-0000-0000-000000000003', 'north-web', HASH_C, [], '2026-11-02T00:00:00Z', [pool(true, 2, 3)]),
+  release('dddddddd-0000-0000-0000-000000000004', 'north-worker', HASH_B, ['prod'], '2026-11-02T00:00:00Z', [pool(false, 0, 1)]),
 ];
 const INVENTORY = [
-  node('n1', [{ name: 'seed', content_hash: HASH_A }, { name: 'acme-web', content_hash: HASH_C }]),
+  node('n1', [{ name: 'seed', content_hash: HASH_A }, { name: 'north-web', content_hash: HASH_C }]),
   node('n2', [{ name: 'seed', content_hash: HASH_A }]),
   node('n3', [{ name: 'seed', content_hash: HASH_A }], false),
 ];
@@ -67,14 +66,17 @@ test('visible tags leave out digest tags and the release digest', () => {
   assert.deepEqual(visibleTemplateTags(['latest', HASH_A, 'a1'.repeat(32), 'prod'], HASH_A), ['latest', 'prod']);
 });
 
-test('the current release is the latest holder, else the newest; nodes count only reachable holders of it', () => {
+test('the current release is the latest holder only; the newest is kept apart', () => {
   const r = byName(rows());
   assert.equal(r.seed.current.id, RELEASES[0].id, 'latest wins over the newer canary release');
+  assert.equal(r.seed.newest.id, RELEASES[1].id);
   assert.deepEqual(r.seed.tagged.map((entry) => entry.tags), [['latest'], ['canary']]);
   assert.equal(r.seed.nodeCount, 2, 'n3 is unreachable');
-  assert.equal(r['acme-web'].current.id, RELEASES[2].id, 'an untagged template falls back to its newest release');
-  assert.equal(r['acme-web'].nodeCount, 1);
+  assert.equal(r['north-web'].current, null, 'a release without latest is not current: a create by name would fail');
+  assert.equal(r['north-web'].newest.id, RELEASES[2].id);
+  assert.equal(r['north-web'].nodeCount, null, 'no current release, so no count');
   assert.equal(r.empty.current, null);
+  assert.equal(r.empty.newest, null);
   assert.equal(r.empty.nodeCount, null);
   assert.equal(r.empty.published, false);
 });
@@ -87,8 +89,8 @@ test('before the releases or the inventory load, nothing is claimed about them',
 
 test('pool status counts enabled cluster pools and policies, or the direct template pool', () => {
   const r = byName(rows({ policies: [{ template_name: 'seed', enabled: true }, { template_name: 'empty', enabled: false }] }));
-  assert.deepEqual([r['acme-web'].pool.active, r['acme-web'].pool.ready, r['acme-web'].pool.target], [true, 2, 3]);
-  assert.deepEqual([r['acme-worker'].pool.active, r['acme-worker'].pool.disabled], [false, 1]);
+  assert.deepEqual([r['north-web'].pool.active, r['north-web'].pool.ready, r['north-web'].pool.target], [true, 2, 3]);
+  assert.deepEqual([r['north-worker'].pool.active, r['north-worker'].pool.disabled], [false, 1]);
   assert.equal(r.seed.pool.active, true, 'an enabled rolling policy is a pool');
   assert.equal(r.empty.pool.active, false, 'a disabled policy is not');
   const direct = byName(rows({ clusterPools: false, templates: [template('seed', { pool_current: 1, pool_target: 4 }), template('empty')] }));
@@ -98,23 +100,23 @@ test('pool status counts enabled cluster pools and policies, or the direct templ
 
 test('a search names releases by tag, content hash prefix or release ID prefix', () => {
   const reasons = (q) => releaseMatches(RELEASES, q).map((match) => `${match.release.template_name}:${match.reason}`);
-  assert.deepEqual(reasons('PROD'), ['acme-worker:tag'], 'tags match whole and case-insensitively');
+  assert.deepEqual(reasons('PROD'), ['north-worker:tag'], 'tags match whole and case-insensitively');
   assert.deepEqual(reasons('pro'), [], 'not by a tag prefix');
-  assert.deepEqual(reasons('b2b2'), ['seed:hash', 'acme-worker:hash']);
-  assert.deepEqual(reasons('sha256:c3c3c3'), ['acme-web:hash'], 'with its algorithm prefix');
+  assert.deepEqual(reasons('b2b2'), ['seed:hash', 'north-worker:hash']);
+  assert.deepEqual(reasons('sha256:c3c3c3'), ['north-web:hash'], 'with its algorithm prefix');
   assert.deepEqual(reasons('a1a'), [], 'a hash prefix shorter than four digits looks nothing up');
-  assert.deepEqual(reasons('dddddddd-0000'), ['acme-worker:id']);
+  assert.deepEqual(reasons('dddddddd-0000'), ['north-worker:id']);
   assert.deepEqual(reasons('seed'), []);
 });
 
 test('the search keeps name substrings and the templates of matching releases', () => {
   const all = rows();
   const run = (q) => filterTemplateRows(all, state({ q }), new Map(), releaseMatches(RELEASES, q));
-  assert.deepEqual(names(run('ACME').rows), ['acme-web', 'acme-worker']);
+  assert.deepEqual(names(run('NORTH').rows), ['north-web', 'north-worker']);
   const byTag = run('canary');
   assert.deepEqual(names(byTag.rows), ['seed']);
   assert.equal(byTag.rows[0].matched[0].reason, 'tag');
-  assert.deepEqual(names(run('c3c3').rows), ['acme-web']);
+  assert.deepEqual(names(run('c3c3').rows), ['north-web']);
   assert.deepEqual(byName(run('seed').rows).seed.matched, [], 'a name match lists no release match');
 });
 
@@ -122,19 +124,19 @@ test('every filter narrows the rows', () => {
   const all = rows();
   const kept = (change, builds = new Map()) => names(filterTemplateRows(all, state(change), builds).rows);
   assert.deepEqual(kept({ org: 'system' }), ['seed', 'empty']);
-  assert.deepEqual(kept({ org: ORG }), ['acme-web', 'acme-worker']);
-  assert.deepEqual(kept({ release: 'published' }), ['seed', 'acme-web', 'acme-worker']);
+  assert.deepEqual(kept({ org: ORG }), ['north-web', 'north-worker']);
+  assert.deepEqual(kept({ release: 'published' }), ['seed', 'north-web', 'north-worker']);
   assert.deepEqual(kept({ release: 'unpublished' }), ['empty']);
-  assert.deepEqual(kept({ pool: 'with' }), ['acme-web']);
-  assert.deepEqual(kept({ pool: 'without' }), ['seed', 'acme-worker', 'empty']);
-  assert.deepEqual(kept({ tag: 'prod' }), ['acme-worker']);
+  assert.deepEqual(kept({ pool: 'with' }), ['north-web']);
+  assert.deepEqual(kept({ pool: 'without' }), ['seed', 'north-worker', 'empty']);
+  assert.deepEqual(kept({ tag: 'prod' }), ['north-worker']);
   const builds = new Map([
     ['seed', build('succeeded', '2026-11-04T00:00:00Z')],
-    ['acme-web', build('publish_failed', '2026-11-04T00:00:00Z')],
-    ['acme-worker', build('pending', '2026-11-04T00:00:00Z')],
+    ['north-web', build('publish_failed', '2026-11-04T00:00:00Z')],
+    ['north-worker', build('pending', '2026-11-04T00:00:00Z')],
   ]);
-  assert.deepEqual(kept({ build: 'failed' }, builds), ['acme-web']);
-  assert.deepEqual(kept({ build: 'running' }, builds), ['acme-worker']);
+  assert.deepEqual(kept({ build: 'failed' }, builds), ['north-web']);
+  assert.deepEqual(kept({ build: 'running' }, builds), ['north-worker']);
   const partial = filterTemplateRows(all, state({ build: 'succeeded' }), builds);
   assert.deepEqual([names(partial.rows), partial.pendingBuilds], [['seed'], 1], 'a template whose build is unread is pending, not dropped silently');
 });
@@ -148,19 +150,19 @@ test('a build the builder cannot report is in no build bucket', () => {
 
 test('sorting puts unknown values last in either order, then by name', () => {
   const all = rows();
-  const orgLabel = (id) => (id ? 'Acme' : 'System');
+  const orgLabel = (id) => (id ? 'North' : 'System');
   const sorted = (sort, order, builds = new Map()) => names(sortTemplateRows(all, { sort, order }, builds, orgLabel));
-  assert.deepEqual(sorted('name', 'descend'), ['seed', 'empty', 'acme-worker', 'acme-web']);
-  assert.deepEqual(sorted('org', 'ascend'), ['acme-web', 'acme-worker', 'empty', 'seed']);
-  assert.deepEqual(sorted('nodes', 'descend'), ['seed', 'acme-web', 'acme-worker', 'empty']);
-  assert.deepEqual(sorted('nodes', 'ascend'), ['acme-worker', 'acme-web', 'seed', 'empty']);
-  assert.deepEqual(sorted('release', 'descend'), ['acme-web', 'acme-worker', 'seed', 'empty']);
+  assert.deepEqual(sorted('name', 'descend'), ['seed', 'north-worker', 'north-web', 'empty']);
+  assert.deepEqual(sorted('org', 'ascend'), ['north-web', 'north-worker', 'empty', 'seed']);
+  assert.deepEqual(sorted('nodes', 'descend'), ['seed', 'empty', 'north-web', 'north-worker']);
+  assert.deepEqual(sorted('nodes', 'ascend'), ['seed', 'empty', 'north-web', 'north-worker'], 'only seed has a current release to count');
+  assert.deepEqual(sorted('release', 'descend'), ['seed', 'empty', 'north-web', 'north-worker'], 'templates without latest sort last');
   const builds = new Map([
     ['seed', build('succeeded', '2026-11-04T00:00:00Z')],
-    ['acme-web', build('failed', '2026-11-03T00:00:00Z')],
-    ['acme-worker', build('failed', '2026-11-04T00:00:00Z')],
+    ['north-web', build('failed', '2026-11-03T00:00:00Z')],
+    ['north-worker', build('failed', '2026-11-04T00:00:00Z')],
   ]);
-  assert.deepEqual(sorted('build', 'ascend', builds), ['acme-worker', 'acme-web', 'seed', 'empty'], 'failed first, newest first within a state');
+  assert.deepEqual(sorted('build', 'ascend', builds), ['north-worker', 'north-web', 'seed', 'empty'], 'failed first, newest first within a state');
 });
 
 test('the list state round-trips through the URL and drops what it cannot apply', () => {
@@ -185,18 +187,9 @@ test('a change to the search, a filter or the sort goes back to page 1; paging k
 test('only the page rows read their build, unless the view filters or sorts by build', () => {
   const all = rows();
   const page = all.slice(0, 2);
-  assert.deepEqual(buildsToRead(page, all, DEFAULT_LIST_STATE), ['seed', 'acme-web']);
+  assert.deepEqual(buildsToRead(page, all, DEFAULT_LIST_STATE), ['seed', 'north-web']);
   assert.deepEqual(buildsToRead(page, all, state({ build: 'failed' })), names(all));
   assert.deepEqual(buildsToRead(page, all, state({ sort: 'build' })), names(all));
-});
-
-test('ages are shown in their largest whole unit', () => {
-  const now = Date.parse('2026-11-05T12:00:00Z');
-  assert.equal(ageText('2026-11-05T11:59:30Z', now), 'just now');
-  assert.equal(ageText('2026-11-05T11:15:00Z', now), '45m ago');
-  assert.equal(ageText('2026-11-04T12:00:00Z', now), '24h ago');
-  assert.equal(ageText('2026-11-01T12:00:00Z', now), '4d ago');
-  assert.equal(ageText('not a time', now), '—');
 });
 
 test('the releases search matches a template substring, a tag substring, a hash prefix or an ID prefix', () => {

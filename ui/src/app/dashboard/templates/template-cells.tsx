@@ -2,7 +2,8 @@
 
 import { Space, Tag, Tooltip, Typography, theme } from 'antd';
 import { shortHash } from '@/lib/template-format';
-import { ageText, buildBucket, type LatestBuild } from '@/lib/template-list';
+import { buildBucket, type LatestBuild } from '@/lib/template-list';
+import { formatAge, formatBytes } from '@/lib/sandbox-debug';
 import type { NodeRole, SpaceNode, Template, TemplateBuildListEntry, TemplateReleaseWarmPool } from '@/lib/types';
 import type { TemplateNodeAvailability } from './use-templates-data';
 
@@ -10,14 +11,6 @@ const { Text } = Typography;
 
 // The Templates views' dense tables, and the row a search marked.
 export const COMPACT_TABLE_STYLE = `.compact-table .ant-table-cell { padding: 4px 6px !important; } .compact-table .icon-action-btn { padding-left: 6px; padding-right: 6px; } .compact-table .icon-action-btn .anticon { font-size: 18px; } .compact-table .template-release-highlight > td { background: rgba(250, 173, 20, 0.12); }`;
-
-export function formatBytes(n: number | null | undefined) {
-  if (n === null || n === undefined) return '—';
-  if (n >= 1e9) return `${(n / 1e9).toFixed(1)} GB`;
-  if (n >= 1e6) return `${(n / 1e6).toFixed(1)} MB`;
-  if (n >= 1e3) return `${(n / 1e3).toFixed(1)} KB`;
-  return `${n} B`;
-}
 
 export function formatDiskSize(mib: number | null | undefined) {
   return mib && mib > 0 ? formatBytes(mib * 1024 * 1024) : '—';
@@ -240,7 +233,7 @@ export function LatestBuildCell({ latest, now }: { latest: LatestBuild | undefin
         <Space size={4} wrap={false}>
           <BuildStateTag state={latest.build.state} statusError={latest.build.status_error} />
           <Tooltip title={new Date(latest.build.created_at).toLocaleString()}>
-            <Text type="secondary" style={{ fontSize: 12, whiteSpace: 'nowrap' }}>{ageText(latest.build.created_at, now)}</Text>
+            <Text type="secondary" style={{ fontSize: 12, whiteSpace: 'nowrap' }}>{formatAge(latest.build.created_at, now)} ago</Text>
           </Tooltip>
           {buildBucket(latest) === 'succeeded' && latest.build.content_hash ? (
             <Text code style={{ fontSize: 11 }}>{shortHash(latest.build.content_hash)}</Text>

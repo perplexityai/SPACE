@@ -2,7 +2,7 @@
 
 import { useMemo } from 'react';
 import Link from 'next/link';
-import { Button, Input, Popconfirm, Space, Table, Tag, Tooltip, Typography } from 'antd';
+import { Alert, Button, Input, Popconfirm, Space, Table, Tag, Tooltip, Typography } from 'antd';
 import { DeleteOutlined } from '@ant-design/icons';
 import type { ColumnsType } from 'antd/es/table';
 import { shortHash } from '@/lib/template-format';
@@ -25,11 +25,14 @@ interface Props {
   templateName?: string;
   search: string;
   onSearch: (search: string) => void;
-  // A release to mark, such as one a search on the list named.
+  // A release a search on the list named: the table shows only it, marked,
+  // until `onClearHighlight` (Show all releases), so it is never on a page
+  // the operator has not opened.
   highlight?: string | null;
+  onClearHighlight?: () => void;
 }
 
-export default function ReleasesTable({ data, actions, templateName, search, onSearch, highlight }: Props) {
+export default function ReleasesTable({ data, actions, templateName, search, onSearch, highlight, onClearHighlight }: Props) {
   const { templateReleases, loadingReleases, supportsClusterPools, canAdminTemplates, warmPoolPolicyCapabilities } = data;
   const { canManageTemplateReleases, templateOperationRunning, renderReleaseTagControls, openClusterPoolModal, handleDeleteRelease } = actions;
 
@@ -37,7 +40,13 @@ export default function ReleasesTable({ data, actions, templateName, search, onS
     () => (templateName ? templateReleases.filter((release) => release.template_name === templateName) : templateReleases),
     [templateReleases, templateName],
   );
-  const shown = useMemo(() => scoped.filter((release) => releaseRowMatches(release, search)), [scoped, search]);
+  const focused = Boolean(highlight && onClearHighlight);
+  const shown = useMemo(
+    () => (focused
+      ? scoped.filter((release) => release.id === highlight)
+      : scoped.filter((release) => releaseRowMatches(release, search))),
+    [scoped, search, focused, highlight],
+  );
 
   const releaseTemplateFilters = useMemo(
     () => tableFilterOptions(scoped.map((release) => release.template_name)),
@@ -202,7 +211,19 @@ export default function ReleasesTable({ data, actions, templateName, search, onS
 
   return (
     <>
+      {focused ? (
+        <Alert
+          type={shown.length || !data.releasesLoaded ? 'info' : 'warning'}
+          showIcon
+          style={{ marginBottom: 8 }}
+          title={shown.length || !data.releasesLoaded
+            ? 'Showing the release the search named.'
+            : `The release the link names (${highlight}) is not one of this template's releases; it may have been unpublished.`}
+          action={<Button size="small" onClick={onClearHighlight}>Show all releases</Button>}
+        />
+      ) : null}
       <Input.Search
+        disabled={focused}
         allowClear
         value={search}
         onChange={(event) => onSearch(event.target.value)}
