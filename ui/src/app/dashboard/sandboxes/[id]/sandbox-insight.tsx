@@ -59,6 +59,9 @@ function SectionError({ error, what }: { error: string | null; what?: string }) 
 export interface DebugView {
   debug: SandboxDebug | null;
   error: string | null;
+  // When the read that produced this view was requested (ms), or null
+  // before the first.
+  requestedAt: number | null;
 }
 
 function sectionState(view: DebugView, section: DebugSection<unknown> | undefined) {
