@@ -166,7 +166,9 @@ fn credentials_match(status: &str, uid: u32, gid: u32) -> bool {
 
 /// Identify a deployed sidecar binary, including content-addressed installs.
 pub fn process_matches_program(pid: u32, program: &str) -> std::io::Result<bool> {
-    use pplx_space_common_core::host::linux::paths;
+    use pplx_space_uds_peer_auth::exe::{
+        is_content_addressed_binary_file_name, strip_exe_deleted_marker,
+    };
     let Some(binary) = std::path::Path::new(program)
         .file_name()
         .and_then(|name| name.to_str())
@@ -177,11 +179,11 @@ pub fn process_matches_program(pid: u32, program: &str) -> std::io::Result<bool>
         ));
     };
     std::fs::read_link(format!("/proc/{pid}/exe")).map(|exe| {
-        paths::strip_exe_deleted_marker(&exe)
+        strip_exe_deleted_marker(&exe)
             .file_name()
             .and_then(|name| name.to_str())
             .is_some_and(|name| {
-                name == binary || paths::is_content_addressed_binary_file_name(name, binary)
+                name == binary || is_content_addressed_binary_file_name(name, binary)
             })
     })
 }

@@ -148,10 +148,10 @@ pub use rate_limiter::{
 };
 
 pub use peer_auth::{
-    AuthorizedUdsPeer, LocalRole, PEER_PROCESS_CHECK_ENV, ParsePeerProcessCheckModeError,
-    PeerIdentity, PeerProcessCheckMode, PeerProcessCheckModeEnvError, UdsPeerAccount,
-    UdsPeerAuthorizer, UdsPeerPrincipal, capability, peer_identity_from_tonic_request,
-    peer_may_set_local_authority, require_local_authority_peer,
+    AuthorizedUdsPeer, ContentAddressedInstalls, LocalRole, PEER_PROCESS_CHECK_ENV,
+    ParsePeerProcessCheckModeError, PeerIdentity, PeerProcessCheckMode,
+    PeerProcessCheckModeEnvError, UdsPeerAccount, UdsPeerAuthorizer, UdsPeerPrincipal, capability,
+    peer_identity_from_tonic_request, peer_may_set_local_authority, require_local_authority_peer,
 };
 
 pub use pplx_space_ingress_admission as ingress_admission;

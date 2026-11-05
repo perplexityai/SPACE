@@ -315,6 +315,11 @@ impl CallerResolver {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn uds_authorizer(&self) -> &UdsPeerAuthorizer {
+        &self.uds.authorizer
+    }
+
     /// Classify the request's transport into a fully-resolved caller. A
     /// request with neither UDS peer credentials nor an injected TCP identity
     /// is `Unauthenticated` — the auth layer must run before the handler on
@@ -488,7 +493,10 @@ pub(crate) struct CredentialUdsService<S> {
 fn volume_peer_authorizer() -> UdsPeerAuthorizer {
     UdsPeerAuthorizer::new(
         "space-credential-manager",
-        [UdsPeerAccount::with_linux_user(users::SPACE_VOLMGR)],
+        [UdsPeerAccount::with_fallback_uid(
+            users::SPACE_VOLMGR.name,
+            users::SPACE_VOLMGR.uid,
+        )],
     )
 }
 

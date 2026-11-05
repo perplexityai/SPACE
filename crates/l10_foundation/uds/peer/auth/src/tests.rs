@@ -1,16 +1,29 @@
-use pplx_space_common_core::host::linux::identities::{user_names, users};
-
 use super::*;
 
-const SBXMGR: &str = user_names::SPACE_SBXMGR;
-const TMPLMGR: &str = user_names::SPACE_TMPLMGR;
+/// Synthetic service accounts: names no host defines, so classification
+/// falls back to these uids.
+const SBXMGR: &str = "test-sandbox-peer";
+const SBXMGR_UID: u32 = 61_001;
+const SBXMGR_GID: u32 = 61_001;
+const TMPLMGR: &str = "test-template-peer";
+const TMPLMGR_UID: u32 = 61_002;
+const TMPLMGR_GID: u32 = 61_002;
+const VOLMGR_UID: u32 = 61_003;
+const NODEAPI: &str = "test-node-api-peer";
+const NODECTL: &str = "test-node-ctl-peer";
+
+/// The content-addressed layout the process-check tests configure.
+const LAYOUT: ContentAddressedInstalls = ContentAddressedInstalls {
+    bin_dir: "/space/bin",
+    apps_dir: "/space/apps",
+};
 
 fn authorizer() -> UdsPeerAuthorizer {
     UdsPeerAuthorizer::new(
         "test-service",
         [
-            UdsPeerAccount::with_linux_user(users::SPACE_SBXMGR),
-            UdsPeerAccount::with_linux_user(users::SPACE_TMPLMGR),
+            UdsPeerAccount::with_fallback_uid(SBXMGR, SBXMGR_UID),
+            UdsPeerAccount::with_fallback_uid(TMPLMGR, TMPLMGR_UID),
         ],
     )
 }
@@ -28,12 +41,8 @@ fn classifies_root() {
 fn classifies_known_fallback_uid() {
     let auth = authorizer();
     assert_eq!(
-        auth.classify(&PeerIdentity::new(
-            users::SPACE_SBXMGR.uid,
-            users::SPACE_SBXMGR.primary_group.gid,
-            Some(42),
-        ))
-        .principal,
+        auth.classify(&PeerIdentity::new(SBXMGR_UID, SBXMGR_GID, Some(42)))
+            .principal,
         UdsPeerPrincipal::Service(SBXMGR)
     );
 }
@@ -53,11 +62,7 @@ fn authorizes_allowed_principal() {
     let auth = authorizer();
     let peer = auth
         .authorize_identity(
-            PeerIdentity::new(
-                users::SPACE_TMPLMGR.uid,
-                users::SPACE_TMPLMGR.primary_group.gid,
-                Some(42),
-            ),
+            PeerIdentity::new(TMPLMGR_UID, TMPLMGR_GID, Some(42)),
             "test_op",
             &[UdsPeerPrincipal::Root, UdsPeerPrincipal::Service(TMPLMGR)],
         )
@@ -70,11 +75,7 @@ fn rejects_disallowed_principal() {
     let auth = authorizer();
     let err = auth
         .authorize_identity(
-            PeerIdentity::new(
-                users::SPACE_SBXMGR.uid,
-                users::SPACE_SBXMGR.primary_group.gid,
-                Some(42),
-            ),
+            PeerIdentity::new(SBXMGR_UID, SBXMGR_GID, Some(42)),
             "test_op",
             &[UdsPeerPrincipal::Service(TMPLMGR)],
         )
@@ -196,11 +197,7 @@ fn authorize_identity_records_peer_principal_on_current_span() {
 
         authorizer()
             .authorize_identity(
-                PeerIdentity::new(
-                    users::SPACE_SBXMGR.uid,
-                    users::SPACE_SBXMGR.primary_group.gid,
-                    Some(42),
-                ),
+                PeerIdentity::new(SBXMGR_UID, SBXMGR_GID, Some(42)),
                 "test_op",
                 &[UdsPeerPrincipal::Service(SBXMGR)],
             )
@@ -270,7 +267,7 @@ fn snapshot(exe: &str, uid: u32, cap_effective: u64) -> PeerProcessSnapshot {
 fn evaluate_passes_when_unconfigured() {
     let checks = PeerProcessChecks::EMPTY;
     let snap = snapshot("/opt/space/bin/space-sbxmgr-svc", 1001, 0);
-    evaluate_process_checks(&checks, 1001, &snap, |_| Vec::new())
+    evaluate_process_checks(&checks, Some(LAYOUT), 1001, &snap, |_| Vec::new())
         .expect("EMPTY checks always pass");
 }
 
@@ -280,7 +277,8 @@ fn evaluate_rejects_uid_drift() {
     // Authorizer saw uid=1001 from SO_PEERCRED but /proc says
     // effective uid=4242 — pid was reused.
     let snap = snapshot("/opt/space/bin/space-sbxmgr-svc", 4242, 0);
-    let err = evaluate_process_checks(&checks, 1001, &snap, |_| Vec::new()).unwrap_err();
+    let err =
+        evaluate_process_checks(&checks, Some(LAYOUT), 1001, &snap, |_| Vec::new()).unwrap_err();
     assert!(matches!(
         err,
         ProcessCheckFailure::UidDrift {
@@ -301,9 +299,11 @@ fn evaluate_accepts_allowed_binary() {
     };
     for path in checks.binary_paths {
         let snap = snapshot(path, 1001, 0);
-        evaluate_process_checks(&checks, 1001, &snap, |_| Vec::new()).unwrap_or_else(|e| {
-            panic!("expected {path:?} to be allowed: {e}");
-        });
+        evaluate_process_checks(&checks, Some(LAYOUT), 1001, &snap, |_| Vec::new()).unwrap_or_else(
+            |e| {
+                panic!("expected {path:?} to be allowed: {e}");
+            },
+        );
     }
 }
 
@@ -320,34 +320,65 @@ fn evaluate_admits_the_content_addressed_systemd_install() {
         ..PeerProcessChecks::EMPTY
     };
     let snap = snapshot("/space/apps/space-sbxmgr-svc-1a2b3c4d", 1001, 0);
-    evaluate_process_checks(&checks, 1001, &snap, |_| Vec::new())
+    evaluate_process_checks(&checks, Some(LAYOUT), 1001, &snap, |_| Vec::new())
         .expect("the deploy script's content-addressed install must satisfy its stable link entry");
+    // Without a configured layout the digest target is just another path.
+    let err = evaluate_process_checks(&checks, None, 1001, &snap, |_| Vec::new())
+        .expect_err("no layout, no content-addressed form");
+    assert!(matches!(err, ProcessCheckFailure::BinaryNotAllowed(_)));
+}
+
+#[test]
+fn authorizer_admits_content_addressed_installs_only_under_its_layout() {
+    let account = || {
+        UdsPeerAccount::with_fallback_uid(SBXMGR, SBXMGR_UID)
+            .require_binary(&["/space/bin/space-sbxmgr-svc"])
+    };
+    let snap = snapshot("/space/apps/space-sbxmgr-svc-1a2b3c4d", SBXMGR_UID, 0);
+
+    let with_layout =
+        UdsPeerAuthorizer::new("test-service", [account()]).with_content_addressed_installs(LAYOUT);
+    with_layout
+        .evaluate_account_checks(&with_layout.accounts[0], SBXMGR_UID, &snap, |_| Vec::new())
+        .expect("the authorizer's layout admits the digest install");
+
+    let without_layout = UdsPeerAuthorizer::new("test-service", [account()]);
+    let err = without_layout
+        .evaluate_account_checks(&without_layout.accounts[0], SBXMGR_UID, &snap, |_| {
+            Vec::new()
+        })
+        .expect_err("no layout, no content-addressed form");
+    assert!(matches!(err, ProcessCheckFailure::BinaryNotAllowed(_)));
 }
 
 #[test]
 fn volmgr_exe_is_admitted_only_for_its_service_account() {
-    use pplx_space_common_core::host::linux::identities::users;
-
     let volume_checks = PeerProcessChecks {
-        binary_paths: pplx_space_common_core::host::linux::paths::SPACE_VOLMGR_SVC_BINARIES,
+        binary_paths: &[
+            "/opt/space/bin/space-volmgr-svc",
+            "/space/bin/space-volmgr-svc",
+        ],
         ..PeerProcessChecks::EMPTY
     };
     let sandbox_checks = PeerProcessChecks {
-        binary_paths: pplx_space_common_core::host::linux::paths::SPACE_SBXMGR_UID_BINARIES,
+        binary_paths: &[
+            "/opt/space/bin/space-sbxmgr-svc",
+            "/space/bin/space-sbxmgr-svc",
+        ],
         ..PeerProcessChecks::EMPTY
     };
     for exe in [
         "/opt/space/bin/space-volmgr-svc",
         "/space/apps/space-volmgr-svc-1a2b3c4d",
     ] {
-        let snap = snapshot(exe, users::SPACE_VOLMGR.uid, 0);
-        evaluate_process_checks(&volume_checks, users::SPACE_VOLMGR.uid, &snap, |_| {
+        let snap = snapshot(exe, VOLMGR_UID, 0);
+        evaluate_process_checks(&volume_checks, Some(LAYOUT), VOLMGR_UID, &snap, |_| {
             Vec::new()
         })
         .unwrap();
-        let snap = snapshot(exe, users::SPACE_SBXMGR.uid, 0);
+        let snap = snapshot(exe, SBXMGR_UID, 0);
         let error =
-            evaluate_process_checks(&sandbox_checks, users::SPACE_SBXMGR.uid, &snap, |_| {
+            evaluate_process_checks(&sandbox_checks, Some(LAYOUT), SBXMGR_UID, &snap, |_| {
                 Vec::new()
             })
             .unwrap_err();
@@ -357,8 +388,8 @@ fn volmgr_exe_is_admitted_only_for_its_service_account() {
         "/opt/space/bin/space-sbxmgr-svc",
         "/space/apps/space-sbxmgr-svc-1a2b3c4d",
     ] {
-        let snap = snapshot(exe, users::SPACE_SBXMGR.uid, 0);
-        evaluate_process_checks(&sandbox_checks, users::SPACE_SBXMGR.uid, &snap, |_| {
+        let snap = snapshot(exe, SBXMGR_UID, 0);
+        evaluate_process_checks(&sandbox_checks, Some(LAYOUT), SBXMGR_UID, &snap, |_| {
             Vec::new()
         })
         .unwrap();
@@ -376,7 +407,7 @@ fn content_addressed_install_does_not_satisfy_the_helm_entry() {
         ..PeerProcessChecks::EMPTY
     };
     let snap = snapshot("/space/apps/space-sbxmgr-svc-1a2b3c4d", 1001, 0);
-    let err = evaluate_process_checks(&checks, 1001, &snap, |_| Vec::new())
+    let err = evaluate_process_checks(&checks, Some(LAYOUT), 1001, &snap, |_| Vec::new())
         .expect_err("a digest install must not satisfy an entry from the Helm layout");
     assert!(matches!(err, ProcessCheckFailure::BinaryNotAllowed(_)));
 }
@@ -399,7 +430,7 @@ fn evaluate_rejects_lookalike_content_addressed_installs() {
         "/space/apps2/space-sbxmgr-svc-1a2b3c4d",  // different directory
     ] {
         let snap = snapshot(exe, 1001, 0);
-        let err = evaluate_process_checks(&checks, 1001, &snap, |_| Vec::new())
+        let err = evaluate_process_checks(&checks, Some(LAYOUT), 1001, &snap, |_| Vec::new())
             .expect_err(&format!("{exe} must not match the allowlist"));
         assert!(matches!(err, ProcessCheckFailure::BinaryNotAllowed(_)));
     }
@@ -416,12 +447,12 @@ fn evaluate_admits_a_check_time_resolved_symlink_target() {
     };
     let snap = snapshot("/somewhere/else/space-sbxmgr-svc", 1001, 0);
 
-    let err = evaluate_process_checks(&checks, 1001, &snap, |_| Vec::new())
+    let err = evaluate_process_checks(&checks, Some(LAYOUT), 1001, &snap, |_| Vec::new())
         .expect_err("an unresolved off-layout target must not match");
     assert!(matches!(err, ProcessCheckFailure::BinaryNotAllowed(_)));
 
     let resolved = vec![PathBuf::from("/somewhere/else/space-sbxmgr-svc")];
-    evaluate_process_checks(&checks, 1001, &snap, |_| resolved)
+    evaluate_process_checks(&checks, Some(LAYOUT), 1001, &snap, |_| resolved)
         .expect("the entry's resolved symlink target must match");
 }
 
@@ -438,8 +469,14 @@ fn real_proc_read_reaches_the_binary_allowlist() {
         binary_paths: &["/no/such/space-binary"],
         ..PeerProcessChecks::EMPTY
     };
-    let err = evaluate_process_checks(&checks, snapshot.effective_uid, &snapshot, |_| Vec::new())
-        .expect_err("the test binary is not in the allowlist");
+    let err = evaluate_process_checks(
+        &checks,
+        Some(LAYOUT),
+        snapshot.effective_uid,
+        &snapshot,
+        |_| Vec::new(),
+    )
+    .expect_err("the test binary is not in the allowlist");
     assert!(
         matches!(err, ProcessCheckFailure::BinaryNotAllowed(_)),
         "{err}"
@@ -453,8 +490,14 @@ fn real_proc_read_reaches_the_binary_allowlist() {
         binary_paths: own_list,
         ..PeerProcessChecks::EMPTY
     };
-    evaluate_process_checks(&checks, snapshot.effective_uid, &snapshot, |_| Vec::new())
-        .expect("this process's own exe is allowlisted");
+    evaluate_process_checks(
+        &checks,
+        Some(LAYOUT),
+        snapshot.effective_uid,
+        &snapshot,
+        |_| Vec::new(),
+    )
+    .expect("this process's own exe is allowlisted");
 }
 
 #[test]
@@ -466,7 +509,7 @@ fn symlink_resolution_is_skipped_when_a_string_form_matches() {
         ..PeerProcessChecks::EMPTY
     };
     let snap = snapshot("/opt/space/bin/space-sbxmgr-svc", 1001, 0);
-    evaluate_process_checks(&checks, 1001, &snap, |_| {
+    evaluate_process_checks(&checks, Some(LAYOUT), 1001, &snap, |_| {
         unreachable!("a literal match must not resolve symlinks")
     })
     .expect("literal match authorizes without touching the filesystem");
@@ -501,7 +544,8 @@ fn evaluate_rejects_disallowed_binary() {
         ..PeerProcessChecks::EMPTY
     };
     let snap = snapshot("/usr/bin/bash", 1001, 0);
-    let err = evaluate_process_checks(&checks, 1001, &snap, |_| Vec::new()).unwrap_err();
+    let err =
+        evaluate_process_checks(&checks, Some(LAYOUT), 1001, &snap, |_| Vec::new()).unwrap_err();
     assert!(matches!(err, ProcessCheckFailure::BinaryNotAllowed(_)));
 }
 
@@ -512,7 +556,8 @@ fn evaluate_forbidden_caps_must_all_be_absent() {
         ..PeerProcessChecks::EMPTY
     };
     let snap = snapshot("/x", 1001, capability::CAP_SYS_PTRACE);
-    let err = evaluate_process_checks(&checks, 1001, &snap, |_| Vec::new()).unwrap_err();
+    let err =
+        evaluate_process_checks(&checks, Some(LAYOUT), 1001, &snap, |_| Vec::new()).unwrap_err();
     let ProcessCheckFailure::HoldsForbiddenCapabilities(held) = err else {
         panic!("got {err:?}");
     };
@@ -526,14 +571,15 @@ fn evaluate_forbidden_caps_pass_when_absent() {
         ..PeerProcessChecks::EMPTY
     };
     let snap = snapshot("/x", 1001, capability::CAP_NET_ADMIN);
-    evaluate_process_checks(&checks, 1001, &snap, |_| Vec::new()).expect("forbidden cap not held");
+    evaluate_process_checks(&checks, Some(LAYOUT), 1001, &snap, |_| Vec::new())
+        .expect("forbidden cap not held");
 }
 
 // --- UdsPeerAccount builders -------------------------------------------
 
 #[test]
 fn account_builders_compose() {
-    let acct = UdsPeerAccount::with_linux_user(users::SPACE_SBXMGR)
+    let acct = UdsPeerAccount::with_fallback_uid(SBXMGR, SBXMGR_UID)
         .require_binary(&["/opt/space/bin/space-sbxmgr-svc"])
         .forbid_capabilities(capability::CAP_SYS_PTRACE);
     assert_eq!(acct.process_checks.binary_paths.len(), 1);
@@ -546,7 +592,7 @@ fn account_builders_compose() {
 
 #[test]
 fn unconfigured_checks_are_not_configured() {
-    let acct = UdsPeerAccount::with_linux_user(users::SPACE_SBXMGR);
+    let acct = UdsPeerAccount::with_fallback_uid(SBXMGR, SBXMGR_UID);
     assert!(!acct.process_checks.is_configured());
 }
 
@@ -762,7 +808,7 @@ fn require_local_authority_peer_is_the_shared_operator_boundary() {
     // authority=cluster is always allowed, regardless of principal.
     for principal in [
         UdsPeerPrincipal::Root,
-        UdsPeerPrincipal::Service(user_names::SPACE_NODEAPI),
+        UdsPeerPrincipal::Service(NODEAPI),
         UdsPeerPrincipal::Role(LocalRole::Observer),
         UdsPeerPrincipal::Other,
     ] {
@@ -783,8 +829,8 @@ fn require_local_authority_peer_is_the_shared_operator_boundary() {
         .expect("operator may set local");
 
     for principal in [
-        UdsPeerPrincipal::Service(user_names::SPACE_NODEAPI),
-        UdsPeerPrincipal::Service(user_names::SPACE_NODECTL),
+        UdsPeerPrincipal::Service(NODEAPI),
+        UdsPeerPrincipal::Service(NODECTL),
         UdsPeerPrincipal::Role(LocalRole::Observer),
         UdsPeerPrincipal::Other,
     ] {

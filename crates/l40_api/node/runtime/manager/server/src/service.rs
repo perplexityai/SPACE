@@ -85,7 +85,10 @@ impl RuntimeManagerService {
             audit_identity: AuditIdentity::of_this_process(),
             peer_authorizer: UdsPeerAuthorizer::new_with_default_local_roles(
                 SERVICE_NAME.as_str(),
-                [UdsPeerAccount::with_linux_user(users::SPACE_NODECTL)],
+                [UdsPeerAccount::with_fallback_uid(
+                    users::SPACE_NODECTL.name,
+                    users::SPACE_NODECTL.uid,
+                )],
             ),
             kernel_source: Default::default(),
             installer: None,

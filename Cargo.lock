@@ -6708,6 +6708,7 @@ dependencies = [
  "pplx-space-metrics",
  "pplx-space-net-common",
  "pplx-space-test-env",
+ "pplx-space-uds-peer-auth",
  "prost",
  "rustix",
  "semver",
@@ -7877,7 +7878,6 @@ version = "0.8.1"
 dependencies = [
  "http 1.5.0",
  "nix 0.31.3",
- "pplx-space-common-core",
  "pplx-space-metrics",
  "tempfile",
  "thiserror 2.0.20",

@@ -190,9 +190,18 @@ impl NodeCredentialManager {
                 UdsPeerAuthorizer::new(
                     "space-credential-manager",
                     [
-                        UdsPeerAccount::with_linux_user(users::SPACE_SBXMGR),
-                        UdsPeerAccount::with_linux_user(users::SPACE_TMPLMGR),
-                        UdsPeerAccount::with_linux_user(users::SPACE_VOLMGR),
+                        UdsPeerAccount::with_fallback_uid(
+                            users::SPACE_SBXMGR.name,
+                            users::SPACE_SBXMGR.uid,
+                        ),
+                        UdsPeerAccount::with_fallback_uid(
+                            users::SPACE_TMPLMGR.name,
+                            users::SPACE_TMPLMGR.uid,
+                        ),
+                        UdsPeerAccount::with_fallback_uid(
+                            users::SPACE_VOLMGR.name,
+                            users::SPACE_VOLMGR.uid,
+                        ),
                     ],
                 )
                 .with_process_check_mode(peer_process_check_mode),

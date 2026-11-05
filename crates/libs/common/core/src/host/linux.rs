@@ -165,7 +165,9 @@ pub mod paths {
     /// scripts in lockstep when the install surface changes.
     ///
     /// Used to configure
-    /// `pplx_space_common_svc::UdsPeerAccount::require_binary`.
+    /// `pplx_space_uds_peer_auth::UdsPeerAccount::require_binary`, with
+    /// [`SPACE_SYSTEMD_BIN_DIR`] and [`SPACE_SYSTEMD_APPS_DIR`] as the
+    /// authorizer's `ContentAddressedInstalls`.
     macro_rules! space_svc_binaries {
         ($($name:literal),+ $(,)?) => {
             &[$(
@@ -184,46 +186,6 @@ pub mod paths {
     pub const SPACE_SBXMGR_UID_BINARIES: &[&str] = space_svc_binaries!("space-sbxmgr-svc");
     pub const SPACE_VOLMGR_SVC_BINARIES: &[&str] = space_svc_binaries!("space-volmgr-svc");
     pub const SPACE_TMPLMGR_SVC_BINARIES: &[&str] = space_svc_binaries!("space-tmplmgr-svc");
-
-    /// Marker the kernel appends to a `/proc/<pid>/exe` readlink target
-    /// when the backing inode was unlinked while the process kept running.
-    const EXE_DELETED_MARKER: &str = " (deleted)";
-
-    /// Strip a trailing kernel ` (deleted)` marker from a `/proc/<pid>/exe`
-    /// readlink target. The systemd deploy never unlinks a running inode's
-    /// path (`deploy_binaries` uploads a fresh [`SPACE_SYSTEMD_APPS_DIR`]
-    /// digest file and repoints the [`SPACE_SYSTEMD_BIN_DIR`] symlink); the
-    /// marker's producers are in-place replacement under the Helm bin dir
-    /// and any future GC of old digest installs. Conservative: only the
-    /// literal trailing marker goes.
-    pub fn strip_exe_deleted_marker(path: &Path) -> PathBuf {
-        if let Some(s) = path.to_str()
-            && let Some(stripped) = s.strip_suffix(EXE_DELETED_MARKER)
-        {
-            return PathBuf::from(stripped);
-        }
-        path.to_path_buf()
-    }
-
-    /// Whether a raw `/proc/<pid>/exe` readlink target carries the kernel's
-    /// trailing ` (deleted)` marker — the backing inode was unlinked while
-    /// the process kept running.
-    pub fn exe_link_was_deleted(path: &Path) -> bool {
-        path.to_str()
-            .is_some_and(|s| s.ends_with(EXE_DELETED_MARKER))
-    }
-
-    /// True when `file_name` is `binary`'s content-addressed install name,
-    /// `<binary>-<sha256[:8]>` (exactly 8 lowercase hex).
-    pub fn is_content_addressed_binary_file_name(file_name: &str, binary: &str) -> bool {
-        let Some(digest) = file_name
-            .strip_prefix(binary)
-            .and_then(|rest| rest.strip_prefix('-'))
-        else {
-            return false;
-        };
-        digest.len() == 8 && digest.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f'))
-    }
 
     pub const SPACED_HOST_SOCKET_DIR: &str = SPACE_RUN_DIR;
     pub const SPACED_HOST_SOCKET_FILE: &str = "spaced-host.sock";

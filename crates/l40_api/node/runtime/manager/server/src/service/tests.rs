@@ -489,7 +489,7 @@ async fn artifact_mutations_require_an_operator_and_an_enabled_installer() {
     service.peer_authorizer = UdsPeerAuthorizer::new(
         "runtime-manager-test",
         [
-            UdsPeerAccount::with_linux_user(users::SPACE_NODECTL),
+            UdsPeerAccount::with_fallback_uid(users::SPACE_NODECTL.name, users::SPACE_NODECTL.uid),
             pplx_space_common_svc::UdsPeerAccount::role_with_fallback_uid(
                 "rtmgr-test-observer",
                 LocalRole::Observer,

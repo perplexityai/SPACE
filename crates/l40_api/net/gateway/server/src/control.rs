@@ -76,7 +76,10 @@ impl NetGatewayControlService {
             shutdown_token,
             peer_authorizer: UdsPeerAuthorizer::new_with_default_local_roles(
                 "space-net-gateway",
-                [UdsPeerAccount::with_linux_user(users::SPACE_SBXMGR)],
+                [UdsPeerAccount::with_fallback_uid(
+                    users::SPACE_SBXMGR.name,
+                    users::SPACE_SBXMGR.uid,
+                )],
             ),
         }
     }

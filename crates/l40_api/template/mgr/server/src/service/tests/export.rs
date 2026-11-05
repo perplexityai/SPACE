@@ -47,7 +47,7 @@ async fn export_enforces_forwarded_authority(
     service.peer_authorizer = UdsPeerAuthorizer::new(
         "template-export-test",
         [
-            UdsPeerAccount::with_linux_user(users::SPACE_NODEAPI),
+            UdsPeerAccount::with_fallback_uid(users::SPACE_NODEAPI.name, users::SPACE_NODEAPI.uid),
             UdsPeerAccount::role_with_fallback_uid(
                 "template-export-operator",
                 LocalRole::Operator,

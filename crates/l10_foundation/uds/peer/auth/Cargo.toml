@@ -18,7 +18,6 @@ tonic = { workspace = true }
 tracing = { workspace = true }
 
 # internal
-pplx-space-common-core = { workspace = true }
 pplx-space-metrics = { workspace = true }
 
 [dev-dependencies]

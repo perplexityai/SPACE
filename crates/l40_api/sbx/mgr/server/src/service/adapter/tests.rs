@@ -182,7 +182,7 @@ async fn artifact_transfer_handlers_admit_only_local_operators() {
     service.peer_authorizer = UdsPeerAuthorizer::new(
         "artifact-test",
         [
-            UdsPeerAccount::with_linux_user(users::SPACE_NODEAPI),
+            UdsPeerAccount::with_fallback_uid(users::SPACE_NODEAPI.name, users::SPACE_NODEAPI.uid),
             UdsPeerAccount::role_with_fallback_uid(
                 "artifact-test-operator",
                 LocalRole::Operator,

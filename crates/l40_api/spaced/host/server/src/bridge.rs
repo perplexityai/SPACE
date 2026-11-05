@@ -797,7 +797,10 @@ impl SpacedHostService {
                 host_peer_authorization: config.host_peer_authorization,
                 host_peer_authorizer: UdsPeerAuthorizer::new(
                     "space-spaced-host",
-                    [UdsPeerAccount::with_linux_user(users::SPACE_SBXMGR)],
+                    [UdsPeerAccount::with_fallback_uid(
+                        users::SPACE_SBXMGR.name,
+                        users::SPACE_SBXMGR.uid,
+                    )],
                 ),
             }),
         }

@@ -119,6 +119,27 @@ fn decrypt_request(
 }
 
 #[test]
+fn uds_peer_binary_checks_admit_the_systemd_content_addressed_installs() {
+    // The systemd deploy installs each build under /space/apps and repoints
+    // the /space/bin symlink the allowlists name; without this layout every
+    // peer exec'd through that symlink fails the binary check under enforce.
+    let service = CredentialManagerService::new(
+        Arc::new(InMemoryKeyWrapper::new()),
+        PeerProcessCheckMode::Off,
+    );
+    assert_eq!(
+        service
+            .caller_resolver
+            .uds_authorizer()
+            .content_addressed_installs(),
+        Some(ContentAddressedInstalls {
+            bin_dir: "/space/bin",
+            apps_dir: "/space/apps",
+        })
+    );
+}
+
+#[test]
 fn over_long_purpose_is_rejected_not_truncated() {
     // The AAD encodes purpose length in a u16 prefix. A purpose longer
     // than u16::MAX must be rejected, not silently truncated — otherwise

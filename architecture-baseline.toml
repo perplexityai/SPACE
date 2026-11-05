@@ -128,9 +128,6 @@ pplx-space-observability = [
   "pplx-space-cluster-id",
   "pplx-space-common-core",
 ]
-pplx-space-uds-peer-auth = [
-  "pplx-space-common-core",
-]
 
 [layers.domain_dependencies]
 pplx-space-common-core = [
