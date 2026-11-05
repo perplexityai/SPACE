@@ -155,6 +155,81 @@ async fn restore_defers_guest_readiness_only_while_paused() {
     }
 }
 
+/// A restored guest runs the agent its snapshot captured, so a Started restore
+/// reports that agent's version the way a fresh boot does. A paused restore
+/// never asks the guest and reports nothing.
+#[tokio::test(start_paused = true)]
+async fn started_restore_reports_the_restored_agent_on_guest_ready() {
+    use pplx_space_spaced_host_client::proto::{VersionInfo, WaitReadyResponse};
+    use tracing_subscriber::layer::SubscriberExt as _;
+
+    let capture = super::super::tests::service_tests::SandboxEventCapture::default();
+    let _subscriber =
+        tracing::subscriber::set_default(tracing_subscriber::registry().with(capture.clone()));
+    for final_state in [SandboxState::Started, SandboxState::Paused] {
+        let conn = crate::db::test_conn();
+        let id = SandboxId::new().to_string();
+        insert_test_sandbox(&conn, &id, SandboxState::Restoring);
+        // Pool members skip the network gate; no gateway exists here.
+        crate::db::set_pool_template(&conn, &id, Some("seed")).unwrap();
+        let db = crate::db::SharedConnection::new(conn);
+        complete_restore_after_guest_ready(
+            db.clone(),
+            &id,
+            &BTreeMap::new(),
+            final_state,
+            None,
+            async {
+                Ok(WaitReadyResponse {
+                    guest_uptime: Some(prost_types::Duration {
+                        seconds: 40,
+                        nanos: 0,
+                    }),
+                    guest_version: Some(VersionInfo {
+                        version: "0.1.2".to_string(),
+                        compatibility_family: "0.1".to_string(),
+                    }),
+                    ..Default::default()
+                })
+            },
+        )
+        .await
+        .unwrap_or_else(|error| panic!("{final_state:?} restore failed: {error}"));
+        assert_eq!(
+            crate::db::get_sandbox(&db.lock().unwrap(), &id)
+                .unwrap()
+                .unwrap()
+                .state,
+            final_state
+        );
+
+        let events = capture.events.lock().unwrap();
+        let guest_ready = events
+            .iter()
+            .filter(|event| {
+                event.get("sandbox_id") == Some(&id)
+                    && event.get("event_type").map(String::as_str) == Some("guest_ready")
+            })
+            .collect::<Vec<_>>();
+        if final_state == SandboxState::Started {
+            let [event] = guest_ready.as_slice() else {
+                panic!("expected one guest_ready, got {guest_ready:?}");
+            };
+            assert_eq!(event.get("operation").map(String::as_str), Some("restore"));
+            assert_eq!(
+                event.get("spaced_version").map(String::as_str),
+                Some("0.1.2")
+            );
+            assert_eq!(
+                event.get("guest_uptime_ms").map(String::as_str),
+                Some("40000")
+            );
+        } else {
+            assert!(guest_ready.is_empty(), "{guest_ready:?}");
+        }
+    }
+}
+
 #[tokio::test]
 async fn start_guest_failure_preserves_terminal_status_and_activation_ownership() {
     for (code, superseded) in [
@@ -394,6 +469,40 @@ fn guest_observed_specs_log_identifies_the_sandbox_and_observed_values() {
             ("vcpu_count".to_string(), "4".to_string()),
         ])
     );
+}
+
+#[test]
+fn guest_ready_event_carries_the_version_the_ready_guest_reported() {
+    use pplx_space_spaced_host_client::proto::{VersionInfo, WaitReadyResponse};
+
+    let response = WaitReadyResponse {
+        guest_uptime: Some(prost_types::Duration {
+            seconds: 2,
+            nanos: 500_000_000,
+        }),
+        guest_version: Some(VersionInfo {
+            version: "0.1.2".to_string(),
+            compatibility_family: "0.1".to_string(),
+        }),
+        ..Default::default()
+    };
+    let details = guest_ready_event_details("start", Duration::from_millis(1_250), Some(&response));
+    assert_eq!(details.operation.as_deref(), Some("start"));
+    assert_eq!(details.elapsed_ms.as_deref(), Some("1250"));
+    assert_eq!(details.guest_uptime_ms.as_deref(), Some("2500"));
+    assert_eq!(details.spaced_version.as_deref(), Some("0.1.2"));
+
+    // A sidecar that predates readiness identity omits the version rather
+    // than reporting a placeholder; a TCP-service guest has no agent at all.
+    let legacy = WaitReadyResponse {
+        guest_version: None,
+        ..response
+    };
+    let details = guest_ready_event_details("start", Duration::ZERO, Some(&legacy));
+    assert_eq!(details.spaced_version, None);
+    let details = guest_ready_event_details("start", Duration::ZERO, None);
+    assert_eq!(details.guest_uptime_ms, None);
+    assert_eq!(details.spaced_version, None);
 }
 
 /// Every activation stage, paired with whether its failure carries a
