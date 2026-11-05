@@ -598,13 +598,20 @@ async fn accepted_build_without_builder_identity_records_unpinned_routing(
 }
 
 #[rstest]
+#[case::legacy(None)]
+#[case::selected(Some(format!("sha256:{}", "1".repeat(64))))]
 #[tokio::test]
 async fn accepted_build_with_builder_identity_records_routing(
     #[future] template_controller_fixture: TestDbResult<TemplateControllerFixture>,
+    #[case] environment: Option<String>,
 ) -> TestDbResult<()> {
     let fixture = template_controller_fixture.await?;
     let template_name = TemplateName::parse("code-runtime").unwrap();
     let (job_id, response) = accepted_build(Some(fixture.builder_node_id));
+    let response = BuildTemplateResponse {
+        environment: environment.clone(),
+        ..response
+    };
 
     let actual = fixture
         .controller
@@ -618,6 +625,7 @@ async fn accepted_build_with_builder_identity_records_routing(
     let builder_node = fixture.store.find_builder_node(job_id).await?;
 
     assert_eq!(actual.job_id, job_id.to_string());
+    assert_eq!(actual.environment, environment);
     assert_eq!(job.map(|job| job.daemon_job_id), Some(job_id));
     assert_eq!(builder_node, Some(fixture.builder_node_id));
     Ok(())

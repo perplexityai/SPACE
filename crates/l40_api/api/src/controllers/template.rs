@@ -172,16 +172,25 @@ impl TemplateBuildSubmission {
     }
 
     fn into_start_build_request(self, grant: Option<PublicationGrant>) -> StartBuildRequest {
-        let environment = self.environment;
-        let mut request = StartBuildRequest {
-            environment: None,
+        let (recipe, environment) = match self.environment {
+            Some(reference) => (
+                None,
+                Some(build_proto::EnvironmentBuildInput {
+                    reference: reference.to_string(),
+                    recipe: Some(self.recipe),
+                }),
+            ),
+            None => (Some(self.recipe), None),
+        };
+        StartBuildRequest {
+            environment,
             system_publication_grant_id: grant
                 .and_then(PublicationGrant::system)
                 .map(|grant| grant.to_string()),
             tenant_publication_grant_id: grant
                 .and_then(PublicationGrant::tenant)
                 .map(|grant| grant.to_string()),
-            recipe: Some(self.recipe),
+            recipe,
             template_id: self.target.template_name().to_string(),
             options: Some(BuildOptions {
                 force: self.force,
@@ -192,12 +201,7 @@ impl TemplateBuildSubmission {
                 TemplateBuildTarget::Organization(_) => Some(self.org_id.to_string()),
                 TemplateBuildTarget::System(_) => None,
             },
-        };
-        if let Some(reference) = environment {
-            // The recipe moves out of the legacy arm so old readers reject, never default.
-            pplx_space_build_mgr_client::environment::bind(&mut request, reference);
         }
-        request
     }
 }
 
@@ -393,7 +397,6 @@ impl TemplateController {
             }
         };
         let job_id = response.job_id.parse::<BuildRunId>().ok();
-        let acknowledged_environment = response.environment.clone();
         let recorded = self
             .record_template_build_response(
                 org_id,
@@ -406,7 +409,7 @@ impl TemplateController {
             .await
             .map_err(|error| TemplateBuildSubmitError::MaybeAccepted { error, job_id })?;
         if let Some(environment) = environment
-            && acknowledged_environment.as_deref() != Some(environment.to_string().as_str())
+            && recorded.environment.as_deref() != Some(environment.to_string().as_str())
         {
             return Err(TemplateBuildSubmitError::MaybeAccepted {
                 error: ControllerError::internal(
@@ -584,7 +587,7 @@ impl TemplateController {
             })?;
 
         Ok(StartBuildResponse {
-            environment: None,
+            environment: response.environment,
             job_id: job_id.to_string(),
         })
     }
