@@ -337,19 +337,20 @@ class NativeRecoveryControl:
                 "dispatcher fairness requires at least two execution slots and a tick of at most 5 s"
             )
 
-    def _patch_budget_env(self, expected: list[dict], desired: list[dict], *, remove: bool = False) -> None:
+    def _patch_env(self, name: str, expected: list[dict], desired: list[dict], *, remove: bool = False) -> None:
         self._fence()
-        name = "space-cluster-controller"
-        self.harness.set_native_operation_probe_budgets(
-            expected, desired, expected_uid=self._captures[name].uid, remove=remove
-        )
+        patch = {
+            "space-cluster-controller": self.harness.set_native_operation_probe_budgets,
+            "space-data-plane": self.harness.set_native_file_upload_admission_env,
+        }[name]
+        patch(expected, desired, expected_uid=self._captures[name].uid, remove=remove)
         self._wait(name, self._captures[name].replicas)
 
-    def _verify_budget_env(self, values: Mapping[str, str | None]) -> None:
-        for pod in self._pods("space-cluster-controller"):
+    def _verify_env(self, name: str, values: Mapping[str, str | None]) -> None:
+        for pod in self._pods(name):
             containers = pod["spec"]["containers"]
             if len(containers) != 1:
-                raise SmokeConfigurationError("controller budget verification requires one container")
+                raise SmokeConfigurationError(f"{name} env verification requires one container")
             for key, value in values.items():
                 entries = [entry for entry in containers[0].get("env", []) if entry.get("name") == key]
                 matches = not entries if value is None else (
@@ -357,37 +358,31 @@ class NativeRecoveryControl:
                     and entries[0].get("value", "") == value
                 )
                 if not matches:
-                    raise SmokeConfigurationError(f"running controller pod did not restore budget {key}")
+                    raise SmokeConfigurationError(f"running {name} pod did not take {key}")
 
     @contextmanager
-    def operation_age_limit(self, *, seconds: int = 5, readiness_seconds: int | None = None) -> Iterator[None]:
-        """Shorten only probe deadlines and restore their exact deployment entries."""
-        if not 1 <= seconds <= 30 or readiness_seconds is not None and not 1 <= readiness_seconds <= 30:
-            raise ValueError("probe operation budgets must be between 1 and 30 seconds")
+    def _scoped_env(self, name: str, values: Mapping[str, str], label: str) -> Iterator[None]:
+        """Set `values` on `name`'s pods while the body runs, then put back their exact entries."""
         self._fence()
-        name = "space-cluster-controller"
-        values = {M1_AGE_ENV: str(seconds)}
-        if readiness_seconds is not None:
-            values.update({key: str(readiness_seconds) for key in READINESS_BUDGET_ENVS})
         standing = self.harness._deployment_env_literals(name, tuple(values))
         deployment = self._deployment(name)
         containers = deployment["spec"]["template"]["spec"]["containers"]
         if len(containers) != 1:
-            raise SmokeConfigurationError("controller budget override requires one container")
+            raise SmokeConfigurationError(f"{name} env override requires one container")
         original = containers[0].get("env", [])
         had_env = "env" in containers[0]
         changed = [dict(entry) for entry in original]
         for key, value in values.items():
             matches = [entry for entry in changed if entry.get("name") == key]
             if len(matches) > 1:
-                raise SmokeConfigurationError("controller budget environment contains duplicate entries")
+                raise SmokeConfigurationError(f"{name} environment contains duplicate entries")
             if matches:
                 matches[0]["value"] = value
             else:
                 changed.append({"name": key, "value": value})
         applied = False
 
-        def restore_budgets() -> None:
+        def restore_env() -> None:
             nonlocal applied
             if not applied:
                 return
@@ -396,34 +391,62 @@ class NativeRecoveryControl:
                 # The attempted mutation may have failed before committing.
                 self._wait(name, self._captures[name].replicas)
             else:
-                self._patch_budget_env(changed, original, remove=not had_env)
-            self._verify_budget_env(standing)
+                self._patch_env(name, changed, original, remove=not had_env)
+            self._verify_env(name, standing)
             applied = False
-            self.context.record("native_probe_budgets_restored", True)
+            self.context.record(f"{label}_restored", True)
 
-        fallback = self.context.scope.defer(
-            "restore native operation probe budgets", restore_budgets, critical=True
-        )
+        fallback = self.context.scope.defer(f"restore {label}", restore_env, critical=True)
         primary = None
         try:
             # Arm before patch dispatch: a lost response can still commit.
             applied = True
-            self._patch_budget_env(original, changed)
-            self._verify_budget_env(values)
-            self.context.record("native_probe_budgets", values)
+            self._patch_env(name, original, changed)
+            self._verify_env(name, values)
+            self.context.record(label, dict(values))
             yield
         except BaseException as error:
             primary = error
             raise
         finally:
             try:
-                restore_budgets()
+                restore_env()
                 fallback.disarm()
             except Exception as error:
-                self.context.record("native_probe_budget_restore_failure", str(error))
+                self.context.record(f"{label}_restore_failure", str(error))
                 if primary is None:
                     raise
-                primary.add_note(f"Operation budget restoration also failed: {error}")
+                primary.add_note(f"Restoring {label} also failed: {error}")
+
+    @contextmanager
+    def operation_age_limit(self, *, seconds: int = 5, readiness_seconds: int | None = None) -> Iterator[None]:
+        """Shorten only probe deadlines and restore their exact deployment entries."""
+        if not 1 <= seconds <= 30 or readiness_seconds is not None and not 1 <= readiness_seconds <= 30:
+            raise ValueError("probe operation budgets must be between 1 and 30 seconds")
+        values = {M1_AGE_ENV: str(seconds)}
+        if readiness_seconds is not None:
+            values.update({key: str(readiness_seconds) for key in READINESS_BUDGET_ENVS})
+        with self._scoped_env("space-cluster-controller", values, "native_probe_budgets"):
+            yield
+
+    @contextmanager
+    def one_upload_per_sandbox(self) -> Iterator[None]:
+        """Turn the data plane's Native upload admission on at one write per
+        sandbox with no wait, and put back its exact entries after."""
+        with self._scoped_env(
+            "space-data-plane",
+            {
+                "SPACE_DATA_PLANE_NATIVE_UPLOAD_ADMISSION": "true",
+                "SPACE_DATA_PLANE_MAX_CONCURRENT_NATIVE_UPLOADS_PER_SANDBOX": "1",
+                "SPACE_DATA_PLANE_NATIVE_UPLOAD_ADMISSION_WAIT_MS": "0",
+            },
+            "native_upload_admission",
+        ):
+            yield
+
+    def data_plane_replicas(self) -> int:
+        """The data plane's replica count, pinned while the faults run."""
+        return self._captures["space-data-plane"].replicas
 
     def restart(self, name: str) -> None:
         before = self.begin_restart(name)
