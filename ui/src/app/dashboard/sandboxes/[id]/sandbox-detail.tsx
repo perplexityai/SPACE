@@ -70,7 +70,7 @@ import type {
 import { tablePagination } from '@/lib/table-pagination';
 import { useAuth } from '@/lib/auth';
 import { isOwnOrg } from '@/lib/own-org';
-import { latestResponse } from '@/lib/latest-response';
+import { serialReads } from '@/lib/serial-reads';
 import { listsSnapshotsOn } from '@/lib/admin-fallback';
 import { RollbackButton, RollbackRefusalNote, useSnapshotRollback, type SnapshotRollback } from '@/components/snapshot-rollback';
 import { rollbackRoute, rollbackTargets, snapshotTimeMs, type RollbackTarget } from '@/lib/rollback-targets';
@@ -1267,9 +1267,9 @@ export default function SandboxDetailPage({ dashboardUrl }: { dashboardUrl: stri
   const [insightGeneration, setInsightGeneration] = useState(0);
   // Only the newest insight request may write its answers.
   const insightRequest = useRef(0);
-  // Only the newest sandbox read may write the row and when it was read: an
-  // older one finishing last would date stale periodic state as the newest.
-  const sandboxRead = useRef(latestResponse()).current;
+  // Sandbox reads run one at a time, so an older answer never lands after a
+  // newer one.
+  const sandboxReads = useRef(serialReads()).current;
   const [nowMs, setNowMs] = useState(() => Date.now());
   const sandboxRef = useRef<Sandbox | null>(null);
   sandboxRef.current = sandbox;
@@ -1310,14 +1310,10 @@ export default function SandboxDetailPage({ dashboardUrl }: { dashboardUrl: stri
     }
   };
 
-  const refresh = async (showSpinner = false): Promise<boolean> => {
-    if (showSpinner) setLoading(true);
-    // A read that a newer one has overtaken still says whether it found the
-    // sandbox, but writes nothing.
-    const current = sandboxRead.begin();
+  // Reads the sandbox row and writes what it found; true when it found it.
+  const readSandbox = async (showSpinner: boolean): Promise<boolean> => {
     try {
       const loaded = await getConsoleSandbox(safeDecodeURIComponent(id));
-      if (!current()) return true;
       // The insight reads that follow use the org before the next render.
       sandboxRef.current = loaded;
       setSandbox(loaded);
@@ -1326,7 +1322,6 @@ export default function SandboxDetailPage({ dashboardUrl }: { dashboardUrl: stri
       setErrorStatus(null);
       return true;
     } catch (err: any) {
-      if (!current()) return false;
       const status = typeof err?.status === 'number' ? err.status : null;
       setError(err.message || 'Failed to load sandbox');
       setErrorStatus(status);
@@ -1342,6 +1337,13 @@ export default function SandboxDetailPage({ dashboardUrl }: { dashboardUrl: stri
     } finally {
       if (showSpinner) setLoading(false);
     }
+  };
+
+  // Refresh, and the read after an action: once a pending read finishes, so
+  // it still sees what the action changed.
+  const refresh = (showSpinner = false): Promise<boolean> => {
+    if (showSpinner) setLoading(true);
+    return sandboxReads.next(() => readSandbox(showSpinner));
   };
 
   useEffect(() => {
@@ -1363,8 +1365,9 @@ export default function SandboxDetailPage({ dashboardUrl }: { dashboardUrl: stri
       if (typeof document !== 'undefined' && document.hidden) return;
       // A sandbox that was missing (still being created) loads its debug and
       // operations as soon as it appears, not at the next insight tick.
+      // A tick whose read would overlap a pending one skips it.
       const wasMissing = !sandboxRef.current;
-      void refresh(false).then((found) => {
+      void sandboxReads.poll(() => readSandbox(false))?.then((found) => {
         if (found && wasMissing) void loadInsight(true);
       });
       ticks += 1;
