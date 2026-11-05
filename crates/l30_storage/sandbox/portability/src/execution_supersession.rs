@@ -34,9 +34,10 @@ pub struct ExecutionSupersessionRow {
     /// same statements that record or clear a `pod_uid`; `pod_uid` alone is
     /// current state, which re-materialization, failed-recovery pod absence
     /// and a cross-node re-drive's reset clear after the pod may have run. The
-    /// record can be NULL on rows that predate it, so a non-blank `pod_uid`
-    /// counts too, and a row whose `pod_uid` a writer from before the record
-    /// cleared reads as never having run, as it did before the record existed.
+    /// record is NULL on a row whose `pod_uid` was recorded before the record
+    /// existed and that no current writer has recorded or cleared since, so a
+    /// non-blank `pod_uid` counts too. Such a row whose `pod_uid` an older
+    /// writer cleared reads as never having run.
     ///
     /// The store records a pod's UID when it creates the pod, before the
     /// scheduler places it, so a created pod counts even if it never started:
