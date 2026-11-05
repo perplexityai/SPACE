@@ -4789,15 +4789,24 @@ async fn observed_demand_release_matching_characterization() -> TestResult {
         // to stop that.
         (hex('a'), "deleting", Some(|w| w.bare)),
     ];
+    let fixture = postgres_fixture().await?;
+    let w = seed_resolver_releases(&fixture.pool).await?;
+    upsert_warm_pool_policy(&fixture.pool, RESOLVER_TEMPLATE, 2, 10, 1).await?;
     for (demand_hash, desired_state, expected) in cases {
-        let fixture = postgres_fixture().await?;
-        let w = seed_resolver_releases(&fixture.pool).await?;
+        // The cases share one database. Each starts as a fresh one would:
+        // no demand and no pool configs.
+        sqlx::query("DELETE FROM sandboxes WHERE template_id = $1")
+            .bind(RESOLVER_TEMPLATE)
+            .execute(&fixture.pool)
+            .await?;
+        sqlx::query("DELETE FROM kubernetes_pool_configs")
+            .execute(&fixture.pool)
+            .await?;
         sqlx::query("UPDATE templates SET desired_state = $2 WHERE name = $1")
             .bind(RESOLVER_TEMPLATE)
             .bind(desired_state)
             .execute(&fixture.pool)
             .await?;
-        upsert_warm_pool_policy(&fixture.pool, RESOLVER_TEMPLATE, 2, 10, 1).await?;
         for _ in 0..10 {
             insert_sandbox_for_template(
                 &fixture.pool,
