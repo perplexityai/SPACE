@@ -76,14 +76,19 @@ pub(super) fn record_pool_claim(surface: SandboxApiSurface, template: &str, sand
     );
 }
 
-/// Record an activation's or resume's size, read from the sandbox row it
-/// runs.
-pub(super) fn record_lifecycle_action(
-    kind: RequestedKind,
+/// Record an eligible activation or resume on success or admission rejection.
+pub(super) fn record_lifecycle_action<T>(
+    kind: Option<RequestedKind>,
     surface: SandboxApiSurface,
-    admission: AdmissionDecision,
     sandbox: &Sandbox,
+    result: &Result<T, ControllerError>,
 ) {
+    let Some(kind) = kind else {
+        return;
+    };
+    let Some(admission) = admission(result) else {
+        return;
+    };
     emit(
         kind,
         surface,

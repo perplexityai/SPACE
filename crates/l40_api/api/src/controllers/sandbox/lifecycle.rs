@@ -533,6 +533,16 @@ impl SandboxAction {
         }
     }
 
+    fn requested_kind(self, lifecycle: Option<SandboxLifecycle>) -> Option<RequestedKind> {
+        if self.activation_class(lifecycle).is_some() {
+            Some(RequestedKind::Activate)
+        } else if self == Self::Resume && lifecycle == Some(SandboxLifecycle::Paused) {
+            Some(RequestedKind::Resume)
+        } else {
+            None
+        }
+    }
+
     pub fn pause_or_checkpoint(self) -> bool {
         matches!(self, Self::Pause | Self::Checkpoint)
     }
@@ -1447,20 +1457,9 @@ impl SandboxController {
                 .await;
         };
 
-        // An action that activates the sandbox from its lifecycle at entry,
-        // or a resume of a paused one, requests its size. A follower that
-        // joins another caller's activation clears it: it requested nothing
-        // of its own.
+        // Classify at entry; callers that join another activation clear this.
         let entry_lifecycle = sandbox.lifecycle.parse::<SandboxLifecycle>().ok();
-        let mut requested_kind = if action.activation_class(entry_lifecycle).is_some() {
-            Some(RequestedKind::Activate)
-        } else if action == SandboxAction::Resume
-            && entry_lifecycle == Some(SandboxLifecycle::Paused)
-        {
-            Some(RequestedKind::Resume)
-        } else {
-            None
-        };
+        let mut requested_kind = action.requested_kind(entry_lifecycle);
         // The body's early returns leave this block, so the sample below sees
         // every outcome.
         let result: Result<serde_json::Value, ControllerError> = async {
@@ -2153,16 +2152,12 @@ impl SandboxController {
             Ok(body)
         }
         .await;
-        if let Some(kind) = requested_kind
-            && let Some(admission) = requested_size_metrics::admission(&result)
-        {
-            requested_size_metrics::record_lifecycle_action(
-                kind,
-                metric_identity.surface,
-                admission,
-                sandbox,
-            );
-        }
+        requested_size_metrics::record_lifecycle_action(
+            requested_kind,
+            metric_identity.surface,
+            sandbox,
+            &result,
+        );
         result
     }
 
