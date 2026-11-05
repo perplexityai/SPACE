@@ -172,6 +172,8 @@ pub async fn create_sandbox(
         Err(err) => return err.into_response(),
     };
     let org_id = request.org_id;
+    let requested_by =
+        crate::public_sandbox_operations::admin_create_requested_by_enabled().then_some(actor.id);
     if let Err(err) = admin_create_precheck(
         &state.pool,
         &request,
@@ -186,7 +188,7 @@ pub async fn create_sandbox(
         return err.into_response();
     }
     // The organization resolved; every answer from here names it.
-    match create_sandbox_for_org(&state.pool, request, &idempotency_key, actor.id).await {
+    match create_sandbox_for_org(&state.pool, request, &idempotency_key, requested_by).await {
         Ok(response) => {
             audit::record_sandbox(AdminSandboxAuditEntry {
                 actor: &actor,
@@ -252,7 +254,7 @@ async fn create_sandbox_for_org(
     pool: &sqlx::PgPool,
     request: AdminCreateSandboxRequest,
     idempotency_key: &IdempotencyKey,
-    requested_by: UserId,
+    requested_by: Option<UserId>,
 ) -> Result<SandboxOperationResponse, AdminSandboxActionError> {
     let org_id = request.org_id;
     let internal = |error: &dyn std::fmt::Display| {
@@ -306,7 +308,7 @@ async fn create_sandbox_for_org(
         node_pool: request.node_pool,
         federated_create: None,
         pool_claim: None,
-        requested_by_user_id: Some(requested_by),
+        requested_by_user_id: requested_by,
     }
     .into_json();
 

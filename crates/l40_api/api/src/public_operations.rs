@@ -3843,8 +3843,9 @@ pub struct AdminPublicOperationRecord {
     pub target_id: Option<String>,
     /// For a sandbox create, the administrator who submitted it on behalf of
     /// `actor_user_id`, when the create recorded one. `None` for every other
-    /// kind, for a create the owner requested, and for an admin create an
-    /// older API release queued without recording its requester.
+    /// kind, for a create the owner requested, and for an admin create queued
+    /// by an older API release or while `SPACE_ADMIN_CREATE_REQUESTED_BY_ENABLED`
+    /// was off.
     pub requested_by_user_id: Option<UserId>,
     pub progress_message: String,
     pub terminal_error_code: Option<PublicErrorCode>,

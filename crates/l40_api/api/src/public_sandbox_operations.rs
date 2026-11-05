@@ -94,10 +94,8 @@ pub struct CreateSandboxOperationPayload {
     ///
     /// Same mixed-version rule as `node_pool`: absent payloads serialize
     /// byte-identically and old payloads parse unchanged, while a present key
-    /// is rejected by an older executor's `deny_unknown_fields`. Every admin
-    /// create sets it, so every `space-cluster-controller` replica must run a
-    /// release that accepts it before an API that sets it serves admin
-    /// creates.
+    /// is rejected by an older executor's `deny_unknown_fields`. The admin
+    /// create sets it unless [`ADMIN_CREATE_REQUESTED_BY_ENV`] is off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub requested_by_user_id: Option<UserId>,
 }
@@ -209,6 +207,25 @@ pub(crate) const IMPLICIT_WAKE_ACTIVITY_ENV: &str = "SPACE_IMPLICIT_WAKE_ACTIVIT
 /// [`IMPLICIT_WAKE_ACTIVITY_ENV`].
 pub(crate) fn implicit_wake_activity_enabled() -> bool {
     pplx_space_common_core::env::env_flag_var(IMPLICIT_WAKE_ACTIVITY_ENV, false)
+}
+
+/// The switch for recording
+/// [`CreateSandboxOperationPayload::requested_by_user_id`] on admin creates,
+/// on by default so that admin creates record the operator: `0`, `false`,
+/// `no`, `off` or `disabled`, in any case, turns it off; unset or anything
+/// else keeps it on. Off, admin creates go in without it, as before the
+/// field, and the admin operations API reports no requester. Turn it off only
+/// for an out-of-order deploy, where an API with this release serves admin
+/// creates before every `space-cluster-controller` replica runs #1303
+/// (`e083c944e`) or later, since older ones reject the field, and before
+/// rolling a controller back below #1303, letting the admin creates queued
+/// with it finish first.
+pub(crate) const ADMIN_CREATE_REQUESTED_BY_ENV: &str = "SPACE_ADMIN_CREATE_REQUESTED_BY_ENABLED";
+
+/// Whether admin creates record their requester; see
+/// [`ADMIN_CREATE_REQUESTED_BY_ENV`].
+pub(crate) fn admin_create_requested_by_enabled() -> bool {
+    pplx_space_common_core::env::env_flag_var(ADMIN_CREATE_REQUESTED_BY_ENV, true)
 }
 
 impl SandboxLifecycleOperationPayload {
