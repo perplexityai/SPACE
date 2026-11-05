@@ -479,15 +479,16 @@ step('sandboxes-create-form', ['sandboxes'], async (c) => {
 
 // The Datadog logs button shows only where SPACE_UI_DATADOG_LOGS_URL is set on
 // the console; the loop reads whether it is set from its own environment, so
-// run it with the console's value, and checks what the button links to.
+// run it with the console's value. Unset, the link must be absent; set, it must
+// be shown and link to an HTTPS URL that queries the sandbox.
 step('sandbox-detail-datadog', ['sandboxes'], async (c) => {
   const id = sandboxId(c, 'running');
   if (!id) return c.rec.check(false, 'the seed has a running sandbox');
   await visit(c, `/dashboard/sandboxes/${id}`, 3000);
   const logs = c.page.getByRole('link', { name: 'Datadog logs' });
   const shown = await logs.count() > 0;
-  if (c.config.datadogLogsConfigured) c.rec.check(shown, 'the Datadog logs link is shown, as SPACE_UI_DATADOG_LOGS_URL is set');
-  else if (!shown) return c.rec.note('no Datadog logs button (SPACE_UI_DATADOG_LOGS_URL unset)');
+  if (!c.config.datadogLogsConfigured) return c.rec.check(!shown, 'no Datadog logs link, as SPACE_UI_DATADOG_LOGS_URL is unset');
+  c.rec.check(shown, 'the Datadog logs link is shown, as SPACE_UI_DATADOG_LOGS_URL is set');
   if (!shown) return;
   const href = new URL((await logs.first().getAttribute('href')) ?? '', c.config.baseUrl);
   c.rec.check(href.protocol === 'https:' && (href.searchParams.get('query') ?? '').includes(id.replace(/^sbx_/, '')), 'the Datadog logs button queries the sandbox on an HTTPS URL');
