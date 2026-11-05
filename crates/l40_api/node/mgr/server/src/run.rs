@@ -194,7 +194,9 @@ pub enum RunNodeMgrError {
     #[error("failed to apply sandbox parent CPU limit: {0}")]
     ApplyParentCpuLimit(String),
     #[error("failed to apply sandbox parent memory limit: {0}")]
-    ApplyParentMemoryLimit(String),
+    ApplyParentMemoryLimit(#[source] crate::cgroup::ParentMemoryLimitError),
+    #[error("sandbox cgroup memory {memory_mib} MiB must exceed its {headroom_mib} MiB headroom")]
+    InvalidSandboxCgroupMemory { memory_mib: u64, headroom_mib: u64 },
     #[error("failed to apply sandbox parent disk I/O reservation: {0}")]
     ApplyParentDiskIoReservation(String),
     #[error("failed to migrate node-manager's SQLite database: {0}")]
@@ -671,15 +673,20 @@ pub async fn run(
 
     // Host-cgroup writes happen only after we hold the mutex: two coexisting
     // instances would otherwise clobber each other's parent cgroup limits.
+    let sandbox_memory_mib = sandbox_cgroup_config.memory_mib_or_default();
+    let sandbox_memory_headroom_mib = crate::cgroup::DEFAULT_SANDBOX_MEMORY_HEADROOM_MIB;
+    if sandbox_memory_mib <= sandbox_memory_headroom_mib {
+        return Err(RunNodeMgrError::InvalidSandboxCgroupMemory {
+            memory_mib: sandbox_memory_mib,
+            headroom_mib: sandbox_memory_headroom_mib,
+        });
+    }
     let parent_cpu_reserved_count = crate::cgroup::default_parent_cpu_reserved_count();
     let sandbox_parent_cpu_limit =
         crate::cgroup::apply_parent_cpu_reservation(parent_cpu_reserved_count)
             .map_err(RunNodeMgrError::ApplyParentCpuLimit)?;
-    let sandbox_parent_memory_limit = crate::cgroup::apply_parent_memory_limit(
-        sandbox_cgroup_config.memory_mib_or_default(),
-        pool_config.max_slots,
-    )
-    .map_err(RunNodeMgrError::ApplyParentMemoryLimit)?;
+    let sandbox_parent_memory_limit = crate::cgroup::apply_parent_memory_limit()
+        .map_err(RunNodeMgrError::ApplyParentMemoryLimit)?;
     let sandbox_parent_disk_io_reservation =
         crate::disk_io_reservation::apply_parent_disk_io_reservation(&disk_io_reservation_config)
             .map_err(RunNodeMgrError::ApplyParentDiskIoReservation)?;
@@ -837,8 +844,7 @@ pub async fn run(
             memory_admission_reserve_mib = memory_admission_config.reserve_mib,
             sandbox_cgroup_parent_cpu_reserved_count = sandbox_parent_cpu_limit.reserved_count,
             sandbox_cgroup_parent_cpu_max = sandbox_parent_cpu_limit.cpu_max,
-            sandbox_cgroup_parent_memory_mib = sandbox_parent_memory_limit.sandbox_cgroup_memory_mib,
-            sandbox_cgroup_parent_memory_max_slots = sandbox_parent_memory_limit.max_slots,
+            host_memory_bytes = sandbox_parent_memory_limit.host_memory_bytes,
             sandbox_cgroup_parent_memory_max = sandbox_parent_memory_limit.memory_max,
             sandbox_cgroup_parent_memory_swap_max = sandbox_parent_memory_limit.memory_swap_max,
             sandbox_cgroup_parent_disk_io_mode = sandbox_parent_disk_io_reservation.mode(),

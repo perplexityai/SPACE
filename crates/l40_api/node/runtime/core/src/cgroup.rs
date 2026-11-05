@@ -175,10 +175,23 @@ pub struct ParentCpuLimit {
 }
 
 pub struct ParentMemoryLimit {
-    pub sandbox_cgroup_memory_mib: u64,
-    pub max_slots: u32,
+    pub host_memory_bytes: u64,
     pub memory_max: String,
     pub memory_swap_max: String,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ParentMemoryLimitError {
+    #[error("failed to read /proc/meminfo: {0}")]
+    ReadMeminfo(#[source] std::io::Error),
+    #[error("/proc/meminfo has a missing, invalid, or too small MemTotal in kB")]
+    InvalidMemTotal,
+    #[error("failed to write {path}: {source}")]
+    Write {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -298,35 +311,50 @@ pub fn sandbox_cgroup_total_memory_mib(
     sandbox_cgroup_memory_mib.checked_mul(u64::from(max_slots))
 }
 
-pub fn apply_parent_memory_limit(
-    sandbox_cgroup_memory_mib: u64,
-    max_slots: u32,
-) -> Result<ParentMemoryLimit, String> {
-    if sandbox_cgroup_memory_mib <= DEFAULT_SANDBOX_MEMORY_HEADROOM_MIB {
-        return Err(format!(
-            "sandbox cgroup memory must be greater than {} MiB",
-            DEFAULT_SANDBOX_MEMORY_HEADROOM_MIB
-        ));
-    }
+/// Cap aggregate sandbox memory at 90% of host RAM, rounded down to MiB,
+/// independently of slot count and individual limits so overcommit remains possible.
+pub fn apply_parent_memory_limit() -> Result<ParentMemoryLimit, ParentMemoryLimitError> {
+    let meminfo =
+        fs::read_to_string("/proc/meminfo").map_err(ParentMemoryLimitError::ReadMeminfo)?;
+    apply_parent_memory_limit_at(Path::new(CGROUP_BASE), &meminfo)
+}
 
-    let total_memory_mib =
-        sandbox_cgroup_total_memory_mib(sandbox_cgroup_memory_mib, max_slots).ok_or_else(|| {
-            format!(
-                "sandbox parent memory overflow: {sandbox_cgroup_memory_mib} MiB * {max_slots} slots"
-            )
-        })?;
-    let memory_max_bytes = total_memory_mib.checked_mul(MIB_BYTES).ok_or_else(|| {
-        format!("sandbox parent memory overflow: {total_memory_mib} MiB to bytes")
-    })?;
+fn apply_parent_memory_limit_at(
+    cgroup_path: &Path,
+    meminfo: &str,
+) -> Result<ParentMemoryLimit, ParentMemoryLimitError> {
+    let host_memory_bytes = meminfo
+        .lines()
+        .find_map(|line| line.strip_prefix("MemTotal:"))
+        .and_then(|value| {
+            let mut fields = value.split_whitespace();
+            let kib = fields.next()?.parse::<u64>().ok()?;
+            if fields.next()? != "kB" || fields.next().is_some() {
+                return None;
+            }
+            kib.checked_mul(1024).filter(|bytes| *bytes > 0)
+        })
+        .ok_or(ParentMemoryLimitError::InvalidMemTotal)?;
+    // Reserve a rounded-up tenth to floor the 90% cap without overflowing.
+    let memory_max_bytes =
+        (host_memory_bytes - host_memory_bytes.div_ceil(10)) / MIB_BYTES * MIB_BYTES;
+    // MiB alignment avoids the kernel rounding an unaligned limit upward.
+    if memory_max_bytes == 0 {
+        return Err(ParentMemoryLimitError::InvalidMemTotal);
+    }
     let memory_max = memory_max_bytes.to_string();
     let memory_swap_max = "0".to_string();
 
-    write_cgroup_file(CGROUP_BASE, "memory.max", &memory_max)?;
-    write_cgroup_file(CGROUP_BASE, "memory.swap.max", &memory_swap_max)?;
+    for (file, value) in [
+        ("memory.max", &memory_max),
+        ("memory.swap.max", &memory_swap_max),
+    ] {
+        let path = cgroup_path.join(file);
+        fs::write(&path, value).map_err(|source| ParentMemoryLimitError::Write { path, source })?;
+    }
 
     Ok(ParentMemoryLimit {
-        sandbox_cgroup_memory_mib,
-        max_slots,
+        host_memory_bytes,
         memory_max,
         memory_swap_max,
     })
