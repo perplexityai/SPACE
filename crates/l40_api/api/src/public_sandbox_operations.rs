@@ -214,12 +214,14 @@ pub(crate) fn implicit_wake_activity_enabled() -> bool {
 /// on by default so that admin creates record the operator: `0`, `false`,
 /// `no`, `off` or `disabled`, in any case, turns it off; unset or anything
 /// else keeps it on. Off, admin creates go in without it, as before the
-/// field, and the admin operations API reports no requester. Turn it off only
-/// for an out-of-order deploy, where an API with this release serves admin
-/// creates before every `space-cluster-controller` replica runs #1303
-/// (`e083c944e`) or later, since older ones reject the field, and before
-/// rolling a controller back below #1303, letting the admin creates queued
-/// with it finish first.
+/// field, and the admin operations API reports no requester. Controllers
+/// before #1303 (`e083c944e`) reject the field, and nothing here checks their
+/// version, so turn it off:
+/// - when upgrading from a release before #1303, since the chart rolls the
+///   API and the controllers out together, and turn it on again once every
+///   `space-cluster-controller` replica runs this release;
+/// - before rolling a controller back below #1303, letting the admin creates
+///   queued with it finish first.
 pub(crate) const ADMIN_CREATE_REQUESTED_BY_ENV: &str = "SPACE_ADMIN_CREATE_REQUESTED_BY_ENABLED";
 
 /// Whether admin creates record their requester; see
