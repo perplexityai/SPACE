@@ -290,20 +290,47 @@ step('sandboxes-search-id', ['sandboxes'], async (c) => {
 });
 
 // The search box's text goes to the server's `search` (a name prefix
-// ignoring case, or an ID suffix such as the ID column's label), so a match
-// beyond the loaded page is found. An API without `search` refuses it with a
-// 400 and the console searches as before; the step notes which it saw and
-// checks the server's matches only when the server answered.
-const searchAnsweredByServer = async (c: Ctx, typed: string): Promise<boolean> => {
-  const answered = c.page.waitForResponse((res) => {
-    const url = new URL(res.url());
-    return url.pathname.endsWith('/admin/api/v1/sandboxes') && url.searchParams.get('search') === typed;
-  }, { timeout: 5000 }).then((res) => res.ok(), () => false);
-  await content(c.page).locator('input[placeholder*="ID"]').first().fill(typed);
-  const server = await answered;
-  await c.page.waitForTimeout(1500);
-  c.rec.note(server ? `the server answered "${typed}" as search` : `"${typed}" was not answered as search (an API without it); the console searched as before`);
-  return server;
+// ignoring case, or the start or end of an ID's hex digits, such as the ID
+// column's label), so a match beyond the loaded page is found. An API
+// without `search` refuses it with a 400 naming the parameter, and the
+// console then searches as before: a case-sensitive `prefix` request, and a
+// match within the page for hex text. `server` and `fallback` are those two
+// answers; anything else, a timeout included, is `failed`, and fails the
+// step. `followUp` is the fallback's own list request, without `search`.
+type SearchAnswer = { kind: 'server' | 'failed' } | { kind: 'fallback'; followUp: URL | null };
+const isListRequest = (url: URL) => url.pathname.endsWith('/admin/api/v1/sandboxes');
+
+const typeSearch = async (c: Ctx, typed: string): Promise<SearchAnswer> => {
+  const lists: URL[] = [];
+  const onRequest = (req: Request) => {
+    const url = new URL(req.url());
+    if (isListRequest(url)) lists.push(url);
+  };
+  c.page.on('request', onRequest);
+  try {
+    const answered = c.page.waitForResponse((res) => {
+      const url = new URL(res.url());
+      return isListRequest(url) && url.searchParams.get('search') === typed;
+    }, { timeout: 10_000 }).catch(() => null);
+    await content(c.page).locator('input[placeholder*="ID"]').first().fill(typed);
+    const res = await answered;
+    await c.page.waitForTimeout(2000);
+    let answer: SearchAnswer = { kind: 'failed' };
+    if (res?.ok()) {
+      answer = { kind: 'server' };
+    } else if (res?.status() === 400) {
+      const body = await res.json().catch(() => null);
+      if (body?.error === 'unknown query parameter "search"') {
+        const followUp = lists.find((url) => !url.searchParams.has('search') && url.searchParams.get('prefix') === typed) ?? null;
+        answer = { kind: 'fallback', followUp };
+      }
+    }
+    c.rec.check(answer.kind !== 'failed', `"${typed}" was answered as search, or refused as an unknown parameter (${res ? res.status() : 'no answer'})`);
+    if (answer.kind !== 'failed') c.rec.note(answer.kind === 'server' ? `the server answered "${typed}" as search` : `an API without search refused "${typed}"; the console searched as before`);
+    return answer;
+  } finally {
+    c.page.off('request', onRequest);
+  }
 };
 
 step('sandboxes-search-label', ['sandboxes'], async (c) => {
@@ -311,9 +338,14 @@ step('sandboxes-search-label', ['sandboxes'], async (c) => {
   if (!id) return c.rec.check(false, 'the seed has a running sandbox');
   await visit(c, '/dashboard/sandboxes?age=all&page_size=25', 2000);
   const label = shortLabel(id);
-  if (await searchAnsweredByServer(c, label)) {
-    const rows = content(c.page).locator('tbody tr.ant-table-row');
-    c.rec.check(await rows.filter({ hasText: label }).count() === 1, "searching the ID column's label finds the sandbox through the server");
+  const answer = await typeSearch(c, label);
+  const rows = content(c.page).locator('tbody tr.ant-table-row');
+  const labels = (await rows.locator('td:first-child').allInnerTexts()).map((text) => text.trim());
+  if (answer.kind === 'server') {
+    c.rec.check(labels.length === 1 && labels[0] === label, `searching the ID column's label lists exactly that sandbox (${labels.join(', ')})`);
+  } else if (answer.kind === 'fallback') {
+    c.rec.check(answer.followUp !== null, 'the fallback sends the label as a prefix, as before');
+    c.rec.check(labels.every((shown) => shown.includes(label)), 'the fallback lists only rows of this page that match the label');
   }
 });
 
@@ -322,29 +354,47 @@ step('sandboxes-search-name-case', ['sandboxes'], async (c) => {
   if (!id) return c.rec.check(false, 'the seed has a suspended sandbox');
   await visit(c, '/dashboard/sandboxes?age=all&page_size=25', 2000);
   const name = `${c.config.prefix}-suspended`;
-  if (await searchAnsweredByServer(c, name.toUpperCase())) {
-    const rows = content(c.page).locator('tbody tr.ant-table-row');
-    c.rec.check(await rows.count() === 1 && await rows.filter({ hasText: shortLabel(id) }).count() === 1, `searching ${name.toUpperCase()} finds ${name} alone`);
+  const typed = name.toUpperCase();
+  const answer = await typeSearch(c, typed);
+  const rows = content(c.page).locator('tbody tr.ant-table-row');
+  if (answer.kind === 'server') {
+    c.rec.check(await rows.count() === 1 && await rows.filter({ hasText: shortLabel(id) }).count() === 1, `searching ${typed} lists ${name} alone`);
+  } else if (answer.kind === 'fallback') {
+    // A case-sensitive prefix, as before: the seeded names are lower case.
+    c.rec.check(answer.followUp !== null, `the fallback sends ${typed} as a prefix, as before`);
+    c.rec.check(await rows.count() === 0, `the fallback's case-sensitive prefix lists nothing for ${typed}`);
   }
 });
 
 step('sandboxes-user-email', ['sandboxes'], async (c) => {
-  const id = sandboxId(c, 'acme-running');
-  if (!id) return c.rec.check(false, 'the seed has an acme-running sandbox');
+  const id = sandboxId(c, 'running');
+  if (!id) return c.rec.check(false, 'the seed has a running sandbox');
   const api = await adminFetch(c.page, 'GET', `/admin/api/v1/sandboxes/${id}`);
   const userEmail = api.json?.user_email;
   if (typeof userEmail !== 'string') return c.rec.note('the API reports no user_email; the User column shows the user ID');
-  // The org's own list, so the sandbox is on its first page.
-  await visit(c, `/dashboard/sandboxes?age=all&page_size=25&org=${orgId(c, 'acme')}`, 2000);
+  // Its full ID, which the list looks up wherever the sandbox is.
+  await visit(c, `/dashboard/sandboxes?age=all&id=${id}`, 3000);
   const row = content(c.page).locator('tbody tr.ant-table-row', { hasText: shortLabel(id) });
   c.rec.check((await row.innerText()).includes(userEmail), "the User column shows the owner's email");
 });
 
+// The create form has no runtime control: none of its selects offers a
+// runtime, open or closed.
 step('sandboxes-create-form', ['sandboxes'], async (c) => {
   await visit(c, '/dashboard/sandboxes', 2000);
   const card = c.page.locator('.ant-card', { hasText: 'Create sandbox' });
-  const t = await card.innerText();
-  c.rec.check(!/gVisor|Cloud Hypervisor|Hyper-V/.test(t), 'the create form offers no runtimes SPACE does not implement');
+  const runtimes = /Firecracker|gVisor|Cloud Hypervisor|Hyper-V/;
+  c.rec.check(await card.locator('.ant-select', { hasText: runtimes }).count() === 0, 'no select of the create form shows a runtime');
+  const selects = card.locator('.ant-select');
+  const offered: string[] = [];
+  for (let i = 0; i < await selects.count(); i += 1) {
+    await selects.nth(i).click();
+    await c.page.waitForTimeout(400);
+    offered.push(...await c.page.locator('.ant-select-dropdown:visible .ant-select-item-option').allInnerTexts());
+    await c.page.keyboard.press('Escape');
+  }
+  c.rec.check(offered.length > 0, `the create form's selects open (${offered.length} options)`);
+  c.rec.check(!offered.some((option) => runtimes.test(option)), 'no select of the create form offers a runtime');
 });
 
 // The Datadog logs button shows only where SPACE_UI_DATADOG_LOGS_URL is set,
