@@ -102,6 +102,9 @@ export interface Sandbox {
   pool_template: string | null;
   disk_usage_bytes: number | null;
   failure_reason: string | null;
+  // Why a stopped sandbox stopped when nobody asked it to. Absent from an API
+  // that predates it; null for a requested stop and every other state.
+  stop_cause?: SandboxStopCause | null;
   age: string | null;
   volume_encryption: boolean;
   auto_lifecycle: AutoLifecyclePolicy | null;
@@ -112,6 +115,14 @@ export interface Sandbox {
   network_policy: NetworkPolicyV1 | null;
   network_policy_generation: number | null;
   network_policy_status: NetworkPolicyStatus | null;
+}
+
+// `stop_cause` on an admin sandbox: why its node stopped it when nobody asked
+// (`pod_terminated`, `vm_exited`, or a reason a newer API adds) and when, by
+// the node's clock.
+export interface SandboxStopCause {
+  reason: string;
+  stopped_at: string;
 }
 
 export interface SandboxNodeSummary {

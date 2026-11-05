@@ -73,6 +73,8 @@ import { useAuth } from '@/lib/auth';
 import { isOwnOrg } from '@/lib/own-org';
 import { serialReads, withTimeout } from '@/lib/serial-reads';
 import { listsSnapshotsOn } from '@/lib/admin-fallback';
+import { reportedStopCause, stopCauseText } from '@/lib/stop-cause';
+import { StopCauseTag } from '@/components/stop-cause-tag';
 import { RollbackButton, RollbackRefusalNote, useSnapshotRollback, type SnapshotRollback } from '@/components/snapshot-rollback';
 import { rollbackRoute, rollbackTargets, snapshotTimeMs, type RollbackTarget } from '@/lib/rollback-targets';
 import { formatAge, formatBytes, sectionData, sectionError, snapshotKey, snapshotStorageById, snapshotStorageLabel, type DebugSnapshot } from '@/lib/sandbox-debug';
@@ -1546,6 +1548,7 @@ export default function SandboxDetailPage({ dashboardUrl }: { dashboardUrl: stri
   // to see those rows in the DB without dropping to the CLI.
   const showSnapshots = sandbox.resource_type !== 'pool_slot';
   const ownOrg = isOwnOrg(authOrg?.id, sandbox.org_id);
+  const stopCause = reportedStopCause(sandbox);
 
   return (
     <div>
@@ -1557,6 +1560,7 @@ export default function SandboxDetailPage({ dashboardUrl }: { dashboardUrl: stri
           </Title>
           <Text code copyable={{ text: sandbox.id }}>{sandbox.id}</Text>
           {statusTag(sandbox.status, sandbox.failure_reason)}
+          <StopCauseTag cause={stopCause} />
           {sandbox.resource_type === 'pool_slot' ? <Tag color="cyan">Pool slot</Tag> : null}
           {sandbox.resource_type === 'observed_local' ? <Tag>Observed local</Tag> : null}
           {sandbox.volume_encryption ? (
@@ -1629,6 +1633,11 @@ export default function SandboxDetailPage({ dashboardUrl }: { dashboardUrl: stri
             {sandbox.failure_reason ? (
               <Descriptions.Item label="Failure reason" span={2}>
                 <Text type="danger">{sandbox.failure_reason}</Text>
+              </Descriptions.Item>
+            ) : null}
+            {stopCause ? (
+              <Descriptions.Item label="Stop cause" span={2}>
+                <Text type="warning" data-testid="stop-cause-text">{stopCauseText(stopCause)}</Text>
               </Descriptions.Item>
             ) : null}
           </Descriptions>

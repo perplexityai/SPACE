@@ -95,6 +95,8 @@ import NetworkPolicyDesigner, {
   compactNetworkPolicyLabel,
 } from '@/components/network-policy-designer';
 import NetworkPolicyGenerationTag from '@/components/network-policy-generation-tag';
+import { StopCauseTag } from '@/components/stop-cause-tag';
+import { reportedStopCause } from '@/lib/stop-cause';
 import {
   AutoLifecycleEditor,
   disabledAutoLifecycle,
@@ -1505,6 +1507,7 @@ function SandboxesPage() {
         <Space size={2} wrap>
           {sandboxResourceTag(record)}
           {statusTag(status, record.failure_reason)}
+          <StopCauseTag cause={reportedStopCause(record)} compact />
           {encryptedTag(record)}
         </Space>
       ),

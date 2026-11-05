@@ -307,6 +307,66 @@ step('sandbox-detail-deleted', ['sandboxes'], async (c) => {
   c.rec.check(/not found|deleted|could not/i.test(await text(c.page)), 'a deleted sandbox shows a not-found state');
 });
 
+// Why a stopped sandbox stopped. The admin API reports a cause only for a
+// sandbox its pod or VM stopped, which no public call sets up, so the step
+// serves the seeded `stopped` sandbox's admin reads three ways: as the API
+// answers (a requested stop: no cause), with a recorded cause, and without
+// the field (an API that predates it). The list and the detail page must show
+// the cause only in the second.
+step('sandbox-stop-cause', ['sandboxes'], async (c) => {
+  const id = sandboxId(c, 'stopped');
+  if (!id) return c.rec.check(false, 'the seed has a stopped sandbox');
+  const bare = id.replace(/^sbx_/, '');
+  const recorded = { reason: 'vm_exited', stopped_at: '2026-11-05T12:00:00Z' };
+  for (const mode of ['as answered', 'recorded', 'absent'] as const) {
+    const rewrite = (sandbox: Record<string, unknown> | null) => {
+      if (!sandbox || String(sandbox.id).replace(/^sbx_/, '') !== bare) return;
+      if (mode === 'recorded') sandbox.stop_cause = recorded;
+      else delete sandbox.stop_cause;
+    };
+    const handler = async (route: Route) => {
+      if (route.request().method() !== 'GET') return route.fallback();
+      const response = await fetchWithoutRedirect(route);
+      if (!response) return;
+      const json = await response.json().catch(() => null);
+      if (json === null) return route.fulfill({ response });
+      for (const sandbox of Array.isArray(json) ? json : Array.isArray(json.sandboxes) ? json.sandboxes : [json]) rewrite(sandbox);
+      const headers = { ...response.headers() };
+      delete headers['content-length'];
+      await route.fulfill({ status: response.status(), headers, body: JSON.stringify(json) });
+    };
+    const matches = (url: URL) => url.pathname.startsWith('/admin/api/v1/sandboxes');
+    if (mode !== 'as answered') await c.page.route(matches, handler);
+    try {
+      const shown = mode === 'recorded';
+      await visit(c, `/dashboard/sandboxes/${id}`, 3000);
+      // Count first: reading an absent element waits out the locator timeout.
+      const text = content(c.page).getByTestId('stop-cause-text');
+      const detail = (await text.count()) ? await text.innerText() : '';
+      c.rec.check(shown ? detail.startsWith('Stopped unexpectedly: VM exited at ') : detail === '',
+        `${mode}: the detail page ${shown ? 'says why it stopped' : 'reads as a plain stop'} (${detail || 'nothing'})`);
+      if (shown) await c.page.screenshot({ path: `${c.rec.outDir}/sandbox-stop-cause-detail.png`, fullPage: true });
+      await visit(c, '/dashboard/sandboxes?age=all', 2000);
+      await content(c.page).locator('input[placeholder*="ID"]').first().fill(id);
+      await c.page.waitForTimeout(1500);
+      const row = content(c.page).locator('tbody tr.ant-table-row', { hasText: shortLabel(id) });
+      const badge = row.getByTestId('stop-cause-tag');
+      const label = (await badge.count()) ? await badge.getAttribute('aria-label') : null;
+      c.rec.check(shown ? label?.startsWith('Stopped unexpectedly: VM exited at ') === true : label === null,
+        `${mode}: the list ${shown ? 'marks the sandbox, named for screen readers' : 'shows no mark'} (${label ?? 'none'})`);
+      if (shown) {
+        await badge.focus();
+        await c.page.waitForTimeout(500);
+        c.rec.check(await c.page.locator('.ant-tooltip:visible', { hasText: 'Stopped unexpectedly' }).count() > 0,
+          'recorded: focusing the list mark shows its tooltip');
+        await c.page.screenshot({ path: `${c.rec.outDir}/sandbox-stop-cause-list.png`, fullPage: true });
+      }
+    } finally {
+      if (mode !== 'as answered') await c.page.unroute(matches, handler);
+    }
+  }
+});
+
 step('sandbox-create', ['sandboxes', 'flows', 'lifecycle'], async (c) => {
   await visit(c, '/dashboard/sandboxes', 3000);
   const card = c.page.locator('.ant-card', { hasText: 'Create sandbox' });
