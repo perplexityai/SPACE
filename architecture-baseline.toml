@@ -124,9 +124,6 @@ pplx-space-common-svc = [
 pplx-space-metrics = [
   "pplx-space-common-core",
 ]
-pplx-space-object-store = [
-  "pplx-space-common-core",
-]
 pplx-space-observability = [
   "pplx-space-cluster-id",
   "pplx-space-common-core",

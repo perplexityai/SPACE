@@ -29,7 +29,6 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
 use tokio::task::JoinSet;
 use tracing::{Instrument, debug, info, warn};
 
-use pplx_space_common_core::types::{MULTIPART_CONCURRENCY, MULTIPART_PART_SIZE};
 use pplx_space_s3_http_client::{DEFAULT_POOL_IDLE_TIMEOUT, s3_http_client};
 
 mod attempts;
@@ -388,6 +387,21 @@ impl Default for S3ObjectStore {
         Self::new()
     }
 }
+
+/// Default chunk size for S3 multipart uploads.
+///
+/// Sized for artifacts in the 1–8 GiB range. 256 MiB keeps part counts low
+/// (32 parts for an 8 GiB file, 4 for a 1 GiB file) so many concurrent
+/// uploads stay well under S3's per-prefix request budget without giving up
+/// multipart parallelism.
+pub const MULTIPART_PART_SIZE: usize = 256 * 1024 * 1024;
+
+/// Default concurrency for in-flight multipart parts.
+///
+/// A single TCP flow to S3 caps around 80–100 MB/s, so saturating a 25 Gbps
+/// NIC requires ~32 concurrent flows. Callers that run several uploads at
+/// once size their own concurrency so `uploads × parts` reaches that target.
+pub const MULTIPART_CONCURRENCY: usize = 16;
 
 /// Env var that overrides the multipart part size, in bytes. Accepted range
 /// is 8 MiB ..= 5 GiB. S3's hard lower limit is 5 MiB for non-final parts,

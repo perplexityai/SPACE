@@ -6858,7 +6858,6 @@ dependencies = [
  "jiff",
  "md-5 0.11.0",
  "percent-encoding",
- "pplx-space-common-core",
  "pplx-space-metrics",
  "pplx-space-s3-http-client",
  "rand 0.10.2",
