@@ -5,7 +5,7 @@
 //! UDS peer-process metrics tag the checked socket's service as `service` on
 //! native DogStatsD and `service.role` on OTLP, separately from process identity.
 
-use crate::emit::{counter, tag};
+use crate::emit::{counter, gauge, tag};
 
 /// One authentication decision on a service identity surface.
 ///
@@ -177,5 +177,31 @@ pub fn external_console_decision(result: &str) {
         "auth.external_console.decision",
         1,
         &[tag("result", result)],
+    );
+}
+
+/// One password login or password-session request while an external console
+/// authenticator is installed; password mode is not counted.
+///
+/// `result`: `"login_accepted"`, `"login_refused"` (a console request, or an
+/// account not listed for password sessions), `"login_invalid"` (a listed
+/// account with wrong credentials), `"session_accepted"` or
+/// `"session_refused"` (a valid session whose account is no longer listed).
+pub fn external_console_password_session(result: &str) {
+    counter(
+        "auth.external_console.password_session",
+        1,
+        &[tag("result", result)],
+    );
+}
+
+/// Accounts listed for password sessions beside an installed external
+/// console authenticator, written at startup. Nonzero marks a deployment
+/// whose listed accounts sign in without the external provider.
+pub fn external_console_password_session_accounts(count: usize) {
+    gauge(
+        "auth.external_console.password_session_accounts",
+        count as f64,
+        &[],
     );
 }

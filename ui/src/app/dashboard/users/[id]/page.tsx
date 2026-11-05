@@ -13,6 +13,7 @@ import { AdminUser, ApiKeyMetadata, Organization, Sandbox, UserRole } from '@/li
 import { assignableRoleOptions, canDeleteUser, canManageUserRole, roleChangeConfirmation, roleColors, roleLabels } from '@/lib/userRoles';
 import { Typography, Descriptions, Select, Tag, App, Alert, Button, Card, Form, Input, Modal, Popconfirm, Space, Table, Tooltip } from 'antd';
 import { DeleteOutlined, EditOutlined, KeyOutlined, ReloadOutlined } from '@ant-design/icons';
+import { passwordChangeOutcome } from '@/lib/user-password';
 import { MAX_PASSWORD_BYTES, USER_DELETE_CONSEQUENCES, USER_OWNS_SANDBOXES, passwordTooLong, userDeleteFailureMessage } from '@/lib/user-delete';
 
 const { Title, Text } = Typography;
@@ -121,10 +122,12 @@ export default function UserDetailPage() {
   const canUpdateRole = !isSelf && canManageUserRole(currentUser, user, cluster, visibleOrgIds) && roleOptions.length > 0;
   const canEdit = isSelf || canManageUserRole(currentUser, user, cluster, visibleOrgIds);
   const canDelete = !isSelf && canDeleteUser(currentUser, user, cluster, visibleOrgIds);
-  // External sign-in has no local passwords. The API also refuses one for a
-  // federated user, which its user response does not mark; that refusal is
-  // shown as the API's message.
-  const canSetPassword = canEdit && authMode?.mode !== 'external';
+  // Local passwords can be set in either sign-in mode, so an administrator
+  // can rotate one with external sign-in too; see `passwordChangeOutcome`.
+  // The API refuses one for a federated user, which its user response does
+  // not mark; that refusal is shown as the API's message.
+  const canSetPassword = canEdit;
+  const passwordChange = passwordChangeOutcome(authMode, isSelf);
   // `null` when the cluster record did not load: console access is unknown.
   const inManagingOrg = cluster ? user.org_id === cluster.managing_org_id : null;
   // External sign-in matches the provider's email exactly against the user's
@@ -154,7 +157,7 @@ export default function UserDetailPage() {
     setSaving(true);
     try {
       const saved = await adminApi.patch<AdminUser>(`/v1/users/${user.id}`, body);
-      if (body.password !== undefined && isSelf) {
+      if (body.password !== undefined && passwordChange.endsConsoleSession) {
         // Setting a password ends every session of that user, this one too.
         setSignInNotice('Your password was changed and your sessions ended. Sign in with the new password.');
         localStorage.removeItem('token');
@@ -337,9 +340,7 @@ export default function UserDetailPage() {
         destroyOnHidden
       >
         <Typography.Paragraph type="secondary">
-          {isSelf
-            ? 'Setting a password ends all of your sessions, including this one: you will sign in again with the new password.'
-            : "Setting a password ends all of this user's sessions. Your own session is not affected."}
+          {passwordChange.notice}
         </Typography.Paragraph>
         <Form
           form={passwordForm}

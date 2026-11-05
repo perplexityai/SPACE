@@ -256,12 +256,17 @@ pub async fn run_with(
     )
     .await?;
     if let Some(external_console) = external_console {
-        if external_console.settings().allow_password_sessions() {
+        let password_session_emails = external_console.settings().password_session_emails();
+        pplx_space_metrics::auth::external_console_password_session_accounts(
+            password_session_emails.len(),
+        );
+        if !password_session_emails.is_empty() {
             tracing::warn!(
                 surface = ?config.surface,
                 trusted_origins = ?external_console.settings().trusted_origins(),
-                "external console identity enabled; password sessions stay enabled for requests \
-                 without the console header, which is meant for test deployments only"
+                password_session_emails = ?password_session_emails,
+                "external console identity enabled; the listed accounts keep password sessions \
+                 for requests without the console header, which is meant for test automation only"
             );
         } else {
             tracing::info!(

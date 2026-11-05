@@ -28,7 +28,6 @@ use axum::{
 
 use super::{AppState, authz, debug};
 use crate::{
-    auth,
     external_console::ExternalConsoleAuth,
     middleware::auth::{AuthOrg, AuthUser, bearer_token},
     routes::public::error::PublicApiError,
@@ -364,9 +363,10 @@ async fn require_admin_auth(
 ) -> Response {
     // With an external console authenticator installed, a console request
     // with an admitted assertion is the only admin credential and bearer
-    // sessions are ignored, unless the settings allow password sessions: then
-    // a request without the console header authenticates with its session as
-    // in password mode. Admin authorization below is unchanged either way.
+    // sessions are ignored, unless some account is listed for password
+    // sessions: then a request without the console header authenticates with
+    // a session of a listed account as in password mode. Admin authorization
+    // below is unchanged either way.
     let console_principal = if let Some(external_console) = &state.external_console {
         let method = request.method().clone();
         match external_console
@@ -374,7 +374,7 @@ async fn require_admin_auth(
             .await
         {
             ExternalConsoleAuth::Principal(principal) => Some(*principal),
-            ExternalConsoleAuth::NotConsole if state.password_sessions_enabled() => None,
+            ExternalConsoleAuth::NotConsole if state.password_sessions_possible() => None,
             ExternalConsoleAuth::NotConsole => {
                 return PublicApiError::unauthorized("Console sign-in is required").into_response();
             }
@@ -391,7 +391,7 @@ async fn require_admin_auth(
                 .into_response();
         };
 
-        match auth::get_session_user(&state.pool, token).await {
+        match state.session_user(token).await {
             Ok(Some(context)) => context,
             Ok(None) => {
                 return PublicApiError::unauthorized("Invalid or expired session").into_response();

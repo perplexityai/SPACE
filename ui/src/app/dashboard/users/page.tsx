@@ -8,6 +8,7 @@ import { Table, Button, Form, Input, Select, Typography, Popconfirm, App, Card, 
 import { assignableRoleOptions, canDeleteUser, canManageUserRole, roleChangeConfirmation, roleColors, roleLabels } from '@/lib/userRoles';
 import { PlusOutlined, DeleteOutlined } from '@ant-design/icons';
 import { USER_DELETE_CONSEQUENCES, userDeleteFailureMessage } from '@/lib/user-delete';
+import { passwordChangeOutcome } from '@/lib/user-password';
 import Link from 'next/link';
 import type { ColumnsType } from 'antd/es/table';
 
@@ -15,7 +16,8 @@ const { Title } = Typography;
 
 export default function UsersPage() {
   const { message, modal } = App.useApp();
-  const { user: currentUser, org: currentOrg, cluster } = useAuth();
+  const { user: currentUser, org: currentOrg, cluster, authMode } = useAuth();
+  const createPasswordHint = passwordChangeOutcome(authMode, false).createHint;
   const [orgs, setOrgs] = useState<Organization[]>([]);
   const [selectedOrgId, setSelectedOrgId] = useState('');
   const [users, setUsers] = useState<AdminUser[]>([]);
@@ -209,6 +211,11 @@ export default function UsersPage() {
             </Button>
           </Form.Item>
         </Form>
+        {createPasswordHint ? (
+          <Typography.Paragraph type="secondary" style={{ marginTop: 8, marginBottom: 0 }}>
+            {createPasswordHint}
+          </Typography.Paragraph>
+        ) : null}
       </Card>
 
       <Table

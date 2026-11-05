@@ -87,9 +87,9 @@ async fn run_as_console_user(
 /// With an external console authenticator installed, a console request
 /// passes only with an admitted assertion. Any other request is refused, and a
 /// bearer session token is ignored so an old password session cannot bypass
-/// the mode, unless the settings allow password sessions: then a request
-/// without the console header authenticates with its session as in password
-/// mode.
+/// the mode, unless some account is listed for password sessions: then a
+/// request without the console header authenticates with a session of a
+/// listed account as in password mode, and any other session is invalid.
 pub async fn require_auth(State(state): State<AppState>, request: Request, next: Next) -> Response {
     let pool = &state.pool;
 
@@ -103,7 +103,7 @@ pub async fn require_auth(State(state): State<AppState>, request: Request, next:
                 let (user, org) = *principal;
                 return run_as_console_user(request, next, user, org).await;
             }
-            ExternalConsoleAuth::NotConsole if state.password_sessions_enabled() => {}
+            ExternalConsoleAuth::NotConsole if state.password_sessions_possible() => {}
             ExternalConsoleAuth::NotConsole => {
                 return PublicApiError::unauthorized("Console sign-in is required").into_response();
             }
@@ -120,7 +120,7 @@ pub async fn require_auth(State(state): State<AppState>, request: Request, next:
         .into_response();
     };
 
-    match crate::auth::get_session_user(pool, token).await {
+    match state.session_user(token).await {
         Ok(Some((user, org))) => run_as_console_user(request, next, user, org).await,
         Ok(None) => {
             crate::routes::public::error::PublicApiError::unauthorized("Invalid or expired session")
@@ -295,8 +295,8 @@ fn federated_identity_error(
 /// decided by its assertion alone: a missing or refused assertion is final,
 /// and an admitted one may not also present a bearer credential. Any other
 /// request may still authenticate with a service credential, and with a
-/// session token only when the settings allow password sessions; the proxy's
-/// assertion on it is not consulted.
+/// session token only of an account listed for password sessions; the
+/// proxy's assertion on it is not consulted.
 pub async fn require_native_auth(
     State(state): State<AppState>,
     mut request: Request,
@@ -339,8 +339,8 @@ pub async fn require_native_auth(
         .into_response();
     };
 
-    if state.password_sessions_enabled() {
-        match crate::auth::get_session_user(pool, token).await {
+    if state.password_sessions_possible() {
+        match state.session_user(token).await {
             Ok(Some((user, org))) => {
                 if owner_headers_present(request.headers()) {
                     return PublicApiError::forbidden("sessions may not assert an owner")
