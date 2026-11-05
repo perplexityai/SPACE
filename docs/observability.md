@@ -1200,8 +1200,9 @@ tags:
 | `defaulted` | `false` when the request set both vCPU and memory; `true` when a build shape, the platform default, a warm-pool config or a warm-pool policy supplied either. Warm-pool claims are always `true` |
 | `client_id` | The request's bounded caller, as described above |
 
-There is one sample per create call, so a retried call adds one; `count:` on
-either distribution is the call count.
+Each eligible recorded create contributes one sample to each distribution.
+Retries that reach a recording point add another sample; the distribution count
+is not the total number of incoming create requests.
 
 A cold create is recorded at its cluster admission decision, so an admitted
 create that fails later still counts and one that fails before admission does
