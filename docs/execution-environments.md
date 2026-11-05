@@ -712,9 +712,8 @@ space-admin-cli template build seed --environment "$ENV_REF" --async
 
 No `latest` tag moves unless `--publish-tag latest` is supplied. Selecting a pair
 makes its kernel authoritative instead of the bundled seed recipe's kernel pin.
-A dependent code-runtime build should carry the same pair and an exact
-`seed@sha256:…` base, never a moving tag. This is a build operation, not a claim
-that reusing an existing rootfs necessarily requires rebuilding its userspace.
+This builds seed independently of any other template. Promotion is a separate
+tag assignment and does not require another template to exist.
 
 The API forwards the fail-closed environment wire arm and requires an
 acknowledgement. If the gateway does not acknowledge selection, inspect the
