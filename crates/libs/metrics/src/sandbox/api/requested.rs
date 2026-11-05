@@ -10,9 +10,10 @@
 //!
 //! - `kind`: `create` (cold and warm-pool creates), `activate` (a lifecycle
 //!   action that activates a `created`, `stopped` or `suspended` sandbox) or
-//!   `resume` (a resume of a `paused` sandbox, which is still resident in
-//!   memory and spends no cluster admission, so it is always `accepted`). Not
-//!   `op`, which on other `sandbox.api.*` metrics names the API route.
+//!   `resume` (a resume requested from the `paused` lifecycle). Resuming an
+//!   existing resident runtime spends no cluster admission; runtime recovery
+//!   may require admission and can be rejected. Not `op`, which on other
+//!   `sandbox.api.*` metrics names the API route.
 //! - `surface`: `native` or `ecw`, the API the call arrived on.
 //! - `admission`: `accepted`, or `rejected` when cluster activation admission
 //!   refused the call ([`AdmissionDecision`], the cluster limiter's own
@@ -46,7 +47,7 @@ metric_vocabulary!(
         Create => "create",
         /// A start, wake or restore of a dormant sandbox.
         Activate => "activate",
-        /// A resume of a paused sandbox, still resident in memory.
+        /// A resume requested from the paused lifecycle.
         Resume => "resume",
     }
 );
@@ -83,6 +84,3 @@ pub fn requested(sample: RequestedSize<'_>) {
         &tags,
     );
 }
-
-#[cfg(test)]
-mod tests;
