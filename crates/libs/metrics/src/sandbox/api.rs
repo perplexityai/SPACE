@@ -7,8 +7,10 @@ use crate::emit::{counter, distribution, elapsed_ms, tag, timing_ms};
 use super::sandbox_tags;
 
 mod client_id;
+mod requested;
 
 pub use client_id::{ClientIdTag, request_client_id, scope_request_client_id};
+pub use requested::{RequestedKind, RequestedSize, requested};
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum SandboxApiSurface {
