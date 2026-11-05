@@ -1,6 +1,73 @@
 use super::*;
 
 #[test]
+fn parent_memory_cap_leaves_ten_percent_of_host_ram() {
+    let root = tempfile::tempdir().unwrap();
+    // 256 GiB host: the shared limit is not the sum of per-slot ceilings.
+    let limit = apply_parent_memory_limit_at(
+        root.path(),
+        "MemTotal:       268435456 kB\nMemAvailable:   1024 kB\n",
+    )
+    .unwrap();
+
+    assert_eq!(limit.host_memory_bytes, 274_877_906_944);
+    assert_eq!(limit.memory_max, "247389487104");
+    assert_eq!(
+        fs::read_to_string(root.path().join("memory.max")).unwrap(),
+        limit.memory_max
+    );
+    assert_eq!(
+        fs::read_to_string(root.path().join("memory.swap.max")).unwrap(),
+        "0"
+    );
+
+    // A non-divisible total must round down, never above 90%.
+    let limit = apply_parent_memory_limit_at(root.path(), "MemTotal: 2048 kB\n").unwrap();
+    assert_eq!(limit.memory_max, "1048576");
+}
+
+#[test]
+fn invalid_host_memory_does_not_change_parent_limits() {
+    let root = tempfile::tempdir().unwrap();
+    fs::write(root.path().join("memory.max"), "max").unwrap();
+    fs::write(root.path().join("memory.swap.max"), "0").unwrap();
+    for meminfo in [
+        "",
+        "MemAvailable: 1024 kB\n",
+        "MemTotal: 0 kB\n",
+        "MemTotal: 1 kB\n",
+        "MemTotal: invalid kB\n",
+        "MemTotal: 1024 MB\n",
+        "MemTotal: 1024\n",
+        "MemTotal: 18446744073709551615 kB\n",
+    ] {
+        assert!(matches!(
+            apply_parent_memory_limit_at(root.path(), meminfo),
+            Err(ParentMemoryLimitError::InvalidMemTotal)
+        ));
+        assert_eq!(
+            fs::read_to_string(root.path().join("memory.max")).unwrap(),
+            "max"
+        );
+        assert_eq!(
+            fs::read_to_string(root.path().join("memory.swap.max")).unwrap(),
+            "0"
+        );
+    }
+}
+
+#[test]
+fn parent_memory_write_failure_is_not_ignored() {
+    let root = tempfile::tempdir().unwrap();
+    fs::create_dir(root.path().join("memory.max")).unwrap();
+    assert!(matches!(
+        apply_parent_memory_limit_at(root.path(), "MemTotal: 2048 kB\n"),
+        Err(ParentMemoryLimitError::Write { .. })
+    ));
+    assert!(!root.path().join("memory.swap.max").exists());
+}
+
+#[test]
 fn termination_waits_for_known_quiescence_and_removal() {
     // Synthetic filesystem observations: the async supervisor owns timing.
     let root = tempfile::tempdir().unwrap();
