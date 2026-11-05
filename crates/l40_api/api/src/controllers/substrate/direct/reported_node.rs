@@ -18,14 +18,17 @@
 /// NULL.
 ///
 /// The first conjunct only narrows: the sandboxes whose row or route names
-/// the node, which the planner finds through `idx_sandboxes_active_node` and
-/// the primary key instead of testing every row in a list's order, so a node
-/// with few sandboxes costs few. The route side reads the routes on the node
-/// once per statement; no index covers `current_node_id`, so that read scans
-/// the route table, inside the database. The second conjunct is the exact
-/// test. The first is NULL for a sandbox with no route and no
-/// `active_node_id`; the second is then FALSE rather than NULL, so the
-/// predicate is too.
+/// the node. A plan that knows `node_id` can find them by index, through
+/// `idx_sandboxes_active_node` and an index on `sandboxes.id`, instead of
+/// testing every row in a list's order, so a node with few sandboxes costs
+/// few. Nothing guarantees that plan: where a statement makes the filter
+/// optional (`$n IS NULL OR` this predicate) and runs a generic plan, the
+/// planner cannot drop the `IS NULL` arm and tests every row in the list's
+/// order. The route side reads the routes on the node once per statement; no
+/// index covers `current_node_id`, so that read scans the route table, inside
+/// the database. The second conjunct is the exact test. The first is NULL for
+/// a sandbox with no route and no `active_node_id`; the second is then FALSE
+/// rather than NULL, so the predicate is too.
 pub(crate) fn reported_on_node(sandbox_alias: &str, node_id: &str) -> String {
     format!(
         "(\n\

@@ -347,8 +347,18 @@ async fn an_empty_filter_parameter_is_unset(
         return Ok(());
     };
     let owner = seed_owner(&harness.pool).await?;
-    for _ in 0..2 {
-        seed_sandbox(&harness.pool, owner, SeedSandbox::default()).await?;
+    // One on a node and two on none, so `assigned=` read as either value
+    // lists other rows than unset.
+    for active_node_id in [Some(NodeId::new()), None, None] {
+        seed_sandbox(
+            &harness.pool,
+            owner,
+            SeedSandbox {
+                active_node_id,
+                ..SeedSandbox::default()
+            },
+        )
+        .await?;
     }
     let org = owner.org_id.as_uuid();
     // A body's `age` counts whole seconds on the wall clock, so two requests'
