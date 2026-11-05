@@ -48,6 +48,7 @@ from space_smoke.capabilities import (
     EcwSandboxState,
     EcwSandboxUnavailable,
     EcwTimeoutAction,
+    KindColdCreateConfig,
     NetworkConfig,
 )
 from space_smoke.fixtures import Ecw
@@ -624,6 +625,66 @@ class EcwCommandRoundTripTests(unittest.TestCase):
                         trace.index("sandbox.kill"), trace.index("kind.cold-release")
                     )
                 self.assertEqual(trace.count("kind.cold-release"), 1)
+
+    def test_shape_supplying_cold_setup_restores_even_when_enable_fails(self) -> None:
+        pin = "seed@sha256:" + "c" * 64
+        for failure in (None, "enable"):
+            with self.subTest(failure=failure):
+
+                @smoke.scenario(
+                    f"ecw.shape_supplying_cold_create_{failure or 'enabled'}",
+                    sandbox=smoke.SandboxConfig(
+                        kind_cold_create=KindColdCreateConfig(
+                            vcpu=2, memory_mib=1024, supply_shape=True
+                        )
+                    ),
+                )
+                def shape_supplying(_test: smoke.KindEcw) -> None:
+                    """The owned config supplies the create's shape."""
+
+                def setup(kind, template, config, failure=failure):
+                    self.assertTrue(config.supply_shape)
+
+                    def enable():
+                        kind.trace.append("kind.cold-enable")
+                        if failure == "enable":
+                            raise SmokeConfigurationError("enable failed")
+
+                    return ColdCreateSelection(
+                        pin,
+                        "owned-config",
+                        "owned-receipt",
+                        lambda: kind.trace.append("kind.cold-verified"),
+                        enable=enable,
+                        restore=lambda: kind.trace.append("kind.cold-restore"),
+                    )
+
+                with mock.patch.object(_Kind, "prepare_cold_create", setup):
+                    result, trace = _run(
+                        EcwCommandResult(0, "", ""), registered=shape_supplying
+                    )
+                creates = [
+                    i for i, item in enumerate(trace) if item.startswith("ecw.create:")
+                ]
+                # A restore deferred only after enable returned would not run
+                # when enable raises.
+                self.assertEqual(trace.count("kind.cold-restore"), 1)
+                self.assertLess(
+                    trace.index("kind.cold-restore"), trace.index("kind.cold-release")
+                )
+                if failure:
+                    self.assertNotEqual(result.verdict, Verdict.PASS)
+                    self.assertEqual(creates, [])
+                else:
+                    self.assertEqual(result.verdict, Verdict.PASS)
+                    self.assertLess(
+                        trace.index("kind.cold-enable"), trace.index("kind.cold-verified")
+                    )
+                    self.assertLess(trace.index("kind.cold-verified"), creates[0])
+                    self.assertTrue(trace[creates[0]].startswith("ecw.create:" + pin + ":"))
+                    self.assertLess(
+                        trace.index("sandbox.kill"), trace.index("kind.cold-restore")
+                    )
 
     def test_fixture_forwards_empty_and_multiline_environment_to_cold_create(
         self,

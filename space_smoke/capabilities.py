@@ -13,6 +13,13 @@ from typing import Any, BinaryIO, Generic, Protocol, TypeVar
 class KindColdCreateConfig:
     vcpu: int
     memory_mib: int
+    supply_shape: bool = False
+    """Enable the owned config with a zero slot target, so the API resolves this
+    shape for the create while no warm capacity exists to adopt.
+
+    Otherwise the config stays disabled and the create keeps whatever shape the
+    template itself declares, which for the Kind seed is none.
+    """
 
 
 @dataclass(frozen=True)
@@ -27,6 +34,10 @@ class ColdCreateSelection:
     config_id: str
     ownership_receipt: str
     verify: Callable[[], None]
+    # Set only for a `supply_shape` config: the caller defers `restore` and
+    # only then calls `enable`, so a failure at any later point disables it.
+    enable: Callable[[], None] | None = None
+    restore: Callable[[], None] | None = None
 
 
 @dataclass(frozen=True)

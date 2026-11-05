@@ -128,7 +128,9 @@ class KindColdCreateSetup:
                 )
             return rows, policies
 
-        def require_owned(rows: list[dict[str, Any]], owned: dict[str, Any]) -> None:
+        def require_owned(
+            rows: list[dict[str, Any]], owned: dict[str, Any], *, enabled: bool = False
+        ) -> None:
             if owned["identity"] != identity or len(rows) != 1:
                 raise SmokeConfigurationError("unknown or changed cold pool ownership")
             row = rows[0]
@@ -136,6 +138,7 @@ class KindColdCreateSetup:
             # No slot count is used to infer coldness.
             expected = {
                 **request,
+                "enabled": enabled,
                 "template_release_id": release["id"],
                 "managed_by": "manual",
             }
@@ -143,8 +146,9 @@ class KindColdCreateSetup:
                 type(row.get(k)) is not type(v) or row[k] != v
                 for k, v in expected.items()
             ):
+                state = "enabled zero-slot" if enabled else "disabled"
                 raise SmokeConfigurationError(
-                    "cold pool config is not the disabled owned config"
+                    f"cold pool config is not the {state} owned config"
                 )
             if (
                 row.get("id") != owned["config_id"]
@@ -223,7 +227,56 @@ class KindColdCreateSetup:
             )
 
         verify()
-        return ColdCreateSelection(pin, owned["config_id"], str(owned_path), verify)
+        if not config.supply_shape:
+            return ColdCreateSelection(pin, owned["config_id"], str(owned_path), verify)
+
+        # The API reads a shape only from an enabled config. A zero slot target
+        # keeps the pool from warming anything the create could adopt, so the
+        # create still builds cold, now with this config's shape.
+        enabled_request = {**request, "enabled": True}
+
+        def verify_enabled() -> None:
+            rows, policies = inventory()
+            require_owned(rows, owned, enabled=True)
+            _seal(
+                directory / f"verified-enabled-{uuid.uuid4().hex}.json",
+                {"identity": identity, "configs": rows, "policies": policies},
+            )
+
+        def put(body: dict[str, Any], action: str) -> None:
+            self.assert_lease()
+            response = self.admin("PUT", "warm-pools", body)
+            _seal(directory / f"{action}-{uuid.uuid4().hex}.json", response)
+            if response.get("id") != owned["config_id"]:
+                raise SmokeConfigurationError(
+                    f"cold config {action} changed the owned config identity"
+                )
+
+        def enable() -> None:
+            put(enabled_request, "enable")
+            verify_enabled()
+
+        def restore() -> None:
+            # Idempotent, so it is safe to arm before `enable` runs.
+            put(request, "restore")
+            deadline = time.monotonic() + 90
+            while True:
+                try:
+                    verify()
+                    return
+                except SmokeConfigurationError:
+                    if time.monotonic() >= deadline:
+                        raise
+                time.sleep(1)
+
+        return ColdCreateSelection(
+            pin,
+            owned["config_id"],
+            str(owned_path),
+            verify_enabled,
+            enable=enable,
+            restore=restore,
+        )
 
     def prepare_warm(
         self, template: str, config: KindWarmPoolConfig

@@ -298,7 +298,8 @@ class SmokeServices:
         if sandbox_config.kind_cold_create is not None:
             if kind is None or fixture_type is not KindEcw:
                 raise SmokeConfigurationError("configured cold create requires KindEcw")
-            with context.phase("establish owned disabled cold-create config"):
+            state = "zero-slot" if sandbox_config.kind_cold_create.supply_shape else "disabled"
+            with context.phase(f"establish owned {state} cold-create config"):
                 release = kind.acquire_cold_create_setup()
                 context.scope.defer(
                     "release Kind cold-create setup Lease", release, critical=True
@@ -306,6 +307,13 @@ class SmokeServices:
                 selection = kind.prepare_cold_create(
                     template, sandbox_config.kind_cold_create
                 )
+                if selection.enable is not None and selection.restore is not None:
+                    context.scope.defer(
+                        "disable owned cold-create config",
+                        selection.restore,
+                        critical=True,
+                    )
+                    selection.enable()
                 template = selection.template
                 before_create = selection.verify
                 context.record("cold_config_id", selection.config_id)

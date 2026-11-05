@@ -13,7 +13,9 @@ scenario's own sandbox, never for whatever an earlier scenario left behind:
 - Prometheus holds the shim's create latency from a shim process that started
   after the scenario did, on the node that trace names, and a space-api create
   count that grew after the scenario's start;
-- Loki holds a SPACE pod log line that names the sandbox.
+- Loki holds a SPACE pod log line that names the sandbox;
+- Prometheus holds exactly one requested-size observation per distribution
+  for the sandbox's create, with its classification tags and its size.
 
 Each check records what it read, at the scenario's start and at its last poll
 where it compares the two, so a failure's evidence shows which leg stopped.
@@ -39,6 +41,13 @@ if TYPE_CHECKING:
 
 SHIM_SERVICE = "containerd-shim-space-v2"
 API_SERVICE = "space-api"
+# `sandbox.api.requested.vcpu` and `.memory_bytes` under the Kind Prometheus
+# OTLP translation (UnderscoreEscapingWithSuffixes): the unitless vCPU name
+# gains nothing, and the `By` memory name already ends in `_bytes`. Both are
+# exponential histograms, so they arrive as native histograms.
+REQUESTED_VCPU = "space_sandbox_api_requested_vcpu"
+REQUESTED_MEMORY = "space_sandbox_api_requested_memory_bytes"
+MIB = 1024 * 1024
 # Two metric export periods plus the Collector's batch, with room for a slow
 # runner.
 DELIVERY_BUDGET_SECONDS = 60.0
@@ -253,6 +262,141 @@ class TelemetryDeliveryAssertions:
             f"Loki holds no SPACE pod log line naming {sandbox_id}",
             failure_evidence=space_lines,
         )
+
+    def expect_requested_create_size(
+        self, *, template: str, client_id: str, vcpu: int, memory_mib: int
+    ) -> None:
+        """The create recorded one accepted, defaulted sample of its size in each
+        requested-size distribution.
+
+        Exact deltas hold only on a bench that creates nothing else of this
+        template and shape meanwhile: the suite runs one scenario at a time,
+        and every series these tags select is shared with other runs.
+        """
+
+        labels = {
+            "kind": "create",
+            "surface": "ecw",
+            "admission": "accepted",
+            "defaulted": "true",
+            "template": template,
+            "client_id": client_id,
+        }
+        selector = "{" + ", ".join(f'{key}="{value}"' for key, value in labels.items()) + "}"
+        expected = {REQUESTED_VCPU: float(vcpu), REQUESTED_MEMORY: float(memory_mib * MIB)}
+        queries = {
+            name: {
+                part: f"sum by (service_instance_id) (histogram_{part}({name}{selector}))"
+                for part in ("count", "sum")
+            }
+            for name in expected
+        }
+        self._fixture.record("requested_size_queries", queries)
+
+        def read(at: int) -> dict[str, dict[str, tuple[float, float]]]:
+            """Per distribution, each producer instance's `(count, sum)`."""
+            observed: dict[str, dict[str, tuple[float, float]]] = {}
+            for name, parts in queries.items():
+                counts = self._prometheus_vector(parts["count"], at)
+                sums = self._prometheus_vector(parts["sum"], at)
+                self._fixture.verify(
+                    counts.keys() == sums.keys(),
+                    f"{name}: histogram count and sum name different instances",
+                    count_instances=sorted(counts),
+                    sum_instances=sorted(sums),
+                )
+                observed[name] = {
+                    instance: (counts[instance], sums[instance]) for instance in counts
+                }
+            return observed
+
+        def delta(
+            before: Mapping[str, tuple[float, float]], now: Mapping[str, tuple[float, float]]
+        ) -> tuple[float, float, list[str]]:
+            # As in `expect_metrics`: an instance absent at the start counts from
+            # zero, and one whose count fell restarted and counts from zero too.
+            count = total = 0.0
+            resets = []
+            for instance, (now_count, now_sum) in now.items():
+                start_count, start_sum = before.get(instance, (0.0, 0.0))
+                if now_count < start_count:
+                    resets.append(instance)
+                    start_count = start_sum = 0.0
+                count += now_count - start_count
+                total += now_sum - start_sum
+            return count, total, sorted(resets)
+
+        baseline_at = self._since
+        baseline = read(baseline_at)
+        final_at = baseline_at
+
+        def poll() -> dict[str, dict[str, tuple[float, float]]]:
+            nonlocal final_at
+            final_at = int(time.time())
+            return read(final_at)
+
+        final = self._poll(
+            poll,
+            lambda now: all(delta(baseline[name], now[name])[0] >= 1 for name in expected),
+        )
+        deltas = {name: delta(baseline[name], final[name]) for name in expected}
+        evidence = {
+            "labels": labels,
+            "baseline_at": baseline_at,
+            "final_at": final_at,
+            "budget_seconds": DELIVERY_BUDGET_SECONDS,
+            "baseline": baseline,
+            "final": final,
+            "deltas": {
+                name: {"count": count, "sum": total, "reset_instances": resets}
+                for name, (count, total, resets) in deltas.items()
+            },
+            "expected_sums": expected,
+        }
+        self._fixture.record("requested_size", evidence)
+        for name, value in expected.items():
+            count, total, _ = deltas[name]
+            self._fixture.verify(
+                count == 1 and total == value,
+                f"Prometheus {name}{selector} moved by count {count} and sum {total}, "
+                f"not count 1 and sum {value}, between {baseline_at} and {final_at}",
+                **evidence,
+            )
+
+    def _prometheus_vector(self, query: str, at: int) -> dict[str, float]:
+        """An instant vector keyed by `service_instance_id`; anything else fails."""
+        body = self._control.telemetry_query(
+            "prometheus", "/api/v1/query", {"query": query, "time": str(at)}
+        )
+        data = body.get("data") if isinstance(body, Mapping) else None
+        self._fixture.verify(
+            isinstance(data, Mapping)
+            and body.get("status") == "success"
+            and data.get("resultType") == "vector"
+            and isinstance(data.get("result"), list),
+            "Prometheus answered a requested-size query with no instant vector",
+            query=query,
+            at=at,
+            response=str(body)[:400],
+        )
+        vector: dict[str, float] = {}
+        for sample in data["result"]:
+            instance = sample.get("metric", {}).get("service_instance_id")
+            value = sample.get("value")
+            number: float | None
+            try:
+                number = float(value[1])
+            except (TypeError, IndexError, ValueError):
+                number = None
+            self._fixture.verify(
+                bool(instance) and number is not None and instance not in vector,
+                "Prometheus returned a malformed requested-size sample",
+                query=query,
+                at=at,
+                sample=str(sample)[:400],
+            )
+            vector[str(instance)] = number  # verified above
+        return vector
 
     def _prometheus(self, query: str, at: int) -> list[dict[str, Any]]:
         body = self._control.telemetry_query(

@@ -24,6 +24,9 @@ class _Admin:
         self.policies = []
         self.calls = []
         self.lose_put_response = False
+        # Only the shape-supplying mode rewrites its own config, and only after
+        # creating it; every other PUT must find no config.
+        self.update_owned = False
         self.releases = [
             {
                 "id": "release-id",
@@ -36,6 +39,17 @@ class _Admin:
 
     def __call__(self, method, resource, body=None):
         self.calls.append((method, resource))
+        if method == "PUT" and self.update_owned:
+            (row,) = [
+                row
+                for row in self.configs
+                if all(
+                    row[key] == body[key]
+                    for key in ("template_name", "content_hash", "vcpu", "memory_mib")
+                )
+            ]
+            row.update(body)
+            return copy.deepcopy(row)
         if method == "PUT":
             intents = list(self.receipts.glob("*/intent.json"))
             if (
@@ -108,6 +122,51 @@ class KindColdCreateTests(unittest.TestCase):
         )
         fresh.prepare("seed", CONFIG).verify()
         self.assertEqual(self.admin.calls.count(("PUT", "warm-pools")), 1)
+
+    def test_shape_supplying_config_is_enabled_without_capacity_then_restored(self):
+        selection = self.control.prepare(
+            "seed", KindColdCreateConfig(2, 1024, supply_shape=True)
+        )
+        self.assertIsNotNone(selection.enable)
+        self.assertIsNotNone(selection.restore)
+        # Owned exactly as the disabled mode owns it: created disabled, once.
+        self.assertIs(self.admin.configs[0]["enabled"], False)
+        with self.assertRaises(SmokeConfigurationError):
+            selection.verify()
+        # Restore is armed before enable, so it must hold for a config that
+        # was never enabled.
+        self.admin.update_owned = True
+        selection.restore()
+        self.assertIs(self.admin.configs[0]["enabled"], False)
+
+        selection.enable()
+        row = self.admin.configs[0]
+        self.assertEqual(
+            (row["id"], row["enabled"], row["target_ready_slots"], row["vcpu"], row["memory_mib"]),
+            ("config-id", True, 0, 2, 1024),
+        )
+        selection.verify()
+        for slots in ("warming_slots", "ready_slots", "claimed_slots"):
+            with self.subTest(slots=slots):
+                row[slots] = 1
+                with self.assertRaises(SmokeConfigurationError):
+                    selection.verify()
+                row[slots] = 0
+        self.lease_owned = False
+        with self.assertRaises(SmokeConfigurationError):
+            selection.verify()
+        self.lease_owned = True
+
+        selection.restore()
+        self.assertIs(self.admin.configs[0]["enabled"], False)
+        # The disabled mode adopts the restored config unchanged, and stays
+        # without an enable step of its own.
+        self.admin.update_owned = False
+        disabled = self.control.prepare("seed", CONFIG)
+        disabled.verify()
+        self.assertIsNone(disabled.enable)
+        self.assertIsNone(disabled.restore)
+        self.assertEqual(len(self.admin.configs), 1)
 
     def test_unknown_config_and_enabled_policy_refuse_without_put(self):
         for case in (

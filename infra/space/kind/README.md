@@ -895,7 +895,8 @@ Rust service and the shim, with no OTLP endpoint or identity overrides, for a
 leaner bench. The Kind CI shards explicitly pin `otel`;
 the typed `local.telemetry_reaches_local_backends` scenario, in their normal
 inventory, polls Tempo, Prometheus and Loki for its own sandbox's trace, shim
-metrics and log lines.
+metrics and log lines, and Prometheus for the requested-size samples of its
+cold create.
 
 For external metrics/traces, set `SPACE_KIND_OTLP_METRICS_ENDPOINT` and/or
 `SPACE_KIND_OTLP_TRACES_ENDPOINT` in the same JSON. Each explicit plaintext
