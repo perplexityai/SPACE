@@ -115,6 +115,21 @@ const RO_COLUMN_DENYLIST: &[(&str, &[&str])] = &[
     ("template_tenant_publication_grants", &["id"]),
 ];
 
+/// Relations bootstrap grants the application roles nothing on: compatibility
+/// views being browned out before a migration drops them. The brownout revokes
+/// the application roles' privileges so a remaining reader fails loudly, and
+/// the grant loop would otherwise restore them on the next run. Revokes still
+/// apply to a listed relation: the credential fence, and the column fence's
+/// `space_ro` revoke without its column-scoped re-grant. Beyond those revokes,
+/// bootstrap does not redo a brownout that something else undid, such as a
+/// migration that recreates the view or a run from an image without the entry.
+/// An entry must ship in every migrator image that can run bootstrap while its
+/// brownout is in effect. Remove it only after the migration that drops its
+/// view has applied everywhere: provisioning runs bootstrap before migrations,
+/// so an image without the entry would re-grant the view before the drop. An
+/// entry that names no relation is ignored.
+const GRANT_EXCLUDED_RELATIONS: &[&str] = &[];
+
 #[derive(Parser)]
 pub struct BootstrapRolesArgs {
     /// Control-plane Postgres connection URI. Must authenticate as a role
@@ -670,7 +685,7 @@ async fn bootstrap(
     skipped += adopt_relation_ownership(conn).await?;
     skipped += adopt_routine_ownership(conn).await?;
     skipped += adopt_type_ownership(conn).await?;
-    skipped += converge_grants(conn).await?;
+    skipped += converge_grants(conn, GRANT_EXCLUDED_RELATIONS).await?;
     Ok(skipped)
 }
 
@@ -1337,7 +1352,11 @@ async fn converge_schema_privileges(conn: &mut PgConnection) -> Result<usize, Bo
     Ok(skipped)
 }
 
-async fn converge_grants(conn: &mut PgConnection) -> Result<usize, BootstrapRolesError> {
+/// Relations in `excluded` receive no grants; see [`GRANT_EXCLUDED_RELATIONS`].
+async fn converge_grants(
+    conn: &mut PgConnection,
+    excluded: &[&str],
+) -> Result<usize, BootstrapRolesError> {
     let mut skipped = 0_usize;
 
     for sql in [
@@ -1383,7 +1402,12 @@ async fn converge_grants(conn: &mut PgConnection) -> Result<usize, BootstrapRole
     let credential_tables: BTreeSet<&str> = CREDENTIAL_TABLES.iter().copied().collect();
     let ro_column_denylist: std::collections::BTreeMap<&str, &[&str]> =
         RO_COLUMN_DENYLIST.iter().copied().collect();
+    let excluded: BTreeSet<&str> = excluded.iter().copied().collect();
     for (relkind, relname) in &relations {
+        if excluded.contains(relname.as_str()) {
+            tracing::info!(relation = %relname, "granting nothing on excluded relation");
+            continue;
+        }
         let target = quote_ident(relname);
         let statements = if relkind.is_sequence() {
             vec![format!(
@@ -1459,6 +1483,10 @@ async fn converge_grants(conn: &mut PgConnection) -> Result<usize, BootstrapRole
             relation: relname.clone(),
             source,
         })?;
+        // A listed relation keeps the revoke but gets no column-scoped re-grant.
+        if excluded.contains(relname.as_str()) {
+            continue;
+        }
         let columns = ro_visible_columns(conn, relname, denied).await?;
         if !columns.is_empty() {
             let column_list = columns
