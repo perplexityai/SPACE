@@ -3,15 +3,14 @@
 
 #[test]
 fn emit() {
-    if pplx_space_common_core::env::test_hook_var("SPACE_TRACE_PARITY_MODE").is_none() {
+    if std::env::var("SPACE_TRACE_PARITY_MODE").is_err() {
         return;
     }
     let runtime = tokio::runtime::Runtime::new().expect("fixture runtime");
     runtime.block_on(async {
-        let guard = crate::init("space-trace-parity-rust").expect("tracing initialization");
-        if pplx_space_common_core::env::test_hook_var("SPACE_TRACE_PARITY_MODE").as_deref()
-            == Some("operation-names")
-        {
+        let guard = crate::init("space-trace-parity-rust", crate::LogContext::default())
+            .expect("tracing initialization");
+        if std::env::var("SPACE_TRACE_PARITY_MODE").as_deref() == Ok("operation-names") {
             operation_names_workload();
         } else {
             for failed in [false, true] {

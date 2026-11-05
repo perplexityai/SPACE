@@ -50,7 +50,10 @@ fn cleared_sidecar_environment_preserves_otlp_producer_identity() {
                 assert_eq!(std::env::var("OTEL_SERVICE_NAME").unwrap(), "manager-canary");
                 assert_eq!(std::env::var("OTEL_RESOURCE_ATTRIBUTES").unwrap(),
                     "team=infra,deployment.environment.name=testing,service.version=revision,service.instance.id=shared");
-                let guard = pplx_space_observability::init("space-spaced-host").unwrap();
+                let guard = pplx_space_observability::init(
+                    "space-spaced-host",
+                    pplx_space_observability::LogContext::default(),
+                ).unwrap();
                 pplx_space_metrics::grpc::server_active_requests(1);
                 tokio::task::spawn_blocking(move || drop(guard))
                     .await

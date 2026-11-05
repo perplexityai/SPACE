@@ -122,11 +122,32 @@ pub fn log_startup_banner(service_name: &str) {
 
 #[derive(Clone, Debug, Default)]
 pub struct LogContext {
+    cluster_id: Option<String>,
     sandbox_id: Option<String>,
     boot_type: Option<String>,
 }
 
 impl LogContext {
+    /// The process's cluster identity, carried as `cluster_id` on every
+    /// JSON log line and every metric (a constant tag, and the OTLP
+    /// resource's `space.cluster.id`). An empty id is none: without one,
+    /// neither carries it.
+    pub fn with_cluster_id(mut self, cluster_id: impl Into<String>) -> Self {
+        let cluster_id = cluster_id.into();
+        self.cluster_id = (!cluster_id.is_empty()).then_some(cluster_id);
+        self
+    }
+
+    /// Clears a cluster id set by [`with_cluster_id`](Self::with_cluster_id).
+    pub fn without_cluster_id(mut self) -> Self {
+        self.cluster_id = None;
+        self
+    }
+
+    pub fn cluster_id(&self) -> Option<&str> {
+        self.cluster_id.as_deref()
+    }
+
     pub fn with_sandbox_id(mut self, sandbox_id: impl Into<String>) -> Self {
         self.sandbox_id = Some(sandbox_id.into());
         self
@@ -154,8 +175,7 @@ impl JsonLogContext {
             service: service_name.to_string(),
             environment: logging::environment(),
             version: logging::version(),
-            cluster_id: pplx_space_cluster_id::process_cluster_id()
-                .map(|id| id.as_str().to_string()),
+            cluster_id: context.cluster_id,
             sandbox_id: context.sandbox_id,
             boot_type: context.boot_type,
         }
@@ -742,11 +762,12 @@ fn deployment_env_is_json(value: Result<String, std::env::VarError>) -> bool {
     )
 }
 
-pub fn init(service_name: &str) -> Result<TelemetryGuard, ObservabilityError> {
-    init_with_log_context(service_name, LogContext::default())
-}
-
-pub fn init_with_log_context(
+/// Installs logging, tracing and metrics for `service_name`.
+///
+/// `log_context` carries the process identity that every log line and metric
+/// repeats, such as [`LogContext::with_cluster_id`]; it is a required argument
+/// so a caller cannot drop that identity by choosing a shorter entry point.
+pub fn init(
     service_name: &str,
     log_context: LogContext,
 ) -> Result<TelemetryGuard, ObservabilityError> {
@@ -760,7 +781,7 @@ pub fn init_with_log_context(
     // unreachable receiver is a runtime condition handled when the sink is
     // built, and so is a configuration `auto` chose.
     sink::validate_metrics_sink_env(metrics_sink_choice, metrics_selection)?;
-    let constant_metric_tags = sink::constant_tags_from_env(&identity);
+    let constant_metric_tags = sink::build_constant_tags(&identity, log_context.cluster_id.clone());
     // tracing-subscriber's fmt layer writes to stdout by default, so the
     // ANSI decision must follow stdout's TTY status. Checking stderr would
     // surface escape codes when stdout is piped to a file/journal.

@@ -217,7 +217,6 @@ fn child_command(mode: &str, endpoint: &str, hostname: &str, sink: Option<&str>)
         .env("DD_VERSION", "test-sha")
         .env("RUST_LOG", "info")
         .env("SPACE_LOG_FORMAT", "json")
-        .env("SPACE_CLUSTER_ID", "test-cluster")
         .env("KUBERNETES_SERVICE_HOST", "10.0.0.1")
         .env("SPACE_K8S_POD_NAME", format!("{hostname}-pod"))
         .env_remove("SPACE_K8S_NODE_NAME")
@@ -233,21 +232,27 @@ fn run_child(mode: &str, endpoint: &str, hostname: &str) -> ExitStatus {
     run_child_with_sink(mode, endpoint, hostname, "otlp")
 }
 
+fn init_fixture()
+-> Result<pplx_space_observability::TelemetryGuard, pplx_space_observability::ObservabilityError> {
+    pplx_space_observability::init(
+        "sandbox-manager",
+        pplx_space_observability::LogContext::default().with_cluster_id("test-cluster"),
+    )
+}
+
 #[test]
 fn otlp_process_fixture_child() {
     let Ok(mode) = std::env::var(CHILD_MODE_ENV) else {
         return;
     };
     if mode == "no-runtime" {
-        let _guard = pplx_space_observability::init("sandbox-manager")
-            .expect("initialize synchronous fixture observability");
+        let _guard = init_fixture().expect("initialize synchronous fixture observability");
         pplx_space_observability::counter("lifecycle.fixture", 1, &[]);
         return;
     }
     let runtime = tokio::runtime::Runtime::new().expect("build fixture Tokio runtime");
     let _runtime_context = runtime.enter();
-    let guard = pplx_space_observability::init("sandbox-manager")
-        .expect("initialize fixture observability");
+    let guard = init_fixture().expect("initialize fixture observability");
     pplx_space_observability::counter("lifecycle.fixture", 1, &[]);
     if mode == "selection" {
         pplx_space_observability::gauge("lifecycle.fixture.gauge", 0.0, &[]);

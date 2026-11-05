@@ -7,7 +7,7 @@ use tracing_subscriber::layer::SubscriberExt as _;
 fn trace_filter_validation_is_strict_and_does_not_disclose_values() {
     const CHILD: &str = "SPACE_TRACE_FILTER_VALIDATION_CHILD";
     if std::env::var_os(CHILD).is_some() {
-        let error = match super::init("filter-validation") {
+        let error = match super::init("filter-validation", super::LogContext::default()) {
             Ok(_) => panic!("invalid trace filter accepted"),
             Err(error) => error,
         };
@@ -75,7 +75,7 @@ fn deployment_git_sha_prefers_runtime_env_then_identity_file() {
 fn log_filters_apply_in_every_format_without_trace_export() {
     const CHILD: &str = "SPACE_LOG_FILTER_FORMAT_CHILD";
     if std::env::var_os(CHILD).is_some() {
-        let guard = super::init("filter-formats").unwrap();
+        let guard = super::init("filter-formats", super::LogContext::default()).unwrap();
         tracing::info!("fixture-info");
         tracing::error!("fixture-error");
         guard.shutdown().unwrap();
@@ -245,6 +245,31 @@ fn json_logs_include_service_and_sandbox_context() {
     assert!(value["timestamp"].as_str().is_some_and(|ts| !ts.is_empty()));
 }
 
+#[test]
+fn json_logs_carry_a_nonempty_cluster_id_only() {
+    // Metrics omit an empty id when building their constant tags (see the
+    // sink tests); the log field must agree with them.
+    for (cluster_id, expected) in [("prod-2", Some("prod-2")), ("", None)] {
+        let output = CapturedLogs::default();
+        let layer = tracing_subscriber::fmt::layer()
+            .event_format(super::SpaceJsonFormat::new(
+                "producer",
+                super::LogContext::default().with_cluster_id(cluster_id),
+            ))
+            .fmt_fields(tracing_subscriber::fmt::format::JsonFields::new())
+            .with_writer(output.clone());
+        let subscriber = tracing_subscriber::registry().with(layer);
+        tracing::subscriber::with_default(subscriber, || tracing::info!("logged"));
+
+        let value: serde_json::Value = serde_json::from_str(output.contents().trim()).unwrap();
+        assert_eq!(
+            value.get("cluster_id").and_then(|v| v.as_str()),
+            expected,
+            "{cluster_id:?}"
+        );
+    }
+}
+
 // The layer is deliberately built and used before init. This catches a
 // formatter that caches Legacy too early, or an early policy lookup that pins
 // a later OTLP process to the compatibility path.
@@ -275,7 +300,7 @@ async fn logging_layers_follow_resolved_destinations_even_when_created_early() {
             })
         };
         emit();
-        let guard = super::init("producer").unwrap();
+        let guard = super::init("producer", super::LogContext::default()).unwrap();
         emit();
         guard.shutdown_async().await.unwrap();
         let records: Vec<serde_json::Value> = output

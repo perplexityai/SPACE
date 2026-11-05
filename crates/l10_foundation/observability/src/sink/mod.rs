@@ -3,8 +3,6 @@ mod datadog;
 #[cfg(feature = "otlp-metrics")]
 mod otlp;
 
-use pplx_space_cluster_id::process_cluster_id;
-
 use crate::{ObservabilityError, identity::Identity, selection::Selection};
 
 #[cfg(feature = "datadog")]
@@ -265,21 +263,13 @@ pub(super) fn shutdown_metrics() {
     }
 }
 
-pub(super) fn constant_tags_from_env(identity: &Identity) -> Vec<String> {
-    // Read the shared process-global cluster id (single owner in cluster-id,
-    // also consumed by the sandbox-event stream), so metrics and events never
-    // disagree about cluster identity. A malformed value is already dropped +
-    // logged once at that single owner, so it never reaches this tag.
-    let cluster_id = process_cluster_id().map(|id| id.as_str().to_owned());
-    build_constant_tags(identity, cluster_id)
-}
-
 /// Builds the constant tag list attached to every metric emission.
 ///
-/// `cluster_id` is the first-class cluster identity (`SPACE_CLUSTER_ID`); it is
-/// omitted when unset or empty so local/dev processes without a cluster id do
-/// not emit a bare `cluster_id:` tag.
-fn build_constant_tags(identity: &Identity, cluster_id: Option<String>) -> Vec<String> {
+/// `cluster_id` is the caller's cluster identity (see
+/// [`crate::LogContext::with_cluster_id`]); it is omitted when unset or empty
+/// so local/dev processes without a cluster id do not emit a bare
+/// `cluster_id:` tag.
+pub(super) fn build_constant_tags(identity: &Identity, cluster_id: Option<String>) -> Vec<String> {
     let mut constant_tags = Vec::new();
     let [env, service, version] = identity.metric_identity();
     if let Some(env) = env {
