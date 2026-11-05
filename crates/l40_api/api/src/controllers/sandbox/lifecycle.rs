@@ -680,15 +680,11 @@ fn cluster_admission_controller_error(
         ClusterAdmissionError::RateLimited {
             message,
             retry_after,
-        } => ControllerError::rate_limited(message)
-            .with_retry_after_header(retry_after)
-            .with_retry_after_cause(
-                crate::controllers::ControllerRetryAfterCause::ClusterActivationAdmission,
-            ),
+        } => ControllerError::cluster_admission_rejected(message, Some(retry_after), true),
         ClusterAdmissionError::EmptyCluster {
             message,
             retry_after,
-        } => ControllerError::rate_limited(message).with_retry_after_header(retry_after),
+        } => ControllerError::cluster_admission_rejected(message, Some(retry_after), false),
     }
 }
 

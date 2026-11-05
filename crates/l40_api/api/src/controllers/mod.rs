@@ -381,6 +381,27 @@ impl ControllerError {
     pub fn precondition_failed(message: impl Into<String>) -> Self {
         Self::new(StatusCode::PRECONDITION_FAILED, message)
     }
+
+    /// A 429 from cluster activation admission, at request entry or charged
+    /// later by the substrate. Only `rate_limited` adds the
+    /// [`ControllerRetryAfterCause::ClusterActivationAdmission`] cause: an
+    /// empty cluster omits it, so the async dispatcher gives that refusal a
+    /// bounded retry rather than re-queueing it forever.
+    pub(crate) fn cluster_admission_rejected(
+        message: impl Into<String>,
+        retry_after: Option<Duration>,
+        rate_limited: bool,
+    ) -> Self {
+        let mut error = Self::rate_limited(message);
+        if let Some(retry_after) = retry_after {
+            error = error.with_retry_after_header(retry_after);
+        }
+        if rate_limited {
+            error =
+                error.with_retry_after_cause(ControllerRetryAfterCause::ClusterActivationAdmission);
+        }
+        error
+    }
 }
 
 pub(crate) fn internal_error(message: &'static str, error: impl fmt::Display) -> ControllerError {
