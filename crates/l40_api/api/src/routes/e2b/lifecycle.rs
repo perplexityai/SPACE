@@ -236,12 +236,20 @@ pub(super) fn federated_grant_required() -> bool {
 /// propagates (it is the enforced renewal path), connect warns and continues
 /// (its renewal is opportunistic). A stale renewal is skipped inside the
 /// store and reported as success to both.
+///
+/// A delete tombstone (`deleted`, `cleanup_required`) persists nothing and
+/// reports success: ECW answers it as not found, which both callers reach
+/// through their own lifecycle check, so no renewal error can preempt that
+/// answer and no newer grant outlives the sandbox it was offered for.
 pub(super) async fn persist_request_grant(
     state: &AppState,
     sandbox: &crate::models::Sandbox,
     federated_owner: Option<&crate::federated_identity::FederatedOwner>,
     federated_service_grant: Option<&crate::federated_identity::FederatedServiceGrant>,
 ) -> Result<(), crate::controllers::ControllerError> {
+    if SandboxStateInput::stored(sandbox.lifecycle.as_str()).is_tombstone() {
+        return Ok(());
+    }
     if let Some((owner, grant)) = grant_to_persist(
         sandbox.owner_source,
         federated_owner,
@@ -1134,7 +1142,7 @@ fn legacy_connect_should_touch(
     requested_timeout_secs.is_some() || e2b_policy_for_refresh(current_policy).is_some()
 }
 
-fn teardown_lifecycle_connect_error(sandbox: &Sandbox) -> Option<E2bApiError> {
+pub(super) fn teardown_lifecycle_connect_error(sandbox: &Sandbox) -> Option<E2bApiError> {
     match sandbox
         .lifecycle
         .trim()
@@ -1150,8 +1158,7 @@ fn teardown_lifecycle_connect_error(sandbox: &Sandbox) -> Option<E2bApiError> {
         }
         Ok(_) => None,
         Err(_) => match sandbox.lifecycle.trim().to_ascii_lowercase().as_str() {
-            "deleted" => Some(E2bApiError::not_found("Sandbox")),
-            "cleanup_required" => Some(E2bApiError::sandbox_not_ready()),
+            "deleted" | "cleanup_required" => Some(E2bApiError::not_found("Sandbox")),
             _ => None,
         },
     }

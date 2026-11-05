@@ -181,6 +181,11 @@ async fn timeout_validation_scope_and_policy_matrix() -> TestDbResult<()> {
         ("stopped", default.clone(), StatusCode::PRECONDITION_FAILED),
         ("deleted", default.clone(), StatusCode::PRECONDITION_FAILED),
         (
+            "cleanup_required",
+            default.clone(),
+            StatusCode::PRECONDITION_FAILED,
+        ),
+        (
             "suspended",
             AutoLifecyclePolicy::disabled(),
             StatusCode::PRECONDITION_FAILED,

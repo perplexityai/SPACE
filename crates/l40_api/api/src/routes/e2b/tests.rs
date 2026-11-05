@@ -48,9 +48,10 @@ use super::{
     file_upload_capability_org, file_upload_signing_secret, mint_file_upload_query,
     parse_metadata_query, parse_state_filter, path_root_router_with_ecw_hosts, request_client_id,
     sandbox_metadata, sandbox_template_id, should_ensure_usable_pod_on_connect,
-    should_touch_on_connect, should_wake_on_connect, terminal_sandbox_error,
-    translate_create_request, translate_sandbox_state, validate_connect_request,
-    validate_list_query, validate_pause_request, validate_refresh_request, validate_resume_request,
+    should_touch_on_connect, should_wake_on_connect, teardown_lifecycle_connect_error,
+    terminal_sandbox_error, translate_create_request, translate_sandbox_state,
+    validate_connect_request, validate_list_query, validate_pause_request,
+    validate_refresh_request, validate_resume_request,
 };
 use crate::{
     controllers::sandbox::AutoLifecycleTouchOutcome,
@@ -3267,6 +3268,25 @@ fn connect_touch_recovery_does_not_wake_teardown_state() {
     }
 }
 
+/// Connect re-reads the row before a retried touch: both delete tombstones
+/// are gone there too, while a teardown still in flight is not ready yet.
+#[test]
+fn connect_teardown_check_answers_tombstones_not_found() {
+    for (lifecycle, expected) in [
+        ("deleted", StatusCode::NOT_FOUND),
+        ("cleanup_required", StatusCode::NOT_FOUND),
+        ("stopping", StatusCode::CONFLICT),
+        ("deleting", StatusCode::CONFLICT),
+    ] {
+        let mut sandbox = test_sandbox();
+        sandbox.lifecycle = lifecycle.to_string();
+
+        let error = teardown_lifecycle_connect_error(&sandbox)
+            .unwrap_or_else(|| panic!("{lifecycle} must refuse connect"));
+        assert_eq!(error.status, expected, "{lifecycle}");
+    }
+}
+
 #[test]
 fn not_started_connect_touch_can_wake_refetched_paused_state() {
     let mut sandbox = test_sandbox();
@@ -3969,7 +3989,7 @@ async fn connect_route_extends_deadline_without_replacing_policy(
     "cleanup_required",
     "unplaced",
     ConnectRouteActiveNode::None,
-    StatusCode::CONFLICT,
+    StatusCode::NOT_FOUND,
 ))]
 #[case::deleted_teardown_row(ConnectRouteDbShape::error(
     "deleted teardown row",
@@ -5473,6 +5493,176 @@ async fn connect_renews_the_persisted_federated_grant() -> TestResult {
     assert_eq!(expiry, fresher_expiry);
 
     Ok(())
+}
+
+/// ECW answers both delete tombstones as not found, so neither grant path may
+/// renew a tombstone's grant, while a live row's renewal still lands.
+#[tokio::test(flavor = "current_thread")]
+async fn grant_renewal_skips_tombstoned_sandboxes() -> TestResult {
+    use crate::federated_identity::{
+        FEDERATED_SERVICE_GRANT_EXPIRES_AT_HEADER, FEDERATED_SERVICE_GRANT_HEADER,
+    };
+
+    let db = pg_test_db().await?;
+    let fixture = federated_connect_fixture(&db).await?;
+    let expiry = time::OffsetDateTime::now_utc().unix_timestamp() + 7 * 24 * 3600;
+    for (lifecycle, route) in [
+        ("deleted", "connect"),
+        ("deleted", "refreshes"),
+        ("cleanup_required", "connect"),
+        ("cleanup_required", "refreshes"),
+        ("creating", "refreshes"),
+    ] {
+        sqlx::query(sql!(
+            "DELETE FROM sandbox_federated_service_grants WHERE sandbox_id = $1"
+        ))
+        .bind(fixture.sandbox_id)
+        .execute(&db.pool)
+        .await?;
+        set_sandbox_lifecycle(&db.pool, fixture.sandbox_id, lifecycle).await?;
+
+        let response = fixture
+            .app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/sandboxes/{}/{route}", fixture.sandbox_id))
+                    .header(header::HOST, TEST_ECW_API_HOST)
+                    .header(FEDERATED_SERVICE_GRANT_HEADER, "offered-grant")
+                    .header(
+                        FEDERATED_SERVICE_GRANT_EXPIRES_AT_HEADER,
+                        expiry.to_string(),
+                    )
+                    .body(Body::empty())?,
+            )
+            .await?;
+        let label = format!("{route} on a {lifecycle} sandbox");
+        let tombstone = lifecycle != "creating";
+        if tombstone {
+            assert_e2b_error_response(
+                response,
+                StatusCode::NOT_FOUND,
+                404,
+                "Sandbox not found",
+                &label,
+            )
+            .await;
+        }
+        assert_eq!(
+            stored_federated_grant_blob(&db.pool, fixture.sandbox_id).await?,
+            (!tombstone).then(|| b"offered-grant".to_vec()),
+            "{label}"
+        );
+    }
+    Ok(())
+}
+
+/// A tombstone's expired grant is not a retryable renewal failure: refresh
+/// with an older offer answers not found and leaves the stored grant alone.
+#[tokio::test(flavor = "current_thread")]
+async fn refresh_of_a_tombstone_with_an_expired_grant_is_not_found() -> TestResult {
+    use crate::federated_identity::{
+        DEFAULT_FEDERATED_GRANT_AUDIENCE, FEDERATED_OWNER_GRANT_PURPOSE,
+        FEDERATED_SERVICE_GRANT_EXPIRES_AT_HEADER, FEDERATED_SERVICE_GRANT_HEADER,
+        FEDERATED_SERVICE_GRANT_ISSUED_AT_HEADER, FederatedServiceGrant,
+        upsert_sandbox_federated_service_grant,
+    };
+
+    let db = pg_test_db().await?;
+    let fixture = federated_connect_fixture(&db).await?;
+    let now_unix = time::OffsetDateTime::now_utc().unix_timestamp();
+    upsert_sandbox_federated_service_grant(
+        &db.pool,
+        fixture.sandbox_id,
+        &fixture.owner,
+        &FederatedServiceGrant::from_unix_expiry(b"stored-grant".to_vec(), now_unix + 24 * 3600)?
+            .with_issued_at_unix(now_unix - 3600)?,
+        DEFAULT_FEDERATED_GRANT_AUDIENCE,
+        FEDERATED_OWNER_GRANT_PURPOSE,
+    )
+    .await?;
+    // Age the stored grant into expiry. The BEFORE UPDATE trigger would stamp
+    // updated_at past the new expiry and trip the row's CHECK.
+    sqlx::query(sql!(
+        "ALTER TABLE sandbox_federated_service_grants DISABLE TRIGGER USER"
+    ))
+    .execute(&db.pool)
+    .await?;
+    sqlx::query(sql!(
+        "UPDATE sandbox_federated_service_grants
+         SET grant_expires_at = NOW() - INTERVAL '1 minute',
+             updated_at = NOW() - INTERVAL '2 hours'
+         WHERE sandbox_id = $1"
+    ))
+    .bind(fixture.sandbox_id)
+    .execute(&db.pool)
+    .await?;
+    sqlx::query(sql!(
+        "ALTER TABLE sandbox_federated_service_grants ENABLE TRIGGER USER"
+    ))
+    .execute(&db.pool)
+    .await?;
+    set_sandbox_lifecycle(&db.pool, fixture.sandbox_id, "cleanup_required").await?;
+
+    let response = fixture
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/sandboxes/{}/refreshes", fixture.sandbox_id))
+                .header(header::HOST, TEST_ECW_API_HOST)
+                .header(FEDERATED_SERVICE_GRANT_HEADER, "older-grant")
+                .header(
+                    FEDERATED_SERVICE_GRANT_EXPIRES_AT_HEADER,
+                    (now_unix + 7 * 24 * 3600).to_string(),
+                )
+                .header(
+                    FEDERATED_SERVICE_GRANT_ISSUED_AT_HEADER,
+                    (now_unix - 2 * 3600).to_string(),
+                )
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_e2b_error_response(
+        response,
+        StatusCode::NOT_FOUND,
+        404,
+        "Sandbox not found",
+        "refresh on a cleanup_required sandbox",
+    )
+    .await;
+    assert_eq!(
+        stored_federated_grant_blob(&db.pool, fixture.sandbox_id).await?,
+        Some(b"stored-grant".to_vec())
+    );
+    Ok(())
+}
+
+async fn set_sandbox_lifecycle(
+    pool: &sqlx::PgPool,
+    sandbox_id: SandboxId,
+    lifecycle: &str,
+) -> TestResult {
+    sqlx::query(sql!("UPDATE sandboxes SET lifecycle = $2 WHERE id = $1"))
+        .bind(sandbox_id)
+        .bind(lifecycle)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+async fn stored_federated_grant_blob(
+    pool: &sqlx::PgPool,
+    sandbox_id: SandboxId,
+) -> TestResult<Option<Vec<u8>>> {
+    Ok(sqlx::query_scalar(sql!(
+        "SELECT grant_blob FROM sandbox_federated_service_grants WHERE sandbox_id = $1"
+    ))
+    .bind(sandbox_id)
+    .fetch_optional(pool)
+    .await?)
 }
 
 struct FederatedConnectFixture {
