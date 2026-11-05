@@ -6,6 +6,40 @@ use std::{
 };
 
 #[test]
+fn runner_drops_privileges_without_procfs() {
+    assert_eq!(Uid::effective(), Uid::from_raw(0), "requires root fixture");
+    const CHILD_ROOT: &str = "SPACE_TEST_CONTAINED_RUNNER_ROOT";
+    if let Some(root) = std::env::var_os(CHILD_ROOT) {
+        // The runner has already discarded host procfs and must release the
+        // child before the child can mount its replacement.
+        nix::unistd::chroot(Path::new(&root)).unwrap();
+        nix::unistd::chdir("/").unwrap();
+        assert!(!Path::new("/proc/self/oom_score_adj").exists());
+        drop_privileges(10001, 10001).unwrap();
+        assert_eq!(Uid::effective(), Uid::from_raw(10001));
+        assert_eq!(Gid::effective(), Gid::from_raw(10001));
+        return;
+    }
+
+    let root = tempfile::tempdir().unwrap();
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "contained_launcher::linux::tests::runner_drops_privileges_without_procfs",
+            "--nocapture",
+        ])
+        .env(CHILD_ROOT, root.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+#[test]
 fn registration_uses_the_sidecar_directory_contract() {
     assert_eq!(Uid::effective(), Uid::from_raw(0), "requires root fixture");
     let scratch = tempfile::tempdir().unwrap();
