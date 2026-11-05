@@ -1,6 +1,7 @@
 import { adminApi, api } from '@/lib/api';
 import { isMissingRoute } from '@/lib/admin-fallback';
 import { publicSandboxIdFromAny } from '@/lib/sandbox-id';
+import { terminalInputFrames } from '@/lib/terminal-input';
 
 type DataPlaneAttachInfo = {
   url: string;
@@ -39,7 +40,8 @@ export type TerminalSessionEvent =
 
 export type TerminalConnection = {
   readonly sessionId: string;
-  // Text is sent UTF-8 encoded; bytes are sent as they are.
+  // Text is sent UTF-8 encoded; bytes are sent as they are. Either is split
+  // into frames of at most TERMINAL_INPUT_CHUNK_BYTES.
   sendInput: (input: string | Uint8Array) => void;
   resize: (cols: number, rows: number) => void;
   close: () => void;
@@ -76,15 +78,6 @@ function toWebSocketUrl(rawUrl: string): string {
     parsed.protocol = 'ws:';
   }
   return parsed.toString();
-}
-
-function encodeBase64(input: string | Uint8Array): string {
-  const bytes = typeof input === 'string' ? new TextEncoder().encode(input) : input;
-  let binary = '';
-  for (const byte of bytes) {
-    binary += String.fromCharCode(byte);
-  }
-  return window.btoa(binary);
 }
 
 function decodeBase64(input: string, decoder: TextDecoder): string {
@@ -246,8 +239,7 @@ export async function openSandboxTerminal(
   return {
     sessionId: session.id,
     sendInput(input: string | Uint8Array) {
-      seq += 1;
-      sendJson({ type: 'input', seq, data_base64: encodeBase64(input) });
+      for (const frame of terminalInputFrames(input, () => (seq += 1))) sendJson(frame);
     },
     resize(cols: number, rows: number) {
       sendJson({ type: 'resize', cols, rows });
