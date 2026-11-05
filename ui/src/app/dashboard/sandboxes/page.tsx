@@ -800,9 +800,7 @@ function SandboxesPage() {
     search: pagedSearch.kind === 'search' ? pagedSearch.text : '',
   };
   const filterInputsKey = JSON.stringify(filterInputs);
-  // What the search box sends, which changes as the operator types.
-  const typedSearch = `${filterInputs.prefix}\n${filterInputs.search}`;
-  const appliedInputsRef = useRef({ key: filterInputsKey, typed: typedSearch });
+  const appliedInputsRef = useRef({ key: filterInputsKey, typed: idFilter });
   // The selected scope, the rows' scope and the next page's cursor, and the
   // loads in flight; see `ListSelection`. The filters change only once a
   // filter does. The creation-time bounds stay relative ("the last hour")
@@ -1275,9 +1273,11 @@ function SandboxesPage() {
     if (appliedInputsRef.current.key === filterInputsKey && appliedSizesRef.current.pageSize === pageSize && appliedSizesRef.current.listLimit === listLimit) {
       return;
     }
-    const delay = appliedInputsRef.current.typed !== typedSearch ? 300 : 0;
+    // Only typing waits: a search an API without `search` refused is sent
+    // again as before at once.
+    const delay = appliedInputsRef.current.typed !== idFilter ? 300 : 0;
     const timer = setTimeout(() => {
-      appliedInputsRef.current = { key: filterInputsKey, typed: typedSearch };
+      appliedInputsRef.current = { key: filterInputsKey, typed: idFilter };
       appliedSizesRef.current = { pageSize, listLimit };
       const plan = selection.select({ filters: serverFilters(filterInputs), pageSize, sampleSize: listLimit });
       if (plan === 'unchanged') return;
