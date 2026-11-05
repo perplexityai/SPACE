@@ -13,8 +13,10 @@
 -- bytes, but the column is unconstrained and rows written before that cap can
 -- be longer; a btree entry over about 2.7 kB fails the build, and an index on
 -- the whole name would leave it INVALID on such a row. 256 characters are at
--- most 1 kB. Names change only on a rename, so the index adds no work to other
--- updates and leaves them HOT.
+-- most 1 kB. Names change only on a rename, so the index keeps an update that
+-- leaves the name unchanged and is otherwise HOT, HOT; an update that is not
+-- HOT anyway, such as one that changes an indexed column like lifecycle,
+-- inserts an entry into this index too.
 --
 -- CONCURRENTLY because sandboxes takes writes on every lifecycle change: a
 -- plain build holds SHARE on the table and would stall them for its

@@ -11,7 +11,9 @@
 -- any database collation, and lets the statement compare with plain `>=`
 -- and `<` in both custom and generic plans, where a LIKE prefix would be
 -- indexable only with a constant pattern. A sandbox's id never changes, so
--- the index adds no work to updates and leaves them HOT.
+-- the index keeps an otherwise-HOT update HOT; an update that is not HOT
+-- anyway, such as one that changes an indexed column like lifecycle,
+-- inserts an entry into this index too.
 --
 -- CONCURRENTLY because sandboxes takes writes on every lifecycle change: a
 -- plain build holds SHARE on the table and would stall them for its
