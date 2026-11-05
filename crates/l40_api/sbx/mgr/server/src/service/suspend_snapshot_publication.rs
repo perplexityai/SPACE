@@ -20,6 +20,14 @@ pub(super) fn canonical_suspend_snapshot_dir(sandbox_dir: &Path) -> PathBuf {
     sandbox_dir.join(LOCAL_SNAPSHOT_DIR)
 }
 
+/// Whether `snapshot_dir` is a sandbox's canonical suspend directory, the only
+/// one a newer suspend publishes over.
+pub(crate) fn is_canonical_suspend_snapshot_dir(snapshot_dir: &Path) -> bool {
+    snapshot_dir
+        .parent()
+        .is_some_and(|sandbox_dir| canonical_suspend_snapshot_dir(sandbox_dir) == snapshot_dir)
+}
+
 pub(super) fn suspend_snapshot_staging_parent_dir(sandbox_dir: &Path) -> PathBuf {
     sandbox_dir.join(SUSPEND_STAGING_PARENT_DIR)
 }

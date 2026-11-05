@@ -1323,7 +1323,7 @@ fn capture_generation_from_record(
 /// refusal of a superseded execution keeps the control plane's verdict, since
 /// a retry by artifact id is refused again while the capture's earlier upload
 /// is retained; anything else is internal.
-fn artifact_backup_submission_status(
+pub(super) fn artifact_backup_submission_status(
     context: &str,
     error: ArtifactBackupSubmissionError,
 ) -> Status {
@@ -1335,6 +1335,9 @@ fn artifact_backup_submission_status(
             format!("{context}: {error}"),
             generation,
         ),
+        ArtifactBackupSubmissionError::Replaced(error) => {
+            Status::failed_precondition(format!("{context}: {error}"))
+        }
         error => Status::internal(format!("{context}: {error}")),
     }
 }
