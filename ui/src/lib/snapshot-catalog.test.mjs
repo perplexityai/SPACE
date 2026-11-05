@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { catalogEmptyText, inventoryCurrent, nodeEmptyText, nodeInventory, nodeListing, seePeriodic } from './snapshot-catalog.ts';
+import { rollbackTargets } from './rollback-targets.ts';
+import { catalogEmptyText, currentInventory, inventoryCurrent, nodeEmptyText, nodeInventory, nodeListing, seePeriodic } from './snapshot-catalog.ts';
 
 const UNAVAILABLE = "The node's report is unavailable, so what it reports keeping for this sandbox is unknown.";
 const PERIODIC_OFF = 'The node does not report its snapshots while periodic snapshots are off, so this list is empty whatever it keeps, checkpoints and earlier periodic snapshots included.';
@@ -61,6 +62,43 @@ test('an inventory read before a periodic change is not read against it', () => 
   seen = seePeriodic(seen, false, 400);
   assert.equal(nodeEmptyText(false, shown(210, seen, 0, false)), UNAVAILABLE);
   assert.equal(nodeEmptyText(false, shown(410, seen, 0, false)), PERIODIC_OFF);
+});
+
+// The rows On the node shows, and offers Rollback on, come from the same
+// check as what it says: a read older than the periodic change shows none.
+test('a read before a periodic change shows no rows to roll back to', () => {
+  const section = { snapshots: [], inventory: [row, { ...row, snapshot_id: 'f-manual-2' }] };
+  const seen = seePeriodic(seePeriodic(null, false, 100), true, 200);
+  for (const requestedAt of [50, 190, null]) {
+    assert.equal(currentInventory(section, requestedAt, seen), null, `requested at ${requestedAt}`);
+  }
+  const shown = currentInventory(section, 200, seen);
+  assert.equal(rollbackTargets(shown, 'running').length, 2);
+  assert.equal(nodeListing(shown.length, true).count, 2);
+  // Nothing changed in this view: the loaded read stands.
+  assert.equal(currentInventory(section, 50, seePeriodic(null, true, 100)), section.inventory);
+  // Not known for the reasons `nodeInventory` gives, whenever it was read.
+  assert.equal(currentInventory({ snapshots: [] }, 200, seen), null);
+  assert.equal(currentInventory(null, 200, seen), null);
+});
+
+// A render React abandons never commits the periodic state it saw, so a later
+// committed render reads the inventory against the history it committed.
+test('a periodic change seen only by an abandoned render does not age a read', () => {
+  const committed = seePeriodic(null, false, 100);
+  // A render sees periodic snapshots on at 200 and is abandoned; the next
+  // committed render still shows them off, from the read at 100.
+  const abandoned = seePeriodic(committed, true, 200);
+  const next = seePeriodic(committed, false, 100);
+  assert.equal(next, committed);
+  assert.equal(nodeEmptyText(false, nodeListing(currentInventory({ inventory: [] }, 50, next)?.length ?? null, false)), PERIODIC_OFF);
+  // Had the abandoned render's history been kept, that read would be aged by
+  // a change no committed render showed.
+  assert.equal(currentInventory({ inventory: [] }, 50, seePeriodic(abandoned, false, 100)), null);
+  // When the change commits, reads before it are old, as for any change.
+  const changed = seePeriodic(committed, true, 200);
+  for (const requestedAt of [50, 190]) assert.equal(currentInventory({ inventory: [row] }, requestedAt, changed), null);
+  assert.deepEqual(currentInventory({ inventory: [row] }, 200, changed), [row]);
 });
 
 test('a failed read says so, and the sandbox list points nowhere', () => {

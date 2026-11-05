@@ -66,8 +66,20 @@ export function inventoryCurrent(requestedAt: number | null, seen: PeriodicSeen)
   return seen.changedAt === null || (requestedAt !== null && requestedAt >= seen.changedAt);
 }
 
+// The inventory rows On the node shows, and offers Rollback on, or null when
+// they are not known: the inventory is not (`nodeInventory`), or the read was
+// requested before the periodic state `seen` holds changed
+// (`inventoryCurrent`).
+export function currentInventory<T>(
+  section: { inventory?: T[] | null } | null | undefined,
+  requestedAt: number | null,
+  seen: PeriodicSeen,
+): T[] | null {
+  return inventoryCurrent(requestedAt, seen) ? nodeInventory(section) : null;
+}
+
 // `shown` is how many snapshots the On the node list shows, or null when the
-// inventory is not known (`nodeInventory`, `inventoryCurrent`). `periodic` is
+// inventory is not known (`currentInventory`). `periodic` is
 // whether the node runs the sandbox with periodic snapshots on (its observed
 // `snapshots_enabled`), or null when the API does not say. A listed
 // snapshot is evidence on its own; an empty list is only with periodic

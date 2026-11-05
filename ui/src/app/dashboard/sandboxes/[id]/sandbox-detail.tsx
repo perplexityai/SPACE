@@ -75,7 +75,7 @@ import { RollbackButton, RollbackRefusalNote, useSnapshotRollback, type Snapshot
 import { rollbackRoute, rollbackTargets, snapshotTimeMs, type RollbackTarget } from '@/lib/rollback-targets';
 import { formatAge, formatBytes, sectionData, sectionError, snapshotKey, snapshotStorageById, snapshotStorageLabel, type DebugSnapshot } from '@/lib/sandbox-debug';
 import {
-  CATALOG_NOTE, CATALOG_TITLE, NODE_NOTE, RECORDS_NOTE, catalogEmptyText, inventoryCurrent, nodeEmptyText, nodeInventory, nodeListing, seePeriodic,
+  CATALOG_NOTE, CATALOG_TITLE, NODE_NOTE, RECORDS_NOTE, catalogEmptyText, currentInventory, nodeEmptyText, nodeListing, seePeriodic,
   type NodeListing, type PeriodicSeen,
 } from '@/lib/snapshot-catalog';
 import { OperationsCard, OrgLink, PlacementCard, QuarantineCard, ResourcesCard, TimelineCard, UserLink, type DebugView } from './sandbox-insight';
@@ -640,13 +640,15 @@ function SnapshotsCard({
   // The node's list, which the empty catalog points at. An inventory the
   // debug view does not carry is unknown, not empty, and so is one read
   // before the periodic state shown changed: the two come from separate
-  // reads, and the next insight load reads the inventory again.
-  const periodicSeen = useRef<PeriodicSeen | null>(null);
-  periodicSeen.current = seePeriodic(periodicSeen.current, periodicSnapshots, periodicObservedAt);
-  const inventory = nodeInventory(sectionData(debug?.snapshots));
+  // reads, and the next insight load reads the inventory again. Such a read
+  // shows no rows, so it offers no Rollback either. The periodic history is
+  // committed after each render, so a render React abandons leaves no trace.
+  const [periodicSeen, setPeriodicSeen] = useState<PeriodicSeen | null>(null);
+  const seen = seePeriodic(periodicSeen, periodicSnapshots, periodicObservedAt);
+  useEffect(() => setPeriodicSeen(seen), [seen]);
+  const inventory = currentInventory(sectionData(debug?.snapshots), debugView.requestedAt, seen);
   const targets = inventory ? rollbackTargets(inventory, sandboxStatus) : [];
-  const current = inventoryCurrent(debugView.requestedAt, periodicSeen.current);
-  const listing = nodeListing(inventory && current ? targets.length : null, periodicSnapshots);
+  const listing = nodeListing(inventory ? targets.length : null, periodicSnapshots);
   const nodeSnapshots = (
     <NodeSnapshotsTable debugView={debugView} targets={targets} listing={listing} route={route} rollback={rollback} nowMs={nowMs} />
   );
