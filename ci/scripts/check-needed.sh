@@ -7,6 +7,9 @@
 #
 # Usage: ci/scripts/check-needed.sh SCOPE [BASE [PULL_REQUEST_HEAD]]
 #
+# Prints `needed=true` or `needed=false`, then `base=<sha>` when it compared
+# the change with a base.
+#
 # An empty BASE means "run every check": Main CI passes none. SCOPE `always`
 # is always needed. Anything this script cannot decide, a missing base or an
 # empty change included, also answers `needed=true`, so an error costs time,
@@ -32,8 +35,13 @@ if [[ -z "${scope}" ]]; then
     exit 2
 fi
 
+# Prints the answer, and the base it was decided against once there is one,
+# which a check can use to narrow its own work (rust-isolated-crates.sh).
 answer() {
     printf 'needed=%s\n' "$1"
+    if [[ -n "${decided_base:-}" ]]; then
+        printf 'base=%s\n' "${decided_base}"
+    fi
     exit 0
 }
 
@@ -118,6 +126,9 @@ if [[ "${#changed[@]}" -eq 0 ]]; then
     echo "No change against ${base}: running the check." >&2
     answer true
 fi
+# Named only once there is a change to decide on: a check that narrows its
+# work to the change would otherwise find nothing to do.
+decided_base="$(git rev-parse --verify "${base}^{commit}")"
 
 # Whether path $1 matches the patterns in the array named $2: the last
 # pattern that matches decides, and a `!` pattern un-matches.

@@ -86,10 +86,11 @@ jobs:
         run: |
           set -euo pipefail
           decision="$(bash ci/scripts/check-needed.sh "${SCOPE}" "${SCOPE_BASE}" "${PULL_REQUEST_HEAD}")"
-          case "${decision}" in
-            needed=true | needed=false) printf '%s\n' "${decision}" >>"${GITHUB_OUTPUT}" ;;
-            *) echo "check-needed.sh answered '${decision}'" >&2; exit 1 ;;
-          esac
+          if [[ ! "${decision}" =~ ^needed=(true|false)($'\n'base=[0-9a-f]{40})?$ ]]; then
+            echo "check-needed.sh answered '${decision}'" >&2
+            exit 1
+          fi
+          printf '%s\n' "${decision}" >>"${GITHUB_OUTPUT}"
 
       # The report after Clippy runs this copy of the package cache helper,
       # taken before Clippy starts, as in common-ci.yml.
@@ -179,6 +180,8 @@ jobs:
           SPACE_CI_SCCACHE_DIR: ${{ runner.temp }}/space-sccache
           SPACE_CI_SCCACHE_RUN_DIR: ${{ runner.temp }}/space-sccache-run
           SPACE_CI_SCCACHE_SIZE: ${{ matrix.rust_cache_size }}
+          # The lint jobs check alone only the crates this change can affect.
+          SPACE_RUST_LINT_BASE: ${{ steps.scope.outputs.base }}
         run: |
           set -euo pipefail
 
@@ -195,6 +198,7 @@ jobs:
             --env CARGO_INCREMENTAL=0
             --env GITHUB_ACTIONS=true
             --env SPACE_CI_COMMAND
+            --env SPACE_RUST_LINT_BASE
           )
 
           if [[ "${SPACE_CI_RUST_CACHE}" == true ]]; then
@@ -386,10 +390,11 @@ jobs:
         run: |
           set -euo pipefail
           decision="$(bash ci/scripts/check-needed.sh "${SCOPE}" "${SCOPE_BASE}" "${PULL_REQUEST_HEAD}")"
-          case "${decision}" in
-            needed=true | needed=false) printf '%s\n' "${decision}" >>"${GITHUB_OUTPUT}" ;;
-            *) echo "check-needed.sh answered '${decision}'" >&2; exit 1 ;;
-          esac
+          if [[ ! "${decision}" =~ ^needed=(true|false)($'\n'base=[0-9a-f]{40})?$ ]]; then
+            echo "check-needed.sh answered '${decision}'" >&2
+            exit 1
+          fi
+          printf '%s\n' "${decision}" >>"${GITHUB_OUTPUT}"
       - name: Install protobuf compiler
         if: steps.scope.outputs.needed == 'true'
         run: |
