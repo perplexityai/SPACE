@@ -153,11 +153,20 @@ the endpoint's certificate name. Provision a separate listener certificate/key
 with `SPACE_INTERNAL_RPC_TLS_CERT` and `SPACE_INTERNAL_RPC_TLS_KEY`; API HTTP
 routing does not expose this RPC.
 
+The same listener serves `NativeFileAccessApi` (`AuthorizeNativeFileRequest`
+and `PrepareNativeFileCall`) for a data plane that answers Native `files:*`
+(`SPACE_DATA_PLANE_NATIVE_FILES=serve`). The data plane dials
+`SPACE_INGRESS_ACTIVATION_ENDPOINT` with the same CA bundle and optional
+`SPACE_INGRESS_ACTIVATION_TLS_SERVER_NAME`, and presents its projected
+cluster-API token. Its identity may call only those two RPCs there.
+
 The listener uses the existing **Cluster** bearer-authentication surface.
 On the hosting API deployment, enable Kubernetes TokenReview, disable static
 fallback, and set `SPACE_CLUSTER_API_AUTH_ALLOWED_SERVICE_ACCOUNTS` to only the
 trusted cluster-API route-resolver identities. Those callers must already have
-authorized the user's session or service-port credentials. Mount a projected
+authorized the user's session or service-port credentials. A data plane that
+serves Native files is listed too: it forwards the user's credentials, which
+the listener authorizes itself, and may call nothing else there. Mount a projected
 token for the configured cluster-API audience on the caller via
 `SPACE_CLUSTER_API_TOKEN_PATH`. Static-only local deployments use
 `SPACE_INTERNAL_TOKEN`. The RPC always requests implicit Access activation,
