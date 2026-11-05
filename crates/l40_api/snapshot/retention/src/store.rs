@@ -65,8 +65,7 @@ pub(crate) const CLAIMED_SCAN_EPOCH_SQL: &str = sql!(
        FROM (
              SELECT id
                FROM snapshots
-              WHERE type = 'full'
-                AND state = 'deleting'
+              WHERE state = 'deleting'
              OFFSET 0
             ) claimed
       ORDER BY claimed.id DESC
@@ -92,8 +91,7 @@ pub(crate) const LIST_CLAIMED_SQL: &str = sql!(
      FROM (
            SELECT id, sandbox_id, timestamp
              FROM snapshots
-            WHERE type = 'full'
-              AND state = 'deleting'
+            WHERE state = 'deleting'
               AND id > COALESCE($2::UUID, '00000000-0000-0000-0000-000000000000'::UUID)
               AND id <= $3
            OFFSET 0
@@ -226,11 +224,14 @@ impl RetentionSink for SnapshotRetentionDbStore {
         // behind the cursor are revisited after wrap. Discovery grants no deletion
         // permission: claim revalidates the live floor and restore source.
         let min_age_secs = min_age.map(|d| d.as_secs() as i64);
-        // A candidate is outside the keep-set exactly when the indexed
-        // sibling probe can skip `keep_n - 1` newer ready/full rows with a
-        // usable attached location and still find one more. The tuple
-        // comparison preserves UUID
-        // tie-breaking for equal timestamps. Cursor and age constrain only
+        // Only a `disk` row of origin `stop` (a stopped sandbox's evacuation
+        // or retire backup) is swept, and it has no keep-set: past the age
+        // gate, only the restore source guard keeps it. Named (`snapshot`)
+        // and `fork` disk rows are never candidates. A `full` candidate is
+        // outside the keep-set exactly when the indexed sibling probe can
+        // skip `keep_n - 1` newer ready/full rows with a usable attached
+        // location and still find one more. The tuple comparison preserves
+        // UUID tie-breaking for equal timestamps. Cursor and age constrain only
         // the candidate; newer siblings of any age still count toward the
         // keep floor. `keep_n` is always positive by configuration, so the
         // OFFSET is non-negative. The unique snapshot-location constraint makes
@@ -271,7 +272,8 @@ impl RetentionSink for SnapshotRetentionDbStore {
                  ) AS has_encrypted_fields,
                  EXTRACT(EPOCH FROM (NOW() - s.timestamp))::BIGINT AS age_secs
              FROM (
-                 SELECT id, sandbox_id, type, state, timestamp, local_artifact_id, artifact_kind
+                 SELECT id, sandbox_id, type, state, timestamp, local_artifact_id, artifact_kind,
+                        artifact_origin
                    FROM snapshots
                   WHERE id >= $5::UUID AND id <= $6::UUID
                     AND id = ANY($3::UUID[])
@@ -290,28 +292,29 @@ impl RetentionSink for SnapshotRetentionDbStore {
                   WHERE snapshot_id = s.id AND orphaned_at IS NULL
                   OFFSET 0
              ) ssl ON TRUE
-             WHERE s.type = 'full'
-               AND s.state = 'ready'
+             WHERE s.state = 'ready'
                AND ($4::BIGINT IS NULL
                     OR s.timestamp < NOW() - make_interval(secs => $4::BIGINT))
                AND NOT {restore_source}
-               AND EXISTS (
-                   SELECT 1
-                     FROM snapshots newer
-                    WHERE newer.sandbox_id = s.sandbox_id
-                      AND newer.state = 'ready'
-                      AND newer.type = 'full'
-                      AND EXISTS (
-                          SELECT 1 FROM snapshot_storage_locations newer_ssl
-                           WHERE newer_ssl.snapshot_id = newer.id
-                             AND newer_ssl.orphaned_at IS NULL
-                           OFFSET 0
-                      )
-                      AND (newer.timestamp, newer.id) > (s.timestamp, s.id)
-                   ORDER BY newer.timestamp DESC
-                   OFFSET ($1 - 1)
-                   LIMIT 1
-               )
+               AND ((s.type = 'disk' AND s.artifact_origin = 'stop')
+                    OR (s.type = 'full'
+                        AND EXISTS (
+                            SELECT 1
+                              FROM snapshots newer
+                             WHERE newer.sandbox_id = s.sandbox_id
+                               AND newer.state = 'ready'
+                               AND newer.type = 'full'
+                               AND EXISTS (
+                                   SELECT 1 FROM snapshot_storage_locations newer_ssl
+                                    WHERE newer_ssl.snapshot_id = newer.id
+                                      AND newer_ssl.orphaned_at IS NULL
+                                    OFFSET 0
+                               )
+                               AND (newer.timestamp, newer.id) > (s.timestamp, s.id)
+                            ORDER BY newer.timestamp DESC
+                            OFFSET ($1 - 1)
+                            LIMIT 1
+                        )))
              ORDER BY s.id ASC
              LIMIT $2",
         );
@@ -410,8 +413,8 @@ impl RetentionSink for SnapshotRetentionDbStore {
         // Lock the snapshot before reading its child. The storage-location FK
         // makes a concurrent insert take a conflicting parent key lock, so the
         // optional location below cannot change through commit.
-        let state: Option<(String, String)> = sqlx::query_as(sql!(
-            "SELECT state, type
+        let state: Option<String> = sqlx::query_scalar(sql!(
+            "SELECT state
                FROM snapshots
               WHERE id = $1
                 AND sandbox_id = $2
@@ -421,11 +424,10 @@ impl RetentionSink for SnapshotRetentionDbStore {
         .bind(candidate.sandbox_id)
         .fetch_optional(&mut *tx)
         .await?;
-        let refusal = match state.as_ref() {
+        let refusal = match state.as_deref() {
             None => Some(ClaimRefusalReason::MissingSnapshot),
-            Some((_, kind)) if kind != "full" => Some(ClaimRefusalReason::SnapshotNotFull),
-            Some((state, _)) if state != "ready" => Some(ClaimRefusalReason::SnapshotNotReady),
-            Some(_) => None,
+            Some("ready") => None,
+            Some(_) => Some(ClaimRefusalReason::SnapshotNotReady),
         };
         if let Some(reason) = refusal {
             tx.rollback().await?;
@@ -472,26 +474,31 @@ impl RetentionSink for SnapshotRetentionDbStore {
         let restore_source = snapshot_is_live_restore_source("sb", "cur");
         let newer_location = usable_snapshot_location_exists("newer", "newer_ssl");
         let min_age_secs = min_age.map(|duration| duration.as_secs() as i64);
+        // `floor_ok` is also what keeps unswept rows unclaimed: a `disk` row of
+        // any origin but `stop` fails it and is refused as `KeepNFloor`.
+        // `IS NOT DISTINCT FROM` keeps a markerless row's NULL origin a FALSE
+        // here rather than a NULL the boolean decode rejects.
         let query = format!(
-            "SELECT EXISTS (
-                 SELECT 1
-                   FROM snapshots newer
-                  WHERE newer.sandbox_id = cur.sandbox_id
-                    AND newer.state = 'ready'
-                    AND newer.type = 'full'
-                    AND {newer_location}
-                    AND (newer.timestamp, newer.id) > (cur.timestamp, cur.id)
-                  OFFSET ($2 - 1)
-                  LIMIT 1
-             ) AS floor_ok,
+            "SELECT ((cur.type = 'disk' AND cur.artifact_origin IS NOT DISTINCT FROM 'stop')
+                     OR (cur.type = 'full'
+                         AND EXISTS (
+                             SELECT 1
+                               FROM snapshots newer
+                              WHERE newer.sandbox_id = cur.sandbox_id
+                                AND newer.state = 'ready'
+                                AND newer.type = 'full'
+                                AND {newer_location}
+                                AND (newer.timestamp, newer.id) > (cur.timestamp, cur.id)
+                              OFFSET ($2 - 1)
+                              LIMIT 1
+                         ))) AS floor_ok,
              NOT {restore_source} AS restore_source_ok,
              ($3::BIGINT IS NULL
                 OR cur.timestamp < NOW() - make_interval(secs => $3::BIGINT)) AS age_ok
              FROM snapshots cur
              JOIN sandboxes sb ON sb.id = cur.sandbox_id
              WHERE cur.id = $1
-               AND cur.state = 'ready'
-               AND cur.type = 'full'",
+               AND cur.state = 'ready'",
         );
         let safe: Option<(bool, bool, bool)> =
             sqlx::query_as(sqlx::AssertSqlSafe(sql!(query.as_str())))
@@ -628,13 +635,21 @@ impl RetentionSink for SnapshotRetentionDbStore {
             return Ok(PruneFinalize::NotClaimed);
         }
 
-        // Recheck the keep-N floor purely for telemetry. This remains bounded
+        // Recheck the keep-N floor purely for telemetry; a swept `disk` row
+        // (origin `stop`) has none, so it always passes. This remains bounded
         // at the configured floor while the hot sandbox lock is held.
         // It is not a gate: bytes are already gone, so drift is reported and
         // the unrestorable row still finishes forward.
         let newer_location = usable_snapshot_location_exists("newer", "newer_ssl");
         let floor_query = format!(
             "SELECT EXISTS (
+                 SELECT 1
+                   FROM snapshots cur
+                  WHERE cur.id = $1
+                    AND cur.type = 'disk'
+                    AND cur.artifact_origin = 'stop'
+             )
+             OR EXISTS (
                  SELECT 1
                    FROM snapshots newer
                    JOIN snapshots cur ON cur.id = $1

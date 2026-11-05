@@ -284,11 +284,9 @@ impl K8sStore {
     /// Composing that shared fragment rather than an inline equivalent is what
     /// keeps the retention sweeper from pruning the row this selector loads;
     /// the fragment's own docs in `pplx_space_sandbox_portability` own that
-    /// argument. One thing those docs do *not* cover, because it is specific
-    /// to disk rows: `SnapshotRetentionDbStore`'s `list_candidates` and
-    /// `claim_prune` also filter `type = 'full'`, so a disk row never reaches
-    /// the guard at all. The shared spelling is what keeps the property true
-    /// if that narrowing is ever lifted — it is not what enforces it now.
+    /// argument. `SnapshotRetentionDbStore` sweeps `stop` disk rows as well as
+    /// full ones, so that guard is the operative exclusion for the pinned disk
+    /// row.
     ///
     /// ## Why there is no markerless legacy branch
     ///

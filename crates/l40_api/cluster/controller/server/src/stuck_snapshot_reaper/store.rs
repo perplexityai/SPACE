@@ -37,7 +37,7 @@ impl ReaperSink for SnapshotDbStore {
     /// `evacuate_stopped_sandbox`).
     ///
     /// So a stale `creating` disk row has no reaper: this statement will not
-    /// touch it and the retention sweeper filters `type = 'full'` too. The
+    /// touch it and the retention sweeper reclaims only `ready` rows. The
     /// consequence is documented where it bites — that gate parks an evacuation
     /// instead of retrying it, fails stuck rather than open, and shows up on
     /// `node_drain.stopped_evacuation_stall_secs`. **Do not read the exclusion

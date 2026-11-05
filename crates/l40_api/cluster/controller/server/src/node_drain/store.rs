@@ -1789,8 +1789,8 @@ struct StoppedEvacuationState {
     /// `snapshots` row per attempt id, with `ON CONFLICT` keyed on that id, so
     /// the clause dedupes retries of one attempt rather than attempts of one
     /// artifact. At a five-second tick that is twelve rows a minute for a
-    /// sandbox whose upload keeps failing, in a table the retention sweeper
-    /// filters to `type = 'full'` and therefore never prunes.
+    /// sandbox whose upload keeps failing, and the retention sweeper never
+    /// prunes them: it reclaims only `ready` rows.
     ///
     /// The node layer's choice is right for a one-shot caller: it looks at the
     /// failed job and declines to reuse it, because a failed attempt should be
@@ -4535,7 +4535,7 @@ impl NodeDrainSink for SubstrateSink {
         //     through to a fresh `BackupAttemptId` — and one `snapshots` row is
         //     inserted per attempt id. Re-issuing every tick therefore leaks a
         //     row every five seconds for a sandbox whose upload keeps failing,
-        //     into a table the retention sweeper never prunes for disk rows.
+        //     and the retention sweeper reclaims only `ready` rows.
         //     Skipping while an attempt is live is what keeps the *retry* rate
         //     tied to attempts rather than to ticks.
         //
@@ -4564,7 +4564,7 @@ impl NodeDrainSink for SubstrateSink {
         //     With it, a `creating` row that never finalizes blocks the
         //     re-publish for as long as it persists — and nothing terminalizes a
         //     stale *disk* row: `stuck_snapshot_reaper` is scoped `type =
-        //     'full'`, and the retention sweeper filters the same way. So a
+        //     'full'`, and the retention sweeper reclaims only `ready` rows. So a
         //     finalize that never lands (its RPC failing permanently for that
         //     attempt, say) parks the evacuation instead of retrying it.
         //

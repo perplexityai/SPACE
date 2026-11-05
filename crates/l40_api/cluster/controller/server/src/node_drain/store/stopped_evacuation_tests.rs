@@ -1309,8 +1309,8 @@ async fn cluster_pin(pool: &PgPool, sandbox_id: SandboxId) -> TestResult<Option<
 /// `snapshots` row per attempt id. Its `ON CONFLICT` is keyed on that id, so it
 /// dedupes retries of one attempt, not attempts of one artifact. Re-issuing on
 /// every five-second tick therefore leaks a catalog row per tick for a sandbox
-/// whose upload keeps failing, into a table the retention sweeper filters to
-/// `type = 'full'` and so never prunes for disk rows.
+/// whose upload keeps failing, and the retention sweeper never prunes those
+/// rows: it reclaims only `ready` ones.
 ///
 /// So the steady-state tick must publish *nothing* while an attempt is live.
 /// Asserted on the fake's own record of publish calls, because the outcome is
