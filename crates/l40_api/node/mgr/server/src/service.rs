@@ -251,6 +251,9 @@ struct SandboxCgroupLaunchGuards {
 pub struct SandboxCgroupConfig {
     pub vcpu_count: Option<u32>,
     pub memory_mib: Option<u64>,
+    /// Cgroup memory above guest RAM, for the VMM and the host page cache of
+    /// the sandbox's disk writes.
+    pub memory_headroom_mib: u64,
 }
 
 impl Default for SandboxCgroupConfig {
@@ -258,6 +261,7 @@ impl Default for SandboxCgroupConfig {
         Self {
             vcpu_count: Some(crate::cgroup::DEFAULT_VCPU_COUNT),
             memory_mib: Some(crate::cgroup::DEFAULT_MEMORY_MAX_MIB),
+            memory_headroom_mib: crate::cgroup::DEFAULT_SANDBOX_MEMORY_HEADROOM_MIB,
         }
     }
 }
@@ -269,7 +273,11 @@ impl SandboxCgroupConfig {
     }
 
     pub fn guest_memory_max_mib(self) -> u64 {
-        crate::cgroup::sandbox_guest_memory_max_mib(self.memory_mib_or_default()).unwrap_or(0)
+        crate::cgroup::sandbox_guest_memory_max_mib(
+            self.memory_mib_or_default(),
+            self.memory_headroom_mib,
+        )
+        .unwrap_or(0)
     }
 
     pub fn total_memory_mib(self, max_slots: u32) -> u64 {

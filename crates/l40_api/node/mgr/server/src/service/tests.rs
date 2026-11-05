@@ -508,6 +508,7 @@ pub(super) mod service_tests {
         let config = SandboxCgroupConfig {
             vcpu_count: Some(2),
             memory_mib: Some(8320),
+            ..SandboxCgroupConfig::default()
         };
 
         assert_eq!(
