@@ -8,11 +8,15 @@ export const TERMINAL_RESIZE_DEBOUNCE_MS = 120;
 // shell without line editing: no history and no Tab completion. bash is
 // interactive with both. It runs as a non-login shell, so a PATH from the
 // sandbox's create env survives (a login shell's /etc/profile can reset it).
-// The passwd shell is not used: for a service user it can be nologin or false.
+// That PATH may lack /bin, so bash is also looked for at its usual paths, and
+// the fallback is `/bin/sh` by path, as the data plane's default is. The
+// passwd shell is not used: for a service user it can be nologin or false.
 export const TERMINAL_SHELL_COMMAND = [
   '/bin/sh',
   '-c',
-  'if command -v bash >/dev/null 2>&1; then exec bash -i; fi; exec sh -i',
+  'for shell in "$(command -v bash)" /bin/bash /usr/bin/bash; do'
+    + ' if [ -n "$shell" ] && [ -x "$shell" ]; then exec "$shell" -i; fi;'
+    + ' done; exec /bin/sh -i',
 ];
 
 // xterm.js implements xterm-256color; full-screen programs need TERM to draw.
@@ -51,14 +55,18 @@ export function debounce(callback: () => void, delayMs: number, timers: Timers =
 
 export type TerminalInput = { kind: 'text'; data: string } | { kind: 'bytes'; data: Uint8Array };
 
+const utf8 = new TextEncoder();
+
 // Holds what is typed between Connect and the shell's start, which the data
 // plane would reject, and hands it over in order once the shell runs. Input
-// with no session open, or after it ends, is dropped. Past `limit` bytes of
-// held input (a large paste before the start) the rest is dropped.
+// with no session open, or after it ends, is dropped. Held input is all or
+// nothing: once it would pass `limit` UTF-8 bytes (a large paste before the
+// start), everything held is dropped and nothing more is held, so the shell
+// never runs a command with a piece missing.
 export class TerminalInputGate {
   private held: TerminalInput[] = [];
   private heldBytes = 0;
-  private state: 'closed' | 'opening' | 'started' = 'closed';
+  private state: 'closed' | 'opening' | 'discarded' | 'started' = 'closed';
   private readonly limit: number;
 
   constructor(limit = 64 * 1024) {
@@ -72,22 +80,26 @@ export class TerminalInputGate {
     this.state = 'opening';
   }
 
-  // Returns the input to send now; while the session opens, holds it.
-  write(input: TerminalInput): TerminalInput | null {
+  // Returns the input to send now, or null while the session opens (held, or
+  // dropped). Returns 'discarded' once, when held input passes the limit.
+  write(input: TerminalInput): TerminalInput | 'discarded' | null {
     if (this.state === 'started') return input;
-    if (this.state === 'opening') {
-      const size = input.kind === 'text' ? input.data.length : input.data.byteLength;
-      if (this.heldBytes + size <= this.limit) {
-        this.held.push(input);
-        this.heldBytes += size;
-      }
+    if (this.state !== 'opening') return null;
+    const size = input.kind === 'text' ? utf8.encode(input.data).byteLength : input.data.byteLength;
+    if (this.heldBytes + size > this.limit) {
+      this.held = [];
+      this.heldBytes = 0;
+      this.state = 'discarded';
+      return 'discarded';
     }
+    this.held.push(input);
+    this.heldBytes += size;
     return null;
   }
 
   // The shell started: returns the held input, in order, to send first.
   start(): TerminalInput[] {
-    if (this.state !== 'opening') return [];
+    if (this.state !== 'opening' && this.state !== 'discarded') return [];
     const held = this.held;
     this.held = [];
     this.heldBytes = 0;

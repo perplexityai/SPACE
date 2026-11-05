@@ -1,6 +1,11 @@
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { test } from 'node:test';
 import {
+  TERMINAL_SHELL_COMMAND,
   TerminalInputGate,
   binaryStringToBytes,
   debounce,
@@ -159,13 +164,80 @@ test('input typed before the shell starts is sent first, in order', () => {
   assert.deepEqual(gate.start(), [text('new')]);
 });
 
-test('held input is bounded', () => {
+test('held input past the limit is dropped whole, and nothing more is held', () => {
+  const text = (data) => ({ kind: 'text', data });
   const gate = new TerminalInputGate(8);
   gate.open();
-  gate.write({ kind: 'text', data: 'abcde' });
-  gate.write({ kind: 'text', data: 'fghij' });
-  gate.write({ kind: 'text', data: 'xyz' });
-  assert.deepEqual(gate.start(), [{ kind: 'text', data: 'abcde' }, { kind: 'text', data: 'xyz' }]);
+  assert.equal(gate.write(text('echo ')), null);
+  // A paste that would pass the limit drops everything held, once.
+  assert.equal(gate.write(text('0123456789')), 'discarded');
+  // The Enter after it must not run `echo` alone.
+  assert.equal(gate.write(text('\r')), null);
+  assert.equal(gate.write(text('x')), null);
+  assert.deepEqual(gate.start(), []);
+  // Once started, input flows again.
+  assert.deepEqual(gate.write(text('ls\r')), text('ls\r'));
+  // The next session holds again.
+  gate.open();
+  assert.equal(gate.write(text('pwd\r')), null);
+  assert.deepEqual(gate.start(), [text('pwd\r')]);
+});
+
+test('the limit counts UTF-8 bytes', () => {
+  const text = (data) => ({ kind: 'text', data });
+  // 'é' is one UTF-16 unit and two UTF-8 bytes; '€' one unit and three bytes.
+  const exact = new TerminalInputGate(8);
+  exact.open();
+  assert.equal(exact.write(text('ééé')), null);
+  assert.equal(exact.write(text('é')), null);
+  assert.deepEqual(exact.start(), [text('ééé'), text('é')]);
+
+  const over = new TerminalInputGate(8);
+  over.open();
+  assert.equal(over.write(text('€€')), null);
+  // 6 + 3 bytes is past 8, though it is only 3 UTF-16 units.
+  assert.equal(over.write(text('€')), 'discarded');
+  assert.deepEqual(over.start(), []);
+
+  const bytes = new TerminalInputGate(4);
+  bytes.open();
+  assert.equal(bytes.write({ kind: 'bytes', data: Uint8Array.of(1, 2, 3, 4) }), null);
+  assert.equal(bytes.write({ kind: 'bytes', data: Uint8Array.of(5) }), 'discarded');
+});
+
+// Runs the terminal command with stdin as the shell's input, in an
+// environment holding only `env`.
+function runShellCommand(env, input) {
+  return spawnSync(TERMINAL_SHELL_COMMAND[0], TERMINAL_SHELL_COMMAND.slice(1), {
+    env, input, encoding: 'utf8', timeout: 3000,
+  });
+}
+
+test('the shell command finds bash on PATH first, and keeps PATH', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'terminal-shell-'));
+  try {
+    const bash = path.join(dir, 'bash');
+    fs.writeFileSync(bash, '#!/bin/sh\necho "path-bash $*"\n', { mode: 0o755 });
+    const result = runShellCommand({ PATH: `${dir}:/usr/bin:/bin`, HOME: dir }, '');
+    assert.equal(result.stdout.trim(), 'path-bash -i');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a PATH without /bin still opens an interactive shell that keeps that PATH', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'terminal-shell-'));
+  try {
+    // Nothing is on this PATH; bash comes from its usual path, or /bin/sh.
+    const result = runShellCommand({ PATH: dir, HOME: dir }, 'case $- in *i*) echo "interactive PATH=$PATH";; esac\nexit 0\n');
+    assert.equal(result.status, 0, result.stderr);
+    const shown = result.stdout.trim().match(/^interactive PATH=(.*)$/);
+    assert.ok(shown, result.stdout);
+    // A system bashrc may add to PATH; the given one must still be there.
+    assert.ok(shown[1].split(':').includes(dir), shown[1]);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test('binary input keeps each byte', () => {

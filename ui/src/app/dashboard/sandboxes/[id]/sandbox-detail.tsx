@@ -912,6 +912,13 @@ function copyText(text: string) {
   }
 }
 
+// Sandbox output is untrusted: only an http(s) link opens, in a new tab that
+// gets neither this page as its opener nor its URL as the referrer.
+function openTerminalLink(text: string) {
+  const url = terminalLinkUrl(text);
+  if (url) window.open(url, '_blank', 'noopener,noreferrer');
+}
+
 function TerminalCard({ sandbox, ownOrg }: { sandbox: Sandbox; ownOrg: boolean }) {
   const { token } = theme.useToken();
   const [status, setStatus] = useState<TerminalStatus>('disconnected');
@@ -940,11 +947,6 @@ function TerminalCard({ sandbox, ownOrg }: { sandbox: Sandbox; ownOrg: boolean }
     connectionRef.current = null;
   };
 
-  const send = (input: TerminalInput) => {
-    const now = gateRef.current.write(input);
-    if (now) connectionRef.current?.sendInput(now.data);
-  };
-
   useEffect(() => {
     const pane = paneRef.current;
     if (!pane) return;
@@ -968,22 +970,25 @@ function TerminalCard({ sandbox, ownOrg }: { sandbox: Sandbox; ownOrg: boolean }
           fontSize: 13,
           scrollback: 5000,
           theme: terminalColors,
+          // OSC 8 hyperlinks open as the addon's plain-text links do.
+          linkHandler: { activate: (_event, text) => openTerminalLink(text) },
         });
         disposers.push(() => term.dispose());
         const fit = new FitAddon();
         term.loadAddon(fit);
-        term.loadAddon(new WebLinksAddon((_event, uri) => {
-          const url = terminalLinkUrl(uri);
-          if (url) window.open(url, '_blank', 'noopener,noreferrer');
-        }));
+        term.loadAddon(new WebLinksAddon((_event, uri) => openTerminalLink(uri)));
         const mac = isMacPlatform(navigator.platform || navigator.userAgent);
         term.attachCustomKeyEventHandler((event) => {
           const action = terminalKeyAction(event, term.hasSelection(), mac);
           if (action === 'terminal') return true;
-          if (action === 'copy' && event.type === 'keydown') {
+          if (event.type === 'keydown' && action !== 'paste') {
+            // A copy chord with nothing selected still must not reach the
+            // browser, where Ctrl+Shift+C opens the DevTools picker.
             event.preventDefault();
-            copyText(term.getSelection());
-            term.clearSelection();
+            if (action === 'copy') {
+              copyText(term.getSelection());
+              term.clearSelection();
+            }
           }
           return false;
         });
@@ -991,6 +996,11 @@ function TerminalCard({ sandbox, ownOrg }: { sandbox: Sandbox; ownOrg: boolean }
         const next = { term, fit };
         fitTerminal(next);
         term.write('\x1b[2mConnect to open an interactive shell.\x1b[22m\r\n');
+        const send = (input: TerminalInput) => {
+          const now = gateRef.current.write(input);
+          if (now === 'discarded') term.write(terminalNotice('input typed before the shell started was discarded'));
+          else if (now) connectionRef.current?.sendInput(now.data);
+        };
         term.onData((data) => send({ kind: 'text', data }));
         term.onBinary((data) => send({ kind: 'bytes', data: binaryStringToBytes(data) }));
         term.onResize(({ cols, rows }) => {
