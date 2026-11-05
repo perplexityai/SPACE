@@ -6,6 +6,7 @@ use pplx_space_node_api_client::proto::{
     FacetRef, MarkFacetDirtyRequest, NetworkPolicyTargetRef, ReconcileFacet, facet_ref,
     network_policy_target_ref,
 };
+use pplx_space_template_mgr_store::node_dirty_refs;
 use rusqlite::Connection;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -83,7 +84,7 @@ pub(crate) fn spawn_dirty_outbox_worker(db: Arc<Mutex<Connection>>) {
                     delay = next_dirty_mark_delay(delay);
                     continue;
                 };
-                match crate::db::list_node_dirty_refs(&db, batch_limit) {
+                match node_dirty_refs::list_node_dirty_refs(&db, batch_limit) {
                     Ok(rows) => rows,
                     Err(error) => {
                         tracing::warn!(%error, "failed to read template node dirty outbox");
@@ -224,7 +225,7 @@ fn facet_label(facet: i32) -> Option<&'static str> {
     }
 }
 
-fn dirty_row_to_facet_ref(row: &crate::db::NodeDirtyRefRow) -> Option<FacetRef> {
+fn dirty_row_to_facet_ref(row: &node_dirty_refs::NodeDirtyRefRow) -> Option<FacetRef> {
     let facet = ReconcileFacet::try_from(row.facet).ok()?;
     match (facet, row.element_kind.as_str()) {
         (ReconcileFacet::NetworkPolicy, "network_policy_template") => {

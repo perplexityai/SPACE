@@ -450,6 +450,7 @@ pplx-space-snapshot-store = [
   "pplx-space-internal-api-server",
   "pplx-space-snapshot-retention",
 ]
+pplx-space-template-mgr-store = ["pplx-space-template-mgr"]
 
 # Edges the dependency matrix forbids, allowed by name.
 [rules.layers.allowed_edges]

@@ -7753,6 +7753,7 @@ dependencies = [
  "pplx-space-sqlite",
  "pplx-space-stopwatch",
  "pplx-space-template-mgr-client",
+ "pplx-space-template-mgr-store",
  "pplx-space-test-env",
  "pplx-space-volmgr-client",
  "prost-types",
@@ -7814,6 +7815,10 @@ dependencies = [
 [[package]]
 name = "pplx-space-template-mgr-store"
 version = "0.8.1"
+dependencies = [
+ "pplx-space-sql-locator",
+ "rusqlite",
+]
 
 [[package]]
 name = "pplx-space-template-mgr-svc"
