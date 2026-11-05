@@ -48,6 +48,7 @@ pub enum StatePublicationField {
     TransitionReceiptExecutionGeneration,
     TransitionReceiptReasonCode,
     TransitionReceiptActivationAttemptId,
+    StoredLifecycle,
 }
 
 impl StatePublicationField {
@@ -64,6 +65,7 @@ impl StatePublicationField {
             Self::TransitionReceiptActivationAttemptId => {
                 "transition_receipt_activation_attempt_id"
             }
+            Self::StoredLifecycle => "stored_lifecycle",
         }
     }
 }
@@ -82,6 +84,7 @@ pub enum StatePublicationDisposition {
     OmitTransitionReceipt,
     FallbackTransitionReason,
     FallbackQuarantined,
+    SkipPauseFailedRecovery,
 }
 
 impl StatePublicationDisposition {
@@ -93,6 +96,7 @@ impl StatePublicationDisposition {
             Self::OmitTransitionReceipt => "omit_transition_receipt",
             Self::FallbackTransitionReason => "fallback_transition_reason",
             Self::FallbackQuarantined => "fallback_quarantined",
+            Self::SkipPauseFailedRecovery => "skip_pause_failed_recovery",
         }
     }
 }
