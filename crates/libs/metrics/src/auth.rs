@@ -196,8 +196,9 @@ pub fn external_console_password_session(result: &str) {
 }
 
 /// Accounts listed for password sessions beside an installed external
-/// console authenticator, written at startup. Nonzero marks a deployment
-/// whose listed accounts sign in without the external provider.
+/// console authenticator, reported every minute while one is installed.
+/// Nonzero marks a deployment whose listed accounts sign in without the
+/// external provider.
 pub fn external_console_password_session_accounts(count: usize) {
     gauge(
         "auth.external_console.password_session_accounts",

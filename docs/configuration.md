@@ -519,13 +519,15 @@ With an authenticator installed:
   Federated owners and legacy disabled service accounts are not eligible.
 - Password login (`POST /auth/v1/sessions`) is refused with 403 and existing
   password session tokens no longer authenticate, so an old session cannot
-  bypass the mode, except for the accounts listed in
-  `SPACE_EXTERNAL_CONSOLE_PASSWORD_SESSION_EMAILS` (below). `DELETE /auth/v1/session` revokes nothing; the console
-  ends the provider session through the logout URL instead.
+  bypass the mode. `DELETE /auth/v1/session` revokes nothing; the console
+  ends the provider session through the logout URL instead. Accounts listed
+  in `SPACE_EXTERNAL_CONSOLE_PASSWORD_SESSION_EMAILS` are the one exception
+  (below).
 - Requests without the console header are machine requests. The native API
   authenticates them with API keys exactly as before and never consults an
   assertion the proxy attached; console-gated routes refuse them. Session
-  tokens are not accepted as native API credentials in this mode.
+  tokens are not accepted as native API credentials in this mode, except a
+  listed account's.
 - Each account listed in `SPACE_EXTERNAL_CONSOLE_PASSWORD_SESSION_EMAILS` is
   exempt from the two rules above for requests without the console header
   only: its password login issues a session, that session authenticates the
@@ -535,6 +537,10 @@ With an authenticator installed:
   header is refused with 403, and a missing or rejected assertion never falls
   back to a session. Every other account is refused with the same 403 before
   its password is checked, whether or not it exists. Keep in mind:
+  - Whether an email is listed is observable: a listed account with a wrong
+    password gets 401 after the password check, an unlisted one 403 at once.
+    Treat the list as known to anyone who can reach the API and guess an
+    email.
   - A listed account's sign-in bypasses the proxy: its admission policy,
     multi-factor and device checks, and offboarding do not apply. List only
     automation accounts with the least role they need, not people or shared
@@ -555,9 +561,9 @@ With an authenticator installed:
 - Password logins and sessions in this mode increment
   `auth.external_console.password_session` with `result` `login_accepted`,
   `login_refused`, `login_invalid`, `session_accepted` or `session_refused`.
-  The gauge `auth.external_console.password_session_accounts`, written at
-  startup, is the number of listed accounts; alert on it being nonzero where
-  the list must stay empty.
+  The gauge `auth.external_console.password_session_accounts`, reported every
+  minute while an authenticator is installed, is the number of listed
+  accounts; alert on it being nonzero where the list must stay empty.
 - Each console decision increments `auth.external_console.decision` with
   `result` `accepted`, `missing_assertion`, `unauthenticated`, `forbidden`,
   `unavailable`, `csrf_rejected`, `no_user` or `lookup_failed`.

@@ -257,9 +257,19 @@ pub async fn run_with(
     .await?;
     if let Some(external_console) = external_console {
         let password_session_emails = external_console.settings().password_session_emails();
-        pplx_space_metrics::auth::external_console_password_session_accounts(
-            password_session_emails.len(),
-        );
+        // Reported on the limiter heartbeat cadence rather than once: a gauge
+        // written only at startup is exported in one window and then absent,
+        // so a monitor on it would see no data instead of the count.
+        let listed_accounts = password_session_emails.len();
+        task_tracker.spawn(crate::limiter_liveness::run_heartbeat(
+            crate::limiter_liveness::HEARTBEAT_INTERVAL,
+            shutdown_token.child_token(),
+            move || {
+                pplx_space_metrics::auth::external_console_password_session_accounts(
+                    listed_accounts,
+                );
+            },
+        ));
         if !password_session_emails.is_empty() {
             tracing::warn!(
                 surface = ?config.surface,
