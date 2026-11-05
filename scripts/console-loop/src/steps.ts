@@ -340,21 +340,25 @@ step('sandbox-create', ['sandboxes', 'flows', 'lifecycle'], async (c) => {
 
 // A checkpoint stays on the sandbox's node, not in the snapshot catalog: the
 // card says so, and lists it under "On the node" only while periodic
-// snapshots are on (the node lists its snapshots only then). Runs on the
+// snapshots are on (the node reports its snapshots only then). Runs on the
 // sandbox `sandbox-create` made, and turns periodic snapshots off again.
 step('sandbox-checkpoint-snapshots', ['sandboxes', 'flows', 'lifecycle'], async (c) => {
   const id = c.shared.sandbox;
   if (!id) return c.rec.check(false, 'a sandbox was created by sandbox-create');
   await visit(c, `/dashboard/sandboxes/${id}`, 2000);
   await waitForStatus(c, id, ['started', 'running'], 120_000);
+  // Every read below is bounded by its poll's deadline, so a stalled one
+  // cannot hold the step (and its `finally`) past it.
+  const read = (method: string, path: string, deadline: number) =>
+    adminFetch(c.page, method, path, undefined, { timeoutMs: Math.min(15_000, deadline - Date.now()) });
   const operation = async (action: string) => {
-    const accepted = await adminFetch(c.page, 'POST', `/admin/api/v1/sandboxes/${id}:${action}`);
+    const deadline = Date.now() + 120_000;
+    const accepted = await read('POST', `/admin/api/v1/sandboxes/${id}:${action}`, deadline);
     const opId = accepted.json?.operation_id;
     if (accepted.status !== 202 || typeof opId !== 'string') return `${accepted.status}`;
-    const deadline = Date.now() + 120_000;
     let state = 'unfinished';
     while (Date.now() < deadline) {
-      state = (await adminFetch(c.page, 'GET', `/admin/api/v1/operations/${opId}`)).json?.state ?? state;
+      state = (await read('GET', `/admin/api/v1/operations/${opId}`, deadline)).json?.state ?? state;
       if (TERMINAL_OPERATION_STATES.includes(state)) return state;
       await c.page.waitForTimeout(2000);
     }
@@ -366,12 +370,25 @@ step('sandbox-checkpoint-snapshots', ['sandboxes', 'flows', 'lifecycle'], async 
     const deadline = Date.now() + 120_000;
     let seen: unknown;
     while (Date.now() < deadline) {
-      seen = (await adminFetch(c.page, 'GET', `/admin/api/v1/sandboxes/${id}`)).json?.snapshots_enabled;
+      seen = (await read('GET', `/admin/api/v1/sandboxes/${id}`, deadline)).json?.snapshots_enabled;
       if (seen === want) return true;
       await c.page.waitForTimeout(2000);
     }
     c.rec.note(`snapshots_enabled stayed ${String(seen)}, wanted ${want}`);
     return false;
+  };
+  // The checkpoint names the node reports, once one is reported.
+  const reportedCheckpoints = async () => {
+    const deadline = Date.now() + 120_000;
+    while (Date.now() < deadline) {
+      const debug = await read('GET', `/admin/api/v1/debug/sandbox/${id.replace(/^sbx_/, '')}`, deadline);
+      const names: string[] = (debug.json?.snapshots?.inventory ?? [])
+        .map((row: { snapshot_id: string }) => row.snapshot_id)
+        .filter((name: string) => name.startsWith('f-manual-'));
+      if (names.length) return names;
+      await c.page.waitForTimeout(3000);
+    }
+    return [];
   };
   // The card holds the catalog's table, then the node's. The page reloads
   // the node's list every 20 s, so a reading is retried for longer than that.
@@ -382,7 +399,8 @@ step('sandbox-checkpoint-snapshots', ['sandboxes', 'flows', 'lifecycle'], async 
     let last = '';
     while (Date.now() < deadline) {
       if ((await tables().count()) === 2) {
-        last = (await (which === 'catalog' ? tables().first() : tables().last()).innerText()).replace(/\s+/g, ' ');
+        const table = which === 'catalog' ? tables().first() : tables().last();
+        last = (await table.innerText({ timeout: Math.max(1, deadline - Date.now()) }).catch(() => last)).replace(/\s+/g, ' ');
         if (want.test(last)) return true;
       }
       await c.page.waitForTimeout(1500);
@@ -390,39 +408,49 @@ step('sandbox-checkpoint-snapshots', ['sandboxes', 'flows', 'lifecycle'], async 
     c.rec.note(`the ${which} table showed: ${last.slice(0, 300)}`);
     return false;
   };
-  const PERIODIC_OFF = /The node does not list its snapshots while periodic snapshots are off\. Turning them off hides every snapshot the node keeps/;
+  const PERIODIC_OFF = /The node does not report its snapshots while periodic snapshots are off/;
+  const POINTS = /No snapshot records\. The node reports \d+ snapshots?, listed under On the node below\.|No snapshots recorded for upload\. The node reports \d+ snapshots?, listed under On the node below\./;
+  const escape = (name: string) => name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
   const checkpointed = await operation('force-checkpoint');
   c.rec.check(checkpointed === 'succeeded', `the checkpoint succeeds (${checkpointed})`);
   c.rec.check(await observedPeriodic(false), 'the node reports periodic snapshots off');
   await visit(c, `/dashboard/sandboxes/${id}`, 2000);
-  c.rec.check(/A checkpoint stays on the node and is not listed here/.test(await card().innerText()), 'the card says a checkpoint is not in the catalog');
-  c.rec.check(await shows('node', PERIODIC_OFF), 'with periodic snapshots off, On the node says the node does not list them');
-  c.rec.check(await shows('catalog', /^.*No backup records$/), 'the empty catalog makes no claim about the node');
+  c.rec.check(/A checkpoint stays on the node and is not listed here/.test(await card().innerText({ timeout: 30_000 }).catch(() => '')), 'the card says a checkpoint is not in the catalog');
+  c.rec.check(await shows('node', PERIODIC_OFF), 'with periodic snapshots off, On the node says the node does not report them');
+  c.rec.check(await shows('catalog', /^.*(No snapshot records|No snapshots recorded for upload)$/), 'the empty catalog makes no claim about the node');
 
   let off = false;
   try {
     const enabled = await operation('force-enable_snapshots');
     c.rec.check(enabled === 'succeeded', `periodic snapshots turn on (${enabled})`);
     c.rec.check(await observedPeriodic(true), 'the node reports periodic snapshots on');
-    const deadline = Date.now() + 120_000;
-    let listed = false;
-    while (!listed && Date.now() < deadline) {
-      const debug = await adminFetch(c.page, 'GET', `/admin/api/v1/debug/sandbox/${id.replace(/^sbx_/, '')}`);
-      listed = (debug.json?.snapshots?.inventory ?? []).some((row: { snapshot_id: string }) => row.snapshot_id.startsWith('f-manual-'));
-      if (!listed) await c.page.waitForTimeout(3000);
-    }
-    c.rec.check(listed, 'the node publishes the checkpoint');
+    const reported = await reportedCheckpoints();
+    const checkpoint = reported[0];
+    c.rec.check(!!checkpoint, `the node reports the checkpoint (${checkpoint ?? 'none'})`);
     await visit(c, `/dashboard/sandboxes/${id}`, 2000);
-    c.rec.check(await shows('node', /f-manual-/), 'On the node lists the checkpoint');
-    c.rec.check(await shows('catalog', /No backup records\. The node keeps \d+ snapshots?, listed under On the node below\./), 'the empty catalog points at On the node');
+    c.rec.check(await shows('node', new RegExp(escape(checkpoint ?? 'f-manual-'))), 'On the node lists the checkpoint');
+    c.rec.check(await shows('catalog', POINTS), 'the empty catalog points at On the node');
 
     const disabled = await operation('force-disable_snapshots');
-    off = disabled === 'succeeded';
-    c.rec.check(off, `periodic snapshots turn off again (${disabled})`);
+    c.rec.check(disabled === 'succeeded', `periodic snapshots turn off (${disabled})`);
     c.rec.check(await observedPeriodic(false), 'the node reports periodic snapshots off again');
     await visit(c, `/dashboard/sandboxes/${id}`, 2000);
-    c.rec.check(await shows('node', PERIODIC_OFF), 'turning periodic snapshots off hides the checkpoint taken before');
+    c.rec.check(await shows('node', PERIODIC_OFF), 'turning periodic snapshots off empties On the node');
+
+    // Hidden, not deleted: with them on again the node reports the same
+    // checkpoint.
+    const again = await operation('force-enable_snapshots');
+    c.rec.check(again === 'succeeded', `periodic snapshots turn on again (${again})`);
+    c.rec.check(await observedPeriodic(true), 'the node reports periodic snapshots on again');
+    const reportedAgain = await reportedCheckpoints();
+    c.rec.check(!!checkpoint && reportedAgain.includes(checkpoint), `the node reports the same checkpoint again (${reportedAgain.join(', ') || 'none'})`);
+    await visit(c, `/dashboard/sandboxes/${id}`, 2000);
+    c.rec.check(await shows('node', new RegExp(escape(checkpoint ?? 'f-manual-'))), 'On the node lists the same checkpoint again');
+
+    const last = await operation('force-disable_snapshots');
+    off = last === 'succeeded';
+    c.rec.check(off, `periodic snapshots turn off again (${last})`);
   } finally {
     if (!off) {
       const disabled = await operation('force-disable_snapshots');
