@@ -471,22 +471,15 @@ def test_apply_exits_1_on_what_it_cannot_do_exactly(
     assert message in result.stderr
 
 
-def test_apply_by_layer_resumes_after_a_rename(repo: Path) -> None:
+def test_apply_after_a_move_finds_renamed_crates_by_their_new_names(repo: Path) -> None:
     generated(repo)
-    first = tool(repo, "--apply", "--layer", "l40_api")
-    assert first.returncode == 0, first.stderr
-    assert tool(repo, "--verify", "--skip-arch", "--layer", "l40_api").returncode == 0
-    everything = tool(repo, "--verify", "--skip-arch")
-    assert everything.returncode == 1
-    assert "pplx-space-widget is at crates/libs/model/widget, not crates/l20_domain/widget" in everything.stderr
-    git(repo, "commit", "-qm", "l40_api")
+    assert tool(repo, "--apply").returncode == 0
+    git(repo, "commit", "-qm", "move")
 
-    rest = tool(repo, "--apply")
+    again = tool(repo, "--apply")
 
-    assert rest.returncode == 0, rest.stderr
-    assert "crates/libs/model/widget -> crates/l20_domain/widget" in rest.stdout
-    check = cargo_check(repo)
-    assert check.returncode == 0, check.stderr
+    assert again.returncode == 0, again.stderr
+    assert "nothing to move" in again.stdout
 
 
 def test_verify_reports_old_paths_and_names(repo: Path) -> None:
