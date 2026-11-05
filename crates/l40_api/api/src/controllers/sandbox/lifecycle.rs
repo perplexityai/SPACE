@@ -491,7 +491,8 @@ impl SandboxAction {
         lifecycle: Option<SandboxLifecycle>,
     ) -> Option<crate::cluster_admission::ClusterActivationClass> {
         match self {
-            // Start adds runtime placement only from a not-yet-running            // lifecycle. Against an already-running/in-flight/terminal sandbox
+            // Start adds runtime placement only from a not-yet-running
+            // lifecycle. Against an already-running/in-flight/terminal sandbox
             // (started/starting/creating/restoring/failed/deleting) it is a
             // no-op, a join of in-flight work, or a reject, so it must not spend
             // an activation token. No lifecycle context (the internal execute
@@ -990,7 +991,8 @@ pub(super) async fn fetch_active_node_drain_state(
     // restoring`; the snapshot is still canonical mid-restore.
     //
     // The portability check and the primary lookup below read the same
-    // sandbox row, so they are one statement: a snapshot at least as    // consistent as the two reads it replaces. `portable` is only consulted
+    // sandbox row, so they are one statement: a snapshot at least as
+    // consistent as the two reads it replaces. `portable` is only consulted
     // first; the primary columns are ignored when it is true.
     let portable_predicate = portable_for_restore_affinity("s");
     let gate_query = format!(
@@ -1489,7 +1491,8 @@ impl SandboxController {
 
             // Gate cluster activation admission BEFORE emitting the `*_requested`
             // event. A rejected or backpressured activation must not leave an
-            // orphaned requested event with no terminal outcome: the async            // operation dispatcher re-drives the action on every requeue, so an
+            // orphaned requested event with no terminal outcome: the async
+            // operation dispatcher re-drives the action on every requeue, so an
             // early requested-without-terminal would repeat indefinitely. Admission
             // is a rate-limit decision on the lifecycle observed at request entry,
             // not a consistency guard for races with other lifecycle writers. For
@@ -1988,7 +1991,8 @@ impl SandboxController {
                 //   runtime is unreachable we return 503 instead of
                 //   optimistically marking the sandbox stopped: an earlier
                 //   version that decided from the pod-IP lookup conflated
-                //   "pod gone" with "pod Pending / no IP yet" and falsely                //   reported success on a still-running VM.
+                //   "pod gone" with "pod Pending / no IP yet" and falsely
+                //   reported success on a still-running VM.
                 //
                 // This branch keys on the drain *phase* only, not the mode. A
                 // gentle drain still cordons the node, so `ensure_pod_exists`
