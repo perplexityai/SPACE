@@ -42,3 +42,4 @@ pplx-space-test-env = { workspace = true }
 tempfile = { workspace = true }
 testcontainers = { workspace = true }
 testcontainers-modules = { workspace = true, features = ["postgres"] }
+uuid = { workspace = true, features = ["v7"] }

@@ -41,6 +41,108 @@ static SHARED_POSTGRES: OnceCell<Mutex<Weak<SharedPostgres>>> = OnceCell::const_
 
 pub type TestDbResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
+/// Names the [`SchemaVariant`] the migrated template takes on. Unset or empty
+/// leaves the template exactly as the migrations make it.
+pub const SCHEMA_VARIANT_ENV: &str = "SPACE_TEST_POSTGRES_SCHEMA_VARIANT";
+
+/// A candidate schema change the migrated template takes on after the
+/// migrations, so the existing suites can run against it before it is written
+/// as a migration. Each variant's SQL lives in this crate's `schema-variants/`
+/// directory and is never applied to a real database.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SchemaVariant {
+    /// `sandbox_k8s_executions` and `node_k8s` renamed to
+    /// `sandbox_execution_records` and `node_identities`, with compatibility
+    /// views under the old names.
+    ExecutionRecordViews,
+}
+
+impl SchemaVariant {
+    pub const ALL: &[Self] = &[Self::ExecutionRecordViews];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ExecutionRecordViews => "execution-record-views",
+        }
+    }
+
+    /// The statements that turn a migrated database into this variant.
+    pub const fn sql(self) -> &'static str {
+        match self {
+            Self::ExecutionRecordViews => {
+                include_str!("../schema-variants/execution_record_views.sql")
+            }
+        }
+    }
+
+    /// The physical table behind `relation` in this variant: the renamed
+    /// table where `relation` is now a compatibility view, `relation` itself
+    /// otherwise. For test DDL that only a table accepts, such as a row
+    /// trigger.
+    pub fn physical_table(self, relation: &'static str) -> &'static str {
+        match (self, relation) {
+            (Self::ExecutionRecordViews, "sandbox_k8s_executions") => "sandbox_execution_records",
+            (Self::ExecutionRecordViews, "node_k8s") => "node_identities",
+            (Self::ExecutionRecordViews, _) => relation,
+        }
+    }
+
+    /// The variant this run selected with [`SCHEMA_VARIANT_ENV`]. An unknown
+    /// name or a value that is not UTF-8 is an error rather than the default
+    /// schema, so a misspelled variant cannot pass as a run against it.
+    pub fn from_env() -> TestDbResult<Option<Self>> {
+        Self::from_environment(&ProcessEnvironment)
+    }
+
+    fn from_environment(env: &dyn Environment) -> TestDbResult<Option<Self>> {
+        match env.var(SCHEMA_VARIANT_ENV) {
+            Ok(value) => Self::parse(Some(&value)),
+            Err(std::env::VarError::NotPresent) => Ok(None),
+            Err(std::env::VarError::NotUnicode(value)) => Err(FixtureError::boxed(format!(
+                "{SCHEMA_VARIANT_ENV}={value:?} is not valid UTF-8, so it names no schema variant"
+            ))),
+        }
+    }
+
+    fn parse(value: Option<&str>) -> TestDbResult<Option<Self>> {
+        match value {
+            None | Some("") => Ok(None),
+            Some(value) => value.parse().map(Some),
+        }
+    }
+}
+
+impl Display for SchemaVariant {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for SchemaVariant {
+    type Err = Box<dyn Error + Send + Sync>;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|variant| variant.as_str() == value)
+            .ok_or_else(|| {
+                let known: Vec<&str> = Self::ALL.iter().map(|variant| variant.as_str()).collect();
+                FixtureError::boxed(format!(
+                    "{SCHEMA_VARIANT_ENV}={value:?} names no schema variant; known: {}",
+                    known.join(", ")
+                ))
+            })
+    }
+}
+
+/// The physical table behind `relation` in this run's schema variant, or
+/// `relation` itself when the run selected none. See
+/// [`SchemaVariant::physical_table`].
+pub fn physical_table(relation: &'static str) -> TestDbResult<&'static str> {
+    Ok(SchemaVariant::from_env()?.map_or(relation, |variant| variant.physical_table(relation)))
+}
+
 /// Split an image reference into the `(name, tag)` pair
 /// [`testcontainers::ImageExt`] wants, taking `env_var` as an override of
 /// `default`.
@@ -797,6 +899,9 @@ async fn create_template_database(
     admin_pool: &PgPool,
     template_database_url: &str,
 ) -> Result<(), InitError> {
+    // Resolved first, so a misspelled variant fails before a full migration run.
+    let variant =
+        SchemaVariant::from_env().map_err(|error| InitError::failed(error.to_string()))?;
     let create_template = format!("CREATE DATABASE {}", quote_ident(TEMPLATE_DATABASE));
     sqlx::query(sqlx::AssertSqlSafe(create_template.as_str()))
         .execute(admin_pool)
@@ -825,6 +930,17 @@ async fn create_template_database(
                 "failed to migrate postgres template database: {error}"
             ))
         })?;
+    if let Some(variant) = variant {
+        sqlx::raw_sql(variant.sql())
+            .execute(&template_pool)
+            .await
+            .map_err(|error| {
+                InitError::failed(format!(
+                    "failed to apply schema variant {variant} to the postgres template \
+                     database: {error}"
+                ))
+            })?;
+    }
     // Cross-organization tests use these stable IDs independently of production seeds.
     sqlx::query(
         "INSERT INTO organizations (id, name, slug) VALUES

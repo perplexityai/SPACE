@@ -3,7 +3,8 @@ use std::sync::{Arc, Barrier};
 use pplx_space_test_env::TestEnv;
 
 use super::{
-    TestDepsPolicy, append_skip_record, report_dependency_skip_to, unavailable_dependency_outcome,
+    SchemaVariant, TestDepsPolicy, append_skip_record, report_dependency_skip_to,
+    unavailable_dependency_outcome,
 };
 
 #[test]
@@ -222,4 +223,41 @@ fn report_dependency_skip_rejects_relative_log_paths() {
     );
 
     assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidInput);
+}
+
+#[test]
+fn schema_variant_names_round_trip_and_unknown_names_fail() {
+    assert_eq!(SchemaVariant::parse(None).unwrap(), None);
+    assert_eq!(SchemaVariant::parse(Some("")).unwrap(), None);
+    for &variant in SchemaVariant::ALL {
+        assert_eq!(
+            SchemaVariant::parse(Some(variant.as_str())).unwrap(),
+            Some(variant)
+        );
+    }
+    // A misspelled variant must not run the suites against the default schema
+    // and report them as passing against the variant.
+    let error = SchemaVariant::parse(Some("execution-records-views")).unwrap_err();
+    assert!(
+        error.to_string().contains("execution-record-views"),
+        "the error lists the known variants: {error}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn schema_variant_values_that_are_not_utf8_fail() {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let mut env = TestEnv::default();
+    env.set(
+        super::SCHEMA_VARIANT_ENV,
+        std::ffi::OsStr::from_bytes(b"execution-record-views\xff"),
+    );
+    // Read as unset, this would run the suites against the default schema.
+    let error = SchemaVariant::from_environment(&env).unwrap_err();
+    assert!(
+        error.to_string().contains(super::SCHEMA_VARIANT_ENV),
+        "the error names the variable: {error}"
+    );
 }
