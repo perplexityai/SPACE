@@ -120,8 +120,10 @@ members = [
     "crates/l10_foundation/common/lru/reaper",
     "crates/l10_foundation/common/proto/build",
     "crates/l10_foundation/common/work/coalescer",
-    "crates/libs/common/svc",
     "crates/l40_api/rpc/auth",
+    "crates/l40_api/grpc/server",
+    "crates/l40_api/local/health",
+    "crates/l40_api/service/host",
     "crates/l30_storage/postgres/pool",
     "crates/l30_storage/sandbox/residency",
     "crates/l10_foundation/content/digest",
@@ -374,7 +376,6 @@ pplx-space-common-io = { path = "crates/l10_foundation/common/io" }
 pplx-space-common-jobs = { path = "crates/l10_foundation/common/jobs" }
 pplx-space-common-lru-reaper = { path = "crates/l10_foundation/common/lru/reaper" }
 pplx-space-common-proto-build = { path = "crates/l10_foundation/common/proto/build" }
-pplx-space-common-svc = { path = "crates/libs/common/svc", default-features = false }
 pplx-space-common-work-coalescer = { path = "crates/l10_foundation/common/work/coalescer" }
 pplx-space-content-digest = { path = "crates/l10_foundation/content/digest" }
 pplx-space-cpu-arch = { path = "crates/l10_foundation/cpu/arch" }
@@ -448,6 +449,9 @@ pplx-space-linux-ids = { path = "crates/l10_foundation/linux/ids" }
 pplx-space-network-roles = { path = "crates/l20_domain/network/roles" }
 pplx-space-auto-lifecycle = { path = "crates/l20_domain/auto/lifecycle/policy" }
 pplx-space-pii = { path = "crates/l10_foundation/pii" }
+pplx-space-grpc-server = { path = "crates/l40_api/grpc/server" }
+pplx-space-local-health = { path = "crates/l40_api/local/health" }
+pplx-space-service-host = { path = "crates/l40_api/service/host" }
 pplx-space-rpc-auth = { path = "crates/l40_api/rpc/auth" }
 pplx-space-rpc-contracts = { path = "crates/l20_domain/rpc/contracts" }
 pplx-space-btrfs = { path = "crates/l10_foundation/btrfs" }

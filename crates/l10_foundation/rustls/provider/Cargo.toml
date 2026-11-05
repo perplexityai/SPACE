@@ -11,7 +11,7 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
-# The features common-svc enabled for this call. `aws_lc_rs` provides the
+# The features this call needs. `aws_lc_rs` provides the
 # provider and `tls12` keeps TLS 1.2 in its default cipher suites. Other
 # features that shape the provider, such as `prefer-post-quantum` and `fips`,
 # come from the rest of the build.

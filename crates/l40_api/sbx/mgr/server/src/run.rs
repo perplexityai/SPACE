@@ -19,15 +19,15 @@ use std::time::Duration;
 
 use http::{HeaderMap, Request as HttpRequest, Response as HttpResponse};
 use http_body::{Body, Frame, SizeHint};
-use pplx_space_common_svc::core::host::linux::identities::group_names;
-use pplx_space_common_svc::core::host::linux::paths::{
-    SANDBOX_MANAGER_DEPENDENCY_ADMISSION_GATE, SANDBOX_MANAGER_DEPENDENCY_DRAIN_CAPABILITY,
-    SANDBOX_MANAGER_DEPENDENCY_WORK_GATE,
+use pplx_space_common_core::host::linux::identities::group_names;
+use pplx_space_common_core::{
+    host::linux::paths::SANDBOX_MANAGER_DEPENDENCY_ADMISSION_GATE,
+    host::linux::paths::SANDBOX_MANAGER_DEPENDENCY_DRAIN_CAPABILITY,
+    host::linux::paths::SANDBOX_MANAGER_DEPENDENCY_WORK_GATE,
 };
-use pplx_space_common_svc::{
-    AcquireOutcome, DEFAULT_DRAIN_TIMEOUT, DEFAULT_SERVICE_MUTEX_TIMEOUT, LocalHealthServer,
-    ServiceMutex,
-};
+use pplx_space_local_health::LocalHealthServer;
+use pplx_space_service_lifecycle::{DEFAULT_DRAIN_TIMEOUT, DEFAULT_SERVICE_MUTEX_TIMEOUT};
+use pplx_space_service_mutex::{AcquireOutcome, ServiceMutex};
 use pplx_space_spaced_common::proto::host_control::host_control_server::HostControlServer;
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::UnixListenerStream;
@@ -560,13 +560,11 @@ pub enum RunSbxMgrError {
     #[error("invalid sandbox-manager configuration: {0}")]
     Config(#[source] crate::config::ConfigLoadError),
     #[error("invalid or missing SPACE API route verification configuration: {0}")]
-    RouteVerificationBundle(
-        #[source] pplx_space_common_svc::space_api_route_ed25519::SpaceApiRouteEd25519Error,
-    ),
+    RouteVerificationBundle(#[source] pplx_space_api_route::ed25519::SpaceApiRouteEd25519Error),
     #[error("failed to bind the sandbox-manager health socket: {0}")]
-    HealthSocket(#[source] pplx_space_common_svc::bootstrap::BindUnixSocketError),
+    HealthSocket(#[source] pplx_space_unix_socket_bind::BindUnixSocketError),
     #[error("failed to acquire the sandbox-manager service mutex: {0}")]
-    ServiceMutex(#[source] pplx_space_common_svc::service_mutex::AcquireError),
+    ServiceMutex(#[source] pplx_space_service_mutex::AcquireError),
     #[error("failed to migrate the sandbox-manager database: {0}")]
     Migrate(#[source] crate::db::OpenError),
     #[error("failed to open the sandbox-manager database: {0}")]
@@ -575,7 +573,7 @@ pub enum RunSbxMgrError {
     NodeRole {
         role: String,
         #[source]
-        source: pplx_space_common_svc::core::types::NodeRoleParseError,
+        source: pplx_space_common_core::types::NodeRoleParseError,
     },
     #[error("invalid {SPACE_NODE_MANAGED_BY_ENV}: {0}")]
     NodeManagedBy(#[source] pplx_space_common_core::types::NodeManagedByParseError),
@@ -600,9 +598,9 @@ pub enum RunSbxMgrError {
         #[source] crate::service::RefundInterruptedSnapshotUploadAttemptsError,
     ),
     #[error("failed to bind the sandbox-manager socket: {0}")]
-    BindSocket(#[source] pplx_space_common_svc::bootstrap::BindUnixSocketError),
+    BindSocket(#[source] pplx_space_unix_socket_bind::BindUnixSocketError),
     #[error("failed to bind the sandbox-manager host-control socket: {0}")]
-    BindHostControlSocket(#[source] pplx_space_common_svc::bootstrap::BindUnixSocketError),
+    BindHostControlSocket(#[source] pplx_space_unix_socket_bind::BindUnixSocketError),
     #[error("failed to release the dependency restart drain capability: {0}")]
     ReleaseDependencyRestartDrain(#[source] ReleaseDependencyRestartDrainError),
     /// A production gRPC server returned or panicked before shutdown was
@@ -691,7 +689,7 @@ where
     let health_guard = health_shutdown.clone().drop_guard();
     let health = LocalHealthServer::spawn_optional_waiting(
         config.health_socket_path.as_deref(),
-        pplx_space_common_svc::UnixSocketOptions::new(0o660),
+        pplx_space_unix_socket_bind::UnixSocketOptions::new(0o660),
         SERVICE_NAME,
         health_shutdown.clone(),
     )
@@ -759,7 +757,7 @@ pub async fn run(
     let service_config = crate::config::load().map_err(RunSbxMgrError::Config)?;
     let node_managed_by = parse_node_managed_by(std::env::var(SPACE_NODE_MANAGED_BY_ENV))?;
     let route_ed25519_verification_bundle = Some(std::sync::Arc::new(
-        pplx_space_common_svc::space_api_route_ed25519::load_required_space_api_route_ed25519_verification_bundle()
+        pplx_space_api_route::ed25519::load_required_space_api_route_ed25519_verification_bundle()
             .map_err(RunSbxMgrError::RouteVerificationBundle)?,
     ));
 
@@ -808,7 +806,7 @@ pub async fn run(
         Ok(value) if !value.trim().is_empty() => {
             let role = value.trim();
             Some(
-                pplx_space_common_svc::core::types::NodeRole::from_str(role).map_err(|source| {
+                pplx_space_common_core::types::NodeRole::from_str(role).map_err(|source| {
                     RunSbxMgrError::NodeRole {
                         role: role.to_string(),
                         source,
@@ -994,16 +992,17 @@ pub async fn run(
     );
     task_tracker.close();
 
-    let sandbox_listener = pplx_space_common_svc::bind_unix_socket(
+    let sandbox_listener = pplx_space_unix_socket_bind::bind_unix_socket(
         &config.socket_path,
-        pplx_space_common_svc::UnixSocketOptions::new(0o770)
-            .with_group(pplx_space_common_svc::SocketGroup::Required(SOCKET_GROUP)),
+        pplx_space_unix_socket_bind::UnixSocketOptions::new(0o770).with_group(
+            pplx_space_unix_socket_bind::SocketGroup::Required(SOCKET_GROUP),
+        ),
     )
     .map_err(RunSbxMgrError::BindSocket)
     .inspect_err(report_active_failure)?;
-    let host_control_listener = pplx_space_common_svc::bind_unix_socket(
+    let host_control_listener = pplx_space_unix_socket_bind::bind_unix_socket(
         &config.host_control_socket_path,
-        pplx_space_common_svc::UnixSocketOptions::new(0o666),
+        pplx_space_unix_socket_bind::UnixSocketOptions::new(0o666),
     )
     .map_err(RunSbxMgrError::BindHostControlSocket)
     .inspect_err(report_active_failure)?;
@@ -1025,7 +1024,7 @@ pub async fn run(
     let unexpected_server_exit = CancellationToken::new();
     let active_response_streams = ActiveResponseStreams::default();
 
-    let (health_reporter, health_service) = pplx_space_common_svc::grpc_health_service();
+    let (health_reporter, health_service) = pplx_space_grpc_server::grpc_health_service();
     health_reporter
         .set_service_status(
             pplx_space_sbx_mgr_client::ACTIVATION_POLICY_HEALTH_SERVICE,
@@ -1052,13 +1051,17 @@ pub async fn run(
         SERVICE_NAME,
         &shutdown_token,
         &unexpected_server_exit,
-        pplx_space_common_svc::grpc_server_builder()
+        pplx_space_grpc_server::grpc_server_builder()
             .layer(HandoffStreamCancellationLayer::new(
                 rpc_drain_token.clone(),
                 active_response_streams.clone(),
             ))
-            .layer(pplx_space_common_svc::conservative_uds_grpc_rate_limiter_layer(SERVICE_NAME))
-            .layer(pplx_space_common_svc::grpc_trace_layer())
+            .layer(
+                pplx_space_grpc_rate_limiter::conservative_uds_grpc_rate_limiter_layer(
+                    SERVICE_NAME,
+                ),
+            )
+            .layer(pplx_space_grpc_server::grpc_trace_layer())
             .layer(service.restart_admission_layer())
             .add_service(health_service)
             // A reset upload is an error, not a complete file.
@@ -1084,17 +1087,17 @@ pub async fn run(
         "space-sandbox-manager-host-control",
         &shutdown_token,
         &unexpected_server_exit,
-        pplx_space_common_svc::grpc_server_builder()
+        pplx_space_grpc_server::grpc_server_builder()
             .layer(HandoffStreamCancellationLayer::new(
                 rpc_drain_token.clone(),
                 active_response_streams.clone(),
             ))
             .layer(
-                pplx_space_common_svc::conservative_uds_grpc_rate_limiter_layer(
+                pplx_space_grpc_rate_limiter::conservative_uds_grpc_rate_limiter_layer(
                     HOST_CONTROL_SERVICE_NAME,
                 ),
             )
-            .layer(pplx_space_common_svc::grpc_trace_layer())
+            .layer(pplx_space_grpc_server::grpc_trace_layer())
             .layer(service.restart_admission_layer())
             .add_service(InterceptedService::new(
                 HostControlServer::new(service.clone())

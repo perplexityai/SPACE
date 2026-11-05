@@ -2,6 +2,15 @@ use super::*;
 use crate::{native::first_frame_attach_token_from_recv, runtime_route::sweep_expired_ecw_routes};
 use aws_lc_rs::rand::SystemRandom;
 use aws_lc_rs::signature::Ed25519KeyPair;
+use pplx_space_api_route::{
+    RouteIdentityRemediation, SpaceApiRouteIdentityDimension, SpaceApiRouteProtocol,
+    set_route_identity_rejection_metadata,
+};
+use pplx_space_api_route::{
+    ed25519::SpaceApiRouteEd25519Claims, ed25519::SpaceApiRouteEd25519Issuer,
+    ed25519::SpaceApiRouteEd25519KeyId, ed25519::SpaceApiRouteEd25519Signer,
+    ed25519::SpaceApiRouteEd25519Token,
+};
 use pplx_space_common_core::{
     host::disk_admission::CacheDiskAdmissionReason,
     types::{
@@ -9,14 +18,6 @@ use pplx_space_common_core::{
         SandboxActivationAttemptId, SandboxId, SandboxRouteIdentity, SimpleDuration,
         SpaceApiRouteIdentity,
     },
-};
-use pplx_space_common_svc::space_api_route::{
-    RouteIdentityRemediation, SpaceApiRouteIdentityDimension, SpaceApiRouteProtocol,
-    set_route_identity_rejection_metadata,
-};
-use pplx_space_common_svc::space_api_route_ed25519::{
-    SpaceApiRouteEd25519Claims, SpaceApiRouteEd25519Issuer, SpaceApiRouteEd25519KeyId,
-    SpaceApiRouteEd25519Signer, SpaceApiRouteEd25519Token,
 };
 use pplx_space_net_gateway_client::proto::{
     ServicePortIngressFrame, ServicePortIngressStart, service_port_ingress_frame,
@@ -887,7 +888,7 @@ async fn spawn_cluster_api_stub(
         .await
         .expect("bind cluster-api stub");
     let addr = listener.local_addr().expect("stub addr");
-    let (_reporter, health) = pplx_space_common_svc::bootstrap::grpc_health_service();
+    let (_reporter, health) = pplx_space_grpc_server::grpc_health_service();
     tokio::spawn(async move {
         let _ = tonic::transport::Server::builder()
             .add_service(health)
@@ -1220,13 +1221,11 @@ fn cluster_api_startup_retry_is_transport_only() {
         &ConnectClusterApiError::MissingEndpoint
     ));
     assert!(!cluster_api_connect_error_is_retryable(
-        &ConnectClusterApiError::MissingToken(
-            pplx_space_common_svc::bearer_token::BearerTokenError::Missing {
-                path_env: "SPACE_CLUSTER_API_TOKEN_PATH",
-                default_path: "/var/run/space-auth/cluster-api.token".into(),
-                fallback_env: "SPACE_INTERNAL_TOKEN",
-            }
-        )
+        &ConnectClusterApiError::MissingToken(pplx_space_bearer_token::BearerTokenError::Missing {
+            path_env: "SPACE_CLUSTER_API_TOKEN_PATH",
+            default_path: "/var/run/space-auth/cluster-api.token".into(),
+            fallback_env: "SPACE_INTERNAL_TOKEN",
+        })
     ));
 }
 
@@ -2011,7 +2010,7 @@ async fn run_refuses_a_revocation_check_interval_above_the_maximum() {
         Err(RunDataPlaneError::RevocationCheckIntervalTooLong { .. })
     ));
     // Refused before it connects to anything.
-    let stop = pplx_space_common_svc::StopTokens {
+    let stop = pplx_space_service_lifecycle::shutdown::StopTokens {
         shutdown: CancellationToken::new(),
         forced: CancellationToken::new(),
     };
@@ -2855,8 +2854,8 @@ fn data_plane_http_span_metadata_redacts_ecw_proxy_paths() {
             None
         ),
         (
-            Cow::Borrowed(pplx_space_common_svc::REDACTED_HTTP_PATH_VALUE),
-            Cow::Borrowed(pplx_space_common_svc::REDACTED_HTTP_PATH_VALUE),
+            Cow::Borrowed(pplx_space_http_server::REDACTED_HTTP_PATH_VALUE),
+            Cow::Borrowed(pplx_space_http_server::REDACTED_HTTP_PATH_VALUE),
         ),
     );
     assert_eq!(

@@ -273,7 +273,7 @@ async fn connect_host_control(
         .await
         .map_err(|source| HydrateNetworkStateError::ConnectHostControl { sandbox_id, source })?;
     Ok(HostControlClient::new(
-        pplx_space_common_svc::bootstrap::wrap_grpc_client_channel(channel),
+        pplx_space_common_grpc::trace_grpc_client_transport(channel),
     ))
 }
 

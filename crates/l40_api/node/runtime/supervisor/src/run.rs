@@ -39,12 +39,12 @@ pub enum RunRuntimeSupervisorError {
     #[error("failed to configure the runtime-supervisor Tokio runtime: {0}")]
     BuildRuntime(#[source] std::io::Error),
     #[error("failed to initialize runtime-supervisor telemetry: {0}")]
-    Telemetry(#[source] pplx_space_common_svc::ObservabilityError),
+    Telemetry(#[source] pplx_space_observability::ObservabilityError),
     #[error("failed to bind the runtime-supervisor socket {path}: {source}")]
     BindSocket {
         path: PathBuf,
         #[source]
-        source: pplx_space_common_svc::bootstrap::BindUnixSocketError,
+        source: pplx_space_unix_socket_bind::BindUnixSocketError,
     },
     #[error("failed to start the tracked child reaper: {0}")]
     ChildReaper(#[source] std::io::Error),
@@ -82,19 +82,20 @@ async fn run_service(
     socket: PathBuf,
     jailer_start_timeout: Duration,
 ) -> Result<(), RunRuntimeSupervisorError> {
-    let telemetry = pplx_space_common_svc::init_service(SERVICE_NAME)
+    let telemetry = pplx_space_service_host::init_service(SERVICE_NAME)
         .map_err(RunRuntimeSupervisorError::Telemetry)?;
-    let listener = pplx_space_common_svc::bind_unix_socket(
+    let listener = pplx_space_unix_socket_bind::bind_unix_socket(
         Path::new(&socket),
-        pplx_space_common_svc::UnixSocketOptions::new(0o600)
-            .with_group(pplx_space_common_svc::SocketGroup::Required(SOCKET_GROUP)),
+        pplx_space_unix_socket_bind::UnixSocketOptions::new(0o600).with_group(
+            pplx_space_unix_socket_bind::SocketGroup::Required(SOCKET_GROUP),
+        ),
     )
     .map_err(|source| RunRuntimeSupervisorError::BindSocket {
         path: socket.clone(),
         source,
     })?;
-    let (_, health_service) = pplx_space_common_svc::grpc_health_service();
-    let shutdown_token = pplx_space_common_svc::shutdown_token();
+    let (_, health_service) = pplx_space_grpc_server::grpc_health_service();
+    let shutdown_token = pplx_space_service_lifecycle::shutdown::shutdown_token();
     let service = RuntimeSupervisorService::new(shutdown_token.clone())
         .with_jailer_start_timeout(jailer_start_timeout);
     service
@@ -110,13 +111,13 @@ async fn run_service(
         shutdown_token.cancelled().await;
         tracing::warn!("space-runtime-supervisor shutting down");
     };
-    let result = pplx_space_common_svc::grpc_server_builder()
-        .layer(pplx_space_common_svc::grpc_trace_layer())
+    let result = pplx_space_grpc_server::grpc_server_builder()
+        .layer(pplx_space_grpc_server::grpc_trace_layer())
         .add_service(health_service)
         .add_service(RuntimeSupervisorServer::new(service.clone()))
         .serve_with_incoming_shutdown(UnixListenerStream::new(listener), shutdown)
         .await;
     service.drain().await;
-    pplx_space_common_svc::shutdown_telemetry(telemetry).await;
+    pplx_space_service_host::shutdown_telemetry(telemetry).await;
     result.map_err(RunRuntimeSupervisorError::Serve)
 }

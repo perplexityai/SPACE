@@ -1,10 +1,8 @@
 //! Shared helpers that open, migrate and maintain a service-owned SQLite
 //! database by path, for the node services and the migrator that own one.
 //!
-//! They live apart from `pplx-space-common-svc` so that a crate that must not
-//! touch a service's database can leave them out of its dependencies; Cargo
-//! feature unification would otherwise expose them to every crate that
-//! depends on common-svc. `cargo arch`'s `layers.storage_access` lets only
+//! They live in their own crate so that a crate that must not touch a
+//! service's database can leave them out of its dependencies. `cargo arch`'s `layers.storage_access` lets only
 //! stores, storage helpers and the crates its `[layers.storage_access]`
 //! baseline lists have a normal or build dependency on this crate, and that
 //! baseline only shrinks.

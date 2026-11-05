@@ -533,7 +533,7 @@ fn a_failed_attempt_may_have_been_accepted_unless_it_proves_otherwise() {
         ),
         (
             TemplateBuildAttemptError::Credential(
-                pplx_space_common_svc::bearer_token::BearerTokenError::EmptyEnv {
+                pplx_space_bearer_token::BearerTokenError::EmptyEnv {
                     env_var: "SYNTHETIC_TOKEN",
                 },
             ),

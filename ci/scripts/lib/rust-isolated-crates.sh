@@ -14,10 +14,10 @@
 #   bash -euo pipefail -c 'source ci/scripts/lib/rust-isolated-crates.sh; run_isolated_crate_checks'
 
 # The workspace libraries run_isolated_crate_checks lints, one per line: every
-# library, other than common-core and common-svc, that reaches common-core at
-# most directly. No other workspace member in its normal dependency graph may
-# reach common-core or common-svc. A crate split out of the two is linted once
-# it depends on nothing else that reaches them, and a new library joins
+# library, other than common-core, that reaches common-core at most directly.
+# No other workspace member in its normal dependency graph may reach
+# common-core. A crate split out of it is linted once it depends on nothing
+# else that reaches it, and a new library joins
 # without a CI edit, wherever it lives. A crate that reaches common-core
 # through another crate builds that crate's graph too, so linting all of them
 # would take several times as long; the workspace clippy still lints them.
@@ -36,18 +36,22 @@ import json
 import subprocess
 import sys
 
-COMMON_CORE, COMMON_SVC = "pplx-space-common-core", "pplx-space-common-svc"
+COMMON_CORE = "pplx-space-common-core"
 # Reach common-core, besides directly, only through crates that are linted
-# alone themselves (pplx-space-metrics, for rpc-auth also pplx-space-api-route,
-# for postgres-pool also pplx-space-state-reconciliation), and build quickly
-# alone, so they are linted as well. rpc-auth is here so that its build without
-# `k8s` is linted: no binary's release build leaves that feature off. Each
+# alone themselves (pplx-space-metrics, and for some also pplx-space-api-route,
+# pplx-space-state-reconciliation, pplx-space-common-grpc and each other), and
+# build quickly alone, so they are linted as well. rpc-auth is here so that its
+# build without `k8s` is linted: no binary's release build leaves that feature
+# off; service-host so that its build without `otel` and `datadog` is. Each
 # entry must be a workspace library the rule leaves out for reaching
 # common-core through another crate.
 ALSO = {
+    "pplx-space-grpc-server",
     "pplx-space-ingress-admission",
+    "pplx-space-local-health",
     "pplx-space-postgres-pool",
     "pplx-space-rpc-auth",
+    "pplx-space-service-host",
     "pplx-space-tokio-runtime",
     "pplx-space-uds-peer-auth",
 }
@@ -99,9 +103,7 @@ def reaches(start, edges):
 
 def classify(name, edges):
     others = reaches(name, edges) - {COMMON_CORE}
-    if COMMON_SVC in others:
-        return "rest"
-    if any(reaches(other, edges) & {COMMON_CORE, COMMON_SVC} for other in others):
+    if any(COMMON_CORE in reaches(other, edges) for other in others):
         return "indirect"
     return "selected"
 
@@ -118,18 +120,18 @@ libraries = sorted(
 undecided = [
     name
     for name in libraries
-    if name not in (COMMON_CORE, COMMON_SVC)
+    if name != COMMON_CORE
     and classify(name, declared_edges) != "selected"
 ]
 # Cargo's package-cache lock serializes most of each `cargo tree`; running a
 # few at once still overlaps the rest, which saves about a third.
 with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
     resolved = dict(zip(undecided, pool.map(resolved_edges, undecided)))
-groups = {"selected": [], "indirect": [], "rest": []}
+groups = {"selected": [], "indirect": []}
 for name in libraries:
-    if name in (COMMON_CORE, COMMON_SVC):
-        group = "rest"
-    elif name in resolved:
+    if name == COMMON_CORE:
+        continue
+    if name in resolved:
         group = classify(name, resolved[name])
     else:
         group = "selected"
@@ -149,11 +151,6 @@ for name in sorted(groups["selected"]):
 print(
     f"Not linted alone, reaching common-core through another crate: "
     f"{len(groups['indirect'])}: {' '.join(groups['indirect'])}",
-    file=sys.stderr,
-)
-print(
-    f"Not linted alone, being common-core or common-svc or reaching common-svc: "
-    f"{len(groups['rest'])}: {' '.join(groups['rest'])}",
     file=sys.stderr,
 )
 PY

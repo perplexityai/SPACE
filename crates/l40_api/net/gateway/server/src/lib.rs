@@ -10,6 +10,7 @@ pub mod reserved_dns;
 pub mod resource_budget;
 pub mod route_verification;
 mod run;
+mod sandbox_span;
 pub mod sniff;
 pub mod state;
 pub mod stats;

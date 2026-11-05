@@ -23,7 +23,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use pplx_space_common_core::types::SandboxId;
-use pplx_space_common_svc::PeerIdentity;
+use pplx_space_uds_peer_auth::PeerIdentity;
 use tonic::Request;
 
 use super::{

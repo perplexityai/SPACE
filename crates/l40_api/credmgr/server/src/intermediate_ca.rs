@@ -34,8 +34,8 @@ pub const ISSUE_INTERMEDIATE_METHOD_PATH: &str =
 /// fraction of one per second, so a rate near the ceiling is a retry storm.
 /// TCP peers share one bucket, making this a fleet-wide cap; a shed node backs
 /// off and keeps signing under the intermediate it already holds.
-pub fn issue_rate_limits() -> pplx_space_common_svc::GrpcRateLimiterLimits {
-    pplx_space_common_svc::GrpcRateLimiterLimits {
+pub fn issue_rate_limits() -> pplx_space_grpc_rate_limiter::GrpcRateLimiterLimits {
+    pplx_space_grpc_rate_limiter::GrpcRateLimiterLimits {
         // Issuance polls for seconds at a time, so in-flight depth is not a
         // proxy for rate; small enough that a stall cannot pin tasks.
         max_global_in_flight: Some(32),

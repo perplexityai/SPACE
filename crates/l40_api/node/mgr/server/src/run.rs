@@ -10,10 +10,10 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use pplx_space_common_svc::core::host::linux::identities::group_names;
-use pplx_space_common_svc::{
-    AcquireOutcome, DEFAULT_DRAIN_TIMEOUT, LocalHealthServer, ServiceMutex,
-};
+use pplx_space_common_core::host::linux::identities::group_names;
+use pplx_space_local_health::LocalHealthServer;
+use pplx_space_service_lifecycle::DEFAULT_DRAIN_TIMEOUT;
+use pplx_space_service_mutex::{AcquireOutcome, ServiceMutex};
 use serde::Deserialize;
 use tokio_stream::wrappers::UnixListenerStream;
 use tokio_util::sync::CancellationToken;
@@ -176,7 +176,7 @@ pub enum RunNodeMgrError {
     )]
     SandboxCgroupMemoryBelowHeadroom { memory_mib: u64, headroom_mib: u64 },
     #[error("failed to look up a required node-manager runtime group: {0}")]
-    RuntimeGroupLookup(#[source] pplx_space_common_svc::bootstrap::UnixGroupLookupError),
+    RuntimeGroupLookup(#[source] pplx_space_unix_socket_bind::UnixGroupLookupError),
     #[error("missing required node-manager runtime groups: {}", groups.join(", "))]
     MissingRuntimeGroups { groups: Vec<&'static str> },
     #[error("failed to run runtime-supervisor activator: {0}")]
@@ -188,9 +188,9 @@ pub enum RunNodeMgrError {
     #[error("failed to resolve sandbox disk I/O capacity profile: {0}")]
     ResolveDiskIoCapacityProfile(String),
     #[error("failed to bind the node-manager health socket: {0}")]
-    HealthSocket(#[source] pplx_space_common_svc::bootstrap::BindUnixSocketError),
+    HealthSocket(#[source] pplx_space_unix_socket_bind::BindUnixSocketError),
     #[error("failed to acquire the node-manager service mutex: {0}")]
-    ServiceMutex(#[source] pplx_space_common_svc::service_mutex::AcquireError),
+    ServiceMutex(#[source] pplx_space_service_mutex::AcquireError),
     #[error("failed to apply sandbox parent CPU limit: {0}")]
     ApplyParentCpuLimit(String),
     #[error("failed to apply sandbox parent memory limit: {0}")]
@@ -212,7 +212,7 @@ pub enum RunNodeMgrError {
     #[error("failed to remove legacy root namespace service-port DNAT rules: {0}")]
     RemoveLegacyRootIngressDnatRules(#[source] crate::firewall::FirewallError),
     #[error("failed to bind the node-manager socket: {0}")]
-    BindSocket(#[source] pplx_space_common_svc::bootstrap::BindUnixSocketError),
+    BindSocket(#[source] pplx_space_unix_socket_bind::BindUnixSocketError),
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -553,7 +553,7 @@ async fn resolve_disk_io_capacity_profile(
 fn validate_runtime_groups() -> Result<(), RunNodeMgrError> {
     let mut missing = Vec::new();
     for group in REQUIRED_RUNTIME_GROUPS {
-        if !pplx_space_common_svc::unix_group_exists(group)
+        if !pplx_space_unix_socket_bind::unix_group_exists(group)
             .map_err(RunNodeMgrError::RuntimeGroupLookup)?
         {
             missing.push(*group);
@@ -583,7 +583,7 @@ fn activate_runtime_supervisor_on_start() -> Result<(), RunNodeMgrError> {
 }
 
 fn runtime_supervisor_activation_enabled(raw: Option<&str>) -> bool {
-    pplx_space_common_svc::core::env::env_flag(raw, false)
+    pplx_space_common_core::env::env_flag(raw, false)
 }
 
 /// Run node-manager until `shutdown_token` fires or a startup step fails.
@@ -613,7 +613,7 @@ pub async fn run(
 
     let health_server = LocalHealthServer::spawn_optional(
         cli.health_socket_path.as_deref(),
-        pplx_space_common_svc::UnixSocketOptions::new(0o660),
+        pplx_space_unix_socket_bind::UnixSocketOptions::new(0o660),
         SERVICE_NAME,
         shutdown_token.clone(),
     )
@@ -655,7 +655,7 @@ pub async fn run(
 
     // Reject incompatible ownership before any host limit can shrink beneath
     // live sandboxes. Pool construction repeats this check before row repair.
-    let db_path = Path::new(pplx_space_common_svc::core::host::linux::paths::NODE_MANAGER_DB);
+    let db_path = Path::new(pplx_space_common_core::host::linux::paths::NODE_MANAGER_DB);
     pplx_space_sqlite::migrate("node-manager", db_path, &NODE_MANAGER_MIGRATOR)
         .await
         .map_err(RunNodeMgrError::Migrate)?;
@@ -821,10 +821,10 @@ pub async fn run(
         let sandbox_guest_memory_max_mib = sandbox_cgroup_config.guest_memory_max_mib();
         let sandbox_memory_headroom_mib = crate::cgroup::DEFAULT_SANDBOX_MEMORY_HEADROOM_MIB;
 
-        let listener = pplx_space_common_svc::bind_unix_socket(
+        let listener = pplx_space_unix_socket_bind::bind_unix_socket(
             &cli.socket_path,
-            pplx_space_common_svc::UnixSocketOptions::new(0o770)
-                .with_group(pplx_space_common_svc::SocketGroup::Required(SOCKET_GROUP)),
+            pplx_space_unix_socket_bind::UnixSocketOptions::new(0o770)
+                .with_group(pplx_space_unix_socket_bind::SocketGroup::Required(SOCKET_GROUP)),
         )
         .map_err(RunNodeMgrError::BindSocket)?;
 
@@ -885,7 +885,7 @@ pub async fn run(
             shutdown_token.child_token(),
             &task_tracker,
         );
-        let (health_reporter, health_service) = pplx_space_common_svc::grpc_health_service();
+        let (health_reporter, health_service) = pplx_space_grpc_server::grpc_health_service();
         health_reporter
             .set_service_status(
                 RUNTIME_SUPERVISOR_CONNECT_RETRY_HEALTH_SERVICE,
@@ -897,10 +897,10 @@ pub async fn run(
             async move { token.cancelled().await }
         };
         let server_handle = tokio::spawn(
-            pplx_space_common_svc::grpc_server_builder()
+            pplx_space_grpc_server::grpc_server_builder()
                 .http2_max_pending_accept_reset_streams(Some(MAX_PENDING_ACCEPT_RESET_STREAMS))
-                .layer(pplx_space_common_svc::conservative_uds_grpc_rate_limiter_layer(SERVICE_NAME))
-                .layer(pplx_space_common_svc::grpc_trace_layer())
+                .layer(pplx_space_grpc_rate_limiter::conservative_uds_grpc_rate_limiter_layer(SERVICE_NAME))
+                .layer(pplx_space_grpc_server::grpc_trace_layer())
                 .add_service(health_service)
                 .add_service(NodeManagerServer::new(service.clone()))
                 .serve_with_incoming_shutdown(UnixListenerStream::new(listener), production_shutdown),

@@ -13,9 +13,9 @@ use crate::clients::{BackendClientError, BackendClients};
 use crate::drain::NodeApiDrainLayer;
 use crate::node_info::NodeInfoService;
 use crate::worker::WorkerApiService;
+use pplx_space_bearer_token::SPACE_INTERNAL_TOKEN_ENV;
 use pplx_space_common_core::types::{K8sNodeNameParseError, NodeId, NodeRole as SpaceNodeRole};
-use pplx_space_common_svc::bearer_token::SPACE_INTERNAL_TOKEN_ENV;
-use pplx_space_common_svc::types::k8s::space_node_id;
+use pplx_space_k8s_node_id::space_node_id;
 use pplx_space_node_api_client::proto::NodeRole;
 use pplx_space_node_api_client::proto::node_info_server::NodeInfoServer;
 use pplx_space_node_api_client::proto::worker_api_internal_server::WorkerApiInternalServer;
@@ -102,7 +102,7 @@ pub enum RunNodeApiError {
     #[error(transparent)]
     BindListener(#[from] BindListenerError),
     #[error("failed to bind the node-api health socket: {0}")]
-    HealthSocket(#[source] pplx_space_common_svc::bootstrap::BindUnixSocketError),
+    HealthSocket(#[source] pplx_space_unix_socket_bind::BindUnixSocketError),
     #[error("failed to connect node-api backends for {role} role: {source}")]
     BackendClients {
         role: String,
@@ -290,27 +290,25 @@ async fn sandbox_manager_capability_serving(
         )
         .await
         .map_err(|source| CapabilityProbeError::Connect { capability, source })?;
-        HealthClient::new(pplx_space_common_svc::bootstrap::wrap_grpc_client_channel(
-            channel,
-        ))
-        .check(HealthCheckRequest {
-            service: capability.to_string(),
-        })
-        .await
-        .map(|response| response.into_inner().status == HealthStatus::Serving as i32)
-        .or_else(|status| {
-            if matches!(
-                status.code(),
-                tonic::Code::NotFound | tonic::Code::Unimplemented
-            ) {
-                Ok(false)
-            } else {
-                Err(CapabilityProbeError::Check {
-                    capability,
-                    source: status,
-                })
-            }
-        })
+        HealthClient::new(pplx_space_common_grpc::trace_grpc_client_transport(channel))
+            .check(HealthCheckRequest {
+                service: capability.to_string(),
+            })
+            .await
+            .map(|response| response.into_inner().status == HealthStatus::Serving as i32)
+            .or_else(|status| {
+                if matches!(
+                    status.code(),
+                    tonic::Code::NotFound | tonic::Code::Unimplemented
+                ) {
+                    Ok(false)
+                } else {
+                    Err(CapabilityProbeError::Check {
+                        capability,
+                        source: status,
+                    })
+                }
+            })
     })
     .await
     .map_err(|_| CapabilityProbeError::Timeout { capability })?
@@ -583,12 +581,12 @@ async fn spawn_local_health(
         return Ok(None);
     };
 
-    let listener = pplx_space_common_svc::bind_unix_socket(
+    let listener = pplx_space_unix_socket_bind::bind_unix_socket(
         health_socket,
-        pplx_space_common_svc::UnixSocketOptions::new(0o660),
+        pplx_space_unix_socket_bind::UnixSocketOptions::new(0o660),
     )
     .map_err(RunNodeApiError::HealthSocket)?;
-    let (health_reporter, health_service) = pplx_space_common_svc::grpc_health_service();
+    let (health_reporter, health_service) = pplx_space_grpc_server::grpc_health_service();
     health_reporter
         .set_service_status("", ReporterServingStatus::NotServing)
         .await;
@@ -599,8 +597,8 @@ async fn spawn_local_health(
         .set_service_status(LIVENESS_SERVICE, ReporterServingStatus::Serving)
         .await;
     let handle = tokio::spawn(async move {
-        let result = pplx_space_common_svc::grpc_server_builder()
-            .layer(pplx_space_common_svc::grpc_trace_layer())
+        let result = pplx_space_grpc_server::grpc_server_builder()
+            .layer(pplx_space_grpc_server::grpc_trace_layer())
             .add_service(health_service)
             .serve_with_incoming_shutdown(UnixListenerStream::new(listener), async move {
                 shutdown_token.cancelled().await
@@ -693,7 +691,7 @@ async fn start_local_health_and_await_capabilities(
 /// token only says that shutdown started. The task also exits when the service
 /// token is cancelled directly, which is how [`run`] stops it on the way out.
 fn drain_before_shutdown(
-    drain_signal: pplx_space_common_svc::DrainSignal,
+    drain_signal: pplx_space_service_lifecycle::DrainSignal,
     shutdown_token: CancellationToken,
 ) -> CancellationToken {
     let service_token = CancellationToken::new();
@@ -746,7 +744,7 @@ pub async fn run(
         NodeApiRole::Builder => None,
     };
 
-    let drain_signal = pplx_space_common_svc::DrainSignal::new();
+    let drain_signal = pplx_space_service_lifecycle::DrainSignal::new();
     let shutdown_token = drain_before_shutdown(drain_signal.clone(), shutdown_token);
     let drain_timeout = config.shutdown_grace;
     let health_server = match start_local_health_and_await_capabilities(
@@ -782,7 +780,7 @@ pub async fn run(
             // service. The drain gate runs after auth and before WorkerApi /
             // BuilderApi dispatch, so rejected drain-time requests never reach
             // node-local backends.
-            .layer(pplx_space_common_svc::grpc_trace_layer())
+            .layer(pplx_space_grpc_server::grpc_trace_layer())
             .layer(auth_layer)
             .layer(NodeApiDrainLayer::new(drain_signal.clone()));
 
@@ -795,7 +793,7 @@ pub async fn run(
                     )
                     .build_v1()?;
                 let (health_reporter, health_service) =
-                    pplx_space_common_svc::grpc_health_service();
+                    pplx_space_grpc_server::grpc_health_service();
                 health_reporter
                     .set_service_status(
                         pplx_space_sbx_mgr_client::OPERATION_ACTIVATION_RECEIPT_HEALTH_SERVICE,
@@ -845,7 +843,7 @@ pub async fn run(
                     ),
                     std::future::pending(),
                 );
-                let serve_result = pplx_space_common_svc::drain_server(
+                let serve_result = pplx_space_service_lifecycle::drain_server(
                     SERVICE_NAME,
                     &shutdown_token,
                     drain_timeout,
@@ -871,7 +869,7 @@ pub async fn run(
                         pplx_space_node_api_client::proto::BUILDER_FILE_DESCRIPTOR_SET,
                     )
                     .build_v1()?;
-                let (_, health_service) = pplx_space_common_svc::grpc_health_service();
+                let (_, health_service) = pplx_space_grpc_server::grpc_health_service();
                 // One budget is shared by all clones of the routed service.
                 // Additional builder listeners must reuse this same pool.
                 let upload_slots = std::sync::Arc::new(tokio::sync::Semaphore::new(32));
@@ -898,7 +896,7 @@ pub async fn run(
                     ),
                     std::future::pending(),
                 );
-                let serve_result = pplx_space_common_svc::drain_server(
+                let serve_result = pplx_space_service_lifecycle::drain_server(
                     SERVICE_NAME,
                     &shutdown_token,
                     drain_timeout,

@@ -2,11 +2,11 @@ use crate::db::db_private_outside_tests;
 use std::str::FromStr;
 
 use crate::db::{Connection, Error, OptionalExtension};
+use pplx_space_auto_lifecycle_receipt::AutoLifecyclePolicyFingerprint;
 use pplx_space_common_core::types::{
     AutoLifecycleDeleteReceiptId, ExecutionGeneration, NodeManagedBy, NodeRole, PolicyAuthority,
     SandboxActivationAttemptId, SandboxId,
 };
-use pplx_space_common_svc::types::AutoLifecyclePolicyFingerprint;
 use pplx_space_sqlite::SqliteU64;
 use rusqlite::{params, types::Type};
 
@@ -56,7 +56,7 @@ impl RouteIdentityAdoptionMetadata {
 }
 
 const RECEIPT_BATCH_SIZE: usize =
-    pplx_space_common_svc::types::AUTO_LIFECYCLE_DELETE_COMPLETION_BATCH_SIZE;
+    pplx_space_auto_lifecycle_receipt::AUTO_LIFECYCLE_DELETE_COMPLETION_BATCH_SIZE;
 const AUTO_LIFECYCLE_DELETE_RETRY_DELAY: std::time::Duration =
     std::time::Duration::from_secs(15 * 60);
 

@@ -135,13 +135,11 @@ impl std::fmt::Debug for ApiExtensions {
 #[derive(Debug, thiserror::Error)]
 pub enum RunApiError {
     #[error("invalid or missing SPACE API route signing configuration: {0}")]
-    RouteSigningConfiguration(
-        #[source] pplx_space_common_svc::space_api_route_ed25519::SpaceApiRouteEd25519Error,
-    ),
+    RouteSigningConfiguration(#[source] pplx_space_api_route::ed25519::SpaceApiRouteEd25519Error),
     #[error("{0}")]
     PublicCursorSecret(String),
     #[error("invalid or missing ECW credential signing configuration: {0}")]
-    EcwCredentialConfiguration(#[source] pplx_space_common_svc::ecw_credential::EcwCredentialError),
+    EcwCredentialConfiguration(#[source] pplx_space_ecw_credential::EcwCredentialError),
     #[error("invalid external console configuration: {0}")]
     ExternalConsoleConfiguration(#[source] crate::external_console::ExternalConsoleConfigError),
     #[error("failed to bind the API listener on {listen}: {source}")]
@@ -174,7 +172,7 @@ pub enum RunApiError {
 /// task also exits when the service token is cancelled directly, which is how
 /// [`run`] stops it on the way out.
 fn drain_before_shutdown(
-    drain_signal: pplx_space_common_svc::DrainSignal,
+    drain_signal: pplx_space_service_lifecycle::DrainSignal,
     shutdown: CancellationToken,
 ) -> CancellationToken {
     let service_token = CancellationToken::new();
@@ -219,7 +217,7 @@ pub async fn run_with(
     let route_ed25519_authority = match config.surface {
         ApiSurface::Admin => None,
         ApiSurface::Public | ApiSurface::Shared => Some(
-            pplx_space_common_svc::space_api_route_ed25519::SpaceApiRouteEd25519Authority::load_required_from_env()
+            pplx_space_api_route::ed25519::SpaceApiRouteEd25519Authority::load_required_from_env()
                 .map_err(RunApiError::RouteSigningConfiguration)?,
         ),
     };
@@ -228,7 +226,7 @@ pub async fn run_with(
         crate::routes::validate_public_cursor_secret().map_err(RunApiError::PublicCursorSecret)?;
     }
     if !matches!(config.surface, ApiSurface::Admin) {
-        pplx_space_common_svc::ecw_credential::EcwCredentialKeyring::load_required_from_env()
+        pplx_space_ecw_credential::EcwCredentialKeyring::load_required_from_env()
             .map_err(RunApiError::EcwCredentialConfiguration)?;
     }
 
@@ -243,7 +241,7 @@ pub async fn run_with(
     let credentials_pool = CredentialsPool::connect_lazy(&config.database_url, service_name)
         .map_err(RunApiError::CredentialsPool)?;
     tracing::info!("prepared lazy space_user and space_creds API database pools");
-    let drain_signal = pplx_space_common_svc::DrainSignal::new();
+    let drain_signal = pplx_space_service_lifecycle::DrainSignal::new();
     let shutdown_token = drain_before_shutdown(drain_signal.clone(), shutdown);
     let task_tracker = TaskTracker::new();
     let mut state = AppState::from_pools_with_lifecycle(
@@ -292,7 +290,7 @@ pub async fn run_with(
     // Connect info gives request handlers the TCP peer address — the
     // ECW request log falls back to it when `X-Forwarded-For` is absent.
     let server = axum::serve(
-        pplx_space_common_svc::http_listener::nodelay(listener),
+        pplx_space_http_server::http_listener::nodelay(listener),
         app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
     .with_graceful_shutdown(shutdown);
@@ -320,7 +318,7 @@ pub async fn run_with(
         }
     };
 
-    let drain_outcome = pplx_space_common_svc::drain_server(
+    let drain_outcome = pplx_space_service_lifecycle::drain_server(
         service_name,
         &shutdown_token,
         config.shutdown_grace,

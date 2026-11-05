@@ -342,15 +342,17 @@ async fn logging_child() {
         return;
     };
     let context = if mode == "context" {
-        pplx_space_common_svc::LogContext::default()
+        pplx_space_observability::LogContext::default()
             .with_sandbox_id("synthetic-sandbox")
             .with_boot_type("snapshot")
     } else {
-        pplx_space_common_svc::LogContext::default()
+        pplx_space_observability::LogContext::default()
     };
-    let _guard =
-        pplx_space_common_svc::init_service_subprocess_with_log_context("fixture-service", context)
-            .unwrap();
+    let _guard = pplx_space_service_host::init_service_subprocess_with_log_context(
+        "fixture-service",
+        context,
+    )
+    .unwrap();
     let span = tracing::info_span!(
         "fixture_span",
         operation.name = "http.server",
@@ -421,15 +423,15 @@ async fn logging_child() {
             .target("library::fixture")
             .build(),
     );
-    pplx_space_common_svc::log_failed_grpc_request_params(
+    pplx_space_grpc_server::log_failed_grpc_request_params(
         &tonic::Status::internal("synthetic failure"),
         "{\"safe\":true}",
     );
-    pplx_space_common_svc::log_failed_grpc_request_params(
+    pplx_space_grpc_server::log_failed_grpc_request_params(
         &tonic::Status::internal("empty parameters"),
         "",
     );
-    pplx_space_common_svc::log_failed_grpc_request_params(
+    pplx_space_grpc_server::log_failed_grpc_request_params(
         &tonic::Status::not_found("application status"),
         "{\"safe\":true}",
     );

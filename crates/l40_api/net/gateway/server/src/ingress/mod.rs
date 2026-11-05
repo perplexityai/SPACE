@@ -4,18 +4,19 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
-use pplx_space_common_svc::core::guest::linux::network::IPV4_ADDR as GUEST_IPV4_ADDR;
-use pplx_space_common_svc::core::types::{
-    ExecutionGeneration, GuestPort, NodeId, NodeManagedBy, PodUid, RouteGeneration,
-    SandboxActivationAttemptId, SandboxId, SpaceApiRouteIdentity,
-};
-use pplx_space_common_svc::space_api_route::{
+use pplx_space_api_route::{
     SpaceApiRouteIdentityDimension, SpaceApiRouteIdentityMatchError, SpaceApiRouteProtocol,
     SpaceApiRoutePurpose, match_present_route_identity_dimensions,
 };
-use pplx_space_common_svc::space_api_route_ed25519::{
-    SpaceApiRouteEd25519Claims, SpaceApiRouteEd25519Error,
-    space_api_route_ed25519_token_from_metadata,
+use pplx_space_api_route::{
+    ed25519::SpaceApiRouteEd25519Claims, ed25519::SpaceApiRouteEd25519Error,
+    ed25519::space_api_route_ed25519_token_from_metadata,
+};
+use pplx_space_common_core::guest::linux::network::IPV4_ADDR as GUEST_IPV4_ADDR;
+use pplx_space_common_core::{
+    types::ExecutionGeneration, types::GuestPort, types::NodeId, types::NodeManagedBy,
+    types::PodUid, types::RouteGeneration, types::SandboxActivationAttemptId, types::SandboxId,
+    types::SpaceApiRouteIdentity,
 };
 use pplx_space_metrics::gateway::{ServicePortIngressCloseReason, ServicePortIngressOpenResult};
 use pplx_space_net_gateway_client::SERVICE_PORT_INGRESS_START_TIMEOUT;

@@ -1362,13 +1362,15 @@ mod template_release_resolution_postgres_tests {
 mod response_tests {
 
     use super::*;
+    use pplx_space_api_route::{
+        ed25519::SPACE_API_ROUTE_ED25519_ISSUER_ENV,
+        ed25519::SPACE_API_ROUTE_ED25519_SIGNING_KEY_ID_ENV,
+        ed25519::SPACE_API_ROUTE_ED25519_SIGNING_KEY_PATH_ENV,
+        ed25519::SpaceApiRouteEd25519Authority,
+        ed25519::decode_unverified_space_api_route_ed25519_claims,
+    };
     use pplx_space_common_core::types::{NodeId, NodeManagedBy, SandboxId, SandboxOwnerSource};
     use pplx_space_common_core::types::{OrgId, UserId};
-    use pplx_space_common_svc::space_api_route_ed25519::{
-        SPACE_API_ROUTE_ED25519_ISSUER_ENV, SPACE_API_ROUTE_ED25519_SIGNING_KEY_ID_ENV,
-        SPACE_API_ROUTE_ED25519_SIGNING_KEY_PATH_ENV, SpaceApiRouteEd25519Authority,
-        decode_unverified_space_api_route_ed25519_claims,
-    };
 
     use sqlx::types::Json;
 
@@ -1584,7 +1586,7 @@ mod response_tests {
             env.set("SPACE_CLUSTER_ID", "unit-test");
             env.set(
                 SPACE_API_ROUTE_ED25519_SIGNING_KEY_PATH_ENV,
-                pplx_space_common_svc::space_api_route_ed25519::test_signing_key_path()
+                pplx_space_api_route::ed25519::test_signing_key_path()
                     .to_str()
                     .unwrap(),
             );

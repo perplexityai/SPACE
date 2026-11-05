@@ -4859,7 +4859,7 @@ fn benchmark_production_shaped_sparse_accounting_with_metrics() {
             }
         }
     });
-    let _telemetry = pplx_space_common_svc::init_service_subprocess(
+    let _telemetry = pplx_space_service_host::init_service_subprocess(
         "space-volume-manager-sparse-accounting-benchmark",
     )
     .expect("initialize benchmark telemetry");

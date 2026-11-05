@@ -4,10 +4,11 @@ use pplx_space_common_core::types::SnapshotId;
 
 use std::str::FromStr;
 
-use pplx_space_common_svc::core::types::{
-    ContentHash, K8sNodeName, K8sNodeUid, OrgId, SandboxId, StorageUri, TemplateName,
+use pplx_space_common_core::{
+    types::ContentHash, types::K8sNodeName, types::K8sNodeUid, types::OrgId, types::SandboxId,
+    types::StorageUri, types::TemplateName,
 };
-use pplx_space_common_svc::sql;
+use pplx_space_sql_locator::sql;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SandboxStorageContext {

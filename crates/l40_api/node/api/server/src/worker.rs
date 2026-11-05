@@ -11,12 +11,12 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use futures_util::{Stream, StreamExt};
-use pplx_space_common_core::types::SandboxId;
-use pplx_space_common_grpc::fwd_retry;
-use pplx_space_common_svc::space_api_route::{
+use pplx_space_api_route::{
     SpaceApiBridgeCallerPolicy, WaitReadyCallPurpose, set_space_api_bridge_caller_policy,
     space_api_route_capability_presence, take_wait_ready_call_purpose, wait_ready_call_purpose,
 };
+use pplx_space_common_core::types::SandboxId;
+use pplx_space_common_grpc::fwd_retry;
 use pplx_space_node_mgr_client::{CacheDiskSchedulingEffect, NodeResourceStatusReader};
 use pplx_space_rpc_auth::{
     NetworkPolicyMutationAuthority, NodeApiAuthenticatedCaller, WaitReadyLifecycleAuthority,
@@ -527,7 +527,7 @@ fn allow_port_request_params(req: &pplx_space_node_mgr_client::proto::AllowPortR
     let protocol = pplx_space_node_mgr_client::proto::NetworkProtocol::try_from(req.protocol)
         .map(|protocol| protocol.as_str_name().to_ascii_lowercase())
         .unwrap_or_else(|_| req.protocol.to_string());
-    pplx_space_common_svc::format_grpc_request_params([
+    pplx_space_grpc_server::format_grpc_request_params([
         ("sandbox_id", req.sandbox_id.clone()),
         ("port", req.port.to_string()),
         ("protocol", protocol),
@@ -830,8 +830,7 @@ impl WorkerApi for WorkerApiService {
         &self,
         r: Request<tonic::Streaming<pplx_space_sbx_mgr_client::proto::SpacedWriteRequest>>,
     ) -> Result<Response<pplx_space_sbx_mgr_client::proto::SpacedWriteResponse>, Status> {
-        let metadata =
-            pplx_space_common_svc::space_api_route::space_api_route_token_metadata(r.metadata());
+        let metadata = pplx_space_api_route::space_api_route_token_metadata(r.metadata());
         let node_permit = self
             .uds_per_sandbox_limiter
             .acquire_node("SpacedWrite")
@@ -1062,8 +1061,7 @@ impl WorkerApi for WorkerApiService {
         &self,
         r: Request<tonic::Streaming<ServicePortIngressFrame>>,
     ) -> Result<Response<Self::ServicePortIngressStream>, Status> {
-        let mut metadata =
-            pplx_space_common_svc::space_api_route::space_api_route_token_metadata(r.metadata());
+        let mut metadata = pplx_space_api_route::space_api_route_token_metadata(r.metadata());
         // Temporary rollout opt-in; remove after completion framing is universal.
         if let Some(value) = r
             .metadata()
@@ -1175,10 +1173,10 @@ impl WorkerApi for WorkerApiService {
         r: Request<pplx_space_node_mgr_client::proto::AllowPortRequest>,
     ) -> Result<Response<pplx_space_node_mgr_client::proto::AllowPortResponse>, Status> {
         let request_params = allow_port_request_params(r.get_ref());
-        pplx_space_common_svc::record_safe_grpc_request_params(&request_params);
+        pplx_space_grpc_server::record_safe_grpc_request_params(&request_params);
         let result = self.clients.node().allow_port(r).await;
         if let Err(status) = &result {
-            pplx_space_common_svc::log_failed_grpc_request_params(status, &request_params);
+            pplx_space_grpc_server::log_failed_grpc_request_params(status, &request_params);
         }
         result
     }

@@ -8,8 +8,8 @@ use std::borrow::Cow;
 use std::num::NonZeroU32;
 use std::time::{Duration, Instant};
 
-use pplx_space_common_svc::sql;
 use pplx_space_db_test_fixtures::try_raw_pg_test_db_with_max_connections;
+use pplx_space_sql_locator::sql;
 use sqlx::migrate::{Migration, MigrationType};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgConnection, PgPool, Postgres, SqlSafeStr as _, Transaction};

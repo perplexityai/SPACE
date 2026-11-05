@@ -2,7 +2,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use pplx_space_common_svc::space_api_route::{
+use pplx_space_api_route::{
     RouteIdentityRemediation, SpaceApiRouteIdentityDimension, route_identity_dimension_from_status,
     route_identity_remediation_from_status, set_route_identity_rejection_metadata,
 };

@@ -3,8 +3,7 @@
 //!
 //! The type needs only the standard library and `thiserror`, so it lives in
 //! its own crate: clients that pass a socket path to a node-local service can
-//! name it without depending on `pplx-space-common-svc` and the service host
-//! behind it.
+//! name it without depending on a service host.
 
 use std::path::{Path, PathBuf};
 

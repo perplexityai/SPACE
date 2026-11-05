@@ -195,9 +195,8 @@ async fn orphan_authority_reaches_cleanup_and_is_never_refreshed_on_rejection() 
     let channel = pplx_space_common_grpc::connect_uds_channel("orphan-authority", &socket)
         .await
         .unwrap();
-    let mut client = NodeManagerGrpcClient::new(
-        pplx_space_common_svc::bootstrap::wrap_grpc_client_channel(channel),
-    );
+    let mut client =
+        NodeManagerGrpcClient::new(pplx_space_common_grpc::trace_grpc_client_transport(channel));
     let reconcile = || {
         let (db, client, cache, run) = (db.clone(), client.clone(), cache.clone(), run.clone());
         tokio::task::spawn_blocking(move || {

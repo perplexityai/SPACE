@@ -13,14 +13,16 @@ workspace = true
 [features]
 default = []
 test-support = []
-# Telemetry pipelines forward to `common-svc`, which is where this
-# crate's service telemetry is initialized.
-otel = ["pplx-space-common-svc/otel"]
-datadog = ["otel", "pplx-space-common-svc/datadog"]
+# Telemetry pipelines forward to `pplx-space-observability`; `service-host`
+# initializes this crate's service telemetry.
+otel = ["pplx-space-observability/otel"]
+datadog = ["otel", "pplx-space-observability/datadog"]
 # Deprecated for one release; use otel and datadog.
 datadog-otel = ["otel", "datadog"]
 
 [dependencies]
+pplx-space-grpc-rate-limiter = { workspace = true }
+pplx-space-grpc-server = { workspace = true }
 pplx-space-guest-process = { workspace = true }
 tower = { workspace = true }
 http-body = { workspace = true }
@@ -36,9 +38,10 @@ tracing = { workspace = true }
 pplx-space-common-connection-admission = { workspace = true }
 pplx-space-common-core = { workspace = true }
 pplx-space-common-grpc = { workspace = true }
-pplx-space-common-svc = { workspace = true }
 pplx-space-metrics = { workspace = true }
+pplx-space-observability = { workspace = true }
 pplx-space-spaced-common = { workspace = true }
+pplx-space-uds-peer-auth = { workspace = true }
 prost-types = { workspace = true }
 
 [dev-dependencies]

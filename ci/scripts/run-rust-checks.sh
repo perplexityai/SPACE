@@ -368,16 +368,6 @@ run_clippy_checks() {
         return 1
     fi
 
-    # Preserve the feature-isolation check without a redundant cargo check;
-    # clippy compiles this same graph before running its lint passes.
-    echo "--- :rust: Running common-svc no-default-features clippy"
-    CARGO_TARGET_DIR="${target_dir}" cargo clippy \
-        --locked \
-        -p pplx-space-common-svc \
-        --no-default-features \
-        -- \
-        -D warnings
-
     # Pull CI and the merge queue run these only when the change can affect
     # the crates they lint (lint_affects_any in lib/rust-isolated-crates.sh).
     if lint_affects_any "${target_dir}" "${SBXMGR_PRODUCTION_CRATES[@]}"; then

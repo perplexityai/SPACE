@@ -4,10 +4,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
-use pplx_space_common_svc::page_cache;
 use pplx_space_object_store::{
     ObjectCredentials, ObjectStore, ObjectStoreError, ObjectTarget, S3ObjectStore,
 };
+use pplx_space_page_cache as page_cache;
 use sha2::{Digest, Sha256};
 
 use crate::blob_storage::{BlobStorageAdmission, BlobStorageReservation};

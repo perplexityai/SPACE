@@ -10,10 +10,12 @@
 //! inventory, including the broker-wrapped blob when applicable, race-safe via
 //! the partial unique active-KEK index.
 
-use pplx_space_common_svc::sql;
+use pplx_space_sql_locator::sql;
 use std::sync::Arc;
 
-use pplx_space_common_svc::core::types::{KekProvider, MasterKeyIdentifier, OrgId, SandboxId};
+use pplx_space_common_core::{
+    types::KekProvider, types::MasterKeyIdentifier, types::OrgId, types::SandboxId,
+};
 use uuid::Uuid;
 
 use crate::intermediate_key_broker::{IntermediateKeyBrokerApi, ProviderError};

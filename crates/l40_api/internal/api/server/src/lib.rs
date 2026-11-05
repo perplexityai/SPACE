@@ -55,14 +55,14 @@ use pplx_space_common_core::types::{
     SandboxId, SnapshotArtifact as SnapshotArtifactFile, SnapshotContentHash, SnapshotId,
     SnapshotKind, SnapshotName, SnapshotState, SubstrateKind, TemplateName,
 };
-use pplx_space_common_svc::types::{
+use pplx_space_events::{
+    SandboxEvent, SandboxEventDetails, SandboxEventSource, SandboxEventTrigger, SandboxEventType,
+};
+use pplx_space_state_reconciliation::{
     FACET_NETWORK_POLICY, FACET_NODE_STATUS, FACET_RUNTIME_PROVISIONING,
     FACET_SANDBOX_DESIRED_STATE, FACET_SANDBOX_INVENTORY, FACET_TEMPLATE_BASE_SNAPSHOT_POLICY,
     FACET_TEMPLATE_DESIRED_STATE, FACET_TEMPLATE_INVENTORY, NODE_RECONCILE_CLAIM_STALE_SECS,
     NetworkPolicyTarget, ReconcileFacet,
-};
-use pplx_space_events::{
-    SandboxEvent, SandboxEventDetails, SandboxEventSource, SandboxEventTrigger, SandboxEventType,
 };
 use uuid::Uuid;
 
@@ -328,13 +328,9 @@ pub struct ClusterApiService {
     runtime_catalog_pool: sqlx::PgPool,
     visibility_observations: std::sync::Arc<visibility_observations::Observations>,
     template_releases_store: template_releases_store::TemplateReleasesStore,
-    route_ed25519_authority: Option<
-        std::sync::Arc<
-            pplx_space_common_svc::space_api_route_ed25519::SpaceApiRouteEd25519Authority,
-        >,
-    >,
-    ecw_credential_keyring:
-        std::sync::Arc<pplx_space_common_svc::ecw_credential::EcwCredentialKeyring>,
+    route_ed25519_authority:
+        Option<std::sync::Arc<pplx_space_api_route::ed25519::SpaceApiRouteEd25519Authority>>,
+    ecw_credential_keyring: std::sync::Arc<pplx_space_ecw_credential::EcwCredentialKeyring>,
     /// Last-known `templates.visibility` per template, so one database problem
     /// cannot suppress visibility-gated prefetch warming fleet-wide. Sits in
     /// front of `visibility_pool`, which is the complementary half: the pool
@@ -575,12 +571,12 @@ fn storage_uri_names_backup_attempt(
 impl ClusterApiService {
     pub fn new(pool: sqlx::PgPool) -> Self {
         let route_ed25519_authority =
-            pplx_space_common_svc::space_api_route_ed25519::SpaceApiRouteEd25519Authority::load_from_env()
+            pplx_space_api_route::ed25519::SpaceApiRouteEd25519Authority::load_from_env()
                 .ok()
                 .flatten()
                 .map(std::sync::Arc::new);
         let ecw_credential_keyring = std::sync::Arc::new(
-            pplx_space_common_svc::ecw_credential::EcwCredentialKeyring::load_from_env()
+            pplx_space_ecw_credential::EcwCredentialKeyring::load_from_env()
                 .expect("ClusterApiService ECW credential configuration must be valid"),
         );
         let trusted_template_storage = trusted_storage::TrustedTemplateStorageBuckets::from_env()
@@ -594,13 +590,9 @@ impl ClusterApiService {
     fn with_security_state(
         pool: sqlx::PgPool,
         route_ed25519_authority: Option<
-            std::sync::Arc<
-                pplx_space_common_svc::space_api_route_ed25519::SpaceApiRouteEd25519Authority,
-            >,
+            std::sync::Arc<pplx_space_api_route::ed25519::SpaceApiRouteEd25519Authority>,
         >,
-        ecw_credential_keyring: std::sync::Arc<
-            pplx_space_common_svc::ecw_credential::EcwCredentialKeyring,
-        >,
+        ecw_credential_keyring: std::sync::Arc<pplx_space_ecw_credential::EcwCredentialKeyring>,
     ) -> Self {
         let template_releases_store =
             template_releases_store::TemplateReleasesStore::new(pool.clone());
@@ -679,13 +671,9 @@ impl ClusterApiService {
     pub async fn from_env_with_security_state(
         pool: sqlx::PgPool,
         route_ed25519_authority: Option<
-            std::sync::Arc<
-                pplx_space_common_svc::space_api_route_ed25519::SpaceApiRouteEd25519Authority,
-            >,
+            std::sync::Arc<pplx_space_api_route::ed25519::SpaceApiRouteEd25519Authority>,
         >,
-        ecw_credential_keyring: std::sync::Arc<
-            pplx_space_common_svc::ecw_credential::EcwCredentialKeyring,
-        >,
+        ecw_credential_keyring: std::sync::Arc<pplx_space_ecw_credential::EcwCredentialKeyring>,
     ) -> Result<Self, Status> {
         let mut service =
             Self::with_security_state(pool, route_ed25519_authority, ecw_credential_keyring);

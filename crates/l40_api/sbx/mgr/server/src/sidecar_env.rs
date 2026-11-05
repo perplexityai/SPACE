@@ -1,10 +1,10 @@
 use std::collections::HashMap;
 
-use pplx_space_common_core::types::CLUSTER_ID_ENV;
-use pplx_space_common_svc::space_api_route_ed25519::{
-    SPACE_API_ROUTE_ED25519_VERIFICATION_BUNDLE_ENV,
-    SPACE_API_ROUTE_ED25519_VERIFICATION_BUNDLE_PATH_ENV,
+use pplx_space_api_route::{
+    ed25519::SPACE_API_ROUTE_ED25519_VERIFICATION_BUNDLE_ENV,
+    ed25519::SPACE_API_ROUTE_ED25519_VERIFICATION_BUNDLE_PATH_ENV,
 };
+use pplx_space_common_core::types::CLUSTER_ID_ENV;
 use pplx_space_observability::{identity, logging};
 
 /// Telemetry env forwarded from sandbox-manager to the sidecars it launches

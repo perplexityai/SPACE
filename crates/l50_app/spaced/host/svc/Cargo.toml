@@ -17,12 +17,12 @@ path = "src/main.rs"
 [features]
 default = []
 otel = [
-    "pplx-space-common-svc/otel",
+    "pplx-space-service-host/otel",
     "pplx-space-spaced-host-server/otel",
 ]
 datadog = [
     "otel",
-    "pplx-space-common-svc/datadog",
+    "pplx-space-service-host/datadog",
     "pplx-space-spaced-host-server/datadog",
 ]
 # Deprecated for one release; use otel and datadog.
@@ -34,5 +34,6 @@ anyhow = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal"] }
 
 # internal
-pplx-space-common-svc = { workspace = true }
+pplx-space-service-host = { workspace = true }
+pplx-space-service-lifecycle = { workspace = true }
 pplx-space-spaced-host-server = { workspace = true }

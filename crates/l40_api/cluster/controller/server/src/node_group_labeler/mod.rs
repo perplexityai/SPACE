@@ -178,7 +178,7 @@ pub(crate) fn clamp_write_concurrency(value: usize) -> usize {
 ///
 /// Without a bound there is no ceiling: `kube_client::Config` leaves
 /// `read_timeout` unset in every constructor, including the `Config::infer`
-/// that `common-svc`'s `traced_kube_client_from_env` builds this process's
+/// that `pplx-space-kube-client`'s `traced_kube_client_from_env` builds this process's
 /// client from, and nothing in SPACE sets one, so one wedged patch would stall
 /// the rollout indefinitely.
 ///

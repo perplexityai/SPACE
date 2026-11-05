@@ -248,7 +248,7 @@ async fn native_build_fixture() -> TestResult<NativeBuildFixture> {
     let mut state = AppState::from_pools_with_lifecycle(
         db.pool.clone(),
         pplx_space_postgres_pool::CredentialsPool::shared(db.pool.clone()),
-        pplx_space_common_svc::DrainSignal::new(),
+        pplx_space_service_lifecycle::DrainSignal::new(),
         shutdown.clone(),
         tasks.clone(),
         None,
@@ -861,10 +861,8 @@ async fn a_failed_system_build_frees_its_key_only_if_the_builder_did_not_take_it
             // The builder's bearer token cannot be read, so the call is not made:
             // the key is freed, and once the token is back the same key builds.
             let token_path = std::path::PathBuf::from(
-                std::env::var_os(
-                    pplx_space_common_svc::bearer_token::SpaceBearerToken::NodeApi.path_env(),
-                )
-                .expect("the test owns the node-api token file"),
+                std::env::var_os(pplx_space_bearer_token::SpaceBearerToken::NodeApi.path_env())
+                    .expect("the test owns the node-api token file"),
             );
             let moved = token_path.with_extension("moved");
             std::fs::rename(&token_path, &moved)?;

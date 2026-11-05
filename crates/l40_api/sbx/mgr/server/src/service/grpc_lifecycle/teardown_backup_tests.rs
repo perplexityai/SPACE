@@ -80,7 +80,7 @@ async fn teardown_reuses_ready_backup_but_waits_for_active_local_upload() {
             Some(OsStr::new(&endpoint)),
         ),
         (
-            pplx_space_common_svc::bearer_token::SPACE_CLUSTER_API_TOKEN_PATH_ENV,
+            pplx_space_bearer_token::SPACE_CLUSTER_API_TOKEN_PATH_ENV,
             Some(token.path().as_os_str()),
         ),
     ]);
@@ -246,7 +246,7 @@ async fn teardown_retry_seals_publishes_backs_up_and_completes_the_same_capture(
             Some(OsStr::new(&endpoint)),
         ),
         (
-            pplx_space_common_svc::bearer_token::SPACE_CLUSTER_API_TOKEN_PATH_ENV,
+            pplx_space_bearer_token::SPACE_CLUSTER_API_TOKEN_PATH_ENV,
             Some(token.path().as_os_str()),
         ),
     ]);

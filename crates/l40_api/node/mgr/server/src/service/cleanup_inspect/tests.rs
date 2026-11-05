@@ -89,7 +89,7 @@ async fn every_failed_stop_preserves_the_active_lease_and_reservation() {
         });
         release
             .extensions_mut()
-            .insert(pplx_space_common_svc::PeerIdentity::new(0, 0, None));
+            .insert(pplx_space_uds_peer_auth::PeerIdentity::new(0, 0, None));
         assert_eq!(service.release(release).await.unwrap_err().code(), code);
         let after = service.pool.all_records().unwrap();
         assert_eq!(after[0].state, before[0].state);
@@ -798,7 +798,7 @@ async fn artifact_deletion_ahead_of_a_claimed_cleanup_refuses_and_lets_it_procee
         let mut request = tonic::Request::new(message);
         request
             .extensions_mut()
-            .insert(pplx_space_common_svc::PeerIdentity::new(0, 0, None));
+            .insert(pplx_space_uds_peer_auth::PeerIdentity::new(0, 0, None));
         request
     }
     type Deletion = fn(

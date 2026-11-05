@@ -2,7 +2,7 @@ use pplx_space_common_core::types::LocalArtifactId;
 
 use super::*;
 use crate::snapshot_upload::build_storage_uri_for_tests;
-use pplx_space_common_svc::bearer_token::BearerTokenError;
+use pplx_space_bearer_token::BearerTokenError;
 use pplx_space_node_api_client::cluster::ConnectClusterApiError;
 
 #[test]

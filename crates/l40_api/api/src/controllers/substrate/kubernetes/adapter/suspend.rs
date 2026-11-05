@@ -165,7 +165,7 @@ where
                     // SuspendFailed events. A reasonless tail describes the latest
                     // observation without erasing earlier reasoned Pending history.
                     last_pending_reason = response.reason.map(|reason| {
-                        pplx_space_common_svc::bootstrap::truncate_utf8_for_log(
+                        pplx_space_grpc_server::truncate_utf8_for_log(
                             &reason,
                             MAX_LOGGED_SUSPEND_PENDING_REASON_BYTES,
                         ).value

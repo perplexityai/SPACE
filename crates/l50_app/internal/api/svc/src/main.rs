@@ -34,15 +34,15 @@ impl From<Cli> for InternalApiRunConfig {
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    pplx_space_common_svc::tokio_runtime::build_multi_thread_runtime()
+    pplx_space_tokio_runtime::build_multi_thread_runtime()
         .context("failed to configure cluster-api Tokio runtime")?
         .block_on(async {
             // `init_service` installs the process-global aws-lc-rs rustls crypto
             // provider used by the kube TokenReview client; no separate install here.
-            let telemetry = pplx_space_common_svc::init_service(SERVICE_NAME)?;
-            let shutdown_token = pplx_space_common_svc::shutdown_token();
+            let telemetry = pplx_space_service_host::init_service(SERVICE_NAME)?;
+            let shutdown_token = pplx_space_service_lifecycle::shutdown::shutdown_token();
             let result = pplx_space_internal_api_server::run(cli.into(), shutdown_token).await;
-            pplx_space_common_svc::shutdown_telemetry(telemetry).await;
+            pplx_space_service_host::shutdown_telemetry(telemetry).await;
             Ok(result?)
         })
 }

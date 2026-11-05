@@ -345,12 +345,11 @@ pub(super) async fn native_service_io(
         ServiceRouteTransport::ServicePortIngress,
     );
     let session_id = attached.session_id;
-    let _waiter = pplx_space_common_svc::ingress_admission::IngressPreparationPermit::acquire(
-        Some(attached.sandbox_id),
-    )
-    .map_err(StreamBridgeError::ClusterStatus)?;
-    let deadline = tokio::time::Instant::now()
-        + pplx_space_common_svc::ingress_admission::preparation_timeout();
+    let _waiter =
+        pplx_space_ingress_admission::IngressPreparationPermit::acquire(Some(attached.sandbox_id))
+            .map_err(StreamBridgeError::ClusterStatus)?;
+    let deadline =
+        tokio::time::Instant::now() + pplx_space_ingress_admission::preparation_timeout();
     let io = tokio::time::timeout_at(deadline, async {
         for attempt in 0..2 {
             match native_service_port_ingress_io(state, attached).await {

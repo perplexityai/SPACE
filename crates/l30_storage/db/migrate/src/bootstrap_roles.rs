@@ -50,7 +50,7 @@
 //! until the next `bootstrap-roles` run — which is why provisioning must
 //! re-run this command after migrations.
 
-use pplx_space_common_svc::sql;
+use pplx_space_sql_locator::sql;
 use std::collections::BTreeSet;
 
 use clap::Parser;

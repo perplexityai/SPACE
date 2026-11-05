@@ -14,11 +14,11 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use futures_util::future::join_all;
-use pplx_space_common_svc::core::host::linux::identities::{group_names, user_names, users};
-use pplx_space_common_svc::{
-    AcquireOutcome, DEFAULT_DRAIN_TIMEOUT, LocalHealthServer, LocalRole, ServiceMutex,
-    UdsPeerAccount, UdsPeerAuthorizer, UdsPeerPrincipal,
+use pplx_space_common_core::{
+    host::linux::identities::group_names, host::linux::identities::user_names,
+    host::linux::identities::users,
 };
+use pplx_space_local_health::LocalHealthServer;
 use pplx_space_node_api_client::node_status_freshness::{
     DEFAULT_NODE_CTL_POLL_INTERVAL, MAX_NODE_CTL_POLL_INTERVAL, NODE_STATUS_OUTBOUND_RECONCILER,
 };
@@ -38,6 +38,9 @@ use pplx_space_node_mgr_client::{
     CacheDiskSchedulingEffect, NetworkPoolStatusReader, NodeManagerGrpcClient,
     NodeResourceStatusReader,
 };
+use pplx_space_service_lifecycle::DEFAULT_DRAIN_TIMEOUT;
+use pplx_space_service_mutex::{AcquireOutcome, ServiceMutex};
+use pplx_space_uds_peer_auth::{LocalRole, UdsPeerAccount, UdsPeerAuthorizer, UdsPeerPrincipal};
 use rusqlite::{Connection, params};
 use serde::Deserialize;
 use tokio::sync::mpsc;
@@ -246,9 +249,9 @@ pub enum RunNodeCtlError {
     #[error("unsupported node role {role:?}; expected cluster, worker, or builder")]
     UnsupportedNodeRole { role: String },
     #[error("failed to bind the node-ctl health socket: {0}")]
-    HealthSocket(#[source] pplx_space_common_svc::bootstrap::BindUnixSocketError),
+    HealthSocket(#[source] pplx_space_unix_socket_bind::BindUnixSocketError),
     #[error("failed to acquire the node-ctl service mutex: {0}")]
-    ServiceMutex(#[source] pplx_space_common_svc::service_mutex::AcquireError),
+    ServiceMutex(#[source] pplx_space_service_mutex::AcquireError),
     #[error("failed to migrate node-ctl's SQLite database: {0}")]
     Migrate(#[source] pplx_space_sqlite::SqliteError),
     #[error("failed to open node-ctl's SQLite database: {0}")]
@@ -256,7 +259,7 @@ pub enum RunNodeCtlError {
     #[error("failed to seed reconciliation status rows: {0}")]
     InitReconciliationStatus(#[source] rusqlite::Error),
     #[error("failed to bind the node-ctl socket: {0}")]
-    BindSocket(#[source] pplx_space_common_svc::bootstrap::BindUnixSocketError),
+    BindSocket(#[source] pplx_space_unix_socket_bind::BindUnixSocketError),
     /// The worker returned before shutdown was requested: a dead per-node loop.
     #[error("node-ctl worker exited unexpectedly")]
     WorkerExited,
@@ -554,7 +557,7 @@ pub async fn run(
 
     let health_server = LocalHealthServer::spawn_optional(
         cli.health_socket_path.as_deref(),
-        pplx_space_common_svc::UnixSocketOptions::new(0o660),
+        pplx_space_unix_socket_bind::UnixSocketOptions::new(0o660),
         SERVICE_NAME,
         shutdown_token.clone(),
     )
@@ -647,10 +650,10 @@ pub async fn run(
 
     spawn_poll_loop(tx.clone(), poll_interval_secs, shutdown_token.child_token());
 
-    let listener = pplx_space_common_svc::bind_unix_socket(
+    let listener = pplx_space_unix_socket_bind::bind_unix_socket(
         &cli.socket_path,
-        pplx_space_common_svc::UnixSocketOptions::new(0o660).with_group(
-            pplx_space_common_svc::SocketGroup::Required(cli.socket_group),
+        pplx_space_unix_socket_bind::UnixSocketOptions::new(0o660).with_group(
+            pplx_space_unix_socket_bind::SocketGroup::Required(cli.socket_group),
         ),
     )
     .map_err(RunNodeCtlError::BindSocket)?;
@@ -671,10 +674,10 @@ pub async fn run(
         server_shutdown_token.cancelled().await;
     };
 
-    let (_, health_service) = pplx_space_common_svc::grpc_health_service();
-    let server = pplx_space_common_svc::grpc_server_builder()
-        .layer(pplx_space_common_svc::conservative_uds_grpc_rate_limiter_layer(SERVICE_NAME))
-        .layer(pplx_space_common_svc::grpc_trace_layer())
+    let (_, health_service) = pplx_space_grpc_server::grpc_health_service();
+    let server = pplx_space_grpc_server::grpc_server_builder()
+        .layer(pplx_space_grpc_rate_limiter::conservative_uds_grpc_rate_limiter_layer(SERVICE_NAME))
+        .layer(pplx_space_grpc_server::grpc_trace_layer())
         .add_service(health_service)
         .add_service(NodeCtlServer::new(NodeCtlService {
             tx,
@@ -2008,7 +2011,7 @@ impl NodeCtlWorker {
         let origins = std::mem::take(&mut claim.origins);
         let span = (!origins.is_empty()).then(|| {
             let span = ClusterPass::span(&self.node_id, cause, refs, &sandbox_ids);
-            pplx_space_common_svc::observability::trace_propagation::link_root_to_origins(
+            pplx_space_observability::trace_propagation::link_root_to_origins(
                 &span,
                 origins.iter().map(String::as_str),
             );
@@ -2365,7 +2368,7 @@ fn i64_to_u64(value: i64) -> u64 {
 }
 
 type TracedClusterApiClient = ClusterApiClient<
-    pplx_space_common_svc::bootstrap::GrpcClientTrace<
+    pplx_space_common_grpc::GrpcClientTrace<
         tonic::service::interceptor::InterceptedService<
             tonic::transport::Channel,
             pplx_space_bearer_token::SpaceBearerInterceptor,
@@ -2504,12 +2507,10 @@ async fn build_cluster_api_client(
         let channel = tonic::service::interceptor::InterceptedService::new(
             channel,
             pplx_space_bearer_token::SpaceBearerInterceptor::new(
-                pplx_space_common_svc::bearer_token::SpaceBearerToken::ClusterApi,
+                pplx_space_bearer_token::SpaceBearerToken::ClusterApi,
             ),
         );
-        ClusterApiClient::new(pplx_space_common_svc::bootstrap::wrap_grpc_client_channel(
-            channel,
-        ))
+        ClusterApiClient::new(pplx_space_common_grpc::trace_grpc_client_transport(channel))
     };
     Ok(client)
 }

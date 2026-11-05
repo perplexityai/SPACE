@@ -40,10 +40,10 @@ impl From<Cli> for ClusterControllerConfig {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    let telemetry = pplx_space_common_svc::init_service(SERVICE_NAME)?;
-    let shutdown_token = pplx_space_common_svc::shutdown_token();
+    let telemetry = pplx_space_service_host::init_service(SERVICE_NAME)?;
+    let shutdown_token = pplx_space_service_lifecycle::shutdown::shutdown_token();
 
     let result = pplx_space_cluster_controller_server::run(cli.into(), shutdown_token).await;
-    pplx_space_common_svc::shutdown_telemetry(telemetry).await;
+    pplx_space_service_host::shutdown_telemetry(telemetry).await;
     Ok(result?)
 }

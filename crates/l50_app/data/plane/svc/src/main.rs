@@ -144,11 +144,11 @@ impl From<Cli> for DataPlaneConfig {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    let telemetry = pplx_space_common_svc::init_service(SERVICE_NAME)?;
-    let stop = pplx_space_common_svc::stop_tokens();
+    let telemetry = pplx_space_service_host::init_service(SERVICE_NAME)?;
+    let stop = pplx_space_service_lifecycle::shutdown::stop_tokens();
 
     let result = pplx_space_data_plane_server::run(cli.into(), stop).await;
-    pplx_space_common_svc::shutdown_telemetry(telemetry).await;
+    pplx_space_service_host::shutdown_telemetry(telemetry).await;
     Ok(result?)
 }
 

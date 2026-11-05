@@ -7,8 +7,7 @@
 //! writers of those tables still write their SQL inline. [`active_quarantine`]
 //! and [`quarantine_history`] are the read verbs. sbx-mgr's SQLite tables of
 //! the same names belong to `pplx-space-sbx-mgr-store`, not here. The fragments
-//! sit in their own crate, outside `pplx-space-common-svc`, until store
-//! functions for these tables replace them.
+//! stay here until store functions for these tables replace them.
 
 use pplx_space_common_core::sql;
 use pplx_space_common_core::types::{NodeId, SandboxId};

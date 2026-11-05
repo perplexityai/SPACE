@@ -12,11 +12,11 @@ type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
 #[derive(Clone)]
 pub struct NodeApiDrainLayer {
-    drain_signal: pplx_space_common_svc::DrainSignal,
+    drain_signal: pplx_space_service_lifecycle::DrainSignal,
 }
 
 impl NodeApiDrainLayer {
-    pub fn new(drain_signal: pplx_space_common_svc::DrainSignal) -> Self {
+    pub fn new(drain_signal: pplx_space_service_lifecycle::DrainSignal) -> Self {
         Self { drain_signal }
     }
 }
@@ -35,7 +35,7 @@ impl<S> Layer<S> for NodeApiDrainLayer {
 #[derive(Clone)]
 pub struct NodeApiDrainService<S> {
     inner: S,
-    drain_signal: pplx_space_common_svc::DrainSignal,
+    drain_signal: pplx_space_service_lifecycle::DrainSignal,
 }
 
 impl<S, ReqBody, ResBody> Service<Request<ReqBody>> for NodeApiDrainService<S>

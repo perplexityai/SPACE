@@ -137,7 +137,7 @@ async fn restart_drain_allows_authorized_read_only_rpcs() {
 #[tokio::test]
 async fn artifact_transfer_handlers_admit_only_local_operators() {
     use pplx_space_common_core::host::linux::identities::users;
-    use pplx_space_common_svc::peer_auth::UdsPeerAccount;
+    use pplx_space_uds_peer_auth::UdsPeerAccount;
     use std::{
         marker::PhantomData,
         sync::atomic::{AtomicBool, Ordering},

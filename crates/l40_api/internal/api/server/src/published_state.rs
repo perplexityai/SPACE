@@ -20,13 +20,6 @@ use pplx_space_common_core::types::{
     SandboxTransitionReceipt, SandboxTransitionReceiptInvariantError, SandboxTransitionReceiptKind,
     SandboxTransitionTargetState, SemVer,
 };
-use pplx_space_common_svc::types::{
-    FACET_NETWORK_POLICY, FACET_SANDBOX_DESIRED_STATE, FACET_TEMPLATE_BASE_SNAPSHOT_POLICY,
-    FACET_TEMPLATE_DESIRED_STATE, NetworkPolicyTarget, ReconcileReason,
-    SANDBOX_FAILURE_ACTIVATION_ATTEMPT_ID_KEY, SANDBOX_FAILURE_EPISODE_KEY,
-    SANDBOX_FAILURE_EXECUTION_GENERATION_KEY, SANDBOX_FAILURE_POD_UID_KEY,
-    SANDBOX_LOCAL_SUSPEND_KEY,
-};
 use pplx_space_events::{
     SandboxEvent, SandboxEventDetails, SandboxEventSource, SandboxEventTrigger, SandboxEventType,
 };
@@ -40,6 +33,13 @@ use pplx_space_sandbox_quarantine_store::{
 };
 use pplx_space_sbx_mgr_client::proto::{
     QuarantineRecoveryObservedOwner, SnapshotDetail, SnapshotType,
+};
+use pplx_space_state_reconciliation::{
+    FACET_NETWORK_POLICY, FACET_SANDBOX_DESIRED_STATE, FACET_TEMPLATE_BASE_SNAPSHOT_POLICY,
+    FACET_TEMPLATE_DESIRED_STATE, NetworkPolicyTarget, ReconcileReason,
+    SANDBOX_FAILURE_ACTIVATION_ATTEMPT_ID_KEY, SANDBOX_FAILURE_EPISODE_KEY,
+    SANDBOX_FAILURE_EXECUTION_GENERATION_KEY, SANDBOX_FAILURE_POD_UID_KEY,
+    SANDBOX_LOCAL_SUSPEND_KEY,
 };
 use pplx_space_template_mgr_client::proto::SnapshotInfo;
 
@@ -513,7 +513,7 @@ pub(crate) fn capture_host_cpu(
     }
     pplx_space_common_core::types::HostCpu::parse(raw)
         .inspect_err(|error| {
-            let logged = pplx_space_common_svc::truncate_utf8_for_log(
+            let logged = pplx_space_grpc_server::truncate_utf8_for_log(
                 raw,
                 MAX_LOGGED_CAPTURE_HOST_CPU_BYTES,
             );

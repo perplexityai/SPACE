@@ -44,11 +44,11 @@ type InsertedFederatedPooledSandboxRow = (
 );
 use crate::models::{SandboxMetadata, SandboxMetadataValue};
 use pplx_space_common_core::types::{UpstreamIssuer, UpstreamOrgId, UpstreamSubjectId};
-use pplx_space_common_svc::types::ReconcileFacet;
 use pplx_space_db_test_fixtures::{
     SEED_ORG_ID, SEED_USER_ID, insert_ready_worker_node, pg_test_db,
 };
 use pplx_space_placement::test_support::stored_lifecycle_matrix;
+use pplx_space_state_reconciliation::ReconcileFacet;
 use sqlx::{PgPool, Postgres, Transaction};
 use std::{
     collections::VecDeque,

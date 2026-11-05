@@ -33,8 +33,8 @@ const MAX_HOST_SERVER_CONNECTIONS: usize = 512;
 const MAX_BRIDGE_HOST_CONNECTIONS: usize = 64;
 const MIN_NON_GRPC_DESCRIPTOR_RESERVE: usize = 2048;
 
-fn host_request_limiter() -> pplx_space_common_svc::GrpcRateLimiterLayer {
-    use pplx_space_common_svc::{
+fn host_request_limiter() -> pplx_space_grpc_rate_limiter::GrpcRateLimiterLayer {
+    use pplx_space_grpc_rate_limiter::{
         GrpcRateLimitBucket, GrpcRateLimiterConfig, GrpcRateLimiterLimits,
     };
     let mut config = GrpcRateLimiterConfig::enforce("space-spaced-host")
@@ -81,7 +81,7 @@ fn host_request_limiter() -> pplx_space_common_svc::GrpcRateLimiterLayer {
             );
         }
     }
-    pplx_space_common_svc::grpc_rate_limiter_layer(config)
+    pplx_space_grpc_rate_limiter::grpc_rate_limiter_layer(config)
 }
 const _: () = assert!(
     MAX_HOST_SERVER_CONNECTIONS + MAX_BRIDGE_HOST_CONNECTIONS + MIN_NON_GRPC_DESCRIPTOR_RESERVE
@@ -864,7 +864,7 @@ impl SpacedHostService {
                     .http2_keepalive_timeout(Some(Duration::from_secs(5)))
                     .layer(crate::authorization::HostAuthorizationLayer(self.clone()))
                     .layer(host_request_limiter())
-                    .layer(pplx_space_common_svc::grpc_trace_layer())
+                    .layer(pplx_space_grpc_server::grpc_trace_layer())
                     .add_service(MetaServer::new(self.clone()))
                     .add_service(self.filesystem_grpc_service())
                     .add_service(self.process_grpc_service())
@@ -897,11 +897,11 @@ impl SpacedHostService {
                     .http2_keepalive_interval(Some(Duration::from_secs(10)))
                     .http2_keepalive_timeout(Some(Duration::from_secs(5)))
                     .layer(
-                        pplx_space_common_svc::conservative_uds_grpc_rate_limiter_layer(
+                        pplx_space_grpc_rate_limiter::conservative_uds_grpc_rate_limiter_layer(
                             "space-spaced-host-bridge",
                         ),
                     )
-                    .layer(pplx_space_common_svc::grpc_trace_layer())
+                    .layer(pplx_space_grpc_server::grpc_trace_layer())
                     .add_service(
                         BridgeHostMetaServer::new(self.clone())
                             .max_decoding_message_size(GUEST_BRIDGE_MAX_MESSAGE_SIZE)

@@ -1,7 +1,4 @@
 //! Deployment policy shared by federated grant writers and consumers.
-//!
-//! It is its own crate so that code can read the policy without depending on
-//! `pplx-space-common-svc`, which re-exports it as `federated_identity`.
 use std::collections::BTreeSet;
 
 use pplx_space_common_core::types::{FederatedGrantAudience, UpstreamIssuer, UpstreamSubjectId};

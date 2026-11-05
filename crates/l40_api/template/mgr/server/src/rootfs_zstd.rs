@@ -11,7 +11,7 @@ use pplx_space_common_core::types::{
     TEMPLATE_ROOTFS_ZSTD_LEVEL,
 };
 use pplx_space_common_io::sparse::SparseFileWriter;
-use pplx_space_common_svc::page_cache;
+use pplx_space_page_cache as page_cache;
 use sha2::{Digest as _, Sha256};
 
 use crate::content_hash::ContentHasher;

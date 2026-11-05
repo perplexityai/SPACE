@@ -1,8 +1,8 @@
 use pplx_space_common_core::sql;
 use std::time::Duration;
 
-use pplx_space_common_svc::types::{NODE_RECONCILE_CLAIM_STALE_SECS, RECONCILE_FACETS};
 use pplx_space_metrics::reconcile::QueueLagStage;
+use pplx_space_state_reconciliation::{NODE_RECONCILE_CLAIM_STALE_SECS, RECONCILE_FACETS};
 use sqlx::PgPool;
 use tokio_util::sync::CancellationToken;
 

@@ -115,7 +115,7 @@ async fn stalled_transfer_probe_is_bounded_without_cancelling_remote_work() {
     .unwrap()
     .connect_lazy();
     let client = pplx_space_volmgr_client::VolumeManagerClient::new(
-        pplx_space_common_svc::bootstrap::wrap_grpc_client_channel(channel),
+        pplx_space_common_grpc::trace_grpc_client_transport(channel),
     );
     let cancellation = tokio_util::sync::CancellationToken::new();
     let probe = tokio::spawn(poll_artifact_job(

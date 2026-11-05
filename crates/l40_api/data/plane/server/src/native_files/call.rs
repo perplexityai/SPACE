@@ -7,10 +7,12 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use axum::http::StatusCode;
+use pplx_space_api_route::{
+    ed25519::SpaceApiRouteEd25519Token, ed25519::insert_space_api_route_ed25519_token,
+};
 use pplx_space_common_core::types::SandboxId;
-use pplx_space_common_svc::bootstrap::{GrpcClientTrace, wrap_grpc_client_channel};
-use pplx_space_common_svc::space_api_route_ed25519::{
-    SpaceApiRouteEd25519Token, insert_space_api_route_ed25519_token,
+use pplx_space_common_grpc::{
+    GrpcClientTrace, trace_grpc_client_transport as wrap_grpc_client_channel,
 };
 use pplx_space_guest_process::IdempotencyKey;
 use pplx_space_native_files::{

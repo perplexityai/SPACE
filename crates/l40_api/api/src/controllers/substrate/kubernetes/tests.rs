@@ -57,6 +57,12 @@ mod kubernetes_tests {
     use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
     use kube::client::{Body, ClientBuilder};
     use kube::runtime::{reflector, watcher::Event};
+    use pplx_space_api_route::{
+        ed25519::SPACE_API_ROUTE_ED25519_ISSUER_ENV,
+        ed25519::SPACE_API_ROUTE_ED25519_SIGNING_KEY_ID_ENV,
+        ed25519::SPACE_API_ROUTE_ED25519_SIGNING_KEY_PATH_ENV,
+        ed25519::SpaceApiRouteEd25519Authority,
+    };
     use pplx_space_common_core::kubernetes::{
         NodeGroupPlacement, SANDBOX_CHECKPOINT_ANNOTATION, SANDBOX_EXECUTION_GENERATION_ANNOTATION,
         SANDBOX_NETWORK_SLOTS_RESOURCE, SANDBOX_NODE_GROUP_LABEL,
@@ -70,10 +76,6 @@ mod kubernetes_tests {
         OrgId, PodName, PodResourceVersion, PodUid, SandboxActivationAttemptId, SandboxLifecycle,
         SandboxOwner, SandboxOwnerSource, SandboxTransitionTargetState, TemplateCompatSpec,
         TemplateName, TemplateVisibility,
-    };
-    use pplx_space_common_svc::space_api_route_ed25519::{
-        SPACE_API_ROUTE_ED25519_ISSUER_ENV, SPACE_API_ROUTE_ED25519_SIGNING_KEY_ID_ENV,
-        SPACE_API_ROUTE_ED25519_SIGNING_KEY_PATH_ENV, SpaceApiRouteEd25519Authority,
     };
     use pplx_space_internal_api_server::publish_sandbox_states;
     use pplx_space_metrics::sandbox::api::SandboxApiMetricIdentity;
@@ -1952,7 +1954,7 @@ mod kubernetes_tests {
     }
 
     fn test_worker_node_id() -> NodeId {
-        pplx_space_common_svc::types::k8s::space_k8s_node_id("node-a", "worker")
+        pplx_space_k8s_node_id::space_k8s_node_id("node-a", "worker")
     }
 
     async fn start_sim_worker() -> Result<SimWorkerHarness, BoxError> {
@@ -2090,7 +2092,7 @@ mod kubernetes_tests {
             echo_route_identity,
             received: Arc::clone(&received),
         };
-        let (health_reporter, health_service) = pplx_space_common_svc::grpc_health_service();
+        let (health_reporter, health_service) = pplx_space_grpc_server::grpc_health_service();
         health_reporter
             .set_service_status(
                 pplx_space_sbx_mgr_client::ACTIVATION_POLICY_HEALTH_SERVICE,
@@ -3183,7 +3185,7 @@ mod kubernetes_tests {
             env.set("SPACE_CLUSTER_ID", "testing");
             env.set(
                 SPACE_API_ROUTE_ED25519_SIGNING_KEY_PATH_ENV,
-                pplx_space_common_svc::space_api_route_ed25519::test_signing_key_path()
+                pplx_space_api_route::ed25519::test_signing_key_path()
                     .to_str()
                     .unwrap(),
             );
@@ -13121,7 +13123,7 @@ mod kubernetes_tests {
              VALUES ($1, $2, $3, '{\"preserve\":true}'::JSONB, NOW())"
         ))
         .bind(node_id)
-        .bind(pplx_space_common_svc::types::FACET_SANDBOX_DESIRED_STATE)
+        .bind(pplx_space_state_reconciliation::FACET_SANDBOX_DESIRED_STATE)
         .bind(sandbox_id.to_string())
         .execute(&db.pool)
         .await?;
@@ -13248,7 +13250,7 @@ mod kubernetes_tests {
         let payload: serde_json::Value = sqlx::query_scalar(sql!(
             "SELECT observed_payload FROM node_facet_observed_status WHERE node_id = $1 AND facet = $2 AND element = $3"
         ))
-        .bind(node_id).bind(pplx_space_common_svc::types::FACET_SANDBOX_DESIRED_STATE)
+        .bind(node_id).bind(pplx_space_state_reconciliation::FACET_SANDBOX_DESIRED_STATE)
         .bind(sandbox_id.to_string()).fetch_one(&db.pool).await?;
         assert_eq!(
             payload.get("preserve"),

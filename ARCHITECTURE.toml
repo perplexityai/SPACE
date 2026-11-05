@@ -360,7 +360,6 @@ mode = "advisory"
 # (Layers).
 [rules.layers.unmoved]
 l10_foundation = [
-  "pplx-space-common-svc",
   "pplx-space-metrics",
 ]
 l20_domain = [
@@ -492,7 +491,7 @@ helpers = [
 # The crates being dissolved: they predate the layers and mix SPACE-specific
 # code in until they are split up. Every check covers them, with today's edges
 # baselined.
-legacy = ["pplx-space-common-core", "pplx-space-common-svc", "pplx-space-metrics"]
+legacy = ["pplx-space-common-core", "pplx-space-metrics"]
 
 # An l20_domain crate is a protocol (wire schemas and the conversions between
 # them and the models) if its name ends in -protocol or -proto, or `protocols`
@@ -517,10 +516,9 @@ protocols = [
 # aws-lc-rs and aws-lc-sys are cryptography, not cloud SDKs. The workspace's
 # own I/O crates need no entry: an l10_foundation crate, legacy or not, with
 # a required dependency on a fenced package is fenced under that package's
-# family, such as common-grpc (hyper-util), tokio-runtime (tokio) or
-# common-svc (axum). Only declared dependencies are
-# seen: tonic's transport brings tokio and hyper into every tonic user's
-# build regardless. Features are not followed, so observability, which brings
+# family, such as common-grpc (hyper-util) or tokio-runtime (tokio). Only
+# declared dependencies are seen: tonic's transport brings tokio and hyper
+# into every tonic user's build regardless. Features are not followed, so observability, which brings
 # tokio in only behind its otel feature, is listed; feature-flags, whose
 # openfeature feature does too, is fenced already by its required dependency
 # on metrics.
@@ -595,8 +593,8 @@ mode = "required"
 mode = "required"
 
 # Normal and build edges follow the dependency matrix; today's exceptions are
-# baselined in [layers.direction], most of them from common-svc and other
-# Foundation crates that still name SPACE types.
+# baselined in [layers.direction], most of them from Foundation crates that
+# still name SPACE types.
 [rules.layers.direction.no_crossing]
 mode = "required"
 

@@ -18,12 +18,12 @@ path = "src/main.rs"
 default = []
 federated-identity = ["pplx-space-api/federated-identity"]
 otel = [
-    "pplx-space-common-svc/otel",
+    "pplx-space-service-host/otel",
     "pplx-space-api/otel",
 ]
 datadog = [
     "otel",
-    "pplx-space-common-svc/datadog",
+    "pplx-space-service-host/datadog",
     "pplx-space-api/datadog",
 ]
 # Deprecated for one release; use otel and datadog.
@@ -37,7 +37,8 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
 # internal
 pplx-space-api = { workspace = true }
-pplx-space-common-svc = { workspace = true }
+pplx-space-service-host = { workspace = true }
+pplx-space-service-lifecycle = { workspace = true }
 
 # jemalloc on glibc Linux targets — better fragmentation behavior for the
 # long-running HTTP service than the system glibc allocator.

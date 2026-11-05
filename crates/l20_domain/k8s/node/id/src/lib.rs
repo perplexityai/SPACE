@@ -3,9 +3,7 @@
 //! `(k8s node name, SPACE node role)`, and the parser that accepts either a
 //! direct node UUID or a Kubernetes node name.
 //!
-//! It is its own crate so that code can derive a node id without depending on
-//! `pplx-space-common-svc`, which re-exports both functions from
-//! `types::k8s`. It cannot live in `pplx-space-k8s-ids`, which holds only
+//! It cannot live in `pplx-space-k8s-ids`, which holds only
 //! Kubernetes' own identifiers: it returns `NodeId` and reads `NodeRole`,
 //! which belong to `pplx-space-common-core`.
 

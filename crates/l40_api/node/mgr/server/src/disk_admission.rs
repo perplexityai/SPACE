@@ -1,16 +1,18 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::disk_admission::cache_handle::CacheDiskAdmissionHandle;
 use pplx_space_common_core::host::disk_admission::{
     CacheDiskAdmissionConfig, CacheDiskAdmissionDecision, CacheDiskAdmissionReason,
     CacheDiskAdmissionState as CoreCacheDiskAdmissionState, CacheDiskRefreshKind,
 };
-use pplx_space_common_svc::disk_admission::CacheDiskAdmissionHandle;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use tonic::Status;
 
 use crate::proto::{CacheDiskAdmissionState as ProtoCacheDiskAdmissionState, CacheDiskStatus};
+
+pub mod cache_handle;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DiskAllocationOperation {
@@ -98,11 +100,11 @@ impl DiskAdmission {
 
     fn emit_metrics(&self) {
         let decision = self.decision();
-        pplx_space_common_svc::disk_admission::emit_cache_disk_admission_metrics(&decision);
+        crate::disk_admission::cache_handle::emit_cache_disk_admission_metrics(&decision);
     }
 
     async fn refresh_once_result(&self) -> Result<(), String> {
-        let result = pplx_space_common_svc::disk_admission::refresh_cache_disk_admission_once(
+        let result = crate::disk_admission::cache_handle::refresh_cache_disk_admission_once(
             &self.handle,
             CacheDiskRefreshKind::AfterAllocation,
         )
@@ -139,7 +141,7 @@ impl DiskAdmission {
             .fetch_add(reservation_bytes, Ordering::AcqRel)
             .saturating_add(reservation_bytes);
         let decision = self.decision();
-        pplx_space_common_svc::disk_admission::emit_cache_disk_admission_metrics(&decision);
+        crate::disk_admission::cache_handle::emit_cache_disk_admission_metrics(&decision);
 
         if decision.allows_new_allocation() {
             tracing::debug!(

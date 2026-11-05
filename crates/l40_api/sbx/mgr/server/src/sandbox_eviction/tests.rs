@@ -1479,11 +1479,11 @@ fn cluster_api_env<'a>(
             None,
         ),
         (
-            pplx_space_common_svc::bearer_token::SPACE_INTERNAL_TOKEN_ENV,
+            pplx_space_bearer_token::SPACE_INTERNAL_TOKEN_ENV,
             Some(std::ffi::OsStr::new(token)),
         ),
         (
-            pplx_space_common_svc::bearer_token::SPACE_CLUSTER_API_TOKEN_PATH_ENV,
+            pplx_space_bearer_token::SPACE_CLUSTER_API_TOKEN_PATH_ENV,
             Some(token_path.as_os_str()),
         ),
     ]

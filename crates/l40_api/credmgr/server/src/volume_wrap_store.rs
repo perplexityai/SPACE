@@ -11,7 +11,7 @@
 
 use pplx_space_common_core::types::{OrgId, SandboxId};
 
-use pplx_space_common_svc::sql;
+use pplx_space_sql_locator::sql;
 use uuid::Uuid;
 
 /// A resolved `sandbox_volume_encryption` row, narrowed to what the unwrap

@@ -153,7 +153,7 @@ async fn private_republication() -> TestResult {
     let deny_exchange = Arc::clone(&deny);
     let authority = CredentialManagerService::new(
         Arc::new(InMemoryKeyWrapper::new()),
-        pplx_space_common_svc::PeerProcessCheckMode::Off,
+        pplx_space_uds_peer_auth::PeerProcessCheckMode::Off,
     )
     .with_storage_vend_store(Arc::new(PgStorageVendStore::new(db.pool.clone())));
     let credential_service =

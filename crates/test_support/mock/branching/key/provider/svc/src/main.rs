@@ -130,7 +130,7 @@ impl IntermediateKeyBroker for MockBroker {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let _telemetry = pplx_space_common_svc::init_service("space-mock-branching-key-provider")?;
+    let _telemetry = pplx_space_service_host::init_service("space-mock-branching-key-provider")?;
     let cli = Cli::parse();
     let broker = MockBroker {
         authorization: format!("Bearer {}", cli.bearer_token),

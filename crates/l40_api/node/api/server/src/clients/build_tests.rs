@@ -3,7 +3,7 @@ use crate::{builder::BuilderApiService, proto::builder_api_server::BuilderApi};
 use axum::{Router, body::Body, routing::post};
 use pplx_space_build_mgr_client::proto::{GetBuildStatusRequest, StartBuildRequest};
 use pplx_space_common_core::types::{NodeId, OrgId};
-use pplx_space_common_svc::bootstrap::wrap_grpc_client_channel;
+use pplx_space_common_grpc::trace_grpc_client_transport as wrap_grpc_client_channel;
 use pplx_space_rpc_auth::build::BuildAuthenticatedCaller;
 use std::sync::{
     Arc,

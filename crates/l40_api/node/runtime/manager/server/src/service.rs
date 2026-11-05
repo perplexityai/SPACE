@@ -12,13 +12,13 @@ use pplx_space_common_core::host::linux::identities::{user_names, users};
 use pplx_space_common_core::types::{
     ComponentIdentity, Digest, JobId, RuntimeIdentity, RuntimeKind, RuntimeVersion,
 };
-use pplx_space_common_svc::{LocalRole, UdsPeerAccount, UdsPeerAuthorizer, UdsPeerPrincipal};
 use pplx_space_execution_common::proto::{self as execution, ArtifactComponentKind};
 use pplx_space_node_runtime_core::runtime_inventory::diagnostic::{
     self, ArtifactKinds, ArtifactScan, DigestCache, ScanLimits, ScanRoots, SystemScanClock,
 };
 use pplx_space_node_runtime_manager_client::proto::runtime_manager_server::RuntimeManager;
 use pplx_space_node_runtime_manager_client::proto::{self, *};
+use pplx_space_uds_peer_auth::{LocalRole, UdsPeerAccount, UdsPeerAuthorizer, UdsPeerPrincipal};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tonic::{Request, Response, Status};
 

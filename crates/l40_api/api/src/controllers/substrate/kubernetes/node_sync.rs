@@ -18,7 +18,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::time::Duration;
 
 use pplx_space_common_core::types::NodeRole;
-use pplx_space_common_svc::types::k8s::space_k8s_node_id;
+use pplx_space_k8s_node_id::space_k8s_node_id;
 
 use super::{
     KubernetesSubstrate, NodeLifecycleState, NodeStateWrite, support::k8s_node_internal_ip,

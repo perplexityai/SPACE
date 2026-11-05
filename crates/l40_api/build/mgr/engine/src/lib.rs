@@ -31,13 +31,13 @@ use pplx_space_common_core::{
         PolicyAuthority, TemplateBuildId,
     },
 };
-use pplx_space_common_svc::page_cache;
 pub use pplx_space_metrics::template::TemplateBuildErrorKind;
 pub use pplx_space_net_common::NetworkPolicyV1;
 use pplx_space_net_common::proto::NetworkPolicyV1 as NetworkPolicyV1Proto;
 use pplx_space_node_mgr_client::proto::{
     CompletePreparedRootfsRequest, PreparedRootfsDisposition, ReservePreparedRootfsRequest,
 };
+use pplx_space_page_cache as page_cache;
 use pplx_space_sbx_mgr_client::SandboxManagerGrpcClient;
 use pplx_space_sbx_mgr_client::proto::{CreateRequest, DeleteRequest, StartRequest, StopRequest};
 use pplx_space_template_mgr_client::proto::{

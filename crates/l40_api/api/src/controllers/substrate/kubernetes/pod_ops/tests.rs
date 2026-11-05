@@ -1511,7 +1511,7 @@ async fn pod_worker_channel_verifies_tls_for_raw_pod_ips() {
     ]) {
         return;
     }
-    pplx_space_common_svc::install_default_rustls_crypto_provider();
+    pplx_space_rustls_provider::install_default_rustls_crypto_provider();
     let ca_path = std::path::PathBuf::from(std::env::var_os(CA_ENV).unwrap());
     // The certificate has no IP SAN: dialing a Pod IP must use the configured
     // NodeApi identity as well as the mounted CA.

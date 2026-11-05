@@ -11,16 +11,16 @@ use pplx_space_common_core::types::{
     MaterializationMode, SnapshotArtifact, StorageUri, SubjectId, TransferScopeId,
     parse_snapshot_object_key,
 };
+use pplx_space_common_core::{host::linux::identities::user_names, host::linux::identities::users};
+use pplx_space_common_core::{types::KekProvider, types::MasterKeyIdentifier, types::OrgId};
 use pplx_space_common_jobs::{
     BackgroundWorker, JobExecutor, JobFailure, JobFailureReason, JobPriority, PriorityBand,
     WorkerConfig,
 };
-use pplx_space_common_svc::core::host::linux::identities::{user_names, users};
-use pplx_space_common_svc::core::types::{KekProvider, MasterKeyIdentifier, OrgId};
-use pplx_space_common_svc::{
+use pplx_space_sandbox_grpc::record_sandbox_id;
+use pplx_space_uds_peer_auth::{
     AuthorizedUdsPeer, UdsPeerAccount, UdsPeerAuthorizer, UdsPeerPrincipal,
 };
-use pplx_space_sandbox_grpc::record_sandbox_id;
 use tonic::{Request, Response, Status};
 
 use crate::executor::{

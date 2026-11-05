@@ -7,7 +7,6 @@ use pplx_space_common_core::types::{
     PolicyAuthority, RuntimeKind, SandboxAutoLifecyclePatch, SandboxId, SandboxLifecycle, SemVer,
     TemplateDesiredState, TemplateName, TemplateReference, TemplateTag, TemplateVisibility,
 };
-use pplx_space_common_svc::types::{NetworkPolicyTarget, ReconcileFacet};
 use pplx_space_metrics::sandbox::api::{
     ReconnectAttempt, ReconnectEntrypoint, ReconnectOutcome, ReconnectReason,
     ReconnectTerminalPhase, SandboxApiMetricIdentity, SandboxApiSurface,
@@ -33,6 +32,7 @@ use pplx_space_sbx_mgr_client::proto::{
     SpacedWriteRequest, SpacedWriteResponse, StatsRequest, StopRequest, TouchAutoLifecycleRequest,
     TouchAutoLifecycleResponse, UpdateRequest, WakeRequest,
 };
+use pplx_space_state_reconciliation::{NetworkPolicyTarget, ReconcileFacet};
 use sqlx::{FromRow, PgPool, Postgres, Transaction};
 use std::time::Duration;
 use uuid::Uuid;
@@ -1070,11 +1070,8 @@ pub struct SandboxController {
     substrate: Substrate,
     feature_flags: pplx_space_feature_flags::FeatureFlagClient,
     cluster_admission: Option<std::sync::Arc<crate::cluster_admission::ClusterSandboxAdmission>>,
-    route_ed25519_authority: Option<
-        std::sync::Arc<
-            pplx_space_common_svc::space_api_route_ed25519::SpaceApiRouteEd25519Authority,
-        >,
-    >,
+    route_ed25519_authority:
+        Option<std::sync::Arc<pplx_space_api_route::ed25519::SpaceApiRouteEd25519Authority>>,
     /// Estimated bytes after which a sandbox list page stops:
     /// [`list_page::MAX_SANDBOX_LIST_PAGE_BYTES`]. Tests shrink it to page
     /// KiB rows, as the walk only compares running sizes against it.
@@ -1163,9 +1160,7 @@ impl SandboxController {
     pub fn with_route_ed25519_authority(
         mut self,
         authority: Option<
-            std::sync::Arc<
-                pplx_space_common_svc::space_api_route_ed25519::SpaceApiRouteEd25519Authority,
-            >,
+            std::sync::Arc<pplx_space_api_route::ed25519::SpaceApiRouteEd25519Authority>,
         >,
     ) -> Self {
         self.route_ed25519_authority = authority;

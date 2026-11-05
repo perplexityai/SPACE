@@ -8,8 +8,8 @@ use super::validation::*;
 use super::*;
 use crate::snapshot_request::SnapshotStorage;
 
+use pplx_space_common_core::host::linux::identities::gids;
 use pplx_space_common_core::types::SandboxId;
-use pplx_space_common_svc::core::host::linux::identities::gids;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;

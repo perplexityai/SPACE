@@ -10,10 +10,10 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use pplx_space_common_svc::core::host::linux::identities::group_names;
-use pplx_space_common_svc::{
-    AcquireOutcome, DEFAULT_DRAIN_TIMEOUT, LocalHealthServer, ServiceMutex,
-};
+use pplx_space_common_core::host::linux::identities::group_names;
+use pplx_space_local_health::LocalHealthServer;
+use pplx_space_service_lifecycle::DEFAULT_DRAIN_TIMEOUT;
+use pplx_space_service_mutex::{AcquireOutcome, ServiceMutex};
 use tokio_stream::wrappers::UnixListenerStream;
 use tokio_util::sync::CancellationToken;
 
@@ -62,9 +62,9 @@ pub enum RunTemplateMgrError {
     #[error("template cache cannot honor the rootfs backing policy: {0}")]
     RootfsBackingFilesystem(#[source] std::io::Error),
     #[error("failed to bind the template-manager health socket: {0}")]
-    HealthSocket(#[source] pplx_space_common_svc::bootstrap::BindUnixSocketError),
+    HealthSocket(#[source] pplx_space_unix_socket_bind::BindUnixSocketError),
     #[error("failed to acquire the template-manager service mutex: {0}")]
-    ServiceMutex(#[source] pplx_space_common_svc::service_mutex::AcquireError),
+    ServiceMutex(#[source] pplx_space_service_mutex::AcquireError),
     #[error("failed to migrate the template-manager SQLite database: {0}")]
     Migrate(#[source] pplx_space_sqlite::SqliteError),
     #[error("failed to open the template-manager SQLite database: {0}")]
@@ -72,7 +72,7 @@ pub enum RunTemplateMgrError {
     #[error("failed to initialize template-manager service state: {0}")]
     InitializeService(#[source] rusqlite::Error),
     #[error("failed to bind the template-manager socket: {0}")]
-    BindSocket(#[source] pplx_space_common_svc::bootstrap::BindUnixSocketError),
+    BindSocket(#[source] pplx_space_unix_socket_bind::BindUnixSocketError),
 }
 
 struct ServiceRuntime {
@@ -90,7 +90,7 @@ pub fn run(
     config: TemplateMgrRunConfig,
     shutdown_token: CancellationToken,
     runtime: tokio::runtime::Runtime,
-    telemetry: pplx_space_common_svc::TelemetryGuard,
+    telemetry: pplx_space_service_host::TelemetryGuard,
 ) -> Result<(), RunTemplateMgrError> {
     let mut service = ServiceRuntime {
         runtime,
@@ -98,7 +98,7 @@ pub fn run(
     };
     service.runtime.block_on(async {
         let result = run_service(config, shutdown_token, &mut service.service_mutex).await;
-        pplx_space_common_svc::shutdown_telemetry(telemetry).await;
+        pplx_space_service_host::shutdown_telemetry(telemetry).await;
         result
     })
 }
@@ -110,7 +110,7 @@ async fn run_service(
 ) -> Result<(), RunTemplateMgrError> {
     let health_server = LocalHealthServer::spawn_optional(
         config.health_socket_path.as_deref(),
-        pplx_space_common_svc::UnixSocketOptions::new(0o660),
+        pplx_space_unix_socket_bind::UnixSocketOptions::new(0o660),
         SERVICE_NAME,
         shutdown_token.clone(),
     )
@@ -207,10 +207,11 @@ async fn run_service(
     let background_worker = service.background_worker();
     background_worker.recover_and_log("template-mgr.background_worker");
 
-    let listener = pplx_space_common_svc::bind_unix_socket(
+    let listener = pplx_space_unix_socket_bind::bind_unix_socket(
         &config.socket_path,
-        pplx_space_common_svc::UnixSocketOptions::new(0o770)
-            .with_group(pplx_space_common_svc::SocketGroup::Required(SOCKET_GROUP)),
+        pplx_space_unix_socket_bind::UnixSocketOptions::new(0o770).with_group(
+            pplx_space_unix_socket_bind::SocketGroup::Required(SOCKET_GROUP),
+        ),
     )
     .map_err(RunTemplateMgrError::BindSocket)?;
 
@@ -232,16 +233,20 @@ async fn run_service(
     // traffic while the local health server drains on shutdown_token.
     let production_shutdown_token = CancellationToken::new();
 
-    let (_, health_service) = pplx_space_common_svc::grpc_health_service();
+    let (_, health_service) = pplx_space_grpc_server::grpc_health_service();
     let production_shutdown = {
         let token = production_shutdown_token.clone();
         async move { token.cancelled().await }
     };
     let server_handle = tokio::spawn(
-        pplx_space_common_svc::grpc_server_builder()
+        pplx_space_grpc_server::grpc_server_builder()
             .timeout(crate::GRPC_REQUEST_TIMEOUT)
-            .layer(pplx_space_common_svc::conservative_uds_grpc_rate_limiter_layer(SERVICE_NAME))
-            .layer(pplx_space_common_svc::grpc_trace_layer())
+            .layer(
+                pplx_space_grpc_rate_limiter::conservative_uds_grpc_rate_limiter_layer(
+                    SERVICE_NAME,
+                ),
+            )
+            .layer(pplx_space_grpc_server::grpc_trace_layer())
             .add_service(health_service)
             .add_service(TemplateManagerServer::new(service))
             .serve_with_incoming_shutdown(UnixListenerStream::new(listener), production_shutdown),

@@ -186,9 +186,8 @@
 "pplx-space-archcheck" = { to = "crates/tools/archcheck" }
 "pplx-space-netgtw-bench" = { to = "crates/tools/net/gateway/bench", rename = "pplx-space-net-gateway-bench" }  # renamed
 "pplx-space-spaced-loopback-test" = { to = "crates/tools/spaced/loopback/test" }
-# stay (3)
+# stay (2)
 "pplx-space-common-core" = "stay"
-"pplx-space-common-svc" = "stay"
 "pplx-space-metrics" = "stay"
 
 # Tracked files below crates/apps and crates/libs outside a crate, moving

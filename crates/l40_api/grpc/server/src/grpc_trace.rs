@@ -45,59 +45,6 @@ pub fn grpc_trace_layer() -> TraceLayer<
         .on_failure(GrpcOnFailure)
 }
 
-/// Records one sandbox's id on every request span of a server that serves only
-/// that sandbox, such as its net-gateway, so `{span.sandbox_id=...}` finds its
-/// RPCs. Add it after [`grpc_trace_layer`], which makes the request span
-/// current while it calls the services inside it.
-#[derive(Clone, Copy, Debug)]
-pub struct SandboxSpanLayer {
-    pub(super) sandbox_id: pplx_space_common_core::types::SandboxId,
-}
-
-impl SandboxSpanLayer {
-    pub fn new(sandbox_id: pplx_space_common_core::types::SandboxId) -> Self {
-        Self { sandbox_id }
-    }
-}
-
-impl<S> tower::Layer<S> for SandboxSpanLayer {
-    type Service = SandboxSpanService<S>;
-
-    fn layer(&self, inner: S) -> Self::Service {
-        SandboxSpanService {
-            inner,
-            sandbox_id: self.sandbox_id,
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct SandboxSpanService<S> {
-    pub(super) inner: S,
-    pub(super) sandbox_id: pplx_space_common_core::types::SandboxId,
-}
-
-impl<S, Request> tower::Service<Request> for SandboxSpanService<S>
-where
-    S: tower::Service<Request>,
-{
-    type Response = S::Response;
-    type Error = S::Error;
-    type Future = S::Future;
-
-    fn poll_ready(
-        &mut self,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Result<(), Self::Error>> {
-        self.inner.poll_ready(cx)
-    }
-
-    fn call(&mut self, request: Request) -> Self::Future {
-        tracing::Span::current().record("sandbox_id", tracing::field::display(self.sandbox_id));
-        self.inner.call(request)
-    }
-}
-
 pub(super) fn grpc_server_status_classifier() -> GrpcErrorsAsFailures {
     grpc_application_status_classifier()
 }
@@ -148,7 +95,7 @@ impl<B> MakeSpan<B> for GrpcMakeSpan {
         let server_service = current_service_name();
         let client_service =
             grpc_client_service_from_headers(request.headers()).unwrap_or(UNKNOWN_SERVICE);
-        let peer_identity = crate::peer_auth::peer_identity_from_http_request(request);
+        let peer_identity = pplx_space_uds_peer_auth::peer_identity_from_http_request(request);
         let request_id = request_id_from_headers(request.headers())
             .unwrap_or_else(|| Uuid::now_v7().to_string());
         let otel_name = format!("{rpc_service}/{rpc_method}");

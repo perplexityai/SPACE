@@ -12,9 +12,11 @@ workspace = true
 
 [features]
 default = []
-# Forwarded by the binary; the library owns the service body that is traced.
-otel = ["pplx-space-common-svc/otel"]
-datadog = ["otel", "pplx-space-common-svc/datadog"]
+# Turn on telemetry for this crate's own tests, such as the sparse-accounting
+# benchmark, through the service-host dev-dependency. `space-volmgr-svc`
+# enables service-host's features itself.
+otel = ["pplx-space-service-host/otel"]
+datadog = ["otel", "pplx-space-service-host/datadog"]
 # Deprecated for one release; use otel and datadog.
 datadog-otel = ["otel", "datadog"]
 
@@ -40,14 +42,21 @@ tracing = { workspace = true }
 
 # internal
 pplx-space-common-core = { workspace = true, features = ["serde", "rusqlite"] }
+pplx-space-common-grpc = { workspace = true }
 pplx-space-common-io = { workspace = true, features = ["reflink"] }
 pplx-space-common-jobs = { workspace = true }
-pplx-space-common-svc = { workspace = true }
+pplx-space-grpc-rate-limiter = { workspace = true }
+pplx-space-grpc-server = { workspace = true }
+pplx-space-local-health = { workspace = true }
+pplx-space-page-cache = { workspace = true }
+pplx-space-service-mutex = { workspace = true }
 pplx-space-sandbox-grpc = { workspace = true }
 pplx-space-sqlite = { workspace = true }
 pplx-space-credmgr-client = { workspace = true }
 pplx-space-metrics = { workspace = true }
 pplx-space-object-store = { workspace = true }
+pplx-space-uds-peer-auth = { workspace = true }
+pplx-space-unix-socket-bind = { workspace = true }
 pplx-space-volmgr-client = { workspace = true }
 pplx-space-node-mgr-client = { workspace = true }
 tempfile = { workspace = true }
@@ -57,6 +66,7 @@ insta = { workspace = true }
 axum = { workspace = true }
 bytes = { workspace = true }
 pplx-space-common-grpc = { workspace = true }
+pplx-space-service-host = { workspace = true }
 pplx-space-test-env = { workspace = true }
 rstest = { workspace = true }
 tonic-health = { workspace = true }

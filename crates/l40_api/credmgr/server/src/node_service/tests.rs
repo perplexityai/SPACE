@@ -4,10 +4,10 @@ use std::future::ready;
 use std::sync::Mutex;
 use std::time::Duration;
 
-use pplx_space_common_svc::PeerIdentity;
-use pplx_space_common_svc::bootstrap::wrap_grpc_client_channel;
+use pplx_space_common_grpc::trace_grpc_client_transport as wrap_grpc_client_channel;
 use pplx_space_credmgr_client::TlsFiles;
 use pplx_space_credmgr_client::{CredentialManagerClient, CredmgrBearerInterceptor};
+use pplx_space_uds_peer_auth::PeerIdentity;
 use std::path::PathBuf;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::service::interceptor::InterceptedService;

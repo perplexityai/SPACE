@@ -35,12 +35,9 @@ slow-timeout = { period = "30s", terminate-after = 4 }
 # only cost them their own container and their own copy of the template. Its
 # postgres_baseline_tests take the raw fixture too, and without the shared
 # server they would need a Docker socket the default CI job does not have.
-# Spaced host tests use only local sockets; common-svc's dev dependency
-# otherwise pulls them into this transitive fixture selection.
 filter = '''
 (rdeps(pplx-space-db-test-fixtures)
- and not package(pplx-space-db-migrate)
- and not package(pplx-space-spaced-host-server))
+ and not package(pplx-space-db-migrate))
 or test(postgres_collision_repair_tests)
 or test(postgres_lock_retry_tests)
 or (package(pplx-space-db-migrate) and test(user_password::))

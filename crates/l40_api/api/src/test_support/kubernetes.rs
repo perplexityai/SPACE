@@ -235,7 +235,7 @@ pub(crate) fn substrate_over_pods(
 /// Registers [`WORKER_NODE`] as a ready Kubernetes worker node and returns
 /// its id.
 pub(crate) async fn insert_kubernetes_worker_node(pool: &PgPool) -> TestResult<NodeId> {
-    let node_id = pplx_space_common_svc::types::k8s::space_k8s_node_id(WORKER_NODE, "worker");
+    let node_id = pplx_space_k8s_node_id::space_k8s_node_id(WORKER_NODE, "worker");
     sqlx::query(sql!(
         "INSERT INTO nodes (id, address, role, managed_by, state)
          VALUES ($1, $2::INET, 'worker', 'k8s', 'ready')"

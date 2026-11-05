@@ -97,9 +97,9 @@ impl SpacedHostRunConfig {
     /// this process, plus the sandbox it serves when one was named. The host
     /// process installs this *before* calling [`run`] so startup failures are
     /// already attributed to the right sandbox and boot type.
-    pub fn log_context(&self) -> pplx_space_common_svc::LogContext {
+    pub fn log_context(&self) -> pplx_space_observability::LogContext {
         let mut log_context =
-            pplx_space_common_svc::LogContext::default().with_boot_type(self.boot_type.as_str());
+            pplx_space_observability::LogContext::default().with_boot_type(self.boot_type.as_str());
         if let Some(sandbox_id) = &self.sandbox_id {
             log_context = log_context.with_sandbox_id(sandbox_id.clone());
         }

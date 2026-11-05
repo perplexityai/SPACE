@@ -4,9 +4,6 @@
 //! narrower service question "which local principal is this request from, and
 //! is it allowed to perform this operation?".
 //!
-//! It is its own crate so a service can authorize UDS peers without
-//! depending on the rest of `pplx-space-common-svc`.
-//!
 //! Authentication layers, weakest to strongest:
 //!
 //! 1. **Filesystem permissions** — the UDS itself is mode `0o770` with a
@@ -609,7 +606,7 @@ impl UdsPeerAuthorizer {
         }
 
         // Record on the gRPC server span (declared in
-        // `common-svc::bootstrap::GrpcServerMakeSpan`) so every handler that
+        // `pplx-space-grpc-server`'s `GrpcMakeSpan`) so every handler that
         // delegates UDS authorization here surfaces `rpc.client.peer_principal`
         // without each service having to record it locally.
         tracing::Span::current().record("rpc.client.peer_principal", principal.as_str());

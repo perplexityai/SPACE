@@ -14,8 +14,8 @@ workspace = true
 default = []
 # Read Firecracker release archives from GitHub releases.
 github = ["dep:reqwest"]
-otel = ["pplx-space-common-svc/otel"]
-datadog = ["otel", "pplx-space-common-svc/datadog"]
+otel = ["pplx-space-observability/otel"]
+datadog = ["otel", "pplx-space-observability/datadog"]
 # Deprecated for one release; use otel and datadog.
 datadog-otel = ["otel", "datadog"]
 
@@ -48,13 +48,17 @@ tracing = { workspace = true }
 # internal
 pplx-space-common-core = { workspace = true, features = ["rusqlite", "serde"] }
 pplx-space-common-jobs = { workspace = true }
-pplx-space-common-svc = { workspace = true }
+pplx-space-grpc-server = { workspace = true }
+pplx-space-observability = { workspace = true }
 pplx-space-sqlite = { workspace = true }
 pplx-space-execution-common = { workspace = true }
 pplx-space-node-mgr-client = { workspace = true }
 pplx-space-node-runtime-core = { workspace = true, features = ["artifact-store"] }
 pplx-space-node-runtime-manager-client = { workspace = true }
 pplx-space-s3-http-client = { workspace = true }
+pplx-space-uds-peer-auth = { workspace = true }
+pplx-space-unix-socket-bind = { workspace = true }
+pplx-space-unix-socket-path = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

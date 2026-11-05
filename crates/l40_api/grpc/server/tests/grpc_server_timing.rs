@@ -94,7 +94,7 @@ async fn configured_request_timeout_still_expires_through_the_observation_layers
     let addr = listener.local_addr().unwrap();
 
     let server = tokio::spawn(async move {
-        pplx_space_common_svc::grpc_server_builder_with_request_timeout(REQUEST_TIMEOUT)
+        pplx_space_grpc_server::grpc_server_builder_with_request_timeout(REQUEST_TIMEOUT)
             .add_service(SlowService)
             .serve_with_incoming(TcpListenerStream::new(listener))
             .await

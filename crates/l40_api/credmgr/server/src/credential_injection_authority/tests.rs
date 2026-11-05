@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use pplx_space_common_svc::core::types::{K8sNodeUid, NodeId};
+use pplx_space_common_core::{types::K8sNodeUid, types::NodeId};
 use pplx_space_credential_injection_core::secret_arn::SecretArn;
 use pplx_space_credential_injection_store::references::{Config, ReferenceState};
 use pplx_space_net_common::{

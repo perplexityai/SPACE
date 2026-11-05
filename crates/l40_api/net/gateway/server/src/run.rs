@@ -122,7 +122,7 @@ pub enum RunNetGatewayError {
     BindControlSocket {
         path: PathBuf,
         #[source]
-        source: pplx_space_common_svc::bootstrap::BindUnixSocketError,
+        source: pplx_space_unix_socket_bind::BindUnixSocketError,
     },
     #[error("failed to adopt the inherited TCP listener fd {fd}: {source}")]
     InheritedTcpListener {
@@ -317,9 +317,9 @@ pub async fn run(
     let certificates = CertificateProvider::new(authority.clone(), certificate_context);
     // The control endpoint must exist before CA acquisition and guest traffic
     // startup. The owner never waits for a guest request or Started state.
-    let control_listener = pplx_space_common_svc::bind_unix_socket(
+    let control_listener = pplx_space_unix_socket_bind::bind_unix_socket(
         &config.socket_path,
-        pplx_space_common_svc::UnixSocketOptions::new(0o770),
+        pplx_space_unix_socket_bind::UnixSocketOptions::new(0o770),
     )
     .map_err(|source| RunNetGatewayError::BindControlSocket {
         path: config.socket_path.clone(),
@@ -476,14 +476,14 @@ pub async fn run(
     let control_server = async move {
         let result = control_admission
             .supervise(move |incoming| {
-                pplx_space_common_svc::grpc_server_builder()
+                pplx_space_grpc_server::grpc_server_builder()
                     .layer(
-                        pplx_space_common_svc::conservative_uds_grpc_rate_limiter_layer(
+                        pplx_space_grpc_rate_limiter::conservative_uds_grpc_rate_limiter_layer(
                             SERVICE_NAME,
                         ),
                     )
-                    .layer(pplx_space_common_svc::grpc_trace_layer())
-                    .layer(pplx_space_common_svc::SandboxSpanLayer::new(
+                    .layer(pplx_space_grpc_server::grpc_trace_layer())
+                    .layer(crate::sandbox_span::SandboxSpanLayer::new(
                         trusted_sandbox_id,
                     ))
                     .add_service(NetGatewayControlServer::new(service))

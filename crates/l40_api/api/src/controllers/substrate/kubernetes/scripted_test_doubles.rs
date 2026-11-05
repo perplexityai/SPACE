@@ -358,7 +358,7 @@ pub(super) async fn start_scripted_worker(
     let calls: CallLog = Arc::default();
     let replies = Arc::new(config.replies);
     let observers = Arc::new(config.observers);
-    let (health_reporter, health_service) = pplx_space_common_svc::grpc_health_service();
+    let (health_reporter, health_service) = pplx_space_grpc_server::grpc_health_service();
     health_reporter
         .set_service_status(
             pplx_space_sbx_mgr_client::ACTIVATION_POLICY_HEALTH_SERVICE,

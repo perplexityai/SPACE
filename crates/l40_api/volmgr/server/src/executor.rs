@@ -39,10 +39,10 @@ use pplx_space_common_io::sparse::{SparseDataRange, SparseFileWriter, SparseMate
 use pplx_space_common_jobs::{
     Job, JobError, JobExecutor, JobFailureKind, JobFailureReason, JobPriority,
 };
-use pplx_space_common_svc::page_cache;
 use pplx_space_object_store::{
     ObjectMeta, ObjectStore, ObjectStoreError, ObjectTarget, S3ObjectStore,
 };
+use pplx_space_page_cache as page_cache;
 use pplx_space_volmgr_client::{
     VERIFIED_REPLICA_PROVENANCE_VERSION, VerifiedReplicaProvenance,
     verified_replica_provenance_path,

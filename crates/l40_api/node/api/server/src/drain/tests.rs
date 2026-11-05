@@ -36,7 +36,7 @@ impl tonic::server::NamedService for CountingService {
 
 #[tokio::test]
 async fn rejects_space_rpc_while_draining_before_inner_service() {
-    let drain_signal = pplx_space_common_svc::DrainSignal::new();
+    let drain_signal = pplx_space_service_lifecycle::DrainSignal::new();
     drain_signal.begin();
     let calls = Arc::new(AtomicUsize::new(0));
     let mut service = NodeApiDrainLayer::new(drain_signal).layer(CountingService {
@@ -57,7 +57,7 @@ async fn rejects_space_rpc_while_draining_before_inner_service() {
 
 #[tokio::test]
 async fn allows_health_rpc_while_draining() {
-    let drain_signal = pplx_space_common_svc::DrainSignal::new();
+    let drain_signal = pplx_space_service_lifecycle::DrainSignal::new();
     drain_signal.begin();
     let calls = Arc::new(AtomicUsize::new(0));
     let mut service = NodeApiDrainLayer::new(drain_signal).layer(CountingService {
@@ -76,7 +76,7 @@ async fn allows_health_rpc_while_draining() {
 
 #[tokio::test]
 async fn grpc_client_observes_unavailable_while_draining() {
-    let drain_signal = pplx_space_common_svc::DrainSignal::new();
+    let drain_signal = pplx_space_service_lifecycle::DrainSignal::new();
     drain_signal.begin();
     let calls = Arc::new(AtomicUsize::new(0));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

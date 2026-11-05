@@ -368,13 +368,13 @@ impl TemplateManagerService {
             crate::db::PolicyAuthority::try_from(req.network_policy_authority)
                 .map_err(|error| Status::invalid_argument(error.to_string()))?;
         if network_policy.is_some() {
-            pplx_space_common_svc::require_local_authority_peer(
+            pplx_space_uds_peer_auth::require_local_authority_peer(
                 peer.principal(),
                 network_policy_authority == crate::db::PolicyAuthority::Local,
             )?;
         }
         if auto_lifecycle_requested {
-            pplx_space_common_svc::require_local_authority_peer(
+            pplx_space_uds_peer_auth::require_local_authority_peer(
                 peer.principal(),
                 auto_lifecycle_authority == crate::db::PolicyAuthority::Local,
             )?;

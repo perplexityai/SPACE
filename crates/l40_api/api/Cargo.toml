@@ -77,14 +77,22 @@ uuid = { workspace = true, features = ["v5", "v7", "serde"] }
 # internal
 # build-manager is reached indirectly via space-node-api-svc (BuilderApi).
 # The recipe adapter keeps system builds on the same TOML contract as the builder CLI.
+pplx-space-api-route = { workspace = true }
+pplx-space-bearer-token = { workspace = true }
 pplx-space-build-mgr = { workspace = true }
 pplx-space-build-mgr-client = { workspace = true }
 pplx-space-execution-catalog = { workspace = true }
 pplx-space-credmgr-client = { workspace = true }
 pplx-space-credential-injection-core = { workspace = true }
 pplx-space-credential-injection-store = { workspace = true }
+pplx-space-ecw-credential = { workspace = true }
 pplx-space-feature-flags = { workspace = true }
 pplx-space-federated-grant-store = { workspace = true }
+pplx-space-federated-identity = { workspace = true }
+pplx-space-grpc-server = { workspace = true }
+pplx-space-http-server = { workspace = true }
+pplx-space-ingress-admission = { workspace = true }
+pplx-space-k8s-node-id = { workspace = true }
 pplx-space-kube-client = { workspace = true, optional = true }
 pplx-space-node-api-client = { workspace = true }
 pplx-space-node-mgr-client = { workspace = true }
@@ -98,7 +106,6 @@ pplx-space-observability = { workspace = true, default-features = false }
 pplx-space-public-api = { workspace = true, features = ["schema", "serde"] }
 pplx-space-common-core = { workspace = true, features = ["serde", "sqlx"] }
 pplx-space-common-grpc = { workspace = true, features = ["internal-tls"] }
-pplx-space-common-svc = { workspace = true }
 pplx-space-sandbox-grpc = { workspace = true }
 pplx-space-common-work-coalescer = { workspace = true, optional = true }
 pplx-space-cluster-pool = { workspace = true }
@@ -111,7 +118,9 @@ pplx-space-sandbox-residency = { workspace = true }
 pplx-space-sandbox-store = { workspace = true }
 pplx-space-sandbox-teardown = { workspace = true }
 pplx-space-sbx-mgr-client = { workspace = true }
+pplx-space-service-lifecycle = { workspace = true }
 pplx-space-snapshot-store = { workspace = true }
+pplx-space-state-reconciliation = { workspace = true }
 pplx-space-template-mgr-client = { workspace = true }
 
 [dev-dependencies]
@@ -128,6 +137,7 @@ pplx-space-placement = { workspace = true, features = ["test-support"] }
 pplx-space-metrics = { workspace = true, features = ["test-capture"] }
 pplx-space-observability = { workspace = true, features = ["test-capture"] }
 pplx-space-node-api-sim = { workspace = true }
+pplx-space-rustls-provider = { workspace = true }
 pplx-space-test-env = { workspace = true }
 rcgen = { workspace = true, features = ["aws_lc_rs", "pem"] }
 rstest = { workspace = true }

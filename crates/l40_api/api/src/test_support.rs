@@ -1,4 +1,4 @@
-use pplx_space_common_svc::bearer_token::{
+use pplx_space_bearer_token::{
     SPACE_INTERNAL_CONTROL_TOKEN_ENV, SPACE_INTERNAL_TOKEN_ENV,
     SPACE_NODE_API_INTERNAL_TOKEN_PATH_ENV, SPACE_NODE_API_TOKEN_PATH_ENV,
 };

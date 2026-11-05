@@ -7,8 +7,8 @@
 //! cryptographic context binding. The Postgres connection uses the dedicated
 //! read-only `space_credmgr` role.
 
-use pplx_space_common_svc::core::types::{KekProvider, MasterKeyIdentifier, OrgId};
-use pplx_space_common_svc::sql;
+use pplx_space_common_core::{types::KekProvider, types::MasterKeyIdentifier, types::OrgId};
+use pplx_space_sql_locator::sql;
 use uuid::Uuid;
 
 /// A resolved `org_master_keys` row, narrowed to what the key wrapper needs.

@@ -35,7 +35,7 @@ use pplx_space_common_core::types::{
     AutoLifecycleIdleAction, AutoLifecyclePolicy, AutoLifecycleRuntimeState, DEFAULT_TEMPLATE_TAG,
     SandboxLifecycle, SandboxOwnerSource, TemplateVisibility,
 };
-use pplx_space_common_svc::ecw_credential::EcwCredentialKeyring;
+use pplx_space_ecw_credential::EcwCredentialKeyring;
 
 use super::{
     ConnectTouchRecovery, ECW_DEFAULT_CREATE_TIMEOUT_SECS, ECW_DEFAULT_TEMPLATE_ID,

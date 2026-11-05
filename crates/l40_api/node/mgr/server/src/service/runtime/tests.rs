@@ -98,7 +98,7 @@ fn rpc<T>(message: T, caller: Option<u32>) -> Request<T> {
     let mut request = Request::new(message);
     request
         .extensions_mut()
-        .insert(pplx_space_common_svc::PeerIdentity::new(
+        .insert(pplx_space_uds_peer_auth::PeerIdentity::new(
             0,
             0,
             caller.map(|pid| i32::try_from(pid).unwrap()),

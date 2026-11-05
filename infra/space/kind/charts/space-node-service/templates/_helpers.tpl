@@ -243,7 +243,7 @@ service by TokenReview. Pair with the credmgr-token volume below.
 Instance-local health socket. Each binary binds it before waiting for its
 service mutex and answers `readiness` (SERVING while passive, NOT_SERVING
 while taking over, then the production socket's verdict) and `liveness`
-(crates/libs/common/svc/src/local_health.rs). It must be on a pod-private
+(crates/l40_api/local/health/src/lib.rs). It must be on a pod-private
 mount, so a surging successor cannot replace its predecessor's socket.
 */}}
 {{- define "space-node-service.healthSocket" -}}

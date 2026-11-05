@@ -245,7 +245,7 @@ enum TemplateBuildAttemptError {
     /// The bearer token the builder client attaches could not be read, so
     /// the call was not made.
     #[error("builder credential: {0}")]
-    Credential(#[source] pplx_space_common_svc::bearer_token::BearerTokenError),
+    Credential(#[source] pplx_space_bearer_token::BearerTokenError),
 }
 
 impl TemplateBuildAttemptError {
@@ -607,7 +607,7 @@ impl TemplateController {
             // like the wire's. Reading it here first makes that failure one
             // that provably sent nothing. A token that goes missing between
             // the two reads still fails as UNAVAILABLE, possibly accepted.
-            pplx_space_common_svc::bearer_token::space_bearer_token(
+            pplx_space_bearer_token::space_bearer_token(
                 crate::controllers::substrate::BUILDER_BEARER_TOKEN,
             )
             .map_err(TemplateBuildAttemptError::Credential)?;

@@ -22,11 +22,11 @@ use futures_util::{Stream, StreamExt as _};
 use pplx_space_common_core::types::{
     DEFAULT_GUEST_USER, IdempotencyKey, NodeId, ProcessId, SandboxId, generated_idempotency_key,
 };
+use pplx_space_common_grpc::trace_grpc_client_transport as wrap_grpc_client_channel;
 use pplx_space_common_grpc::{
     DEFAULT_TCP_GRPC_CONNECT_RETRY_POLICY, GrpcRetryContext, UdsPerSandboxLimitExceeded,
     is_temporary_tcp_failure, retry_grpc_status_with_context_if,
 };
-use pplx_space_common_svc::bootstrap::wrap_grpc_client_channel;
 use pplx_space_metrics::data_plane::{
     ProcessStartDeliveryOutcome, ProcessStartRecoveryInterruption, ProcessStartRecoveryMode,
 };

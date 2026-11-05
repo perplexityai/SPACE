@@ -5,7 +5,8 @@ use std::sync::{Arc, Mutex};
 use super::*;
 use async_trait::async_trait;
 use pplx_space_common_jobs::{Job, JobError, JobExecutor, WorkerConfig};
-use pplx_space_common_svc::{ServiceMutex, UnixSocketOptions};
+use pplx_space_service_mutex::ServiceMutex;
+use pplx_space_unix_socket_bind::UnixSocketOptions;
 use tonic::codegen::Bytes;
 use tonic::transport::Channel;
 use tonic_health::ServingStatus;
@@ -458,9 +459,9 @@ async fn spawn_health_server(
     active_response_streams: ActiveResponseStreams,
 ) -> (HealthReporter, CancellationToken, GrpcServerHandle) {
     let listener =
-        pplx_space_common_svc::bind_unix_socket(socket_path, UnixSocketOptions::new(0o600))
+        pplx_space_unix_socket_bind::bind_unix_socket(socket_path, UnixSocketOptions::new(0o600))
             .unwrap();
-    let (reporter, health) = pplx_space_common_svc::grpc_health_service();
+    let (reporter, health) = pplx_space_grpc_server::grpc_health_service();
     reporter
         .set_service_status(service, ServingStatus::Serving)
         .await;
@@ -760,7 +761,7 @@ async fn grpc_writer_during_pre_handoff_drain_returns_retry_on_successor() {
     let dir = temp_socket_dir();
     let socket_path = dir.path().join("sandbox-manager.sock");
     let listener =
-        pplx_space_common_svc::bind_unix_socket(&socket_path, UnixSocketOptions::new(0o600))
+        pplx_space_unix_socket_bind::bind_unix_socket(&socket_path, UnixSocketOptions::new(0o600))
             .unwrap();
     let service = SandboxManagerService::for_test(crate::db::Connection::open_in_memory());
     let rpc_drain_token = CancellationToken::new();
@@ -807,7 +808,7 @@ async fn grpc_in_flight_request_interrupted_at_handoff_is_not_marked_replayable(
     let dir = temp_socket_dir();
     let socket_path = dir.path().join("sandbox-manager.sock");
     let listener =
-        pplx_space_common_svc::bind_unix_socket(&socket_path, UnixSocketOptions::new(0o600))
+        pplx_space_unix_socket_bind::bind_unix_socket(&socket_path, UnixSocketOptions::new(0o600))
             .unwrap();
     let service = SandboxManagerService::for_test(crate::db::Connection::open_in_memory());
     let rpc_drain_token = CancellationToken::new();

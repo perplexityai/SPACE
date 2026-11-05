@@ -1,6 +1,6 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use pplx_space_common_svc::core::types::MasterKeyIdentifier;
+use pplx_space_common_core::types::MasterKeyIdentifier;
 use pplx_space_db_test_fixtures::{try_pg_test_db, try_pg_test_db_with_max_connections};
 use zeroize::Zeroizing;
 

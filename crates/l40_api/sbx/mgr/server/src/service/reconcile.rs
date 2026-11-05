@@ -521,7 +521,7 @@ impl SandboxManagerService {
                     }),
                     Some(
                         crate::auto_lifecycle_delete_receipts::AutoLifecycleDeleteExpectation {
-                            policy_fingerprint: pplx_space_common_svc::types::AutoLifecyclePolicyFingerprint::for_policy(
+                            policy_fingerprint: pplx_space_auto_lifecycle_receipt::AutoLifecyclePolicyFingerprint::for_policy(
                                 &sandbox.auto_lifecycle,
                             ),
                             authority: sandbox.auto_lifecycle_authority,

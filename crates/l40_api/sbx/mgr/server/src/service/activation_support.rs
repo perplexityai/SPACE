@@ -8,10 +8,10 @@ use pplx_space_common_core::types::{
     SandboxActivationAttemptId, SandboxQuarantineReasonCode, SpaceApiRouteIdentity,
 };
 use pplx_space_common_core::wake_signals::MISSING_RUNTIME_CONTEXT_MARKER;
-use pplx_space_common_svc::types::k8s::space_node_id;
 use pplx_space_events::{
     SandboxEventDetails, SandboxEventSource, SandboxEventType, emit_sandbox_event,
 };
+use pplx_space_k8s_node_id::space_node_id;
 
 const NODE_ID_PATH: &str = "/space/etc/node-id";
 
@@ -466,7 +466,7 @@ impl SandboxManagerService {
             self.local_node_id,
         ) {
             let generation_fence_enabled =
-                pplx_space_common_svc::space_api_route::space_api_route_generation_fence_enabled();
+                pplx_space_api_route::space_api_route_generation_fence_enabled();
             if let Some(requested_node_id) = identity.identity.current_node_id {
                 let local_node_id = self.local_node_id.or_else(local_space_node_id).ok_or_else(|| {
                     Status::failed_precondition(

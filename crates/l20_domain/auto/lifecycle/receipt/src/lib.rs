@@ -6,9 +6,7 @@
 //! fingerprint and `AUTO_LIFECYCLE_DELETE_COMPLETION_BATCH_SIZE`. The other
 //! `AUTO_LIFECYCLE_DELETE_COMPLETION_*` constants bound only the internal API.
 //!
-//! It is its own crate so that both sides can share the receipt contract
-//! without depending on `pplx-space-common-svc`. `pplx-space-common-svc`
-//! re-exports it as `types::auto_lifecycle`.
+//! It is its own crate so that both sides can share the receipt contract.
 
 use std::{fmt, str::FromStr, time::Duration};
 

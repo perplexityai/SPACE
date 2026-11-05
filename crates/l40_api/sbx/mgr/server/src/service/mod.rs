@@ -10,6 +10,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use arc_swap::ArcSwapOption;
+use pplx_space_api_route::{
+    ed25519::SpaceApiRouteEd25519VerificationBundleUpdate,
+    ed25519::SpaceApiRouteEd25519VerificationBundleUpdateError,
+};
 use pplx_space_common_core::host::linux::identities::user_names;
 use pplx_space_common_core::host::linux::paths::{
     TEMPLATE_CACHE_DIR_MODE, normalize_template_cache_tree as normalize_template_cache_tree_io,
@@ -23,14 +27,6 @@ use pplx_space_common_core::types::{
     SandboxCleanupEpisodeId, SandboxId, SandboxOwner, SandboxOwnerKind,
     SandboxQuarantineReasonCode, SandboxRouteIdentity, SandboxRuntimeLabel, SpaceApiRouteIdentity,
     TEMPLATE_MANAGER_SANDBOX_OWNER, format_reserved_sandbox_owner_kind_labels, parse_grpc_timeout,
-};
-use pplx_space_common_svc::space_api_route_ed25519::{
-    SpaceApiRouteEd25519VerificationBundleUpdate, SpaceApiRouteEd25519VerificationBundleUpdateError,
-};
-use pplx_space_common_svc::{
-    AuthorizedUdsPeer, LocalRole, PeerIdentity, UdsPeerAccount, UdsPeerAuthorizer,
-    UdsPeerPrincipal,
-    types::{ApplyDecisionKind, FACET_NETWORK_POLICY},
 };
 use pplx_space_net_common::{NetworkPolicyV1, proto::NetworkPolicyApplyDecision};
 use pplx_space_net_gateway_client::proto::{ServicePortIngressFrame, service_port_ingress_frame};
@@ -58,6 +54,10 @@ use pplx_space_spaced_common::proto::host_control::{
 };
 use pplx_space_spaced_common::{validate_duration, validate_optional_reason};
 use pplx_space_spaced_host_client::proto as host_proto;
+use pplx_space_state_reconciliation::{ApplyDecisionKind, FACET_NETWORK_POLICY};
+use pplx_space_uds_peer_auth::{
+    AuthorizedUdsPeer, LocalRole, PeerIdentity, UdsPeerAccount, UdsPeerAuthorizer, UdsPeerPrincipal,
+};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use tonic::{Request, Response, Status};
@@ -462,11 +462,8 @@ pub struct SandboxManagerService {
     /// Eppo client for capability rollout. Disabled (every flag
     /// resolves to its default) when `EPPO_SDK_KEY` is unset.
     feature_flags: pplx_space_feature_flags::FeatureFlagClient,
-    route_ed25519_verification_bundle: Arc<
-        ArcSwapOption<
-            pplx_space_common_svc::space_api_route_ed25519::SpaceApiRouteEd25519VerificationBundle,
-        >,
-    >,
+    route_ed25519_verification_bundle:
+        Arc<ArcSwapOption<pplx_space_api_route::ed25519::SpaceApiRouteEd25519VerificationBundle>>,
     route_ed25519_verification_refresh_lock: Arc<Mutex<()>>,
     route_stream_epochs: Arc<Mutex<BTreeMap<SandboxId, RouteStreamEpoch>>>,
     endpoint_proof_flights: spaced_bridge::endpoint_proof_flights::EndpointProofFlights,
@@ -769,33 +766,29 @@ impl Drop for ServicePortIngressAdmissionPermit {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RouteVerificationBundleRefresh {
-    Updated(
-        pplx_space_common_svc::space_api_route_ed25519::SpaceApiRouteEd25519VerificationGeneration,
-    ),
-    Unchanged(
-        pplx_space_common_svc::space_api_route_ed25519::SpaceApiRouteEd25519VerificationGeneration,
-    ),
+    Updated(pplx_space_api_route::ed25519::SpaceApiRouteEd25519VerificationGeneration),
+    Unchanged(pplx_space_api_route::ed25519::SpaceApiRouteEd25519VerificationGeneration),
     Absent,
 }
 
 #[derive(Debug, thiserror::Error)]
 enum RouteVerificationBundleRefreshError {
     #[error("route verification bundle reload failed: {0}")]
-    Invalid(#[source] pplx_space_common_svc::space_api_route_ed25519::SpaceApiRouteEd25519Error),
+    Invalid(#[source] pplx_space_api_route::ed25519::SpaceApiRouteEd25519Error),
     #[error("route verification bundle disappeared after generation {generation} was installed")]
     Missing {
-        generation: pplx_space_common_svc::space_api_route_ed25519::SpaceApiRouteEd25519VerificationGeneration,
+        generation: pplx_space_api_route::ed25519::SpaceApiRouteEd25519VerificationGeneration,
     },
     #[error(
         "route verification bundle generation moved backwards: current={current}, incoming={incoming}"
     )]
     Stale {
-        current: pplx_space_common_svc::space_api_route_ed25519::SpaceApiRouteEd25519VerificationGeneration,
-        incoming: pplx_space_common_svc::space_api_route_ed25519::SpaceApiRouteEd25519VerificationGeneration,
+        current: pplx_space_api_route::ed25519::SpaceApiRouteEd25519VerificationGeneration,
+        incoming: pplx_space_api_route::ed25519::SpaceApiRouteEd25519VerificationGeneration,
     },
     #[error("route verification bundle changed without increasing generation {generation}")]
     Conflict {
-        generation: pplx_space_common_svc::space_api_route_ed25519::SpaceApiRouteEd25519VerificationGeneration,
+        generation: pplx_space_api_route::ed25519::SpaceApiRouteEd25519VerificationGeneration,
     },
     #[error("{0}")]
     Internal(&'static str),
@@ -1041,9 +1034,8 @@ pub struct SandboxManagerServiceOptions {
     pub node_role: Option<NodeRole>,
     /// Trusted deployment substrate; absence is not evidence of Direct ownership.
     pub node_managed_by: Option<NodeManagedBy>,
-    pub route_ed25519_verification_bundle: Option<
-        Arc<pplx_space_common_svc::space_api_route_ed25519::SpaceApiRouteEd25519VerificationBundle>,
-    >,
+    pub route_ed25519_verification_bundle:
+        Option<Arc<pplx_space_api_route::ed25519::SpaceApiRouteEd25519VerificationBundle>>,
     /// Every node-manager client the service and its subsystems use.
     pub node_manager: NodeManagerConnector,
     /// The volume-manager socket that snapshot uploads stage their transfers
@@ -1133,7 +1125,7 @@ impl SandboxManagerService {
     fn refresh_route_ed25519_verification_bundle(
         &self,
     ) -> Result<RouteVerificationBundleRefresh, RouteVerificationBundleRefreshError> {
-        use pplx_space_common_svc::space_api_route_ed25519::load_space_api_route_ed25519_verification_bundle;
+        use pplx_space_api_route::ed25519::load_space_api_route_ed25519_verification_bundle;
 
         let _refresh_guard = self
             .route_ed25519_verification_refresh_lock

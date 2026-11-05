@@ -11,8 +11,8 @@
 use super::*;
 use crate::node_manager_transport::fake::FakeNodeManager;
 use crate::service::tests::service_tests::insert_test_sandbox;
-use pplx_space_common_svc::PeerIdentity;
 use pplx_space_node_mgr_client::proto::{CleanupSandboxRequest, CleanupSandboxResponse};
+use pplx_space_uds_peer_auth::PeerIdentity;
 
 const CLAIM_REFUSAL: &str = "scripted lifecycle claim refusal";
 

@@ -1,11 +1,11 @@
 use super::*;
 use crate::node_state_sync::tests::RecordingNodeStatusDirtySink;
 use crate::service::tests::service_tests::{root_request, service_for_unit_tests};
+use pplx_space_common_core::host::linux::identities::users;
 use pplx_space_common_core::types::Arch;
-use pplx_space_common_svc::PeerIdentity;
-use pplx_space_common_svc::core::host::linux::identities::users;
 use pplx_space_node_runtime_core::catalog::CompiledEnvironment;
 use pplx_space_node_runtime_core::runtime_inventory::ExecutionSelectionMode;
+use pplx_space_uds_peer_auth::PeerIdentity;
 
 const BOTH: &str = "e0,fc-1.17.0-linux-6.1.155,legacy";
 /// Each test holding the inventory refresh lock waits out this bound. It

@@ -1,4 +1,4 @@
-use pplx_space_common_svc::core::types::{K8sNodeUid, NodeRole};
+use pplx_space_common_core::{types::K8sNodeUid, types::NodeRole};
 
 use super::*;
 use crate::auth::{ClientService, K8sIdentity};
@@ -18,7 +18,7 @@ fn node_agent_identity_maps_to_the_worker_node_incarnation() {
         .unwrap(),
     );
     let expected_node_id =
-        pplx_space_common_svc::types::k8s::space_k8s_node_id("worker-a", NodeRole::Worker.as_str());
+        pplx_space_k8s_node_id::space_k8s_node_id("worker-a", NodeRole::Worker.as_str());
 
     assert_eq!(
         resolution_caller(&caller).unwrap(),

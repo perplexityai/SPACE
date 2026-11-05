@@ -1413,7 +1413,7 @@ async fn a_stopped_target_replay_never_answers_for_a_running_sandbox() {
 /// upgrade, but may not stage.
 #[tokio::test]
 async fn staging_takes_a_starts_authority() {
-    use pplx_space_common_svc::peer_auth::{LocalRole, UdsPeerAccount, UdsPeerAuthorizer};
+    use pplx_space_uds_peer_auth::{LocalRole, UdsPeerAccount, UdsPeerAuthorizer};
     let (source, _) = environments();
     let target = certified_target(&source);
     let mut service = SandboxManagerService::new_with_options(
@@ -1441,7 +1441,9 @@ async fn staging_takes_a_starts_authority() {
     let mut operator = tonic::Request::new(request);
     operator
         .extensions_mut()
-        .insert(pplx_space_common_svc::PeerIdentity::new(16001, 16001, None));
+        .insert(pplx_space_uds_peer_auth::PeerIdentity::new(
+            16001, 16001, None,
+        ));
 
     let error = service.upgrade_runtime(operator).await.unwrap_err();
 
@@ -1559,7 +1561,7 @@ async fn a_stopped_target_meeting_a_moving_sandbox_is_retryable() {
 /// refused before anything is read.
 #[tokio::test]
 async fn the_runtime_upgrade_report_is_read_only_by_the_upgrades_principals() {
-    use pplx_space_common_svc::peer_auth::{LocalRole, UdsPeerAccount, UdsPeerAuthorizer};
+    use pplx_space_uds_peer_auth::{LocalRole, UdsPeerAccount, UdsPeerAuthorizer};
     let mut service = SandboxManagerService::new_with_options(
         crate::db::test_conn(),
         crate::service::SandboxManagerServiceOptions::for_test(),
@@ -1579,7 +1581,7 @@ async fn the_runtime_upgrade_report_is_read_only_by_the_upgrades_principals() {
         });
         request
             .extensions_mut()
-            .insert(pplx_space_common_svc::PeerIdentity::new(uid, uid, None));
+            .insert(pplx_space_uds_peer_auth::PeerIdentity::new(uid, uid, None));
         request
     };
 

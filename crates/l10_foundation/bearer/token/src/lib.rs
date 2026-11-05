@@ -5,9 +5,8 @@
 //! when they load or check the static token they accept.
 //!
 //! It is its own crate so client crates can attach these tokens without
-//! depending on `pplx-space-common-svc` and the service host it brings.
-//! `pplx-space-common-svc` re-exports it as `bearer_token` and re-exports the
-//! interceptor and `required_space_bearer_token` from its `auth` module.
+//! depending on a service host. `pplx-space-rpc-auth` re-exports the
+//! interceptor and `required_space_bearer_token`.
 
 use std::collections::HashMap;
 use std::io::ErrorKind;

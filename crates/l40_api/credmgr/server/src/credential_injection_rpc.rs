@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 
-use pplx_space_common_svc::core::types::NodeRole;
+use pplx_space_common_core::types::NodeRole;
 use pplx_space_credmgr_client::NETWORK_CREDENTIAL_RESOLUTION_TIMEOUT;
 use tokio::sync::Semaphore;
 use tonic::Status;
@@ -81,7 +81,7 @@ fn resolution_caller(caller: &ResolvedCaller) -> Result<ResolutionCaller, Status
             // retains the Kubernetes node identity for agents on every node
             // role; this RPC supplies the worker role needed by the stable
             // SPACE NodeId derivation.
-            let node_id = pplx_space_common_svc::types::k8s::space_k8s_node_id(
+            let node_id = pplx_space_k8s_node_id::space_k8s_node_id(
                 node_identity.node_name().as_str(),
                 NodeRole::Worker.as_str(),
             );

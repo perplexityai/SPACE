@@ -1052,7 +1052,7 @@ async fn set_route_identity_with_client(
 pub(super) async fn push_route_verification_keys(
     sandbox_id: &str,
     identity_profile_version: Option<u32>,
-    bundle: &pplx_space_common_svc::space_api_route_ed25519::SpaceApiRouteEd25519VerificationBundle,
+    bundle: &pplx_space_api_route::ed25519::SpaceApiRouteEd25519VerificationBundle,
 ) -> Result<NetGatewayRouteVerificationKeyPushOutcome, Status> {
     validate_route_verification_profile(identity_profile_version)?;
     let (expected_generation, request) = route_verification_keys_request(bundle);
@@ -1082,7 +1082,7 @@ pub(super) async fn push_route_security_with_retry_policy(
     sandbox_id: &str,
     identity: &SpaceApiRouteIdentity,
     verification_bundle: Option<
-        &pplx_space_common_svc::space_api_route_ed25519::SpaceApiRouteEd25519VerificationBundle,
+        &pplx_space_api_route::ed25519::SpaceApiRouteEd25519VerificationBundle,
     >,
     retry_policy: pplx_space_common_grpc::GrpcRetryPolicy,
 ) -> Result<NetGatewayRouteSecurityPushOutcome, Status> {
@@ -1138,7 +1138,7 @@ async fn push_route_verification_keys_with_client(
     client: &mut pplx_space_net_gateway_client::NetGatewayControlGrpcClient,
     sandbox_id: &str,
     identity_profile_version: Option<u32>,
-    bundle: &pplx_space_common_svc::space_api_route_ed25519::SpaceApiRouteEd25519VerificationBundle,
+    bundle: &pplx_space_api_route::ed25519::SpaceApiRouteEd25519VerificationBundle,
 ) -> Result<NetGatewayRouteVerificationKeyPushOutcome, Status> {
     validate_route_verification_profile(identity_profile_version)?;
     let (expected_generation, request) = route_verification_keys_request(bundle);
@@ -1151,9 +1151,9 @@ async fn push_route_verification_keys_with_client(
 }
 
 fn route_verification_keys_request(
-    bundle: &pplx_space_common_svc::space_api_route_ed25519::SpaceApiRouteEd25519VerificationBundle,
+    bundle: &pplx_space_api_route::ed25519::SpaceApiRouteEd25519VerificationBundle,
 ) -> (
-    pplx_space_common_svc::space_api_route_ed25519::SpaceApiRouteEd25519VerificationGeneration,
+    pplx_space_api_route::ed25519::SpaceApiRouteEd25519VerificationGeneration,
     pplx_space_net_gateway_client::proto::SetRouteVerificationKeysRequest,
 ) {
     (
@@ -1179,7 +1179,7 @@ fn route_verification_keys_request(
 async fn set_route_verification_keys_with_client(
     client: &mut pplx_space_net_gateway_client::NetGatewayControlGrpcClient,
     request: pplx_space_net_gateway_client::proto::SetRouteVerificationKeysRequest,
-    expected_generation: pplx_space_common_svc::space_api_route_ed25519::SpaceApiRouteEd25519VerificationGeneration,
+    expected_generation: pplx_space_api_route::ed25519::SpaceApiRouteEd25519VerificationGeneration,
 ) -> Result<NetGatewayRouteVerificationKeyPushOutcome, NetGatewayRouteVerificationKeyPushError> {
     classify_route_verification_key_response(
         client
@@ -1195,7 +1195,7 @@ fn classify_route_verification_key_response(
         pplx_space_net_gateway_client::proto::SetRouteVerificationKeysResponse,
         Status,
     >,
-    expected_generation: pplx_space_common_svc::space_api_route_ed25519::SpaceApiRouteEd25519VerificationGeneration,
+    expected_generation: pplx_space_api_route::ed25519::SpaceApiRouteEd25519VerificationGeneration,
 ) -> Result<NetGatewayRouteVerificationKeyPushOutcome, NetGatewayRouteVerificationKeyPushError> {
     let applied_generation = response
         .map_err(NetGatewayRouteVerificationKeyPushError::Rpc)?
@@ -1532,13 +1532,13 @@ pub(super) fn set_network_policy_desired_generation(
 /// cluster overrides (a later `authority=cluster` reconcile is a no-op).
 /// Only an on-node operator may set it; the node-api and
 /// node-ctl service peers always push `authority=cluster`. Delegates to the
-/// shared boundary in `common/svc` so sandbox-manager and template-manager stay
+/// shared boundary in `uds-peer-auth` so sandbox-manager and template-manager stay
 /// in lockstep.
 pub(super) fn require_local_authority_peer(
     principal: UdsPeerPrincipal,
     authority: crate::db::PolicyAuthority,
 ) -> Result<(), Status> {
-    pplx_space_common_svc::require_local_authority_peer(
+    pplx_space_uds_peer_auth::require_local_authority_peer(
         principal,
         authority == crate::db::PolicyAuthority::Local,
     )

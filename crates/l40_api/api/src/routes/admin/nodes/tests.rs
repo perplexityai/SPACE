@@ -2368,7 +2368,7 @@ async fn node_reads_report_cordon_group_trigger_and_runtimes() -> TestResult {
     crate::reconcile_trigger::enqueue_triggers(
         &db.pool,
         [busy],
-        pplx_space_common_svc::types::ReconcileReason::ManualNodeReconcile,
+        pplx_space_state_reconciliation::ReconcileReason::ManualNodeReconcile,
     )
     .await?;
 
@@ -2508,7 +2508,7 @@ async fn node_reads_survive_a_failed_read_state_read() -> TestResult {
     crate::reconcile_trigger::enqueue_triggers(
         &db.pool,
         [node_id],
-        pplx_space_common_svc::types::ReconcileReason::ManualNodeReconcile,
+        pplx_space_state_reconciliation::ReconcileReason::ManualNodeReconcile,
     )
     .await?;
     let read_node = |response: axum::response::Response| async move {

@@ -14,13 +14,13 @@
 //! choose the freshest live grant directly. An org with no live grant sends
 //! none — the provider decides whether that is fatal.
 
-use pplx_space_common_svc::core::types::{FederatedGrantAudience, OrgId, SandboxId};
-use pplx_space_common_svc::federated_identity::FEDERATED_OWNER_GRANT_PURPOSE;
-use pplx_space_common_svc::sql;
+use pplx_space_common_core::{types::FederatedGrantAudience, types::OrgId, types::SandboxId};
 use pplx_space_federated_grant_store::{
     FreshestLiveFederatedGrant, FreshestLiveFederatedGrantError, freshest_live_federated_grant,
     live_federated_grant_prefer_sandbox,
 };
+use pplx_space_federated_identity::FEDERATED_OWNER_GRANT_PURPOSE;
+use pplx_space_sql_locator::sql;
 
 /// `organizations.owner_source` for an org whose identity came from a trusted upstream client.
 const FEDERATED_IDENTITY_OWNER_SOURCE: &str = "federated_identity";

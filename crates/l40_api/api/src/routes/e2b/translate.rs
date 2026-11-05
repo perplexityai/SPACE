@@ -769,7 +769,7 @@ pub(super) async fn build_listed_sandbox(
 }
 
 pub(super) fn build_detail_sandbox(
-    keyring: &pplx_space_common_svc::ecw_credential::EcwCredentialKeyring,
+    keyring: &pplx_space_ecw_credential::EcwCredentialKeyring,
     sandbox: &Sandbox,
     native: &SandboxResponse,
     domain: Option<String>,

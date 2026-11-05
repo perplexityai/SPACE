@@ -2029,7 +2029,7 @@ impl SandboxManagerService {
             // long as its own pull takes. Neither `Start` call site into
             // `run_cross_node_restore` wraps it in a `tokio::time::timeout`; the
             // bound is the transport's, since sandbox-manager serves this through
-            // `pplx_space_common_svc::grpc_server_builder` and tonic applies
+            // `pplx_space_grpc_server::grpc_server_builder` and tonic applies
             // `min(the caller's grpc-timeout, 120s)`, surfacing on elapse as
             // `CANCELLED "Timeout expired"`. Nothing here records a fence failure
             // when that fires, so the only evidence is on the calling side.

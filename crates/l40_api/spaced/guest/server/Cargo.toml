@@ -24,18 +24,22 @@ workspace = true
 [features]
 # The service entry point: process-mode dispatch, telemetry init, the Tokio
 # runtime, and the readiness loop that `spaced-svc`'s `main` calls. Off by
-# default because it is the only thing here that needs `common-svc`: consumers
+# default because it is the only thing here that needs `service-host`: consumers
 # that link this crate for its service types or `loopback-diagnostic` -- the in-VM
 # loopback diagnostic, the spaced host test suites -- would otherwise compile
-# `common-svc`'s Postgres, Redis, and TLS stack to reach code they never call.
-service-entrypoint = ["dep:pplx-space-common-svc", "pplx-space-spaced-guest-execution/telemetry"]
+# `service-host`'s process setup to reach code they never call.
+service-entrypoint = [
+    "dep:pplx-space-service-host",
+    "dep:pplx-space-service-lifecycle",
+    "pplx-space-spaced-guest-execution/telemetry",
+]
 # Compiles in the test-only environment hooks; never enabled for release builds.
 test-hooks = ["pplx-space-common-core/test-hooks", "pplx-space-spaced-guest-execution/test-hooks"]
-# Forwards to `common-svc`'s telemetry pipeline. The entry point is where
+# Forwards to `service-host`'s telemetry pipeline. The entry point is where
 # this crate initializes telemetry, so the gate has to reach it rather than the
 # binary, and it implies the entry point it configures.
-otel = ["service-entrypoint", "pplx-space-common-svc/otel", "pplx-space-spaced-guest-execution/otel"]
-datadog = ["otel", "service-entrypoint", "pplx-space-common-svc/datadog", "pplx-space-spaced-guest-execution/datadog"]
+otel = ["service-entrypoint", "pplx-space-service-host/otel", "pplx-space-spaced-guest-execution/otel"]
+datadog = ["otel", "service-entrypoint", "pplx-space-service-host/datadog", "pplx-space-spaced-guest-execution/datadog"]
 # Deprecated for one release; use otel and datadog.
 datadog-otel = ["otel", "datadog"]
 # Exposes the in-VM loopback diagnostic without stabilizing runtime internals.
@@ -61,11 +65,12 @@ tower = { workspace = true }
 uuid = { workspace = true, features = ["v7"] }
 
 # internal
+pplx-space-service-host = { workspace = true, optional = true }
+pplx-space-service-lifecycle = { workspace = true, optional = true }
 pplx-space-spaced-guest-execution = { workspace = true }
 pplx-space-common-connection-admission = { workspace = true }
 pplx-space-common-core = { workspace = true }
 pplx-space-common-grpc = { workspace = true }
-pplx-space-common-svc = { workspace = true, optional = true }
 pplx-space-metrics = { workspace = true }
 pplx-space-observability = { workspace = true }
 pplx-space-spaced-common = { workspace = true }

@@ -15,7 +15,7 @@ use axum::{
     middleware,
     response::IntoResponse,
 };
-use pplx_space_common_svc::{HttpServerMakeSpan, HttpSpanMetadata, http_trace_layer};
+use pplx_space_http_server::{HttpServerMakeSpan, HttpSpanMetadata, http_trace_layer};
 use sqlx::PgPool;
 use std::borrow::Cow;
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
@@ -49,7 +49,7 @@ pub struct AppState {
     /// initial `LIST`. `/readyz` gates the Service endpoint on this so a
     /// fresh replica does not receive traffic with a cold cache.
     pub readiness: crate::controllers::substrate::ReflectorReady,
-    pub drain_signal: pplx_space_common_svc::DrainSignal,
+    pub drain_signal: pplx_space_service_lifecycle::DrainSignal,
     /// Claimed operations this process executes itself instead of leaving
     /// them to the dispatcher. See [`crate::inline_operations`].
     pub inline_operations: crate::inline_operations::InlineOperations,
@@ -71,8 +71,7 @@ pub struct AppState {
     /// Orgs the environment enables for hidden native operations; see
     /// [`public::hidden_operations`].
     pub native_hidden_operations: public::hidden_operations::HiddenOperationsGate,
-    pub ecw_credential_keyring:
-        std::sync::Arc<pplx_space_common_svc::ecw_credential::EcwCredentialKeyring>,
+    pub ecw_credential_keyring: std::sync::Arc<pplx_space_ecw_credential::EcwCredentialKeyring>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -88,11 +87,9 @@ pub enum AppStateError {
     #[error("sandbox controller initialization failed: {0}")]
     SandboxController(#[from] crate::controllers::substrate::SubstrateError),
     #[error("route-token authority initialization failed: {0}")]
-    RouteTokenAuthority(
-        #[from] pplx_space_common_svc::space_api_route_ed25519::SpaceApiRouteEd25519Error,
-    ),
+    RouteTokenAuthority(#[from] pplx_space_api_route::ed25519::SpaceApiRouteEd25519Error),
     #[error("ECW credential keyring initialization failed: {0}")]
-    EcwCredentialKeyring(#[from] pplx_space_common_svc::ecw_credential::EcwCredentialError),
+    EcwCredentialKeyring(#[from] pplx_space_ecw_credential::EcwCredentialError),
     #[error("client classification configuration failed: {0}")]
     ClientClassification(#[from] crate::client_classification::ClientClassificationError),
     #[error(transparent)]
@@ -107,12 +104,12 @@ impl AppState {
     #[cfg(test)]
     pub async fn from_pool(pool: PgPool) -> Result<Self, AppStateError> {
         let route_ed25519_authority =
-            pplx_space_common_svc::space_api_route_ed25519::SpaceApiRouteEd25519Authority::load_from_env()?
+            pplx_space_api_route::ed25519::SpaceApiRouteEd25519Authority::load_from_env()?
                 .map(std::sync::Arc::new);
         Self::from_pools_with_lifecycle(
             pool.clone(),
             pplx_space_postgres_pool::CredentialsPool::shared(pool),
-            pplx_space_common_svc::DrainSignal::new(),
+            pplx_space_service_lifecycle::DrainSignal::new(),
             CancellationToken::new(),
             TaskTracker::new(),
             route_ed25519_authority,
@@ -123,13 +120,11 @@ impl AppState {
     pub async fn from_pools_with_lifecycle(
         pool: PgPool,
         credentials_pool: pplx_space_postgres_pool::CredentialsPool,
-        drain_signal: pplx_space_common_svc::DrainSignal,
+        drain_signal: pplx_space_service_lifecycle::DrainSignal,
         shutdown_token: CancellationToken,
         task_tracker: TaskTracker,
         route_ed25519_authority: Option<
-            std::sync::Arc<
-                pplx_space_common_svc::space_api_route_ed25519::SpaceApiRouteEd25519Authority,
-            >,
+            std::sync::Arc<pplx_space_api_route::ed25519::SpaceApiRouteEd25519Authority>,
         >,
     ) -> Result<Self, AppStateError> {
         let route_signing = route_ed25519_authority.is_some();
@@ -205,9 +200,8 @@ impl AppState {
             ),
             feature_flags.clone(),
         );
-        let ecw_credential_keyring = std::sync::Arc::new(
-            pplx_space_common_svc::ecw_credential::EcwCredentialKeyring::load_from_env()?,
-        );
+        let ecw_credential_keyring =
+            std::sync::Arc::new(pplx_space_ecw_credential::EcwCredentialKeyring::load_from_env()?);
 
         Ok(Self {
             pool,
@@ -388,7 +382,7 @@ pub fn dedicated_admin_router(state: AppState) -> Router {
 /// space-api customization of the shared SPACE `http.server` trace layer.
 ///
 /// The span construction, response/failure status recording, and traceparent
-/// extraction all live in `pplx_space_common_svc::http_trace_layer`.
+/// extraction all live in `pplx_space_http_server::http_trace_layer`.
 #[derive(Clone)]
 struct ApiHttpSpanMetadata;
 

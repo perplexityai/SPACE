@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use anyhow::Context as _;
 use clap::Parser;
-use pplx_space_common_svc::DEFAULT_SERVICE_MUTEX_TIMEOUT;
+use pplx_space_service_lifecycle::DEFAULT_SERVICE_MUTEX_TIMEOUT;
 use pplx_space_template_mgr::{SERVICE_NAME, SOCKET_PATH, TemplateMgrRunConfig};
 
 #[derive(Parser)]
@@ -51,13 +51,13 @@ impl From<Cli> for TemplateMgrRunConfig {
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    let runtime = pplx_space_common_svc::tokio_runtime::build_multi_thread_runtime()
+    let runtime = pplx_space_tokio_runtime::build_multi_thread_runtime()
         .context("failed to configure template-manager Tokio runtime")?;
     let (telemetry, shutdown_token) = {
         let _entered = runtime.enter();
         (
-            pplx_space_common_svc::init_service(SERVICE_NAME)?,
-            pplx_space_common_svc::shutdown_token(),
+            pplx_space_service_host::init_service(SERVICE_NAME)?,
+            pplx_space_service_lifecycle::shutdown::shutdown_token(),
         )
     };
     Ok(pplx_space_template_mgr::run(

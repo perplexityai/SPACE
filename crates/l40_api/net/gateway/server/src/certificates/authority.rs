@@ -472,7 +472,7 @@ impl GatewayAuthority {
                 })
                 .await?;
             let mut client = HostControlClient::new(
-                pplx_space_common_svc::bootstrap::wrap_grpc_client_channel(channel),
+                pplx_space_common_grpc::trace_grpc_client_transport(channel),
             )
             .max_decoding_message_size(2 * MAX_CERTIFICATE_BYTES + 1024);
             let mut request = tonic::Request::new(IssueGatewayIntermediateCertificateRequest {

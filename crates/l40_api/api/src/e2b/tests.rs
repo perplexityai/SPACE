@@ -139,7 +139,7 @@ async fn error_messages_land_on_the_http_server_span() {
 
     use axum::body::Body;
     use axum::http::Request;
-    use pplx_space_common_svc::{HttpServerMakeSpan, http_trace_layer};
+    use pplx_space_http_server::{HttpServerMakeSpan, http_trace_layer};
     use tower::util::ServiceExt;
     use tracing_subscriber::prelude::*;
 

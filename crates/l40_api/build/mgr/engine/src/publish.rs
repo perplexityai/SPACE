@@ -11,7 +11,6 @@ use pplx_space_common_core::types::{
     TEMPLATE_ROOTFS_ZSTD_LEVEL, TemplateArtifact, TemplateName, TenantPublicationGrantId,
     template_object_key, template_object_prefix,
 };
-use pplx_space_common_svc::page_cache;
 use pplx_space_node_api_client::cluster::{
     AuthenticatedClusterApiClient, ConnectClusterApiError,
     connect_from_env as connect_cluster_api_from_env,
@@ -24,6 +23,7 @@ use pplx_space_node_api_client::proto::{
 use pplx_space_object_store::{
     ObjectCredentials, ObjectStore, ObjectStoreError, ObjectTarget, S3ObjectStore,
 };
+use pplx_space_page_cache as page_cache;
 use serde::{Deserialize, Serialize};
 use tonic::Code;
 

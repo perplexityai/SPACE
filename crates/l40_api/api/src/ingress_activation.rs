@@ -2,7 +2,7 @@
 //! ingress activation, and the native file access RPCs
 //! ([`crate::native_file_access`]).
 use pplx_space_common_core::types::{SandboxId, parse_grpc_timeout};
-use pplx_space_common_svc::ingress_admission::{IngressPreparationPermit, preparation_timeout};
+use pplx_space_ingress_admission::{IngressPreparationPermit, preparation_timeout};
 use pplx_space_node_api_client::{
     activation::IngressActivation,
     proto::{
@@ -132,7 +132,7 @@ fn serve(
         .map_err(|error| Status::failed_precondition(error.to_string()))?;
     Ok(Box::pin(async move {
         server
-            .layer(pplx_space_common_svc::grpc_trace_layer())
+            .layer(pplx_space_grpc_server::grpc_trace_layer())
             .layer(auth_layer)
             .add_service(
                 IngressActivationApiServer::new(service)

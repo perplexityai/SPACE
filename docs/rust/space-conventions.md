@@ -42,7 +42,7 @@ including `aws_lc_rs` for rustls and rcgen, `tls-aws-lc` for tonic, and
 
 Services install the process-wide rustls provider through
 `pplx_space_rustls_provider::install_default_rustls_crypto_provider`
-(re-exported from `pplx-space-common-svc`); downstream
+(which `pplx-space-service-host`'s `init_service` calls); downstream
 crates must not attempt to install a competing provider. A transitive dependency
 that offers no provider choice may retain ring temporarily, but record that
 constraint rather than adding SPACE-owned ring usage around it. Changing the
@@ -128,8 +128,7 @@ Reach for `Mutex<HashMap<_, _>>` or `RwLock<HashMap<_, _>>` only when you genuin
 ## SQL statements: wrap in the `sql!` locator macro
 
 Every SQL statement handed to `sqlx::query*` is wrapped in
-`pplx_space_common_core::sql!` (defined in `pplx-space-sql-locator`;
-re-exported from `pplx-space-common-svc`),
+`pplx_space_sql_locator::sql!` (re-exported as `pplx_space_common_core::sql!`),
 which prepends a `/*module_path:line*/` comment to the statement:
 
 ```rust

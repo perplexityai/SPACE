@@ -99,7 +99,7 @@ pub struct AdminNodeResponse {
     /// `None` whenever `drainability` is.
     ///
     /// A `String` rather than the enum because that type lives in
-    /// `pplx-space-common-svc`, which this crate is a dependency *of*. The value
+    /// `pplx-space-sandbox-residency`, which this crate is a dependency *of*. The value
     /// is always that enum's own `as_str()`, never hand-written here.
     ///
     /// Load-bearing for interpreting the counts: under `lifecycle_only` — the

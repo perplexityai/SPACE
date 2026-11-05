@@ -14,11 +14,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use pplx_space_common_svc::core::host::linux::identities::group_names;
-use pplx_space_common_svc::core::types::{KekProvider, MasterKeyIdentifier};
-use pplx_space_common_svc::{
-    AcquireOutcome, DEFAULT_DRAIN_TIMEOUT, LocalHealthServer, PeerProcessCheckMode, ServiceMutex,
-};
+use pplx_space_common_core::host::linux::identities::group_names;
+use pplx_space_common_core::{types::KekProvider, types::MasterKeyIdentifier};
+use pplx_space_local_health::LocalHealthServer;
+use pplx_space_service_lifecycle::DEFAULT_DRAIN_TIMEOUT;
+use pplx_space_service_mutex::{AcquireOutcome, ServiceMutex};
+use pplx_space_uds_peer_auth::PeerProcessCheckMode;
 use tokio::task::JoinSet;
 use tokio_stream::wrappers::UnixListenerStream;
 use tokio_util::sync::CancellationToken;
@@ -128,7 +129,7 @@ pub enum RunCredmgrError {
     #[error("--volume-socket requires UDS and a path distinct from --socket")]
     InvalidVolumeSocket,
     #[error("invalid peer-process check mode: {0}")]
-    PeerProcessCheck(#[source] pplx_space_common_svc::PeerProcessCheckModeEnvError),
+    PeerProcessCheck(#[source] pplx_space_uds_peer_auth::PeerProcessCheckModeEnvError),
     #[error("{STORAGE_VEND_ROLE_ENV} must be valid UTF-8")]
     StorageVendRoleNotUnicode,
     #[error("{STORAGE_VEND_ROLE_ENV} is not a valid IAM role ARN")]
@@ -187,9 +188,7 @@ pub enum RunCredmgrError {
     #[error("invalid intermediate-key broker protocol configuration: {0}")]
     IntermediateKeyBrokerProtocol(#[source] BrokerProtocolConfigError),
     #[error("invalid federated-identity policy: {0}")]
-    FederatedIdentityPolicy(
-        #[source] pplx_space_common_svc::federated_identity::FederatedIdentityPolicyError,
-    ),
+    FederatedIdentityPolicy(#[source] pplx_space_federated_identity::FederatedIdentityPolicyError),
     #[error("invalid AWS Private CA configuration: {0}")]
     IntermediateCaConfig(#[source] crate::intermediate_ca::aws_private_ca::ConfigError),
     #[error(transparent)]
@@ -208,7 +207,7 @@ pub enum RunCredmgrError {
     MissingPlatformKekIdentifier,
     #[error("SPACE_PLATFORM_KEK_IDENTIFIER is invalid: {0}")]
     InvalidPlatformKekIdentifier(
-        #[source] pplx_space_common_svc::core::types::MasterKeyIdentifierParseError,
+        #[source] pplx_space_common_core::types::MasterKeyIdentifierParseError,
     ),
     #[error(
         "SPACE_PLATFORM_KEK_PROVIDER=intermediate-key-broker requires DATABASE_URL and a \
@@ -216,11 +215,11 @@ pub enum RunCredmgrError {
     )]
     MissingIntermediateKeyBrokerPlatformConfig,
     #[error("failed to bind the credential-manager health socket: {0}")]
-    HealthSocket(#[source] pplx_space_common_svc::bootstrap::BindUnixSocketError),
+    HealthSocket(#[source] pplx_space_unix_socket_bind::BindUnixSocketError),
     #[error("failed to acquire the credential-manager service mutex: {0}")]
-    ServiceMutex(#[source] pplx_space_common_svc::service_mutex::AcquireError),
+    ServiceMutex(#[source] pplx_space_service_mutex::AcquireError),
     #[error("failed to bind the credential-manager socket: {0}")]
-    BindSocket(#[source] pplx_space_common_svc::bootstrap::BindUnixSocketError),
+    BindSocket(#[source] pplx_space_unix_socket_bind::BindUnixSocketError),
     #[error("volume credential socket preflight failed for {path}: {source}")]
     VolumeSocketPreflight {
         path: PathBuf,
@@ -582,7 +581,7 @@ async fn initialize_authority_service(
             (private_ca_issuer, resolver)
         };
 
-    let platform_kek_provider = pplx_space_common_svc::core::types::platform_default_kek_provider();
+    let platform_kek_provider = pplx_space_common_core::types::platform_default_kek_provider();
     let in_memory_enabled = pplx_space_common_core::env::env_flag(
         pplx_space_common_core::env::test_hook_var(IN_MEMORY_KEK_ENABLED_ENV).as_deref(),
         false,
@@ -640,7 +639,7 @@ async fn initialize_authority_service(
         // node-local instance never installs this backend.
         let identity = Arc::new(PgIntermediateKeyIdentityLookup::new(
             pool.clone(),
-            pplx_space_common_svc::federated_identity::FederatedIdentityPolicy::from_env()
+            pplx_space_federated_identity::FederatedIdentityPolicy::from_env()
                 .map_err(RunCredmgrError::FederatedIdentityPolicy)?
                 .grant_audience,
         ));
@@ -955,7 +954,7 @@ async fn prepare_node_local(
         }
         None => LocalHealthServer::spawn_optional(
             config.health_socket_path.as_deref(),
-            pplx_space_common_svc::UnixSocketOptions::new(0o660),
+            pplx_space_unix_socket_bind::UnixSocketOptions::new(0o660),
             SERVICE_NAME,
             shutdown_token.clone(),
         )
@@ -1003,10 +1002,11 @@ async fn prepare_node_local(
 fn bind_credential_manager_socket(
     path: &Path,
 ) -> Result<tokio::net::UnixListener, RunCredmgrError> {
-    pplx_space_common_svc::bind_unix_socket(
+    pplx_space_unix_socket_bind::bind_unix_socket(
         path,
-        pplx_space_common_svc::UnixSocketOptions::new(0o770)
-            .with_group(pplx_space_common_svc::SocketGroup::Required(SOCKET_GROUP)),
+        pplx_space_unix_socket_bind::UnixSocketOptions::new(0o770).with_group(
+            pplx_space_unix_socket_bind::SocketGroup::Required(SOCKET_GROUP),
+        ),
     )
     .map_err(RunCredmgrError::BindSocket)
 }
@@ -1022,7 +1022,7 @@ impl CredentialListeners {
             .volume_socket_path
             .as_ref()
             .map(|path| {
-                pplx_space_common_svc::bind_unix_socket(path, volume_socket::options())
+                pplx_space_unix_socket_bind::bind_unix_socket(path, volume_socket::options())
                     .map_err(RunCredmgrError::BindSocket)
             })
             .transpose()?;
@@ -1064,11 +1064,11 @@ async fn serve_uds_until<S>(
 where
     S: CredentialManager,
 {
-    let (_, health_service) = pplx_space_common_svc::grpc_health_service();
-    pplx_space_common_svc::grpc_server_builder()
-        .layer(pplx_space_common_svc::grpc_trace_layer())
+    let (_, health_service) = pplx_space_grpc_server::grpc_health_service();
+    pplx_space_grpc_server::grpc_server_builder()
+        .layer(pplx_space_grpc_server::grpc_trace_layer())
         .layer(
-            pplx_space_common_svc::conservative_uds_grpc_rate_limiter_layer(
+            pplx_space_grpc_rate_limiter::conservative_uds_grpc_rate_limiter_layer(
                 "space-credential-manager",
             ),
         )
@@ -1400,7 +1400,7 @@ async fn start_agent<U: AgentUpstream>(
     let health_shutdown = shutdown_token.child_token();
     let health_server = LocalHealthServer::spawn_optional_waiting(
         config.health_socket_path.as_deref(),
-        pplx_space_common_svc::UnixSocketOptions::new(0o660),
+        pplx_space_unix_socket_bind::UnixSocketOptions::new(0o660),
         SERVICE_NAME,
         health_shutdown.clone(),
     )
@@ -1543,7 +1543,7 @@ async fn serve_tcp_until(
         }
     };
 
-    let mut builder = pplx_space_common_svc::grpc_server_builder();
+    let mut builder = pplx_space_grpc_server::grpc_server_builder();
     match &security {
         TcpSecurity::ServerTls { cert, key } => {
             let identity =
@@ -1565,23 +1565,27 @@ async fn serve_tcp_until(
     // The auth layer authenticates every non-health request and injects the
     // resolved caller identity; the health service stays exempt inside the
     // layer so Kubernetes gRPC probes work without a credential.
-    let (_, health_service) = pplx_space_common_svc::grpc_health_service();
+    let (_, health_service) = pplx_space_grpc_server::grpc_health_service();
     builder
-        .layer(pplx_space_common_svc::grpc_rate_limiter_layer(
-            pplx_space_common_svc::GrpcRateLimiterConfig::enforce("space-credential-manager-tcp")
-                .with_default_limits(
-                    pplx_space_common_svc::GrpcRateLimiterLimits::conservative_worker_default(),
-                )
-                .with_method_limits(
-                    intermediate_ca::ISSUE_INTERMEDIATE_METHOD_PATH,
-                    intermediate_ca::issue_rate_limits(),
-                )
-                // TCP peers carry no Linux peer identity; rate-limit them
-                // as one shared bucket instead of rejecting outright.
-                .with_unknown_peer_policy(pplx_space_common_svc::UnknownPeerPolicy::SharedBucket),
+        .layer(pplx_space_grpc_rate_limiter::grpc_rate_limiter_layer(
+            pplx_space_grpc_rate_limiter::GrpcRateLimiterConfig::enforce(
+                "space-credential-manager-tcp",
+            )
+            .with_default_limits(
+                pplx_space_grpc_rate_limiter::GrpcRateLimiterLimits::conservative_worker_default(),
+            )
+            .with_method_limits(
+                intermediate_ca::ISSUE_INTERMEDIATE_METHOD_PATH,
+                intermediate_ca::issue_rate_limits(),
+            )
+            // TCP peers carry no Linux peer identity; rate-limit them
+            // as one shared bucket instead of rejecting outright.
+            .with_unknown_peer_policy(
+                pplx_space_grpc_rate_limiter::UnknownPeerPolicy::SharedBucket,
+            ),
         ))
         .layer(auth_layer)
-        .layer(pplx_space_common_svc::grpc_trace_layer())
+        .layer(pplx_space_grpc_server::grpc_trace_layer())
         .add_service(health_service)
         .add_service(CredentialManagerServer::new(service))
         .serve_with_shutdown(addr, async move { shutdown_token.cancelled().await })

@@ -35,9 +35,8 @@ use tonic_health::pb::health_client::HealthClient;
 use tonic_health::pb::health_server::{Health, HealthServer};
 use tonic_health::pb::{HealthCheckRequest, HealthCheckResponse};
 
-use crate::bootstrap::{
-    UnixSocketOptions, bind_unix_socket, grpc_server_builder, grpc_trace_layer,
-};
+use pplx_space_grpc_server::{grpc_server_builder, grpc_trace_layer};
+use pplx_space_unix_socket_bind::{BindUnixSocketError, UnixSocketOptions, bind_unix_socket};
 
 const ACTIVE_PROBE_TIMEOUT: Duration = Duration::from_millis(800);
 const LIVENESS_SERVICE: &str = "liveness";
@@ -100,7 +99,7 @@ impl LocalHealthActivator {
 /// Builds an instance-local health server and its lifecycle activator.
 ///
 /// `service_name` is the daemon's canonical identifier (e.g. the value passed
-/// to [`crate::init_service`]). It flows into log lines and into the gRPC
+/// to `pplx_space_service_host::init_service`). It flows into log lines and into the gRPC
 /// client that probes the production socket so attribution stays correct
 /// when several daemons share the binary.
 pub fn local_health_pair(service_name: &'static str) -> (LocalHealth, LocalHealthActivator) {
@@ -171,7 +170,7 @@ impl LocalHealthServer {
         socket_options: UnixSocketOptions,
         service_name: &'static str,
         shutdown_token: CancellationToken,
-    ) -> Result<Self, crate::bootstrap::BindUnixSocketError> {
+    ) -> Result<Self, BindUnixSocketError> {
         Self::spawn_with_liveness(
             socket_path,
             socket_options,
@@ -188,7 +187,7 @@ impl LocalHealthServer {
         service_name: &'static str,
         liveness: LocalHealthLiveness,
         shutdown_token: CancellationToken,
-    ) -> Result<Self, crate::bootstrap::BindUnixSocketError> {
+    ) -> Result<Self, BindUnixSocketError> {
         Self::spawn_with_readiness(
             socket_path,
             socket_options,
@@ -206,7 +205,7 @@ impl LocalHealthServer {
         liveness: LocalHealthLiveness,
         readiness: InitialReadiness,
         shutdown_token: CancellationToken,
-    ) -> Result<Self, crate::bootstrap::BindUnixSocketError> {
+    ) -> Result<Self, BindUnixSocketError> {
         let listener = bind_unix_socket(socket_path, socket_options)?;
         let (local_health, activator) =
             local_health_pair_with_readiness(service_name, liveness, readiness);
@@ -235,7 +234,7 @@ impl LocalHealthServer {
         socket_options: UnixSocketOptions,
         service_name: &'static str,
         shutdown_token: CancellationToken,
-    ) -> Result<Self, crate::bootstrap::BindUnixSocketError> {
+    ) -> Result<Self, BindUnixSocketError> {
         Self::spawn_optional_with_liveness(
             socket_path,
             socket_options,
@@ -252,7 +251,7 @@ impl LocalHealthServer {
         service_name: &'static str,
         liveness: LocalHealthLiveness,
         shutdown_token: CancellationToken,
-    ) -> Result<Self, crate::bootstrap::BindUnixSocketError> {
+    ) -> Result<Self, BindUnixSocketError> {
         match socket_path {
             Some(path) => Self::spawn_with_liveness(
                 path,
@@ -273,7 +272,7 @@ impl LocalHealthServer {
         socket_options: UnixSocketOptions,
         service_name: &'static str,
         shutdown_token: CancellationToken,
-    ) -> Result<Self, crate::bootstrap::BindUnixSocketError> {
+    ) -> Result<Self, BindUnixSocketError> {
         match socket_path {
             Some(path) => Self::spawn_with_readiness(
                 path,

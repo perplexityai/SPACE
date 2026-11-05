@@ -36,8 +36,8 @@ use tokio::sync::oneshot;
 async fn set_network_policy_rejects_local_authority_from_forwarded_service_peer() {
     use crate::service::tests::service_tests::insert_test_sandbox;
     use pplx_space_common_core::host::linux::identities::users;
-    use pplx_space_common_svc::PeerIdentity;
     use pplx_space_sbx_mgr_client::proto::SetNetworkPolicyRequest;
+    use pplx_space_uds_peer_auth::PeerIdentity;
 
     let conn = crate::db::test_conn();
     let sandbox_id = SandboxId::new().to_string();
@@ -107,8 +107,8 @@ async fn set_network_policy_rejects_local_authority_from_forwarded_service_peer(
 async fn set_auto_lifecycle_policy_rejects_local_authority_from_forwarded_service_peer() {
     use crate::service::tests::service_tests::insert_test_sandbox;
     use pplx_space_common_core::host::linux::identities::users;
-    use pplx_space_common_svc::PeerIdentity;
     use pplx_space_sbx_mgr_client::proto::SetAutoLifecyclePolicyRequest;
+    use pplx_space_uds_peer_auth::PeerIdentity;
 
     let conn = crate::db::test_conn();
     let sandbox_id = SandboxId::new().to_string();
@@ -266,7 +266,7 @@ async fn staging_guard_preserves_files_without_confirmed_remote_cleanup() {
                         .timeout(std::time::Duration::from_secs(1)),
                 );
                 let mut client = pplx_space_node_mgr_client::NodeManagerGrpcClient::new(
-                    pplx_space_common_svc::bootstrap::wrap_grpc_client_channel(channel),
+                    pplx_space_common_grpc::trace_grpc_client_transport(channel),
                 );
                 guard.cleanup(&mut client).await;
             }
@@ -2212,7 +2212,7 @@ async fn confirmed_node_pause_reports_paused_and_carries_the_execution_fence() {
         .await
         .unwrap();
     let mut client = pplx_space_node_mgr_client::NodeManagerGrpcClient::new(
-        pplx_space_common_svc::bootstrap::wrap_grpc_client_channel(channel),
+        pplx_space_common_grpc::trace_grpc_client_transport(channel),
     );
     let fence = ExecutionFence {
         execution_id: uuid::Uuid::now_v7().to_string(),

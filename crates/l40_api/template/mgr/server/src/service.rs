@@ -17,15 +17,15 @@ use pplx_space_common_core::types::{
     TEMPLATE_ROOTFS_FILE, TEMPLATE_ROOTFS_ZSTD_CODEC, TEMPLATE_ROOTFS_ZSTD_FILE,
     TEMPLATE_ROOTFS_ZSTD_LEVEL,
 };
-use pplx_space_common_svc::{
-    AuthorizedUdsPeer, LocalRole, PeerIdentity, UdsPeerAccount, UdsPeerAuthorizer, UdsPeerPrincipal,
-};
 use pplx_space_feature_flags::FeatureFlagClient;
 use pplx_space_net_common::{
     NetworkPolicyV1,
     proto::{NetworkPolicyApplyDecision, NetworkPolicyV1 as NetworkPolicyProto},
 };
 use pplx_space_sbx_mgr_client::proto as sbx_proto;
+use pplx_space_uds_peer_auth::{
+    AuthorizedUdsPeer, LocalRole, PeerIdentity, UdsPeerAccount, UdsPeerAuthorizer, UdsPeerPrincipal,
+};
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 use tonic::{Request, Response, Status};

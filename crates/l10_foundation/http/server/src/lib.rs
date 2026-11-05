@@ -9,10 +9,6 @@
 //! The parent trace context and the `traceparent` response header need
 //! `pplx-space-observability`'s `otel` feature, which this crate does not
 //! forward: services enable it through their own features.
-//!
-//! It is its own crate so that an HTTP server can be traced and served
-//! without depending on `pplx-space-common-svc`, which re-exports these items
-//! at their old paths (`bootstrap::…`, the crate root and `http_listener`).
 
 pub mod http_listener;
 mod http_trace;

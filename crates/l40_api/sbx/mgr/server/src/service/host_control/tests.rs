@@ -200,7 +200,7 @@ async fn with_agent_gate<F, Fut>(
     service.shutdown_token = CancellationToken::new();
     let host_socket = directory.path().join("host-control.sock");
     let host_listener = tokio::net::UnixListener::bind(&host_socket).unwrap();
-    let host_server = pplx_space_common_svc::grpc_server_builder()
+    let host_server = pplx_space_grpc_server::grpc_server_builder()
         .add_service(HostControlServer::new(service.clone()))
         .serve_with_incoming(UnixListenerStream::new(host_listener));
     let exercise = async {

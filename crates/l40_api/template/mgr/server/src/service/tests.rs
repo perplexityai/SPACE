@@ -442,7 +442,7 @@ async fn update_template_settings_accepts_tls_interception_on_after_activation()
 
 #[tokio::test]
 async fn update_template_settings_rejects_local_network_policy_from_node_api() {
-    use pplx_space_common_svc::PeerIdentity;
+    use pplx_space_uds_peer_auth::PeerIdentity;
 
     let service = TemplateManagerService::new(crate::db::test_conn()).unwrap();
     let local_update = || UpdateTemplateSettingsRequest {
@@ -486,7 +486,7 @@ async fn update_template_settings_rejects_local_network_policy_from_node_api() {
 
 #[tokio::test]
 async fn update_template_settings_rejects_local_auto_lifecycle_from_node_api() {
-    use pplx_space_common_svc::PeerIdentity;
+    use pplx_space_uds_peer_auth::PeerIdentity;
 
     let service = TemplateManagerService::new(crate::db::test_conn()).unwrap();
     let local_update = || UpdateTemplateSettingsRequest {

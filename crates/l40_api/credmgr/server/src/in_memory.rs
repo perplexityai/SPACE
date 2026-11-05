@@ -22,7 +22,9 @@ use std::sync::RwLock;
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Nonce};
 use async_trait::async_trait;
-use pplx_space_common_svc::core::types::{KekProvider, MasterKeyIdentifier, OrgId, SandboxId};
+use pplx_space_common_core::{
+    types::KekProvider, types::MasterKeyIdentifier, types::OrgId, types::SandboxId,
+};
 
 use crate::key_wrapper::{DekKeySpec, GenerateDekOutput, KeyWrapper, UnwrapError, WrapError};
 

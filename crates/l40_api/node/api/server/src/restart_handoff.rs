@@ -14,7 +14,7 @@ use std::future::Future;
 use std::time::Duration;
 
 use pplx_space_common_grpc::{GrpcRetryContext, GrpcRetryPolicy};
-use pplx_space_common_svc::DEFAULT_DRAIN_TIMEOUT;
+use pplx_space_service_lifecycle::DEFAULT_DRAIN_TIMEOUT;
 use tonic::metadata::MetadataMap;
 use tonic::{Request, Response, Status};
 

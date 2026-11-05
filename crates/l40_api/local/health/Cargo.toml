@@ -1,0 +1,29 @@
+[package]
+name = "pplx-space-local-health"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["net", "rt", "sync", "time"] }
+tokio-stream = { workspace = true, features = ["net"] }
+tokio-util = { workspace = true }
+tonic = { workspace = true }
+tonic-health = { workspace = true }
+tracing = { workspace = true }
+
+# internal
+pplx-space-common-grpc = { workspace = true }
+pplx-space-grpc-server = { workspace = true }
+pplx-space-unix-socket-bind = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["macros"] }

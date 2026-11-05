@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use pplx_space_common_svc::bootstrap::wrap_grpc_client_channel;
+use pplx_space_common_grpc::trace_grpc_client_transport as wrap_grpc_client_channel;
 use pplx_space_rpc_auth::template_lookup::TemplateLookupScope;
 use tokio_stream::StreamExt;
 use tonic::Status;
@@ -116,7 +116,7 @@ async fn connect_remote(
             // SPACE_INTERNAL_TOKEN). Read it only after registered-source admission;
             // the transfer stream authenticates its headers once when opened.
             let token = crate::auth::required_space_bearer_token(
-                pplx_space_common_svc::bearer_token::SpaceBearerToken::NodeApi,
+                pplx_space_bearer_token::SpaceBearerToken::NodeApi,
             )?;
             let endpoint = pplx_space_common_grpc::internal_transport::client_connect_endpoint(
                 pplx_space_common_grpc::internal_transport::Service::NodeApi,

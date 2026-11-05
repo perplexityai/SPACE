@@ -27,7 +27,7 @@ tool changes an image, change its line there too.
 
 Rust CI checks are owned by `ci/scripts/run-rust-checks.sh` and its
 pipeline steps: formatting/error policy, workspace lint and compilation with
-all targets/features, and the common-svc feature-isolation check. The checks
+all targets/features, and the observability feature-isolation check. The checks
 that run beside nextest live in `ci/scripts/lib/rust-side-checks.sh`, which the
 Rust caches' keys do not hash.
 
@@ -37,9 +37,8 @@ workspace libraries one at a time, so a crate that uses a dependency feature
 it gets only through workspace feature unification fails. Its selection and
 lints live in `ci/scripts/lib/rust-isolated-crates.sh`, which the cache keys do
 not hash either. From `cargo metadata` it selects every library, other than
-`pplx-space-common-core` and `pplx-space-common-svc`, that reaches common-core
-at most directly: no other workspace member in its normal dependency graph may
-reach either of the two. Declared dependencies, optional ones included, decide
+`pplx-space-common-core`, that reaches common-core at most directly: no other
+workspace member in its normal dependency graph may reach it. Declared dependencies, optional ones included, decide
 first; a library they leave out is decided again from the graph `cargo tree`
 resolves for it with all of its features, so an optional dependency nothing
 enables does not count. Crates that reach common-core through another crate,

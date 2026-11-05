@@ -17,12 +17,12 @@ path = "src/main.rs"
 [features]
 default = []
 otel = [
-    "pplx-space-common-svc/otel",
+    "pplx-space-service-host/otel",
     "pplx-space-volmgr/otel",
 ]
 datadog = [
     "otel",
-    "pplx-space-common-svc/datadog",
+    "pplx-space-service-host/datadog",
     "pplx-space-volmgr/datadog",
 ]
 # Deprecated for one release; use otel and datadog.
@@ -36,8 +36,10 @@ tonic = { workspace = true }
 
 # internal
 pplx-space-common-core = { workspace = true }
-pplx-space-common-svc = { workspace = true }
 pplx-space-credmgr-client = { workspace = true }
+pplx-space-service-host = { workspace = true }
+pplx-space-service-lifecycle = { workspace = true }
+pplx-space-tokio-runtime = { workspace = true }
 pplx-space-volmgr = { workspace = true }
 
 [dev-dependencies]

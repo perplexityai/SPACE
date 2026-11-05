@@ -15,7 +15,7 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use futures_util::{Stream, StreamExt, stream};
 use http_body_util::BodyExt;
 use pplx_space_common_core::types::{GuestUserName, SandboxId, validate_linux_guest_path_input};
-use pplx_space_common_svc::bootstrap::wrap_grpc_client_channel;
+use pplx_space_common_grpc::trace_grpc_client_transport as wrap_grpc_client_channel;
 use pplx_space_node_api_client::{
     NodeApiOperationBudget, proto::worker_api_client::WorkerApiClient,
 };

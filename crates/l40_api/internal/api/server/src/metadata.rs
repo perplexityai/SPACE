@@ -224,9 +224,7 @@ pub(super) fn claimed_origin_traceparents(rows: &[ClaimedFacetRefRow]) -> Vec<St
     picked
         .into_iter()
         .filter_map(|row| row.traceparent.as_deref())
-        .filter(|traceparent| {
-            pplx_space_common_svc::observability::is_storable_traceparent(traceparent)
-        })
+        .filter(|traceparent| pplx_space_observability::is_storable_traceparent(traceparent))
         .filter(|traceparent| seen.insert(*traceparent))
         .map(str::to_string)
         .collect()

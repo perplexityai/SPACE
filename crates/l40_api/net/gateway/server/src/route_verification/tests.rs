@@ -2,7 +2,7 @@ use aws_lc_rs::rand::SystemRandom;
 use aws_lc_rs::signature::Ed25519KeyPair;
 
 use super::*;
-use pplx_space_common_svc::space_api_route_ed25519::SpaceApiRouteEd25519Signer;
+use pplx_space_api_route::ed25519::SpaceApiRouteEd25519Signer;
 
 fn key(key_id: &str) -> SpaceApiRouteEd25519VerificationKey {
     let pkcs8 = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).unwrap();

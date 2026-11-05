@@ -58,20 +58,32 @@ tracing = { workspace = true }
 uuid = { workspace = true, features = ["v5", "v7"] }
 
 # internal
+pplx-space-api-route = { workspace = true }
+pplx-space-auto-lifecycle-receipt = { workspace = true }
 pplx-space-common-core = { workspace = true, features = ["serde"] }
 pplx-space-common-grpc = { workspace = true }
 pplx-space-common-io = { workspace = true }
 pplx-space-common-jobs = { workspace = true }
 pplx-space-common-lru-reaper = { workspace = true }
-pplx-space-common-svc = { workspace = true }
 pplx-space-sandbox-grpc = { workspace = true }
 pplx-space-credential-injection-core = { workspace = true }
 pplx-space-credmgr-client = { workspace = true }
+pplx-space-dependency-drain = { workspace = true }
 pplx-space-events = { workspace = true }
 pplx-space-execution-common = { workspace = true }
 pplx-space-execution-catalog = { workspace = true }
 pplx-space-feature-flags = { workspace = true }
+pplx-space-grpc-rate-limiter = { workspace = true }
+pplx-space-grpc-server = { workspace = true }
+pplx-space-ingress-admission = { workspace = true }
+pplx-space-k8s-node-id = { workspace = true }
+pplx-space-local-health = { workspace = true }
 pplx-space-rpc-auth = { workspace = true }
+pplx-space-service-lifecycle = { workspace = true }
+pplx-space-service-mutex = { workspace = true }
+pplx-space-state-reconciliation = { workspace = true }
+pplx-space-uds-peer-auth = { workspace = true }
+pplx-space-unix-socket-bind = { workspace = true }
 pplx-space-volmgr-client = { workspace = true }
 pplx-space-net-common = { workspace = true, features = ["serde"] }
 pplx-space-net-gateway-client = { workspace = true }
@@ -88,6 +100,7 @@ pplx-space-template-mgr-client = { workspace = true }
 
 [dev-dependencies]
 rstest = { workspace = true }
+pplx-space-bearer-token = { workspace = true }
 pplx-space-common-core = { workspace = true, features = ["serde", "test-hooks"] }
 pplx-space-sbx-mgr-store = { workspace = true, features = ["test-support"] }
 pplx-space-common-jobs = { workspace = true, features = ["test-support"] }

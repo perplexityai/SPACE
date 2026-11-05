@@ -56,7 +56,7 @@ impl GatewayNode {
         );
         service.gateway_caller_client =
             pplx_space_node_mgr_client::proto::node_manager_client::NodeManagerClient::new(
-                pplx_space_common_svc::bootstrap::wrap_grpc_client_channel(channel),
+                pplx_space_common_grpc::trace_grpc_client_transport(channel),
             );
         Self {
             _directory: directory,

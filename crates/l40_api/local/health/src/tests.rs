@@ -161,7 +161,7 @@ async fn spawned_server_lifecycle_over_socket() {
         }
 
         let listener = bind_unix_socket(&production_path, UnixSocketOptions::new(0o600)).unwrap();
-        let (reporter, health) = crate::bootstrap::grpc_health_service();
+        let (reporter, health) = pplx_space_grpc_server::grpc_health_service();
         reporter
             .set_service_status("", tonic_health::ServingStatus::Serving)
             .await;

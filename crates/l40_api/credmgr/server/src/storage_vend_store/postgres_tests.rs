@@ -1,6 +1,6 @@
 use pplx_space_common_core::types::{NodeId, SnapshotId};
 
-use pplx_space_common_svc::core::types::{OrgId, SandboxId, TemplateName};
+use pplx_space_common_core::{types::OrgId, types::SandboxId, types::TemplateName};
 use pplx_space_db_test_fixtures::{
     SEED_ORG_ID, SEED_USER_ID, TestDbResult, insert_ready_worker_node, pg_test_db,
 };

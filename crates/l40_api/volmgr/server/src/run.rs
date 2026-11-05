@@ -11,12 +11,14 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use pplx_space_common_core::host::linux::identities::group_names;
-use pplx_space_common_svc::bootstrap::BindUnixSocketError;
-use pplx_space_common_svc::{
-    AcquireOutcome, LocalHealthLiveness, LocalHealthServer, SERVICE_MUTEX_POLL_INTERVAL,
-    ServiceMutex, ServiceMutexAcquireError, UnixSocketOptions,
+use pplx_space_local_health::{LocalHealthLiveness, LocalHealthServer};
+use pplx_space_service_mutex::{
+    AcquireError as ServiceMutexAcquireError, AcquireOutcome, SERVICE_MUTEX_POLL_INTERVAL,
+    ServiceMutex,
 };
 use pplx_space_sqlite::SqliteError;
+use pplx_space_unix_socket_bind::BindUnixSocketError;
+use pplx_space_unix_socket_bind::UnixSocketOptions;
 use tokio_stream::wrappers::UnixListenerStream;
 use tokio_util::sync::CancellationToken;
 
@@ -552,10 +554,11 @@ pub async fn run(
             .run_queue_metrics(queue_metrics_token.clone()),
     );
 
-    let listener = pplx_space_common_svc::bind_unix_socket(
+    let listener = pplx_space_unix_socket_bind::bind_unix_socket(
         &config.socket_path,
-        pplx_space_common_svc::UnixSocketOptions::new(0o770)
-            .with_group(pplx_space_common_svc::SocketGroup::Required(SOCKET_GROUP)),
+        pplx_space_unix_socket_bind::UnixSocketOptions::new(0o770).with_group(
+            pplx_space_unix_socket_bind::SocketGroup::Required(SOCKET_GROUP),
+        ),
     )
     .map_err(|source| RunVolmgrError::BindProductionSocket {
         path: config.socket_path.clone(),
@@ -588,13 +591,13 @@ pub async fn run(
     // transfer admission and drains durable work while the production UDS
     // remains available for polling/status RPCs. Only then is tonic stopped.
     let production_shutdown_token = CancellationToken::new();
-    let (_, health_service) = pplx_space_common_svc::grpc_health_service();
+    let (_, health_service) = pplx_space_grpc_server::grpc_health_service();
     let mut server_handle = tokio::spawn(
-        pplx_space_common_svc::grpc_server_builder_with_request_timeout(
+        pplx_space_grpc_server::grpc_server_builder_with_request_timeout(
             VOLMGR_GRPC_REQUEST_TIMEOUT,
         )
-        .layer(pplx_space_common_svc::conservative_uds_grpc_rate_limiter_layer(SERVICE_NAME))
-        .layer(pplx_space_common_svc::grpc_trace_layer())
+        .layer(pplx_space_grpc_rate_limiter::conservative_uds_grpc_rate_limiter_layer(SERVICE_NAME))
+        .layer(pplx_space_grpc_server::grpc_trace_layer())
         .add_service(health_service)
         .add_service(VolumeManagerServer::new(service))
         .serve_with_incoming_shutdown(UnixListenerStream::new(listener), {

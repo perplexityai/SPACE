@@ -1,4 +1,4 @@
-use pplx_space_common_svc::space_api_route_ed25519::SPACE_API_ROUTE_ED25519_VERIFICATION_BUNDLE_PATH_ENV;
+use pplx_space_api_route::ed25519::SPACE_API_ROUTE_ED25519_VERIFICATION_BUNDLE_PATH_ENV;
 
 #[test]
 fn net_gateway_route_env_forwards_verification_bundle_path() {

@@ -24,14 +24,14 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::Instant;
 
-use pplx_space_common_svc::core::host::linux::identities::{user_names, users};
-use pplx_space_common_svc::{
-    PeerProcessCheckMode, UdsPeerAccount, UdsPeerAuthorizer, UdsPeerPrincipal,
-};
+use pplx_space_common_core::{host::linux::identities::user_names, host::linux::identities::users};
 use pplx_space_credmgr_client::proto::credential_manager_server::CredentialManager;
 use pplx_space_credmgr_client::proto::*;
 use pplx_space_credmgr_client::{
     CredentialManagerGrpcClient, CredmgrEndpoint, SERVICE_ACTOR_TOKEN_TYPE,
+};
+use pplx_space_uds_peer_auth::{
+    PeerProcessCheckMode, UdsPeerAccount, UdsPeerAuthorizer, UdsPeerPrincipal,
 };
 use tokio_util::sync::CancellationToken;
 use tonic::{Code, Request, Response, Status};

@@ -7,9 +7,9 @@
 use super::*;
 use crate::node_manager_transport::fake::{FakeNodeManager, ServedNodeManager};
 use crate::template_resolver::fake::FakeTemplateResolver;
-use pplx_space_common_svc::PeerIdentity;
 use pplx_space_node_mgr_client::proto::{NetworkPoolStatusRequest, NetworkPoolStatusResponse};
 use pplx_space_template_mgr_client::proto::{GetTemplateRequest, GetTemplateResponse, TemplateRef};
+use pplx_space_uds_peer_auth::PeerIdentity;
 use std::collections::HashMap;
 
 pub(super) const TEMPLATE: &str = "seed";

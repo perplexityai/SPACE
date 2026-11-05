@@ -1,6 +1,6 @@
 //! Credential Authority's reader delegates its atomic snapshot to the owning store.
 use async_trait::async_trait;
-use pplx_space_common_svc::core::types::SandboxId;
+use pplx_space_common_core::types::SandboxId;
 pub(super) use pplx_space_credential_injection_store::resolution::{
     NetworkPolicyResolutionCandidate, ResolutionState, ResolutionStateError,
 };

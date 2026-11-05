@@ -1,18 +1,20 @@
 use super::{SandboxManagerService, SandboxManagerServiceOptions, SandboxState, SpacedRpc};
 use aws_lc_rs::rand::SystemRandom;
 use aws_lc_rs::signature::Ed25519KeyPair;
-use pplx_space_common_core::types::{
-    ClusterId, ExecutionGeneration, NodeId, NodeManagedBy, PodUid, RouteGeneration,
-    SandboxActivationAttemptId, SandboxId, SandboxRouteIdentity, SpaceApiRouteIdentity,
-};
-use pplx_space_common_svc::space_api_route::{
+use pplx_space_api_route::{
     RouteIdentityRemediation, SpaceApiRouteIdentityDimension, route_identity_dimension_from_status,
     route_identity_remediation_from_status,
 };
-use pplx_space_common_svc::space_api_route_ed25519::{
-    SpaceApiRouteEd25519Claims, SpaceApiRouteEd25519Issuer, SpaceApiRouteEd25519KeyId,
-    SpaceApiRouteEd25519Signer, SpaceApiRouteEd25519VerificationBundle,
-    SpaceApiRouteEd25519VerificationGeneration, insert_space_api_route_ed25519_token,
+use pplx_space_api_route::{
+    ed25519::SpaceApiRouteEd25519Claims, ed25519::SpaceApiRouteEd25519Issuer,
+    ed25519::SpaceApiRouteEd25519KeyId, ed25519::SpaceApiRouteEd25519Signer,
+    ed25519::SpaceApiRouteEd25519VerificationBundle,
+    ed25519::SpaceApiRouteEd25519VerificationGeneration,
+    ed25519::insert_space_api_route_ed25519_token,
+};
+use pplx_space_common_core::types::{
+    ClusterId, ExecutionGeneration, NodeId, NodeManagedBy, PodUid, RouteGeneration,
+    SandboxActivationAttemptId, SandboxId, SandboxRouteIdentity, SpaceApiRouteIdentity,
 };
 
 use std::sync::Arc;

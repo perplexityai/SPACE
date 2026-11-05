@@ -13,7 +13,7 @@ use std::io::{self, Read, Write};
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
-use pplx_space_common_svc::{LocalRole, UdsPeerPrincipal};
+use pplx_space_uds_peer_auth::{LocalRole, UdsPeerPrincipal};
 use tonic::{Request, Response, Status};
 use uuid::Uuid;
 

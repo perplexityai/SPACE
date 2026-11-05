@@ -99,11 +99,9 @@ pub enum RunInternalApiError {
     #[error(transparent)]
     InternalTransport(#[from] pplx_space_common_grpc::internal_transport::TransportError),
     #[error("invalid or missing SPACE API route signing configuration")]
-    RouteSigningConfig(
-        #[source] pplx_space_common_svc::space_api_route_ed25519::SpaceApiRouteEd25519Error,
-    ),
+    RouteSigningConfig(#[source] pplx_space_api_route::ed25519::SpaceApiRouteEd25519Error),
     #[error("invalid ECW credential signing configuration")]
-    EcwCredentialConfig(#[source] pplx_space_common_svc::ecw_credential::EcwCredentialError),
+    EcwCredentialConfig(#[source] pplx_space_ecw_credential::EcwCredentialError),
     #[error(transparent)]
     NodeId(#[from] NodeIdError),
     /// The static `SPACE_INTERNAL_TOKEN` boot precondition was not met. The
@@ -273,11 +271,11 @@ pub async fn run(
     shutdown_token: CancellationToken,
 ) -> Result<(), RunInternalApiError> {
     let route_ed25519_authority = Some(std::sync::Arc::new(
-        pplx_space_common_svc::space_api_route_ed25519::SpaceApiRouteEd25519Authority::load_required_from_env()
+        pplx_space_api_route::ed25519::SpaceApiRouteEd25519Authority::load_required_from_env()
             .map_err(RunInternalApiError::RouteSigningConfig)?,
     ));
     let ecw_credential_keyring = std::sync::Arc::new(
-        pplx_space_common_svc::ecw_credential::EcwCredentialKeyring::load_required_from_env()
+        pplx_space_ecw_credential::EcwCredentialKeyring::load_required_from_env()
             .map_err(RunInternalApiError::EcwCredentialConfig)?,
     );
 
@@ -338,7 +336,7 @@ pub async fn run(
             pplx_space_node_api_client::proto::CLUSTER_FILE_DESCRIPTOR_SET,
         )
         .build_v1()?;
-    let (_, health_service) = pplx_space_common_svc::grpc_health_service();
+    let (_, health_service) = pplx_space_grpc_server::grpc_health_service();
 
     let activation = std::sync::Arc::new(
         pplx_space_node_api_client::activation::RemoteIngressActivation::from_env()
@@ -387,7 +385,7 @@ pub async fn run(
         .http2_keepalive_timeout(Some(std::time::Duration::from_mins(1)))
         // Trace first (outermost) so denied requests still produce server
         // spans; auth runs after tracing but before any routed service.
-        .layer(pplx_space_common_svc::grpc_trace_layer())
+        .layer(pplx_space_grpc_server::grpc_trace_layer())
         .layer(auth_layer)
         .layer(publisher_auth)
         .add_service(health_service)

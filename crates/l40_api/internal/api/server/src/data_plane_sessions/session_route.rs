@@ -66,7 +66,7 @@ pub(crate) async fn resolve_session_route(
         ) {
             validate_ingress_session(&row)?;
             Some(
-                pplx_space_common_svc::ingress_admission::IngressPreparationPermit::acquire(Some(
+                pplx_space_ingress_admission::IngressPreparationPermit::acquire(Some(
                     row.sandbox_id,
                 ))?,
             )

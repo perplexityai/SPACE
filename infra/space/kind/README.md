@@ -1822,7 +1822,7 @@ instance-local health socket (`--health-socket=/run/health/<service>.sock` on a
 pod-private emptyDir) are probed on it: liveness answers once the socket is bound,
 readiness is SERVING while a successor waits passively for the service mutex and
 follows the production socket once active
-(`crates/libs/common/svc/src/local_health.rs`). runtime-manager is probed on its
+(`crates/l40_api/local/health/src/lib.rs`). runtime-manager is probed on its
 service socket and build-manager on its gRPC health service.
 
 **Rollouts and termination.** Services that hold a node-wide service mutex

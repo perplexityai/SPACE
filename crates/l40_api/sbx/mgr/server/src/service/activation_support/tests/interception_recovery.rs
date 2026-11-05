@@ -267,7 +267,7 @@ async fn exercise_recovery(restore: bool) {
                 async move {
                     // Stand in for the authenticated manager on this local control call.
                     let mut request = Request::new(message);
-                    request.extensions_mut().insert(pplx_space_common_svc::PeerIdentity::new(0, 0, Some(std::process::id().try_into().unwrap())));
+                    request.extensions_mut().insert(pplx_space_uds_peer_auth::PeerIdentity::new(0, 0, Some(std::process::id().try_into().unwrap())));
                     control.refresh_network_policy(request).await.map(Response::into_inner)
                         .map_err(super::super::super::network_runtime::NetworkPolicyRefreshAttemptError::Rpc)
                 }

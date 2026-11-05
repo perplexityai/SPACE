@@ -1044,7 +1044,7 @@ impl WorkerApi for SimWorkerApiService {
     ) -> Result<Response<sbx::SpacedWaitReadyResponse>, Status> {
         let route_token = request
             .metadata()
-            .get(pplx_space_common_svc::space_api_route::SPACE_API_ROUTE_ED25519_TOKEN_METADATA_KEY)
+            .get(pplx_space_api_route::SPACE_API_ROUTE_ED25519_TOKEN_METADATA_KEY)
             .and_then(|value| value.to_str().ok())
             .map(ToOwned::to_owned);
         self.state.record_wait_ready_route_token(route_token).await;
@@ -1858,10 +1858,7 @@ fn sim_direct_route_identity(
         route_generation: Some(route_generation),
         current_node_id: if kubernetes_identity {
             requested_identity.current_node_id.or_else(|| {
-                Some(
-                    pplx_space_common_svc::types::k8s::space_k8s_node_id(node_id, "worker")
-                        .to_string(),
-                )
+                Some(pplx_space_k8s_node_id::space_k8s_node_id(node_id, "worker").to_string())
             })
         } else {
             Some(node_id.to_string())

@@ -1,5 +1,5 @@
 use super::*;
-use pplx_space_common_svc::core::host::linux::identities::users;
+use pplx_space_common_core::host::linux::identities::users;
 
 const UNIX_SOCKET_READY_RETRY_DELAYS: [std::time::Duration; 9] = [
     std::time::Duration::from_millis(0),

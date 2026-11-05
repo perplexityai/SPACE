@@ -3,8 +3,8 @@ use std::time::Duration;
 
 use anyhow::Context as _;
 use clap::Parser;
-use pplx_space_common_svc::DEFAULT_SERVICE_MUTEX_TIMEOUT;
 use pplx_space_sbx_mgr::{SERVICE_NAME, SOCKET_PATH, SbxMgrRunConfig};
+use pplx_space_service_lifecycle::DEFAULT_SERVICE_MUTEX_TIMEOUT;
 
 #[derive(Parser)]
 #[command(
@@ -60,13 +60,13 @@ impl From<Cli> for SbxMgrRunConfig {
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    pplx_space_common_svc::tokio_runtime::build_multi_thread_runtime()
+    pplx_space_tokio_runtime::build_multi_thread_runtime()
         .context("failed to configure sandbox-manager Tokio runtime")?
         .block_on(async {
-            let telemetry = pplx_space_common_svc::init_service(SERVICE_NAME)?;
-            let shutdown_token = pplx_space_common_svc::shutdown_token();
+            let telemetry = pplx_space_service_host::init_service(SERVICE_NAME)?;
+            let shutdown_token = pplx_space_service_lifecycle::shutdown::shutdown_token();
             let result = pplx_space_sbx_mgr::run(cli.into(), shutdown_token).await;
-            pplx_space_common_svc::shutdown_telemetry(telemetry).await;
+            pplx_space_service_host::shutdown_telemetry(telemetry).await;
             Ok(result?)
         })
 }

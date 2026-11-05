@@ -1,7 +1,7 @@
 use super::store::PlacementRetryDisposition;
 use super::support::*;
 use super::*;
-use pplx_space_common_svc::space_api_route::wait_ready_lifecycle_request;
+use pplx_space_api_route::wait_ready_lifecycle_request;
 
 #[derive(Clone, Copy)]
 pub(super) enum CommandReadyPod<'a> {
