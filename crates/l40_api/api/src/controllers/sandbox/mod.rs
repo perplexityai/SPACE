@@ -1370,7 +1370,7 @@ pub(crate) mod list_page;
 mod org;
 mod ports;
 mod queries;
-mod requested_metrics;
+mod requested_size_metrics;
 mod responses;
 #[cfg(test)]
 mod sandbox_portability_tests;

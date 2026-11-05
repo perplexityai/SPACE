@@ -2154,9 +2154,9 @@ impl SandboxController {
         }
         .await;
         if let Some(kind) = requested_kind
-            && let Some(admission) = requested_metrics::admission(&result)
+            && let Some(admission) = requested_size_metrics::admission(&result)
         {
-            requested_metrics::record_lifecycle_action(
+            requested_size_metrics::record_lifecycle_action(
                 kind,
                 metric_identity.surface,
                 admission,
