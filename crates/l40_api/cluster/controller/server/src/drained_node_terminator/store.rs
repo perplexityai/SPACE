@@ -1,5 +1,4 @@
 use pplx_space_common_core::types::NodeId;
-use pplx_space_common_core::types::SnapshotId;
 use pplx_space_common_core::types::SubstrateKind;
 
 use pplx_space_common_core::sql;
@@ -7,16 +6,12 @@ use std::time::Duration;
 
 use pplx_space_common_core::types::SandboxId;
 use pplx_space_common_svc::sql::sandbox_residency::{self, ResidencyEvidence};
-use pplx_space_events::{SandboxEventDetails, SandboxEventTrigger};
-use pplx_space_sandbox_portability::{
-    drain_gate_blockers_for_node, snapshot_durable_for_source_release,
+use pplx_space_events::{
+    SandboxEvent, SandboxEventDetails, SandboxEventSource, SandboxEventTrigger, SandboxEventType,
 };
-use pplx_space_sandbox_store::lost;
+use pplx_space_sandbox_portability::drain_gate_blockers_for_node;
+use pplx_space_sandbox_store::gone_node::{self, ExpectedPhase, NodeIdentityGuard, WriteOff};
 use sqlx::PgPool;
-
-use crate::gone_node_write_off::{
-    emit_lost_and_failed, node_identity_holds, write_off_lost_sandboxes,
-};
 
 use super::{
     DRAIN_KEEP_ANNOTATION, DrainKeepAnnotationLookup, DrainKeepStatus, DrainedNodeTerminatorSink,
@@ -119,6 +114,16 @@ pub(crate) fn mark_terminating_query(residency: ResidencyEvidence) -> String {
     )
 }
 
+/// The node identity guard of the reap and its diagnosis: `$1` = node id,
+/// `$2` = the uid observed at the EC2 cross-check, `$3` =
+/// [`SubstrateKind::Kubernetes`].
+const DRAINED_IDENTITY: NodeIdentityGuard<'static> = NodeIdentityGuard {
+    node: "$1",
+    uid: "$2",
+    phase: ExpectedPhase::Is(PHASE_DRAINED),
+    managed_by: Some("$3"),
+};
+
 /// `$1` = node id, `$3` = [`SubstrateKind::Kubernetes`]. Guarded hard-DELETE
 /// for the KubeNodeGone recovery path: reaps a `drained`, Kubernetes-managed
 /// row whose backing EC2 instance the caller has already confirmed
@@ -139,28 +144,21 @@ pub(crate) fn mark_terminating_query(residency: ResidencyEvidence) -> String {
 /// until the sandbox sweepers or an operator clear them.
 ///
 /// `$2` = the `node_k8s.k8s_node_uid` observed when the EC2 cross-check
-/// resolved this node's private DNS. The `IS NOT DISTINCT FROM` identity guard
-/// refuses the reap if the uid changed — a same-name (same `nodes.id`, since
-/// it's `v5(name, role)`) kube Node replacement that registered after the kube
-/// 404 bumps `node_k8s.k8s_node_uid` before the inventory reflector resets
-/// `drain_phase`, and without this guard the fresh node's row could be reaped.
-/// Mirrors `orphaned_nodes`' uid-guarded delete.
+/// resolved this node's private DNS. The identity guard ([`DRAINED_IDENTITY`])
+/// refuses the reap once the uid changed, so a same-name replacement's row is
+/// never reaped. Mirrors `orphaned_nodes`' uid-guarded delete.
 pub(crate) fn delete_drained_node_if_orphan_query(residency: ResidencyEvidence) -> String {
     let snapshot_blockers = snapshot_blockers_for_node();
     let resident_clause = resident_blocking_clause(residency);
+    let node = DRAINED_IDENTITY.node_predicate();
+    let uid_row = DRAINED_IDENTITY.uid_row();
     format!(
         "DELETE FROM nodes
-         WHERE id = $1
-           AND drain_phase = 'drained'
-           AND managed_by = $3
+         WHERE {node}
            -- Identity guard: refuse if a same-name kube Node replacement
            -- bumped node_k8s.k8s_node_uid since the EC2 cross-check observed
            -- it (the row would now belong to the fresh node).
-           AND EXISTS (
-               SELECT 1 FROM node_k8s
-               WHERE node_id = $1
-                 AND k8s_node_uid IS NOT DISTINCT FROM $2
-           )
+           AND EXISTS ({uid_row})
            -- Snapshot guard: same marker-aware predicate as
            -- mark_terminating_query, so a durably-portable suspended sandbox
            -- does not block the reap but a local-only one does.
@@ -189,17 +187,12 @@ pub(crate) fn delete_drained_node_if_orphan_query(residency: ResidencyEvidence) 
 pub(crate) fn delete_refusal_diagnostics_query(residency: ResidencyEvidence) -> String {
     let snapshot_blockers = snapshot_blockers_for_node();
     let resident_predicate = active_resident_predicate(residency);
+    let node_row = DRAINED_IDENTITY.node_row();
+    let uid_row = DRAINED_IDENTITY.uid_row();
     format!(
         "SELECT
-             NOT EXISTS (
-                 SELECT 1 FROM nodes
-                 WHERE id = $1 AND drain_phase = 'drained' AND managed_by = $3
-             ) AS phase_drifted,
-             NOT EXISTS (
-                 SELECT 1 FROM node_k8s
-                 WHERE node_id = $1
-                   AND k8s_node_uid IS NOT DISTINCT FROM $2
-             ) AS uid_mismatch,
+             NOT EXISTS ({node_row}) AS phase_drifted,
+             NOT EXISTS ({uid_row}) AS uid_mismatch,
              (SELECT COUNT(*)::BIGINT
                 FROM ({snapshot_blockers}) node_blockers) AS snapshot_blockers,
              (SELECT COUNT(*)::BIGINT FROM sandboxes
@@ -208,69 +201,13 @@ pub(crate) fn delete_refusal_diagnostics_query(residency: ResidencyEvidence) -> 
 }
 
 /// Quiet period a same-node `creating` snapshot row must have sat without a
-/// worker heartbeat (`COALESCE(last_attempt_at, timestamp)`) before the
-/// mark-lost give-up treats it as provably dead. EC2 `terminated` already
-/// proves the upload *worker* died with the instance — what it cannot bound
-/// is a `FinalizeArtifactBackup(READY)` RPC that left the node before the
-/// instance died and is still queued in the API path with all bytes already
-/// durable in S3. Such an RPC lives for seconds (gRPC deadline), so ten
-/// quiet minutes is overwhelmingly past it: a row still inside the window
-/// defers the flip (the sandbox stays parked and the next ticks re-check);
-/// one quiet for longer can no longer become `ready` and is finalized
-/// `failed` so the reap converges.
+/// worker heartbeat (`COALESCE(last_attempt_at, timestamp)`) before a gone-node
+/// give-up treats it as dead: the `dead_upload_settle` of
+/// [`gone_node::write_off_on_gone_node`]. A `FinalizeArtifactBackup(READY)`
+/// RPC still in the API path lives for seconds (gRPC deadline), so ten quiet
+/// minutes is overwhelmingly past it: a row still inside the window defers
+/// the flip, and the next ticks re-check.
 pub(crate) const DEAD_UPLOAD_SETTLE: Duration = Duration::from_mins(10);
-
-/// `$1` = node id. The give-up candidate claim: the node's pinned `suspended`
-/// rows that have no durable copy, locked in `id` order.
-///
-/// Exposed as a function rather than inlined at the call site so the
-/// lock-footprint and plan tests drive the statement this reconciler actually
-/// runs. Retyped SQL in a test asserts about the test's copy: it keeps passing
-/// after the production statement changes, which is the one failure a
-/// lock-discipline test must not have.
-///
-/// It claims only rows without a durable copy because those are the only rows
-/// [`lost::mark_unrecoverable_sandboxes_lost_query`] can flip: the flip re-checks
-/// `AND NOT {durable}` on the claimed ids. Every pinned `suspended` row with
-/// a durable copy is one the flip can't touch, so locking it buys nothing;
-/// this filter drops those rows from the lock set.
-///
-/// Durability can change between this claim and the flip, in either direction:
-///
-/// * Not durable at the claim and durable by the flip: the row is claimed, and
-///   the flip's own `NOT {durable}` spares it.
-/// * Durable at the claim and not durable by the flip, for example because its
-///   ready copy's storage location was orphaned: the row isn't claimed, so this
-///   tick can't flip it. It still blocks the reap: [`snapshot_blockers_for_node`]
-///   counts a `suspended` row that is `NOT {durable}` by the same predicate,
-///   through `drain_gate_target_pinned_blocks`. So the next
-///   tick's refused delete runs the give-up again and claims it then. That
-///   one-tick miss is accepted; the alternative is locking every durable row
-///   on every tick.
-///
-/// The durability check is wrapped in a scalar subquery, `NOT (SELECT …)`,
-/// for the reason `pinned_local_only_sandboxes_query` gives: a bare `NOT
-/// EXISTS` is pullable, and the planner may realise it as a hash or merge
-/// anti-join over the whole `snapshots` ⋈ `snapshot_storage_locations`
-/// product. Inside a scalar subquery it stays a per-row `SubPlan`, whose
-/// `sn.sandbox_id = s.id` makes each execution an index probe.
-/// `giveup_claim_tests::the_claim_keeps_its_durability_check_fenced` pins that
-/// plan shape.
-///
-/// The statement locks `sandboxes` rows and nothing else: `FOR UPDATE` locks
-/// the rows of its own `FROM` list, and the durability check is a sublink.
-pub(crate) fn gone_node_giveup_claim_query() -> String {
-    let durable = snapshot_durable_for_source_release("s");
-    format!(
-        "SELECT s.id
-           FROM sandboxes s
-          WHERE s.lifecycle = 'suspended'
-            AND s.target_node_id = $1
-            AND NOT (SELECT {durable})
-          ORDER BY s.id
-          FOR UPDATE"
-    )
-}
 
 /// Outcome of looking up the `space.pplx.net/drain-keep` annotation for
 /// a SPACE node id.
@@ -300,6 +237,28 @@ pub enum AnnotationLookupError {
     /// inventory reflector (it will reset `drain_phase` on its next tick).
     #[error("kube Node UID changed under us; deferring to inventory reconcile")]
     StaleIdentity,
+}
+
+/// Emit the `sandbox_lost` and `sandbox_failed` pair for a committed
+/// gone-node give-up. The failed event also names the `operation` that gave
+/// the sandbox up. Shared with `lost_started_sandboxes`.
+pub(crate) fn emit_lost_and_failed(
+    sandbox_id: SandboxId,
+    details: SandboxEventDetails,
+    operation: &str,
+) {
+    SandboxEvent::new(
+        sandbox_id,
+        SandboxEventType::SandboxLost,
+        SandboxEventSource::ClusterController,
+    )
+    .emit_with(details.clone());
+    SandboxEvent::new(
+        sandbox_id,
+        SandboxEventType::SandboxFailed,
+        SandboxEventSource::ClusterController,
+    )
+    .emit_with(details.operation(operation));
 }
 
 // ---------------------------------------------------------------------------
@@ -434,125 +393,16 @@ impl DrainedNodeTerminatorSink for NodeDbStore {
         node_id: NodeId,
         expected_uid: Option<String>,
     ) -> Result<Vec<SandboxId>, sqlx::Error> {
-        // Intentionally does NOT bump `placement_changed_at`, matching
-        // node_drain's mark-lost: that column tracks placement, and bumping
-        // it here could mask freshness checks if a future read path still
-        // consults `failed` rows.
-        //
-        // One transaction: the lifecycle flip plus the stale-bookkeeping
-        // sweep the flip would otherwise orphan. A node-side auto-suspended
-        // candidate (the API-driven `finish_suspended_execution` never ran
-        // for it) still carries an `active = TRUE` execution row, a recorded
-        // pod IP, and `placement = 'on_node'` / `active_node_id` pinned to
-        // the gone node. The suspended-execution reaper that normally
-        // retires those scans `lifecycle = 'suspended'` only, so flipping to
-        // `failed` first would hide the rows from it forever — leaving a
-        // phantom active execution and an `active_node_id` dangling at a
-        // node row the next tick hard-deletes. Retiring here mirrors the
-        // reaper's retire (execution write-off + pod-IP clear + unplace);
-        // `'forgotten'` is the established pod-tracking write-off state (the
-        // pod died with the node — it was never cleanly suspended). The
-        // flip's row locks serialize this against the reaper's
-        // `FOR UPDATE` + lifecycle re-check and against wake's
-        // `suspended -> restoring` CAS, so either order commutes. Port
-        // exposures are deliberately left alone: the sandbox is terminal, so
-        // re-queueing them (the reaper's behavior for recoverable rows)
-        // would only create work that can never apply.
         let mut tx = self.pool.begin().await?;
-        // Lock-and-recheck the identity guards before the terminal flip
-        // (the suspended-execution reaper's `FOR UPDATE` + re-check
-        // pattern). The UPDATE's own `EXISTS` guards evaluate against the
-        // statement snapshot without locking `nodes` / `node_k8s`, so a
-        // concurrent admin undrain or reflector uid bump that commits
-        // mid-transaction would not be observed — the hard-DELETE doesn't
-        // have this hole only because it modifies the `nodes` row itself
-        // and therefore serializes on its row lock. `FOR SHARE` is enough:
-        // the guard rows are read, not written, and the shared lock blocks
-        // the undrain/reflector UPDATE until this transaction commits (or
-        // waits for theirs and then re-reads the latest committed version,
-        // refusing on drift).
-        if !node_identity_holds(
+        let ids = gone_node::write_off_on_gone_node(
             &mut tx,
             node_id,
-            Some(PHASE_DRAINED),
-            expected_uid.as_deref(),
-        )
-        .await?
-        {
-            tx.rollback().await?;
-            return Ok(Vec::new());
-        }
-        // Claim the candidate rows before evaluating the in-flight veto. A
-        // concurrent `BeginArtifactBackup` INSERT holds only a `KEY SHARE`
-        // FK lock on the referenced sandbox row, which does not conflict
-        // with the flip UPDATE's `NO KEY UPDATE` row lock — so without this
-        // claim the veto could evaluate before the insert commits and
-        // terminally fail a sandbox whose durable copy is about to start
-        // uploading. `FOR UPDATE` does conflict with `KEY SHARE`: the insert
-        // either committed first (the flip's fresh statement snapshot sees
-        // the `creating` row and vetoes) or blocks until this transaction
-        // commits. `ORDER BY id` keeps the multi-row lock order
-        // deterministic against other multi-row lockers. (An insert that
-        // lands entirely after the commit is out of this transaction's
-        // reach — same pre-existing semantics as node_drain's
-        // `mark_sandbox_lost`, since `BeginArtifactBackup` does not check
-        // the sandbox lifecycle.)
-        //
-        // Only rows without a durable copy at the claim's snapshot are
-        // claimed; see [`gone_node_giveup_claim_query`] for why the flip could
-        // act on no other row at that snapshot, and for the one-tick miss on a
-        // row that loses durability after it.
-        let claim = gone_node_giveup_claim_query();
-        let claimed: Vec<SandboxId> = sqlx::query_scalar(sqlx::AssertSqlSafe(sql!(claim.as_str())))
-            .bind(node_id)
-            .fetch_all(&mut *tx)
-            .await?;
-        if claimed.is_empty() {
-            tx.rollback().await?;
-            return Ok(Vec::new());
-        }
-        // Lock the candidates' same-node `creating` upload rows before the
-        // flip evaluates. The upload may have durably completed with its
-        // `FinalizeArtifactBackup(READY)` still in flight when EC2 declared
-        // the instance terminated; that finalizer only touches `snapshots`,
-        // so the sandbox row locks above do not serialize it. With these
-        // locks, a finalize that committed first is visible to the flip's
-        // fresh statement snapshot (durable -> the sandbox is spared); one
-        // that arrives while this transaction holds the lock waits and then
-        // refuses on its own `state IN ('creating', …)` guard rather than
-        // resurrecting the row this transaction finalizes `failed` — the
-        // S3 object it uploaded is left for the storage sweeper. That
-        // residual (terminal flip beats a finalize RPC still in flight one
-        // tick after the instance was confirmed terminated) is accepted:
-        // the bytes are preserved in S3 and the row is operator-revivable.
-        let _locked_dead_uploads: Vec<SnapshotId> = sqlx::query_scalar(sql!(
-            "SELECT id FROM snapshots
-              WHERE sandbox_id = ANY($1)
-                AND source_node_id = $2
-                AND type = 'full'
-                AND state = 'creating'
-              ORDER BY id
-              FOR UPDATE"
-        ))
-        .bind(&claimed)
-        .bind(node_id)
-        .fetch_all(&mut *tx)
-        .await?;
-        // The flip is restricted to the claimed ids: the claim only fences
-        // rows that matched at its own snapshot, so a row entering the
-        // candidate set after it must wait for the next tick's claim rather
-        // than flip un-fenced.
-        let ids = lost::mark_unrecoverable_sandboxes_lost(
-            &mut tx,
-            node_id,
-            expected_uid.as_deref(),
-            &claimed,
+            WriteOff::UnrecoverableSuspended {
+                expected_uid: expected_uid.as_deref(),
+            },
             DEAD_UPLOAD_SETTLE,
         )
         .await?;
-        if !ids.is_empty() {
-            write_off_lost_sandboxes(&mut tx, node_id, &ids, DEAD_UPLOAD_SETTLE).await?;
-        }
         tx.commit().await?;
         let node_label = node_id.to_string();
         for sandbox_id in &ids {

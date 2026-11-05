@@ -12,6 +12,8 @@
 //! be: each near-miss is a *possible* yes turned into a no by exactly one field,
 //! seeded alongside a real yes so no assertion holds vacuously.
 
+use pplx_space_common_core::types::SnapshotId;
+
 use super::*;
 
 pub(super) type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;

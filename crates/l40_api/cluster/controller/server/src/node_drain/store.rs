@@ -1,5 +1,4 @@
 use pplx_space_common_core::sql;
-use pplx_space_common_core::types::SnapshotId;
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -37,8 +36,9 @@ use pplx_space_sandbox_portability::{
 use pplx_space_sandbox_store as sandbox_store;
 use pplx_space_sandbox_store::drain::{
     self, StoppedEvacuationClaim, claim_evacuation_suspend, claim_stopped_evacuation,
-    gone_node_identity_guards, record_stopped_evacuation_artifact, revert_evacuation_suspend_claim,
+    record_stopped_evacuation_artifact, revert_evacuation_suspend_claim,
 };
+use pplx_space_sandbox_store::gone_node;
 
 use pplx_space_metrics::sandbox::api::SandboxApiMetricIdentity;
 use pplx_space_node_api_client::NodeApiClient;
@@ -1416,40 +1416,10 @@ fn node_is_force_draining(node_ref: &str) -> String {
 }
 
 /// `failure_reason` stamped on `creating` suspend-snapshot rows terminalized
-/// by the gone-node recovery (mirrors the stuck-snapshot reaper's stamp).
+/// by the gone-node recovery ([`gone_node::fail_inflight_uploads`]; mirrors
+/// the stuck-snapshot reaper's stamp).
 pub(crate) const GONE_NODE_UPLOAD_FAILURE_REASON: &str = "source node's kube Node is gone and its EC2 instance is terminated; \
      the upload worker died with the instance";
-
-/// `$1` = node id, `$2` = the observed `node_k8s.k8s_node_uid` (nullable),
-/// `$3` = the failure reason to stamp. Terminalize every in-flight
-/// (`state='creating'`, `type='full'`) suspend-snapshot upload sourced from a
-/// node whose kube Node is gone and whose EC2 instance is confirmed
-/// terminated: the upload worker ran on that instance, so no finalize can
-/// ever arrive. This is exactly the flip the stuck-snapshot reaper would
-/// apply after its age window — applied immediately under the EC2 verdict
-/// instead, because the drain blocker count's in-flight-upload term counts
-/// these rows regardless of the owning sandbox's lifecycle: without this, a
-/// bulk-failed resident with a `creating` row keeps the node wedged in
-/// `draining` until the reaper runs (≈10h), or forever where the reaper is
-/// disabled. The identity guards refuse once a same-name replacement
-/// registered, so a fresh node's genuinely-live uploads are never killed.
-/// `failure_reason` is stamped only when still NULL, preserving any reason
-/// the worker recorded on an earlier best-effort attempt (same contract as
-/// the reaper). Returns `(snapshot_id, sandbox_id)` per flipped row so the
-/// caller can emit the per-snapshot `suspend_failed` event.
-pub(crate) fn fail_inflight_snapshots_on_gone_node_query() -> String {
-    let identity_guards = gone_node_identity_guards("$1", "$2");
-    format!(
-        "UPDATE snapshots
-            SET state = 'failed',
-                failure_reason = COALESCE(failure_reason, $3)
-          WHERE state = 'creating'
-            AND type = 'full'
-            AND source_node_id = $1
-            {identity_guards}
-          RETURNING id, sandbox_id"
-    )
-}
 
 /// `$3` for [`drain::mark_sandbox_failed_on_node_query`]: the lifecycles the suspend
 /// pipeline evacuates, as `text[]`.
@@ -3523,8 +3493,8 @@ impl NodeDrainSink for SubstrateSink {
     /// KubeNodeGone bulk give-up: flip every resident sandbox on a draining
     /// node whose kube Node is gone and whose EC2 instance is confirmed
     /// terminated to `lifecycle = 'failed'`, under the drain-phase + kube-uid
-    /// guards (see [`drain::fail_resident_sandboxes_on_gone_node_query`]), and emit
-    /// the required `space.sandbox` event per flipped row. Unlike the
+    /// guards (see [`gone_node::fail_residents_query`]), and emit the
+    /// required `space.sandbox` event per flipped row. Unlike the
     /// abandon-stale and failed-on-node give-ups there is no best-effort
     /// substrate teardown: the kube Node object is gone, so its pods are
     /// reaped by Kubernetes' pod garbage collector — issuing per-sandbox
@@ -3537,13 +3507,8 @@ impl NodeDrainSink for SubstrateSink {
         // Single source of truth for the resident set, rendered to its wire
         // forms at this boundary because the parameter is a `text[]`.
         let lifecycle_strs = resident_lifecycle_strs();
-        let claimed = drain::fail_resident_sandboxes_on_gone_node(
-            &self.pool,
-            node_id,
-            &lifecycle_strs,
-            expected_uid,
-        )
-        .await?;
+        let claimed =
+            gone_node::fail_residents(&self.pool, node_id, &lifecycle_strs, expected_uid).await?;
 
         let node_label = node_id.to_string();
         for (sandbox_id, prev_lifecycle) in &claimed {
@@ -3577,14 +3542,13 @@ impl NodeDrainSink for SubstrateSink {
         node_id: NodeId,
         expected_uid: Option<&str>,
     ) -> Result<u64, sqlx::Error> {
-        let query = fail_inflight_snapshots_on_gone_node_query();
-        let flipped: Vec<(SnapshotId, SandboxId)> =
-            sqlx::query_as(sqlx::AssertSqlSafe(sql!(query.as_str())))
-                .bind(node_id)
-                .bind(expected_uid)
-                .bind(GONE_NODE_UPLOAD_FAILURE_REASON)
-                .fetch_all(&self.pool)
-                .await?;
+        let flipped = gone_node::fail_inflight_uploads(
+            &self.pool,
+            node_id,
+            expected_uid,
+            GONE_NODE_UPLOAD_FAILURE_REASON,
+        )
+        .await?;
 
         let node_label = node_id.to_string();
         for (snapshot_id, sandbox_id) in &flipped {
@@ -3663,22 +3627,18 @@ impl NodeDrainSink for SubstrateSink {
     /// ready full snapshot exists — stricter than `mark_sandbox_lost`'s
     /// freshness-anchored guard, because this path chains after the adopt CAS
     /// and must not race it into failing an adoptable row (see
-    /// [`drain::mark_sandbox_lost_on_gone_node_query`]) — and refuses once a
+    /// [`gone_node::mark_suspended_lost_query`]) — and refuses once a
     /// same-name kube Node replacement bumped the observed uid or reset the
-    /// drain phase (see [`gone_node_identity_guards`]).
+    /// drain phase (see [`gone_node::NodeIdentityGuard`]).
     async fn mark_sandbox_lost_on_gone_node(
         &self,
         sandbox_id: SandboxId,
         source_node_id: NodeId,
         expected_uid: Option<&str>,
     ) -> Result<u64, sqlx::Error> {
-        let flipped = drain::mark_sandbox_lost_on_gone_node(
-            &self.pool,
-            sandbox_id,
-            source_node_id,
-            expected_uid,
-        )
-        .await?;
+        let flipped =
+            gone_node::mark_suspended_lost(&self.pool, sandbox_id, source_node_id, expected_uid)
+                .await?;
         if flipped > 0 {
             // The WHERE guard pins the pre-flip lifecycle to `suspended`.
             emit_node_drain_event(
@@ -3707,7 +3667,7 @@ impl NodeDrainSink for SubstrateSink {
     /// kube Node is gone and whose EC2 instance is confirmed terminated.
     /// Adds the node-identity guards and the current-suspend-cycle anchor on
     /// top of the shared adopt CAS (see
-    /// [`drain::adopt_remote_snapshot_on_gone_node_query`]); emits the same
+    /// [`gone_node::adopt_remote_snapshot_query`]); emits the same
     /// `LocalSnapshotPromotionAbandoned` event with a gone-node reason.
     async fn make_sandbox_durable_on_gone_node(
         &self,
@@ -3716,7 +3676,7 @@ impl NodeDrainSink for SubstrateSink {
         settle: PositiveDuration,
         expected_uid: Option<&str>,
     ) -> Result<u64, sqlx::Error> {
-        let flipped = drain::adopt_remote_snapshot_on_gone_node(
+        let flipped = gone_node::adopt_remote_snapshot(
             &self.pool,
             sandbox_id,
             source_node_id,

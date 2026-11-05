@@ -549,7 +549,7 @@ mod postgres_backed {
     use pplx_space_common_core::sql;
     use pplx_space_common_core::types::{SandboxLifecycle, SnapshotId};
     use pplx_space_db_test_fixtures::{SEED_ORG_ID, SEED_USER_ID, try_pg_test_db};
-    use pplx_space_sandbox_store::lost::mark_started_lost;
+    use pplx_space_sandbox_store::gone_node::mark_started_lost;
     use pplx_space_test_env::TestResult;
     use sqlx::PgPool;
 

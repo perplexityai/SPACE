@@ -689,6 +689,10 @@ common = [
 # Placement's commit puts a sandbox on its node. Temporary: the write folds
 # into sandbox-store.
 sandboxes = ["pplx-space-placement"]
+# Giving up a gone node's sandboxes fails the uploads that died with it
+# (sandbox-store's `gone_node`), in the statements and transaction that give
+# the sandboxes up. Temporary: the writes fold into snapshot-store.
+snapshots = ["pplx-space-sandbox-store"]
 # Deleting a sandbox orphans its snapshots' storage locations for cleanup.
 # Temporary: the write folds into snapshot-store.
 snapshot_storage_locations = ["pplx-space-sandbox-store"]

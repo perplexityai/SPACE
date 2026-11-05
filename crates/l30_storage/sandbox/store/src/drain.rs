@@ -3,32 +3,29 @@
 //! finalize, the stopped evacuation's artifact pin, the restore retry backoff,
 //! the stranded-suspend redrive, the give-ups that fail a sandbox or adopt its
 //! remote snapshot when the drain can't move it, and the pod-less give-up's
-//! revert to `suspended`.
+//! revert to `suspended`. The give-ups for a node whose instance is gone are
+//! in [`crate::gone_node`].
 //!
 //! The drain keeps everything around them: the candidate lists, the node row
 //! lock and lock timeout, the standalone `FOR UPDATE` / `FOR SHARE` reads, the
-//! transactions, and the snapshot and node writes beside them. Three
+//! transactions, and the snapshot and node writes beside them. Two
 //! statements lock their own rows with `FOR UPDATE SKIP LOCKED` in a CTE
-//! ([`mark_sandbox_failed_on_node_query`],
-//! [`abandon_stale_resident_sandboxes_query`] and
-//! [`fail_resident_sandboxes_on_gone_node_query`]); those locks moved with
+//! ([`mark_sandbox_failed_on_node_query`] and
+//! [`abandon_stale_resident_sandboxes_query`]); those locks moved with
 //! them. Every write function runs on the executor its caller passes.
 //! [`revert_pod_less_resident_to_suspended`] requires the caller's
 //! transaction: it has no row-state guard of its own and relies on the
 //! precheck its caller re-ran under that transaction's locks.
 //!
-//! Three statements bind a lifecycle set (`$3` of
+//! Two statements bind a lifecycle set (`$3` of
 //! [`abandon_stale_resident_sandboxes_query`] and of
-//! [`mark_sandbox_failed_on_node_query`], `$2` of
-//! [`fail_resident_sandboxes_on_gone_node_query`]). The caller chooses the
-//! set (the drain's non-evacuable and suspend-evacuable sets, and
-//! `pplx-space-common-svc`'s resident set) and passes its wire strings.
+//! [`mark_sandbox_failed_on_node_query`]). The caller chooses the set (the
+//! drain's non-evacuable and suspend-evacuable sets) and passes its wire
+//! strings.
 //!
-//! [`gone_node_identity_guards`] is also interpolated by the drain's
-//! in-flight snapshot give-up, a `snapshots` write that stays with the drain,
-//! so it is public to keep one definition. The statement builders
-//! (`*_query`) are public only because the drain's Postgres tests run them
-//! directly. Production code calls the function here that binds each one.
+//! The statement builders (`*_query`) are public only because the drain's
+//! Postgres tests run them directly. Production code calls the function here
+//! that binds each one.
 
 use pplx_space_common_core::types::{
     ArtifactKind, ArtifactOrigin, LocalArtifactId, NodeDrainMode, NodeDrainPhase, NodeId,
@@ -48,7 +45,7 @@ use sqlx::{Postgres, Transaction};
 
 /// Saturating seconds-as-`i64` for SQL binds; any value above `i64::MAX`
 /// is "never" in human terms.
-fn secs_bind(duration: PositiveDuration) -> i64 {
+pub(crate) fn secs_bind(duration: PositiveDuration) -> i64 {
     i64::try_from(duration.get().as_secs()).unwrap_or(i64::MAX)
 }
 
@@ -750,182 +747,6 @@ pub async fn mark_sandbox_lost(
     Ok(result.rows_affected())
 }
 
-/// `$1` = sandbox id, `$2` = source node id, `$3` = the observed
-/// `node_k8s.k8s_node_uid` (nullable; see [`gone_node_identity_guards`]).
-/// The KubeNodeGone variant of [`mark_sandbox_lost_query`], used when the
-/// node's kube Node is gone and EC2 has confirmed the backing instance
-/// terminated — the local artifact bytes died with the instance, so "the
-/// artifact is gone" needs no on-node RPC to establish.
-///
-/// **Stricter snapshot guard than [`mark_sandbox_lost_query`], on purpose.**
-/// That query refuses on `snapshot_durable_for_source_release`, whose
-/// unmarked branch is placement-freshness-anchored — a ready snapshot left
-/// placement-stale by a stuck restore's pod bump does *not* refuse it. On
-/// the artifact-missing path that's correct (the freshness test is the
-/// portability question, and the predicates must agree with the blocker
-/// count). On this path it would be a data-loss hazard: the gone-node
-/// give-up chains adopt → lost, and the adopt CAS
-/// ([`adopt_remote_snapshot_for_drain_query`]) can return 0 transiently
-/// (settle window) for exactly such a row even though it would adopt the
-/// ready snapshot on a later tick. So this DELETE-equivalent refuses while
-/// **any** `state='ready'` full snapshot exists, regardless of freshness or
-/// artifact identity: when a durable copy of *some* cycle exists, the row
-/// parks (visible, alertable) for adoption or operator review rather than
-/// being terminally failed. With no ready snapshot at all, both portability
-/// branches are necessarily false, so this guard subsumes the original
-/// `NOT durable` clause. The in-flight-upload guard is kept verbatim: a
-/// `creating` row from the dead node never finalizes on its own, but the
-/// stuck-snapshot reaper terminalizes it (≈10h), after which this fires.
-pub fn mark_sandbox_lost_on_gone_node_query() -> String {
-    let inflight_upload = inflight_suspend_upload_exists("sandboxes");
-    let identity_guards = gone_node_identity_guards("$2", "$3");
-    format!(
-        "UPDATE sandboxes
-            SET lifecycle = 'failed'
-          WHERE id = $1
-            AND lifecycle = 'suspended'
-            AND target_node_id = $2
-            AND NOT EXISTS (
-                SELECT 1
-                  FROM snapshots sn
-                  JOIN snapshot_storage_locations ssl ON ssl.snapshot_id = sn.id
-                 WHERE sn.sandbox_id = sandboxes.id
-                   AND sn.type = 'full'
-                   AND sn.state = 'ready'
-            )
-            AND NOT {inflight_upload}
-            {identity_guards}"
-    )
-}
-
-/// Fail a `suspended` sandbox pinned to a node whose kube Node is gone and
-/// whose instance is terminated ([`mark_sandbox_lost_on_gone_node_query`]).
-/// `expected_uid` is the `node_k8s.k8s_node_uid` the cross-check observed.
-/// Returns the rows flipped, `0` or `1`.
-///
-/// Writes an **inference**: a drain give-up on the cloud provider's verdict.
-pub async fn mark_sandbox_lost_on_gone_node(
-    executor: impl sqlx::PgExecutor<'_>,
-    sandbox_id: SandboxId,
-    source_node_id: NodeId,
-    expected_uid: Option<&str>,
-) -> Result<u64, sqlx::Error> {
-    let query = mark_sandbox_lost_on_gone_node_query();
-    let result = sqlx::query(sqlx::AssertSqlSafe(sql!(query.as_str())))
-        .bind(sandbox_id)
-        .bind(source_node_id)
-        .bind(expected_uid)
-        .execute(executor)
-        .await?;
-    Ok(result.rows_affected())
-}
-
-/// Shared node-identity guard clauses for the gone-node give-up writes.
-/// `node_param` / `uid_param` are the bind placeholders for the node id and
-/// the `node_k8s.k8s_node_uid` observed by the EC2 cross-check (they differ
-/// per query). Identical in intent to the guards on
-/// [`fail_resident_sandboxes_on_gone_node_query`]: between the EC2 cross-check
-/// returning `Gone` and these writes landing, a same-name kube Node
-/// replacement can register (`nodes.id` is `v5(name, role)`, so it reuses the
-/// same row id) — its registration bumps `node_k8s.k8s_node_uid` and the
-/// inventory reflector resets `drain_phase`, and either change must refuse the
-/// give-up so the replacement's freshly suspended sandboxes (and its live
-/// in-flight uploads) can't be mutated under the dead node's verdict.
-pub fn gone_node_identity_guards(node_param: &str, uid_param: &str) -> String {
-    format!(
-        "AND EXISTS (
-                SELECT 1 FROM nodes
-                 WHERE id = {node_param}
-                   AND drain_phase = 'draining'
-            )
-            AND EXISTS (
-                SELECT 1 FROM node_k8s
-                 WHERE node_id = {node_param}
-                   AND k8s_node_uid IS NOT DISTINCT FROM {uid_param}
-            )"
-    )
-}
-
-/// `$1` = sandbox id, `$2` = source node id, `$3` = the observed
-/// `node_k8s.k8s_node_uid` (nullable), `$4` = settle seconds (BIGINT). The
-/// KubeNodeGone variant of [`adopt_remote_snapshot_for_drain_query`]: makes a
-/// pinned local-only `suspended` row durable from its remote snapshot so a
-/// node whose EC2 instance is confirmed terminated can finish draining. Two
-/// guards are added on top of the shared adopt CAS:
-///
-/// - **Node identity** ([`gone_node_identity_guards`]): refuse once a
-///   same-name kube Node replacement bumped the uid or the inventory
-///   reflector reset `drain_phase` — the EC2 `Gone` verdict no longer
-///   describes the row's node.
-/// - **Current-suspend-cycle anchor** ([`current_suspend_snapshot_ready`]).
-///   The reupload give-up reaches the shared adopt CAS only with a
-///   `SandboxRestoringOnNode` proof — the VM is loading *from* the snapshot,
-///   so the snapshot is canonical by construction and `latest_full_snapshot_
-///   ready` alone is safe. The gone-node path has no such proof: it runs for
-///   *every* pinned local-only row on a terminated node. For a legacy
-///   nullable row whose last `wake → modify → re-suspend` cycle never
-///   registered a snapshot record at all, the newest full snapshot is the
-///   prior cycle's ready one — `latest_full_snapshot_ready` would adopt it
-///   and silently roll the sandbox back to pre-modification bytes. The
-///   current-cycle anchor (`sn.timestamp >= lifecycle_changed_at`, the same
-///   gate the crash-recovery redrive uses) refuses that: the row parks
-///   (visible, alertable) or, if no ready snapshot exists at all, is marked
-///   lost — an explicit failure instead of a silent rollback. For
-///   identity-carrying rows the anchor adds nothing (their exact-artifact
-///   branch already pins the snapshot to the current artifact), so the
-///   composition only tightens the legacy branch.
-pub fn adopt_remote_snapshot_on_gone_node_query() -> String {
-    let inflight_upload = inflight_suspend_upload_exists("s");
-    let latest_ready = latest_full_snapshot_ready("s");
-    let current_cycle_ready = current_suspend_snapshot_ready("s");
-    // The identity guards are uncorrelated EXISTS subqueries on `nodes` /
-    // `node_k8s`, so they compose unchanged under this query's `s` alias.
-    let identity_guards = gone_node_identity_guards("$2", "$3");
-    format!(
-        "UPDATE sandboxes s
-            SET current_local_artifact_id = NULL,
-                current_local_artifact_kind = NULL,
-                current_local_artifact_origin = NULL,
-                evacuation_restore_target = NULL,
-                placement_changed_at = NULL
-          WHERE s.id = $1
-            AND s.lifecycle = 'suspended'
-            AND s.target_node_id = $2
-            AND s.lifecycle_changed_at < NOW() - make_interval(secs => $4::BIGINT)
-            AND NOT {inflight_upload}
-            AND {latest_ready}
-            AND {current_cycle_ready}
-            {identity_guards}"
-    )
-}
-
-/// Make a pinned local-only `suspended` sandbox on a gone node durable from its
-/// remote snapshot ([`adopt_remote_snapshot_on_gone_node_query`]), once it has
-/// rested in `suspended` for `settle`. Returns the rows flipped, `0` or `1`.
-///
-/// Writes an **inference**: a drain give-up that adopts the remote snapshot in
-/// place of the local artifact that died with the node. The lifecycle stays
-/// `suspended`.
-pub async fn adopt_remote_snapshot_on_gone_node(
-    executor: impl sqlx::PgExecutor<'_>,
-    sandbox_id: SandboxId,
-    source_node_id: NodeId,
-    settle: PositiveDuration,
-    expected_uid: Option<&str>,
-) -> Result<u64, sqlx::Error> {
-    let flipped = sqlx::query(sqlx::AssertSqlSafe(sql!(
-        adopt_remote_snapshot_on_gone_node_query(),
-    )))
-    .bind(sandbox_id)
-    .bind(source_node_id)
-    .bind(expected_uid)
-    .bind(secs_bind(settle))
-    .execute(executor)
-    .await?
-    .rows_affected();
-    Ok(flipped)
-}
-
 /// `$1` = sandbox id, `$2` = source node id, `$3` = the suspend-evacuable
 /// lifecycle strings (the drain's `mark_sandbox_failed_on_node_lifecycles`).
 /// Terminal give-up flip for a
@@ -1199,125 +1020,6 @@ pub async fn abandon_stale_resident_sandboxes(
         .bind(node_id)
         .bind(secs_bind(age))
         .bind(lifecycles)
-        .fetch_all(executor)
-        .await
-}
-
-/// `$1` = node id, `$2` = the resident lifecycle strings
-/// (`RESIDENT_LIFECYCLES` as `text[]`), `$3` = the
-/// `node_k8s.k8s_node_uid` observed by the EC2 cross-check (nullable). The
-/// KubeNodeGone recovery's bulk give-up: flip every sandbox still resident on
-/// a draining node (`active_node_id = $1`) to `'failed'` once the node's kube
-/// Node is gone **and** EC2 has confirmed the backing instance terminated.
-/// Every resident lifecycle is dead at that point — a running VM, an
-/// in-flight transition, and a published-but-unbacked local artifact all
-/// lived on the terminated instance's disk/memory — so unlike the age-gated
-/// abandon sweep there is no settling to wait for: nothing on a terminated
-/// instance resolves on its own. `suspended` is deliberately **not** in `$2`:
-/// a suspended row's recoverability depends on its remote snapshot, which the
-/// per-sandbox adopt/mark-lost give-up evaluates individually.
-///
-/// Two sparing clauses are shared with [`abandon_stale_resident_sandboxes_query`]
-/// because those rows are recoverable *without* the dead node:
-/// - A **marked `restoring`** row (`evacuation_restore_target IS NOT NULL`)
-///   reads from the durable S3 snapshot; the cluster-wide restore sweep
-///   re-drives it onto a healthy cohort node (its crash-recovery arm selects
-///   `restoring` + marker rows), so failing it would lose a recoverable
-///   sandbox.
-/// - A **marked `suspending`** row whose current cycle still has recoverable
-///   evidence ([`recoverable_suspend_snapshot_exists`]) is spared. Within
-///   this sweep's `active_node_id = $1` scope only the legacy
-///   current-cycle-`creating`/`ready` snapshot branch can match (the
-///   exact-identity branch requires `active_node_id IS NULL`): a `ready`
-///   backup means the bytes are durable, and a `creating` one is settled by
-///   the stuck-snapshot reaper (its terminal flip makes the row eligible
-///   here on a later tick). Failing either now would discard a durable or
-///   pending-durable copy. The `ready`-evidence row is spared knowing it
-///   has no automatic path forward today — the crash-redrive requires
-///   `active_node_id IS NULL` (proof of execution retirement, which the
-///   dead node never completed) and the restore sweep selects only
-///   `suspended`/`restoring` — so it parks the drain, lossless and visible
-///   (the stuck-drain warn plus `node_drain.sandboxes_remaining`), until an
-///   operator advances it. A gone-node redrive that performs the missing
-///   execution-retirement bookkeeping under the EC2-terminated verdict is
-///   future work; it belongs in the substrate store, which owns that
-///   bookkeeping.
-///
-/// Guards, atomic with the flip:
-/// - `EXISTS (... drain_phase = 'draining')` — an admin `:undrain` landing
-///   between `list_draining_nodes()` and this UPDATE aborts the sweep
-///   (mirrors [`abandon_stale_resident_sandboxes_query`]).
-/// - `EXISTS (node_k8s.k8s_node_uid IS NOT DISTINCT FROM $3)` — refuse if a
-///   same-name kube Node replacement bumped the uid since the EC2 cross-check
-///   observed it: `nodes.id` is `v5(name, role)`, so a replacement instance
-///   reuses the same row id, and without this guard fresh sandboxes placed on
-///   the replacement could be swept in the window before the inventory
-///   reflector resets `drain_phase`. Mirrors `drained_node_terminator`'s
-///   uid-guarded delete.
-///
-/// Returns `(id, pre_failure_lifecycle)` per claimed row via the
-/// data-modifying CTE (the bare `RETURNING` would only see the post-flip
-/// `'failed'`) so the caller can emit per-sandbox `space.sandbox` events with
-/// the real `from_state`. `FOR UPDATE SKIP LOCKED` lets a concurrent
-/// completion CAS that already holds a row's lock be skipped this tick rather
-/// than fought over. No substrate teardown follows the flip: the kube Node is
-/// gone, so its pods are reaped by Kubernetes' pod garbage collector, not by
-/// us. Extracted as a builder so the guard set is unit-testable against a
-/// live Postgres without constructing a `KubernetesSubstrate`.
-pub fn fail_resident_sandboxes_on_gone_node_query() -> String {
-    let recoverable = recoverable_suspend_snapshot_exists("sandboxes");
-    format!(
-        "WITH claimed AS (
-         SELECT id, lifecycle
-           FROM sandboxes
-          WHERE active_node_id = $1
-            AND lifecycle = ANY($2)
-            AND (evacuation_restore_target IS NULL OR lifecycle = 'suspending')
-            AND NOT (
-                lifecycle = 'suspending'
-                AND evacuation_restore_target IS NOT NULL
-                AND {recoverable}
-            )
-            AND EXISTS (
-                SELECT 1 FROM nodes
-                 WHERE id = $1
-                   AND drain_phase = 'draining'
-            )
-            AND EXISTS (
-                SELECT 1 FROM node_k8s
-                 WHERE node_id = $1
-                   AND k8s_node_uid IS NOT DISTINCT FROM $3
-            )
-          FOR UPDATE SKIP LOCKED
-     )
-     UPDATE sandboxes s
-        SET lifecycle = 'failed',
-            evacuation_restore_target = NULL
-       FROM claimed c
-      WHERE s.id = c.id
-      RETURNING s.id, c.lifecycle"
-    )
-}
-
-/// Fail every sandbox still resident in one of `lifecycles` on a draining node
-/// whose kube Node is gone and whose instance is terminated
-/// ([`fail_resident_sandboxes_on_gone_node_query`]). `lifecycles` is the
-/// resident set, as wire strings; `expected_uid` is the
-/// `node_k8s.k8s_node_uid` the cross-check observed. Returns `(id,
-/// pre-failure lifecycle)` for each row flipped.
-///
-/// Writes an **inference**: a drain give-up on the cloud provider's verdict.
-pub async fn fail_resident_sandboxes_on_gone_node(
-    executor: impl sqlx::PgExecutor<'_>,
-    node_id: NodeId,
-    lifecycles: &[&str],
-    expected_uid: Option<&str>,
-) -> Result<Vec<(SandboxId, String)>, sqlx::Error> {
-    let query = fail_resident_sandboxes_on_gone_node_query();
-    sqlx::query_as(sqlx::AssertSqlSafe(sql!(query.as_str())))
-        .bind(node_id)
-        .bind(lifecycles)
-        .bind(expected_uid)
         .fetch_all(executor)
         .await
 }

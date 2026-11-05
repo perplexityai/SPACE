@@ -16,7 +16,7 @@ use super::{
 use crate::lifecycle_writer_test_support::{
     SandboxSeed, bounded, insert_sandbox, single_backend_pool, wait_until_blocked,
 };
-use pplx_space_sandbox_store::lost::mark_unrecoverable_sandboxes_lost_query;
+use pplx_space_sandbox_store::gone_node::mark_unrecoverable_suspended_lost_query as mark_unrecoverable_sandboxes_lost_query;
 
 const SUBSTRATES: [(SubstrateKind, bool); 2] = [
     (SubstrateKind::Kubernetes, true),

@@ -1192,26 +1192,17 @@ pub trait NodeDrainSink: Send + Sync + 'static {
         sandbox_id: SandboxId,
         source_node_id: NodeId,
     ) -> impl std::future::Future<Output = Result<u64, sqlx::Error>> + Send;
-    /// KubeNodeGone variant of [`Self::mark_sandbox_lost`]: terminal flip for
-    /// a pinned local-only `suspended` sandbox whose node's kube Node is gone
-    /// and whose EC2 instance is confirmed terminated — the local artifact
-    /// bytes died with the instance, so no on-node RPC is needed (or
-    /// possible) to establish that the artifact is gone. Guarded like
-    /// `mark_sandbox_lost` (`lifecycle = 'suspended' AND target_node_id =
-    /// $source_node_id`, no in-flight upload), but with a **stricter**
-    /// snapshot guard: it refuses while *any* ready full snapshot exists,
-    /// regardless of placement freshness or artifact identity. This path
-    /// chains after [`Self::make_sandbox_durable_on_gone_node`], and the
-    /// adopt CAS can return 0 transiently (settle window) for a row it
-    /// would adopt on a later tick — the stricter guard keeps that row
-    /// parked instead of terminally failing it.
+    /// KubeNodeGone variant of [`Self::mark_sandbox_lost`] for a pinned
+    /// local-only `suspended` sandbox on a node whose EC2 instance is
+    /// confirmed terminated. No on-node RPC precedes it, and it refuses while
+    /// *any* ready full snapshot exists, because it chains after
+    /// [`Self::make_sandbox_durable_on_gone_node`] (see
+    /// [`pplx_space_sandbox_store::gone_node::mark_suspended_lost_query`]).
     ///
     /// `expected_uid` is the `node_k8s.k8s_node_uid` the EC2 cross-check
-    /// observed; implementations must refuse (atomically with the flip) if
-    /// the uid has since changed or the node left `drain_phase = 'draining'`
-    /// — a same-name kube Node replacement's sandboxes must not be
-    /// terminally failed under the dead predecessor's verdict. Returns the
-    /// number of rows flipped; `0` means parked, drifted, or
+    /// observed; implementations must refuse, atomically with the flip, once
+    /// the uid has changed or the node left `drain_phase = 'draining'`.
+    /// Returns the number of rows flipped; `0` means parked, drifted, or
     /// identity-refused, re-evaluated next tick.
     fn mark_sandbox_lost_on_gone_node(
         &self,
@@ -1220,21 +1211,11 @@ pub trait NodeDrainSink: Send + Sync + 'static {
         expected_uid: Option<&str>,
     ) -> impl std::future::Future<Output = Result<u64, sqlx::Error>> + Send;
     /// KubeNodeGone variant of
-    /// [`Self::make_sandbox_durable_from_remote_snapshot`]: the same
-    /// adopt-the-remote-snapshot CAS, plus two guards the gone-node trigger
-    /// requires (see [`pplx_space_sandbox_store::drain::adopt_remote_snapshot_on_gone_node_query`]):
-    ///
-    /// - the node-identity guards shared with
-    ///   [`Self::mark_sandbox_lost_on_gone_node`] (`expected_uid` +
-    ///   `drain_phase = 'draining'`), refusing once a same-name kube Node
-    ///   replacement registered;
-    /// - a current-suspend-cycle anchor on the adopted snapshot. The give-up
-    ///   only adopts with a `SandboxRestoringOnNode` proof (the VM is
-    ///   loading *from* the snapshot, making it canonical); this path has no
-    ///   such proof, so for a legacy nullable row whose last re-suspend never
-    ///   registered a snapshot record, the newest-ready test alone would
-    ///   adopt the prior cycle's snapshot and silently roll the sandbox back.
-    ///   The anchor refuses that; the row parks or is marked lost instead.
+    /// [`Self::make_sandbox_durable_from_remote_snapshot`]: the same adopt
+    /// CAS, plus the node identity guard shared with
+    /// [`Self::mark_sandbox_lost_on_gone_node`] and a current-suspend-cycle
+    /// anchor on the adopted snapshot (see
+    /// [`pplx_space_sandbox_store::gone_node::adopt_remote_snapshot_query`]).
     ///
     /// Returns the number of rows flipped; `0` means not eligible this tick.
     fn make_sandbox_durable_on_gone_node(
@@ -1596,20 +1577,16 @@ pub trait NodeDrainSink: Send + Sync + 'static {
     ) -> impl std::future::Future<Output = Result<CordonOutcome, CordonError>> + Send;
     /// KubeNodeGone bulk give-up: flip every sandbox still resident on the
     /// draining node (`active_node_id = node_id`, lifecycle in
-    /// `RESIDENT_LIFECYCLES`) to `lifecycle = 'failed'`.
-    /// Only called after the kube Node was observed gone **and** EC2
-    /// confirmed the backing instance terminated — every resident VM,
-    /// in-flight transition, and unbacked local artifact died with the
-    /// instance, so no evacuation or settling can ever service these rows.
+    /// `RESIDENT_LIFECYCLES`) to `lifecycle = 'failed'`. Only called after the
+    /// kube Node was observed gone **and** EC2 confirmed the backing instance
+    /// terminated.
     ///
     /// Implementations must guard the flip atomically on the node still
     /// being `drain_phase = 'draining'` and on `node_k8s.k8s_node_uid`
-    /// matching `expected_uid` (the uid observed by the EC2 cross-check),
-    /// and must spare rows recoverable without the dead node: a marked
-    /// `restoring` row (re-driven from S3 by the cluster-wide restore
-    /// sweep) and a marked `suspending` row whose current cycle still has
-    /// recoverable snapshot evidence. See
-    /// [`pplx_space_sandbox_store::drain::fail_resident_sandboxes_on_gone_node_query`].
+    /// matching `expected_uid`, and must spare rows recoverable without the
+    /// dead node: a marked `restoring` row and a marked `suspending` row whose
+    /// current cycle still has recoverable snapshot evidence. See
+    /// [`pplx_space_sandbox_store::gone_node::fail_residents_query`].
     /// Returns the number of rows flipped.
     fn fail_resident_sandboxes_on_gone_node(
         &self,
@@ -1618,16 +1595,10 @@ pub trait NodeDrainSink: Send + Sync + 'static {
     ) -> impl std::future::Future<Output = Result<u64, sqlx::Error>> + Send;
     /// KubeNodeGone companion to the bulk fail: terminalize every in-flight
     /// (`state='creating'`) full suspend-snapshot upload sourced from the
-    /// gone node. The upload worker ran on the terminated instance, so no
-    /// finalize can ever arrive — and the drain blocker count's
-    /// in-flight-upload term counts these rows regardless of the owning
-    /// sandbox's lifecycle, so leaving them wedges the node in `draining`
-    /// until the stuck-snapshot reaper's age window (or forever where that
-    /// reaper is disabled). Same flip the reaper applies, triggered by the
-    /// EC2-terminated verdict instead of age, under the same identity
-    /// guards as the other gone-node writes (see
-    /// `fail_inflight_snapshots_on_gone_node_query` in `store`). Returns
-    /// the number of snapshot rows flipped.
+    /// gone node, at once rather than after the stuck-snapshot reaper's age
+    /// window, under the same identity guards as the other gone-node writes
+    /// (see [`pplx_space_sandbox_store::gone_node::fail_inflight_uploads_query`]).
+    /// Returns the number of snapshot rows flipped.
     fn fail_inflight_snapshots_on_gone_node(
         &self,
         node_id: NodeId,
@@ -2369,13 +2340,9 @@ impl<S: NodeDrainSink, T: InstanceTerminator> Reconciler<S, T> {
                 }
             }
 
-            // Terminalize the dead node's in-flight snapshot uploads. Their
-            // worker died with the instance, so they can never finalize, yet
-            // the drain blocker count's in-flight-upload term counts them
-            // regardless of the owning sandbox's lifecycle — left alone they
-            // wedge the drain until the stuck-snapshot reaper's age window
-            // (or forever where that reaper is disabled). Same flip the
-            // reaper applies, brought forward by the EC2-terminated verdict.
+            // Terminalize the dead node's in-flight snapshot uploads, which
+            // the drain blocker count counts whatever the owning sandbox's
+            // lifecycle.
             match self
                 .sink
                 .fail_inflight_snapshots_on_gone_node(node_id, recovery.expected_uid.as_deref())
@@ -2698,10 +2665,8 @@ impl<S: NodeDrainSink, T: InstanceTerminator> Reconciler<S, T> {
         }
         if let Some(recovery) = &gone_recovery {
             // The backup enqueue can never succeed on a node whose EC2
-            // instance is confirmed terminated — there is no node-api pod to
-            // receive the RPC, and the local artifact bytes died with the
-            // instance — so skip the promote RPCs in favor of the guarded
-            // adopt / mark-lost give-ups.
+            // instance is confirmed terminated, so skip the promote RPCs in
+            // favor of the guarded adopt / mark-lost give-ups.
             self.give_up_local_only_on_gone_node(node_id, recovery, &local_only, report)
                 .await;
         } else {
@@ -3165,29 +3130,24 @@ impl<S: NodeDrainSink, T: InstanceTerminator> Reconciler<S, T> {
 
     /// KubeNodeGone give-up for the pinned local-only suspended sandboxes of
     /// a draining node whose kube Node is gone and whose EC2 instance is
-    /// confirmed terminated. The backup enqueue can never succeed — there is
-    /// no node-api pod to receive it, and the local artifact bytes died with
-    /// the instance — so instead of retrying `promote_local_snapshot` every
-    /// tick forever ("no ready node-api pod for role worker", every tick,
-    /// indefinitely), each sandbox gets one of:
+    /// confirmed terminated. The backup enqueue can never succeed there, so
+    /// instead of retrying `promote_local_snapshot` every tick forever ("no
+    /// ready node-api pod for role worker", every tick, indefinitely), each
+    /// sandbox gets one of:
     ///
     /// 1. **Adopt** — if the newest ready remote snapshot already exists and
     ///    is from the current suspend cycle, make the row durable from it
     ///    (the gone-node variant of the reupload give-up's CAS; the sandbox
     ///    stays `suspended` and recoverable).
     /// 2. **Mark lost** — if no ready remote snapshot exists at all and no
-    ///    upload is in flight, flip the row to `failed` (terminal; the data
-    ///    was already lost when the instance terminated).
+    ///    upload is in flight, flip the row to `failed`.
     /// 3. **Park** — neither guard fired (an in-flight `creating` upload row
     ///    the stuck-snapshot reaper hasn't terminalized yet, a ready-but-
     ///    stale snapshot awaiting the adopt CAS's settle window, or a
     ///    drift); the row keeps blocking and is re-evaluated next tick.
     ///
     /// Both writes carry `recovery.expected_uid` plus the `drain_phase =
-    /// 'draining'` guard (the same identity defense as the bulk resident
-    /// fail), so a same-name kube Node replacement that registered after the
-    /// EC2 cross-check refuses them rather than having its fresh sandboxes
-    /// adopted from old snapshots or terminally failed.
+    /// 'draining'` guard, as the bulk resident fail does.
     async fn give_up_local_only_on_gone_node(
         &self,
         node_id: NodeId,

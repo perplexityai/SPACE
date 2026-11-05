@@ -12,7 +12,7 @@ use pplx_space_db_test_fixtures::try_pg_test_db;
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use super::gone_node_giveup_claim_query;
+use pplx_space_sandbox_store::gone_node::unrecoverable_suspended_claim_query as gone_node_giveup_claim_query;
 
 use pplx_space_test_env::TestResult;
 

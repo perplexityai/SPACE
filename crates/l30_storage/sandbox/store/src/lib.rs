@@ -31,7 +31,7 @@
 //!   wake-completion CAS, the restore claims) are correctness mechanisms, not
 //!   row updates, and no plain `update` verb here may absorb one. Each moves
 //!   here as its own module, named for its transition or for the path that
-//!   issues it, as [`lost`], [`delete`], [`ingest`], [`repair`] and
+//!   issues it, as [`gone_node`], [`delete`], [`ingest`], [`repair`] and
 //!   [`sweeper`] have; the ratchet above counts the ones still elsewhere. The
 //!   caller keeps its locks and its transaction: each function runs on the
 //!   transaction or executor its caller passes, and none begins or commits a
@@ -48,7 +48,9 @@
 //!   would change what it does.
 //! * **Locking reads are not gets.** `SELECT ... FOR UPDATE` acquires a row
 //!   lock inside a caller's transaction; converting one to [`get`] would drop
-//!   the lock. They stay at their call sites.
+//!   the lock. They stay at their call sites, or move with the transition
+//!   whose statements they fence, as those in
+//!   [`gone_node::write_off_on_gone_node`] do.
 //! * **The node-local SQLite `sandboxes` table** (`crates/l30_storage/sbx/mgr/store`) is a
 //!   different database on a different machine and is out of scope.
 //!
@@ -111,9 +113,9 @@ pub mod delete;
 pub mod direct;
 pub mod drain;
 pub mod fork_source_lifecycle;
+pub mod gone_node;
 pub mod ingest;
 pub mod intent;
-pub mod lost;
 pub mod orphan;
 pub mod pod_tracking;
 pub mod quarantine;

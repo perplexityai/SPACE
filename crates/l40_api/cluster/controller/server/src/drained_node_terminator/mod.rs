@@ -275,45 +275,15 @@ pub trait DrainedNodeTerminatorSink: Send + Sync + 'static {
 
     /// Mark-lost give-up for the KubeNodeGone recovery: flip every
     /// `suspended` sandbox pinned to `node_id` via `target_node_id` that has
-    /// **no recoverable copy anywhere** to `lifecycle = 'failed'` — the same
-    /// terminal semantics as `node_drain`'s `mark_sandbox_lost` after an
-    /// `ArtifactMissing` reupload (no durable portable snapshot, and no
-    /// in-flight upload that could still produce one).
+    /// **no recoverable copy anywhere** to `lifecycle = 'failed'`, and write
+    /// off the uploads, backup queue rows, executions and placement each
+    /// leaves behind. The production sink runs
+    /// [`pplx_space_sandbox_store::gone_node::write_off_on_gone_node`], whose
+    /// docs carry the guards and the write-off.
     ///
     /// **Only call this after EC2 confirmed the node's backing instance
-    /// terminated** ([`InstanceLookupOutcome::Gone`]). That premise is what
-    /// justifies the two ways this differs from the drain-path give-up:
-    /// the sandbox's local artifact is *provably* gone (no on-node probe is
-    /// possible or needed — the disk died with the box), and an in-flight
-    /// suspend upload **from this node** can never finalize (the upload
-    /// worker died with the box too), so only an upload from some *other*
-    /// node vetoes the flip.
-    ///
-    /// The UPDATE re-checks the same kube-uid + drain-phase identity guards
-    /// as [`Self::delete_drained_node_if_orphan`] atomically — `expected_uid`
-    /// is the uid observed when the EC2 cross-check resolved the node — so
-    /// the flip can't outlive the observation that justified it (a same-name
-    /// kube replacement or an admin undrain between the cross-check and this
-    /// UPDATE matches nothing).
-    ///
-    /// In the same transaction, the flip retires the stale bookkeeping it
-    /// would otherwise orphan on a node-side auto-suspended candidate: any
-    /// still-`active` execution row is written off (`'forgotten'`), the
-    /// recorded pod IPs are cleared, and the sandbox is unplaced
-    /// (`placement = 'unplaced'`, `active_node_id = NULL`) — the
-    /// suspended-execution reaper that normally does this scans
-    /// `lifecycle = 'suspended'` only, so a bare flip would hide the rows
-    /// from it forever while `active_node_id` dangled at a node row the next
-    /// tick hard-deletes. The flipped sandboxes' dead `creating` upload rows
-    /// from this node are finalized `'failed'` too: the snapshot guard's
-    /// in-flight arm is lifecycle-agnostic, so an un-terminalized dead
-    /// upload would keep refusing the reap even after the flip. A same-node
-    /// `creating` row only counts as dead once it has sat without a worker
-    /// heartbeat for the `DEAD_UPLOAD_SETTLE` quiet period — EC2
-    /// `terminated` proves the worker died, but a READY finalize for
-    /// already-durable bytes can still be in the API path for a few more
-    /// seconds; until the window passes, the sandbox defers (stays parked)
-    /// rather than flips.
+    /// terminated** ([`InstanceLookupOutcome::Gone`]). `expected_uid` is the
+    /// uid observed when the cross-check resolved the node.
     ///
     /// Returns the ids of the sandboxes marked lost; an empty list means no
     /// pinned suspended sandbox was provably unrecoverable (or a guard

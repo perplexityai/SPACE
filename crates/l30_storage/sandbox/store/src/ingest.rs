@@ -765,7 +765,7 @@ pub async fn recover_published_pause_failed(
 }
 
 /// Built once: every input is bound, so the text is the same on every publish.
-/// Mirrors the composed statement in [`crate::lost`].
+/// Mirrors the composed statement in [`crate::gone_node::mark_started_lost`].
 ///
 /// The interpolated term comes from `pplx_space_sandbox_portability` rather
 /// than being spelled here because that crate is the single definition of "are

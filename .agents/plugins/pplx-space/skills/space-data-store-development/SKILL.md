@@ -68,7 +68,7 @@ Not store verbs — leave these where they are:
   drift class where a pooled wake resurrected torn-down sandboxes. The
   `sandboxes` row is the exception to leaving them in place: its guarded
   transitions move into `pplx-space-sandbox-store`, in modules named for the
-  transition or for the path that issues them (as `lost` and `delete` are),
+  transition or for the path that issues them (as `gone_node` and `delete` are),
   and its canonical hard delete is that crate's
   `delete::delete_with_dependents`. A write that is one step of such a
   transition stays in its module even when its own `WHERE` checks only the

@@ -10,7 +10,10 @@ use super::{
     OrphanDeleteRefusal, PHASE_DRAINED, PHASE_TERMINATING, ResidencyEvidence,
     delete_drained_node_if_orphan_query, local_snapshots_count_query, mark_terminating_query,
 };
-use pplx_space_sandbox_store::lost::mark_unrecoverable_sandboxes_lost_query;
+use pplx_space_sandbox_store::gone_node::{
+    mark_unrecoverable_suspended_lost_query as mark_unrecoverable_sandboxes_lost_query,
+    unrecoverable_suspended_claim_query as gone_node_giveup_claim_query,
+};
 
 use pplx_space_test_env::TestResult;
 
@@ -1482,7 +1485,7 @@ async fn the_claim_locks_only_rows_without_a_durable_copy() -> TestResult {
         );
     }
 
-    let claim = super::gone_node_giveup_claim_query();
+    let claim = gone_node_giveup_claim_query();
     assert!(
         free_under(pool, &claim, node, SANDBOX_PROBE, durable).await?,
         "the claim must not lock a row with a durable copy"

@@ -5,9 +5,14 @@ use pplx_space_db_test_fixtures::try_pg_test_db;
 use pplx_space_sandbox_portability::fresh_ready_snapshot_exists;
 use pplx_space_sandbox_store::drain::{
     abandon_stale_resident_sandboxes_query, adopt_remote_snapshot_for_drain_query,
-    adopt_remote_snapshot_on_gone_node_query, fail_resident_sandboxes_on_gone_node_query,
-    mark_sandbox_failed_on_node_query, mark_sandbox_lost_on_gone_node_query,
-    mark_sandbox_lost_query, redrive_stranded_suspending_query, schedule_restore_retry_query,
+    mark_sandbox_failed_on_node_query, mark_sandbox_lost_query, redrive_stranded_suspending_query,
+    schedule_restore_retry_query,
+};
+use pplx_space_sandbox_store::gone_node::{
+    adopt_remote_snapshot_query as adopt_remote_snapshot_on_gone_node_query,
+    fail_inflight_uploads_query as fail_inflight_snapshots_on_gone_node_query,
+    fail_residents_query as fail_resident_sandboxes_on_gone_node_query,
+    mark_suspended_lost_query as mark_sandbox_lost_on_gone_node_query,
 };
 
 use super::*;

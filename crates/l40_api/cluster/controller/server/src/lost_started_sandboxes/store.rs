@@ -1,20 +1,17 @@
 //! Postgres-backed [`super::LostStartedSink`].
 
-use pplx_space_common_core::types::{NodeId, SandboxId, SnapshotId, SubstrateKind};
+use pplx_space_common_core::types::{NodeId, SandboxId, SubstrateKind};
 
 use std::sync::LazyLock;
 
 use pplx_space_common_core::sql;
 use pplx_space_events::{SandboxEventDetails, SandboxEventTrigger};
 use pplx_space_sandbox_portability::started_restore_source_absent;
-use pplx_space_sandbox_store::lost::mark_started_lost;
+use pplx_space_sandbox_store::gone_node::{self, StartedSource, WriteOff};
 use sqlx::PgPool;
 
 use super::{LostCandidate, LostStartedSink, SourceNode};
-use crate::drained_node_terminator::store::DEAD_UPLOAD_SETTLE;
-use crate::gone_node_write_off::{
-    emit_lost_and_failed, node_identity_holds, write_off_lost_sandboxes,
-};
+use crate::drained_node_terminator::store::{DEAD_UPLOAD_SETTLE, emit_lost_and_failed};
 
 type CandidateRow = (SandboxId, i64, NodeId, bool, Option<String>, Option<String>);
 
@@ -112,97 +109,31 @@ impl LostStartedSink for LostStartedDbStore {
 
     async fn mark_lost(&self, candidate: &LostCandidate) -> Result<bool, sqlx::Error> {
         let node_id = candidate.source_node_id;
-        let mut tx = self.pool.begin().await?;
-
-        // Re-check that the node is gone the way the scan found it, before
-        // taking the sandbox lock: pod placement and the drained-node give-up
-        // both lock the node rows before the sandbox row, so this order can't
-        // deadlock against them.
-        let gone = match &candidate.source_node {
-            // `FOR SHARE` on a missing row locks nothing, so a registration
-            // committing after this read isn't fenced. A row that reappears
-            // before the read refuses the flip; one that reappears after it
-            // can't make the flip wrong. `nodes.id` is derived from the node
-            // name and role, so the row is a new instance under the old name,
-            // and the sandbox's runtime and local disk went with the old one.
-            SourceNode::RowDeleted => {
-                let row: Option<i32> =
-                    sqlx::query_scalar(sql!("SELECT 1 FROM nodes WHERE id = $1 FOR SHARE"))
-                        .bind(node_id)
-                        .fetch_optional(&mut *tx)
-                        .await?;
-                row.is_none()
-            }
+        let source = match &candidate.source_node {
+            SourceNode::RowDeleted => StartedSource::RowDeleted,
             // Reached only after the tick found the node absent from
-            // Kubernetes with no live EC2 instance. The row must still be
-            // outside any drain and carry the uid the scan observed, so a
-            // same-name replacement refuses.
-            SourceNode::Registered { k8s_node_uid, .. } => {
-                node_identity_holds(&mut tx, node_id, None, k8s_node_uid.as_deref()).await?
-            }
-            SourceNode::Unverifiable => false,
+            // Kubernetes with no live EC2 instance.
+            SourceNode::Registered { k8s_node_uid, .. } => StartedSource::Registered {
+                expected_uid: k8s_node_uid.as_deref(),
+            },
+            SourceNode::Unverifiable => return Ok(false),
         };
-        if !gone {
-            tx.rollback().await?;
-            return Ok(false);
-        }
-
-        // Started recovery's claim takes the sandbox row lock before it re-arms
-        // the execution, so a wake either commits first (the flip's execution
-        // check then refuses) or waits for this transaction, then finds the
-        // row `failed` and claims nothing.
-        let locked: Option<String> = sqlx::query_scalar(sql!(
-            "SELECT lifecycle FROM sandboxes WHERE id = $1 FOR UPDATE"
-        ))
-        .bind(candidate.sandbox_id)
-        .fetch_optional(&mut *tx)
-        .await?;
-        if locked.as_deref() != Some("started") {
-            tx.rollback().await?;
-            return Ok(false);
-        }
-
-        // Lock the sandbox's in-flight uploads before the flip evaluates its
-        // restore-source condition. A finalize that committed first is visible
-        // to the flip's statement snapshot and spares the sandbox. A finalize
-        // racing this transaction updates its snapshot row before it locks the
-        // sandbox row, the opposite order, so Postgres aborts one of the two.
-        // An aborted flip is retried on a later tick. An aborted finalize from
-        // the gone node isn't retried, so the flip lands and the uploaded
-        // bytes are left for the storage sweeper: the residual the drained-node
-        // give-up accepts for the same race.
-        let _locked_uploads: Vec<SnapshotId> = sqlx::query_scalar(sql!(
-            "SELECT id FROM snapshots
-              WHERE sandbox_id = $1
-                AND type = 'full'
-                AND state = 'creating'
-              ORDER BY id
-              FOR UPDATE"
-        ))
-        .bind(candidate.sandbox_id)
-        .fetch_all(&mut *tx)
-        .await?;
-
-        if !mark_started_lost(
-            &mut tx,
-            candidate.sandbox_id,
-            node_id,
-            candidate.generation,
-            DEAD_UPLOAD_SETTLE,
-        )
-        .await?
-        {
-            tx.rollback().await?;
-            return Ok(false);
-        }
-        write_off_lost_sandboxes(
+        let mut tx = self.pool.begin().await?;
+        let flipped = gone_node::write_off_on_gone_node(
             &mut tx,
             node_id,
-            &[candidate.sandbox_id],
+            WriteOff::Started {
+                sandbox_id: candidate.sandbox_id,
+                generation: candidate.generation,
+                source,
+            },
             DEAD_UPLOAD_SETTLE,
         )
         .await?;
         tx.commit().await?;
+        if flipped.is_empty() {
+            return Ok(false);
+        }
 
         let details = SandboxEventDetails::default()
             .with_from_state("started")
