@@ -1,15 +1,21 @@
 use pplx_space_common_core::types::{SandboxId, SandboxLifecycle};
 use pplx_space_net_common::NetworkPolicyV1;
+use pplx_space_placement::StoredSandboxLifecycle;
 use uuid::Uuid;
 
 use super::ArtifactComponentProjection;
+use super::published_status::serialize_published_lifecycle;
 
 /// Checked publication evidence, including the original spelling of open labels.
 /// The legacy JSON batch keeps nullable fields explicit for existing SQL readers.
 #[derive(serde::Serialize)]
 pub(super) struct PublishedSandboxRow {
     pub(super) sandbox_id: SandboxId,
+    /// The node's spelling, trimmed, as `sandbox_observed_states` records it.
     pub(super) status: Option<String>,
+    /// The status's canonical lifecycle, which every ingest decision compares.
+    #[serde(serialize_with = "serialize_published_lifecycle")]
+    pub(super) published_lifecycle: Option<StoredSandboxLifecycle>,
     pub(super) template: Option<String>,
     pub(super) runtime: Option<String>,
     pub(super) spaced_version: Option<String>,
@@ -59,27 +65,23 @@ pub(super) struct PublishedSandboxRow {
     pub(super) pod_uid: Option<String>,
 }
 
-/// A narrow SQL projection. Status remains an open label with its exact spelling;
-/// the database decides lifecycle eligibility under its own collation.
+/// A narrow SQL projection of the published lifecycle.
 #[derive(serde::Serialize)]
-pub(super) struct PublishedLifecycleRow<'a> {
+pub(super) struct PublishedLifecycleRow {
     sandbox_id: SandboxId,
-    status: Option<&'a str>,
+    #[serde(serialize_with = "serialize_published_lifecycle")]
+    published_lifecycle: Option<StoredSandboxLifecycle>,
 }
 
 impl PublishedSandboxRow {
-    pub(super) fn may_report_lifecycle(&self, expected: SandboxLifecycle) -> bool {
-        self.status.as_deref().is_some_and(|status| {
-            // Non-ASCII labels stay in the SQL input rather than assuming Rust
-            // and the database have identical case conversion rules.
-            !status.is_ascii() || status.eq_ignore_ascii_case(expected.as_str())
-        })
+    pub(super) fn reports_lifecycle(&self, expected: SandboxLifecycle) -> bool {
+        self.published_lifecycle == Some(StoredSandboxLifecycle::Live(expected))
     }
 
-    pub(super) fn lifecycle_projection(&self) -> PublishedLifecycleRow<'_> {
+    pub(super) fn lifecycle_projection(&self) -> PublishedLifecycleRow {
         PublishedLifecycleRow {
             sandbox_id: self.sandbox_id,
-            status: self.status.as_deref(),
+            published_lifecycle: self.published_lifecycle,
         }
     }
 }
@@ -106,17 +108,18 @@ impl PublishedSandboxRow {
 }
 
 #[derive(serde::Serialize)]
-pub(super) struct PublishedRestoreRow<'a> {
+pub(super) struct PublishedRestoreRow {
     sandbox_id: SandboxId,
-    status: Option<&'a str>,
+    #[serde(serialize_with = "serialize_published_lifecycle")]
+    published_lifecycle: Option<StoredSandboxLifecycle>,
     transition_receipt_kind: Option<&'static str>,
 }
 
 impl PublishedSandboxRow {
-    pub(super) fn restore_projection(&self) -> PublishedRestoreRow<'_> {
+    pub(super) fn restore_projection(&self) -> PublishedRestoreRow {
         PublishedRestoreRow {
             sandbox_id: self.sandbox_id,
-            status: self.status.as_deref(),
+            published_lifecycle: self.published_lifecycle,
             transition_receipt_kind: self.transition_receipt_kind,
         }
     }
