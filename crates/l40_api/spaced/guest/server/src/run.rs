@@ -53,6 +53,8 @@ pub enum RunSpacedGuestError {
     WorkingDirectory(#[source] std::io::Error),
     #[error(transparent)]
     CreateService(#[from] crate::CreateSpacedGuestServiceError),
+    #[error(transparent)]
+    MemoryReporting(#[from] crate::memory_reporting::MemoryReportingError),
 }
 
 // With the 10s drain these bound daemon exit; `TimeoutStopSec` in the seed's
@@ -84,6 +86,7 @@ pub fn run(config: SpacedGuestRunConfig) -> Result<(), RunSpacedGuestError> {
         crate::memlock::lock_text();
     }
 
+    let reporting_order = crate::memory_reporting::configure_from_env()?;
     block_on_bounded(
         async move {
             let telemetry =
@@ -93,6 +96,9 @@ pub fn run(config: SpacedGuestRunConfig) -> Result<(), RunSpacedGuestError> {
                         source,
                     }
                 })?;
+            if let Some(order) = reporting_order {
+                tracing::info!(%order, "Guest free-page reporting order configured and verified");
+            }
             // The guest's own logs reach no collector; the host's health probe
             // drains its WARN and ERROR callsites over the bridge instead.
             pplx_space_common_svc::observability::warning_tap::enable();

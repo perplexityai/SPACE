@@ -10,6 +10,16 @@ use pplx_space_spaced_guest_server::SpacedGuestRunConfig;
     disable_version_flag = true
 )]
 struct Cli {
+    /// Apply SPACE_FREE_PAGE_REPORTING_ORDER and exit without starting a daemon.
+    #[cfg(unix)]
+    #[arg(long, conflicts_with_all = ["reclaim_setup_cache", "hold_cgroup"])]
+    configure_memory_reporting: bool,
+
+    /// Explicitly release clean guest cache after setup, then exit.
+    #[cfg(unix)]
+    #[arg(long, conflicts_with = "hold_cgroup")]
+    reclaim_setup_cache: bool,
+
     /// Print version.
     #[arg(
         short = 'v',
@@ -43,6 +53,18 @@ impl From<Cli> for SpacedGuestRunConfig {
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    #[cfg(unix)]
+    if cli.configure_memory_reporting || cli.reclaim_setup_cache {
+        let order = pplx_space_spaced_guest_server::memory_reporting::configure_from_env()?;
+        if cli.configure_memory_reporting && order.is_none() {
+            anyhow::bail!("SPACE_FREE_PAGE_REPORTING_ORDER must be set for explicit configuration");
+        }
+        if cli.reclaim_setup_cache {
+            pplx_space_spaced_guest_server::memory_reporting::release_setup_cache()?;
+        }
+        println!("Guest memory maintenance completed; reporting order: {order:?}");
+        return Ok(());
+    }
     #[cfg(unix)]
     if cli.hold_cgroup {
         // No runtime, telemetry or cgroup setup: SIGTERM from the unit's stop

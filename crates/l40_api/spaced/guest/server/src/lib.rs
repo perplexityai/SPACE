@@ -169,6 +169,7 @@ pub use pplx_space_spaced_guest_execution::{
 mod local_admission;
 #[cfg(all(target_os = "linux", feature = "service-entrypoint"))]
 mod memlock;
+pub mod memory_reporting;
 mod meta;
 mod networking;
 mod port_forward;

@@ -174,6 +174,10 @@ In Kind, sandbox pods run in their own namespace, `sandboxes`, apart from the co
 [Snapshot upload streaming](snapshot-upload-streaming.md) describes the worker
 transfer pipeline, memory bounds, failure ownership, and rollout behavior.
 
+[Guest memory reporting](space/design/guest-memory-reporting.md) describes the
+opt-in reporting order, explicit guest setup-cache release, and measured
+memory/CPU tradeoffs without changing configured guest capacity.
+
 Pause and suspend both stop execution, but retain state differently. Use wake to return a paused or suspended sandbox to running, and wait for its operation and readiness before issuing another command.
 
 | State | Process execution | What is retained | Next action |
