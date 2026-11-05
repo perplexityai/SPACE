@@ -1082,35 +1082,52 @@ fn sandbox_lifecycle_counts_groups_durable_rows() {
 #[test]
 fn sandbox_lifecycle_counts_preserve_rows_across_runtime_versions_and_legacy_metadata() {
     let conn = test_conn();
-    let variants = [
-        (
-            "old-a",
-            "abc00101",
-            SandboxState::Started,
-            "fc",
-            Some(r#"{"runtime":{"kind":"firecracker","version":"1.15.1"}}"#),
-        ),
+    let versions = [
+        ("old-a", "abc00101", SandboxState::Started, "fc", "1.15.1"),
         (
             "old-b",
             "abc00102",
             SandboxState::Started,
             "firecracker",
-            Some(r#"{"runtime":{"version":"1.15.1","kind":"fc"}}"#),
+            "1.15.1",
         ),
-        (
-            "new",
-            "abc00103",
-            SandboxState::Started,
-            "fc",
-            Some(r#"{"runtime":{"kind":"firecracker","version":"1.17.0"}}"#),
-        ),
+        ("new", "abc00103", SandboxState::Started, "fc", "1.17.0"),
         (
             "stored",
             "abc00104",
             SandboxState::Suspended,
             "fc",
-            Some(r#"{"runtime":{"kind":"firecracker","version":"1.17.0"}}"#),
+            "1.17.0",
         ),
+        ("other", "abc00110", SandboxState::Started, "ch", "49.0"),
+    ];
+    for (id, uuid8, state, runtime, version) in versions {
+        insert_test_sandbox(&conn, TestSandboxInsert::new(id, uuid8, state));
+        conn.execute(
+            sql!("UPDATE sandboxes SET runtime = ?2 WHERE id = ?1"),
+            params![id, runtime],
+        )
+        .unwrap();
+        let execution = ExecutionMetadata::new(
+            RuntimeIdentity {
+                kind: runtime.parse().unwrap(),
+                version: RuntimeVersion::parse(version).unwrap(),
+            },
+            ExecutionMetadata::initial_firecracker(Arch::Aarch64, vec![]).guest(),
+            None,
+            vec![],
+        )
+        .unwrap();
+        upsert_sandbox_execution_metadata(&conn, id, &execution).unwrap();
+        assert_eq!(
+            get_sandbox(&conn, id).unwrap().unwrap().execution_metadata,
+            Some(execution),
+        );
+    }
+
+    // Raw JSON is reserved for legacy and corrupt rows that the typed writer
+    // cannot produce. A valid runtime alone is not valid execution metadata.
+    let legacy = [
         ("missing", "abc00105", SandboxState::Started, "fc", None),
         (
             "corrupt",
@@ -1141,24 +1158,31 @@ fn sandbox_lifecycle_counts_preserve_rows_across_runtime_versions_and_legacy_met
             None,
         ),
         (
-            "other",
-            "abc00110",
+            "missing-guest",
+            "abc00111",
             SandboxState::Started,
-            "ch",
-            Some(r#"{"runtime":{"kind":"cloud-hypervisor","version":"49.0"}}"#),
+            "fc",
+            Some(r#"{"runtime":{"kind":"firecracker","version":"1.17.0"}}"#),
         ),
     ];
-    for (id, uuid8, state, runtime, execution) in variants {
+    for (id, uuid8, state, runtime, execution) in legacy {
         insert_test_sandbox(&conn, TestSandboxInsert::new(id, uuid8, state));
         conn.execute(
             sql!("UPDATE sandboxes SET runtime = ?2, execution_metadata_json = ?3 WHERE id = ?1"),
             params![id, runtime, execution],
         )
         .unwrap();
+        assert!(
+            get_sandbox(&conn, id)
+                .unwrap()
+                .unwrap()
+                .execution_metadata
+                .is_none()
+        );
     }
 
     let counts = sandbox_lifecycle_counts(&conn).unwrap();
-    assert_eq!(counts.iter().map(|count| count.count).sum::<u64>(), 10);
+    assert_eq!(counts.iter().map(|count| count.count).sum::<u64>(), 11);
     let actual: Vec<_> = counts
         .iter()
         .map(|count| {
@@ -1181,7 +1205,7 @@ fn sandbox_lifecycle_counts_preserve_rows_across_runtime_versions_and_legacy_met
                 SandboxState::Started,
                 Some(RuntimeKind::Firecracker),
                 None,
-                4
+                5
             ),
             (
                 SandboxState::Started,
@@ -1213,7 +1237,7 @@ fn sandbox_lifecycle_counts_preserve_rows_across_runtime_versions_and_legacy_met
     conn.execute(sql!("DELETE FROM sandboxes WHERE id = ?1"), ["new"])
         .unwrap();
     let counts = sandbox_lifecycle_counts(&conn).unwrap();
-    assert_eq!(counts.iter().map(|count| count.count).sum::<u64>(), 9);
+    assert_eq!(counts.iter().map(|count| count.count).sum::<u64>(), 10);
     assert!(!counts.iter().any(|count| {
         count.state == SandboxState::Started
             && count

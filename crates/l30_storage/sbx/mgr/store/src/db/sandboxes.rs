@@ -101,18 +101,31 @@ pub enum InsertRecoveredSuspendedSandboxError {
 }
 
 db_private_outside_tests! {
-    /// Aggregate durable rows by lifecycle and recorded runtime in SQLite rather
-    /// than loading each sandbox's complete execution metadata.
+    /// Aggregate durable rows in SQLite, retaining only lifecycle/runtime buckets
+    /// rather than collecting each sandbox's complete execution metadata.
     fn sandbox_lifecycle_counts(conn: &Connection) -> Result<Vec<SandboxLifecycleCount>> {
+        // Use the row reader's full serde decoder, not a second description of
+        // its wire format in SQL. Only the validated runtime enters GROUP BY;
+        // complete metadata is decoded one row at a time and then discarded.
+        conn.raw().create_scalar_function(
+            "sandbox_execution_runtime",
+            1,
+            rusqlite::functions::FunctionFlags::SQLITE_UTF8
+                | rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC,
+            |context| {
+                let json: Option<String> = context.get(0)?;
+                json.as_deref()
+                    .and_then(|value| serde_json::from_str::<ExecutionMetadata>(value).ok())
+                    .map(|metadata| {
+                        serde_json::to_string(metadata.runtime())
+                            .map_err(|error| rusqlite::Error::UserFunctionError(Box::new(error)))
+                    })
+                    .transpose()
+            },
+        )?;
         let mut statement = conn.prepare(sql!(
             "SELECT state, runtime,
-                    CASE WHEN json_valid(execution_metadata_json) THEN
-                        CASE WHEN json_type(execution_metadata_json, '$.runtime') = 'object'
-                             THEN json_object(
-                                 'kind', json_extract(execution_metadata_json, '$.runtime.kind'),
-                                 'version', json_extract(execution_metadata_json, '$.runtime.version'))
-                        END
-                    END AS execution_runtime,
+                    sandbox_execution_runtime(execution_metadata_json) AS execution_runtime,
                     COUNT(*)
              FROM sandboxes
              GROUP BY state, runtime, execution_runtime"
