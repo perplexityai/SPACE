@@ -1,6 +1,7 @@
-//! Maps create outcomes onto the requested vCPU and memory
-//! distributions (`pplx_space_metrics::sandbox::api::requested`). The emit
-//! sites stay one call each; what counts and how it is tagged is decided here.
+//! Maps create, activation and resume outcomes onto the requested vCPU and
+//! memory distributions (`pplx_space_metrics::sandbox::api::requested`). The
+//! emit sites stay one call each; what counts and how it is tagged is decided
+//! here.
 
 use pplx_space_events::CreateShapeSource;
 use pplx_space_metrics::sandbox::admission::AdmissionDecision;
@@ -11,6 +12,9 @@ use pplx_space_metrics::sandbox::api::{
 use super::ControllerError;
 use crate::controllers::substrate::SandboxResources;
 use crate::models::Sandbox;
+
+/// The template tag for a sandbox row that names none.
+const UNKNOWN_TEMPLATE: &str = "unknown";
 
 /// The admission tag for a call's result: accepted on success, rejected when
 /// cluster activation admission refused it, and `None` (emit nothing) for
@@ -57,6 +61,24 @@ pub(super) fn record_pool_claim(surface: SandboxApiSurface, template: &str, sand
         template,
         effective(sandbox.vcpu, sandbox.memory_mib),
         Some(true),
+    );
+}
+
+/// Record an activation's or resume's size, read from the sandbox row it
+/// runs.
+pub(super) fn record_lifecycle_action(
+    kind: RequestedKind,
+    surface: SandboxApiSurface,
+    admission: AdmissionDecision,
+    sandbox: &Sandbox,
+) {
+    emit(
+        kind,
+        surface,
+        admission,
+        sandbox.template_id.as_deref().unwrap_or(UNKNOWN_TEMPLATE),
+        effective(sandbox.vcpu, sandbox.memory_mib),
+        None,
     );
 }
 
