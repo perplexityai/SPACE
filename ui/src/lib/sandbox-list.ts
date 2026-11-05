@@ -59,10 +59,13 @@ export interface SandboxListFilters {
   olderThan: CreatedAge | null;
   // A name prefix (case-sensitive) or ID prefix, as typed.
   prefix: string;
+  // A name prefix ignoring case, or an ID suffix, as typed; only for a
+  // server that takes `search` (see `isSearchUnsupported`).
+  search: string;
 }
 
 export const NO_FILTERS: SandboxListFilters = {
-  org: null, lifecycles: [], template: null, userId: null, createdWithin: null, olderThan: null, prefix: '',
+  org: null, lifecycles: [], template: null, userId: null, createdWithin: null, olderThan: null, prefix: '', search: '',
 };
 
 // The query string of one list request. A sampled request is the first page
@@ -90,7 +93,24 @@ export function sandboxListQuery(
   // The server refuses a NUL, which no typed prefix needs.
   const prefix = filters.prefix.trim().replaceAll('\0', '');
   if (prefix) params.set('prefix', prefix);
+  const search = filters.search.trim().replaceAll('\0', '');
+  if (search) params.set('search', search);
   return params.toString();
+}
+
+// The answer of a server that predates `search` to a paged request carrying
+// it: a 400 naming the parameter, since a paging server refuses an unknown
+// one once `cursor` is present. The console then searches as it did before
+// (`sandboxSearch` without `serverSearch`) until the page is reloaded.
+export function isSearchUnsupported(error: unknown): boolean {
+  const { status, message } = (error ?? {}) as { status?: unknown; message?: unknown };
+  return status === 400 && typeof message === 'string' && message.includes('unknown query parameter "search"');
+}
+
+// The User column's label: the owner's email when the server sends one,
+// else the node-reported owner, else the start of the user ID.
+export function sandboxUserLabel(row: Pick<Sandbox, 'user_id' | 'user' | 'user_email'>): string {
+  return row.user_email || row.user || (row.user_id ? row.user_id.slice(0, 8) : '—');
 }
 
 // What one list request asks for: the list shape, the page size or sample
@@ -125,6 +145,7 @@ export function listScope(
     within: sent.createdWithin ?? '',
     older: sent.olderThan ?? '',
     prefix: sent.prefix.trim().replaceAll('\0', ''),
+    search: sent.search.trim().replaceAll('\0', ''),
   }).toString();
   return { mode, limit, cursor: at, filters: sent, key };
 }

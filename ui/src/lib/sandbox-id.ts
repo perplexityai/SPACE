@@ -148,8 +148,12 @@ function startsUuid(value: string): boolean {
     dashed && UUID_DASH_POSITIONS.includes(position) ? character === '-' : /^[0-9a-f]$/.test(character));
 }
 
-// What the search box does on each list shape.
+// What the search box does on each list shape. `serverSearch` says the
+// server takes `search` (a name prefix ignoring case, or an ID suffix such as
+// the ID column's label); until it does not, the search box's text goes there.
 // - `ref`: a full identifier in any accepted form, looked up directly.
+// - `search`: sent to a server that takes `search`, as typed: every text but
+//   an ID prefix, which `prefix` matches and an ID suffix would not.
 // - `prefix`: sent to a paging server as typed. It matches the start of
 //   names case-sensitively, and the start of IDs: an `sbx_` ID prefix, or a
 //   dashed one in the UUID's layout, with hex digits in either case. The
@@ -166,14 +170,17 @@ function startsUuid(value: string): boolean {
 // - `page`: matched within the loaded rows, ignoring case, anywhere in the ID
 //   or name. On a paging server this is only text no name can start with. A
 //   sampled list matches all free text this way, as it did before paging.
+// The `prefix`, `fragment` and `page` matches of a paging server are those of
+// a server without `search`.
 export type SandboxSearch =
   | { kind: 'empty' }
   | { kind: 'ref'; ref: SandboxRef }
+  | { kind: 'search'; text: string }
   | { kind: 'prefix'; prefix: string }
   | { kind: 'fragment'; prefix: string; query: Extract<SandboxQuery, { kind: 'text' }> }
   | { kind: 'page'; query: Extract<SandboxQuery, { kind: 'text' }> };
 
-export function sandboxSearch(input: string, mode: ListMode): SandboxSearch {
+export function sandboxSearch(input: string, mode: ListMode, serverSearch = false): SandboxSearch {
   const query = sandboxQuery(input);
   if (query.kind === 'empty') return query;
   if (query.kind === 'ref') return query;
@@ -186,6 +193,8 @@ export function sandboxSearch(input: string, mode: ListMode): SandboxSearch {
     return { kind: 'prefix', prefix: `${PUBLIC_SANDBOX_ID_PREFIX}${afterMarker}` };
   }
   if (lower.includes('-') && startsUuid(lower)) return { kind: 'prefix', prefix: typed };
+  // The server refuses a NUL, which no name or ID holds.
+  if (serverSearch) return { kind: 'search', text: typed.replaceAll('\0', '') };
   const idFragment = /^[0-9a-f-]+$/.test(lower) && /[0-9a-f]/.test(lower);
   const namePrefix = !typed.includes('\0') && new TextEncoder().encode(typed).length <= MAX_SANDBOX_NAME_BYTES;
   if (!namePrefix) return { kind: 'page', query };

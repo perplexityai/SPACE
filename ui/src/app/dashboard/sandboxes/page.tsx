@@ -46,6 +46,7 @@ import {
   PAGE_SIZE_OPTIONS,
   createdAgeMs,
   fragmentSearchScope,
+  isSearchUnsupported,
   listRequestQuery,
   listSections,
   loadedRowFilter,
@@ -53,6 +54,7 @@ import {
   parseListLink,
   parsePageSize,
   sameScope,
+  sandboxUserLabel,
   showsOlderFormat,
   templateFilterOptions,
   type AgeWindow,
@@ -133,11 +135,15 @@ function sandboxesRefreshKey(scope: ListScope): string {
 class RefreshSkipped extends Error {}
 const SCOPE_CHANGED = 'the selected page, filters or size changed';
 const VERSION_CHANGED = 'the API changed version while this page was open';
+const SEARCH_UNSUPPORTED = 'the API does not take search; searching as before';
 // A load error, a stopped list or an older-format answer, which the page
 // already shows above the table.
 class ShownListError extends Error {}
 const alreadyReported = (err: unknown) => err instanceof RefreshSkipped || err instanceof ShownListError;
 const REFRESH_CLICK_COOLDOWN_MS = 3000;
+// Firecracker, the only runtime SPACE implements, so the create form offers
+// no choice.
+const SANDBOX_RUNTIME = 'fc';
 
 // No age limit by default: long-running sandboxes are the ones support
 // cases tend to be about.
@@ -176,9 +182,10 @@ interface FilterInputs {
   user: string | null;
   age: AgeWindow;
   older: OlderThan;
-  // The search box as a paging server's prefix; see `sandboxSearch`. A
-  // sampled request does not send it.
+  // The search box as a paging server's prefix or search; see
+  // `sandboxSearch`. A sampled request sends neither.
   prefix: string;
+  search: string;
 }
 
 function serverFilters(inputs: FilterInputs): SandboxListFilters {
@@ -190,6 +197,7 @@ function serverFilters(inputs: FilterInputs): SandboxListFilters {
     createdWithin: ageWindowAge(inputs.age),
     olderThan: olderThanAge(inputs.older),
     prefix: inputs.prefix,
+    search: inputs.search,
   };
 }
 
@@ -322,7 +330,11 @@ function isPoolSandbox(sandbox: Sandbox) {
 function sandboxResourceTag(sandbox: Sandbox) {
   switch (sandbox.resource_type) {
     case 'pool_slot':
-      return <Tag color="cyan" style={{ marginInlineEnd: 0 }}>Pool slot</Tag>;
+      return (
+        <Tooltip title={sandbox.pool_id ? `Warm-pool slot of pool ${sandbox.pool_id}` : 'Warm-pool slot'}>
+          <Tag color="cyan" style={{ marginInlineEnd: 0 }}>Pool slot</Tag>
+        </Tooltip>
+      );
     case 'observed_local':
       return <Tag color="default" style={{ marginInlineEnd: 0 }}>Observed local</Tag>;
     default:
@@ -763,15 +775,20 @@ function SandboxesPage() {
   // Applied by the admin API (`org_id`) on either list shape.
   const [orgFilter, setOrgFilter] = useState<string | null>(() => parseOrgParam(searchParams.get('org')));
   const query = useMemo(() => sandboxQuery(idFilter), [idFilter]);
+  // Whether the API takes `search`. Assumed until a paged request carrying it
+  // is refused as an unknown parameter (`isSearchUnsupported`), as an API
+  // from before it answers; the search box then works as it did before, until
+  // the page is reloaded.
+  const [serverSearch, setServerSearch] = useState(true);
   // The selected statuses this list applies, and those it cannot.
   const statusSplit = useMemo(() => splitStatusFilter(listMode === 'paged', statusFilter), [listMode, statusFilter]);
   // What the search box does on this list's shape: a direct lookup, a prefix
   // the server matches, a match within the loaded rows, or both of the last
   // two for hex digits and dashes.
-  const search = useMemo(() => sandboxSearch(idFilter, listMode), [idFilter, listMode]);
+  const search = useMemo(() => sandboxSearch(idFilter, listMode, serverSearch), [idFilter, listMode, serverSearch]);
   // The filters are those of a paged request whatever the shape on screen;
   // a sampled request sends only the org (`listScope`).
-  const pagedSearch = useMemo(() => sandboxSearch(idFilter, 'paged'), [idFilter]);
+  const pagedSearch = useMemo(() => sandboxSearch(idFilter, 'paged', serverSearch), [idFilter, serverSearch]);
   const filterInputs: FilterInputs = {
     org: orgFilter,
     statuses: splitStatusFilter(true, statusFilter).applied,
@@ -780,9 +797,12 @@ function SandboxesPage() {
     age: ageWindow,
     older: olderThan,
     prefix: pagedSearch.kind === 'prefix' ? pagedSearch.prefix : '',
+    search: pagedSearch.kind === 'search' ? pagedSearch.text : '',
   };
   const filterInputsKey = JSON.stringify(filterInputs);
-  const appliedInputsRef = useRef({ key: filterInputsKey, prefix: filterInputs.prefix });
+  // What the search box sends, which changes as the operator types.
+  const typedSearch = `${filterInputs.prefix}\n${filterInputs.search}`;
+  const appliedInputsRef = useRef({ key: filterInputsKey, typed: typedSearch });
   // The selected scope, the rows' scope and the next page's cursor, and the
   // loads in flight; see `ListSelection`. The filters change only once a
   // filter does. The creation-time bounds stay relative ("the last hour")
@@ -908,6 +928,11 @@ function SandboxesPage() {
     // The shape and the page position on screen change with the rows.
     setListMode(result.scope.mode);
     setPosition(selection.position);
+    if (result.kind === 'failed' && isSearchUnsupported(result.error)) {
+      // Searching as before changes the filters, which reloads the list.
+      setServerSearch(false);
+      throw new RefreshSkipped(SEARCH_UNSUPPORTED);
+    }
     if (result.kind === 'failed') {
       const err = result.error as { message?: string } | null;
       const text = err?.message || 'failed to refresh sandboxes';
@@ -1023,7 +1048,6 @@ function SandboxesPage() {
     name?: string;
     org_id?: string;
     template: string;
-    runtime: string;
     snapshots?: boolean;
   }) => {
     if (creatingRef.current) return;
@@ -1033,7 +1057,7 @@ function SandboxesPage() {
       const payload = {
         name: values.name || null,
         template: values.template,
-        runtime: values.runtime,
+        runtime: SANDBOX_RUNTIME,
         env: {},
         metadata: {},
         resources: null,
@@ -1063,10 +1087,7 @@ function SandboxesPage() {
         snapshotsOff: isHiddenOperationError,
       });
       form.resetFields();
-      form.setFieldsValue({
-        runtime: 'fc',
-        template: templates[0]?.name,
-      });
+      form.setFieldsValue({ template: templates[0]?.name });
       setCustomCreateAutoLifecycle(null);
       createLifecycleForm.resetFields();
       refreshAndReport();
@@ -1254,9 +1275,9 @@ function SandboxesPage() {
     if (appliedInputsRef.current.key === filterInputsKey && appliedSizesRef.current.pageSize === pageSize && appliedSizesRef.current.listLimit === listLimit) {
       return;
     }
-    const delay = appliedInputsRef.current.prefix !== filterInputs.prefix ? 300 : 0;
+    const delay = appliedInputsRef.current.typed !== typedSearch ? 300 : 0;
     const timer = setTimeout(() => {
-      appliedInputsRef.current = { key: filterInputsKey, prefix: filterInputs.prefix };
+      appliedInputsRef.current = { key: filterInputsKey, typed: typedSearch };
       appliedSizesRef.current = { pageSize, listLimit };
       const plan = selection.select({ filters: serverFilters(filterInputs), pageSize, sampleSize: listLimit });
       if (plan === 'unchanged') return;
@@ -1461,7 +1482,8 @@ function SandboxesPage() {
 
   const userFilterLabel = useMemo(() => {
     if (!userFilter) return null;
-    return sandboxes.find((s) => s.user_id === userFilter)?.user || userFilter.slice(0, 8);
+    const row = sandboxes.find((s) => s.user_id === userFilter);
+    return row ? sandboxUserLabel(row) : userFilter.slice(0, 8);
   }, [sandboxes, userFilter]);
 
   const clearFilters = () => {
@@ -1601,13 +1623,14 @@ function SandboxesPage() {
     {
       title: 'User',
       dataIndex: 'user',
-      width: 95,
+      width: 170,
       ellipsis: true,
       render: (v: string, record) => {
         if (!record.user_id) return v || '—';
         const userId = record.user_id;
+        const label = sandboxUserLabel(record);
         return (
-          <Tooltip title={`Show only ${v || 'this user'}'s sandboxes`}>
+          <Tooltip title={`Show only ${label}'s sandboxes (user ${userId})`}>
             <Button
               type="link"
               size="small"
@@ -1617,7 +1640,7 @@ function SandboxesPage() {
                 setUserFilter(userId);
               }}
             >
-              {v || userId.slice(0, 8)}
+              {label}
             </Button>
           </Tooltip>
         );
@@ -1674,9 +1697,6 @@ function SandboxesPage() {
           form={form}
           layout="inline"
           onFinish={handleCreate}
-          initialValues={{
-            runtime: 'fc',
-          }}
         >
           <div style={{ display: 'flex', alignItems: 'center', gap: 8, width: '100%', flexWrap: 'wrap' }}>
             <Text strong>Create sandbox</Text>
@@ -1695,14 +1715,6 @@ function SandboxesPage() {
             )}
             <Form.Item name="name" style={{ marginBottom: 0 }}>
               <Input placeholder="Name" style={{ width: 150 }} />
-            </Form.Item>
-            <Form.Item name="runtime" style={{ marginBottom: 0 }}>
-              <Select style={{ width: 130 }}>
-                <Select.Option value="fc">Firecracker</Select.Option>
-                <Select.Option value="gvisor" disabled>gVisor</Select.Option>
-                <Select.Option value="ch" disabled>Cloud Hypervisor</Select.Option>
-                <Select.Option value="hyperv" disabled>Hyper-V</Select.Option>
-              </Select>
             </Form.Item>
             <Form.Item name="template" rules={[{ required: true }]} style={{ marginBottom: 0 }}>
               <Select placeholder="Template" style={{ width: 150 }}>
@@ -1736,13 +1748,17 @@ function SandboxesPage() {
             <Input
               allowClear
               size="small"
-              placeholder={paged ? 'Case-sensitive name prefix, ID prefix or full ID' : 'ID, pod name or name'}
+              placeholder={!paged ? 'ID, pod name or name' : serverSearch ? 'Name, ID label or full ID' : 'Case-sensitive name prefix, ID prefix or full ID'}
               value={idFilter}
               onChange={(e) => setIdFilter(e.target.value)}
               style={{ width: 290 }}
               aria-label="Search sandboxes"
             />
-            {paged ? (
+            {paged && serverSearch ? (
+              <Tooltip title="Searched on the server across the whole list: names that start with the text, ignoring case, and IDs that end with it, such as the ID column's label (at least 4 hex digits; dashes and sbx_ are ignored). An ID start, sbx_ followed by hex digits or a dashed UUID start, matches IDs that start with it. A full ID or pod name is looked up directly.">
+                <QuestionCircleOutlined aria-label="About the search" style={{ color: 'rgba(0, 0, 0, 0.45)' }} />
+              </Tooltip>
+            ) : paged ? (
               <Tooltip title="A name or ID prefix is searched on the server as typed. Names match case-sensitively; an ID prefix starts with sbx_ or is a dashed UUID start, and its hex matches in either case. Hex digits and dashes alone, such as the ID column's label or a name like e2e-1, are matched two ways: anywhere in the IDs and names of this page, ignoring case, and on the server as the start of any name or ID, listed after this page. A full ID or pod name is looked up directly.">
                 <QuestionCircleOutlined aria-label="About the search" style={{ color: 'rgba(0, 0, 0, 0.45)' }} />
               </Tooltip>

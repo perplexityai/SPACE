@@ -133,7 +133,9 @@ function datadogTimeWindowParams(createdAt: string | null): DatadogTimeWindowPar
   };
 }
 
-function datadogLogsUrl(sandbox: Sandbox, timeWindowParams: DatadogTimeWindowParams): string {
+// The configured Datadog Logs explorer URL with the sandbox's query and time
+// window; the configured URL's other parameters are kept.
+function datadogLogsUrl(sandbox: Sandbox, timeWindowParams: DatadogTimeWindowParams, logsUrl: string): string {
   const sandboxUuid = sandboxUuidPart(sandbox.id);
   const sandboxPodName = `space-sbx-${sandboxIdWithoutDashes(sandbox.id)}-*`;
   const params = new URLSearchParams({
@@ -151,7 +153,9 @@ function datadogLogsUrl(sandbox: Sandbox, timeWindowParams: DatadogTimeWindowPar
     ...timeWindowParams,
   });
 
-  return `https://app.datadoghq.com/logs?${params.toString()}`;
+  const url = new URL(logsUrl);
+  params.forEach((value, key) => url.searchParams.set(key, value));
+  return url.toString();
 }
 
 function datadogDebugDashboardUrl(
@@ -1239,7 +1243,7 @@ function ControlButtons({ sandbox, onAction, busy }: {
   );
 }
 
-export default function SandboxDetailPage({ dashboardUrl }: { dashboardUrl: string | null }) {
+export default function SandboxDetailPage({ dashboardUrl, logsUrl }: { dashboardUrl: string | null; logsUrl: string | null }) {
   const { message } = App.useApp();
   const params = useParams<{ id: string }>();
   const router = useRouter();
@@ -1536,7 +1540,7 @@ export default function SandboxDetailPage({ dashboardUrl }: { dashboardUrl: stri
   if (!sandbox) return null;
 
   const datadogTimeWindow = datadogTimeWindowParams(sandbox.created_at);
-  const datadogLogsHref = datadogLogsUrl(sandbox, datadogTimeWindow);
+  const datadogLogsHref = logsUrl ? datadogLogsUrl(sandbox, datadogTimeWindow, logsUrl) : null;
   const datadogDashboardHref = dashboardUrl
     ? datadogDebugDashboardUrl(sandbox, datadogTimeWindow, dashboardUrl)
     : null;
@@ -1566,9 +1570,11 @@ export default function SandboxDetailPage({ dashboardUrl }: { dashboardUrl: stri
           ) : null}
           <div style={{ marginLeft: 'auto' }}>
             <Space>
-              <Button size="small" href={datadogLogsHref} target="_blank" rel="noreferrer">
-                Datadog logs
-              </Button>
+              {datadogLogsHref && (
+                <Button size="small" href={datadogLogsHref} target="_blank" rel="noreferrer">
+                  Datadog logs
+                </Button>
+              )}
               {datadogDashboardHref && (
                 <Button size="small" href={datadogDashboardHref} target="_blank" rel="noreferrer">
                   Debug Dashboard
