@@ -162,8 +162,9 @@ reviews:
       where it guards a lifecycle write. Refusing or reordering a valid write is
       not this.
 
-    The items below apply to behavior changes only, except the privilege
-    item; the cases above keep their rating. Deleting or weakening a test is never mechanical.
+    The items below apply to behavior changes only, except the privilege and
+    weakened-test items, which apply to every change; other cases above keep
+    their rating.
 
     At least moderate:
     - a behavior change with no test and no stated reason;
