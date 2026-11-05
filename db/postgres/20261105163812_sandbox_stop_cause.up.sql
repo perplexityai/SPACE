@@ -1,10 +1,14 @@
 SET LOCAL lock_timeout = '1s';
 SET LOCAL statement_timeout = '5s';
 
--- Why a stopped sandbox stopped when no one asked it to, as its node
--- published it (`pod_terminated`, `vm_exited`), and when the node stopped it.
--- NULL for a requested stop. The publish ingest's stopped convergence writes
--- both columns; the admin sandbox response reads them.
+-- The node's attribution of the sandbox's last stop, as it published it with
+-- a `stopped` status: why the sandbox stopped when no one asked it to
+-- (`pod_terminated`, `vm_exited`), and when the node stopped it. A requested
+-- stop is attributed too, with a NULL `stop_cause` and its time; both NULL
+-- means no attribution is recorded (the sandbox ran since, or its node
+-- predates attributions). The publish ingest writes both columns, in a
+-- statement of its own, from a newer attribution; the admin sandbox response
+-- reads them.
 --
 -- `stop_cause_at` is the node's clock for the stop. `lifecycle_changed_at`
 -- can't stand in for it: it is the control plane's time of the convergence,
@@ -12,8 +16,8 @@ SET LOCAL statement_timeout = '5s';
 -- a stopped sandbox's evacuation (`stopped` -> `restoring` -> `stopped`)
 -- included, which keeps the cause.
 --
--- Nullable with no default, backfill, CHECK or index: NULL means no cause, the
--- labels belong to the writer's enum, and nothing filters on either column.
+-- Nullable with no default, backfill, CHECK or index: the labels belong to the
+-- writer's enum, and nothing filters on either column.
 ALTER TABLE public.sandboxes
     ADD COLUMN stop_cause text,
     ADD COLUMN stop_cause_at timestamp with time zone;
@@ -22,11 +26,10 @@ CREATE FUNCTION public.sandboxes_clear_stop_cause() RETURNS trigger
     LANGUAGE plpgsql
     AS $$
 BEGIN
-    -- A cause lasts until the sandbox runs again: a start, wake or restore
-    -- that reaches `started` or `paused` ends the stop it describes. Every
-    -- other move keeps it, so a stopped sandbox's evacuation and the stop's
-    -- own retries don't lose it; a later unexpected stop writes its own cause
-    -- when it converges, and a requested one converges with none.
+    -- An attribution lasts until the sandbox runs again: a start, wake or
+    -- restore that reaches `started` or `paused` ends the stop it describes.
+    -- Every other move keeps it, so a stopped sandbox's evacuation doesn't
+    -- lose it; the node's attribution of a later stop replaces it.
     IF NEW.lifecycle IS DISTINCT FROM OLD.lifecycle
        AND LOWER(TRIM(NEW.lifecycle)) IN ('started', 'paused')
     THEN
