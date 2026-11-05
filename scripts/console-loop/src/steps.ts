@@ -10,6 +10,7 @@ import {
 } from './browser.ts';
 import { TERMINAL_OPERATION_STATES } from './api.ts';
 import { verifyFixtures } from './fixtures.ts';
+import { SYNTHETIC_HEADER } from './recorder.ts';
 import { orgDisplayName, recordCreated } from './seed.ts';
 
 export interface Step {
@@ -290,62 +291,67 @@ step('sandboxes-search-id', ['sandboxes'], async (c) => {
 });
 
 // The search box's text goes to the server's `search` (a name prefix
-// ignoring case, or the start or end of an ID's hex digits, such as the ID
+// ignoring case, or the end or start of an ID's hex digits, such as the ID
 // column's label), so a match beyond the loaded page is found. An API
 // without `search` refuses it with a 400 naming the parameter, and the
 // console then searches as before: a case-sensitive `prefix` request, and a
 // match within the page for hex text. `server` and `fallback` are those two
 // answers; anything else, a timeout included, is `failed`, and fails the
-// step. `followUp` is the fallback's own list request, without `search`.
-type SearchAnswer = { kind: 'server' | 'failed' } | { kind: 'fallback'; followUp: URL | null };
+// step. A fallback carries the answer to its `prefix` request, once rendered.
+type SearchAnswer =
+  | { kind: 'server' | 'failed' }
+  | { kind: 'fallback'; prefixAnswer: { sandboxes: { resource_type?: string }[] } | null };
 const isListRequest = (url: URL) => url.pathname.endsWith('/admin/api/v1/sandboxes');
+const UNKNOWN_SEARCH = 'unknown query parameter "search"';
 
 const typeSearch = async (c: Ctx, typed: string): Promise<SearchAnswer> => {
-  const lists: URL[] = [];
-  const onRequest = (req: Request) => {
-    const url = new URL(req.url());
-    if (isListRequest(url)) lists.push(url);
-  };
-  c.page.on('request', onRequest);
-  try {
-    const answered = c.page.waitForResponse((res) => {
-      const url = new URL(res.url());
-      return isListRequest(url) && url.searchParams.get('search') === typed;
-    }, { timeout: 10_000 }).catch(() => null);
-    await content(c.page).locator('input[placeholder*="ID"]').first().fill(typed);
-    const res = await answered;
-    await c.page.waitForTimeout(2000);
-    let answer: SearchAnswer = { kind: 'failed' };
-    if (res?.ok()) {
-      answer = { kind: 'server' };
-    } else if (res?.status() === 400) {
-      const body = await res.json().catch(() => null);
-      if (body?.error === 'unknown query parameter "search"') {
-        const followUp = lists.find((url) => !url.searchParams.has('search') && url.searchParams.get('prefix') === typed) ?? null;
-        answer = { kind: 'fallback', followUp };
-      }
-    }
-    c.rec.check(answer.kind !== 'failed', `"${typed}" was answered as search, or refused as an unknown parameter (${res ? res.status() : 'no answer'})`);
-    if (answer.kind !== 'failed') c.rec.note(answer.kind === 'server' ? `the server answered "${typed}" as search` : `an API without search refused "${typed}"; the console searched as before`);
-    return answer;
-  } finally {
-    c.page.off('request', onRequest);
+  const answered = c.page.waitForResponse((res) => {
+    const url = new URL(res.url());
+    return isListRequest(url) && url.searchParams.get('search') === typed;
+  }, { timeout: 10_000 }).catch(() => null);
+  const prefixAnswered = c.page.waitForResponse((res) => {
+    const url = new URL(res.url());
+    return isListRequest(url) && !url.searchParams.has('search') && url.searchParams.get('prefix') === typed;
+  }, { timeout: 15_000 }).catch(() => null);
+  await content(c.page).locator('input[placeholder*="ID"]').first().fill(typed);
+  const res = await answered;
+  let answer: SearchAnswer = { kind: 'failed' };
+  if (res?.ok()) {
+    answer = { kind: 'server' };
+  } else if (res?.status() === 400 && (await res.json().catch(() => null))?.error === UNKNOWN_SEARCH) {
+    const prefixRes = await prefixAnswered;
+    answer = { kind: 'fallback', prefixAnswer: prefixRes?.ok() ? await prefixRes.json().catch(() => null) : null };
   }
+  await c.page.waitForTimeout(1500);
+  c.rec.check(answer.kind !== 'failed', `"${typed}" was answered as search, or refused as an unknown parameter (${res ? res.status() : 'no answer'})`);
+  if (answer.kind === 'fallback') {
+    c.rec.note(`an API without search refused "${typed}"; the console searched as before`);
+    c.rec.check(answer.prefixAnswer !== null, `the fallback's prefix request for "${typed}" was answered`);
+  } else if (answer.kind === 'server') {
+    c.rec.note(`the server answered "${typed}" as search`);
+  }
+  return answer;
 };
+
+// The ID labels the main table lists, in order.
+const listedLabels = async (c: Ctx): Promise<string[]> =>
+  (await content(c.page).locator('.ant-table').first().locator('tbody tr.ant-table-row td:first-child').allInnerTexts())
+    .map((text) => text.trim());
 
 step('sandboxes-search-label', ['sandboxes'], async (c) => {
   const id = sandboxId(c, 'running');
   if (!id) return c.rec.check(false, 'the seed has a running sandbox');
   await visit(c, '/dashboard/sandboxes?age=all&page_size=25', 2000);
   const label = shortLabel(id);
+  // The fallback matches within the page shown, so it lists exactly the rows
+  // of this page that carry the label.
+  const onPage = (await listedLabels(c)).filter((shown) => shown.includes(label));
   const answer = await typeSearch(c, label);
-  const rows = content(c.page).locator('tbody tr.ant-table-row');
-  const labels = (await rows.locator('td:first-child').allInnerTexts()).map((text) => text.trim());
+  const labels = await listedLabels(c);
   if (answer.kind === 'server') {
     c.rec.check(labels.length === 1 && labels[0] === label, `searching the ID column's label lists exactly that sandbox (${labels.join(', ')})`);
   } else if (answer.kind === 'fallback') {
-    c.rec.check(answer.followUp !== null, 'the fallback sends the label as a prefix, as before');
-    c.rec.check(labels.every((shown) => shown.includes(label)), 'the fallback lists only rows of this page that match the label');
+    c.rec.check(JSON.stringify(labels) === JSON.stringify(onPage), `the fallback lists the rows of this page that carry the label (${labels.join(', ')}; expected ${onPage.join(', ')})`);
   }
 });
 
@@ -356,13 +362,74 @@ step('sandboxes-search-name-case', ['sandboxes'], async (c) => {
   const name = `${c.config.prefix}-suspended`;
   const typed = name.toUpperCase();
   const answer = await typeSearch(c, typed);
-  const rows = content(c.page).locator('tbody tr.ant-table-row');
+  const labels = await listedLabels(c);
   if (answer.kind === 'server') {
-    c.rec.check(await rows.count() === 1 && await rows.filter({ hasText: shortLabel(id) }).count() === 1, `searching ${typed} lists ${name} alone`);
-  } else if (answer.kind === 'fallback') {
-    // A case-sensitive prefix, as before: the seeded names are lower case.
-    c.rec.check(answer.followUp !== null, `the fallback sends ${typed} as a prefix, as before`);
-    c.rec.check(await rows.count() === 0, `the fallback's case-sensitive prefix lists nothing for ${typed}`);
+    c.rec.check(labels.length === 1 && labels[0] === shortLabel(id), `searching ${typed} lists ${name} alone (${labels.join(', ')})`);
+  } else if (answer.kind === 'fallback' && answer.prefixAnswer) {
+    // A case-sensitive prefix, as before: the table lists what it answered.
+    const answeredRows = answer.prefixAnswer.sandboxes.filter((row) => row.resource_type === 'sandbox').length;
+    c.rec.check(labels.length === answeredRows, `the fallback lists the ${answeredRows} rows its case-sensitive prefix answered (${labels.length})`);
+  }
+});
+
+// The cursor of the page after `row`, as the admin list encodes one:
+// `v1:<created_at in Unix nanoseconds>:<id>`, base64url without padding.
+const cursorAfter = (row: { id: string; created_at: string }): string => {
+  const [, seconds, fraction = ''] = /^(.*?:\d\d)(?:\.(\d+))?Z$/.exec(row.created_at) ?? [];
+  const nanos = BigInt(Date.parse(`${seconds}Z`) / 1000) * 1_000_000_000n + BigInt(fraction.padEnd(9, '0').slice(0, 9) || '0');
+  return Buffer.from(`v1:${nanos}:${row.id}`).toString('base64url');
+};
+
+// The fallback after an API refuses `search` makes its match within the page
+// the search was typed on. The step plays an API without `search`: it
+// answers any request carrying it with that API's 400, and it cuts the first
+// page to its first sandbox with the cursor after it, so page 2 holds the
+// seeded sandboxes. It types the label of page 2's first row on page 2, and
+// that row must be listed, alone, on page 2.
+step('sandboxes-search-fallback-page', ['sandboxes'], async (c) => {
+  const handler = async (route: Route) => {
+    const url = new URL(route.request().url());
+    if (!isListRequest(url)) return route.continue();
+    if (url.searchParams.has('search')) {
+      return route.fulfill({
+        status: 400,
+        contentType: 'application/json',
+        headers: { [SYNTHETIC_HEADER]: '1' },
+        body: JSON.stringify({ error: UNKNOWN_SEARCH }),
+      });
+    }
+    if (url.searchParams.get('cursor') !== '' || url.searchParams.has('prefix')) return route.continue();
+    const res = await fetchWithoutRedirect(route);
+    if (!res) return;
+    const body = await res.json().catch(() => null);
+    const rows = (body?.sandboxes ?? []).filter((row: { resource_type?: string }) => row.resource_type === 'sandbox');
+    if (rows.length < 2) return route.fulfill({ response: res });
+    return route.fulfill({
+      response: res,
+      headers: { ...res.headers(), [SYNTHETIC_HEADER]: '1' },
+      json: { sandboxes: [rows[0]], next_cursor: cursorAfter(rows[0]) },
+    });
+  };
+  await c.page.route('**/admin/api/v1/sandboxes?*', handler);
+  try {
+    await visit(c, '/dashboard/sandboxes?age=all&page_size=25', 2500);
+    await content(c.page).getByRole('button', { name: /Next/ }).first().click();
+    await settle(c.page, 2500);
+    const page2 = await listedLabels(c);
+    if (!page2.length) return c.rec.check(false, 'page 2 lists the seeded sandboxes');
+    const known = page2[0];
+    const reloaded = c.page.waitForResponse((res) => {
+      const url = new URL(res.url());
+      return isListRequest(url) && !url.searchParams.has('search') && !!url.searchParams.get('cursor');
+    }, { timeout: 15_000 }).catch(() => null);
+    await content(c.page).locator('input[placeholder*="ID"]').first().fill(known);
+    c.rec.check((await reloaded)?.ok() === true, 'after the 400 the fallback reloads page 2');
+    await settle(c.page, 1500);
+    const labels = await listedLabels(c);
+    c.rec.check(/Page 2/.test(await text(c.page)), 'the fallback stays on page 2');
+    c.rec.check(labels.length === 1 && labels[0] === known, `the fallback lists ${known}, the page-2 row typed (${labels.join(', ')})`);
+  } finally {
+    await c.page.unroute('**/admin/api/v1/sandboxes?*', handler);
   }
 });
 
@@ -370,8 +437,11 @@ step('sandboxes-user-email', ['sandboxes'], async (c) => {
   const id = sandboxId(c, 'running');
   if (!id) return c.rec.check(false, 'the seed has a running sandbox');
   const api = await adminFetch(c.page, 'GET', `/admin/api/v1/sandboxes/${id}`);
-  const userEmail = api.json?.user_email;
-  if (typeof userEmail !== 'string') return c.rec.note('the API reports no user_email; the User column shows the user ID');
+  if (!api.json || !('user_email' in api.json)) return c.rec.note('the API reports no user_email; the User column shows the user ID');
+  const userEmail = api.json.user_email;
+  // The seeded sandbox's owner is a local user, whose email the API reports.
+  c.rec.check(typeof userEmail === 'string' && userEmail.length > 0, `the API reports the owner's email (${userEmail})`);
+  if (typeof userEmail !== 'string') return;
   // Its full ID, which the list looks up wherever the sandbox is.
   await visit(c, `/dashboard/sandboxes?age=all&id=${id}`, 3000);
   const row = content(c.page).locator('tbody tr.ant-table-row', { hasText: shortLabel(id) });
