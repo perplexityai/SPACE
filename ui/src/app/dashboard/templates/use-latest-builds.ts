@@ -5,6 +5,7 @@ import { adminApi } from '@/lib/api';
 import { isMissingRoute, pageRows } from '@/lib/admin-fallback';
 import { errorMessage } from '@/lib/template-format';
 import { ReadQueue } from '@/lib/read-queue';
+import { READ_TIMEOUT_MS } from '@/lib/template-reads';
 import type { LatestBuild } from '@/lib/template-list';
 import type { TemplateBuildListEntry } from '@/lib/types';
 import { encodedPathSegment } from './use-templates-data';
@@ -29,14 +30,19 @@ export function useLatestBuilds(wanted: string[], reloadKey: number) {
   const [entries, setEntries] = useState<ReadonlyMap<string, Entry>>(() => new Map());
   const [unsupported, setUnsupported] = useState(false);
   const entriesRef = useRef(entries);
-  entriesRef.current = entries;
   const unsupportedRef = useRef(false);
   // When the API last answered that it has no builds route.
   const unsupportedAt = useRef(0);
   const queue = useRef(new ReadQueue(CONCURRENCY));
   const mounted = useRef(false);
   const wantedRef = useRef(new Set(wanted));
-  wantedRef.current = new Set(wanted);
+
+  // Synced after each commit, before the effects below read them: a render
+  // React discards must not leave them holding what no committed view showed.
+  useEffect(() => {
+    entriesRef.current = entries;
+    wantedRef.current = new Set(wanted);
+  });
 
   // Set in the effect, not at first render: Strict Mode runs the cleanup and
   // the setup again on a mounted component. The cleanup drops the reads not
@@ -57,7 +63,10 @@ export function useLatestBuilds(wanted: string[], reloadKey: number) {
 
   const read = async (name: string) => {
     try {
-      const body = await adminApi.get<unknown>(`/v1/templates/${encodedPathSegment(name)}/builds?limit=1`);
+      // Bounded, so a stalled read cannot hold one of the queue's slots.
+      const body = await adminApi.get<unknown>(`/v1/templates/${encodedPathSegment(name)}/builds?limit=1`, {
+        signal: AbortSignal.timeout(READ_TIMEOUT_MS),
+      });
       const [build] = pageRows<TemplateBuildListEntry>(body).rows;
       unsupportedRef.current = false;
       if (mounted.current) setUnsupported(false);

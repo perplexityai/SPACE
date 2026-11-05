@@ -8,6 +8,7 @@ import { idempotencyKey } from '@/lib/public-api';
 import { publicSandboxIdFromAny, sandboxLabelOrId } from '@/lib/sandbox-id';
 import { buildsRead, errorMessage, shortHash, type BuildsView } from '@/lib/template-format';
 import { isMissingRoute, pageRows } from '@/lib/admin-fallback';
+import { latestRead } from '@/lib/template-reads';
 import type { PoolInfo, TemplateBuildListEntry } from '@/lib/types';
 import { BuildStateTag } from './template-cells';
 import { encodedPathSegment, type TemplatePoolStatusResponse } from './use-templates-data';
@@ -27,30 +28,32 @@ export function TemplateBuildsPanel({ templateName, open, reloadKey }: { templat
   const [builds, setBuilds] = useState<TemplateBuildListEntry[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [unsupported, setUnsupported] = useState(false);
-  // Only the newest read may write: a page refresh can overlap a Retry.
-  const request = useRef(0);
+  // A page refresh joins a read already out; opening the panel, another
+  // template or Retry supersedes it.
+  const [reads] = useState(() => latestRead<TemplateBuildListEntry[]>());
 
   const load = (background = false) => {
-    const current = ++request.current;
     if (!background) {
       setBuilds(null);
       setError(null);
     }
-    adminApi
-      .get<unknown>(`/v1/templates/${encodedPathSegment(templateName)}/builds?limit=${TEMPLATE_BUILDS_LIMIT}`)
-      .then((body) => {
-        if (current !== request.current) return;
-        setBuilds(pageRows<TemplateBuildListEntry>(body).rows);
+    const read = (signal: AbortSignal) => adminApi
+      .get<unknown>(`/v1/templates/${encodedPathSegment(templateName)}/builds?limit=${TEMPLATE_BUILDS_LIMIT}`, { signal })
+      .then((body) => pageRows<TemplateBuildListEntry>(body).rows);
+    const write = {
+      value: (rows: TemplateBuildListEntry[]) => {
+        setBuilds(rows);
         setError(null);
         setUnsupported(false);
-      })
-      .catch((err: unknown) => {
-        if (current !== request.current) return;
+      },
+      error: (err: unknown) => {
         const missing = isMissingRoute(err);
         setUnsupported(missing);
         setError(missing ? null : errorMessage(err));
         setBuilds((shown) => (background && shown ? shown : []));
-      });
+      },
+    };
+    void (background ? reads.poll(read, write) : reads.next(read, write)).catch(() => undefined);
   };
 
   const shown = useRef<BuildsView | null>(null);

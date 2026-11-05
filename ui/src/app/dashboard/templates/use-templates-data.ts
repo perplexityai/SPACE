@@ -10,6 +10,7 @@ import { getSpacedVersionCounts } from '@/lib/public-api';
 import { SPACED_SAMPLE_LIMIT, SpacedCounts, loadSpacedCounts } from '@/lib/spaced-counts';
 import { LATEST_TAG, errorMessage, shortHash } from '@/lib/template-format';
 import { visibleTemplateTags } from '@/lib/template-list';
+import { latestRead, refreshAll, type LatestRead, type ReadWrite } from '@/lib/template-reads';
 import {
   markViewRefreshed,
   runLockedViewRefresh,
@@ -71,9 +72,27 @@ export interface TemplateAvailabilityRow {
   nodes: TemplateNodeAvailability[];
 }
 
+// `poll`: a periodic or automatic read, which joins a read of its kind
+// already out. `next`: an explicit read (after a change, or the operator's
+// Refresh), which supersedes it. See `@/lib/template-reads`.
+export type ReadMode = 'poll' | 'next';
+
 export interface RefreshOptions {
   showLoading?: boolean;
   includeBaseSnapshotPolicies?: boolean;
+  mode?: ReadMode;
+}
+
+function runRead<T>(slot: LatestRead<T>, mode: ReadMode, read: (signal: AbortSignal) => Promise<T>, write: ReadWrite<T>) {
+  return mode === 'poll' ? slot.poll(read, write) : slot.next(read, write);
+}
+
+interface TemplatesAnswer {
+  items: Template[];
+  // The template page's template is missing (404).
+  missing: boolean;
+  // Read only when asked for.
+  policies?: Record<string, BaseSnapshotPolicy>;
 }
 
 export function encodedPathSegment(value: string) {
@@ -124,9 +143,18 @@ export function useTemplatesData({ viewKey, templateName }: Options) {
   // A promotion's state is read from the releases; until they first load it
   // is unknown. Before they do, no template can be said to have no release.
   const [releasesLoaded, setReleasesLoaded] = useState(false);
-  // Numbers each release read, so a slower, older answer cannot replace a
-  // newer one (a promotion's state is read from this list).
-  const releasesRequestRef = useRef(0);
+  // One slot per kind of read: an older answer never replaces a newer one (a
+  // promotion's state is read from the releases), and a stalled read times
+  // out rather than holding up the next.
+  const [reads] = useState(() => ({
+    releases: latestRead<TemplateRelease[]>(),
+    templates: latestRead<TemplatesAnswer>(),
+    inventory: latestRead<NodeTemplateInventory[]>(),
+    clusterPools: latestRead<ClusterPoolConfig[]>(),
+    policies: latestRead<WarmPoolPolicy[]>(),
+    capabilities: latestRead<WarmPoolPolicyCapabilities>(),
+    spaced: latestRead<SpacedCounts>(),
+  }));
   const [loadingTemplates, setLoadingTemplates] = useState(true);
   const [loadingInventory, setLoadingInventory] = useState(true);
   const [spacedCounts, setSpacedCounts] = useState<SpacedCounts | null>(null);
@@ -157,20 +185,26 @@ export function useTemplatesData({ viewKey, templateName }: Options) {
     }, REFRESH_CLICK_COOLDOWN_MS);
   };
 
-  const refreshTemplateReleases = async ({ showLoading = true }: RefreshOptions = {}) => {
+  const refreshTemplateReleases = async ({ showLoading = true, mode = 'next' }: RefreshOptions = {}) => {
     if (showLoading) setLoadingReleases(true);
     try {
-      const request = ++releasesRequestRef.current;
-      const items = await adminApi.get<TemplateRelease[]>('/v1/template-releases');
-      if (request === releasesRequestRef.current) {
-        setTemplateReleases(items);
-        setReleasesLoaded(true);
-        setReleasesError(null);
-      }
-      return items;
-    } catch (err: unknown) {
-      console.warn(errorMessage(err));
-      setReleasesError(errorMessage(err));
+      return await runRead(
+        reads.releases,
+        mode,
+        (signal) => adminApi.get<TemplateRelease[]>('/v1/template-releases', { signal }),
+        {
+          value: (items) => {
+            setTemplateReleases(items);
+            setReleasesLoaded(true);
+            setReleasesError(null);
+          },
+          error: (err) => {
+            console.warn(errorMessage(err));
+            setReleasesError(errorMessage(err));
+          },
+        },
+      );
+    } catch {
       throw new Error('failed to refresh template releases');
     } finally {
       if (showLoading) setLoadingReleases(false);
@@ -182,31 +216,38 @@ export function useTemplatesData({ viewKey, templateName }: Options) {
   // count. Read when a view first shows them and on Refresh, not on the
   // periodic refresh: the sample is large. A failed read keeps the last
   // counts, with the error shown.
-  const refreshSpacedCounts = async () => {
+  const refreshSpacedCounts = async (mode: ReadMode = 'next') => {
     if (!canAdminTemplates || !spacedWanted.current) return;
-    try {
-      setSpacedCounts(await loadSpacedCounts(
+    await runRead(
+      reads.spaced,
+      mode,
+      (signal) => loadSpacedCounts(
         getSpacedVersionCounts,
-        () => adminApi.get<Sandbox[]>(`/v1/sandboxes?limit=${SPACED_SAMPLE_LIMIT}`),
-      ));
-      setSpacedCountsError(null);
-    } catch (err: unknown) {
-      setSpacedCountsError(errorMessage(err));
-    }
+        () => adminApi.get<Sandbox[]>(`/v1/sandboxes?limit=${SPACED_SAMPLE_LIMIT}`, { signal }),
+      ),
+      {
+        value: (counts) => {
+          setSpacedCounts(counts);
+          setSpacedCountsError(null);
+        },
+        error: (err) => setSpacedCountsError(errorMessage(err)),
+      },
+    ).catch(() => undefined);
   };
 
   const showSpacedCounts = () => {
     if (spacedWanted.current) return;
     spacedWanted.current = true;
-    void refreshSpacedCounts();
+    void refreshSpacedCounts('poll');
   };
 
-  const refreshBaseSnapshotPolicies = async (items: Template[]) => {
+  const readBaseSnapshotPolicies = async (items: Template[], signal: AbortSignal) => {
     const entries = await Promise.all(
       items.map(async (template) => {
         try {
           const policy = await adminApi.get<BaseSnapshotPolicy>(
             `/v1/templates/${encodedPathSegment(template.name)}/base-snapshot-policy`,
+            { signal },
           );
           return [template.name, policy] as const;
         } catch {
@@ -214,10 +255,10 @@ export function useTemplatesData({ viewKey, templateName }: Options) {
         }
       }),
     );
-    setBaseSnapshotPolicies(Object.fromEntries(entries.filter(Boolean) as [string, BaseSnapshotPolicy][]));
+    return Object.fromEntries(entries.filter(Boolean) as [string, BaseSnapshotPolicy][]);
   };
 
-  const hydrateDirectTemplatePools = async (items: Template[]) => {
+  const hydrateDirectTemplatePools = async (items: Template[], signal: AbortSignal) => {
     if (!isDirectSubstrate || items.length === 0) {
       return items;
     }
@@ -226,6 +267,7 @@ export function useTemplatesData({ viewKey, templateName }: Options) {
       items.map(async (template) => {
         const status = await adminApi.get<TemplatePoolStatusResponse>(
           `/v1/templates/${encodedPathSegment(template.name)}/pool`,
+          { signal },
         );
         return [template.name, status] as const;
       }),
@@ -244,17 +286,15 @@ export function useTemplatesData({ viewKey, templateName }: Options) {
     });
   };
 
-  const readTemplates = async (): Promise<Template[]> => {
-    if (!templateName) return adminApi.get<Template[]>('/v1/templates');
+  const readTemplates = async (signal: AbortSignal): Promise<{ items: Template[]; missing: boolean }> => {
+    if (!templateName) return { items: await adminApi.get<Template[]>('/v1/templates', { signal }), missing: false };
     try {
-      const template = await adminApi.get<Template>(`/v1/templates/${encodedPathSegment(templateName)}`);
-      setTemplateMissing(false);
-      return [template];
+      const template = await adminApi.get<Template>(`/v1/templates/${encodedPathSegment(templateName)}`, { signal });
+      return { items: [template], missing: false };
     } catch (err: unknown) {
       // The handler's own 404 ("Template not found"), not a missing route.
       if ((err as { status?: unknown })?.status === 404 && !isMissingRoute(err)) {
-        setTemplateMissing(true);
-        return [];
+        return { items: [], missing: true };
       }
       throw err;
     }
@@ -263,105 +303,140 @@ export function useTemplatesData({ viewKey, templateName }: Options) {
   const refreshTemplates = async ({
     showLoading = true,
     includeBaseSnapshotPolicies = false,
+    mode = 'next',
   }: RefreshOptions = {}) => {
     if (showLoading) setLoadingTemplates(true);
     try {
-      const items = await hydrateDirectTemplatePools(await readTemplates());
-      setTemplates(items);
-      setTemplatesLoaded(true);
-      setTemplatesError(null);
-      if (includeBaseSnapshotPolicies) {
-        await refreshBaseSnapshotPolicies(items);
-      }
-      return items;
-    } catch (err: unknown) {
-      console.warn(errorMessage(err));
-      setTemplatesError(errorMessage(err));
+      const answer = await runRead(
+        reads.templates,
+        mode,
+        async (signal): Promise<TemplatesAnswer> => {
+          const { items, missing } = await readTemplates(signal);
+          const hydrated = await hydrateDirectTemplatePools(items, signal);
+          const policies = includeBaseSnapshotPolicies ? await readBaseSnapshotPolicies(hydrated, signal) : undefined;
+          return { items: hydrated, missing, policies };
+        },
+        {
+          value: ({ items, missing, policies }) => {
+            setTemplateMissing(missing);
+            setTemplates(items);
+            setTemplatesLoaded(true);
+            setTemplatesError(null);
+            if (policies) setBaseSnapshotPolicies(policies);
+          },
+          error: (err) => {
+            console.warn(errorMessage(err));
+            setTemplatesError(errorMessage(err));
+          },
+        },
+      );
+      return answer.items;
+    } catch {
       throw new Error('failed to refresh templates');
     } finally {
       if (showLoading) setLoadingTemplates(false);
     }
   };
 
-  const refreshInventory = async ({ showLoading = true }: RefreshOptions = {}) => {
+  const refreshInventory = async ({ showLoading = true, mode = 'next' }: RefreshOptions = {}) => {
     if (showLoading) setLoadingInventory(true);
     try {
-      const items = await adminApi.get<NodeTemplateInventory[]>('/v1/nodes/templates');
-      setInventory(items);
-      setInventoryLoaded(true);
-      return items;
-    } catch (err: unknown) {
-      console.warn(errorMessage(err));
-      // Keep the last rendered view when node-api inventory is briefly unavailable.
+      return await runRead(
+        reads.inventory,
+        mode,
+        (signal) => adminApi.get<NodeTemplateInventory[]>('/v1/nodes/templates', { signal }),
+        {
+          value: (items) => {
+            setInventory(items);
+            setInventoryLoaded(true);
+          },
+          // Keep the last rendered view when node-api inventory is briefly unavailable.
+          error: (err) => console.warn(errorMessage(err)),
+        },
+      );
+    } catch {
       throw new Error('failed to refresh template inventory');
     } finally {
       if (showLoading) setLoadingInventory(false);
     }
   };
 
-  const refreshClusterPools = async () => {
+  const refreshClusterPools = async (mode: ReadMode = 'next') => {
     if (!supportsClusterPools) {
       setClusterPools([]);
       return [];
     }
     try {
-      const items = await adminApi.get<ClusterPoolConfig[]>('/v1/warm-pools');
-      setClusterPools(items);
-      return items;
+      return await runRead(
+        reads.clusterPools,
+        mode,
+        (signal) => adminApi.get<ClusterPoolConfig[]>('/v1/warm-pools', { signal }),
+        { value: setClusterPools, error: () => undefined },
+      );
     } catch {
       throw new Error('failed to refresh cluster pools');
     }
   };
 
-  const refreshWarmPoolPolicies = async () => {
+  const refreshWarmPoolPolicies = async (mode: ReadMode = 'next') => {
     if (!supportsClusterPools) {
       setWarmPoolPolicies([]);
       return [];
     }
     try {
-      const items = await adminApi.get<WarmPoolPolicy[]>('/v1/warm-pool-policies');
-      setWarmPoolPolicies(items);
-      return items;
+      return await runRead(
+        reads.policies,
+        mode,
+        (signal) => adminApi.get<WarmPoolPolicy[]>('/v1/warm-pool-policies', { signal }),
+        { value: setWarmPoolPolicies, error: () => undefined },
+      );
     } catch {
       throw new Error('failed to refresh warm pool policies');
     }
   };
 
-  const refreshWarmPoolPolicyCapabilities = async () => {
+  const refreshWarmPoolPolicyCapabilities = async (mode: ReadMode = 'next') => {
     if (!supportsClusterPools) {
       setWarmPoolPolicyCapabilities({});
       return {};
     }
-    try {
-      const capabilities = await adminApi.get<WarmPoolPolicyCapabilities>(
-        '/v1/warm-pool-policy-capabilities',
-      );
-      setWarmPoolPolicyCapabilities(capabilities);
-      return capabilities;
-    } catch (err: unknown) {
-      // During a rolling deploy, an older API replica may not have this optional endpoint yet.
-      console.warn('failed to refresh warm pool policy capabilities', err);
-      setWarmPoolPolicyCapabilities({});
-      return {};
-    }
+    return runRead(
+      reads.capabilities,
+      mode,
+      (signal) => adminApi.get<WarmPoolPolicyCapabilities>('/v1/warm-pool-policy-capabilities', { signal }),
+      {
+        value: setWarmPoolPolicyCapabilities,
+        error: (err) => {
+          // During a rolling deploy, an older API replica may not have this optional endpoint yet.
+          console.warn('failed to refresh warm pool policy capabilities', err);
+          setWarmPoolPolicyCapabilities({});
+        },
+      },
+    ).catch(() => ({}));
   };
 
+  // Open builds panels and the list's latest-build cells read again on each
+  // refresh, answered or failed: a failed refresh must not leave their
+  // unread rows unread. Only a refresh whose reads all answered makes the
+  // view fresh.
   const refresh = async ({
     showLoading = true,
     includeBaseSnapshotPolicies = false,
     spaced = false,
+    mode = 'next',
   }: RefreshOptions & { spaced?: boolean } = {}) => {
-    await Promise.all([
-      refreshTemplateReleases({ showLoading }),
-      spaced ? refreshSpacedCounts() : Promise.resolve(),
-      refreshTemplates({ showLoading, includeBaseSnapshotPolicies }),
-      refreshInventory({ showLoading }),
-      refreshClusterPools(),
-      refreshWarmPoolPolicies(),
-      refreshWarmPoolPolicyCapabilities(),
-    ]);
-    markViewRefreshed(viewKey);
-    setRefreshGeneration((generation) => generation + 1);
+    await refreshAll([
+      refreshTemplateReleases({ showLoading, mode }),
+      spaced ? refreshSpacedCounts(mode) : Promise.resolve(),
+      refreshTemplates({ showLoading, includeBaseSnapshotPolicies, mode }),
+      refreshInventory({ showLoading, mode }),
+      refreshClusterPools(mode),
+      refreshWarmPoolPolicies(mode),
+      refreshWarmPoolPolicyCapabilities(mode),
+    ], {
+      succeeded: () => markViewRefreshed(viewKey),
+      settled: () => setRefreshGeneration((generation) => generation + 1),
+    });
   };
 
   // The template page reads its template's base snapshot policy; the list
@@ -377,7 +452,7 @@ export function useTemplatesData({ viewKey, templateName }: Options) {
     }
     void runLockedViewRefresh(
       viewKey,
-      () => refresh({ showLoading: false }),
+      () => refresh({ showLoading: false, mode: 'poll' }),
       { staleMs: VIEW_REFRESH_STALE_MS },
     ).catch((err: unknown) => console.warn(errorMessage(err)));
   };
@@ -387,9 +462,17 @@ export function useTemplatesData({ viewKey, templateName }: Options) {
   }, [loadingReleases, loadingTemplates, loadingInventory]);
 
   useEffect(() => {
+    // What the previous template's reads left is not this template's.
+    setTemplateMissing(false);
+    setTemplatesLoaded(false);
+    setTemplatesError(null);
     void refresh({ includeBaseSnapshotPolicies: withBaseSnapshotPolicy }).catch((err: unknown) => message.error(errorMessage(err)));
     const interval = setInterval(maybeRefresh, VIEW_REFRESH_INTERVAL_MS);
-    return () => clearInterval(interval);
+    return () => {
+      clearInterval(interval);
+      // A read started for the previous template or substrate never writes.
+      for (const slot of Object.values(reads)) slot.reset();
+    };
   }, [substrate, templateName]);
 
   useEffect(() => () => {

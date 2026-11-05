@@ -54,6 +54,7 @@ import {
 } from '@/lib/system-template-rebuild';
 import { releaseViewRefreshLock, tryAcquireViewRefreshLock } from '@/lib/view-refresh';
 import { exclusiveWith, type BrowserLocks } from '@/lib/exclusive';
+import { READ_TIMEOUT_MS } from '@/lib/template-reads';
 import { templateHref } from './links';
 
 const { Text, Paragraph } = Typography;
@@ -162,6 +163,8 @@ export default function SystemTemplateRebuild({ refreshReleases, releases, relea
   // Bumped after every poll, so the next one is scheduled even when the
   // answer changed nothing.
   const [pollTick, setPollTick] = useState(0);
+  // The templates whose build status read is out: one read each at a time.
+  const statusReads = useRef(new Set<SystemTemplate>());
   const runRef = useRef<RebuildRun | null>(null);
   runRef.current = run;
 
@@ -303,9 +306,16 @@ export default function SystemTemplateRebuild({ refreshReleases, releases, relea
       if (!job || isTerminal(job)) continue;
       const failures = trouble[template]?.failures ?? 0;
       timers.push(setTimeout(async () => {
+        // The other template's poll re-runs this effect; a status read still
+        // out schedules the next poll when it ends.
+        if (statusReads.current.has(template)) return;
         if (!live(runId)) return;
+        statusReads.current.add(template);
         try {
-          const status = await adminApi.get<TemplateBuildStatus>(`/v1/templates/${template}/builds/${encodeURIComponent(job.job_id)}`);
+          const status = await adminApi.get<TemplateBuildStatus>(
+            `/v1/templates/${template}/builds/${encodeURIComponent(job.job_id)}`,
+            { signal: AbortSignal.timeout(READ_TIMEOUT_MS) },
+          );
           const next = await update(runId, (current) => applyStatus(current, runId, template, status));
           if (status.state === 'unspecified') {
             setTrouble((t) => ({ ...t, [template]: { failures: failures + 1, text: `The builder reports an unknown state for ${template}.` } }));
@@ -321,6 +331,7 @@ export default function SystemTemplateRebuild({ refreshReleases, releases, relea
           }
           setTrouble((t) => ({ ...t, [template]: { failures: failures + 1, text: `Could not read the ${template} build status: ${errorMessage(err)}` } }));
         } finally {
+          statusReads.current.delete(template);
           setPollTick((n) => n + 1);
         }
       }, failures === 0 && job.state === 'pending' ? 1_000 : pollDelayMs(failures)));
