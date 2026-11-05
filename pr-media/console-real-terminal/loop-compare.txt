@@ -1,0 +1,5 @@
+
+> space-console-loop@0.0.0 compare
+> node --experimental-strip-types src/compare.ts /tmp/e6fa11/loop-out/runs/2026-11-05T16-49-40-main-baseline-full /tmp/e6fa11/loop-out/runs/2026-11-05T16-54-21-final
+
+0 new error type(s), 0 resolved, 0 not covered by the later run, 1 new step signature(s)

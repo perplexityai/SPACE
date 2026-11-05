@@ -1,0 +1,26 @@
+ok   connect attaches
+ok   ls --color=auto prints (TERM is set)
+ok   ls --color=auto colors output
+ok   TERM=xterm-256color
+ok   up arrow twice recalls ls
+ok   Tab completes a path
+ok   vi opens full screen
+ok   typed text shows in vi
+ok   :q! quits vi without writing
+ok   Ctrl+C with a selection copies it ("copy-me-9")
+ok   Ctrl+V pastes the clipboard into the shell
+ok   Ctrl+C without a selection interrupts
+ok   collapse hides the terminal
+ok   the session survives collapse and expand
+ok   the shell still answers after expand
+ok   tput cols follows the window (144 -> 75)
+ok   Ctrl-D exits the shell and the card says so
+ok   status is closed after exit
+ok   leaving the page closes the socket (1 open before, 0 after)
+ok   another org: command runs
+ok   another org: up arrow
+ok   another org: top
+ok   another org: q quits top
+ok   another org: Disconnect
+ok   another org: Connect again
+ok   no console or page errors ()
