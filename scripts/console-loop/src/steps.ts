@@ -340,22 +340,27 @@ step('sandbox-stop-cause', ['sandboxes'], async (c) => {
     try {
       const shown = mode === 'recorded';
       await visit(c, `/dashboard/sandboxes/${id}`, 3000);
+      // A plain stop is an absence, so first make sure the page rendered the
+      // stopped sandbox at all.
+      const header = content(c.page).locator('.ant-tag', { hasText: /^stopped$/ });
+      const rendered = (await header.count()) > 0;
       // Count first: reading an absent element waits out the locator timeout.
       const text = content(c.page).getByTestId('stop-cause-text');
       const detail = (await text.count()) ? await text.innerText() : '';
-      c.rec.check(shown ? detail.startsWith('Stopped unexpectedly: VM exited at ') : detail === '',
-        `${mode}: the detail page ${shown ? 'says why it stopped' : 'reads as a plain stop'} (${detail || 'nothing'})`);
+      c.rec.check(rendered && (shown ? detail.startsWith('Stopped unexpectedly: VM exited at ') : detail === ''),
+        `${mode}: the detail page ${shown ? 'says why it stopped' : 'reads as a plain stop'} (${rendered ? detail || 'nothing' : 'the stopped sandbox did not render'})`);
       if (shown) await c.page.screenshot({ path: `${c.rec.outDir}/sandbox-stop-cause-detail.png`, fullPage: true });
       await visit(c, '/dashboard/sandboxes?age=all', 2000);
       await content(c.page).locator('input[placeholder*="ID"]').first().fill(id);
       await c.page.waitForTimeout(1500);
       const row = content(c.page).locator('tbody tr.ant-table-row', { hasText: shortLabel(id) });
-      const badge = row.getByTestId('stop-cause-tag');
-      const label = (await badge.count()) ? await badge.getAttribute('aria-label') : null;
-      c.rec.check(shown ? label?.startsWith('Stopped unexpectedly: VM exited at ') === true : label === null,
-        `${mode}: the list ${shown ? 'marks the sandbox, named for screen readers' : 'shows no mark'} (${label ?? 'none'})`);
+      const listed = (await row.count()) === 1 && /\bstopped\b/.test(await row.innerText());
+      const mark = row.getByRole('img', { name: /^Stopped unexpectedly: VM exited at / });
+      const marks = listed ? await row.getByTestId('stop-cause-tag').count() : -1;
+      c.rec.check(listed && (shown ? (await mark.count()) === 1 : marks === 0),
+        `${mode}: the list ${shown ? 'marks the sandbox, named for screen readers' : 'shows no mark'} (${listed ? `${marks} mark(s)` : 'the stopped row did not render'})`);
       if (shown) {
-        await badge.focus();
+        await mark.focus();
         await c.page.waitForTimeout(500);
         c.rec.check(await c.page.locator('.ant-tooltip:visible', { hasText: 'Stopped unexpectedly' }).count() > 0,
           'recorded: focusing the list mark shows its tooltip');

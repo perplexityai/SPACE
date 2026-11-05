@@ -19,7 +19,7 @@ test('no reported cause reads as a plain stop', () => {
   // A requested stop answers null; an API without the field leaves it out.
   assert.equal(reportedStopCause({ status: 'stopped', stop_cause: null }), null);
   assert.equal(reportedStopCause({ status: 'stopped' }), null);
-  // A cause in the round-one shape, without `stopped_at`, is not shown.
+  // A cause without a `stopped_at` time is not shown.
   assert.equal(reportedStopCause({ status: 'stopped', stop_cause: { reason: 'vm_exited', at: recorded.stopped_at } }), null);
 });
 
