@@ -284,6 +284,16 @@ sbxmgr_assert_direct_dependents() {
 # release images' set (docker/Dockerfile.rust-build-common) and the Kind
 # images' set (docker/Dockerfile.rust-build-kind). The migrator has no
 # features of its own.
+# The crates run_sbxmgr_production_checks lints, which run_clippy_checks also
+# asks lint_affects_any about.
+SBXMGR_PRODUCTION_CRATES=(
+    pplx-space-sbx-mgr-store
+    pplx-space-sbx-mgr
+    pplx-space-sbx-mgr-svc
+    pplx-space-db-migrate
+    pplx-space-db-migrator
+)
+
 run_sbxmgr_production_checks() {
     local target_dir="$1"
     local sbxmgr_feature_sets=(
@@ -291,7 +301,10 @@ run_sbxmgr_production_checks() {
         "pplx-space-sbx-mgr-svc/otel,pplx-space-sbx-mgr-svc/datadog"
         "pplx-space-sbx-mgr-svc/otel,pplx-space-sbx-mgr-svc/datadog,pplx-space-sbx-mgr-svc/test-hooks"
     )
-    local sbxmgr_features sbxmgr_feature_args sbxmgr_graph
+    local sbxmgr_features sbxmgr_feature_args sbxmgr_graph sbxmgr_crate sbxmgr_packages=()
+    for sbxmgr_crate in "${SBXMGR_PRODUCTION_CRATES[@]}"; do
+        sbxmgr_packages+=(-p "${sbxmgr_crate}")
+    done
     for sbxmgr_features in "${sbxmgr_feature_sets[@]}"; do
         sbxmgr_feature_args=()
         if [ -n "${sbxmgr_features}" ]; then
@@ -300,11 +313,7 @@ run_sbxmgr_production_checks() {
         echo "--- :rust: Running sbx-mgr production clippy without test-support (features: ${sbxmgr_features:-none})"
         CARGO_TARGET_DIR="${target_dir}" cargo clippy \
             --locked \
-            -p pplx-space-sbx-mgr-store \
-            -p pplx-space-sbx-mgr \
-            -p pplx-space-sbx-mgr-svc \
-            -p pplx-space-db-migrate \
-            -p pplx-space-db-migrator \
+            "${sbxmgr_packages[@]}" \
             "${sbxmgr_feature_args[@]}" \
             --lib --bins \
             -- \
@@ -381,7 +390,13 @@ run_clippy_checks() {
         -- \
         -D warnings
 
-    run_sbxmgr_production_checks "${target_dir}"
+    # Pull CI and the merge queue run these only when the change can affect
+    # the crates they lint (lint_affects_any in lib/rust-isolated-crates.sh).
+    if lint_affects_any "${target_dir}" "${SBXMGR_PRODUCTION_CRATES[@]}"; then
+        run_sbxmgr_production_checks "${target_dir}"
+    else
+        echo "--- :rust: Skipping sbx-mgr production clippy: the change affects none of its crates"
+    fi
 
     # The check above resolves a `-p` selection. The release images build
     # from the workspace root without one, so this one reads each release
