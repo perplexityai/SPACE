@@ -682,6 +682,7 @@ impl SandboxManagerService {
                                 lifecycle: Some(crate::proto::SandboxLifecycleState::from_label(&lifecycle.state).unwrap_or(crate::proto::SandboxLifecycleState::Unspecified) as i32),
                                 sandbox_id,
                                 state_changed_at: sqlite_timestamp(&lifecycle.state_changed_at),
+                                cleanup: lifecycle.cleanup_completion.map(cleanup_to_proto),
                                 state_degraded: true,
                                 ..SandboxInfo::default()
                             };
@@ -1129,6 +1130,7 @@ impl SandboxManagerService {
                 .activation_attempt_id
                 .map(|attempt| attempt.to_string()),
             state_changed_at: state_changed_at.as_deref().and_then(sqlite_timestamp),
+            cleanup: sandbox.cleanup_completion.map(cleanup_to_proto),
             state_degraded: false,
             health_status,
             health_observed_at,
@@ -2045,6 +2047,24 @@ fn durable_copy_destination_origin(value: i32) -> Result<ArtifactOrigin, Status>
             "durable artifact copies cannot publish snapshot origin without a snapshot name",
         )),
         _ => Err(Status::invalid_argument("destination_origin must be FORK")),
+    }
+}
+
+/// The shim's legacy teardown reads this to tell a row whose cleanup keeps
+/// the sandbox, such as a failed stop, start or suspend, from a failed delete.
+fn cleanup_to_proto(completion: crate::db::CleanupCompletion) -> crate::proto::SandboxCleanup {
+    use crate::db::CleanupCompletion;
+    use crate::proto::SandboxCleanupCompletion as Proto;
+    let completion = match completion {
+        CleanupCompletion::MarkCreated => Proto::MarkCreated,
+        CleanupCompletion::MarkStopped => Proto::MarkStopped,
+        CleanupCompletion::MarkSuspended => Proto::MarkSuspended,
+        CleanupCompletion::Quarantine => Proto::Quarantine,
+        CleanupCompletion::DeleteRow => Proto::DeleteRow,
+        CleanupCompletion::DeletePoolClone => Proto::DeletePoolClone,
+    };
+    crate::proto::SandboxCleanup {
+        completion: completion as i32,
     }
 }
 

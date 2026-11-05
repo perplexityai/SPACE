@@ -100,7 +100,9 @@ pub fn state_page(
     for sandbox_id in ids {
         match crate::db::inventory_read::get(conn, sandbox_id, &mut budgets.raw) {
             Ok(Some(row)) => page.push(PageEntry::Row(Box::new(row))),
-            Ok(None) => page.push(PageEntry::Done(StatePageRow::Missing(sandbox_id.clone()))),
+            Ok(None) => page.push(PageEntry::Done(Box::new(StatePageRow::Missing(
+                sandbox_id.clone(),
+            )))),
             Err(error @ (InventoryReadError::Limit(_) | InventoryReadError::Ambiguous)) => {
                 return Err(StatePageError::Row(error));
             }
@@ -108,7 +110,9 @@ pub fn state_page(
                 let lifecycle = match crate::db::raw_sandbox_lifecycle(conn, sandbox_id) {
                     Ok(Some(lifecycle)) => lifecycle,
                     Ok(None) => {
-                        page.push(PageEntry::Done(StatePageRow::Missing(sandbox_id.clone())));
+                        page.push(PageEntry::Done(Box::new(StatePageRow::Missing(
+                            sandbox_id.clone(),
+                        ))));
                         continue;
                     }
                     Err(error) => {
@@ -118,12 +122,14 @@ pub fn state_page(
                         });
                     }
                 };
-                page.push(PageEntry::Done(StatePageRow::StateOnly(StateOnlyRow {
-                    route_provenance: route_provenance.remove(sandbox_id),
-                    sandbox_id: sandbox_id.clone(),
-                    lifecycle,
-                    error,
-                })));
+                page.push(PageEntry::Done(Box::new(StatePageRow::StateOnly(
+                    StateOnlyRow {
+                        route_provenance: route_provenance.remove(sandbox_id),
+                        sandbox_id: sandbox_id.clone(),
+                        lifecycle,
+                        error,
+                    },
+                ))));
             }
         }
     }
@@ -146,7 +152,7 @@ pub fn state_page(
     Ok(page
         .into_iter()
         .map(|entry| match entry {
-            PageEntry::Done(row) => row,
+            PageEntry::Done(row) => *row,
             PageEntry::Row(row) => StatePageRow::Decoded(Box::new(DecodedStateRow {
                 route_provenance: route_provenance.remove(&row.id),
                 publication: publications.remove(&row.id),
@@ -163,5 +169,5 @@ pub fn state_page(
 /// every other result is final when its id is read.
 enum PageEntry {
     Row(Box<SandboxRow>),
-    Done(StatePageRow),
+    Done(Box<StatePageRow>),
 }

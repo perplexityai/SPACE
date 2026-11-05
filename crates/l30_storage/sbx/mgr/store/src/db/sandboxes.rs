@@ -8,17 +8,27 @@ use super::*;
 pub struct RawSandboxLifecycle {
     pub state: String,
     pub state_changed_at: String,
+    /// The recorded cleanup completion, absent when none is recorded or its
+    /// label can't be decoded. A consumer that must not mistake a failed stop
+    /// for a failed delete needs this even when another column of the row
+    /// can't be decoded.
+    pub cleanup_completion: Option<CleanupCompletion>,
 }
 
 db_private_outside_tests! {
     fn raw_sandbox_lifecycle(conn: &Connection, id: &str) -> Result<Option<RawSandboxLifecycle>> {
         conn.query_row(
-            "SELECT state, state_changed_at FROM sandboxes WHERE id = ?1",
+            "SELECT state, state_changed_at, cleanup_completion FROM sandboxes WHERE id = ?1",
             [id],
             |row| {
                 Ok(RawSandboxLifecycle {
                     state: row.get(0)?,
                     state_changed_at: timestamps::diagnostic_column(row, 1)?,
+                    cleanup_completion: row
+                        .get::<_, Option<String>>(2)
+                        .ok()
+                        .flatten()
+                        .and_then(|value| value.parse().ok()),
                 })
             },
         )
