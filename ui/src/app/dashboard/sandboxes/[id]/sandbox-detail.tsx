@@ -74,7 +74,7 @@ import { listsSnapshotsOn } from '@/lib/admin-fallback';
 import { RollbackButton, RollbackRefusalNote, useSnapshotRollback, type SnapshotRollback } from '@/components/snapshot-rollback';
 import { rollbackRoute, rollbackTargets, snapshotTimeMs, type RollbackTarget } from '@/lib/rollback-targets';
 import { formatAge, formatBytes, sectionData, sectionError, snapshotKey, snapshotStorageById, snapshotStorageLabel, type DebugSnapshot } from '@/lib/sandbox-debug';
-import { CATALOG_NOTE, NODE_NOTE, catalogEmptyText, nodeEmptyText } from '@/lib/snapshot-catalog';
+import { CATALOG_NOTE, CATALOG_TITLE, NODE_NOTE, catalogEmptyText, nodeEmptyText, nodeInventory, nodeListing, type NodeListing } from '@/lib/snapshot-catalog';
 import { OperationsCard, OrgLink, PlacementCard, QuarantineCard, ResourcesCard, TimelineCard, UserLink, type DebugView } from './sandbox-insight';
 import NetworkPolicyDesigner, {
   compactNetworkPolicyLabel,
@@ -391,13 +391,13 @@ function AdminSnapshotsTable({
   snapshots,
   error,
   pending,
-  nodeKeeps,
+  nodeListing,
   nowMs,
 }: {
   snapshots: DebugSnapshot[];
   error: string | null;
   pending: boolean;
-  nodeKeeps: number | null;
+  nodeListing: NodeListing;
   nowMs: number;
 }) {
   const { token } = theme.useToken();
@@ -426,7 +426,7 @@ function AdminSnapshotsTable({
       size="small"
       pagination={tablePagination('snapshots', 10)}
       loading={pending}
-      locale={{ emptyText: catalogEmptyText(!!error, nodeKeeps) }}
+      locale={{ emptyText: catalogEmptyText(!!error, nodeListing) }}
       footer={() =>
         snapshots.length === 0 ? null : (
           <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 12, color: token.colorTextSecondary }}>
@@ -446,23 +446,21 @@ function AdminSnapshotsTable({
 // not know.
 function NodeSnapshotsTable({
   debugView,
-  sandboxStatus,
-  periodicSnapshots,
+  targets,
+  listing,
   route,
   rollback,
   nowMs,
 }: {
   debugView: DebugView;
-  sandboxStatus: string | null;
-  periodicSnapshots: boolean | null;
+  targets: RollbackTarget[];
+  listing: NodeListing;
   route: ReturnType<typeof rollbackRoute>;
   rollback: SnapshotRollback;
   nowMs: number;
 }) {
   const debug = debugView.debug;
-  const section = sectionData(debug?.snapshots);
   const error = debugView.error ?? (debug ? sectionError(debug.snapshots) : null);
-  const targets = rollbackTargets(section?.inventory ?? [], sandboxStatus);
   const columns: ColumnsType<RollbackTarget> = [
     { title: 'Name', key: 'name', ellipsis: true, render: (_, target) => <Text code copyable={{ text: target.snapshotName }}>{target.snapshotName}</Text> },
     {
@@ -507,7 +505,7 @@ function NodeSnapshotsTable({
         size="small"
         pagination={tablePagination('node-snapshots', 10)}
         loading={!debug && !debugView.error}
-        locale={{ emptyText: nodeEmptyText(!!error, periodicSnapshots) }}
+        locale={{ emptyText: nodeEmptyText(!!error, listing) }}
       />
     </div>
   );
@@ -633,16 +631,17 @@ function SnapshotsCard({
   // listing is display-only.
   const route = rollbackRoute(ownOrg, adminList);
   const rollback = useSnapshotRollback({ sandboxId, orgId, via: route.via, onSettled: onRollbackSettled });
+  // The node's list, which the empty catalog points at. An inventory the
+  // debug view does not carry is unknown, not empty.
+  const inventory = nodeInventory(sectionData(debug?.snapshots));
+  const targets = inventory ? rollbackTargets(inventory, sandboxStatus) : [];
+  const listing = nodeListing(inventory ? targets.length : null, periodicSnapshots);
   const nodeSnapshots = (
-    <NodeSnapshotsTable debugView={debugView} sandboxStatus={sandboxStatus} periodicSnapshots={periodicSnapshots} route={route} rollback={rollback} nowMs={nowMs} />
+    <NodeSnapshotsTable debugView={debugView} targets={targets} listing={listing} route={route} rollback={rollback} nowMs={nowMs} />
   );
-  // How many snapshots the node list shows, which the empty catalog list
-  // points at; null until the node's inventory has loaded.
-  const nodeSection = sectionData(debug?.snapshots);
-  const nodeKeeps = nodeSection ? rollbackTargets(nodeSection.inventory ?? [], sandboxStatus).length : null;
   const catalogHeader = (
     <Space size={8} wrap style={{ marginBottom: 8 }}>
-      <Text strong>Stored</Text>
+      <Text strong>{CATALOG_TITLE}</Text>
       <Text type="secondary" style={{ fontSize: 12 }}>{CATALOG_NOTE}</Text>
     </Space>
   );
@@ -668,6 +667,7 @@ function SnapshotsCard({
         return <Tag color={codec.color}>{codec.label}</Tag>;
       },
     },
+    { title: 'State', dataIndex: 'state', width: 100, render: (v: string) => <Tag color={v === 'ready' ? 'green' : v === 'failed' ? 'red' : 'default'}>{v}</Tag> },
     { title: 'Timestamp', dataIndex: 'timestamp', width: 200, render: (v: string | null) => v ?? '—' },
     { title: 'Size', dataIndex: 'size_bytes', width: 100, render: (v: number) => formatBytes(v) },
     {
@@ -710,7 +710,7 @@ function SnapshotsCard({
           <Alert type="warning" showIcon style={{ marginBottom: 8 }} title={`Could not load the control plane's snapshot records: ${adminError}`} />
         ) : null}
         {catalogHeader}
-        <AdminSnapshotsTable snapshots={adminSnapshots} error={adminError} pending={!debug && !debugView.error} nodeKeeps={nodeKeeps} nowMs={nowMs} />
+        <AdminSnapshotsTable snapshots={adminSnapshots} error={adminError} pending={!debug && !debugView.error} nodeListing={listing} nowMs={nowMs} />
         {nodeSnapshots}
       </Card>
     );
@@ -748,7 +748,7 @@ function SnapshotsCard({
         loading={loading}
         size="small"
         pagination={tablePagination('snapshots', 10)}
-        locale={{ emptyText: catalogEmptyText(false, nodeKeeps) }}
+        locale={{ emptyText: catalogEmptyText(false, listing) }}
         footer={() =>
           snapshots.length === 0 ? null : (
             <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 12, color: token.colorTextSecondary }}>

@@ -1,26 +1,41 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { catalogEmptyText, nodeEmptyText } from './snapshot-catalog.ts';
+import { catalogEmptyText, nodeEmptyText, nodeInventory, nodeListing } from './snapshot-catalog.ts';
 
-test('an empty catalog points at the snapshots the node keeps', () => {
-  for (const [failed, nodeKeeps, want] of [
-    [false, 2, 'No stored snapshots. The node keeps 2 snapshots, listed under On the node below.'],
-    [false, 1, 'No stored snapshots. The node keeps 1 snapshot, listed under On the node below.'],
-    // Nothing to point at: the node list is empty, or has not loaded.
-    [false, 0, 'No stored snapshots'],
-    [false, null, 'No stored snapshots'],
-    [true, 2, 'Could not load snapshots'],
+const UNAVAILABLE = "The node's snapshot list is unavailable, so whether the node keeps snapshots for this sandbox is unknown.";
+const PERIODIC_OFF = 'The node does not list its snapshots while periodic snapshots are off. Turning them off hides every snapshot the node keeps for this sandbox, earlier periodic snapshots and checkpoints alike.';
+const KEEPS_NONE = 'The node keeps no snapshots for this sandbox';
+const row = { snapshot_id: 'f-manual-1', type: 'full', state: 'ready' };
+
+// What the debug view's snapshots section can be, with the sandbox's
+// observed periodic state, and what each list then says when it is empty.
+test('each list says only what the node inventory shows', () => {
+  for (const [name, section, periodic, node, catalog] of [
+    ['available and empty', { snapshots: [], inventory: [] }, true, KEEPS_NONE, 'No backup records'],
+    ['rows present', { snapshots: [], inventory: [row, row] }, true, null, 'No backup records. The node keeps 2 snapshots, listed under On the node below.'],
+    ['one row', { snapshots: [], inventory: [row] }, true, null, 'No backup records. The node keeps 1 snapshot, listed under On the node below.'],
+    // A row the node lists is evidence even when the observed state says off
+    // or is not reported.
+    ['rows present, periodic off', { snapshots: [], inventory: [row] }, false, null, 'No backup records. The node keeps 1 snapshot, listed under On the node below.'],
+    ['rows present, periodic unknown', { snapshots: [], inventory: [row] }, null, null, 'No backup records. The node keeps 1 snapshot, listed under On the node below.'],
+    ['periodic off', { snapshots: [], inventory: [] }, false, PERIODIC_OFF, 'No backup records'],
+    ['periodic unknown', { snapshots: [], inventory: [] }, null, UNAVAILABLE, 'No backup records'],
+    // A release whose snapshots section carries no inventory.
+    ['an old API', { snapshots: [] }, true, UNAVAILABLE, 'No backup records'],
+    ['an old API, periodic off', { snapshots: [] }, false, UNAVAILABLE, 'No backup records'],
+    ['not loaded or failed', null, true, UNAVAILABLE, 'No backup records'],
   ]) {
-    assert.equal(catalogEmptyText(failed, nodeKeeps), want, `failed=${failed} nodeKeeps=${nodeKeeps}`);
+    const inventory = nodeInventory(section);
+    const listing = nodeListing(inventory ? inventory.length : null, periodic);
+    if (node !== null) assert.equal(nodeEmptyText(false, listing), node, name);
+    assert.equal(catalogEmptyText(false, listing), catalog, name);
   }
 });
 
-test('an empty node list says the node lists nothing while periodic snapshots are off', () => {
-  assert.match(nodeEmptyText(false, false), /only while periodic snapshots are on/);
-  // On, or an API that does not report it: the node publishes its list, so
-  // an empty one means it keeps none.
-  for (const periodic of [true, null]) {
-    assert.equal(nodeEmptyText(false, periodic), 'The node keeps no snapshots for this sandbox');
-  }
-  assert.equal(nodeEmptyText(true, false), "Could not load the node's snapshots");
+test('a failed read says so, and the sandbox list points nowhere', () => {
+  const listed = nodeListing(2, true);
+  assert.equal(nodeEmptyText(true, listed), "Could not load the node's snapshots");
+  assert.equal(catalogEmptyText(true, listed), 'Could not load the snapshot catalog');
+  assert.equal(catalogEmptyText(false, null), 'No backup records');
+  assert.equal(catalogEmptyText(true, null), 'Could not load the snapshot catalog');
 });
