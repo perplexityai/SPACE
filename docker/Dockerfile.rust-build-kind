@@ -16,12 +16,16 @@
 # planner/build-context COPY sets match the production stages. Only LTO is off,
 # as the Tiltfile already chose for local images, and
 # every crate's `test-hooks` feature is on so the test-only environment
-# overrides the Kind charts set take effect (production images never enable it). Keep the
-# lists in step with Dockerfile.rust-build-common when a set changes.
+# overrides the Kind charts set take effect (production images never enable it):
+# infra/space/kind/scripts/test-hook-features.sh derives that list from the
+# workspace. Keep the bin and feature lists in step with
+# Dockerfile.rust-build-common when a set changes.
 #
 # The release lane (SPACE_KIND_RUST_BUILD=release, infra/space/kind/lib/rust-build.sh)
-# builds the same lists with both test-hook lists below empty, thin LTO and
-# SPACE_KIND_CARGO_EXCLUDE below, so that no crate's `test-hooks` feature is on.
+# builds the same lists with no test-hook features: the helper prints none,
+# and build-rust-artifacts.sh's rust_build_args also empties the guest's list
+# below and sets thin LTO and SPACE_KIND_CARGO_EXCLUDE, so that no crate's
+# `test-hooks` feature is on.
 #
 # Build (repo root context):
 #   docker build -t space-rust-chef-base:local -f docker/Dockerfile.rust-build-common --target chef-base .
@@ -30,9 +34,9 @@
 
 ARG SPACE_RUST_CHEF_IMAGE=space-rust-chef-base:local
 ARG SPACE_GRPC_HEALTH_PROBE_IMAGE=space-grpc-health-probe:local
-# Every `test-hooks` feature of the host services' build, and the guest's.
-# build-rust-artifacts.sh reads both defaults for its incremental build.
-ARG SPACE_KIND_TEST_HOOK_FEATURES=pplx-space-spaced-guest-svc/test-hooks,pplx-space-node-mgr-svc/test-hooks,pplx-space-sbx-mgr-svc/test-hooks,pplx-space-template-mgr-svc/test-hooks,pplx-space-template-mgr/test-hooks,pplx-space-internal-api-server/test-hooks,pplx-space-credmgr/test-hooks,pplx-space-common-svc/test-hooks,pplx-space-spaced-guest-server/test-hooks,pplx-space-cluster-controller-server/test-hooks,pplx-space-common-core/test-hooks,pplx-space-sbx-mgr/test-hooks,pplx-space-api/test-hooks,pplx-space-build-mgr-server/test-hooks,pplx-space-node-api-server/test-hooks,pplx-space-node-mgr/test-hooks,pplx-space-node-ctl-svc/test-hooks
+# The guest build's `test-hooks` feature; the host build's are derived (see
+# test-hook-features.sh). build-rust-artifacts.sh reads this default for its
+# incremental build.
 ARG SPACE_KIND_GUEST_TEST_HOOK_FEATURES=pplx-space-spaced-guest-svc/test-hooks
 ARG SPACE_CARGO_RELEASE_LTO=false
 # The workspace member the host cook and build leave out; empty selects every
@@ -40,7 +44,9 @@ ARG SPACE_CARGO_RELEASE_LTO=false
 # pplx-space-db-test-fixtures, so that no selected crate turns a `test-hooks`
 # feature on.
 ARG SPACE_KIND_CARGO_EXCLUDE=
-# Recorded on the artifact image, so a handed-off image names its build.
+# test-hooks or release (infra/space/kind/lib/rust-build.sh): selects the host
+# build's test-hook features, and is recorded on the artifact image, so a
+# handed-off image names its build.
 ARG SPACE_KIND_RUST_BUILD=test-hooks
 
 FROM ${SPACE_RUST_CHEF_IMAGE} AS planner
@@ -56,6 +62,12 @@ COPY templates/firecracker/recipes/code-runtime templates/firecracker/recipes/co
 
 RUN cargo chef prepare --recipe-path recipe.json
 
+# The cook's test-hook features, derived from the same sources the build stage
+# derives its own from.
+COPY infra/space/kind/scripts/test-hook-features.sh infra/space/kind/scripts/test-hook-features.sh
+ARG SPACE_KIND_RUST_BUILD
+RUN bash infra/space/kind/scripts/test-hook-features.sh "$SPACE_KIND_RUST_BUILD" >test-hook-features
+
 # The cook's package selection: every member but SPACE_KIND_CARGO_EXCLUDE, as
 # `-p` arguments, since `cargo chef cook` has no --exclude. Its features then
 # resolve as the build's do, and the build recompiles no dependency.
@@ -68,20 +80,20 @@ RUN if [ -n "$SPACE_KIND_CARGO_EXCLUDE" ]; then \
 
 FROM ${SPACE_RUST_CHEF_IMAGE} AS cook
 
-ARG SPACE_KIND_TEST_HOOK_FEATURES
 ARG SPACE_KIND_GUEST_TEST_HOOK_FEATURES
 ARG SPACE_CARGO_RELEASE_LTO
 ARG SPACE_KIND_CARGO_EXCLUDE
 ENV CARGO_PROFILE_RELEASE_LTO=${SPACE_CARGO_RELEASE_LTO}
 
-COPY --from=planner /workspace/recipe.json /workspace/cook-selection ./
+COPY --from=planner /workspace/recipe.json /workspace/cook-selection /workspace/test-hook-features ./
 COPY infra/space/identity/node-identities.sh infra/space/identity/node-identities.sh
 
 # The union of the worker, api, data-plane and cluster-controller sets.
 # space-runtime-supervisor-svc is cooked here but built by
 # scripts/build-runtime-supervisor.sh below, as the production worker stage does.
-RUN cargo chef cook --locked --release --recipe-path recipe.json $(cat cook-selection) \
-      --features "pplx-space-node-api-svc/otel,pplx-space-node-api-svc/datadog,pplx-space-node-api-svc/k8s,pplx-space-internal-api-svc/otel,pplx-space-internal-api-svc/datadog,pplx-space-internal-api-svc/k8s,pplx-space-node-ctl-svc/otel,pplx-space-node-ctl-svc/datadog,pplx-space-node-ctl-svc/kubernetes,pplx-space-node-mgr-svc/otel,pplx-space-node-mgr-svc/datadog,pplx-space-build-mgr-svc/otel,pplx-space-build-mgr-svc/datadog,pplx-space-build-mgr-svc/k8s,pplx-space-node-runtime-supervisor-svc/otel,pplx-space-node-runtime-supervisor-svc/datadog,pplx-space-node-runtime-manager-svc/otel,pplx-space-node-runtime-manager-svc/datadog,pplx-space-sbx-mgr-svc/otel,pplx-space-sbx-mgr-svc/datadog,pplx-space-spaced-host-svc/otel,pplx-space-spaced-host-svc/datadog,pplx-space-net-gateway-svc/otel,pplx-space-net-gateway-svc/datadog,pplx-space-template-mgr-svc/otel,pplx-space-template-mgr-svc/datadog,pplx-space-volmgr-svc/otel,pplx-space-volmgr-svc/datadog,pplx-space-api-svc/otel,pplx-space-api-svc/datadog,pplx-space-api-svc/kubernetes,pplx-space-api-svc/federated-identity,pplx-space-data-plane-svc/otel,pplx-space-data-plane-svc/datadog,pplx-space-data-plane-svc/kubernetes,pplx-space-cluster-controller-svc/otel,pplx-space-cluster-controller-svc/datadog${SPACE_KIND_TEST_HOOK_FEATURES:+,$SPACE_KIND_TEST_HOOK_FEATURES}" \
+RUN hooks="$(cat test-hook-features)" && \
+    cargo chef cook --locked --release --recipe-path recipe.json $(cat cook-selection) \
+      --features "pplx-space-node-api-svc/otel,pplx-space-node-api-svc/datadog,pplx-space-node-api-svc/k8s,pplx-space-internal-api-svc/otel,pplx-space-internal-api-svc/datadog,pplx-space-internal-api-svc/k8s,pplx-space-node-ctl-svc/otel,pplx-space-node-ctl-svc/datadog,pplx-space-node-ctl-svc/kubernetes,pplx-space-node-mgr-svc/otel,pplx-space-node-mgr-svc/datadog,pplx-space-build-mgr-svc/otel,pplx-space-build-mgr-svc/datadog,pplx-space-build-mgr-svc/k8s,pplx-space-node-runtime-supervisor-svc/otel,pplx-space-node-runtime-supervisor-svc/datadog,pplx-space-node-runtime-manager-svc/otel,pplx-space-node-runtime-manager-svc/datadog,pplx-space-sbx-mgr-svc/otel,pplx-space-sbx-mgr-svc/datadog,pplx-space-spaced-host-svc/otel,pplx-space-spaced-host-svc/datadog,pplx-space-net-gateway-svc/otel,pplx-space-net-gateway-svc/datadog,pplx-space-template-mgr-svc/otel,pplx-space-template-mgr-svc/datadog,pplx-space-volmgr-svc/otel,pplx-space-volmgr-svc/datadog,pplx-space-api-svc/otel,pplx-space-api-svc/datadog,pplx-space-api-svc/kubernetes,pplx-space-api-svc/federated-identity,pplx-space-data-plane-svc/otel,pplx-space-data-plane-svc/datadog,pplx-space-data-plane-svc/kubernetes,pplx-space-cluster-controller-svc/otel,pplx-space-cluster-controller-svc/datadog${hooks:+,$hooks}" \
       --bin space-buildmgr \
       --bin space-buildmgr-svc \
       --bin space-tmplmgr \
@@ -123,9 +135,9 @@ RUN cargo chef cook --locked --release --recipe-path recipe.json \
 
 FROM cook AS build
 
-ARG SPACE_KIND_TEST_HOOK_FEATURES
 ARG SPACE_KIND_GUEST_TEST_HOOK_FEATURES
 ARG SPACE_KIND_CARGO_EXCLUDE
+ARG SPACE_KIND_RUST_BUILD
 
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY .cargo/config.toml .cargo/config.toml
@@ -137,6 +149,11 @@ COPY templates/firecracker/seed/rootfs-builder.sh templates/firecracker/seed/roo
 COPY templates/firecracker/recipes/seed.toml templates/firecracker/recipes/code-runtime.toml templates/firecracker/recipes/
 COPY templates/firecracker/recipes/code-runtime templates/firecracker/recipes/code-runtime
 COPY scripts/build-runtime-supervisor.sh scripts/build-runtime-supervisor.sh
+COPY infra/space/kind/scripts/test-hook-features.sh infra/space/kind/scripts/test-hook-features.sh
+
+# The host build's test-hook features, one line, empty for the release lane
+# (cargo ignores `-F ""`).
+RUN bash infra/space/kind/scripts/test-hook-features.sh "$SPACE_KIND_RUST_BUILD" >test-hook-features
 
 RUN cargo build --locked --release ${SPACE_KIND_CARGO_EXCLUDE:+--workspace --exclude $SPACE_KIND_CARGO_EXCLUDE} \
       -F pplx-space-node-api-svc/otel,pplx-space-node-api-svc/datadog \
@@ -160,7 +177,7 @@ RUN cargo build --locked --release ${SPACE_KIND_CARGO_EXCLUDE:+--workspace --exc
       -F pplx-space-data-plane-svc/otel,pplx-space-data-plane-svc/datadog \
       -F pplx-space-data-plane-svc/kubernetes \
       -F pplx-space-cluster-controller-svc/otel,pplx-space-cluster-controller-svc/datadog \
-      ${SPACE_KIND_TEST_HOOK_FEATURES:+-F "$SPACE_KIND_TEST_HOOK_FEATURES"} \
+      -F "$(cat test-hook-features)" \
       --bin space-buildmgr \
       --bin space-buildmgr-svc \
       --bin space-tmplmgr \
