@@ -21,6 +21,12 @@ pub struct NodeMemorySnapshot {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ParentMemorySnapshot {
+    current_mib: u64,
+    maximum_mib: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ActiveLeaseMemoryReservation {
     pub slot_id: u32,
     pub sandbox_id: SandboxId,
@@ -31,6 +37,7 @@ pub(crate) struct ActiveLeaseMemoryReservation {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct MemoryAdmissionObservation {
     node_memory: NodeMemorySnapshot,
+    parent_memory: ParentMemorySnapshot,
     observed_leases: Vec<ActiveLeaseMemoryReservation>,
     existing_growth_reserve_mib: u64,
 }
@@ -96,12 +103,16 @@ impl MemoryAdmissionConfig {
         active_leases: &[ActiveLeaseMemoryReservation],
         sources: &MemoryAdmissionSources,
     ) -> Result<MemoryAdmissionObservation, NodeMemoryCapacityError> {
-        let memory = read_node_memory_snapshot_from(&sources.meminfo_path).await?;
         let existing_growth_reserve_mib = self
             .measure_existing_growth_reserve_mib(active_leases, sources)
             .await;
+        // Read aggregate usage after leaf headroom so intervening growth is
+        // counted rather than subtracted from both sides of the projection.
+        let memory = read_node_memory_snapshot_from(&sources.meminfo_path).await?;
+        let parent_memory = read_parent_memory_snapshot(&sources.firecracker_cgroup_base).await?;
         Ok(MemoryAdmissionObservation {
             node_memory: memory,
+            parent_memory,
             observed_leases: active_leases.to_vec(),
             existing_growth_reserve_mib,
         })
@@ -137,6 +148,7 @@ impl MemoryAdmissionConfig {
             sandbox_cgroup_memory_mib,
             existing_growth_reserve_mib,
             observation.node_memory,
+            observation.parent_memory,
         )
     }
 
@@ -145,6 +157,7 @@ impl MemoryAdmissionConfig {
         sandbox_cgroup_memory_mib: u64,
         existing_growth_reserve_mib: u64,
         memory: NodeMemorySnapshot,
+        parent: ParentMemorySnapshot,
     ) -> Result<MemoryAdmissionMeasurement, MemoryAdmissionError> {
         let node_used_mib = memory.total_mib - memory.available_mib;
         let required_mib = node_used_mib
@@ -173,6 +186,21 @@ impl MemoryAdmissionConfig {
                 sandbox_cgroup_memory_mib: measurement.sandbox_cgroup_memory_mib,
                 reserve_mib: measurement.reserve_mib,
                 required_mib: measurement.required_mib,
+            });
+        }
+        // memory.current includes every descendant: VMs, host sidecars,
+        // and charged caches, not just the Firecracker lease list.
+        let projected_mib = parent
+            .current_mib
+            .checked_add(existing_growth_reserve_mib)
+            .and_then(|value| value.checked_add(sandbox_cgroup_memory_mib))
+            .and_then(|value| value.checked_add(self.reserve_mib))
+            .ok_or(MemoryAdmissionError::ParentRequirementOverflow)?;
+        if projected_mib > parent.maximum_mib {
+            return Err(MemoryAdmissionError::InsufficientParentCapacity {
+                current_mib: parent.current_mib,
+                maximum_mib: parent.maximum_mib,
+                projected_mib,
             });
         }
         Ok(measurement)
@@ -213,6 +241,16 @@ impl MemoryAdmissionConfig {
 #[derive(Debug, Eq, PartialEq, thiserror::Error)]
 pub enum MemoryAdmissionError {
     #[error(
+        "sandbox parent uses {current_mib} MiB; existing growth, new sandbox demand and admission reserve require {projected_mib} MiB above its memory.max {maximum_mib} MiB"
+    )]
+    InsufficientParentCapacity {
+        current_mib: u64,
+        maximum_mib: u64,
+        projected_mib: u64,
+    },
+    #[error("sandbox parent usage plus pending demand and admission reserve overflows")]
+    ParentRequirementOverflow,
+    #[error(
         "node uses {node_used_mib} MiB plus {existing_growth_reserve_mib} MiB existing Firecracker growth reserve plus new sandbox demand {sandbox_cgroup_memory_mib} MiB plus reserve {reserve_mib} MiB, requiring {required_mib} MiB above total memory {node_memory_total_mib} MiB"
     )]
     InsufficientCapacity {
@@ -244,6 +282,14 @@ pub(crate) enum MemoryAdmissionEvaluationError {
 
 #[derive(Debug, thiserror::Error)]
 pub enum NodeMemoryCapacityError {
+    #[error("failed to read sandbox parent control {path}: {source}")]
+    ParentRead {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("invalid sandbox parent control {path}: {value:?}")]
+    ParentInvalid { path: PathBuf, value: String },
     #[error("failed to read {PROC_MEMINFO_PATH}: {source}")]
     Read {
         #[source]
@@ -257,6 +303,54 @@ pub enum NodeMemoryCapacityError {
         "invalid {PROC_MEMINFO_PATH}: MemAvailable {available_mib} MiB exceeds MemTotal {total_mib} MiB"
     )]
     AvailableExceedsTotal { total_mib: u64, available_mib: u64 },
+}
+
+pub(crate) async fn read_node_memory_snapshot()
+-> Result<NodeMemorySnapshot, NodeMemoryCapacityError> {
+    read_node_memory_snapshot_from(Path::new(PROC_MEMINFO_PATH)).await
+}
+
+async fn read_parent_memory_snapshot(
+    parent: &Path,
+) -> Result<ParentMemorySnapshot, NodeMemoryCapacityError> {
+    let current_path = parent.join("memory.current");
+    let maximum_path = parent.join("memory.max");
+    let (current, maximum) = tokio::try_join!(
+        read_parent_control(&current_path),
+        read_parent_control(&maximum_path),
+    )?;
+    let current_bytes =
+        current
+            .trim()
+            .parse::<u64>()
+            .map_err(|_| NodeMemoryCapacityError::ParentInvalid {
+                path: current_path,
+                value: current,
+            })?;
+    // Startup installs a finite hard cap. An unbounded ("max") or unreadable
+    // parent is not evidence that it is safe to admit more work.
+    let maximum_mib =
+        maximum
+            .trim()
+            .parse::<u64>()
+            .map_err(|_| NodeMemoryCapacityError::ParentInvalid {
+                path: maximum_path,
+                value: maximum,
+            })?
+            / BYTES_PER_MIB;
+    Ok(ParentMemorySnapshot {
+        current_mib: current_bytes.div_ceil(BYTES_PER_MIB),
+        maximum_mib,
+    })
+}
+
+async fn read_parent_control(path: &Path) -> Result<String, NodeMemoryCapacityError> {
+    tokio::fs::read_to_string(path)
+        .await
+        .map_err(|source| NodeMemoryCapacityError::ParentRead {
+            path: path.to_path_buf(),
+            source,
+        })
 }
 
 async fn read_node_memory_snapshot_from(

@@ -108,6 +108,7 @@ because disabling it by mistake would leave every create queued forever.
 | `SPACE_NODEMGR_NETWORK_POOL_TARGET`, `SPACE_NODEMGR_NETWORK_POOL_RETAIN_READY`, `SPACE_NODEMGR_NETWORK_POOL_MIN_READY` | `min(max_slots, 100)`, `max_slots`, `min(max_slots, 32)` | Warm network slot pool sizes; set target and retained to `0` to keep the pool off. The pool only serves allocations that use the pool's own network namespace. |
 | `SPACE_NODEMGR_SERVICE_PORT_INGRESS_ISOLATION` | auto | `shared_host` on Kubernetes, else `exclusive_host`. |
 | `SPACE_NODEMGR_ACTIVATE_RUNTIME_SUPERVISOR_ON_START` | off | |
+| `SPACE_NODEMGR_SANDBOX_PARENT_MEMORY_MAX_HOST_PERCENT` | 90 | Static aggregate sandbox memory budget as a whole percentage of host `MemTotal`, in `1..=100`. Overrides `[sandbox_parent_memory].max_host_percent` in node-manager's TOML config. Read once at startup, not adjusted with memory pressure. See [sandbox parent memory](#sandbox-parent-memory). |
 | `SPACE_RUNTIME_SUPERVISOR_JAILER_START_TIMEOUT_MS` | 5000 | How long the runtime supervisor lets one Firecracker jailer run before it kills it and fails the launch; a positive integer. The supervisor reads it once at startup from the node's environment file, so a change takes effect at its next restart. A set value that is not a positive integer (such as `0` or `5s`) makes the supervisor exit at startup, and launches on that node fail until it is fixed. On a timeout, the error and the supervisor's warning report the elapsed time, the limit and up to the last 1 KiB of what the jailer wrote to stdout and stderr. When the launch names a console log (for example with node-manager's `SPACE_ENABLE_GUEST_CONSOLE_LOGS`), the jailer writes there, and they name that file instead. `runtime_supervisor.jailer.duration_ms` records every jailer run. |
 | `SPACE_RTMGR_INSTALL_KERNELS_DIR` | unset | Enables runtime-manager kernel installs in this versioned kernel root, which must exist on the state directory's filesystem. Unset, installs and uninstalls are refused. |
 | `SPACE_NODEMGR_BTRFS_BALANCE_ENABLED` | on | |
@@ -135,6 +136,59 @@ because disabling it by mistake would leave every create queued forever.
 | `SPACE_SUSPEND_WAKE_ARBITRATION` | on | Kill switch: off lets a suspend that queued behind a concurrent wake through instead of rejecting it as superseded. |
 | `SPACE_SUSPEND_DEFAULT_FORMAT` | `btrfs-send` | Set `full` to roll the suspend codec default back. |
 | `SPACE_CLUSTER_CONTROLLER_LEADER_ELECTION_ENABLED` | on | Kill switch. On, the cluster controller contends for its leader Lease when it runs in a Kubernetes pod (`KUBERNETES_SERVICE_HOST` and `KUBERNETES_SERVICE_PORT` both set) or uses the Kubernetes substrate, and otherwise runs the reconcilers without a lease. Off runs them without a lease everywhere. Running without a lease is only safe with one replica. |
+
+### Sandbox parent memory
+
+Node-manager sets `/sys/fs/cgroup/space/memory.max` once during startup, after
+acquiring its service mutex and validating existing slot ownership. The default
+is the smaller of the logical slot budget (`sandbox_cgroup.memory_mib` times
+`network_pool.max_slots`) and **90% of host `MemTotal`**, rounded down to MiB.
+This is a static budget, not a pressure-driven controller.
+
+Configure a different whole percentage in `/space/config/nodemgr.toml`, or the
+file selected by node-manager's `--config` argument:
+
+```toml
+[sandbox_parent_memory]
+max_host_percent = 90
+```
+
+`SPACE_NODEMGR_SANDBOX_PARENT_MEMORY_MAX_HOST_PERCENT` takes precedence over the
+file. Values outside `1..=100`, invalid host memory, zero budgets, and arithmetic
+overflow fail startup before cgroup writes. Choosing `100` leaves no percentage
+headroom for host services. A config change takes effect at the next
+node-manager restart; an older binary may ignore the new setting.
+
+The parent contains both Firecracker and host-side sandbox processes, so their
+charged memory and caches share the cap. Startup also sets `memory.swap.max=0`,
+`memory.high=max`, and `memory.oom.group=0`: hard containment without an extra
+parent throttle or whole-parent group kill. It verifies the controls by reading
+them back before opening admission. Per-sandbox limits, OOM scores, host swap
+configuration and guest RAM are unchanged.
+
+New lease admission checks both host `MemAvailable` and the parent's
+`memory.current`/`memory.max`. Both projections include the existing bounded
+Firecracker growth allowance, newly committed lease reservations, the requested
+child budget, and `memory_admission.reserve_mib`. Missing, malformed or
+unbounded parent controls fail admission closed. Existing-lease reuse and
+cleanup retain their execution and generation fences.
+
+This admission policy does not reserve every child's full future maximum or
+every sidecar's possible future growth. The kernel parent cap is the final
+backstop if existing workloads grow; it is not a physical reservation for
+services outside `/space`, nor a guarantee against filesystem or I/O stalls.
+The network-pool status field `sandbox_cgroup_total_memory_mib` remains the
+logical slot budget, not this effective cap. Inspect `memory.max` or the
+startup log's `sandbox_cgroup_parent_memory_effective_mib` for the applied cap.
+
+On the first startup with a smaller budget, existing usage can exceed it.
+The kernel may reclaim or kill sandbox processes while applying the limit;
+node-manager does not raise the cap to current usage or require a drain first.
+The write runs off the async executor while retaining the ownership mutex.
+Control-file writes are not transactional: any failure stops startup rather
+than reporting success or restoring a looser cap. Correct the error and
+restart. Rolling back to a binary using the old slot-based calculation
+restores that older, potentially larger cap on startup.
 
 ## API, admission and limits
 

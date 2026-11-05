@@ -1,6 +1,118 @@
 use super::*;
 
 #[test]
+fn parent_memory_budget_is_bounded_by_host_and_logical_capacity() {
+    for (child_mib, slots, host_mib, percent, expected_mib) in [
+        (
+            8320,
+            16,
+            65_536,
+            DEFAULT_PARENT_MEMORY_MAX_HOST_PERCENT,
+            58_982,
+        ),
+        (8320, 16, 65_536, 80, 52_428),
+        (8320, 16, 65_536, 100, 65_536),
+        (8320, 16, 65_536, 1, 655),
+        (1024, 2, 65_536, 90, 2048),
+        // A large child must not raise the cap above the host budget.
+        (8320, 16, 1024, 90, 921),
+    ] {
+        let limit = ParentMemoryLimit::for_host(child_mib, slots, host_mib, percent).unwrap();
+        assert_eq!(limit.memory_max_mib, expected_mib);
+        assert_eq!(limit.memory_max, (expected_mib * MIB_BYTES).to_string());
+    }
+}
+
+#[test]
+fn parent_memory_rejects_invalid_percent_zero_budget_and_overflow() {
+    for percent in [0, 101, u32::MAX] {
+        assert!(matches!(
+            ParentMemoryLimit::for_host(8320, 16, 65_536, percent),
+            Err(ParentMemoryLimitError::InvalidPercent(_))
+        ));
+    }
+    for (child, slots, host) in [
+        (8320, 0, 65_536),
+        (8320, 16, 0),
+        (8320, 16, 1),
+        (u64::MAX, 16, 65_536),
+        (8320, 16, u64::MAX),
+    ] {
+        assert!(matches!(
+            ParentMemoryLimit::for_host(child, slots, host, 90),
+            Err(ParentMemoryLimitError::InvalidBudget)
+        ));
+    }
+    assert!(matches!(
+        ParentMemoryLimit::for_host(DEFAULT_SANDBOX_MEMORY_HEADROOM_MIB, 16, 65_536, 90),
+        Err(ParentMemoryLimitError::InvalidChildLimit)
+    ));
+}
+
+#[test]
+fn parent_setup_enforces_configured_cap_without_usage_floor_or_child_changes() {
+    let root = tempfile::tempdir().unwrap();
+    for (file, value) in [
+        ("memory.oom.group", "1"),
+        ("memory.high", "1"),
+        ("memory.swap.max", "max"),
+        ("memory.max", "max"),
+        ("memory.current", "17179869184"),
+    ] {
+        fs::write(root.path().join(file), value).unwrap();
+    }
+    let child = root.path().join("child");
+    fs::create_dir(&child).unwrap();
+    fs::write(child.join("memory.max"), "536870912").unwrap();
+
+    // Repeating startup is idempotent, even when current usage exceeds the cap.
+    for _ in 0..2 {
+        let limit = ParentMemoryLimit::for_host(1024, 2, 65_536, 90).unwrap();
+        apply_parent_memory_limit_at(root.path(), limit).unwrap();
+        for (file, expected) in [
+            ("memory.oom.group", "0"),
+            ("memory.high", "max"),
+            ("memory.swap.max", "0"),
+            ("memory.max", "2147483648"),
+            ("memory.current", "17179869184"),
+        ] {
+            assert_eq!(
+                fs::read_to_string(root.path().join(file)).unwrap(),
+                expected
+            );
+        }
+        assert_eq!(
+            fs::read_to_string(child.join("memory.max")).unwrap(),
+            "536870912"
+        );
+    }
+}
+
+#[test]
+fn parent_setup_reports_partial_write_failure() {
+    let root = tempfile::tempdir().unwrap();
+    fs::write(root.path().join("memory.high"), "1").unwrap();
+    fs::create_dir(root.path().join("memory.max")).unwrap();
+    let limit = ParentMemoryLimit::for_host(1024, 2, 65_536, 90).unwrap();
+    assert!(matches!(
+        apply_parent_memory_limit_at(root.path(), limit),
+        Err(ParentMemoryLimitError::Write(
+            CgroupUpdateError::Write { .. }
+        ))
+    ));
+    // No rollback to group-wide OOM killing after the hard-cap write fails.
+    assert_eq!(
+        fs::read_to_string(root.path().join("memory.oom.group")).unwrap(),
+        "0"
+    );
+    // Do not remove an existing throttle if installing the hard cap failed.
+    assert_eq!(
+        fs::read_to_string(root.path().join("memory.high")).unwrap(),
+        "1"
+    );
+}
+
+#[test]
 fn termination_waits_for_known_quiescence_and_removal() {
     // Synthetic filesystem observations: the async supervisor owns timing.
     let root = tempfile::tempdir().unwrap();

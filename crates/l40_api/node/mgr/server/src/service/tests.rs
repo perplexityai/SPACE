@@ -520,47 +520,76 @@ pub(super) mod service_tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn concurrent_new_lease_admission_allows_only_one_reserved_cap() {
-        let root = tempfile::tempdir().unwrap();
-        let meminfo_path = root.path().join("meminfo");
-        std::fs::write(
-            &meminfo_path,
-            "MemTotal:       18086912 kB\nMemAvailable:   18086912 kB\n",
-        )
-        .unwrap();
-        let cgroup_base = root.path().join("cgroups");
-        std::fs::create_dir(&cgroup_base).unwrap();
+        // Exercise both the host constraint and a tighter sandbox parent.
+        for (host_mib, parent_mib) in [(17_663u64, 65_536u64), (65_536, 17_663)] {
+            let root = tempfile::tempdir().unwrap();
+            let meminfo_path = root.path().join("meminfo");
+            std::fs::write(
+                &meminfo_path,
+                format!(
+                    "MemTotal: {} kB\nMemAvailable: {} kB\n",
+                    host_mib * 1024,
+                    host_mib * 1024
+                ),
+            )
+            .unwrap();
+            let cgroup_base = root.path().join("cgroups");
+            std::fs::create_dir(&cgroup_base).unwrap();
+            std::fs::write(cgroup_base.join("memory.current"), "0").unwrap();
+            std::fs::write(
+                cgroup_base.join("memory.max"),
+                (parent_mib * 1024 * 1024).to_string(),
+            )
+            .unwrap();
 
-        let mut service = service_for_unit_tests().await;
-        service.pool = NetworkPool::open_in_memory_for_test(NetworkPoolConfig::new(2));
-        service.pool.set_all_slots_ready_for_test();
-        service.memory_admission_config = MemoryAdmissionConfig { reserve_mib: 1024 };
-        service.memory_admission_sources = MemoryAdmissionSources::new(meminfo_path, cgroup_base);
-        let first_id = SandboxId::from_str("019d84bd-280d-7331-99c6-b63377f3a3a2").unwrap();
-        let second_id = SandboxId::from_str("019d84bd-280d-7331-99c6-b63377f3b4b5").unwrap();
+            let mut service = service_for_unit_tests().await;
+            service.pool = NetworkPool::open_in_memory_for_test(NetworkPoolConfig::new(2));
+            service.pool.set_all_slots_ready_for_test();
+            service.memory_admission_config = MemoryAdmissionConfig { reserve_mib: 1024 };
+            service.memory_admission_sources =
+                MemoryAdmissionSources::new(meminfo_path, cgroup_base);
+            let first_id = SandboxId::from_str("019d84bd-280d-7331-99c6-b63377f3a3a2").unwrap();
+            let second_id = SandboxId::from_str("019d84bd-280d-7331-99c6-b63377f3b4b5").unwrap();
 
-        let (first, second) = tokio::join!(
-            service.allocate_new_lease(first_id, None, 8320),
-            service.allocate_new_lease(second_id, None, 8320)
-        );
+            let (first, second) = tokio::join!(
+                service.allocate_new_lease(first_id, None, 8320),
+                service.allocate_new_lease(second_id, None, 8320)
+            );
 
-        let outcomes = [first, second];
-        assert_eq!(
-            outcomes.iter().filter(|outcome| outcome.is_ok()).count(),
-            1,
-            "exactly one allocation should be admitted: {outcomes:?}"
-        );
-        assert!(outcomes.iter().any(|outcome| matches!(
-            outcome,
-            Err(AllocateNewLeaseError::MemoryAdmission(
-                MemoryAdmissionEvaluationError::Admission(
-                    MemoryAdmissionError::InsufficientCapacity {
-                        existing_growth_reserve_mib: 8320,
-                        ..
-                    }
-                )
-            ))
-        )));
-        assert_eq!(service.pool.active_memory_reservations().unwrap().len(), 1);
+            let outcomes = [first, second];
+            assert_eq!(
+                outcomes.iter().filter(|outcome| outcome.is_ok()).count(),
+                1,
+                "exactly one allocation should be admitted: {outcomes:?}"
+            );
+            let error = outcomes.into_iter().find_map(Result::err).unwrap();
+            match (host_mib < parent_mib, error) {
+                (
+                    true,
+                    AllocateNewLeaseError::MemoryAdmission(
+                        MemoryAdmissionEvaluationError::Admission(
+                            MemoryAdmissionError::InsufficientCapacity {
+                                existing_growth_reserve_mib: 8320,
+                                ..
+                            },
+                        ),
+                    ),
+                ) => {}
+                (
+                    false,
+                    AllocateNewLeaseError::MemoryAdmission(
+                        MemoryAdmissionEvaluationError::Admission(
+                            MemoryAdmissionError::InsufficientParentCapacity {
+                                projected_mib: 17_664,
+                                ..
+                            },
+                        ),
+                    ),
+                ) => {}
+                (_, error) => panic!("unexpected admission refusal: {error}"),
+            }
+            assert_eq!(service.pool.active_memory_reservations().unwrap().len(), 1);
+        }
     }
 
     pub(in crate::service) fn bind_test_execution(

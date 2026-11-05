@@ -280,7 +280,7 @@ impl NodeManagerService {
                 tracing::warn!(
                     sandbox_id = %sandbox_id,
                     error = %error,
-                    "rejecting new sandbox allocation because host memory capacity cannot be observed"
+                    "rejecting new sandbox allocation because host or parent memory capacity cannot be observed"
                 );
                 SandboxEvent::new(
                     typed_sandbox_id,
@@ -299,6 +299,25 @@ impl NodeManagerService {
                 MemoryAdmissionEvaluationError::Admission(error),
             )) => {
                 match &error {
+                    MemoryAdmissionError::InsufficientParentCapacity {
+                        current_mib,
+                        maximum_mib,
+                        projected_mib,
+                    } => {
+                        tracing::info!(
+                            sandbox_id = %sandbox_id,
+                            parent_current_mib = current_mib,
+                            parent_maximum_mib = maximum_mib,
+                            parent_projected_mib = projected_mib,
+                            "rejecting new sandbox allocation because measured demand exceeds sandbox parent capacity"
+                        );
+                    }
+                    MemoryAdmissionError::ParentRequirementOverflow => {
+                        tracing::warn!(
+                            sandbox_id = %sandbox_id,
+                            "rejecting new sandbox allocation because parent memory demand overflows"
+                        );
+                    }
                     MemoryAdmissionError::InsufficientCapacity {
                         node_memory_total_mib,
                         node_used_mib,
@@ -340,8 +359,10 @@ impl NodeManagerService {
                 // A capacity refusal is normal operation. An overflow means the
                 // reservation state is corrupt or saturated, so it stays a WARN.
                 let details = match &error {
-                    MemoryAdmissionError::InsufficientCapacity { .. } => details.routine(),
-                    MemoryAdmissionError::RequirementOverflow { .. } => details,
+                    MemoryAdmissionError::InsufficientCapacity { .. }
+                    | MemoryAdmissionError::InsufficientParentCapacity { .. } => details.routine(),
+                    MemoryAdmissionError::RequirementOverflow { .. }
+                    | MemoryAdmissionError::ParentRequirementOverflow => details,
                 };
                 SandboxEvent::new(
                     typed_sandbox_id,

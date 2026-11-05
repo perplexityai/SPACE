@@ -21,7 +21,103 @@ fn sources(total_mib: u64, available_mib: u64) -> (tempfile::TempDir, MemoryAdmi
     let cgroup_base = root.path().join("cgroups");
     std::fs::create_dir(&cgroup_base).unwrap();
     let sources = MemoryAdmissionSources::new(meminfo_path, cgroup_base);
+    write_parent(&sources, 0, total_mib);
     (root, sources)
+}
+
+fn write_parent(sources: &MemoryAdmissionSources, current_mib: u64, maximum_mib: u64) {
+    for (file, value) in [("memory.current", current_mib), ("memory.max", maximum_mib)] {
+        std::fs::write(
+            sources.firecracker_cgroup_base.join(file),
+            (value * BYTES_PER_MIB).to_string(),
+        )
+        .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn parent_limit_refuses_a_new_vm_even_with_host_headroom() {
+    let (_root, sources) = sources(65_536, 49_152);
+    // Aggregate charges include siblings and caches absent from the lease list.
+    write_parent(&sources, 55_000, 56_000);
+
+    let error = MemoryAdmissionConfig { reserve_mib: 1024 }
+        .evaluate_new_allocation(2048, &[], &sources)
+        .await
+        .expect_err("a full sandbox parent must refuse even when the host has available RAM");
+    assert!(matches!(
+        error,
+        MemoryAdmissionEvaluationError::Admission(
+            MemoryAdmissionError::InsufficientParentCapacity {
+                current_mib: 55_000,
+                maximum_mib: 56_000,
+                projected_mib: 58_072,
+            }
+        )
+    ));
+}
+
+#[tokio::test]
+async fn parent_capacity_boundary_rounds_usage_up_and_limit_down() {
+    let (_root, sources) = sources(65_536, 65_536);
+    let admission = MemoryAdmissionConfig { reserve_mib: 1024 };
+    write_parent(&sources, 500, 5000);
+    admission
+        .evaluate_new_allocation(3476, &[], &sources)
+        .await
+        .unwrap();
+
+    std::fs::write(
+        sources.firecracker_cgroup_base.join("memory.current"),
+        (500 * BYTES_PER_MIB + 1).to_string(),
+    )
+    .unwrap();
+    admission
+        .evaluate_new_allocation(3476, &[], &sources)
+        .await
+        .unwrap_err();
+
+    write_parent(&sources, 500, 5000);
+    std::fs::write(
+        sources.firecracker_cgroup_base.join("memory.max"),
+        (5000 * BYTES_PER_MIB - 1).to_string(),
+    )
+    .unwrap();
+    admission
+        .evaluate_new_allocation(3476, &[], &sources)
+        .await
+        .unwrap_err();
+}
+
+#[tokio::test]
+async fn missing_or_invalid_parent_controls_fail_closed() {
+    for (file, value) in [
+        ("memory.current", None),
+        ("memory.current", Some("invalid")),
+        ("memory.max", None),
+        ("memory.max", Some("invalid")),
+        ("memory.max", Some("max")),
+        ("memory.max", Some("-1")),
+        ("memory.max", Some("18446744073709551616")),
+    ] {
+        let (_root, sources) = sources(65_536, 65_536);
+        let path = sources.firecracker_cgroup_base.join(file);
+        match value {
+            Some(value) => std::fs::write(path, value).unwrap(),
+            None => std::fs::remove_file(path).unwrap(),
+        }
+        let error = MemoryAdmissionConfig { reserve_mib: 1024 }
+            .evaluate_new_allocation(2048, &[], &sources)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            MemoryAdmissionEvaluationError::NodeMemory(
+                NodeMemoryCapacityError::ParentRead { .. }
+                    | NodeMemoryCapacityError::ParentInvalid { .. }
+            )
+        ));
+    }
 }
 
 fn write_cgroup(
