@@ -564,16 +564,19 @@ impl SandboxManagerService {
         &self,
         request: Request<StartRequest>,
     ) -> Result<Response<StartResponse>, Status> {
-        self.start_with_runtime_upgrade(request, None).await
+        self.start_with_runtime_upgrade(request, super::start::StartAdmission::default())
+            .await
     }
 
-    /// [`Self::start`] as the cold boot of `runtime_upgrade`, which may pass
-    /// that upgrade's activation fence. The caller's authorization is checked
-    /// exactly as for any Start.
+    /// [`Self::start`] with what sandbox-manager's own caller may claim
+    /// beyond the wire request: the cold boot of a runtime upgrade, which may
+    /// pass that upgrade's activation fence, or the node execution the start
+    /// was decided on. The caller's authorization is checked exactly as for
+    /// any Start.
     pub(super) async fn start_with_runtime_upgrade(
         &self,
         request: Request<StartRequest>,
-        runtime_upgrade: Option<crate::db::RuntimeUpgradeOperationId>,
+        admission: super::start::StartAdmission,
     ) -> Result<Response<StartResponse>, Status> {
         let peer = self.authorize_peer(&request, "Start", ALLOW_SANDBOX_OPERATOR_OR_TMPLMGR)?;
         let req = request.get_ref().clone();
@@ -650,7 +653,7 @@ impl SandboxManagerService {
                 req,
                 restrict_to_template_manager_owned,
                 identity_free_direct_authority,
-                runtime_upgrade,
+                admission,
             )
             .await
         }

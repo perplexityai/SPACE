@@ -255,6 +255,7 @@ fn cluster_controller_built_restore_drops_source_node_pin_and_omits_tolerations(
             extra_tolerations: &[],
             extra_required_affinity: None,
             node_group_placement: None,
+            runtime_upgrade: None,
         },
     );
 
@@ -320,6 +321,7 @@ fn cluster_controller_built_restore_renders_configured_placement() {
             extra_tolerations: std::slice::from_ref(&toleration),
             extra_required_affinity: Some(("space.pplx.net/rollout-cohort", "test-2")),
             node_group_placement: None,
+            runtime_upgrade: None,
         },
     );
 
@@ -566,6 +568,7 @@ fn node_group_labeler_selector_matches_the_rendered_pod_node_selector() {
             // placement adds required nodeAffinity rather than nodeSelector
             // entries, so it would not change what this compares.
             node_group_placement: None,
+            runtime_upgrade: None,
         },
     );
 

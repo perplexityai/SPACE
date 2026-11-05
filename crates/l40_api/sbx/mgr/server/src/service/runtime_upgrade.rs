@@ -28,7 +28,7 @@
 use std::time::Duration;
 
 use pplx_space_common_core::types::{
-    EnvironmentReference, ExecutionMetadata, SandboxActivationAttemptId,
+    EnvironmentReference, ExecutionMetadata, LocalArtifactId, SandboxActivationAttemptId,
 };
 use tonic::Status;
 
@@ -41,6 +41,7 @@ use crate::proto::{StartRequest, StartResponse};
 use crate::state::SandboxState;
 
 mod node_effects;
+mod rpc;
 #[cfg(test)]
 mod tests;
 
@@ -81,6 +82,9 @@ pub(super) fn begin_activation_status(error: BeginActivationError, context: &str
         error @ BeginActivationError::RuntimeUpgrade(
             crate::db::RuntimeUpgradeFenceError::NotFencing { .. },
         ) => Status::aborted(error.to_string()),
+        error @ BeginActivationError::ExecutionChanged => {
+            Status::failed_precondition(error.to_string())
+        }
         error => Status::internal(format!("{context}: {error}")),
     }
 }
@@ -141,12 +145,59 @@ pub(super) struct RuntimeUpgradeRequest {
     pub(super) target_state: RuntimeUpgradeTargetState,
     pub(super) authorization: RuntimeUpgradeAuthorization,
     pub(super) start: StartRequest,
+    /// For a suspended sandbox, the checkpoint the upgrade was decided from;
+    /// see [`require_decided_checkpoint`].
+    pub(super) checkpoint_local_artifact_id: Option<LocalArtifactId>,
+}
+
+impl RuntimeUpgradeRequest {
+    fn identity(&self) -> crate::db::RuntimeUpgradeRequestIdentity {
+        crate::db::RuntimeUpgradeRequestIdentity {
+            operation_id: self.operation_id,
+            sandbox_id: self.sandbox_id.clone(),
+            target_environment: self.target,
+            target_state: self.target_state,
+            authorization_id: self.authorization.id.clone(),
+        }
+    }
+
+    fn names_another(&self) -> Status {
+        Status::invalid_argument(format!(
+            "runtime upgrade {} names a different sandbox, target or authorization",
+            self.operation_id
+        ))
+    }
 }
 
 #[derive(Debug)]
 pub(super) enum RuntimeUpgradeOutcome {
-    Upgraded { start: Option<Box<StartResponse>> },
+    /// This call booted the sandbox under the target.
+    Upgraded,
+    /// A replay of an upgrade that already retired. It never touches the
+    /// sandbox's lifecycle again, so it has no start to report.
+    Replayed,
     AlreadyOnTarget,
+}
+
+/// The boot runs on this node's copy, so for a suspended sandbox it must be
+/// the checkpoint the upgrade was decided from: the row's pinned local
+/// artifact must be the one the caller names. Staging pins the staged
+/// checkpoint, so the check holds across retries. An upgrade of a suspended
+/// sandbox that names no checkpoint has nothing to check the copy against.
+pub(super) fn require_decided_checkpoint(
+    sandbox: &SandboxRow,
+    decided: Option<LocalArtifactId>,
+) -> Result<(), Status> {
+    if sandbox.state == SandboxState::Suspended
+        && (decided.is_none() || sandbox.current_local_artifact_id != decided)
+    {
+        return Err(Status::failed_precondition(format!(
+            "sandbox {}'s checkpoint on this node isn't the one its runtime upgrade was decided \
+             from; refusing to boot it",
+            sandbox.id
+        )));
+    }
+    Ok(())
 }
 
 /// How [`RuntimeUpgrader::settle`] left an upgrade.
@@ -329,26 +380,42 @@ impl<E: RuntimeUpgradeEffects> RuntimeUpgrader<E> {
         }
     }
 
+    /// Refuse a request that names another sandbox, target or authorization
+    /// than its operation's live row or recorded outcome does: a retry may
+    /// not turn an operation into another one.
+    pub(super) fn refuse_another_request(
+        &self,
+        request: &RuntimeUpgradeRequest,
+    ) -> Result<(), Status> {
+        let recorded = crate::db::read::recorded_runtime_upgrade_request(
+            &*self.db()?,
+            request.operation_id,
+        )
+        .map_err(|error| Status::internal(format!("read runtime upgrade outcome: {error}")))?;
+        let live = self
+            .record(request.operation_id)?
+            .map(|record| record.identity());
+        if recorded
+            .into_iter()
+            .chain(live)
+            .any(|identity| identity != request.identity())
+        {
+            return Err(request.names_another());
+        }
+        Ok(())
+    }
+
     /// Run, resume or settle one upgrade.
     pub(super) async fn upgrade(
         &self,
         request: RuntimeUpgradeRequest,
     ) -> Result<RuntimeUpgradeOutcome, Status> {
+        self.refuse_another_request(&request)?;
         if let Some(record) = self.record(request.operation_id)? {
-            if record.sandbox_id != request.sandbox_id
-                || record.target_environment != request.target
-                || record.target_state != request.target_state
-                || record.authorization.id != request.authorization.id
-            {
-                return Err(Status::invalid_argument(format!(
-                    "runtime upgrade {} names a different sandbox, target or authorization",
-                    request.operation_id
-                )));
-            }
             // A retired upgrade already reached its lifecycle; the sandbox may
             // have moved on since, and a replay must not move it back.
             match self.settle(&record, true).await? {
-                Settled::Retired => return Ok(RuntimeUpgradeOutcome::Upgraded { start: None }),
+                Settled::Retired => return Ok(RuntimeUpgradeOutcome::Replayed),
                 // An interrupted attempt is back on its old pair; start over.
                 Settled::RolledBack => {}
             }
@@ -373,10 +440,11 @@ impl<E: RuntimeUpgradeEffects> RuntimeUpgrader<E> {
             )));
         }
         let sandbox = self.existing_sandbox(&request.sandbox_id)?;
+        require_decided_checkpoint(&sandbox, request.checkpoint_local_artifact_id)?;
         if sandbox.state != SandboxState::Suspended
             && saved_environment(&sandbox) == Some(request.target)
         {
-            return Ok(RuntimeUpgradeOutcome::AlreadyOnTarget);
+            return self.already_on_target(&request);
         }
         let disk = self.effects.inspect_local_disk(&sandbox).await?;
         if sandbox.state == SandboxState::Suspended
@@ -386,7 +454,28 @@ impl<E: RuntimeUpgradeEffects> RuntimeUpgrader<E> {
                 .and_then(ExecutionMetadata::environment)
                 == Some(request.target)
         {
-            return Ok(RuntimeUpgradeOutcome::AlreadyOnTarget);
+            return self.already_on_target(&request);
+        }
+        // An operation that already found its sandbox on the target never
+        // boots: a replay after the sandbox moved to another environment
+        // would otherwise undo that move.
+        let found_its_target =
+            crate::db::read::runtime_upgrade_report(&*self.db()?, request.operation_id)
+                .map_err(|error| {
+                    Status::internal(format!("read runtime upgrade outcome: {error}"))
+                })?
+                .is_some_and(|report| {
+                    matches!(
+                        report.status,
+                        crate::db::RuntimeUpgradeStatus::AlreadyOnTarget { .. }
+                    )
+                });
+        if found_its_target {
+            return Err(Status::failed_precondition(format!(
+                "runtime upgrade {} found sandbox {} on its target before, and the sandbox \
+                 moved since; a new attempt takes a new operation id",
+                request.operation_id, request.sandbox_id
+            )));
         }
         // What the sandbox ran under last: its checkpoint's producer when
         // suspended, otherwise its saved consumer or, unbound, its disk's.
@@ -435,6 +524,7 @@ impl<E: RuntimeUpgradeEffects> RuntimeUpgrader<E> {
                     "runtime upgrade {other} already owns this sandbox"
                 )));
             }
+            BeginRuntimeUpgrade::OperationNamesAnother => return Err(request.names_another()),
             BeginRuntimeUpgrade::OperationExists => {
                 return Err(Status::aborted(format!(
                     "runtime upgrade {} began concurrently",
@@ -452,10 +542,27 @@ impl<E: RuntimeUpgradeEffects> RuntimeUpgrader<E> {
                 ));
             }
         };
-        let response = self.run(&record, &disk, request.start).await?;
-        Ok(RuntimeUpgradeOutcome::Upgraded {
-            start: Some(Box::new(response)),
-        })
+        self.run(&record, &disk, request.start).await?;
+        Ok(RuntimeUpgradeOutcome::Upgraded)
+    }
+
+    /// Record that the upgrade fenced nothing, so a caller that lost this
+    /// answer reads it from `GetRuntimeUpgrade`.
+    fn already_on_target(
+        &self,
+        request: &RuntimeUpgradeRequest,
+    ) -> Result<RuntimeUpgradeOutcome, Status> {
+        // Recorded only if no other request reused the operation id first;
+        // the per-sandbox upgrade lock doesn't serialize two sandboxes.
+        let recorded =
+            crate::db::record_runtime_upgrade_already_on_target(&*self.db()?, &request.identity())
+                .map_err(|error| {
+                    Status::internal(format!("record runtime upgrade outcome: {error}"))
+                })?;
+        if !recorded {
+            return Err(request.names_another());
+        }
+        Ok(RuntimeUpgradeOutcome::AlreadyOnTarget)
     }
 
     async fn run(
@@ -808,6 +915,30 @@ fn required_text(value: &str, field: &str, max_bytes: usize) -> Result<String, S
     Ok(value.to_string())
 }
 
+fn parse_sandbox_id(sandbox_id: &str) -> Result<String, Status> {
+    sandbox_id
+        .parse::<pplx_space_common_core::types::SandboxId>()
+        .map(|id| id.to_string())
+        .map_err(|error| Status::invalid_argument(format!("invalid sandbox_id: {error}")))
+}
+
+fn parse_operation_id(operation_id: &str) -> Result<RuntimeUpgradeOperationId, Status> {
+    operation_id
+        .parse()
+        .map_err(|error| Status::invalid_argument(format!("invalid operation_id: {error}")))
+}
+
+fn parse_checkpoint_local_artifact_id(
+    checkpoint_local_artifact_id: Option<&str>,
+) -> Result<Option<LocalArtifactId>, Status> {
+    checkpoint_local_artifact_id
+        .map(str::parse)
+        .transpose()
+        .map_err(|error| {
+            Status::invalid_argument(format!("invalid checkpoint_local_artifact_id: {error}"))
+        })
+}
+
 /// The operation, target and authorization an upgrade names, parsed the same
 /// way whether `UpgradeRuntime` or a Wake carries them.
 fn parse_upgrade_identity(
@@ -822,9 +953,7 @@ fn parse_upgrade_identity(
     ),
     Status,
 > {
-    let operation_id = operation_id
-        .parse::<RuntimeUpgradeOperationId>()
-        .map_err(|error| Status::invalid_argument(format!("invalid operation_id: {error}")))?;
+    let operation_id = parse_operation_id(operation_id)?;
     let target = target_environment
         .parse::<EnvironmentReference>()
         .map_err(|error| {
@@ -885,11 +1014,7 @@ fn parse_request(
     request: crate::proto::UpgradeRuntimeRequest,
 ) -> Result<RuntimeUpgradeRequest, Status> {
     use crate::proto::WakeTargetState;
-    let sandbox_id = request
-        .sandbox_id
-        .parse::<pplx_space_common_core::types::SandboxId>()
-        .map_err(|error| Status::invalid_argument(format!("invalid sandbox_id: {error}")))?
-        .to_string();
+    let sandbox_id = parse_sandbox_id(&request.sandbox_id)?;
     let (operation_id, target, authorization) = parse_upgrade_identity(
         &request.operation_id,
         &request.target_environment,
@@ -917,6 +1042,9 @@ fn parse_request(
         target_state,
         authorization,
         start,
+        checkpoint_local_artifact_id: parse_checkpoint_local_artifact_id(
+            request.checkpoint_local_artifact_id.as_deref(),
+        )?,
     })
 }
 
@@ -929,16 +1057,14 @@ pub(super) struct WakeRuntimeUpgrade {
     authorization: RuntimeUpgradeAuthorization,
     /// The checkpoint the control plane decided the upgrade from, by its
     /// local artifact (`WakeRuntimeUpgrade.checkpoint_local_artifact_id`).
-    checkpoint_local_artifact_id: Option<pplx_space_common_core::types::LocalArtifactId>,
+    checkpoint_local_artifact_id: Option<LocalArtifactId>,
     /// The Wake's caller, whom the upgrade's cold start runs as.
     metadata: tonic::metadata::MetadataMap,
     extensions: tonic::Extensions,
 }
 
 impl WakeRuntimeUpgrade {
-    pub(super) const fn checkpoint_local_artifact_id(
-        &self,
-    ) -> Option<pplx_space_common_core::types::LocalArtifactId> {
+    pub(super) const fn checkpoint_local_artifact_id(&self) -> Option<LocalArtifactId> {
         self.checkpoint_local_artifact_id
     }
 
@@ -952,14 +1078,8 @@ impl WakeRuntimeUpgrade {
             &upgrade.target_environment,
             upgrade.authorization.as_ref(),
         )?;
-        let checkpoint_local_artifact_id = upgrade
-            .checkpoint_local_artifact_id
-            .as_deref()
-            .map(str::parse)
-            .transpose()
-            .map_err(|error| {
-                Status::invalid_argument(format!("invalid checkpoint_local_artifact_id: {error}"))
-            })?;
+        let checkpoint_local_artifact_id =
+            parse_checkpoint_local_artifact_id(upgrade.checkpoint_local_artifact_id.as_deref())?;
         Ok(Self {
             operation_id,
             target,
@@ -972,35 +1092,6 @@ impl WakeRuntimeUpgrade {
 }
 
 impl super::SandboxManagerService {
-    pub(super) async fn upgrade_runtime(
-        &self,
-        request: tonic::Request<crate::proto::UpgradeRuntimeRequest>,
-    ) -> Result<tonic::Response<crate::proto::UpgradeRuntimeResponse>, Status> {
-        self.authorize_peer(
-            &request,
-            "UpgradeRuntime",
-            super::ALLOW_SANDBOX_RUNTIME_UPGRADE,
-        )?;
-        let (metadata, extensions, message) = request.into_parts();
-        let parsed = parse_request(message)?;
-        let (outcome, start) = match self
-            .run_runtime_upgrade(metadata, extensions, parsed)
-            .await?
-        {
-            RuntimeUpgradeOutcome::Upgraded { start } => (
-                crate::proto::RuntimeUpgradeOutcome::Upgraded,
-                start.map(|start| *start),
-            ),
-            RuntimeUpgradeOutcome::AlreadyOnTarget => {
-                (crate::proto::RuntimeUpgradeOutcome::AlreadyOnTarget, None)
-            }
-        };
-        Ok(tonic::Response::new(crate::proto::UpgradeRuntimeResponse {
-            outcome: outcome as i32,
-            start,
-        }))
-    }
-
     /// Run the upgrade a Wake carries, booting `start`: the cold start the
     /// Wake built for this sandbox. The caller holds the Wake's lock.
     pub(super) async fn wake_runtime_upgrade(
@@ -1021,6 +1112,7 @@ impl super::SandboxManagerService {
                 target_state: RuntimeUpgradeTargetState::Started,
                 authorization: upgrade.authorization.clone(),
                 start,
+                checkpoint_local_artifact_id: upgrade.checkpoint_local_artifact_id,
             },
         )
         .await
@@ -1033,20 +1125,41 @@ impl super::SandboxManagerService {
         parsed: RuntimeUpgradeRequest,
     ) -> Result<RuntimeUpgradeOutcome, Status> {
         let sandbox_id = parsed.sandbox_id.clone();
-        let lock = self.auto_lifecycle.runtime_upgrade_lock(&sandbox_id);
-        let _guard = super::restart_admission::wait_for_activation_admission(
-            &sandbox_id,
+        let _guard = self.runtime_upgrade_guard(&sandbox_id).await?;
+        let outcome = self
+            .caller_upgrader(metadata, extensions)
+            .upgrade(parsed)
+            .await;
+        crate::node_state_sync::mark_sandbox_dirty(&self.db, &sandbox_id);
+        outcome
+    }
+
+    /// An upgrader whose boot and stop run as the caller of `metadata` and
+    /// `extensions`.
+    fn caller_upgrader(
+        &self,
+        metadata: tonic::metadata::MetadataMap,
+        extensions: tonic::Extensions,
+    ) -> RuntimeUpgrader<NodeRuntimeUpgradeEffects> {
+        RuntimeUpgrader::new(
+            self.db.clone(),
+            NodeRuntimeUpgradeEffects::for_caller(self.clone(), metadata, extensions),
+        )
+    }
+
+    /// Hold `sandbox_id`'s upgrade lock, waiting at most [`LOCK_WAIT`] for
+    /// another driver of its upgrade.
+    async fn runtime_upgrade_guard(
+        &self,
+        sandbox_id: &str,
+    ) -> Result<crate::auto_lifecycle::LifecycleMutexGuard, Status> {
+        let lock = self.auto_lifecycle.runtime_upgrade_lock(sandbox_id);
+        super::restart_admission::wait_for_activation_admission(
+            sandbox_id,
             tokio::time::timeout(LOCK_WAIT, lock.lock_owned()),
         )
         .await?
-        .map_err(|_| Status::unavailable("another runtime upgrade step is running; retry"))?;
-        let upgrader = RuntimeUpgrader::new(
-            self.db.clone(),
-            NodeRuntimeUpgradeEffects::for_caller(self.clone(), metadata, extensions),
-        );
-        let outcome = upgrader.upgrade(parsed).await;
-        crate::node_state_sync::mark_sandbox_dirty(&self.db, &sandbox_id);
-        outcome
+        .map_err(|_| Status::unavailable("another runtime upgrade step is running; retry"))
     }
 
     /// Refuse to stage or load a checkpoint while an upgrade still owes the

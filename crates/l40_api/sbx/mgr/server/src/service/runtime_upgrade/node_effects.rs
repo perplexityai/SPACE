@@ -333,7 +333,13 @@ impl RuntimeUpgradeEffects for NodeRuntimeUpgradeEffects {
         start: StartRequest,
     ) -> Result<StartResponse, Status> {
         self.service
-            .start_with_runtime_upgrade(self.caller_request(start)?, Some(operation_id))
+            .start_with_runtime_upgrade(
+                self.caller_request(start)?,
+                crate::service::start::StartAdmission {
+                    runtime_upgrade: Some(operation_id),
+                    ..Default::default()
+                },
+            )
             .await
             .map(tonic::Response::into_inner)
     }
@@ -443,4 +449,4 @@ impl RuntimeUpgradeEffects for NodeRuntimeUpgradeEffects {
 }
 
 #[cfg(test)]
-mod tests;
+pub(in crate::service::runtime_upgrade) mod tests;

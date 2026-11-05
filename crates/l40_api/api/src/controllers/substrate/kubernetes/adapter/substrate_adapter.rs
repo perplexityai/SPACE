@@ -320,6 +320,7 @@ impl SubstrateAdapter for KubernetesSubstrate {
                     // carries no source-node pin (`direct_node_name: None`),
                     // so kube-scheduler places it inside the set.
                     node_group_placement: node_group_placement.placement(),
+                    runtime_upgrade: None,
                 }
             }
             None => SandboxPodRequest::OnDemand {

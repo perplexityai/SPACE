@@ -15,17 +15,18 @@ use pplx_space_node_mgr_client::proto::{
 };
 use std::sync::{Arc, Mutex};
 
-struct Fixture {
+pub(in crate::service::runtime_upgrade) struct Fixture {
     _directory: tempfile::TempDir,
     cache: PathBuf,
-    _node: ServedNodeManager,
-    service: SandboxManagerService,
-    sandbox_id: String,
-    source: ExecutionMetadata,
-    target: ExecutionMetadata,
+    pub(in crate::service::runtime_upgrade) _node: ServedNodeManager,
+    pub(in crate::service::runtime_upgrade) service: SandboxManagerService,
+    pub(in crate::service::runtime_upgrade) sandbox_id: String,
+    pub(in crate::service::runtime_upgrade) source: ExecutionMetadata,
+    pub(in crate::service::runtime_upgrade) target: ExecutionMetadata,
 }
 
-fn environments() -> (ExecutionMetadata, ExecutionMetadata) {
+pub(in crate::service::runtime_upgrade) fn environments() -> (ExecutionMetadata, ExecutionMetadata)
+{
     let compiled = pplx_space_node_runtime_core::catalog::CompiledEnvironment::for_architecture(
         pplx_space_common_core::types::Arch::X86_64,
     )
@@ -36,7 +37,11 @@ fn environments() -> (ExecutionMetadata, ExecutionMetadata) {
     )
 }
 
-fn fixture(state: SandboxState, encrypted: bool, node: FakeNodeManager) -> Fixture {
+pub(in crate::service::runtime_upgrade) fn fixture(
+    state: SandboxState,
+    encrypted: bool,
+    node: FakeNodeManager,
+) -> Fixture {
     let (source, target) = environments();
     let directory = tempfile::tempdir().unwrap();
     let cache = directory.path().join("cache");
@@ -103,11 +108,11 @@ impl Fixture {
         NodeRuntimeUpgradeEffects::for_recovery(self.service.clone())
     }
 
-    fn row(&self) -> SandboxRow {
+    pub(in crate::service::runtime_upgrade) fn row(&self) -> SandboxRow {
         self.service.lookup_sandbox(&self.sandbox_id).unwrap()
     }
 
-    fn checkpoint(&self) -> PathBuf {
+    pub(in crate::service::runtime_upgrade) fn checkpoint(&self) -> PathBuf {
         self.cache.join(&self.sandbox_id).join("snapshot")
     }
 
@@ -139,7 +144,7 @@ impl Fixture {
             .unwrap();
     }
 
-    fn adopt_checkpoint(&self) -> LocalArtifactId {
+    pub(in crate::service::runtime_upgrade) fn adopt_checkpoint(&self) -> LocalArtifactId {
         let artifact = LocalArtifactId::new();
         assert!(
             crate::db::adopt_suspended_local_artifact(
@@ -189,7 +194,10 @@ impl Fixture {
     }
 }
 
-fn recording(calls: &Arc<Mutex<Vec<String>>>, entry: String) {
+pub(in crate::service::runtime_upgrade) fn recording(
+    calls: &Arc<Mutex<Vec<String>>>,
+    entry: String,
+) {
     calls.lock().unwrap().push(entry);
 }
 
@@ -735,7 +743,9 @@ fn upgrade_wake(
 
 /// The environment the compiled catalog certifies an upgrade edge to from
 /// `source`.
-fn certified_target(source: &ExecutionMetadata) -> ExecutionMetadata {
+pub(in crate::service::runtime_upgrade) fn certified_target(
+    source: &ExecutionMetadata,
+) -> ExecutionMetadata {
     use pplx_space_node_runtime_core::catalog::CompiledEnvironment;
     let compiled =
         CompiledEnvironment::for_architecture(pplx_space_common_core::types::Arch::X86_64).unwrap();

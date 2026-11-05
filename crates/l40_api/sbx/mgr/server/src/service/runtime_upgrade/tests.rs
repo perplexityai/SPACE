@@ -447,6 +447,7 @@ impl Harness {
                 blocking: true,
                 ..Default::default()
             },
+            checkpoint_local_artifact_id: self.checkpoint_artifact,
         }
     }
 
@@ -529,10 +530,7 @@ async fn a_suspended_sandbox_boots_on_the_target_and_retires_its_checkpoint() {
         .await
         .unwrap();
 
-    assert!(matches!(
-        outcome,
-        RuntimeUpgradeOutcome::Upgraded { start: Some(ref start) } if start.pid == 42
-    ));
+    assert!(matches!(outcome, RuntimeUpgradeOutcome::Upgraded));
     assert_eq!(
         h.fake.calls(),
         [
@@ -825,10 +823,7 @@ async fn a_verified_upgrade_whose_retirement_failed_finishes_on_settle() {
         .await
         .unwrap();
 
-    assert!(matches!(
-        outcome,
-        RuntimeUpgradeOutcome::Upgraded { start: None }
-    ));
+    assert!(matches!(outcome, RuntimeUpgradeOutcome::Replayed));
     assert_eq!(h.fake.calls()[before..], ["retire", "discard"]);
     assert_eq!(
         h.record(operation_id).unwrap().phase,
@@ -1143,7 +1138,7 @@ async fn a_start_that_fails_after_its_guest_is_ready_completes_the_upgrade() {
             .upgrade(h.request(operation_id, RuntimeUpgradeTargetState::Started))
             .await
             .unwrap(),
-        RuntimeUpgradeOutcome::Upgraded { start: None }
+        RuntimeUpgradeOutcome::Replayed
     ));
     assert_eq!(h.fake.calls().len(), before);
 }
@@ -1346,10 +1341,7 @@ async fn a_retry_must_name_the_same_upgrade() {
         .upgrade(h.request(operation_id, RuntimeUpgradeTargetState::Started))
         .await
         .unwrap();
-    assert!(matches!(
-        outcome,
-        RuntimeUpgradeOutcome::Upgraded { start: None }
-    ));
+    assert!(matches!(outcome, RuntimeUpgradeOutcome::Replayed));
     assert_eq!(h.fake.calls().len(), before);
 }
 
@@ -1436,6 +1428,8 @@ fn requests_are_parsed_strictly() {
             ..Default::default()
         }),
         target_state: WakeTargetState::Stopped as i32,
+        stage_from: None,
+        checkpoint_local_artifact_id: None,
     };
     let parsed = parse_request(valid()).unwrap();
     assert_eq!(parsed.target_state, RuntimeUpgradeTargetState::Stopped);
@@ -1552,10 +1546,7 @@ async fn a_replay_of_a_retired_upgrade_leaves_a_later_execution_alone() {
         .await
         .unwrap();
 
-    assert!(matches!(
-        outcome,
-        RuntimeUpgradeOutcome::Upgraded { start: None }
-    ));
+    assert!(matches!(outcome, RuntimeUpgradeOutcome::Replayed));
     assert!(h.fake.calls()[before..].is_empty());
     assert_eq!(h.row().state, SandboxState::Started);
 }
@@ -1732,7 +1723,7 @@ mod service {
                     start,
                     false,
                     crate::service::activation_support::IdentityFreeDirectActivationAuthority::LocalProducer,
-                    None,
+                    crate::service::start::StartAdmission::default(),
                 )
                 .await
                 .unwrap_err();
@@ -1784,7 +1775,7 @@ mod service {
                     },
                     false,
                     crate::service::activation_support::IdentityFreeDirectActivationAuthority::LocalProducer,
-                    None,
+                    crate::service::start::StartAdmission::default(),
                 )
                 .await
                 .unwrap_err();
@@ -1833,7 +1824,10 @@ mod service {
                     start,
                     false,
                     crate::service::activation_support::IdentityFreeDirectActivationAuthority::LocalProducer,
-                    Some(operation_id),
+                    crate::service::start::StartAdmission {
+                        runtime_upgrade: Some(operation_id),
+                        ..Default::default()
+                    },
                 )
                 .await
                 .unwrap_err();

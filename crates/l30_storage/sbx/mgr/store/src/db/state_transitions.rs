@@ -28,6 +28,10 @@ pub enum BeginActivationError {
     },
     #[error(transparent)]
     RuntimeUpgrade(#[from] RuntimeUpgradeFenceError),
+    /// The activation expected the sandbox on an earlier node execution;
+    /// another activation ran since.
+    #[error("sandbox was activated by another execution since this activation was decided")]
+    ExecutionChanged,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -212,6 +216,10 @@ pub struct ActivationRouteAdmission<'a> {
     /// The runtime upgrade this activation is the cold boot of. Only the
     /// upgrade fencing the sandbox, in its `booting` phase, passes the fence.
     pub runtime_upgrade: Option<RuntimeUpgradeOperationId>,
+    /// The node execution the caller decided this activation on, checked in
+    /// the claim's transaction: `Some` refuses a sandbox another activation
+    /// has moved to another execution since.
+    pub expected_node_execution: Option<Option<SandboxActivationAttemptId>>,
 }
 
 /// Claim the caller-observed sandbox state for activation.
@@ -246,6 +254,11 @@ pub fn begin_activation_with_route_evidence(
         return Ok(None);
     }
     admit_past_runtime_upgrade_fence(&tx, id, route_admission.runtime_upgrade)??;
+    if let Some(expected) = route_admission.expected_node_execution
+        && get_sandbox(&tx, id)?.is_some_and(|row| row.node_execution_id != expected)
+    {
+        return Err(BeginActivationError::ExecutionChanged);
+    }
     let keep_filesystem = true;
     // Only activation authorizes node allocation. Filesystem-only staging keeps
     // an unbound request identity and must not become an allocation predecessor.

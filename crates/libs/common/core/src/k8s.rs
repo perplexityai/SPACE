@@ -32,6 +32,10 @@ pub use placement::{
 pub mod node_selector;
 pub use node_selector::SandboxNodeSelector;
 
+#[path = "k8s/runtime_upgrade.rs"]
+mod runtime_upgrade;
+pub use runtime_upgrade::*;
+
 pub const TEMPLATE_LABEL_DOMAIN: &str = "space.pplx.net";
 pub const TEMPLATE_PRESENT_LABEL_VALUE: &str = "true";
 pub const SANDBOX_MANAGED_BY_LABEL: &str = "space.pplx.net/managed-by";
@@ -577,6 +581,11 @@ pub enum SandboxPodRequest<'a> {
         /// Set only on the drain's re-placement of an evacuated `stopped`
         /// sandbox; see [`StoppedMaterialization`].
         stopped_materialization: Option<StoppedMaterialization<'a>>,
+        /// Set only on a pod that boots the sandbox under another execution
+        /// environment; see [`PodRuntimeUpgrade`]. It excludes
+        /// `stopped_materialization` and `fork_disk_restore`, which name other
+        /// intents for the same checkpoint annotation.
+        runtime_upgrade: Option<Box<PodRuntimeUpgrade<'a>>>,
         /// Direct source-node assignment while no portable fallback exists.
         direct_node_name: Option<&'a str>,
         /// Source-node affinity preference once S3 fallback is available.
@@ -748,6 +757,12 @@ pub struct StoppedMaterialization<'a> {
 
 pub fn build_sandbox_pod(config: &SandboxPodConfig<'_>, request: SandboxPodRequest<'_>) -> Pod {
     let cold_create = matches!(&request, SandboxPodRequest::OnDemand { .. });
+    let runtime_upgrade = match &request {
+        SandboxPodRequest::Restore {
+            runtime_upgrade, ..
+        } => runtime_upgrade.as_deref().copied(),
+        SandboxPodRequest::OnDemand { .. } | SandboxPodRequest::Pooled { .. } => None,
+    };
     let empty_tolerations: &[PodToleration] = &[];
     let (
         common,
@@ -801,13 +816,21 @@ pub fn build_sandbox_pod(config: &SandboxPodConfig<'_>, request: SandboxPodReque
             suspend_restore_source_node,
             fork_disk_restore,
             stopped_materialization,
+            runtime_upgrade,
             direct_node_name,
             preferred_node_name,
             restore_node_shortlist,
             extra_tolerations,
             extra_required_affinity,
         } => {
-            let checkpoint =
+            debug_assert!(
+                runtime_upgrade.is_none()
+                    || (stopped_materialization.is_none() && fork_disk_restore.is_none()),
+                "a runtime upgrade pod names no other restore intent"
+            );
+            let checkpoint = if runtime_upgrade.is_some() {
+                Some(RUNTIME_UPGRADE_CHECKPOINT)
+            } else {
                 fork_disk_restore
                     .is_none()
                     .then_some(if stopped_materialization.is_some() {
@@ -817,7 +840,8 @@ pub fn build_sandbox_pod(config: &SandboxPodConfig<'_>, request: SandboxPodReque
                             crate::types::ArtifactKind::Full => "suspend",
                             crate::types::ArtifactKind::Disk => "stopped",
                         }
-                    });
+                    })
+            };
             (
                 common,
                 Some(runtime),
@@ -962,6 +986,42 @@ pub fn build_sandbox_pod(config: &SandboxPodConfig<'_>, request: SandboxPodReque
             SANDBOX_STOPPED_MATERIALIZATION_ARTIFACT_ID_ANNOTATION.to_string(),
             materialization.artifact_id.to_string(),
         );
+    }
+    if let Some(upgrade) = runtime_upgrade {
+        for (key, value) in [
+            (
+                SANDBOX_RUNTIME_UPGRADE_OPERATION_ID_ANNOTATION,
+                upgrade.operation_id.to_string(),
+            ),
+            (
+                SANDBOX_RUNTIME_UPGRADE_TARGET_ENVIRONMENT_ANNOTATION,
+                upgrade.target_environment.to_string(),
+            ),
+            (
+                SANDBOX_RUNTIME_UPGRADE_AUTHORIZATION_ID_ANNOTATION,
+                upgrade.authorization_id.to_string(),
+            ),
+            (
+                SANDBOX_RUNTIME_UPGRADE_AUTHORIZATION_REASON_ANNOTATION,
+                upgrade.authorization_reason.to_string(),
+            ),
+            (
+                SANDBOX_RUNTIME_UPGRADE_MEMORY_LOSS_ANNOTATION,
+                upgrade.memory_loss.to_string(),
+            ),
+            (
+                SANDBOX_RUNTIME_UPGRADE_TARGET_STATE_ANNOTATION,
+                upgrade.target_state.to_string(),
+            ),
+        ] {
+            annotations.insert(key.to_string(), value);
+        }
+        if let Some(artifact_id) = upgrade.checkpoint_local_artifact_id {
+            annotations.insert(
+                SANDBOX_RUNTIME_UPGRADE_CHECKPOINT_LOCAL_ARTIFACT_ID_ANNOTATION.to_string(),
+                artifact_id.to_string(),
+            );
+        }
     }
     if let Some(fork_disk_restore) = fork_disk_restore {
         annotations.insert(

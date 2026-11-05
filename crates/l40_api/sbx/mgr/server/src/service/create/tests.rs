@@ -286,6 +286,7 @@ async fn restore_selects_its_consumer_from_the_checkpoint(
                     crate::auto_lifecycle_delete_receipts::RouteIdentityProvenance::Unfenced,
                 open_activation_claim_eligible: false,
                 restored_snapshot: RestoredSnapshotProvenance::default(),
+                expected_node_execution: None,
             }),
         )
         .await
@@ -452,6 +453,7 @@ async fn a_runtime_upgrade_fence_refuses_a_concurrent_restore_before_allocation(
                 crate::auto_lifecycle_delete_receipts::RouteIdentityProvenance::Unfenced,
             open_activation_claim_eligible: false,
             restored_snapshot: RestoredSnapshotProvenance::default(),
+            expected_node_execution: None,
         }),
     )
     .await

@@ -1400,6 +1400,7 @@ fn beginning_a_new_execution_retires_an_older_pending_receipt() {
             }),
             open_claim: None,
             runtime_upgrade: None,
+            expected_node_execution: None,
         },
     )
     .unwrap();

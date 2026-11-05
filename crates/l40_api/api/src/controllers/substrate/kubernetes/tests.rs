@@ -1973,6 +1973,16 @@ mod kubernetes_tests {
 
     #[tonic::async_trait]
     impl WorkerApiInternal for SequencedWakeWorker {
+        async fn get_runtime_upgrade(
+            &self,
+            _request: tonic::Request<pplx_space_sbx_mgr_client::proto::GetRuntimeUpgradeRequest>,
+        ) -> Result<
+            tonic::Response<pplx_space_sbx_mgr_client::proto::GetRuntimeUpgradeResponse>,
+            tonic::Status,
+        > {
+            Err(tonic::Status::unimplemented("not used by this test"))
+        }
+
         async fn adopt_pool_sandbox(
             &self,
             _request: tonic::Request<pplx_space_sbx_mgr_client::proto::AdoptPoolSandboxRequest>,

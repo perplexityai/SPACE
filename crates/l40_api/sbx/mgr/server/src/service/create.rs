@@ -38,6 +38,9 @@ pub(super) struct StartFromCheckpointLaunch<'a> {
         crate::auto_lifecycle_delete_receipts::RouteIdentityProvenance,
     pub(super) open_activation_claim_eligible: bool,
     pub(super) restored_snapshot: RestoredSnapshotProvenance,
+    /// See [`super::start::StartAdmission::expected_node_execution`].
+    pub(super) expected_node_execution:
+        Option<Option<pplx_space_common_core::types::SandboxActivationAttemptId>>,
 }
 
 /// BYOK restore: rebuild the encrypted rootfs from the suspended `cow.luks` and
@@ -682,6 +685,7 @@ impl SandboxManagerService {
             route_identity_provenance,
             open_activation_claim_eligible,
             restored_snapshot,
+            expected_node_execution,
         } = launch;
         // A stopped target is a data placement that must end before
         // Firecracker. The `Start` boundaries answer it before reaching here;
@@ -839,6 +843,7 @@ impl SandboxManagerService {
                     ),
                     open_claim: open_route_activation.as_ref(),
                     runtime_upgrade: None,
+                    expected_node_execution,
                 },
             )
             .map_err(|error| {

@@ -525,6 +525,10 @@ fn delete_sandbox_child_rows(tx: &Connection, id: &str) -> Result<()> {
         "DELETE FROM sandbox_runtime_upgrades WHERE sandbox_id = ?1",
         params![id],
     )?;
+    tx.execute(
+        "DELETE FROM sandbox_runtime_upgrade_outcomes WHERE sandbox_id = ?1",
+        params![id],
+    )?;
     Ok(())
 }
 

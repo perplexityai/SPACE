@@ -724,23 +724,6 @@ impl SandboxManagerService {
                 SandboxState::Suspended | SandboxState::Stopped
                     if let Some(upgrade) = runtime_upgrade.take() =>
                 {
-                    // The upgrade boots the disk under this node's checkpoint, so
-                    // that checkpoint must be the one the upgrade was decided
-                    // from: the row's pinned local artifact must be the one the
-                    // Wake names. Staging pins the staged checkpoint, so the
-                    // check holds across retries; a stale copy here is refused,
-                    // never booted.
-                    if sandbox.state == SandboxState::Suspended
-                        && (upgrade.checkpoint_local_artifact_id().is_none()
-                            || sandbox.current_local_artifact_id
-                                != upgrade.checkpoint_local_artifact_id())
-                    {
-                        return Err(Status::failed_precondition(format!(
-                            "sandbox {}'s checkpoint on this node isn't the one its runtime \
-                             upgrade was decided from; refusing to boot it",
-                            sandbox.id
-                        )));
-                    }
                     let ready_timeout_secs = wake_ready_timeout_secs(
                         wait_deadline,
                         DEFAULT_BLOCKING_READY_TIMEOUT_SECS,
@@ -756,6 +739,19 @@ impl SandboxManagerService {
                         start.start_request(&sandbox.id, false, Some(ready_timeout_secs))?,
                     ))
                     .await?;
+                    if matches!(
+                        outcome,
+                        super::runtime_upgrade::RuntimeUpgradeOutcome::Replayed
+                    ) {
+                        // A replay moved nothing, and this Wake goes on to
+                        // restore whatever checkpoint the row pins now, which
+                        // must still be the one the upgrade names: a sandbox
+                        // suspended again since holds a newer one.
+                        super::runtime_upgrade::require_decided_checkpoint(
+                            &self.lookup_sandbox(&sandbox.id)?,
+                            upgrade.checkpoint_local_artifact_id(),
+                        )?;
+                    }
                     if matches!(
                         outcome,
                         super::runtime_upgrade::RuntimeUpgradeOutcome::AlreadyOnTarget
