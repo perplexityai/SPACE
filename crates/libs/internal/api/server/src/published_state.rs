@@ -53,6 +53,9 @@ use super::{optional_trimmed, parse_sandbox_id, proto_network_policy_to_common, 
 #[path = "published_state/input.rs"]
 mod input;
 use input::PublishedSandboxRow;
+#[path = "published_state/published_status.rs"]
+mod published_status;
+use published_status::PublishedStatus;
 
 const QUARANTINE_RECOVERY_OBSERVATION_HEARTBEAT_SECS: i64 = 60 * 60;
 
@@ -77,6 +80,7 @@ struct PublishedTransitionReceiptError {
 
 fn parse_published_transition_receipt(
     state: &PublishedSandboxState,
+    status: Option<&PublishedStatus>,
 ) -> Result<
     Option<SandboxTransitionReceipt<SandboxQuarantineReasonCode>>,
     PublishedTransitionReceiptError,
@@ -180,8 +184,8 @@ fn parse_published_transition_receipt(
                 })
                 .transpose()?
     };
-    let status = optional_trimmed(state.status.as_deref()).unwrap_or_default();
-    if !status.eq_ignore_ascii_case(target_state.as_str()) {
+    if !status.is_some_and(|status| status.is(target_state.lifecycle())) {
+        let status = status.map(PublishedStatus::as_str).unwrap_or_default();
         return Err(PublishedTransitionReceiptError {
             field: Field::TransitionReceiptTargetState,
             message: format!("receipt target {target_state} disagrees with status {status:?}"),
@@ -1402,11 +1406,14 @@ fn published_artifact_origin(raw: i32) -> Result<ArtifactOrigin, Status> {
 fn failure_episode_input(
     sandbox_id: SandboxId,
     state: &PublishedSandboxState,
+    status: Option<&PublishedStatus>,
     state_degraded: bool,
 ) -> serde_json::Value {
     serde_json::json!({
         "sandbox_id": sandbox_id,
-        "status": optional_trimmed(state.status.as_deref()),
+        "published_lifecycle": status
+            .and_then(PublishedStatus::lifecycle)
+            .map(|lifecycle| lifecycle.as_str()),
         "state_degraded": state_degraded,
         "execution_generation": state
             .execution_generation
@@ -1509,8 +1516,10 @@ pub async fn publish_sandbox_states_with_retirement(
             absent_ids.push(sandbox_uuid);
             continue;
         }
+        let parsed_status = PublishedStatus::parse(state.status.as_deref());
+        let status = parsed_status.as_ref();
         if state.state_degraded {
-            failure_episode_rows.push(failure_episode_input(sandbox_uuid, state, true));
+            failure_episode_rows.push(failure_episode_input(sandbox_uuid, state, status, true));
             state_only.insert(
                 sandbox_uuid,
                 serde_json::json!({
@@ -1520,7 +1529,7 @@ pub async fn publish_sandbox_states_with_retirement(
             );
             continue;
         }
-        let transition_receipt = match parse_published_transition_receipt(state) {
+        let transition_receipt = match parse_published_transition_receipt(state, status) {
             Ok(receipt) => receipt,
             Err(error) => {
                 let disposition = pplx_space_metrics::sandbox::publication::StatePublicationDisposition::OmitTransitionReceipt;
@@ -1569,9 +1578,7 @@ pub async fn publish_sandbox_states_with_retirement(
         let quarantine_count = quarantine_inputs.len();
         let mut row_publishes_network_policy = false;
         let parse_result = (|| -> Result<(), Status> {
-            if optional_trimmed(state.status.as_deref())
-                .is_some_and(|status| status.eq_ignore_ascii_case("quarantined"))
-            {
+            if status.is_some_and(|status| status.is(SandboxLifecycle::Quarantined)) {
                 let (source, reason_code) = match optional_trimmed(
                     state.quarantine_reason_code.as_deref(),
                 ) {
@@ -1669,7 +1676,7 @@ pub async fn publish_sandbox_states_with_retirement(
                 .as_ref()
                 .map(|timestamp| proto_timestamp(timestamp, "state_changed_at"))
                 .transpose()?;
-            if optional_trimmed(state.status.as_deref()).is_none() && state_changed_at.is_some() {
+            if status.is_none() && state_changed_at.is_some() {
                 return Err(Status::invalid_argument("state_changed_at requires status"));
             }
             let execution_generation = state
@@ -1686,6 +1693,7 @@ pub async fn publish_sandbox_states_with_retirement(
             let row = PublishedSandboxRow {
                 sandbox_id: sandbox_uuid,
                 status: optional_trimmed(state.status.as_deref()),
+                published_lifecycle: status.and_then(PublishedStatus::lifecycle),
                 template: optional_trimmed(state.template.as_deref()),
                 runtime: optional_trimmed(state.runtime.as_deref()).or_else(|| {
                     execution
@@ -1818,7 +1826,7 @@ pub async fn publish_sandbox_states_with_retirement(
             Ok(())
         })();
         if let Err(error) = parse_result {
-            failure_episode_rows.push(failure_episode_input(sandbox_uuid, state, true));
+            failure_episode_rows.push(failure_episode_input(sandbox_uuid, state, status, true));
             rows.truncate(row_count);
             snapshot_rows.truncate(snapshot_count);
             quarantine_inputs.truncate(quarantine_count);
@@ -1844,7 +1852,7 @@ pub async fn publish_sandbox_states_with_retirement(
                 }),
             );
         } else {
-            failure_episode_rows.push(failure_episode_input(sandbox_uuid, state, false));
+            failure_episode_rows.push(failure_episode_input(sandbox_uuid, state, status, false));
             publishes_network_policy |= row_publishes_network_policy;
         }
     }
@@ -2010,7 +2018,7 @@ pub async fn publish_sandbox_states_with_retirement(
              NOW()
          FROM jsonb_to_recordset($2::JSONB) AS input(
              sandbox_id UUID,
-             status TEXT,
+             published_lifecycle TEXT,
              state_degraded BOOLEAN,
              execution_generation BIGINT,
              pod_uid TEXT,
@@ -2021,7 +2029,7 @@ pub async fn publish_sandbox_states_with_retirement(
          LEFT JOIN sandbox_direct_route_identities direct_route
            ON direct_route.sandbox_id = s.id
          WHERE COALESCE(direct_route.current_node_id, s.active_node_id) = $1
-           AND LOWER(TRIM(input.status)) = 'failed'
+           AND input.published_lifecycle = 'failed'
            AND NOT input.state_degraded
            AND input.execution_generation IS NOT NULL
          ON CONFLICT (node_id, facet, element) DO UPDATE
@@ -2053,7 +2061,7 @@ pub async fn publish_sandbox_states_with_retirement(
              updated_at = NOW()
          FROM jsonb_to_recordset($2::JSONB) AS input(
              sandbox_id UUID,
-             status TEXT,
+             published_lifecycle TEXT,
              state_degraded BOOLEAN,
              execution_generation BIGINT,
              pod_uid TEXT,
@@ -2068,7 +2076,7 @@ pub async fn publish_sandbox_states_with_retirement(
            AND observed.facet = $3
            AND observed.element = input.sandbox_id::TEXT
            AND (
-               LOWER(TRIM(input.status)) IS DISTINCT FROM 'failed'
+               input.published_lifecycle IS DISTINCT FROM 'failed'
                OR (
                    NOT input.state_degraded
                    AND input.execution_generation IS NULL
@@ -2108,7 +2116,7 @@ pub async fn publish_sandbox_states_with_retirement(
     sqlx::query(sql!(
         "WITH input AS MATERIALIZED (
              SELECT input.sandbox_id, input.execution_generation, input.pod_uid,
-                    CASE WHEN LOWER(TRIM(input.status)) = 'suspended'
+                    CASE WHEN input.published_lifecycle = 'suspended'
                                AND input.current_local_artifact_id IS NOT NULL
                                AND input.current_local_artifact_kind = 'full'
                                AND input.current_local_artifact_origin = 'suspend'
@@ -2119,7 +2127,8 @@ pub async fn publish_sandbox_states_with_retirement(
                          ))
                          ELSE '{}'::JSONB END AS payload
                FROM jsonb_to_recordset($2::JSONB) AS input(
-                   sandbox_id UUID, status TEXT, execution_generation BIGINT,
+                   sandbox_id UUID, status TEXT, published_lifecycle TEXT,
+                   execution_generation BIGINT,
                    pod_uid TEXT, current_local_artifact_id UUID,
                    current_local_artifact_kind TEXT, current_local_artifact_origin TEXT
                )
@@ -2621,7 +2630,7 @@ async fn project_node_published_suspended_sandboxes(
 ) -> Result<SuspendedProjectionOutcome, Status> {
     let suspended_rows = rows
         .iter()
-        .filter(|row| row.may_report_lifecycle(SandboxLifecycle::Suspended))
+        .filter(|row| row.reports_lifecycle(SandboxLifecycle::Suspended))
         .collect::<Vec<_>>();
     if suspended_rows.is_empty() {
         return Ok(SuspendedProjectionOutcome::default());
@@ -3479,8 +3488,8 @@ async fn recover_pause_failed_sandboxes(
     let healthy_rows = rows
         .iter()
         .filter(|row| {
-            row.may_report_lifecycle(SandboxLifecycle::Started)
-                || row.may_report_lifecycle(SandboxLifecycle::Paused)
+            row.reports_lifecycle(SandboxLifecycle::Started)
+                || row.reports_lifecycle(SandboxLifecycle::Paused)
         })
         .map(PublishedSandboxRow::lifecycle_projection)
         .collect::<Vec<_>>();
@@ -3541,7 +3550,7 @@ async fn converge_restored_sandboxes(
     let restored_rows = rows
         .iter()
         .filter(|row| {
-            row.may_report_lifecycle(SandboxLifecycle::Started)
+            row.reports_lifecycle(SandboxLifecycle::Started)
                 && row.transition_receipt_kind
                     != Some(SandboxTransitionReceiptKind::ActivationCompleted.as_str())
         })
@@ -3571,7 +3580,7 @@ async fn converge_stopped_sandboxes(
 ) -> Result<Vec<SandboxId>, Status> {
     let stopped_rows = rows
         .iter()
-        .filter(|row| row.may_report_lifecycle(SandboxLifecycle::Stopped))
+        .filter(|row| row.reports_lifecycle(SandboxLifecycle::Stopped))
         .map(PublishedSandboxRow::lifecycle_projection)
         .collect::<Vec<_>>();
     let stopped_ids = if stopped_rows.is_empty() {
@@ -3598,7 +3607,7 @@ async fn converge_failed_sandboxes(
 ) -> Result<Vec<(SandboxId, String)>, Status> {
     let failed_rows = rows
         .iter()
-        .filter(|row| row.may_report_lifecycle(SandboxLifecycle::Failed))
+        .filter(|row| row.reports_lifecycle(SandboxLifecycle::Failed))
         .map(PublishedSandboxRow::lifecycle_projection)
         .collect::<Vec<_>>();
     if failed_rows.is_empty() {
