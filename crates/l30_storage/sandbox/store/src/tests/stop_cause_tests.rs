@@ -42,14 +42,16 @@ fn rfc3339(at: time::OffsetDateTime) -> String {
 }
 
 /// One node publication of `stopped`, as the ingest applies it: the lifecycle
-/// convergence, then the attribution statement. `attribution` is `None` for
-/// an older node, `Some((None, at))` for a requested stop.
+/// convergence, then the attribution statement, returning the ids the
+/// attribution statement wrote. `attribution` is `None` for an older node,
+/// whose row carries no attribution fields, and `Some((None, at))` for a
+/// requested stop.
 async fn publish_stopped(
     pool: &PgPool,
     node_id: NodeId,
     id: Uuid,
     attribution: Option<(Option<&str>, time::OffsetDateTime)>,
-) -> TestResult {
+) -> TestResult<Vec<SandboxId>> {
     converge_published_stopped(
         pool,
         node_id,
@@ -63,10 +65,9 @@ async fn publish_stopped(
             "stop_cause": cause,
             "stop_cause_at": rfc3339(at),
         }]),
-        None => serde_json::json!([]),
+        None => serde_json::json!([{ "sandbox_id": id, "published_lifecycle": "stopped" }]),
     };
-    record_published_stop_attributions(pool, node_id, Json(rows)).await?;
-    Ok(())
+    Ok(record_published_stop_attributions(pool, node_id, Json(rows)).await?)
 }
 
 async fn placed(pool: &PgPool, node_id: NodeId, name: &str, lifecycle: &str) -> TestResult<Uuid> {
@@ -108,18 +109,35 @@ async fn a_published_stop_attribution_is_applied_on_its_own() -> TestResult {
         ("stopped".to_owned(), None, Some(T2))
     );
 
-    // The same attribution republished, or an older one, changes nothing; an
-    // older node's report without one leaves the stored cause.
-    publish_stopped(pool, node_id, crashed, Some((Some("vm_exited"), T1))).await?;
-    publish_stopped(
-        pool,
-        node_id,
-        crashed,
-        Some((None, T1 - time::Duration::seconds(1))),
-    )
-    .await?;
-    publish_stopped(pool, node_id, crashed, None).await?;
+    // The same attribution republished, an older one, and an older node's
+    // report of the stopped sandbox without one each write nothing.
+    let written = |ids: Vec<SandboxId>| !ids.is_empty();
+    assert!(!written(
+        publish_stopped(pool, node_id, crashed, Some((Some("vm_exited"), T1))).await?
+    ));
+    assert!(!written(
+        publish_stopped(
+            pool,
+            node_id,
+            crashed,
+            Some((None, T1 - time::Duration::seconds(1))),
+        )
+        .await?
+    ));
+    assert!(!written(
+        publish_stopped(pool, node_id, crashed, None).await?
+    ));
     assert_eq!(stored(pool, crashed).await?, vm_exited(T1));
+    // Nor where nothing is stored: a row an older node stopped stays without
+    // an attribution.
+    let unattributed = placed(pool, node_id, "store-unattributed", "stopped").await?;
+    assert!(!written(
+        publish_stopped(pool, node_id, unattributed, None).await?
+    ));
+    assert_eq!(
+        stored(pool, unattributed).await?,
+        ("stopped".to_owned(), None, None)
+    );
 
     // Another node's report, and any report for a running row, write nothing.
     let running = placed(pool, node_id, "store-running", "started").await?;
@@ -189,8 +207,26 @@ async fn a_stop_attribution_lasts_until_the_sandbox_runs_again() -> TestResult {
     .bind(crashed)
     .execute(pool)
     .await?;
-    place(pool, crashed, node_id).await?;
+    let destination = NodeId::new();
+    place(pool, crashed, destination).await?;
     assert_eq!(stored(pool, crashed).await?, expected);
+
+    // On its new node, that node's newer attribution applies; the old node's
+    // report, even a newer one, no longer does.
+    let requested = ("stopped".to_owned(), None, Some(T2));
+    assert!(
+        !publish_stopped(pool, destination, crashed, Some((None, T2)))
+            .await?
+            .is_empty()
+    );
+    assert_eq!(stored(pool, crashed).await?, requested);
+    let later = T2 + time::Duration::minutes(1);
+    assert!(
+        publish_stopped(pool, node_id, crashed, Some((Some("vm_exited"), later)))
+            .await?
+            .is_empty()
+    );
+    assert_eq!(stored(pool, crashed).await?, requested);
 
     // The next start ends the stop it described.
     assert!(
