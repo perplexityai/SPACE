@@ -1,13 +1,10 @@
 use pplx_space_common_core::types::{SandboxId, SandboxLifecycle};
+use pplx_space_common_grpc::{SANDBOX_SERVICE_ROUTE_ERROR_METADATA, SANDBOX_STATE_METADATA};
 use tonic::metadata::MetadataValue;
 use tonic::{Code, Status};
 
-// The route error and sandbox state keys are the ones common-grpc's route
-// and sandbox-not-running statuses use; the tests pin them to those.
-const SANDBOX_SERVICE_ROUTE_ERROR_METADATA: &str = "space-route-error";
 const SESSION_ROUTE_AT_REST: &str = "session_route_at_rest";
 const SANDBOX_ID_METADATA: &str = "space-sandbox-id";
-const SANDBOX_STATE_METADATA: &str = "space-sandbox-state";
 
 /// Mark a FAILED_PRECONDITION for a session route the sandbox has no node
 /// for as one nothing is about to give it: the sandbox is not heading to

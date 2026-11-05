@@ -16,7 +16,10 @@ pub const RETRY_AFTER_MS_METADATA: &str = "x-space-retry-after-ms";
 /// because sbx-manager answers `FailedPrecondition` for both cases.
 pub const DESIRED_STATE_APPLY_TERMINAL_METADATA: &str = "space-desired-state-apply-terminal";
 const DESIRED_STATE_APPLY_TERMINAL: &str = "1";
-const SANDBOX_SERVICE_ROUTE_ERROR_METADATA: &str = "space-route-error";
+/// Metadata key naming why a sandbox service route failed:
+/// [`sandbox_service_route_not_ready_status`] sets it, and other crates' route
+/// markers use the same key with their own values.
+pub const SANDBOX_SERVICE_ROUTE_ERROR_METADATA: &str = "space-route-error";
 const SANDBOX_SERVICE_ROUTE_NOT_READY: &str = "sandbox_service_route_not_ready";
 const NODE_API_ERROR_METADATA: &str = "space-node-api-error";
 const UDS_PER_SANDBOX_LIMIT_EXCEEDED: &str = "uds_per_sandbox_limit_exceeded";
@@ -229,7 +232,9 @@ pub fn is_guest_path_not_found(status: &Status) -> bool {
             == Some(pplx_space_guest_status::GUEST_PATH_NOT_FOUND)
 }
 
-const SANDBOX_STATE_METADATA: &str = "space-sandbox-state";
+/// Metadata key naming a sandbox's lifecycle state on a refusal, as
+/// [`mark_sandbox_not_running`] and other crates' markers record it.
+pub const SANDBOX_STATE_METADATA: &str = "space-sandbox-state";
 
 /// Mark `status` as a [`pplx_space_guest_status::SANDBOX_NOT_RUNNING`]
 /// refusal, naming the sandbox's `state` as the refusing hop knows it.
