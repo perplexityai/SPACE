@@ -1134,7 +1134,7 @@ fn legacy_connect_should_touch(
     requested_timeout_secs.is_some() || e2b_policy_for_refresh(current_policy).is_some()
 }
 
-fn teardown_lifecycle_connect_error(sandbox: &Sandbox) -> Option<E2bApiError> {
+pub(super) fn teardown_lifecycle_connect_error(sandbox: &Sandbox) -> Option<E2bApiError> {
     match sandbox
         .lifecycle
         .trim()
@@ -1150,8 +1150,7 @@ fn teardown_lifecycle_connect_error(sandbox: &Sandbox) -> Option<E2bApiError> {
         }
         Ok(_) => None,
         Err(_) => match sandbox.lifecycle.trim().to_ascii_lowercase().as_str() {
-            "deleted" => Some(E2bApiError::not_found("Sandbox")),
-            "cleanup_required" => Some(E2bApiError::sandbox_not_ready()),
+            "deleted" | "cleanup_required" => Some(E2bApiError::not_found("Sandbox")),
             _ => None,
         },
     }

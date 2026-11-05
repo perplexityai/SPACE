@@ -569,9 +569,11 @@ pub(super) fn sandbox_to_cached_response(
 ) -> SandboxResponse {
     let mut response = sandbox_to_response(sandbox, None);
     if let Some(observed) = observed {
-        response.set_state(SandboxStateInput::new(
-            Some(sandbox.lifecycle.clone()),
+        response.set_state(SandboxStateInput::observed_on(
+            sandbox.lifecycle.clone(),
+            sandbox.active_node_id,
             observed.status.clone(),
+            observed.node_id,
         ));
         response.spaced_version = observed.spaced_version.clone();
         response.pid = observed.pid.and_then(|value| u32::try_from(value).ok());
