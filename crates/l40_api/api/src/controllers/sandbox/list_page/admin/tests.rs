@@ -1,7 +1,9 @@
 use std::collections::BTreeMap;
 
 use pplx_space_common_core::types::{NodeId, SubstrateKind};
-use pplx_space_db_test_fixtures::{TestDbResult, insert_ready_worker_node, pg_test_db};
+use pplx_space_db_test_fixtures::{
+    TestDbResult, insert_pool_slot_receipt, insert_ready_worker_node, pg_test_db,
+};
 use time::Duration;
 
 use super::*;
@@ -379,7 +381,8 @@ async fn each_filter_returns_exactly_its_rows() -> TestDbResult<()> {
                 .collect(),
         )
     };
-    let search = |prefix: &str| Some(SandboxSearch::new(prefix.to_string()));
+    let prefix = |prefix: &str| Some(SandboxPrefix::new(prefix.to_string()));
+    let search = |text: &str| Some(SandboxSearch::new(text.to_string()));
     let template = |name: &str| Some(TemplateName::parse(name).expect("template name"));
     let cases: Vec<(&str, AdminSandboxFilter, &[usize])> = vec![
         (
@@ -487,7 +490,7 @@ async fn each_filter_returns_exactly_its_rows() -> TestDbResult<()> {
         (
             "name prefix is case-sensitive",
             AdminSandboxFilter {
-                search: search("alpha"),
+                prefix: prefix("alpha"),
                 ..AdminSandboxFilter::default()
             },
             &[0, 1],
@@ -495,7 +498,7 @@ async fn each_filter_returns_exactly_its_rows() -> TestDbResult<()> {
         (
             "public id prefix",
             AdminSandboxFilter {
-                search: search("sbx_2abc"),
+                prefix: prefix("sbx_2abc"),
                 ..AdminSandboxFilter::default()
             },
             &[2],
@@ -503,7 +506,7 @@ async fn each_filter_returns_exactly_its_rows() -> TestDbResult<()> {
         (
             "dashed id prefix in upper case",
             AdminSandboxFilter {
-                search: search("2ABC0000-00"),
+                prefix: prefix("2ABC0000-00"),
                 ..AdminSandboxFilter::default()
             },
             &[2],
@@ -511,7 +514,7 @@ async fn each_filter_returns_exactly_its_rows() -> TestDbResult<()> {
         (
             "undashed id prefix",
             AdminSandboxFilter {
-                search: search("100000000000700080000000000000"),
+                prefix: prefix("100000000000700080000000000000"),
                 ..AdminSandboxFilter::default()
             },
             &[0, 1],
@@ -519,7 +522,7 @@ async fn each_filter_returns_exactly_its_rows() -> TestDbResult<()> {
         (
             "whole id",
             AdminSandboxFilter {
-                search: search("10000000-0000-7000-8000-000000000001"),
+                prefix: prefix("10000000-0000-7000-8000-000000000001"),
                 ..AdminSandboxFilter::default()
             },
             &[1],
@@ -527,10 +530,76 @@ async fn each_filter_returns_exactly_its_rows() -> TestDbResult<()> {
         (
             "no match",
             AdminSandboxFilter {
-                search: search("zeta"),
+                prefix: prefix("zeta"),
                 ..AdminSandboxFilter::default()
             },
             &[],
+        ),
+        (
+            "search ignores the name's case",
+            AdminSandboxFilter {
+                search: search("ALPHA"),
+                ..AdminSandboxFilter::default()
+            },
+            &[0, 1, 5],
+        ),
+        (
+            "search for the console's label, the ID's last eight digits",
+            AdminSandboxFilter {
+                search: search("00000001"),
+                ..AdminSandboxFilter::default()
+            },
+            &[1],
+        ),
+        (
+            "search for a dashed ID suffix in upper case behind SBX_",
+            AdminSandboxFilter {
+                search: search("SBX_8000-000000000001"),
+                ..AdminSandboxFilter::default()
+            },
+            &[1],
+        ),
+        (
+            "search for four digits, the shortest ID suffix",
+            AdminSandboxFilter {
+                search: search("0000"),
+                ..AdminSandboxFilter::default()
+            },
+            &[0, 2, 3, 4, 5],
+        ),
+        (
+            "search for fewer digits is a name prefix only",
+            AdminSandboxFilter {
+                search: search("000"),
+                ..AdminSandboxFilter::default()
+            },
+            &[],
+        ),
+        (
+            "search does not match the start of an ID",
+            AdminSandboxFilter {
+                search: search("2abc"),
+                ..AdminSandboxFilter::default()
+            },
+            &[],
+        ),
+        (
+            "search and prefix both apply",
+            AdminSandboxFilter {
+                search: search("alpha"),
+                prefix: prefix("alpha-t"),
+                ..AdminSandboxFilter::default()
+            },
+            &[1],
+        ),
+        (
+            "search with another filter",
+            AdminSandboxFilter {
+                search: search("alpha"),
+                lifecycles: lifecycles(&["started", "paused"]),
+                ..AdminSandboxFilter::default()
+            },
+            &[0, 1],
         ),
         // Without its node filter the unassigned case lists rows 0, 1 and 3,
         // and the on-a-node case rows 1 and 3, so the node filter decides each
@@ -814,6 +883,35 @@ fn an_id_prefix_is_the_range_of_ids_it_starts() {
     }
 }
 
+#[test]
+fn an_id_suffix_is_the_range_of_reversed_ids_it_starts() {
+    let range = |low: &str, high: &str| Some((low.to_string(), high.to_string()));
+    let cases = [
+        ("0a1b2c3d", range("d3c2b1a0", "d3c2b1a1")),
+        ("9ABC", range("cba9", "cba:")),
+        ("fabc", range("cbaf", "cbag")),
+        ("cafe", range("efac", "efad")),
+        ("sbx_00-0F", range("f000", "f001")),
+        ("SBX_00-0f", range("f000", "f001")),
+        (
+            "0123abcd-ef01-2345-6789-abcdef012345",
+            range(
+                "543210fedcba9876543210fedcba3210",
+                "543210fedcba9876543210fedcba3211",
+            ),
+        ),
+        ("abc", None),
+        ("sbx_abc", None),
+        ("-a-b-c-", None),
+        ("e2e-1", range("1e2e", "1e2f")),
+        ("beta", None),
+        ("0123abcdef0123456789abcdef0123456", None),
+    ];
+    for (text, expected) in cases {
+        assert_eq!(id_suffix_range(text), expected, "{text:?}");
+    }
+}
+
 type Bucket = (
     Option<String>,
     Option<SemVer>,
@@ -975,6 +1073,26 @@ async fn the_count_is_the_tally_of_the_full_list() -> TestDbResult<()> {
         SeedObservation::default(),
     )
     .await?;
+    // A Kubernetes warm-pool slot: its node reports no pool membership, but a
+    // slot reserves its ID.
+    let k8s_slot = SandboxId::new();
+    seed_observation(
+        &db.pool,
+        k8s_slot,
+        node_id,
+        SeedObservation {
+            template: Some("k8s-pooled"),
+            ..started(Some("1.2.0"))
+        },
+    )
+    .await?;
+    insert_pool_slot_receipt(&db.pool, k8s_slot, "ready").await?;
+    let k8s_pool: Uuid = sqlx::query_scalar(sql!(
+        "SELECT config_id FROM kubernetes_pool_slots WHERE reserved_sandbox_id = $1"
+    ))
+    .bind(k8s_slot)
+    .fetch_one(&db.pool)
+    .await?;
 
     let controller = controller(&db.pool);
     for org_id in [None, Some(owner.org_id), Some(other.org_id)] {
@@ -994,6 +1112,21 @@ async fn the_count_is_the_tally_of_the_full_list() -> TestDbResult<()> {
             .await
             .map_err(|error| format!("{error:?}"))?;
         assert_eq!(counted(&counts), tally(&responses), "org {org_id:?}");
+        if org_id.is_none() {
+            let slot = responses
+                .iter()
+                .find(|response| response.id == k8s_slot)
+                .ok_or("the unscoped list carries the Kubernetes pool slot")?;
+            assert_eq!(slot.resource_type, SandboxResourceType::PoolSlot);
+            assert_eq!(slot.pool_id, Some(k8s_pool));
+            let pooled = responses
+                .iter()
+                .filter(|response| response.resource_type == SandboxResourceType::PoolSlot)
+                .filter(|response| response.id != k8s_slot)
+                .collect::<Vec<_>>();
+            assert_eq!(pooled.len(), 1, "the Direct pool slot");
+            assert_eq!(pooled[0].pool_id, None, "a Direct pool has no ID");
+        }
     }
     let everywhere = controller
         .admin_spaced_version_counts(&db.pool, None)
@@ -1006,6 +1139,7 @@ async fn the_count_is_the_tally_of_the_full_list() -> TestDbResult<()> {
     };
     assert!(has("inventoried", SandboxResourceType::Sandbox));
     assert!(has("pooled", SandboxResourceType::PoolSlot));
+    assert!(has("k8s-pooled", SandboxResourceType::PoolSlot));
     assert!(
         everywhere
             .iter()

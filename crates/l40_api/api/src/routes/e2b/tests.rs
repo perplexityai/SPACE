@@ -738,6 +738,7 @@ fn test_sandbox() -> Sandbox {
         id: SandboxId::new(),
         name: Some("session-123".to_string()),
         user_id: UserId::new(),
+        user_email: None,
         org_id: OrgId::new(),
         owner_source: SandboxOwnerSource::Local,
         upstream_issuer: None,

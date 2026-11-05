@@ -1582,6 +1582,26 @@ impl WarmPoolStore {
         Ok(rows)
     }
 
+    /// The pool config of each slot, in any state, that reserves one of the
+    /// given sandbox ids, as `(reserved_sandbox_id, config_id)`. A slot's
+    /// pod runs under its reserved id before a claim gives it a sandbox row,
+    /// so this names the warm pool of a sandbox a node reports with no row.
+    pub async fn reserving_pool_configs(
+        &self,
+        sandbox_ids: &[SandboxId],
+    ) -> Result<Vec<(SandboxId, Uuid)>> {
+        let rows = sqlx::query_as::<_, (SandboxId, Uuid)>(sql!(
+            "SELECT reserved_sandbox_id, config_id
+             FROM kubernetes_pool_slots
+             WHERE reserved_sandbox_id = ANY($1)"
+        ))
+        .bind(sandbox_ids)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows)
+    }
+
     /// Return an unbound claimed slot to the ready inventory. This is the
     /// pre-bind abandon path: the claimed pod failed validation before any
     /// sandbox rows referenced it, so the still-warm slot goes back to the

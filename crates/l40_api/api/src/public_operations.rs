@@ -4133,6 +4133,6 @@ fn duration_secs_i64(duration: Duration) -> i64 {
 #[cfg(test)]
 mod inline_org_limit_plan_tests;
 #[cfg(test)]
-mod plan_explain;
+pub(crate) mod plan_explain;
 #[cfg(test)]
 mod tests;

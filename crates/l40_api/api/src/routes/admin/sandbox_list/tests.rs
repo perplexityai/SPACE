@@ -188,11 +188,18 @@ async fn the_list_pages_by_cursor_and_keeps_the_unpaged_array(
             assert_eq!(ids(&filtered["sandboxes"]), seeded);
             assert_eq!(filtered["next_cursor"], Value::Null);
 
-            // The node filters reach the list, and they and `prefix` leave out the
-            // node-reported row as every filter does, even its own ID's prefix.
+            // The node filters reach the list, and they, `prefix` and `search`
+            // leave out the node-reported row as every filter does, even its
+            // own ID's prefix or suffix.
+            let node_only_label = node_only
+                .replace('-', "")
+                .chars()
+                .skip(24)
+                .collect::<String>();
             for (label, query, expected) in [
                 ("node_id", format!("node_id={node_id}"), Vec::new()),
                 ("prefix", format!("prefix={node_only}"), Vec::new()),
+                ("search", format!("search={node_only_label}"), Vec::new()),
                 ("assigned", "assigned=true".to_string(), Vec::new()),
                 ("unassigned", "assigned=false".to_string(), seeded.clone()),
             ] {
@@ -269,6 +276,7 @@ async fn malformed_list_parameters_answer_400() -> TestDbResult<()> {
         ),
         ("cursor=&node=x", "unknown query parameter \"node\""),
         ("prefix=a%00b", "NUL"),
+        ("search=a%00b", "NUL"),
         ("cursor=bm90LWEtY3Vyc29y", "invalid cursor"),
         ("cursor=%%%", "invalid"),
         (&out_of_range_cursor, "invalid cursor"),
@@ -339,7 +347,8 @@ async fn an_empty_filter_parameter_is_unset(
         "user_id",
         "created_after",
         "created_before",
-        "prefix"
+        "prefix",
+        "search"
     )]
     name: &str,
 ) -> TestDbResult<()> {
@@ -385,6 +394,62 @@ async fn an_empty_filter_parameter_is_unset(
             "{name}{paging}: empty is unset"
         );
     }
+    harness.pool.close().await;
+    Ok(())
+}
+
+/// The list, paged or not, and the sandbox read name each sandbox's owner by
+/// the email the user has when it is read, from the same statement; a
+/// node-reported row has no owner and no email.
+#[tokio::test]
+async fn the_list_and_the_sandbox_name_the_owner_by_email() -> TestDbResult<()> {
+    let Some(harness) = harness().await? else {
+        return Ok(());
+    };
+    let owner = seed_owner(&harness.pool).await?;
+    let sandbox_id = seed_sandbox(&harness.pool, owner, SeedSandbox::default()).await?;
+    let renamed = format!("renamed-{}@example.invalid", owner.user_id);
+    sqlx::query(sql!("UPDATE users SET email = $1 WHERE id = $2"))
+        .bind(&renamed)
+        .bind(owner.user_id)
+        .execute(&harness.pool)
+        .await?;
+    let node_id = NodeId::new();
+    insert_ready_worker_node(&harness.pool, node_id).await?;
+    let node_only = SandboxId::new();
+    seed_observation(
+        &harness.pool,
+        node_only,
+        node_id,
+        SeedObservation::default(),
+    )
+    .await?;
+    let email_of = |rows: &Value, id: String| {
+        rows.as_array()
+            .expect("sandbox array")
+            .iter()
+            .find(|row| row["id"] == json!(id))
+            .map(|row| row["user_email"].clone())
+    };
+
+    let (status, unpaged) = harness.get("/sandboxes").await;
+    assert_eq!(status, StatusCode::OK, "{unpaged}");
+    assert_eq!(
+        email_of(&unpaged, sandbox_id.to_string()),
+        Some(json!(renamed))
+    );
+    assert_eq!(email_of(&unpaged, node_only.to_string()), Some(Value::Null));
+    let (status, page) = harness.get("/sandboxes?cursor=").await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    assert_eq!(
+        email_of(&page["sandboxes"], sandbox_id.to_string()),
+        Some(json!(renamed))
+    );
+    let (status, sandbox) = harness
+        .get(&format!("/sandboxes/{}", PublicSandboxId::from(sandbox_id)))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{sandbox}");
+    assert_eq!(sandbox["user_email"], json!(renamed));
     harness.pool.close().await;
     Ok(())
 }

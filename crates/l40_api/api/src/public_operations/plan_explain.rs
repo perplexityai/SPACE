@@ -1,4 +1,4 @@
-//! `EXPLAIN` helpers for the plan-cost tests of this module's statements.
+//! `EXPLAIN` helpers for the crate's plan-cost tests.
 //!
 //! A cached statement can switch to a generic plan, which knows none of its
 //! arguments, so a plan test explains each statement under both forced
@@ -11,7 +11,7 @@ use pplx_space_test_env::TestResult;
 use sqlx::PgPool;
 
 /// Both forced plan modes, custom first.
-pub(super) const PLAN_CACHE_MODES: [&str; 2] = ["force_custom_plan", "force_generic_plan"];
+pub(crate) const PLAN_CACHE_MODES: [&str; 2] = ["force_custom_plan", "force_generic_plan"];
 
 /// One `EXPLAIN (ANALYZE, FORMAT JSON)` statement's result.
 #[derive(Debug, serde::Deserialize)]
@@ -21,7 +21,7 @@ struct Explained {
 }
 
 #[derive(Debug, serde::Deserialize)]
-pub(super) struct PlanNode {
+pub(crate) struct PlanNode {
     #[serde(rename = "Node Type")]
     node_type: String,
     #[serde(rename = "Join Type", default)]
@@ -49,7 +49,7 @@ impl PlanNode {
     /// loops: `EXPLAIN` reports both per loop. A join that compares every
     /// pair of its inputs discards the unmatched pairs by its join filter,
     /// so they count here too.
-    pub(super) fn rows_handled(&self) -> f64 {
+    pub(crate) fn rows_handled(&self) -> f64 {
         let own = (self.rows
             + self.removed_by_filter
             + self.removed_by_join_filter
@@ -66,7 +66,7 @@ impl PlanNode {
     /// table and index it reads, and the rows it and its children handled,
     /// so a failure names the node that broke the bound. Only plan
     /// structure, no fixture values.
-    pub(super) fn outline(&self) -> String {
+    pub(crate) fn outline(&self) -> String {
         let mut out = String::new();
         self.outline_into(1, &mut out);
         out
@@ -106,7 +106,7 @@ impl PlanNode {
 /// its `EXECUTE`. `EXECUTE` takes no bind parameters of its own, so `execute`
 /// spells its arguments as literals: fixture-generated values and the crate's
 /// own constants.
-pub(super) async fn explain_prepared(
+pub(crate) async fn explain_prepared(
     pool: &PgPool,
     prepare: &str,
     execute: &str,

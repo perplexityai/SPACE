@@ -158,6 +158,9 @@ pub struct Sandbox {
     /// SPACE user row that owns the sandbox. Federated owners map onto local
     /// user/org rows so downstream paths keep the normal sandbox FK shape.
     pub user_id: UserId,
+    /// The current email of `user_id`'s user, read with the row.
+    #[serde(default)]
+    pub user_email: Option<String>,
     pub org_id: OrgId,
     pub owner_source: SandboxOwnerSource,
     pub upstream_issuer: Option<String>,
@@ -372,6 +375,9 @@ pub struct SandboxResponse {
     pub resource_type: SandboxResourceType,
     pub name: Option<String>,
     pub user_id: Option<UserId>,
+    /// The email `user_id`'s user has when the sandbox is read; null for the
+    /// node-reported rows, which have no owner.
+    pub user_email: Option<String>,
     pub org_id: Option<OrgId>,
     /// Rendered from `state_input`, as is `status`.
     pub lifecycle: Option<String>,
@@ -415,6 +421,9 @@ pub struct SandboxResponse {
     pub snapshots_enabled_desired: bool,
     pub snapshots_enabled: Option<bool>,
     pub pool_template: Option<String>,
+    /// The warm pool (`/warm-pools/{pool_id}`) whose slot a `pool_slot` row
+    /// is; null on every other row and on Direct, whose pools have no ID.
+    pub pool_id: Option<uuid::Uuid>,
     pub disk_usage_bytes: Option<u64>,
     pub failure_reason: Option<String>,
     pub age: Option<String>,
