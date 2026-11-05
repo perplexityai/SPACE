@@ -1,0 +1,36 @@
+-- no-transaction
+-- squawk-disable-assume-in-transaction
+-- The admin sandbox list's `search` matches the end of a sandbox ID: the
+-- console labels a sandbox with the last eight hex digits of its UUIDv7,
+-- because the leading ones are the creation timestamp and repeat across
+-- sandboxes created close together. No index orders IDs by their end, so
+-- without this one the search reads every sandbox row. The key is the ID's 32
+-- hex digits, reversed, so the IDs ending in a given suffix are one range of
+-- it, which the list reads as `>=` the reversed suffix and `<` the same with
+-- its last digit incremented. COLLATE "C" makes that range a byte range under
+-- any database collation, and lets the statement compare with plain `>=`
+-- and `<` in both custom and generic plans, where a LIKE prefix would be
+-- indexable only with a constant pattern. A sandbox's id never changes, so
+-- the index adds no work to updates and leaves them HOT.
+--
+-- CONCURRENTLY because sandboxes takes writes on every lifecycle change: a
+-- plain build holds SHARE on the table and would stall them for its
+-- duration. That makes this a single-statement `-- no-transaction` migration,
+-- which the migrator does not retry. A failed build can leave an INVALID index
+-- behind with no history row. There is no IF NOT EXISTS so that a rerun fails
+-- on that index instead of skipping it and recording the migration as applied.
+-- To recover, run this migration's down statement by hand and rerun; the
+-- migrator's `down` would roll back the previous migration, since this one has
+-- no history row.
+--
+-- The statement must be the file's only one, so it cannot set its own lock or
+-- statement timeout and runs under the session's (see db/README.md). Building
+-- concurrently takes SHARE UPDATE EXCLUSIVE, which does not block writers. It
+-- waits for every transaction in the database whose snapshot is older than its
+-- second scan, whatever tables that transaction reads, so a long-running one
+-- can hold the build past the session's lock timeout and leave an INVALID
+-- index.
+-- prefer-robust-stmts asks for the IF NOT EXISTS left out above.
+-- squawk-ignore require-lock-timeout, require-statement-timeout, prefer-robust-stmts
+CREATE INDEX CONCURRENTLY idx_sandboxes_id_suffix
+    ON public.sandboxes USING btree ((reverse(replace(id::text, '-', '')) COLLATE "C"));
