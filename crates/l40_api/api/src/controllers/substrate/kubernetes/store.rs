@@ -680,9 +680,11 @@ pub(super) enum RestoreClaimRevert {
     LifecycleOnly,
     /// The row reverted to `suspended` with an execution still active,
     /// leaving a same-generation pod on a `suspended` row: either the claim's
-    /// own execution, because restore selection isn't proven to choose a
-    /// durable pre-restore source, or one the claim reused rather than
-    /// created, whose pod may hold state of its own.
+    /// own execution, because abandoned-restore retirement is off or restore
+    /// selection isn't proven to choose a durable pre-restore source, or one
+    /// that can't be shown to be this claim's (reused rather than created,
+    /// taken over by a redrive, or a claim with neither attempt nor token),
+    /// whose pod may hold state of its own.
     ExecutionLeftActive,
     /// The row is no longer this claim's `restoring` row; nothing changed.
     NotReverted,

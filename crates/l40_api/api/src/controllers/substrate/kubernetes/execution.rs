@@ -456,9 +456,9 @@ impl KubernetesSubstrate {
             }
             RestoreClaimRevert::ExecutionLeftActive => tracing::warn!(
                 sandbox_id = %sandbox_id,
-                "reverted a failed restore with an execution still active: either restore \
-                 selection isn't proven to choose a durable pre-restore source, or the claim \
-                 reused that execution rather than creating it"
+                "reverted a failed restore with an execution still active: abandoned-restore \
+                 retirement is off, restore selection isn't proven to choose a durable \
+                 pre-restore source, or the execution can't be shown to be this claim's"
             ),
             RestoreClaimRevert::LifecycleOnly | RestoreClaimRevert::NotReverted => {}
         }

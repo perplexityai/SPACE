@@ -34,9 +34,10 @@ table (`node_direct`, `sandbox_direct_route_*`), read the
   stopped, failed and quarantined projections
   (`pplx_space_sandbox_store::ingest`) do.
   Existing exceptions: activation-completion receipts recheck only the
-  lifecycle and are fenced by the execution attempt they release
-  (generation, attempt, `active`); delete receipts for stopped or suspended
-  rows with no `active_node_id` are fenced by the latest execution.
+  lifecycle (and, for a `suspended` row, its evacuation marker) and are
+  fenced by the execution attempt they release (generation, attempt,
+  `active`); delete receipts for stopped or suspended rows with no
+  `active_node_id` are fenced by the latest execution.
 - New restoring-to-target convergence leaves rows with
   `evacuation_restore_target` set to the node-drain redrive.
 - New certification columns advance only on the server's own verdict.

@@ -221,8 +221,12 @@ impl K8sStore {
     /// generation, whose lingering-pod sweep deletes this one), and a backup
     /// its runtime captures registers against a retired generation. Left
     /// active instead, the execution keeps a same-generation pod adoptable on
-    /// a `suspended` row that no reconciler revisits, and that row looks like
-    /// one whose pod holds the only copy of the sandbox's state.
+    /// a `suspended` row, and that row looks like one whose pod holds the only
+    /// copy of the sandbox's state. The shim may have restored the VM in that
+    /// pod anyway. The node's activation-completed receipt repairs such a
+    /// row once the execution has recorded the pod's IP
+    /// (`release_completed_activations` in `pplx-space-sandbox-store`); an
+    /// evacuation-marked row is left to the node-drain redrive instead.
     ///
     /// The retirement needs the suspended-revert proof: restore selection on
     /// the reverted row must still choose a ready, durably stored pre-restore
