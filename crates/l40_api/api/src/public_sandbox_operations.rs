@@ -220,8 +220,11 @@ pub(crate) fn implicit_wake_activity_enabled() -> bool {
 /// - when upgrading from a release before #1303, since the chart rolls the
 ///   API and the controllers out together, and turn it on again once every
 ///   `space-cluster-controller` replica runs this release;
-/// - before rolling a controller back below #1303, letting the admin creates
-///   queued with it finish first.
+/// - before rolling a controller back below #1303. An API replica reads the
+///   setting from its environment, so one started with it on keeps sending the
+///   field until it exits, shutdown drain included: wait until every such
+///   replica has exited, then until the admin creates queued with the field
+///   have finished, and only then roll the controller back.
 pub(crate) const ADMIN_CREATE_REQUESTED_BY_ENV: &str = "SPACE_ADMIN_CREATE_REQUESTED_BY_ENABLED";
 
 /// Whether admin creates record their requester; see
