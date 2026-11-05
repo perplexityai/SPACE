@@ -1243,20 +1243,18 @@ async fn machine_credentials_keep_working_in_external_mode() -> TestResult {
 async fn an_empty_list_allows_no_password_session() -> TestResult {
     let fixture = fixture().await?;
     let seeded = &fixture.seeded;
-    // Failure messages name the case by label, never by its credentials.
-    let accounts = [
-        (
-            "admin",
-            seeded.admin_email.as_str(),
-            seeded.admin_password.as_str(),
-        ),
-        (
-            "member",
-            seeded.member_email.as_str(),
-            seeded.member_password.as_str(),
-        ),
-        ("unknown", "nobody@example.test", "any-password"),
+    // Failure messages name each case by its label. Passwords are looked up
+    // apart from the cases, so no message is built from a value holding one.
+    let cases = [
+        ("admin", seeded.admin_email.as_str()),
+        ("member", seeded.member_email.as_str()),
+        ("unknown", "nobody@example.test"),
     ];
+    let password_for = |label: &str| match label {
+        "admin" => seeded.admin_password.as_str(),
+        "member" => seeded.member_password.as_str(),
+        _ => "any-password",
+    };
 
     // Every way a deployment can end up with no listed account: the variable
     // unset, empty, or only separators, and the builder given nothing. None
@@ -1270,7 +1268,7 @@ async fn an_empty_list_allows_no_password_session() -> TestResult {
             value.map_or_else(unset, var),
         )?;
         assert!(settings.password_session_emails().is_empty(), "{value:?}");
-        for (label, email, _) in accounts {
+        for (label, email) in cases {
             assert!(
                 !settings.allows_password_session(email),
                 "{value:?}: {label}"
@@ -1298,7 +1296,8 @@ async fn an_empty_list_allows_no_password_session() -> TestResult {
         ];
         // Login is refused for every account, right password or not.
         for app in &routers {
-            for (label, email, password) in accounts {
+            for (label, email) in cases {
+                let password = password_for(label);
                 let (status, body) = Call::new(Method::POST, "/auth/v1/sessions")
                     .json(serde_json::json!({ "email": email, "password": password }))
                     .send(app.clone())
@@ -1494,20 +1493,18 @@ async fn unlisted_accounts_get_no_password_sessions() -> TestResult {
     // same way whether the password is right, wrong, or the account does
     // not exist, and with or without an assertion beside it.
     let mut refusals = Vec::new();
-    // Failure messages name the case by label, never by its credentials.
-    for (label, email, password) in [
-        (
-            "admin, right password",
-            seeded.admin_email.as_str(),
-            seeded.admin_password.as_str(),
-        ),
-        (
-            "admin, wrong password",
-            seeded.admin_email.as_str(),
-            "wrong-password",
-        ),
-        ("unknown", "nobody@example.test", "wrong-password"),
+    // Failure messages name each case by its label. Passwords are looked up
+    // apart from the cases, so no message is built from a value holding one.
+    let password_for = |label: &str| match label {
+        "admin, right password" => seeded.admin_password.as_str(),
+        _ => "wrong-password",
+    };
+    for (label, email) in [
+        ("admin, right password", seeded.admin_email.as_str()),
+        ("admin, wrong password", seeded.admin_email.as_str()),
+        ("unknown", "nobody@example.test"),
     ] {
+        let password = password_for(label);
         for assertion in [None, Some("forbidden")] {
             for app in [
                 fixture.mixed_public(),
