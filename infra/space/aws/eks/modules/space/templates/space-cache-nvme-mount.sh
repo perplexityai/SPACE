@@ -5,9 +5,13 @@ mount_space_cache_nvme_if_available() {
 
   # The AMI's unit also formats the cache at boot and isn't ordered against
   # user data. Starting it waits for a run in progress and is a no-op once it
-  # has succeeded, so the devices are formatted once.
+  # has succeeded, so the devices are formatted once. A failed run is retried
+  # once; a second failure stops the bootstrap.
   if [[ -f /etc/systemd/system/space-cache-nvme.service ]]; then
-    systemctl start space-cache-nvme.service
+    if ! systemctl start space-cache-nvme.service; then
+      echo "space-cache-nvme.service failed; retrying once"
+      systemctl start space-cache-nvme.service
+    fi
     return 0
   fi
 
