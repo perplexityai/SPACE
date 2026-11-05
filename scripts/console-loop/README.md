@@ -138,8 +138,9 @@ so if one fails before deleting, `npm run clean` removes it. They need a seed
 state for the prefix, and the identity check above passes before any runs.
 `--no-mutate` skips them. The `terminal` steps open a shell in the seeded
 running sandbox and in the tenant organization's running sandbox, the second
-through the admin terminal route, and type into it; they create no objects. The steps are in
-[`src/steps.ts`](src/steps.ts).
+through the admin terminal route, and type into it. They create no objects,
+but each opens terminal sessions, and the admin route records an admin audit
+row for each, so `--no-mutate` skips them too. The steps are in [`src/steps.ts`](src/steps.ts).
 
 Each run writes `out/runs/<time>[-<label>]/`:
 

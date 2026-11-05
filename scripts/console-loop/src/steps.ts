@@ -378,7 +378,7 @@ step('sandbox-delete', ['sandboxes', 'flows', 'lifecycle'], async (c) => {
 // contain (`$((6*7))` prints 42).
 const terminalCard = (page: Page) => page.locator('.ant-card', { has: page.locator('.ant-card-head', { hasText: 'Terminal' }) });
 const terminalRows = async (page: Page): Promise<string> =>
-  (await terminalCard(page).locator('.xterm-rows').innerText().catch(() => '')).replace(/ /g, ' ');
+  (await terminalCard(page).locator('.xterm-rows').innerText().catch(() => '')).replace(/\u00a0/g, ' ');
 async function terminalShows(page: Page, want: RegExp | ((rows: string) => boolean), timeoutMs = 10_000): Promise<boolean> {
   const matches = typeof want === 'function' ? want : (rows: string) => want.test(rows);
   const deadline = Date.now() + timeoutMs;
@@ -389,28 +389,33 @@ async function terminalShows(page: Page, want: RegExp | ((rows: string) => boole
   return false;
 }
 const terminalStatus = (page: Page) => terminalCard(page).locator('.ant-card-extra').innerText().catch(() => '');
+// The shell is ready for a command once its prompt (a line ending in `$` or
+// `#`) is drawn.
+const showsPrompt = (rows: string) => /[$#]\s*$/m.test(rows);
 async function terminalConnect(c: Ctx): Promise<boolean> {
   await terminalCard(c.page).getByRole('button', { name: /Connect$/ }).click();
   const deadline = Date.now() + 30_000;
   while (Date.now() < deadline && !/attached/.test(await terminalStatus(c.page))) await c.page.waitForTimeout(250);
   const attached = /attached/.test(await terminalStatus(c.page));
   c.rec.check(attached, `Connect attaches a session (${(await terminalStatus(c.page)).replace(/\s+/g, ' ')})`);
-  // The prompt comes after the attach.
-  if (attached) await c.page.waitForTimeout(1000);
-  return attached;
+  if (!attached) return false;
+  const ready = await terminalShows(c.page, showsPrompt, 20_000);
+  c.rec.check(ready, 'the shell draws its prompt');
+  return ready;
 }
-async function terminalRun(c: Ctx, command: string, marker: RegExp, what: string): Promise<boolean> {
+async function terminalRun(c: Ctx, command: string, marker: RegExp, what: string, timeoutMs = 10_000): Promise<boolean> {
   await c.page.keyboard.type(command);
   await c.page.keyboard.press('Enter');
-  const shown = await terminalShows(c.page, marker);
+  const shown = await terminalShows(c.page, marker, timeoutMs);
   c.rec.check(shown, what);
   return shown;
 }
 const terminalShot = (c: Ctx, name: string) => terminalCard(c.page).screenshot({ path: `${c.rec.outDir}/${name}.png` }).catch(() => {});
 const sizeOf = (rows: string, marker: string) => rows.match(new RegExp(`${marker}=(\\d+)x(\\d+)`))?.slice(1).map(Number) ?? null;
 
-for (const [key, ownOrg] of [['running', true], ['acme-running', false]] as const) {
-  step(`terminal-${key}`, ['sandboxes', 'terminal'], async (c) => {
+// Each session is recorded in the admin audit log, so these steps mutate.
+for (const [name, key, ownOrg] of [['own-org', 'running', true], ['other-org', 'acme-running', false]] as const) {
+  step(`terminal-${name}`, ['sandboxes', 'terminal'], async (c) => {
     const id = sandboxId(c, key);
     if (!id) return c.rec.check(false, `the seed has a ${key} sandbox`);
     await visit(c, `/dashboard/sandboxes/${id}`, 3000);
@@ -442,7 +447,7 @@ for (const [key, ownOrg] of [['running', true], ['acme-running', false]] as cons
       await c.page.keyboard.type('top');
       await c.page.keyboard.press('Enter');
       c.rec.check(await terminalShows(c.page, /PID/), 'top draws its process table');
-      await terminalShot(c, `terminal-${key}-top`);
+      await terminalShot(c, `terminal-${name}-top`);
       await c.page.keyboard.press('q');
       await terminalRun(c, 'clear; echo top-quit-$((9*9))', /top-quit-81/, 'q quits top back to the shell');
 
@@ -455,7 +460,7 @@ for (const [key, ownOrg] of [['running', true], ['acme-running', false]] as cons
         await c.page.keyboard.type('ityped-in-vi');
         await c.page.keyboard.press('Escape');
         c.rec.check(await terminalShows(c.page, /typed-in-vi/), 'text typed in vi appears');
-        await terminalShot(c, `terminal-${key}-vi`);
+        await terminalShot(c, `terminal-${name}-vi`);
         await c.page.keyboard.type(':q!');
         await c.page.keyboard.press('Enter');
         await terminalRun(c, 'clear; test ! -e /tmp/console-loop-vi.txt && echo vi-quit-$((10*10))', /vi-quit-100/, ':q! leaves vi without writing');
@@ -477,15 +482,17 @@ for (const [key, ownOrg] of [['running', true], ['acme-running', false]] as cons
       if (viewport) await c.page.setViewportSize(viewport);
       await c.page.waitForTimeout(500);
     }
-    await terminalShot(c, `terminal-${key}-session`);
+    await terminalShot(c, `terminal-${name}-session`);
 
     await card.getByRole('button', { name: /Disconnect$/ }).click();
     await c.page.waitForTimeout(500);
     c.rec.check(/closed/.test(await terminalStatus(c.page)), 'Disconnect closes the session');
-    if (!(await terminalConnect(c))) return;
-    await terminalRun(c, 'echo reconnected-$((11*11))', /reconnected-121/, 'a second Connect opens a new shell');
+    // Typed at once, before the new shell has started: the card holds it and
+    // sends it when the shell starts.
+    await card.getByRole('button', { name: /Connect$/ }).click();
+    await terminalRun(c, 'echo reconnected-$((11*11))', /reconnected-121/, 'a second Connect opens a new shell and runs what was typed before it started', 30_000);
     await card.getByRole('button', { name: /Disconnect$/ }).click();
-  });
+  }, true);
 }
 
 // ---------------------------------------------------- templates and nodes
