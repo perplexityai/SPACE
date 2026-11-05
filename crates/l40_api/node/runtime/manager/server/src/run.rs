@@ -11,7 +11,6 @@ use tokio_util::sync::CancellationToken;
 
 use std::sync::Arc;
 
-#[cfg(feature = "s3")]
 use pplx_space_common_core::types::StorageUri;
 
 use pplx_space_node_runtime_core::runtime_inventory::RuntimeInstallationRoot;
@@ -57,7 +56,6 @@ pub const DEFAULT_INSTALL_LIMITS: InstallLimits = InstallLimits {
 pub enum KernelSourceConfig {
     /// The built-in S3 source of Firecracker kernels, read anonymously from
     /// a root laid out as [`crate::FIRECRACKER_CI_KERNEL_SOURCE`] is.
-    #[cfg(feature = "s3")]
     S3(StorageUri),
     /// A source the deployment supplies.
     Custom(Arc<dyn KernelSource>),
@@ -68,7 +66,6 @@ pub enum KernelSourceConfig {
 impl std::fmt::Debug for KernelSourceConfig {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            #[cfg(feature = "s3")]
             Self::S3(root) => formatter.debug_tuple("S3").field(root).finish(),
             #[cfg(feature = "github")]
             Self::CloudHypervisor => formatter.write_str("CloudHypervisor"),
@@ -83,7 +80,6 @@ impl std::fmt::Debug for KernelSourceConfig {
 impl KernelSourceConfig {
     fn into_source(self) -> Result<Arc<dyn KernelSource>, RunRuntimeManagerError> {
         match self {
-            #[cfg(feature = "s3")]
             Self::S3(root) => Ok(Arc::new(crate::installs::S3KernelSource::new(root))),
             Self::Custom(source) => Ok(source),
             #[cfg(feature = "github")]

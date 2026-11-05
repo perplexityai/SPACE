@@ -17,7 +17,7 @@ members = [
     "crates/l50_app/node/mgr/cli",
     "crates/l50_app/node/mgr/svc",
     "crates/l50_app/node/runtime/manager/cli",
-    "crates/apps/node/runtime/manager/svc",
+    "crates/l50_app/node/runtime/manager/svc",
     "crates/l50_app/node/runtime/supervisor/svc",
     "crates/l50_app/sbx/mgr/cli",
     "crates/l50_app/sbx/mgr/svc",

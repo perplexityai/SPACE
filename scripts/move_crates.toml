@@ -145,7 +145,7 @@
 "pplx-space-template-publisher" = { to = "crates/l40_api/template/publisher" }
 "pplx-space-volmgr-client" = { to = "crates/l40_api/volmgr/client" }
 "pplx-space-volmgr" = { to = "crates/l40_api/volmgr/server" }  # leaf: pplx-space-volmgr-client nest in l40_api/volmgr
-# l50_app (30)
+# l50_app (31)
 "pplx-space-admin-cli" = { to = "crates/l50_app/admin/cli" }
 "pplx-space-api-svc" = { to = "crates/l50_app/api/svc" }
 "pplx-space-build-mgr-cli" = { to = "crates/l50_app/build/mgr/cli" }
@@ -162,6 +162,7 @@
 "pplx-space-node-mgr-cli" = { to = "crates/l50_app/node/mgr/cli" }
 "pplx-space-node-mgr-svc" = { to = "crates/l50_app/node/mgr/svc" }
 "pplx-space-runtime-manager-cli" = { to = "crates/l50_app/node/runtime/manager/cli", rename = "pplx-space-node-runtime-manager-cli" }  # renamed
+"pplx-space-runtime-manager-svc" = { to = "crates/l50_app/node/runtime/manager/svc", rename = "pplx-space-node-runtime-manager-svc" }  # renamed
 "pplx-space-runtime-supervisor-svc" = { to = "crates/l50_app/node/runtime/supervisor/svc", rename = "pplx-space-node-runtime-supervisor-svc" }  # renamed
 "pplx-space-sbx-mgr-cli" = { to = "crates/l50_app/sbx/mgr/cli" }
 "pplx-space-sbxmgr-svc" = { to = "crates/l50_app/sbx/mgr/svc", rename = "pplx-space-sbx-mgr-svc" }  # renamed
@@ -185,11 +186,10 @@
 "pplx-space-archcheck" = { to = "crates/tools/archcheck" }
 "pplx-space-netgtw-bench" = { to = "crates/tools/net/gateway/bench", rename = "pplx-space-net-gateway-bench" }  # renamed
 "pplx-space-spaced-loopback-test" = { to = "crates/tools/spaced/loopback/test" }
-# stay (4)
+# stay (3)
 "pplx-space-common-core" = "stay"
 "pplx-space-common-svc" = "stay"
 "pplx-space-metrics" = "stay"
-"pplx-space-runtime-manager-svc" = { stay = "its rename re-keys its [layers.codec_features] baseline entry (the s3 feature of pplx-space-node-runtime-manager), which no_new_entries reads as new: move it with its rename once that edge is fixed" }
 
 # Tracked files below crates/apps and crates/libs outside a crate, moving
 # with the layer most of their family's crates go to.

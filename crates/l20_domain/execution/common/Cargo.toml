@@ -21,7 +21,7 @@ serde_json = { workspace = true, optional = true }
 prost = { workspace = true }
 pplx-space-common-core = { workspace = true }
 thiserror = { workspace = true }
-tonic = { workspace = true }
+tonic = { workspace = true, default-features = false }
 
 [build-dependencies]
 anyhow = { workspace = true }

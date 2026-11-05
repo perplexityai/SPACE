@@ -366,9 +366,6 @@ l10_foundation = [
 l20_domain = [
   "pplx-space-common-core",
 ]
-l50_app = [
-  "pplx-space-runtime-manager-svc",
-]
 
 
 # Each store's users: the l40_api and l30_storage crates that own its state
