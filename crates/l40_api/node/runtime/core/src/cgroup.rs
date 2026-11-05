@@ -13,7 +13,15 @@ use pplx_space_common_core::types::{SandboxId, VcpuCount};
 use crate::cgroup_paths::{CGROUP_BASE, jailer_cgroup_path};
 pub const DEFAULT_VCPU_COUNT: u32 = 2;
 pub const DEFAULT_SANDBOX_GUEST_MEMORY_MAX_MIB: u64 = 8192;
-pub const DEFAULT_SANDBOX_MEMORY_HEADROOM_MIB: u64 = 128;
+/// Host memory a VM's cgroup needs beyond guest RAM regardless of guest size:
+/// the Firecracker process and host kernel memory charged to the VM, mostly
+/// filesystem slab from its drive I/O.
+pub const SANDBOX_MEMORY_FIXED_HEADROOM_MIB: u64 = 192;
+/// Guest RAM covered by each further MiB of headroom: the host page tables and
+/// KVM's secondary (EPT) page tables for guest RAM, 2 MiB per GiB each.
+pub const SANDBOX_MEMORY_HEADROOM_GUEST_MIB_PER_MIB: u64 = 256;
+pub const DEFAULT_SANDBOX_MEMORY_HEADROOM_MIB: u64 =
+    sandbox_memory_headroom_mib(DEFAULT_SANDBOX_GUEST_MEMORY_MAX_MIB);
 pub const DEFAULT_MEMORY_MAX_MIB: u64 =
     DEFAULT_SANDBOX_GUEST_MEMORY_MAX_MIB + DEFAULT_SANDBOX_MEMORY_HEADROOM_MIB;
 pub const DEFAULT_PARENT_CPU_RESERVED_COUNT: u32 = 2;
@@ -287,8 +295,27 @@ pub fn apply_parent_cpu_reservation(reserved_count: u32) -> Result<ParentCpuLimi
     })
 }
 
+/// Host memory a VM's cgroup needs beyond `guest_memory_mib` of guest RAM.
+pub const fn sandbox_memory_headroom_mib(guest_memory_mib: u64) -> u64 {
+    SANDBOX_MEMORY_FIXED_HEADROOM_MIB
+        + guest_memory_mib.div_ceil(SANDBOX_MEMORY_HEADROOM_GUEST_MIB_PER_MIB)
+}
+
+/// Largest guest RAM whose headroom fits in `sandbox_cgroup_memory_mib`, or
+/// `None` when the cgroup cannot hold the fixed headroom.
 pub fn sandbox_guest_memory_max_mib(sandbox_cgroup_memory_mib: u64) -> Option<u64> {
-    sandbox_cgroup_memory_mib.checked_sub(DEFAULT_SANDBOX_MEMORY_HEADROOM_MIB)
+    let available_mib = sandbox_cgroup_memory_mib.checked_sub(SANDBOX_MEMORY_FIXED_HEADROOM_MIB)?;
+    // The largest `guest` with `guest + ceil(guest / k) <= available` is
+    // `floor(available * k / (k + 1))`.
+    let per_mib = SANDBOX_MEMORY_HEADROOM_GUEST_MIB_PER_MIB;
+    Some(available_mib.saturating_mul(per_mib) / (per_mib + 1))
+}
+
+/// Headroom a node reserves for each VM when its cgroup ceiling is
+/// `sandbox_cgroup_memory_mib`: the ceiling less its largest guest.
+pub fn sandbox_memory_headroom_for_cgroup_mib(sandbox_cgroup_memory_mib: u64) -> Option<u64> {
+    sandbox_guest_memory_max_mib(sandbox_cgroup_memory_mib)
+        .map(|guest_mib| sandbox_cgroup_memory_mib - guest_mib)
 }
 
 pub fn sandbox_cgroup_total_memory_mib(
@@ -302,10 +329,10 @@ pub fn apply_parent_memory_limit(
     sandbox_cgroup_memory_mib: u64,
     max_slots: u32,
 ) -> Result<ParentMemoryLimit, String> {
-    if sandbox_cgroup_memory_mib <= DEFAULT_SANDBOX_MEMORY_HEADROOM_MIB {
+    if sandbox_guest_memory_max_mib(sandbox_cgroup_memory_mib).unwrap_or(0) == 0 {
         return Err(format!(
             "sandbox cgroup memory must be greater than {} MiB",
-            DEFAULT_SANDBOX_MEMORY_HEADROOM_MIB
+            sandbox_memory_headroom_mib(1)
         ));
     }
 

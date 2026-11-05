@@ -272,6 +272,11 @@ impl SandboxCgroupConfig {
         crate::cgroup::sandbox_guest_memory_max_mib(self.memory_mib_or_default()).unwrap_or(0)
     }
 
+    pub fn memory_headroom_mib(self) -> u64 {
+        crate::cgroup::sandbox_memory_headroom_for_cgroup_mib(self.memory_mib_or_default())
+            .unwrap_or(0)
+    }
+
     pub fn total_memory_mib(self, max_slots: u32) -> u64 {
         crate::cgroup::sandbox_cgroup_total_memory_mib(self.memory_mib_or_default(), max_slots)
             .unwrap_or(0)
