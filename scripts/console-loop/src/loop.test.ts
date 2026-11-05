@@ -210,21 +210,31 @@ test('clean keeps a sandbox whose create is still pending at the bound, fails, a
 // The checkpoint step against a fake page: each operation it accepts ends in
 // the next of `outcomes`, periodic snapshots follow the ones that succeed, and
 // the clock moves only when the step waits.
-async function runCheckpointStep(t: { mock: { timers: any } }, outcomes: string[]) {
+async function runCheckpointStep(t: { mock: { timers: any } }, outcomes: string[], frozen?: boolean) {
   t.mock.timers.enable({ apis: ['Date'], now: 0 });
   const posts: string[] = [];
   const reads: string[] = [];
   const failed: string[] = [];
   let enabled = false;
   const states: string[] = [];
-  const TEXT = 'f-manual-1 A checkpoint stays on the node and is not listed here. The node does not report its snapshots while periodic snapshots are off. '
-    + 'No snapshot records. The node reports 1 snapshot, listed under On the node below. No snapshot records';
-  const locator: any = { first: () => locator, last: () => locator, locator: () => locator, count: async () => 2, innerText: async () => TEXT };
+  // The card's catalog and node tables follow periodic snapshots, or, with
+  // `frozen` set, stay as they are with them on (true) or off (false).
+  const on = () => frozen ?? enabled;
+  const catalogText = () => (on() ? 'No snapshot records. The node reports 1 snapshot, listed under On the node below.' : 'No snapshot records');
+  const nodeText = () => (on() ? 'f-manual-1' : 'The node does not report its snapshots while periodic snapshots are off.');
+  const catalog = { innerText: async () => catalogText() };
+  const node = { innerText: async () => nodeText() };
+  const tables = { count: async () => 2, first: () => catalog, last: () => node };
+  const card: any = {
+    first: () => card,
+    locator: () => tables,
+    innerText: async () => `Snapshots A checkpoint stays on the node and is not listed here. ${catalogText()} ${nodeText()}`,
+  };
   const page = {
     goto: async () => null,
     waitForLoadState: async () => {},
     waitForTimeout: async (ms: number) => { t.mock.timers.tick(ms); },
-    locator: () => locator,
+    locator: () => card,
     evaluate: async (_fn: unknown, { method, apiPath }: { method: string; apiPath: string }) => {
       const action = /:(force-[a-z_-]+)$/.exec(apiPath)?.[1];
       if (method === 'POST' && action) {
@@ -279,4 +289,21 @@ test('the checkpoint step stops at an operation that does not succeed', async (t
   assert.equal(passed.error, null);
   assert.deepEqual(passed.failed, []);
   assert.deepEqual(passed.posts, ['force-checkpoint', 'force-enable_snapshots', 'force-disable_snapshots', 'force-enable_snapshots', 'force-disable_snapshots']);
+});
+
+test('the checkpoint step fails a card whose tables never change state', async (t) => {
+  // Frozen off, On the node never lists the checkpoint; frozen on, it never
+  // says the node stopped reporting.
+  const off = await runCheckpointStep(t, [], false);
+  assert.equal(off.error, null);
+  assert.deepEqual(off.failed, ['On the node lists the checkpoint', 'the empty catalog points at On the node', 'On the node lists the same checkpoint again']);
+  t.mock.timers.reset();
+
+  const on = await runCheckpointStep(t, [], true);
+  assert.equal(on.error, null);
+  assert.deepEqual(on.failed, [
+    'with periodic snapshots off, On the node says the node does not report them',
+    'the empty catalog makes no claim about the node',
+    'turning periodic snapshots off empties On the node',
+  ]);
 });
