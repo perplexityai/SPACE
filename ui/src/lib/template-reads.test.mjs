@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { ReadTimeoutError, firstReadError, latestRead, refreshAll } from './template-reads.ts';
+import { ReadTimeoutError, attemptGate, firstReadError, latestRead, refreshAll } from './template-reads.ts';
 
 // A read the test answers when it chooses, and what the slot wrote.
 function harness(timeoutMs) {
@@ -66,8 +66,10 @@ test('a read superseded by an explicit read or a reset never writes, and its cal
 
 test('a refresh counts as done whether its reads answer or fail, and is marked fresh only when all answer', async () => {
   for (const [name, reads, fails] of [
-    ['all answer', [Promise.resolve(1), Promise.resolve(2)], null],
-    ['one fails', [Promise.resolve(1), Promise.reject(new Error('releases failed'))], 'releases failed'],
+    ['all answer', [Promise.resolve('builds'), Promise.resolve('inventory')], null],
+    // An unrelated read failing must not stop the build statuses refreshing.
+    ['the inventory read fails', [Promise.resolve('builds'), Promise.reject(new Error('inventory failed'))], 'inventory failed'],
+    ['a pool read fails', [Promise.reject(new Error('warm pools failed')), Promise.resolve('builds')], 'warm pools failed'],
   ]) {
     const calls = [];
     const run = refreshAll(reads, { settled: () => calls.push('settled'), succeeded: () => calls.push('succeeded') });
@@ -75,6 +77,14 @@ test('a refresh counts as done whether its reads answer or fail, and is marked f
     else await run;
     assert.deepEqual(calls, fails ? ['settled'] : ['succeeded', 'settled'], name);
   }
+});
+
+test('a failed refresh is tried again at the refresh interval, not on every tick', () => {
+  const gate = attemptGate(10_000);
+  assert.equal(gate.due(0), true);
+  gate.mark(0);
+  assert.equal(gate.due(1_000), false, 'the next 1 s tick waits');
+  assert.equal(gate.due(10_000), true);
 });
 
 test('a read is an error only while it has never answered', () => {

@@ -10,7 +10,7 @@ import { getSpacedVersionCounts } from '@/lib/public-api';
 import { SPACED_SAMPLE_LIMIT, SpacedCounts, loadSpacedCounts } from '@/lib/spaced-counts';
 import { LATEST_TAG, errorMessage, shortHash } from '@/lib/template-format';
 import { visibleTemplateTags } from '@/lib/template-list';
-import { latestRead, refreshAll, type LatestRead, type ReadWrite } from '@/lib/template-reads';
+import { attemptGate, latestRead, refreshAll, type LatestRead, type ReadWrite } from '@/lib/template-reads';
 import {
   markViewRefreshed,
   runLockedViewRefresh,
@@ -155,6 +155,7 @@ export function useTemplatesData({ viewKey, templateName }: Options) {
     capabilities: latestRead<WarmPoolPolicyCapabilities>(),
     spaced: latestRead<SpacedCounts>(),
   }));
+  const [periodicAttempts] = useState(() => attemptGate(VIEW_REFRESH_STALE_MS));
   const [loadingTemplates, setLoadingTemplates] = useState(true);
   const [loadingInventory, setLoadingInventory] = useState(true);
   const [spacedCounts, setSpacedCounts] = useState<SpacedCounts | null>(null);
@@ -450,9 +451,15 @@ export function useTemplatesData({ viewKey, templateName }: Options) {
     if (document.hidden) {
       return;
     }
+    if (!periodicAttempts.due(Date.now())) {
+      return;
+    }
     void runLockedViewRefresh(
       viewKey,
-      () => refresh({ showLoading: false, mode: 'poll' }),
+      () => {
+        periodicAttempts.mark(Date.now());
+        return refresh({ showLoading: false, mode: 'poll' });
+      },
       { staleMs: VIEW_REFRESH_STALE_MS },
     ).catch((err: unknown) => console.warn(errorMessage(err)));
   };

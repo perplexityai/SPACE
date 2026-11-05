@@ -114,6 +114,17 @@ export function latestRead<T>(timeoutMs = READ_TIMEOUT_MS): LatestRead<T> {
   };
 }
 
+// When a periodic refresh last started. A failed refresh leaves the view
+// stale, so the 1 s staleness check would otherwise start it again on every
+// tick; it is tried again at the refresh interval instead.
+export function attemptGate(intervalMs: number) {
+  let last: number | null = null;
+  return {
+    due: (now: number) => last === null || now - last >= intervalMs,
+    mark: (now: number) => { last = now; },
+  };
+}
+
 // Runs a refresh's reads together. `settled` runs whether they answer or
 // fail, `succeeded` only when all answered; the first failure is rethrown.
 export async function refreshAll(
