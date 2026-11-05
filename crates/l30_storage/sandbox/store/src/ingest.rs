@@ -8,14 +8,18 @@
 //! runs for a publication and for a ready suspend backup
 //! (`FinalizeArtifactBackup`).
 //!
-//! Stored and published lifecycle text is compared either with
-//! `LOWER(TRIM(..))` or exactly, as each statement is written; which one
-//! decides how a statement treats non-canonical text. Several are single
-//! statements whose CTEs also write other tables (`sandbox_k8s_executions`,
-//! `sandbox_port_exposures`, `sandbox_observed_states`, the quarantine and
-//! node-facet tables, `sandbox_snapshot_inventory`,
-//! `snapshot_storage_locations`): splitting one would change what it does.
-//! The caller owns the transaction, the locking reads that select candidates,
+//! Stored lifecycle text is compared either with `LOWER(TRIM(..))` or
+//! exactly, as each statement is written; which one decides how a statement
+//! treats non-canonical text. The published status arrives already parsed:
+//! each record carries its canonical `published_lifecycle`, NULL when the
+//! node published none or text that is not a lifecycle, and the statements
+//! compare it exactly.
+//!
+//! Several of these writes are single statements whose CTEs also write other
+//! tables (`sandbox_k8s_executions`, `sandbox_port_exposures`,
+//! `sandbox_observed_states`, the quarantine and node-facet tables,
+//! `sandbox_snapshot_inventory`, `snapshot_storage_locations`): splitting one
+//! would change what it does. The caller owns the transaction, the locking reads that select candidates,
 //! the other tables' own statements, and the events it emits.
 //!
 //! A new lifecycle write here from a node report follows the rule for such
@@ -49,7 +53,7 @@ use uuid::Uuid;
 /// NULL.
 pub const TRANSITION_RECEIPT_RECORD_COLUMNS: &str = "
     sandbox_id UUID,
-    status TEXT,
+    published_lifecycle TEXT,
     transition_receipt_id UUID,
     transition_receipt_kind TEXT,
     transition_receipt_target_state TEXT,
@@ -101,12 +105,13 @@ pub async fn mark_published_quarantined(
 /// `lifecycle = 'failed'`, returning each moved row with the lifecycle it
 /// left. **Observed projection**: the node reported the runtime failed.
 ///
-/// `rows` is a recordset of `{sandbox_id, status}`. The statement claims
-/// before it writes: its `claimed` CTE takes `FOR NO KEY UPDATE` on rows still
-/// on `node_id` and outside the terminal and hold lifecycles, so a row a
-/// concurrent writer holds is re-read at its committed version once the lock
-/// is granted, and the returned from-state is the lifecycle the update
-/// actually replaced. The lock is part of the statement.
+/// `rows` is a recordset of `{sandbox_id, published_lifecycle}`. The
+/// statement claims before it writes: its `claimed` CTE takes
+/// `FOR NO KEY UPDATE` on rows still on `node_id` and outside the terminal
+/// and hold lifecycles, so a row a concurrent writer holds is re-read at its
+/// committed version once the lock is granted, and the returned from-state is
+/// the lifecycle the update actually replaced. The lock is part of the
+/// statement.
 pub async fn mark_published_failed(
     executor: impl sqlx::PgExecutor<'_>,
     node_id: NodeId,
@@ -117,7 +122,7 @@ pub async fn mark_published_failed(
              SELECT *
              FROM jsonb_to_recordset($2::jsonb) AS input(
                  sandbox_id UUID,
-                 status TEXT
+                 published_lifecycle TEXT
              )
          ),
          claimed AS (
@@ -126,7 +131,7 @@ pub async fn mark_published_failed(
              JOIN input ON input.sandbox_id = s.id
              WHERE s.active_node_id = $1
                AND s.managed_by = $3
-               AND LOWER(TRIM(input.status)) = 'failed'
+               AND input.published_lifecycle = 'failed'
                AND LOWER(TRIM(s.lifecycle)) NOT IN (
                    'failed',
                    'quarantined',
@@ -349,7 +354,8 @@ pub async fn finalize_suspended(
 /// `lifecycle = 'started'`, returning the ids that converged. **Observed
 /// projection**: the node reported the restored runtime running.
 ///
-/// `rows` is a recordset of `{sandbox_id, status, transition_receipt_kind}`.
+/// `rows` is a recordset of `{sandbox_id, published_lifecycle,
+/// transition_receipt_kind}`.
 /// The write re-checks that the row is on `node_id` and still `restoring`, and
 /// leaves alone a row whose publication carries an activation-completed
 /// receipt (the receipt path owns it), a row marked for the node-drain
@@ -377,7 +383,7 @@ pub async fn converge_published_restoring_to_started(
              SELECT *
              FROM jsonb_to_recordset($2::jsonb) AS input(
                  sandbox_id UUID,
-                 status TEXT,
+                 published_lifecycle TEXT,
                  transition_receipt_kind TEXT
              )
          )
@@ -387,7 +393,7 @@ pub async fn converge_published_restoring_to_started(
          WHERE s.id = input.sandbox_id
            AND s.active_node_id = $1
            AND s.evacuation_restore_target IS NULL
-           AND LOWER(TRIM(input.status)) = 'started'
+           AND input.published_lifecycle = 'started'
            AND input.transition_receipt_kind IS DISTINCT FROM $3
            AND LOWER(TRIM(s.lifecycle)) = 'restoring'
            AND {routable_execution}
@@ -507,9 +513,9 @@ pub async fn advance_published_activity(
 /// `lifecycle = 'stopped'`, returning the ids that converged. **Observed
 /// projection**: the node reported the runtime stopped.
 ///
-/// `rows` is a recordset of `{sandbox_id, status}`. The write re-checks that
-/// the row is on `node_id` and that its lifecycle, compared with
-/// `LOWER(TRIM(..))`, is `started`, `paused`, `suspended`, `stopping` or
+/// `rows` is a recordset of `{sandbox_id, published_lifecycle}`. The write
+/// re-checks that the row is on `node_id` and that its lifecycle, compared
+/// with `LOWER(TRIM(..))`, is `started`, `paused`, `suspended`, `stopping` or
 /// `restoring`. No locking read selects its rows first: the `UPDATE` locks
 /// each row it writes, and under the caller's READ COMMITTED transaction a row
 /// a concurrent writer holds is re-checked against its latest committed
@@ -528,7 +534,7 @@ pub async fn converge_published_stopped(
              SELECT *
              FROM jsonb_to_recordset($2::jsonb) AS input(
                  sandbox_id UUID,
-                 status TEXT
+                 published_lifecycle TEXT
              )
          )
          UPDATE sandboxes s
@@ -536,7 +542,7 @@ pub async fn converge_published_stopped(
          FROM input
          WHERE s.id = input.sandbox_id
            AND s.active_node_id = $1
-           AND LOWER(TRIM(input.status)) = 'stopped'
+           AND input.published_lifecycle = 'stopped'
            AND LOWER(TRIM(s.lifecycle)) IN (
                'started',
                'paused',
@@ -573,7 +579,7 @@ pub async fn converge_published_stopped(
 ///
 /// `rows` is a recordset of [`TRANSITION_RECEIPT_RECORD_COLUMNS`]. The
 /// execution release requires an activation-completed receipt whose
-/// published status equals its target state, naming the active execution's
+/// published lifecycle equals its target state, naming the active execution's
 /// generation, activation attempt and target state; a route activation to be
 /// present; and either a `created` lifecycle (for a `created` target) or a
 /// running execution with a pod IP (for `started` and `paused`). It checks
@@ -608,7 +614,7 @@ pub async fn release_completed_activations(
                 AND execution.route_activation_id IS NOT NULL
                 AND execution.activation_attempt_target_state = input.transition_receipt_target_state
                 AND input.transition_receipt_kind = $3
-                AND LOWER(TRIM(input.status)) = input.transition_receipt_target_state
+                AND input.published_lifecycle = input.transition_receipt_target_state
                 AND (
                     (
                         input.transition_receipt_target_state = 'created'
