@@ -49,11 +49,18 @@ import {
   type TerminalSessionEvent,
 } from '@/lib/data-plane-terminal';
 import {
+  binaryStringToBytes,
   debounce,
+  isMacPlatform,
+  TERMINAL_ENV,
   TERMINAL_RESIZE_DEBOUNCE_MS,
+  TERMINAL_SHELL_COMMAND,
+  TerminalInputGate,
   terminalEventText,
   terminalKeyAction,
+  terminalLinkUrl,
   terminalNotice,
+  type TerminalInput,
 } from '@/lib/terminal-pane';
 import { terminalColors } from '@/lib/curiosity-theme';
 import { isHiddenOperationError } from '@/lib/hidden-operations';
@@ -883,14 +890,39 @@ function fitTerminal(view: TerminalView) {
   view.term.resize(proposed.cols, proposed.rows);
 }
 
+// Without the async clipboard (an insecure origin, or a refusal), a copy
+// command carries the text instead.
+function copyText(text: string) {
+  const legacy = () => {
+    const onCopy = (event: ClipboardEvent) => {
+      event.clipboardData?.setData('text/plain', text);
+      event.preventDefault();
+    };
+    document.addEventListener('copy', onCopy, { capture: true, once: true });
+    try {
+      document.execCommand('copy');
+    } finally {
+      document.removeEventListener('copy', onCopy, { capture: true });
+    }
+  };
+  if (window.isSecureContext && navigator.clipboard) {
+    navigator.clipboard.writeText(text).catch(legacy);
+  } else {
+    legacy();
+  }
+}
+
 function TerminalCard({ sandbox, ownOrg }: { sandbox: Sandbox; ownOrg: boolean }) {
   const { token } = theme.useToken();
   const [status, setStatus] = useState<TerminalStatus>('disconnected');
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [view, setView] = useState<TerminalView | null>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [loadAttempt, setLoadAttempt] = useState(0);
   const connectionRef = useRef<TerminalConnection | null>(null);
-  // The data plane takes input and resizes once the shell has started.
-  const startedRef = useRef(false);
+  // The data plane takes input and resizes once the shell has started; what
+  // is typed before then is held and sent in order.
+  const gateRef = useRef(new TerminalInputGate());
   // Each Connect starts a generation; a superseded session's late events and
   // connection are dropped.
   const generationRef = useRef(0);
@@ -901,70 +933,90 @@ function TerminalCard({ sandbox, ownOrg }: { sandbox: Sandbox; ownOrg: boolean }
   const connecting = status === 'connecting';
   const active = connecting || status === 'attached';
 
+  const endSession = () => {
+    generationRef.current += 1;
+    gateRef.current.close();
+    connectionRef.current?.close();
+    connectionRef.current = null;
+  };
+
+  const send = (input: TerminalInput) => {
+    const now = gateRef.current.write(input);
+    if (now) connectionRef.current?.sendInput(now.data);
+  };
+
   useEffect(() => {
     const pane = paneRef.current;
     if (!pane) return;
     let disposed = false;
-    let cleanup = () => {};
+    const disposers: Array<() => void> = [];
+    const disposeAll = () => {
+      for (const dispose of disposers.splice(0).reverse()) dispose();
+    };
     void (async () => {
-      // xterm touches the DOM as it loads, so it is imported in the browser only.
-      const [{ Terminal }, { FitAddon }, { WebLinksAddon }] = await Promise.all([
-        import('@xterm/xterm'),
-        import('@xterm/addon-fit'),
-        import('@xterm/addon-web-links'),
-      ]);
-      if (disposed) return;
-      const term = new Terminal({
-        cursorBlink: true,
-        fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace',
-        fontSize: 13,
-        scrollback: 5000,
-        theme: terminalColors,
-      });
-      const fit = new FitAddon();
-      term.loadAddon(fit);
-      term.loadAddon(new WebLinksAddon());
-      term.attachCustomKeyEventHandler(
-        (event) => terminalKeyAction(event, term.hasSelection()) === 'terminal',
-      );
-      term.open(pane);
-      const next = { term, fit };
-      fitTerminal(next);
-      term.write('\x1b[2mConnect to open an interactive shell.\x1b[22m\r\n');
-      const input = term.onData((data) => {
-        if (startedRef.current) connectionRef.current?.sendInput(data);
-      });
-      const resized = term.onResize(({ cols, rows }) => {
-        if (startedRef.current) connectionRef.current?.resize(cols, rows);
-      });
-      const refit = debounce(() => fitTerminal(next), TERMINAL_RESIZE_DEBOUNCE_MS);
-      const observer = new ResizeObserver(() => refit.schedule());
-      observer.observe(pane);
-      cleanup = () => {
-        observer.disconnect();
-        refit.cancel();
-        input.dispose();
-        resized.dispose();
-        term.dispose();
-      };
-      setView(next);
+      try {
+        // xterm touches the DOM as it loads, so it is imported in the browser only.
+        const [{ Terminal }, { FitAddon }, { WebLinksAddon }] = await Promise.all([
+          import('@xterm/xterm'),
+          import('@xterm/addon-fit'),
+          import('@xterm/addon-web-links'),
+        ]);
+        if (disposed) return;
+        const term = new Terminal({
+          cursorBlink: true,
+          fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace',
+          fontSize: 13,
+          scrollback: 5000,
+          theme: terminalColors,
+        });
+        disposers.push(() => term.dispose());
+        const fit = new FitAddon();
+        term.loadAddon(fit);
+        term.loadAddon(new WebLinksAddon((_event, uri) => {
+          const url = terminalLinkUrl(uri);
+          if (url) window.open(url, '_blank', 'noopener,noreferrer');
+        }));
+        const mac = isMacPlatform(navigator.platform || navigator.userAgent);
+        term.attachCustomKeyEventHandler((event) => {
+          const action = terminalKeyAction(event, term.hasSelection(), mac);
+          if (action === 'terminal') return true;
+          if (action === 'copy' && event.type === 'keydown') {
+            event.preventDefault();
+            copyText(term.getSelection());
+            term.clearSelection();
+          }
+          return false;
+        });
+        term.open(pane);
+        const next = { term, fit };
+        fitTerminal(next);
+        term.write('\x1b[2mConnect to open an interactive shell.\x1b[22m\r\n');
+        term.onData((data) => send({ kind: 'text', data }));
+        term.onBinary((data) => send({ kind: 'bytes', data: binaryStringToBytes(data) }));
+        term.onResize(({ cols, rows }) => {
+          if (gateRef.current.started) connectionRef.current?.resize(cols, rows);
+        });
+        const refit = debounce(() => fitTerminal(next), TERMINAL_RESIZE_DEBOUNCE_MS);
+        const observer = new ResizeObserver(() => refit.schedule());
+        observer.observe(pane);
+        disposers.push(() => refit.cancel(), () => observer.disconnect());
+        setView(next);
+      } catch (err: any) {
+        disposeAll();
+        pane.replaceChildren();
+        if (!disposed) setLoadError(err?.message || String(err));
+      }
     })();
     return () => {
       disposed = true;
-      generationRef.current += 1;
-      startedRef.current = false;
-      connectionRef.current?.close();
-      connectionRef.current = null;
-      cleanup();
+      endSession();
+      disposeAll();
     };
-  }, []);
+  }, [loadAttempt]);
 
   useEffect(() => {
     if (!terminalEnabled && connectionRef.current) {
-      generationRef.current += 1;
-      startedRef.current = false;
-      connectionRef.current.close();
-      connectionRef.current = null;
+      endSession();
       setStatus('closed');
     }
   }, [terminalEnabled]);
@@ -975,20 +1027,19 @@ function TerminalCard({ sandbox, ownOrg }: { sandbox: Sandbox; ownOrg: boolean }
     if (text) view.term.write(text);
     switch (event.type) {
       case 'status':
-        if (event.status !== 'attached') startedRef.current = false;
         setStatus(event.status);
         if (event.status === 'attached') view.term.focus();
+        if (event.status === 'closed') endSession();
         break;
       case 'started':
-        startedRef.current = true;
         // The pane may have changed size while the session opened.
         fitTerminal(view);
         connectionRef.current?.resize(view.term.cols, view.term.rows);
+        for (const input of gateRef.current.start()) connectionRef.current?.sendInput(input.data);
         break;
       case 'exited':
-        startedRef.current = false;
+        endSession();
         setStatus('closed');
-        connectionRef.current = null;
         break;
       case 'error':
         setStatus('error');
@@ -998,11 +1049,10 @@ function TerminalCard({ sandbox, ownOrg }: { sandbox: Sandbox; ownOrg: boolean }
 
   const connect = async () => {
     if (!terminalEnabled || active || !view) return;
-    const generation = ++generationRef.current;
-    startedRef.current = false;
     // A session left open by a retryable error is replaced, not leaked.
-    connectionRef.current?.close();
-    connectionRef.current = null;
+    endSession();
+    const generation = generationRef.current;
+    gateRef.current.open();
     setStatus('connecting');
     setSessionId(null);
     view.term.reset();
@@ -1012,7 +1062,13 @@ function TerminalCard({ sandbox, ownOrg }: { sandbox: Sandbox; ownOrg: boolean }
       const connection = await openSandboxTerminal(
         sandbox.id,
         (event) => handleTerminalEvent(generation, event),
-        { cols: view.term.cols, rows: view.term.rows, ownOrg },
+        {
+          cols: view.term.cols,
+          rows: view.term.rows,
+          command: TERMINAL_SHELL_COMMAND,
+          env: TERMINAL_ENV,
+          ownOrg,
+        },
       );
       if (generation !== generationRef.current) {
         connection.close();
@@ -1022,16 +1078,14 @@ function TerminalCard({ sandbox, ownOrg }: { sandbox: Sandbox; ownOrg: boolean }
       setSessionId(connection.sessionId);
     } catch (err: any) {
       if (generation !== generationRef.current) return;
+      endSession();
       setStatus('error');
       view.term.write(terminalNotice(`error: ${err.message || 'failed to open terminal'}`));
     }
   };
 
   const disconnect = () => {
-    generationRef.current += 1;
-    startedRef.current = false;
-    connectionRef.current?.close();
-    connectionRef.current = null;
+    endSession();
     setStatus('closed');
     view?.term.write(terminalNotice('disconnected'));
   };
@@ -1099,6 +1153,24 @@ function TerminalCard({ sandbox, ownOrg }: { sandbox: Sandbox; ownOrg: boolean }
                   through the admin terminal route, in that organization; the session is attributed to you and recorded in the
                   admin audit log.
                 </span>
+              )}
+            />
+          ) : null}
+          {loadError ? (
+            <Alert
+              type="error"
+              showIcon
+              title={`The terminal could not load: ${loadError}`}
+              action={(
+                <Button
+                  size="small"
+                  onClick={() => {
+                    setLoadError(null);
+                    setLoadAttempt((attempt) => attempt + 1);
+                  }}
+                >
+                  Retry
+                </Button>
               )}
             />
           ) : null}

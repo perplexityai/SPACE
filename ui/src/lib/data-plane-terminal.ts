@@ -39,7 +39,8 @@ export type TerminalSessionEvent =
 
 export type TerminalConnection = {
   readonly sessionId: string;
-  sendInput: (input: string) => void;
+  // Text is sent UTF-8 encoded; bytes are sent as they are.
+  sendInput: (input: string | Uint8Array) => void;
   resize: (cols: number, rows: number) => void;
   close: () => void;
 };
@@ -47,19 +48,15 @@ export type TerminalConnection = {
 type TerminalOptions = {
   cols: number;
   rows: number;
+  // The PTY's command and environment; an empty command is the data plane's
+  // default.
+  command: string[];
+  env: Record<string, string>;
   // The sandbox belongs to the signed-in operator's organization, which the
   // public route serves; any other organization's goes through the admin
   // route, which opens the session under the sandbox's own organization.
   ownOrg: boolean;
 };
-
-// The data plane's default command is `/bin/sh`, which on many images is a
-// shell without line editing: no history and no Tab completion. Like a
-// terminal login, run the user's login shell, or `/bin/sh` without one.
-const TERMINAL_COMMAND = ['/bin/sh', '-c', 'if [ -x "$SHELL" ]; then exec "$SHELL" -l; fi; exec /bin/sh -l'];
-// The console's emulator, xterm.js, implements xterm-256color. Full-screen
-// programs (top, vi, less) need TERM to draw.
-const TERMINAL_ENV = { TERM: 'xterm-256color' };
 
 export const TERMINAL_OTHER_ORG_UNSUPPORTED =
   "This API release opens terminals only in your organization's sandboxes; another organization's needs a newer API release.";
@@ -81,8 +78,8 @@ function toWebSocketUrl(rawUrl: string): string {
   return parsed.toString();
 }
 
-function encodeBase64(input: string): string {
-  const bytes = new TextEncoder().encode(input);
+function encodeBase64(input: string | Uint8Array): string {
+  const bytes = typeof input === 'string' ? new TextEncoder().encode(input) : input;
   let binary = '';
   for (const byte of bytes) {
     binary += String.fromCharCode(byte);
@@ -105,9 +102,9 @@ export async function openSandboxTerminal(
   options: TerminalOptions,
 ): Promise<TerminalConnection> {
   const body = {
-    command: TERMINAL_COMMAND,
+    command: options.command,
     cwd: null,
-    env: TERMINAL_ENV,
+    env: options.env,
     size: { cols: options.cols, rows: options.rows },
   };
   const headers = { 'Idempotency-Key': idempotencyKey() };
@@ -248,7 +245,7 @@ export async function openSandboxTerminal(
 
   return {
     sessionId: session.id,
-    sendInput(input: string) {
+    sendInput(input: string | Uint8Array) {
       seq += 1;
       sendJson({ type: 'input', seq, data_base64: encodeBase64(input) });
     },
