@@ -39,4 +39,6 @@ allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 [advisories]
 ignore = [
     { id = "RUSTSEC-2024-0449", reason = "unsafe-libyaml is unmaintained; it enters only via datadog-opentelemetry -> libdd-library-config -> serde_yaml 0.9.34+deprecated -> unsafe-libyaml. Removal is tracked in #303." },
+    { id = "RUSTSEC-2026-0440", reason = "astral-tokio-tar is unmaintained, with no safe upgrade; it enters only via testcontainers, a dev-dependency of the database test fixtures, and ships in no binary." },
+    { id = "RUSTSEC-2026-0441", reason = "pin-utils is unmaintained, not unsound; it enters only via the AWS SDK's aws-smithy-http, aws-smithy-runtime and aws-smithy-types, which have no release without it." },
 ]
