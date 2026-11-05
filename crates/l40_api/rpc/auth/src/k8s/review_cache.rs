@@ -1,5 +1,5 @@
 //! The reviewed-token cache that every `TokenReview` reviewer in
-//! [`crate::auth`] uses: node-api's surface verifier and the build reviewer.
+//! [`crate`] uses: node-api's surface verifier and the build reviewer.
 //!
 //! Each reviewer keeps its own instance and decides what a verdict holds and
 //! how long it lives. This module stores verdicts by token digest and
@@ -17,13 +17,13 @@ use super::lock_or_recover;
 /// A token is cached under its SHA-256 digest, never its value, and per
 /// audience: a token reviewed for one audience is no answer for another.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub(in crate::auth) struct TokenCacheKey {
+pub(crate) struct TokenCacheKey {
     token_digest: [u8; 32],
     audience: String,
 }
 
 impl TokenCacheKey {
-    pub(in crate::auth) fn new(token: &str, audience: &str) -> Self {
+    pub(crate) fn new(token: &str, audience: &str) -> Self {
         let mut hasher = Sha256::new();
         hasher.update(token.as_bytes());
         Self {
@@ -34,14 +34,14 @@ impl TokenCacheKey {
 }
 
 #[derive(Clone, Debug)]
-pub(in crate::auth) struct CachedTokenReview<R> {
+pub(crate) struct CachedTokenReview<R> {
     pub(super) result: R,
     pub(super) expires_at: Instant,
 }
 
 /// What a lookup found under a key.
 #[derive(Debug, Eq, PartialEq)]
-pub(in crate::auth) enum Lookup<R> {
+pub(crate) enum Lookup<R> {
     Live(R),
     /// The verdict had expired and is now gone.
     Expired,
@@ -50,14 +50,14 @@ pub(in crate::auth) enum Lookup<R> {
 
 type InFlightReviews = Arc<Mutex<HashMap<TokenCacheKey, Vec<tokio::sync::oneshot::Sender<()>>>>>;
 
-pub(in crate::auth) struct TokenReviewCache<R> {
+pub(crate) struct TokenReviewCache<R> {
     pub(super) entries: Mutex<HashMap<TokenCacheKey, CachedTokenReview<R>>>,
     in_flight: InFlightReviews,
     max_entries: usize,
 }
 
 impl<R: Clone> TokenReviewCache<R> {
-    pub(in crate::auth) fn new(max_entries: usize) -> Self {
+    pub(crate) fn new(max_entries: usize) -> Self {
         Self {
             entries: Mutex::new(HashMap::new()),
             in_flight: Arc::new(Mutex::new(HashMap::new())),
@@ -65,7 +65,7 @@ impl<R: Clone> TokenReviewCache<R> {
         }
     }
 
-    pub(in crate::auth) fn lookup(&self, key: &TokenCacheKey, now: Instant) -> Lookup<R> {
+    pub(crate) fn lookup(&self, key: &TokenCacheKey, now: Instant) -> Lookup<R> {
         let mut entries = lock_or_recover(&self.entries);
         match entries.get(key) {
             Some(cached) if cached.expires_at > now => Lookup::Live(cached.result.clone()),
@@ -79,7 +79,7 @@ impl<R: Clone> TokenReviewCache<R> {
 
     /// Stores `result` until `expires_at`. Returns whether an unexpired entry
     /// was evicted to make room.
-    pub(in crate::auth) fn insert(
+    pub(crate) fn insert(
         &self,
         key: TokenCacheKey,
         result: R,
@@ -99,7 +99,7 @@ impl<R: Clone> TokenReviewCache<R> {
     /// Claims the review of `key`, or joins the review another request
     /// already claimed. A waiter is woken when that claim drops, whatever its
     /// outcome, and must look the key up again.
-    pub(in crate::auth) fn join_in_flight_or_claim(&self, key: &TokenCacheKey) -> InFlightState {
+    pub(crate) fn join_in_flight_or_claim(&self, key: &TokenCacheKey) -> InFlightState {
         let mut in_flight = lock_or_recover(&self.in_flight);
         match in_flight.entry(key.clone()) {
             Entry::Occupied(mut entry) => {
@@ -118,12 +118,12 @@ impl<R: Clone> TokenReviewCache<R> {
     }
 }
 
-pub(in crate::auth) enum InFlightState {
+pub(crate) enum InFlightState {
     Claimed(InFlightClaim),
     Waiting(tokio::sync::oneshot::Receiver<()>),
 }
 
-pub(in crate::auth) struct InFlightClaim {
+pub(crate) struct InFlightClaim {
     key: TokenCacheKey,
     in_flight: InFlightReviews,
 }

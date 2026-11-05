@@ -137,7 +137,7 @@ pub(super) struct K8sTokenReviewer {
 
 impl K8sTokenReviewer {
     pub(super) async fn new(config: K8sTokenAuthConfig) -> Result<Self, kube::Error> {
-        let client = crate::kube_client::traced_kube_client_from_env().await?;
+        let client = pplx_space_kube_client::traced_kube_client_from_env().await?;
         Ok(Self::with_client(config, client))
     }
 

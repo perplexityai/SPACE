@@ -142,7 +142,7 @@ impl TemplateReleasesStore {
     /// Missing or stale inventory yields an empty scope, never an address fallback.
     pub(super) async fn node_scope_for_identity(
         &self,
-        node: &pplx_space_common_svc::auth::AuthenticatedKubernetesNode,
+        node: &pplx_space_rpc_auth::AuthenticatedKubernetesNode,
     ) -> Result<TemplateReadScope, sqlx::Error> {
         let node_ids = self
             .nodes_for_identity(node, &[NodeRole::Worker, NodeRole::Builder])
@@ -157,7 +157,7 @@ impl TemplateReleasesStore {
     /// node sync to supply it.
     pub(super) async fn publisher_node_for_identity(
         &self,
-        node: &pplx_space_common_svc::auth::build::AuthenticatedBuildNode,
+        node: &pplx_space_rpc_auth::build::AuthenticatedBuildNode,
     ) -> Result<PublicationNode, sqlx::Error> {
         let rows = self.nodes_for_identity(node, &[NodeRole::Builder]).await?;
         if let Some((id, _)) = rows.iter().find(|(_, matches)| *matches == Some(true)) {
@@ -171,7 +171,7 @@ impl TemplateReleasesStore {
 
     async fn nodes_for_identity(
         &self,
-        node: &pplx_space_common_svc::auth::AuthenticatedKubernetesNode,
+        node: &pplx_space_rpc_auth::AuthenticatedKubernetesNode,
         roles: &[NodeRole],
     ) -> Result<Vec<(NodeId, Option<bool>)>, sqlx::Error> {
         sqlx::query_as(sql!(

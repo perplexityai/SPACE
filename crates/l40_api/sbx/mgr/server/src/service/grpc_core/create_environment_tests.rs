@@ -109,7 +109,7 @@ fn node_manager(definition: &EnvironmentDefinition, node: Node) -> FakeNodeManag
 fn single_build(response: GetTemplateResponse) -> Arc<FakeTemplateResolver> {
     Arc::new(FakeTemplateResolver::new(move || {
         let mut response = tonic::Response::new(response.clone());
-        pplx_space_common_svc::template_lookup::TemplateLookupScope::LocalExecution
+        pplx_space_rpc_auth::template_lookup::TemplateLookupScope::LocalExecution
             .receipt(&mut response);
         Ok(response)
     }))

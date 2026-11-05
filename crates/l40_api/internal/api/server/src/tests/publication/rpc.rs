@@ -1,7 +1,7 @@
 use super::*;
 use crate::proto::{cluster_api_client::ClusterApiClient, cluster_api_server::ClusterApiServer};
-use pplx_space_common_svc::auth::{
-    self,
+use pplx_space_rpc_auth as auth;
+use pplx_space_rpc_auth::{
     build::BuildAuthLayer,
     test_support::{
         TokenReviewStatus, kubeconfig_for_endpoint, pod_bound_service_account_status,

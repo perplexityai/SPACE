@@ -28,7 +28,7 @@ impl TemplateManagerService {
         request: Request<crate::proto::ExportTemplateRequest>,
     ) -> Result<Response<TemplateExportStream>, Status> {
         let peer = self.authorize_peer(&request, "ExportTemplate", ALLOW_TEMPLATE_OPERATOR)?;
-        pplx_space_common_svc::auth::template_transfer::authorize_forwarded_template_export(
+        pplx_space_rpc_auth::template_transfer::authorize_forwarded_template_export(
             &request,
             peer.principal(),
         )?;

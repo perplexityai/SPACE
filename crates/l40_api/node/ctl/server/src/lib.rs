@@ -2368,7 +2368,7 @@ type TracedClusterApiClient = ClusterApiClient<
     pplx_space_common_svc::bootstrap::GrpcClientTrace<
         tonic::service::interceptor::InterceptedService<
             tonic::transport::Channel,
-            pplx_space_common_svc::auth::SpaceBearerInterceptor,
+            pplx_space_bearer_token::SpaceBearerInterceptor,
         >,
     >,
 >;
@@ -2503,7 +2503,7 @@ async fn build_cluster_api_client(
         // instead of a header-less request the server would reject as a 401.
         let channel = tonic::service::interceptor::InterceptedService::new(
             channel,
-            pplx_space_common_svc::auth::SpaceBearerInterceptor::new(
+            pplx_space_bearer_token::SpaceBearerInterceptor::new(
                 pplx_space_common_svc::bearer_token::SpaceBearerToken::ClusterApi,
             ),
         );

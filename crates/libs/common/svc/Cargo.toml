@@ -16,36 +16,14 @@ otel = ["pplx-space-observability/otel"]
 datadog = ["otel", "pplx-space-observability/datadog"]
 # Deprecated for one release; use otel and datadog.
 datadog-otel = ["otel", "datadog"]
-k8s = ["dep:k8s-openapi", "dep:kube", "dep:pplx-space-kube-client"]
 # Exposes `sql::migration_checksums`, the accepted-checksums adapter every
 # migration runner embeds.
 migration-checksums = ["dep:pplx-space-migration-checksums"]
-# Exposes shared authentication test helpers to other crates, and forwards to
-# `pplx-space-api-route/test-support` for the route test helpers. common-svc's
-# unit tests get its own helpers under `cfg(test)`, but not the route helpers,
-# which outside pplx-space-api-route only this feature enables.
-# External test suites opt in through a dev-dependency. Mirrors
-# `pplx-space-metrics-emit`'s `test-capture`. Also forwards
-# `pplx-space-ecw-credential/test-support`, which exposes
-# `EcwCredentialKeyring::from_current_key_for_test`; this crate's `cfg(test)`
-# does not cover that constructor, so its unit tests get it only with this
-# feature.
-test-support = [
-    "pplx-space-api-route/test-support",
-    "pplx-space-ecw-credential/test-support",
-]
-# Enables the test-only environment overrides (see `pplx_space_common_core::env::test_hook`).
-test-hooks = ["pplx-space-common-core/test-hooks"]
 
 [dependencies]
-axum = { workspace = true }
-base64 = { workspace = true }
 bytes = { workspace = true }
 http = { workspace = true }
-http-body = { workspace = true }
 jiff = { workspace = true }
-k8s-openapi = { workspace = true, features = ["v1_32"], optional = true }
-kube = { workspace = true, default-features = false, features = ["client", "config", "runtime", "rustls-tls"], optional = true }
 libc = { workspace = true }
 log = { workspace = true }
 nix = { workspace = true, features = ["fs", "user"] }
@@ -53,9 +31,7 @@ pin-project-lite = { workspace = true }
 rand = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
-sha2 = { workspace = true }
 sqlx = { workspace = true, features = ["derive", "postgres", "runtime-tokio", "time", "tls-rustls-aws-lc-rs", "uuid"] }
-subtle = { workspace = true }
 thiserror = { workspace = true }
 time = { workspace = true }
 tokio = { workspace = true, features = ["macros", "net", "rt", "signal", "time"] }
@@ -82,7 +58,6 @@ pplx-space-grpc-rate-limiter = { workspace = true }
 pplx-space-http-server = { workspace = true }
 pplx-space-ingress-admission = { workspace = true }
 pplx-space-k8s-node-id = { workspace = true }
-pplx-space-kube-client = { workspace = true, optional = true }
 pplx-space-metrics = { workspace = true }
 pplx-space-migration-checksums = { workspace = true, optional = true }
 pplx-space-node-registration-store = { workspace = true }

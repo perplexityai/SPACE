@@ -14,7 +14,6 @@ pub use pplx_space_common_core as core;
 pub use pplx_space_common_core::sql;
 pub use pplx_space_observability::{self as observability, LogContext, ObservabilityError};
 
-pub mod auth;
 pub use pplx_space_bearer_token as bearer_token;
 pub mod bootstrap;
 pub use pplx_space_dependency_drain as dependency_drain;
@@ -22,8 +21,6 @@ pub mod disk_admission;
 pub use pplx_space_ecw_credential as ecw_credential;
 pub use pplx_space_federated_identity as federated_identity;
 pub use pplx_space_http_server::http_listener;
-#[cfg(feature = "k8s")]
-pub use pplx_space_kube_client as kube_client;
 pub use pplx_space_service_lifecycle as lifecycle;
 pub mod local_health;
 pub use pplx_space_api_route as space_api_route;
@@ -36,7 +33,6 @@ pub use pplx_space_uds_peer_auth as peer_auth;
 pub use pplx_space_valkey::redis;
 pub use pplx_space_valkey::shared_valkey;
 pub mod sql;
-pub mod template_lookup;
 pub use pplx_space_systemd_watchdog as systemd;
 pub use pplx_space_tokio_runtime as tokio_runtime;
 pub mod types;

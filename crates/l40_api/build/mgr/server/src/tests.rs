@@ -445,9 +445,9 @@ fn test_recipe() -> ProtoRecipe {
 
 fn authorized_request<T>(body: T) -> Request<T> {
     let mut request = Request::new(body);
-    request.extensions_mut().insert(
-        pplx_space_common_svc::auth::build::BuildAuthenticatedCaller::trusted_by_configuration(),
-    );
+    request
+        .extensions_mut()
+        .insert(pplx_space_rpc_auth::build::BuildAuthenticatedCaller::trusted_by_configuration());
     request
 }
 

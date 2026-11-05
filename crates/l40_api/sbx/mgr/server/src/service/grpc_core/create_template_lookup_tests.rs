@@ -9,8 +9,8 @@ use crate::template_resolver::TemplateLookupError;
 use crate::template_resolver::fake::{FakeTemplateResolver, LookupChannel};
 use pplx_space_common_core::host::linux::identities::users;
 use pplx_space_common_svc::PeerIdentity;
-use pplx_space_common_svc::template_lookup::TemplateLookupScope;
 use pplx_space_net_common::proto::PolicyAuthority;
+use pplx_space_rpc_auth::template_lookup::TemplateLookupScope;
 use pplx_space_template_mgr_client::proto::{GetTemplateRequest, TemplateRef};
 
 /// The resolver's refusal, distinct from every refusal a check produces before

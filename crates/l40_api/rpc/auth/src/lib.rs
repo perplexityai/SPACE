@@ -1,3 +1,7 @@
+//! Authentication for SPACE's internal RPC surfaces: the node-api and build
+//! auth layers, Kubernetes TokenReview verification behind the `k8s` feature,
+//! and template lookup scope propagation.
+
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -9,11 +13,12 @@ use subtle::ConstantTimeEq;
 use tonic::{Request, Status};
 use tower::{Layer, Service};
 
-use crate::space_api_route::SPACE_API_BRIDGE_CALLER_POLICY_METADATA_KEY;
+use pplx_space_api_route::SPACE_API_BRIDGE_CALLER_POLICY_METADATA_KEY;
 
 pub mod build;
 mod node_identity;
 pub mod template;
+pub mod template_lookup;
 pub mod template_transfer;
 pub use node_identity::{AuthenticatedKubernetesNode, AuthenticatedNodeIdentity};
 
@@ -27,8 +32,8 @@ use k8s::{K8sTokenAuthConfig, K8sTokenReviewer};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
-pub use crate::bearer_token::SPACE_INTERNAL_TOKEN_ENV;
-pub use crate::bearer_token::{SpaceBearerInterceptor, required_space_bearer_token};
+pub use pplx_space_bearer_token::SPACE_INTERNAL_TOKEN_ENV;
+pub use pplx_space_bearer_token::{SpaceBearerInterceptor, required_space_bearer_token};
 
 const SPACE_K8S_TOKEN_AUTH_ENABLED_ENV: &str = "SPACE_K8S_TOKEN_AUTH_ENABLED";
 const SPACE_K8S_TOKEN_AUTH_STATIC_FALLBACK_ENABLED_ENV: &str =
@@ -37,7 +42,7 @@ const SPACE_K8S_TOKEN_AUTH_STATIC_FALLBACK_ENABLED_ENV: &str =
 /// Node role for an auth surface. Reuses the shared registry vocabulary from
 /// `pplx-space-common-core` (with its `FromStr`/`Display`) rather than forking a
 /// parallel enum; parse inbound role strings at the boundary via `FromStr`.
-pub use crate::core::types::NodeRole;
+pub use pplx_space_common_core::types::NodeRole;
 
 #[derive(Clone)]
 pub struct NodeApiAuthLayer {
@@ -593,13 +598,13 @@ impl NodeApiAuthenticator {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum AuthSurface {
+pub(crate) enum AuthSurface {
     Normal,
     WorkerInternal,
 }
 
 impl AuthSurface {
-    pub(super) const fn as_str(self) -> &'static str {
+    pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::Normal => "normal",
             Self::WorkerInternal => "worker_internal",

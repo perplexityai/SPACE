@@ -1,5 +1,5 @@
 use super::*;
-use pplx_space_common_svc::template_lookup::TemplateLookupScope;
+use pplx_space_rpc_auth::template_lookup::TemplateLookupScope;
 use pplx_space_template_mgr_client::proto::{
     GetTemplateRequest, TemplateRef, template_manager_client::TemplateManagerClient,
     template_manager_server::TemplateManagerServer,

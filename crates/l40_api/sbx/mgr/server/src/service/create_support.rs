@@ -9,11 +9,11 @@ use super::validation::{
 };
 use super::*;
 use pplx_space_common_core::types::{EnvMap, EnvSanitizationIssue};
-use pplx_space_common_svc::template_lookup::TemplateLookupScope;
 use pplx_space_events::{
     SandboxEventDetails, SandboxEventSource, SandboxEventType, SandboxRestoreProvenance,
     emit_sandbox_event,
 };
+use pplx_space_rpc_auth::template_lookup::TemplateLookupScope;
 
 pub(super) struct ResolvedTemplatePaths {
     pub(super) guest_image: pplx_space_common_core::types::guest_image::GuestImageContract,

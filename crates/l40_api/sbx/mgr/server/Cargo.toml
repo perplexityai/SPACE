@@ -71,6 +71,7 @@ pplx-space-events = { workspace = true }
 pplx-space-execution-common = { workspace = true }
 pplx-space-execution-catalog = { workspace = true }
 pplx-space-feature-flags = { workspace = true }
+pplx-space-rpc-auth = { workspace = true }
 pplx-space-volmgr-client = { workspace = true }
 pplx-space-net-common = { workspace = true, features = ["serde"] }
 pplx-space-net-gateway-client = { workspace = true }
@@ -107,7 +108,6 @@ tonic-prost = { workspace = true }
 pplx-space-observability = { workspace = true, features = ["test-capture"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "test-util"] }
 tracing-subscriber = { workspace = true }
-pplx-space-common-svc = { workspace = true, features = ["test-support"] }
 pplx-space-metrics = { workspace = true, features = ["test-capture"] }
 pplx-space-sbx-mgr-client = { workspace = true, features = ["test-support"] }
 pplx-space-test-env = { workspace = true }

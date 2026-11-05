@@ -21,7 +21,7 @@ serviceName: space-worker-node-api
 
 # Kubernetes token auth: the ServiceAccounts each node-api surface admits,
 # rendered as the env vars of the same names (K8sTokenAuthConfig,
-# crates/libs/common/svc/src/auth/k8s.rs; names are qualified with
+# crates/l40_api/rpc/auth/src/k8s.rs; names are qualified with
 # node-api's own namespace). These are the worker role's; values-builder.yaml
 # replaces them for builders. An empty list renders nothing.
 auth:
@@ -71,7 +71,7 @@ auth:
   # Peer template transfers: PullTemplate and NodeExportTemplate need this
   # grant as well as admission above (require_template_transfer_authority and
   # prepare_template_export,
-  # crates/libs/common/svc/src/auth/template_transfer.rs). With Kubernetes
+  # crates/l40_api/rpc/auth/src/template_transfer.rs). With Kubernetes
   # auth on, only these accounts get it (AuthPolicy::authenticated_caller,
   # auth/k8s.rs), and an empty list refuses every transfer. A pull is started
   # on the target as the api's account: its only in-tree caller, admin-api's

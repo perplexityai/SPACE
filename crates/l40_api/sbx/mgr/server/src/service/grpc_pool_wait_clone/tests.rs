@@ -64,12 +64,12 @@ fn armed_clone_with_image(
 async fn cloning_preserves_guest_contract_and_requires_current_checkpoint() {
     use crate::node_manager_transport::fake::FakeNodeManager;
     use crate::template_resolver::fake::FakeTemplateResolver;
-    use pplx_space_common_svc::template_lookup::TemplateLookupScope;
     use pplx_space_node_mgr_client::proto::{
         CaptureVmStateRequest, CaptureVmStateResponse, CloneCapabilitiesRequest,
         CloneCapabilitiesResponse, CloneSandboxRequest, CloneSandboxResponse,
         ResolveExecutionEnvironmentRequest, ResolveExecutionEnvironmentResponse,
     };
+    use pplx_space_rpc_auth::template_lookup::TemplateLookupScope;
     use pplx_space_template_mgr_client::proto::{GetTemplateResponse, TemplateRef};
 
     let native = serde_json::from_value(serde_json::json!({

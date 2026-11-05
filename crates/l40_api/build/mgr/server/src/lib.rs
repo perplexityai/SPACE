@@ -792,7 +792,7 @@ impl BuildManager for BuildManagerDaemonService {
     > {
         request
             .extensions()
-            .get::<pplx_space_common_svc::auth::build::BuildAuthenticatedCaller>()
+            .get::<pplx_space_rpc_auth::build::BuildAuthenticatedCaller>()
             .ok_or_else(|| {
                 Status::permission_denied("execution capabilities require authenticated authority")
             })?;
@@ -807,7 +807,7 @@ impl BuildManager for BuildManagerDaemonService {
         &self,
         request: Request<StartBuildRequest>,
     ) -> Result<Response<StartBuildResponse>, Status> {
-        pplx_space_common_svc::auth::build::authorize_template_build(
+        pplx_space_rpc_auth::build::authorize_template_build(
             &request,
             request.get_ref().org_id.as_deref(),
         )?;

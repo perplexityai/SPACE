@@ -2,7 +2,7 @@
 //! clients as proper statuses (UNAUTHENTICATED) rather than transport-level
 //! stream errors.
 
-use pplx_space_common_svc::auth::{NodeApiAuthConfig, NodeApiAuthLayer, NodeRole};
+use pplx_space_rpc_auth::{NodeApiAuthConfig, NodeApiAuthLayer, NodeRole};
 
 #[tokio::test]
 async fn auth_layer_rejection_is_a_grpc_status_not_a_transport_error() {
@@ -17,7 +17,7 @@ async fn auth_layer_rejection_is_a_grpc_status_not_a_transport_error() {
     .unwrap();
     let auth_layer = NodeApiAuthLayer::from_config(config).await.unwrap();
 
-    let (_, health_service) = pplx_space_common_svc::grpc_health_service();
+    let (_, health_service) = tonic_health::server::health_reporter();
     let server = tokio::spawn(async move {
         tonic::transport::Server::builder()
             .layer(auth_layer)

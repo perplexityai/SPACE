@@ -1,6 +1,6 @@
 use super::*;
-use pplx_space_common_svc::auth::{NodeApiAuthConfig, NodeApiAuthLayer, NodeRole};
 use pplx_space_node_api_client::proto::cluster_api_client::ClusterApiClient;
+use pplx_space_rpc_auth::{NodeApiAuthConfig, NodeApiAuthLayer, NodeRole};
 use tokio_stream::wrappers::TcpListenerStream;
 
 #[derive(Clone, Copy)]

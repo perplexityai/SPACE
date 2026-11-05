@@ -22,7 +22,7 @@
 {{- include "space-node-service.serviceAccount" $ctx }}
 ---
 # build-manager reviews its caller's projected token (BuildTokenReviewer,
-# crates/libs/common/svc/src/auth/build/k8s.rs).
+# crates/l40_api/rpc/auth/src/build/k8s.rs).
 {{ include "space-node-service.tokenReviewRbac" $ctx }}
 ---
 apiVersion: apps/v1
@@ -60,7 +60,7 @@ spec:
       # config of traced_kube_client_from_env,
       # crates/l10_foundation/kube/client/src/lib.rs), and the allowlists name
       # accounts in the namespace read from the same mount (auth_namespace,
-      # crates/libs/common/svc/src/auth/k8s.rs). The account may only
+      # crates/l40_api/rpc/auth/src/k8s.rs). The account may only
       # create TokenReviews (RBAC above).
       automountServiceAccountToken: true
       # Pod network: build-manager needs nothing from the node's network
@@ -131,7 +131,7 @@ spec:
             {{- include "space-node-service.env.internalToken" . | nindent 12 }}
             # TokenReview of the caller's projected token, audience
             # space-build-manager, with no static fallback, as deployed
-            # (BuildAuthLayer::from_env, crates/libs/common/svc/src/auth/build.rs;
+            # (BuildAuthLayer::from_env, crates/l40_api/rpc/auth/src/build.rs;
             # BuildSurface::Manager, auth/build/k8s.rs).
             - name: SPACE_K8S_TOKEN_AUTH_ENABLED
               value: "true"

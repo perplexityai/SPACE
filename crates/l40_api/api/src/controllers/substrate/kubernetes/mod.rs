@@ -455,7 +455,7 @@ impl KubernetesState {
             return Ok(None);
         }
 
-        let client = pplx_space_common_svc::kube_client::traced_kube_client_from_env().await?;
+        let client = pplx_space_kube_client::traced_kube_client_from_env().await?;
 
         let sandbox_namespace = std::env::var("SPACE_SANDBOX_NAMESPACE")
             .or_else(|_| std::env::var("POD_NAMESPACE"))

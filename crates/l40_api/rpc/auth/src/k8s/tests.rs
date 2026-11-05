@@ -1,7 +1,7 @@
 use super::review_cache::{CachedTokenReview, insert_token_review, prune_token_review_cache};
 use super::*;
-use crate::auth::NodeApiAuthenticator;
-use crate::auth::test_support::jwt_with_exp;
+use crate::NodeApiAuthenticator;
+use crate::test_support::jwt_with_exp;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -405,7 +405,7 @@ async fn peer_node_identity_is_confined_to_template_export() {
         if allowed {
             assert_eq!(
                 result.unwrap().template_transfer_authority(),
-                crate::auth::template_transfer::TemplateTransferAuthority::Granted,
+                crate::template_transfer::TemplateTransferAuthority::Granted,
                 "{method}"
             );
         } else {

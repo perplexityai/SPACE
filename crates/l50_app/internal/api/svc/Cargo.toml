@@ -19,11 +19,8 @@ default = []
 # Opt-in Kubernetes projected-token (TokenReview) auth, which pulls in the kube
 # stack. Off by default so the workspace builds without kube for non-k8s
 # deployments (dev box, UTM, self-deploy); prod image builds enable it. Forwards
-# to `common-svc`'s `k8s` feature.
-k8s = [
-    "pplx-space-common-svc/k8s",
-    "pplx-space-internal-api-server/kubernetes",
-]
+# to the server's `kubernetes` feature, which enables `rpc-auth`'s `k8s`.
+k8s = ["pplx-space-internal-api-server/kubernetes"]
 otel = [
     "pplx-space-common-svc/otel",
     "pplx-space-internal-api-server/otel",

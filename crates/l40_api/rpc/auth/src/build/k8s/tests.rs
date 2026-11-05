@@ -3,7 +3,7 @@ use super::super::{
     tenant_publication_requires_grant,
 };
 use super::*;
-use crate::auth::test_support::{
+use crate::test_support::{
     TokenReviewStatus, jwt_with_exp, pod_bound_service_account_status, service_account_status,
     token_review_service,
 };

@@ -1,8 +1,8 @@
 use super::*;
 use pplx_space_common_core::sql;
-use pplx_space_common_svc::auth::build::BuildAuthenticatedCaller;
 use pplx_space_internal_api_server::ClusterApiService;
 use pplx_space_node_api_client::proto::cluster_api_server::ClusterApiServer;
+use pplx_space_rpc_auth::build::BuildAuthenticatedCaller;
 use pplx_space_test_env::TestResult;
 use std::sync::{
     Arc,

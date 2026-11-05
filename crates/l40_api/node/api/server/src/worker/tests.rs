@@ -296,9 +296,9 @@ async fn the_internal_wake_forwards_a_runtime_upgrade_only_for_the_control_plane
     };
 
     let mut unprivileged = wake();
-    unprivileged.extensions_mut().insert(
-        pplx_space_common_svc::auth::NodeApiAuthenticatedCaller::unprivileged_workload_for_test(),
-    );
+    unprivileged
+        .extensions_mut()
+        .insert(pplx_space_rpc_auth::NodeApiAuthenticatedCaller::unprivileged_workload_for_test());
     let denied = WorkerApiInternal::wake_sandbox(&service, unprivileged)
         .await
         .unwrap_err();
@@ -326,9 +326,9 @@ async fn the_internal_runtime_upgrade_report_is_forwarded_only_for_the_control_p
     };
 
     let mut unprivileged = read();
-    unprivileged.extensions_mut().insert(
-        pplx_space_common_svc::auth::NodeApiAuthenticatedCaller::unprivileged_workload_for_test(),
-    );
+    unprivileged
+        .extensions_mut()
+        .insert(pplx_space_rpc_auth::NodeApiAuthenticatedCaller::unprivileged_workload_for_test());
     let denied = WorkerApiInternal::get_runtime_upgrade(&service, unprivileged)
         .await
         .unwrap_err();

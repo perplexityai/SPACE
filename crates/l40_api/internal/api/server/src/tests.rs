@@ -334,9 +334,9 @@ async fn sim_worker_node_api(node_id: NodeId) -> TestResult<SimWorkerHarness> {
 
 pub(super) fn publisher_request<T>(body: T) -> Request<T> {
     let mut request = Request::new(body);
-    request.extensions_mut().insert(
-        pplx_space_common_svc::auth::build::BuildAuthenticatedCaller::trusted_by_configuration(),
-    );
+    request
+        .extensions_mut()
+        .insert(pplx_space_rpc_auth::build::BuildAuthenticatedCaller::trusted_by_configuration());
     request
 }
 
@@ -344,9 +344,9 @@ pub(super) fn publisher_request<T>(body: T) -> Request<T> {
 /// guest-bridge caller's authorities.
 fn data_plane_request<T>(body: T) -> Request<T> {
     let mut request = Request::new(body);
-    request.extensions_mut().insert(
-        pplx_space_common_svc::auth::NodeApiAuthenticatedCaller::data_plane_edge_for_test(),
-    );
+    request
+        .extensions_mut()
+        .insert(pplx_space_rpc_auth::NodeApiAuthenticatedCaller::data_plane_edge_for_test());
     request
 }
 
@@ -2459,9 +2459,7 @@ async fn data_plane_route_resolve_without_attach_token_requires_the_edge_identit
         ("no authenticated caller", None),
         (
             "admitted workload without the edge authority",
-            Some(
-                pplx_space_common_svc::auth::NodeApiAuthenticatedCaller::unprivileged_workload_for_test(),
-            ),
+            Some(pplx_space_rpc_auth::NodeApiAuthenticatedCaller::unprivileged_workload_for_test()),
         ),
     ] {
         let mut request = Request::new(tokenless());
@@ -2910,9 +2908,9 @@ async fn data_plane_route_resolve_validates_token_and_scope() -> TestResult {
         required_scope: Some("terminal:connect".to_string()),
         requested_transport: None,
     });
-    request.extensions_mut().insert(
-        pplx_space_common_svc::auth::NodeApiAuthenticatedCaller::unprivileged_workload_for_test(),
-    );
+    request
+        .extensions_mut()
+        .insert(pplx_space_rpc_auth::NodeApiAuthenticatedCaller::unprivileged_workload_for_test());
     let route = fixture
         .service
         .resolve_data_plane_session_route(request)
@@ -3697,9 +3695,9 @@ pub(crate) fn request_from_node<T>(message: T, node_ip: std::net::IpAddr) -> Req
 /// authority every TokenReview identity carries.
 fn node_scoped_request<T>(message: T, node_ip: std::net::Ipv4Addr) -> Request<T> {
     let mut request = request_from_node(message, std::net::IpAddr::V4(node_ip));
-    request.extensions_mut().insert(
-        pplx_space_common_svc::auth::NodeApiAuthenticatedCaller::unprivileged_workload_for_test(),
-    );
+    request
+        .extensions_mut()
+        .insert(pplx_space_rpc_auth::NodeApiAuthenticatedCaller::unprivileged_workload_for_test());
     request
 }
 

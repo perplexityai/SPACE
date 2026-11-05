@@ -13,14 +13,14 @@ use std::time::Duration;
 use futures_util::{Stream, StreamExt};
 use pplx_space_common_core::types::SandboxId;
 use pplx_space_common_grpc::fwd_retry;
-use pplx_space_common_svc::auth::{
-    NetworkPolicyMutationAuthority, NodeApiAuthenticatedCaller, WaitReadyLifecycleAuthority,
-};
 use pplx_space_common_svc::space_api_route::{
     SpaceApiBridgeCallerPolicy, WaitReadyCallPurpose, set_space_api_bridge_caller_policy,
     space_api_route_capability_presence, take_wait_ready_call_purpose, wait_ready_call_purpose,
 };
 use pplx_space_node_mgr_client::{CacheDiskSchedulingEffect, NodeResourceStatusReader};
+use pplx_space_rpc_auth::{
+    NetworkPolicyMutationAuthority, NodeApiAuthenticatedCaller, WaitReadyLifecycleAuthority,
+};
 use pplx_space_sandbox_grpc::record_sandbox_id;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
@@ -1148,7 +1148,7 @@ impl WorkerApi for WorkerApiService {
         r: Request<pplx_space_template_mgr_client::proto::DeleteTemplateRequest>,
     ) -> Result<Response<pplx_space_template_mgr_client::proto::DeleteTemplateResponse>, Status>
     {
-        pplx_space_common_svc::auth::template::require_template_mutation_authority(&r)?;
+        pplx_space_rpc_auth::template::require_template_mutation_authority(&r)?;
         fwd!(self.clients.tmpl(), delete_template, r)
     }
 
@@ -1157,7 +1157,7 @@ impl WorkerApi for WorkerApiService {
         r: Request<pplx_space_template_mgr_client::proto::DeleteTemplateBuildRequest>,
     ) -> Result<Response<pplx_space_template_mgr_client::proto::DeleteTemplateBuildResponse>, Status>
     {
-        pplx_space_common_svc::auth::template::require_template_mutation_authority(&r)?;
+        pplx_space_rpc_auth::template::require_template_mutation_authority(&r)?;
         fwd!(self.clients.tmpl(), delete_template_build, r)
     }
 
@@ -1199,7 +1199,7 @@ impl WorkerApi for WorkerApiService {
         &self,
         mut r: Request<crate::proto::PullTemplateRequest>,
     ) -> Result<Response<crate::proto::PullTemplateResponse>, Status> {
-        pplx_space_common_svc::auth::template_transfer::require_template_transfer_authority(&r)?;
+        pplx_space_rpc_auth::template_transfer::require_template_transfer_authority(&r)?;
         let scope = crate::template_lookup::bind_caller_scope(&mut r)?;
         let req = r.into_inner();
         let resp = crate::transfer::pull_template(&mut self.clients.tmpl(), &req, scope).await?;
@@ -1214,7 +1214,7 @@ impl WorkerApi for WorkerApiService {
         r: Request<pplx_space_template_mgr_client::proto::ExportTemplateRequest>,
     ) -> Result<Response<Self::NodeExportTemplateStream>, Status> {
         let mut r = r;
-        pplx_space_common_svc::auth::template_transfer::prepare_template_export(&mut r)?;
+        pplx_space_rpc_auth::template_transfer::prepare_template_export(&mut r)?;
         Ok(self.clients.tmpl().export_template(r).await?)
     }
 

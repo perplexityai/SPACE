@@ -1,0 +1,64 @@
+[package]
+name = "pplx-space-rpc-auth"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = []
+# Kubernetes TokenReview verification for the node-api and build auth layers.
+k8s = ["dep:k8s-openapi", "dep:kube", "dep:pplx-space-kube-client"]
+# Exposes the shared authentication test helpers (`test_support`, with `k8s`,
+# and the `*_for_test` constructors) to other crates. This crate's unit tests
+# get them under `cfg(test)`; external test suites opt in through a
+# dev-dependency.
+test-support = ["dep:axum", "dep:jiff", "dep:tokio-util"]
+# Enables the test-only environment overrides (see `pplx_space_common_core::env::test_hook`).
+test-hooks = ["pplx-space-common-core/test-hooks"]
+
+[dependencies]
+axum = { workspace = true, optional = true }
+base64 = { workspace = true }
+bytes = { workspace = true }
+http = { workspace = true }
+http-body = { workspace = true }
+jiff = { workspace = true, optional = true }
+k8s-openapi = { workspace = true, features = ["v1_32"], optional = true }
+kube = { workspace = true, default-features = false, features = ["client", "config", "runtime", "rustls-tls"], optional = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+subtle = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["net", "sync", "time"] }
+tokio-util = { workspace = true, optional = true }
+tonic = { workspace = true }
+tower = { workspace = true, features = ["util"] }
+tracing = { workspace = true }
+
+# internal
+pplx-space-api-route = { workspace = true }
+pplx-space-bearer-token = { workspace = true }
+pplx-space-common-core = { workspace = true }
+pplx-space-kube-client = { workspace = true, optional = true }
+pplx-space-metrics = { workspace = true }
+pplx-space-uds-peer-auth = { workspace = true }
+
+[dev-dependencies]
+axum = { workspace = true }
+jiff = { workspace = true }
+# `test-util` enables `#[tokio::test(start_paused = true)]`.
+tokio = { workspace = true, features = ["macros", "rt", "test-util"] }
+tokio-stream = { workspace = true, features = ["net"] }
+tokio-util = { workspace = true }
+tonic-health = { workspace = true }
+tonic-prost = { workspace = true }
+tempfile = { workspace = true }
+uuid = { workspace = true, features = ["v7"] }
+pplx-space-common-core = { workspace = true, features = ["test-hooks"] }
+pplx-space-test-env = { workspace = true }

@@ -539,7 +539,7 @@ ad.datadoghq.com/tags: '{"team":"{{ .ctx.Values.node.datadogTeam }}"}'
 {{/*
 Lets the service's ServiceAccount create TokenReviews, which a listener that
 authenticates its callers' projected tokens issues for each one
-(crates/libs/common/svc/src/auth/k8s.rs, auth/build/k8s.rs). Nothing else.
+(crates/l40_api/rpc/auth/src/k8s.rs, build/k8s.rs). Nothing else.
 */}}
 {{- define "space-node-service.tokenReviewRbac" -}}
 apiVersion: rbac.authorization.k8s.io/v1

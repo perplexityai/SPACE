@@ -11,9 +11,9 @@ publish.workspace = true
 workspace = true
 
 [features]
-test-hooks = ["pplx-space-common-svc/test-hooks"]
+test-hooks = ["pplx-space-rpc-auth/test-hooks"]
 default = []
-k8s = ["pplx-space-common-svc/k8s"]
+k8s = ["pplx-space-rpc-auth/k8s"]
 aws-ecr = ["pplx-space-build-mgr/aws-ecr"]
 otel = [
     "pplx-space-build-mgr/otel",
@@ -49,6 +49,7 @@ pplx-space-build-mgr-client = { workspace = true }
 pplx-space-common-jobs = { workspace = true }
 pplx-space-common-svc = { workspace = true }
 pplx-space-metrics = { workspace = true }
+pplx-space-rpc-auth = { workspace = true }
 
 [dev-dependencies]
 rcgen = { workspace = true, features = ["aws_lc_rs", "pem"] }
@@ -57,7 +58,7 @@ sqlx = { workspace = true, features = ["macros", "migrate"] }
 pplx-space-build-mgr-client = { workspace = true, features = ["test-support"] }
 axum = { workspace = true }
 base64 = { workspace = true }
-pplx-space-common-svc = { workspace = true, features = ["test-support", "test-hooks", "k8s"] }
+pplx-space-rpc-auth = { workspace = true, features = ["k8s", "test-hooks", "test-support"] }
 pplx-space-test-env = { workspace = true }
 rstest = { workspace = true }
 tempfile = { workspace = true }

@@ -23,7 +23,7 @@ probeAddr: 127.0.0.1:9900
 serviceName: space-builder-build-manager
 # The ServiceAccounts build-manager admits, rendered as the env vars of the
 # same names (BuildTokenReviewer::from_env,
-# crates/libs/common/svc/src/auth/build/k8s.rs). Only the builder
+# crates/l40_api/rpc/auth/src/build/k8s.rs). Only the builder
 # node-api dials it (build_mgr_lazy,
 # crates/l40_api/node/api/server/src/clients.rs), and it
 # forwards tenant builds (with an org) and system builds alike, so it needs

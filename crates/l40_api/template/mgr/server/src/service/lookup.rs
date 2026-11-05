@@ -1,5 +1,5 @@
 use pplx_space_common_core::types::OrgId;
-use pplx_space_common_svc::template_lookup::TemplateLookupScope;
+use pplx_space_rpc_auth::template_lookup::TemplateLookupScope;
 
 use super::*;
 

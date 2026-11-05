@@ -1,5 +1,5 @@
-use pplx_space_common_svc::auth::{NodeApiAuthenticatedCaller, TemplateReleaseReadAuthority};
-use pplx_space_common_svc::template_lookup::TemplateLookupScope;
+use pplx_space_rpc_auth::template_lookup::TemplateLookupScope;
+use pplx_space_rpc_auth::{NodeApiAuthenticatedCaller, TemplateReleaseReadAuthority};
 use tonic::{Request, Status};
 
 pub(crate) fn bind_caller_scope<T>(
@@ -24,7 +24,7 @@ pub(crate) fn bind_caller_scope<T>(
 
 /// Record control-plane creation separately from a forwarded node request.
 pub(crate) fn bind_create_caller_scope<T>(request: &mut Request<T>) -> Result<(), Status> {
-    use pplx_space_common_svc::auth::NetworkPolicyMutationAuthority;
+    use pplx_space_rpc_auth::NetworkPolicyMutationAuthority;
     if request
         .extensions()
         .get::<NodeApiAuthenticatedCaller>()
