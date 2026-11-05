@@ -378,6 +378,7 @@ pub async fn start_build(
     state
         .template_controller
         .submit_template_build(TemplateBuildSubmission {
+            environment: None,
             target: TemplateBuildTarget::Organization(template_name),
             client_build_id: Some(build_id),
             recipe,

@@ -51,4 +51,5 @@ service BuilderApi {
 message BuildTemplateResponse {
   string job_id = 1;
   string builder_node_id = 2;
+  optional string environment = 3;
 }

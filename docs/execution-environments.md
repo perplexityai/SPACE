@@ -694,6 +694,32 @@ Disk metadata records its producer; it cannot override the saved selection, and
 conflicting guest or kernel inputs fail. Snapshot producer evidence stays in the
 snapshot manifest, independently of the sandbox's current consumer.
 
+### Admin system-template builds
+
+`POST /admin/api/v1/system-templates/{template}/builds` accepts an optional
+`environment` digest. Older API servers reject the new field because system
+build requests deny unknown fields. Clients omit it entirely when selecting
+the bundled recipe, retaining compatibility with those servers.
+`GET /admin/api/v1/system-template-environments` lists
+qualified runtime/kernel pairs and their immutable references; qualification does
+not imply installation or admission on a particular builder.
+
+After choosing an admitted pair from that catalog:
+
+```bash
+space-admin-cli template build seed --environment "$ENV_REF" --async
+```
+
+No `latest` tag moves unless `--publish-tag latest` is supplied. Selecting a pair
+makes its kernel authoritative instead of the bundled seed recipe's kernel pin.
+This builds seed independently of any other template. Promotion is a separate
+tag assignment and does not require another template to exist.
+
+The API forwards the fail-closed environment wire arm and requires an
+acknowledgement. If the gateway does not acknowledge selection, inspect the
+recorded job before retrying. Idempotency fingerprints include the pair, so a
+key cannot be reused for a different runtime/kernel selection.
+
 Unpinned scratch builds use the configured default, refusing when it is unusable.
 Derived builds and new node-local cold sandboxes prefer the bound source when
 allowed and usable. Only a revoked or unavailable source permits fallback to the

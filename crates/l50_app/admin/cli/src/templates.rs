@@ -37,6 +37,7 @@ impl AdminClient {
             TemplateCommands::Build {
                 template,
                 base,
+                environment,
                 publish_tags,
                 async_mode,
             } => {
@@ -51,10 +52,14 @@ impl AdminClient {
                     "{}{ADMIN_API_PREFIX}/system-templates/{template}/builds",
                     self.base_url
                 );
-                let request = self.http.post(url).json(&serde_json::json!({
-                    "base": base,
-                    "publish_tags": publish_tags,
-                }));
+                let mut payload = serde_json::Map::from_iter([
+                    ("base".to_string(), serde_json::json!(base)),
+                    ("publish_tags".to_string(), serde_json::json!(publish_tags)),
+                ]);
+                if let Some(environment) = environment {
+                    payload.insert("environment".to_string(), serde_json::json!(environment));
+                }
+                let request = self.http.post(url).json(&payload);
                 let body = self.template_request(request).await?;
                 let job: BuildJob =
                     serde_json::from_str(&body).map_err(|err| CliError::Decode(err.to_string()))?;

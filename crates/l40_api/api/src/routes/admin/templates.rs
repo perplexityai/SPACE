@@ -1594,6 +1594,7 @@ pub async fn start_template_build(
         request.force,
         publish_tags,
         request.client,
+        None,
     )
     .await
 }
@@ -1602,6 +1603,47 @@ pub async fn start_template_build(
 /// build's response, not an operation, so this path must never meet
 /// `PublicOperationStore::create_operation`.
 const SYSTEM_TEMPLATE_BUILD_PATH_TEMPLATE: &str = "/admin/v1/system-templates/{template}/builds";
+
+/// Qualification only: installation and execution policy are checked on the builder.
+pub async fn list_system_template_environments(
+    State(state): State<AppState>,
+    Extension(AuthUser(actor)): Extension<AuthUser>,
+) -> impl IntoResponse {
+    if let Err(error) = require_template_admin(&state.pool, &actor).await {
+        return error.into_response();
+    }
+    use pplx_space_common_core::types::Arch;
+    use pplx_space_execution_catalog::catalog::CompiledEnvironment;
+    let mut environments = Vec::new();
+    for architecture in [Arch::X86_64, Arch::Aarch64] {
+        let catalog = match CompiledEnvironment::cached_for_architecture(architecture) {
+            Ok(catalog) => catalog,
+            Err(error) => {
+                tracing::error!(%error, "failed to read qualified build environments");
+                return api_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Cannot read qualified runtime/kernel pairs",
+                )
+                .into_response();
+            }
+        };
+        for entry in catalog {
+            // System recipes currently implement direct Linux kernel boot only.
+            let Some(kernel) = entry.kernel() else {
+                continue;
+            };
+            environments.push(serde_json::json!({
+                "environment": entry.definition().reference(),
+                "name": entry.name(),
+                "architecture": architecture,
+                "runtime": entry.release().release.kind,
+                "runtime_version": entry.release().release.version,
+                "kernel_version": kernel.version,
+            }));
+        }
+    }
+    Json(serde_json::json!({ "environments": environments })).into_response()
+}
 
 pub async fn start_system_template_build(
     State(state): State<AppState>,
@@ -1646,6 +1688,7 @@ pub async fn start_system_template_build(
         base,
         force: request.force,
         publish_tags,
+        environment: request.environment,
     };
     let Some(key) = idempotency_key else {
         return match build.dispatch(&state).await {
@@ -1658,6 +1701,7 @@ pub async fn start_system_template_build(
         build.base.as_deref(),
         build.force,
         &build.publish_tags,
+        build.environment,
     ) {
         Ok(fingerprint) => fingerprint,
         Err(error) => return error.into_response(),
@@ -1686,6 +1730,7 @@ const _: () =
 
 /// A validated system template build request.
 struct SystemTemplateBuild {
+    environment: Option<pplx_space_common_core::types::EnvironmentReference>,
     managing_org_id: OrgId,
     template: SystemTemplate,
     base: Option<String>,
@@ -1836,7 +1881,7 @@ impl SystemTemplateBuild {
         reject_deleted_template_build(&state.pool, &template_name)
             .await
             .map_err(|error| not_accepted(error.into_response()))?;
-        let recipe = system_template_recipe(self.template, self.base.as_deref()).map_err(
+        let mut recipe = system_template_recipe(self.template, self.base.as_deref()).map_err(
             |error| {
                 tracing::error!(%error, template = %self.template, "invalid bundled system template recipe");
                 not_accepted(
@@ -1848,14 +1893,30 @@ impl SystemTemplateBuild {
                 )
             },
         )?;
+        if self.environment.is_some() {
+            // An explicit pair supplies the kernel, rather than the stock recipe's pin.
+            // The builder resolves and verifies that pair before any VM is created.
+            use build_proto::recipe::origin::{FromScratch, Kind};
+            if let Some(origin) = recipe.origin.as_mut()
+                && let Some(Kind::PinnedFromScratch(pinned)) = origin.kind.as_ref()
+            {
+                origin.kind = Some(Kind::FromScratch(FromScratch {
+                    source: pinned.source.clone(),
+                }));
+            }
+        }
         dispatch_admin_template_build(
             state,
-            self.managing_org_id,
-            TemplateBuildTarget::System(self.template),
-            recipe,
-            self.force,
-            self.publish_tags.clone(),
-            None,
+            TemplateBuildSubmission {
+                environment: self.environment,
+                org_id: self.managing_org_id,
+                target: TemplateBuildTarget::System(self.template),
+                client_build_id: None,
+                recipe,
+                force: self.force,
+                publish_tags: self.publish_tags.clone(),
+                client: admin_build_client(None),
+            },
         )
         .await
     }
@@ -1923,14 +1984,22 @@ fn system_template_build_fingerprint(
     base: Option<&str>,
     force: bool,
     publish_tags: &[String],
+    environment: Option<pplx_space_common_core::types::EnvironmentReference>,
 ) -> Result<RequestFingerprint, ApiErrorResponse> {
-    let bytes = serde_json::to_vec(&serde_json::json!({
-        "template": template.to_string(),
-        "base": base,
-        "force": force,
-        "publish_tags": publish_tags,
-    }))
-    .map_err(|error| {
+    let mut body = serde_json::Map::from_iter([
+        (
+            "template".to_string(),
+            serde_json::json!(template.to_string()),
+        ),
+        ("base".to_string(), serde_json::json!(base)),
+        ("force".to_string(), serde_json::json!(force)),
+        ("publish_tags".to_string(), serde_json::json!(publish_tags)),
+    ]);
+    // Preserve fingerprints for legacy requests whose keys predate selection.
+    if let Some(environment) = environment {
+        body.insert("environment".to_string(), serde_json::json!(environment));
+    }
+    let bytes = serde_json::to_vec(&body).map_err(|error| {
         tracing::error!(%error, "failed to serialize system template build fingerprint");
         api_error(StatusCode::INTERNAL_SERVER_ERROR, "Internal server error")
     })?;
@@ -2009,6 +2078,7 @@ async fn submit_admin_template_build(
     force: bool,
     publish_tags: Vec<String>,
     client: Option<TemplateBuildClientContext>,
+    environment: Option<pplx_space_common_core::types::EnvironmentReference>,
 ) -> axum::response::Response {
     let managing_org_id = match managing_org_id(
         &state.pool,
@@ -2021,12 +2091,16 @@ async fn submit_admin_template_build(
     };
     match dispatch_admin_template_build(
         &state,
-        managing_org_id,
-        target,
-        recipe,
-        force,
-        publish_tags,
-        client,
+        TemplateBuildSubmission {
+            environment,
+            org_id: managing_org_id,
+            target,
+            client_build_id: None,
+            recipe,
+            force,
+            publish_tags,
+            client: admin_build_client(client),
+        },
     )
     .await
     {
@@ -2035,37 +2109,28 @@ async fn submit_admin_template_build(
     }
 }
 
+fn admin_build_client(client: Option<TemplateBuildClientContext>) -> build_proto::ClientContext {
+    let client = client.unwrap_or_default();
+    build_proto::ClientContext {
+        source_path: client.source_path.unwrap_or_default(),
+        cli_version: client
+            .cli_version
+            .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string()),
+        hostname: client
+            .hostname
+            .or_else(|| std::env::var("HOSTNAME").ok())
+            .unwrap_or_default(),
+    }
+}
+
 async fn dispatch_admin_template_build(
     state: &AppState,
-    managing_org_id: OrgId,
-    target: TemplateBuildTarget,
-    recipe: build_proto::Recipe,
-    force: bool,
-    publish_tags: Vec<String>,
-    client: Option<TemplateBuildClientContext>,
+    submission: TemplateBuildSubmission,
 ) -> Result<TemplateBuildStartResponse, BuildDispatchFailure> {
-    let template_name = target.template_name();
-    let client = client.unwrap_or_default();
+    let template_name = submission.target.template_name();
     let response = state
         .template_controller
-        .submit_template_build(TemplateBuildSubmission {
-            target,
-            client_build_id: None,
-            recipe,
-            force,
-            publish_tags,
-            client: build_proto::ClientContext {
-                source_path: client.source_path.unwrap_or_default(),
-                cli_version: client
-                    .cli_version
-                    .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string()),
-                hostname: client
-                    .hostname
-                    .or_else(|| std::env::var("HOSTNAME").ok())
-                    .unwrap_or_default(),
-            },
-            org_id: managing_org_id,
-        })
+        .submit_template_build(submission)
         .await;
     match response {
         Ok(response) => Ok(TemplateBuildStartResponse {

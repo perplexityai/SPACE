@@ -6,8 +6,8 @@ use pplx_space_build_mgr_client::proto::{
     UploadBlobResponse,
 };
 use pplx_space_common_core::types::{
-    BuildRunId, NodeId, OrgId, SystemPublicationGrantId, SystemTemplate, TemplateName,
-    TemplateReference, TenantPublicationGrantId,
+    BuildRunId, EnvironmentReference, NodeId, OrgId, SystemPublicationGrantId, SystemTemplate,
+    TemplateName, TemplateReference, TenantPublicationGrantId,
 };
 use pplx_space_node_api_client::proto::BuildTemplateResponse;
 
@@ -110,6 +110,7 @@ impl TemplateBuildTarget {
 
 #[derive(Debug, Clone)]
 pub struct TemplateBuildSubmission {
+    pub environment: Option<EnvironmentReference>,
     pub target: TemplateBuildTarget,
     pub client_build_id: Option<String>,
     pub recipe: build_proto::Recipe,
@@ -171,15 +172,25 @@ impl TemplateBuildSubmission {
     }
 
     fn into_start_build_request(self, grant: Option<PublicationGrant>) -> StartBuildRequest {
+        let (recipe, environment) = match self.environment {
+            Some(reference) => (
+                None,
+                Some(build_proto::EnvironmentBuildInput {
+                    reference: reference.to_string(),
+                    recipe: Some(self.recipe),
+                }),
+            ),
+            None => (Some(self.recipe), None),
+        };
         StartBuildRequest {
-            environment: None,
+            environment,
             system_publication_grant_id: grant
                 .and_then(PublicationGrant::system)
                 .map(|grant| grant.to_string()),
             tenant_publication_grant_id: grant
                 .and_then(PublicationGrant::tenant)
                 .map(|grant| grant.to_string()),
-            recipe: Some(self.recipe),
+            recipe,
             template_id: self.target.template_name().to_string(),
             options: Some(BuildOptions {
                 force: self.force,
@@ -347,6 +358,7 @@ impl TemplateController {
         mut submission: TemplateBuildSubmission,
     ) -> Result<StartBuildResponse, TemplateBuildSubmitError> {
         let org_id = submission.org_id;
+        let environment = submission.environment;
         let template_name = submission.target.template_name();
         let (base_grant, publication_grant) = self
             .authorize_submission(&mut submission)
@@ -385,16 +397,28 @@ impl TemplateController {
             }
         };
         let job_id = response.job_id.parse::<BuildRunId>().ok();
-        self.record_template_build_response(
-            org_id,
-            template_name,
-            client_build_id.as_deref(),
-            response,
-            base_grant,
-            Some(publication_grant),
-        )
-        .await
-        .map_err(|error| TemplateBuildSubmitError::MaybeAccepted { error, job_id })
+        let recorded = self
+            .record_template_build_response(
+                org_id,
+                template_name,
+                client_build_id.as_deref(),
+                response,
+                base_grant,
+                Some(publication_grant),
+            )
+            .await
+            .map_err(|error| TemplateBuildSubmitError::MaybeAccepted { error, job_id })?;
+        if let Some(environment) = environment
+            && recorded.environment.as_deref() != Some(environment.to_string().as_str())
+        {
+            return Err(TemplateBuildSubmitError::MaybeAccepted {
+                error: ControllerError::internal(
+                    "builder did not acknowledge the requested runtime/kernel pair; inspect the recorded job before retrying",
+                ),
+                job_id,
+            });
+        }
+        Ok(recorded)
     }
 
     /// Everything a submission does before it is sent: the ownership check
@@ -563,7 +587,7 @@ impl TemplateController {
             })?;
 
         Ok(StartBuildResponse {
-            environment: None,
+            environment: response.environment,
             job_id: job_id.to_string(),
         })
     }

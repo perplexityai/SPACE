@@ -78,6 +78,7 @@ uuid = { workspace = true, features = ["v5", "v7", "serde"] }
 # The recipe adapter keeps system builds on the same TOML contract as the builder CLI.
 pplx-space-build-mgr = { workspace = true }
 pplx-space-build-mgr-client = { workspace = true }
+pplx-space-execution-catalog = { workspace = true }
 pplx-space-credmgr-client = { workspace = true }
 pplx-space-credential-injection-core = { workspace = true }
 pplx-space-credential-injection-store = { workspace = true }
