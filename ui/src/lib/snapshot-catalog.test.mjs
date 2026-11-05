@@ -35,42 +35,33 @@ test('each list says only what the node inventory shows', () => {
   }
 });
 
-// What On the node shows for a debug view read in `readGeneration`: its
-// rows, which Rollback is offered on, and what the empty lists say.
-const shown = (section, readGeneration, periodic) => {
-  const inventory = currentInventory(section, readGeneration, periodic.generation);
-  const targets = inventory ? rollbackTargets(inventory, 'running') : [];
-  const listing = nodeListing(inventory ? targets.length : null, periodic.periodic);
-  return { targets, node: nodeEmptyText(false, listing), catalog: catalogEmptyText(false, listing) };
-};
 const section = { snapshots: [], inventory: [row, { ...row, snapshot_id: 'f-manual-2' }] };
+const empty = { snapshots: [], inventory: [] };
 
 // The sandbox row (periodic state) and the debug view (inventory) are read
 // separately, so a debug read started before a periodic change may hold the
-// node's report from before it.
+// node's report from before it. Not known, it shows no rows to roll back to.
 test('a read from before a periodic change shows no rows and offers no Rollback', () => {
   const before = observePeriodic(null, false);
   const after = observePeriodic(before, true);
   assert.equal(after.generation, before.generation + 1);
-  for (const inventory of [section, { snapshots: [], inventory: [] }]) {
-    const stale = shown(inventory, before.generation, after);
-    assert.deepEqual(stale.targets, []);
-    assert.equal(stale.node, UNAVAILABLE);
-    assert.equal(stale.catalog, NONE);
-  }
+  assert.equal(currentInventory(section, before.generation, after.generation), null);
+  // An empty read from before the change is unknown, not empty.
+  assert.equal(currentInventory(empty, before.generation, after.generation), null);
   // Before any debug read has landed.
-  assert.deepEqual(shown(section, null, after).targets, []);
+  assert.equal(currentInventory(section, null, after.generation), null);
 });
 
 test('a read from the current generation shows its rows', () => {
   const before = observePeriodic(null, false);
   // First sight: nothing changed in this view, so the loaded read stands.
-  assert.equal(shown({ snapshots: [], inventory: [] }, before.generation, before).node, PERIODIC_OFF);
+  assert.deepEqual(currentInventory(empty, before.generation, before.generation), []);
   const after = observePeriodic(before, true);
-  const current = shown(section, after.generation, after);
-  assert.deepEqual(current.targets.map((target) => target.snapshotName).sort(), ['f-manual-1', 'f-manual-2']);
-  assert.equal(current.catalog, points('2 snapshots'));
-  assert.equal(shown({ snapshots: [], inventory: [] }, after.generation, after).node, REPORTS_NONE);
+  const rows = currentInventory(section, after.generation, after.generation);
+  assert.equal(rows, section.inventory);
+  assert.deepEqual(rollbackTargets(rows, 'running').map((target) => target.snapshotName).sort(), ['f-manual-1', 'f-manual-2']);
+  assert.deepEqual(nodeListing(rows.length, after.periodic), { state: 'listed', count: 2 });
+  assert.deepEqual(currentInventory(empty, after.generation, after.generation), []);
   // Not known for the reasons `nodeInventory` gives, whatever the generation.
   assert.equal(currentInventory({ snapshots: [] }, after.generation, after.generation), null);
   assert.equal(currentInventory(null, after.generation, after.generation), null);
