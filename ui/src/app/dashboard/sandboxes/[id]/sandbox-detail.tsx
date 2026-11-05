@@ -76,8 +76,8 @@ import { RollbackButton, RollbackRefusalNote, useSnapshotRollback, type Snapshot
 import { rollbackRoute, rollbackTargets, snapshotTimeMs, type RollbackTarget } from '@/lib/rollback-targets';
 import { formatAge, formatBytes, sectionData, sectionError, snapshotKey, snapshotStorageById, snapshotStorageLabel, type DebugSnapshot } from '@/lib/sandbox-debug';
 import {
-  CATALOG_NOTE, CATALOG_TITLE, NODE_NOTE, RECORDS_NOTE, catalogEmptyText, currentInventory, nodeEmptyText, nodeListing, seePeriodic,
-  type NodeListing, type PeriodicSeen,
+  CATALOG_NOTE, CATALOG_TITLE, NODE_NOTE, RECORDS_NOTE, catalogEmptyText, currentInventory, nodeEmptyText, nodeListing, observePeriodic,
+  type InventoryGeneration, type NodeListing,
 } from '@/lib/snapshot-catalog';
 import { OperationsCard, OrgLink, PlacementCard, QuarantineCard, ResourcesCard, TimelineCard, UserLink, type DebugView } from './sandbox-insight';
 import NetworkPolicyDesigner, {
@@ -520,7 +520,7 @@ function SnapshotsCard({
   orgId,
   sandboxStatus,
   periodicSnapshots,
-  periodicObservedAt,
+  inventoryGeneration,
   ownOrg,
   debugView,
   onRollbackSettled,
@@ -533,8 +533,9 @@ function SnapshotsCard({
   // Whether the node runs the sandbox with periodic snapshots on (its
   // observed `snapshots_enabled`), or null when the API does not say.
   periodicSnapshots: boolean | null;
-  // When the sandbox read that reported `periodicSnapshots` completed (ms).
-  periodicObservedAt: number;
+  // The inventory generation `periodicSnapshots` was observed in: a debug
+  // view read in an older one shows no node rows (`currentInventory`).
+  inventoryGeneration: number;
   // `isOwnOrg`: the operator's own organization lists through the public
   // routes; another lists through the admin list (see `listSnapshots`).
   ownOrg: boolean;
@@ -639,15 +640,11 @@ function SnapshotsCard({
   const route = rollbackRoute(ownOrg, adminList);
   const rollback = useSnapshotRollback({ sandboxId, orgId, via: route.via, onSettled: onRollbackSettled });
   // The node's list, which the empty catalog points at. An inventory the
-  // debug view does not carry is unknown, not empty, and so is one read
-  // before the periodic state shown changed: the two come from separate
-  // reads, and the next insight load reads the inventory again. Such a read
-  // shows no rows, so it offers no Rollback either. The periodic history is
-  // committed after each render, so a render React abandons leaves no trace.
-  const [periodicSeen, setPeriodicSeen] = useState<PeriodicSeen | null>(null);
-  const seen = seePeriodic(periodicSeen, periodicSnapshots, periodicObservedAt);
-  useEffect(() => setPeriodicSeen(seen), [seen]);
-  const inventory = currentInventory(sectionData(debug?.snapshots), debugView.requestedAt, seen);
+  // debug view does not carry is unknown, not empty, and so is one read in an
+  // older generation than the periodic state shown; the page reads it again
+  // as soon as that state changes. An unknown inventory shows no rows, so it
+  // offers no Rollback either.
+  const inventory = currentInventory(sectionData(debug?.snapshots), debugView.generation, inventoryGeneration);
   const targets = inventory ? rollbackTargets(inventory, sandboxStatus) : [];
   const listing = nodeListing(inventory ? targets.length : null, periodicSnapshots);
   const nodeSnapshots = (
@@ -1255,9 +1252,12 @@ export default function SandboxDetailPage({ dashboardUrl }: { dashboardUrl: stri
   const [editingNetwork, setEditingNetwork] = useState(false);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const [errorStatus, setErrorStatus] = useState<number | null>(null);
-  const [debugView, setDebugView] = useState<DebugView>({ debug: null, error: null, requestedAt: null });
-  // When the last sandbox read completed, which dates its periodic state.
-  const [sandboxReadAt, setSandboxReadAt] = useState(0);
+  const [debugView, setDebugView] = useState<DebugView>({ debug: null, error: null, generation: null });
+  // The periodic state last observed and the node inventory's generation,
+  // which each change of that state bumps. The ref is what a debug read starts
+  // in; the state is what renders.
+  const periodicRef = useRef<InventoryGeneration | null>(null);
+  const [periodic, setPeriodic] = useState<InventoryGeneration | null>(null);
   const debug = debugView.debug;
   const [operations, setOperations] = useState<AdminOperationRecord[]>([]);
   const [operationsMore, setOperationsMore] = useState(false);
@@ -1284,12 +1284,12 @@ export default function SandboxDetailPage({ dashboardUrl }: { dashboardUrl: stri
     const target = safeDecodeURIComponent(id);
     setNowMs(Date.now());
     setInsightGeneration((n) => n + 1);
-    const requestedAt = Date.now();
+    const generation = periodicRef.current?.generation ?? 0;
     await Promise.all([
       withDebug
         ? getSandboxDebug(target)
-            .then((loaded) => { if (current()) setDebugView({ debug: loaded, error: null, requestedAt }); })
-            .catch((err: any) => { if (current()) setDebugView({ debug: null, error: err.message || 'failed to load debug data', requestedAt }); })
+            .then((loaded) => { if (current()) setDebugView({ debug: loaded, error: null, generation }); })
+            .catch((err: any) => { if (current()) setDebugView({ debug: null, error: err.message || 'failed to load debug data', generation }); })
         : null,
       getSandboxOperations(target, { orgId: sandboxRef.current?.org_id ?? null })
         .then(({ operations: ops, more }) => {
@@ -1317,9 +1317,15 @@ export default function SandboxDetailPage({ dashboardUrl }: { dashboardUrl: stri
       // The insight reads that follow use the org before the next render.
       sandboxRef.current = loaded;
       setSandbox(loaded);
-      setSandboxReadAt(Date.now());
       setError(null);
       setErrorStatus(null);
+      // A change of the periodic state makes the node inventory unknown until
+      // a debug read started after it lands, so start one now.
+      const prev = periodicRef.current;
+      const next = observePeriodic(prev, loaded.snapshots_enabled ?? null);
+      periodicRef.current = next;
+      setPeriodic(next);
+      if (prev && next !== prev) void loadInsight(true);
       return true;
     } catch (err: any) {
       const status = typeof err?.status === 'number' ? err.status : null;
@@ -1648,8 +1654,8 @@ export default function SandboxDetailPage({ dashboardUrl }: { dashboardUrl: stri
             sandboxId={sandbox.id}
             orgId={sandbox.org_id ?? null}
             sandboxStatus={sandbox.status}
-            periodicSnapshots={sandbox.snapshots_enabled ?? null}
-            periodicObservedAt={sandboxReadAt}
+            periodicSnapshots={periodic?.periodic ?? null}
+            inventoryGeneration={periodic?.generation ?? 0}
             ownOrg={ownOrg}
             debugView={debugView}
             onRollbackSettled={() => { void Promise.all([refresh(false), loadInsight()]); }}

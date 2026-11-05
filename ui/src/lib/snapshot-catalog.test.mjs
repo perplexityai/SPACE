@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { rollbackTargets } from './rollback-targets.ts';
-import { catalogEmptyText, currentInventory, inventoryCurrent, nodeEmptyText, nodeInventory, nodeListing, seePeriodic } from './snapshot-catalog.ts';
+import { catalogEmptyText, currentInventory, nodeEmptyText, nodeInventory, nodeListing, observePeriodic } from './snapshot-catalog.ts';
 
 const UNAVAILABLE = "The node's report is unavailable, so what it reports keeping for this sandbox is unknown.";
 const PERIODIC_OFF = 'The node does not report its snapshots while periodic snapshots are off, so this list is empty whatever it keeps, checkpoints and earlier periodic snapshots included.';
@@ -35,70 +35,56 @@ test('each list says only what the node inventory shows', () => {
   }
 });
 
+// What On the node shows for a debug view read in `readGeneration`: its
+// rows, which Rollback is offered on, and what the empty lists say.
+const shown = (section, readGeneration, periodic) => {
+  const inventory = currentInventory(section, readGeneration, periodic.generation);
+  const targets = inventory ? rollbackTargets(inventory, 'running') : [];
+  const listing = nodeListing(inventory ? targets.length : null, periodic.periodic);
+  return { targets, node: nodeEmptyText(false, listing), catalog: catalogEmptyText(false, listing) };
+};
+const section = { snapshots: [], inventory: [row, { ...row, snapshot_id: 'f-manual-2' }] };
+
 // The sandbox row (periodic state) and the debug view (inventory) are read
-// separately: an inventory read requested before a periodic change was seen
-// is unknown until a read requested after it completes.
-test('an inventory read before a periodic change is not read against it', () => {
-  const shown = (requestedAt, seen, count, periodic) => nodeListing(inventoryCurrent(requestedAt, seen) ? count : null, periodic);
-  let seen = seePeriodic(null, false, 100);
+// separately, so a debug read started before a periodic change may hold the
+// node's report from before it.
+test('a read from before a periodic change shows no rows and offers no Rollback', () => {
+  const before = observePeriodic(null, false);
+  const after = observePeriodic(before, true);
+  assert.equal(after.generation, before.generation + 1);
+  for (const inventory of [section, { snapshots: [], inventory: [] }]) {
+    const stale = shown(inventory, before.generation, after);
+    assert.deepEqual(stale.targets, []);
+    assert.equal(stale.node, UNAVAILABLE);
+    assert.equal(stale.catalog, NONE);
+  }
+  // Before any debug read has landed.
+  assert.deepEqual(shown(section, null, after).targets, []);
+});
+
+test('a read from the current generation shows its rows', () => {
+  const before = observePeriodic(null, false);
   // First sight: nothing changed in this view, so the loaded read stands.
-  assert.equal(nodeEmptyText(false, shown(50, seen, 0, false)), PERIODIC_OFF);
-  // Periodic snapshots turn on, seen at 200; the empty read from 50, and one
-  // requested at 190 that completes later, are both older.
-  seen = seePeriodic(seen, true, 200);
-  for (const requestedAt of [50, 190, null]) {
-    const listing = shown(requestedAt, seen, 0, true);
-    assert.equal(nodeEmptyText(false, listing), UNAVAILABLE, `requested at ${requestedAt}`);
-    assert.equal(catalogEmptyText(false, listing), NONE);
-  }
-  // Rows from before the change point nowhere either.
-  assert.equal(catalogEmptyText(false, shown(50, seen, 2, true)), NONE);
-  // A read requested once the change was seen is the node's report.
-  assert.equal(nodeEmptyText(false, shown(200, seen, 0, true)), REPORTS_NONE);
-  assert.equal(catalogEmptyText(false, shown(210, seen, 1, true)), points('1 snapshot'));
-  // The same state seen again keeps the time of the change.
-  assert.equal(seePeriodic(seen, true, 300), seen);
-  // Turning them off again makes the read from 210 old.
-  seen = seePeriodic(seen, false, 400);
-  assert.equal(nodeEmptyText(false, shown(210, seen, 0, false)), UNAVAILABLE);
-  assert.equal(nodeEmptyText(false, shown(410, seen, 0, false)), PERIODIC_OFF);
+  assert.equal(shown({ snapshots: [], inventory: [] }, before.generation, before).node, PERIODIC_OFF);
+  const after = observePeriodic(before, true);
+  const current = shown(section, after.generation, after);
+  assert.deepEqual(current.targets.map((target) => target.snapshotName).sort(), ['f-manual-1', 'f-manual-2']);
+  assert.equal(current.catalog, points('2 snapshots'));
+  assert.equal(shown({ snapshots: [], inventory: [] }, after.generation, after).node, REPORTS_NONE);
+  // Not known for the reasons `nodeInventory` gives, whatever the generation.
+  assert.equal(currentInventory({ snapshots: [] }, after.generation, after.generation), null);
+  assert.equal(currentInventory(null, after.generation, after.generation), null);
 });
 
-// The rows On the node shows, and offers Rollback on, come from the same
-// check as what it says: a read older than the periodic change shows none.
-test('a read before a periodic change shows no rows to roll back to', () => {
-  const section = { snapshots: [], inventory: [row, { ...row, snapshot_id: 'f-manual-2' }] };
-  const seen = seePeriodic(seePeriodic(null, false, 100), true, 200);
-  for (const requestedAt of [50, 190, null]) {
-    assert.equal(currentInventory(section, requestedAt, seen), null, `requested at ${requestedAt}`);
-  }
-  const shown = currentInventory(section, 200, seen);
-  assert.equal(rollbackTargets(shown, 'running').length, 2);
-  assert.equal(nodeListing(shown.length, true).count, 2);
-  // Nothing changed in this view: the loaded read stands.
-  assert.equal(currentInventory(section, 50, seePeriodic(null, true, 100)), section.inventory);
-  // Not known for the reasons `nodeInventory` gives, whenever it was read.
-  assert.equal(currentInventory({ snapshots: [] }, 200, seen), null);
-  assert.equal(currentInventory(null, 200, seen), null);
-});
-
-// A render React abandons never commits the periodic state it saw, so a later
-// committed render reads the inventory against the history it committed.
-test('a periodic change seen only by an abandoned render does not age a read', () => {
-  const committed = seePeriodic(null, false, 100);
-  // A render sees periodic snapshots on at 200 and is abandoned; the next
-  // committed render still shows them off, from the read at 100.
-  const abandoned = seePeriodic(committed, true, 200);
-  const next = seePeriodic(committed, false, 100);
-  assert.equal(next, committed);
-  assert.equal(nodeEmptyText(false, nodeListing(currentInventory({ inventory: [] }, 50, next)?.length ?? null, false)), PERIODIC_OFF);
-  // Had the abandoned render's history been kept, that read would be aged by
-  // a change no committed render showed.
-  assert.equal(currentInventory({ inventory: [] }, 50, seePeriodic(abandoned, false, 100)), null);
-  // When the change commits, reads before it are old, as for any change.
-  const changed = seePeriodic(committed, true, 200);
-  for (const requestedAt of [50, 190]) assert.equal(currentInventory({ inventory: [row] }, requestedAt, changed), null);
-  assert.deepEqual(currentInventory({ inventory: [row] }, 200, changed), [row]);
+test('only a change of the periodic state bumps the generation', () => {
+  const first = observePeriodic(null, true);
+  assert.equal(first.generation, 0);
+  assert.equal(observePeriodic(first, true), first);
+  const off = observePeriodic(first, false);
+  const on = observePeriodic(off, true);
+  assert.equal(on.generation, 2);
+  // Not reported counts as a state of its own.
+  assert.equal(observePeriodic(on, null).generation, 3);
 });
 
 test('a failed read says so, and the sandbox list points nowhere', () => {

@@ -30,9 +30,9 @@ export const NODE_NOTE =
 // What the On the node list can say.
 export type NodeListing =
   // Not known: the node's inventory has not loaded, could not, is absent
-  // from the API's answer, or predates the periodic state shown
-  // (`inventoryCurrent`), or it is empty while the API does not say whether
-  // periodic snapshots are on.
+  // from the API's answer, or was read in an older generation than the
+  // periodic state shown (`currentInventory`), or it is empty while the API
+  // does not say whether periodic snapshots are on.
   | { state: 'unavailable' }
   // Empty because the node reports nothing while periodic snapshots are off.
   | { state: 'periodic-off' }
@@ -45,37 +45,30 @@ export function nodeInventory<T>(section: { inventory?: T[] | null } | null | un
   return section && Array.isArray(section.inventory) ? section.inventory : null;
 }
 
-// The sandbox's periodic state as the console last saw it, and when it saw
-// it change (`changedAt`, in ms; null until it has changed in this view).
-export interface PeriodicSeen {
-  value: boolean | null;
-  changedAt: number | null;
+// The periodic state the console last observed, and the inventory's
+// generation: bumped each time that state changes. The sandbox row (periodic
+// state) and the debug view (inventory) are separate reads, so each debug read
+// is tagged with the generation it started in.
+export interface InventoryGeneration {
+  periodic: boolean | null;
+  generation: number;
 }
 
-// `observedAt` is when the sandbox read that reports `value` completed.
-export function seePeriodic(prev: PeriodicSeen | null, value: boolean | null, observedAt: number): PeriodicSeen {
-  if (prev === null) return { value, changedAt: null };
-  if (prev.value === value) return prev;
-  return { value, changedAt: observedAt };
-}
-
-// Whether an inventory read requested at `requestedAt` can be read against
-// the periodic state `seen` holds: a read requested before the change was
-// seen may show the node's report from before it.
-export function inventoryCurrent(requestedAt: number | null, seen: PeriodicSeen): boolean {
-  return seen.changedAt === null || (requestedAt !== null && requestedAt >= seen.changedAt);
+export function observePeriodic(prev: InventoryGeneration | null, periodic: boolean | null): InventoryGeneration {
+  if (prev === null) return { periodic, generation: 0 };
+  return prev.periodic === periodic ? prev : { periodic, generation: prev.generation + 1 };
 }
 
 // The inventory rows On the node shows, and offers Rollback on, or null when
-// they are not known: the inventory is not (`nodeInventory`), or the read was
-// requested before the periodic state `seen` holds changed
-// (`inventoryCurrent`).
+// they are not known: the inventory is not (`nodeInventory`), or the read
+// started in an older generation than `generation`, so it may show the
+// node's report from before the periodic change.
 export function currentInventory<T>(
   section: { inventory?: T[] | null } | null | undefined,
-  requestedAt: number | null,
-  seen: PeriodicSeen,
+  readGeneration: number | null,
+  generation: number,
 ): T[] | null {
-  return inventoryCurrent(requestedAt, seen) ? nodeInventory(section) : null;
+  return readGeneration === generation ? nodeInventory(section) : null;
 }
 
 // `shown` is how many snapshots the On the node list shows, or null when the
