@@ -429,8 +429,9 @@ pub struct SandboxResponse {
     pub snapshots_enabled_desired: bool,
     pub snapshots_enabled: Option<bool>,
     pub pool_template: Option<String>,
-    /// The warm pool (`/warm-pools/{pool_id}`) whose slot a `pool_slot` row
-    /// is; null on every other row and on Direct, whose pools have no ID.
+    /// The warm pool whose slot a `pool_slot` row is: the `id` of its
+    /// `GET /warm-pools` entry. Null on every other row and on Direct, whose
+    /// pools have no ID.
     pub pool_id: Option<uuid::Uuid>,
     pub disk_usage_bytes: Option<u64>,
     pub failure_reason: Option<String>,

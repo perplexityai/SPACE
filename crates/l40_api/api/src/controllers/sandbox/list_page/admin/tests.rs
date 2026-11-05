@@ -584,12 +584,36 @@ async fn each_filter_returns_exactly_its_rows() -> TestDbResult<()> {
             &[2],
         ),
         (
-            "search for an ID start behind sbx_",
+            "search for an ID start of eight digits behind sbx_",
             AdminSandboxFilter {
-                search: search("sbx_1000"),
+                search: search("sbx_10000000"),
                 ..AdminSandboxFilter::default()
             },
             &[0, 1],
+        ),
+        (
+            "search for an ID start of seven digits, too few to span less than days",
+            AdminSandboxFilter {
+                search: search("sbx_1000000"),
+                ..AdminSandboxFilter::default()
+            },
+            &[],
+        ),
+        (
+            "search for an eight-digit ID start with dashes",
+            AdminSandboxFilter {
+                search: search("2ABC-0000"),
+                ..AdminSandboxFilter::default()
+            },
+            &[2],
+        ),
+        (
+            "search for a seven-digit ID start with dashes",
+            AdminSandboxFilter {
+                search: search("2ABC-000"),
+                ..AdminSandboxFilter::default()
+            },
+            &[],
         ),
         (
             "search is trimmed",
@@ -965,28 +989,16 @@ fn an_id_search_is_the_ranges_its_hex_digits_start_and_end() {
                 "0a1b2c3d-ffff-ffff-ffff-ffffffffffff",
             ),
         ),
+        ("9ABC", suffix("cba9", "cba:"), None),
+        ("SBX_00-0f", suffix("f000", "f001"), None),
+        ("e2e-1", suffix("1e2e", "1e2f"), None),
+        ("0a1b2c3", suffix("3c2b1a0", "3c2b1a1"), None),
         (
-            "9ABC",
-            suffix("cba9", "cba:"),
+            "SBX_0a1b-2c3d",
+            suffix("d3c2b1a0", "d3c2b1a1"),
             prefix(
-                "9abc0000-0000-0000-0000-000000000000",
-                "9abcffff-ffff-ffff-ffff-ffffffffffff",
-            ),
-        ),
-        (
-            "SBX_00-0f",
-            suffix("f000", "f001"),
-            prefix(
-                "000f0000-0000-0000-0000-000000000000",
-                "000fffff-ffff-ffff-ffff-ffffffffffff",
-            ),
-        ),
-        (
-            "e2e-1",
-            suffix("1e2e", "1e2f"),
-            prefix(
-                "e2e10000-0000-0000-0000-000000000000",
-                "e2e1ffff-ffff-ffff-ffff-ffffffffffff",
+                "0a1b2c3d-0000-0000-0000-000000000000",
+                "0a1b2c3d-ffff-ffff-ffff-ffffffffffff",
             ),
         ),
         (
@@ -1086,10 +1098,12 @@ async fn a_name_search_finds_names_continuing_with_the_greatest_character() -> T
     Ok(())
 }
 
-/// A search walked a page at a time with the cursor returns the unpaged
-/// search's rows, once each and in order, across rows sharing a `created_at`.
+/// A list walked a page at a time with the cursor returns its unpaged rows,
+/// once each and in order, with or without a search. At page sizes 1, 2 and
+/// 3 the rows that share a `created_at` fall on different pages, so a cursor
+/// that compared `created_at` alone would skip or repeat them.
 #[tokio::test]
-async fn a_search_walks_by_cursor_to_the_unpaged_search() -> TestDbResult<()> {
+async fn a_list_walks_by_cursor_to_its_unpaged_rows() -> TestDbResult<()> {
     let db = pg_test_db().await?;
     let owner = seed_owner(&db.pool).await?;
     let at = |minutes: i64| base_time() + Duration::minutes(minutes);
@@ -1098,9 +1112,10 @@ async fn a_search_walks_by_cursor_to_the_unpaged_search() -> TestDbResult<()> {
         (1, "other"),
         (1, "Walk-b"),
         (1, "WALK-c"),
-        (2, "walk-d"),
+        (1, "walk-d"),
+        (2, "walk-e"),
         (3, "elsewhere"),
-        (4, "walk-e"),
+        (4, "walk-f"),
     ] {
         seed_sandbox(
             &db.pool,
@@ -1113,23 +1128,40 @@ async fn a_search_walks_by_cursor_to_the_unpaged_search() -> TestDbResult<()> {
         )
         .await?;
     }
-    let filter = AdminSandboxFilter {
-        search: SandboxSearch::new("walk-").expect("valid"),
-        ..AdminSandboxFilter::default()
-    };
-    let unpaged = unpaged_ids(&db.pool, &filter).await?;
-    assert_eq!(unpaged.len(), 5);
-    let mut walked = Vec::new();
-    let mut after = None;
-    loop {
-        let page = page(&db.pool, &filter, after, 2).await?;
-        walked.extend(page.rows.iter().map(|sandbox| sandbox.id));
-        if !page.has_more {
-            break;
+    let filters = [
+        (
+            "search",
+            AdminSandboxFilter {
+                search: SandboxSearch::new("walk-").expect("valid"),
+                ..AdminSandboxFilter::default()
+            },
+        ),
+        (
+            "no search",
+            AdminSandboxFilter {
+                org_id: Some(owner.org_id),
+                ..AdminSandboxFilter::default()
+            },
+        ),
+    ];
+    for (label, filter) in filters {
+        let unpaged = unpaged_ids(&db.pool, &filter).await?;
+        let expected_rows = if label == "search" { 6 } else { 8 };
+        assert_eq!(unpaged.len(), expected_rows, "{label}");
+        for limit in [1, 2, 3] {
+            let mut walked = Vec::new();
+            let mut after = None;
+            loop {
+                let page = page(&db.pool, &filter, after, limit).await?;
+                walked.extend(page.rows.iter().map(|sandbox| sandbox.id));
+                if !page.has_more {
+                    break;
+                }
+                after = page.rows.last().map(cursor_after);
+            }
+            assert_eq!(walked, unpaged, "{label}, {limit} a page");
         }
-        after = page.rows.last().map(cursor_after);
     }
-    assert_eq!(walked, unpaged);
     db.pool.close().await;
     Ok(())
 }

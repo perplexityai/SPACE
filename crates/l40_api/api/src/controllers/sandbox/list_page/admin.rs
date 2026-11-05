@@ -175,15 +175,18 @@ impl SandboxPrefix {
 }
 
 /// What the console's search box finds: a sandbox row whose name starts with
-/// the text, ignoring case, or whose ID starts or ends with its hex digits.
-/// The ID's end is what the console labels a sandbox with, since a UUIDv7
-/// starts with its creation time.
+/// the text, ignoring case, or whose ID ends or starts with the text, when the
+/// text is an ID's hex digits. The ID's end is what the console labels a
+/// sandbox with, since a UUIDv7 starts with its creation time.
 ///
 /// The text is trimmed and must be at least [`MIN_SEARCH_CHARS`] characters:
 /// a shorter name prefix matches too many rows for the search to read and
-/// sort on every page. It is an ID prefix and suffix when, after an optional
-/// `sbx_` in either case and with dashes removed, it is 4 to 32 hex digits
-/// in either case. Both sides of the name match are lowercased by Postgres's
+/// sort on every page. The text's hex digits are those left after an
+/// optional `sbx_` in either case and its dashes, when nothing else is left.
+/// IDs that end with them match from [`MIN_ID_SUFFIX_DIGITS`] digits, which
+/// are random. IDs that start with them match from [`MIN_ID_PREFIX_DIGITS`]:
+/// a UUIDv7 starts with its creation time in milliseconds, so four digits
+/// span about 50 days of sandboxes and eight about a minute. Both sides of the name match are lowercased by Postgres's
 /// `lower()`, the one the index is built with, so the text is bound as
 /// given; the controller reads its index key back before it searches
 /// ([`name_key_range`]). The node-reported rows never match (see
@@ -195,7 +198,8 @@ pub struct SandboxSearch {
     /// (`idx_sandboxes_id_suffix`): at least the reversed suffix and below
     /// it with its last digit incremented.
     id_suffix: Option<(String, String)>,
-    /// The lowest and highest IDs that start with the text's hex digits.
+    /// The lowest and highest IDs that start with the text's hex digits,
+    /// when there are at least [`MIN_ID_PREFIX_DIGITS`] of them.
     id_prefix: Option<(SandboxId, SandboxId)>,
 }
 
@@ -218,18 +222,22 @@ impl SandboxSearch {
         Ok(Some(Self {
             text: text.to_string(),
             id_suffix: hex.as_deref().map(id_suffix_range),
-            id_prefix: hex.as_deref().and_then(hex_prefix_range),
+            id_prefix: hex
+                .as_deref()
+                .filter(|hex| hex.len() >= MIN_ID_PREFIX_DIGITS)
+                .and_then(hex_prefix_range),
         }))
     }
 }
 
 pub const MIN_SEARCH_CHARS: usize = 3;
-const MIN_ID_SEARCH_DIGITS: usize = 4;
+const MIN_ID_SUFFIX_DIGITS: usize = 4;
+const MIN_ID_PREFIX_DIGITS: usize = 8;
 /// The characters of a lowercased name `idx_sandboxes_name_lower` keeps.
 const NAME_KEY_CHARS: usize = 256;
 
 /// The text's hex digits, lowercased, when after an optional `sbx_` and
-/// without its dashes it is [`MIN_ID_SEARCH_DIGITS`] to 32 of them.
+/// without its dashes it is [`MIN_ID_SUFFIX_DIGITS`] to 32 of them.
 fn id_hex(text: &str) -> Option<String> {
     let marker = PUBLIC_SANDBOX_ID_PREFIX.len();
     let id = match (text.get(..marker), text.get(marker..)) {
@@ -241,7 +249,7 @@ fn id_hex(text: &str) -> Option<String> {
         .filter(|character| *character != '-')
         .map(|character| character.to_ascii_lowercase())
         .collect::<String>();
-    ((MIN_ID_SEARCH_DIGITS..=UNDASHED_UUID_LEN).contains(&hex.len())
+    ((MIN_ID_SUFFIX_DIGITS..=UNDASHED_UUID_LEN).contains(&hex.len())
         && hex.chars().all(|character| character.is_ascii_hexdigit()))
     .then_some(hex)
 }
@@ -399,7 +407,8 @@ static ADMIN_LIST_SQL: LazyLock<String> = LazyLock::new(|| {
 /// key ([`name_key_range`]). `starts_with` then checks the whole name, which
 /// the key may cut. The suffix arm reads `idx_sandboxes_id_suffix` in [$15,
 /// $16), the reversed suffix's range; the prefix arm reads the primary key
-/// in [$17, $18]. Both ID arms are NULL when $12 is not an ID's hex digits.
+/// in [$17, $18]. Each ID arm is NULL when $12 is not an ID's hex digits or
+/// too few of them for it (see [`SandboxSearch`]).
 static ADMIN_SEARCH_CANDIDATE_ROWS: LazyLock<String> = LazyLock::new(|| {
     let on_node = reported_on_node("s", "$10");
     let on_a_node = reported_on_a_node("s");
@@ -781,7 +790,7 @@ impl SandboxController {
                         s.id IS NOT NULL AS has_row,
                         s.id IS NULL
                             AND (sos.pool_template IS NOT NULL
-                                 OR sos.sandbox_id = ANY($3::UUID[])) AS pool_slot
+                                 OR sos.sandbox_id IN (SELECT unnest($3::UUID[]))) AS pool_slot
                  FROM sandboxes s
                  FULL JOIN sandbox_observed_states sos ON sos.sandbox_id = s.id
                  LEFT JOIN LATERAL (

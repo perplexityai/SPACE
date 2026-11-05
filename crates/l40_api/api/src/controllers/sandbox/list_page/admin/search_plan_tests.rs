@@ -9,8 +9,8 @@
 //!
 //! [`a_search_reads_only_the_rows_it_matches`] explains the page statement
 //! and the unpaged one for a name prefix in another case, at full length and
-//! at the three characters a search needs, an ID label and a text nothing
-//! matches, under both modes, and bounds the rows every plan
+//! at the three characters a search needs, an ID label, an eight-digit ID
+//! start of UUIDv7-shaped IDs spread over time, and a text nothing matches, under both modes, and bounds the rows every plan
 //! node handles by [`MAX_ROWS_HANDLED`]. The fixture is many times larger, so
 //! a plan that reads the table fails. To show that the bound is what the
 //! indexes buy, it then drops both and requires the generic plan of each
@@ -32,11 +32,20 @@ const SANDBOXES: i32 = 20_000;
 /// the page's full rows.
 const MAX_ROWS_HANDLED: f64 = 500.0;
 
+/// The first fixture sandbox's creation time, in Unix milliseconds, and the
+/// time between two sandboxes: a UUIDv7 starts with this, so an eight-digit
+/// ID start, which spans 65.5 s, matches six or seven of them.
+const FIRST_CREATED_MS: i64 = 1_790_000_000_000;
+const CREATED_EVERY_MS: i64 = 10_000;
+
 /// The fixture's sandboxes: [`SANDBOXES`] with names sharing one prefix, of
-/// which three are named `Needle-…` and one has a known ID.
+/// which three are named `Needle-…`, with UUIDv7-shaped IDs, and one more
+/// with a known ID.
 struct Fixture {
     /// The console's label for `labelled`: its ID's last eight hex digits.
     label: String,
+    /// The first eight hex digits of a fixture sandbox's ID.
+    id_start: String,
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -50,6 +59,7 @@ async fn a_search_reads_only_the_rows_it_matches() -> TestResult {
         ("a name prefix in another case", "nEEDLE".to_string()),
         ("the shortest name prefix, three letters", "NEE".to_string()),
         ("an ID label", fixture.label.clone()),
+        ("an eight-digit ID start", fixture.id_start.clone()),
         ("a text nothing matches", "no-such-sandbox".to_string()),
     ];
     let statements = [
@@ -156,7 +166,8 @@ async fn seed(pool: &PgPool) -> TestResult<Fixture> {
     sqlx::query(sql!(
         "INSERT INTO sandboxes
              (id, name, user_id, org_id, managed_by, lifecycle, network_policy_generation)
-         SELECT gen_random_uuid(),
+         SELECT (lpad(to_hex($4 + g * $5), 12, '0') || '7' || substr(md5(g::text), 1, 3)
+                 || '8' || substr(md5(g::text), 4, 15))::UUID,
                 CASE WHEN g <= 3 THEN 'Needle-' || g ELSE 'sandbox-' || g END,
                 $1, $2, 'k8s', 'started', 1
            FROM generate_series(1, $3) g"
@@ -164,13 +175,20 @@ async fn seed(pool: &PgPool) -> TestResult<Fixture> {
     .bind(owner.user_id)
     .bind(owner.org_id)
     .bind(SANDBOXES)
+    .bind(FIRST_CREATED_MS)
+    .bind(CREATED_EVERY_MS)
     .execute(pool)
     .await?;
     let labelled =
         super::tests::seed_sandbox(pool, owner, super::tests::SeedSandbox::default()).await?;
     sqlx::query(sql!("ANALYZE sandboxes")).execute(pool).await?;
     let compact = labelled.as_uuid().simple().to_string();
+    let middle = format!(
+        "{:012x}",
+        FIRST_CREATED_MS + i64::from(SANDBOXES / 2) * CREATED_EVERY_MS
+    );
     Ok(Fixture {
         label: compact.chars().skip(24).collect(),
+        id_start: middle.chars().take(8).collect(),
     })
 }
