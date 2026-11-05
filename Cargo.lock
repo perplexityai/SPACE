@@ -6805,6 +6805,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "pplx-space-node-runtime-manager-svc"
+version = "0.8.1"
+dependencies = [
+ "anyhow",
+ "clap",
+ "pplx-space-common-core",
+ "pplx-space-common-svc",
+ "pplx-space-node-runtime-core",
+ "pplx-space-node-runtime-manager",
+]
+
+[[package]]
 name = "pplx-space-node-runtime-supervisor"
 version = "0.8.1"
 dependencies = [
@@ -7015,18 +7027,6 @@ dependencies = [
  "time",
  "tokio",
  "uuid",
-]
-
-[[package]]
-name = "pplx-space-runtime-manager-svc"
-version = "0.8.1"
-dependencies = [
- "anyhow",
- "clap",
- "pplx-space-common-core",
- "pplx-space-common-svc",
- "pplx-space-node-runtime-core",
- "pplx-space-node-runtime-manager",
 ]
 
 [[package]]

@@ -460,9 +460,8 @@ pub enum SourceError {
 
 pub type ByteChunks = Pin<Box<dyn Stream<Item = Result<bytes::Bytes, SourceError>> + Send>>;
 
-/// Where kernels come from. The runtime manager ships an S3 source behind
-/// the `s3` feature; a deployment can supply its own through
-/// `KernelSourceConfig::Custom`. Calls that wait on the network must be
+/// Where kernels come from. The runtime manager ships an S3 source; a
+/// deployment can supply its own through `KernelSourceConfig::Custom`. Calls that wait on the network must be
 /// bounded by the source.
 #[async_trait::async_trait]
 pub trait KernelSource: Send + Sync {

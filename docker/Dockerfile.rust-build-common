@@ -113,7 +113,7 @@ RUN --mount=type=secret,id=aws_web_identity_token \
       case "${SPACE_RUST_ARTIFACT_SET}" in \
         worker) \
           run-cargo-with-sccache cargo chef cook --locked --release --recipe-path recipe.json \
-            --features "pplx-space-node-api-svc/otel,pplx-space-node-api-svc/datadog,pplx-space-node-api-svc/k8s,pplx-space-internal-api-svc/otel,pplx-space-internal-api-svc/datadog,pplx-space-internal-api-svc/k8s,pplx-space-node-ctl-svc/otel,pplx-space-node-ctl-svc/datadog,pplx-space-node-ctl-svc/kubernetes,pplx-space-node-mgr-svc/otel,pplx-space-node-mgr-svc/datadog,pplx-space-build-mgr-svc/otel,pplx-space-build-mgr-svc/datadog,pplx-space-build-mgr-svc/k8s,pplx-space-node-runtime-supervisor-svc/otel,pplx-space-node-runtime-supervisor-svc/datadog,pplx-space-runtime-manager-svc/otel,pplx-space-runtime-manager-svc/datadog,pplx-space-sbx-mgr-svc/otel,pplx-space-sbx-mgr-svc/datadog,pplx-space-spaced-host-svc/otel,pplx-space-spaced-host-svc/datadog,pplx-space-net-gateway-svc/otel,pplx-space-net-gateway-svc/datadog,pplx-space-template-mgr-svc/otel,pplx-space-template-mgr-svc/datadog,pplx-space-volmgr-svc/otel,pplx-space-volmgr-svc/datadog" \
+            --features "pplx-space-node-api-svc/otel,pplx-space-node-api-svc/datadog,pplx-space-node-api-svc/k8s,pplx-space-internal-api-svc/otel,pplx-space-internal-api-svc/datadog,pplx-space-internal-api-svc/k8s,pplx-space-node-ctl-svc/otel,pplx-space-node-ctl-svc/datadog,pplx-space-node-ctl-svc/kubernetes,pplx-space-node-mgr-svc/otel,pplx-space-node-mgr-svc/datadog,pplx-space-build-mgr-svc/otel,pplx-space-build-mgr-svc/datadog,pplx-space-build-mgr-svc/k8s,pplx-space-node-runtime-supervisor-svc/otel,pplx-space-node-runtime-supervisor-svc/datadog,pplx-space-node-runtime-manager-svc/otel,pplx-space-node-runtime-manager-svc/datadog,pplx-space-sbx-mgr-svc/otel,pplx-space-sbx-mgr-svc/datadog,pplx-space-spaced-host-svc/otel,pplx-space-spaced-host-svc/datadog,pplx-space-net-gateway-svc/otel,pplx-space-net-gateway-svc/datadog,pplx-space-template-mgr-svc/otel,pplx-space-template-mgr-svc/datadog,pplx-space-volmgr-svc/otel,pplx-space-volmgr-svc/datadog" \
             --bin space-buildmgr \
             --bin space-buildmgr-svc \
             --bin space-tmplmgr \
@@ -199,7 +199,7 @@ RUN --mount=type=secret,id=aws_web_identity_token \
       -F pplx-space-node-mgr-svc/otel,pplx-space-node-mgr-svc/datadog \
       -F pplx-space-build-mgr-svc/otel,pplx-space-build-mgr-svc/datadog \
       -F pplx-space-build-mgr-svc/k8s \
-      -F pplx-space-runtime-manager-svc/otel,pplx-space-runtime-manager-svc/datadog \
+      -F pplx-space-node-runtime-manager-svc/otel,pplx-space-node-runtime-manager-svc/datadog \
       -F pplx-space-sbx-mgr-svc/otel,pplx-space-sbx-mgr-svc/datadog \
       -F pplx-space-spaced-host-svc/otel,pplx-space-spaced-host-svc/datadog \
       -F pplx-space-net-gateway-svc/otel,pplx-space-net-gateway-svc/datadog \

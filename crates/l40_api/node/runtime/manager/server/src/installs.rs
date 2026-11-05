@@ -3,7 +3,7 @@
 //!
 //! - [`source`]: the published-kernel vocabulary (release lines, kernel
 //!   versions, MD5s) and the [`KernelSource`] trait.
-//! - `s3`: the S3 kernel source, behind the `s3` feature.
+//! - `s3`: the S3 kernel source.
 //! - [`release_source`]: the release vocabulary and the [`ReleaseSource`]
 //!   trait; `github`, Firecracker's GitHub releases, behind the `github`
 //!   feature.
@@ -26,7 +26,6 @@ mod operations;
 mod publisher;
 mod release;
 mod release_source;
-#[cfg(feature = "s3")]
 mod s3;
 pub(crate) mod source;
 mod staging;
@@ -53,7 +52,6 @@ pub use release_source::{
     ReleaseChunks, ReleasePayload, ReleaseSource, ReleaseSourceError, ReleaseUrl,
     ReleaseUrlParseError, VerifiableRelease,
 };
-#[cfg(feature = "s3")]
 pub(crate) use s3::S3KernelSource;
 pub(crate) use source::host_arch;
 pub use source::{

@@ -1,5 +1,5 @@
 [package]
-name = "pplx-space-runtime-manager-svc"
+name = "pplx-space-node-runtime-manager-svc"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -29,4 +29,4 @@ clap = { workspace = true, features = ["derive", "env"] }
 pplx-space-common-core = { workspace = true }
 pplx-space-common-svc = { workspace = true }
 pplx-space-node-runtime-core = { workspace = true }
-pplx-space-node-runtime-manager = { workspace = true, features = ["github", "s3"] }
+pplx-space-node-runtime-manager = { workspace = true, features = ["github"] }

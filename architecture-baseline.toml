@@ -85,9 +85,6 @@ pplx-space-internal-api-server = [
 pplx-space-node-runtime-manager = [
   "pplx-space-common-core/rusqlite",
 ]
-pplx-space-runtime-manager-svc = [
-  "pplx-space-node-runtime-manager/s3",
-]
 pplx-space-snapshot-retention = [
   "pplx-space-common-core/sqlx",
 ]
