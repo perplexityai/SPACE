@@ -14,10 +14,6 @@ use pplx_space_common_core::types::{
 };
 
 use pplx_space_common_core::sql;
-use pplx_space_sandbox_portability::{
-    SuspendedTargetNodeAssignment, clear_current_local_artifact_marker_assignments,
-    suspended_k8s_finalization_sql, write_current_local_artifact_marker_assignments,
-};
 
 /// **Operation step.** Claim the suspend of the execution at `generation`
 /// tracking `pod_uid`: flip the row from `previous` to `suspending` while
@@ -90,7 +86,7 @@ pub async fn record_committed_artifact(
 /// and unplaced, with `artifact_id` as its current local `suspend` artifact.
 ///
 /// One statement whose CTEs also write `sandbox_k8s_executions` and the port
-/// exposures (`suspended_k8s_finalization_sql`). It has no lifecycle
+/// exposures. It has no lifecycle
 /// predicate of its own and matches the row by id alone: it relies on the
 /// caller's sandbox and execution row locks and the re-checks it made under
 /// them in the same transaction.
@@ -100,37 +96,55 @@ pub async fn finalize_with_committed_artifact(
     artifact_id: LocalArtifactId,
     artifact_kind: ArtifactKind,
 ) -> Result<(), sqlx::Error> {
-    let marker_assignments = write_current_local_artifact_marker_assignments("$2", "$3", "$4");
-    let finalization = suspended_k8s_finalization_sql(
-        "s",
-        "candidate",
-        &marker_assignments,
-        SuspendedTargetNodeAssignment::Preserve,
-    );
-    let query = format!(
+    sqlx::query(sql!(
         "WITH candidate AS MATERIALIZED (
                  SELECT id
                    FROM sandboxes
                   WHERE id = $1
              ),
-             {retire_active_execution_cte},
-             {invalidate_open_port_exposures_cte}
+             retired_execution AS (\n\
+                 UPDATE sandbox_k8s_executions e\n\
+                    SET active = FALSE,\n\
+                        state = 'suspended',\n\
+                        pod_ip = NULL,\n\
+                        terminated_at = COALESCE(e.terminated_at, NOW()),\n\
+                        updated_at = NOW()\n\
+                   FROM candidate\n\
+                  WHERE e.sandbox_id = candidate.id\n\
+                    AND e.active\n\
+                  RETURNING e.sandbox_id\n\
+             ),
+             reset_port_exposures AS (\n\
+                 UPDATE sandbox_port_exposures spe\n\
+                    SET apply_state = 'pending',\n\
+                        last_applied_node_id = NULL,\n\
+                        last_error = NULL,\n\
+                        last_bridge_status = NULL,\n\
+                        last_applied_bridge_generation = NULL,\n\
+                        last_observed_at = NULL,\n\
+                        updated_at = NOW()\n\
+                   FROM candidate\n\
+                  WHERE spe.sandbox_id = candidate.id\n\
+                    AND spe.desired_state = 'open'\n\
+                  RETURNING spe.sandbox_id\n\
+             )
              UPDATE sandboxes s
-                SET {sandbox_assignments}
+                SET lifecycle = 'suspended',
+                    placement = 'unplaced',
+                    active_node_id = NULL,
+                    command_ready_pending = FALSE,
+                    current_local_artifact_id = $2,\n\
+                    current_local_artifact_kind = $3,\n\
+                    current_local_artifact_origin = $4
                FROM candidate
-              WHERE s.id = candidate.id",
-        retire_active_execution_cte = finalization.retire_active_execution_cte(),
-        invalidate_open_port_exposures_cte = finalization.invalidate_open_port_exposures_cte(),
-        sandbox_assignments = finalization.sandbox_assignments(),
-    );
-
-    sqlx::query(sqlx::AssertSqlSafe(sql!(query.as_str())))
-        .bind(sandbox_id)
-        .bind(artifact_id.as_uuid())
-        .bind(artifact_kind.as_str())
-        .bind(ArtifactOrigin::Suspend.as_str())
-        .execute(executor)
-        .await?;
+              WHERE s.id = candidate.id"
+    ))
+    .bind(sandbox_id)
+    .bind(artifact_id.as_uuid())
+    .bind(artifact_kind.as_str())
+    .bind(ArtifactOrigin::Suspend.as_str())
+    .execute(executor)
+    .await?;
     Ok(())
 }
 
@@ -147,16 +161,15 @@ pub async fn finalize_missing_pod_from_current_snapshot(
     sandbox_id: SandboxId,
     clear_marker: bool,
 ) -> Result<(), sqlx::Error> {
-    let marker_assignments = clear_current_local_artifact_marker_assignments("s", "$2");
-    let sandbox_assignments = suspended_k8s_finalization_sql(
-        "s",
-        "candidate",
-        &marker_assignments,
-        SuspendedTargetNodeAssignment::Preserve,
-    )
-    .sandbox_assignments();
-    let query = format!("UPDATE sandboxes s SET {sandbox_assignments} WHERE s.id = $1");
-    sqlx::query(sqlx::AssertSqlSafe(sql!(query.as_str())))
+    sqlx::query(sql!(
+        "UPDATE sandboxes s SET lifecycle = 'suspended',
+                    placement = 'unplaced',
+                    active_node_id = NULL,
+                    command_ready_pending = FALSE,
+                    current_local_artifact_id = CASE WHEN $2 THEN NULL ELSE s.current_local_artifact_id END,\n\
+                    current_local_artifact_kind = CASE WHEN $2 THEN NULL ELSE s.current_local_artifact_kind END,\n\
+                    current_local_artifact_origin = CASE WHEN $2 THEN NULL ELSE s.current_local_artifact_origin END WHERE s.id = $1"
+    ))
         .bind(sandbox_id)
         .bind(clear_marker)
         .execute(executor)

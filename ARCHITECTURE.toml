@@ -188,7 +188,7 @@ mode = "required"
 # `INSERT INTO`, `DELETE FROM`, `MERGE INTO` or `TRUNCATE` naming `sandboxes`,
 # in any case, schema-qualified or quoted, before any alias, including right
 # after a `\n`, `\r` or `\t` escape in a one-line string), and each call to
-# the sandbox-portability renderers that compose part of its SET list
+# a renderer of part of its SET list, by the names such renderers have used
 # (`sandbox_assignments()`, as a method or a path call, and the
 # `*_current_local_artifact_marker_assignments` functions, after punctuation,
 # a line start or `return`, `match`, `if`, `in`, `else` or `while`), so a file
@@ -201,7 +201,7 @@ mode = "required"
 # `postgres/sql/`; a head right after an escape other than `\n`, `\r` or
 # `\t` (`\0`, `\x0a`); a renderer called through an alias or a `use ... as`
 # rename, passed as a function value
-# (`.map(SuspendedK8sFinalizationSql::sandbox_assignments)`), or called
+# (`.map(Finalization::sandbox_assignments)`), or called
 # right after `break` or `yield`; database triggers; scripts and smoke
 # harnesses outside workspace members' `src/`.
 # False positives: the same text in a trailing `//` or `/* */` comment, in
@@ -223,9 +223,7 @@ mode = "required"
 # store is a new entry (`no_new_entries`); another write in a listed file is a
 # raised cap (`no_raised_caps`); splitting a listed file into modules needs
 # entries for the new files and a lower cap on the old one, since `--renames`
-# pairs only whole-file renames. Portability calls its private
-# `sandbox_assignments` helper bare; a path-qualified call to it there
-# (`Self::...`, `super::...`) matches and needs a reviewed entry.
+# pairs only whole-file renames.
 [rules.pattern_ratchet.sandbox_writes]
 patterns = [
   # A statement head on the row's table

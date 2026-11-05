@@ -439,8 +439,8 @@ pub fn sandbox_attached_anywhere(sandbox_alias: &str) -> String {
 ///   it lasts, and a lagged sandbox can then be restored elsewhere.
 ///
 ///   So the conjunct is not justified by "lag is same-node". It is justified
-///   by where the marker can go next.
-///   [`publish_clear_or_preserve_current_local_artifact_marker_assignments`]
+///   by where the marker can go next. The node-published suspended
+///   finalization (`pplx_space_sandbox_store::ingest::finalize_suspended`)
 ///   moves the marker only for a sandbox some node is publishing a non-NULL
 ///   artifact for. Reaching this delete means the node's *pending-backup
 ///   report* no longer names the sandbox, which is weaker than the node
@@ -1467,238 +1467,6 @@ pub fn failed_repair_revert_eligibility(sandbox_alias: &str) -> SuspendRevertEli
     suspend_revert_eligibility(sandbox_alias, marker_current, newest_current)
 }
 
-/// Returns the shared SET-list fragment for clearing or preserving the current
-/// local artifact marker while reverting a started sandbox back to suspended.
-///
-/// `clear_marker_expr` must evaluate to TRUE only when the current marker is
-/// stale and safe to clear; when it is FALSE, all marker columns are preserved.
-pub fn clear_current_local_artifact_marker_assignments(
-    sandbox_alias: &str,
-    clear_marker_expr: &str,
-) -> String {
-    format!(
-        "current_local_artifact_id = CASE WHEN {clear_marker_expr} THEN NULL ELSE {sandbox_alias}.current_local_artifact_id END,\n\
-         current_local_artifact_kind = CASE WHEN {clear_marker_expr} THEN NULL ELSE {sandbox_alias}.current_local_artifact_kind END,\n\
-         current_local_artifact_origin = CASE WHEN {clear_marker_expr} THEN NULL ELSE {sandbox_alias}.current_local_artifact_origin END"
-    )
-}
-
-pub fn write_current_local_artifact_marker_assignments(
-    artifact_id_expr: &str,
-    artifact_kind_expr: &str,
-    artifact_origin_expr: &str,
-) -> String {
-    format!(
-        "current_local_artifact_id = {artifact_id_expr},\n\
-         current_local_artifact_kind = {artifact_kind_expr},\n\
-         current_local_artifact_origin = {artifact_origin_expr}"
-    )
-}
-
-/// Returns the shared SET-list fragment for choosing between a newly
-/// published artifact marker, clearing a stale marker, and preserving the
-/// current marker.
-pub fn publish_clear_or_preserve_current_local_artifact_marker_assignments(
-    sandbox_alias: &str,
-    published_artifact_id_expr: &str,
-    published_artifact_kind_expr: &str,
-    published_artifact_origin_expr: &str,
-    clear_marker_expr: &str,
-) -> String {
-    format!(
-        "current_local_artifact_id = CASE
-             WHEN {published_artifact_id_expr} IS NOT NULL THEN {published_artifact_id_expr}
-             WHEN {clear_marker_expr} THEN NULL
-             ELSE {sandbox_alias}.current_local_artifact_id
-         END,
-         current_local_artifact_kind = CASE
-             WHEN {published_artifact_id_expr} IS NOT NULL THEN {published_artifact_kind_expr}
-             WHEN {clear_marker_expr} THEN NULL
-             ELSE {sandbox_alias}.current_local_artifact_kind
-         END,
-         current_local_artifact_origin = CASE
-             WHEN {published_artifact_id_expr} IS NOT NULL THEN {published_artifact_origin_expr}
-             WHEN {clear_marker_expr} THEN NULL
-             ELSE {sandbox_alias}.current_local_artifact_origin
-         END"
-    )
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum SuspendedTargetNodeAssignment {
-    Preserve,
-    PreserveOrBackfillActive,
-    Clear,
-}
-
-pub struct SuspendedK8sFinalizationSql {
-    sandbox_alias: String,
-    candidate_alias: String,
-    marker_assignments: String,
-    target_node_assignment: SuspendedTargetNodeAssignment,
-    lifecycle: SandboxLifecycle,
-}
-
-impl SuspendedK8sFinalizationSql {
-    pub fn active_execution_assignments(&self, execution_alias: &str) -> String {
-        active_execution_assignments(execution_alias, self.lifecycle)
-    }
-
-    pub fn open_port_exposure_assignments(&self) -> &'static str {
-        OPEN_PORT_EXPOSURE_ASSIGNMENTS
-    }
-
-    pub fn sandbox_assignments(&self) -> String {
-        sandbox_assignments(
-            &self.sandbox_alias,
-            &self.marker_assignments,
-            self.target_node_assignment,
-            self.lifecycle,
-        )
-    }
-
-    pub fn retire_active_execution_cte(&self) -> String {
-        let active_execution_assignments = self.active_execution_assignments("e");
-        let candidate_alias = &self.candidate_alias;
-        format!(
-            "retired_execution AS (\n\
-                 UPDATE sandbox_k8s_executions e\n\
-                    SET {active_execution_assignments}\n\
-                   FROM {candidate_alias}\n\
-                  WHERE e.sandbox_id = {candidate_alias}.id\n\
-                    AND e.active\n\
-                  RETURNING e.sandbox_id\n\
-             )"
-        )
-    }
-
-    pub fn invalidate_open_port_exposures_cte(&self) -> String {
-        let open_port_exposure_assignments = self.open_port_exposure_assignments();
-        let candidate_alias = &self.candidate_alias;
-        format!(
-            "reset_port_exposures AS (\n\
-                 UPDATE sandbox_port_exposures spe\n\
-                    SET {open_port_exposure_assignments}\n\
-                   FROM {candidate_alias}\n\
-                  WHERE spe.sandbox_id = {candidate_alias}.id\n\
-                    AND spe.desired_state = 'open'\n\
-                  RETURNING spe.sandbox_id\n\
-             )"
-        )
-    }
-}
-
-/// Returns shared SQL fragments for projecting a Kubernetes sandbox as
-/// suspended after a durable suspend handoff.
-///
-/// `marker_assignments` supplies the caller-specific current artifact marker
-/// policy: explicit suspend writes the just-published marker, while recovery
-/// paths may preserve or clear an existing marker.
-pub fn suspended_k8s_finalization_sql(
-    sandbox_alias: &str,
-    candidate_alias: &str,
-    marker_assignments: &str,
-    target_node_assignment: SuspendedTargetNodeAssignment,
-) -> SuspendedK8sFinalizationSql {
-    k8s_finalization_sql(
-        sandbox_alias,
-        candidate_alias,
-        marker_assignments,
-        target_node_assignment,
-        SandboxLifecycle::Suspended,
-    )
-}
-
-/// Like [`suspended_k8s_finalization_sql`] but lands the sandbox in
-/// `quarantined`, for finalizations that unplace a sandbox after authoritative
-/// pod absence with no recoverable artifact.
-pub fn quarantined_k8s_finalization_sql(
-    sandbox_alias: &str,
-    candidate_alias: &str,
-    marker_assignments: &str,
-    target_node_assignment: SuspendedTargetNodeAssignment,
-) -> SuspendedK8sFinalizationSql {
-    k8s_finalization_sql(
-        sandbox_alias,
-        candidate_alias,
-        marker_assignments,
-        target_node_assignment,
-        SandboxLifecycle::Quarantined,
-    )
-}
-
-/// Private renderer shared by the two public constructors. The lifecycle is
-/// deliberately not part of any public signature: only `suspended` and
-/// `quarantined` are valid unplaced-terminal states, so exposing the full
-/// `SandboxLifecycle` would let a caller render a contradictory row (e.g.
-/// `started` with `placement = 'unplaced'`). The constructors fix the two
-/// legal modes; the lifecycle string still comes from the shared
-/// `SandboxLifecycle::as_str()` (no parallel vocabulary).
-fn k8s_finalization_sql(
-    sandbox_alias: &str,
-    candidate_alias: &str,
-    marker_assignments: &str,
-    target_node_assignment: SuspendedTargetNodeAssignment,
-    lifecycle: SandboxLifecycle,
-) -> SuspendedK8sFinalizationSql {
-    SuspendedK8sFinalizationSql {
-        sandbox_alias: sandbox_alias.to_string(),
-        candidate_alias: candidate_alias.to_string(),
-        marker_assignments: marker_assignments.to_string(),
-        target_node_assignment,
-        lifecycle,
-    }
-}
-
-fn sandbox_assignments(
-    sandbox_alias: &str,
-    marker_assignments: &str,
-    target_node_assignment: SuspendedTargetNodeAssignment,
-    lifecycle: SandboxLifecycle,
-) -> String {
-    let target_node_assignment = match target_node_assignment {
-        SuspendedTargetNodeAssignment::Preserve => None,
-        SuspendedTargetNodeAssignment::PreserveOrBackfillActive => Some(format!(
-            "target_node_id = COALESCE({sandbox_alias}.target_node_id, {sandbox_alias}.active_node_id)"
-        )),
-        SuspendedTargetNodeAssignment::Clear => Some(
-            "target_node_id = NULL,\n                    placement_changed_at = NULL".to_string(),
-        ),
-    };
-    let mut sandbox_assignments = vec![
-        format!("lifecycle = '{}'", lifecycle.as_str()),
-        "placement = 'unplaced'".to_string(),
-        "active_node_id = NULL".to_string(),
-        "command_ready_pending = FALSE".to_string(),
-    ];
-    if let Some(target_node_assignment) = target_node_assignment {
-        sandbox_assignments.push(target_node_assignment);
-    }
-    if !marker_assignments.is_empty() {
-        sandbox_assignments.push(marker_assignments.to_string());
-    }
-    sandbox_assignments.join(",\n                    ")
-}
-
-fn active_execution_assignments(execution_alias: &str, lifecycle: SandboxLifecycle) -> String {
-    format!(
-        "active = FALSE,\n\
-                        state = '{}',\n\
-                        pod_ip = NULL,\n\
-                        terminated_at = COALESCE({execution_alias}.terminated_at, NOW()),\n\
-                        updated_at = NOW()",
-        lifecycle.as_str()
-    )
-}
-
-const OPEN_PORT_EXPOSURE_ASSIGNMENTS: &str = "apply_state = 'pending',\n\
-                        last_applied_node_id = NULL,\n\
-                        last_error = NULL,\n\
-                        last_bridge_status = NULL,\n\
-                        last_applied_bridge_generation = NULL,\n\
-                        last_observed_at = NULL,\n\
-                        updated_at = NOW()";
-
 /// Returns a SQL fragment evaluating to TRUE iff the snapshot the markerless
 /// restore selector would actually load is a ready, durable full `suspend`
 /// snapshot that provably loses no writes.
@@ -2046,10 +1814,10 @@ fn inflight_snapshot_matches_current_suspend(sandbox_alias: &str) -> String {
 /// the artifact the node published, but only through
 /// [`node_published_suspend_evidence`], which requires the published origin to
 /// be `'suspend'` and its kind `'full'`, so it cannot carry a `'stop'` marker
-/// either. It also finalizes through [`suspended_k8s_finalization_sql`], which
-/// nulls `active_node_id` in the same statement, while this arm only reaches
-/// rows whose `active_node_id` names the publishing node. So no current writer
-/// produces a row this term spares. The schema has admitted a `'stop'` origin
+/// either. Its statement (`pplx_space_sandbox_store::ingest::finalize_suspended`)
+/// also nulls `active_node_id`, while this arm only reaches rows whose
+/// `active_node_id` names the publishing node. So no current writer produces
+/// a row this term spares. The schema has admitted a `'stop'` origin
 /// since the marker columns were added, so a row an earlier writer left
 /// pinned that way would be spared only if its pinned artifact is durable,
 /// which is the outcome this term exists for.
