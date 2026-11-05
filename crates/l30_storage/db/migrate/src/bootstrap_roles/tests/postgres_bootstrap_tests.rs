@@ -63,7 +63,7 @@ async fn role_settings(fixture: &PostgresFixture, role: &str) -> TestResult<Vec<
     .await?)
 }
 
-async fn run_bootstrap(fixture: &PostgresFixture) -> TestResult {
+pub(super) async fn run_bootstrap(fixture: &PostgresFixture) -> TestResult {
     let mut conn = fixture.connect_as("postgres").await?;
     bootstrap(&mut conn, &test_passwords(), &TEST_TIMEOUTS).await?;
     Ok(())

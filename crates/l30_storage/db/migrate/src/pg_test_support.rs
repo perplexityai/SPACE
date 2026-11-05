@@ -4,34 +4,113 @@
 //! reachable it fails the test, or returns `Ok(None)` for the test to skip
 //! when the run opted out, by the same rule as the shared fixtures
 //! (`pplx_space_db_test_fixtures::report_unavailable_dependency`).
+//!
+//! [`bare_postgres_server`] instead returns the bare server nextest's
+//! `bare-postgres` setup script starts for the run, when it published one. A
+//! published server that cannot be reached fails the test rather than
+//! skipping it: the run asked for that server.
 
-use sqlx::postgres::PgPoolOptions;
+use std::str::FromStr as _;
+use std::sync::Arc;
+
+use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::{Connection as _, PgConnection, PgPool};
 use testcontainers::{ContainerAsync, ImageExt, core::Mount, runners::AsyncRunner};
 use testcontainers_modules::postgres::Postgres as PostgresImage;
 
 pub(crate) use pplx_space_test_env::TestResult;
 
+/// The bare server `ci/scripts/setup-nextest-postgres.sh --bare` starts for a
+/// nextest run: nothing applied, and no other suite's tests on it.
+const BARE_POSTGRES_ADMIN_URL_ENV: &str = "SPACE_TEST_BARE_POSTGRES_ADMIN_URL";
+
 pub(crate) struct PostgresFixture {
     pub(crate) pool: PgPool,
-    host: String,
-    port: u16,
-    _container: ContainerAsync<PostgresImage>,
+    /// `host:port`.
+    server: String,
+    database: String,
+    _container: Option<Arc<ContainerAsync<PostgresImage>>>,
 }
 
 impl PostgresFixture {
-    /// Connection URL for `user`. The fixture container trusts all host
+    /// Connection URL for `user`. The fixture's server trusts all host
     /// connections, so any LOGIN role connects without a password.
     pub(crate) fn database_url(&self, user: &str) -> String {
         format!(
-            "postgres://{user}@{}:{}/postgres?sslmode=disable",
-            self.host, self.port
+            "postgres://{user}@{}/{}?sslmode=disable",
+            self.server, self.database
         )
     }
 
     pub(crate) async fn connect_as(&self, user: &str) -> TestResult<PgConnection> {
         Ok(PgConnection::connect(&self.database_url(user)).await?)
     }
+}
+
+/// A server to create databases on, and the container running it when this
+/// test started one.
+pub(crate) struct PostgresServer {
+    /// `host:port`.
+    server: String,
+    _container: Option<Arc<ContainerAsync<PostgresImage>>>,
+}
+
+impl PostgresServer {
+    /// A superuser connection to the server's `postgres` database.
+    pub(crate) async fn connect_admin(&self) -> TestResult<PgConnection> {
+        Ok(PgConnection::connect(&self.database_url("postgres")).await?)
+    }
+
+    /// A fixture on this server's `database`, which keeps the container
+    /// running.
+    pub(crate) async fn database(&self, database: &str) -> TestResult<PostgresFixture> {
+        let pool = PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&self.database_url(database))
+            .await?;
+        Ok(PostgresFixture {
+            pool,
+            server: self.server.clone(),
+            database: database.to_owned(),
+            _container: self._container.clone(),
+        })
+    }
+
+    fn database_url(&self, database: &str) -> String {
+        format!(
+            "postgres://postgres@{}/{database}?sslmode=disable",
+            self.server
+        )
+    }
+}
+
+/// The run's bare server when nextest's setup script published one, else a
+/// container of this test's own. Cluster-global state such as roles is shared
+/// with every other test given the bare server.
+pub(crate) async fn bare_postgres_server() -> TestResult<Option<PostgresServer>> {
+    let admin_url = match std::env::var(BARE_POSTGRES_ADMIN_URL_ENV) {
+        Ok(admin_url) => admin_url,
+        Err(std::env::VarError::NotPresent) => {
+            let Some(fixture) = postgres_fixture().await? else {
+                return Ok(None);
+            };
+            fixture.pool.close().await;
+            return Ok(Some(PostgresServer {
+                server: fixture.server,
+                _container: fixture._container,
+            }));
+        }
+        Err(std::env::VarError::NotUnicode(value)) => {
+            return Err(
+                format!("{BARE_POSTGRES_ADMIN_URL_ENV}={value:?} is not valid UTF-8").into(),
+            );
+        }
+    };
+    let options = PgConnectOptions::from_str(&admin_url)?;
+    Ok(Some(PostgresServer {
+        server: format!("{}:{}", options.get_host(), options.get_port()),
+        _container: None,
+    }))
 }
 
 pub(crate) async fn postgres_fixture() -> TestResult<Option<PostgresFixture>> {
@@ -83,8 +162,8 @@ pub(crate) async fn postgres_fixture() -> TestResult<Option<PostgresFixture>> {
     };
     Ok(Some(PostgresFixture {
         pool,
-        host,
-        port,
-        _container: container,
+        server: format!("{host}:{port}"),
+        database: "postgres".to_owned(),
+        _container: Some(Arc::new(container)),
     }))
 }

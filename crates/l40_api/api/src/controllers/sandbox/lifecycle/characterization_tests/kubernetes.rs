@@ -109,15 +109,19 @@ async fn install_lifecycle_write_on_route_publication(pool: &PgPool) -> TestResu
     ))
     .execute(pool)
     .await?;
-    sqlx::query(sql!(
+    // A row trigger needs the table, which a schema variant may have renamed
+    // out from under a compatibility view.
+    let create_trigger = format!(
         "CREATE TRIGGER test_lifecycle_on_route_publication
-         AFTER UPDATE OF route_activation_id ON sandbox_k8s_executions
+         AFTER UPDATE OF route_activation_id ON {}
          FOR EACH ROW
          WHEN (OLD.route_activation_id IS NULL AND NEW.route_activation_id IS NOT NULL)
-         EXECUTE FUNCTION test_lifecycle_on_route_publication()"
-    ))
-    .execute(pool)
-    .await?;
+         EXECUTE FUNCTION test_lifecycle_on_route_publication()",
+        pplx_space_db_test_fixtures::physical_table("sandbox_k8s_executions")?
+    );
+    sqlx::query(sqlx::AssertSqlSafe(sql!(create_trigger.as_str())))
+        .execute(pool)
+        .await?;
     Ok(())
 }
 
