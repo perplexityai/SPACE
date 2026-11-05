@@ -12,7 +12,7 @@ use pplx_space_common_core::types::{
     SandboxQuarantineSource, SandboxTransitionReceiptKind, SandboxTransitionTargetState,
     SnapshotId,
 };
-use pplx_space_metrics::sandbox::publication::{
+use pplx_space_sandbox_metrics::publication::{
     StatePublicationComponent, StatePublicationDisposition, StatePublicationField,
 };
 use pplx_space_sandbox_portability::{
@@ -104,7 +104,7 @@ fn reject_quarantine_recovery_plan(
     cause: QuarantineRecoveryPlanRejectionCause,
     message: String,
 ) -> Status {
-    pplx_space_metrics::internal_api::quarantine_recovery_plan_rejected(cause);
+    crate::metrics::internal_api::quarantine_recovery_plan_rejected(cause);
     tracing::info!(
         %sandbox_id,
         %node_id,
@@ -447,7 +447,7 @@ fn skip_non_canonical_stored_lifecycle(
     sandbox_id: SandboxId,
     disposition: StatePublicationDisposition,
 ) {
-    pplx_space_metrics::sandbox::publication::degraded(
+    pplx_space_sandbox_metrics::publication::degraded(
         StatePublicationComponent::Api,
         StatePublicationField::StoredLifecycle,
         disposition,

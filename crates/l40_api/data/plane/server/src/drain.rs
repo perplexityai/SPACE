@@ -177,7 +177,7 @@ pub(super) const SHUTDOWN_CLOSE_REASON: &str = "data plane is shutting down; re-
 /// 503 rather than a 429: the refusal says nothing about the caller's load,
 /// and the retry lands on a replica that is not leaving.
 pub(super) fn native_draining_response(kind: &'static str) -> Response {
-    pplx_space_metrics::data_plane::attach(kind, "draining");
+    crate::metrics::attach(kind, "draining");
     native_draining_error()
 }
 

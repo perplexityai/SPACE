@@ -184,7 +184,7 @@ pub(super) async fn fork_sandbox(
                 let client_id = request_client_id(&headers);
                 let client_slot = acquire_client_slot(
                     &state,
-                    pplx_space_metrics::sandbox::api::client_limit::Operation::Fork,
+                    crate::metrics::sandbox::api::client_limit::Operation::Fork,
                     client_id.as_deref(),
                     Some(wait_timeout),
                 )

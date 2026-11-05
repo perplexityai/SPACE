@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use super::*;
 use pplx_space_common_core::env::valid_positive_f64;
-use pplx_space_metrics::sandbox::admission::{
+use pplx_space_sandbox_metrics::admission::{
     AdmissionDecision, AdmissionOperationClass, AdmissionPermitOutcome, AdmissionQueueOutcome,
     AdmissionRejectReason,
 };
@@ -409,7 +409,7 @@ impl AdmissionQueueMetricGuard {
 
 impl Drop for AdmissionQueueMetricGuard {
     fn drop(&mut self) {
-        pplx_space_metrics::sandbox::admission::node_queue_wait(
+        pplx_space_sandbox_metrics::admission::node_queue_wait(
             self.kind.metric_class(),
             self.outcome,
             self.reason,
@@ -431,8 +431,8 @@ impl ActivationAdmissionLimiter {
 
     pub(super) fn with_config(config: ActivationAdmissionConfig) -> Self {
         let config = sanitize_config(config);
-        pplx_space_metrics::sandbox::admission::node_refill_rps(config.refill_rps);
-        pplx_space_metrics::sandbox::admission::node_max_concurrent(
+        pplx_space_sandbox_metrics::admission::node_refill_rps(config.refill_rps);
+        pplx_space_sandbox_metrics::admission::node_max_concurrent(
             config.max_concurrent_activations,
         );
         Self {
@@ -474,8 +474,8 @@ impl ActivationAdmissionLimiter {
         sandbox_id: &str,
         wait_timeout: Duration,
     ) -> Result<ActivationAdmissionPermit, Status> {
-        pplx_space_metrics::sandbox::admission::node_refill_rps(self.config.refill_rps);
-        pplx_space_metrics::sandbox::admission::node_max_concurrent(
+        pplx_space_sandbox_metrics::admission::node_refill_rps(self.config.refill_rps);
+        pplx_space_sandbox_metrics::admission::node_max_concurrent(
             self.config.max_concurrent_activations,
         );
         let queued_at = Instant::now();
@@ -588,13 +588,13 @@ impl ActivationAdmissionLimiter {
             .counter(kind)
             .fetch_add(1, Ordering::SeqCst)
             + 1;
-        pplx_space_metrics::sandbox::admission::node_decision(
+        pplx_space_sandbox_metrics::admission::node_decision(
             metric_class,
             AdmissionDecision::Accepted,
             AdmissionRejectReason::None,
         );
-        pplx_space_metrics::sandbox::admission::node_in_flight(in_flight);
-        pplx_space_metrics::sandbox::admission::node_operation_in_flight(
+        pplx_space_sandbox_metrics::admission::node_in_flight(in_flight);
+        pplx_space_sandbox_metrics::admission::node_operation_in_flight(
             metric_class,
             operation_in_flight,
         );
@@ -611,13 +611,13 @@ impl ActivationAdmissionLimiter {
     }
 
     fn emit_rejection(&self, kind: LimitedActivationKind, reason: AdmissionRejectReason) {
-        pplx_space_metrics::sandbox::admission::node_refill_rps(self.config.refill_rps);
-        pplx_space_metrics::sandbox::admission::node_decision(
+        pplx_space_sandbox_metrics::admission::node_refill_rps(self.config.refill_rps);
+        pplx_space_sandbox_metrics::admission::node_decision(
             kind.metric_class(),
             AdmissionDecision::Rejected,
             reason,
         );
-        pplx_space_metrics::sandbox::admission::node_in_flight(self.in_flight());
+        pplx_space_sandbox_metrics::admission::node_in_flight(self.in_flight());
     }
 
     fn consume_token(&self) -> Result<(), Duration> {
@@ -691,12 +691,12 @@ impl Drop for LimitedActivationPermit {
             .counter(self.kind)
             .fetch_sub(1, Ordering::SeqCst)
             .saturating_sub(1);
-        pplx_space_metrics::sandbox::admission::node_in_flight(in_flight);
-        pplx_space_metrics::sandbox::admission::node_operation_in_flight(
+        pplx_space_sandbox_metrics::admission::node_in_flight(in_flight);
+        pplx_space_sandbox_metrics::admission::node_operation_in_flight(
             self.kind.metric_class(),
             operation_in_flight,
         );
-        pplx_space_metrics::sandbox::admission::node_permit_hold(
+        pplx_space_sandbox_metrics::admission::node_permit_hold(
             self.kind.metric_class(),
             self.outcome,
             elapsed_ms(self.started_at),

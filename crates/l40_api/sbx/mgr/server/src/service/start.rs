@@ -65,7 +65,6 @@ use pplx_space_events::{
     SandboxEventDetails, SandboxEventSource, SandboxEventTrigger, SandboxEventType,
     emit_sandbox_event,
 };
-use pplx_space_metrics::sandbox::admission::AdmissionPermitOutcome;
 use pplx_space_node_mgr_client::{
     NodeManagerGrpcClient,
     proto::{
@@ -73,6 +72,7 @@ use pplx_space_node_mgr_client::{
         ReleaseRequest,
     },
 };
+use pplx_space_sandbox_metrics::admission::AdmissionPermitOutcome;
 use std::sync::Arc;
 use std::time::Duration;
 use tonic::{Response, Status};

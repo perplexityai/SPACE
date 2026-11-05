@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use pplx_space_common_core::env::{env_flag_var, parse_positive_f64_env, valid_positive_f64};
 use pplx_space_feature_flags::{FeatureFlagClient, SPACE_CLUSTER_RATE_LIMITER_FLAG};
-use pplx_space_metrics::sandbox::admission::{
+use pplx_space_sandbox_metrics::admission::{
     AdmissionDecision, AdmissionOperationClass, AdmissionRejectReason,
 };
 use rand::RngExt as _;
@@ -318,7 +318,7 @@ impl ClusterSandboxAdmission {
         crate::limiter_liveness::run_heartbeat(
             crate::limiter_liveness::HEARTBEAT_INTERVAL,
             shutdown_token,
-            pplx_space_metrics::sandbox::admission::cluster_heartbeat,
+            pplx_space_sandbox_metrics::admission::cluster_heartbeat,
         )
     }
 
@@ -503,9 +503,9 @@ async fn prepare_activation_admission(
     // Emit the outcome-independent gauges exactly once, here, so the bucket-path
     // decision emitters don't double-count them.
     if let Some(count) = eligible_nodes {
-        pplx_space_metrics::sandbox::admission::cluster_eligible_nodes(count);
+        pplx_space_sandbox_metrics::admission::cluster_eligible_nodes(count);
     }
-    pplx_space_metrics::sandbox::admission::cluster_refill_rps(config.refill_rps);
+    pplx_space_sandbox_metrics::admission::cluster_refill_rps(config.refill_rps);
 
     if should_reject_empty(eligible_nodes, config.refill_rps) {
         emit_decision(
@@ -686,13 +686,9 @@ fn emit_decision(
     reason: AdmissionRejectReason,
     tokens: Option<f64>,
 ) {
-    pplx_space_metrics::sandbox::admission::cluster_decision(
-        class.metric_class(),
-        decision,
-        reason,
-    );
+    pplx_space_sandbox_metrics::admission::cluster_decision(class.metric_class(), decision, reason);
     if let Some(tokens) = tokens {
-        pplx_space_metrics::sandbox::admission::cluster_tokens(tokens);
+        pplx_space_sandbox_metrics::admission::cluster_tokens(tokens);
     }
 }
 

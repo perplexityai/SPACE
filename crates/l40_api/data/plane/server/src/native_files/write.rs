@@ -12,7 +12,6 @@ use axum::{
 };
 use futures_util::stream;
 use pplx_space_guest_process::IdempotencyKey;
-use pplx_space_metrics::response::{ResponseKind, ResponseOrigin};
 use pplx_space_native_files::{
     BatchEntry, FileOperation, decode_write_batch_entries, decode_write_chunks, parse_guest_path,
     parse_guest_user, shared_spaced_write_requests, spaced_write_requests,
@@ -23,6 +22,7 @@ use pplx_space_node_api_client::NodeApiOperationBudget;
 use pplx_space_public_api::{
     FileWriteBatchRequest, FileWriteBatchResponse, FileWriteRequest, FileWriteResponse,
 };
+use pplx_space_public_api_http::metrics::{ResponseKind, ResponseOrigin};
 use pplx_space_public_api_http::{PublicApiError, normalize_public_error, with_retry_after_hint};
 use pplx_space_sbx_mgr_client::proto::{SpacedMkdirRequest, SpacedWriteBatchEntry};
 

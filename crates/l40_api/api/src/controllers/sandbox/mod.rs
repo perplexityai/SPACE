@@ -1,3 +1,7 @@
+use crate::metrics::sandbox::api::{
+    ReconnectAttempt, ReconnectEntrypoint, ReconnectOutcome, ReconnectReason,
+    ReconnectTerminalPhase, SandboxApiMetricIdentity, SandboxApiSurface,
+};
 use futures_core::Stream;
 use pplx_space_common_core::sql;
 #[cfg(test)]
@@ -6,10 +10,6 @@ use pplx_space_common_core::types::{
     AutoLifecyclePolicy, DEFAULT_TEMPLATE_TAG, Email, EnvMap, EnvSanitizationIssue, NodeId, OrgId,
     PolicyAuthority, RuntimeKind, SandboxAutoLifecyclePatch, SandboxId, SandboxLifecycle, SemVer,
     TemplateDesiredState, TemplateName, TemplateReference, TemplateTag, TemplateVisibility,
-};
-use pplx_space_metrics::sandbox::api::{
-    ReconnectAttempt, ReconnectEntrypoint, ReconnectOutcome, ReconnectReason,
-    ReconnectTerminalPhase, SandboxApiMetricIdentity, SandboxApiSurface,
 };
 use pplx_space_net_common::{NetworkPolicy, NetworkPolicyV1, proto::NetworkPolicySource};
 use pplx_space_node_mgr_client::proto::{AllowPortRequest, ExposePortRequest, NetworkProtocol};
@@ -788,7 +788,7 @@ pub(crate) fn record_reconnect_attempt(
     else {
         return;
     };
-    pplx_space_metrics::sandbox::api::reconnect_attempt(ReconnectAttempt {
+    crate::metrics::sandbox::api::reconnect_attempt(ReconnectAttempt {
         entrypoint: tags.entrypoint,
         outcome: tags.outcome,
         initial_lifecycle: tags.initial_lifecycle,

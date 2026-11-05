@@ -124,7 +124,7 @@ fn public_network_policy_resource_is_read_only() {
 /// `PublicApiError::internal()`, so it has no translator to table here.
 #[test]
 fn every_public_translator_keeps_contention_attributed_to_this_service() {
-    use pplx_space_metrics::response::{ResponseKind, ResponseOrigin};
+    use pplx_space_public_api_http::metrics::{ResponseKind, ResponseOrigin};
 
     type Translator = fn(crate::controllers::ControllerError) -> super::error::PublicApiError;
 

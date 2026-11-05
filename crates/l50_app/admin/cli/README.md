@@ -270,7 +270,7 @@ pod can't be evacuated, so it keeps the node in `draining`. Find it like this:
   won't clear on its own logs `node_drain: sandbox has no pod and the pod-less
   give-up can't release it, so it stays and parks the drain`, at most hourly
   per node and reason. The metric's
-  [doc comment](../../../libs/metrics/src/node_drain.rs) explains each reason.
+  [doc comment](../../../l40_api/cluster/controller/server/src/metrics/node_drain.rs) explains each reason.
 
 Recover in this order:
 

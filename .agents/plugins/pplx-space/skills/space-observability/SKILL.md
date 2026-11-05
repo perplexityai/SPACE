@@ -17,8 +17,7 @@ description: Develop or review SPACE metrics, traces, sandbox events, Datadog da
   allow its names, as `pplx-space-reconcile-metrics` (l10_foundation) and
   `pplx-space-sandbox-metrics` (l40_api) were added. A vocabulary whose values
   a lower crate computes lives in that crate, as the auto-lifecycle delete
-  admission reason lives in `pplx-space-sbx-mgr-store`. `pplx-space-metrics`
-  is being split up into those owners; add no family to it.
+  admission reason lives in `pplx-space-sbx-mgr-store`.
 - Product code emits through a metrics module's named functions, not the
   low-level `counter`, `gauge`, `timing_ms`, or `tag` functions of
   `pplx-space-observability` or `pplx-space-metrics-emit`.

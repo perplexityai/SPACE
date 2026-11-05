@@ -1,5 +1,5 @@
+use crate::metrics::sandbox::api::SandboxApiMetricIdentity;
 use axum::http::Method;
-use pplx_space_metrics::sandbox::api::SandboxApiMetricIdentity;
 
 use super::sandbox_route_metric;
 

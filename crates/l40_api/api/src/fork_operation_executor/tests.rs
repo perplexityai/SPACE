@@ -361,24 +361,24 @@ fn fork_metrics_follow_the_persisted_workflow_phase() {
     assert_eq!(
         dimensions(&payload),
         (
-            pplx_space_metrics::sandbox_fork::ForkPhase::SourceFreeze,
-            pplx_space_metrics::sandbox_fork::ForkSourceLifecycle::Unfrozen,
+            crate::metrics::sandbox_fork::ForkPhase::SourceFreeze,
+            crate::metrics::sandbox_fork::ForkSourceLifecycle::Unfrozen,
         )
     );
     payload.freeze_source(7, ForkSourceLifecycle::Paused, target_config(), None);
     assert_eq!(
         dimensions(&payload),
         (
-            pplx_space_metrics::sandbox_fork::ForkPhase::ArtifactMaterialization,
-            pplx_space_metrics::sandbox_fork::ForkSourceLifecycle::Paused,
+            crate::metrics::sandbox_fork::ForkPhase::ArtifactMaterialization,
+            crate::metrics::sandbox_fork::ForkSourceLifecycle::Paused,
         )
     );
     payload.resolve_fork_snapshot(SnapshotId::new(), uuid::Uuid::now_v7());
     assert_eq!(
         dimensions(&payload),
         (
-            pplx_space_metrics::sandbox_fork::ForkPhase::TargetRestore,
-            pplx_space_metrics::sandbox_fork::ForkSourceLifecycle::Paused,
+            crate::metrics::sandbox_fork::ForkPhase::TargetRestore,
+            crate::metrics::sandbox_fork::ForkSourceLifecycle::Paused,
         )
     );
 }
@@ -388,15 +388,15 @@ fn fork_retry_metrics_distinguish_transient_failures_from_workflow_progress() {
     assert_eq!(
         classify_fork_attempt(&retry("temporary failure")),
         (
-            pplx_space_metrics::sandbox_fork::ForkAttemptOutcome::TransientRetry,
-            Some(pplx_space_metrics::sandbox_fork::ForkRetryKind::TransientFailure),
+            crate::metrics::sandbox_fork::ForkAttemptOutcome::TransientRetry,
+            Some(crate::metrics::sandbox_fork::ForkRetryKind::TransientFailure),
         )
     );
     assert_eq!(
         classify_fork_attempt(&wait("artifact pending")),
         (
-            pplx_space_metrics::sandbox_fork::ForkAttemptOutcome::WorkflowWait,
-            Some(pplx_space_metrics::sandbox_fork::ForkRetryKind::WorkflowProgress),
+            crate::metrics::sandbox_fork::ForkAttemptOutcome::WorkflowWait,
+            Some(crate::metrics::sandbox_fork::ForkRetryKind::WorkflowProgress),
         )
     );
 }
@@ -467,7 +467,7 @@ fn deadline_with_a_failed_target_is_not_reported_as_success() {
 fn failed_targets_are_reported_as_a_failed_fork_outcome() {
     assert_eq!(
         fork_outcome(&[sandbox_error(500, "restore failed")]),
-        pplx_space_metrics::sandbox_fork::ForkOutcome::Failed
+        crate::metrics::sandbox_fork::ForkOutcome::Failed
     );
 }
 

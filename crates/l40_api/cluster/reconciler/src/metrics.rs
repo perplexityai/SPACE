@@ -1,10 +1,13 @@
 use pplx_space_common_core::sql;
 use std::time::Duration;
 
-use pplx_space_metrics::reconcile::QueueLagStage;
 use pplx_space_state_reconciliation::{NODE_RECONCILE_CLAIM_STALE_SECS, RECONCILE_FACETS};
 use sqlx::PgPool;
 use tokio_util::sync::CancellationToken;
+
+use reconcile::QueueLagStage;
+
+pub mod reconcile;
 
 const DEFAULT_QUEUE_METRICS_INTERVAL: Duration = Duration::from_secs(10);
 
@@ -89,7 +92,7 @@ pub async fn emit_node_queue_stale_claims(pool: &PgPool) {
     match rows {
         Ok(rows) => {
             for (facet, count) in rows {
-                pplx_space_metrics::reconcile::queue_stale_claims(
+                crate::metrics::reconcile::queue_stale_claims(
                     &facet,
                     u64::try_from(count).unwrap_or(0),
                 );
@@ -120,12 +123,12 @@ pub async fn emit_node_queue_lag(pool: &PgPool) {
     match rows {
         Ok(rows) => {
             for (facet, claim_seconds, retry_seconds) in rows {
-                pplx_space_metrics::reconcile::queue_lag_seconds(
+                crate::metrics::reconcile::queue_lag_seconds(
                     &facet,
                     QueueLagStage::Claim,
                     claim_seconds,
                 );
-                pplx_space_metrics::reconcile::queue_lag_seconds(
+                crate::metrics::reconcile::queue_lag_seconds(
                     &facet,
                     QueueLagStage::Retry,
                     retry_seconds,
@@ -250,10 +253,7 @@ pub async fn emit_trigger_depth(pool: &PgPool) {
     match rows {
         Ok(rows) => {
             for (state, count) in rows {
-                pplx_space_metrics::reconcile::trigger_depth(
-                    &state,
-                    u64::try_from(count).unwrap_or(0),
-                );
+                crate::metrics::reconcile::trigger_depth(&state, u64::try_from(count).unwrap_or(0));
             }
         }
         Err(error) => {

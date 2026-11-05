@@ -21,8 +21,8 @@ use pplx_space_common_core::types::{
     AutoLifecycleWakePolicy, AutoLifecycleWakeSource, EcwCredentialEpoch, SandboxId,
 };
 use pplx_space_ecw_credential::{EcwCredentialKeyring, EcwCredentialKind};
-use pplx_space_metrics::response::{ResponseKind, ResponseOrigin};
 use pplx_space_net_common::{EgressDestinationV1, IpCidr};
+use pplx_space_public_api_http::metrics::{ResponseKind, ResponseOrigin};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use time::OffsetDateTime;
@@ -828,7 +828,7 @@ pub mod errors {
         fn into_response(self) -> axum::response::Response {
             let origin = self.origin;
             let kind = self.kind;
-            pplx_space_metrics::response::ecw_api(origin, kind, self.status.as_u16());
+            pplx_space_public_api_http::metrics::ecw_api(origin, kind, self.status.as_u16());
             tracing::Span::current().record("space.response_origin", origin.as_str());
             tracing::Span::current().record("space.response_kind", kind.as_str());
             // Client-error bodies may legitimately identify a rejected field,

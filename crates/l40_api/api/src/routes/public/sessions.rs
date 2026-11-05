@@ -1,5 +1,6 @@
 use pplx_space_common_core::types::{OrgId, UserId};
 
+use crate::metrics::operations::InlineAdmissionPath;
 use axum::{
     Extension, Json,
     extract::{Path, Query, State},
@@ -10,8 +11,6 @@ use pplx_space_common_core::types::{
     AutoLifecyclePolicy, GuestUserName, IdempotencyKey, ProcessCommand, SandboxLifecycle,
     validate_linux_guest_path_input,
 };
-use pplx_space_metrics::operations::InlineAdmissionPath;
-use pplx_space_metrics::response::{ResponseKind, ResponseOrigin};
 use pplx_space_public_api::{
     CreateCommandRequest, CreateFileWatchSessionRequest, CreatePortSessionRequest,
     CreateProcessRequest, CreateProtocolSessionRequest, CreateTerminalSessionRequest,
@@ -19,6 +18,7 @@ use pplx_space_public_api::{
     PublicSession, SandboxLifecycleAction, SessionKind, SessionTargetProtocol, TerminalSize,
     routes as native_routes,
 };
+use pplx_space_public_api_http::metrics::{ResponseKind, ResponseOrigin};
 use serde::Deserialize;
 use time::OffsetDateTime;
 

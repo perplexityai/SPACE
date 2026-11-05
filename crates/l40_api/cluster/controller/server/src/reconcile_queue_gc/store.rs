@@ -11,7 +11,7 @@ use pplx_space_common_core::types::{NodeId, SubstrateKind};
 use pplx_space_common_core::sql;
 use std::time::Duration;
 
-use pplx_space_metrics::reconcile::QueueGcMode;
+use crate::metrics::reconcile::QueueGcMode;
 use sqlx::PgPool;
 
 use super::{GoneCandidate, GoneNodeEvaluation, PruneCounts, QueueGcSink};

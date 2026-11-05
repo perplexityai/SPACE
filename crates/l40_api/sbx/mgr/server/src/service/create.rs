@@ -19,7 +19,7 @@ use pplx_space_events::{
     SandboxEventDetails, SandboxEventSource, SandboxEventTrigger, SandboxEventType,
     emit_sandbox_event,
 };
-use pplx_space_metrics::sandbox::admission::AdmissionPermitOutcome;
+use pplx_space_sandbox_metrics::admission::AdmissionPermitOutcome;
 
 const MIB_BYTES: u64 = 1024 * 1024;
 

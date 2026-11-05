@@ -44,9 +44,9 @@ use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::metrics::node_service_readiness::LabelWriteOutcome;
 use futures_util::StreamExt;
 use pplx_space_api::controllers::substrate::kubernetes::KubernetesSubstrate;
-use pplx_space_metrics::node_service_readiness::LabelWriteOutcome;
 use tokio_util::sync::CancellationToken;
 
 use crate::env_config;
@@ -546,14 +546,14 @@ async fn reconcile_once<B: ReadinessBackend>(
     let mut changes = plan.changes;
     cursor.apply(&mut changes);
 
-    pplx_space_metrics::node_service_readiness::evaluated_nodes(nodes.len());
-    pplx_space_metrics::node_service_readiness::not_ready_nodes(plan.not_ready);
+    crate::metrics::node_service_readiness::evaluated_nodes(nodes.len());
+    crate::metrics::node_service_readiness::not_ready_nodes(plan.not_ready);
     // Nodes whose published label disagrees with the verdict computed *this*
     // tick. In steady state this is the size of the current rollout wave; if it
     // stays elevated across ticks the writer is not keeping up with the
     // transition rate and labels are trailing the rollout they describe.
-    pplx_space_metrics::node_service_readiness::pending_label_changes(changes.len());
-    pplx_space_metrics::node_service_readiness::fail_open(plan.failed_open);
+    crate::metrics::node_service_readiness::pending_label_changes(changes.len());
+    crate::metrics::node_service_readiness::fail_open(plan.failed_open);
     if plan.failed_open {
         tracing::warn!(
             not_ready = plan.not_ready,
@@ -564,7 +564,7 @@ async fn reconcile_once<B: ReadinessBackend>(
         );
     }
     let unchanged = nodes.len().saturating_sub(changes.len());
-    pplx_space_metrics::node_service_readiness::label_writes(
+    crate::metrics::node_service_readiness::label_writes(
         LabelWriteOutcome::Unchanged,
         unchanged as u64,
     );
@@ -603,8 +603,8 @@ async fn reconcile_once<B: ReadinessBackend>(
     .count()
     .await;
 
-    pplx_space_metrics::node_service_readiness::tick_duration_ms(
-        tick_started.elapsed().as_millis() as u64,
+    crate::metrics::node_service_readiness::tick_duration_ms(
+        tick_started.elapsed().as_millis() as u64
     );
     cursor.advance(attempted);
 }
@@ -653,7 +653,7 @@ async fn apply_one_label<B: ReadinessBackend>(
                 "node-services-ready verdict changed under the plan; skipping the \
                  stale write and re-planning next tick"
             );
-            pplx_space_metrics::node_service_readiness::stale_verdict_skipped();
+            crate::metrics::node_service_readiness::stale_verdict_skipped();
             return true;
         }
     }
@@ -671,7 +671,7 @@ async fn apply_one_label<B: ReadinessBackend>(
                 timeout_secs = LABEL_WRITE_TIMEOUT.as_secs(),
                 "node-services-ready label write timed out; retrying next tick"
             );
-            pplx_space_metrics::node_service_readiness::label_write(LabelWriteOutcome::Error);
+            crate::metrics::node_service_readiness::label_write(LabelWriteOutcome::Error);
         }
         Ok(Ok(())) => {
             tracing::info!(
@@ -679,7 +679,7 @@ async fn apply_one_label<B: ReadinessBackend>(
                 desired = %change.desired,
                 "node-services-ready label reconciled"
             );
-            pplx_space_metrics::node_service_readiness::label_write(LabelWriteOutcome::Applied);
+            crate::metrics::node_service_readiness::label_write(LabelWriteOutcome::Applied);
         }
         Ok(Err(error)) => {
             tracing::warn!(
@@ -688,7 +688,7 @@ async fn apply_one_label<B: ReadinessBackend>(
                 %error,
                 "failed to set node-services-ready label"
             );
-            pplx_space_metrics::node_service_readiness::label_write(LabelWriteOutcome::Error);
+            crate::metrics::node_service_readiness::label_write(LabelWriteOutcome::Error);
         }
     }
     true

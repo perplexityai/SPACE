@@ -2,11 +2,11 @@ use pplx_space_common_core::types::OrgId;
 
 use super::*;
 use pplx_space_common_core::types::{AutoLifecyclePolicy, SandboxLifecycle};
-use pplx_space_metrics::response::{ResponseKind, ResponseOrigin};
 use pplx_space_public_api::{
     OperationState, PublicErrorCode, PublicSandboxId,
     SandboxLifecycleAction as PublicSandboxLifecycleAction,
 };
+use pplx_space_public_api_http::metrics::{ResponseKind, ResponseOrigin};
 
 use crate::controllers::sandbox::lifecycle::user_admission::{
     UserLifecycleRequest, admit_user_lifecycle,
@@ -50,7 +50,7 @@ pub(super) fn request_client_id(headers: &HeaderMap) -> Option<String> {
 /// `crate::client_concurrency`).
 pub(super) async fn acquire_client_slot(
     state: &AppState,
-    operation: pplx_space_metrics::sandbox::api::client_limit::Operation,
+    operation: crate::metrics::sandbox::api::client_limit::Operation,
     client_id: Option<&str>,
     minimum_hold: Option<std::time::Duration>,
 ) -> Result<crate::client_concurrency::ClientConcurrencyGuard, E2bApiError> {
@@ -346,7 +346,7 @@ pub(super) async fn create_sandbox(
     let client_id = request_client_id(&headers);
     let _client_slot = acquire_client_slot(
         &state,
-        pplx_space_metrics::sandbox::api::client_limit::Operation::Create,
+        crate::metrics::sandbox::api::client_limit::Operation::Create,
         client_id.as_deref(),
         None,
     )
@@ -827,7 +827,7 @@ pub(super) async fn connect_sandbox_inner(
     let client_slot = state
         .client_concurrency
         .try_acquire(
-            pplx_space_metrics::sandbox::api::client_limit::Operation::Reconnect,
+            crate::metrics::sandbox::api::client_limit::Operation::Reconnect,
             client_id.as_deref(),
         )
         .await;
@@ -851,9 +851,9 @@ pub(super) async fn connect_sandbox_inner(
             crate::controllers::sandbox::record_reconnect_attempt(
                 reconnect_identity,
                 "",
-                pplx_space_metrics::sandbox::api::ReconnectOutcome::Rejected,
-                pplx_space_metrics::sandbox::api::ReconnectTerminalPhase::Api,
-                pplx_space_metrics::sandbox::api::ReconnectReason::RateLimited,
+                crate::metrics::sandbox::api::ReconnectOutcome::Rejected,
+                crate::metrics::sandbox::api::ReconnectTerminalPhase::Api,
+                crate::metrics::sandbox::api::ReconnectReason::RateLimited,
                 reconnect_started_at,
             );
             return Err(err);
@@ -893,9 +893,9 @@ pub(super) async fn connect_sandbox_inner(
         crate::controllers::sandbox::record_reconnect_attempt(
             reconnect_identity,
             &sandbox.lifecycle,
-            pplx_space_metrics::sandbox::api::ReconnectOutcome::Rejected,
-            pplx_space_metrics::sandbox::api::ReconnectTerminalPhase::Api,
-            pplx_space_metrics::sandbox::api::ReconnectReason::TerminalLifecycle,
+            crate::metrics::sandbox::api::ReconnectOutcome::Rejected,
+            crate::metrics::sandbox::api::ReconnectTerminalPhase::Api,
+            crate::metrics::sandbox::api::ReconnectReason::TerminalLifecycle,
             reconnect_started_at,
         );
         return Err(terminal_sandbox_error(&native));
@@ -1018,9 +1018,9 @@ pub(super) async fn connect_sandbox_inner(
                     crate::controllers::sandbox::record_reconnect_attempt(
                         reconnect_identity,
                         &sandbox.lifecycle,
-                        pplx_space_metrics::sandbox::api::ReconnectOutcome::Rejected,
-                        pplx_space_metrics::sandbox::api::ReconnectTerminalPhase::Api,
-                        pplx_space_metrics::sandbox::api::ReconnectReason::Unavailable,
+                        crate::metrics::sandbox::api::ReconnectOutcome::Rejected,
+                        crate::metrics::sandbox::api::ReconnectTerminalPhase::Api,
+                        crate::metrics::sandbox::api::ReconnectReason::Unavailable,
                         reconnect_started_at,
                     );
                     return Err(E2bApiError::sandbox_timeout().with_classification(
@@ -1087,9 +1087,9 @@ pub(super) async fn connect_sandbox_inner(
         crate::controllers::sandbox::record_reconnect_attempt(
             reconnect_identity,
             &sandbox.lifecycle,
-            pplx_space_metrics::sandbox::api::ReconnectOutcome::Connected,
-            pplx_space_metrics::sandbox::api::ReconnectTerminalPhase::NoWake,
-            pplx_space_metrics::sandbox::api::ReconnectReason::NoWakeNeeded,
+            crate::metrics::sandbox::api::ReconnectOutcome::Connected,
+            crate::metrics::sandbox::api::ReconnectTerminalPhase::NoWake,
+            crate::metrics::sandbox::api::ReconnectReason::NoWakeNeeded,
             reconnect_started_at,
         );
     }

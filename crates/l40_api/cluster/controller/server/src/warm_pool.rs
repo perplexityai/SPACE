@@ -7,6 +7,9 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::metrics::warm_pool::{
+    ProbeOutcome, ProbeStep, ProbeStepOutcome, PromoteOutcome, SlotDeleteReason,
+};
 use futures_util::{
     FutureExt,
     stream::{self, StreamExt},
@@ -38,9 +41,6 @@ use pplx_space_common_core::{
         template_write_annotation_key_for,
     },
     types::{SandboxId, TemplateArtifactDigest, TemplateReference},
-};
-use pplx_space_metrics::warm_pool::{
-    ProbeOutcome, ProbeStep, ProbeStepOutcome, PromoteOutcome, SlotDeleteReason,
 };
 use pplx_space_sandbox_store::delete::delete_with_dependents;
 use pplx_space_sbx_mgr_client::proto::SpacedWaitReadyRequest;
@@ -221,8 +221,8 @@ async fn run_pass(reconciler: &Reconciler) {
     let result = reconciler.reconcile_once().await;
     let report = reconciler.take_pass_report();
     let result_ok = result.is_ok();
-    pplx_space_metrics::warm_pool::reconcile_tick_duration(started_at);
-    pplx_space_metrics::warm_pool::reconcile_tick(result_ok);
+    crate::metrics::warm_pool::reconcile_tick_duration(started_at);
+    crate::metrics::warm_pool::reconcile_tick(result_ok);
     pass::record_outcome(&tracing::Span::current(), &report, result_ok);
     let total_duration_ms = started_at.elapsed().as_millis();
 
@@ -956,7 +956,7 @@ impl Reconciler {
             }
         };
         self.pass_report().autoscale = outcome;
-        pplx_space_metrics::warm_pool::autoscale(outcome.as_str());
+        crate::metrics::warm_pool::autoscale(outcome.as_str());
         retired
     }
 
@@ -1126,8 +1126,8 @@ impl Reconciler {
             },
         )
         .await;
-        pplx_space_metrics::cluster_reconciler::loop_latency(
-            pplx_space_metrics::cluster_reconciler::Loop::WarmPoolOrphanGc,
+        crate::metrics::cluster_reconciler::loop_latency(
+            crate::metrics::cluster_reconciler::Loop::WarmPoolOrphanGc,
             started,
         );
         tracing::info!(
@@ -1174,7 +1174,7 @@ impl Reconciler {
         let result = future.await;
         let elapsed = started_at.elapsed();
         let duration_ms = elapsed.as_millis();
-        pplx_space_metrics::warm_pool::reconcile_stage_duration(
+        crate::metrics::warm_pool::reconcile_stage_duration(
             stage_name,
             &content_hash,
             template,
@@ -2316,15 +2316,12 @@ impl ReconcileSummary {
     }
 
     fn emit_metrics(&self) {
-        pplx_space_metrics::warm_pool::reconcile_summary(
-            self.created_slots,
-            self.marked_ready_slots,
-        );
+        crate::metrics::warm_pool::reconcile_summary(self.created_slots, self.marked_ready_slots);
         for (reason, count) in self.delete_counts() {
-            pplx_space_metrics::warm_pool::slots_deleted(reason, count);
+            crate::metrics::warm_pool::slots_deleted(reason, count);
         }
-        pplx_space_metrics::warm_pool::slots_evicted_cordoned(self.deleted_cordoned_slots);
-        pplx_space_metrics::warm_pool::dead_claimed_slots_drained(self.deleted_dead_claimed_slots);
+        crate::metrics::warm_pool::slots_evicted_cordoned(self.deleted_cordoned_slots);
+        crate::metrics::warm_pool::dead_claimed_slots_drained(self.deleted_dead_claimed_slots);
     }
 }
 
@@ -2604,8 +2601,8 @@ where
 }
 
 fn emit_promote_probe(content_hash: &str, outcome: ProbeOutcome, started_at: Instant) {
-    pplx_space_metrics::warm_pool::promote_probe_duration(content_hash, outcome, started_at);
-    pplx_space_metrics::warm_pool::promote_probe(content_hash, outcome);
+    crate::metrics::warm_pool::promote_probe_duration(content_hash, outcome, started_at);
+    crate::metrics::warm_pool::promote_probe(content_hash, outcome);
 }
 
 fn emit_promote_probe_step(
@@ -2614,17 +2611,12 @@ fn emit_promote_probe_step(
     outcome: ProbeStepOutcome,
     started_at: Instant,
 ) {
-    pplx_space_metrics::warm_pool::promote_probe_step_duration(
-        content_hash,
-        step,
-        outcome,
-        started_at,
-    );
-    pplx_space_metrics::warm_pool::promote_probe_step(content_hash, step, outcome);
+    crate::metrics::warm_pool::promote_probe_step_duration(content_hash, step, outcome, started_at);
+    crate::metrics::warm_pool::promote_probe_step(content_hash, step, outcome);
 }
 
 fn emit_promote_attempt(content_hash: &str, outcome: PromoteOutcome) {
-    pplx_space_metrics::warm_pool::promote_attempt(content_hash, outcome);
+    crate::metrics::warm_pool::promote_attempt(content_hash, outcome);
 }
 
 fn pod_ip_for_log(pod: &SandboxPodView) -> &str {
@@ -2719,7 +2711,7 @@ fn emit_reconcile_config_states(config: &PoolConfig, succeeded: bool) {
     let memory_mib = config.memory.as_mib_floor();
     let state = reconcile_config_state(config, succeeded);
 
-    pplx_space_metrics::warm_pool::reconcile_config_state(
+    crate::metrics::warm_pool::reconcile_config_state(
         template,
         &content_hash,
         vcpu,
@@ -2728,7 +2720,7 @@ fn emit_reconcile_config_states(config: &PoolConfig, succeeded: bool) {
         "active",
         state.active,
     );
-    pplx_space_metrics::warm_pool::reconcile_config_state(
+    crate::metrics::warm_pool::reconcile_config_state(
         template,
         &content_hash,
         vcpu,
@@ -2785,7 +2777,7 @@ fn report_invalid_config_rows(read: &'static str, rows: &[InvalidPoolConfigRow])
             error = %row.error,
             "warm pool: config row is not valid; skipping it and continuing with remaining configs"
         );
-        pplx_space_metrics::warm_pool::config_decode_failed(read, &row.template_name);
+        crate::metrics::warm_pool::config_decode_failed(read, &row.template_name);
     }
 }
 
@@ -2810,7 +2802,7 @@ fn emit_slot_gauges(config: &PoolConfig, counts: PoolSlotCounts) {
     let vcpu = config.vcpu.get().get();
     let memory_mib = config.memory.as_mib_floor();
 
-    pplx_space_metrics::warm_pool::slots(
+    crate::metrics::warm_pool::slots(
         template,
         &content_hash,
         vcpu,
@@ -2819,7 +2811,7 @@ fn emit_slot_gauges(config: &PoolConfig, counts: PoolSlotCounts) {
         "ready",
         counts.ready,
     );
-    pplx_space_metrics::warm_pool::slots(
+    crate::metrics::warm_pool::slots(
         template,
         &content_hash,
         vcpu,
@@ -2828,7 +2820,7 @@ fn emit_slot_gauges(config: &PoolConfig, counts: PoolSlotCounts) {
         "warming",
         counts.warming,
     );
-    pplx_space_metrics::warm_pool::slots(
+    crate::metrics::warm_pool::slots(
         template,
         &content_hash,
         vcpu,

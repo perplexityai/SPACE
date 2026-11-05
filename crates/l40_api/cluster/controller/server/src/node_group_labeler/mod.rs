@@ -747,7 +747,7 @@ enum DeferReason {
 /// an operator acts, so a monitor over a counter (or a log line) fires once
 /// and recovers while the capacity is still dark.
 fn publish_metrics(report: &TickReport) {
-    use pplx_space_metrics::node_group_labeler as m;
+    use crate::metrics::node_group_labeler as m;
 
     // Gauges describe state, so they may only be published by a tick that
     // actually measured it. An early return carries `default()` in every

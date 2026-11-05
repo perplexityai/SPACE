@@ -4,9 +4,9 @@
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 
+use crate::metrics::sandbox::api::SandboxApiMetricIdentity;
 use pplx_space_common_core::types::{LocalArtifactId, SandboxId};
 use pplx_space_db_test_fixtures::pg_test_db;
-use pplx_space_metrics::sandbox::api::SandboxApiMetricIdentity;
 use pplx_space_test_env::TestResult;
 
 use super::*;

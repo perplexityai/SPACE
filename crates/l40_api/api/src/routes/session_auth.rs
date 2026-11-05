@@ -167,14 +167,14 @@ async fn create_session(
     // an unlisted email is refused the same way and in the same time whether
     // or not the account exists.
     if is_console_request(&headers) || !state.password_session_allowed(&request.email) {
-        pplx_space_metrics::auth::external_console_password_session("login_refused");
+        crate::metrics::auth::external_console_password_session("login_refused");
         return Err(AuthRouteError::PasswordLoginDisabled);
     }
     let result = create_session_for_password(&state.pool, request).await;
     match &result {
-        Ok(_) => pplx_space_metrics::auth::external_console_password_session("login_accepted"),
+        Ok(_) => crate::metrics::auth::external_console_password_session("login_accepted"),
         Err(AuthRouteError::InvalidCredentials) => {
-            pplx_space_metrics::auth::external_console_password_session("login_invalid");
+            crate::metrics::auth::external_console_password_session("login_invalid");
         }
         Err(_) => {}
     }

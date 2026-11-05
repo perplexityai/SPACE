@@ -6,6 +6,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::metrics::sandbox::api::SandboxApiMetricIdentity;
 use pplx_space_common_core::types::{
     ArtifactKind, BackupAttemptId, BackupSource, EcwCredentialEpoch, ExecutionGeneration,
     SandboxId, SandboxLifecycle, SnapshotState,
@@ -13,7 +14,6 @@ use pplx_space_common_core::types::{
 use pplx_space_events::{
     SandboxEventDetails, SandboxEventSource, SandboxEventType, emit_sandbox_event,
 };
-use pplx_space_metrics::sandbox::api::SandboxApiMetricIdentity;
 use pplx_space_public_api::{
     OperationState, PublicErrorCode, PublicForkOperationResult, PublicOperationResult,
 };
@@ -72,37 +72,33 @@ fn active_copy_node_target_is_complete(
 fn fork_metric_dimensions(
     payload: &serde_json::Value,
 ) -> (
-    pplx_space_metrics::sandbox_fork::ForkPhase,
-    pplx_space_metrics::sandbox_fork::ForkSourceLifecycle,
+    crate::metrics::sandbox_fork::ForkPhase,
+    crate::metrics::sandbox_fork::ForkSourceLifecycle,
 ) {
     let Ok(payload) = decode_fork_payload(payload.clone()) else {
         return (
-            pplx_space_metrics::sandbox_fork::ForkPhase::InvalidPayload,
-            pplx_space_metrics::sandbox_fork::ForkSourceLifecycle::Unfrozen,
+            crate::metrics::sandbox_fork::ForkPhase::InvalidPayload,
+            crate::metrics::sandbox_fork::ForkSourceLifecycle::Unfrozen,
         );
     };
     let phase = match payload.workflow_phase() {
-        ForkWorkflowPhase::SourceFreeze => {
-            pplx_space_metrics::sandbox_fork::ForkPhase::SourceFreeze
-        }
+        ForkWorkflowPhase::SourceFreeze => crate::metrics::sandbox_fork::ForkPhase::SourceFreeze,
         ForkWorkflowPhase::ArtifactMaterialization => {
-            pplx_space_metrics::sandbox_fork::ForkPhase::ArtifactMaterialization
+            crate::metrics::sandbox_fork::ForkPhase::ArtifactMaterialization
         }
-        ForkWorkflowPhase::TargetRestore => {
-            pplx_space_metrics::sandbox_fork::ForkPhase::TargetRestore
-        }
-        ForkWorkflowPhase::Completed => pplx_space_metrics::sandbox_fork::ForkPhase::Completed,
+        ForkWorkflowPhase::TargetRestore => crate::metrics::sandbox_fork::ForkPhase::TargetRestore,
+        ForkWorkflowPhase::Completed => crate::metrics::sandbox_fork::ForkPhase::Completed,
     };
     let source_lifecycle = match payload.source_lifecycle() {
-        None => pplx_space_metrics::sandbox_fork::ForkSourceLifecycle::Unfrozen,
+        None => crate::metrics::sandbox_fork::ForkSourceLifecycle::Unfrozen,
         Some(ForkSourceLifecycle::Started) => {
-            pplx_space_metrics::sandbox_fork::ForkSourceLifecycle::Started
+            crate::metrics::sandbox_fork::ForkSourceLifecycle::Started
         }
         Some(ForkSourceLifecycle::Paused) => {
-            pplx_space_metrics::sandbox_fork::ForkSourceLifecycle::Paused
+            crate::metrics::sandbox_fork::ForkSourceLifecycle::Paused
         }
         Some(ForkSourceLifecycle::Suspended) => {
-            pplx_space_metrics::sandbox_fork::ForkSourceLifecycle::Suspended
+            crate::metrics::sandbox_fork::ForkSourceLifecycle::Suspended
         }
     };
     (phase, source_lifecycle)
@@ -111,41 +107,39 @@ fn fork_metric_dimensions(
 fn classify_fork_attempt(
     result: &PublicOperationExecutionResult,
 ) -> (
-    pplx_space_metrics::sandbox_fork::ForkAttemptOutcome,
-    Option<pplx_space_metrics::sandbox_fork::ForkRetryKind>,
+    crate::metrics::sandbox_fork::ForkAttemptOutcome,
+    Option<crate::metrics::sandbox_fork::ForkRetryKind>,
 ) {
     let retry_kind = if result.state == OperationState::Queued {
         Some(match result.requeue_reason {
             PublicOperationRequeueReason::TransientFailure
             | PublicOperationRequeueReason::RetryDeferred => {
-                pplx_space_metrics::sandbox_fork::ForkRetryKind::TransientFailure
+                crate::metrics::sandbox_fork::ForkRetryKind::TransientFailure
             }
             PublicOperationRequeueReason::WorkflowProgress => {
-                pplx_space_metrics::sandbox_fork::ForkRetryKind::WorkflowProgress
+                crate::metrics::sandbox_fork::ForkRetryKind::WorkflowProgress
             }
             PublicOperationRequeueReason::ActivationBackpressure => {
-                pplx_space_metrics::sandbox_fork::ForkRetryKind::ActivationBackpressure
+                crate::metrics::sandbox_fork::ForkRetryKind::ActivationBackpressure
             }
         })
     } else {
         None
     };
     let outcome = match result.state {
-        OperationState::Succeeded => {
-            pplx_space_metrics::sandbox_fork::ForkAttemptOutcome::Succeeded
-        }
+        OperationState::Succeeded => crate::metrics::sandbox_fork::ForkAttemptOutcome::Succeeded,
         OperationState::Failed
         | OperationState::Canceled
         | OperationState::Expired
-        | OperationState::Other(_) => pplx_space_metrics::sandbox_fork::ForkAttemptOutcome::Failed,
+        | OperationState::Other(_) => crate::metrics::sandbox_fork::ForkAttemptOutcome::Failed,
         OperationState::Queued | OperationState::Running => match result.requeue_reason {
             PublicOperationRequeueReason::TransientFailure
             | PublicOperationRequeueReason::RetryDeferred => {
-                pplx_space_metrics::sandbox_fork::ForkAttemptOutcome::TransientRetry
+                crate::metrics::sandbox_fork::ForkAttemptOutcome::TransientRetry
             }
             PublicOperationRequeueReason::WorkflowProgress
             | PublicOperationRequeueReason::ActivationBackpressure => {
-                pplx_space_metrics::sandbox_fork::ForkAttemptOutcome::WorkflowWait
+                crate::metrics::sandbox_fork::ForkAttemptOutcome::WorkflowWait
             }
         },
     };
@@ -208,15 +202,15 @@ impl ForkSandboxOperationExecutor {
             let step = self.execute_step(claim_token, &operation).await;
             let (outcome, retry_kind) = match &step {
                 ControlFlow::Continue(_) => (
-                    pplx_space_metrics::sandbox_fork::ForkAttemptOutcome::Succeeded,
+                    crate::metrics::sandbox_fork::ForkAttemptOutcome::Succeeded,
                     None,
                 ),
                 ControlFlow::Break(result) => classify_fork_attempt(result),
             };
             if let Some(retry_kind) = retry_kind {
-                pplx_space_metrics::sandbox_fork::retry(phase, source_lifecycle, retry_kind);
+                crate::metrics::sandbox_fork::retry(phase, source_lifecycle, retry_kind);
             }
-            pplx_space_metrics::sandbox_fork::phase_attempt(
+            crate::metrics::sandbox_fork::phase_attempt(
                 phase,
                 source_lifecycle,
                 outcome,
@@ -245,12 +239,12 @@ impl ForkSandboxOperationExecutor {
                     ForkExecutionError::Terminal { code, message } => (
                         code,
                         message,
-                        pplx_space_metrics::sandbox_fork::ForkOutcome::Failed,
+                        crate::metrics::sandbox_fork::ForkOutcome::Failed,
                     ),
                     ForkExecutionError::DeadlineExceeded { code, message } => (
                         code,
                         message,
-                        pplx_space_metrics::sandbox_fork::ForkOutcome::DeadlineExceeded,
+                        crate::metrics::sandbox_fork::ForkOutcome::DeadlineExceeded,
                     ),
                     ForkExecutionError::Retry(_) | ForkExecutionError::Wait(_) => unreachable!(),
                 };
@@ -295,7 +289,7 @@ impl ForkSandboxOperationExecutor {
                         "failed to retire terminal fork artifact: {error}"
                     )));
                 }
-                pplx_space_metrics::sandbox_fork::completed(outcome);
+                crate::metrics::sandbox_fork::completed(outcome);
                 // `sandbox_id()` reads either form of the source's id, while
                 // the event parser takes only the bare UUID.
                 if let Some(source_id) = operation.sandbox_id() {
@@ -1354,7 +1348,7 @@ impl ForkSandboxOperationExecutor {
             payload.source_sandbox_id(),
             operation.id,
             payload.fork_snapshot_id(),
-            pplx_space_metrics::sandbox_fork::ForkOutcome::Completed,
+            crate::metrics::sandbox_fork::ForkOutcome::Completed,
         );
         Ok(result)
     }
@@ -1689,7 +1683,7 @@ fn successful_fork_result(
 fn deadline_fork_result(
     results: Vec<ForkTargetOutcome>,
 ) -> Result<PublicOperationExecutionResult, ForkExecutionError> {
-    if fork_outcome(&results) != pplx_space_metrics::sandbox_fork::ForkOutcome::Completed {
+    if fork_outcome(&results) != crate::metrics::sandbox_fork::ForkOutcome::Completed {
         return Err(ForkExecutionError::deadline_exceeded(
             "sandbox fork hard deadline exceeded",
         ));
@@ -1699,15 +1693,15 @@ fn deadline_fork_result(
     Ok(result)
 }
 
-fn fork_outcome(results: &[ForkTargetOutcome]) -> pplx_space_metrics::sandbox_fork::ForkOutcome {
+fn fork_outcome(results: &[ForkTargetOutcome]) -> crate::metrics::sandbox_fork::ForkOutcome {
     if !results.is_empty()
         && results
             .iter()
             .all(|result| matches!(result, ForkTargetOutcome::Succeeded { .. }))
     {
-        pplx_space_metrics::sandbox_fork::ForkOutcome::Completed
+        crate::metrics::sandbox_fork::ForkOutcome::Completed
     } else {
-        pplx_space_metrics::sandbox_fork::ForkOutcome::Failed
+        crate::metrics::sandbox_fork::ForkOutcome::Failed
     }
 }
 
@@ -1729,15 +1723,15 @@ fn emit_terminal_fork_observability(
     source_sandbox_id: SandboxId,
     operation_id: pplx_space_public_api::OperationId,
     snapshot_id: Option<SnapshotId>,
-    outcome: pplx_space_metrics::sandbox_fork::ForkOutcome,
+    outcome: crate::metrics::sandbox_fork::ForkOutcome,
 ) {
     let (event_type, mut details) = match outcome {
-        pplx_space_metrics::sandbox_fork::ForkOutcome::Completed => (
+        crate::metrics::sandbox_fork::ForkOutcome::Completed => (
             SandboxEventType::ForkCompleted,
             SandboxEventDetails::default().operation(operation_id.to_string()),
         ),
-        pplx_space_metrics::sandbox_fork::ForkOutcome::Failed
-        | pplx_space_metrics::sandbox_fork::ForkOutcome::DeadlineExceeded => (
+        crate::metrics::sandbox_fork::ForkOutcome::Failed
+        | crate::metrics::sandbox_fork::ForkOutcome::DeadlineExceeded => (
             SandboxEventType::ForkFailed,
             SandboxEventDetails::default()
                 .operation(operation_id.to_string())
@@ -1753,7 +1747,7 @@ fn emit_terminal_fork_observability(
         SandboxEventSource::ClusterController,
         details,
     );
-    pplx_space_metrics::sandbox_fork::completed(outcome);
+    crate::metrics::sandbox_fork::completed(outcome);
 }
 
 fn successful_fork_result_after_retirement(

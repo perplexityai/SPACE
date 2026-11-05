@@ -1,13 +1,13 @@
 use super::*;
-use pplx_space_common_core::types::{SandboxId, TemplateReference, TemplateSelector};
-use pplx_space_metrics::response::{ResponseKind, ResponseOrigin};
-use pplx_space_metrics::sandbox::api::{
+use crate::metrics::sandbox::api::{
     SandboxApiMetricIdentity, TemplateSelectorKind, TemplateSelectorRequest, TemplateTagShape,
 };
+use pplx_space_common_core::types::{SandboxId, TemplateReference, TemplateSelector};
 use pplx_space_net_common::{
     DomainName, EgressDefaultAction, EgressDestinationV1, EgressPolicyV1, IpCidr, NetworkPolicyV1,
     NetworkPolicyVersion, TlsInterception, WildcardDomainName,
 };
+use pplx_space_public_api_http::metrics::{ResponseKind, ResponseOrigin};
 use std::net::IpAddr;
 
 use crate::controllers::ControllerError;
@@ -224,7 +224,7 @@ pub(super) fn ecw_template_selector_metric_labels(
 
 fn record_ecw_template_selector_request(template: &TemplateReference) {
     let (selector_kind, tag_shape, requested_tag) = ecw_template_selector_metric_labels(template);
-    pplx_space_metrics::sandbox::api::template_selector_requested(TemplateSelectorRequest {
+    crate::metrics::sandbox::api::template_selector_requested(TemplateSelectorRequest {
         identity: SandboxApiMetricIdentity::ecw("create"),
         template: template.name().as_str(),
         selector_kind,

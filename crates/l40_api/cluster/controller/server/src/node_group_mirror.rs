@@ -31,7 +31,7 @@
 //!
 //! A converged tick writes nothing and logs nothing, so liveness rides on
 //! [`publish_metrics`] rather than on the log line. See
-//! `pplx_space_metrics::node_group_mirror` for what each series means.
+//! `crate::metrics::node_group_mirror` for what each series means.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -183,8 +183,8 @@ enum MirrorError {
 }
 
 impl MirrorError {
-    fn kind(&self) -> pplx_space_metrics::node_group_mirror::TickErrorKind {
-        use pplx_space_metrics::node_group_mirror::TickErrorKind;
+    fn kind(&self) -> crate::metrics::node_group_mirror::TickErrorKind {
+        use crate::metrics::node_group_mirror::TickErrorKind;
         match self {
             Self::Kube(_) | Self::ListTimedOut => TickErrorKind::List,
             Self::Db(_) | Self::QueryTimedOut(_) => TickErrorKind::Query,
@@ -278,7 +278,7 @@ async fn run_loop<B: MirrorBackend>(
 
 /// Publish one tick's result.
 ///
-/// Two invariants, both load-bearing; `pplx_space_metrics::node_group_mirror`
+/// Two invariants, both load-bearing; `crate::metrics::node_group_mirror`
 /// carries the reasoning behind each.
 ///
 /// 1. **Every** successful tick books `tick_completed`, no-ops included.
@@ -301,7 +301,7 @@ async fn run_loop<B: MirrorBackend>(
 /// arm would need `MirrorError` to carry the partial outcome; until something
 /// needs it, one rule is easier to keep true than two.
 fn publish_metrics(result: &Result<MirrorOutcome, MirrorError>) {
-    use pplx_space_metrics::node_group_mirror as m;
+    use crate::metrics::node_group_mirror as m;
 
     match result {
         Ok(outcome) => {

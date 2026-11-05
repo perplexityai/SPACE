@@ -67,9 +67,7 @@ use pplx_space_common_core::types::{NodeId, SandboxId};
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
-use pplx_space_metrics::cluster_reconciler::{
-    self as metrics, Loop, LostStartedOutcome, OutcomeEvent,
-};
+use crate::metrics::cluster_reconciler::{self as metrics, Loop, LostStartedOutcome, OutcomeEvent};
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 

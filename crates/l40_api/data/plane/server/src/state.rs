@@ -144,10 +144,7 @@ pub(super) fn parse_proto_space_api_route_token(
     match decode_proto_space_api_route_token(route_source, token) {
         Ok(token) => Some(token),
         Err(error) => {
-            pplx_space_metrics::data_plane::space_api_route_token_dropped(
-                route_source,
-                error.metric_reason(),
-            );
+            crate::metrics::space_api_route_token_dropped(route_source, error.metric_reason());
             tracing::warn!(%error, "dropping unrefreshable SPACE API route token");
             None
         }
@@ -254,7 +251,7 @@ impl BackendChannelPoolEntry {
 impl BackendChannelPool {
     pub(super) fn new(pool_size: usize) -> Self {
         let pool_size = pool_size.max(1);
-        pplx_space_metrics::data_plane::backend_channel_pool_size(pool_size);
+        crate::metrics::backend_channel_pool_size(pool_size);
         Self {
             pool_size,
             channels: DashMap::new(),
@@ -321,7 +318,7 @@ impl BackendChannelPool {
                     )
                     .is_some()
                 {
-                    pplx_space_metrics::data_plane::backend_channel_pool_entries(self.len());
+                    crate::metrics::backend_channel_pool_entries(self.len());
                 }
             })
     }
@@ -420,7 +417,7 @@ pub(super) fn reset_ecw_backend_channel_on_transport_status(
     let removed = state
         .backend_channels
         .forget_endpoint(&route.backend_endpoint);
-    pplx_space_metrics::data_plane::backend_channel_reset("ecw", reason.as_str());
+    crate::metrics::backend_channel_reset("ecw", reason.as_str());
     tracing::debug!(
         operation,
         sandbox_id = %route.sandbox_id,
@@ -1925,7 +1922,7 @@ impl EcwProxyError {
 
 impl IntoResponse for EcwProxyError {
     fn into_response(self) -> Response {
-        pplx_space_metrics::data_plane::response(
+        crate::metrics::response(
             ResponseSurface::Ecw,
             self.origin,
             self.kind,
@@ -2029,8 +2026,8 @@ impl AttachedStreamLimiter {
             return Err(AttachedStreamLimit::Sandbox);
         }
 
-        pplx_space_metrics::data_plane::stream_active("all", self.total.load(Ordering::Acquire));
-        pplx_space_metrics::data_plane::stream_active(kind, kind_count);
+        crate::metrics::stream_active("all", self.total.load(Ordering::Acquire));
+        crate::metrics::stream_active(kind, kind_count);
 
         Ok(AttachedStreamPermit {
             limiter: Arc::clone(self),
@@ -2054,8 +2051,8 @@ impl AttachedStreamLimiter {
             .or_insert_with(|| Arc::new(AtomicUsize::new(0)))
             .clone();
         let kind_count = kind_counter.fetch_add(1, Ordering::AcqRel) + 1;
-        pplx_space_metrics::data_plane::stream_active("all", self.total.load(Ordering::Acquire));
-        pplx_space_metrics::data_plane::stream_active(kind, kind_count);
+        crate::metrics::stream_active("all", self.total.load(Ordering::Acquire));
+        crate::metrics::stream_active(kind, kind_count);
 
         Ok(AttachedStreamPermit {
             limiter: Arc::clone(self),
@@ -2153,8 +2150,8 @@ impl Drop for AttachedStreamPermit {
         {
             remove_zero_counter(&self.limiter.by_sandbox, key, counter);
         }
-        pplx_space_metrics::data_plane::stream_active("all", total);
-        pplx_space_metrics::data_plane::stream_active(self.kind, kind_count);
+        crate::metrics::stream_active("all", total);
+        crate::metrics::stream_active(self.kind, kind_count);
     }
 }
 

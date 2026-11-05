@@ -71,10 +71,7 @@ pub(crate) async fn session_events(
     let attached = match resolve_attach_route(&state, session_id, &token).await {
         Ok(attached) => attached,
         Err(error) => {
-            pplx_space_metrics::data_plane::attach(
-                session_id.kind().as_str(),
-                error.metric_label(),
-            );
+            crate::metrics::attach(session_id.kind().as_str(), error.metric_label());
             return route_resolution_http_error(error);
         }
     };
@@ -85,10 +82,7 @@ pub(crate) async fn session_events(
     let stream_permit = match state.attached_streams.try_acquire_attached(&attached) {
         Ok(permit) => permit,
         Err(limit) => {
-            pplx_space_metrics::data_plane::attach(
-                session_id.kind().as_str(),
-                limit.metric_label(),
-            );
+            crate::metrics::attach(session_id.kind().as_str(), limit.metric_label());
             return too_many_attached_streams_response(limit);
         }
     };
@@ -97,10 +91,7 @@ pub(crate) async fn session_events(
         SessionKind::Process => {
             // Only a forged id leaves no later id to number the stream with.
             let Some(replay) = ProcessReplayState::load(last_event_id) else {
-                pplx_space_metrics::data_plane::attach(
-                    session_id.kind().as_str(),
-                    "invalid_last_event_id",
-                );
+                crate::metrics::attach(session_id.kind().as_str(), "invalid_last_event_id");
                 return data_plane_http_error(
                     StatusCode::BAD_REQUEST,
                     DataPlaneHttpErrorCode::InvalidRequest,
@@ -113,10 +104,7 @@ pub(crate) async fn session_events(
             let start_permit = match state.native_sessions.try_acquire(session_id, attached.kind) {
                 Ok(permit) => permit,
                 Err(()) => {
-                    pplx_space_metrics::data_plane::attach(
-                        session_id.kind().as_str(),
-                        "session_already_attached",
-                    );
+                    crate::metrics::attach(session_id.kind().as_str(), "session_already_attached");
                     return data_plane_http_error(
                         StatusCode::CONFLICT,
                         DataPlaneHttpErrorCode::Conflict,
@@ -145,10 +133,7 @@ pub(crate) async fn session_events(
                     }
                     Ok(current) => (current, ProcessInput::ConnectOnly),
                     Err(error) => {
-                        pplx_space_metrics::data_plane::attach(
-                            session_id.kind().as_str(),
-                            error.metric_label(),
-                        );
+                        crate::metrics::attach(session_id.kind().as_str(), error.metric_label());
                         return route_resolution_http_error(error);
                     }
                 }
@@ -178,10 +163,7 @@ pub(crate) async fn session_events(
                 Err(error)
                     if input == ProcessInput::ConnectOnly && is_missing_guest_process(&error) =>
                 {
-                    pplx_space_metrics::data_plane::attach(
-                        session_id.kind().as_str(),
-                        "input_unsupported",
-                    );
+                    crate::metrics::attach(session_id.kind().as_str(), "input_unsupported");
                     return data_plane_http_error(
                         StatusCode::BAD_REQUEST,
                         DataPlaneHttpErrorCode::InvalidRequest,
@@ -193,7 +175,7 @@ pub(crate) async fn session_events(
                 }
                 Err(error) => {
                     let result = stream_bridge_error_label(&error);
-                    pplx_space_metrics::data_plane::attach(session_id.kind().as_str(), result);
+                    crate::metrics::attach(session_id.kind().as_str(), result);
                     tracing::warn!(%error, "failed to start process event stream");
                     forget_route_of_refused_sandbox(&route_cache, session_id, &error);
                     return process_stream_start_http_error(&error, sandbox_id);
@@ -215,7 +197,7 @@ pub(crate) async fn session_events(
                 Ok(stream_state) => SessionSseState::FileWatch(stream_state),
                 Err(error) => {
                     let result = stream_bridge_error_label(&error);
-                    pplx_space_metrics::data_plane::attach(session_id.kind().as_str(), result);
+                    crate::metrics::attach(session_id.kind().as_str(), result);
                     tracing::warn!(%error, "failed to start file-watch event stream");
                     forget_route_of_refused_sandbox(&route_cache, session_id, &error);
                     return file_watch_stream_start_http_error(&error, sandbox_id);
@@ -234,7 +216,7 @@ pub(crate) async fn session_events(
         }
     };
 
-    pplx_space_metrics::data_plane::attach(session_id.kind().as_str(), "ok");
+    crate::metrics::attach(session_id.kind().as_str(), "ok");
     let stream = futures_util::stream::unfold(stream_state, next_session_sse_event);
     Sse::new(stream)
         .keep_alive(KeepAlive::default())
@@ -621,7 +603,7 @@ impl ProcessSseState {
     }
 
     fn finish(&mut self, result: &'static str) {
-        pplx_space_metrics::data_plane::stream_closed(self.session_id.kind().as_str(), result);
+        crate::metrics::stream_closed(self.session_id.kind().as_str(), result);
         self.finished = true;
     }
 
@@ -632,7 +614,7 @@ impl ProcessSseState {
 
     fn finish_with_error(&mut self, error: StreamBridgeError) {
         let result = stream_bridge_error_label(&error);
-        pplx_space_metrics::data_plane::stream_closed(self.session_id.kind().as_str(), result);
+        crate::metrics::stream_closed(self.session_id.kind().as_str(), result);
         tracing::warn!(%error, "data-plane process event stream failed");
         self.finished = true;
         self.push_frame(DataPlaneServerFrame::Error {
@@ -1117,7 +1099,7 @@ impl FileWatchSseState {
     }
 
     fn finish(&mut self, result: &'static str) {
-        pplx_space_metrics::data_plane::stream_closed(self.session_id.kind().as_str(), result);
+        crate::metrics::stream_closed(self.session_id.kind().as_str(), result);
         self.finished = true;
     }
 
@@ -1128,7 +1110,7 @@ impl FileWatchSseState {
 
     fn finish_with_error(&mut self, error: StreamBridgeError) {
         let result = stream_bridge_error_label(&error);
-        pplx_space_metrics::data_plane::stream_closed(self.session_id.kind().as_str(), result);
+        crate::metrics::stream_closed(self.session_id.kind().as_str(), result);
         tracing::warn!(%error, "data-plane file watch event stream failed");
         self.finished = true;
         self.push_frame(DataPlaneServerFrame::Error {

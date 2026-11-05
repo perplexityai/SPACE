@@ -15,9 +15,9 @@ use pplx_space_common_core::inventory::InventoryBudget;
 
 fn state_publication_metric_field(
     field: crate::db::SandboxStatePublicationMetadataField,
-) -> pplx_space_metrics::sandbox::publication::StatePublicationField {
+) -> pplx_space_sandbox_metrics::publication::StatePublicationField {
     use crate::db::SandboxStatePublicationMetadataField as DbField;
-    use pplx_space_metrics::sandbox::publication::StatePublicationField as MetricField;
+    use pplx_space_sandbox_metrics::publication::StatePublicationField as MetricField;
 
     match field {
         DbField::QuarantineReasonCode => MetricField::QuarantineReasonCode,
@@ -36,8 +36,8 @@ fn state_publication_metric_field(
 
 fn state_publication_metadata_disposition(
     state: SandboxState,
-) -> pplx_space_metrics::sandbox::publication::StatePublicationDisposition {
-    use pplx_space_metrics::sandbox::publication::StatePublicationDisposition;
+) -> pplx_space_sandbox_metrics::publication::StatePublicationDisposition {
+    use pplx_space_sandbox_metrics::publication::StatePublicationDisposition;
 
     if state == SandboxState::Quarantined {
         StatePublicationDisposition::FallbackQuarantined
@@ -656,10 +656,10 @@ impl SandboxManagerService {
                                 error,
                                 route_provenance,
                             } = *row;
-                            let disposition = pplx_space_metrics::sandbox::publication::StatePublicationDisposition::StateOnly;
-                            pplx_space_metrics::sandbox::publication::degraded(
-                                pplx_space_metrics::sandbox::publication::StatePublicationComponent::Worker,
-                                pplx_space_metrics::sandbox::publication::StatePublicationField::CoreRow,
+                            let disposition = pplx_space_sandbox_metrics::publication::StatePublicationDisposition::StateOnly;
+                            pplx_space_sandbox_metrics::publication::degraded(
+                                pplx_space_sandbox_metrics::publication::StatePublicationComponent::Worker,
+                                pplx_space_sandbox_metrics::publication::StatePublicationField::CoreRow,
                                 disposition,
                             );
                             tracing::warn!(
@@ -808,10 +808,10 @@ impl SandboxManagerService {
                     sandboxes.push(sandbox);
                 }
                 Err(error) => {
-                    let disposition = pplx_space_metrics::sandbox::publication::StatePublicationDisposition::StateOnly;
-                    pplx_space_metrics::sandbox::publication::degraded(
-                        pplx_space_metrics::sandbox::publication::StatePublicationComponent::Worker,
-                        pplx_space_metrics::sandbox::publication::StatePublicationField::CoreRow,
+                    let disposition = pplx_space_sandbox_metrics::publication::StatePublicationDisposition::StateOnly;
+                    pplx_space_sandbox_metrics::publication::degraded(
+                        pplx_space_sandbox_metrics::publication::StatePublicationComponent::Worker,
+                        pplx_space_sandbox_metrics::publication::StatePublicationField::CoreRow,
                         disposition,
                     );
                     tracing::warn!(%sandbox_id, %error, %disposition, "publishing lifecycle without unpublishable sandbox fields");
@@ -969,9 +969,9 @@ impl SandboxManagerService {
             Some(Ok(metadata)) => (Some(metadata), true),
             Some(Err(error)) => {
                 let disposition = state_publication_metadata_disposition(sandbox.state);
-                pplx_space_metrics::sandbox::publication::degraded(
-                    pplx_space_metrics::sandbox::publication::StatePublicationComponent::Worker,
-                    pplx_space_metrics::sandbox::publication::StatePublicationField::CoreRow,
+                pplx_space_sandbox_metrics::publication::degraded(
+                    pplx_space_sandbox_metrics::publication::StatePublicationComponent::Worker,
+                    pplx_space_sandbox_metrics::publication::StatePublicationField::CoreRow,
                     disposition,
                 );
                 tracing::warn!(
@@ -990,8 +990,8 @@ impl SandboxManagerService {
             .unwrap_or_else(|error| {
                 let field = state_publication_metric_field(error.field());
                 let disposition = state_publication_metadata_disposition(sandbox.state);
-                pplx_space_metrics::sandbox::publication::degraded(
-                    pplx_space_metrics::sandbox::publication::StatePublicationComponent::Worker,
+                pplx_space_sandbox_metrics::publication::degraded(
+                    pplx_space_sandbox_metrics::publication::StatePublicationComponent::Worker,
                     field,
                     disposition,
                 );
@@ -1005,10 +1005,10 @@ impl SandboxManagerService {
                 None
             });
         if sandbox.state == SandboxState::Quarantined && !metadata_was_present {
-            let disposition = pplx_space_metrics::sandbox::publication::StatePublicationDisposition::FallbackQuarantined;
-            pplx_space_metrics::sandbox::publication::degraded(
-                pplx_space_metrics::sandbox::publication::StatePublicationComponent::Worker,
-                pplx_space_metrics::sandbox::publication::StatePublicationField::QuarantineReasonCode,
+            let disposition = pplx_space_sandbox_metrics::publication::StatePublicationDisposition::FallbackQuarantined;
+            pplx_space_sandbox_metrics::publication::degraded(
+                pplx_space_sandbox_metrics::publication::StatePublicationComponent::Worker,
+                pplx_space_sandbox_metrics::publication::StatePublicationField::QuarantineReasonCode,
                 disposition,
             );
             tracing::warn!(
@@ -1048,10 +1048,10 @@ impl SandboxManagerService {
                 match observation {
                     Ok(observation) => Some(observation),
                     Err(error) => {
-                        let disposition = pplx_space_metrics::sandbox::publication::StatePublicationDisposition::OmitQuarantineRecoveryObservation;
-                        pplx_space_metrics::sandbox::publication::degraded(
-                                pplx_space_metrics::sandbox::publication::StatePublicationComponent::Worker,
-                                pplx_space_metrics::sandbox::publication::StatePublicationField::QuarantineRecoveryObservation,
+                        let disposition = pplx_space_sandbox_metrics::publication::StatePublicationDisposition::OmitQuarantineRecoveryObservation;
+                        pplx_space_sandbox_metrics::publication::degraded(
+                                pplx_space_sandbox_metrics::publication::StatePublicationComponent::Worker,
+                                pplx_space_sandbox_metrics::publication::StatePublicationField::QuarantineRecoveryObservation,
                                 disposition,
                             );
                         tracing::warn!(

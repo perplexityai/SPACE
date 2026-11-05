@@ -145,16 +145,14 @@ impl<R> ResumableProcessStartState<R> {
                     } else {
                         ProcessStartDeliveryOutcome::NewStart
                     };
-                    pplx_space_metrics::data_plane::process_start_delivery(outcome);
+                    crate::metrics::process_start_delivery(outcome);
                 } else if self.replaying
                     && matches!(
                         &event.event,
                         Some(spaced_ops::process_event::Event::Connected(_))
                     )
                 {
-                    pplx_space_metrics::data_plane::process_start_delivery(
-                        ProcessStartDeliveryOutcome::Reattached,
-                    );
+                    crate::metrics::process_start_delivery(ProcessStartDeliveryOutcome::Reattached);
                 }
             }
             Some(
@@ -265,7 +263,7 @@ where
                         if state.replaying
                             && let Some(outcome) = process_start_delivery_failure(&status)
                         {
-                            pplx_space_metrics::data_plane::process_start_delivery(outcome);
+                            crate::metrics::process_start_delivery(outcome);
                         }
                         state.ended = true;
                         return Some((Err(status), state));
@@ -336,7 +334,7 @@ pub(super) fn record_process_start_recovery(
     mode: ProcessStartRecoveryMode,
 ) {
     if let Some(interruption) = process_start_recovery_interruption(status) {
-        pplx_space_metrics::data_plane::process_start_recovery(interruption, mode);
+        crate::metrics::process_start_recovery(interruption, mode);
     }
 }
 
@@ -520,7 +518,7 @@ pub(super) fn process_start_reopen_status(
     if resume.is_connect()
         && let Some(outcome) = process_start_delivery_failure(&status)
     {
-        pplx_space_metrics::data_plane::process_start_delivery(outcome);
+        crate::metrics::process_start_delivery(outcome);
     }
     status
 }
@@ -529,8 +527,8 @@ pub(super) fn reset_process_start_stream_channel(state: &DataPlaneState, route: 
     state
         .backend_channels
         .forget_endpoint(&route.backend_endpoint);
-    pplx_space_metrics::data_plane::backend_channel_reset("ecw", "worker_unavailable");
-    pplx_space_metrics::data_plane::backend_affected_streams(ECW_PROCESS_STREAM_KIND, 1);
+    crate::metrics::backend_channel_reset("ecw", "worker_unavailable");
+    crate::metrics::backend_affected_streams(ECW_PROCESS_STREAM_KIND, 1);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -780,14 +778,14 @@ impl<S> ProcessConnectJsonStream<S> {
             return;
         }
         self.close_recorded = true;
-        pplx_space_metrics::data_plane::stream_closed(ECW_PROCESS_STREAM_KIND, result);
+        crate::metrics::stream_closed(ECW_PROCESS_STREAM_KIND, result);
     }
 }
 
 impl<S> Drop for ProcessConnectJsonStream<S> {
     fn drop(&mut self) {
         if !self.close_recorded {
-            pplx_space_metrics::data_plane::stream_closed(ECW_PROCESS_STREAM_KIND, "client_closed");
+            crate::metrics::stream_closed(ECW_PROCESS_STREAM_KIND, "client_closed");
         }
     }
 }
@@ -931,5 +929,5 @@ where
 }
 
 pub(super) fn record_ecw_process_stream_bytes(bytes: &Bytes) {
-    pplx_space_metrics::data_plane::stream_bytes_out(ECW_PROCESS_STREAM_KIND, bytes.len() as u64);
+    crate::metrics::stream_bytes_out(ECW_PROCESS_STREAM_KIND, bytes.len() as u64);
 }

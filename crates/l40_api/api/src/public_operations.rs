@@ -6,8 +6,8 @@ use std::str::FromStr;
 use std::sync::LazyLock;
 use std::time::Duration;
 
+use crate::metrics::operations::ClaimAttempt;
 use pplx_space_common_core::types::{IdempotencyKey, SandboxId, SandboxLifecycle};
-use pplx_space_metrics::operations::ClaimAttempt;
 use pplx_space_public_api::{
     OperationId, OperationKind, OperationState, OperationTargetType, PublicErrorCode,
     PublicOperationEvent, PublicOperationEventType, PublicOperationRecord, PublicOperationResult,
@@ -675,7 +675,7 @@ impl PublicOperationStore {
         tx.commit().await?;
         superseded.record();
         if matches!(result, CreatePublicOperationResult::Created(_)) {
-            pplx_space_metrics::operations::created(
+            crate::metrics::operations::created(
                 api_product.as_str(),
                 kind.as_str(),
                 target_type
@@ -820,7 +820,7 @@ impl PublicOperationStore {
                 tx.commit().await?;
                 superseded.record();
                 if matches!(result, CreatePublicOperationResult::Created(_)) {
-                    pplx_space_metrics::operations::created(
+                    crate::metrics::operations::created(
                         ApiProduct::Native.as_str(),
                         kind.as_str(),
                         OperationTargetType::Sandbox.as_str(),
@@ -987,7 +987,7 @@ impl PublicOperationStore {
         tx.commit().await?;
         superseded.record();
 
-        pplx_space_metrics::operations::created(
+        crate::metrics::operations::created(
             api_product.as_str(),
             kind.as_str(),
             target_type
@@ -995,7 +995,7 @@ impl PublicOperationStore {
                 .map(OperationTargetType::as_str)
                 .unwrap_or("none"),
         );
-        pplx_space_metrics::operations::claimed(api_product.as_str(), kind.as_str());
+        crate::metrics::operations::claimed(api_product.as_str(), kind.as_str());
         Ok(CreateClaimedPublicOperationResult::Claimed {
             claim_token,
             operation,
@@ -1442,7 +1442,7 @@ struct CreationRecord {
 impl CreationRecord {
     fn record(self) {
         self.superseded.record();
-        pplx_space_metrics::operations::created(
+        crate::metrics::operations::created(
             self.api_product.as_str(),
             self.kind.as_str(),
             self.target_type
@@ -1666,7 +1666,7 @@ impl PublicOperationAdmission {
         self.tx.commit().await?;
         superseded.record();
         if matches!(result, CreatePublicOperationResult::Created(_)) {
-            pplx_space_metrics::operations::created(
+            crate::metrics::operations::created(
                 api_product.as_str(),
                 kind.as_str(),
                 target_type
@@ -1890,7 +1890,7 @@ impl PublicOperationAdmission {
         }
         self.tx.commit().await?;
         superseded.record();
-        pplx_space_metrics::operations::created(
+        crate::metrics::operations::created(
             api_product.as_str(),
             kind.as_str(),
             target_type
@@ -2266,7 +2266,7 @@ impl SupersededCreates {
     /// Count the canceled creates; call after the transaction commits.
     pub fn record(self) {
         for api_product in self.0 {
-            pplx_space_metrics::operations::completed(
+            crate::metrics::operations::completed(
                 api_product.as_str(),
                 OperationKind::CreateSandbox.as_str(),
                 OperationState::Canceled.as_str(),
@@ -3207,7 +3207,7 @@ async fn claim_operations(
         } else {
             ClaimAttempt::First
         };
-        pplx_space_metrics::operations::queue_wait(
+        crate::metrics::operations::queue_wait(
             operation.api_product.as_str(),
             operation.kind.as_str(),
             attempt,

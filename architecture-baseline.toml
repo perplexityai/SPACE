@@ -94,9 +94,6 @@ pplx-space-sbx-mgr-store = [
 ]
 
 [layers.direction]
-pplx-space-metrics = [
-  "pplx-space-common-core",
-]
 
 [layers.domain_dependencies]
 pplx-space-common-core = [

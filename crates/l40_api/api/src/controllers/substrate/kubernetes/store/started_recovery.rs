@@ -409,7 +409,7 @@ impl K8sStore {
             .await
             .db_context("failed to commit started recovery handoff")?;
         if activation_attempt_id.is_some() {
-            pplx_space_metrics::sandbox::api::route_identity_decision(
+            crate::metrics::sandbox::api::route_identity_decision(
                 RouteIdentityDecisionReason::ExecutionReplaced,
             );
         }

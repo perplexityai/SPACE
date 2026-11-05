@@ -102,7 +102,7 @@ impl KubernetesSubstrate {
         if let Some(pod) = self.lookup_sandbox_pod(pod_name)
             && pod_status_is_settled(&pod)
         {
-            pplx_space_metrics::sandbox::api::read_sandbox_pod_outcome("cache_settled");
+            crate::metrics::sandbox::api::read_sandbox_pod_outcome("cache_settled");
             return Ok(Some(pod));
         }
         // Wait for either a matching reflector event or the budget to elapse.
@@ -117,10 +117,10 @@ impl KubernetesSubstrate {
         if let Some(pod) = self.lookup_sandbox_pod(pod_name)
             && pod_status_is_settled(&pod)
         {
-            pplx_space_metrics::sandbox::api::read_sandbox_pod_outcome("event_settled");
+            crate::metrics::sandbox::api::read_sandbox_pod_outcome("event_settled");
             return Ok(Some(pod));
         }
-        pplx_space_metrics::sandbox::api::read_sandbox_pod_outcome("get_fallback");
+        crate::metrics::sandbox::api::read_sandbox_pod_outcome("get_fallback");
         fetch_sandbox_pod_uncached(&self.k8s, pod_name).await
     }
 

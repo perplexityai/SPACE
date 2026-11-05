@@ -60,6 +60,7 @@ use std::collections::HashSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
+use crate::metrics::cluster_reconciler as metrics;
 use jiff::{SignedDuration, Timestamp};
 use k8s_openapi::api::core::v1::Pod;
 use kube::Client;
@@ -71,7 +72,6 @@ use pplx_space_common_core::types::{PodUid, SandboxId};
 use pplx_space_events::{
     SandboxEvent, SandboxEventDetails, SandboxEventSource, SandboxEventTrigger, SandboxEventType,
 };
-use pplx_space_metrics::cluster_reconciler as metrics;
 use uuid::Uuid;
 
 use crate::env_config;

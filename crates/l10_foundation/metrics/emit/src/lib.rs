@@ -8,10 +8,11 @@
 //! crates emit through a metrics module's named functions, not by calling
 //! these directly.
 //!
-//! It is its own crate so that each crate can define the metrics it records
-//! without depending on `pplx-space-metrics` and, through it, on
-//! `pplx-space-common-core`. Tests that assert on captured values enable
-//! `test-capture` on their own dev-dependency on this crate.
+//! It defines no metric itself: each crate defines the metrics it records in
+//! its own `metrics` module on top of it, and a family several crates record
+//! lives in the recorder the others depend on or in a shared `*-metrics` crate
+//! such as `pplx-space-grpc-metrics`. Tests that assert on captured values
+//! enable `test-capture` on their own dev-dependency on this crate.
 
 /// Declare a bounded metric-tag vocabulary: the enum, its canonical `as_str`,
 /// and a `Display` that agrees with it.

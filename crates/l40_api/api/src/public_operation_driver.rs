@@ -22,8 +22,8 @@ use crate::public_operations::{
 use crate::public_sandbox_operations::PublicOperationExecutionResult;
 use crate::retry_deferral::RetryDeferral;
 
-use pplx_space_metrics::operations::ExecutionOutcome;
-pub use pplx_space_metrics::operations::OperationExecutor;
+use crate::metrics::operations::ExecutionOutcome;
+pub use crate::metrics::operations::OperationExecutor;
 
 /// How long a claim may go unrenewed before the dispatcher reclaims it.
 pub const DEFAULT_CLAIM_STALE_AFTER: Duration = Duration::from_secs(60);
@@ -336,7 +336,7 @@ where
             report.expired += 1;
             // Not an execution, so counted as the sweep counts an expiry:
             // no claim by this executor, and a completion with no executor.
-            pplx_space_metrics::operations::completed(
+            crate::metrics::operations::completed(
                 api_product_label,
                 kind.as_str(),
                 OperationState::Expired.as_str(),
@@ -354,7 +354,7 @@ where
         }
         return Ok(report);
     }
-    pplx_space_metrics::operations::claimed_by(api_product_label, kind.as_str(), executor);
+    crate::metrics::operations::claimed_by(api_product_label, kind.as_str(), executor);
     let started_at = Instant::now();
     let (report, outcome) = match execute_and_record(
         store,
@@ -369,7 +369,7 @@ where
         Ok((report, outcome)) => (Ok(report), outcome),
         Err(error) => (Err(error), ExecutionOutcome::Error),
     };
-    pplx_space_metrics::operations::execution(
+    crate::metrics::operations::execution(
         api_product_label,
         kind.as_str(),
         executor,
@@ -440,7 +440,7 @@ where
                 .await?;
             if updated {
                 report.succeeded += 1;
-                pplx_space_metrics::operations::completed_by(
+                crate::metrics::operations::completed_by(
                     api_product_label,
                     kind.as_str(),
                     OperationState::Succeeded.as_str(),
@@ -470,13 +470,13 @@ where
                 .await?;
             if updated {
                 report.failed += 1;
-                pplx_space_metrics::operations::failed(
+                crate::metrics::operations::failed(
                     api_product_label,
                     kind.as_str(),
                     &terminal_error_label,
                     executor,
                 );
-                pplx_space_metrics::operations::completed_by(
+                crate::metrics::operations::completed_by(
                     api_product_label,
                     kind.as_str(),
                     OperationState::Failed.as_str(),
@@ -573,19 +573,19 @@ where
                     .await?;
                 if updated {
                     report.failed += 1;
-                    pplx_space_metrics::operations::failed(
+                    crate::metrics::operations::failed(
                         api_product_label,
                         kind.as_str(),
                         terminal_error_code.as_str(),
                         executor,
                     );
-                    pplx_space_metrics::operations::completed_by(
+                    crate::metrics::operations::completed_by(
                         api_product_label,
                         kind.as_str(),
                         OperationState::Failed.as_str(),
                         executor,
                     );
-                    pplx_space_metrics::operations::deadline_exceeded(
+                    crate::metrics::operations::deadline_exceeded(
                         api_product_label,
                         kind.as_str(),
                         last_requeue_reason,
@@ -668,13 +668,13 @@ where
                         );
                     }
                     report.failed += 1;
-                    pplx_space_metrics::operations::failed(
+                    crate::metrics::operations::failed(
                         api_product_label,
                         kind.as_str(),
                         terminal_error_code.as_str(),
                         executor,
                     );
-                    pplx_space_metrics::operations::completed_by(
+                    crate::metrics::operations::completed_by(
                         api_product_label,
                         kind.as_str(),
                         OperationState::Failed.as_str(),
@@ -716,7 +716,7 @@ where
                 match released {
                     ReleasedClaim::Requeued => {
                         report.retried += 1;
-                        pplx_space_metrics::operations::requeued(
+                        crate::metrics::operations::requeued(
                             api_product_label,
                             kind.as_str(),
                             retry_reason,
@@ -726,7 +726,7 @@ where
                     }
                     ReleasedClaim::Superseded { delete_id } => {
                         report.canceled += 1;
-                        pplx_space_metrics::operations::completed_by(
+                        crate::metrics::operations::completed_by(
                             api_product_label,
                             kind.as_str(),
                             OperationState::Canceled.as_str(),
@@ -778,7 +778,7 @@ fn record_lost_claim(
     operation_id: OperationId,
 ) {
     report.stale_claims += 1;
-    pplx_space_metrics::operations::stale_claim(api_product_label, kind.as_str(), executor);
+    crate::metrics::operations::stale_claim(api_product_label, kind.as_str(), executor);
     tracing::warn!(
         operation_id = %operation_id,
         "public operation claim was lost before completion update"
@@ -810,7 +810,7 @@ pub async fn expire_overdue_queued_operations(
         )
         .await?;
     for operation in &expired {
-        pplx_space_metrics::operations::completed(
+        crate::metrics::operations::completed(
             ApiProduct::Native.as_str(),
             operation.kind.as_str(),
             OperationState::Expired.as_str(),

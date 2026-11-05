@@ -617,7 +617,7 @@ impl ConsoleDecision {
     }
 
     fn record(self) {
-        pplx_space_metrics::auth::external_console_decision(self.as_str());
+        crate::metrics::auth::external_console_decision(self.as_str());
     }
 }
 

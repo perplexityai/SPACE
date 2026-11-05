@@ -973,7 +973,7 @@ async fn direct_create_rejects_node_pool_placement() -> TestResult {
     let result = fixture
         .substrate
         .create_execution(CreateExecutionRequest {
-            metric_identity: pplx_space_metrics::sandbox::api::SandboxApiMetricIdentity::native(
+            metric_identity: crate::metrics::sandbox::api::SandboxApiMetricIdentity::native(
                 "create",
             ),
             sandbox_id,
@@ -2689,7 +2689,7 @@ async fn direct_create_receipt_failure_deletes_node_local_sandbox() -> TestResul
     let result = fixture
         .substrate
         .create_execution(CreateExecutionRequest {
-            metric_identity: pplx_space_metrics::sandbox::api::SandboxApiMetricIdentity::native(
+            metric_identity: crate::metrics::sandbox::api::SandboxApiMetricIdentity::native(
                 "create",
             ),
             sandbox_id,
@@ -2766,7 +2766,7 @@ async fn direct_create_identity_preparation_failure_deletes_node_local_sandbox()
     let result = fixture
         .substrate
         .create_execution(CreateExecutionRequest {
-            metric_identity: pplx_space_metrics::sandbox::api::SandboxApiMetricIdentity::native(
+            metric_identity: crate::metrics::sandbox::api::SandboxApiMetricIdentity::native(
                 "create",
             ),
             sandbox_id,
@@ -2839,7 +2839,7 @@ async fn two_step_direct_create_initializes_identity_for_initial_start() -> Test
     let outcome = fixture
         .substrate
         .create_execution(CreateExecutionRequest {
-            metric_identity: pplx_space_metrics::sandbox::api::SandboxApiMetricIdentity::native(
+            metric_identity: crate::metrics::sandbox::api::SandboxApiMetricIdentity::native(
                 "create",
             ),
             sandbox_id,
@@ -2959,7 +2959,7 @@ impl DirectCreateFixture {
                 &self.postgres.pool,
                 &self.actor,
                 request,
-                pplx_space_metrics::sandbox::api::SandboxApiMetricIdentity::native("create"),
+                crate::metrics::sandbox::api::SandboxApiMetricIdentity::native("create"),
                 crate::controllers::sandbox::FederatedSandboxCreateContext::new(None, None),
             )
             .await
@@ -3125,7 +3125,7 @@ async fn live_cpu_update_preserves_allocation_across_cold_restart() -> TestResul
             fixture
                 .substrate
                 .start_execution(
-                    pplx_space_metrics::sandbox::api::SandboxApiMetricIdentity::native("start"),
+                    crate::metrics::sandbox::api::SandboxApiMetricIdentity::native("start"),
                     sandbox_id,
                     ActivationOptions {
                         blocking: true,
@@ -3184,7 +3184,7 @@ async fn direct_start_persists_complete_route_identity_receipt() -> TestResult {
     fixture
         .substrate
         .start_execution(
-            pplx_space_metrics::sandbox::api::SandboxApiMetricIdentity::native("start"),
+            crate::metrics::sandbox::api::SandboxApiMetricIdentity::native("start"),
             sandbox_id,
             ActivationOptions {
                 blocking: true,
@@ -3746,7 +3746,7 @@ async fn direct_start_rejects_wrong_worker_receipt_and_clears_stale_identity() -
     fixture
         .substrate
         .start_execution(
-            pplx_space_metrics::sandbox::api::SandboxApiMetricIdentity::native("start"),
+            crate::metrics::sandbox::api::SandboxApiMetricIdentity::native("start"),
             sandbox_id,
             ActivationOptions {
                 blocking: true,
@@ -3889,9 +3889,7 @@ async fn pooled_claim_persists_route_receipt_after_api_sandbox_insert() -> TestR
     let auto_lifecycle = AutoLifecyclePolicy::disabled();
     let policy = NetworkPolicyV1::deny_all();
     let request = PooledExecutionClaimRequest {
-        metric_identity: pplx_space_metrics::sandbox::api::SandboxApiMetricIdentity::native(
-            "create",
-        ),
+        metric_identity: crate::metrics::sandbox::api::SandboxApiMetricIdentity::native("create"),
         actor: &actor,
         template: "seed",
         content_hash: Some("hash-seed"),
@@ -4030,7 +4028,7 @@ async fn cross_node_restore_handles_candidate_failures(
     let result = fixture
         .substrate
         .restore_execution(
-            pplx_space_metrics::sandbox::api::SandboxApiMetricIdentity::native("restore"),
+            crate::metrics::sandbox::api::SandboxApiMetricIdentity::native("restore"),
             sandbox_id,
             ActivationOptions {
                 blocking: true,
@@ -4186,7 +4184,7 @@ async fn cross_node_restore_retains_source_after_receipt_persistence_failure() -
     let error = fixture
         .substrate
         .restore_execution(
-            pplx_space_metrics::sandbox::api::SandboxApiMetricIdentity::native("restore"),
+            crate::metrics::sandbox::api::SandboxApiMetricIdentity::native("restore"),
             sandbox_id,
             ActivationOptions {
                 blocking: true,
@@ -4468,7 +4466,7 @@ async fn implicit_access_wake_honors_the_workers_effective_policy() -> TestResul
         let result = fixture
             .substrate
             .access_runtime_client(
-                pplx_space_metrics::sandbox::api::SandboxApiMetricIdentity::native("ingress"),
+                crate::metrics::sandbox::api::SandboxApiMetricIdentity::native("ingress"),
                 &sandbox,
                 ExecutionActivityKind::Access,
                 Duration::from_secs(5),
@@ -4518,7 +4516,7 @@ async fn implicit_access_wake_refuses_when_the_cluster_policy_denies_it() -> Tes
     let error = match fixture
         .substrate
         .access_runtime_client(
-            pplx_space_metrics::sandbox::api::SandboxApiMetricIdentity::native("ingress"),
+            crate::metrics::sandbox::api::SandboxApiMetricIdentity::native("ingress"),
             &sandbox,
             ExecutionActivityKind::Access,
             Duration::from_secs(5),
@@ -4550,9 +4548,7 @@ async fn pooled_claim_checks_capability_before_adopting_and_retains_its_generati
     let policy = crate::e2b::auto_lifecycle_policy(60, true, true);
     let network = NetworkPolicyV1::deny_all();
     let request = PooledExecutionClaimRequest {
-        metric_identity: pplx_space_metrics::sandbox::api::SandboxApiMetricIdentity::native(
-            "create",
-        ),
+        metric_identity: crate::metrics::sandbox::api::SandboxApiMetricIdentity::native("create"),
         actor: &actor,
         template: "seed",
         content_hash: Some("hash-seed"),
@@ -4690,7 +4686,7 @@ async fn wake_reserves_fresh_identity_when_observed_resident_retires() -> TestRe
     fixture
         .substrate
         .wake_execution(
-            pplx_space_metrics::sandbox::api::SandboxApiMetricIdentity::native("wake"),
+            crate::metrics::sandbox::api::SandboxApiMetricIdentity::native("wake"),
             &sandbox,
             Duration::from_secs(5),
             None,
@@ -4751,7 +4747,7 @@ async fn wake_keeps_generation_observed_during_resident_transition(
     fixture
         .substrate
         .wake_execution(
-            pplx_space_metrics::sandbox::api::SandboxApiMetricIdentity::native("wake"),
+            crate::metrics::sandbox::api::SandboxApiMetricIdentity::native("wake"),
             &sandbox,
             Duration::from_secs(5),
             Some(ExecutionActivityKind::Access),

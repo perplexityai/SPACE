@@ -420,14 +420,14 @@ impl CommandReadyPollBackoff {
 }
 
 pub(super) fn record_pod_proxy_wait_ready(
-    metric_identity: pplx_space_metrics::sandbox::api::SandboxApiMetricIdentity,
+    metric_identity: crate::metrics::sandbox::api::SandboxApiMetricIdentity,
     sandbox_id: SandboxId,
     started_at: Instant,
     connect_started_at: Instant,
 ) {
-    pplx_space_metrics::sandbox::api::api_step_latency(
+    crate::metrics::sandbox::api::api_step_latency(
         sandbox_id,
-        pplx_space_metrics::sandbox::api::ApiStep {
+        crate::metrics::sandbox::api::ApiStep {
             identity: metric_identity,
             backend: "fc",
             template: None,
@@ -439,9 +439,9 @@ pub(super) fn record_pod_proxy_wait_ready(
             since: None,
         },
     );
-    pplx_space_metrics::sandbox::api::api_step_latency(
+    crate::metrics::sandbox::api::api_step_latency(
         sandbox_id,
-        pplx_space_metrics::sandbox::api::ApiStep {
+        crate::metrics::sandbox::api::ApiStep {
             identity: metric_identity,
             backend: "fc",
             template: None,
@@ -456,13 +456,13 @@ pub(super) fn record_pod_proxy_wait_ready(
 }
 
 pub(super) fn record_pod_proxy_wait_timeout(
-    metric_identity: pplx_space_metrics::sandbox::api::SandboxApiMetricIdentity,
+    metric_identity: crate::metrics::sandbox::api::SandboxApiMetricIdentity,
     sandbox_id: SandboxId,
     started_at: Instant,
 ) {
-    pplx_space_metrics::sandbox::api::api_step_error(
+    crate::metrics::sandbox::api::api_step_error(
         sandbox_id,
-        pplx_space_metrics::sandbox::api::ApiStepError {
+        crate::metrics::sandbox::api::ApiStepError {
             identity: metric_identity,
             backend: "fc",
             template: None,
@@ -473,9 +473,9 @@ pub(super) fn record_pod_proxy_wait_timeout(
             grpc_code: None,
         },
     );
-    pplx_space_metrics::sandbox::api::api_step_latency(
+    crate::metrics::sandbox::api::api_step_latency(
         sandbox_id,
-        pplx_space_metrics::sandbox::api::ApiStep {
+        crate::metrics::sandbox::api::ApiStep {
             identity: metric_identity,
             backend: "fc",
             template: None,
@@ -490,14 +490,14 @@ pub(super) fn record_pod_proxy_wait_timeout(
 }
 
 pub(super) fn record_pod_ip_ready(
-    metric_identity: pplx_space_metrics::sandbox::api::SandboxApiMetricIdentity,
+    metric_identity: crate::metrics::sandbox::api::SandboxApiMetricIdentity,
     sandbox_id: SandboxId,
     started_at: Instant,
     result: &'static str,
 ) {
-    pplx_space_metrics::sandbox::api::api_step_latency(
+    crate::metrics::sandbox::api::api_step_latency(
         sandbox_id,
-        pplx_space_metrics::sandbox::api::ApiStep {
+        crate::metrics::sandbox::api::ApiStep {
             identity: metric_identity,
             backend: "fc",
             template: None,
@@ -513,15 +513,15 @@ pub(super) fn record_pod_ip_ready(
 
 pub(super) fn record_api_wait_ready_latency(
     sandbox_id: SandboxId,
-    metric_identity: pplx_space_metrics::sandbox::api::SandboxApiMetricIdentity,
+    metric_identity: crate::metrics::sandbox::api::SandboxApiMetricIdentity,
     wait_phase: &'static str,
     result: &'static str,
     started_at: Instant,
     since: Option<&'static str>,
 ) {
-    pplx_space_metrics::sandbox::api::api_step_latency(
+    crate::metrics::sandbox::api::api_step_latency(
         sandbox_id,
-        pplx_space_metrics::sandbox::api::ApiStep {
+        crate::metrics::sandbox::api::ApiStep {
             identity: metric_identity,
             backend: "fc",
             template: None,
@@ -537,14 +537,14 @@ pub(super) fn record_api_wait_ready_latency(
 
 pub(super) fn record_api_wait_ready_error(
     sandbox_id: SandboxId,
-    metric_identity: pplx_space_metrics::sandbox::api::SandboxApiMetricIdentity,
+    metric_identity: crate::metrics::sandbox::api::SandboxApiMetricIdentity,
     wait_phase: &'static str,
     reason: &'static str,
     grpc_code: &'static str,
 ) {
-    pplx_space_metrics::sandbox::api::api_step_error(
+    crate::metrics::sandbox::api::api_step_error(
         sandbox_id,
-        pplx_space_metrics::sandbox::api::ApiStepError {
+        crate::metrics::sandbox::api::ApiStepError {
             identity: metric_identity,
             backend: "fc",
             template: None,
@@ -1235,7 +1235,7 @@ impl Drop for CancelGuard {
                 pod_name = %pod_name,
                 "create_execution cancelled (node-mgr unreachable) — deferring pod cleanup to reconciler"
             );
-            pplx_space_metrics::sandbox::api::create_cancel_cleanup_deferred();
+            crate::metrics::sandbox::api::create_cancel_cleanup_deferred();
             return;
         }
 

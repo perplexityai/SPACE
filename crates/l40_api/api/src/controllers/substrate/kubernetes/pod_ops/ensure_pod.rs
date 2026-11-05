@@ -11,8 +11,8 @@ use super::*;
 pub(super) fn restore_placement_sample(
     context: &PodCreateContext<'_>,
     hard_pin: bool,
-) -> Option<pplx_space_metrics::sandbox::restore::PlacementSample> {
-    use pplx_space_metrics::sandbox::restore::{PlacementSample, RestorePlacement, SourcePin};
+) -> Option<crate::metrics::sandbox::restore::PlacementSample> {
+    use crate::metrics::sandbox::restore::{PlacementSample, RestorePlacement, SourcePin};
     match context {
         PodCreateContext::OnDemand => None,
         // Evacuation deliberately drops the source pin: always cross-node.
@@ -529,7 +529,7 @@ impl KubernetesSubstrate {
                     // itself re-verifies the pod with an authoritative GET
                     // before any teardown.
                     match Box::pin(self.redrive_unschedulable_restore_cross_node_recorded(
-                        pplx_space_metrics::sandbox::restore::RedrivePath::Retry,
+                        crate::metrics::sandbox::restore::RedrivePath::Retry,
                         &sandbox,
                         &claim,
                         claim_lifecycle,
@@ -558,11 +558,11 @@ impl KubernetesSubstrate {
                             let local_snapshot_present = cross_node_pod
                                 .annotation(SandboxPodKey::SuspendRestoreSourceNode)
                                 .is_some_and(|value| !value.trim().is_empty());
-                            pplx_space_metrics::sandbox::restore::placement_directed(
-                                pplx_space_metrics::sandbox::restore::PlacementSample {
-                                    placement: pplx_space_metrics::sandbox::restore::RestorePlacement::CrossNode,
+                            crate::metrics::sandbox::restore::placement_directed(
+                                crate::metrics::sandbox::restore::PlacementSample {
+                                    placement: crate::metrics::sandbox::restore::RestorePlacement::CrossNode,
                                     local_snapshot_present,
-                                    pin: pplx_space_metrics::sandbox::restore::SourcePin::None,
+                                    pin: crate::metrics::sandbox::restore::SourcePin::None,
                                 },
                             );
                             return Ok(());
@@ -1229,7 +1229,7 @@ impl KubernetesSubstrate {
 
         // Only `Ok(Some(_))` reaches here — materialization is committed and we
         // own the generation. `Ok(None)` / `Err` returned above.
-        use pplx_space_metrics::sandbox::restore::{RestorePlacement, SourcePin};
+        use crate::metrics::sandbox::restore::{RestorePlacement, SourcePin};
         let mut placement_pod = pod;
         let mut placement_sample = placement_sample;
 
@@ -1270,7 +1270,7 @@ impl KubernetesSubstrate {
                 // with an authoritative GET before any teardown.
                 Some(SchedulingOutcome::Unschedulable) => {
                     match Box::pin(self.redrive_unschedulable_restore_cross_node_recorded(
-                        pplx_space_metrics::sandbox::restore::RedrivePath::FreshCreate,
+                        crate::metrics::sandbox::restore::RedrivePath::FreshCreate,
                         &sandbox,
                         &claim,
                         claim_lifecycle,
@@ -1347,7 +1347,7 @@ impl KubernetesSubstrate {
         // and after any in-request cross-node re-drive so the metric reflects
         // the actual landing site.
         if created && let Some(sample) = placement_sample {
-            pplx_space_metrics::sandbox::restore::placement_directed(sample);
+            crate::metrics::sandbox::restore::placement_directed(sample);
         }
 
         let _ = self

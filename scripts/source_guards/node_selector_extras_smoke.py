@@ -19,7 +19,9 @@ right tool for:
   controller, so attributing that one file to one Deployment would miss the
   others. Resolution walks the workspace dependency graph transitively, so a
   binary that reaches a call site through an intermediate crate is a renderer
-  too.
+  too. Binaries in the `tools` layer are the exception: they are never shipped
+  (`crates/tools/AGENTS.md`), so one that reaches a call site, such as a
+  hand-run validation workload, composes no deployed selector.
 
   The one thing it cannot see is a call reached under a different spelling — a
   `use … as` alias, or the constructor renamed. That is a real limit, not a
@@ -64,6 +66,11 @@ APP_DEPLOYMENTS = {
     "crates/l50_app/internal/api/svc": "space-internal-api",
     "crates/l50_app/cluster/controller/svc": "space-cluster-controller",
 }
+
+
+# Layer directories whose binaries are never deployed: repository tools run only
+# in development or CI (crates/tools/AGENTS.md), so they are no renderer.
+NEVER_DEPLOYED_DIRS = ("crates/tools/",)
 
 
 class GuardError(Exception):
@@ -245,6 +252,8 @@ def _renderer_deployments() -> dict[str, str]:
     for package, directory in sorted(directories.items()):
         relative_dir = directory.relative_to(CRATES.parent).as_posix()
         if not _declares_binary(directory / "Cargo.toml"):
+            continue
+        if relative_dir.startswith(NEVER_DEPLOYED_DIRS):
             continue
         via = reaches(package)
         if via is None:

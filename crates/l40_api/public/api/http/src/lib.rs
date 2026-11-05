@@ -4,6 +4,7 @@
 //! rejection or an unhandled error status is normalized into.
 
 mod error;
+pub mod metrics;
 mod request_id;
 
 pub use error::{

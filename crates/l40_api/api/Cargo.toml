@@ -99,8 +99,8 @@ pplx-space-node-mgr-client = { workspace = true }
 pplx-space-cluster-trigger-queue = { workspace = true }
 pplx-space-events = { workspace = true }
 pplx-space-grpc-metrics = { workspace = true }
-pplx-space-metrics = { workspace = true }
 pplx-space-metrics-emit = { workspace = true }
+pplx-space-sandbox-metrics = { workspace = true }
 pplx-space-native-files = { workspace = true }
 pplx-space-postgres-pool = { workspace = true }
 pplx-space-public-api-http = { workspace = true }

@@ -8,12 +8,12 @@ use axum::{
 };
 use pplx_space_common_core::sql;
 use pplx_space_common_core::types::IdempotencyKey;
-use pplx_space_metrics::response::{ResponseKind, ResponseOrigin};
 use pplx_space_public_api::{
     ClosePortExposureRequest, ListPortExposuresResponse, OpenPortExposureRequest, PortExposure,
     PortExposureApplyState, PortExposureDesiredState, PortExposureProtocol, PortExposureResponse,
     PortExposureVisibility, RequestFingerprint,
 };
+use pplx_space_public_api_http::metrics::{ResponseKind, ResponseOrigin};
 use sha2::{Digest, Sha256};
 use sqlx::types::Json as SqlJson;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};

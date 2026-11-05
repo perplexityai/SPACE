@@ -184,10 +184,10 @@ where
                 self.config.max_delete_per_tick,
             )
             .await?;
-        pplx_space_metrics::admin::audit_retained_rows(report.retained_rows);
+        crate::metrics::admin::audit_retained_rows(report.retained_rows);
         let total_deleted = report.total_deleted();
         if total_deleted > 0 {
-            pplx_space_metrics::admin::audit_retention_deleted(total_deleted);
+            crate::metrics::admin::audit_retention_deleted(total_deleted);
             tracing::info!(
                 aged_deleted = report.aged_deleted,
                 overflow_deleted = report.overflow_deleted,

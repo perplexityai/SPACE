@@ -10,6 +10,12 @@ use std::sync::{
 };
 use std::time::Duration;
 
+use crate::metrics::{
+    BackendRpcResult, BackendRpcSurface, ResponseKind, ResponseOrigin, ResponseSurface,
+    RouteRepairResult, RouteRepairSurface, ServicePortIngressOpenReason,
+    ServicePortIngressOpenResult, ServiceRouteSurface, ServiceRouteTransport,
+    SpaceApiRouteTokenDropReason, SpaceApiRouteTokenRouteSource, TooManyRequestsReason,
+};
 use axum::body::Body;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{ConnectInfo, Path, State};
@@ -37,12 +43,6 @@ use pplx_space_feature_flags::{
     Attributes, FeatureFlagClient, SPACE_CLUSTER_API_CLIENT_SIDE_BALANCING_FLAG,
 };
 use pplx_space_http_server::{HttpServerMakeSpan, HttpSpanMetadata};
-use pplx_space_metrics::data_plane::{
-    BackendRpcResult, BackendRpcSurface, ResponseKind, ResponseOrigin, ResponseSurface,
-    RouteRepairResult, RouteRepairSurface, ServicePortIngressOpenReason,
-    ServicePortIngressOpenResult, ServiceRouteSurface, ServiceRouteTransport,
-    SpaceApiRouteTokenDropReason, SpaceApiRouteTokenRouteSource, TooManyRequestsReason,
-};
 use pplx_space_net_gateway_client::proto::{
     ServicePortIngressFrame, ServicePortIngressStart, service_port_ingress_frame,
 };
@@ -93,6 +93,7 @@ mod ecw_files;
 mod ecw_process;
 mod http_traffic;
 mod ingress_lifetime;
+pub mod metrics;
 mod native;
 mod native_files;
 use ingress_lifetime::{Completion, IngressIo, Progress};
@@ -213,14 +214,9 @@ fn record_ecw_backend_rpc_latency(
     result: BackendRpcResult,
     started_at: std::time::Instant,
 ) {
-    pplx_space_metrics::data_plane::backend_rpc_latency(
-        BackendRpcSurface::Ecw,
-        operation,
-        result,
-        started_at,
-    );
+    crate::metrics::backend_rpc_latency(BackendRpcSurface::Ecw, operation, result, started_at);
     if result == BackendRpcResult::Timeout {
-        pplx_space_metrics::data_plane::backend_rpc_timeout(BackendRpcSurface::Ecw, operation);
+        crate::metrics::backend_rpc_timeout(BackendRpcSurface::Ecw, operation);
     }
 }
 
@@ -818,7 +814,7 @@ async fn record_request_latency(
     };
     let started_at = std::time::Instant::now();
     let response = next.run(request).await;
-    pplx_space_metrics::data_plane::request_latency(
+    crate::metrics::request_latency(
         method,
         matched_path.as_str(),
         response.status().as_u16(),
@@ -933,11 +929,11 @@ async fn ecw_service_proxy(
         refuse_new_ecw_stream_while_draining(&state, ECW_SERVICE_STREAM_KIND)?;
     }
 
-    pplx_space_metrics::data_plane::service_route_transport(
+    crate::metrics::service_route_transport(
         ServiceRouteSurface::Ecw,
         ServiceRouteTransport::ServicePortIngress,
     );
-    let mut preparation = pplx_space_metrics::data_plane::IngressPreparationObservation::default();
+    let mut preparation = crate::metrics::IngressPreparationObservation::default();
     let _waiter =
         pplx_space_ingress_admission::IngressPreparationPermit::acquire(Some(target.sandbox_id))
             .map_err(|_| {
@@ -1001,7 +997,7 @@ async fn ecw_service_proxy(
     .await;
     let Some(prepared) = prepared else {
         if is_upgrade_request(&request_headers) {
-            pplx_space_metrics::data_plane::attach(ECW_SERVICE_STREAM_KIND, "draining");
+            crate::metrics::attach(ECW_SERVICE_STREAM_KIND, "draining");
         }
         return Err(EcwProxyError::draining());
     };
@@ -1138,12 +1134,12 @@ async fn ecw_service_ingress_proxy_with_io(
             )
             .await
             {
-                Ok(close) => pplx_space_metrics::data_plane::stream_closed(
+                Ok(close) => crate::metrics::stream_closed(
                     ECW_SERVICE_STREAM_KIND,
                     close.result_label(),
                 ),
                 Err(error) => {
-                    pplx_space_metrics::data_plane::stream_closed(
+                    crate::metrics::stream_closed(
                         ECW_SERVICE_STREAM_KIND,
                         "proxy_error",
                     );
@@ -1176,7 +1172,7 @@ fn record_service_port_ingress_open(
     result: ServicePortIngressOpenResult,
     reason: ServicePortIngressOpenReason,
 ) {
-    pplx_space_metrics::data_plane::service_port_ingress_open(result, reason);
+    crate::metrics::service_port_ingress_open(result, reason);
 }
 
 fn service_port_ingress_open_reason(error: &tonic::Status) -> ServicePortIngressOpenReason {
@@ -1468,7 +1464,7 @@ where
         biased;
         _ = shutdown_token.cancelled() => { progress.abort.cancel(); Ok(()) },
         _ = progress.expired(pplx_space_net_gateway_client::service_port_ingress_idle_timeout_from_env()) => {
-            pplx_space_metrics::data_plane::ingress_completion_timeout();
+            crate::metrics::ingress_completion_timeout();
             Err(ServicePortIngressPumpError::Io(std::io::Error::new(std::io::ErrorKind::TimedOut, "ingress completion timed out")))
         },
         _ = complete.cancelled() => {
@@ -1489,7 +1485,7 @@ where
 }
 
 fn record_ecw_sandbox_proxy_response(status: StatusCode) {
-    pplx_space_metrics::data_plane::response(
+    crate::metrics::response(
         ResponseSurface::Ecw,
         ResponseOrigin::SandboxTraffic,
         ResponseKind::ProxiedStatus,
@@ -1699,10 +1695,7 @@ fn schedule_ecw_sandbox_service_route_repair(
     ) {
         EcwRouteRepairSchedule::Enqueue => {}
         EcwRouteRepairSchedule::Coalesce { cooldown_remaining } => {
-            pplx_space_metrics::data_plane::route_repair(
-                RouteRepairSurface::Ecw,
-                RouteRepairResult::Coalesced,
-            );
+            crate::metrics::route_repair(RouteRepairSurface::Ecw, RouteRepairResult::Coalesced);
             tracing::debug!(
                 sandbox_id = %target.sandbox_id,
                 port = target.port,
@@ -1714,18 +1707,12 @@ fn schedule_ecw_sandbox_service_route_repair(
         }
     }
 
-    pplx_space_metrics::data_plane::route_repair(
-        RouteRepairSurface::Ecw,
-        RouteRepairResult::Enqueued,
-    );
+    crate::metrics::route_repair(RouteRepairSurface::Ecw, RouteRepairResult::Enqueued);
     let state = state.clone();
     let repair_tasks = state.upgrade_tasks.clone();
     repair_tasks.spawn(async move {
         reset_ecw_sandbox_service_route(&state, &target, &route, diagnostic_message.as_str()).await;
-        pplx_space_metrics::data_plane::route_repair(
-            RouteRepairSurface::Ecw,
-            RouteRepairResult::Completed,
-        );
+        crate::metrics::route_repair(RouteRepairSurface::Ecw, RouteRepairResult::Completed);
     });
 }
 

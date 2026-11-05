@@ -9,6 +9,9 @@ use std::{
     time::Duration,
 };
 
+use crate::metrics::{
+    ProcessStartDeliveryOutcome, ProcessStartRecoveryInterruption, ProcessStartRecoveryMode,
+};
 use axum::{
     Json,
     body::Body,
@@ -26,9 +29,6 @@ use pplx_space_common_grpc::trace_grpc_client_transport as wrap_grpc_client_chan
 use pplx_space_common_grpc::{
     DEFAULT_TCP_GRPC_CONNECT_RETRY_POLICY, GrpcRetryContext, UdsPerSandboxLimitExceeded,
     is_temporary_tcp_failure, retry_grpc_status_with_context_if,
-};
-use pplx_space_metrics::data_plane::{
-    ProcessStartDeliveryOutcome, ProcessStartRecoveryInterruption, ProcessStartRecoveryMode,
 };
 use pplx_space_node_api_client::{
     NodeApiOperationBudget, proto::worker_api_client::WorkerApiClient,
@@ -446,7 +446,7 @@ pub(super) async fn process_connect(
     .await;
     let Some(opened) = opened else {
         // The permit above already counted the attach as `ok`.
-        pplx_space_metrics::data_plane::stream_closed(ECW_PROCESS_STREAM_KIND, "shutdown");
+        crate::metrics::stream_closed(ECW_PROCESS_STREAM_KIND, "shutdown");
         return Err(EcwProxyError::draining());
     };
     let (stream, route) = opened?;

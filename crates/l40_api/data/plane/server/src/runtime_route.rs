@@ -3,12 +3,12 @@ use std::fmt;
 use std::future::Future;
 use std::time::{Duration as StdDuration, Instant};
 
+use crate::metrics::{RouteIdentityRefreshOutcome, RouteIdentityRefreshProtocol};
 use pplx_space_api_route::{
     RouteIdentityRemediation, route_identity_dimension_from_status,
     route_identity_remediation_from_status,
 };
 use pplx_space_common_grpc::SandboxServiceRouteNotReady;
-use pplx_space_metrics::data_plane::{RouteIdentityRefreshOutcome, RouteIdentityRefreshProtocol};
 use pplx_space_node_api_client::proto::{
     SandboxServiceRouteCredentialKind, SandboxServiceRouteCredentialProof, SandboxServiceRouteKind,
     SandboxServiceRouteTransport, UnstableResolveSandboxServiceRouteRequest,
@@ -80,11 +80,7 @@ pub(super) async fn resolve_ecw_route(
     };
     let cache_key = origin.cache_key();
     let cache_lookup = state.route_cache.lookup_ecw(&cache_key);
-    pplx_space_metrics::data_plane::route_cache_lookup(
-        "ecw",
-        "ecw_service",
-        cache_lookup.result_label(),
-    );
+    crate::metrics::route_cache_lookup("ecw", "ecw_service", cache_lookup.result_label());
     if let RouteCacheLookup::Hit(route) = cache_lookup
         && !ecw_route_tokens_need_refresh(&route)
     {
@@ -302,7 +298,7 @@ where
         };
         if policy.timeout_scope == EcwCallTimeoutScope::EndToEnd && remaining.is_zero() {
             if let Some(dimension) = refresh_dimension {
-                pplx_space_metrics::data_plane::route_identity_refresh(
+                crate::metrics::route_identity_refresh(
                     RouteIdentityRefreshProtocol::Ecw,
                     dimension,
                     RouteIdentityRefreshOutcome::DeadlineExceeded,
@@ -333,7 +329,7 @@ where
         match attempt {
             Ok(Ok(value)) => {
                 if let Some(dimension) = refresh_dimension {
-                    pplx_space_metrics::data_plane::route_identity_refresh(
+                    crate::metrics::route_identity_refresh(
                         RouteIdentityRefreshProtocol::Ecw,
                         dimension,
                         RouteIdentityRefreshOutcome::Succeeded,
@@ -377,7 +373,7 @@ where
                         } else {
                             RouteIdentityRefreshOutcome::ResolveFailed
                         };
-                        pplx_space_metrics::data_plane::route_identity_refresh(
+                        crate::metrics::route_identity_refresh(
                             RouteIdentityRefreshProtocol::Ecw,
                             dimension,
                             outcome,
@@ -421,7 +417,7 @@ where
                     continue;
                 }
                 if let Some(dimension) = refresh_dimension {
-                    pplx_space_metrics::data_plane::route_identity_refresh(
+                    crate::metrics::route_identity_refresh(
                         RouteIdentityRefreshProtocol::Ecw,
                         dimension,
                         RouteIdentityRefreshOutcome::RetryFailed,
@@ -445,7 +441,7 @@ where
             }
             Err(_) => {
                 if let Some(dimension) = refresh_dimension {
-                    pplx_space_metrics::data_plane::route_identity_refresh(
+                    crate::metrics::route_identity_refresh(
                         RouteIdentityRefreshProtocol::Ecw,
                         dimension,
                         RouteIdentityRefreshOutcome::DeadlineExceeded,
@@ -551,8 +547,8 @@ pub(super) fn sweep_expired_ecw_routes(state: &DataPlaneState) {
         )
         .is_some()
     {
-        pplx_space_metrics::data_plane::route_cache_entries(
-            pplx_space_metrics::data_plane::RouteCacheKind::Ecw,
+        crate::metrics::route_cache_entries(
+            crate::metrics::RouteCacheKind::Ecw,
             state.route_cache.ecw_len(),
         );
     }
@@ -685,7 +681,7 @@ pub(super) fn refuse_new_ecw_stream_while_draining(
     kind: &'static str,
 ) -> Result<(), EcwProxyError> {
     if state.drain_started.is_cancelled() {
-        pplx_space_metrics::data_plane::attach(kind, "draining");
+        crate::metrics::attach(kind, "draining");
         return Err(EcwProxyError::draining());
     }
     Ok(())
@@ -698,11 +694,11 @@ pub(super) fn acquire_ecw_stream_permit(
     refuse_new_ecw_stream_while_draining(state, kind)?;
     match state.attached_streams.try_acquire_label(kind) {
         Ok(permit) => {
-            pplx_space_metrics::data_plane::attach(kind, "ok");
+            crate::metrics::attach(kind, "ok");
             Ok(permit)
         }
         Err(()) => {
-            pplx_space_metrics::data_plane::attach(kind, "too_many_attached_streams");
+            crate::metrics::attach(kind, "too_many_attached_streams");
             Err(EcwProxyError::too_many_attached_streams(
                 TooManyRequestsReason::AttachedStreams,
             ))

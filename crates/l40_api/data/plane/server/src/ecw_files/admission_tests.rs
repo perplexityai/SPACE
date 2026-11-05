@@ -782,8 +782,8 @@ async fn admitted_uploads_are_tracked_with_their_reservation_and_rejections_name
     assert_eq!(
         response
             .extensions()
-            .get::<pplx_space_metrics::data_plane::TooManyRequestsReason>(),
-        Some(&pplx_space_metrics::data_plane::TooManyRequestsReason::UploadConcurrency),
+            .get::<crate::metrics::TooManyRequestsReason>(),
+        Some(&crate::metrics::TooManyRequestsReason::UploadConcurrency),
     );
     assert_eq!(tracker.snapshot(), (0, 0));
 }

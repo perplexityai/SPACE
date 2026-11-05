@@ -6,8 +6,8 @@ use std::fmt;
 use std::hash::Hash;
 use std::sync::Arc;
 
+use crate::metrics::UploadRejectReason;
 use dashmap::DashMap;
-use pplx_space_metrics::data_plane::UploadRejectReason;
 use tokio::time::Instant;
 
 use super::{Budget, BudgetPermit, UploadShareConfig};

@@ -38,6 +38,7 @@ use std::{
     time::Duration,
 };
 
+use crate::metrics::sandbox::api::SandboxApiMetricIdentity;
 use pplx_space_api_route::wait_ready_lifecycle_request;
 use pplx_space_bearer_token::SpaceBearerToken;
 use pplx_space_common_core::types::{
@@ -49,7 +50,6 @@ use pplx_space_common_core::types::{
 use pplx_space_common_grpc::{
     GrpcClientTrace, trace_grpc_client_transport as wrap_grpc_client_channel,
 };
-use pplx_space_metrics::sandbox::api::SandboxApiMetricIdentity;
 use pplx_space_net_common::NetworkPolicyV1;
 use pplx_space_net_common::proto::NetworkPolicyV1 as NetworkPolicyProto;
 use pplx_space_rpc_auth::SpaceBearerInterceptor;

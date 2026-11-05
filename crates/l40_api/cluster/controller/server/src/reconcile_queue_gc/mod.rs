@@ -22,7 +22,7 @@ use pplx_space_common_core::types::NodeId;
 use std::sync::Arc;
 use std::time::Duration;
 
-use pplx_space_metrics::reconcile::{QueueGcClass, QueueGcDetector, QueueGcMode, QueueGcResult};
+use crate::metrics::reconcile::{QueueGcClass, QueueGcDetector, QueueGcMode, QueueGcResult};
 use tokio_util::sync::CancellationToken;
 
 use crate::env_config;
@@ -404,21 +404,21 @@ impl<S: QueueGcSink, D: GoneDetector> Reconciler<S, D> {
 }
 
 fn emit_tick_metrics(report: &TickReport, detector: QueueGcDetector, mode: QueueGcMode) {
-    pplx_space_metrics::reconcile::queue_gc_pruned(
+    crate::metrics::reconcile::queue_gc_pruned(
         QueueGcClass::Dead,
         detector,
         mode,
         report.dead_deleted,
     );
-    pplx_space_metrics::reconcile::queue_gc_pruned(
+    crate::metrics::reconcile::queue_gc_pruned(
         QueueGcClass::GoneLive,
         detector,
         mode,
         report.gone_live_deleted,
     );
-    pplx_space_metrics::reconcile::queue_gc_eligible(detector, mode, report.gone_live_eligible);
-    pplx_space_metrics::reconcile::queue_gc_gone_nodes(detector, mode, report.gone_nodes);
-    pplx_space_metrics::reconcile::queue_gc_tick(report.result(), detector);
+    crate::metrics::reconcile::queue_gc_eligible(detector, mode, report.gone_live_eligible);
+    crate::metrics::reconcile::queue_gc_gone_nodes(detector, mode, report.gone_nodes);
+    crate::metrics::reconcile::queue_gc_tick(report.result(), detector);
 }
 
 pub async fn run<S: QueueGcSink, D: GoneDetector>(

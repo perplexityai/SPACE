@@ -430,7 +430,7 @@ pub async fn run<E>(
                     finish_execution(joined, &mut busy_keys, &mut task_keys, &mut other_tasks);
                     claim_backoff_until = None;
                 }
-                pplx_space_metrics::operations::dispatcher_slots(
+                crate::metrics::operations::dispatcher_slots(
                     in_flight.len(),
                     slots.concurrency,
                     other_tasks.len(),
@@ -623,7 +623,7 @@ async fn hand_back_busy_key(
     {
         Ok(ReleasedClaim::Superseded { delete_id }) => {
             // Not an execution, so counted as a cancel at enqueue is.
-            pplx_space_metrics::operations::completed(
+            pplx_space_api::metrics::operations::completed(
                 operation.api_product.as_str(),
                 operation.kind.as_str(),
                 OperationState::Canceled.as_str(),

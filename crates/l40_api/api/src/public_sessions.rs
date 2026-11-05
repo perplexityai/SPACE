@@ -223,12 +223,12 @@ impl PublicSessionStore {
         .await?;
         tx.commit().await?;
 
-        pplx_space_metrics::operations::created(
+        crate::metrics::operations::created(
             API_PRODUCT_NATIVE.as_str(),
             OperationKind::CreateSession.as_str(),
             OperationTargetType::Session.as_str(),
         );
-        pplx_space_metrics::operations::completed(
+        crate::metrics::operations::completed(
             API_PRODUCT_NATIVE.as_str(),
             OperationKind::CreateSession.as_str(),
             OperationState::Succeeded.as_str(),

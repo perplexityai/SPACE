@@ -306,7 +306,7 @@ async fn enqueue_node_reconcile_refs_for_nodes_on<'e>(
             } in rows
             {
                 if queued > 0 {
-                    pplx_space_metrics::reconcile::queued_count(&facet, "ok", queued);
+                    crate::metrics::reconcile::queued_count(&facet, "ok", queued);
                 }
                 by_node
                     .entry(node_id)
@@ -321,7 +321,7 @@ async fn enqueue_node_reconcile_refs_for_nodes_on<'e>(
         Err(error) => {
             for _node_id in node_ids {
                 for (facet, _) in refs {
-                    pplx_space_metrics::reconcile::queued(facet, "error");
+                    crate::metrics::reconcile::queued(facet, "error");
                 }
             }
             Err(error)

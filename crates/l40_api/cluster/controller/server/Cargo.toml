@@ -84,7 +84,7 @@ pplx-space-snapshot-retention = { workspace = true, features = ["s3"] }
 pplx-space-snapshot-store = { workspace = true }
 pplx-space-events = { workspace = true }
 pplx-space-feature-flags = { workspace = true }
-pplx-space-metrics = { workspace = true }
+pplx-space-metrics-emit = { workspace = true }
 pplx-space-runtime-environment-catalog-store = { workspace = true }
 pplx-space-node-api-client = { workspace = true }
 pplx-space-public-api = { workspace = true }

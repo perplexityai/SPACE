@@ -40,7 +40,7 @@ use pplx_space_sandbox_store::drain::{
     gone_node_identity_guards, record_stopped_evacuation_artifact, revert_evacuation_suspend_claim,
 };
 
-use pplx_space_metrics::sandbox::api::SandboxApiMetricIdentity;
+use pplx_space_api::metrics::sandbox::api::SandboxApiMetricIdentity;
 use pplx_space_node_api_client::NodeApiClient;
 use sqlx::PgPool;
 

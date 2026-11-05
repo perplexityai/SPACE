@@ -125,7 +125,7 @@ fn unattributed(
         "no recorded execution attributes this sandbox to a catalog environment; \
          activating as recorded"
     );
-    pplx_space_metrics::runtime_upgrade::activation_decision(
+    crate::metrics::runtime_upgrade::activation_decision(
         activation.as_str(),
         "unattributed",
         "none",
@@ -142,11 +142,7 @@ fn record(sandbox_id: SandboxId, activation: UpgradeActivation, plan: RuntimePla
         | RuntimePlan::Stranded(to_default) => Some(to_default),
     };
     let cause = to_default.map_or("none", |to_default| to_default.cause.as_str());
-    pplx_space_metrics::runtime_upgrade::activation_decision(
-        activation.as_str(),
-        plan.as_str(),
-        cause,
-    );
+    crate::metrics::runtime_upgrade::activation_decision(activation.as_str(), plan.as_str(), cause);
     if let Some(to_default) = to_default {
         tracing::info!(
             sandbox_id = %sandbox_id,

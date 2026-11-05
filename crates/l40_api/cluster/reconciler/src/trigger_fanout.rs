@@ -313,7 +313,7 @@ async fn process_claim<R>(
                 .map(|node_id| (node_id, format!("load trigger target: {error}")))
                 .collect::<Vec<_>>();
             complete_claim_best_effort(pool, &claim.claim_token, &[], &failed).await;
-            pplx_space_metrics::reconcile::trigger_fanout_batch(claimed, started);
+            crate::metrics::reconcile::trigger_fanout_batch(claimed, started);
             return;
         }
     };
@@ -362,7 +362,7 @@ async fn process_claim<R>(
             .get(node_id)
             .map(TriggerReasonPayload::diagnostic_reason)
             .unwrap_or("unspecified");
-        pplx_space_metrics::reconcile::trigger_fanout("permanent_error", "target_absent");
+        crate::metrics::reconcile::trigger_fanout("permanent_error", "target_absent");
         tracing::warn!(
             %node_id,
             reason,
@@ -399,15 +399,15 @@ async fn process_claim<R>(
     for result in results {
         match result {
             Ok(node_id) => {
-                pplx_space_metrics::reconcile::trigger_fanout("ok", "none");
+                crate::metrics::reconcile::trigger_fanout("ok", "none");
                 succeeded.push(node_id);
             }
             Err((node_id, error)) if error.is_permanent() => {
-                pplx_space_metrics::reconcile::trigger_fanout("permanent_error", error.class());
+                crate::metrics::reconcile::trigger_fanout("permanent_error", error.class());
                 permanent_failed.push((node_id, error.to_string()));
             }
             Err((node_id, error)) => {
-                pplx_space_metrics::reconcile::trigger_fanout("error", error.class());
+                crate::metrics::reconcile::trigger_fanout("error", error.class());
                 failed.push((node_id, error.to_string()));
             }
         }
@@ -425,7 +425,7 @@ async fn process_claim<R>(
             tracing::warn!(%node_id, %error, "state-reconciliation trigger permanently failed");
         }
     }
-    pplx_space_metrics::reconcile::trigger_fanout_batch(claimed, started);
+    crate::metrics::reconcile::trigger_fanout_batch(claimed, started);
     tracing::info!(
         claimed = reason_by_node.len(),
         triggered = succeeded.len().saturating_sub(

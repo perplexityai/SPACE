@@ -34,9 +34,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
+use crate::metrics::operations::{InlineAdmissionPath, InlineAdmissionReason};
 use pplx_space_common_core::types::OrgId;
 use pplx_space_feature_flags::{FeatureFlagClient, SPACE_NATIVE_INLINE_OPERATIONS_FLAG};
-use pplx_space_metrics::operations::{InlineAdmissionPath, InlineAdmissionReason};
 use pplx_space_public_api::{OperationId, OperationKind, OperationState};
 use pplx_space_service_lifecycle::DrainSignal;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
@@ -371,7 +371,7 @@ impl InlineOperations {
             0
         };
         crate::limiter_liveness::run_heartbeat(SLOT_REPORT_INTERVAL, shutdown_token, move || {
-            pplx_space_metrics::operations::inline_slots(
+            crate::metrics::operations::inline_slots(
                 inner.in_flight.load(Ordering::Acquire),
                 capacity,
             );
@@ -381,7 +381,7 @@ impl InlineOperations {
     /// Count an operation offered on `path` that the route left queued for a
     /// reason only it knows.
     pub fn refuse(&self, path: InlineAdmissionPath, refusal: InlineRefusal) {
-        pplx_space_metrics::operations::inline_admission(path, refusal.reason());
+        crate::metrics::operations::inline_admission(path, refusal.reason());
     }
 
     /// Commit `claim` and drive its operation to its recorded outcome, both
@@ -418,7 +418,7 @@ impl InlineOperations {
                         return;
                     }
                 };
-                pplx_space_metrics::operations::inline_admission(
+                crate::metrics::operations::inline_admission(
                     permit.path,
                     InlineAdmissionReason::Admitted,
                 );
