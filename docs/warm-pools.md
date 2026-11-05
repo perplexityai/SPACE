@@ -133,6 +133,12 @@ curl -sS -X POST "$SPACE_API_URL/admin/api/v1/templates/my-template/builds" \
   }'
 ```
 
+To opt the new template into ballooning, add `build_config` to `recipe`, for
+example `"build_config": {"balloon": {"mode": "report", "stats_polling_interval_s": 1}}`.
+Omitting it preserves the existing no-balloon behavior. See
+[Template balloon device](configuration.md#template-balloon-device) for modes
+and snapshot behavior.
+
 The build returns a `job_id`. Poll
 `GET /admin/api/v1/templates/my-template/builds/{job_id}` until `state` is
 `succeeded`. The response then includes the new `content_hash`.

@@ -681,7 +681,7 @@ impl TryFrom<build_proto::recipe::BuildConfig> for BuildConfig {
     }
 }
 
-fn balloon_proto(
+pub fn balloon_proto(
     balloon: pplx_space_common_core::types::BalloonConfig,
 ) -> build_proto::recipe::Balloon {
     use build_proto::recipe::balloon::{FreePageHinting, FreePageReporting, Inflate, Mode};

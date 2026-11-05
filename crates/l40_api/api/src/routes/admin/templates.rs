@@ -1388,25 +1388,9 @@ fn template_build_config_proto(config: TemplateBuildConfig) -> build_proto::reci
         vcpu: config.vcpu,
         memory_bytes: config.memory_bytes,
         disk_bytes: config.disk_bytes,
-        balloon: config.balloon.map(|policy| {
-            use build_proto::recipe::balloon::{FreePageHinting, FreePageReporting, Inflate, Mode};
-            use pplx_space_common_core::types::BalloonDevice;
-            let mode = match policy.device() {
-                BalloonDevice::Inflate {
-                    amount_mib,
-                    deflate_on_oom,
-                } => Mode::Inflate(Inflate {
-                    amount_mib: amount_mib.get(),
-                    deflate_on_oom,
-                }),
-                BalloonDevice::FreePageReporting => Mode::FreePageReporting(FreePageReporting {}),
-                BalloonDevice::FreePageHinting => Mode::FreePageHinting(FreePageHinting {}),
-            };
-            build_proto::recipe::Balloon {
-                mode: Some(mode),
-                stats_polling_interval_s: u32::from(policy.stats_polling_interval_s()),
-            }
-        }),
+        balloon: config
+            .balloon
+            .map(pplx_space_build_mgr::recipe::balloon_proto),
     }
 }
 

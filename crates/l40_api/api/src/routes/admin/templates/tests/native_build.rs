@@ -28,14 +28,16 @@ use crate::{routes::session_auth, user_role::UserRole};
 #[test]
 fn native_build_config_preserves_reporting_and_default_behavior() {
     use build_proto::recipe::balloon::{FreePageHinting, FreePageReporting, Inflate, Mode};
-    for (policy, expected) in [
+    for (policy, expected, expected_interval) in [
         (
-            serde_json::json!({"mode": "report", "stats_polling_interval_s": 1}),
+            serde_json::json!({"mode": "report", "stats_polling_interval_s": 0}),
             Mode::FreePageReporting(FreePageReporting {}),
+            0,
         ),
         (
-            serde_json::json!({"mode": "hint", "stats_polling_interval_s": 1}),
+            serde_json::json!({"mode": "hint", "stats_polling_interval_s": 17}),
             Mode::FreePageHinting(FreePageHinting {}),
+            17,
         ),
         (
             serde_json::json!({
@@ -46,6 +48,18 @@ fn native_build_config_preserves_reporting_and_default_behavior() {
                 amount_mib: 512,
                 deflate_on_oom: false,
             }),
+            1,
+        ),
+        (
+            serde_json::json!({
+                "mode": "inflate", "amount_mib": 1024,
+                "deflate_on_oom": true, "stats_polling_interval_s": 65535
+            }),
+            Mode::Inflate(Inflate {
+                amount_mib: 1024,
+                deflate_on_oom: true,
+            }),
+            65535,
         ),
     ] {
         let config = serde_json::from_value::<TemplateBuildConfig>(serde_json::json!({
@@ -58,7 +72,7 @@ fn native_build_config_preserves_reporting_and_default_behavior() {
             .balloon
             .expect("explicit balloon policy reaches the builder");
         assert_eq!(balloon.mode, Some(expected));
-        assert_eq!(balloon.stats_polling_interval_s, 1);
+        assert_eq!(balloon.stats_polling_interval_s, expected_interval);
     }
     let defaults = serde_json::from_value::<TemplateBuildConfig>(serde_json::json!({})).unwrap();
     assert!(template_build_config_proto(defaults).balloon.is_none());
