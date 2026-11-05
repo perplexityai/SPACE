@@ -153,8 +153,8 @@ reviews:
       after, or named existing tests covering it;
     - a Kind test environment change Pull CI's Kind smoke covers;
     - a tested change that only rejects, skips, or quarantines malformed input
-      (a value no current writer produces), even where it guards a lifecycle
-      write. Refusing or reordering a valid write is not this.
+      (a value no current writer produces). Refusing or reordering a valid
+      write is not this.
 
     Items below apply to behavior changes only, unless marked "any change".
 
@@ -182,7 +182,8 @@ reviews:
     - a breaking protobuf or storage contract change;
     - any change to privileges or tenant isolation, including unused new code
       that can grant, withhold, or skip privileges;
-    - what a sandboxes.lifecycle write does, or its guard predicate;
+    - what a sandboxes.lifecycle write does, or its guard predicate, beyond
+      rejecting malformed input;
     - deleting or garbage-collecting sandboxes, snapshots, volumes, or their rows;
     - a default, limit, or quota existing deployments use;
     - a change old and new versions cannot run together in a rolling upgrade;
