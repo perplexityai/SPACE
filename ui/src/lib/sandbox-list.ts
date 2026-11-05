@@ -59,8 +59,11 @@ export interface SandboxListFilters {
   olderThan: CreatedAge | null;
   // A name prefix (case-sensitive) or ID prefix, as typed.
   prefix: string;
-  // A name prefix ignoring case, or an ID suffix, as typed; only for a
-  // server that takes `search` (see `isSearchUnsupported`).
+  // Trimmed text of at least 3 characters for a server that takes `search`
+  // (see `isSearchUnsupported`): it matches names that start with it,
+  // ignoring case, and, when it is hex digits once dashes and a leading
+  // `sbx_` are left out, IDs that end with them (from 4 digits) or start with
+  // them (from 8).
   search: string;
 }
 
@@ -101,7 +104,9 @@ export function sandboxListQuery(
 // The answer of a server that predates `search` to a paged request carrying
 // it: a 400 naming the parameter, since a paging server refuses an unknown
 // one once `cursor` is present. The console then searches as it did before
-// (`sandboxSearch` without `serverSearch`) until the page is reloaded.
+// (`sandboxSearch` without `serverSearch`) for as long as the list page stays
+// mounted: a reload, or leaving the page and coming back, tries `search`
+// again.
 export function isSearchUnsupported(error: unknown): boolean {
   const { status, message } = (error ?? {}) as { status?: unknown; message?: unknown };
   return status === 400 && typeof message === 'string' && message.includes('unknown query parameter "search"');

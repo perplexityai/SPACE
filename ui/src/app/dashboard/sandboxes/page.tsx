@@ -779,8 +779,9 @@ function SandboxesPage() {
   const query = useMemo(() => sandboxQuery(idFilter), [idFilter]);
   // Whether the API takes `search`. Assumed until a paged request carrying it
   // is refused as an unknown parameter (`isSearchUnsupported`), as an API
-  // from before it answers; the search box then works as it did before, until
-  // the page is reloaded.
+  // from before it answers; the search box then works as it did before while
+  // this page stays mounted. A reload, or leaving the page and coming back,
+  // starts with `search` again.
   const [serverSearch, setServerSearch] = useState(true);
   // Set when the API refused `search`, until the fallback's filters are
   // selected (`ListSelection.select`'s `refusedSearch`).
@@ -1767,7 +1768,7 @@ function SandboxesPage() {
               aria-label="Search sandboxes"
             />
             {paged && serverSearch ? (
-              <Tooltip title="Text of 3 characters or more is searched on the server across the whole list: names that start with it, ignoring case, and IDs that start or end with its hex digits, such as the ID column's label. An ID match needs at least 4 hex digits; dashes, and sbx_ in front, are left out of them. Shorter text is matched as a case-sensitive name or ID prefix on the server and within this page. A full ID or pod name is looked up directly.">
+              <Tooltip title="Text of 3 characters or more is searched on the server across the whole list. It matches names that start with it, ignoring case. When the text is all hex digits, once dashes and a leading sbx_ are left out, it also matches IDs that end with them, from 4 digits (such as the ID column's label), and IDs that start with them, from 8 digits. Other text matches names only. Matches are at the start of a name or the start or end of an ID, never in the middle. Shorter text is matched as a case-sensitive name or ID prefix on the server and within this page. A full ID or pod name is looked up directly.">
                 <QuestionCircleOutlined aria-label="About the search" style={{ color: 'rgba(0, 0, 0, 0.45)' }} />
               </Tooltip>
             ) : paged ? (

@@ -153,9 +153,10 @@ function startsUuid(value: string): boolean {
 export const MIN_SEARCH_CHARS = 3;
 
 // What the search box does on each list shape. `serverSearch` says the
-// server takes `search`: a name prefix ignoring case, or the start or end of
-// an ID's hex digits, such as the ID column's label. While it does, all text
-// of at least `MIN_SEARCH_CHARS` characters goes there.
+// server takes `search`: a name prefix ignoring case or, for hex text, the
+// end of an ID (from 4 digits, such as the ID column's label) or its start
+// (from 8). While it does, all text of at least `MIN_SEARCH_CHARS`
+// characters goes there, and none of it is matched within the page.
 // - `ref`: a full identifier in any accepted form, looked up directly.
 // - `search`: sent to a server that takes `search`, trimmed.
 // - `prefix`: sent to a paging server as typed. It matches the start of
