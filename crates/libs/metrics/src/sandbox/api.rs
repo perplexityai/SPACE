@@ -790,7 +790,7 @@ pub struct RequestedSize<'a> {
 /// or admission rejection. Skip forks, unknown sizes and joined activations.
 /// Resident resumes need no admission; runtime recovery may require it. Reads
 /// `client_id` from the request scope, so call it on the request's task.
-pub fn requested(sample: RequestedSize<'_>) {
+pub fn requested_size(sample: RequestedSize<'_>) {
     let mut tags = vec![
         tag("kind", sample.kind),
         tag("surface", sample.surface),

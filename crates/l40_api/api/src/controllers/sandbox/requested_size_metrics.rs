@@ -1,12 +1,12 @@
 //! Maps create, activation and resume outcomes onto the requested vCPU and
-//! memory distributions (`pplx_space_metrics::sandbox::api::requested`). The
-//! emit sites stay one call each; what counts and how it is tagged is decided
-//! here.
+//! memory distributions (`pplx_space_metrics::sandbox::api::requested_size`).
+//! The emit sites stay one call each; what counts and how it is tagged is
+//! decided here.
 
 use pplx_space_events::CreateShapeSource;
 use pplx_space_metrics::sandbox::admission::AdmissionDecision;
 use pplx_space_metrics::sandbox::api::{
-    RequestedKind, RequestedSize, SandboxApiSurface, requested,
+    RequestedKind, RequestedSize, SandboxApiSurface, requested_size,
 };
 
 use super::ControllerError;
@@ -111,7 +111,7 @@ fn emit(
     let Some((vcpu, memory_mib)) = size else {
         return;
     };
-    requested(RequestedSize {
+    requested_size(RequestedSize {
         kind,
         surface,
         admission,
