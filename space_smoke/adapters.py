@@ -4968,7 +4968,7 @@ ON CONFLICT (key_hash) DO NOTHING;
         self._require_isolated_kind("console sandbox execution")
         factory = NativeSandboxFactory(NativeConfig(
             api_url=self.config.api_url,
-            data_plane_url=self.environment.get("ECW_DATA_PLANE_BASE_URL", "http://127.0.0.1:8090"),
+            data_plane_url=self.environment.get("ECW_DATA_PLANE_BASE_URL", self.config.data_plane_url),
             token=self._admin_token(),
             template="seed",
         ))
@@ -4977,13 +4977,17 @@ ON CONFLICT (key_hash) DO NOTHING;
     def console_runtime_version(self, sandbox_id: str) -> str:
         self._require_isolated_kind("console runtime inspection")
         sandbox_id = _sql_uuid(sandbox_id.removeprefix("sbx_"))
-        placement = self.sandbox_pod_placement(sandbox_id)
+        live_pods = [
+            pod for pod in self.sandbox_pods(sandbox_id)
+            if not pod.deleting and pod.phase == "Running" and pod.node_name
+        ]
+        node_name = live_pods[0].node_name if len(live_pods) == 1 else None
         response = self.console_api("GET", f"/admin/api/v1/sandboxes/{sandbox_id}")
         pid = response.body.get("pid") if isinstance(response.body, dict) else None
-        if placement is None or not isinstance(pid, int) or pid <= 0:
+        if node_name is None or not isinstance(pid, int) or pid <= 0:
             raise SmokeConfigurationError("the console sandbox has no running runtime identity")
         result = self._node_shell_exec(
-            placement.node_name, f"/proc/{pid}/exe --version", timeout=15
+            node_name, f"/proc/{pid}/exe --version", timeout=15
         )
         return _require_ok(
             result, "inspect the running sandbox runtime executable"
