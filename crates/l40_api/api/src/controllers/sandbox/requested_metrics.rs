@@ -9,6 +9,7 @@ use pplx_space_metrics::sandbox::api::{
 };
 
 use super::ControllerError;
+use super::queries::stored_resource;
 use crate::controllers::substrate::SandboxResources;
 use crate::models::Sandbox;
 
@@ -41,9 +42,20 @@ pub(super) fn record_create(
         surface,
         admission,
         template,
-        effective(resources.vcpu, resources.memory_mib),
+        create_size(resources),
         Some(defaulted(source)),
     );
+}
+
+/// The size a cold create will store, or `None` when it cannot store it.
+/// The create refuses an out-of-range size after admission, through this same
+/// `stored_resource` bound, so that size must not be recorded either.
+fn create_size(resources: &SandboxResources) -> Option<(u32, u32)> {
+    let stored = |value, field| stored_resource(value, field).ok().flatten();
+    effective(
+        stored(resources.vcpu, "vcpu"),
+        stored(resources.memory_mib, "memory_mib"),
+    )
 }
 
 /// Record a warm-pool claim's size, read from the claimed sandbox row. The
@@ -94,19 +106,13 @@ fn defaulted(source: CreateShapeSource) -> bool {
     }
 }
 
-/// The vCPU and memory a sandbox runs with, or `None` when either is unset
-/// or not positive.
-fn effective<T>(vcpu: Option<T>, memory_mib: Option<T>) -> Option<(u32, u32)>
-where
-    u32: TryFrom<T>,
-{
+/// The stored vCPU and memory a sandbox runs with, or `None` when either is
+/// unset or not positive.
+fn effective(vcpu: Option<i32>, memory_mib: Option<i32>) -> Option<(u32, u32)> {
     Some((positive(vcpu)?, positive(memory_mib)?))
 }
 
-fn positive<T>(value: Option<T>) -> Option<u32>
-where
-    u32: TryFrom<T>,
-{
+fn positive(value: Option<i32>) -> Option<u32> {
     value
         .and_then(|value| u32::try_from(value).ok())
         .filter(|value| *value > 0)
