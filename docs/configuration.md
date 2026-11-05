@@ -166,17 +166,18 @@ parent throttle or whole-parent group kill. It verifies the controls by reading
 them back before opening admission. Per-sandbox limits, OOM scores, host swap
 configuration and guest RAM are unchanged.
 
-New lease admission checks both host `MemAvailable` and the parent's
-`memory.current`/`memory.max`. Both projections include the existing bounded
-Firecracker growth allowance, newly committed lease reservations, the requested
-child budget, and `memory_admission.reserve_mib`. Missing, malformed or
-unbounded parent controls fail admission closed. Existing-lease reuse and
-cleanup retain their execution and generation fences.
+The parent caps actual charged memory, not the sum of VM reservations.
+Child limits and VM reservations may sum above the parent cap: overcommit is
+intentional. This setting adds no parent-budget admission gate. Existing
+host-memory admission, bounded Firecracker growth allowances and concurrent
+lease-reservation checks are unchanged; they do not reserve every running VM's
+full future maximum.
 
-This admission policy does not reserve every child's full future maximum or
-every sidecar's possible future growth. The kernel parent cap is the final
-backstop if existing workloads grow; it is not a physical reservation for
-services outside `/space`, nor a guarantee against filesystem or I/O stalls.
+If actual charged usage reaches the parent limit, kernel reclaim and
+parent-domain OOM handling remain the backstop. A memory reservation is not a
+guarantee that every VM can simultaneously use its full limit. The cap is
+neither a physical reservation for services outside `/space` nor a guarantee
+against filesystem or I/O stalls.
 The network-pool status field `sandbox_cgroup_total_memory_mib` remains the
 logical slot budget, not this effective cap. Inspect `memory.max` or the
 startup log's `sandbox_cgroup_parent_memory_effective_mib` for the applied cap.

@@ -35,8 +35,6 @@ impl Node {
         service.pool.set_all_slots_ready_for_test();
         let memory = tempfile::tempdir().unwrap();
         std::fs::create_dir(memory.path().join("cgroups")).unwrap();
-        std::fs::write(memory.path().join("cgroups/memory.current"), "0").unwrap();
-        std::fs::write(memory.path().join("cgroups/memory.max"), "68719476736").unwrap();
         service.memory_admission_sources = MemoryAdmissionSources::new(
             memory.path().join("meminfo"),
             memory.path().join("cgroups"),
@@ -179,8 +177,6 @@ enum AllocateRefusal {
     ClosedLimiter,
     UnreadableNodeMemory,
     InsufficientNodeMemory,
-    UnreadableParentMemory,
-    InsufficientParentMemory,
     OverflowingMemoryDemand,
     DrainingPool,
     NoReadySlot,
@@ -241,16 +237,6 @@ enum AllocateRefusal {
     AllocateRefusal::InsufficientNodeMemory,
     Code::ResourceExhausted,
     "above total memory"
-)]
-#[case::unreadable_parent_memory(
-    AllocateRefusal::UnreadableParentMemory,
-    Code::Unavailable,
-    "sandbox parent control"
-)]
-#[case::insufficient_parent_memory(
-    AllocateRefusal::InsufficientParentMemory,
-    Code::ResourceExhausted,
-    "above its memory.max"
 )]
 #[case::overflowing_memory_demand(
     AllocateRefusal::OverflowingMemoryDemand,
@@ -314,12 +300,6 @@ async fn allocate_refusal_grants_no_lease(
         AllocateRefusal::MissingMemoryDemand => request.sandbox_cgroup_memory_mib = 0,
         AllocateRefusal::ClosedLimiter => node.service.lifecycle_limiter.close(),
         AllocateRefusal::UnreadableNodeMemory => node.set_node_memory(None),
-        AllocateRefusal::UnreadableParentMemory => {
-            std::fs::remove_file(node.memory.path().join("cgroups/memory.max")).unwrap();
-        }
-        AllocateRefusal::InsufficientParentMemory => {
-            std::fs::write(node.memory.path().join("cgroups/memory.max"), "1073741824").unwrap();
-        }
         AllocateRefusal::InsufficientNodeMemory => {
             node.set_node_memory(Some("MemTotal: 2097152 kB\nMemAvailable: 2097152 kB\n"));
         }
