@@ -177,6 +177,7 @@ pub struct ParentCpuLimit {
 pub struct ParentMemoryLimit {
     pub sandbox_cgroup_memory_mib: u64,
     pub max_slots: u32,
+    pub host_memory_total_mib: u64,
     pub memory_max: String,
     pub memory_swap_max: String,
 }
@@ -298,6 +299,32 @@ pub fn sandbox_cgroup_total_memory_mib(
     sandbox_cgroup_memory_mib.checked_mul(u64::from(max_slots))
 }
 
+/// Host memory kept outside the sandbox parent cgroup for the kernel, node
+/// services and the control plane: 1/16 of host memory, at least 8 GiB.
+pub fn host_memory_reserve_mib(host_memory_total_mib: u64) -> u64 {
+    (host_memory_total_mib / 16).max(8 * 1024)
+}
+
+/// The sandbox parent cgroup's `memory.max`, in MiB: every slot at its
+/// per-sandbox limit, capped at host memory less [`host_memory_reserve_mib`].
+/// The cap always admits one sandbox, and never drops beneath
+/// `current_mib`, the memory sandboxes already hold: a lower limit would
+/// OOM-kill them at once.
+pub fn parent_memory_max_mib(
+    sandbox_cgroup_memory_mib: u64,
+    max_slots: u32,
+    host_memory_total_mib: u64,
+    current_mib: u64,
+) -> Option<u64> {
+    let host_cap_mib = host_memory_total_mib
+        .saturating_sub(host_memory_reserve_mib(host_memory_total_mib))
+        .max(sandbox_cgroup_memory_mib);
+    let slots_mib = sandbox_cgroup_total_memory_mib(sandbox_cgroup_memory_mib, max_slots)?;
+    Some(slots_mib.min(host_cap_mib).max(current_mib))
+}
+
+/// Cap the memory all sandboxes together may use, so host memory pressure
+/// OOM-kills a sandbox inside the parent cgroup before node services starve.
 pub fn apply_parent_memory_limit(
     sandbox_cgroup_memory_mib: u64,
     max_slots: u32,
@@ -309,12 +336,24 @@ pub fn apply_parent_memory_limit(
         ));
     }
 
-    let total_memory_mib =
-        sandbox_cgroup_total_memory_mib(sandbox_cgroup_memory_mib, max_slots).ok_or_else(|| {
-            format!(
-                "sandbox parent memory overflow: {sandbox_cgroup_memory_mib} MiB * {max_slots} slots"
-            )
-        })?;
+    let host_memory_total_mib = read_host_memory_total_mib()?;
+    let current_path = format!("{CGROUP_BASE}/memory.current");
+    let current_bytes: u64 = fs::read_to_string(&current_path)
+        .map_err(|e| format!("failed to read {current_path}: {e}"))?
+        .trim()
+        .parse()
+        .map_err(|e| format!("invalid {current_path}: {e}"))?;
+    let total_memory_mib = parent_memory_max_mib(
+        sandbox_cgroup_memory_mib,
+        max_slots,
+        host_memory_total_mib,
+        current_bytes.div_ceil(MIB_BYTES),
+    )
+    .ok_or_else(|| {
+        format!(
+            "sandbox parent memory overflow: {sandbox_cgroup_memory_mib} MiB * {max_slots} slots"
+        )
+    })?;
     let memory_max_bytes = total_memory_mib.checked_mul(MIB_BYTES).ok_or_else(|| {
         format!("sandbox parent memory overflow: {total_memory_mib} MiB to bytes")
     })?;
@@ -327,9 +366,23 @@ pub fn apply_parent_memory_limit(
     Ok(ParentMemoryLimit {
         sandbox_cgroup_memory_mib,
         max_slots,
+        host_memory_total_mib,
         memory_max,
         memory_swap_max,
     })
+}
+
+fn read_host_memory_total_mib() -> Result<u64, String> {
+    const MEMINFO: &str = "/proc/meminfo";
+    let meminfo =
+        fs::read_to_string(MEMINFO).map_err(|e| format!("failed to read {MEMINFO}: {e}"))?;
+    meminfo
+        .lines()
+        .find_map(|line| line.strip_prefix("MemTotal:"))
+        .and_then(|value| value.trim().strip_suffix("kB"))
+        .and_then(|kib| kib.trim().parse::<u64>().ok())
+        .map(|kib| kib / 1024)
+        .ok_or_else(|| format!("{MEMINFO} has no valid MemTotal"))
 }
 
 fn parent_cpu_max_value(reserved_count: u32) -> String {

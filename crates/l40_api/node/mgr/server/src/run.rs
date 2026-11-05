@@ -839,6 +839,7 @@ pub async fn run(
             sandbox_cgroup_parent_cpu_max = sandbox_parent_cpu_limit.cpu_max,
             sandbox_cgroup_parent_memory_mib = sandbox_parent_memory_limit.sandbox_cgroup_memory_mib,
             sandbox_cgroup_parent_memory_max_slots = sandbox_parent_memory_limit.max_slots,
+            sandbox_cgroup_parent_host_memory_total_mib = sandbox_parent_memory_limit.host_memory_total_mib,
             sandbox_cgroup_parent_memory_max = sandbox_parent_memory_limit.memory_max,
             sandbox_cgroup_parent_memory_swap_max = sandbox_parent_memory_limit.memory_swap_max,
             sandbox_cgroup_parent_disk_io_mode = sandbox_parent_disk_io_reservation.mode(),

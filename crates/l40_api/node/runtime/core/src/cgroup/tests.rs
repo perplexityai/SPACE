@@ -296,3 +296,29 @@ fn legacy_cpu_updates_only_reduce_the_current_rate() {
     std::fs::remove_file(path).unwrap();
     cpu_quota_is_nonincreasing_at(directory.path(), 1).unwrap_err();
 }
+
+#[test]
+fn parent_memory_max_keeps_host_reserve_without_shrinking_beneath_sandboxes() {
+    const GIB: u64 = 1024;
+    let host = 1008 * GIB;
+    let reserve = host_memory_reserve_mib(host);
+    assert_eq!(reserve, 63 * GIB);
+
+    // 300 slots of 16 GiB would overcommit the host; the cap keeps the reserve.
+    assert_eq!(
+        parent_memory_max_mib(16_512, 300, host, 0),
+        Some(host - reserve)
+    );
+    // A pool that fits beneath the host cap keeps its own total.
+    assert_eq!(parent_memory_max_mib(8_320, 10, host, 0), Some(83_200));
+    // A live node already holding more than the cap is never shrunk beneath it.
+    assert_eq!(
+        parent_memory_max_mib(16_512, 300, host, 990 * GIB),
+        Some(990 * GIB)
+    );
+    // A small host still fits one sandbox.
+    assert_eq!(
+        parent_memory_max_mib(16_512, 300, 16 * GIB, 0),
+        Some(16_512)
+    );
+}
