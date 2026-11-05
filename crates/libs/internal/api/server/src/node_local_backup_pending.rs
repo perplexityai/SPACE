@@ -337,9 +337,9 @@ pub(super) enum PendingLocalBackupCensus {
 /// setting `cleanup_required`
 /// (`sbx/mgr/store/src/db/local_artifacts.rs`'s `pin_suspended_artifact_for_cleanup`, a
 /// SQLite writer), and the teardown-suspend path pins one mid-transition,
-/// and each of those eventually reaches this column through
-/// `publish_clear_or_preserve_current_local_artifact_marker_assignments`. A
-/// hand-kept status list that missed one would accept an incomplete report
+/// and each of those eventually reaches this column through the node-published
+/// suspended finalization (`pplx_space_sandbox_store::ingest::finalize_suspended`).
+/// A hand-kept status list that missed one would accept an incomplete report
 /// and certify an empty queue. Reading the marker the server already stores
 /// is closed by construction and fails safe for states nobody has thought of
 /// yet.

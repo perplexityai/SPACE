@@ -43,9 +43,8 @@
 "crates/libs/node/mgr/server/src/service/artifact_fs/receive.rs" = 4
 "crates/libs/node/mgr/server/src/net/fallback.rs" = 1
 
-# Writers of the control-plane Postgres `sandboxes` row outside sandbox-store,
-# and their calls to sandbox-portability's assignment renderers. They move into
-# the store; lower each cap as they go.
+# Writers of the control-plane Postgres `sandboxes` row outside sandbox-store.
+# They move into the store; lower each cap as they go.
 [pattern_ratchet.sandbox_writes]
 "crates/libs/api/src/controllers/sandbox/responses.rs" = 1
 "crates/libs/api/src/controllers/substrate/direct.rs" = 1

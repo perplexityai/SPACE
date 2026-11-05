@@ -6,10 +6,7 @@ use pplx_space_common_core::types::SubstrateKind;
 
 use pplx_space_common_core::sql;
 use pplx_space_common_core::types::PositiveDuration;
-use pplx_space_sandbox_portability::{
-    SuspendedK8sFinalizationSql, SuspendedTargetNodeAssignment, started_repair_revert_eligibility,
-    suspended_k8s_finalization_sql,
-};
+use pplx_space_sandbox_portability::started_repair_revert_eligibility;
 use pplx_space_sandbox_store::repair;
 use sqlx::PgPool;
 
@@ -173,11 +170,7 @@ impl RepairDbStore {
             return Ok(ApplyOutcome::SkippedRaced);
         };
 
-        // Only the port-exposure assignments are read from this renderer;
-        // they do not depend on the marker policy the flip above applied.
-        let finalization =
-            suspended_k8s_finalization_sql("s", "pre", "", SuspendedTargetNodeAssignment::Clear);
-        self.reset_open_port_exposures(&mut tx, candidate.sandbox_id, &finalization)
+        self.reset_open_port_exposures(&mut tx, candidate.sandbox_id)
             .await?;
 
         tx.commit().await?;
@@ -188,19 +181,22 @@ impl RepairDbStore {
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         sandbox_id: SandboxId,
-        finalization: &SuspendedK8sFinalizationSql,
     ) -> Result<(), sqlx::Error> {
-        let query = format!(
+        sqlx::query(sql!(
             "UPDATE sandbox_port_exposures
-                SET {assignments}
+                SET apply_state = 'pending',\n\
+                    last_applied_node_id = NULL,\n\
+                    last_error = NULL,\n\
+                    last_bridge_status = NULL,\n\
+                    last_applied_bridge_generation = NULL,\n\
+                    last_observed_at = NULL,\n\
+                    updated_at = NOW()
               WHERE sandbox_id = $1
-                AND desired_state = 'open'",
-            assignments = finalization.open_port_exposure_assignments(),
-        );
-        sqlx::query(sqlx::AssertSqlSafe(sql!(query.as_str())))
-            .bind(sandbox_id)
-            .execute(&mut **tx)
-            .await?;
+                AND desired_state = 'open'"
+        ))
+        .bind(sandbox_id)
+        .execute(&mut **tx)
+        .await?;
         Ok(())
     }
 }

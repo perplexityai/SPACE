@@ -14,11 +14,12 @@
 
 use pplx_space_common_core::types::{LocalArtifactId, PositiveDuration, SandboxId, SubstrateKind};
 
+use std::sync::LazyLock;
+
 use pplx_space_common_core::sql;
 use pplx_space_sandbox_portability::{
-    SuspendedTargetNodeAssignment, clear_current_local_artifact_marker_assignments,
     failed_repair_revert_eligibility, newest_suspend_snapshot_current,
-    started_repair_revert_eligibility, suspended_k8s_finalization_sql,
+    started_repair_revert_eligibility,
 };
 use sqlx::{Postgres, Transaction};
 
@@ -80,24 +81,26 @@ pub async fn revert_started_to_suspended(
     min_age: PositiveDuration,
     newest_generation: i64,
 ) -> Result<Option<bool>, sqlx::Error> {
-    let eligibility = started_repair_revert_eligibility("s");
-    let artifact_marker_assignments =
-        clear_current_local_artifact_marker_assignments("s", "pre.will_clear");
-    let finalization = suspended_k8s_finalization_sql(
-        "s",
-        "pre",
-        &artifact_marker_assignments,
-        SuspendedTargetNodeAssignment::Clear,
-    );
-    let query = format!(
-        "WITH pre AS (
+    /// Built once: every input is a literal or a bind placeholder.
+    static QUERY: LazyLock<String> = LazyLock::new(|| {
+        let eligibility = started_repair_revert_eligibility("s");
+        sql!(format!(
+            "WITH pre AS (
                  SELECT id,
                         {clear_marker} AS will_clear
                    FROM sandboxes s
                   WHERE s.id = $1
              )
              UPDATE sandboxes s
-                SET {sandbox_assignments}
+                SET lifecycle = 'suspended',
+                    placement = 'unplaced',
+                    active_node_id = NULL,
+                    command_ready_pending = FALSE,
+                    target_node_id = NULL,
+                    placement_changed_at = NULL,
+                    current_local_artifact_id = CASE WHEN pre.will_clear THEN NULL ELSE s.current_local_artifact_id END,\n\
+                    current_local_artifact_kind = CASE WHEN pre.will_clear THEN NULL ELSE s.current_local_artifact_kind END,\n\
+                    current_local_artifact_origin = CASE WHEN pre.will_clear THEN NULL ELSE s.current_local_artifact_origin END
                FROM pre
               WHERE s.id = pre.id
                 AND {guards}
@@ -106,12 +109,12 @@ pub async fn revert_started_to_suspended(
                       WHERE e.sandbox_id = s.id) = $3
                 AND {eligible}
             RETURNING pre.will_clear",
-        clear_marker = eligibility.clear_marker,
-        sandbox_assignments = finalization.sandbox_assignments(),
-        guards = started_repair_row_state_guards("$4", "$2"),
-        eligible = eligibility.eligible,
-    );
-    sqlx::query_scalar(sqlx::AssertSqlSafe(sql!(query.as_str())))
+            clear_marker = eligibility.clear_marker,
+            guards = started_repair_row_state_guards("$4", "$2"),
+            eligible = eligibility.eligible,
+        ))
+    });
+    sqlx::query_scalar(sqlx::AssertSqlSafe(QUERY.as_str()))
         .bind(sandbox_id)
         .bind(duration_secs_i64(min_age))
         .bind(newest_generation)
@@ -195,22 +198,25 @@ pub async fn revert_failed_to_suspended(
     sandbox_id: SandboxId,
     min_age: PositiveDuration,
 ) -> Result<Option<bool>, sqlx::Error> {
-    let eligibility = failed_repair_revert_eligibility("s");
-    let marker_assignments = clear_current_local_artifact_marker_assignments("s", "pre.will_clear");
-    let finalization = suspended_k8s_finalization_sql(
-        "s",
-        "pre",
-        &marker_assignments,
-        SuspendedTargetNodeAssignment::Clear,
-    );
-    let query = format!(
-        "WITH pre AS (
+    /// Built once: every input is a literal or a bind placeholder.
+    static QUERY: LazyLock<String> = LazyLock::new(|| {
+        let eligibility = failed_repair_revert_eligibility("s");
+        sql!(format!(
+            "WITH pre AS (
                  SELECT id, {clear} AS will_clear
                    FROM sandboxes s
                   WHERE s.id = $1
              )
              UPDATE sandboxes s
-                SET {sandbox_assignments},
+                SET lifecycle = 'suspended',
+                    placement = 'unplaced',
+                    active_node_id = NULL,
+                    command_ready_pending = FALSE,
+                    target_node_id = NULL,
+                    placement_changed_at = NULL,
+                    current_local_artifact_id = CASE WHEN pre.will_clear THEN NULL ELSE s.current_local_artifact_id END,\n\
+                    current_local_artifact_kind = CASE WHEN pre.will_clear THEN NULL ELSE s.current_local_artifact_kind END,\n\
+                    current_local_artifact_origin = CASE WHEN pre.will_clear THEN NULL ELSE s.current_local_artifact_origin END,
                     restore_lease_expires_at = NULL,
                     restore_lease_token = NULL
                FROM pre
@@ -218,12 +224,12 @@ pub async fn revert_failed_to_suspended(
                 AND {guards}
                 AND {eligible}
             RETURNING pre.will_clear",
-        clear = eligibility.clear_marker,
-        sandbox_assignments = finalization.sandbox_assignments(),
-        guards = failed_repair_row_state_guards("$3", "$2"),
-        eligible = eligibility.eligible,
-    );
-    sqlx::query_scalar(sqlx::AssertSqlSafe(sql!(query.as_str())))
+            clear = eligibility.clear_marker,
+            guards = failed_repair_row_state_guards("$3", "$2"),
+            eligible = eligibility.eligible,
+        ))
+    });
+    sqlx::query_scalar(sqlx::AssertSqlSafe(QUERY.as_str()))
         .bind(sandbox_id)
         .bind(duration_secs_i64(min_age))
         .bind(SubstrateKind::Kubernetes)
