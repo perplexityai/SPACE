@@ -95,7 +95,7 @@ pub struct CreateSandboxOperationPayload {
     /// Same mixed-version rule as `node_pool`: absent payloads serialize
     /// byte-identically and old payloads parse unchanged, while a present key
     /// is rejected by an older executor's `deny_unknown_fields`. The admin
-    /// create sets it only while [`ADMIN_CREATE_REQUESTED_BY_ENV`] is on.
+    /// create sets it unless [`ADMIN_CREATE_REQUESTED_BY_ENV`] is off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub requested_by_user_id: Option<UserId>,
 }
@@ -210,19 +210,27 @@ pub(crate) fn implicit_wake_activity_enabled() -> bool {
 }
 
 /// The switch for recording
-/// [`CreateSandboxOperationPayload::requested_by_user_id`] on admin creates:
-/// `1`, `true`, `yes`, `on` or `enabled`, in any case, turns it on; unset or
-/// anything else keeps it off. Off, admin creates go in without it, as before
-/// the field, and the admin operations API reports no requester. Turn it on
-/// only once every `space-cluster-controller` replica runs this release or a
-/// later one, which accept the field without reading it, and off again,
-/// letting the creates queued with it drain, before rolling one back.
+/// [`CreateSandboxOperationPayload::requested_by_user_id`] on admin creates,
+/// on by default so that admin creates record the operator: `0`, `false`,
+/// `no`, `off` or `disabled`, in any case, turns it off; unset or anything
+/// else keeps it on. Off, admin creates go in without it, as before the
+/// field, and the admin operations API reports no requester. Controllers
+/// before #1303 (`e083c944e`) reject the field, and nothing here checks their
+/// version, so turn it off:
+/// - when upgrading from a release before #1303, since the chart rolls the
+///   API and the controllers out together, and turn it on again once every
+///   `space-cluster-controller` replica runs this release;
+/// - before rolling a controller back below #1303. An API replica reads the
+///   setting from its environment, so one started with it on keeps sending the
+///   field until it exits, shutdown drain included: wait until every such
+///   replica has exited, then until the admin creates queued with the field
+///   have finished, and only then roll the controller back.
 pub(crate) const ADMIN_CREATE_REQUESTED_BY_ENV: &str = "SPACE_ADMIN_CREATE_REQUESTED_BY_ENABLED";
 
 /// Whether admin creates record their requester; see
 /// [`ADMIN_CREATE_REQUESTED_BY_ENV`].
 pub(crate) fn admin_create_requested_by_enabled() -> bool {
-    pplx_space_common_core::env::env_flag_var(ADMIN_CREATE_REQUESTED_BY_ENV, false)
+    pplx_space_common_core::env::env_flag_var(ADMIN_CREATE_REQUESTED_BY_ENV, true)
 }
 
 impl SandboxLifecycleOperationPayload {

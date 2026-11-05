@@ -673,61 +673,197 @@ fn admin_idempotency_key_is_header_text_within_the_cap() {
     }
 }
 
-/// An admin create keeps the owner as the operation's actor and, when the
-/// requester is recorded, reports the administrator as `requested_by_user_id`
-/// in the admin operations API; a create without it reports none.
+/// The admin create body for a sandbox `owner` holds in `org_id`.
+fn admin_create_request(org_id: OrgId, owner: UserId) -> serde_json::Value {
+    serde_json::json!({
+        "org_id": org_id,
+        "user_id": owner,
+        "sandbox": {
+            "name": null,
+            "template": "seed",
+            "runtime": "fc",
+            "env": {},
+            "metadata": {},
+            "resources": null
+        },
+    })
+}
+
+/// Submits an admin create for `owner` through the handler as a managing-org
+/// administrator, returning that administrator and the accepted create.
+async fn admin_create_through_handler(
+    pool: &sqlx::PgPool,
+    org_id: OrgId,
+    owner: UserId,
+) -> TestResult<(crate::models::User, SandboxOperationResponse)> {
+    let admin = sqlx::query_as::<_, crate::models::User>(sql!(
+        "SELECT u.*
+         FROM users u
+         JOIN clusters c ON c.managing_org_id = u.org_id
+         WHERE c.singleton
+           AND u.role = 'organization_admin'
+         ORDER BY u.id
+         LIMIT 1"
+    ))
+    .fetch_one(pool)
+    .await?;
+    let mut headers = HeaderMap::new();
+    headers.insert(IDEMPOTENCY_KEY_HEADER, Uuid::now_v7().to_string().parse()?);
+    let response = create_sandbox(
+        State(AppState::from_pool(pool.clone()).await?),
+        Extension(AuthUser(admin.clone())),
+        headers,
+        AdminCreateJson(serde_json::from_value(admin_create_request(org_id, owner))?),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let response =
+        serde_json::from_slice(&axum::body::to_bytes(response.into_body(), 100_000).await?)?;
+    Ok((admin, response))
+}
+
+/// The `(actor_user_id, requested_by_user_id)` the admin operations API
+/// reports for an operation, read by its ID and then listed by its target.
+async fn admin_operation_reads(
+    store: &PublicOperationStore,
+    operation_id: OperationId,
+    org_id: OrgId,
+    target_id: String,
+) -> TestResult<[(Option<UserId>, Option<UserId>); 2]> {
+    let fetched = store
+        .fetch_operation_admin(operation_id)
+        .await?
+        .expect("the create's operation exists");
+    let listed = store
+        .list_operations_admin(crate::public_operations::ListAdminPublicOperations {
+            org_id: Some(org_id),
+            state: None,
+            kind: None,
+            target_type: None,
+            target_id: Some(target_id),
+            limit: 10,
+        })
+        .await?;
+    let [listed] = listed.as_slice() else {
+        return Err(format!("{} operations listed for the target", listed.len()).into());
+    };
+    Ok([
+        (fetched.actor_user_id, fetched.requested_by_user_id),
+        (listed.actor_user_id, listed.requested_by_user_id),
+    ])
+}
+
+/// With `SPACE_ADMIN_CREATE_REQUESTED_BY_ENABLED` unset, an admin create keeps
+/// the owner as the operation's actor and reports the administrator who
+/// submitted it as `requested_by_user_id` in the admin operations API; a
+/// create an older API release queued without one reports none.
 #[tokio::test]
 async fn an_admin_create_reports_its_requester_apart_from_the_owner() -> TestResult {
+    // Leave the switch at its default, and keep the substrate
+    // `AppState::from_pool` chooses from the process environment Direct
+    // whatever the host sets.
+    if !pplx_space_test_env::enter_test_process(&[
+        (
+            crate::public_sandbox_operations::ADMIN_CREATE_REQUESTED_BY_ENV,
+            None,
+        ),
+        (
+            "SPACE_K8S_CONTROL_PLANE",
+            Some(std::ffi::OsStr::new("false")),
+        ),
+    ]) {
+        return Ok(());
+    }
     let Some(db) = try_pg_test_db().await? else {
         return Ok(());
     };
-    let admin = UserId::from_uuid(pplx_space_db_test_fixtures::SEED_USER_ID);
     let org_id = OrgId::from_uuid(seed_org(&db.pool).await?);
     let owner = UserId::from_uuid(seed_user(&db.pool, org_id).await?);
+    let (admin, response) = admin_create_through_handler(&db.pool, org_id, owner).await?;
     let store = PublicOperationStore::new(db.pool.clone());
-    for (key, requested_by) in [
-        ("requested-by-recorded", Some(admin)),
-        ("requested-by-off", None),
-    ] {
-        let request = serde_json::from_value(serde_json::json!({
-            "org_id": org_id,
-            "user_id": owner,
-            "sandbox": {
-                "name": null,
-                "template": "seed",
-                "runtime": "fc",
-                "env": {},
-                "metadata": {},
-                "resources": null
-            },
-        }))?;
-        let response = create_sandbox_for_org(
-            &db.pool,
-            request,
-            &IdempotencyKey::parse_header(key.as_bytes())?,
-            requested_by,
+    assert_eq!(
+        admin_operation_reads(
+            &store,
+            response.operation_id,
+            org_id,
+            response.sandbox_id.to_string(),
         )
-        .await
-        .map_err(|error| error.message)?;
-        let operation = store
-            .fetch_operation_admin(response.operation_id)
-            .await?
-            .expect("the create's operation exists");
-        assert_eq!(operation.actor_user_id, Some(owner), "{key}");
-        assert_eq!(operation.requested_by_user_id, requested_by, "{key}");
-        let listed = store
-            .list_operations_admin(crate::public_operations::ListAdminPublicOperations {
-                org_id: Some(org_id),
-                state: None,
-                kind: None,
-                target_type: None,
-                target_id: Some(response.sandbox_id.to_string()),
-                limit: 10,
-            })
-            .await?;
-        assert_eq!(listed.len(), 1, "{key}");
-        assert_eq!(listed[0].requested_by_user_id, requested_by, "{key}");
+        .await?,
+        [(Some(owner), Some(admin.id)); 2],
+    );
+
+    let older: AdminCreateSandboxRequest =
+        serde_json::from_value(admin_create_request(org_id, owner))?;
+    let older_sandbox_id = PublicSandboxId::new();
+    let older_target_id = older_sandbox_id.to_string();
+    let CreatePublicOperationResult::Created(older_operation_id) = store
+        .create_operation(CreatePublicOperation {
+            org_id,
+            actor_user_id: Some(owner),
+            api_product: ApiProduct::Admin,
+            kind: OperationKind::CreateSandbox,
+            target_type: Some(OperationTargetType::Sandbox),
+            target_id: Some(&older_target_id),
+            payload_json: CreateSandboxOperationPayload {
+                sandbox_id: older_sandbox_id,
+                request: older.sandbox,
+                node_pool: None,
+                federated_create: None,
+                pool_claim: None,
+                requested_by_user_id: None,
+            }
+            .into_json(),
+            idempotency: None,
+            traceparent: None,
+        })
+        .await?
+    else {
+        return Err("the older create was not queued".into());
+    };
+    assert_eq!(
+        admin_operation_reads(&store, older_operation_id, org_id, older_target_id).await?,
+        [(Some(owner), None); 2],
+    );
+    db.pool.close().await;
+    Ok(())
+}
+
+/// With `SPACE_ADMIN_CREATE_REQUESTED_BY_ENABLED` off, an admin create goes in
+/// without its requester, for controllers older than the field: the admin
+/// operations API reports the owner as the actor and no requester.
+#[tokio::test]
+async fn an_admin_create_with_the_requester_switch_off_reports_none() -> TestResult {
+    // Turn the switch off, in a spelling only the case-insensitive parser
+    // reads as off, and keep the substrate Direct as above.
+    if !pplx_space_test_env::enter_test_process(&[
+        (
+            crate::public_sandbox_operations::ADMIN_CREATE_REQUESTED_BY_ENV,
+            Some(std::ffi::OsStr::new("Off")),
+        ),
+        (
+            "SPACE_K8S_CONTROL_PLANE",
+            Some(std::ffi::OsStr::new("false")),
+        ),
+    ]) {
+        return Ok(());
     }
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let org_id = OrgId::from_uuid(seed_org(&db.pool).await?);
+    let owner = UserId::from_uuid(seed_user(&db.pool, org_id).await?);
+    let (_, response) = admin_create_through_handler(&db.pool, org_id, owner).await?;
+    let store = PublicOperationStore::new(db.pool.clone());
+    assert_eq!(
+        admin_operation_reads(
+            &store,
+            response.operation_id,
+            org_id,
+            response.sandbox_id.to_string(),
+        )
+        .await?,
+        [(Some(owner), None); 2],
+    );
     db.pool.close().await;
     Ok(())
 }
