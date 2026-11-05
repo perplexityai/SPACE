@@ -65,6 +65,11 @@ enum ControllerErrorKind {
     /// Carried so the native delete executor can wait for the upload to
     /// finalize instead of failing the operation.
     SnapshotUploadInFlight(SnapshotUploadInFlight),
+    /// Cluster activation admission refused this request, whether the
+    /// limiter was out of tokens or the cluster had no eligible node. Carried
+    /// so request metrics can count the refusal without reading the retry
+    /// cause, which only the rate-limited case sets.
+    ClusterAdmissionRejection,
 }
 
 /// Why a template the caller may use resolved to no release.
@@ -400,7 +405,13 @@ impl ControllerError {
             error =
                 error.with_retry_after_cause(ControllerRetryAfterCause::ClusterActivationAdmission);
         }
+        error.kind = ControllerErrorKind::ClusterAdmissionRejection;
         error
+    }
+
+    /// Whether cluster activation admission refused this request.
+    pub(crate) const fn is_cluster_admission_rejection(&self) -> bool {
+        matches!(self.kind, ControllerErrorKind::ClusterAdmissionRejection)
     }
 }
 

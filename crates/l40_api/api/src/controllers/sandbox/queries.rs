@@ -1362,8 +1362,22 @@ impl SandboxController {
         )
         .await?;
 
-        self.admit_cluster_activation(crate::cluster_admission::ClusterActivationClass::Cold)
-            .await?;
+        let admission = self
+            .admit_cluster_activation(crate::cluster_admission::ClusterActivationClass::Cold)
+            .await;
+        // A fork's size comes from its source snapshot, not this request.
+        if restore_from.is_none()
+            && let Some(sample) = requested_metrics::admission(&admission)
+        {
+            requested_metrics::record_create(
+                metric_identity.surface,
+                sample,
+                template,
+                &resources,
+                shape_source,
+            );
+        }
+        admission?;
 
         // Store the resolved hash as the sandbox's immutable build pin; wake and restore
         // keep using it even if a tag moves later.
@@ -2277,6 +2291,11 @@ impl SandboxController {
                     input.template,
                 ),
             );
+            requested_metrics::record_pool_claim(
+                input.metric_identity.surface,
+                input.template,
+                &sandbox,
+            );
 
             if prepare_attempt > 1 {
                 tracing::info!(
@@ -2537,6 +2556,11 @@ impl SandboxController {
                 input.backend,
                 input.template,
             ),
+        );
+        requested_metrics::record_pool_claim(
+            input.metric_identity.surface,
+            input.template,
+            &sandbox,
         );
         pplx_space_metrics::warm_pool::acquire_duration(
             input.template,
