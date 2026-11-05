@@ -7,6 +7,7 @@ import { Button, Popconfirm, Result, Space, Spin, Tabs, Tag, Tooltip, Typography
 import { ArrowLeftOutlined, DeleteOutlined, ReloadOutlined } from '@ant-design/icons';
 import { adminApi } from '@/lib/api';
 import { LATEST_TAG, shortHash } from '@/lib/template-format';
+import { linkableTemplates } from '@/lib/system-template-rebuild';
 import { templateListRows } from '@/lib/template-list';
 import type { Organization } from '@/lib/types';
 import { useTemplatesData } from '../use-templates-data';
@@ -171,7 +172,7 @@ function TemplateDetailPage() {
               releasesLoaded={data.releasesLoaded}
               refreshReleases={() => data.refreshTemplateReleases({ showLoading: false })}
               title={<Title level={5} style={{ margin: 0 }}>System template rebuild</Title>}
-              listedTemplates={new Set(data.templates.map((listed) => listed.name))}
+              listedTemplates={linkableTemplates({ open: template.name, releases: data.templateReleases, listed: data.templates })}
             />
           ) : null}
           <TemplateBuildsPanel templateName={template.name} open={tab === 'builds'} reloadKey={data.refreshGeneration} />

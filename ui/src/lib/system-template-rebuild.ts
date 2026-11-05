@@ -411,6 +411,21 @@ export function testSandboxName(template: SystemTemplate, runId: string): string
   return `rebuild-check-${template}-${runId.slice(0, 8)}`;
 }
 
+// The templates the rebuild panel may link to: those known to have a record,
+// and so a page. A template page lists only its own template, but the
+// releases name every template that published one, and the list knows the
+// rest. A first build still queued has no record yet and stays unlinked.
+export function linkableTemplates(known: {
+  open?: string;
+  releases: Pick<TemplateRelease, 'template_name'>[];
+  listed: { name: string }[];
+}): Set<string> {
+  const names = new Set<string>(known.releases.map((release) => release.template_name));
+  for (const template of known.listed) names.add(template.name);
+  if (known.open) names.add(known.open);
+  return names;
+}
+
 export function latestDigest(
   releases: Pick<TemplateRelease, 'template_name' | 'tags' | 'content_hash'>[],
   template: SystemTemplate,

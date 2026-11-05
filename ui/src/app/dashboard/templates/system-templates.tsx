@@ -3,6 +3,7 @@
 import Link from 'next/link';
 import { Alert, Button, Space, Table, Tag, Tooltip, Typography } from 'antd';
 import { LATEST_TAG, shortHash } from '@/lib/template-format';
+import { linkableTemplates } from '@/lib/system-template-rebuild';
 import SystemTemplateRebuild from './system-template-rebuild';
 import type { TemplatesData } from './use-templates-data';
 import { templateHref } from './links';
@@ -71,7 +72,7 @@ export default function SystemTemplates({ data }: { data: TemplatesData }) {
         releasesLoaded={data.releasesLoaded}
         refreshReleases={() => data.refreshTemplateReleases({ showLoading: false })}
         title={<Title level={5} style={{ margin: 0 }}>System template rebuild</Title>}
-        listedTemplates={new Set(data.templates.map((template) => template.name))}
+        listedTemplates={linkableTemplates({ releases: data.templateReleases, listed: data.templates })}
       />
     </Space>
   );
