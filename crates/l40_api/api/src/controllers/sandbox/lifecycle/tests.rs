@@ -68,6 +68,66 @@ fn cluster_delete_miss_reason_classifies_by_substrate_error() {
     );
 }
 
+/// Admission refusals at request entry and those the substrate charges later
+/// share one constructor. Only a rate-limited refusal carries the
+/// backpressure cause the async dispatcher re-queues behind; an empty
+/// cluster keeps its bounded retry.
+#[test]
+fn admission_refusals_keep_their_dispatcher_retry_causes() {
+    use crate::cluster_admission::ClusterAdmissionError;
+
+    let cases = [
+        (
+            "request entry, rate limited",
+            cluster_admission_controller_error(ClusterAdmissionError::RateLimited {
+                message: "activation budget exhausted".into(),
+                retry_after: Duration::from_secs(1),
+            }),
+            Some(Duration::from_secs(1)),
+            Some(ControllerRetryAfterCause::ClusterActivationAdmission),
+        ),
+        (
+            "request entry, empty cluster",
+            cluster_admission_controller_error(ClusterAdmissionError::EmptyCluster {
+                message: "no eligible nodes".into(),
+                retry_after: Duration::from_secs(5),
+            }),
+            Some(Duration::from_secs(5)),
+            None,
+        ),
+        (
+            "substrate charge, rate limited",
+            ControllerError::from(SubstrateError::AdmissionRejected {
+                message: "activation budget exhausted".into(),
+                retry_after: Some(Duration::from_secs(1)),
+                rate_limited: true,
+            }),
+            Some(Duration::from_secs(1)),
+            Some(ControllerRetryAfterCause::ClusterActivationAdmission),
+        ),
+        (
+            "substrate charge, empty cluster",
+            ControllerError::from(SubstrateError::AdmissionRejected {
+                message: "no eligible nodes".into(),
+                retry_after: None,
+                rate_limited: false,
+            }),
+            None,
+            None,
+        ),
+    ];
+    for (case, error, retry_after_header, cause) in cases {
+        assert_eq!(
+            error.status(),
+            axum::http::StatusCode::TOO_MANY_REQUESTS,
+            "{case}"
+        );
+        assert_eq!(error.retry_after_header(), retry_after_header, "{case}");
+        assert_eq!(error.retry_after(), None, "{case}");
+        assert_eq!(error.retry_after_cause(), cause, "{case}");
+    }
+}
+
 #[test]
 fn protected_node_delete_defers_control_plane_delete() {
     assert!(cluster_delete_must_defer_control_plane(
