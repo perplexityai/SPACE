@@ -604,7 +604,7 @@ async fn wake_completion_outcome_maps_to_the_wake_response(
 }
 
 /// Where `completed_actions_keep_a_terminal_lifecycle_that_landed_mid_flight`
-/// lands the terminal lifecycle.
+/// lands the lifecycle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Landing {
     /// Before the action runs, as in the direct test.
@@ -636,7 +636,19 @@ enum Landing {
 /// claim and its finalization, the substrate's own writes accept only a
 /// `suspending` row; this test does not land a lifecycle there.
 ///
-/// The row keeps the terminal lifecycle in every case. Its placement is kept
+/// Start's post-Wake landing also lands a delete, stop or suspend's lifecycle
+/// (`deleting`, `stopping`, `suspending`, `suspended`), the race the stamp's
+/// guard closes on this substrate: the start reports success and its stamp
+/// keeps each one. A Kubernetes start claims `restoring` before it restores a
+/// `suspended` row, so unlike on direct its stamp keeps a landed `suspended`.
+/// Resume and pause also land a completed stop's `stopped` before they run:
+/// their runtime client reads the row and still dials the live pod, the
+/// action reports success, and its stamp keeps `stopped`, as on direct.
+/// Pause also lands a `restoring` before it runs: its non-recovering runtime
+/// client refuses a `restoring` row without dialing or joining the restore,
+/// so the pause fails with a 503 and the row stays the restore owner's.
+///
+/// The row keeps the landed lifecycle in every case. Its placement is kept
 /// too, except after start's Wake: the substrate itself records the pod's
 /// node placement (`persist_pod_node_placement`), so that row ends `on_node`.
 #[rstest::rstest]
@@ -723,13 +735,28 @@ async fn completed_actions_keep_a_terminal_lifecycle_that_landed_mid_flight(
     } else {
         RouteIdentity::Published
     };
-    // The same exclusion as the direct test: only the lifecycles both
-    // guard families treat as terminal.
-    let terminal = ["failed", "quarantined"]
+    // Every case lands the lifecycles both guard families treat as
+    // terminal. The `BeforeAction` cases of start, stop, kill and suspend
+    // land nothing else: there the action's own checks run against what
+    // landed, and the direct test covers the stamp's guard over the
+    // cross-intent lifecycles. Resume and pause also land `stopped`, which
+    // their runtime client re-reads on this substrate before the node call
+    // and their stamp keeps. The `AfterWakeAck` case, whose write lands
+    // after the node acknowledged the start's Wake and before its stamp,
+    // also lands a delete, stop or suspend's lifecycle, which the stamp
+    // keeps on this substrate too.
+    let cross_intent: &[&'static str] = match (landing, action) {
+        (Landing::AfterWakeAck, _) => &["deleting", "stopping", "suspending", "suspended"],
+        (Landing::BeforeAction, SandboxAction::Resume) => &["stopped"],
+        (Landing::BeforeAction, SandboxAction::Pause) => &["stopped", "restoring"],
+        _ => &[],
+    };
+    let landings = ["failed", "quarantined"]
         .into_iter()
         .chain(StoredSandboxLifecycle::tombstones_as_str())
+        .chain(cross_intent.iter().copied())
         .map(Some);
-    for landed in [None].into_iter().chain(terminal) {
+    for landed in [None].into_iter().chain(landings) {
         let case = format!("{action:?} with {landed:?} landed {landing:?}");
         let sandbox_id = SandboxId::new();
         insert_sandbox(pool, sandbox_id, prior, "k8s").await?;
@@ -790,6 +817,14 @@ async fn completed_actions_keep_a_terminal_lifecycle_that_landed_mid_flight(
                     format!("sandbox cannot be started while lifecycle is {lifecycle}"),
                 );
             }
+            (Some("restoring"), SandboxAction::Pause, Landing::BeforeAction) => {
+                let error = result.expect_err("pause never dials a restoring pod");
+                assert_eq!(error.status(), StatusCode::SERVICE_UNAVAILABLE, "{case}");
+                assert_eq!(
+                    error.to_string(),
+                    "sandbox runtime is not currently reachable"
+                );
+            }
             (Some(_), SandboxAction::Suspend, Landing::BeforeAction) => {
                 let error = result.expect_err("suspend cannot claim a terminal lifecycle");
                 assert_eq!(error.status(), StatusCode::SERVICE_UNAVAILABLE, "{case}");
@@ -815,9 +850,9 @@ async fn completed_actions_keep_a_terminal_lifecycle_that_landed_mid_flight(
 /// route-receipt trigger: the native start operation writes `started` over
 /// it and succeeds without a retry. A Kubernetes start of a `created` row
 /// publishes the route once the node acknowledged its Wake, then the shared
-/// `maybe_mark_started_after_start` runs unguarded, so
-/// the activation-receipt path the direct test's doc mentions is not what
-/// writes `started` here.
+/// `maybe_mark_started_after_start` runs with only its in-flight guard,
+/// which admits `stopped`, so the activation-receipt path the direct test's
+/// doc mentions is not what writes `started` here.
 #[tokio::test(flavor = "current_thread")]
 async fn native_start_overwrites_a_stopped_written_mid_flight_without_a_retry() -> TestResult {
     use crate::public_operations::{ApiProduct, ClaimedPublicOperation};

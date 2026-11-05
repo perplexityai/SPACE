@@ -19,6 +19,7 @@ use pplx_space_metrics::sandbox::api::{SandboxApiMetricIdentity, WakeCompletionA
 use pplx_space_node_api_sim::{SandboxRecord, SimState, SimWorkerHarness};
 use pplx_space_placement::StoredSandboxLifecycle;
 use pplx_space_placement::test_support::{known_defects, stored_lifecycle_matrix};
+use pplx_space_sandbox_store::action_stamp::{ActionStamp, StartSubstrate};
 use pplx_space_test_env::TestResult;
 
 use super::*;
@@ -572,11 +573,27 @@ async fn wake_completion_outcome_maps_to_the_wake_response(
 }
 
 /// Every runtime action that reports a resulting lifecycle (start, resume,
-/// pause, stop, kill, suspend) writes it through the terminal-state guard:
-/// a terminal lifecycle that landed while the runtime call was in flight is
-/// kept, together with the placement, while the action itself still reports
-/// success. Only start also writes the placement (`on_node`), so the row is
-/// seeded `unplaced` with its active node still assigned.
+/// pause, stop, kill, suspend) writes it through its in-flight guard: a
+/// terminal lifecycle, or a delete, stop or suspend's, that landed while the
+/// runtime call was in flight is kept, together with the placement, while the
+/// action itself still reports success. Suspend's own stamp writes over a
+/// landed `suspended`, which leaves the same row. A Direct start writes
+/// `started` over a landed `suspended` too: its node cold-boots a suspended
+/// sandbox as part of the start, and a Direct suspend writes no `suspending`
+/// claim, so the stamp cannot tell a concurrent suspend's `suspended` from
+/// one the start began on. Overwriting is wrong only if a suspend finishes
+/// between the start's node call and its stamp, and the node's `suspended`
+/// report does not project that back; refusing would leave a running sandbox
+/// reading `suspended` whenever a suspend finishes before the node call (the
+/// `action_stamp` module docs in `pplx-space-sandbox-store`). A landed
+/// `stopped`, a stop or kill that completed mid-flight, is kept by resume,
+/// pause and suspend, which cannot begin from it. A start begins from it and
+/// a stop or kill stamps it itself, so each of those writes its own result
+/// over it. A landed `restoring`, a restore lease or evacuation restore
+/// claim, is kept by resume, pause and suspend, which on direct neither claim
+/// nor drive a restore, so its owner's completion still matches; start, stop
+/// and kill write over it. Only start also writes the placement (`on_node`),
+/// so the row is seeded `unplaced` with its active node still assigned.
 #[rstest::rstest]
 #[case::start(SandboxAction::Start, "stopped", "stopped", "started")]
 #[case::resume(SandboxAction::Resume, "paused", "paused", "started")]
@@ -604,16 +621,19 @@ async fn completed_actions_keep_a_terminal_lifecycle_that_landed_mid_flight(
     } else {
         "unplaced"
     };
-    // Only the lifecycles both guard families treat as terminal. The
-    // cross-intent lifecycles `deleting`, `stopping`, `suspending` and
-    // `suspended` are deliberately excluded: this post-result write
-    // currently replaces them with the action's own lifecycle, which is
-    // an open bug and is not encoded here.
-    let terminal = ["failed", "quarantined"]
+    let landings = ["failed", "quarantined"]
         .into_iter()
         .chain(StoredSandboxLifecycle::tombstones_as_str())
+        .chain([
+            "deleting",
+            "stopping",
+            "stopped",
+            "suspending",
+            "suspended",
+            "restoring",
+        ])
         .map(Some);
-    for landed in [None].into_iter().chain(terminal) {
+    for landed in [None].into_iter().chain(landings) {
         let sandbox_id = SandboxId::new();
         insert_sandbox(pool, sandbox_id, prior, "space").await?;
         place_on_node(pool, sandbox_id, node_id).await?;
@@ -636,6 +656,17 @@ async fn completed_actions_keep_a_terminal_lifecycle_that_landed_mid_flight(
         );
         let expected = match landed {
             None => Row::new(completed, completed_placement),
+            Some("suspended") if action == SandboxAction::Start => {
+                Row::new(completed, completed_placement)
+            }
+            Some("stopped" | "restoring")
+                if matches!(
+                    action,
+                    SandboxAction::Start | SandboxAction::Stop | SandboxAction::Kill
+                ) =>
+            {
+                Row::new(completed, completed_placement)
+            }
             Some(lifecycle) => Row::new(lifecycle, "unplaced"),
         };
         assert_eq!(
@@ -647,48 +678,142 @@ async fn completed_actions_keep_a_terminal_lifecycle_that_landed_mid_flight(
     Ok(())
 }
 
-/// The two post-action stamps and the pooled post-wake update share one
-/// guard: they write unless the row is `failed`, `quarantined` or a
-/// tombstone. Swept here over every stored value with today's outcome, so a
-/// change to that guard fails this table. Columns: `stamp` is
-/// `maybe_update_sandbox_lifecycle` with the pause stamp `paused`;
-/// `state_stamp` is start's `maybe_mark_started_after_start`, which writes
-/// `started`/`on_node`; `post_wake` is `update_and_fetch_post_wake_sandbox`.
-///
-/// `!` marks the known defect `completed_actions_keep_a_terminal_lifecycle_that_landed_mid_flight`
-/// leaves unencoded: a write that lands after a cross-intent transition
-/// (`deleting`, `stopping`, `suspending`, `suspended`, however spelled)
-/// replaces it with the action's own lifecycle. Fixing it means turning
-/// those marks into `.` and lowering `KNOWN_DEFECTS`. Whether a row is
-/// written is read from `xmin`, so a stamp that rewrites the value the row
-/// already holds still counts as applied.
+/// A start makes at most one post-result write: a synthetic rewrite that
+/// lands right after its stamp, standing in for another writer between two
+/// start writes, is kept rather than overwritten by a second, lifecycle-only
+/// write. The start runs as in
+/// [`completed_actions_keep_a_terminal_lifecycle_that_landed_mid_flight`].
 #[tokio::test(flavor = "current_thread")]
-async fn post_action_stamps_write_every_stored_lifecycle_but_the_terminal_ones() -> TestResult {
+async fn a_start_keeps_a_rewrite_that_landed_after_its_stamp() -> TestResult {
+    if !crate::test_support::enter_sim_worker_process() {
+        return Ok(());
+    }
+    let db = pg_test_db_with_max_connections(4).await?;
+    let pool = &db.pool;
+    let controller = direct_controller(pool);
+    let (worker, node_id) = start_sim_worker(pool).await?;
+
+    // A synthetic rewrite after the start's stamp: the trigger writes
+    // `stopped`/`unplaced` on the stamp's `unplaced` -> `on_node` move, as
+    // another writer landing between two start writes would, and counts its
+    // firings.
+    sqlx::query(sql!(
+        "CREATE TABLE test_start_compensations (sandbox_id UUID PRIMARY KEY, firings INT NOT NULL)"
+    ))
+    .execute(pool)
+    .await?;
+    sqlx::query(sql!(
+        "CREATE FUNCTION test_compensate_after_start_stamp() RETURNS trigger
+         LANGUAGE plpgsql AS $$
+         BEGIN
+             UPDATE test_start_compensations c
+                SET firings = c.firings + 1
+              WHERE c.sandbox_id = NEW.id;
+             IF FOUND THEN
+                 UPDATE sandboxes SET lifecycle = 'stopped', placement = 'unplaced'
+                  WHERE id = NEW.id;
+             END IF;
+             RETURN NEW;
+         END $$"
+    ))
+    .execute(pool)
+    .await?;
+    sqlx::query(sql!(
+        "CREATE TRIGGER test_compensate_after_start_stamp
+         AFTER UPDATE ON sandboxes
+         FOR EACH ROW
+         WHEN (OLD.placement = 'unplaced' AND NEW.placement = 'on_node'
+               AND NEW.lifecycle = 'started')
+         EXECUTE FUNCTION test_compensate_after_start_stamp()"
+    ))
+    .execute(pool)
+    .await?;
+    let sandbox_id = SandboxId::new();
+    insert_sandbox(pool, sandbox_id, "stopped", "space").await?;
+    place_on_node(pool, sandbox_id, node_id).await?;
+    set_placement(pool, sandbox_id, "unplaced").await?;
+    insert_resident(worker.state(), sandbox_id, "stopped").await?;
+    sqlx::query(sql!(
+        "INSERT INTO test_start_compensations (sandbox_id, firings) VALUES ($1, 0)"
+    ))
+    .bind(sandbox_id)
+    .execute(pool)
+    .await?;
+    let sandbox = tracked(pool, sandbox_id).await?;
+
+    let body = run_action(
+        &controller,
+        pool,
+        sandbox_id,
+        Some(&sandbox),
+        SandboxAction::Start,
+        None,
+    )
+    .await?;
+
+    assert_eq!(body["ok"], true, "{body}");
+    let firings: i32 = sqlx::query_scalar(sql!(
+        "SELECT firings FROM test_start_compensations WHERE sandbox_id = $1"
+    ))
+    .bind(sandbox_id)
+    .fetch_one(pool)
+    .await?;
+    assert_eq!(firings, 1, "the compensation never landed");
+    assert_eq!(
+        row(pool, sandbox_id).await?,
+        Some(Row::new("stopped", "unplaced")),
+        "a second start write moved the compensated row"
+    );
+    Ok(())
+}
+
+/// The two post-action stamps and the pooled post-wake update share one
+/// guard: they write only from the lifecycles an action can find the row in
+/// with no other intent owning it, and refuse `failed`, `quarantined`, the
+/// tombstones, the cross-intent lifecycles (`deleting`, `stopping`,
+/// `suspending`, `suspended`, however spelled) and any value outside the
+/// stored vocabulary. A pause also refuses `stopped`, which it does not
+/// begin from, and `restoring`, a restore its non-recovering runtime client
+/// never joins. Start's stamp writes over both: a start begins from
+/// `stopped`, and on Kubernetes a start of a `suspended` row claims
+/// `restoring`. The post-wake update takes a resume's decision: the pooled
+/// claim inserts the row `paused` and joins no restore, so it refuses
+/// `stopped`, a stop that completed while the wake was in flight, and
+/// `restoring`, another owner's restore claim. Swept here over
+/// every stored value, so a change to that guard fails this table. Columns: `stamp` is `maybe_update_sandbox_lifecycle`
+/// with the pause stamp `paused`; `state_stamp` is start's
+/// `maybe_mark_started_after_start`, which writes `started`/`on_node`, for a
+/// start on a substrate that claims `restoring` (Kubernetes); `post_wake` is
+/// `update_and_fetch_post_wake_sandbox`. The store's `action_stamp` tests
+/// cover each stamp's own states, and the stamps that keep `suspended`.
+/// Whether a row is written is read from `xmin`, so a stamp that rewrites the
+/// value the row already holds still counts as applied.
+#[tokio::test(flavor = "current_thread")]
+async fn post_action_stamps_write_only_over_an_in_flight_lifecycle() -> TestResult {
     const EXPECTED: &[&str] = &[
         //              stamp  state_stamp  post_wake
         "created           A        A           A",
         "creating          A        A           A",
         "starting          A        A           A",
         "started           A        A           A",
-        "restoring         A        A           A",
+        "restoring         .        A           .",
         "pausing           A        A           A",
         "paused            A        A           A",
         "resuming          A        A           A",
-        "suspending        !        !           !",
-        "suspended         !        !           !",
-        "stopping          !        !           !",
-        "stopped           A        A           A",
-        "deleting          !        !           !",
+        "suspending        .        .           .",
+        "suspended         .        .           .",
+        "stopping          .        .           .",
+        "stopped           .        A           .",
+        "deleting          .        .           .",
         "checkpointing     A        A           A",
         "quarantined       .        .           .",
         "failed            .        .           .",
         "deleted           .        .           .",
         "cleanup_required  .        .           .",
-        "bogus             A        A           A",
-        "_Suspended_       !        !           !",
+        "bogus             .        .           .",
+        "_Suspended_       .        .           .",
     ];
-    /// Five cross-intent rows in each of three columns.
-    const KNOWN_DEFECTS: usize = 15;
+    const KNOWN_DEFECTS: usize = 0;
 
     async fn written_row(pool: &PgPool, sandbox_id: SandboxId) -> TestResult<(String, Row)> {
         let (xmin, lifecycle, placement): (String, String, String) = sqlx::query_as(sql!(
@@ -724,11 +849,16 @@ async fn post_action_stamps_write_every_stored_lifecycle_but_the_terminal_ones()
             // update reports a refusal as an error.
             let (moved_to, reported) = match writer {
                 Writer::Stamp => {
-                    maybe_update_sandbox_lifecycle(pool, sandbox_id, "paused").await;
+                    maybe_update_sandbox_lifecycle(pool, sandbox_id, ActionStamp::Pause).await;
                     (Row::new("paused", "unplaced"), None)
                 }
                 Writer::StateStamp => {
-                    maybe_mark_started_after_start(pool, sandbox_id).await;
+                    maybe_mark_started_after_start(
+                        pool,
+                        sandbox_id,
+                        StartSubstrate::ClaimsRestoring,
+                    )
+                    .await;
                     (Row::new("started", "on_node"), None)
                 }
                 Writer::PostWake => {
@@ -756,14 +886,15 @@ async fn post_action_stamps_write_every_stored_lifecycle_but_the_terminal_ones()
     Ok(())
 }
 
-/// A native start operation whose post-result writes find a `stopped` written
-/// while its runtime call was in flight write `started` over it: first
-/// `maybe_mark_started_after_start`, then the shared
-/// `maybe_update_sandbox_lifecycle`. The lifecycle operation executor reports
+/// A native start operation whose post-result write finds a `stopped` written
+/// while its runtime call was in flight writes `started` over it
+/// (`maybe_mark_started_after_start`, start's only post-result lifecycle
+/// write). The lifecycle operation executor reports
 /// success, without a retry, with the sandbox running. This pins today's
-/// start write, which has no CAS on the lifecycle it read (only the terminal
-/// guard, pinned by `completed_actions_keep_a_terminal_lifecycle_that_landed_mid_flight`),
-/// not an invariant: the wake path makes the opposite choice for the same
+/// start write, which has no CAS on the lifecycle it read (only its in-flight
+/// guard, pinned by `completed_actions_keep_a_terminal_lifecycle_that_landed_mid_flight`,
+/// which admits `stopped` because a start may begin from it), not an
+/// invariant: the wake path makes the opposite choice for the same
 /// race, and its completion CAS refuses `started` over a mid-flight `stopped`
 /// (`wake_completion_outcome_maps_to_the_wake_response`). Unifying the two is
 /// a decision, not a refactor. What the overwrite relies on is node

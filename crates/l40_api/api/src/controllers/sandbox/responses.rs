@@ -5,6 +5,8 @@ use pplx_space_common_core::sql;
 use pplx_space_net_common::NetworkPolicy;
 use pplx_space_sandbox_store as sandbox_store;
 
+use super::lifecycle::SandboxAction;
+
 fn proto_spaced_version(value: Option<&str>) -> Option<SemVer> {
     let value = value?;
     match SemVer::parse(value) {
@@ -326,42 +328,103 @@ pub(super) fn network_policy_status_for(
     })
 }
 
-/// Best-effort `sandboxes.lifecycle` write that refuses to overwrite a
-/// terminal state. Called from the lifecycle action dispatcher after a
-/// substrate operation succeeds (e.g. `pause`, `stop`, `checkpoint`) to
-/// stamp the user-facing result lifecycle onto the row.
-///
-/// The terminal-state exclusion is the safety contract with the
-/// transient-lifecycle sweeper: if the sweeper landed on `pausing`/
-/// `stopping`/etc. while the substrate call was in flight and flipped
-/// the row to `failed` (with the backing execution torn down), a
-/// post-substrate "stamp `paused` / `stopped`" write would resurrect
-/// the row as live while the pod is gone. CAS-guarding on `lifecycle
-/// NOT IN ('failed', 'quarantined', 'deleted', 'cleanup_required')` keeps the swept
-/// terminal state.
-///
-/// The `maybe_` prefix is preserved: the helper has always been
-/// best-effort (the original shape silently swallowed DB errors); a
-/// race-loss now also silently leaves the swept state in place rather
-/// than 5xx-ing. Long-running paths that *should* surface a CAS-loss
-/// (Restore, Wake) carry their own dedicated CAS upstream of this
-/// helper.
-pub(super) async fn maybe_update_sandbox_lifecycle(pool: &PgPool, id: SandboxId, lifecycle: &str) {
-    if let Err(err) = sandbox_store::action_stamp::stamp_action_lifecycle(pool, id, lifecycle).await
-    {
-        tracing::warn!(
-            sandbox_id = %id,
-            lifecycle,
-            error = %err,
-            "best-effort sandbox lifecycle update failed"
-        );
+/// Which start stamp this substrate needs. On a substrate whose start of a
+/// `suspended` row claims no `restoring` (Direct), a start of a `suspended`
+/// row cold-boots it on its node and leaves the row `suspended` until the
+/// stamp, and a Direct suspend writes no `suspending`, so every start there
+/// may write over `suspended` (see the `action_stamp` module docs). On
+/// Kubernetes a start of a `suspended` row delegates to the wake, which
+/// claims `restoring` and normally commits `started` itself, so a
+/// `suspended` the stamp finds is a newer suspend's.
+pub(super) fn start_substrate(
+    capabilities: crate::controllers::substrate::SubstrateCapabilities,
+) -> sandbox_store::action_stamp::StartSubstrate {
+    use sandbox_store::action_stamp::StartSubstrate;
+    if capabilities.start_of_suspended_claims_restoring {
+        StartSubstrate::ClaimsRestoring
+    } else {
+        StartSubstrate::LeavesSuspended
     }
 }
 
-/// Best-effort write of a successful start: `started`, `on_node`, refusing to
-/// overwrite a terminal state. Same terminal-state guard as
-/// [`maybe_update_sandbox_lifecycle`]; see that function's doc for the
-/// transient-lifecycle-sweeper safety contract.
+/// The stamp a successful run of `action` writes after its substrate call.
+/// `None` for the actions that write no result lifecycle there: start's arm
+/// already attempted its full stamp (`maybe_mark_started_after_start`), wake
+/// and restore run their own completion CAS, a suspend on a substrate whose
+/// suspend commits the lifecycle itself writes none (see
+/// `SubstrateCapabilities::suspend_commits_lifecycle`), and the rest leave
+/// the lifecycle alone.
+pub(super) fn post_action_stamp(
+    action: SandboxAction,
+    capabilities: crate::controllers::substrate::SubstrateCapabilities,
+) -> Option<sandbox_store::action_stamp::ActionStamp> {
+    use sandbox_store::action_stamp::ActionStamp;
+    match action {
+        SandboxAction::Resume => Some(ActionStamp::Resume),
+        SandboxAction::Pause => Some(ActionStamp::Pause),
+        SandboxAction::Stop | SandboxAction::Kill => Some(ActionStamp::Stop),
+        SandboxAction::Suspend => {
+            (!capabilities.suspend_commits_lifecycle).then_some(ActionStamp::Suspend)
+        }
+        SandboxAction::Start
+        | SandboxAction::Wake
+        | SandboxAction::ImplicitWake(_)
+        | SandboxAction::Restore
+        | SandboxAction::Checkpoint
+        | SandboxAction::EnableSnapshots
+        | SandboxAction::DisableSnapshots
+        | SandboxAction::Stats
+        | SandboxAction::OpenPort
+        | SandboxAction::Rollback
+        | SandboxAction::Spaced
+        | SandboxAction::Update => None,
+    }
+}
+
+/// Best-effort `sandboxes.lifecycle` write of an action's result. Called from
+/// the lifecycle action dispatcher after a substrate operation succeeds
+/// (e.g. `pause`, `stop`) to stamp the user-facing result lifecycle onto the
+/// row.
+///
+/// The stamp writes only while the row is still in one of its action's
+/// in-flight lifecycles (`ActionStamp::admits` in
+/// `pplx-space-sandbox-store`, whose `action_stamp` module docs say who owns
+/// the row when it refuses). That keeps the transient-lifecycle sweeper's
+/// `failed` (with the backing execution torn down, a stamp would resurrect
+/// the row as live while the pod is gone) and another intent's state: a
+/// delete, stop or suspend that began or finished while the substrate call
+/// was in flight, or another owner's restore claim. The `action_stamp`
+/// module docs list which stamp keeps which.
+///
+/// The `maybe_` prefix is preserved: the helper has always been
+/// best-effort (the original shape silently swallowed DB errors). A refusal
+/// is another writer winning, so it is logged and the action still succeeds
+/// rather than 5xx-ing. Long-running paths that *should* surface a CAS-loss
+/// (Restore, Wake) carry their own dedicated CAS upstream of this helper.
+pub(super) async fn maybe_update_sandbox_lifecycle(
+    pool: &PgPool,
+    id: SandboxId,
+    stamp: sandbox_store::action_stamp::ActionStamp,
+) {
+    match sandbox_store::action_stamp::stamp_action_lifecycle(pool, id, stamp).await {
+        Ok(true) => {}
+        Ok(false) => tracing::info!(
+            sandbox_id = %id,
+            lifecycle = %stamp.lifecycle(),
+            "sandbox lifecycle stamp refused: another writer owns the row"
+        ),
+        Err(err) => tracing::warn!(
+            sandbox_id = %id,
+            lifecycle = %stamp.lifecycle(),
+            error = %err,
+            "best-effort sandbox lifecycle update failed"
+        ),
+    }
+}
+
+/// Best-effort write of a successful start: `started`, `on_node`, under the
+/// same in-flight guard as [`maybe_update_sandbox_lifecycle`] with
+/// `ActionStamp::Start(substrate)`; see that function's doc.
 ///
 /// It also drops a `disk` artifact pin. A disk pin names the bytes of a
 /// stopped rootfs, and a started guest can write past them, so once the start
@@ -373,13 +436,22 @@ pub(super) async fn maybe_update_sandbox_lifecycle(pool: &PgPool, id: SandboxId,
 /// which a stopped re-placement's finalize keeps in place. A `full` pin is
 /// kept: this write also completes a start that restored a suspended sandbox,
 /// and the node keeps that pin across a restore (`mark_restore_succeeded`).
-pub(super) async fn maybe_mark_started_after_start(pool: &PgPool, id: SandboxId) {
-    if let Err(err) = sandbox_store::action_stamp::stamp_started_after_start(pool, id).await {
-        tracing::warn!(
+pub(super) async fn maybe_mark_started_after_start(
+    pool: &PgPool,
+    id: SandboxId,
+    substrate: sandbox_store::action_stamp::StartSubstrate,
+) {
+    match sandbox_store::action_stamp::stamp_started_after_start(pool, id, substrate).await {
+        Ok(true) => {}
+        Ok(false) => tracing::info!(
+            sandbox_id = %id,
+            "post-start sandbox state stamp refused: another writer owns the row"
+        ),
+        Err(err) => tracing::warn!(
             sandbox_id = %id,
             error = %err,
             "best-effort post-start sandbox state update failed"
-        );
+        ),
     }
 }
 
@@ -746,12 +818,28 @@ pub async fn fetch_sandbox(pool: &PgPool, id: SandboxId) -> Result<Option<Sandbo
     .await
 }
 
+/// The lifecycles [`update_and_fetch_post_wake_sandbox`] may replace: a
+/// resume's decision. The pooled claim inserts the row `paused`, the wake
+/// resumes it, and a Kubernetes activation receipt can project `started`
+/// before this update. The pooled prepare claims and joins no restore on
+/// either substrate. So, as for a resume, it refuses `stopped` (a stop that
+/// completed while the wake was in flight; the wake did not begin from it)
+/// and `restoring` (another owner's restore claim). It also refuses
+/// `failed`, `quarantined` and the tombstones (the sweeper or a quarantine
+/// won), `deleting` (the delete owns the row), `suspending` and `suspended`
+/// (a suspend owns it), `stopping` (no control-plane writer sets it; node
+/// publication and the transient-lifecycle sweeper converge it), and any
+/// value outside the stored vocabulary. The `action_stamp` module of
+/// `pplx-space-sandbox-store` says who finishes each.
+const POOLED_POST_WAKE_FROM: sandbox_store::action_stamp::ActionStamp =
+    sandbox_store::action_stamp::ActionStamp::Resume;
+
 /// Marks a pooled sandbox as started/on-node after its wake completes and
 /// returns the freshly-joined response row in the same round-trip. The
-/// lifecycle guard matches the non-pooled wake/restore completion writers:
-/// if a supervisor moved the row into an inert lifecycle while wake was in
-/// flight, this helper must surface the CAS miss rather than resurrecting it
-/// as started.
+/// lifecycle guard ([`POOLED_POST_WAKE_FROM`]) refuses a row another writer
+/// moved while the wake was in flight: this helper must surface the CAS miss
+/// rather than resurrecting a failed row as started or overwriting a delete
+/// or suspend that began.
 pub async fn update_and_fetch_post_wake_sandbox(
     pool: &PgPool,
     id: SandboxId,
@@ -765,7 +853,7 @@ pub async fn update_and_fetch_post_wake_sandbox(
                  active_node_id = $1,
                  placement_changed_at = NOW()
              WHERE id = $2
-               AND lifecycle NOT IN ('failed', 'quarantined', 'deleted', 'cleanup_required')
+               AND LOWER(TRIM(lifecycle)) = ANY($3::TEXT[])
              RETURNING *
          )
          SELECT {sandbox_columns}
@@ -775,6 +863,7 @@ pub async fn update_and_fetch_post_wake_sandbox(
     sqlx::query_as::<_, Sandbox>(sqlx::AssertSqlSafe(sql!(sql.as_str())))
         .bind(active_node_id)
         .bind(id)
+        .bind(POOLED_POST_WAKE_FROM.admitted_values())
         .fetch_optional(pool)
         .await
         // Not classified, deliberately, and for the same reason as the
@@ -792,8 +881,9 @@ pub async fn update_and_fetch_post_wake_sandbox(
         })?
         .ok_or_else(|| {
             ControllerError::internal(
-                "pooled sandbox wake lost the lifecycle CAS — another supervisor flipped the row \
-                 to an inert lifecycle while pooled wake was in flight",
+                "pooled sandbox wake lost the lifecycle CAS — another writer moved the row to a \
+                 terminal, deleting, stopped, restoring or suspend lifecycle while pooled wake was \
+                 in flight",
             )
         })
 }
