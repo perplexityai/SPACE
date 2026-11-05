@@ -74,6 +74,7 @@ import { listsSnapshotsOn } from '@/lib/admin-fallback';
 import { RollbackButton, RollbackRefusalNote, useSnapshotRollback, type SnapshotRollback } from '@/components/snapshot-rollback';
 import { rollbackRoute, rollbackTargets, snapshotTimeMs, type RollbackTarget } from '@/lib/rollback-targets';
 import { formatAge, formatBytes, sectionData, sectionError, snapshotKey, snapshotStorageById, snapshotStorageLabel, type DebugSnapshot } from '@/lib/sandbox-debug';
+import { CATALOG_NOTE, NODE_NOTE, catalogEmptyText, nodeEmptyText } from '@/lib/snapshot-catalog';
 import { OperationsCard, OrgLink, PlacementCard, QuarantineCard, ResourcesCard, TimelineCard, UserLink, type DebugView } from './sandbox-insight';
 import NetworkPolicyDesigner, {
   compactNetworkPolicyLabel,
@@ -390,11 +391,13 @@ function AdminSnapshotsTable({
   snapshots,
   error,
   pending,
+  nodeKeeps,
   nowMs,
 }: {
   snapshots: DebugSnapshot[];
   error: string | null;
   pending: boolean;
+  nodeKeeps: number | null;
   nowMs: number;
 }) {
   const { token } = theme.useToken();
@@ -423,7 +426,7 @@ function AdminSnapshotsTable({
       size="small"
       pagination={tablePagination('snapshots', 10)}
       loading={pending}
-      locale={{ emptyText: error ? 'Could not load snapshots' : 'No snapshots' }}
+      locale={{ emptyText: catalogEmptyText(!!error, nodeKeeps) }}
       footer={() =>
         snapshots.length === 0 ? null : (
           <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 12, color: token.colorTextSecondary }}>
@@ -444,12 +447,14 @@ function AdminSnapshotsTable({
 function NodeSnapshotsTable({
   debugView,
   sandboxStatus,
+  periodicSnapshots,
   route,
   rollback,
   nowMs,
 }: {
   debugView: DebugView;
   sandboxStatus: string | null;
+  periodicSnapshots: boolean | null;
   route: ReturnType<typeof rollbackRoute>;
   rollback: SnapshotRollback;
   nowMs: number;
@@ -488,7 +493,7 @@ function NodeSnapshotsTable({
       <Space size={8} wrap style={{ marginBottom: 8 }}>
         <Text strong>On the node</Text>
         <Text type="secondary" style={{ fontSize: 12 }}>
-          Rollback restores one of the snapshots the sandbox&apos;s node keeps.
+          {NODE_NOTE}
         </Text>
         <RollbackRefusalNote state={rollback} />
       </Space>
@@ -502,7 +507,7 @@ function NodeSnapshotsTable({
         size="small"
         pagination={tablePagination('node-snapshots', 10)}
         loading={!debug && !debugView.error}
-        locale={{ emptyText: error ? "Could not load the node's snapshots" : 'The node keeps no snapshots for this sandbox' }}
+        locale={{ emptyText: nodeEmptyText(!!error, periodicSnapshots) }}
       />
     </div>
   );
@@ -512,6 +517,7 @@ function SnapshotsCard({
   sandboxId,
   orgId,
   sandboxStatus,
+  periodicSnapshots,
   ownOrg,
   debugView,
   onRollbackSettled,
@@ -521,6 +527,9 @@ function SnapshotsCard({
   sandboxId: string;
   orgId: string | null;
   sandboxStatus: string | null;
+  // Whether the node runs the sandbox with periodic snapshots on (its
+  // observed `snapshots_enabled`), or null when the API does not say.
+  periodicSnapshots: boolean | null;
   // `isOwnOrg`: the operator's own organization lists through the public
   // routes; another lists through the admin list (see `listSnapshots`).
   ownOrg: boolean;
@@ -625,7 +634,17 @@ function SnapshotsCard({
   const route = rollbackRoute(ownOrg, adminList);
   const rollback = useSnapshotRollback({ sandboxId, orgId, via: route.via, onSettled: onRollbackSettled });
   const nodeSnapshots = (
-    <NodeSnapshotsTable debugView={debugView} sandboxStatus={sandboxStatus} route={route} rollback={rollback} nowMs={nowMs} />
+    <NodeSnapshotsTable debugView={debugView} sandboxStatus={sandboxStatus} periodicSnapshots={periodicSnapshots} route={route} rollback={rollback} nowMs={nowMs} />
+  );
+  // How many snapshots the node list shows, which the empty catalog list
+  // points at; null until the node's inventory has loaded.
+  const nodeSection = sectionData(debug?.snapshots);
+  const nodeKeeps = nodeSection ? rollbackTargets(nodeSection.inventory ?? [], sandboxStatus).length : null;
+  const catalogHeader = (
+    <Space size={8} wrap style={{ marginBottom: 8 }}>
+      <Text strong>Stored</Text>
+      <Text type="secondary" style={{ fontSize: 12 }}>{CATALOG_NOTE}</Text>
+    </Space>
   );
   // Refresh and Retry. In a view that showed the control plane's records
   // instead (no listing yet, or a release without the admin list), the
@@ -690,7 +709,8 @@ function SnapshotsCard({
         {adminError ? (
           <Alert type="warning" showIcon style={{ marginBottom: 8 }} title={`Could not load the control plane's snapshot records: ${adminError}`} />
         ) : null}
-        <AdminSnapshotsTable snapshots={adminSnapshots} error={adminError} pending={!debug && !debugView.error} nowMs={nowMs} />
+        {catalogHeader}
+        <AdminSnapshotsTable snapshots={adminSnapshots} error={adminError} pending={!debug && !debugView.error} nodeKeeps={nodeKeeps} nowMs={nowMs} />
         {nodeSnapshots}
       </Card>
     );
@@ -720,6 +740,7 @@ function SnapshotsCard({
           action={<Button size="small" onClick={relist}>Retry</Button>}
         />
       ) : null}
+      {catalogHeader}
       <Table
         columns={columns}
         dataSource={snapshots}
@@ -727,7 +748,7 @@ function SnapshotsCard({
         loading={loading}
         size="small"
         pagination={tablePagination('snapshots', 10)}
-        locale={{ emptyText: 'No snapshots' }}
+        locale={{ emptyText: catalogEmptyText(false, nodeKeeps) }}
         footer={() =>
           snapshots.length === 0 ? null : (
             <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 12, color: token.colorTextSecondary }}>
@@ -1598,6 +1619,7 @@ export default function SandboxDetailPage({ dashboardUrl }: { dashboardUrl: stri
             sandboxId={sandbox.id}
             orgId={sandbox.org_id ?? null}
             sandboxStatus={sandbox.status}
+            periodicSnapshots={sandbox.snapshots_enabled ?? null}
             ownOrg={ownOrg}
             debugView={debugView}
             onRollbackSettled={() => { void Promise.all([refresh(false), loadInsight()]); }}

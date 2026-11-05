@@ -337,6 +337,57 @@ step('sandbox-create', ['sandboxes', 'flows', 'lifecycle'], async (c) => {
   c.rec.check(!!c.shared.sandbox, 'creating a sandbox from the form produces one');
 }, true);
 
+// A checkpoint is kept on the sandbox's node, not in the snapshot catalog:
+// the card says so, and lists it under "On the node" once periodic snapshots
+// are on (the node lists its snapshots only then). Runs on the sandbox
+// `sandbox-create` made, and turns periodic snapshots off again.
+step('sandbox-checkpoint-snapshots', ['sandboxes', 'flows', 'lifecycle'], async (c) => {
+  const id = c.shared.sandbox;
+  if (!id) return c.rec.check(false, 'a sandbox was created by sandbox-create');
+  await visit(c, `/dashboard/sandboxes/${id}`, 2000);
+  await waitForStatus(c, id, ['started', 'running'], 120_000);
+  const operation = async (action: string) => {
+    const accepted = await adminFetch(c.page, 'POST', `/admin/api/v1/sandboxes/${id}:${action}`);
+    const opId = accepted.json?.operation_id;
+    if (accepted.status !== 202 || typeof opId !== 'string') return `${accepted.status}`;
+    const deadline = Date.now() + 120_000;
+    while (Date.now() < deadline) {
+      const state = (await adminFetch(c.page, 'GET', `/admin/api/v1/operations/${opId}`)).json?.state;
+      if (state === 'succeeded' || state === 'failed') return state;
+      await c.page.waitForTimeout(2000);
+    }
+    return 'unfinished';
+  };
+  const card = () => c.page.locator('.ant-card', { has: c.page.locator('.ant-card-head-title', { hasText: 'Snapshots' }) }).first();
+  const checkpointed = await operation('force-checkpoint');
+  c.rec.check(checkpointed === 'succeeded', `the checkpoint succeeds (${checkpointed})`);
+  await visit(c, `/dashboard/sandboxes/${id}`, 4000);
+  let shown = await card().innerText();
+  c.rec.check(/A checkpoint is kept on the node/.test(shown), 'the card says checkpoints are not in the stored list');
+  c.rec.check(/only while periodic snapshots are on/.test(shown), 'with periodic snapshots off, the node list says why it is empty');
+
+  const enabled = await operation('force-enable_snapshots');
+  try {
+    c.rec.check(enabled === 'succeeded', `periodic snapshots turn on (${enabled})`);
+    const uuid = id.replace(/^sbx_/, '');
+    const deadline = Date.now() + 120_000;
+    let listed = false;
+    while (!listed && Date.now() < deadline) {
+      const debug = await adminFetch(c.page, 'GET', `/admin/api/v1/debug/sandbox/${uuid}`);
+      listed = (debug.json?.snapshots?.inventory ?? []).some((row: { snapshot_id: string }) => row.snapshot_id.startsWith('f-manual-'));
+      if (!listed) await c.page.waitForTimeout(3000);
+    }
+    c.rec.check(listed, 'the node publishes the checkpoint');
+    await visit(c, `/dashboard/sandboxes/${id}`, 4000);
+    shown = await card().innerText();
+    c.rec.check(/f-manual-/.test(shown), 'On the node lists the checkpoint');
+    c.rec.check(/No stored snapshots\. The node keeps \d+ snapshots?, listed under On the node below\./.test(shown), 'the empty stored list points at On the node');
+  } finally {
+    const disabled = await operation('force-disable_snapshots');
+    c.rec.check(disabled === 'succeeded', `periodic snapshots turn off again (${disabled})`);
+  }
+}, true);
+
 // A control's accessible name starts with its icon's label.
 for (const [action, label, want, confirm] of [
   ['pause', /(^|\s)Pause$/, ['paused'], false],
