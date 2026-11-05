@@ -111,6 +111,29 @@ spec:
                   key: SPACE_INTERNAL_TOKEN
             - name: SPACE_ECW_HOSTS
               value: {{ .Values.ecwHosts | quote }}
+            {{- if .Values.nativeFiles.enabled }}
+            # Native files: each request is authorized and prepared by the
+            # API's activation listener over the internal RPC TLS above, with
+            # the cluster-api token; the sandbox call goes to the runtime it
+            # grants (values.yaml).
+            - name: SPACE_DATA_PLANE_NATIVE_FILES
+              value: serve
+            - name: SPACE_INGRESS_ACTIVATION_ENDPOINT
+              value: {{ .Values.nativeFiles.accessEndpoint | quote }}
+            {{- with .Values.nativeFiles.uploadAdmission }}
+            {{- if .enabled }}
+            # Bounds the write bodies it holds to the pod's memory (values.yaml).
+            - name: SPACE_DATA_PLANE_NATIVE_UPLOAD_ADMISSION
+              value: "true"
+            - name: SPACE_DATA_PLANE_MAX_IN_FLIGHT_NATIVE_UPLOAD_BYTES
+              value: {{ .maxInFlightBytes | int64 | quote }}
+            - name: SPACE_DATA_PLANE_MAX_IN_FLIGHT_NATIVE_UPLOAD_BYTES_PER_ORG
+              value: {{ .maxInFlightBytesPerOrg | int64 | quote }}
+            - name: SPACE_DATA_PLANE_MAX_IN_FLIGHT_NATIVE_UPLOAD_BYTES_PER_SANDBOX
+              value: {{ .maxInFlightBytesPerSandbox | int64 | quote }}
+            {{- end }}
+            {{- end }}
+            {{- end }}
           ports:
             - name: http
               containerPort: {{ .Values.service.port }}

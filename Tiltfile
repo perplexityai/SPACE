@@ -506,7 +506,9 @@ deploy_yaml("infra/space/kind/manifests/runtimeclass.yaml")
 # sandbox pod carries (the chart cites the code behind each rule). The API
 # waits for them, so no sandbox pod runs before its namespace is confined.
 # internal-rpc-tls applies the Namespace manifest first.
-deploy_yaml(helm("infra/space/kind/charts/space-sandbox-network-policy", name = "space", namespace = NAMESPACE))
+# values-kind.yaml admits Kind's data plane, which serves Native files.
+deploy_yaml(helm("infra/space/kind/charts/space-sandbox-network-policy", name = "space", namespace = NAMESPACE,
+                 values = ["infra/space/kind/charts/space-sandbox-network-policy/values-kind.yaml"]))
 k8s_resource(
     new_name = "space-sandbox-network-policy",
     objects = [

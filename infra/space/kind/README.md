@@ -1583,8 +1583,11 @@ that needs it:
 - `space-sandbox-default-deny` isolates every pod in the namespace, ingress and
   egress.
 - `space-sandbox-allow` gives sandbox pods (`app.kubernetes.io/name=space-sandbox`)
-  what they carry: ingress on TCP 9800 from the two components that dial a
-  sandbox pod IP, `space-api` and `space-cluster-controller`; egress to the IPv4
+  what they carry: ingress on TCP 9800 from the three components that dial a
+  sandbox pod IP, `space-api`, `space-cluster-controller` and `space-data-plane`
+  (whose Native files routes call the runtime the API grants, the same pod
+  address; the chart admits it only with `allowDataPlane`, which the Kind
+  bring-up sets in `values-kind.yaml`); egress to the IPv4
   internet outside `10.0.0.0/8`, `100.64.0.0/10`, `172.16.0.0/12`,
   `192.168.0.0/16` and `169.254.0.0/16`; and DNS to the cluster DNS pods only.
   There is no IPv6 egress.
@@ -1593,8 +1596,8 @@ The guest needs nothing more. Its traffic leaves the pod masqueraded to the
 pod IP, its DNS goes to public resolvers over that internet rule (the gateway
 answers the guest's reserved resolvers over DNS-over-TLS), and the shim's
 redirect of `<pod IP>:9800` to the node-local node-api is pod-to-own-node
-traffic, which NetworkPolicy always allows. internal-api and the data plane
-dial node-api at node addresses, never a sandbox pod. The policy sits beneath
+traffic, which NetworkPolicy always allows. internal-api, and the data plane's
+ECW and session routes, dial node-api at node addresses, never a sandbox pod. The policy sits beneath
 the per-sandbox net-gateway's tenant rules and holds for anything that reaches
 the pod's network namespace outside the VM.
 
@@ -2095,10 +2098,13 @@ workload if the CA itself changed, because neither reloads them while running.
 TLS here is server-authenticated: projected ServiceAccount tokens, reviewed by
 each listener, authorize callers (see node-api and build-manager authentication
 above), and internal-api's node-address check is unchanged. The api's ingress activation
-listener admits only internal-api's ServiceAccount, by TokenReview of its
-projected `space-cluster-api` token with no static fallback, as
+listener admits only internal-api's ServiceAccount and, for its Native files
+routes, the data plane's (`space-api-local`'s `values-kind.yaml`), by
+TokenReview of their projected `space-cluster-api` tokens with no static
+fallback, as
 [Ingress activation delegation](../../../docs/internal-rpc-tls.md#ingress-activation-delegation)
-asks of the hosting deployment.
+asks of the hosting deployment. The data plane may call only the two native
+file access RPCs there.
 
 ## Differences from the EKS deployment modules
 
