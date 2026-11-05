@@ -208,6 +208,7 @@ RUST_ARTIFACT_DEPS = ["Cargo.toml", "Cargo.lock", "rust-toolchain.toml", ".cargo
                       "docker/Dockerfile.rust-build-kind",
                       "docker/Dockerfile.rust-artifacts-host",
                       "infra/space/kind/scripts/build-rust-artifacts.sh",
+                      "infra/space/kind/scripts/test-hook-features.sh",
                       "infra/space/kind/lib/rust-build.sh",
                       "scripts/build-runtime-supervisor.sh",
                       "infra/space/identity/node-identities.sh",

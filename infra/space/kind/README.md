@@ -79,8 +79,9 @@ forces either; `SPACE_KIND_RUST_PROFILE=dev-release` uses the incremental-codege
 profile with debug info for the fastest edit loop. Either way a Rust change
 compiles once and the affected runtime images then re-copy their binaries from
 it. Both paths take their cargo features from the build stage of
-`docker/Dockerfile.rust-build-kind`, which also enables
-`pplx-space-common-core/test-hooks`: the test-only environment overrides the
+`docker/Dockerfile.rust-build-kind`, which also enables every workspace
+member's `test-hooks` feature (`scripts/test-hook-features.sh` derives the
+list): the test-only environment overrides the
 Kind charts set (for example the sweeper timings and the `*_TOKEN_PATH` files)
 are compiled in only for these images, and release images never enable the
 feature. `SPACE_KIND_RUST_BUILD=release` builds and deploys binaries without
@@ -318,8 +319,10 @@ charts set several on every run. `SPACE_KIND_RUST_BUILD=release`
 the Kind services with no crate's `test-hooks` feature enabled:
 
 - **Build.** `build-rust-artifacts.sh` compiles the default's bin and feature
-  lists, in either artifact mode, with both test-hook feature lists of
-  `docker/Dockerfile.rust-build-kind` empty and with thin LTO. Turning every
+  lists, in either artifact mode, with no test-hook features and with thin LTO:
+  `scripts/test-hook-features.sh`, which otherwise names every workspace
+  member's `test-hooks` feature for the host build, prints none, and the
+  guest's list in `docker/Dockerfile.rust-build-kind` is emptied. Turning every
   `test-hooks` feature off also requires leaving the test-support member
   `pplx-space-db-test-fixtures` out of the package selection: the host builds
   pass `--workspace --exclude pplx-space-db-test-fixtures`, and the Docker
