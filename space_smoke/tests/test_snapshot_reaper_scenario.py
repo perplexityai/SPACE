@@ -24,7 +24,11 @@ from space_smoke.adapters import (
     _SdkSandbox,
 )
 from space_smoke.capabilities import EcwSandboxBusy, EcwSandboxDeleteRetryable
-from space_smoke.fixtures import SANDBOX_CLEANUP_ATTEMPTS, retry_sandbox_delete
+from space_smoke.fixtures import (
+    SANDBOX_CLEANUP_ATTEMPTS,
+    retry_sandbox_delete,
+    snapshot_reap_residue,
+)
 from space_smoke.runtime import CommandResult
 
 
@@ -154,6 +158,29 @@ class SharedCleanupRetryPolicy(unittest.TestCase):
         ):
             retry_sandbox_delete(mock.Mock(side_effect=RuntimeError("HTTP 500")))
         sleep.assert_not_called()
+
+
+class SnapshotReapResidue(unittest.TestCase):
+    def test_original_names_and_staging_in_either_shape_are_residue(self) -> None:
+        artifact = "01a0b0c9-b8a3-7473-9c12-3821a701bc28"
+        before = ("d-operation-x-artifact",)
+        self.assertEqual(snapshot_reap_residue(before, ("d-1m-kept",)), [])
+        self.assertEqual(
+            snapshot_reap_residue(
+                before,
+                (
+                    "d-1m-kept",
+                    "d-operation-x-artifact",
+                    f".gc-pending-{artifact}",
+                    f"d-operation-x-artifact.gc-pending-{artifact}",
+                ),
+            ),
+            [
+                f".gc-pending-{artifact}",
+                "d-operation-x-artifact",
+                f"d-operation-x-artifact.gc-pending-{artifact}",
+            ],
+        )
 
 
 if __name__ == "__main__":

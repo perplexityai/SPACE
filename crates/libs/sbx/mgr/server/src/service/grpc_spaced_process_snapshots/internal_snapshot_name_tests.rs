@@ -8,6 +8,24 @@ fn operation_snapshots_are_internal() {
         "operation snapshots must not be exposed to list, delete, or rollback"
     );
     assert!(!is_internal_snapshot_name("d-manual-20260804T180000Z"));
+    // GC staging in either shape: `.gc-pending-<id>` as the whole name, or as
+    // the suffix of the snapshot's own name.
+    for staging in [
+        ".gc-pending-019f9ce3-2370-7a33-8706-fda0d0496d33",
+        "d-manual-20260804T180000Z.gc-pending-019f9ce3-2370-7a33-8706-fda0d0496d33",
+    ] {
+        assert!(is_internal_snapshot_name(staging), "{staging}");
+    }
+    // The marker without an artifact id after it is part of an ordinary name,
+    // which the orphan sweep would never reclaim.
+    for ordinary in [
+        "run.gc-pending-1",
+        "d-x.gc-pending-note",
+        ".gc-pending-",
+        "d-x.gc-pending-019f9ce3-2370-7a33-8706-fda0d0496d33.old",
+    ] {
+        assert!(!is_internal_snapshot_name(ordinary), "{ordinary}");
+    }
 }
 
 #[test]
