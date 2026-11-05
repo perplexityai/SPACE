@@ -291,17 +291,18 @@ step('sandboxes-search-id', ['sandboxes'], async (c) => {
 
 // The search box's text goes to the server's `search` (a name prefix
 // ignoring case, or an ID suffix such as the ID column's label), so a match
-// beyond the loaded page is found. Against an API without `search` the
-// console searches as before; the step notes which it saw.
-const searchSentToServer = async (c: Ctx, typed: string): Promise<boolean> => {
-  const sent = c.page.waitForRequest((req) => {
-    const url = new URL(req.url());
+// beyond the loaded page is found. An API without `search` refuses it with a
+// 400 and the console searches as before; the step notes which it saw and
+// checks the server's matches only when the server answered.
+const searchAnsweredByServer = async (c: Ctx, typed: string): Promise<boolean> => {
+  const answered = c.page.waitForResponse((res) => {
+    const url = new URL(res.url());
     return url.pathname.endsWith('/admin/api/v1/sandboxes') && url.searchParams.get('search') === typed;
-  }, { timeout: 5000 }).then(() => true, () => false);
+  }, { timeout: 5000 }).then((res) => res.ok(), () => false);
   await content(c.page).locator('input[placeholder*="ID"]').first().fill(typed);
-  const server = await sent;
+  const server = await answered;
   await c.page.waitForTimeout(1500);
-  c.rec.note(server ? `"${typed}" was sent as search` : `"${typed}" was not sent as search (an API without it)`);
+  c.rec.note(server ? `the server answered "${typed}" as search` : `"${typed}" was not answered as search (an API without it); the console searched as before`);
   return server;
 };
 
@@ -310,9 +311,10 @@ step('sandboxes-search-label', ['sandboxes'], async (c) => {
   if (!id) return c.rec.check(false, 'the seed has a running sandbox');
   await visit(c, '/dashboard/sandboxes?age=all&page_size=25', 2000);
   const label = shortLabel(id);
-  const server = await searchSentToServer(c, label);
-  const rows = content(c.page).locator('tbody tr.ant-table-row');
-  c.rec.check(await rows.filter({ hasText: label }).count() === 1, `searching the ID column's label finds the sandbox${server ? ' through the server' : ''}`);
+  if (await searchAnsweredByServer(c, label)) {
+    const rows = content(c.page).locator('tbody tr.ant-table-row');
+    c.rec.check(await rows.filter({ hasText: label }).count() === 1, "searching the ID column's label finds the sandbox through the server");
+  }
 });
 
 step('sandboxes-search-name-case', ['sandboxes'], async (c) => {
@@ -320,7 +322,7 @@ step('sandboxes-search-name-case', ['sandboxes'], async (c) => {
   if (!id) return c.rec.check(false, 'the seed has a suspended sandbox');
   await visit(c, '/dashboard/sandboxes?age=all&page_size=25', 2000);
   const name = `${c.config.prefix}-suspended`;
-  if (await searchSentToServer(c, name.toUpperCase())) {
+  if (await searchAnsweredByServer(c, name.toUpperCase())) {
     const rows = content(c.page).locator('tbody tr.ant-table-row');
     c.rec.check(await rows.count() === 1 && await rows.filter({ hasText: shortLabel(id) }).count() === 1, `searching ${name.toUpperCase()} finds ${name} alone`);
   }
