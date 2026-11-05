@@ -39,6 +39,44 @@ pub fn verify_password(password: &str, hash: &str) -> Result<bool, bcrypt::Bcryp
     bcrypt::verify(password, hash)
 }
 
+/// Password logins that may verify a password at once in this process.
+/// A cost-12 verification is hundreds of milliseconds of CPU, so it runs on
+/// the blocking pool rather than an async worker, and this bound keeps a
+/// flood of login attempts to at most half the cores. Further logins wait
+/// for a slot before they open a database transaction, so waiting holds no
+/// connection or row lock, and requests other than logins are not delayed.
+static PASSWORD_VERIFICATIONS: std::sync::LazyLock<tokio::sync::Semaphore> =
+    std::sync::LazyLock::new(|| tokio::sync::Semaphore::new(password_verification_slots()));
+
+fn password_verification_slots() -> usize {
+    std::thread::available_parallelism().map_or(1, |cores| cores.get().div_ceil(2))
+}
+
+/// The password verifier could not run: its slot pool was closed or the
+/// blocking task failed. Neither happens in normal operation.
+#[derive(Debug, thiserror::Error)]
+#[error("password verification could not run")]
+pub(crate) struct VerifierUnavailable;
+
+/// Wait for a password-verification slot; see [`PASSWORD_VERIFICATIONS`].
+pub(crate) async fn password_verification_slot()
+-> Result<tokio::sync::SemaphorePermit<'static>, VerifierUnavailable> {
+    PASSWORD_VERIFICATIONS
+        .acquire()
+        .await
+        .map_err(|_| VerifierUnavailable)
+}
+
+/// [`verify_password`] on the blocking pool, off the async workers.
+pub(crate) async fn verify_password_blocking(
+    password: String,
+    hash: String,
+) -> Result<Result<bool, bcrypt::BcryptError>, VerifierUnavailable> {
+    tokio::task::spawn_blocking(move || verify_password(&password, &hash))
+        .await
+        .map_err(|_| VerifierUnavailable)
+}
+
 /// Returns (raw_token, token_hash). Send raw_token to the client; store token_hash in the DB.
 pub fn generate_session_token() -> (String, String) {
     let mut bytes = [0u8; 32];
@@ -365,3 +403,7 @@ mod surface_scope_tests;
 #[cfg(test)]
 #[path = "auth/api_key_use_tests.rs"]
 mod api_key_use_tests;
+
+#[cfg(test)]
+#[path = "auth/password_verification_tests.rs"]
+mod password_verification_tests;

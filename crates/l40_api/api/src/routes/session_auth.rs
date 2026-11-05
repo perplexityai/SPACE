@@ -13,7 +13,7 @@ use uuid::Uuid;
 
 use super::AppState;
 use crate::{
-    auth::{generate_session_token, hash_token, verify_password},
+    auth::{generate_session_token, hash_token},
     external_console::{ConsoleAuthConfig, is_console_request},
     middleware::auth::{AuthOrg, AuthUser, bearer_token, require_auth},
     models::{Cluster, LoginRequest, LoginResponse, Organization, User},
@@ -59,6 +59,8 @@ enum AuthRouteError {
     Internal(#[source] sqlx::Error),
     #[error("Internal server error")]
     Password(#[from] bcrypt::BcryptError),
+    #[error("Internal server error")]
+    Verifier(#[from] crate::auth::VerifierUnavailable),
     /// A statement lost a race for a lock. The login path reads `users` and
     /// inserts a `sessions` row, and the session delete takes a row lock, so
     /// any of them can abort with `55P03` under the role-level bound; the
@@ -89,7 +91,9 @@ impl AuthRouteError {
         match self {
             Self::InvalidCredentials | Self::MissingBearerToken => StatusCode::UNAUTHORIZED,
             Self::PasswordLoginDisabled => StatusCode::FORBIDDEN,
-            Self::Internal(_) | Self::Password(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::Internal(_) | Self::Password(_) | Self::Verifier(_) => {
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
             Self::Contended => StatusCode::SERVICE_UNAVAILABLE,
         }
     }
@@ -218,6 +222,9 @@ async fn create_session_for_password(
     pool: &PgPool,
     request: LoginRequest,
 ) -> Result<LoginResponse, AuthRouteError> {
+    // Taken before the transaction, so a login waiting for a slot holds no
+    // connection or lock; released once the password is checked.
+    let slot = crate::auth::password_verification_slot().await?;
     let mut tx = pool.begin().await?;
     // Hold the password read through session insertion so resets revoke every
     // session authenticated with the old password.
@@ -231,10 +238,12 @@ async fn create_session_for_password(
     };
 
     if !user.password_login_configured()
-        || !verify_password(&request.password, &user.password_hash)?
+        || !crate::auth::verify_password_blocking(request.password, user.password_hash.clone())
+            .await??
     {
         return Err(AuthRouteError::InvalidCredentials);
     }
+    drop(slot);
 
     let org = sqlx::query_as::<_, Organization>(sql!("SELECT * FROM organizations WHERE id = $1"))
         .bind(user.org_id)

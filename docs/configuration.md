@@ -546,14 +546,18 @@ With an authenticator installed:
     automation accounts with the least role they need, not people or shared
     administrator accounts.
   - The list is checked at login and on every request, so removing an email
-    and restarting ends that account's sessions without deleting them.
-    Listing it again revives its unexpired sessions (they last 7 days), so
-    set the account's password when listing it: setting a password ends all
-    of its sessions.
-  - Password login is not rate limited, and it is served by every API
-    surface, including the admin API. Give listed accounts strong random
-    passwords and keep the API reachable only through the proxy or trusted
-    networks.
+    suspends that account's sessions on each API process once it restarts
+    with the new list; access has ended only when every process serving the
+    API has. The sessions are not deleted: listing the email again revives
+    those that have not expired (they last 7 days). To end them for good,
+    set the account's password, which deletes all of its sessions; do so
+    before listing an email again.
+  - Password login is served by every API surface, including the admin API,
+    and is not rate limited per account or client. Each process verifies at
+    most half its cores' worth of passwords at once, off the request
+    workers, so a flood of login attempts slows other logins but not other
+    requests. Give listed accounts strong random passwords and keep the API
+    reachable only through the proxy or trusted networks.
   - Any local user's password can be set or rotated in this mode, from the
     console's user page or `PATCH /admin/api/v1/users/{id}`; it only takes
     effect for listed accounts. The console stays signed in, because its own
