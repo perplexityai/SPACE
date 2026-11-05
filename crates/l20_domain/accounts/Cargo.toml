@@ -16,7 +16,6 @@ rusqlite = { workspace = true, optional = true }
 serde = { workspace = true, features = ["derive"], optional = true }
 sqlx = { workspace = true, features = ["postgres", "uuid"], optional = true }
 thiserror = { workspace = true }
-uuid = { workspace = true, features = ["v7"] }
 
 [features]
 default = []

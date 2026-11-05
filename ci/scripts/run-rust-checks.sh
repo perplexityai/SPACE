@@ -421,7 +421,9 @@ run_clippy_checks() {
     # that relies on another being enabled fails here; the isolated-crates
     # mode builds them only with no features and with all of them. Both call
     # job-id's uuid_id! macro, whose impls follow the calling crate's own
-    # features; nothing else enables job-id's sqlx, so this lints its impls.
+    # features. No workspace crate enables job-id's sqlx, so only the
+    # --all-features builds and this loop compile its Postgres impls, and only
+    # this loop compiles them without serde and rusqlite.
     echo "--- :rust: Running account and job identity clippy with each feature alone"
     local identity_crate identity_feature
     for identity_crate in pplx-space-accounts pplx-space-job-id; do

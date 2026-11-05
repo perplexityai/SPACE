@@ -28,8 +28,8 @@ pub enum AuthIdParseError {
     InvalidUuid(#[from] uuid::Error),
 }
 
-/// What [`uuid_id!`] and [`sqlite_uuid!`] expand to, so a caller needs no
-/// `uuid` dependency of its own to use them.
+/// What [`uuid_id!`] expands to, so a caller needs no `uuid` dependency of its
+/// own to use it.
 #[doc(hidden)]
 pub mod __private {
     pub use uuid::Uuid;
@@ -42,8 +42,14 @@ pub mod __private {
 /// The `serde` and `sqlx` impls are compiled when the calling crate's own
 /// `serde` and `sqlx` features are on, and use its `serde` and `sqlx`
 /// dependencies: serde as the UUID's string form, sqlx as a Postgres `UUID`.
-/// A caller declares both features, even if it enables neither. Attributes
-/// before the name, doc comments included, are put on the struct.
+/// A caller declares both features, even if it enables neither, and its
+/// `serde` dependency needs serde's `derive` feature and its `sqlx` one
+/// sqlx's `postgres` and `uuid`. Attributes before the name, doc comments
+/// included, are put on the struct.
+///
+/// The generated methods' doc examples import the invoking module through
+/// `module_path!()`, so invoke it in a module reachable from outside the
+/// crate, or those doctests fail to compile.
 ///
 /// ```rust
 /// pplx_space_job_id::uuid_id!(
@@ -59,8 +65,16 @@ macro_rules! uuid_id {
     ($(#[$meta:meta])* $name:ident) => {
         $(#[$meta])*
         #[cfg_attr(feature = "serde", derive(::serde::Serialize, ::serde::Deserialize))]
-        #[cfg_attr(feature = "serde", serde(try_from = "String", into = "String"))]
-        #[derive(Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash)]
+        #[cfg_attr(feature = "serde", serde(try_from = "::std::string::String", into = "::std::string::String"))]
+        #[derive(
+            ::core::clone::Clone,
+            ::core::marker::Copy,
+            ::core::cmp::Eq,
+            ::core::cmp::PartialEq,
+            ::core::cmp::Ord,
+            ::core::cmp::PartialOrd,
+            ::core::hash::Hash,
+        )]
         pub struct $name($crate::__private::Uuid);
 
         impl $name {
@@ -92,11 +106,12 @@ macro_rules! uuid_id {
                 "# use ",
                 module_path!(),
                 "::*;\n",
-                "let uuid = uuid::Uuid::nil();\n",
                 "let id = ",
                 stringify!($name),
-                "::from_uuid(uuid);\n",
-                "assert_eq!(id.as_uuid(), uuid);\n",
+                "::new();\n",
+                "assert_eq!(",
+                stringify!($name),
+                "::from_uuid(id.as_uuid()), id);\n",
                 "```"
             )]
             pub const fn from_uuid(value: $crate::__private::Uuid) -> Self {
@@ -110,11 +125,12 @@ macro_rules! uuid_id {
                 "# use ",
                 module_path!(),
                 "::*;\n",
-                "let uuid = uuid::Uuid::nil();\n",
                 "let id = ",
                 stringify!($name),
-                "::from_uuid(uuid);\n",
-                "assert_eq!(id.as_uuid(), uuid);\n",
+                "::new();\n",
+                "assert_eq!(",
+                stringify!($name),
+                "::from_uuid(id.as_uuid()), id);\n",
                 "```"
             )]
             pub const fn as_uuid(self) -> $crate::__private::Uuid {
@@ -125,7 +141,7 @@ macro_rules! uuid_id {
         impl ::core::fmt::Debug for $name {
             fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
                 f.debug_tuple(stringify!($name))
-                    .field(&self.to_string())
+                    .field(&::std::string::ToString::to_string(self))
                     .finish()
             }
         }
@@ -152,17 +168,17 @@ macro_rules! uuid_id {
             }
         }
 
-        impl ::core::convert::TryFrom<String> for $name {
+        impl ::core::convert::TryFrom<::std::string::String> for $name {
             type Error = $crate::AuthIdParseError;
 
-            fn try_from(value: String) -> ::core::result::Result<Self, Self::Error> {
+            fn try_from(value: ::std::string::String) -> ::core::result::Result<Self, Self::Error> {
                 <Self as ::core::str::FromStr>::from_str(&value)
             }
         }
 
-        impl ::core::convert::From<$name> for String {
+        impl ::core::convert::From<$name> for ::std::string::String {
             fn from(value: $name) -> Self {
-                value.to_string()
+                ::std::string::ToString::to_string(&value)
             }
         }
 
@@ -201,7 +217,7 @@ macro_rules! uuid_id {
             fn decode(
                 value: ::sqlx::postgres::PgValueRef<'r>,
             ) -> ::core::result::Result<Self, ::sqlx::error::BoxDynError> {
-                Ok(Self(
+                ::core::result::Result::Ok(Self(
                     <$crate::__private::Uuid as ::sqlx::Decode<'r, ::sqlx::Postgres>>::decode(value)?,
                 ))
             }
@@ -228,13 +244,18 @@ macro_rules! sqlite_uuid {
     ($($name:ty),+ $(,)?) => {$(
         impl ::rusqlite::types::ToSql for $name {
             fn to_sql(&self) -> ::rusqlite::Result<::rusqlite::types::ToSqlOutput<'_>> {
-                Ok(self.to_string().into())
+                ::core::result::Result::Ok(::core::convert::Into::into(
+                    ::std::string::ToString::to_string(self),
+                ))
             }
         }
 
         impl ::rusqlite::types::FromSql for $name {
             fn column_result(value: ::rusqlite::types::ValueRef<'_>) -> ::rusqlite::types::FromSqlResult<Self> {
-                value.as_str()?.parse().map_err(|error| ::rusqlite::types::FromSqlError::Other(Box::new(error)))
+                value
+                    .as_str()?
+                    .parse()
+                    .map_err(|error| ::rusqlite::types::FromSqlError::Other(::std::boxed::Box::new(error)))
             }
         }
     )+};
