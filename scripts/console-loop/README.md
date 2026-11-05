@@ -132,11 +132,14 @@ once nothing is left in it.
 `--only` and `--skip` take comma-separated step names or tags, each matched
 exactly; a name that is neither is an error. The tags are `routes`, `orgs`,
 `users`, `api-keys`, `sandboxes`, `flows`, `lifecycle`, `templates`, `nodes`,
-`roles`. Sign-in always runs. Steps tagged `flows` create objects and delete
-them again; each records its object's ID as soon as the create is answered,
+`roles`, `terminal`. Sign-in always runs. Steps tagged `flows` create objects
+and delete them again; each records its object's ID as soon as the create is answered,
 so if one fails before deleting, `npm run clean` removes it. They need a seed
 state for the prefix, and the identity check above passes before any runs.
-`--no-mutate` skips them. The steps are in [`src/steps.ts`](src/steps.ts).
+`--no-mutate` skips them. The `terminal` steps open a shell in the seeded
+running sandbox and in the tenant organization's running sandbox, the second
+through the admin terminal route, and type into it; they create no objects. The steps are in
+[`src/steps.ts`](src/steps.ts).
 
 Each run writes `out/runs/<time>[-<label>]/`:
 

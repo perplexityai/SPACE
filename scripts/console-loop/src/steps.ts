@@ -371,6 +371,123 @@ step('sandbox-delete', ['sandboxes', 'flows', 'lifecycle'], async (c) => {
   c.rec.check(/\/dashboard\/sandboxes$/.test(c.page.url()), 'deleting a sandbox returns to the list');
 }, true);
 
+// ---------------------------------------------------------------- terminal
+// The sandbox page's terminal is an emulator on a PTY: keys go to the shell as
+// typed, and full-screen programs draw in it. The checks read the rows it
+// renders, so each command prints a marker the command line itself does not
+// contain (`$((6*7))` prints 42).
+const terminalCard = (page: Page) => page.locator('.ant-card', { has: page.locator('.ant-card-head', { hasText: 'Terminal' }) });
+const terminalRows = async (page: Page): Promise<string> =>
+  (await terminalCard(page).locator('.xterm-rows').innerText().catch(() => '')).replace(/ /g, ' ');
+async function terminalShows(page: Page, want: RegExp | ((rows: string) => boolean), timeoutMs = 10_000): Promise<boolean> {
+  const matches = typeof want === 'function' ? want : (rows: string) => want.test(rows);
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (matches(await terminalRows(page))) return true;
+    await page.waitForTimeout(200);
+  }
+  return false;
+}
+const terminalStatus = (page: Page) => terminalCard(page).locator('.ant-card-extra').innerText().catch(() => '');
+async function terminalConnect(c: Ctx): Promise<boolean> {
+  await terminalCard(c.page).getByRole('button', { name: /Connect$/ }).click();
+  const deadline = Date.now() + 30_000;
+  while (Date.now() < deadline && !/attached/.test(await terminalStatus(c.page))) await c.page.waitForTimeout(250);
+  const attached = /attached/.test(await terminalStatus(c.page));
+  c.rec.check(attached, `Connect attaches a session (${(await terminalStatus(c.page)).replace(/\s+/g, ' ')})`);
+  // The prompt comes after the attach.
+  if (attached) await c.page.waitForTimeout(1000);
+  return attached;
+}
+async function terminalRun(c: Ctx, command: string, marker: RegExp, what: string): Promise<boolean> {
+  await c.page.keyboard.type(command);
+  await c.page.keyboard.press('Enter');
+  const shown = await terminalShows(c.page, marker);
+  c.rec.check(shown, what);
+  return shown;
+}
+const terminalShot = (c: Ctx, name: string) => terminalCard(c.page).screenshot({ path: `${c.rec.outDir}/${name}.png` }).catch(() => {});
+const sizeOf = (rows: string, marker: string) => rows.match(new RegExp(`${marker}=(\\d+)x(\\d+)`))?.slice(1).map(Number) ?? null;
+
+for (const [key, ownOrg] of [['running', true], ['acme-running', false]] as const) {
+  step(`terminal-${key}`, ['sandboxes', 'terminal'], async (c) => {
+    const id = sandboxId(c, key);
+    if (!id) return c.rec.check(false, `the seed has a ${key} sandbox`);
+    await visit(c, `/dashboard/sandboxes/${id}`, 3000);
+    const card = terminalCard(c.page);
+    await card.scrollIntoViewIfNeeded();
+    c.rec.check(await card.locator('.xterm').count() === 1, 'the Terminal card holds a terminal emulator');
+    if (!ownOrg) c.rec.check(/another organization/.test(await card.innerText()), "another organization's sandbox shows the admin-route notice");
+    if (!(await terminalConnect(c))) return;
+    c.rec.check(await c.page.evaluate(() => !!document.activeElement?.closest('.xterm')), 'the terminal has focus once attached');
+
+    await terminalRun(c, 'ls --color=always / && echo listed-$((6*7))', /listed-42/, 'a command runs and prints');
+    const colored = await card.locator('.xterm-rows span[class*="xterm-fg-"], .xterm-rows span[style*="color"]').count();
+    c.rec.check(colored > 0, `ls --color draws colored text (${colored} spans)`);
+    await c.page.keyboard.press('ArrowUp');
+    await c.page.keyboard.press('Enter');
+    c.rec.check(await terminalShows(c.page, (rows) => (rows.match(/listed-42/g) ?? []).length >= 2), 'the up arrow recalls the last command');
+
+    await c.page.keyboard.type('ech');
+    await c.page.keyboard.press('Tab');
+    await terminalRun(c, ' completed-$((7*7))', /completed-49/, 'Tab completes a command name');
+
+    await c.page.keyboard.type('sleep 100');
+    await c.page.keyboard.press('Enter');
+    await c.page.waitForTimeout(1000);
+    await c.page.keyboard.press('Control+C');
+    await terminalRun(c, 'echo interrupted-$((8*8))', /interrupted-64/, 'Ctrl-C stops sleep 100');
+
+    if (ownOrg) {
+      await c.page.keyboard.type('top');
+      await c.page.keyboard.press('Enter');
+      c.rec.check(await terminalShows(c.page, /PID/), 'top draws its process table');
+      await terminalShot(c, `terminal-${key}-top`);
+      await c.page.keyboard.press('q');
+      await terminalRun(c, 'clear; echo top-quit-$((9*9))', /top-quit-81/, 'q quits top back to the shell');
+
+      // The seed template has no editor; a template with vi gets the check.
+      await terminalRun(c, 'clear; command -v vi >/dev/null && echo vi-$((5*5))-found || echo vi-$((5*5))-none', /vi-25-(found|none)/, 'the shell reports whether vi exists');
+      if (/vi-25-found/.test(await terminalRows(c.page))) {
+        await c.page.keyboard.type('vi /tmp/console-loop-vi.txt');
+        await c.page.keyboard.press('Enter');
+        c.rec.check(await terminalShows(c.page, /~\s*\n\s*~/), 'vi opens full screen');
+        await c.page.keyboard.type('ityped-in-vi');
+        await c.page.keyboard.press('Escape');
+        c.rec.check(await terminalShows(c.page, /typed-in-vi/), 'text typed in vi appears');
+        await terminalShot(c, `terminal-${key}-vi`);
+        await c.page.keyboard.type(':q!');
+        await c.page.keyboard.press('Enter');
+        await terminalRun(c, 'clear; test ! -e /tmp/console-loop-vi.txt && echo vi-quit-$((10*10))', /vi-quit-100/, ':q! leaves vi without writing');
+      } else {
+        c.rec.note('the sandbox has no vi; the vi check did not run');
+      }
+
+      // The PTY follows the card's size.
+      await terminalRun(c, 'echo before=$(tput cols 2>/dev/null || stty size | cut -d" " -f2)x$(tput lines 2>/dev/null || stty size | cut -d" " -f1)', /before=\d+x\d+/, 'the shell reports its size');
+      const viewport = c.page.viewportSize();
+      await c.page.setViewportSize({ width: 1000, height: viewport?.height ?? 900 });
+      await c.page.waitForTimeout(1000);
+      await card.scrollIntoViewIfNeeded();
+      await c.page.keyboard.press('Enter');
+      await terminalRun(c, 'echo after=$(tput cols 2>/dev/null || stty size | cut -d" " -f2)x$(tput lines 2>/dev/null || stty size | cut -d" " -f1)', /after=\d+x\d+/, 'the shell reports its size after the resize');
+      const rows = await terminalRows(c.page);
+      const [before, after] = [sizeOf(rows, 'before'), sizeOf(rows, 'after')];
+      c.rec.check(!!before && !!after && after[0] < before[0], `a narrower window narrows the PTY (${before?.join('x')} → ${after?.join('x')})`);
+      if (viewport) await c.page.setViewportSize(viewport);
+      await c.page.waitForTimeout(500);
+    }
+    await terminalShot(c, `terminal-${key}-session`);
+
+    await card.getByRole('button', { name: /Disconnect$/ }).click();
+    await c.page.waitForTimeout(500);
+    c.rec.check(/closed/.test(await terminalStatus(c.page)), 'Disconnect closes the session');
+    if (!(await terminalConnect(c))) return;
+    await terminalRun(c, 'echo reconnected-$((11*11))', /reconnected-121/, 'a second Connect opens a new shell');
+    await card.getByRole('button', { name: /Disconnect$/ }).click();
+  });
+}
+
 // ---------------------------------------------------- templates and nodes
 step('templates', ['templates'], async (c) => {
   await visit(c, '/dashboard/templates', 4000);
