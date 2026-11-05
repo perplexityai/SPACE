@@ -1,0 +1,3 @@
+2 new error type(s), 0 resolved, 0 not covered by the later run, 3 new step signature(s)
+  NEW         http|GET /admin/api/v1/orgs/<uuid>/master-key|404
+  NEW         http|GET /admin/api/v1/orgs/<uuid>|404
