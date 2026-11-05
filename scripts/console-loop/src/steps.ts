@@ -372,10 +372,178 @@ step('sandbox-delete', ['sandboxes', 'flows', 'lifecycle'], async (c) => {
 }, true);
 
 // ---------------------------------------------------- templates and nodes
+// A stack with many templates pages them: the search keeps seed on the
+// first page.
 step('templates', ['templates'], async (c) => {
-  await visit(c, '/dashboard/templates', 4000);
+  await visit(c, '/dashboard/templates?q=seed', 4000);
   c.rec.check((await text(c.page)).includes('seed'), 'the templates page lists the seed template');
 });
+
+// The Templates list keeps its search, filters, sort and page in the URL.
+// These steps read the `seed` release from the API, so they hold on any
+// stack, seeded with more templates or not.
+const templateRows = (c: Ctx) => content(c.page).locator('.ant-tabs-tabpane-active tbody tr.ant-table-row');
+const templateSearch = (c: Ctx) => content(c.page).getByLabel('Search templates');
+const seedRelease = async (c: Ctx): Promise<{ id: string; content_hash: string; tags: string[] } | null> => {
+  const releases = await adminFetch(c.page, 'GET', '/admin/api/v1/template-releases');
+  return (releases.json ?? []).find((r: { template_name: string; tags: string[] }) => r.template_name === 'seed' && r.tags.includes('latest')) ?? null;
+};
+const urlParam = (c: Ctx, name: string) => new URL(c.page.url()).searchParams.get(name);
+// The template names on the page: each name cell's first line.
+const templateNames = async (c: Ctx) => (await templateRows(c).locator('td:first-child').allInnerTexts()).map((cell) => cell.split('\n')[0].trim());
+
+step('templates-search-name', ['templates'], async (c) => {
+  await visit(c, '/dashboard/templates', 3000);
+  await templateSearch(c).fill('SEE');
+  await c.page.waitForTimeout(500);
+  const names = await templateNames(c);
+  c.rec.check(names.length >= 1 && names.every((name) => name.toLowerCase().includes('see')), `a name search keeps matching rows only (${names.length})`);
+  c.rec.check(urlParam(c, 'q') === 'SEE', 'the search is in the URL');
+});
+
+step('templates-search-hash', ['templates'], async (c) => {
+  await visit(c, '/dashboard/templates', 2000);
+  const release = await seedRelease(c);
+  if (!release) return c.rec.check(false, 'the seed template has a latest release');
+  const prefix = release.content_hash.replace(/^[a-z0-9]+:/, '').slice(0, 8);
+  await templateSearch(c).fill(prefix);
+  await c.page.waitForTimeout(500);
+  const t = await text(c.page);
+  c.rec.check(t.includes(`seed@${prefix}`), `a content hash prefix names the seed release (${prefix})`);
+  c.rec.check((await templateRows(c).filter({ hasText: 'seed' }).count()) >= 1, "the release's template is listed");
+  await content(c.page).locator('.ant-alert a', { hasText: `seed@${prefix}` }).first().click();
+  await c.page.waitForURL(/\/dashboard\/templates\/seed/, { timeout: 10_000 }).catch(() => {});
+  await settle(c.page, 2500);
+  c.rec.check(urlParam(c, 'tab') === 'releases' && urlParam(c, 'release') === release.id, "the match opens the template's releases with it marked");
+  c.rec.check(await content(c.page).locator('tr.template-release-highlight').count() === 1, 'the searched release is marked');
+});
+
+step('templates-search-tag', ['templates'], async (c) => {
+  await visit(c, '/dashboard/templates?org=system', 2000);
+  await templateSearch(c).fill('latest');
+  await c.page.waitForTimeout(500);
+  c.rec.check(/release(s)? match(es)? “latest”/.test(await text(c.page)), 'a tag search lists the releases holding it');
+  c.rec.check((await templateRows(c).filter({ hasText: 'seed' }).count()) >= 1, 'the seed template, whose release holds latest, is listed');
+});
+
+for (const [query, label, holds] of [
+  ['org=system', 'the system organization', 'seed'],
+  ['release=published', 'templates with a release', 'seed'],
+  ['pool=without', 'templates without a warm pool', null],
+  ['tag=latest', 'the latest tag', 'seed'],
+  ['build=failed', 'a failed latest build', null],
+] as const) {
+  step(`templates-filter-${query.split('=')[0]}`, ['templates'], async (c) => {
+    // With `q=seed`, seed is on the first page whenever the filter keeps it.
+    await visit(c, `/dashboard/templates?${query}${holds ? `&q=${holds}` : ''}`, 3000);
+    // A build filter reads each template's latest build first.
+    await content(c.page).getByText(/Reading the latest build/).waitFor({ state: 'detached', timeout: 60_000 }).catch(() => {});
+    const [param, value] = query.split('=');
+    c.rec.check(urlParam(c, param) === value, `the ${param} filter from the link is kept in the URL`);
+    const t = await text(c.page);
+    c.rec.check(/of \d+ templates|No template matches/.test(t), `filtering by ${label} shows a list`);
+    if (holds) c.rec.check((await templateRows(c).filter({ hasText: holds }).count()) >= 1, `filtering by ${label} keeps ${holds}`);
+  });
+}
+
+step('templates-url-state', ['templates'], async (c) => {
+  await visit(c, '/dashboard/templates?q=e&sort=name&order=descend&size=10', 3000);
+  await c.page.reload({ waitUntil: 'domcontentloaded' });
+  await settle(c.page, 2500);
+  c.rec.check((await templateSearch(c).inputValue()) === 'e', 'the search survives a reload');
+  const names = await templateNames(c);
+  c.rec.check(names.length > 0 && names.every((name, i) => i === 0 || names[i - 1].localeCompare(name) >= 0), 'the sort from the link applies after a reload');
+  c.rec.check(urlParam(c, 'sort') === 'name' && urlParam(c, 'order') === 'descend' && urlParam(c, 'size') === '10', 'the sort and page size stay in the URL');
+});
+
+step('templates-sort-page', ['templates'], async (c) => {
+  await visit(c, '/dashboard/templates?size=10', 3000);
+  await content(c.page).locator('th', { hasText: 'Nodes' }).first().click();
+  await c.page.waitForTimeout(500);
+  c.rec.check(urlParam(c, 'sort') === 'nodes', 'sorting by a column is written to the URL');
+  const next = content(c.page).locator('.ant-tabs-tabpane-active .ant-pagination-item-2');
+  if (!(await next.count())) return c.rec.note('ten templates or fewer: paging not exercised');
+  await next.click();
+  await c.page.waitForTimeout(500);
+  c.rec.check(urlParam(c, 'page') === '2', 'the page is written to the URL');
+  await c.page.reload({ waitUntil: 'domcontentloaded' });
+  await settle(c.page, 2500);
+  c.rec.check(await content(c.page).locator('.ant-tabs-tabpane-active .ant-pagination-item-active').innerText() === '2', 'the page survives a reload');
+});
+
+for (const [tab, label, expect] of [
+  ['releases', 'All releases', /template releases/],
+  ['policies', 'Warm pool policies', /Rolling Warm Pool Policies/],
+  ['nodes', 'Node availability', /template builds|No data/],
+  ['spaced', 'spaced versions', /spaced version|Running sandboxes/],
+] as const) {
+  step(`templates-tab-${tab}`, ['templates'], async (c) => {
+    await visit(c, '/dashboard/templates', 2500);
+    const tabButton = content(c.page).getByRole('tab', { name: new RegExp(`^${label}`) });
+    if (!(await tabButton.count())) return c.rec.note(`no ${label} tab on this stack (substrate or role)`);
+    await tabButton.click();
+    await settle(c.page, 2500);
+    c.rec.check(urlParam(c, 'tab') === tab, `the ${label} tab is in the URL`);
+    c.rec.check(expect.test(await text(c.page)), `the ${label} tab renders its table`);
+  });
+}
+
+step('templates-releases-search', ['templates'], async (c) => {
+  await visit(c, '/dashboard/templates?tab=releases&rq=seed', 3000);
+  const rows = content(c.page).locator('.ant-tabs-tabpane-active tbody tr.ant-table-row');
+  const all = await rows.allInnerTexts();
+  c.rec.check(all.length > 0 && all.every((row) => row.includes('seed')), `the releases search from the link keeps matching rows (${all.length})`);
+});
+
+for (const [tab, expect] of [
+  ['overview', /Default auto lifecycle/],
+  ['releases', /template releases/],
+  ['builds', /System template rebuild|No builds recorded|Created/],
+  ['pool', /Release pools|pool/i],
+  ['nodes', /template builds|No reachable node/],
+  ['sandboxes', /Open the sandboxes of seed/],
+] as const) {
+  step(`template-detail-${tab}`, ['templates'], async (c) => {
+    await visit(c, `/dashboard/templates/seed${tab === 'overview' ? '' : `?tab=${tab}`}`, 3000);
+    c.rec.check(expect.test(await text(c.page)), `the seed template's ${tab} section renders`);
+  });
+}
+
+step('template-detail-unknown', ['templates'], async (c) => {
+  await visit(c, '/dashboard/templates/loop-no-such-template', 3000);
+  c.rec.check(/not found/i.test(await text(c.page)), 'an unknown template shows a not-found state');
+});
+
+step('template-detail-sandboxes-link', ['templates'], async (c) => {
+  await visit(c, '/dashboard/templates/seed?tab=sandboxes', 2500);
+  await content(c.page).getByRole('button', { name: /Open the sandboxes of seed/ }).click();
+  await c.page.waitForURL(/\/dashboard\/sandboxes/, { timeout: 10_000 }).catch(() => {});
+  await settle(c.page, 2500);
+  c.rec.check(urlParam(c, 'template') === 'seed', 'the link opens the sandbox list filtered by the template');
+});
+
+// Assigns a tag of its own to the seed release through the retag dialog,
+// then deletes it from the tag's own control.
+step('template-tag-assign-delete', ['templates', 'flows'], async (c) => {
+  await visit(c, '/dashboard/templates/seed?tab=releases', 3000);
+  const release = await seedRelease(c);
+  if (!release) return c.rec.check(false, 'the seed template has a latest release');
+  const tag = c.runTag;
+  const row = content(c.page).locator('tbody tr.ant-table-row', { hasText: release.content_hash.replace(/^[a-z0-9]+:/, '').slice(0, 12) });
+  await row.getByRole('button', { name: 'Assign or move release tag' }).click();
+  const modal = c.page.locator('.ant-modal:visible');
+  await modal.getByLabel('Tag').fill(tag);
+  await modal.getByRole('button', { name: 'OK' }).click();
+  await settle(c.page, 2000);
+  const after = await seedRelease(c);
+  c.rec.check(!!after?.tags.includes(tag), `the tag ${tag} names the seed release`);
+  if (!after?.tags.includes(tag)) return;
+  await row.getByRole('button', { name: `Delete tag ${tag}` }).click();
+  await confirmPopover(c.page);
+  await settle(c.page, 2000);
+  const cleaned = await seedRelease(c);
+  c.rec.check(!cleaned?.tags.includes(tag), 'deleting the tag removes it');
+}, true);
 
 step('nodes', ['nodes'], async (c) => {
   await visit(c, '/dashboard/nodes', 4000);
