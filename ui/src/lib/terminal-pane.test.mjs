@@ -274,7 +274,7 @@ test('binary input keeps each byte', () => {
 test('links in sandbox output open only as http(s)', () => {
   const cases = [
     ['https://example.com/a?b=1', 'https://example.com/a?b=1'],
-    ['http://localhost:3000/x', 'http://localhost:3000/x'],
+    ['http://sandbox.example.com:8080/x', 'http://sandbox.example.com:8080/x'],
     ['HTTPS://EXAMPLE.COM', 'https://example.com/'],
     ['javascript:alert(1)', null],
     ['data:text/html,<script>1</script>', null],
