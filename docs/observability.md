@@ -1204,6 +1204,11 @@ Each eligible recorded create contributes one sample to each distribution.
 Retries that reach a recording point add another sample; the distribution count
 is not the total number of incoming create requests.
 
+Native creates (`/v1` and admin) are re-queued by the dispatcher when cluster
+admission refuses them, and each retry that reaches admission adds another
+`admission:rejected` sample, so `surface:native` rejected counts overstate how
+many requests were refused.
+
 A cold create is recorded at its cluster admission decision, so an admitted
 create that fails later still counts and one that fails before admission does
 not. A warm-pool create is recorded when its claim is adopted.
