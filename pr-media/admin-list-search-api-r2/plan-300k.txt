@@ -1,0 +1,946 @@
+# search_plan_tests at 300,000 sandboxes
+
+Rows handled per plan under both plan cache modes, with each plan's outline, from #1523 round 2 (1da9f69e: UUIDv7-shaped fixture IDs, one per 10 s; SANDBOXES = 300_000 as a local edit, reverted).
+
+MEASURE page | a name prefix in another case | force_custom_plan | rows handled 105
+  Sort: 105 rows
+    Aggregate: 19 rows
+      Limit: 18 rows
+        Index Scan on sandboxes using idx_sandboxes_name_lower: 3 rows
+        Sort: 12 rows
+          Nested Loop Inner: 9 rows
+            CTE Scan: 3 rows
+            Index Scan on sandboxes using sandboxes_id_org_id_key: 3 rows
+    Recursive Union: 25 rows
+      Result: 1 rows
+      Nested Loop Inner: 20 rows
+        Nested Loop Inner: 12 rows
+          CTE Scan: 4 rows
+          WorkTable Scan: 4 rows
+        Index Scan on sandboxes using sandboxes_id_org_id_key: 4 rows
+    Nested Loop Left: 58 rows
+      Nested Loop Left: 52 rows
+        Nested Loop Left: 49 rows
+          Nested Loop Left: 46 rows
+            Nested Loop Left: 43 rows
+              Nested Loop Left: 40 rows
+                Nested Loop Inner: 37 rows
+                  Nested Loop Left: 30 rows
+                    Nested Loop Left: 27 rows
+                      Nested Loop Inner: 24 rows
+                        Nested Loop Inner: 18 rows
+                          Subquery Scan: 12 rows
+                            WindowAgg: 8 rows
+                              CTE Scan: 4 rows
+                          Index Scan on sandboxes using sandboxes_id_org_id_key: 3 rows
+                        Index Scan on organizations using organizations_pkey: 3 rows
+                      Index Scan on templates using templates_name_org_id_key: 0 rows
+                    Index Scan on sandbox_direct_route_identities using sandbox_direct_route_identities_pkey: 0 rows
+                    Index Scan on users using users_pkey: 1 rows
+                Index Scan on nodes using nodes_pkey: 0 rows
+              Index Scan on node_direct using node_direct_pkey: 0 rows
+            Index Scan on node_k8s using node_k8s_pkey: 0 rows
+          Index Scan on sandbox_ecw_credential_epochs using sandbox_ecw_credential_epochs_pkey: 0 rows
+        Limit: 0 rows
+          Index Scan on sandbox_k8s_executions using idx_k8s_executions_sandbox_generation: 0 rows
+      Aggregate: 3 rows
+        Sort: 0 rows
+          Nested Loop Inner: 0 rows
+            Index Scan on template_releases using idx_template_releases_template_name_hash_unique: 0 rows
+            Bitmap Heap Scan on template_release_tags: 0 rows
+              Bitmap Index Scan using idx_template_release_tags_release_id: 0 rows
+MEASURE page | a name prefix in another case | force_generic_plan | rows handled 108
+  Sort: 108 rows
+    Aggregate: 22 rows
+      Limit: 21 rows
+        Bitmap Heap Scan on sandboxes: 6 rows
+          BitmapOr: 3 rows
+            Bitmap Index Scan using idx_sandboxes_name_lower: 3 rows
+            Bitmap Index Scan using idx_sandboxes_id_suffix: 0 rows
+            Bitmap Index Scan using sandboxes_pkey: 0 rows
+        Seq Scan on sandbox_direct_route_identities: 0 rows
+        Sort: 12 rows
+          Nested Loop Inner: 9 rows
+            CTE Scan: 3 rows
+            Index Scan on sandboxes using sandboxes_pkey: 3 rows
+              Seq Scan on sandbox_direct_route_identities: 0 rows
+              Index Scan on sandbox_direct_route_identities using sandbox_direct_route_identities_pkey: 0 rows
+    Recursive Union: 25 rows
+      Result: 1 rows
+      Nested Loop Inner: 20 rows
+        Nested Loop Inner: 12 rows
+          CTE Scan: 4 rows
+          WorkTable Scan: 4 rows
+        Index Scan on sandboxes using sandboxes_id_org_id_key: 4 rows
+    Nested Loop Left: 58 rows
+      Nested Loop Left: 52 rows
+        Nested Loop Left: 49 rows
+          Nested Loop Left: 46 rows
+            Nested Loop Left: 43 rows
+              Nested Loop Left: 40 rows
+                Nested Loop Inner: 37 rows
+                  Nested Loop Left: 30 rows
+                    Nested Loop Left: 27 rows
+                      Nested Loop Inner: 24 rows
+                        Nested Loop Inner: 18 rows
+                          Subquery Scan: 12 rows
+                            WindowAgg: 8 rows
+                              CTE Scan: 4 rows
+                          Index Scan on sandboxes using sandboxes_id_org_id_key: 3 rows
+                        Index Scan on organizations using organizations_pkey: 3 rows
+                      Index Scan on templates using templates_name_org_id_key: 0 rows
+                    Index Scan on sandbox_direct_route_identities using sandbox_direct_route_identities_pkey: 0 rows
+                    Index Scan on users using users_pkey: 1 rows
+                Index Scan on nodes using nodes_pkey: 0 rows
+              Index Scan on node_direct using node_direct_pkey: 0 rows
+            Index Scan on node_k8s using node_k8s_pkey: 0 rows
+          Index Scan on sandbox_ecw_credential_epochs using sandbox_ecw_credential_epochs_pkey: 0 rows
+        Limit: 0 rows
+          Index Scan on sandbox_k8s_executions using idx_k8s_executions_sandbox_generation: 0 rows
+      Aggregate: 3 rows
+        Sort: 0 rows
+          Nested Loop Inner: 0 rows
+            Index Scan on template_releases using idx_template_releases_template_name_hash_unique: 0 rows
+            Bitmap Heap Scan on template_release_tags: 0 rows
+              Bitmap Index Scan using idx_template_release_tags_release_id: 0 rows
+MEASURE page | the shortest name prefix, three letters | force_custom_plan | rows handled 105
+  Sort: 105 rows
+    Aggregate: 19 rows
+      Limit: 18 rows
+        Index Scan on sandboxes using idx_sandboxes_name_lower: 3 rows
+        Sort: 12 rows
+          Nested Loop Inner: 9 rows
+            CTE Scan: 3 rows
+            Index Scan on sandboxes using sandboxes_id_org_id_key: 3 rows
+    Recursive Union: 25 rows
+      Result: 1 rows
+      Nested Loop Inner: 20 rows
+        Nested Loop Inner: 12 rows
+          CTE Scan: 4 rows
+          WorkTable Scan: 4 rows
+        Index Scan on sandboxes using sandboxes_id_org_id_key: 4 rows
+    Nested Loop Left: 58 rows
+      Nested Loop Left: 52 rows
+        Nested Loop Left: 49 rows
+          Nested Loop Left: 46 rows
+            Nested Loop Left: 43 rows
+              Nested Loop Left: 40 rows
+                Nested Loop Inner: 37 rows
+                  Nested Loop Left: 30 rows
+                    Nested Loop Left: 27 rows
+                      Nested Loop Inner: 24 rows
+                        Nested Loop Inner: 18 rows
+                          Subquery Scan: 12 rows
+                            WindowAgg: 8 rows
+                              CTE Scan: 4 rows
+                          Index Scan on sandboxes using sandboxes_id_org_id_key: 3 rows
+                        Index Scan on organizations using organizations_pkey: 3 rows
+                      Index Scan on templates using templates_name_org_id_key: 0 rows
+                    Index Scan on sandbox_direct_route_identities using sandbox_direct_route_identities_pkey: 0 rows
+                    Index Scan on users using users_pkey: 1 rows
+                Index Scan on nodes using nodes_pkey: 0 rows
+              Index Scan on node_direct using node_direct_pkey: 0 rows
+            Index Scan on node_k8s using node_k8s_pkey: 0 rows
+          Index Scan on sandbox_ecw_credential_epochs using sandbox_ecw_credential_epochs_pkey: 0 rows
+        Limit: 0 rows
+          Index Scan on sandbox_k8s_executions using idx_k8s_executions_sandbox_generation: 0 rows
+      Aggregate: 3 rows
+        Sort: 0 rows
+          Nested Loop Inner: 0 rows
+            Index Scan on template_releases using idx_template_releases_template_name_hash_unique: 0 rows
+            Bitmap Heap Scan on template_release_tags: 0 rows
+              Bitmap Index Scan using idx_template_release_tags_release_id: 0 rows
+MEASURE page | the shortest name prefix, three letters | force_generic_plan | rows handled 108
+  Sort: 108 rows
+    Aggregate: 22 rows
+      Limit: 21 rows
+        Bitmap Heap Scan on sandboxes: 6 rows
+          BitmapOr: 3 rows
+            Bitmap Index Scan using idx_sandboxes_name_lower: 3 rows
+            Bitmap Index Scan using idx_sandboxes_id_suffix: 0 rows
+            Bitmap Index Scan using sandboxes_pkey: 0 rows
+        Seq Scan on sandbox_direct_route_identities: 0 rows
+        Sort: 12 rows
+          Nested Loop Inner: 9 rows
+            CTE Scan: 3 rows
+            Index Scan on sandboxes using sandboxes_pkey: 3 rows
+              Seq Scan on sandbox_direct_route_identities: 0 rows
+              Index Scan on sandbox_direct_route_identities using sandbox_direct_route_identities_pkey: 0 rows
+    Recursive Union: 25 rows
+      Result: 1 rows
+      Nested Loop Inner: 20 rows
+        Nested Loop Inner: 12 rows
+          CTE Scan: 4 rows
+          WorkTable Scan: 4 rows
+        Index Scan on sandboxes using sandboxes_id_org_id_key: 4 rows
+    Nested Loop Left: 58 rows
+      Nested Loop Left: 52 rows
+        Nested Loop Left: 49 rows
+          Nested Loop Left: 46 rows
+            Nested Loop Left: 43 rows
+              Nested Loop Left: 40 rows
+                Nested Loop Inner: 37 rows
+                  Nested Loop Left: 30 rows
+                    Nested Loop Left: 27 rows
+                      Nested Loop Inner: 24 rows
+                        Nested Loop Inner: 18 rows
+                          Subquery Scan: 12 rows
+                            WindowAgg: 8 rows
+                              CTE Scan: 4 rows
+                          Index Scan on sandboxes using sandboxes_id_org_id_key: 3 rows
+                        Index Scan on organizations using organizations_pkey: 3 rows
+                      Index Scan on templates using templates_name_org_id_key: 0 rows
+                    Index Scan on sandbox_direct_route_identities using sandbox_direct_route_identities_pkey: 0 rows
+                    Index Scan on users using users_pkey: 1 rows
+                Index Scan on nodes using nodes_pkey: 0 rows
+              Index Scan on node_direct using node_direct_pkey: 0 rows
+            Index Scan on node_k8s using node_k8s_pkey: 0 rows
+          Index Scan on sandbox_ecw_credential_epochs using sandbox_ecw_credential_epochs_pkey: 0 rows
+        Limit: 0 rows
+          Index Scan on sandbox_k8s_executions using idx_k8s_executions_sandbox_generation: 0 rows
+      Aggregate: 3 rows
+        Sort: 0 rows
+          Nested Loop Inner: 0 rows
+            Index Scan on template_releases using idx_template_releases_template_name_hash_unique: 0 rows
+            Bitmap Heap Scan on template_release_tags: 0 rows
+              Bitmap Index Scan using idx_template_release_tags_release_id: 0 rows
+MEASURE page | an ID label | force_custom_plan | rows handled 40
+  Sort: 40 rows
+    Aggregate: 8 rows
+      Limit: 7 rows
+        Bitmap Heap Scan on sandboxes: 2 rows
+          BitmapOr: 1 rows
+            Bitmap Index Scan using idx_sandboxes_name_lower: 0 rows
+            Bitmap Index Scan using idx_sandboxes_id_suffix: 1 rows
+            Bitmap Index Scan using sandboxes_id_org_id_key: 0 rows
+        Sort: 4 rows
+          Nested Loop Inner: 3 rows
+            CTE Scan: 1 rows
+            Index Scan on sandboxes using sandboxes_id_org_id_key: 1 rows
+    Recursive Union: 9 rows
+      Result: 1 rows
+      Nested Loop Inner: 6 rows
+        Nested Loop Inner: 6 rows
+          CTE Scan: 2 rows
+          WorkTable Scan: 2 rows
+        Index Scan on sandboxes using sandboxes_id_org_id_key: 0 rows
+    Nested Loop Left: 22 rows
+      Nested Loop Left: 20 rows
+        Nested Loop Left: 19 rows
+          Nested Loop Left: 18 rows
+            Nested Loop Left: 17 rows
+              Nested Loop Left: 16 rows
+                Nested Loop Inner: 15 rows
+                  Nested Loop Left: 12 rows
+                    Nested Loop Left: 11 rows
+                      Nested Loop Inner: 10 rows
+                        Nested Loop Inner: 8 rows
+                          Subquery Scan: 6 rows
+                            WindowAgg: 4 rows
+                              CTE Scan: 2 rows
+                          Index Scan on sandboxes using sandboxes_id_org_id_key: 1 rows
+                        Index Scan on organizations using organizations_pkey: 1 rows
+                      Index Scan on templates using templates_name_org_id_key: 0 rows
+                    Index Scan on sandbox_direct_route_identities using sandbox_direct_route_identities_pkey: 0 rows
+                    Index Scan on users using users_pkey: 1 rows
+                Index Scan on nodes using nodes_pkey: 0 rows
+              Index Scan on node_direct using node_direct_pkey: 0 rows
+            Index Scan on node_k8s using node_k8s_pkey: 0 rows
+          Index Scan on sandbox_ecw_credential_epochs using sandbox_ecw_credential_epochs_pkey: 0 rows
+        Limit: 0 rows
+          Index Scan on sandbox_k8s_executions using idx_k8s_executions_sandbox_generation: 0 rows
+      Aggregate: 1 rows
+        Sort: 0 rows
+          Nested Loop Inner: 0 rows
+            Index Scan on template_releases using idx_template_releases_template_name_hash_unique: 0 rows
+            Bitmap Heap Scan on template_release_tags: 0 rows
+              Bitmap Index Scan using idx_template_release_tags_release_id: 0 rows
+MEASURE page | an ID label | force_generic_plan | rows handled 40
+  Sort: 40 rows
+    Aggregate: 8 rows
+      Limit: 7 rows
+        Bitmap Heap Scan on sandboxes: 2 rows
+          BitmapOr: 1 rows
+            Bitmap Index Scan using idx_sandboxes_name_lower: 0 rows
+            Bitmap Index Scan using idx_sandboxes_id_suffix: 1 rows
+            Bitmap Index Scan using sandboxes_pkey: 0 rows
+        Seq Scan on sandbox_direct_route_identities: 0 rows
+        Sort: 4 rows
+          Nested Loop Inner: 3 rows
+            CTE Scan: 1 rows
+            Index Scan on sandboxes using sandboxes_pkey: 1 rows
+              Seq Scan on sandbox_direct_route_identities: 0 rows
+              Index Scan on sandbox_direct_route_identities using sandbox_direct_route_identities_pkey: 0 rows
+    Recursive Union: 9 rows
+      Result: 1 rows
+      Nested Loop Inner: 6 rows
+        Nested Loop Inner: 6 rows
+          CTE Scan: 2 rows
+          WorkTable Scan: 2 rows
+        Index Scan on sandboxes using sandboxes_id_org_id_key: 0 rows
+    Nested Loop Left: 22 rows
+      Nested Loop Left: 20 rows
+        Nested Loop Left: 19 rows
+          Nested Loop Left: 18 rows
+            Nested Loop Left: 17 rows
+              Nested Loop Left: 16 rows
+                Nested Loop Inner: 15 rows
+                  Nested Loop Left: 12 rows
+                    Nested Loop Left: 11 rows
+                      Nested Loop Inner: 10 rows
+                        Nested Loop Inner: 8 rows
+                          Subquery Scan: 6 rows
+                            WindowAgg: 4 rows
+                              CTE Scan: 2 rows
+                          Index Scan on sandboxes using sandboxes_id_org_id_key: 1 rows
+                        Index Scan on organizations using organizations_pkey: 1 rows
+                      Index Scan on templates using templates_name_org_id_key: 0 rows
+                    Index Scan on sandbox_direct_route_identities using sandbox_direct_route_identities_pkey: 0 rows
+                    Index Scan on users using users_pkey: 1 rows
+                Index Scan on nodes using nodes_pkey: 0 rows
+              Index Scan on node_direct using node_direct_pkey: 0 rows
+            Index Scan on node_k8s using node_k8s_pkey: 0 rows
+          Index Scan on sandbox_ecw_credential_epochs using sandbox_ecw_credential_epochs_pkey: 0 rows
+        Limit: 0 rows
+          Index Scan on sandbox_k8s_executions using idx_k8s_executions_sandbox_generation: 0 rows
+      Aggregate: 1 rows
+        Sort: 0 rows
+          Nested Loop Inner: 0 rows
+            Index Scan on template_releases using idx_template_releases_template_name_hash_unique: 0 rows
+            Bitmap Heap Scan on template_release_tags: 0 rows
+              Bitmap Index Scan using idx_template_release_tags_release_id: 0 rows
+MEASURE page | an eight-digit ID start | force_custom_plan | rows handled 204
+  Sort: 204 rows
+    Aggregate: 43 rows
+      Limit: 42 rows
+        Bitmap Heap Scan on sandboxes: 12 rows
+          BitmapOr: 6 rows
+            Bitmap Index Scan using idx_sandboxes_name_lower: 0 rows
+            Bitmap Index Scan using idx_sandboxes_id_suffix: 0 rows
+            Bitmap Index Scan using sandboxes_id_org_id_key: 6 rows
+        Sort: 24 rows
+          Nested Loop Inner: 18 rows
+            CTE Scan: 6 rows
+            Index Scan on sandboxes using sandboxes_id_org_id_key: 6 rows
+    Recursive Union: 43 rows
+      Result: 1 rows
+      Nested Loop Inner: 35 rows
+        Nested Loop Inner: 21 rows
+          CTE Scan: 7 rows
+          WorkTable Scan: 7 rows
+        Index Scan on sandboxes using sandboxes_id_org_id_key: 7 rows
+    Nested Loop Left: 112 rows
+      Nested Loop Left: 100 rows
+        Nested Loop Left: 94 rows
+          Nested Loop Left: 88 rows
+            Nested Loop Left: 82 rows
+              Nested Loop Left: 76 rows
+                Nested Loop Inner: 70 rows
+                  Nested Loop Left: 57 rows
+                    Nested Loop Left: 51 rows
+                      Nested Loop Inner: 45 rows
+                        Nested Loop Inner: 33 rows
+                          Subquery Scan: 21 rows
+                            WindowAgg: 14 rows
+                              CTE Scan: 7 rows
+                          Index Scan on sandboxes using sandboxes_id_org_id_key: 6 rows
+                        Index Scan on organizations using organizations_pkey: 6 rows
+                      Index Scan on templates using templates_name_org_id_key: 0 rows
+                    Index Scan on sandbox_direct_route_identities using sandbox_direct_route_identities_pkey: 0 rows
+                    Index Scan on users using users_pkey: 1 rows
+                Index Scan on nodes using nodes_pkey: 0 rows
+              Index Scan on node_direct using node_direct_pkey: 0 rows
+            Index Scan on node_k8s using node_k8s_pkey: 0 rows
+          Index Scan on sandbox_ecw_credential_epochs using sandbox_ecw_credential_epochs_pkey: 0 rows
+        Limit: 0 rows
+          Index Scan on sandbox_k8s_executions using idx_k8s_executions_sandbox_generation: 0 rows
+      Aggregate: 6 rows
+        Sort: 0 rows
+          Nested Loop Inner: 0 rows
+            Index Scan on template_releases using idx_template_releases_template_name_hash_unique: 0 rows
+            Bitmap Heap Scan on template_release_tags: 0 rows
+              Bitmap Index Scan using idx_template_release_tags_release_id: 0 rows
+MEASURE page | an eight-digit ID start | force_generic_plan | rows handled 204
+  Sort: 204 rows
+    Aggregate: 43 rows
+      Limit: 42 rows
+        Bitmap Heap Scan on sandboxes: 12 rows
+          BitmapOr: 6 rows
+            Bitmap Index Scan using idx_sandboxes_name_lower: 0 rows
+            Bitmap Index Scan using idx_sandboxes_id_suffix: 0 rows
+            Bitmap Index Scan using sandboxes_pkey: 6 rows
+        Seq Scan on sandbox_direct_route_identities: 0 rows
+        Sort: 24 rows
+          Nested Loop Inner: 18 rows
+            CTE Scan: 6 rows
+            Index Scan on sandboxes using sandboxes_pkey: 6 rows
+              Seq Scan on sandbox_direct_route_identities: 0 rows
+              Index Scan on sandbox_direct_route_identities using sandbox_direct_route_identities_pkey: 0 rows
+    Recursive Union: 43 rows
+      Result: 1 rows
+      Nested Loop Inner: 35 rows
+        Nested Loop Inner: 21 rows
+          CTE Scan: 7 rows
+          WorkTable Scan: 7 rows
+        Index Scan on sandboxes using sandboxes_id_org_id_key: 7 rows
+    Nested Loop Left: 112 rows
+      Nested Loop Left: 100 rows
+        Nested Loop Left: 94 rows
+          Nested Loop Left: 88 rows
+            Nested Loop Left: 82 rows
+              Nested Loop Left: 76 rows
+                Nested Loop Inner: 70 rows
+                  Nested Loop Left: 57 rows
+                    Nested Loop Left: 51 rows
+                      Nested Loop Inner: 45 rows
+                        Nested Loop Inner: 33 rows
+                          Subquery Scan: 21 rows
+                            WindowAgg: 14 rows
+                              CTE Scan: 7 rows
+                          Index Scan on sandboxes using sandboxes_id_org_id_key: 6 rows
+                        Index Scan on organizations using organizations_pkey: 6 rows
+                      Index Scan on templates using templates_name_org_id_key: 0 rows
+                    Index Scan on sandbox_direct_route_identities using sandbox_direct_route_identities_pkey: 0 rows
+                    Index Scan on users using users_pkey: 1 rows
+                Index Scan on nodes using nodes_pkey: 0 rows
+              Index Scan on node_direct using node_direct_pkey: 0 rows
+            Index Scan on node_k8s using node_k8s_pkey: 0 rows
+          Index Scan on sandbox_ecw_credential_epochs using sandbox_ecw_credential_epochs_pkey: 0 rows
+        Limit: 0 rows
+          Index Scan on sandbox_k8s_executions using idx_k8s_executions_sandbox_generation: 0 rows
+      Aggregate: 6 rows
+        Sort: 0 rows
+          Nested Loop Inner: 0 rows
+            Index Scan on template_releases using idx_template_releases_template_name_hash_unique: 0 rows
+            Bitmap Heap Scan on template_release_tags: 0 rows
+              Bitmap Index Scan using idx_template_release_tags_release_id: 0 rows
+MEASURE page | a text nothing matches | force_custom_plan | rows handled 9
+  Sort: 9 rows
+    Aggregate: 1 rows
+      Limit: 0 rows
+        Index Scan on sandboxes using idx_sandboxes_name_lower: 0 rows
+        Sort: 0 rows
+          Nested Loop Inner: 0 rows
+            CTE Scan: 0 rows
+            Index Scan on sandboxes using sandboxes_id_org_id_key: 0 rows
+    Recursive Union: 5 rows
+      Result: 1 rows
+      Nested Loop Inner: 3 rows
+        Nested Loop Inner: 3 rows
+          CTE Scan: 1 rows
+          WorkTable Scan: 1 rows
+        Index Scan on sandboxes using sandboxes_id_org_id_key: 0 rows
+    Nested Loop Left: 3 rows
+      Nested Loop Left: 3 rows
+        Nested Loop Left: 3 rows
+          Nested Loop Left: 3 rows
+            Nested Loop Left: 3 rows
+              Nested Loop Left: 3 rows
+                Nested Loop Inner: 3 rows
+                  Nested Loop Left: 3 rows
+                    Nested Loop Left: 3 rows
+                      Nested Loop Inner: 3 rows
+                        Nested Loop Inner: 3 rows
+                          Subquery Scan: 3 rows
+                            WindowAgg: 2 rows
+                              CTE Scan: 1 rows
+                          Index Scan on sandboxes using sandboxes_id_org_id_key: 0 rows
+                        Index Scan on organizations using organizations_pkey: 0 rows
+                      Index Scan on templates using templates_name_org_id_key: 0 rows
+                    Index Scan on sandbox_direct_route_identities using sandbox_direct_route_identities_pkey: 0 rows
+                    Index Scan on users using users_pkey: 0 rows
+                Index Scan on nodes using nodes_pkey: 0 rows
+              Index Scan on node_direct using node_direct_pkey: 0 rows
+            Index Scan on node_k8s using node_k8s_pkey: 0 rows
+          Index Scan on sandbox_ecw_credential_epochs using sandbox_ecw_credential_epochs_pkey: 0 rows
+        Limit: 0 rows
+          Index Scan on sandbox_k8s_executions using idx_k8s_executions_sandbox_generation: 0 rows
+      Aggregate: 0 rows
+        Sort: 0 rows
+          Nested Loop Inner: 0 rows
+            Index Scan on template_releases using idx_template_releases_template_name_hash_unique: 0 rows
+            Bitmap Heap Scan on template_release_tags: 0 rows
+              Bitmap Index Scan using idx_template_release_tags_release_id: 0 rows
+MEASURE page | a text nothing matches | force_generic_plan | rows handled 9
+  Sort: 9 rows
+    Aggregate: 1 rows
+      Limit: 0 rows
+        Bitmap Heap Scan on sandboxes: 0 rows
+          BitmapOr: 0 rows
+            Bitmap Index Scan using idx_sandboxes_name_lower: 0 rows
+            Bitmap Index Scan using idx_sandboxes_id_suffix: 0 rows
+            Bitmap Index Scan using sandboxes_pkey: 0 rows
+        Seq Scan on sandbox_direct_route_identities: 0 rows
+        Sort: 0 rows
+          Nested Loop Inner: 0 rows
+            CTE Scan: 0 rows
+            Index Scan on sandboxes using sandboxes_pkey: 0 rows
+              Seq Scan on sandbox_direct_route_identities: 0 rows
+              Index Scan on sandbox_direct_route_identities using sandbox_direct_route_identities_pkey: 0 rows
+    Recursive Union: 5 rows
+      Result: 1 rows
+      Nested Loop Inner: 3 rows
+        Nested Loop Inner: 3 rows
+          CTE Scan: 1 rows
+          WorkTable Scan: 1 rows
+        Index Scan on sandboxes using sandboxes_id_org_id_key: 0 rows
+    Nested Loop Left: 3 rows
+      Nested Loop Left: 3 rows
+        Nested Loop Left: 3 rows
+          Nested Loop Left: 3 rows
+            Nested Loop Left: 3 rows
+              Nested Loop Left: 3 rows
+                Nested Loop Inner: 3 rows
+                  Nested Loop Left: 3 rows
+                    Nested Loop Left: 3 rows
+                      Nested Loop Inner: 3 rows
+                        Nested Loop Inner: 3 rows
+                          Subquery Scan: 3 rows
+                            WindowAgg: 2 rows
+                              CTE Scan: 1 rows
+                          Index Scan on sandboxes using sandboxes_id_org_id_key: 0 rows
+                        Index Scan on organizations using organizations_pkey: 0 rows
+                      Index Scan on templates using templates_name_org_id_key: 0 rows
+                    Index Scan on sandbox_direct_route_identities using sandbox_direct_route_identities_pkey: 0 rows
+                    Index Scan on users using users_pkey: 0 rows
+                Index Scan on nodes using nodes_pkey: 0 rows
+              Index Scan on node_direct using node_direct_pkey: 0 rows
+            Index Scan on node_k8s using node_k8s_pkey: 0 rows
+          Index Scan on sandbox_ecw_credential_epochs using sandbox_ecw_credential_epochs_pkey: 0 rows
+        Limit: 0 rows
+          Index Scan on sandbox_k8s_executions using idx_k8s_executions_sandbox_generation: 0 rows
+      Aggregate: 0 rows
+        Sort: 0 rows
+          Nested Loop Inner: 0 rows
+            Index Scan on template_releases using idx_template_releases_template_name_hash_unique: 0 rows
+            Bitmap Heap Scan on template_release_tags: 0 rows
+              Bitmap Index Scan using idx_template_release_tags_release_id: 0 rows
+MEASURE unpaged list | a name prefix in another case | force_custom_plan | rows handled 69
+  Sort: 69 rows
+    Index Scan on sandboxes using idx_sandboxes_name_lower: 3 rows
+    Limit: 15 rows
+      Sort: 12 rows
+        Nested Loop Inner: 9 rows
+          CTE Scan: 3 rows
+          Index Scan on sandboxes using sandboxes_id_org_id_key: 3 rows
+    Nested Loop Left: 48 rows
+      Nested Loop Left: 42 rows
+        Nested Loop Left: 39 rows
+          Nested Loop Left: 36 rows
+            Nested Loop Left: 33 rows
+              Nested Loop Left: 30 rows
+                Nested Loop Left: 27 rows
+                  Nested Loop Left: 24 rows
+                    Nested Loop Inner: 21 rows
+                      Nested Loop Inner: 15 rows
+                        Nested Loop Inner: 9 rows
+                          CTE Scan: 3 rows
+                          Index Scan on sandboxes using sandboxes_id_org_id_key: 3 rows
+                        Index Scan on users using users_pkey: 3 rows
+                      Index Scan on organizations using organizations_pkey: 3 rows
+                    Index Scan on templates using templates_name_org_id_key: 0 rows
+                  Index Scan on sandbox_direct_route_identities using sandbox_direct_route_identities_pkey: 0 rows
+                Index Scan on nodes using nodes_pkey: 0 rows
+              Index Scan on node_direct using node_direct_pkey: 0 rows
+            Index Scan on node_k8s using node_k8s_pkey: 0 rows
+          Index Scan on sandbox_ecw_credential_epochs using sandbox_ecw_credential_epochs_pkey: 0 rows
+        Limit: 0 rows
+          Index Scan on sandbox_k8s_executions using idx_k8s_executions_sandbox_generation: 0 rows
+      Aggregate: 3 rows
+        Sort: 0 rows
+          Nested Loop Inner: 0 rows
+            Index Scan on template_releases using idx_template_releases_template_name_hash_unique: 0 rows
+            Bitmap Heap Scan on template_release_tags: 0 rows
+              Bitmap Index Scan using idx_template_release_tags_release_id: 0 rows
+MEASURE unpaged list | a name prefix in another case | force_generic_plan | rows handled 72
+  Sort: 72 rows
+    Bitmap Heap Scan on sandboxes: 6 rows
+      BitmapOr: 3 rows
+        Bitmap Index Scan using idx_sandboxes_name_lower: 3 rows
+        Bitmap Index Scan using idx_sandboxes_id_suffix: 0 rows
+        Bitmap Index Scan using sandboxes_pkey: 0 rows
+    Limit: 15 rows
+      Seq Scan on sandbox_direct_route_identities: 0 rows
+      Sort: 12 rows
+        Nested Loop Inner: 9 rows
+          CTE Scan: 3 rows
+          Index Scan on sandboxes using sandboxes_pkey: 3 rows
+            Seq Scan on sandbox_direct_route_identities: 0 rows
+            Index Scan on sandbox_direct_route_identities using sandbox_direct_route_identities_pkey: 0 rows
+    Nested Loop Left: 48 rows
+      Nested Loop Left: 42 rows
+        Nested Loop Left: 39 rows
+          Nested Loop Left: 36 rows
+            Nested Loop Left: 33 rows
+              Nested Loop Left: 30 rows
+                Nested Loop Left: 27 rows
+                  Nested Loop Left: 24 rows
+                    Nested Loop Inner: 21 rows
+                      Nested Loop Inner: 15 rows
+                        Nested Loop Inner: 9 rows
+                          CTE Scan: 3 rows
+                          Index Scan on sandboxes using sandboxes_id_org_id_key: 3 rows
+                        Index Scan on users using users_pkey: 3 rows
+                      Index Scan on organizations using organizations_pkey: 3 rows
+                    Index Scan on templates using templates_name_org_id_key: 0 rows
+                  Index Scan on sandbox_direct_route_identities using sandbox_direct_route_identities_pkey: 0 rows
+                Index Scan on nodes using nodes_pkey: 0 rows
+              Index Scan on node_direct using node_direct_pkey: 0 rows
+            Index Scan on node_k8s using node_k8s_pkey: 0 rows
+          Index Scan on sandbox_ecw_credential_epochs using sandbox_ecw_credential_epochs_pkey: 0 rows
+        Limit: 0 rows
+          Index Scan on sandbox_k8s_executions using idx_k8s_executions_sandbox_generation: 0 rows
+      Aggregate: 3 rows
+        Sort: 0 rows
+          Nested Loop Inner: 0 rows
+            Index Scan on template_releases using idx_template_releases_template_name_hash_unique: 0 rows
+            Bitmap Heap Scan on template_release_tags: 0 rows
+              Bitmap Index Scan using idx_template_release_tags_release_id: 0 rows
+MEASURE unpaged list | the shortest name prefix, three letters | force_custom_plan | rows handled 69
+  Sort: 69 rows
+    Index Scan on sandboxes using idx_sandboxes_name_lower: 3 rows
+    Limit: 15 rows
+      Sort: 12 rows
+        Nested Loop Inner: 9 rows
+          CTE Scan: 3 rows
+          Index Scan on sandboxes using sandboxes_id_org_id_key: 3 rows
+    Nested Loop Left: 48 rows
+      Nested Loop Left: 42 rows
+        Nested Loop Left: 39 rows
+          Nested Loop Left: 36 rows
+            Nested Loop Left: 33 rows
+              Nested Loop Left: 30 rows
+                Nested Loop Left: 27 rows
+                  Nested Loop Left: 24 rows
+                    Nested Loop Inner: 21 rows
+                      Nested Loop Inner: 15 rows
+                        Nested Loop Inner: 9 rows
+                          CTE Scan: 3 rows
+                          Index Scan on sandboxes using sandboxes_id_org_id_key: 3 rows
+                        Index Scan on users using users_pkey: 3 rows
+                      Index Scan on organizations using organizations_pkey: 3 rows
+                    Index Scan on templates using templates_name_org_id_key: 0 rows
+                  Index Scan on sandbox_direct_route_identities using sandbox_direct_route_identities_pkey: 0 rows
+                Index Scan on nodes using nodes_pkey: 0 rows
+              Index Scan on node_direct using node_direct_pkey: 0 rows
+            Index Scan on node_k8s using node_k8s_pkey: 0 rows
+          Index Scan on sandbox_ecw_credential_epochs using sandbox_ecw_credential_epochs_pkey: 0 rows
+        Limit: 0 rows
+          Index Scan on sandbox_k8s_executions using idx_k8s_executions_sandbox_generation: 0 rows
+      Aggregate: 3 rows
+        Sort: 0 rows
+          Nested Loop Inner: 0 rows
+            Index Scan on template_releases using idx_template_releases_template_name_hash_unique: 0 rows
+            Bitmap Heap Scan on template_release_tags: 0 rows
+              Bitmap Index Scan using idx_template_release_tags_release_id: 0 rows
+MEASURE unpaged list | the shortest name prefix, three letters | force_generic_plan | rows handled 72
+  Sort: 72 rows
+    Bitmap Heap Scan on sandboxes: 6 rows
+      BitmapOr: 3 rows
+        Bitmap Index Scan using idx_sandboxes_name_lower: 3 rows
+        Bitmap Index Scan using idx_sandboxes_id_suffix: 0 rows
+        Bitmap Index Scan using sandboxes_pkey: 0 rows
+    Limit: 15 rows
+      Seq Scan on sandbox_direct_route_identities: 0 rows
+      Sort: 12 rows
+        Nested Loop Inner: 9 rows
+          CTE Scan: 3 rows
+          Index Scan on sandboxes using sandboxes_pkey: 3 rows
+            Seq Scan on sandbox_direct_route_identities: 0 rows
+            Index Scan on sandbox_direct_route_identities using sandbox_direct_route_identities_pkey: 0 rows
+    Nested Loop Left: 48 rows
+      Nested Loop Left: 42 rows
+        Nested Loop Left: 39 rows
+          Nested Loop Left: 36 rows
+            Nested Loop Left: 33 rows
+              Nested Loop Left: 30 rows
+                Nested Loop Left: 27 rows
+                  Nested Loop Left: 24 rows
+                    Nested Loop Inner: 21 rows
+                      Nested Loop Inner: 15 rows
+                        Nested Loop Inner: 9 rows
+                          CTE Scan: 3 rows
+                          Index Scan on sandboxes using sandboxes_id_org_id_key: 3 rows
+                        Index Scan on users using users_pkey: 3 rows
+                      Index Scan on organizations using organizations_pkey: 3 rows
+                    Index Scan on templates using templates_name_org_id_key: 0 rows
+                  Index Scan on sandbox_direct_route_identities using sandbox_direct_route_identities_pkey: 0 rows
+                Index Scan on nodes using nodes_pkey: 0 rows
+              Index Scan on node_direct using node_direct_pkey: 0 rows
+            Index Scan on node_k8s using node_k8s_pkey: 0 rows
+          Index Scan on sandbox_ecw_credential_epochs using sandbox_ecw_credential_epochs_pkey: 0 rows
+        Limit: 0 rows
+          Index Scan on sandbox_k8s_executions using idx_k8s_executions_sandbox_generation: 0 rows
+      Aggregate: 3 rows
+        Sort: 0 rows
+          Nested Loop Inner: 0 rows
+            Index Scan on template_releases using idx_template_releases_template_name_hash_unique: 0 rows
+            Bitmap Heap Scan on template_release_tags: 0 rows
+              Bitmap Index Scan using idx_template_release_tags_release_id: 0 rows
+MEASURE unpaged list | an ID label | force_custom_plan | rows handled 24
+  Sort: 24 rows
+    Bitmap Heap Scan on sandboxes: 2 rows
+      BitmapOr: 1 rows
+        Bitmap Index Scan using idx_sandboxes_name_lower: 0 rows
+        Bitmap Index Scan using idx_sandboxes_id_suffix: 1 rows
+        Bitmap Index Scan using sandboxes_id_org_id_key: 0 rows
+    Limit: 5 rows
+      Sort: 4 rows
+        Nested Loop Inner: 3 rows
+          CTE Scan: 1 rows
+          Index Scan on sandboxes using sandboxes_id_org_id_key: 1 rows
+    Nested Loop Left: 16 rows
+      Nested Loop Left: 14 rows
+        Nested Loop Left: 13 rows
+          Nested Loop Left: 12 rows
+            Nested Loop Left: 11 rows
+              Nested Loop Left: 10 rows
+                Nested Loop Left: 9 rows
+                  Nested Loop Left: 8 rows
+                    Nested Loop Inner: 7 rows
+                      Nested Loop Inner: 5 rows
+                        Nested Loop Inner: 3 rows
+                          CTE Scan: 1 rows
+                          Index Scan on sandboxes using sandboxes_id_org_id_key: 1 rows
+                        Index Scan on users using users_pkey: 1 rows
+                      Index Scan on organizations using organizations_pkey: 1 rows
+                    Index Scan on templates using templates_name_org_id_key: 0 rows
+                  Index Scan on sandbox_direct_route_identities using sandbox_direct_route_identities_pkey: 0 rows
+                Index Scan on nodes using nodes_pkey: 0 rows
+              Index Scan on node_direct using node_direct_pkey: 0 rows
+            Index Scan on node_k8s using node_k8s_pkey: 0 rows
+          Index Scan on sandbox_ecw_credential_epochs using sandbox_ecw_credential_epochs_pkey: 0 rows
+        Limit: 0 rows
+          Index Scan on sandbox_k8s_executions using idx_k8s_executions_sandbox_generation: 0 rows
+      Aggregate: 1 rows
+        Sort: 0 rows
+          Nested Loop Inner: 0 rows
+            Index Scan on template_releases using idx_template_releases_template_name_hash_unique: 0 rows
+            Bitmap Heap Scan on template_release_tags: 0 rows
+              Bitmap Index Scan using idx_template_release_tags_release_id: 0 rows
+MEASURE unpaged list | an ID label | force_generic_plan | rows handled 24
+  Sort: 24 rows
+    Bitmap Heap Scan on sandboxes: 2 rows
+      BitmapOr: 1 rows
+        Bitmap Index Scan using idx_sandboxes_name_lower: 0 rows
+        Bitmap Index Scan using idx_sandboxes_id_suffix: 1 rows
+        Bitmap Index Scan using sandboxes_pkey: 0 rows
+    Limit: 5 rows
+      Seq Scan on sandbox_direct_route_identities: 0 rows
+      Sort: 4 rows
+        Nested Loop Inner: 3 rows
+          CTE Scan: 1 rows
+          Index Scan on sandboxes using sandboxes_pkey: 1 rows
+            Seq Scan on sandbox_direct_route_identities: 0 rows
+            Index Scan on sandbox_direct_route_identities using sandbox_direct_route_identities_pkey: 0 rows
+    Nested Loop Left: 16 rows
+      Nested Loop Left: 14 rows
+        Nested Loop Left: 13 rows
+          Nested Loop Left: 12 rows
+            Nested Loop Left: 11 rows
+              Nested Loop Left: 10 rows
+                Nested Loop Left: 9 rows
+                  Nested Loop Left: 8 rows
+                    Nested Loop Inner: 7 rows
+                      Nested Loop Inner: 5 rows
+                        Nested Loop Inner: 3 rows
+                          CTE Scan: 1 rows
+                          Index Scan on sandboxes using sandboxes_id_org_id_key: 1 rows
+                        Index Scan on users using users_pkey: 1 rows
+                      Index Scan on organizations using organizations_pkey: 1 rows
+                    Index Scan on templates using templates_name_org_id_key: 0 rows
+                  Index Scan on sandbox_direct_route_identities using sandbox_direct_route_identities_pkey: 0 rows
+                Index Scan on nodes using nodes_pkey: 0 rows
+              Index Scan on node_direct using node_direct_pkey: 0 rows
+            Index Scan on node_k8s using node_k8s_pkey: 0 rows
+          Index Scan on sandbox_ecw_credential_epochs using sandbox_ecw_credential_epochs_pkey: 0 rows
+        Limit: 0 rows
+          Index Scan on sandbox_k8s_executions using idx_k8s_executions_sandbox_generation: 0 rows
+      Aggregate: 1 rows
+        Sort: 0 rows
+          Nested Loop Inner: 0 rows
+            Index Scan on template_releases using idx_template_releases_template_name_hash_unique: 0 rows
+            Bitmap Heap Scan on template_release_tags: 0 rows
+              Bitmap Index Scan using idx_template_release_tags_release_id: 0 rows
+MEASURE unpaged list | an eight-digit ID start | force_custom_plan | rows handled 144
+  Sort: 144 rows
+    Bitmap Heap Scan on sandboxes: 12 rows
+      BitmapOr: 6 rows
+        Bitmap Index Scan using idx_sandboxes_name_lower: 0 rows
+        Bitmap Index Scan using idx_sandboxes_id_suffix: 0 rows
+        Bitmap Index Scan using sandboxes_id_org_id_key: 6 rows
+    Limit: 30 rows
+      Sort: 24 rows
+        Nested Loop Inner: 18 rows
+          CTE Scan: 6 rows
+          Index Scan on sandboxes using sandboxes_id_org_id_key: 6 rows
+    Nested Loop Left: 96 rows
+      Nested Loop Left: 84 rows
+        Nested Loop Left: 78 rows
+          Nested Loop Left: 72 rows
+            Nested Loop Left: 66 rows
+              Nested Loop Left: 60 rows
+                Nested Loop Left: 54 rows
+                  Nested Loop Left: 48 rows
+                    Nested Loop Inner: 42 rows
+                      Nested Loop Inner: 30 rows
+                        Nested Loop Inner: 18 rows
+                          CTE Scan: 6 rows
+                          Index Scan on sandboxes using sandboxes_id_org_id_key: 6 rows
+                        Index Scan on users using users_pkey: 6 rows
+                      Index Scan on organizations using organizations_pkey: 6 rows
+                    Index Scan on templates using templates_name_org_id_key: 0 rows
+                  Index Scan on sandbox_direct_route_identities using sandbox_direct_route_identities_pkey: 0 rows
+                Index Scan on nodes using nodes_pkey: 0 rows
+              Index Scan on node_direct using node_direct_pkey: 0 rows
+            Index Scan on node_k8s using node_k8s_pkey: 0 rows
+          Index Scan on sandbox_ecw_credential_epochs using sandbox_ecw_credential_epochs_pkey: 0 rows
+        Limit: 0 rows
+          Index Scan on sandbox_k8s_executions using idx_k8s_executions_sandbox_generation: 0 rows
+      Aggregate: 6 rows
+        Sort: 0 rows
+          Nested Loop Inner: 0 rows
+            Index Scan on template_releases using idx_template_releases_template_name_hash_unique: 0 rows
+            Bitmap Heap Scan on template_release_tags: 0 rows
+              Bitmap Index Scan using idx_template_release_tags_release_id: 0 rows
+MEASURE unpaged list | an eight-digit ID start | force_generic_plan | rows handled 144
+  Sort: 144 rows
+    Bitmap Heap Scan on sandboxes: 12 rows
+      BitmapOr: 6 rows
+        Bitmap Index Scan using idx_sandboxes_name_lower: 0 rows
+        Bitmap Index Scan using idx_sandboxes_id_suffix: 0 rows
+        Bitmap Index Scan using sandboxes_pkey: 6 rows
+    Limit: 30 rows
+      Seq Scan on sandbox_direct_route_identities: 0 rows
+      Sort: 24 rows
+        Nested Loop Inner: 18 rows
+          CTE Scan: 6 rows
+          Index Scan on sandboxes using sandboxes_pkey: 6 rows
+            Seq Scan on sandbox_direct_route_identities: 0 rows
+            Index Scan on sandbox_direct_route_identities using sandbox_direct_route_identities_pkey: 0 rows
+    Nested Loop Left: 96 rows
+      Nested Loop Left: 84 rows
+        Nested Loop Left: 78 rows
+          Nested Loop Left: 72 rows
+            Nested Loop Left: 66 rows
+              Nested Loop Left: 60 rows
+                Nested Loop Left: 54 rows
+                  Nested Loop Left: 48 rows
+                    Nested Loop Inner: 42 rows
+                      Nested Loop Inner: 30 rows
+                        Nested Loop Inner: 18 rows
+                          CTE Scan: 6 rows
+                          Index Scan on sandboxes using sandboxes_id_org_id_key: 6 rows
+                        Index Scan on users using users_pkey: 6 rows
+                      Index Scan on organizations using organizations_pkey: 6 rows
+                    Index Scan on templates using templates_name_org_id_key: 0 rows
+                  Index Scan on sandbox_direct_route_identities using sandbox_direct_route_identities_pkey: 0 rows
+                Index Scan on nodes using nodes_pkey: 0 rows
+              Index Scan on node_direct using node_direct_pkey: 0 rows
+            Index Scan on node_k8s using node_k8s_pkey: 0 rows
+          Index Scan on sandbox_ecw_credential_epochs using sandbox_ecw_credential_epochs_pkey: 0 rows
+        Limit: 0 rows
+          Index Scan on sandbox_k8s_executions using idx_k8s_executions_sandbox_generation: 0 rows
+      Aggregate: 6 rows
+        Sort: 0 rows
+          Nested Loop Inner: 0 rows
+            Index Scan on template_releases using idx_template_releases_template_name_hash_unique: 0 rows
+            Bitmap Heap Scan on template_release_tags: 0 rows
+              Bitmap Index Scan using idx_template_release_tags_release_id: 0 rows
+MEASURE unpaged list | a text nothing matches | force_custom_plan | rows handled 0
+  Sort: 0 rows
+    Index Scan on sandboxes using idx_sandboxes_name_lower: 0 rows
+    Limit: 0 rows
+      Sort: 0 rows
+        Nested Loop Inner: 0 rows
+          CTE Scan: 0 rows
+          Index Scan on sandboxes using sandboxes_id_org_id_key: 0 rows
+    Nested Loop Left: 0 rows
+      Nested Loop Left: 0 rows
+        Nested Loop Left: 0 rows
+          Nested Loop Left: 0 rows
+            Nested Loop Left: 0 rows
+              Nested Loop Left: 0 rows
+                Nested Loop Left: 0 rows
+                  Nested Loop Left: 0 rows
+                    Nested Loop Inner: 0 rows
+                      Nested Loop Inner: 0 rows
+                        Nested Loop Inner: 0 rows
+                          CTE Scan: 0 rows
+                          Index Scan on sandboxes using sandboxes_id_org_id_key: 0 rows
+                        Index Scan on users using users_pkey: 0 rows
+                      Index Scan on organizations using organizations_pkey: 0 rows
+                    Index Scan on templates using templates_name_org_id_key: 0 rows
+                  Index Scan on sandbox_direct_route_identities using sandbox_direct_route_identities_pkey: 0 rows
+                Index Scan on nodes using nodes_pkey: 0 rows
+              Index Scan on node_direct using node_direct_pkey: 0 rows
+            Index Scan on node_k8s using node_k8s_pkey: 0 rows
+          Index Scan on sandbox_ecw_credential_epochs using sandbox_ecw_credential_epochs_pkey: 0 rows
+        Limit: 0 rows
+          Index Scan on sandbox_k8s_executions using idx_k8s_executions_sandbox_generation: 0 rows
+      Aggregate: 0 rows
+        Sort: 0 rows
+          Nested Loop Inner: 0 rows
+            Index Scan on template_releases using idx_template_releases_template_name_hash_unique: 0 rows
+            Bitmap Heap Scan on template_release_tags: 0 rows
+              Bitmap Index Scan using idx_template_release_tags_release_id: 0 rows
+MEASURE unpaged list | a text nothing matches | force_generic_plan | rows handled 0
+  Sort: 0 rows
+    Bitmap Heap Scan on sandboxes: 0 rows
+      BitmapOr: 0 rows
+        Bitmap Index Scan using idx_sandboxes_name_lower: 0 rows
+        Bitmap Index Scan using idx_sandboxes_id_suffix: 0 rows
+        Bitmap Index Scan using sandboxes_pkey: 0 rows
+    Limit: 0 rows
+      Seq Scan on sandbox_direct_route_identities: 0 rows
+      Sort: 0 rows
+        Nested Loop Inner: 0 rows
+          CTE Scan: 0 rows
+          Index Scan on sandboxes using sandboxes_pkey: 0 rows
+            Seq Scan on sandbox_direct_route_identities: 0 rows
+            Index Scan on sandbox_direct_route_identities using sandbox_direct_route_identities_pkey: 0 rows
+    Nested Loop Left: 0 rows
+      Nested Loop Left: 0 rows
+        Nested Loop Left: 0 rows
+          Nested Loop Left: 0 rows
+            Nested Loop Left: 0 rows
+              Nested Loop Left: 0 rows
+                Nested Loop Left: 0 rows
+                  Nested Loop Left: 0 rows
+                    Nested Loop Inner: 0 rows
+                      Nested Loop Inner: 0 rows
+                        Nested Loop Inner: 0 rows
+                          CTE Scan: 0 rows
+                          Index Scan on sandboxes using sandboxes_id_org_id_key: 0 rows
+                        Index Scan on users using users_pkey: 0 rows
+                      Index Scan on organizations using organizations_pkey: 0 rows
+                    Index Scan on templates using templates_name_org_id_key: 0 rows
+                  Index Scan on sandbox_direct_route_identities using sandbox_direct_route_identities_pkey: 0 rows
+                Index Scan on nodes using nodes_pkey: 0 rows
+              Index Scan on node_direct using node_direct_pkey: 0 rows
+            Index Scan on node_k8s using node_k8s_pkey: 0 rows
+          Index Scan on sandbox_ecw_credential_epochs using sandbox_ecw_credential_epochs_pkey: 0 rows
+        Limit: 0 rows
+          Index Scan on sandbox_k8s_executions using idx_k8s_executions_sandbox_generation: 0 rows
+      Aggregate: 0 rows
+        Sort: 0 rows
+          Nested Loop Inner: 0 rows
+            Index Scan on template_releases using idx_template_releases_template_name_hash_unique: 0 rows
+            Bitmap Heap Scan on template_release_tags: 0 rows
+              Bitmap Index Scan using idx_template_release_tags_release_id: 0 rows
+
+## Broad 3-letter searches (round 1, 6f5e7109; the name arm is unchanged since)
+
+MEASURE-BROAD Page | SAN | force_custom_plan | rows handled 1502727 | 412.295058ms
+MEASURE-BROAD Page | sandbox-1 | force_custom_plan | rows handled 747182 | 188.163808ms
+MEASURE-BROAD Page | SAN | force_generic_plan | rows handled 1502724 | 765.092965ms
+MEASURE-BROAD Page | sandbox-1 | force_generic_plan | rows handled 558289 | 305.327643ms
+MEASURE-BROAD Unpaged | SAN | force_custom_plan | rows handled 1501790 | 398.857002ms
+MEASURE-BROAD Unpaged | sandbox-1 | force_custom_plan | rows handled 746245 | 184.126365ms
+MEASURE-BROAD Unpaged | SAN | force_generic_plan | rows handled 1501885 | 735.022261ms
+MEASURE-BROAD Unpaged | sandbox-1 | force_generic_plan | rows handled 557450 | 296.637393ms
+
+## The ID label with both indexes dropped (round 1, 6f5e7109)
+
+MEASURE-NOINDEX page | an ID label | force_generic_plan | rows handled 300039
+MEASURE-NOINDEX unpaged list | an ID label | force_generic_plan | rows handled 300023
