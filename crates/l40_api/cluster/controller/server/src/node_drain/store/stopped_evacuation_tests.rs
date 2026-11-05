@@ -159,7 +159,7 @@ async fn disk_backup_ready(pool: &PgPool, sandbox_id: SandboxId) -> TestResult<b
 }
 
 async fn restore_pending(pool: &PgPool) -> TestResult<Vec<(SandboxId, String)>> {
-    let query = restore_pending_evacuations_query(true);
+    let query = restore_pending_evacuations_query();
     Ok(
         sqlx::query_as::<_, (SandboxId, String)>(sqlx::AssertSqlSafe(sql!(query.as_str())))
             .fetch_all(pool)

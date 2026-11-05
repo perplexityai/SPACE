@@ -36,10 +36,8 @@
 //! ## AC — Abandon-stuck-transient sweep
 //! - AC1 `ac1_sweep_runs_with_configured_age_each_tick`
 //! - AC2 `ac2_abandoned_rows_unblock_drain_within_one_tick`
-//! - AC3 `ac3_none_disables_sweep`
 //! - AC4 `ac4_db_error_on_sweep_does_not_block_tick`
 //! - AC5 `ac5_undrained_node_aborts_sweep`
-//! - AC6 `ac6_stuck_restoring_only_resident_drains_only_with_sweep`
 //!
 //! ## G — KubeNodeGone recovery for draining nodes
 //! - G1 `g1_gone_node_without_lookup_parks_and_keeps_promoting`
@@ -47,7 +45,6 @@
 //! - G3 `g3_gone_node_lookup_error_parks_and_keeps_promoting`
 //! - G4 `g4_gone_node_terminated_bulk_fails_and_adopts_without_promote_rpcs`
 //! - G5 `g5_gone_node_adopt_miss_falls_back_to_mark_lost`
-//! - G6 `g6_gone_node_giveup_disabled_leaves_pinned_rows_alone`
 //! - G7 `g7_gone_node_recovery_converges_to_drained`
 //! - G8 `g8_gone_node_never_spawns_evacuations_even_when_bulk_fail_refuses`
 //! - G9 `g9_gone_node_terminalizes_inflight_snapshot_uploads`
@@ -122,8 +119,6 @@
 //! - RP11 `rp11_restore_success_schedules_no_retry_backoff`
 //! - RP12 `rp12_deferred_restore_schedules_no_retry_backoff` — a user
 //!   takeover (`Deferred`) is not a failure; no backoff is written
-//! - RP13 `rp13_backoff_disabled_schedules_no_retry` — base `0` disables the
-//!   backoff: no attempt state written, and the sweep bypasses stale windows
 
 use pplx_space_common_core::types::{LocalArtifactId, NodeId, SandboxId};
 
@@ -352,6 +347,9 @@ struct FakeSink {
     // Recorded `(node_id, age)` per call so tests can assert the
     // reconciler propagates the configured timeout.
     abandon_stale_calls: StdMutex<Vec<(NodeId, PositiveDuration)>>,
+    // Names of the sweep and resident-listing calls, in call order, so a test
+    // can assert the sweep runs before the resident scan.
+    sweep_scan_order: StdMutex<Vec<&'static str>>,
     // One-shot DB-error injection for `abandon_stale_resident_sandboxes`.
     fail_abandon_stale: StdMutex<Option<String>>,
 
@@ -384,10 +382,6 @@ struct FakeSink {
     // `schedule_restore_retry` call so the failure-backoff policy can be
     // asserted in tests.
     restore_retry_calls: StdMutex<Vec<(SandboxId, PositiveDuration, PositiveDuration)>>,
-    // `honor_backoff_windows` recorded per `list_restore_pending_evacuations`
-    // call, so tests can assert the reconciler bypasses stale backoff windows
-    // exactly when the backoff is disabled.
-    restore_pending_honor_flags: StdMutex<Vec<bool>>,
 
     // Cluster-wide queue of "stranded suspending re-drive" results: the ids a
     // `redrive_stranded_suspending_evacuations` call should report advancing
@@ -788,6 +782,10 @@ impl FakeSink {
             .push(count);
     }
 
+    fn sweep_scan_order(&self) -> Vec<&'static str> {
+        self.sweep_scan_order.lock().unwrap().clone()
+    }
+
     fn abandon_stale_calls(&self) -> Vec<(NodeId, PositiveDuration)> {
         self.abandon_stale_calls.lock().unwrap().clone()
     }
@@ -864,12 +862,6 @@ impl FakeSink {
         self.restore_retry_calls.lock().unwrap().clone()
     }
 
-    /// `honor_backoff_windows` values recorded per
-    /// `list_restore_pending_evacuations` call.
-    fn restore_pending_honor_flags(&self) -> Vec<bool> {
-        self.restore_pending_honor_flags.lock().unwrap().clone()
-    }
-
     fn gate_restores(&self) {
         *self.restore_permits.lock().unwrap() = Some(Arc::new(tokio::sync::Semaphore::new(0)));
     }
@@ -919,6 +911,7 @@ impl NodeDrainSink for FakeSink {
         &self,
         node_id: NodeId,
     ) -> Result<ResidentSandboxCounts, sqlx::Error> {
+        self.sweep_scan_order.lock().unwrap().push("resident_scan");
         if let Some(msg) = self.fail_list_resident.lock().unwrap().take() {
             return Err(forced_db_err(&msg));
         }
@@ -1186,6 +1179,7 @@ impl NodeDrainSink for FakeSink {
         node_id: NodeId,
         age: PositiveDuration,
     ) -> Result<u64, sqlx::Error> {
+        self.sweep_scan_order.lock().unwrap().push("abandon");
         self.abandon_stale_calls
             .lock()
             .unwrap()
@@ -1262,12 +1256,7 @@ impl NodeDrainSink for FakeSink {
 
     async fn list_restore_pending_evacuations(
         &self,
-        honor_backoff_windows: bool,
     ) -> Result<Vec<(SandboxId, SandboxLifecycle)>, sqlx::Error> {
-        self.restore_pending_honor_flags
-            .lock()
-            .unwrap()
-            .push(honor_backoff_windows);
         if *self.restore_listing_fails.lock().unwrap() {
             return Err(sqlx::Error::RowNotFound);
         }
@@ -1637,24 +1626,14 @@ fn config_enabled(max_per_node: usize, max_per_cluster: usize) -> ReconcilerConf
         max_per_node,
         max_per_cluster,
         evacuate_timeout: PositiveDuration::new_panic(Duration::from_secs(1)),
-        // Use the real default here so existing tests exercise the
-        // abandon-stuck-transient sweep on the same code path
-        // production runs. Tests that need to disable the policy can
-        // override on the returned struct.
-        stale_abandon: PositiveDuration::new(Duration::from_secs(DEFAULT_STALE_ABANDON_SECS)),
-        // Real default so existing tests exercise the reupload give-up on the
-        // same settle-gated path production runs; tests that need it disabled
-        // override on the returned struct.
-        reupload_giveup_settle: PositiveDuration::new(Duration::from_secs(
+        stale_abandon: PositiveDuration::new_panic(Duration::from_secs(DEFAULT_STALE_ABANDON_SECS)),
+        reupload_giveup_settle: PositiveDuration::new_panic(Duration::from_secs(
             DEFAULT_REUPLOAD_GIVEUP_SETTLE_SECS,
         )),
         // On for the suite, unlike the production default, so the give-up's
         // dispatch is exercised; `f8` covers it off.
         pod_less_giveup_stale: PositiveDuration::new(TEST_POD_LESS_GIVEUP_STALE),
-        // Real defaults so failure-path tests exercise the restore retry
-        // backoff bookkeeping on the same code path production runs; tests
-        // that need it disabled override on the returned struct.
-        restore_backoff_base: PositiveDuration::new(Duration::from_secs(
+        restore_backoff_base: PositiveDuration::new_panic(Duration::from_secs(
             DEFAULT_RESTORE_BACKOFF_BASE_SECS,
         )),
         restore_backoff_cap: PositiveDuration::new_panic(Duration::from_secs(
@@ -1710,15 +1689,15 @@ fn c1_defaults_when_env_unset() {
         Duration::from_secs(DEFAULT_EVACUATE_TIMEOUT_SECS)
     );
     assert_eq!(
-        cfg.stale_abandon,
-        PositiveDuration::new(Duration::from_secs(DEFAULT_STALE_ABANDON_SECS)),
+        cfg.stale_abandon.get(),
+        Duration::from_secs(DEFAULT_STALE_ABANDON_SECS),
     );
     // Off by default: the give-up moves user sandboxes off a draining node
     // without anyone asking, so each environment opts in.
     assert_eq!(cfg.pod_less_giveup_stale, None);
     assert_eq!(
-        cfg.restore_backoff_base,
-        PositiveDuration::new(Duration::from_secs(DEFAULT_RESTORE_BACKOFF_BASE_SECS)),
+        cfg.restore_backoff_base.get(),
+        Duration::from_secs(DEFAULT_RESTORE_BACKOFF_BASE_SECS),
     );
     assert_eq!(
         cfg.restore_backoff_cap.get(),
@@ -2005,11 +1984,8 @@ impl NodeDrainSink for ArcSink {
     }
     async fn list_restore_pending_evacuations(
         &self,
-        honor_backoff_windows: bool,
     ) -> Result<Vec<(SandboxId, SandboxLifecycle)>, sqlx::Error> {
-        self.0
-            .list_restore_pending_evacuations(honor_backoff_windows)
-            .await
+        self.0.list_restore_pending_evacuations().await
     }
     async fn count_stopped_replacements_pending(&self) -> Result<u64, sqlx::Error> {
         self.0.count_stopped_replacements_pending().await
@@ -2655,35 +2631,6 @@ async fn l7_restoring_noop_keeps_blocking_and_does_not_lose_sandbox() {
     );
 }
 
-/// With the give-up disabled (`reupload_giveup_settle = None`), a
-/// restoring-on-node refusal falls back to the prior behavior: retry next tick.
-/// The reconciler must NOT call the adopt-remote-snapshot store method.
-#[tokio::test]
-async fn l8_restoring_giveup_disabled_does_not_adopt() {
-    let node = NodeId::new();
-    let sandbox = SandboxId::new();
-    let sink = FakeSink::new();
-    sink.set_initial_state(node, PHASE_DRAINING);
-    sink.set_draining_list(vec![node]);
-    sink.enqueue_pinned_local_only(node, vec![sandbox]);
-    sink.fail_promote(
-        sandbox,
-        PromoteError::SandboxRestoringOnNode(
-            "cannot reupload snapshot: sandbox is restoring, must be suspended".into(),
-        ),
-    );
-
-    let mut cfg = config_enabled(4, 8);
-    cfg.reupload_giveup_settle = None;
-    let reconciler = Reconciler::new(cfg, sink, FakeTerminator::default());
-    let _ = reconciler.tick().await;
-
-    assert!(
-        reconciler.sink.adopted_remote_snapshot().is_empty(),
-        "give-up disabled (None) must not invoke make_sandbox_durable_from_remote_snapshot"
-    );
-}
-
 // =================================================================
 // TB — Termination-blocking residents (the terminator's resident guard)
 // =================================================================
@@ -3179,18 +3126,16 @@ async fn ac1_sweep_runs_with_configured_age_each_tick() {
     );
 }
 
-/// When the sweep reports rows flipped, the next tick's reconciler
-/// state machine treats them as gone — the immediately-following
-/// `list_sandboxes_on_node` call returning empty means drain
-/// completes. This locks in the ordering: abandon BEFORE the resident
-/// scan, so the same tick can finish a node that had `creating`
-/// sandboxes as its only blockers.
+/// A forced drain runs the stale-abandon sweep before the resident scan, so
+/// the same tick can finish a node whose only blockers were wedged transient
+/// rows. The sweep is forced-only, so the drain is forced; the test asserts the
+/// sweep ran once with the default age and that it preceded the resident scan.
 #[tokio::test]
 async fn ac2_abandoned_rows_unblock_drain_within_one_tick() {
     let node = NodeId::new();
     let sink = FakeSink::new();
     sink.set_initial_state(node, PHASE_DRAINING);
-    sink.set_draining_list(vec![node]);
+    sink.set_draining_list_forced(vec![node]);
     // The sweep reports 2 rows abandoned. The resident-listing
     // pipeline reflects the post-abandon state (empty), so drain
     // completes on this same tick — without this ordering, the
@@ -3210,28 +3155,20 @@ async fn ac2_abandoned_rows_unblock_drain_within_one_tick() {
         reconciler.sink.current_state(node).as_deref(),
         Some(PHASE_DRAINED)
     );
-}
-
-/// `stale_abandon = None` is the operator opt-out: the sweep
-/// short-circuits at the call site (the `if let Some(age) = …` block
-/// in `handle_draining_node` never fires) so the sink method isn't
-/// even called. Using `None` instead of an in-band `Duration::ZERO`
-/// sentinel keeps the disabled state unrepresentable downstream.
-#[tokio::test]
-async fn ac3_none_disables_sweep() {
-    let node = NodeId::new();
-    let sink = FakeSink::new();
-    sink.set_initial_state(node, PHASE_DRAINING);
-    sink.set_draining_list(vec![node]);
-
-    let mut config = config_enabled(4, 8);
-    config.stale_abandon = None;
-    let reconciler = Reconciler::new(config, sink, FakeTerminator::default());
-    let _ = reconciler.tick().await;
-
+    assert_eq!(
+        reconciler.sink.abandon_stale_calls(),
+        vec![(
+            node,
+            PositiveDuration::new_panic(Duration::from_secs(DEFAULT_STALE_ABANDON_SECS)),
+        )],
+        "the forced drain must run the sweep once with the default age"
+    );
+    let order = reconciler.sink.sweep_scan_order();
+    let abandon = order.iter().position(|c| *c == "abandon");
+    let scan = order.iter().position(|c| *c == "resident_scan");
     assert!(
-        reconciler.sink.abandon_stale_calls().is_empty(),
-        "stale_abandon = None must short-circuit the sweep entirely",
+        abandon.is_some() && scan.is_some() && abandon < scan,
+        "the sweep must precede the resident scan, got {order:?}"
     );
 }
 
@@ -3259,7 +3196,7 @@ async fn ac5_undrained_node_aborts_sweep() {
     let _ = reconciler.tick().await;
 
     // The reconciler did make the sweep call (the call is
-    // unconditional when `stale_abandon = Some(_)`), but the SQL
+    // unconditional under a forced drain), but the SQL
     // guard short-circuited the row count to zero — modeled by the
     // FakeSink ignoring the pre-staged return when the node isn't in
     // PHASE_DRAINING. No abandon metric is emitted at zero.
@@ -3292,65 +3229,6 @@ async fn ac4_db_error_on_sweep_does_not_block_tick() {
         report.spawned_evacuations, 1,
         "sweep DB error must not gate the downstream evacuation pipeline"
     );
-}
-
-/// A draining node's only resident is wedged in a non-evacuation transient
-/// lifecycle. The FakeSink is lifecycle-agnostic; the SQL lifecycle set is
-/// covered by `non_evacuatable_set_is_the_stale_abandon_sweep_set`. With the sweep
-/// enabled the row is abandoned and the node drains on the same tick; with
-/// the sweep disabled the same wedged row blocks the drain indefinitely.
-/// Before the sweep covered the full non-evacuable transient set it only
-/// handled `creating`, so a stuck `restoring` row held the node forever.
-#[tokio::test]
-async fn ac6_stuck_restoring_only_resident_drains_only_with_sweep() {
-    // Sweep enabled: the wedged row is abandoned, so the resident scan that
-    // follows in the same tick sees an empty node and drain completes.
-    {
-        let node = NodeId::new();
-        let sink = FakeSink::new();
-        sink.set_initial_state(node, PHASE_DRAINING);
-        sink.set_draining_list(vec![node]);
-        sink.enqueue_abandon_stale(node, 1);
-        sink.enqueue_resident(node, Vec::new());
-
-        let reconciler = Reconciler::new(config_enabled(4, 8), sink, FakeTerminator::default());
-        let report = reconciler.tick().await;
-
-        assert_eq!(
-            report.drained_transitions, 1,
-            "the stale-abandon sweep must unblock a node whose only resident is a wedged \
-             transient row"
-        );
-        assert_eq!(
-            reconciler.sink.current_state(node).as_deref(),
-            Some(PHASE_DRAINED)
-        );
-    }
-    // Sweep disabled (`stale_abandon = None`): the same wedged, non-evacuatable
-    // resident keeps blocking `draining -> drained`.
-    {
-        let node = NodeId::new();
-        let sink = FakeSink::new();
-        sink.set_initial_state(node, PHASE_DRAINING);
-        sink.set_draining_list(vec![node]);
-        // Resident stays non-empty and is not evacuatable (default empty
-        // evacuatable listing), so nothing clears it this tick.
-        sink.enqueue_resident(node, vec![SandboxId::new()]);
-
-        let mut config = config_enabled(4, 8);
-        config.stale_abandon = None;
-        let reconciler = Reconciler::new(config, sink, FakeTerminator::default());
-        let report = reconciler.tick().await;
-
-        assert_eq!(
-            report.drained_transitions, 0,
-            "without the sweep a wedged transient resident must keep blocking the drain"
-        );
-        assert_eq!(
-            reconciler.sink.current_state(node).as_deref(),
-            Some(PHASE_DRAINING)
-        );
-    }
 }
 
 // =================================================================
@@ -5243,9 +5121,9 @@ async fn rp10_restore_failure_schedules_retry_backoff() {
     sink.fail_restore(sandbox, EvacuateError::Restore("boom".into()));
 
     let mut config = config_enabled(4, 8);
-    let base = PositiveDuration::new_panic(Duration::from_secs(60));
-    let cap = PositiveDuration::new_panic(Duration::from_secs(1800));
-    config.restore_backoff_base = Some(base);
+    let base = PositiveDuration::new_panic(Duration::from_secs(7));
+    let cap = PositiveDuration::new_panic(Duration::from_secs(50));
+    config.restore_backoff_base = base;
     config.restore_backoff_cap = cap;
     let reconciler = Reconciler::new(config, sink, FakeTerminator::default());
 
@@ -5255,11 +5133,6 @@ async fn rp10_restore_failure_schedules_retry_backoff() {
         reconciler.sink.restore_retry_calls(),
         vec![(sandbox, base, cap)],
         "the failure must schedule exactly one retry backoff with the configured base/cap"
-    );
-    assert_eq!(
-        reconciler.sink.restore_pending_honor_flags(),
-        vec![true],
-        "with the backoff enabled, the sweep must honor backoff windows"
     );
 }
 
@@ -5303,35 +5176,6 @@ async fn rp12_deferred_restore_schedules_no_retry_backoff() {
     assert!(
         reconciler.sink.restore_retry_calls().is_empty(),
         "a deferred (user-takeover) outcome must not schedule a retry backoff"
-    );
-}
-
-/// rp13: `restore_backoff_base = None` (env `0`) disables the backoff —
-/// failures keep the prior retry-next-sweep behavior and never write
-/// attempt state, and the sweep's pending listing is asked to bypass any
-/// stale backoff windows written before the disable.
-#[tokio::test]
-async fn rp13_backoff_disabled_schedules_no_retry() {
-    let sandbox = SandboxId::new();
-    let sink = FakeSink::new();
-    sink.enqueue_restore_pending(vec![(sandbox, SandboxLifecycle::Started)]);
-    sink.fail_restore(sandbox, EvacuateError::Restore("boom".into()));
-
-    let mut config = config_enabled(4, 8);
-    config.restore_backoff_base = None;
-    let reconciler = Reconciler::new(config, sink, FakeTerminator::default());
-
-    reconciler.tick().await;
-    wait_restore_in_flight_empty(&reconciler).await;
-    assert_eq!(reconciler.sink.restored_evacuations().len(), 1);
-    assert!(
-        reconciler.sink.restore_retry_calls().is_empty(),
-        "with the backoff disabled, a failure must not write attempt state"
-    );
-    assert_eq!(
-        reconciler.sink.restore_pending_honor_flags(),
-        vec![false],
-        "with the backoff disabled, the sweep must bypass stale backoff windows"
     );
 }
 
@@ -5501,35 +5345,6 @@ async fn g5_gone_node_adopt_miss_falls_back_to_mark_lost() {
     assert!(reconciler.sink.adopted_remote_snapshot().is_empty());
     assert_eq!(report.kube_node_gone_adopted_sandboxes, 0);
     assert_eq!(report.kube_node_gone_lost_sandboxes, 1);
-}
-
-#[tokio::test]
-async fn g6_gone_node_giveup_disabled_leaves_pinned_rows_alone() {
-    // `reupload_giveup_settle = None` disables every automatic give-up:
-    // no adopt, no mark-lost — and no futile promote RPCs either (the node
-    // is confirmed terminated, so the enqueue can never be received).
-    let node = NodeId::new();
-    let pinned = SandboxId::new();
-    let sink = FakeSink::new();
-    sink.set_initial_state(node, PHASE_DRAINING);
-    sink.set_draining_list(vec![node]);
-    sink.set_cordon_kube_node_gone(node);
-    sink.enqueue_pinned_local_only(node, vec![pinned]);
-    let lookup = Arc::new(FakeInstanceLookup::default());
-    lookup.set_gone(node, None);
-
-    let mut config = config_enabled(4, 8);
-    config.reupload_giveup_settle = None;
-    let reconciler = Reconciler::new(config, sink, FakeTerminator::default())
-        .with_instance_lookup(Some(lookup as Arc<dyn InstanceStateLookup>));
-    let report = reconciler.tick().await;
-
-    assert!(reconciler.sink.adopted_remote_snapshot().is_empty());
-    assert!(reconciler.sink.adopted_on_gone_node().is_empty());
-    assert!(reconciler.sink.marked_lost_on_gone_node().is_empty());
-    assert!(reconciler.sink.promoted().is_empty());
-    assert_eq!(report.kube_node_gone_adopted_sandboxes, 0);
-    assert_eq!(report.kube_node_gone_lost_sandboxes, 0);
 }
 
 #[tokio::test]

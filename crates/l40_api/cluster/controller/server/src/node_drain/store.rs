@@ -568,19 +568,10 @@ pub(crate) fn drain_blocking_sandboxes_query() -> String {
 ///
 /// **Retry backoff + composed ordering (attempt tiers, then recency).** A
 /// row whose previous cohort restore failed carries
-/// `next_restore_attempt_at` ([`drain::schedule_restore_retry_query`]); when
-/// `honor_backoff_windows` is true the gate here keeps it out of the sweep
-/// until that instant passes, so a deterministic failer is retried on an
-/// exponential schedule instead of on every reconciler tick (and every
-/// backup-ready NOTIFY). When the operator disables the backoff
-/// (`honor_backoff_windows = false`) the scan ignores the backoff state
-/// entirely — the window gate is omitted, **and** the attempt-tier ordering
-/// key is dropped in favor of the pure recency ordering. Both halves matter
-/// for the escape hatch: stale windows written before the disable must not
-/// keep suppressing rows, and frozen pre-disable attempt counts must not
-/// keep sorting a row behind every fresh evacuation (under slot pressure
-/// that starves it just as effectively as the gate). Disabled mode is
-/// therefore exactly the pre-backoff recency behavior, immediately.
+/// `next_restore_attempt_at` ([`drain::schedule_restore_retry_query`]); the
+/// gate here keeps it out of the sweep until that instant passes, so a
+/// deterministic failer is retried on an exponential schedule instead of on
+/// every reconciler tick (and every backup-ready NOTIFY).
 ///
 /// The ordering composes the backoff tiers with the recency ordering:
 /// `restore_attempt_count ASC` first, then `lifecycle_changed_at DESC, id
@@ -602,17 +593,9 @@ pub(crate) fn drain_blocking_sandboxes_query() -> String {
 /// same instant. The backoff state
 /// is reset by the `sandboxes_clear_evacuation_restore_target` trigger the
 /// moment the marker clears (restore success or user takeover).
-pub(crate) fn restore_pending_evacuations_query(honor_backoff_windows: bool) -> String {
+pub(crate) fn restore_pending_evacuations_query() -> String {
     let snapshot_exists = latest_full_snapshot_ready("s");
     let disk_backup_ready = current_disk_artifact_backup_ready("s");
-    let (backoff_gate, attempt_tier_key) = if honor_backoff_windows {
-        (
-            "AND (s.next_restore_attempt_at IS NULL OR s.next_restore_attempt_at <= NOW())",
-            "s.restore_attempt_count ASC,",
-        )
-    } else {
-        ("", "")
-    };
     // Two populations, discriminated by the marker rather than by the
     // lifecycle, because `restoring` is reachable from both and says nothing
     // about which kind of evacuation is mid-flight.
@@ -661,7 +644,7 @@ pub(crate) fn restore_pending_evacuations_query(honor_backoff_windows: bool) -> 
            FROM sandboxes s
           WHERE s.evacuation_restore_target IS NOT NULL
             AND s.lifecycle IN ('suspended', 'restoring', 'stopped')
-            {backoff_gate}
+            AND (s.next_restore_attempt_at IS NULL OR s.next_restore_attempt_at <= NOW())
             AND (
                 (
                     s.evacuation_restore_target <> 'stopped'
@@ -682,7 +665,7 @@ pub(crate) fn restore_pending_evacuations_query(honor_backoff_windows: bool) -> 
                     AND {disk_backup_ready}
                 )
             )
-          ORDER BY {attempt_tier_key}
+          ORDER BY s.restore_attempt_count ASC,
                    CASE
                        WHEN s.evacuation_restore_target = 'stopped'
                        THEN COALESCE(s.placement_changed_at, s.lifecycle_changed_at)
@@ -3439,8 +3422,7 @@ impl NodeDrainSink for SubstrateSink {
     ) -> Result<u64, sqlx::Error> {
         // No `is_zero` guard anywhere on this path: `PositiveDuration`
         // carries the non-zero invariant at the type level (its smart
-        // constructor rejects `Duration::ZERO`), and the disabled case
-        // is filtered out at the call site via `Option<PositiveDuration>`.
+        // constructor rejects `Duration::ZERO`).
         // Single source of truth for the swept set; sqlx wants `&[&str]`
         // for the `text[]` parameter.
         let lifecycle_strs: Vec<&'static str> = NON_EVACUATABLE_RESIDENT_LIFECYCLES
@@ -4699,9 +4681,8 @@ impl NodeDrainSink for SubstrateSink {
 
     async fn list_restore_pending_evacuations(
         &self,
-        honor_backoff_windows: bool,
     ) -> Result<Vec<(SandboxId, SandboxLifecycle)>, sqlx::Error> {
-        let query = restore_pending_evacuations_query(honor_backoff_windows);
+        let query = restore_pending_evacuations_query();
         let rows: Vec<(SandboxId, String)> =
             sqlx::query_as(sqlx::AssertSqlSafe(sql!(query.as_str())))
                 .fetch_all(&self.pool)

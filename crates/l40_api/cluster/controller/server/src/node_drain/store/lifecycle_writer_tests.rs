@@ -663,7 +663,7 @@ async fn cohort_restore_defers_rows_the_restore_sweep_would_not_list() -> TestRe
     }
 
     let listed: Vec<SandboxId> = sink
-        .list_restore_pending_evacuations(false)
+        .list_restore_pending_evacuations()
         .await?
         .into_iter()
         .map(|(sandbox_id, _)| sandbox_id)

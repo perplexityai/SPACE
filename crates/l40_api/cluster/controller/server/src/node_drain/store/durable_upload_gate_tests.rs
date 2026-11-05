@@ -659,16 +659,9 @@ async fn set_current_local_artifact(
 }
 
 async fn restore_pending(pool: &PgPool) -> TestResult<Vec<(SandboxId, String)>> {
-    restore_pending_with(pool, true).await
-}
-
-async fn restore_pending_with(
-    pool: &PgPool,
-    honor_backoff_windows: bool,
-) -> TestResult<Vec<(SandboxId, String)>> {
     Ok(
         sqlx::query_as::<_, (SandboxId, String)>(sqlx::AssertSqlSafe(sql!(
-            restore_pending_evacuations_query(honor_backoff_windows),
+            restore_pending_evacuations_query(),
         )))
         .fetch_all(pool)
         .await?,
@@ -1912,58 +1905,6 @@ async fn restore_pending_gates_on_next_restore_attempt_at() -> TestResult {
         ],
         "open-window failer excluded; fresh row ordered before the re-admitted failer; \
          got {pending:?}"
-    );
-    Ok(())
-}
-
-/// Disabling the backoff must bypass windows that failures wrote
-/// *before* the disable: with `honor_backoff_windows = false` the scan
-/// re-admits a marked, snapshot-ready row whose `next_restore_attempt_at`
-/// is still in the future — the operator escape hatch restores
-/// retry-next-sweep behavior immediately instead of waiting out stale
-/// state (up to the configured cap). The bypass covers **both** halves of
-/// the backoff's influence on the scan: the window gate AND the
-/// attempt-tier ordering key — a frozen pre-disable `restore_attempt_count`
-/// must not keep sorting a row behind every fresh evacuation (under slot
-/// pressure that would starve it just as effectively as the gate), so
-/// disabled mode falls back to the pure recency ordering.
-#[tokio::test(flavor = "current_thread")]
-async fn restore_pending_ignores_stale_windows_when_backoff_disabled() -> TestResult {
-    let Some(db) = try_pg_test_db().await? else {
-        return Ok(());
-    };
-    let pool = &db.pool;
-    let node = NodeId::new();
-
-    // Backed off before the operator disabled the backoff: window still
-    // open for another hour, and the most-recently-active row of the set.
-    let stale_window = SandboxId::new();
-    insert_sandbox(pool, stale_window, "suspended", Some(node)).await?;
-    insert_snapshot(pool, stale_window, "ready", node).await?;
-    set_evacuation_marker(pool, stale_window, "started").await?;
-    set_backoff_state(pool, stale_window, 3, Some(3600)).await?;
-    age_lifecycle(pool, stale_window, 60).await?;
-
-    // Never-failed but colder evacuation.
-    let fresh_cold = SandboxId::new();
-    insert_sandbox(pool, fresh_cold, "suspended", Some(node)).await?;
-    insert_snapshot(pool, fresh_cold, "ready", node).await?;
-    set_evacuation_marker(pool, fresh_cold, "paused").await?;
-    age_lifecycle(pool, fresh_cold, 7200).await?;
-
-    assert_eq!(
-        restore_pending_with(pool, true).await?,
-        vec![(fresh_cold, "paused".to_string())],
-        "with the backoff enabled, the open window must exclude the failer"
-    );
-    assert_eq!(
-        restore_pending_with(pool, false).await?,
-        vec![
-            (stale_window, "started".to_string()),
-            (fresh_cold, "paused".to_string()),
-        ],
-        "with the backoff disabled, stale windows must not suppress the row and \
-         frozen attempt counts must not order it behind fresh rows — pure recency"
     );
     Ok(())
 }

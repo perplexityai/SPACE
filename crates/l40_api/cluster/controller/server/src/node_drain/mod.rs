@@ -505,9 +505,7 @@ pub(crate) const DEFAULT_EVACUATE_TIMEOUT_SECS: u64 = 600;
 /// lifecycle in that long is one the start/wake path has effectively given
 /// up on. The drain's own in-flight evacuation suspend/restore is excluded
 /// by the `evacuation_restore_target IS NOT NULL` marker, so this never
-/// aborts the pipeline's own work. Wrapped in `Option<PositiveDuration>`
-/// at the config layer so tests can disable the policy; the reconciler always
-/// uses this default.
+/// aborts the pipeline's own work.
 pub(crate) const DEFAULT_STALE_ABANDON_SECS: u64 = 600;
 /// How long a `suspended` sandbox whose local-snapshot backup is permanently
 /// refused (not `Suspended` on the node — a stuck on-node `restoring`) must
@@ -519,9 +517,6 @@ pub(crate) const DEFAULT_STALE_ABANDON_SECS: u64 = 600;
 /// well inside this budget, so the reupload succeeds (or the artifact becomes
 /// durable) before the window elapses. A restore wedged longer than the budget
 /// is eligible immediately. The default matches `DEFAULT_STALE_ABANDON_SECS`.
-/// Wrapped in `Option<PositiveDuration>` at the config layer so tests can
-/// disable the give-up entirely (`None` — the reupload is retried forever, the
-/// prior behavior); the reconciler always uses this default.
 pub(crate) const DEFAULT_REUPLOAD_GIVEUP_SETTLE_SECS: u64 = 600;
 /// The shortest pod-less give-up window the environment may set; a smaller
 /// value clamps up to it. The window is how long a resident whose evacuation
@@ -544,10 +539,7 @@ pub(crate) const MAX_POD_LESS_GIVEUP_STALE: Duration = Duration::from_secs(24 * 
 /// [`DEFAULT_RESTORE_BACKOFF_CAP_SECS`]), instead of being retried on every
 /// 5s tick forever. One minute keeps the first retry prompt for transient
 /// failures while a deterministic failer quickly backs off out of the shared
-/// restore budget. Wrapped in `Option<PositiveDuration>` at the config layer;
-/// tests can disable the backoff entirely (`None` — every failure retried on
-/// the next sweep, the prior behavior); the reconciler always uses this
-/// default.
+/// restore budget.
 pub(crate) const DEFAULT_RESTORE_BACKOFF_BASE_SECS: u64 = 60;
 /// Upper bound on the per-sandbox cohort-restore retry delay. 30 minutes
 /// bounds how long a recovered sandbox (e.g. its wedged target node finally
@@ -769,34 +761,22 @@ pub struct ReconcilerConfig {
     /// whose lifecycle has been one of [`NON_EVACUATABLE_RESIDENT_LIFECYCLES`]
     /// (and whose `active_node_id` is pinned to a draining node) for longer
     /// than this is flipped to `lifecycle = 'failed'` so the node can finish
-    /// draining. `None` disables the policy entirely — the sweep is not even
-    /// called.
+    /// draining.
     ///
-    /// `Option<PositiveDuration>` carries two type-level invariants:
-    /// (1) the disabled case is `None`, not an in-band magic value
-    /// like `Duration::ZERO`, so downstream consumers can't forget the
-    /// off-check and accidentally feed zero to the SQL (which would
-    /// match every transient row and abandon every in-flight transition
-    /// on every draining node); (2) when present, the value is guaranteed
-    /// non-zero by `PositiveDuration`'s smart constructor, so the
-    /// sink-side SQL never receives `INTERVAL '0s'` even via a
-    /// programmer-error path.
-    pub stale_abandon: Option<PositiveDuration>,
+    /// `PositiveDuration` guarantees the value is non-zero, so the sink-side
+    /// SQL never receives `INTERVAL '0s'`, which would match every transient
+    /// row and abandon every in-flight transition on every draining node.
+    pub stale_abandon: PositiveDuration,
     /// Settle window for the local-snapshot-promotion give-up. A `suspended`
     /// sandbox whose backup is permanently refused (not `Suspended` on the
     /// node — a stuck on-node `restoring`) is, after it has been settled this
     /// long (by `lifecycle_changed_at`) and **if the current suspend cycle's
     /// ready remote snapshot exists**, made durable from that snapshot so the
     /// node finishes draining instead of retrying the refused backup forever.
-    /// `None` disables the give-up — the backup is retried every tick (prior
-    /// behavior).
     ///
-    /// `Option<PositiveDuration>` for the same two reasons as
-    /// [`Self::stale_abandon`]: the disabled case is `None` (not a magic
-    /// zero a downstream consumer could forget to special-case), and when
-    /// present the value is guaranteed non-zero so the give-up SQL never sees a
-    /// zero settle interval that would fire on a just-suspended row.
-    pub reupload_giveup_settle: Option<PositiveDuration>,
+    /// `PositiveDuration` so the give-up SQL never sees a zero settle interval
+    /// that would fire on a just-suspended row.
+    pub reupload_giveup_settle: PositiveDuration,
     /// Staleness window for the pod-less give-up (see
     /// [`MIN_POD_LESS_GIVEUP_STALE`]), read from
     /// `SPACE_NODE_DRAIN_POD_LESS_GIVEUP_STALE_SECS`. Off (`None`) by
@@ -806,26 +786,21 @@ pub struct ReconcilerConfig {
     /// behavior). Unset, `0` or an unparseable value leaves it off; a number
     /// is clamped to [`MIN_POD_LESS_GIVEUP_STALE`] and
     /// [`MAX_POD_LESS_GIVEUP_STALE`].
-    /// `Option<PositiveDuration>` for the same reasons as
-    /// [`Self::stale_abandon`]: a zero window would let the give-up fire on a
-    /// generation whose pod is being created right now.
+    /// `Option<PositiveDuration>` rather than a zero sentinel: a zero window
+    /// would let the give-up fire on a generation whose pod is being created
+    /// right now.
     pub pod_less_giveup_stale: Option<PositiveDuration>,
     /// First-failure delay for the cohort-restore retry backoff. A failed
     /// cohort restore schedules its next attempt
     /// `base * 2^(failures - 1)` out (capped at
     /// [`Self::restore_backoff_cap`]) instead of being re-selected on the
     /// next tick, so a deterministic failer can't monopolize the shared
-    /// `max_per_cluster` restore budget. `None` disables the backoff — every
-    /// failure is retried on the next sweep (the prior behavior).
+    /// `max_per_cluster` restore budget.
     ///
-    /// `Option<PositiveDuration>` for the same two reasons as
-    /// [`Self::stale_abandon`]: the disabled case is `None` (not a magic zero
-    /// a downstream consumer could forget to special-case), and when present
-    /// the value is guaranteed non-zero so the backoff SQL never computes a
-    /// zero delay that would re-arm the failer immediately.
-    pub restore_backoff_base: Option<PositiveDuration>,
-    /// Upper bound on the per-sandbox cohort-restore retry delay. Only
-    /// consulted when [`Self::restore_backoff_base`] is `Some`.
+    /// `PositiveDuration` so the backoff SQL never computes a zero delay that
+    /// would re-arm the failer immediately.
+    pub restore_backoff_base: PositiveDuration,
+    /// Upper bound on the per-sandbox cohort-restore retry delay.
     pub restore_backoff_cap: PositiveDuration,
     /// Target-cohort placement applied to cluster-controller-built
     /// evacuation pods so that, during a two-MNG blue/green node rollout,
@@ -852,12 +827,14 @@ impl Default for ReconcilerConfig {
             evacuate_timeout: PositiveDuration::new_panic(Duration::from_secs(
                 DEFAULT_EVACUATE_TIMEOUT_SECS,
             )),
-            stale_abandon: PositiveDuration::new(Duration::from_secs(DEFAULT_STALE_ABANDON_SECS)),
-            reupload_giveup_settle: PositiveDuration::new(Duration::from_secs(
+            stale_abandon: PositiveDuration::new_panic(Duration::from_secs(
+                DEFAULT_STALE_ABANDON_SECS,
+            )),
+            reupload_giveup_settle: PositiveDuration::new_panic(Duration::from_secs(
                 DEFAULT_REUPLOAD_GIVEUP_SETTLE_SECS,
             )),
             pod_less_giveup_stale: None,
-            restore_backoff_base: PositiveDuration::new(Duration::from_secs(
+            restore_backoff_base: PositiveDuration::new_panic(Duration::from_secs(
                 DEFAULT_RESTORE_BACKOFF_BASE_SECS,
             )),
             restore_backoff_cap: PositiveDuration::new_panic(Duration::from_secs(
@@ -1193,11 +1170,9 @@ pub trait NodeDrainSink: Send + Sync + 'static {
     ///     landing can't flip legitimate in-flight rows on a node that is
     ///     no longer being drained.
     ///
-    /// The "disabled" case is filtered out at the call site
-    /// (`Option<PositiveDuration>` on `ReconcilerConfig`), so this trait
-    /// method only ever sees a positive `age` — `PositiveDuration` carries
-    /// the non-zero invariant at the type level, so no `is_zero` guard is
-    /// needed in either the dispatch or the impl.
+    /// `age` is always positive — `PositiveDuration` carries the non-zero
+    /// invariant at the type level, so no `is_zero` guard is needed in
+    /// either the dispatch or the impl.
     fn abandon_stale_resident_sandboxes(
         &self,
         node_id: NodeId,
@@ -1464,18 +1439,10 @@ pub trait NodeDrainSink: Send + Sync + 'static {
     /// must outrank recency). [`Reconciler::spawn_restores`] fills the
     /// bounded cluster restore budget in list order, so under slot pressure
     /// never-failed sandboxes win the slots, hottest first within a tier.
-    ///
-    /// `honor_backoff_windows` mirrors whether the retry backoff is enabled
-    /// ([`ReconcilerConfig::restore_backoff_base`] is `Some`): when true, a
-    /// row whose `next_restore_attempt_at` is still in the future is
-    /// excluded; when false the backoff state is ignored outright — the
-    /// window gate is skipped and the attempt-tier ordering key is dropped
-    /// (pure recency order) — so disabling the backoff immediately restores
-    /// the pre-backoff behavior even for rows carrying stale windows or
-    /// frozen attempt counts written before the disable.
+    /// A row whose `next_restore_attempt_at` is still in the future is
+    /// excluded.
     fn list_restore_pending_evacuations(
         &self,
-        honor_backoff_windows: bool,
     ) -> impl std::future::Future<Output = Result<Vec<(SandboxId, SandboxLifecycle)>, sqlx::Error>> + Send;
     /// How many evacuated `stopped` sandboxes can't serve a `start` yet:
     /// released and on no node, or claimed for re-placement and unsettled.
@@ -2047,16 +2014,7 @@ impl<S: NodeDrainSink, T: InstanceTerminator> Reconciler<S, T> {
             }
         }
 
-        // With the backoff disabled, ignore any backoff windows already
-        // written by failures before the disable — the operator's escape
-        // hatch must restore retry-next-sweep behavior immediately, not
-        // after stale windows drain.
-        let honor_backoff_windows = self.config.restore_backoff_base.is_some();
-        let pending = match self
-            .sink
-            .list_restore_pending_evacuations(honor_backoff_windows)
-            .await
-        {
+        let pending = match self.sink.list_restore_pending_evacuations().await {
             Ok(v) => v,
             Err(err) => {
                 tracing::warn!(
@@ -2111,13 +2069,11 @@ impl<S: NodeDrainSink, T: InstanceTerminator> Reconciler<S, T> {
         let mut evacuations = self.evacuations.lock().await;
         // Failed restores back off exponentially (base doubling up to cap) so
         // a deterministic failer is re-armed on a schedule instead of on every
-        // tick. `None` disables the backoff: every failure retries on the next
-        // sweep (the prior behavior). Both halves are `Copy`, captured per
-        // task below.
-        let restore_backoff = self
-            .config
-            .restore_backoff_base
-            .map(|base| (base, self.config.restore_backoff_cap));
+        // tick. Both halves are `Copy`, captured per task below.
+        let restore_backoff = (
+            self.config.restore_backoff_base,
+            self.config.restore_backoff_cap,
+        );
         for (sandbox_id, target_lifecycle) in sandboxes {
             if spawned == slots {
                 break;
@@ -2191,63 +2147,60 @@ impl<S: NodeDrainSink, T: InstanceTerminator> Reconciler<S, T> {
                         // resets via the marker-clear trigger) schedules the
                         // next attempt on the exponential backoff, keeping the
                         // sandbox out of the sweep until the window passes.
-                        if let Some((base, cap)) = restore_backoff {
-                            match sink.schedule_restore_retry(sandbox, base, cap).await {
-                                Ok(Some(attempts)) => {
-                                    tracing::info!(
+                        let (base, cap) = restore_backoff;
+                        match sink.schedule_restore_retry(sandbox, base, cap).await {
+                            Ok(Some(attempts)) => {
+                                tracing::info!(
+                                    sandbox_id = %sandbox,
+                                    attempts,
+                                    "node_drain: cohort restore retry backed off"
+                                );
+                                // An evacuated `stopped` sandbox that keeps
+                                // failing to place is the one restore
+                                // failure with nowhere to fall back to: its
+                                // source node is gone or emptied, so unlike
+                                // a `started`/`paused` restore there is no
+                                // live copy still serving the user while the
+                                // retries run. Name it at ERROR once the
+                                // retries stop looking transient, so the
+                                // responder the pending gauge pages has the
+                                // sandbox id without a log dig.
+                                if stopped_replacement_needs_escalation(target_lifecycle, attempts)
+                                {
+                                    tracing::error!(
                                         sandbox_id = %sandbox,
                                         attempts,
-                                        "node_drain: cohort restore retry backed off"
-                                    );
-                                    // An evacuated `stopped` sandbox that keeps
-                                    // failing to place is the one restore
-                                    // failure with nowhere to fall back to: its
-                                    // source node is gone or emptied, so unlike
-                                    // a `started`/`paused` restore there is no
-                                    // live copy still serving the user while the
-                                    // retries run. Name it at ERROR once the
-                                    // retries stop looking transient, so the
-                                    // responder the pending gauge pages has the
-                                    // sandbox id without a log dig.
-                                    if stopped_replacement_needs_escalation(
-                                        target_lifecycle,
-                                        attempts,
-                                    ) {
-                                        tracing::error!(
-                                            sandbox_id = %sandbox,
-                                            attempts,
-                                            "node_drain: evacuated stopped sandbox has failed \
-                                             re-placement on every attempt so far; its disk \
-                                             artifact is durable in S3 but the sandbox cannot be \
-                                             started until a re-placement lands. \
-                                             This needs an operator: check target-cohort \
-                                             capacity and placement admission, that \
-                                             SPACE_NODE_DRAIN_REPLACE_STOPPED_EVACUATIONS is \
-                                             on, and that the destination's shim, \
-                                             sandbox-manager and node-manager support stopped \
-                                             materialization"
-                                        );
-                                    }
-                                }
-                                Ok(None) => {
-                                    // Marker cleared mid-attempt: a user
-                                    // restore took the sandbox over, so the
-                                    // sweep no longer owns it and there is
-                                    // nothing to back off.
-                                    tracing::info!(
-                                        sandbox_id = %sandbox,
-                                        "node_drain: skipping restore retry backoff; \
-                                         evacuation marker cleared by a user takeover"
+                                        "node_drain: evacuated stopped sandbox has failed \
+                                         re-placement on every attempt so far; its disk \
+                                         artifact is durable in S3 but the sandbox cannot be \
+                                         started until a re-placement lands. \
+                                         This needs an operator: check target-cohort \
+                                         capacity and placement admission, that \
+                                         SPACE_NODE_DRAIN_REPLACE_STOPPED_EVACUATIONS is \
+                                         on, and that the destination's shim, \
+                                         sandbox-manager and node-manager support stopped \
+                                         materialization"
                                     );
                                 }
-                                Err(db_err) => {
-                                    tracing::warn!(
-                                        sandbox_id = %sandbox,
-                                        error = %db_err,
-                                        "node_drain: failed to record restore retry backoff; \
-                                         the next sweep may retry immediately"
-                                    );
-                                }
+                            }
+                            Ok(None) => {
+                                // Marker cleared mid-attempt: a user
+                                // restore took the sandbox over, so the
+                                // sweep no longer owns it and there is
+                                // nothing to back off.
+                                tracing::info!(
+                                    sandbox_id = %sandbox,
+                                    "node_drain: skipping restore retry backoff; \
+                                     evacuation marker cleared by a user takeover"
+                                );
+                            }
+                            Err(db_err) => {
+                                tracing::warn!(
+                                    sandbox_id = %sandbox,
+                                    error = %db_err,
+                                    "node_drain: failed to record restore retry backoff; \
+                                     the next sweep may retry immediately"
+                                );
                             }
                         }
                     }
@@ -2463,8 +2416,7 @@ impl<S: NodeDrainSink, T: InstanceTerminator> Reconciler<S, T> {
         // the `evacuation_restore_target` marker (a wedged evacuation
         // *suspend* stays eligible — nothing else recovers it), so this never
         // aborts a live restore. Done before the resident scan so
-        // the same tick sees the post-abandon set. `stale_abandon = None`
-        // disables the policy entirely — the sink call doesn't happen.
+        // the same tick sees the post-abandon set.
         //
         // **Forced mode only.** The sweep selects on age, not on liveness:
         // nothing here proves the transition is actually wedged rather than
@@ -2489,11 +2441,8 @@ impl<S: NodeDrainSink, T: InstanceTerminator> Reconciler<S, T> {
         // Either way it converges as soon as the operator escalates the drain
         // with `:drain --forced`, which rewrites the mode and re-enables this
         // sweep along with the evacuation.
-        if let Some(age) = self
-            .config
-            .stale_abandon
-            .filter(|_| mode.evacuates_residents())
-        {
+        if mode.evacuates_residents() {
+            let age = self.config.stale_abandon;
             match self
                 .sink
                 .abandon_stale_resident_sandboxes(node_id, age)
@@ -3129,71 +3078,54 @@ impl<S: NodeDrainSink, T: InstanceTerminator> Reconciler<S, T> {
                     // Current-instance backup was permanently refused because the
                     // sandbox is wedged in `restoring` on the node while the DB
                     // reads `suspended`. Retrying it every tick wedges the drain
-                    // forever. If the give-up is enabled, hand the sandbox to
-                    // the adopt-remote-snapshot path: after the settle window,
-                    // and only if the newest ready remote snapshot already
-                    // exists, it makes the row durable from that
-                    // snapshot so the node can finish draining (the sandbox
-                    // stays recoverable). `None` keeps the old retry-forever
-                    // behavior.
+                    // forever. Hand the sandbox to the adopt-remote-snapshot
+                    // path: after the settle window, and only if the newest
+                    // ready remote snapshot already exists, it makes the row
+                    // durable from that snapshot so the node can finish
+                    // draining (the sandbox stays recoverable).
                     // `gave_up_remote_snapshot` is emitted only after a row was
                     // actually made durable, so the counter reflects give-ups
                     // (not detections) and a retried refusal can't inflate it;
-                    // every other path (disabled, still settling, no ready
+                    // every other path (still settling, no ready
                     // snapshot, in-flight upload, drifted, or a DB error) leaves
                     // the sandbox blocking and is counted as a retry.
-                    let outcome = match self.config.reupload_giveup_settle {
-                        None => {
+                    let settle = self.config.reupload_giveup_settle;
+                    let outcome = match self
+                        .sink
+                        .make_sandbox_durable_from_remote_snapshot(sandbox_id, node_id, settle)
+                        .await
+                    {
+                        Ok(0) => {
+                            tracing::info!(
+                                node_id = %node_id,
+                                sandbox_id = %sandbox_id,
+                                detail = %detail,
+                                "node_drain: reupload refused (sandbox restoring on \
+                                 node); awaiting settle window / newest ready \
+                                 remote snapshot"
+                            );
+                            "restoring_retry"
+                        }
+                        Ok(_) => {
                             tracing::warn!(
                                 node_id = %node_id,
                                 sandbox_id = %sandbox_id,
                                 detail = %detail,
-                                "node_drain: reupload refused (sandbox restoring on node); \
-                                 give-up disabled, will retry on next tick"
+                                "node_drain: reupload permanently refused (sandbox \
+                                 restoring on node); adopted newest ready remote \
+                                 snapshot and abandoned local promotion so drain proceeds"
                             );
-                            "failed"
+                            "gave_up_remote_snapshot"
                         }
-                        Some(settle) => {
-                            match self
-                                .sink
-                                .make_sandbox_durable_from_remote_snapshot(
-                                    sandbox_id, node_id, settle,
-                                )
-                                .await
-                            {
-                                Ok(0) => {
-                                    tracing::info!(
-                                        node_id = %node_id,
-                                        sandbox_id = %sandbox_id,
-                                        detail = %detail,
-                                        "node_drain: reupload refused (sandbox restoring on \
-                                         node); awaiting settle window / newest ready \
-                                         remote snapshot"
-                                    );
-                                    "restoring_retry"
-                                }
-                                Ok(_) => {
-                                    tracing::warn!(
-                                        node_id = %node_id,
-                                        sandbox_id = %sandbox_id,
-                                        detail = %detail,
-                                        "node_drain: reupload permanently refused (sandbox \
-                                         restoring on node); adopted newest ready remote \
-                                         snapshot and abandoned local promotion so drain proceeds"
-                                    );
-                                    "gave_up_remote_snapshot"
-                                }
-                                Err(db_err) => {
-                                    tracing::warn!(
-                                        node_id = %node_id,
-                                        sandbox_id = %sandbox_id,
-                                        error = %db_err,
-                                        "node_drain: failed to adopt remote snapshot for \
-                                         restoring-on-node sandbox; will retry on next tick"
-                                    );
-                                    "restoring_retry"
-                                }
-                            }
+                        Err(db_err) => {
+                            tracing::warn!(
+                                node_id = %node_id,
+                                sandbox_id = %sandbox_id,
+                                error = %db_err,
+                                "node_drain: failed to adopt remote snapshot for \
+                                 restoring-on-node sandbox; will retry on next tick"
+                            );
+                            "restoring_retry"
                         }
                     };
                     node_drain_metrics::local_snapshot_promotion(&node_label, outcome);
@@ -3256,13 +3188,6 @@ impl<S: NodeDrainSink, T: InstanceTerminator> Reconciler<S, T> {
     /// fail), so a same-name kube Node replacement that registered after the
     /// EC2 cross-check refuses them rather than having its fresh sandboxes
     /// adopted from old snapshots or terminally failed.
-    ///
-    /// Gated on the same `reupload_giveup_settle` knob as the reupload
-    /// give-up: `None` disables every automatic give-up, so operators who
-    /// opted out keep park-forever semantics. The mark-lost arm is withheld
-    /// together with the adopt arm — running it alone could terminally fail
-    /// a row whose ready-but-placement-stale snapshot the adopt CAS would
-    /// have recovered.
     async fn give_up_local_only_on_gone_node(
         &self,
         node_id: NodeId,
@@ -3273,16 +3198,7 @@ impl<S: NodeDrainSink, T: InstanceTerminator> Reconciler<S, T> {
         if local_only.is_empty() {
             return;
         }
-        let Some(settle) = self.config.reupload_giveup_settle else {
-            tracing::warn!(
-                node_id = %node_id,
-                pinned = local_only.len(),
-                "node_drain: kube Node gone and EC2 instance terminated, but the \
-                 give-up is disabled (the reupload give-up settle window=0); \
-                 pinned local-only sandboxes keep blocking the drain"
-            );
-            return;
-        };
+        let settle = self.config.reupload_giveup_settle;
         // Pure SQL per sandbox (no node RPC can exist for a gone node), so a
         // wider per-tick cap than the RPC-bound promote path is safe; still
         // bounded so one dead node with a deep backlog can't monopolize the

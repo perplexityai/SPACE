@@ -603,7 +603,7 @@ async fn a_re_placement_every_worker_excludes_waits_unschedulable_and_backs_off(
         )
         .await?;
     assert_eq!(attempts, Some(1), "the failure must arm the backoff");
-    let sweep = restore_pending_evacuations_query(true);
+    let sweep = restore_pending_evacuations_query();
     let swept: Vec<(SandboxId, String)> = sqlx::query_as(sqlx::AssertSqlSafe(sql!(sweep.as_str())))
         .fetch_all(pool)
         .await?;
@@ -794,7 +794,7 @@ async fn a_stopped_re_placement_that_never_confirms_backs_off_out_of_the_only_sl
     .bind(stuck)
     .execute(pool)
     .await?;
-    let listed = sink.list_restore_pending_evacuations(true).await?;
+    let listed = sink.list_restore_pending_evacuations().await?;
     assert_eq!(
         listed,
         vec![

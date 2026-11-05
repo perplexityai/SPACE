@@ -96,15 +96,6 @@ pub struct ReconcilerConfig {
     /// while `node_drain` is disabled.
     pub enabled: bool,
     pub tick: Duration,
-    /// Gate for the KubeNodeGone mark-lost give-up: when the guarded
-    /// hard-delete of a gone-node `drained` row is refused by the snapshot
-    /// guard and the backing EC2 instance is confirmed terminated, mark the
-    /// blocking suspended sandboxes that have no recoverable copy anywhere
-    /// as `lifecycle = 'failed'` so the reap converges on the next tick.
-    /// Always `true` in production configuration: once the instance is
-    /// confirmed terminated, the row is flipped to `lost`. Tests set `false`
-    /// to exercise the parked path.
-    pub mark_lost_enabled: bool,
 }
 
 impl Default for ReconcilerConfig {
@@ -112,7 +103,6 @@ impl Default for ReconcilerConfig {
         Self {
             enabled: false,
             tick: DEFAULT_TICK,
-            mark_lost_enabled: true,
         }
     }
 }
@@ -131,7 +121,6 @@ impl ReconcilerConfig {
             enabled: config
                 .truthy_default("SPACE_DRAINED_NODE_TERMINATOR_ENABLED", default.enabled),
             tick: default.tick,
-            mark_lost_enabled: true,
         }
     }
 }
@@ -405,9 +394,6 @@ pub struct Reconciler<S: DrainedNodeTerminatorSink, A: DrainKeepAnnotationLookup
     /// when absent, a missing k8s Node is parked for manual review exactly
     /// as before this recovery path existed.
     instance_lookup: Option<Arc<dyn InstanceStateLookup>>,
-    /// Gate for the KubeNodeGone mark-lost give-up. See
-    /// [`ReconcilerConfig::mark_lost_enabled`].
-    mark_lost_enabled: bool,
     /// Paces the per-node "delete refused" WARN at [`REFUSAL_WARN_INTERVAL`].
     /// Pruned every tick down to the nodes still listed as `drained`, so a
     /// converged or undrained node can't leak its slot.
@@ -418,22 +404,18 @@ impl<S: DrainedNodeTerminatorSink, A: DrainKeepAnnotationLookup> Reconciler<S, A
     /// `instance_lookup` is the EC2 cross-check for the KubeNodeGone
     /// recovery path; pass `None` on substrates without a real EC2
     /// (`kube-delete` / `noop`), where a missing k8s Node is parked for
-    /// manual review exactly as before this recovery path existed.
-    /// `mark_lost_enabled` gates the KubeNodeGone mark-lost give-up
-    /// (see [`ReconcilerConfig::mark_lost_enabled`]); it is only reachable
-    /// when `instance_lookup` is present, since the give-up requires an EC2
-    /// `Gone` verdict.
+    /// manual review exactly as before this recovery path existed. The
+    /// KubeNodeGone mark-lost give-up is only reachable when
+    /// `instance_lookup` is present, since it requires an EC2 `Gone` verdict.
     pub fn new(
         sink: S,
         annotation_lookup: A,
         instance_lookup: Option<Arc<dyn InstanceStateLookup>>,
-        mark_lost_enabled: bool,
     ) -> Self {
         Self {
             sink: Arc::new(sink),
             annotation_lookup: Arc::new(annotation_lookup),
             instance_lookup,
-            mark_lost_enabled,
             refusal_warn_pacer: PerNodeWarnPacer::new(REFUSAL_WARN_INTERVAL),
         }
     }
@@ -686,7 +668,9 @@ impl<S: DrainedNodeTerminatorSink, A: DrainKeepAnnotationLookup> Reconciler<S, A
     /// Mark-lost give-up half of the KubeNodeGone recovery. Called only from
     /// the EC2-`Gone` arm after the guarded delete was refused; fires only
     /// when the snapshot guard is among the refusers (those are its only
-    /// candidates) and the give-up is enabled. The SQL re-checks every
+    /// candidates). It marks the blocking suspended sandboxes that have no
+    /// recoverable copy anywhere as `lifecycle = 'failed'` so the reap
+    /// converges on the next tick. The SQL re-checks every
     /// guard — lifecycle, portability, in-flight uploads from still-live
     /// nodes, kube-uid identity, drain phase — atomically, so the
     /// possibly-stale `refusal` diagnosis is only a pre-filter here.
@@ -699,17 +683,6 @@ impl<S: DrainedNodeTerminatorSink, A: DrainKeepAnnotationLookup> Reconciler<S, A
         refusal: &OrphanDeleteRefusal,
     ) -> usize {
         if refusal.snapshot_blockers == 0 {
-            return 0;
-        }
-        if !self.mark_lost_enabled {
-            tracing::info!(
-                node_id = %node_id,
-                snapshot_blockers = refusal.snapshot_blockers,
-                "drained_node_terminator: gone-node reap blocked by non-portable \
-                 sandboxes whose instance is terminated; mark-lost give-up disabled \
-                 (the fixed-enabled mark-lost policy unset), leaving \
-                 them suspended"
-            );
             return 0;
         }
         match self
@@ -852,15 +825,9 @@ pub async fn run<S: DrainedNodeTerminatorSink, A: DrainKeepAnnotationLookup>(
     tracing::info!(
         tick_secs = config.tick.as_secs(),
         ec2_cross_check = instance_lookup.is_some(),
-        mark_lost_enabled = config.mark_lost_enabled,
         "starting drained-node-terminator reconciler"
     );
-    let reconciler = Reconciler::new(
-        sink,
-        annotation_lookup,
-        instance_lookup,
-        config.mark_lost_enabled,
-    );
+    let reconciler = Reconciler::new(sink, annotation_lookup, instance_lookup);
     let mut interval = tokio::time::interval(config.tick);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // Consume the immediate first tick without processing. This gives

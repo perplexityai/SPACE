@@ -26,8 +26,7 @@
 //! - T6d `t6d_kube_node_gone_ec2_terminated_but_delete_guard_refuses_parks`
 //! - T6e `t6e_kube_node_gone_ec2_terminated_delete_db_error_parks`
 //! - T6f `t6f_kube_node_gone_threads_observed_uid_into_delete`
-//! - T6g `t6g_mark_lost_disabled_leaves_blocking_sandboxes_suspended`
-//! - T6h `t6h_mark_lost_enabled_marks_blocking_sandboxes_and_threads_uid`
+//! - T6h `t6h_mark_lost_flips_blocking_sandboxes_and_threads_uid`
 //! - T6i `t6i_mark_lost_not_attempted_without_snapshot_blockers`
 //! - T6j `t6j_mark_lost_db_error_parks_without_counting`
 //! - T6k `t6k_mark_lost_empty_result_counts_nothing`
@@ -263,13 +262,12 @@ fn forced_db_err(msg: &str) -> sqlx::Error {
 /// so tests only create one object. The shared Arc survives after `new_reconciler`
 /// returns so tests can assert on sink state post-tick.
 fn new_reconciler(sink: StdArc<FakeSink>) -> Reconciler<StdArc<FakeSink>, StdArc<FakeSink>> {
-    Reconciler::new(StdArc::clone(&sink), sink, None, false)
+    Reconciler::new(StdArc::clone(&sink), sink, None)
 }
 
 /// Like [`new_reconciler`], but wires the same fake as the EC2 cross-check so
 /// the KubeNodeGone recovery path is exercised. Mirrors the production wiring
-/// on the `aws` terminator deploy with the mark-lost give-up at its default
-/// (disabled).
+/// on the `aws` terminator deploy.
 fn new_reconciler_with_ec2(
     sink: StdArc<FakeSink>,
 ) -> Reconciler<StdArc<FakeSink>, StdArc<FakeSink>> {
@@ -280,21 +278,6 @@ fn new_reconciler_with_ec2(
         StdArc::clone(&sink),
         StdArc::clone(&sink),
         Some(instance_lookup),
-        false,
-    )
-}
-
-/// Like [`new_reconciler_with_ec2`], with the KubeNodeGone mark-lost give-up
-/// enabled.
-fn new_reconciler_with_ec2_mark_lost(
-    sink: StdArc<FakeSink>,
-) -> Reconciler<StdArc<FakeSink>, StdArc<FakeSink>> {
-    let instance_lookup = StdArc::clone(&sink);
-    Reconciler::new(
-        StdArc::clone(&sink),
-        StdArc::clone(&sink),
-        Some(instance_lookup),
-        true,
     )
 }
 
@@ -492,7 +475,6 @@ fn c1_defaults_when_env_unset() {
     let cfg = ReconcilerConfig::from_environment(&env);
     assert!(!cfg.enabled);
     assert_eq!(cfg.tick, DEFAULT_TICK);
-    assert!(cfg.mark_lost_enabled);
 }
 
 #[test]
@@ -530,7 +512,6 @@ async fn r1_enabled_false_returns_on_shutdown_without_ticking() {
     let cfg = ReconcilerConfig {
         enabled: false,
         tick: Duration::from_millis(1),
-        mark_lost_enabled: false,
     };
     let runner = tokio::spawn(run(
         cfg,
@@ -564,7 +545,6 @@ async fn r2_enabled_true_ticks_until_shutdown() {
     let cfg = ReconcilerConfig {
         enabled: true,
         tick: Duration::from_millis(5),
-        mark_lost_enabled: false,
     };
     let token = CancellationToken::new();
 
@@ -884,35 +864,10 @@ fn snapshot_guard_refusal(blockers: i64) -> OrphanDeleteRefusal {
 }
 
 #[tokio::test]
-async fn t6g_mark_lost_disabled_leaves_blocking_sandboxes_suspended() {
-    // EC2 confirms terminated and the snapshot guard refuses the reap, but
-    // the give-up gate is at its default (disabled): the terminal flip must
-    // not be attempted, and the row parks exactly as before.
-    let node = NodeId::new();
-    let sink = FakeSink::new();
-    sink.set_drained_list(vec![node]);
-    sink.set_phase(node, PHASE_DRAINED);
-    sink.set_keep_error(node, AnnotationLookupError::KubeNodeGone);
-    sink.set_instance_terminated(node);
-    sink.set_delete_refused(node, snapshot_guard_refusal(2));
-
-    let reconciler = new_reconciler_with_ec2(StdArc::clone(&sink));
-    let report = reconciler.tick().await;
-
-    assert!(
-        sink.mark_lost_calls().is_empty(),
-        "the disabled give-up must never reach the sink"
-    );
-    assert_eq!(report.sandboxes_marked_lost, 0);
-    assert_eq!(report.kube_node_gone_parked, 1);
-    assert_eq!(sink.current_phase(node).as_deref(), Some(PHASE_DRAINED));
-}
-
-#[tokio::test]
-async fn t6h_mark_lost_enabled_marks_blocking_sandboxes_and_threads_uid() {
-    // The give-up fires: snapshot guard refused, EC2 terminated, gate
-    // enabled. The observed kube uid must be threaded into the sink (the SQL
-    // re-checks identity with it), the marked count lands in the report, and
+async fn t6h_mark_lost_flips_blocking_sandboxes_and_threads_uid() {
+    // The give-up fires: snapshot guard refused, EC2 terminated. The observed
+    // kube uid must be threaded into the sink (the SQL re-checks identity
+    // with it), the marked count lands in the report, and
     // the node still parks this tick — convergence is the *next* tick's
     // delete, never a same-tick retry.
     let node = NodeId::new();
@@ -927,7 +882,7 @@ async fn t6h_mark_lost_enabled_marks_blocking_sandboxes_and_threads_uid() {
     sink.set_delete_refused(node, snapshot_guard_refusal(2));
     sink.set_mark_lost_result(node, vec![lost_a, lost_b]);
 
-    let reconciler = new_reconciler_with_ec2_mark_lost(StdArc::clone(&sink));
+    let reconciler = new_reconciler_with_ec2(StdArc::clone(&sink));
     let report = reconciler.tick().await;
 
     assert_eq!(
@@ -964,7 +919,7 @@ async fn t6i_mark_lost_not_attempted_without_snapshot_blockers() {
         },
     );
 
-    let reconciler = new_reconciler_with_ec2_mark_lost(StdArc::clone(&sink));
+    let reconciler = new_reconciler_with_ec2(StdArc::clone(&sink));
     let report = reconciler.tick().await;
 
     assert!(
@@ -986,7 +941,7 @@ async fn t6j_mark_lost_db_error_parks_without_counting() {
     sink.set_delete_refused(node, snapshot_guard_refusal(1));
     sink.inject_fail_mark_lost("simulated DB error");
 
-    let reconciler = new_reconciler_with_ec2_mark_lost(StdArc::clone(&sink));
+    let reconciler = new_reconciler_with_ec2(StdArc::clone(&sink));
     let report = reconciler.tick().await;
 
     assert_eq!(sink.mark_lost_calls().len(), 1);
@@ -1012,7 +967,7 @@ async fn t6k_mark_lost_empty_result_counts_nothing() {
     sink.set_instance_terminated(node);
     sink.set_delete_refused(node, snapshot_guard_refusal(1));
 
-    let reconciler = new_reconciler_with_ec2_mark_lost(StdArc::clone(&sink));
+    let reconciler = new_reconciler_with_ec2(StdArc::clone(&sink));
     let report = reconciler.tick().await;
 
     assert_eq!(sink.mark_lost_calls().len(), 1);
