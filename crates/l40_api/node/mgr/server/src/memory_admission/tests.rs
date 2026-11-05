@@ -24,6 +24,38 @@ fn sources(total_mib: u64, available_mib: u64) -> (tempfile::TempDir, MemoryAdmi
     (root, sources)
 }
 
+#[tokio::test]
+async fn parent_cap_does_not_limit_total_vm_reservations() {
+    let (_root, sources) = sources(65_536, 15_872);
+    for (file, mib) in [("memory.current", 49_152u64), ("memory.max", 58_982)] {
+        std::fs::write(
+            sources.firecracker_cgroup_base.join(file),
+            (mib * BYTES_PER_MIB).to_string(),
+        )
+        .unwrap();
+    }
+    let active_leases: Vec<_> = (1..=6)
+        .map(|slot_id| {
+            let id = sandbox_id(&format!("019f0000-0000-7000-8000-{slot_id:012}"));
+            write_cgroup(&sources, id, 8192, 16_512);
+            ActiveLeaseMemoryReservation {
+                slot_id,
+                sandbox_id: id,
+                generation: 1,
+                memory_reservation_mib: 16_512,
+            }
+        })
+        .collect();
+
+    // 107392 MiB of total reservations exceeds the 58982 MiB parent cap,
+    // but measured usage plus the existing host growth allowance still fits.
+    let measurement = MemoryAdmissionConfig::default()
+        .evaluate_new_allocation(8320, &active_leases, &sources)
+        .await
+        .expect("the parent cap must not introduce reservation-based refusal");
+    assert_eq!(measurement.required_mib, 65_152);
+}
+
 fn write_cgroup(
     sources: &MemoryAdmissionSources,
     sandbox_id: SandboxId,

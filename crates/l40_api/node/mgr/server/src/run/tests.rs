@@ -14,6 +14,7 @@ fn configuration_precedence_and_owned_sections() {
     for section in [
         "network_pool",
         "sandbox_cgroup",
+        "sandbox_parent_memory",
         "memory_admission",
         "disk_io_reservation",
     ] {

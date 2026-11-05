@@ -194,7 +194,11 @@ pub enum RunNodeMgrError {
     #[error("failed to apply sandbox parent CPU limit: {0}")]
     ApplyParentCpuLimit(String),
     #[error("failed to apply sandbox parent memory limit: {0}")]
-    ApplyParentMemoryLimit(String),
+    ApplyParentMemoryLimit(#[from] crate::cgroup::ParentMemoryLimitError),
+    #[error("cannot determine host memory for sandbox parent limit: {0}")]
+    ParentHostMemory(#[source] crate::memory_admission::NodeMemoryCapacityError),
+    #[error("sandbox parent memory setup task failed: {0}")]
+    ParentMemoryTask(#[source] tokio::task::JoinError),
     #[error("failed to apply sandbox parent disk I/O reservation: {0}")]
     ApplyParentDiskIoReservation(String),
     #[error("failed to migrate node-manager's SQLite database: {0}")]
@@ -218,6 +222,7 @@ pub enum RunNodeMgrError {
 struct NodeConfig {
     network_pool: NetworkPoolFileConfig,
     sandbox_cgroup: SandboxCgroupFileConfig,
+    sandbox_parent_memory: SandboxParentMemoryFileConfig,
     memory_admission: MemoryAdmissionFileConfig,
     disk_io_reservation: DiskIoReservationFileConfig,
 }
@@ -252,6 +257,12 @@ struct NetworkPoolFileConfig {
 struct SandboxCgroupFileConfig {
     vcpu_count: Option<u32>,
     memory_mib: Option<u64>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct SandboxParentMemoryFileConfig {
+    max_host_percent: Option<u32>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -595,6 +606,22 @@ pub async fn run(
     let file = read_node_config(&cli.config_path)?;
     let pool_config = resolve_pool_config(&cli, &file.network_pool)?;
     let sandbox_cgroup_config = resolve_sandbox_cgroup_config(&cli, &file.sandbox_cgroup)?;
+    let parent_memory_max_host_percent = setting(
+        "sandbox_parent_memory.max_host_percent",
+        None,
+        env_u32(&["SPACE_NODEMGR_SANDBOX_PARENT_MEMORY_MAX_HOST_PERCENT"])?,
+        file.sandbox_parent_memory.max_host_percent,
+        crate::cgroup::DEFAULT_PARENT_MEMORY_MAX_HOST_PERCENT,
+    );
+    let host_memory = crate::memory_admission::read_node_memory_snapshot()
+        .await
+        .map_err(RunNodeMgrError::ParentHostMemory)?;
+    let parent_memory_limit = crate::cgroup::ParentMemoryLimit::for_host(
+        sandbox_cgroup_config.memory_mib_or_default(),
+        pool_config.max_slots,
+        host_memory.total_mib,
+        parent_memory_max_host_percent,
+    )?;
     let memory_admission_config = resolve_memory_admission_config(&cli, &file.memory_admission)?;
     let mut disk_io_reservation_config =
         resolve_disk_io_reservation_config(file.disk_io_reservation)?;
@@ -675,11 +702,15 @@ pub async fn run(
     let sandbox_parent_cpu_limit =
         crate::cgroup::apply_parent_cpu_reservation(parent_cpu_reserved_count)
             .map_err(RunNodeMgrError::ApplyParentCpuLimit)?;
-    let sandbox_parent_memory_limit = crate::cgroup::apply_parent_memory_limit(
-        sandbox_cgroup_config.memory_mib_or_default(),
-        pool_config.max_slots,
-    )
-    .map_err(RunNodeMgrError::ApplyParentMemoryLimit)?;
+    let memory_setup_mutex = service_mutex.clone();
+    let sandbox_parent_memory_limit = tokio::task::spawn_blocking(move || {
+        // A memory.max write can reclaim or OOM existing workloads. Keep the
+        // startup ownership fence even if the awaiting future is cancelled.
+        let _mutex = memory_setup_mutex;
+        crate::cgroup::apply_parent_memory_limit(parent_memory_limit)
+    })
+    .await
+    .map_err(RunNodeMgrError::ParentMemoryTask)??;
     let sandbox_parent_disk_io_reservation =
         crate::disk_io_reservation::apply_parent_disk_io_reservation(&disk_io_reservation_config)
             .map_err(RunNodeMgrError::ApplyParentDiskIoReservation)?;
@@ -839,6 +870,9 @@ pub async fn run(
             sandbox_cgroup_parent_cpu_max = sandbox_parent_cpu_limit.cpu_max,
             sandbox_cgroup_parent_memory_mib = sandbox_parent_memory_limit.sandbox_cgroup_memory_mib,
             sandbox_cgroup_parent_memory_max_slots = sandbox_parent_memory_limit.max_slots,
+            sandbox_cgroup_parent_memory_host_total_mib = sandbox_parent_memory_limit.host_total_mib,
+            sandbox_cgroup_parent_memory_max_host_percent = sandbox_parent_memory_limit.max_host_percent,
+            sandbox_cgroup_parent_memory_effective_mib = sandbox_parent_memory_limit.memory_max_mib,
             sandbox_cgroup_parent_memory_max = sandbox_parent_memory_limit.memory_max,
             sandbox_cgroup_parent_memory_swap_max = sandbox_parent_memory_limit.memory_swap_max,
             sandbox_cgroup_parent_disk_io_mode = sandbox_parent_disk_io_reservation.mode(),

@@ -259,6 +259,11 @@ pub enum NodeMemoryCapacityError {
     AvailableExceedsTotal { total_mib: u64, available_mib: u64 },
 }
 
+pub(crate) async fn read_node_memory_snapshot()
+-> Result<NodeMemorySnapshot, NodeMemoryCapacityError> {
+    read_node_memory_snapshot_from(Path::new(PROC_MEMINFO_PATH)).await
+}
+
 async fn read_node_memory_snapshot_from(
     path: &Path,
 ) -> Result<NodeMemorySnapshot, NodeMemoryCapacityError> {

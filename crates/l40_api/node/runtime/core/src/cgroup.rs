@@ -17,6 +17,8 @@ pub const DEFAULT_SANDBOX_MEMORY_HEADROOM_MIB: u64 = 128;
 pub const DEFAULT_MEMORY_MAX_MIB: u64 =
     DEFAULT_SANDBOX_GUEST_MEMORY_MAX_MIB + DEFAULT_SANDBOX_MEMORY_HEADROOM_MIB;
 pub const DEFAULT_PARENT_CPU_RESERVED_COUNT: u32 = 2;
+/// The aggregate sandbox budget is static until node-manager restarts.
+pub const DEFAULT_PARENT_MEMORY_MAX_HOST_PERCENT: u32 = 90;
 const MIB_BYTES: u64 = 1024 * 1024;
 const CGROUP_CPU_PERIOD_US: u64 = 100_000;
 
@@ -174,11 +176,77 @@ pub struct ParentCpuLimit {
     pub cpu_max: String,
 }
 
+#[derive(Debug)]
 pub struct ParentMemoryLimit {
     pub sandbox_cgroup_memory_mib: u64,
     pub max_slots: u32,
+    pub host_total_mib: u64,
+    pub max_host_percent: u32,
+    pub memory_max_mib: u64,
     pub memory_max: String,
     pub memory_swap_max: String,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ParentMemoryLimitError {
+    #[error("sandbox parent max_host_percent must be in 1..=100, got {0}")]
+    InvalidPercent(u32),
+    #[error("sandbox cgroup memory must exceed {DEFAULT_SANDBOX_MEMORY_HEADROOM_MIB} MiB")]
+    InvalidChildLimit,
+    #[error("sandbox parent memory budget must be positive and fit in u64 bytes")]
+    InvalidBudget,
+    #[error(transparent)]
+    Write(#[from] CgroupUpdateError),
+    #[error("failed to read back {path}: {source}")]
+    Read {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("{path} read back {actual:?}, expected {expected:?}")]
+    Readback {
+        path: PathBuf,
+        expected: String,
+        actual: String,
+    },
+}
+
+impl ParentMemoryLimit {
+    /// Cap the logical slot budget at a percentage of physical host MemTotal.
+    /// Round down to MiB; never floor the result at one child or current usage.
+    pub fn for_host(
+        sandbox_cgroup_memory_mib: u64,
+        max_slots: u32,
+        host_total_mib: u64,
+        max_host_percent: u32,
+    ) -> Result<Self, ParentMemoryLimitError> {
+        if !(1..=100).contains(&max_host_percent) {
+            return Err(ParentMemoryLimitError::InvalidPercent(max_host_percent));
+        }
+        if sandbox_cgroup_memory_mib <= DEFAULT_SANDBOX_MEMORY_HEADROOM_MIB {
+            return Err(ParentMemoryLimitError::InvalidChildLimit);
+        }
+        let slot_budget_mib = sandbox_cgroup_total_memory_mib(sandbox_cgroup_memory_mib, max_slots)
+            .ok_or(ParentMemoryLimitError::InvalidBudget)?;
+        let host_budget_mib = host_total_mib
+            .checked_mul(u64::from(max_host_percent))
+            .ok_or(ParentMemoryLimitError::InvalidBudget)?
+            / 100;
+        let memory_max_mib = slot_budget_mib.min(host_budget_mib);
+        let memory_max_bytes = memory_max_mib
+            .checked_mul(MIB_BYTES)
+            .filter(|bytes| *bytes > 0)
+            .ok_or(ParentMemoryLimitError::InvalidBudget)?;
+        Ok(Self {
+            sandbox_cgroup_memory_mib,
+            max_slots,
+            host_total_mib,
+            max_host_percent,
+            memory_max_mib,
+            memory_max: memory_max_bytes.to_string(),
+            memory_swap_max: "0".to_string(),
+        })
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -299,37 +367,43 @@ pub fn sandbox_cgroup_total_memory_mib(
 }
 
 pub fn apply_parent_memory_limit(
-    sandbox_cgroup_memory_mib: u64,
-    max_slots: u32,
-) -> Result<ParentMemoryLimit, String> {
-    if sandbox_cgroup_memory_mib <= DEFAULT_SANDBOX_MEMORY_HEADROOM_MIB {
-        return Err(format!(
-            "sandbox cgroup memory must be greater than {} MiB",
-            DEFAULT_SANDBOX_MEMORY_HEADROOM_MIB
-        ));
+    limit: ParentMemoryLimit,
+) -> Result<ParentMemoryLimit, ParentMemoryLimitError> {
+    apply_parent_memory_limit_at(Path::new(CGROUP_BASE), limit)
+}
+
+fn apply_parent_memory_limit_at(
+    parent: &Path,
+    limit: ParentMemoryLimit,
+) -> Result<ParentMemoryLimit, ParentMemoryLimitError> {
+    // Set individual-victim OOM semantics before installing the hard cap.
+    // Clear any old throttle only after the hard cap is in place.
+    let controls = [
+        ("memory.oom.group", "0"),
+        ("memory.swap.max", limit.memory_swap_max.as_str()),
+        ("memory.max", limit.memory_max.as_str()),
+        ("memory.high", "max"),
+    ];
+    for (file, value) in controls {
+        write_cgroup_file_typed(parent, file, value)?;
     }
-
-    let total_memory_mib =
-        sandbox_cgroup_total_memory_mib(sandbox_cgroup_memory_mib, max_slots).ok_or_else(|| {
-            format!(
-                "sandbox parent memory overflow: {sandbox_cgroup_memory_mib} MiB * {max_slots} slots"
-            )
+    // Writes are not transactional. On any error startup fails; never silently
+    // restore a larger budget or admit work under a partially applied policy.
+    for (file, expected) in controls {
+        let path = parent.join(file);
+        let actual = fs::read_to_string(&path).map_err(|source| ParentMemoryLimitError::Read {
+            path: path.clone(),
+            source,
         })?;
-    let memory_max_bytes = total_memory_mib.checked_mul(MIB_BYTES).ok_or_else(|| {
-        format!("sandbox parent memory overflow: {total_memory_mib} MiB to bytes")
-    })?;
-    let memory_max = memory_max_bytes.to_string();
-    let memory_swap_max = "0".to_string();
-
-    write_cgroup_file(CGROUP_BASE, "memory.max", &memory_max)?;
-    write_cgroup_file(CGROUP_BASE, "memory.swap.max", &memory_swap_max)?;
-
-    Ok(ParentMemoryLimit {
-        sandbox_cgroup_memory_mib,
-        max_slots,
-        memory_max,
-        memory_swap_max,
-    })
+        if actual.trim() != expected {
+            return Err(ParentMemoryLimitError::Readback {
+                path,
+                expected: expected.to_string(),
+                actual,
+            });
+        }
+    }
+    Ok(limit)
 }
 
 fn parent_cpu_max_value(reserved_count: u32) -> String {
