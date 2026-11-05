@@ -2376,6 +2376,7 @@ pub(crate) mod service_tests {
                     ),
                     open_claim: None,
                     runtime_upgrade: None,
+                    expected_node_execution: None,
                 },
             )
             .unwrap()

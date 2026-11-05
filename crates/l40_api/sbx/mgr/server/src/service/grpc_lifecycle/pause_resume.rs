@@ -554,6 +554,31 @@ impl SandboxManagerService {
                     "a runtime upgrade wake requires start_context and blocking STARTED",
                 ));
             }
+            // A Kubernetes sandbox launches in its pod's shim at container
+            // create, which never sees this Wake, and the Wake has no pod
+            // namespace to boot in. Its upgrade is the pod's own
+            // `runtime-upgrade` checkpoint, so here it is refused before
+            // anything is staged, fenced or booted. Whether the sandbox is a
+            // Kubernetes one is the request's identity or, for a sandbox the
+            // node holds, its row's, so for a sandbox here a request that
+            // leaves its substrate out can't pass for a Direct one. One that
+            // names neither substrate nor pod for a sandbox the node doesn't
+            // hold is an identity-free Direct activation.
+            let kubernetes = |identity: &pplx_space_common_core::types::SpaceApiRouteIdentity| {
+                identity.effective_substrate_kind()
+                    == Some(pplx_space_common_core::types::NodeManagedBy::Kubernetes)
+            };
+            let row_kubernetes = match self.lookup_sandbox(&req.sandbox_id) {
+                Ok(row) => kubernetes(&row.space_api_route_identity),
+                Err(status) if status.code() == tonic::Code::NotFound => false,
+                Err(status) => return Err(status),
+            };
+            if kubernetes(&start.space_api_route_identity) || row_kubernetes {
+                return Err(Status::failed_precondition(
+                    "a Kubernetes sandbox's runtime upgrade runs in its pod's shim through the \
+                     runtime-upgrade checkpoint, never from a Wake",
+                ));
+            }
             start.runtime_upgrade = Some(super::super::runtime_upgrade::WakeRuntimeUpgrade::parse(
                 upgrade,
                 request.metadata().clone(),

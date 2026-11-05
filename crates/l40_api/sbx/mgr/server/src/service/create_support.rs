@@ -612,7 +612,7 @@ pub(super) enum CheckpointRestoreRetryAction {
     Reject,
 }
 
-fn checkpoint_start_response_for_live_runtime(
+pub(super) fn checkpoint_start_response_for_live_runtime(
     existing: &crate::db::SandboxRow,
     runtime_live: bool,
 ) -> Option<StartResponse> {

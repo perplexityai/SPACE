@@ -222,6 +222,13 @@ impl SandboxManager for SandboxManagerService {
         SandboxManagerService::upgrade_runtime(self, request).await
     }
 
+    async fn get_runtime_upgrade(
+        &self,
+        request: Request<crate::proto::GetRuntimeUpgradeRequest>,
+    ) -> Result<Response<crate::proto::GetRuntimeUpgradeResponse>, Status> {
+        SandboxManagerService::get_runtime_upgrade(self, &request).map(Response::new)
+    }
+
     async fn kill(&self, request: Request<KillRequest>) -> Result<Response<KillResponse>, Status> {
         record_entry_sandbox_id(&request.get_ref().sandbox_id);
         SandboxManagerService::kill(self, request).await

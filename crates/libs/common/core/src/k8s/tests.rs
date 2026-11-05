@@ -608,6 +608,7 @@ fn build_sandbox_pod_direct_restore_keeps_artifact_kind_and_node_assignment() {
                 extra_tolerations: &[],
                 extra_required_affinity: None,
                 node_group_placement: None,
+                runtime_upgrade: None,
             },
         );
 
@@ -826,6 +827,7 @@ fn build_sandbox_pod_source_pinned_restore_skips_node_services_bias() {
             extra_required_affinity: None,
             fork_disk_restore: None,
             node_group_placement: None,
+            runtime_upgrade: None,
         },
     );
 
@@ -936,6 +938,7 @@ fn sandbox_pod_shapes_render_expected_yaml() {
             extra_tolerations: &[],
             extra_required_affinity: None,
             node_group_placement: None,
+            runtime_upgrade: None,
         },
     );
     let restore_portable = build_sandbox_pod(
@@ -960,6 +963,7 @@ fn sandbox_pod_shapes_render_expected_yaml() {
             extra_tolerations: &[],
             extra_required_affinity: None,
             node_group_placement: None,
+            runtime_upgrade: None,
         },
     );
     // Source-aware hard pin on: the same portable restore renders a required
@@ -991,6 +995,7 @@ fn sandbox_pod_shapes_render_expected_yaml() {
             extra_tolerations: &[],
             extra_required_affinity: None,
             node_group_placement: None,
+            runtime_upgrade: None,
         },
     );
     // Shortlist mode: ORed required terms for source + fallbacks, the
@@ -1024,6 +1029,7 @@ fn sandbox_pod_shapes_render_expected_yaml() {
             extra_tolerations: &[],
             extra_required_affinity: None,
             node_group_placement: None,
+            runtime_upgrade: None,
         },
     );
     let restore_storage_only = build_sandbox_pod(
@@ -1048,7 +1054,77 @@ fn sandbox_pod_shapes_render_expected_yaml() {
             extra_tolerations: &[],
             extra_required_affinity: None,
             node_group_placement: None,
+            runtime_upgrade: None,
         },
+    );
+    // Runtime upgrade pods: the shim calls `UpgradeRuntime` instead of
+    // `Start`. A stopped source upgraded in place on its node and left
+    // stopped, the same source upgraded as it starts, and a suspended source
+    // staged from its checkpoint elsewhere and upgraded as it resumes.
+    let upgrade_target =
+        crate::types::EnvironmentReference::new(crate::types::Digest::sha256([7; 32]));
+    let runtime_upgrade =
+        |target_state, checkpoint_local_artifact_id: Option<crate::types::LocalArtifactId>| {
+            PodRuntimeUpgrade {
+                operation_id: Uuid::from_u128(0x019f_8000_0000_7000_8000_0000_0000_0011),
+                target_environment: upgrade_target,
+                authorization_id: "environment-block-e0",
+                authorization_reason: "e0 runs a blocked runtime",
+                memory_loss: checkpoint_local_artifact_id.is_some(),
+                target_state,
+                checkpoint_local_artifact_id,
+            }
+        };
+    let restore_runtime_upgrade =
+        |name, generation, artifact_kind, storage_uri, source_node, upgrade| {
+            build_sandbox_pod(
+                &config,
+                SandboxPodRequest::Restore {
+                    stopped_materialization: None,
+                    artifact_kind,
+                    common: common(name, TEST_SANDBOX_ID, generation),
+                    runtime,
+                    suspend_restore_storage_uri: storage_uri,
+                    suspend_restore_source_node: source_node,
+                    fork_disk_restore: None,
+                    direct_node_name: source_node,
+                    preferred_node_name: None,
+                    restore_node_shortlist: Vec::new(),
+                    extra_tolerations: &[],
+                    extra_required_affinity: None,
+                    node_group_placement: None,
+                    runtime_upgrade: Some(Box::new(upgrade)),
+                },
+            )
+        };
+    let restore_runtime_upgrade_stopped = restore_runtime_upgrade(
+        "space-sbx-019de67463d77ef0a5888e106a878093-g21",
+        21,
+        crate::types::ArtifactKind::Disk,
+        None,
+        Some("worker-source"),
+        runtime_upgrade(PodRuntimeUpgradeTargetState::Stopped, None),
+    );
+    let restore_runtime_upgrade_started = restore_runtime_upgrade(
+        "space-sbx-019de67463d77ef0a5888e106a878093-g22",
+        22,
+        crate::types::ArtifactKind::Disk,
+        None,
+        Some("worker-source"),
+        runtime_upgrade(PodRuntimeUpgradeTargetState::Started, None),
+    );
+    let restore_runtime_upgrade_suspended = restore_runtime_upgrade(
+        "space-sbx-019de67463d77ef0a5888e106a878093-g23",
+        23,
+        crate::types::ArtifactKind::Full,
+        Some("s3://space-test/suspend-snapshots/current?region=us-east-1"),
+        None,
+        runtime_upgrade(
+            PodRuntimeUpgradeTargetState::Started,
+            Some(crate::types::LocalArtifactId::from_uuid(Uuid::from_u128(
+                0x019f_8000_0000_7000_8000_0000_0000_0012,
+            ))),
+        ),
     );
     // Evacuation pod with cohort placement: one Equal-operator toleration
     // and a matching required nodeAffinity term derived from the same
@@ -1084,6 +1160,7 @@ fn sandbox_pod_shapes_render_expected_yaml() {
             extra_tolerations: std::slice::from_ref(&evacuation_toleration),
             extra_required_affinity: Some(("space.pplx.net/rollout-cohort", "test-2")),
             node_group_placement: None,
+            runtime_upgrade: None,
         },
     );
     let restore_fork_disk = build_sandbox_pod(
@@ -1112,6 +1189,7 @@ fn sandbox_pod_shapes_render_expected_yaml() {
             extra_tolerations: &[],
             extra_required_affinity: None,
             node_group_placement: None,
+            runtime_upgrade: None,
         },
     );
     // BYOK: an encrypted cold create renders the volume-encryption
@@ -1276,6 +1354,7 @@ fn sandbox_pod_shapes_render_expected_yaml() {
             preferred_node_name: Some("space-worker-a"),
             extra_tolerations: &[],
             extra_required_affinity: None,
+            runtime_upgrade: None,
         },
     );
     let pooled_placed = build_sandbox_pod(
@@ -1320,6 +1399,7 @@ fn sandbox_pod_shapes_render_expected_yaml() {
             preferred_node_name: None,
             extra_tolerations: &[],
             extra_required_affinity: None,
+            runtime_upgrade: None,
         },
     );
     let mismatched_placement = NodeGroupPlacement::for_caller(
@@ -1358,6 +1438,18 @@ fn sandbox_pod_shapes_render_expected_yaml() {
         ("sandbox_pod_restore_storage_only", restore_storage_only),
         ("sandbox_pod_restore_evacuation", restore_evacuation),
         ("sandbox_pod_restore_fork_disk", restore_fork_disk),
+        (
+            "sandbox_pod_restore_runtime_upgrade_stopped",
+            restore_runtime_upgrade_stopped,
+        ),
+        (
+            "sandbox_pod_restore_runtime_upgrade_started",
+            restore_runtime_upgrade_started,
+        ),
+        (
+            "sandbox_pod_restore_runtime_upgrade_suspended",
+            restore_runtime_upgrade_suspended,
+        ),
         (
             "sandbox_pod_on_demand_create_encrypted",
             on_demand_encrypted,
@@ -1488,6 +1580,7 @@ fn every_sandbox_pod_shape_requests_one_network_slot() {
                 extra_tolerations: &[],
                 extra_required_affinity: None,
                 node_group_placement: None,
+                runtime_upgrade: None,
             },
         ),
         build_sandbox_pod(
@@ -1619,6 +1712,7 @@ fn portable_restore_prefers_source_node_and_carries_remote_fallback() {
             extra_tolerations: &[],
             extra_required_affinity: None,
             node_group_placement: None,
+            runtime_upgrade: None,
         },
     );
 
@@ -1761,6 +1855,7 @@ fn build_sandbox_pod_hard_pins_portable_restore_to_source_node() {
             extra_tolerations: &[],
             extra_required_affinity: None,
             node_group_placement: None,
+            runtime_upgrade: None,
         },
     );
 
@@ -1835,6 +1930,7 @@ fn build_sandbox_pod_source_annotation_without_pin_renders_no_source_affinity() 
             extra_tolerations: &[],
             extra_required_affinity: None,
             node_group_placement: None,
+            runtime_upgrade: None,
         },
     );
 
@@ -1900,6 +1996,7 @@ fn build_sandbox_pod_shortlist_renders_or_terms_with_preferred_source() {
             extra_tolerations: &[],
             extra_required_affinity: None,
             node_group_placement: None,
+            runtime_upgrade: None,
         },
     );
 
@@ -1981,6 +2078,7 @@ fn build_sandbox_pod_hard_pin_without_ssd_affinity_omits_placement_block() {
             extra_tolerations: &[],
             extra_required_affinity: None,
             node_group_placement: None,
+            runtime_upgrade: None,
         },
     );
 
@@ -2037,6 +2135,7 @@ fn restore_with_extra_tolerations_renders_pod_tolerations() {
             extra_tolerations: &tolerations,
             extra_required_affinity: None,
             node_group_placement: None,
+            runtime_upgrade: None,
         },
     );
 
@@ -2153,6 +2252,7 @@ fn extra_required_affinity_renders_into_required_node_selector_term() {
             extra_tolerations: std::slice::from_ref(&toleration),
             extra_required_affinity: Some(("space.pplx.net/rollout-cohort", "test-2")),
             node_group_placement: None,
+            runtime_upgrade: None,
         },
     );
     let spec = pod.spec.as_ref().unwrap();
@@ -2455,6 +2555,7 @@ fn node_group_placement_and_drain_cohort_are_anded_in_one_term() {
             extra_required_affinity: Some(("space.pplx.net/rollout-cohort", "test-2")),
             fork_disk_restore: None,
             restore_node_shortlist: Vec::new(),
+            runtime_upgrade: None,
         },
     );
 
@@ -2590,6 +2691,7 @@ fn local_only_restore_keeps_direct_node_assignment_under_placement() {
             preferred_node_name: None,
             extra_tolerations: &[],
             extra_required_affinity: None,
+            runtime_upgrade: None,
         },
     );
 
@@ -2773,6 +2875,7 @@ fn soft_pinned_restore_suppresses_the_dedicated_preference() {
             preferred_node_name: Some("space-worker-a"),
             extra_tolerations: &[],
             extra_required_affinity: None,
+            runtime_upgrade: None,
         },
     );
 
@@ -2975,6 +3078,7 @@ fn restore_shortlist_suppresses_dedicated_preference_but_keeps_toleration() {
             extra_tolerations: &[],
             extra_required_affinity: None,
             fork_disk_restore: None,
+            runtime_upgrade: None,
         },
     );
 
@@ -3358,6 +3462,7 @@ fn an_empty_preferred_node_name_does_not_drop_the_required_shortlist() {
             preferred_node_name: Some(""),
             extra_tolerations: &[],
             extra_required_affinity: None,
+            runtime_upgrade: None,
         },
     );
 
@@ -3592,6 +3697,7 @@ fn render_stopped_re_placement(stopped_materialization: Option<StoppedMaterializ
             extra_tolerations: &[],
             extra_required_affinity: None,
             node_group_placement: None,
+            runtime_upgrade: None,
         },
     )
 }

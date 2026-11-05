@@ -622,6 +622,7 @@ async fn a_retry_waiting_on_a_rollback_cleanup_sees_its_receipt() {
                     crate::auto_lifecycle_delete_receipts::RouteIdentityProvenance::ClusterFenced,
                 open_activation_claim_eligible: true,
                 restored_snapshot: Default::default(),
+                expected_node_execution: None,
             });
         let finish_cleanup = async {
             // The retry takes its own handle on the lock just before it waits

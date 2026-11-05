@@ -243,6 +243,7 @@ impl KubernetesSubstrate {
                     restore_node_shortlist,
                     extra_tolerations: &[],
                     extra_required_affinity: None,
+                    runtime_upgrade: None,
                 }
             }
             PodCreateContext::Restore(RestoreContext::Evacuation {
@@ -273,6 +274,7 @@ impl KubernetesSubstrate {
                 restore_node_shortlist: Vec::new(),
                 extra_tolerations,
                 extra_required_affinity,
+                runtime_upgrade: None,
             },
         }
     }

@@ -1,0 +1,2 @@
+DROP INDEX sandbox_runtime_upgrade_outcomes_by_sandbox;
+DROP TABLE sandbox_runtime_upgrade_outcomes;

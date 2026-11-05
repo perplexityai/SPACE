@@ -310,3 +310,32 @@ async fn the_internal_wake_forwards_a_runtime_upgrade_only_for_the_control_plane
         .unwrap_err();
     assert_eq!(forwarded.code(), tonic::Code::Unimplemented, "{forwarded}");
 }
+
+/// The outcome of a runtime upgrade a pod's shim ran is the control plane's
+/// to read, as the upgrade was its to request.
+#[tokio::test]
+async fn the_internal_runtime_upgrade_report_is_forwarded_only_for_the_control_plane() {
+    use pplx_space_node_api_client::proto::worker_api_internal_server::WorkerApiInternal;
+    let service =
+        service_with_limiter(UdsPerSandboxLimiter::for_tests_with_reserved(1, 1, 8)).await;
+    let read = || {
+        Request::new(proto::GetRuntimeUpgradeRequest {
+            sandbox_id: SandboxId::new().to_string(),
+            operation_id: uuid::Uuid::now_v7().to_string(),
+        })
+    };
+
+    let mut unprivileged = read();
+    unprivileged.extensions_mut().insert(
+        pplx_space_common_svc::auth::NodeApiAuthenticatedCaller::unprivileged_workload_for_test(),
+    );
+    let denied = WorkerApiInternal::get_runtime_upgrade(&service, unprivileged)
+        .await
+        .unwrap_err();
+    assert_eq!(denied.code(), tonic::Code::PermissionDenied, "{denied}");
+
+    let forwarded = WorkerApiInternal::get_runtime_upgrade(&service, read())
+        .await
+        .unwrap_err();
+    assert_eq!(forwarded.code(), tonic::Code::Unimplemented, "{forwarded}");
+}

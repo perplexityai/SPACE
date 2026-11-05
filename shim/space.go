@@ -493,6 +493,10 @@ func (s *spaceTaskService) Create(ctx context.Context, r *taskAPI.CreateTaskRequ
 	if parseErr != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "invalid sandbox start annotations: %v", parseErr)
 	}
+	runtimeUpgrade, parseErr := spec.sandboxRuntimeUpgrade()
+	if parseErr != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "invalid sandbox runtime upgrade annotations: %v", parseErr)
+	}
 	if artifactRestore != nil {
 		artifactRestore.DiskIoMaxOperationsPerSec = sandboxDiskIOMaxOperationsPerSec
 		artifactRestore.DiskIoMaxBandwidthMibPerSec = sandboxDiskIOMaxBandwidthMiBPerSec
@@ -561,14 +565,25 @@ func (s *spaceTaskService) Create(ctx context.Context, r *taskAPI.CreateTaskRequ
 			}
 		}
 		var startResp *pb.StartResponse
+		upgradedStopped := runtimeUpgrade != nil && runtimeUpgrade.stopped()
+		startStep, startLabel := "sbxmgr_start", "sbx-manager Start"
+		if runtimeUpgrade != nil {
+			startStep, startLabel = "sbxmgr_upgrade_runtime", "sbx-manager UpgradeRuntime"
+		}
 		if sandboxAutoLifecycle != nil && sandboxAutoLifecycleAuthority == netpb.PolicyAuthority_POLICY_AUTHORITY_CLUSTER {
 			startRequest.ActivationAutoLifecycle = sandboxAutoLifecycle
 			err = requireActivationPolicySupport(startCtx, conn)
 		}
 		if err == nil {
-			if materializeStopped || (sandboxCheckpoint != nil && *sandboxCheckpoint == "stopped" && startRequest.Checkpoint != nil) {
+			switch {
+			case runtimeUpgrade != nil:
+				// The upgrade is the whole of this create: any refusal or
+				// failure fails it, and nothing here falls back to a Start,
+				// which would boot the environment the upgrade moves off.
+				startResp, err = upgradeRuntime(startCtx, client, startRequest, runtimeUpgrade)
+			case materializeStopped || (sandboxCheckpoint != nil && *sandboxCheckpoint == "stopped" && startRequest.Checkpoint != nil):
 				startResp, err = startStoppedCheckpoint(startCtx, client, startRequest)
-			} else {
+			default:
 				startResp, err = client.Start(startCtx, startRequest)
 			}
 		}
@@ -578,8 +593,8 @@ func (s *spaceTaskService) Create(ctx context.Context, r *taskAPI.CreateTaskRequ
 			if redirect.podIP != "" {
 				removeDataPlaneRedirect(netnsPath, sbxID)
 			}
-			emitShimStepError("create", "sbxmgr_start", "sbxmgr_start", err, metricTag("template", sandboxTemplate))
-			return nil, annotateStatus("sbx-manager Start", err)
+			emitShimStepError("create", startStep, startStep, err, metricTag("template", sandboxTemplate))
+			return nil, annotateStatus(startLabel, err)
 		}
 		if redirect.err != nil {
 			if redirect.podIP != "" {
@@ -588,15 +603,15 @@ func (s *spaceTaskService) Create(ctx context.Context, r *taskAPI.CreateTaskRequ
 			emitShimStepError("create", "dataplane_redirect", "dataplane_redirect", redirect.err, metricTag("template", sandboxTemplate))
 			return nil, status.Errorf(codes.Unavailable, "prepare data-plane redirect: %v", redirect.err)
 		}
-		emitShimStepLatency("create", "sbxmgr_start", startRPCStartedAt, shimMetricResultSuccess, metricTag("template", sandboxTemplate))
-		if materializeStopped {
-			// sbx-manager staged the disk and left the sandbox stopped. The
-			// data-plane redirect stays, so the control plane can confirm the
-			// materialization through it.
+		emitShimStepLatency("create", startStep, startRPCStartedAt, shimMetricResultSuccess, metricTag("template", sandboxTemplate))
+		if materializeStopped || upgradedStopped {
+			// sbx-manager staged the disk, or upgraded it and stopped it
+			// again, and left the sandbox stopped. The data-plane redirect
+			// stays, so the control plane can confirm the outcome through it.
 			markMaterializedStopped(t, sbxID, redirect.podIP, netnsPath)
 			s.tasks[r.ID] = t
 			createSucceeded = true
-			logShim("Create: materialized stopped sandbox %s without a VM (template=%s)", sbxID, sandboxTemplate)
+			logShim("Create: left sandbox %s stopped without a VM (template=%s restore_mode=%s)", sbxID, sandboxTemplate, restoreMode)
 			emitShimOperationLatency("create", createStartedAt, shimMetricResultSuccess, metricTag("template", sandboxTemplate))
 			return &taskAPI.CreateTaskResponse{Pid: uint32(t.pid)}, nil
 		}
@@ -2292,7 +2307,8 @@ func (s *ociSpec) sandboxStoppedMaterializationArtifactID() string {
 const stoppedMaterializationCheckpoint = "stopped-materialization"
 
 // markMaterializedStopped makes t the task of a pod whose sandbox was
-// materialized stopped: no VM, so the task stands in on the shim's own pid,
+// materialized stopped, or upgraded to a stopped target: no VM, so the task
+// stands in on the shim's own pid,
 // and detached, so Kill and Delete never ask sbx-manager to release, suspend or
 // delete the sandbox the next start boots from. Unlike an ordinarily stopped
 // sandbox's task, this one is still running, so containerd would let an exec

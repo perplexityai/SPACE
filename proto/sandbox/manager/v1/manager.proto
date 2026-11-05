@@ -115,8 +115,18 @@ service SandboxManager {
   // the old checkpoint. Files survive; memory and processes don't. A failed
   // boot restores the old pair and releases the fence. Idempotent per
   // `operation_id`: a retry resumes or settles the same upgrade. A rolled-back
-  // upgrade leaves no row behind, so a retry after it starts over.
+  // upgrade keeps only its outcome, so a retry after it starts over. A
+  // sandbox already on the target is activated in place for a STARTED
+  // target, and a suspended one absent from the node may be staged first;
+  // see `UpgradeRuntimeRequest.target_state` and `stage_from`, and
+  // `GetRuntimeUpgrade` for what the node records.
   rpc UpgradeRuntime(UpgradeRuntimeRequest) returns (UpgradeRuntimeResponse);
+
+  // Internal-only, read-only: where one `UpgradeRuntime` operation stands on
+  // this node, for a caller that can't see its response. A Kubernetes pod's
+  // shim runs the upgrade at container create, so the control plane reads the
+  // outcome here.
+  rpc GetRuntimeUpgrade(GetRuntimeUpgradeRequest) returns (GetRuntimeUpgradeResponse);
 
   // Enable rolling btrfs snapshots for a sandbox.
   rpc EnableSnapshots(EnableSnapshotsRequest) returns (EnableSnapshotsResponse);
@@ -1174,8 +1184,48 @@ message UpgradeRuntimeRequest {
   // Lifecycle after a verified boot: STARTED (or unspecified) leaves the new
   // execution running; STOPPED stops it again, unless the sandbox stopped,
   // suspended or started another execution first, which the upgrade leaves
-  // as it is.
+  // as it is. A sandbox already on the target ends STOPPED only if it's
+  // stopped or suspended; one that runs is refused with FAILED_PRECONDITION.
+  //
+  // With STARTED the response always carries the running execution's
+  // `start`. A sandbox already on the target is activated in place: a stopped
+  // one is cold-started and a suspended one restored from its checkpoint,
+  // with this request's `start`. An operation starts the sandbox at most
+  // once while the node keeps its records: a start refused before its
+  // activation claimed the sandbox may be retried; once an activation has
+  // claimed it, this one or another, a retry is answered as below. The claim
+  // itself refuses a sandbox another activation moved off the execution the
+  // start was decided on. An operation answered with the execution already
+  // running is complete too: a retry after a later stop never starts it. A sandbox already started, a replay of
+  // an upgrade that already finished, and a retry of an activation answer
+  // with the live execution only when its route identity names the same pod
+  // (`pod_uid` and `execution_generation`), or to a caller whose `start`
+  // names no pod; anything else is refused with
+  // FAILED_PRECONDITION rather than moved, and a new attempt takes a new
+  // operation id.
   WakeTargetState target_state = 6;
+  // Requires `checkpoint_local_artifact_id`.
+  // Where to stage a suspended sandbox absent from this node from, before the
+  // upgrade inspects it, and where a stage interrupted after it adopted the
+  // row resumes from. Staging leaves the row suspended and never launches the
+  // checkpoint. Ignored when the node holds a row for the sandbox in any
+  // other state. Staging runs before the upgrade's own checks, so an upgrade
+  // refused afterwards (an uncertified edge, missing consent) leaves the
+  // staged sandbox suspended on this node.
+  optional RuntimeUpgradeStageFrom stage_from = 7;
+  // For a suspended sandbox, the local artifact of the checkpoint the control
+  // plane decided the upgrade from, as `WakeRuntimeUpgrade` names it. Required
+  // for a suspended sandbox: the node upgrades only a row whose current local
+  // artifact is that checkpoint, and refuses a stale copy or an upgrade that
+  // names none.
+  optional string checkpoint_local_artifact_id = 8;
+}
+
+// The suspend checkpoint an `UpgradeRuntime` stages a sandbox absent from
+// the node from: the same pair a restore `Start` carries.
+message RuntimeUpgradeStageFrom {
+  string suspend_restore_storage_uri = 1;
+  optional string suspend_restore_source_node = 2;
 }
 
 enum RuntimeUpgradeOutcome {
@@ -1192,8 +1242,66 @@ enum RuntimeUpgradeOutcome {
 
 message UpgradeRuntimeResponse {
   RuntimeUpgradeOutcome outcome = 1;
-  // Present when this call ran the cold boot.
+  // Present when this call ran the cold boot, and for a STARTED target
+  // whenever the call succeeds: see `UpgradeRuntimeRequest.target_state`.
   optional StartResponse start = 2;
+}
+
+message GetRuntimeUpgradeRequest {
+  string sandbox_id = 1;
+  string operation_id = 2;
+}
+
+enum RuntimeUpgradeStatus {
+  RUNTIME_UPGRADE_STATUS_UNSPECIFIED = 0;
+  // The node holds no record of the operation: it never reached this node,
+  // it was refused before fencing anything, or the sandbox was deleted from
+  // this node since, with its upgrade records.
+  RUNTIME_UPGRADE_STATUS_ABSENT = 1;
+  // The upgrade fences the sandbox, or its verified boot hasn't retired the
+  // old checkpoint yet. `phase` says which.
+  RUNTIME_UPGRADE_STATUS_IN_PROGRESS = 2;
+  // The sandbox booted under the target and its old checkpoint is retired.
+  RUNTIME_UPGRADE_STATUS_UPGRADED = 3;
+  // The old disk/checkpoint pair is back; `failure` says why.
+  RUNTIME_UPGRADE_STATUS_ROLLED_BACK = 4;
+  // The sandbox was already on the target; nothing was fenced or booted.
+  RUNTIME_UPGRADE_STATUS_ALREADY_ON_TARGET = 5;
+}
+
+// The phase of an upgrade that's IN_PROGRESS.
+enum RuntimeUpgradePhase {
+  RUNTIME_UPGRADE_PHASE_UNSPECIFIED = 0;
+  RUNTIME_UPGRADE_PHASE_FENCED = 1;
+  RUNTIME_UPGRADE_PHASE_PRESERVED = 2;
+  RUNTIME_UPGRADE_PHASE_BOOTING = 3;
+  RUNTIME_UPGRADE_PHASE_VERIFIED = 4;
+}
+
+// The upgrade's outcome on the node, not the outcome of the pod that asked
+// for it: an upgrade can be recorded UPGRADED or ALREADY_ON_TARGET while the
+// pod's create was refused, for one whose sandbox ran another pod's execution
+// or wasn't at rest for a STOPPED target. Read it together with the pod's
+// status. An operation the node recorded for another sandbox than the request
+// names is refused with INVALID_ARGUMENT.
+message GetRuntimeUpgradeResponse {
+  RuntimeUpgradeStatus status = 1;
+  // Set with IN_PROGRESS.
+  RuntimeUpgradePhase phase = 2;
+  // Set with ROLLED_BACK when the node recorded a reason.
+  optional string failure = 3;
+  // With ALREADY_ON_TARGET: the operation's `UpgradeRuntime` claimed its
+  // activation for a STARTED target, either by claiming the start of the
+  // sandbox, which is written before the start runs, so the start itself may
+  // have failed and the flag alone doesn't say the sandbox runs, or by
+  // answering with the execution already running. A Wake's upgrade that
+  // found its target starts the sandbox as a Wake does and claims nothing.
+  // Once anything has started the sandbox since, or the operation answered
+  // with a running execution, the operation never starts it again, and a
+  // sandbox that isn't running the caller's pod's execution needs a new
+  // operation id; a start refused before its activation claimed the sandbox
+  // may be retried under the same one.
+  bool activation_claimed = 4;
 }
 
 message EnableSnapshotsRequest { string sandbox_id = 1; }
