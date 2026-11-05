@@ -416,7 +416,9 @@ The device is rendered only when a sandbox cold-boots from the template build,
 which includes creating the template's base snapshot. Sandboxes restored from a
 snapshot keep the device that snapshot captured, so changing the setting takes
 effect only after rebuilding the template and its base snapshot. The REST build
-API does not accept the setting yet.
+API accepts the same object under `recipe.build_config.balloon`, for example
+`"build_config": {"balloon": {"mode": "report", "stats_polling_interval_s": 1}}`.
+Omitting it leaves ballooning disabled for the resulting recipe-built template.
 
 Hint mode also needs `balloon_hint_timeout_ms` (at most 30000) in the node's
 `/space/etc/sandbox.toml`. Before each suspend snapshot, a VM whose balloon has

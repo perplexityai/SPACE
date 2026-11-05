@@ -883,6 +883,8 @@ pub struct TemplateBuildConfig {
     pub memory_bytes: Option<u64>,
     #[serde(default)]
     pub disk_bytes: Option<u64>,
+    #[serde(default)]
+    pub balloon: Option<pplx_space_common_core::types::BalloonConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
