@@ -13,6 +13,7 @@ import {
   canPromote,
   confirmPromotion,
   jobOutcomeNotice,
+  linkableTemplates,
   newRun,
   parseStoredRun,
   pinnedTemplate,
@@ -117,7 +118,7 @@ test('a refused build is known not to have started; a 5xx or a network error is 
     assert.equal(unknown.known, false);
     assert.doesNotMatch(unknown.text, /was not started/);
     assert.match(unknown.text, /may have accepted it/);
-    assert.match(unknown.text, /appears in Template Releases only when it finishes/);
+    assert.match(unknown.text, /appears in the template's releases only when it finishes/);
     assert.match(unknown.text, /starts a second job/);
     const sandbox = testSandboxFailureText('rebuild-check-seed-x', err);
     assert.equal(sandbox.known, false);
@@ -419,4 +420,14 @@ test('a stored run keeps its key generations and closed keys, and runs stored be
   ]) {
     assert.equal(parseStoredRun(JSON.stringify(bad), ids, at + 1000), null, JSON.stringify(bad));
   }
+});
+
+test('the rebuild links each system template that has a record, from any page that shows it', () => {
+  const releases = [{ template_name: 'code-runtime' }, { template_name: 'north-web' }];
+  // A template page lists only its own template: the releases name the rest.
+  assert.deepEqual([...linkableTemplates({ open: 'seed', releases, listed: [{ name: 'seed' }] })].sort(), ['code-runtime', 'north-web', 'seed']);
+  // A first build still queued has no record yet, so no page to link.
+  assert.equal(linkableTemplates({ open: 'north-web', releases: [], listed: [{ name: 'north-web' }] }).has('code-runtime'), false);
+  // The list's templates, with or without a release.
+  assert.equal(linkableTemplates({ releases: [], listed: [{ name: 'code-runtime' }] }).has('code-runtime'), true);
 });

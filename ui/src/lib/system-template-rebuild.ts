@@ -124,7 +124,7 @@ export function buildSucceeded(job: BuildJob | null): job is BuildJob & { conten
 }
 
 export function buildFailureText(template: SystemTemplate, job: BuildJob): string | null {
-  if (job.lost) return `${template}: the builder no longer reports job ${job.job_id}; check Template Releases for its result`;
+  if (job.lost) return `${template}: the builder no longer reports job ${job.job_id}; check its releases for its result`;
   if (job.state === 'failed') return `${template} failed${job.error ? `: ${job.error}` : ''}`;
   if (job.state === 'publish_failed') return `${template} built but did not publish${job.error ? `: ${job.error}` : ''}`;
   return null;
@@ -382,7 +382,7 @@ export function submitFailureText(
       closed: { jobId: conflict.jobId },
       text: `The ${template} build sent earlier has an unknown outcome: it may have started and may still be running` +
         `${conflict.jobId ? ` as job ${conflict.jobId}` : ''}. Building again with the same request answers the same. ` +
-        'Check Template Releases and the template\'s builds; start a new build only if neither shows it.',
+        'Check the template\'s releases and builds; start a new build only if neither shows it.',
     };
   }
   if (refused(status)) return { known: true, lateNote: answered, text: `The ${template} build was not started: ${message}` };
@@ -390,9 +390,9 @@ export function submitFailureText(
     known: false,
     lateNote: answered,
     text: `The ${template} build request failed (${message}), and the builder may have accepted it. An accepted build ` +
-      'appears in Template Releases only when it finishes. Building again resends the same Idempotency-Key: an API ' +
+      'appears in the template\'s releases only when it finishes. Building again resends the same Idempotency-Key: an API ' +
       'release that recorded the first build answers with it, one that could not tell whether the builder took it ' +
-      'says so (and offers a new build), and an older release starts a second job. Wait, refresh Template Releases, ' +
+      'says so (and offers a new build), and an older release starts a second job. Wait, refresh the template\'s releases, ' +
       'and build again only if no new release appears.',
   };
 }
@@ -409,6 +409,21 @@ export function testSandboxFailureText(name: string, err: unknown): { known: boo
 
 export function testSandboxName(template: SystemTemplate, runId: string): string {
   return `rebuild-check-${template}-${runId.slice(0, 8)}`;
+}
+
+// The templates the rebuild panel may link to: those known to have a record,
+// and so a page. A template page lists only its own template, but the
+// releases name every template that published one, and the list knows the
+// rest. A first build still queued has no record yet and stays unlinked.
+export function linkableTemplates(known: {
+  open?: string;
+  releases: Pick<TemplateRelease, 'template_name'>[];
+  listed: { name: string }[];
+}): Set<string> {
+  const names = new Set<string>(known.releases.map((release) => release.template_name));
+  for (const template of known.listed) names.add(template.name);
+  if (known.open) names.add(known.open);
+  return names;
 }
 
 export function latestDigest(
