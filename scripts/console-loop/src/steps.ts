@@ -289,6 +289,74 @@ step('sandboxes-search-id', ['sandboxes'], async (c) => {
   c.rec.check(await content(c.page).locator('tbody tr.ant-table-row', { hasText: shortLabel(id) }).count() === 1, 'searching a full sbx_ ID finds the sandbox');
 });
 
+// The search box's text goes to the server's `search` (a name prefix
+// ignoring case, or an ID suffix such as the ID column's label), so a match
+// beyond the loaded page is found. Against an API without `search` the
+// console searches as before; the step notes which it saw.
+const searchSentToServer = async (c: Ctx, typed: string): Promise<boolean> => {
+  const sent = c.page.waitForRequest((req) => {
+    const url = new URL(req.url());
+    return url.pathname.endsWith('/admin/api/v1/sandboxes') && url.searchParams.get('search') === typed;
+  }, { timeout: 5000 }).then(() => true, () => false);
+  await content(c.page).locator('input[placeholder*="ID"]').first().fill(typed);
+  const server = await sent;
+  await c.page.waitForTimeout(1500);
+  c.rec.note(server ? `"${typed}" was sent as search` : `"${typed}" was not sent as search (an API without it)`);
+  return server;
+};
+
+step('sandboxes-search-label', ['sandboxes'], async (c) => {
+  const id = sandboxId(c, 'running');
+  if (!id) return c.rec.check(false, 'the seed has a running sandbox');
+  await visit(c, '/dashboard/sandboxes?age=all&page_size=25', 2000);
+  const label = shortLabel(id);
+  const server = await searchSentToServer(c, label);
+  const rows = content(c.page).locator('tbody tr.ant-table-row');
+  c.rec.check(await rows.filter({ hasText: label }).count() === 1, `searching the ID column's label finds the sandbox${server ? ' through the server' : ''}`);
+});
+
+step('sandboxes-search-name-case', ['sandboxes'], async (c) => {
+  const id = sandboxId(c, 'suspended');
+  if (!id) return c.rec.check(false, 'the seed has a suspended sandbox');
+  await visit(c, '/dashboard/sandboxes?age=all&page_size=25', 2000);
+  const name = `${c.config.prefix}-suspended`;
+  if (await searchSentToServer(c, name.toUpperCase())) {
+    const rows = content(c.page).locator('tbody tr.ant-table-row');
+    c.rec.check(await rows.count() === 1 && await rows.filter({ hasText: shortLabel(id) }).count() === 1, `searching ${name.toUpperCase()} finds ${name} alone`);
+  }
+});
+
+step('sandboxes-user-email', ['sandboxes'], async (c) => {
+  const id = sandboxId(c, 'acme-running');
+  if (!id) return c.rec.check(false, 'the seed has an acme-running sandbox');
+  const api = await adminFetch(c.page, 'GET', `/admin/api/v1/sandboxes/${id}`);
+  const userEmail = api.json?.user_email;
+  if (typeof userEmail !== 'string') return c.rec.note('the API reports no user_email; the User column shows the user ID');
+  // The org's own list, so the sandbox is on its first page.
+  await visit(c, `/dashboard/sandboxes?age=all&page_size=25&org=${orgId(c, 'acme')}`, 2000);
+  const row = content(c.page).locator('tbody tr.ant-table-row', { hasText: shortLabel(id) });
+  c.rec.check((await row.innerText()).includes(userEmail), "the User column shows the owner's email");
+});
+
+step('sandboxes-create-form', ['sandboxes'], async (c) => {
+  await visit(c, '/dashboard/sandboxes', 2000);
+  const card = c.page.locator('.ant-card', { hasText: 'Create sandbox' });
+  const t = await card.innerText();
+  c.rec.check(!/gVisor|Cloud Hypervisor|Hyper-V/.test(t), 'the create form offers no runtimes SPACE does not implement');
+});
+
+// The Datadog logs button shows only where SPACE_UI_DATADOG_LOGS_URL is set,
+// which the loop cannot read; it checks what a shown button links to.
+step('sandbox-detail-datadog', ['sandboxes'], async (c) => {
+  const id = sandboxId(c, 'running');
+  if (!id) return c.rec.check(false, 'the seed has a running sandbox');
+  await visit(c, `/dashboard/sandboxes/${id}`, 3000);
+  const logs = c.page.getByRole('link', { name: 'Datadog logs' });
+  if (await logs.count() === 0) return c.rec.note('no Datadog logs button (SPACE_UI_DATADOG_LOGS_URL unset)');
+  const href = new URL((await logs.first().getAttribute('href')) ?? '', c.config.baseUrl);
+  c.rec.check(href.protocol === 'https:' && (href.searchParams.get('query') ?? '').includes(id.replace(/^sbx_/, '')), 'the Datadog logs button queries the sandbox on an HTTPS URL');
+});
+
 for (const key of ['running', 'paused', 'suspended', 'stopped', 'acme-running']) {
   step(`sandbox-detail-${key}`, ['sandboxes'], async (c) => {
     const id = sandboxId(c, key);
