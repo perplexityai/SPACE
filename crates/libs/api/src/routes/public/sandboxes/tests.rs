@@ -993,6 +993,72 @@ async fn sandbox_reads_exclude_deleted_tombstones_before_pagination() -> TestDbR
     Ok(())
 }
 
+/// `cleanup_required` is a delete tombstone like `deleted`, so `GET
+/// /v1/sandboxes/{id}` answers it with the same status and body.
+#[tokio::test]
+async fn get_answers_a_cleanup_required_tombstone_as_deleted() -> TestDbResult<()> {
+    Box::pin(async {
+        const KEY: &str = "tombstone-read-test-key";
+        let db = pg_test_db().await?;
+        sqlx::query(pplx_space_common_core::sql!(
+            "INSERT INTO api_keys (id, org_id, name, key_hash, allowed_surfaces)
+             VALUES ($1, $2, 'tombstone-read-test', $3, ARRAY['native'])"
+        ))
+        .bind(Uuid::now_v7())
+        .bind(SEED_ORG_ID)
+        .bind(crate::auth::hash_token(KEY))
+        .execute(&db.pool)
+        .await?;
+        let state = AppState::from_pool(db.pool.clone()).await?;
+        let app = axum::Router::new()
+            .nest("/v1", crate::routes::public::v1_router(state.clone()))
+            .with_state(state);
+
+        let mut answers = Vec::new();
+        for lifecycle in ["deleted", "cleanup_required"] {
+            let id = SandboxId::new();
+            sqlx::query(pplx_space_common_core::sql!(
+                "INSERT INTO sandboxes (
+                     id, user_id, org_id, lifecycle, network_policy_override_json,
+                     network_policy_generation
+                 ) VALUES ($1, $2, $3, $4, $5, 1)"
+            ))
+            .bind(id)
+            .bind(SEED_USER_ID)
+            .bind(SEED_ORG_ID)
+            .bind(lifecycle)
+            .bind(SqlJson(&pplx_space_net_common::NetworkPolicyV1::default()))
+            .execute(&db.pool)
+            .await?;
+            let request =
+                axum::http::Request::get(format!("/v1/sandboxes/{}", PublicSandboxId::from(id)))
+                    .header("authorization", format!("Bearer {KEY}"))
+                    .body(axum::body::Body::empty())?;
+            let response = tower::ServiceExt::oneshot(app.clone(), request).await?;
+            let status = response.status();
+            let body = axum::body::to_bytes(response.into_body(), 1024 * 1024).await?;
+            let mut body: serde_json::Value = serde_json::from_slice(&body)?;
+            // Each request has its own ID.
+            let request_id = body
+                .as_object_mut()
+                .and_then(|body| body.remove("request_id"));
+            assert!(request_id.is_some(), "{lifecycle}: {body}");
+            answers.push((lifecycle, status, body));
+        }
+
+        let (_, deleted_status, deleted_body) = &answers[0];
+        assert_eq!(*deleted_status, StatusCode::NOT_FOUND, "{deleted_body}");
+        let (_, status, body) = &answers[1];
+        assert_eq!(
+            (status, body),
+            (deleted_status, deleted_body),
+            "cleanup_required must read as deleted"
+        );
+        Ok(())
+    })
+    .await
+}
+
 #[tokio::test]
 async fn sandbox_reads_expose_only_the_current_failure_episode() -> TestDbResult<()> {
     let db = pg_test_db().await?;
