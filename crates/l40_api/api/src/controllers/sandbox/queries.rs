@@ -2793,7 +2793,7 @@ async fn observed_only_responses(
         .map(|observed| observed.sandbox_id)
         .collect::<Vec<_>>();
     let pool_ids = WarmPoolStore::new(pool.clone())
-        .reserving_pool_configs(&ids)
+        .pool_reservations(&ids)
         .await
         .map_err(|error| {
             pool_store_error(
@@ -2802,6 +2802,7 @@ async fn observed_only_responses(
             )
         })?
         .into_iter()
+        .map(|reservation| (reservation.sandbox_id, reservation.config_id))
         .collect::<HashMap<_, _>>();
     Ok(observed
         .iter()

@@ -214,8 +214,10 @@ impl AdminSandboxListQuery {
                 Some(search) if search.contains('\0') => {
                     return Err(bad_request("search must not contain a NUL character"));
                 }
-                Some(search) if !search.is_empty() => Some(SandboxSearch::new(search)),
-                _ => None,
+                Some(search) => {
+                    SandboxSearch::new(&search).map_err(|error| bad_request(error.to_string()))?
+                }
+                None => None,
             },
         };
         Ok(ListRequest {

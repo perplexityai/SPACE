@@ -756,7 +756,10 @@ pub fn sandbox_to_response(sandbox: &Sandbox, live: Option<&SandboxInfo>) -> San
         resource_type: SandboxResourceType::Sandbox,
         name: sandbox.name.clone(),
         user_id: Some(sandbox.user_id),
-        user_email: sandbox.user_email.clone(),
+        user_email: match sandbox.owner_source {
+            pplx_space_common_core::types::SandboxOwnerSource::Local => sandbox.user_email.clone(),
+            pplx_space_common_core::types::SandboxOwnerSource::FederatedIdentity => None,
+        },
         org_id: Some(sandbox.org_id),
         lifecycle: state_input.reported_lifecycle(),
         placement: Some(if live.is_some() {

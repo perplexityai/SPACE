@@ -24,6 +24,8 @@ pub(crate) const TEST_SANDBOX_LIST_PAGE_BYTES: i64 = MAX_SANDBOX_LIST_PAGE_BYTES
 pub(crate) const SANDBOX_LIST_ROW_OVERHEAD_BYTES: i64 = 2 * 1024;
 
 pub(crate) mod admin;
+#[cfg(test)]
+mod tests;
 
 /// The placeholders of the bound values [`page_rows_cte`] reads, such as
 /// `"$11"`, and the columns it sizes. The caller binds the cursor's
@@ -77,6 +79,12 @@ pub(crate) fn page_rows_cte(candidate_rows: &str, params: &PageWalkParams) -> St
         row_overhead_bytes,
         lists_env,
     } = params;
+    // Without either placeholder the walk would list every page from the
+    // start, or without a bound; a statement built once fails on first use.
+    assert!(
+        candidate_rows.contains("{after_cursor}") && candidate_rows.contains("{max_rows}"),
+        "candidate rows must write {{after_cursor}} and {{max_rows}}: {candidate_rows}"
+    );
     let candidate_rows = candidate_rows
         .replace(
             "{after_cursor}",

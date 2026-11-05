@@ -295,6 +295,15 @@ pub struct ClaimedPoolSlot {
 /// that was admitted against that slot. `state` and `claim_id` are what the
 /// caller checks before adopting: only a `claimed` slot carrying the admitted
 /// claim id is the caller's to adopt.
+/// A pool slot's reservation of a sandbox id
+/// ([`crate::WarmPoolStore::pool_reservations`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, sqlx::FromRow)]
+pub struct PoolReservation {
+    pub sandbox_id: SandboxId,
+    /// The slot's pool config: the warm pool's id.
+    pub config_id: Uuid,
+}
+
 #[derive(Debug, Clone)]
 pub struct ReservedPoolSlot {
     pub slot: ClaimedPoolSlot,

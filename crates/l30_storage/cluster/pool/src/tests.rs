@@ -11,7 +11,7 @@ use uuid::Uuid;
 
 use crate::{
     AutoscaleRead, ManualPoolConfigSpec, NewPoolSlot, OpenPoolSlotDeleteLock, PoolConfigOwner,
-    PoolError, PoolSlot, PoolSlotState, WarmPoolStore,
+    PoolError, PoolReservation, PoolSlot, PoolSlotState, WarmPoolStore,
 };
 
 type TestResult<T = ()> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -3806,9 +3806,9 @@ async fn store_bind_source_reads_locked_identity_and_normalizes_pod_uid() -> Tes
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn store_reserved_sandbox_ids_reports_slots_in_any_state() -> TestResult {
-    // arrange: one warming slot; its reserved id must be reported while an
-    // unknown id is not.
+async fn store_pool_reservations_report_slots_in_any_state_with_their_pool() -> TestResult {
+    // arrange: one warming slot; its reserved id must be reported, with its
+    // pool config, while an unknown id is not.
     let fixture = postgres_fixture().await?;
     let template = TemplateName::parse("seed")?;
     let (template_release_id, config_id, content_hash) =
@@ -3834,11 +3834,18 @@ async fn store_reserved_sandbox_ids_reports_slots_in_any_state() -> TestResult {
     // act
     let reserved = fixture
         .store
-        .reserved_sandbox_ids(&[reserved_sandbox_id, SandboxId::new()])
+        .pool_reservations(&[reserved_sandbox_id, SandboxId::new()])
         .await?;
 
     // assert
-    assert_eq!(reserved, vec![reserved_sandbox_id]);
+    assert_eq!(
+        reserved,
+        vec![PoolReservation {
+            sandbox_id: reserved_sandbox_id,
+            config_id,
+        }]
+    );
+    assert!(fixture.store.pool_reservations(&[]).await?.is_empty());
 
     Ok(())
 }

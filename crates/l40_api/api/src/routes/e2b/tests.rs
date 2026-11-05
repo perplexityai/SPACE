@@ -5104,6 +5104,27 @@ async fn failed_terminal_state_control_plane_routes_return_failed_to_place() -> 
     Ok(())
 }
 
+/// The ECW sandbox detail carries no owner email, which only the admin
+/// surface shows (`SandboxResponse::user_email`), although the row and the
+/// native response it translates both hold one.
+#[test]
+fn detail_sandbox_never_shows_the_owners_email() {
+    const EMAIL: &str = "owner@example.test";
+    let mut sandbox = test_sandbox();
+    sandbox.user_email = Some(EMAIL.to_string());
+    let response = SandboxResponse {
+        user_email: Some(EMAIL.to_string()),
+        ..native_sandbox_response(sandbox.id)
+    };
+
+    let detail =
+        build_detail_sandbox(&test_ecw_credential_keyring(), &sandbox, &response, None).unwrap();
+
+    let body = serde_json::to_string(&detail).unwrap();
+    assert!(!body.contains("user_email"), "{body}");
+    assert!(!body.contains(EMAIL), "{body}");
+}
+
 #[test]
 fn detail_sandbox_uses_cached_runtime_spec() {
     let mut sandbox = test_sandbox();

@@ -382,7 +382,7 @@ async fn each_filter_returns_exactly_its_rows() -> TestDbResult<()> {
         )
     };
     let prefix = |prefix: &str| Some(SandboxPrefix::new(prefix.to_string()));
-    let search = |text: &str| Some(SandboxSearch::new(text.to_string()));
+    let search = |text: &str| SandboxSearch::new(text).expect("a search");
     let template = |name: &str| Some(TemplateName::parse(name).expect("template name"));
     let cases: Vec<(&str, AdminSandboxFilter, &[usize])> = vec![
         (
@@ -576,12 +576,64 @@ async fn each_filter_returns_exactly_its_rows() -> TestDbResult<()> {
             &[],
         ),
         (
-            "search does not match the start of an ID",
+            "search matches the start of an ID too, without its dashes",
             AdminSandboxFilter {
-                search: search("2abc"),
+                search: search("2ABC00000000"),
                 ..AdminSandboxFilter::default()
             },
-            &[],
+            &[2],
+        ),
+        (
+            "search for an ID start behind sbx_",
+            AdminSandboxFilter {
+                search: search("sbx_1000"),
+                ..AdminSandboxFilter::default()
+            },
+            &[0, 1],
+        ),
+        (
+            "search is trimmed",
+            AdminSandboxFilter {
+                search: search("  beta  "),
+                ..AdminSandboxFilter::default()
+            },
+            &[2],
+        ),
+        (
+            "search with a template",
+            AdminSandboxFilter {
+                search: search("alpha"),
+                template: template("node"),
+                ..AdminSandboxFilter::default()
+            },
+            &[5],
+        ),
+        (
+            "search with a user",
+            AdminSandboxFilter {
+                search: search("alpha"),
+                user_id: Some(first_user.user_id),
+                ..AdminSandboxFilter::default()
+            },
+            &[0, 1],
+        ),
+        (
+            "search with a node",
+            AdminSandboxFilter {
+                search: search("0000"),
+                node: Some(NodeAssignment::Node(node_one)),
+                ..AdminSandboxFilter::default()
+            },
+            &[0, 4],
+        ),
+        (
+            "search for unassigned sandboxes",
+            AdminSandboxFilter {
+                search: search("0000"),
+                node: Some(NodeAssignment::Unassigned),
+                ..AdminSandboxFilter::default()
+            },
+            &[2, 3],
         ),
         (
             "search and prefix both apply",
@@ -884,32 +936,202 @@ fn an_id_prefix_is_the_range_of_ids_it_starts() {
 }
 
 #[test]
-fn an_id_suffix_is_the_range_of_reversed_ids_it_starts() {
-    let range = |low: &str, high: &str| Some((low.to_string(), high.to_string()));
+fn a_search_is_trimmed_and_at_least_three_characters() {
+    assert_eq!(SandboxSearch::new(""), Ok(None));
+    assert_eq!(SandboxSearch::new("   "), Ok(None));
+    assert_eq!(SandboxSearch::new("ab"), Err(SearchTooShort));
+    assert_eq!(SandboxSearch::new(" ab "), Err(SearchTooShort));
+    assert_eq!(SandboxSearch::new("é\u{10FFFF}"), Err(SearchTooShort));
+    let search = SandboxSearch::new("  abc ")
+        .expect("valid")
+        .expect("a search");
+    assert_eq!(search.text, "abc");
+    assert_eq!(
+        search.id_suffix, None,
+        "three digits are a name prefix only"
+    );
+}
+
+#[test]
+fn an_id_search_is_the_ranges_its_hex_digits_start_and_end() {
+    let suffix = |low: &str, high: &str| Some((low.to_string(), high.to_string()));
+    let prefix = |low: &str, high: &str| Some((fixed_id(low), fixed_id(high)));
     let cases = [
-        ("0a1b2c3d", range("d3c2b1a0", "d3c2b1a1")),
-        ("9ABC", range("cba9", "cba:")),
-        ("fabc", range("cbaf", "cbag")),
-        ("cafe", range("efac", "efad")),
-        ("sbx_00-0F", range("f000", "f001")),
-        ("SBX_00-0f", range("f000", "f001")),
+        (
+            "0a1b2c3d",
+            suffix("d3c2b1a0", "d3c2b1a1"),
+            prefix(
+                "0a1b2c3d-0000-0000-0000-000000000000",
+                "0a1b2c3d-ffff-ffff-ffff-ffffffffffff",
+            ),
+        ),
+        (
+            "9ABC",
+            suffix("cba9", "cba:"),
+            prefix(
+                "9abc0000-0000-0000-0000-000000000000",
+                "9abcffff-ffff-ffff-ffff-ffffffffffff",
+            ),
+        ),
+        (
+            "SBX_00-0f",
+            suffix("f000", "f001"),
+            prefix(
+                "000f0000-0000-0000-0000-000000000000",
+                "000fffff-ffff-ffff-ffff-ffffffffffff",
+            ),
+        ),
+        (
+            "e2e-1",
+            suffix("1e2e", "1e2f"),
+            prefix(
+                "e2e10000-0000-0000-0000-000000000000",
+                "e2e1ffff-ffff-ffff-ffff-ffffffffffff",
+            ),
+        ),
         (
             "0123abcd-ef01-2345-6789-abcdef012345",
-            range(
+            suffix(
                 "543210fedcba9876543210fedcba3210",
                 "543210fedcba9876543210fedcba3211",
             ),
+            prefix(
+                "0123abcd-ef01-2345-6789-abcdef012345",
+                "0123abcd-ef01-2345-6789-abcdef012345",
+            ),
         ),
-        ("abc", None),
-        ("sbx_abc", None),
-        ("-a-b-c-", None),
-        ("e2e-1", range("1e2e", "1e2f")),
-        ("beta", None),
-        ("0123abcdef0123456789abcdef0123456", None),
+        ("abc", None, None),
+        ("sbx_abc", None, None),
+        ("beta", None, None),
+        ("0123abcdef0123456789abcdef0123456", None, None),
     ];
-    for (text, expected) in cases {
-        assert_eq!(id_suffix_range(text), expected, "{text:?}");
+    for (text, expected_suffix, expected_prefix) in cases {
+        let search = SandboxSearch::new(text).expect("valid").expect("a search");
+        assert_eq!(search.id_suffix, expected_suffix, "{text:?} suffix");
+        assert_eq!(search.id_prefix, expected_prefix, "{text:?} prefix");
     }
+}
+
+#[test]
+fn a_key_range_ends_at_the_least_string_above_every_key_it_starts() {
+    let max = char::MAX.to_string();
+    let cases = [
+        ("abc".to_string(), "abd".to_string()),
+        ("ab9".to_string(), "ab:".to_string()),
+        (format!("ab{max}"), "ac".to_string()),
+        (format!("ab{max}{max}"), "ac".to_string()),
+        ("a\u{D7FF}".to_string(), "a\u{E000}".to_string()),
+        (max.repeat(3), max.repeat(NAME_KEY_CHARS + 1)),
+    ];
+    for (key, high) in cases {
+        assert_eq!(name_key_range(key.clone()), (key.clone(), high), "{key:?}");
+    }
+}
+
+/// A name search's range ends at its key's successor, so a name that
+/// continues past the text with U+10FFFF, the greatest character, matches,
+/// and so does a text that ends in it; on the page and the unpaged list.
+#[tokio::test]
+async fn a_name_search_finds_names_continuing_with_the_greatest_character() -> TestDbResult<()> {
+    let db = pg_test_db().await?;
+    let owner = seed_owner(&db.pool).await?;
+    let at = |minutes: i64| base_time() + Duration::minutes(minutes);
+    let mut ids = Vec::new();
+    for (minute, name) in [
+        (0, "Edge\u{10FFFF}one"),
+        (1, "edge\u{10FFFF}\u{10FFFF}"),
+        (2, "edgf"),
+        (3, "edge"),
+    ] {
+        let id = SandboxId::new();
+        sqlx::query(sql!(
+            "INSERT INTO sandboxes (
+                 id, name, user_id, org_id, managed_by, lifecycle, placement,
+                 network_policy_generation, created_at
+             )
+             VALUES ($1, $2, $3, $4, $5, 'started', 'placed', 1, $6)"
+        ))
+        .bind(id)
+        .bind(name)
+        .bind(owner.user_id)
+        .bind(owner.org_id)
+        .bind(SubstrateKind::Kubernetes)
+        .bind(at(minute))
+        .execute(&db.pool)
+        .await?;
+        ids.push(id);
+    }
+    for (text, expected) in [
+        ("EDGE", vec![ids[3], ids[1], ids[0]]),
+        ("edge\u{10FFFF}", vec![ids[1], ids[0]]),
+        ("edge\u{10FFFF}\u{10FFFF}", vec![ids[1]]),
+        ("edg", vec![ids[3], ids[2], ids[1], ids[0]]),
+    ] {
+        let filter = AdminSandboxFilter {
+            search: SandboxSearch::new(text).expect("valid"),
+            ..AdminSandboxFilter::default()
+        };
+        assert_eq!(
+            listed_ids(&db.pool, &filter).await?,
+            expected,
+            "{text:?}: page"
+        );
+        assert_eq!(
+            unpaged_ids(&db.pool, &filter).await?,
+            expected,
+            "{text:?}: unpaged"
+        );
+    }
+    db.pool.close().await;
+    Ok(())
+}
+
+/// A search walked a page at a time with the cursor returns the unpaged
+/// search's rows, once each and in order, across rows sharing a `created_at`.
+#[tokio::test]
+async fn a_search_walks_by_cursor_to_the_unpaged_search() -> TestDbResult<()> {
+    let db = pg_test_db().await?;
+    let owner = seed_owner(&db.pool).await?;
+    let at = |minutes: i64| base_time() + Duration::minutes(minutes);
+    for (minute, name) in [
+        (0, "walk-a"),
+        (1, "other"),
+        (1, "Walk-b"),
+        (1, "WALK-c"),
+        (2, "walk-d"),
+        (3, "elsewhere"),
+        (4, "walk-e"),
+    ] {
+        seed_sandbox(
+            &db.pool,
+            owner,
+            SeedSandbox {
+                name: Some(name),
+                created_at: Some(at(minute)),
+                ..SeedSandbox::default()
+            },
+        )
+        .await?;
+    }
+    let filter = AdminSandboxFilter {
+        search: SandboxSearch::new("walk-").expect("valid"),
+        ..AdminSandboxFilter::default()
+    };
+    let unpaged = unpaged_ids(&db.pool, &filter).await?;
+    assert_eq!(unpaged.len(), 5);
+    let mut walked = Vec::new();
+    let mut after = None;
+    loop {
+        let page = page(&db.pool, &filter, after, 2).await?;
+        walked.extend(page.rows.iter().map(|sandbox| sandbox.id));
+        if !page.has_more {
+            break;
+        }
+        after = page.rows.last().map(cursor_after);
+    }
+    assert_eq!(walked, unpaged);
+    db.pool.close().await;
+    Ok(())
 }
 
 type Bucket = (

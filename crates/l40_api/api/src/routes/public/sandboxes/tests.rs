@@ -1111,6 +1111,71 @@ async fn reads_answer_a_cleanup_required_tombstone_as_deleted() -> TestDbResult<
     .await
 }
 
+/// The native list and read carry no owner identity, the owner's email
+/// included, which only the admin surface shows (`SandboxResponse::user_email`).
+#[tokio::test]
+async fn native_reads_never_show_the_owners_email() -> TestDbResult<()> {
+    Box::pin(async {
+        const KEY: &str = "owner-email-read-test-key";
+        const EMAIL: &str = "root@local";
+        let db = pg_test_db().await?;
+        sqlx::query(pplx_space_common_core::sql!(
+            "INSERT INTO api_keys (id, org_id, name, key_hash, allowed_surfaces)
+             VALUES ($1, $2, 'owner-email-read-test', $3, ARRAY['native'])"
+        ))
+        .bind(Uuid::now_v7())
+        .bind(SEED_ORG_ID)
+        .bind(crate::auth::hash_token(KEY))
+        .execute(&db.pool)
+        .await?;
+        let owner_email: String = sqlx::query_scalar(pplx_space_common_core::sql!(
+            "SELECT email FROM users WHERE id = $1"
+        ))
+        .bind(SEED_USER_ID)
+        .fetch_one(&db.pool)
+        .await?;
+        assert_eq!(owner_email, EMAIL);
+        let id = SandboxId::new();
+        sqlx::query(pplx_space_common_core::sql!(
+            "INSERT INTO sandboxes (
+                 id, user_id, org_id, lifecycle, network_policy_override_json,
+                 network_policy_generation
+             ) VALUES ($1, $2, $3, 'started', $4, 1)"
+        ))
+        .bind(id)
+        .bind(SEED_USER_ID)
+        .bind(SEED_ORG_ID)
+        .bind(SqlJson(&pplx_space_net_common::NetworkPolicyV1::default()))
+        .execute(&db.pool)
+        .await?;
+        let state = AppState::from_pool(db.pool.clone()).await?;
+        let app = axum::Router::new()
+            .nest("/v1", crate::routes::public::v1_router(state.clone()))
+            .with_state(state);
+        for path in [
+            "/v1/sandboxes".to_string(),
+            format!("/v1/sandboxes/{}", PublicSandboxId::from(id)),
+        ] {
+            let request = axum::http::Request::get(&path)
+                .header("authorization", format!("Bearer {KEY}"))
+                .body(axum::body::Body::empty())?;
+            let response = tower::ServiceExt::oneshot(app.clone(), request).await?;
+            let status = response.status();
+            let body = axum::body::to_bytes(response.into_body(), 1024 * 1024).await?;
+            let body = String::from_utf8(body.to_vec())?;
+            assert_eq!(status, StatusCode::OK, "{path}: {body}");
+            assert!(
+                body.contains(&PublicSandboxId::from(id).to_string()),
+                "{path}: {body}"
+            );
+            assert!(!body.contains("user_email"), "{path}: {body}");
+            assert!(!body.contains(EMAIL), "{path}: {body}");
+        }
+        Ok(())
+    })
+    .await
+}
+
 #[tokio::test]
 async fn sandbox_reads_expose_only_the_current_failure_episode() -> TestDbResult<()> {
     let db = pg_test_db().await?;

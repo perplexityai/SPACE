@@ -8,8 +8,9 @@
 //! its ID range, so the bound has to hold under both plan modes.
 //!
 //! [`a_search_reads_only_the_rows_it_matches`] explains the page statement
-//! and the unpaged one for a name prefix in another case, an ID label and a
-//! text nothing matches, under both modes, and bounds the rows every plan
+//! and the unpaged one for a name prefix in another case, at full length and
+//! at the three characters a search needs, an ID label and a text nothing
+//! matches, under both modes, and bounds the rows every plan
 //! node handles by [`MAX_ROWS_HANDLED`]. The fixture is many times larger, so
 //! a plan that reads the table fails. To show that the bound is what the
 //! indexes buy, it then drops both and requires the generic plan of each
@@ -47,6 +48,7 @@ async fn a_search_reads_only_the_rows_it_matches() -> TestResult {
     let fixture = seed(pool).await?;
     let searches = [
         ("a name prefix in another case", "nEEDLE".to_string()),
+        ("the shortest name prefix, three letters", "NEE".to_string()),
         ("an ID label", fixture.label.clone()),
         ("a text nothing matches", "no-such-sandbox".to_string()),
     ];
@@ -102,22 +104,31 @@ async fn explain(
     text: &str,
     plan_cache_mode: &str,
 ) -> TestResult<PlanNode> {
-    let search = SandboxSearch::new(text.to_string());
-    let literal =
-        |value: Option<&str>| value.map_or("NULL".to_string(), |value| format!("'{value}'"));
-    let (low, high) = search
-        .id_suffix
-        .as_ref()
-        .map(|(low, high)| (low.as_str(), high.as_str()))
-        .unzip();
-    let search_values = format!("'{}', {}, {}", search.text, literal(low), literal(high));
+    let search = SandboxSearch::new(text)?.ok_or("an empty search")?;
+    let binds = SearchBinds::new(pool, &search).await?;
+    let literal = |value: Option<String>| {
+        value.map_or("NULL".to_string(), |value| {
+            format!("'{}'", value.replace('\'', "''"))
+        })
+    };
+    let search_values = [
+        literal(Some(binds.text.to_string())),
+        literal(Some(binds.name_key.0.clone())),
+        literal(Some(binds.name_key.1.clone())),
+        literal(binds.id_suffix.map(|(low, _)| low.clone())),
+        literal(binds.id_suffix.map(|(_, high)| high.clone())),
+        literal(binds.id_prefix.map(|(low, _)| low.to_string())),
+        literal(binds.id_prefix.map(|(_, high)| high.to_string())),
+    ]
+    .join(", ");
+    let search_types = "text, text, text, text, text, uuid, uuid";
     let filters = "NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL";
     let filter_types =
         "uuid, text[], text, uuid, timestamptz, timestamptz, text, uuid, uuid, uuid, boolean";
     let (prepare, execute) = match statement {
         Statement::Page => (
             format!(
-                "PREPARE search({filter_types}, text, text, text, timestamptz, uuid, bigint, \
+                "PREPARE search({filter_types}, {search_types}, timestamptz, uuid, bigint, \
                  bigint, bigint) AS {}",
                 ADMIN_SEARCH_PAGE_SQL.as_str()
             ),
@@ -129,7 +140,7 @@ async fn explain(
         ),
         Statement::Unpaged => (
             format!(
-                "PREPARE search({filter_types}, text, text, text, bigint) AS {}",
+                "PREPARE search({filter_types}, {search_types}, bigint) AS {}",
                 ADMIN_SEARCH_LIST_SQL.as_str()
             ),
             format!("EXECUTE search({filters}, {search_values}, 100)"),
