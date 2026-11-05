@@ -864,7 +864,7 @@ pub(crate) async fn reap_stuck_deleting(
                     },
                     "template GC reaper: resolved stuck-deleting row",
                 );
-                pplx_space_metrics::template::gc_reaper_resolution(match state {
+                crate::metrics::gc_reaper_resolution(match state {
                     ReaperDiskState::Intact => "reset_to_ready",
                     ReaperDiskState::Missing => "drop_row",
                 });
@@ -1042,8 +1042,8 @@ pub(crate) enum GcTickError {
 }
 
 impl GcTickError {
-    fn metric_reason(&self) -> pplx_space_metrics::template::TemplateGcTickFailure {
-        use pplx_space_metrics::template::TemplateGcTickFailure as Failure;
+    fn metric_reason(&self) -> crate::metrics::TemplateGcTickFailure {
+        use crate::metrics::TemplateGcTickFailure as Failure;
         match self {
             Self::Task(_) => Failure::Task,
             Self::PlanSnapshot(_) => Failure::PlanSnapshot,
@@ -1160,7 +1160,7 @@ pub(crate) async fn gc_tick(
             Ok(Ok(EvictionOutcome::Deleted)) => {
                 report.deleted += 1;
                 report.bytes_freed = report.bytes_freed.saturating_add(candidate.size_bytes);
-                pplx_space_metrics::template::gc_deleted(&candidate.name);
+                crate::metrics::gc_deleted(&candidate.name);
                 // Surface the deletion to the cluster immediately so
                 // scheduler template-presence labels don't stay stale
                 // until the next periodic node-state reconcile.
@@ -1168,19 +1168,19 @@ pub(crate) async fn gc_tick(
             }
             Ok(Ok(EvictionOutcome::SkippedPinnedAtExecute)) => {
                 report.skipped_pinned += 1;
-                pplx_space_metrics::template::gc_skipped("pinned_at_execute");
+                crate::metrics::gc_skipped("pinned_at_execute");
             }
             Ok(Ok(EvictionOutcome::SkippedActiveAtExecute)) => {
                 report.skipped_active += 1;
-                pplx_space_metrics::template::gc_skipped("active_at_execute");
+                crate::metrics::gc_skipped("active_at_execute");
             }
             Ok(Ok(EvictionOutcome::SkippedWarmPoolAtExecute)) => {
                 report.skipped_warm_pool += 1;
-                pplx_space_metrics::template::gc_skipped("warm_pool_at_execute");
+                crate::metrics::gc_skipped("warm_pool_at_execute");
             }
             Ok(Ok(EvictionOutcome::SkippedRowMissing)) => {
                 report.skipped_row_missing += 1;
-                pplx_space_metrics::template::gc_skipped("row_missing");
+                crate::metrics::gc_skipped("row_missing");
             }
             Ok(Err(err)) => {
                 warn!(
@@ -1190,7 +1190,7 @@ pub(crate) async fn gc_tick(
                     "template GC: candidate delete failed"
                 );
                 report.errors += 1;
-                pplx_space_metrics::template::gc_skipped("error");
+                crate::metrics::gc_skipped("error");
             }
             Err(err) => {
                 warn!(
@@ -1200,7 +1200,7 @@ pub(crate) async fn gc_tick(
                     "template GC: candidate delete task panicked"
                 );
                 report.errors += 1;
-                pplx_space_metrics::template::gc_skipped("error");
+                crate::metrics::gc_skipped("error");
             }
         }
     }
@@ -1333,8 +1333,8 @@ pub async fn run_loop(
                         error = %err,
                         "template GC: skipping tick because active-sandbox snapshot is unavailable",
                     );
-                    pplx_space_metrics::template::gc_tick(
-                        Err(pplx_space_metrics::template::TemplateGcTickFailure::ActiveSetUnavailable),
+                    crate::metrics::gc_tick(
+                        Err(crate::metrics::TemplateGcTickFailure::ActiveSetUnavailable),
                         tick_started,
                         0,
                         0,
@@ -1365,8 +1365,8 @@ pub async fn run_loop(
                         error = %err,
                         "template GC: skipping tick because warm-pool protected set is unavailable",
                     );
-                    pplx_space_metrics::template::gc_tick(
-                        Err(pplx_space_metrics::template::TemplateGcTickFailure::WarmPoolUnavailable),
+                    crate::metrics::gc_tick(
+                        Err(crate::metrics::TemplateGcTickFailure::WarmPoolUnavailable),
                         tick_started,
                         0,
                         0,
@@ -1415,7 +1415,7 @@ pub async fn run_loop(
                     bytes_freed = report.bytes_freed,
                     "template GC tick complete",
                 );
-                pplx_space_metrics::template::gc_tick(
+                crate::metrics::gc_tick(
                     Ok(()),
                     tick_started,
                     report.bytes_before,
@@ -1425,13 +1425,7 @@ pub async fn run_loop(
             }
             Err(err) => {
                 warn!(error = %err, "template GC tick failed");
-                pplx_space_metrics::template::gc_tick(
-                    Err(err.metric_reason()),
-                    tick_started,
-                    0,
-                    0,
-                    0,
-                );
+                crate::metrics::gc_tick(Err(err.metric_reason()), tick_started, 0, 0, 0);
             }
         }
 

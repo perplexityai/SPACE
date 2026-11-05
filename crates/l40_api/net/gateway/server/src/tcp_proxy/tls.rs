@@ -465,7 +465,7 @@ impl DialTimer {
     }
 
     fn record(&self, outcome: &str) {
-        pplx_space_metrics::gateway::origin_tcp_connect_duration_ms(
+        crate::metrics::origin_tcp_connect_duration_ms(
             outcome,
             self.started_at.elapsed().as_secs_f64() * 1_000.0,
         );
@@ -499,7 +499,7 @@ impl HandshakeAttempt {
         self.finished = true;
         let outcome = match result {
             Ok(_) => {
-                pplx_space_metrics::gateway::tls_handshake(
+                crate::metrics::tls_handshake(
                     self.leg.as_str(),
                     "success",
                     "none",
@@ -515,7 +515,7 @@ impl HandshakeAttempt {
     }
 
     fn record_duration(&self, outcome: &str) {
-        pplx_space_metrics::gateway::tls_handshake_duration_ms(
+        crate::metrics::tls_handshake_duration_ms(
             self.leg.as_str(),
             outcome,
             self.started_at.elapsed().as_secs_f64() * 1_000.0,
@@ -537,7 +537,7 @@ impl HandshakeAttempt {
         } else {
             "error"
         };
-        pplx_space_metrics::gateway::tls_handshake(
+        crate::metrics::tls_handshake(
             leg.as_str(),
             outcome,
             failure.reason,
@@ -565,7 +565,7 @@ impl Drop for HandshakeAttempt {
         if self.finished {
             return;
         }
-        pplx_space_metrics::gateway::tls_handshake(
+        crate::metrics::tls_handshake(
             self.leg.as_str(),
             "cancelled",
             "work_dropped",
@@ -674,7 +674,7 @@ impl<T> TlsIo<T> {
         let (failure, level) =
             TlsFailure::established(self.leg, operation, error, self.activity.is_idle());
         self.error_reported = true;
-        pplx_space_metrics::gateway::tls_connection_error(
+        crate::metrics::tls_connection_error(
             self.leg.as_str(),
             failure.reason,
             io_kind_tag(Some(error.kind())),

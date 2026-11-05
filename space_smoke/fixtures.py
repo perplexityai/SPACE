@@ -3714,8 +3714,8 @@ class SuspendCodecAssertions:
     def stream_rejections(self, node_name: str) -> dict[str, float]:
         """node-manager's cumulative rejected send streams on `node_name`, by reason.
 
-        `node_mgr.btrfs_send.stream_rejected` (`crates/libs/metrics/src/
-        node_manager.rs`), read from the bench's Prometheus. A series appears
+        `node_mgr.btrfs_send.stream_rejected` (`crates/l40_api/node/mgr/server/
+        src/metrics/node_manager.rs`), read from the bench's Prometheus. A series appears
         with its first rejection, so a reason absent here has counted none.
         """
 
@@ -4023,8 +4023,8 @@ class SuspendCodecAssertions:
         `trigger=on_demand` with a result that put the build on disk, read
         from the bench's Prometheus. Its `trigger` tag exists so dashboards
         can split caller-driven pulls from prefetch (`request_tags` in
-        `crates/libs/metrics/src/template.rs`); that tag set carries no
-        content hash, so `tag=by_hash` — a lookup by exact build, as the
+        `crates/l40_api/template/mgr/server/src/metrics.rs`); that tag set
+        carries no content hash, so `tag=by_hash` — a lookup by exact build, as the
         restore asks for its parent — narrows it to that kind of lookup. A
         pull that joined a prefetch already in flight counts as `coalesced`:
         the restore's own lookup still asked for the parent and got it.

@@ -11,7 +11,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
 
-use pplx_space_metrics::gateway::TcpConnectionFault;
+use crate::metrics::TcpConnectionFault;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 /// Which peer of a relay an observation came from.

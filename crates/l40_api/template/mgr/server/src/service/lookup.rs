@@ -203,7 +203,7 @@ impl TemplateManagerService {
         {
             Ok(mut resp) => {
                 resp.authorized_org_id = caller_org.map(|org| org.to_string());
-                pplx_space_metrics::template::get_cache_hit(&cache_tags);
+                crate::metrics::get_cache_hit(&cache_tags);
                 if snapshot_selector.is_none() && resp.snapshot_dir.is_none() {
                     self.spawn_desired_base_snapshot_reconcile(
                         template_id.clone(),
@@ -222,7 +222,7 @@ impl TemplateManagerService {
                 return Err(status);
             }
             Err(_) => {
-                pplx_space_metrics::template::get_cache_miss(&cache_tags);
+                crate::metrics::get_cache_miss(&cache_tags);
             }
         }
 

@@ -109,8 +109,8 @@ impl SandboxManagerService {
             base_details(),
         );
         let fail = |error: String| {
-            pplx_space_metrics::sandbox::worker::net_gateway_cycle(
-                pplx_space_metrics::sandbox::worker::NetGatewayCycleResult::Error,
+            crate::metrics::sandbox::worker::net_gateway_cycle(
+                crate::metrics::sandbox::worker::NetGatewayCycleResult::Error,
             );
             emit_sandbox_event(
                 &id,
@@ -186,8 +186,8 @@ impl SandboxManagerService {
             .await
             .map_err(|error| fail(format!("relaunch net-gateway failed: {error}")))?;
 
-        pplx_space_metrics::sandbox::worker::net_gateway_cycle(
-            pplx_space_metrics::sandbox::worker::NetGatewayCycleResult::Ok,
+        crate::metrics::sandbox::worker::net_gateway_cycle(
+            crate::metrics::sandbox::worker::NetGatewayCycleResult::Ok,
         );
         emit_sandbox_event(
             &id,

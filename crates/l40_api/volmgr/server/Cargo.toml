@@ -53,7 +53,7 @@ pplx-space-service-mutex = { workspace = true }
 pplx-space-sandbox-grpc = { workspace = true }
 pplx-space-sqlite = { workspace = true }
 pplx-space-credmgr-client = { workspace = true }
-pplx-space-metrics = { workspace = true }
+pplx-space-metrics-emit = { workspace = true }
 pplx-space-object-store = { workspace = true }
 pplx-space-uds-peer-auth = { workspace = true }
 pplx-space-unix-socket-bind = { workspace = true }

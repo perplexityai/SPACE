@@ -5,12 +5,12 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
+use crate::metrics::snapshot::SchedulerCaptureSkip;
 use pplx_space_common_core::types::{LocalArtifactId, SandboxId};
 use pplx_space_events::{
     SandboxEventDetails, SandboxEventSource, SandboxEventTrigger, SandboxEventType,
     emit_sandbox_event,
 };
-use pplx_space_metrics::snapshot::SchedulerCaptureSkip;
 use tokio::sync::Mutex;
 
 use super::{CheckpointContext, SandboxSnapshotState};
@@ -190,14 +190,12 @@ pub(super) async fn prune_and_capture<T>(
     };
     let remaining = staged.delete(node_client, &artifacts, tick).await;
     if let Err(error) = pruned {
-        pplx_space_metrics::snapshot::scheduler_capture_skipped(SchedulerCaptureSkip::PruneFailed);
+        crate::metrics::snapshot::scheduler_capture_skipped(SchedulerCaptureSkip::PruneFailed);
         return Err(error);
     }
     *unowned_staging = Some(remaining);
     if remaining >= UNOWNED_STAGING_LIMIT {
-        pplx_space_metrics::snapshot::scheduler_capture_skipped(
-            SchedulerCaptureSkip::StagingBacklog,
-        );
+        crate::metrics::snapshot::scheduler_capture_skipped(SchedulerCaptureSkip::StagingBacklog);
         tracing::warn!(
             sandbox_id,
             unowned_staging = remaining,
@@ -419,7 +417,7 @@ pub(super) async fn emit_unowned_staging_gauge(
         .values()
         .filter_map(|state| state.unowned_staging)
         .sum();
-    pplx_space_metrics::snapshot::scheduler_unowned_staging(total);
+    crate::metrics::snapshot::scheduler_unowned_staging(total);
 }
 
 /// For each of `paths`, whether it still exists as GC staging that no row

@@ -148,7 +148,7 @@ async fn run_tick(
     emit_usage_gauges(usage);
 
     let decision = evaluate(usage);
-    pplx_space_metrics::node_disk::btrfs_balance_needed(decision == BalanceDecision::BalanceNeeded);
+    crate::metrics::node_disk::btrfs_balance_needed(decision == BalanceDecision::BalanceNeeded);
     match decision {
         BalanceDecision::Healthy => return,
         BalanceDecision::InsufficientSlack => {
@@ -229,7 +229,7 @@ async fn run_balance_ladder(initial: FilesystemUsage, shutdown: &CancellationTok
                 break;
             }
         }
-        pplx_space_metrics::node_disk::btrfs_balance_stage_runs(dusage);
+        crate::metrics::node_disk::btrfs_balance_stage_runs(dusage);
 
         if !wait_for_balance_idle(shutdown).await {
             return;
@@ -253,9 +253,9 @@ async fn run_balance_ladder(initial: FilesystemUsage, shutdown: &CancellationTok
     let reclaimed_bytes = current
         .device_unallocated_bytes
         .saturating_sub(initial.device_unallocated_bytes);
-    pplx_space_metrics::node_disk::btrfs_balance_reclaimed_bytes(reclaimed_bytes);
+    crate::metrics::node_disk::btrfs_balance_reclaimed_bytes(reclaimed_bytes);
     if current.device_unallocated_bytes < UNALLOCATED_LOW_BYTES {
-        pplx_space_metrics::node_disk::btrfs_balance_ineffective();
+        crate::metrics::node_disk::btrfs_balance_ineffective();
         warn!(
             reclaimed_bytes,
             device_unallocated_bytes = current.device_unallocated_bytes,
@@ -324,9 +324,9 @@ async fn probe_usage() -> Option<FilesystemUsage> {
 }
 
 fn emit_usage_gauges(usage: FilesystemUsage) {
-    pplx_space_metrics::node_disk::btrfs_unallocated_bytes(usage.device_unallocated_bytes);
-    pplx_space_metrics::node_disk::btrfs_data_slack_bytes(usage.data_slack_bytes());
-    pplx_space_metrics::node_disk::btrfs_metadata_available_bytes(usage.metadata_available_bytes());
+    crate::metrics::node_disk::btrfs_unallocated_bytes(usage.device_unallocated_bytes);
+    crate::metrics::node_disk::btrfs_data_slack_bytes(usage.data_slack_bytes());
+    crate::metrics::node_disk::btrfs_metadata_available_bytes(usage.metadata_available_bytes());
 }
 
 #[cfg(test)]

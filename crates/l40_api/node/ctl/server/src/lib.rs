@@ -54,6 +54,7 @@ mod dirty_state;
 mod facets;
 #[cfg(feature = "kubernetes")]
 mod kubernetes_controller;
+pub mod metrics;
 mod orphan_inventory;
 mod outbound_retry;
 mod util;
@@ -1979,7 +1980,7 @@ impl NodeCtlWorker {
                         return None;
                     }
                 };
-                pplx_space_metrics::reconcile::claimed(refs.len() as u64);
+                crate::metrics::reconcile::claimed(refs.len() as u64);
                 if refs.is_empty() {
                     None
                 } else {

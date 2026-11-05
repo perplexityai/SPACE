@@ -49,13 +49,7 @@ pub(super) fn emit_transfer_phase_duration(
     mode: MaterializationMode,
     started_at: Instant,
 ) {
-    pplx_space_metrics::volume_manager::transfer_phase_duration(
-        kind,
-        artifact,
-        phase.as_str(),
-        mode,
-        started_at,
-    );
+    crate::metrics::transfer_phase_duration(kind, artifact, phase.as_str(), mode, started_at);
 }
 
 pub(super) fn emit_transfer_throughput_mib_s(
@@ -69,13 +63,7 @@ pub(super) fn emit_transfer_throughput_mib_s(
     let elapsed = started_at.elapsed().as_secs_f64();
     if elapsed > 0.0 {
         let mib_s = (bytes as f64 / 1024.0 / 1024.0) / elapsed;
-        pplx_space_metrics::volume_manager::transfer_throughput_mib_s(
-            kind,
-            artifact,
-            phase.as_str(),
-            mode,
-            mib_s,
-        );
+        crate::metrics::transfer_throughput_mib_s(kind, artifact, phase.as_str(), mode, mib_s);
     }
 }
 
@@ -116,7 +104,7 @@ pub(super) async fn observe_decompression_allocation(
     } else {
         MaterializationLayout::Dense
     };
-    pplx_space_metrics::volume_manager::transfer_materialization_allocation(
+    crate::metrics::transfer_materialization_allocation(
         kind,
         artifact,
         report.mode,

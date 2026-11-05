@@ -142,7 +142,7 @@ impl Drop for WireAccounting {
         let tx = self.written.load(Ordering::Relaxed);
         let rx = self.read.load(Ordering::Relaxed);
         self.stats.add_network_bytes(tx, rx);
-        pplx_space_metrics::gateway::tcp_bytes("tx", tx);
-        pplx_space_metrics::gateway::tcp_bytes("rx", rx);
+        crate::metrics::tcp_bytes("tx", tx);
+        crate::metrics::tcp_bytes("rx", rx);
     }
 }

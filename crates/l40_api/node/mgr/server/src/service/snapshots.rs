@@ -1543,7 +1543,7 @@ async fn prepare_balloon_for_snapshot(
     sandbox_id: &str,
     hint_timeout: std::time::Duration,
 ) {
-    use pplx_space_metrics::node_manager::{
+    use crate::metrics::node_manager::{
         BalloonHintResult, BalloonSnapshotProbe, balloon_free_page_hint,
         balloon_snapshot_probe_failed, balloon_snapshot_statistics,
     };

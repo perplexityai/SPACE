@@ -69,9 +69,9 @@ pub async fn reconcile_ssd_headroom_tier(
     let tier = desired_tier(cache_disk.as_ref());
     let blocked = desired_block(cache_disk.as_ref());
     if let Some(cache_disk) = cache_disk.as_ref() {
-        pplx_space_metrics::node_disk::ssd_free_fraction(statvfs_free_fraction(cache_disk));
+        crate::metrics::node_disk::ssd_free_fraction(statvfs_free_fraction(cache_disk));
     }
-    pplx_space_metrics::node_disk::ssd_headroom_tier(tier.as_u8());
+    crate::metrics::node_disk::ssd_headroom_tier(tier.as_u8());
 
     let current_metadata =
         node_cache

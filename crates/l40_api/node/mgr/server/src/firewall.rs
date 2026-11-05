@@ -12,8 +12,8 @@ use std::net::{IpAddr, Ipv4Addr};
 use std::process::Output;
 mod host_cache;
 
+use crate::metrics::node_manager::GuestUdp443Action;
 use crate::net::{SANDBOX_SUBNET, SANDBOX_SUBNET_PREFIX_LEN};
-use pplx_space_metrics::node_manager::GuestUdp443Action;
 use pplx_space_net_common::PLATFORM_EGRESS_HARD_DENY_CIDRS;
 
 const SPACE_TABLE: &str = "space";

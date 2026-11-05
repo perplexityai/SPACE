@@ -218,9 +218,7 @@ impl TransferExecutor {
                 .metadata()
                 .map_err(|error| JobError::Retriable(error.to_string()))?
                 .len();
-            use pplx_space_metrics::volume_manager::{
-                PushPayloadEncoding, PushPayloadPhase, push_payload,
-            };
+            use crate::metrics::{PushPayloadEncoding, PushPayloadPhase, push_payload};
             push_payload(
                 "rootfs_btrfs_send",
                 if compress {
@@ -256,9 +254,7 @@ impl TransferExecutor {
                         wire,
                     );
                 } else {
-                    use pplx_space_metrics::volume_manager::{
-                        PushPayloadEncoding, PushPayloadPhase, push_payload,
-                    };
+                    use crate::metrics::{PushPayloadEncoding, PushPayloadPhase, push_payload};
                     push_payload(
                         "rootfs_btrfs_send",
                         if self.config.compress {

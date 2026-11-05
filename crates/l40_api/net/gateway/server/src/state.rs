@@ -537,9 +537,7 @@ impl GatewayNetworkState {
 
             attempts = attempts.saturating_add(1);
             self.set_retry_backoff(retry_delay).await;
-            pplx_space_metrics::gateway::policy_hydration_retry(
-                NetworkStateReason::SelfRetry.as_str(),
-            );
+            crate::metrics::policy_hydration_retry(NetworkStateReason::SelfRetry.as_str());
             let snapshot = self
                 .refresh(loader.clone(), None, NetworkStateReason::SelfRetry)
                 .instrument(startup_pass.unwrap_or_else(tracing::Span::none))
@@ -636,7 +634,7 @@ impl GatewayNetworkState {
                 inner.current_retry_backoff_ms = 0;
                 inner.consecutive_hydration_failures =
                     inner.consecutive_hydration_failures.saturating_add(1);
-                pplx_space_metrics::gateway::policy_hydration_error("permanent");
+                crate::metrics::policy_hydration_error("permanent");
                 record_hydration_failures(
                     inner.last_error_kind,
                     inner.consecutive_hydration_failures,
@@ -664,7 +662,7 @@ impl GatewayNetworkState {
                 inner.last_error_kind = NetworkPolicyErrorKind::None;
                 inner.current_retry_backoff_ms = 0;
                 inner.consecutive_hydration_failures = 0;
-                pplx_space_metrics::gateway::policy_ref("no_identity", inner.mode.as_str());
+                crate::metrics::policy_ref("no_identity", inner.mode.as_str());
                 record_hydration_failures(
                     inner.last_error_kind,
                     inner.consecutive_hydration_failures,
@@ -737,11 +735,8 @@ impl GatewayNetworkState {
                         inner.last_error_kind = NetworkPolicyErrorKind::None;
                         inner.current_retry_backoff_ms = 0;
                         inner.consecutive_hydration_failures = 0;
-                        pplx_space_metrics::gateway::policy_hydration_latency(
-                            "success",
-                            latency_ms as f64,
-                        );
-                        pplx_space_metrics::gateway::policy_ref(
+                        crate::metrics::policy_hydration_latency("success", latency_ms as f64);
+                        crate::metrics::policy_ref(
                             pulled.policy_ref.authority_label(),
                             inner.mode.as_str(),
                         );
@@ -786,8 +781,8 @@ impl GatewayNetworkState {
                         inner.last_error_kind = NetworkPolicyErrorKind::PolicyRefMismatch;
                         inner.consecutive_hydration_failures =
                             inner.consecutive_hydration_failures.saturating_add(1);
-                        pplx_space_metrics::gateway::policy_hydration_error("policy_ref_mismatch");
-                        pplx_space_metrics::gateway::policy_ref(
+                        crate::metrics::policy_hydration_error("policy_ref_mismatch");
+                        crate::metrics::policy_ref(
                             pulled.policy_ref.authority_label(),
                             inner.mode.as_str(),
                         );
@@ -806,11 +801,8 @@ impl GatewayNetworkState {
                         inner.last_error_kind = NetworkPolicyErrorKind::LoaderError;
                         inner.consecutive_hydration_failures =
                             inner.consecutive_hydration_failures.saturating_add(1);
-                        pplx_space_metrics::gateway::policy_hydration_error("invalid_policy_ref");
-                        pplx_space_metrics::gateway::policy_hydration_latency(
-                            "error",
-                            latency_ms as f64,
-                        );
+                        crate::metrics::policy_hydration_error("invalid_policy_ref");
+                        crate::metrics::policy_hydration_latency("error", latency_ms as f64);
                         warn!(
                             last_error = %inner.last_error,
                             latency_ms,
@@ -826,11 +818,8 @@ impl GatewayNetworkState {
                         inner.last_error_kind = NetworkPolicyErrorKind::LoaderError;
                         inner.consecutive_hydration_failures =
                             inner.consecutive_hydration_failures.saturating_add(1);
-                        pplx_space_metrics::gateway::policy_hydration_error("loader_error");
-                        pplx_space_metrics::gateway::policy_hydration_latency(
-                            "error",
-                            latency_ms as f64,
-                        );
+                        crate::metrics::policy_hydration_error("loader_error");
+                        crate::metrics::policy_hydration_latency("error", latency_ms as f64);
                         warn!(
                             last_error = %inner.last_error,
                             latency_ms,
@@ -849,11 +838,8 @@ impl GatewayNetworkState {
                         inner.last_error_kind = NetworkPolicyErrorKind::Timeout;
                         inner.consecutive_hydration_failures =
                             inner.consecutive_hydration_failures.saturating_add(1);
-                        pplx_space_metrics::gateway::policy_hydration_error("timeout");
-                        pplx_space_metrics::gateway::policy_hydration_latency(
-                            "timeout",
-                            latency_ms as f64,
-                        );
+                        crate::metrics::policy_hydration_error("timeout");
+                        crate::metrics::policy_hydration_latency("timeout", latency_ms as f64);
                         warn!(
                             latency_ms,
                             reason = reason.as_str(),
@@ -897,12 +883,12 @@ impl GatewayNetworkState {
                 NetworkState::PendingPolicy => {
                     if pending_waiter.is_none() {
                         pending_waiter = Some(self.start_tcp_pending_waiter());
-                        pplx_space_metrics::gateway::pending_tcp_wait("started");
+                        crate::metrics::pending_tcp_wait("started");
                     }
                     let now = Instant::now();
                     if now >= deadline {
                         pending_waiter.take();
-                        pplx_space_metrics::gateway::pending_timeout("tcp");
+                        crate::metrics::pending_timeout("tcp");
                         record_tcp_pending_wait("timeout", started_at);
                         return TrafficPolicy::NotReady(PolicyNotReady::PendingPolicyTimeout);
                     }
@@ -926,7 +912,7 @@ impl GatewayNetworkState {
                             continue;
                         }
                         pending_waiter.take();
-                        pplx_space_metrics::gateway::pending_timeout("tcp");
+                        crate::metrics::pending_timeout("tcp");
                         record_tcp_pending_wait("timeout", started_at);
                         return TrafficPolicy::NotReady(PolicyNotReady::PendingPolicyTimeout);
                     }
@@ -1068,11 +1054,7 @@ fn set_mode(inner: &mut NetworkStateInner, mode: NetworkState, reason: NetworkSt
     if inner.mode == mode {
         return;
     }
-    pplx_space_metrics::gateway::network_state_transition(
-        inner.mode.as_str(),
-        mode.as_str(),
-        reason.as_str(),
-    );
+    crate::metrics::network_state_transition(inner.mode.as_str(), mode.as_str(), reason.as_str());
     inner.last_transition_unix_ms = unix_time_ms();
     inner.mode = mode;
 }
@@ -1141,7 +1123,7 @@ fn record_hydration_failures(active_kind: NetworkPolicyErrorKind, active_failure
         } else {
             0
         };
-        pplx_space_metrics::gateway::policy_hydration_consecutive_failures(kind.as_str(), failures);
+        crate::metrics::policy_hydration_consecutive_failures(kind.as_str(), failures);
     }
 }
 
@@ -1160,17 +1142,14 @@ fn unix_time_ms() -> u64 {
 }
 
 fn record_tcp_pending_wait(result: &str, started_at: Instant) {
-    pplx_space_metrics::gateway::pending_tcp_wait(result);
-    pplx_space_metrics::gateway::pending_tcp_wait_ms(
-        result,
-        started_at.elapsed().as_millis() as f64,
-    );
+    crate::metrics::pending_tcp_wait(result);
+    crate::metrics::pending_tcp_wait_ms(result, started_at.elapsed().as_millis() as f64);
 }
 
 fn record_pending_tcp_slow_wait(snapshot: &NetworkStateSnapshot, started_at: Instant) {
-    pplx_space_metrics::gateway::pending_tcp_slow_wait(
-        effective_network_policy_ref_authority_label(&snapshot.installed_policy_ref),
-    );
+    crate::metrics::pending_tcp_slow_wait(effective_network_policy_ref_authority_label(
+        &snapshot.installed_policy_ref,
+    ));
     let wait_ms = u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
     // Only the hydration wait reaches here; unavailable interception
     // dependencies deny the connection instead of holding it. Carry the
@@ -1186,9 +1165,9 @@ fn record_pending_tcp_slow_wait(snapshot: &NetworkStateSnapshot, started_at: Ins
 
 fn record_not_ready_denial(protocol: &str, reason: PolicyNotReady) {
     match reason {
-        PolicyNotReady::NoIdentity => pplx_space_metrics::gateway::no_identity_denied(protocol),
+        PolicyNotReady::NoIdentity => crate::metrics::no_identity_denied(protocol),
         PolicyNotReady::Draining | PolicyNotReady::Stopped => {
-            pplx_space_metrics::gateway::draining_closed(protocol)
+            crate::metrics::draining_closed(protocol)
         }
         _ => {}
     }

@@ -69,9 +69,9 @@ async fn run_loop(pool: Arc<NetworkPool>, interval: Duration, shutdown: Cancella
                         continue;
                     }
                 };
-                pplx_space_metrics::sandbox::worker::leaked_cgroups(stats.leaked);
+                crate::metrics::sandbox_worker::leaked_cgroups(stats.leaked);
                 if stats.reclaimed > 0 || stats.failed > 0 {
-                    pplx_space_metrics::sandbox::worker::cgroups_reclaimed(stats.reclaimed as u64);
+                    crate::metrics::sandbox_worker::cgroups_reclaimed(stats.reclaimed as u64);
                     info!(
                         reclaimed = stats.reclaimed,
                         failed = stats.failed,

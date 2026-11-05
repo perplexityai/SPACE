@@ -137,7 +137,7 @@ impl TerminalTeardownSuspend {
             Self::AwaitingDelete => Some(teardown_suspend_prepare_response(
                 TeardownSuspendOutcome::Pending,
                 Some("sandbox is deleting; its delete receipt releases this execution".to_string()),
-                pplx_space_metrics::sandbox::worker::TeardownSuspendPrepareOutcome::Pending,
+                crate::metrics::sandbox::worker::TeardownSuspendPrepareOutcome::Pending,
                 started_at,
             )),
             Self::Deleted => Some(deleted_teardown_suspend_response(started_at)),
@@ -151,7 +151,7 @@ fn deleted_teardown_suspend_response(
     teardown_suspend_prepare_response(
         TeardownSuspendOutcome::Deleted,
         Some("a generation-fenced local delete covers this execution".to_string()),
-        pplx_space_metrics::sandbox::worker::TeardownSuspendPrepareOutcome::Deleted,
+        crate::metrics::sandbox::worker::TeardownSuspendPrepareOutcome::Deleted,
         started_at,
     )
 }
@@ -159,10 +159,10 @@ fn deleted_teardown_suspend_response(
 fn teardown_suspend_prepare_response(
     outcome: TeardownSuspendOutcome,
     reason: Option<String>,
-    metric_outcome: pplx_space_metrics::sandbox::worker::TeardownSuspendPrepareOutcome,
+    metric_outcome: crate::metrics::sandbox::worker::TeardownSuspendPrepareOutcome,
     started_at: std::time::Instant,
 ) -> Response<PrepareTeardownSuspendResponse> {
-    pplx_space_metrics::sandbox::worker::teardown_suspend_prepare(metric_outcome, started_at);
+    crate::metrics::sandbox::worker::teardown_suspend_prepare(metric_outcome, started_at);
     let span = tracing::Span::current();
     span.record("grpc.response.outcome", outcome.as_str_name());
     if let Some(reason) = reason.as_deref() {
@@ -189,7 +189,7 @@ fn durable_teardown_suspend_prepare_response(
     let mut response = teardown_suspend_prepare_response(
         TeardownSuspendOutcome::Durable,
         None,
-        pplx_space_metrics::sandbox::worker::TeardownSuspendPrepareOutcome::Durable,
+        crate::metrics::sandbox::worker::TeardownSuspendPrepareOutcome::Durable,
         started_at,
     )
     .into_inner();
@@ -258,7 +258,7 @@ impl SandboxManagerService {
             return Ok(teardown_suspend_prepare_response(
                 TeardownSuspendOutcome::Pending,
                 Some("sandbox record is not present on this node".to_string()),
-                pplx_space_metrics::sandbox::worker::TeardownSuspendPrepareOutcome::Pending,
+                crate::metrics::sandbox::worker::TeardownSuspendPrepareOutcome::Pending,
                 metric_started_at,
             ));
         };
@@ -267,7 +267,7 @@ impl SandboxManagerService {
             return Ok(teardown_suspend_prepare_response(
                 TeardownSuspendOutcome::Superseded,
                 Some("a generation-fenced activation rollback retired this execution".to_string()),
-                pplx_space_metrics::sandbox::worker::TeardownSuspendPrepareOutcome::Superseded,
+                crate::metrics::sandbox::worker::TeardownSuspendPrepareOutcome::Superseded,
                 metric_started_at,
             ));
         }
@@ -285,7 +285,7 @@ impl SandboxManagerService {
                 return Ok(teardown_suspend_prepare_response(
                     TeardownSuspendOutcome::Pending,
                     Some("local runtime execution generation is not available".to_string()),
-                    pplx_space_metrics::sandbox::worker::TeardownSuspendPrepareOutcome::Pending,
+                    crate::metrics::sandbox::worker::TeardownSuspendPrepareOutcome::Pending,
                     metric_started_at,
                 ));
             }
@@ -295,13 +295,13 @@ impl SandboxManagerService {
                 (
                     TeardownSuspendOutcome::Superseded,
                     "a newer local execution owns generation suspend",
-                    pplx_space_metrics::sandbox::worker::TeardownSuspendPrepareOutcome::Superseded,
+                    crate::metrics::sandbox::worker::TeardownSuspendPrepareOutcome::Superseded,
                 )
             } else {
                 (
                     TeardownSuspendOutcome::Pending,
                     "the requested execution does not own the local runtime",
-                    pplx_space_metrics::sandbox::worker::TeardownSuspendPrepareOutcome::Pending,
+                    crate::metrics::sandbox::worker::TeardownSuspendPrepareOutcome::Pending,
                 )
             };
             return Ok(teardown_suspend_prepare_response(
@@ -318,7 +318,7 @@ impl SandboxManagerService {
             return Ok(teardown_suspend_prepare_response(
                 TeardownSuspendOutcome::Superseded,
                 Some("a generation-fenced stop retired this execution".to_string()),
-                pplx_space_metrics::sandbox::worker::TeardownSuspendPrepareOutcome::Superseded,
+                crate::metrics::sandbox::worker::TeardownSuspendPrepareOutcome::Superseded,
                 metric_started_at,
             ));
         }
@@ -330,7 +330,7 @@ impl SandboxManagerService {
             return Ok(teardown_suspend_prepare_response(
                 TeardownSuspendOutcome::Superseded,
                 Some("a newer local execution owns generation suspend".to_string()),
-                pplx_space_metrics::sandbox::worker::TeardownSuspendPrepareOutcome::Superseded,
+                crate::metrics::sandbox::worker::TeardownSuspendPrepareOutcome::Superseded,
                 metric_started_at,
             ));
         }
@@ -354,7 +354,7 @@ impl SandboxManagerService {
                     return Ok(teardown_suspend_prepare_response(
                         TeardownSuspendOutcome::Superseded,
                         Some("a newer local execution owns generation suspend".to_string()),
-                        pplx_space_metrics::sandbox::worker::TeardownSuspendPrepareOutcome::Superseded,
+                        crate::metrics::sandbox::worker::TeardownSuspendPrepareOutcome::Superseded,
                         metric_started_at,
                     ));
                 }
@@ -391,7 +391,7 @@ impl SandboxManagerService {
                     return Ok(teardown_suspend_prepare_response(
                         TeardownSuspendOutcome::Superseded,
                         Some("a newer local execution owns generation suspend".to_string()),
-                        pplx_space_metrics::sandbox::worker::TeardownSuspendPrepareOutcome::Superseded,
+                        crate::metrics::sandbox::worker::TeardownSuspendPrepareOutcome::Superseded,
                         metric_started_at,
                     ));
                 }
@@ -449,7 +449,7 @@ impl SandboxManagerService {
             return Ok(teardown_suspend_prepare_response(
                 TeardownSuspendOutcome::Pending,
                 None,
-                pplx_space_metrics::sandbox::worker::TeardownSuspendPrepareOutcome::Pending,
+                crate::metrics::sandbox::worker::TeardownSuspendPrepareOutcome::Pending,
                 metric_started_at,
             ));
         }
@@ -459,7 +459,7 @@ impl SandboxManagerService {
                 "sandbox is {} without a durable teardown artifact",
                 state
             )),
-            pplx_space_metrics::sandbox::worker::TeardownSuspendPrepareOutcome::Pending,
+            crate::metrics::sandbox::worker::TeardownSuspendPrepareOutcome::Pending,
             metric_started_at,
         ))
     }
@@ -640,7 +640,7 @@ impl SandboxManagerService {
         let permit = match Arc::clone(&self.teardown_suspend_driver_sem).try_acquire_owned() {
             Ok(permit) => permit,
             Err(_) => {
-                pplx_space_metrics::sandbox::worker::teardown_suspend_driver_saturated();
+                crate::metrics::sandbox::worker::teardown_suspend_driver_saturated();
                 tracing::debug!(
                     %sandbox_id,
                         "generation suspend driver capacity is full; caller polling will retry admission"

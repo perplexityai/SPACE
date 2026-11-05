@@ -368,7 +368,7 @@ impl NodeManagerService {
                     _ = interval.tick() => {}
                 }
                 // DogStatsD gauges need periodic samples, including disabled nodes.
-                pplx_space_metrics::node_disk::disk_io_ceiling_config(
+                crate::metrics::node_disk::disk_io_ceiling_config(
                     service.disk_io_ceiling.configured(),
                 );
                 if service.disk_io_ceiling.0.is_none() {
@@ -383,7 +383,7 @@ impl NodeManagerService {
                 {
                     Ok(records) => records,
                     Err(error) => {
-                        pplx_space_metrics::node_disk::disk_io_ceiling_inventory_failed();
+                        crate::metrics::node_disk::disk_io_ceiling_inventory_failed();
                         tracing::warn!(%error, "disk IOPS ceiling inventory failed; retrying next sweep");
                         continue;
                     }
@@ -428,7 +428,7 @@ impl NodeManagerService {
                     match result {
                         Ok(Enforcement::Verified { updated }) => {
                             if updated {
-                                pplx_space_metrics::node_disk::disk_io_ceiling_updated();
+                                crate::metrics::node_disk::disk_io_ceiling_updated();
                                 tracing::info!(
                                     sandbox_id = record.info.sandbox_id,
                                     maximum_iops = service.disk_io_ceiling.configured(),
@@ -440,7 +440,7 @@ impl NodeManagerService {
                         // identifies the replacement; stale evidence is not success.
                         Ok(Enforcement::AwaitingSnapshot | Enforcement::Superseded) => {}
                         Err(error) => {
-                            pplx_space_metrics::node_disk::disk_io_ceiling_update_failed(
+                            crate::metrics::node_disk::disk_io_ceiling_update_failed(
                                 error.code() == tonic::Code::DeadlineExceeded,
                             );
                             tracing::warn!(
@@ -519,8 +519,8 @@ fn publish_inventory(
     pending: usize,
     timestamp: f64,
 ) {
-    pplx_space_metrics::node_disk::disk_io_ceiling_config(ceiling.configured());
-    pplx_space_metrics::node_disk::disk_io_ceiling_inventory(
+    crate::metrics::node_disk::disk_io_ceiling_config(ceiling.configured());
+    crate::metrics::node_disk::disk_io_ceiling_inventory(
         verified.0.len() as u64,
         pending as u64,
         timestamp,

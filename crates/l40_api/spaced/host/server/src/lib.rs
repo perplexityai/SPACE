@@ -90,6 +90,7 @@ use guest_connection::OperationClient;
 use pplx_space_spaced_common::proto::platform::GuestOperation;
 mod filesystem;
 mod meta;
+pub mod metrics;
 mod networking;
 mod process;
 mod protocol;

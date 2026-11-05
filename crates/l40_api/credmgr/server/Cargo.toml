@@ -90,7 +90,7 @@ pplx-space-grpc-server = { workspace = true }
 pplx-space-k8s-node-id = { workspace = true }
 pplx-space-kube-client = { workspace = true }
 pplx-space-local-health = { workspace = true }
-pplx-space-metrics = { workspace = true }
+pplx-space-metrics-emit = { workspace = true }
 pplx-space-net-common = { workspace = true }
 pplx-space-node-registration-store = { workspace = true }
 pplx-space-observability = { workspace = true }

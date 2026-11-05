@@ -185,7 +185,7 @@ impl DeferredRestoreStart {
         if self.emitted.replace(true) {
             return;
         }
-        pplx_space_metrics::snapshot::restore_started(self.kind, self.codec, encrypted);
+        crate::metrics::snapshot::restore_started(self.kind, self.codec, encrypted);
     }
 }
 
@@ -1085,7 +1085,7 @@ impl SandboxManagerService {
 
         let original_not_found = Status::not_found(format!("sandbox not found: {sandbox_id}"));
         let cross_node_started_at = std::time::Instant::now();
-        let cross_node_codec_at_start = pplx_space_metrics::snapshot::CODEC_FULL;
+        let cross_node_codec_at_start = crate::metrics::snapshot::CODEC_FULL;
         // The `started` sample is deferred rather than emitted here. This
         // function runs precisely when the local row is absent, so the
         // encryption stamp is unknown until the restore repopulates it —
@@ -1116,7 +1116,7 @@ impl SandboxManagerService {
                     let observed_encrypted =
                         super::recovery_cross_node::encrypted_from_staged_sidecar(sandbox_id);
                     cross_node_start.emit(observed_encrypted);
-                    pplx_space_metrics::snapshot::restore_failed(
+                    crate::metrics::snapshot::restore_failed(
                         "cross_node",
                         cross_node_codec_at_start,
                         observed_encrypted,
@@ -1132,7 +1132,7 @@ impl SandboxManagerService {
                 })?;
                 let codec = codec_from_local_sidecar(&sandbox);
                 cross_node_start.emit(sandbox.volume_encryption);
-                pplx_space_metrics::snapshot::restore_completed(
+                crate::metrics::snapshot::restore_completed(
                     "cross_node",
                     codec,
                     sandbox.volume_encryption,
@@ -1158,7 +1158,7 @@ impl SandboxManagerService {
                 let observed_encrypted =
                     super::recovery_cross_node::encrypted_from_staged_sidecar(sandbox_id);
                 cross_node_start.emit(observed_encrypted);
-                pplx_space_metrics::snapshot::restore_failed(
+                crate::metrics::snapshot::restore_failed(
                     "cross_node",
                     cross_node_codec_at_start,
                     observed_encrypted,
@@ -1177,7 +1177,7 @@ impl SandboxManagerService {
                 let observed_encrypted =
                     super::recovery_cross_node::encrypted_from_staged_sidecar(sandbox_id);
                 cross_node_start.emit(observed_encrypted);
-                pplx_space_metrics::snapshot::restore_failed(
+                crate::metrics::snapshot::restore_failed(
                     "cross_node",
                     cross_node_codec_at_start,
                     observed_encrypted,
@@ -1196,7 +1196,7 @@ impl SandboxManagerService {
                 let observed_encrypted =
                     super::recovery_cross_node::encrypted_from_staged_sidecar(sandbox_id);
                 cross_node_start.emit(observed_encrypted);
-                pplx_space_metrics::snapshot::restore_failed(
+                crate::metrics::snapshot::restore_failed(
                     "cross_node",
                     cross_node_codec_at_start,
                     observed_encrypted,
@@ -1210,7 +1210,7 @@ impl SandboxManagerService {
                 let observed_encrypted =
                     super::recovery_cross_node::encrypted_from_staged_sidecar(sandbox_id);
                 cross_node_start.emit(observed_encrypted);
-                pplx_space_metrics::snapshot::restore_failed(
+                crate::metrics::snapshot::restore_failed(
                     "cross_node",
                     cross_node_codec_at_start,
                     observed_encrypted,
@@ -1224,7 +1224,7 @@ impl SandboxManagerService {
                 let observed_encrypted =
                     super::recovery_cross_node::encrypted_from_staged_sidecar(sandbox_id);
                 cross_node_start.emit(observed_encrypted);
-                pplx_space_metrics::snapshot::restore_failed(
+                crate::metrics::snapshot::restore_failed(
                     "cross_node",
                     cross_node_codec_at_start,
                     observed_encrypted,
@@ -1243,7 +1243,7 @@ impl SandboxManagerService {
                 let observed_encrypted =
                     super::recovery_cross_node::encrypted_from_staged_sidecar(sandbox_id);
                 cross_node_start.emit(observed_encrypted);
-                pplx_space_metrics::snapshot::restore_stage_failed(
+                crate::metrics::snapshot::restore_stage_failed(
                     "cross_node",
                     cross_node_codec_at_start,
                     observed_encrypted,
@@ -1468,7 +1468,7 @@ impl SandboxManagerService {
                         })?
                     };
                     if !retired {
-                        pplx_space_metrics::snapshot::restore_retry_preserved_cleanup_intent();
+                        crate::metrics::snapshot::restore_retry_preserved_cleanup_intent();
                     }
                     sandbox = self.lookup_sandbox(&sandbox.id)?;
                 }
@@ -1662,7 +1662,7 @@ impl SandboxManagerService {
         };
         let restore_started_at = std::time::Instant::now();
         let codec = codec_from_local_sidecar(&sandbox);
-        pplx_space_metrics::snapshot::restore_started("in_place", codec, sandbox.volume_encryption);
+        crate::metrics::snapshot::restore_started("in_place", codec, sandbox.volume_encryption);
         // Placement alone cannot distinguish a local checkpoint from a remote
         // snapshot staged on the same node. Record provenance after staging;
         // this span measures checkpoint resume, not the preceding transfer.
@@ -1705,13 +1705,13 @@ impl SandboxManagerService {
             );
         }
         match &result {
-            Ok(_) => pplx_space_metrics::snapshot::restore_completed(
+            Ok(_) => crate::metrics::snapshot::restore_completed(
                 "in_place",
                 codec,
                 sandbox.volume_encryption,
                 restore_started_at,
             ),
-            Err(status) => pplx_space_metrics::snapshot::restore_failed(
+            Err(status) => crate::metrics::snapshot::restore_failed(
                 "in_place",
                 codec,
                 sandbox.volume_encryption,

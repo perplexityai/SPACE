@@ -550,7 +550,7 @@ fn snapshot_restore_event_details(
             )
             .operation("cross_node")
             .template_id(meta.source.template_id.as_str())
-            .restore_codec(pplx_space_metrics::snapshot::codec_tag_from_diff_format(
+            .restore_codec(crate::metrics::snapshot::codec_tag_from_diff_format(
                 meta.rootfs_diff_format.as_deref(),
             )),
     );
@@ -1133,12 +1133,12 @@ pub(super) fn codec_from_local_sidecar(sandbox: &crate::db::SandboxRow) -> &'sta
     let sandbox_dir = std::path::PathBuf::from(format!("{CACHE_DIR}/{}", sandbox.id));
     let meta_path = canonical_suspend_snapshot_dir(&sandbox_dir).join("snapshot.json");
     let Ok(json) = std::fs::read_to_string(&meta_path) else {
-        return pplx_space_metrics::snapshot::CODEC_FULL;
+        return crate::metrics::snapshot::CODEC_FULL;
     };
     let Ok(meta) = serde_json::from_str::<crate::snapshot_upload::SnapshotMeta>(&json) else {
-        return pplx_space_metrics::snapshot::CODEC_FULL;
+        return crate::metrics::snapshot::CODEC_FULL;
     };
-    pplx_space_metrics::snapshot::codec_tag_from_diff_format(meta.rootfs_diff_format.as_deref())
+    crate::metrics::snapshot::codec_tag_from_diff_format(meta.rootfs_diff_format.as_deref())
 }
 
 impl SandboxManagerService {
@@ -1841,9 +1841,9 @@ impl SandboxManagerService {
                 SandboxEventDetails::default().reason("metadata_pulled"),
             ),
         );
-        pplx_space_metrics::snapshot::restore_step(
+        crate::metrics::snapshot::restore_step(
             "cross_node",
-            pplx_space_metrics::snapshot::codec_tag_from_diff_format(
+            crate::metrics::snapshot::codec_tag_from_diff_format(
                 staged.meta.rootfs_diff_format.as_deref(),
             ),
             staged.meta.encrypted,
@@ -1896,8 +1896,8 @@ impl SandboxManagerService {
         }
 
         let meta_diff_format = staged.meta.rootfs_diff_format.as_deref();
-        let codec = pplx_space_metrics::snapshot::codec_tag_from_diff_format(meta_diff_format);
-        pplx_space_metrics::snapshot::restore_step(
+        let codec = crate::metrics::snapshot::codec_tag_from_diff_format(meta_diff_format);
+        crate::metrics::snapshot::restore_step(
             "cross_node",
             codec,
             staged.meta.encrypted,
@@ -2156,7 +2156,7 @@ impl SandboxManagerService {
             return Err(error);
         }
 
-        pplx_space_metrics::snapshot::restore_step(
+        crate::metrics::snapshot::restore_step(
             "cross_node",
             codec,
             staged.meta.encrypted,

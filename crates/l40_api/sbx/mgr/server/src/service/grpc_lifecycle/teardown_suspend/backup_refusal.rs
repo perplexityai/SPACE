@@ -117,15 +117,15 @@ pub(super) fn record_refusal_replay(
     job_id: &JobId,
     verdict: crate::snapshot_upload_jobs::RegistrationProbe,
 ) {
+    use crate::metrics::sandbox::worker::TeardownBackupRefusalReplay;
     use crate::snapshot_upload_jobs::RegistrationProbe;
-    use pplx_space_metrics::sandbox::worker::TeardownBackupRefusalReplay;
     let reason = match verdict {
         RegistrationProbe::Superseded(_) => TeardownBackupRefusalReplay::Superseded,
         RegistrationProbe::Admitted => TeardownBackupRefusalReplay::AdmittedNotCleared,
         RegistrationProbe::NotSuperseded => TeardownBackupRefusalReplay::NotSuperseded,
         RegistrationProbe::Unanswered => TeardownBackupRefusalReplay::Unanswered,
     };
-    pplx_space_metrics::sandbox::worker::teardown_suspend_backup_refusal_replayed(reason);
+    crate::metrics::sandbox::worker::teardown_suspend_backup_refusal_replayed(reason);
     tracing::info!(target: super::LOG_TARGET, sandbox_id, %job_id, reason = reason.as_str(),
         "rejoining a refused teardown backup without a new upload");
 }

@@ -62,7 +62,7 @@ pplx-space-sqlite = { workspace = true }
 pplx-space-state-reconciliation = { workspace = true }
 pplx-space-stopwatch = { workspace = true }
 pplx-space-execution-common = { workspace = true }
-pplx-space-metrics = { workspace = true }
+pplx-space-metrics-emit = { workspace = true }
 pplx-space-reconcile-metrics = { workspace = true }
 pplx-space-feature-flags = { workspace = true }
 pplx-space-node-api-client = { workspace = true }

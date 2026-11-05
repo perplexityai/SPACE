@@ -319,7 +319,7 @@ pub(super) fn get_template_metric_tags(name: &str, req_hash: &str, req_tag: &str
     // The `GetTemplate` cache-hit/miss path is always caller-driven; the
     // prefetch loop never goes through this code, so the trigger is
     // hard-coded to `on_demand` here.
-    pplx_space_metrics::template::request_tags(
+    crate::metrics::request_tags(
         name,
         req_hash,
         req_tag,
@@ -328,5 +328,5 @@ pub(super) fn get_template_metric_tags(name: &str, req_hash: &str, req_tag: &str
 }
 
 pub(super) fn record_fetch_error(name: &str, req_hash: &str, req_tag: &str, reason: &'static str) {
-    pplx_space_metrics::template::fetch_error(name, req_hash, req_tag, reason);
+    crate::metrics::fetch_error(name, req_hash, req_tag, reason);
 }

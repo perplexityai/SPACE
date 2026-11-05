@@ -1846,7 +1846,7 @@ fn a_refused_stopped_materialization_is_a_source_mismatch_stage_failure() {
     for error in [unsuitable, mismatch] {
         assert_eq!(
             error.stage_error_kind().as_str(),
-            pplx_space_metrics::snapshot::RestoreStageErrorKind::SourceMismatch.as_str(),
+            crate::metrics::snapshot::RestoreStageErrorKind::SourceMismatch.as_str(),
             "{error}"
         );
     }

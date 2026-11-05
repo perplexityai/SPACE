@@ -389,7 +389,7 @@ where
     Record: FnMut(usize, bool, &DmCryptError) -> RecordFut,
     RecordFut: std::future::Future<Output = ()>,
 {
-    use pplx_space_metrics::byok;
+    use crate::metrics::byok;
     let mut attempt = 0;
     loop {
         attempt += 1;

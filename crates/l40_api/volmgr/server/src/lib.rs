@@ -7,6 +7,7 @@ pub mod credentials;
 pub mod crypto;
 pub mod db;
 pub mod executor;
+pub mod metrics;
 pub mod run;
 pub mod service;
 pub mod staging;
