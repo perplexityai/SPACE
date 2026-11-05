@@ -413,7 +413,8 @@ async function terminalRun(c: Ctx, command: string, marker: RegExp, what: string
 const terminalShot = (c: Ctx, name: string) => terminalCard(c.page).screenshot({ path: `${c.rec.outDir}/${name}.png` }).catch(() => {});
 const sizeOf = (rows: string, marker: string) => rows.match(new RegExp(`${marker}=(\\d+)x(\\d+)`))?.slice(1).map(Number) ?? null;
 
-// Each session is recorded in the admin audit log, so these steps mutate.
+// These steps open terminal sessions. The other organization's go through the
+// admin route, which records an admin audit row for each, so they mutate.
 for (const [name, key, ownOrg] of [['own-org', 'running', true], ['other-org', 'acme-running', false]] as const) {
   step(`terminal-${name}`, ['sandboxes', 'terminal'], async (c) => {
     const id = sandboxId(c, key);
@@ -487,10 +488,10 @@ for (const [name, key, ownOrg] of [['own-org', 'running', true], ['other-org', '
     await card.getByRole('button', { name: /Disconnect$/ }).click();
     await c.page.waitForTimeout(500);
     c.rec.check(/closed/.test(await terminalStatus(c.page)), 'Disconnect closes the session');
-    // Typed at once, before the new shell has started: the card holds it and
-    // sends it when the shell starts.
+    // Typed right after Connect. If the shell has not started yet the card
+    // holds it until it has; the unit tests cover that order.
     await card.getByRole('button', { name: /Connect$/ }).click();
-    await terminalRun(c, 'echo reconnected-$((11*11))', /reconnected-121/, 'a second Connect opens a new shell and runs what was typed before it started', 30_000);
+    await terminalRun(c, 'echo reconnected-$((11*11))', /reconnected-121/, 'a second Connect opens a new shell and runs what was typed right after it', 30_000);
     await card.getByRole('button', { name: /Disconnect$/ }).click();
   }, true);
 }
