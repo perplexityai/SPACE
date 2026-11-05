@@ -379,6 +379,9 @@ export class ListSelection {
   private pageSize: number;
   private sampleSize: number;
   private continuation: Continuation | null = null;
+  // The scope and page position on screen when the filters started sending
+  // `search`, until they stop.
+  private searchOrigin: { key: string; position: PagePosition } | null = null;
   private readonly requests = new ListRequests();
 
   constructor({ filters, pageSize, sampleSize }: {
@@ -396,17 +399,33 @@ export class ListSelection {
     return listScope(this.mode, this.filters, { limit, cursor: pageCursor(this.position) });
   }
 
-  // A change of the filters or sizes. It restarts at the first page. When
+  // A change of the filters or sizes. It restarts at the first page, except
+  // for the fallback after an API refused `search` (`refusedSearch`): that
+  // returns to the page the search was typed on (`searchOrigin`) when the
+  // filters are back to those it was typed under, so a match within the page
+  // is made on that page, as it was before the console sent `search`. When
   // the selected request is the same (a sampled list sends only the org and
   // the sample size) nothing else changes. Otherwise the loads in flight are
   // invalidated; the rows on screen are kept when they are the new scope's
   // (a change undone before its answer arrived), and otherwise it is loaded.
-  select(next: { filters: SandboxListFilters; pageSize: number; sampleSize: number }): 'unchanged' | 'keep' | 'load' {
+  select(
+    next: { filters: SandboxListFilters; pageSize: number; sampleSize: number },
+    { refusedSearch = false }: { refusedSearch?: boolean } = {},
+  ): 'unchanged' | 'keep' | 'load' {
     const before = this.selected;
+    if (!before.filters.search.trim() && next.filters.search.trim()) {
+      this.searchOrigin = { key: before.key, position: this.position };
+    }
     this.filters = next.filters;
     this.pageSize = next.pageSize;
     this.sampleSize = next.sampleSize;
     this.position = FIRST_PAGE;
+    const origin = this.searchOrigin;
+    if (refusedSearch && origin) {
+      this.position = origin.position;
+      if (this.selected.key !== origin.key) this.position = FIRST_PAGE;
+    }
+    if (!next.filters.search.trim()) this.searchOrigin = null;
     if (sameScope(before, this.selected)) return 'unchanged';
     this.requests.invalidate();
     return scopeChangePlan(this.shown, this.selected);

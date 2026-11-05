@@ -141,8 +141,10 @@ const SEARCH_UNSUPPORTED = 'the API does not take search; searching as before';
 class ShownListError extends Error {}
 const alreadyReported = (err: unknown) => err instanceof RefreshSkipped || err instanceof ShownListError;
 const REFRESH_CLICK_COOLDOWN_MS = 3000;
-// Firecracker, the only runtime SPACE implements, so the create form offers
-// no choice.
+// Firecracker, the only runtime a control-plane create can place: nodes refuse
+// a Cloud Hypervisor create that carries a control-plane sandbox ID until
+// cluster placement can qualify a node for it. So the create form offers no
+// choice.
 const SANDBOX_RUNTIME = 'fc';
 
 // No age limit by default: long-running sandboxes are the ones support
@@ -780,6 +782,9 @@ function SandboxesPage() {
   // from before it answers; the search box then works as it did before, until
   // the page is reloaded.
   const [serverSearch, setServerSearch] = useState(true);
+  // Set when the API refused `search`, until the fallback's filters are
+  // selected (`ListSelection.select`'s `refusedSearch`).
+  const searchRefusedRef = useRef(false);
   // The selected statuses this list applies, and those it cannot.
   const statusSplit = useMemo(() => splitStatusFilter(listMode === 'paged', statusFilter), [listMode, statusFilter]);
   // What the search box does on this list's shape: a direct lookup, a prefix
@@ -927,7 +932,9 @@ function SandboxesPage() {
     setListMode(result.scope.mode);
     setPosition(selection.position);
     if (result.kind === 'failed' && isSearchUnsupported(result.error)) {
-      // Searching as before changes the filters, which reloads the list.
+      // Searching as before changes the filters, which reloads the list on
+      // the page the search was typed on.
+      searchRefusedRef.current = true;
       setServerSearch(false);
       throw new RefreshSkipped(SEARCH_UNSUPPORTED);
     }
@@ -1279,7 +1286,12 @@ function SandboxesPage() {
     const timer = setTimeout(() => {
       appliedInputsRef.current = { key: filterInputsKey, typed: idFilter };
       appliedSizesRef.current = { pageSize, listLimit };
-      const plan = selection.select({ filters: serverFilters(filterInputs), pageSize, sampleSize: listLimit });
+      const refusedSearch = searchRefusedRef.current;
+      searchRefusedRef.current = false;
+      const plan = selection.select(
+        { filters: serverFilters(filterInputs), pageSize, sampleSize: listLimit },
+        { refusedSearch },
+      );
       if (plan === 'unchanged') return;
       setPosition(selection.position);
       selectionChanged();
@@ -1755,7 +1767,7 @@ function SandboxesPage() {
               aria-label="Search sandboxes"
             />
             {paged && serverSearch ? (
-              <Tooltip title="Searched on the server across the whole list: names that start with the text, ignoring case, and IDs that end with it, such as the ID column's label (at least 4 hex digits; dashes and sbx_ are ignored). An ID start, sbx_ followed by hex digits or a dashed UUID start, matches IDs that start with it. A full ID or pod name is looked up directly.">
+              <Tooltip title="Text of 3 characters or more is searched on the server across the whole list: names that start with it, ignoring case, and IDs that start or end with its hex digits, such as the ID column's label. An ID match needs at least 4 hex digits; dashes, and sbx_ in front, are left out of them. Shorter text is matched as a case-sensitive name or ID prefix on the server and within this page. A full ID or pod name is looked up directly.">
                 <QuestionCircleOutlined aria-label="About the search" style={{ color: 'rgba(0, 0, 0, 0.45)' }} />
               </Tooltip>
             ) : paged ? (

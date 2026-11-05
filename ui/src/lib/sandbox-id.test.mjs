@@ -167,16 +167,22 @@ test('a full identifier is a lookup on either list, and a sampled list matches a
   }
 });
 
-test('on a server that takes search, the text is searched there, the label and names in any case included', () => {
+test('on a server that takes search, text of three characters or more is searched there', () => {
   const label = sandboxLabelOrId(sandbox.id);
-  for (const typed of [label, label.toUpperCase(), 'ae1d-72e0', 'e2e-1', 'Build-', 'BUILD cache', 'sbx_x1', 'n'.repeat(300)]) {
+  for (const typed of [label, label.toUpperCase(), 'ae1d-72e0', 'e2e-1', 'Build-', 'BUILD cache', 'sbx_x1', 'abc', 'n'.repeat(300)]) {
     assert.deepEqual(sandboxSearch(` ${typed} `, 'paged', true), { kind: 'search', text: typed }, typed);
+  }
+  // ID starts go there too: the server matches the start of an ID's hex
+  // digits, behind sbx_ and with dashes or without.
+  for (const typed of ['01a19089394a', '01a19089-394a', 'sbx_01a19089-394a-70', 'SBX_01A19089']) {
+    assert.deepEqual(sandboxSearch(typed, 'paged', true), { kind: 'search', text: typed }, typed);
   }
   // The server refuses a NUL, which no name or ID holds.
   assert.deepEqual(sandboxSearch('build\0', 'paged', true), { kind: 'search', text: 'build' });
-  // An ID start still goes as a prefix, which a suffix search would miss.
-  assert.deepEqual(sandboxSearch('01a19089-394a', 'paged', true), { kind: 'prefix', prefix: '01a19089-394a' });
-  assert.deepEqual(sandboxSearch('SBX_01A19089', 'paged', true), { kind: 'prefix', prefix: 'sbx_01A19089' });
+  // Shorter text is searched as before: the server refuses it.
+  assert.deepEqual(sandboxSearch(' xy ', 'paged', true), { kind: 'prefix', prefix: 'xy' });
+  assert.equal(sandboxSearch('e2', 'paged', true).kind, 'fragment');
+  assert.equal(sandboxSearch('a\0b', 'paged', true).kind, 'page');
   // A full identifier is still a lookup, and a sampled list still matches
   // within its rows: a server without paging has no search either.
   assert.equal(sandboxSearch(sandbox.id, 'paged', true).kind, 'ref');
