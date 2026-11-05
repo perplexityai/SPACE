@@ -2032,10 +2032,7 @@ async fn wait_for_blocked_query_count(
 async fn wake_signal_classifies_post_wake_flip_by_recency_not_lease(
     fixture: &PostgresStore,
 ) -> TestResult {
-    use crate::controllers::sandbox::{
-        POST_WAKE_LISTENER_REBIND_GRACE, fetch_sandbox_wake_signal,
-        update_and_fetch_post_wake_sandbox,
-    };
+    use crate::controllers::sandbox::{POST_WAKE_LISTENER_REBIND_GRACE, fetch_sandbox_wake_signal};
     use pplx_space_common_core::types::SandboxLifecycle;
 
     let sandbox_id = SandboxId::new();
@@ -2069,10 +2066,13 @@ async fn wake_signal_classifies_post_wake_flip_by_recency_not_lease(
         "restoring row must classify as waking"
     );
 
-    // Finalize the wake through the real post-wake update path; the
-    // lease-clear and lifecycle-changed-at triggers fire inside this
-    // UPDATE.
-    update_and_fetch_post_wake_sandbox(&fixture.pool, sandbox_id, None).await?;
+    // Finalize the wake through the wake's real completion CAS, as
+    // `complete_wake_lifecycle` calls it; the lease-clear and
+    // lifecycle-changed-at triggers fire inside this UPDATE.
+    assert!(
+        pplx_space_sandbox_store::wake::complete_wake(&fixture.pool, sandbox_id, true).await?,
+        "the wake's completion CAS must move the `restoring` row to `started`"
+    );
 
     let (lease_expires_at, lease_token): (Option<OffsetDateTime>, Option<Uuid>) =
         sqlx::query_as(sql!(
@@ -9391,7 +9391,11 @@ async fn a_contended_post_wake_update_is_not_retryable() -> TestResult {
 
     let db = pg_test_db_with_max_connections(2).await?;
     let sandbox_id = SandboxId::new();
-    insert_sandbox(&db.pool, sandbox_id, SandboxLifecycle::Suspended.as_str()).await?;
+    // `paused`, the lifecycle the pooled claim inserts, so the update's guard
+    // admits the row and the update waits on the held lock. A refused
+    // lifecycle is skipped on its visible version without waiting, and the
+    // update returns the CAS-miss 500 without ever reaching the lock.
+    insert_sandbox(&db.pool, sandbox_id, SandboxLifecycle::Paused.as_str()).await?;
 
     // A bounded pool so the held row lock aborts rather than blocking.
     let bounded = sqlx::postgres::PgPoolOptions::new()
@@ -9426,6 +9430,14 @@ async fn a_contended_post_wake_update_is_not_retryable() -> TestResult {
     assert!(
         !error.is_lock_contention(),
         "the contention marking would reach the surface as a retryable 503"
+    );
+    // The lock abort's own message, not the CAS miss's: the update reached
+    // the held lock.
+    assert!(
+        error
+            .to_string()
+            .starts_with("pooled sandbox post-wake update failed"),
+        "the update must reach the held row lock: {error}"
     );
 
     blocker.rollback().await?;

@@ -29,6 +29,16 @@
 //!   keeps a live, undecodable or unreadable record. Delete reaches the active node, else that target node; with neither
 //!   it returns `Unavailable` and the caller removes the row without
 //!   node-local teardown.
+//! - The post-action stamps (`action_stamp` in `pplx-space-sandbox-store`)
+//!   refuse `deleting`, `stopping`, `suspending`, `failed`, `quarantined` and
+//!   the tombstones for every action. A resume, pause or suspend stamp, and
+//!   the pooled post-wake update, also refuse `stopped` and `restoring`: none
+//!   begins from a stop, and none claims or joins a restore here, so a
+//!   `restoring` row is a restore lease's. Every start writes over
+//!   `suspended`, since its node cold-boots a suspended sandbox and the row
+//!   stays `suspended` until the stamp. A start and a stop also write over
+//!   `stopped` and `restoring`, so a start or stop that races a restore lease
+//!   can make the lease's completion miss.
 //! - Warm-pool claims adopt node-side.
 //! - Custom vCPU or memory uses separate create and start calls: only
 //!   `StartRequest` carries those fields. A readiness wait still blocks on

@@ -1075,6 +1075,13 @@ pub struct SubstrateCapabilities {
     /// to advance; its lease restore claims `restoring` and writes `started`
     /// itself.
     pub caller_completes_claimed_restore: bool,
+    /// A start of a `suspended` row claims `restoring` through the wake
+    /// before its node call, so the start's own stamp may find that claim,
+    /// and a `suspended` it finds is a newer suspend's. Without it, a start
+    /// cold-boots a `suspended` row on its node and leaves the row
+    /// `suspended` until its stamp (see the `action_stamp` module of
+    /// `pplx-space-sandbox-store`).
+    pub start_of_suspended_claims_restoring: bool,
     /// How node-api targets are addressed.
     pub node_addressing: NodeAddressing,
     /// Nodes live in the admin API's node registry: they are registered,
@@ -1121,6 +1128,7 @@ pub struct SubstrateCapabilities {
 impl SubstrateCapabilities {
     pub const DIRECT: Self = Self {
         caller_completes_claimed_restore: false,
+        start_of_suspended_claims_restoring: false,
         node_addressing: NodeAddressing::DirectEndpoint,
         registers_nodes_via_admin_api: true,
         resolves_cold_create_shape: false,
@@ -1132,6 +1140,7 @@ impl SubstrateCapabilities {
 
     pub const KUBERNETES: Self = Self {
         caller_completes_claimed_restore: true,
+        start_of_suspended_claims_restoring: true,
         node_addressing: NodeAddressing::SubstrateNodeId,
         registers_nodes_via_admin_api: false,
         resolves_cold_create_shape: true,
