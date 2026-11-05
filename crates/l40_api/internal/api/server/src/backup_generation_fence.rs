@@ -37,11 +37,15 @@ struct FenceRow {
 /// reason (a suspend the transient-lifecycle sweeper aged out, a pod found
 /// missing) with nothing newer: its capture may be the sandbox's latest state,
 /// so it registers as it did before this fence. That holds on a row left on
-/// no node too, where the source-node check then refuses the capture without
-/// a verdict and the node keeps it resident: a ready earlier snapshot isn't
-/// proof that the last execution's later writes are disposable. The predicate
-/// is the generation, which retirement works in; it doesn't tell apart two
-/// attempts of the same still-active generation.
+/// no node too, whose source is the execution's pod node when that resolves
+/// to one live worker (see `pplx_space_sandbox_store::SnapshotCaptureSource`).
+/// When it doesn't, as for a pod that was never placed, the source falls
+/// back to the target (to no node, and so to a refusal of every caller, when
+/// there's no target either), the source-node check refuses any other node
+/// without a verdict, and that node keeps the capture resident: a ready
+/// earlier snapshot isn't proof that the last execution's later writes are
+/// disposable. The predicate is the generation, which retirement works in;
+/// it doesn't tell apart two attempts of the same still-active generation.
 ///
 /// The caller applies it to an artifact's first registration only. A capture
 /// the control plane admitted once was taken while its execution was current
@@ -97,4 +101,43 @@ pub(crate) async fn refuse_superseded_backup_execution(
         ),
         generation,
     ))
+}
+
+/// Refuse a registration attributed to `generation`'s pod node once a newer
+/// execution is active or has materialized a pod: the sandbox has run
+/// elsewhere since, so that node no longer stands in for the target.
+/// `pplx_space_sandbox_store::snapshot_capture_source` names the pod node
+/// without checking for newer executions; the fence refuses it on a first
+/// registration, and this check, read after the snapshot insert, on the
+/// attempt the fence skips: a fresh attempt for bytes another attempt
+/// registered. That insert's key-share lock on the sandbox row keeps a newer
+/// execution from being inserted, and `FOR SHARE` keeps one from
+/// materializing, until commit.
+pub(crate) async fn refuse_overtaken_execution_attribution(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    sandbox_id: SandboxId,
+    generation: ExecutionGeneration,
+) -> Result<(), Status> {
+    let newer_ran: Vec<bool> = sqlx::query_scalar(sql!(
+        "SELECT active
+                OR pod_materialized_at IS NOT NULL
+                OR NULLIF(BTRIM(pod_uid), '') IS NOT NULL
+           FROM sandbox_k8s_executions
+          WHERE sandbox_id = $1
+            AND generation > $2
+            FOR SHARE"
+    ))
+    .bind(sandbox_id)
+    .bind(generation.get())
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(|e| Status::internal(format!("backup execution lookup: {e}")))?;
+    if newer_ran.contains(&true) {
+        return Err(Status::permission_denied(format!(
+            "a newer execution of sandbox {sandbox_id} than generation {generation} is \
+             active or has run a pod, so that generation's pod node no longer uploads its \
+             backups"
+        )));
+    }
+    Ok(())
 }

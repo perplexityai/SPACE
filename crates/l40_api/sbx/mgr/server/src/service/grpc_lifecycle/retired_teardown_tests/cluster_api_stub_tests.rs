@@ -117,6 +117,9 @@ pub(in crate::service::grpc_lifecycle) fn record_finalized_backup(
 /// `admits_unfenced`, as for a replay or for bytes another attempt
 /// registered. When `predates_verdicts`, it answers as a server that predates
 /// verdict-only requests and the fence's admission does: it echoes neither.
+/// When `refuses_source_node`, it refuses every registration
+/// `PERMISSION_DENIED`, as the source-node check does a caller that isn't the
+/// node the backup is attributed to.
 #[derive(Clone, Copy)]
 pub(super) struct RetiringClusterApi {
     pub(super) unavailable: bool,
@@ -128,6 +131,7 @@ pub(super) struct RetiringClusterApi {
     pub(super) supersession_lapsed: bool,
     pub(super) admits_unfenced: bool,
     pub(super) predates_verdicts: bool,
+    pub(super) refuses_source_node: bool,
 }
 
 pub(super) const RETIRING: RetiringClusterApi = RetiringClusterApi {
@@ -140,6 +144,7 @@ pub(super) const RETIRING: RetiringClusterApi = RetiringClusterApi {
     supersession_lapsed: false,
     admits_unfenced: false,
     predates_verdicts: false,
+    refuses_source_node: false,
 };
 
 /// The stub's answer to a backup readiness query: whether the sandbox has a
@@ -228,6 +233,11 @@ impl tonic::server::UnaryService<pplx_space_node_api_client::proto::BeginArtifac
         if self.unavailable {
             return std::future::ready(Err(tonic::Status::unavailable(
                 "cluster-api is restarting",
+            )));
+        }
+        if self.refuses_source_node {
+            return std::future::ready(Err(tonic::Status::permission_denied(
+                "caller is not the backup's source node",
             )));
         }
         let refusable = !self.supersession_lapsed

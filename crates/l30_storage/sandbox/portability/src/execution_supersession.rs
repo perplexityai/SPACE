@@ -9,7 +9,12 @@
 //! unchecked. Both decide
 //! with the same function ([`execution_generation_superseded`]). Each query
 //! spells out the four [`ExecutionSupersessionRow`] columns at its own site,
-//! so a change to how a column is read must be made at both.
+//! so a change to how a column is read must be made at both. Two more sites
+//! read an execution's `active` and materialized columns the same way, to
+//! decide whether a capture's pod node still stands in for its target:
+//! `pplx-space-sandbox-store`'s `snapshot_storage_placed_on` and
+//! internal-api's `refuse_overtaken_execution_attribution`. Change those with
+//! them.
 //!
 //! The fence runs in internal-api and the GC in the cluster controller, so a
 //! change to this predicate reaches them at different times. When it makes

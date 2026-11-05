@@ -2,7 +2,7 @@
 //! completed jobs prove.
 
 use crate::db::{Connection, Result};
-use pplx_space_common_core::types::{JobId, LocalArtifactId};
+use pplx_space_common_core::types::{ExecutionGeneration, JobId, LocalArtifactId};
 use rusqlite::params;
 
 /// The `jobs.kind` of the snapshot-upload pipeline's jobs.
@@ -53,25 +53,50 @@ pub fn set_upload_failure_scope(conn: &Connection, job_id: &JobId, scope: &str) 
     )
 }
 
+/// Record that a pending or running snapshot-upload job's registration was
+/// refused for this node as the artifact's source, and only that field of
+/// its payload (see [`set_upload_failure_scope`]). The number of rows changed.
+pub fn set_upload_source_node_refused(conn: &Connection, job_id: &JobId) -> Result<usize> {
+    conn.execute(
+        "UPDATE jobs SET payload = json_set(payload, '$.source_node_refused', json('true'))
+         WHERE job_id = ?1 AND kind = ?2 AND status IN ('pending', 'running')",
+        params![job_id, SNAPSHOT_UPLOAD_JOB_KIND],
+    )
+}
+
 /// How many snapshot-upload jobs under `dedup_key` failed permanently with a
-/// recorded failure scope other than `excluded_scope`. A payload that
-/// recorded no scope, or isn't JSON, counts; `CASE` keeps `json_extract`
-/// off a payload that isn't, since SQLite needn't short-circuit `AND`.
+/// recorded failure scope other than `excluded_scope`, leaving out a refusal
+/// of this node as the artifact's source that `execution_generation`'s
+/// teardown can re-send: one with no transfer IDs that registers under that
+/// generation or none. A source-node refusal it can't re-send counts, as an
+/// attempt's failure. A payload that recorded neither, or isn't JSON, counts;
+/// `CASE` keeps `json_extract` off a payload that isn't, since SQLite needn't
+/// short-circuit `AND`.
 pub fn count_permanent_upload_failures_outside_scope(
     conn: &Connection,
     dedup_key: &str,
     excluded_scope: &str,
+    execution_generation: ExecutionGeneration,
 ) -> Result<u64> {
     let count: i64 = conn.query_row(
         "SELECT COUNT(*) FROM jobs
          WHERE kind = ?1 AND dedup_key = ?2 AND status = 'failed' AND error_kind = ?3
            AND CASE WHEN json_valid(payload)
-                    THEN json_extract(payload, '$.failure_scope') END IS NOT ?4",
+                    THEN json_extract(payload, '$.failure_scope') END IS NOT ?4
+           AND NOT COALESCE(
+                 CASE WHEN json_valid(payload)
+                      THEN json_extract(payload, '$.source_node_refused') IS 1
+                           AND COALESCE(json_array_length(payload, '$.job_ids'), 0) = 0
+                           AND COALESCE(json_extract(payload, '$.execution_generation'), ?5)
+                               = ?5
+                 END,
+                 0)",
         params![
             SNAPSHOT_UPLOAD_JOB_KIND,
             dedup_key,
             pplx_space_common_jobs::JobFailureKind::Permanent.as_str(),
-            excluded_scope
+            excluded_scope,
+            execution_generation.get()
         ],
         |row| row.get(0),
     )?;

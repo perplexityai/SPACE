@@ -156,47 +156,92 @@ async fn direct_refusal_off_its_node_releases_on_the_first_drive() {
     .await;
 }
 
+/// Settle a refused teardown's drive against `cluster_api` and assert it
+/// leaves the teardown running with nothing released, after `before` checks
+/// the probe the refusal gets.
+async fn assert_settle_keeps_the_teardown_running(
+    cluster_api: RetiringClusterApi,
+    before: impl AsyncFnOnce(LocalArtifactId),
+) {
+    with_cluster_api(cluster_api, async || {
+        let refused = refused_teardown_with(|staged| {
+            serde_json::to_string(&bound_upload_payload(staged)).unwrap()
+        })
+        .await;
+        before(refused.staged).await;
+        let service = &refused.service;
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            service.settle_teardown_suspend_drive(
+                refused.sandbox_id,
+                generation(GENERATION),
+                Err(refused.error.clone()),
+            ),
+        )
+        .await
+        .expect("the drive should settle");
+        assert!(result.is_err(), "the drive must stay failed");
+        assert!(refused.dispatched.lock().unwrap().is_empty());
+        let status = {
+            let db = service.db.lock().unwrap();
+            crate::db::latest_teardown_suspend_operation(&db, &refused.sandbox_id.to_string())
+                .unwrap()
+                .unwrap()
+                .status
+        };
+        assert_eq!(
+            status,
+            crate::db::TeardownSuspendOperationStatus::Running,
+            "the settle must not close the teardown"
+        );
+        drain(service).await;
+    })
+    .await;
+}
+
 /// A probe cluster-api can't answer is no verdict, and the lookup that can't
 /// see a sandbox placed on another node is no proof it's gone: the teardown
 /// stays running, nothing is released, and the next drive asks again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unanswered_probe_off_its_node_keeps_the_teardown_running() {
-    with_cluster_api(
+    assert_settle_keeps_the_teardown_running(
         RetiringClusterApi {
             unavailable: true,
             ..RETIRING
         },
-        async || {
-            let refused = refused_teardown_with(|staged| {
-                serde_json::to_string(&bound_upload_payload(staged)).unwrap()
-            })
-            .await;
-            let service = &refused.service;
-            let result = tokio::time::timeout(
-                Duration::from_secs(5),
-                service.settle_teardown_suspend_drive(
-                    refused.sandbox_id,
-                    generation(GENERATION),
-                    Err(refused.error.clone()),
-                ),
-            )
-            .await
-            .expect("the drive should settle");
-            assert!(result.is_err(), "the drive must stay failed");
-            assert!(refused.dispatched.lock().unwrap().is_empty());
-            let status = {
-                let db = service.db.lock().unwrap();
-                crate::db::latest_teardown_suspend_operation(&db, &refused.sandbox_id.to_string())
-                    .unwrap()
-                    .unwrap()
-                    .status
-            };
+        async |_| {},
+    )
+    .await;
+}
+
+/// The cluster can refuse a node as a backup's source while its storage
+/// lookup still places the sandbox there, as it does the pod node of the
+/// newest execution. The probe reads that refusal as `SourceNodeRefused`, the
+/// registration's refusal says so for the worker to record
+/// (`refusal_failure_scope`), and the settle leaves the teardown running.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn source_node_refusal_of_a_sandbox_placed_here_keeps_the_teardown_running() {
+    assert_settle_keeps_the_teardown_running(
+        RetiringClusterApi {
+            refuses_source_node: true,
+            placed: true,
+            ..RETIRING
+        },
+        async |staged| {
+            let payload = bound_upload_payload(staged);
             assert_eq!(
-                status,
-                crate::db::TeardownSuspendOperationStatus::Running,
-                "an unanswered probe must not close the teardown"
+                crate::snapshot_upload_jobs::prepared_begin_refused_as_superseded(&payload).await,
+                RegistrationProbe::SourceNodeRefused
             );
-            drain(service).await;
+            let refusal =
+                crate::snapshot_upload_jobs::begin_prepared_upload_naming_supersession(&payload)
+                    .await
+                    .expect_err("the cluster refuses this node as the source");
+            assert!(
+                refusal.refuses_source_node && !refusal.refuses_artifact,
+                "the refusal must be recorded as the node's, so later drives re-ask instead \
+                 of exhausting their attempts"
+            );
         },
     )
     .await;
@@ -205,7 +250,7 @@ async fn unanswered_probe_off_its_node_keeps_the_teardown_running() {
 /// The re-sent registration carries the refused generation back across the
 /// wire, to the probe and to a direct registration: a generation-bound upload
 /// reads as superseded at exactly its own generation, and an unbound one,
-/// which the cluster admits, reads as not.
+/// which the cluster admits without the fence, reads as that.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn resent_registration_recovers_the_superseded_generation() {
     with_cluster_api(RETIRING, async || {
@@ -227,7 +272,7 @@ async fn resent_registration_recovers_the_superseded_generation() {
         payload.execution_generation = None;
         assert_eq!(
             crate::snapshot_upload_jobs::prepared_begin_refused_as_superseded(&payload).await,
-            RegistrationProbe::NotSuperseded
+            RegistrationProbe::AdmittedUnfenced
         );
     })
     .await;
@@ -255,9 +300,9 @@ async fn the_probe_asks_for_a_verdict_only() {
     .await;
 }
 
-/// A teardown whose capture the cluster refused as superseded, its upload
-/// failed and its row marked as permanently refused, after one more drive's
-/// `ensure_teardown_suspend_backup` against `cluster`.
+/// A teardown whose capture's registration the cluster refused, its upload
+/// failed with the recorded scope and its row marked as permanently refused,
+/// after one more drive's `ensure_teardown_suspend_backup` against `cluster`.
 struct RedrivenRefusal {
     service: SandboxManagerService,
     sandbox_id: SandboxId,
@@ -291,29 +336,44 @@ async fn redrive_refusal() -> RedrivenRefusal {
 }
 
 async fn redrive_refusal_of(shape: RefusedRow) -> RedrivenRefusal {
+    redrive_refusal_scoped(
+        shape,
+        crate::snapshot_upload::UploadFailureScope::Artifact,
+        false,
+    )
+    .await
+}
+
+/// [`redrive_refusal_of`] for a refused upload recorded with `scope`, whose
+/// payload already holds transfer IDs when `replayed`: the refusal met a
+/// replay of a registration the cluster had admitted.
+async fn redrive_refusal_scoped(
+    shape: RefusedRow,
+    scope: crate::snapshot_upload::UploadFailureScope,
+    replayed: bool,
+) -> RedrivenRefusal {
     let conn = crate::db::test_conn();
     let sandbox_id = SandboxId::new();
     let staged =
         insert_stranded_teardown_suspend_sandbox(&conn, sandbox_id, generation(GENERATION));
+    let mut payload = bound_upload_payload(staged);
+    if replayed {
+        payload.job_ids = vec![JobId::new()];
+    }
     let refused = insert_upload_job(
         &conn,
         &sandbox_id.to_string(),
         staged,
-        &serde_json::to_string(&bound_upload_payload(staged)).unwrap(),
+        &serde_json::to_string(&payload).unwrap(),
     );
-    crate::snapshot_upload_jobs::record_failure_scope(
-        &conn,
-        &refused,
-        crate::snapshot_upload::UploadFailureScope::Artifact,
-    )
-    .unwrap();
-    pplx_space_common_jobs::db::fail_job_permanent(
-        conn.raw(),
-        &refused,
-        "cluster-api rejected begin_artifact_backup (FailedPrecondition): execution retired",
-        None,
-    )
-    .unwrap();
+    crate::snapshot_upload_jobs::record_failure_scope(&conn, &refused, scope).unwrap();
+    let refusal = match scope {
+        crate::snapshot_upload::UploadFailureScope::SourceNode => {
+            "cluster-api rejected begin_artifact_backup (PermissionDenied): not the source node"
+        }
+        _ => "cluster-api rejected begin_artifact_backup (FailedPrecondition): execution retired",
+    };
+    pplx_space_common_jobs::db::fail_job_permanent(conn.raw(), &refused, refusal, None).unwrap();
     assert!(
         crate::db::mark_teardown_suspend_backup_permanently_failed(
             &conn,
@@ -427,15 +487,92 @@ async fn lapsed_supersession_registers_the_capture_again() {
     };
     with_cluster_api(lapsed, async || {
         for shape in [RefusedRow::Suspending, RefusedRow::SuspendedByRestart] {
-            assert_lapsed_refusal_registers_again(shape).await;
+            assert_lapsed_refusal_registers_again(redrive_refusal_of(shape).await).await;
         }
     })
     .await;
 }
 
-/// One shape of [`lapsed_supersession_registers_the_capture_again`].
-async fn assert_lapsed_refusal_registers_again(shape: RefusedRow) {
-    let drive = redrive_refusal_of(shape).await;
+/// The cluster refused this node as the teardown backup's source, and now
+/// attributes the capture to it. The next drive's probe is admitted, here
+/// without the fence, as a replay or a previously-suspended capture is, and
+/// starts a new upload instead of rejoining the refusal for good.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_lifted_source_node_refusal_registers_the_capture_again() {
+    let admitting = RetiringClusterApi {
+        supersession_lapsed: true,
+        admits_unfenced: true,
+        ..RETIRING
+    };
+    with_cluster_api(admitting, async || {
+        for shape in [RefusedRow::Suspending, RefusedRow::SuspendedByRestart] {
+            let drive = redrive_refusal_scoped(
+                shape,
+                crate::snapshot_upload::UploadFailureScope::SourceNode,
+                false,
+            )
+            .await;
+            assert_lapsed_refusal_registers_again(drive).await;
+        }
+    })
+    .await;
+}
+
+/// While the cluster still refuses this node as the source, the drive rejoins
+/// the refused upload: it starts no new one and the row stays marked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_standing_source_node_refusal_starts_no_upload() {
+    let refusing = RetiringClusterApi {
+        refuses_source_node: true,
+        ..RETIRING
+    };
+    with_cluster_api(refusing, async || {
+        let drive = redrive_refusal_scoped(
+            RefusedRow::Suspending,
+            crate::snapshot_upload::UploadFailureScope::SourceNode,
+            false,
+        )
+        .await;
+        assert_eq!(
+            drive.newest, drive.refused,
+            "a standing refusal starts no upload"
+        );
+        assert!(marked_permanently_refused(&drive.service, drive.sandbox_id));
+        drain(&drive.service).await;
+    })
+    .await;
+}
+
+/// A refusal of this node that met a replay of an admitted registration,
+/// whose payload holds transfer IDs, can't be re-sent to ask again, as when
+/// the node's registered address changed after it registered. It's budgeted
+/// as the attempt's, as before source-node refusals were recorded, so while
+/// the cluster still refuses the node the next drive starts a fresh upload,
+/// under a new attempt id, instead of rejoining the replay for good.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_replayed_source_node_refusal_gets_a_new_attempt() {
+    let refusing = RetiringClusterApi {
+        refuses_source_node: true,
+        ..RETIRING
+    };
+    with_cluster_api(refusing, async || {
+        let drive = redrive_refusal_scoped(
+            RefusedRow::Suspending,
+            crate::snapshot_upload::UploadFailureScope::SourceNode,
+            true,
+        )
+        .await;
+        assert_ne!(
+            drive.newest, drive.refused,
+            "the drive must start a new upload, not rejoin the replayed refusal"
+        );
+        drain(&drive.service).await;
+    })
+    .await;
+}
+
+/// One drive of [`lapsed_supersession_registers_the_capture_again`].
+async fn assert_lapsed_refusal_registers_again(drive: RedrivenRefusal) {
     assert_ne!(
         drive.newest, drive.refused,
         "the drive must start a new upload, not rejoin the refused one"
@@ -659,7 +796,9 @@ fn a_rejoined_refusal_carries_its_verdict_to_the_settle() {
     for verdict in [
         RegistrationProbe::Superseded(generation(GENERATION)),
         RegistrationProbe::Admitted,
+        RegistrationProbe::AdmittedUnfenced,
         RegistrationProbe::NotSuperseded,
+        RegistrationProbe::SourceNodeRefused,
         RegistrationProbe::Unanswered,
     ] {
         let status = teardown_backup_verdict_status(tonic::Status::internal("refused"), verdict);

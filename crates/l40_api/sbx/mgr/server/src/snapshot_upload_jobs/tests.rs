@@ -783,6 +783,7 @@ pub(crate) fn reclaim_fixture_payload(
         deferred_metadata: false,
         execution_generation: None,
         failure_scope: Default::default(),
+        source_node_refused: false,
     }
 }
 
@@ -1332,4 +1333,29 @@ fn suspend_uncommitted_follows_the_row_state_and_its_pin() {
 
     assert!(!suspend_uncommitted(&db, &meta("sbx-absent", ArtifactOrigin::Suspend)).unwrap());
     assert!(!suspend_uncommitted(&db, &meta("sbx-0", ArtifactOrigin::Stop)).unwrap());
+}
+
+/// The failure scope the worker records for each kind of registration
+/// refusal: the artifact's, this node's as the source (which teardowns
+/// re-ask about instead of spending attempts), or none.
+#[test]
+fn a_refused_registration_records_its_failure_scope() {
+    use crate::snapshot_upload::UploadFailureScope;
+    for (refuses_artifact, refuses_source_node, expected) in [
+        (true, false, Some(UploadFailureScope::Artifact)),
+        (false, true, Some(UploadFailureScope::SourceNode)),
+        (false, false, None),
+    ] {
+        let refusal = BeginRefusal {
+            error: pplx_space_common_jobs::JobError::permanent("refused"),
+            superseded_generation: None,
+            refuses_artifact,
+            refuses_source_node,
+        };
+        assert_eq!(
+            refusal_failure_scope(&refusal),
+            expected,
+            "artifact {refuses_artifact}, source node {refuses_source_node}"
+        );
+    }
 }
