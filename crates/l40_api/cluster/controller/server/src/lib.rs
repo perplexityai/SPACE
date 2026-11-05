@@ -40,7 +40,6 @@ mod reconcile_queue_gc;
 mod reconcilers;
 mod snapshot_retention_sweeper;
 mod snapshot_storage_sweeper;
-mod started_sandbox_repair;
 mod stuck_container_creating_gc;
 mod stuck_snapshot_reaper;
 mod suspended_execution_reaper;

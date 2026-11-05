@@ -883,6 +883,83 @@ async fn classify_missing_pod_with_current_artifact_recovers_to_suspended() -> T
     Ok(())
 }
 
+/// A marker that names an older suspend snapshot doesn't block recovery when a
+/// newer suspend snapshot covers the sandbox's last lifecycle change, command
+/// and access. The row recovers from that newer snapshot, and the stale marker
+/// is cleared so the next restore selects it rather than the marker's older
+/// bytes.
+#[tokio::test(flavor = "current_thread")]
+async fn classify_missing_pod_with_stale_marker_recovers_and_clears_marker() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let node_id = NodeId::new();
+    let sandbox_id = SandboxId::new();
+    let marked_artifact_id = Uuid::now_v7();
+    let newer_artifact_id = Uuid::now_v7();
+    insert_node(&db.pool, node_id).await?;
+    insert_started_sandbox_with_active_execution(&db.pool, sandbox_id, node_id).await?;
+    sqlx::query(sql!(
+        "UPDATE sandboxes
+            SET current_local_artifact_id = $2,
+                current_local_artifact_kind = 'full',
+                current_local_artifact_origin = 'suspend',
+                lifecycle_changed_at = NOW() - INTERVAL '1 hour',
+                last_command_at = NOW() - INTERVAL '10 minutes',
+                last_access_at = NOW() - INTERVAL '10 minutes'
+          WHERE id = $1"
+    ))
+    .bind(sandbox_id)
+    .bind(marked_artifact_id)
+    .execute(&db.pool)
+    .await?;
+    insert_ready_full_snapshot(
+        &db.pool,
+        sandbox_id,
+        marked_artifact_id,
+        "NOW() - INTERVAL '20 minutes'",
+    )
+    .await?;
+    insert_ready_full_snapshot(
+        &db.pool,
+        sandbox_id,
+        newer_artifact_id,
+        "NOW() - INTERVAL '5 minutes'",
+    )
+    .await?;
+
+    let sink = SubstrateActionSink::new_without_substrate(db.pool.clone());
+    let pod_name = format!("space-sbx-{}-g1", sandbox_id.as_uuid().simple());
+    let pod_uid = Some(PodUid::parse(format!(
+        "{}-uid",
+        sandbox_id.as_uuid().simple()
+    ))?);
+    let guard = ClassifyGuard::PodName {
+        name: pod_name,
+        uid: pod_uid,
+    };
+    let outcome = sink.classify_orphan(sandbox_id, guard).await?;
+
+    assert_eq!(
+        outcome,
+        ClassifyOutcome::RecoveredSuspended {
+            from_lifecycle: SandboxLifecycle::Started,
+        }
+    );
+    let (lifecycle, marker): (SandboxLifecycle, Option<Uuid>) = sqlx::query_as(sql!(
+        "SELECT lifecycle, current_local_artifact_id FROM sandboxes WHERE id = $1"
+    ))
+    .bind(sandbox_id)
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(lifecycle, SandboxLifecycle::Suspended);
+    assert_eq!(
+        marker, None,
+        "the stale marker must be cleared so restore selects the newer snapshot"
+    );
+    Ok(())
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn failed_retry_of_exact_ready_artifact_does_not_block_recovery() -> TestResult {
     let Some(db) = try_pg_test_db().await? else {

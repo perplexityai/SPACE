@@ -42,7 +42,6 @@ use crate::public_operation_retention;
 use crate::reconcile_queue_gc;
 use crate::snapshot_retention_sweeper;
 use crate::snapshot_storage_sweeper;
-use crate::started_sandbox_repair;
 use crate::stuck_container_creating_gc;
 use crate::stuck_snapshot_reaper;
 use crate::suspended_execution_reaper;
@@ -459,20 +458,6 @@ pub async fn run_reconcilers(
                 pool.clone(),
                 kube.clone(),
                 suspended_execution_reaper::ReconcilerConfig::from_env(),
-                shutdown_token.child_token(),
-            )));
-
-            // Started-sandbox repair: moves `lifecycle = 'started'`
-            // Kubernetes sandboxes back to `suspended` only when there is no
-            // active execution/pod IP, any tracked pod is confirmed missing,
-            // and a current-cycle suspend snapshot is ready. Enabled by
-            // default and applies its fenced write directly;
-            // `SPACE_STARTED_SANDBOX_REPAIR_ENABLED=false` disables it, and any
-            // other non-truthy value disables it too.
-            handles.push(tokio::spawn(started_sandbox_repair::run(
-                pool.clone(),
-                kube.clone(),
-                started_sandbox_repair::ReconcilerConfig::from_env(),
                 shutdown_token.child_token(),
             )));
 

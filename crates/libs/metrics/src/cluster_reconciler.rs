@@ -1,8 +1,8 @@
 //! Unified metric + structured-log emission for the cluster-controller's
 //! sandbox repair/sweep loops.
 //!
-//! Names live in the `cluster_reconciler.*` namespace. Nine loops share the family, distinguished by the
-//! `loop` tag: `started_sandbox_repair`, `failed_restorable_repair`,
+//! Names live in the `cluster_reconciler.*` namespace. Eight loops share the family, distinguished by the
+//! `loop` tag: `failed_restorable_repair`,
 //! `transient_lifecycle_sweeper`, `suspended_execution_reaper`,
 //! `stuck_snapshot_reaper`, `stuck_container_creating_gc`,
 //! `warm_pool_orphan_gc`, `orphaned_restore_pod_gc`, and
@@ -53,7 +53,6 @@ use crate::emit::{counter, elapsed_ms, tag, timing_ms};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Loop {
     FailedRestorableRepair,
-    StartedSandboxRepair,
     TransientLifecycleSweeper,
     SuspendedExecutionReaper,
     StuckSnapshotReaper,
@@ -67,7 +66,6 @@ impl Loop {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::FailedRestorableRepair => "failed_restorable_repair",
-            Self::StartedSandboxRepair => "started_sandbox_repair",
             Self::TransientLifecycleSweeper => "transient_lifecycle_sweeper",
             Self::SuspendedExecutionReaper => "suspended_execution_reaper",
             Self::StuckSnapshotReaper => "stuck_snapshot_reaper",
@@ -167,10 +165,9 @@ const OUTCOME_SKIPPED: &str = "skipped";
 const OUTCOME_CAS_LOST: &str = "cas_lost";
 const OUTCOME_ERROR: &str = "error";
 
-/// Per-candidate result of the snapshot-revert repair loops
-/// (`loop:started_sandbox_repair` and `loop:failed_restorable_repair`, both
-/// `sweep:main`). The constructors pin `from_lifecycle` per loop (`started`
-/// / `failed`); reverts always land in `to_lifecycle:suspended`.
+/// Per-candidate result of the snapshot-revert repair loop
+/// (`loop:failed_restorable_repair`, `sweep:main`). Its constructor pins
+/// `from_lifecycle:failed`; reverts always land in `to_lifecycle:suspended`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RepairOutcome {
     /// Row moved to `suspended`, marker preserved (its own snapshot is
@@ -179,9 +176,6 @@ pub enum RepairOutcome {
     /// Row moved to `suspended` and the stale marker cleared so restore
     /// selects the newest durable snapshot.
     RevertedToNewestSnapshotMarkerCleared,
-    /// Left alone: the tracked pod still exists (`reason:pod_present`).
-    Skipped,
-    Deferred,
     CasLost,
     Error,
 }
@@ -193,8 +187,6 @@ impl RepairOutcome {
             Self::RevertedToNewestSnapshotMarkerCleared => {
                 "reverted_to_newest_snapshot_marker_cleared"
             }
-            Self::Skipped => OUTCOME_SKIPPED,
-            Self::Deferred => OUTCOME_DEFERRED,
             Self::CasLost => OUTCOME_CAS_LOST,
             Self::Error => OUTCOME_ERROR,
         }
@@ -205,7 +197,7 @@ impl RepairOutcome {
             Self::RevertedToDurableSnapshot | Self::RevertedToNewestSnapshotMarkerCleared => {
                 Some(LIFECYCLE_SUSPENDED)
             }
-            Self::Skipped | Self::Deferred | Self::CasLost | Self::Error => None,
+            Self::CasLost | Self::Error => None,
         }
     }
 }
@@ -806,14 +798,6 @@ impl OutcomeEvent {
             error: None,
             detail: None,
         }
-    }
-
-    pub fn started_sandbox_repair(outcome: RepairOutcome, mode: Mode) -> Self {
-        let mut event = Self::new(Loop::StartedSandboxRepair, Sweep::Main, outcome.as_str());
-        event.mode = Some(mode);
-        event.from_lifecycle = Some(LIFECYCLE_STARTED.to_string());
-        event.to_lifecycle = outcome.to_lifecycle();
-        event
     }
 
     pub fn failed_restorable_repair(outcome: RepairOutcome, mode: Mode) -> Self {

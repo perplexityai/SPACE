@@ -1272,10 +1272,13 @@ pub fn missing_suspending_pod_revert_eligibility(sandbox_alias: &str) -> Suspend
 /// branch trusts an exact durable backup even when the snapshot predates
 /// `lifecycle_changed_at` (see [`exact_marker_snapshot_backup_current`]).
 ///
-/// Only for the started-sandbox repair reconciler, which lists rows already
-/// proven inactive (no active execution, no pod evidence) and aged past its
-/// repair minimum before this eligibility runs. Always-on projections must use
-/// the default variant.
+/// Only for the orphaned-sandbox reconciler: its disposition read
+/// (`plan_orphan_in_tx` in the cluster controller), whose answer also decides
+/// whether an abandoned create is deleted, and its recovery and quarantine
+/// writes (`pplx_space_sandbox_store::orphan`). It acts on the answer only
+/// after its grace period, for a row whose active execution's pod is missing,
+/// terminal or unready (being deleted included), or whose latest execution is
+/// `forgotten`. Always-on projections must use the default variant.
 pub fn started_repair_revert_eligibility(sandbox_alias: &str) -> SuspendRevertEligibility {
     let marker_current = exact_marker_snapshot_backup_current(sandbox_alias);
     let newest_current = newest_suspend_snapshot_current(sandbox_alias);
