@@ -347,8 +347,7 @@ counts only on an unsampled context: a sampled one is saved whatever its
 A `grpc.client` span that ends in a non-OK status is marked ERROR, except for
 an answer the call expects: a readiness poll's FAILED_PRECONDITION, a guest
 file or process operation's application status, and a code the caller marks
-on that one call with `ExpectedGrpcStatus`. A marked call records the code in
-`space.grpc.expected_status` whatever the answer. net-gateway marks its policy
+on that one call with `ExpectedGrpcStatus`. A marked call records the code in`space.grpc.expected_status` whatever the answer. net-gateway marks its policy
 pulls PERMISSION_DENIED until sandbox-manager has registered it: a pull sent
 before the owner's first control call, within ten seconds of launch, and short
 of the last pending attempt. A marked pull's refusal is always retried; the
@@ -697,8 +696,7 @@ events use the log target
   leg, or without a recorded leg (`fault:relay_io`).
 - DEBUG `guest side failed an established known egress connection`: a
   pass-through relay that connected and then failed first on the guest leg.
-  These events are visible only when the gateway's log filter enables DEBUG
-  for that target.
+  These events are visible only when the gateway's log filter enables DEBUG  for that target.
 
 The INFO and DEBUG events add `fault`, with the same pass-through values as
 the metric tag above. Each of these failures is also counted by
@@ -1047,8 +1045,7 @@ selector errors are declared in
 
 ### Operator requirements
 
-- Keep the receiver internal. Apply an ingress **NetworkPolicy limiting TCP
-  4317 to the intended SPACE namespaces**, with narrowly selected producers
+- Keep the receiver internal. Apply an ingress **NetworkPolicy limiting TCP  4317 to the intended SPACE namespaces**, with narrowly selected producers
   where possible. Use a CNI that enforces the policy; do not expose the receiver
   through a public load balancer or an unprotected node port.
 - **Sandbox guests must not reach the Collector.** Namespace selection alone
@@ -1193,24 +1190,32 @@ tags:
 
 | Tag | Values |
 | --- | --- |
-| `kind` | `create` for a cold or warm-pool create |
+| `kind` | `create` for a cold or warm-pool create; `activate` for a lifecycle action that activates a dormant sandbox: a start from `created`, `stopped` or `suspended`, a wake from `created` or `suspended`, or a restore from `suspended`; `resume` for a resume of a `paused` sandbox |
 | `surface` | `native` or `ecw`, the API the call arrived on |
-| `admission` | `accepted`, or `rejected` when cluster activation admission refused the call |
-| `template` | The resolved template |
-| `defaulted` | `false` when the request set both vCPU and memory; `true` when a build shape, the platform default, a warm-pool config or a warm-pool policy supplied either. Warm-pool claims are always `true` |
+| `admission` | `accepted`, or `rejected` when cluster activation admission refused the call, whether at request entry or when the substrate charged a restore claim |
+| `template` | The resolved template for a create; otherwise the sandbox's template (`unknown` if the row names none) |
+| `defaulted` | Creates only. `false` when the request set both vCPU and memory; `true` when a build shape, the platform default, a warm-pool config or a warm-pool policy supplied either. Warm-pool claims are always `true` |
 | `client_id` | The request's bounded caller, as described above |
 
-Each eligible recorded create contributes one sample to each distribution.
-Retries that reach a recording point add another sample; the distribution count
-is not the total number of incoming create requests.
+Each eligible recorded create, activation or resume contributes one sample to
+each distribution. Retries that reach a recording point add another sample;
+the distribution count is not the total number of incoming calls.
 
 A cold create is recorded at its cluster admission decision, so an admitted
 create that fails later still counts and one that fails before admission does
-not. A warm-pool create is recorded when its claim is adopted.
+not. A warm-pool create is recorded when its claim is adopted. An activation
+or resume is recorded only when the action succeeds or admission refuses it; a
+caller that joins another caller's in-flight activation adds none.
 
-Nothing is recorded for a fork, or for a create whose size the API did not
-resolve: a Direct create, or a Kubernetes create left to the node's default
-shape. Disk size is not recorded.
+Resident resumes need no admission; recovering a missing runtime can require
+admission and be rejected. Eligible implicit wakes routed through the lifecycle
+action controller are included; data-plane paths that bypass it are not.
+
+Nothing is recorded for a fork; a create whose size the API did not resolve (a
+Direct create, or a Kubernetes create left to the node's default shape); a
+wake of a running or `paused` sandbox; a lifecycle action on a `restoring`
+sandbox, including a restore-lease takeover the substrate charges. Disk size is
+not recorded.
 
 ## Sandboxes in a transient lifecycle
 
