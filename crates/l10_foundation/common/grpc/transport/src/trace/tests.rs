@@ -456,3 +456,35 @@ async fn expected_status_mark_reaches_the_traced_transport() {
         Some(Some(tonic::Code::PermissionDenied))
     );
 }
+
+/// Fields a caller attaches to a call are recorded on the client span the
+/// trace layer opens for it.
+#[test]
+fn marked_client_span_fields_are_recorded_on_the_call_span() {
+    #[derive(Clone, Default)]
+    struct CountRecords(Arc<std::sync::atomic::AtomicUsize>);
+
+    impl RecordClientSpan for CountRecords {
+        fn record(&self, _span: &tracing::Span) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    let fields = CountRecords::default();
+    let mut request = Request::builder()
+        .uri("/pplx.space.node.NodeManager/CreateSandbox")
+        .body(())
+        .unwrap();
+    request
+        .extensions_mut()
+        .insert(ClientSpanFields::new(fields.clone()));
+    let _span = GrpcClientMakeSpan.make_span(&request);
+    assert_eq!(fields.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    let unmarked = Request::builder()
+        .uri("/pplx.space.node.NodeManager/CreateSandbox")
+        .body(())
+        .unwrap();
+    let _span = GrpcClientMakeSpan.make_span(&unmarked);
+    assert_eq!(fields.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+}

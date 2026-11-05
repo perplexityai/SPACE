@@ -11,6 +11,7 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+pplx-space-guest-status = { workspace = true }
 pplx-space-durations = { workspace = true }
 serde = { workspace = true, features = ["derive"], optional = true }
 thiserror = { workspace = true }

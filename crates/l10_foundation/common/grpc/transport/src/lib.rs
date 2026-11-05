@@ -37,6 +37,8 @@ mod connection_watch;
 mod context;
 mod deadline;
 mod forward;
+mod guest_outcome;
+pub use guest_outcome::{record_guest_service_outcome, record_guest_service_status};
 mod idempotency;
 pub use connection_watch::ConnectionWatch;
 mod policy;
@@ -49,12 +51,7 @@ mod request_admission;
 mod request_body;
 mod retry;
 mod rotate;
-mod sandbox_trace;
 mod server;
-pub use sandbox_trace::{
-    SandboxTraceContext, record_guest_service_outcome, record_guest_service_status,
-    record_sandbox_id,
-};
 mod status;
 mod upload_body;
 pub use upload_body::{UploadBody, UploadBodyClosed, UploadSender, upload_channel};
@@ -72,7 +69,8 @@ pub use connect::{
     connect_uds_channel_with_retry, retrying_redial_bound,
 };
 pub use context::GrpcRetryContext;
-pub use idempotency::generated_idempotency_key;
+#[doc(hidden)]
+pub use idempotency::generated_idempotency_key_string;
 pub use policy::{
     DEFAULT_GRPC_CONNECT_RETRY_POLICY, DEFAULT_LOCAL_GRPC_RETRY_POLICY,
     DEFAULT_TCP_GRPC_CONNECT_RETRY_POLICY, GrpcRetryPolicy,
@@ -90,16 +88,16 @@ pub use server::{GrpcServer, grpc_server_builder};
 pub use status::{
     DESIRED_STATE_APPLY_TERMINAL_METADATA, GuestCapability, GuestCapabilityUnsupported,
     GuestServiceUnavailable, RETRY_AFTER_MS_METADATA, RateLimited, RetryableNotReady,
-    SandboxServiceRouteNotReady, SessionRouteAtRest, UdsPerSandboxLimitExceeded,
-    guest_capability_unsupported_status, guest_service_connect_status,
-    is_desired_state_apply_terminal, is_guest_path_not_found, is_refused_before_start,
-    is_terminal_guest_process_error, mark_desired_state_apply_terminal, mark_guest_path_not_found,
-    mark_guest_process_error, mark_sandbox_not_running, mark_session_route_at_rest,
+    SandboxServiceRouteNotReady, UdsPerSandboxLimitExceeded, guest_capability_unsupported_status,
+    guest_service_connect_status, is_desired_state_apply_terminal, is_guest_path_not_found,
+    is_refused_before_start, is_terminal_guest_process_error, mark_desired_state_apply_terminal,
+    mark_guest_path_not_found, mark_guest_process_error, mark_sandbox_not_running,
     rate_limited_status, refused_before_start, retry_after, sandbox_not_running_state,
-    sandbox_service_route_not_ready_status, session_route_at_rest,
-    uds_per_sandbox_limit_exceeded_status, with_retry_after,
+    sandbox_service_route_not_ready_status, uds_per_sandbox_limit_exceeded_status,
+    with_retry_after,
 };
 pub use trace::{
-    CLIENT_SERVICE_METADATA_KEY, ExpectedGrpcStatus, GrpcClientTrace, current_service_name,
-    is_untraced_grpc_path, set_current_service_name, trace_grpc_client_transport,
+    CLIENT_SERVICE_METADATA_KEY, ClientSpanFields, ExpectedGrpcStatus, GrpcClientTrace,
+    RecordClientSpan, current_service_name, is_untraced_grpc_path, set_current_service_name,
+    trace_grpc_client_transport,
 };

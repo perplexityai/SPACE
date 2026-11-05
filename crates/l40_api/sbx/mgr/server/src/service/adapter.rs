@@ -589,7 +589,7 @@ impl SandboxManager for SandboxManagerService {
 /// span, the current span while a handler runs, so a search by `sandbox_id`
 /// finds the request and not only its children.
 fn record_entry_sandbox_id(sandbox_id: &str) {
-    pplx_space_common_svc::record_sandbox_id(&tracing::Span::current(), sandbox_id);
+    pplx_space_sandbox_grpc::record_sandbox_id(&tracing::Span::current(), sandbox_id);
 }
 
 #[cfg(test)]

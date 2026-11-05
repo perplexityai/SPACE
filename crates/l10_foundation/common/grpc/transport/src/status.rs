@@ -112,9 +112,9 @@ pub fn mark_guest_process_error(mut status: Status) -> Status {
     let storage_full = status.code() == Code::ResourceExhausted
         && status
             .metadata()
-            .get(pplx_space_common_core::spaced::ERROR_REASON_METADATA_KEY)
+            .get(pplx_space_guest_status::ERROR_REASON_METADATA_KEY)
             .and_then(|value| value.to_str().ok())
-            == Some(pplx_space_common_core::spaced::GUEST_STORAGE_FULL);
+            == Some(pplx_space_guest_status::GUEST_STORAGE_FULL);
     if storage_full
         || matches!(
             status.code(),
@@ -183,13 +183,13 @@ pub fn with_retry_after(mut status: Status, try_again: Duration) -> Status {
 }
 
 /// Mark `status` as a request refused before any of its work started (see
-/// [`pplx_space_common_core::spaced::REQUEST_REFUSED`]), with a retry hint.
+/// [`pplx_space_guest_status::REQUEST_REFUSED`]), with a retry hint.
 /// Hops relay it unchanged and do not retry it; the public surfaces answer it
 /// as retryable, with `Retry-After`.
 pub fn refused_before_start(mut status: Status, try_again: Duration) -> Status {
     status.metadata_mut().insert(
-        pplx_space_common_core::spaced::ERROR_REASON_METADATA_KEY,
-        MetadataValue::from_static(pplx_space_common_core::spaced::REQUEST_REFUSED),
+        pplx_space_guest_status::ERROR_REASON_METADATA_KEY,
+        MetadataValue::from_static(pplx_space_guest_status::REQUEST_REFUSED),
     );
     with_retry_after(status, try_again)
 }
@@ -198,13 +198,13 @@ pub fn refused_before_start(mut status: Status, try_again: Duration) -> Status {
 pub fn is_refused_before_start(status: &Status) -> bool {
     status
         .metadata()
-        .get(pplx_space_common_core::spaced::ERROR_REASON_METADATA_KEY)
+        .get(pplx_space_guest_status::ERROR_REASON_METADATA_KEY)
         .and_then(|value| value.to_str().ok())
-        == Some(pplx_space_common_core::spaced::REQUEST_REFUSED)
+        == Some(pplx_space_guest_status::REQUEST_REFUSED)
 }
 
 /// Mark a NOT_FOUND returned by a guest filesystem call on a path as the path
-/// being missing (see [`pplx_space_common_core::spaced::GUEST_PATH_NOT_FOUND`]).
+/// being missing (see [`pplx_space_guest_status::GUEST_PATH_NOT_FOUND`]).
 ///
 /// Only the hop that has already resolved the sandbox to a running guest may
 /// call this: there, a NOT_FOUND from the guest's filesystem service can only
@@ -212,8 +212,8 @@ pub fn is_refused_before_start(status: &Status) -> bool {
 pub fn mark_guest_path_not_found(mut status: Status) -> Status {
     if status.code() == Code::NotFound {
         status.metadata_mut().insert(
-            pplx_space_common_core::spaced::ERROR_REASON_METADATA_KEY,
-            MetadataValue::from_static(pplx_space_common_core::spaced::GUEST_PATH_NOT_FOUND),
+            pplx_space_guest_status::ERROR_REASON_METADATA_KEY,
+            MetadataValue::from_static(pplx_space_guest_status::GUEST_PATH_NOT_FOUND),
         );
     }
     status
@@ -224,77 +224,19 @@ pub fn is_guest_path_not_found(status: &Status) -> bool {
     status.code() == Code::NotFound
         && status
             .metadata()
-            .get(pplx_space_common_core::spaced::ERROR_REASON_METADATA_KEY)
+            .get(pplx_space_guest_status::ERROR_REASON_METADATA_KEY)
             .and_then(|value| value.to_str().ok())
-            == Some(pplx_space_common_core::spaced::GUEST_PATH_NOT_FOUND)
+            == Some(pplx_space_guest_status::GUEST_PATH_NOT_FOUND)
 }
 
-const SESSION_ROUTE_AT_REST: &str = "session_route_at_rest";
-
-/// Mark a FAILED_PRECONDITION for a session route the sandbox has no node
-/// for as one nothing is about to give it: the sandbox is not heading to
-/// running, no wake is queued, and none could be queued for it. The marker
-/// names the sandbox and its state, so the answer can say how to wake it.
-/// Absence keeps the old meaning, a route that is not ready yet, so a client
-/// may wait and attach again.
-pub fn mark_session_route_at_rest(
-    mut status: Status,
-    sandbox_id: pplx_space_common_core::types::SandboxId,
-    state: pplx_space_common_core::types::SandboxLifecycle,
-) -> Status {
-    status.metadata_mut().insert(
-        SANDBOX_SERVICE_ROUTE_ERROR_METADATA,
-        MetadataValue::from_static(SESSION_ROUTE_AT_REST),
-    );
-    status.metadata_mut().insert(
-        SANDBOX_STATE_METADATA,
-        MetadataValue::from_static(state.as_str()),
-    );
-    if let Ok(sandbox_id) = MetadataValue::try_from(sandbox_id.to_string()) {
-        status
-            .metadata_mut()
-            .insert(SANDBOX_ID_METADATA, sandbox_id);
-    }
-    status
-}
-
-/// What [`mark_session_route_at_rest`] recorded, each part `None` when it did
-/// not survive.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct SessionRouteAtRest {
-    pub sandbox_id: Option<pplx_space_common_core::types::SandboxId>,
-    pub state: Option<pplx_space_common_core::types::SandboxLifecycle>,
-}
-
-/// The at-rest mark on `status`, or `None` when it has none.
-pub fn session_route_at_rest(status: &Status) -> Option<SessionRouteAtRest> {
-    let metadata = status.metadata();
-    let marked = status.code() == Code::FailedPrecondition
-        && metadata
-            .get(SANDBOX_SERVICE_ROUTE_ERROR_METADATA)
-            .and_then(|value| value.to_str().ok())
-            == Some(SESSION_ROUTE_AT_REST);
-    marked.then(|| SessionRouteAtRest {
-        sandbox_id: metadata
-            .get(SANDBOX_ID_METADATA)
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.parse().ok()),
-        state: metadata
-            .get(SANDBOX_STATE_METADATA)
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.parse().ok()),
-    })
-}
-
-const SANDBOX_ID_METADATA: &str = "space-sandbox-id";
 const SANDBOX_STATE_METADATA: &str = "space-sandbox-state";
 
-/// Mark `status` as a [`pplx_space_common_core::spaced::SANDBOX_NOT_RUNNING`]
+/// Mark `status` as a [`pplx_space_guest_status::SANDBOX_NOT_RUNNING`]
 /// refusal, naming the sandbox's `state` as the refusing hop knows it.
 pub fn mark_sandbox_not_running(mut status: Status, state: &str) -> Status {
     status.metadata_mut().insert(
-        pplx_space_common_core::spaced::ERROR_REASON_METADATA_KEY,
-        MetadataValue::from_static(pplx_space_common_core::spaced::SANDBOX_NOT_RUNNING),
+        pplx_space_guest_status::ERROR_REASON_METADATA_KEY,
+        MetadataValue::from_static(pplx_space_guest_status::SANDBOX_NOT_RUNNING),
     );
     if let Ok(state) = MetadataValue::try_from(state) {
         status.metadata_mut().insert(SANDBOX_STATE_METADATA, state);
@@ -308,9 +250,9 @@ pub fn sandbox_not_running_state(status: &Status) -> Option<&str> {
     let marked = status.code() == Code::FailedPrecondition
         && status
             .metadata()
-            .get(pplx_space_common_core::spaced::ERROR_REASON_METADATA_KEY)
+            .get(pplx_space_guest_status::ERROR_REASON_METADATA_KEY)
             .and_then(|value| value.to_str().ok())
-            == Some(pplx_space_common_core::spaced::SANDBOX_NOT_RUNNING);
+            == Some(pplx_space_guest_status::SANDBOX_NOT_RUNNING);
     marked.then(|| {
         status
             .metadata()

@@ -4866,6 +4866,7 @@ dependencies = [
  "pplx-space-public-api",
  "pplx-space-public-api-http",
  "pplx-space-runtime-environment-policy-store",
+ "pplx-space-sandbox-grpc",
  "pplx-space-sandbox-portability",
  "pplx-space-sandbox-store",
  "pplx-space-sandbox-teardown",
@@ -5357,9 +5358,11 @@ dependencies = [
  "http-body 1.1.0",
  "hyper",
  "hyper-util",
- "pplx-space-common-core",
+ "pplx-space-durations",
+ "pplx-space-env-vars",
  "pplx-space-grpc-metrics",
  "pplx-space-guest-capability",
+ "pplx-space-guest-status",
  "pplx-space-metrics-emit",
  "pplx-space-observability",
  "rand 0.10.2",
@@ -5734,6 +5737,7 @@ dependencies = [
  "pplx-space-node-api-client",
  "pplx-space-public-api",
  "pplx-space-public-api-http",
+ "pplx-space-sandbox-grpc",
  "pplx-space-sbx-mgr-client",
  "pplx-space-test-env",
  "prost",
@@ -5988,11 +5992,16 @@ name = "pplx-space-guest-process"
 version = "0.8.1"
 dependencies = [
  "pplx-space-durations",
+ "pplx-space-guest-status",
  "serde",
  "serde_json",
  "thiserror 2.0.20",
  "uuid",
 ]
+
+[[package]]
+name = "pplx-space-guest-status"
+version = "0.8.1"
 
 [[package]]
 name = "pplx-space-http-server"
@@ -6045,6 +6054,7 @@ dependencies = [
  "pplx-space-public-api",
  "pplx-space-runtime-environment-catalog-store",
  "pplx-space-runtime-environment-policy-store",
+ "pplx-space-sandbox-grpc",
  "pplx-space-sandbox-portability",
  "pplx-space-sandbox-store",
  "pplx-space-sbx-mgr-client",
@@ -6264,6 +6274,7 @@ dependencies = [
  "pplx-space-net-common",
  "pplx-space-net-gateway-client",
  "pplx-space-observability",
+ "pplx-space-sandbox-grpc",
  "pplx-space-spaced-common",
  "pplx-space-test-env",
  "prost",
@@ -6426,6 +6437,7 @@ dependencies = [
  "pplx-space-net-gateway-client",
  "pplx-space-node-api-client",
  "pplx-space-node-mgr-client",
+ "pplx-space-sandbox-grpc",
  "pplx-space-sbx-mgr-client",
  "pplx-space-template-mgr-client",
  "pplx-space-test-env",
@@ -7058,6 +7070,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "pplx-space-sandbox-grpc"
+version = "0.8.1"
+dependencies = [
+ "pplx-space-common-core",
+ "pplx-space-common-grpc",
+ "pplx-space-observability",
+ "tonic",
+ "tracing",
+]
+
+[[package]]
 name = "pplx-space-sandbox-portability"
 version = "0.8.1"
 dependencies = [
@@ -7157,6 +7180,7 @@ dependencies = [
  "pplx-space-node-mgr-client",
  "pplx-space-node-runtime-core",
  "pplx-space-observability",
+ "pplx-space-sandbox-grpc",
  "pplx-space-sbx-mgr-client",
  "pplx-space-sbx-mgr-store",
  "pplx-space-spaced-common",
@@ -7947,6 +7971,7 @@ dependencies = [
  "pplx-space-metrics",
  "pplx-space-node-mgr-client",
  "pplx-space-object-store",
+ "pplx-space-sandbox-grpc",
  "pplx-space-sqlite",
  "pplx-space-test-env",
  "pplx-space-volmgr-client",

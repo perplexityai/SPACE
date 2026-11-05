@@ -52,7 +52,7 @@ macro_rules! fwd_retry_keyed {
             .map(str::is_empty)
             .unwrap_or(true);
         if needs_idempotency_key {
-            message.idempotency_key = Some($crate::generated_idempotency_key().into());
+            message.idempotency_key = Some($crate::generated_idempotency_key_string());
         }
         let context = $crate::GrpcRetryContext::none().with_grpc_timeout_metadata(&metadata);
         $crate::retry_grpc_status_with_context(

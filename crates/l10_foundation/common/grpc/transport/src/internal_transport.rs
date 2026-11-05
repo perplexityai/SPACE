@@ -5,7 +5,7 @@ mod incoming;
 pub use incoming::Incoming;
 
 use http::Uri;
-use pplx_space_common_core::env::{Environment, ProcessEnvironment};
+use pplx_space_env_vars::{Environment, ProcessEnvironment};
 use std::path::PathBuf;
 use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity, ServerTlsConfig};
 
@@ -69,7 +69,7 @@ pub enum TransportError {
 }
 
 fn insecure(env: &dyn Environment) -> bool {
-    pplx_space_common_core::env::env_flag(env.var(INSECURE_DEV_ENV).ok().as_deref(), false)
+    pplx_space_env_vars::env_flag(env.var(INSECURE_DEV_ENV).ok().as_deref(), false)
 }
 
 pub fn default_scheme() -> &'static str {

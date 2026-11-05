@@ -417,7 +417,7 @@ impl HttpSpanMetadata for ApiHttpSpanMetadata {
         span: &tracing::Span,
     ) {
         if let Some(sandbox_id) = sandbox_path_segment(raw_path) {
-            pplx_space_common_svc::record_sandbox_id(span, sandbox_id);
+            pplx_space_sandbox_grpc::record_sandbox_id(span, sandbox_id);
         }
     }
 }

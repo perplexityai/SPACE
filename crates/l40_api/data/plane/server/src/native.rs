@@ -37,7 +37,7 @@ pub(super) fn route_resolution_error(status: &tonic::Status) -> RouteResolutionE
         tonic::Code::PermissionDenied => RouteResolutionError::Forbidden,
         tonic::Code::NotFound => RouteResolutionError::SessionNotFound,
         tonic::Code::FailedPrecondition
-            if let Some(at_rest) = pplx_space_common_grpc::session_route_at_rest(status) =>
+            if let Some(at_rest) = pplx_space_sandbox_grpc::session_route_at_rest(status) =>
         {
             RouteResolutionError::SessionAtRest(at_rest)
         }

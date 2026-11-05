@@ -1,4 +1,9 @@
 //! Stable guest error metadata shared by native guests and API relays.
+//!
+//! Its own crate, with no dependencies, so the gRPC transport can mark and
+//! read these reasons; `pplx-space-guest-process` re-exports it as `status`
+//! and `pplx-space-common-core` as `spaced`.
+
 /// gRPC metadata key naming why a call failed where its code alone is
 /// ambiguous. Hops relay a status unchanged, so the key reaches the API.
 pub const ERROR_REASON_METADATA_KEY: &str = "space-error-reason";

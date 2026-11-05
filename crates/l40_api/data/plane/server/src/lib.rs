@@ -1235,7 +1235,7 @@ async fn open_service_port_ingress_io(
     let trace_context = u16::try_from(port)
         .ok()
         .and_then(|value| pplx_space_common_core::types::GuestPort::try_from_u16(value).ok())
-        .map(|port| pplx_space_common_grpc::SandboxTraceContext {
+        .map(|port| pplx_space_sandbox_grpc::SandboxTraceContext {
             sandbox_id: *sandbox_id,
             port,
             route_generation: route_generation.try_into().ok(),
@@ -1285,7 +1285,7 @@ async fn open_service_port_ingress_io(
         tonic::metadata::MetadataValue::from_static("1"),
     );
     if let Some(context) = trace_context {
-        request.extensions_mut().insert(context);
+        context.mark(&mut request);
     }
     let response = client
         .service_port_ingress(request)

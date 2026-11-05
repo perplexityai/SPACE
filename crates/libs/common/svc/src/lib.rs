@@ -160,8 +160,6 @@ pub use bootstrap::{
 
 pub use lifecycle::{DrainSignal, drain_server};
 
-pub use pplx_space_common_grpc::record_sandbox_id;
-
 pub use rate_limiter::{
     GrpcRateLimitBucket, GrpcRateLimiterConfig, GrpcRateLimiterLayer, GrpcRateLimiterLimits,
     GrpcRateLimiterMode, UnknownPeerPolicy, conservative_uds_grpc_rate_limiter_layer,

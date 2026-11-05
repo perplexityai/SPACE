@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use futures_util::{Stream, StreamExt};
 use pplx_space_common_core::types::SandboxId;
-use pplx_space_common_grpc::{fwd_retry, record_sandbox_id};
+use pplx_space_common_grpc::fwd_retry;
 use pplx_space_common_svc::auth::{
     NetworkPolicyMutationAuthority, NodeApiAuthenticatedCaller, WaitReadyLifecycleAuthority,
 };
@@ -21,6 +21,7 @@ use pplx_space_common_svc::space_api_route::{
     space_api_route_capability_presence, take_wait_ready_call_purpose, wait_ready_call_purpose,
 };
 use pplx_space_node_mgr_client::{CacheDiskSchedulingEffect, NodeResourceStatusReader};
+use pplx_space_sandbox_grpc::record_sandbox_id;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 use tonic::{Request, Response, Status};
@@ -1100,7 +1101,7 @@ impl WorkerApi for WorkerApiService {
                 ));
             }
         };
-        let trace_context = pplx_space_common_grpc::SandboxTraceContext::new(sandbox_id, port);
+        let trace_context = pplx_space_sandbox_grpc::SandboxTraceContext::new(sandbox_id, port);
         trace_context.record(&tracing::Span::current());
         let sandbox_id_string = sandbox_id.to_string();
         let ingress_permit = self
@@ -1114,7 +1115,7 @@ impl WorkerApi for WorkerApiService {
         let request_stream = tokio_stream::iter(std::iter::once(first)).chain(rest);
         let mut request = Request::new(request_stream);
         *request.metadata_mut() = metadata;
-        request.extensions_mut().insert(trace_context);
+        trace_context.mark(&mut request);
         // Bidirectional stream: frames are consumed as they arrive and cannot
         // be rebuilt, so a restart-drain marker at establishment is not
         // replayed; the ingress caller owns reconnecting the whole stream.

@@ -181,7 +181,7 @@ pub(super) fn linked_trace_span(
         origin_trace_id = tracing::field::Empty,
         origin_sampled = tracing::field::Empty,
     );
-    pplx_space_common_svc::record_sandbox_id(&span, sandbox_id);
+    pplx_space_sandbox_grpc::record_sandbox_id(&span, sandbox_id);
     if let Some(request_id) = pplx_space_observability::current_request_id() {
         span.record("request_id", request_id.as_str());
     }

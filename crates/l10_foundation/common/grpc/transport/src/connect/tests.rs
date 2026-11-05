@@ -481,7 +481,7 @@ async fn an_endpoint_without_a_dial_bound_is_redialed_at_the_default_one() {
 struct TestEnvironment(std::collections::HashMap<&'static str, std::ffi::OsString>);
 
 #[cfg(feature = "internal-tls")]
-impl pplx_space_common_core::env::Environment for TestEnvironment {
+impl pplx_space_env_vars::Environment for TestEnvironment {
     fn var_os(&self, key: &str) -> Option<std::ffi::OsString> {
         self.0.get(key).cloned()
     }
