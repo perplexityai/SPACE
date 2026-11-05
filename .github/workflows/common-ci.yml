@@ -63,10 +63,11 @@ jobs:
         run: |
           set -euo pipefail
           decision="$(bash ci/scripts/check-needed.sh "${SCOPE}" "${SCOPE_BASE}" "${PULL_REQUEST_HEAD}")"
-          case "${decision}" in
-            needed=true | needed=false) printf '%s\n' "${decision}" >>"${GITHUB_OUTPUT}" ;;
-            *) echo "check-needed.sh answered '${decision}'" >&2; exit 1 ;;
-          esac
+          if [[ ! "${decision}" =~ ^needed=(true|false)($'\n'base=[0-9a-f]{40})?$ ]]; then
+            echo "check-needed.sh answered '${decision}'" >&2
+            exit 1
+          fi
+          printf '%s\n' "${decision}" >>"${GITHUB_OUTPUT}"
 
       # The steps after the workload run this copy of the package cache
       # helper, taken before the workload starts, so they always run the
@@ -217,10 +218,11 @@ jobs:
         run: |
           set -euo pipefail
           decision="$(bash ci/scripts/check-needed.sh "${SCOPE}" "${SCOPE_BASE}" "${PULL_REQUEST_HEAD}")"
-          case "${decision}" in
-            needed=true | needed=false) printf '%s\n' "${decision}" >>"${GITHUB_OUTPUT}" ;;
-            *) echo "check-needed.sh answered '${decision}'" >&2; exit 1 ;;
-          esac
+          if [[ ! "${decision}" =~ ^needed=(true|false)($'\n'base=[0-9a-f]{40})?$ ]]; then
+            echo "check-needed.sh answered '${decision}'" >&2
+            exit 1
+          fi
+          printf '%s\n' "${decision}" >>"${GITHUB_OUTPUT}"
 
       - *copy-package-cache-helper
 
@@ -353,10 +355,11 @@ jobs:
         run: |
           set -euo pipefail
           decision="$(bash ci/scripts/check-needed.sh "${SCOPE}" "${SCOPE_BASE}" "${PULL_REQUEST_HEAD}")"
-          case "${decision}" in
-            needed=true | needed=false) printf '%s\n' "${decision}" >>"${GITHUB_OUTPUT}" ;;
-            *) echo "check-needed.sh answered '${decision}'" >&2; exit 1 ;;
-          esac
+          if [[ ! "${decision}" =~ ^needed=(true|false)($'\n'base=[0-9a-f]{40})?$ ]]; then
+            echo "check-needed.sh answered '${decision}'" >&2
+            exit 1
+          fi
+          printf '%s\n' "${decision}" >>"${GITHUB_OUTPUT}"
 
       - *copy-package-cache-helper
 
@@ -520,10 +523,11 @@ jobs:
         run: |
           set -euo pipefail
           decision="$(bash ci/scripts/check-needed.sh "${SCOPE}" "${SCOPE_BASE}" "${PULL_REQUEST_HEAD}")"
-          case "${decision}" in
-            needed=true | needed=false) printf '%s\n' "${decision}" >>"${GITHUB_OUTPUT}" ;;
-            *) echo "check-needed.sh answered '${decision}'" >&2; exit 1 ;;
-          esac
+          if [[ ! "${decision}" =~ ^needed=(true|false)($'\n'base=[0-9a-f]{40})?$ ]]; then
+            echo "check-needed.sh answered '${decision}'" >&2
+            exit 1
+          fi
+          printf '%s\n' "${decision}" >>"${GITHUB_OUTPUT}"
 
       - *copy-package-cache-helper
 

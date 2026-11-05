@@ -381,7 +381,14 @@ run_clippy_checks() {
         -- \
         -D warnings
 
-    run_sbxmgr_production_checks "${target_dir}"
+    # Pull CI and the merge queue run these only when the change can affect
+    # the crates they lint (lint_affects_any in lib/rust-isolated-crates.sh).
+    if lint_affects_any "${target_dir}" pplx-space-sbx-mgr-store pplx-space-sbx-mgr \
+        pplx-space-sbx-mgr-svc pplx-space-db-migrate pplx-space-db-migrator; then
+        run_sbxmgr_production_checks "${target_dir}"
+    else
+        echo "--- :rust: Skipping sbx-mgr production clippy: the change affects none of its crates"
+    fi
 
     # The check above resolves a `-p` selection. The release images build
     # from the workspace root without one, so this one reads each release

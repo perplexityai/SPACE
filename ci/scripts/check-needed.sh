@@ -7,6 +7,9 @@
 #
 # Usage: ci/scripts/check-needed.sh SCOPE [BASE [PULL_REQUEST_HEAD]]
 #
+# Prints `needed=true` or `needed=false`, then `base=<sha>` when it compared
+# the change with a base.
+#
 # An empty BASE means "run every check": Main CI passes none. SCOPE `always`
 # is always needed. Anything this script cannot decide, a missing base or an
 # empty change included, also answers `needed=true`, so an error costs time,
@@ -32,8 +35,13 @@ if [[ -z "${scope}" ]]; then
     exit 2
 fi
 
+# Prints the answer, and the base it was decided against once there is one,
+# which a check can use to narrow its own work (rust-isolated-crates.sh).
 answer() {
     printf 'needed=%s\n' "$1"
+    if [[ -n "${decided_base:-}" ]]; then
+        printf 'base=%s\n' "${decided_base}"
+    fi
     exit 0
 }
 
@@ -103,6 +111,7 @@ if ! have_commit "${base}"; then
     echo "Cannot read base ${base}: running the check." >&2
     answer true
 fi
+decided_base="$(git rev-parse --verify "${base}^{commit}")"
 
 # Both sides of a rename (--no-renames), so moving an input out of a scope
 # still counts as changing it, and raw NUL-separated names (-z), which git

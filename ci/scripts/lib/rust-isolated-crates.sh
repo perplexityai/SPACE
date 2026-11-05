@@ -154,6 +154,158 @@ print(
 PY
 }
 
+# The crates of LISTED (one per line) that the change since BASE can affect,
+# one per line: those whose own directory changed, those that include a
+# changed file from another crate's directory (include_str!, include_bytes!),
+# and every workspace crate that depends on one of them, through any kind of
+# dependency. Prints every listed crate when the change touches a path outside
+# all crates that such a lint may read (Cargo.lock, the root manifest, the
+# toolchain, proto/, db/, templates/, ...), since Cargo, a build script or an
+# include can read it; ci/check-scopes/rust.skip and UNREAD_BY_LINT below name
+# the paths none reads. Main CI passes no base and lints all.
+affected_lint_crates() {
+    local metadata="$1" base="$2" listed="$3"
+    python3 - "${metadata}" "${base}" "${listed}" <<'PY'
+import fnmatch
+import json
+import os
+import re
+import subprocess
+import sys
+
+metadata, base, listed = sys.argv[1], sys.argv[2], sys.argv[3].split()
+with open(metadata) as metadata_file:
+    meta = json.load(metadata_file)
+root = meta["workspace_root"]
+packages = {p["name"]: p for p in meta["packages"]}
+directory = {
+    name: os.path.relpath(os.path.dirname(p["manifest_path"]), root)
+    for name, p in packages.items()
+}
+# Innermost first, so a crate nested in another's directory owns its files.
+by_depth = sorted(directory.items(), key=lambda item: -len(item[1]))
+
+
+def owner(path):
+    for name, crate_dir in by_depth:
+        if path == crate_dir or path.startswith(crate_dir + "/"):
+            return name
+    return None
+
+
+def unread_by_rust(path):
+    """Whether ci/check-scopes/rust.skip says no Rust check reads PATH, with
+    check-needed.sh's rules: `*` crosses `/`, the last matching line wins."""
+    matched = False
+    with open(os.path.join(root, "ci/check-scopes/rust.skip")) as scope:
+        for line in scope:
+            pattern = line.split("#", 1)[0].strip()
+            if pattern.startswith("!"):
+                if fnmatch.fnmatchcase(path, pattern[1:]):
+                    matched = False
+            elif pattern and fnmatch.fnmatchcase(path, pattern):
+                matched = True
+    return matched
+
+
+# Outside every crate, paths that a Rust check may read but no crate's lint
+# alone does: archcheck's files, nextest's configuration, the workflows, and
+# CI scripts other than this lint's own (run-rust-checks.sh, this file and
+# the image it runs in, ci/Dockerfile.ci).
+UNREAD_BY_LINT = (
+    "architecture-baseline.toml",
+    "ARCHITECTURE.toml",
+    ".config/nextest.toml",
+    ".coderabbit.yaml",
+    ".gitleaks.toml",
+    "lefthook.yaml",
+    "Tiltfile",
+)
+LINT_INPUTS_IN_CI = (
+    "ci/Dockerfile.ci",
+    "ci/scripts/run-rust-checks.sh",
+    "ci/scripts/lib/rust-isolated-crates.sh",
+)
+
+
+def unread_by_lint(path):
+    if path in UNREAD_BY_LINT or path.startswith(".github/"):
+        return True
+    return path.startswith("ci/") and path not in LINT_INPUTS_IN_CI
+
+
+listing = subprocess.run(
+    ["git", "-c", f"safe.directory={root}", "diff", "--name-only", "--no-renames",
+     "-z", base, "HEAD"],
+    cwd=root, stdout=subprocess.PIPE, check=False,
+)
+if listing.returncode != 0:
+    print(f"Cannot list the change against {base}: linting every crate.", file=sys.stderr)
+    print("\n".join(listed))
+    sys.exit(0)
+changed = [path for path in listing.stdout.decode().split("\0") if path]
+outside = [
+    p for p in changed if owner(p) is None and not unread_by_rust(p) and not unread_by_lint(p)
+]
+if outside:
+    print(f"{outside[0]} is outside every crate: linting every crate.", file=sys.stderr)
+    print("\n".join(listed))
+    sys.exit(0)
+
+affected = {owner(p) for p in changed} - {None}
+# A crate that includes a changed file from another crate's directory.
+changed_set = set(changed)
+include = re.compile(r'include_(?:str|bytes)!\(\s*"([^"]+)"')
+for name, crate_dir in directory.items():
+    for dirpath, dirnames, filenames in os.walk(os.path.join(root, crate_dir)):
+        dirnames[:] = [d for d in dirnames if d != "target"]
+        for filename in filenames:
+            if not filename.endswith(".rs"):
+                continue
+            source = os.path.join(dirpath, filename)
+            with open(source, errors="ignore") as text:
+                for match in include.finditer(text.read()):
+                    target = os.path.relpath(
+                        os.path.normpath(os.path.join(dirpath, match.group(1))), root
+                    )
+                    if target in changed_set and owner(target) != name:
+                        affected.add(name)
+dependents = {}
+for name, package in packages.items():
+    for dependency in package["dependencies"]:
+        if dependency["name"] in packages:
+            dependents.setdefault(dependency["name"], set()).add(name)
+pending = list(affected)
+while pending:
+    for dependent in dependents.get(pending.pop(), set()) - affected:
+        affected.add(dependent)
+        pending.append(dependent)
+for name in listed:
+    if name in affected:
+        print(name)
+print(
+    f"The change affects {len(affected)} workspace crates; "
+    f"{sum(name in affected for name in listed)} of {len(listed)} listed crates need linting alone.",
+    file=sys.stderr,
+)
+PY
+}
+
+# Whether the change since SPACE_RUST_LINT_BASE can affect any of the crates
+# named after TARGET_DIR, per affected_lint_crates; always without a base, as
+# in Main CI. run_clippy_checks uses it for its per-crate configurations.
+lint_affects_any() {
+    local target_dir="$1"
+    shift
+    [ -n "${SPACE_RUST_LINT_BASE:-}" ] || return 0
+    mkdir -p "${target_dir}"
+    cargo metadata --locked --format-version 1 --no-deps >"${target_dir}/lint-metadata.json"
+    local affected
+    affected="$(affected_lint_crates "${target_dir}/lint-metadata.json" \
+        "${SPACE_RUST_LINT_BASE}" "$(printf '%s\n' "$@")")"
+    [ -n "${affected}" ]
+}
+
 # Lint each crate isolated_crates names on its own, with no features and with
 # all of them. One Cargo invocation per crate and configuration: a single one
 # would unify features across its packages again. `--all-targets` builds the
@@ -174,6 +326,17 @@ run_isolated_crate_checks() {
     if [ -z "${listed}" ]; then
         echo "::error::No workspace crate qualifies to be linted alone; the selection is broken." >&2
         return 1
+    fi
+    # Pull CI and the merge queue pass the base check-needed.sh decided
+    # against (ci/check-scopes/README.md); Main CI passes none.
+    if [ -n "${SPACE_RUST_LINT_BASE:-}" ]; then
+        listed="$(affected_lint_crates "${target_dir}/metadata.json" \
+            "${SPACE_RUST_LINT_BASE}" "${listed}")"
+        if [ -z "${listed}" ]; then
+            echo "The change affects no crate linted alone."
+            return 0
+        fi
+        mapfile -t crates <<<"${listed}"
     fi
     echo "Linting ${#crates[@]} crates alone: ${crates[*]}"
 

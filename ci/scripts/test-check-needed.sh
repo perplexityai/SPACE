@@ -31,7 +31,7 @@ assert_needed() {
     shift 2
     change "$@"
     local actual
-    actual="$(cd "${fixture}" && env -u GITHUB_ACTIONS bash "${selector}" "${scope}" "${base}" 2>"${tmp_dir}/stderr")"
+    actual="$(cd "${fixture}" && env -u GITHUB_ACTIONS bash "${selector}" "${scope}" "${base}" 2>"${tmp_dir}/stderr" | head -n1)"
     if [[ "${actual}" != "needed=${expected}" ]]; then
         echo "${scope} for $*: expected needed=${expected}, got ${actual}" >&2
         cat "${tmp_dir}/stderr" >&2
@@ -85,7 +85,7 @@ with_shim="$(git -C "${fixture}" rev-parse HEAD)"
 mkdir -p "${fixture}/docs"
 git -C "${fixture}" mv shim/identity.go docs/identity.go
 git -C "${fixture}" commit -q -m "move it to docs"
-renamed="$(cd "${fixture}" && env -u GITHUB_ACTIONS bash "${selector}" go "${with_shim}" 2>/dev/null)"
+renamed="$(cd "${fixture}" && env -u GITHUB_ACTIONS bash "${selector}" go "${with_shim}" 2>/dev/null | head -n1)"
 [[ "${renamed}" == needed=true ]] || { echo "rename out of shim/: got ${renamed}" >&2; exit 1; }
 
 # A name git would quote, or one with a space, still matches its scope.
@@ -110,12 +110,12 @@ git -C "${fixture}" commit -q -m rust
 printf 'change\n' >"${fixture}/ui/page.tsx"
 git -C "${fixture}" add ui/page.tsx
 git -C "${fixture}" commit -q -m console
-two="$(cd "${fixture}" && env -u GITHUB_ACTIONS bash "${selector}" rust "${base}" 2>/dev/null)"
+two="$(cd "${fixture}" && env -u GITHUB_ACTIONS bash "${selector}" rust "${base}" 2>/dev/null | head -n1)"
 [[ "${two}" == needed=true ]] || { echo "two commits: got ${two}" >&2; exit 1; }
 
 # No change at all runs the check.
 git -C "${fixture}" checkout -q --detach "${base}"
-empty="$(cd "${fixture}" && bash "${selector}" rust "${base}" 2>/dev/null)"
+empty="$(cd "${fixture}" && bash "${selector}" rust "${base}" 2>/dev/null | head -n1)"
 [[ "${empty}" == needed=true ]] || { echo "empty change: got ${empty}" >&2; exit 1; }
 
 # A pull request decides against its synthetic merge's first parent, not the
@@ -133,22 +133,28 @@ printf 'main\n' >"${fixture}/crates/y/lib.rs"
 git -C "${fixture}" add crates/y/lib.rs
 git -C "${fixture}" commit -q -m main-moved
 git -C "${fixture}" merge -q --no-ff --no-edit "${pr_head}" >/dev/null
-merge_base="$(cd "${fixture}" && env -u GITHUB_ACTIONS bash "${selector}" rust "${base}" "${pr_head}" 2>/dev/null)"
+merge_base="$(cd "${fixture}" && env -u GITHUB_ACTIONS bash "${selector}" rust "${base}" "${pr_head}" 2>/dev/null | head -n1)"
 [[ "${merge_base}" == needed=false ]] || { echo "synthetic merge: got ${merge_base}" >&2; exit 1; }
-event_base="$(cd "${fixture}" && env -u GITHUB_ACTIONS bash "${selector}" rust "${base}" 2>/dev/null)"
+event_base="$(cd "${fixture}" && env -u GITHUB_ACTIONS bash "${selector}" rust "${base}" 2>/dev/null | head -n1)"
 [[ "${event_base}" == needed=true ]] || { echo "event base: got ${event_base}" >&2; exit 1; }
 # A merge of some other head runs the check.
-wrong="$(cd "${fixture}" && bash "${selector}" rust "${base}" "${base}" 2>/dev/null)"
+wrong="$(cd "${fixture}" && bash "${selector}" rust "${base}" "${base}" 2>/dev/null | head -n1)"
 [[ "${wrong}" == needed=true ]] || { echo "wrong PR head: got ${wrong}" >&2; exit 1; }
+
+# With a base, the answer names the commit it compared with; a pull request's
+# is its synthetic merge's first parent.
+change crates/l40_api/api/src/lib.rs
+named="$(cd "${fixture}" && bash "${selector}" rust "${base}" 2>/dev/null | sed -n 2p)"
+[[ "${named}" == "base=${base}" ]] || { echo "base line: got ${named}" >&2; exit 1; }
 
 # Always means always, and so does no base.
 assert_needed true always ui/src/app/page.tsx
 change ui/src/app/page.tsx
-no_base="$(cd "${fixture}" && bash "${selector}" rust "" 2>/dev/null)"
+no_base="$(cd "${fixture}" && bash "${selector}" rust "" 2>/dev/null | head -n1)"
 [[ "${no_base}" == needed=true ]] || { echo "no base: got ${no_base}" >&2; exit 1; }
 
 # An unreadable base runs the check instead of failing it.
-missing="$(cd "${fixture}" && bash "${selector}" rust 0000000000000000000000000000000000000000 2>/dev/null)"
+missing="$(cd "${fixture}" && bash "${selector}" rust 0000000000000000000000000000000000000000 2>/dev/null | head -n1)"
 [[ "${missing}" == needed=true ]] || { echo "missing base: got ${missing}" >&2; exit 1; }
 
 # An unknown scope, a scope without patterns and a missing run-all.txt are
