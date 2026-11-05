@@ -54,6 +54,7 @@ import {
 } from '@/lib/system-template-rebuild';
 import { releaseViewRefreshLock, tryAcquireViewRefreshLock } from '@/lib/view-refresh';
 import { exclusiveWith, type BrowserLocks } from '@/lib/exclusive';
+import { templateHref } from './links';
 
 const { Text, Paragraph } = Typography;
 const TEMPLATES: SystemTemplate[] = ['seed', 'code-runtime'];
@@ -70,6 +71,16 @@ const exclusive = <T,>(name: string, work: () => T): Promise<T> => exclusiveWith
 
 const digest = (hash: string | null | undefined) => <code>{shortHash(hash, 'none')}</code>;
 
+// Where a build's outcome shows: the template's releases and its builds.
+function ReleasesAndBuilds({ template }: { template: SystemTemplate }) {
+  return (
+    <>
+      the <Link href={templateHref(template, 'releases')}>{template} releases</Link> and{' '}
+      <Link href={templateHref(template, 'builds')}>{template} builds</Link>
+    </>
+  );
+}
+
 // A build attempt "Start a new build" replaced, which may still publish a
 // release of its own. Later answers of its key are listed, never read as its
 // outcome.
@@ -77,9 +88,8 @@ function RetiredAttempt({ template, attempt }: { template: SystemTemplate; attem
   return (
     <Text type="warning">
       Earlier attempt {attempt.generation + 1}{attempt.jobId ? <>, job <Text code copyable>{attempt.jobId}</Text>,</> : null} has an
-      unknown outcome: it may still be running and publish a release of its own; see{' '}
-      <a href="#template-releases">Template Releases</a> below, and the {template} row&apos;s builds in the Templates table
-      above.{attempt.notes.length ? ` Since then, ${attempt.notes.join('; ')}.` : ''}
+      unknown outcome: it may still be running and publish a release of its own; see <ReleasesAndBuilds template={template} />.
+      {attempt.notes.length ? ` Since then, ${attempt.notes.join('; ')}.` : ''}
     </Text>
   );
 }
@@ -114,7 +124,7 @@ interface Props {
   // The releases have been read at least once (until then, a promotion's
   // state is not known).
   releasesLoaded: boolean;
-  // The Template Releases title, which this component's header row carries.
+  // The title this component's header row carries.
   title: ReactNode;
 }
 
@@ -615,8 +625,7 @@ export default function SystemTemplateRebuild({ refreshReleases, releases, relea
           {closed ? (
             <Text type="secondary">
               {closed.jobId ? <>Job <Text code copyable>{closed.jobId}</Text>: </> : null}
-              see <a href="#template-releases">Template Releases</a> below, and the {template} row&apos;s builds in the
-              Templates table above.
+              see <ReleasesAndBuilds template={template} />.
             </Text>
           ) : null}
           {retiredBuilds(run, template).map((attempt) => <RetiredAttempt key={attempt.generation} template={template} attempt={attempt} />)}
@@ -840,7 +849,7 @@ function RollbackTargets({ promotion, expiresAt }: { promotion: Promotion; expir
       })}
       <Text type="secondary">
         Record these digests now. This browser keeps them only until {formatTime(expiresAt)}, and no other browser has
-        them. To roll back, assign latest to them with the tag button in Template Releases.
+        them. To roll back, assign latest to them with the tag button in each template's releases.
       </Text>
     </Space>
   );

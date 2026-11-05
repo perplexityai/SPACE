@@ -117,7 +117,7 @@ test('a refused build is known not to have started; a 5xx or a network error is 
     assert.equal(unknown.known, false);
     assert.doesNotMatch(unknown.text, /was not started/);
     assert.match(unknown.text, /may have accepted it/);
-    assert.match(unknown.text, /appears in Template Releases only when it finishes/);
+    assert.match(unknown.text, /appears in the template's releases only when it finishes/);
     assert.match(unknown.text, /starts a second job/);
     const sandbox = testSandboxFailureText('rebuild-check-seed-x', err);
     assert.equal(sandbox.known, false);

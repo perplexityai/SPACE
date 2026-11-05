@@ -25,8 +25,9 @@ A warm pool is for one **template release** and one VM size (vCPU and memory).
 ### In the UI
 
 1. Open the SPACE UI (`http://127.0.0.1:3000` on Kind) and sign in.
-2. Go to **Templates** and find the release in **Template Releases**.
-3. Choose **Create Pool**.
+2. Go to **Templates**, open the template, and choose its **Releases** tab.
+   (The **All releases** tab of **Templates** lists every template's releases.)
+3. Choose **Create Pool** on the release.
 4. Set **vCPU** and **Memory (MiB)** to the size your sandboxes use, and set
    **Target Ready Slots** to how many sandboxes to keep ready. Save.
 
@@ -147,7 +148,8 @@ builds, newest first, with each one's state, `content_hash` on success and
 `error` on failure. A build its builder can no longer report lists with
 `state: null` and a `status_error`.
 
-The **Template Releases** table in the UI lists every release with its tags.
+In the UI, a template's **Releases** tab lists its releases with their tags,
+and its **Builds** tab its recent builds.
 Existing sandboxes and existing warm pools stay on their release when `latest`
 moves.
 
@@ -157,7 +159,8 @@ If you publish new releases often, use a rolling policy instead of creating a
 pool for each release. The policy keeps the newest releases of a template
 warm and drains pools for releases that are no longer used.
 
-Create one in the UI under **Templates** → **Rolling Warm Pool Policies**, or
+Create one in the UI under **Templates** → **Warm pool policies**, or from the
+template's **Warm pool** tab, or
 with the Admin API:
 
 ```bash
