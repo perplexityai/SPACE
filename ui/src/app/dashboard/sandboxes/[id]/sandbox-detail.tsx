@@ -19,6 +19,9 @@ import {
   theme,
 } from 'antd';
 import type { ColumnsType } from 'antd/es/table';
+import type { Terminal as XtermTerminal } from '@xterm/xterm';
+import type { FitAddon } from '@xterm/addon-fit';
+import '@xterm/xterm/css/xterm.css';
 import {
   ArrowLeftOutlined,
   CameraOutlined,
@@ -35,7 +38,6 @@ import {
   RightOutlined,
   RollbackOutlined,
   SaveOutlined,
-  SendOutlined,
   StopOutlined,
   ThunderboltOutlined,
 } from '@ant-design/icons';
@@ -46,6 +48,14 @@ import {
   type TerminalConnection,
   type TerminalSessionEvent,
 } from '@/lib/data-plane-terminal';
+import {
+  debounce,
+  TERMINAL_RESIZE_DEBOUNCE_MS,
+  terminalEventText,
+  terminalKeyAction,
+  terminalNotice,
+} from '@/lib/terminal-pane';
+import { terminalColors } from '@/lib/curiosity-theme';
 import { isHiddenOperationError } from '@/lib/hidden-operations';
 import {
   forceConsoleSandboxAction,
@@ -345,11 +355,14 @@ function CollapsibleCard({
   extra,
   children,
   defaultOpen = true,
+  keepMounted = false,
 }: {
   title: React.ReactNode;
   extra?: React.ReactNode;
   children: React.ReactNode;
   defaultOpen?: boolean;
+  // Hide the collapsed body instead of unmounting it.
+  keepMounted?: boolean;
 }) {
   const [open, setOpen] = useState(defaultOpen);
   return (
@@ -368,7 +381,7 @@ function CollapsibleCard({
       )}
       extra={extra}
     >
-      {open ? children : null}
+      {keepMounted ? <div hidden={!open}>{children}</div> : (open ? children : null)}
     </Card>
   );
 }
@@ -855,111 +868,172 @@ function ExecCard({ sandbox }: { sandbox: Sandbox }) {
 
 type TerminalStatus = 'disconnected' | 'connecting' | 'attached' | 'closed' | 'error';
 
-type TerminalLine = {
-  id: number;
-  stream: 'stdout' | 'stderr' | 'system';
-  text: string;
+type TerminalView = {
+  term: XtermTerminal;
+  fit: FitAddon;
 };
+
+// Fits the terminal to its pane. A collapsed card's pane has no size, so the
+// terminal keeps its last one.
+function fitTerminal(view: TerminalView) {
+  const proposed = view.fit.proposeDimensions();
+  if (!proposed || !Number.isFinite(proposed.cols) || !Number.isFinite(proposed.rows)) return;
+  if (proposed.cols < 2 || proposed.rows < 1) return;
+  if (proposed.cols === view.term.cols && proposed.rows === view.term.rows) return;
+  view.term.resize(proposed.cols, proposed.rows);
+}
 
 function TerminalCard({ sandbox, ownOrg }: { sandbox: Sandbox; ownOrg: boolean }) {
   const { token } = theme.useToken();
   const [status, setStatus] = useState<TerminalStatus>('disconnected');
-  const [input, setInput] = useState('');
-  const [lines, setLines] = useState<TerminalLine[]>([]);
   const [sessionId, setSessionId] = useState<string | null>(null);
+  const [view, setView] = useState<TerminalView | null>(null);
   const connectionRef = useRef<TerminalConnection | null>(null);
-  const lineIdRef = useRef(0);
-  const outputRef = useRef<HTMLPreElement | null>(null);
+  // The data plane takes input and resizes once the shell has started.
+  const startedRef = useRef(false);
+  // Each Connect starts a generation; a superseded session's late events and
+  // connection are dropped.
+  const generationRef = useRef(0);
+  const paneRef = useRef<HTMLDivElement | null>(null);
   const enabled = sandbox.status === 'started' || sandbox.status === 'running';
   const versionStatus = terminalVersionStatus(sandbox);
   const terminalEnabled = enabled && versionStatus.supported;
   const connecting = status === 'connecting';
-  const attached = status === 'attached';
-  const active = connecting || attached;
-
-  const appendLine = (stream: TerminalLine['stream'], text: string) => {
-    if (!text) return;
-    lineIdRef.current += 1;
-    const line = { id: lineIdRef.current, stream, text };
-    setLines((current) => [...current.slice(-400), line]);
-  };
-
-  const handleTerminalEvent = (event: TerminalSessionEvent) => {
-    switch (event.type) {
-      case 'status':
-        setStatus(event.status === 'closed' ? 'closed' : event.status);
-        if (event.message) appendLine('system', `\n[${event.message}]\n`);
-        break;
-      case 'started':
-        appendLine('system', `[process ${event.processId}${event.pid ? ` pid ${event.pid}` : ''}]\n`);
-        break;
-      case 'output':
-        appendLine(event.stream, event.text);
-        break;
-      case 'accepted':
-        break;
-      case 'exited':
-        appendLine('system', `\n[process exited: ${event.status} ${event.exitCode}]\n`);
-        setStatus('closed');
-        connectionRef.current = null;
-        break;
-      case 'reconnecting':
-        appendLine('system', `\n[${event.message}]\n`);
-        break;
-      case 'error':
-        appendLine('system', `\n[error: ${event.message}]\n`);
-        setStatus('error');
-        break;
-    }
-  };
+  const active = connecting || status === 'attached';
 
   useEffect(() => {
-    outputRef.current?.scrollTo({ top: outputRef.current.scrollHeight });
-  }, [lines]);
+    const pane = paneRef.current;
+    if (!pane) return;
+    let disposed = false;
+    let cleanup = () => {};
+    void (async () => {
+      // xterm touches the DOM as it loads, so it is imported in the browser only.
+      const [{ Terminal }, { FitAddon }, { WebLinksAddon }] = await Promise.all([
+        import('@xterm/xterm'),
+        import('@xterm/addon-fit'),
+        import('@xterm/addon-web-links'),
+      ]);
+      if (disposed) return;
+      const term = new Terminal({
+        cursorBlink: true,
+        fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace',
+        fontSize: 13,
+        scrollback: 5000,
+        theme: terminalColors,
+      });
+      const fit = new FitAddon();
+      term.loadAddon(fit);
+      term.loadAddon(new WebLinksAddon());
+      term.attachCustomKeyEventHandler(
+        (event) => terminalKeyAction(event, term.hasSelection()) === 'terminal',
+      );
+      term.open(pane);
+      const next = { term, fit };
+      fitTerminal(next);
+      term.write('\x1b[2mConnect to open an interactive shell.\x1b[22m\r\n');
+      const input = term.onData((data) => {
+        if (startedRef.current) connectionRef.current?.sendInput(data);
+      });
+      const resized = term.onResize(({ cols, rows }) => {
+        if (startedRef.current) connectionRef.current?.resize(cols, rows);
+      });
+      const refit = debounce(() => fitTerminal(next), TERMINAL_RESIZE_DEBOUNCE_MS);
+      const observer = new ResizeObserver(() => refit.schedule());
+      observer.observe(pane);
+      cleanup = () => {
+        observer.disconnect();
+        refit.cancel();
+        input.dispose();
+        resized.dispose();
+        term.dispose();
+      };
+      setView(next);
+    })();
+    return () => {
+      disposed = true;
+      generationRef.current += 1;
+      startedRef.current = false;
+      connectionRef.current?.close();
+      connectionRef.current = null;
+      cleanup();
+    };
+  }, []);
 
   useEffect(() => {
     if (!terminalEnabled && connectionRef.current) {
+      generationRef.current += 1;
+      startedRef.current = false;
       connectionRef.current.close();
       connectionRef.current = null;
       setStatus('closed');
     }
   }, [terminalEnabled]);
 
-  useEffect(() => () => {
-    connectionRef.current?.close();
-    connectionRef.current = null;
-  }, []);
+  const handleTerminalEvent = (generation: number, event: TerminalSessionEvent) => {
+    if (generation !== generationRef.current || !view) return;
+    const text = terminalEventText(event);
+    if (text) view.term.write(text);
+    switch (event.type) {
+      case 'status':
+        if (event.status !== 'attached') startedRef.current = false;
+        setStatus(event.status);
+        if (event.status === 'attached') view.term.focus();
+        break;
+      case 'started':
+        startedRef.current = true;
+        // The pane may have changed size while the session opened.
+        fitTerminal(view);
+        connectionRef.current?.resize(view.term.cols, view.term.rows);
+        break;
+      case 'exited':
+        startedRef.current = false;
+        setStatus('closed');
+        connectionRef.current = null;
+        break;
+      case 'error':
+        setStatus('error');
+        break;
+    }
+  };
 
   const connect = async () => {
-    if (!terminalEnabled || active) return;
+    if (!terminalEnabled || active || !view) return;
+    const generation = ++generationRef.current;
+    startedRef.current = false;
+    // A session left open by a retryable error is replaced, not leaked.
+    connectionRef.current?.close();
+    connectionRef.current = null;
     setStatus('connecting');
-    setLines([]);
     setSessionId(null);
+    view.term.reset();
+    fitTerminal(view);
+    view.term.focus();
     try {
-      const connection = await openSandboxTerminal(sandbox.id, handleTerminalEvent, {
-        cols: 100,
-        rows: 30,
-        ownOrg,
-      });
+      const connection = await openSandboxTerminal(
+        sandbox.id,
+        (event) => handleTerminalEvent(generation, event),
+        { cols: view.term.cols, rows: view.term.rows, ownOrg },
+      );
+      if (generation !== generationRef.current) {
+        connection.close();
+        return;
+      }
       connectionRef.current = connection;
       setSessionId(connection.sessionId);
     } catch (err: any) {
+      if (generation !== generationRef.current) return;
       setStatus('error');
-      appendLine('system', `[error: ${err.message || 'failed to open terminal'}]\n`);
+      view.term.write(terminalNotice(`error: ${err.message || 'failed to open terminal'}`));
     }
   };
 
   const disconnect = () => {
+    generationRef.current += 1;
+    startedRef.current = false;
     connectionRef.current?.close();
     connectionRef.current = null;
     setStatus('closed');
-  };
-
-  const sendInput = () => {
-    const connection = connectionRef.current;
-    if (!connection || !input) return;
-    connection.sendInput(`${input}\n`);
-    setInput('');
+    view?.term.write(terminalNotice('disconnected'));
   };
 
   const shortSessionId = sessionId && sessionId.length > 24
@@ -973,6 +1047,8 @@ function TerminalCard({ sandbox, ownOrg }: { sandbox: Sandbox; ownOrg: boolean }
 
   return (
     <CollapsibleCard
+      // The emulator and its session survive a collapse.
+      keepMounted
       title={<Space><DesktopOutlined /> Terminal</Space>}
       extra={(
         <Space>
@@ -980,8 +1056,11 @@ function TerminalCard({ sandbox, ownOrg }: { sandbox: Sandbox; ownOrg: boolean }
           <Button
             size="small"
             icon={<ClearOutlined />}
-            onClick={() => setLines([])}
-            disabled={lines.length === 0}
+            onClick={() => {
+              view?.term.clear();
+              view?.term.focus();
+            }}
+            disabled={!view}
           >
             Clear
           </Button>
@@ -1000,7 +1079,7 @@ function TerminalCard({ sandbox, ownOrg }: { sandbox: Sandbox; ownOrg: boolean }
               type="primary"
               icon={<PlayCircleOutlined />}
               onClick={connect}
-              disabled={!terminalEnabled}
+              disabled={!terminalEnabled || !view}
             >
               Connect
             </Button>
@@ -1023,61 +1102,16 @@ function TerminalCard({ sandbox, ownOrg }: { sandbox: Sandbox; ownOrg: boolean }
               )}
             />
           ) : null}
-          <pre
-            ref={outputRef}
+          <div
             style={{
-              background: '#101418',
-              color: '#e6edf3',
-              border: '1px solid rgba(255,255,255,0.08)',
-              borderRadius: 4,
-              fontSize: 12,
-              lineHeight: 1.5,
-              minHeight: 260,
-              maxHeight: 420,
-              overflow: 'auto',
-              padding: 12,
-              whiteSpace: 'pre-wrap',
-              wordBreak: 'break-word',
+              background: terminalColors.background,
+              border: `1px solid ${token.colorBorder}`,
+              borderRadius: token.borderRadiusSM,
+              padding: 8,
             }}
           >
-            {lines.length === 0 ? 'Connect to open an interactive shell.\n' : lines.map((line) => (
-              <span
-                key={line.id}
-                style={{
-                  color: line.stream === 'stderr'
-                    ? '#ffb4a8'
-                    : line.stream === 'system'
-                      ? '#8ab4f8'
-                      : '#e6edf3',
-                }}
-              >
-                {line.text}
-              </span>
-            ))}
-          </pre>
-          <Space.Compact block>
-            <Space.Addon>$</Space.Addon>
-            <Input
-              value={input}
-              onChange={(event) => setInput(event.target.value)}
-              onPressEnter={(event) => {
-                event.preventDefault();
-                sendInput();
-              }}
-              disabled={!attached || !terminalEnabled}
-              placeholder="Type shell input and press Enter"
-              suffix={(
-                <Button
-                  type="text"
-                  size="small"
-                  icon={<SendOutlined />}
-                  disabled={!attached || !terminalEnabled || !input}
-                  onClick={sendInput}
-                  aria-label="Send terminal input"
-                />
-              )}
-            />
-          </Space.Compact>
+            <div ref={paneRef} style={{ height: 420 }} />
+          </div>
         </Space>
         {!versionStatus.supported ? (
           <div

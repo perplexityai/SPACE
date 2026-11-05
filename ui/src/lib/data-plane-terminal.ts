@@ -53,6 +53,14 @@ type TerminalOptions = {
   ownOrg: boolean;
 };
 
+// The data plane's default command is `/bin/sh`, which on many images is a
+// shell without line editing: no history and no Tab completion. Like a
+// terminal login, run the user's login shell, or `/bin/sh` without one.
+const TERMINAL_COMMAND = ['/bin/sh', '-c', 'if [ -x "$SHELL" ]; then exec "$SHELL" -l; fi; exec /bin/sh -l'];
+// The console's emulator, xterm.js, implements xterm-256color. Full-screen
+// programs (top, vi, less) need TERM to draw.
+const TERMINAL_ENV = { TERM: 'xterm-256color' };
+
 export const TERMINAL_OTHER_ORG_UNSUPPORTED =
   "This API release opens terminals only in your organization's sandboxes; another organization's needs a newer API release.";
 
@@ -97,9 +105,9 @@ export async function openSandboxTerminal(
   options: TerminalOptions,
 ): Promise<TerminalConnection> {
   const body = {
-    command: [],
+    command: TERMINAL_COMMAND,
     cwd: null,
-    env: {},
+    env: TERMINAL_ENV,
     size: { cols: options.cols, rows: options.rows },
   };
   const headers = { 'Idempotency-Key': idempotencyKey() };
