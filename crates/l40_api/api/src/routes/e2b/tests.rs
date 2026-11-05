@@ -15,6 +15,7 @@ use k8s_openapi::api::core::v1::{Pod, PodIP, PodStatus};
 use pplx_space_common_core::sql;
 use pplx_space_db_test_fixtures::{SEED_ORG_ID, SEED_USER_ID, TestDb, pg_test_db};
 use pplx_space_node_api_sim::{SimWorkerHarness, state::status};
+use pplx_space_placement::StoredSandboxLifecycle;
 use rstest::{fixture, rstest};
 use serde::Deserialize;
 use serde_json::json;
@@ -48,9 +49,10 @@ use super::{
     file_upload_capability_org, file_upload_signing_secret, mint_file_upload_query,
     parse_metadata_query, parse_state_filter, path_root_router_with_ecw_hosts, request_client_id,
     sandbox_metadata, sandbox_template_id, should_ensure_usable_pod_on_connect,
-    should_touch_on_connect, should_wake_on_connect, terminal_sandbox_error,
-    translate_create_request, translate_sandbox_state, validate_connect_request,
-    validate_list_query, validate_pause_request, validate_refresh_request, validate_resume_request,
+    should_touch_on_connect, should_wake_on_connect, teardown_lifecycle_connect_error,
+    terminal_sandbox_error, translate_create_request, translate_sandbox_state,
+    validate_connect_request, validate_list_query, validate_pause_request,
+    validate_refresh_request, validate_resume_request,
 };
 use crate::{
     controllers::sandbox::AutoLifecycleTouchOutcome,
@@ -3267,6 +3269,25 @@ fn connect_touch_recovery_does_not_wake_teardown_state() {
     }
 }
 
+/// Connect re-reads the row before a retried touch: both delete tombstones
+/// are gone there too, while a teardown still in flight is not ready yet.
+#[test]
+fn connect_teardown_check_answers_tombstones_not_found() {
+    for (lifecycle, expected) in [
+        ("deleted", StatusCode::NOT_FOUND),
+        ("cleanup_required", StatusCode::NOT_FOUND),
+        ("stopping", StatusCode::CONFLICT),
+        ("deleting", StatusCode::CONFLICT),
+    ] {
+        let mut sandbox = test_sandbox();
+        sandbox.lifecycle = lifecycle.to_string();
+
+        let error = teardown_lifecycle_connect_error(&sandbox)
+            .unwrap_or_else(|| panic!("{lifecycle} must refuse connect"));
+        assert_eq!(error.status, expected, "{lifecycle}");
+    }
+}
+
 #[test]
 fn not_started_connect_touch_can_wake_refetched_paused_state() {
     let mut sandbox = test_sandbox();
@@ -3969,7 +3990,7 @@ async fn connect_route_extends_deadline_without_replacing_policy(
     "cleanup_required",
     "unplaced",
     ConnectRouteActiveNode::None,
-    StatusCode::CONFLICT,
+    StatusCode::NOT_FOUND,
 ))]
 #[case::deleted_teardown_row(ConnectRouteDbShape::error(
     "deleted teardown row",
@@ -5473,6 +5494,242 @@ async fn connect_renews_the_persisted_federated_grant() -> TestResult {
     assert_eq!(expiry, fresher_expiry);
 
     Ok(())
+}
+
+/// Refresh and connect renew the federated grant only once their lifecycle
+/// checks pass, on every stored lifecycle. A row refused by either check
+/// answers its status and gets no grant, even when its stored grant has
+/// expired and the offer is older, which on a renewing refresh is the store's
+/// retryable stale-renewal 503. The terminal check refuses `stopped`, `failed`,
+/// `quarantined` and the tombstones on both routes, and connect's teardown
+/// check refuses `stopping` and `deleting`. Refresh has no teardown check, so
+/// it still renews `stopping` and `deleting`; every other row (`paused` and
+/// `suspended` read as Paused) renews on both routes.
+#[tokio::test(flavor = "current_thread")]
+async fn grant_renewal_follows_the_lifecycle_checks() -> TestResult {
+    let db = pg_test_db().await?;
+    let fixture = federated_connect_fixture(&db).await?;
+    let now_unix = time::OffsetDateTime::now_utc().unix_timestamp();
+    for &stored in StoredSandboxLifecycle::all() {
+        let lifecycle = stored.as_str();
+        for route in ["connect", "refreshes"] {
+            let label = format!("{route} on a {lifecycle} sandbox");
+            let expected = grant_offer_outcome(stored, route);
+            let refused_status = match expected {
+                GrantOfferOutcome::Refused(status) => Some(status),
+                GrantOfferOutcome::Renewed { .. } => None,
+            };
+
+            // No stored grant and a fresh offer: renewal stores it. A connect's
+            // wake or touch may rewrite the row, so each request sets it.
+            sqlx::query(sql!(
+                "DELETE FROM sandbox_federated_service_grants WHERE sandbox_id = $1"
+            ))
+            .bind(fixture.sandbox_id)
+            .execute(&db.pool)
+            .await?;
+            set_sandbox_lifecycle(&db.pool, fixture.sandbox_id, lifecycle).await?;
+            let response =
+                offer_federated_grant(&fixture, route, b"offered-grant", now_unix, None).await?;
+            if let Some(status) = refused_status {
+                assert_eq!(response.status(), status, "{label}");
+            }
+            assert_eq!(
+                stored_federated_grant_blob(&db.pool, fixture.sandbox_id).await?,
+                refused_status.is_none().then(|| b"offered-grant".to_vec()),
+                "{label}"
+            );
+
+            // An expired stored grant and an older offer.
+            store_expired_federated_grant(&db.pool, &fixture, now_unix).await?;
+            set_sandbox_lifecycle(&db.pool, fixture.sandbox_id, lifecycle).await?;
+            let response = offer_federated_grant(
+                &fixture,
+                route,
+                b"older-grant",
+                now_unix,
+                Some(now_unix - 2 * 3600),
+            )
+            .await?;
+            let stale_status = match expected {
+                GrantOfferOutcome::Refused(status) => Some(status),
+                GrantOfferOutcome::Renewed { stale_status } => stale_status,
+            };
+            if let Some(status) = stale_status {
+                assert_eq!(response.status(), status, "{label}, stale renewal");
+            }
+            assert_eq!(
+                stored_federated_grant_blob(&db.pool, fixture.sandbox_id).await?,
+                Some(b"stored-grant".to_vec()),
+                "{label}, stale renewal"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// What an ECW route does with a federated grant offered on a row.
+#[derive(Clone, Copy)]
+enum GrantOfferOutcome {
+    /// A lifecycle check answers this status before any grant is stored.
+    Refused(StatusCode),
+    /// The route stores a fresh offer. An older offer over an expired stored
+    /// grant answers `stale_status` when it is set.
+    Renewed { stale_status: Option<StatusCode> },
+}
+
+/// The outcome of offering a grant to `route` on a `stored` row. Matches
+/// every lifecycle without a wildcard, so a new one fails to build here until
+/// it is classified.
+fn grant_offer_outcome(stored: StoredSandboxLifecycle, route: &str) -> GrantOfferOutcome {
+    let refresh = route == "refreshes";
+    let renewed = GrantOfferOutcome::Renewed {
+        stale_status: refresh.then_some(StatusCode::SERVICE_UNAVAILABLE),
+    };
+    let lifecycle = match stored {
+        StoredSandboxLifecycle::Live(lifecycle) => lifecycle,
+        StoredSandboxLifecycle::Deleted | StoredSandboxLifecycle::CleanupRequired => {
+            return GrantOfferOutcome::Refused(StatusCode::NOT_FOUND);
+        }
+    };
+    match lifecycle {
+        SandboxLifecycle::Failed | SandboxLifecycle::Quarantined => {
+            GrantOfferOutcome::Refused(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+        SandboxLifecycle::Stopped => GrantOfferOutcome::Refused(StatusCode::NOT_FOUND),
+        // Connect's teardown check refuses these; refresh has none.
+        SandboxLifecycle::Stopping | SandboxLifecycle::Deleting => {
+            if refresh {
+                renewed
+            } else {
+                GrantOfferOutcome::Refused(StatusCode::CONFLICT)
+            }
+        }
+        SandboxLifecycle::Created
+        | SandboxLifecycle::Creating
+        | SandboxLifecycle::Starting
+        | SandboxLifecycle::Started
+        | SandboxLifecycle::Restoring
+        | SandboxLifecycle::Pausing
+        | SandboxLifecycle::Paused
+        | SandboxLifecycle::Resuming
+        | SandboxLifecycle::Suspending
+        | SandboxLifecycle::Suspended
+        | SandboxLifecycle::Checkpointing => renewed,
+    }
+}
+
+/// Posts to the sandbox's ECW `route` offering `grant`, which expires a week
+/// after `now_unix`.
+async fn offer_federated_grant(
+    fixture: &FederatedConnectFixture,
+    route: &str,
+    grant: &[u8],
+    now_unix: i64,
+    issued_at_unix: Option<i64>,
+) -> TestResult<Response> {
+    use crate::federated_identity::{
+        FEDERATED_SERVICE_GRANT_EXPIRES_AT_HEADER, FEDERATED_SERVICE_GRANT_HEADER,
+        FEDERATED_SERVICE_GRANT_ISSUED_AT_HEADER,
+    };
+
+    let mut request = Request::builder()
+        .method("POST")
+        .uri(format!("/sandboxes/{}/{route}", fixture.sandbox_id))
+        .header(header::HOST, TEST_ECW_API_HOST)
+        .header(FEDERATED_SERVICE_GRANT_HEADER, grant)
+        .header(
+            FEDERATED_SERVICE_GRANT_EXPIRES_AT_HEADER,
+            (now_unix + 7 * 24 * 3600).to_string(),
+        );
+    if let Some(issued_at_unix) = issued_at_unix {
+        request = request.header(
+            FEDERATED_SERVICE_GRANT_ISSUED_AT_HEADER,
+            issued_at_unix.to_string(),
+        );
+    }
+    Ok(fixture
+        .app
+        .clone()
+        .oneshot(request.body(Body::empty())?)
+        .await?)
+}
+
+/// Replaces the sandbox's grant with `stored-grant`, issued an hour before
+/// `now_unix` and since expired.
+async fn store_expired_federated_grant(
+    pool: &sqlx::PgPool,
+    fixture: &FederatedConnectFixture,
+    now_unix: i64,
+) -> TestResult {
+    use crate::federated_identity::{
+        DEFAULT_FEDERATED_GRANT_AUDIENCE, FEDERATED_OWNER_GRANT_PURPOSE, FederatedServiceGrant,
+        upsert_sandbox_federated_service_grant,
+    };
+
+    sqlx::query(sql!(
+        "DELETE FROM sandbox_federated_service_grants WHERE sandbox_id = $1"
+    ))
+    .bind(fixture.sandbox_id)
+    .execute(pool)
+    .await?;
+    upsert_sandbox_federated_service_grant(
+        pool,
+        fixture.sandbox_id,
+        &fixture.owner,
+        &FederatedServiceGrant::from_unix_expiry(b"stored-grant".to_vec(), now_unix + 24 * 3600)?
+            .with_issued_at_unix(now_unix - 3600)?,
+        DEFAULT_FEDERATED_GRANT_AUDIENCE,
+        FEDERATED_OWNER_GRANT_PURPOSE,
+    )
+    .await?;
+    // Age the stored grant into expiry. The BEFORE UPDATE trigger would stamp
+    // updated_at past the new expiry and trip the row's CHECK.
+    sqlx::query(sql!(
+        "ALTER TABLE sandbox_federated_service_grants DISABLE TRIGGER USER"
+    ))
+    .execute(pool)
+    .await?;
+    sqlx::query(sql!(
+        "UPDATE sandbox_federated_service_grants
+         SET grant_expires_at = NOW() - INTERVAL '1 minute',
+             updated_at = NOW() - INTERVAL '2 hours'
+         WHERE sandbox_id = $1"
+    ))
+    .bind(fixture.sandbox_id)
+    .execute(pool)
+    .await?;
+    sqlx::query(sql!(
+        "ALTER TABLE sandbox_federated_service_grants ENABLE TRIGGER USER"
+    ))
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+async fn set_sandbox_lifecycle(
+    pool: &sqlx::PgPool,
+    sandbox_id: SandboxId,
+    lifecycle: &str,
+) -> TestResult {
+    sqlx::query(sql!("UPDATE sandboxes SET lifecycle = $2 WHERE id = $1"))
+        .bind(sandbox_id)
+        .bind(lifecycle)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+async fn stored_federated_grant_blob(
+    pool: &sqlx::PgPool,
+    sandbox_id: SandboxId,
+) -> TestResult<Option<Vec<u8>>> {
+    Ok(sqlx::query_scalar(sql!(
+        "SELECT grant_blob FROM sandbox_federated_service_grants WHERE sandbox_id = $1"
+    ))
+    .bind(sandbox_id)
+    .fetch_optional(pool)
+    .await?)
 }
 
 struct FederatedConnectFixture {

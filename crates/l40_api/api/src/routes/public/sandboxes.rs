@@ -1276,7 +1276,7 @@ const PUBLIC_SANDBOX_JOINS: &str = "LEFT JOIN sandbox_direct_route_identities di
 const PAGE_CANDIDATE_ROWS: &str = "SELECT s.id, s.created_at
     FROM sandboxes s
     WHERE s.org_id = $8
-      AND s.lifecycle <> 'deleted'
+      AND s.lifecycle NOT IN ('deleted', 'cleanup_required')
       AND (($12::UUID IS NOT NULL AND s.user_id = $12)
         OR ($12::UUID IS NULL AND EXISTS (
             SELECT 1 FROM users owner WHERE owner.id = s.user_id
@@ -1304,13 +1304,16 @@ enum PublicSandboxQuery {
 
 fn public_sandbox_query(query: PublicSandboxQuery) -> sqlx::AssertSqlSafe<String> {
     // Control-plane retention keeps deleted tombstones, but deleted public
-    // resources are NotFound and must not consume a list page's lookahead.
+    // resources are NotFound and must not consume a list page's lookahead. A
+    // `cleanup_required` tombstone, a delete whose cleanup is still owed,
+    // reads as deleted too.
     let sql = match query {
         PublicSandboxQuery::ById => format!(
             "{PUBLIC_SANDBOX_SELECT}, FALSE AS has_next
              FROM sandboxes s
              {PUBLIC_SANDBOX_JOINS}
-             WHERE s.id = $8 AND s.org_id = $9 AND s.lifecycle <> 'deleted'"
+             WHERE s.id = $8 AND s.org_id = $9
+               AND s.lifecycle NOT IN ('deleted', 'cleanup_required')"
         ),
         PublicSandboxQuery::Page => format!(
             "{page_rows}

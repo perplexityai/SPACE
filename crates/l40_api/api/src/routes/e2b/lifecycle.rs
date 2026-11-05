@@ -235,7 +235,8 @@ pub(super) fn federated_grant_required() -> bool {
 /// two paths cannot drift. Error policy stays at the call sites: refresh
 /// propagates (it is the enforced renewal path), connect warns and continues
 /// (its renewal is opportunistic). A stale renewal is skipped inside the
-/// store and reported as success to both.
+/// store and reported as success to both. Both call it only after their
+/// terminal check passes.
 pub(super) async fn persist_request_grant(
     state: &AppState,
     sandbox: &crate::models::Sandbox,
@@ -866,25 +867,6 @@ pub(super) async fn connect_sandbox_inner(
     )?;
     let scope = ecw_access_scope(&org, &federated);
     let sandbox = fetch_scoped_sandbox(&state, &scope, &sandbox_id).await?;
-    // Warn-and-continue, unlike refresh: renewal on connect is opportunistic
-    // (the headers are optional here during the ramp) and a transient store
-    // failure must not kill a reconnect that would otherwise succeed. Refresh
-    // remains the enforced renewal path and still propagates.
-    if let Err(error) = persist_request_grant(
-        &state,
-        &sandbox,
-        federated_owner,
-        federated_service_grant.as_ref(),
-    )
-    .await
-    {
-        tracing::warn!(
-            sandbox_id = %sandbox.id,
-            %error,
-            "failed to renew the federated service grant on connect; refresh remains the enforced path"
-        );
-    }
-
     // Informational only: log the connecting client so it shows in Datadog.
     // Never gates control-plane behavior. Metadata persistence is intentionally
     // deferred for now.
@@ -916,6 +898,26 @@ pub(super) async fn connect_sandbox_inner(
     }
     if let Some(err) = teardown_lifecycle_connect_error(&sandbox) {
         return Err(err);
+    }
+    // Renewed only once the lifecycle checks pass, so a renewal error cannot
+    // preempt their answer and a refused sandbox gets no newer grant.
+    // Warn-and-continue, unlike refresh: renewal on connect is opportunistic
+    // (the headers are optional here during the ramp) and a transient store
+    // failure must not kill a reconnect that would otherwise succeed. Refresh
+    // remains the enforced renewal path and still propagates.
+    if let Err(error) = persist_request_grant(
+        &state,
+        &sandbox,
+        federated_owner,
+        federated_service_grant.as_ref(),
+    )
+    .await
+    {
+        tracing::warn!(
+            sandbox_id = %sandbox.id,
+            %error,
+            "failed to renew the federated service grant on connect; refresh remains the enforced path"
+        );
     }
 
     let mut touched_by_wake = false;
@@ -1134,13 +1136,9 @@ fn legacy_connect_should_touch(
     requested_timeout_secs.is_some() || e2b_policy_for_refresh(current_policy).is_some()
 }
 
-fn teardown_lifecycle_connect_error(sandbox: &Sandbox) -> Option<E2bApiError> {
-    match sandbox
-        .lifecycle
-        .trim()
-        .to_ascii_lowercase()
-        .parse::<SandboxLifecycle>()
-    {
+pub(super) fn teardown_lifecycle_connect_error(sandbox: &Sandbox) -> Option<E2bApiError> {
+    let lifecycle = sandbox.lifecycle.trim().to_ascii_lowercase();
+    match lifecycle.parse::<SandboxLifecycle>() {
         Ok(SandboxLifecycle::Failed | SandboxLifecycle::Quarantined) => {
             Some(E2bApiError::failed_to_place_sandbox())
         }
@@ -1149,11 +1147,10 @@ fn teardown_lifecycle_connect_error(sandbox: &Sandbox) -> Option<E2bApiError> {
             Some(E2bApiError::sandbox_not_ready())
         }
         Ok(_) => None,
-        Err(_) => match sandbox.lifecycle.trim().to_ascii_lowercase().as_str() {
-            "deleted" => Some(E2bApiError::not_found("Sandbox")),
-            "cleanup_required" => Some(E2bApiError::sandbox_not_ready()),
-            _ => None,
-        },
+        Err(_) if crate::models::is_tombstone(&lifecycle) => {
+            Some(E2bApiError::not_found("Sandbox"))
+        }
+        Err(_) => None,
     }
 }
 
@@ -1398,14 +1395,6 @@ pub(super) async fn refresh_sandbox(
     let federated_service_grant = request_federated_service_grant(&headers, federated_owner)?;
     let scope = ecw_access_scope(&org, &federated);
     let sandbox = fetch_scoped_sandbox(&state, &scope, &sandbox_id).await?;
-    persist_request_grant(
-        &state,
-        &sandbox,
-        federated_owner,
-        federated_service_grant.as_ref(),
-    )
-    .await
-    .map_err(controller_error)?;
     let native = state
         .sandbox_controller
         .tracked_response(&state.pool, sandbox.clone())
@@ -1414,6 +1403,15 @@ pub(super) async fn refresh_sandbox(
     if translate_sandbox_state(&native).is_none() {
         return Err(terminal_sandbox_error(&native));
     }
+    // After the terminal check, so a renewal error cannot preempt its answer.
+    persist_request_grant(
+        &state,
+        &sandbox,
+        federated_owner,
+        federated_service_grant.as_ref(),
+    )
+    .await
+    .map_err(controller_error)?;
     let current_policy = native
         .auto_lifecycle
         .as_ref()

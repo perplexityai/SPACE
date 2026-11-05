@@ -313,20 +313,21 @@ async fn set_listed_row(
     Ok(())
 }
 
-/// Follows an ECW list from the first page to the last, as the route does:
-/// the cursor is the last row of a page that has more. Returns each page's
-/// sandbox IDs, and checks that a page of more than one row stays within the
-/// byte budget.
+/// Follows an ECW list of `limit`-row pages from the first page to the last,
+/// as the route does: the cursor is the last row of a page that has more.
+/// Returns each page's sandbox IDs, and checks that a page of more than one
+/// row stays within the byte budget.
 async fn walk_scoped_pages(
     fixture: &ScopeFixture,
     scope: &SandboxAccessScope,
+    limit: u32,
 ) -> TestResult<Vec<Vec<SandboxId>>> {
     let mut pages = Vec::new();
     let mut cursor = None;
     loop {
         let page = fixture
             .controller
-            .scoped_sandbox_page(&fixture.db.pool, scope, cursor, 1000, None)
+            .scoped_sandbox_page(&fixture.db.pool, scope, cursor, limit, None)
             .await?;
         let row_bytes = page
             .rows
@@ -392,18 +393,81 @@ async fn scoped_sandbox_page_bounds_the_bytes_it_returns() -> TestResult {
     }
 
     // The oversized row comes back alone; one-unit rows fit seven to a page.
-    let federated = walk_scoped_pages(&fixture, &federated_scope(UPSTREAM_SUBJECT_ID)).await?;
+    let federated =
+        walk_scoped_pages(&fixture, &federated_scope(UPSTREAM_SUBJECT_ID), 1000).await?;
     assert_eq!(
         federated.iter().map(Vec::len).collect::<Vec<_>>(),
         vec![1, 7, 8]
     );
     assert_eq!(federated.concat(), all);
     // The local rows are the oversized one, six one-unit rows and one small.
-    let local_pages = walk_scoped_pages(&fixture, &local_scope()).await?;
+    let local_pages = walk_scoped_pages(&fixture, &local_scope(), 1000).await?;
     assert_eq!(
         local_pages.iter().map(Vec::len).collect::<Vec<_>>(),
         vec![1, 7]
     );
     assert_eq!(local_pages.concat(), local);
+    Ok(())
+}
+
+/// ECW reads both delete tombstones as not found, so they take no place on a
+/// list page: with tombstones between the live rows, every page but the last
+/// is full of live rows, and following the cursor visits each live row once,
+/// in order. The federated walk crosses both arms of its statement.
+#[tokio::test]
+async fn scoped_sandbox_pages_leave_out_tombstones() -> TestResult {
+    let fixture = scope_fixture().await?;
+    let newest = time::OffsetDateTime::from_unix_timestamp(1_800_000_000)?;
+    // Newest first, alternating between a legacy local row and the federated
+    // subject's own row.
+    let lifecycles = [
+        "started",
+        "deleted",
+        "cleanup_required",
+        "suspended",
+        "started",
+        "deleted",
+        "deleted",
+        "cleanup_required",
+        "started",
+        "paused",
+        "cleanup_required",
+        "started",
+    ];
+    let mut live = Vec::new();
+    let mut local_live = Vec::new();
+    for (offset, lifecycle) in lifecycles.into_iter().enumerate() {
+        let local = offset % 2 == 0;
+        let sandbox_id = if local {
+            insert_local_sandbox(&fixture.db.pool).await?
+        } else {
+            insert_federated_sandbox(&fixture.db.pool, UPSTREAM_SUBJECT_ID).await?
+        };
+        sqlx::query(sql!(
+            "UPDATE sandboxes SET created_at = $2, lifecycle = $3 WHERE id = $1"
+        ))
+        .bind(sandbox_id)
+        .bind(newest - time::Duration::seconds(offset as i64))
+        .bind(lifecycle)
+        .execute(&fixture.db.pool)
+        .await?;
+        if !crate::models::is_tombstone(lifecycle) {
+            live.push(sandbox_id);
+            if local {
+                local_live.push(sandbox_id);
+            }
+        }
+    }
+
+    for (scope, expected) in [
+        (federated_scope(UPSTREAM_SUBJECT_ID), live),
+        (local_scope(), local_live),
+    ] {
+        let pages = walk_scoped_pages(&fixture, &scope, 2).await?;
+        let (last, full) = pages.split_last().expect("the walk reads a page");
+        assert!(full.iter().all(|page| page.len() == 2), "{pages:?}");
+        assert!(!last.is_empty() && last.len() <= 2, "{pages:?}");
+        assert_eq!(pages.concat(), expected, "{scope:?}");
+    }
     Ok(())
 }

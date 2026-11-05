@@ -923,9 +923,16 @@ async fn a_delete_never_sees_another_orgs_create_in_flight() -> TestDbResult<()>
 async fn sandbox_reads_exclude_deleted_tombstones_before_pagination() -> TestDbResult<()> {
     let db = pg_test_db().await?;
     let mut visible = Vec::new();
-    for (offset, lifecycle) in ["started", "failed", "quarantined", "deleted", "deleted"]
-        .into_iter()
-        .enumerate()
+    for (offset, lifecycle) in [
+        "started",
+        "failed",
+        "quarantined",
+        "deleted",
+        "deleted",
+        "cleanup_required",
+    ]
+    .into_iter()
+    .enumerate()
     {
         let id = SandboxId::new();
         let created_at = OffsetDateTime::from_unix_timestamp(1_800_000_000 + offset as i64)?;
@@ -957,7 +964,7 @@ async fn sandbox_reads_exclude_deleted_tombstones_before_pagination() -> TestDbR
             PublicSandboxId::from(id),
         )
         .await?;
-        if lifecycle == "deleted" {
+        if matches!(lifecycle, "deleted" | "cleanup_required") {
             // The GET handler maps this absence to NotFound, not a lifecycle
             // decode failure. The durable tombstone itself must remain intact.
             assert!(row.is_none());
@@ -1015,6 +1022,93 @@ async fn sandbox_reads_exclude_deleted_tombstones_before_pagination() -> TestDbR
         vec![visible[1].1, visible[2].1]
     );
     Ok(())
+}
+
+/// `cleanup_required` is a delete tombstone like `deleted`, so `GET
+/// /v1/sandboxes/{id}` answers it with the same status and body, and `GET
+/// /v1/sandboxes` lists neither.
+#[tokio::test]
+async fn reads_answer_a_cleanup_required_tombstone_as_deleted() -> TestDbResult<()> {
+    Box::pin(async {
+        const KEY: &str = "tombstone-read-test-key";
+        let db = pg_test_db().await?;
+        sqlx::query(pplx_space_common_core::sql!(
+            "INSERT INTO api_keys (id, org_id, name, key_hash, allowed_surfaces)
+             VALUES ($1, $2, 'tombstone-read-test', $3, ARRAY['native'])"
+        ))
+        .bind(Uuid::now_v7())
+        .bind(SEED_ORG_ID)
+        .bind(crate::auth::hash_token(KEY))
+        .execute(&db.pool)
+        .await?;
+        let state = AppState::from_pool(db.pool.clone()).await?;
+        let app = axum::Router::new()
+            .nest("/v1", crate::routes::public::v1_router(state.clone()))
+            .with_state(state);
+
+        let mut answers = Vec::new();
+        let mut tombstone_ids = Vec::new();
+        for lifecycle in ["deleted", "cleanup_required"] {
+            let id = SandboxId::new();
+            tombstone_ids.push(PublicSandboxId::from(id).to_string());
+            sqlx::query(pplx_space_common_core::sql!(
+                "INSERT INTO sandboxes (
+                     id, user_id, org_id, lifecycle, network_policy_override_json,
+                     network_policy_generation
+                 ) VALUES ($1, $2, $3, $4, $5, 1)"
+            ))
+            .bind(id)
+            .bind(SEED_USER_ID)
+            .bind(SEED_ORG_ID)
+            .bind(lifecycle)
+            .bind(SqlJson(&pplx_space_net_common::NetworkPolicyV1::default()))
+            .execute(&db.pool)
+            .await?;
+            let request =
+                axum::http::Request::get(format!("/v1/sandboxes/{}", PublicSandboxId::from(id)))
+                    .header("authorization", format!("Bearer {KEY}"))
+                    .body(axum::body::Body::empty())?;
+            let response = tower::ServiceExt::oneshot(app.clone(), request).await?;
+            let status = response.status();
+            let body = axum::body::to_bytes(response.into_body(), 1024 * 1024).await?;
+            let mut body: serde_json::Value = serde_json::from_slice(&body)?;
+            // Each request has its own ID.
+            let request_id = body
+                .as_object_mut()
+                .and_then(|body| body.remove("request_id"));
+            assert!(request_id.is_some(), "{lifecycle}: {body}");
+            answers.push((lifecycle, status, body));
+        }
+
+        let (_, deleted_status, deleted_body) = &answers[0];
+        assert_eq!(*deleted_status, StatusCode::NOT_FOUND, "{deleted_body}");
+        let (_, status, body) = &answers[1];
+        assert_eq!(
+            (status, body),
+            (deleted_status, deleted_body),
+            "cleanup_required must read as deleted"
+        );
+
+        let request = axum::http::Request::get("/v1/sandboxes")
+            .header("authorization", format!("Bearer {KEY}"))
+            .body(axum::body::Body::empty())?;
+        let response = tower::ServiceExt::oneshot(app.clone(), request).await?;
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024).await?;
+        let body: serde_json::Value = serde_json::from_slice(&body)?;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let listed = body["data"]
+            .as_array()
+            .unwrap_or_else(|| panic!("list body has no data: {body}"));
+        for id in &tombstone_ids {
+            assert!(
+                !listed.iter().any(|sandbox| sandbox["id"] == id.as_str()),
+                "tombstone {id} must not be listed: {body}"
+            );
+        }
+        Ok(())
+    })
+    .await
 }
 
 #[tokio::test]

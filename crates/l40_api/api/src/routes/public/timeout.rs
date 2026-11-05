@@ -61,7 +61,7 @@ pub(super) async fn set_timeout(
             .map(Json)
             .map_err(|_| PublicApiError::internal());
     }
-    if sandbox.lifecycle == "deleted" {
+    if crate::models::is_tombstone(&sandbox.lifecycle) {
         return Err(PublicApiError::failed_precondition("sandbox is terminal"));
     }
     let public = read_public_sandbox(&state.pool, org_id, sandbox_id).await?;
