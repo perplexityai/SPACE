@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use pplx_space_metrics::feature_flags as feature_flag_metrics;
+use crate::metrics as feature_flag_metrics;
 
 use crate::{
     Attributes, BoolFlag, FeatureFlagProvider, FloatFlag, IntegerFlag, JsonFlag, ProviderState,
@@ -689,11 +689,12 @@ impl FeatureFlagClient {
     }
 }
 
-/// The reason a read resolved nothing, as the metrics crate's tag vocabulary.
+/// The reason a read resolved nothing, as this crate's `feature_flags.evaluation`
+/// tag vocabulary.
 ///
-/// Two enums rather than one because the metrics crate cannot depend on this
-/// one — it is this crate's dependency, not the other way round. A new
-/// [`Unresolved`] variant is a compile error here, and
+/// Two enums rather than one because the tag vocabulary also has `Assigned`,
+/// which no unresolved read produces. A new [`Unresolved`] variant is a
+/// compile error here, and
 /// `every_reason_maps_to_a_distinct_evaluation_outcome` keeps the mapping
 /// injective so two reasons cannot collapse into one indistinguishable tag.
 const fn evaluation_outcome(unresolved: Unresolved) -> feature_flag_metrics::EvaluationOutcome {

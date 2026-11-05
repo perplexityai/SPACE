@@ -1907,7 +1907,7 @@ fn emit_auto_lifecycle_delete_gauges(db: &crate::db::SharedConnection) {
     );
     for reason in crate::auto_lifecycle_delete_receipts::AutoLifecycleDeleteBlockReason::ALL {
         let stats = blocked.iter().find(|stats| stats.reason == reason);
-        pplx_space_metrics::sandbox::worker::auto_lifecycle_delete_blocked(
+        crate::metrics::sandbox::worker::auto_lifecycle_delete_blocked(
             stats.map_or(0, |stats| stats.count),
             stats.map_or(0, |stats| stats.oldest_age_secs),
             reason.metric_reason(),

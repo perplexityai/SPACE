@@ -77,7 +77,7 @@ async fn routed_requests_record_latency_by_route_template() {
         return;
     }
 
-    let capture = pplx_space_metrics::test_capture::capture_values_guard();
+    let capture = pplx_space_metrics_emit::test_capture::capture_values_guard();
     let response = router(test_data_plane_state().await)
         .oneshot(Request::get("/files/compose").body(Body::empty()).unwrap())
         .await

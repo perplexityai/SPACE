@@ -186,7 +186,7 @@ async fn durable_lease_survives_producer_removal_and_cancelled_grpc_reader() {
 fn a_restarted_send_is_refused_as_retriable_and_counted() {
     const STREAM: &[u8] = include_bytes!("../../fixtures/btrfs_send_v1.stream");
     let restarted = [&STREAM[..STREAM.len() / 2], STREAM].concat();
-    let capture = pplx_space_metrics::test_capture::capture_counters_guard();
+    let capture = pplx_space_metrics_emit::test_capture::capture_counters_guard();
     let mut framing = framing::SendStreamFraming::new();
     let status = framing
         .feed(&restarted)

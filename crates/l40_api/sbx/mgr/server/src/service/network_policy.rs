@@ -602,7 +602,7 @@ impl NetworkPolicyReconcileQueue {
             state.retry_after.remove(&sandbox_id);
             state.attempts.remove(&sandbox_id);
             state.dead.insert(sandbox_id, error.to_string());
-            pplx_space_metrics::reconcile::queue_dead_letter(NETWORK_POLICY_RECONCILE_FACET);
+            pplx_space_reconcile_metrics::queue_dead_letter(NETWORK_POLICY_RECONCILE_FACET);
             false
         } else {
             state.attempts.insert(sandbox_id.clone(), attempts);
@@ -754,17 +754,17 @@ impl NetworkPolicyReconcileQueue {
 
     fn emit_metrics(&self) {
         let state = self.state();
-        pplx_space_metrics::reconcile::queue_depth(
+        pplx_space_reconcile_metrics::queue_depth(
             NETWORK_POLICY_RECONCILE_FACET,
             "ready",
             state.pending.len() as u64,
         );
-        pplx_space_metrics::reconcile::queue_depth(
+        pplx_space_reconcile_metrics::queue_depth(
             NETWORK_POLICY_RECONCILE_FACET,
             "retry",
             state.retry_after.len() as u64,
         );
-        pplx_space_metrics::reconcile::queue_depth(
+        pplx_space_reconcile_metrics::queue_depth(
             NETWORK_POLICY_RECONCILE_FACET,
             "dead",
             state.dead.len() as u64,

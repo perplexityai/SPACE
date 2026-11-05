@@ -168,13 +168,13 @@ run_feature_isolation_checks() {
     # Listing them here also states the invariant. The day one of these becomes
     # feature-gated — `crates/l10_foundation/feature/flags/Cargo.toml` discusses exactly
     # that — this breaks loudly, which is the moment the check would otherwise
-    # lose its evidence base silently. `pplx-space-metrics` is on the list for
+    # lose its evidence base silently. `pplx-space-metrics-emit` is on the list for
     # that reason and not only as a control: an SDK-free deployment is the one
     # with no vendor console, so putting the flag counters back behind the
     # `eppo` feature would take away the only evidence it has that its flags
     # are inert on purpose.
     local required
-    for required in pplx-space-feature-flags pplx-space-metrics serde_json tracing; do
+    for required in pplx-space-feature-flags pplx-space-metrics-emit serde_json tracing; do
         if ! grep -qxF "${required}" <<<"${sdk_free_packages}"; then
             echo "the --no-default-features dependency graph for" \
                 "pplx-space-feature-flags is missing ${required}; it is not a" \

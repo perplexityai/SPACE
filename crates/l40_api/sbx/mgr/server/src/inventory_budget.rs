@@ -27,7 +27,7 @@ pub(crate) fn unary_list_response<T: prost::Message>(rpc: &'static str, message:
             max_encoded_bytes = MAX_ENCODED_BYTES,
             "unary sandbox list response exceeds its encoded budget; serving the complete list"
         );
-        pplx_space_metrics::sandbox::worker::unary_list_budget_exceeded(rpc, "encoded_bytes");
+        pplx_space_sbx_mgr_store::metrics::unary_list_budget_exceeded(rpc, "encoded_bytes");
     }
     Response::new(message)
 }

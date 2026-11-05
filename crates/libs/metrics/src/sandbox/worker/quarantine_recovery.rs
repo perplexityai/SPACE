@@ -67,21 +67,6 @@ impl fmt::Display for QuarantineRecoveryOutcome {
     }
 }
 
-/// A sandbox entered `quarantined`, counted once per entry after the
-/// transition commits, beside its `sandbox_quarantined` event. `reason` is
-/// the quarantine's reason code; `operation` names the sandbox-manager path
-/// that quarantined it, the event's own `operation` (`mark_quarantined`,
-/// `insert_quarantined_sandbox`, `startup_resident_recovery`,
-/// `complete_cleanup_episode`, `complete_row_intent_cleanup`,
-/// `quarantine_cleanup_episode`).
-pub fn quarantine_entered(reason: SandboxQuarantineReasonCode, operation: &'static str) {
-    counter(
-        "sandbox.worker.quarantine.entered",
-        1,
-        &[tag("reason", reason.as_str()), tag("operation", operation)],
-    );
-}
-
 pub fn quarantine_recovery_no_progress(
     reason: QuarantineRecoveryNoProgressReason,
     outcome: QuarantineRecoveryAttemptOutcome,

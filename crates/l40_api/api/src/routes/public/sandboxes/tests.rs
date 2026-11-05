@@ -1813,7 +1813,7 @@ mod admission_pool_claim {
 
     /// The `outcome` tags of every admission-claim counter in `counters`.
     fn admission_outcomes(
-        counters: &[pplx_space_metrics::test_capture::CapturedCounter],
+        counters: &[pplx_space_metrics_emit::test_capture::CapturedCounter],
     ) -> Vec<String> {
         counters
             .iter()
@@ -1844,7 +1844,7 @@ mod admission_pool_claim {
     #[tokio::test(flavor = "current_thread")]
     async fn disabled_admission_takes_a_fresh_id_and_leaves_the_pool_alone() -> TestDbResult<()> {
         let fixture = AdmissionPoolFixture::new(1).await?;
-        let capture = pplx_space_metrics::test_capture::capture_counters_guard();
+        let capture = pplx_space_metrics_emit::test_capture::capture_counters_guard();
         let response = fixture
             .create(None, "admission-disabled", fixture.request())
             .await
@@ -1871,7 +1871,7 @@ mod admission_pool_claim {
     async fn eligible_admission_takes_the_ready_slot_and_its_reserved_id() -> TestDbResult<()> {
         let fixture = AdmissionPoolFixture::new(1).await?;
         let controller = fixture.controller();
-        let capture = pplx_space_metrics::test_capture::capture_counters_guard();
+        let capture = pplx_space_metrics_emit::test_capture::capture_counters_guard();
         let response = fixture
             .create(Some(&controller), "admission-hit", fixture.request())
             .await
@@ -1967,7 +1967,7 @@ mod admission_pool_claim {
             .expect("create is recorded");
         assert_eq!(fixture.slot_count("ready").await?, 1);
 
-        let capture = pplx_space_metrics::test_capture::capture_counters_guard();
+        let capture = pplx_space_metrics_emit::test_capture::capture_counters_guard();
         let retry = fixture
             .create(Some(&controller), "admission-retry", fixture.request())
             .await
@@ -2050,7 +2050,7 @@ mod admission_pool_claim {
         let fixture = AdmissionPoolFixture::new(1).await?;
         fixture.enable_org_encryption().await?;
         let controller = fixture.controller();
-        let capture = pplx_space_metrics::test_capture::capture_counters_guard();
+        let capture = pplx_space_metrics_emit::test_capture::capture_counters_guard();
         let response = fixture
             .create(Some(&controller), "admission-encrypted", fixture.request())
             .await
@@ -2100,7 +2100,7 @@ mod admission_pool_claim {
         {
             let mut request = fixture.request();
             request.resources = Some(resources);
-            let capture = pplx_space_metrics::test_capture::capture_counters_guard();
+            let capture = pplx_space_metrics_emit::test_capture::capture_counters_guard();
             let response = fixture
                 .create(
                     Some(&controller),
@@ -2161,7 +2161,7 @@ mod admission_pool_claim {
     async fn a_pool_miss_is_admitted_cold() -> TestDbResult<()> {
         let fixture = AdmissionPoolFixture::new(0).await?;
         let controller = fixture.controller();
-        let capture = pplx_space_metrics::test_capture::capture_counters_guard();
+        let capture = pplx_space_metrics_emit::test_capture::capture_counters_guard();
         let response = fixture
             .create(Some(&controller), "admission-miss", fixture.request())
             .await
@@ -2181,7 +2181,7 @@ mod admission_pool_claim {
         let controller = fixture.controller();
         let mut request = fixture.request();
         request.template = "no-such-template:latest".parse().unwrap();
-        let capture = pplx_space_metrics::test_capture::capture_counters_guard();
+        let capture = pplx_space_metrics_emit::test_capture::capture_counters_guard();
         let response = fixture
             .create(Some(&controller), "admission-template-miss", request)
             .await

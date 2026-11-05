@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use crate::emit::gauge;
+use pplx_space_metrics_emit::gauge;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RuntimeHealth {

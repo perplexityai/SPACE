@@ -503,8 +503,8 @@ async fn t1b_fresh_scan_gauges_require_a_completed_scan() {
     let backend = FakeBackend::new();
     let mut reconciler = Reconciler::new(config(10), sink, registry_with(backend));
 
-    let failure_counters = pplx_space_metrics::test_capture::capture_counters_guard();
-    let failed_capture = pplx_space_metrics::test_capture::capture_values_guard();
+    let failure_counters = pplx_space_metrics_emit::test_capture::capture_counters_guard();
+    let failed_capture = pplx_space_metrics_emit::test_capture::capture_values_guard();
     let failed_report = reconciler.tick().await;
     let failed_values = failed_capture.finish();
     assert!(failure_counters.finish().iter().any(|counter| {
@@ -536,7 +536,7 @@ async fn t1b_fresh_scan_gauges_require_a_completed_scan() {
     let sink = FakeSink::new();
     let backend = FakeBackend::new();
     let mut reconciler = Reconciler::new(config(10), sink, registry_with(backend));
-    let success_capture = pplx_space_metrics::test_capture::capture_values_guard();
+    let success_capture = pplx_space_metrics_emit::test_capture::capture_values_guard();
     let success_report = reconciler.tick().await;
     let success_values = success_capture.finish();
     assert_eq!(success_report.scanned, 0);
@@ -571,7 +571,7 @@ async fn t1c_scan_volume_combines_fresh_and_claimed_rows() {
     cfg.dry_run = true;
     let mut reconciler = Reconciler::new(cfg, sink, registry_with(backend));
 
-    let values_capture = pplx_space_metrics::test_capture::capture_values_guard();
+    let values_capture = pplx_space_metrics_emit::test_capture::capture_values_guard();
     let report = reconciler.tick().await;
     let values = values_capture.finish();
 
@@ -596,8 +596,8 @@ async fn t1d_claimed_scan_failure_is_loud_and_silences_its_heartbeat() {
     let backend = FakeBackend::new();
     let mut reconciler = Reconciler::new(config(10), sink, registry_with(backend));
 
-    let values_capture = pplx_space_metrics::test_capture::capture_values_guard();
-    let counter_capture = pplx_space_metrics::test_capture::capture_counters_guard();
+    let values_capture = pplx_space_metrics_emit::test_capture::capture_values_guard();
+    let counter_capture = pplx_space_metrics_emit::test_capture::capture_counters_guard();
     let report = reconciler.tick().await;
     let counters = counter_capture.finish();
     let values = values_capture.finish();
@@ -917,7 +917,7 @@ async fn t8d_live_encrypted_claim_is_parked_not_benignly_skipped() {
     sink.set_claimed(vec![c]);
     let mut r = Reconciler::new(config(10), sink.clone(), registry_with(backend.clone()));
 
-    let capture = pplx_space_metrics::test_capture::capture_counters_guard();
+    let capture = pplx_space_metrics_emit::test_capture::capture_counters_guard();
     let report = r.tick().await;
     let counters = capture.finish();
 

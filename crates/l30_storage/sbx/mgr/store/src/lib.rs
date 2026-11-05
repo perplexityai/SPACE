@@ -21,5 +21,6 @@ pub mod auto_lifecycle;
 pub mod auto_lifecycle_delete_receipts;
 pub mod db;
 pub mod endpoint_proof;
+pub mod metrics;
 pub mod restore_operation;
 pub mod state;

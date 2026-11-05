@@ -5,5 +5,5 @@ pub(crate) use pplx_space_metrics_emit::{
     counter, distribution, elapsed_ms, gauge, tag, timing_ms,
 };
 
-#[cfg(any(test, feature = "test-capture"))]
+#[cfg(test)]
 pub(crate) use pplx_space_metrics_emit::test_capture;

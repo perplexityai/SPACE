@@ -2394,7 +2394,8 @@ async fn t51_mislabeled_dedicated_nodes_are_published_as_a_gauge() {
         report.completed,
         "the gauges are only published on a measured tick"
     );
-    let emitted = pplx_space_metrics::test_capture::capture_values(|| publish_metrics(&report));
+    let emitted =
+        pplx_space_metrics_emit::test_capture::capture_values(|| publish_metrics(&report));
     let value = |name: &str| {
         emitted
             .iter()

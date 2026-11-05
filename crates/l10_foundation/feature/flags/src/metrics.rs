@@ -1,4 +1,4 @@
-use crate::emit::{counter, tag};
+use pplx_space_metrics_emit::{counter, tag};
 
 /// What one flag read produced, as the `outcome` tag on
 /// `feature_flags.evaluation`.

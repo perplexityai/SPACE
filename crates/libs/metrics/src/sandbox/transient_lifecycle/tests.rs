@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use super::{LifecycleAge, LifecycleCensus, census};
-use crate::test_capture::{CapturedValue, capture_values};
+use crate::emit::test_capture::{CapturedValue, capture_values};
 
 fn transient() -> Vec<SandboxLifecycle> {
     SandboxLifecycle::all()

@@ -38,6 +38,7 @@ tracing = { workspace = true }
 pplx-space-common-connection-admission = { workspace = true }
 pplx-space-common-core = { workspace = true }
 pplx-space-common-grpc = { workspace = true }
+pplx-space-grpc-metrics = { workspace = true }
 pplx-space-metrics = { workspace = true }
 pplx-space-observability = { workspace = true }
 pplx-space-spaced-common = { workspace = true }

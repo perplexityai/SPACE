@@ -105,10 +105,10 @@ impl PodWorkerChannels {
         F: Future<Output = Result<(Channel, ConnectionWatch), ControllerError>>,
     {
         if let Some(client) = self.live(&key, Instant::now()) {
-            pplx_space_metrics::grpc::client_channel_cache(SERVICE, "hit");
+            pplx_space_grpc_metrics::client_channel_cache(SERVICE, "hit");
             return Ok(client);
         }
-        pplx_space_metrics::grpc::client_channel_cache(SERVICE, "miss");
+        pplx_space_grpc_metrics::client_channel_cache(SERVICE, "miss");
         let (channel, watch) = dial.await?;
         Ok(self.keep(key, channel, watch, Instant::now()))
     }
@@ -124,10 +124,10 @@ impl PodWorkerChannels {
     {
         let now = Instant::now();
         if let Some((client, handout)) = self.live_with_handout(&key, now) {
-            pplx_space_metrics::grpc::client_channel_cache(SERVICE, "hit");
+            pplx_space_grpc_metrics::client_channel_cache(SERVICE, "hit");
             return Ok((client, handout));
         }
-        pplx_space_metrics::grpc::client_channel_cache(SERVICE, "miss");
+        pplx_space_grpc_metrics::client_channel_cache(SERVICE, "miss");
         let (channel, watch) = dial.await?;
         let client = self.keep(key, channel, watch, Instant::now());
         Ok((

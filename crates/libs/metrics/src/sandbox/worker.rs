@@ -18,7 +18,7 @@ use std::{fmt, str::FromStr, time::Instant};
 
 use pplx_space_common_core::types::{
     AutoLifecycleIdleAction, ExecutionReleaseDetachReason, ExecutionReleaseIntent,
-    QuarantineRecoveryNoProgressReason, SandboxQuarantineReasonCode,
+    QuarantineRecoveryNoProgressReason,
 };
 
 use crate::emit::{counter, distribution, elapsed_ms, gauge, tag, timing_ms};

@@ -53,6 +53,7 @@ pplx-space-bearer-token = { workspace = true }
 pplx-space-build-mgr-client = { workspace = true }
 pplx-space-common-core = { workspace = true, features = ["serde"] }
 pplx-space-common-grpc = { workspace = true, features = ["internal-tls"] }
+pplx-space-grpc-metrics = { workspace = true }
 pplx-space-grpc-server = { workspace = true }
 pplx-space-k8s-node-id = { workspace = true }
 pplx-space-sandbox-grpc = { workspace = true }

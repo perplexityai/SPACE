@@ -42,18 +42,12 @@ COMMON_CORE = "pplx-space-common-core"
 # pplx-space-state-reconciliation, pplx-space-common-grpc and each other), and
 # build quickly alone, so they are linted as well. rpc-auth is here so that its
 # build without `k8s` is linted: no binary's release build leaves that feature
-# off; service-host so that its build without `otel` and `datadog` is. Each
-# entry must be a workspace library the rule leaves out for reaching
+# off. Each entry must be a workspace library the rule leaves out for reaching
 # common-core through another crate.
 ALSO = {
-    "pplx-space-grpc-server",
     "pplx-space-ingress-admission",
-    "pplx-space-local-health",
     "pplx-space-postgres-pool",
     "pplx-space-rpc-auth",
-    "pplx-space-service-host",
-    "pplx-space-tokio-runtime",
-    "pplx-space-uds-peer-auth",
 }
 
 with open(sys.argv[1]) as metadata_file:

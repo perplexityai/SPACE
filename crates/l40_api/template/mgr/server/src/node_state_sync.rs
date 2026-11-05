@@ -119,7 +119,7 @@ pub(crate) fn spawn_dirty_outbox_worker(db: Arc<Mutex<Connection>>) {
             match mark_dirty_once(refs.clone()).await {
                 Ok(()) => {
                     for &facet in &facets {
-                        pplx_space_metrics::reconcile::dirty_mark(facet, "ok");
+                        pplx_space_reconcile_metrics::dirty_mark(facet, "ok");
                     }
                     let Some(db) = lock_db(&db, "delete sent template node dirty outbox rows")
                     else {
@@ -133,7 +133,7 @@ pub(crate) fn spawn_dirty_outbox_worker(db: Arc<Mutex<Connection>>) {
                 }
                 Err(error) => {
                     for &facet in &facets {
-                        pplx_space_metrics::reconcile::dirty_mark(facet, "error");
+                        pplx_space_reconcile_metrics::dirty_mark(facet, "error");
                     }
                     delay = next_dirty_mark_delay(delay);
                     tracing::warn!(

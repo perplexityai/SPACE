@@ -1,7 +1,9 @@
 use std::fmt;
 use std::time::{Duration, Instant};
 
-use crate::emit::{counter, distribution, elapsed_ms, gauge, tag, timing_ms};
+use pplx_space_metrics_emit::{
+    counter, distribution, elapsed_ms, gauge, metric_vocabulary, tag, timing_ms,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SchedulerState {

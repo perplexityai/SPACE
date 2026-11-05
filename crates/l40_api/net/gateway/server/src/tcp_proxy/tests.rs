@@ -805,7 +805,7 @@ async fn record_emits_one_connection_metric_and_reports_every_failure_outcome() 
     let mut emitted_tag_sets = HashSet::with_capacity(outcome_count);
 
     for (case, outcome) in outcomes.into_iter().enumerate() {
-        let capture = pplx_space_metrics::test_capture::capture_counters_guard();
+        let capture = pplx_space_metrics_emit::test_capture::capture_counters_guard();
         let failure = matches!(
             &outcome,
             FlowOutcome::Rejected(_) | FlowOutcome::RelayFailed(_)

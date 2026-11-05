@@ -75,8 +75,8 @@ fn reports_lookup_update_eviction_and_size_metrics() {
     let deny_policy = NetworkPolicyV1::deny_all();
     let cache = DnsAllowCache::default();
     let packet = dns_a_response("example.com", [93, 184, 216, 34], 60);
-    let counter_capture = pplx_space_metrics::test_capture::capture_counters_guard();
-    let value_capture = pplx_space_metrics::test_capture::capture_values_guard();
+    let counter_capture = pplx_space_metrics_emit::test_capture::capture_counters_guard();
+    let value_capture = pplx_space_metrics_emit::test_capture::capture_values_guard();
 
     assert!(cache.observe_response(&packet, &allow_policy));
     assert!(cache.observe_response(&packet, &allow_policy));
@@ -89,37 +89,37 @@ fn reports_lookup_update_eviction_and_size_metrics() {
     assert_eq!(
         counter_capture.finish(),
         [
-            pplx_space_metrics::test_capture::CapturedCounter {
+            pplx_space_metrics_emit::test_capture::CapturedCounter {
                 name: "gateway.dns_attribution_cache.update".to_string(),
                 value: 1,
                 tags: vec!["result:insert".to_string()],
             },
-            pplx_space_metrics::test_capture::CapturedCounter {
+            pplx_space_metrics_emit::test_capture::CapturedCounter {
                 name: "gateway.dns_attribution_cache.update".to_string(),
                 value: 1,
                 tags: vec!["result:refresh".to_string()],
             },
-            pplx_space_metrics::test_capture::CapturedCounter {
+            pplx_space_metrics_emit::test_capture::CapturedCounter {
                 name: "gateway.dns_attribution_cache.lookup".to_string(),
                 value: 1,
                 tags: vec!["kind:ip_allow".to_string(), "result:hit".to_string()],
             },
-            pplx_space_metrics::test_capture::CapturedCounter {
+            pplx_space_metrics_emit::test_capture::CapturedCounter {
                 name: "gateway.dns_attribution_cache.lookup".to_string(),
                 value: 1,
                 tags: vec!["kind:ip_allow".to_string(), "result:miss".to_string()],
             },
-            pplx_space_metrics::test_capture::CapturedCounter {
+            pplx_space_metrics_emit::test_capture::CapturedCounter {
                 name: "gateway.dns_attribution_cache.lookup".to_string(),
                 value: 1,
                 tags: vec!["kind:host_binding".to_string(), "result:hit".to_string(),],
             },
-            pplx_space_metrics::test_capture::CapturedCounter {
+            pplx_space_metrics_emit::test_capture::CapturedCounter {
                 name: "gateway.dns_attribution_cache.lookup".to_string(),
                 value: 1,
                 tags: vec!["kind:host_binding".to_string(), "result:miss".to_string(),],
             },
-            pplx_space_metrics::test_capture::CapturedCounter {
+            pplx_space_metrics_emit::test_capture::CapturedCounter {
                 name: "gateway.dns_attribution_cache.eviction".to_string(),
                 value: 1,
                 tags: vec!["reason:policy".to_string()],
@@ -129,17 +129,17 @@ fn reports_lookup_update_eviction_and_size_metrics() {
     assert_eq!(
         value_capture.finish(),
         [
-            pplx_space_metrics::test_capture::CapturedValue {
+            pplx_space_metrics_emit::test_capture::CapturedValue {
                 name: "gateway.dns_attribution_cache.entries".to_string(),
                 value: 1.0,
                 tags: Vec::new(),
             },
-            pplx_space_metrics::test_capture::CapturedValue {
+            pplx_space_metrics_emit::test_capture::CapturedValue {
                 name: "gateway.dns_attribution_cache.entries".to_string(),
                 value: 1.0,
                 tags: Vec::new(),
             },
-            pplx_space_metrics::test_capture::CapturedValue {
+            pplx_space_metrics_emit::test_capture::CapturedValue {
                 name: "gateway.dns_attribution_cache.entries".to_string(),
                 value: 0.0,
                 tags: Vec::new(),

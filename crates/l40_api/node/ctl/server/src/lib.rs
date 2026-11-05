@@ -1388,14 +1388,14 @@ impl NodeCtlWorker {
                 }
             };
             let result_label = if error.is_some() { "error" } else { "ok" };
-            pplx_space_metrics::reconcile::run_duration(
+            pplx_space_reconcile_metrics::run_duration(
                 facet.name(),
                 "inbound",
                 result_label,
                 "node_ctl",
                 started_at,
             );
-            pplx_space_metrics::reconcile::run_items(
+            pplx_space_reconcile_metrics::run_items(
                 facet.name(),
                 "inbound",
                 result_label,
@@ -1618,7 +1618,7 @@ impl NodeCtlWorker {
             match result {
                 Err(error) => {
                     let error = error.to_string();
-                    pplx_space_metrics::reconcile::run_duration(
+                    pplx_space_reconcile_metrics::run_duration(
                         facet.name(),
                         "outbound",
                         "error",
@@ -1645,14 +1645,14 @@ impl NodeCtlWorker {
                     }
                 }
                 Ok(stats) => {
-                    pplx_space_metrics::reconcile::run_duration(
+                    pplx_space_reconcile_metrics::run_duration(
                         facet.name(),
                         "outbound",
                         "ok",
                         pass.metric_trigger(),
                         started_at,
                     );
-                    pplx_space_metrics::reconcile::run_items(
+                    pplx_space_reconcile_metrics::run_items(
                         facet.name(),
                         "outbound",
                         "ok",
@@ -2478,7 +2478,7 @@ async fn connect_cluster_api() -> Result<TracedClusterApiClient, ClusterApiConne
             || build_cluster_api_client(endpoint),
         )
         .await?;
-    pplx_space_metrics::grpc::client_channel_cache("cluster-api", outcome.as_str());
+    pplx_space_grpc_metrics::client_channel_cache("cluster-api", outcome.as_str());
     if outcome == ClientCacheOutcome::Rotated {
         tracing::debug!("rotated cluster API client channel");
     }

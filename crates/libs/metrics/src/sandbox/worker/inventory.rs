@@ -2,16 +2,6 @@
 
 use super::*;
 
-/// A complete unary sandbox List exceeded a strict inventory budget and was
-/// served anyway. `rpc` and `limit` are bounded static labels.
-pub fn unary_list_budget_exceeded(rpc: &'static str, limit: &'static str) {
-    counter(
-        "sandbox.worker.inventory.unary_list_budget_exceeded",
-        1,
-        &[tag("rpc", rpc), tag("limit", limit)],
-    );
-}
-
 /// Current node-local durable sandbox rows in one lifecycle/runtime bucket. The caller
 /// supplies a value decoded through the sandbox-manager's bounded state enum;
 /// do not attach sandbox, pod, node, or execution identifiers.

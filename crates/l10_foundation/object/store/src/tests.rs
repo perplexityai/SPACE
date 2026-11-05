@@ -1,5 +1,5 @@
 use super::*;
-use pplx_space_metrics::object_store::S3AttemptFailureKind;
+use crate::metrics::S3AttemptFailureKind;
 use std::io::SeekFrom;
 use tokio::io::AsyncSeekExt;
 

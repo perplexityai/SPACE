@@ -734,7 +734,7 @@ async fn retention_prune_skips_pinned_and_leased_snapshot_artifacts() {
         let prepared = std::sync::Mutex::new(None);
         let captured_under_lock = std::sync::Mutex::new(None);
         let mut recorded = None;
-        let counters = pplx_space_metrics::test_capture::capture_counters_guard();
+        let counters = pplx_space_metrics_emit::test_capture::capture_counters_guard();
         let result = super::retention::prune_and_capture(
             &mut node_manager.connector().lazy(),
             &ctx,
@@ -835,7 +835,9 @@ async fn retention_prune_skips_pinned_and_leased_snapshot_artifacts() {
     }
 }
 
-fn capture_skips(counters: Vec<pplx_space_metrics::test_capture::CapturedCounter>) -> Vec<String> {
+fn capture_skips(
+    counters: Vec<pplx_space_metrics_emit::test_capture::CapturedCounter>,
+) -> Vec<String> {
     counters
         .into_iter()
         .filter(|counter| counter.name == "snapshot.scheduler.capture_skipped")
@@ -1068,8 +1070,8 @@ impl StagingHarness {
     /// scheduler loop does it.
     async fn tick(&self) -> StagingTick {
         self.deletes.lock().unwrap().clear();
-        let counters = pplx_space_metrics::test_capture::capture_counters_guard();
-        let values = pplx_space_metrics::test_capture::capture_values_guard();
+        let counters = pplx_space_metrics_emit::test_capture::capture_counters_guard();
+        let values = pplx_space_metrics_emit::test_capture::capture_values_guard();
         let (mut ticked, mut recorded) = (None, None);
         let mut captured = false;
         let result = run_scheduled_tick(&self.states, &self.sandbox_id, async |tick, _| {

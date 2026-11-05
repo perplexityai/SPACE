@@ -8,10 +8,10 @@
 //! crates emit through a metrics module's named functions, not by calling
 //! these directly.
 //!
-//! It is its own crate so that a metric module can emit through it without
-//! depending on `pplx-space-metrics` and, through it, on
-//! `pplx-space-common-core`. `pplx-space-metrics` re-exports it from its
-//! private `emit` module and its public `test_capture` module.
+//! It is its own crate so that each crate can define the metrics it records
+//! without depending on `pplx-space-metrics` and, through it, on
+//! `pplx-space-common-core`. Tests that assert on captured values enable
+//! `test-capture` on their own dev-dependency on this crate.
 
 /// Declare a bounded metric-tag vocabulary: the enum, its canonical `as_str`,
 /// and a `Display` that agrees with it.
@@ -24,8 +24,8 @@
 /// tag value *means* is the part an operator reading the metrics catalog needs
 /// and the part a hand-written copy tends to omit.
 ///
-/// Exported from the crate root; `pplx-space-metrics` imports it with
-/// `#[macro_use]`, so every module there can invoke it without a `use`.
+/// Exported from the crate root: a metrics module imports it with
+/// `use pplx_space_metrics_emit::metric_vocabulary;`.
 #[macro_export]
 macro_rules! metric_vocabulary {
     (
