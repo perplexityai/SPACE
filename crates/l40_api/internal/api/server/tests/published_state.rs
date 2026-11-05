@@ -2884,6 +2884,100 @@ async fn node_inventory_only_recovers_sbx_manager_pause_failed_quarantines() -> 
     Ok(())
 }
 
+/// A pause-failed row whose stored lifecycle is a padded `Quarantined` is
+/// skipped, not fatal: `PublishNodeState` succeeds, the canonical row in the
+/// same publication recovers, and the padded row keeps its lifecycle text and
+/// quarantine while its observation still records the published state.
+#[tokio::test(flavor = "current_thread")]
+async fn node_publish_recovers_pause_failed_rows_past_a_non_canonical_one() -> TestResult {
+    let db = pg_test_db().await?;
+    let node_id = NodeId::new();
+    insert_ready_worker_node(&db.pool, node_id).await?;
+
+    let canonical = SandboxId::new();
+    let padded = SandboxId::new();
+    for sandbox_id in [canonical, padded] {
+        insert_active_sandbox(&db.pool, sandbox_id, node_id, "started").await?;
+        let mut quarantined = quarantined_sandbox_state(sandbox_id);
+        quarantined.quarantine_reason_code =
+            Some(SandboxQuarantineReasonCode::PauseFailed.to_string());
+        let mut conn = db.pool.acquire().await?;
+        publish_sandbox_states(&mut conn, node_id, &[quarantined]).await?;
+    }
+    sqlx::query(sql!(
+        "UPDATE sandboxes SET lifecycle = ' Quarantined' WHERE id = $1"
+    ))
+    .bind(padded)
+    .execute(&db.pool)
+    .await?;
+
+    let mut request = Request::new(PublishNodeStateRequest {
+        node_id: node_id.to_string(),
+        role: Some(ProtoNodeRole::Worker as i32),
+        sandboxes: vec![
+            published_sandbox_state(padded, "started"),
+            published_sandbox_state(canonical, "started"),
+        ],
+        ..PublishNodeStateRequest::default()
+    });
+    request
+        .extensions_mut()
+        .insert(tonic::transport::server::TcpConnectInfo {
+            local_addr: None,
+            remote_addr: Some(std::net::SocketAddr::from(([127, 0, 0, 1], 49000))),
+        });
+    let service = ClusterApiService::new(db.pool.clone());
+    Box::pin(service.publish_node_state(request)).await?;
+
+    let state = async |sandbox_id: SandboxId| {
+        sqlx::query_as::<_, (String, String, bool, Vec<String>)>(sql!(
+            "SELECT s.lifecycle,
+                    observed.status,
+                    EXISTS (
+                        SELECT 1 FROM sandbox_quarantine_state WHERE sandbox_id = s.id
+                    ),
+                    ARRAY(
+                        SELECT history.action FROM sandbox_quarantine_history history
+                         WHERE history.sandbox_id = s.id
+                         ORDER BY history.occurred_at, history.action
+                    )
+               FROM sandboxes s
+               JOIN sandbox_observed_states observed ON observed.sandbox_id = s.id
+              WHERE s.id = $1"
+        ))
+        .bind(sandbox_id)
+        .fetch_one(&db.pool)
+        .await
+    };
+    let entered = SandboxQuarantineHistoryAction::EnteredQuarantine
+        .as_str()
+        .to_owned();
+    assert_eq!(
+        state(canonical).await?,
+        (
+            "started".to_owned(),
+            "started".to_owned(),
+            false,
+            vec![
+                entered.clone(),
+                SandboxQuarantineHistoryAction::RecoveredToStarted
+                    .as_str()
+                    .to_owned(),
+            ],
+        )
+    );
+    assert_eq!(
+        state(padded).await?,
+        (
+            " Quarantined".to_owned(),
+            "started".to_owned(),
+            true,
+            vec![entered],
+        )
+    );
+    Ok(())
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn recovery_receipt_converges_each_safe_pre_resume_failure_to_suspended() -> TestResult {
     let db = pg_test_db().await?;
