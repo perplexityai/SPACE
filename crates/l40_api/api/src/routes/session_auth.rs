@@ -223,7 +223,7 @@ async fn create_session_for_password(
     request: LoginRequest,
 ) -> Result<LoginResponse, AuthRouteError> {
     // Taken before the transaction, so a login waiting for a slot holds no
-    // connection or lock; released once the password is checked.
+    // connection or lock; released when the password check ends.
     let slot = crate::auth::password_verification_slot().await?;
     let mut tx = pool.begin().await?;
     // Hold the password read through session insertion so resets revoke every
@@ -238,12 +238,15 @@ async fn create_session_for_password(
     };
 
     if !user.password_login_configured()
-        || !crate::auth::verify_password_blocking(request.password, user.password_hash.clone())
-            .await??
+        || !crate::auth::verify_password_blocking(
+            request.password,
+            user.password_hash.clone(),
+            slot,
+        )
+        .await??
     {
         return Err(AuthRouteError::InvalidCredentials);
     }
-    drop(slot);
 
     let org = sqlx::query_as::<_, Organization>(sql!("SELECT * FROM organizations WHERE id = $1"))
         .bind(user.org_id)

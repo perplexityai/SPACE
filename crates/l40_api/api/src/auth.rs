@@ -67,14 +67,21 @@ pub(crate) async fn password_verification_slot()
         .map_err(|_| VerifierUnavailable)
 }
 
-/// [`verify_password`] on the blocking pool, off the async workers.
+/// [`verify_password`] on the blocking pool, off the async workers. The slot
+/// moves into the blocking task and is released only when the verification
+/// ends, so a cancelled login cannot free it while bcrypt still runs.
 pub(crate) async fn verify_password_blocking(
     password: String,
     hash: String,
+    slot: tokio::sync::SemaphorePermit<'static>,
 ) -> Result<Result<bool, bcrypt::BcryptError>, VerifierUnavailable> {
-    tokio::task::spawn_blocking(move || verify_password(&password, &hash))
-        .await
-        .map_err(|_| VerifierUnavailable)
+    tokio::task::spawn_blocking(move || {
+        let verified = verify_password(&password, &hash);
+        drop(slot);
+        verified
+    })
+    .await
+    .map_err(|_| VerifierUnavailable)
 }
 
 /// Returns (raw_token, token_hash). Send raw_token to the client; store token_hash in the DB.

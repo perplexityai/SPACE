@@ -556,8 +556,11 @@ With an authenticator installed:
     and is not rate limited per account or client. Each process verifies at
     most half its cores' worth of passwords at once, off the request
     workers, so a flood of login attempts slows other logins but not other
-    requests. Give listed accounts strong random passwords and keep the API
-    reachable only through the proxy or trusted networks.
+    requests. The exception is the targeted account: a login holds a shared
+    lock on its user row while it checks the password, so setting that
+    account's password waits for its in-flight logins to finish. Give listed
+    accounts strong random passwords and keep the API reachable only
+    through the proxy or trusted networks.
   - Any local user's password can be set or rotated in this mode, from the
     console's user page or `PATCH /admin/api/v1/users/{id}`; it only takes
     effect for listed accounts. The console stays signed in, because its own
