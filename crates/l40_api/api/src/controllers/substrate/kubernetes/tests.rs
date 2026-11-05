@@ -7322,6 +7322,8 @@ mod kubernetes_tests {
 
     fn test_sandbox_with_lifecycle(lifecycle: &str) -> Sandbox {
         Sandbox {
+            stop_cause: None,
+            stop_cause_at: None,
             id: SandboxId::from_uuid(Uuid::nil()),
             name: None,
             user_id: UserId::from_uuid(Uuid::nil()),

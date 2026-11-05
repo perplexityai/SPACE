@@ -221,6 +221,51 @@ async fn stopped_report_leaves_a_stopped_re_placement_to_the_drain() -> TestResu
     Ok(())
 }
 
+/// A `stopped` report carries why the node stopped the sandbox, and the row
+/// it converges keeps that cause with the node's stop time; a report without
+/// one, from a requested stop or an older node, records none, and an
+/// unspecified cause reads the same. The store's `stop_cause_tests` pin when a
+/// cause ends.
+#[tokio::test(flavor = "current_thread")]
+async fn stopped_report_records_why_the_node_stopped_the_sandbox() -> TestResult {
+    use pplx_space_sbx_mgr_client::proto::SandboxStopCause;
+    let db = pg_test_db().await?;
+    let pool = &db.pool;
+    let node_id = ready_node(pool).await?;
+    let stopped_at = time::macros::datetime!(2026-11-05 12:00:00 UTC);
+
+    for (cause, expected) in [
+        (
+            Some(SandboxStopCause::PodTerminated),
+            Some("pod_terminated"),
+        ),
+        (Some(SandboxStopCause::VmExited), Some("vm_exited")),
+        (Some(SandboxStopCause::Unspecified), None),
+        (None, None),
+    ] {
+        let (sandbox_id, _) = insert_running(pool, node_id, "started").await?;
+        let mut state = published_sandbox_state(sandbox_id, "stopped");
+        state.stop_cause = cause.map(|cause| cause as i32);
+        state.state_changed_at = Some(prost_types::Timestamp {
+            seconds: stopped_at.unix_timestamp(),
+            nanos: 0,
+        });
+        publish(pool, node_id, state).await?;
+
+        let (lifecycle, stop_cause, stop_cause_at) =
+            sqlx::query_as::<_, (String, Option<String>, Option<time::OffsetDateTime>)>(sql!(
+                "SELECT lifecycle, stop_cause, stop_cause_at FROM sandboxes WHERE id = $1"
+            ))
+            .bind(sandbox_id)
+            .fetch_one(pool)
+            .await?;
+        assert_eq!(lifecycle, "stopped", "{cause:?}");
+        assert_eq!(stop_cause.as_deref(), expected, "{cause:?}");
+        assert_eq!(stop_cause_at, expected.map(|_| stopped_at), "{cause:?}");
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // `failed` and `quarantined` projections.
 // ---------------------------------------------------------------------------

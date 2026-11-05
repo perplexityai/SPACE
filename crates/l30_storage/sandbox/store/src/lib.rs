@@ -17,7 +17,7 @@
 //!   ([`insert_unplaced`], [`insert_pooled`], [`update_desired_state`],
 //!   [`set_auto_lifecycle_policy`]) touch `sandboxes` only and re-check
 //!   nothing in their `WHERE` beyond the row's id.
-//! * **Column writes respect the row's triggers.** `sandboxes` carries five
+//! * **Column writes respect the row's triggers.** `sandboxes` carries six
 //!   `BEFORE UPDATE` triggers. `updated_at` is trigger-maintained, so verbs
 //!   here leave it to the trigger, except
 //!   [`ingest::prune_census_absent_sandboxes`] and
@@ -188,6 +188,51 @@ pub struct SandboxRecord {
     pub created_at: OffsetDateTime,
     pub updated_at: OffsetDateTime,
 }
+
+/// Why a stopped sandbox stopped when no one asked it to, as its node
+/// published it with the `stopped` status. `sandboxes.stop_cause` holds
+/// [`Self::as_str`]; the `sandboxes_clear_stop_cause` trigger drops it, with
+/// `stop_cause_at`, once the sandbox runs again (`started` or `paused`), and
+/// keeps it through everything else, a stopped sandbox's evacuation included.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SandboxStopCause {
+    /// The sandbox's Kubernetes pod was torn down while it ran.
+    PodTerminated,
+    /// The sandbox's VM process exited on its own.
+    VmExited,
+}
+
+impl SandboxStopCause {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::PodTerminated => "pod_terminated",
+            Self::VmExited => "vm_exited",
+        }
+    }
+}
+
+impl std::fmt::Display for SandboxStopCause {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for SandboxStopCause {
+    type Err = SandboxStopCauseParseError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "pod_terminated" => Ok(Self::PodTerminated),
+            "vm_exited" => Ok(Self::VmExited),
+            _ => Err(SandboxStopCauseParseError),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("stop cause must be pod_terminated or vm_exited")]
+pub struct SandboxStopCauseParseError;
 
 /// Fetch one sandbox row by id. `None` when no row exists.
 ///
@@ -565,7 +610,7 @@ pub struct SandboxDesiredStatePatch<'a> {
 /// actually changed; writing it explicitly makes the trigger return early
 /// and defeats that no-op detection.
 ///
-/// This row carries four further `BEFORE UPDATE` triggers, two of which
+/// This row carries five further `BEFORE UPDATE` triggers, two of which
 /// (`sandboxes_clear_restore_lease`, `sandboxes_clear_evacuation_restore_target`)
 /// have no change guard. They fire on any update regardless of which columns
 /// this sets, so an all-`Unchanged` patch is still not a database no-op.

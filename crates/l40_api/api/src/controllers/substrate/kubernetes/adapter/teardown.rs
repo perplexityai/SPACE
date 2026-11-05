@@ -506,6 +506,7 @@ impl KubernetesSubstrate {
                 if mode.sends_sandbox_stop() {
                     let stop_result = client
                         .stop_sandbox(pplx_space_sbx_mgr_client::proto::StopRequest {
+                            stop_cause: None,
                             sandbox_id: sandbox_id.to_string(),
                             template_filter: None,
                             blocking: true,

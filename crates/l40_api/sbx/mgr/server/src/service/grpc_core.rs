@@ -683,6 +683,7 @@ impl SandboxManagerService {
         let template_filter = req.template_filter.as_deref().filter(|s| !s.is_empty());
         let blocking = req.blocking;
         let immediate_kill = req.immediate_kill;
+        let stop_cause = stop_cause_from_proto(req.stop_cause);
 
         let to_stop = self
             .resolve_lifecycle_target(
@@ -721,6 +722,7 @@ impl SandboxManagerService {
                     !blocking,
                     template_filter,
                     Self::is_template_manager_peer(&peer),
+                    stop_cause,
                 )
                 .await
                 .map_err(|error| error.into_status())?;
@@ -932,6 +934,7 @@ impl SandboxManagerService {
                         !blocking,
                         template_filter,
                         Self::is_template_manager_peer(&peer),
+                        None,
                     )
                     .await
                 }
@@ -1288,6 +1291,17 @@ fn project_template_catalog(
             })
         })
         .collect()
+}
+
+/// A cause the caller set, or none for an absent, unspecified or unknown one:
+/// a cause from a newer caller this node can't name is not recorded.
+fn stop_cause_from_proto(value: Option<i32>) -> Option<crate::db::StopCause> {
+    use crate::proto::SandboxStopCause as Proto;
+    match value.and_then(|value| Proto::try_from(value).ok())? {
+        Proto::PodTerminated => Some(crate::db::StopCause::PodTerminated),
+        Proto::VmExited => Some(crate::db::StopCause::VmExited),
+        Proto::Unspecified => None,
+    }
 }
 
 #[cfg(test)]

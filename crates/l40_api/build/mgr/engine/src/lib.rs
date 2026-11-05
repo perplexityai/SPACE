@@ -422,6 +422,7 @@ async fn stop_sandbox_best_effort(
 ) {
     match sbx
         .stop(StopRequest {
+            stop_cause: None,
             sandbox_id: sandbox_id.to_string(),
             template_filter: None,
             blocking: true,
@@ -1091,6 +1092,7 @@ impl TemplateBuilder {
         // Stop sandbox (kill VM, release network, keep filesystem for rootfs copy)
         if let Err(error) = build_phase(template_id, BuildPhase::StopSandbox, async {
             sbx.stop(StopRequest {
+                stop_cause: None,
                 sandbox_id: sandbox_id.clone(),
                 template_filter: None,
                 blocking: true,

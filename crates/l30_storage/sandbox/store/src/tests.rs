@@ -14,6 +14,7 @@ use super::{
 
 mod create_finish_tests;
 mod insert_unplaced_tests;
+mod stop_cause_tests;
 
 /// The three desired-state columns, read back raw.
 async fn read_desired_state(

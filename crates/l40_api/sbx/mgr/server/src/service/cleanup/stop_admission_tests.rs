@@ -177,6 +177,41 @@ impl Cleanup {
         }
     }
 
+    /// The cause the sweep stops with, as the shim's pod teardown does; a
+    /// delete has none.
+    fn stop_cause(self) -> Option<crate::db::StopCause> {
+        match self {
+            Self::Stop => Some(crate::db::StopCause::PodTerminated),
+            Self::Delete => None,
+        }
+    }
+
+    /// The cause the row holds after the sweep's admission from a plain row
+    /// in `state`. A row a stop already owns keeps that stop's attribution
+    /// (none, on these rows) instead of taking the re-admitting stop's.
+    fn recorded_cause(self, state: SandboxState) -> Option<crate::db::StopCause> {
+        match state {
+            SandboxState::Stopping
+            | SandboxState::Stopped
+            | SandboxState::CleanupRequired
+            | SandboxState::CleanupFailed => None,
+            SandboxState::Creating
+            | SandboxState::Created
+            | SandboxState::Starting
+            | SandboxState::Started
+            | SandboxState::Deleting
+            | SandboxState::Pausing
+            | SandboxState::Paused
+            | SandboxState::Resuming
+            | SandboxState::Checkpointing
+            | SandboxState::Suspending
+            | SandboxState::Suspended
+            | SandboxState::Restoring
+            | SandboxState::Quarantined
+            | SandboxState::Failed => self.stop_cause(),
+        }
+    }
+
     fn keep_filesystem(self) -> bool {
         match self {
             Self::Stop => true,
@@ -257,6 +292,7 @@ async fn sweep_every_source_state(cleanup: Cleanup) {
                     persist_intent,
                     None,
                     false,
+                    cleanup.stop_cause(),
                 ),
             )
             .await
@@ -281,6 +317,7 @@ async fn sweep_every_source_state(cleanup: Cleanup) {
                     );
                     let row = crate::db::get_sandbox(&db, &id).unwrap().unwrap();
                     assert_eq!(row.state, cleanup.target(), "{case}");
+                    assert_eq!(row.stop_cause, cleanup.recorded_cause(state), "{case}");
                     assert_eq!(
                         (row.cleanup_completion, row.cleanup_keep_filesystem),
                         if persist_intent {
@@ -350,6 +387,7 @@ async fn stop_rpc_admits_nothing_without_a_live_runtime() {
             let service = isolated_service(conn, scratch.path());
             let before = snapshot(&service.db_conn().unwrap());
             let mut request = Request::new(StopRequest {
+                stop_cause: None,
                 sandbox_id: sandbox_id.to_string(),
                 template_filter: None,
                 blocking,
@@ -368,6 +406,100 @@ async fn stop_rpc_admits_nothing_without_a_live_runtime() {
             assert_unchanged(&case, &before, &service.db_conn().unwrap());
             shutdown(service).await;
         }
+    }
+}
+
+/// The stop that first owns a row attributes it; a Stop that re-admits the
+/// row keeps that attribution. The shim can read `started`, lose the race to
+/// an operator's Stop, and send its own `POD_TERMINATED` Stop to the
+/// `stopping` row: that stays a requested stop. A runtime-exit stop that an
+/// operator's Stop then re-admits stays `vm_exited`. A requested stop that newly
+/// owns a row replaces a cause an earlier stop left (a `starting` row keeps the
+/// cause of the stop it is starting from until it reaches `started`).
+#[tokio::test(flavor = "current_thread")]
+async fn a_readmitted_stop_keeps_the_first_stops_attribution() {
+    use crate::db::StopCause;
+    if !crate::service::tests::enter_route_test_process(&[
+        ("EPPO_SDK_KEY", None),
+        ("SPACE_FLAGD_ENABLED", None),
+    ]) {
+        return;
+    }
+    for (case, state, seeded, readmitted_with, expected) in [
+        (
+            "operator stop, then the shim's",
+            SandboxState::Stopping,
+            None,
+            Some(StopCause::PodTerminated),
+            None,
+        ),
+        (
+            "runtime exit, then an operator's",
+            SandboxState::Stopping,
+            Some("vm_exited"),
+            None,
+            Some(StopCause::VmExited),
+        ),
+        (
+            "failed crash cleanup retried",
+            SandboxState::CleanupFailed,
+            Some("pod_terminated"),
+            None,
+            Some(StopCause::PodTerminated),
+        ),
+        (
+            "requested stop of a start",
+            SandboxState::Starting,
+            Some("vm_exited"),
+            None,
+            None,
+        ),
+    ] {
+        let conn = crate::db::test_conn();
+        let sandbox_id = insert_row(&conn, state);
+        let id = sandbox_id.to_string();
+        conn.execute(
+            "UPDATE sandboxes SET stop_cause = ?2, cleanup_completion = CASE
+                 WHEN state = 'cleanup_failed' THEN 'mark_stopped' ELSE cleanup_completion END
+              WHERE id = ?1",
+            crate::db::fixture::params![&id, seeded],
+        )
+        .unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let service = isolated_service(conn, scratch.path());
+        service.shutdown_token.cancel();
+        tokio::time::timeout(WAIT, async {
+            while !service.task_tracker.is_empty() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{case}: service tasks outlived shutdown"));
+
+        let admission = tokio::time::timeout(
+            WAIT,
+            service.admit_selected_cleanup(
+                sandbox_id,
+                CleanupCompletion::MarkStopped,
+                false,
+                true,
+                None,
+                false,
+                readmitted_with,
+            ),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("{case}: admission waited longer than {WAIT:?}"));
+        assert!(
+            matches!(admission, Ok(CleanupAdmission::Persisted { .. })),
+            "{case}: expected a persisted admission"
+        );
+        let row = crate::db::get_sandbox(&service.db_conn().unwrap(), &id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.state, SandboxState::Stopping, "{case}");
+        assert_eq!(row.stop_cause, expected, "{case}");
+        shutdown(service).await;
     }
 }
 
@@ -457,6 +589,11 @@ async fn exited_runtime_recovery_requires_death_and_the_current_execution() {
             } else {
                 SandboxState::Started
             }
+        );
+        // Nobody asked for this stop: the row says why it happened.
+        assert_eq!(
+            service.lookup_sandbox(&id.to_string()).unwrap().stop_cause,
+            (exited && !stale && !busy).then_some(crate::db::StopCause::VmExited)
         );
         drop(admission);
         if !exited {

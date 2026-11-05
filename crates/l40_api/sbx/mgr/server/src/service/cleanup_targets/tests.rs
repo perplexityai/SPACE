@@ -104,6 +104,7 @@ async fn selected_cleanup_rechecks_template_and_owner_after_acquiring_admission_
                 true,
                 filter_template.then_some(selected_template.as_str()),
                 require_template_owner,
+                None,
             ));
             std::future::poll_fn(|cx| {
                 assert!(admission.as_mut().poll(cx).is_pending());
@@ -496,7 +497,15 @@ async fn a_stops_guest_flush_is_decided_from_the_state_it_supersedes() {
         // Keep the executor from taking the job before it is read.
         service.shutdown_token.cancel();
         let admission = service
-            .admit_selected_cleanup(id, CleanupCompletion::MarkStopped, false, true, None, false)
+            .admit_selected_cleanup(
+                id,
+                CleanupCompletion::MarkStopped,
+                false,
+                true,
+                None,
+                false,
+                None,
+            )
             .await
             .unwrap_or_else(|error| panic!("{state:?}: {}", error.into_status()));
         let persisted = {

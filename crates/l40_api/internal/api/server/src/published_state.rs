@@ -1818,6 +1818,7 @@ pub async fn publish_sandbox_states_with_retirement(
                     .transpose()?,
                 execution_generation: execution_generation.map(|generation| generation.get()),
                 pod_uid: pod_uid.map(|pod_uid| pod_uid.to_string()),
+                stop_cause: published_stop_cause(state.stop_cause),
             };
             rows.push(row);
             for snapshot in &state.snapshots {
@@ -3573,6 +3574,18 @@ async fn converge_restored_sandboxes(
     Ok(restored_ids)
 }
 
+/// The cause a node published with its `stopped` status. An unspecified or
+/// unknown value, such as one a newer node names, records no cause.
+fn published_stop_cause(value: Option<i32>) -> Option<pplx_space_sandbox_store::SandboxStopCause> {
+    use pplx_space_sandbox_store::SandboxStopCause;
+    use pplx_space_sbx_mgr_client::proto::SandboxStopCause as Proto;
+    match value.and_then(|value| Proto::try_from(value).ok())? {
+        Proto::PodTerminated => Some(SandboxStopCause::PodTerminated),
+        Proto::VmExited => Some(SandboxStopCause::VmExited),
+        Proto::Unspecified => None,
+    }
+}
+
 async fn converge_stopped_sandboxes(
     conn: &mut sqlx::PgConnection,
     node_id: NodeId,
@@ -3581,7 +3594,7 @@ async fn converge_stopped_sandboxes(
     let stopped_rows = rows
         .iter()
         .filter(|row| row.reports_lifecycle(SandboxLifecycle::Stopped))
-        .map(PublishedSandboxRow::lifecycle_projection)
+        .map(PublishedSandboxRow::stopped_projection)
         .collect::<Vec<_>>();
     let stopped_ids = if stopped_rows.is_empty() {
         Vec::new()

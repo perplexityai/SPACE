@@ -2722,7 +2722,7 @@ impl SubstrateSink {
     /// those are `UPDATE`s that write byte-identical values from the second
     /// tick onward, for the length of a multi-gigabyte upload — and on
     /// `sandboxes` that is not free. Postgres writes a new row version
-    /// regardless, five `BEFORE UPDATE` triggers run (one of them doing two
+    /// regardless, six `BEFORE UPDATE` triggers run (one of them doing two
     /// whole-row `to_jsonb` conversions and a deep compare), and an update that
     /// misses HOT writes an entry in every index on `sandboxes` whose predicate
     /// the row matches. At 16 residents x 12 ticks/min x 2 statements that is

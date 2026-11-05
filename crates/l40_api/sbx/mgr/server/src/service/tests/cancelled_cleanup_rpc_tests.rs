@@ -55,6 +55,7 @@ async fn cancelled_cleanup_rpcs_preserve_admitted_termination_strength() {
             match operation {
                 "stop" => rpc_service
                     .stop(internal_request(StopRequest {
+                        stop_cause: None,
                         sandbox_id: rpc_id,
                         template_filter: None,
                         blocking,

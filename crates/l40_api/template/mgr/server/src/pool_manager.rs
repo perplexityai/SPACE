@@ -213,6 +213,7 @@ async fn pool_tick(db: &Arc<Mutex<rusqlite::Connection>>) -> PoolResult<PoolTick
             eprintln!("[pool-manager] cleaning up failed pool sandbox {short}");
             if let Err(error) = sbx_client
                 .stop(pplx_space_sbx_mgr_client::proto::StopRequest {
+                    stop_cause: None,
                     sandbox_id: sbx.sandbox_id.clone(),
                     template_filter: None,
                     blocking: true,
@@ -496,6 +497,7 @@ async fn do_create_from_base(
         eprintln!("[pool-manager] cleaning up sandbox {short} after error: {e}");
         if let Err(stop_error) = sbx_client
             .stop(pplx_space_sbx_mgr_client::proto::StopRequest {
+                stop_cause: None,
                 sandbox_id: sandbox_id.clone(),
                 template_filter: None,
                 blocking: true,
@@ -609,6 +611,7 @@ async fn do_clone_and_start(
         eprintln!("[pool-manager] cleaning up cloned sandbox {short} after error: {e}");
         if let Err(stop_error) = sbx_client
             .stop(pplx_space_sbx_mgr_client::proto::StopRequest {
+                stop_cause: None,
                 sandbox_id: sandbox_id.clone(),
                 template_filter: None,
                 blocking: true,

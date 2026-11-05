@@ -245,6 +245,7 @@ impl TemplateManagerService {
                     if sbx.pool_template.as_deref() == Some(template_name) {
                         let _ = pool_sbx_client
                             .stop(pplx_space_sbx_mgr_client::proto::StopRequest {
+                                stop_cause: None,
                                 sandbox_id: sbx.sandbox_id.clone(),
                                 template_filter: None,
                                 blocking: true,
@@ -389,6 +390,7 @@ impl TemplateManagerService {
         match tokio::time::timeout(
             cleanup_timeout,
             sbx_client.stop(pplx_space_sbx_mgr_client::proto::StopRequest {
+                stop_cause: None,
                 sandbox_id: sandbox_id.clone(),
                 template_filter: None,
                 blocking: true,

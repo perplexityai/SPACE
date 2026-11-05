@@ -62,4 +62,5 @@ SandboxInfo {
     ),
     current_local_artifact_created_at: None,
     cleanup: None,
+    stop_cause: None,
 }

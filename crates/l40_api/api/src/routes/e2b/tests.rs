@@ -735,6 +735,8 @@ fn native_sandbox_response(id: SandboxId) -> SandboxResponse {
 
 fn test_sandbox() -> Sandbox {
     Sandbox {
+        stop_cause: None,
+        stop_cause_at: None,
         id: SandboxId::new(),
         name: Some("session-123".to_string()),
         user_id: UserId::new(),

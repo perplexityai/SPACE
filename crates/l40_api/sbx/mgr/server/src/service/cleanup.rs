@@ -441,6 +441,24 @@ struct CleanupAdmissionSpec {
     persist_intent: bool,
     immediate_kill: bool,
     guest_flush: crate::db::cleanup_jobs::GuestFlush,
+    /// Recorded on the row when the admission moves it to `stopping`: set
+    /// only for a stop no one asked for.
+    stop_cause: Option<crate::db::StopCause>,
+}
+
+/// Whether a stop admitted over `superseded` starts a new stop rather than
+/// re-admitting one: `stopping` and `stopped` rows, and the cleanup states a
+/// stop's failed or interrupted cleanup leaves, already belong to a stop.
+fn newly_owns_stop(superseded: Option<SandboxState>) -> bool {
+    !matches!(
+        superseded,
+        Some(
+            SandboxState::Stopping
+                | SandboxState::Stopped
+                | SandboxState::CleanupRequired
+                | SandboxState::CleanupFailed
+        )
+    )
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -857,6 +875,7 @@ impl SandboxManagerService {
                 immediate_kill: true,
                 guest_flush: crate::db::cleanup_jobs::GuestFlush::Unrequested,
                 persist_intent: true,
+                stop_cause: Some(crate::db::StopCause::VmExited),
             }, fence)?;
             service.ensure_cleanup_executor();
             tracing::warn!(sandbox_id = %observed.id, pid, "runtime exited; admitted fenced cleanup preserving sandbox disk");
@@ -872,6 +891,7 @@ impl SandboxManagerService {
         self.admit_lifecycle_cleanup_inner(
             sandbox_id,
             CleanupAdmissionSpec {
+                stop_cause: None,
                 mode: CleanupAdmissionMode::ObservedState {
                     state: claim.observed_state,
                     execution_generation: claim.observed_execution_generation,
@@ -909,6 +929,7 @@ impl SandboxManagerService {
         self.admit_lifecycle_cleanup_inner(
             sandbox_id,
             CleanupAdmissionSpec {
+                stop_cause: None,
                 mode: CleanupAdmissionMode::ObservedActivation { state, execution },
                 template_filter: None,
                 require_template_owner: false,
@@ -943,6 +964,7 @@ impl SandboxManagerService {
         self.admit_lifecycle_cleanup_inner(
             sandbox_id,
             CleanupAdmissionSpec {
+                stop_cause: None,
                 mode,
                 template_filter: None,
                 require_template_owner: false,
@@ -965,6 +987,7 @@ impl SandboxManagerService {
         self.admit_lifecycle_cleanup_inner(
             sandbox_id,
             CleanupAdmissionSpec {
+                stop_cause: None,
                 mode: CleanupAdmissionMode::AutoLifecycleDelete { expectation },
                 template_filter: None,
                 require_template_owner: false,
@@ -1009,6 +1032,10 @@ impl SandboxManagerService {
         Ok(())
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "each argument is an independent field of the Stop or Delete request being admitted"
+    )]
     pub(super) async fn admit_selected_cleanup(
         &self,
         sandbox_id: SandboxId,
@@ -1017,6 +1044,7 @@ impl SandboxManagerService {
         persist_intent: bool,
         template_filter: Option<&str>,
         require_template_owner: bool,
+        stop_cause: Option<crate::db::StopCause>,
     ) -> Result<CleanupAdmission, CleanupAdmissionError> {
         let template_filter = template_filter
             .map(pplx_space_common_core::types::TemplateName::parse)
@@ -1039,6 +1067,7 @@ impl SandboxManagerService {
         self.admit_lifecycle_cleanup_inner(
             sandbox_id,
             CleanupAdmissionSpec {
+                stop_cause,
                 mode: CleanupAdmissionMode::Unfenced,
                 template_filter,
                 require_template_owner,
@@ -1121,6 +1150,7 @@ impl SandboxManagerService {
             persist_intent,
             immediate_kill,
             guest_flush,
+            stop_cause,
         } = spec;
         // Fenced callers depend on readable generation lineage. Auto-lifecycle
         // deletion requires the lifecycle claim and intent write to be atomic;
@@ -1399,13 +1429,13 @@ impl SandboxManagerService {
         } else {
             None
         };
-        let guest_flush = guest_flush.for_superseded_state(
+        let superseded_state: Option<SandboxState> =
             crate::db::read::sandbox_view(&transaction, &sandbox_id_string)
                 .current_state_label()
                 .ok()
                 .flatten()
-                .and_then(|state| state.parse().ok()),
-        );
+                .and_then(|state| state.parse().ok());
+        let guest_flush = guest_flush.for_superseded_state(superseded_state);
         match crate::db::update_state_superseding_activation_in_transaction(
             &transaction,
             &sandbox_id_string,
@@ -1491,6 +1521,22 @@ impl SandboxManagerService {
                 guest_flush_forbidden,
                 fence,
             ));
+        }
+        // A stop this admission newly owns records its attribution, its cause
+        // or none for a requested stop, replacing any an earlier stop left. One
+        // that re-admits a row another stop already owns (a second Stop on a
+        // `stopping` row, or a retry of a stop's failed cleanup) keeps that
+        // stop's attribution: an operator's Stop that the shim's pod-teardown
+        // Stop re-admits stays a requested stop. Written in the admission's
+        // transaction, so the stop can't reach `stopped` and be published
+        // first. A cause explains a stop and must never block one: a failed
+        // write only loses it.
+        if target_state == SandboxState::Stopping
+            && newly_owns_stop(superseded_state)
+            && let Err(error) =
+                crate::db::record_stop_cause(&transaction, &sandbox_id_string, stop_cause)
+        {
+            tracing::warn!(sandbox_id = %sandbox_id, cause = ?stop_cause, %error, "recording the stop cause failed");
         }
         let (auto_lifecycle_delete_receipt, admission_metric) =
             match auto_lifecycle_delete_admission {

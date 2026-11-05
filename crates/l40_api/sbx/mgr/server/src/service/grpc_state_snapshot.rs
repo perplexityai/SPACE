@@ -1131,6 +1131,10 @@ impl SandboxManagerService {
                 .map(|attempt| attempt.to_string()),
             state_changed_at: state_changed_at.as_deref().and_then(sqlite_timestamp),
             cleanup: sandbox.cleanup_completion.map(cleanup_to_proto),
+            stop_cause: sandbox
+                .stop_cause
+                .filter(|_| sandbox.state == SandboxState::Stopped)
+                .map(stop_cause_to_proto),
             state_degraded: false,
             health_status,
             health_observed_at,
@@ -2066,6 +2070,16 @@ fn cleanup_to_proto(completion: crate::db::CleanupCompletion) -> crate::proto::S
     crate::proto::SandboxCleanup {
         completion: completion as i32,
     }
+}
+
+fn stop_cause_to_proto(cause: crate::db::StopCause) -> i32 {
+    use crate::db::StopCause;
+    use crate::proto::SandboxStopCause as Proto;
+    let cause = match cause {
+        StopCause::PodTerminated => Proto::PodTerminated,
+        StopCause::VmExited => Proto::VmExited,
+    };
+    cause as i32
 }
 
 #[cfg(test)]

@@ -2568,6 +2568,10 @@ func TestLegacyKillThenDeleteStillCallsManagerDelete(t *testing.T) {
 			if client.stopCalls != 1 || client.deleteCalls != 1 {
 				t.Fatalf("legacy teardown calls = stop:%d delete:%d, want stop:1 delete:1", client.stopCalls, client.deleteCalls)
 			}
+			// Nobody asked this running sandbox to stop: its pod went away.
+			if got := client.stopRequests[0].GetStopCause(); got != pb.SandboxStopCause_SANDBOX_STOP_CAUSE_POD_TERMINATED {
+				t.Fatalf("Kill's Stop cause = %v, want POD_TERMINATED", got)
+			}
 			if _, ok := service.tasks["task"]; ok {
 				t.Fatal("Delete() left the legacy task in the task map")
 			}
@@ -2836,6 +2840,7 @@ type fakeSandboxManagerClient struct {
 	teardownRequests []*pb.PrepareTeardownSuspendRequest
 	onTeardownCall   func()
 	stopCalls        int
+	stopRequests     []*pb.StopRequest
 	stopErrors       []error
 	deleteCalls      int
 	deleteError      error
@@ -3047,6 +3052,7 @@ func (f *fakeSandboxManagerClient) PrepareTeardownSuspend(ctx context.Context, i
 
 func (f *fakeSandboxManagerClient) Stop(ctx context.Context, in *pb.StopRequest, opts ...grpc.CallOption) (*pb.StopResponse, error) {
 	f.stopCalls++
+	f.stopRequests = append(f.stopRequests, in)
 	if len(f.stopErrors) > 0 {
 		err := f.stopErrors[0]
 		f.stopErrors = f.stopErrors[1:]

@@ -65,7 +65,7 @@ fn projection_order_does_not_change_values_or_corrupt_column_diagnostics() {
                     restore_origin, restore_phase, restore_storage_uri,
                     space_api_route_substrate_kind, space_api_route_activation_attempt_id,
                     spaced_endpoint_proof_json, disk_io_max_operations_per_sec,
-                    disk_io_max_bandwidth_mib_per_sec, node_execution_id, guest_image_contract_json, id
+                    disk_io_max_bandwidth_mib_per_sec, node_execution_id, guest_image_contract_json, stop_cause, id
                FROM sandboxes WHERE id = ?1",
         )
         .unwrap();

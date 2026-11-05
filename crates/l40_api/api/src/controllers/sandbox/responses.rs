@@ -65,6 +65,8 @@ const SANDBOX_COLUMNS: &str = "
     s.last_used_at,
     s.last_access_at,
     s.last_command_at,
+    s.stop_cause,
+    s.stop_cause_at,
     s.created_at,
     s.updated_at,
     COALESCE(release_tags.tags, ARRAY[]::TEXT[]) AS release_tags
@@ -741,6 +743,7 @@ pub fn sandbox_to_response(sandbox: &Sandbox, live: Option<&SandboxInfo>) -> San
             .unwrap_or_else(|_| "unknown".into())
     });
     let state_input = SandboxStateInput::new(Some(sandbox.lifecycle.clone()), live_lifecycle);
+    let stop_cause = stop_cause_response(sandbox, state_input.reported_lifecycle().as_deref());
 
     SandboxResponse {
         id: sandbox.id,
@@ -798,11 +801,31 @@ pub fn sandbox_to_response(sandbox: &Sandbox, live: Option<&SandboxInfo>) -> San
         pool_template: live.and_then(|info| info.pool_template.clone()),
         disk_usage_bytes: None,
         failure_reason: live.and_then(|info| info.failure_reason.clone()),
+        stop_cause,
         age: live
             .and_then(|info| info.created_at.as_deref().and_then(format_age))
             .or_else(|| format_age_from_time(sandbox.created_at)),
         volume_encryption: sandbox.volume_encryption,
     }
+}
+
+/// The row's stored stop cause, when the response renders the sandbox
+/// `stopped`. The row keeps a cause until the sandbox runs again, through
+/// lifecycles such as an evacuation's `restoring`, so only the rendered
+/// lifecycle decides whether it explains what the caller sees;
+/// [`SandboxResponse::set_state`] applies the same rule when an observation
+/// replaces it.
+fn stop_cause_response(
+    sandbox: &Sandbox,
+    rendered_lifecycle: Option<&str>,
+) -> Option<crate::models::SandboxStopCauseResponse> {
+    if !crate::models::renders_stopped(rendered_lifecycle) {
+        return None;
+    }
+    Some(crate::models::SandboxStopCauseResponse {
+        reason: sandbox.stop_cause.as_deref()?.parse().ok()?,
+        stopped_at: sandbox.stop_cause_at?,
+    })
 }
 
 pub fn sandbox_query(sql: &str) -> String {

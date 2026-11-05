@@ -63,6 +63,7 @@ pub(super) struct PublishedSandboxRow {
     pub(super) state_changed_at: Option<String>,
     pub(super) execution_generation: Option<i64>,
     pub(super) pod_uid: Option<String>,
+    pub(super) stop_cause: Option<pplx_space_sandbox_store::SandboxStopCause>,
 }
 
 /// A narrow SQL projection of the published lifecycle.
@@ -82,6 +83,28 @@ impl PublishedSandboxRow {
         PublishedLifecycleRow {
             sandbox_id: self.sandbox_id,
             published_lifecycle: self.published_lifecycle,
+        }
+    }
+}
+
+/// The lifecycle projection plus why the node stopped the sandbox, for the
+/// `stopped` convergence. The cause's time is the node's state change time.
+#[derive(serde::Serialize)]
+pub(super) struct PublishedStoppedRow<'a> {
+    sandbox_id: SandboxId,
+    #[serde(serialize_with = "serialize_published_lifecycle")]
+    published_lifecycle: Option<StoredSandboxLifecycle>,
+    stop_cause: Option<pplx_space_sandbox_store::SandboxStopCause>,
+    stop_cause_at: Option<&'a str>,
+}
+
+impl PublishedSandboxRow {
+    pub(super) fn stopped_projection(&self) -> PublishedStoppedRow<'_> {
+        PublishedStoppedRow {
+            sandbox_id: self.sandbox_id,
+            published_lifecycle: self.published_lifecycle,
+            stop_cause: self.stop_cause,
+            stop_cause_at: self.stop_cause.and(self.state_changed_at.as_deref()),
         }
     }
 }

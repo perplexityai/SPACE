@@ -11114,6 +11114,7 @@ pub(crate) mod service_tests {
                 } else {
                     service
                         .stop(internal_request(StopRequest {
+                            stop_cause: None,
                             sandbox_id: selector.to_string(),
                             template_filter: Some("seed".to_string()),
                             blocking: false,
@@ -15949,6 +15950,46 @@ pub(crate) mod service_tests {
                 info.cleanup.map(|cleanup| cleanup.completion),
                 expected.map(|completion| completion as i32),
                 "{completion:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn build_sandbox_info_publishes_the_stop_cause_only_when_stopped() {
+        use crate::db::StopCause;
+        use crate::proto::SandboxStopCause as Proto;
+        let conn = crate::db::test_conn();
+        let sandbox_id = SandboxId::new().to_string();
+        insert_test_sandbox(&conn, &sandbox_id, SandboxState::Stopped);
+        let service = service_with_runtime_probe(conn, false);
+        for (state, cause, expected) in [
+            (SandboxState::Stopped, None, None),
+            (
+                SandboxState::Stopped,
+                Some(StopCause::PodTerminated),
+                Some(Proto::PodTerminated),
+            ),
+            (
+                SandboxState::Stopped,
+                Some(StopCause::VmExited),
+                Some(Proto::VmExited),
+            ),
+            // A stop still in flight hasn't stopped the sandbox yet.
+            (SandboxState::Stopping, Some(StopCause::VmExited), None),
+        ] {
+            let mut sandbox = service.lookup_sandbox(&sandbox_id).unwrap();
+            sandbox.state = state;
+            sandbox.stop_cause = cause;
+
+            let info = service
+                .build_sandbox_info(sandbox, None, None, None, None)
+                .await
+                .unwrap();
+
+            assert_eq!(
+                info.stop_cause,
+                expected.map(|cause| cause as i32),
+                "{state} {cause:?}"
             );
         }
     }

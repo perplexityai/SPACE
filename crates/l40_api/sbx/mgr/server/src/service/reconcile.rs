@@ -495,6 +495,7 @@ impl SandboxManagerService {
                 match sandbox.state {
                     SandboxState::Started | SandboxState::Paused => {
                         self.stop(auto_lifecycle_request(StopRequest {
+                            stop_cause: None,
                             sandbox_id: sandbox.id.clone(),
                             template_filter: None,
                             blocking: true,

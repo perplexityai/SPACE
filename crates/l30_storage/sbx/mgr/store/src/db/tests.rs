@@ -10024,6 +10024,7 @@ mod network_policy_live_gateway;
 mod pinned_artifact_capture;
 mod pool_donors;
 mod state_write_table;
+mod stop_cause;
 mod stopped_artifact_pin;
 mod thin_writer_coverage;
 mod update_state_from;

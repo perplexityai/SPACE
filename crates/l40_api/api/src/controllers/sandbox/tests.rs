@@ -1379,6 +1379,8 @@ mod response_tests {
         template_generation: Option<i64>,
     ) -> Sandbox {
         Sandbox {
+            stop_cause: None,
+            stop_cause_at: None,
             id: SandboxId::from_uuid(Uuid::nil()),
             name: None,
             user_id: UserId::from_uuid(Uuid::nil()),
@@ -1530,6 +1532,68 @@ mod response_tests {
         let response = sandbox_to_response(&sandbox, None);
 
         assert_eq!(response.release_tags, sandbox.release_tags);
+    }
+
+    /// The stored cause renders only on a `stopped` row; `sandbox-store`'s
+    /// `stop_cause_tests` pin when the row holds one.
+    #[test]
+    fn db_backed_response_shows_why_a_stopped_sandbox_stopped() {
+        use pplx_space_sandbox_store::SandboxStopCause;
+        let at = time::macros::datetime!(2026-11-05 12:00:00 UTC);
+        for (lifecycle, label, expected) in [
+            (
+                "stopped",
+                Some("pod_terminated"),
+                Some(SandboxStopCause::PodTerminated),
+            ),
+            (
+                "stopped",
+                Some("vm_exited"),
+                Some(SandboxStopCause::VmExited),
+            ),
+            ("stopped", None, None),
+            // A label from a newer writer is not shown as a cause.
+            ("stopped", Some("cause_from_a_newer_writer"), None),
+            ("started", Some("vm_exited"), None),
+        ] {
+            let mut sandbox = sandbox_with_network_policy(None, 1, None, None);
+            sandbox.lifecycle = lifecycle.to_string();
+            sandbox.stop_cause = label.map(str::to_string);
+            sandbox.stop_cause_at = Some(at);
+
+            let response = sandbox_to_response(&sandbox, None);
+
+            assert_eq!(
+                response.stop_cause,
+                expected.map(|reason| crate::models::SandboxStopCauseResponse {
+                    reason,
+                    stopped_at: at
+                }),
+                "{lifecycle} {label:?}"
+            );
+        }
+    }
+
+    /// A row whose node already observes it running again renders `started`,
+    /// so the stored cause of its last stop isn't shown with it.
+    #[test]
+    fn cached_response_shows_no_stop_cause_once_the_node_reports_it_running() {
+        let mut sandbox = sandbox_with_network_policy(None, 1, None, None);
+        sandbox.lifecycle = "stopped".to_string();
+        sandbox.stop_cause = Some("vm_exited".to_string());
+        sandbox.stop_cause_at = Some(time::macros::datetime!(2026-11-05 12:00:00 UTC));
+        for (status, lifecycle, shown) in
+            [("stopped", "stopped", true), ("started", "started", false)]
+        {
+            let mut observed = observed_network_policy("template", 1);
+            observed.node_id = sandbox.active_node_id;
+            observed.status = Some(status.to_string());
+
+            let response = sandbox_to_cached_response(&sandbox, Some(&observed));
+
+            assert_eq!(response.lifecycle.as_deref(), Some(lifecycle), "{status}");
+            assert_eq!(response.stop_cause.is_some(), shown, "{status}");
+        }
     }
 
     #[test]

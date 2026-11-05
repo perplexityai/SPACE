@@ -98,6 +98,7 @@ async fn legacy_delete_after_durable_delete_does_not_dispatch_node_cleanup() {
             true,
             None,
             false,
+            None,
         )
         .await
         .unwrap();
@@ -413,6 +414,7 @@ impl CleanupRpc {
                 Self::Stop => service
                     .stop(peer_request(
                         StopRequest {
+                            stop_cause: None,
                             sandbox_id: sandbox_id.to_owned(),
                             template_filter,
                             blocking,
@@ -674,6 +676,7 @@ async fn nonblocking_cleanup_returns_once_admitted_and_honors_skip_node_publish(
                                 metadata,
                                 extensions,
                                 StopRequest {
+                                    stop_cause: None,
                                     sandbox_id: id.clone(),
                                     template_filter: None,
                                     blocking: false,

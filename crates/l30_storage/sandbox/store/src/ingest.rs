@@ -523,9 +523,11 @@ pub async fn advance_published_activity(
 /// `lifecycle = 'stopped'`, returning the ids that converged. **Observed
 /// projection**: the node reported the runtime stopped.
 ///
-/// `rows` is a recordset of `{sandbox_id, published_lifecycle}`. The write
-/// re-checks that the row is on `node_id` and that its lifecycle, compared
-/// with `LOWER(TRIM(..))`, is `started`, `paused`, `suspended`, `stopping` or
+/// `rows` is a recordset of `{sandbox_id, published_lifecycle, stop_cause,
+/// stop_cause_at}`. A row that converges with a published `stop_cause` takes
+/// it with `stop_cause_at`; a report without one keeps what the row holds.
+/// The write re-checks that the row is on `node_id` and that its lifecycle,
+/// compared with `LOWER(TRIM(..))`, is `started`, `paused`, `suspended`, `stopping` or
 /// `restoring`. No locking read selects its rows first: the `UPDATE` locks
 /// each row it writes, and under the caller's READ COMMITTED transaction a row
 /// a concurrent writer holds is re-checked against its latest committed
@@ -544,11 +546,18 @@ pub async fn converge_published_stopped(
              SELECT *
              FROM jsonb_to_recordset($2::jsonb) AS input(
                  sandbox_id UUID,
-                 published_lifecycle TEXT
+                 published_lifecycle TEXT,
+                 stop_cause TEXT,
+                 stop_cause_at TIMESTAMPTZ
              )
          )
          UPDATE sandboxes s
-         SET lifecycle = 'stopped'
+         SET lifecycle = 'stopped',
+             stop_cause = COALESCE(input.stop_cause, s.stop_cause),
+             stop_cause_at = CASE
+                 WHEN input.stop_cause IS NULL THEN s.stop_cause_at
+                 ELSE COALESCE(input.stop_cause_at, NOW())
+             END
          FROM input
          WHERE s.id = input.sandbox_id
            AND s.active_node_id = $1

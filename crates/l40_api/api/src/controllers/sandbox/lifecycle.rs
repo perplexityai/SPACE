@@ -895,6 +895,7 @@ async fn run_stop_or_kill(
         SandboxAction::Stop => {
             client
                 .stop_sandbox(StopRequest {
+                    stop_cause: None,
                     sandbox_id: id_str,
                     template_filter: None,
                     blocking: true,
@@ -2205,6 +2206,7 @@ impl SandboxController {
                     .await?;
                 client
                     .stop_sandbox(StopRequest {
+                        stop_cause: None,
                         sandbox_id: id_str.clone(),
                         template_filter: None,
                         blocking: true,

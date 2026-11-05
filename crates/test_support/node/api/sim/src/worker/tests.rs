@@ -149,6 +149,7 @@ async fn stop_and_kill_reach_stopped() {
 
     let stop = svc
         .stop_sandbox(Request::new(sbx::StopRequest {
+            stop_cause: None,
             sandbox_id: "sbx-stop".into(),
             template_filter: None,
             blocking: true,
@@ -627,6 +628,7 @@ async fn stop_and_kill_end_the_sandbox_processes_before_a_restart() {
         match teardown {
             "stop" => {
                 svc.stop_sandbox(Request::new(sbx::StopRequest {
+                    stop_cause: None,
                     sandbox_id: sandbox_id.into(),
                     template_filter: None,
                     blocking: true,
@@ -790,6 +792,7 @@ async fn internal_wake_prefers_and_records_the_start_context_identity() {
         .await
         .unwrap();
     svc.stop_sandbox(Request::new(sbx::StopRequest {
+        stop_cause: None,
         sandbox_id: "sbx-w".into(),
         template_filter: None,
         blocking: true,
@@ -965,6 +968,7 @@ async fn wake_replays_the_recorded_activation_attempt() {
     );
 
     svc.stop_sandbox(Request::new(sbx::StopRequest {
+        stop_cause: None,
         sandbox_id: "sbx-att".into(),
         template_filter: None,
         blocking: true,

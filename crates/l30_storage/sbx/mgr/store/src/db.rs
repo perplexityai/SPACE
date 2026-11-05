@@ -93,6 +93,7 @@ mod sandboxes;
 mod startup_recovery;
 mod state_transitions;
 mod state_write;
+mod stop_cause;
 mod store_job_failures;
 mod teardown_suspend;
 pub use auto_lifecycle::*;
@@ -109,6 +110,7 @@ pub use sandboxes::*;
 pub use startup_recovery::*;
 pub use state_transitions::*;
 pub use state_write::*;
+pub use stop_cause::*;
 pub use teardown_suspend::*;
 
 // Most of the no-progress vocabulary is durable: its rendered form is persisted

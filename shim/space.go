@@ -1075,7 +1075,19 @@ func releaseLegacyTaskTeardown(ctx context.Context, client pb.SandboxManagerClie
 		if recordStopIssued != nil {
 			recordStopIssued(true)
 		}
-		_, err = client.Stop(ctx, &pb.StopRequest{SandboxId: identity.sandboxID})
+		// No requested stop or suspend owns this row (the switch above
+		// released those): the sandbox is stopping because its pod went away,
+		// and sbx-manager records that on the stopped row. Only the legacy
+		// teardown sends a cause: a generation-two-or-later pod, or one with
+		// the durable-suspend annotation, takes the teardown-suspend path,
+		// which records none. The pod's Delete that follows deletes
+		// the node's row, and with it the node's copy of the sandbox; when
+		// it lands before node-ctl publishes `stopped`, the control plane
+		// never sees this stop or its cause.
+		_, err = client.Stop(ctx, &pb.StopRequest{
+			SandboxId: identity.sandboxID,
+			StopCause: pb.SandboxStopCause_SANDBOX_STOP_CAUSE_POD_TERMINATED.Enum(),
+		})
 		// A call that ended on this side, or a dropped connection, may have
 		// been admitted unseen, so it keeps the ownership. Any other answer is
 		// sbx-manager refusing the stop, and treating a refused Stop as this

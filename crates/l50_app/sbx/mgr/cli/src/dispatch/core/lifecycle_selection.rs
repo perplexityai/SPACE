@@ -25,6 +25,7 @@ impl Mutation {
     ) -> MutationRequest {
         match self {
             Self::Stop { immediate_kill } => MutationRequest::Stop(StopRequest {
+                stop_cause: None,
                 sandbox_id: id,
                 template_filter,
                 blocking,

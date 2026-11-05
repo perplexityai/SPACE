@@ -44,6 +44,7 @@ impl Rpc {
             match self {
                 Self::Stop => {
                     let mut request = Request::new(StopRequest {
+                        stop_cause: None,
                         sandbox_id: id.to_owned(),
                         template_filter: None,
                         blocking,
@@ -277,6 +278,7 @@ async fn unpersisted_admission_preserves_flush_qualification_after_row_loss() {
                 true,
                 None,
                 false,
+                None,
             )
             .await
             .unwrap_or_else(|error| panic!("cleanup admission: {}", error.into_status()));

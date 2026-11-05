@@ -509,6 +509,58 @@ func (WakeTransition) EnumDescriptor() ([]byte, []int) {
 	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{8}
 }
 
+// Why a sandbox stopped when nobody asked it to.
+type SandboxStopCause int32
+
+const (
+	SandboxStopCause_SANDBOX_STOP_CAUSE_UNSPECIFIED SandboxStopCause = 0
+	// The sandbox's Kubernetes pod was torn down while the sandbox ran.
+	SandboxStopCause_SANDBOX_STOP_CAUSE_POD_TERMINATED SandboxStopCause = 1
+	// The sandbox's VM process exited on its own.
+	SandboxStopCause_SANDBOX_STOP_CAUSE_VM_EXITED SandboxStopCause = 2
+)
+
+// Enum value maps for SandboxStopCause.
+var (
+	SandboxStopCause_name = map[int32]string{
+		0: "SANDBOX_STOP_CAUSE_UNSPECIFIED",
+		1: "SANDBOX_STOP_CAUSE_POD_TERMINATED",
+		2: "SANDBOX_STOP_CAUSE_VM_EXITED",
+	}
+	SandboxStopCause_value = map[string]int32{
+		"SANDBOX_STOP_CAUSE_UNSPECIFIED":    0,
+		"SANDBOX_STOP_CAUSE_POD_TERMINATED": 1,
+		"SANDBOX_STOP_CAUSE_VM_EXITED":      2,
+	}
+)
+
+func (x SandboxStopCause) Enum() *SandboxStopCause {
+	p := new(SandboxStopCause)
+	*p = x
+	return p
+}
+
+func (x SandboxStopCause) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (SandboxStopCause) Descriptor() protoreflect.EnumDescriptor {
+	return file_sandbox_manager_v1_manager_proto_enumTypes[9].Descriptor()
+}
+
+func (SandboxStopCause) Type() protoreflect.EnumType {
+	return &file_sandbox_manager_v1_manager_proto_enumTypes[9]
+}
+
+func (x SandboxStopCause) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use SandboxStopCause.Descriptor instead.
+func (SandboxStopCause) EnumDescriptor() ([]byte, []int) {
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{9}
+}
+
 // Node-local lifecycle, including cleanup states that are not control-plane
 // desired lifecycles. Unknown observations are never evidence of a safe state.
 type SandboxLifecycleState int32
@@ -592,11 +644,11 @@ func (x SandboxLifecycleState) String() string {
 }
 
 func (SandboxLifecycleState) Descriptor() protoreflect.EnumDescriptor {
-	return file_sandbox_manager_v1_manager_proto_enumTypes[9].Descriptor()
+	return file_sandbox_manager_v1_manager_proto_enumTypes[10].Descriptor()
 }
 
 func (SandboxLifecycleState) Type() protoreflect.EnumType {
-	return &file_sandbox_manager_v1_manager_proto_enumTypes[9]
+	return &file_sandbox_manager_v1_manager_proto_enumTypes[10]
 }
 
 func (x SandboxLifecycleState) Number() protoreflect.EnumNumber {
@@ -605,7 +657,7 @@ func (x SandboxLifecycleState) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use SandboxLifecycleState.Descriptor instead.
 func (SandboxLifecycleState) EnumDescriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{9}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{10}
 }
 
 // What an admitted node-local cleanup does to the row when it finishes. For a
@@ -664,11 +716,11 @@ func (x SandboxCleanupCompletion) String() string {
 }
 
 func (SandboxCleanupCompletion) Descriptor() protoreflect.EnumDescriptor {
-	return file_sandbox_manager_v1_manager_proto_enumTypes[10].Descriptor()
+	return file_sandbox_manager_v1_manager_proto_enumTypes[11].Descriptor()
 }
 
 func (SandboxCleanupCompletion) Type() protoreflect.EnumType {
-	return &file_sandbox_manager_v1_manager_proto_enumTypes[10]
+	return &file_sandbox_manager_v1_manager_proto_enumTypes[11]
 }
 
 func (x SandboxCleanupCompletion) Number() protoreflect.EnumNumber {
@@ -677,7 +729,7 @@ func (x SandboxCleanupCompletion) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use SandboxCleanupCompletion.Descriptor instead.
 func (SandboxCleanupCompletion) EnumDescriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{10}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{11}
 }
 
 type SandboxHealthStatus int32
@@ -716,11 +768,11 @@ func (x SandboxHealthStatus) String() string {
 }
 
 func (SandboxHealthStatus) Descriptor() protoreflect.EnumDescriptor {
-	return file_sandbox_manager_v1_manager_proto_enumTypes[11].Descriptor()
+	return file_sandbox_manager_v1_manager_proto_enumTypes[12].Descriptor()
 }
 
 func (SandboxHealthStatus) Type() protoreflect.EnumType {
-	return &file_sandbox_manager_v1_manager_proto_enumTypes[11]
+	return &file_sandbox_manager_v1_manager_proto_enumTypes[12]
 }
 
 func (x SandboxHealthStatus) Number() protoreflect.EnumNumber {
@@ -729,7 +781,7 @@ func (x SandboxHealthStatus) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use SandboxHealthStatus.Descriptor instead.
 func (SandboxHealthStatus) EnumDescriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{11}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{12}
 }
 
 type SandboxHealthComponent int32
@@ -771,11 +823,11 @@ func (x SandboxHealthComponent) String() string {
 }
 
 func (SandboxHealthComponent) Descriptor() protoreflect.EnumDescriptor {
-	return file_sandbox_manager_v1_manager_proto_enumTypes[12].Descriptor()
+	return file_sandbox_manager_v1_manager_proto_enumTypes[13].Descriptor()
 }
 
 func (SandboxHealthComponent) Type() protoreflect.EnumType {
-	return &file_sandbox_manager_v1_manager_proto_enumTypes[12]
+	return &file_sandbox_manager_v1_manager_proto_enumTypes[13]
 }
 
 func (x SandboxHealthComponent) Number() protoreflect.EnumNumber {
@@ -784,7 +836,7 @@ func (x SandboxHealthComponent) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use SandboxHealthComponent.Descriptor instead.
 func (SandboxHealthComponent) EnumDescriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{12}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{13}
 }
 
 type SandboxHealthProbeOutcome int32
@@ -829,11 +881,11 @@ func (x SandboxHealthProbeOutcome) String() string {
 }
 
 func (SandboxHealthProbeOutcome) Descriptor() protoreflect.EnumDescriptor {
-	return file_sandbox_manager_v1_manager_proto_enumTypes[13].Descriptor()
+	return file_sandbox_manager_v1_manager_proto_enumTypes[14].Descriptor()
 }
 
 func (SandboxHealthProbeOutcome) Type() protoreflect.EnumType {
-	return &file_sandbox_manager_v1_manager_proto_enumTypes[13]
+	return &file_sandbox_manager_v1_manager_proto_enumTypes[14]
 }
 
 func (x SandboxHealthProbeOutcome) Number() protoreflect.EnumNumber {
@@ -842,7 +894,7 @@ func (x SandboxHealthProbeOutcome) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use SandboxHealthProbeOutcome.Descriptor instead.
 func (SandboxHealthProbeOutcome) EnumDescriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{13}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{14}
 }
 
 type MissingDiskUsageReason int32
@@ -878,11 +930,11 @@ func (x MissingDiskUsageReason) String() string {
 }
 
 func (MissingDiskUsageReason) Descriptor() protoreflect.EnumDescriptor {
-	return file_sandbox_manager_v1_manager_proto_enumTypes[14].Descriptor()
+	return file_sandbox_manager_v1_manager_proto_enumTypes[15].Descriptor()
 }
 
 func (MissingDiskUsageReason) Type() protoreflect.EnumType {
-	return &file_sandbox_manager_v1_manager_proto_enumTypes[14]
+	return &file_sandbox_manager_v1_manager_proto_enumTypes[15]
 }
 
 func (x MissingDiskUsageReason) Number() protoreflect.EnumNumber {
@@ -891,7 +943,7 @@ func (x MissingDiskUsageReason) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use MissingDiskUsageReason.Descriptor instead.
 func (MissingDiskUsageReason) EnumDescriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{14}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{15}
 }
 
 // Target lifecycle state for a Wake / WakeSandbox call. UNSPECIFIED is
@@ -943,11 +995,11 @@ func (x WakeTargetState) String() string {
 }
 
 func (WakeTargetState) Descriptor() protoreflect.EnumDescriptor {
-	return file_sandbox_manager_v1_manager_proto_enumTypes[15].Descriptor()
+	return file_sandbox_manager_v1_manager_proto_enumTypes[16].Descriptor()
 }
 
 func (WakeTargetState) Type() protoreflect.EnumType {
-	return &file_sandbox_manager_v1_manager_proto_enumTypes[15]
+	return &file_sandbox_manager_v1_manager_proto_enumTypes[16]
 }
 
 func (x WakeTargetState) Number() protoreflect.EnumNumber {
@@ -956,7 +1008,7 @@ func (x WakeTargetState) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use WakeTargetState.Descriptor instead.
 func (WakeTargetState) EnumDescriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{15}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{16}
 }
 
 type SnapshotType int32
@@ -992,11 +1044,11 @@ func (x SnapshotType) String() string {
 }
 
 func (SnapshotType) Descriptor() protoreflect.EnumDescriptor {
-	return file_sandbox_manager_v1_manager_proto_enumTypes[16].Descriptor()
+	return file_sandbox_manager_v1_manager_proto_enumTypes[17].Descriptor()
 }
 
 func (SnapshotType) Type() protoreflect.EnumType {
-	return &file_sandbox_manager_v1_manager_proto_enumTypes[16]
+	return &file_sandbox_manager_v1_manager_proto_enumTypes[17]
 }
 
 func (x SnapshotType) Number() protoreflect.EnumNumber {
@@ -1005,7 +1057,7 @@ func (x SnapshotType) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use SnapshotType.Descriptor instead.
 func (SnapshotType) EnumDescriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{16}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{17}
 }
 
 type SnapshotSourceLifecycle int32
@@ -1041,11 +1093,11 @@ func (x SnapshotSourceLifecycle) String() string {
 }
 
 func (SnapshotSourceLifecycle) Descriptor() protoreflect.EnumDescriptor {
-	return file_sandbox_manager_v1_manager_proto_enumTypes[17].Descriptor()
+	return file_sandbox_manager_v1_manager_proto_enumTypes[18].Descriptor()
 }
 
 func (SnapshotSourceLifecycle) Type() protoreflect.EnumType {
-	return &file_sandbox_manager_v1_manager_proto_enumTypes[17]
+	return &file_sandbox_manager_v1_manager_proto_enumTypes[18]
 }
 
 func (x SnapshotSourceLifecycle) Number() protoreflect.EnumNumber {
@@ -1054,7 +1106,7 @@ func (x SnapshotSourceLifecycle) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use SnapshotSourceLifecycle.Descriptor instead.
 func (SnapshotSourceLifecycle) EnumDescriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{17}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{18}
 }
 
 // Codec for the rootfs artifact a suspend snapshot writes to object
@@ -1107,11 +1159,11 @@ func (x SuspendSnapshotFormat) String() string {
 }
 
 func (SuspendSnapshotFormat) Descriptor() protoreflect.EnumDescriptor {
-	return file_sandbox_manager_v1_manager_proto_enumTypes[18].Descriptor()
+	return file_sandbox_manager_v1_manager_proto_enumTypes[19].Descriptor()
 }
 
 func (SuspendSnapshotFormat) Type() protoreflect.EnumType {
-	return &file_sandbox_manager_v1_manager_proto_enumTypes[18]
+	return &file_sandbox_manager_v1_manager_proto_enumTypes[19]
 }
 
 func (x SuspendSnapshotFormat) Number() protoreflect.EnumNumber {
@@ -1120,7 +1172,7 @@ func (x SuspendSnapshotFormat) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use SuspendSnapshotFormat.Descriptor instead.
 func (SuspendSnapshotFormat) EnumDescriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{18}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{19}
 }
 
 type ArtifactKind int32
@@ -1156,11 +1208,11 @@ func (x ArtifactKind) String() string {
 }
 
 func (ArtifactKind) Descriptor() protoreflect.EnumDescriptor {
-	return file_sandbox_manager_v1_manager_proto_enumTypes[19].Descriptor()
+	return file_sandbox_manager_v1_manager_proto_enumTypes[20].Descriptor()
 }
 
 func (ArtifactKind) Type() protoreflect.EnumType {
-	return &file_sandbox_manager_v1_manager_proto_enumTypes[19]
+	return &file_sandbox_manager_v1_manager_proto_enumTypes[20]
 }
 
 func (x ArtifactKind) Number() protoreflect.EnumNumber {
@@ -1169,7 +1221,7 @@ func (x ArtifactKind) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use ArtifactKind.Descriptor instead.
 func (ArtifactKind) EnumDescriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{19}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{20}
 }
 
 type ArtifactOrigin int32
@@ -1211,11 +1263,11 @@ func (x ArtifactOrigin) String() string {
 }
 
 func (ArtifactOrigin) Descriptor() protoreflect.EnumDescriptor {
-	return file_sandbox_manager_v1_manager_proto_enumTypes[20].Descriptor()
+	return file_sandbox_manager_v1_manager_proto_enumTypes[21].Descriptor()
 }
 
 func (ArtifactOrigin) Type() protoreflect.EnumType {
-	return &file_sandbox_manager_v1_manager_proto_enumTypes[20]
+	return &file_sandbox_manager_v1_manager_proto_enumTypes[21]
 }
 
 func (x ArtifactOrigin) Number() protoreflect.EnumNumber {
@@ -1224,7 +1276,7 @@ func (x ArtifactOrigin) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use ArtifactOrigin.Descriptor instead.
 func (ArtifactOrigin) EnumDescriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{20}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{21}
 }
 
 type RuntimeUpgradeOutcome int32
@@ -1266,11 +1318,11 @@ func (x RuntimeUpgradeOutcome) String() string {
 }
 
 func (RuntimeUpgradeOutcome) Descriptor() protoreflect.EnumDescriptor {
-	return file_sandbox_manager_v1_manager_proto_enumTypes[21].Descriptor()
+	return file_sandbox_manager_v1_manager_proto_enumTypes[22].Descriptor()
 }
 
 func (RuntimeUpgradeOutcome) Type() protoreflect.EnumType {
-	return &file_sandbox_manager_v1_manager_proto_enumTypes[21]
+	return &file_sandbox_manager_v1_manager_proto_enumTypes[22]
 }
 
 func (x RuntimeUpgradeOutcome) Number() protoreflect.EnumNumber {
@@ -1279,7 +1331,7 @@ func (x RuntimeUpgradeOutcome) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use RuntimeUpgradeOutcome.Descriptor instead.
 func (RuntimeUpgradeOutcome) EnumDescriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{21}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{22}
 }
 
 type TeardownSuspendAction int32
@@ -1320,11 +1372,11 @@ func (x TeardownSuspendAction) String() string {
 }
 
 func (TeardownSuspendAction) Descriptor() protoreflect.EnumDescriptor {
-	return file_sandbox_manager_v1_manager_proto_enumTypes[22].Descriptor()
+	return file_sandbox_manager_v1_manager_proto_enumTypes[23].Descriptor()
 }
 
 func (TeardownSuspendAction) Type() protoreflect.EnumType {
-	return &file_sandbox_manager_v1_manager_proto_enumTypes[22]
+	return &file_sandbox_manager_v1_manager_proto_enumTypes[23]
 }
 
 func (x TeardownSuspendAction) Number() protoreflect.EnumNumber {
@@ -1333,7 +1385,7 @@ func (x TeardownSuspendAction) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use TeardownSuspendAction.Descriptor instead.
 func (TeardownSuspendAction) EnumDescriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{22}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{23}
 }
 
 type TeardownSuspendOutcome int32
@@ -1382,11 +1434,11 @@ func (x TeardownSuspendOutcome) String() string {
 }
 
 func (TeardownSuspendOutcome) Descriptor() protoreflect.EnumDescriptor {
-	return file_sandbox_manager_v1_manager_proto_enumTypes[23].Descriptor()
+	return file_sandbox_manager_v1_manager_proto_enumTypes[24].Descriptor()
 }
 
 func (TeardownSuspendOutcome) Type() protoreflect.EnumType {
-	return &file_sandbox_manager_v1_manager_proto_enumTypes[23]
+	return &file_sandbox_manager_v1_manager_proto_enumTypes[24]
 }
 
 func (x TeardownSuspendOutcome) Number() protoreflect.EnumNumber {
@@ -1395,7 +1447,7 @@ func (x TeardownSuspendOutcome) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use TeardownSuspendOutcome.Descriptor instead.
 func (TeardownSuspendOutcome) EnumDescriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{23}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{24}
 }
 
 // Node-local facts about the current legacy quarantine-recovery episode.
@@ -1430,11 +1482,11 @@ func (x QuarantineRecoveryObservedOwner) String() string {
 }
 
 func (QuarantineRecoveryObservedOwner) Descriptor() protoreflect.EnumDescriptor {
-	return file_sandbox_manager_v1_manager_proto_enumTypes[24].Descriptor()
+	return file_sandbox_manager_v1_manager_proto_enumTypes[25].Descriptor()
 }
 
 func (QuarantineRecoveryObservedOwner) Type() protoreflect.EnumType {
-	return &file_sandbox_manager_v1_manager_proto_enumTypes[24]
+	return &file_sandbox_manager_v1_manager_proto_enumTypes[25]
 }
 
 func (x QuarantineRecoveryObservedOwner) Number() protoreflect.EnumNumber {
@@ -1443,7 +1495,7 @@ func (x QuarantineRecoveryObservedOwner) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use QuarantineRecoveryObservedOwner.Descriptor instead.
 func (QuarantineRecoveryObservedOwner) EnumDescriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{24}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{25}
 }
 
 type AutoLifecycleWakePolicy struct {
@@ -2528,8 +2580,16 @@ type StopRequest struct {
 	TemplateFilter *string `protobuf:"bytes,2,opt,name=template_filter,json=templateFilter,proto3,oneof" json:"template_filter,omitempty"`
 	Blocking       bool    `protobuf:"varint,3,opt,name=blocking,proto3" json:"blocking,omitempty"`                                // If true, wait until sandbox state is stopped
 	ImmediateKill  bool    `protobuf:"varint,4,opt,name=immediate_kill,json=immediateKill,proto3" json:"immediate_kill,omitempty"` // If true, skip SIGTERM grace and use SIGKILL immediately
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+	// Set only by a caller stopping the sandbox because its infrastructure went
+	// away rather than because anyone asked for a stop: the shim's legacy pod
+	// teardown (a first-generation pod without the durable-suspend teardown
+	// annotation) sends POD_TERMINATED; a later-generation pod takes the
+	// teardown-suspend path, which records no cause. sbx-manager records it only when this Stop newly admits the stop:
+	// a Stop that re-admits a row another stop owns keeps that stop's
+	// attribution. Absent for every requested stop, and from older callers.
+	StopCause     *SandboxStopCause `protobuf:"varint,5,opt,name=stop_cause,json=stopCause,proto3,enum=space.sandbox.manager.v1.SandboxStopCause,oneof" json:"stop_cause,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *StopRequest) Reset() {
@@ -2588,6 +2648,13 @@ func (x *StopRequest) GetImmediateKill() bool {
 		return x.ImmediateKill
 	}
 	return false
+}
+
+func (x *StopRequest) GetStopCause() SandboxStopCause {
+	if x != nil && x.StopCause != nil {
+		return *x.StopCause
+	}
+	return SandboxStopCause_SANDBOX_STOP_CAUSE_UNSPECIFIED
 }
 
 type StopResponse struct {
@@ -3330,7 +3397,12 @@ type SandboxInfo struct {
 	CurrentLocalArtifactCreatedAt *timestamppb.Timestamp `protobuf:"bytes,58,opt,name=current_local_artifact_created_at,json=currentLocalArtifactCreatedAt,proto3,oneof" json:"current_local_artifact_created_at,omitempty"`
 	// The row's recorded node-local cleanup. Absent when none is recorded, or
 	// from an older node that never set it.
-	Cleanup       *SandboxCleanup `protobuf:"bytes,59,opt,name=cleanup,proto3,oneof" json:"cleanup,omitempty"`
+	Cleanup *SandboxCleanup `protobuf:"bytes,59,opt,name=cleanup,proto3,oneof" json:"cleanup,omitempty"`
+	// Why a STOPPED sandbox stopped, when no one asked for the stop. Set only on
+	// a STOPPED row whose stop sbx-manager admitted for that cause, until the
+	// sandbox runs again; absent for a requested stop and from older nodes. The
+	// control plane takes state_changed_at as the stop's time.
+	StopCause     *SandboxStopCause `protobuf:"varint,60,opt,name=stop_cause,json=stopCause,proto3,enum=space.sandbox.manager.v1.SandboxStopCause,oneof" json:"stop_cause,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -3734,6 +3806,13 @@ func (x *SandboxInfo) GetCleanup() *SandboxCleanup {
 		return x.Cleanup
 	}
 	return nil
+}
+
+func (x *SandboxInfo) GetStopCause() SandboxStopCause {
+	if x != nil && x.StopCause != nil {
+		return *x.StopCause
+	}
+	return SandboxStopCause_SANDBOX_STOP_CAUSE_UNSPECIFIED
 }
 
 // A node-local cleanup recorded on a sandbox row. An activation records one,
@@ -13370,14 +13449,17 @@ const file_sandbox_manager_v1_manager_proto_rawDesc = "" +
 	"\blog_path\x18\x06 \x01(\tR\alogPath\x12$\n" +
 	"\x0evsock_uds_path\x18\a \x01(\tR\fvsockUdsPath\x12W\n" +
 	"\x0eroute_identity\x18\b \x01(\v2+.space.net.gateway.v1.SpaceApiRouteIdentityH\x00R\rrouteIdentity\x88\x01\x01B\x11\n" +
-	"\x0f_route_identity\"\xb1\x01\n" +
+	"\x0f_route_identity\"\x90\x02\n" +
 	"\vStopRequest\x12\x1d\n" +
 	"\n" +
 	"sandbox_id\x18\x01 \x01(\tR\tsandboxId\x12,\n" +
 	"\x0ftemplate_filter\x18\x02 \x01(\tH\x00R\x0etemplateFilter\x88\x01\x01\x12\x1a\n" +
 	"\bblocking\x18\x03 \x01(\bR\bblocking\x12%\n" +
-	"\x0eimmediate_kill\x18\x04 \x01(\bR\rimmediateKillB\x12\n" +
-	"\x10_template_filter\"/\n" +
+	"\x0eimmediate_kill\x18\x04 \x01(\bR\rimmediateKill\x12N\n" +
+	"\n" +
+	"stop_cause\x18\x05 \x01(\x0e2*.space.sandbox.manager.v1.SandboxStopCauseH\x01R\tstopCause\x88\x01\x01B\x12\n" +
+	"\x10_template_filterB\r\n" +
+	"\v_stop_cause\"/\n" +
 	"\fStopResponse\x12\x1f\n" +
 	"\vstopped_ids\x18\x01 \x03(\tR\n" +
 	"stoppedIds\"`\n" +
@@ -13424,7 +13506,7 @@ const file_sandbox_manager_v1_manager_proto_rawDesc = "" +
 	"\x0emetadata_valid\x18\x04 \x01(\bR\rmetadataValidB\v\n" +
 	"\t_template\"b\n" +
 	"\x12CleanupTargetBatch\x12L\n" +
-	"\atargets\x18\x01 \x03(\v22.space.sandbox.manager.v1.CleanupTargetObservationR\atargets\"\xda\x1f\n" +
+	"\atargets\x18\x01 \x03(\v22.space.sandbox.manager.v1.CleanupTargetObservationR\atargets\"\xb9 \n" +
 	"\vSandboxInfo\x12\x1d\n" +
 	"\n" +
 	"sandbox_id\x18\x01 \x01(\tR\tsandboxId\x12\x1f\n" +
@@ -13483,7 +13565,9 @@ const file_sandbox_manager_v1_manager_proto_rawDesc = "" +
 	"\x15activation_attempt_id\x188 \x01(\tH#R\x13activationAttemptId\x88\x01\x01\x12R\n" +
 	"\tlifecycle\x189 \x01(\x0e2/.space.sandbox.manager.v1.SandboxLifecycleStateH$R\tlifecycle\x88\x01\x01\x12i\n" +
 	"!current_local_artifact_created_at\x18: \x01(\v2\x1a.google.protobuf.TimestampH%R\x1dcurrentLocalArtifactCreatedAt\x88\x01\x01\x12G\n" +
-	"\acleanup\x18; \x01(\v2(.space.sandbox.manager.v1.SandboxCleanupH&R\acleanup\x88\x01\x01B\v\n" +
+	"\acleanup\x18; \x01(\v2(.space.sandbox.manager.v1.SandboxCleanupH&R\acleanup\x88\x01\x01\x12N\n" +
+	"\n" +
+	"stop_cause\x18< \x01(\x0e2*.space.sandbox.manager.v1.SandboxStopCauseH'R\tstopCause\x88\x01\x01B\v\n" +
 	"\t_templateB\x06\n" +
 	"\x04_pidB\f\n" +
 	"\n" +
@@ -13529,7 +13613,8 @@ const file_sandbox_manager_v1_manager_proto_rawDesc = "" +
 	"_lifecycleB$\n" +
 	"\"_current_local_artifact_created_atB\n" +
 	"\n" +
-	"\b_cleanup\"d\n" +
+	"\b_cleanupB\r\n" +
+	"\v_stop_cause\"d\n" +
 	"\x0eSandboxCleanup\x12R\n" +
 	"\n" +
 	"completion\x18\x01 \x01(\x0e22.space.sandbox.manager.v1.SandboxCleanupCompletionR\n" +
@@ -14436,7 +14521,11 @@ const file_sandbox_manager_v1_manager_proto_rawDesc = "" +
 	"\x16WAKE_TRANSITION_RESUME\x10\x02\x12\x1b\n" +
 	"\x17WAKE_TRANSITION_RESTORE\x10\x03\x12\x19\n" +
 	"\x15WAKE_TRANSITION_START\x10\x04\x12\x18\n" +
-	"\x14WAKE_TRANSITION_WAIT\x10\x05*\xfe\x05\n" +
+	"\x14WAKE_TRANSITION_WAIT\x10\x05*\x7f\n" +
+	"\x10SandboxStopCause\x12\"\n" +
+	"\x1eSANDBOX_STOP_CAUSE_UNSPECIFIED\x10\x00\x12%\n" +
+	"!SANDBOX_STOP_CAUSE_POD_TERMINATED\x10\x01\x12 \n" +
+	"\x1cSANDBOX_STOP_CAUSE_VM_EXITED\x10\x02*\xfe\x05\n" +
 	"\x15SandboxLifecycleState\x12'\n" +
 	"#SANDBOX_LIFECYCLE_STATE_UNSPECIFIED\x10\x00\x12$\n" +
 	" SANDBOX_LIFECYCLE_STATE_CREATING\x10\x01\x12#\n" +
@@ -14629,7 +14718,7 @@ func file_sandbox_manager_v1_manager_proto_rawDescGZIP() []byte {
 	return file_sandbox_manager_v1_manager_proto_rawDescData
 }
 
-var file_sandbox_manager_v1_manager_proto_enumTypes = make([]protoimpl.EnumInfo, 25)
+var file_sandbox_manager_v1_manager_proto_enumTypes = make([]protoimpl.EnumInfo, 26)
 var file_sandbox_manager_v1_manager_proto_msgTypes = make([]protoimpl.MessageInfo, 183)
 var file_sandbox_manager_v1_manager_proto_goTypes = []any{
 	(BootMode)(0),                                          // 0: space.sandbox.manager.v1.BootMode
@@ -14641,646 +14730,649 @@ var file_sandbox_manager_v1_manager_proto_goTypes = []any{
 	(AutoLifecycleConditionSetId)(0),                       // 6: space.sandbox.manager.v1.AutoLifecycleConditionSetId
 	(AutoLifecycleTransition)(0),                           // 7: space.sandbox.manager.v1.AutoLifecycleTransition
 	(WakeTransition)(0),                                    // 8: space.sandbox.manager.v1.WakeTransition
-	(SandboxLifecycleState)(0),                             // 9: space.sandbox.manager.v1.SandboxLifecycleState
-	(SandboxCleanupCompletion)(0),                          // 10: space.sandbox.manager.v1.SandboxCleanupCompletion
-	(SandboxHealthStatus)(0),                               // 11: space.sandbox.manager.v1.SandboxHealthStatus
-	(SandboxHealthComponent)(0),                            // 12: space.sandbox.manager.v1.SandboxHealthComponent
-	(SandboxHealthProbeOutcome)(0),                         // 13: space.sandbox.manager.v1.SandboxHealthProbeOutcome
-	(MissingDiskUsageReason)(0),                            // 14: space.sandbox.manager.v1.MissingDiskUsageReason
-	(WakeTargetState)(0),                                   // 15: space.sandbox.manager.v1.WakeTargetState
-	(SnapshotType)(0),                                      // 16: space.sandbox.manager.v1.SnapshotType
-	(SnapshotSourceLifecycle)(0),                           // 17: space.sandbox.manager.v1.SnapshotSourceLifecycle
-	(SuspendSnapshotFormat)(0),                             // 18: space.sandbox.manager.v1.SuspendSnapshotFormat
-	(ArtifactKind)(0),                                      // 19: space.sandbox.manager.v1.ArtifactKind
-	(ArtifactOrigin)(0),                                    // 20: space.sandbox.manager.v1.ArtifactOrigin
-	(RuntimeUpgradeOutcome)(0),                             // 21: space.sandbox.manager.v1.RuntimeUpgradeOutcome
-	(TeardownSuspendAction)(0),                             // 22: space.sandbox.manager.v1.TeardownSuspendAction
-	(TeardownSuspendOutcome)(0),                            // 23: space.sandbox.manager.v1.TeardownSuspendOutcome
-	(QuarantineRecoveryObservedOwner)(0),                   // 24: space.sandbox.manager.v1.QuarantineRecoveryObservedOwner
-	(*AutoLifecycleWakePolicy)(nil),                        // 25: space.sandbox.manager.v1.AutoLifecycleWakePolicy
-	(*AutoLifecycleConditionSet)(nil),                      // 26: space.sandbox.manager.v1.AutoLifecycleConditionSet
-	(*AutoLifecycleStage)(nil),                             // 27: space.sandbox.manager.v1.AutoLifecycleStage
-	(*AutoLifecyclePolicy)(nil),                            // 28: space.sandbox.manager.v1.AutoLifecyclePolicy
-	(*AutoLifecycleConditionStatus)(nil),                   // 29: space.sandbox.manager.v1.AutoLifecycleConditionStatus
-	(*AutoLifecycleStatus)(nil),                            // 30: space.sandbox.manager.v1.AutoLifecycleStatus
-	(*CreateRequest)(nil),                                  // 31: space.sandbox.manager.v1.CreateRequest
-	(*CreateResponse)(nil),                                 // 32: space.sandbox.manager.v1.CreateResponse
-	(*StartRequest)(nil),                                   // 33: space.sandbox.manager.v1.StartRequest
-	(*StartResponse)(nil),                                  // 34: space.sandbox.manager.v1.StartResponse
-	(*StopRequest)(nil),                                    // 35: space.sandbox.manager.v1.StopRequest
-	(*StopResponse)(nil),                                   // 36: space.sandbox.manager.v1.StopResponse
-	(*KillRequest)(nil),                                    // 37: space.sandbox.manager.v1.KillRequest
-	(*KillResponse)(nil),                                   // 38: space.sandbox.manager.v1.KillResponse
-	(*DeleteRequest)(nil),                                  // 39: space.sandbox.manager.v1.DeleteRequest
-	(*DeleteResponse)(nil),                                 // 40: space.sandbox.manager.v1.DeleteResponse
-	(*StateRequest)(nil),                                   // 41: space.sandbox.manager.v1.StateRequest
-	(*StateResponse)(nil),                                  // 42: space.sandbox.manager.v1.StateResponse
-	(*GetEnvRequest)(nil),                                  // 43: space.sandbox.manager.v1.GetEnvRequest
-	(*GetEnvResponse)(nil),                                 // 44: space.sandbox.manager.v1.GetEnvResponse
-	(*ListRequest)(nil),                                    // 45: space.sandbox.manager.v1.ListRequest
-	(*ScanCleanupTargetsRequest)(nil),                      // 46: space.sandbox.manager.v1.ScanCleanupTargetsRequest
-	(*CleanupTargetObservation)(nil),                       // 47: space.sandbox.manager.v1.CleanupTargetObservation
-	(*CleanupTargetBatch)(nil),                             // 48: space.sandbox.manager.v1.CleanupTargetBatch
-	(*SandboxInfo)(nil),                                    // 49: space.sandbox.manager.v1.SandboxInfo
-	(*SandboxCleanup)(nil),                                 // 50: space.sandbox.manager.v1.SandboxCleanup
-	(*SandboxHealthObservation)(nil),                       // 51: space.sandbox.manager.v1.SandboxHealthObservation
-	(*SandboxComponentHealth)(nil),                         // 52: space.sandbox.manager.v1.SandboxComponentHealth
-	(*GetSandboxHealthRequest)(nil),                        // 53: space.sandbox.manager.v1.GetSandboxHealthRequest
-	(*GetSandboxHealthResponse)(nil),                       // 54: space.sandbox.manager.v1.GetSandboxHealthResponse
-	(*TransitionReceipt)(nil),                              // 55: space.sandbox.manager.v1.TransitionReceipt
-	(*SandboxListElement)(nil),                             // 56: space.sandbox.manager.v1.SandboxListElement
-	(*ListResponse)(nil),                                   // 57: space.sandbox.manager.v1.ListResponse
-	(*ListBuildReferencingSandboxesRequest)(nil),           // 58: space.sandbox.manager.v1.ListBuildReferencingSandboxesRequest
-	(*ListBuildReferencingSandboxesResponse)(nil),          // 59: space.sandbox.manager.v1.ListBuildReferencingSandboxesResponse
-	(*GetDiskUsageRequest)(nil),                            // 60: space.sandbox.manager.v1.GetDiskUsageRequest
-	(*MissingDiskUsageId)(nil),                             // 61: space.sandbox.manager.v1.MissingDiskUsageId
-	(*GetDiskUsageResponse)(nil),                           // 62: space.sandbox.manager.v1.GetDiskUsageResponse
-	(*CleanupRequest)(nil),                                 // 63: space.sandbox.manager.v1.CleanupRequest
-	(*CleanupResponse)(nil),                                // 64: space.sandbox.manager.v1.CleanupResponse
-	(*ListTemplatesRequest)(nil),                           // 65: space.sandbox.manager.v1.ListTemplatesRequest
-	(*TemplateInfo)(nil),                                   // 66: space.sandbox.manager.v1.TemplateInfo
-	(*ListTemplatesResponse)(nil),                          // 67: space.sandbox.manager.v1.ListTemplatesResponse
-	(*PauseRequest)(nil),                                   // 68: space.sandbox.manager.v1.PauseRequest
-	(*PauseResponse)(nil),                                  // 69: space.sandbox.manager.v1.PauseResponse
-	(*ResumeRequest)(nil),                                  // 70: space.sandbox.manager.v1.ResumeRequest
-	(*ResumeResponse)(nil),                                 // 71: space.sandbox.manager.v1.ResumeResponse
-	(*WakeRequest)(nil),                                    // 72: space.sandbox.manager.v1.WakeRequest
-	(*WakeRuntimeUpgrade)(nil),                             // 73: space.sandbox.manager.v1.WakeRuntimeUpgrade
-	(*WakeStartContext)(nil),                               // 74: space.sandbox.manager.v1.WakeStartContext
-	(*WakeResponse)(nil),                                   // 75: space.sandbox.manager.v1.WakeResponse
-	(*CreateSnapshotRequest)(nil),                          // 76: space.sandbox.manager.v1.CreateSnapshotRequest
-	(*CreateSnapshotResponse)(nil),                         // 77: space.sandbox.manager.v1.CreateSnapshotResponse
-	(*SnapshotCreationIdentity)(nil),                       // 78: space.sandbox.manager.v1.SnapshotCreationIdentity
-	(*CurrentSandboxSnapshotSource)(nil),                   // 79: space.sandbox.manager.v1.CurrentSandboxSnapshotSource
-	(*CreateSnapshotSource)(nil),                           // 80: space.sandbox.manager.v1.CreateSnapshotSource
-	(*DurableArtifactSnapshotSource)(nil),                  // 81: space.sandbox.manager.v1.DurableArtifactSnapshotSource
-	(*PublishedDurableArtifact)(nil),                       // 82: space.sandbox.manager.v1.PublishedDurableArtifact
-	(*CreateTemplateBaseSnapshotRequest)(nil),              // 83: space.sandbox.manager.v1.CreateTemplateBaseSnapshotRequest
-	(*CreateTemplateBaseSnapshotResponse)(nil),             // 84: space.sandbox.manager.v1.CreateTemplateBaseSnapshotResponse
-	(*SuspendRequest)(nil),                                 // 85: space.sandbox.manager.v1.SuspendRequest
-	(*PublishedArtifact)(nil),                              // 86: space.sandbox.manager.v1.PublishedArtifact
-	(*SuspendResponse)(nil),                                // 87: space.sandbox.manager.v1.SuspendResponse
-	(*CurrentInstanceSource)(nil),                          // 88: space.sandbox.manager.v1.CurrentInstanceSource
-	(*EnqueueArtifactBackupRequest)(nil),                   // 89: space.sandbox.manager.v1.EnqueueArtifactBackupRequest
-	(*EnqueueArtifactBackupResponse)(nil),                  // 90: space.sandbox.manager.v1.EnqueueArtifactBackupResponse
-	(*EvictClusterDeletedSandboxRequest)(nil),              // 91: space.sandbox.manager.v1.EvictClusterDeletedSandboxRequest
-	(*EvictClusterDeletedSandboxResponse)(nil),             // 92: space.sandbox.manager.v1.EvictClusterDeletedSandboxResponse
-	(*RuntimeUpgradeAuthorization)(nil),                    // 93: space.sandbox.manager.v1.RuntimeUpgradeAuthorization
-	(*UpgradeRuntimeRequest)(nil),                          // 94: space.sandbox.manager.v1.UpgradeRuntimeRequest
-	(*UpgradeRuntimeResponse)(nil),                         // 95: space.sandbox.manager.v1.UpgradeRuntimeResponse
-	(*EnableSnapshotsRequest)(nil),                         // 96: space.sandbox.manager.v1.EnableSnapshotsRequest
-	(*EnableSnapshotsResponse)(nil),                        // 97: space.sandbox.manager.v1.EnableSnapshotsResponse
-	(*DisableSnapshotsRequest)(nil),                        // 98: space.sandbox.manager.v1.DisableSnapshotsRequest
-	(*DisableSnapshotsResponse)(nil),                       // 99: space.sandbox.manager.v1.DisableSnapshotsResponse
-	(*ListSnapshotsRequest)(nil),                           // 100: space.sandbox.manager.v1.ListSnapshotsRequest
-	(*ListSnapshotsResponse)(nil),                          // 101: space.sandbox.manager.v1.ListSnapshotsResponse
-	(*SnapshotDetail)(nil),                                 // 102: space.sandbox.manager.v1.SnapshotDetail
-	(*SnapshotLocation)(nil),                               // 103: space.sandbox.manager.v1.SnapshotLocation
-	(*DeleteSnapshotsRequest)(nil),                         // 104: space.sandbox.manager.v1.DeleteSnapshotsRequest
-	(*DeleteSnapshotsResponse)(nil),                        // 105: space.sandbox.manager.v1.DeleteSnapshotsResponse
-	(*RollbackRequest)(nil),                                // 106: space.sandbox.manager.v1.RollbackRequest
-	(*RollbackResponse)(nil),                               // 107: space.sandbox.manager.v1.RollbackResponse
-	(*StatsRequest)(nil),                                   // 108: space.sandbox.manager.v1.StatsRequest
-	(*StatsResponse)(nil),                                  // 109: space.sandbox.manager.v1.StatsResponse
-	(*UpdateRequest)(nil),                                  // 110: space.sandbox.manager.v1.UpdateRequest
-	(*UpdateResponse)(nil),                                 // 111: space.sandbox.manager.v1.UpdateResponse
-	(*SpacedPingGuestRequest)(nil),                         // 112: space.sandbox.manager.v1.SpacedPingGuestRequest
-	(*SpacedPingGuestResponse)(nil),                        // 113: space.sandbox.manager.v1.SpacedPingGuestResponse
-	(*SpacedGetStatusRequest)(nil),                         // 114: space.sandbox.manager.v1.SpacedGetStatusRequest
-	(*SpacedGetStatusResponse)(nil),                        // 115: space.sandbox.manager.v1.SpacedGetStatusResponse
-	(*SpacedVersionInfo)(nil),                              // 116: space.sandbox.manager.v1.SpacedVersionInfo
-	(*SpacedWaitReadyRequest)(nil),                         // 117: space.sandbox.manager.v1.SpacedWaitReadyRequest
-	(*SpacedWaitReadyResponse)(nil),                        // 118: space.sandbox.manager.v1.SpacedWaitReadyResponse
-	(*SpacedStatRequest)(nil),                              // 119: space.sandbox.manager.v1.SpacedStatRequest
-	(*SpacedListRequest)(nil),                              // 120: space.sandbox.manager.v1.SpacedListRequest
-	(*SpacedReadRequest)(nil),                              // 121: space.sandbox.manager.v1.SpacedReadRequest
-	(*SpacedWriteRequest)(nil),                             // 122: space.sandbox.manager.v1.SpacedWriteRequest
-	(*SpacedWriteBatchRequest)(nil),                        // 123: space.sandbox.manager.v1.SpacedWriteBatchRequest
-	(*SpacedMkdirRequest)(nil),                             // 124: space.sandbox.manager.v1.SpacedMkdirRequest
-	(*SpacedRemoveRequest)(nil),                            // 125: space.sandbox.manager.v1.SpacedRemoveRequest
-	(*SpacedRenameRequest)(nil),                            // 126: space.sandbox.manager.v1.SpacedRenameRequest
-	(*SpacedNormalizeWatchRootRequest)(nil),                // 127: space.sandbox.manager.v1.SpacedNormalizeWatchRootRequest
-	(*SpacedWatchRequest)(nil),                             // 128: space.sandbox.manager.v1.SpacedWatchRequest
-	(*SpacedCreateWatcherRequest)(nil),                     // 129: space.sandbox.manager.v1.SpacedCreateWatcherRequest
-	(*SpacedGetWatcherEventsRequest)(nil),                  // 130: space.sandbox.manager.v1.SpacedGetWatcherEventsRequest
-	(*SpacedRemoveWatcherRequest)(nil),                     // 131: space.sandbox.manager.v1.SpacedRemoveWatcherRequest
-	(*SpacedEnableFileChangesRequest)(nil),                 // 132: space.sandbox.manager.v1.SpacedEnableFileChangesRequest
-	(*SpacedDisableFileChangesRequest)(nil),                // 133: space.sandbox.manager.v1.SpacedDisableFileChangesRequest
-	(*SpacedGetModifiedFilesRequest)(nil),                  // 134: space.sandbox.manager.v1.SpacedGetModifiedFilesRequest
-	(*SpacedStartProcessRequest)(nil),                      // 135: space.sandbox.manager.v1.SpacedStartProcessRequest
-	(*SpacedConnectProcessRequest)(nil),                    // 136: space.sandbox.manager.v1.SpacedConnectProcessRequest
-	(*SpacedListProcessesRequest)(nil),                     // 137: space.sandbox.manager.v1.SpacedListProcessesRequest
-	(*SpacedListProcessesResponse)(nil),                    // 138: space.sandbox.manager.v1.SpacedListProcessesResponse
-	(*SpacedSendSignalRequest)(nil),                        // 139: space.sandbox.manager.v1.SpacedSendSignalRequest
-	(*SpacedSendInputRequest)(nil),                         // 140: space.sandbox.manager.v1.SpacedSendInputRequest
-	(*SpacedCloseStdinRequest)(nil),                        // 141: space.sandbox.manager.v1.SpacedCloseStdinRequest
-	(*SpacedResizePtyRequest)(nil),                         // 142: space.sandbox.manager.v1.SpacedResizePtyRequest
-	(*SpacedKillProcessRequest)(nil),                       // 143: space.sandbox.manager.v1.SpacedKillProcessRequest
-	(*SetAutoLifecyclePolicyRequest)(nil),                  // 144: space.sandbox.manager.v1.SetAutoLifecyclePolicyRequest
-	(*SetAutoLifecyclePolicyResponse)(nil),                 // 145: space.sandbox.manager.v1.SetAutoLifecyclePolicyResponse
-	(*TouchAutoLifecycleRequest)(nil),                      // 146: space.sandbox.manager.v1.TouchAutoLifecycleRequest
-	(*AccessIdleUpdate)(nil),                               // 147: space.sandbox.manager.v1.AccessIdleUpdate
-	(*TouchAutoLifecycleResponse)(nil),                     // 148: space.sandbox.manager.v1.TouchAutoLifecycleResponse
-	(*GetNetworkPolicyRequest)(nil),                        // 149: space.sandbox.manager.v1.GetNetworkPolicyRequest
-	(*GetNetworkPolicyResponse)(nil),                       // 150: space.sandbox.manager.v1.GetNetworkPolicyResponse
-	(*SetNetworkPolicyRequest)(nil),                        // 151: space.sandbox.manager.v1.SetNetworkPolicyRequest
-	(*SetNetworkPolicyResponse)(nil),                       // 152: space.sandbox.manager.v1.SetNetworkPolicyResponse
-	(*TemplateNetworkPolicyUpdatedRequest)(nil),            // 153: space.sandbox.manager.v1.TemplateNetworkPolicyUpdatedRequest
-	(*TemplateNetworkPolicyUpdatedResponse)(nil),           // 154: space.sandbox.manager.v1.TemplateNetworkPolicyUpdatedResponse
-	(*CycleNetGatewayRequest)(nil),                         // 155: space.sandbox.manager.v1.CycleNetGatewayRequest
-	(*CycleNetGatewayResponse)(nil),                        // 156: space.sandbox.manager.v1.CycleNetGatewayResponse
-	(*AdoptPoolSandboxRequest)(nil),                        // 157: space.sandbox.manager.v1.AdoptPoolSandboxRequest
-	(*AdoptPoolSandboxResponse)(nil),                       // 158: space.sandbox.manager.v1.AdoptPoolSandboxResponse
-	(*WaitRequest)(nil),                                    // 159: space.sandbox.manager.v1.WaitRequest
-	(*WaitResponse)(nil),                                   // 160: space.sandbox.manager.v1.WaitResponse
-	(*CloneFromDonorRequest)(nil),                          // 161: space.sandbox.manager.v1.CloneFromDonorRequest
-	(*CloneFromDonorResponse)(nil),                         // 162: space.sandbox.manager.v1.CloneFromDonorResponse
-	(*ExportSnapshotRequest)(nil),                          // 163: space.sandbox.manager.v1.ExportSnapshotRequest
-	(*ExportSnapshotChunk)(nil),                            // 164: space.sandbox.manager.v1.ExportSnapshotChunk
-	(*ExportSnapshotHeader)(nil),                           // 165: space.sandbox.manager.v1.ExportSnapshotHeader
-	(*ExportSnapshotFileChunk)(nil),                        // 166: space.sandbox.manager.v1.ExportSnapshotFileChunk
-	(*ImportSnapshotRequest)(nil),                          // 167: space.sandbox.manager.v1.ImportSnapshotRequest
-	(*ImportSnapshotHeader)(nil),                           // 168: space.sandbox.manager.v1.ImportSnapshotHeader
-	(*ImportSnapshotFileChunk)(nil),                        // 169: space.sandbox.manager.v1.ImportSnapshotFileChunk
-	(*ImportSnapshotResponse)(nil),                         // 170: space.sandbox.manager.v1.ImportSnapshotResponse
-	(*ExportSandboxRequest)(nil),                           // 171: space.sandbox.manager.v1.ExportSandboxRequest
-	(*ExportSandboxChunk)(nil),                             // 172: space.sandbox.manager.v1.ExportSandboxChunk
-	(*ExportSandboxHeader)(nil),                            // 173: space.sandbox.manager.v1.ExportSandboxHeader
-	(*ExportSandboxFileChunk)(nil),                         // 174: space.sandbox.manager.v1.ExportSandboxFileChunk
-	(*ImportSandboxRequest)(nil),                           // 175: space.sandbox.manager.v1.ImportSandboxRequest
-	(*ImportSandboxHeader)(nil),                            // 176: space.sandbox.manager.v1.ImportSandboxHeader
-	(*ImportSandboxFileChunk)(nil),                         // 177: space.sandbox.manager.v1.ImportSandboxFileChunk
-	(*ImportSandboxResponse)(nil),                          // 178: space.sandbox.manager.v1.ImportSandboxResponse
-	(*SpacedOpenLoopbackBridgeRequest)(nil),                // 179: space.sandbox.manager.v1.SpacedOpenLoopbackBridgeRequest
-	(*SpacedCloseLoopbackBridgeRequest)(nil),               // 180: space.sandbox.manager.v1.SpacedCloseLoopbackBridgeRequest
-	(*ResolveSandboxMemoryRequest)(nil),                    // 181: space.sandbox.manager.v1.ResolveSandboxMemoryRequest
-	(*ResolveSandboxMemoryResponse)(nil),                   // 182: space.sandbox.manager.v1.ResolveSandboxMemoryResponse
-	(*NetworkPolicyDetail)(nil),                            // 183: space.sandbox.manager.v1.NetworkPolicyDetail
-	(*PrepareTeardownSuspendRequest)(nil),                  // 184: space.sandbox.manager.v1.PrepareTeardownSuspendRequest
-	(*PrepareTeardownSuspendResponse)(nil),                 // 185: space.sandbox.manager.v1.PrepareTeardownSuspendResponse
-	(*RestoreArtifactAsNewContext)(nil),                    // 186: space.sandbox.manager.v1.RestoreArtifactAsNewContext
-	(*AutoLifecycleDeleteReceipt)(nil),                     // 187: space.sandbox.manager.v1.AutoLifecycleDeleteReceipt
-	(*ListAutoLifecycleDeleteReceiptsRequest)(nil),         // 188: space.sandbox.manager.v1.ListAutoLifecycleDeleteReceiptsRequest
-	(*ListAutoLifecycleDeleteReceiptsResponse)(nil),        // 189: space.sandbox.manager.v1.ListAutoLifecycleDeleteReceiptsResponse
-	(*AcknowledgeAutoLifecycleDeleteReceiptsRequest)(nil),  // 190: space.sandbox.manager.v1.AcknowledgeAutoLifecycleDeleteReceiptsRequest
-	(*AcknowledgeAutoLifecycleDeleteReceiptsResponse)(nil), // 191: space.sandbox.manager.v1.AcknowledgeAutoLifecycleDeleteReceiptsResponse
-	(*PendingLocalBackup)(nil),                             // 192: space.sandbox.manager.v1.PendingLocalBackup
-	(*ListPendingLocalBackupsRequest)(nil),                 // 193: space.sandbox.manager.v1.ListPendingLocalBackupsRequest
-	(*ListPendingLocalBackupsResponse)(nil),                // 194: space.sandbox.manager.v1.ListPendingLocalBackupsResponse
-	(*QuarantineRecoveryObservation)(nil),                  // 195: space.sandbox.manager.v1.QuarantineRecoveryObservation
-	(*WaitTemplateAppsRequest)(nil),                        // 196: space.sandbox.manager.v1.WaitTemplateAppsRequest
-	(*WaitTemplateAppsResponse)(nil),                       // 197: space.sandbox.manager.v1.WaitTemplateAppsResponse
-	(*GetExecutionCapabilitiesRequest)(nil),                // 198: space.sandbox.manager.v1.GetExecutionCapabilitiesRequest
-	(*GetExecutionCapabilitiesResponse)(nil),               // 199: space.sandbox.manager.v1.GetExecutionCapabilitiesResponse
-	(*EnvironmentCreateInput)(nil),                         // 200: space.sandbox.manager.v1.EnvironmentCreateInput
-	nil,                                                    // 201: space.sandbox.manager.v1.CreateRequest.EnvEntry
-	nil,                                                    // 202: space.sandbox.manager.v1.GetEnvResponse.EnvEntry
-	nil,                                                    // 203: space.sandbox.manager.v1.GetDiskUsageResponse.UsageBytesEntry
-	nil,                                                    // 204: space.sandbox.manager.v1.UpdateRequest.ProcessEnvEntry
-	nil,                                                    // 205: space.sandbox.manager.v1.AdoptPoolSandboxRequest.EnvEntry
-	nil,                                                    // 206: space.sandbox.manager.v1.ExportSandboxHeader.EnvEntry
-	nil,                                                    // 207: space.sandbox.manager.v1.ImportSandboxHeader.EnvEntry
-	(*durationpb.Duration)(nil),                            // 208: google.protobuf.Duration
-	(*timestamppb.Timestamp)(nil),                          // 209: google.protobuf.Timestamp
-	(*v1.NetworkPolicyV1)(nil),                             // 210: space.net.policy.v1.NetworkPolicyV1
-	(v1.PolicyAuthority)(0),                                // 211: space.net.policy.v1.PolicyAuthority
-	(*v11.SpaceApiRouteIdentity)(nil),                      // 212: space.net.gateway.v1.SpaceApiRouteIdentity
-	(v1.NetworkPolicySource)(0),                            // 213: space.net.policy.v1.NetworkPolicySource
-	(*v12.ExecutionMetadata)(nil),                          // 214: space.execution.v1.ExecutionMetadata
-	(v11.SandboxSubstrateKind)(0),                          // 215: space.net.gateway.v1.SandboxSubstrateKind
-	(*v13.StatRequest)(nil),                                // 216: space.spaced.operations.v1.StatRequest
-	(*v13.ListRequest)(nil),                                // 217: space.spaced.operations.v1.ListRequest
-	(*v13.ReadRequest)(nil),                                // 218: space.spaced.operations.v1.ReadRequest
-	(*v13.WriteRequest)(nil),                               // 219: space.spaced.operations.v1.WriteRequest
-	(*v13.WriteBatchRequest)(nil),                          // 220: space.spaced.operations.v1.WriteBatchRequest
-	(*v13.MkdirRequest)(nil),                               // 221: space.spaced.operations.v1.MkdirRequest
-	(*v13.RemoveRequest)(nil),                              // 222: space.spaced.operations.v1.RemoveRequest
-	(*v13.RenameRequest)(nil),                              // 223: space.spaced.operations.v1.RenameRequest
-	(*v13.NormalizeWatchRootRequest)(nil),                  // 224: space.spaced.operations.v1.NormalizeWatchRootRequest
-	(*v13.WatchRequest)(nil),                               // 225: space.spaced.operations.v1.WatchRequest
-	(*v13.CreateWatcherRequest)(nil),                       // 226: space.spaced.operations.v1.CreateWatcherRequest
-	(*v13.GetWatcherEventsRequest)(nil),                    // 227: space.spaced.operations.v1.GetWatcherEventsRequest
-	(*v13.RemoveWatcherRequest)(nil),                       // 228: space.spaced.operations.v1.RemoveWatcherRequest
-	(*v13.EnableFileChangesRequest)(nil),                   // 229: space.spaced.operations.v1.EnableFileChangesRequest
-	(*v13.DisableFileChangesRequest)(nil),                  // 230: space.spaced.operations.v1.DisableFileChangesRequest
-	(*v13.GetModifiedFilesRequest)(nil),                    // 231: space.spaced.operations.v1.GetModifiedFilesRequest
-	(*v13.StartRequest)(nil),                               // 232: space.spaced.operations.v1.StartRequest
-	(*v13.ConnectProcessRequest)(nil),                      // 233: space.spaced.operations.v1.ConnectProcessRequest
-	(*v13.ListProcessesRequest)(nil),                       // 234: space.spaced.operations.v1.ListProcessesRequest
-	(*v13.ProcessInfo)(nil),                                // 235: space.spaced.operations.v1.ProcessInfo
-	(*v13.SendSignalRequest)(nil),                          // 236: space.spaced.operations.v1.SendSignalRequest
-	(*v13.SendInputRequest)(nil),                           // 237: space.spaced.operations.v1.SendInputRequest
-	(*v13.CloseStdinRequest)(nil),                          // 238: space.spaced.operations.v1.CloseStdinRequest
-	(*v13.ResizePtyRequest)(nil),                           // 239: space.spaced.operations.v1.ResizePtyRequest
-	(*v13.KillRequest)(nil),                                // 240: space.spaced.operations.v1.KillRequest
-	(v1.NetworkPolicyApplyDecision)(0),                     // 241: space.net.policy.v1.NetworkPolicyApplyDecision
-	(*v13.OpenLoopbackBridgeRequest)(nil),                  // 242: space.spaced.operations.v1.OpenLoopbackBridgeRequest
-	(*v13.CloseLoopbackBridgeRequest)(nil),                 // 243: space.spaced.operations.v1.CloseLoopbackBridgeRequest
-	(*v11.ServicePortIngressFrame)(nil),                    // 244: space.net.gateway.v1.ServicePortIngressFrame
-	(*v13.StatResponse)(nil),                               // 245: space.spaced.operations.v1.StatResponse
-	(*v13.FileInfo)(nil),                                   // 246: space.spaced.operations.v1.FileInfo
-	(*v13.FileChunk)(nil),                                  // 247: space.spaced.operations.v1.FileChunk
-	(*v13.WriteResponse)(nil),                              // 248: space.spaced.operations.v1.WriteResponse
-	(*v13.WriteBatchResponse)(nil),                         // 249: space.spaced.operations.v1.WriteBatchResponse
-	(*v13.MkdirResponse)(nil),                              // 250: space.spaced.operations.v1.MkdirResponse
-	(*v13.RemoveResponse)(nil),                             // 251: space.spaced.operations.v1.RemoveResponse
-	(*v13.RenameResponse)(nil),                             // 252: space.spaced.operations.v1.RenameResponse
-	(*v13.NormalizeWatchRootResponse)(nil),                 // 253: space.spaced.operations.v1.NormalizeWatchRootResponse
-	(*v13.FileEvent)(nil),                                  // 254: space.spaced.operations.v1.FileEvent
-	(*v13.CreateWatcherResponse)(nil),                      // 255: space.spaced.operations.v1.CreateWatcherResponse
-	(*v13.GetWatcherEventsResponse)(nil),                   // 256: space.spaced.operations.v1.GetWatcherEventsResponse
-	(*v13.RemoveWatcherResponse)(nil),                      // 257: space.spaced.operations.v1.RemoveWatcherResponse
-	(*v13.EnableFileChangesResponse)(nil),                  // 258: space.spaced.operations.v1.EnableFileChangesResponse
-	(*v13.DisableFileChangesResponse)(nil),                 // 259: space.spaced.operations.v1.DisableFileChangesResponse
-	(*v13.GetModifiedFilesResponse)(nil),                   // 260: space.spaced.operations.v1.GetModifiedFilesResponse
-	(*v13.ProcessEvent)(nil),                               // 261: space.spaced.operations.v1.ProcessEvent
-	(*v13.SendSignalResponse)(nil),                         // 262: space.spaced.operations.v1.SendSignalResponse
-	(*v13.SendInputResponse)(nil),                          // 263: space.spaced.operations.v1.SendInputResponse
-	(*v13.CloseStdinResponse)(nil),                         // 264: space.spaced.operations.v1.CloseStdinResponse
-	(*v13.ResizePtyResponse)(nil),                          // 265: space.spaced.operations.v1.ResizePtyResponse
-	(*v13.KillResponse)(nil),                               // 266: space.spaced.operations.v1.KillResponse
-	(*v13.OpenLoopbackBridgeResponse)(nil),                 // 267: space.spaced.operations.v1.OpenLoopbackBridgeResponse
-	(*v13.CloseLoopbackBridgeResponse)(nil),                // 268: space.spaced.operations.v1.CloseLoopbackBridgeResponse
+	(SandboxStopCause)(0),                                  // 9: space.sandbox.manager.v1.SandboxStopCause
+	(SandboxLifecycleState)(0),                             // 10: space.sandbox.manager.v1.SandboxLifecycleState
+	(SandboxCleanupCompletion)(0),                          // 11: space.sandbox.manager.v1.SandboxCleanupCompletion
+	(SandboxHealthStatus)(0),                               // 12: space.sandbox.manager.v1.SandboxHealthStatus
+	(SandboxHealthComponent)(0),                            // 13: space.sandbox.manager.v1.SandboxHealthComponent
+	(SandboxHealthProbeOutcome)(0),                         // 14: space.sandbox.manager.v1.SandboxHealthProbeOutcome
+	(MissingDiskUsageReason)(0),                            // 15: space.sandbox.manager.v1.MissingDiskUsageReason
+	(WakeTargetState)(0),                                   // 16: space.sandbox.manager.v1.WakeTargetState
+	(SnapshotType)(0),                                      // 17: space.sandbox.manager.v1.SnapshotType
+	(SnapshotSourceLifecycle)(0),                           // 18: space.sandbox.manager.v1.SnapshotSourceLifecycle
+	(SuspendSnapshotFormat)(0),                             // 19: space.sandbox.manager.v1.SuspendSnapshotFormat
+	(ArtifactKind)(0),                                      // 20: space.sandbox.manager.v1.ArtifactKind
+	(ArtifactOrigin)(0),                                    // 21: space.sandbox.manager.v1.ArtifactOrigin
+	(RuntimeUpgradeOutcome)(0),                             // 22: space.sandbox.manager.v1.RuntimeUpgradeOutcome
+	(TeardownSuspendAction)(0),                             // 23: space.sandbox.manager.v1.TeardownSuspendAction
+	(TeardownSuspendOutcome)(0),                            // 24: space.sandbox.manager.v1.TeardownSuspendOutcome
+	(QuarantineRecoveryObservedOwner)(0),                   // 25: space.sandbox.manager.v1.QuarantineRecoveryObservedOwner
+	(*AutoLifecycleWakePolicy)(nil),                        // 26: space.sandbox.manager.v1.AutoLifecycleWakePolicy
+	(*AutoLifecycleConditionSet)(nil),                      // 27: space.sandbox.manager.v1.AutoLifecycleConditionSet
+	(*AutoLifecycleStage)(nil),                             // 28: space.sandbox.manager.v1.AutoLifecycleStage
+	(*AutoLifecyclePolicy)(nil),                            // 29: space.sandbox.manager.v1.AutoLifecyclePolicy
+	(*AutoLifecycleConditionStatus)(nil),                   // 30: space.sandbox.manager.v1.AutoLifecycleConditionStatus
+	(*AutoLifecycleStatus)(nil),                            // 31: space.sandbox.manager.v1.AutoLifecycleStatus
+	(*CreateRequest)(nil),                                  // 32: space.sandbox.manager.v1.CreateRequest
+	(*CreateResponse)(nil),                                 // 33: space.sandbox.manager.v1.CreateResponse
+	(*StartRequest)(nil),                                   // 34: space.sandbox.manager.v1.StartRequest
+	(*StartResponse)(nil),                                  // 35: space.sandbox.manager.v1.StartResponse
+	(*StopRequest)(nil),                                    // 36: space.sandbox.manager.v1.StopRequest
+	(*StopResponse)(nil),                                   // 37: space.sandbox.manager.v1.StopResponse
+	(*KillRequest)(nil),                                    // 38: space.sandbox.manager.v1.KillRequest
+	(*KillResponse)(nil),                                   // 39: space.sandbox.manager.v1.KillResponse
+	(*DeleteRequest)(nil),                                  // 40: space.sandbox.manager.v1.DeleteRequest
+	(*DeleteResponse)(nil),                                 // 41: space.sandbox.manager.v1.DeleteResponse
+	(*StateRequest)(nil),                                   // 42: space.sandbox.manager.v1.StateRequest
+	(*StateResponse)(nil),                                  // 43: space.sandbox.manager.v1.StateResponse
+	(*GetEnvRequest)(nil),                                  // 44: space.sandbox.manager.v1.GetEnvRequest
+	(*GetEnvResponse)(nil),                                 // 45: space.sandbox.manager.v1.GetEnvResponse
+	(*ListRequest)(nil),                                    // 46: space.sandbox.manager.v1.ListRequest
+	(*ScanCleanupTargetsRequest)(nil),                      // 47: space.sandbox.manager.v1.ScanCleanupTargetsRequest
+	(*CleanupTargetObservation)(nil),                       // 48: space.sandbox.manager.v1.CleanupTargetObservation
+	(*CleanupTargetBatch)(nil),                             // 49: space.sandbox.manager.v1.CleanupTargetBatch
+	(*SandboxInfo)(nil),                                    // 50: space.sandbox.manager.v1.SandboxInfo
+	(*SandboxCleanup)(nil),                                 // 51: space.sandbox.manager.v1.SandboxCleanup
+	(*SandboxHealthObservation)(nil),                       // 52: space.sandbox.manager.v1.SandboxHealthObservation
+	(*SandboxComponentHealth)(nil),                         // 53: space.sandbox.manager.v1.SandboxComponentHealth
+	(*GetSandboxHealthRequest)(nil),                        // 54: space.sandbox.manager.v1.GetSandboxHealthRequest
+	(*GetSandboxHealthResponse)(nil),                       // 55: space.sandbox.manager.v1.GetSandboxHealthResponse
+	(*TransitionReceipt)(nil),                              // 56: space.sandbox.manager.v1.TransitionReceipt
+	(*SandboxListElement)(nil),                             // 57: space.sandbox.manager.v1.SandboxListElement
+	(*ListResponse)(nil),                                   // 58: space.sandbox.manager.v1.ListResponse
+	(*ListBuildReferencingSandboxesRequest)(nil),           // 59: space.sandbox.manager.v1.ListBuildReferencingSandboxesRequest
+	(*ListBuildReferencingSandboxesResponse)(nil),          // 60: space.sandbox.manager.v1.ListBuildReferencingSandboxesResponse
+	(*GetDiskUsageRequest)(nil),                            // 61: space.sandbox.manager.v1.GetDiskUsageRequest
+	(*MissingDiskUsageId)(nil),                             // 62: space.sandbox.manager.v1.MissingDiskUsageId
+	(*GetDiskUsageResponse)(nil),                           // 63: space.sandbox.manager.v1.GetDiskUsageResponse
+	(*CleanupRequest)(nil),                                 // 64: space.sandbox.manager.v1.CleanupRequest
+	(*CleanupResponse)(nil),                                // 65: space.sandbox.manager.v1.CleanupResponse
+	(*ListTemplatesRequest)(nil),                           // 66: space.sandbox.manager.v1.ListTemplatesRequest
+	(*TemplateInfo)(nil),                                   // 67: space.sandbox.manager.v1.TemplateInfo
+	(*ListTemplatesResponse)(nil),                          // 68: space.sandbox.manager.v1.ListTemplatesResponse
+	(*PauseRequest)(nil),                                   // 69: space.sandbox.manager.v1.PauseRequest
+	(*PauseResponse)(nil),                                  // 70: space.sandbox.manager.v1.PauseResponse
+	(*ResumeRequest)(nil),                                  // 71: space.sandbox.manager.v1.ResumeRequest
+	(*ResumeResponse)(nil),                                 // 72: space.sandbox.manager.v1.ResumeResponse
+	(*WakeRequest)(nil),                                    // 73: space.sandbox.manager.v1.WakeRequest
+	(*WakeRuntimeUpgrade)(nil),                             // 74: space.sandbox.manager.v1.WakeRuntimeUpgrade
+	(*WakeStartContext)(nil),                               // 75: space.sandbox.manager.v1.WakeStartContext
+	(*WakeResponse)(nil),                                   // 76: space.sandbox.manager.v1.WakeResponse
+	(*CreateSnapshotRequest)(nil),                          // 77: space.sandbox.manager.v1.CreateSnapshotRequest
+	(*CreateSnapshotResponse)(nil),                         // 78: space.sandbox.manager.v1.CreateSnapshotResponse
+	(*SnapshotCreationIdentity)(nil),                       // 79: space.sandbox.manager.v1.SnapshotCreationIdentity
+	(*CurrentSandboxSnapshotSource)(nil),                   // 80: space.sandbox.manager.v1.CurrentSandboxSnapshotSource
+	(*CreateSnapshotSource)(nil),                           // 81: space.sandbox.manager.v1.CreateSnapshotSource
+	(*DurableArtifactSnapshotSource)(nil),                  // 82: space.sandbox.manager.v1.DurableArtifactSnapshotSource
+	(*PublishedDurableArtifact)(nil),                       // 83: space.sandbox.manager.v1.PublishedDurableArtifact
+	(*CreateTemplateBaseSnapshotRequest)(nil),              // 84: space.sandbox.manager.v1.CreateTemplateBaseSnapshotRequest
+	(*CreateTemplateBaseSnapshotResponse)(nil),             // 85: space.sandbox.manager.v1.CreateTemplateBaseSnapshotResponse
+	(*SuspendRequest)(nil),                                 // 86: space.sandbox.manager.v1.SuspendRequest
+	(*PublishedArtifact)(nil),                              // 87: space.sandbox.manager.v1.PublishedArtifact
+	(*SuspendResponse)(nil),                                // 88: space.sandbox.manager.v1.SuspendResponse
+	(*CurrentInstanceSource)(nil),                          // 89: space.sandbox.manager.v1.CurrentInstanceSource
+	(*EnqueueArtifactBackupRequest)(nil),                   // 90: space.sandbox.manager.v1.EnqueueArtifactBackupRequest
+	(*EnqueueArtifactBackupResponse)(nil),                  // 91: space.sandbox.manager.v1.EnqueueArtifactBackupResponse
+	(*EvictClusterDeletedSandboxRequest)(nil),              // 92: space.sandbox.manager.v1.EvictClusterDeletedSandboxRequest
+	(*EvictClusterDeletedSandboxResponse)(nil),             // 93: space.sandbox.manager.v1.EvictClusterDeletedSandboxResponse
+	(*RuntimeUpgradeAuthorization)(nil),                    // 94: space.sandbox.manager.v1.RuntimeUpgradeAuthorization
+	(*UpgradeRuntimeRequest)(nil),                          // 95: space.sandbox.manager.v1.UpgradeRuntimeRequest
+	(*UpgradeRuntimeResponse)(nil),                         // 96: space.sandbox.manager.v1.UpgradeRuntimeResponse
+	(*EnableSnapshotsRequest)(nil),                         // 97: space.sandbox.manager.v1.EnableSnapshotsRequest
+	(*EnableSnapshotsResponse)(nil),                        // 98: space.sandbox.manager.v1.EnableSnapshotsResponse
+	(*DisableSnapshotsRequest)(nil),                        // 99: space.sandbox.manager.v1.DisableSnapshotsRequest
+	(*DisableSnapshotsResponse)(nil),                       // 100: space.sandbox.manager.v1.DisableSnapshotsResponse
+	(*ListSnapshotsRequest)(nil),                           // 101: space.sandbox.manager.v1.ListSnapshotsRequest
+	(*ListSnapshotsResponse)(nil),                          // 102: space.sandbox.manager.v1.ListSnapshotsResponse
+	(*SnapshotDetail)(nil),                                 // 103: space.sandbox.manager.v1.SnapshotDetail
+	(*SnapshotLocation)(nil),                               // 104: space.sandbox.manager.v1.SnapshotLocation
+	(*DeleteSnapshotsRequest)(nil),                         // 105: space.sandbox.manager.v1.DeleteSnapshotsRequest
+	(*DeleteSnapshotsResponse)(nil),                        // 106: space.sandbox.manager.v1.DeleteSnapshotsResponse
+	(*RollbackRequest)(nil),                                // 107: space.sandbox.manager.v1.RollbackRequest
+	(*RollbackResponse)(nil),                               // 108: space.sandbox.manager.v1.RollbackResponse
+	(*StatsRequest)(nil),                                   // 109: space.sandbox.manager.v1.StatsRequest
+	(*StatsResponse)(nil),                                  // 110: space.sandbox.manager.v1.StatsResponse
+	(*UpdateRequest)(nil),                                  // 111: space.sandbox.manager.v1.UpdateRequest
+	(*UpdateResponse)(nil),                                 // 112: space.sandbox.manager.v1.UpdateResponse
+	(*SpacedPingGuestRequest)(nil),                         // 113: space.sandbox.manager.v1.SpacedPingGuestRequest
+	(*SpacedPingGuestResponse)(nil),                        // 114: space.sandbox.manager.v1.SpacedPingGuestResponse
+	(*SpacedGetStatusRequest)(nil),                         // 115: space.sandbox.manager.v1.SpacedGetStatusRequest
+	(*SpacedGetStatusResponse)(nil),                        // 116: space.sandbox.manager.v1.SpacedGetStatusResponse
+	(*SpacedVersionInfo)(nil),                              // 117: space.sandbox.manager.v1.SpacedVersionInfo
+	(*SpacedWaitReadyRequest)(nil),                         // 118: space.sandbox.manager.v1.SpacedWaitReadyRequest
+	(*SpacedWaitReadyResponse)(nil),                        // 119: space.sandbox.manager.v1.SpacedWaitReadyResponse
+	(*SpacedStatRequest)(nil),                              // 120: space.sandbox.manager.v1.SpacedStatRequest
+	(*SpacedListRequest)(nil),                              // 121: space.sandbox.manager.v1.SpacedListRequest
+	(*SpacedReadRequest)(nil),                              // 122: space.sandbox.manager.v1.SpacedReadRequest
+	(*SpacedWriteRequest)(nil),                             // 123: space.sandbox.manager.v1.SpacedWriteRequest
+	(*SpacedWriteBatchRequest)(nil),                        // 124: space.sandbox.manager.v1.SpacedWriteBatchRequest
+	(*SpacedMkdirRequest)(nil),                             // 125: space.sandbox.manager.v1.SpacedMkdirRequest
+	(*SpacedRemoveRequest)(nil),                            // 126: space.sandbox.manager.v1.SpacedRemoveRequest
+	(*SpacedRenameRequest)(nil),                            // 127: space.sandbox.manager.v1.SpacedRenameRequest
+	(*SpacedNormalizeWatchRootRequest)(nil),                // 128: space.sandbox.manager.v1.SpacedNormalizeWatchRootRequest
+	(*SpacedWatchRequest)(nil),                             // 129: space.sandbox.manager.v1.SpacedWatchRequest
+	(*SpacedCreateWatcherRequest)(nil),                     // 130: space.sandbox.manager.v1.SpacedCreateWatcherRequest
+	(*SpacedGetWatcherEventsRequest)(nil),                  // 131: space.sandbox.manager.v1.SpacedGetWatcherEventsRequest
+	(*SpacedRemoveWatcherRequest)(nil),                     // 132: space.sandbox.manager.v1.SpacedRemoveWatcherRequest
+	(*SpacedEnableFileChangesRequest)(nil),                 // 133: space.sandbox.manager.v1.SpacedEnableFileChangesRequest
+	(*SpacedDisableFileChangesRequest)(nil),                // 134: space.sandbox.manager.v1.SpacedDisableFileChangesRequest
+	(*SpacedGetModifiedFilesRequest)(nil),                  // 135: space.sandbox.manager.v1.SpacedGetModifiedFilesRequest
+	(*SpacedStartProcessRequest)(nil),                      // 136: space.sandbox.manager.v1.SpacedStartProcessRequest
+	(*SpacedConnectProcessRequest)(nil),                    // 137: space.sandbox.manager.v1.SpacedConnectProcessRequest
+	(*SpacedListProcessesRequest)(nil),                     // 138: space.sandbox.manager.v1.SpacedListProcessesRequest
+	(*SpacedListProcessesResponse)(nil),                    // 139: space.sandbox.manager.v1.SpacedListProcessesResponse
+	(*SpacedSendSignalRequest)(nil),                        // 140: space.sandbox.manager.v1.SpacedSendSignalRequest
+	(*SpacedSendInputRequest)(nil),                         // 141: space.sandbox.manager.v1.SpacedSendInputRequest
+	(*SpacedCloseStdinRequest)(nil),                        // 142: space.sandbox.manager.v1.SpacedCloseStdinRequest
+	(*SpacedResizePtyRequest)(nil),                         // 143: space.sandbox.manager.v1.SpacedResizePtyRequest
+	(*SpacedKillProcessRequest)(nil),                       // 144: space.sandbox.manager.v1.SpacedKillProcessRequest
+	(*SetAutoLifecyclePolicyRequest)(nil),                  // 145: space.sandbox.manager.v1.SetAutoLifecyclePolicyRequest
+	(*SetAutoLifecyclePolicyResponse)(nil),                 // 146: space.sandbox.manager.v1.SetAutoLifecyclePolicyResponse
+	(*TouchAutoLifecycleRequest)(nil),                      // 147: space.sandbox.manager.v1.TouchAutoLifecycleRequest
+	(*AccessIdleUpdate)(nil),                               // 148: space.sandbox.manager.v1.AccessIdleUpdate
+	(*TouchAutoLifecycleResponse)(nil),                     // 149: space.sandbox.manager.v1.TouchAutoLifecycleResponse
+	(*GetNetworkPolicyRequest)(nil),                        // 150: space.sandbox.manager.v1.GetNetworkPolicyRequest
+	(*GetNetworkPolicyResponse)(nil),                       // 151: space.sandbox.manager.v1.GetNetworkPolicyResponse
+	(*SetNetworkPolicyRequest)(nil),                        // 152: space.sandbox.manager.v1.SetNetworkPolicyRequest
+	(*SetNetworkPolicyResponse)(nil),                       // 153: space.sandbox.manager.v1.SetNetworkPolicyResponse
+	(*TemplateNetworkPolicyUpdatedRequest)(nil),            // 154: space.sandbox.manager.v1.TemplateNetworkPolicyUpdatedRequest
+	(*TemplateNetworkPolicyUpdatedResponse)(nil),           // 155: space.sandbox.manager.v1.TemplateNetworkPolicyUpdatedResponse
+	(*CycleNetGatewayRequest)(nil),                         // 156: space.sandbox.manager.v1.CycleNetGatewayRequest
+	(*CycleNetGatewayResponse)(nil),                        // 157: space.sandbox.manager.v1.CycleNetGatewayResponse
+	(*AdoptPoolSandboxRequest)(nil),                        // 158: space.sandbox.manager.v1.AdoptPoolSandboxRequest
+	(*AdoptPoolSandboxResponse)(nil),                       // 159: space.sandbox.manager.v1.AdoptPoolSandboxResponse
+	(*WaitRequest)(nil),                                    // 160: space.sandbox.manager.v1.WaitRequest
+	(*WaitResponse)(nil),                                   // 161: space.sandbox.manager.v1.WaitResponse
+	(*CloneFromDonorRequest)(nil),                          // 162: space.sandbox.manager.v1.CloneFromDonorRequest
+	(*CloneFromDonorResponse)(nil),                         // 163: space.sandbox.manager.v1.CloneFromDonorResponse
+	(*ExportSnapshotRequest)(nil),                          // 164: space.sandbox.manager.v1.ExportSnapshotRequest
+	(*ExportSnapshotChunk)(nil),                            // 165: space.sandbox.manager.v1.ExportSnapshotChunk
+	(*ExportSnapshotHeader)(nil),                           // 166: space.sandbox.manager.v1.ExportSnapshotHeader
+	(*ExportSnapshotFileChunk)(nil),                        // 167: space.sandbox.manager.v1.ExportSnapshotFileChunk
+	(*ImportSnapshotRequest)(nil),                          // 168: space.sandbox.manager.v1.ImportSnapshotRequest
+	(*ImportSnapshotHeader)(nil),                           // 169: space.sandbox.manager.v1.ImportSnapshotHeader
+	(*ImportSnapshotFileChunk)(nil),                        // 170: space.sandbox.manager.v1.ImportSnapshotFileChunk
+	(*ImportSnapshotResponse)(nil),                         // 171: space.sandbox.manager.v1.ImportSnapshotResponse
+	(*ExportSandboxRequest)(nil),                           // 172: space.sandbox.manager.v1.ExportSandboxRequest
+	(*ExportSandboxChunk)(nil),                             // 173: space.sandbox.manager.v1.ExportSandboxChunk
+	(*ExportSandboxHeader)(nil),                            // 174: space.sandbox.manager.v1.ExportSandboxHeader
+	(*ExportSandboxFileChunk)(nil),                         // 175: space.sandbox.manager.v1.ExportSandboxFileChunk
+	(*ImportSandboxRequest)(nil),                           // 176: space.sandbox.manager.v1.ImportSandboxRequest
+	(*ImportSandboxHeader)(nil),                            // 177: space.sandbox.manager.v1.ImportSandboxHeader
+	(*ImportSandboxFileChunk)(nil),                         // 178: space.sandbox.manager.v1.ImportSandboxFileChunk
+	(*ImportSandboxResponse)(nil),                          // 179: space.sandbox.manager.v1.ImportSandboxResponse
+	(*SpacedOpenLoopbackBridgeRequest)(nil),                // 180: space.sandbox.manager.v1.SpacedOpenLoopbackBridgeRequest
+	(*SpacedCloseLoopbackBridgeRequest)(nil),               // 181: space.sandbox.manager.v1.SpacedCloseLoopbackBridgeRequest
+	(*ResolveSandboxMemoryRequest)(nil),                    // 182: space.sandbox.manager.v1.ResolveSandboxMemoryRequest
+	(*ResolveSandboxMemoryResponse)(nil),                   // 183: space.sandbox.manager.v1.ResolveSandboxMemoryResponse
+	(*NetworkPolicyDetail)(nil),                            // 184: space.sandbox.manager.v1.NetworkPolicyDetail
+	(*PrepareTeardownSuspendRequest)(nil),                  // 185: space.sandbox.manager.v1.PrepareTeardownSuspendRequest
+	(*PrepareTeardownSuspendResponse)(nil),                 // 186: space.sandbox.manager.v1.PrepareTeardownSuspendResponse
+	(*RestoreArtifactAsNewContext)(nil),                    // 187: space.sandbox.manager.v1.RestoreArtifactAsNewContext
+	(*AutoLifecycleDeleteReceipt)(nil),                     // 188: space.sandbox.manager.v1.AutoLifecycleDeleteReceipt
+	(*ListAutoLifecycleDeleteReceiptsRequest)(nil),         // 189: space.sandbox.manager.v1.ListAutoLifecycleDeleteReceiptsRequest
+	(*ListAutoLifecycleDeleteReceiptsResponse)(nil),        // 190: space.sandbox.manager.v1.ListAutoLifecycleDeleteReceiptsResponse
+	(*AcknowledgeAutoLifecycleDeleteReceiptsRequest)(nil),  // 191: space.sandbox.manager.v1.AcknowledgeAutoLifecycleDeleteReceiptsRequest
+	(*AcknowledgeAutoLifecycleDeleteReceiptsResponse)(nil), // 192: space.sandbox.manager.v1.AcknowledgeAutoLifecycleDeleteReceiptsResponse
+	(*PendingLocalBackup)(nil),                             // 193: space.sandbox.manager.v1.PendingLocalBackup
+	(*ListPendingLocalBackupsRequest)(nil),                 // 194: space.sandbox.manager.v1.ListPendingLocalBackupsRequest
+	(*ListPendingLocalBackupsResponse)(nil),                // 195: space.sandbox.manager.v1.ListPendingLocalBackupsResponse
+	(*QuarantineRecoveryObservation)(nil),                  // 196: space.sandbox.manager.v1.QuarantineRecoveryObservation
+	(*WaitTemplateAppsRequest)(nil),                        // 197: space.sandbox.manager.v1.WaitTemplateAppsRequest
+	(*WaitTemplateAppsResponse)(nil),                       // 198: space.sandbox.manager.v1.WaitTemplateAppsResponse
+	(*GetExecutionCapabilitiesRequest)(nil),                // 199: space.sandbox.manager.v1.GetExecutionCapabilitiesRequest
+	(*GetExecutionCapabilitiesResponse)(nil),               // 200: space.sandbox.manager.v1.GetExecutionCapabilitiesResponse
+	(*EnvironmentCreateInput)(nil),                         // 201: space.sandbox.manager.v1.EnvironmentCreateInput
+	nil,                                                    // 202: space.sandbox.manager.v1.CreateRequest.EnvEntry
+	nil,                                                    // 203: space.sandbox.manager.v1.GetEnvResponse.EnvEntry
+	nil,                                                    // 204: space.sandbox.manager.v1.GetDiskUsageResponse.UsageBytesEntry
+	nil,                                                    // 205: space.sandbox.manager.v1.UpdateRequest.ProcessEnvEntry
+	nil,                                                    // 206: space.sandbox.manager.v1.AdoptPoolSandboxRequest.EnvEntry
+	nil,                                                    // 207: space.sandbox.manager.v1.ExportSandboxHeader.EnvEntry
+	nil,                                                    // 208: space.sandbox.manager.v1.ImportSandboxHeader.EnvEntry
+	(*durationpb.Duration)(nil),                            // 209: google.protobuf.Duration
+	(*timestamppb.Timestamp)(nil),                          // 210: google.protobuf.Timestamp
+	(*v1.NetworkPolicyV1)(nil),                             // 211: space.net.policy.v1.NetworkPolicyV1
+	(v1.PolicyAuthority)(0),                                // 212: space.net.policy.v1.PolicyAuthority
+	(*v11.SpaceApiRouteIdentity)(nil),                      // 213: space.net.gateway.v1.SpaceApiRouteIdentity
+	(v1.NetworkPolicySource)(0),                            // 214: space.net.policy.v1.NetworkPolicySource
+	(*v12.ExecutionMetadata)(nil),                          // 215: space.execution.v1.ExecutionMetadata
+	(v11.SandboxSubstrateKind)(0),                          // 216: space.net.gateway.v1.SandboxSubstrateKind
+	(*v13.StatRequest)(nil),                                // 217: space.spaced.operations.v1.StatRequest
+	(*v13.ListRequest)(nil),                                // 218: space.spaced.operations.v1.ListRequest
+	(*v13.ReadRequest)(nil),                                // 219: space.spaced.operations.v1.ReadRequest
+	(*v13.WriteRequest)(nil),                               // 220: space.spaced.operations.v1.WriteRequest
+	(*v13.WriteBatchRequest)(nil),                          // 221: space.spaced.operations.v1.WriteBatchRequest
+	(*v13.MkdirRequest)(nil),                               // 222: space.spaced.operations.v1.MkdirRequest
+	(*v13.RemoveRequest)(nil),                              // 223: space.spaced.operations.v1.RemoveRequest
+	(*v13.RenameRequest)(nil),                              // 224: space.spaced.operations.v1.RenameRequest
+	(*v13.NormalizeWatchRootRequest)(nil),                  // 225: space.spaced.operations.v1.NormalizeWatchRootRequest
+	(*v13.WatchRequest)(nil),                               // 226: space.spaced.operations.v1.WatchRequest
+	(*v13.CreateWatcherRequest)(nil),                       // 227: space.spaced.operations.v1.CreateWatcherRequest
+	(*v13.GetWatcherEventsRequest)(nil),                    // 228: space.spaced.operations.v1.GetWatcherEventsRequest
+	(*v13.RemoveWatcherRequest)(nil),                       // 229: space.spaced.operations.v1.RemoveWatcherRequest
+	(*v13.EnableFileChangesRequest)(nil),                   // 230: space.spaced.operations.v1.EnableFileChangesRequest
+	(*v13.DisableFileChangesRequest)(nil),                  // 231: space.spaced.operations.v1.DisableFileChangesRequest
+	(*v13.GetModifiedFilesRequest)(nil),                    // 232: space.spaced.operations.v1.GetModifiedFilesRequest
+	(*v13.StartRequest)(nil),                               // 233: space.spaced.operations.v1.StartRequest
+	(*v13.ConnectProcessRequest)(nil),                      // 234: space.spaced.operations.v1.ConnectProcessRequest
+	(*v13.ListProcessesRequest)(nil),                       // 235: space.spaced.operations.v1.ListProcessesRequest
+	(*v13.ProcessInfo)(nil),                                // 236: space.spaced.operations.v1.ProcessInfo
+	(*v13.SendSignalRequest)(nil),                          // 237: space.spaced.operations.v1.SendSignalRequest
+	(*v13.SendInputRequest)(nil),                           // 238: space.spaced.operations.v1.SendInputRequest
+	(*v13.CloseStdinRequest)(nil),                          // 239: space.spaced.operations.v1.CloseStdinRequest
+	(*v13.ResizePtyRequest)(nil),                           // 240: space.spaced.operations.v1.ResizePtyRequest
+	(*v13.KillRequest)(nil),                                // 241: space.spaced.operations.v1.KillRequest
+	(v1.NetworkPolicyApplyDecision)(0),                     // 242: space.net.policy.v1.NetworkPolicyApplyDecision
+	(*v13.OpenLoopbackBridgeRequest)(nil),                  // 243: space.spaced.operations.v1.OpenLoopbackBridgeRequest
+	(*v13.CloseLoopbackBridgeRequest)(nil),                 // 244: space.spaced.operations.v1.CloseLoopbackBridgeRequest
+	(*v11.ServicePortIngressFrame)(nil),                    // 245: space.net.gateway.v1.ServicePortIngressFrame
+	(*v13.StatResponse)(nil),                               // 246: space.spaced.operations.v1.StatResponse
+	(*v13.FileInfo)(nil),                                   // 247: space.spaced.operations.v1.FileInfo
+	(*v13.FileChunk)(nil),                                  // 248: space.spaced.operations.v1.FileChunk
+	(*v13.WriteResponse)(nil),                              // 249: space.spaced.operations.v1.WriteResponse
+	(*v13.WriteBatchResponse)(nil),                         // 250: space.spaced.operations.v1.WriteBatchResponse
+	(*v13.MkdirResponse)(nil),                              // 251: space.spaced.operations.v1.MkdirResponse
+	(*v13.RemoveResponse)(nil),                             // 252: space.spaced.operations.v1.RemoveResponse
+	(*v13.RenameResponse)(nil),                             // 253: space.spaced.operations.v1.RenameResponse
+	(*v13.NormalizeWatchRootResponse)(nil),                 // 254: space.spaced.operations.v1.NormalizeWatchRootResponse
+	(*v13.FileEvent)(nil),                                  // 255: space.spaced.operations.v1.FileEvent
+	(*v13.CreateWatcherResponse)(nil),                      // 256: space.spaced.operations.v1.CreateWatcherResponse
+	(*v13.GetWatcherEventsResponse)(nil),                   // 257: space.spaced.operations.v1.GetWatcherEventsResponse
+	(*v13.RemoveWatcherResponse)(nil),                      // 258: space.spaced.operations.v1.RemoveWatcherResponse
+	(*v13.EnableFileChangesResponse)(nil),                  // 259: space.spaced.operations.v1.EnableFileChangesResponse
+	(*v13.DisableFileChangesResponse)(nil),                 // 260: space.spaced.operations.v1.DisableFileChangesResponse
+	(*v13.GetModifiedFilesResponse)(nil),                   // 261: space.spaced.operations.v1.GetModifiedFilesResponse
+	(*v13.ProcessEvent)(nil),                               // 262: space.spaced.operations.v1.ProcessEvent
+	(*v13.SendSignalResponse)(nil),                         // 263: space.spaced.operations.v1.SendSignalResponse
+	(*v13.SendInputResponse)(nil),                          // 264: space.spaced.operations.v1.SendInputResponse
+	(*v13.CloseStdinResponse)(nil),                         // 265: space.spaced.operations.v1.CloseStdinResponse
+	(*v13.ResizePtyResponse)(nil),                          // 266: space.spaced.operations.v1.ResizePtyResponse
+	(*v13.KillResponse)(nil),                               // 267: space.spaced.operations.v1.KillResponse
+	(*v13.OpenLoopbackBridgeResponse)(nil),                 // 268: space.spaced.operations.v1.OpenLoopbackBridgeResponse
+	(*v13.CloseLoopbackBridgeResponse)(nil),                // 269: space.spaced.operations.v1.CloseLoopbackBridgeResponse
 }
 var file_sandbox_manager_v1_manager_proto_depIdxs = []int32{
 	2,   // 0: space.sandbox.manager.v1.AutoLifecycleWakePolicy.on:type_name -> space.sandbox.manager.v1.AutoLifecycleWakeSource
 	6,   // 1: space.sandbox.manager.v1.AutoLifecycleConditionSet.id:type_name -> space.sandbox.manager.v1.AutoLifecycleConditionSetId
 	3,   // 2: space.sandbox.manager.v1.AutoLifecycleConditionSet.kind:type_name -> space.sandbox.manager.v1.AutoLifecycleConditionKind
 	4,   // 3: space.sandbox.manager.v1.AutoLifecycleConditionSet.activity_source:type_name -> space.sandbox.manager.v1.AutoLifecycleActivitySource
-	208, // 4: space.sandbox.manager.v1.AutoLifecycleConditionSet.max_guest_idle_extension:type_name -> google.protobuf.Duration
+	209, // 4: space.sandbox.manager.v1.AutoLifecycleConditionSet.max_guest_idle_extension:type_name -> google.protobuf.Duration
 	6,   // 5: space.sandbox.manager.v1.AutoLifecycleStage.condition_set:type_name -> space.sandbox.manager.v1.AutoLifecycleConditionSetId
-	208, // 6: space.sandbox.manager.v1.AutoLifecycleStage.at:type_name -> google.protobuf.Duration
+	209, // 6: space.sandbox.manager.v1.AutoLifecycleStage.at:type_name -> google.protobuf.Duration
 	1,   // 7: space.sandbox.manager.v1.AutoLifecycleStage.action:type_name -> space.sandbox.manager.v1.AutoLifecycleIdleAction
-	25,  // 8: space.sandbox.manager.v1.AutoLifecyclePolicy.wake:type_name -> space.sandbox.manager.v1.AutoLifecycleWakePolicy
-	26,  // 9: space.sandbox.manager.v1.AutoLifecyclePolicy.condition_sets:type_name -> space.sandbox.manager.v1.AutoLifecycleConditionSet
-	27,  // 10: space.sandbox.manager.v1.AutoLifecyclePolicy.stages:type_name -> space.sandbox.manager.v1.AutoLifecycleStage
+	26,  // 8: space.sandbox.manager.v1.AutoLifecyclePolicy.wake:type_name -> space.sandbox.manager.v1.AutoLifecycleWakePolicy
+	27,  // 9: space.sandbox.manager.v1.AutoLifecyclePolicy.condition_sets:type_name -> space.sandbox.manager.v1.AutoLifecycleConditionSet
+	28,  // 10: space.sandbox.manager.v1.AutoLifecyclePolicy.stages:type_name -> space.sandbox.manager.v1.AutoLifecycleStage
 	6,   // 11: space.sandbox.manager.v1.AutoLifecycleConditionStatus.condition_set:type_name -> space.sandbox.manager.v1.AutoLifecycleConditionSetId
-	209, // 12: space.sandbox.manager.v1.AutoLifecycleConditionStatus.epoch_at:type_name -> google.protobuf.Timestamp
-	209, // 13: space.sandbox.manager.v1.AutoLifecycleConditionStatus.last_touched_at:type_name -> google.protobuf.Timestamp
-	29,  // 14: space.sandbox.manager.v1.AutoLifecycleStatus.conditions:type_name -> space.sandbox.manager.v1.AutoLifecycleConditionStatus
-	209, // 15: space.sandbox.manager.v1.AutoLifecycleStatus.next_auto_event_at:type_name -> google.protobuf.Timestamp
+	210, // 12: space.sandbox.manager.v1.AutoLifecycleConditionStatus.epoch_at:type_name -> google.protobuf.Timestamp
+	210, // 13: space.sandbox.manager.v1.AutoLifecycleConditionStatus.last_touched_at:type_name -> google.protobuf.Timestamp
+	30,  // 14: space.sandbox.manager.v1.AutoLifecycleStatus.conditions:type_name -> space.sandbox.manager.v1.AutoLifecycleConditionStatus
+	210, // 15: space.sandbox.manager.v1.AutoLifecycleStatus.next_auto_event_at:type_name -> google.protobuf.Timestamp
 	7,   // 16: space.sandbox.manager.v1.AutoLifecycleStatus.last_auto_transition:type_name -> space.sandbox.manager.v1.AutoLifecycleTransition
-	209, // 17: space.sandbox.manager.v1.AutoLifecycleStatus.last_auto_transition_at:type_name -> google.protobuf.Timestamp
-	209, // 18: space.sandbox.manager.v1.AutoLifecycleStatus.last_access_at:type_name -> google.protobuf.Timestamp
-	209, // 19: space.sandbox.manager.v1.AutoLifecycleStatus.last_command_at:type_name -> google.protobuf.Timestamp
-	200, // 20: space.sandbox.manager.v1.CreateRequest.environment:type_name -> space.sandbox.manager.v1.EnvironmentCreateInput
+	210, // 17: space.sandbox.manager.v1.AutoLifecycleStatus.last_auto_transition_at:type_name -> google.protobuf.Timestamp
+	210, // 18: space.sandbox.manager.v1.AutoLifecycleStatus.last_access_at:type_name -> google.protobuf.Timestamp
+	210, // 19: space.sandbox.manager.v1.AutoLifecycleStatus.last_command_at:type_name -> google.protobuf.Timestamp
+	201, // 20: space.sandbox.manager.v1.CreateRequest.environment:type_name -> space.sandbox.manager.v1.EnvironmentCreateInput
 	0,   // 21: space.sandbox.manager.v1.CreateRequest.boot_mode:type_name -> space.sandbox.manager.v1.BootMode
-	201, // 22: space.sandbox.manager.v1.CreateRequest.env:type_name -> space.sandbox.manager.v1.CreateRequest.EnvEntry
-	28,  // 23: space.sandbox.manager.v1.CreateRequest.auto_lifecycle:type_name -> space.sandbox.manager.v1.AutoLifecyclePolicy
-	210, // 24: space.sandbox.manager.v1.CreateRequest.network_policy:type_name -> space.net.policy.v1.NetworkPolicyV1
-	211, // 25: space.sandbox.manager.v1.CreateRequest.network_policy_authority:type_name -> space.net.policy.v1.PolicyAuthority
-	211, // 26: space.sandbox.manager.v1.CreateRequest.auto_lifecycle_authority:type_name -> space.net.policy.v1.PolicyAuthority
-	210, // 27: space.sandbox.manager.v1.CreateRequest.template_network_policy:type_name -> space.net.policy.v1.NetworkPolicyV1
-	211, // 28: space.sandbox.manager.v1.CreateRequest.template_network_policy_authority:type_name -> space.net.policy.v1.PolicyAuthority
-	212, // 29: space.sandbox.manager.v1.CreateRequest.route_identity:type_name -> space.net.gateway.v1.SpaceApiRouteIdentity
+	202, // 22: space.sandbox.manager.v1.CreateRequest.env:type_name -> space.sandbox.manager.v1.CreateRequest.EnvEntry
+	29,  // 23: space.sandbox.manager.v1.CreateRequest.auto_lifecycle:type_name -> space.sandbox.manager.v1.AutoLifecyclePolicy
+	211, // 24: space.sandbox.manager.v1.CreateRequest.network_policy:type_name -> space.net.policy.v1.NetworkPolicyV1
+	212, // 25: space.sandbox.manager.v1.CreateRequest.network_policy_authority:type_name -> space.net.policy.v1.PolicyAuthority
+	212, // 26: space.sandbox.manager.v1.CreateRequest.auto_lifecycle_authority:type_name -> space.net.policy.v1.PolicyAuthority
+	211, // 27: space.sandbox.manager.v1.CreateRequest.template_network_policy:type_name -> space.net.policy.v1.NetworkPolicyV1
+	212, // 28: space.sandbox.manager.v1.CreateRequest.template_network_policy_authority:type_name -> space.net.policy.v1.PolicyAuthority
+	213, // 29: space.sandbox.manager.v1.CreateRequest.route_identity:type_name -> space.net.gateway.v1.SpaceApiRouteIdentity
 	0,   // 30: space.sandbox.manager.v1.CreateResponse.boot_mode_used:type_name -> space.sandbox.manager.v1.BootMode
-	212, // 31: space.sandbox.manager.v1.CreateResponse.route_identity:type_name -> space.net.gateway.v1.SpaceApiRouteIdentity
-	15,  // 32: space.sandbox.manager.v1.StartRequest.target_state:type_name -> space.sandbox.manager.v1.WakeTargetState
-	212, // 33: space.sandbox.manager.v1.StartRequest.route_identity:type_name -> space.net.gateway.v1.SpaceApiRouteIdentity
-	186, // 34: space.sandbox.manager.v1.StartRequest.restore_artifact_as_new:type_name -> space.sandbox.manager.v1.RestoreArtifactAsNewContext
-	28,  // 35: space.sandbox.manager.v1.StartRequest.activation_auto_lifecycle:type_name -> space.sandbox.manager.v1.AutoLifecyclePolicy
-	212, // 36: space.sandbox.manager.v1.StartResponse.route_identity:type_name -> space.net.gateway.v1.SpaceApiRouteIdentity
-	49,  // 37: space.sandbox.manager.v1.StateResponse.sandboxes:type_name -> space.sandbox.manager.v1.SandboxInfo
-	202, // 38: space.sandbox.manager.v1.GetEnvResponse.env:type_name -> space.sandbox.manager.v1.GetEnvResponse.EnvEntry
-	47,  // 39: space.sandbox.manager.v1.CleanupTargetBatch.targets:type_name -> space.sandbox.manager.v1.CleanupTargetObservation
-	28,  // 40: space.sandbox.manager.v1.SandboxInfo.auto_lifecycle:type_name -> space.sandbox.manager.v1.AutoLifecyclePolicy
-	30,  // 41: space.sandbox.manager.v1.SandboxInfo.auto_lifecycle_status:type_name -> space.sandbox.manager.v1.AutoLifecycleStatus
-	209, // 42: space.sandbox.manager.v1.SandboxInfo.last_guest_ready_at:type_name -> google.protobuf.Timestamp
-	209, // 43: space.sandbox.manager.v1.SandboxInfo.last_guest_heartbeat_at:type_name -> google.protobuf.Timestamp
-	213, // 44: space.sandbox.manager.v1.SandboxInfo.applied_network_policy_source:type_name -> space.net.policy.v1.NetworkPolicySource
-	211, // 45: space.sandbox.manager.v1.SandboxInfo.network_policy_authority:type_name -> space.net.policy.v1.PolicyAuthority
-	211, // 46: space.sandbox.manager.v1.SandboxInfo.auto_lifecycle_authority:type_name -> space.net.policy.v1.PolicyAuthority
-	19,  // 47: space.sandbox.manager.v1.SandboxInfo.current_local_artifact_kind:type_name -> space.sandbox.manager.v1.ArtifactKind
-	20,  // 48: space.sandbox.manager.v1.SandboxInfo.current_local_artifact_origin:type_name -> space.sandbox.manager.v1.ArtifactOrigin
-	214, // 49: space.sandbox.manager.v1.SandboxInfo.execution:type_name -> space.execution.v1.ExecutionMetadata
-	55,  // 50: space.sandbox.manager.v1.SandboxInfo.transition_receipt:type_name -> space.sandbox.manager.v1.TransitionReceipt
-	11,  // 51: space.sandbox.manager.v1.SandboxInfo.health_status:type_name -> space.sandbox.manager.v1.SandboxHealthStatus
-	209, // 52: space.sandbox.manager.v1.SandboxInfo.health_observed_at:type_name -> google.protobuf.Timestamp
-	215, // 53: space.sandbox.manager.v1.SandboxInfo.route_provenance_substrate_kind:type_name -> space.net.gateway.v1.SandboxSubstrateKind
-	209, // 54: space.sandbox.manager.v1.SandboxInfo.state_changed_at:type_name -> google.protobuf.Timestamp
-	195, // 55: space.sandbox.manager.v1.SandboxInfo.quarantine_recovery:type_name -> space.sandbox.manager.v1.QuarantineRecoveryObservation
-	9,   // 56: space.sandbox.manager.v1.SandboxInfo.lifecycle:type_name -> space.sandbox.manager.v1.SandboxLifecycleState
-	209, // 57: space.sandbox.manager.v1.SandboxInfo.current_local_artifact_created_at:type_name -> google.protobuf.Timestamp
-	50,  // 58: space.sandbox.manager.v1.SandboxInfo.cleanup:type_name -> space.sandbox.manager.v1.SandboxCleanup
-	10,  // 59: space.sandbox.manager.v1.SandboxCleanup.completion:type_name -> space.sandbox.manager.v1.SandboxCleanupCompletion
-	209, // 60: space.sandbox.manager.v1.SandboxHealthObservation.observed_at:type_name -> google.protobuf.Timestamp
-	13,  // 61: space.sandbox.manager.v1.SandboxHealthObservation.outcome:type_name -> space.sandbox.manager.v1.SandboxHealthProbeOutcome
-	12,  // 62: space.sandbox.manager.v1.SandboxComponentHealth.component:type_name -> space.sandbox.manager.v1.SandboxHealthComponent
-	51,  // 63: space.sandbox.manager.v1.SandboxComponentHealth.observations:type_name -> space.sandbox.manager.v1.SandboxHealthObservation
-	11,  // 64: space.sandbox.manager.v1.GetSandboxHealthResponse.status:type_name -> space.sandbox.manager.v1.SandboxHealthStatus
-	209, // 65: space.sandbox.manager.v1.GetSandboxHealthResponse.evaluated_at:type_name -> google.protobuf.Timestamp
-	12,  // 66: space.sandbox.manager.v1.GetSandboxHealthResponse.degraded_components:type_name -> space.sandbox.manager.v1.SandboxHealthComponent
-	52,  // 67: space.sandbox.manager.v1.GetSandboxHealthResponse.components:type_name -> space.sandbox.manager.v1.SandboxComponentHealth
-	9,   // 68: space.sandbox.manager.v1.SandboxListElement.lifecycle:type_name -> space.sandbox.manager.v1.SandboxLifecycleState
-	56,  // 69: space.sandbox.manager.v1.ListResponse.sandboxes:type_name -> space.sandbox.manager.v1.SandboxListElement
-	56,  // 70: space.sandbox.manager.v1.ListBuildReferencingSandboxesResponse.sandboxes:type_name -> space.sandbox.manager.v1.SandboxListElement
-	14,  // 71: space.sandbox.manager.v1.MissingDiskUsageId.reason:type_name -> space.sandbox.manager.v1.MissingDiskUsageReason
-	203, // 72: space.sandbox.manager.v1.GetDiskUsageResponse.usage_bytes:type_name -> space.sandbox.manager.v1.GetDiskUsageResponse.UsageBytesEntry
-	61,  // 73: space.sandbox.manager.v1.GetDiskUsageResponse.missing_ids:type_name -> space.sandbox.manager.v1.MissingDiskUsageId
-	66,  // 74: space.sandbox.manager.v1.ListTemplatesResponse.templates:type_name -> space.sandbox.manager.v1.TemplateInfo
-	28,  // 75: space.sandbox.manager.v1.ResumeRequest.activation_auto_lifecycle:type_name -> space.sandbox.manager.v1.AutoLifecyclePolicy
-	212, // 76: space.sandbox.manager.v1.ResumeResponse.route_identity:type_name -> space.net.gateway.v1.SpaceApiRouteIdentity
-	74,  // 77: space.sandbox.manager.v1.WakeRequest.start_context:type_name -> space.sandbox.manager.v1.WakeStartContext
-	15,  // 78: space.sandbox.manager.v1.WakeRequest.target_state:type_name -> space.sandbox.manager.v1.WakeTargetState
-	2,   // 79: space.sandbox.manager.v1.WakeRequest.implicit_wake_source:type_name -> space.sandbox.manager.v1.AutoLifecycleWakeSource
-	73,  // 80: space.sandbox.manager.v1.WakeRequest.runtime_upgrade:type_name -> space.sandbox.manager.v1.WakeRuntimeUpgrade
-	93,  // 81: space.sandbox.manager.v1.WakeRuntimeUpgrade.authorization:type_name -> space.sandbox.manager.v1.RuntimeUpgradeAuthorization
-	212, // 82: space.sandbox.manager.v1.WakeStartContext.route_identity:type_name -> space.net.gateway.v1.SpaceApiRouteIdentity
-	28,  // 83: space.sandbox.manager.v1.WakeStartContext.activation_auto_lifecycle:type_name -> space.sandbox.manager.v1.AutoLifecyclePolicy
-	8,   // 84: space.sandbox.manager.v1.WakeResponse.transition:type_name -> space.sandbox.manager.v1.WakeTransition
-	212, // 85: space.sandbox.manager.v1.WakeResponse.route_identity:type_name -> space.net.gateway.v1.SpaceApiRouteIdentity
-	16,  // 86: space.sandbox.manager.v1.CreateSnapshotRequest.type:type_name -> space.sandbox.manager.v1.SnapshotType
-	78,  // 87: space.sandbox.manager.v1.CreateSnapshotRequest.creation_identity:type_name -> space.sandbox.manager.v1.SnapshotCreationIdentity
-	80,  // 88: space.sandbox.manager.v1.CreateSnapshotRequest.source:type_name -> space.sandbox.manager.v1.CreateSnapshotSource
-	16,  // 89: space.sandbox.manager.v1.CreateSnapshotResponse.type:type_name -> space.sandbox.manager.v1.SnapshotType
-	86,  // 90: space.sandbox.manager.v1.CreateSnapshotResponse.published_artifact:type_name -> space.sandbox.manager.v1.PublishedArtifact
-	82,  // 91: space.sandbox.manager.v1.CreateSnapshotResponse.published_durable_artifact:type_name -> space.sandbox.manager.v1.PublishedDurableArtifact
-	17,  // 92: space.sandbox.manager.v1.CurrentSandboxSnapshotSource.lifecycle:type_name -> space.sandbox.manager.v1.SnapshotSourceLifecycle
-	79,  // 93: space.sandbox.manager.v1.CreateSnapshotSource.current_sandbox:type_name -> space.sandbox.manager.v1.CurrentSandboxSnapshotSource
-	81,  // 94: space.sandbox.manager.v1.CreateSnapshotSource.durable_artifact:type_name -> space.sandbox.manager.v1.DurableArtifactSnapshotSource
-	20,  // 95: space.sandbox.manager.v1.DurableArtifactSnapshotSource.destination_origin:type_name -> space.sandbox.manager.v1.ArtifactOrigin
-	18,  // 96: space.sandbox.manager.v1.SuspendRequest.format:type_name -> space.sandbox.manager.v1.SuspendSnapshotFormat
-	19,  // 97: space.sandbox.manager.v1.PublishedArtifact.artifact_kind:type_name -> space.sandbox.manager.v1.ArtifactKind
-	20,  // 98: space.sandbox.manager.v1.PublishedArtifact.origin:type_name -> space.sandbox.manager.v1.ArtifactOrigin
-	86,  // 99: space.sandbox.manager.v1.SuspendResponse.published_artifact:type_name -> space.sandbox.manager.v1.PublishedArtifact
-	19,  // 100: space.sandbox.manager.v1.EnqueueArtifactBackupRequest.expected_artifact_kind:type_name -> space.sandbox.manager.v1.ArtifactKind
-	88,  // 101: space.sandbox.manager.v1.EnqueueArtifactBackupRequest.current_instance:type_name -> space.sandbox.manager.v1.CurrentInstanceSource
-	19,  // 102: space.sandbox.manager.v1.EnqueueArtifactBackupResponse.artifact_kind:type_name -> space.sandbox.manager.v1.ArtifactKind
-	93,  // 103: space.sandbox.manager.v1.UpgradeRuntimeRequest.authorization:type_name -> space.sandbox.manager.v1.RuntimeUpgradeAuthorization
-	33,  // 104: space.sandbox.manager.v1.UpgradeRuntimeRequest.start:type_name -> space.sandbox.manager.v1.StartRequest
-	15,  // 105: space.sandbox.manager.v1.UpgradeRuntimeRequest.target_state:type_name -> space.sandbox.manager.v1.WakeTargetState
-	21,  // 106: space.sandbox.manager.v1.UpgradeRuntimeResponse.outcome:type_name -> space.sandbox.manager.v1.RuntimeUpgradeOutcome
-	34,  // 107: space.sandbox.manager.v1.UpgradeRuntimeResponse.start:type_name -> space.sandbox.manager.v1.StartResponse
-	102, // 108: space.sandbox.manager.v1.ListSnapshotsResponse.snapshots:type_name -> space.sandbox.manager.v1.SnapshotDetail
-	16,  // 109: space.sandbox.manager.v1.SnapshotDetail.type:type_name -> space.sandbox.manager.v1.SnapshotType
-	103, // 110: space.sandbox.manager.v1.SnapshotDetail.locations:type_name -> space.sandbox.manager.v1.SnapshotLocation
-	212, // 111: space.sandbox.manager.v1.RollbackRequest.route_identity:type_name -> space.net.gateway.v1.SpaceApiRouteIdentity
-	212, // 112: space.sandbox.manager.v1.RollbackResponse.route_identity:type_name -> space.net.gateway.v1.SpaceApiRouteIdentity
-	204, // 113: space.sandbox.manager.v1.UpdateRequest.process_env:type_name -> space.sandbox.manager.v1.UpdateRequest.ProcessEnvEntry
-	208, // 114: space.sandbox.manager.v1.SpacedGetStatusResponse.guest_uptime:type_name -> google.protobuf.Duration
-	116, // 115: space.sandbox.manager.v1.SpacedGetStatusResponse.host_version:type_name -> space.sandbox.manager.v1.SpacedVersionInfo
-	116, // 116: space.sandbox.manager.v1.SpacedGetStatusResponse.guest_version:type_name -> space.sandbox.manager.v1.SpacedVersionInfo
-	208, // 117: space.sandbox.manager.v1.SpacedWaitReadyRequest.timeout:type_name -> google.protobuf.Duration
-	208, // 118: space.sandbox.manager.v1.SpacedWaitReadyResponse.guest_uptime:type_name -> google.protobuf.Duration
-	216, // 119: space.sandbox.manager.v1.SpacedStatRequest.operation:type_name -> space.spaced.operations.v1.StatRequest
-	217, // 120: space.sandbox.manager.v1.SpacedListRequest.operation:type_name -> space.spaced.operations.v1.ListRequest
-	218, // 121: space.sandbox.manager.v1.SpacedReadRequest.operation:type_name -> space.spaced.operations.v1.ReadRequest
-	219, // 122: space.sandbox.manager.v1.SpacedWriteRequest.operation:type_name -> space.spaced.operations.v1.WriteRequest
-	220, // 123: space.sandbox.manager.v1.SpacedWriteBatchRequest.operation:type_name -> space.spaced.operations.v1.WriteBatchRequest
-	221, // 124: space.sandbox.manager.v1.SpacedMkdirRequest.operation:type_name -> space.spaced.operations.v1.MkdirRequest
-	222, // 125: space.sandbox.manager.v1.SpacedRemoveRequest.operation:type_name -> space.spaced.operations.v1.RemoveRequest
-	223, // 126: space.sandbox.manager.v1.SpacedRenameRequest.operation:type_name -> space.spaced.operations.v1.RenameRequest
-	224, // 127: space.sandbox.manager.v1.SpacedNormalizeWatchRootRequest.operation:type_name -> space.spaced.operations.v1.NormalizeWatchRootRequest
-	225, // 128: space.sandbox.manager.v1.SpacedWatchRequest.operation:type_name -> space.spaced.operations.v1.WatchRequest
-	226, // 129: space.sandbox.manager.v1.SpacedCreateWatcherRequest.operation:type_name -> space.spaced.operations.v1.CreateWatcherRequest
-	227, // 130: space.sandbox.manager.v1.SpacedGetWatcherEventsRequest.operation:type_name -> space.spaced.operations.v1.GetWatcherEventsRequest
-	228, // 131: space.sandbox.manager.v1.SpacedRemoveWatcherRequest.operation:type_name -> space.spaced.operations.v1.RemoveWatcherRequest
-	229, // 132: space.sandbox.manager.v1.SpacedEnableFileChangesRequest.operation:type_name -> space.spaced.operations.v1.EnableFileChangesRequest
-	230, // 133: space.sandbox.manager.v1.SpacedDisableFileChangesRequest.operation:type_name -> space.spaced.operations.v1.DisableFileChangesRequest
-	231, // 134: space.sandbox.manager.v1.SpacedGetModifiedFilesRequest.operation:type_name -> space.spaced.operations.v1.GetModifiedFilesRequest
-	232, // 135: space.sandbox.manager.v1.SpacedStartProcessRequest.operation:type_name -> space.spaced.operations.v1.StartRequest
-	233, // 136: space.sandbox.manager.v1.SpacedConnectProcessRequest.operation:type_name -> space.spaced.operations.v1.ConnectProcessRequest
-	234, // 137: space.sandbox.manager.v1.SpacedListProcessesRequest.operation:type_name -> space.spaced.operations.v1.ListProcessesRequest
-	235, // 138: space.sandbox.manager.v1.SpacedListProcessesResponse.processes:type_name -> space.spaced.operations.v1.ProcessInfo
-	236, // 139: space.sandbox.manager.v1.SpacedSendSignalRequest.operation:type_name -> space.spaced.operations.v1.SendSignalRequest
-	237, // 140: space.sandbox.manager.v1.SpacedSendInputRequest.operation:type_name -> space.spaced.operations.v1.SendInputRequest
-	238, // 141: space.sandbox.manager.v1.SpacedCloseStdinRequest.operation:type_name -> space.spaced.operations.v1.CloseStdinRequest
-	239, // 142: space.sandbox.manager.v1.SpacedResizePtyRequest.operation:type_name -> space.spaced.operations.v1.ResizePtyRequest
-	240, // 143: space.sandbox.manager.v1.SpacedKillProcessRequest.operation:type_name -> space.spaced.operations.v1.KillRequest
-	28,  // 144: space.sandbox.manager.v1.SetAutoLifecyclePolicyRequest.policy:type_name -> space.sandbox.manager.v1.AutoLifecyclePolicy
-	211, // 145: space.sandbox.manager.v1.SetAutoLifecyclePolicyRequest.authority:type_name -> space.net.policy.v1.PolicyAuthority
-	28,  // 146: space.sandbox.manager.v1.SetAutoLifecyclePolicyResponse.effective_policy:type_name -> space.sandbox.manager.v1.AutoLifecyclePolicy
-	211, // 147: space.sandbox.manager.v1.SetAutoLifecyclePolicyResponse.authority:type_name -> space.net.policy.v1.PolicyAuthority
-	4,   // 148: space.sandbox.manager.v1.TouchAutoLifecycleRequest.source:type_name -> space.sandbox.manager.v1.AutoLifecycleActivitySource
-	209, // 149: space.sandbox.manager.v1.TouchAutoLifecycleRequest.observed_at:type_name -> google.protobuf.Timestamp
-	147, // 150: space.sandbox.manager.v1.TouchAutoLifecycleRequest.access_idle_update:type_name -> space.sandbox.manager.v1.AccessIdleUpdate
-	209, // 151: space.sandbox.manager.v1.AccessIdleUpdate.expires_at:type_name -> google.protobuf.Timestamp
-	209, // 152: space.sandbox.manager.v1.AccessIdleUpdate.extend_until:type_name -> google.protobuf.Timestamp
-	28,  // 153: space.sandbox.manager.v1.AccessIdleUpdate.reset_policy:type_name -> space.sandbox.manager.v1.AutoLifecyclePolicy
-	5,   // 154: space.sandbox.manager.v1.TouchAutoLifecycleResponse.result:type_name -> space.sandbox.manager.v1.AutoLifecycleTouchResult
-	183, // 155: space.sandbox.manager.v1.GetNetworkPolicyResponse.policies:type_name -> space.sandbox.manager.v1.NetworkPolicyDetail
-	210, // 156: space.sandbox.manager.v1.SetNetworkPolicyRequest.policy:type_name -> space.net.policy.v1.NetworkPolicyV1
-	211, // 157: space.sandbox.manager.v1.SetNetworkPolicyRequest.authority:type_name -> space.net.policy.v1.PolicyAuthority
-	210, // 158: space.sandbox.manager.v1.SetNetworkPolicyResponse.effective_policy:type_name -> space.net.policy.v1.NetworkPolicyV1
-	213, // 159: space.sandbox.manager.v1.SetNetworkPolicyResponse.applied_source:type_name -> space.net.policy.v1.NetworkPolicySource
-	241, // 160: space.sandbox.manager.v1.SetNetworkPolicyResponse.apply_decision:type_name -> space.net.policy.v1.NetworkPolicyApplyDecision
-	211, // 161: space.sandbox.manager.v1.SetNetworkPolicyResponse.authority:type_name -> space.net.policy.v1.PolicyAuthority
-	210, // 162: space.sandbox.manager.v1.TemplateNetworkPolicyUpdatedRequest.policy:type_name -> space.net.policy.v1.NetworkPolicyV1
-	211, // 163: space.sandbox.manager.v1.TemplateNetworkPolicyUpdatedRequest.authority:type_name -> space.net.policy.v1.PolicyAuthority
-	241, // 164: space.sandbox.manager.v1.TemplateNetworkPolicyUpdatedResponse.apply_decision:type_name -> space.net.policy.v1.NetworkPolicyApplyDecision
-	205, // 165: space.sandbox.manager.v1.AdoptPoolSandboxRequest.env:type_name -> space.sandbox.manager.v1.AdoptPoolSandboxRequest.EnvEntry
-	28,  // 166: space.sandbox.manager.v1.AdoptPoolSandboxRequest.auto_lifecycle:type_name -> space.sandbox.manager.v1.AutoLifecyclePolicy
-	210, // 167: space.sandbox.manager.v1.AdoptPoolSandboxRequest.network_policy:type_name -> space.net.policy.v1.NetworkPolicyV1
-	211, // 168: space.sandbox.manager.v1.AdoptPoolSandboxRequest.network_policy_authority:type_name -> space.net.policy.v1.PolicyAuthority
-	210, // 169: space.sandbox.manager.v1.AdoptPoolSandboxRequest.template_network_policy:type_name -> space.net.policy.v1.NetworkPolicyV1
-	211, // 170: space.sandbox.manager.v1.AdoptPoolSandboxRequest.template_network_policy_authority:type_name -> space.net.policy.v1.PolicyAuthority
-	211, // 171: space.sandbox.manager.v1.AdoptPoolSandboxRequest.auto_lifecycle_authority:type_name -> space.net.policy.v1.PolicyAuthority
-	212, // 172: space.sandbox.manager.v1.AdoptPoolSandboxRequest.route_identity:type_name -> space.net.gateway.v1.SpaceApiRouteIdentity
-	212, // 173: space.sandbox.manager.v1.AdoptPoolSandboxResponse.route_identity:type_name -> space.net.gateway.v1.SpaceApiRouteIdentity
-	9,   // 174: space.sandbox.manager.v1.WaitResponse.lifecycle:type_name -> space.sandbox.manager.v1.SandboxLifecycleState
-	165, // 175: space.sandbox.manager.v1.ExportSnapshotChunk.header:type_name -> space.sandbox.manager.v1.ExportSnapshotHeader
-	166, // 176: space.sandbox.manager.v1.ExportSnapshotChunk.chunk:type_name -> space.sandbox.manager.v1.ExportSnapshotFileChunk
-	16,  // 177: space.sandbox.manager.v1.ExportSnapshotHeader.snapshot_type:type_name -> space.sandbox.manager.v1.SnapshotType
-	168, // 178: space.sandbox.manager.v1.ImportSnapshotRequest.header:type_name -> space.sandbox.manager.v1.ImportSnapshotHeader
-	169, // 179: space.sandbox.manager.v1.ImportSnapshotRequest.chunk:type_name -> space.sandbox.manager.v1.ImportSnapshotFileChunk
-	16,  // 180: space.sandbox.manager.v1.ImportSnapshotHeader.snapshot_type:type_name -> space.sandbox.manager.v1.SnapshotType
-	173, // 181: space.sandbox.manager.v1.ExportSandboxChunk.header:type_name -> space.sandbox.manager.v1.ExportSandboxHeader
-	174, // 182: space.sandbox.manager.v1.ExportSandboxChunk.chunk:type_name -> space.sandbox.manager.v1.ExportSandboxFileChunk
-	206, // 183: space.sandbox.manager.v1.ExportSandboxHeader.env:type_name -> space.sandbox.manager.v1.ExportSandboxHeader.EnvEntry
-	28,  // 184: space.sandbox.manager.v1.ExportSandboxHeader.auto_lifecycle:type_name -> space.sandbox.manager.v1.AutoLifecyclePolicy
-	210, // 185: space.sandbox.manager.v1.ExportSandboxHeader.network_policy:type_name -> space.net.policy.v1.NetworkPolicyV1
-	211, // 186: space.sandbox.manager.v1.ExportSandboxHeader.network_policy_authority:type_name -> space.net.policy.v1.PolicyAuthority
-	211, // 187: space.sandbox.manager.v1.ExportSandboxHeader.auto_lifecycle_authority:type_name -> space.net.policy.v1.PolicyAuthority
-	214, // 188: space.sandbox.manager.v1.ExportSandboxHeader.execution:type_name -> space.execution.v1.ExecutionMetadata
-	176, // 189: space.sandbox.manager.v1.ImportSandboxRequest.header:type_name -> space.sandbox.manager.v1.ImportSandboxHeader
-	177, // 190: space.sandbox.manager.v1.ImportSandboxRequest.chunk:type_name -> space.sandbox.manager.v1.ImportSandboxFileChunk
-	207, // 191: space.sandbox.manager.v1.ImportSandboxHeader.env:type_name -> space.sandbox.manager.v1.ImportSandboxHeader.EnvEntry
-	28,  // 192: space.sandbox.manager.v1.ImportSandboxHeader.auto_lifecycle:type_name -> space.sandbox.manager.v1.AutoLifecyclePolicy
-	210, // 193: space.sandbox.manager.v1.ImportSandboxHeader.network_policy:type_name -> space.net.policy.v1.NetworkPolicyV1
-	211, // 194: space.sandbox.manager.v1.ImportSandboxHeader.network_policy_authority:type_name -> space.net.policy.v1.PolicyAuthority
-	211, // 195: space.sandbox.manager.v1.ImportSandboxHeader.auto_lifecycle_authority:type_name -> space.net.policy.v1.PolicyAuthority
-	214, // 196: space.sandbox.manager.v1.ImportSandboxHeader.execution:type_name -> space.execution.v1.ExecutionMetadata
-	28,  // 197: space.sandbox.manager.v1.ImportSandboxResponse.auto_lifecycle:type_name -> space.sandbox.manager.v1.AutoLifecyclePolicy
-	30,  // 198: space.sandbox.manager.v1.ImportSandboxResponse.auto_lifecycle_status:type_name -> space.sandbox.manager.v1.AutoLifecycleStatus
-	242, // 199: space.sandbox.manager.v1.SpacedOpenLoopbackBridgeRequest.operation:type_name -> space.spaced.operations.v1.OpenLoopbackBridgeRequest
-	243, // 200: space.sandbox.manager.v1.SpacedCloseLoopbackBridgeRequest.operation:type_name -> space.spaced.operations.v1.CloseLoopbackBridgeRequest
-	210, // 201: space.sandbox.manager.v1.NetworkPolicyDetail.effective_policy:type_name -> space.net.policy.v1.NetworkPolicyV1
-	213, // 202: space.sandbox.manager.v1.NetworkPolicyDetail.applied_source:type_name -> space.net.policy.v1.NetworkPolicySource
-	211, // 203: space.sandbox.manager.v1.NetworkPolicyDetail.authority:type_name -> space.net.policy.v1.PolicyAuthority
-	22,  // 204: space.sandbox.manager.v1.PrepareTeardownSuspendRequest.action:type_name -> space.sandbox.manager.v1.TeardownSuspendAction
-	23,  // 205: space.sandbox.manager.v1.PrepareTeardownSuspendResponse.outcome:type_name -> space.sandbox.manager.v1.TeardownSuspendOutcome
-	86,  // 206: space.sandbox.manager.v1.PrepareTeardownSuspendResponse.published_artifact:type_name -> space.sandbox.manager.v1.PublishedArtifact
-	19,  // 207: space.sandbox.manager.v1.RestoreArtifactAsNewContext.artifact_kind:type_name -> space.sandbox.manager.v1.ArtifactKind
-	187, // 208: space.sandbox.manager.v1.ListAutoLifecycleDeleteReceiptsResponse.receipts:type_name -> space.sandbox.manager.v1.AutoLifecycleDeleteReceipt
-	19,  // 209: space.sandbox.manager.v1.PendingLocalBackup.artifact_kind:type_name -> space.sandbox.manager.v1.ArtifactKind
-	192, // 210: space.sandbox.manager.v1.ListPendingLocalBackupsResponse.pending:type_name -> space.sandbox.manager.v1.PendingLocalBackup
-	24,  // 211: space.sandbox.manager.v1.QuarantineRecoveryObservation.observed_owner:type_name -> space.sandbox.manager.v1.QuarantineRecoveryObservedOwner
-	209, // 212: space.sandbox.manager.v1.QuarantineRecoveryObservation.next_attempt_at:type_name -> google.protobuf.Timestamp
-	198, // 213: space.sandbox.manager.v1.SandboxManager.GetExecutionCapabilities:input_type -> space.sandbox.manager.v1.GetExecutionCapabilitiesRequest
-	31,  // 214: space.sandbox.manager.v1.SandboxManager.Create:input_type -> space.sandbox.manager.v1.CreateRequest
-	33,  // 215: space.sandbox.manager.v1.SandboxManager.Start:input_type -> space.sandbox.manager.v1.StartRequest
-	35,  // 216: space.sandbox.manager.v1.SandboxManager.Stop:input_type -> space.sandbox.manager.v1.StopRequest
-	37,  // 217: space.sandbox.manager.v1.SandboxManager.Kill:input_type -> space.sandbox.manager.v1.KillRequest
-	39,  // 218: space.sandbox.manager.v1.SandboxManager.Delete:input_type -> space.sandbox.manager.v1.DeleteRequest
-	41,  // 219: space.sandbox.manager.v1.SandboxManager.State:input_type -> space.sandbox.manager.v1.StateRequest
-	53,  // 220: space.sandbox.manager.v1.SandboxManager.GetSandboxHealth:input_type -> space.sandbox.manager.v1.GetSandboxHealthRequest
-	43,  // 221: space.sandbox.manager.v1.SandboxManager.GetEnv:input_type -> space.sandbox.manager.v1.GetEnvRequest
-	45,  // 222: space.sandbox.manager.v1.SandboxManager.List:input_type -> space.sandbox.manager.v1.ListRequest
-	46,  // 223: space.sandbox.manager.v1.SandboxManager.ScanCleanupTargets:input_type -> space.sandbox.manager.v1.ScanCleanupTargetsRequest
-	58,  // 224: space.sandbox.manager.v1.SandboxManager.ListBuildReferencingSandboxes:input_type -> space.sandbox.manager.v1.ListBuildReferencingSandboxesRequest
-	60,  // 225: space.sandbox.manager.v1.SandboxManager.GetDiskUsage:input_type -> space.sandbox.manager.v1.GetDiskUsageRequest
-	63,  // 226: space.sandbox.manager.v1.SandboxManager.Cleanup:input_type -> space.sandbox.manager.v1.CleanupRequest
-	65,  // 227: space.sandbox.manager.v1.SandboxManager.ListTemplates:input_type -> space.sandbox.manager.v1.ListTemplatesRequest
-	68,  // 228: space.sandbox.manager.v1.SandboxManager.Pause:input_type -> space.sandbox.manager.v1.PauseRequest
-	70,  // 229: space.sandbox.manager.v1.SandboxManager.Resume:input_type -> space.sandbox.manager.v1.ResumeRequest
-	72,  // 230: space.sandbox.manager.v1.SandboxManager.Wake:input_type -> space.sandbox.manager.v1.WakeRequest
-	76,  // 231: space.sandbox.manager.v1.SandboxManager.CreateSnapshot:input_type -> space.sandbox.manager.v1.CreateSnapshotRequest
-	196, // 232: space.sandbox.manager.v1.SandboxManager.WaitTemplateApps:input_type -> space.sandbox.manager.v1.WaitTemplateAppsRequest
-	83,  // 233: space.sandbox.manager.v1.SandboxManager.CreateTemplateBaseSnapshot:input_type -> space.sandbox.manager.v1.CreateTemplateBaseSnapshotRequest
-	85,  // 234: space.sandbox.manager.v1.SandboxManager.Suspend:input_type -> space.sandbox.manager.v1.SuspendRequest
-	184, // 235: space.sandbox.manager.v1.SandboxManager.PrepareTeardownSuspend:input_type -> space.sandbox.manager.v1.PrepareTeardownSuspendRequest
-	89,  // 236: space.sandbox.manager.v1.SandboxManager.EnqueueArtifactBackup:input_type -> space.sandbox.manager.v1.EnqueueArtifactBackupRequest
-	91,  // 237: space.sandbox.manager.v1.SandboxManager.EvictClusterDeletedSandbox:input_type -> space.sandbox.manager.v1.EvictClusterDeletedSandboxRequest
-	94,  // 238: space.sandbox.manager.v1.SandboxManager.UpgradeRuntime:input_type -> space.sandbox.manager.v1.UpgradeRuntimeRequest
-	96,  // 239: space.sandbox.manager.v1.SandboxManager.EnableSnapshots:input_type -> space.sandbox.manager.v1.EnableSnapshotsRequest
-	98,  // 240: space.sandbox.manager.v1.SandboxManager.DisableSnapshots:input_type -> space.sandbox.manager.v1.DisableSnapshotsRequest
-	100, // 241: space.sandbox.manager.v1.SandboxManager.ListSnapshots:input_type -> space.sandbox.manager.v1.ListSnapshotsRequest
-	104, // 242: space.sandbox.manager.v1.SandboxManager.DeleteSnapshots:input_type -> space.sandbox.manager.v1.DeleteSnapshotsRequest
-	106, // 243: space.sandbox.manager.v1.SandboxManager.Rollback:input_type -> space.sandbox.manager.v1.RollbackRequest
-	108, // 244: space.sandbox.manager.v1.SandboxManager.Stats:input_type -> space.sandbox.manager.v1.StatsRequest
-	110, // 245: space.sandbox.manager.v1.SandboxManager.Update:input_type -> space.sandbox.manager.v1.UpdateRequest
-	144, // 246: space.sandbox.manager.v1.SandboxManager.SetAutoLifecyclePolicy:input_type -> space.sandbox.manager.v1.SetAutoLifecyclePolicyRequest
-	146, // 247: space.sandbox.manager.v1.SandboxManager.TouchAutoLifecycle:input_type -> space.sandbox.manager.v1.TouchAutoLifecycleRequest
-	188, // 248: space.sandbox.manager.v1.SandboxManager.ListAutoLifecycleDeleteReceipts:input_type -> space.sandbox.manager.v1.ListAutoLifecycleDeleteReceiptsRequest
-	190, // 249: space.sandbox.manager.v1.SandboxManager.AcknowledgeAutoLifecycleDeleteReceipts:input_type -> space.sandbox.manager.v1.AcknowledgeAutoLifecycleDeleteReceiptsRequest
-	193, // 250: space.sandbox.manager.v1.SandboxManager.ListPendingLocalBackups:input_type -> space.sandbox.manager.v1.ListPendingLocalBackupsRequest
-	149, // 251: space.sandbox.manager.v1.SandboxManager.GetNetworkPolicy:input_type -> space.sandbox.manager.v1.GetNetworkPolicyRequest
-	151, // 252: space.sandbox.manager.v1.SandboxManager.SetNetworkPolicy:input_type -> space.sandbox.manager.v1.SetNetworkPolicyRequest
-	153, // 253: space.sandbox.manager.v1.SandboxManager.TemplateNetworkPolicyUpdated:input_type -> space.sandbox.manager.v1.TemplateNetworkPolicyUpdatedRequest
-	155, // 254: space.sandbox.manager.v1.SandboxManager.CycleNetGateway:input_type -> space.sandbox.manager.v1.CycleNetGatewayRequest
-	112, // 255: space.sandbox.manager.v1.SandboxManager.SpacedPingGuest:input_type -> space.sandbox.manager.v1.SpacedPingGuestRequest
-	114, // 256: space.sandbox.manager.v1.SandboxManager.SpacedGetStatus:input_type -> space.sandbox.manager.v1.SpacedGetStatusRequest
-	117, // 257: space.sandbox.manager.v1.SandboxManager.SpacedWaitReady:input_type -> space.sandbox.manager.v1.SpacedWaitReadyRequest
-	119, // 258: space.sandbox.manager.v1.SandboxManager.SpacedStat:input_type -> space.sandbox.manager.v1.SpacedStatRequest
-	120, // 259: space.sandbox.manager.v1.SandboxManager.SpacedList:input_type -> space.sandbox.manager.v1.SpacedListRequest
-	121, // 260: space.sandbox.manager.v1.SandboxManager.SpacedRead:input_type -> space.sandbox.manager.v1.SpacedReadRequest
-	122, // 261: space.sandbox.manager.v1.SandboxManager.SpacedWrite:input_type -> space.sandbox.manager.v1.SpacedWriteRequest
-	123, // 262: space.sandbox.manager.v1.SandboxManager.SpacedWriteBatch:input_type -> space.sandbox.manager.v1.SpacedWriteBatchRequest
-	124, // 263: space.sandbox.manager.v1.SandboxManager.SpacedMkdir:input_type -> space.sandbox.manager.v1.SpacedMkdirRequest
-	125, // 264: space.sandbox.manager.v1.SandboxManager.SpacedRemove:input_type -> space.sandbox.manager.v1.SpacedRemoveRequest
-	126, // 265: space.sandbox.manager.v1.SandboxManager.SpacedRename:input_type -> space.sandbox.manager.v1.SpacedRenameRequest
-	127, // 266: space.sandbox.manager.v1.SandboxManager.SpacedNormalizeWatchRoot:input_type -> space.sandbox.manager.v1.SpacedNormalizeWatchRootRequest
-	128, // 267: space.sandbox.manager.v1.SandboxManager.SpacedWatch:input_type -> space.sandbox.manager.v1.SpacedWatchRequest
-	129, // 268: space.sandbox.manager.v1.SandboxManager.SpacedCreateWatcher:input_type -> space.sandbox.manager.v1.SpacedCreateWatcherRequest
-	130, // 269: space.sandbox.manager.v1.SandboxManager.SpacedGetWatcherEvents:input_type -> space.sandbox.manager.v1.SpacedGetWatcherEventsRequest
-	131, // 270: space.sandbox.manager.v1.SandboxManager.SpacedRemoveWatcher:input_type -> space.sandbox.manager.v1.SpacedRemoveWatcherRequest
-	132, // 271: space.sandbox.manager.v1.SandboxManager.SpacedEnableFileChanges:input_type -> space.sandbox.manager.v1.SpacedEnableFileChangesRequest
-	133, // 272: space.sandbox.manager.v1.SandboxManager.SpacedDisableFileChanges:input_type -> space.sandbox.manager.v1.SpacedDisableFileChangesRequest
-	134, // 273: space.sandbox.manager.v1.SandboxManager.SpacedGetModifiedFiles:input_type -> space.sandbox.manager.v1.SpacedGetModifiedFilesRequest
-	135, // 274: space.sandbox.manager.v1.SandboxManager.SpacedStartProcess:input_type -> space.sandbox.manager.v1.SpacedStartProcessRequest
-	136, // 275: space.sandbox.manager.v1.SandboxManager.SpacedConnectProcess:input_type -> space.sandbox.manager.v1.SpacedConnectProcessRequest
-	137, // 276: space.sandbox.manager.v1.SandboxManager.SpacedListProcesses:input_type -> space.sandbox.manager.v1.SpacedListProcessesRequest
-	139, // 277: space.sandbox.manager.v1.SandboxManager.SpacedSendSignal:input_type -> space.sandbox.manager.v1.SpacedSendSignalRequest
-	140, // 278: space.sandbox.manager.v1.SandboxManager.SpacedSendInput:input_type -> space.sandbox.manager.v1.SpacedSendInputRequest
-	141, // 279: space.sandbox.manager.v1.SandboxManager.SpacedCloseStdin:input_type -> space.sandbox.manager.v1.SpacedCloseStdinRequest
-	142, // 280: space.sandbox.manager.v1.SandboxManager.SpacedResizePty:input_type -> space.sandbox.manager.v1.SpacedResizePtyRequest
-	143, // 281: space.sandbox.manager.v1.SandboxManager.SpacedKillProcess:input_type -> space.sandbox.manager.v1.SpacedKillProcessRequest
-	179, // 282: space.sandbox.manager.v1.SandboxManager.SpacedOpenLoopbackBridge:input_type -> space.sandbox.manager.v1.SpacedOpenLoopbackBridgeRequest
-	180, // 283: space.sandbox.manager.v1.SandboxManager.SpacedCloseLoopbackBridge:input_type -> space.sandbox.manager.v1.SpacedCloseLoopbackBridgeRequest
-	244, // 284: space.sandbox.manager.v1.SandboxManager.ServicePortIngress:input_type -> space.net.gateway.v1.ServicePortIngressFrame
-	157, // 285: space.sandbox.manager.v1.SandboxManager.AdoptPoolSandbox:input_type -> space.sandbox.manager.v1.AdoptPoolSandboxRequest
-	159, // 286: space.sandbox.manager.v1.SandboxManager.Wait:input_type -> space.sandbox.manager.v1.WaitRequest
-	161, // 287: space.sandbox.manager.v1.SandboxManager.CloneFromDonor:input_type -> space.sandbox.manager.v1.CloneFromDonorRequest
-	163, // 288: space.sandbox.manager.v1.SandboxManager.ExportSnapshot:input_type -> space.sandbox.manager.v1.ExportSnapshotRequest
-	167, // 289: space.sandbox.manager.v1.SandboxManager.ImportSnapshot:input_type -> space.sandbox.manager.v1.ImportSnapshotRequest
-	171, // 290: space.sandbox.manager.v1.SandboxManager.ExportSandbox:input_type -> space.sandbox.manager.v1.ExportSandboxRequest
-	175, // 291: space.sandbox.manager.v1.SandboxManager.ImportSandbox:input_type -> space.sandbox.manager.v1.ImportSandboxRequest
-	181, // 292: space.sandbox.manager.v1.SandboxManager.ResolveSandboxMemory:input_type -> space.sandbox.manager.v1.ResolveSandboxMemoryRequest
-	199, // 293: space.sandbox.manager.v1.SandboxManager.GetExecutionCapabilities:output_type -> space.sandbox.manager.v1.GetExecutionCapabilitiesResponse
-	32,  // 294: space.sandbox.manager.v1.SandboxManager.Create:output_type -> space.sandbox.manager.v1.CreateResponse
-	34,  // 295: space.sandbox.manager.v1.SandboxManager.Start:output_type -> space.sandbox.manager.v1.StartResponse
-	36,  // 296: space.sandbox.manager.v1.SandboxManager.Stop:output_type -> space.sandbox.manager.v1.StopResponse
-	38,  // 297: space.sandbox.manager.v1.SandboxManager.Kill:output_type -> space.sandbox.manager.v1.KillResponse
-	40,  // 298: space.sandbox.manager.v1.SandboxManager.Delete:output_type -> space.sandbox.manager.v1.DeleteResponse
-	42,  // 299: space.sandbox.manager.v1.SandboxManager.State:output_type -> space.sandbox.manager.v1.StateResponse
-	54,  // 300: space.sandbox.manager.v1.SandboxManager.GetSandboxHealth:output_type -> space.sandbox.manager.v1.GetSandboxHealthResponse
-	44,  // 301: space.sandbox.manager.v1.SandboxManager.GetEnv:output_type -> space.sandbox.manager.v1.GetEnvResponse
-	57,  // 302: space.sandbox.manager.v1.SandboxManager.List:output_type -> space.sandbox.manager.v1.ListResponse
-	48,  // 303: space.sandbox.manager.v1.SandboxManager.ScanCleanupTargets:output_type -> space.sandbox.manager.v1.CleanupTargetBatch
-	59,  // 304: space.sandbox.manager.v1.SandboxManager.ListBuildReferencingSandboxes:output_type -> space.sandbox.manager.v1.ListBuildReferencingSandboxesResponse
-	62,  // 305: space.sandbox.manager.v1.SandboxManager.GetDiskUsage:output_type -> space.sandbox.manager.v1.GetDiskUsageResponse
-	64,  // 306: space.sandbox.manager.v1.SandboxManager.Cleanup:output_type -> space.sandbox.manager.v1.CleanupResponse
-	67,  // 307: space.sandbox.manager.v1.SandboxManager.ListTemplates:output_type -> space.sandbox.manager.v1.ListTemplatesResponse
-	69,  // 308: space.sandbox.manager.v1.SandboxManager.Pause:output_type -> space.sandbox.manager.v1.PauseResponse
-	71,  // 309: space.sandbox.manager.v1.SandboxManager.Resume:output_type -> space.sandbox.manager.v1.ResumeResponse
-	75,  // 310: space.sandbox.manager.v1.SandboxManager.Wake:output_type -> space.sandbox.manager.v1.WakeResponse
-	77,  // 311: space.sandbox.manager.v1.SandboxManager.CreateSnapshot:output_type -> space.sandbox.manager.v1.CreateSnapshotResponse
-	197, // 312: space.sandbox.manager.v1.SandboxManager.WaitTemplateApps:output_type -> space.sandbox.manager.v1.WaitTemplateAppsResponse
-	84,  // 313: space.sandbox.manager.v1.SandboxManager.CreateTemplateBaseSnapshot:output_type -> space.sandbox.manager.v1.CreateTemplateBaseSnapshotResponse
-	87,  // 314: space.sandbox.manager.v1.SandboxManager.Suspend:output_type -> space.sandbox.manager.v1.SuspendResponse
-	185, // 315: space.sandbox.manager.v1.SandboxManager.PrepareTeardownSuspend:output_type -> space.sandbox.manager.v1.PrepareTeardownSuspendResponse
-	90,  // 316: space.sandbox.manager.v1.SandboxManager.EnqueueArtifactBackup:output_type -> space.sandbox.manager.v1.EnqueueArtifactBackupResponse
-	92,  // 317: space.sandbox.manager.v1.SandboxManager.EvictClusterDeletedSandbox:output_type -> space.sandbox.manager.v1.EvictClusterDeletedSandboxResponse
-	95,  // 318: space.sandbox.manager.v1.SandboxManager.UpgradeRuntime:output_type -> space.sandbox.manager.v1.UpgradeRuntimeResponse
-	97,  // 319: space.sandbox.manager.v1.SandboxManager.EnableSnapshots:output_type -> space.sandbox.manager.v1.EnableSnapshotsResponse
-	99,  // 320: space.sandbox.manager.v1.SandboxManager.DisableSnapshots:output_type -> space.sandbox.manager.v1.DisableSnapshotsResponse
-	101, // 321: space.sandbox.manager.v1.SandboxManager.ListSnapshots:output_type -> space.sandbox.manager.v1.ListSnapshotsResponse
-	105, // 322: space.sandbox.manager.v1.SandboxManager.DeleteSnapshots:output_type -> space.sandbox.manager.v1.DeleteSnapshotsResponse
-	107, // 323: space.sandbox.manager.v1.SandboxManager.Rollback:output_type -> space.sandbox.manager.v1.RollbackResponse
-	109, // 324: space.sandbox.manager.v1.SandboxManager.Stats:output_type -> space.sandbox.manager.v1.StatsResponse
-	111, // 325: space.sandbox.manager.v1.SandboxManager.Update:output_type -> space.sandbox.manager.v1.UpdateResponse
-	145, // 326: space.sandbox.manager.v1.SandboxManager.SetAutoLifecyclePolicy:output_type -> space.sandbox.manager.v1.SetAutoLifecyclePolicyResponse
-	148, // 327: space.sandbox.manager.v1.SandboxManager.TouchAutoLifecycle:output_type -> space.sandbox.manager.v1.TouchAutoLifecycleResponse
-	189, // 328: space.sandbox.manager.v1.SandboxManager.ListAutoLifecycleDeleteReceipts:output_type -> space.sandbox.manager.v1.ListAutoLifecycleDeleteReceiptsResponse
-	191, // 329: space.sandbox.manager.v1.SandboxManager.AcknowledgeAutoLifecycleDeleteReceipts:output_type -> space.sandbox.manager.v1.AcknowledgeAutoLifecycleDeleteReceiptsResponse
-	194, // 330: space.sandbox.manager.v1.SandboxManager.ListPendingLocalBackups:output_type -> space.sandbox.manager.v1.ListPendingLocalBackupsResponse
-	150, // 331: space.sandbox.manager.v1.SandboxManager.GetNetworkPolicy:output_type -> space.sandbox.manager.v1.GetNetworkPolicyResponse
-	152, // 332: space.sandbox.manager.v1.SandboxManager.SetNetworkPolicy:output_type -> space.sandbox.manager.v1.SetNetworkPolicyResponse
-	154, // 333: space.sandbox.manager.v1.SandboxManager.TemplateNetworkPolicyUpdated:output_type -> space.sandbox.manager.v1.TemplateNetworkPolicyUpdatedResponse
-	156, // 334: space.sandbox.manager.v1.SandboxManager.CycleNetGateway:output_type -> space.sandbox.manager.v1.CycleNetGatewayResponse
-	113, // 335: space.sandbox.manager.v1.SandboxManager.SpacedPingGuest:output_type -> space.sandbox.manager.v1.SpacedPingGuestResponse
-	115, // 336: space.sandbox.manager.v1.SandboxManager.SpacedGetStatus:output_type -> space.sandbox.manager.v1.SpacedGetStatusResponse
-	118, // 337: space.sandbox.manager.v1.SandboxManager.SpacedWaitReady:output_type -> space.sandbox.manager.v1.SpacedWaitReadyResponse
-	245, // 338: space.sandbox.manager.v1.SandboxManager.SpacedStat:output_type -> space.spaced.operations.v1.StatResponse
-	246, // 339: space.sandbox.manager.v1.SandboxManager.SpacedList:output_type -> space.spaced.operations.v1.FileInfo
-	247, // 340: space.sandbox.manager.v1.SandboxManager.SpacedRead:output_type -> space.spaced.operations.v1.FileChunk
-	248, // 341: space.sandbox.manager.v1.SandboxManager.SpacedWrite:output_type -> space.spaced.operations.v1.WriteResponse
-	249, // 342: space.sandbox.manager.v1.SandboxManager.SpacedWriteBatch:output_type -> space.spaced.operations.v1.WriteBatchResponse
-	250, // 343: space.sandbox.manager.v1.SandboxManager.SpacedMkdir:output_type -> space.spaced.operations.v1.MkdirResponse
-	251, // 344: space.sandbox.manager.v1.SandboxManager.SpacedRemove:output_type -> space.spaced.operations.v1.RemoveResponse
-	252, // 345: space.sandbox.manager.v1.SandboxManager.SpacedRename:output_type -> space.spaced.operations.v1.RenameResponse
-	253, // 346: space.sandbox.manager.v1.SandboxManager.SpacedNormalizeWatchRoot:output_type -> space.spaced.operations.v1.NormalizeWatchRootResponse
-	254, // 347: space.sandbox.manager.v1.SandboxManager.SpacedWatch:output_type -> space.spaced.operations.v1.FileEvent
-	255, // 348: space.sandbox.manager.v1.SandboxManager.SpacedCreateWatcher:output_type -> space.spaced.operations.v1.CreateWatcherResponse
-	256, // 349: space.sandbox.manager.v1.SandboxManager.SpacedGetWatcherEvents:output_type -> space.spaced.operations.v1.GetWatcherEventsResponse
-	257, // 350: space.sandbox.manager.v1.SandboxManager.SpacedRemoveWatcher:output_type -> space.spaced.operations.v1.RemoveWatcherResponse
-	258, // 351: space.sandbox.manager.v1.SandboxManager.SpacedEnableFileChanges:output_type -> space.spaced.operations.v1.EnableFileChangesResponse
-	259, // 352: space.sandbox.manager.v1.SandboxManager.SpacedDisableFileChanges:output_type -> space.spaced.operations.v1.DisableFileChangesResponse
-	260, // 353: space.sandbox.manager.v1.SandboxManager.SpacedGetModifiedFiles:output_type -> space.spaced.operations.v1.GetModifiedFilesResponse
-	261, // 354: space.sandbox.manager.v1.SandboxManager.SpacedStartProcess:output_type -> space.spaced.operations.v1.ProcessEvent
-	261, // 355: space.sandbox.manager.v1.SandboxManager.SpacedConnectProcess:output_type -> space.spaced.operations.v1.ProcessEvent
-	138, // 356: space.sandbox.manager.v1.SandboxManager.SpacedListProcesses:output_type -> space.sandbox.manager.v1.SpacedListProcessesResponse
-	262, // 357: space.sandbox.manager.v1.SandboxManager.SpacedSendSignal:output_type -> space.spaced.operations.v1.SendSignalResponse
-	263, // 358: space.sandbox.manager.v1.SandboxManager.SpacedSendInput:output_type -> space.spaced.operations.v1.SendInputResponse
-	264, // 359: space.sandbox.manager.v1.SandboxManager.SpacedCloseStdin:output_type -> space.spaced.operations.v1.CloseStdinResponse
-	265, // 360: space.sandbox.manager.v1.SandboxManager.SpacedResizePty:output_type -> space.spaced.operations.v1.ResizePtyResponse
-	266, // 361: space.sandbox.manager.v1.SandboxManager.SpacedKillProcess:output_type -> space.spaced.operations.v1.KillResponse
-	267, // 362: space.sandbox.manager.v1.SandboxManager.SpacedOpenLoopbackBridge:output_type -> space.spaced.operations.v1.OpenLoopbackBridgeResponse
-	268, // 363: space.sandbox.manager.v1.SandboxManager.SpacedCloseLoopbackBridge:output_type -> space.spaced.operations.v1.CloseLoopbackBridgeResponse
-	244, // 364: space.sandbox.manager.v1.SandboxManager.ServicePortIngress:output_type -> space.net.gateway.v1.ServicePortIngressFrame
-	158, // 365: space.sandbox.manager.v1.SandboxManager.AdoptPoolSandbox:output_type -> space.sandbox.manager.v1.AdoptPoolSandboxResponse
-	160, // 366: space.sandbox.manager.v1.SandboxManager.Wait:output_type -> space.sandbox.manager.v1.WaitResponse
-	162, // 367: space.sandbox.manager.v1.SandboxManager.CloneFromDonor:output_type -> space.sandbox.manager.v1.CloneFromDonorResponse
-	164, // 368: space.sandbox.manager.v1.SandboxManager.ExportSnapshot:output_type -> space.sandbox.manager.v1.ExportSnapshotChunk
-	170, // 369: space.sandbox.manager.v1.SandboxManager.ImportSnapshot:output_type -> space.sandbox.manager.v1.ImportSnapshotResponse
-	172, // 370: space.sandbox.manager.v1.SandboxManager.ExportSandbox:output_type -> space.sandbox.manager.v1.ExportSandboxChunk
-	178, // 371: space.sandbox.manager.v1.SandboxManager.ImportSandbox:output_type -> space.sandbox.manager.v1.ImportSandboxResponse
-	182, // 372: space.sandbox.manager.v1.SandboxManager.ResolveSandboxMemory:output_type -> space.sandbox.manager.v1.ResolveSandboxMemoryResponse
-	293, // [293:373] is the sub-list for method output_type
-	213, // [213:293] is the sub-list for method input_type
-	213, // [213:213] is the sub-list for extension type_name
-	213, // [213:213] is the sub-list for extension extendee
-	0,   // [0:213] is the sub-list for field type_name
+	213, // 31: space.sandbox.manager.v1.CreateResponse.route_identity:type_name -> space.net.gateway.v1.SpaceApiRouteIdentity
+	16,  // 32: space.sandbox.manager.v1.StartRequest.target_state:type_name -> space.sandbox.manager.v1.WakeTargetState
+	213, // 33: space.sandbox.manager.v1.StartRequest.route_identity:type_name -> space.net.gateway.v1.SpaceApiRouteIdentity
+	187, // 34: space.sandbox.manager.v1.StartRequest.restore_artifact_as_new:type_name -> space.sandbox.manager.v1.RestoreArtifactAsNewContext
+	29,  // 35: space.sandbox.manager.v1.StartRequest.activation_auto_lifecycle:type_name -> space.sandbox.manager.v1.AutoLifecyclePolicy
+	213, // 36: space.sandbox.manager.v1.StartResponse.route_identity:type_name -> space.net.gateway.v1.SpaceApiRouteIdentity
+	9,   // 37: space.sandbox.manager.v1.StopRequest.stop_cause:type_name -> space.sandbox.manager.v1.SandboxStopCause
+	50,  // 38: space.sandbox.manager.v1.StateResponse.sandboxes:type_name -> space.sandbox.manager.v1.SandboxInfo
+	203, // 39: space.sandbox.manager.v1.GetEnvResponse.env:type_name -> space.sandbox.manager.v1.GetEnvResponse.EnvEntry
+	48,  // 40: space.sandbox.manager.v1.CleanupTargetBatch.targets:type_name -> space.sandbox.manager.v1.CleanupTargetObservation
+	29,  // 41: space.sandbox.manager.v1.SandboxInfo.auto_lifecycle:type_name -> space.sandbox.manager.v1.AutoLifecyclePolicy
+	31,  // 42: space.sandbox.manager.v1.SandboxInfo.auto_lifecycle_status:type_name -> space.sandbox.manager.v1.AutoLifecycleStatus
+	210, // 43: space.sandbox.manager.v1.SandboxInfo.last_guest_ready_at:type_name -> google.protobuf.Timestamp
+	210, // 44: space.sandbox.manager.v1.SandboxInfo.last_guest_heartbeat_at:type_name -> google.protobuf.Timestamp
+	214, // 45: space.sandbox.manager.v1.SandboxInfo.applied_network_policy_source:type_name -> space.net.policy.v1.NetworkPolicySource
+	212, // 46: space.sandbox.manager.v1.SandboxInfo.network_policy_authority:type_name -> space.net.policy.v1.PolicyAuthority
+	212, // 47: space.sandbox.manager.v1.SandboxInfo.auto_lifecycle_authority:type_name -> space.net.policy.v1.PolicyAuthority
+	20,  // 48: space.sandbox.manager.v1.SandboxInfo.current_local_artifact_kind:type_name -> space.sandbox.manager.v1.ArtifactKind
+	21,  // 49: space.sandbox.manager.v1.SandboxInfo.current_local_artifact_origin:type_name -> space.sandbox.manager.v1.ArtifactOrigin
+	215, // 50: space.sandbox.manager.v1.SandboxInfo.execution:type_name -> space.execution.v1.ExecutionMetadata
+	56,  // 51: space.sandbox.manager.v1.SandboxInfo.transition_receipt:type_name -> space.sandbox.manager.v1.TransitionReceipt
+	12,  // 52: space.sandbox.manager.v1.SandboxInfo.health_status:type_name -> space.sandbox.manager.v1.SandboxHealthStatus
+	210, // 53: space.sandbox.manager.v1.SandboxInfo.health_observed_at:type_name -> google.protobuf.Timestamp
+	216, // 54: space.sandbox.manager.v1.SandboxInfo.route_provenance_substrate_kind:type_name -> space.net.gateway.v1.SandboxSubstrateKind
+	210, // 55: space.sandbox.manager.v1.SandboxInfo.state_changed_at:type_name -> google.protobuf.Timestamp
+	196, // 56: space.sandbox.manager.v1.SandboxInfo.quarantine_recovery:type_name -> space.sandbox.manager.v1.QuarantineRecoveryObservation
+	10,  // 57: space.sandbox.manager.v1.SandboxInfo.lifecycle:type_name -> space.sandbox.manager.v1.SandboxLifecycleState
+	210, // 58: space.sandbox.manager.v1.SandboxInfo.current_local_artifact_created_at:type_name -> google.protobuf.Timestamp
+	51,  // 59: space.sandbox.manager.v1.SandboxInfo.cleanup:type_name -> space.sandbox.manager.v1.SandboxCleanup
+	9,   // 60: space.sandbox.manager.v1.SandboxInfo.stop_cause:type_name -> space.sandbox.manager.v1.SandboxStopCause
+	11,  // 61: space.sandbox.manager.v1.SandboxCleanup.completion:type_name -> space.sandbox.manager.v1.SandboxCleanupCompletion
+	210, // 62: space.sandbox.manager.v1.SandboxHealthObservation.observed_at:type_name -> google.protobuf.Timestamp
+	14,  // 63: space.sandbox.manager.v1.SandboxHealthObservation.outcome:type_name -> space.sandbox.manager.v1.SandboxHealthProbeOutcome
+	13,  // 64: space.sandbox.manager.v1.SandboxComponentHealth.component:type_name -> space.sandbox.manager.v1.SandboxHealthComponent
+	52,  // 65: space.sandbox.manager.v1.SandboxComponentHealth.observations:type_name -> space.sandbox.manager.v1.SandboxHealthObservation
+	12,  // 66: space.sandbox.manager.v1.GetSandboxHealthResponse.status:type_name -> space.sandbox.manager.v1.SandboxHealthStatus
+	210, // 67: space.sandbox.manager.v1.GetSandboxHealthResponse.evaluated_at:type_name -> google.protobuf.Timestamp
+	13,  // 68: space.sandbox.manager.v1.GetSandboxHealthResponse.degraded_components:type_name -> space.sandbox.manager.v1.SandboxHealthComponent
+	53,  // 69: space.sandbox.manager.v1.GetSandboxHealthResponse.components:type_name -> space.sandbox.manager.v1.SandboxComponentHealth
+	10,  // 70: space.sandbox.manager.v1.SandboxListElement.lifecycle:type_name -> space.sandbox.manager.v1.SandboxLifecycleState
+	57,  // 71: space.sandbox.manager.v1.ListResponse.sandboxes:type_name -> space.sandbox.manager.v1.SandboxListElement
+	57,  // 72: space.sandbox.manager.v1.ListBuildReferencingSandboxesResponse.sandboxes:type_name -> space.sandbox.manager.v1.SandboxListElement
+	15,  // 73: space.sandbox.manager.v1.MissingDiskUsageId.reason:type_name -> space.sandbox.manager.v1.MissingDiskUsageReason
+	204, // 74: space.sandbox.manager.v1.GetDiskUsageResponse.usage_bytes:type_name -> space.sandbox.manager.v1.GetDiskUsageResponse.UsageBytesEntry
+	62,  // 75: space.sandbox.manager.v1.GetDiskUsageResponse.missing_ids:type_name -> space.sandbox.manager.v1.MissingDiskUsageId
+	67,  // 76: space.sandbox.manager.v1.ListTemplatesResponse.templates:type_name -> space.sandbox.manager.v1.TemplateInfo
+	29,  // 77: space.sandbox.manager.v1.ResumeRequest.activation_auto_lifecycle:type_name -> space.sandbox.manager.v1.AutoLifecyclePolicy
+	213, // 78: space.sandbox.manager.v1.ResumeResponse.route_identity:type_name -> space.net.gateway.v1.SpaceApiRouteIdentity
+	75,  // 79: space.sandbox.manager.v1.WakeRequest.start_context:type_name -> space.sandbox.manager.v1.WakeStartContext
+	16,  // 80: space.sandbox.manager.v1.WakeRequest.target_state:type_name -> space.sandbox.manager.v1.WakeTargetState
+	2,   // 81: space.sandbox.manager.v1.WakeRequest.implicit_wake_source:type_name -> space.sandbox.manager.v1.AutoLifecycleWakeSource
+	74,  // 82: space.sandbox.manager.v1.WakeRequest.runtime_upgrade:type_name -> space.sandbox.manager.v1.WakeRuntimeUpgrade
+	94,  // 83: space.sandbox.manager.v1.WakeRuntimeUpgrade.authorization:type_name -> space.sandbox.manager.v1.RuntimeUpgradeAuthorization
+	213, // 84: space.sandbox.manager.v1.WakeStartContext.route_identity:type_name -> space.net.gateway.v1.SpaceApiRouteIdentity
+	29,  // 85: space.sandbox.manager.v1.WakeStartContext.activation_auto_lifecycle:type_name -> space.sandbox.manager.v1.AutoLifecyclePolicy
+	8,   // 86: space.sandbox.manager.v1.WakeResponse.transition:type_name -> space.sandbox.manager.v1.WakeTransition
+	213, // 87: space.sandbox.manager.v1.WakeResponse.route_identity:type_name -> space.net.gateway.v1.SpaceApiRouteIdentity
+	17,  // 88: space.sandbox.manager.v1.CreateSnapshotRequest.type:type_name -> space.sandbox.manager.v1.SnapshotType
+	79,  // 89: space.sandbox.manager.v1.CreateSnapshotRequest.creation_identity:type_name -> space.sandbox.manager.v1.SnapshotCreationIdentity
+	81,  // 90: space.sandbox.manager.v1.CreateSnapshotRequest.source:type_name -> space.sandbox.manager.v1.CreateSnapshotSource
+	17,  // 91: space.sandbox.manager.v1.CreateSnapshotResponse.type:type_name -> space.sandbox.manager.v1.SnapshotType
+	87,  // 92: space.sandbox.manager.v1.CreateSnapshotResponse.published_artifact:type_name -> space.sandbox.manager.v1.PublishedArtifact
+	83,  // 93: space.sandbox.manager.v1.CreateSnapshotResponse.published_durable_artifact:type_name -> space.sandbox.manager.v1.PublishedDurableArtifact
+	18,  // 94: space.sandbox.manager.v1.CurrentSandboxSnapshotSource.lifecycle:type_name -> space.sandbox.manager.v1.SnapshotSourceLifecycle
+	80,  // 95: space.sandbox.manager.v1.CreateSnapshotSource.current_sandbox:type_name -> space.sandbox.manager.v1.CurrentSandboxSnapshotSource
+	82,  // 96: space.sandbox.manager.v1.CreateSnapshotSource.durable_artifact:type_name -> space.sandbox.manager.v1.DurableArtifactSnapshotSource
+	21,  // 97: space.sandbox.manager.v1.DurableArtifactSnapshotSource.destination_origin:type_name -> space.sandbox.manager.v1.ArtifactOrigin
+	19,  // 98: space.sandbox.manager.v1.SuspendRequest.format:type_name -> space.sandbox.manager.v1.SuspendSnapshotFormat
+	20,  // 99: space.sandbox.manager.v1.PublishedArtifact.artifact_kind:type_name -> space.sandbox.manager.v1.ArtifactKind
+	21,  // 100: space.sandbox.manager.v1.PublishedArtifact.origin:type_name -> space.sandbox.manager.v1.ArtifactOrigin
+	87,  // 101: space.sandbox.manager.v1.SuspendResponse.published_artifact:type_name -> space.sandbox.manager.v1.PublishedArtifact
+	20,  // 102: space.sandbox.manager.v1.EnqueueArtifactBackupRequest.expected_artifact_kind:type_name -> space.sandbox.manager.v1.ArtifactKind
+	89,  // 103: space.sandbox.manager.v1.EnqueueArtifactBackupRequest.current_instance:type_name -> space.sandbox.manager.v1.CurrentInstanceSource
+	20,  // 104: space.sandbox.manager.v1.EnqueueArtifactBackupResponse.artifact_kind:type_name -> space.sandbox.manager.v1.ArtifactKind
+	94,  // 105: space.sandbox.manager.v1.UpgradeRuntimeRequest.authorization:type_name -> space.sandbox.manager.v1.RuntimeUpgradeAuthorization
+	34,  // 106: space.sandbox.manager.v1.UpgradeRuntimeRequest.start:type_name -> space.sandbox.manager.v1.StartRequest
+	16,  // 107: space.sandbox.manager.v1.UpgradeRuntimeRequest.target_state:type_name -> space.sandbox.manager.v1.WakeTargetState
+	22,  // 108: space.sandbox.manager.v1.UpgradeRuntimeResponse.outcome:type_name -> space.sandbox.manager.v1.RuntimeUpgradeOutcome
+	35,  // 109: space.sandbox.manager.v1.UpgradeRuntimeResponse.start:type_name -> space.sandbox.manager.v1.StartResponse
+	103, // 110: space.sandbox.manager.v1.ListSnapshotsResponse.snapshots:type_name -> space.sandbox.manager.v1.SnapshotDetail
+	17,  // 111: space.sandbox.manager.v1.SnapshotDetail.type:type_name -> space.sandbox.manager.v1.SnapshotType
+	104, // 112: space.sandbox.manager.v1.SnapshotDetail.locations:type_name -> space.sandbox.manager.v1.SnapshotLocation
+	213, // 113: space.sandbox.manager.v1.RollbackRequest.route_identity:type_name -> space.net.gateway.v1.SpaceApiRouteIdentity
+	213, // 114: space.sandbox.manager.v1.RollbackResponse.route_identity:type_name -> space.net.gateway.v1.SpaceApiRouteIdentity
+	205, // 115: space.sandbox.manager.v1.UpdateRequest.process_env:type_name -> space.sandbox.manager.v1.UpdateRequest.ProcessEnvEntry
+	209, // 116: space.sandbox.manager.v1.SpacedGetStatusResponse.guest_uptime:type_name -> google.protobuf.Duration
+	117, // 117: space.sandbox.manager.v1.SpacedGetStatusResponse.host_version:type_name -> space.sandbox.manager.v1.SpacedVersionInfo
+	117, // 118: space.sandbox.manager.v1.SpacedGetStatusResponse.guest_version:type_name -> space.sandbox.manager.v1.SpacedVersionInfo
+	209, // 119: space.sandbox.manager.v1.SpacedWaitReadyRequest.timeout:type_name -> google.protobuf.Duration
+	209, // 120: space.sandbox.manager.v1.SpacedWaitReadyResponse.guest_uptime:type_name -> google.protobuf.Duration
+	217, // 121: space.sandbox.manager.v1.SpacedStatRequest.operation:type_name -> space.spaced.operations.v1.StatRequest
+	218, // 122: space.sandbox.manager.v1.SpacedListRequest.operation:type_name -> space.spaced.operations.v1.ListRequest
+	219, // 123: space.sandbox.manager.v1.SpacedReadRequest.operation:type_name -> space.spaced.operations.v1.ReadRequest
+	220, // 124: space.sandbox.manager.v1.SpacedWriteRequest.operation:type_name -> space.spaced.operations.v1.WriteRequest
+	221, // 125: space.sandbox.manager.v1.SpacedWriteBatchRequest.operation:type_name -> space.spaced.operations.v1.WriteBatchRequest
+	222, // 126: space.sandbox.manager.v1.SpacedMkdirRequest.operation:type_name -> space.spaced.operations.v1.MkdirRequest
+	223, // 127: space.sandbox.manager.v1.SpacedRemoveRequest.operation:type_name -> space.spaced.operations.v1.RemoveRequest
+	224, // 128: space.sandbox.manager.v1.SpacedRenameRequest.operation:type_name -> space.spaced.operations.v1.RenameRequest
+	225, // 129: space.sandbox.manager.v1.SpacedNormalizeWatchRootRequest.operation:type_name -> space.spaced.operations.v1.NormalizeWatchRootRequest
+	226, // 130: space.sandbox.manager.v1.SpacedWatchRequest.operation:type_name -> space.spaced.operations.v1.WatchRequest
+	227, // 131: space.sandbox.manager.v1.SpacedCreateWatcherRequest.operation:type_name -> space.spaced.operations.v1.CreateWatcherRequest
+	228, // 132: space.sandbox.manager.v1.SpacedGetWatcherEventsRequest.operation:type_name -> space.spaced.operations.v1.GetWatcherEventsRequest
+	229, // 133: space.sandbox.manager.v1.SpacedRemoveWatcherRequest.operation:type_name -> space.spaced.operations.v1.RemoveWatcherRequest
+	230, // 134: space.sandbox.manager.v1.SpacedEnableFileChangesRequest.operation:type_name -> space.spaced.operations.v1.EnableFileChangesRequest
+	231, // 135: space.sandbox.manager.v1.SpacedDisableFileChangesRequest.operation:type_name -> space.spaced.operations.v1.DisableFileChangesRequest
+	232, // 136: space.sandbox.manager.v1.SpacedGetModifiedFilesRequest.operation:type_name -> space.spaced.operations.v1.GetModifiedFilesRequest
+	233, // 137: space.sandbox.manager.v1.SpacedStartProcessRequest.operation:type_name -> space.spaced.operations.v1.StartRequest
+	234, // 138: space.sandbox.manager.v1.SpacedConnectProcessRequest.operation:type_name -> space.spaced.operations.v1.ConnectProcessRequest
+	235, // 139: space.sandbox.manager.v1.SpacedListProcessesRequest.operation:type_name -> space.spaced.operations.v1.ListProcessesRequest
+	236, // 140: space.sandbox.manager.v1.SpacedListProcessesResponse.processes:type_name -> space.spaced.operations.v1.ProcessInfo
+	237, // 141: space.sandbox.manager.v1.SpacedSendSignalRequest.operation:type_name -> space.spaced.operations.v1.SendSignalRequest
+	238, // 142: space.sandbox.manager.v1.SpacedSendInputRequest.operation:type_name -> space.spaced.operations.v1.SendInputRequest
+	239, // 143: space.sandbox.manager.v1.SpacedCloseStdinRequest.operation:type_name -> space.spaced.operations.v1.CloseStdinRequest
+	240, // 144: space.sandbox.manager.v1.SpacedResizePtyRequest.operation:type_name -> space.spaced.operations.v1.ResizePtyRequest
+	241, // 145: space.sandbox.manager.v1.SpacedKillProcessRequest.operation:type_name -> space.spaced.operations.v1.KillRequest
+	29,  // 146: space.sandbox.manager.v1.SetAutoLifecyclePolicyRequest.policy:type_name -> space.sandbox.manager.v1.AutoLifecyclePolicy
+	212, // 147: space.sandbox.manager.v1.SetAutoLifecyclePolicyRequest.authority:type_name -> space.net.policy.v1.PolicyAuthority
+	29,  // 148: space.sandbox.manager.v1.SetAutoLifecyclePolicyResponse.effective_policy:type_name -> space.sandbox.manager.v1.AutoLifecyclePolicy
+	212, // 149: space.sandbox.manager.v1.SetAutoLifecyclePolicyResponse.authority:type_name -> space.net.policy.v1.PolicyAuthority
+	4,   // 150: space.sandbox.manager.v1.TouchAutoLifecycleRequest.source:type_name -> space.sandbox.manager.v1.AutoLifecycleActivitySource
+	210, // 151: space.sandbox.manager.v1.TouchAutoLifecycleRequest.observed_at:type_name -> google.protobuf.Timestamp
+	148, // 152: space.sandbox.manager.v1.TouchAutoLifecycleRequest.access_idle_update:type_name -> space.sandbox.manager.v1.AccessIdleUpdate
+	210, // 153: space.sandbox.manager.v1.AccessIdleUpdate.expires_at:type_name -> google.protobuf.Timestamp
+	210, // 154: space.sandbox.manager.v1.AccessIdleUpdate.extend_until:type_name -> google.protobuf.Timestamp
+	29,  // 155: space.sandbox.manager.v1.AccessIdleUpdate.reset_policy:type_name -> space.sandbox.manager.v1.AutoLifecyclePolicy
+	5,   // 156: space.sandbox.manager.v1.TouchAutoLifecycleResponse.result:type_name -> space.sandbox.manager.v1.AutoLifecycleTouchResult
+	184, // 157: space.sandbox.manager.v1.GetNetworkPolicyResponse.policies:type_name -> space.sandbox.manager.v1.NetworkPolicyDetail
+	211, // 158: space.sandbox.manager.v1.SetNetworkPolicyRequest.policy:type_name -> space.net.policy.v1.NetworkPolicyV1
+	212, // 159: space.sandbox.manager.v1.SetNetworkPolicyRequest.authority:type_name -> space.net.policy.v1.PolicyAuthority
+	211, // 160: space.sandbox.manager.v1.SetNetworkPolicyResponse.effective_policy:type_name -> space.net.policy.v1.NetworkPolicyV1
+	214, // 161: space.sandbox.manager.v1.SetNetworkPolicyResponse.applied_source:type_name -> space.net.policy.v1.NetworkPolicySource
+	242, // 162: space.sandbox.manager.v1.SetNetworkPolicyResponse.apply_decision:type_name -> space.net.policy.v1.NetworkPolicyApplyDecision
+	212, // 163: space.sandbox.manager.v1.SetNetworkPolicyResponse.authority:type_name -> space.net.policy.v1.PolicyAuthority
+	211, // 164: space.sandbox.manager.v1.TemplateNetworkPolicyUpdatedRequest.policy:type_name -> space.net.policy.v1.NetworkPolicyV1
+	212, // 165: space.sandbox.manager.v1.TemplateNetworkPolicyUpdatedRequest.authority:type_name -> space.net.policy.v1.PolicyAuthority
+	242, // 166: space.sandbox.manager.v1.TemplateNetworkPolicyUpdatedResponse.apply_decision:type_name -> space.net.policy.v1.NetworkPolicyApplyDecision
+	206, // 167: space.sandbox.manager.v1.AdoptPoolSandboxRequest.env:type_name -> space.sandbox.manager.v1.AdoptPoolSandboxRequest.EnvEntry
+	29,  // 168: space.sandbox.manager.v1.AdoptPoolSandboxRequest.auto_lifecycle:type_name -> space.sandbox.manager.v1.AutoLifecyclePolicy
+	211, // 169: space.sandbox.manager.v1.AdoptPoolSandboxRequest.network_policy:type_name -> space.net.policy.v1.NetworkPolicyV1
+	212, // 170: space.sandbox.manager.v1.AdoptPoolSandboxRequest.network_policy_authority:type_name -> space.net.policy.v1.PolicyAuthority
+	211, // 171: space.sandbox.manager.v1.AdoptPoolSandboxRequest.template_network_policy:type_name -> space.net.policy.v1.NetworkPolicyV1
+	212, // 172: space.sandbox.manager.v1.AdoptPoolSandboxRequest.template_network_policy_authority:type_name -> space.net.policy.v1.PolicyAuthority
+	212, // 173: space.sandbox.manager.v1.AdoptPoolSandboxRequest.auto_lifecycle_authority:type_name -> space.net.policy.v1.PolicyAuthority
+	213, // 174: space.sandbox.manager.v1.AdoptPoolSandboxRequest.route_identity:type_name -> space.net.gateway.v1.SpaceApiRouteIdentity
+	213, // 175: space.sandbox.manager.v1.AdoptPoolSandboxResponse.route_identity:type_name -> space.net.gateway.v1.SpaceApiRouteIdentity
+	10,  // 176: space.sandbox.manager.v1.WaitResponse.lifecycle:type_name -> space.sandbox.manager.v1.SandboxLifecycleState
+	166, // 177: space.sandbox.manager.v1.ExportSnapshotChunk.header:type_name -> space.sandbox.manager.v1.ExportSnapshotHeader
+	167, // 178: space.sandbox.manager.v1.ExportSnapshotChunk.chunk:type_name -> space.sandbox.manager.v1.ExportSnapshotFileChunk
+	17,  // 179: space.sandbox.manager.v1.ExportSnapshotHeader.snapshot_type:type_name -> space.sandbox.manager.v1.SnapshotType
+	169, // 180: space.sandbox.manager.v1.ImportSnapshotRequest.header:type_name -> space.sandbox.manager.v1.ImportSnapshotHeader
+	170, // 181: space.sandbox.manager.v1.ImportSnapshotRequest.chunk:type_name -> space.sandbox.manager.v1.ImportSnapshotFileChunk
+	17,  // 182: space.sandbox.manager.v1.ImportSnapshotHeader.snapshot_type:type_name -> space.sandbox.manager.v1.SnapshotType
+	174, // 183: space.sandbox.manager.v1.ExportSandboxChunk.header:type_name -> space.sandbox.manager.v1.ExportSandboxHeader
+	175, // 184: space.sandbox.manager.v1.ExportSandboxChunk.chunk:type_name -> space.sandbox.manager.v1.ExportSandboxFileChunk
+	207, // 185: space.sandbox.manager.v1.ExportSandboxHeader.env:type_name -> space.sandbox.manager.v1.ExportSandboxHeader.EnvEntry
+	29,  // 186: space.sandbox.manager.v1.ExportSandboxHeader.auto_lifecycle:type_name -> space.sandbox.manager.v1.AutoLifecyclePolicy
+	211, // 187: space.sandbox.manager.v1.ExportSandboxHeader.network_policy:type_name -> space.net.policy.v1.NetworkPolicyV1
+	212, // 188: space.sandbox.manager.v1.ExportSandboxHeader.network_policy_authority:type_name -> space.net.policy.v1.PolicyAuthority
+	212, // 189: space.sandbox.manager.v1.ExportSandboxHeader.auto_lifecycle_authority:type_name -> space.net.policy.v1.PolicyAuthority
+	215, // 190: space.sandbox.manager.v1.ExportSandboxHeader.execution:type_name -> space.execution.v1.ExecutionMetadata
+	177, // 191: space.sandbox.manager.v1.ImportSandboxRequest.header:type_name -> space.sandbox.manager.v1.ImportSandboxHeader
+	178, // 192: space.sandbox.manager.v1.ImportSandboxRequest.chunk:type_name -> space.sandbox.manager.v1.ImportSandboxFileChunk
+	208, // 193: space.sandbox.manager.v1.ImportSandboxHeader.env:type_name -> space.sandbox.manager.v1.ImportSandboxHeader.EnvEntry
+	29,  // 194: space.sandbox.manager.v1.ImportSandboxHeader.auto_lifecycle:type_name -> space.sandbox.manager.v1.AutoLifecyclePolicy
+	211, // 195: space.sandbox.manager.v1.ImportSandboxHeader.network_policy:type_name -> space.net.policy.v1.NetworkPolicyV1
+	212, // 196: space.sandbox.manager.v1.ImportSandboxHeader.network_policy_authority:type_name -> space.net.policy.v1.PolicyAuthority
+	212, // 197: space.sandbox.manager.v1.ImportSandboxHeader.auto_lifecycle_authority:type_name -> space.net.policy.v1.PolicyAuthority
+	215, // 198: space.sandbox.manager.v1.ImportSandboxHeader.execution:type_name -> space.execution.v1.ExecutionMetadata
+	29,  // 199: space.sandbox.manager.v1.ImportSandboxResponse.auto_lifecycle:type_name -> space.sandbox.manager.v1.AutoLifecyclePolicy
+	31,  // 200: space.sandbox.manager.v1.ImportSandboxResponse.auto_lifecycle_status:type_name -> space.sandbox.manager.v1.AutoLifecycleStatus
+	243, // 201: space.sandbox.manager.v1.SpacedOpenLoopbackBridgeRequest.operation:type_name -> space.spaced.operations.v1.OpenLoopbackBridgeRequest
+	244, // 202: space.sandbox.manager.v1.SpacedCloseLoopbackBridgeRequest.operation:type_name -> space.spaced.operations.v1.CloseLoopbackBridgeRequest
+	211, // 203: space.sandbox.manager.v1.NetworkPolicyDetail.effective_policy:type_name -> space.net.policy.v1.NetworkPolicyV1
+	214, // 204: space.sandbox.manager.v1.NetworkPolicyDetail.applied_source:type_name -> space.net.policy.v1.NetworkPolicySource
+	212, // 205: space.sandbox.manager.v1.NetworkPolicyDetail.authority:type_name -> space.net.policy.v1.PolicyAuthority
+	23,  // 206: space.sandbox.manager.v1.PrepareTeardownSuspendRequest.action:type_name -> space.sandbox.manager.v1.TeardownSuspendAction
+	24,  // 207: space.sandbox.manager.v1.PrepareTeardownSuspendResponse.outcome:type_name -> space.sandbox.manager.v1.TeardownSuspendOutcome
+	87,  // 208: space.sandbox.manager.v1.PrepareTeardownSuspendResponse.published_artifact:type_name -> space.sandbox.manager.v1.PublishedArtifact
+	20,  // 209: space.sandbox.manager.v1.RestoreArtifactAsNewContext.artifact_kind:type_name -> space.sandbox.manager.v1.ArtifactKind
+	188, // 210: space.sandbox.manager.v1.ListAutoLifecycleDeleteReceiptsResponse.receipts:type_name -> space.sandbox.manager.v1.AutoLifecycleDeleteReceipt
+	20,  // 211: space.sandbox.manager.v1.PendingLocalBackup.artifact_kind:type_name -> space.sandbox.manager.v1.ArtifactKind
+	193, // 212: space.sandbox.manager.v1.ListPendingLocalBackupsResponse.pending:type_name -> space.sandbox.manager.v1.PendingLocalBackup
+	25,  // 213: space.sandbox.manager.v1.QuarantineRecoveryObservation.observed_owner:type_name -> space.sandbox.manager.v1.QuarantineRecoveryObservedOwner
+	210, // 214: space.sandbox.manager.v1.QuarantineRecoveryObservation.next_attempt_at:type_name -> google.protobuf.Timestamp
+	199, // 215: space.sandbox.manager.v1.SandboxManager.GetExecutionCapabilities:input_type -> space.sandbox.manager.v1.GetExecutionCapabilitiesRequest
+	32,  // 216: space.sandbox.manager.v1.SandboxManager.Create:input_type -> space.sandbox.manager.v1.CreateRequest
+	34,  // 217: space.sandbox.manager.v1.SandboxManager.Start:input_type -> space.sandbox.manager.v1.StartRequest
+	36,  // 218: space.sandbox.manager.v1.SandboxManager.Stop:input_type -> space.sandbox.manager.v1.StopRequest
+	38,  // 219: space.sandbox.manager.v1.SandboxManager.Kill:input_type -> space.sandbox.manager.v1.KillRequest
+	40,  // 220: space.sandbox.manager.v1.SandboxManager.Delete:input_type -> space.sandbox.manager.v1.DeleteRequest
+	42,  // 221: space.sandbox.manager.v1.SandboxManager.State:input_type -> space.sandbox.manager.v1.StateRequest
+	54,  // 222: space.sandbox.manager.v1.SandboxManager.GetSandboxHealth:input_type -> space.sandbox.manager.v1.GetSandboxHealthRequest
+	44,  // 223: space.sandbox.manager.v1.SandboxManager.GetEnv:input_type -> space.sandbox.manager.v1.GetEnvRequest
+	46,  // 224: space.sandbox.manager.v1.SandboxManager.List:input_type -> space.sandbox.manager.v1.ListRequest
+	47,  // 225: space.sandbox.manager.v1.SandboxManager.ScanCleanupTargets:input_type -> space.sandbox.manager.v1.ScanCleanupTargetsRequest
+	59,  // 226: space.sandbox.manager.v1.SandboxManager.ListBuildReferencingSandboxes:input_type -> space.sandbox.manager.v1.ListBuildReferencingSandboxesRequest
+	61,  // 227: space.sandbox.manager.v1.SandboxManager.GetDiskUsage:input_type -> space.sandbox.manager.v1.GetDiskUsageRequest
+	64,  // 228: space.sandbox.manager.v1.SandboxManager.Cleanup:input_type -> space.sandbox.manager.v1.CleanupRequest
+	66,  // 229: space.sandbox.manager.v1.SandboxManager.ListTemplates:input_type -> space.sandbox.manager.v1.ListTemplatesRequest
+	69,  // 230: space.sandbox.manager.v1.SandboxManager.Pause:input_type -> space.sandbox.manager.v1.PauseRequest
+	71,  // 231: space.sandbox.manager.v1.SandboxManager.Resume:input_type -> space.sandbox.manager.v1.ResumeRequest
+	73,  // 232: space.sandbox.manager.v1.SandboxManager.Wake:input_type -> space.sandbox.manager.v1.WakeRequest
+	77,  // 233: space.sandbox.manager.v1.SandboxManager.CreateSnapshot:input_type -> space.sandbox.manager.v1.CreateSnapshotRequest
+	197, // 234: space.sandbox.manager.v1.SandboxManager.WaitTemplateApps:input_type -> space.sandbox.manager.v1.WaitTemplateAppsRequest
+	84,  // 235: space.sandbox.manager.v1.SandboxManager.CreateTemplateBaseSnapshot:input_type -> space.sandbox.manager.v1.CreateTemplateBaseSnapshotRequest
+	86,  // 236: space.sandbox.manager.v1.SandboxManager.Suspend:input_type -> space.sandbox.manager.v1.SuspendRequest
+	185, // 237: space.sandbox.manager.v1.SandboxManager.PrepareTeardownSuspend:input_type -> space.sandbox.manager.v1.PrepareTeardownSuspendRequest
+	90,  // 238: space.sandbox.manager.v1.SandboxManager.EnqueueArtifactBackup:input_type -> space.sandbox.manager.v1.EnqueueArtifactBackupRequest
+	92,  // 239: space.sandbox.manager.v1.SandboxManager.EvictClusterDeletedSandbox:input_type -> space.sandbox.manager.v1.EvictClusterDeletedSandboxRequest
+	95,  // 240: space.sandbox.manager.v1.SandboxManager.UpgradeRuntime:input_type -> space.sandbox.manager.v1.UpgradeRuntimeRequest
+	97,  // 241: space.sandbox.manager.v1.SandboxManager.EnableSnapshots:input_type -> space.sandbox.manager.v1.EnableSnapshotsRequest
+	99,  // 242: space.sandbox.manager.v1.SandboxManager.DisableSnapshots:input_type -> space.sandbox.manager.v1.DisableSnapshotsRequest
+	101, // 243: space.sandbox.manager.v1.SandboxManager.ListSnapshots:input_type -> space.sandbox.manager.v1.ListSnapshotsRequest
+	105, // 244: space.sandbox.manager.v1.SandboxManager.DeleteSnapshots:input_type -> space.sandbox.manager.v1.DeleteSnapshotsRequest
+	107, // 245: space.sandbox.manager.v1.SandboxManager.Rollback:input_type -> space.sandbox.manager.v1.RollbackRequest
+	109, // 246: space.sandbox.manager.v1.SandboxManager.Stats:input_type -> space.sandbox.manager.v1.StatsRequest
+	111, // 247: space.sandbox.manager.v1.SandboxManager.Update:input_type -> space.sandbox.manager.v1.UpdateRequest
+	145, // 248: space.sandbox.manager.v1.SandboxManager.SetAutoLifecyclePolicy:input_type -> space.sandbox.manager.v1.SetAutoLifecyclePolicyRequest
+	147, // 249: space.sandbox.manager.v1.SandboxManager.TouchAutoLifecycle:input_type -> space.sandbox.manager.v1.TouchAutoLifecycleRequest
+	189, // 250: space.sandbox.manager.v1.SandboxManager.ListAutoLifecycleDeleteReceipts:input_type -> space.sandbox.manager.v1.ListAutoLifecycleDeleteReceiptsRequest
+	191, // 251: space.sandbox.manager.v1.SandboxManager.AcknowledgeAutoLifecycleDeleteReceipts:input_type -> space.sandbox.manager.v1.AcknowledgeAutoLifecycleDeleteReceiptsRequest
+	194, // 252: space.sandbox.manager.v1.SandboxManager.ListPendingLocalBackups:input_type -> space.sandbox.manager.v1.ListPendingLocalBackupsRequest
+	150, // 253: space.sandbox.manager.v1.SandboxManager.GetNetworkPolicy:input_type -> space.sandbox.manager.v1.GetNetworkPolicyRequest
+	152, // 254: space.sandbox.manager.v1.SandboxManager.SetNetworkPolicy:input_type -> space.sandbox.manager.v1.SetNetworkPolicyRequest
+	154, // 255: space.sandbox.manager.v1.SandboxManager.TemplateNetworkPolicyUpdated:input_type -> space.sandbox.manager.v1.TemplateNetworkPolicyUpdatedRequest
+	156, // 256: space.sandbox.manager.v1.SandboxManager.CycleNetGateway:input_type -> space.sandbox.manager.v1.CycleNetGatewayRequest
+	113, // 257: space.sandbox.manager.v1.SandboxManager.SpacedPingGuest:input_type -> space.sandbox.manager.v1.SpacedPingGuestRequest
+	115, // 258: space.sandbox.manager.v1.SandboxManager.SpacedGetStatus:input_type -> space.sandbox.manager.v1.SpacedGetStatusRequest
+	118, // 259: space.sandbox.manager.v1.SandboxManager.SpacedWaitReady:input_type -> space.sandbox.manager.v1.SpacedWaitReadyRequest
+	120, // 260: space.sandbox.manager.v1.SandboxManager.SpacedStat:input_type -> space.sandbox.manager.v1.SpacedStatRequest
+	121, // 261: space.sandbox.manager.v1.SandboxManager.SpacedList:input_type -> space.sandbox.manager.v1.SpacedListRequest
+	122, // 262: space.sandbox.manager.v1.SandboxManager.SpacedRead:input_type -> space.sandbox.manager.v1.SpacedReadRequest
+	123, // 263: space.sandbox.manager.v1.SandboxManager.SpacedWrite:input_type -> space.sandbox.manager.v1.SpacedWriteRequest
+	124, // 264: space.sandbox.manager.v1.SandboxManager.SpacedWriteBatch:input_type -> space.sandbox.manager.v1.SpacedWriteBatchRequest
+	125, // 265: space.sandbox.manager.v1.SandboxManager.SpacedMkdir:input_type -> space.sandbox.manager.v1.SpacedMkdirRequest
+	126, // 266: space.sandbox.manager.v1.SandboxManager.SpacedRemove:input_type -> space.sandbox.manager.v1.SpacedRemoveRequest
+	127, // 267: space.sandbox.manager.v1.SandboxManager.SpacedRename:input_type -> space.sandbox.manager.v1.SpacedRenameRequest
+	128, // 268: space.sandbox.manager.v1.SandboxManager.SpacedNormalizeWatchRoot:input_type -> space.sandbox.manager.v1.SpacedNormalizeWatchRootRequest
+	129, // 269: space.sandbox.manager.v1.SandboxManager.SpacedWatch:input_type -> space.sandbox.manager.v1.SpacedWatchRequest
+	130, // 270: space.sandbox.manager.v1.SandboxManager.SpacedCreateWatcher:input_type -> space.sandbox.manager.v1.SpacedCreateWatcherRequest
+	131, // 271: space.sandbox.manager.v1.SandboxManager.SpacedGetWatcherEvents:input_type -> space.sandbox.manager.v1.SpacedGetWatcherEventsRequest
+	132, // 272: space.sandbox.manager.v1.SandboxManager.SpacedRemoveWatcher:input_type -> space.sandbox.manager.v1.SpacedRemoveWatcherRequest
+	133, // 273: space.sandbox.manager.v1.SandboxManager.SpacedEnableFileChanges:input_type -> space.sandbox.manager.v1.SpacedEnableFileChangesRequest
+	134, // 274: space.sandbox.manager.v1.SandboxManager.SpacedDisableFileChanges:input_type -> space.sandbox.manager.v1.SpacedDisableFileChangesRequest
+	135, // 275: space.sandbox.manager.v1.SandboxManager.SpacedGetModifiedFiles:input_type -> space.sandbox.manager.v1.SpacedGetModifiedFilesRequest
+	136, // 276: space.sandbox.manager.v1.SandboxManager.SpacedStartProcess:input_type -> space.sandbox.manager.v1.SpacedStartProcessRequest
+	137, // 277: space.sandbox.manager.v1.SandboxManager.SpacedConnectProcess:input_type -> space.sandbox.manager.v1.SpacedConnectProcessRequest
+	138, // 278: space.sandbox.manager.v1.SandboxManager.SpacedListProcesses:input_type -> space.sandbox.manager.v1.SpacedListProcessesRequest
+	140, // 279: space.sandbox.manager.v1.SandboxManager.SpacedSendSignal:input_type -> space.sandbox.manager.v1.SpacedSendSignalRequest
+	141, // 280: space.sandbox.manager.v1.SandboxManager.SpacedSendInput:input_type -> space.sandbox.manager.v1.SpacedSendInputRequest
+	142, // 281: space.sandbox.manager.v1.SandboxManager.SpacedCloseStdin:input_type -> space.sandbox.manager.v1.SpacedCloseStdinRequest
+	143, // 282: space.sandbox.manager.v1.SandboxManager.SpacedResizePty:input_type -> space.sandbox.manager.v1.SpacedResizePtyRequest
+	144, // 283: space.sandbox.manager.v1.SandboxManager.SpacedKillProcess:input_type -> space.sandbox.manager.v1.SpacedKillProcessRequest
+	180, // 284: space.sandbox.manager.v1.SandboxManager.SpacedOpenLoopbackBridge:input_type -> space.sandbox.manager.v1.SpacedOpenLoopbackBridgeRequest
+	181, // 285: space.sandbox.manager.v1.SandboxManager.SpacedCloseLoopbackBridge:input_type -> space.sandbox.manager.v1.SpacedCloseLoopbackBridgeRequest
+	245, // 286: space.sandbox.manager.v1.SandboxManager.ServicePortIngress:input_type -> space.net.gateway.v1.ServicePortIngressFrame
+	158, // 287: space.sandbox.manager.v1.SandboxManager.AdoptPoolSandbox:input_type -> space.sandbox.manager.v1.AdoptPoolSandboxRequest
+	160, // 288: space.sandbox.manager.v1.SandboxManager.Wait:input_type -> space.sandbox.manager.v1.WaitRequest
+	162, // 289: space.sandbox.manager.v1.SandboxManager.CloneFromDonor:input_type -> space.sandbox.manager.v1.CloneFromDonorRequest
+	164, // 290: space.sandbox.manager.v1.SandboxManager.ExportSnapshot:input_type -> space.sandbox.manager.v1.ExportSnapshotRequest
+	168, // 291: space.sandbox.manager.v1.SandboxManager.ImportSnapshot:input_type -> space.sandbox.manager.v1.ImportSnapshotRequest
+	172, // 292: space.sandbox.manager.v1.SandboxManager.ExportSandbox:input_type -> space.sandbox.manager.v1.ExportSandboxRequest
+	176, // 293: space.sandbox.manager.v1.SandboxManager.ImportSandbox:input_type -> space.sandbox.manager.v1.ImportSandboxRequest
+	182, // 294: space.sandbox.manager.v1.SandboxManager.ResolveSandboxMemory:input_type -> space.sandbox.manager.v1.ResolveSandboxMemoryRequest
+	200, // 295: space.sandbox.manager.v1.SandboxManager.GetExecutionCapabilities:output_type -> space.sandbox.manager.v1.GetExecutionCapabilitiesResponse
+	33,  // 296: space.sandbox.manager.v1.SandboxManager.Create:output_type -> space.sandbox.manager.v1.CreateResponse
+	35,  // 297: space.sandbox.manager.v1.SandboxManager.Start:output_type -> space.sandbox.manager.v1.StartResponse
+	37,  // 298: space.sandbox.manager.v1.SandboxManager.Stop:output_type -> space.sandbox.manager.v1.StopResponse
+	39,  // 299: space.sandbox.manager.v1.SandboxManager.Kill:output_type -> space.sandbox.manager.v1.KillResponse
+	41,  // 300: space.sandbox.manager.v1.SandboxManager.Delete:output_type -> space.sandbox.manager.v1.DeleteResponse
+	43,  // 301: space.sandbox.manager.v1.SandboxManager.State:output_type -> space.sandbox.manager.v1.StateResponse
+	55,  // 302: space.sandbox.manager.v1.SandboxManager.GetSandboxHealth:output_type -> space.sandbox.manager.v1.GetSandboxHealthResponse
+	45,  // 303: space.sandbox.manager.v1.SandboxManager.GetEnv:output_type -> space.sandbox.manager.v1.GetEnvResponse
+	58,  // 304: space.sandbox.manager.v1.SandboxManager.List:output_type -> space.sandbox.manager.v1.ListResponse
+	49,  // 305: space.sandbox.manager.v1.SandboxManager.ScanCleanupTargets:output_type -> space.sandbox.manager.v1.CleanupTargetBatch
+	60,  // 306: space.sandbox.manager.v1.SandboxManager.ListBuildReferencingSandboxes:output_type -> space.sandbox.manager.v1.ListBuildReferencingSandboxesResponse
+	63,  // 307: space.sandbox.manager.v1.SandboxManager.GetDiskUsage:output_type -> space.sandbox.manager.v1.GetDiskUsageResponse
+	65,  // 308: space.sandbox.manager.v1.SandboxManager.Cleanup:output_type -> space.sandbox.manager.v1.CleanupResponse
+	68,  // 309: space.sandbox.manager.v1.SandboxManager.ListTemplates:output_type -> space.sandbox.manager.v1.ListTemplatesResponse
+	70,  // 310: space.sandbox.manager.v1.SandboxManager.Pause:output_type -> space.sandbox.manager.v1.PauseResponse
+	72,  // 311: space.sandbox.manager.v1.SandboxManager.Resume:output_type -> space.sandbox.manager.v1.ResumeResponse
+	76,  // 312: space.sandbox.manager.v1.SandboxManager.Wake:output_type -> space.sandbox.manager.v1.WakeResponse
+	78,  // 313: space.sandbox.manager.v1.SandboxManager.CreateSnapshot:output_type -> space.sandbox.manager.v1.CreateSnapshotResponse
+	198, // 314: space.sandbox.manager.v1.SandboxManager.WaitTemplateApps:output_type -> space.sandbox.manager.v1.WaitTemplateAppsResponse
+	85,  // 315: space.sandbox.manager.v1.SandboxManager.CreateTemplateBaseSnapshot:output_type -> space.sandbox.manager.v1.CreateTemplateBaseSnapshotResponse
+	88,  // 316: space.sandbox.manager.v1.SandboxManager.Suspend:output_type -> space.sandbox.manager.v1.SuspendResponse
+	186, // 317: space.sandbox.manager.v1.SandboxManager.PrepareTeardownSuspend:output_type -> space.sandbox.manager.v1.PrepareTeardownSuspendResponse
+	91,  // 318: space.sandbox.manager.v1.SandboxManager.EnqueueArtifactBackup:output_type -> space.sandbox.manager.v1.EnqueueArtifactBackupResponse
+	93,  // 319: space.sandbox.manager.v1.SandboxManager.EvictClusterDeletedSandbox:output_type -> space.sandbox.manager.v1.EvictClusterDeletedSandboxResponse
+	96,  // 320: space.sandbox.manager.v1.SandboxManager.UpgradeRuntime:output_type -> space.sandbox.manager.v1.UpgradeRuntimeResponse
+	98,  // 321: space.sandbox.manager.v1.SandboxManager.EnableSnapshots:output_type -> space.sandbox.manager.v1.EnableSnapshotsResponse
+	100, // 322: space.sandbox.manager.v1.SandboxManager.DisableSnapshots:output_type -> space.sandbox.manager.v1.DisableSnapshotsResponse
+	102, // 323: space.sandbox.manager.v1.SandboxManager.ListSnapshots:output_type -> space.sandbox.manager.v1.ListSnapshotsResponse
+	106, // 324: space.sandbox.manager.v1.SandboxManager.DeleteSnapshots:output_type -> space.sandbox.manager.v1.DeleteSnapshotsResponse
+	108, // 325: space.sandbox.manager.v1.SandboxManager.Rollback:output_type -> space.sandbox.manager.v1.RollbackResponse
+	110, // 326: space.sandbox.manager.v1.SandboxManager.Stats:output_type -> space.sandbox.manager.v1.StatsResponse
+	112, // 327: space.sandbox.manager.v1.SandboxManager.Update:output_type -> space.sandbox.manager.v1.UpdateResponse
+	146, // 328: space.sandbox.manager.v1.SandboxManager.SetAutoLifecyclePolicy:output_type -> space.sandbox.manager.v1.SetAutoLifecyclePolicyResponse
+	149, // 329: space.sandbox.manager.v1.SandboxManager.TouchAutoLifecycle:output_type -> space.sandbox.manager.v1.TouchAutoLifecycleResponse
+	190, // 330: space.sandbox.manager.v1.SandboxManager.ListAutoLifecycleDeleteReceipts:output_type -> space.sandbox.manager.v1.ListAutoLifecycleDeleteReceiptsResponse
+	192, // 331: space.sandbox.manager.v1.SandboxManager.AcknowledgeAutoLifecycleDeleteReceipts:output_type -> space.sandbox.manager.v1.AcknowledgeAutoLifecycleDeleteReceiptsResponse
+	195, // 332: space.sandbox.manager.v1.SandboxManager.ListPendingLocalBackups:output_type -> space.sandbox.manager.v1.ListPendingLocalBackupsResponse
+	151, // 333: space.sandbox.manager.v1.SandboxManager.GetNetworkPolicy:output_type -> space.sandbox.manager.v1.GetNetworkPolicyResponse
+	153, // 334: space.sandbox.manager.v1.SandboxManager.SetNetworkPolicy:output_type -> space.sandbox.manager.v1.SetNetworkPolicyResponse
+	155, // 335: space.sandbox.manager.v1.SandboxManager.TemplateNetworkPolicyUpdated:output_type -> space.sandbox.manager.v1.TemplateNetworkPolicyUpdatedResponse
+	157, // 336: space.sandbox.manager.v1.SandboxManager.CycleNetGateway:output_type -> space.sandbox.manager.v1.CycleNetGatewayResponse
+	114, // 337: space.sandbox.manager.v1.SandboxManager.SpacedPingGuest:output_type -> space.sandbox.manager.v1.SpacedPingGuestResponse
+	116, // 338: space.sandbox.manager.v1.SandboxManager.SpacedGetStatus:output_type -> space.sandbox.manager.v1.SpacedGetStatusResponse
+	119, // 339: space.sandbox.manager.v1.SandboxManager.SpacedWaitReady:output_type -> space.sandbox.manager.v1.SpacedWaitReadyResponse
+	246, // 340: space.sandbox.manager.v1.SandboxManager.SpacedStat:output_type -> space.spaced.operations.v1.StatResponse
+	247, // 341: space.sandbox.manager.v1.SandboxManager.SpacedList:output_type -> space.spaced.operations.v1.FileInfo
+	248, // 342: space.sandbox.manager.v1.SandboxManager.SpacedRead:output_type -> space.spaced.operations.v1.FileChunk
+	249, // 343: space.sandbox.manager.v1.SandboxManager.SpacedWrite:output_type -> space.spaced.operations.v1.WriteResponse
+	250, // 344: space.sandbox.manager.v1.SandboxManager.SpacedWriteBatch:output_type -> space.spaced.operations.v1.WriteBatchResponse
+	251, // 345: space.sandbox.manager.v1.SandboxManager.SpacedMkdir:output_type -> space.spaced.operations.v1.MkdirResponse
+	252, // 346: space.sandbox.manager.v1.SandboxManager.SpacedRemove:output_type -> space.spaced.operations.v1.RemoveResponse
+	253, // 347: space.sandbox.manager.v1.SandboxManager.SpacedRename:output_type -> space.spaced.operations.v1.RenameResponse
+	254, // 348: space.sandbox.manager.v1.SandboxManager.SpacedNormalizeWatchRoot:output_type -> space.spaced.operations.v1.NormalizeWatchRootResponse
+	255, // 349: space.sandbox.manager.v1.SandboxManager.SpacedWatch:output_type -> space.spaced.operations.v1.FileEvent
+	256, // 350: space.sandbox.manager.v1.SandboxManager.SpacedCreateWatcher:output_type -> space.spaced.operations.v1.CreateWatcherResponse
+	257, // 351: space.sandbox.manager.v1.SandboxManager.SpacedGetWatcherEvents:output_type -> space.spaced.operations.v1.GetWatcherEventsResponse
+	258, // 352: space.sandbox.manager.v1.SandboxManager.SpacedRemoveWatcher:output_type -> space.spaced.operations.v1.RemoveWatcherResponse
+	259, // 353: space.sandbox.manager.v1.SandboxManager.SpacedEnableFileChanges:output_type -> space.spaced.operations.v1.EnableFileChangesResponse
+	260, // 354: space.sandbox.manager.v1.SandboxManager.SpacedDisableFileChanges:output_type -> space.spaced.operations.v1.DisableFileChangesResponse
+	261, // 355: space.sandbox.manager.v1.SandboxManager.SpacedGetModifiedFiles:output_type -> space.spaced.operations.v1.GetModifiedFilesResponse
+	262, // 356: space.sandbox.manager.v1.SandboxManager.SpacedStartProcess:output_type -> space.spaced.operations.v1.ProcessEvent
+	262, // 357: space.sandbox.manager.v1.SandboxManager.SpacedConnectProcess:output_type -> space.spaced.operations.v1.ProcessEvent
+	139, // 358: space.sandbox.manager.v1.SandboxManager.SpacedListProcesses:output_type -> space.sandbox.manager.v1.SpacedListProcessesResponse
+	263, // 359: space.sandbox.manager.v1.SandboxManager.SpacedSendSignal:output_type -> space.spaced.operations.v1.SendSignalResponse
+	264, // 360: space.sandbox.manager.v1.SandboxManager.SpacedSendInput:output_type -> space.spaced.operations.v1.SendInputResponse
+	265, // 361: space.sandbox.manager.v1.SandboxManager.SpacedCloseStdin:output_type -> space.spaced.operations.v1.CloseStdinResponse
+	266, // 362: space.sandbox.manager.v1.SandboxManager.SpacedResizePty:output_type -> space.spaced.operations.v1.ResizePtyResponse
+	267, // 363: space.sandbox.manager.v1.SandboxManager.SpacedKillProcess:output_type -> space.spaced.operations.v1.KillResponse
+	268, // 364: space.sandbox.manager.v1.SandboxManager.SpacedOpenLoopbackBridge:output_type -> space.spaced.operations.v1.OpenLoopbackBridgeResponse
+	269, // 365: space.sandbox.manager.v1.SandboxManager.SpacedCloseLoopbackBridge:output_type -> space.spaced.operations.v1.CloseLoopbackBridgeResponse
+	245, // 366: space.sandbox.manager.v1.SandboxManager.ServicePortIngress:output_type -> space.net.gateway.v1.ServicePortIngressFrame
+	159, // 367: space.sandbox.manager.v1.SandboxManager.AdoptPoolSandbox:output_type -> space.sandbox.manager.v1.AdoptPoolSandboxResponse
+	161, // 368: space.sandbox.manager.v1.SandboxManager.Wait:output_type -> space.sandbox.manager.v1.WaitResponse
+	163, // 369: space.sandbox.manager.v1.SandboxManager.CloneFromDonor:output_type -> space.sandbox.manager.v1.CloneFromDonorResponse
+	165, // 370: space.sandbox.manager.v1.SandboxManager.ExportSnapshot:output_type -> space.sandbox.manager.v1.ExportSnapshotChunk
+	171, // 371: space.sandbox.manager.v1.SandboxManager.ImportSnapshot:output_type -> space.sandbox.manager.v1.ImportSnapshotResponse
+	173, // 372: space.sandbox.manager.v1.SandboxManager.ExportSandbox:output_type -> space.sandbox.manager.v1.ExportSandboxChunk
+	179, // 373: space.sandbox.manager.v1.SandboxManager.ImportSandbox:output_type -> space.sandbox.manager.v1.ImportSandboxResponse
+	183, // 374: space.sandbox.manager.v1.SandboxManager.ResolveSandboxMemory:output_type -> space.sandbox.manager.v1.ResolveSandboxMemoryResponse
+	295, // [295:375] is the sub-list for method output_type
+	215, // [215:295] is the sub-list for method input_type
+	215, // [215:215] is the sub-list for extension type_name
+	215, // [215:215] is the sub-list for extension extendee
+	0,   // [0:215] is the sub-list for field type_name
 }
 
 func init() { file_sandbox_manager_v1_manager_proto_init() }
@@ -15369,7 +15461,7 @@ func file_sandbox_manager_v1_manager_proto_init() {
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_sandbox_manager_v1_manager_proto_rawDesc), len(file_sandbox_manager_v1_manager_proto_rawDesc)),
-			NumEnums:      25,
+			NumEnums:      26,
 			NumMessages:   183,
 			NumExtensions: 0,
 			NumServices:   1,

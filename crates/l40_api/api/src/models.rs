@@ -209,6 +209,12 @@ pub struct Sandbox {
     pub last_used_at: Option<OffsetDateTime>,
     pub last_access_at: Option<OffsetDateTime>,
     pub last_command_at: Option<OffsetDateTime>,
+    /// The stored `sandboxes.stop_cause` label, parsed into the response by
+    /// `sandbox_to_response`; a label a newer writer added reads as none.
+    #[serde(default)]
+    pub stop_cause: Option<String>,
+    #[serde(default)]
+    pub stop_cause_at: Option<OffsetDateTime>,
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
     #[serde(with = "time::serde::rfc3339")]
@@ -417,10 +423,29 @@ pub struct SandboxResponse {
     pub pool_template: Option<String>,
     pub disk_usage_bytes: Option<u64>,
     pub failure_reason: Option<String>,
+    /// Why a `stopped` sandbox stopped when no one asked it to: its pod was
+    /// torn down or its VM exited. Null for a requested stop, for any other
+    /// lifecycle, and when the sandbox's node predates the cause.
+    pub stop_cause: Option<SandboxStopCauseResponse>,
     pub age: Option<String>,
     /// BYOK: the sandbox runs on dm-crypt encrypted volumes. Stamped at
     /// create time and immutable for the sandbox's lifetime.
     pub volume_encryption: bool,
+}
+
+/// [`SandboxResponse::stop_cause`]: what ended the sandbox's run, and when its
+/// node stopped it, by the node's clock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct SandboxStopCauseResponse {
+    pub reason: pplx_space_sandbox_store::SandboxStopCause,
+    #[serde(with = "time::serde::rfc3339")]
+    pub stopped_at: OffsetDateTime,
+}
+
+/// Whether a rendered lifecycle is `stopped`, the only one a stop cause
+/// explains.
+pub(crate) fn renders_stopped(lifecycle: Option<&str>) -> bool {
+    lifecycle.is_some_and(|lifecycle| lifecycle.trim().eq_ignore_ascii_case("stopped"))
 }
 
 impl SandboxResponse {
@@ -429,6 +454,11 @@ impl SandboxResponse {
         self.lifecycle = state.reported_lifecycle();
         self.status = state.reported_lifecycle();
         self.state_input = state;
+        // An observation that renders the sandbox running shows no cause of
+        // the stop the stored row still describes.
+        if !renders_stopped(self.lifecycle.as_deref()) {
+            self.stop_cause = None;
+        }
     }
 }
 

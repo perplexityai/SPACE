@@ -171,6 +171,7 @@ impl TemplateManagerService {
                 if sbx.pool_template.as_deref() == Some(req.template.as_str()) {
                     let _ = sbx_client
                         .stop(pplx_space_sbx_mgr_client::proto::StopRequest {
+                            stop_cause: None,
                             sandbox_id: sbx.sandbox_id.clone(),
                             template_filter: None,
                             blocking: true,
