@@ -38,4 +38,5 @@ pplx-space-common-svc = { workspace = true }
 pplx-space-node-runtime-core = { workspace = true, features = ["host-runtime", "artifact-store"] }
 
 [dev-dependencies]
+pplx-space-test-env = { workspace = true }
 tokio = { workspace = true, features = ["macros", "test-util"] }

@@ -7,7 +7,9 @@ use std::{
 
 #[test]
 fn runner_drops_privileges_without_procfs() {
-    assert_eq!(Uid::effective(), Uid::from_raw(0), "requires root fixture");
+    if !pplx_space_test_env::root_or_skip("chroot and drop contained runner privileges") {
+        return;
+    }
     const CHILD_ROOT: &str = "SPACE_TEST_CONTAINED_RUNNER_ROOT";
     if let Some(root) = std::env::var_os(CHILD_ROOT) {
         // The runner has already discarded host procfs and must release the

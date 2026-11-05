@@ -6815,6 +6815,7 @@ dependencies = [
  "pplx-space-common-svc",
  "pplx-space-execution-common",
  "pplx-space-node-runtime-core",
+ "pplx-space-test-env",
  "serde",
  "serde_json",
  "tempfile",
