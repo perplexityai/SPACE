@@ -5327,6 +5327,7 @@ dependencies = [
  "pplx-space-env-vars",
  "pplx-space-execution-spec",
  "pplx-space-guest-process",
+ "pplx-space-job-id",
  "pplx-space-k8s-ids",
  "pplx-space-linux-ids",
  "pplx-space-net-common",

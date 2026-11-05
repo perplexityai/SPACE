@@ -23,5 +23,7 @@ rusqlite = { workspace = true }
 [features]
 default = []
 serde = ["dep:serde"]
+# JobId's Postgres impls: uuid_id! compiles them when its caller, here this
+# crate, enables `sqlx`.
 sqlx = ["dep:sqlx"]
 rusqlite = ["dep:rusqlite"]

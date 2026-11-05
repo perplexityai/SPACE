@@ -17,3 +17,12 @@ fn sqlite_stores_canonical_text_and_rejects_invalid_values() {
     conn.query_row::<JobId, _, _>("SELECT 'not-an-id'", [], |row| row.get(0))
         .unwrap_err();
 }
+
+#[test]
+fn debug_names_the_type_and_shows_the_display_text() {
+    let id = JobId::from_uuid(uuid::Uuid::nil());
+    assert_eq!(
+        format!("{id:?}"),
+        "JobId(\"00000000-0000-0000-0000-000000000000\")"
+    );
+}
