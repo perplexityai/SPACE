@@ -128,16 +128,15 @@ REFUSAL_RESTART_SEEN_SECONDS = 30.0
 # The OTLP metric export interval (crates/l10_foundation/observability/src/sink/otlp.rs).
 EXPORT_INTERVAL_SECONDS = 10.0
 # The loops that record the reconciler tick histogram in Kind, by the
-# controller setting that ticks each: started_sandbox_repair,
-# failed_restorable_repair, transient_lifecycle_sweeper and the
-# orphaned-restore-pod GC ship at 60 s, and the Kind bring-up ticks them every
-# 10 s (infra/space/kind/charts/space-cluster-controller-local/values-kind.yaml).
+# controller setting that ticks each: failed_restorable_repair,
+# transient_lifecycle_sweeper and the orphaned-restore-pod GC ship at 60 s,
+# and the Kind bring-up ticks them every 10 s
+# (infra/space/kind/charts/space-cluster-controller-local/values-kind.yaml).
 # The stuck-ContainerCreating GC, also at 60 s, is off on Kind. The warm
 # pool's 5 s loop records it only with its orphan GC on, which Kind leaves off.
 # The preflight reads these from the controller Deployment, so a bench that
 # still ticks at 60 s gets the windows a minute's ticks need.
 RECONCILER_TICK_ENV: dict[str, float] = {
-    "SPACE_STARTED_SANDBOX_REPAIR_TICK_SECS": 60.0,
     "SPACE_FAILED_RESTORABLE_REPAIR_TICK_SECS": 60.0,
     "SPACE_TRANSIENT_LIFECYCLE_SWEEPER_TICK_SECS": 60.0,
     "SPACE_ORPHANED_RESTORE_POD_GC_INTERVAL_SECS": 60.0,

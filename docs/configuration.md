@@ -32,7 +32,7 @@ because disabling it by mistake would leave every create queued forever.
 | Variable | Default | Notes |
 | --- | --- | --- |
 | `SPACE_FAILED_RESTORABLE_REPAIR_ENABLED` | on | Reverts failed restorable sandboxes. |
-| `SPACE_STARTED_SANDBOX_REPAIR_ENABLED` | on | |
+| `SPACE_STARTED_SANDBOX_REPAIR_ENABLED` | retired | Ignored. |
 | `SPACE_FAILED_SANDBOX_CLEANUP_ENABLED` | on | Part of the transient lifecycle sweeper. |
 | `SPACE_INTERNAL_API_DELETED_PARTITION_ENABLED` | on | |
 | `SPACE_INTERNAL_API_DELETED_SUPPRESS_ABSOLUTE` | 500 | |

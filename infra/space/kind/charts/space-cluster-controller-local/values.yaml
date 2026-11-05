@@ -132,19 +132,15 @@ reconcilers:
     env:
       SPACE_PUBLIC_OPERATION_DISPATCHER_ENABLED: "true"
       SPACE_PUBLIC_OPERATION_DISPATCHER_EXECUTION_CONCURRENCY: "16"
-  # Both repairs ship on and live, with no dry-run mode, and deployments run
-  # them so. Each moves a sandbox row back to `suspended` only when no
+  # The repair ships on and live, with no dry-run mode, and deployments run
+  # it so. It moves a failed sandbox row back to `suspended` only when no
   # execution or pod is left and a restorable snapshot is ready, after a
-  # minimum age: 180 s for failed rows (MIN_AGE_SECS,
-  # crates/l40_api/cluster/controller/server/src/failed_restorable_repair/mod.rs),
-  # 300 s for started ones (DEFAULT_MIN_AGE_SECS, started_sandbox_repair/mod.rs).
+  # minimum age of 180 s (MIN_AGE_SECS,
+  # crates/l40_api/cluster/controller/server/src/failed_restorable_repair/mod.rs).
   # Rendered explicitly so the chart says what runs.
   failedRestorableRepair:
     env:
       SPACE_FAILED_RESTORABLE_REPAIR_ENABLED: "true"
-  startedSandboxRepair:
-    env:
-      SPACE_STARTED_SANDBOX_REPAIR_ENABLED: "true"
   orphanedSandboxes:
     env: {}
   warmPool:

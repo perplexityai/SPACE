@@ -19,7 +19,6 @@ use std::sync::LazyLock;
 use pplx_space_common_core::sql;
 use pplx_space_sandbox_portability::{
     failed_repair_revert_eligibility, newest_suspend_snapshot_current,
-    started_repair_revert_eligibility,
 };
 use sqlx::{Postgres, Transaction};
 
@@ -27,100 +26,6 @@ use sqlx::{Postgres, Transaction};
 /// than wrap: any value above i64::MAX means "never act" in human terms.
 fn duration_secs_i64(duration: PositiveDuration) -> i64 {
     i64::try_from(duration.get().as_secs()).unwrap_or(i64::MAX)
-}
-
-/// The row-state guards shared by the started-repair scan and
-/// [`revert_started_to_suspended`]: an aged `started` Kubernetes row with no
-/// active execution and no execution that still carries a `pod_ip` (a row
-/// that could describe a live route). The snapshot eligibility is composed in
-/// separately. `managed_by_param` is bound to [`SubstrateKind::Kubernetes`].
-///
-/// Public only because the caller's candidate scan composes the same guards;
-/// it stays one definition so the scan and the apply cannot drift.
-pub fn started_repair_row_state_guards(managed_by_param: &str, min_age_param: &str) -> String {
-    format!(
-        "s.managed_by = {managed_by_param}
-         AND s.lifecycle = 'started'
-         AND s.lifecycle_changed_at <= NOW() - make_interval(secs => {min_age_param}::BIGINT)
-         AND NOT EXISTS (
-             SELECT 1
-               FROM sandbox_k8s_executions e
-              WHERE e.sandbox_id = s.id
-                AND e.active
-         )
-         AND NOT EXISTS (
-             SELECT 1
-               FROM sandbox_k8s_executions e
-              WHERE e.sandbox_id = s.id
-                AND e.pod_ip IS NOT NULL
-         )"
-    )
-}
-
-/// **Inference.** Revert an aged `started` Kubernetes sandbox with no active
-/// execution and no execution carrying a `pod_ip` to `suspended`, clearing the
-/// current local artifact marker when it is stale. Returns `Some(cleared_marker)` when the row flipped and `None`
-/// when a guard refused it.
-///
-/// The `WHERE` re-verifies every scan condition
-/// ([`started_repair_row_state_guards`] and
-/// [`started_repair_revert_eligibility`]) and asserts the newest execution
-/// generation is still `newest_generation` (0 for none): a raced start
-/// allocates a higher generation, so the CAS matches zero rows. The `pre` CTE
-/// re-derives the marker-clear decision at apply time.
-///
-/// The generation CAS is sound only under the caller's sandbox row lock
-/// (`SELECT ... FOR UPDATE`, in its own earlier statement of the same
-/// transaction): the subqueries here evaluate on this statement's snapshot,
-/// and a lock conflict on the sandbox row re-checks only the row's own
-/// quals, so without the pre-lock a newly committed generation could go
-/// unseen.
-pub async fn revert_started_to_suspended(
-    tx: &mut Transaction<'_, Postgres>,
-    sandbox_id: SandboxId,
-    min_age: PositiveDuration,
-    newest_generation: i64,
-) -> Result<Option<bool>, sqlx::Error> {
-    /// Built once: every input is a literal or a bind placeholder.
-    static QUERY: LazyLock<String> = LazyLock::new(|| {
-        let eligibility = started_repair_revert_eligibility("s");
-        sql!(format!(
-            "WITH pre AS (
-                 SELECT id,
-                        {clear_marker} AS will_clear
-                   FROM sandboxes s
-                  WHERE s.id = $1
-             )
-             UPDATE sandboxes s
-                SET lifecycle = 'suspended',
-                    placement = 'unplaced',
-                    active_node_id = NULL,
-                    command_ready_pending = FALSE,
-                    target_node_id = NULL,
-                    placement_changed_at = NULL,
-                    current_local_artifact_id = CASE WHEN pre.will_clear THEN NULL ELSE s.current_local_artifact_id END,\n\
-                    current_local_artifact_kind = CASE WHEN pre.will_clear THEN NULL ELSE s.current_local_artifact_kind END,\n\
-                    current_local_artifact_origin = CASE WHEN pre.will_clear THEN NULL ELSE s.current_local_artifact_origin END
-               FROM pre
-              WHERE s.id = pre.id
-                AND {guards}
-                AND (SELECT COALESCE(MAX(e.generation), 0)
-                       FROM sandbox_k8s_executions e
-                      WHERE e.sandbox_id = s.id) = $3
-                AND {eligible}
-            RETURNING pre.will_clear",
-            clear_marker = eligibility.clear_marker,
-            guards = started_repair_row_state_guards("$4", "$2"),
-            eligible = eligibility.eligible,
-        ))
-    });
-    sqlx::query_scalar(sqlx::AssertSqlSafe(QUERY.as_str()))
-        .bind(sandbox_id)
-        .bind(duration_secs_i64(min_age))
-        .bind(newest_generation)
-        .bind(SubstrateKind::Kubernetes)
-        .fetch_optional(&mut **tx)
-        .await
 }
 
 /// The row-state guards shared by the failed-restorable scan and
