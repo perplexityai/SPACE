@@ -55,8 +55,8 @@ export async function getConsoleSandboxList(query: string, signal?: AbortSignal)
 
 // `GET /sandboxes/spaced-versions`; see `loadSpacedCounts` for what a server
 // without it answers.
-export function getSpacedVersionCounts(): Promise<unknown> {
-  return adminApi.get<unknown>('/v1/sandboxes/spaced-versions');
+export function getSpacedVersionCounts(signal?: AbortSignal): Promise<unknown> {
+  return adminApi.get<unknown>('/v1/sandboxes/spaced-versions', { signal });
 }
 
 // `id` may be any form `parseSandboxRef` accepts; the admin route takes only

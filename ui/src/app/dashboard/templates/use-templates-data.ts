@@ -10,7 +10,7 @@ import { getSpacedVersionCounts } from '@/lib/public-api';
 import { SPACED_SAMPLE_LIMIT, SpacedCounts, loadSpacedCounts } from '@/lib/spaced-counts';
 import { LATEST_TAG, errorMessage, shortHash } from '@/lib/template-format';
 import { visibleTemplateTags } from '@/lib/template-list';
-import { attemptGate, latestRead, refreshAll, type LatestRead, type ReadWrite } from '@/lib/template-reads';
+import { ReadDroppedError, attemptGate, latestRead, refreshAll, type LatestRead, type ReadWrite } from '@/lib/template-reads';
 import {
   markViewRefreshed,
   runLockedViewRefresh,
@@ -85,6 +85,17 @@ export interface RefreshOptions {
 
 function runRead<T>(slot: LatestRead<T>, mode: ReadMode, read: (signal: AbortSignal) => Promise<T>, write: ReadWrite<T>) {
   return mode === 'poll' ? slot.poll(read, write) : slot.next(read, write);
+}
+
+// A read the closed page dropped stays recognisable, so it is not reported.
+function refreshFailure(err: unknown, what: string) {
+  return err instanceof ReadDroppedError ? err : new Error(`failed to refresh ${what}`);
+}
+
+// Whether a failure is worth telling the operator: not a read the page that
+// asked for it dropped when it closed.
+export function reportableFailure(err: unknown) {
+  return !(err instanceof ReadDroppedError);
 }
 
 interface TemplatesAnswer {
@@ -205,8 +216,8 @@ export function useTemplatesData({ viewKey, templateName }: Options) {
           },
         },
       );
-    } catch {
-      throw new Error('failed to refresh template releases');
+    } catch (err) {
+      throw refreshFailure(err, 'template releases');
     } finally {
       if (showLoading) setLoadingReleases(false);
     }
@@ -224,7 +235,9 @@ export function useTemplatesData({ viewKey, templateName }: Options) {
       mode,
       (signal) => loadSpacedCounts(
         getSpacedVersionCounts,
-        () => adminApi.get<Sandbox[]>(`/v1/sandboxes?limit=${SPACED_SAMPLE_LIMIT}`, { signal }),
+        (sampleSignal) => adminApi.get<Sandbox[]>(`/v1/sandboxes?limit=${SPACED_SAMPLE_LIMIT}`, { signal: sampleSignal }),
+        SPACED_SAMPLE_LIMIT,
+        signal,
       ),
       {
         value: (counts) => {
@@ -332,8 +345,8 @@ export function useTemplatesData({ viewKey, templateName }: Options) {
         },
       );
       return answer.items;
-    } catch {
-      throw new Error('failed to refresh templates');
+    } catch (err) {
+      throw refreshFailure(err, 'templates');
     } finally {
       if (showLoading) setLoadingTemplates(false);
     }
@@ -355,8 +368,8 @@ export function useTemplatesData({ viewKey, templateName }: Options) {
           error: (err) => console.warn(errorMessage(err)),
         },
       );
-    } catch {
-      throw new Error('failed to refresh template inventory');
+    } catch (err) {
+      throw refreshFailure(err, 'template inventory');
     } finally {
       if (showLoading) setLoadingInventory(false);
     }
@@ -374,8 +387,8 @@ export function useTemplatesData({ viewKey, templateName }: Options) {
         (signal) => adminApi.get<ClusterPoolConfig[]>('/v1/warm-pools', { signal }),
         { value: setClusterPools, error: () => undefined },
       );
-    } catch {
-      throw new Error('failed to refresh cluster pools');
+    } catch (err) {
+      throw refreshFailure(err, 'cluster pools');
     }
   };
 
@@ -391,8 +404,8 @@ export function useTemplatesData({ viewKey, templateName }: Options) {
         (signal) => adminApi.get<WarmPoolPolicy[]>('/v1/warm-pool-policies', { signal }),
         { value: setWarmPoolPolicies, error: () => undefined },
       );
-    } catch {
-      throw new Error('failed to refresh warm pool policies');
+    } catch (err) {
+      throw refreshFailure(err, 'warm pool policies');
     }
   };
 
@@ -473,7 +486,9 @@ export function useTemplatesData({ viewKey, templateName }: Options) {
     setTemplateMissing(false);
     setTemplatesLoaded(false);
     setTemplatesError(null);
-    void refresh({ includeBaseSnapshotPolicies: withBaseSnapshotPolicy }).catch((err: unknown) => message.error(errorMessage(err)));
+    void refresh({ includeBaseSnapshotPolicies: withBaseSnapshotPolicy }).catch((err: unknown) => {
+      if (reportableFailure(err)) message.error(errorMessage(err));
+    });
     const interval = setInterval(maybeRefresh, VIEW_REFRESH_INTERVAL_MS);
     return () => {
       clearInterval(interval);
@@ -507,7 +522,7 @@ export function useTemplatesData({ viewKey, templateName }: Options) {
       }
       message.success('Templates refreshed');
     }).catch((err: unknown) => {
-      message.error(errorMessage(err));
+      if (reportableFailure(err)) message.error(errorMessage(err));
     }).finally(() => {
       setManualRefreshing(false);
     });

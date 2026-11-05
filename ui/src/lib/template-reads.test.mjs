@@ -64,6 +64,36 @@ test('a read superseded by an explicit read or a reset never writes, and its cal
   }
 });
 
+test('a superseded read whose request ignores its signal still settles, and so does the refresh over it', { timeout: 2_000 }, async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  for (const [name, supersede, outcome] of [
+    // The spaced-versions read once sent no signal: aborting it did not end it.
+    ['explicit read', (h) => h.slot.next(h.read('newer'), h.write), 'newer'],
+    // The page closed: no read follows, and the caller must not wait for one.
+    ['reset with no next read', (h) => { h.slot.reset(); return null; }, 'ReadDroppedError'],
+  ]) {
+    const h = harness(20_000);
+    const older = h.slot.poll(() => new Promise(() => {}), h.write);
+    const calls = [];
+    const refreshing = refreshAll([older], { settled: () => calls.push('settled'), succeeded: () => calls.push('succeeded') });
+    const newer = supersede(h);
+    if (newer) {
+      h.sent[0].answer();
+      assert.equal(await newer, 'newer', name);
+      assert.equal(await older, 'newer', name);
+      await refreshing;
+      assert.deepEqual(calls, ['succeeded', 'settled'], name);
+    } else {
+      await assert.rejects(older, { name: outcome }, name);
+      await assert.rejects(refreshing, { name: outcome }, name);
+      assert.deepEqual(calls, ['settled'], name);
+    }
+    // The superseded read's timeout went with it.
+    t.mock.timers.tick(20_000);
+    assert.deepEqual(h.written, newer ? [['value', 'newer']] : [], name);
+  }
+});
+
 test('a refresh counts as done whether its reads answer or fail, and is marked fresh only when all answer', async () => {
   for (const [name, reads, fails] of [
     ['all answer', [Promise.resolve('builds'), Promise.resolve('inventory')], null],

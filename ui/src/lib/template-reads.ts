@@ -22,6 +22,15 @@ export class ReadTimeoutError extends Error {
   }
 }
 
+// Why a reset's dropped read failed when no read followed it: the page that
+// asked has closed, so there is nothing to report.
+export class ReadDroppedError extends Error {
+  constructor() {
+    super('the read was dropped');
+    this.name = 'ReadDroppedError';
+  }
+}
+
 // What a read writes, called only while it is the slot's current read.
 export interface ReadWrite<T> {
   value(value: T): void;
@@ -36,8 +45,9 @@ export interface LatestRead<T> {
   // An explicit read: cancels the pending read, whose answer then never
   // writes, and starts a new one.
   next(read: Read<T>, write: ReadWrite<T>): Promise<T>;
-  // Drops the pending read without starting another (the page now shows
-  // another template). Its callers take the next read's answer.
+  // Drops the pending read without starting another. Its callers take the
+  // answer of a read started in the same turn (the page now shows another
+  // template); with none (the page closed), they fail with `ReadDroppedError`.
   reset(): void;
 }
 
@@ -49,8 +59,13 @@ function withTimeout<T>(work: Promise<T>, ms: number, controller: AbortControlle
       controller.abort(err);
       reject(err);
     }, ms);
-    // A superseded read is cancelled: its timer goes with it.
-    controller.signal.addEventListener('abort', () => clearTimeout(timer), { once: true });
+    // A superseded read is cancelled: its timer goes with it, and it settles
+    // now even if its request ignores the signal, so its caller is not left
+    // waiting.
+    controller.signal.addEventListener('abort', () => {
+      clearTimeout(timer);
+      reject(controller.signal.reason);
+    }, { once: true });
   });
   return Promise.race([work, timeout]).finally(() => clearTimeout(timer));
 }
@@ -63,14 +78,12 @@ export function latestRead<T>(timeoutMs = READ_TIMEOUT_MS): LatestRead<T> {
   // The newest read started since the last reset, answered or not.
   let latest: Promise<T> | null = null;
   let controller: AbortController | null = null;
-  // Callers whose read a reset dropped, waiting for the next read.
-  let followers: ((outcome: Promise<T>) => void)[] = [];
 
   // A superseded read's caller gets the newer read's answer: an explicit
-  // read never leaves its caller without one.
-  const follow = (): Promise<T> => latest ?? new Promise<T>((resolve, reject) => {
-    followers.push((outcome) => outcome.then(resolve, reject));
-  });
+  // read never leaves its caller without one. A superseded read's answer is
+  // handled after the turn that superseded it, so a read that turn started
+  // is already `latest`; with none, the caller fails with the abort.
+  const follow = (signal: AbortSignal): Promise<T> => latest ?? Promise.reject(signal.reason);
 
   const start = (read: Read<T>, write: ReadWrite<T>): Promise<T> => {
     controller?.abort();
@@ -79,14 +92,14 @@ export function latestRead<T>(timeoutMs = READ_TIMEOUT_MS): LatestRead<T> {
     controller = own;
     const outcome = withTimeout(read(own.signal), timeoutMs, own).then(
       (value) => {
-        if (mine !== generation) return follow();
+        if (mine !== generation) return follow(own.signal);
         pending = null;
         controller = null;
         write.value(value);
         return value;
       },
       (err: unknown) => {
-        if (mine !== generation) return follow();
+        if (mine !== generation) return follow(own.signal);
         pending = null;
         controller = null;
         write.error(err);
@@ -95,9 +108,6 @@ export function latestRead<T>(timeoutMs = READ_TIMEOUT_MS): LatestRead<T> {
     );
     pending = outcome;
     latest = outcome;
-    const waiting = followers;
-    followers = [];
-    for (const resume of waiting) resume(outcome);
     return outcome;
   };
 
@@ -105,7 +115,7 @@ export function latestRead<T>(timeoutMs = READ_TIMEOUT_MS): LatestRead<T> {
     poll: (read, write) => pending ?? start(read, write),
     next: start,
     reset: () => {
-      controller?.abort();
+      controller?.abort(new ReadDroppedError());
       controller = null;
       generation += 1;
       pending = null;

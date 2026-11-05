@@ -135,20 +135,22 @@ export function spacedCountRouteMissing(err: unknown): boolean {
 }
 
 // The server's count when it has the route, else the tally of a sample.
+// `signal`, when given, goes to both requests.
 export async function loadSpacedCounts(
-  readServer: () => Promise<unknown>,
-  readSample: () => Promise<Row[]>,
+  readServer: (signal?: AbortSignal) => Promise<unknown>,
+  readSample: (signal?: AbortSignal) => Promise<Row[]>,
   sampleLimit: number = SPACED_SAMPLE_LIMIT,
+  signal?: AbortSignal,
 ): Promise<SpacedCounts> {
   let body: unknown;
   try {
-    body = await readServer();
+    body = await readServer(signal);
   } catch (err) {
     if (!spacedCountRouteMissing(err)) throw err;
-    return spacedCounts(await readSample(), sampleLimit);
+    return spacedCounts(await readSample(signal), sampleLimit);
   }
   const groups = parseServerSpacedCounts(body);
-  return groups ? spacedCountsFromServer(groups) : spacedCounts(await readSample(), sampleLimit);
+  return groups ? spacedCountsFromServer(groups) : spacedCounts(await readSample(signal), sampleLimit);
 }
 
 export function spacedCoverage(counts: SpacedCounts, formatTime: (iso: string) => string): string {
