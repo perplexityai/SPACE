@@ -433,15 +433,25 @@ step('sandboxes-search-fallback-page', ['sandboxes'], async (c) => {
   }
 });
 
+// The API reports `user_email` in the same change that adds `search`, so the
+// search probe tells the two versions apart: an API without `search` predates
+// owner emails and the step skips; one that takes it must report the email,
+// and an inconclusive probe fails. The API fetch is only the oracle for the
+// browser check; the API contract is tested where the API lives. The seeded
+// running sandbox is owned by the password-signed-in admin, a local user, who
+// always has an email.
 step('sandboxes-user-email', ['sandboxes'], async (c) => {
   const id = sandboxId(c, 'running');
   if (!id) return c.rec.check(false, 'the seed has a running sandbox');
+  await visit(c, '/dashboard/sandboxes?age=all&page_size=25', 2000);
+  const probe = await typeSearch(c, shortLabel(id));
+  if (probe.kind === 'fallback') return c.rec.note('the API predates owner emails (it refused search); the User column check is skipped');
+  if (probe.kind === 'failed') return c.rec.check(false, "the API's version is known (search answered or refused as unknown), to tell whether it reports owner emails");
   const api = await adminFetch(c.page, 'GET', `/admin/api/v1/sandboxes/${id}`);
-  if (!api.json || !('user_email' in api.json)) return c.rec.note('the API reports no user_email; the User column shows the user ID');
-  const userEmail = api.json.user_email;
-  // The seeded sandbox's owner is a local user, whose email the API reports.
-  c.rec.check(typeof userEmail === 'string' && userEmail.length > 0, `the API reports the owner's email (${userEmail})`);
-  if (typeof userEmail !== 'string') return;
+  const userEmail = api.json?.user_email;
+  const present = typeof userEmail === 'string' && userEmail.length > 0;
+  c.rec.check(present, "the local owner's email is present to check the User column");
+  if (!present) return;
   // Its full ID, which the list looks up wherever the sandbox is.
   await visit(c, `/dashboard/sandboxes?age=all&id=${id}`, 3000);
   const row = content(c.page).locator('tbody tr.ant-table-row', { hasText: shortLabel(id) });
@@ -467,14 +477,18 @@ step('sandboxes-create-form', ['sandboxes'], async (c) => {
   c.rec.check(!offered.some((option) => runtimes.test(option)), 'no select of the create form offers a runtime');
 });
 
-// The Datadog logs button shows only where SPACE_UI_DATADOG_LOGS_URL is set,
-// which the loop cannot read; it checks what a shown button links to.
+// The Datadog logs button shows only where SPACE_UI_DATADOG_LOGS_URL is set on
+// the console; the loop reads whether it is set from its own environment, so
+// run it with the console's value, and checks what the button links to.
 step('sandbox-detail-datadog', ['sandboxes'], async (c) => {
   const id = sandboxId(c, 'running');
   if (!id) return c.rec.check(false, 'the seed has a running sandbox');
   await visit(c, `/dashboard/sandboxes/${id}`, 3000);
   const logs = c.page.getByRole('link', { name: 'Datadog logs' });
-  if (await logs.count() === 0) return c.rec.note('no Datadog logs button (SPACE_UI_DATADOG_LOGS_URL unset)');
+  const shown = await logs.count() > 0;
+  if (c.config.datadogLogsConfigured) c.rec.check(shown, 'the Datadog logs link is shown, as SPACE_UI_DATADOG_LOGS_URL is set');
+  else if (!shown) return c.rec.note('no Datadog logs button (SPACE_UI_DATADOG_LOGS_URL unset)');
+  if (!shown) return;
   const href = new URL((await logs.first().getAttribute('href')) ?? '', c.config.baseUrl);
   c.rec.check(href.protocol === 'https:' && (href.searchParams.get('query') ?? '').includes(id.replace(/^sbx_/, '')), 'the Datadog logs button queries the sandbox on an HTTPS URL');
 });

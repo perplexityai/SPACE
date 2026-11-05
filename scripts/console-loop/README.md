@@ -159,6 +159,10 @@ Every setting is a flag or an environment variable:
 | `--prefix` | `CONSOLE_LOOP_PREFIX` | `loop` |
 | `--template` (seed) | `CONSOLE_LOOP_TEMPLATE` | `seed:latest` |
 
+`SPACE_UI_DATADOG_LOGS_URL` has no flag: set it in the loop's environment to
+what the console under test has, and the detail step then requires the
+"Datadog logs" link (only whether it is set is read, not its value).
+
 A prefix is up to 32 lowercase letters, digits and dashes. `npm run seed`
 also takes `--skip-sandboxes`, and `npm run clean` takes `--delete-orgs`.
 `npm run loop` also takes `--label NAME`, `--slow-ms N` (default 1500),
