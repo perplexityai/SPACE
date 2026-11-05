@@ -14,6 +14,7 @@ import {
 import { isDigestTag, visibleTemplateTags } from '@/lib/template-list';
 import { singleFlight } from '@/lib/single-flight';
 import { TAG_PRECONDITION_UNCHECKED, moveReleaseTag, tagMoveFailureMessage } from '@/lib/admin-fallback';
+import { runMutation } from '@/lib/mutation-refresh';
 import NetworkPolicyDesigner, { networkPoliciesEqual } from '@/components/network-policy-designer';
 import {
   AutoLifecycleEditor,
@@ -25,7 +26,7 @@ import type {
   ClusterPoolConfig, NetworkPolicyV1, SpaceNode, Template, TemplateOperationResponse, TemplateRelease, WarmPoolPolicy,
 } from '@/lib/types';
 import { hasObservedPoolSandboxes } from './template-cells';
-import { encodedPathSegment, nodeLabel, type TemplateAvailabilityRow, type TemplatesData } from './use-templates-data';
+import { encodedPathSegment, nodeLabel, reportableFailure, type TemplateAvailabilityRow, type TemplatesData } from './use-templates-data';
 
 const { Text } = Typography;
 
@@ -155,6 +156,25 @@ export function useTemplateActions(data: TemplatesData, { onTemplateDeleted }: O
 
   const templateOperationRunning = (operation: string) => templateOperations.has(operation);
 
+  // A change's result is told before its refresh starts; a refresh that
+  // fails after it is not the change failing (`runMutation`).
+  const change = <T,>({ mutate, succeeded, refresh, failed = (err) => message.error(errorMessage(err)) }: {
+    mutate: () => Promise<T>;
+    succeeded: (value: T) => void;
+    refresh: (value: T) => Promise<unknown>;
+    failed?: (err: unknown) => void;
+  }) => runMutation({
+    mutate,
+    succeeded,
+    failed,
+    refresh,
+    refreshFailed: (err) => {
+      if (reportableFailure(err)) {
+        message.warning(`The change was made, but the page could not read it back (${errorMessage(err)}). Refresh to see it.`);
+      }
+    },
+  });
+
   const openRetagModal = (release: TemplateRelease) => {
     if (!canManageTemplateReleases) return;
     retagSession.current += 1;
@@ -205,19 +225,18 @@ export function useTemplateActions(data: TemplatesData, { onTemplateDeleted }: O
         setRetagModal((current) => ({ ...current, ...step.baseline }));
         return;
       }
-      // Moved only while the tag still points where the operator saw it.
-      const { checked } = await moveReleaseTag(
-        (path, body) => adminApi.put(path, body),
-        release.id,
-        tag,
-        step.expected,
-      );
-      closeRetagModal();
-      await refreshTemplateReleases({ showLoading: false });
-      if (checked) message.success('Template release tag updated');
-      else message.warning(`Template release tag updated. ${TAG_PRECONDITION_UNCHECKED}`);
-    } catch (err: unknown) {
-      message.error(tagMoveFailureMessage(err));
+      const expected = step.expected;
+      await change({
+        // Moved only while the tag still points where the operator saw it.
+        mutate: () => moveReleaseTag((path, body) => adminApi.put(path, body), release.id, tag, expected),
+        succeeded: ({ checked }) => {
+          closeRetagModal();
+          if (checked) message.success('Template release tag updated');
+          else message.warning(`Template release tag updated. ${TAG_PRECONDITION_UNCHECKED}`);
+        },
+        failed: (err) => message.error(tagMoveFailureMessage(err)),
+        refresh: () => refreshTemplateReleases({ showLoading: false }),
+      });
     } finally {
       setRetagSubmitting(false);
     }
@@ -228,11 +247,11 @@ export function useTemplateActions(data: TemplatesData, { onTemplateDeleted }: O
     const operation = `delete-tag:${release.id}:${tag}`;
     startTemplateOperation(operation);
     try {
-      await adminApi.delete(`/v1/template-releases/${release.id}/tags/${encodedPathSegment(tag)}`);
-      await refreshTemplateReleases({ showLoading: false });
-      message.success('Template release tag deleted');
-    } catch (err: unknown) {
-      message.error(errorMessage(err));
+      await change({
+        mutate: () => adminApi.delete(`/v1/template-releases/${release.id}/tags/${encodedPathSegment(tag)}`),
+        succeeded: () => message.success('Template release tag deleted'),
+        refresh: () => refreshTemplateReleases({ showLoading: false }),
+      });
     } finally {
       finishTemplateOperation(operation);
     }
@@ -243,14 +262,14 @@ export function useTemplateActions(data: TemplatesData, { onTemplateDeleted }: O
     const operation = `delete-release:${release.id}`;
     startTemplateOperation(operation);
     try {
-      await adminApi.delete(`/v1/template-releases/${release.id}`);
-      await Promise.all([
-        refreshTemplateReleases({ showLoading: false }),
-        refreshTemplates({ showLoading: false }),
-      ]);
-      message.success('Template release deleted');
-    } catch (err: unknown) {
-      message.error(errorMessage(err));
+      await change({
+        mutate: () => adminApi.delete(`/v1/template-releases/${release.id}`),
+        succeeded: () => message.success('Template release deleted'),
+        refresh: () => Promise.all([
+          refreshTemplateReleases({ showLoading: false }),
+          refreshTemplates({ showLoading: false }),
+        ]),
+      });
     } finally {
       finishTemplateOperation(operation);
     }
@@ -280,8 +299,8 @@ export function useTemplateActions(data: TemplatesData, { onTemplateDeleted }: O
     const release = clusterPoolModal.release;
     if (!release) return;
 
-    try {
-      await adminApi.put('/v1/warm-pools', {
+    await change({
+      mutate: () => adminApi.put('/v1/warm-pools', {
         template_name: release.template_name,
         content_hash: release.content_hash,
         vcpu: values.vcpu,
@@ -299,25 +318,25 @@ export function useTemplateActions(data: TemplatesData, { onTemplateDeleted }: O
         max_warming_slots: values.max_warming_slots,
         namespace: values.namespace?.trim() || undefined,
         enabled: values.enabled ?? true,
-      });
-      closeClusterPoolModal();
-      await Promise.all([
+      }),
+      succeeded: () => {
+        closeClusterPoolModal();
+        message.success('Cluster pool config saved');
+      },
+      refresh: () => Promise.all([
         refreshClusterPools(),
         refreshTemplateReleases({ showLoading: false }),
-      ]);
-      message.success('Cluster pool config saved');
-    } catch (err: unknown) {
-      message.error(errorMessage(err));
-    }
+      ]),
+    });
   };
 
   const handleDisableClusterPool = async () => {
     const existing = clusterPoolModal.config;
     if (!existing) return;
 
-    try {
-      if (existing.managed_by === 'autoscaler') {
-        await adminApi.put('/v1/warm-pools', {
+    await change({
+      mutate: () => existing.managed_by === 'autoscaler'
+        ? adminApi.put('/v1/warm-pools', {
           template_name: existing.template_name,
           content_hash: existing.content_hash,
           vcpu: existing.vcpu,
@@ -328,19 +347,17 @@ export function useTemplateActions(data: TemplatesData, { onTemplateDeleted }: O
           max_warming_slots: existing.max_warming_slots,
           namespace: existing.namespace,
           enabled: false,
-        });
-      } else {
-        await adminApi.delete(`/v1/warm-pools/${existing.id}`);
-      }
-      closeClusterPoolModal();
-      await Promise.all([
+        })
+        : adminApi.delete(`/v1/warm-pools/${existing.id}`),
+      succeeded: () => {
+        closeClusterPoolModal();
+        message.success('Cluster pool disabled');
+      },
+      refresh: () => Promise.all([
         refreshClusterPools(),
         refreshTemplateReleases({ showLoading: false }),
-      ]);
-      message.success('Cluster pool disabled');
-    } catch (err: unknown) {
-      message.error(errorMessage(err));
-    }
+      ]),
+    });
   };
 
   const openWarmPoolPolicyModal = (policy: WarmPoolPolicy | null = null, template: string | null = null) => {
@@ -373,32 +390,36 @@ export function useTemplateActions(data: TemplatesData, { onTemplateDeleted }: O
   ) => {
     const hasDiskIoLimits = !formNumberIsBlank(values.disk_io_max_operations_per_sec)
       && !formNumberIsBlank(values.disk_io_max_bandwidth_mib_per_sec);
-    await adminApi.put('/v1/warm-pool-policies', {
-      template_name: values.template_name,
-      vcpu: values.vcpu,
-      memory_mib: values.memory_mib,
-      ...(warmPoolPolicyCapabilities.disk_capacity && !formNumberIsBlank(values.disk_mib)
-        ? { disk_mib: values.disk_mib }
-        : {}),
-      ...(resetDiskToTemplateDefault ? { reset_disk_to_template_default: true } : {}),
-      min_ready_slots: values.min_ready_slots,
-      max_ready_slots: values.max_ready_slots,
-      refill_per_tick: values.refill_per_tick,
-      max_warming_slots: values.max_warming_slots,
-      retain_releases: values.retain_releases,
-      ...(hasDiskIoLimits ? {
-        disk_io_max_operations_per_sec: values.disk_io_max_operations_per_sec,
-        disk_io_max_bandwidth_mib_per_sec: values.disk_io_max_bandwidth_mib_per_sec,
-      } : {}),
-      ...(resetDiskIoToDefault ? { reset_disk_io_to_default: true } : {}),
-      enabled: values.enabled ?? true,
+    await change({
+      mutate: () => adminApi.put('/v1/warm-pool-policies', {
+        template_name: values.template_name,
+        vcpu: values.vcpu,
+        memory_mib: values.memory_mib,
+        ...(warmPoolPolicyCapabilities.disk_capacity && !formNumberIsBlank(values.disk_mib)
+          ? { disk_mib: values.disk_mib }
+          : {}),
+        ...(resetDiskToTemplateDefault ? { reset_disk_to_template_default: true } : {}),
+        min_ready_slots: values.min_ready_slots,
+        max_ready_slots: values.max_ready_slots,
+        refill_per_tick: values.refill_per_tick,
+        max_warming_slots: values.max_warming_slots,
+        retain_releases: values.retain_releases,
+        ...(hasDiskIoLimits ? {
+          disk_io_max_operations_per_sec: values.disk_io_max_operations_per_sec,
+          disk_io_max_bandwidth_mib_per_sec: values.disk_io_max_bandwidth_mib_per_sec,
+        } : {}),
+        ...(resetDiskIoToDefault ? { reset_disk_io_to_default: true } : {}),
+        enabled: values.enabled ?? true,
+      }),
+      succeeded: () => {
+        closeWarmPoolPolicyModal();
+        message.success('Warm pool policy saved');
+      },
+      refresh: () => Promise.all([
+        refreshWarmPoolPolicies(),
+        refreshTemplateReleases({ showLoading: false }),
+      ]),
     });
-    closeWarmPoolPolicyModal();
-    await Promise.all([
-      refreshWarmPoolPolicies(),
-      refreshTemplateReleases({ showLoading: false }),
-    ]);
-    message.success('Warm pool policy saved');
   };
 
   const handleWarmPoolPolicySubmit = async (values: WarmPoolPolicyValues) => {
@@ -456,32 +477,32 @@ export function useTemplateActions(data: TemplatesData, { onTemplateDeleted }: O
 
   const handleTemplateLifecycleUpdate = async (values: { auto_lifecycle?: any }) => {
     if (!editingTemplateLifecycle) return;
-    try {
-      const templateName = editingTemplateLifecycle.name;
-      await adminApi.patch(`/v1/templates/${encodedPathSegment(templateName)}`, {
+    const templateName = editingTemplateLifecycle.name;
+    await change({
+      mutate: () => adminApi.patch(`/v1/templates/${encodedPathSegment(templateName)}`, {
         default_auto_lifecycle: formValueToPolicy(values.auto_lifecycle),
-      });
-      closeTemplateLifecycleModal();
-      await refreshTemplates({ showLoading: false, includeBaseSnapshotPolicies: true });
-      message.success('Template lifecycle policy updated');
-    } catch (err: unknown) {
-      message.error(errorMessage(err));
-    }
+      }),
+      succeeded: () => {
+        closeTemplateLifecycleModal();
+        message.success('Template lifecycle policy updated');
+      },
+      refresh: () => refreshTemplates({ showLoading: false, includeBaseSnapshotPolicies: true }),
+    });
   };
 
   const handleTemplateLifecycleClear = async () => {
     if (!editingTemplateLifecycle) return;
-    try {
-      const templateName = editingTemplateLifecycle.name;
-      await adminApi.patch(`/v1/templates/${encodedPathSegment(templateName)}`, {
+    const templateName = editingTemplateLifecycle.name;
+    await change({
+      mutate: () => adminApi.patch(`/v1/templates/${encodedPathSegment(templateName)}`, {
         default_auto_lifecycle: disabledAutoLifecycle(),
-      });
-      closeTemplateLifecycleModal();
-      await refreshTemplates({ showLoading: false, includeBaseSnapshotPolicies: true });
-      message.success('Template lifecycle policy cleared');
-    } catch (err: unknown) {
-      message.error(errorMessage(err));
-    }
+      }),
+      succeeded: () => {
+        closeTemplateLifecycleModal();
+        message.success('Template lifecycle policy cleared');
+      },
+      refresh: () => refreshTemplates({ showLoading: false, includeBaseSnapshotPolicies: true }),
+    });
   };
 
   const handleTemplateNetworkSave = async (policy: NetworkPolicyV1) => {
@@ -491,33 +512,40 @@ export function useTemplateActions(data: TemplatesData, { onTemplateDeleted }: O
       return;
     }
 
-    try {
-      const templateName = editingTemplateNetwork.name;
-      await adminApi.patch(`/v1/templates/${encodedPathSegment(templateName)}`, {
+    const templateName = editingTemplateNetwork.name;
+    await change({
+      mutate: () => adminApi.patch(`/v1/templates/${encodedPathSegment(templateName)}`, {
         network_policy: policy,
-      });
-      setEditingTemplateNetwork(null);
-      await refreshTemplates({ showLoading: false, includeBaseSnapshotPolicies: true });
-      message.success('Template network policy updated');
-    } catch (err: unknown) {
-      message.error(errorMessage(err));
-    }
+      }),
+      succeeded: () => {
+        setEditingTemplateNetwork(null);
+        message.success('Template network policy updated');
+      },
+      refresh: () => refreshTemplates({ showLoading: false, includeBaseSnapshotPolicies: true }),
+    });
   };
 
   const handleDelete = async (name: string) => {
     const operation = `delete-template:${name}`;
     startTemplateOperation(operation);
     try {
-      const response = await adminApi.delete<TemplateOperationResponse>(
-        `/v1/templates/${encodedPathSegment(name)}`,
-        { 'Idempotency-Key': idempotencyKey() },
-      );
-      await waitForPublicOperation(response.operation_id, 120_000);
-      if (!onTemplateDeleted) await refresh({ showLoading: false });
-      message.success(`Template ${name} deleted`);
-      onTemplateDeleted?.(name);
-    } catch (err: unknown) {
-      message.error(errorMessage(err));
+      await change({
+        mutate: async () => {
+          const response = await adminApi.delete<TemplateOperationResponse>(
+            `/v1/templates/${encodedPathSegment(name)}`,
+            { 'Idempotency-Key': idempotencyKey() },
+          );
+          await waitForPublicOperation(response.operation_id, 120_000);
+        },
+        succeeded: () => {
+          message.success(`Template ${name} deleted`);
+          onTemplateDeleted?.(name);
+        },
+        // The template page leaves instead; the list it opens reads afresh.
+        refresh: async () => {
+          if (!onTemplateDeleted) await refresh({ showLoading: false });
+        },
+      });
     } finally {
       finishTemplateOperation(operation);
     }
@@ -542,37 +570,38 @@ export function useTemplateActions(data: TemplatesData, { onTemplateDeleted }: O
 
   const handlePoolSubmit = async (values: { target_count: number; boot_mode: 'cold' | 'snapshot' }) => {
     if (!poolModal.name) return;
-    try {
-      await adminApi.post(`/v1/templates/${encodedPathSegment(poolModal.name)}/pool`, values);
-      closePoolModal();
-      await refreshTemplates({ showLoading: false });
-      message.success('Template pool policy saved');
-    } catch (err: unknown) {
-      message.error(errorMessage(err));
-    }
+    const name = poolModal.name;
+    await change({
+      mutate: () => adminApi.post(`/v1/templates/${encodedPathSegment(name)}/pool`, values),
+      succeeded: () => {
+        closePoolModal();
+        message.success('Template pool policy saved');
+      },
+      refresh: () => refreshTemplates({ showLoading: false }),
+    });
   };
 
   const handleDeletePool = async (name: string) => {
-    try {
-      await adminApi.delete(`/v1/templates/${encodedPathSegment(name)}/pool`);
-      closePoolModal();
-      await refreshTemplates({ showLoading: false });
-      message.success('Template pool policy deleted');
-    } catch (err: unknown) {
-      message.error(errorMessage(err));
-    }
+    await change({
+      mutate: () => adminApi.delete(`/v1/templates/${encodedPathSegment(name)}/pool`),
+      succeeded: () => {
+        closePoolModal();
+        message.success('Template pool policy deleted');
+      },
+      refresh: () => refreshTemplates({ showLoading: false }),
+    });
   };
 
   const handleToggleBaseSnapshot = async (template: Template, enabled: boolean) => {
     setBuildingSnapshot(template.name);
     try {
-      await adminApi.patch(`/v1/templates/${encodedPathSegment(template.name)}/base-snapshot-policy`, {
-        ensure_base_snapshot: enabled,
+      await change({
+        mutate: () => adminApi.patch(`/v1/templates/${encodedPathSegment(template.name)}/base-snapshot-policy`, {
+          ensure_base_snapshot: enabled,
+        }),
+        succeeded: () => message.success(enabled ? 'Base snapshot policy enabled' : 'Base snapshot policy disabled'),
+        refresh: () => refreshTemplates({ showLoading: false, includeBaseSnapshotPolicies: true }),
       });
-      await refreshTemplates({ showLoading: false, includeBaseSnapshotPolicies: true });
-      message.success(enabled ? 'Base snapshot policy enabled' : 'Base snapshot policy disabled');
-    } catch (err: unknown) {
-      message.error(errorMessage(err));
     } finally {
       setBuildingSnapshot(null);
     }
@@ -599,23 +628,23 @@ export function useTemplateActions(data: TemplatesData, { onTemplateDeleted }: O
       pullForm.resetFields();
       const source = template.nodes.find((availability) => availability.node.id === values.source_node_id);
       const snapshot = source?.snapshots[0] ?? template.nodes.flatMap((availability) => availability.snapshots)[0];
-      await adminApi.post(`/v1/nodes/${values.target_node_id}/template-pulls`, {
-        template_id: template.name,
-        content_hash: template.content_hash || undefined,
-        source_node_id: values.source_node_id,
-        include_snapshot: Boolean(snapshot),
-        snapshot_vcpu: snapshot?.vcpu,
-        snapshot_memory_mib: snapshot?.memory_mib,
-        skip_if_exists: true,
-        block_on_snapshot_policy_achieved: true,
+      await change({
+        mutate: () => adminApi.post(`/v1/nodes/${values.target_node_id}/template-pulls`, {
+          template_id: template.name,
+          content_hash: template.content_hash || undefined,
+          source_node_id: values.source_node_id,
+          include_snapshot: Boolean(snapshot),
+          snapshot_vcpu: snapshot?.vcpu,
+          snapshot_memory_mib: snapshot?.memory_mib,
+          skip_if_exists: true,
+          block_on_snapshot_policy_achieved: true,
+        }),
+        succeeded: () => message.success('Template pull queued'),
+        refresh: () => Promise.all([
+          refreshInventory({ showLoading: false }),
+          refreshTemplateReleases({ showLoading: false }),
+        ]),
       });
-      await Promise.all([
-        refreshInventory({ showLoading: false }),
-        refreshTemplateReleases({ showLoading: false }),
-      ]);
-      message.success('Template pull queued');
-    } catch (err: unknown) {
-      message.error(errorMessage(err));
     } finally {
       finishTemplateOperation(operation);
     }
@@ -628,11 +657,11 @@ export function useTemplateActions(data: TemplatesData, { onTemplateDeleted }: O
       const query = template.content_hash
         ? `?content_hash=${encodeURIComponent(template.content_hash)}`
         : '';
-      await adminApi.delete(`/v1/nodes/${node.id}/templates/${encodedPathSegment(template.name)}${query}`);
-      await refreshInventory({ showLoading: false });
-      message.success('Template deleted from node');
-    } catch (err: unknown) {
-      message.error(errorMessage(err));
+      await change({
+        mutate: () => adminApi.delete(`/v1/nodes/${node.id}/templates/${encodedPathSegment(template.name)}${query}`),
+        succeeded: () => message.success('Template deleted from node'),
+        refresh: () => refreshInventory({ showLoading: false }),
+      });
     } finally {
       finishTemplateOperation(operation);
     }
