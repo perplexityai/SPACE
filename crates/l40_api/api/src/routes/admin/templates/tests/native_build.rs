@@ -199,6 +199,10 @@ async fn native_build_fixture() -> TestResult<NativeBuildFixture> {
                     assert_eq!(Some(owner.to_string()), request.org_id);
                     assert_eq!(pinned, None, "the accepting builder is not known yet");
                 }
+                let environment = request
+                    .environment
+                    .as_ref()
+                    .map(|input| input.reference.clone());
                 sender.send(request).await.unwrap();
                 if fails.load(Ordering::SeqCst) {
                     let mut trailers = HeaderMap::new();
@@ -212,6 +216,7 @@ async fn native_build_fixture() -> TestResult<NativeBuildFixture> {
                     );
                 }
                 let response = BuildTemplateResponse {
+                    environment,
                     job_id: job_id.to_string(),
                     builder_node_id: node_id.to_string(),
                 }
@@ -587,31 +592,62 @@ async fn native_build_session_ownership(
 #[tokio::test]
 async fn a_system_build_replay_with_its_idempotency_key_starts_one_job(
     #[future] native_build_fixture: TestResult<NativeBuildFixture>,
+    #[values(false, true)] explicit_pair: bool,
 ) -> TestResult {
     if !crate::test_support::enter_sim_worker_process() {
         return Ok(());
     }
     let mut fixture = native_build_fixture.await?;
     let token = build_admin_token(&fixture).await?;
-    let build = |key: &'static str, body: serde_json::Value| {
+    let reference = "sha256:6e97c03b2523af6cc7b8e67bcde3fd89cf756c1958b10c24472aeadd68a32e0a";
+    let build = |key: &'static str, mut body: serde_json::Value| {
+        if explicit_pair && body.get("environment").is_none() {
+            body["environment"] = serde_json::json!(reference);
+        }
         post_system_build(fixture.app.clone(), token.clone(), key, body)
     };
 
-    let (status, first) = build(KEY, serde_json::json!({ "publish_tags": ["candidate"] })).await?;
+    let mut body = serde_json::json!({ "publish_tags": ["candidate"] });
+    if explicit_pair {
+        body["environment"] = serde_json::json!(reference);
+    }
+    let (status, first) = build(KEY, body.clone()).await?;
     assert_eq!(status, StatusCode::ACCEPTED, "{first}");
-    assert!(
-        fixture.builds.try_recv().is_ok(),
-        "the first build dispatches"
-    );
+    let submitted = fixture
+        .builds
+        .try_recv()
+        .expect("the first build dispatches");
+    if explicit_pair {
+        assert!(submitted.recipe.is_none());
+        let selected = submitted.environment.expect("pair forwarded to builder");
+        assert_eq!(selected.reference, reference);
+        let origin = selected.recipe.unwrap().origin.unwrap().kind.unwrap();
+        assert!(matches!(
+            origin,
+            build_proto::recipe::origin::Kind::FromScratch(_)
+        ));
+    } else {
+        assert!(submitted.environment.is_none());
+        assert!(submitted.recipe.is_some());
+    }
     assert_eq!(first["job_id"], fixture.job_id.to_string());
 
-    let (status, replay) = build(KEY, serde_json::json!({ "publish_tags": ["candidate"] })).await?;
+    let (status, replay) = build(KEY, body.clone()).await?;
     assert_eq!(status, StatusCode::ACCEPTED, "{replay}");
     assert_eq!(replay, first);
     assert!(
         fixture.builds.try_recv().is_err(),
         "a replay must not start a second build"
     );
+    if explicit_pair {
+        body["environment"] = serde_json::json!(format!("sha256:{}", "2".repeat(64)));
+        let (status, conflict) = build(KEY, body).await?;
+        assert_eq!(status, StatusCode::CONFLICT, "{conflict}");
+        assert!(
+            fixture.builds.try_recv().is_err(),
+            "changing only the pair must not dispatch"
+        );
+    }
 
     let (status, conflict) = build(KEY, serde_json::json!({ "force": true })).await?;
     assert_eq!(status, StatusCode::CONFLICT, "{conflict}");

@@ -193,6 +193,7 @@ impl BuilderApi for BuilderApiService {
             })?
             .into_inner();
         Ok(Response::new(BuildTemplateResponse {
+            environment: response.environment,
             job_id: response.job_id,
             builder_node_id: self.node_id.to_string(),
         }))

@@ -4852,6 +4852,7 @@ dependencies = [
  "pplx-space-credmgr-client",
  "pplx-space-db-test-fixtures",
  "pplx-space-events",
+ "pplx-space-execution-catalog",
  "pplx-space-feature-flags",
  "pplx-space-internal-api-server",
  "pplx-space-metrics",

@@ -77,34 +77,43 @@ async fn system_build_submits_options_and_reports_publication_outcome() {
 
 #[tokio::test]
 async fn async_seed_build_returns_job_without_polling_or_promoting_latest() {
-    let app = Router::new().route(
-        "/admin/api/v1/system-templates/seed/builds",
-        post(|Json(body): Json<Value>| async move {
-            assert_eq!(body, json!({"base": null, "publish_tags": []}));
-            Json(json!({"job_id": JOB, "template_name": "seed"}))
-        }),
-    );
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let client = AdminClient::new(
-        &format!("http://{}", listener.local_addr().unwrap()),
-        "synthetic-token",
-    )
-    .unwrap();
-    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    let cli =
-        Cli::try_parse_from(["space-admin-cli", "template", "build", "seed", "--async"]).unwrap();
-    let Commands::Template { command } = cli.command else {
-        panic!("template command")
-    };
+    for environment in [None, Some(HASH)] {
+        let app = Router::new().route(
+            "/admin/api/v1/system-templates/seed/builds",
+            post(move |Json(body): Json<Value>| async move {
+                let mut expected = json!({"base": null, "publish_tags": []});
+                if let Some(reference) = environment {
+                    expected["environment"] = json!(reference);
+                }
+                assert_eq!(body, expected);
+                Json(json!({"job_id": JOB, "template_name": "seed"}))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = AdminClient::new(
+            &format!("http://{}", listener.local_addr().unwrap()),
+            "synthetic-token",
+        )
+        .unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut args = vec!["space-admin-cli", "template", "build", "seed", "--async"];
+        if let Some(reference) = environment {
+            args.extend(["--environment", reference]);
+        }
+        let cli = Cli::try_parse_from(args).unwrap();
+        let Commands::Template { command } = cli.command else {
+            panic!("template command")
+        };
 
-    let result = client.template_command(command).await.unwrap();
+        let result = client.template_command(command).await.unwrap();
 
-    assert_eq!(
-        serde_json::from_str::<Value>(&result).unwrap()["job_id"],
-        JOB
-    );
-    server.abort();
-    assert!(server.await.unwrap_err().is_cancelled());
+        assert_eq!(
+            serde_json::from_str::<Value>(&result).unwrap()["job_id"],
+            JOB
+        );
+        server.abort();
+        assert!(server.await.unwrap_err().is_cancelled());
+    }
 }
 
 #[tokio::test]

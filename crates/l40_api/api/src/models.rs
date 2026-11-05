@@ -837,6 +837,9 @@ pub struct TemplateBuildRequest {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SystemTemplateBuildRequest {
+    /// Exact qualified runtime/kernel pair. Omitted: retain the bundled recipe's behavior.
+    #[serde(default)]
+    pub environment: Option<pplx_space_common_core::types::EnvironmentReference>,
     #[serde(default)]
     pub base: Option<pplx_space_common_core::types::TemplateReference>,
     #[serde(default)]

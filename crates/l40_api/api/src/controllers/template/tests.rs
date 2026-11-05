@@ -44,6 +44,7 @@ async fn base_release_fixture() -> TestDbResult<BaseReleaseFixture> {
 
 fn base_submission(base: String, org_id: OrgId) -> TemplateBuildSubmission {
     TemplateBuildSubmission {
+        environment: None,
         target: TemplateBuildTarget::Organization(TemplateName::parse("child").unwrap()),
         client_build_id: None,
         recipe: build_proto::Recipe {
@@ -56,6 +57,37 @@ fn base_submission(base: String, org_id: OrgId) -> TemplateBuildSubmission {
         publish_tags: vec![],
         client: ClientContext::default(),
         org_id,
+    }
+}
+
+#[test]
+fn explicit_build_pair_uses_fail_closed_wire_arm_and_preserves_grants() {
+    let environment: EnvironmentReference = format!("sha256:{}", "1".repeat(64)).parse().unwrap();
+    for selected in [None, Some(environment)] {
+        let org = OrgId::new();
+        let mut submission = base_submission("seed@latest".to_string(), org);
+        submission.environment = selected;
+        let grant = SystemPublicationGrantId::new();
+        let request = submission.into_start_build_request(Some(PublicationGrant::System(grant)));
+        assert_eq!(request.system_publication_grant_id, Some(grant.to_string()));
+        assert_eq!(request.org_id, Some(org.to_string()));
+        match selected {
+            Some(reference) => {
+                assert!(
+                    request.recipe.is_none(),
+                    "legacy daemons cannot accept a selected build"
+                );
+                let input = request
+                    .environment
+                    .expect("explicit pair has a wire binding");
+                assert_eq!(input.reference, reference.to_string());
+                assert!(input.recipe.is_some());
+            }
+            None => {
+                assert!(request.recipe.is_some());
+                assert!(request.environment.is_none());
+            }
+        }
     }
 }
 
@@ -413,6 +445,7 @@ fn accepted_build(builder_node_id: Option<NodeId>) -> (BuildRunId, BuildTemplate
     (
         job_id,
         BuildTemplateResponse {
+            environment: None,
             job_id: job_id.to_string(),
             builder_node_id: builder_node_id.map_or_else(String::new, |id| id.to_string()),
         },
@@ -652,6 +685,7 @@ async fn accepted_build_with_invalid_builder_identity_is_rejected(
 fn template_build_submission_maps_to_builder_request(#[case] system: Option<SystemTemplate>) {
     let org_id = Uuid::parse_str("018f4a92-5c2a-7a10-bf19-5ec77e1d8f9f").unwrap();
     let request = TemplateBuildSubmission {
+        environment: None,
         target: system.map_or_else(
             || TemplateBuildTarget::Organization(TemplateName::parse("custom").unwrap()),
             TemplateBuildTarget::System,
@@ -763,6 +797,7 @@ async fn system_build_withdraws_its_publication_grant_when_dispatch_fails() -> T
         .fetch_one(&db.pool)
     };
     let submission = |target| TemplateBuildSubmission {
+        environment: None,
         target,
         client_build_id: None,
         recipe: build_proto::Recipe::default(),

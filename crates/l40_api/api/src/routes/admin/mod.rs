@@ -213,6 +213,10 @@ pub fn v1_router(state: AppState) -> Router<AppState> {
             axum::routing::post(templates::start_system_template_build),
         )
         .route(
+            "/system-template-environments",
+            get(templates::list_system_template_environments),
+        )
+        .route(
             "/templates/{template_name}/builds",
             get(templates::list_template_builds).post(templates::start_template_build),
         )
