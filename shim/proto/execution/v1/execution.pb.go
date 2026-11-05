@@ -863,8 +863,12 @@ type RuntimeInstallation struct {
 	// and only within one runtime kind. Empty when the driver defines no order
 	// for the version, or the node predates this field.
 	VersionSortKey []uint32 `protobuf:"varint,4,rep,packed,name=version_sort_key,json=versionSortKey,proto3" json:"version_sort_key,omitempty"`
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+	// True when this installation is available only through an explicit
+	// environment binding, not the legacy/unbound runtime projection. Older
+	// producers report only legacy installations and leave this false.
+	RequiresEnvironment bool `protobuf:"varint,5,opt,name=requires_environment,json=requiresEnvironment,proto3" json:"requires_environment,omitempty"`
+	unknownFields       protoimpl.UnknownFields
+	sizeCache           protoimpl.SizeCache
 }
 
 func (x *RuntimeInstallation) Reset() {
@@ -923,6 +927,13 @@ func (x *RuntimeInstallation) GetVersionSortKey() []uint32 {
 		return x.VersionSortKey
 	}
 	return nil
+}
+
+func (x *RuntimeInstallation) GetRequiresEnvironment() bool {
+	if x != nil {
+		return x.RequiresEnvironment
+	}
+	return false
 }
 
 type ArtifactComponentInstallation struct {
@@ -2046,12 +2057,13 @@ const file_execution_v1_execution_proto_rawDesc = "" +
 	"\bidentity\x18\x01 \x01(\v2'.space.execution.v1.StateFormatIdentityR\bidentity\x12\x1d\n" +
 	"\n" +
 	"can_create\x18\x02 \x01(\bR\tcanCreate\x12\x19\n" +
-	"\bcan_load\x18\x03 \x01(\bR\acanLoad\"\x9c\x02\n" +
+	"\bcan_load\x18\x03 \x01(\bR\acanLoad\"\xcf\x02\n" +
 	"\x13RuntimeInstallation\x12=\n" +
 	"\aruntime\x18\x01 \x01(\v2#.space.execution.v1.RuntimeIdentityR\aruntime\x12L\n" +
 	"\x10supported_guests\x18\x02 \x03(\v2!.space.execution.v1.GuestPlatformR\x0fsupportedGuests\x12N\n" +
 	"\rstate_formats\x18\x03 \x03(\v2).space.execution.v1.StateFormatCapabilityR\fstateFormats\x12(\n" +
-	"\x10version_sort_key\x18\x04 \x03(\rR\x0eversionSortKey\"\xb3\x01\n" +
+	"\x10version_sort_key\x18\x04 \x03(\rR\x0eversionSortKey\x121\n" +
+	"\x14requires_environment\x18\x05 \x01(\bR\x13requiresEnvironment\"\xb3\x01\n" +
 	"\x1dArtifactComponentInstallation\x12C\n" +
 	"\tcomponent\x18\x01 \x01(\v2%.space.execution.v1.ArtifactComponentR\tcomponent\x12&\n" +
 	"\x0fdefault_for_new\x18\x02 \x01(\bR\rdefaultForNew\x12%\n" +

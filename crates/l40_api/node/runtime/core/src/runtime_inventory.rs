@@ -1324,15 +1324,26 @@ impl RuntimeInventory {
         })
     }
 
-    /// Legacy placement evidence. Additional environment-only artifacts are
-    /// available through explicit resolution, never as unselected capacity.
+    /// Report verified runtimes, including explicitly admitted managed bindings.
+    /// Reporting a release does not add it to legacy default selection or prove
+    /// that every kernel pairing is usable; those remain separate projections.
     pub fn to_proto(&self) -> pplx_space_execution_common::proto::NodeExecutionInventory {
         use pplx_space_execution_common::proto;
 
         let runtimes = self
             .runtimes
             .iter()
+            .chain(
+                self.environments
+                    .values()
+                    .filter_map(|environment| environment.runtime.as_ref().ok()),
+            )
             .map(|installation| proto::RuntimeInstallation {
+                requires_environment: !self.runtimes.iter().any(|legacy| {
+                    legacy.runtime == installation.runtime
+                        && legacy.guest == installation.guest
+                        && legacy.state_format == installation.state_format
+                }),
                 runtime: Some((&installation.runtime).into()),
                 supported_guests: vec![installation.guest.into()],
                 state_formats: installation
@@ -1349,7 +1360,12 @@ impl RuntimeInventory {
                     version_sort_key(&installation.runtime).as_ref(),
                 ),
             })
-            .collect();
+            .fold(Vec::new(), |mut runtimes, runtime| {
+                if !runtimes.contains(&runtime) {
+                    runtimes.push(runtime);
+                }
+                runtimes
+            });
         let components = self
             .components
             .iter()

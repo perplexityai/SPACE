@@ -701,6 +701,42 @@ fn nondefault_inventory_preserves_e0_and_recovers_only_the_exact_pair() {
     let ready = discover();
     assert_default(&ready);
     assert_legacy(&ready);
+    let mut managed_only = ready.clone();
+    managed_only
+        .runtimes
+        .retain(|runtime| runtime.runtime == initial.release().release);
+    let reported = managed_only.to_proto();
+    let reported_identity = Some((&environment.release().release).into());
+    assert!(
+        reported.runtimes.iter().any(|runtime| {
+            runtime.runtime == reported_identity
+                && runtime.requires_environment
+                && runtime.state_formats.iter().any(|state| {
+                    state.identity.as_ref().is_some_and(|state| {
+                        state.format == "firecracker-snapshot" && state.version == "12.0.0"
+                    })
+                })
+        }),
+        "an admitted verified managed release must be reported without an external copy"
+    );
+    assert!(
+        ready
+            .to_proto()
+            .runtimes
+            .iter()
+            .all(|runtime| !runtime.requires_environment),
+        "an external copy must preserve unbound availability when a managed copy coexists"
+    );
+    assert_eq!(
+        ready
+            .to_proto()
+            .runtimes
+            .iter()
+            .filter(|runtime| runtime.runtime == reported_identity)
+            .count(),
+        1,
+        "external and managed copies of one installation must not duplicate the report"
+    );
     let unreadable = fixture._dir.path().join("blocked-release-root");
     std::fs::write(&unreadable, b"not a directory").unwrap();
     let blocked_store =
@@ -713,6 +749,17 @@ fn nondefault_inventory_preserves_e0_and_recovers_only_the_exact_pair() {
     assert_default(&isolated);
     assert_legacy(&isolated);
     resolve(&isolated).expect_err("an unreadable candidate must fail only its own binding");
+    isolated
+        .runtimes
+        .retain(|runtime| runtime.runtime == initial.release().release);
+    assert!(
+        isolated
+            .to_proto()
+            .runtimes
+            .iter()
+            .all(|runtime| runtime.runtime != reported_identity),
+        "an unavailable managed release must not become reported capacity"
+    );
     let resolved = resolve(&ready).unwrap();
     assert_eq!(resolved.environment, Some(definition.reference()));
     assert_eq!(

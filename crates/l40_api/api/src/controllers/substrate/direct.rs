@@ -40,6 +40,9 @@
 //!   `stopped` and `restoring`, so a start or stop that races a restore lease
 //!   can make the lease's completion miss.
 //! - Warm-pool claims adopt node-side.
+//! - Managed-only installations do not authorize unbound create candidates.
+//!   These use the legacy runtime projection, including FC's historical
+//!   no-inventory fallback.
 //! - Custom vCPU or memory uses separate create and start calls: only
 //!   `StartRequest` carries those fields. A readiness wait still blocks on
 //!   start. Default shapes and disk-only overrides can use one-shot create,
@@ -1813,6 +1816,11 @@ impl DirectSubstrate {
                         + (nss.stale_after - nss.observed_at) > NOW()
                     AND EXISTS (
                         SELECT 1 FROM node_runtime_guests guest
+                        JOIN node_runtime_installations installation
+                          ON installation.node_id = guest.node_id
+                         AND installation.runtime = guest.runtime
+                         AND installation.runtime_version = guest.runtime_version
+                         AND NOT installation.requires_environment
                         WHERE guest.node_id = n.id
                           AND guest.runtime = $3
                           AND guest.guest_os = nti.guest_os
@@ -1831,6 +1839,7 @@ impl DirectSubstrate {
                         SELECT 1 FROM node_runtime_installations runtime
                         WHERE runtime.node_id = n.id
                           AND runtime.runtime = $3
+                          AND NOT runtime.requires_environment
                     )
                )
                AND (
@@ -1844,6 +1853,11 @@ impl DirectSubstrate {
                     ))
                     OR EXISTS (
                         SELECT 1 FROM node_runtime_state_formats state_format
+                        JOIN node_runtime_installations installation
+                          ON installation.node_id = state_format.node_id
+                         AND installation.runtime = state_format.runtime
+                         AND installation.runtime_version = state_format.runtime_version
+                         AND NOT installation.requires_environment
                         WHERE state_format.node_id = n.id
                           AND state_format.runtime = $3
                           AND state_format.state_format_name = nti.state_format_name
@@ -1911,6 +1925,11 @@ impl DirectSubstrate {
                         + (nss.stale_after - nss.observed_at) > NOW()
                     AND EXISTS (
                         SELECT 1 FROM node_runtime_guests guest
+                        JOIN node_runtime_installations installation
+                          ON installation.node_id = guest.node_id
+                         AND installation.runtime = guest.runtime
+                         AND installation.runtime_version = guest.runtime_version
+                         AND NOT installation.requires_environment
                         WHERE guest.node_id = n.id
                           AND guest.runtime = $3
                           AND guest.guest_os = nti.guest_os
@@ -1929,6 +1948,7 @@ impl DirectSubstrate {
                         SELECT 1 FROM node_runtime_installations runtime
                         WHERE runtime.node_id = n.id
                           AND runtime.runtime = $3
+                          AND NOT runtime.requires_environment
                     )
                )
                AND (
@@ -1942,6 +1962,11 @@ impl DirectSubstrate {
                     ))
                     OR EXISTS (
                         SELECT 1 FROM node_runtime_state_formats state_format
+                        JOIN node_runtime_installations installation
+                          ON installation.node_id = state_format.node_id
+                         AND installation.runtime = state_format.runtime
+                         AND installation.runtime_version = state_format.runtime_version
+                         AND NOT installation.requires_environment
                         WHERE state_format.node_id = n.id
                           AND state_format.runtime = $3
                           AND state_format.state_format_name = nti.state_format_name
@@ -2025,6 +2050,7 @@ impl DirectSubstrate {
                         SELECT 1 FROM node_runtime_installations runtime
                         WHERE runtime.node_id = n.id
                           AND runtime.runtime = $1
+                          AND NOT runtime.requires_environment
                     )
                )
                AND ($1 = 'fc' OR (
@@ -2036,6 +2062,11 @@ impl DirectSubstrate {
                         + (nss.stale_after - nss.observed_at) > NOW()
                     AND EXISTS (
                         SELECT 1 FROM node_runtime_guests guest
+                        JOIN node_runtime_installations installation
+                          ON installation.node_id = guest.node_id
+                         AND installation.runtime = guest.runtime
+                         AND installation.runtime_version = guest.runtime_version
+                         AND NOT installation.requires_environment
                         WHERE guest.node_id = n.id
                           AND guest.runtime = $1
                     )

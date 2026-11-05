@@ -128,6 +128,7 @@ async fn execution_metadata_and_node_capabilities_are_queryable() -> TestResult 
                 })
                 .collect(),
             version_sort_key: Vec::new(),
+            requires_environment: false,
         }],
         components: execution
             .components()

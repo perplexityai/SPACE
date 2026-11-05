@@ -330,6 +330,7 @@ async fn repeated_samples_refresh_receipts_without_rewriting_the_projection() ->
     // Reordered duplicate entries have the same set/union semantics as the
     // normalized projection, including split true flags within one report.
     let mut duplicate = inventory.clone();
+    duplicate.runtimes[0].requires_environment = true;
     duplicate.runtimes[0].state_formats[0].can_create = false;
     duplicate.runtimes.push(inventory.runtimes[0].clone());
     duplicate.runtimes[1].state_formats[0].can_load = false;
@@ -372,6 +373,7 @@ async fn changed_samples_revoke_capabilities_and_remove_absent_rows() -> TestRes
     insert_ready_worker_node(&db.pool, node_id).await?;
     enum Change {
         RevokeFlags,
+        RequireEnvironment,
         RemoveGuest,
         RemoveFormat,
         RemoveComponent,
@@ -380,6 +382,7 @@ async fn changed_samples_revoke_capabilities_and_remove_absent_rows() -> TestRes
     }
     for change in [
         Change::RevokeFlags,
+        Change::RequireEnvironment,
         Change::RemoveGuest,
         Change::RemoveFormat,
         Change::RemoveComponent,
@@ -389,6 +392,10 @@ async fn changed_samples_revoke_capabilities_and_remove_absent_rows() -> TestRes
         let mut inventory = populated_inventory();
         commit_inventory(&db.pool, node_id, inventory.clone()).await?;
         let expected_kinds = match change {
+            Change::RequireEnvironment => {
+                inventory.runtimes[0].requires_environment = true;
+                vec!["component", "format", "guest", "runtime"]
+            }
             Change::RevokeFlags => {
                 inventory.runtimes[0].state_formats[0].can_create = false;
                 inventory.runtimes[0].state_formats[0].can_load = false;
@@ -423,6 +430,14 @@ async fn changed_samples_revoke_capabilities_and_remove_absent_rows() -> TestRes
             rows.iter().map(|row| row.0.as_str()).collect::<Vec<_>>(),
             expected_kinds
         );
+        if matches!(change, Change::RequireEnvironment) {
+            let (_, content, _) = rows.iter().find(|row| row.0 == "runtime").unwrap();
+            let content: serde_json::Value = serde_json::from_str(content)?;
+            assert_eq!(
+                content["requires_environment"],
+                serde_json::Value::Bool(true)
+            );
+        }
         if matches!(change, Change::RevokeFlags) {
             for (kind, content, _) in rows {
                 let content: serde_json::Value = serde_json::from_str(&content)?;
