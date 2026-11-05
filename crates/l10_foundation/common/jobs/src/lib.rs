@@ -26,6 +26,7 @@
 pub use pplx_space_common_core::types::JobId;
 
 pub mod db;
+pub mod metrics;
 mod scheduler;
 mod worker;
 
@@ -397,8 +398,8 @@ pub trait JobExecutor: Clone + Send + Sync + 'static {
     /// completes a job with a domain failure recorded for its caller, rather
     /// than failing the job, reports it here, so the job is not counted as a
     /// success.
-    fn completed_result(&self, _job: &Job) -> pplx_space_metrics::jobs::JobCompletedResult {
-        pplx_space_metrics::jobs::JobCompletedResult::Success
+    fn completed_result(&self, _job: &Job) -> crate::metrics::JobCompletedResult {
+        crate::metrics::JobCompletedResult::Success
     }
 }
 

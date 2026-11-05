@@ -1,4 +1,4 @@
-use pplx_space_metrics::test_capture::{
+use pplx_space_metrics_emit::test_capture::{
     CapturedCounter, CapturedValue, capture_counters_guard, capture_values_guard,
 };
 

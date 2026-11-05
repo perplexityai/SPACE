@@ -121,10 +121,8 @@ impl AutoLifecycleDeleteBlockReason {
         }
     }
 
-    pub const fn metric_reason(
-        self,
-    ) -> pplx_space_metrics::sandbox::worker::AutoLifecycleDeleteAdmissionReason {
-        use pplx_space_metrics::sandbox::worker::AutoLifecycleDeleteAdmissionReason as Reason;
+    pub const fn metric_reason(self) -> crate::metrics::AutoLifecycleDeleteAdmissionReason {
+        use crate::metrics::AutoLifecycleDeleteAdmissionReason as Reason;
         match self {
             Self::NodeRoleUnavailable => Reason::NodeRoleUnavailable,
             Self::NodeRoleNotWorker => Reason::NodeRoleNotWorker,
@@ -295,10 +293,8 @@ impl AutoLifecycleDeleteOrdinaryReason {
         }
     }
 
-    pub const fn metric_reason(
-        self,
-    ) -> pplx_space_metrics::sandbox::worker::AutoLifecycleDeleteAdmissionReason {
-        use pplx_space_metrics::sandbox::worker::AutoLifecycleDeleteAdmissionReason as Reason;
+    pub const fn metric_reason(self) -> crate::metrics::AutoLifecycleDeleteAdmissionReason {
+        use crate::metrics::AutoLifecycleDeleteAdmissionReason as Reason;
         match self {
             Self::LocalAuthority => Reason::LocalAuthority,
             Self::DirectUnsupported => Reason::DirectUnsupported,

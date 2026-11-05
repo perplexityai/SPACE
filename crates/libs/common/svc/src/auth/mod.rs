@@ -12,6 +12,7 @@ use tower::{Layer, Service};
 use crate::space_api_route::SPACE_API_BRIDGE_CALLER_POLICY_METADATA_KEY;
 
 pub mod build;
+pub mod metrics;
 mod node_identity;
 pub mod template;
 pub mod template_transfer;
@@ -500,23 +501,13 @@ impl NodeApiAuthenticator {
                 } else {
                     "invalid_bearer_scheme"
                 };
-                pplx_space_metrics::auth::node_api_decision(
-                    "static",
-                    surface.as_str(),
-                    "deny",
-                    reason,
-                );
+                crate::auth::metrics::node_api_decision("static", surface.as_str(), "deny", reason);
                 return Err(status);
             }
         };
         if self.static_token_matches(surface, token) {
             if self.static_fallback_enabled {
-                pplx_space_metrics::auth::node_api_decision(
-                    "static",
-                    surface.as_str(),
-                    "allow",
-                    "ok",
-                );
+                crate::auth::metrics::node_api_decision("static", surface.as_str(), "allow", "ok");
                 #[cfg(feature = "k8s")]
                 let mode = if self.k8s.is_some() {
                     KubernetesAuthenticationMode::Configured
@@ -527,7 +518,7 @@ impl NodeApiAuthenticator {
                 let mode = KubernetesAuthenticationMode::Disabled;
                 return Ok(Some(NodeApiAuthenticatedCaller::static_token(mode)));
             }
-            pplx_space_metrics::auth::node_api_decision(
+            crate::auth::metrics::node_api_decision(
                 "static",
                 surface.as_str(),
                 "deny",
@@ -544,7 +535,7 @@ impl NodeApiAuthenticator {
         #[cfg(feature = "k8s")]
         if let Some(k8s) = &self.k8s {
             if !is_jwt_shaped(token) {
-                pplx_space_metrics::auth::node_api_decision(
+                crate::auth::metrics::node_api_decision(
                     "k8s",
                     surface.as_str(),
                     "deny",
@@ -556,7 +547,7 @@ impl NodeApiAuthenticator {
             return Ok(Some(caller));
         }
 
-        pplx_space_metrics::auth::node_api_decision(
+        crate::auth::metrics::node_api_decision(
             "static",
             surface.as_str(),
             "deny",
@@ -580,7 +571,7 @@ impl NodeApiAuthenticator {
         path: &str,
     ) -> Result<Option<NodeApiAuthenticatedCaller>, Status> {
         if let Some(surface) = auth_surface(path) {
-            pplx_space_metrics::auth::node_api_decision(
+            crate::auth::metrics::node_api_decision(
                 "static",
                 surface.as_str(),
                 "deny",

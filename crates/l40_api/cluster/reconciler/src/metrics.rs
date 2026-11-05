@@ -54,7 +54,7 @@ pub async fn emit_node_queue_depth(pool: &PgPool) {
     match rows {
         Ok(rows) => {
             for (facet, state, count) in rows {
-                pplx_space_metrics::reconcile::queue_depth(
+                pplx_space_reconcile_metrics::queue_depth(
                     &facet,
                     &state,
                     u64::try_from(count).unwrap_or(0),

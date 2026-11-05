@@ -431,7 +431,9 @@ impl ClusterApi for ClusterApiService {
         let scope = self.template_read_scope(&request).await?;
         let delegation = TemplateLookupScope::from_request(&request)?;
         if delegation.is_none() {
-            pplx_space_metrics::auth::template_lookup_compatibility("missing_scope");
+            pplx_space_common_svc::template_lookup::metrics::template_lookup_compatibility(
+                "missing_scope",
+            );
         }
         let request = request.into_inner();
         let template_name = trimmed_required(&request.template_name, "template_name")?;
@@ -514,7 +516,9 @@ impl ClusterApi for ClusterApiService {
         let scope = self.template_read_scope(&request).await?;
         let delegation = TemplateLookupScope::from_request(&request)?;
         if delegation.is_none() {
-            pplx_space_metrics::auth::template_lookup_compatibility("missing_scope");
+            pplx_space_common_svc::template_lookup::metrics::template_lookup_compatibility(
+                "missing_scope",
+            );
         }
         let request = request.into_inner();
         let template_name = trimmed_required(&request.template_name, "template_name")?;
@@ -1698,7 +1702,7 @@ impl ClusterApi for ClusterApiService {
             }
             .map_err(|err| Status::internal(format!("complete reconcile failure: {err}")))?;
             if next_attempt >= NODE_RECONCILE_MAX_ATTEMPTS && result.rows_affected() != 0 {
-                pplx_space_metrics::reconcile::queue_dead_letter(&facet_for_metrics);
+                pplx_space_reconcile_metrics::queue_dead_letter(&facet_for_metrics);
             }
             if result.rows_affected() != 0 {
                 record_facet_apply_failed_condition(&mut tx, origin.id, &reference, &error).await?;

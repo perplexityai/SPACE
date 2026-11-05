@@ -384,20 +384,20 @@ impl CredmgrTokenReviewer {
                     break claim;
                 }
                 InFlightState::Waiting(waiter) => {
-                    pplx_space_metrics::auth::token_review_cache("in_flight_wait");
+                    pplx_space_common_svc::auth::metrics::token_review_cache("in_flight_wait");
                     let _ = waiter.await;
                     continue;
                 }
             }
         };
 
-        pplx_space_metrics::auth::token_review_cache("miss");
+        pplx_space_common_svc::auth::metrics::token_review_cache("miss");
         // Rate-limit + bound concurrency on actual apiserver reviews. Single-
         // flight already collapsed same-token concurrency, so this gates the
         // distinct-token spray vector. Shedding here is retryable backpressure,
         // not a verdict, so it is never cached.
         if !self.rate_limiter.try_acquire() {
-            pplx_space_metrics::auth::token_review_cache("rate_limited");
+            pplx_space_common_svc::auth::metrics::token_review_cache("rate_limited");
             self.deny_metric("token_review_rate_limited");
             tracing::warn!(
                 audience = self.config.audience,
@@ -408,7 +408,7 @@ impl CredmgrTokenReviewer {
         let _permit = match self.review_limiter.try_acquire() {
             Ok(permit) => permit,
             Err(_) => {
-                pplx_space_metrics::auth::token_review_cache("limiter_wait");
+                pplx_space_common_svc::auth::metrics::token_review_cache("limiter_wait");
                 match tokio::time::timeout(
                     self.config.review_timeout,
                     self.review_limiter.acquire(),
@@ -418,7 +418,7 @@ impl CredmgrTokenReviewer {
                     Ok(Ok(permit)) => permit,
                     Ok(Err(_)) => unreachable!("token review semaphore is never closed"),
                     Err(_elapsed) => {
-                        pplx_space_metrics::auth::token_review_cache("limiter_timeout");
+                        pplx_space_common_svc::auth::metrics::token_review_cache("limiter_timeout");
                         self.deny_metric("token_review_overloaded");
                         tracing::warn!(
                             audience = self.config.audience,
@@ -513,19 +513,19 @@ impl CredmgrTokenReviewer {
             audience = self.config.audience,
             "credmgr accepted a projected ServiceAccount token"
         );
-        pplx_space_metrics::auth::decision("k8s", AUTH_SURFACE, "allow", "ok");
+        pplx_space_common_svc::auth::metrics::decision("k8s", AUTH_SURFACE, "allow", "ok");
         Ok(identity)
     }
 
     fn resolve_cached(&self, cached: CachedReviewResult) -> Result<K8sIdentity, Status> {
         match cached {
             CachedReviewResult::Accepted { identity } => {
-                pplx_space_metrics::auth::token_review_cache("hit_authenticated");
-                pplx_space_metrics::auth::decision("k8s", AUTH_SURFACE, "allow", "ok");
+                pplx_space_common_svc::auth::metrics::token_review_cache("hit_authenticated");
+                pplx_space_common_svc::auth::metrics::decision("k8s", AUTH_SURFACE, "allow", "ok");
                 Ok(identity)
             }
             CachedReviewResult::Rejected { reason } => {
-                pplx_space_metrics::auth::token_review_cache("hit_deny");
+                pplx_space_common_svc::auth::metrics::token_review_cache("hit_deny");
                 self.deny_metric(reason.as_str());
                 Err(reason.to_status())
             }
@@ -533,7 +533,7 @@ impl CredmgrTokenReviewer {
     }
 
     fn deny_metric(&self, reason: &str) {
-        pplx_space_metrics::auth::decision("k8s", AUTH_SURFACE, "deny", reason);
+        pplx_space_common_svc::auth::metrics::decision("k8s", AUTH_SURFACE, "deny", reason);
     }
 
     fn cached_result(&self, key: &TokenCacheKey) -> Option<CachedReviewResult> {
@@ -543,7 +543,7 @@ impl CredmgrTokenReviewer {
             Some(cached) if cached.expires_at > now => Some(cached.result.clone()),
             Some(_) => {
                 cache.remove(key);
-                pplx_space_metrics::auth::token_review_cache("evict_expired");
+                pplx_space_common_svc::auth::metrics::token_review_cache("evict_expired");
                 None
             }
             None => None,
@@ -579,9 +579,9 @@ impl CredmgrTokenReviewer {
             self.config.cache_max_entries,
         );
         if evicted_capacity {
-            pplx_space_metrics::auth::token_review_cache("evict_capacity");
+            pplx_space_common_svc::auth::metrics::token_review_cache("evict_capacity");
         }
-        pplx_space_metrics::auth::token_review_cache(tag);
+        pplx_space_common_svc::auth::metrics::token_review_cache(tag);
     }
 
     async fn review_token(&self, token: &str) -> Result<ReviewedToken, ReviewFailure> {

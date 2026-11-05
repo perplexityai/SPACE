@@ -486,7 +486,7 @@ async fn a_blackholed_worker_redial_is_untransmitted_and_replayed_once() -> Test
     );
 
     let mut attempts = 0;
-    let capture = pplx_space_metrics::test_capture::capture_counters_guard();
+    let capture = pplx_space_metrics_emit::test_capture::capture_counters_guard();
     let state = client
         .clone()
         .call(

@@ -74,6 +74,7 @@ use tonic::transport::server::UdsConnectInfo;
 use tonic::{Request as TonicRequest, Status};
 
 pub mod exe;
+pub mod metrics;
 
 use exe::is_content_addressed_binary_file_name;
 
@@ -736,7 +737,7 @@ impl UdsPeerAuthorizer {
                 peer_exe = %snapshot.exe.display(),
                 "peer process backing binary is deleted (in-place upgrade or tampering)"
             );
-            pplx_space_metrics::auth::uds_peer_exe_deleted(&self.service_name, principal);
+            crate::metrics::uds_peer_exe_deleted(&self.service_name, principal);
         }
 
         if let Err(err) = self.evaluate_account_checks(
@@ -755,7 +756,7 @@ impl UdsPeerAuthorizer {
             );
         }
 
-        pplx_space_metrics::auth::uds_peer_process_check(
+        crate::metrics::uds_peer_process_check(
             &self.service_name,
             "allow",
             "ok",
@@ -792,7 +793,7 @@ impl UdsPeerAuthorizer {
             detail,
             "peer process check step failed"
         );
-        pplx_space_metrics::auth::uds_peer_process_check(
+        crate::metrics::uds_peer_process_check(
             &self.service_name,
             if enforced { "deny" } else { "allow" },
             reason,

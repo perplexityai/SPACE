@@ -35,7 +35,7 @@ tokio-util = { workspace = true }
 tracing = { workspace = true }
 
 # internal
-pplx-space-metrics = { workspace = true }
+pplx-space-metrics-emit = { workspace = true }
 pplx-space-s3-http-client = { workspace = true }
 
 

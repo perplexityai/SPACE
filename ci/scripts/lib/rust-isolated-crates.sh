@@ -37,14 +37,12 @@ import subprocess
 import sys
 
 COMMON_CORE, COMMON_SVC = "pplx-space-common-core", "pplx-space-common-svc"
-# Reach common-core, besides directly, only through pplx-space-metrics, which
-# is linted alone itself, and build quickly alone, so they are linted as well.
+# Reaches common-core, besides directly, only through pplx-space-metrics, which
+# is linted alone itself, and builds quickly alone, so it is linted as well.
 # Each entry must be a workspace library the rule leaves out for reaching
 # common-core through another crate.
 ALSO = {
     "pplx-space-ingress-admission",
-    "pplx-space-tokio-runtime",
-    "pplx-space-uds-peer-auth",
 }
 
 with open(sys.argv[1]) as metadata_file:

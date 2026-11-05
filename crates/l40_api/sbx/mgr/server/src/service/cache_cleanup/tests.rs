@@ -691,7 +691,7 @@ fn nested_materialization_database_failure_is_classified_as_database_error() {
                 .expect("break nested artifact registration");
         },
     };
-    let capture = pplx_space_metrics::test_capture::capture_counters_guard();
+    let capture = pplx_space_metrics_emit::test_capture::capture_counters_guard();
 
     reconcile_sandbox_inventory_ids(
         &db,
@@ -778,7 +778,7 @@ fn inventory_preserves_a_row_with_malformed_cleanup_intent() {
         [&sandbox_id_string],
     )
     .expect("write partial cleanup intent");
-    let capture = pplx_space_metrics::test_capture::capture_counters_guard();
+    let capture = pplx_space_metrics_emit::test_capture::capture_counters_guard();
 
     let report = reconcile_sandbox_inventory_in(
         &conn,

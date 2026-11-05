@@ -3,7 +3,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use pplx_space_metrics::sandbox::admission::{EgressProfileOutcome, egress_profile};
+use crate::metrics::egress_profile::{EgressProfileOutcome, egress_profile};
 use pplx_space_net_common::{EgressDefaultAction, EgressDestinationV1, NetworkPolicyV1};
 use serde::{Deserialize, Deserializer, Serialize, de};
 

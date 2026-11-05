@@ -46,7 +46,7 @@ enables does not count. Crates that reach common-core through another crate,
 such as everything built on `pplx-space-metrics`, are left out because each
 builds that crate's graph too. A short commented `ALSO` list adds crates whose
 only other path to common-core is `pplx-space-metrics`, such as
-`pplx-space-tokio-runtime`; the check fails on an entry that is not a
+`pplx-space-ingress-admission`; the check fails on an entry that is not a
 workspace library or that the rule does not leave out for that reason. The log
 names the libraries left out. Each crate gets its own `cargo clippy` runs with
 `--no-default-features` and with `--all-features`, each once with

@@ -2,7 +2,7 @@ use std::future::Future;
 
 use pplx_space_common_core::types::SandboxId;
 use pplx_space_common_grpc::client_connect_failure_cause;
-use pplx_space_metrics::grpc::ClientReplayOutcome;
+use pplx_space_grpc_metrics::ClientReplayOutcome;
 use tokio::time::Instant;
 
 use super::{ControllerError, RuntimeClient, Substrate, SubstrateAdapter};
@@ -113,7 +113,7 @@ impl RuntimeClient {
         .await
         .unwrap_or_else(|_| Err(expired()));
         if let Some(cause) = replay_cause {
-            pplx_space_metrics::grpc::client_replay(
+            pplx_space_grpc_metrics::client_replay(
                 SERVICE,
                 cause.as_str(),
                 replay_outcome.unwrap_or(ClientReplayOutcome::DeadlineExpired),

@@ -221,7 +221,7 @@ impl FilesystemHandle {
             pplx_space_common_grpc::QueuedSlots::new(self.payload_slots.clone()),
             filesystem_limits::PAYLOAD_METHODS,
         )
-        .with_observation(pplx_space_metrics::payload::Budget::GuestFilesystem)
+        .with_observation(pplx_space_grpc_metrics::payload::Budget::GuestFilesystem)
     }
 
     pub(crate) async fn drain(&self) {
@@ -367,7 +367,7 @@ impl FilesystemHandle {
         let admission = crate::payload::acquire(
             &self.payload_slots,
             1,
-            pplx_space_metrics::payload::Budget::GuestFilesystem,
+            pplx_space_grpc_metrics::payload::Budget::GuestFilesystem,
             request.extensions_mut().remove::<RequestPermit>(),
         )?;
         let incoming = request.into_inner();
@@ -1192,7 +1192,7 @@ impl Filesystem for FilesystemHandle {
             &mut request,
             &self.payload_slots,
             filesystem_limits::BATCH_REQUEST_WEIGHT,
-            pplx_space_metrics::payload::Budget::GuestFilesystem,
+            pplx_space_grpc_metrics::payload::Budget::GuestFilesystem,
             filesystem_limits::MAX_MESSAGE_BYTES,
         )?;
         let request = request.into_inner();
@@ -1276,7 +1276,7 @@ impl Filesystem for FilesystemHandle {
             &mut request,
             &self.payload_slots,
             1,
-            pplx_space_metrics::payload::Budget::GuestFilesystem,
+            pplx_space_grpc_metrics::payload::Budget::GuestFilesystem,
             filesystem_limits::MAX_MESSAGE_BYTES,
         )?;
         let request = request.into_inner();

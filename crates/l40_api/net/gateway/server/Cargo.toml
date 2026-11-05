@@ -74,7 +74,7 @@ tempfile = { workspace = true }
 insta = { workspace = true }
 nix = { workspace = true, features = ["net"] }
 pplx-space-common-svc = { workspace = true, features = ["test-support"] }
-pplx-space-metrics = { workspace = true, features = ["test-capture"] }
+pplx-space-metrics-emit = { workspace = true, features = ["test-capture"] }
 pplx-space-observability = { workspace = true, features = ["test-capture"] }
 # Devbox validation (`#[ignore]`d): capture the proxy's real tracing output to
 # assert the SNI was extracted end-to-end through `tcp_proxy::run`.

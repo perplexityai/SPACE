@@ -139,6 +139,7 @@ members = [
     "crates/libs/metrics",
     "crates/l10_foundation/metrics/emit",
     "crates/l10_foundation/grpc/metrics",
+    "crates/l10_foundation/reconcile/metrics",
     "crates/l10_foundation/observability",
     "crates/l40_api/internal/api/server",
     "crates/l10_foundation/k8s/ids",
@@ -422,6 +423,7 @@ pplx-space-public-api-http = { path = "crates/l40_api/public/api/http" }
 pplx-space-metrics = { path = "crates/libs/metrics" }
 pplx-space-metrics-emit = { path = "crates/l10_foundation/metrics/emit" }
 pplx-space-grpc-metrics = { path = "crates/l10_foundation/grpc/metrics" }
+pplx-space-reconcile-metrics = { path = "crates/l10_foundation/reconcile/metrics" }
 pplx-space-observability = { path = "crates/l10_foundation/observability", default-features = false }
 pplx-space-placement = { path = "crates/l30_storage/placement" }
 pplx-space-internal-api-server = { path = "crates/l40_api/internal/api/server" }

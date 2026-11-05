@@ -355,7 +355,7 @@ where
         }
         tokio::time::sleep(delay).await;
         attempts += 1;
-        pplx_space_metrics::grpc::client_retry("sandbox-manager", method, "rpc", "restart_handoff");
+        pplx_space_grpc_metrics::client_retry("sandbox-manager", method, "rpc", "restart_handoff");
         let budget = attempt_budget(&context, handoff_deadline);
         let shared_dial = async { Ok(dialer.fresh_client(seen_epoch, &dial).await) };
         let (epoch, dialed) = match run_within(budget, method, shared_dial).await {

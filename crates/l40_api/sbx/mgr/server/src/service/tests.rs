@@ -3980,7 +3980,7 @@ pub(crate) mod service_tests {
             activation_attempt_id: Some(SandboxActivationAttemptId::new()),
         };
 
-        let metric_capture = pplx_space_metrics::test_capture::capture_counters_guard();
+        let metric_capture = pplx_space_metrics_emit::test_capture::capture_counters_guard();
         let error = service
             .adopt_authoritative_route_identity(sandbox_id, &incoming)
             .expect_err("cleanup ownership must reject route-only adoption");
@@ -5320,7 +5320,7 @@ pub(crate) mod service_tests {
         insert_test_sandbox(&conn, &sandbox_id, SandboxState::Restoring);
         let service = SandboxManagerService::for_test(conn);
 
-        let metric_capture = pplx_space_metrics::test_capture::capture_counters_guard();
+        let metric_capture = pplx_space_metrics_emit::test_capture::capture_counters_guard();
         let error = service
             .spaced_open_loopback_bridge(internal_request_with_invalid_space_api_route_token(
                 SpacedOpenLoopbackBridgeRequest {
@@ -6106,7 +6106,7 @@ pub(crate) mod service_tests {
 
         // Startup and cleanup reconciles carry no verdicts: a wait, not a
         // failed inspection.
-        let metric_capture = pplx_space_metrics::test_capture::capture_counters_guard();
+        let metric_capture = pplx_space_metrics_emit::test_capture::capture_counters_guard();
         let report = reconcile(&Default::default());
         let counters = metric_capture.finish();
         assert!(report.changed_ids().is_empty());

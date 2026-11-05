@@ -929,14 +929,14 @@ impl SandboxManagerService {
         }
 
         let outcome = if result.is_ok() { "ok" } else { "error" };
-        pplx_space_metrics::reconcile::run_duration(
+        pplx_space_reconcile_metrics::run_duration(
             "network-policy",
             "local",
             outcome,
             "queue",
             started_at,
         );
-        pplx_space_metrics::reconcile::run_items("network-policy", "local", outcome, 1);
+        pplx_space_reconcile_metrics::run_items("network-policy", "local", outcome, 1);
         result
     }
 

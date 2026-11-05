@@ -277,7 +277,7 @@ mod postgres {
     }
 
     fn executor_tags(
-        counters: &[pplx_space_metrics::test_capture::CapturedCounter],
+        counters: &[pplx_space_metrics_emit::test_capture::CapturedCounter],
         name: &str,
     ) -> Vec<String> {
         counters
@@ -294,7 +294,7 @@ mod postgres {
         let fixture = AdmissionPoolFixture::new(1).await?;
         let controller = fixture.controller();
         let script = ScriptedCreate::new(Script::Succeed);
-        let capture = pplx_space_metrics::test_capture::capture_counters_guard();
+        let capture = pplx_space_metrics_emit::test_capture::capture_counters_guard();
         let response = fixture
             .create_with(
                 claims(&controller, Some(script.inline(Duration::from_secs(5)))),
@@ -455,7 +455,7 @@ mod postgres {
         let fixture = AdmissionPoolFixture::new(1).await?;
         let controller = fixture.controller();
         let script = ScriptedCreate::new(Script::Retry);
-        let capture = pplx_space_metrics::test_capture::capture_counters_guard();
+        let capture = pplx_space_metrics_emit::test_capture::capture_counters_guard();
         let response = fixture
             .create_with(
                 claims(&controller, Some(script.inline(Duration::from_secs(5)))),

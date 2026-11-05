@@ -7,6 +7,8 @@ use pplx_space_common_core::host::disk_admission::{
 };
 use tokio_util::sync::CancellationToken;
 
+pub mod metrics;
+
 pub const CACHE_DISK_ADMISSION_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
 
 #[derive(Clone, Debug)]
@@ -123,25 +125,25 @@ async fn run_cache_disk_admission_refresh_loop<F>(
 
 pub fn emit_cache_disk_admission_metrics(decision: &CacheDiskAdmissionDecision) {
     if let Some(measurement) = decision.measurement {
-        pplx_space_metrics::node_disk::sandbox_admission_available_fraction(
+        crate::disk_admission::metrics::sandbox_admission_available_fraction(
             measurement.status.available_fraction(),
         );
-        pplx_space_metrics::node_disk::sandbox_admission_available_bytes(
+        crate::disk_admission::metrics::sandbox_admission_available_bytes(
             measurement.status.available_bytes,
         );
         let metadata_pressure = matches!(
             decision.reason,
             CacheDiskAdmissionReason::BtrfsAllocationPressure
         );
-        pplx_space_metrics::node_disk::sandbox_admission_btrfs_allocation_pressure(
+        crate::disk_admission::metrics::sandbox_admission_btrfs_allocation_pressure(
             "metadata_growth",
             metadata_pressure,
         );
     }
-    pplx_space_metrics::node_disk::sandbox_admission_effective_available_bytes(
+    crate::disk_admission::metrics::sandbox_admission_effective_available_bytes(
         decision.effective_available_bytes,
     );
-    pplx_space_metrics::node_disk::sandbox_admission_pending_reservation_bytes(
+    crate::disk_admission::metrics::sandbox_admission_pending_reservation_bytes(
         decision.pending_reservation_bytes,
     );
     if matches!(

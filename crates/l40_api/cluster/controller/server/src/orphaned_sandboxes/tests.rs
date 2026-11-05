@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex};
 type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
 fn classified_counter_count(
-    counters: &[pplx_space_metrics::test_capture::CapturedCounter],
+    counters: &[pplx_space_metrics_emit::test_capture::CapturedCounter],
     outcome: &str,
     mode: &str,
 ) -> usize {
@@ -2216,7 +2216,7 @@ async fn quarantine_circuit_breaker_stops_mutations_at_configured_ceiling() {
         sink,
     );
 
-    let counters = pplx_space_metrics::test_capture::capture_counters_guard();
+    let counters = pplx_space_metrics_emit::test_capture::capture_counters_guard();
     let report = reconciler.tick(Instant::now()).await;
     let counters = counters.finish();
 
@@ -2308,7 +2308,7 @@ async fn dry_run_shadow_evaluates_active_quarantine_ceiling() {
     sink.set_active_quarantine_count(DEFAULT_MAX_ACTIVE_QUARANTINES);
     let mut reconciler = Reconciler::new(config(0, 1000, true), FakePresence::default(), sink);
 
-    let counters = pplx_space_metrics::test_capture::capture_counters_guard();
+    let counters = pplx_space_metrics_emit::test_capture::capture_counters_guard();
     let report = reconciler.tick(Instant::now()).await;
     let counters = counters.finish();
 

@@ -1,6 +1,6 @@
 //! Test-only tracing event capture.
 //!
-//! Gated behind `test-capture`, mirroring `pplx-space-metrics`'s
+//! Gated behind `test-capture`, mirroring `pplx-space-metrics-emit`'s
 //! `test-capture` feature shape: code lives under
 //! `#[cfg(any(test, feature = "test-capture"))]` so this crate's own tests use
 //! it without an explicit flag, while dev-dependents opt in with

@@ -38,6 +38,7 @@ use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
+use crate::metrics::S3AttemptFailureKind;
 use aws_sdk_s3::operation::abort_multipart_upload::{
     AbortMultipartUploadError, AbortMultipartUploadInput,
 };
@@ -67,7 +68,6 @@ use aws_smithy_types::config_bag::{ConfigBag, Storable, StoreReplace};
 use aws_smithy_types::error::display::DisplayErrorContext;
 use aws_smithy_types::error::metadata::ProvideErrorMetadata;
 use aws_smithy_types::timeout::TimeoutConfig;
-use pplx_space_metrics::object_store::S3AttemptFailureKind;
 use tracing::{debug, info, warn};
 
 use crate::{S3Operation, is_s3_rate_limited};
@@ -136,7 +136,7 @@ pub(crate) struct LogAndCount;
 
 impl AttemptReporter for LogAndCount {
     fn attempt_failed(&self, target: &AttemptTarget, failure: &FailedAttempt) {
-        pplx_space_metrics::object_store::s3_attempt_failed(
+        crate::metrics::s3_attempt_failed(
             failure.operation.as_str(),
             failure.kind,
             failure.will_retry,

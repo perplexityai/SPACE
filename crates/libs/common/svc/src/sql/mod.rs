@@ -13,6 +13,7 @@ use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 pub use pplx_space_federated_grant_store as federated_service_grants;
 pub use pplx_space_postgres_contention as contention;
 pub mod identity;
+pub mod metrics;
 #[cfg(feature = "migration-checksums")]
 pub use pplx_space_migration_checksums as migration_checksums;
 pub use pplx_space_node_registration_store as node_registration;
@@ -389,10 +390,10 @@ pub fn spawn_postgres_pool_metrics_reporter_for_identity(pool: PgPool, identity:
             let size = pool.size();
             let idle = pool.num_idle();
             let in_use = size.saturating_sub(idle as u32);
-            pplx_space_metrics::db::pool::connections_in_use_for_identity(in_use, identity);
-            pplx_space_metrics::db::pool::connections_idle_for_identity(idle, identity);
+            crate::sql::metrics::connections_in_use_for_identity(in_use, identity);
+            crate::sql::metrics::connections_idle_for_identity(idle, identity);
             if let Some(ratio) = pool_utilization(in_use, max) {
-                pplx_space_metrics::db::pool::utilization_for_identity(ratio, identity);
+                crate::sql::metrics::utilization_for_identity(ratio, identity);
             }
         }
     });

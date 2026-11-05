@@ -20,7 +20,7 @@ test-support = []
 [dependencies]
 async-trait = { workspace = true }
 pplx-space-common-core = { workspace = true, features = ["rusqlite"] }
-pplx-space-metrics = { workspace = true }
+pplx-space-metrics-emit = { workspace = true }
 pplx-space-observability = { workspace = true }
 rusqlite = { workspace = true }
 serde = { workspace = true }

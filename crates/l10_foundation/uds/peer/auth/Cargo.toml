@@ -18,7 +18,7 @@ tonic = { workspace = true }
 tracing = { workspace = true }
 
 # internal
-pplx-space-metrics = { workspace = true }
+pplx-space-metrics-emit = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

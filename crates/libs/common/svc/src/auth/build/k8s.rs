@@ -240,7 +240,7 @@ impl BuildTokenReviewer {
     }
 
     fn cache_metric(&self, result: &str) {
-        pplx_space_metrics::auth::build_token_review_cache(self.surface.as_str(), result);
+        crate::auth::metrics::build_token_review_cache(self.surface.as_str(), result);
     }
 
     /// Reviews `token` with the apiserver by `deadline`, within the

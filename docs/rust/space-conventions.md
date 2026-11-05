@@ -386,7 +386,7 @@ in its `[features]`, the helper gated `#[cfg(any(test, feature = "test-capture")
 (`crates/l10_foundation/metrics/emit/src/lib.rs`), so the crate's own tests get it for
 free and downstream crates opt in explicitly. `cfg(test)` does not reach a
 dependency, so a crate that re-exports such a helper forwards the feature and
-enables it on its own dev-dependency, as `pplx-space-metrics` does.
+enables it on its own dev-dependency.
 
 ### Watch items when moving or writing test files
 

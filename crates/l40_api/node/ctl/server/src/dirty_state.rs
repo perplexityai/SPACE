@@ -470,7 +470,7 @@ fn mark_error_row(
         if changed == 0 {
             release_refreshed_claim(tx, facet, element, claim_token, now)?;
         } else {
-            pplx_space_metrics::reconcile::queue_dead_letter(facet);
+            pplx_space_reconcile_metrics::queue_dead_letter(facet);
         }
         return Ok(());
     }

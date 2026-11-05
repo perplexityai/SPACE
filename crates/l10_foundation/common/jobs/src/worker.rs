@@ -617,7 +617,7 @@ impl<E: JobExecutor> BackgroundWorker<E> {
                 db::count_active_jobs(&conn).unwrap_or(0)
             };
             let inflight = self.inflight();
-            pplx_space_metrics::jobs::drain_outstanding(active_jobs);
+            crate::metrics::drain_outstanding(active_jobs);
             if active_jobs == 0 && inflight == 0 {
                 return true;
             }
@@ -673,7 +673,7 @@ impl<E: JobExecutor> BackgroundWorker<E> {
         };
         let job_ids: Vec<JobId> = jobs.iter().map(|(id, _, _, _)| *id).collect();
         for (job_id, kind, _, delay_secs) in &jobs {
-            pplx_space_metrics::jobs::recovered(kind);
+            crate::metrics::recovered(kind);
             let delay = db::nonnegative_i64_to_u64(*delay_secs);
             if delay == 0 {
                 self.spawn_job(*job_id, kind);
@@ -846,7 +846,7 @@ impl<E: JobExecutor> BackgroundWorker<E> {
             }
             self.promote_deduplicated(&conn, kind, &existing, priority)?;
             tracing::debug!(job_id = %existing, kind, "job deduplicated");
-            pplx_space_metrics::jobs::submitted(kind, "hit");
+            crate::metrics::submitted(kind, "hit");
             record_deduplicated_submission(&existing);
             return Ok(existing);
         }
@@ -895,7 +895,7 @@ impl<E: JobExecutor> BackgroundWorker<E> {
                     }
                     self.promote_deduplicated(&conn, kind, &existing, priority)?;
                     tracing::debug!(job_id = %existing, kind, "job deduplicated after insert race");
-                    pplx_space_metrics::jobs::submitted(kind, "hit");
+                    crate::metrics::submitted(kind, "hit");
                     record_deduplicated_submission(&existing);
                     return Ok(existing);
                 }
@@ -919,7 +919,7 @@ impl<E: JobExecutor> BackgroundWorker<E> {
                 }
                 self.promote_deduplicated(&conn, kind, &existing, priority)?;
                 tracing::debug!(job_id = %existing, kind, "job deduplicated at admission limit");
-                pplx_space_metrics::jobs::submitted(kind, "hit");
+                crate::metrics::submitted(kind, "hit");
                 record_deduplicated_submission(&existing);
                 return Ok(existing);
             }
@@ -932,7 +932,7 @@ impl<E: JobExecutor> BackgroundWorker<E> {
                 subject_id,
                 "job admission rejected"
             );
-            pplx_space_metrics::jobs::admission_rejected(kind, &priority_band);
+            crate::metrics::admission_rejected(kind, &priority_band);
             return Err(Status::resource_exhausted(format!(
                 "{kind} job admission limit reached ({} active jobs in priority band {priority_band})",
                 admission_band.active_jobs
@@ -948,7 +948,7 @@ impl<E: JobExecutor> BackgroundWorker<E> {
         }
         drop(conn);
 
-        pplx_space_metrics::jobs::submitted(kind, "miss");
+        crate::metrics::submitted(kind, "miss");
         tracing::info!(
             job_id = %job_id,
             kind,
@@ -1022,10 +1022,7 @@ impl<E: JobExecutor> BackgroundWorker<E> {
 
             if job.is_terminal() {
                 if let Some(notified_at) = completion_notified_at {
-                    pplx_space_metrics::jobs::completion_observation_delay(
-                        &job.kind,
-                        notified_at.elapsed(),
-                    );
+                    crate::metrics::completion_observation_delay(&job.kind, notified_at.elapsed());
                 }
                 return Ok(job);
             }
@@ -1068,7 +1065,7 @@ impl<E: JobExecutor> BackgroundWorker<E> {
             previous_status,
             "job cancellation requested"
         );
-        pplx_space_metrics::jobs::cancellation_requested(&job.kind);
+        crate::metrics::cancellation_requested(&job.kind);
 
         let token = self
             .cancellation_tokens
@@ -1194,7 +1191,7 @@ impl<E: JobExecutor> BackgroundWorker<E> {
                 db::count_active_jobs(&conn).unwrap_or(0)
             };
 
-            pplx_space_metrics::jobs::drain_outstanding(active);
+            crate::metrics::drain_outstanding(active);
 
             if active == 0 {
                 return;
@@ -1249,35 +1246,31 @@ impl<E: JobExecutor> BackgroundWorker<E> {
             (depth, oldest, perm)
         };
         for (kind, status, count) in depth {
-            pplx_space_metrics::jobs::queue_depth(
-                &kind,
-                &status,
-                db::nonnegative_i64_to_u64(count),
-            );
+            crate::metrics::queue_depth(&kind, &status, db::nonnegative_i64_to_u64(count));
         }
         for (kind, age) in oldest {
-            pplx_space_metrics::jobs::queue_oldest_pending_age_seconds(&kind, age.max(0) as f64);
+            crate::metrics::queue_oldest_pending_age_seconds(&kind, age.max(0) as f64);
         }
         let mut perm_by_kind = BTreeMap::<String, u64>::new();
         for (kind, _, count) in perm {
             *perm_by_kind.entry(kind).or_default() += count;
         }
         for (kind, count) in perm_by_kind {
-            pplx_space_metrics::jobs::permanent_failures(&kind, count);
+            crate::metrics::permanent_failures(&kind, count);
         }
         for (kind, scheduler) in self.schedulers.iter() {
             let snapshot = scheduler.snapshot();
             for band in snapshot.bands {
                 let priority_band = priority_band_metric_label(band.min_priority);
-                pplx_space_metrics::jobs::scheduler_depth(
+                crate::metrics::scheduler_depth(
                     kind,
-                    pplx_space_metrics::jobs::SchedulerState::Running,
+                    crate::metrics::SchedulerState::Running,
                     &priority_band,
                     band.running,
                 );
-                pplx_space_metrics::jobs::scheduler_depth(
+                crate::metrics::scheduler_depth(
                     kind,
-                    pplx_space_metrics::jobs::SchedulerState::Waiting,
+                    crate::metrics::SchedulerState::Waiting,
                     &priority_band,
                     band.waiting,
                 );
@@ -1513,7 +1506,7 @@ impl<E: JobExecutor> BackgroundWorker<E> {
     }
 
     async fn execute_claimed_job(&self, job: Job, lease_owner: Option<String>) {
-        pplx_space_metrics::jobs::started(&job.kind, job.attempts);
+        crate::metrics::started(&job.kind, job.attempts);
 
         let operation_name = format!("job.{}", job.kind);
         // A submitter waiting in `submit_and_wait` is the job's parent. Any
@@ -1619,13 +1612,13 @@ impl<E: JobExecutor> BackgroundWorker<E> {
                             elapsed_ms = started_at.elapsed().as_millis(),
                             "job completed"
                         );
-                        pplx_space_metrics::jobs::completed(
+                        crate::metrics::completed(
                             &job.kind,
                             self.executor.completed_result(&job),
                             db::nonnegative_i64_to_u64(bytes),
                             started_at,
                         );
-                        pplx_space_metrics::jobs::attempts(&job.kind, "completed", job.attempts);
+                        crate::metrics::attempts(&job.kind, "completed", job.attempts);
                     }
                     self.notify_completion(&job.job_id);
                 }
@@ -1680,9 +1673,9 @@ impl<E: JobExecutor> BackgroundWorker<E> {
                             }
                         }
                     };
-                    pplx_space_metrics::jobs::failed(&job.kind, error_kind_tag, started_at);
+                    crate::metrics::failed(&job.kind, error_kind_tag, started_at);
                     if matches!(error_kind_tag, "permanent" | "exhausted") {
-                        pplx_space_metrics::jobs::attempts(&job.kind, "failed", job.attempts);
+                        crate::metrics::attempts(&job.kind, "failed", job.attempts);
                     }
                     self.handle_failure(&job, lease_owner.as_deref(), e).await;
                 }
@@ -1699,9 +1692,9 @@ impl<E: JobExecutor> BackgroundWorker<E> {
                         max_attempts = job.max_attempts,
                         "job timed out (retriable)"
                     );
-                    pplx_space_metrics::jobs::failed(&job.kind, "timeout", started_at);
+                    crate::metrics::failed(&job.kind, "timeout", started_at);
                     if job.attempts >= job.max_attempts {
-                        pplx_space_metrics::jobs::attempts(&job.kind, "failed", job.attempts);
+                        crate::metrics::attempts(&job.kind, "failed", job.attempts);
                     }
                     self.handle_failure(&job, lease_owner.as_deref(), JobError::Retriable(msg))
                         .await;
@@ -1769,9 +1762,9 @@ impl<E: JobExecutor> BackgroundWorker<E> {
                                 kind = %job.kind,
                                 "job cancellation completed"
                             );
-                            pplx_space_metrics::jobs::cancellation_completed(
+                            crate::metrics::cancellation_completed(
                                 &job.kind,
-                                pplx_space_metrics::jobs::CancellationOutcome::Cancelled,
+                                crate::metrics::CancellationOutcome::Cancelled,
                             );
                             self.notify_completion(&job.job_id);
                         }
@@ -1823,9 +1816,9 @@ impl<E: JobExecutor> BackgroundWorker<E> {
             };
             match result {
                 Ok(true) => {
-                    pplx_space_metrics::jobs::cancellation_completed(
+                    crate::metrics::cancellation_completed(
                         &job.kind,
-                        pplx_space_metrics::jobs::CancellationOutcome::CleanupFailed,
+                        crate::metrics::CancellationOutcome::CleanupFailed,
                     );
                     self.notify_completion(&job.job_id);
                 }

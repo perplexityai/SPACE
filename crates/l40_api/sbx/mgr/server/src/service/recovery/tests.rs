@@ -425,7 +425,7 @@ fn orphan_restore_terminal_outcomes_are_reported_distinctly() {
 
 #[test]
 fn a_lost_claim_is_reported_without_a_durable_retry_write() {
-    let counters = pplx_space_metrics::test_capture::capture_counters_guard();
+    let counters = pplx_space_metrics_emit::test_capture::capture_counters_guard();
     emit_quarantine_recovery_claim_not_acquired(
         crate::db::QuarantineRecoveryNoProgressReason::ClaimPreconditionsChanged,
     );
@@ -554,7 +554,7 @@ const BACKGROUND_RESTORE_TEST_TIMEOUT: std::time::Duration = std::time::Duration
 /// would read; taking the last rather than the first is what makes an assertion
 /// about "what this pass reported" correct.
 fn gauge_value(
-    captured: &[pplx_space_metrics::test_capture::CapturedValue],
+    captured: &[pplx_space_metrics_emit::test_capture::CapturedValue],
     name: &str,
 ) -> Option<f64> {
     captured
@@ -819,7 +819,7 @@ async fn background_dispatch_defers_a_second_orphan_while_the_first_holds_capaci
     let lookup_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let lookups = Arc::clone(&lookup_count);
 
-    let counters = pplx_space_metrics::test_capture::capture_counters_guard();
+    let counters = pplx_space_metrics_emit::test_capture::capture_counters_guard();
     service
         .adopt_quarantine_recovery_episodes_with_shutdown(
             &mut crate::db::PeriodicQuarantineRecoveryScan::default(),
@@ -877,7 +877,7 @@ async fn a_detached_orphan_restore_task_panic_is_observed() {
     let service = recovery_test_service(conn);
     let sandbox_id = SandboxId::new();
     let local_quarantine_id = uuid::Uuid::now_v7();
-    let counters = pplx_space_metrics::test_capture::capture_counters_guard();
+    let counters = pplx_space_metrics_emit::test_capture::capture_counters_guard();
 
     let failed_task = service.task_tracker.spawn(async {
         panic!("deliberate detached restore panic");
@@ -942,7 +942,7 @@ async fn the_dispatch_path_supervises_the_task_it_spawns() {
     cancel_orphan_restore_operation(&service);
 
     let capture = crate::service::tests::service_tests::SandboxEventCapture::default();
-    let counters = pplx_space_metrics::test_capture::capture_counters_guard();
+    let counters = pplx_space_metrics_emit::test_capture::capture_counters_guard();
     {
         use tracing_subscriber::layer::SubscriberExt;
         let subscriber = tracing_subscriber::registry().with(capture.clone());
@@ -1173,8 +1173,8 @@ async fn closed_capacity_is_not_reported_as_busy_capacity() {
     let service = recovery_test_service(conn);
     service.quarantine_recovery_restore_sem.close();
 
-    let counters = pplx_space_metrics::test_capture::capture_counters_guard();
-    let values = pplx_space_metrics::test_capture::capture_values_guard();
+    let counters = pplx_space_metrics_emit::test_capture::capture_counters_guard();
+    let values = pplx_space_metrics_emit::test_capture::capture_values_guard();
     service
         .adopt_quarantine_recovery_episodes_with(
             Path::new("/nonexistent"),
@@ -1224,7 +1224,7 @@ async fn closed_capacity_is_not_reported_as_busy_capacity() {
     let open_conn = crate::db::test_conn();
     crate::db::test_fixtures::setup_quarantine_recovery_episode(&open_conn, artifact_reason);
     let open_service = recovery_test_service(open_conn);
-    let counters = pplx_space_metrics::test_capture::capture_counters_guard();
+    let counters = pplx_space_metrics_emit::test_capture::capture_counters_guard();
     open_service
         .adopt_quarantine_recovery_episodes_with(
             Path::new("/nonexistent"),
@@ -1505,7 +1505,7 @@ async fn a_candidate_that_stops_being_admissible_is_reported_without_a_write() {
         .unwrap();
     };
 
-    let counters = pplx_space_metrics::test_capture::capture_counters_guard();
+    let counters = pplx_space_metrics_emit::test_capture::capture_counters_guard();
     service
         .adopt_quarantine_recovery_episodes_with_probe(
             Path::new("/space/cache/firecracker/sandboxes"),
@@ -1736,7 +1736,7 @@ async fn a_validated_artifact_is_adopted_into_durable_cleanup() {
         pplx_space_common_core::types::SandboxQuarantineReasonCode::RestoreFirecrackerLaunchFailed,
     );
 
-    let counters = pplx_space_metrics::test_capture::capture_counters_guard();
+    let counters = pplx_space_metrics_emit::test_capture::capture_counters_guard();
     service
         .adopt_quarantine_recovery_episodes_with(
             cache.path(),
@@ -3029,7 +3029,7 @@ async fn the_cleanup_contention_release_reports_only_a_real_loss() {
         let capture = crate::service::tests::service_tests::SandboxEventCapture::default();
         let subscriber = tracing_subscriber::registry().with(capture.clone());
         let guard = tracing::subscriber::set_default(subscriber);
-        let counters = pplx_space_metrics::test_capture::capture_counters_guard();
+        let counters = pplx_space_metrics_emit::test_capture::capture_counters_guard();
         service
             .record_quarantine_recovery_no_progress(
                 &claimed,
@@ -3307,7 +3307,7 @@ async fn closed_capacity_is_read_off_the_semaphore_not_the_walk() {
     let service = recovery_test_service(conn);
     service.quarantine_recovery_restore_sem.close();
 
-    let values = pplx_space_metrics::test_capture::capture_values_guard();
+    let values = pplx_space_metrics_emit::test_capture::capture_values_guard();
     // `stub_plan` is one-shot on purpose, and this pass makes one lookup per
     // admitted adoption, so the resolution is rebuilt per call here.
     service

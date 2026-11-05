@@ -35,6 +35,7 @@ mod attempts;
 mod content_md5;
 mod copy;
 mod download;
+pub mod metrics;
 #[cfg(test)]
 mod test_support;
 mod timeouts;
@@ -720,7 +721,7 @@ where
 {
     let classification = classify_s3_sdk_error(err);
     let http_status = classification.http_status_tag();
-    pplx_space_metrics::object_store::s3_error(
+    crate::metrics::s3_error(
         operation.as_str(),
         classification.kind.as_str(),
         classification.code,

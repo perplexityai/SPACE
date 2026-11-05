@@ -8,7 +8,7 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use pplx_space_metrics::feature_flags::{self as feature_flag_metrics, DiagnosticCode};
+use crate::metrics::{self as feature_flag_metrics, DiagnosticCode};
 
 use self::env::{EPPO_BASE_URL_ENV, EPPO_SDK_KEY_ENV, eppo_sdk_key_from_env, non_empty_env};
 use crate::{AttributeValue, Attributes, FeatureFlagProvider, ProviderState, Unresolved};

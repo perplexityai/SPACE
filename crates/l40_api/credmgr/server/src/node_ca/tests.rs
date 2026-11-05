@@ -650,7 +650,7 @@ async fn a_refusal_is_reprobed_after_backoff_and_recovers_without_a_restart() {
         .boxed()
     }))
     .unwrap();
-    let capture = pplx_space_metrics::test_capture::capture_counters_guard();
+    let capture = pplx_space_metrics_emit::test_capture::capture_counters_guard();
 
     // Every caller inside the wait is answered from the cached refusal.
     for _ in 0..8 {

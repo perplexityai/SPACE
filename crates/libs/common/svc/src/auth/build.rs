@@ -191,12 +191,7 @@ impl BuildAuthenticator {
                 } else {
                     "invalid_bearer_scheme"
                 };
-                pplx_space_metrics::auth::decision(
-                    self.mode(),
-                    self.surface.as_str(),
-                    "deny",
-                    reason,
-                );
+                crate::auth::metrics::decision(self.mode(), self.surface.as_str(), "deny", reason);
                 return Err(status);
             }
         };
@@ -216,7 +211,7 @@ impl BuildAuthenticator {
                 },
             ),
         };
-        pplx_space_metrics::auth::decision(mode, self.surface.as_str(), outcome, reason);
+        crate::auth::metrics::decision(mode, self.surface.as_str(), outcome, reason);
         result
     }
 

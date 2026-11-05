@@ -2732,7 +2732,7 @@ async fn failed_started_recovery_after_pod_absence_refuses_stale_snapshot(
     // back without publishing a route or retaining a new operation lease.
     let candidate = SandboxActivationAttemptId::new();
     for direct_assignment in [true, false] {
-        let capture = pplx_space_metrics::test_capture::capture_counters_guard();
+        let capture = pplx_space_metrics_emit::test_capture::capture_counters_guard();
         let result = if direct_assignment {
             fixture
                 .store

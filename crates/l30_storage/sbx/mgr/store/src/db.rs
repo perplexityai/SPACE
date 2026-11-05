@@ -454,7 +454,7 @@ fn emit_sandbox_quarantined_event(
         SandboxState::Quarantined,
         error,
     );
-    pplx_space_metrics::sandbox::worker::quarantine_entered(reason_code, operation);
+    crate::metrics::quarantine_entered(reason_code, operation);
 }
 
 fn emit_auto_lifecycle_delete_receipt_superseded(
