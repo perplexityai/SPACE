@@ -518,9 +518,9 @@ async fn retired_execution_without_a_successor_still_registers() -> TestResult {
 /// A newer claim abandoned before it materialized a pod never ran, so it
 /// doesn't supersede the execution below it. One that materialized does, even
 /// after it retired: by its `pod_uid` alone while the materialization record
-/// is unset (a row from before the record, until the backfill stamps it), and
-/// by the record once its `pod_uid` is cleared, as pod re-materialization and
-/// failed-recovery pod absence clear it after the pod may have run.
+/// is unset (a row from before the record), and by the record once its
+/// `pod_uid` is cleared, as pod re-materialization and failed-recovery pod
+/// absence clear it after the pod may have run.
 #[tokio::test(flavor = "current_thread")]
 async fn only_a_newer_execution_that_ran_supersedes() -> TestResult {
     let Some(fixture) = cluster_fixture().await? else {
