@@ -25,11 +25,10 @@ use sqlx::{Postgres, Transaction};
 /// runs; a caller that skips the parse would overwrite them.
 ///
 /// Once committed, `deleting` fences some writers and not others. Fork
-/// admission and the API's wake-completion compare-and-set
-/// (`complete_wake_lifecycle`) refuse the row. Other writers can still move
-/// it off `deleting`, among them the API's best-effort lifecycle stamps and
-/// its pooled post-wake update, which refuse only `failed`, `quarantined`,
-/// `deleted` and `cleanup_required` rows (see
+/// admission, the API's wake-completion compare-and-set
+/// (`complete_wake_lifecycle`), its post-action stamps
+/// ([`crate::action_stamp`]) and its pooled post-wake update refuse the row.
+/// Other writers can still move it off `deleting` (see
 /// [`restore_lifecycle_from_deleting`]).
 pub async fn mark_deleting(
     tx: &mut Transaction<'_, Postgres>,

@@ -1601,7 +1601,12 @@ impl SandboxController {
                     if !execution.completion.should_finalize_lifecycle() {
                         return Ok(body);
                     }
-                    maybe_mark_started_after_start(pool, id).await;
+                    maybe_mark_started_after_start(
+                        pool,
+                        id,
+                        start_substrate(self.substrate.capabilities()),
+                    )
+                    .await;
                     self.substrate
                         .complete_activation_lease(typed_id, execution.lease_completion)
                         .await;
@@ -2113,10 +2118,8 @@ impl SandboxController {
             }
         };
         if let Some(status) = status {
-            if !(status == SandboxLifecycleStatus::Suspended
-                && self.substrate.capabilities().suspend_commits_lifecycle)
-            {
-                maybe_update_sandbox_lifecycle(pool, id, status.as_str()).await;
+            if let Some(stamp) = post_action_stamp(action, self.substrate.capabilities()) {
+                maybe_update_sandbox_lifecycle(pool, id, stamp).await;
             }
             if status == SandboxLifecycleStatus::Started {
                 record_dormant_activation_if_needed(sandbox, metric_identity, action);
