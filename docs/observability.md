@@ -347,7 +347,8 @@ counts only on an unsampled context: a sampled one is saved whatever its
 A `grpc.client` span that ends in a non-OK status is marked ERROR, except for
 an answer the call expects: a readiness poll's FAILED_PRECONDITION, a guest
 file or process operation's application status, and a code the caller marks
-on that one call with `ExpectedGrpcStatus`. A marked call records the code in`space.grpc.expected_status` whatever the answer. net-gateway marks its policy
+on that one call with `ExpectedGrpcStatus`. A marked call records the code in
+`space.grpc.expected_status` whatever the answer. net-gateway marks its policy
 pulls PERMISSION_DENIED until sandbox-manager has registered it: a pull sent
 before the owner's first control call, within ten seconds of launch, and short
 of the last pending attempt. A marked pull's refusal is always retried; the
@@ -696,7 +697,8 @@ events use the log target
   leg, or without a recorded leg (`fault:relay_io`).
 - DEBUG `guest side failed an established known egress connection`: a
   pass-through relay that connected and then failed first on the guest leg.
-  These events are visible only when the gateway's log filter enables DEBUG  for that target.
+  These events are visible only when the gateway's log filter enables DEBUG
+  for that target.
 
 The INFO and DEBUG events add `fault`, with the same pass-through values as
 the metric tag above. Each of these failures is also counted by
@@ -1045,7 +1047,8 @@ selector errors are declared in
 
 ### Operator requirements
 
-- Keep the receiver internal. Apply an ingress **NetworkPolicy limiting TCP  4317 to the intended SPACE namespaces**, with narrowly selected producers
+- Keep the receiver internal. Apply an ingress **NetworkPolicy limiting TCP
+  4317 to the intended SPACE namespaces**, with narrowly selected producers
   where possible. Use a CNI that enforces the policy; do not expose the receiver
   through a public load balancer or an unprotected node port.
 - **Sandbox guests must not reach the Collector.** Namespace selection alone
