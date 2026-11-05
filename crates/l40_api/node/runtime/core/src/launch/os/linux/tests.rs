@@ -293,6 +293,25 @@ fn direct_jailer_preserves_runtime_supervisor_scheduling_priority() {
 }
 
 #[test]
+fn direct_jailer_is_preferred_for_oom_kill() {
+    let cat_path = if std::path::Path::new("/bin/cat").exists() {
+        "/bin/cat"
+    } else {
+        "/usr/bin/cat"
+    };
+    let output = direct_jailer_command(
+        crate::launch::JailerExecutable::LegacyPath(cat_path),
+        &["/proc/self/oom_score_adj".to_string()],
+    )
+    .unwrap()
+    .output()
+    .expect("read spawned process oom_score_adj");
+
+    assert!(output.status.success());
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "1000");
+}
+
+#[test]
 fn firecracker_api_socket_path_points_inside_jail_root() {
     let socket_path = firecracker_api_socket_path("/space/cache/firecracker/jails", "sandbox-a");
 

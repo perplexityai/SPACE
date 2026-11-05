@@ -383,6 +383,10 @@ pub fn prepare_sidecar_launch(
             .map_err(|error| format!("PR_SET_KEEPCAPS failed: {error}"))?;
     }
 
+    // Before setuid: an unprivileged, non-dumpable process cannot open its own
+    // /proc/self/oom_score_adj.
+    pplx_space_common_core::host::linux::prefer_for_oom_kill()
+        .map_err(|error| format!("set oom_score_adj failed: {error}"))?;
     nix::unistd::setgroups(&[]).map_err(|e| format!("setgroups([]) failed: {e}"))?;
     nix::unistd::setgid(Gid::from_raw(gid)).map_err(|e| format!("setgid failed: {e}"))?;
     nix::unistd::setuid(Uid::from_raw(uid)).map_err(|e| format!("setuid failed: {e}"))?;
@@ -716,6 +720,13 @@ fn direct_jailer_command(
     let mut cmd = std::process::Command::new(&program);
     cmd.env_clear().env("PATH", JAILER_PATH);
     cmd.args(jailer_args);
+    // Jailer and the Firecracker process it daemonizes inherit this score.
+    // Registered first: the sealed-executable hook below never returns.
+    // SAFETY: `prefer_for_oom_kill` is async-signal-safe.
+    unsafe {
+        use std::os::unix::process::CommandExt;
+        cmd.pre_exec(pplx_space_common_core::host::linux::prefer_for_oom_kill);
+    }
     if let JailerExecutable::Sealed(file) = jailer {
         bind_jailer_descriptor(&mut cmd, file.file().try_clone()?, &program, jailer_args)?;
     }

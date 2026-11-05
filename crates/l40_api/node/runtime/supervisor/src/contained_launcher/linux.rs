@@ -198,6 +198,10 @@ fn prepare_and_exec(config: &Config, stream: &mut Option<UnixStream>) -> Result<
     }
     drop(private_devices);
     let proc_directory = private_mountpoint("proc")?;
+    // Host procfs disappears at the pivot. Set the policy before forking so
+    // both the runner and runtime inherit it, without procfs in privilege drop.
+    pplx_space_common_core::host::linux::prefer_for_oom_kill()
+        .map_err(io("prefer runtime for OOM kill"))?;
     nix::unistd::pivot_root(".", ".").map_err(sys("pivot isolation root"))?;
     nix::mount::umount2(".", nix::mount::MntFlags::MNT_DETACH)
         .map_err(sys("detach host mount tree"))?;
