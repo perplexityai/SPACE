@@ -7,6 +7,9 @@ import { linkableTemplates } from '@/lib/system-template-rebuild';
 import { firstReadError } from '@/lib/template-reads';
 import { ReadErrorAlert } from './template-cells';
 import SystemTemplateRebuild from './system-template-rebuild';
+import SeedBuilder from './seed-builder';
+import { useAuth } from '@/lib/auth';
+import type { TemplateActions } from './template-actions';
 import type { TemplatesData } from './use-templates-data';
 import { templateHref } from './links';
 
@@ -16,8 +19,10 @@ const SYSTEM_TEMPLATES = ['seed', 'code-runtime'] as const;
 // The system templates and their rebuild. The rebuild builds from the recipe
 // bundled with the API, so it is offered here whether or not the templates
 // exist yet: a new cluster's first build starts from this tab.
-export default function SystemTemplates({ data }: { data: TemplatesData }) {
-  const rows = SYSTEM_TEMPLATES.map((name) => {
+export default function SystemTemplates({ data, actions }: { data: TemplatesData; actions: TemplateActions }) {
+  const { cluster, user } = useAuth();
+  const hasCodeRuntime = data.templates.some((template) => template.name === 'code-runtime');
+  const rows = SYSTEM_TEMPLATES.filter((name) => name === 'seed' || hasCodeRuntime).map((name) => {
     const template = data.templates.find((candidate) => candidate.name === name) ?? null;
     const latest = data.templateReleases.find((release) => release.template_name === name && release.tags.includes(LATEST_TAG)) ?? null;
     return { name, template, latest };
@@ -65,13 +70,14 @@ export default function SystemTemplates({ data }: { data: TemplatesData }) {
           },
         ]}
       />
-      <SystemTemplateRebuild
+      <SeedBuilder key={`${cluster?.id}:${user?.id}`} data={data} actions={actions} />
+      {hasCodeRuntime ? <SystemTemplateRebuild
         releases={data.templateReleases}
         releasesLoaded={data.releasesLoaded}
         refreshReleases={() => data.refreshTemplateReleases({ showLoading: false })}
         title={<Title level={5} style={{ margin: 0 }}>System template rebuild</Title>}
         listedTemplates={linkableTemplates({ releases: data.templateReleases, listed: data.templates })}
-      />
+      /> : null}
     </Space>
   );
 }

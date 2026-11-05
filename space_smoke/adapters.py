@@ -65,6 +65,7 @@ from space_smoke.capabilities import (
     ColdCreatePod,
     ColdCreateSelection,
     ConsoleApiResponse,
+    DurableLifecycleSandbox,
     DrainGateBlocker,
     TerminateAttempt,
     EcwCommandResult,
@@ -4960,6 +4961,33 @@ ON CONFLICT (key_hash) DO NOTHING;
 
     def console_operator_login(self) -> tuple[str, str]:
         return "root@local", self.environment.get("SPACE_CONSOLE_PASSWORD") or "password"
+
+    def console_sandbox(self, sandbox_id: str) -> DurableLifecycleSandbox:
+        from space_smoke.native import NativeConfig, NativeSandboxFactory
+
+        self._require_isolated_kind("console sandbox execution")
+        factory = NativeSandboxFactory(NativeConfig(
+            api_url=self.config.api_url,
+            data_plane_url=self.environment.get("ECW_DATA_PLANE_BASE_URL", "http://127.0.0.1:8090"),
+            token=self._admin_token(),
+            template="seed",
+        ))
+        return factory.connect(sandbox_id)
+
+    def console_runtime_version(self, sandbox_id: str) -> str:
+        self._require_isolated_kind("console runtime inspection")
+        sandbox_id = _sql_uuid(sandbox_id.removeprefix("sbx_"))
+        placement = self.sandbox_pod_placement(sandbox_id)
+        response = self.console_api("GET", f"/admin/api/v1/sandboxes/{sandbox_id}")
+        pid = response.body.get("pid") if isinstance(response.body, dict) else None
+        if placement is None or not isinstance(pid, int) or pid <= 0:
+            raise SmokeConfigurationError("the console sandbox has no running runtime identity")
+        result = self._node_shell_exec(
+            placement.node_name, f"/proc/{pid}/exe --version", timeout=15
+        )
+        return _require_ok(
+            result, "inspect the running sandbox runtime executable"
+        ).split("\n", 1)[0].strip()
 
     def console_api(
         self,

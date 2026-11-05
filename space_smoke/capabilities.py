@@ -2921,6 +2921,14 @@ class ConsoleControl(Protocol):
         """The console's origin on this bench."""
         ...
 
+    def console_sandbox(self, sandbox_id: str) -> DurableLifecycleSandbox:
+        """Attach to an operator-owned sandbox without taking cleanup ownership."""
+        ...
+
+    def console_runtime_version(self, sandbox_id: str) -> str:
+        """Read the version of the running sandbox's actual runtime executable."""
+        ...
+
     def console_operator_login(self) -> tuple[str, str]:
         """Email and password of the bench's seeded console operator."""
         ...
