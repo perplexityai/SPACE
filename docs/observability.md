@@ -1133,13 +1133,14 @@ carries `client_id`: route latency and errors (`sandbox.api.latency_ms`,
 `sandbox.api.request_error`), step latency and errors
 (`sandbox.api.step.latency_ms`, `sandbox.api.error`), restore-claim laps,
 wake-coalescer outcomes, template selection and dormant activation, plus
-`sandbox.api.created`. The sandbox route middleware resolves the request's
-`X-Client-ID` against the static list only (never the runtime overrides, so an
-override-only caller reads `unknown` there) and scopes it over the handler, so
-these metrics need no per-call-site stamping. A value the handler stamps itself,
-such as connect's limiter-resolved ID, wins. Work a request hands to another
-task leaves the scope and reports `unknown`, as do the gRPC server metrics and
-the background reconciler, wake-completion and limiter-gauge metrics.
+`sandbox.api.created` and the requested-size distributions. The sandbox route
+middleware resolves the request's `X-Client-ID` against the static list only
+(never the runtime overrides, so an override-only caller reads `unknown` there)
+and scopes it over the handler, so these metrics need no per-call-site
+stamping. A value the handler stamps itself, such as connect's limiter-resolved
+ID, wins. Work a request hands to another task leaves the scope and reports
+`unknown`, as do the gRPC server metrics and the background reconciler,
+wake-completion and limiter-gauge metrics.
 Deployments that filter tags by key must keep `client_id` on these metrics.
 
 Two independent signals describe a restore:
@@ -1178,6 +1179,37 @@ or `default`. A partial request reports the fallback that filled the gap. The
 `runtime` and `template`. A non-zero `shape_source:default` count means creates
 fell back to the platform default shape; those events omit `vcpu` and
 `memory_mib`. Direct creates and forks omit `shape_source`.
+
+## Requested sandbox size
+
+The API records the vCPU and guest memory each sandbox will run with, after
+template and warm-pool defaults are applied, as two distributions with the same
+tags:
+
+| Metric | Value |
+| --- | --- |
+| `sandbox.api.requested.vcpu` | vCPUs |
+| `sandbox.api.requested.memory_bytes` | Guest memory in bytes (`memory_mib * 1048576`) |
+
+| Tag | Values |
+| --- | --- |
+| `kind` | `create` for a cold or warm-pool create |
+| `surface` | `native` or `ecw`, the API the call arrived on |
+| `admission` | `accepted`, or `rejected` when cluster activation admission refused the call |
+| `template` | The resolved template |
+| `defaulted` | `false` when the request set both vCPU and memory; `true` when a build shape, the platform default, a warm-pool config or a warm-pool policy supplied either. Warm-pool claims are always `true` |
+| `client_id` | The request's bounded caller, as described above |
+
+There is one sample per create call, so a retried call adds one; `count:` on
+either distribution is the call count.
+
+A cold create is recorded at its cluster admission decision, so an admitted
+create that fails later still counts and one that fails before admission does
+not. A warm-pool create is recorded when its claim is adopted.
+
+Nothing is recorded for a fork, or for a create whose size the API did not
+resolve: a Direct create, or a Kubernetes create left to the node's default
+shape. Disk size is not recorded.
 
 ## Sandboxes in a transient lifecycle
 

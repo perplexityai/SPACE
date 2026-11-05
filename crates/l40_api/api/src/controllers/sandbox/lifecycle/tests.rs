@@ -69,9 +69,9 @@ fn cluster_delete_miss_reason_classifies_by_substrate_error() {
 }
 
 /// Admission refusals at request entry and those the substrate charges later
-/// share one constructor. Only a rate-limited refusal carries the
-/// backpressure cause the async dispatcher re-queues behind; an empty
-/// cluster keeps its bounded retry.
+/// share one constructor, which marks them as admission refusals. Only a
+/// rate-limited refusal carries the backpressure cause the async dispatcher
+/// re-queues behind; an empty cluster keeps its bounded retry.
 #[test]
 fn admission_refusals_keep_their_dispatcher_retry_causes() {
     use crate::cluster_admission::ClusterAdmissionError;
@@ -125,7 +125,12 @@ fn admission_refusals_keep_their_dispatcher_retry_causes() {
         assert_eq!(error.retry_after_header(), retry_after_header, "{case}");
         assert_eq!(error.retry_after(), None, "{case}");
         assert_eq!(error.retry_after_cause(), cause, "{case}");
+        assert!(error.is_cluster_admission_rejection(), "{case}");
     }
+    // A 429 from anything else, such as a per-client limiter, is not one.
+    assert!(
+        !ControllerError::rate_limited("client concurrency limit").is_cluster_admission_rejection()
+    );
 }
 
 #[test]

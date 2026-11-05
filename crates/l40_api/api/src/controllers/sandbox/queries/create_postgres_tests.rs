@@ -12,6 +12,7 @@ use pplx_space_common_core::types::PodUid;
 
 #[cfg(feature = "kubernetes")]
 mod kubernetes;
+mod requested_metrics;
 
 type InsertedPooledSandboxRow = (
     Option<String>,
@@ -2212,6 +2213,7 @@ async fn postgres_pooled_create_retries_prepare_in_place_before_reclaiming() -> 
     let updated_policy = crate::e2b::auto_lifecycle_policy(120, true, false);
     substrate.policy_after_prepare_failure = Some(updated_policy.clone());
 
+    let capture = pplx_space_metrics::test_capture::capture_values_guard();
     let response = SandboxController::try_create_from_pool_with_substrate(
         &substrate,
         input,
@@ -2220,8 +2222,14 @@ async fn postgres_pooled_create_retries_prepare_in_place_before_reclaiming() -> 
     .await?
     .response
     .expect("same warm-pool claim should succeed after prepare retry");
+    let requested = requested_metrics::requested_samples(capture);
 
     assert_eq!(response.id, sandbox_id);
+    assert_eq!(
+        requested,
+        requested_metrics::create_samples("accepted", "seed", true, 4, 2048),
+        "the adopted claim records its pool shape once, not once per prepare attempt"
+    );
     assert_eq!(response.lifecycle.as_deref(), Some("paused"));
     assert_eq!(substrate.claim_calls(), 1);
     assert_eq!(substrate.prepare_calls(), 2);
@@ -3308,6 +3316,7 @@ async fn admission_claim_executes_and_runs_under_the_claimed_id(
         inner: kubernetes(),
         prepared: Mutex::new(Vec::new()),
     };
+    let capture = pplx_space_metrics::test_capture::capture_values_guard();
     let result = SandboxController::try_create_from_admitted_pool_claim_with_substrate(
         &substrate,
         input,
@@ -3316,11 +3325,22 @@ async fn admission_claim_executes_and_runs_under_the_claimed_id(
         Arc::new(AtomicU64::new(0)),
     )
     .await?;
+    let requested = requested_metrics::requested_samples(capture);
 
     let sandbox = result
         .response
         .expect("the admitted slot is adopted, not rebuilt cold");
     assert_eq!(sandbox.id, slot.reserved_sandbox_id);
+    assert_eq!(
+        requested,
+        requested_metrics::create_samples(
+            "accepted",
+            TEMPLATE,
+            true,
+            crate::routes::public::sandboxes::admission_test_fixture::VCPU,
+            crate::routes::public::sandboxes::admission_test_fixture::MEMORY_MIB,
+        )
+    );
     assert_eq!(
         *substrate.prepared.lock().unwrap(),
         vec![(slot.reserved_sandbox_id, true)]
