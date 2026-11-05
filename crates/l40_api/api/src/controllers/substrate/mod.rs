@@ -934,18 +934,7 @@ impl From<SubstrateError> for ControllerError {
                 message,
                 retry_after,
                 rate_limited,
-            } => {
-                let mut error = ControllerError::rate_limited(message);
-                if let Some(retry_after) = retry_after {
-                    error = error.with_retry_after_header(retry_after);
-                }
-                if rate_limited {
-                    error = error.with_retry_after_cause(
-                        ControllerRetryAfterCause::ClusterActivationAdmission,
-                    );
-                }
-                error
-            }
+            } => ControllerError::cluster_admission_rejected(message, retry_after, rate_limited),
             SubstrateError::Cancelled { message } => ControllerError::service_unavailable(message),
             SubstrateError::Unsupported { message } => {
                 ControllerError::new(axum::http::StatusCode::NOT_IMPLEMENTED, message)
