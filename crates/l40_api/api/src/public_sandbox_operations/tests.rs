@@ -929,7 +929,7 @@ fn create_payload_without_a_requester_is_wire_compatible_with_old_shape() {
     assert_eq!(parsed.requested_by_user_id, None);
 
     // Recorded, it round-trips, and an older executor refuses it: the
-    // consumer-first precondition `ADMIN_CREATE_REQUESTED_BY_ENV` guards.
+    // consumer-first precondition every admin create relies on.
     let admin = UserId::new();
     let recorded = payload(Some(admin)).into_json();
     let parsed: CreateSandboxOperationPayload = serde_json::from_value(recorded.clone()).unwrap();
