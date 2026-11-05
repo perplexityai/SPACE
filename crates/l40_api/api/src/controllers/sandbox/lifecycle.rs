@@ -1,4 +1,5 @@
 use pplx_space_common_core::types::SandboxId;
+use pplx_space_metrics::sandbox::api::RequestedKind;
 
 use super::*;
 use crate::controllers::db_contention_error;
@@ -490,8 +491,7 @@ impl SandboxAction {
         lifecycle: Option<SandboxLifecycle>,
     ) -> Option<crate::cluster_admission::ClusterActivationClass> {
         match self {
-            // Start adds runtime placement only from a not-yet-running
-            // lifecycle. Against an already-running/in-flight/terminal sandbox
+            // Start adds runtime placement only from a not-yet-running            // lifecycle. Against an already-running/in-flight/terminal sandbox
             // (started/starting/creating/restoring/failed/deleting) it is a
             // no-op, a join of in-flight work, or a reject, so it must not spend
             // an activation token. No lifecycle context (the internal execute
@@ -990,8 +990,7 @@ pub(super) async fn fetch_active_node_drain_state(
     // restoring`; the snapshot is still canonical mid-restore.
     //
     // The portability check and the primary lookup below read the same
-    // sandbox row, so they are one statement: a snapshot at least as
-    // consistent as the two reads it replaces. `portable` is only consulted
+    // sandbox row, so they are one statement: a snapshot at least as    // consistent as the two reads it replaces. `portable` is only consulted
     // first; the primary columns are ignored when it is true.
     let portable_predicate = portable_for_restore_affinity("s");
     let gate_query = format!(
@@ -1440,121 +1439,143 @@ impl SandboxController {
         action: SandboxAction,
         activation: Option<SandboxActivationRequest>,
     ) -> Result<serde_json::Value, ControllerError> {
-        let typed_id = id;
         let Some(sandbox) = sandbox else {
             return self
                 .untracked_action(id, metric_identity, action, activation)
                 .await;
         };
 
-        let reconnect_started_at = std::time::Instant::now();
-        if action.affects_lifecycle()
-            && let Err(err) = ensure_resolved_node_not_draining(pool, id, action).await
+        // An action that activates the sandbox from its lifecycle at entry,
+        // or a resume of a paused one, requests its size. A follower that
+        // joins another caller's activation clears it: it requested nothing
+        // of its own.
+        let entry_lifecycle = sandbox.lifecycle.parse::<SandboxLifecycle>().ok();
+        let mut requested_kind = if action.activation_class(entry_lifecycle).is_some() {
+            Some(RequestedKind::Activate)
+        } else if action == SandboxAction::Resume
+            && entry_lifecycle == Some(SandboxLifecycle::Paused)
         {
-            if matches!(action, SandboxAction::Wake | SandboxAction::ImplicitWake(_)) {
-                record_reconnect_attempt(
-                    metric_identity,
-                    sandbox.lifecycle.as_str(),
-                    ReconnectOutcome::Rejected,
-                    ReconnectTerminalPhase::Api,
-                    ReconnectReason::DrainBlocked,
-                    reconnect_started_at,
-                );
-            }
-            return Err(err);
-        }
-
-        // Validate activation options before admission and the requested event:
-        // a malformed request (e.g. `ready_timeout_secs=0`) must be rejected
-        // without spending a token or leaving an orphaned `*_requested` event.
-        // Only Start/Restore/Resume carry these; for other actions `activation`
-        // is `None`, so this resolves to defaults and never errors.
-        let activation_options = resolve_activation_options(activation.as_ref(), true)?;
-
-        // Gate cluster activation admission BEFORE emitting the `*_requested`
-        // event. A rejected or backpressured activation must not leave an
-        // orphaned requested event with no terminal outcome: the async
-        // operation dispatcher re-drives the action on every requeue, so an
-        // early requested-without-terminal would repeat indefinitely. Admission
-        // is a rate-limit decision on the lifecycle observed at request entry,
-        // not a consistency guard for races with other lifecycle writers. For
-        // Wake the terminal-lifecycle check runs first — a Wake the guard
-        // rejects must not spend a shared token or draw a 429 either.
-        match action {
-            SandboxAction::Start | SandboxAction::Restore => {
-                let lifecycle = sandbox.lifecycle.parse::<SandboxLifecycle>().ok();
-                // Restore-shaped starts defer admission to the restore-lease
-                // claim-winner too. Direct has no lease and spends the same
-                // policy at its substrate entry.
-                if self.restore_claim_charge(lifecycle).is_none() {
-                    self.admit_action_cluster_activation(action, lifecycle)
-                        .await?;
-                }
-            }
-            SandboxAction::Wake | SandboxAction::ImplicitWake(_) => {
-                if !wake_lifecycle_allows_started_update(sandbox.lifecycle.as_str()) {
+            Some(RequestedKind::Resume)
+        } else {
+            None
+        };
+        // The body's early returns leave this block, so the sample below sees
+        // every outcome.
+        let result: Result<serde_json::Value, ControllerError> = async {
+            let typed_id = id;
+            let reconnect_started_at = std::time::Instant::now();
+            if action.affects_lifecycle()
+                && let Err(err) = ensure_resolved_node_not_draining(pool, id, action).await
+            {
+                if matches!(action, SandboxAction::Wake | SandboxAction::ImplicitWake(_)) {
                     record_reconnect_attempt(
                         metric_identity,
                         sandbox.lifecycle.as_str(),
                         ReconnectOutcome::Rejected,
                         ReconnectTerminalPhase::Api,
-                        ReconnectReason::TerminalLifecycle,
+                        ReconnectReason::DrainBlocked,
                         reconnect_started_at,
                     );
-                    return Err(ControllerError::conflict(format!(
-                        "sandbox cannot be woken while lifecycle is {}",
-                        sandbox.lifecycle
-                    )));
                 }
-                let lifecycle = sandbox
-                    .lifecycle
-                    .parse::<SandboxLifecycle>()
-                    .map_err(|error| {
-                        ControllerError::internal(format!("sandbox has invalid lifecycle: {error}"))
-                    })?;
-                // A restore-eligible wake (suspended/restoring) defers the
-                // activation charge to the substrate RecoveryCharge path, whose
-                // rejections surface as SubstrateError and are recorded there;
-                // only the up-front admission charge is handled here. A
-                // cluster-activation 429/backpressure here is the
-                // control-plane-saturation signature the retry-storm alert
-                // exists to catch, so record it on the reconnect series (the
-                // error classifier maps the retry-after to exhausted/wait_budget)
-                // before returning — otherwise a storm throttled by the cluster
-                // limiter is invisible to the monitor.
-                if self.restore_claim_charge(Some(lifecycle)).is_none()
-                    && let Err(err) = self
-                        .admit_action_cluster_activation(action, Some(lifecycle))
-                        .await
-                {
-                    let (outcome, terminal_phase, reason) =
-                        reconnect_controller_error_outcome(sandbox.lifecycle.as_str(), &err);
-                    record_reconnect_attempt(
-                        metric_identity,
-                        sandbox.lifecycle.as_str(),
-                        outcome,
-                        terminal_phase,
-                        reason,
-                        reconnect_started_at,
-                    );
-                    return Err(err);
-                }
+                return Err(err);
             }
-            _ => {}
-        }
 
-        let id_str = id.to_string();
-        let body = serde_json::json!({"ok": true, "action": action.as_str(), "sandbox_id": id_str});
-        emit_api_sandbox_event(
-            typed_id,
-            action.requested_event(),
-            action,
-            SandboxEventDetails::default()
-                .lifecycle_state(sandbox.lifecycle.as_str())
-                .placement(sandbox.placement.as_str()),
-        );
-        let result: Result<(Option<SandboxLifecycleStatus>, serde_json::Value), ControllerError> =
+            // Validate activation options before admission and the requested event:
+            // a malformed request (e.g. `ready_timeout_secs=0`) must be rejected
+            // without spending a token or leaving an orphaned `*_requested` event.
+            // Only Start/Restore/Resume carry these; for other actions `activation`
+            // is `None`, so this resolves to defaults and never errors.
+            let activation_options = resolve_activation_options(activation.as_ref(), true)?;
+
+            // Gate cluster activation admission BEFORE emitting the `*_requested`
+            // event. A rejected or backpressured activation must not leave an
+            // orphaned requested event with no terminal outcome: the async            // operation dispatcher re-drives the action on every requeue, so an
+            // early requested-without-terminal would repeat indefinitely. Admission
+            // is a rate-limit decision on the lifecycle observed at request entry,
+            // not a consistency guard for races with other lifecycle writers. For
+            // Wake the terminal-lifecycle check runs first — a Wake the guard
+            // rejects must not spend a shared token or draw a 429 either.
             match action {
+                SandboxAction::Start | SandboxAction::Restore => {
+                    let lifecycle = sandbox.lifecycle.parse::<SandboxLifecycle>().ok();
+                    // Restore-shaped starts defer admission to the restore-lease
+                    // claim-winner too. Direct has no lease and spends the same
+                    // policy at its substrate entry.
+                    if self.restore_claim_charge(lifecycle).is_none() {
+                        self.admit_action_cluster_activation(action, lifecycle)
+                            .await?;
+                    }
+                }
+                SandboxAction::Wake | SandboxAction::ImplicitWake(_) => {
+                    if !wake_lifecycle_allows_started_update(sandbox.lifecycle.as_str()) {
+                        record_reconnect_attempt(
+                            metric_identity,
+                            sandbox.lifecycle.as_str(),
+                            ReconnectOutcome::Rejected,
+                            ReconnectTerminalPhase::Api,
+                            ReconnectReason::TerminalLifecycle,
+                            reconnect_started_at,
+                        );
+                        return Err(ControllerError::conflict(format!(
+                            "sandbox cannot be woken while lifecycle is {}",
+                            sandbox.lifecycle
+                        )));
+                    }
+                    let lifecycle =
+                        sandbox
+                            .lifecycle
+                            .parse::<SandboxLifecycle>()
+                            .map_err(|error| {
+                                ControllerError::internal(format!(
+                                    "sandbox has invalid lifecycle: {error}"
+                                ))
+                            })?;
+                    // A restore-eligible wake (suspended/restoring) defers the
+                    // activation charge to the substrate RecoveryCharge path, whose
+                    // rejections surface as SubstrateError and are recorded there;
+                    // only the up-front admission charge is handled here. A
+                    // cluster-activation 429/backpressure here is the
+                    // control-plane-saturation signature the retry-storm alert
+                    // exists to catch, so record it on the reconnect series (the
+                    // error classifier maps the retry-after to exhausted/wait_budget)
+                    // before returning — otherwise a storm throttled by the cluster
+                    // limiter is invisible to the monitor.
+                    if self.restore_claim_charge(Some(lifecycle)).is_none()
+                        && let Err(err) = self
+                            .admit_action_cluster_activation(action, Some(lifecycle))
+                            .await
+                    {
+                        let (outcome, terminal_phase, reason) =
+                            reconnect_controller_error_outcome(sandbox.lifecycle.as_str(), &err);
+                        record_reconnect_attempt(
+                            metric_identity,
+                            sandbox.lifecycle.as_str(),
+                            outcome,
+                            terminal_phase,
+                            reason,
+                            reconnect_started_at,
+                        );
+                        return Err(err);
+                    }
+                }
+                _ => {}
+            }
+
+            let id_str = id.to_string();
+            let body =
+                serde_json::json!({"ok": true, "action": action.as_str(), "sandbox_id": id_str});
+            emit_api_sandbox_event(
+                typed_id,
+                action.requested_event(),
+                action,
+                SandboxEventDetails::default()
+                    .lifecycle_state(sandbox.lifecycle.as_str())
+                    .placement(sandbox.placement.as_str()),
+            );
+            let result: Result<
+                (Option<SandboxLifecycleStatus>, serde_json::Value),
+                ControllerError,
+            > = match action {
                 SandboxAction::Start => {
                     let activation = activation_options;
                     let execution = match self
@@ -1589,6 +1610,7 @@ impl SandboxController {
                         }
                     };
                     if !execution.completion.should_finalize_lifecycle() {
+                        requested_kind = None;
                         return Ok(body);
                     }
                     maybe_mark_started_after_start(pool, id).await;
@@ -1670,6 +1692,7 @@ impl SandboxController {
                     };
                     if !execution.completion.should_finalize_lifecycle() {
                         completion_guard.defuse();
+                        requested_kind = None;
                         record_reconnect_attempt(
                             metric_identity,
                             reconnect_initial_lifecycle,
@@ -1738,11 +1761,11 @@ impl SandboxController {
                         );
                         return Err(ControllerError::internal(
                             "sandbox wake lost the lifecycle CAS — the transient-lifecycle \
-                             sweeper or another supervisor flipped the row to a terminal \
-                             state (likely 'failed') while the substrate wake was in flight. \
-                             The substrate work this request started has been undone by the \
-                             sweeper's cleanup; the sandbox needs to be recreated rather than \
-                             retried, since wake_execution rejects terminal-lifecycle rows",
+                                 sweeper or another supervisor flipped the row to a terminal \
+                                 state (likely 'failed') while the substrate wake was in flight. \
+                                 The substrate work this request started has been undone by the \
+                                 sweeper's cleanup; the sandbox needs to be recreated rather than \
+                                 retried, since wake_execution rejects terminal-lifecycle rows",
                         ));
                     }
                     record_reconnect_attempt(
@@ -1829,6 +1852,7 @@ impl SandboxController {
                     };
                     if !completion.should_finalize_lifecycle() {
                         completion_guard.defuse();
+                        requested_kind = None;
                         return Ok(body);
                     }
                     // Refuse to overwrite a terminal, teardown, or newer
@@ -1888,11 +1912,11 @@ impl SandboxController {
                         );
                         return Err(ControllerError::internal(
                             "sandbox restore lost the lifecycle CAS — the transient-lifecycle \
-                             sweeper or another supervisor flipped the row to a terminal state \
-                             (likely 'failed') while the substrate restore was in flight. The \
-                             substrate work this request started has been undone by the \
-                             sweeper's cleanup; the sandbox needs to be recreated rather than \
-                             retried, since restore_execution rejects terminal-lifecycle rows",
+                                 sweeper or another supervisor flipped the row to a terminal state \
+                                 (likely 'failed') while the substrate restore was in flight. The \
+                                 substrate work this request started has been undone by the \
+                                 sweeper's cleanup; the sandbox needs to be recreated rather than \
+                                 retried, since restore_execution rejects terminal-lifecycle rows",
                         ));
                     }
                     record_dormant_activation_if_needed(sandbox, metric_identity, action);
@@ -1964,8 +1988,7 @@ impl SandboxController {
                 //   runtime is unreachable we return 503 instead of
                 //   optimistically marking the sandbox stopped: an earlier
                 //   version that decided from the pod-IP lookup conflated
-                //   "pod gone" with "pod Pending / no IP yet" and falsely
-                //   reported success on a still-running VM.
+                //   "pod gone" with "pod Pending / no IP yet" and falsely                //   reported success on a still-running VM.
                 //
                 // This branch keys on the drain *phase* only, not the mode. A
                 // gentle drain still cordons the node, so `ensure_pod_exists`
@@ -1989,8 +2012,8 @@ impl SandboxController {
                             None => {
                                 return Err(ControllerError::service_unavailable(format!(
                                     "sandbox runtime is currently unreachable for {action}; \
-                                     retry once the worker recovers or the drain reconciler \
-                                     migrates the sandbox"
+                                         retry once the worker recovers or the drain reconciler \
+                                         migrates the sandbox"
                                 )));
                             }
                         };
@@ -2088,39 +2111,52 @@ impl SandboxController {
                 }
             };
 
-        let (status, body) = match result {
-            Ok(result) => result,
-            Err(err) => {
+            let (status, body) = match result {
+                Ok(result) => result,
+                Err(err) => {
+                    emit_api_sandbox_event(
+                        typed_id,
+                        action.failed_event(),
+                        action,
+                        SandboxEventDetails::default()
+                            .reason("controller")
+                            .error(err.to_string()),
+                    );
+                    return Err(err);
+                }
+            };
+            if let Some(status) = status {
+                if !(status == SandboxLifecycleStatus::Suspended
+                    && self.substrate.capabilities().suspend_commits_lifecycle)
+                {
+                    maybe_update_sandbox_lifecycle(pool, id, status.as_str()).await;
+                }
+                if status == SandboxLifecycleStatus::Started {
+                    record_dormant_activation_if_needed(sandbox, metric_identity, action);
+                    self.reconcile_open_sandbox_port_exposures_best_effort(pool, id)
+                        .await;
+                }
                 emit_api_sandbox_event(
                     typed_id,
-                    action.failed_event(),
+                    action.completed_event(),
                     action,
-                    SandboxEventDetails::default()
-                        .reason("controller")
-                        .error(err.to_string()),
+                    SandboxEventDetails::default().with_to_state(status.as_str()),
                 );
-                return Err(err);
             }
-        };
-        if let Some(status) = status {
-            if !(status == SandboxLifecycleStatus::Suspended
-                && self.substrate.capabilities().suspend_commits_lifecycle)
-            {
-                maybe_update_sandbox_lifecycle(pool, id, status.as_str()).await;
-            }
-            if status == SandboxLifecycleStatus::Started {
-                record_dormant_activation_if_needed(sandbox, metric_identity, action);
-                self.reconcile_open_sandbox_port_exposures_best_effort(pool, id)
-                    .await;
-            }
-            emit_api_sandbox_event(
-                typed_id,
-                action.completed_event(),
-                action,
-                SandboxEventDetails::default().with_to_state(status.as_str()),
+            Ok(body)
+        }
+        .await;
+        if let Some(kind) = requested_kind
+            && let Some(admission) = requested_metrics::admission(&result)
+        {
+            requested_metrics::record_lifecycle_action(
+                kind,
+                metric_identity.surface,
+                admission,
+                sandbox,
             );
         }
-        Ok(body)
+        result
     }
 
     async fn untracked_action(
