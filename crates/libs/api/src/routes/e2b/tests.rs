@@ -3997,7 +3997,7 @@ async fn connect_route_never_bad_gateways_for_db_state_shapes() -> TestResult {
             "cleanup_required",
             "unplaced",
             ConnectRouteActiveNode::None,
-            StatusCode::CONFLICT,
+            StatusCode::NOT_FOUND,
         ),
         ConnectRouteDbShape::error(
             "deleted teardown row",
