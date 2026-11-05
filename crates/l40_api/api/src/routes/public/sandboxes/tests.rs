@@ -1152,9 +1152,12 @@ async fn native_reads_never_show_the_owners_email() -> TestDbResult<()> {
         let app = axum::Router::new()
             .nest("/v1", crate::routes::public::v1_router(state.clone()))
             .with_state(state);
-        for path in [
-            "/v1/sandboxes".to_string(),
-            format!("/v1/sandboxes/{}", PublicSandboxId::from(id)),
+        for (label, path) in [
+            ("list", "/v1/sandboxes".to_string()),
+            (
+                "get",
+                format!("/v1/sandboxes/{}", PublicSandboxId::from(id)),
+            ),
         ] {
             let request = axum::http::Request::get(&path)
                 .header("authorization", format!("Bearer {KEY}"))
@@ -1163,13 +1166,20 @@ async fn native_reads_never_show_the_owners_email() -> TestDbResult<()> {
             let status = response.status();
             let body = axum::body::to_bytes(response.into_body(), 1024 * 1024).await?;
             let body = String::from_utf8(body.to_vec())?;
-            assert_eq!(status, StatusCode::OK, "{path}: {body}");
+            // The messages are static: the body can hold the owner's email.
+            assert_eq!(status, StatusCode::OK, "{label}: status");
             assert!(
                 body.contains(&PublicSandboxId::from(id).to_string()),
-                "{path}: {body}"
+                "{label}: must name the sandbox"
             );
-            assert!(!body.contains("user_email"), "{path}: {body}");
-            assert!(!body.contains(EMAIL), "{path}: {body}");
+            assert!(
+                !body.contains("user_email"),
+                "{label}: must not carry user_email"
+            );
+            assert!(
+                !body.contains(EMAIL),
+                "{label}: must not carry the owner's email"
+            );
         }
         Ok(())
     })

@@ -458,7 +458,7 @@ async fn the_list_and_the_sandbox_name_the_owner_by_email() -> TestDbResult<()> 
     };
 
     let (status, unpaged) = harness.get("/sandboxes").await;
-    assert_eq!(status, StatusCode::OK, "{unpaged}");
+    assert_eq!(status, StatusCode::OK, "unpaged list: status");
     assert_eq!(
         email_of(&unpaged, sandbox_id.to_string()),
         Some(json!(renamed))
@@ -469,7 +469,7 @@ async fn the_list_and_the_sandbox_name_the_owner_by_email() -> TestDbResult<()> 
         Some(Value::Null)
     );
     let (status, page) = harness.get("/sandboxes?cursor=").await;
-    assert_eq!(status, StatusCode::OK, "{page}");
+    assert_eq!(status, StatusCode::OK, "first page: status");
     assert_eq!(
         email_of(&page["sandboxes"], sandbox_id.to_string()),
         Some(json!(renamed))
@@ -524,7 +524,7 @@ async fn the_sandbox_read_names_a_kubernetes_pool_slot() -> TestDbResult<()> {
     let (status, body) = harness
         .get(&format!("/sandboxes/{}", PublicSandboxId::from(slot)))
         .await;
-    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(status, StatusCode::OK, "pool slot detail: status");
     assert_eq!(body["resource_type"], json!("pool_slot"));
     assert_eq!(body["pool_id"], json!(pool_id));
     let (status, body) = harness
@@ -533,7 +533,7 @@ async fn the_sandbox_read_names_a_kubernetes_pool_slot() -> TestDbResult<()> {
             PublicSandboxId::from(observed_local)
         ))
         .await;
-    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(status, StatusCode::OK, "observed local detail: status");
     assert_eq!(body["resource_type"], json!("observed_local"));
     assert_eq!(body["pool_id"], Value::Null);
     harness.pool.close().await;

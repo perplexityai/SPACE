@@ -17,6 +17,7 @@
 //! statement to exceed it. It reads rows off the plan through
 //! [`crate::public_operations::plan_explain`].
 
+use futures_util::future::try_join_all;
 use pplx_space_common_core::sql;
 use pplx_space_db_test_fixtures::try_pg_test_db;
 use pplx_space_test_env::TestResult;
@@ -26,7 +27,7 @@ use super::*;
 use crate::public_operations::plan_explain::{PLAN_CACHE_MODES, PlanNode, explain_prepared};
 
 /// Sandboxes in the fixture.
-const SANDBOXES: i32 = 20_000;
+const SANDBOXES: i32 = 5_000;
 /// The rows a search for a few sandboxes may handle across its plan: the
 /// index entries and heap rows of its matches, their sort, and the joins of
 /// the page's full rows.
@@ -66,19 +67,25 @@ async fn a_search_reads_only_the_rows_it_matches() -> TestResult {
         ("page", Statement::Page),
         ("unpaged list", Statement::Unpaged),
     ];
-    for (statement_label, statement) in statements {
-        for (search_label, text) in &searches {
-            for plan_cache_mode in PLAN_CACHE_MODES {
-                let plan = explain(pool, statement, text, plan_cache_mode).await?;
-                let handled = plan.rows_handled();
-                assert!(
-                    handled <= MAX_ROWS_HANDLED,
-                    "{statement_label}, {search_label} ({plan_cache_mode}): handled {handled} \
-                     rows, over {MAX_ROWS_HANDLED}. Rows handled by node:{}",
-                    plan.outline()
-                );
-            }
-        }
+    let plans = try_join_all(statements.iter().flat_map(|&(statement_label, statement)| {
+        searches.iter().flat_map(move |(search_label, text)| {
+            PLAN_CACHE_MODES
+                .into_iter()
+                .map(move |plan_cache_mode| async move {
+                    let plan = explain(pool, statement, text, plan_cache_mode).await?;
+                    TestResult::Ok((statement_label, search_label, plan_cache_mode, plan))
+                })
+        })
+    }))
+    .await?;
+    for (statement_label, search_label, plan_cache_mode, plan) in plans {
+        let handled = plan.rows_handled();
+        assert!(
+            handled <= MAX_ROWS_HANDLED,
+            "{statement_label}, {search_label} ({plan_cache_mode}): handled {handled} \
+             rows, over {MAX_ROWS_HANDLED}. Rows handled by node:{}",
+            plan.outline()
+        );
     }
 
     sqlx::query(sql!(

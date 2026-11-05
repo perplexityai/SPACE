@@ -5121,8 +5121,15 @@ fn detail_sandbox_never_shows_the_owners_email() {
         build_detail_sandbox(&test_ecw_credential_keyring(), &sandbox, &response, None).unwrap();
 
     let body = serde_json::to_string(&detail).unwrap();
-    assert!(!body.contains("user_email"), "{body}");
-    assert!(!body.contains(EMAIL), "{body}");
+    // The messages are static: the body can hold the owner's email.
+    assert!(
+        !body.contains("user_email"),
+        "detail must not carry user_email"
+    );
+    assert!(
+        !body.contains(EMAIL),
+        "detail must not carry the owner's email"
+    );
 }
 
 #[test]
