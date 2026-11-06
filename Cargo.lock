@@ -6984,6 +6984,7 @@ dependencies = [
  "pplx-space-request-id",
  "serde",
  "serde_json",
+ "serde_path_to_error",
  "tokio",
  "tower",
  "tracing",

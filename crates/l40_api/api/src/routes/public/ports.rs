@@ -1,5 +1,6 @@
 use crate::routes::public::error::database_error;
 use pplx_space_common_core::types::OrgId;
+use pplx_space_public_api_http::PublicJson;
 
 use axum::{
     Extension, Json,
@@ -67,10 +68,10 @@ pub async fn open_port(
     authorized: Option<Extension<AuthorizedSandbox>>,
     headers: HeaderMap,
     Path((sandbox_id, port)): Path<(String, u16)>,
-    body: Option<Json<serde_json::Value>>,
+    body: Option<PublicJson<serde_json::Value>>,
 ) -> Result<Json<PortExposureResponse>, PublicApiError> {
     let request = body
-        .map(|Json(value)| serde_json::from_value::<OpenPortExposureRequest>(value))
+        .map(|PublicJson(value)| serde_json::from_value::<OpenPortExposureRequest>(value))
         .transpose()
         .map_err(|_| PublicApiError::bad_request("invalid open port request"))?
         .unwrap_or(OpenPortExposureRequest {
@@ -96,10 +97,10 @@ pub async fn close_port(
     authorized: Option<Extension<AuthorizedSandbox>>,
     headers: HeaderMap,
     Path((sandbox_id, port)): Path<(String, u16)>,
-    body: Option<Json<serde_json::Value>>,
+    body: Option<PublicJson<serde_json::Value>>,
 ) -> Result<Json<PortExposureResponse>, PublicApiError> {
     let request = body
-        .map(|Json(value)| serde_json::from_value::<ClosePortExposureRequest>(value))
+        .map(|PublicJson(value)| serde_json::from_value::<ClosePortExposureRequest>(value))
         .transpose()
         .map_err(|_| PublicApiError::bad_request("invalid close port request"))?
         .unwrap_or(ClosePortExposureRequest { protocol: None });

@@ -4,6 +4,7 @@
 //! rejection or an unhandled error status is normalized into.
 
 mod error;
+mod json;
 mod request_id;
 
 pub use error::{
@@ -11,4 +12,5 @@ pub use error::{
     normalize_public_error_response, public_route_not_found, retry_after_header_value,
     with_retry_after_hint,
 };
+pub use json::PublicJson;
 pub use request_id::{current_request_id, scope_request_id, with_public_request_id};
