@@ -332,6 +332,12 @@ impl SandboxController {
             ControllerError::conflict("sandbox has no active node for port exposure")
         })?;
 
+        super::lifecycle::user_admission::admit_user_lifecycle(
+            sandbox.id,
+            super::lifecycle::user_admission::UserLifecycleRequest::Action(
+                super::lifecycle::SandboxAction::ImplicitWake(ExecutionActivityKind::Access),
+            ),
+        );
         super::lifecycle::ensure_access_path_not_blocked_by_drain(
             pool,
             &sandbox,

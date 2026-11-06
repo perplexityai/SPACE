@@ -296,3 +296,65 @@ fn a_kept_connection_is_retired_after_a_timeout_or_transport_close_only() {
         assert!(!should_retire_kept_connection(&status), "{status:?}");
     }
 }
+
+/// A runtime grant whose request names an activity admits the wake that
+/// activity implies, once; a grant that names no activity (`wait_ready`)
+/// admits nothing. The sandbox is suspended, so each grant reaches for a
+/// runtime it does not have.
+#[tokio::test]
+async fn a_runtime_grant_to_a_suspended_sandbox_admits_the_wake_its_activity_implies() -> TestResult
+{
+    use crate::controllers::sandbox::lifecycle::user_admission::{
+        UserLifecycleRequest, recorded::admitted,
+    };
+    let db = pg_test_db().await?;
+    let controller = SandboxController::new(Substrate::from_direct(
+        crate::controllers::substrate::direct::DirectSubstrate::new(db.pool.clone()),
+    ));
+    for (port, (activity, expected)) in (1..).zip([
+        (None, vec![]),
+        (
+            Some(ExecutionActivityKind::Access),
+            vec![UserLifecycleRequest::Action(
+                super::super::lifecycle::SandboxAction::ImplicitWake(ExecutionActivityKind::Access),
+            )],
+        ),
+        (
+            Some(ExecutionActivityKind::Command),
+            vec![UserLifecycleRequest::Action(
+                super::super::lifecycle::SandboxAction::ImplicitWake(
+                    ExecutionActivityKind::Command,
+                ),
+            )],
+        ),
+    ]) {
+        // Each node needs an endpoint of its own; nothing listens on these.
+        let node_api = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+        let sandbox = insert_direct_sandbox_on_node(&db.pool, node_api, None).await?;
+        sqlx::query(sql!(
+            "UPDATE sandboxes SET lifecycle = 'suspended' WHERE id = $1"
+        ))
+        .bind(sandbox.id)
+        .execute(&db.pool)
+        .await?;
+        let sandbox = fetch_sandbox(&db.pool, sandbox.id)
+            .await?
+            .ok_or("suspended sandbox")?;
+
+        let granted = controller
+            .spaced_runtime_grant(
+                &db.pool,
+                &sandbox,
+                SandboxApiMetricIdentity::native("test"),
+                activity,
+            )
+            .await;
+
+        assert!(
+            granted.is_err(),
+            "{activity:?}: a suspended sandbox has no runtime"
+        );
+        assert_eq!(admitted(sandbox.id), expected, "{activity:?}");
+    }
+    Ok(())
+}

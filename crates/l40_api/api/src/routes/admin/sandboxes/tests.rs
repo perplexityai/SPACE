@@ -1640,3 +1640,32 @@ mod cross_org_routes {
         Ok(())
     }
 }
+
+/// An admin create is admitted once, for the ID it records.
+#[tokio::test]
+async fn admin_create_is_admitted_for_the_sandbox_it_records()
+-> pplx_space_db_test_fixtures::TestDbResult<()> {
+    use crate::controllers::sandbox::lifecycle::user_admission::{
+        UserLifecycleRequest, recorded::admitted,
+    };
+    let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+    let created = create_sandbox_for_org(
+        &db.pool,
+        AdminCreateSandboxRequest {
+            org_id: OrgId::from_uuid(pplx_space_db_test_fixtures::SEED_ORG_ID),
+            user_id: None,
+            sandbox: serde_json::from_value(serde_json::json!({ "template": "seed:latest" }))?,
+            node_pool: None,
+        },
+        &IdempotencyKey::parse("admin-create-admission")?,
+        None,
+    )
+    .await
+    .map_err(|error| format!("admin create should be admitted: {error:?}"))?;
+
+    assert_eq!(
+        admitted(created.sandbox_id.into()),
+        [UserLifecycleRequest::Create]
+    );
+    Ok(())
+}
