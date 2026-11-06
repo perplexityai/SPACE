@@ -720,6 +720,22 @@ struct HealthObservation {
 struct ComposedProbeResult {
     observations: [HealthObservation; 4],
     guest_status: Option<pplx_space_spaced_host_client::proto::GetStatusResponse>,
+    /// The guest's used memory from its successful Ping. Telemetry beside the
+    /// health observations, never part of them.
+    memory_used_bytes: Option<u64>,
+}
+
+/// What an accepted probe result yields: its health transition, and the
+/// guest memory reading to emit once, which nothing keeps.
+struct AcceptedHealthResult {
+    transition: Option<diagnostics::HealthTransition>,
+    guest_memory: Option<GuestMemorySample>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct GuestMemorySample {
+    template: String,
+    used_bytes: u64,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -2629,7 +2645,7 @@ async fn probe_composed_health(
     };
     let spaced_guest = probe_spaced_guest_health(info, lifecycle, restored_guests);
     let net_gateway = probe_net_gateway_health(sandbox_id);
-    let (firecracker, spaced_host, spaced_guest, net_gateway) =
+    let (firecracker, spaced_host, (spaced_guest, memory_used_bytes), net_gateway) =
         tokio::join!(firecracker, spaced_host, spaced_guest, net_gateway);
     let guest_status = if spaced_host.outcome == HealthProbeOutcome::Success {
         read_guest_status_via_spaced_host(sandbox_id).await
@@ -2639,6 +2655,7 @@ async fn probe_composed_health(
     ComposedProbeResult {
         observations: [firecracker, spaced_host, spaced_guest, net_gateway],
         guest_status,
+        memory_used_bytes,
     }
 }
 
@@ -2728,42 +2745,55 @@ async fn probe_spaced_host_health(sandbox_id: &str) -> HealthObservation {
     observation_from_probe_result(started, result, "pong")
 }
 
+/// The guest's health, and the used memory its successful Ping reported.
 async fn probe_spaced_guest_health(
     info: &SidecarInfo,
     lifecycle: Option<crate::state::SandboxState>,
     restored_guests: &crate::vm_diagnostics::RestoredGuests,
-) -> HealthObservation {
+) -> (HealthObservation, Option<u64>) {
     let started = Instant::now();
     if !info.guest_image.expects_agent() || lifecycle == Some(crate::state::SandboxState::Paused) {
-        return health_observation(
-            started,
-            HealthProbeOutcome::NotApplicable,
-            if info.guest_image.expects_agent() {
-                "guest vCPUs are paused"
-            } else {
-                "guest image has no SPACE guest agent"
-            },
+        return (
+            health_observation(
+                started,
+                HealthProbeOutcome::NotApplicable,
+                if info.guest_image.expects_agent() {
+                    "guest vCPUs are paused"
+                } else {
+                    "guest image has no SPACE guest agent"
+                },
+            ),
+            None,
         );
     }
     let Some(vsock_uds_path) = info.vsock_uds_path.as_deref() else {
-        return health_observation(
-            started,
-            HealthProbeOutcome::Unavailable,
-            "v.sock path is absent",
+        return (
+            health_observation(
+                started,
+                HealthProbeOutcome::Unavailable,
+                "v.sock path is absent",
+            ),
+            None,
         );
     };
     let (Some(runtime_pid), Some(uid)) = (info.runtime_pid, info.uid) else {
-        return health_observation(
-            started,
-            HealthProbeOutcome::Unavailable,
-            "Firecracker peer credentials are absent",
+        return (
+            health_observation(
+                started,
+                HealthProbeOutcome::Unavailable,
+                "Firecracker peer credentials are absent",
+            ),
+            None,
         );
     };
     let Ok(runtime_pid) = i32::try_from(runtime_pid) else {
-        return health_observation(
-            started,
-            HealthProbeOutcome::Unavailable,
-            "Firecracker pid is outside the peer-credential range",
+        return (
+            health_observation(
+                started,
+                HealthProbeOutcome::Unavailable,
+                "Firecracker pid is outside the peer-credential range",
+            ),
+            None,
         );
     };
     let result = tokio::time::timeout(SPACED_GUEST_HEALTH_TIMEOUT, async {
@@ -2791,14 +2821,19 @@ async fn probe_spaced_guest_health(
             .map_err(|error| error.to_string())
     })
     .await;
+    let mut memory_used_bytes = None;
     if let Ok(Ok(response)) = &result {
         crate::vm_diagnostics::forward_guest_diagnostics(
             &info.sandbox_id,
             response.get_ref(),
             restored_guests,
         );
+        memory_used_bytes = response.get_ref().memory_used_bytes;
     }
-    observation_from_probe_result(started, result, "pong")
+    (
+        observation_from_probe_result(started, result, "pong"),
+        memory_used_bytes,
+    )
 }
 
 // The probe dials afresh, unlike the gateway's kept clients: a dial is what
@@ -2953,7 +2988,13 @@ async fn apply_and_reconcile_composed_health_result(
             .map(|id| (id, *lifecycle_epoch)),
         _ => None,
     };
-    let transition = apply_composed_health_result(state, db, result).await;
+    let accepted = apply_composed_health_result(state, db, result).await;
+    if let Some(sample) = accepted
+        .as_ref()
+        .and_then(|accepted| accepted.guest_memory.as_ref())
+    {
+        pplx_space_metrics::sandbox::worker::guest_memory_used(&sample.template, sample.used_bytes);
+    }
     if let Some((sandbox_id, lifecycle_epoch)) = pause_failed_recovery {
         reconcile_pause_failed_quarantine(
             db,
@@ -2965,20 +3006,23 @@ async fn apply_and_reconcile_composed_health_result(
         )
         .await;
     }
-    transition
+    accepted.and_then(|accepted| accepted.transition)
 }
 
+/// Apply a completed probe unless it is from an older lifecycle epoch or its
+/// sandbox is gone, which discards it: `None`.
 async fn apply_composed_health_result(
     state: &Arc<Mutex<HashMap<String, SandboxHealth>>>,
     db: &crate::db::SharedConnection,
     result: Option<CompletedHealthProbe>,
-) -> Option<diagnostics::HealthTransition> {
+) -> Option<AcceptedHealthResult> {
     let Some(Ok((sandbox_id, lifecycle, lifecycle_epoch, result))) = result else {
         return None;
     };
     let ComposedProbeResult {
         observations,
         guest_status,
+        memory_used_bytes,
     } = result;
     let mut map = state.lock().await;
     let health = map.get_mut(&sandbox_id)?;
@@ -3063,7 +3107,41 @@ async fn apply_composed_health_result(
             }
         }
     }
-    transition
+    // Memory takes the epoch fence above with the rest of the result: a
+    // lifecycle edge since dispatch discarded it all.
+    let guest_memory = memory_used_bytes
+        .filter(|_| lifecycle == Some(crate::state::SandboxState::Started))
+        .and_then(|used_bytes| {
+            running_workload_template(db, &sandbox_id).map(|template| GuestMemorySample {
+                template,
+                used_bytes,
+            })
+        });
+    Some(AcceptedHealthResult {
+        transition,
+        guest_memory,
+    })
+}
+
+/// The template of `sandbox_id` unless it is an idle warm-pool member, whose
+/// memory is not a workload's. `None` also when the row is gone or does not
+/// read, which skips only the memory sample.
+fn running_workload_template(db: &crate::db::SharedConnection, sandbox_id: &str) -> Option<String> {
+    let conn = db
+        .lock()
+        .inspect_err(|error| {
+            tracing::debug!(sandbox_id, %error, "sandbox database mutex poisoned; skipping guest memory");
+        })
+        .ok()?;
+    match crate::db::read::sandbox(&conn, sandbox_id) {
+        Ok(row) => row
+            .filter(|row| row.pool_template.is_none())
+            .map(|row| row.template),
+        Err(error) => {
+            tracing::debug!(sandbox_id, %error, "failed to read sandbox template; skipping guest memory");
+            None
+        }
+    }
 }
 
 async fn reconcile_pause_failed_quarantine(

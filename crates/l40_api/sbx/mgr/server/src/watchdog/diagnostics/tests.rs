@@ -31,10 +31,12 @@ async fn apply_guest_outcome(
             ComposedProbeResult {
                 observations,
                 guest_status: None,
+                memory_used_bytes: None,
             },
         ))),
     )
     .await
+    .and_then(|accepted| accepted.transition)
 }
 
 #[tokio::test]
