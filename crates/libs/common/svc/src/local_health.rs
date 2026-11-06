@@ -12,18 +12,25 @@
 //!   (mutex acquired, running migrations/recovery, production socket not yet
 //!   bound), `Active(path)` → forwards a fresh `Check` to the production
 //!   socket and returns whatever it answers.
-//! - `"liveness"` returns `SERVING` as long as the process can respond to the
-//!   RPC. Daemons may opt in to forwarding liveness to the production socket
-//!   after activation. A slow active-startup keeps liveness green so the
-//!   kubelet does not SIGKILL the instance mid-recovery.
+//! - `"liveness"` returns `SERVING` while the process can respond to the RPC
+//!   and the caller's runtime has run its heartbeat task within
+//!   [`MAIN_RUNTIME_STALL_LIMIT`]. Daemons may opt in to forwarding liveness
+//!   to the production socket after activation. A slow active-startup keeps
+//!   liveness green so the kubelet does not SIGKILL the instance mid-recovery.
+//!
+//! [`LocalHealthServer`] serves on a dedicated OS thread with its own
+//! single-threaded Tokio runtime. Probes therefore get answered while the
+//! daemon's main runtime is saturated or its workers are blocked in
+//! synchronous calls; only a main-runtime stall longer than
+//! [`MAIN_RUNTIME_STALL_LIMIT`] turns liveness to `NOT_SERVING`.
 //!
 //! Generic across daemons: each service supplies its own logging name via
 //! [`local_health_pair`].
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use pplx_space_common_grpc::connect_uds_channel;
 use tokio::task::JoinHandle;
@@ -40,6 +47,14 @@ use crate::bootstrap::{
 };
 
 const ACTIVE_PROBE_TIMEOUT: Duration = Duration::from_millis(800);
+/// How often the caller's runtime records its heartbeat.
+const MAIN_RUNTIME_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
+/// Liveness reports `NOT_SERVING` once the caller's runtime has not run its
+/// heartbeat task for this long. The kubelet's `failureThreshold` decides how
+/// long a stall must continue before a restart, so this only needs to clear
+/// the heartbeat interval and brief scheduling delays.
+pub const MAIN_RUNTIME_STALL_LIMIT: Duration = Duration::from_secs(10);
+const HEALTH_THREAD_NAME: &str = "local-health";
 const LIVENESS_SERVICE: &str = "liveness";
 const READINESS_SERVICE: &str = "readiness";
 
@@ -48,6 +63,61 @@ pub struct LocalHealth {
     liveness: LocalHealthLiveness,
     readiness_withheld: Arc<AtomicBool>,
     production_socket: Arc<OnceLock<PathBuf>>,
+    main_runtime: Option<Arc<RuntimeHeartbeat>>,
+}
+
+/// The last time the daemon's main runtime ran its heartbeat task, as
+/// milliseconds since `origin`.
+#[derive(Debug)]
+struct RuntimeHeartbeat {
+    origin: Instant,
+    last_beat_ms: AtomicU64,
+}
+
+impl RuntimeHeartbeat {
+    fn new() -> Self {
+        Self {
+            origin: Instant::now(),
+            last_beat_ms: AtomicU64::new(0),
+        }
+    }
+
+    fn beat(&self) {
+        self.beat_at(Instant::now());
+    }
+
+    fn beat_at(&self, now: Instant) {
+        let elapsed = now.saturating_duration_since(self.origin);
+        let millis = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
+        self.last_beat_ms.fetch_max(millis, Ordering::Relaxed);
+    }
+
+    fn stalled_for(&self, now: Instant) -> Duration {
+        let last = self.origin + Duration::from_millis(self.last_beat_ms.load(Ordering::Relaxed));
+        now.saturating_duration_since(last)
+    }
+
+    /// Records a heartbeat every [`MAIN_RUNTIME_HEARTBEAT_INTERVAL`] on the
+    /// runtime that awaits it, until `shutdown_token` is cancelled.
+    async fn run(self: Arc<Self>, shutdown_token: CancellationToken) {
+        let mut interval = tokio::time::interval(MAIN_RUNTIME_HEARTBEAT_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                _ = shutdown_token.cancelled() => return,
+                _ = interval.tick() => self.beat(),
+            }
+        }
+    }
+}
+
+/// Why [`LocalHealthServer`] could not start.
+#[derive(Debug, thiserror::Error)]
+pub enum LocalHealthServerError {
+    #[error(transparent)]
+    Bind(#[from] crate::bootstrap::BindUnixSocketError),
+    #[error("failed to start the local health thread: {0}")]
+    StartThread(#[source] std::io::Error),
 }
 
 /// Selects what the local liveness endpoint reports after activation.
@@ -136,6 +206,7 @@ fn local_health_pair_with_readiness(
             liveness,
             readiness_withheld: Arc::clone(&readiness_withheld),
             production_socket: Arc::clone(&cell),
+            main_runtime: None,
         },
         LocalHealthActivator {
             readiness_withheld,
@@ -171,7 +242,7 @@ impl LocalHealthServer {
         socket_options: UnixSocketOptions,
         service_name: &'static str,
         shutdown_token: CancellationToken,
-    ) -> Result<Self, crate::bootstrap::BindUnixSocketError> {
+    ) -> Result<Self, LocalHealthServerError> {
         Self::spawn_with_liveness(
             socket_path,
             socket_options,
@@ -188,7 +259,7 @@ impl LocalHealthServer {
         service_name: &'static str,
         liveness: LocalHealthLiveness,
         shutdown_token: CancellationToken,
-    ) -> Result<Self, crate::bootstrap::BindUnixSocketError> {
+    ) -> Result<Self, LocalHealthServerError> {
         Self::spawn_with_readiness(
             socket_path,
             socket_options,
@@ -206,23 +277,32 @@ impl LocalHealthServer {
         liveness: LocalHealthLiveness,
         readiness: InitialReadiness,
         shutdown_token: CancellationToken,
-    ) -> Result<Self, crate::bootstrap::BindUnixSocketError> {
-        let listener = bind_unix_socket(socket_path, socket_options)?;
-        let (local_health, activator) =
+    ) -> Result<Self, LocalHealthServerError> {
+        // The listener is moved to the health thread's runtime, so it leaves
+        // the caller's reactor as a std listener.
+        let listener = bind_unix_socket(socket_path, socket_options)?
+            .into_std()
+            .map_err(LocalHealthServerError::StartThread)?;
+        let (mut local_health, activator) =
             local_health_pair_with_readiness(service_name, liveness, readiness);
+        let heartbeat = Arc::new(RuntimeHeartbeat::new());
+        heartbeat.beat();
+        local_health.main_runtime = Some(Arc::clone(&heartbeat));
+        tokio::spawn(Arc::clone(&heartbeat).run(shutdown_token.clone()));
+
+        let (exited_tx, exited_rx) = tokio::sync::oneshot::channel::<()>();
+        std::thread::Builder::new()
+            .name(HEALTH_THREAD_NAME.to_owned())
+            .spawn(move || {
+                serve_on_health_thread(service_name, local_health, listener, shutdown_token);
+                let _ = exited_tx.send(());
+            })
+            .map_err(LocalHealthServerError::StartThread)?;
         let handle = tokio::spawn(async move {
-            let result = grpc_server_builder()
-                .layer(grpc_trace_layer())
-                .add_service(HealthServer::new(local_health))
-                .serve_with_incoming_shutdown(UnixListenerStream::new(listener), async move {
-                    shutdown_token.cancelled().await
-                })
-                .await;
-            if let Err(error) = result {
+            if exited_rx.await.is_err() {
                 tracing::error!(
                     service = service_name,
-                    %error,
-                    "local health server exited with error"
+                    "local health thread ended without reporting its exit"
                 );
             }
         });
@@ -235,7 +315,7 @@ impl LocalHealthServer {
         socket_options: UnixSocketOptions,
         service_name: &'static str,
         shutdown_token: CancellationToken,
-    ) -> Result<Self, crate::bootstrap::BindUnixSocketError> {
+    ) -> Result<Self, LocalHealthServerError> {
         Self::spawn_optional_with_liveness(
             socket_path,
             socket_options,
@@ -252,7 +332,7 @@ impl LocalHealthServer {
         service_name: &'static str,
         liveness: LocalHealthLiveness,
         shutdown_token: CancellationToken,
-    ) -> Result<Self, crate::bootstrap::BindUnixSocketError> {
+    ) -> Result<Self, LocalHealthServerError> {
         match socket_path {
             Some(path) => Self::spawn_with_liveness(
                 path,
@@ -273,7 +353,7 @@ impl LocalHealthServer {
         socket_options: UnixSocketOptions,
         service_name: &'static str,
         shutdown_token: CancellationToken,
-    ) -> Result<Self, crate::bootstrap::BindUnixSocketError> {
+    ) -> Result<Self, LocalHealthServerError> {
         match socket_path {
             Some(path) => Self::spawn_with_readiness(
                 path,
@@ -308,9 +388,10 @@ impl LocalHealthServer {
         }
     }
 
-    /// Awaits the server's exit. A join error (panic in the spawned task)
-    /// is logged but not propagated — the caller is mid-shutdown and has
-    /// no useful recovery.
+    /// Awaits the health thread's exit after `shutdown_token` is cancelled.
+    /// A health thread that ends without reporting (for example a panic) is
+    /// logged but not propagated: the caller is mid-shutdown and has no
+    /// useful recovery.
     pub async fn join(self) {
         if let Self::Enabled { handle, .. } = self {
             match handle.await {
@@ -321,6 +402,57 @@ impl LocalHealthServer {
             }
         }
     }
+}
+
+/// Runs the health gRPC server on the calling thread's own single-threaded
+/// runtime until `shutdown_token` is cancelled.
+fn serve_on_health_thread(
+    service_name: &'static str,
+    local_health: LocalHealth,
+    listener: std::os::unix::net::UnixListener,
+    shutdown_token: CancellationToken,
+) {
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            tracing::error!(
+                service = service_name,
+                %error,
+                "local health runtime could not be built"
+            );
+            return;
+        }
+    };
+    runtime.block_on(async move {
+        let listener = match tokio::net::UnixListener::from_std(listener) {
+            Ok(listener) => listener,
+            Err(error) => {
+                tracing::error!(
+                    service = service_name,
+                    %error,
+                    "local health listener could not be registered"
+                );
+                return;
+            }
+        };
+        let result = grpc_server_builder()
+            .layer(grpc_trace_layer())
+            .add_service(HealthServer::new(local_health))
+            .serve_with_incoming_shutdown(UnixListenerStream::new(listener), async move {
+                shutdown_token.cancelled().await
+            })
+            .await;
+        if let Err(error) = result {
+            tracing::error!(
+                service = service_name,
+                %error,
+                "local health server exited with error"
+            );
+        }
+    });
 }
 
 impl LocalHealth {
@@ -351,6 +483,17 @@ impl LocalHealth {
     }
 
     async fn liveness_status(&self) -> ServingStatus {
+        if let Some(heartbeat) = &self.main_runtime {
+            let stalled_for = heartbeat.stalled_for(Instant::now());
+            if stalled_for > MAIN_RUNTIME_STALL_LIMIT {
+                tracing::warn!(
+                    service = self.service_name,
+                    stalled_ms = u64::try_from(stalled_for.as_millis()).unwrap_or(u64::MAX),
+                    "local health: main runtime heartbeat is stale"
+                );
+                return ServingStatus::NotServing;
+            }
+        }
         match (self.liveness, self.production_socket.get()) {
             (LocalHealthLiveness::ProductionWhenActive, Some(socket)) => {
                 self.production_status(socket).await

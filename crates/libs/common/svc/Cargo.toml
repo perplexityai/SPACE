@@ -58,7 +58,7 @@ sqlx = { workspace = true, features = ["derive", "postgres", "runtime-tokio", "t
 subtle = { workspace = true }
 thiserror = { workspace = true }
 time = { workspace = true }
-tokio = { workspace = true, features = ["macros", "net", "rt", "signal", "time"] }
+tokio = { workspace = true, features = ["macros", "net", "rt", "signal", "sync", "time"] }
 tokio-stream = { workspace = true, features = ["net"] }
 tokio-util = { workspace = true }
 tonic = { workspace = true }
