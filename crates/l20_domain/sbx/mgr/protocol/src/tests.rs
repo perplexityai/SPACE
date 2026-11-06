@@ -21,6 +21,20 @@ fn template_policy_dependency_survives_forwarded_grpc_trailers() {
 }
 
 #[test]
+fn stop_not_admitted_survives_grpc_trailers_and_keeps_its_code() {
+    let dropped = tonic::Status::unavailable("transport is closing");
+    assert!(!is_stop_not_admitted(&dropped));
+    for code in [tonic::Code::Unavailable, tonic::Code::FailedPrecondition] {
+        let marked = stop_not_admitted_status(tonic::Status::new(code, "stop refused"));
+        let mut trailers = tonic::codegen::http::HeaderMap::new();
+        marked.add_header(&mut trailers).unwrap();
+        let decoded = tonic::Status::from_header_map(&trailers).unwrap();
+        assert!(is_stop_not_admitted(&decoded));
+        assert_eq!(decoded.code(), code);
+    }
+}
+
+#[test]
 fn restart_retry_requires_explicit_successor_metadata() {
     let unavailable = tonic::Status::unavailable("transport unavailable");
     assert!(!is_restart_retry_on_successor(&unavailable));

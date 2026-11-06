@@ -676,12 +676,19 @@ impl SandboxManagerService {
         &self,
         request: Request<StopRequest>,
     ) -> Result<Response<StopResponse>, Status> {
-        let peer = self.authorize_peer(&request, "Stop", ALLOW_SANDBOX_OPERATOR_OR_TMPLMGR)?;
-        let _request_permit = self.cleanup_request_permit().await?;
+        // Mark every refusal before admission: `Unavailable` alone can't tell
+        // one from a connection that dropped after admission.
+        use pplx_space_sbx_mgr_client::stop_not_admitted_status as not_admitted;
+        let peer = self
+            .authorize_peer(&request, "Stop", ALLOW_SANDBOX_OPERATOR_OR_TMPLMGR)
+            .map_err(not_admitted)?;
+        let _request_permit = self.cleanup_request_permit().await.map_err(not_admitted)?;
         let publish_node_state = !should_skip_node_publish(&request);
         let req = request.get_ref();
         let requested_id = req.sandbox_id.parse::<SandboxId>().map_err(|error| {
-            Status::invalid_argument(format!("Stop requires one exact sandbox UUID: {error}"))
+            not_admitted(Status::invalid_argument(format!(
+                "Stop requires one exact sandbox UUID: {error}"
+            )))
         })?;
         let template_filter = req.template_filter.as_deref().filter(|s| !s.is_empty());
         let blocking = req.blocking;
@@ -694,7 +701,8 @@ impl SandboxManagerService {
                 Self::is_template_manager_peer(&peer),
                 true,
             )
-            .await?;
+            .await
+            .map_err(not_admitted)?;
 
         let mut stopped_ids: Vec<String> = Vec::new();
         if let Some((id, runtime_label)) = &to_stop {
@@ -708,7 +716,8 @@ impl SandboxManagerService {
                 SandboxEventSource::SbxManager,
                 details,
             );
-            let (sandbox_id, uuid8) = Self::cleanup_identity(id, runtime_label.as_ref())?;
+            let (sandbox_id, uuid8) =
+                Self::cleanup_identity(id, runtime_label.as_ref()).map_err(not_admitted)?;
             let completion = CleanupCompletion::MarkStopped;
             // Admission decides from the state it supersedes, under its fence.
             let guest_flush = if immediate_kill {
@@ -726,7 +735,7 @@ impl SandboxManagerService {
                     Self::is_template_manager_peer(&peer),
                 )
                 .await
-                .map_err(|error| error.into_status())?;
+                .map_err(|error| not_admitted(error.into_status()))?;
 
             // Stop sidecar monitoring and snapshot scheduling
             self.watchdog.remove_sandbox(id).await;

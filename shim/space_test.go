@@ -24,6 +24,7 @@ import (
 	"github.com/containerd/errdefs"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/anypb"
@@ -2478,17 +2479,25 @@ func TestLegacyTeardownStillTearsDownOtherFailedCleanups(t *testing.T) {
 // A Stop that sbx-manager admits can still fail on the way back. The retried
 // Kill then sees its own stop as STOPPING and must not mistake it for a
 // user's, or the pod deletion leaves the sandbox behind. A Stop sbx-manager
-// refuses was never this task's, so a user STOP that follows stays kept.
+// refuses was never this task's, so a user STOP that follows stays kept,
+// including a refusal sbx-manager sends as Unavailable while shutting down
+// or draining for a restart.
 func TestLegacyKillOwnsOnlyAStopThatMayHaveBeenAdmitted(t *testing.T) {
+	notAdmitted := metadata.Pairs(stopNotAdmittedTrailer, "true")
 	for _, tc := range []struct {
-		name       string
-		stopError  error
-		wantStops  int
-		wantDelete int
+		name        string
+		stopError   error
+		stopTrailer metadata.MD
+		wantStops   int
+		wantDelete  int
 	}{
-		{"reply lost", status.Error(codes.DeadlineExceeded, "reply lost"), 2, 1},
-		{"connection dropped", status.Error(codes.Unavailable, "transport is closing"), 2, 1},
-		{"refused", status.Error(codes.FailedPrecondition, "stop refused"), 1, 0},
+		{"reply lost", status.Error(codes.DeadlineExceeded, "reply lost"), nil, 2, 1},
+		{"connection dropped", status.Error(codes.Unavailable, "transport is closing"), nil, 2, 1},
+		{"refused", status.Error(codes.FailedPrecondition, "stop refused"), nil, 1, 0},
+		{"refused while shutting down", status.Error(codes.Unavailable, "cleanup admission closed"), notAdmitted, 1, 0},
+		{"refused by the restart drain", status.Error(codes.Unavailable, "retry on successor"), metadata.Pairs(retryOnSuccessorTrailer, "true"), 1, 0},
+		// Only the value sbx-manager sends counts; any other is unmarked.
+		{"marked false", status.Error(codes.Unavailable, "transport is closing"), metadata.Pairs(stopNotAdmittedTrailer, "false"), 2, 1},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			podTask := &task{id: "task", sandboxID: "sbx", status: tasktypes.Status_RUNNING}
@@ -2498,7 +2507,8 @@ func TestLegacyKillOwnsOnlyAStopThatMayHaveBeenAdmitted(t *testing.T) {
 					cleanupState(pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_STOPPING, nil),
 					cleanupState(pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_STOPPING, nil),
 				},
-				stopErrors: []error{tc.stopError},
+				stopErrors:   []error{tc.stopError},
+				stopTrailers: []metadata.MD{tc.stopTrailer},
 			}
 			service := &spaceTaskService{
 				tasks: map[string]*task{"task": podTask},
@@ -2837,6 +2847,7 @@ type fakeSandboxManagerClient struct {
 	onTeardownCall   func()
 	stopCalls        int
 	stopErrors       []error
+	stopTrailers     []metadata.MD
 	deleteCalls      int
 	deleteError      error
 }
@@ -3047,6 +3058,15 @@ func (f *fakeSandboxManagerClient) PrepareTeardownSuspend(ctx context.Context, i
 
 func (f *fakeSandboxManagerClient) Stop(ctx context.Context, in *pb.StopRequest, opts ...grpc.CallOption) (*pb.StopResponse, error) {
 	f.stopCalls++
+	if len(f.stopTrailers) > 0 {
+		trailer := f.stopTrailers[0]
+		f.stopTrailers = f.stopTrailers[1:]
+		for _, opt := range opts {
+			if option, ok := opt.(grpc.TrailerCallOption); ok {
+				*option.TrailerAddr = trailer
+			}
+		}
+	}
 	if len(f.stopErrors) > 0 {
 		err := f.stopErrors[0]
 		f.stopErrors = f.stopErrors[1:]

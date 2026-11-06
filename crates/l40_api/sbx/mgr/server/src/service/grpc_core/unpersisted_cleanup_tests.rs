@@ -152,6 +152,12 @@ async fn unpersisted_stop_and_delete_clean_up_through_node_manager_and_report_th
 
                 let error = rpc.call(&service, &id, blocking).await;
 
+                // Admission ran, so the caller's Stop owns this cleanup: an
+                // error after admission must not say it was refused.
+                assert!(
+                    !pplx_space_sbx_mgr_client::is_stop_not_admitted(&error),
+                    "{context}: {error}"
+                );
                 if node_refuses {
                     assert_eq!(error.code(), tonic::Code::Unavailable, "{context}: {error}");
                     assert_eq!(

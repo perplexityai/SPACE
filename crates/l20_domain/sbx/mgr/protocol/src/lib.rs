@@ -70,6 +70,9 @@ pub mod proto {
 pub mod auto_lifecycle;
 pub mod lifecycle;
 
+/// Set only on a request refused before it was served, so a successor may
+/// replay it. The shim relies on that to read a marked Stop as refused
+/// (`shim/space.go`).
 pub const RESTART_RETRY_ON_SUCCESSOR_METADATA: &str = "x-space-retry-on-successor";
 const TEMPLATE_POLICY_DEPENDENCY_METADATA: &str = "x-space-template-policy-dependency";
 
@@ -88,6 +91,30 @@ pub fn is_template_policy_dependency(status: &tonic::Status) -> bool {
     status
         .metadata()
         .get(TEMPLATE_POLICY_DEPENDENCY_METADATA)
+        .is_some_and(|value| value == "true")
+}
+
+/// Set on a Stop error sandbox-manager answered before admitting the stop.
+/// `Unavailable` also reports a connection that dropped after admission, so a
+/// caller that tracks whether its own Stop owns the sandbox reads only a
+/// marked error as a refusal. The shim reads it by name (`shim/space.go`), as
+/// it reads `RESTART_RETRY_ON_SUCCESSOR_METADATA`, which the restart drain sets
+/// on a Stop it refuses before the handler runs.
+pub const STOP_NOT_ADMITTED_METADATA: &str = "x-space-stop-not-admitted";
+
+/// `status`, keeping its code, marked as a Stop refused before admission.
+pub fn stop_not_admitted_status(mut status: tonic::Status) -> tonic::Status {
+    status.metadata_mut().insert(
+        STOP_NOT_ADMITTED_METADATA,
+        tonic::metadata::MetadataValue::from_static("true"),
+    );
+    status
+}
+
+pub fn is_stop_not_admitted(status: &tonic::Status) -> bool {
+    status
+        .metadata()
+        .get(STOP_NOT_ADMITTED_METADATA)
         .is_some_and(|value| value == "true")
 }
 
