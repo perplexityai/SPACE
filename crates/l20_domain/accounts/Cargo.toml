@@ -17,6 +17,9 @@ serde = { workspace = true, features = ["derive"], optional = true }
 sqlx = { workspace = true, features = ["postgres", "uuid"], optional = true }
 thiserror = { workspace = true }
 
+[dev-dependencies]
+uuid = { workspace = true }
+
 [features]
 default = []
 serde = ["dep:serde", "pplx-space-job-id/serde"]

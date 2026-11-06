@@ -4794,6 +4794,7 @@ dependencies = [
  "serde",
  "sqlx",
  "thiserror 2.0.20",
+ "uuid",
 ]
 
 [[package]]

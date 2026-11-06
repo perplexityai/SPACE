@@ -49,7 +49,8 @@ pub mod __private {
 ///
 /// The generated methods' doc examples import the invoking module through
 /// `module_path!()`, so invoke it in a module reachable from outside the
-/// crate, or those doctests fail to compile.
+/// crate, or those doctests fail to compile. They also call `uuid`, so a
+/// caller needs it at least as a dev-dependency.
 ///
 /// ```rust
 /// pplx_space_job_id::uuid_id!(
@@ -112,6 +113,9 @@ macro_rules! uuid_id {
                 "assert_eq!(",
                 stringify!($name),
                 "::from_uuid(id.as_uuid()), id);\n",
+                "assert_eq!(",
+                stringify!($name),
+                "::from_uuid(uuid::Uuid::nil()).as_uuid(), uuid::Uuid::nil());\n",
                 "```"
             )]
             pub const fn from_uuid(value: $crate::__private::Uuid) -> Self {
@@ -131,6 +135,9 @@ macro_rules! uuid_id {
                 "assert_eq!(",
                 stringify!($name),
                 "::from_uuid(id.as_uuid()), id);\n",
+                "assert_eq!(",
+                stringify!($name),
+                "::from_uuid(uuid::Uuid::nil()).as_uuid(), uuid::Uuid::nil());\n",
                 "```"
             )]
             pub const fn as_uuid(self) -> $crate::__private::Uuid {
