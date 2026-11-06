@@ -507,8 +507,10 @@ pub(crate) const DEFAULT_EVACUATE_TIMEOUT_SECS: u64 = 600;
 /// by the `evacuation_restore_target IS NOT NULL` marker, so this never
 /// aborts the pipeline's own work. Wrapped in `Option<PositiveDuration>`
 /// at the config layer so tests can disable the policy; the reconciler always
-/// uses this default.
-pub(crate) const DEFAULT_STALE_ABANDON_SECS: u64 = 600;
+/// uses this default. Defined in sandbox-store beside the sweep that applies
+/// it; the admin holds read's stuck threshold is the same constant.
+pub(crate) const DEFAULT_STALE_ABANDON_SECS: u64 =
+    pplx_space_sandbox_store::drain::STALE_ABANDON_AFTER.as_secs();
 /// How long a `suspended` sandbox whose local-snapshot backup is permanently
 /// refused (not `Suspended` on the node — a stuck on-node `restoring`) must
 /// have been settled before the node-drain give-up adopts an existing ready

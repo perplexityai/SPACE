@@ -1372,6 +1372,8 @@ mod live_residents_tests;
 /// `terminate_decrement_capacity` survive whatever the request carried.
 #[cfg(test)]
 mod in_flight_drain_tests;
+#[cfg(test)]
+mod node_holds_agreement_tests;
 /// Postgres-backed plan-structure and page-shape regression for the
 /// `:force-upload-local-snapshots` enumeration: the scan stays bounded by the
 /// node's own pinned history rather than the fleet, the in-flight probe runs

@@ -28,6 +28,9 @@ expression: paths_by_method
   "/nodes/{node_id}/health": [
     "get"
   ],
+  "/nodes/{node_id}/holds": [
+    "get"
+  ],
   "/nodes/{node_id}/network-policy:reconcile": [
     "post"
   ],

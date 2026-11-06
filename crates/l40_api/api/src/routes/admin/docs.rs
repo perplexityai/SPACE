@@ -436,14 +436,33 @@ fn insert_node_maintenance_paths(paths: &mut Map<String, Value>) {
     paths.insert("/nodes/{node_id}/sandboxes".to_string(), json!({
                 "get": {
                     "summary": "List active and target sandbox placements for one node",
-                    "description": "At most 100 placement rows, ordered by sandbox UUID and deduplicated across active and target associations. No durability accounting or live census. Use next_after as the after cursor; null means the last page. Concurrent placement changes may affect pagination.",
+                    "description": "At most 100 placement rows, in every lifecycle, deduplicated across active and target associations. No durability accounting or live census; GET /nodes/{node_id}/holds lists what holds the node. Ordered by sandbox UUID unless order=lifecycle_changed_desc. In id order, use next_after as the after cursor; with order=lifecycle_changed_desc, rows are newest lifecycle_changed_at first, then id descending, each carries lifecycle_changed_at, and the response has next_cursor instead of next_after, passed back as cursor. after and cursor each answer 400 with the other order. null means the last page. Keep the filters unchanged between pages. Concurrent placement changes may affect pagination.",
                     "parameters": [
                         { "name": "node_id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } },
-                        { "name": "after", "in": "query", "schema": { "type": "string", "format": "uuid" } }
+                        { "name": "after", "in": "query", "schema": { "type": "string", "format": "uuid" } },
+                        { "name": "lifecycle", "in": "query", "description": "Stored lifecycle to keep: a sandbox lifecycle or deleted. Repeat it, or separate values with commas, to keep any of several. An unknown value answers 400", "schema": { "type": "string" } },
+                        { "name": "changed_since", "in": "query", "description": "RFC 3339 timestamp; keeps rows whose lifecycle_changed_at is at or after it, for example failed rows since a drain started", "schema": { "type": "string", "format": "date-time" } },
+                        { "name": "order", "in": "query", "schema": { "type": "string", "enum": ["id", "lifecycle_changed_desc"], "default": "id" } },
+                        { "name": "cursor", "in": "query", "description": "next_cursor from the previous order=lifecycle_changed_desc page", "schema": { "type": "string" } }
                     ],
                     "responses": {
-                        "200": { "description": "Object containing sandboxes (id, lifecycle, active_node_id, target_node_id) and nullable next_after cursor" },
-                        "400": { "description": "Invalid UUID or cursor" },
+                        "200": { "description": "Object containing sandboxes (id, lifecycle, active_node_id, target_node_id, and lifecycle_changed_at with order=lifecycle_changed_desc) and a nullable next_after, or with order=lifecycle_changed_desc next_cursor" },
+                        "400": { "description": "Invalid UUID, cursor, lifecycle, timestamp or order, or a cursor for the other order" },
+                        "403": { "description": "Managing organization administrator required" },
+                        "404": { "description": "Node not found" }
+                    }
+                }
+            }));
+    paths.insert("/nodes/{node_id}/holds".to_string(), json!({
+                "get": {
+                    "summary": "List the sandboxes that hold one node, and why",
+                    "description": "The rows the node-release gates count against the node: those whose active_node_id names it in a lifecycle the :terminate guard counts, and the drain gate's blockers (target-pinned suspending, non-evacuation restoring and non-durable suspended rows, and rows with a full snapshot upload in flight from the node and no durable snapshot). A row the node census discounts is listed too. Each row has a reason, one of census_absent (active_node_id names the node, its fresh census omits the sandbox, and it is not a drain-gate blocker; under node_census_aware evidence no term counts it), evacuating (evacuation_restore_target is set; a forced drain still fails a marked suspending row older than stuck_transient_after_secs unless its suspend snapshot is recoverable), upload_in_flight, stuck_transient and transient (a resident transient lifecycle older or younger than stuck_transient_after_secs, the drain's stale-abandon age), local_only_snapshot (suspended with no durable snapshot), resident (started or paused) and termination_blocking (created, stopped, deleting, quarantined or an unmodelled value). terms has the gate terms that count it, under the residency_evidence the response reports: resident is the drain's resident scan (drainability live_residents), drain_blocker the drain gate's blocker set (drainability drain_blockers and the :terminate 409's sandboxes_drain_blockers), and active_resident the occupancy scope (drainability terminate_blockers and the 409's sandboxes_active). counted_by has three flags computed from those terms: terminate (active_resident or drain_blocker, what :terminate refuses on), drain (resident or drain_blocker), and drain_with_termination_blocking_gate (what the drain counts when the cluster-controller's termination-blocking gate is on: resident, drain_blocker or active_resident, the same rows as terminate). The API does not read that gate's setting, and the drain's own in-flight evacuations are not visible here. Rows any term counts come first and rows no term counts last, each group ordered by reason in that order, then oldest lifecycle_changed_at first; at most 500 are listed, with truncated set when more exist, and total, reason_counts and term_counts cover every row. Only the drain gate and the :terminate guard are covered; the drained-node terminator refuses on the same rows as :terminate. The sweeps that delete a node's row outside a drain also count rows this list omits, such as suspended rows with a durable snapshot, and a drained node can wait on its drain-keep annotation rather than on any sandbox.",
+                    "parameters": [
+                        { "name": "node_id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }
+                    ],
+                    "responses": {
+                        "200": { "description": "Object with node_id, residency_evidence, stuck_transient_after_secs, total, truncated, reason_counts, term_counts (resident, drain_blocker, active_resident) and holds, each with sandbox_id, lifecycle, lifecycle_changed_at, placement (active, target, both, or upload_source when only an upload from the node holds it), reason, counted_by (terminate, drain, drain_with_termination_blocking_gate), terms (resident, drain_blocker, active_resident) and facts (census_absent, durable_snapshot, upload_in_flight, upload_started_at, evacuation_restore_target, restore_attempt_count and next_restore_attempt_at when a cohort restore has failed, past_stuck_threshold)" },
+                        "400": { "description": "Invalid UUID" },
                         "403": { "description": "Managing organization administrator required" },
                         "404": { "description": "Node not found" }
                     }
