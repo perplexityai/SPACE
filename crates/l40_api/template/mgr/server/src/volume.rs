@@ -8,21 +8,18 @@
 //!    over TCP with SPACE internal bearer auth) for the release
 //!    matching the requested full digest or tag (default `latest`). Tenant
 //!    requests require an org authorization acknowledgement from ClusterApi.
-//! 2. Disk recovery: a prior cache-miss pull whose caller's future got
-//!    dropped may have left a complete artifact set in the digest dir
-//!    (`metadata.json`, `manifest.json`, `rootfs.ext4.zst`,
-//!    `rootfs.ext4`) without ever landing a DB row. [`try_recover_from_disk`]
-//!    re-registers the row and returns; if any file is missing we fall
-//!    through to the pull path.
+//! 2. Refusing a build dir that's already on disk without a DB row, such
+//!    as one startup recovery dropped the row of over a read that can
+//!    clear, or one a pull stopped before registering. The pull neither
+//!    adopts nor writes into it: it fails retryably, and the next startup
+//!    verifies the dir from scratch.
 //! 3. Issuing three synchronous `PullFile` RPCs against the on-node
 //!    `space-volume-manager` daemon — one each for `metadata.json`,
 //!    `manifest.json`, and `rootfs.ext4.zst`. Volume-manager handles
 //!    credmgr token exchange and the actual S3 GETs; template-manager
 //!    never talks to S3 directly. The three pulls run in parallel and
 //!    write directly into the digest dir — vol-mgr's per-file
-//!    `.partial → rename` provides per-file atomicity, and vol-mgr's
-//!    skip-if-present elides any re-download of files already on disk
-//!    from a prior partial attempt.
+//!    `.partial → rename` provides per-file atomicity.
 //! 4. Materializing local `rootfs.ext4` in expanded runtime shape via
 //!    [`crate::rootfs_zstd::decompress_rootfs`] (process-unique tmp
 //!    filename + atomic rename, so two overlapping decompresses from a
@@ -401,19 +398,12 @@ impl VolumePuller {
     /// (e.g., gRPC deadline exceeded), the resolved pull task continues
     /// and other callers for the same `(template, hash)` keep waiting on
     /// the shared flight. If the task itself is aborted or the process
-    /// exits, the next `GetTemplate` recovers from whatever is on disk:
-    ///
-    /// - All commit artifacts present (`metadata.json`, `manifest.json`,
-    ///   `rootfs.ext4.zst`, `rootfs.ext4`) → recovery upserts the DB row
-    ///   and returns.
-    /// - Some source files present, no decompressed rootfs → vol-mgr's
-    ///   skip-if-present short-circuits the re-pulls and we just
-    ///   decompress + commit.
-    /// - Nothing or a partial set on disk → fresh pull.
+    /// exits, the build dir it left has no row: later pulls refuse it
+    /// retryably until the next startup verifies it and restores its row
+    /// or removes it.
     ///
     /// This keeps caller cancellation from multiplying rootfs
-    /// decompressions while preserving the recover-from-disk behavior for
-    /// process death.
+    /// decompressions.
     pub async fn pull(
         &self,
         db: Arc<std::sync::Mutex<rusqlite::Connection>>,
@@ -542,6 +532,7 @@ impl VolumePuller {
                 tokio::spawn(
                     async move {
                         let (outcome, path_taken) = pull_resolved_owner(
+                            Path::new(TEMPLATE_DIR),
                             db,
                             &name,
                             &resolved_hash,
@@ -879,8 +870,6 @@ impl Drop for PullFlightGuard {
 enum PullPath {
     /// Pulled fresh from object storage (cluster API → vol-mgr).
     FreshPull,
-    /// Filesystem already had the artifacts; just re-registered the DB row.
-    Recovered,
     /// DB row was present from a prior call — no work needed.
     DbHit,
     /// Another caller already owned the same resolved digest pull.
@@ -994,7 +983,6 @@ fn outcome_label(outcome: &PullOutcome, path: PullPath) -> &'static str {
     match outcome {
         PullOutcome::Materialized => match path {
             PullPath::FreshPull => "materialized",
-            PullPath::Recovered => "recovered",
             PullPath::DbHit => "db_hit",
             PullPath::Coalesced => "coalesced",
         },
@@ -1009,7 +997,22 @@ fn record_phase(base_tags: &[String], phase: &'static str, result: &'static str,
     pplx_space_metrics::template::pull_s3_phase(base_tags, phase, result, started);
 }
 
+/// Why a pull refuses a build dir that's on disk without a catalog row.
+fn rowless_build_dir_refusal(name: &str, content_hash: &str) -> String {
+    format!(
+        "template {name} build {content_hash} is on disk without a catalog row; \
+         retry after template-manager verifies it"
+    )
+}
+
+/// The owner's work for one resolved digest, under `template_root`
+/// (`TEMPLATE_DIR` in production).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the pull's inputs plus the template root tests point elsewhere"
+)]
 async fn pull_resolved_owner(
+    template_root: &Path,
     db: Arc<std::sync::Mutex<rusqlite::Connection>>,
     name: &str,
     resolved_hash: &str,
@@ -1035,16 +1038,36 @@ async fn pull_resolved_owner(
         return (PullOutcome::Materialized, PullPath::DbHit);
     }
 
-    // Disk recovery: a prior cache-miss pull (possibly one whose caller
-    // was cancelled) may have left a complete artifact set in the digest
-    // dir without finishing the DB upsert. Re-register from disk.
-    if try_recover_from_disk(&db, name, resolved_hash).await {
-        return (PullOutcome::Materialized, PullPath::Recovered);
+    // A build dir on disk without a row isn't this pull's: startup recovery
+    // may have dropped its row over a read that can clear, or a pull may
+    // have stopped before writing its row. Adopting it would serve bytes
+    // nobody verified, and pulling into it would delete an installed build
+    // when the write fails. Leave it to the next startup, which verifies it
+    // from scratch, and refuse retryably until then.
+    // A dir whose existence can't be checked may be one; refuse the same way.
+    let build_dir = template_root.join(name).join(resolved_hash);
+    let refusal = match tokio::fs::try_exists(&build_dir).await {
+        Ok(false) => None,
+        Ok(true) => Some(rowless_build_dir_refusal(name, resolved_hash)),
+        Err(error) => Some(format!(
+            "could not check for a build dir of template {name} build {resolved_hash}: {error}"
+        )),
+    };
+    if let Some(refusal) = refusal {
+        warn!(
+            template = name,
+            content_hash = resolved_hash,
+            dir = %build_dir.display(),
+            %refusal,
+            "refusing the pull until template-manager verifies the build dir"
+        );
+        return (
+            PullOutcome::Retryable(Status::unavailable(refusal)),
+            PullPath::FreshPull,
+        );
     }
 
-    // Fresh pull. Vol-mgr deduplicates concurrent PullFile calls server-side,
-    // and its skip-if-present check elides re-downloads of files already on
-    // disk from a prior incomplete attempt.
+    // Fresh pull. Vol-mgr deduplicates concurrent PullFile calls server-side.
     let outcome = match do_pull(
         db,
         name,
@@ -1457,60 +1480,77 @@ async fn do_pull(
     let mut tried_any = false;
     let mut last_failure = PullFailure::NoUsableStorageLocations;
     let mut last_downstream_status = None;
-    for uri in storage_uris {
-        let parts = match StorageUri::parse(uri) {
-            Ok(p) => p,
-            Err(err) => {
-                warn!(uri = %uri, error = %err, "skipping unusable storage_location");
-                continue;
-            }
-        };
-        tried_any = true;
-        match try_pull_from(
-            Arc::clone(&db),
-            name,
-            content_hash,
-            &parts,
-            base_tags,
-            background_worker,
-            backing_policy,
-        )
-        .await
-        {
-            Ok(()) => return Ok(()),
-            Err(PullError::HashMismatch { expected, actual }) => {
-                return Err(PullError::HashMismatch { expected, actual });
-            }
-            Err(error @ PullError::Retryable(_)) => return Err(error),
-            Err(PullError::Failed(status)) => {
-                warn!(
-                    uri = %uri,
-                    error = %status,
-                    "pull from storage_location returned a permanent status; trying next location",
-                );
-                last_downstream_status = Some(status);
-            }
-            Err(PullError::Failure(failure)) => {
-                last_failure = prefer_retryable_failure(last_failure, failure);
-                warn!(
-                    uri = %uri,
-                    reason = failure.metric_reason(),
-                    error = %failure,
-                    "pull from storage_location failed; trying next location",
-                );
+    let cleanup = PullCleanupSlot::default();
+    let result = async {
+        for uri in storage_uris {
+            // A failed attempt's build dir must be gone before the next one
+            // starts: a pull refuses a build dir that exists when it starts.
+            cleanup.finish().await;
+            let parts = match StorageUri::parse(uri) {
+                Ok(p) => p,
+                Err(err) => {
+                    warn!(uri = %uri, error = %err, "skipping unusable storage_location");
+                    continue;
+                }
+            };
+            tried_any = true;
+            match try_pull_from(
+                Arc::clone(&db),
+                name,
+                content_hash,
+                &parts,
+                base_tags,
+                background_worker,
+                backing_policy,
+                &cleanup,
+            )
+            .await
+            {
+                Ok(()) => return Ok(()),
+                Err(PullError::HashMismatch { expected, actual }) => {
+                    return Err(PullError::HashMismatch { expected, actual });
+                }
+                Err(error @ PullError::Retryable(_)) => return Err(error),
+                Err(PullError::Failed(status)) => {
+                    warn!(
+                        uri = %uri,
+                        error = %status,
+                        "pull from storage_location returned a permanent status; trying next location",
+                    );
+                    last_downstream_status = Some(status);
+                }
+                Err(PullError::Failure(failure)) => {
+                    last_failure = prefer_retryable_failure(last_failure, failure);
+                    warn!(
+                        uri = %uri,
+                        reason = failure.metric_reason(),
+                        error = %failure,
+                        "pull from storage_location failed; trying next location",
+                    );
+                }
             }
         }
-    }
 
-    if !tried_any {
-        warn!(
-            ?storage_uris,
-            "no usable storage_location; skipping object-store pull"
-        );
+        if !tried_any {
+            warn!(
+                ?storage_uris,
+                "no usable storage_location; skipping object-store pull"
+            );
+        }
+        Err(finish_pull_failures(last_failure, last_downstream_status))
     }
-    Err(finish_pull_failures(last_failure, last_downstream_status))
+    .await;
+    // On every exit, including an early one: the owner releases the digest
+    // when this returns, and a retry that takes it must not meet the failed
+    // attempt's dir mid-delete.
+    cleanup.finish().await;
+    result
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one storage location's attempt: the pull's inputs plus its cleanup slot"
+)]
 async fn try_pull_from(
     db: Arc<std::sync::Mutex<rusqlite::Connection>>,
     name: &str,
@@ -1523,6 +1563,7 @@ async fn try_pull_from(
         >,
     >,
     backing_policy: RootfsBackingPolicy,
+    cleanup: &PullCleanupSlot,
 ) -> Result<(), PullError> {
     // Parse the template name into the typed identity that becomes the
     // SubjectId we hand to volume-manager. This is also the *only* boundary
@@ -1547,10 +1588,8 @@ async fn try_pull_from(
 
     // Write directly into the content-addressed digest dir. No staging dir:
     // vol-mgr's per-file `.partial → rename` gives us per-file atomicity, the
-    // digest dir is named by `content_hash` (so a stale dir from a prior
-    // partial attempt can't be confused for a different build), and the next
-    // GetTemplate's recovery picks up wherever we left off if our caller's
-    // future is dropped.
+    // digest dir is named by `content_hash`, and a pull refuses a dir it
+    // didn't create, so a stale dir from a prior attempt is never adopted.
     let name_dir = format!("{TEMPLATE_DIR}/{name}");
     if let Err(err) = tokio::fs::create_dir_all(&name_dir).await {
         warn!(error = %err, template = name, content_hash, dir = %name_dir, "create name dir failed; falling through");
@@ -1562,43 +1601,52 @@ async fn try_pull_from(
         return Err(PullError::Failure(PullFailure::LocalStorageUnavailable));
     }
     let digest_dir = format!("{TEMPLATE_DIR}/{name}/{content_hash}");
-    let digest_dir_existed = Path::new(&digest_dir).exists();
+    // A pull never writes into, or deletes, a build dir it didn't create:
+    // the owner refused a rowless dir already, so one here appeared since.
+    if Path::new(&digest_dir).exists() {
+        warn!(
+            template = name,
+            content_hash,
+            dir = %digest_dir,
+            "build dir appeared before the pull created it; leaving it alone"
+        );
+        return Err(PullError::Retryable(Status::unavailable(
+            rowless_build_dir_refusal(name, content_hash),
+        )));
+    }
     // Arm the cleanup guard before any subvolume create / file write
     // touches the digest dir. Any error path below — including the
     // create_subvolume fallback's plain-dir path, vol-mgr connect
     // failure, manifest parse failure, hash mismatch, and atomic write
-    // failure — drops the guard, which wipes the dir so the next
-    // caller's `digest_dir_existed` adoption can't pick up partial
-    // bytes. Disarmed below right before the final `Ok(())` once the
-    // sqlite upsert has committed.
-    let cleanup_guard = PullCleanupGuard::new(name, content_hash, &digest_dir);
-    if !digest_dir_existed {
-        // Create the digest dir as a btrfs subvolume via node-manager.
-        // The ioctl requires CAP_SYS_ADMIN, so delegate to privileged
-        // node-manager. An unprivileged direct call would return EPERM and
-        // fall back to a plain directory, breaking btrfs-send's subvolume
-        // precondition. Non-btrfs hosts still fall back to plain mkdir.
-        match crate::btrfs_via_nodemgr::create_template_subvolume(name, content_hash).await {
-            Ok(_path) => {
-                tracing::debug!(
-                    template = name,
-                    content_hash,
-                    dir = %digest_dir,
-                    "on-demand pull: digest dir created as btrfs subvolume (via nodemgr)"
-                );
-            }
-            Err(err) => {
-                tracing::info!(
-                    template = name,
-                    content_hash,
-                    dir = %digest_dir,
-                    error = %err,
-                    "on-demand pull: nodemgr btrfs subvolume create failed; falling back to plain directory"
-                );
-                if let Err(err) = tokio::fs::create_dir_all(&digest_dir).await {
-                    warn!(error = %err, template = name, content_hash, dir = %digest_dir, "create digest dir failed; falling through");
-                    return Err(PullError::Failure(PullFailure::LocalStorageUnavailable));
-                }
+    // failure — drops the guard, which wipes the dir this pull created so
+    // a later pull starts clean. Disarmed below right before the final
+    // `Ok(())` once the sqlite upsert has committed.
+    let cleanup_guard = PullCleanupGuard::new(name, content_hash, &digest_dir, cleanup);
+    // Create the digest dir as a btrfs subvolume via node-manager.
+    // The ioctl requires CAP_SYS_ADMIN, so delegate to privileged
+    // node-manager. An unprivileged direct call would return EPERM and
+    // fall back to a plain directory, breaking btrfs-send's subvolume
+    // precondition. Non-btrfs hosts still fall back to plain mkdir.
+    match crate::btrfs_via_nodemgr::create_template_subvolume(name, content_hash).await {
+        Ok(_path) => {
+            tracing::debug!(
+                template = name,
+                content_hash,
+                dir = %digest_dir,
+                "on-demand pull: digest dir created as btrfs subvolume (via nodemgr)"
+            );
+        }
+        Err(err) => {
+            tracing::info!(
+                template = name,
+                content_hash,
+                dir = %digest_dir,
+                error = %err,
+                "on-demand pull: nodemgr btrfs subvolume create failed; falling back to plain directory"
+            );
+            if let Err(err) = tokio::fs::create_dir_all(&digest_dir).await {
+                warn!(error = %err, template = name, content_hash, dir = %digest_dir, "create digest dir failed; falling through");
+                return Err(PullError::Failure(PullFailure::LocalStorageUnavailable));
             }
         }
     }
@@ -1647,7 +1695,14 @@ async fn try_pull_from(
         PullOptions::control("manifest"),
         base_tags,
     );
-    let (meta_bytes, man_bytes) = tokio::try_join!(metadata_fut, manifest_fut)?;
+    // Await both even when one fails: volume-manager keeps a started job
+    // running after its waiter drops, and one that wrote after the cleanup
+    // guard removed the dir would leave a dir without a row that later
+    // pulls refuse. A job that outlives its own failed RPC (a deadline, or
+    // a volume-manager restart) can still do that; startup recovery then
+    // verifies or removes the dir.
+    let (meta_bytes, man_bytes) = tokio::join!(metadata_fut, manifest_fut);
+    let (meta_bytes, man_bytes) = (meta_bytes?, man_bytes?);
     pplx_space_metrics::template::pull_s3_bytes(base_tags, Some(&parts.region), meta_bytes);
     pplx_space_metrics::template::pull_s3_bytes(base_tags, Some(&parts.region), man_bytes);
 
@@ -1686,8 +1741,7 @@ async fn try_pull_from(
     // surfaces as `manifest_parse_failed` instead of silently
     // collapsing to an empty `TemplateManifest::default()` (which would
     // then hit the `manifest_empty` branch below, masking the real
-    // failure mode from logs + metrics). Mirrors the recovery path's
-    // parse handling.
+    // failure mode from logs + metrics).
     let parsed_manifest: pplx_space_common_core::types::TemplateManifest =
         match serde_json::from_slice(&manifest_bytes) {
             Ok(m) => m,
@@ -1751,11 +1805,10 @@ async fn try_pull_from(
         "vol-mgr pull plan resolved from manifest"
     );
 
-    // 4. Parallel-pull every entry in the plan. `try_join_all` mirrors
-    //    the previous `try_join!`'s short-circuit semantics: the first
-    //    failure aborts the join and the remaining pulls keep running on
-    //    vol-mgr's side (vol-mgr's `BackgroundWorker` doesn't observe our
-    //    cancellation).
+    // 4. Parallel-pull every entry in the plan, awaiting every one before
+    //    acting on a failure: vol-mgr's `BackgroundWorker` doesn't observe
+    //    a dropped waiter, so a pull still running after the cleanup guard
+    //    removed the dir would write it back without a row.
     let pull_futs: Vec<_> = pull_plan
         .iter()
         .map(|entry| {
@@ -1769,7 +1822,10 @@ async fn try_pull_from(
             )
         })
         .collect();
-    let pull_bytes = futures_util::future::try_join_all(pull_futs).await?;
+    let pull_bytes = futures_util::future::join_all(pull_futs)
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()?;
     for bytes in &pull_bytes {
         pplx_space_metrics::template::pull_s3_bytes(base_tags, Some(&parts.region), *bytes);
     }
@@ -1820,11 +1876,9 @@ async fn try_pull_from(
         );
         // `decompress_rootfs` has already atomically renamed the (verified-
         // hash-wrong) bytes onto rootfs.ext4. Without cleanup, the next
-        // GetTemplate for this `(name, content_hash)` would see all four
-        // artifacts present, treat the dir as an orphaned-but-valid build,
-        // and silently upsert a `state=ready` DB row pointing at
-        // unverified bytes. Wipe the dir so recovery declines and a fresh
-        // pull is forced.
+        // startup recovery would hash the dir, reject it and remove it,
+        // and pulls of this `(name, content_hash)` would be refused until
+        // then. Wipe the dir so the next pull starts clean.
         cleanup_digest_dir_after_hash_mismatch(name, content_hash, Path::new(&digest_dir)).await;
         return Err(PullError::HashMismatch {
             expected: content_hash.to_string(),
@@ -2050,295 +2104,11 @@ async fn try_pull_from(
     }
 }
 
-/// Re-register a digest dir whose artifacts are already on disk but whose
-/// DB row is missing — the typical residue of a cancelled GetTemplate whose
-/// caller dropped after the local commit work finished but before the upsert
-/// landed.
-///
-/// All four artifacts (`metadata.json`, `manifest.json`, `rootfs.ext4.zst`,
-/// `rootfs.ext4`) must be present; an absent set falls through to the regular
-/// pull path, which re-uses any already-downloaded files via vol-mgr's
-/// skip-if-present check and decompresses as needed.
-///
-/// We trust the `rootfs.ext4` bytes without re-hashing because of two
-/// invariants:
-///
-/// 1. **Verify-before-rename in [`crate::rootfs_zstd::decompress_rootfs`].**
-///    The decompressor streams into a sibling tmp file and only renames
-///    onto `rootfs.ext4` once it has verified the full digest over the
-///    decoded bytes; the caller (`try_pull_from`) compares that hash against
-///    the resolved release hash and rejects on mismatch. A file at
-///    `rootfs.ext4` therefore reflects bytes that passed verification.
-/// 2. **Content-addressed dir naming.** `digest_dir` ends in `<content_hash>`,
-///    so a stray file from a different build can't end up here under normal
-///    operation — there is no path by which a wrong-hash rootfs lands at
-///    this exact spot.
-///
-/// **If either invariant is ever broken** (e.g. someone removes the verify
-/// step in `decompress_rootfs`, or an operator manually drops a file into a
-/// digest dir), recovery will silently re-register the wrong bytes. The
-/// defense-in-depth fix would be a digest check of `rootfs.ext4` on every
-/// recovery, but that's a multi-second cost on a 1 GB rootfs for a cold
-/// path. We accept the trust on the basis that the invariants are local to
-/// this crate.
-async fn try_recover_from_disk(
-    db: &Arc<Mutex<rusqlite::Connection>>,
-    name: &str,
-    content_hash: &str,
-) -> bool {
-    let digest_dir = format!("{TEMPLATE_DIR}/{name}/{content_hash}");
-    match recover_from_digest_dir(db, name, content_hash, Path::new(&digest_dir)).await {
-        Ok(rootfs_size) => {
-            info!(
-                template = name,
-                content_hash,
-                dir = %digest_dir,
-                rootfs_size,
-                "recovered template build from disk; DB row re-registered"
-            );
-            crate::node_state_sync::mark_template_dirty(db, name);
-            true
-        }
-        Err(reason) => {
-            // Expected outcomes (missing file, parse fail) log inside the
-            // helper; nothing more to say here.
-            tracing::debug!(
-                template = name,
-                content_hash,
-                dir = %digest_dir,
-                reason,
-                "disk recovery did not apply"
-            );
-            false
-        }
-    }
-}
-
-/// Side-effect-isolated core of [`try_recover_from_disk`]: reads the digest
-/// dir, normalizes the manifest, atomically rewrites it, and upserts the DB
-/// row. Returns the rootfs size on success (for logging by the wrapper), or
-/// a short reason string when the digest dir doesn't qualify for recovery.
-///
-/// Split out from `try_recover_from_disk` so tests can drive it with a
-/// `tempfile::tempdir()` and an `Connection::open_in_memory()` DB —
-/// proving the "if files are on disk but DB row is missing, the next
-/// caller commits the DB row" half of the cancellation-safety contract.
-/// External side effects (the `mark_template_dirty` enqueue) stay in the
-/// wrapper so this function is fully self-contained.
-async fn recover_from_digest_dir(
-    db: &Arc<Mutex<rusqlite::Connection>>,
-    name: &str,
-    content_hash: &str,
-    digest_dir: &Path,
-) -> Result<u64, &'static str> {
-    let metadata_path = digest_dir.join("metadata.json");
-    let manifest_path = digest_dir.join("manifest.json");
-
-    // Read metadata + manifest first; recovery is manifest-driven, so we
-    // can't decide what other files to check for until we know what the
-    // manifest declares.
-    let metadata_bytes = tokio::fs::read(&metadata_path)
-        .await
-        .map_err(|_| "metadata_missing")?;
-    let manifest_bytes = tokio::fs::read(&manifest_path)
-        .await
-        .map_err(|_| "manifest_missing")?;
-
-    let manifest: pplx_space_common_core::types::TemplateManifest =
-        match serde_json::from_slice(&manifest_bytes) {
-            Ok(v) => v,
-            Err(err) => {
-                warn!(
-                    error = %err,
-                    template = name,
-                    content_hash,
-                    path = %manifest_path.display(),
-                    "manifest parse failed during recovery; falling through to fresh pull"
-                );
-                return Err("manifest_parse_failed");
-            }
-        };
-    // Same path-injection defense as the pull path. The on-disk
-    // manifest is whatever the last writer left (potentially the raw
-    // S3 object from an interrupted pull), so we cannot assume it's
-    // already been validated.
-    if let Err(err) = manifest.validate_filenames() {
-        warn!(
-            template = name,
-            content_hash,
-            error = %err,
-            "manifest filename validation rejected the on-disk manifest during recovery"
-        );
-        return Err("manifest_unsafe_filename");
-    }
-
-    // The bootable artifact is always required (it's what the VM boots
-    // off, regardless of what the manifest's `files` map happens to
-    // contain). Fall back to the canonical `rootfs.ext4` filename when
-    // the manifest doesn't declare a bootable artifact — common for
-    // the raw, pre-normalized manifests vol-mgr writes mid-pull.
-    let rootfs_filename = if manifest.bootable_artifact.is_empty() {
-        TEMPLATE_ROOTFS_FILE
-    } else {
-        manifest.bootable_artifact.as_str()
-    };
-    let rootfs_path = digest_dir.join(rootfs_filename);
-    let rootfs_meta = tokio::fs::metadata(&rootfs_path)
-        .await
-        .map_err(|_| "rootfs_missing")?;
-    if !rootfs_meta.is_file() {
-        return Err("rootfs_not_a_file");
-    }
-
-    // Every other file the manifest declares must also be on disk. Vol-
-    // mgr's per-file atomic rename means a present file is whole, so
-    // existence is a sufficient liveness check.
-    //
-    // Manifest-driven: a legacy template that only lists `rootfs.ext4`
-    // recovers without a `.zst` on disk; a new-format template that
-    // lists both still requires both. Skips the bootable artifact since
-    // it's already validated above.
-    for key in manifest.files.keys() {
-        if key == rootfs_filename {
-            continue;
-        }
-        let path = digest_dir.join(key);
-        let meta = tokio::fs::metadata(&path).await.map_err(|_| {
-            // `&'static str` reason; concrete missing key goes to the
-            // tracing event in the wrapper, not the return value.
-            "manifest_file_missing"
-        })?;
-        if !meta.is_file() {
-            return Err("manifest_file_not_a_file");
-        }
-    }
-    let metadata: pplx_space_common_core::types::TemplateMetadata =
-        match serde_json::from_slice(&metadata_bytes) {
-            Ok(v) => v,
-            Err(err) => {
-                warn!(
-                    error = %err,
-                    template = name,
-                    content_hash,
-                    path = %metadata_path.display(),
-                    "metadata parse failed during recovery; falling through to fresh pull"
-                );
-                return Err("metadata_parse_failed");
-            }
-        };
-    let rootfs_size = rootfs_meta.len();
-
-    // Re-normalize the manifest before commit: the on-disk manifest may be
-    // the raw object vol-mgr wrote, not yet patched by
-    // `normalize_template_manifest`, if a previous attempt was cancelled
-    // between rootfs.ext4 rename and the atomic manifest re-write. Without
-    // this, recovery would store an unnormalized manifest with `state=ready`
-    // and downstream readers would see a missing `content_hash`,
-    // `bootable_artifact`, and `files` entries.
-    //
-    // We pass `None` for the compressed_rootfs entry: we don't have
-    // decompress stats here and re-hashing the .zst on every cold recovery
-    // would dominate the cost. Downstream tolerates the missing files entry
-    // for rootfs.ext4.zst on recovered builds.
-    let normalized = crate::service::normalize_template_manifest(
-        manifest,
-        name,
-        content_hash,
-        &metadata,
-        rootfs_size,
-        None,
-    )
-    .map_err(|error| {
-        warn!(
-            template = name,
-            content_hash,
-            %error,
-            "recovered template execution metadata validation failed"
-        );
-        "execution_metadata_invalid"
-    })?;
-    let manifest_json = serde_json::to_string_pretty(&normalized).unwrap_or_default();
-
-    // Rewrite the on-disk manifest atomically so subsequent recoveries (or
-    // any other reader of the digest dir) see the normalized form too.
-    // Failure here is non-fatal — we still have the in-memory normalized
-    // copy for the DB upsert.
-    if let Err(err) = write_file_atomic(&manifest_path, manifest_json.as_bytes()).await {
-        warn!(
-            error = %err,
-            template = name,
-            content_hash,
-            path = %manifest_path.display(),
-            "atomic rewrite of recovered manifest failed; proceeding with DB upsert anyway"
-        );
-    }
-
-    let build_date = normalized.build_date.clone();
-    let runtime = if normalized.runtime.is_empty() {
-        pplx_space_common_core::types::RUNTIME_FIRECRACKER_ALIAS.to_string()
-    } else {
-        normalized.runtime.clone()
-    };
-    let arch = arch_from(&metadata, &normalized);
-
-    let n = name.to_string();
-    let h = content_hash.to_string();
-    let db_for_upsert = Arc::clone(db);
-    let upsert = tokio::task::spawn_blocking(move || {
-        let conn = db_for_upsert.lock().map_err(|_| {
-            rusqlite::Error::SqliteFailure(
-                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_IOERR),
-                Some("template DB mutex poisoned".to_string()),
-            )
-        })?;
-        crate::db::upsert_build(
-            &conn,
-            &crate::db::BuildUpsert {
-                name: &n,
-                content_hash: &h,
-                build_date: &build_date,
-                manifest_json: &manifest_json,
-                runtime: &runtime,
-                arch: &arch,
-                artifact_size_bytes: rootfs_size,
-                state: "ready",
-            },
-        )
-    })
-    .await;
-
-    match upsert {
-        Ok(Ok(())) => Ok(rootfs_size),
-        Ok(Err(err)) => {
-            warn!(
-                error = %err,
-                template = name,
-                content_hash,
-                "DB upsert_build failed during recovery; falling through to fresh pull"
-            );
-            Err("db_upsert_failed")
-        }
-        Err(err) => {
-            warn!(
-                error = %err,
-                template = name,
-                content_hash,
-                "spawn_blocking for DB upsert_build panicked during recovery"
-            );
-            Err("db_upsert_panicked")
-        }
-    }
-}
-
 /// Local sync fallback for the privileged delete RPC. Production
 /// callers go through nodemgr's `BtrfsDeleteTemplateSubvolume`
 /// because tmplmgr no longer has `CAP_SYS_ADMIN` to delete RO
 /// subvolumes locally. This helper is the fallback used when the RPC
-/// errors transiently: on a plain-dir digest it wipes the artifact
-/// files, which is enough to disarm recovery
-/// (`recover_from_digest_dir` requires the manifest-declared files to
-/// be present, so removing `rootfs.ext4` alone is enough) even when
-/// the empty subvolume root persists.
+/// errors transiently: on a plain-dir digest it wipes the dir.
 ///
 /// Subvolume-aware order:
 ///  1. If RO (a prior install ran far enough to flip it), clear the
@@ -2382,35 +2152,40 @@ async fn cleanup_digest_dir_local_fallback(digest_dir: PathBuf) -> std::io::Resu
 }
 
 async fn cleanup_digest_dir_after_hash_mismatch(name: &str, content_hash: &str, digest_dir: &Path) {
+    remove_build_dir(name, content_hash, digest_dir, "hash_mismatch").await;
+}
+
+/// Remove a build dir this pull created: through node-manager, the
+/// privileged delete path, falling back to a local delete when the RPC
+/// fails. Even when the subvolume delete EPERMs (production tmplmgr is
+/// non-root), the local recursive removal still wipes the dir's contents.
+/// A subvolume root it can't remove stays without a row, and pulls refuse
+/// it until startup recovery removes it.
+async fn remove_build_dir(name: &str, content_hash: &str, dir: &Path, reason: &'static str) {
     match crate::btrfs_via_nodemgr::delete_template_subvolume(name, content_hash).await {
         Ok(()) => {
-            info!(
-                dir = %digest_dir.display(),
-                reason = "hash_mismatch",
-                "removed digest dir to prevent recovery from adopting bad bytes (via nodemgr)"
-            );
+            info!(dir = %dir.display(), reason, "removed digest dir (via nodemgr)");
             return;
         }
         Err(err) => warn!(
             error = %err,
-            dir = %digest_dir.display(),
-            "nodemgr delete_template_subvolume failed after hash mismatch; trying local fallback"
+            dir = %dir.display(),
+            reason,
+            "nodemgr delete_template_subvolume failed; trying local fallback"
         ),
     }
-    // Local fallback: even if the privileged subvolume-delete path
-    // EPERMs (production tmplmgr is non-root), the recursive
-    // file-removal still wipes the artifact files so the next call's
-    // recovery cannot mistake unverified bytes for a ready build.
-    if let Err(err) = cleanup_digest_dir_local_fallback(digest_dir.to_path_buf()).await {
+    if let Err(err) = cleanup_digest_dir_local_fallback(dir.to_path_buf()).await {
         warn!(
             error = %err,
-            dir = %digest_dir.display(),
-            "local fallback cleanup also failed after hash mismatch; recovery may adopt bad bytes on the next call"
+            dir = %dir.display(),
+            reason,
+            "local fallback cleanup also failed; \
+             pulls of the build are refused until startup recovery verifies the dir"
         );
     } else {
         info!(
-            dir = %digest_dir.display(),
-            reason = "hash_mismatch",
+            dir = %dir.display(),
+            reason,
             "removed digest dir via local fallback after nodemgr RPC failed"
         );
     }
@@ -2423,29 +2198,68 @@ async fn cleanup_digest_dir_after_hash_mismatch(name: &str, content_hash: &str, 
 /// connect, metadata + manifest fetch, hash verify, manifest rewrite,
 /// permission normalization, …, sqlite upsert. Without a guard, any
 /// `return Err` between subvolume create and the final upsert leaks an
-/// empty subvolume that the next retry adopts via `digest_dir_existed`,
-/// permanently blocking a clean install of that `(name, content_hash)`.
+/// empty subvolume, which later pulls refuse as a dir without a row until
+/// startup recovery drops it, blocking a clean install of that
+/// `(name, content_hash)` meanwhile.
 ///
 /// The guard is armed at digest-dir creation and explicitly
 /// [`Self::disarm`]ed right before `pull_inner` returns `Ok(())`. On any
 /// other exit path, Drop spawns an async `BtrfsDeleteTemplateSubvolume`
-/// RPC against node-manager — fire-and-forget on the calling tokio
-/// runtime. Drop itself is sync (Rust requirement) so it can't await;
-/// the spawn means the cleanup runs eventually unless the runtime is
-/// already shutting down, in which case the next pull's recovery
-/// catches up via `cleanup_digest_dir_after_hash_mismatch`.
+/// RPC against node-manager on the calling tokio runtime and leaves its
+/// handle in the attempt's [`PullCleanupSlot`], which `do_pull` waits on.
+/// Drop itself is sync (Rust requirement) so it can't await. If the
+/// runtime is already shutting down, the next startup's recovery rejects
+/// the incomplete dir and removes it.
 struct PullCleanupGuard {
     name: String,
     content_hash: String,
     digest_dir: Option<PathBuf>,
+    slot: PullCleanupSlot,
+    remove: PullDirRemoval,
+}
+
+/// Removes a failed pull's build dir, given its template, hash and path.
+type PullDirRemoval =
+    fn(String, String, PathBuf) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
+
+/// How a failed pull removes the build dir it created; see
+/// [`remove_build_dir`].
+fn remove_failed_pull_dir(
+    name: String,
+    content_hash: String,
+    dir: PathBuf,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+    Box::pin(async move { remove_build_dir(&name, &content_hash, &dir, "pull_failed").await })
+}
+
+/// Where a [`PullCleanupGuard`] leaves the cleanup it spawns, so the next
+/// storage location's attempt can wait for the dir to go first.
+#[derive(Clone, Default)]
+struct PullCleanupSlot(Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>);
+
+impl PullCleanupSlot {
+    /// Wait for the cleanup a failed attempt spawned, if any.
+    async fn finish(&self) {
+        let pending = lock_or_recover(&self.0, "pull cleanup slot").take();
+        if let Some(pending) = pending {
+            let _ = pending.await;
+        }
+    }
 }
 
 impl PullCleanupGuard {
-    fn new(name: &str, content_hash: &str, digest_dir: impl Into<PathBuf>) -> Self {
+    fn new(
+        name: &str,
+        content_hash: &str,
+        digest_dir: impl Into<PathBuf>,
+        slot: &PullCleanupSlot,
+    ) -> Self {
         Self {
             name: name.to_string(),
             content_hash: content_hash.to_string(),
             digest_dir: Some(digest_dir.into()),
+            slot: slot.clone(),
+            remove: remove_failed_pull_dir,
         }
     }
 
@@ -2464,56 +2278,23 @@ impl Drop for PullCleanupGuard {
         let content_hash = std::mem::take(&mut self.content_hash);
 
         // Cleanup goes through node-manager (the privileged delete
-        // path). Drop must be sync, so we spawn a fire-and-forget
-        // task on the current tokio runtime. If no runtime is
-        // available (Drop fired outside an async context — shouldn't
+        // path). Drop must be sync, so we spawn a task on the current
+        // tokio runtime and leave its handle in the slot. If no runtime
+        // is available (Drop fired outside an async context — shouldn't
         // happen during pull_inner, but be defensive), the next
-        // pull's hash-mismatch / recovery cleanup catches up.
+        // startup's recovery catches up.
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
             warn!(
                 dir = %dir.display(),
                 template = %name,
                 content_hash = %content_hash,
                 "PullCleanupGuard fired outside a tokio runtime; partial \
-                 digest dir may remain until the next recovery pass picks it up"
+                 digest dir may remain until the next startup recovery removes it"
             );
             return;
         };
-        handle.spawn(async move {
-            match crate::btrfs_via_nodemgr::delete_template_subvolume(&name, &content_hash).await {
-                Ok(()) => {
-                    info!(
-                        dir = %dir.display(),
-                        reason = "pull_failed",
-                        "removed digest dir on pull failure (via nodemgr)"
-                    );
-                    return;
-                }
-                Err(err) => warn!(
-                    error = %err,
-                    dir = %dir.display(),
-                    "nodemgr delete_template_subvolume failed on pull failure; trying local fallback"
-                ),
-            }
-            // Same fallback as `cleanup_digest_dir_after_hash_mismatch`:
-            // wipe the artifact files locally so the next pull's
-            // recovery doesn't adopt partial bytes when the nodemgr
-            // RPC is transiently unavailable.
-            if let Err(err) = cleanup_digest_dir_local_fallback(dir.clone()).await {
-                warn!(
-                    error = %err,
-                    dir = %dir.display(),
-                    "local fallback cleanup also failed on pull failure; \
-                     recovery may adopt partial bytes on the next call"
-                );
-            } else {
-                info!(
-                    dir = %dir.display(),
-                    reason = "pull_failed",
-                    "removed digest dir via local fallback after nodemgr RPC failed"
-                );
-            }
-        });
+        let cleanup = handle.spawn((self.remove)(name, content_hash, dir));
+        *lock_or_recover(&self.slot.0, "pull cleanup slot") = Some(cleanup);
     }
 }
 
@@ -2986,8 +2767,7 @@ async fn materialize_rootfs(
                 actual,
             })) => {
                 // The decoder left nothing at the output path; wipe the
-                // rest of the digest dir so recovery cannot adopt the
-                // other pulled artifacts around the missing rootfs.
+                // rest of the digest dir so the next pull starts clean.
                 let phase = decompress_phase(target, rootfs_filename);
                 record_phase(base_tags, phase, "expanded_digest_mismatch", phase_started);
                 warn!(

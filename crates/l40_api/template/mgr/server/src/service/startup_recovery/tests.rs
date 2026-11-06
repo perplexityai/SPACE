@@ -497,11 +497,13 @@ async fn delete_template_build_waits_for_a_pull_of_the_digest() {
     assert!(!row_exists(&service, "seed", &hash));
 }
 
-/// Startup recovery runs once requests flow, so it skips a build whose digest
-/// a pull, import, registration or delete holds, rather than verifying it
-/// alongside them; once the claim goes, the next pass registers it.
+/// Startup recovery runs once requests flow, so it doesn't verify a build
+/// whose digest a pull, import, registration or delete holds alongside them.
+/// It waits for the holder after its scan and then verifies the build in the
+/// same pass, since a pull refuses a dir without a row while it holds the
+/// digest and no later pass would check the dir.
 #[tokio::test]
-async fn startup_recovery_skips_a_build_someone_else_claims() {
+async fn startup_recovery_verifies_a_held_build_once_its_holder_lets_go() {
     let root = tempfile::tempdir().unwrap();
     let (hash, dir) = place_build_dir(root.path(), "seed", b"claimed-at-startup-rootfs");
     let service =
@@ -513,11 +515,297 @@ async fn startup_recovery_skips_a_build_someone_else_claims() {
         .try_claim_digest("seed", &hash)
         .unwrap();
 
-    service.run_startup_recovery().await;
+    let recovery = tokio::spawn({
+        let service = service.clone();
+        async move { service.run_startup_recovery().await }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
+    assert!(!recovery.is_finished());
     assert!(!row_exists(&service, "seed", &hash));
     assert!(dir.join(TEMPLATE_ROOTFS_FILE).exists());
     drop(held);
-    service.run_startup_recovery().await;
+    tokio::time::timeout(std::time::Duration::from_secs(1), recovery)
+        .await
+        .expect("recovery finishes once the claim goes")
+        .unwrap();
     assert!(row_exists(&service, "seed", &hash));
+}
+
+fn registered(service: &TemplateManagerService, fixture: &DigestFixture) -> bool {
+    row_exists(service, "seed", &fixture.rootfs_hash)
+}
+
+fn insert_row(conn: &rusqlite::Connection, fixture: &DigestFixture, manifest: &TemplateManifest) {
+    crate::db::upsert_build(
+        conn,
+        &crate::db::BuildUpsert {
+            name: "seed",
+            content_hash: &fixture.rootfs_hash,
+            build_date: "2026-01-01T00:00:00Z",
+            manifest_json: &serde_json::to_string(manifest).unwrap(),
+            runtime: "fc",
+            arch: "x86_64",
+            artifact_size_bytes: fixture.rootfs_size,
+            state: "ready",
+        },
+    )
+    .unwrap();
+}
+
+async fn reconcile(service: &TemplateManagerService, fixture: &DigestFixture) {
+    reconcile_digest_dir_against_db(service, "seed", &fixture.rootfs_hash, fixture.dir.path())
+        .await;
+}
+
+/// A build whose metadata.json read fails with EIO, here a link to an
+/// unmapped address of `/proc/self/mem`, keeps its dir: the failure is a
+/// transient rejection, never the default metadata, which would register the
+/// build without its arch and execution metadata. Its row goes, and once
+/// metadata.json reads again the next pass registers it.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn an_unreadable_metadata_json_keeps_the_dir() {
+    let fixture = write_digest_fixture(b"metadata-eio-rootfs", b"zst-bytes");
+    write_manifest_json(fixture.dir.path(), &canonical_manifest(&fixture));
+    let metadata_path = fixture.dir.path().join("metadata.json");
+    let metadata_json = br#"{"arch":"aarch64"}"#;
+    std::fs::write(&metadata_path, metadata_json).unwrap();
+    let service =
+        TemplateManagerService::new_with_template_root(crate::db::test_conn(), fixture.dir.path())
+            .unwrap();
+    reconcile(&service, &fixture).await;
+    assert!(registered(&service, &fixture));
+    // As after a pull that stopped before its row: only a build without a
+    // row reads its metadata.
+    crate::db::delete_build(&service.db.lock().unwrap(), "seed", &fixture.rootfs_hash).unwrap();
+
+    std::fs::remove_file(&metadata_path).unwrap();
+    std::os::unix::fs::symlink("/proc/self/mem", &metadata_path).unwrap();
+    let error = std::fs::read_to_string(&metadata_path).unwrap_err();
+    assert_eq!(
+        error.raw_os_error(),
+        Some(rustix::io::Errno::IO.raw_os_error()),
+        "{error}"
+    );
+
+    reconcile(&service, &fixture).await;
+
+    assert_eq!(
+        std::fs::read(fixture.dir.path().join(TEMPLATE_ROOTFS_FILE)).unwrap(),
+        b"metadata-eio-rootfs"
+    );
+    assert!(fixture.dir.path().join("manifest.json").exists());
+    assert!(!registered(&service, &fixture));
+
+    std::fs::remove_file(&metadata_path).unwrap();
+    std::fs::write(&metadata_path, metadata_json).unwrap();
+    reconcile(&service, &fixture).await;
+
+    assert!(registered(&service, &fixture));
+    let arch = crate::db::get_build(&service.db.lock().unwrap(), "seed", &fixture.rootfs_hash)
+        .unwrap()
+        .unwrap()
+        .arch;
+    assert_eq!(arch, "aarch64");
+}
+
+/// A metadata.json that reads but doesn't parse can't say what the build's
+/// arch and execution metadata are, so it's a permanent rejection, as an
+/// unparseable manifest is. An absent or empty one is a build without
+/// metadata, as registration installs it.
+#[rstest::rstest]
+#[case::unparseable(Some(&b"{not json"[..]), false)]
+#[case::empty(Some(&b""[..]), true)]
+#[case::absent(None, true)]
+fn only_unparseable_metadata_json_is_a_rejection(
+    #[case] contents: Option<&[u8]>,
+    #[case] accepted: bool,
+) {
+    let fixture = write_digest_fixture(b"metadata-parse-rootfs", b"zst-bytes");
+    if let Some(contents) = contents {
+        std::fs::write(fixture.dir.path().join("metadata.json"), contents).unwrap();
+    }
+    match parse_metadata_from_digest_dir(fixture.dir.path()) {
+        Ok(metadata) => {
+            assert!(accepted, "{contents:?} must be rejected");
+            assert_eq!(metadata, TemplateMetadata::default());
+        }
+        Err(rejection) => {
+            assert!(!accepted, "{contents:?} must be accepted: {rejection}");
+            assert!(
+                matches!(rejection, DigestDirRejection::MetadataUnparseable(_)),
+                "{rejection}"
+            );
+            assert!(!rejection.is_transient(), "{rejection}");
+        }
+    }
+}
+
+#[test]
+fn io_errors_that_can_clear_are_transient() {
+    use std::io::{Error, ErrorKind};
+    for kind in [
+        ErrorKind::NotFound,
+        ErrorKind::InvalidData,
+        ErrorKind::InvalidInput,
+        ErrorKind::InvalidFilename,
+        ErrorKind::IsADirectory,
+        ErrorKind::NotADirectory,
+    ] {
+        assert!(!io_error_is_transient(&Error::from(kind)), "{kind:?}");
+    }
+    let looped = Error::from_raw_os_error(rustix::io::Errno::LOOP.raw_os_error());
+    assert!(!io_error_is_transient(&looped), "{looped}");
+    for error in [
+        Error::from_raw_os_error(rustix::io::Errno::IO.raw_os_error()),
+        Error::from(ErrorKind::PermissionDenied),
+        Error::from(ErrorKind::Interrupted),
+        Error::from(ErrorKind::TimedOut),
+    ] {
+        assert!(io_error_is_transient(&error), "{error}");
+    }
+}
+
+/// A manifest that fails to read with EIO, here a link to an unmapped
+/// address of `/proc/self/mem`, never deletes the installed build: its row
+/// goes, so it can't be selected, and its dir stays. Once the manifest reads
+/// again, the next startup verifies the dir from scratch and registers it.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_transient_rejection_keeps_the_dir_and_the_next_startup_restores_it() {
+    let fixture = write_digest_fixture(b"transient-rootfs", b"zst-bytes");
+    let manifest = canonical_manifest(&fixture);
+    let manifest_path = fixture.dir.path().join("manifest.json");
+    std::os::unix::fs::symlink("/proc/self/mem", &manifest_path).unwrap();
+    let error = std::fs::read_to_string(&manifest_path).unwrap_err();
+    assert_eq!(
+        error.raw_os_error(),
+        Some(rustix::io::Errno::IO.raw_os_error()),
+        "{error}"
+    );
+    let conn = crate::db::test_conn();
+    insert_row(&conn, &fixture, &manifest);
+    let service = TemplateManagerService::new_with_template_root(conn, fixture.dir.path()).unwrap();
+
+    reconcile(&service, &fixture).await;
+
+    assert!(fixture.dir.path().join(TEMPLATE_ROOTFS_FILE).exists());
+    assert!(!registered(&service, &fixture));
+    assert!(
+        crate::db::get_latest_build(&service.db.lock().unwrap(), "seed")
+            .unwrap()
+            .is_none()
+    );
+
+    // The next startup, with the manifest readable again.
+    std::fs::remove_file(&manifest_path).unwrap();
+    write_manifest_json(fixture.dir.path(), &manifest);
+    reconcile(&service, &fixture).await;
+
+    assert!(registered(&service, &fixture));
+}
+
+/// A bootable artifact whose read fails with EIO while it's hashed is a
+/// transient rejection. The ordinary reader reads from offset 0, which
+/// `/proc/self/mem` fails with EIO; the sparse one sizes the file first.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn hashing_a_rootfs_that_fails_with_eio_is_transient() {
+    let fixture = write_digest_fixture(b"unhashable-rootfs", b"zst-bytes");
+    let rootfs = fixture.dir.path().join(TEMPLATE_ROOTFS_FILE);
+    std::fs::remove_file(&rootfs).unwrap();
+    std::os::unix::fs::symlink("/proc/self/mem", &rootfs).unwrap();
+
+    let rejection = verify_bootable_artifact_hash(
+        fixture.dir.path(),
+        TEMPLATE_ROOTFS_FILE,
+        &fixture.rootfs_hash,
+        crate::file_reader::TemplateReadMode::Ordinary,
+    )
+    .await
+    .unwrap_err();
+
+    assert!(
+        matches!(
+            rejection,
+            DigestDirRejection::BootableArtifactUnreadable { .. }
+        ),
+        "{rejection}"
+    );
+    assert!(rejection.is_transient(), "{rejection}");
+}
+
+/// A manifest that can never read, because it's missing or its path is a
+/// directory, is a permanent rejection: the build and its row go, as before.
+#[rstest::rstest]
+#[case::missing(false)]
+#[case::directory(true)]
+#[tokio::test]
+async fn a_permanent_rejection_removes_the_build(#[case] directory: bool) {
+    let fixture = write_digest_fixture(b"no-manifest-rootfs", b"zst-bytes");
+    if directory {
+        std::fs::create_dir(fixture.dir.path().join("manifest.json")).unwrap();
+    }
+    let conn = crate::db::test_conn();
+    insert_row(&conn, &fixture, &canonical_manifest(&fixture));
+    let service = TemplateManagerService::new_with_template_root(conn, fixture.dir.path()).unwrap();
+
+    reconcile(&service, &fixture).await;
+
+    assert!(!fixture.dir.path().exists());
+    assert!(!registered(&service, &fixture));
+}
+
+/// Startup recovery runs once requests flow, so an import that starts first
+/// can own a staging dir by the time it scans. It leaves the dir alone; the
+/// same dirs left by a crashed process go before the socket binds.
+#[tokio::test]
+async fn startup_recovery_leaves_a_live_import_s_staging_dirs() {
+    let root = tempfile::tempdir().unwrap();
+    let hash = sha256_content_hash(b"staging-rootfs");
+    let name_dir = root.path().join("seed");
+    let live = [
+        name_dir.join(format!("{hash}.importing.{}", uuid::Uuid::now_v7())),
+        name_dir.join(format!("{hash}.republishing.{}", uuid::Uuid::now_v7())),
+    ];
+    for dir in &live {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join("manifest.json"), b"{}").unwrap();
+    }
+    let service =
+        TemplateManagerService::new_with_template_root(crate::db::test_conn(), root.path())
+            .unwrap();
+    *service.pool_handle.lock().unwrap() = Some(tokio::spawn(async {}));
+
+    service.run_startup_recovery().await;
+
+    for dir in &live {
+        assert!(dir.join("manifest.json").exists(), "{}", dir.display());
+    }
+
+    service.clean_transient_dirs_before_serving();
+
+    for dir in &live {
+        assert!(!dir.exists(), "{}", dir.display());
+    }
+}
+
+/// A build with a row is never registered from its metadata, so a
+/// metadata.json that no longer parses, as one a newer release wrote might
+/// not, leaves the build and its row alone.
+#[tokio::test]
+async fn a_build_with_a_row_keeps_it_whatever_its_metadata_json_holds() {
+    let fixture = write_digest_fixture(b"row-backed-rootfs", b"zst-bytes");
+    let manifest = canonical_manifest(&fixture);
+    write_manifest_json(fixture.dir.path(), &manifest);
+    std::fs::write(fixture.dir.path().join("metadata.json"), b"{not json").unwrap();
+    let conn = crate::db::test_conn();
+    insert_row(&conn, &fixture, &manifest);
+    let service = TemplateManagerService::new_with_template_root(conn, fixture.dir.path()).unwrap();
+
+    reconcile(&service, &fixture).await;
+
+    assert!(registered(&service, &fixture));
+    assert!(fixture.dir.path().join(TEMPLATE_ROOTFS_FILE).exists());
 }
