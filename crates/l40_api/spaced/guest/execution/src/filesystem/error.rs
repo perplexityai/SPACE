@@ -21,6 +21,9 @@ pub(crate) fn map_io_error(error: std::io::Error) -> Status {
             libc::EISDIR | libc::ENOTDIR | libc::EXDEV | libc::ELOOP | libc::ENOEXEC => {
                 return Status::failed_precondition(error.to_string());
             }
+            // A non-recursive remove of a directory that still has entries:
+            // the path's state refuses it, as on the Windows guest.
+            libc::ENOTEMPTY => return Status::failed_precondition(error.to_string()),
             // Invalid request content (EINVAL), an overlong path or path
             // component (ENAMETOOLONG), or an exec argv/env exceeding the
             // kernel's limits (E2BIG) is caller input, not a server fault.
