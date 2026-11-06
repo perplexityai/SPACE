@@ -340,14 +340,14 @@ test('a search cleared or changed by the operator restarts at the first page', a
   const selection = newSelection({ template: 'alpha' });
   await selection.load(selection.selected, reads(page('c1')).read);
   selection.goTo(selection.nextPosition());
-  selection.select({ filters: { ...NO_FILTERS, template: 'alpha', search: 'abc' }, pageSize: 50, sampleSize: 1000 });
+  selection.select({ filters: { ...NO_FILTERS, template: 'alpha', search: '0a1b' }, pageSize: 50, sampleSize: 1000 });
   // Cleared by the operator: no fallback, so the first page.
   selection.select({ filters: { ...NO_FILTERS, template: 'alpha' }, pageSize: 50, sampleSize: 1000 });
   assert.equal(selection.selected.cursor, '');
   // A fallback under other filters than the search was typed under starts
   // at their first page.
   selection.goTo({ cursors: ['', 'c1'], index: 1 });
-  selection.select({ filters: { ...NO_FILTERS, template: 'alpha', search: 'abc' }, pageSize: 50, sampleSize: 1000 });
+  selection.select({ filters: { ...NO_FILTERS, template: 'alpha', search: '0a1b' }, pageSize: 50, sampleSize: 1000 });
   selection.select({ filters: { ...NO_FILTERS, template: 'beta' }, pageSize: 50, sampleSize: 1000 }, { refusedSearch: true });
   assert.equal(selection.selected.cursor, '');
 });

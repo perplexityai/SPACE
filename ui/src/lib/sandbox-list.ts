@@ -59,11 +59,10 @@ export interface SandboxListFilters {
   olderThan: CreatedAge | null;
   // A name prefix (case-sensitive) or ID prefix, as typed.
   prefix: string;
-  // Trimmed text of at least 3 characters for a server that takes `search`
-  // (see `isSearchUnsupported`): it matches names that start with it,
-  // ignoring case, and, when it is hex digits once dashes and a leading
-  // `sbx_` are left out, IDs that end with them (from 4 digits) or start with
-  // them (from 8).
+  // An ID's hex digits, trimmed, for a server that takes `search` (see
+  // `isSearchUnsupported`): 4 to 32 once dashes and a leading `sbx_` are left
+  // out. It matches IDs that end with them, and from 8 digits IDs that start
+  // with them.
   search: string;
 }
 

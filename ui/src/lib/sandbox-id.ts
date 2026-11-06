@@ -148,17 +148,28 @@ function startsUuid(value: string): boolean {
     dashed && UUID_DASH_POSITIONS.includes(position) ? character === '-' : /^[0-9a-f]$/.test(character));
 }
 
-// The fewest characters the server takes as `search` (`MIN_SEARCH_CHARS` in
-// crates/l40_api/api/src/controllers/sandbox/list_page/admin.rs).
-export const MIN_SEARCH_CHARS = 3;
+// Text the server takes as `search` (`SandboxSearch` in
+// crates/l40_api/api/src/controllers/sandbox/list_page/admin.rs): an
+// optional `sbx_` in either case, then hex digits and dashes, with 4 to 32
+// digits. It matches IDs that end with the digits, such as the ID column's
+// label, and from 8 digits IDs that start with them; it never matches names.
+const ID_SEARCH_PATTERN = /^(?:[sS][bB][xX]_)?[0-9a-fA-F-]+$/;
+const MIN_ID_SEARCH_DIGITS = 4;
+const MAX_ID_SEARCH_DIGITS = 32;
+
+function isIdSearch(typed: string): boolean {
+  if (!ID_SEARCH_PATTERN.test(typed)) return false;
+  const digits = typed.replace(/^sbx_/i, '').replaceAll('-', '').length;
+  return digits >= MIN_ID_SEARCH_DIGITS && digits <= MAX_ID_SEARCH_DIGITS;
+}
 
 // What the search box does on each list shape. `serverSearch` says the
-// server takes `search`: a name prefix ignoring case or, for hex text, the
-// end of an ID (from 4 digits, such as the ID column's label) or its start
-// (from 8). While it does, all text of at least `MIN_SEARCH_CHARS`
-// characters goes there, and none of it is matched within the page.
+// server takes `search`. While it does, an ID's hex digits (`isIdSearch`)
+// go there; all other text is matched as on a server without it.
 // - `ref`: a full identifier in any accepted form, looked up directly.
-// - `search`: sent to a server that takes `search`, trimmed.
+// - `search`: an ID's hex digits, sent to a server that takes `search`,
+//   trimmed. A name made only of hex digits and dashes, such as `e2e-1`,
+//   is searched this way too, so it is not found by its name.
 // - `prefix`: sent to a paging server as typed. It matches the start of
 //   names case-sensitively, and the start of IDs: an `sbx_` ID prefix, or a
 //   dashed one in the UUID's layout, with hex digits in either case. The
@@ -175,8 +186,8 @@ export const MIN_SEARCH_CHARS = 3;
 // - `page`: matched within the loaded rows, ignoring case, anywhere in the ID
 //   or name. On a paging server this is only text no name can start with. A
 //   sampled list matches all free text this way, as it did before paging.
-// The `prefix`, `fragment` and `page` matches of a paging server are those of
-// a server without `search`, and of text too short for it.
+// The `prefix`, `fragment` and `page` matches are those of a server without
+// `search`, and of every text other than an ID's hex digits.
 export type SandboxSearch =
   | { kind: 'empty' }
   | { kind: 'ref'; ref: SandboxRef }
@@ -191,9 +202,7 @@ export function sandboxSearch(input: string, mode: ListMode, serverSearch = fals
   if (query.kind === 'ref') return query;
   if (mode === 'sampled') return { kind: 'page', query };
   const typed = input.trim();
-  // The server refuses a NUL, which no name or ID holds.
-  const searched = typed.replaceAll('\0', '');
-  if (serverSearch && [...searched].length >= MIN_SEARCH_CHARS) return { kind: 'search', text: searched };
+  if (serverSearch && isIdSearch(typed)) return { kind: 'search', text: typed };
   const lower = typed.toLowerCase();
   // As typed: lowercasing would lose a name such as `sbx_AB-worker`.
   const afterMarker = typed.slice(PUBLIC_SANDBOX_ID_PREFIX.length);

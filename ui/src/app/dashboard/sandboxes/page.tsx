@@ -788,9 +788,10 @@ function SandboxesPage() {
   const searchRefusedRef = useRef(false);
   // The selected statuses this list applies, and those it cannot.
   const statusSplit = useMemo(() => splitStatusFilter(listMode === 'paged', statusFilter), [listMode, statusFilter]);
-  // What the search box does on this list's shape: a direct lookup, a prefix
-  // the server matches, a match within the loaded rows, or both of the last
-  // two for hex digits and dashes.
+  // What the search box does on this list's shape: a direct lookup, an ID
+  // search the server matches, a prefix the server matches, a match within
+  // the loaded rows, or both of the last two for hex digits and dashes too
+  // few for an ID search.
   const search = useMemo(() => sandboxSearch(idFilter, listMode, serverSearch), [idFilter, listMode, serverSearch]);
   // The filters are those of a paged request whatever the shape on screen;
   // a sampled request sends only the org (`listScope`).
@@ -1761,14 +1762,14 @@ function SandboxesPage() {
             <Input
               allowClear
               size="small"
-              placeholder={!paged ? 'ID, pod name or name' : serverSearch ? 'Name, ID label or full ID' : 'Case-sensitive name prefix, ID prefix or full ID'}
+              placeholder={!paged ? 'ID, pod name or name' : serverSearch ? 'Case-sensitive name prefix, ID label or full ID' : 'Case-sensitive name prefix, ID prefix or full ID'}
               value={idFilter}
               onChange={(e) => setIdFilter(e.target.value)}
               style={{ width: 290 }}
               aria-label="Search sandboxes"
             />
             {paged && serverSearch ? (
-              <Tooltip title="Text of 3 characters or more is searched on the server across the whole list. It matches names that start with it, ignoring case. When the text is all hex digits, once dashes and a leading sbx_ are left out, it also matches IDs that end with them, from 4 digits (such as the ID column's label), and IDs that start with them, from 8 digits. Other text matches names only. Matches are at the start of a name or the start or end of an ID, never in the middle. Shorter text is matched as a case-sensitive name or ID prefix on the server and within this page. A full ID or pod name is looked up directly.">
+              <Tooltip title="Hex digits, once dashes and a leading sbx_ are left out, are searched on the server across the whole list as part of an ID: from 4 digits they match IDs that end with them, such as the ID column's label, and from 8 digits also IDs that start with them. They never match names, so a name made only of hex digits and dashes, such as e2e-1, is not found by its name. Other text is searched as a case-sensitive name or ID prefix on the server; fewer than 4 hex digits, such as e2e, are also matched anywhere in the IDs and names of this page. A full ID or pod name is looked up directly.">
                 <QuestionCircleOutlined aria-label="About the search" style={{ color: 'rgba(0, 0, 0, 0.45)' }} />
               </Tooltip>
             ) : paged ? (

@@ -167,22 +167,33 @@ test('a full identifier is a lookup on either list, and a sampled list matches a
   }
 });
 
-test('on a server that takes search, text of three characters or more is searched there', () => {
+test('on a server that takes search, ID digits are searched there and other text as without it', () => {
   const label = sandboxLabelOrId(sandbox.id);
-  for (const typed of [label, label.toUpperCase(), 'ae1d-72e0', 'e2e-1', 'Build-', 'BUILD cache', 'sbx_x1', 'abc', 'n'.repeat(300)]) {
+  // An ID's end from 4 digits, and its start from 8, behind sbx_ and with
+  // dashes or without. A name made only of hex digits and dashes is one too.
+  for (const typed of [label, label.toUpperCase(), '72e0', 'ae1d-72e0', 'e2e-1', 'cafe', 'sbx_2abc', '01a19089394a', '01a19089-394a', 'sbx_01a19089-394a-70', 'SBX_01A19089']) {
     assert.deepEqual(sandboxSearch(` ${typed} `, 'paged', true), { kind: 'search', text: typed }, typed);
   }
-  // ID starts go there too: the server matches the start of an ID's hex
-  // digits, behind sbx_ and with dashes or without.
-  for (const typed of ['01a19089394a', '01a19089-394a', 'sbx_01a19089-394a-70', 'SBX_01A19089']) {
-    assert.deepEqual(sandboxSearch(typed, 'paged', true), { kind: 'search', text: typed }, typed);
+  // Everything else is matched as on a server without search: a
+  // case-sensitive prefix, hex digits too few for an ID within the page as
+  // well, and text no name can start with within the page only.
+  for (const [typed, kind] of [
+    ['Build-', 'prefix'],
+    ['BUILD cache', 'prefix'],
+    ['loop-suspended', 'prefix'],
+    ['sbx_x1', 'prefix'],
+    ['sbx_2ab', 'prefix'],
+    ['abc', 'fragment'],
+    ['e2e', 'fragment'],
+    ['0a1g', 'prefix'],
+    ['f'.repeat(33), 'fragment'],
+    ['build\0', 'page'],
+    ['n'.repeat(300), 'page'],
+  ]) {
+    const searched = sandboxSearch(typed, 'paged', true);
+    assert.equal(searched.kind, kind, typed);
+    assert.deepEqual(searched, sandboxSearch(typed, 'paged'), typed);
   }
-  // The server refuses a NUL, which no name or ID holds.
-  assert.deepEqual(sandboxSearch('build\0', 'paged', true), { kind: 'search', text: 'build' });
-  // Shorter text is searched as before: the server refuses it.
-  assert.deepEqual(sandboxSearch(' xy ', 'paged', true), { kind: 'prefix', prefix: 'xy' });
-  assert.equal(sandboxSearch('e2', 'paged', true).kind, 'fragment');
-  assert.equal(sandboxSearch('a\0b', 'paged', true).kind, 'page');
   // A full identifier is still a lookup, and a sampled list still matches
   // within its rows: a server without paging has no search either.
   assert.equal(sandboxSearch(sandbox.id, 'paged', true).kind, 'ref');
