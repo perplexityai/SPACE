@@ -86,8 +86,8 @@ fn record_cleanup_registry_snapshot(
                 .as_secs_f64()
         })
         .fold(0.0, f64::max);
-    pplx_space_metrics::node_manager::cleanup_operation_in_flight(operations.len());
-    pplx_space_metrics::node_manager::cleanup_operation_oldest_claim_age_seconds(oldest_age);
+    crate::metrics::node_manager::cleanup_operation_in_flight(operations.len());
+    crate::metrics::node_manager::cleanup_operation_oldest_claim_age_seconds(oldest_age);
 }
 
 impl Drop for CleanupOperationClaim {
@@ -151,37 +151,38 @@ impl CleanupOperationRegistry {
                 if !*admission_open {
                     return Err(Status::unavailable("node manager is shutting down"));
                 }
-                (result, same_request, operation_owner) = match self.operations.entry(sandbox_id) {
-                    dashmap::mapref::entry::Entry::Occupied(entry) => {
-                        let in_flight = entry.get();
-                        (
-                            in_flight.result.clone(),
-                            in_flight.request == request,
-                            false,
-                        )
-                    }
-                    dashmap::mapref::entry::Entry::Vacant(entry) => {
-                        let (result_tx, result_rx) = tokio::sync::watch::channel(None);
-                        let started_at = Instant::now();
-                        entry.insert(InFlightCleanupOperation {
-                            request: request.clone(),
-                            result: result_rx.clone(),
-                            started_at,
-                        });
-                        record_cleanup_registry_snapshot(&self.operations);
-                        let claim = CleanupOperationClaim {
-                            operations: std::sync::Arc::clone(&self.operations),
-                            sandbox_id,
-                            armed: true,
-                        };
-                        let operation = operation
-                            .take()
-                            .expect("cleanup operation closure is consumed only by its own claim");
-                        let operations = std::sync::Arc::clone(&self.operations);
-                        // The owner's request span follows the operation, so
-                        // its cleanup events and calls stay in that request's
-                        // trace, as `run_owned_operation`'s work does.
-                        self.task_tracker.spawn(async move {
+                (result, same_request, operation_owner) =
+                    match self.operations.entry(sandbox_id) {
+                        dashmap::mapref::entry::Entry::Occupied(entry) => {
+                            let in_flight = entry.get();
+                            (
+                                in_flight.result.clone(),
+                                in_flight.request == request,
+                                false,
+                            )
+                        }
+                        dashmap::mapref::entry::Entry::Vacant(entry) => {
+                            let (result_tx, result_rx) = tokio::sync::watch::channel(None);
+                            let started_at = Instant::now();
+                            entry.insert(InFlightCleanupOperation {
+                                request: request.clone(),
+                                result: result_rx.clone(),
+                                started_at,
+                            });
+                            record_cleanup_registry_snapshot(&self.operations);
+                            let claim = CleanupOperationClaim {
+                                operations: std::sync::Arc::clone(&self.operations),
+                                sandbox_id,
+                                armed: true,
+                            };
+                            let operation = operation.take().expect(
+                                "cleanup operation closure is consumed only by its own claim",
+                            );
+                            let operations = std::sync::Arc::clone(&self.operations);
+                            // The owner's request span follows the operation, so
+                            // its cleanup events and calls stay in that request's
+                            // trace, as `run_owned_operation`'s work does.
+                            self.task_tracker.spawn(async move {
                             let operation = operation();
                             tokio::pin!(operation);
                             let mut warning = tokio::time::interval_at(
@@ -203,20 +204,20 @@ impl CleanupOperationRegistry {
                                 }
                             };
                             let outcome = if result.is_ok() {
-                                pplx_space_metrics::node_manager::CleanupOperationOutcome::Succeeded
+                                crate::metrics::node_manager::CleanupOperationOutcome::Succeeded
                             } else {
-                                pplx_space_metrics::node_manager::CleanupOperationOutcome::Failed
+                                crate::metrics::node_manager::CleanupOperationOutcome::Failed
                             };
-                            pplx_space_metrics::node_manager::cleanup_operation_finished(
+                            crate::metrics::node_manager::cleanup_operation_finished(
                                 outcome, started_at,
                             );
                             claim.complete(|| {
                                 result_tx.send_replace(Some(result));
                             });
                         }.in_current_span());
-                        (result_rx, true, true)
-                    }
-                };
+                            (result_rx, true, true)
+                        }
+                    };
             }
 
             let wait_started = Instant::now();
@@ -241,7 +242,7 @@ impl CleanupOperationRegistry {
                         tokio::time::timeout(self.waiter_timeout, wait_for_result)
                             .await
                             .map_err(|_| {
-                                pplx_space_metrics::node_manager::cleanup_operation_waiter_timed_out(wait_started);
+                                crate::metrics::node_manager::cleanup_operation_waiter_timed_out(wait_started);
                                 record_cleanup_registry_snapshot(&self.operations);
                                 Status::resource_exhausted(
                                     "sandbox cleanup is still in progress; retry later",
@@ -448,7 +449,7 @@ impl NodeManagerService {
                 .await
                 .inspect_err(|error| {
                     tracing::warn!(sandbox_id, %error, "runtime stop unconfirmed; preserving cleanup ownership and artifacts");
-                    pplx_space_metrics::sandbox::worker::runtime_stop_failed();
+                    crate::metrics::sandbox_worker::runtime_stop_failed();
                 })?,
         );
         tracing::debug!(

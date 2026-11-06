@@ -1,9 +1,9 @@
 use std::io;
 use std::time::Duration;
 
+use crate::metrics::DnsAttributionCacheObservationSource;
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
-use pplx_space_metrics::gateway::DnsAttributionCacheObservationSource;
 use pplx_space_net_common::NetworkPolicyV1;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_util::codec::LengthDelimitedCodec;
@@ -85,7 +85,7 @@ where
             .network_state
             .dns_allow_cache()
             .observe_response(&reply, admitted_policy);
-        pplx_space_metrics::gateway::dns_attribution_cache_observation(
+        crate::metrics::dns_attribution_cache_observation(
             DnsAttributionCacheObservationSource::ReservedDns,
             accepted,
         );

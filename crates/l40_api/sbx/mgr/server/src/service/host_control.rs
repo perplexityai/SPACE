@@ -85,7 +85,7 @@ impl SandboxManagerService {
             return Ok(Vec::new());
         }
 
-        let pull = pplx_space_metrics::reconcile::network_credential_pull();
+        let pull = crate::metrics::reconcile::network_credential_pull();
         let execution_generation = sandbox
             .space_api_route_identity
             .execution_generation
@@ -123,7 +123,7 @@ impl SandboxManagerService {
             },
         )
         .await?;
-        pull.finish(pplx_space_metrics::reconcile::NetworkCredentialPullOutcome::Success);
+        pull.finish(crate::metrics::reconcile::NetworkCredentialPullOutcome::Success);
         Ok(credentials)
     }
 

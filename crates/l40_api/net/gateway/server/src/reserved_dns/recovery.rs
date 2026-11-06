@@ -33,9 +33,8 @@ impl RecoveringResolver {
         let provider = LoggingConnectionProvider::new(runtime, resolver);
         let builder =
             Resolver::builder_with_config(config.clone(), provider.clone()).with_options(options);
-        let resolver =
-            pplx_space_metrics::gateway::with_reserved_dns_hickory_metrics(|| builder.build())
-                .map_err(BuildReservedDnsCoreError::Resolver)?;
+        let resolver = crate::metrics::with_reserved_dns_hickory_metrics(|| builder.build())
+            .map_err(BuildReservedDnsCoreError::Resolver)?;
         Ok(Self {
             config,
             provider,
@@ -75,9 +74,7 @@ impl RecoveringResolver {
                 let builder =
                     Resolver::builder_with_config(self.config.clone(), self.provider.clone())
                         .with_options(original.options().clone());
-                match pplx_space_metrics::gateway::with_reserved_dns_hickory_metrics(|| {
-                    builder.build()
-                }) {
+                match crate::metrics::with_reserved_dns_hickory_metrics(|| builder.build()) {
                     Ok(resolver) => state.resolver = Arc::new(resolver),
                     Err(error) => {
                         tracing::warn!(

@@ -8,7 +8,7 @@
 //! control characters, counts clamped
 //! and only a fixed number of entries read; nothing reaches a metric tag.
 
-use pplx_space_metrics::sandbox::vm::{VmDiagnosticLevel, VmDiagnosticOutcome, VmDiagnosticSource};
+use crate::metrics::sandbox::vm::{VmDiagnosticLevel, VmDiagnosticOutcome, VmDiagnosticSource};
 use pplx_space_spaced_common::proto::bridge_guest::{GuestDiagnosticCallsite, PingResponse};
 
 use super::sanitized;
@@ -100,7 +100,7 @@ pub(crate) fn forward_guest_diagnostics(
 
 fn emit(level: VmDiagnosticLevel, outcome: VmDiagnosticOutcome, count: u64) {
     if count > 0 {
-        pplx_space_metrics::sandbox::vm::vm_diagnostics(
+        crate::metrics::sandbox::vm::vm_diagnostics(
             VmDiagnosticSource::Guest,
             level,
             outcome,

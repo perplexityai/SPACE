@@ -285,7 +285,7 @@ impl NodeCredentialManager {
                 );
             }
         }
-        pplx_space_metrics::credmgr::agent_upstream_call(
+        crate::metrics::agent_upstream_call(
             method,
             outcome.result_tag(),
             result

@@ -488,7 +488,7 @@ async fn gc_tick(
             .zip(staging_lock.try_lock_owned().ok());
         let Some(guards) = guards else {
             report.skipped_not_ready += 1;
-            pplx_space_metrics::snapshot::gc_skipped("not_ready");
+            crate::metrics::snapshot::gc_skipped("not_ready");
             continue;
         };
         let Ok(writer) =
@@ -518,7 +518,7 @@ async fn gc_tick(
             Ok((EvictionOutcome::Deleted, staging_to_clean)) => {
                 report.deleted += 1;
                 report.bytes_freed = report.bytes_freed.saturating_add(candidate_size);
-                pplx_space_metrics::snapshot::gc_deleted(&origin, &kind);
+                crate::metrics::snapshot::gc_deleted(&origin, &kind);
                 // Clean up the staging directory via node-mgr.
                 // The RPC handles both btrfs subvolumes (created by
                 // node-mgr's `create_btrfs_snapshot` for d-*/f-*
@@ -549,7 +549,7 @@ async fn gc_tick(
                     EvictionOutcome::Deleted => unreachable!(),
                 }
                 if let Some(label) = skip.metric_label() {
-                    pplx_space_metrics::snapshot::gc_skipped(label);
+                    crate::metrics::snapshot::gc_skipped(label);
                 }
             }
             Err(err) => {
@@ -559,7 +559,7 @@ async fn gc_tick(
                     "snapshot reaper: candidate delete failed",
                 );
                 report.errors += 1;
-                pplx_space_metrics::snapshot::gc_skipped("error");
+                crate::metrics::snapshot::gc_skipped("error");
             }
         }
     }
@@ -867,7 +867,7 @@ pub(crate) async fn run_loop(
         let tick_started = Instant::now();
         let tick_result = match crate::disk_usage::read_cache_disk_usage() {
             Some(disk) => {
-                pplx_space_metrics::snapshot::gc_disk_usage_fraction(disk.fraction());
+                crate::metrics::snapshot::gc_disk_usage_fraction(disk.fraction());
                 // Cancellation stops candidate admission, not an already-owned
                 // blocking rename/commit. Its writer lease also survives panic
                 // or cancellation of this supervising future.
@@ -903,9 +903,9 @@ pub(crate) async fn run_loop(
                     bytes_freed = report.bytes_freed,
                     "snapshot reaper tick complete",
                 );
-                pplx_space_metrics::snapshot::gc_tick("ok", tick_started);
+                crate::metrics::snapshot::gc_tick("ok", tick_started);
                 if report.engaged {
-                    pplx_space_metrics::snapshot::gc_tick_work(
+                    crate::metrics::snapshot::gc_tick_work(
                         report.sampled_bytes_before,
                         report.bytes_freed,
                         report.candidates_planned as u64,
@@ -914,7 +914,7 @@ pub(crate) async fn run_loop(
             }
             Err(err) => {
                 warn!(error = %err, "snapshot reaper tick failed");
-                pplx_space_metrics::snapshot::gc_tick("error", tick_started);
+                crate::metrics::snapshot::gc_tick("error", tick_started);
             }
         }
 

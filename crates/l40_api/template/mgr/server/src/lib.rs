@@ -7,6 +7,7 @@ mod file_reader;
 pub use content_hash::TemplateHashConfigError;
 pub mod db;
 pub(crate) mod eviction;
+pub mod metrics;
 mod node_state_sync;
 pub mod pinned_digests;
 pub mod pool_manager;

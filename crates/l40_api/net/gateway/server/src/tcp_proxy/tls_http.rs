@@ -303,7 +303,7 @@ where
     }
 
     fn record(protocol: HttpProtocol, outcome: &'static str, status: StatusCode) {
-        pplx_space_metrics::gateway::domain_binding("tcp", "tls_http", outcome, None);
+        crate::metrics::domain_binding("tcp", "tls_http", outcome, None);
         tracing::debug!(
             protocol = protocol.as_str(),
             outcome,

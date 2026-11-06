@@ -816,7 +816,7 @@ impl NodeManagerService {
             && resolved_execution.runtime_files.integrity() == ExecutionSourceIntegrity::FsVerity
         {
             warn_legacy_execution(sandbox_id);
-            pplx_space_metrics::node_manager::legacy_execution_source_launch();
+            crate::metrics::node_manager::legacy_execution_source_launch();
         }
 
         Ok(Response::new(LaunchSandboxResponse {

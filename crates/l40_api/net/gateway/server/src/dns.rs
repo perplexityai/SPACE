@@ -3,11 +3,11 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use arc_swap::ArcSwap;
-use pplx_space_metrics::gateway::{
+use crate::metrics::{
     DnsAttributionCacheEvictionReason, DnsAttributionCacheLookupKind,
     DnsAttributionCacheUpdateResult,
 };
+use arc_swap::ArcSwap;
 use pplx_space_net_common::NetworkPolicyV1;
 use tracing::debug;
 
@@ -60,10 +60,7 @@ impl DnsAllowCache {
                     && entry_still_relevant(policy, ip, entry.domain.as_str())
             })
         });
-        pplx_space_metrics::gateway::dns_attribution_cache_lookup(
-            DnsAttributionCacheLookupKind::IpAllow,
-            hit,
-        );
+        crate::metrics::dns_attribution_cache_lookup(DnsAttributionCacheLookupKind::IpAllow, hit);
         hit
     }
 
@@ -80,7 +77,7 @@ impl DnsAllowCache {
                 .iter()
                 .any(|entry| entry.expires_at > now && entry.domain.eq_ignore_ascii_case(host))
         });
-        pplx_space_metrics::gateway::dns_attribution_cache_lookup(
+        crate::metrics::dns_attribution_cache_lookup(
             DnsAttributionCacheLookupKind::HostBinding,
             hit,
         );
@@ -103,11 +100,11 @@ impl DnsAllowCache {
         if after != before {
             self.inner.store(Arc::new(inner));
         }
-        pplx_space_metrics::gateway::dns_attribution_cache_eviction(
+        crate::metrics::dns_attribution_cache_eviction(
             DnsAttributionCacheEvictionReason::Expired,
             before - after,
         );
-        pplx_space_metrics::gateway::dns_attribution_cache_entries(after);
+        crate::metrics::dns_attribution_cache_entries(after);
     }
 
     /// Drop entries the freshly installed `policy` no longer justifies.
@@ -138,15 +135,15 @@ impl DnsAllowCache {
         if expired + policy_pruned > 0 {
             self.inner.store(Arc::new(inner));
         }
-        pplx_space_metrics::gateway::dns_attribution_cache_eviction(
+        crate::metrics::dns_attribution_cache_eviction(
             DnsAttributionCacheEvictionReason::Expired,
             expired,
         );
-        pplx_space_metrics::gateway::dns_attribution_cache_eviction(
+        crate::metrics::dns_attribution_cache_eviction(
             DnsAttributionCacheEvictionReason::Policy,
             policy_pruned,
         );
-        pplx_space_metrics::gateway::dns_attribution_cache_entries(entries);
+        crate::metrics::dns_attribution_cache_entries(entries);
     }
 
     /// Returns whether the response supplied cacheable attribution evidence.
@@ -246,27 +243,27 @@ impl DnsAllowCache {
         let global_capacity_evicted = trim_global_cache(&mut inner);
         let entries = total_entries(&inner);
         self.inner.store(Arc::new(inner));
-        pplx_space_metrics::gateway::dns_attribution_cache_eviction(
+        crate::metrics::dns_attribution_cache_eviction(
             DnsAttributionCacheEvictionReason::Expired,
             expired,
         );
-        pplx_space_metrics::gateway::dns_attribution_cache_update(
+        crate::metrics::dns_attribution_cache_update(
             DnsAttributionCacheUpdateResult::Insert,
             inserted,
         );
-        pplx_space_metrics::gateway::dns_attribution_cache_update(
+        crate::metrics::dns_attribution_cache_update(
             DnsAttributionCacheUpdateResult::Refresh,
             refreshed,
         );
-        pplx_space_metrics::gateway::dns_attribution_cache_eviction(
+        crate::metrics::dns_attribution_cache_eviction(
             DnsAttributionCacheEvictionReason::PerIpCapacity,
             per_ip_capacity_evicted,
         );
-        pplx_space_metrics::gateway::dns_attribution_cache_eviction(
+        crate::metrics::dns_attribution_cache_eviction(
             DnsAttributionCacheEvictionReason::GlobalCapacity,
             global_capacity_evicted,
         );
-        pplx_space_metrics::gateway::dns_attribution_cache_entries(entries);
+        crate::metrics::dns_attribution_cache_entries(entries);
         true
     }
 }

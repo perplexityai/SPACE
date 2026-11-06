@@ -5,11 +5,9 @@
 use std::io;
 use std::time::Duration;
 
+use crate::metrics::{StreamPushPhase, stream_push_payload, stream_push_producer};
 use object_store::{
     StreamingUpload, StreamingUploadError, StreamingUploadOptions, UploadBufferBudget, UploadSource,
-};
-use pplx_space_metrics::volume_manager::{
-    StreamPushPhase, stream_push_payload, stream_push_producer,
 };
 use pplx_space_object_store as object_store;
 use tokio::io::AsyncWrite;

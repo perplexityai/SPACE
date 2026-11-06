@@ -10,12 +10,12 @@ use super::{
     RecoveryPassProbe, RecoveryPassWindow, SandboxManagerService,
     quarantine_recovery_no_progress_reason,
 };
+use crate::metrics::sandbox::worker::{
+    QuarantineRecoveryAttemptOutcome, QuarantineRecoveryOutcome,
+};
 use pplx_space_common_core::types::SandboxId;
 use pplx_space_events::{
     SandboxEvent, SandboxEventDetails, SandboxEventSource, SandboxEventTrigger, SandboxEventType,
-};
-use pplx_space_metrics::sandbox::worker::{
-    QuarantineRecoveryAttemptOutcome, QuarantineRecoveryOutcome,
 };
 
 /// Which of the pass's two recoveries a claimed candidate was admitted for, and
@@ -110,7 +110,7 @@ impl SandboxManagerService {
             let Err(error) = task.await else {
                 return;
             };
-            pplx_space_metrics::sandbox::worker::quarantine_recovery_no_progress(
+            crate::metrics::sandbox::worker::quarantine_recovery_no_progress(
                 crate::db::QuarantineRecoveryNoProgressReason::OrphanRestoreTaskFailed,
                 QuarantineRecoveryAttemptOutcome::BackgroundTaskFailed,
             );
@@ -169,7 +169,7 @@ impl SandboxManagerService {
                     snapshot_id = %plan.snapshot_id,
                     "recovered orphaned restore staging to suspended"
                 );
-                pplx_space_metrics::sandbox::worker::quarantine_recovery_succeeded(
+                crate::metrics::sandbox::worker::quarantine_recovery_succeeded(
                     QuarantineRecoveryOutcome::OrphanRestored,
                 );
             }

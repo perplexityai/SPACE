@@ -1,0 +1,17 @@
+[package]
+name = "pplx-space-sandbox-metrics"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# internal
+pplx-space-k8s-ids = { workspace = true }
+pplx-space-metrics-emit = { workspace = true }
+pplx-space-observability = { workspace = true, default-features = false }

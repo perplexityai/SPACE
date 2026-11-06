@@ -2189,9 +2189,7 @@ impl TransferExecutor {
             ))),
             Ok(meta) => {
                 let wire_size = meta.len();
-                use pplx_space_metrics::volume_manager::{
-                    PushPayloadEncoding, PushPayloadPhase, push_payload,
-                };
+                use crate::metrics::{PushPayloadEncoding, PushPayloadPhase, push_payload};
                 let artifact = transfer_artifact_tag(p.effective_snapshot_artifact());
                 let encoding = match (self.config.compress, p.encryption.is_some()) {
                     (false, false) => PushPayloadEncoding::Raw,

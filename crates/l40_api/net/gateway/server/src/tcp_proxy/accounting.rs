@@ -85,24 +85,19 @@ impl Attempt {
     fn record(&self, outcome: Outcome, reason: &'static str) {
         match self.boundary {
             Boundary::InspectionAdmission => {
-                pplx_space_metrics::gateway::inspection_admission(outcome.as_str(), reason);
+                crate::metrics::inspection_admission(outcome.as_str(), reason);
             }
             Boundary::HttpAuthorization { protocol } => {
-                pplx_space_metrics::gateway::http_authorization(protocol, outcome.as_str(), reason);
+                crate::metrics::http_authorization(protocol, outcome.as_str(), reason);
             }
             Boundary::OriginTcp => {
-                pplx_space_metrics::gateway::origin_tcp_connect(outcome.as_str(), reason);
+                crate::metrics::origin_tcp_connect(outcome.as_str(), reason);
             }
             Boundary::Forwarding {
                 protocol,
                 operation,
             } => {
-                pplx_space_metrics::gateway::forwarding(
-                    protocol,
-                    operation,
-                    outcome.as_str(),
-                    reason,
-                );
+                crate::metrics::forwarding(protocol, operation, outcome.as_str(), reason);
             }
         }
     }

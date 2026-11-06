@@ -171,7 +171,7 @@ impl HandshakeAdmission {
             Ok(Ok(permit)) => Ok(self.issue(leg, permit, Admission::Queued { waited })),
             Ok(Err(_closed)) => Err(self.refuse(leg, Refused::Closed)),
             Err(_elapsed) => {
-                pplx_space_metrics::gateway::tls_handshake_admission_wait_ms(
+                crate::metrics::tls_handshake_admission_wait_ms(
                     leg.as_str(),
                     "saturated",
                     millis(waited),
@@ -182,7 +182,7 @@ impl HandshakeAdmission {
     }
 
     fn refuse(&self, leg: TlsHandshakeLeg, refused: Refused) -> Refused {
-        pplx_space_metrics::gateway::tls_handshake_admission(leg.as_str(), refused.as_str());
+        crate::metrics::tls_handshake_admission(leg.as_str(), refused.as_str());
         self.pool.record_in_flight(leg);
         refused
     }
@@ -194,9 +194,9 @@ impl HandshakeAdmission {
         admission: Admission,
     ) -> HandshakePermit {
         self.pool.active.get(leg).fetch_add(1, Ordering::Relaxed);
-        pplx_space_metrics::gateway::tls_handshake_admission(leg.as_str(), admission.as_str());
+        crate::metrics::tls_handshake_admission(leg.as_str(), admission.as_str());
         if let Admission::Queued { waited } = admission {
-            pplx_space_metrics::gateway::tls_handshake_admission_wait_ms(
+            crate::metrics::tls_handshake_admission_wait_ms(
                 leg.as_str(),
                 admission.as_str(),
                 millis(waited),
@@ -223,12 +223,8 @@ impl Refused {
 
 impl Pool {
     fn record_in_flight(&self, leg: TlsHandshakeLeg) {
-        pplx_space_metrics::gateway::tls_handshake_in_flight(
-            "shared",
-            self.active.total(),
-            self.limit,
-        );
-        pplx_space_metrics::gateway::tls_handshake_in_flight(
+        crate::metrics::tls_handshake_in_flight("shared", self.active.total(), self.limit);
+        crate::metrics::tls_handshake_in_flight(
             leg.as_str(),
             self.active.get(leg).load(Ordering::Relaxed),
             self.limit,
@@ -236,7 +232,7 @@ impl Pool {
     }
 
     fn record_queued(&self, leg: TlsHandshakeLeg) {
-        pplx_space_metrics::gateway::tls_handshake_queued(
+        crate::metrics::tls_handshake_queued(
             leg.as_str(),
             self.queued.get(leg).load(Ordering::Relaxed),
             self.limit,

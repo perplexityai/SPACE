@@ -467,7 +467,7 @@ async fn identity_fence_aborts_an_idle_stream() {
     let stream: BoxedStatusStream<()> = Box::pin(futures_util::stream::pending());
     let mut fenced = fence_status_stream(stream, fence.child());
 
-    fence.cancel(pplx_space_metrics::sandbox::worker::RouteStreamCloseReason::IdentityChanged);
+    fence.cancel(crate::metrics::sandbox::worker::RouteStreamCloseReason::IdentityChanged);
 
     let error = fenced
         .next()
@@ -485,7 +485,7 @@ async fn identity_fence_already_cancelled_beats_ready_upstream_eof() {
     for _ in 0..32 {
         let fence = RouteStreamFence::new();
         let child = fence.child();
-        fence.cancel(pplx_space_metrics::sandbox::worker::RouteStreamCloseReason::IdentityChanged);
+        fence.cancel(crate::metrics::sandbox::worker::RouteStreamCloseReason::IdentityChanged);
         let stream: BoxedStatusStream<()> = Box::pin(futures_util::stream::empty());
         let mut response = fence_status_stream(stream, child);
 
@@ -512,7 +512,7 @@ async fn identity_fence_releases_admission_while_response_is_backpressured() {
 
     // Let forwarding fill its bounded response channel and park on send.
     tokio::time::sleep(Duration::from_millis(10)).await;
-    fence.cancel(pplx_space_metrics::sandbox::worker::RouteStreamCloseReason::IdentityChanged);
+    fence.cancel(crate::metrics::sandbox::worker::RouteStreamCloseReason::IdentityChanged);
 
     let _replacement_admission =
         tokio::time::timeout(Duration::from_secs(1), slots.clone().acquire_owned())
@@ -595,7 +595,7 @@ async fn late_identity_change_does_not_replace_completed_stream_outcome() {
         0,
         "buffered output retains admission"
     );
-    fence.cancel(pplx_space_metrics::sandbox::worker::RouteStreamCloseReason::IdentityChanged);
+    fence.cancel(crate::metrics::sandbox::worker::RouteStreamCloseReason::IdentityChanged);
 
     assert_eq!(response.next().await.expect("data item").unwrap(), 7);
     assert!(response.next().await.is_none());
@@ -629,7 +629,7 @@ async fn late_identity_change_does_not_replace_upstream_error() {
         0,
         "buffered output retains admission"
     );
-    fence.cancel(pplx_space_metrics::sandbox::worker::RouteStreamCloseReason::IdentityChanged);
+    fence.cancel(crate::metrics::sandbox::worker::RouteStreamCloseReason::IdentityChanged);
 
     assert_eq!(response.next().await.expect("data item").unwrap(), 7);
     let error = response

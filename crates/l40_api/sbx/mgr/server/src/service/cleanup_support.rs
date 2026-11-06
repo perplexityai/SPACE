@@ -477,14 +477,14 @@ impl CleanupMetrics {
             .waiting
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
             + 1;
-        pplx_space_metrics::sandbox::worker::cleanup_queue_depth(v);
+        crate::metrics::sandbox::worker::cleanup_queue_depth(v);
     }
 
     pub(super) fn waiting_dec(&self) {
         let prev = self
             .waiting
             .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-        pplx_space_metrics::sandbox::worker::cleanup_queue_depth(prev.saturating_sub(1));
+        crate::metrics::sandbox::worker::cleanup_queue_depth(prev.saturating_sub(1));
     }
 
     pub(super) fn in_flight_inc(&self) {
@@ -492,14 +492,14 @@ impl CleanupMetrics {
             .in_flight
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
             + 1;
-        pplx_space_metrics::sandbox::worker::cleanup_active(v);
+        crate::metrics::sandbox::worker::cleanup_active(v);
     }
 
     pub(super) fn in_flight_dec(&self) {
         let prev = self
             .in_flight
             .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-        pplx_space_metrics::sandbox::worker::cleanup_active(prev.saturating_sub(1));
+        crate::metrics::sandbox::worker::cleanup_active(prev.saturating_sub(1));
     }
 
     #[cfg(test)]

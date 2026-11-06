@@ -36,12 +36,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
+use crate::metrics::sandbox::worker::{SandboxHealthEvidenceOutcome, SandboxRawVsockCheckOutcome};
 use pplx_space_common_core::host::linux::paths;
 use pplx_space_events::{
     SandboxEventDetails, SandboxEventSource, SandboxEventType, emit_sandbox_event,
-};
-use pplx_space_metrics::sandbox::worker::{
-    SandboxHealthEvidenceOutcome, SandboxRawVsockCheckOutcome,
 };
 use pplx_space_spaced_common::ExpectedUdsPeer;
 use tokio::sync::{Mutex, Semaphore};
@@ -443,7 +441,7 @@ pub(super) fn report_transition(queue: &EvidenceQueue, transition: &HealthTransi
             Admission::Dropped => Some(SandboxHealthEvidenceOutcome::Dropped),
         };
         if let Some(outcome) = outcome {
-            pplx_space_metrics::sandbox::worker::sandbox_health_evidence_report(outcome);
+            crate::metrics::sandbox::worker::sandbox_health_evidence_report(outcome);
         }
         admission
     });
@@ -926,7 +924,7 @@ impl TransitionEvidence {
                 detail: "v.sock path is absent".to_string(),
             },
         };
-        pplx_space_metrics::sandbox::worker::sandbox_health_raw_vsock_check(
+        crate::metrics::sandbox::worker::sandbox_health_raw_vsock_check(
             raw_vsock.outcome.as_metric(),
         );
         self.raw_vsock = Some(raw_vsock);
@@ -1030,13 +1028,11 @@ pub(super) async fn run_evidence_collector(
             ) => evidence,
         };
         evidence.emit(&request, queued);
-        pplx_space_metrics::sandbox::worker::sandbox_health_evidence_report(
-            if evidence.is_partial() {
-                SandboxHealthEvidenceOutcome::Partial
-            } else {
-                SandboxHealthEvidenceOutcome::Complete
-            },
-        );
+        crate::metrics::sandbox::worker::sandbox_health_evidence_report(if evidence.is_partial() {
+            SandboxHealthEvidenceOutcome::Partial
+        } else {
+            SandboxHealthEvidenceOutcome::Complete
+        });
     }
 }
 

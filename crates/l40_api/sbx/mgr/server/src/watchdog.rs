@@ -21,10 +21,10 @@ use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
-use pplx_space_common_core::types::{LinuxPid, SandboxId, SemVer};
-use pplx_space_metrics::sandbox::worker::{
+use crate::metrics::sandbox::worker::{
     NetGatewayRouteVerificationStatus, NetGatewayTlsInterceptionMode,
 };
+use pplx_space_common_core::types::{LinuxPid, SandboxId, SemVer};
 use pplx_space_node_runtime_core::vm_state::VmState;
 
 use crate::auto_lifecycle::AutoLifecycleCoordinator;
@@ -603,16 +603,14 @@ impl ComposedHealthStatus {
         }
     }
 
-    fn as_metric(self) -> pplx_space_metrics::sandbox::worker::SandboxHealthStatus {
+    fn as_metric(self) -> crate::metrics::sandbox::worker::SandboxHealthStatus {
         match self {
-            Self::Unspecified => {
-                pplx_space_metrics::sandbox::worker::SandboxHealthStatus::Unspecified
-            }
+            Self::Unspecified => crate::metrics::sandbox::worker::SandboxHealthStatus::Unspecified,
             Self::Initializing => {
-                pplx_space_metrics::sandbox::worker::SandboxHealthStatus::Initializing
+                crate::metrics::sandbox::worker::SandboxHealthStatus::Initializing
             }
-            Self::Healthy => pplx_space_metrics::sandbox::worker::SandboxHealthStatus::Healthy,
-            Self::Degraded => pplx_space_metrics::sandbox::worker::SandboxHealthStatus::Degraded,
+            Self::Healthy => crate::metrics::sandbox::worker::SandboxHealthStatus::Healthy,
+            Self::Degraded => crate::metrics::sandbox::worker::SandboxHealthStatus::Degraded,
         }
     }
 }
@@ -642,20 +640,16 @@ impl HealthComponent {
         }
     }
 
-    fn as_metric(self) -> pplx_space_metrics::sandbox::worker::SandboxHealthComponent {
+    fn as_metric(self) -> crate::metrics::sandbox::worker::SandboxHealthComponent {
         match self {
             Self::Firecracker => {
-                pplx_space_metrics::sandbox::worker::SandboxHealthComponent::Firecracker
+                crate::metrics::sandbox::worker::SandboxHealthComponent::Firecracker
             }
-            Self::SpacedHost => {
-                pplx_space_metrics::sandbox::worker::SandboxHealthComponent::SpacedHost
-            }
+            Self::SpacedHost => crate::metrics::sandbox::worker::SandboxHealthComponent::SpacedHost,
             Self::SpacedGuest => {
-                pplx_space_metrics::sandbox::worker::SandboxHealthComponent::SpacedGuest
+                crate::metrics::sandbox::worker::SandboxHealthComponent::SpacedGuest
             }
-            Self::NetGateway => {
-                pplx_space_metrics::sandbox::worker::SandboxHealthComponent::NetGateway
-            }
+            Self::NetGateway => crate::metrics::sandbox::worker::SandboxHealthComponent::NetGateway,
         }
     }
 }
@@ -686,22 +680,18 @@ impl HealthProbeOutcome {
         }
     }
 
-    fn as_metric(self) -> pplx_space_metrics::sandbox::worker::SandboxHealthProbeOutcome {
+    fn as_metric(self) -> crate::metrics::sandbox::worker::SandboxHealthProbeOutcome {
         match self {
-            Self::Success => {
-                pplx_space_metrics::sandbox::worker::SandboxHealthProbeOutcome::Success
-            }
-            Self::Timeout => {
-                pplx_space_metrics::sandbox::worker::SandboxHealthProbeOutcome::Timeout
-            }
+            Self::Success => crate::metrics::sandbox::worker::SandboxHealthProbeOutcome::Success,
+            Self::Timeout => crate::metrics::sandbox::worker::SandboxHealthProbeOutcome::Timeout,
             Self::Unavailable => {
-                pplx_space_metrics::sandbox::worker::SandboxHealthProbeOutcome::Unavailable
+                crate::metrics::sandbox::worker::SandboxHealthProbeOutcome::Unavailable
             }
             Self::UnexpectedState => {
-                pplx_space_metrics::sandbox::worker::SandboxHealthProbeOutcome::UnexpectedState
+                crate::metrics::sandbox::worker::SandboxHealthProbeOutcome::UnexpectedState
             }
             Self::NotApplicable => {
-                pplx_space_metrics::sandbox::worker::SandboxHealthProbeOutcome::NotApplicable
+                crate::metrics::sandbox::worker::SandboxHealthProbeOutcome::NotApplicable
             }
         }
     }
@@ -1550,7 +1540,7 @@ async fn sidecar_loop(
             drain_net_gateway_stats_probe(&mut net_gateway_stats_pending).await;
         }
 
-        pplx_space_metrics::sandbox::worker::sandbox_health_node_lease_missing(
+        crate::metrics::sandbox::worker::sandbox_health_node_lease_missing(
             node_lease_missing_count(&*state.lock().await),
         );
         let guest_health_rows = load_guest_health_rows(&db);
@@ -1859,7 +1849,7 @@ async fn finish_sidecar_restart(
 }
 
 fn emit_auto_lifecycle_delete_gauges(db: &crate::db::SharedConnection) {
-    use pplx_space_metrics::sandbox::worker::AutoLifecycleDeleteOutboxState;
+    use crate::metrics::sandbox::worker::AutoLifecycleDeleteOutboxState;
 
     let (outbox, blocked) = {
         let db = match db.lock() {
@@ -1886,23 +1876,23 @@ fn emit_auto_lifecycle_delete_gauges(db: &crate::db::SharedConnection) {
         (outbox, blocked)
     };
 
-    pplx_space_metrics::sandbox::worker::auto_lifecycle_delete_outbox_depth(
+    crate::metrics::sandbox::worker::auto_lifecycle_delete_outbox_depth(
         outbox.pending_count,
         AutoLifecycleDeleteOutboxState::Pending,
     );
-    pplx_space_metrics::sandbox::worker::auto_lifecycle_delete_outbox_depth(
+    crate::metrics::sandbox::worker::auto_lifecycle_delete_outbox_depth(
         outbox.completed_count,
         AutoLifecycleDeleteOutboxState::Completed,
     );
-    pplx_space_metrics::sandbox::worker::auto_lifecycle_delete_outbox_oldest_age_secs(
+    crate::metrics::sandbox::worker::auto_lifecycle_delete_outbox_oldest_age_secs(
         outbox.oldest_pending_age_secs,
         AutoLifecycleDeleteOutboxState::Pending,
     );
-    pplx_space_metrics::sandbox::worker::auto_lifecycle_delete_outbox_oldest_age_secs(
+    crate::metrics::sandbox::worker::auto_lifecycle_delete_outbox_oldest_age_secs(
         outbox.oldest_completed_age_secs,
         AutoLifecycleDeleteOutboxState::Completed,
     );
-    pplx_space_metrics::sandbox::worker::auto_lifecycle_delete_outbox_max_attempt_count(
+    crate::metrics::sandbox::worker::auto_lifecycle_delete_outbox_max_attempt_count(
         outbox.max_attempt_count,
     );
     for reason in crate::auto_lifecycle_delete_receipts::AutoLifecycleDeleteBlockReason::ALL {
@@ -1947,11 +1937,7 @@ async fn emit_health_gauges(
         guest_health_gauge_counts(rows, &health_snapshot, guest_health_probe_from_processes);
     let composed_counts = composed_health_gauge_counts(rows, &health_snapshot);
     for value in guest_health_gauge_values(&guest_counts) {
-        pplx_space_metrics::sandbox::worker::guest_health(
-            value.count,
-            value.lifecycle,
-            value.health,
-        );
+        crate::metrics::sandbox::worker::guest_health(value.count, value.lifecycle, value.health);
     }
     for lifecycle in COMPOSED_HEALTH_LIFECYCLES {
         for status in [
@@ -1960,7 +1946,7 @@ async fn emit_health_gauges(
             ComposedHealthStatus::Healthy,
             ComposedHealthStatus::Degraded,
         ] {
-            pplx_space_metrics::sandbox::worker::sandbox_health_status(
+            crate::metrics::sandbox::worker::sandbox_health_status(
                 composed_counts
                     .get(&(lifecycle.as_str(), status))
                     .copied()
@@ -2030,7 +2016,7 @@ async fn emit_net_gateway_live_gauges(
     };
     published.extend(live_counts.keys().cloned());
     for bucket in published.iter() {
-        pplx_space_metrics::sandbox::worker::net_gateway_live(
+        crate::metrics::sandbox::worker::net_gateway_live(
             live_counts.get(bucket).copied().unwrap_or(0),
             &bucket.0,
             bucket.1.as_str(),
@@ -2064,7 +2050,7 @@ fn net_gateway_live_counts<'health>(
             .netgtw_git_sha
             .as_deref()
             .filter(|sha| !sha.is_empty())
-            .unwrap_or(pplx_space_metrics::sandbox::worker::NET_GATEWAY_SHA_UNKNOWN);
+            .unwrap_or(crate::metrics::sandbox::worker::NET_GATEWAY_SHA_UNKNOWN);
         *counts
             .entry((gateway_sha.to_string(), lifecycle))
             .or_default() += 1;
@@ -2073,7 +2059,7 @@ fn net_gateway_live_counts<'health>(
 }
 
 fn emit_net_gateway_inventory_gauge(value: usize, bucket: &NetGatewayInventoryBucket) {
-    pplx_space_metrics::sandbox::worker::net_gateway_inventory(
+    crate::metrics::sandbox::worker::net_gateway_inventory(
         value,
         bucket.tls_interception_mode,
         &bucket.gateway_sha,
@@ -2096,11 +2082,11 @@ fn net_gateway_inventory_counts<'health, 'row>(
             .netgtw_git_sha
             .as_deref()
             .filter(|sha| !sha.is_empty())
-            .unwrap_or(pplx_space_metrics::sandbox::worker::NET_GATEWAY_SHA_UNKNOWN);
+            .unwrap_or(crate::metrics::sandbox::worker::NET_GATEWAY_SHA_UNKNOWN);
         let template_content_hash = row
             .and_then(|row| row.template_content_hash.as_deref())
             .filter(|hash| !hash.is_empty())
-            .unwrap_or(pplx_space_metrics::sandbox::worker::NET_GATEWAY_INVENTORY_UNKNOWN);
+            .unwrap_or(crate::metrics::sandbox::worker::NET_GATEWAY_INVENTORY_UNKNOWN);
         let lifecycle = row.map_or(NetGatewayLifecycle::Unknown, |row| {
             NetGatewayLifecycle::Known(row.state)
         });
@@ -2188,7 +2174,7 @@ async fn emit_net_gateway_route_verification_gauges(
         NetGatewayRouteVerificationStatus::Unsupported,
         NetGatewayRouteVerificationStatus::Unknown,
     ] {
-        pplx_space_metrics::sandbox::worker::net_gateway_route_verification(
+        crate::metrics::sandbox::worker::net_gateway_route_verification(
             counts.get(&status).copied().unwrap_or_default(),
             status,
         );
@@ -3004,7 +2990,7 @@ async fn apply_composed_health_result(
             ));
         }
         let outcome = observation.outcome;
-        pplx_space_metrics::sandbox::worker::sandbox_health_probe(
+        crate::metrics::sandbox::worker::sandbox_health_probe(
             component.as_metric(),
             outcome.as_metric(),
             observation.latency_micros,
@@ -3038,7 +3024,7 @@ async fn apply_composed_health_result(
     }
     health.health_status = classify_composed_health(health, lifecycle);
     if health.health_status != previous_status {
-        pplx_space_metrics::sandbox::worker::sandbox_health_transition(
+        crate::metrics::sandbox::worker::sandbox_health_transition(
             health.health_status.as_metric(),
         );
     }

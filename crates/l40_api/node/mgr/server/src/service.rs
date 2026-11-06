@@ -315,7 +315,7 @@ impl NodeManagerService {
     ) -> Result<Response<pplx_space_execution_common::proto::NodeExecutionInventory>, Status> {
         self.authorize_peer(&request, "GetExecutionInventory", ALLOW_NODE_STATUS)?;
         // Before discovery, so a node that can't report inventory still reports this.
-        pplx_space_metrics::node_manager::execution_policy_record_unreadable(
+        crate::metrics::node_manager::execution_policy_record_unreadable(
             self.execution_policy().cluster_policy_unreadable(),
         );
         let inventory = self.runtime_inventory().await?;

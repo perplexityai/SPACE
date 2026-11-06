@@ -39,7 +39,7 @@ impl NodeManagerService {
             .await?;
         let source = intent.source();
         if source.environment() != Some(definition.reference()) {
-            pplx_space_metrics::node_manager::execution_consumer_fallback();
+            crate::metrics::node_manager::execution_consumer_fallback();
             tracing::warn!(
                 source_environment = ?source.environment(),
                 consumer_environment = %definition.reference(),
