@@ -476,7 +476,7 @@ mod template_release_resolution_postgres_tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn missing_explicit_tag_falls_back_to_latest() -> TestResult {
+    async fn missing_explicit_tag_does_not_resolve_latest() -> TestResult {
         let db = pg_test_db().await?;
         let release_id = Uuid::now_v7();
         let content_hash =
@@ -503,11 +503,23 @@ mod template_release_resolution_postgres_tests {
 
         insert_release_with_latest_tag(&db.pool, "custom-template", release_id, content_hash, None)
             .await?;
-        for reference in [
-            "custom-template:v123",
-            "custom-template:latest",
-            "custom-template",
-        ] {
+        let error = resolve_template_release(
+            &db.pool,
+            &missing,
+            RuntimeKind::Firecracker,
+            caller_org,
+            ReleaseMissReport::Classified,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.status(), axum::http::StatusCode::NOT_FOUND);
+        assert_eq!(
+            error.template_release_miss(),
+            Some(TemplateReleaseMiss::NoMatchingRelease),
+            "{error}"
+        );
+        assert!(error.to_string().contains("tag 'v123'"), "{error}");
+        for reference in ["custom-template:latest", "custom-template"] {
             let template = reference.parse::<TemplateReference>()?;
 
             let resolved = resolve_template_release(
@@ -1139,8 +1151,8 @@ mod template_release_resolution_postgres_tests {
         Ok(())
     }
 
-    /// Characterization of sandbox-create release resolution (tag with
-    /// `latest` fallback, digest stored as given or with `sha256:` stripped)
+    /// Characterization of sandbox-create release resolution (exact tag,
+    /// digest stored as given or with `sha256:` stripped)
     /// over the shared resolver world. A bare-hex request cannot reach this
     /// resolver: `TemplateReference` rejects `name@<hex>` without an algorithm.
     #[tokio::test(flavor = "current_thread")]
@@ -1212,15 +1224,8 @@ mod template_release_resolution_postgres_tests {
                 OTHER,
                 hit(w.bare, hex('a')),
             ),
-            // Unknown tag falls back to `latest`; build base does not. Pinned as
-            // today's behaviour, not a contract: consolidating the resolvers is
-            // expected to answer not found instead of falling back silently.
-            (
-                "resolver-fixture:missing".into(),
-                fc,
-                OTHER,
-                hit(w.latest_holder, sha('d')),
-            ),
+            // An unknown tag is not found, as it is for a build base.
+            ("resolver-fixture:missing".into(), fc, OTHER, None),
             ("resolver-fixture:latest".into(), ch, OTHER, None),
             ("resolver-fixture:missing".into(), ch, OTHER, None),
             (format!("resolver-fixture@{}", sha('b')), ch, OTHER, None),
