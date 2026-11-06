@@ -1,8 +1,16 @@
 """Reject invalid resources and command inputs before admitting their work."""
 import json
+from collections.abc import Mapping
 
 from space_smoke.native_hardening import NativeHardeningFixture
 from space_smoke.registry import scenario
+
+
+
+def _media_type(headers: Mapping[str, str]) -> str:
+    value = next((value for name, value in headers.items()
+                  if name.lower() == "content-type"), "")
+    return value.split(";", 1)[0].strip().lower()
 
 
 @scenario("native_contract.command_validation", api_surfaces=("native",))
@@ -72,8 +80,17 @@ def command_validation(test: NativeHardeningFixture) -> None:
     streamed = test.request("POST", f"/v1/sandboxes/{sid}/commands", body=reads_stdin,
                             idempotency_key=test.new_key("stream_stdin"),
                             accept="text/event-stream", timeout=30)
-    frames = [json.loads(line[5:]) for line in streamed.text.splitlines()
-              if line.startswith("data:")]
+    # An API with no data-plane relay answers with the JSON handle instead,
+    # and the command starts when the client attaches to its events stream.
+    relayed = _media_type(streamed.headers) == "text/event-stream"
+    test.context.record("streamed_relayed", relayed)
+    if relayed:
+        frames = [json.loads(line[5:]) for line in streamed.text.splitlines()
+                  if line.startswith("data:")]
+    elif streamed.status == 201:
+        frames = [event.data for event in test.events(streamed.body, timeout=30).events]
+    else:
+        frames = []
     streamed_exits = [frame.get("exit_code") for frame in frames
                       if frame.get("type") == "process_exited"]
     created = test.request("POST", f"/v1/sandboxes/{sid}/commands", body=reads_stdin,
