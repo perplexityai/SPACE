@@ -218,6 +218,8 @@ fn validate_unverified_space_api_route_ed25519_claims(
 
 pub(super) struct BackendChannelPool {
     pub(super) pool_size: usize,
+    /// How each pooled channel connects and keeps its connection alive.
+    endpoint_config: pplx_space_node_api_client::NodeApiEndpointConfig,
     /// Endpoint entries are bounded by node-api endpoints, not sandbox route cache keys.
     /// Transport failures reset an endpoint; route-cache churn must not evict channels.
     pub(super) channels: DashMap<String, Arc<BackendChannelPoolEntry>>,
@@ -253,10 +255,21 @@ impl BackendChannelPoolEntry {
 
 impl BackendChannelPool {
     pub(super) fn new(pool_size: usize) -> Self {
+        Self::with_endpoint_config(
+            pool_size,
+            pplx_space_node_api_client::NodeApiEndpointConfig::default(),
+        )
+    }
+
+    pub(super) fn with_endpoint_config(
+        pool_size: usize,
+        endpoint_config: pplx_space_node_api_client::NodeApiEndpointConfig,
+    ) -> Self {
         let pool_size = pool_size.max(1);
         pplx_space_metrics::data_plane::backend_channel_pool_size(pool_size);
         Self {
             pool_size,
+            endpoint_config,
             channels: DashMap::new(),
             last_idle_sweep: Mutex::new(tokio::time::Instant::now()),
         }
@@ -291,7 +304,7 @@ impl BackendChannelPool {
             entry
         } else {
             let entry = Arc::new(BackendChannelPoolEntry::new(
-                build_backend_channels(&cache_key, self.pool_size).await?,
+                build_backend_channels(&cache_key, self.pool_size, self.endpoint_config).await?,
                 now,
             ));
             let entry = self
@@ -462,15 +475,21 @@ pub(super) enum BackendChannelPoolError {
 pub(super) async fn build_backend_channels(
     endpoint: &str,
     pool_size: usize,
+    config: pplx_space_node_api_client::NodeApiEndpointConfig,
 ) -> Result<Vec<Channel>, pplx_space_common_grpc::internal_transport::TransportError> {
     // Each pooled channel carries calls for many sandboxes on one connection.
     let endpoint = pplx_space_node_api_client::configure_node_api_endpoint(
         Endpoint::from_shared(normalize_backend_endpoint(endpoint)?)?,
-        pplx_space_node_api_client::NodeApiEndpointConfig::default(),
+        config,
     )
-    .initial_connection_window_size(
-        pplx_space_node_api_client::MULTIPLEXED_CONNECTION_WINDOW_BYTES,
-    );
+    .initial_connection_window_size(pplx_space_node_api_client::MULTIPLEXED_CONNECTION_WINDOW_BYTES)
+    // On Kubernetes an endpoint is a sandbox pod's address, which a later pod
+    // can be given once this one is gone. Pinging an idle connection finds
+    // one whose far end went away and closes it, so the next call dials the
+    // endpoint afresh, rather than waiting out the keep-alive timeout on a
+    // connection nothing answers or failing at once on one the new pod
+    // resets.
+    .keep_alive_while_idle(true);
     let endpoint = pplx_space_common_grpc::internal_transport::client_connect_endpoint(
         pplx_space_common_grpc::internal_transport::Service::NodeApi,
         endpoint,
