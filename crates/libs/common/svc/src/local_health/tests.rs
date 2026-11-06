@@ -224,3 +224,91 @@ async fn disabled_server_lifecycle_is_noop() {
 
     assert!(!socket_path.exists());
 }
+
+#[test]
+fn heartbeat_reports_time_since_last_beat() {
+    let heartbeat = RuntimeHeartbeat::new();
+    let beat = heartbeat.origin + Duration::from_secs(5);
+    heartbeat.beat_at(beat);
+    assert_eq!(
+        heartbeat.stalled_for(beat + Duration::from_secs(3)),
+        Duration::from_secs(3)
+    );
+    // An older beat never moves the heartbeat backwards.
+    heartbeat.beat_at(heartbeat.origin + Duration::from_secs(1));
+    assert_eq!(heartbeat.stalled_for(beat), Duration::ZERO);
+}
+
+#[tokio::test]
+async fn liveness_fails_only_once_main_runtime_stall_exceeds_limit() {
+    let (mut health, _activator) = local_health_pair("test");
+    let mut heartbeat = RuntimeHeartbeat::new();
+    heartbeat.origin = Instant::now()
+        .checked_sub(MAIN_RUNTIME_STALL_LIMIT + Duration::from_secs(5))
+        .expect("monotonic clock is past the stall limit");
+    let heartbeat = Arc::new(heartbeat);
+    health.main_runtime = Some(Arc::clone(&heartbeat));
+    assert_eq!(status(&health, "liveness").await, ServingStatus::NotServing);
+    // Readiness keeps its own signal.
+    assert_eq!(status(&health, "readiness").await, ServingStatus::Serving);
+
+    heartbeat.beat_at(heartbeat.origin + Duration::from_secs(6));
+    assert_eq!(status(&health, "liveness").await, ServingStatus::Serving);
+}
+
+#[test]
+fn health_server_answers_while_main_runtime_workers_are_blocked() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("health.sock");
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    let shutdown = CancellationToken::new();
+    let server = runtime.block_on({
+        let socket = socket.clone();
+        let shutdown = shutdown.clone();
+        async move {
+            LocalHealthServer::spawn(&socket, UnixSocketOptions::new(0o600), "test", shutdown)
+                .unwrap()
+        }
+    });
+    // Block the main runtime's only worker in a synchronous call.
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    runtime.spawn(async move {
+        let _ = release_rx.recv();
+    });
+    std::thread::sleep(Duration::from_millis(100));
+
+    let probe = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let status = probe.block_on(async {
+        let channel =
+            tokio::time::timeout(Duration::from_secs(2), connect_uds_channel("test", &socket))
+                .await
+                .expect("connect within the probe budget")
+                .unwrap();
+        let mut client = HealthClient::new(channel);
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            client.check(HealthCheckRequest {
+                service: LIVENESS_SERVICE.to_owned(),
+            }),
+        )
+        .await
+        .expect("check within the probe budget")
+        .unwrap()
+        .into_inner()
+        .status
+    });
+    assert_eq!(status, ServingStatus::Serving as i32);
+    // Close the probe connection so the server's graceful shutdown completes.
+    drop(probe);
+
+    release_tx.send(()).unwrap();
+    shutdown.cancel();
+    runtime.block_on(server.join());
+}

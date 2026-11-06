@@ -563,8 +563,8 @@ pub enum RunSbxMgrError {
     RouteVerificationBundle(
         #[source] pplx_space_common_svc::space_api_route_ed25519::SpaceApiRouteEd25519Error,
     ),
-    #[error("failed to bind the sandbox-manager health socket: {0}")]
-    HealthSocket(#[source] pplx_space_common_svc::bootstrap::BindUnixSocketError),
+    #[error("failed to start the sandbox-manager health server: {0}")]
+    HealthSocket(#[source] pplx_space_common_svc::LocalHealthServerError),
     #[error("failed to acquire the sandbox-manager service mutex: {0}")]
     ServiceMutex(#[source] pplx_space_common_svc::service_mutex::AcquireError),
     #[error("failed to migrate the sandbox-manager database: {0}")]

@@ -46,7 +46,8 @@ pub use dependency_drain::{
 };
 pub use lifecycle::{DEFAULT_DRAIN_TIMEOUT, DEFAULT_SERVICE_MUTEX_TIMEOUT};
 pub use local_health::{
-    LocalHealth, LocalHealthActivator, LocalHealthLiveness, LocalHealthServer, local_health_pair,
+    LocalHealth, LocalHealthActivator, LocalHealthLiveness, LocalHealthServer,
+    LocalHealthServerError, local_health_pair,
 };
 pub use service_mutex::{
     AcquireError as ServiceMutexAcquireError, AcquireOutcome, SERVICE_MUTEX_POLL_INTERVAL,
