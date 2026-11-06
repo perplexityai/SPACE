@@ -1191,13 +1191,15 @@ fell back to the platform default shape; those events omit `vcpu` and
 ## Requested sandbox size
 
 The API records the vCPU and guest memory each sandbox will run with, after
-template and warm-pool defaults are applied, as two distributions with the same
-tags:
+template and warm-pool defaults are applied, and its configured disk size, as
+distributions with shared call-context tags. Only vCPU and memory samples on
+creates carry the additional `defaulted` tag:
 
 | Metric | Value |
 | --- | --- |
 | `sandbox.api.requested.vcpu` | vCPUs |
 | `sandbox.api.requested.memory_bytes` | Guest memory in bytes (`memory_mib * 1048576`) |
+| `sandbox.api.requested.disk_bytes` | Configured rootfs size in bytes (`disk_mib * 1048576`) |
 
 | Tag | Values |
 | --- | --- |
@@ -1205,12 +1207,14 @@ tags:
 | `surface` | `native` or `ecw`, the API the call arrived on |
 | `admission` | `accepted`, or `rejected` when cluster activation admission refused the call, whether at request entry or when the substrate charged a restore claim |
 | `template` | The resolved template for a create; otherwise the sandbox's template (`unknown` if the row names none) |
-| `defaulted` | Creates only. `false` when the request set both vCPU and memory; `true` when a build shape, the platform default, a warm-pool config or a warm-pool policy supplied either. Warm-pool claims are always `true` |
+| `defaulted` | vCPU and memory samples on creates only. `false` when the request set both vCPU and memory; `true` when a build shape, the platform default, a warm-pool config or a warm-pool policy supplied either. Warm-pool claims are always `true` |
 | `client_id` | The request's bounded caller, as described above |
 
 Each eligible recorded create, activation or resume contributes one sample to
-each distribution. Retries that reach a recording point add another sample;
-the distribution count is not the total number of incoming calls.
+the vCPU and memory distributions when both values are known and positive,
+and independently to the disk distribution when its value is known and positive.
+Retries that reach a recording point add another sample; the distribution
+count is not the total number of incoming calls.
 
 Native creates (`/v1` and admin) are re-queued by the dispatcher when cluster
 admission refuses them, and each retry that reaches admission adds another
@@ -1228,10 +1232,17 @@ admission and be rejected. Eligible implicit wakes routed through the lifecycle
 action controller are included; data-plane paths that bypass it are not.
 
 Nothing is recorded for a fork; a create whose size the API did not resolve (a
-Direct create, or a Kubernetes create left to the node's default shape); a
-wake of a running sandbox; a lifecycle action on a `restoring` sandbox,
-including a restore-lease takeover the substrate charges. Disk size is not
-recorded.
+Direct create, or a Kubernetes create left to the node's default shape and
+template rootfs size); a wake of a running sandbox; a lifecycle action on a
+`restoring` sandbox, including a restore-lease takeover the substrate charges.
+
+The disk size is the sandbox's `disk_mib`: the request's, or one a warm-pool
+config or policy supplied. It is the size the rootfs is configured to, not disk
+usage or host allocation. A sandbox that leaves `disk_mib` unset runs on its
+template's own rootfs size, which the API does not resolve, so it records no
+disk sample and the disk distribution can count fewer calls than the vCPU and
+memory ones. A known disk size is recorded even when the vCPU and memory are
+not.
 
 ## Worker-local lifecycle populations
 

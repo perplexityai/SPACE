@@ -1,12 +1,13 @@
-//! Maps create, activation and resume outcomes onto the requested vCPU and
-//! memory distributions (`pplx_space_metrics::sandbox::api::requested_size`).
+//! Maps create, activation and resume outcomes onto the requested vCPU,
+//! memory and disk distributions
+//! (`pplx_space_metrics::sandbox::api::requested_size`).
 //! The emit sites stay one call each; what counts and how it is tagged is
 //! decided here.
 
 use pplx_space_events::CreateShapeSource;
 use pplx_space_metrics::sandbox::admission::AdmissionDecision;
 use pplx_space_metrics::sandbox::api::{
-    RequestedKind, RequestedSize, SandboxApiSurface, requested_size,
+    RequestedCompute, RequestedKind, RequestedSize, SandboxApiSurface, requested_size,
 };
 
 use super::ControllerError;
@@ -48,6 +49,7 @@ pub(super) fn record_create(
         template,
         create_size(resources),
         Some(defaulted(source)),
+        create_disk(resources),
     );
 }
 
@@ -62,9 +64,19 @@ fn create_size(resources: &SandboxResources) -> Option<(u32, u32)> {
     )
 }
 
+/// The positive rootfs size a cold create will store, under the same bound as
+/// `create_size`. Skip unset, nonpositive, or unrepresentable values.
+fn create_disk(resources: &SandboxResources) -> Option<u32> {
+    positive(
+        stored_resource(resources.disk_mib, "disk_mib")
+            .ok()
+            .flatten(),
+    )
+}
+
 /// Record a warm-pool claim's size, read from the claimed sandbox row. The
-/// pool config chose that size, so it is always defaulted, and a claim spends
-/// no cluster admission, so it is always accepted.
+/// pool config chose the compute size, so the compute samples are always
+/// defaulted. A claim spends no cluster admission, so it is always accepted.
 pub(super) fn record_pool_claim(surface: SandboxApiSurface, template: &str, sandbox: &Sandbox) {
     emit(
         RequestedKind::Create,
@@ -73,6 +85,7 @@ pub(super) fn record_pool_claim(surface: SandboxApiSurface, template: &str, sand
         template,
         effective(sandbox.vcpu, sandbox.memory_mib),
         Some(true),
+        positive(sandbox.disk_mib),
     );
 }
 
@@ -96,10 +109,13 @@ pub(super) fn record_lifecycle_action<T>(
         sandbox.template_id.as_deref().unwrap_or(UNKNOWN_TEMPLATE),
         effective(sandbox.vcpu, sandbox.memory_mib),
         None,
+        positive(sandbox.disk_mib),
     );
 }
 
-/// Emit one sample, or nothing when the size is unknown.
+/// Emit the known parts of one size independently: the vCPU and memory pair,
+/// with `defaulted` on creates only, and disk without that tag.
+/// Emit nothing when neither is known.
 fn emit(
     kind: RequestedKind,
     surface: SandboxApiSurface,
@@ -107,22 +123,26 @@ fn emit(
     template: &str,
     size: Option<(u32, u32)>,
     defaulted: Option<bool>,
+    disk_mib: Option<u32>,
 ) {
-    let Some((vcpu, memory_mib)) = size else {
+    if size.is_none() && disk_mib.is_none() {
         return;
-    };
+    }
     requested_size(RequestedSize {
         kind,
         surface,
         admission,
         template,
-        vcpu,
-        memory_mib,
-        defaulted,
+        compute: size.map(|(vcpu, memory_mib)| RequestedCompute {
+            vcpu,
+            memory_mib,
+            defaulted,
+        }),
+        disk_mib,
     });
 }
 
-/// Whether anything other than the request chose the size.
+/// Whether anything other than the request chose the vCPU and memory.
 fn defaulted(source: CreateShapeSource) -> bool {
     match source {
         CreateShapeSource::Request => false,
