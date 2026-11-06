@@ -377,14 +377,17 @@ reviews:
         Admin console. Before reporting a regression, trace the changed
         component's callers, render conditions, data source, and API contract
         in crates/l40_api/api. Give a reachable operator action, the relevant
-        state or response, and the incorrect result. A plausible improvement
-        without a demonstrated broken contract is not a defect.
+        state or response, and the incorrect result; a causal path established
+        from code is sufficient, without a live reproduction. A plausible
+        improvement without a demonstrated broken contract is not a defect.
 
         A deliberately removed control or narrowed workflow is not a
         regression merely because the previous UI offered it. Check the
         replacement path and supported states against the diff and API;
         still report a supported operation that becomes unreachable or
-        unsafe. Do not treat a description's claim of intent as proof.
+        unsafe. Where relevant, check fresh or empty clusters, failed reads,
+        and existing resources. Do not treat a description's claim of intent
+        as proof, or an old comment as the sole contract.
 
         Flag requests or fields that do not match the API, error and empty
         states that conceal failed reads, stale responses that overwrite
@@ -406,7 +409,10 @@ reviews:
         assertions are not a reason to duplicate that platform contract.
         Still flag vacuous assertions, missing required oracle data,
         unconditional compatibility skips, and fixed sleeps that can race
-        observable readiness.
+        observable readiness. For a coverage defect, name a concrete wrong
+        result the assertion would accept and the smallest assertion or
+        owning-layer test that would reject it; do not demand a new scenario
+        merely because an existing assertion needs correction.
 
   pre_merge_checks:
     # Only requested reviewers can tick "Ignore failed checks". Any
