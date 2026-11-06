@@ -91,9 +91,12 @@ pub async fn reconcile_network_slot_capacity(
 /// the pods bound to the node request less than capacity, so capacity
 /// `leased + admittable` leaves room for exactly the sandboxes memory
 /// admission would accept, minus pods already bound but not yet admitted.
-/// `None` (node memory unreadable) keeps the slot limit alone. While memory is
-/// not the binding limit this returns `max_slots`, so the Node is not
-/// re-patched on every memory fluctuation.
+/// Capacity can drop below the requests of pods already bound here; kubelet
+/// then fails a bound pod it has not yet admitted with
+/// an `OutOf<resource>` reason, as memory admission would have
+/// refused it. `None` (node memory unreadable) keeps the slot limit alone.
+/// While memory is not the binding limit this returns `max_slots`, so the
+/// Node is not re-patched on every memory fluctuation.
 pub(super) fn desired_network_slot_capacity(
     max_slots: u32,
     leased_slots: u32,
