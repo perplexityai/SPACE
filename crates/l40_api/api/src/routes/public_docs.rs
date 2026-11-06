@@ -206,14 +206,15 @@ fn public_openapi_value() -> Value {
             "/sandboxes/{sandbox_id}/files:read": {
                 "post": {
                     "summary": "Read bytes from a guest file path",
-                    "description": "Requires an explicit length no larger than the control-plane API read cap. Use data-plane transfer surfaces for larger reads.",
+                    "description": "Requires an explicit length no larger than the control-plane API read cap. Use data-plane transfer surfaces for larger reads. The response starts once the sandbox sends the file's first bytes: a read it refuses before then answers with that refusal, and one that sends nothing within 120 seconds answers 503. A failure after the 200 aborts the body.",
                     "responses": {
                         "200": {
                             "description": "File byte stream",
                             "content": { "application/octet-stream": {} }
                         },
                         "400": { "description": "Invalid sandbox id, or missing or oversized length" },
-                        "404": { "description": "Sandbox or file not found" }
+                        "404": { "description": "Sandbox or file not found" },
+                        "412": { "description": "The path is a directory, FIFO, socket or other file that cannot be read" }
                     }
                 }
             },
