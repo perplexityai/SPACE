@@ -343,6 +343,17 @@ const ALLOW_TEMPLATE_SNAPSHOT_POLICY_OPERATOR: &[UdsPeerPrincipal] = &[
     UdsPeerPrincipal::Service(SPACE_NODECTL_ACCOUNT),
 ];
 
+/// Build dirs without a row the GC tick verifies per tick; each can mean
+/// hashing a multi-GiB rootfs, which delays the tick's eviction pass.
+const ROWLESS_BUILD_DIRS_PER_GC_TICK: usize = 2;
+
+/// How long the GC tick waits for one rowless-dir check before moving on.
+/// Hashing a multi-GiB rootfs takes well under this on a healthy disk. A tick
+/// can wait this long for each of its `ROWLESS_BUILD_DIRS_PER_GC_TICK`
+/// checks before its eviction pass; later ticks don't, while those checks
+/// hold the permits.
+const ROWLESS_BUILD_DIR_CHECK_WAIT: std::time::Duration = std::time::Duration::from_secs(600);
+
 #[derive(Clone)]
 pub struct TemplateManagerService {
     db: Arc<Mutex<rusqlite::Connection>>,
@@ -381,6 +392,12 @@ pub struct TemplateManagerService {
     pool_sandbox_lister: PoolSandboxLister,
     /// Shared by the GC loop, startup recovery and `DeleteIdleTemplate`.
     eviction_gate: crate::eviction::EvictionGate,
+    /// The last `(template, build dir)` the GC tick's rowless check
+    /// examined, so the next tick starts after it.
+    rowless_cursor: Arc<Mutex<Option<(String, String)>>>,
+    /// Checks of build dirs without a row that may run at once, across
+    /// ticks: one that outlives its tick holds its permit until it ends.
+    rowless_checks: Arc<tokio::sync::Semaphore>,
 }
 
 // ── Path helpers ──────────────────────────────────────────────────────────────
@@ -1067,6 +1084,18 @@ fn dependent_sandbox_ids_for_template_delete_target(
                     .then(|| (build.name.clone(), build.content_hash.clone(), sandbox_ids))
             })
             .collect(),
+        TemplateBuildDeleteTarget::Digest { name, content_hash } => {
+            let sandbox_ids = sandboxes
+                .iter()
+                .filter(|sandbox| sandbox_matches_template_build(sandbox, name, content_hash))
+                .map(|sandbox| sandbox.sandbox_id.clone())
+                .collect::<Vec<_>>();
+            if sandbox_ids.is_empty() {
+                Vec::new()
+            } else {
+                vec![(name.to_string(), content_hash.to_string(), sandbox_ids)]
+            }
+        }
         TemplateBuildDeleteTarget::Template { name } => {
             let sandbox_ids = sandboxes
                 .iter()
@@ -1101,7 +1130,14 @@ fn sandbox_matches_template_build(
 #[derive(Clone, Copy)]
 enum TemplateBuildDeleteTarget<'a> {
     Builds(&'a [crate::db::BuildRow]),
-    Template { name: &'a str },
+    /// A digest with no row, only a build dir or base-snapshot dir on disk.
+    Digest {
+        name: &'a str,
+        content_hash: &'a str,
+    },
+    Template {
+        name: &'a str,
+    },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1395,7 +1431,7 @@ fn build_disk_usage_with_snapshots(
 /// past all of that (e.g. a write-protected parent dir) leaves at most
 /// a wiped-out digest dir; the helper still returns Ok so Phase 3
 /// finalizes the row. Pulls then refuse any leftover dir, which has no
-/// row, until startup recovery removes it.
+/// row, until the GC tick's rowless check removes it.
 fn fallback_delete_build_artifacts(
     store: &TemplateArtifactStore,
     name: &str,
@@ -1416,7 +1452,7 @@ fn fallback_delete_build_artifacts(
             // Soft success: the RO flag was already cleared and the
             // recursive file-removal ran, so what remains is at most
             // an empty btrfs subvolume root without a row. Pulls refuse
-            // it until startup recovery removes it. The
+            // it until the GC tick's rowless check removes it. The
             // alternative — surfacing Err from here —
             // would skip Phase 3 finalize and leave the row in
             // `state='deleting'`, which is the bug this helper exists
@@ -1434,7 +1470,7 @@ fn fallback_delete_build_artifacts(
                 error = %err,
                 dir = %build_dir.display(),
                 "fallback cleanup: local subvolume removal incomplete; pulls refuse the \
-                 leftover rowless dir until startup recovery removes it",
+                 leftover rowless dir until the GC tick's rowless check removes it",
             );
             Ok(())
         }
@@ -1476,6 +1512,9 @@ async fn ensure_no_dependent_sandboxes_for_template_builds(
             format!("build {}@{}", build.name, build.content_hash)
         }
         TemplateBuildDeleteTarget::Builds(builds) => format!("{} build(s)", builds.len()),
+        TemplateBuildDeleteTarget::Digest { name, content_hash } => {
+            format!("build {name}@{content_hash}")
+        }
         TemplateBuildDeleteTarget::Template { name } => format!("template {name}"),
     };
 
@@ -1584,6 +1623,8 @@ impl TemplateManagerService {
             sbx_connect_retry_policy: pplx_space_sbx_mgr_client::DEFAULT_CONNECT_RETRY_POLICY,
             pool_sandbox_lister: PoolSandboxLister::sandbox_manager(),
             eviction_gate: crate::eviction::EvictionGate::default(),
+            rowless_cursor: Arc::new(Mutex::new(None)),
+            rowless_checks: Arc::new(tokio::sync::Semaphore::new(ROWLESS_BUILD_DIRS_PER_GC_TICK)),
         })
     }
 
@@ -1722,8 +1763,8 @@ impl TemplateManagerService {
 
     /// Spawn the LRU eviction loop. Budgeted by
     /// `SPACE_TEMPLATE_CACHE_BUDGET_BYTES` (default 100 GiB): when it is
-    /// explicitly zero, [`crate::eviction::run_loop`] logs and returns
-    /// immediately, so calling this unconditionally is safe.
+    /// explicitly zero, [`crate::eviction::run_loop`] evicts nothing and
+    /// only checks build dirs without a row on each tick.
     ///
     /// The loop owns:
     /// - The shared `Arc<Mutex<Connection>>` (same instance as the
@@ -1751,6 +1792,20 @@ impl TemplateManagerService {
         );
 
         let delete_disk_for = gc_delete_disk_fn(artifact_store.clone());
+        let reconcile_rowless: crate::eviction::ReconcileRowlessFn = {
+            let service = self.clone();
+            Arc::new(move || {
+                let service = service.clone();
+                Box::pin(async move {
+                    service
+                        .reconcile_rowless_build_dirs(
+                            ROWLESS_BUILD_DIRS_PER_GC_TICK,
+                            ROWLESS_BUILD_DIR_CHECK_WAIT,
+                        )
+                        .await;
+                })
+            })
+        };
 
         // Stuck-deleting reaper probe: queried by `gc_tick`'s
         // start-of-tick recovery pass for any row left in
@@ -1773,6 +1828,7 @@ impl TemplateManagerService {
                     disk_size_for,
                     delete_disk_for,
                     reaper_probe,
+                    reconcile_rowless,
                 },
                 self.eviction_gate.clone(),
             ),

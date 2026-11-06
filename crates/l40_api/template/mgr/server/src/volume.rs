@@ -11,8 +11,8 @@
 //! 2. Refusing a build dir that's already on disk without a DB row, such
 //!    as one startup recovery dropped the row of over a read that can
 //!    clear, or one a pull stopped before registering. The pull neither
-//!    adopts nor writes into it: it fails retryably, and the next startup
-//!    verifies the dir from scratch.
+//!    adopts nor writes into it: it fails retryably, and the GC tick's
+//!    rowless check or the next startup verifies the dir from scratch.
 //! 3. Issuing three synchronous `PullFile` RPCs against the on-node
 //!    `space-volume-manager` daemon — one each for `metadata.json`,
 //!    `manifest.json`, and `rootfs.ext4.zst`. Volume-manager handles
@@ -334,11 +334,12 @@ pub enum PullOutcome {
 /// completion or drop; this is not a cache.
 ///
 /// The map is also the digest claim: registration, imports, background rootfs
-/// compression, `DeleteTemplateBuild` and startup recovery's per-dir pass
-/// hold a [`DigestClaim`] in it while they write or remove the digest's dirs
-/// and rows, and `DeleteTemplate` holds one for the whole template, so no
-/// two of them, and no pull, hold the same digest at once. Eviction coordinates
-/// through the eviction gate and the row's `deleting` state instead.
+/// compression, `DeleteTemplateBuild`, startup recovery's per-dir pass and the
+/// GC tick's rowless check hold a [`DigestClaim`] in it while they write or
+/// remove the digest's dirs and rows, and `DeleteTemplate` holds one for the
+/// whole template, so no two of them, and no pull, hold the same digest at
+/// once. Eviction coordinates through the eviction gate and the row's
+/// `deleting` state instead.
 #[derive(Clone, Default)]
 pub struct VolumePuller {
     pub(crate) backing_policy: RootfsBackingPolicy,
@@ -399,8 +400,8 @@ impl VolumePuller {
     /// and other callers for the same `(template, hash)` keep waiting on
     /// the shared flight. If the task itself is aborted or the process
     /// exits, the build dir it left has no row: later pulls refuse it
-    /// retryably until the next startup verifies it and restores its row
-    /// or removes it.
+    /// retryably until the GC tick's rowless check, or the next startup,
+    /// verifies it and restores its row or removes it.
     ///
     /// This keeps caller cancellation from multiplying rootfs
     /// decompressions.
@@ -588,8 +589,9 @@ impl VolumePuller {
     }
 
     /// Whether a pull or a digest [`DigestClaim`] has `(name, content_hash)`'s
-    /// own entry. A claim of the whole template doesn't count.
-    #[cfg(test)]
+    /// own entry, and so may own a build dir that has no row yet. A claim of
+    /// the whole template doesn't count; [`Self::try_claim_digest`] still
+    /// refuses under one.
     pub(crate) fn is_claimed(&self, name: &str, content_hash: &str) -> bool {
         lock_or_recover(&self.in_flight, "template pull in-flight map")
             .contains_key(&PullKey::new(name, content_hash))
@@ -1042,8 +1044,9 @@ async fn pull_resolved_owner(
     // may have dropped its row over a read that can clear, or a pull may
     // have stopped before writing its row. Adopting it would serve bytes
     // nobody verified, and pulling into it would delete an installed build
-    // when the write fails. Leave it to the next startup, which verifies it
-    // from scratch, and refuse retryably until then.
+    // when the write fails. Leave it to the GC tick's rowless check, or the
+    // next startup, which verify it from scratch, and refuse retryably
+    // until then.
     // A dir whose existence can't be checked may be one; refuse the same way.
     let build_dir = template_root.join(name).join(resolved_hash);
     let refusal = match tokio::fs::try_exists(&build_dir).await {
@@ -2160,7 +2163,7 @@ async fn cleanup_digest_dir_after_hash_mismatch(name: &str, content_hash: &str, 
 /// fails. Even when the subvolume delete EPERMs (production tmplmgr is
 /// non-root), the local recursive removal still wipes the dir's contents.
 /// A subvolume root it can't remove stays without a row, and pulls refuse
-/// it until startup recovery removes it.
+/// it until the GC tick's rowless check removes it.
 async fn remove_build_dir(name: &str, content_hash: &str, dir: &Path, reason: &'static str) {
     match crate::btrfs_via_nodemgr::delete_template_subvolume(name, content_hash).await {
         Ok(()) => {
@@ -2180,7 +2183,7 @@ async fn remove_build_dir(name: &str, content_hash: &str, dir: &Path, reason: &'
             dir = %dir.display(),
             reason,
             "local fallback cleanup also failed; \
-             pulls of the build are refused until startup recovery verifies the dir"
+             pulls of the build are refused until the GC tick's rowless check verifies the dir"
         );
     } else {
         info!(
@@ -2199,7 +2202,7 @@ async fn remove_build_dir(name: &str, content_hash: &str, dir: &Path, reason: &'
 /// permission normalization, …, sqlite upsert. Without a guard, any
 /// `return Err` between subvolume create and the final upsert leaks an
 /// empty subvolume, which later pulls refuse as a dir without a row until
-/// startup recovery drops it, blocking a clean install of that
+/// the GC tick's rowless check removes it, blocking a clean install of that
 /// `(name, content_hash)` meanwhile.
 ///
 /// The guard is armed at digest-dir creation and explicitly
@@ -2208,8 +2211,8 @@ async fn remove_build_dir(name: &str, content_hash: &str, dir: &Path, reason: &'
 /// RPC against node-manager on the calling tokio runtime and leaves its
 /// handle in the attempt's [`PullCleanupSlot`], which `do_pull` waits on.
 /// Drop itself is sync (Rust requirement) so it can't await. If the
-/// runtime is already shutting down, the next startup's recovery rejects
-/// the incomplete dir and removes it.
+/// runtime is already shutting down, the GC tick's rowless check, or the
+/// next startup's recovery, rejects the incomplete dir and removes it.
 struct PullCleanupGuard {
     name: String,
     content_hash: String,
@@ -2281,15 +2284,15 @@ impl Drop for PullCleanupGuard {
         // path). Drop must be sync, so we spawn a task on the current
         // tokio runtime and leave its handle in the slot. If no runtime
         // is available (Drop fired outside an async context — shouldn't
-        // happen during pull_inner, but be defensive), the next
-        // startup's recovery catches up.
+        // happen during pull_inner, but be defensive), the GC tick's
+        // rowless check catches up.
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
             warn!(
                 dir = %dir.display(),
                 template = %name,
                 content_hash = %content_hash,
                 "PullCleanupGuard fired outside a tokio runtime; partial \
-                 digest dir may remain until the next startup recovery removes it"
+                 digest dir may remain until the GC tick's rowless check removes it"
             );
             return;
         };

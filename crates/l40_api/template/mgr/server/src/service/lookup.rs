@@ -520,23 +520,21 @@ impl TemplateManagerService {
         validate_template_name(&name)?;
         validate_content_hash(&content_hash)?;
         // Held until the delete returns: no pull, import, registration or
-        // startup recovery's per-dir check of the digest runs alongside it.
+        // startup recovery's per-dir check or the GC tick's rowless check of
+        // the digest runs alongside it.
         let _claim = self.claim_digest_for_delete(&name, &content_hash)?;
 
         // Check that no pools or local sandboxes reference this build before
         // deleting its master rootfs.
         let db = Arc::clone(&self.db);
+        let root = self.artifact_store.root.clone();
         let n = name.clone();
         let h = content_hash.clone();
-        let build = tokio::task::spawn_blocking(move || {
+        let builds = tokio::task::spawn_blocking(move || {
+            let builds = cached_builds_to_delete(&db, &root, &n, &h)?;
             let conn = db
                 .lock()
                 .map_err(|_| Status::internal("template DB mutex poisoned"))?;
-
-            // Verify build exists
-            let build = crate::db::get_build(&conn, &n, &h)
-                .map_err(|e| Status::internal(format!("db: {e}")))?
-                .ok_or_else(|| Status::not_found(format!("build not found: {n}@{h}")))?;
 
             // Check pools by template name
             let pools = crate::db::get_all_pools(&conn)
@@ -548,16 +546,26 @@ impl TemplateManagerService {
                 )));
             }
 
-            Ok::<_, Status>(build)
+            Ok::<_, Status>(builds)
         })
         .await
         .map_err(|e| Status::internal(format!("spawn_blocking: {e}")))?
         .map_err(|e: Status| e)?;
 
+        // A digest whose only trace is a dir has no row to match sandboxes
+        // against; they're matched by the digest instead.
+        let target = if builds.is_empty() {
+            TemplateBuildDeleteTarget::Digest {
+                name: &name,
+                content_hash: &content_hash,
+            }
+        } else {
+            TemplateBuildDeleteTarget::Builds(&builds)
+        };
         ensure_no_dependent_sandboxes_for_template_builds(
             TemplateBuildDeleteOperation::Build,
             DependentSandboxScope::All,
-            TemplateBuildDeleteTarget::Builds(std::slice::from_ref(&build)),
+            target,
         )
         .await?;
 
@@ -570,8 +578,9 @@ impl TemplateManagerService {
     }
 
     /// Claim a digest for `DeleteTemplateBuild`, so no pull, import,
-    /// registration, compression, other delete or startup recovery's per-dir
-    /// check is writing a dir or row the delete removes. Refuses retryably while one holds it; the claim goes
+    /// registration, compression, other delete, startup recovery's per-dir
+    /// check or the GC tick's rowless check is writing a dir or row the delete
+    /// removes. Refuses retryably while one holds it; the claim goes
     /// when dropped.
     pub(super) fn claim_digest_for_delete(
         &self,
@@ -583,7 +592,7 @@ impl TemplateManagerService {
             .ok_or_else(|| {
                 Status::aborted(format!(
                     "{name}@{content_hash} is busy (a pull, import, registration, compression, \
-                     delete or startup check holds it); retry the delete"
+                     delete or recovery check holds it); retry the delete"
                 ))
             })
     }
@@ -823,3 +832,56 @@ impl TemplateManagerService {
 /// node-manager is down or mid-rollout.
 pub(super) const NODEMGR_SUBVOLUME_DELETE_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(2);
+
+/// The row `DeleteTemplateBuild` removes, failing `NOT_FOUND` when the digest
+/// has no row, no build dir and no base-snapshot dir. A build dir without a
+/// row counts, with no row to return: pulls refuse such a dir until the GC
+/// tick verifies it, and this delete is the operator's way to clear it. So
+/// does a base-snapshot dir a removed build left behind. A dir whose
+/// presence can't be read fails retryably, rather than reading as absent
+/// and reporting a cached digest as not found.
+///
+/// The DB lock is held only for the row read: the dirs are read without it,
+/// so a stalled disk holds up this delete and not every DB user. The
+/// caller's digest claim keeps a row from appearing in between.
+pub(super) fn cached_builds_to_delete(
+    db: &Mutex<rusqlite::Connection>,
+    root: &Path,
+    name: &str,
+    content_hash: &str,
+) -> Result<Vec<crate::db::BuildRow>, Status> {
+    let builds: Vec<_> = {
+        let conn = db
+            .lock()
+            .map_err(|_| Status::internal("template DB mutex poisoned"))?;
+        crate::db::get_build(&conn, name, content_hash)
+            .map_err(|e| Status::internal(format!("db: {e}")))?
+    }
+    .into_iter()
+    .collect();
+    if !builds.is_empty() {
+        return Ok(builds);
+    }
+    let mut cached = false;
+    for dir in [
+        build_artifacts_dir(root, name, content_hash),
+        build_snapshots_artifacts_dir(root, name, content_hash),
+    ] {
+        match std::fs::symlink_metadata(&dir) {
+            Ok(_) => cached = true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(Status::unavailable(format!(
+                    "check for cached build {name}@{content_hash} at {}: {error}",
+                    dir.display()
+                )));
+            }
+        }
+    }
+    if !cached {
+        return Err(Status::not_found(format!(
+            "build not found: {name}@{content_hash}"
+        )));
+    }
+    Ok(builds)
+}

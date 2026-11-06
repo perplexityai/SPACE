@@ -20,9 +20,9 @@
 //! - A read that fails in a way that can clear (an I/O error reading the
 //!   manifest or `metadata.json`, stating a file or hashing the bootable
 //!   artifact) never deletes the dir: recovery drops the build's row and
-//!   keeps the dir, which the next startup verifies from scratch. Until
-//!   then pulls refuse the dir retryably, since a pull never adopts or
-//!   writes into a build dir that has no row.
+//!   keeps the dir, which the GC tick's rowless check, or the next startup,
+//!   verifies from scratch. Until then pulls refuse the dir retryably,
+//!   since a pull never adopts or writes into a build dir that has no row.
 //! - `metadata.json` that's absent or empty means the build has none; one
 //!   that reads but doesn't parse is a permanent rejection.
 //! - Leftover transient dirs (`.old` template dirs, import and republish
@@ -47,8 +47,8 @@ fn lock_recovery_db<'a>(
 /// A permanent rejection removes the dir. A transient one, an I/O error
 /// reading the manifest or metadata, stating a file or hashing the bootable
 /// artifact that can clear without any change to the dir, drops only the
-/// build's row and keeps the dir, so the next startup verifies it from
-/// scratch; see [`DigestDirRejection::is_transient`].
+/// build's row and keeps the dir, so the next GC tick, or the next startup,
+/// verifies it from scratch; see [`DigestDirRejection::is_transient`].
 #[derive(Debug, thiserror::Error)]
 enum DigestDirRejection {
     #[error("manifest.json read failed: {error}")]
@@ -128,9 +128,10 @@ impl DigestDirRejection {
 /// that as permanent would delete every node's cache with no way back short
 /// of re-pulling it once the deploy is fixed. As transient, an EACCES that
 /// never clears keeps the dir without a row, so every pull of its digest is
-/// refused until it clears or a startup finds it readable. That's where this
-/// differs from `host::path_errors::host_path_io_error_is_transient`, whose
-/// permanent answer fails a sandbox create rather than deleting a build.
+/// refused until it clears or `DeleteTemplateBuild` removes the dir, with a
+/// warning each time the GC tick examines it. That's where this differs from
+/// `host::path_errors::host_path_io_error_is_transient`, whose permanent
+/// answer fails a sandbox create rather than deleting a build.
 fn io_error_is_transient(error: &std::io::Error) -> bool {
     use std::io::ErrorKind;
     let permanent = matches!(
@@ -388,7 +389,7 @@ async fn delete_stale_build_row(
 /// Remove an invalid build dir under `template_root`. Installed builds are
 /// read-only btrfs subvolumes that only node-manager can delete; the local
 /// subvolume-aware cleanup is the fallback, as on the pull path. A dir that
-/// survives both stays without a row, and the next startup rejects it and
+/// survives both stays without a row, and the next GC tick rejects it and
 /// tries again.
 ///
 /// Node-manager resolves `(name, hash)` under `TEMPLATE_DIR`, so the RPC is
@@ -444,7 +445,7 @@ async fn drop_invalid_digest_dir(
     if rejection.is_transient() {
         // Never delete an installed build over a read that can clear. Its
         // row goes, so the build isn't served unverified, and pulls refuse
-        // the dir without a row until the next startup verifies it from
+        // the dir without a row until the next GC tick verifies it from
         // scratch. If the row can't be dropped, the build stays served
         // as it was, and the next startup checks it against that row.
         tracing::warn!(
@@ -452,7 +453,7 @@ async fn drop_invalid_digest_dir(
             content_hash = %hash_name,
             dir = %digest_dir.display(),
             reason = %rejection,
-            "could not verify digest dir; dropping its row and keeping it for the next startup"
+            "could not verify digest dir; dropping its row and keeping it for the next GC tick"
         );
         if let Err(error) = delete_stale_build_row(db, name, hash_name).await {
             tracing::warn!(
@@ -474,6 +475,44 @@ async fn drop_invalid_digest_dir(
         reason = %rejection,
         "dropping invalid digest dir during startup recovery"
     );
+    // Its base snapshots go first: left behind, they'd be registered as the
+    // snapshots of the next build installed under the same hash. If they
+    // can't be removed, the dir stays too, so the next pass retries both
+    // rather than leaving snapshots no build dir points back to; the row
+    // still goes, so the invalid build isn't served, and the dir, now
+    // without a row, is the GC tick's to retry.
+    let (store, n, h) = (
+        service.artifact_store.clone(),
+        name.to_string(),
+        hash_name.to_string(),
+    );
+    match off_runtime(name, hash_name, move || {
+        store.remove_snapshot_artifacts(&n, &h)
+    })
+    .await
+    {
+        Some(Ok(())) => {}
+        removal => {
+            if let Some(Err(error)) = removal {
+                tracing::warn!(
+                    template = %name,
+                    content_hash = %hash_name,
+                    %error,
+                    "could not remove base snapshots of an invalid digest dir; dropping its row and keeping it for the next GC tick"
+                );
+            }
+            if let Err(error) = delete_stale_build_row(db, name, hash_name).await {
+                tracing::warn!(
+                    template = %name,
+                    content_hash = %hash_name,
+                    %error,
+                    "could not drop the row of an invalid digest dir"
+                );
+            }
+            crate::node_state_sync::mark_template_dirty(db, name);
+            return;
+        }
+    }
     remove_digest_dir_from_disk(&service.artifact_store.root, name, hash_name, digest_dir).await;
     if let Err(error) = delete_stale_build_row(db, name, hash_name).await {
         tracing::warn!(
@@ -482,6 +521,29 @@ async fn drop_invalid_digest_dir(
             %error,
             "could not delete stale build row after removing invalid digest dir"
         );
+    }
+}
+
+/// Run a step that reads or writes the build dir with blocking calls on the
+/// blocking pool, so a read stalled on a hung disk can't take a runtime
+/// worker; the GC tick runs these checks over and over, not once. `None`,
+/// logged, when the step's task fails.
+async fn off_runtime<T: Send + 'static>(
+    name: &str,
+    hash_name: &str,
+    step: impl FnOnce() -> T + Send + 'static,
+) -> Option<T> {
+    match tokio::task::spawn_blocking(step).await {
+        Ok(output) => Some(output),
+        Err(error) => {
+            tracing::warn!(
+                template = %name,
+                content_hash = %hash_name,
+                %error,
+                "digest dir check task failed; leaving digest dir alone for next pass"
+            );
+            None
+        }
     }
 }
 
@@ -500,7 +562,15 @@ async fn reconcile_digest_dir_against_db(
     hash_name: &str,
     digest_dir: &Path,
 ) {
-    let (manifest, manifest_json) = match parse_manifest_from_digest_dir(digest_dir) {
+    let dir = digest_dir.to_path_buf();
+    let Some(parsed) = off_runtime(name, hash_name, move || {
+        parse_manifest_from_digest_dir(&dir)
+    })
+    .await
+    else {
+        return;
+    };
+    let (manifest, manifest_json) = match parsed {
         Ok(parsed) => parsed,
         Err(rejection) => {
             drop_invalid_digest_dir(service, name, hash_name, digest_dir, &rejection).await;
@@ -513,7 +583,15 @@ async fn reconcile_digest_dir_against_db(
         return;
     }
 
-    if let Err(rejection) = verify_local_files_against_manifest(digest_dir, &manifest) {
+    let (dir, declared) = (digest_dir.to_path_buf(), manifest.clone());
+    let Some(local_files) = off_runtime(name, hash_name, move || {
+        verify_local_files_against_manifest(&dir, &declared)
+    })
+    .await
+    else {
+        return;
+    };
+    if let Err(rejection) = local_files {
         drop_invalid_digest_dir(service, name, hash_name, digest_dir, &rejection).await;
         return;
     }
@@ -542,7 +620,15 @@ async fn reconcile_digest_dir_against_db(
 
     // Only a build without a row is registered from its metadata, so only
     // its metadata.json is read.
-    let metadata = match parse_metadata_from_digest_dir(digest_dir) {
+    let dir = digest_dir.to_path_buf();
+    let Some(metadata) = off_runtime(name, hash_name, move || {
+        parse_metadata_from_digest_dir(&dir)
+    })
+    .await
+    else {
+        return;
+    };
+    let metadata = match metadata {
         Ok(metadata) => metadata,
         Err(rejection) => {
             drop_invalid_digest_dir(service, name, hash_name, digest_dir, &rejection).await;
@@ -562,7 +648,13 @@ async fn reconcile_digest_dir_against_db(
         return;
     }
 
-    if let Err(error) = normalize_template_cache_tree(digest_dir) {
+    let dir = digest_dir.to_path_buf();
+    let Some(normalized) =
+        off_runtime(name, hash_name, move || normalize_template_cache_tree(&dir)).await
+    else {
+        return;
+    };
+    if let Err(error) = normalized {
         tracing::warn!(
             template = %name,
             content_hash = %hash_name,
@@ -744,50 +836,71 @@ async fn reconcile_base_snapshots_for_template(
         if !snap_hash.starts_with("sha256:") || !snap_hash_entry.path().is_dir() {
             continue;
         }
-        let Ok(config_entries) = std::fs::read_dir(snap_hash_entry.path()) else {
-            continue;
-        };
-        for config_entry in config_entries.flatten() {
-            let config_name = config_entry.file_name().to_string_lossy().to_string();
-            let Some((vcpu, memory_mib)) = parse_snapshot_config_dir(&config_name) else {
-                continue;
-            };
-            let config_dir = config_entry.path();
-            if !config_dir.join("snapshot.base").exists()
-                || !config_dir.join("vmstate.base").exists()
-            {
-                continue;
-            }
-            let snap_hash_val =
-                std::fs::read_to_string(config_dir.join("snapshot_hash")).unwrap_or_default();
+        reconcile_base_snapshots_for_build(db, name, &snap_hash, &snap_hash_entry.path()).await;
+    }
+}
 
-            let db = Arc::clone(db);
-            let n = name.to_string();
-            let h = snap_hash.clone();
-            match tokio::task::spawn_blocking(move || {
-                let conn = lock_recovery_db(&db)?;
-                crate::db::upsert_snapshot(&conn, &n, &h, vcpu, memory_mib, &snap_hash_val)
-                    .map_err(|error| error.to_string())
+/// Register the base snapshots under one build's snapshot dir
+/// `{name}/snapshots/{snap_hash}`. A snapshot row needs its build's row, so
+/// this registers nothing for a build without one.
+async fn reconcile_base_snapshots_for_build(
+    db: &Arc<Mutex<rusqlite::Connection>>,
+    name: &str,
+    snap_hash: &str,
+    snap_hash_dir: &Path,
+) {
+    let dir = snap_hash_dir.to_path_buf();
+    let Some(snapshots) = off_runtime(name, snap_hash, move || {
+        let Ok(config_entries) = std::fs::read_dir(&dir) else {
+            return Vec::new();
+        };
+        config_entries
+            .flatten()
+            .filter_map(|config_entry| {
+                let config_name = config_entry.file_name().to_string_lossy().to_string();
+                let (vcpu, memory_mib) = parse_snapshot_config_dir(&config_name)?;
+                let config_dir = config_entry.path();
+                (config_dir.join("snapshot.base").exists()
+                    && config_dir.join("vmstate.base").exists())
+                .then(|| {
+                    let snap_hash_val = std::fs::read_to_string(config_dir.join("snapshot_hash"))
+                        .unwrap_or_default();
+                    (vcpu, memory_mib, snap_hash_val)
+                })
             })
-            .await
-            {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => {
-                    tracing::warn!(
-                        template = %name,
-                        content_hash = %snap_hash,
-                        %error,
-                        "failed to upsert base snapshot during startup recovery"
-                    );
-                }
-                Err(error) => {
-                    tracing::warn!(
-                        template = %name,
-                        content_hash = %snap_hash,
-                        %error,
-                        "base snapshot upsert task failed during startup recovery"
-                    );
-                }
+            .collect::<Vec<_>>()
+    })
+    .await
+    else {
+        return;
+    };
+    for (vcpu, memory_mib, snap_hash_val) in snapshots {
+        let db = Arc::clone(db);
+        let n = name.to_string();
+        let h = snap_hash.to_string();
+        match tokio::task::spawn_blocking(move || {
+            let conn = lock_recovery_db(&db)?;
+            crate::db::upsert_snapshot(&conn, &n, &h, vcpu, memory_mib, &snap_hash_val)
+                .map_err(|error| error.to_string())
+        })
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::warn!(
+                    template = %name,
+                    content_hash = %snap_hash,
+                    %error,
+                    "failed to upsert base snapshot during startup recovery"
+                );
+            }
+            Err(error) => {
+                tracing::warn!(
+                    template = %name,
+                    content_hash = %snap_hash,
+                    %error,
+                    "base snapshot upsert task failed during startup recovery"
+                );
             }
         }
     }
@@ -817,9 +930,9 @@ async fn prune_catalog_rows_missing_on_disk(
         // inspecting the artifact:
         //   - artifacts present → flip back to `ready` so the
         //     build is usable again.
-        //   - artifacts missing → delete the row outright; any
-        //     partial subvolume on disk is a small leak handled by
-        //     the next eviction's nodemgr-delete path.
+        //   - artifacts missing → delete the row outright; a partial
+        //     dir left on disk has no row, so the GC tick's rowless
+        //     check removes it.
         let stuck: Vec<(String, String)> = match conn.prepare(
             "SELECT name, content_hash FROM template_builds WHERE state = 'deleting'",
         ) {
@@ -929,6 +1042,78 @@ async fn prune_catalog_rows_missing_on_disk(
     }
 }
 
+/// Whether a dir directly under the template root is a template's dir, not
+/// a hidden or transient one.
+fn is_template_name_dir(name: &str) -> bool {
+    !(name.starts_with('.') || name.ends_with(".old") || name.ends_with(".importing"))
+}
+
+/// Whether a dir name under a template's dir names a build, not import or
+/// republish staging or an interrupted replacement.
+fn is_build_dir_name(hash_name: &str) -> bool {
+    !is_import_staging_dir(hash_name)
+        && !is_republish_staging_dir(hash_name)
+        && replaced_digest_base(hash_name).is_none()
+        && hash_name.parse::<Digest>().is_ok()
+}
+
+/// Build dirs `{template}/{hash}` under `root` that have no row and no claim,
+/// as `(template, hash, dir)` in name order. The scan reads the disk without
+/// the DB lock, then filters under it. A row lookup that fails counts as a
+/// row, so the dir waits for a later tick.
+fn rowless_build_dirs(
+    root: &Path,
+    db: &Mutex<rusqlite::Connection>,
+    puller: &crate::volume::VolumePuller,
+) -> Vec<(String, String, PathBuf)> {
+    let mut dirs = Vec::new();
+    let templates = match std::fs::read_dir(root) {
+        Ok(templates) => templates,
+        Err(error) => {
+            tracing::warn!(
+                dir = %root.display(),
+                %error,
+                "could not list the template root for build dirs without a row"
+            );
+            return Vec::new();
+        }
+    };
+    for template in templates.flatten() {
+        let name = template.file_name().to_string_lossy().to_string();
+        if !is_template_name_dir(&name) || !template.path().is_dir() {
+            continue;
+        }
+        let entries = match std::fs::read_dir(template.path()) {
+            Ok(entries) => entries,
+            Err(error) => {
+                tracing::warn!(
+                    template = %name,
+                    %error,
+                    "could not list a template's build dirs to find ones without a row"
+                );
+                continue;
+            }
+        };
+        for entry in entries.flatten() {
+            let hash = entry.file_name().to_string_lossy().to_string();
+            if is_build_dir_name(&hash) && entry.path().is_dir() {
+                dirs.push((name.clone(), hash, entry.path()));
+            }
+        }
+    }
+    dirs.sort();
+    let Ok(conn) = db.lock() else {
+        tracing::warn!("template DB mutex poisoned; skipping build dirs without a row");
+        return Vec::new();
+    };
+    dirs.into_iter()
+        .filter(|(name, hash, _)| {
+            !puller.is_claimed(name, hash)
+                && crate::db::get_build(&conn, name, hash).is_ok_and(|row| row.is_none())
+        })
+        .collect()
+}
+
 impl TemplateManagerService {
     /// Prune `template_builds` / `template_snapshots` rows whose on-disk
     /// artifacts are missing. Exposed so tests can drive the recovery
@@ -940,6 +1125,180 @@ impl TemplateManagerService {
             let _evicting = self.eviction_gate.hold().await;
             prune_catalog_rows_missing_on_disk(&self.db, &self.artifact_store).await;
         }
+    }
+
+    /// Run startup recovery's check, from the GC tick, on up to `limit` build
+    /// dirs under the template root that have no row. A valid one gets its
+    /// row back, a permanently invalid one is removed, and one whose read
+    /// fails in a way that can clear stays for a later tick. Pulls refuse a
+    /// build dir without a row, so this bounds how long one blocks its build.
+    /// Dirs a pull or import has in flight are skipped: they have no row
+    /// until that work finishes.
+    ///
+    /// The dirs are taken in `(template, build dir)` order from just after
+    /// the last one the previous tick examined, wrapping around, so every one
+    /// is reached within `ceil(N / limit)` ticks however many keep failing,
+    /// as long as checks finish within `wait`; while checks parked past their
+    /// tick hold every permit, no tick starts another. Returns how many
+    /// checks it started that verified their dir or were left running past
+    /// `wait`; one that found the digest claimed, its row back or the dir
+    /// gone, or whose task failed, isn't counted.
+    ///
+    /// The tick waits up to `wait` for each check. One that takes longer, as
+    /// a read of a hung disk can, keeps running in its own task under its
+    /// claim, so the next tick's scan skips it, and the tick moves on to
+    /// eviction rather than stalling behind it. The scan for candidates
+    /// isn't bounded: it lists the same template dirs eviction's own
+    /// planning reads, so a disk that stalls it stalls eviction anyway.
+    pub(super) async fn reconcile_rowless_build_dirs(
+        &self,
+        limit: usize,
+        wait: std::time::Duration,
+    ) -> usize {
+        let root = self.artifact_store.root.clone();
+        let cursor = self
+            .rowless_cursor
+            .lock()
+            .map(|cursor| cursor.clone())
+            .unwrap_or_default();
+        let db = Arc::clone(&self.db);
+        let puller = self.volume_puller.clone();
+        let scan = tokio::task::spawn_blocking(move || {
+            let rowless = rowless_build_dirs(&root, &db, &puller);
+            // Start after the cursor and wrap around.
+            let start = cursor.as_ref().map_or(0, |cursor| {
+                rowless
+                    .iter()
+                    .position(|(name, hash, _)| (name, hash) > (&cursor.0, &cursor.1))
+                    .unwrap_or(0)
+            });
+            rowless
+                .iter()
+                .cycle()
+                .skip(start)
+                .take(limit.min(rowless.len()))
+                .cloned()
+                .collect::<Vec<_>>()
+        });
+        let candidates = scan.await.unwrap_or_else(|error| {
+            tracing::warn!(%error, "scan for build dirs without a row failed");
+            Vec::new()
+        });
+
+        let mut checked = 0;
+        for (name, content_hash, digest_dir) in candidates {
+            // A check that outlives its tick keeps its permit, so checks
+            // parked on a hung disk can't pile up across ticks: while they
+            // hold every permit, no tick starts another.
+            let Ok(permit) = Arc::clone(&self.rowless_checks).try_acquire_owned() else {
+                tracing::warn!(
+                    "earlier checks of build dirs without a row are still running; \
+                     skipping the rest of this tick's"
+                );
+                break;
+            };
+            // The cursor passes only dirs a check started on, so one skipped
+            // for want of a permit comes first next tick.
+            if let Ok(mut cursor) = self.rowless_cursor.lock() {
+                *cursor = Some((name.clone(), content_hash.clone()));
+            }
+            // Its own task, so a tick that shutdown cancels can't drop the
+            // digest claim while a blocking removal or catalog write it
+            // guards keeps running; the task lets go once those finish.
+            let service = self.clone();
+            let verify = tokio::spawn(async move {
+                let _permit = permit;
+                service
+                    .verify_rowless_build_dir(&name, &content_hash, &digest_dir)
+                    .await
+            });
+            match tokio::time::timeout(wait, verify).await {
+                Ok(Ok(verified)) => checked += usize::from(verified),
+                Ok(Err(error)) => {
+                    tracing::warn!(%error, "a check of a build dir without a row failed");
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        ?wait,
+                        "a check of a build dir without a row is still running; \
+                         the tick moves on and leaves it to finish under its claim"
+                    );
+                    checked += 1;
+                }
+            }
+        }
+        checked
+    }
+
+    /// Run startup recovery's check on one build dir the scan found without
+    /// a row, under its digest claim. Returns false, and touches nothing,
+    /// when someone else holds the claim, or, by the time the claim is taken,
+    /// the build has a row or the dir is gone: the scan ran before the claim,
+    /// and a registration or import may have finished the build since, or a
+    /// delete removed it.
+    pub(super) async fn verify_rowless_build_dir(
+        &self,
+        name: &str,
+        content_hash: &str,
+        digest_dir: &Path,
+    ) -> bool {
+        // Held for the whole check, so no pull, import, registration or
+        // DeleteTemplateBuild of the digest runs alongside it.
+        let Some(_claim) = self.volume_puller.try_claim_digest(name, content_hash) else {
+            return false;
+        };
+        self.verify_claimed_rowless_build_dir(name, content_hash, digest_dir)
+            .await
+    }
+
+    /// [`Self::verify_rowless_build_dir`] once the claim is held.
+    async fn verify_claimed_rowless_build_dir(
+        &self,
+        name: &str,
+        content_hash: &str,
+        digest_dir: &Path,
+    ) -> bool {
+        if !lookup_build_row(&self.db, name, content_hash)
+            .await
+            .is_ok_and(|row| row.is_none())
+        {
+            return false;
+        }
+        // A delete may also have removed the dir since the scan.
+        let dir = digest_dir.to_path_buf();
+        if !off_runtime(name, content_hash, move || dir.is_dir())
+            .await
+            .unwrap_or(false)
+        {
+            return false;
+        }
+        tracing::info!(
+            template = %name,
+            content_hash = %content_hash,
+            dir = %digest_dir.display(),
+            "verifying a build dir without a row"
+        );
+        reconcile_digest_dir_against_db(self, name, content_hash, digest_dir).await;
+        // Dropping the row dropped its base-snapshot rows too, and they
+        // can't come back without it; startup recovery only registers
+        // snapshot dirs once. Register them with the restored row.
+        if lookup_build_row(&self.db, name, content_hash)
+            .await
+            .is_ok_and(|row| row.is_some())
+        {
+            reconcile_base_snapshots_for_build(
+                &self.db,
+                name,
+                content_hash,
+                &build_snapshots_artifacts_dir(&self.artifact_store.root, name, content_hash),
+            )
+            .await;
+        }
+        // A restored row, or a removed dir, changes what the node can
+        // serve; the cluster hears of it now rather than at the next
+        // periodic reconcile.
+        crate::node_state_sync::mark_template_dirty(&self.db, name);
+        true
     }
 
     /// Spawn startup recovery once the socket is bound. Requests are served
@@ -961,7 +1320,7 @@ impl TemplateManagerService {
         self.spawn_node_state_dirty_syncer();
         self.spawn_network_policy_notification_syncer();
         // Budgeted by `SPACE_TEMPLATE_CACHE_BUDGET_BYTES`; an explicit
-        // zero makes the loop log and return immediately.
+        // zero turns eviction off and leaves only the rowless-dir check.
         self.spawn_eviction_loop(shutdown);
 
         let service = self.clone();
@@ -996,7 +1355,7 @@ impl TemplateManagerService {
                     continue;
                 }
                 let name = entry.file_name().to_string_lossy().to_string();
-                if name.starts_with('.') || name.ends_with(".old") || name.ends_with(".importing") {
+                if !is_template_name_dir(&name) {
                     continue;
                 }
 
@@ -1015,12 +1374,7 @@ impl TemplateManagerService {
                             let _ = std::fs::remove_dir_all(digest_entry.path());
                             continue;
                         }
-                        if is_import_staging_dir(&hash_name)
-                            || is_republish_staging_dir(&hash_name)
-                            || replaced_digest_base(&hash_name).is_some()
-                            || hash_name.parse::<Digest>().is_err()
-                            || !digest_entry.path().is_dir()
-                        {
+                        if !is_build_dir_name(&hash_name) || !digest_entry.path().is_dir() {
                             continue;
                         }
                         // Requests flow by now: a digest a pull, import,

@@ -388,6 +388,7 @@ async fn run_loop_exits_cooperatively_on_shutdown() {
             disk_size_for: disk_size,
             delete_disk_for: delete_disk,
             reaper_probe: noop_reaper_probe(),
+            reconcile_rowless: noop_reconcile_rowless(),
         },
         EvictionGate::default(),
     ));
@@ -727,6 +728,7 @@ async fn run_loop_exits_when_active_fetch_is_stuck() {
             disk_size_for: disk_size,
             delete_disk_for: delete_disk,
             reaper_probe: noop_reaper_probe(),
+            reconcile_rowless: noop_reconcile_rowless(),
         },
         EvictionGate::default(),
     ));
@@ -745,15 +747,16 @@ async fn run_loop_exits_when_active_fetch_is_stuck() {
     );
 }
 
-/// When `cfg.enabled` is false the loop logs once and returns
-/// immediately, regardless of shutdown state. Cheap defensive
-/// check that an operator-misconfigured budget (env unset) does
-/// not stall daemon startup waiting for a tick.
+/// With eviction disabled the loop keeps running, for the rowless-dir check
+/// only: it never deletes a build, and it stops as soon as shutdown fires.
+/// It runs as a spawned task, so it doesn't hold up startup.
 #[tokio::test]
-async fn run_loop_returns_immediately_when_disabled() {
+async fn run_loop_with_eviction_disabled_never_evicts_and_stops_on_shutdown() {
     use std::sync::Mutex;
-    let conn = crate::db::test_conn();
-    let db = Arc::new(Mutex::new(conn));
+    let raw = crate::db::test_conn();
+    seed_build(&raw, "seed", "h1", 1_000);
+    crate::db::set_last_used_at_for_test(&raw, "seed", "h1", 1).unwrap();
+    let db = Arc::new(Mutex::new(raw));
 
     let cfg = GcConfig {
         enabled: false,
@@ -763,28 +766,34 @@ async fn run_loop_returns_immediately_when_disabled() {
         grace: Duration::from_secs(0),
     };
     let shutdown = CancellationToken::new();
-    let fetch_active: FetchActiveFn = Arc::new(|| Box::pin(async { Ok(HashSet::new()) }));
-    let disk_size: DiskSizeFn = Arc::new(|_, _, fallback, _| fallback);
-    let delete_disk: DeleteDiskFn = Arc::new(|_, _| Box::pin(async { Ok(()) }));
+    let gc = tokio::spawn(run_loop(
+        Arc::clone(&db),
+        cfg,
+        shutdown.clone(),
+        GcHooks {
+            fetch_active: Arc::new(|| Box::pin(async { Ok(HashSet::new()) })),
+            fetch_warm_pool: empty_warm_pool_fetch(),
+            disk_size_for: Arc::new(|_, _, fallback, _| fallback),
+            delete_disk_for: Arc::new(|_, _| panic!("eviction is disabled")),
+            reaper_probe: noop_reaper_probe(),
+            reconcile_rowless: noop_reconcile_rowless(),
+        },
+        EvictionGate::default(),
+    ));
+    // The first tick runs at once; shutdown then lands in the interval wait.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    shutdown.cancel();
 
-    let outcome = tokio::time::timeout(
-        Duration::from_secs(1),
-        run_loop(
-            db,
-            cfg,
-            shutdown,
-            GcHooks {
-                fetch_active,
-                fetch_warm_pool: empty_warm_pool_fetch(),
-                disk_size_for: disk_size,
-                delete_disk_for: delete_disk,
-                reaper_probe: noop_reaper_probe(),
-            },
-            EvictionGate::default(),
-        ),
-    )
-    .await;
-    assert!(outcome.is_ok(), "disabled run_loop must return immediately");
+    tokio::time::timeout(Duration::from_secs(1), gc)
+        .await
+        .expect("a disabled loop stops on shutdown, even mid-interval")
+        .unwrap();
+    assert_eq!(
+        crate::db::list_builds_by_name(&db.lock().unwrap(), "seed")
+            .unwrap()
+            .len(),
+        1
+    );
 }
 
 /// `gc_tick` honours the active set passed in by the caller — a
@@ -1717,6 +1726,7 @@ async fn gc_repair_waits_for_a_live_idle_eviction() {
             disk_size_for: Arc::new(|_, _, fallback, _| fallback),
             delete_disk_for: Arc::new(|_, _| Box::pin(async { Ok(()) })),
             reaper_probe,
+            reconcile_rowless: noop_reconcile_rowless(),
         },
         gate,
     ));
@@ -1744,4 +1754,103 @@ async fn gc_repair_waits_for_a_live_idle_eviction() {
             .unwrap()
             .is_empty()
     );
+}
+
+/// The GC loop runs the rowless-dir check on every tick, even one that skips
+/// eviction because the active-sandbox set is unavailable, and even with
+/// eviction disabled.
+#[rstest::rstest]
+#[case::eviction_enabled(true)]
+#[case::eviction_disabled(false)]
+#[tokio::test]
+async fn gc_loop_checks_rowless_dirs_on_every_tick(#[case] enabled: bool) {
+    let db = Arc::new(std::sync::Mutex::new(crate::db::test_conn()));
+    let checks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let shutdown = CancellationToken::new();
+    let gc = tokio::spawn(run_loop(
+        db,
+        GcConfig {
+            enabled,
+            budget_bytes: u64::MAX,
+            headroom_fraction: 0.9,
+            interval: Duration::from_millis(10),
+            grace: Duration::from_secs(0),
+        },
+        shutdown.clone(),
+        GcHooks {
+            fetch_active: Arc::new(|| Box::pin(async { Err("sandbox-manager down".to_string()) })),
+            fetch_warm_pool: empty_warm_pool_fetch(),
+            disk_size_for: Arc::new(|_, _, fallback, _| fallback),
+            delete_disk_for: Arc::new(|_, _| Box::pin(async { Ok(()) })),
+            reaper_probe: noop_reaper_probe(),
+            reconcile_rowless: {
+                let checks = Arc::clone(&checks);
+                Arc::new(move || {
+                    checks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Box::pin(async {})
+                })
+            },
+        },
+        EvictionGate::default(),
+    ));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while checks.load(std::sync::atomic::Ordering::SeqCst) < 2 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("two ticks each check rowless dirs");
+    shutdown.cancel();
+    gc.await.unwrap();
+}
+
+/// The rowless-dir check runs outside the eviction gate, so the hashing it
+/// can do doesn't hold off `DeleteIdleTemplate` or startup recovery's repair
+/// of `deleting` rows, with eviction enabled or not.
+#[rstest::rstest]
+#[case::eviction_enabled(true)]
+#[case::eviction_disabled(false)]
+#[tokio::test]
+async fn gc_loop_checks_rowless_dirs_without_holding_the_eviction_gate(#[case] enabled: bool) {
+    let gate = EvictionGate::default();
+    let free = Arc::new(std::sync::Mutex::new(Vec::<bool>::new()));
+    let shutdown = CancellationToken::new();
+    let gc = tokio::spawn(run_loop(
+        Arc::new(std::sync::Mutex::new(crate::db::test_conn())),
+        GcConfig {
+            enabled,
+            budget_bytes: u64::MAX,
+            headroom_fraction: 0.9,
+            interval: Duration::from_millis(10),
+            grace: Duration::from_secs(0),
+        },
+        shutdown.clone(),
+        GcHooks {
+            fetch_active: Arc::new(|| Box::pin(async { Ok(HashSet::new()) })),
+            fetch_warm_pool: empty_warm_pool_fetch(),
+            disk_size_for: Arc::new(|_, _, fallback, _| fallback),
+            delete_disk_for: Arc::new(|_, _| Box::pin(async { Ok(()) })),
+            reaper_probe: noop_reaper_probe(),
+            reconcile_rowless: {
+                let gate = gate.clone();
+                let free = Arc::clone(&free);
+                Arc::new(move || {
+                    free.lock().unwrap().push(gate.try_hold().is_some());
+                    Box::pin(async {})
+                })
+            },
+        },
+        gate.clone(),
+    ));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while free.lock().unwrap().len() < 2 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("two ticks each check rowless dirs");
+    shutdown.cancel();
+    gc.await.unwrap();
+    let free = free.lock().unwrap();
+    assert!(free.iter().all(|free| *free), "{free:?}");
 }
