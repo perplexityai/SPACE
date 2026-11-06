@@ -363,36 +363,6 @@ mod policy_tests {
         )
         .expect("existing desired-open exposure remains idempotent above the new admission limit");
     }
-
-    #[test]
-    fn validate_create_template_reference_accepts_tags_and_full_digest() {
-        let template = TemplateReference::latest(TemplateName::parse("seed").unwrap());
-        validate_create_template_reference(&template).unwrap();
-        assert!(template.uses_default_selector());
-        assert_eq!(template.artifact_digest(), None);
-
-        let template = "seed:prod".parse::<TemplateReference>().unwrap();
-        validate_create_template_reference(&template).unwrap();
-        assert!(!template.uses_default_selector());
-
-        let hash = "sha256:1111111111111111111111111111111111111111111111111111111111111111";
-        let template = format!("seed@{hash}").parse::<TemplateReference>().unwrap();
-        validate_create_template_reference(&template).unwrap();
-        assert_eq!(
-            template.artifact_digest().map(|digest| digest.to_string()),
-            Some(hash.to_string())
-        );
-    }
-
-    #[test]
-    fn validate_create_template_reference_rejects_digest_prefixes() {
-        let template = "seed@sha256:111111111111"
-            .parse::<TemplateReference>()
-            .unwrap();
-
-        let error = validate_create_template_reference(&template).unwrap_err();
-        assert!(error.to_string().contains("digest prefixes"));
-    }
 }
 
 mod template_release_resolution_postgres_tests {
@@ -1139,8 +1109,65 @@ mod template_release_resolution_postgres_tests {
         Ok(())
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn digest_prefix_shared_by_two_releases_is_rejected() -> TestResult {
+        let db = pg_test_db().await?;
+        sqlx::query(sql!(
+            "INSERT INTO templates (id, name, description, org_id, network_policy_generation)
+             VALUES ($1, 'custom-template', NULL, NULL, 1)"
+        ))
+        .bind(TemplateId::new().as_uuid())
+        .execute(&db.pool)
+        .await?;
+        let shared = "0123456789ab";
+        let first = format!("sha256:{shared}{}", "1".repeat(52));
+        let first_id = Uuid::now_v7();
+        for (id, hash) in [
+            (first_id, first.clone()),
+            (Uuid::now_v7(), format!("sha256:{shared}{}", "2".repeat(52))),
+        ] {
+            sqlx::query(sql!(
+                "INSERT INTO template_releases (id, template_name, type, hash, org_id)
+                 VALUES ($1, 'custom-template', 'fc', $2, NULL)"
+            ))
+            .bind(id)
+            .bind(hash)
+            .execute(&db.pool)
+            .await?;
+        }
+        let caller_org = OrgId::new();
+        let ambiguous = format!("custom-template@sha256:{shared}").parse()?;
+        let error = resolve_template_release(
+            &db.pool,
+            &ambiguous,
+            RuntimeKind::Firecracker,
+            caller_org,
+            ReleaseMissReport::Classified,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.status(), axum::http::StatusCode::BAD_REQUEST);
+        assert!(
+            error.to_string().contains("more than one release"),
+            "{error}"
+        );
+
+        let longer = format!("custom-template@sha256:{shared}1").parse()?;
+        let resolved = resolve_template_release(
+            &db.pool,
+            &longer,
+            RuntimeKind::Firecracker,
+            caller_org,
+            ReleaseMissReport::Classified,
+        )
+        .await?;
+        assert_eq!(resolved, (first_id, first));
+        Ok(())
+    }
+
     /// Characterization of sandbox-create release resolution (tag with
-    /// `latest` fallback, digest stored as given or with `sha256:` stripped)
+    /// `latest` fallback, full digest or unique digest prefix, stored as given
+    /// or with `sha256:` stripped)
     /// over the shared resolver world. A bare-hex request cannot reach this
     /// resolver: `TemplateReference` rejects `name@<hex>` without an algorithm.
     #[tokio::test(flavor = "current_thread")]
@@ -1153,6 +1180,8 @@ mod template_release_resolution_postgres_tests {
         let (fc, ch) = (RuntimeKind::Firecracker, RuntimeKind::CloudHypervisor);
         let sha = |c| format!("sha256:{}", hex(c));
         let blake = |c| format!("blake3:{}", hex(c));
+        let sha_prefix = |c: char| format!("sha256:{}", c.to_string().repeat(12));
+        let blake_prefix = |c: char| format!("blake3:{}", c.to_string().repeat(12));
         let hit = |id, hash: String| Some((id, hash));
 
         let cases = [
@@ -1177,6 +1206,51 @@ mod template_release_resolution_postgres_tests {
             ),
             (format!("resolver-fixture@{}", blake('a')), fc, OTHER, None),
             (format!("resolver-fixture@{}", sha('c')), fc, OTHER, None),
+            // A digest prefix resolves to the one release it starts, answered
+            // in canonical form like a full digest. A legacy bare row is a
+            // SHA-256 digest, and one stored in both forms is one release.
+            (
+                format!("resolver-fixture@{}", sha_prefix('a')),
+                fc,
+                OTHER,
+                hit(w.bare, sha('a')),
+            ),
+            (
+                format!("resolver-fixture@{}", sha_prefix('b')),
+                fc,
+                OTHER,
+                hit(w.prefixed, sha('b')),
+            ),
+            (
+                format!("resolver-fixture@{}", blake_prefix('c')),
+                fc,
+                OTHER,
+                hit(w.blake3, blake('c')),
+            ),
+            (
+                format!("resolver-fixture@{}", sha_prefix('9')),
+                fc,
+                OTHER,
+                hit(w.dual_prefixed, sha('9')),
+            ),
+            (
+                format!("resolver-fixture@{}", blake_prefix('a')),
+                fc,
+                OTHER,
+                None,
+            ),
+            (
+                format!("resolver-fixture@{}", sha_prefix('c')),
+                fc,
+                OTHER,
+                None,
+            ),
+            (
+                format!("resolver-fixture@{}", sha_prefix('b')),
+                ch,
+                OTHER,
+                None,
+            ),
             // Both forms stored: the row stored in the requested form wins over
             // the newer bare row with the larger id, and over the older bare
             // row with the smaller id.
@@ -1246,6 +1320,24 @@ mod template_release_resolution_postgres_tests {
             ("resolver-fixture-private:latest".into(), fc, OTHER, None),
             (
                 format!("resolver-fixture-private@{}", sha('f')),
+                fc,
+                OTHER,
+                None,
+            ),
+            (
+                format!("resolver-fixture-private@{}", sha_prefix('f')),
+                fc,
+                OWNER,
+                hit(w.private, sha('f')),
+            ),
+            (
+                format!("resolver-fixture-private@{}", sha_prefix('f')),
+                fc,
+                OTHER,
+                None,
+            ),
+            (
+                format!("resolver-fixture-deleting@{}", sha_prefix('7')),
                 fc,
                 OTHER,
                 None,

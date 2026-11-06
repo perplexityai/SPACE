@@ -3,9 +3,10 @@ use pplx_space_common_core::sql;
 #[cfg(test)]
 use pplx_space_common_core::types::AutoLifecycleRuntimeState;
 use pplx_space_common_core::types::{
-    AutoLifecyclePolicy, DEFAULT_TEMPLATE_TAG, Email, EnvMap, EnvSanitizationIssue, NodeId, OrgId,
-    PolicyAuthority, RuntimeKind, SandboxAutoLifecyclePatch, SandboxId, SandboxLifecycle, SemVer,
-    TemplateDesiredState, TemplateName, TemplateReference, TemplateTag, TemplateVisibility,
+    AutoLifecyclePolicy, DEFAULT_TEMPLATE_TAG, DigestPrefixResolveError, Email, EnvMap,
+    EnvSanitizationIssue, NodeId, OrgId, PolicyAuthority, RuntimeKind, SandboxAutoLifecyclePatch,
+    SandboxId, SandboxLifecycle, SemVer, TemplateDesiredState, TemplateName, TemplateReference,
+    TemplateTag, TemplateVisibility,
 };
 use pplx_space_common_svc::types::{NetworkPolicyTarget, ReconcileFacet};
 use pplx_space_metrics::sandbox::api::{
@@ -140,15 +141,6 @@ struct CreateTemplateDefaults {
     default_auto_lifecycle: Option<sqlx::types::Json<AutoLifecyclePolicy>>,
 }
 
-fn validate_create_template_reference(template: &TemplateReference) -> Result<(), ControllerError> {
-    if template.artifact_digest_prefix().is_some() {
-        return Err(ControllerError::bad_request(
-            "template digest prefixes are not supported yet; use a full sha256 digest",
-        ));
-    }
-    Ok(())
-}
-
 /// Builds the not-found error for an unresolvable template reference.
 ///
 /// The create-time authorization gate reuses this for cross-org denials so a
@@ -162,6 +154,12 @@ fn template_release_not_found(
     if let Some(digest) = template.artifact_digest() {
         return ControllerError::not_found(format!(
             "no release found for template '{template_name}' runtime '{}' hash '{digest}'",
+            runtime.alias(),
+        ));
+    }
+    if let Some(prefix) = template.artifact_digest_prefix() {
+        return ControllerError::not_found(format!(
+            "no release found for template '{template_name}' runtime '{}' hash prefix '{prefix}'",
             runtime.alias(),
         ));
     }
@@ -263,7 +261,6 @@ async fn resolve_template_release(
     caller_org: OrgId,
     miss_report: ReleaseMissReport,
 ) -> Result<(Uuid, String), ControllerError> {
-    validate_create_template_reference(template)?;
     let template_name = template.name().as_str();
 
     let access = gate_template_access(pool, template.name(), caller_org).await?;
@@ -275,7 +272,43 @@ async fn resolve_template_release(
     // the gate and the lookups are separate READ COMMITTED statements, so a
     // template published or flipped to org_specific in between must still
     // not resolve cross-org at read time.
-    if let Some(digest) = template.artifact_digest() {
+    let digest = match template.artifact_digest_prefix() {
+        Some(prefix) => {
+            let candidates = crate::template_releases_store::template_release_digests_with_prefix(
+                pool,
+                template.name(),
+                prefix,
+                runtime,
+                caller_org,
+            )
+            .await
+            .map_err(|err| {
+                db_contention_error("failed to resolve template release by hash prefix", &err)
+            })?;
+            match prefix.resolve_unique(candidates) {
+                Ok(digest) => Some(digest),
+                Err(DigestPrefixResolveError::NoMatch(_)) => {
+                    return Err(release_miss(
+                        pool,
+                        template,
+                        runtime,
+                        caller_org,
+                        access,
+                        miss_report,
+                    )
+                    .await?);
+                }
+                Err(DigestPrefixResolveError::Ambiguous(_)) => {
+                    return Err(ControllerError::bad_request(format!(
+                        "template digest prefix '{prefix}' matches more than one release of \
+                         template '{template_name}'; use a longer prefix or the full digest"
+                    )));
+                }
+            }
+        }
+        None => template.artifact_digest(),
+    };
+    if let Some(digest) = digest {
         let resolved = crate::template_releases_store::resolve_template_release_by_digest(
             pool,
             template.name(),
