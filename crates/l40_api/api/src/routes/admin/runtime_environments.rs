@@ -12,6 +12,9 @@
 //! while a sandbox's environment can't be told. Blocking stops the blocked
 //! environment; the first default stops every environment with no state.
 //!
+//! A write that commits also queues a `runtime-provisioning` reconcile on
+//! every worker and builder ([`enqueue_policy_reconcile`]).
+//!
 //! Not yet checked: that every node can run a new default (per-node usable
 //! environments are recorded, but a default change doesn't consult them yet),
 //! that a template
@@ -47,8 +50,10 @@ use super::support::{
     api_error, db_error, format_time, parse_if_match_generation, parse_json_body, read_db_error,
     require_managing_org_admin,
 };
+use super::templates::requeue_reconcile_targets_tx;
 use crate::middleware::auth::AuthUser;
 use crate::models::User;
+use crate::reconcile_queue::{ReconcileFacet, ReconcileReason, ReconcileRef};
 use crate::routes::AppState;
 
 /// A refusal from a parse helper, in the admin error shape.
@@ -254,6 +259,11 @@ async fn already_stale(pool: &sqlx::PgPool, expected: Option<u64>) -> bool {
         .is_ok_and(|generation| generation > expected)
 }
 
+/// The audit outcome of a write whose node reconcile enqueue failed, which
+/// rolls the write back.
+const QUEUE_RECONCILE_FAILED: &str =
+    "couldn't queue the node reconciles; the write was rolled back";
+
 /// What a write's audit entry needs besides its outcome.
 struct AuditContext<'a> {
     actor: &'a User,
@@ -320,6 +330,37 @@ impl AuditContext<'_> {
         self.record(None, Some(&message));
         api_error(status, message).into_response()
     }
+}
+
+/// Queue a whole-facet `runtime-provisioning` ref and a reconcile trigger on
+/// every worker and builder in the policy write's transaction, so the enqueue
+/// commits or rolls back with the write and nodes fetch the new policy within
+/// trigger latency. The enqueue lives in the handlers rather than the store's
+/// verbs: which nodes a change reconciles is a use-case decision, and the
+/// policy store writes only the policy's tables.
+///
+/// A ref already queued on a node, even one backing off after failures, is
+/// queued again as a new request and is due at once
+/// ([`requeue_reconcile_targets_tx`]). One a node holds a claim on keeps the
+/// claim and runs again once the claim is released or goes stale.
+///
+/// The trigger reuses `node_updated` rather than a new
+/// `state_reconciliation_reason` value. A controller that decodes the reasons
+/// strictly fails every claim batch holding a value it doesn't know, which
+/// would stall triggers across the fleet during a rolling deploy or after a
+/// rollback. Claims tolerate unknown values from this change on, so a
+/// dedicated reason is safe once no controller you could roll back to
+/// predates it. The reason is diagnostic only; the queued ref decides what the
+/// node reconciles.
+async fn enqueue_policy_reconcile(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+) -> Result<(), sqlx::Error> {
+    requeue_reconcile_targets_tx(
+        tx,
+        &[ReconcileRef::full(ReconcileFacet::RuntimeProvisioning)],
+        ReconcileReason::NodeUpdated,
+    )
+    .await
 }
 
 /// The strand check's verdict on a block, read before the write.
@@ -508,6 +549,13 @@ pub(super) async fn set_default_runtime_environment(
             return audit.fail("couldn't check what the write would stop", *response);
         }
     }
+    // A refusal drops the transaction, which discards anything queued in it,
+    // and so does a failed enqueue, rolling the write back with it. The
+    // enqueue goes last so a refused write doesn't do it at all, and the
+    // trigger rows it locks are held only until the commit.
+    if let Err(err) = enqueue_policy_reconcile(&mut tx).await {
+        return audit.fail(QUEUE_RECONCILE_FAILED, db_error(err).into_response());
+    }
     if let Err(err) = tx.commit().await {
         return audit.fail(
             "the commit failed; the write may have landed",
@@ -660,6 +708,10 @@ pub(super) async fn set_runtime_environment_state(
     if let Some(at_risk) = at_risk {
         drop(tx);
         return audit.refuse_strand(at_risk);
+    }
+    // As for the default: last before the commit.
+    if let Err(err) = enqueue_policy_reconcile(&mut tx).await {
+        return audit.fail(QUEUE_RECONCILE_FAILED, db_error(err).into_response());
     }
     if let Err(err) = tx.commit().await {
         return audit.fail(

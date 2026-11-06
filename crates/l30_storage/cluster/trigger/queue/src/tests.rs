@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use pplx_space_common_core::types::NodeId;
 
 use super::*;
@@ -563,5 +565,107 @@ async fn queued_triggers_reads_a_legacy_row_as_a_claim_does() -> TestResult {
             ReconcileReason::ManualNodeReconcile
         ]
     );
+    Ok(())
+}
+
+/// A reason a newer build added to the enum neither fails the claim nor
+/// strands the row: the claim returns every picked row with the reasons this
+/// build knows, and completing or failing the claim settles the row as usual.
+#[tokio::test(flavor = "current_thread")]
+async fn a_claim_skips_reasons_this_build_does_not_know() -> TestResult {
+    let db = pg_test_db().await?;
+    // Committed on its own: Postgres refuses a value added in the same
+    // transaction that uses it.
+    sqlx::query(sql!(
+        "ALTER TYPE state_reconciliation_reason ADD VALUE 'reason_from_a_newer_build'"
+    ))
+    .execute(&db.pool)
+    .await?;
+    let mixed = NodeId::new();
+    let unknown_only = NodeId::new();
+    let known = NodeId::new();
+    for node_id in [mixed, unknown_only, known] {
+        insert_node(
+            &db.pool,
+            node_id,
+            SpaceNodeRole::Worker.as_str(),
+            "k8s",
+            None,
+        )
+        .await?;
+    }
+    // The mixed row's diagnostic text names only the unknown reason, so its
+    // known reason can come only from the array, not from the fallback that
+    // parses the text when the array yields nothing. It repeats that reason,
+    // which the claim reports once.
+    for (node_id, diagnostic, reasons) in [
+        (
+            mixed,
+            "reason_from_a_newer_build",
+            "{reason_from_a_newer_build,node_updated,node_updated}",
+        ),
+        (
+            unknown_only,
+            "reason_from_a_newer_build",
+            "{reason_from_a_newer_build}",
+        ),
+    ] {
+        sqlx::query(sql!(
+            "INSERT INTO node_reconcile_triggers (node_id, reason, reasons)
+             VALUES ($1, $2, $3::state_reconciliation_reason[])"
+        ))
+        .bind(node_id)
+        .bind(diagnostic)
+        .bind(reasons)
+        .execute(&db.pool)
+        .await?;
+    }
+    enqueue_triggers(&db.pool, [known], ReconcileReason::NodeRegistered).await?;
+
+    let claim = claim_triggers(&db.pool, 10).await?;
+    let claimed = claim
+        .triggers
+        .iter()
+        .map(|trigger| {
+            (
+                trigger.node_id,
+                (trigger.reasons.clone(), trigger.diagnostic_reason.as_str()),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let expected = BTreeMap::from([
+        (
+            mixed,
+            (
+                vec![ReconcileReason::NodeUpdated],
+                "reason_from_a_newer_build",
+            ),
+        ),
+        // Nothing known is left, so the trigger fires on its diagnostic text.
+        (unknown_only, (vec![], "reason_from_a_newer_build")),
+        (
+            known,
+            (vec![ReconcileReason::NodeRegistered], "node_registered"),
+        ),
+    ]);
+    assert_eq!(claimed, expected);
+
+    // A failure is recorded against the row, so it backs off and
+    // dead-letters like any other instead of being claimed again unchanged.
+    complete_claim(
+        &db.pool,
+        &claim.claim_token,
+        &[mixed, known],
+        &[(unknown_only, "node unreachable".to_string())],
+    )
+    .await?;
+    let [failed] = queued_triggers(&db.pool, &[mixed, unknown_only, known])
+        .await?
+        .try_into()
+        .unwrap();
+    assert_eq!(failed.node_id, unknown_only);
+    assert_eq!(failed.attempts, 1);
+    assert_eq!(failed.claimed_at, None);
+    assert_eq!(failed.last_error.as_deref(), Some("node unreachable"));
     Ok(())
 }

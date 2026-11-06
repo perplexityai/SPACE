@@ -216,7 +216,13 @@ pub async fn enqueue_node_reconcile_refs_for_nodes(
     if node_ids.is_empty() || refs.is_empty() {
         return Ok(Vec::new());
     }
-    enqueue_node_reconcile_refs_for_nodes_on(pool, &node_ids, &refs).await
+    enqueue_node_reconcile_refs_for_nodes_on(
+        pool,
+        &node_ids,
+        &refs,
+        QueuedRefConflict::KeepProgress,
+    )
+    .await
 }
 
 pub async fn enqueue_node_reconcile_refs_for_nodes_tx(
@@ -229,7 +235,38 @@ pub async fn enqueue_node_reconcile_refs_for_nodes_tx(
     if node_ids.is_empty() || refs.is_empty() {
         return Ok(Vec::new());
     }
-    enqueue_node_reconcile_refs_for_nodes_on(&mut **tx, &node_ids, &refs).await
+    enqueue_node_reconcile_refs_for_nodes_on(
+        &mut **tx,
+        &node_ids,
+        &refs,
+        QueuedRefConflict::KeepProgress,
+    )
+    .await
+}
+
+/// As [`enqueue_node_reconcile_refs_for_nodes_tx`], but a ref already queued
+/// is queued again as a new request ([`QueuedRefConflict::RetryNow`]): due at
+/// once even while it backs off, with its attempts and last error reset; a
+/// claimed ref keeps its claim and runs again once it's released. For
+/// a writer whose change replaces the desired state a failing ref was
+/// retrying.
+pub async fn requeue_node_reconcile_refs_for_nodes_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    node_ids: impl IntoIterator<Item = NodeId>,
+    refs: &[ReconcileRef],
+) -> Result<Vec<EnqueuedNodeReconcile>, sqlx::Error> {
+    let node_ids = normalized_node_ids(node_ids);
+    let refs = normalized_refs(refs);
+    if node_ids.is_empty() || refs.is_empty() {
+        return Ok(Vec::new());
+    }
+    enqueue_node_reconcile_refs_for_nodes_on(
+        &mut **tx,
+        &node_ids,
+        &refs,
+        QueuedRefConflict::RetryNow,
+    )
+    .await
 }
 
 fn normalized_node_ids(node_ids: impl IntoIterator<Item = NodeId>) -> Vec<NodeId> {
@@ -257,9 +294,9 @@ async fn enqueue_node_reconcile_refs_for_nodes_on<'e>(
     executor: impl sqlx::PgExecutor<'e>,
     node_ids: &[NodeId],
     refs: &[(String, String)],
+    conflict: QueuedRefConflict,
 ) -> Result<Vec<EnqueuedNodeReconcile>, sqlx::Error> {
-    match queue_node_reconcile_refs(executor, node_ids, refs, QueuedRefConflict::KeepProgress).await
-    {
+    match queue_node_reconcile_refs(executor, node_ids, refs, conflict).await {
         Ok(rows) => {
             let mut by_node = BTreeMap::<NodeId, u64>::new();
             for QueuedReconcileRefs {

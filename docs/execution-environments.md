@@ -1066,7 +1066,10 @@ checked, unless another policy write lands while the block waits for the lock.
 Both writes take an optional `If-Match: <generation>` (`--if-generation` in the
 CLI) and answer 412 without changing anything unless the policy is still at
 that generation, so an operator writing from a stale read can't undo another's
-change, such as re-allowing an environment that was just blocked.
+change, such as re-allowing an environment that was just blocked. A write
+that commits also queues a reconcile on every worker and builder node, except a
+Direct node without a live registration, so they apply it within trigger latency
+(see "Node runtime provisioning").
 `GET .../nodes` compares each node's published policy with the cluster's, a page
 of 100 nodes at a time, and `GET .../population` counts sandboxes and template
 releases per environment binding. Node status reports the generation each node
@@ -1645,9 +1648,29 @@ catalog. While the catalog is over it, the cluster API omits the recipe, still
 serves the policy, and logs an error on every call, so no node installs anything
 new until environments are retired. Retire them before the catalog passes it.
 
-A change to the catalog or the policy reaches nodes on their next periodic tick.
-Its writer is where a `RUNTIME_PROVISIONING` reconcile trigger belongs, enqueued
-in the same transaction, to reach them within trigger latency instead.
+A policy write through the admin API queues a whole-facet `runtime-provisioning`
+ref and a reconcile trigger for every worker and builder node in the write's own
+transaction, so a committed change reaches them within trigger latency, and a
+refused write, or one rolled back because its enqueue failed, queues nothing. A
+commit error is ambiguous: the write and its enqueue may still have landed. A
+`runtime-provisioning` ref already queued on a node, even one backing off after
+failures, is queued again as a new request and is due at once; one the node
+holds a claim on runs again once the claim is released or goes stale. A Direct
+node without a live registration isn't queued, and a node the trigger misses
+still gets the change on its next periodic tick. The trigger carries the existing `node_updated` reason, because
+a controller that decodes reasons strictly fails every claim batch holding a
+`state_reconciliation_reason` value it doesn't know. Claims skip unknown values
+from this change on, so a dedicated reason can follow once no controller you
+could roll back to predates it. A catalog change still waits for the next
+periodic tick; its writer is where the same enqueue belongs.
+
+Node-ctl and the internal API read a queued `runtime-provisioning` ref only
+from PR #900 on. An older node-ctl drops a claim holding one without
+completing it, and an older internal API fails the claim, so the ref never
+dead-letters and that node's cluster reconcile queue stalls until the ref is
+gone; periodic passes still converge. Before the first policy write, run
+node-ctl on every node and every internal API replica at a release from PR #900
+on, and don't roll either back below it while such a ref is queued.
 
 Node-ctl validates the complete recipe's size, reference syntax and uniqueness
 before submitting work. It expands host-supported compiled environments into
