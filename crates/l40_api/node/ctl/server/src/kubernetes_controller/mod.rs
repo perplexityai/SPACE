@@ -66,11 +66,21 @@ fn spawn_network_slot_capacity_loop(
             if node_cache.metadata().is_none() {
                 continue;
             }
-            if let Err(error) =
-                network_slots::reconcile_network_slot_capacity(&kube, &node_cache, &node_name, true)
-                    .await
-            {
-                tracing::debug!(%error, "fast network-slot capacity reconcile failed");
+            // Stop at shutdown even mid-reconcile; the capacity patch is an
+            // idempotent apply, so an interrupted one is safe either way.
+            let reconcile = network_slots::reconcile_network_slot_capacity(
+                &kube,
+                &node_cache,
+                &node_name,
+                true,
+            );
+            tokio::select! {
+                () = shutdown.cancelled() => return,
+                result = reconcile => {
+                    if let Err(error) = result {
+                        tracing::debug!(%error, "fast network-slot capacity reconcile failed");
+                    }
+                }
             }
         }
     });
