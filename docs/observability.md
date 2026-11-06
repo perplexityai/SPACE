@@ -1138,12 +1138,15 @@ middleware resolves the request's `X-Client-ID` against the static list only
 (never the runtime overrides, so an override-only caller reads `unknown` there)
 and scopes it over the handler, so these metrics need no per-call-site
 stamping. A value the handler stamps itself, such as connect's limiter-resolved
-ID, wins. The native create executor restores this scope from the operation's
-optional `metric_client_id`, covering inline execution, dispatcher retries and
-warm-pool adoption; admission does not write that field yet. The field holds
-an ID admission already resolved, so the executing process interns it under the
+ID, wins. While `SPACE_NATIVE_CREATE_CLIENT_ATTRIBUTION_ENABLED` is on (off by
+default; see [configuration](configuration.md)), native create admission
+persists this identity as the operation's `metric_client_id`, and the shared
+create executor restores the scope for inline execution, dispatcher retries and
+warm-pool adoption. The field holds an
+ID admission already resolved, so the executing process interns it under the
 same runtime cap as override keys instead of consulting the allowlist. An
-operation without attribution reports `unknown`.
+operation without attribution reports `unknown`. Attribution is not part of the
+idempotency fingerprint, so a replay keeps the original operation's identity.
 
 Other work a request hands to another task leaves the scope and reports
 `unknown`, as do the gRPC server metrics and the background reconciler,

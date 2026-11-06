@@ -4,6 +4,7 @@ use pplx_space_common_core::types::{
 };
 use pplx_space_common_core::types::{NodeId, SandboxId};
 use pplx_space_common_core::types::{OrgId, UserId};
+use pplx_space_metrics::sandbox::api::{ClientIdTag, scope_request_client_id};
 use uuid::Uuid;
 
 use super::*;
@@ -219,8 +220,55 @@ fn native_create_rejects_zero_vcpu_before_operation_admission() {
     }
 }
 
+/// With `SPACE_NATIVE_CREATE_CLIENT_ATTRIBUTION_ENABLED` unset, a native
+/// create from an allowlisted client goes in without `metric_client_id`, so
+/// executors older than the field still accept it.
+#[tokio::test]
+async fn native_create_records_no_client_with_the_attribution_switch_unset() -> TestDbResult<()> {
+    if !pplx_space_test_env::enter_test_process(&[(
+        crate::public_sandbox_operations::NATIVE_CREATE_CLIENT_ATTRIBUTION_ENV,
+        None,
+    )]) {
+        return Ok(());
+    }
+    let db = pg_test_db().await?;
+    let response = scope_request_client_id(
+        ClientIdTag::allowlisted("admitting-client"),
+        create_native_sandbox_operation(
+            &db.pool,
+            OrgId::from_uuid(SEED_ORG_ID),
+            UserId::from_uuid(SEED_USER_ID),
+            &IdempotencyKey::parse("native-create-attribution-switch-unset")?,
+            create_request_with_auto_lifecycle(None),
+            None,
+            None,
+            None,
+            None,
+        ),
+    )
+    .await
+    .expect("native create should persist an operation");
+
+    let SqlJson(payload): SqlJson<serde_json::Value> = sqlx::query_scalar(sql!(
+        "SELECT payload_json FROM public_operations WHERE operation_id = $1"
+    ))
+    .bind(response.operation_id.as_uuid())
+    .fetch_one(&db.pool)
+    .await?;
+    assert!(payload.get("metric_client_id").is_none(), "{payload}");
+    Ok(())
+}
+
 #[tokio::test]
 async fn native_create_persists_default_policy_in_operation_payload() -> TestDbResult<()> {
+    // Turn client attribution on, in a spelling only the case-insensitive
+    // parser reads as on.
+    if !pplx_space_test_env::enter_test_process(&[(
+        crate::public_sandbox_operations::NATIVE_CREATE_CLIENT_ATTRIBUTION_ENV,
+        Some(std::ffi::OsStr::new("On")),
+    )]) {
+        return Ok(());
+    }
     let db = pg_test_db().await?;
     let context: crate::fork_operations::ForkFederatedCreateContext =
         serde_json::from_value(serde_json::json!({
@@ -237,32 +285,38 @@ async fn native_create_persists_default_policy_in_operation_payload() -> TestDbR
             IdempotencyKey::parse(format!("native-default-policy-persistence-{initial}"))?;
         let mut admitted = context.clone();
         admitted.egress_profiles = selection.clone();
-        let response = create_native_sandbox_operation(
-            &db.pool,
-            OrgId::from_uuid(SEED_ORG_ID),
-            UserId::from_uuid(SEED_USER_ID),
-            &idempotency_key,
-            create_request_with_auto_lifecycle(None),
-            Some(admitted),
-            None,
-            None,
-            None,
+        let response = scope_request_client_id(
+            ClientIdTag::allowlisted("admitting-client"),
+            create_native_sandbox_operation(
+                &db.pool,
+                OrgId::from_uuid(SEED_ORG_ID),
+                UserId::from_uuid(SEED_USER_ID),
+                &idempotency_key,
+                create_request_with_auto_lifecycle(None),
+                Some(admitted),
+                None,
+                None,
+                None,
+            ),
         )
         .await
         .expect("native create should persist an operation");
         for (retry, selection) in selections.iter().enumerate() {
             let mut retried = context.clone();
             retried.egress_profiles = selection.clone();
-            let result = create_native_sandbox_operation(
-                &db.pool,
-                OrgId::from_uuid(SEED_ORG_ID),
-                UserId::from_uuid(SEED_USER_ID),
-                &idempotency_key,
-                create_request_with_auto_lifecycle(None),
-                Some(retried),
-                None,
-                None,
-                None,
+            let result = scope_request_client_id(
+                ClientIdTag::allowlisted("replaying-client"),
+                create_native_sandbox_operation(
+                    &db.pool,
+                    OrgId::from_uuid(SEED_ORG_ID),
+                    UserId::from_uuid(SEED_USER_ID),
+                    &idempotency_key,
+                    create_request_with_auto_lifecycle(None),
+                    Some(retried),
+                    None,
+                    None,
+                    None,
+                ),
             )
             .await;
             if initial == retry || (initial < 2 && retry < 2) {
@@ -290,6 +344,11 @@ async fn native_create_persists_default_policy_in_operation_payload() -> TestDbR
         .fetch_one(&db.pool)
         .await?;
         let payload: CreateSandboxOperationPayload = serde_json::from_value(payload)?;
+        assert_eq!(
+            payload.metric_client_id.as_deref(),
+            Some("admitting-client"),
+            "admission persists its client, and replays keep it",
+        );
         assert_eq!(
             &payload
                 .federated_create

@@ -65,6 +65,12 @@ pub struct CreateSandboxOperationPayload {
     pub request: pplx_space_public_api::CreateSandboxRequest,
     /// The admitting request's resolved client ID, so metrics from detached
     /// execution keep its attribution. Older operations omit it.
+    ///
+    /// Same mixed-version rule as `node_pool`: absent payloads serialize
+    /// byte-identically and old payloads parse unchanged, while a present key
+    /// is rejected by an older executor's `deny_unknown_fields`. Native create
+    /// admission sets it only while [`NATIVE_CREATE_CLIENT_ATTRIBUTION_ENV`] is
+    /// on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metric_client_id: Option<String>,
     /// Operator-only isolation node pool pin, carried from the admin create
@@ -239,6 +245,27 @@ pub(crate) const ADMIN_CREATE_REQUESTED_BY_ENV: &str = "SPACE_ADMIN_CREATE_REQUE
 /// [`ADMIN_CREATE_REQUESTED_BY_ENV`].
 pub(crate) fn admin_create_requested_by_enabled() -> bool {
     pplx_space_common_core::env::env_flag_var(ADMIN_CREATE_REQUESTED_BY_ENV, true)
+}
+
+/// The switch for recording [`CreateSandboxOperationPayload::metric_client_id`]
+/// on native creates: `1`, `true`, `yes`, `on` or `enabled`, in any case, turns
+/// it on; unset or anything else keeps it off. Off, native creates go in
+/// without it, as before the field, and metrics from their detached execution
+/// report `client_id:unknown`. Both the API's inline runner and the cluster
+/// controller's dispatcher execute these creates, so turn it on only once every
+/// `space-api` and `space-cluster-controller` replica runs this release or a
+/// later one; older ones reject the create's payload. Before rolling either
+/// back, turn it off. An API replica reads the setting from its environment, so
+/// one started with it on keeps sending the field until it exits, shutdown
+/// drain included: wait until every such replica has exited, then until the
+/// native creates queued with the field have finished, and only then roll back.
+pub(crate) const NATIVE_CREATE_CLIENT_ATTRIBUTION_ENV: &str =
+    "SPACE_NATIVE_CREATE_CLIENT_ATTRIBUTION_ENABLED";
+
+/// Whether native creates record their client; see
+/// [`NATIVE_CREATE_CLIENT_ATTRIBUTION_ENV`].
+pub(crate) fn native_create_client_attribution_enabled() -> bool {
+    pplx_space_common_core::env::env_flag_var(NATIVE_CREATE_CLIENT_ATTRIBUTION_ENV, false)
 }
 
 impl SandboxLifecycleOperationPayload {
