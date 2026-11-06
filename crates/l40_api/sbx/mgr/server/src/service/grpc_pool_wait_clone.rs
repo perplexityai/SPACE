@@ -743,6 +743,7 @@ impl SandboxManagerService {
                     return Ok(Response::new(WaitResponse {
                         sandbox_id: id,
                         lifecycle: Some(crate::proto::SandboxLifecycleState::from(state) as i32),
+                        cleanup: None,
                     }));
                 }
 

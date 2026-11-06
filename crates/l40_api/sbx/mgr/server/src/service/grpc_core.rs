@@ -37,6 +37,7 @@ fn sandbox_list_element(row: &crate::db::SandboxListRow) -> SandboxListElement {
         runtime: Some(row.runtime.clone()),
         created_at: Some(row.created_at.clone()),
         owner: Some(row.user.to_string()),
+        cleanup: None,
     }
 }
 

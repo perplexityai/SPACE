@@ -20,6 +20,7 @@ fn lifecycle_observation_requires_a_known_present_enum() {
         let wait = WaitResponse {
             sandbox_id: String::new(),
             lifecycle: Some(raw),
+            cleanup: None,
         };
         assert_eq!(info.observed_lifecycle().unwrap(), state);
         assert_eq!(list.observed_lifecycle().unwrap(), state);
