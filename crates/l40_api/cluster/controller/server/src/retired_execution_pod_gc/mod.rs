@@ -33,13 +33,16 @@
 //! capture state. The loop therefore reaps only two shapes:
 //!
 //! - **Terminal** (`TerminalRetired`): the pod is `Succeeded` or `Failed` and
-//!   every container has terminated. There is no VM left to capture.
+//!   every container has terminated. There is no VM left to capture. This
+//!   includes restore pods: a suspended sandbox's latest pod is often its
+//!   restore pod, which `orphaned_restore_pod_gc` doesn't treat as superseded.
 //! - **Never started** (`ReplacedNeverStarted`): the row was retired as
-//!   `replaced`, the pod is still `Pending`, and it is not a restore pod.
-//!   A `replaced` generation's capture is refused by the backup fence, and a
-//!   `Pending` fresh-create pod never booted a VM. Restore pods in this shape
-//!   are left to `orphaned_restore_pod_gc`, which applies the restore-specific
-//!   supersession rules.
+//!   `replaced`, the pod is still `Pending` with no pod IP, and it is not a
+//!   restore pod. The SPACE shim boots the VM in `RunPodSandbox`, and the pod
+//!   gets its IP when that sandbox comes up, so a pod without one has no VM.
+//!   A `replaced` generation's capture is also refused by the backup fence.
+//!   Non-terminal restore pods are left to `orphaned_restore_pod_gc`, which
+//!   applies the restore-specific supersession rules.
 //!
 //! Every other retired pod (`Running`, or a non-`replaced` retirement with
 //! live containers) is skipped: its VM may still hold state, and the
