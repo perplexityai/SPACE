@@ -5,6 +5,8 @@ description: Develop and validate the Go containerd shim under `shim/` and its s
 
 # Develop the SPACE Go shim
 
+Current branch: !`git branch --show-current`
+
 Keep the shim's `sbxMgrSocket` constant in `shim/space.go` synchronized with
 Rust's `SANDBOX_MANAGER_SOCKET` in
 `crates/libs/common/core/src/host/linux.rs`.
