@@ -2450,6 +2450,10 @@ class TelemetryBackendControl(Protocol):
         """The decoded JSON body of `GET <path>?<params>` on `prometheus`, `tempo` or `loki`."""
         ...
 
+    def sandbox_pod_count(self) -> int:
+        """Non-pool, non-terminating pods, used to reject a contaminated metric window."""
+        ...
+
     def telemetry_mode(self) -> str:
         """The Kind telemetry mode (`datadog`, `otel` or `off`) the bench runs.
 

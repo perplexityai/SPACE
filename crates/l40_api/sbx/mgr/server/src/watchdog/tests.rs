@@ -1320,6 +1320,7 @@ async fn accepted_probe_yields_guest_memory_only_for_a_running_workload() {
         warm_pool_member: bool,
         lifecycle: Option<crate::state::SandboxState>,
         stale: bool,
+        removed: bool,
         guest: HealthProbeOutcome,
         memory: Option<u64>,
         /// `None` when the probe is discarded.
@@ -1331,6 +1332,7 @@ async fn accepted_probe_yields_guest_memory_only_for_a_running_workload() {
         warm_pool_member: false,
         lifecycle: Some(Started),
         stale: false,
+        removed: false,
         guest: HealthProbeOutcome::Success,
         memory,
         expected,
@@ -1347,6 +1349,14 @@ async fn accepted_probe_yields_guest_memory_only_for_a_running_workload() {
         Case {
             stale: true,
             ..case("older lifecycle epoch", Some(used), None)
+        },
+        Case {
+            removed: true,
+            ..case("sandbox retired during probe", Some(used), None)
+        },
+        Case {
+            lifecycle: None,
+            ..case("unknown lifecycle", Some(used), Some(None))
         },
         Case {
             row: Some(Paused),
@@ -1389,6 +1399,9 @@ async fn accepted_probe_yields_guest_memory_only_for_a_running_workload() {
             let mut observations = std::array::from_fn(|_| sample(HealthProbeOutcome::Success));
             observations[2] = sample(case.guest);
             async move {
+                if case.removed {
+                    state.lock().await.remove(&sandbox_id);
+                }
                 let accepted = apply_composed_health_result(
                     &state,
                     &db,
@@ -1404,7 +1417,11 @@ async fn accepted_probe_yields_guest_memory_only_for_a_running_workload() {
                     ))),
                 )
                 .await;
-                let status = state.lock().await[&sandbox_id].health_status;
+                let status = state
+                    .lock()
+                    .await
+                    .get(&sandbox_id)
+                    .map(|health| health.health_status);
                 (accepted.map(|accepted| accepted.guest_memory), status)
             }
         };
