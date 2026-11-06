@@ -1363,9 +1363,9 @@ impl SandboxController {
             .await;
         // A fork's size comes from its source snapshot, not this request.
         if restore_from.is_none()
-            && let Some(sample) = requested_metrics::admission(&admission)
+            && let Some(sample) = requested_size_metrics::admission(&admission)
         {
-            requested_metrics::record_create(
+            requested_size_metrics::record_create(
                 metric_identity.surface,
                 sample,
                 template,
@@ -2287,7 +2287,7 @@ impl SandboxController {
                     input.template,
                 ),
             );
-            requested_metrics::record_pool_claim(
+            requested_size_metrics::record_pool_claim(
                 input.metric_identity.surface,
                 input.template,
                 &sandbox,
@@ -2553,7 +2553,7 @@ impl SandboxController {
                 input.template,
             ),
         );
-        requested_metrics::record_pool_claim(
+        requested_size_metrics::record_pool_claim(
             input.metric_identity.surface,
             input.template,
             &sandbox,

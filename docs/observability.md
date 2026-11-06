@@ -1193,16 +1193,16 @@ tags:
 
 | Tag | Values |
 | --- | --- |
-| `kind` | `create` for a cold or warm-pool create |
+| `kind` | `create` for a cold or warm-pool create; `activate` for a lifecycle action that activates a dormant sandbox: a start from `created`, `stopped` or `suspended`, a wake from `created` or `suspended`, or a restore from `suspended`; `resume` for a resume or wake of a `paused` sandbox, including an ECW connect |
 | `surface` | `native` or `ecw`, the API the call arrived on |
-| `admission` | `accepted`, or `rejected` when cluster activation admission refused the call |
-| `template` | The resolved template |
-| `defaulted` | `false` when the request set both vCPU and memory; `true` when a build shape, the platform default, a warm-pool config or a warm-pool policy supplied either. Warm-pool claims are always `true` |
+| `admission` | `accepted`, or `rejected` when cluster activation admission refused the call, whether at request entry or when the substrate charged a restore claim |
+| `template` | The resolved template for a create; otherwise the sandbox's template (`unknown` if the row names none) |
+| `defaulted` | Creates only. `false` when the request set both vCPU and memory; `true` when a build shape, the platform default, a warm-pool config or a warm-pool policy supplied either. Warm-pool claims are always `true` |
 | `client_id` | The request's bounded caller, as described above |
 
-Each eligible recorded create contributes one sample to each distribution.
-Retries that reach a recording point add another sample; the distribution count
-is not the total number of incoming create requests.
+Each eligible recorded create, activation or resume contributes one sample to
+each distribution. Retries that reach a recording point add another sample;
+the distribution count is not the total number of incoming calls.
 
 Native creates (`/v1` and admin) are re-queued by the dispatcher when cluster
 admission refuses them, and each retry that reaches admission adds another
@@ -1211,11 +1211,19 @@ many requests were refused.
 
 A cold create is recorded at its cluster admission decision, so an admitted
 create that fails later still counts and one that fails before admission does
-not. A warm-pool create is recorded when its claim is adopted.
+not. A warm-pool create is recorded when its claim is adopted. An activation
+or resume is recorded only when the action succeeds or admission refuses it; a
+caller that joins another caller's in-flight activation adds none.
 
-Nothing is recorded for a fork, or for a create whose size the API did not
-resolve: a Direct create, or a Kubernetes create left to the node's default
-shape. Disk size is not recorded.
+Resident resumes need no admission; recovering a missing runtime can require
+admission and be rejected. Eligible implicit wakes routed through the lifecycle
+action controller are included; data-plane paths that bypass it are not.
+
+Nothing is recorded for a fork; a create whose size the API did not resolve (a
+Direct create, or a Kubernetes create left to the node's default shape); a
+wake of a running sandbox; a lifecycle action on a `restoring` sandbox,
+including a restore-lease takeover the substrate charges. Disk size is not
+recorded.
 
 ## Worker-local lifecycle populations
 

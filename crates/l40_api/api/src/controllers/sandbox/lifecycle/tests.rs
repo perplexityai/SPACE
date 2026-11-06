@@ -68,6 +68,77 @@ fn cluster_delete_miss_reason_classifies_by_substrate_error() {
     );
 }
 
+#[test]
+fn requested_size_kind_classifies_by_action_and_entry_lifecycle() {
+    use SandboxAction::*;
+    use SandboxLifecycle::{Created, Paused, Stopped, Suspended};
+
+    // Each row lists the dormant states that require activation and the
+    // resident states that only resume. Every other lifecycle must be excluded,
+    // including already-running, in-flight and terminal sandboxes.
+    for (action, activations, resumes, without_lifecycle) in [
+        (
+            Start,
+            &[Created, Stopped, Suspended][..],
+            &[][..],
+            Some(RequestedKind::Activate),
+        ),
+        (
+            Wake,
+            &[Created, Stopped, Suspended][..],
+            &[Paused][..],
+            None,
+        ),
+        (
+            ImplicitWake(ExecutionActivityKind::Access),
+            &[Created, Stopped, Suspended][..],
+            &[Paused][..],
+            None,
+        ),
+        (Resume, &[][..], &[Paused][..], None),
+        (
+            Restore,
+            &[Suspended][..],
+            &[][..],
+            Some(RequestedKind::Activate),
+        ),
+        (Suspend, &[][..], &[][..], None),
+        (Stop, &[][..], &[][..], None),
+        (Kill, &[][..], &[][..], None),
+        (Pause, &[][..], &[][..], None),
+        (Checkpoint, &[][..], &[][..], None),
+        (EnableSnapshots, &[][..], &[][..], None),
+        (DisableSnapshots, &[][..], &[][..], None),
+        (Stats, &[][..], &[][..], None),
+        (OpenPort, &[][..], &[][..], None),
+        (Rollback, &[][..], &[][..], None),
+        (Spaced, &[][..], &[][..], None),
+        (Update, &[][..], &[][..], None),
+    ] {
+        for &lifecycle in SandboxLifecycle::all() {
+            let expected = if activations.contains(&lifecycle) {
+                Some(RequestedKind::Activate)
+            } else if resumes.contains(&lifecycle) {
+                Some(RequestedKind::Resume)
+            } else {
+                None
+            };
+            assert_eq!(
+                action.requested_size_kind(Some(lifecycle)),
+                expected,
+                "{action:?} from {lifecycle:?}"
+            );
+        }
+        // Start and Restore conservatively classify missing context as an
+        // activation; Wake needs a known dormant state and Resume a paused one.
+        assert_eq!(
+            action.requested_size_kind(None),
+            without_lifecycle,
+            "{action:?} without lifecycle context"
+        );
+    }
+}
+
 /// Admission refusals at request entry and those the substrate charges later
 /// share one constructor, which marks them as admission refusals. Only a
 /// rate-limited refusal carries the backpressure cause the async dispatcher

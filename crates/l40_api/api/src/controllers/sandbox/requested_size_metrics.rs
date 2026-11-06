@@ -1,17 +1,21 @@
-//! Maps create outcomes onto the requested vCPU and memory
-//! distributions (`pplx_space_metrics::sandbox::api::requested`). The emit
-//! sites stay one call each; what counts and how it is tagged is decided here.
+//! Maps create, activation and resume outcomes onto the requested vCPU and
+//! memory distributions (`pplx_space_metrics::sandbox::api::requested_size`).
+//! The emit sites stay one call each; what counts and how it is tagged is
+//! decided here.
 
 use pplx_space_events::CreateShapeSource;
 use pplx_space_metrics::sandbox::admission::AdmissionDecision;
 use pplx_space_metrics::sandbox::api::{
-    RequestedKind, RequestedSize, SandboxApiSurface, requested,
+    RequestedKind, RequestedSize, SandboxApiSurface, requested_size,
 };
 
 use super::ControllerError;
 use super::queries::stored_resource;
 use crate::controllers::substrate::SandboxResources;
 use crate::models::Sandbox;
+
+/// The template tag for a sandbox row that names none.
+const UNKNOWN_TEMPLATE: &str = "unknown";
 
 /// The admission tag for a call's result: accepted on success, rejected when
 /// cluster activation admission refused it, and `None` (emit nothing) for
@@ -72,6 +76,29 @@ pub(super) fn record_pool_claim(surface: SandboxApiSurface, template: &str, sand
     );
 }
 
+/// Record an eligible activation or resume on success or admission rejection.
+pub(super) fn record_lifecycle_action<T>(
+    kind: Option<RequestedKind>,
+    surface: SandboxApiSurface,
+    sandbox: &Sandbox,
+    result: &Result<T, ControllerError>,
+) {
+    let Some(kind) = kind else {
+        return;
+    };
+    let Some(admission) = admission(result) else {
+        return;
+    };
+    emit(
+        kind,
+        surface,
+        admission,
+        sandbox.template_id.as_deref().unwrap_or(UNKNOWN_TEMPLATE),
+        effective(sandbox.vcpu, sandbox.memory_mib),
+        None,
+    );
+}
+
 /// Emit one sample, or nothing when the size is unknown.
 fn emit(
     kind: RequestedKind,
@@ -84,7 +111,7 @@ fn emit(
     let Some((vcpu, memory_mib)) = size else {
         return;
     };
-    requested(RequestedSize {
+    requested_size(RequestedSize {
         kind,
         surface,
         admission,
