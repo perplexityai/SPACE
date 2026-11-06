@@ -40,7 +40,8 @@ pub struct SweepCandidate {
     /// exempt from the sweep entirely.
     pub evacuation_restore_target: Option<SandboxLifecycle>,
     /// Whether a `state='ready'` durable snapshot exists for the row, under
-    /// per-lifecycle semantics (`store::ready_snapshot_predicate`):
+    /// per-lifecycle semantics (sandbox-store's
+    /// `sweeper::ready_snapshot_predicate`):
     /// pre-restore source-window for `restoring` (where the snapshot is
     /// recoverable and may drive a guarded revert), placement-freshness for
     /// everything else (diagnostic only — the decision table never reverts
