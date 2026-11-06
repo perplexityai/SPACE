@@ -571,6 +571,7 @@ impl SandboxManagerService {
         raw_budget: InventoryBudget,
         metadata_budget: InventoryBudget,
     ) -> Result<(StateResponse, InventoryBudget, InventoryBudget), Status> {
+        let native_lifecycle = self.config.publish_native_lifecycle;
         let (
             rows,
             missing_ids,
@@ -648,12 +649,13 @@ impl SandboxManagerService {
                             }
                             rows.push(decoded.row);
                         }
-                        StatePageRow::StateOnly(crate::db::read::StateOnlyRow {
-                            sandbox_id,
-                            lifecycle,
-                            error,
-                            route_provenance,
-                        }) => {
+                        StatePageRow::StateOnly(row) => {
+                            let crate::db::read::StateOnlyRow {
+                                sandbox_id,
+                                lifecycle,
+                                error,
+                                route_provenance,
+                            } = *row;
                             let disposition = pplx_space_metrics::sandbox::publication::StatePublicationDisposition::StateOnly;
                             pplx_space_metrics::sandbox::publication::degraded(
                                 pplx_space_metrics::sandbox::publication::StatePublicationComponent::Worker,
@@ -678,8 +680,19 @@ impl SandboxManagerService {
                                 }
                                 None => crate::db::ActivationRouteProvenance::default(),
                             };
+                            // A cleanup-owned row publishes its stored
+                            // lifecycle label once native publication is on.
+                            let published_label = if native_lifecycle
+                                && lifecycle.state.parse::<SandboxState>().is_ok_and(|status| {
+                                    cleanup_owner(status)
+                                        != crate::proto::SandboxCleanupState::Unspecified
+                                }) {
+                                &lifecycle.lifecycle
+                            } else {
+                                &lifecycle.state
+                            };
                             let mut sandbox = SandboxInfo {
-                                lifecycle: Some(crate::proto::SandboxLifecycleState::from_label(&lifecycle.state).unwrap_or(crate::proto::SandboxLifecycleState::Unspecified) as i32),
+                                lifecycle: Some(crate::proto::SandboxLifecycleState::from_label(published_label).unwrap_or(crate::proto::SandboxLifecycleState::Unspecified) as i32),
                                 sandbox_id,
                                 state_changed_at: sqlite_timestamp(&lifecycle.state_changed_at),
                                 // An undecodable status publishes only the
@@ -720,7 +733,7 @@ impl SandboxManagerService {
         let mut route_identity_provenance = route_identity_provenance;
         let sandbox_results = stream::iter(rows.into_iter().map(|sandbox| {
             let sandbox_id = sandbox.id.clone();
-            let status = (sandbox.state.to_string(), sandbox.cleanup_completion);
+            let status = (sandbox.state, sandbox.lifecycle, sandbox.cleanup_completion);
             let metadata = publication_metadata.remove(&sandbox.id);
             let state_changed_at = state_changed_at.remove(&sandbox.id);
             let pinned_artifact_created_at = pinned_artifact_created_at.remove(&sandbox.id);
@@ -803,21 +816,18 @@ impl SandboxManagerService {
                     );
                     tracing::warn!(%sandbox_id, %error, %disposition, "publishing lifecycle without unpublishable sandbox fields");
                     // The row was read; only fields published from it failed,
-                    // so its status and recorded completion are still known.
-                    let (status, completion) = status;
+                    // so its status, stored lifecycle and recorded completion
+                    // are still known.
+                    let (status, lifecycle, completion) = status;
                     let mut sandbox = SandboxInfo {
-                        lifecycle: Some(
-                            crate::proto::SandboxLifecycleState::from_label(&status)
-                                .unwrap_or(crate::proto::SandboxLifecycleState::Unspecified)
-                                as i32,
-                        ),
-                        cleanup: cleanup_observation(
-                            status.parse::<SandboxState>().map_or(
-                                crate::proto::SandboxCleanupState::Unspecified,
-                                cleanup_owner,
+                        lifecycle: Some(crate::proto::SandboxLifecycleState::from(
+                            published_lifecycle(
+                                self.config.publish_native_lifecycle,
+                                status,
+                                lifecycle,
                             ),
-                            completion,
-                        ),
+                        ) as i32),
+                        cleanup: cleanup_observation(cleanup_owner(status), completion),
                         sandbox_id,
                         state_degraded: true,
                         ..SandboxInfo::default()
@@ -1061,7 +1071,13 @@ impl SandboxManagerService {
         Ok(SandboxInfo {
             sandbox_id: sandbox.id.clone(),
             template: Some(sandbox.template.clone()),
-            lifecycle: Some(crate::proto::SandboxLifecycleState::from(observed_state) as i32),
+            lifecycle: Some(
+                crate::proto::SandboxLifecycleState::from(published_lifecycle(
+                    self.config.publish_native_lifecycle,
+                    observed_state,
+                    sandbox.lifecycle,
+                )) as i32,
+            ),
             pid,
             namespace: live_sandbox_namespace(pid_alive, &sandbox.uuid8),
             uid: sandbox.uid,
@@ -2097,6 +2113,22 @@ pub(super) fn cleanup_observation(
         completion: completion as i32,
         state: state as i32,
     })
+}
+
+/// The lifecycle published for a row read as `status` whose stored lifecycle
+/// is `lifecycle`. Until `publish_native_lifecycle` is set, a cleanup-owned
+/// row publishes its combined status; with it, the lifecycle its cleanup is
+/// over. Either way `cleanup.state` names the cleanup.
+pub(super) fn published_lifecycle(
+    native: bool,
+    status: SandboxState,
+    lifecycle: SandboxState,
+) -> SandboxState {
+    if native && cleanup_owner(status) != crate::proto::SandboxCleanupState::Unspecified {
+        lifecycle
+    } else {
+        status
+    }
 }
 
 /// Whether a cleanup owns a row with this combined status.

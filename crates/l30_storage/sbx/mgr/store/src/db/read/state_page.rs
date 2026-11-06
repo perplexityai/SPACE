@@ -27,7 +27,7 @@ pub enum StatePageRow {
     /// The whole row decoded.
     Decoded(Box<DecodedStateRow>),
     /// The row exists but did not decode; only its raw lifecycle did.
-    StateOnly(StateOnlyRow),
+    StateOnly(Box<StateOnlyRow>),
 }
 
 pub struct DecodedStateRow {
@@ -123,12 +123,12 @@ pub fn state_page(
                     }
                 };
                 page.push(PageEntry::Done(Box::new(StatePageRow::StateOnly(
-                    StateOnlyRow {
+                    Box::new(StateOnlyRow {
                         route_provenance: route_provenance.remove(sandbox_id),
                         sandbox_id: sandbox_id.clone(),
                         lifecycle,
                         error,
-                    },
+                    }),
                 ))));
             }
         }
