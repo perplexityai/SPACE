@@ -243,6 +243,10 @@ pub struct SpacedGuestServiceConfig {
     pub local_socket_path: Option<PathBuf>,
     pub bridge_socket_path: Option<PathBuf>,
     pub guest_uptime_source: fn() -> Option<prost_types::Duration>,
+    /// What a diagnostic-draining bridge Ping reports as used memory, in bytes.
+    /// Configurable so a test can fix the value or its absence; the deployed
+    /// configuration reads `/proc/meminfo`.
+    pub guest_memory_used_source: fn() -> Option<u64>,
     pub default_operation_user: GuestUserName,
     /// Image WORKDIR; explicit process cwd takes precedence.
     pub default_working_dir: Option<PathBuf>,
@@ -269,6 +273,7 @@ impl Default for SpacedGuestServiceConfig {
             ),
             bridge_socket_path: Some(pplx_space_spaced_common::default_bridge_guest_uds_path()),
             guest_uptime_source: read_guest_uptime,
+            guest_memory_used_source: meta::guest_memory_used_bytes,
             default_operation_user: execution.default_operation_user,
             default_working_dir: execution.default_working_dir,
             filesystem_execution: execution.filesystem_execution,
@@ -303,6 +308,7 @@ struct SpacedGuestServiceInner {
     bridge_socket_path: Option<PathBuf>,
     http2_preface_timeout: Duration,
     guest_uptime_source: fn() -> Option<prost_types::Duration>,
+    guest_memory_used_source: fn() -> Option<u64>,
     ready: watch::Sender<bool>,
     ready_events: watch::Sender<u64>,
     loopback_bridge: LoopbackBridgeManager,
@@ -393,6 +399,7 @@ impl SpacedGuestService {
                 bridge_socket_path: config.bridge_socket_path,
                 http2_preface_timeout: config.http2_preface_timeout,
                 guest_uptime_source: config.guest_uptime_source,
+                guest_memory_used_source: config.guest_memory_used_source,
                 ready,
                 ready_events,
                 loopback_bridge,
