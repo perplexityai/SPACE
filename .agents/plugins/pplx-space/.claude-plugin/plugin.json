@@ -1,5 +1,10 @@
 {
   "name": "pplx-space",
   "description": "SPACE development, validation, infrastructure, and operations workflows.",
-  "version": "0.2.47"
+  "version": "0.2.48",
+  "hooks": {
+    "SessionStart": [
+      {"hooks": [{"type": "command", "command": "echo 'Read AGENTS.md before you start.'"}]}
+    ]
+  }
 }
