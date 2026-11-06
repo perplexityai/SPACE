@@ -237,9 +237,9 @@ async fn reads_answer_through_the_granted_route_in_the_apis_shapes() {
         other => panic!("expected a read, got {other:?}"),
     }
 
-    // The API was asked to authorize, then to prepare, each request: about
-    // the operation, the path's sandbox segment and the client's headers,
-    // with the request id the client is answered with.
+    // The API was asked once for each request, to prepare it, which
+    // authorizes it too: about the operation, the path's sandbox segment and
+    // the client's headers, with the request id the client is answered with.
     let access = harness.api.calls();
     let asked: Vec<_> = access
         .iter()
@@ -252,14 +252,7 @@ async fn reads_answer_through_the_granted_route_in_the_apis_shapes() {
     );
     assert_eq!(
         asked,
-        [
-            ("authorize", stat),
-            ("prepare", stat),
-            ("authorize", list),
-            ("prepare", list),
-            ("authorize", read),
-            ("prepare", read),
-        ]
+        [("prepare", stat), ("prepare", list), ("prepare", read)]
     );
     for call in &access {
         assert_eq!(
@@ -271,7 +264,86 @@ async fn reads_answer_through_the_granted_route_in_the_apis_shapes() {
         assert_eq!(call.fingerprint, None);
     }
     assert_eq!(access[0].request.request_id, stat_request_id);
-    assert_eq!(access[1].request.request_id, stat_request_id);
+}
+
+#[tokio::test]
+async fn a_small_body_is_checked_before_the_api_is_asked_and_its_refusal_still_comes_first() {
+    if !test_process() {
+        return;
+    }
+    let harness = Harness::start().await;
+    let unauthorized = br#"{"code":"unauthorized","message":"invalid API key","request_id":"req_1","retryable":false,"details":[]}"#;
+    let not_json = || {
+        Request::post(harness.path("stat"))
+            .header(header::AUTHORIZATION, CLIENT_KEY)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from("{"))
+            .unwrap()
+    };
+
+    // A body that fails its checks is not answered until the API has
+    // authorized the request: its refusal is the answer, as on the API's
+    // route, where credentials are checked before the body is read.
+    harness.api.authorize(Answer::Refuse(rendered(
+        401,
+        &[("content-type", "application/json")],
+        unauthorized,
+    )));
+    let (status, _, body) = read_body(harness.send(not_json()).await).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(body.as_ref(), unauthorized);
+
+    // Authorized, the check's own refusal is the answer, and nothing is
+    // prepared.
+    assert_eq!(
+        harness.send(not_json()).await.status(),
+        StatusCode::BAD_REQUEST
+    );
+    let asked: Vec<_> = harness.api.calls().iter().map(|call| call.rpc).collect();
+    assert_eq!(asked, ["authorize", "authorize"]);
+
+    // A body that passes them is only prepared, and a refusal of its
+    // credentials there is answered as the API rendered it.
+    harness.api.prepare(Answer::Refuse(rendered(
+        401,
+        &[("content-type", "application/json")],
+        unauthorized,
+    )));
+    let (status, _, body) = read_body(harness.send(stat(&harness)).await).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(body.as_ref(), unauthorized);
+    let asked: Vec<_> = harness.api.calls().iter().map(|call| call.rpc).collect();
+    assert_eq!(asked, ["authorize", "authorize", "prepare"]);
+    assert!(harness.worker.calls().is_empty());
+}
+
+#[tokio::test]
+async fn a_body_too_large_to_check_first_is_authorized_before_it_is_read() {
+    if !test_process() {
+        return;
+    }
+    let harness = Harness::start().await;
+    // Valid, and one byte over the bound once padded.
+    let mut padded = json!({"path": "/workspace/a.txt"}).to_string();
+    padded.insert_str(1, &" ".repeat(16 * 1024 + 1 - padded.len()));
+    let over_the_bound = Request::post(harness.path("stat"))
+        .header(header::AUTHORIZATION, CLIENT_KEY)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(padded))
+        .unwrap();
+    // A client that waits for `100 Continue` has not sent its body yet.
+    let mut waits_to_send = stat(&harness);
+    waits_to_send
+        .headers_mut()
+        .insert(header::EXPECT, "100-continue".parse().unwrap());
+    for request in [over_the_bound, waits_to_send] {
+        harness.worker.reply(Reply::Stat(Ok(StatResponse {
+            info: Some(file_info("/workspace/a.txt", 5)),
+        })));
+        assert_eq!(harness.send(request).await.status(), StatusCode::OK);
+    }
+    let asked: Vec<_> = harness.api.calls().iter().map(|call| call.rpc).collect();
+    assert_eq!(asked, ["authorize", "prepare", "authorize", "prepare"]);
 }
 
 /// A body that records whether anything read it.
@@ -379,7 +451,7 @@ async fn the_routes_are_mounted_only_when_served() {
         .send(harness.post("stat", json!({"path": "/workspace"})))
         .await;
     assert!(served.headers().contains_key("x-request-id"));
-    assert_eq!(harness.api.calls().len(), 2);
+    assert_eq!(harness.api.calls().len(), 1);
 
     harness.state.native_files = None;
     let unmounted = harness
@@ -388,7 +460,7 @@ async fn the_routes_are_mounted_only_when_served() {
     // The request reaches the data plane's other routes, which answer it
     // as no Native route.
     assert!(!unmounted.headers().contains_key("x-request-id"));
-    assert_eq!(harness.api.calls().len(), 2);
+    assert_eq!(harness.api.calls().len(), 1);
 }
 
 /// What the API's route answers for one failure.
@@ -1013,7 +1085,7 @@ async fn an_api_that_cannot_answer_is_a_retryable_503() {
         Status::unimplemented("unknown service"),
         Status::deadline_exceeded("timed out"),
     ] {
-        harness.api.authorize(Answer::Fail(failure));
+        harness.api.prepare(Answer::Fail(failure));
         let (status, headers, body) = read_body(harness.send(stat(&harness)).await).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(headers[header::RETRY_AFTER], "1");
@@ -1027,7 +1099,7 @@ async fn an_api_that_cannot_answer_is_a_retryable_503() {
     // A request the API could not read is this server's fault.
     harness
         .api
-        .authorize(Answer::Fail(Status::invalid_argument("bad header")));
+        .prepare(Answer::Fail(Status::invalid_argument("bad header")));
     let response = harness.send(stat(&harness)).await;
     assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     assert!(harness.worker.calls().is_empty());

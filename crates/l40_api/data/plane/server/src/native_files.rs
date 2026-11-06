@@ -1,14 +1,22 @@
 //! Native `files:*` on the data plane.
 //!
 //! The data plane carries a request's bytes and the lifecycle API decides it.
-//! Before the body is read, [`access`] asks the API's activation listener to
-//! authorize the request from its headers. Once the body is checked, it asks
-//! the API to prepare the sandbox call: the idempotency binding, drain gate,
-//! admission charge and wake. The call itself then goes straight to the
-//! sandbox's runtime ([`call`]). Field checks, worker requests and the
-//! mapping of a failed call are `pplx-space-native-files`'s, which the API's
-//! own handlers use too, so a request gets the same answer from either
-//! server. The API keeps those handlers, and serves whatever reaches it.
+//! Once the body is checked, [`access`] asks the API's activation listener to
+//! prepare the sandbox call: it authorizes the request, then runs the
+//! idempotency binding, drain gate, admission charge and wake. The call
+//! itself then goes straight to the sandbox's runtime ([`call`]). Field
+//! checks, worker requests and the mapping of a failed call are
+//! `pplx-space-native-files`'s, which the API's own handlers use too, so a
+//! request gets the same answer from either server. The API keeps those
+//! handlers, and serves whatever reaches it.
+//!
+//! A request whose body is not small enough to check first is authorized
+//! from its headers before its body is read, in an RPC of its own: every
+//! write, and any request that declares no length or more than
+//! [`CHECKED_BEFORE_AUTHORIZATION_MAX_BYTES`]. A small body is checked first
+//! so that a request the API admits costs it one RPC, not two. One that
+//! fails its checks is authorized before it is answered, so the API's
+//! refusal still comes first, as it does on the API's own route.
 
 mod access;
 mod admission;
@@ -23,7 +31,10 @@ use axum::{
     Router,
     body::Body,
     extract::{DefaultBodyLimit, FromRequest, FromRequestParts, Path},
-    http::{Extensions, HeaderMap, HeaderValue, Method, Request, StatusCode, Version, header},
+    http::{
+        Extensions, HeaderMap, HeaderValue, Method, Request, StatusCode, Version, header,
+        request::Parts,
+    },
     middleware,
     response::{IntoResponse, Response},
     routing::any,
@@ -48,6 +59,12 @@ use super::DataPlaneState;
 use crate::upload_admission::UploadAdmission;
 
 const IDEMPOTENCY_KEY_HEADER: &str = "idempotency-key";
+/// The largest declared body a request is checked with before the API has
+/// authorized it. Every body but a write's is a path or two and a few
+/// fields, well under this; an unauthenticated client can make a replica
+/// hold no more than this per request, less than the headers it already
+/// sends the API to be authorized.
+const CHECKED_BEFORE_AUTHORIZATION_MAX_BYTES: u64 = 16 * 1024;
 
 /// Whether this data plane answers Native `files:*`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
@@ -125,15 +142,22 @@ fn handler(operation: FileOperation) -> axum::routing::MethodRouter<DataPlaneSta
     }
 }
 
-/// A request the API has authorized, with its body still unread.
+/// A files request with its body still unread.
 pub(super) struct FileRequest {
     files: Arc<NativeFiles>,
-    /// What the API was asked to authorize; preparing asks it again.
+    /// What the API is asked about the request.
     access: pplx_space_node_api_client::proto::NativeFileRequest,
     pub(super) headers: HeaderMap,
     /// The route's, such as its body limit, for reading the body.
     extensions: Extensions,
     pub(super) version: Version,
+    /// Whether the API has authorized the request from its headers already.
+    /// One it has not is authorized when it is prepared.
+    authorized: bool,
+}
+
+/// Who a request the API authorized from its headers acts for.
+pub(super) struct Authorized {
     /// The sandbox the path names, as the API parsed it.
     pub(super) sandbox_id: SandboxId,
     /// The org the request acts for.
@@ -141,6 +165,25 @@ pub(super) struct FileRequest {
 }
 
 impl FileRequest {
+    /// Take `request` as `operation` without asking the API yet when its
+    /// body is small enough to check first, or else have the API authorize
+    /// it from its headers as [`Self::authorize`] does. Pass the outcome of
+    /// the body's checks to [`Self::checked`]. The body is handed back
+    /// unread.
+    pub(super) async fn receive(
+        state: &DataPlaneState,
+        operation: FileOperation,
+        request: Request<Body>,
+    ) -> Result<(Self, Body), Refusal> {
+        if !checks_before_authorization(&request) {
+            let (request, _, body) = Self::authorize(state, operation, request).await?;
+            return Ok((request, body));
+        }
+        let (files, parts, body) = accept(state, request)?;
+        let access = access::file_request(operation, &parts);
+        Ok((Self::from_parts(files, access, parts, false), body))
+    }
+
     /// Have the API authorize `request` as `operation` from its headers
     /// alone, and answer its refusal if it refuses. The body is handed back
     /// unread.
@@ -148,17 +191,8 @@ impl FileRequest {
         state: &DataPlaneState,
         operation: FileOperation,
         request: Request<Body>,
-    ) -> Result<(Self, Body), Refusal> {
-        // A replica that is leaving takes no new request; the retry reaches
-        // one that is not, as a refused stream's does.
-        if state.drain_started.is_cancelled() {
-            return Err(draining().into());
-        }
-        let Some(files) = state.native_files.clone() else {
-            // The routes are mounted only with a client to the API.
-            return Err(PublicApiError::internal().into());
-        };
-        let (mut parts, body) = request.into_parts();
+    ) -> Result<(Self, Authorized, Body), Refusal> {
+        let (files, mut parts, body) = accept(state, request)?;
         let access = access::file_request(operation, &parts);
         let authorization = files.access.authorize(access.clone()).await?;
         if parts.method != Method::POST {
@@ -175,23 +209,48 @@ impl FileRequest {
             .org_id
             .parse()
             .map_err(|_| PublicApiError::internal())?;
+        let authorized = Authorized {
+            sandbox_id: sandbox_id.into(),
+            org_id,
+        };
         Ok((
-            Self {
-                files,
-                access,
-                headers: parts.headers,
-                extensions: parts.extensions,
-                version: parts.version,
-                sandbox_id: sandbox_id.into(),
-                org_id,
-            },
+            Self::from_parts(files, access, parts, true),
+            authorized,
             body,
         ))
     }
 
-    /// Have the API prepare the sandbox call: everything its handler does
-    /// before calling the sandbox, with `fingerprint` the body's for an
-    /// operation whose key is bound.
+    fn from_parts(
+        files: Arc<NativeFiles>,
+        access: pplx_space_node_api_client::proto::NativeFileRequest,
+        parts: Parts,
+        authorized: bool,
+    ) -> Self {
+        Self {
+            files,
+            access,
+            headers: parts.headers,
+            extensions: parts.extensions,
+            version: parts.version,
+            authorized,
+        }
+    }
+
+    /// `checks`, the outcome of the body's checks, unless the API refuses
+    /// the request: a request whose body failed them before the API
+    /// authorized it is authorized first, so that it is answered as the
+    /// API's route answers it.
+    pub(super) async fn checked<T>(&self, checks: Result<T, Refusal>) -> Result<T, Refusal> {
+        let refusal = match checks {
+            Ok(checked) => return Ok(checked),
+            Err(refusal) => refusal,
+        };
+        if !self.authorized {
+            self.files.access.authorize(self.access.clone()).await?;
+        }
+        Err(refusal)
+    }
+
     /// The request again, around `body`.
     fn with_body(&self, body: Body) -> Request<Body> {
         let mut request = Request::new(body);
@@ -201,6 +260,9 @@ impl FileRequest {
         request
     }
 
+    /// Have the API prepare the sandbox call: authorize the request and do
+    /// everything its handler does before calling the sandbox, with
+    /// `fingerprint` the body's for an operation whose key is bound.
     pub(super) async fn prepare(
         &self,
         fingerprint: Option<&pplx_space_public_api::RequestFingerprint>,
@@ -210,6 +272,37 @@ impl FileRequest {
             .prepare(self.access.clone(), fingerprint)
             .await
     }
+}
+
+/// `request`'s parts and body, unless this replica takes no files request
+/// now.
+fn accept(
+    state: &DataPlaneState,
+    request: Request<Body>,
+) -> Result<(Arc<NativeFiles>, Parts, Body), Refusal> {
+    // A replica that is leaving takes no new request; the retry reaches one
+    // that is not, as a refused stream's does.
+    if state.drain_started.is_cancelled() {
+        return Err(draining().into());
+    }
+    let Some(files) = state.native_files.clone() else {
+        // The routes are mounted only with a client to the API.
+        return Err(PublicApiError::internal().into());
+    };
+    let (parts, body) = request.into_parts();
+    Ok((files, parts, body))
+}
+
+/// Whether `request`'s body is checked before the API authorizes it: a POST
+/// that declares a body of at most [`CHECKED_BEFORE_AUTHORIZATION_MAX_BYTES`]
+/// and does not wait for `100 Continue` to send it. Any other is authorized
+/// first, so an unauthenticated client is refused before it sends more.
+fn checks_before_authorization(request: &Request<Body>) -> bool {
+    request.method() == Method::POST
+        && !request.headers().contains_key(header::EXPECT)
+        && http_body::Body::size_hint(request.body())
+            .exact()
+            .is_some_and(|declared| declared <= CHECKED_BEFORE_AUTHORIZATION_MAX_BYTES)
 }
 
 /// The body as `T`, rejected as the API's `Json` extractor rejects it: the

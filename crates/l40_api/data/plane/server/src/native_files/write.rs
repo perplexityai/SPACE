@@ -28,7 +28,7 @@ use pplx_space_sbx_mgr_client::proto::{SpacedMkdirRequest, SpacedWriteBatchEntry
 
 use super::admission::HTTP2_WAITING_WRITE_MAX_BYTES;
 use super::call::{CallFailure, Reconnect, SandboxCall};
-use super::{FileRequest, Refusal, idempotency_key, json_body, rejected};
+use super::{Authorized, FileRequest, Refusal, idempotency_key, json_body, rejected};
 use crate::DataPlaneState;
 use crate::state::EcwProxyError;
 use crate::upload_admission::{UploadPermit, UploadTenant};
@@ -53,8 +53,8 @@ pub(super) async fn write_file_batch(
 
 async fn write(state: &DataPlaneState, request: Request<Body>) -> Result<Response, Refusal> {
     const OPERATION: FileOperation = FileOperation::Write;
-    let (request, body) = FileRequest::authorize(state, OPERATION, request).await?;
-    let (_permit, body) = admit(&request, body, OPERATION).await?;
+    let (request, authorized, body) = FileRequest::authorize(state, OPERATION, request).await?;
+    let (_permit, body) = admit(&request, &authorized, body, OPERATION).await?;
     let FileWriteRequest {
         path,
         data_base64,
@@ -111,8 +111,8 @@ async fn write(state: &DataPlaneState, request: Request<Body>) -> Result<Respons
 
 async fn write_batch(state: &DataPlaneState, request: Request<Body>) -> Result<Response, Refusal> {
     const OPERATION: FileOperation = FileOperation::WriteBatch;
-    let (request, body) = FileRequest::authorize(state, OPERATION, request).await?;
-    let (_permit, body) = admit(&request, body, OPERATION).await?;
+    let (request, authorized, body) = FileRequest::authorize(state, OPERATION, request).await?;
+    let (_permit, body) = admit(&request, &authorized, body, OPERATION).await?;
     let body: FileWriteBatchRequest = json_body(&request, body).await?;
     idempotency_key(&request.headers)?;
     validate_write_batch_shape(&body).map_err(rejected)?;
@@ -211,6 +211,7 @@ async fn mkdir_parent(
 /// The permit is held until the write answers.
 async fn admit(
     request: &FileRequest,
+    authorized: &Authorized,
     body: Body,
     operation: FileOperation,
 ) -> Result<(Option<UploadPermit>, Body), Refusal> {
@@ -229,8 +230,8 @@ async fn admit(
         return Ok((None, body));
     };
     let tenant = UploadTenant {
-        org_id: request.org_id,
-        sandbox_id: request.sandbox_id,
+        org_id: authorized.org_id,
+        sandbox_id: authorized.sandbox_id,
     };
     // Over HTTP/2 only a small write waits, so the bodies of waiting writes
     // can't fill their connection's window (see `admission`).
