@@ -11333,6 +11333,10 @@ mod kubernetes_tests {
         /// The caller drops the create while it waits for the pod it created
         /// to become reachable.
         CancelledDuringReadinessWait,
+        /// The control plane retires the execution as `replaced` (a node's
+        /// activation-rollback receipt) while the create waits for its pod,
+        /// and the caller then drops the create.
+        CancelledAfterExecutionRetiredElsewhere,
     }
 
     /// What an ended create must leave behind.
@@ -11356,7 +11360,8 @@ mod kubernetes_tests {
                 | Self::CancelledDuringAutoLifecycleReload
                 | Self::CancelledDuringClaimRelease => ClaimAfterEnd::Released,
                 Self::CancelledDuringPodCreate => ClaimAfterEnd::Retained,
-                Self::CancelledDuringReadinessWait => ClaimAfterEnd::RetiredWithItsPod,
+                Self::CancelledDuringReadinessWait
+                | Self::CancelledAfterExecutionRetiredElsewhere => ClaimAfterEnd::RetiredWithItsPod,
             }
         }
     }
@@ -11426,6 +11431,9 @@ mod kubernetes_tests {
     #[case::cancelled_during_claim_release(CreateEnd::CancelledDuringClaimRelease)]
     #[case::cancelled_during_pod_create(CreateEnd::CancelledDuringPodCreate)]
     #[case::cancelled_during_readiness_wait(CreateEnd::CancelledDuringReadinessWait)]
+    #[case::cancelled_after_execution_retired_elsewhere(
+        CreateEnd::CancelledAfterExecutionRetiredElsewhere
+    )]
     #[tokio::test(flavor = "current_thread")]
     async fn create_ending_early_gives_back_exactly_what_it_claimed(
         #[case] end: CreateEnd,
@@ -11776,7 +11784,8 @@ mod kubernetes_tests {
                 .await?;
                 drop(create);
             }
-            CreateEnd::CancelledDuringReadinessWait => {
+            CreateEnd::CancelledDuringReadinessWait
+            | CreateEnd::CancelledAfterExecutionRetiredElsewhere => {
                 let mut create = Box::pin(
                     unreachable_substrate.create_execution(request(sandbox_id, Some(end))),
                 );
@@ -11799,6 +11808,16 @@ mod kubernetes_tests {
                     }
                 })
                 .await?;
+                if matches!(end, CreateEnd::CancelledAfterExecutionRetiredElsewhere) {
+                    sqlx::query(sql!(
+                        "UPDATE sandbox_k8s_executions
+                            SET active = FALSE, state = 'replaced'
+                          WHERE sandbox_id = $1"
+                    ))
+                    .bind(sandbox_id)
+                    .execute(&pool)
+                    .await?;
+                }
                 drop(create);
                 assert_eq!(
                     unreachable_substrate.cancel_tracker.current_count(),
