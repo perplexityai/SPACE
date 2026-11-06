@@ -33,17 +33,27 @@ preference and an optional organization primary color. An unset color uses the
 preset accent; a configured color derives matching interaction and link states
 without replacing status colors or surfaces. Table density remains page-owned.
 
-## Sandbox dashboard link
+## Sandbox Datadog links
 
-Set `SPACE_UI_DATADOG_DASHBOARD_URL` on the running UI server to enable the
-sandbox's Debug Dashboard button. The URL must use HTTPS and contain no
-username or password. An unset or invalid value hides only the button; invalid
-values produce a server warning without logging the URL. This is runtime
-configuration: the same built image can serve different deployments without
-rebuilding browser assets. The URL is
-visible to UI users, so do not put secrets in its query parameters either.
+Set `SPACE_UI_DATADOG_LOGS_URL` on the running UI server to enable the
+sandbox's Datadog logs button, and `SPACE_UI_DATADOG_DASHBOARD_URL` to enable
+its Debug Dashboard button. Each button is hidden while its variable is
+unset, so a deployment without Datadog shows neither.
+
+The logs URL is your Datadog site's Logs explorer, such as
+`https://app.datadoghq.com/logs` (or the explorer of another Datadog site).
+The link sets the explorer's query to the sandbox's ID, UUID and pod name,
+and its time window to the sandbox's creation until now; other query
+parameters in the configured URL are kept unless the link sets them.
+
+Both follow the same rules. Each URL must use HTTPS and contain no
+username or password. An unset or invalid value hides only its button;
+invalid values produce a server warning without logging the URL. This is
+runtime configuration: the same built image can serve different deployments
+without rebuilding browser assets. The URLs are visible to UI users, so do
+not put secrets in their query parameters either.
 
 The dashboard should expose `sandbox_id` and `sandbox_pod_name` template
 variables. The link fills those variables and the sandbox's creation-to-now
 time window; unrelated query parameters in the configured URL are preserved.
-The Datadog logs link remains available independently.
+Each link works without the other.

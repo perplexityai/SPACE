@@ -11,6 +11,7 @@ import {
   continuationFor,
   createdBounds,
   fragmentSearchScope,
+  isSearchUnsupported,
   listRequestQuery,
   listScope,
   listSections,
@@ -25,6 +26,7 @@ import {
   previousPage,
   sameScope,
   sandboxListQuery,
+  sandboxUserLabel,
   scopeChangePlan,
   showsOlderFormat,
   splitNodeReported,
@@ -67,6 +69,7 @@ test('every set filter maps to its list parameter on a paged request', () => {
     createdWithin: '30d',
     olderThan: '24h',
     prefix: '  Build-  ',
+    search: ' 9b10B406\0 ',
   }, { limit: 50, cursor: 'djE6MTo', now: NOW });
   assert.deepEqual(parse(query), {
     limit: '50',
@@ -79,7 +82,34 @@ test('every set filter maps to its list parameter on a paged request', () => {
     created_before: '2026-11-02T12:00:00.000Z',
     // Trimmed, case kept: a name prefix is case-sensitive.
     prefix: 'Build-',
+    // Trimmed, without the NUL the server refuses.
+    search: '9b10B406',
   });
+});
+
+test('a search is part of the scope, and a sampled request does not send it', () => {
+  const searched = listScope('paged', { ...NO_FILTERS, search: 'e2e-1' }, { limit: 50, cursor: '' });
+  assert.ok(!sameScope(searched, listScope('paged', NO_FILTERS, { limit: 50, cursor: '' })));
+  assert.ok(!sameScope(searched, listScope('paged', { ...NO_FILTERS, prefix: 'e2e-1' }, { limit: 50, cursor: '' })));
+  assert.equal(parse(sandboxListQuery('sampled', { ...NO_FILTERS, search: 'e2e-1' }, { limit: 1000, now: NOW })).search, undefined);
+});
+
+test('only a 400 naming search shows a server without it', () => {
+  const refused = (status, message) => Object.assign(new Error(message), { status });
+  assert.equal(isSearchUnsupported(refused(400, 'unknown query parameter "search"')), true);
+  assert.equal(isSearchUnsupported(refused(400, 'unknown query parameter "prefix"')), false);
+  assert.equal(isSearchUnsupported(refused(400, 'search must not contain a NUL character')), false);
+  assert.equal(isSearchUnsupported(refused(503, 'unknown query parameter "search"')), false);
+  assert.equal(isSearchUnsupported(null), false);
+});
+
+test('the User column shows the email, else the reported owner, else the user ID', () => {
+  const userId = '0193a000-0000-7000-8000-000000000002';
+  assert.equal(sandboxUserLabel({ user_id: userId, user: 'root', user_email: 'dev@example.test' }), 'dev@example.test');
+  // A server that does not report emails.
+  assert.equal(sandboxUserLabel({ user_id: userId, user: 'root' }), 'root');
+  assert.equal(sandboxUserLabel({ user_id: userId, user: null, user_email: null }), '0193a000');
+  assert.equal(sandboxUserLabel({ user_id: null, user: null, user_email: null }), '—');
 });
 
 test('the first page sends an empty cursor, and unset filters send nothing', () => {
@@ -180,6 +210,10 @@ test('a fragment search reads the first page of the selected filters with it as 
   // The list itself is read without it.
   assert.equal(parse(listRequestQuery(selected, NOW)).prefix, undefined);
   assert.equal(fragmentSearchScope(listScope('sampled', NO_FILTERS, { limit: 1000, cursor: '' }), 'e2e-1'), null);
+  // A fragment search is how a server without `search` is searched, so it
+  // never sends one, even before the list's own filters drop it.
+  const unsupported = scopeOf({ search: 'e2e-1' });
+  assert.equal(parse(listRequestQuery(fragmentSearchScope(unsupported, 'e2e-1'), NOW)).search, undefined);
 });
 
 test('an answer for a filter undone before it arrived is dropped, and the rows on screen are kept', () => {
@@ -281,6 +315,41 @@ test('Next follows the page shown, and a failed load of another page leaves it o
   assert.equal(selection.goTo(selection.previousPosition()), true);
   assert.equal(selection.selected.cursor, '');
   assert.equal(selection.goTo(selection.previousPosition()), false);
+});
+
+test('a search an API refuses returns to the page it was typed on', async () => {
+  const selection = newSelection({ template: 'alpha' });
+  await selection.load(selection.selected, reads(page('c1')).read);
+  selection.goTo(selection.nextPosition());
+  await selection.load(selection.selected, reads(page('c2')).read);
+  const onPage2 = selection.selected;
+  // Sending the search restarts at the first page, as any filter does.
+  selection.select({ filters: { ...NO_FILTERS, template: 'alpha', search: '9b10b406' }, pageSize: 50, sampleSize: 1000 });
+  assert.equal(selection.selected.cursor, '');
+  const unsupported = Object.assign(new Error('unknown query parameter "search"'), { status: 400 });
+  assert.equal((await selection.load(selection.selected, reads(unsupported).read)).kind, 'failed');
+  // The fallback goes back to the filters it was typed under, and to page 2,
+  // where the console matches within the page as it did before.
+  const plan = selection.select({ filters: { ...NO_FILTERS, template: 'alpha' }, pageSize: 50, sampleSize: 1000 }, { refusedSearch: true });
+  assert.equal(plan, 'load');
+  assert.equal(selection.selected.key, onPage2.key);
+  assert.equal(selection.selected.cursor, 'c1');
+});
+
+test('a search cleared or changed by the operator restarts at the first page', async () => {
+  const selection = newSelection({ template: 'alpha' });
+  await selection.load(selection.selected, reads(page('c1')).read);
+  selection.goTo(selection.nextPosition());
+  selection.select({ filters: { ...NO_FILTERS, template: 'alpha', search: 'abc' }, pageSize: 50, sampleSize: 1000 });
+  // Cleared by the operator: no fallback, so the first page.
+  selection.select({ filters: { ...NO_FILTERS, template: 'alpha' }, pageSize: 50, sampleSize: 1000 });
+  assert.equal(selection.selected.cursor, '');
+  // A fallback under other filters than the search was typed under starts
+  // at their first page.
+  selection.goTo({ cursors: ['', 'c1'], index: 1 });
+  selection.select({ filters: { ...NO_FILTERS, template: 'alpha', search: 'abc' }, pageSize: 50, sampleSize: 1000 });
+  selection.select({ filters: { ...NO_FILTERS, template: 'beta' }, pageSize: 50, sampleSize: 1000 }, { refusedSearch: true });
+  assert.equal(selection.selected.cursor, '');
 });
 
 test('a failed refresh of the page on screen keeps its rows and its Next', async () => {

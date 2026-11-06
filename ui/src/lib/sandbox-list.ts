@@ -59,10 +59,16 @@ export interface SandboxListFilters {
   olderThan: CreatedAge | null;
   // A name prefix (case-sensitive) or ID prefix, as typed.
   prefix: string;
+  // Trimmed text of at least 3 characters for a server that takes `search`
+  // (see `isSearchUnsupported`): it matches names that start with it,
+  // ignoring case, and, when it is hex digits once dashes and a leading
+  // `sbx_` are left out, IDs that end with them (from 4 digits) or start with
+  // them (from 8).
+  search: string;
 }
 
 export const NO_FILTERS: SandboxListFilters = {
-  org: null, lifecycles: [], template: null, userId: null, createdWithin: null, olderThan: null, prefix: '',
+  org: null, lifecycles: [], template: null, userId: null, createdWithin: null, olderThan: null, prefix: '', search: '',
 };
 
 // The query string of one list request. A sampled request is the first page
@@ -90,7 +96,26 @@ export function sandboxListQuery(
   // The server refuses a NUL, which no typed prefix needs.
   const prefix = filters.prefix.trim().replaceAll('\0', '');
   if (prefix) params.set('prefix', prefix);
+  const search = filters.search.trim().replaceAll('\0', '');
+  if (search) params.set('search', search);
   return params.toString();
+}
+
+// The answer of a server that predates `search` to a paged request carrying
+// it: a 400 naming the parameter, since a paging server refuses an unknown
+// one once `cursor` is present. The console then searches as it did before
+// (`sandboxSearch` without `serverSearch`) for as long as the list page stays
+// mounted: a reload, or leaving the page and coming back, tries `search`
+// again.
+export function isSearchUnsupported(error: unknown): boolean {
+  const { status, message } = (error ?? {}) as { status?: unknown; message?: unknown };
+  return status === 400 && typeof message === 'string' && message.includes('unknown query parameter "search"');
+}
+
+// The User column's label: the owner's email when the server sends one,
+// else the node-reported owner, else the start of the user ID.
+export function sandboxUserLabel(row: Pick<Sandbox, 'user_id' | 'user' | 'user_email'>): string {
+  return row.user_email || row.user || (row.user_id ? row.user_id.slice(0, 8) : '—');
 }
 
 // What one list request asks for: the list shape, the page size or sample
@@ -125,6 +150,7 @@ export function listScope(
     within: sent.createdWithin ?? '',
     older: sent.olderThan ?? '',
     prefix: sent.prefix.trim().replaceAll('\0', ''),
+    search: sent.search.trim().replaceAll('\0', ''),
   }).toString();
   return { mode, limit, cursor: at, filters: sent, key };
 }
@@ -253,10 +279,12 @@ export class ListRequests {
 // filters with the search as `prefix`, read from the first page at the page
 // size. The list itself is read without it, so the search still matches ID
 // suffixes, such as the ID column's label, within the page on screen. Null on
-// a sampled list, which sends no prefix.
+// a sampled list, which sends no prefix. It never sends `search`: it is how a
+// server without it is searched, and the selected filters can still carry the
+// search that server refused until the search box's pause has passed.
 export function fragmentSearchScope(selected: ListScope, prefix: string): ListScope | null {
   if (selected.mode !== 'paged') return null;
-  return listScope('paged', { ...selected.filters, prefix }, { limit: selected.limit, cursor: '' });
+  return listScope('paged', { ...selected.filters, prefix, search: '' }, { limit: selected.limit, cursor: '' });
 }
 
 // After the selection changes: the rows on screen are kept when they are the
@@ -356,6 +384,9 @@ export class ListSelection {
   private pageSize: number;
   private sampleSize: number;
   private continuation: Continuation | null = null;
+  // The scope and page position on screen when the filters started sending
+  // `search`, until they stop.
+  private searchOrigin: { key: string; position: PagePosition } | null = null;
   private readonly requests = new ListRequests();
 
   constructor({ filters, pageSize, sampleSize }: {
@@ -373,17 +404,33 @@ export class ListSelection {
     return listScope(this.mode, this.filters, { limit, cursor: pageCursor(this.position) });
   }
 
-  // A change of the filters or sizes. It restarts at the first page. When
+  // A change of the filters or sizes. It restarts at the first page, except
+  // for the fallback after an API refused `search` (`refusedSearch`): that
+  // returns to the page the search was typed on (`searchOrigin`) when the
+  // filters are back to those it was typed under, so a match within the page
+  // is made on that page, as it was before the console sent `search`. When
   // the selected request is the same (a sampled list sends only the org and
   // the sample size) nothing else changes. Otherwise the loads in flight are
   // invalidated; the rows on screen are kept when they are the new scope's
   // (a change undone before its answer arrived), and otherwise it is loaded.
-  select(next: { filters: SandboxListFilters; pageSize: number; sampleSize: number }): 'unchanged' | 'keep' | 'load' {
+  select(
+    next: { filters: SandboxListFilters; pageSize: number; sampleSize: number },
+    { refusedSearch = false }: { refusedSearch?: boolean } = {},
+  ): 'unchanged' | 'keep' | 'load' {
     const before = this.selected;
+    if (!before.filters.search.trim() && next.filters.search.trim()) {
+      this.searchOrigin = { key: before.key, position: this.position };
+    }
     this.filters = next.filters;
     this.pageSize = next.pageSize;
     this.sampleSize = next.sampleSize;
     this.position = FIRST_PAGE;
+    const origin = this.searchOrigin;
+    if (refusedSearch && origin) {
+      this.position = origin.position;
+      if (this.selected.key !== origin.key) this.position = FIRST_PAGE;
+    }
+    if (!next.filters.search.trim()) this.searchOrigin = null;
     if (sameScope(before, this.selected)) return 'unchanged';
     this.requests.invalidate();
     return scopeChangePlan(this.shown, this.selected);
