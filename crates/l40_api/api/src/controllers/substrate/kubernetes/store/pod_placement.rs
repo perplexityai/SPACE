@@ -56,6 +56,11 @@ impl K8sStore {
     /// owns the active execution. Unlike `persist_pod_metadata`, this must
     /// never adopt a different Pod UID: callers use the result immediately to
     /// send an authenticated node-api request.
+    ///
+    /// A `created` row becomes `running`, as it does in `persist_pod_metadata`
+    /// once its pod has an IP. A start of a stopped sandbox learns its pod's
+    /// IP only here, and suspend claims only a `running` execution. Every
+    /// other state is kept.
     pub(in crate::controllers::substrate::kubernetes) async fn persist_selected_route_pod_ip(
         &self,
         sandbox_id: SandboxId,
@@ -68,8 +73,9 @@ impl K8sStore {
         let result = sqlx::query(sql!(
             "UPDATE sandbox_k8s_executions
              SET pod_ip = $1::INET,
+                 state = CASE WHEN state = 'created' THEN 'running' ELSE state END,
                  updated_at = CASE
-                     WHEN pod_ip IS DISTINCT FROM $1::INET THEN NOW()
+                     WHEN pod_ip IS DISTINCT FROM $1::INET OR state = 'created' THEN NOW()
                      ELSE updated_at
                  END
              WHERE sandbox_id = $2
