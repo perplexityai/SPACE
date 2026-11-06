@@ -136,7 +136,7 @@ pub(crate) enum RouteResolutionError {
     SessionNotReady,
     /// The sandbox has no route and nothing is about to give it one: it is
     /// at rest, no wake is queued for it, and none could be queued.
-    SessionAtRest(pplx_space_common_grpc::SessionRouteAtRest),
+    SessionAtRest(pplx_space_sandbox_grpc::SessionRouteAtRest),
     ResolutionFailed,
     RouteStateInvalid,
 }
@@ -209,7 +209,7 @@ impl SandboxNotRunning {
 
     /// For an at-rest route; with no details when the mark lost its sandbox
     /// or state.
-    pub(crate) fn at_rest(at_rest: pplx_space_common_grpc::SessionRouteAtRest) -> Self {
+    pub(crate) fn at_rest(at_rest: pplx_space_sandbox_grpc::SessionRouteAtRest) -> Self {
         match (at_rest.sandbox_id, at_rest.state) {
             (Some(sandbox_id), Some(state)) => Self::new(
                 sandbox_id,

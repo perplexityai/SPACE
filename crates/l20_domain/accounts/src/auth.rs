@@ -7,7 +7,7 @@ use std::borrow::Cow;
 use std::fmt;
 use std::str::FromStr;
 
-use uuid::Uuid;
+use pplx_space_job_id::uuid_id;
 
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
@@ -40,20 +40,10 @@ impl AuthParseError {
     }
 }
 
-/// Error returned when an auth/account UUID cannot be parsed.
-///
-/// # Examples
-///
-/// ```rust
-/// # use std::str::FromStr;
-/// # use pplx_space_accounts::UserId;
-/// assert!(UserId::from_str("not-a-uuid").is_err());
-/// ```
-#[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
-pub enum AuthIdParseError {
-    #[error("invalid auth UUID: {0}")]
-    InvalidUuid(#[from] uuid::Error),
-}
+/// Error returned when an auth/account UUID cannot be parsed. Defined in
+/// `pplx-space-job-id` beside the `uuid_id!` macro, so the job ID and every
+/// identifier here share one parse error.
+pub use pplx_space_job_id::AuthIdParseError;
 
 /// The owner principal stored on a sandbox-manager sandbox row.
 ///
@@ -318,146 +308,6 @@ pub fn format_reserved_sandbox_owner_kind_labels(kinds: &[SandboxOwnerKind]) -> 
     }
 }
 
-macro_rules! uuid_id {
-    ($(#[$meta:meta])* $name:ident) => {
-        $(#[$meta])*
-        #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-        #[cfg_attr(feature = "serde", serde(try_from = "String", into = "String"))]
-        #[derive(Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash)]
-        pub struct $name(Uuid);
-
-        impl $name {
-            #[doc = concat!(
-                "Creates a fresh `",
-                stringify!($name),
-                "` using a UUIDv7 value.\n\n",
-                "# Examples\n\n",
-                "```rust\n",
-                "# use pplx_space_accounts::*;\n",
-                "let id = ",
-                stringify!($name),
-                "::new();\n",
-                "assert!(!id.to_string().is_empty());\n",
-                "```"
-            )]
-            pub fn new() -> Self {
-                Self(Uuid::now_v7())
-            }
-
-            #[doc = concat!(
-                "Wraps an existing UUID as a `",
-                stringify!($name),
-                "`.\n\n",
-                "# Examples\n\n",
-                "```rust\n",
-                "# use pplx_space_accounts::*;\n",
-                "let uuid = uuid::Uuid::nil();\n",
-                "let id = ",
-                stringify!($name),
-                "::from_uuid(uuid);\n",
-                "assert_eq!(id.as_uuid(), uuid);\n",
-                "```"
-            )]
-            pub const fn from_uuid(value: Uuid) -> Self {
-                Self(value)
-            }
-
-            #[doc = concat!(
-                "Returns the underlying UUID.\n\n",
-                "# Examples\n\n",
-                "```rust\n",
-                "# use pplx_space_accounts::*;\n",
-                "let uuid = uuid::Uuid::nil();\n",
-                "let id = ",
-                stringify!($name),
-                "::from_uuid(uuid);\n",
-                "assert_eq!(id.as_uuid(), uuid);\n",
-                "```"
-            )]
-            pub const fn as_uuid(self) -> Uuid {
-                self.0
-            }
-        }
-
-        impl fmt::Debug for $name {
-            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                f.debug_tuple(stringify!($name))
-                    .field(&self.to_string())
-                    .finish()
-            }
-        }
-
-        impl fmt::Display for $name {
-            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                self.0.fmt(f)
-            }
-        }
-
-        impl Default for $name {
-            fn default() -> Self {
-                Self::new()
-            }
-        }
-
-        impl FromStr for $name {
-            type Err = AuthIdParseError;
-
-            fn from_str(value: &str) -> Result<Self, Self::Err> {
-                Uuid::parse_str(value).map(Self).map_err(Into::into)
-            }
-        }
-
-        impl TryFrom<String> for $name {
-            type Error = AuthIdParseError;
-
-            fn try_from(value: String) -> Result<Self, Self::Error> {
-                Self::from_str(&value)
-            }
-        }
-
-        impl From<$name> for String {
-            fn from(value: $name) -> Self {
-                value.to_string()
-            }
-        }
-
-        #[cfg(feature = "sqlx")]
-        impl sqlx::postgres::PgHasArrayType for $name {
-            fn array_type_info() -> sqlx::postgres::PgTypeInfo {
-                <Uuid as sqlx::postgres::PgHasArrayType>::array_type_info()
-            }
-        }
-
-        #[cfg(feature = "sqlx")]
-        impl sqlx::Type<sqlx::Postgres> for $name {
-            fn type_info() -> sqlx::postgres::PgTypeInfo {
-                <Uuid as sqlx::Type<sqlx::Postgres>>::type_info()
-            }
-
-            fn compatible(ty: &sqlx::postgres::PgTypeInfo) -> bool {
-                <Uuid as sqlx::Type<sqlx::Postgres>>::compatible(ty)
-            }
-        }
-
-        #[cfg(feature = "sqlx")]
-        impl<'q> sqlx::Encode<'q, sqlx::Postgres> for $name {
-            fn encode_by_ref(
-                &self,
-                buf: &mut sqlx::postgres::PgArgumentBuffer,
-            ) -> Result<sqlx::encode::IsNull, sqlx::error::BoxDynError> {
-                <Uuid as sqlx::Encode<'q, sqlx::Postgres>>::encode_by_ref(&self.0, buf)
-            }
-        }
-
-        #[cfg(feature = "sqlx")]
-        impl<'r> sqlx::Decode<'r, sqlx::Postgres> for $name {
-            fn decode(value: sqlx::postgres::PgValueRef<'r>) -> Result<Self, sqlx::error::BoxDynError> {
-                Ok(Self(<Uuid as sqlx::Decode<'r, sqlx::Postgres>>::decode(value)?))
-            }
-        }
-    };
-}
-
 uuid_id!(CredentialReferenceId);
 
 uuid_id!(
@@ -470,10 +320,9 @@ uuid_id!(
     TenantPublicationGrantId
 );
 
-uuid_id!(
-    /// Identity of a persisted background job, retained across retries and recovery.
-    JobId
-);
+/// Identity of a persisted background job, defined in `pplx-space-job-id` so
+/// the job queue can name it without this crate.
+pub use pplx_space_job_id::JobId;
 
 uuid_id!(
     /// Stable identifier for a platform user.

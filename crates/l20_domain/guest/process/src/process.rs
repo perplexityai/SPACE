@@ -518,6 +518,21 @@ impl From<IdempotencyKey> for String {
     }
 }
 
+/// A fresh idempotency key for a request whose caller supplied none: a
+/// UUIDv7.
+///
+/// # Examples
+///
+/// ```rust
+/// # use pplx_space_guest_process::*;
+/// let key = generated_idempotency_key();
+/// assert_ne!(key, generated_idempotency_key());
+/// ```
+pub fn generated_idempotency_key() -> IdempotencyKey {
+    IdempotencyKey::parse(Uuid::now_v7().to_string())
+        .expect("UUIDv7 string is a valid idempotency key")
+}
+
 fn non_empty_no_nul(value: &str) -> Result<(), ProcessParseError> {
     if value.is_empty() {
         return Err(ProcessParseError("value must not be empty"));

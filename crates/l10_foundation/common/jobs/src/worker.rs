@@ -1,4 +1,4 @@
-use pplx_space_common_core::types::{JobId, SubjectId};
+use pplx_space_job_id::JobId;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -327,9 +327,6 @@ fn priority_band_metric_label(min_priority: Option<JobPriority>) -> String {
     )
 }
 
-/// The bare sandbox UUID a `sandbox:<uuid>` subject names: the canonical
-/// `sandbox_id` that every service's spans and logs carry, so a sandbox's
-/// jobs are found by the same value as the rest of its telemetry.
 /// Name the job a deduplicated submission joined on the submitter's span. The
 /// job runs in the trace of the submission that created it, so this is how
 /// the submitter's trace finds it.
@@ -343,11 +340,16 @@ fn record_deduplicated_submission(job_id: &JobId) {
     pplx_space_observability::trace_propagation::set_span_attribute(&span, "job.dedup", "hit");
 }
 
+/// The bare sandbox UUID a `sandbox:<uuid>` subject names: the canonical
+/// `sandbox_id` that every service's spans and logs carry, so a sandbox's
+/// jobs are found by the same value as the rest of its telemetry. This reads
+/// the sandbox form of common-core's `SubjectId` wire text, whose sandbox ID
+/// is a UUID displayed hyphenated, without depending on it.
 fn subject_sandbox_id(subject_id: Option<&str>) -> Option<String> {
-    match subject_id?.parse::<SubjectId>().ok()? {
-        SubjectId::Sandbox(sandbox_id) => Some(sandbox_id.to_string()),
-        SubjectId::Template(_) => None,
-    }
+    let sandbox_id = subject_id?.strip_prefix("sandbox:")?;
+    uuid::Uuid::parse_str(sandbox_id)
+        .ok()
+        .map(|sandbox_id| sandbox_id.to_string())
 }
 
 /// How the lease claim treats jobs that share a `(kind, subject_id)`.

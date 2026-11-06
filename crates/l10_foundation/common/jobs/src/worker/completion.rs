@@ -1,4 +1,4 @@
-use pplx_space_common_core::types::JobId;
+use pplx_space_job_id::JobId;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;

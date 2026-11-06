@@ -1282,3 +1282,22 @@ async fn serialized_subjects_do_not_starve_other_subjects() {
     driver.await.expect("queue driver task should not panic");
     remove_test_db(path);
 }
+
+#[test]
+fn only_a_sandbox_subject_names_a_sandbox_id() {
+    let sandbox_id = "019d84bd-280d-7331-99c6-b63377f3a3a2";
+    assert_eq!(
+        subject_sandbox_id(Some(&format!("sandbox:{sandbox_id}"))).as_deref(),
+        Some(sandbox_id)
+    );
+    // Any UUID spelling is recorded in the canonical form.
+    assert_eq!(
+        subject_sandbox_id(Some("sandbox:019D84BD280D733199C6B63377F3A3A2")).as_deref(),
+        Some(sandbox_id)
+    );
+    assert_eq!(subject_sandbox_id(Some("template:seed")), None);
+    assert_eq!(subject_sandbox_id(Some("sandbox:first")), None);
+    assert_eq!(subject_sandbox_id(Some("sandbox:")), None);
+    assert_eq!(subject_sandbox_id(Some(sandbox_id)), None);
+    assert_eq!(subject_sandbox_id(None), None);
+}

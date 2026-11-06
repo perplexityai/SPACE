@@ -332,13 +332,13 @@ run_sbxmgr_production_checks() {
         sbxmgr_assert_direct_dependents pplx-space-sqlite "${sbxmgr_feature_args[@]}" -- \
             pplx-space-sbx-mgr-store
         # rusqlite enters only through the store, the helpers it depends on,
-        # and three shared crates whose rusqlite use hands no connection out:
-        # common-jobs' functions take a connection in, and common-core and
-        # accounts only implement rusqlite's value conversion traits for
-        # their types.
+        # and four shared crates whose rusqlite use hands no connection out:
+        # common-jobs' functions take a connection in, and common-core,
+        # accounts and job-id only implement rusqlite's value conversion
+        # traits for their types.
         sbxmgr_assert_direct_dependents rusqlite "${sbxmgr_feature_args[@]}" -- \
             pplx-space-sbx-mgr-store pplx-space-sqlite pplx-space-common-jobs pplx-space-common-core \
-            pplx-space-accounts
+            pplx-space-accounts pplx-space-job-id
     done
 }
 
@@ -417,20 +417,26 @@ run_clippy_checks() {
         -- \
         -D warnings
 
-    # Each of the account identity crate's features by itself, so one that
-    # relies on another being enabled fails here; the isolated-crates mode
-    # builds it only with no features and with all of them.
-    echo "--- :rust: Running account identity clippy with each feature alone"
-    local accounts_feature
-    for accounts_feature in serde sqlx rusqlite; do
-        CARGO_TARGET_DIR="${target_dir}" cargo clippy \
-            --locked \
-            -p pplx-space-accounts \
-            --no-default-features \
-            --features "${accounts_feature}" \
-            --all-targets \
-            -- \
-            -D warnings
+    # Each feature of the account and job identity crates by itself, so one
+    # that relies on another being enabled fails here; the isolated-crates
+    # mode builds them only with no features and with all of them. Both call
+    # job-id's uuid_id! macro, whose impls follow the calling crate's own
+    # features. No workspace crate enables job-id's sqlx, so only the
+    # --all-features builds and this loop compile its Postgres impls, and only
+    # this loop compiles them without serde and rusqlite.
+    echo "--- :rust: Running account and job identity clippy with each feature alone"
+    local identity_crate identity_feature
+    for identity_crate in pplx-space-accounts pplx-space-job-id; do
+        for identity_feature in serde sqlx rusqlite; do
+            CARGO_TARGET_DIR="${target_dir}" cargo clippy \
+                --locked \
+                -p "${identity_crate}" \
+                --no-default-features \
+                --features "${identity_feature}" \
+                --all-targets \
+                -- \
+                -D warnings
+        done
     done
 
     # The crates split out of common-core and common-svc, and the other

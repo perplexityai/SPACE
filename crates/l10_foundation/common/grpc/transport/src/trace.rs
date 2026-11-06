@@ -1,4 +1,4 @@
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -78,6 +78,39 @@ impl ExpectedGrpcStatus {
 
     fn honored(self) -> Option<tonic::Code> {
         (self.0 != tonic::Code::Ok && !grpc_status_is_error(self.0)).then_some(self.0)
+    }
+}
+
+/// Request identity that a caller records on one call's gRPC client span,
+/// such as the sandbox the call is for. The span declares `sandbox_id`,
+/// `sandbox_port`, `route_generation`, `execution_generation`,
+/// `current_node_id` and `traceparent` empty for it to fill.
+pub trait RecordClientSpan: Send + Sync + 'static {
+    fn record(&self, span: &tracing::Span);
+}
+
+/// A [`RecordClientSpan`] attached to one call as an in-process request
+/// extension, never as diagnostic wire headers. That call's client span
+/// records it when the span opens.
+#[derive(Clone)]
+pub struct ClientSpanFields(Arc<dyn RecordClientSpan>);
+
+impl ClientSpanFields {
+    pub fn new(fields: impl RecordClientSpan) -> Self {
+        Self(Arc::new(fields))
+    }
+
+    /// Attach these fields to `request`'s client span.
+    pub fn mark<T>(self, request: &mut tonic::Request<T>) {
+        request.extensions_mut().insert(self);
+    }
+}
+
+impl std::fmt::Debug for ClientSpanFields {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ClientSpanFields")
+            .finish_non_exhaustive()
     }
 }
 
@@ -370,8 +403,8 @@ impl<B> MakeSpan<B> for GrpcClientMakeSpan {
             span.record("untraced_caller", true);
             pplx_space_observability::trace_propagation::set_unsampled_remote_parent(&span);
         }
-        if let Some(context) = request.extensions().get::<crate::SandboxTraceContext>() {
-            context.record(&span);
+        if let Some(fields) = request.extensions().get::<ClientSpanFields>() {
+            fields.0.record(&span);
         }
         span
     }

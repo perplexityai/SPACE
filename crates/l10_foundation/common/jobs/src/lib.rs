@@ -23,7 +23,7 @@
 //! service. On restart, [`BackgroundWorker::recover`] resets interrupted
 //! `running` jobs back to `pending` and re-queues them.
 
-pub use pplx_space_common_core::types::JobId;
+pub use pplx_space_job_id::JobId;
 
 pub mod db;
 mod scheduler;

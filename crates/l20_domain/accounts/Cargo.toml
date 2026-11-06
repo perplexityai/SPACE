@@ -11,14 +11,17 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+pplx-space-job-id = { workspace = true }
 rusqlite = { workspace = true, optional = true }
 serde = { workspace = true, features = ["derive"], optional = true }
 sqlx = { workspace = true, features = ["postgres", "uuid"], optional = true }
 thiserror = { workspace = true }
-uuid = { workspace = true, features = ["v7"] }
+
+[dev-dependencies]
+uuid = { workspace = true }
 
 [features]
 default = []
-serde = ["dep:serde"]
+serde = ["dep:serde", "pplx-space-job-id/serde"]
 sqlx = ["dep:sqlx"]
 rusqlite = ["dep:rusqlite"]

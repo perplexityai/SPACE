@@ -1,4 +1,4 @@
-use pplx_space_common_core::types::JobId;
+use pplx_space_job_id::JobId;
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};

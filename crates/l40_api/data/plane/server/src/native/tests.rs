@@ -3539,7 +3539,7 @@ async fn an_at_rest_route_answers_as_the_node_refusal_does() {
         ),
     ] {
         let at_rest =
-            RouteResolutionError::SessionAtRest(pplx_space_common_grpc::SessionRouteAtRest {
+            RouteResolutionError::SessionAtRest(pplx_space_sandbox_grpc::SessionRouteAtRest {
                 sandbox_id: Some(sandbox_id),
                 state: Some(lifecycle),
             });
@@ -3580,10 +3580,11 @@ async fn an_at_rest_route_answers_as_the_node_refusal_does() {
     }
 
     // A mark that lost its sandbox or state is still final, with no details.
-    let unnamed = RouteResolutionError::SessionAtRest(pplx_space_common_grpc::SessionRouteAtRest {
-        sandbox_id: None,
-        state: None,
-    });
+    let unnamed =
+        RouteResolutionError::SessionAtRest(pplx_space_sandbox_grpc::SessionRouteAtRest {
+            sandbox_id: None,
+            state: None,
+        });
     let (status, _, answer) = body(route_resolution_http_error(unnamed)).await;
     assert_eq!(status, StatusCode::CONFLICT, "{answer}");
     assert_eq!(answer["error"]["retryable"], false, "{answer}");
@@ -3630,10 +3631,11 @@ async fn an_attach_waits_for_a_route_within_its_deadline() {
     assert_eq!(calls.load(Ordering::Relaxed), 1);
 
     let calls = AtomicUsize::new(0);
-    let at_rest = RouteResolutionError::SessionAtRest(pplx_space_common_grpc::SessionRouteAtRest {
-        sandbox_id: None,
-        state: None,
-    });
+    let at_rest =
+        RouteResolutionError::SessionAtRest(pplx_space_sandbox_grpc::SessionRouteAtRest {
+            sandbox_id: None,
+            state: None,
+        });
     let waited: Result<(), _> =
         retry_not_ready_until(tokio::time::Instant::now() + Duration::from_secs(5), || {
             calls.fetch_add(1, Ordering::Relaxed);
@@ -3730,15 +3732,15 @@ fn a_route_refusal_marked_at_rest_is_not_a_route_that_is_coming() {
     );
     let sandbox_id = SandboxId::new();
     let suspended = pplx_space_common_core::types::SandboxLifecycle::Suspended;
-    let at_rest = pplx_space_common_grpc::mark_session_route_at_rest(plain, sandbox_id, suspended);
+    let at_rest = pplx_space_sandbox_grpc::mark_session_route_at_rest(plain, sandbox_id, suspended);
     assert_eq!(
         route_resolution_error(&at_rest),
-        RouteResolutionError::SessionAtRest(pplx_space_common_grpc::SessionRouteAtRest {
+        RouteResolutionError::SessionAtRest(pplx_space_sandbox_grpc::SessionRouteAtRest {
             sandbox_id: Some(sandbox_id),
             state: Some(suspended),
         })
     );
-    let other = pplx_space_common_grpc::mark_session_route_at_rest(
+    let other = pplx_space_sandbox_grpc::mark_session_route_at_rest(
         tonic::Status::unavailable("x"),
         sandbox_id,
         suspended,

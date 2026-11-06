@@ -1,10 +1,14 @@
 use pplx_space_common_core::types::{
     ExecutionGeneration, GuestPort, NodeId, RouteGeneration, SandboxId,
 };
+use pplx_space_common_grpc::{ClientSpanFields, RecordClientSpan};
 
 /// Parsed request/runtime identity for independently exported RPC spans.
-/// This is an in-process request extension, never diagnostic wire headers.
-#[derive(Clone, Debug)]
+/// [`Self::mark`] attaches it to a call as an in-process request extension,
+/// never as diagnostic wire headers. Not `Clone`, so it cannot be inserted
+/// into a request's extensions directly, where the trace layer would not
+/// see it.
+#[derive(Debug)]
 pub struct SandboxTraceContext {
     pub sandbox_id: SandboxId,
     pub port: GuestPort,
@@ -22,6 +26,11 @@ impl SandboxTraceContext {
             execution_generation: None,
             current_node_id: None,
         }
+    }
+
+    /// Record this identity on `request`'s gRPC client span.
+    pub fn mark<T>(self, request: &mut tonic::Request<T>) {
+        ClientSpanFields::new(self).mark(request);
     }
 
     pub fn record(&self, span: &tracing::Span) {
@@ -46,6 +55,12 @@ impl SandboxTraceContext {
     }
 }
 
+impl RecordClientSpan for SandboxTraceContext {
+    fn record(&self, span: &tracing::Span) {
+        SandboxTraceContext::record(self, span);
+    }
+}
+
 /// Record one sandbox's canonical identity, its bare UUID, as `sandbox_id` on
 /// `span`. The public `sbx_<uuid>` spelling is accepted and recorded without
 /// its prefix, so every service's spans agree on one value. A value that is
@@ -59,25 +74,4 @@ pub fn record_sandbox_id(span: &tracing::Span, sandbox_id: &str) -> Option<Sandb
         .ok()?;
     span.record("sandbox_id", tracing::field::display(canonical));
     Some(canonical)
-}
-
-/// Record a typed guest outcome without changing the enclosing span's status.
-/// Public HTTP spans still classify their legitimate 502 as an HTTP error.
-pub fn record_guest_service_outcome(status: &tonic::Status, span: &tracing::Span) -> bool {
-    if crate::GuestServiceUnavailable::from_status(status).is_none() {
-        return false;
-    }
-    span.record("failure_origin", "guest");
-    span.record("failure_reason", "connection_refused");
-    true
-}
-
-/// Keep the gRPC status visible without classifying an expected guest refusal
-/// as an internal APM error. The marker and code must both match.
-pub fn record_guest_service_status(status: &tonic::Status, span: &tracing::Span) -> bool {
-    if !record_guest_service_outcome(status, span) {
-        return false;
-    }
-    span.record("otel.status_code", "OK");
-    true
 }

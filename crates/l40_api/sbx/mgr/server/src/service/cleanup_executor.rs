@@ -226,7 +226,7 @@ impl SandboxManagerService {
             origin_trace_id = tracing::field::Empty,
             origin_sampled = tracing::field::Empty,
         );
-        pplx_space_common_svc::record_sandbox_id(&span, subject);
+        pplx_space_sandbox_grpc::record_sandbox_id(&span, subject);
         if attempt <= 1 || waiting.is_some() {
             pplx_space_observability::trace_propagation::link_root_to_origins(&span, origins);
         } else {

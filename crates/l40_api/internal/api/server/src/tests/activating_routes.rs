@@ -70,7 +70,7 @@ async fn a_placed_route_waits_for_an_activation_queued_for_its_sandbox() -> Test
             assert_eq!(error.code(), Code::FailedPrecondition, "{case}: {error:?}");
             // Retryable, not the at-rest mark: the sandbox is on its way.
             assert_eq!(
-                pplx_space_common_grpc::session_route_at_rest(&error),
+                pplx_space_sandbox_grpc::session_route_at_rest(&error),
                 None,
                 "{case}"
             );

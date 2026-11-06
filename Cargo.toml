@@ -149,6 +149,9 @@ members = [
     "crates/l20_domain/federated/identity",
     "crates/l20_domain/guest/process",
     "crates/l10_foundation/guest/capability",
+    "crates/l10_foundation/guest/status",
+    "crates/l10_foundation/job/id",
+    "crates/l40_api/sandbox/grpc",
     "crates/l10_foundation/request/id",
     "crates/l20_domain/execution/spec",
     "crates/l10_foundation/linux/ids",
@@ -433,6 +436,9 @@ pplx-space-accounts = { path = "crates/l20_domain/accounts" }
 pplx-space-federated-identity = { path = "crates/l20_domain/federated/identity" }
 pplx-space-guest-process = { path = "crates/l20_domain/guest/process" }
 pplx-space-guest-capability = { path = "crates/l10_foundation/guest/capability" }
+pplx-space-guest-status = { path = "crates/l10_foundation/guest/status" }
+pplx-space-job-id = { path = "crates/l10_foundation/job/id" }
+pplx-space-sandbox-grpc = { path = "crates/l40_api/sandbox/grpc" }
 pplx-space-request-id = { path = "crates/l10_foundation/request/id" }
 pplx-space-execution-spec = { path = "crates/l20_domain/execution/spec" }
 pplx-space-linux-ids = { path = "crates/l10_foundation/linux/ids" }

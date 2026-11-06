@@ -1,0 +1,29 @@
+[package]
+name = "pplx-space-job-id"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+rusqlite = { workspace = true, optional = true }
+serde = { workspace = true, features = ["derive"], optional = true }
+sqlx = { workspace = true, features = ["postgres", "uuid"], optional = true }
+thiserror = { workspace = true }
+uuid = { workspace = true, features = ["v7"] }
+
+[dev-dependencies]
+rusqlite = { workspace = true }
+
+[features]
+default = []
+serde = ["dep:serde"]
+# JobId's Postgres impls: uuid_id! compiles them when its caller, here this
+# crate, enables `sqlx`.
+sqlx = ["dep:sqlx"]
+rusqlite = ["dep:rusqlite"]

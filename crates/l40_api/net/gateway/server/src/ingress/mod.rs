@@ -4,7 +4,6 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
-use pplx_space_common_grpc::SandboxTraceContext;
 use pplx_space_common_svc::core::guest::linux::network::IPV4_ADDR as GUEST_IPV4_ADDR;
 use pplx_space_common_svc::core::types::{
     ExecutionGeneration, GuestPort, NodeId, NodeManagedBy, PodUid, RouteGeneration,
@@ -24,6 +23,7 @@ use pplx_space_net_gateway_client::proto::{
     NetworkState, SandboxSubstrateKind, ServicePortIngressFrame, ServicePortIngressStart,
     SpaceApiRouteIdentity as ProtoSpaceApiRouteIdentity, service_port_ingress_frame,
 };
+use pplx_space_sandbox_grpc::SandboxTraceContext;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};

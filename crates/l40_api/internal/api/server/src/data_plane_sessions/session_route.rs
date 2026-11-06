@@ -230,7 +230,7 @@ pub(crate) async fn resolve_session_route(
         };
         let error = match at_rest {
             Some(lifecycle) => {
-                pplx_space_common_grpc::mark_session_route_at_rest(error, sandbox_id, lifecycle)
+                pplx_space_sandbox_grpc::mark_session_route_at_rest(error, sandbox_id, lifecycle)
             }
             None => error,
         };

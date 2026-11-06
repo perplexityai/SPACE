@@ -17,10 +17,10 @@ use pplx_space_common_jobs::{
 };
 use pplx_space_common_svc::core::host::linux::identities::{user_names, users};
 use pplx_space_common_svc::core::types::{KekProvider, MasterKeyIdentifier, OrgId};
-use pplx_space_common_svc::record_sandbox_id;
 use pplx_space_common_svc::{
     AuthorizedUdsPeer, UdsPeerAccount, UdsPeerAuthorizer, UdsPeerPrincipal,
 };
+use pplx_space_sandbox_grpc::record_sandbox_id;
 use tonic::{Request, Response, Status};
 
 use crate::executor::{

@@ -672,7 +672,7 @@ impl SandboxManagerService {
                 |sandbox| route_auth.authorize_service_port(sandbox, port),
             )
             .await?;
-        let trace_context = pplx_space_common_grpc::SandboxTraceContext {
+        let trace_context = pplx_space_sandbox_grpc::SandboxTraceContext {
             sandbox_id,
             port,
             route_generation: sandbox.space_api_route_identity.route_generation,
@@ -739,7 +739,6 @@ impl SandboxManagerService {
         let request_stream = futures_util::stream::once(async move { first }).chain(rest);
         let mut request = Request::new(request_stream);
         *request.metadata_mut() = metadata;
-        request.extensions_mut().insert(trace_context.clone());
 
         let span = tracing::info_span!(
             "net_gateway.service_port_ingress",
@@ -760,6 +759,7 @@ impl SandboxManagerService {
             otel.status_description = tracing::field::Empty,
         );
         trace_context.record(&span);
+        trace_context.mark(&mut request);
         let response_result = bounded_loopback_bridge_op(
             "ServicePortIngress",
             async {

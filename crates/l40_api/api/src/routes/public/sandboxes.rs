@@ -425,7 +425,7 @@ pub(crate) async fn create_native_sandbox_operation(
         CreatePublicOperationResult::Created(operation_id) => {
             pplx_space_metrics::warm_pool::admission_claim(outcome);
             // The path names no sandbox yet; the request span learns it here.
-            pplx_space_common_svc::record_sandbox_id(
+            pplx_space_sandbox_grpc::record_sandbox_id(
                 &tracing::Span::current(),
                 &sandbox_id.to_string(),
             );

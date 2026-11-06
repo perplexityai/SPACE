@@ -35,8 +35,10 @@ tracing = { workspace = true }
 uuid = { workspace = true, features = ["v7"] }
 
 # internal
-pplx-space-common-core = { workspace = true }
+pplx-space-durations = { workspace = true }
+pplx-space-env-vars = { workspace = true }
 pplx-space-grpc-metrics = { workspace = true }
+pplx-space-guest-status = { workspace = true }
 pplx-space-observability = { workspace = true }
 
 [dev-dependencies]
