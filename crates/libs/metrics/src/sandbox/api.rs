@@ -766,25 +766,40 @@ metric_vocabulary!(
     }
 );
 
-/// One create, activation or resume's requested size.
+/// One create, activation or resume's requested size. Each part is `None`
+/// when the API does not know it, and its distributions get no sample.
 pub struct RequestedSize<'a> {
     pub kind: RequestedKind,
     pub surface: SandboxApiSurface,
     pub admission: AdmissionDecision,
     pub template: &'a str,
+    pub compute: Option<RequestedCompute>,
+    pub disk_mib: Option<u32>,
+}
+
+/// The vCPU and guest memory part of a requested size.
+pub struct RequestedCompute {
     pub vcpu: u32,
     pub memory_mib: u32,
     /// `None` for an activation or resume, which omits the tag.
     pub defaulted: Option<bool>,
 }
 
-/// Record the vCPU and guest memory one create, activation or resume requested,
-/// after defaults, as one sample in each of `sandbox.api.requested.vcpu` and
-/// `sandbox.api.requested.memory_bytes` (memory in bytes).
+/// Record the size one create, activation or resume requested, after
+/// defaults: one sample in each of `sandbox.api.requested.vcpu` and
+/// `sandbox.api.requested.memory_bytes` (memory in bytes) when the compute
+/// size is known, and one in `sandbox.api.requested.disk_bytes` when the disk
+/// size is known.
 ///
 /// Tags: `kind`, `surface`, `admission`, `template` and request-scoped
-/// `client_id`. Creates also carry `defaulted`, false only when the request
-/// supplied both sizes; warm-pool claims are always true.
+/// `client_id`. Compute samples on creates also carry `defaulted`, false only
+/// when the request supplied both vCPU and memory; warm-pool claims are always
+/// true. Disk samples never carry it.
+///
+/// The disk size is the configured rootfs size: the request's or an inherited
+/// warm-pool config's or policy's `disk_mib`. A sandbox left at its template's
+/// own rootfs size has none, so the disk distribution does not cover every
+/// sandbox. It is not disk usage or host allocation.
 ///
 /// Callers record cold creates at admission, and activations/resumes on success
 /// or admission rejection. Skip forks, unknown sizes and joined activations.
@@ -798,13 +813,23 @@ pub fn requested_size(sample: RequestedSize<'_>) {
         tag("template", sample.template),
         tag("client_id", request_client_id().as_str()),
     ];
-    if let Some(defaulted) = sample.defaulted {
+    if let Some(disk_mib) = sample.disk_mib {
+        distribution(
+            "sandbox.api.requested.disk_bytes",
+            (u64::from(disk_mib) * BYTES_PER_MIB) as f64,
+            &tags,
+        );
+    }
+    let Some(compute) = sample.compute else {
+        return;
+    };
+    if let Some(defaulted) = compute.defaulted {
         tags.push(tag("defaulted", defaulted));
     }
-    distribution("sandbox.api.requested.vcpu", f64::from(sample.vcpu), &tags);
+    distribution("sandbox.api.requested.vcpu", f64::from(compute.vcpu), &tags);
     distribution(
         "sandbox.api.requested.memory_bytes",
-        (u64::from(sample.memory_mib) * BYTES_PER_MIB) as f64,
+        (u64::from(compute.memory_mib) * BYTES_PER_MIB) as f64,
         &tags,
     );
 }
