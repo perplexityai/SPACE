@@ -51,10 +51,11 @@ use pplx_space_node_api_client::proto::{
     BindDataPlaneSessionProcessRequest, DataPlaneReconnectReason, DataPlaneRevocationState,
     DataPlaneRevocationStatus, GetDataPlaneOrgRevocationEpochRequest,
     GetDataPlaneSessionRevocationStateRequest, GetSandboxRuntimeAccessRequest,
-    RecordDataPlaneSessionReconnectRequest, ResolveDataPlaneSessionRouteRequest,
-    ResolveDataPlaneSessionRouteResponse, SandboxRuntimeAccess, SandboxRuntimeAccessDecision,
-    SandboxServiceRouteKey, SandboxServiceRouteKind, SandboxServiceRouteTransport,
-    UnstableResetSandboxServiceRouteRequest, worker_api_client::WorkerApiClient,
+    RecordDataPlaneSessionProcessExitedRequest, RecordDataPlaneSessionReconnectRequest,
+    ResolveDataPlaneSessionRouteRequest, ResolveDataPlaneSessionRouteResponse,
+    SandboxRuntimeAccess, SandboxRuntimeAccessDecision, SandboxServiceRouteKey,
+    SandboxServiceRouteKind, SandboxServiceRouteTransport, UnstableResetSandboxServiceRouteRequest,
+    worker_api_client::WorkerApiClient,
 };
 use pplx_space_public_api::{
     CreateFileWatchSessionRequest, CreateProcessRequest, CreateTerminalSessionRequest,
