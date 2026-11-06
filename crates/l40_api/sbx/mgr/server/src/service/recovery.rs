@@ -12,6 +12,9 @@ use super::suspend_snapshot_publication::{
 };
 use super::*;
 use crate::db::{edges, require_startup_state_write};
+use crate::metrics::sandbox::worker::{
+    QuarantineRecoveryAttemptOutcome, QuarantineRecoveryOutcome,
+};
 use futures_util::{StreamExt, stream};
 use orphan_dispatch::AdmittedRecoveryKind;
 use pplx_space_common_core::types::{
@@ -20,9 +23,6 @@ use pplx_space_common_core::types::{
 use pplx_space_events::{
     SandboxEventDetails, SandboxEventSource, SandboxEventTrigger, SandboxEventType,
     emit_sandbox_event,
-};
-use pplx_space_metrics::sandbox::worker::{
-    QuarantineRecoveryAttemptOutcome, QuarantineRecoveryOutcome,
 };
 
 const SUSPEND_RECOVERY_KIND: &str = "suspend";
@@ -63,16 +63,14 @@ pub(super) const QUARANTINE_RECOVERY_ORPHAN_RESTORE_PERMITS: usize = 1;
 /// read from an incomplete scan is what lets a stalled node look healthy.
 fn publish_quarantine_recovery_backlog(scan: Option<&crate::db::QuarantineRecoveryScan>) {
     let Some(scan) = scan else {
-        pplx_space_metrics::sandbox::worker::quarantine_recovery_backlog_sample_valid(false);
+        crate::metrics::sandbox::worker::quarantine_recovery_backlog_sample_valid(false);
         return;
     };
-    pplx_space_metrics::sandbox::worker::quarantine_recovery_backlog(
+    crate::metrics::sandbox::worker::quarantine_recovery_backlog(
         scan.pending_count,
         scan.pending_oldest_age,
     );
-    pplx_space_metrics::sandbox::worker::quarantine_recovery_candidates_malformed(
-        scan.malformed_count,
-    );
+    crate::metrics::sandbox::worker::quarantine_recovery_candidates_malformed(scan.malformed_count);
 }
 
 /// A pass that never acquired the claim has no episode row to charge, so the
@@ -80,7 +78,7 @@ fn publish_quarantine_recovery_backlog(scan: Option<&crate::db::QuarantineRecove
 fn emit_quarantine_recovery_claim_not_acquired(
     reason: crate::db::QuarantineRecoveryNoProgressReason,
 ) {
-    pplx_space_metrics::sandbox::worker::quarantine_recovery_no_progress(
+    crate::metrics::sandbox::worker::quarantine_recovery_no_progress(
         reason,
         QuarantineRecoveryAttemptOutcome::ClaimNotAcquired,
     );
@@ -703,7 +701,7 @@ impl SandboxManagerService {
                                 %error,
                                 "deferred interrupted suspend publication recovery"
                             );
-                            pplx_space_metrics::snapshot::create_recovery(
+                            crate::metrics::snapshot::create_recovery(
                                 SUSPEND_RECOVERY_KIND,
                                 SUSPEND_RECOVERY_DEFERRED,
                             );
@@ -917,7 +915,7 @@ impl SandboxManagerService {
             && teardown_generation.is_some()
             && status.artifact.is_some()
         {
-            pplx_space_metrics::snapshot::create_recovery(
+            crate::metrics::snapshot::create_recovery(
                 SUSPEND_RECOVERY_KIND,
                 SUSPEND_RECOVERY_DEFERRED,
             );
@@ -1025,7 +1023,7 @@ impl SandboxManagerService {
                         %error,
                         "deferred interrupted suspend publication recovery after publish retry failed"
                     );
-                    pplx_space_metrics::snapshot::create_recovery(
+                    crate::metrics::snapshot::create_recovery(
                         SUSPEND_RECOVERY_KIND,
                         SUSPEND_RECOVERY_PUBLISH_RETRY_FAILED,
                     );
@@ -1044,7 +1042,7 @@ impl SandboxManagerService {
                             .artifact_origin("suspend")
                             .local_path(snapshot_dir.to_string_lossy()),
                     );
-                    pplx_space_metrics::snapshot::create_recovery(
+                    crate::metrics::snapshot::create_recovery(
                         SUSPEND_RECOVERY_KIND,
                         SUSPEND_RECOVERY_DEFERRED,
                     );
@@ -1078,7 +1076,7 @@ impl SandboxManagerService {
                     // Staging is rediscovered independently of this transition
                     // by the inventory loop, including after restart or a failed
                     // deletion. A rollback is not evidence that a writer exited.
-                    pplx_space_metrics::snapshot::create_recovery(
+                    crate::metrics::snapshot::create_recovery(
                         SUSPEND_RECOVERY_KIND,
                         SUSPEND_RECOVERY_ROLLED_BACK_TO_PAUSED,
                     );
@@ -1098,7 +1096,7 @@ impl SandboxManagerService {
                         outcome: crate::db::StartupRecoveryOutcome::State(SandboxState::Paused),
                     });
                 }
-                pplx_space_metrics::snapshot::create_recovery(
+                crate::metrics::snapshot::create_recovery(
                     SUSPEND_RECOVERY_KIND,
                     SUSPEND_RECOVERY_DEFERRED,
                 );
@@ -1117,7 +1115,7 @@ impl SandboxManagerService {
                 )?;
                 drop(db);
                 if !quarantined {
-                    pplx_space_metrics::snapshot::create_recovery(
+                    crate::metrics::snapshot::create_recovery(
                         SUSPEND_RECOVERY_KIND,
                         SUSPEND_RECOVERY_DEFERRED,
                     );
@@ -1127,7 +1125,7 @@ impl SandboxManagerService {
                         outcome: crate::db::StartupRecoveryOutcome::Deferred,
                     });
                 }
-                pplx_space_metrics::snapshot::create_recovery(
+                crate::metrics::snapshot::create_recovery(
                     SUSPEND_RECOVERY_KIND,
                     SUSPEND_RECOVERY_QUARANTINED_NO_ARTIFACT_RUNTIME_GONE,
                 );
@@ -1165,10 +1163,7 @@ impl SandboxManagerService {
             local_artifact_id,
             &snapshot_dir.to_string_lossy(),
         )?;
-        pplx_space_metrics::snapshot::create_recovery(
-            SUSPEND_RECOVERY_KIND,
-            SUSPEND_RECOVERY_DEFERRED,
-        );
+        crate::metrics::snapshot::create_recovery(SUSPEND_RECOVERY_KIND, SUSPEND_RECOVERY_DEFERRED);
         Ok(crate::db::StartupRecoveryRecord {
             id: row.id,
             previous_state: row.state,
@@ -1192,7 +1187,7 @@ impl SandboxManagerService {
             local_artifact_id,
             &local_path,
         )?;
-        pplx_space_metrics::snapshot::create_recovery(SUSPEND_RECOVERY_KIND, recovery_outcome);
+        crate::metrics::snapshot::create_recovery(SUSPEND_RECOVERY_KIND, recovery_outcome);
         emit_sandbox_event(
             &row.id,
             SandboxEventType::LocalArtifactPublished,
@@ -1483,7 +1478,7 @@ impl SandboxManagerService {
         if let Some(summary) = scan.completed_sweep.as_ref() {
             publish_quarantine_recovery_backlog(Some(summary));
         }
-        pplx_space_metrics::sandbox::worker::quarantine_recovery_backlog_sample_valid(
+        crate::metrics::sandbox::worker::quarantine_recovery_backlog_sample_valid(
             scan_cursor.has_recent_completed_sweep(),
         );
 
@@ -1875,7 +1870,7 @@ impl SandboxManagerService {
                         reason_code = %claimed.candidate.reason_code,
                         "adopted quarantine into durable cleanup"
                     );
-                    pplx_space_metrics::sandbox::worker::quarantine_recovery_succeeded(
+                    crate::metrics::sandbox::worker::quarantine_recovery_succeeded(
                         QuarantineRecoveryOutcome::CleanupAdopted,
                     );
                     mark_sandbox_dirty(&self.db, &sandbox_id.to_string());
@@ -1928,7 +1923,7 @@ impl SandboxManagerService {
         // prior per-pass ceiling of the admission cap, and distort every rate built
         // on it. A gauge reports the depth without accumulating.
         let capacity_closed_now = self.quarantine_recovery_restore_sem.is_closed();
-        pplx_space_metrics::sandbox::worker::quarantine_recovery_orphan_capacity(
+        crate::metrics::sandbox::worker::quarantine_recovery_orphan_capacity(
             capacity_deferred,
             capacity_closed_now,
         );
@@ -2006,7 +2001,7 @@ impl SandboxManagerService {
                             .rows_affected("0"),
                     );
                 }
-                pplx_space_metrics::sandbox::worker::quarantine_recovery_no_progress(
+                crate::metrics::sandbox::worker::quarantine_recovery_no_progress(
                     reason,
                     match outcome {
                         crate::db::QuarantineRecoveryNoProgressOutcome::StaleClaim => {
@@ -2056,7 +2051,7 @@ impl SandboxManagerService {
                 // outage behind an absence — the pass looks idle rather than
                 // broken. The claim was held, so `claim_not_acquired` would say the
                 // opposite of what happened; the write is what failed.
-                pplx_space_metrics::sandbox::worker::quarantine_recovery_no_progress(
+                crate::metrics::sandbox::worker::quarantine_recovery_no_progress(
                     reason,
                     QuarantineRecoveryAttemptOutcome::RetryWriteFailed,
                 );
@@ -2295,8 +2290,8 @@ impl SandboxManagerService {
                     };
                     match requested {
                         Ok(crate::db::CleanupEpisodeRequestOutcome::Requested) => {
-                            pplx_space_metrics::sandbox::worker::activation_cleanup(
-                                pplx_space_metrics::sandbox::worker::ActivationCleanupOutcome::Requested,
+                            crate::metrics::sandbox::worker::activation_cleanup(
+                                crate::metrics::sandbox::worker::ActivationCleanupOutcome::Requested,
                             );
                         }
                         Ok(crate::db::CleanupEpisodeRequestOutcome::AlreadyRequested) => {}

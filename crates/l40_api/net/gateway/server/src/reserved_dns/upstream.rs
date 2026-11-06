@@ -9,6 +9,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Poll, ready};
 use std::time::{Duration, Instant};
 
+use crate::metrics::ReservedDnsUpstreamClosedOutcome as ClosedOutcome;
+use crate::metrics::ReservedDnsUpstreamResponseOutcome as ResponseOutcome;
 use futures_util::future::{BoxFuture, FutureExt, Shared};
 use futures_util::stream::{self, BoxStream};
 use futures_util::{StreamExt, TryStreamExt};
@@ -20,8 +22,6 @@ use hickory_resolver::proto::op::{DnsRequest, DnsResponse};
 use hickory_resolver::proto::rr::RecordType;
 use hickory_resolver::{ConnectionProvider, PoolContext, TlsConfig};
 use parking_lot::Mutex;
-use pplx_space_metrics::gateway::ReservedDnsUpstreamClosedOutcome as ClosedOutcome;
-use pplx_space_metrics::gateway::ReservedDnsUpstreamResponseOutcome as ResponseOutcome;
 use tokio::sync::{Semaphore, oneshot};
 
 use super::{GatewayRuntimeProvider, MAX_CONCURRENT_LOOKUPS, ReservedResolver};
@@ -351,10 +351,7 @@ struct PooledConnection {
 impl PooledConnection {
     async fn replace(&self, closed: &Arc<Exchange>) -> Result<Arc<Exchange>, NetError> {
         let (result, outcome) = self.upstream.usable_exchange().await;
-        pplx_space_metrics::gateway::reserved_dns_upstream_closed(
-            self.upstream.resolver.as_str(),
-            outcome,
-        );
+        crate::metrics::reserved_dns_upstream_closed(self.upstream.resolver.as_str(), outcome);
         let exchange = result?;
         let mut current = self.exchange.lock();
         if Arc::ptr_eq(&current, closed) {
@@ -481,7 +478,7 @@ impl UpstreamTiming {
         if std::mem::replace(&mut self.recorded, true) {
             return;
         }
-        pplx_space_metrics::gateway::reserved_dns_upstream_request(
+        crate::metrics::reserved_dns_upstream_request(
             self.resolver.as_str(),
             outcome,
             self.started_at.elapsed().as_secs_f64() * 1000.0,
@@ -569,7 +566,7 @@ impl Drop for SetOnDrop {
 
 fn record_busy(lookup_slots: &Semaphore) -> usize {
     let active = MAX_CONCURRENT_LOOKUPS - lookup_slots.available_permits();
-    pplx_space_metrics::gateway::reserved_dns_upstream_busy_lookup_in_flight(active);
+    crate::metrics::reserved_dns_upstream_busy_lookup_in_flight(active);
     active
 }
 

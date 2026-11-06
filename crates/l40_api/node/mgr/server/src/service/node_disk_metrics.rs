@@ -172,30 +172,24 @@ impl DiskMetricSnapshot {
         // rather than publishing a misleading drop toward zero that looks like
         // reclaimed disk.
         if self.should_emit_byte_gauge(DiskUsageCategory::Template) {
-            pplx_space_metrics::node_disk::templates_bytes(self.templates_bytes);
+            crate::metrics::node_disk::templates_bytes(self.templates_bytes);
         }
         if self.should_emit_byte_gauge(DiskUsageCategory::SuspendCheckpoint) {
-            pplx_space_metrics::node_disk::snapshotted_sandbox_bytes(
-                self.snapshotted_sandbox_bytes,
-            );
+            crate::metrics::node_disk::snapshotted_sandbox_bytes(self.snapshotted_sandbox_bytes);
         }
         if self.should_emit_byte_gauge(DiskUsageCategory::ActiveInstance) {
-            pplx_space_metrics::node_disk::active_sandbox_bytes(self.active_sandbox_bytes);
+            crate::metrics::node_disk::active_sandbox_bytes(self.active_sandbox_bytes);
         }
         if self.should_emit_byte_gauge(DiskUsageCategory::BtrfsSnapshot) {
-            pplx_space_metrics::node_disk::btrfs_snapshot_bytes(self.btrfs_snapshot_bytes);
+            crate::metrics::node_disk::btrfs_snapshot_bytes(self.btrfs_snapshot_bytes);
         }
-        pplx_space_metrics::node_disk::template_count(self.template_count);
-        pplx_space_metrics::node_disk::snapshotted_sandbox_count(self.snapshotted_sandbox_count);
-        pplx_space_metrics::node_disk::btrfs_snapshot_count(self.btrfs_snapshot_count);
-        pplx_space_metrics::node_disk::measurement_success_count(
-            self.measurement_counts.success_count,
-        );
-        pplx_space_metrics::node_disk::measurement_missing_count(
-            self.measurement_counts.missing_count,
-        );
-        pplx_space_metrics::node_disk::measurement_error_count(self.measurement_counts.error_count);
-        pplx_space_metrics::node_disk::measurement_unmeasured_count(
+        crate::metrics::node_disk::template_count(self.template_count);
+        crate::metrics::node_disk::snapshotted_sandbox_count(self.snapshotted_sandbox_count);
+        crate::metrics::node_disk::btrfs_snapshot_count(self.btrfs_snapshot_count);
+        crate::metrics::node_disk::measurement_success_count(self.measurement_counts.success_count);
+        crate::metrics::node_disk::measurement_missing_count(self.measurement_counts.missing_count);
+        crate::metrics::node_disk::measurement_error_count(self.measurement_counts.error_count);
+        crate::metrics::node_disk::measurement_unmeasured_count(
             self.measurement_counts.unmeasured_count,
         );
     }
@@ -343,7 +337,7 @@ async fn run_loop(
                 // A failed tick publishes none of the byte, target-count or
                 // measurement gauges, so without this a stale byte gauge looks
                 // like a node that stopped reporting.
-                pplx_space_metrics::node_disk::metrics_tick_success(result.is_ok());
+                crate::metrics::node_disk::metrics_tick_success(result.is_ok());
                 if let Err(error) = result {
                     warn!(%error, "node disk metrics tick failed");
                 }

@@ -335,12 +335,7 @@ impl TransferExecutor {
             execution_materialization_mode,
             download_started_at,
         );
-        pplx_space_metrics::volume_manager::transfer_bytes(
-            &job.kind,
-            artifact,
-            "downloaded",
-            bytes,
-        );
+        crate::metrics::transfer_bytes(&job.kind, artifact, "downloaded", bytes);
         emit_transfer_throughput_mib_s(
             &job.kind,
             artifact,
@@ -429,7 +424,7 @@ impl TransferExecutor {
                         .await
                         .map(|m| m.len())
                         .unwrap_or(bytes);
-                    pplx_space_metrics::volume_manager::transfer_bytes(
+                    crate::metrics::transfer_bytes(
                         &job.kind,
                         artifact,
                         if was_decompressed {
@@ -448,7 +443,7 @@ impl TransferExecutor {
                         decrypt_started_at,
                     );
                     if was_decompressed && bytes > 0 {
-                        pplx_space_metrics::volume_manager::transfer_inflation_ratio(
+                        crate::metrics::transfer_inflation_ratio(
                             &job.kind,
                             artifact,
                             plaintext_size as f64 / bytes as f64,
@@ -529,12 +524,7 @@ impl TransferExecutor {
         // decoded a second time.
         let file_is_zstd = !chained_decompressed && !streamed && is_zstd(local_path).await;
         if p.should_transparent_decompress(file_is_zstd) {
-            pplx_space_metrics::volume_manager::transfer_bytes(
-                &job.kind,
-                artifact,
-                "compressed",
-                bytes,
-            );
+            crate::metrics::transfer_bytes(&job.kind, artifact, "compressed", bytes);
             tracing::debug!(
                 job_id = %job.job_id,
                 subject_id = %p.subject_id,
@@ -572,12 +562,7 @@ impl TransferExecutor {
                 execution_materialization_mode,
                 decompress_started_at,
             );
-            pplx_space_metrics::volume_manager::transfer_bytes(
-                &job.kind,
-                artifact,
-                "decompressed",
-                decompressed,
-            );
+            crate::metrics::transfer_bytes(&job.kind, artifact, "decompressed", decompressed);
             emit_transfer_throughput_mib_s(
                 &job.kind,
                 artifact,
@@ -587,7 +572,7 @@ impl TransferExecutor {
                 decompress_started_at,
             );
             if bytes > 0 {
-                pplx_space_metrics::volume_manager::transfer_inflation_ratio(
+                crate::metrics::transfer_inflation_ratio(
                     &job.kind,
                     artifact,
                     decompressed as f64 / bytes as f64,
@@ -650,24 +635,14 @@ impl TransferExecutor {
         if streamed_decoded {
             // The ranged download decoded inline; account the compressed and
             // decoded sizes the way the legacy decompress pass would have.
-            pplx_space_metrics::volume_manager::transfer_bytes(
-                &job.kind,
-                artifact,
-                "compressed",
-                bytes,
-            );
+            crate::metrics::transfer_bytes(&job.kind, artifact, "compressed", bytes);
             let decompressed = tokio::fs::metadata(local_path)
                 .await
                 .map(|m| m.len())
                 .unwrap_or(bytes);
-            pplx_space_metrics::volume_manager::transfer_bytes(
-                &job.kind,
-                artifact,
-                "decompressed",
-                decompressed,
-            );
+            crate::metrics::transfer_bytes(&job.kind, artifact, "decompressed", decompressed);
             if bytes > 0 {
-                pplx_space_metrics::volume_manager::transfer_inflation_ratio(
+                crate::metrics::transfer_inflation_ratio(
                     &job.kind,
                     artifact,
                     decompressed as f64 / bytes as f64,
@@ -695,12 +670,7 @@ impl TransferExecutor {
         } else {
             bytes
         };
-        pplx_space_metrics::volume_manager::transfer_bytes(
-            &job.kind,
-            artifact,
-            "output",
-            output_size,
-        );
+        crate::metrics::transfer_bytes(&job.kind, artifact, "output", output_size);
         let materialization_mode = decompression_report.mode;
         let materialization = if chained_decompressed || streamed_decoded {
             #[cfg(unix)]

@@ -125,7 +125,7 @@ impl SandboxManagerService {
         policy: SpacedEndpointProofPolicy,
     ) -> Result<pplx_space_spaced_host_client::SpacedHostClient, Status> {
         super::guest_image::require_agent(sandbox)?;
-        use pplx_space_metrics::sandbox::worker::{
+        use crate::metrics::sandbox::worker::{
             SpacedEndpointAttestationResult, spaced_endpoint_attestation,
         };
 
@@ -207,8 +207,8 @@ impl SandboxManagerService {
             record_endpoint_attestation_error(&error);
             return Err(error);
         }
-        pplx_space_metrics::sandbox::worker::spaced_endpoint_attestation(
-            pplx_space_metrics::sandbox::worker::SpacedEndpointAttestationResult::Ok,
+        crate::metrics::sandbox::worker::spaced_endpoint_attestation(
+            crate::metrics::sandbox::worker::SpacedEndpointAttestationResult::Ok,
             super::start::short_grpc_code(tonic::Code::Ok),
         );
         Ok(client)
@@ -546,7 +546,7 @@ fn resolve_endpoint_proof_cas_winner(
 }
 
 fn record_endpoint_attestation_error(error: &Status) {
-    use pplx_space_metrics::sandbox::worker::{
+    use crate::metrics::sandbox::worker::{
         SpacedEndpointAttestationResult, spaced_endpoint_attestation,
     };
 
@@ -562,7 +562,7 @@ fn record_endpoint_attestation_error(error: &Status) {
 async fn connect_spaced_host_live(
     sandbox: &crate::db::SandboxRow,
 ) -> Result<pplx_space_spaced_host_client::SpacedHostClient, Status> {
-    use pplx_space_metrics::sandbox::worker::{
+    use crate::metrics::sandbox::worker::{
         SpacedEndpointAttestationResult, spaced_endpoint_attestation,
     };
 
@@ -1202,12 +1202,12 @@ impl<T> tokio_stream::Stream for FencedStatusStream<T> {
 
 fn route_stream_cancellation_status(identity_fence: &RouteStreamFence) -> Status {
     let close_reason = identity_fence.close_reason();
-    pplx_space_metrics::sandbox::worker::route_stream_closed(close_reason);
+    crate::metrics::sandbox::worker::route_stream_closed(close_reason);
     Status::aborted(match close_reason {
-        pplx_space_metrics::sandbox::worker::RouteStreamCloseReason::IdentityChanged => {
+        crate::metrics::sandbox::worker::RouteStreamCloseReason::IdentityChanged => {
             "sandbox execution identity changed while stream was open"
         }
-        pplx_space_metrics::sandbox::worker::RouteStreamCloseReason::LifecycleTeardown => {
+        crate::metrics::sandbox::worker::RouteStreamCloseReason::LifecycleTeardown => {
             "sandbox lifecycle teardown closed the stream"
         }
     })
@@ -1271,7 +1271,7 @@ where
                             elapsed_secs = started_at.elapsed().as_secs(),
                             "stream presence cap reached; idle reclaim resumes for this sandbox"
                         );
-                        pplx_space_metrics::stream_presence::touch("cap_reached");
+                        crate::metrics::stream_presence::touch("cap_reached");
                         presence_active = false;
                         continue;
                     }
@@ -1284,14 +1284,14 @@ where
                         .await
                     {
                         Ok(outcome) => {
-                            pplx_space_metrics::stream_presence::touch(outcome.as_str());
+                            crate::metrics::stream_presence::touch(outcome.as_str());
                             #[cfg(test)]
                             if let Some(observer) = &presence.tick_observer {
                                 let _ = observer.send(outcome);
                             }
                         }
                         Err(error) => {
-                            pplx_space_metrics::stream_presence::touch("failed");
+                            crate::metrics::stream_presence::touch("failed");
                             // Best-effort: a failed touch must never tear down
                             // the data stream. NotFound is the expected shape
                             // (row deleted under an open stream, repeating every

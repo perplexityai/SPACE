@@ -45,7 +45,7 @@ pplx-space-common-jobs = { workspace = true }
 pplx-space-common-svc = { workspace = true }
 pplx-space-sqlite = { workspace = true }
 pplx-space-credmgr-client = { workspace = true }
-pplx-space-metrics = { workspace = true }
+pplx-space-metrics-emit = { workspace = true }
 pplx-space-object-store = { workspace = true }
 pplx-space-volmgr-client = { workspace = true }
 pplx-space-node-mgr-client = { workspace = true }

@@ -5,8 +5,6 @@ pub mod api;
 pub mod publication;
 pub mod restore;
 pub mod transient_lifecycle;
-pub mod vm;
-pub mod worker;
 
 fn sandbox_tags(backend: &str, template: Option<&str>, result: &str) -> Vec<String> {
     let mut tags = vec![tag("backend", backend), tag("result", result)];

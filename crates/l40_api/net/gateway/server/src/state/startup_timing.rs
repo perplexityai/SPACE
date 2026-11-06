@@ -4,8 +4,8 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use pplx_space_metrics::gateway::readiness::{self as metrics, Outcome};
 use pplx_space_net_common::TlsInterception;
+use pplx_space_sandbox_metrics::gateway_readiness::{self as metrics, Outcome};
 
 use super::NetworkStateInner;
 use crate::proto::NetworkState;

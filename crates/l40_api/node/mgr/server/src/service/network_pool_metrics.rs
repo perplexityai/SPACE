@@ -2,9 +2,9 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::metrics::node_manager::GuestUdp443Action;
+use crate::metrics::node_network::{self, NetworkSlotState};
 use futures_util::{StreamExt, stream};
-use pplx_space_metrics::node_manager::GuestUdp443Action;
-use pplx_space_metrics::node_network::{self, NetworkSlotState};
 use tokio::time::MissedTickBehavior;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
@@ -129,9 +129,9 @@ where
                 (GuestUdp443Action::Observe, observed),
                 (GuestUdp443Action::Reject, rejected),
             ] {
-                pplx_space_metrics::node_manager::guest_udp443_packets(packets, action);
+                crate::metrics::node_manager::guest_udp443_packets(packets, action);
             }
-            pplx_space_metrics::node_manager::guest_vlan_packets(vlan_packets);
+            crate::metrics::node_manager::guest_vlan_packets(vlan_packets);
         };
         // Dropping the pass stops admission and discards incomplete totals.
         // At most eight started probes retain the existing host-command timeout.

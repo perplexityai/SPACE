@@ -5024,7 +5024,7 @@ dependencies = [
  "pplx-space-db-test-fixtures",
  "pplx-space-execution-common",
  "pplx-space-internal-api-server",
- "pplx-space-metrics",
+ "pplx-space-metrics-emit",
  "pplx-space-net-common",
  "pplx-space-node-api-client",
  "pplx-space-node-mgr-client",
@@ -5112,7 +5112,6 @@ dependencies = [
  "pplx-space-common-grpc",
  "pplx-space-common-jobs",
  "pplx-space-common-svc",
- "pplx-space-metrics",
  "pplx-space-test-env",
  "prost",
  "rcgen",
@@ -5646,7 +5645,6 @@ dependencies = [
  "pplx-space-credential-provider-client",
  "pplx-space-credmgr-client",
  "pplx-space-db-test-fixtures",
- "pplx-space-metrics",
  "pplx-space-metrics-emit",
  "pplx-space-net-common",
  "pplx-space-test-env",
@@ -6140,7 +6138,6 @@ dependencies = [
 name = "pplx-space-metrics"
 version = "0.8.1"
 dependencies = [
- "metrics",
  "pplx-space-common-core",
  "pplx-space-metrics-emit",
  "pplx-space-observability",
@@ -6155,6 +6152,19 @@ name = "pplx-space-metrics-emit"
 version = "0.8.1"
 dependencies = [
  "pplx-space-observability",
+]
+
+[[package]]
+name = "pplx-space-metrics-workload"
+version = "0.8.1"
+dependencies = [
+ "pplx-space-common-core",
+ "pplx-space-metrics",
+ "pplx-space-node-mgr",
+ "pplx-space-observability",
+ "pplx-space-sbx-mgr",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -6248,6 +6258,7 @@ dependencies = [
  "jiff",
  "libc",
  "lru 0.18.4",
+ "metrics",
  "nix 0.31.3",
  "parking_lot",
  "pplx-space-common-connection-admission",
@@ -6257,11 +6268,11 @@ dependencies = [
  "pplx-space-credential-injection-core",
  "pplx-space-credmgr-client",
  "pplx-space-events",
- "pplx-space-metrics",
  "pplx-space-metrics-emit",
  "pplx-space-net-common",
  "pplx-space-net-gateway-client",
  "pplx-space-observability",
+ "pplx-space-sandbox-metrics",
  "pplx-space-spaced-common",
  "pplx-space-test-env",
  "prost",
@@ -6420,7 +6431,7 @@ dependencies = [
  "pplx-space-common-grpc",
  "pplx-space-common-svc",
  "pplx-space-grpc-metrics",
- "pplx-space-metrics",
+ "pplx-space-metrics-emit",
  "pplx-space-net-common",
  "pplx-space-net-gateway-client",
  "pplx-space-node-api-client",
@@ -6539,7 +6550,7 @@ dependencies = [
  "pplx-space-common-svc",
  "pplx-space-execution-common",
  "pplx-space-grpc-metrics",
- "pplx-space-metrics",
+ "pplx-space-metrics-emit",
  "pplx-space-net-common",
  "pplx-space-node-api-client",
  "pplx-space-node-mgr-client",
@@ -6607,7 +6618,6 @@ dependencies = [
  "pplx-space-events",
  "pplx-space-execution-common",
  "pplx-space-grpc-metrics",
- "pplx-space-metrics",
  "pplx-space-metrics-emit",
  "pplx-space-net-common",
  "pplx-space-node-ctl-client",
@@ -6721,7 +6731,7 @@ dependencies = [
  "pplx-space-common-proto-build",
  "pplx-space-execution-catalog",
  "pplx-space-execution-common",
- "pplx-space-metrics",
+ "pplx-space-metrics-emit",
  "pplx-space-net-common",
  "pplx-space-test-env",
  "pplx-space-uds-peer-auth",
@@ -7069,6 +7079,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "pplx-space-sandbox-metrics"
+version = "0.8.1"
+dependencies = [
+ "pplx-space-k8s-ids",
+ "pplx-space-metrics-emit",
+ "pplx-space-observability",
+]
+
+[[package]]
 name = "pplx-space-sandbox-portability"
 version = "0.8.1"
 dependencies = [
@@ -7171,6 +7190,7 @@ dependencies = [
  "pplx-space-node-runtime-core",
  "pplx-space-observability",
  "pplx-space-reconcile-metrics",
+ "pplx-space-sandbox-metrics",
  "pplx-space-sbx-mgr-client",
  "pplx-space-sbx-mgr-store",
  "pplx-space-spaced-common",
@@ -7349,7 +7369,6 @@ dependencies = [
  "pplx-space-common-core",
  "pplx-space-db-test-fixtures",
  "pplx-space-events",
- "pplx-space-metrics",
  "pplx-space-metrics-emit",
  "pplx-space-observability",
  "pplx-space-sandbox-portability",
@@ -7653,7 +7672,7 @@ dependencies = [
  "pplx-space-common-svc",
  "pplx-space-grpc-metrics",
  "pplx-space-guest-process",
- "pplx-space-metrics",
+ "pplx-space-metrics-emit",
  "pplx-space-net-common",
  "pplx-space-spaced-common",
  "pplx-space-spaced-guest-server",
@@ -7771,7 +7790,7 @@ dependencies = [
  "pplx-space-execution-common",
  "pplx-space-feature-flags",
  "pplx-space-internal-api-server",
- "pplx-space-metrics",
+ "pplx-space-metrics-emit",
  "pplx-space-net-common",
  "pplx-space-node-api-client",
  "pplx-space-node-mgr-client",
@@ -7961,7 +7980,7 @@ dependencies = [
  "pplx-space-common-jobs",
  "pplx-space-common-svc",
  "pplx-space-credmgr-client",
- "pplx-space-metrics",
+ "pplx-space-metrics-emit",
  "pplx-space-node-mgr-client",
  "pplx-space-object-store",
  "pplx-space-sqlite",

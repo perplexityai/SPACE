@@ -224,9 +224,9 @@ pub(super) async fn collect_auto_lifecycle_delete_completions(
     let mut client = match pplx_space_sbx_mgr_client::connect().await {
         Ok(client) => client,
         Err(error) => {
-            pplx_space_metrics::reconcile::auto_lifecycle_delete_delivery(
-                pplx_space_metrics::reconcile::AutoLifecycleDeleteDeliveryOperation::List,
-                pplx_space_metrics::reconcile::AutoLifecycleDeleteDeliveryOutcome::Failed,
+            crate::metrics::reconcile::auto_lifecycle_delete_delivery(
+                crate::metrics::reconcile::AutoLifecycleDeleteDeliveryOperation::List,
+                crate::metrics::reconcile::AutoLifecycleDeleteDeliveryOutcome::Failed,
             );
             tracing::warn!(%error, "cannot connect to sbx-manager to list delete receipts");
             return Vec::new();
@@ -239,9 +239,9 @@ pub(super) async fn collect_auto_lifecycle_delete_completions(
         .await
     {
         Ok(response) => {
-            pplx_space_metrics::reconcile::auto_lifecycle_delete_delivery(
-                pplx_space_metrics::reconcile::AutoLifecycleDeleteDeliveryOperation::List,
-                pplx_space_metrics::reconcile::AutoLifecycleDeleteDeliveryOutcome::Succeeded,
+            crate::metrics::reconcile::auto_lifecycle_delete_delivery(
+                crate::metrics::reconcile::AutoLifecycleDeleteDeliveryOperation::List,
+                crate::metrics::reconcile::AutoLifecycleDeleteDeliveryOutcome::Succeeded,
             );
             response
                 .into_inner()
@@ -257,16 +257,16 @@ pub(super) async fn collect_auto_lifecycle_delete_completions(
                 .collect()
         }
         Err(error) if error.code() == Code::Unimplemented => {
-            pplx_space_metrics::reconcile::auto_lifecycle_delete_delivery(
-                pplx_space_metrics::reconcile::AutoLifecycleDeleteDeliveryOperation::List,
-                pplx_space_metrics::reconcile::AutoLifecycleDeleteDeliveryOutcome::Unimplemented,
+            crate::metrics::reconcile::auto_lifecycle_delete_delivery(
+                crate::metrics::reconcile::AutoLifecycleDeleteDeliveryOperation::List,
+                crate::metrics::reconcile::AutoLifecycleDeleteDeliveryOutcome::Unimplemented,
             );
             Vec::new()
         }
         Err(error) => {
-            pplx_space_metrics::reconcile::auto_lifecycle_delete_delivery(
-                pplx_space_metrics::reconcile::AutoLifecycleDeleteDeliveryOperation::List,
-                pplx_space_metrics::reconcile::AutoLifecycleDeleteDeliveryOutcome::Failed,
+            crate::metrics::reconcile::auto_lifecycle_delete_delivery(
+                crate::metrics::reconcile::AutoLifecycleDeleteDeliveryOperation::List,
+                crate::metrics::reconcile::AutoLifecycleDeleteDeliveryOutcome::Failed,
             );
             tracing::warn!(%error, "cannot list auto-lifecycle delete receipts");
             Vec::new()
@@ -284,9 +284,9 @@ pub(super) async fn acknowledge_auto_lifecycle_delete_completions(
     let mut client = match pplx_space_sbx_mgr_client::connect().await {
         Ok(client) => client,
         Err(error) => {
-            pplx_space_metrics::reconcile::auto_lifecycle_delete_delivery(
-                pplx_space_metrics::reconcile::AutoLifecycleDeleteDeliveryOperation::Acknowledge,
-                pplx_space_metrics::reconcile::AutoLifecycleDeleteDeliveryOutcome::Failed,
+            crate::metrics::reconcile::auto_lifecycle_delete_delivery(
+                crate::metrics::reconcile::AutoLifecycleDeleteDeliveryOperation::Acknowledge,
+                crate::metrics::reconcile::AutoLifecycleDeleteDeliveryOutcome::Failed,
             );
             tracing::warn!(%error, "cannot connect to sbx-manager to acknowledge delete receipts");
             return;
@@ -301,15 +301,15 @@ pub(super) async fn acknowledge_auto_lifecycle_delete_completions(
         .await
     {
         Ok(_) => {
-            pplx_space_metrics::reconcile::auto_lifecycle_delete_delivery(
-                pplx_space_metrics::reconcile::AutoLifecycleDeleteDeliveryOperation::Acknowledge,
-                pplx_space_metrics::reconcile::AutoLifecycleDeleteDeliveryOutcome::Succeeded,
+            crate::metrics::reconcile::auto_lifecycle_delete_delivery(
+                crate::metrics::reconcile::AutoLifecycleDeleteDeliveryOperation::Acknowledge,
+                crate::metrics::reconcile::AutoLifecycleDeleteDeliveryOutcome::Succeeded,
             );
         }
         Err(error) => {
-            pplx_space_metrics::reconcile::auto_lifecycle_delete_delivery(
-                pplx_space_metrics::reconcile::AutoLifecycleDeleteDeliveryOperation::Acknowledge,
-                pplx_space_metrics::reconcile::AutoLifecycleDeleteDeliveryOutcome::Failed,
+            crate::metrics::reconcile::auto_lifecycle_delete_delivery(
+                crate::metrics::reconcile::AutoLifecycleDeleteDeliveryOperation::Acknowledge,
+                crate::metrics::reconcile::AutoLifecycleDeleteDeliveryOutcome::Failed,
             );
             tracing::warn!(%error, "cannot acknowledge auto-lifecycle delete receipts");
         }

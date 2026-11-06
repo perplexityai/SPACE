@@ -172,14 +172,14 @@ pub async fn run(
 
             let drained = service.wait_for_running_builds(drain_timeout).await;
             if drained {
-                pplx_space_metrics::template::build_drain_completed(
-                    pplx_space_metrics::template::TemplateBuildDrainResult::Completed,
+                pplx_space_build_mgr::metrics::build_drain_completed(
+                    pplx_space_build_mgr::metrics::TemplateBuildDrainResult::Completed,
                     drain_started_at,
                 );
                 tracing::info!("build-manager drain completed");
             } else {
-                pplx_space_metrics::template::build_drain_completed(
-                    pplx_space_metrics::template::TemplateBuildDrainResult::Timeout,
+                pplx_space_build_mgr::metrics::build_drain_completed(
+                    pplx_space_build_mgr::metrics::TemplateBuildDrainResult::Timeout,
                     drain_started_at,
                 );
                 tracing::warn!(

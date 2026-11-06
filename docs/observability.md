@@ -724,7 +724,8 @@ node-wide metrics carry no sandbox id:
 | `sandbox.firecracker.telemetry_dropped` | counter, flushes or log lines Firecracker could not write | `stream` (`metrics`, `log`) |
 | `sandbox.vm.diagnostics` | counter, forwarded Firecracker ERROR lines and guest WARN and ERROR diagnostics | `source` (`firecracker`, `guest`), `level` (`warn`, `error`), `outcome` (`logged`, `rate_limited`, `dropped_in_guest`) |
 
-The `error` values are listed in `crates/libs/metrics/src/sandbox/vm.rs`.
+The `error` values are listed in
+`crates/l40_api/sbx/mgr/server/src/metrics/sandbox/vm.rs`.
 Firecracker's flow-control counters (`block` `no_avail_buffer`, `net`
 `no_rx_avail_buffer` and `no_tx_avail_buffer`) are not among them: they count
 times the guest had not yet posted a buffer, which the device retries, not

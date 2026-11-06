@@ -17,6 +17,8 @@ pub mod catalog;
 pub mod file_delta;
 
 pub mod launch_admission;
+#[cfg(feature = "host-runtime")]
+pub mod metrics;
 pub mod runtime_inventory;
 pub mod selection;
 pub mod verity;

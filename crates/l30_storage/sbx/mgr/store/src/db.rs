@@ -116,7 +116,8 @@ pub use teardown_suspend::*;
 // into `sandbox_quarantine_state.last_error`. Pre-claim reasons and a detached
 // task failure are metric-only, but share the same bounded classification so one
 // pass does not invent a second reason type. It therefore belongs in common-core
-// rather than in the metrics crate whose tag it also happens to be. Re-exported here so
+// rather than in sbx-mgr's `metrics::sandbox::worker`, whose tag it also happens
+// to be. Re-exported here so
 // `crate::db::QuarantineRecoveryNoProgressReason` stays the name callers use.
 pub use pplx_space_common_core::types::QuarantineRecoveryNoProgressReason;
 

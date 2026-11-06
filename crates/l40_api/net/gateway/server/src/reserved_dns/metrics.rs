@@ -68,7 +68,7 @@ pub(super) fn record_request_outcome(
         Some(_) => "other",
         None => "unknown",
     };
-    pplx_space_metrics::gateway::reserved_dns_request_outcome(
+    crate::metrics::reserved_dns_request_outcome(
         resolver,
         qtype,
         outcome,

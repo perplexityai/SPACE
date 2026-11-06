@@ -12,10 +12,10 @@ From the repository root, with Python 3, the Rust toolchain and the verified
 Kind bench available:
 
 ```bash
-cargo build --locked -p pplx-space-metrics --example metrics_workload \
-  --features pplx-space-observability/otlp-metrics
+cargo build --locked -p pplx-space-metrics-workload --bin metrics_workload \
+  --features otlp-metrics
 docker build -t space-oss-workload:local \
-  -f scripts/tests/observability/metrics/workload.Dockerfile target/debug/examples
+  -f scripts/tests/observability/metrics/workload.Dockerfile target/debug
 bash infra/space/kind/metrics/local.sh status
 kind load docker-image --name space-local space-oss-workload:local
 bash scripts/tests/observability/metrics/run.sh review01 \

@@ -255,11 +255,8 @@ pub(crate) fn record(
     // The detail rides the scan itself, not just an interception refusal, so a
     // fleet can size its missing-SNI exposure before interception is enabled.
     let detail = missing_sni_detail.map_or("none", MissingSniDetail::as_str);
-    pplx_space_metrics::gateway::tls_client_hello(outcome(scan), client_alpn, detail);
-    pplx_space_metrics::gateway::tls_client_hello_duration_ms(
-        outcome(scan),
-        elapsed.as_secs_f64() * 1_000.0,
-    );
+    crate::metrics::tls_client_hello(outcome(scan), client_alpn, detail);
+    crate::metrics::tls_client_hello_duration_ms(outcome(scan), elapsed.as_secs_f64() * 1_000.0);
 
     let outcome = outcome(scan).as_str();
     match scan.server_name() {
@@ -304,8 +301,8 @@ pub(crate) fn record(
 
 /// Map a scan verdict to its metered outcome. `tls_sni` is kept free of the
 /// metrics vocabulary, so this boundary mapping lives here.
-fn outcome(scan: &ClientHelloScan) -> pplx_space_metrics::gateway::TlsClientHelloOutcome {
-    use pplx_space_metrics::gateway::TlsClientHelloOutcome;
+fn outcome(scan: &ClientHelloScan) -> crate::metrics::TlsClientHelloOutcome {
+    use crate::metrics::TlsClientHelloOutcome;
     match scan {
         ClientHelloScan::ServerName(_) => TlsClientHelloOutcome::Sni,
         ClientHelloScan::NoServerName => TlsClientHelloOutcome::NoSni,

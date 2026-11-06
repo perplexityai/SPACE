@@ -16,6 +16,7 @@ pub mod k8s_identity;
 pub mod kek_provisioning;
 pub mod kek_store;
 pub mod key_wrapper;
+pub mod metrics;
 pub mod node_ca;
 pub mod node_service;
 mod run;
