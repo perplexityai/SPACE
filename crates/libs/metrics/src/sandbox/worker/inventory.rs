@@ -1,4 +1,4 @@
-//! Inventory: list budgets, lifecycle counts, orphan rows and inventory reconciliation.
+//! Inventory: list budgets, lifecycle and status counts, orphan rows and inventory reconciliation.
 
 use super::*;
 
@@ -35,6 +35,20 @@ pub fn lifecycle_count(
                 runtime_version.map_or("unknown", |version| version.as_str()),
             ),
         ],
+    );
+}
+
+/// Current node-local durable sandbox rows with one stored lifecycle and
+/// cleanup state. Unlike `sandbox.worker.lifecycle.count`, a cleanup is not
+/// folded into the lifecycle: `cleanup_state` is `required`, `failed` or
+/// `none`, and `state` is always a lifecycle state. The caller supplies values
+/// decoded through the sandbox-manager's bounded state enums; do not attach
+/// sandbox, pod, node, or execution identifiers.
+pub fn lifecycle_status_count(value: u64, state: &str, cleanup_state: &str) {
+    gauge(
+        "sandbox.worker.lifecycle.status_count",
+        value as f64,
+        &[tag("state", state), tag("cleanup_state", cleanup_state)],
     );
 }
 

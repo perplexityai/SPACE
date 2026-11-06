@@ -75,3 +75,41 @@ fn disappeared_lifecycle_buckets_are_zeroed_once() {
         ]
     );
 }
+
+#[test]
+fn status_buckets_name_the_cleanup_state_and_zero_a_disappeared_series_once() {
+    let mut sampler = LifecycleGaugeSampler::default();
+    let initial = [
+        SandboxStatusCount {
+            state: SandboxState::Stopping,
+            cleanup_state: Some("failed"),
+            count: 2,
+        },
+        SandboxStatusCount {
+            state: SandboxState::Stopping,
+            cleanup_state: None,
+            count: 1,
+        },
+    ];
+    let bucket = |cleanup_state: &str| StatusBucket {
+        state: "stopping".to_owned(),
+        cleanup_state: cleanup_state.to_owned(),
+    };
+    let mut emitted = Vec::new();
+    sampler.emit_sample(&initial, |bucket, count| {
+        emitted.push((bucket.clone(), count));
+    });
+    sampler.emit_sample(&initial[1..], |bucket, count| {
+        emitted.push((bucket.clone(), count));
+    });
+
+    assert_eq!(
+        emitted,
+        vec![
+            (bucket("failed"), 2),
+            (bucket("none"), 1),
+            (bucket("none"), 1),
+            (bucket("failed"), 0),
+        ]
+    );
+}

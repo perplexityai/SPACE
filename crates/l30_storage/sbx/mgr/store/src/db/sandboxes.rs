@@ -44,6 +44,16 @@ pub struct SandboxLifecycleCount {
     pub count: u64,
 }
 
+/// Rows with one stored lifecycle and cleanup state. `cleanup_state` is the
+/// label of the cleanup that owns the rows (`required` or `failed`), absent
+/// when none does.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SandboxStatusCount {
+    pub state: SandboxState,
+    pub cleanup_state: Option<&'static str>,
+    pub count: u64,
+}
+
 pub struct RuntimeFields<'a> {
     pub uid: u32,
     pub slot: u32,
@@ -176,6 +186,52 @@ db_private_outside_tests! {
             ))
         });
         Ok(counts)
+    }
+}
+
+db_private_outside_tests! {
+    /// Count every durable sandbox-manager row by its stored lifecycle and
+    /// cleanup state, unsummed. A label this binary does not know fails the
+    /// count rather than being dropped from it.
+    fn sandbox_status_counts(conn: &Connection) -> Result<Vec<SandboxStatusCount>> {
+        let mut statement = conn.prepare(
+            "SELECT state, cleanup_state, COUNT(*)
+           FROM sandboxes
+       GROUP BY state, cleanup_state
+       ORDER BY state, cleanup_state",
+        )?;
+        let rows = statement.query_map([], |row| {
+            let unknown = |column, label: &str| {
+                let kind = if column == 0 { "state" } else { "cleanup state" };
+                rusqlite::Error::FromSqlConversionFailure(
+                    column,
+                    Type::Text,
+                    format!("unknown sandbox {kind} '{label}'").into(),
+                )
+            };
+            let state_label: String = row.get(0)?;
+            let state = state_label
+                .parse::<SandboxState>()
+                .ok()
+                .filter(|state| state.cleanup_label().is_none())
+                .ok_or_else(|| unknown(0, &state_label))?;
+            let cleanup_state = row
+                .get::<_, Option<String>>(1)?
+                .map(|label| {
+                    SandboxState::all()
+                        .into_iter()
+                        .find_map(|state| state.cleanup_label().filter(|known| *known == label))
+                        .ok_or_else(|| unknown(1, &label))
+                })
+                .transpose()?;
+            let count = row.get::<_, SqliteU64>(2)?.0;
+            Ok(SandboxStatusCount {
+                state,
+                cleanup_state,
+                count,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 }
 

@@ -1250,6 +1250,59 @@ fn sandbox_lifecycle_counts_preserve_rows_across_runtime_versions_and_legacy_met
 }
 
 #[test]
+fn sandbox_status_counts_keep_each_lifecycle_and_cleanup_pair_apart() {
+    let conn = test_conn();
+    // Plain, required and failed rows share `stopping`; plain and failed rows
+    // share `deleting`.
+    for (id, uuid8, state) in [
+        ("started", "abc00001", SandboxState::Started),
+        ("stopping", "abc00002", SandboxState::Stopping),
+        ("stop-required", "abc00003", SandboxState::CleanupRequired),
+        ("stop-failed", "abc00004", SandboxState::CleanupFailed),
+        ("deleting", "abc00005", SandboxState::Deleting),
+        ("delete-failed", "abc00006", SandboxState::CleanupFailed),
+    ] {
+        insert_test_sandbox(&conn, TestSandboxInsert::new(id, uuid8, state));
+    }
+    set_cleanup_intent(&conn, "stop-failed", true, CleanupCompletion::MarkStopped).unwrap();
+    set_cleanup_intent(&conn, "delete-failed", false, CleanupCompletion::DeleteRow).unwrap();
+
+    let status = |state, cleanup_state| SandboxStatusCount {
+        state,
+        cleanup_state,
+        count: 1,
+    };
+    assert_eq!(
+        sandbox_status_counts(&conn).unwrap(),
+        vec![
+            status(SandboxState::Deleting, None),
+            status(SandboxState::Deleting, Some("failed")),
+            status(SandboxState::Started, None),
+            status(SandboxState::Stopping, None),
+            status(SandboxState::Stopping, Some("failed")),
+            status(SandboxState::Stopping, Some("required")),
+        ]
+    );
+
+    // The legacy count folds each cleanup into its combined status.
+    let legacy: Vec<_> = sandbox_lifecycle_counts(&conn)
+        .unwrap()
+        .into_iter()
+        .map(|count| (count.state, count.count))
+        .collect();
+    assert_eq!(
+        legacy,
+        vec![
+            (SandboxState::CleanupFailed, 2),
+            (SandboxState::CleanupRequired, 1),
+            (SandboxState::Deleting, 1),
+            (SandboxState::Started, 1),
+            (SandboxState::Stopping, 1),
+        ]
+    );
+}
+
+#[test]
 fn suspend_publication_protects_live_and_retry_owned_suspend() {
     assert_eq!(
         sandbox_erase_safety(SandboxState::Suspending, None, None),
