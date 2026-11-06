@@ -894,7 +894,11 @@ pub(crate) fn controller_create_request(
         disk_mib: resources.disk_mib,
         file_changes: None,
         auto_lifecycle: request.auto_lifecycle,
-        wait_until_ready: false,
+        // The operation succeeds once the guest answers, so a client that
+        // waited for it can run a command or a file call at once, as an ECW
+        // create answers. The pinned sandbox ID keeps this from adopting a
+        // warm-pool slot, which only the admission-time claim does.
+        wait_until_ready: true,
         network_policy: request.network_policy,
         // Placement pin carried from the operator (admin) create surface; the
         // public API never sets it.

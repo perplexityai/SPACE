@@ -98,8 +98,9 @@ async fn native_create_executor_preserves_operator_policy_across_replacements(
     use crate::tls_interception_exemptions::TlsInterceptionExemptions;
     use pplx_space_net_common::NetworkPolicyV1;
 
-    // The fully instrumented native create path needs more than libtest's default stack.
-    if !pplx_space_test_env::enter_test_process(&[(
+    // The fully instrumented native create path needs more than libtest's
+    // default stack, and its readiness wait calls the sim worker.
+    if !crate::test_support::enter_sim_worker_process_with(&[(
         "RUST_MIN_STACK",
         Some(std::ffi::OsStr::new("16777216")),
     )]) {
@@ -159,13 +160,17 @@ async fn native_create_executor_preserves_operator_policy_across_replacements(
         time::OffsetDateTime::now_utc() + time::Duration::hours(1),
     )?;
     let captured_pods = Arc::new(Mutex::new(Vec::new()));
-    // Native create probes the pod's TCP listener even with command readiness disabled.
-    let pod_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    // Native create waits for the guest, which the worker behind the pod's
+    // proxy port answers for.
+    let worker = pplx_space_node_api_sim::SimWorkerHarness::builder(NodeId::new().to_string())
+        .with_internal_api()
+        .start()
+        .await?;
     let substrate = crate::controllers::substrate::Substrate::from_kubernetes(
         substrate_with_store_client_proxy_port_and_pod(
             db.pool.clone(),
             running_pod_kubernetes_client(Arc::clone(&captured_pods), "127.0.0.1"),
-            pod_listener.local_addr()?.port(),
+            worker.port(),
             None,
         ),
     );
@@ -815,7 +820,8 @@ fn controller_create_request_uses_public_contract_defaults() {
     assert_eq!(controller.name.as_deref(), Some("native-create"));
     assert_eq!(controller.runtime.as_deref(), Some("fc"));
     assert_eq!(controller.boot_mode, None);
-    assert!(!controller.wait_until_ready);
+    // The operation succeeds once the guest answers.
+    assert!(controller.wait_until_ready);
     assert_eq!(controller.vcpu, Some(2));
     assert_eq!(controller.memory_mib, Some(1024));
     assert_eq!(controller.disk_mib, None);
