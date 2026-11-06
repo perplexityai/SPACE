@@ -118,10 +118,11 @@ async fn unsupported_envd_method_returns_explicit_ecw_error() {
     );
 }
 
-/// Both proxy routes must reach the handler through the router. The subpath
-/// mount captures `session_id` and `path`; a scalar extractor rejects it with a
-/// 500 before authentication, so an unauthenticated request must surface the
-/// handler's 401 on every route shape.
+/// Every proxy route must reach the handler through the router, the service
+/// root `/proxy/` included. The subpath mount captures `session_id` and
+/// `path`; a scalar extractor rejects it with a 500 before authentication, so
+/// an unauthenticated request must surface the handler's 401 on every route
+/// shape.
 #[tokio::test]
 async fn proxy_session_routes_extract_path_parameters() {
     if !pplx_space_test_env::enter_test_process(&[(
@@ -135,6 +136,8 @@ async fn proxy_session_routes_extract_path_parameters() {
     let session_id = DataPlaneSessionId::Port(Default::default());
     for path in [
         format!("/v1/sessions/{session_id}/proxy"),
+        format!("/v1/sessions/{session_id}/proxy/"),
+        format!("/v1/sessions/{session_id}/proxy/?tab=1"),
         format!("/v1/sessions/{session_id}/proxy/api/v1/healthz"),
         format!("/v1/sessions/{session_id}/proxy/assets/app.js?v=1"),
     ] {
