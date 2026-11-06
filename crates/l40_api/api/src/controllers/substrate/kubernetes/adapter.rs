@@ -73,6 +73,13 @@ pub(super) const WARM_POOL_SETUP_RPC_TIMEOUT: Duration = Duration::from_secs(5);
 /// answering, holds the create for the rest of its readiness budget before a
 /// fallthrough create starts its cold create.
 pub(super) const POOLED_COMMAND_READY_BUDGET: Duration = Duration::from_secs(10);
+/// Bound on one warm-pool adoption label write, throttling retries included.
+/// The kube client sets no read timeout and the create route has no request
+/// timeout, so without it an apiserver that stops answering would hold the
+/// create, and its claimed slot, until the stale-claim sweep. A write
+/// abandoned at the bound may still land later, so its slot is invalidated
+/// rather than given back to the pool.
+pub(super) const ADOPTION_LABEL_TIMEOUT: Duration = Duration::from_secs(5);
 // Planned teardown waits for the exact snapshot upload to become remotely
 // durable before retiring the pod. Full-codec artifacts can outlive the
 // generic node-RPC budget, so this path needs its own outer deadline.

@@ -54,6 +54,48 @@ pub struct PooledExecutionClaimRequest<'a> {
     /// creates bypass the pool until claim-time re-homing can stamp and apply
     /// the flag at adoption.
     pub volume_encryption: bool,
+    /// The create's client id: the ECW caller's, or `native`; `None` adopts
+    /// an unlabeled pod.
+    pub client_id: Option<&'a pplx_space_common_core::types::ClientId>,
+}
+
+/// What `label_adopted_execution` does with a claim whose label patch failed
+/// transiently: throttled past its retries, a 408 or 5xx, a dropped
+/// connection, or no answer within the adoption label budget. The failure
+/// doesn't speak to the pod, but only a throttled patch is known not to have
+/// run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdoptionLabelTransient {
+    /// Give a throttled slot back to the pool for a later create. Any other
+    /// transient failure invalidates the slot and removes the label
+    /// best-effort, since its patch may still land, even after a later
+    /// adopter's.
+    ReleaseSlot,
+    /// Keep the claim, so a retry of the same operation adopts the same slot.
+    /// An admitted claim reserves its operation's planned sandbox id, which a
+    /// released slot would hand to another create.
+    KeepClaim,
+}
+
+/// The result of labeling an adopted pool pod with its adopter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdoptionLabelOutcome {
+    /// The pod carries the adopter's label, or there's no label to set.
+    Labeled,
+    /// The patch failed transiently (see [`AdoptionLabelTransient`]). The slot
+    /// is given up or the claim kept, as the caller asked; the adoption must
+    /// not proceed, and the create shouldn't fall back to a cold pod, which
+    /// under throttling would add apiserver writes while the apiserver is
+    /// struggling. Only a throttled slot goes back to the pool, unlabeled;
+    /// one whose patch may have landed is invalidated, unless the caller
+    /// keeps the claim.
+    Transient,
+    /// The apiserver refused the patch for good, or the pod has no recorded
+    /// UID, and the slot is invalidated so no create adopts it; the pool's
+    /// cleanup deletes the pod. A permanently failed slot is never given back:
+    /// a refusal that repeats (a replaced pod, a missing RBAC verb) would hand
+    /// the same slot, first in claim order, to every later create.
+    Invalidated,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

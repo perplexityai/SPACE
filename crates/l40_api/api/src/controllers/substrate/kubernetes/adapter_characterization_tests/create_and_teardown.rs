@@ -97,6 +97,48 @@ async fn create_execution_backpressure_refuses_before_claiming_an_execution(
     Ok(())
 }
 
+/// A cold create's pod carries the creating client's
+/// `space.pplx.net/client-id` label, and no label without one.
+#[rstest::rstest]
+#[case::labeled(Some("creator"))]
+#[case::unlabeled(None)]
+#[tokio::test(flavor = "current_thread")]
+async fn create_execution_labels_the_pod_with_the_creating_client(
+    #[case] creator: Option<&str>,
+) -> TestResult {
+    let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+    let sandbox_id = SandboxId::new();
+    insert_test_sandbox_row(&db.pool, sandbox_id, "creating").await?;
+    let (client, log) = scripted_kube_client(|request| match request.method {
+        Method::POST => kube_status(StatusCode::FORBIDDEN, "Forbidden"),
+        _ => kube_status(StatusCode::BAD_REQUEST, "BadRequest"),
+    });
+    let substrate = substrate_with_store_and_client(db.pool.clone(), client);
+    let inputs = CreateInputs::new();
+    let template_ref = inputs.template_ref();
+    let creator = creator.map(|id| pplx_space_common_core::types::ClientId::parse(id).unwrap());
+    let mut request = inputs.create_request(sandbox_id, &template_ref);
+    request.client_id = creator.as_ref();
+
+    let _ = substrate.create_execution(request).await;
+
+    let posts = requests_matching(&log, &Method::POST);
+    let [post] = posts.as_slice() else {
+        panic!("expected one pod create, got {}", posts.len());
+    };
+    assert_eq!(
+        post.body
+            .as_ref()
+            .and_then(|pod| pod.pointer("/metadata/labels"))
+            .and_then(|labels| {
+                labels.get(pplx_space_common_core::kubernetes::SANDBOX_CLIENT_ID_LABEL)
+            })
+            .and_then(serde_json::Value::as_str),
+        creator.as_ref().map(|id| id.as_str())
+    );
+    Ok(())
+}
+
 /// A pod create the apiserver rejects fails the create and releases the
 /// execution it had claimed, so the sandbox is not left bound to a pod that
 /// never existed.

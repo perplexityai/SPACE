@@ -182,6 +182,12 @@ impl KubernetesSubstrate {
                 message: format!("failed to parse sandbox pod lifecycle: {err}"),
             })?;
         let sandbox = self.store.require_sandbox(sandbox_id).await?;
+        // Read after the refresh, so a rebuild that inherits takes the record
+        // as it is now, not as the caller loaded it.
+        let pod_client = self
+            .k8s
+            .activation_client_attribution
+            .gate(pod_client_id(activation_attempt.as_ref(), &sandbox));
         let materialization_lifecycle =
             sandbox
                 .lifecycle
@@ -469,6 +475,7 @@ impl KubernetesSubstrate {
                         claim.row.generation,
                         existing.uid(),
                         pod_ip.as_deref(),
+                        existing.client_id().as_ref(),
                     )
                     .await?
                     .is_none()
@@ -516,6 +523,7 @@ impl KubernetesSubstrate {
                         suspend_restore_source_node,
                         suspend_restore_storage_uri,
                         restore_lease_token,
+                        pod_client.as_ref(),
                     ))
                     .await?
                     {
@@ -636,6 +644,7 @@ impl KubernetesSubstrate {
                             claim.row.generation,
                             existing.uid(),
                             pod_ip.as_deref(),
+                            existing.client_id().as_ref(),
                         )
                         .await?
                         .is_none()
@@ -843,6 +852,7 @@ impl KubernetesSubstrate {
                             claim.row.generation,
                             existing.uid(),
                             pod_ip.as_deref(),
+                            existing.client_id().as_ref(),
                         )
                         .await?
                         .is_none()
@@ -1032,6 +1042,7 @@ impl KubernetesSubstrate {
                     auto_lifecycle_json: &auto_lifecycle_json,
                     network_policy_json: &network_policy_json,
                     node_group_placement: node_group_placement.placement(),
+                    client_id: pod_client.as_ref(),
                 },
                 pod_create_context,
             ),
@@ -1126,6 +1137,7 @@ impl KubernetesSubstrate {
                 claim_lifecycle,
                 pod.uid(),
                 pod_ip.as_deref(),
+                pod.client_id().as_ref(),
             )
             .await
         {
@@ -1257,6 +1269,7 @@ impl KubernetesSubstrate {
                         suspend_restore_source_node,
                         suspend_restore_storage_uri,
                         restore_lease_token,
+                        pod_client.as_ref(),
                     ))
                     .await?
                     {

@@ -563,15 +563,16 @@ pub(super) async fn persist_pooled_execution_claim(
     Ok(())
 }
 
+/// Returns whether this call took the slot out; `false` when it was no
+/// longer claimed under this claim (already released, invalidated or bound).
 pub(super) async fn invalidate_claimed_pool_slot(
     pool: &PgPool,
     claim: &PooledExecutionClaim,
-) -> Result<(), ControllerError> {
+) -> Result<bool, ControllerError> {
     WarmPoolStore::new(pool.clone())
         .invalidate_claimed_slot(claim.claim_id, claim.sandbox_id)
         .await
-        .map_err(|err| pool_store_error("failed to invalidate claimed pool slot", &err))?;
-    Ok(())
+        .map_err(|err| pool_store_error("failed to invalidate claimed pool slot", &err))
 }
 
 pub(super) async fn mark_claimed_pool_slot_cleanup_pending(

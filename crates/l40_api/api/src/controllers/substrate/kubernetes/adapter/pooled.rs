@@ -201,6 +201,9 @@ impl KubernetesSubstrate {
             // apply to the already-booted pod.
             volume_encryption: _,
             disk_io_limits: _,
+            // Labeled by `label_adopted_execution` before the adoption
+            // committed.
+            client_id: _,
         } = setup;
         // The pool pod's user_id/org_id annotations carry the pool's identity;
         // adoption conveys the adopter's identity through the owner update below
@@ -429,5 +432,114 @@ impl KubernetesSubstrate {
         .await?;
 
         Ok(())
+    }
+}
+
+/// What one warm-pool adoption label write did.
+pub(super) enum AdoptionLabelWrite {
+    Applied,
+    /// Throttled (429) through every retry. The apiserver rejects a throttled
+    /// request before it runs, so the write didn't land.
+    Throttled(String),
+    /// The write failed in a way that says nothing about the pod, and it may
+    /// have landed, then or later: a 408 or 5xx (the apiserver may still
+    /// commit a write it timed out), a dropped connection, or no answer within
+    /// [`SubstrateBudgets::adoption_label`](super::super::budgets::SubstrateBudgets).
+    /// Nothing fences a late write from a later one: the UID stays the same
+    /// across pool claims.
+    Transient(String),
+    /// Any other error: a refusal the apiserver answered (the write didn't
+    /// land), or a local one, such as a response that failed to decode, which
+    /// may follow a write that did.
+    Refused(kube::Error),
+}
+
+impl KubernetesSubstrate {
+    /// Set a claimed pool pod's `space.pplx.net/client-id` label to `client_id`,
+    /// or remove it for `None`. The claimed UID fences the patch: UID is
+    /// immutable, so the apiserver rejects it (422) for a pod recreated under
+    /// the same name. The write retries while the apiserver throttles, all
+    /// within the adoption label budget.
+    pub(super) async fn write_adoption_label(
+        &self,
+        claim: &PooledExecutionClaim,
+        pod_uid: &str,
+        client_id: Option<&pplx_space_common_core::types::ClientId>,
+    ) -> AdoptionLabelWrite {
+        use kube::api::{Patch, PatchParams};
+        use pplx_space_common_core::kubernetes::SANDBOX_CLIENT_ID_LABEL;
+
+        let pods: Api<Pod> = Api::namespaced(self.k8s.client.clone(), &self.k8s.sandbox_namespace);
+        // A merge patch removes a label whose value is `null`.
+        let patch = Patch::Merge(serde_json::json!({
+            "metadata": {
+                "uid": pod_uid,
+                "labels": { SANDBOX_CLIENT_ID_LABEL: client_id.map(|id| id.as_str()) }
+            }
+        }));
+        let params = PatchParams::default();
+        let write = super::super::pod_ops::retry_kube_throttling("label_adopted_pod", || {
+            pods.patch(&claim.pod_name, &params, &patch)
+        });
+        match tokio::time::timeout(self.budgets.adoption_label, write).await {
+            Ok(Ok(_)) => AdoptionLabelWrite::Applied,
+            Ok(Err(error)) if super::super::pod_ops::is_kube_api_throttling_error(&error) => {
+                AdoptionLabelWrite::Throttled(error.to_string())
+            }
+            Ok(Err(error)) if super::super::pod_ops::is_transient_kube_read_error(&error) => {
+                AdoptionLabelWrite::Transient(error.to_string())
+            }
+            Ok(Err(error)) => AdoptionLabelWrite::Refused(error),
+            Err(_elapsed) => AdoptionLabelWrite::Transient(format!(
+                "no answer within {:?}",
+                self.budgets.adoption_label
+            )),
+        }
+    }
+
+    /// Best-effort removal of the adoption label from the pod of a slot that
+    /// was just taken out of the inventory, so the label doesn't outlive the
+    /// adoption it recorded. A label it can't remove stays on the pod until
+    /// the stale-claim sweep deletes it.
+    pub(super) async fn clear_adoption_label(&self, claim: &PooledExecutionClaim) {
+        // Nothing was written with attribution off, and nothing can be
+        // without the UID that fences the write.
+        if !self.k8s.activation_client_attribution.is_enabled() {
+            return;
+        }
+        let Some(pod_uid) = &claim.pod_uid else {
+            return;
+        };
+        let error = match self
+            .write_adoption_label(claim, pod_uid.as_str(), None)
+            .await
+        {
+            AdoptionLabelWrite::Applied => return,
+            AdoptionLabelWrite::Throttled(error) | AdoptionLabelWrite::Transient(error) => error,
+            AdoptionLabelWrite::Refused(error) => error.to_string(),
+        };
+        tracing::warn!(
+            sandbox_id = %claim.sandbox_id,
+            pod_name = %claim.pod_name,
+            %error,
+            "failed to clear the adoption label from an abandoned pool pod"
+        );
+    }
+
+    /// Take a claimed slot out of the inventory without touching its pod; the
+    /// stale-claim sweep deletes the pod. Returns whether this call took it
+    /// out, as [`pool::invalidate_claimed_pool_slot`] does.
+    pub(super) async fn invalidate_pooled_execution_claim(
+        &self,
+        claim: &PooledExecutionClaim,
+    ) -> Result<bool, ControllerError> {
+        pool::invalidate_claimed_pool_slot(self.store.pool(), claim)
+            .await
+            .map_err(|error| {
+                ControllerError::internal(format!(
+                    "pool claim leaked for pod {}: failed to invalidate claimed pool slot: {error}",
+                    claim.pod_name
+                ))
+            })
     }
 }
