@@ -22,3 +22,13 @@ fn state_read_errors_preserve_rpc_code_without_peer_payloads() {
         assert!(matches!(error, RuntimeStateReadError::Rpc(status) if status.code() == code));
     }
 }
+
+#[test]
+fn node_manager_deadline_counts_as_a_timeout() {
+    let node_manager_deadline = RuntimeStateReadError::from(tonic::Status::deadline_exceeded(
+        "runtime state probe timed out",
+    ));
+    assert!(node_manager_deadline.is_timeout());
+    assert!(RuntimeStateReadError::Timeout { timeout_ms: 500 }.is_timeout());
+    assert!(!RuntimeStateReadError::from(tonic::Status::unavailable("down")).is_timeout());
+}
