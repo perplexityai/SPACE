@@ -9,6 +9,12 @@ use tonic::Status;
 pub(crate) struct ResolveGuestAccountError(GuestUserName);
 
 impl ResolveGuestAccountError {
+    /// The account does not exist, as opposed to a lookup that failed. This
+    /// platform cannot switch users at all, so it never says so.
+    pub(crate) fn is_not_found(&self) -> bool {
+        false
+    }
+
     pub(crate) fn into_status(self) -> Status {
         Status::failed_precondition(self.to_string())
     }

@@ -17,6 +17,11 @@ pub(crate) enum ResolveGuestAccountError {
 }
 
 impl ResolveGuestAccountError {
+    /// The account does not exist, as opposed to a lookup that failed.
+    pub(crate) fn is_not_found(&self) -> bool {
+        matches!(self, Self::NotFound(_))
+    }
+
     pub(crate) fn into_status(self) -> Status {
         match self {
             Self::NotFound(user) => Status::invalid_argument(format!("user not found: {user}")),
