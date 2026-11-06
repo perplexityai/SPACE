@@ -6,8 +6,13 @@ use super::*;
 const MEMORY_REJECTION: &str = "Failed to create pod sandbox: rpc error: code = ResourceExhausted \
 desc = failed to start sandbox \"b054b625699f\": failed to create containerd task: failed to \
 create shim task: sbx-manager Wake [space-err=ResourceExhausted]: network allocate failed: node \
-uses 90000 MiB plus 9000 MiB existing Firecracker growth reserve plus new sandbox demand 8320 \
+memory admission refused: node uses 90000 MiB plus 9000 MiB existing Firecracker growth reserve plus new sandbox demand 8320 \
 MiB plus reserve 1024 MiB, requiring 108344 MiB above total memory 100000 MiB";
+
+/// Transient node-mgr backpressure shares the gRPC code but clears on retry.
+const QUEUE_FULL: &str = "Failed to create pod sandbox: rpc error: code = ResourceExhausted \
+desc = failed to create shim task: sbx-manager Wake [space-err=ResourceExhausted]: network \
+allocate failed: lifecycle queue full";
 
 const JAILER_TIMEOUT: &str = "Failed to create pod sandbox: rpc error: code = Unknown desc = \
 failed to start sandbox \"abc\": failed to create shim task: sbx-manager Wake \
@@ -43,9 +48,9 @@ fn memory_admission_rejection_is_recorded_with_node_mgr_reason() {
     assert_eq!(rejection.pod_uid.as_deref(), Some("61a90a93"));
     assert_eq!(rejection.node_name.as_deref(), Some("node-a"));
     assert!(
-        rejection
-            .message
-            .starts_with("network allocate failed: node uses 90000 MiB"),
+        rejection.message.starts_with(
+            "network allocate failed: node memory admission refused: node uses 90000 MiB"
+        ),
         "{}",
         rejection.message
     );
@@ -63,6 +68,9 @@ fn other_sandbox_create_failures_are_left_to_kubelet_retry() {
         .is_none()
     );
     assert!(rejection_from_event(&event("BackOff", "Pod", MEMORY_REJECTION)).is_none());
+    assert!(
+        rejection_from_event(&event(FAILED_CREATE_POD_SANDBOX_REASON, "Pod", QUEUE_FULL)).is_none()
+    );
     assert!(
         rejection_from_event(&event(
             FAILED_CREATE_POD_SANDBOX_REASON,

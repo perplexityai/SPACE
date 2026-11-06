@@ -30,9 +30,10 @@ use kube::{
 pub(super) const FAILED_CREATE_POD_SANDBOX_REASON: &str = "FailedCreatePodSandBox";
 
 /// Marker the SPACE shim puts in the CRI error for a gRPC `ResourceExhausted`
-/// from node-mgr (see `create_support.rs`, `space-err=<code>`). Node memory
-/// admission and slot exhaustion both surface this way; neither clears on a
-/// kubelet retry within a create's budget under load.
+/// from node-mgr (see `create_support.rs`, `space-err=<code>`). Transient
+/// backpressure (queue limits, rate limits, slot exhaustion) shares the code
+/// and usually clears on kubelet's next retry, so only a refusal that also
+/// carries node-mgr's memory admission prefix counts.
 const RESOURCE_EXHAUSTED_MARKER: &str = "space-err=ResourceExhausted";
 
 /// How long a recorded rejection is kept. Longer than any create's ready
@@ -40,8 +41,10 @@ const RESOURCE_EXHAUSTED_MARKER: &str = "space-err=ResourceExhausted";
 /// match the same pod instance, and the uid check guards a recreated name.
 const REJECTION_TTL: Duration = Duration::from_secs(15 * 60);
 
-/// Prune the index once it grows past this many entries.
+/// Prune expired entries once the index grows past this many, at most once
+/// per [`PRUNE_INTERVAL`], so a large live index costs no per-insert scan.
 const PRUNE_THRESHOLD: usize = 4096;
+const PRUNE_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Env flag enabling the fail-fast (default off). Needs list/watch on
 /// `events` in the sandbox namespace for the API's service account.
@@ -64,8 +67,14 @@ struct Entry {
 /// Index of node admission rejections keyed by sandbox pod name.
 #[derive(Clone, Default)]
 pub struct SandboxCreateRejections {
-    inner: Arc<Mutex<HashMap<String, Entry>>>,
+    inner: Arc<Mutex<Inner>>,
     disabled: bool,
+}
+
+#[derive(Default)]
+struct Inner {
+    entries: HashMap<String, Entry>,
+    last_pruned: Option<Instant>,
 }
 
 impl SandboxCreateRejections {
@@ -100,9 +109,21 @@ impl SandboxCreateRejections {
                 .default_backoff()
                 .applied_objects();
             let mut stream = std::pin::pin!(stream);
+            let mut reported_error = false;
             while let Some(event) = stream.next().await {
                 match event {
                     Ok(event) => writer.observe_event(&event),
+                    // Usually missing list/watch on `events`, which leaves the
+                    // fail-fast inert: say so loudly once.
+                    Err(error) if !reported_error => {
+                        reported_error = true;
+                        tracing::error!(
+                            %error,
+                            env = FAIL_FAST_ENV,
+                            "sandbox create rejection event watcher failed; create fail-fast \
+                             is inactive until it recovers (needs list/watch on events)"
+                        );
+                    }
                     Err(error) => tracing::warn!(
                         %error,
                         "sandbox create rejection event watcher error"
@@ -125,10 +146,17 @@ impl SandboxCreateRejections {
     pub(super) fn record(&self, pod_name: String, rejection: SandboxCreateRejection) {
         let now = Instant::now();
         let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        if inner.len() >= PRUNE_THRESHOLD {
-            inner.retain(|_, entry| now.duration_since(entry.recorded_at) < REJECTION_TTL);
+        if inner.entries.len() >= PRUNE_THRESHOLD
+            && inner
+                .last_pruned
+                .is_none_or(|at| now.duration_since(at) >= PRUNE_INTERVAL)
+        {
+            inner
+                .entries
+                .retain(|_, entry| now.duration_since(entry.recorded_at) < REJECTION_TTL);
+            inner.last_pruned = Some(now);
         }
-        inner.insert(
+        inner.entries.insert(
             pod_name,
             Entry {
                 rejection,
@@ -149,7 +177,7 @@ impl SandboxCreateRejections {
             return None;
         }
         let inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        let entry = inner.get(pod_name)?;
+        let entry = inner.entries.get(pod_name)?;
         if entry.recorded_at.elapsed() >= REJECTION_TTL {
             return None;
         }
@@ -218,9 +246,11 @@ pub(super) fn rejection_from_event(event: &Event) -> Option<(String, SandboxCrea
     ))
 }
 
-/// Whether a kubelet sandbox-create error is a node-side resource rejection.
+/// Whether a kubelet sandbox-create error is node-mgr's memory admission
+/// refusal, which kubelet's retries on the same node won't get past.
 pub(super) fn is_node_admission_rejection(message: &str) -> bool {
     message.contains(RESOURCE_EXHAUSTED_MARKER)
+        && message.contains(pplx_space_node_mgr_client::MEMORY_ADMISSION_REFUSED)
 }
 
 /// The node-mgr reason from a kubelet error, without the nested CRI/gRPC
