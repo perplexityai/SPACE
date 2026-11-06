@@ -1,0 +1,29 @@
+-- no-transaction
+-- squawk-disable-assume-in-transaction
+-- idx_sandboxes_name_lower keyed every sandbox row by its lowercased name, cut
+-- to 256 characters, for an admin list search that matched the start of a
+-- name ignoring case. The admin list's `search` now matches IDs only, so no
+-- statement reads the index. Most rows have no name to search by: an ECW/E2B
+-- create never sets one and a native create sets one only when the caller
+-- passes it, so the index mostly holds NULL keys. It still costs every write
+-- that is not HOT, such as one that changes the lifecycle, an entry in it on
+-- the busiest table. Names are still matched by the list's case-sensitive
+-- `prefix`, which needs no index of its own.
+--
+-- CONCURRENTLY because sandboxes takes writes on every lifecycle change: a
+-- plain DROP INDEX takes ACCESS EXCLUSIVE on the table, so it waits behind
+-- every transaction using the table and blocks every read and write queued
+-- after it until it has dropped the index. That makes this a
+-- single-statement `-- no-transaction` migration, which the migrator does not
+-- retry. IF EXISTS so a rerun, or a database whose index was already dropped
+-- by hand, drops nothing and still records the migration. A failure leaves
+-- the index, possibly marked INVALID, and no history row, so the next
+-- migrator run drops it again.
+--
+-- The statement must be the file's only one, so it cannot set its own lock or
+-- statement timeout and runs under the session's (see db/README.md). Dropping
+-- concurrently takes SHARE UPDATE EXCLUSIVE, which does not block writers. It
+-- waits for every transaction that holds a lock on sandboxes, so a
+-- long-running one can hold the drop past the session's lock timeout.
+-- squawk-ignore require-lock-timeout, require-statement-timeout
+DROP INDEX CONCURRENTLY IF EXISTS public.idx_sandboxes_name_lower;
