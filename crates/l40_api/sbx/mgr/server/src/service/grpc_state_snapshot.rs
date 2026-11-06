@@ -2065,6 +2065,7 @@ fn cleanup_to_proto(completion: crate::db::CleanupCompletion) -> crate::proto::S
     };
     crate::proto::SandboxCleanup {
         completion: completion as i32,
+        state: crate::proto::SandboxCleanupState::Unspecified as i32,
     }
 }
 

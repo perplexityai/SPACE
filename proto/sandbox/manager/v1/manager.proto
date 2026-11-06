@@ -726,11 +726,11 @@ message SandboxInfo {
 }
 
 // A node-local cleanup recorded on a sandbox row. An activation records one,
-// as does a stop, suspend or delete admitted with a persisted intent. A
-// CLEANUP_REQUIRED or CLEANUP_FAILED row keeps the one it was admitted with,
-// but such a row can also have none, for example one that sbx-manager's
-// cleanup recovery will quarantine, so an absent cleanup there doesn't mean
-// an older node.
+// as does a stop, suspend or delete admitted with a persisted intent. A row a
+// cleanup owns keeps the completion it was admitted with, but can also have
+// none, for example one that sbx-manager's cleanup recovery will quarantine.
+// A node that sets `state` publishes such a row with `state` set and
+// `completion` UNSPECIFIED; an older node publishes no message for it.
 message SandboxCleanup {
   // What the cleanup does to the row when it finishes. Every writer of
   // MARK_STOPPED keeps the rootfs: a stop, whether a user's or sbx-manager's
@@ -739,6 +739,18 @@ message SandboxCleanup {
   // start, a first start included. This is what tells those rows from a
   // failed delete.
   SandboxCleanupCompletion completion = 1;
+  // Whether a cleanup owns the row: a forced teardown is required, or a
+  // teardown attempt failed and is retried. UNSPECIFIED means no cleanup owns
+  // it. An armed activation, whose rollback target is recorded in
+  // `completion` while the start still runs, is UNSPECIFIED, so read this
+  // field, not the presence of this message, to tell a cleanup-owned row. A
+  // row can be REQUIRED or FAILED with no completion recorded. An older node
+  // never sets this field: honor CLEANUP_REQUIRED and CLEANUP_FAILED
+  // lifecycles too. Nodes publish these rows with those lifecycles by
+  // default; one configured to publish the native lifecycle reports the
+  // teardown transition the cleanup is over (STOPPING, DELETING or
+  // SUSPENDING) instead.
+  SandboxCleanupState state = 2;
 }
 
 // What an admitted node-local cleanup does to the row when it finishes. For a
@@ -760,6 +772,20 @@ enum SandboxCleanupCompletion {
   SANDBOX_CLEANUP_COMPLETION_DELETE_ROW = 5;
   // Deletes a pool clone's row.
   SANDBOX_CLEANUP_COMPLETION_DELETE_POOL_CLONE = 6;
+}
+
+// Whether a node-local cleanup owns a sandbox row. This is the cleanup's own
+// state, kept apart from the sandbox lifecycle.
+enum SandboxCleanupState {
+  // No cleanup owns the row.
+  SANDBOX_CLEANUP_STATE_UNSPECIFIED = 0;
+  // A forced teardown owns the row and is owed. Published as the
+  // CLEANUP_REQUIRED lifecycle unless the node publishes the native one.
+  SANDBOX_CLEANUP_STATE_REQUIRED = 1;
+  // A teardown owns the row and its last attempt failed; it is retried.
+  // Published as the CLEANUP_FAILED lifecycle unless the node publishes the
+  // native one.
+  SANDBOX_CLEANUP_STATE_FAILED = 2;
 }
 
 enum SandboxHealthStatus {
@@ -833,6 +859,10 @@ message SandboxListElement {
   optional string created_at = 7;
   optional string owner = 8;
   optional SandboxLifecycleState lifecycle = 9;
+  // The row's recorded cleanup, from the same read as `lifecycle`, as on
+  // SandboxInfo. Absent when none is recorded, or from a node that doesn't
+  // publish it.
+  optional SandboxCleanup cleanup = 10;
 }
 
 message ListResponse {
@@ -1681,6 +1711,11 @@ message WaitRequest {
 message WaitResponse {
   string sandbox_id = 1;
   optional SandboxLifecycleState lifecycle = 3;
+  // The row's recorded cleanup, from the same read as `lifecycle`, as on
+  // SandboxInfo. Absent when none is recorded, or from a node that doesn't
+  // publish it. Wait answers only once the wait completes, so a cleanup it
+  // reports as owning the row has FAILED, never REQUIRED.
+  optional SandboxCleanup cleanup = 4;
 }
 
 message CloneFromDonorRequest {
