@@ -137,6 +137,7 @@ fn public_openapi_value() -> Value {
             "/sandboxes/{sandbox_id}/terminal-sessions": {
                 "post": {
                     "summary": "Create a terminal session",
+                    "description": "The terminal starts with `TERM=xterm-256color` and `LANG=C.UTF-8` unless the sandbox's environment or the request's `env` sets them. Sandboxes from older templates set neither.",
                     "parameters": [idempotency_key_parameter.clone()],
                     "responses": {
                         "201": { "description": "Terminal session with attach token" },
