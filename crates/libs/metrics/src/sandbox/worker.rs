@@ -31,7 +31,6 @@ mod ingress;
 mod inventory;
 mod net_gateway;
 mod quarantine_recovery;
-mod resource;
 mod route_authorization;
 mod teardown_suspend;
 
@@ -43,7 +42,6 @@ pub use ingress::*;
 pub use inventory::*;
 pub use net_gateway::*;
 pub use quarantine_recovery::*;
-pub use resource::*;
 pub use route_authorization::*;
 pub use teardown_suspend::*;
 

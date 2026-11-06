@@ -725,8 +725,8 @@ struct ComposedProbeResult {
     memory_used_bytes: Option<u64>,
 }
 
-/// What an accepted probe result yields: its health transition, and the
-/// guest memory reading to emit once, which nothing keeps.
+/// Outputs of an accepted probe. Memory is emitted by the caller,
+/// not retained in watchdog state.
 struct AcceptedHealthResult {
     transition: Option<diagnostics::HealthTransition>,
     guest_memory: Option<GuestMemorySample>,

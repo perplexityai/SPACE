@@ -1,5 +1,5 @@
 //! The spaced guest bridge: RPC results, latency and timeouts, guest readiness, the activation
-//! environment, guest flushes on stop, and observed guest specs.
+//! environment, guest flushes on stop, observed guest specs, and guest memory usage.
 
 use super::*;
 
@@ -140,4 +140,18 @@ pub fn guest_observed_specs(template: &str, mem_total_bytes: Option<u64>, vcpu_c
     if let Some(value) = vcpu_count {
         distribution("sandbox.guest.vcpu_count", f64::from(value), tags);
     }
+}
+
+/// One guest memory reading of a running workload, in bytes.
+///
+/// Reports `MemTotal - MemAvailable`, tagged only by `template`; deployment
+/// dimensions come from the sink. The watchdog emits one sample per accepted
+/// probe of a started workload, excluding idle warm-pool members.
+/// Do not attach sandbox IDs or other per-sandbox identifiers.
+pub fn guest_memory_used(template: &str, used_bytes: u64) {
+    distribution(
+        "sandbox.resource.memory.guest_used_bytes",
+        used_bytes as f64,
+        &[tag("template", template)],
+    );
 }
