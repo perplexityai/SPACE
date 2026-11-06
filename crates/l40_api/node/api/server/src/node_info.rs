@@ -76,7 +76,7 @@ impl NodeInfoService {
             .network_pool_status_reader
             .read(
                 clients.node(),
-                Request::new(node_mgr_proto::NetworkPoolStatusRequest {}),
+                Request::new(node_mgr_proto::NetworkPoolStatusRequest::default()),
             )
             .await;
         let response = match status {

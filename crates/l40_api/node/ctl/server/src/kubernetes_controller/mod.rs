@@ -13,6 +13,16 @@ mod template_pull_requests;
 
 const TEMPLATE_MANAGER_RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 const TEMPLATE_PULL_RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+/// Env flag clamping the advertised network-slot capacity to what node memory
+/// admission would accept (default off: capacity is `network_pool_max_slots`).
+const NETWORK_SLOTS_MEMORY_CLAMP_ENV: &str = "SPACE_NETWORK_SLOTS_MEMORY_CLAMP";
+/// Cadence of the memory-clamped network-slot capacity reconcile. Memory headroom
+/// moves within seconds under a create ramp, faster than the shared
+/// node-object pass on the node-status tick, and a stale capacity keeps the
+/// scheduler binding pods to nodes memory admission has already filled. The
+/// patch is skipped while the advertised value is current, so a quiet node
+/// costs one local node-mgr status read per tick.
+const NETWORK_SLOT_CAPACITY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 
 pub struct Controller {
     kube: Client,
@@ -21,6 +31,7 @@ pub struct Controller {
     tmpl: template_manager::Client,
     template_writes: template_pull_requests::TemplatePullRequestReconciler,
     resource_status_reader: NodeResourceStatusReader,
+    network_slots_memory_clamp: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -34,6 +45,36 @@ pub enum TemplateInventoryReconcileError {
 #[derive(Debug, thiserror::Error)]
 #[error("failed to initialize Kubernetes client: {0}")]
 pub struct ControllerFromEnvError(#[from] kube::Error);
+
+/// Reconcile the network-slot capacity every [`NETWORK_SLOT_CAPACITY_INTERVAL`]
+/// so the memory-clamped capacity tracks node memory between the 60s
+/// node-object passes (which still run it, as a self-heal).
+fn spawn_network_slot_capacity_loop(
+    kube: Client,
+    node_cache: node_watch::NodeMetadataCache,
+    node_name: String,
+    shutdown: CancellationToken,
+) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(NETWORK_SLOT_CAPACITY_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                () = shutdown.cancelled() => return,
+                _ = interval.tick() => {}
+            }
+            if node_cache.metadata().is_none() {
+                continue;
+            }
+            if let Err(error) =
+                network_slots::reconcile_network_slot_capacity(&kube, &node_cache, &node_name, true)
+                    .await
+            {
+                tracing::debug!(%error, "fast network-slot capacity reconcile failed");
+            }
+        }
+    });
+}
 
 impl Controller {
     pub async fn from_env(
@@ -51,7 +92,21 @@ impl Controller {
         let kube = pplx_space_common_svc::kube_client::traced_kube_client_from_env().await?;
         let node_cache = node_watch::spawn(kube.clone(), node_name.clone(), shutdown.child_token());
 
-        tracing::info!(%node_name, "space Kubernetes node-local controller starting");
+        let network_slots_memory_clamp =
+            pplx_space_common_core::env::env_flag_var(NETWORK_SLOTS_MEMORY_CLAMP_ENV, false);
+        tracing::info!(
+            %node_name,
+            network_slots_memory_clamp,
+            "space Kubernetes node-local controller starting"
+        );
+        if network_slots_memory_clamp {
+            spawn_network_slot_capacity_loop(
+                kube.clone(),
+                node_cache.clone(),
+                node_name.clone(),
+                shutdown.child_token(),
+            );
+        }
 
         Ok(Some(Self {
             kube,
@@ -66,6 +121,7 @@ impl Controller {
                 shutdown.child_token(),
             ),
             resource_status_reader,
+            network_slots_memory_clamp,
         }))
     }
 
@@ -116,6 +172,7 @@ impl Controller {
             &self.kube,
             &self.node_cache,
             &self.node_name,
+            self.network_slots_memory_clamp,
         )
         .await
     }

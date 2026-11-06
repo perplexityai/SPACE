@@ -577,7 +577,12 @@ message NodeResourceStatusResponse {
   CacheDiskStatus cache_disk = 1;
 }
 
-message NetworkPoolStatusRequest {}
+message NetworkPoolStatusRequest {
+  // Also measure node memory and fill `memory_admittable_sandboxes`. Reads
+  // every active sandbox's cgroup, so only node-ctl's capacity reconcile asks;
+  // the sbx-manager hot paths leave it unset.
+  bool include_memory_admission = 1;
+}
 
 message CloneCapabilitiesRequest {}
 message CloneCapabilitiesResponse {
@@ -604,6 +609,12 @@ message NetworkPoolStatusResponse {
   uint64 sandbox_guest_memory_max_mib = 17;
   uint64 sandbox_memory_headroom_mib = 18;
   uint64 sandbox_cgroup_total_memory_mib = 19;
+  // How many more sandboxes of `sandbox_cgroup_memory_mib` node memory
+  // admission would accept right now, by the same rule `Allocate` applies.
+  // Absent when node memory could not be read. Node-ctl clamps the advertised
+  // network-slot capacity with it so kube-scheduler stops placing pods that
+  // memory admission would refuse.
+  optional uint32 memory_admittable_sandboxes = 20;
 }
 
 message ListNetworkLeasesRequest {}

@@ -75,6 +75,7 @@ pub(super) fn network_pool_status_response(
     draining: bool,
     config: &NetworkPoolConfig,
     sandbox_cgroup_config: SandboxCgroupConfig,
+    memory_admittable_sandboxes: Option<u32>,
 ) -> NetworkPoolStatusResponse {
     NetworkPoolStatusResponse {
         network_pool_status: pool_status(counts, draining, config),
@@ -96,6 +97,7 @@ pub(super) fn network_pool_status_response(
         sandbox_guest_memory_max_mib: sandbox_cgroup_config.guest_memory_max_mib(),
         sandbox_memory_headroom_mib: crate::cgroup::DEFAULT_SANDBOX_MEMORY_HEADROOM_MIB,
         sandbox_cgroup_total_memory_mib: sandbox_cgroup_config.total_memory_mib(config.max_slots),
+        memory_admittable_sandboxes,
     }
 }
 

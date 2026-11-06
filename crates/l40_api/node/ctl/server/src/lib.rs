@@ -1726,7 +1726,7 @@ impl NodeCtlWorker {
             .read(
                 self.node_manager.clone(),
                 local_manager_request(
-                    pplx_space_node_mgr_client::proto::NetworkPoolStatusRequest {},
+                    pplx_space_node_mgr_client::proto::NetworkPoolStatusRequest::default(),
                     false,
                 ),
             )

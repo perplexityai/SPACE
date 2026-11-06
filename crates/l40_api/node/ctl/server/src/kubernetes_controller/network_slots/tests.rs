@@ -43,3 +43,27 @@ fn patch_params_force_owns_capacity_field_manager() {
         "force apply lets node-ctl reclaim the capacity field after a kubelet rewrite"
     );
 }
+
+#[test]
+fn capacity_is_max_slots_while_memory_is_not_binding() {
+    assert_eq!(desired_network_slot_capacity(64, 10, Some(54)), 64);
+    assert_eq!(desired_network_slot_capacity(64, 10, Some(500)), 64);
+    assert_eq!(desired_network_slot_capacity(64, 10, None), 64);
+}
+
+#[test]
+fn capacity_shrinks_to_what_memory_admission_accepts() {
+    // A node whose memory admission refuses every new sandbox advertises
+    // only its leased slots, so the scheduler binds no more pods to it.
+    assert_eq!(desired_network_slot_capacity(64, 56, Some(0)), 56);
+    assert_eq!(desired_network_slot_capacity(64, 56, Some(3)), 59);
+}
+
+#[test]
+fn capacity_never_exceeds_max_slots_or_overflows() {
+    assert_eq!(
+        desired_network_slot_capacity(64, u32::MAX, Some(u32::MAX)),
+        64
+    );
+    assert_eq!(desired_network_slot_capacity(0, 0, Some(10)), 0);
+}

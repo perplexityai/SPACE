@@ -359,7 +359,7 @@ async fn run(cli: Cli) -> Result<(), String> {
         }
         Commands::Status { sandbox_ids } => {
             let pool = client
-                .get_network_pool_status(NetworkPoolStatusRequest {})
+                .get_network_pool_status(NetworkPoolStatusRequest::default())
                 .await
                 .map_err(|e| format!("ERROR: {e}"))?
                 .into_inner();
@@ -743,7 +743,7 @@ async fn run(cli: Cli) -> Result<(), String> {
                 && min_ready.is_none()
             {
                 let resp = client
-                    .get_network_pool_status(NetworkPoolStatusRequest {})
+                    .get_network_pool_status(NetworkPoolStatusRequest::default())
                     .await
                     .map_err(|e| format!("ERROR: {e}"))?
                     .into_inner();
