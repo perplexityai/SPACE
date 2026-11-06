@@ -494,3 +494,174 @@ fn restore_guest_memory_uses_capture_shape_or_legacy_payload_and_rejects_conflic
         );
     }
 }
+
+/// A restore of a suspended sandbox from its local snapshot passes the VM
+/// launch-time admission as a restore activation before it asks node-manager
+/// to launch Firecracker. Node-manager refuses the launch, so the restore
+/// stops there.
+#[tokio::test]
+async fn suspend_restore_is_admitted_before_the_vm_launches() {
+    use crate::node_manager_transport::fake::FakeNodeManager;
+    use crate::service::start_support::{ActivationAdmissionKind, REQUESTED_VM_ACTIVATIONS};
+    use pplx_space_common_core::types::{
+        Arch, AutoLifecyclePolicy, ContentHash, RuntimeKind, SandboxArtifactMetadata,
+        SandboxRuntimeLabel, SnapshotExecutionMetadata,
+    };
+    use pplx_space_node_mgr_client::proto::{
+        AllocateRequest, AllocateResponse, ExecutionEnvironmentSelection, LaunchSandboxResponse,
+        NetworkPoolStatusRequest, NetworkPoolStatusResponse, PrepareSandboxResponse,
+        ResolveExecutionEnvironmentRequest, ResolveExecutionEnvironmentResponse,
+    };
+
+    let compiled =
+        pplx_space_node_runtime_core::catalog::CompiledEnvironment::for_architecture(Arch::X86_64)
+            .unwrap();
+    let definition = compiled[0].definition().clone();
+    let producer = definition.execution_requirements().unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let cache = directory.path().join("cache");
+    let conn = crate::db::test_conn();
+    let sandbox_id = SandboxId::new();
+    let id = sandbox_id.to_string();
+    let template_hash: ContentHash = format!("sha256:{}", "ab".repeat(32)).parse().unwrap();
+    crate::db::insert_sandbox(
+        &conn,
+        crate::db::InsertSandboxParams {
+            id: &id,
+            uuid8: &SandboxRuntimeLabel::from_sandbox_id(sandbox_id),
+            state: SandboxState::Suspended,
+            template: "active-template",
+            template_hash: Some(&template_hash.to_string()),
+            user: &SandboxOwner::parse("user").unwrap(),
+            runtime: RuntimeKind::Firecracker.alias(),
+            guest_image: Default::default(),
+            snapshots_enabled: false,
+            rootfs_size_mb: Some(2048),
+            disk_io_limits: Default::default(),
+            // A pool member skips the effective network policy lookup.
+            pool_template: Some("pool-template"),
+            volume_encryption: false,
+            process_env: &Default::default(),
+            auto_lifecycle: &AutoLifecyclePolicy::disabled(),
+            network_policy_override: None,
+            network_policy_generation: 0,
+            network_policy_authority: crate::db::PolicyAuthority::Cluster,
+            auto_lifecycle_authority: crate::db::PolicyAuthority::Cluster,
+        },
+    )
+    .unwrap();
+    crate::db::upsert_sandbox_execution_metadata(&conn, &id, &producer).unwrap();
+    crate::service::tests::service_tests::register_full_suspend_artifact(&conn, &id);
+    let instance = cache.join(&id).join("instance");
+    let snapshot = cache.join(&id).join("snapshot");
+    std::fs::create_dir_all(&instance).unwrap();
+    std::fs::create_dir_all(&snapshot).unwrap();
+    std::fs::write(instance.join("rootfs.ext4"), []).unwrap();
+    std::fs::write(
+        instance.parent().unwrap().join("metadata.json"),
+        serde_json::to_vec(&SandboxArtifactMetadata::new(
+            sandbox_id,
+            producer.clone(),
+            "active-template".parse().unwrap(),
+            Some(template_hash),
+        ))
+        .unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        snapshot.join("runtime.json"),
+        serde_json::to_vec(&SnapshotExecutionMetadata::new(producer.clone()).unwrap()).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(snapshot.join("vmstate"), b"vmstate").unwrap();
+    std::fs::write(snapshot.join("memory"), b"memory").unwrap();
+
+    let admitted = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let admitted_at_launch = Arc::new(std::sync::Mutex::new(None));
+    let selected = producer.clone();
+    let node = FakeNodeManager::default()
+        .unary("GetNetworkPoolStatus", |_: NetworkPoolStatusRequest| {
+            Ok(NetworkPoolStatusResponse {
+                sandbox_cgroup_memory_mib: 4096,
+                sandbox_guest_memory_max_mib: 3968,
+                sandbox_memory_headroom_mib: 128,
+                ..Default::default()
+            })
+        })
+        .unary(
+            "ResolveExecutionEnvironment",
+            move |_: ResolveExecutionEnvironmentRequest| {
+                Ok(ResolveExecutionEnvironmentResponse {
+                    accepted_selection: ExecutionEnvironmentSelection::Restore as i32,
+                    definition: Some((&definition).into()),
+                    execution: Some((&selected).into()),
+                })
+            },
+        )
+        .unary("Allocate", |_: AllocateRequest| {
+            Ok(AllocateResponse {
+                sandbox_uid: 10_000,
+                ..Default::default()
+            })
+        })
+        .unary("PrepareSandbox", |request: PrepareSandboxRequest| {
+            Ok(PrepareSandboxResponse {
+                resolved_execution: request.requested_execution,
+                ..Default::default()
+            })
+        })
+        .unary("LaunchSandbox", {
+            let admitted = Arc::clone(&admitted);
+            let admitted_at_launch = Arc::clone(&admitted_at_launch);
+            move |_: LaunchSandboxRequest| -> Result<LaunchSandboxResponse, Status> {
+                *admitted_at_launch.lock().unwrap() = Some(admitted.lock().unwrap().clone());
+                Err(Status::unavailable(
+                    "firecracker launch refused by the test",
+                ))
+            }
+        })
+        .serve();
+    let service = SandboxManagerService::new_with_options(
+        conn,
+        SandboxManagerServiceOptions {
+            node_manager: node.connector(),
+            create_cache_dir: Some(cache),
+            ..SandboxManagerServiceOptions::for_test()
+        },
+    );
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(30),
+        REQUESTED_VM_ACTIVATIONS.scope(
+            Arc::clone(&admitted),
+            service.start_sandbox_with_upgrade_authority(
+                StartRequest {
+                    sandbox_id: id.clone(),
+                    checkpoint: Some("suspend".into()),
+                    ..Default::default()
+                },
+                false,
+                crate::service::activation_support::IdentityFreeDirectActivationAuthority::LocalProducer,
+                crate::service::start::StartAdmission::default(),
+            ),
+        ),
+    )
+    .await
+    .expect("the restore finishes within 30 seconds");
+
+    let error = result.expect_err("node-manager refuses the launch");
+    assert_eq!(
+        *admitted_at_launch.lock().unwrap(),
+        Some(vec![ActivationAdmissionKind::Restore]),
+        "node-manager was asked to launch the VM only after it requested admission: {error}"
+    );
+    assert_eq!(
+        *admitted.lock().unwrap(),
+        vec![ActivationAdmissionKind::Restore]
+    );
+    service.shutdown_token.cancel();
+    service.task_tracker.close();
+    tokio::time::timeout(Duration::from_secs(30), service.task_tracker.wait())
+        .await
+        .expect("service tasks stop within 30 seconds of shutdown");
+}

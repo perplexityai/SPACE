@@ -1152,8 +1152,7 @@ impl SandboxManagerService {
         // (it must be visible to host-control auth before the jailer launch
         // completes), not a post-join step.
         match self
-            .activation_admission_limiter
-            .acquire(ActivationAdmissionKind::Restore, id)
+            .admit_vm_activation(ActivationAdmissionKind::Restore, id)
             .await
         {
             Ok(permit) => {

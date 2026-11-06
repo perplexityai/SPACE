@@ -6,9 +6,12 @@
 //! and returns at once; a test barrier then holds the resume before its
 //! `resuming` write while the test moves the row. Node-manager is a fake that
 //! answers only `ResumeSandbox`, with the error a VM that is gone gets.
+//!
+//! The same row and fake show that a resume is admitted, without waiting for
+//! activation limiter capacity, before node-manager is asked to resume the VM.
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use pplx_space_common_core::types::{
@@ -24,6 +27,10 @@ use crate::node_manager_transport::fake::FakeNodeManager;
 use crate::proto::ResumeRequest;
 use crate::service::activation_support::internal_request;
 use crate::service::cleanup_executor::TestAdmissionBarrier;
+use crate::service::start_support::{
+    ActivationAdmissionConfig, ActivationAdmissionKind, ActivationAdmissionLimiter,
+    LimitedActivationKind, REQUESTED_VM_ACTIVATIONS,
+};
 use crate::service::{SandboxManagerService, SandboxManagerServiceOptions};
 use crate::state::SandboxState;
 
@@ -265,4 +272,79 @@ async fn policy_free_resume_writes_resuming_only_over_paused() {
             .expect("service tasks stop within 30 seconds of shutdown");
     }
     assert!(mismatches.is_empty(), "{mismatches:#?}");
+}
+
+/// A resident resume passes the VM launch-time admission before it asks
+/// node-manager to thaw the VM.
+#[tokio::test]
+async fn resident_resume_is_admitted_before_the_vm_resumes() {
+    let scratch = tempfile::tempdir().unwrap();
+    let admitted = Arc::new(Mutex::new(Vec::new()));
+    let admitted_at_resume = Arc::new(Mutex::new(None));
+    let node_manager = FakeNodeManager::default()
+        .unary("ResumeSandbox", {
+            let admitted = Arc::clone(&admitted);
+            let admitted_at_resume = Arc::clone(&admitted_at_resume);
+            move |_: ResumeSandboxRequest| -> Result<ResumeSandboxResponse, Status> {
+                *admitted_at_resume.lock().unwrap() = Some(admitted.lock().unwrap().clone());
+                Err(Status::not_found("no Firecracker process for the sandbox"))
+            }
+        })
+        .serve();
+    let conn = crate::db::test_conn();
+    let sandbox_id = SandboxId::new();
+    insert_paused_pool_member(&conn, sandbox_id, &scratch.path().to_string_lossy());
+    let mut service = SandboxManagerService::new_with_options(
+        conn,
+        SandboxManagerServiceOptions {
+            node_manager: node_manager.connector(),
+            ..SandboxManagerServiceOptions::for_test_in(scratch.path())
+        },
+    );
+    // The limiter's only slot is held, so a resume that waited for limiter
+    // capacity would not reach node-manager.
+    service.activation_admission_limiter = Arc::new(ActivationAdmissionLimiter::with_config(
+        ActivationAdmissionConfig {
+            max_concurrent_activations: 1,
+            refill_rps: 100.0,
+            burst: 100.0,
+        },
+    ));
+    let _held = service
+        .activation_admission_limiter
+        .try_acquire(LimitedActivationKind::Cold)
+        .expect("the test holds the limiter's only slot");
+
+    let result = tokio::time::timeout(
+        WAIT,
+        REQUESTED_VM_ACTIVATIONS.scope(
+            Arc::clone(&admitted),
+            service.resume(internal_request(ResumeRequest {
+                sandbox_id: sandbox_id.to_string(),
+                ..Default::default()
+            })),
+        ),
+    )
+    .await
+    .expect("the resume finishes within 30 seconds");
+
+    assert_eq!(
+        result.map(|_| ()).map_err(|status| status.code()),
+        Err(Code::Internal),
+        "the fake answers ResumeSandbox with the error a VM that is gone gets"
+    );
+    assert_eq!(
+        *admitted_at_resume.lock().unwrap(),
+        Some(vec![ActivationAdmissionKind::ResidentResume]),
+        "node-manager was asked to resume the VM only after it requested admission"
+    );
+    assert_eq!(
+        *admitted.lock().unwrap(),
+        vec![ActivationAdmissionKind::ResidentResume]
+    );
+    service.shutdown_token.cancel();
+    service.task_tracker.close();
+    tokio::time::timeout(WAIT, service.task_tracker.wait())
+        .await
+        .expect("service tasks stop within 30 seconds of shutdown");
 }

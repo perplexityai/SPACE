@@ -1774,3 +1774,79 @@ async fn the_second_stopped_boundary_fences_the_request_too() {
         "the route-identity fence must be what refuses it: {error}"
     );
 }
+
+/// A cold boot of a `created` row passes the VM launch-time admission as a
+/// cold activation. The row's local owner holds no route identity, so the
+/// start is refused at the route-identity check that follows admission,
+/// before it claims the row.
+#[tokio::test]
+async fn cold_boot_is_admitted_as_a_cold_activation() {
+    use crate::service::start_support::REQUESTED_VM_ACTIVATIONS;
+    use crate::service::tests::service_tests::insert_test_sandbox;
+    use pplx_space_template_mgr_client::proto::GetTemplateResponse;
+
+    let template = tempfile::tempdir().unwrap();
+    std::fs::write(
+        template.path().join("metadata.json"),
+        serde_json::json!({
+            "arch": std::env::consts::ARCH,
+            "spaced_version": pplx_space_spaced_common::spaced_version(),
+            "spaced_compatibility_family": pplx_space_spaced_common::spaced_compatibility_family(),
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let template_dir = template.path().to_str().unwrap().to_owned();
+    let templates = Arc::new(crate::template_resolver::fake::FakeTemplateResolver::new(
+        move || {
+            Ok(tonic::Response::new(GetTemplateResponse {
+                template_dir: template_dir.clone(),
+                arch: std::env::consts::ARCH.into(),
+                network_policy_authority: crate::db::PolicyAuthority::Local.as_proto_i32(),
+                auto_lifecycle_authority: crate::db::PolicyAuthority::Local.as_proto_i32(),
+                ..Default::default()
+            }))
+        },
+    ));
+    let conn = crate::db::test_conn();
+    let sandbox_id = SandboxId::new().to_string();
+    insert_test_sandbox(&conn, &sandbox_id, SandboxState::Created);
+    let scratch = tempfile::tempdir().unwrap();
+    let service = SandboxManagerService::new_with_options(
+        conn,
+        crate::service::SandboxManagerServiceOptions {
+            template_resolver: templates,
+            ..crate::service::SandboxManagerServiceOptions::for_test_in(scratch.path())
+        },
+    );
+
+    let admitted = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let error = REQUESTED_VM_ACTIVATIONS
+        .scope(
+            Arc::clone(&admitted),
+            service.start_sandbox(
+                StartRequest {
+                    sandbox_id: sandbox_id.clone(),
+                    ..Default::default()
+                },
+                false,
+            ),
+        )
+        .await
+        .expect_err("a local owner's start has no route identity to activate with");
+
+    assert!(
+        error
+            .message()
+            .contains("requires an authoritative route identity"),
+        "the start stops at the route-identity check after admission: {error}"
+    );
+    assert_eq!(
+        *admitted.lock().unwrap(),
+        vec![ActivationAdmissionKind::Cold]
+    );
+    assert_eq!(
+        service.lookup_sandbox(&sandbox_id).unwrap().state,
+        SandboxState::Created
+    );
+}

@@ -2173,8 +2173,7 @@ impl SandboxManagerService {
 
         let id = &sandbox.id;
         let activation_admission_permit = self
-            .activation_admission_limiter
-            .acquire(ActivationAdmissionKind::Cold, id)
+            .admit_vm_activation(ActivationAdmissionKind::Cold, id)
             .await?;
         if let Err(error) = sandbox.state.transition(SandboxState::Starting) {
             activation_admission_permit.finish(AdmissionPermitOutcome::Failed);
