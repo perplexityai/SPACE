@@ -212,6 +212,7 @@ impl Fixture {
             self.templates.requests(),
             vec![GetTemplateRequest {
                 caller_org_id: None,
+                cached_only: false,
                 template: Some(TemplateRef {
                     name: TEMPLATE.into(),
                     content_hash: None,

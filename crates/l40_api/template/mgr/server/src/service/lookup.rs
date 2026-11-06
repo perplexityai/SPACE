@@ -82,6 +82,66 @@ impl TemplateManagerService {
             .map(str::parse::<OrgId>)
             .transpose()
             .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        if req.cached_only {
+            // A ready catalog row, or nothing: no release resolution, memory
+            // policy lookup, pull or snapshot reconcile. A build dir without
+            // a row, such as one a transient recovery failure left, is
+            // NOT_FOUND. This is the one authority on whether a build can be
+            // read in place as a delta base, so a ready row is still
+            // FAILED_PRECONDITION when its build records no rootfs size or its
+            // `rootfs.ext4` isn't a regular file.
+            //
+            // The LRU touch `resolve_template` makes on a hit isn't
+            // incidental: eviction plans made within the grace period after
+            // it skip the build while a transfer reads it, which is why a
+            // delta import looks its base up again just before applying.
+            // Keep it. It's best effort: a GC tick that planned the build's
+            // eviction before the touch can still remove it, and a transfer
+            // that then opens the missing file fails rather than reading a
+            // wrong base.
+            if req_hash.is_empty() || caller_org.is_some() {
+                return Err(Status::invalid_argument(
+                    "cached_only takes an exact content_hash and no caller_org_id",
+                ));
+            }
+            let mut response = build_get_template_response(
+                self.artifact_store.root.clone(),
+                Arc::clone(&self.db),
+                template_id.clone(),
+                req_hash,
+                req_tag,
+                None,
+                None,
+            )
+            .await?;
+            let build_dir = PathBuf::from(&response.template_dir);
+            tokio::task::spawn_blocking(move || {
+                let recorded = crate::rootfs_cache::recorded_rootfs_bytes(&build_dir)
+                    .map_err(|error| Status::failed_precondition(error.to_string()))?;
+                if recorded.is_none() {
+                    return Err(Status::failed_precondition(format!(
+                        "{} records no rootfs size to check it against",
+                        build_dir.display()
+                    )));
+                }
+                let rootfs = build_dir.join(pplx_space_common_core::types::TEMPLATE_ROOTFS_FILE);
+                match std::fs::symlink_metadata(&rootfs) {
+                    Ok(metadata) if metadata.is_file() => Ok(()),
+                    Ok(_) => Err(Status::failed_precondition(format!(
+                        "{} is not a regular file",
+                        rootfs.display()
+                    ))),
+                    Err(error) => Err(Status::failed_precondition(format!(
+                        "inspect {}: {error}",
+                        rootfs.display()
+                    ))),
+                }
+            })
+            .await
+            .map_err(|e| Status::internal(format!("spawn_blocking: {e}")))??;
+            response.cached_only = true;
+            return Ok(Response::new(response));
+        }
         // Request metrics (cache, fetch-error, and pull) are tagged with the
         // caller's selector, not the resolved hash that replaces `req_hash`
         // below.

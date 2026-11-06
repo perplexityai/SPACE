@@ -710,6 +710,7 @@ impl TemplateBuilder {
             let resp = tmpl_client
                 .get_template(pplx_space_template_mgr_client::proto::GetTemplateRequest {
                     caller_org_id: self.caller_org.map(|org| org.to_string()),
+                    cached_only: false,
                     template: Some(TemplateRef::try_from(&base)?),
                     vcpu: None,
                     memory_mib: None,

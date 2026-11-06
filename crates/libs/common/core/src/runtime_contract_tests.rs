@@ -21,8 +21,8 @@ fn host_linux_paths_preserve_space_layout() {
         "/space/cache/firecracker/sandboxes/sbx-1/metadata.json"
     );
     assert_eq!(
-        host::linux::paths::template_rootfs_path("seed", "abc"),
-        "/space/cache/firecracker/templates/seed/abc/rootfs.ext4"
+        host::linux::paths::template_build_dir("seed", "abc"),
+        "/space/cache/firecracker/templates/seed/abc"
     );
 }
 

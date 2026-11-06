@@ -180,6 +180,7 @@ async fn create_checks_auto_lifecycle_authority_before_template_lookup(
         let expected_lookups = if case.looks_up_template {
             vec![GetTemplateRequest {
                 caller_org_id: None,
+                cached_only: false,
                 template: Some(TemplateRef {
                     name: "seed".into(),
                     content_hash: None,

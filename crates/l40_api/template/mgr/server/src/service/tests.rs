@@ -1469,6 +1469,7 @@ async fn get_template_authorizes_and_resolves_before_using_cached_builds(
                 tag: tag.map(str::to_owned),
             }),
             caller_org_id: Some(org.to_string()),
+            cached_only: false,
             vcpu: Some(1),
             memory_mib: Some(512),
         })
@@ -1577,6 +1578,200 @@ async fn get_template_authorizes_and_resolves_before_using_cached_builds(
         assert_eq!(error.code(), tonic::Code::NotFound);
         assert_eq!(error.message(), "template release not found");
     }
+}
+
+fn cached_only_lookup(hash: Option<String>) -> Request<crate::proto::GetTemplateRequest> {
+    internal_request(crate::proto::GetTemplateRequest {
+        template: Some(crate::proto::TemplateRef {
+            name: "base".into(),
+            content_hash: hash,
+            tag: None,
+        }),
+        caller_org_id: None,
+        cached_only: true,
+        vcpu: None,
+        memory_mib: None,
+    })
+}
+
+/// A `cached_only` lookup, which must neither resolve a release nor pull. An
+/// exact-digest miss without a caller org pulls through the volume puller,
+/// not `materialize`; with no cluster endpoint here, such a pull fails
+/// `UNAVAILABLE`, so a lookup that answers `NOT_FOUND` pulled nothing.
+async fn get_cached_only(
+    service: &TemplateManagerService,
+    request: Request<crate::proto::GetTemplateRequest>,
+) -> Result<crate::proto::GetTemplateResponse, Status> {
+    service
+        .get_template_resolving(
+            request,
+            async |_, _, _, _| panic!("cached_only resolves no release"),
+            async |_, _, _| panic!("cached_only pulls nothing"),
+        )
+        .await
+        .map(Response::into_inner)
+}
+
+/// A delta-transfer base comes from a ready catalog row, never from a build
+/// dir that merely exists. A digest with neither a row nor a dir, and a
+/// rowless partial build dir, are NOT_FOUND, and nothing is resolved or
+/// pulled. A ready row whose build records no rootfs size is
+/// FAILED_PRECONDITION, since nothing can check its rootfs is complete; once
+/// its manifest records the size, the lookup answers with the dir and says it
+/// made the `cached_only` checks, which an ordinary lookup of the same build
+/// doesn't.
+#[tokio::test]
+async fn a_cached_only_lookup_skips_a_rowless_dir_for_a_verified_sibling() {
+    let root = tempfile::tempdir().unwrap();
+    let hash = format!("sha256:{}", "a".repeat(64));
+    let build_dir = root.path().join("base").join(&hash);
+    std::fs::create_dir_all(&build_dir).unwrap();
+    std::fs::write(build_dir.join("rootfs.ext4"), b"partial").unwrap();
+    let service =
+        TemplateManagerService::new_with_template_root(crate::db::test_conn(), root.path())
+            .unwrap();
+
+    let absent = format!("sha256:{}", "c".repeat(64));
+    let status = get_cached_only(&service, cached_only_lookup(Some(absent)))
+        .await
+        .unwrap_err();
+    assert_eq!(status.code(), tonic::Code::NotFound, "{status}");
+
+    let status = get_cached_only(&service, cached_only_lookup(Some(hash.clone())))
+        .await
+        .unwrap_err();
+    assert_eq!(status.code(), tonic::Code::NotFound, "{status}");
+    assert!(build_dir.join("rootfs.ext4").exists());
+
+    insert_ready_build(&service.db.lock().unwrap(), "base", &hash);
+    let status = get_cached_only(&service, cached_only_lookup(Some(hash.clone())))
+        .await
+        .unwrap_err();
+    assert_eq!(status.code(), tonic::Code::FailedPrecondition, "{status}");
+
+    std::fs::write(
+        build_dir.join("manifest.json"),
+        serde_json::json!({
+            "files": { "rootfs.ext4": { "digest": hash, "size": b"partial".len() } }
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let response = get_cached_only(&service, cached_only_lookup(Some(hash.clone())))
+        .await
+        .unwrap();
+    assert_eq!(response.template_dir, build_dir.to_string_lossy());
+    assert!(response.cached_only);
+    let mut ordinary = cached_only_lookup(Some(hash.clone()));
+    ordinary.get_mut().cached_only = false;
+    let response = get_cached_only(&service, ordinary).await.unwrap();
+    assert_eq!(response.template_dir, build_dir.to_string_lossy());
+    assert!(!response.cached_only);
+}
+
+/// A ready build in `root` whose manifest records the size of the
+/// `rootfs.ext4` that `make_rootfs` creates, as registration records it.
+fn sized_ready_build(
+    root: &Path,
+    hash: &str,
+    make_rootfs: impl FnOnce(&Path),
+) -> (TemplateManagerService, std::path::PathBuf) {
+    let build_dir = root.join("base").join(hash);
+    std::fs::create_dir_all(&build_dir).unwrap();
+    make_rootfs(&build_dir.join("rootfs.ext4"));
+    std::fs::write(
+        build_dir.join("manifest.json"),
+        serde_json::json!({ "files": { "rootfs.ext4": { "digest": hash, "size": 7 } } })
+            .to_string(),
+    )
+    .unwrap();
+    let conn = crate::db::test_conn();
+    insert_ready_build(&conn, "base", hash);
+    let service = TemplateManagerService::new_with_template_root(conn, root).unwrap();
+    (service, build_dir)
+}
+
+/// A `cached_only` hit is what keeps a delta base out of eviction while a
+/// transfer reads it: it refreshes the build's LRU recency, which the
+/// eviction planner's grace period reads.
+#[tokio::test]
+async fn a_cached_only_hit_refreshes_its_build_s_lru_recency() {
+    let root = tempfile::tempdir().unwrap();
+    let hash = format!("sha256:{}", "a".repeat(64));
+    let (service, _) = sized_ready_build(root.path(), &hash, |rootfs| {
+        std::fs::write(rootfs, b"partial").unwrap()
+    });
+    service
+        .db
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE template_builds SET last_used_at = '0' WHERE content_hash = ?1",
+            [&hash],
+        )
+        .unwrap();
+
+    get_cached_only(&service, cached_only_lookup(Some(hash.clone())))
+        .await
+        .unwrap();
+
+    let [build] = crate::db::list_eviction_candidates(&service.db.lock().unwrap())
+        .unwrap()
+        .try_into()
+        .unwrap_or_else(|_| panic!("one ready build"));
+    assert!(
+        build.last_used_at_secs > 0,
+        "the hit left the build's recency at {}",
+        build.last_used_at_secs
+    );
+}
+
+/// `cached_only` is the one check on whether a build can be read in place, so
+/// a ready row whose `rootfs.ext4` isn't a regular file is
+/// FAILED_PRECONDITION, even when what it points at has the recorded size.
+#[tokio::test]
+async fn a_cached_only_lookup_needs_a_regular_rootfs_file() {
+    let root = tempfile::tempdir().unwrap();
+    let elsewhere = root.path().join("elsewhere");
+    std::fs::write(&elsewhere, b"partial").unwrap();
+    let hash = format!("sha256:{}", "a".repeat(64));
+    let (service, build_dir) = sized_ready_build(root.path(), &hash, |rootfs| {
+        std::os::unix::fs::symlink(&elsewhere, rootfs).unwrap()
+    });
+
+    let status = get_cached_only(&service, cached_only_lookup(Some(hash.clone())))
+        .await
+        .unwrap_err();
+    assert_eq!(status.code(), tonic::Code::FailedPrecondition, "{status}");
+
+    std::fs::remove_file(build_dir.join("rootfs.ext4")).unwrap();
+    std::fs::write(build_dir.join("rootfs.ext4"), b"partial").unwrap();
+    get_cached_only(&service, cached_only_lookup(Some(hash)))
+        .await
+        .unwrap();
+}
+
+#[rstest::rstest]
+#[case::no_hash(true, false)]
+#[case::caller_org(false, true)]
+#[tokio::test]
+async fn a_cached_only_lookup_takes_an_exact_digest_and_no_org(
+    cached_base_fixture: CachedBaseFixture,
+    #[case] drop_hash: bool,
+    #[case] with_org: bool,
+) {
+    let CachedBaseFixture {
+        service,
+        org,
+        hash_a,
+        ..
+    } = cached_base_fixture;
+    let mut request = cached_only_lookup((!drop_hash).then_some(hash_a));
+    if with_org {
+        request.get_mut().caller_org_id = Some(org.to_string());
+    }
+    let status = get_cached_only(&service, request).await.unwrap_err();
+    assert_eq!(status.code(), tonic::Code::InvalidArgument, "{status}");
 }
 
 #[test]

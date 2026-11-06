@@ -484,3 +484,649 @@ async fn import_identity_normalization_and_existing_owner_detection_agree() {
         assert!(validate_import_sandbox_header(&header).is_err());
     }
 }
+
+/// A delta base is the rootfs of the build template-manager's catalog
+/// answers for, never a build dir that merely exists: the lookup is
+/// `cached_only`, carries no caller org, and its answer must carry its scope's
+/// receipt or none, and say it made the `cached_only` checks, which a
+/// template-manager that predates them doesn't. With no verified build there's
+/// no base, and a delta
+/// import is refused: only an absent build is told to pull the template, a
+/// build that can't serve isn't, and a template-manager that couldn't say is
+/// a retryable `UNAVAILABLE`.
+#[tokio::test]
+async fn a_delta_base_is_the_catalog_s_verified_build_or_none() {
+    use crate::template_resolver::fake::FakeTemplateResolver;
+    use pplx_space_rpc_auth::template_lookup::TemplateLookupScope;
+    use pplx_space_template_mgr_client::proto::{GetTemplateResponse, TemplateRef};
+
+    let hash = format!("sha256:{}", "a".repeat(64));
+    let root = tempfile::tempdir().unwrap();
+    let verified_dir = root.path().join("seed").join(&hash);
+    std::fs::create_dir_all(&verified_dir).unwrap();
+    std::fs::write(verified_dir.join("rootfs.ext4"), b"verified").unwrap();
+    let answering_with =
+        |dir: &std::path::Path, receipt: Option<TemplateLookupScope>, cached_only: bool| {
+            let answer_dir = dir.to_string_lossy().into_owned();
+            let answer_hash = hash.clone();
+            FakeTemplateResolver::new(move || {
+                let mut response = tonic::Response::new(GetTemplateResponse {
+                    template: Some(TemplateRef {
+                        name: "seed".into(),
+                        content_hash: Some(answer_hash.clone()),
+                        tag: None,
+                    }),
+                    template_dir: answer_dir.clone(),
+                    cached_only,
+                    ..Default::default()
+                });
+                if let Some(scope) = receipt {
+                    scope.receipt(&mut response);
+                }
+                Ok(response)
+            })
+        };
+    let answering = |dir: &std::path::Path| answering_with(dir, None, true);
+    let verified = answering(&verified_dir);
+
+    assert_eq!(
+        verified_template_rootfs(&verified, "seed", &hash).await,
+        Some(verified_dir.join("rootfs.ext4"))
+    );
+    assert_eq!(
+        verified_template_rootfs(
+            &answering_with(
+                &verified_dir,
+                Some(TemplateLookupScope::LocalExecution),
+                true
+            ),
+            "seed",
+            &hash
+        )
+        .await,
+        Some(verified_dir.join("rootfs.ext4"))
+    );
+    let [request] = verified.requests().try_into().unwrap();
+    assert!(request.cached_only);
+    assert_eq!(request.caller_org_id, None);
+    let template = request.template.unwrap();
+    assert_eq!(template.name, "seed");
+    assert_eq!(template.content_hash.as_deref(), Some(hash.as_str()));
+
+    let header = crate::proto::ImportSandboxHeader {
+        is_delta: true,
+        template_id: "seed".into(),
+        content_hash: hash.clone(),
+        ..Default::default()
+    };
+    // Only an absent build is worth pulling; a build that can't serve, or a
+    // refused lookup, needs a full transfer; an unanswered one, a retry.
+    const PULL: &str = "Pull the template first";
+    const UNUSABLE: &str = "can't serve as a delta base";
+    const RETRY: &str = "Retry";
+    for (unverified, refusal, says) in [
+        (
+            FakeTemplateResolver::refusing(tonic::Status::not_found("no ready build")),
+            tonic::Code::FailedPrecondition,
+            PULL,
+        ),
+        (
+            FakeTemplateResolver::refusing(tonic::Status::failed_precondition("wrong size")),
+            tonic::Code::FailedPrecondition,
+            UNUSABLE,
+        ),
+        (
+            answering_with(
+                &verified_dir,
+                Some(TemplateLookupScope::Node("127.0.0.2".parse().unwrap())),
+                true,
+            ),
+            tonic::Code::FailedPrecondition,
+            UNUSABLE,
+        ),
+        // An ordinary lookup's answer, as from a template-manager that
+        // ignores `cached_only`.
+        (
+            answering_with(&verified_dir, None, false),
+            tonic::Code::FailedPrecondition,
+            UNUSABLE,
+        ),
+        (
+            FakeTemplateResolver::refusing(tonic::Status::invalid_argument("bad hash")),
+            tonic::Code::FailedPrecondition,
+            UNUSABLE,
+        ),
+        (
+            FakeTemplateResolver::refusing(tonic::Status::permission_denied("not a reader")),
+            tonic::Code::FailedPrecondition,
+            UNUSABLE,
+        ),
+        (
+            FakeTemplateResolver::refusing(tonic::Status::unavailable("template-manager down")),
+            tonic::Code::Unavailable,
+            RETRY,
+        ),
+        (
+            FakeTemplateResolver::refusing(tonic::Status::internal("db")),
+            tonic::Code::Unavailable,
+            RETRY,
+        ),
+    ] {
+        assert_eq!(
+            verified_template_rootfs(&unverified, "seed", &hash).await,
+            None
+        );
+        let status = delta_import_base(&unverified, &header).await.unwrap_err();
+        assert_eq!(status.code(), refusal, "{status}");
+        assert!(status.message().contains(says), "{status}");
+    }
+    assert_eq!(
+        delta_import_base(&verified, &crate::proto::ImportSandboxHeader::default())
+            .await
+            .unwrap(),
+        None
+    );
+}
+
+/// An export looks its delta base up before taking the sandbox's locks, so it
+/// keeps the base only while the sandbox, read again under them, pins the same
+/// build; it looks nothing up when it wants no delta or has no pinned build.
+#[tokio::test]
+async fn an_early_delta_base_is_kept_only_for_the_build_still_pinned() {
+    use crate::template_resolver::fake::FakeTemplateResolver;
+    use pplx_space_template_mgr_client::proto::{GetTemplateResponse, TemplateRef};
+
+    let hash = format!("sha256:{}", "a".repeat(64));
+    let other = format!("sha256:{}", "b".repeat(64));
+    let template = tempfile::tempdir().unwrap();
+    std::fs::write(template.path().join("rootfs.ext4"), b"verified").unwrap();
+    let answer_dir = template.path().to_string_lossy().into_owned();
+    let answer_hash = hash.clone();
+    let resolver = FakeTemplateResolver::new(move || {
+        Ok(tonic::Response::new(GetTemplateResponse {
+            template: Some(TemplateRef {
+                name: "seed".into(),
+                content_hash: Some(answer_hash.clone()),
+                tag: None,
+            }),
+            template_dir: answer_dir.clone(),
+            cached_only: true,
+            ..Default::default()
+        }))
+    });
+    let rootfs = template.path().join("rootfs.ext4");
+
+    let early = || EarlyDeltaBase::look_up(&resolver, true, "seed", Some(&hash));
+    assert_eq!(
+        EarlyDeltaBase::for_pinned(early().await, "seed", &hash),
+        Some(rootfs)
+    );
+    assert_eq!(
+        EarlyDeltaBase::for_pinned(early().await, "seed", &other),
+        None
+    );
+    assert_eq!(
+        EarlyDeltaBase::for_pinned(early().await, "other", &hash),
+        None
+    );
+    assert_eq!(resolver.requests().len(), 3);
+
+    assert!(
+        EarlyDeltaBase::look_up(&resolver, false, "seed", Some(&hash))
+            .await
+            .is_none()
+    );
+    assert!(
+        EarlyDeltaBase::look_up(&resolver, true, "seed", None)
+            .await
+            .is_none()
+    );
+    assert_eq!(resolver.requests().len(), 3);
+}
+
+/// Sandbox and snapshot export take a delta base only from a `cached_only`
+/// lookup of the build their sandbox pins, and look nothing up when they want
+/// no delta. Each export then stops at its missing host directories.
+#[tokio::test]
+async fn exports_look_up_the_pinned_build_only_for_a_delta() {
+    use crate::service::activation_support::internal_request;
+    use crate::service::tests::service_tests::service_for_teardown_test;
+    use crate::template_resolver::fake::FakeTemplateResolver;
+
+    let conn = crate::db::test_conn();
+    let id = SandboxId::new().to_string();
+    crate::db::fixture::insert_test_sandbox(&conn, &id, SandboxState::Stopped);
+    let resolver = std::sync::Arc::new(FakeTemplateResolver::refusing(tonic::Status::not_found(
+        "no ready build",
+    )));
+    let mut service = service_for_teardown_test(conn);
+    service.template_resolver = resolver.clone();
+
+    for use_delta in [false, true] {
+        let _ = service
+            .export_sandbox(internal_request(crate::proto::ExportSandboxRequest {
+                sandbox_id: id.clone(),
+                use_delta,
+            }))
+            .await;
+    }
+    for (include_rootfs, use_delta) in [(false, true), (true, false), (true, true)] {
+        let _ = service
+            .export_snapshot(internal_request(crate::proto::ExportSnapshotRequest {
+                sandbox_id: id.clone(),
+                snapshot_name: "d-1m-20260922T120000Z".into(),
+                include_rootfs,
+                use_delta,
+            }))
+            .await;
+    }
+
+    let requests = resolver.requests();
+    assert_eq!(requests.len(), 2, "{requests:?}");
+    for request in requests {
+        assert!(request.cached_only);
+        assert_eq!(request.caller_org_id, None);
+        let template = request.template.unwrap();
+        assert_eq!(template.name, "seed");
+        assert_eq!(template.content_hash.as_deref(), Some("hash"));
+    }
+}
+
+/// `ImportSandbox` refuses a delta import whose base this node can't verify
+/// before it reserves the sandbox or reads the body.
+#[tokio::test]
+async fn import_refuses_a_delta_without_a_verified_base_before_its_body() {
+    use crate::service::activation_support::sandbox_peer_authorizer;
+    use crate::service::tests::service_tests::service_for_teardown_test;
+    use crate::template_resolver::fake::FakeTemplateResolver;
+
+    let resolver = std::sync::Arc::new(FakeTemplateResolver::refusing(tonic::Status::not_found(
+        "no ready build",
+    )));
+    let mut service = service_for_teardown_test(crate::db::test_conn());
+    service.template_resolver = resolver.clone();
+    let peer = sandbox_peer_authorizer()
+        .authorize_identity(
+            PeerIdentity::new(0, 0, None),
+            "ImportSandbox",
+            ALLOW_SANDBOX_OPERATOR,
+        )
+        .unwrap();
+    let id = SandboxId::new().to_string();
+    let hash = format!("sha256:{}", "a".repeat(64));
+    let stream = tokio_stream::iter([Ok(ImportSandboxRequest {
+        payload: Some(crate::proto::import_sandbox_request::Payload::Header(
+            crate::proto::ImportSandboxHeader {
+                sandbox_id: id.clone(),
+                template_id: "seed".to_owned(),
+                content_hash: hash.clone(),
+                runtime: "fc".to_owned(),
+                owner: "root@local".to_owned(),
+                is_delta: true,
+                ..Default::default()
+            },
+        )),
+    })]);
+
+    let error = service
+        .import_sandbox_owned(stream, peer)
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition, "{error}");
+    assert!(
+        error
+            .message()
+            .starts_with("delta import requires template"),
+        "{error}"
+    );
+    let [request] = resolver.requests().try_into().unwrap();
+    assert!(request.cached_only);
+    assert_eq!(
+        request.template.unwrap().content_hash.as_deref(),
+        Some(hash.as_str())
+    );
+    assert!(!crate::db::sandbox_exists(&service.db_conn().unwrap(), &id).unwrap());
+}
+
+/// A retried delta import still learns what it would without a delta: an
+/// existing sandbox answers `ALREADY_EXISTS` and a cleanup in progress
+/// `ABORTED`, before any delta-base lookup, so a retry of an import that
+/// already landed isn't told to pull its template.
+#[tokio::test]
+async fn a_delta_import_answers_already_exists_and_aborted_before_its_base_lookup() {
+    use crate::service::activation_support::sandbox_peer_authorizer;
+    use crate::service::tests::service_tests::service_for_teardown_test;
+    use crate::template_resolver::fake::FakeTemplateResolver;
+
+    let resolver = std::sync::Arc::new(FakeTemplateResolver::refusing(tonic::Status::not_found(
+        "no ready build",
+    )));
+    let conn = crate::db::test_conn();
+    let existing = SandboxId::new().to_string();
+    crate::db::fixture::insert_test_sandbox(&conn, &existing, SandboxState::Stopped);
+    let mut service = service_for_teardown_test(conn);
+    service.template_resolver = resolver.clone();
+    let peer = sandbox_peer_authorizer()
+        .authorize_identity(
+            PeerIdentity::new(0, 0, None),
+            "ImportSandbox",
+            ALLOW_SANDBOX_OPERATOR,
+        )
+        .unwrap();
+    let delta_import = |sandbox_id: &str| {
+        tokio_stream::iter([Ok(ImportSandboxRequest {
+            payload: Some(crate::proto::import_sandbox_request::Payload::Header(
+                crate::proto::ImportSandboxHeader {
+                    sandbox_id: sandbox_id.to_owned(),
+                    template_id: "seed".to_owned(),
+                    content_hash: format!("sha256:{}", "a".repeat(64)),
+                    runtime: "fc".to_owned(),
+                    owner: "root@local".to_owned(),
+                    is_delta: true,
+                    ..Default::default()
+                },
+            )),
+        })])
+    };
+
+    let status = service
+        .import_sandbox_owned(delta_import(&existing), peer.clone())
+        .await
+        .unwrap_err();
+    assert_eq!(status.code(), tonic::Code::AlreadyExists, "{status}");
+
+    let cleaning = SandboxId::new().to_string();
+    let fence = service.try_cleanup_fence(&cleaning);
+    assert!(matches!(fence, CleanupLockTryResult::Acquired(_)));
+    let status = service
+        .import_sandbox_owned(delta_import(&cleaning), peer)
+        .await
+        .unwrap_err();
+    assert_eq!(status.code(), tonic::Code::Aborted, "{status}");
+    drop(fence);
+
+    assert!(resolver.requests().is_empty(), "{:?}", resolver.requests());
+}
+
+/// A delta import's body can take until the import deadline, so the base
+/// verified before the body arrived is looked up again before the diff is
+/// applied. A build removed in between refuses the apply, and nothing is
+/// written.
+#[tokio::test]
+async fn a_delta_import_verifies_its_base_again_before_applying() {
+    use crate::service::tests::service_tests::service_for_teardown_test;
+    use crate::template_resolver::fake::FakeTemplateResolver;
+    use pplx_space_template_mgr_client::proto::{GetTemplateResponse, TemplateRef};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    let hash = format!("sha256:{}", "a".repeat(64));
+    let template = tempfile::tempdir().unwrap();
+    std::fs::write(template.path().join("rootfs.ext4"), b"verified").unwrap();
+    let staging = tempfile::tempdir().unwrap();
+    std::fs::write(staging.path().join("rootfs.ext4.diff"), b"diff").unwrap();
+    let mut paths = SandboxImportPaths::new(&SandboxId::new().to_string());
+    paths.instance_staging = staging.path().to_string_lossy().into_owned();
+    let header = crate::proto::ImportSandboxHeader {
+        is_delta: true,
+        template_id: "seed".into(),
+        content_hash: hash.clone(),
+        ..Default::default()
+    };
+    let answer_dir = template.path().to_string_lossy().into_owned();
+    let lookups = AtomicUsize::new(0);
+    let resolver = Arc::new(FakeTemplateResolver::new(move || {
+        if lookups.fetch_add(1, Ordering::SeqCst) == 0 {
+            Ok(tonic::Response::new(GetTemplateResponse {
+                template: Some(TemplateRef {
+                    name: "seed".into(),
+                    content_hash: Some(hash.clone()),
+                    tag: None,
+                }),
+                template_dir: answer_dir.clone(),
+                cached_only: true,
+                ..Default::default()
+            }))
+        } else {
+            Err(crate::template_resolver::TemplateLookupError::Rpc(
+                tonic::Status::not_found("build removed"),
+            ))
+        }
+    }));
+    let mut service = service_for_teardown_test(crate::db::test_conn());
+    service.template_resolver = resolver.clone();
+
+    delta_import_base(service.template_resolver.as_ref(), &header)
+        .await
+        .unwrap()
+        .unwrap();
+    let status = apply_sandbox_delta_import(&service, &header, &paths)
+        .await
+        .unwrap_err();
+
+    assert_eq!(status.code(), tonic::Code::FailedPrecondition, "{status}");
+    assert!(
+        status
+            .message()
+            .starts_with("delta import requires template"),
+        "{status}"
+    );
+    assert_eq!(resolver.requests().len(), 2);
+    assert!(!staging.path().join("rootfs.ext4").exists());
+}
+
+/// The apply reads its base by path, so a build evicted and pulled again
+/// between the lookup and the read could hand it unverified bytes. It keeps
+/// the result only if a lookup after the apply still answers with the same
+/// path naming the inode it read: a base replaced in between is `ABORTED`,
+/// even with the catalog answering, and an untouched one applies.
+#[tokio::test]
+async fn a_delta_apply_keeps_its_result_only_for_the_base_it_read() {
+    use crate::service::tests::service_tests::service_for_teardown_test;
+    use crate::template_resolver::fake::FakeTemplateResolver;
+    use pplx_space_template_mgr_client::proto::{GetTemplateResponse, TemplateRef};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    for replaced in [false, true] {
+        let hash = format!("sha256:{}", "a".repeat(64));
+        let template = tempfile::tempdir().unwrap();
+        let base = template.path().join("rootfs.ext4");
+        std::fs::write(&base, vec![1u8; 16384]).unwrap();
+        let staging = tempfile::tempdir().unwrap();
+        let current = staging.path().join("current");
+        let mut changed = vec![1u8; 16384];
+        changed[5000] = 2;
+        std::fs::write(&current, &changed).unwrap();
+        let diff = staging.path().join("rootfs.ext4.diff");
+        pplx_space_node_runtime_core::file_delta::compute_diff(&base, &current, &diff).unwrap();
+        let mut paths = SandboxImportPaths::new(&SandboxId::new().to_string());
+        paths.instance_staging = staging.path().to_string_lossy().into_owned();
+        let header = crate::proto::ImportSandboxHeader {
+            is_delta: true,
+            template_id: "seed".into(),
+            content_hash: hash.clone(),
+            ..Default::default()
+        };
+        let answer_dir = template.path().to_string_lossy().into_owned();
+        let lookups = AtomicUsize::new(0);
+        let swap = base.clone();
+        let resolver = Arc::new(FakeTemplateResolver::new(move || {
+            // The second lookup runs after the apply read the base: replace
+            // it with a new file, as an eviction and a fresh pull would.
+            if replaced && lookups.fetch_add(1, Ordering::SeqCst) == 1 {
+                let fresh = swap.with_extension("fresh");
+                std::fs::write(&fresh, vec![1u8; 16384]).unwrap();
+                std::fs::rename(&fresh, &swap).unwrap();
+            }
+            Ok(tonic::Response::new(GetTemplateResponse {
+                template: Some(TemplateRef {
+                    name: "seed".into(),
+                    content_hash: Some(hash.clone()),
+                    tag: None,
+                }),
+                template_dir: answer_dir.clone(),
+                cached_only: true,
+                ..Default::default()
+            }))
+        }));
+        let mut service = service_for_teardown_test(crate::db::test_conn());
+        service.template_resolver = resolver.clone();
+
+        let result = apply_sandbox_delta_import(&service, &header, &paths).await;
+
+        assert_eq!(resolver.requests().len(), 2);
+        if replaced {
+            let status = result.unwrap_err();
+            assert_eq!(status.code(), tonic::Code::Aborted, "{status}");
+        } else {
+            result.unwrap();
+            assert_eq!(
+                std::fs::read(staging.path().join("rootfs.ext4")).unwrap(),
+                changed
+            );
+        }
+    }
+}
+
+/// A delta export computes its diff from the base by path, so it keeps the
+/// diff only if a lookup after the computation still answers with the same
+/// path naming the file it read. A base replaced in between, deleted and
+/// written again (which can reuse its inode number, unless the base is held
+/// open), or a build gone by then, sends the full rootfs, and the diff is
+/// removed.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_delta_export_keeps_its_diff_only_for_the_base_it_read() {
+    use crate::template_resolver::fake::FakeTemplateResolver;
+    use pplx_space_template_mgr_client::proto::{GetTemplateResponse, TemplateRef};
+
+    #[derive(Clone, Copy, Debug)]
+    enum After {
+        Untouched,
+        Replaced,
+        Recreated,
+        Gone,
+    }
+    for after in [
+        After::Untouched,
+        After::Replaced,
+        After::Recreated,
+        After::Gone,
+    ] {
+        let hash = format!("sha256:{}", "a".repeat(64));
+        let template = tempfile::tempdir().unwrap();
+        let base = template.path().join("rootfs.ext4");
+        std::fs::write(&base, vec![1u8; 16384]).unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let current = work.path().join("rootfs.ext4");
+        let mut changed = vec![1u8; 16384];
+        changed[5000] = 2;
+        std::fs::write(&current, &changed).unwrap();
+        let diff = work.path().join("rootfs.diff");
+        let answer_dir = template.path().to_string_lossy().into_owned();
+        let swap = base.clone();
+        let resolver = FakeTemplateResolver::new(move || {
+            match after {
+                After::Untouched => {}
+                After::Replaced => {
+                    let fresh = swap.with_extension("fresh");
+                    std::fs::write(&fresh, vec![1u8; 16384]).unwrap();
+                    std::fs::rename(&fresh, &swap).unwrap();
+                }
+                After::Recreated => {
+                    std::fs::remove_file(&swap).unwrap();
+                    std::fs::write(&swap, vec![1u8; 16384]).unwrap();
+                }
+                After::Gone => {
+                    return Err(crate::template_resolver::TemplateLookupError::Rpc(
+                        tonic::Status::not_found("build removed"),
+                    ));
+                }
+            }
+            Ok(tonic::Response::new(GetTemplateResponse {
+                template: Some(TemplateRef {
+                    name: "seed".into(),
+                    content_hash: Some(hash.clone()),
+                    tag: None,
+                }),
+                template_dir: answer_dir.clone(),
+                cached_only: true,
+                ..Default::default()
+            }))
+        });
+        let runtime = tokio::runtime::Handle::current();
+        let resolver = std::sync::Arc::new(resolver);
+        let lookups = std::sync::Arc::clone(&resolver);
+        let (base_path, current_path, diff_path) = (base.clone(), current.clone(), diff.clone());
+        let hash_for_diff = format!("sha256:{}", "a".repeat(64));
+        let kept = tokio::task::spawn_blocking(move || {
+            diff_against_verified_base(
+                &runtime,
+                resolver.as_ref(),
+                ("seed", &hash_for_diff),
+                base_path,
+                &current_path,
+                &diff_path,
+            )
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(lookups.requests().len(), 1, "{after:?}");
+        assert_eq!(kept, matches!(after, After::Untouched), "{after:?}");
+        assert_eq!(diff.exists(), kept, "{after:?}");
+    }
+}
+
+/// A template-manager that accepts the lookup but never answers can't hold a
+/// transfer, and the sandbox locks it holds, past the lookup's bound: it gives
+/// no verified base, and a delta import is refused as retryable.
+#[tokio::test(start_paused = true)]
+async fn a_delta_base_lookup_that_never_answers_gives_no_base() {
+    struct Silent;
+    #[async_trait::async_trait]
+    impl crate::template_resolver::TemplateResolver for Silent {
+        async fn get_template(
+            &self,
+            _: tonic::Request<pplx_space_template_mgr_client::proto::GetTemplateRequest>,
+        ) -> Result<
+            tonic::Response<pplx_space_template_mgr_client::proto::GetTemplateResponse>,
+            crate::template_resolver::TemplateLookupError,
+        > {
+            std::future::pending().await
+        }
+
+        async fn get_template_on_shared_channel(
+            &self,
+            _: tonic::Request<pplx_space_template_mgr_client::proto::GetTemplateRequest>,
+        ) -> Result<
+            tonic::Response<pplx_space_template_mgr_client::proto::GetTemplateResponse>,
+            tonic::Status,
+        > {
+            std::future::pending().await
+        }
+    }
+    let hash = format!("sha256:{}", "a".repeat(64));
+    let started = tokio::time::Instant::now();
+
+    // The outer bound turns a lookup that waits forever into a failure.
+    let base = tokio::time::timeout(
+        DELTA_BASE_LOOKUP_TIMEOUT * 2,
+        verified_template_rootfs(&Silent, "seed", &hash),
+    )
+    .await
+    .expect("the delta-base lookup outlived its bound");
+    assert_eq!(base, None);
+    assert_eq!(started.elapsed(), DELTA_BASE_LOOKUP_TIMEOUT);
+
+    // A delta import it can't confirm is refused as retryable.
+    let status = required_delta_base(&Silent, "seed", &hash)
+        .await
+        .unwrap_err();
+    assert_eq!(status.code(), tonic::Code::Unavailable, "{status}");
+}

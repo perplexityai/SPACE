@@ -85,23 +85,32 @@ pub(crate) fn expand_rootfs_from_metadata(
         .map(|path| Some((path, size_bytes)))
 }
 
+/// The rootfs size a build records: its expanded size from `metadata.json`,
+/// or else the size its manifest lists for `rootfs.ext4`. `None` when it
+/// records neither, so nothing can check that its rootfs is complete.
+pub(crate) fn recorded_rootfs_bytes(
+    build_dir: impl AsRef<Path>,
+) -> Result<Option<u64>, ExpandedRootfsError> {
+    let build_dir = build_dir.as_ref();
+    let expanded_bytes =
+        rootfs_size_mb_from_metadata(build_dir)?.map(|mb| u64::from(mb) * 1024 * 1024);
+    if expanded_bytes.is_some() {
+        return Ok(expanded_bytes);
+    }
+    manifest_rootfs_size_bytes(build_dir)
+}
+
 /// Verify that a published template build_dir contains a runtime-sized
 /// rootfs.ext4. When metadata declares `disk_size_mb`, that expanded size is
 /// the local-cache invariant on both builders and workers. Builds without a
 /// disk size fall back to the manifest rootfs size for older or non-Firecracker
 /// artifacts.
+/// A build that records no size has nothing to check against and passes.
 pub(crate) fn verify_rootfs_from_metadata(
     build_dir: impl AsRef<Path>,
 ) -> Result<(), ExpandedRootfsError> {
     let build_dir = build_dir.as_ref();
-    let expanded_bytes =
-        rootfs_size_mb_from_metadata(build_dir)?.map(|mb| u64::from(mb) * 1024 * 1024);
-    let manifest_bytes = if expanded_bytes.is_none() {
-        manifest_rootfs_size_bytes(build_dir)?
-    } else {
-        None
-    };
-    let expected_bytes = expanded_bytes.or(manifest_bytes);
+    let expected_bytes = recorded_rootfs_bytes(build_dir)?;
 
     if expected_bytes.is_none() {
         // Nothing to verify against; treat as available.

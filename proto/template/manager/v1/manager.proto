@@ -199,6 +199,26 @@ message GetTemplateRequest {
   optional uint32 vcpu = 2;            // match snapshot with this vcpu
   optional uint32 memory_mib = 3;      // match snapshot with this memory
   optional string caller_org_id = 4;   // authorize before cache lookup or pull
+  // Answer from this node's catalog only, never pulling or reconciling. A
+  // build without a ready catalog row is NOT_FOUND. A ready row is
+  // FAILED_PRECONDITION when the build dir's metadata.json or manifest.json
+  // can't be read, neither declares a rootfs size, rootfs.ext4 doesn't have
+  // the declared size, or rootfs.ext4 is missing or isn't a regular file. The
+  // row itself is what says the rootfs was installed whole: registration,
+  // imports and pulls publish the build dir before writing its row, and
+  // startup recovery writes one only after hashing the dir's bootable
+  // artifact. A lookup that finds a ready row refreshes the build's LRU
+  // recency, even when it then answers FAILED_PRECONDITION, and can insert
+  // the template's default settings rows, as any lookup does. Eviction plans
+  // made within the grace period after that refresh skip the build, which a
+  // caller reading the build relies on; a plan made before it can still evict
+  // the build. Requires an exact content_hash and no caller_org_id; tag, vcpu
+  // and memory_mib are ignored. For callers that read a cached build's bytes
+  // in place, such as a delta-transfer base. A template-manager that predates
+  // the field ignores it and serves an ordinary lookup, which can pull and
+  // doesn't make these checks; its answer leaves GetTemplateResponse's
+  // cached_only false.
+  bool cached_only = 5;
 }
 
 message GetTemplateResponse {
@@ -222,6 +242,10 @@ message GetTemplateResponse {
   space.net.policy.v1.PolicyAuthority network_policy_authority = 18;
   space.net.policy.v1.PolicyAuthority auto_lifecycle_authority = 19;
   optional string authorized_org_id = 20;
+  // True only on an answer to a cached_only request that made that request's
+  // checks. A caller that needs them treats an answer without it, such as one
+  // from a template-manager that predates cached_only, as no answer.
+  bool cached_only = 21;
 }
 
 message UpdateTemplateSettingsRequest {

@@ -301,6 +301,7 @@ async fn main() -> anyhow::Result<()> {
             let resp = client
                 .get_template(GetTemplateRequest {
                     caller_org_id: None,
+                    cached_only: false,
                     template: Some(TemplateRef {
                         name: template,
                         content_hash: if content_hash.is_empty() {

@@ -394,11 +394,6 @@ pub mod paths {
         format!("{TEMPLATE_DIR}/{template}/snapshots/{content_hash}/{vcpu}vcpu-{memory_mib}mib")
     }
 
-    /// Returns the rootfs path for a template/content hash.
-    pub fn template_rootfs_path(template: &str, content_hash: &str) -> String {
-        format!("{}/rootfs.ext4", template_build_dir(template, content_hash))
-    }
-
     /// Applies the shared SPACE template cache rwx bits to one path.
     ///
     /// Runtime services run with `RestrictSUIDSGID=true`, so they only manage
