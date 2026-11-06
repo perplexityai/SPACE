@@ -380,8 +380,8 @@ impl TemplateManagerService {
         };
 
         // The digest's claim, held while the import writes, so no pull,
-        // registration, DeleteTemplateBuild or startup recovery's per-dir check of it
-        // runs alongside. It waits for a holder rather than refusing:
+        // registration, DeleteTemplateBuild, startup recovery's per-dir check
+        // or GC rowless check of it runs alongside. It waits for a holder rather than refusing:
         // node-api's PullTemplate maps any import error to INTERNAL, so a
         // retryable refusal here would reach its caller as a hard failure.
         let digest = self

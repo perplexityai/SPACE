@@ -13,21 +13,22 @@ impl TemplateManagerService {
         let template = &request.get_ref().template;
         validate_template_name(template)?;
         let publish_node_state = !crate::node_state_sync::should_skip_node_publish(&request);
-        // Held until the delete returns, so no pull, import, compression or
-        // startup recovery's per-dir check of any of the template's builds
-        // overlaps it: a pull, import or compression that reaches a build's
-        // claim meanwhile waits, and startup recovery skips the build. A
-        // registration claims only after copying and hashing its rootfs in a
-        // staging dir under the template's dir, so it can overlap the delete:
-        // once the delete removes that dir, the registration fails, whether
-        // it was still hashing or already waiting for the claim.
+        // Held until the delete returns, so no pull, import, compression,
+        // startup recovery's per-dir check or GC rowless check of any of the
+        // template's builds overlaps it: a pull, import, compression or
+        // startup recovery's check that reaches a build's claim meanwhile
+        // waits, and the GC tick skips the build. A registration claims only
+        // after copying and hashing its rootfs in a staging dir under the
+        // template's dir, so it can overlap the delete: once the delete
+        // removes that dir, the registration fails, whether it was still
+        // hashing or already waiting for the claim.
         let _claim = self
             .volume_puller
             .try_claim_template(template)
             .ok_or_else(|| {
                 Status::aborted(format!(
                     "a build of {template} is busy (a pull, import, registration, compression, \
-                     delete or startup check holds it); retry the delete"
+                     delete or recovery check holds it); retry the delete"
                 ))
             })?;
 
@@ -695,7 +696,8 @@ impl TemplateManagerService {
             .map_err(|e| Status::internal(format!("stat rootfs {}: {e}", rootfs_path.display())))?;
 
         // Held from here until the row is written: no pull, import,
-        // DeleteTemplateBuild or startup recovery's per-dir check of the digest overlaps
+        // DeleteTemplateBuild, startup recovery's per-dir check or GC rowless
+        // check of the digest overlaps
         // the existence check, the publish and the row. A delete that holds
         // it first finishes before this one publishes; one that comes later
         // refuses retryably.

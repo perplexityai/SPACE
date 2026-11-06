@@ -1628,6 +1628,43 @@ policy and retain compatibility checks at node admission. Retirement and garbage
 collection require a separate reference-aware operation; recipe omission alone
 never grants deletion authority.
 
+### Template cache recovery
+
+A template-manager build directory `{name}/{content_hash}` without a catalog row
+isn't served: a pull doesn't adopt or write into it, and fails retryably
+instead. Such a directory is left when a read during startup recovery fails
+in a way that can clear, when a permanently invalid build's base snapshots
+or build directory can't be removed (its row goes, what's left stays), when
+a stuck
+eviction's repair or an eviction that couldn't remove its whole directory
+drops the row over what's left, or when a pull stops before registering. Pulls, imports,
+registration, background compression, `DeleteTemplateBuild`, startup
+recovery's per-directory check and the GC tick's check below each hold the
+digest's one claim while they write or remove its directories and rows, and
+`DeleteTemplate` holds one for the whole template, so no two of them hold the
+same digest at once. A registration copies and hashes its rootfs in staging
+before it claims, so it can overlap `DeleteTemplate`, and then fails. Eviction
+takes no claim: it acts only on builds that have a row, and the GC tick's
+check only on directories that don't. Startup recovery skips a digest someone
+holds during its scan, then waits for each one and checks it if the directory
+is still there.
+
+Each template-cache GC tick runs startup recovery's check on a few build
+directories without a row: a valid one gets its row back, a permanently
+invalid one is removed, and one whose read still fails waits for a later tick.
+Each tick takes up to two directories, in name order from just after the last one
+it examined, so with a stable set of N such directories every one is examined
+within `ceil(N / 2)` ticks, however many keep failing, as long as each check
+finishes within its wait. A check still running past its tick keeps one of
+two slots shared across ticks, and a tick starts a check only while a slot
+is free. A create from such a
+build fails until a check restores its row or removes it, or until
+`DeleteTemplateBuild`, which also accepts a digest whose only trace is such a
+directory or a leftover base-snapshot directory, removes it. As with a build
+that has a row, `DeleteTemplateBuild` refuses while a pool references the
+template. The check runs on the GC interval even with template-cache
+eviction disabled.
+
 
 ## Runtime control transport
 

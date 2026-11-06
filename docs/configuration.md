@@ -283,7 +283,7 @@ Prefetch requires the catalog to confirm generic-only release resolution from th
 | `SPACE_TEMPLATE_PREFETCH_ENABLED` | on | |
 | `SPACE_TEMPLATE_PREFETCH_TAGS` | `seed:latest`, `code-runtime:latest` | |
 | `SPACE_TEMPLATE_PREFETCH_VISIBILITY_ENFORCEMENT` | retired | Ignored; prefetch requires confirmed generic visibility. |
-| `SPACE_TEMPLATE_CACHE_BUDGET_BYTES` | 100 GiB | 0 or an invalid value disables cache GC. |
+| `SPACE_TEMPLATE_CACHE_BUDGET_BYTES` | 100 GiB | 0 or an invalid value disables cache eviction; the GC tick still checks build directories without a catalog row ([Template cache recovery](execution-environments.md#template-cache-recovery)). |
 | `SPACE_NODECTL_UNANSWERED_TEMPLATE_EVICT_AFTER_SECS` | 3600 | node-ctl on workers: how long the cluster must keep releasing a local template (present, held by the node, but with no sandbox, generic visibility or warm pool to justify it) before the worker deletes its copy. 0 or an invalid value turns these deletes off. |
 | `SPACE_TEMPLATE_BUILD_DISK_MIB` | build-manager default | JSON. |
 | `SPACE_TRUSTED_TEMPLATE_STORAGE_BUCKETS` | empty = any bucket | |

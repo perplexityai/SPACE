@@ -739,8 +739,8 @@ pub(crate) enum ReaperDiskState {
     /// partially succeeded — contents wiped — but Phase 3 didn't
     /// commit (typically the post-cleanup `rmdir` on a btrfs subvol
     /// root failed and surfaced as Err). The row is dropped; pulls
-    /// refuse a leftover dir without a row until startup recovery
-    /// removes it, and then re-fetch the build.
+    /// refuse a leftover dir without a row until a GC tick's rowless
+    /// check examines it and removes it, and then re-fetch the build.
     Missing,
 }
 
@@ -771,8 +771,8 @@ pub(crate) type ReaperDiskProbeFn = Arc<
 ///   while it was stuck, the planner's filters keep it alive.
 /// - **Disk missing** ⇒ drop the row. `resolve_template` reports
 ///   NotFound. A pull refuses a leftover btrfs subvol root, which has
-///   no row, until startup recovery removes it, then re-fetches the
-///   build.
+///   no row, until a tick's rowless check examines it and removes it,
+///   then re-fetches the build.
 ///
 /// **Race safety:** called at the start of `gc_tick`, before any
 /// candidate enters `execute_precheck`. `execute_precheck`'s Phase 1 CAS
@@ -901,6 +901,12 @@ pub(crate) fn noop_reaper_probe() -> ReaperDiskProbeFn {
     Arc::new(|_, _| Box::pin(async { ReaperDiskState::Intact }))
 }
 
+/// Test stand-in for the rowless-dir check: does nothing.
+#[cfg(test)]
+pub(crate) fn noop_reconcile_rowless() -> ReconcileRowlessFn {
+    Arc::new(|| Box::pin(async {}))
+}
+
 /// Test stand-in for the warm-pool protected-set fetcher: no warm
 /// pools. Mirrors the inline `fetch_active` stubs the run_loop tests
 /// build.
@@ -914,8 +920,8 @@ pub(crate) fn empty_warm_pool_fetch() -> FetchWarmPoolFn {
 /// Env vars are read once at daemon startup via [`GcConfig::from_env`]. The
 /// loop is enabled with a [`GcConfig::DEFAULT_BUDGET_BYTES`] cache budget;
 /// `SPACE_TEMPLATE_CACHE_BUDGET_BYTES` overrides the budget, and an explicit
-/// `0` disables the loop (it then spawns, logs once, and returns without ever
-/// reading from the DB or touching disk), as does a value that is not a byte
+/// `0` disables eviction (the loop then evicts nothing and only checks build
+/// dirs without a row on each tick), as does a value that is not a byte
 /// count (with a warning). The loop only reclaims once the node
 /// is over budget and never within the grace period.
 #[derive(Clone, Debug)]
@@ -973,7 +979,7 @@ impl GcConfig {
                     tracing::warn!(
                         env_var = Self::ENV_BUDGET,
                         value = %raw,
-                        "invalid template cache budget; template GC is disabled \
+                        "invalid template cache budget; template cache eviction is disabled \
                          (set a byte count, or unset the variable for the default)",
                     );
                     None
@@ -1223,7 +1229,15 @@ pub struct GcHooks {
     pub disk_size_for: DiskSizeFn,
     pub delete_disk_for: DeleteDiskFn,
     pub reaper_probe: ReaperDiskProbeFn,
+    /// Runs startup recovery's check on a bounded number of build dirs that
+    /// have no row, so a dir a reaper, a failed cleanup or a transient read
+    /// left behind doesn't block pulls of its build until the next restart.
+    pub reconcile_rowless: ReconcileRowlessFn,
 }
+
+/// Re-verifies build dirs without a row once per GC tick.
+pub type ReconcileRowlessFn =
+    Arc<dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send + Sync>;
 
 /// Drive the GC tick on a recurring interval until `shutdown` fires.
 /// The [`GcHooks`] closures handle every side effect (active-set and
@@ -1244,13 +1258,25 @@ pub async fn run_loop(
         disk_size_for,
         delete_disk_for,
         reaper_probe,
+        reconcile_rowless,
     } = hooks;
     if !cfg.enabled {
         info!(
             env_var = GcConfig::ENV_BUDGET,
-            "template eviction disabled (budget is zero); loop exiting",
+            "template eviction disabled (budget is zero); checking only build dirs without a row",
         );
-        return;
+        // Pulls refuse a build dir without a row, so its check runs on the
+        // same interval even with eviction off.
+        loop {
+            tokio::select! {
+                biased;
+                _ = shutdown.cancelled() => return,
+                () = reconcile_rowless() => {}
+            }
+            if wait_or_shutdown(cfg.interval, &shutdown).await {
+                return;
+            }
+        }
     }
 
     info!(
@@ -1262,6 +1288,17 @@ pub async fn run_loop(
     );
 
     loop {
+        // Rowless build dirs first, before the eviction gate and the
+        // protected sets. The check needs neither: it acts only on a digest
+        // without a row, under that digest's claim, and eviction acts only on
+        // builds with one. So an unavailable sandbox-manager doesn't stop it,
+        // and its hashing doesn't hold off `DeleteIdleTemplate` or startup
+        // recovery's repair of `deleting` rows.
+        tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => return,
+            () = reconcile_rowless() => {}
+        }
         let tick_started = std::time::Instant::now();
         // Held from before the protected sets are fetched until the tick
         // ends, so a wait for an idle eviction cannot leave the tick acting
