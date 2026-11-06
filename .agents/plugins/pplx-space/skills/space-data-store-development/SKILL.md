@@ -81,10 +81,13 @@ Not store verbs — leave these where they are:
   `delete::delete_with_dependents`. A write that is one step of such a
   transition stays in its module even when its own `WHERE` checks only the
   id, because the caller's locks and re-checks guard it (as with
-  `delete::mark_deleting`). Other unguarded writes of the row, such as its
-  desired-configuration columns, belong in ordinary verbs like
-  `update_desired_state`. The caller keeps its locks and transaction (see the
-  crate docs).
+  `delete::mark_deleting`). A step that writes a table another store owns can
+  instead be a verb of that store, run in the caller's transaction with its
+  guard whole, as `pplx-space-snapshot-store`'s
+  `lost::fail_quiet_full_uploads_from_node` is for the lost give-ups. Other
+  unguarded writes of the row, such as its desired-configuration columns,
+  belong in ordinary verbs like `update_desired_state`. The caller keeps its
+  locks and transaction (see the crate docs).
 - **`SELECT ... FOR UPDATE`**: a lock acquisition inside the caller's
   transaction. Converting it to a store read silently drops the lock.
 - **Predicates evaluated against the database clock** (`NOW()`-relative

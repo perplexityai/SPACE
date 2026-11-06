@@ -13,6 +13,19 @@ use pplx_space_sandbox_portability::{
 };
 use sqlx::{Postgres, Transaction};
 
+/// Quiet period a same-node `creating` snapshot row must have sat without a
+/// worker heartbeat (`COALESCE(last_attempt_at, timestamp)`) before the
+/// mark-lost give-up treats it as provably dead. EC2 `terminated` already
+/// proves the upload *worker* died with the instance — what it cannot bound
+/// is a `FinalizeArtifactBackup(READY)` RPC that left the node before the
+/// instance died and is still queued in the API path with all bytes already
+/// durable in S3. Such an RPC lives for seconds (gRPC deadline), so ten
+/// quiet minutes is overwhelmingly past it: a row still inside the window
+/// defers the flip (the sandbox stays parked and the next ticks re-check);
+/// one quiet for longer can no longer become `ready` and is finalized
+/// `failed` so the reap converges.
+pub const DEAD_UPLOAD_SETTLE: Duration = Duration::from_mins(10);
+
 /// The guarded flip of `sandboxes` from `started` to `failed`. Returns
 /// whether the row flipped.
 ///
@@ -25,9 +38,9 @@ use sqlx::{Postgres, Transaction};
 /// with `dead_upload_settle` as its settle window).
 ///
 /// The caller owns everything around it: the sandbox row lock, the re-check
-/// that the node is still gone, and the write-off of the
-/// execution and placement (see [`release_lost_placement`]) in the same
-/// transaction.
+/// that the node is still gone, and, in the same transaction, the write-off:
+/// `pplx_space_snapshot_store::lost::fail_quiet_full_uploads_from_node`, then
+/// [`write_off_lost_sandboxes`].
 pub async fn mark_started_lost(
     tx: &mut Transaction<'_, Postgres>,
     sandbox_id: SandboxId,
@@ -99,10 +112,58 @@ pub async fn release_lost_placement(
     Ok(())
 }
 
+/// Clean up after `ids` were flipped to `failed` in this transaction because
+/// `node_id` is gone. Run it after the flip, in the flip's transaction, and
+/// after `pplx_space_snapshot_store::lost::fail_quiet_full_uploads_from_node`
+/// has failed the node's dead uploads.
+///
+/// - **The backup queue.** A gone node sends no census to replace its
+///   `node_local_backup_pending` set, and the table's only foreign key is on
+///   `sandbox_id`, so the rows would stay until the sandbox row is deleted.
+///   Scoped to `node_id`: a sandbox can hold a queue row on a live node too,
+///   and that row is the live node's pending work. Lock order is
+///   sandboxes-then-queue, while the census publish takes the queue row first;
+///   that can only deadlock against a census from the gone node itself.
+/// - **Executions.** The active execution is written off as `forgotten`, the
+///   pod-tracking write-off state: its pod, if one ran, died with the node.
+/// - **Placement.** Released through [`release_lost_placement`], so the row
+///   stops pinning the gone node.
+///
+/// Port exposures are left alone: re-queueing them for a terminal sandbox
+/// would only create work that can never apply.
+pub async fn write_off_lost_sandboxes(
+    tx: &mut Transaction<'_, Postgres>,
+    node_id: NodeId,
+    ids: &[SandboxId],
+) -> Result<(), sqlx::Error> {
+    sqlx::query(sql!(
+        "DELETE FROM node_local_backup_pending
+          WHERE node_id = $1 AND sandbox_id = ANY($2)"
+    ))
+    .bind(node_id)
+    .bind(ids)
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query(sql!(
+        "UPDATE sandbox_k8s_executions
+            SET active = FALSE,
+                state = 'forgotten',
+                pod_ip = NULL,
+                terminated_at = COALESCE(terminated_at, NOW()),
+                updated_at = NOW()
+          WHERE sandbox_id = ANY($1)
+            AND active"
+    ))
+    .bind(ids)
+    .execute(&mut **tx)
+    .await?;
+    release_lost_placement(tx, ids).await
+}
+
 /// `$1` = node id, `$2` = the kube uid observed at the EC2 cross-check,
 /// `$3` = the candidate ids the caller has already `FOR UPDATE`-claimed in
 /// the same transaction (only those may flip — see the inline comment),
-/// `$4` = the terminator's `DEAD_UPLOAD_SETTLE` quiet seconds for same-node
+/// `$4` = the [`DEAD_UPLOAD_SETTLE`] quiet seconds for same-node
 /// `creating` rows, `$5` = [`SubstrateKind::Kubernetes`]. Mark-lost give-up for the
 /// KubeNodeGone recovery: flips every `suspended` sandbox pinned to the node
 /// via `target_node_id` that has no recoverable copy anywhere to
@@ -223,3 +284,6 @@ pub async fn mark_unrecoverable_sandboxes_lost(
         .fetch_all(&mut **tx)
         .await
 }
+
+#[cfg(test)]
+mod tests;

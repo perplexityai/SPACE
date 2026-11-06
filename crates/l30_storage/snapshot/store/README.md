@@ -80,6 +80,10 @@ snapshot inside the caller's existing authorization-and-lock transaction. The
 store does not decide whether deletion or retry is safe and does not touch
 storage-backend bytes.
 
+The `lost` module holds the guarded write the lost-sandbox give-ups run in
+their flip's transaction: failing the gone node's quiet `creating` full
+uploads for the sandboxes they flipped.
+
 Add further typed CRUD incrementally with each migrated caller. Add claim/prune
 with its live retention workflow, after the workflow has a complete protection
 matrix for restore, fork, lifecycle, publication, the zero-or-one location invariant,
