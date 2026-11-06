@@ -70,7 +70,11 @@ pub(super) async fn initial_process_stream(
         // start succeeded earlier and its binding was never persisted. The
         // process id is derived rather than discovered, so recovery does not
         // depend on that binding: connect to the existing process instead of
-        // running the command a second time.
+        // running the command a second time. A guest that predates assigned
+        // ids mints its own and never answers this, so for it only a
+        // persisted binding, or its own handling of the start's idempotency
+        // key (the session id), keeps a repeated start from running the
+        // command again.
         Err(StreamBridgeError::BackendStatus(status))
             if status.code() == tonic::Code::AlreadyExists =>
         {
