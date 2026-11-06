@@ -20,6 +20,21 @@ fn deterministic_uuid_for_seed_is_pinned() {
     );
 }
 
+/// A build in an environment's cache partition is stamped from its directory
+/// name, `{content_hash}@{environment}`. Every node that installs it has to
+/// arrive at the same bytes, as for the legacy pin above.
+#[test]
+fn deterministic_uuid_for_a_partitioned_build_is_pinned() {
+    let got = deterministic_template_received_uuid(
+        "seed",
+        &format!(
+            "sha256:6dfaca783bd73dbb42fe5833b46e575a7c9555e56801e79cda7f01f573f2ebb1@sha256:{}",
+            "09".repeat(32)
+        ),
+    );
+    assert_eq!(got.to_string(), "19f18f52-6ca4-5e7f-93bf-e4ba9d8a2118");
+}
+
 #[test]
 fn deterministic_uuid_differs_per_content_hash() {
     let a = deterministic_template_received_uuid("seed", "sha256:aaaa");

@@ -412,6 +412,7 @@ fn snapshot_dir(name: &str, content_hash: &str, vcpu: u32, memory_mib: u32) -> S
     pplx_space_common_core::host::linux::paths::template_snapshot_dir(
         name,
         content_hash,
+        pplx_space_common_core::types::TemplateCachePartition::Legacy,
         vcpu,
         memory_mib,
     )

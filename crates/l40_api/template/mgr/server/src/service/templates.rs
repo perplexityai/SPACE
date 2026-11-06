@@ -846,6 +846,7 @@ impl TemplateManagerService {
                 name: template_id.clone(),
                 content_hash: Some(content_hash),
                 tag: None,
+                environment: None,
             }),
             build_date,
         }))
@@ -923,6 +924,7 @@ impl TemplateManagerService {
                 name: template_id.to_string(),
                 content_hash: Some(content_hash.to_string()),
                 tag: None,
+                environment: None,
             }),
             build_date,
         }))

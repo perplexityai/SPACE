@@ -910,6 +910,7 @@ fn delete_template_build_rejects_traversal_hash_before_delete() {
                     name: template.to_string(),
                     content_hash: Some(content_hash.to_string()),
                     tag: None,
+                    environment: None,
                 }),
             },
         )))
@@ -1467,6 +1468,7 @@ async fn get_template_authorizes_and_resolves_before_using_cached_builds(
                 name: "base".into(),
                 content_hash: hash,
                 tag: tag.map(str::to_owned),
+                environment: None,
             }),
             caller_org_id: Some(org.to_string()),
             cached_only: false,
@@ -1586,6 +1588,7 @@ fn cached_only_lookup(hash: Option<String>) -> Request<crate::proto::GetTemplate
             name: "base".into(),
             content_hash: hash,
             tag: None,
+            environment: None,
         }),
         caller_org_id: None,
         cached_only: true,

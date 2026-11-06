@@ -43,6 +43,7 @@ impl TryFrom<&TemplateReference> for proto::TemplateRef {
             name: reference.name().as_str().to_string(),
             content_hash: None,
             tag: None,
+            environment: None,
         };
         match reference.selector() {
             TemplateSelector::Tag(tag) => {

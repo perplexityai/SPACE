@@ -22,6 +22,7 @@ fn import_template_response(
             name: template_id.to_string(),
             content_hash: Some(content_hash.to_string()),
             tag: None,
+            environment: None,
         }),
     })
 }

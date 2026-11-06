@@ -49,6 +49,7 @@ pplx-space-metrics = { workspace = true }
 pplx-space-net-common = { workspace = true }
 pplx-space-node-api-client = { workspace = true }
 pplx-space-node-mgr-client = { workspace = true }
+pplx-space-node-runtime-core = { workspace = true }
 pplx-space-object-store = { workspace = true }
 pplx-space-page-cache = { workspace = true }
 pplx-space-rpc-auth = { workspace = true }

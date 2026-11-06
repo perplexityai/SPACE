@@ -132,6 +132,7 @@ async fn cloning_preserves_guest_contract_and_requires_current_checkpoint() {
                     name: "seed".into(),
                     content_hash: Some("sha256:test".into()),
                     tag: None,
+                    environment: None,
                 }),
                 template_dir: directory.clone(),
                 arch: std::env::consts::ARCH.into(),

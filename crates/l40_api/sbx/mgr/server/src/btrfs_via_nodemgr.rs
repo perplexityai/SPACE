@@ -153,6 +153,7 @@ pub(crate) async fn encode_rootfs_send(
             execution_fence: Some(execution_fence.into()),
             retain_source: retain_send_sources(),
             defer_send: defer,
+            environment_build: None,
         })
         .await
         .map_err(|status| BtrfsViaNodemgrError::Rpc { rpc: RPC, status })?
@@ -192,6 +193,7 @@ pub(crate) async fn encode_snapshot_rootfs_send(
             dest_dir: dest_dir.to_string(),
             retain_source: false,
             defer_send: false,
+            environment_build: None,
         })
         .await
         .map_err(|status| BtrfsViaNodemgrError::Rpc {
@@ -225,6 +227,7 @@ pub(crate) async fn receive_instance(
             template_name: template_name.to_string(),
             content_hash: content_hash.to_string(),
             target: Some(target.into()),
+            environment_build: None,
         })
         .await
         .map_err(|status| BtrfsViaNodemgrError::Rpc {

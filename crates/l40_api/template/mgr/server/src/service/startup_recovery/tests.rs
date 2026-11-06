@@ -481,6 +481,7 @@ async fn delete_template_build_waits_for_a_pull_of_the_digest() {
                     name: "seed".into(),
                     content_hash: Some(hash.clone()),
                     tag: None,
+                    environment: None,
                 }),
             },
         ))
@@ -1147,6 +1148,7 @@ async fn deleting_a_digest_whose_dirs_cannot_be_listed_fails_retryably() {
                     name: "seed".into(),
                     content_hash: Some(hash.clone()),
                     tag: None,
+                    environment: None,
                 }),
             },
         ))

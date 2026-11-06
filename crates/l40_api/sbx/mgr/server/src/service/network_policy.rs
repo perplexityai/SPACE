@@ -141,6 +141,7 @@ pub(crate) async fn fetch_template_default_network_policy(
                 name: template.to_string(),
                 content_hash: None,
                 tag: None,
+                environment: None,
             }),
             vcpu: None,
             memory_mib: None,

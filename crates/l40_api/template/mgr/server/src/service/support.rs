@@ -277,6 +277,7 @@ pub(super) async fn build_get_template_response(
                 name: build.name,
                 content_hash: Some(build.content_hash),
                 tag: None,
+                environment: None,
             }),
             build_date: build.build_date,
             artifact_size_bytes: build.artifact_size_bytes,

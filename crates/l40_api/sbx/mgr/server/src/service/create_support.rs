@@ -894,6 +894,18 @@ fn start_template_resolution_failed_status(error: Status) -> Status {
     Status::new(code, error.message().to_string())
 }
 
+/// The template lookup preference for starting `sandbox`: the environment its
+/// saved execution is bound to. It's a preference, not a filter, so a sandbox
+/// whose binding was upgraded still finds a disk. A template-manager that
+/// doesn't key its cache by environment ignores it.
+pub(super) fn sandbox_template_preference(sandbox: &crate::db::SandboxRow) -> Option<String> {
+    sandbox
+        .execution_metadata
+        .as_ref()
+        .and_then(|execution| execution.environment())
+        .map(|environment| environment.to_string())
+}
+
 pub(super) async fn template_runtime_defaults_for_sandbox_start(
     templates: &dyn crate::template_resolver::TemplateResolver,
     sandbox: &crate::db::SandboxRow,
@@ -903,12 +915,14 @@ pub(super) async fn template_runtime_defaults_for_sandbox_start(
         return template_runtime_defaults(template_dir);
     }
 
+    // The lookup states the sandbox's own environment as a preference.
     match resolve_template_paths(
         templates,
         pplx_space_template_mgr_client::proto::TemplateRef {
             name: sandbox.template.clone(),
             content_hash: sandbox.template_hash.clone(),
             tag: None,
+            environment: sandbox_template_preference(sandbox),
         },
         match template_lookup_scope(&sandbox.user, Some(&sandbox.id)) {
             Ok(scope) => scope,
@@ -1015,12 +1029,15 @@ pub(super) async fn template_source_for_sandbox_prepare_in(
         )));
     }
 
+    // The saved binding selects execution (`bind_disk_execution`), so the
+    // lookup states a preference for the build of that environment.
     let resolved_template = resolve_template_paths_for_start(
         templates,
         pplx_space_template_mgr_client::proto::TemplateRef {
             name: sandbox.template.clone(),
             content_hash: sandbox.template_hash.clone(),
             tag: None,
+            environment: sandbox_template_preference(sandbox),
         },
         sandbox,
     )
