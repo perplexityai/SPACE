@@ -226,6 +226,17 @@ impl KubernetesSubstrate {
 
             let pod_uid = pod.uid().map(str::to_owned);
             let pod_ip = assigned_pod_ip(&pod)?;
+            // A pod that finished without an IP never gets one, e.g. kubelet
+            // rejecting it at admission (`OutOf<resource>`) after the node's
+            // advertised capacity shrank.
+            if pod_ip.is_none() && pod.is_terminal() {
+                return Err(SubstrateError::Unavailable {
+                    message: format!(
+                        "sandbox pod {pod_name} reached phase {} before an IP was assigned",
+                        pod.phase().unwrap_or("unknown")
+                    ),
+                });
+            }
             let _ = self
                 .remember_pod_node_placement(
                     sandbox_uuid,
