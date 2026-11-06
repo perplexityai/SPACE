@@ -7064,7 +7064,8 @@ version = "0.8.1"
 dependencies = [
  "log",
  "pplx-space-db-identity",
- "pplx-space-metrics",
+ "pplx-space-metrics-emit",
+ "pplx-space-observability",
  "pplx-space-postgres-contention",
  "pplx-space-sql-locator",
  "pplx-space-state-reconciliation",
@@ -7138,7 +7139,7 @@ dependencies = [
  "pplx-space-bearer-token",
  "pplx-space-common-core",
  "pplx-space-kube-client",
- "pplx-space-metrics",
+ "pplx-space-metrics-emit",
  "pplx-space-test-env",
  "pplx-space-uds-peer-auth",
  "serde_json",

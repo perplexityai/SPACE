@@ -13,6 +13,7 @@ use tonic::Status;
 use crate::proto::{CacheDiskAdmissionState as ProtoCacheDiskAdmissionState, CacheDiskStatus};
 
 pub mod cache_handle;
+pub mod metrics;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DiskAllocationOperation {

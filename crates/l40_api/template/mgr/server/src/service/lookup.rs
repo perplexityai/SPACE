@@ -20,7 +20,9 @@ impl TemplateManagerService {
     ) -> Result<Response<crate::proto::GetTemplateResponse>, Status> {
         let scope = TemplateLookupScope::from_request(&request)?;
         if scope.is_none() {
-            pplx_space_metrics::auth::template_lookup_compatibility("missing_scope");
+            pplx_space_rpc_auth::template_lookup::metrics::template_lookup_compatibility(
+                "missing_scope",
+            );
         }
         let mut response = self
             .get_template_resolving(

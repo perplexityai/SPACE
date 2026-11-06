@@ -429,7 +429,9 @@ impl ClusterApi for ClusterApiService {
         let scope = self.template_read_scope(&request).await?;
         let delegation = TemplateLookupScope::from_request(&request)?;
         if delegation.is_none() {
-            pplx_space_metrics::auth::template_lookup_compatibility("missing_scope");
+            pplx_space_rpc_auth::template_lookup::metrics::template_lookup_compatibility(
+                "missing_scope",
+            );
         }
         let request = request.into_inner();
         let template_name = trimmed_required(&request.template_name, "template_name")?;
@@ -512,7 +514,9 @@ impl ClusterApi for ClusterApiService {
         let scope = self.template_read_scope(&request).await?;
         let delegation = TemplateLookupScope::from_request(&request)?;
         if delegation.is_none() {
-            pplx_space_metrics::auth::template_lookup_compatibility("missing_scope");
+            pplx_space_rpc_auth::template_lookup::metrics::template_lookup_compatibility(
+                "missing_scope",
+            );
         }
         let request = request.into_inner();
         let template_name = trimmed_required(&request.template_name, "template_name")?;

@@ -11,7 +11,6 @@ pub mod byok;
 pub mod cluster_reconciler;
 pub mod credmgr;
 pub mod data_plane;
-pub mod db;
 pub mod gateway;
 pub mod internal_api;
 pub mod leader_election;

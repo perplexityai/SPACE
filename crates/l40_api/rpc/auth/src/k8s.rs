@@ -163,7 +163,7 @@ impl K8sTokenReviewer {
         let policy = match self.config.policy(role, surface) {
             Ok(policy) => policy,
             Err(rejection) => {
-                pplx_space_metrics::auth::node_api_decision(
+                crate::metrics::node_api_decision(
                     "k8s",
                     surface.as_str(),
                     "deny",
@@ -186,14 +186,14 @@ impl K8sTokenReviewer {
                     break claim;
                 }
                 InFlightState::Waiting(waiter) => {
-                    pplx_space_metrics::auth::token_review_cache("in_flight_wait");
+                    crate::metrics::token_review_cache("in_flight_wait");
                     let _ = waiter.await;
                     continue;
                 }
             }
         };
 
-        pplx_space_metrics::auth::token_review_cache("miss");
+        crate::metrics::token_review_cache("miss");
         // Rate-limit actual apiserver TokenReviews. Single-flight has already
         // collapsed same-token concurrency, so this gates *distinct*-token
         // reviews — the spray vector. The concurrency permit below bounds how
@@ -202,8 +202,8 @@ impl K8sTokenReviewer {
         // immediately). Shedding here is local backpressure: retryable, not a
         // verdict, so it is not cached.
         if !self.rate_limiter.try_acquire() {
-            pplx_space_metrics::auth::token_review_cache("rate_limited");
-            pplx_space_metrics::auth::node_api_decision(
+            crate::metrics::token_review_cache("rate_limited");
+            crate::metrics::node_api_decision(
                 "k8s",
                 surface.as_str(),
                 "deny",
@@ -225,7 +225,7 @@ impl K8sTokenReviewer {
                 // of distinct JWT-shaped tokens cannot grow the waiter set (and
                 // its in-flight-map entries) without limit — shed with a
                 // retryable status instead of queueing indefinitely.
-                pplx_space_metrics::auth::token_review_cache("limiter_wait");
+                crate::metrics::token_review_cache("limiter_wait");
                 match tokio::time::timeout(
                     self.config.review_timeout,
                     self.review_limiter.acquire(),
@@ -239,8 +239,8 @@ impl K8sTokenReviewer {
                         unreachable!("token review semaphore is never closed")
                     }
                     Err(_elapsed) => {
-                        pplx_space_metrics::auth::token_review_cache("limiter_timeout");
-                        pplx_space_metrics::auth::node_api_decision(
+                        crate::metrics::token_review_cache("limiter_timeout");
+                        crate::metrics::node_api_decision(
                             "k8s",
                             surface.as_str(),
                             "deny",
@@ -267,12 +267,7 @@ impl K8sTokenReviewer {
                     CachedTokenReviewResult::Rejected { reason },
                     Instant::now() + self.config.negative_cache_ttl,
                 );
-                pplx_space_metrics::auth::node_api_decision(
-                    "k8s",
-                    surface.as_str(),
-                    "deny",
-                    reason.as_str(),
-                );
+                crate::metrics::node_api_decision("k8s", surface.as_str(), "deny", reason.as_str());
                 return Err(reason.to_status());
             }
             Err(TokenReviewFailure::Unavailable) => {
@@ -281,7 +276,7 @@ impl K8sTokenReviewer {
                 // valid token for the negative-TTL window after the apiserver
                 // recovers. Single-flight still collapses the concurrent
                 // same-token retries, and the rate limiter bounds the rest.
-                pplx_space_metrics::auth::node_api_decision(
+                crate::metrics::node_api_decision(
                     "k8s",
                     surface.as_str(),
                     "deny",
@@ -312,7 +307,7 @@ impl K8sTokenReviewer {
         match self.cache.lookup(key, Instant::now()) {
             Lookup::Live(result) => Some(result),
             Lookup::Expired => {
-                pplx_space_metrics::auth::token_review_cache("evict_expired");
+                crate::metrics::token_review_cache("evict_expired");
                 None
             }
             Lookup::Absent => None,
@@ -331,18 +326,13 @@ impl K8sTokenReviewer {
                 username,
                 node_identity,
             } => {
-                pplx_space_metrics::auth::token_review_cache("hit_authenticated");
+                crate::metrics::token_review_cache("hit_authenticated");
                 self.authorize_username(policy, surface, method, &username, false)?;
                 Ok(policy.authenticated_caller(&username, node_identity))
             }
             CachedTokenReviewResult::Rejected { reason } => {
-                pplx_space_metrics::auth::token_review_cache("hit_deny");
-                pplx_space_metrics::auth::node_api_decision(
-                    "k8s",
-                    surface.as_str(),
-                    "deny",
-                    reason.as_str(),
-                );
+                crate::metrics::token_review_cache("hit_deny");
+                crate::metrics::node_api_decision("k8s", surface.as_str(), "deny", reason.as_str());
                 Err(reason.to_status())
             }
         }
@@ -364,7 +354,7 @@ impl K8sTokenReviewer {
                 audience = policy.audience,
                 "Kubernetes service account is not allowed for node-api surface"
             );
-            pplx_space_metrics::auth::node_api_decision(
+            crate::metrics::node_api_decision(
                 "k8s",
                 surface.as_str(),
                 "deny",
@@ -398,7 +388,7 @@ impl K8sTokenReviewer {
                 "accepted Kubernetes service account for node-api"
             );
         }
-        pplx_space_metrics::auth::node_api_decision("k8s", surface.as_str(), "allow", "ok");
+        crate::metrics::node_api_decision("k8s", surface.as_str(), "allow", "ok");
         Ok(())
     }
 
@@ -410,9 +400,9 @@ impl K8sTokenReviewer {
     ) {
         let result_tag = result.insert_metric();
         if self.cache.insert(key, result, expires_at, Instant::now()) {
-            pplx_space_metrics::auth::token_review_cache("evict_capacity");
+            crate::metrics::token_review_cache("evict_capacity");
         }
-        pplx_space_metrics::auth::token_review_cache(result_tag);
+        crate::metrics::token_review_cache(result_tag);
     }
 
     async fn review_token(

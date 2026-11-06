@@ -69,7 +69,7 @@ impl Authenticator {
                 // compare against. Non-JWT bearers fail before reaching the
                 // apiserver; JWT-shaped values are reviewed normally.
                 if !is_jwt_shaped(token) {
-                    pplx_space_metrics::auth::decision(
+                    pplx_space_rpc_auth::metrics::decision(
                         "k8s",
                         "credmgr-tcp",
                         "deny",
@@ -84,10 +84,10 @@ impl Authenticator {
             }
             Self::StaticToken(expected) => {
                 if constant_time_eq(token, expected) {
-                    pplx_space_metrics::auth::decision("static", "credmgr-tcp", "allow", "ok");
+                    pplx_space_rpc_auth::metrics::decision("static", "credmgr-tcp", "allow", "ok");
                     Ok(TcpCallerIdentity::Plaintext)
                 } else {
-                    pplx_space_metrics::auth::decision(
+                    pplx_space_rpc_auth::metrics::decision(
                         "static",
                         "credmgr-tcp",
                         "deny",
@@ -191,7 +191,7 @@ where
                     }
                     None => authenticator.authenticate(None, req.extensions()).await?,
                     Some(Err(_)) => {
-                        pplx_space_metrics::auth::decision(
+                        pplx_space_rpc_auth::metrics::decision(
                             "static",
                             "credmgr-tcp",
                             "deny",
@@ -239,11 +239,11 @@ fn is_auth_exempt(path: &str) -> bool {
 
 fn bearer_token(auth_header: Option<&str>) -> Result<&str, Status> {
     let header = auth_header.ok_or_else(|| {
-        pplx_space_metrics::auth::decision("static", "credmgr-tcp", "deny", "missing_bearer");
+        pplx_space_rpc_auth::metrics::decision("static", "credmgr-tcp", "deny", "missing_bearer");
         Status::unauthenticated("missing authorization header")
     })?;
     header.strip_prefix("Bearer ").ok_or_else(|| {
-        pplx_space_metrics::auth::decision(
+        pplx_space_rpc_auth::metrics::decision(
             "static",
             "credmgr-tcp",
             "deny",

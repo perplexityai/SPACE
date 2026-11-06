@@ -7,6 +7,8 @@ use std::net::IpAddr;
 use pplx_space_common_core::types::SandboxId;
 use tonic::{Request, Response, Status};
 
+pub mod metrics;
+
 const SCOPE_HEADER: &str = "x-space-template-lookup-scope";
 const RECEIPT_HEADER: &str = "x-space-template-lookup-scope-received";
 
@@ -107,14 +109,14 @@ impl TemplateLookupScope {
     pub fn observe_response<T>(self, response: &Response<T>) -> Result<(), Status> {
         match response.metadata().get(RECEIPT_HEADER) {
             None => {
-                pplx_space_metrics::auth::template_lookup_compatibility("missing_receipt");
+                crate::template_lookup::metrics::template_lookup_compatibility("missing_receipt");
                 tracing::warn!(
                     "template lookup peer has no scope receipt; retaining legacy behavior"
                 );
                 Ok(())
             }
             Some(value) if value.to_str().ok() == Some(self.to_string().as_str()) => {
-                pplx_space_metrics::auth::template_lookup_compatibility("received");
+                crate::template_lookup::metrics::template_lookup_compatibility("received");
                 Ok(())
             }
             Some(_) => Err(Status::failed_precondition(

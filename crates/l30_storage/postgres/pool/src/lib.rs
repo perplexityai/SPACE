@@ -15,6 +15,7 @@ use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 
 pub mod contention;
 pub mod identity;
+pub mod metrics;
 
 const POOL_METRICS_INTERVAL: Duration = Duration::from_secs(10);
 
@@ -385,10 +386,10 @@ pub fn spawn_postgres_pool_metrics_reporter_for_identity(pool: PgPool, identity:
             let size = pool.size();
             let idle = pool.num_idle();
             let in_use = size.saturating_sub(idle as u32);
-            pplx_space_metrics::db::pool::connections_in_use_for_identity(in_use, identity);
-            pplx_space_metrics::db::pool::connections_idle_for_identity(idle, identity);
+            crate::metrics::connections_in_use_for_identity(in_use, identity);
+            crate::metrics::connections_idle_for_identity(idle, identity);
             if let Some(ratio) = pool_utilization(in_use, max) {
-                pplx_space_metrics::db::pool::utilization_for_identity(ratio, identity);
+                crate::metrics::utilization_for_identity(ratio, identity);
             }
         }
     });
