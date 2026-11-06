@@ -147,6 +147,21 @@ async fn template_rows_include_observed_base_snapshot_inventory() -> TestResult 
     insert_node(&db.pool, worker_id, "worker").await?;
     insert_base_snapshot_inventory(&db.pool, worker_id, &template, "sha256:current").await?;
 
+    sqlx::query(sql!(
+        "UPDATE node_template_inventory SET runtime_version = $2 WHERE node_id = $1"
+    ))
+    .bind(builder_id)
+    .bind("1.15.1")
+    .execute(&db.pool)
+    .await?;
+    sqlx::query(sql!(
+        "UPDATE node_template_inventory SET runtime_version = $2 WHERE node_id = $1"
+    ))
+    .bind(worker_id)
+    .bind("1.14.0")
+    .execute(&db.pool)
+    .await?;
+
     let templates = fetch_template_rows(&db.pool, None).await?;
     let response = templates
         .into_iter()
@@ -155,6 +170,7 @@ async fn template_rows_include_observed_base_snapshot_inventory() -> TestResult 
         .expect("seed template should be listed");
 
     assert_eq!(response.content_hash.as_deref(), Some("sha256:current"));
+    assert_eq!(response.runtime_version.as_deref(), Some("1.15.1"));
     assert_eq!(response.has_base_snapshot, Some(true));
     assert_eq!(response.base_snapshot_size_bytes, Some(4096));
 

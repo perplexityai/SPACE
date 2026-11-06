@@ -103,7 +103,10 @@ export default function TemplateOverview({ template, current, newest, releaseCou
         )}
       </Descriptions.Item>
       <Descriptions.Item label="Built">{template.built_at ? formatShortDateTime(template.built_at) : '—'}</Descriptions.Item>
-      <Descriptions.Item label="Runtime">{template.runtime || '—'}{template.arch ? ` / ${template.arch}` : ''}</Descriptions.Item>
+      <Descriptions.Item label="Execution">
+        {template.runtime || '—'}{template.runtime && template.runtime_version ? ` ${template.runtime_version}` : ''}
+        {template.arch ? ` / ${template.arch}` : ''}
+      </Descriptions.Item>
       <Descriptions.Item label="Shape">
         {template.vcpu ? `${template.vcpu}c` : '—'} / {template.memory_mib ? `${template.memory_mib} MiB` : '—'}
       </Descriptions.Item>
