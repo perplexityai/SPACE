@@ -2696,13 +2696,11 @@ async fn probe_firecracker_health(
         }
     };
     match crate::runtime_via_nodemgr::get_vm_state(sandbox_id, node_manager).await {
-        Err(crate::runtime_via_nodemgr::RuntimeStateReadError::Timeout { .. }) => {
-            health_observation(
-                started,
-                HealthProbeOutcome::Timeout,
-                "Firecracker state request timed out",
-            )
-        }
+        Err(error) if error.is_timeout() => health_observation(
+            started,
+            HealthProbeOutcome::Timeout,
+            "Firecracker state request timed out",
+        ),
         Err(error) => health_observation(
             started,
             HealthProbeOutcome::Unavailable,
