@@ -59,6 +59,7 @@ pub enum Loop {
     StuckContainerCreatingGc,
     WarmPoolOrphanGc,
     OrphanedRestorePodGc,
+    RetiredExecutionPodGc,
     LostStartedSandboxes,
 }
 
@@ -72,6 +73,7 @@ impl Loop {
             Self::StuckContainerCreatingGc => "stuck_container_creating_gc",
             Self::WarmPoolOrphanGc => "warm_pool_orphan_gc",
             Self::OrphanedRestorePodGc => "orphaned_restore_pod_gc",
+            Self::RetiredExecutionPodGc => "retired_execution_pod_gc",
             Self::LostStartedSandboxes => "lost_started_sandboxes",
         }
     }
@@ -740,6 +742,62 @@ impl fmt::Display for OrphanedRestorePodOutcome {
     }
 }
 
+/// Outcomes for `retired_execution_pod_gc`: one per reapable candidate
+/// acted on in a tick. The loop changes no sandbox lifecycle (the execution is
+/// already retired), so no lifecycle tags. `verdict` carries the reap shape
+/// (`terminal_retired` or `replaced_never_started`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetiredExecutionPodOutcome {
+    // State change: the UID-preconditioned DELETE was accepted (live), or
+    // would have been (dry-run).
+    Reaped,
+    // No-ops: `skipped`.
+    AlreadyGone,
+    NotReapableOnRecheck,
+    // No-ops: `deferred`.
+    RateLimited,
+    Deferred,
+    // No-op: `cas_lost`.
+    StaleIdentity,
+    // No-ops: `error`.
+    ReadError,
+    DeleteFailed,
+    TimedOut,
+}
+
+impl RetiredExecutionPodOutcome {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Reaped => "reaped_retired_execution_pod",
+            Self::AlreadyGone | Self::NotReapableOnRecheck => OUTCOME_SKIPPED,
+            Self::RateLimited | Self::Deferred => OUTCOME_DEFERRED,
+            Self::StaleIdentity => OUTCOME_CAS_LOST,
+            Self::ReadError | Self::DeleteFailed | Self::TimedOut => OUTCOME_ERROR,
+        }
+    }
+
+    pub fn reason(self) -> Option<&'static str> {
+        let reason = match self {
+            Self::Reaped => return None,
+            Self::AlreadyGone => "already_gone",
+            Self::NotReapableOnRecheck => "not_reapable_on_recheck",
+            Self::RateLimited => "rate_limited",
+            Self::Deferred => "tick_budget",
+            Self::StaleIdentity => "stale_identity",
+            Self::ReadError => "read_error",
+            Self::DeleteFailed => "delete_failed",
+            Self::TimedOut => "timed_out",
+        };
+        Some(reason)
+    }
+}
+
+impl fmt::Display for RetiredExecutionPodOutcome {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// The severity the paired log event is emitted at. The metric increment is
 /// identical across levels; the level only controls log visibility.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -926,6 +984,18 @@ impl OutcomeEvent {
         // Two-tier vocabulary: no-op outcomes carry the case-specific cause in
         // `reason`; the state-change (`reaped_orphaned_restore_pod`) stands
         // alone. This reaper changes no sandbox lifecycle, so no lifecycle tags.
+        event.reason = outcome.reason().map(str::to_string);
+        event
+    }
+
+    pub fn retired_execution_pod_gc(
+        outcome: RetiredExecutionPodOutcome,
+        mode: Mode,
+        verdict: &'static str,
+    ) -> Self {
+        let mut event = Self::new(Loop::RetiredExecutionPodGc, Sweep::Main, outcome.as_str());
+        event.mode = Some(mode);
+        event.verdict = Some(verdict.to_string());
         event.reason = outcome.reason().map(str::to_string);
         event
     }

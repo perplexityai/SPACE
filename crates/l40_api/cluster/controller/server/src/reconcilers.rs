@@ -39,6 +39,7 @@ use crate::orphaned_sandboxes;
 use crate::public_operation_dispatcher;
 use crate::public_operation_retention;
 use crate::reconcile_queue_gc;
+use crate::retired_execution_pod_gc;
 use crate::snapshot_retention_sweeper;
 use crate::snapshot_storage_sweeper;
 use crate::stuck_container_creating_gc;
@@ -505,6 +506,21 @@ pub async fn run_reconcilers(
                 pool.clone(),
                 kube.clone(),
                 orphaned_restore_pod_gc::ReconcilerConfig::from_env(),
+                shutdown_token.child_token(),
+            )));
+
+            // Retired-execution pod GC: deletes sandbox pods whose execution
+            // row is already retired and that no runtime will use again — the
+            // `Succeeded` pod a node-published auto-suspend leaves behind, and
+            // the `Pending` pod a node-published activation rollback retires
+            // as `replaced` (kubelet otherwise retries its sandbox create
+            // against the retired generation forever). Pod-cache-driven with a
+            // batched Postgres lookup; needs no DB-convergence companion.
+            // Default-disabled; starts in dry-run.
+            handles.push(tokio::spawn(retired_execution_pod_gc::run(
+                pool.clone(),
+                kube.clone(),
+                retired_execution_pod_gc::ReconcilerConfig::from_env(),
                 shutdown_token.child_token(),
             )));
 
