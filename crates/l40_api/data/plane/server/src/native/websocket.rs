@@ -558,6 +558,9 @@ pub(crate) async fn bridge_process_session(
     let mut process_bound = attached.backend_process_id.is_some();
     let mut binding: Option<PendingProcessBinding> = None;
     let mut revocation_tick = revocation_check_interval(&state);
+    // A backend reopened at the live tail can skip output the process wrote
+    // meanwhile, which `process_exited` then reports as `output_truncated`.
+    let mut output_skipped = false;
 
     // Raced as a whole, as in `bridge_raw_service_session`, so a stalled
     // revocation check, route refresh, backend reopen or control RPC doesn't
@@ -620,7 +623,13 @@ pub(crate) async fn bridge_process_session(
                                 settle_process_binding(&mut binding).await?;
                             }
                             record_process_output_bytes(attached.kind.as_str(), &batch);
-                            for frame in batch.frames {
+                            for mut frame in batch.frames {
+                                if let DataPlaneServerFrame::ProcessExited {
+                                    output_truncated, ..
+                                } = &mut frame
+                                {
+                                    *output_truncated = output_skipped;
+                                }
                                 if send_server_frame(&mut sink, &frame).await.is_err() {
                                     return Ok(BridgeEnd::Completed);
                                 }
@@ -691,6 +700,7 @@ pub(crate) async fn bridge_process_session(
                                 )
                                 .await
                                 .map_err(|_| StreamBridgeError::ClientClosed)?;
+                                output_skipped = true;
                                 send_server_frame(
                                     &mut sink,
                                     &resync_required_frame(
@@ -779,6 +789,7 @@ pub(crate) async fn bridge_process_session(
                                     )
                                     .await
                                     .map_err(|_| StreamBridgeError::ClientClosed)?;
+                                    output_skipped = true;
                                     send_server_frame(
                                         &mut sink,
                                         &resync_required_frame(
