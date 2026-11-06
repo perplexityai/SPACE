@@ -17,10 +17,12 @@ from space_smoke.native_hardening import NativeHardeningFixture
 from space_smoke.native_recovery import KindNativeHardeningFixture
 from space_smoke.runtime import ScenarioContext, SmokeConfigurationError
 from space_smoke.services import SmokeServices
+from space_smoke.runtime_provisioning import RuntimeProvisioningFixture
 
 # The fixture type is the scenario's capability declaration; requesting a
 # privileged fixture narrows the backends the scenario may run on.
 FIXTURE_BACKENDS: dict[type[Any], frozenset[str]] = {
+    RuntimeProvisioningFixture: frozenset({"deployed"}),
     DirectNodeRecoveryFixture: frozenset({"deployed"}),
     NativeHardeningFixture: frozenset({"kind", "deployed"}),
     KindNativeHardeningFixture: frozenset({"kind"}),
@@ -38,6 +40,7 @@ FIXTURE_BACKENDS: dict[type[Any], frozenset[str]] = {
 # support what it asserts by contract: one that asserts sandbox pods, or forks,
 # narrows to kubernetes.
 FIXTURE_SUBSTRATES: dict[type[Any], frozenset[str]] = {
+    RuntimeProvisioningFixture: frozenset({"direct"}),
     # A standalone node, outside any cluster control plane.
     DirectNodeRecoveryFixture: frozenset({"direct"}),
     NativeHardeningFixture: frozenset({"kubernetes", "direct"}),
@@ -232,11 +235,11 @@ def scenario(
                 f"smoke {id} fixture must be one of {supported}; got "
                 f"{getattr(fixture_type, '__name__', fixture_type)!r}"
             )
-        if (fixture_type is DirectNodeRecoveryFixture) != (
+        if (fixture_type in (DirectNodeRecoveryFixture, RuntimeProvisioningFixture)) != (
             "node" in supported_surfaces
         ):
             raise TypeError("node API scenarios require DirectNodeRecoveryFixture")
-        if fixture_type is DirectNodeRecoveryFixture and supported_surfaces != {"node"}:
+        if fixture_type in (DirectNodeRecoveryFixture, RuntimeProvisioningFixture) and supported_surfaces != {"node"}:
             raise TypeError(
                 "DirectNodeRecoveryFixture requires only the node API surface"
             )

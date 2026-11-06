@@ -242,6 +242,7 @@ runpy.run_module("space_smoke", run_name="__main__")
                 "node.runtime_base_memory",
                 "node.runtime_crash_preserves_disk",
                 "node.runtime_memory_lifecycle",
+                "node.runtime_provisioning",
                 "node.runtime_survives_manager_restarts",
                 "node.windows_agent_operations",
                 "node.windows_agent_readiness",
@@ -258,6 +259,32 @@ runpy.run_module("space_smoke", run_name="__main__")
             ("ecw", "local", "native", "native_concurrency", "native_contract",
              "native_recovery", "network_policy", "node")
         )
+
+    def test_runtime_provisioning_requires_explicit_disposable_opt_in(self) -> None:
+        from space_smoke.services import SmokeServices
+
+        registered = REGISTRY.get("node.runtime_provisioning")
+        environment = {
+            "SPACE_SMOKE_BACKEND": "deployed",
+            "SPACE_SMOKE_API_SURFACE": "node",
+            "SPACE_SMOKE_SUBSTRATE": "direct",
+        }
+        with self.assertRaises(SmokeConfigurationError):
+            SmokeServices.from_environment(registered, environment)
+        environment.update({
+            "SPACE_SMOKE_LOCAL_RUNTIME_PROVISIONING": "1",
+            "SPACE_SMOKE_RUNTIME_BINARY_DIR": "/unused/binaries",
+            "SPACE_SMOKE_RUNTIME_SOURCE_DIR": "/unused/source",
+            "SPACE_SMOKE_RUNTIME_EVIDENCE_DIR": "/unused/evidence",
+            "SPACE_SMOKE_RUNTIME_WORKER_IMAGE": "fixture-worker",
+            "SPACE_SMOKE_RUNTIME_POSTGRES_IMAGE": "fixture-postgres",
+        })
+        services = SmokeServices.from_environment(registered, environment)
+        self.assertIsNotNone(services.local_runtime)
+        self.assertIsNone(services.kind)
+        self.assertIsNone(services.ecw)
+        self.assertFalse(services.owns_api_key)
+        self.assertEqual(services.api_key, "")
 
     def test_external_scenario_package_extends_the_public_inventory(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

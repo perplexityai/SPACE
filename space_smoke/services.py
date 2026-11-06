@@ -67,6 +67,11 @@ from space_smoke.runtime import (
     SubprocessExecutor,
 )
 from space_smoke.template_build import build_dedicated_template
+from space_smoke.runtime_provisioning import (
+    LocalDockerRuntimeProvisioning,
+    LocalRuntimeProvisioningConfig,
+    RuntimeProvisioningFixture,
+)
 
 
 class MissingToolError(RuntimeError):
@@ -115,6 +120,7 @@ class SmokeServices:
     native: CommandSandboxFactory | None = None
     api_surface: str = ECW_API_SURFACE
     direct_node: DirectNodeConfig | None = None
+    local_runtime: LocalDockerRuntimeProvisioning | None = None
     # Reads the Kind bench's modes for the suite. Set on the kind backend
     # whatever the fixture, unlike `kind`, which only fixtures given Kind
     # controls receive.
@@ -185,6 +191,10 @@ class SmokeServices:
         sandbox: SandboxConfig,
         sandbox_count: int = 1,
     ) -> Fixture:
+        if fixture_type is RuntimeProvisioningFixture:
+            if self.local_runtime is None:
+                raise SmokeConfigurationError("Disposable local runtime fixture is not configured")
+            return cast(Fixture, RuntimeProvisioningFixture(self.local_runtime, context))
         if fixture_type is DirectNodeRecoveryFixture:
             if self.direct_node is None:
                 raise SmokeConfigurationError("node recovery configuration is missing")
@@ -504,6 +514,21 @@ class SmokeServices:
         *,
         required_tools: Iterable[str] | None = None,
     ) -> SmokeServices:
+        if scenario.fixture_type is RuntimeProvisioningFixture:
+            values = dict(os.environ if environment is None else environment)
+            if (
+                values.get("SPACE_SMOKE_LOCAL_RUNTIME_PROVISIONING") != "1"
+                or values.get("SPACE_SMOKE_BACKEND") != DEPLOYED_BACKEND
+                or values.get("SPACE_SMOKE_API_SURFACE") != "node"
+            ):
+                raise SmokeConfigurationError("Disposable runtime fixture requires explicit node/deployed opt-in")
+            return cls(
+                kind=None, ecw=None, api_key="", owns_api_key=False,
+                api_surface="node",
+                local_runtime=LocalDockerRuntimeProvisioning(
+                    LocalRuntimeProvisioningConfig.from_environment(values)
+                ),
+            )
         if scenario.fixture_type is DirectNodeRecoveryFixture:
             values = dict(os.environ if environment is None else environment)
             if (
