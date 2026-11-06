@@ -6,6 +6,8 @@ use axum::{
     http::{HeaderMap, Method},
     routing::get,
 };
+use futures_util::FutureExt;
+use http_body_util::BodyExt;
 use pplx_space_common_core::sql;
 use pplx_space_db_test_fixtures::{SEED_ORG_ID, SEED_USER_ID, TestDbResult, pg_test_db};
 use pplx_space_public_api::{DATA_PLANE_SESSION_EVENTS_PATH_TEMPLATE, PublicSandboxId};
@@ -160,23 +162,8 @@ async fn post_command_body(
     accept: Option<&str>,
     body: &Value,
 ) -> TestDbResult<Answer> {
-    let mut request = Request::builder()
-        .method(Method::POST)
-        .uri(&fixture.commands_path)
-        .header(header::AUTHORIZATION, format!("Bearer {KEY}"))
-        .header(header::CONTENT_TYPE, "application/json");
-    if let Some(key) = idempotency_key {
-        request = request.header("idempotency-key", key);
-    }
-    if let Some(accept) = accept {
-        request = request.header(header::ACCEPT, accept);
-    }
-    let body = serde_json::to_vec(body)?;
-    let response = fixture
-        .app
-        .clone()
-        .oneshot(request.body(Body::from(body))?)
-        .await?;
+    let request = command_request(fixture, idempotency_key, accept, body)?;
+    let response = fixture.app.clone().oneshot(request).await?;
     let status = response.status();
     let content_type = response
         .headers()
@@ -189,6 +176,27 @@ async fn post_command_body(
         content_type,
         body: String::from_utf8(body.to_vec())?,
     })
+}
+
+fn command_request(
+    fixture: &Fixture,
+    idempotency_key: Option<&str>,
+    accept: Option<&str>,
+    body: &Value,
+) -> TestDbResult<Request<Body>> {
+    let mut request = Request::builder()
+        .method(Method::POST)
+        .uri(&fixture.commands_path)
+        .header(header::AUTHORIZATION, format!("Bearer {KEY}"))
+        .header(header::CONTENT_TYPE, "application/json");
+    if let Some(key) = idempotency_key {
+        request = request.header("idempotency-key", key);
+    }
+    if let Some(accept) = accept {
+        request = request.header(header::ACCEPT, accept);
+    }
+    let body = serde_json::to_vec(body)?;
+    Ok(request.body(Body::from(body))?)
 }
 
 /// Splits the relayed body into the leading `command` handle and the rest.
@@ -438,21 +446,43 @@ async fn shutdown_ends_relayed_streams() -> TestDbResult<()> {
     let shutdown = CancellationToken::new();
     let fixture = fixture(Some(CommandStreamProxy::new(&origin, shutdown.clone())?)).await?;
 
-    let answer = tokio::spawn(async move {
-        post_command(&fixture, Some("held"), Some("text/event-stream"))
-            .await
-            .map(|answer| answer.body)
-            .map_err(|error| error.to_string())
-    });
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    assert!(!answer.is_finished(), "held stream ended on its own");
+    let request = command_request(
+        &fixture,
+        Some("held"),
+        Some("text/event-stream"),
+        &json!({"command": ["echo", "hello"]}),
+    )?;
+    let response = fixture.app.clone().oneshot(request).await?;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let mut body = response.into_body();
+
+    // Read until the data plane's event has been relayed, so shutdown lands
+    // on a live relay rather than racing the stream's start.
+    let attached = b"event: attached\ndata: {}\n\n";
+    let mut received = Vec::new();
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while !received.ends_with(attached) {
+            let frame = body.frame().await.expect("held stream ended on its own")?;
+            if let Ok(data) = frame.into_data() {
+                received.extend_from_slice(&data);
+            }
+        }
+        Ok::<_, axum::Error>(())
+    })
+    .await
+    .expect("the data plane's event is relayed")?;
+    assert!(
+        body.frame().now_or_never().is_none(),
+        "held stream ended or relayed more before shutdown"
+    );
+
     shutdown.cancel();
-    let body = tokio::time::timeout(Duration::from_secs(5), answer)
+    let rest = tokio::time::timeout(Duration::from_secs(5), body.collect())
         .await
-        .expect("stream ends on shutdown")
-        .unwrap()
-        .unwrap();
-    let (_, rest) = split_command_event(&body);
+        .expect("stream ends on shutdown")?
+        .to_bytes();
+    assert!(rest.is_empty(), "relayed after shutdown: {rest:?}");
+    let (_, rest) = split_command_event(std::str::from_utf8(&received)?);
     assert_eq!(rest, "event: attached\ndata: {}\n\n");
     Ok(())
 }
