@@ -13,7 +13,8 @@
 //! environment; the first default stops every environment with no state.
 //!
 //! Not yet checked: that every node can run a new default (per-node usable
-//! environments have a column, but nothing writes it yet), that a template
+//! environments are recorded, but a default change doesn't consult them yet),
+//! that a template
 //! campaign finished before a block (campaigns don't exist yet), and which
 //! nodes can't enforce a block (node status reports each node's applied
 //! generation; refusing on it is a later change).

@@ -107,6 +107,7 @@ pub(super) async fn prepare<'a>(
 pub(super) struct PublishedExecutionObservation {
     pub status: InventoryStatus,
     pub policy: Option<pplx_space_common_core::types::ExecutionPolicyObservation>,
+    pub environments: crate::environment_observation::EnvironmentRefs,
 }
 
 pub(super) async fn publish(
@@ -116,7 +117,7 @@ pub(super) async fn publish(
     let Some(PreparedObservation { node_id, report }) = prepared else {
         return Ok(None);
     };
-    let (status, inventory) = match report {
+    let (status, inventory) = match &report {
         Report::Complete(inventory) => (InventoryStatus::Complete, Some(inventory)),
         Report::Legacy(inventory) => (InventoryStatus::Legacy, Some(inventory)),
         Report::Unavailable => (InventoryStatus::Unavailable, None),
@@ -124,6 +125,13 @@ pub(super) async fn publish(
     if let Some(inventory) = inventory {
         publish_inventory(tx, node_id, inventory).await?;
     }
+    // Environment arrays are stored only from a complete inventory; the
+    // other outcomes leave them to age out by their own receipt.
+    let environments = if let Report::Complete(inventory) = &report {
+        crate::environment_observation::publish(tx, node_id, inventory).await?
+    } else {
+        crate::environment_observation::EnvironmentRefs::Preserve
+    };
     let policy = inventory
         .and_then(|inventory| inventory.policy.as_ref())
         .and_then(|policy| {
@@ -135,7 +143,11 @@ pub(super) async fn publish(
                 }
             }
         });
-    Ok(Some(PublishedExecutionObservation { status, policy }))
+    Ok(Some(PublishedExecutionObservation {
+        status,
+        policy,
+        environments,
+    }))
 }
 
 /// Reconcile a complete inventory without rewriting unchanged artifact rows.
