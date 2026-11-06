@@ -5208,12 +5208,12 @@ async fn connect_restore_listener(
 /// Delete a k8s node row in `drain_phase = 'terminating'` and record a
 /// tombstone in the same transaction.
 ///
-/// The tombstone outlives the `node_k8s` CASCADE so the
-/// `bootstrap_k8s_origin_node` path can refuse heartbeats from a daemon
-/// running on the same physical instance during AWS `shutting-down` (the
-/// `m5d.metal` shutdown is slow and the daemon keeps publishing) as well
-/// as a recycled-IP fresh EC2 that joins under the same hostname before
-/// an operator clears the tombstone.
+/// The tombstone outlives the `node_k8s` CASCADE so node registration (the
+/// Kubernetes Node sync, the admin inventory listing and late pod placement)
+/// refuses to re-create the node while the instance is still in AWS
+/// `shutting-down` (the `m5d.metal` shutdown is slow), and for a recycled-IP
+/// fresh EC2 instance that joins under the same hostname before an operator
+/// clears the tombstone.
 pub(crate) async fn delete_terminating_node_and_record_tombstone(
     pool: &PgPool,
     node_id: NodeId,
