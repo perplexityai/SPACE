@@ -8,10 +8,29 @@ const KIB_PER_MIB: u64 = 1024;
 const BYTES_PER_MIB: u64 = 1024 * 1024;
 
 pub const DEFAULT_MEMORY_ADMISSION_RESERVE_MIB: u64 = 1024;
+pub const MAX_MEMORY_ADMISSION_COMMIT_PERCENT: u64 = 100;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MemoryAdmissionConfig {
     pub reserve_mib: u64,
+    /// Share, in percent of its cgroup `memory.max`, that admission charges
+    /// every running sandbox whatever it currently uses. Each running sandbox
+    /// is charged its current use plus at least `reserve_mib` of growth, and
+    /// at least enough growth to reach this share. 0 charges only the
+    /// `reserve_mib` growth, so guests may grow past what admission accounted
+    /// for; 100 admits no guest memory overcommit.
+    pub commit_percent: u64,
+}
+
+/// Memory of the parent cgroup that contains every sandbox cgroup. The kernel
+/// OOM-kills sandboxes when it reaches `memory.max`, even while the host still
+/// reports available memory.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SandboxParentCgroupMemory {
+    /// `memory.current` less the file cache the kernel reclaims before it
+    /// OOM-kills, matching how `MemAvailable` counts host memory.
+    used_mib: u64,
+    max_mib: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -33,6 +52,9 @@ pub(crate) struct MemoryAdmissionObservation {
     node_memory: NodeMemorySnapshot,
     observed_leases: Vec<ActiveLeaseMemoryReservation>,
     existing_growth_reserve_mib: u64,
+    /// `None` when the parent cgroup is absent, has no memory limit, or cannot
+    /// be read (logged); admission then checks host memory only.
+    parent_cgroup: Option<SandboxParentCgroupMemory>,
 }
 
 #[derive(Clone, Debug)]
@@ -74,6 +96,7 @@ impl Default for MemoryAdmissionConfig {
     fn default() -> Self {
         Self {
             reserve_mib: DEFAULT_MEMORY_ADMISSION_RESERVE_MIB,
+            commit_percent: 0,
         }
     }
 }
@@ -100,10 +123,12 @@ impl MemoryAdmissionConfig {
         let existing_growth_reserve_mib = self
             .measure_existing_growth_reserve_mib(active_leases, sources)
             .await;
+        let parent_cgroup = read_parent_cgroup_memory(&sources.firecracker_cgroup_base).await;
         Ok(MemoryAdmissionObservation {
             node_memory: memory,
             observed_leases: active_leases.to_vec(),
             existing_growth_reserve_mib,
+            parent_cgroup,
         })
     }
 
@@ -137,6 +162,7 @@ impl MemoryAdmissionConfig {
             sandbox_cgroup_memory_mib,
             existing_growth_reserve_mib,
             observation.node_memory,
+            observation.parent_cgroup,
         )
     }
 
@@ -188,11 +214,15 @@ impl MemoryAdmissionConfig {
         admitted
     }
 
+    /// Admits a new sandbox only when its cgroup demand, the growth reserve of
+    /// every running sandbox, and the reserve fit both in host memory and
+    /// under the sandbox parent cgroup's `memory.max`.
     fn check_measured_capacity(
         self,
         sandbox_cgroup_memory_mib: u64,
         existing_growth_reserve_mib: u64,
         memory: NodeMemorySnapshot,
+        parent_cgroup: Option<SandboxParentCgroupMemory>,
     ) -> Result<MemoryAdmissionMeasurement, MemoryAdmissionError> {
         let node_used_mib = memory.total_mib - memory.available_mib;
         let required_mib = node_used_mib
@@ -223,6 +253,23 @@ impl MemoryAdmissionConfig {
                 required_mib: measurement.required_mib,
             });
         }
+        if let Some(parent) = parent_cgroup {
+            let parent_required_mib = parent
+                .used_mib
+                .saturating_add(existing_growth_reserve_mib)
+                .saturating_add(sandbox_cgroup_memory_mib)
+                .saturating_add(self.reserve_mib);
+            if parent_required_mib > parent.max_mib {
+                return Err(MemoryAdmissionError::InsufficientParentCgroupCapacity {
+                    parent_cgroup_used_mib: parent.used_mib,
+                    parent_cgroup_max_mib: parent.max_mib,
+                    existing_growth_reserve_mib,
+                    sandbox_cgroup_memory_mib,
+                    reserve_mib: self.reserve_mib,
+                    required_mib: parent_required_mib,
+                });
+            }
+        }
         Ok(measurement)
     }
 
@@ -252,9 +299,22 @@ impl MemoryAdmissionConfig {
             .join(lease.sandbox_id.to_string());
         let current = read_cgroup_memory_bytes(&cgroup_path.join("memory.current")).await?;
         let maximum = read_cgroup_memory_bytes(&cgroup_path.join("memory.max")).await?;
+        // Both admission checks count reclaimable cache as free, and the
+        // sandbox may still grow into it, so charge growth from its other use.
+        let stat = tokio::fs::read_to_string(cgroup_path.join("memory.stat"))
+            .await
+            .ok()?;
+        let reclaimable_bytes = reclaimable_file_bytes(&stat)?;
+        let current = current.saturating_sub(reclaimable_bytes);
         let reserve_bytes = self.reserve_mib.checked_mul(BYTES_PER_MIB)?;
+        let committed_bytes = u64::try_from(
+            u128::from(maximum) * u128::from(self.commit_percent)
+                / u128::from(MAX_MEMORY_ADMISSION_COMMIT_PERCENT),
+        )
+        .ok()?;
+        let growth_bytes = reserve_bytes.max(committed_bytes.saturating_sub(current));
         let remaining_bytes = maximum.saturating_sub(current);
-        Some(remaining_bytes.min(reserve_bytes).div_ceil(BYTES_PER_MIB))
+        Some(remaining_bytes.min(growth_bytes).div_ceil(BYTES_PER_MIB))
     }
 }
 
@@ -266,6 +326,17 @@ pub enum MemoryAdmissionError {
     InsufficientCapacity {
         node_memory_total_mib: u64,
         node_used_mib: u64,
+        existing_growth_reserve_mib: u64,
+        sandbox_cgroup_memory_mib: u64,
+        reserve_mib: u64,
+        required_mib: u64,
+    },
+    #[error(
+        "sandbox parent cgroup uses {parent_cgroup_used_mib} MiB plus {existing_growth_reserve_mib} MiB existing Firecracker growth reserve plus new sandbox demand {sandbox_cgroup_memory_mib} MiB plus reserve {reserve_mib} MiB, requiring {required_mib} MiB above its memory.max {parent_cgroup_max_mib} MiB"
+    )]
+    InsufficientParentCgroupCapacity {
+        parent_cgroup_used_mib: u64,
+        parent_cgroup_max_mib: u64,
         existing_growth_reserve_mib: u64,
         sandbox_cgroup_memory_mib: u64,
         reserve_mib: u64,
@@ -354,6 +425,67 @@ fn parse_meminfo_field(
             field,
             line: line.to_string(),
         })
+}
+
+async fn read_parent_cgroup_memory(cgroup_base: &Path) -> Option<SandboxParentCgroupMemory> {
+    parent_cgroup_memory(cgroup_base)
+        .await
+        .unwrap_or_else(|error| {
+            tracing::warn!(
+                cgroup = %cgroup_base.display(),
+                error,
+                "cannot read sandbox parent cgroup memory; admitting against host memory only"
+            );
+            None
+        })
+}
+
+/// `Ok(None)` when the parent cgroup does not exist or has no memory limit.
+async fn parent_cgroup_memory(
+    cgroup_base: &Path,
+) -> Result<Option<SandboxParentCgroupMemory>, String> {
+    let maximum = match tokio::fs::read_to_string(cgroup_base.join("memory.max")).await {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("memory.max: {error}")),
+        Ok(maximum) if maximum.trim() == "max" => return Ok(None),
+        Ok(maximum) => parse_cgroup_value("memory.max", &maximum)?,
+    };
+    let current = tokio::fs::read_to_string(cgroup_base.join("memory.current"))
+        .await
+        .map_err(|error| format!("memory.current: {error}"))?;
+    let current = parse_cgroup_value("memory.current", &current)?;
+    let stat = tokio::fs::read_to_string(cgroup_base.join("memory.stat"))
+        .await
+        .map_err(|error| format!("memory.stat: {error}"))?;
+    let reclaimable_file = reclaimable_file_bytes(&stat)
+        .ok_or_else(|| "memory.stat: no active_file or inactive_file".to_string())?;
+    Ok(Some(SandboxParentCgroupMemory {
+        used_mib: current
+            .saturating_sub(reclaimable_file)
+            .div_ceil(BYTES_PER_MIB),
+        max_mib: maximum / BYTES_PER_MIB,
+    }))
+}
+
+fn parse_cgroup_value(file: &str, contents: &str) -> Result<u64, String> {
+    contents
+        .trim()
+        .parse()
+        .map_err(|_| format!("{file}: invalid value {:?}", contents.trim()))
+}
+
+/// File cache on the cgroup's LRU lists, which the kernel reclaims before it
+/// OOM-kills. Excludes shmem, which sits on the anonymous lists.
+fn reclaimable_file_bytes(stat: &str) -> Option<u64> {
+    Some(
+        memory_stat_field(stat, "active_file")?
+            .saturating_add(memory_stat_field(stat, "inactive_file")?),
+    )
+}
+
+fn memory_stat_field(stat: &str, field: &str) -> Option<u64> {
+    stat.lines()
+        .find_map(|line| line.strip_prefix(field)?.strip_prefix(' ')?.parse().ok())
 }
 
 async fn read_cgroup_memory_bytes(path: &Path) -> Option<u64> {
