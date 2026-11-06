@@ -95,21 +95,7 @@ pub(crate) async fn session_events(
     let sandbox_id = attached.sandbox_id;
     let stream_state = match attached.kind {
         SessionKind::Process => {
-            // Only a forged id leaves no later id to number the stream with.
-            let Some(replay) = ProcessReplayState::load(last_event_id) else {
-                pplx_space_metrics::data_plane::attach(
-                    session_id.kind().as_str(),
-                    "invalid_last_event_id",
-                );
-                return data_plane_http_error(
-                    StatusCode::BAD_REQUEST,
-                    DataPlaneHttpErrorCode::InvalidRequest,
-                    "last-event-id is past every event id this stream can send",
-                    false,
-                    ResponseOrigin::Client,
-                    ResponseKind::Validation,
-                );
-            };
+            let replay = ProcessReplayState::load(last_event_id);
             let start_permit = match state.native_sessions.try_acquire(session_id, attached.kind) {
                 Ok(permit) => permit,
                 Err(()) => {
@@ -492,31 +478,35 @@ impl ProcessReplayState {
     /// continues from the position its `Last-Event-ID` carries. A resume from
     /// an id without one also replays from the start, behind
     /// `resync_required(cursor_replay_unavailable)`, as output the client
-    /// already has may repeat. Every id the stream sends is above
-    /// `Last-Event-ID`; `None` when no id can be (see
-    /// [`ProcessEventId::first_after`]).
-    fn load(last_event_id: Option<u64>) -> Option<Self> {
+    /// already has may repeat. Every id the stream sends is above a
+    /// `Last-Event-ID` that a process stream sent. One too high for any id to
+    /// follow (see [`ProcessEventId::first_after`]) was never sent: its replay
+    /// is numbered from the start of the output, so that a resume from the
+    /// ids it does send is exact.
+    fn load(last_event_id: Option<u64>) -> Self {
         let Some(last_event_id) = last_event_id else {
-            return Some(Self {
+            return Self {
                 event_id: ProcessEventId::START,
                 backend_output_cursor: 0,
                 resync: None,
-            });
+            };
         };
         if let Some(event_id @ ProcessEventId::Position { position, .. }) =
             ProcessEventId::decode(last_event_id)
         {
-            return Some(Self {
+            return Self {
                 event_id,
                 backend_output_cursor: position,
                 resync: None,
-            });
+            };
         }
-        Some(Self {
-            event_id: ProcessEventId::first_after(last_event_id)?.next(Some(0)),
+        Self {
+            event_id: ProcessEventId::first_after(last_event_id)
+                .unwrap_or(ProcessEventId::START)
+                .next(Some(0)),
             backend_output_cursor: 0,
             resync: Some(DataPlaneResyncReason::CursorReplayUnavailable),
-        })
+        }
     }
 }
 
