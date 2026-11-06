@@ -926,3 +926,295 @@ async fn a_rolled_back_restore_keeps_its_capture_with_retirement_disabled() -> T
     );
     Ok(())
 }
+
+/// The address and role of the node a snapshot is attributed to.
+async fn snapshot_source_node(
+    pool: &sqlx::PgPool,
+    snapshot_id: SnapshotId,
+) -> TestResult<Option<(String, String)>> {
+    Ok(sqlx::query_as(sql!(
+        "SELECT host(n.address), n.role
+           FROM snapshots sn JOIN nodes n ON n.id = sn.source_node_id
+          WHERE sn.id = $1"
+    ))
+    .bind(snapshot_id)
+    .fetch_optional(pool)
+    .await?)
+}
+
+/// An execution's pod ran on one node, then a restore claim placed the row on
+/// another and was abandoned before its pod ran: the revert clears the active
+/// node and keeps that target. Tearing the first pod down captures the VM on
+/// its node, which is that capture's to upload: the target holds none of it,
+/// and refusing the pod node leaves its pod and VM up with nothing to re-drive
+/// them. The source recorded is the pod node's worker, though a builder on
+/// the same host registers under the same name and address. A newer
+/// execution that never ran leaves that so; one that ran elsewhere revokes it
+/// even where the fence doesn't run. A placed row still binds the backup to
+/// its active node.
+#[tokio::test(flavor = "current_thread")]
+async fn teardown_of_a_restore_pod_off_its_target_node_registers_from_the_pod_node() -> TestResult {
+    let Some(fixture) = cluster_fixture().await? else {
+        return Ok(());
+    };
+    let pool = &fixture.service.pool;
+    let (sandbox_id, target_ip, pod_ip) = seed_sandbox_on_source_node(pool).await?;
+    name_node(pool, pod_ip, "pod-node").await?;
+    // A builder daemon on the same host registers under the same name and
+    // address.
+    let builder = NodeId::new();
+    sqlx::query(sql!(
+        "INSERT INTO nodes (id, address, role, managed_by, state)
+             VALUES ($1, $2::INET, 'builder', 'k8s', 'ready')"
+    ))
+    .bind(builder)
+    .bind(pod_ip.to_string())
+    .execute(pool)
+    .await?;
+    sqlx::query(sql!(
+        "INSERT INTO node_k8s (node_id, k8s_node_name) VALUES ($1, 'pod-node')"
+    ))
+    .bind(builder)
+    .execute(pool)
+    .await?;
+    insert_execution_on(pool, sandbox_id, 1, true, "pod-node").await?;
+    suspend_on_source_node(pool, sandbox_id).await?;
+
+    let refused = SnapshotId::new();
+    let error = begin_teardown_backup(&fixture.service, target_ip, sandbox_id, refused, 1)
+        .await
+        .expect_err("the target node did not run the pod and holds none of its capture");
+    assert_eq!(error.code(), Code::PermissionDenied, "{error}");
+    assert_eq!(snapshot_row_count(pool, refused).await?, 0);
+
+    // The pod node uploads to the organization's storage, so it may read it.
+    let storage_from = |node_ip| {
+        fixture
+            .service
+            .get_sandbox_snapshot_storage_uri(request_from_node(
+                crate::proto::GetSandboxSnapshotStorageUriRequest {
+                    sandbox_id: sandbox_id.to_string(),
+                },
+                node_ip,
+            ))
+    };
+    storage_from(pod_ip).await?;
+
+    let capture = LocalArtifactId::new();
+    let admitted = SnapshotId::new();
+    begin_teardown_backup_of(&fixture.service, pod_ip, sandbox_id, capture, admitted, 1).await?;
+    let pod_worker = Some((pod_ip.to_string(), "worker".to_string()));
+    assert_eq!(snapshot_source_node(pool, admitted).await?, pod_worker);
+    finalize_artifact_backup_from_node(&fixture.service, pod_ip, admitted).await?;
+    assert_eq!(snapshot_state(pool, admitted).await?, "ready");
+
+    // A newer claim that failed before its pod ran doesn't move the capture.
+    insert_execution(pool, sandbox_id, 2, "failed", false).await?;
+    let after_failed_claim = SnapshotId::new();
+    begin_teardown_backup(&fixture.service, pod_ip, sandbox_id, after_failed_claim, 1).await?;
+    assert_eq!(
+        snapshot_source_node(pool, after_failed_claim).await?,
+        pod_worker
+    );
+
+    // Once its pod ran, the old pod's node no longer stands in for the
+    // target, even for a retry of bytes already registered, which the fence
+    // admits without running. The pod's UID may be gone by then; the record
+    // that it ran stays.
+    sqlx::query(sql!(
+        "UPDATE sandbox_k8s_executions SET pod_uid = NULL, pod_materialized_at = NOW()
+          WHERE sandbox_id = $1 AND generation = 2"
+    ))
+    .bind(sandbox_id)
+    .execute(pool)
+    .await?;
+    let stale = SnapshotId::new();
+    let error = begin_teardown_backup_of(&fixture.service, pod_ip, sandbox_id, capture, stale, 1)
+        .await
+        .expect_err("an older pod's node isn't the source once the sandbox ran elsewhere");
+    assert_eq!(error.code(), Code::PermissionDenied, "{error}");
+    assert_eq!(snapshot_row_count(pool, stale).await?, 0);
+    let error = storage_from(pod_ip)
+        .await
+        .expect_err("nor does it read the storage once the sandbox ran elsewhere");
+    assert_eq!(error.code(), Code::NotFound, "{error}");
+
+    place_sandbox_on_node_at(pool, sandbox_id, target_ip).await?;
+    let placed = SnapshotId::new();
+    let error = begin_teardown_backup(&fixture.service, pod_ip, sandbox_id, placed, 2)
+        .await
+        .expect_err("a placed row's backup belongs to its active node");
+    assert_eq!(error.code(), Code::PermissionDenied, "{error}");
+    assert_eq!(snapshot_row_count(pool, placed).await?, 0);
+    Ok(())
+}
+
+/// A retry of bytes the pod node already registered skips the fence, and the
+/// source is read before the transaction. A newer execution that materializes
+/// a pod in between still revokes the pod node: the registration re-reads the
+/// newer executions under lock after its insert.
+#[tokio::test(flavor = "current_thread")]
+async fn a_newer_execution_materializing_during_a_retry_revokes_the_pod_node() -> TestResult {
+    let Some(fixture) = cluster_fixture_with_max_connections(5).await? else {
+        return Ok(());
+    };
+    let pool = &fixture.service.pool;
+    let (sandbox_id, _, pod_ip) = seed_sandbox_on_source_node(pool).await?;
+    name_node(pool, pod_ip, "pod-node").await?;
+    insert_execution_on(pool, sandbox_id, 1, true, "pod-node").await?;
+    suspend_on_source_node(pool, sandbox_id).await?;
+    let capture = LocalArtifactId::new();
+    begin_teardown_backup_of(
+        &fixture.service,
+        pod_ip,
+        sandbox_id,
+        capture,
+        SnapshotId::new(),
+        1,
+    )
+    .await?;
+    insert_execution(pool, sandbox_id, 2, "creating", false).await?;
+
+    // The newer execution's pod materializes, uncommitted, while the retry runs.
+    let mut materializing = pool.begin().await?;
+    sqlx::query(sql!(
+        "UPDATE sandbox_k8s_executions SET pod_uid = 'pod-2'
+          WHERE sandbox_id = $1 AND generation = 2"
+    ))
+    .bind(sandbox_id)
+    .execute(&mut *materializing)
+    .await?;
+    let retry = SnapshotId::new();
+    let commit_once_the_retry_waits = async {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let waiting: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM pg_stat_activity
+                  WHERE datname = current_database()
+                    AND wait_event_type = 'Lock'
+                    AND query LIKE '%FROM sandbox_k8s_executions%FOR SHARE%'",
+            )
+            .fetch_one(pool)
+            .await?;
+            if waiting > 0 {
+                break;
+            }
+            if tokio::time::Instant::now() > deadline {
+                return TestResult::Err(
+                    "the retry never waited on the materializing execution".into(),
+                );
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        materializing.commit().await?;
+        Ok(())
+    };
+    let (registered, committed) = tokio::join!(
+        begin_teardown_backup_of(&fixture.service, pod_ip, sandbox_id, capture, retry, 1),
+        commit_once_the_retry_waits
+    );
+    committed?;
+    let error =
+        registered.expect_err("the pod node no longer uploads once the sandbox ran elsewhere");
+    assert_eq!(error.code(), Code::PermissionDenied, "{error}");
+    assert_eq!(snapshot_row_count(pool, retry).await?, 0);
+    let error = fixture
+        .service
+        .get_sandbox_snapshot_storage_uri(request_from_node(
+            crate::proto::GetSandboxSnapshotStorageUriRequest {
+                sandbox_id: sandbox_id.to_string(),
+            },
+            pod_ip,
+        ))
+        .await
+        .expect_err("nor does it read the storage once the newer pod ran");
+    assert_eq!(error.code(), Code::NotFound, "{error}");
+    Ok(())
+}
+
+/// When the pod ran on the target node, a newer execution materializing
+/// during a retry revokes nothing: the source is the target either way, so
+/// the retry registers without waiting on it.
+#[tokio::test(flavor = "current_thread")]
+async fn a_retry_from_the_target_registers_while_a_newer_execution_materializes() -> TestResult {
+    let Some(fixture) = cluster_fixture_with_max_connections(5).await? else {
+        return Ok(());
+    };
+    let pool = &fixture.service.pool;
+    let (sandbox_id, target_ip, _) = seed_sandbox_on_source_node(pool).await?;
+    name_node(pool, target_ip, "target-node").await?;
+    insert_execution_on(pool, sandbox_id, 1, true, "target-node").await?;
+    suspend_on_source_node(pool, sandbox_id).await?;
+    let capture = LocalArtifactId::new();
+    begin_teardown_backup_of(
+        &fixture.service,
+        target_ip,
+        sandbox_id,
+        capture,
+        SnapshotId::new(),
+        1,
+    )
+    .await?;
+    insert_execution(pool, sandbox_id, 2, "creating", false).await?;
+
+    let mut materializing = pool.begin().await?;
+    sqlx::query(sql!(
+        "UPDATE sandbox_k8s_executions SET pod_uid = 'pod-2'
+          WHERE sandbox_id = $1 AND generation = 2"
+    ))
+    .bind(sandbox_id)
+    .execute(&mut *materializing)
+    .await?;
+    let retry = SnapshotId::new();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        begin_teardown_backup_of(&fixture.service, target_ip, sandbox_id, capture, retry, 1),
+    )
+    .await
+    .map_err(|_| "the target's retry waited on the materializing execution")??;
+    materializing.commit().await?;
+    assert_eq!(
+        snapshot_source_node(pool, retry).await?,
+        Some((target_ip.to_string(), "worker".to_string()))
+    );
+    Ok(())
+}
+
+/// Pod-tracking cleanup can detach a row from every node, its active and
+/// target both NULL, with its last execution's pod still to tear down. That
+/// capture registers from the pod's node, the only one that holds it, and can
+/// become the row's newest ready snapshot. Any other node is still refused.
+#[tokio::test(flavor = "current_thread")]
+async fn a_detached_rows_teardown_registers_from_its_last_pod_node() -> TestResult {
+    let Some(fixture) = cluster_fixture().await? else {
+        return Ok(());
+    };
+    let pool = &fixture.service.pool;
+    let (sandbox_id, other_ip, pod_ip) = seed_sandbox_on_source_node(pool).await?;
+    name_node(pool, pod_ip, "pod-node").await?;
+    insert_execution_on(pool, sandbox_id, 1, true, "pod-node").await?;
+    sqlx::query(sql!(
+        "UPDATE sandboxes
+            SET lifecycle = 'suspended', placement = 'unplaced',
+                active_node_id = NULL, target_node_id = NULL
+          WHERE id = $1"
+    ))
+    .bind(sandbox_id)
+    .execute(pool)
+    .await?;
+
+    let refused = SnapshotId::new();
+    let error = begin_teardown_backup(&fixture.service, other_ip, sandbox_id, refused, 1)
+        .await
+        .expect_err("a node that didn't run the pod holds none of its capture");
+    assert_eq!(error.code(), Code::PermissionDenied, "{error}");
+    assert_eq!(snapshot_row_count(pool, refused).await?, 0);
+
+    let admitted = SnapshotId::new();
+    begin_teardown_backup(&fixture.service, pod_ip, sandbox_id, admitted, 1).await?;
+    assert_eq!(
+        snapshot_source_node(pool, admitted).await?,
+        Some((pod_ip.to_string(), "worker".to_string()))
+    );
+    Ok(())
+}

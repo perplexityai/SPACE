@@ -789,6 +789,9 @@ pub(crate) mod tests;
 mod dirty_outbox_tests;
 
 #[cfg(test)]
+mod snapshot_upload_jobs_tests;
+
+#[cfg(test)]
 mod cleanup_discovery_tests;
 
 #[cfg(test)]

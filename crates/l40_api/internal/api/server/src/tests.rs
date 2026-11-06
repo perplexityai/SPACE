@@ -4797,17 +4797,15 @@ async fn seed_suspend_snapshot_with_identity(
     let storage_uri = ExactStorageUri::parse(&storage_uri)
         .map_err(|e| tonic::Status::invalid_argument(format!("invalid storage_uri: {e}")))?;
     let execution_metadata = snapshot_execution_metadata(Some(&execution))?;
-    let snapshot = service
-        .lookup_snapshot_sandbox(sandbox_id)
-        .await?
-        .new_snapshot(
-            snapshot_id,
-            sandbox_id,
-            SnapshotKind::Full,
-            SnapshotState::Creating,
-            storage_uri,
-        )?
-        .with_execution_metadata(execution_metadata);
+    let snapshot = new_snapshot(
+        &service.lookup_snapshot_sandbox(sandbox_id, None).await?,
+        snapshot_id,
+        sandbox_id,
+        SnapshotKind::Full,
+        SnapshotState::Creating,
+        storage_uri,
+    )?
+    .with_execution_metadata(execution_metadata);
     let mut tx = service
         .pool
         .begin()
@@ -5138,6 +5136,50 @@ async fn seed_sandbox_on_source_node(
     let sandbox_id = SandboxId::new();
     seed_active_k8s_sandbox(pool, sandbox_id, source_node).await?;
     Ok((sandbox_id, source_ip, other_ip))
+}
+
+/// Record `k8s_node_name` for the registered node at `node_ip`.
+async fn name_node(
+    pool: &sqlx::PgPool,
+    node_ip: std::net::IpAddr,
+    k8s_node_name: &str,
+) -> TestResult {
+    sqlx::query(
+        "INSERT INTO node_k8s (node_id, k8s_node_name)
+         SELECT id, $2 FROM nodes WHERE host(address) = $1",
+    )
+    .bind(node_ip.to_string())
+    .bind(k8s_node_name)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+async fn insert_execution_on(
+    pool: &sqlx::PgPool,
+    sandbox_id: SandboxId,
+    generation: i64,
+    active: bool,
+    k8s_node_name: &str,
+) -> TestResult {
+    sqlx::query(
+        "INSERT INTO sandbox_k8s_executions (
+             sandbox_id, generation, pod_name, pod_namespace, state, active, k8s_node_name
+         )
+         VALUES ($1, $2, $3, 'space', $4, $5, $6)",
+    )
+    .bind(sandbox_id)
+    .bind(generation)
+    .bind(format!(
+        "space-sbx-{}-g{generation}",
+        sandbox_id.as_uuid().simple()
+    ))
+    .bind(if active { "running" } else { "replaced" })
+    .bind(active)
+    .bind(k8s_node_name)
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 /// Place the sandbox on the registered node at `node_ip`.

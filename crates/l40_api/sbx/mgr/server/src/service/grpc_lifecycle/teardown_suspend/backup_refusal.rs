@@ -75,7 +75,9 @@ pub(in crate::service::grpc_lifecycle) fn teardown_backup_verdict_status(
             return teardown_backup_superseded_status(status, generation);
         }
         RegistrationProbe::Admitted => "admitted",
+        RegistrationProbe::AdmittedUnfenced => "admitted_unfenced",
         RegistrationProbe::NotSuperseded => "not_superseded",
+        RegistrationProbe::SourceNodeRefused => "source_node_refused",
         RegistrationProbe::Unanswered => "unanswered",
     };
     let mut status = status;
@@ -103,7 +105,9 @@ pub(in crate::service::grpc_lifecycle) fn teardown_backup_drive_verdict(
         .ok()?
     {
         "admitted" => Some(RegistrationProbe::Admitted),
+        "admitted_unfenced" => Some(RegistrationProbe::AdmittedUnfenced),
         "not_superseded" => Some(RegistrationProbe::NotSuperseded),
+        "source_node_refused" => Some(RegistrationProbe::SourceNodeRefused),
         "unanswered" => Some(RegistrationProbe::Unanswered),
         _ => None,
     }
@@ -111,7 +115,10 @@ pub(in crate::service::grpc_lifecycle) fn teardown_backup_drive_verdict(
 
 /// Count and log a drive that rejoined the refused upload `job_id` after
 /// re-asking the cluster, which answered `verdict`. An admission only gets
-/// here when the drive couldn't clear the row's marker to start a new upload.
+/// here when the drive couldn't start a new upload: an artifact refusal's
+/// admission that wasn't fenced or registers without this generation, or any
+/// admission whose row marker couldn't be cleared. The reason follows the
+/// verdict, not the recorded refusal.
 pub(super) fn record_refusal_replay(
     sandbox_id: &str,
     job_id: &JobId,
@@ -122,7 +129,11 @@ pub(super) fn record_refusal_replay(
     let reason = match verdict {
         RegistrationProbe::Superseded(_) => TeardownBackupRefusalReplay::Superseded,
         RegistrationProbe::Admitted => TeardownBackupRefusalReplay::AdmittedNotCleared,
-        RegistrationProbe::NotSuperseded => TeardownBackupRefusalReplay::NotSuperseded,
+        // Neither says anything about a new attempt of a refused capture.
+        RegistrationProbe::AdmittedUnfenced | RegistrationProbe::NotSuperseded => {
+            TeardownBackupRefusalReplay::NotSuperseded
+        }
+        RegistrationProbe::SourceNodeRefused => TeardownBackupRefusalReplay::SourceNodeRefused,
         RegistrationProbe::Unanswered => TeardownBackupRefusalReplay::Unanswered,
     };
     pplx_space_metrics::sandbox::worker::teardown_suspend_backup_refusal_replayed(reason);
@@ -299,19 +310,24 @@ impl SandboxManagerService {
 
     /// The cluster's current verdict on the registration that `job`, the
     /// newest upload under the artifact's key, failed on, when that failure is
-    /// a refusal of the artifact for this generation's capture; otherwise
-    /// `None`. A refusal names a retired execution or rejects the artifact, and
-    /// only the first can stop holding. The recorded scope doesn't say which,
-    /// so re-asking tells them apart.
+    /// a refusal of the artifact, or of this node as its source, for this
+    /// generation's capture; otherwise `None`. An artifact refusal names a
+    /// retired execution or rejects the artifact, and only the first can stop
+    /// holding. The recorded scope doesn't say which, so re-asking tells them
+    /// apart. A source-node refusal stops holding once the cluster attributes
+    /// the capture to this node; only one the teardown can re-send reads as
+    /// one (see `recorded_failure_scope`).
     ///
-    /// The refused upload's payload, not the backup's origin, decides: a row
-    /// startup recovery marked `suspended` under a running teardown takes the
-    /// previously-suspended arm, yet its refused upload registered this
-    /// generation's own capture. An admission starts a new attempt only when
-    /// that attempt registers under this generation, as it does once the
-    /// capture's record or the refused upload names it (see
-    /// `ensure_teardown_suspend_backup`), so the fence that admitted the probe
-    /// runs on it too.
+    /// For an artifact refusal, the refused upload's payload, not the
+    /// backup's origin, decides: a row startup recovery marked `suspended`
+    /// under a running teardown takes the previously-suspended arm, yet its
+    /// refused upload registered this generation's own capture. Its admission
+    /// starts a new attempt only when that attempt registers under this
+    /// generation, as it does once the capture's record or the refused upload
+    /// names it (see `ensure_teardown_suspend_backup`), so the fence that
+    /// admitted the probe runs on it too. A source-node refusal's admission,
+    /// fenced or not, starts a new attempt that registers as the refused one
+    /// did.
     pub(super) async fn teardown_backup_refusal_verdict(
         &self,
         backup: &TeardownSuspendBackup<'_>,
@@ -323,10 +339,19 @@ impl SandboxManagerService {
         ) {
             return None;
         }
-        let payload = teardown_backup_payload_of(job, backup.execution_generation)?;
-        if payload.failure_scope != crate::snapshot_upload::UploadFailureScope::Artifact {
-            return None;
-        }
+        let payload = match super::recorded_failure_scope(job, backup.execution_generation) {
+            crate::snapshot_upload::UploadFailureScope::Attempt => return None,
+            crate::snapshot_upload::UploadFailureScope::Artifact => {
+                teardown_backup_payload_of(job, backup.execution_generation)?
+            }
+            // A refusal of this node binds no execution, so the refused
+            // upload asks again under whatever generation it registers with
+            // (a previously-suspended capture registers with none);
+            // `recorded_failure_scope` reads only a re-sendable one so.
+            crate::snapshot_upload::UploadFailureScope::SourceNode => job
+                .payload_as::<crate::snapshot_upload::SnapshotUploadJobs>()
+                .ok()?,
+        };
         Some(crate::snapshot_upload_jobs::prepared_begin_refused_as_superseded(&payload).await)
     }
 }

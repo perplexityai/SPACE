@@ -39,24 +39,76 @@ pub(in crate::service) enum KeyedUploadUse {
 /// under the artifact's key may start their own.
 pub(in crate::service) const PERMANENTLY_FAILED_UPLOAD_LIMIT: u64 = 2;
 
+/// The failure scope `job`'s worker recorded, as `execution_generation`'s
+/// teardown reads it. Unreadable means unrecorded, and an unrecorded scope is
+/// the attempt's.
+///
+/// A refusal of this node as the artifact's source reads as
+/// [`crate::snapshot_upload::UploadFailureScope::SourceNode`] only while the
+/// teardown can re-send the refused registration to ask again: the payload
+/// holds no transfer IDs, which mean a replay of an admitted registration,
+/// and registers under this generation or none. Any other source-node
+/// refusal is the attempt's, so it spends the attempt budget as any attempt
+/// failure does and the next drive starts a fresh, re-sendable attempt.
+/// [`crate::db::snapshot_upload_jobs::count_permanent_upload_failures_outside_scope`]
+/// leaves out of the attempt budget exactly the refusals this reads as
+/// `SourceNode`, for every payload the upload worker writes: it records one
+/// scope per job, `job_ids` as an array and `source_node_refused` as a
+/// boolean. A payload outside that shape, such as one with both a recorded
+/// artifact scope and `source_node_refused`, can be classified differently
+/// by the two.
+pub(in crate::service) fn recorded_failure_scope(
+    job: &pplx_space_common_jobs::Job,
+    execution_generation: pplx_space_common_core::types::ExecutionGeneration,
+) -> crate::snapshot_upload::UploadFailureScope {
+    use crate::snapshot_upload::UploadFailureScope;
+    #[derive(serde::Deserialize)]
+    struct RecordedScope {
+        #[serde(default)]
+        failure_scope: UploadFailureScope,
+        #[serde(default)]
+        source_node_refused: bool,
+        #[serde(default)]
+        job_ids: Vec<serde::de::IgnoredAny>,
+        #[serde(default)]
+        execution_generation: Option<pplx_space_common_core::types::ExecutionGeneration>,
+    }
+    match job.payload_as::<RecordedScope>() {
+        Ok(recorded) if recorded.source_node_refused => {
+            let resendable = recorded.job_ids.is_empty()
+                && recorded
+                    .execution_generation
+                    .is_none_or(|generation| generation == execution_generation);
+            if resendable {
+                UploadFailureScope::SourceNode
+            } else {
+                UploadFailureScope::Attempt
+            }
+        }
+        Ok(recorded) => recorded.failure_scope,
+        Err(_) => Default::default(),
+    }
+}
+
 /// The teardown's rule for the newest upload under the artifact's key, in
 /// `status` with `failure` and the `scope` its worker recorded, given
 /// `permanently_failed` uploads under the key so far, by any caller:
 ///
 /// - an active or completed upload is joined;
 /// - a retriable failure only ran out of attempts, so a new attempt follows;
-/// - a permanent failure of the artifact itself (see
-///   [`crate::snapshot_upload::UploadFailureScope`]) is joined, which makes it
-///   final unless the cluster has since stopped refusing the registration
-///   (see [`SandboxManagerService::ensure_teardown_suspend_backup`]);
+/// - a permanent failure of the artifact itself, or a refusal of this node as
+///   its source (see [`crate::snapshot_upload::UploadFailureScope`]), is
+///   joined, which makes it final unless the cluster has since stopped
+///   refusing the registration (see
+///   [`SandboxManagerService::ensure_teardown_suspend_backup`]);
 /// - a permanent failure of an attempt gets a new attempt while fewer than
 ///   [`PERMANENTLY_FAILED_UPLOAD_LIMIT`] uploads have failed permanently, and
 ///   is final after that.
 ///
 /// The limit bounds the attempt-scoped rule, so a failure recorded as the
-/// attempt's that is really the artifact's still ends. It counts no failure
-/// recorded as the artifact's: a refusal of the artifact, even one that
-/// lapses, isn't an attempt's failure. The failed jobs it counts persist across
+/// attempt's that is really the artifact's still ends. It counts only failures
+/// recorded as the attempt's: a refusal of the artifact or of this node, even
+/// one that lapses, isn't an attempt's failure. The failed jobs it counts persist across
 /// restarts until the jobs retention pruner removes them.
 pub(in crate::service) fn teardown_keyed_upload_use(
     status: pplx_space_common_jobs::JobStatus,
@@ -815,7 +867,13 @@ impl SandboxManagerService {
             // the next drive's to register again (see
             // `ensure_teardown_suspend_backup`), in either arm.
             RegistrationProbe::Superseded(_) | RegistrationProbe::Admitted => backup_lookup = None,
-            RegistrationProbe::NotSuperseded => {}
+            // An admission without the fence, like a refusal of this node,
+            // says nothing about whether the row is placed here, so the
+            // lookup decides: it finds a sandbox this node may still upload
+            // for, including on the pod node of its newest execution.
+            RegistrationProbe::AdmittedUnfenced
+            | RegistrationProbe::NotSuperseded
+            | RegistrationProbe::SourceNodeRefused => {}
         }
         self.settle_teardown_suspend_driver_failure(
             sandbox_id,
@@ -1327,6 +1385,29 @@ impl SandboxManagerService {
                                  starting a new upload");
                             None
                         }
+                        // The cluster refused this node as the backup's source and
+                        // no longer does. The refusal was about the node, not the
+                        // capture, so a new attempt of the same capture starts under
+                        // this backup's registration generation. It's fenced whenever
+                        // the capture is this execution's, which a refused fenced
+                        // attempt shows, and which for a refused unfenced one the
+                        // capture's record or the running teardown can still show.
+                        Some(
+                            probe @ (RegistrationProbe::Admitted
+                            | RegistrationProbe::AdmittedUnfenced),
+                        ) if recorded_failure_scope(&job, backup.execution_generation)
+                            == crate::snapshot_upload::UploadFailureScope::SourceNode
+                            && self.clear_teardown_suspend_backup_permanent_failure(
+                                &sandbox.id,
+                                backup.artifact.local_artifact_id,
+                            ) =>
+                        {
+                            tracing::info!(sandbox_id = %sandbox.id, job_id = %job.job_id,
+                                verdict = ?probe,
+                                "the cluster no longer refuses this node as a teardown \
+                                 backup's source; starting a new upload");
+                            None
+                        }
                         probe => {
                             if let Some(probe) = probe {
                                 record_refusal_replay(&sandbox.id, &job.job_id, probe);
@@ -1424,11 +1505,6 @@ impl SandboxManagerService {
         backup: &TeardownSuspendBackup<'_>,
         job: &pplx_space_common_jobs::Job,
     ) -> Result<KeyedUploadUse, Status> {
-        #[derive(serde::Deserialize)]
-        struct RecordedScope {
-            #[serde(default)]
-            failure_scope: crate::snapshot_upload::UploadFailureScope,
-        }
         let status = job
             .status
             .parse::<pplx_space_common_jobs::JobStatus>()
@@ -1438,10 +1514,7 @@ impl SandboxManagerService {
                     backup.artifact.local_artifact_id
                 ))
             })?;
-        // Unreadable means unrecorded, and an unrecorded scope is the attempt's.
-        let scope = job
-            .payload_as::<RecordedScope>()
-            .map_or_else(|_| Default::default(), |recorded| recorded.failure_scope);
+        let scope = recorded_failure_scope(job, backup.execution_generation);
         let permanently_failed = {
             let db = self.db_conn()?;
             crate::db::snapshot_upload_jobs::count_permanent_upload_failures_outside_scope(
@@ -1450,6 +1523,7 @@ impl SandboxManagerService {
                     backup.artifact.local_artifact_id,
                 ),
                 crate::snapshot_upload::UploadFailureScope::Artifact.as_str(),
+                backup.execution_generation,
             )
             .map_err(|error| Status::internal(format!("db error: {error}")))?
         };

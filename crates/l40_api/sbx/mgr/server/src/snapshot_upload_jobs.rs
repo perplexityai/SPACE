@@ -177,18 +177,14 @@ impl JobExecutor for SnapshotUploadExecutor {
         {
             // Best effort: an unrecorded scope reads as the attempt's, which
             // costs a later caller one doomed attempt at most.
-            if refusal.refuses_artifact
+            if let Some(scope) = refusal_failure_scope(&refusal)
                 && let Err(error) = self
                     .db
                     .lock()
                     .map_err(|_| "database mutex poisoned".to_string())
                     .and_then(|conn| {
-                        record_failure_scope(
-                            &conn,
-                            &job.job_id,
-                            crate::snapshot_upload::UploadFailureScope::Artifact,
-                        )
-                        .map_err(|error| error.to_string())
+                        record_failure_scope(&conn, &job.job_id, scope)
+                            .map_err(|error| error.to_string())
                     })
             {
                 tracing::warn!(job_id = %job.job_id, %error,
@@ -614,6 +610,9 @@ pub(crate) struct BeginRefusal {
     pub(crate) superseded_generation: Option<pplx_space_common_core::types::ExecutionGeneration>,
     /// See [`registration_refusal_is_final`].
     pub(crate) refuses_artifact: bool,
+    /// The control plane refused this node (`PermissionDenied`); see
+    /// [`crate::snapshot_upload::UploadFailureScope::SourceNode`].
+    pub(crate) refuses_source_node: bool,
 }
 
 /// Send a prepared upload's `BeginArtifactBackup`, keeping the refusal's
@@ -629,10 +628,11 @@ pub(crate) async fn begin_prepared_upload_naming_supersession(
                 error,
                 superseded_generation: None,
                 refuses_artifact: false,
+                refuses_source_node: false,
             });
         }
     };
-    let (superseded_generation, refuses_artifact) = match &refused {
+    let (superseded_generation, refuses_artifact, refuses_source_node) = match &refused {
         BeginArtifactBackupError::BeginArtifactBackup {
             superseded_generation,
             code,
@@ -640,13 +640,15 @@ pub(crate) async fn begin_prepared_upload_naming_supersession(
         } => (
             *superseded_generation,
             registration_refusal_is_final(*code, *superseded_generation),
+            *code == tonic::Code::PermissionDenied,
         ),
-        BeginArtifactBackupError::Connect(_) => (None, false),
+        BeginArtifactBackupError::Connect(_) => (None, false, false),
     };
     Err(BeginRefusal {
         error: classify_begin_error(refused),
         superseded_generation,
         refuses_artifact,
+        refuses_source_node,
     })
 }
 
@@ -659,12 +661,30 @@ pub(crate) async fn begin_prepared_upload_naming_supersession(
 /// node that isn't registered yet, `FailedPrecondition` for a node with no
 /// origin address or an attempt id reused with another identity, and
 /// authentication or authorization refusals. A caller bounds the attempts it
-/// starts after such a failure.
+/// starts after such a failure; a `PermissionDenied` is recorded as
+/// [`crate::snapshot_upload::SnapshotUploadJobs::source_node_refused`]
+/// instead.
 fn registration_refusal_is_final(
     code: tonic::Code,
     superseded_generation: Option<pplx_space_common_core::types::ExecutionGeneration>,
 ) -> bool {
     code == tonic::Code::InvalidArgument || superseded_generation.is_some()
+}
+
+/// The failure scope a refused registration records on its upload, if any:
+/// the artifact's for a refusal of the artifact, this node's for a refusal of
+/// this node as the source, and nothing, so the attempt's, otherwise.
+pub(crate) fn refusal_failure_scope(
+    refusal: &BeginRefusal,
+) -> Option<crate::snapshot_upload::UploadFailureScope> {
+    use crate::snapshot_upload::UploadFailureScope;
+    if refusal.refuses_artifact {
+        Some(UploadFailureScope::Artifact)
+    } else if refusal.refuses_source_node {
+        Some(UploadFailureScope::SourceNode)
+    } else {
+        None
+    }
 }
 
 /// Record on a failing upload's payload what its failure failed, for a later
@@ -674,7 +694,17 @@ pub(crate) fn record_failure_scope(
     job_id: &JobId,
     scope: crate::snapshot_upload::UploadFailureScope,
 ) -> crate::db::Result<usize> {
-    crate::db::snapshot_upload_jobs::set_upload_failure_scope(conn, job_id, scope.as_str())
+    use crate::snapshot_upload::UploadFailureScope;
+    match scope {
+        // Its own field, so an sbx-mgr that predates it still decodes the
+        // payload (see `SnapshotUploadJobs::source_node_refused`).
+        UploadFailureScope::SourceNode => {
+            crate::db::snapshot_upload_jobs::set_upload_source_node_refused(conn, job_id)
+        }
+        UploadFailureScope::Attempt | UploadFailureScope::Artifact => {
+            crate::db::snapshot_upload_jobs::set_upload_failure_scope(conn, job_id, scope.as_str())
+        }
+    }
 }
 
 /// What the re-sent registration says about the upload's execution.
@@ -687,14 +717,23 @@ pub(crate) enum RegistrationProbe {
     /// registration and admitted it, so the fence would admit a fresh attempt
     /// too.
     Admitted,
-    /// The control plane refused the registration without naming a
-    /// superseded generation, admitted it without running the fence, or
-    /// registered it as a server that predates verdict-only requests does; or
-    /// the payload can't make one. The fence doesn't run on a replay of an
-    /// attempt that has a row, even a failed one, or on a fresh attempt for
-    /// bytes another attempt registered, so that admission says nothing about
+    /// The control plane admitted the verdict-only registration without
+    /// running the fence: a replay of an attempt that has a row, even a
+    /// failed one, a fresh attempt for bytes another attempt registered, or a
+    /// registration with no generation. That admission says nothing about
     /// whether a new attempt would be fenced.
+    AdmittedUnfenced,
+    /// The control plane refused the registration without naming a
+    /// superseded generation or refusing this node, or registered it as a
+    /// server that predates verdict-only requests does; or the payload can't
+    /// make one.
     NotSuperseded,
+    /// The control plane refused this node (`PermissionDenied`): its
+    /// source-node check or the node auth layer. A teardown that rejoins
+    /// such a refusal keeps rejoining while this holds, and starts a new
+    /// upload once the cluster stops refusing. Like [`Self::NotSuperseded`],
+    /// it says nothing about whether the sandbox is still placed here.
+    SourceNodeRefused,
     /// No answer: cluster-api couldn't be reached, or failed in a way a retry
     /// may clear.
     Unanswered,
@@ -731,7 +770,11 @@ pub(crate) async fn prepared_begin_refused_as_superseded(
             RegistrationProbe::NotSuperseded
         }
         Ok(Ok(reply)) if reply.generation_fence_admitted => RegistrationProbe::Admitted,
-        Ok(Ok(_)) => RegistrationProbe::NotSuperseded,
+        Ok(Ok(_)) => RegistrationProbe::AdmittedUnfenced,
+        Ok(Err(BeginArtifactBackupError::BeginArtifactBackup {
+            code: tonic::Code::PermissionDenied,
+            ..
+        })) => RegistrationProbe::SourceNodeRefused,
         Ok(Err(refused)) => match classify_begin_error(refused).kind() {
             pplx_space_common_jobs::JobFailureKind::Permanent => RegistrationProbe::NotSuperseded,
             _ => RegistrationProbe::Unanswered,

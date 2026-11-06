@@ -553,6 +553,7 @@ fn new_payload_round_trips_metadata_job_flag() {
         deferred_metadata: false,
         execution_generation: None,
         failure_scope: Default::default(),
+        source_node_refused: false,
     };
     let round: SnapshotUploadJobs =
         serde_json::from_str(&serde_json::to_string(&jobs).unwrap()).unwrap();
@@ -577,6 +578,7 @@ fn payload_round_trips_execution_generation() {
         deferred_metadata: false,
         execution_generation: Some(generation),
         failure_scope: Default::default(),
+        source_node_refused: false,
     };
     let encoded = serde_json::to_value(&jobs).unwrap();
     let round: SnapshotUploadJobs = serde_json::from_value(encoded.clone()).unwrap();
@@ -612,6 +614,7 @@ fn cleanup_metadata_staging_dir_removes_only_owned_staging_dir() {
         deferred_metadata: false,
         execution_generation: None,
         failure_scope: Default::default(),
+        source_node_refused: false,
     };
 
     cleanup_metadata_staging_dir(&jobs);

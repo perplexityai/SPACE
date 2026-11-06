@@ -51,7 +51,7 @@ use tonic::{Request, Response, Status};
 use pplx_space_common_core::node_drain_signals::EVACUATION_RESTORE_READY_CHANNEL;
 use pplx_space_common_core::types::{
     ArtifactKind, ArtifactOrigin, AutoLifecyclePolicy, BackupAttemptId, Digest, ExactStorageUri,
-    ExecutionGeneration, LocalArtifactId, NodeId, NodeRole as SpaceNodeRole, OrgId, RuntimeKind,
+    ExecutionGeneration, LocalArtifactId, NodeId, NodeRole as SpaceNodeRole, RuntimeKind,
     SandboxId, SnapshotArtifact as SnapshotArtifactFile, SnapshotContentHash, SnapshotId,
     SnapshotKind, SnapshotName, SnapshotState, SubstrateKind, TemplateName,
 };
@@ -387,60 +387,34 @@ struct OriginNode {
     role: SpaceNodeRole,
 }
 
-/// Capture-time fields the `snapshots` row inherits from the source sandbox.
-#[derive(FromRow)]
-struct SnapshotSandboxRow {
-    org_id: OrgId,
-    active_node_id: Option<NodeId>,
-    target_node_id: Option<NodeId>,
-    vcpu: Option<i32>,
-    memory_mib: Option<i32>,
-    template_id: Option<String>,
-    content_hash: Option<String>,
-}
-
-impl SnapshotSandboxRow {
-    /// The node the snapshot is physically uploading **from**, recorded as
-    /// `snapshots.source_node_id`. For a fresh suspend the VM is still placed,
-    /// so `active_node_id` is the source. For a **reupload** of an
-    /// already-suspended sandbox, `active_node_id` is NULL (cleared at
-    /// suspend), but the on-disk artifacts and the reupload worker live on
-    /// `target_node_id` (preserved across suspend) — so fall back to it.
-    /// Without this, reupload snapshots get a NULL `source_node_id` and the
-    /// node-scoped in-flight-upload drain guard can't attribute them to the
-    /// node actually running the upload, letting that node be terminated
-    /// mid-reupload.
-    fn source_node_id(&self) -> Option<NodeId> {
-        self.active_node_id.or(self.target_node_id)
-    }
-
-    fn new_snapshot(
-        &self,
-        id: SnapshotId,
-        sandbox_id: SandboxId,
-        kind: SnapshotKind,
-        state: SnapshotState,
-        storage_uri: ExactStorageUri,
-    ) -> Result<snapshot_store::NewSnapshot, Status> {
-        let template_id = self
-            .template_id
-            .as_deref()
-            .map(TemplateName::parse)
-            .transpose()
-            .map_err(|error| {
-                Status::failed_precondition(format!("sandbox has invalid template_id: {error}"))
-            })?;
-        let content_hash = self
-            .content_hash
-            .clone()
-            .map(SnapshotContentHash::from_stored);
-        Ok(
-            snapshot_store::NewSnapshot::new(id, sandbox_id, kind, state, self.org_id, storage_uri)
-                .with_source_node_id(self.source_node_id())
-                .with_resources(self.vcpu, self.memory_mib)
-                .with_template(template_id, content_hash),
-        )
-    }
+/// The `snapshots` row a backup attempt of `source`'s sandbox registers,
+/// inheriting its capture-time fields and source node.
+fn new_snapshot(
+    source: &pplx_space_sandbox_store::SnapshotCaptureSource,
+    id: SnapshotId,
+    sandbox_id: SandboxId,
+    kind: SnapshotKind,
+    state: SnapshotState,
+    storage_uri: ExactStorageUri,
+) -> Result<snapshot_store::NewSnapshot, Status> {
+    let template_id = source
+        .template_id
+        .as_deref()
+        .map(TemplateName::parse)
+        .transpose()
+        .map_err(|error| {
+            Status::failed_precondition(format!("sandbox has invalid template_id: {error}"))
+        })?;
+    let content_hash = source
+        .content_hash
+        .clone()
+        .map(SnapshotContentHash::from_stored);
+    Ok(
+        snapshot_store::NewSnapshot::new(id, sandbox_id, kind, state, source.org_id, storage_uri)
+            .with_source_node_id(source.source_node_id())
+            .with_resources(source.vcpu, source.memory_mib)
+            .with_template(template_id, content_hash),
+    )
 }
 
 /// What a `GetArtifactBackupLocation` request asks. The two wire shapes are
@@ -998,17 +972,19 @@ impl ClusterApiService {
             .map(ExecutionGeneration::new)
             .transpose()
             .map_err(|e| Status::invalid_argument(format!("invalid execution_generation: {e}")))?;
-        let sandbox = self.lookup_snapshot_sandbox(sandbox_id).await?;
-        let snapshot = sandbox
-            .new_snapshot(
-                snapshot_id,
-                sandbox_id,
-                snapshot_kind,
-                SnapshotState::Creating,
-                storage_uri,
-            )?
-            .with_artifact(artifact)
-            .with_execution_metadata(execution_metadata);
+        let sandbox = self
+            .lookup_snapshot_sandbox(sandbox_id, execution_generation)
+            .await?;
+        let snapshot = new_snapshot(
+            &sandbox,
+            snapshot_id,
+            sandbox_id,
+            snapshot_kind,
+            SnapshotState::Creating,
+            storage_uri,
+        )?
+        .with_artifact(artifact)
+        .with_execution_metadata(execution_metadata);
         let mut tx = self
             .pool
             .begin()
@@ -1048,6 +1024,18 @@ impl ClusterApiService {
             )
             .await?;
             generation_fence_admitted = true;
+        }
+        if outcome == snapshot_store::InsertOutcome::Created
+            && !generation_fence_admitted
+            && sandbox.execution_node_stands_in_for_target()
+            && let Some(execution_generation) = execution_generation
+        {
+            backup_generation_fence::refuse_overtaken_execution_attribution(
+                &mut tx,
+                sandbox_id,
+                execution_generation,
+            )
+            .await?;
         }
         // Authorize on the persisted row: a replay stays bound to the node
         // that registered the attempt even after retirement or relocation,
@@ -1274,25 +1262,21 @@ impl ClusterApiService {
         }
     }
 
-    /// Shared sandbox lookup for the artifact-backup write path. Fetches
-    /// the org-scoped, capture-time fields that the `snapshots` row inherits
-    /// from the source sandbox (org_id, active_node_id, vcpu, memory_mib,
-    /// template_id, content_hash).
+    /// The artifact-backup write path's sandbox lookup: the fields the
+    /// `snapshots` row inherits, read by the sandbox's primary key, and the
+    /// pod node of `execution_generation`. `snapshot_execution_metadata`
+    /// requires caller-supplied execution metadata, so no template or
+    /// runtime-guest lookup is needed here.
     async fn lookup_snapshot_sandbox(
         &self,
         sandbox_id: SandboxId,
-    ) -> Result<SnapshotSandboxRow, Status> {
-        sqlx::query_as::<_, SnapshotSandboxRow>(sql!(
-            // A primary-key fetch is sufficient: `snapshot_execution_metadata`
-            // requires caller-supplied execution metadata, so no template or
-            // runtime-guest lookup is needed here.
-            "SELECT org_id, active_node_id, target_node_id, vcpu, memory_mib,
-                    template_id, content_hash
-             FROM sandboxes
-             WHERE id = $1"
-        ))
-        .bind(sandbox_id)
-        .fetch_optional(&self.pool)
+        execution_generation: Option<ExecutionGeneration>,
+    ) -> Result<pplx_space_sandbox_store::SnapshotCaptureSource, Status> {
+        pplx_space_sandbox_store::snapshot_capture_source(
+            &self.pool,
+            sandbox_id,
+            execution_generation,
+        )
         .await
         .map_err(|e| Status::internal(format!("sandbox lookup: {e}")))?
         .ok_or_else(|| Status::not_found(format!("sandbox {sandbox_id} not found")))
@@ -1360,9 +1344,11 @@ impl ClusterApiService {
 
     /// The registered nodes at the caller's remote address: the identity a
     /// sandbox-scoped read acts for, bound the way `validate_origin_remote_addr`
-    /// binds the node-bound RPCs. The reads these nodes make are then limited
-    /// to sandboxes placed on one of them, active there or as the target of a
-    /// pending migration or restore. A host may register more than one node
+    /// binds the node-bound RPCs. Each read these nodes make then limits
+    /// itself to sandboxes those nodes may act for: placed on one of them,
+    /// active there or as the target of a pending migration or restore, or,
+    /// for the snapshot-storage lookup, the worker that ran the newest
+    /// execution's pod on a row with no active node. A host may register more than one node
     /// (a worker and a builder), so the identity is a set; an address with no
     /// registered node is an empty set and resolves nothing. A request with no
     /// remote address is refused.
