@@ -1225,6 +1225,35 @@ wake of a running sandbox; a lifecycle action on a `restoring` sandbox,
 including a restore-lease takeover the substrate charges. Disk size is not
 recorded.
 
+## Guest memory in use
+
+Sandbox-manager records the memory each running workload's guest is using as
+the distribution `sandbox.resource.memory.guest_used_bytes`: the guest's
+`MemTotal - MemAvailable` from one `/proc/meminfo` read, in bytes. The guest
+reports it on the bridge `Ping` the health probe already sends about every 24
+to 37 seconds, so there is no separate schedule.
+
+| Tag | Values |
+| --- | --- |
+| `template` | The sandbox's template |
+
+Deployment dimensions such as `cluster_id` and `env` come from the metrics
+sink. No sandbox ID, host or `client_id` is attached.
+
+A sample is recorded once per probe whose result sandbox-manager accepts: a
+probe that crossed a lifecycle edge, or whose sandbox was removed, is
+discarded. Only a `started` sandbox that is not an idle warm-pool member
+contributes; paused, quarantined and other sandboxes, and unclaimed warm-pool
+members, do not. A guest that predates the field, the Windows guest, a guest
+that cannot read or make sense of `/proc/meminfo`, and a failed `Ping` report
+nothing, and nothing is recorded for that probe; zero is a valid sample. A
+reading is never kept or repeated.
+
+The value is telemetry, not health: a missing reading leaves the `Ping`
+successful, and high usage changes no health status. The guest is
+tenant-controlled, so the value is whatever it reports. The count of samples
+grows with running sandboxes and time, not with distinct sandboxes.
+
 ## Worker-local lifecycle populations
 
 Sandbox-manager emits `sandbox.worker.lifecycle.count` every 60 seconds from
