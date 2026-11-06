@@ -357,6 +357,9 @@ async fn teardown_keeps_execution_tracked_when_the_node_cannot_finish(
 enum BestEffortNodeFailure {
     /// Delete's node-local delete fails for an ordinary reason.
     DeleteFails,
+    /// Delete's node-local delete never answers within the teardown's wait
+    /// budget, as a node still freeing a killed guest's memory does.
+    DeleteOutlastsWaitBudget,
     /// Retire's stopped-disk backup is moot: the node has no sandbox row.
     RetireBackupMoot,
 }
@@ -365,6 +368,7 @@ enum BestEffortNodeFailure {
 /// it: the pod is deleted and tracking released.
 #[rstest::rstest]
 #[case::delete_fails(BestEffortNodeFailure::DeleteFails)]
+#[case::delete_outlasts_wait_budget(BestEffortNodeFailure::DeleteOutlastsWaitBudget)]
 #[case::retire_backup_moot(BestEffortNodeFailure::RetireBackupMoot)]
 #[tokio::test(flavor = "current_thread")]
 async fn teardown_continues_past_a_best_effort_node_failure(
@@ -386,27 +390,26 @@ async fn teardown_continues_past_a_best_effort_node_failure(
         },
     )
     .await?;
-    let (failed_method, status) = match failure {
+    let (failed_method, reply) = match failure {
         BestEffortNodeFailure::DeleteFails => (
             "WorkerApi/DeleteSandbox",
-            tonic::Status::internal("scripted delete failure"),
+            ScriptedReply::Status(tonic::Status::internal("scripted delete failure")),
         ),
+        BestEffortNodeFailure::DeleteOutlastsWaitBudget => {
+            ("WorkerApi/DeleteSandbox", ScriptedReply::Hang)
+        }
         BestEffortNodeFailure::RetireBackupMoot => (
             "WorkerApi/EnqueueSandboxArtifactBackup",
-            tonic::Status::not_found("scripted no sandbox"),
+            ScriptedReply::Status(tonic::Status::not_found("scripted no sandbox")),
         ),
     };
-    let worker = start_scripted_worker(ScriptedWorkerConfig::new([(
-        failed_method,
-        ScriptedReply::Status(status),
-    )]))
-    .await?;
+    let worker = start_scripted_worker(ScriptedWorkerConfig::new([(failed_method, reply)])).await?;
     worker
         .sim
         .ensure_default_running(&sandbox_id.to_string())
         .await?;
     let (client, log) = teardown_kube_client();
-    let substrate = substrate_with_store_client_proxy_port_and_pod(
+    let mut substrate = substrate_with_store_client_proxy_port_and_pod(
         db.pool.clone(),
         client,
         worker.port,
@@ -420,8 +423,14 @@ async fn teardown_continues_past_a_best_effort_node_failure(
         )),
     );
 
+    let node_delete_wait = Duration::from_millis(300);
+    substrate.budgets.teardown_node_delete_wait = node_delete_wait;
+
+    let started = Instant::now();
     match failure {
-        BestEffortNodeFailure::DeleteFails => substrate.delete_execution(sandbox_id).await?,
+        BestEffortNodeFailure::DeleteFails | BestEffortNodeFailure::DeleteOutlastsWaitBudget => {
+            substrate.delete_execution(sandbox_id).await?
+        }
         BestEffortNodeFailure::RetireBackupMoot => assert_eq!(
             retire(&substrate, sandbox_id).await?,
             RetireExecutionOutcome::Retired
@@ -432,6 +441,18 @@ async fn teardown_continues_past_a_best_effort_node_failure(
         !worker.received(failed_method).is_empty(),
         "{failure:?}: the failing step must have run"
     );
+    if let BestEffortNodeFailure::DeleteOutlastsWaitBudget = failure {
+        // The substrate's wait budget, not the node RPC timeout, ends the
+        // wait, so the teardown frees its dispatcher slot.
+        assert!(
+            started.elapsed() < crate::controllers::substrate::NODE_RPC_TIMEOUT,
+            "the teardown wait budget must end the node-local delete wait"
+        );
+        assert!(
+            started.elapsed() >= node_delete_wait,
+            "the teardown must wait the budget for the node-local delete"
+        );
+    }
     let deletes = requests_matching(&log, &Method::DELETE);
     assert!(
         deletes

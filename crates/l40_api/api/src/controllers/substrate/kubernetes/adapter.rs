@@ -77,6 +77,16 @@ pub(super) const POOLED_COMMAND_READY_BUDGET: Duration = Duration::from_secs(10)
 // durable before retiring the pod. Full-codec artifacts can outlive the
 // generic node-RPC budget, so this path needs its own outer deadline.
 pub(super) const TEARDOWN_SUSPEND_DURABILITY_BUDGET: Duration = Duration::from_secs(300);
+/// How long a Delete teardown waits on the node's blocking sbx-mgr Delete
+/// before it deletes the pod anyway. sbx-mgr runs per node, outside the
+/// sandbox pod, and its durable cleanup job owns the node-local retry. An
+/// UNAVAILABLE reply already continues teardown, so the wait only orders a
+/// healthy node's cleanup ahead of the pod delete. Without this cap the RPC
+/// inherits `NODE_RPC_TIMEOUT`, and a node slow to finish cgroup teardown (for
+/// example, freeing guest memory under memcg pressure) holds one of the
+/// public-operation dispatcher's execution slots the whole time. Healthy nodes
+/// finish well inside this budget.
+pub(super) const TEARDOWN_NODE_DELETE_WAIT_BUDGET: Duration = Duration::from_secs(10);
 const MAX_LOGGED_SUSPEND_PENDING_REASON_BYTES: usize = 512;
 const MAX_SUSPEND_PENDING_REASON_LOGS: u8 = 3;
 const SUSPEND_PENDING_REASON_LOG_INTERVAL: Duration = Duration::from_secs(30);
