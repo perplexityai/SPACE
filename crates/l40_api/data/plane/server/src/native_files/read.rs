@@ -52,10 +52,14 @@ pub(super) async fn read_file(
 
 async fn stat(state: &DataPlaneState, request: Request<Body>) -> Result<Response, Refusal> {
     const OPERATION: FileOperation = FileOperation::Stat;
-    let (request, body) = FileRequest::authorize(state, OPERATION, request).await?;
-    let body: FileStatRequest = json_body(&request, body).await?;
-    let user = parse_guest_user(body.user).map_err(rejected)?;
-    let path = parse_guest_path(body.path).map_err(rejected)?;
+    let (request, body) = FileRequest::receive(state, OPERATION, request).await?;
+    let checks = async {
+        let body: FileStatRequest = json_body(&request, body).await?;
+        let user = parse_guest_user(body.user).map_err(rejected)?;
+        let path = parse_guest_path(body.path).map_err(rejected)?;
+        Ok((user, path))
+    };
+    let (user, path) = request.checked(checks.await).await?;
     let call = SandboxCall::prepare(state, &request, None).await?;
     let message = stat_request(call.grant().sandbox_id, path, user.as_ref());
     let response = call
@@ -77,11 +81,15 @@ async fn stat(state: &DataPlaneState, request: Request<Body>) -> Result<Response
 
 async fn list(state: &DataPlaneState, request: Request<Body>) -> Result<Response, Refusal> {
     const OPERATION: FileOperation = FileOperation::List;
-    let (request, body) = FileRequest::authorize(state, OPERATION, request).await?;
-    let body: FileListRequest = json_body(&request, body).await?;
-    let depth = list_depth(body.depth).map_err(rejected)?;
-    let user = parse_guest_user(body.user).map_err(rejected)?;
-    let path = parse_guest_path(body.path).map_err(rejected)?;
+    let (request, body) = FileRequest::receive(state, OPERATION, request).await?;
+    let checks = async {
+        let body: FileListRequest = json_body(&request, body).await?;
+        let depth = list_depth(body.depth).map_err(rejected)?;
+        let user = parse_guest_user(body.user).map_err(rejected)?;
+        let path = parse_guest_path(body.path).map_err(rejected)?;
+        Ok((depth, user, path))
+    };
+    let (depth, user, path) = request.checked(checks.await).await?;
     let call = SandboxCall::prepare(state, &request, None).await?;
     let message = list_request(call.grant().sandbox_id, path, Some(depth), user.as_ref());
     let mut stream = call
@@ -107,19 +115,17 @@ async fn list(state: &DataPlaneState, request: Request<Body>) -> Result<Response
 
 async fn read(state: &DataPlaneState, request: Request<Body>) -> Result<Response, Refusal> {
     const OPERATION: FileOperation = FileOperation::Read;
-    let (request, body) = FileRequest::authorize(state, OPERATION, request).await?;
-    let body: FileReadRequest = json_body(&request, body).await?;
-    validate_read_length(body.length).map_err(rejected)?;
-    let user = parse_guest_user(body.user).map_err(rejected)?;
-    let path = parse_guest_path(body.path).map_err(rejected)?;
+    let (request, body) = FileRequest::receive(state, OPERATION, request).await?;
+    let checks = async {
+        let body: FileReadRequest = json_body(&request, body).await?;
+        validate_read_length(body.length).map_err(rejected)?;
+        let user = parse_guest_user(body.user).map_err(rejected)?;
+        let path = parse_guest_path(body.path).map_err(rejected)?;
+        Ok((body.offset, body.length, user, path))
+    };
+    let (offset, length, user, path) = request.checked(checks.await).await?;
     let call = SandboxCall::prepare(state, &request, None).await?;
-    let message = read_request(
-        call.grant().sandbox_id,
-        path,
-        body.offset,
-        body.length,
-        user.as_ref(),
-    );
+    let message = read_request(call.grant().sandbox_id, path, offset, length, user.as_ref());
     let stream = call
         .call(
             "spaced_read",
