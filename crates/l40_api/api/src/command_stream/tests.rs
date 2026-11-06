@@ -473,7 +473,7 @@ async fn shutdown_ends_relayed_streams() -> TestDbResult<()> {
     .expect("the data plane's event is relayed")?;
     assert!(
         body.frame().now_or_never().is_none(),
-        "held stream ended on its own"
+        "held stream ended or relayed more before shutdown"
     );
 
     shutdown.cancel();
