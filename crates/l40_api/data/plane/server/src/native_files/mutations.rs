@@ -250,7 +250,7 @@ async fn modified(state: &DataPlaneState, request: Request<Body>) -> Result<Resp
     let response = call
         .call(
             "spaced_get_modified_files",
-            Reconnect::WhenDraining,
+            Reconnect::ReadOnly,
             Some(NodeApiOperationBudget::FilesystemMetadata),
             message,
             |mut client, request| async move { client.spaced_get_modified_files(request).await },

@@ -81,6 +81,20 @@ impl ExpectedGrpcStatus {
     }
 }
 
+/// A call its caller sends once more, over a new connection, if its
+/// connection fails before the call is answered. That failure is logged as a
+/// warning, not an error: the second attempt, which is not marked, reports
+/// whether the callee could be reached.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RetriedOnTransportFailure;
+
+impl RetriedOnTransportFailure {
+    /// Mark `request` as one its caller retries after a transport failure.
+    pub fn mark<T>(self, request: &mut tonic::Request<T>) {
+        request.extensions_mut().insert(self);
+    }
+}
+
 fn expected_status_for<B>(request: &Request<B>) -> Option<tonic::Code> {
     request
         .extensions()
@@ -116,6 +130,10 @@ impl MakeClassifier for GrpcClientMakeClassifier {
         };
         GrpcClientClassifier {
             inner,
+            transport_failure_retried: request
+                .extensions()
+                .get::<RetriedOnTransportFailure>()
+                .is_some(),
             service_port_ingress: matches!(
                 path,
                 "/space.node.api.v1.WorkerApi/ServicePortIngress"
@@ -134,12 +152,15 @@ impl MakeClassifier for GrpcClientMakeClassifier {
 pub struct GrpcClientClassifier {
     inner: GrpcErrorsAsFailures,
     service_port_ingress: bool,
+    /// The request is marked [`RetriedOnTransportFailure`].
+    transport_failure_retried: bool,
 }
 
 #[derive(Clone, Debug)]
 pub struct GrpcClientEosClassifier {
     inner: GrpcEosErrorsAsFailures,
     service_port_ingress: bool,
+    transport_failure_retried: bool,
 }
 
 /// Carry the request-specific error decision to OnFailure, which cannot recover
@@ -148,6 +169,8 @@ pub struct GrpcClientEosClassifier {
 pub struct GrpcClientFailureClass {
     inner: GrpcFailureClass,
     is_error: bool,
+    /// A transport failure on a call its caller retries.
+    transport_failure_retried: bool,
 }
 
 impl GrpcClientFailureClass {
@@ -163,7 +186,20 @@ impl GrpcClientFailureClass {
             GrpcFailureClass::Error(_) => true,
             _ => true,
         };
-        Self { inner, is_error }
+        Self {
+            inner,
+            is_error,
+            transport_failure_retried: false,
+        }
+    }
+
+    /// A failure classified from a transport error rather than a status.
+    fn transport(inner: GrpcFailureClass, service_port_ingress: bool, retried: bool) -> Self {
+        let transport_failure_retried = retried && matches!(inner, GrpcFailureClass::Error(_));
+        Self {
+            transport_failure_retried,
+            ..Self::new(inner, service_port_ingress, false)
+        }
     }
 }
 
@@ -208,16 +244,17 @@ impl ClassifyResponse for GrpcClientClassifier {
                 ClassifiedResponse::RequiresEos(GrpcClientEosClassifier {
                     inner,
                     service_port_ingress: self.service_port_ingress,
+                    transport_failure_retried: self.transport_failure_retried,
                 })
             }
         }
     }
 
     fn classify_error<E: std::fmt::Display + 'static>(self, error: &E) -> Self::FailureClass {
-        GrpcClientFailureClass::new(
+        GrpcClientFailureClass::transport(
             self.inner.classify_error(error),
             self.service_port_ingress,
-            false,
+            self.transport_failure_retried,
         )
     }
 }
@@ -239,10 +276,10 @@ impl ClassifyEos for GrpcClientEosClassifier {
     }
 
     fn classify_error<E: std::fmt::Display + 'static>(self, error: &E) -> Self::FailureClass {
-        GrpcClientFailureClass::new(
+        GrpcClientFailureClass::transport(
             self.inner.classify_error(error),
             self.service_port_ingress,
-            false,
+            self.transport_failure_retried,
         )
     }
 }
@@ -448,6 +485,18 @@ impl OnFailure<GrpcClientFailureClass> for GrpcClientOnFailure {
             GrpcFailureClass::Error(error) => {
                 span.record("otel.status_code", "ERROR");
                 span.record("otel.status_description", error.as_str());
+                if failure.transport_failure_retried {
+                    tracing::warn!(
+                        target: "grpc.client",
+                        rpc_log_side = "client",
+                        grpc_error = %error,
+                        latency_ms,
+                        failure_origin = "transport",
+                        "gRPC client transport error before status was returned; \
+                         the call is retried over a new connection",
+                    );
+                    return;
+                }
                 tracing::error!(
                     target: "grpc.client",
                     rpc_log_side = "client",
