@@ -84,27 +84,31 @@ async fn run_as_console_user(
 
 /// Console session auth for the `/auth/v1` routes.
 ///
-/// With an external console authenticator installed, only a console request
-/// with an admitted assertion passes: a bearer session token is ignored, so an
-/// old password session cannot bypass the mode.
+/// With an external console authenticator installed, a console request
+/// passes only with an admitted assertion. Any other request is refused, and a
+/// bearer session token is ignored so an old password session cannot bypass
+/// the mode, unless some account is listed for password sessions: then a
+/// request without the console header authenticates with a session of a
+/// listed account as in password mode, and any other session is invalid.
 pub async fn require_auth(State(state): State<AppState>, request: Request, next: Next) -> Response {
     let pool = &state.pool;
 
     if let Some(external_console) = &state.external_console {
         let method = request.method().clone();
-        return match external_console
+        match external_console
             .resolve(pool, &method, request.headers())
             .await
         {
             ExternalConsoleAuth::Principal(principal) => {
                 let (user, org) = *principal;
-                run_as_console_user(request, next, user, org).await
+                return run_as_console_user(request, next, user, org).await;
             }
+            ExternalConsoleAuth::NotConsole if state.password_sessions_possible() => {}
             ExternalConsoleAuth::NotConsole => {
-                PublicApiError::unauthorized("Console sign-in is required").into_response()
+                return PublicApiError::unauthorized("Console sign-in is required").into_response();
             }
-            ExternalConsoleAuth::Denied(error) => error.into_response(),
-        };
+            ExternalConsoleAuth::Denied(error) => return error.into_response(),
+        }
     }
 
     let token = bearer_token(request.headers());
@@ -116,7 +120,7 @@ pub async fn require_auth(State(state): State<AppState>, request: Request, next:
         .into_response();
     };
 
-    match crate::auth::get_session_user(pool, token).await {
+    match state.session_user(token).await {
         Ok(Some((user, org))) => run_as_console_user(request, next, user, org).await,
         Ok(None) => {
             crate::routes::public::error::PublicApiError::unauthorized("Invalid or expired session")
@@ -290,8 +294,9 @@ fn federated_identity_error(
 /// from the verified assertion instead of a session. A console request is
 /// decided by its assertion alone: a missing or refused assertion is final,
 /// and an admitted one may not also present a bearer credential. Any other
-/// request may still authenticate with a service credential, but never with a
-/// session token; the proxy's assertion on it is not consulted.
+/// request may still authenticate with a service credential, and with a
+/// session token only of an account listed for password sessions; the
+/// proxy's assertion on it is not consulted.
 pub async fn require_native_auth(
     State(state): State<AppState>,
     mut request: Request,
@@ -334,8 +339,8 @@ pub async fn require_native_auth(
         .into_response();
     };
 
-    if state.external_console.is_none() {
-        match crate::auth::get_session_user(pool, token).await {
+    if state.password_sessions_possible() {
+        match state.session_user(token).await {
             Ok(Some((user, org))) => {
                 if owner_headers_present(request.headers()) {
                     return PublicApiError::forbidden("sessions may not assert an owner")

@@ -61,7 +61,7 @@ pub struct AppState {
     pub template_build_state: std::sync::Arc<crate::routes::e2b::TemplateBuildState>,
     pub federated_identity: crate::federated_identity::FederatedIdentityConfig,
     /// External console identity; `None` keeps password sessions. See
-    /// [`crate::external_console`].
+    /// [`crate::external_console`] and [`Self::session_user`].
     pub external_console: Option<crate::external_console::ExternalConsole>,
     pub data_plane_base_url: String,
     /// Relays a new command's event stream from `POST .../commands` when the
@@ -104,6 +104,56 @@ pub enum AppStateError {
 }
 
 impl AppState {
+    /// Whether any password session can authenticate a request without the
+    /// console request header: always in password mode, and in external
+    /// console mode only when some account is listed for password sessions.
+    pub(crate) fn password_sessions_possible(&self) -> bool {
+        self.external_console
+            .as_ref()
+            .is_none_or(|external_console| {
+                !external_console
+                    .settings()
+                    .password_session_emails()
+                    .is_empty()
+            })
+    }
+
+    /// Whether `email` may log in with a password and use its password
+    /// sessions on requests without the console request header: any account
+    /// in password mode, and only listed accounts in external console mode.
+    pub(crate) fn password_session_allowed(&self, email: &str) -> bool {
+        self.external_console
+            .as_ref()
+            .is_none_or(|external_console| {
+                external_console.settings().allows_password_session(email)
+            })
+    }
+
+    /// The user and organization of a live password session, or `None` when
+    /// the session is unknown, expired, or belongs to an account no longer
+    /// allowed password sessions. The list is checked here, on every request,
+    /// so removing an account from it ends that account's sessions.
+    pub(crate) async fn session_user(
+        &self,
+        raw_token: &str,
+    ) -> Result<Option<(crate::models::User, crate::models::Organization)>, sqlx::Error> {
+        let Some((user, organization)) =
+            crate::auth::get_session_user(&self.pool, raw_token).await?
+        else {
+            return Ok(None);
+        };
+        if self.external_console.is_none() {
+            return Ok(Some((user, organization)));
+        }
+        if self.password_session_allowed(&user.email) {
+            pplx_space_metrics::auth::external_console_password_session("session_accepted");
+            Ok(Some((user, organization)))
+        } else {
+            pplx_space_metrics::auth::external_console_password_session("session_refused");
+            Ok(None)
+        }
+    }
+
     #[cfg(test)]
     pub async fn from_pool(pool: PgPool) -> Result<Self, AppStateError> {
         let route_ed25519_authority =

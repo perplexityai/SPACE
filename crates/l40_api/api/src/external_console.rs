@@ -15,15 +15,22 @@
 //!   as before and their assertion, if the proxy added one, is not consulted.
 //!   A client therefore cannot gain anything by adding or omitting the
 //!   header: with it, it needs an admitted assertion; without it, a service
-//!   credential;
+//!   credential, or the password of an account listed in
+//!   [`PASSWORD_SESSION_EMAILS_ENV`];
 //! - the authenticator alone decides whether the assertion is genuine and
 //!   whether policy admits the identity; this crate never reads an unsigned
 //!   identity header and holds no provider-specific policy;
 //! - the verified email maps to an existing local SPACE user, whose own role
 //!   and organization authorize the request exactly as a password session
 //!   would. Nothing is provisioned and no role is granted;
-//! - password login, password sessions and session revocation are disabled
-//!   everywhere, so an old session token cannot bypass the mode;
+//! - password login, password sessions and session revocation are disabled,
+//!   so an old session token cannot bypass the mode, except for the accounts
+//!   listed in [`PASSWORD_SESSION_EMAILS_ENV`]: automation accounts of a test
+//!   deployment that sign in with a password. Those accounts log in and use
+//!   their sessions on requests without the console header only, the list is
+//!   checked on every request so removing an account ends its sessions, and
+//!   their sign-in bypasses the proxy's policy. Console requests still
+//!   authenticate with the assertion alone;
 //! - an assertion that is present but rejected never falls back to another
 //!   credential;
 //! - state-changing requests must come from a trusted console origin and carry
@@ -58,6 +65,15 @@ pub const PROVIDER_NAME_ENV: &str = "SPACE_EXTERNAL_CONSOLE_PROVIDER_NAME";
 /// same-origin absolute path or an `https` URL. Optional.
 pub const LOGOUT_URL_ENV: &str = "SPACE_EXTERNAL_CONSOLE_LOGOUT_URL";
 
+/// Comma-separated exact emails of local accounts that keep password login
+/// and password sessions beside the external sign-in, on requests that do not
+/// carry [`CONSOLE_REQUEST_HEADER`]. Optional, default empty: no account.
+/// Only read when an authenticator is installed; password mode always allows
+/// passwords. Meant for the automation accounts of a test deployment, such as
+/// smoke tests that sign in with a password. Their sign-in does not pass the
+/// proxy's policy, so do not list people or shared administrator accounts.
+pub const PASSWORD_SESSION_EMAILS_ENV: &str = "SPACE_EXTERNAL_CONSOLE_PASSWORD_SESSION_EMAILS";
+
 /// Header every console request sends in external mode, with the value `1`.
 /// It marks the request as a console request, authenticated by the assertion.
 /// A cross-site page cannot add a custom header without a CORS preflight, so
@@ -68,6 +84,8 @@ const DEFAULT_PROVIDER_NAME: &str = "Single sign-on";
 const MAX_PROVIDER_NAME_LEN: usize = 64;
 const MAX_LOGOUT_URL_LEN: usize = 2048;
 const MAX_TRUSTED_ORIGINS: usize = 16;
+/// An automation list, not a user directory.
+const MAX_PASSWORD_SESSION_EMAILS: usize = 16;
 
 /// Identity an [`ExternalConsoleAuthenticator`] verified and admitted for one
 /// request.
@@ -151,6 +169,8 @@ pub struct ExternalConsoleSettings {
     provider_name: String,
     logout_url: Option<String>,
     trusted_origins: Vec<String>,
+    /// Sorted and deduplicated, for [`Self::allows_password_session`].
+    password_session_emails: Vec<String>,
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -169,6 +189,12 @@ pub enum ExternalConsoleConfigError {
     InvalidProviderName,
     #[error("{LOGOUT_URL_ENV} must be a same-origin absolute path or an https URL")]
     InvalidLogoutUrl,
+    #[error(
+        "{PASSWORD_SESSION_EMAILS_ENV} entry {0:?} is not an exact email; wildcards are not accepted"
+    )]
+    InvalidPasswordSessionEmail(String),
+    #[error("{PASSWORD_SESSION_EMAILS_ENV} names more than {MAX_PASSWORD_SESSION_EMAILS} emails")]
+    TooManyPasswordSessionEmails,
 }
 
 impl ExternalConsoleSettings {
@@ -200,6 +226,7 @@ impl ExternalConsoleSettings {
             provider_name: DEFAULT_PROVIDER_NAME.to_owned(),
             logout_url: None,
             trusted_origins: origins,
+            password_session_emails: Vec::new(),
         })
     }
 
@@ -232,11 +259,42 @@ impl ExternalConsoleSettings {
         Ok(self)
     }
 
+    /// Accounts that keep password login and password sessions on requests
+    /// without the console header. See [`PASSWORD_SESSION_EMAILS_ENV`].
+    /// Entries are trimmed and blank ones skipped; anything that is not a
+    /// single exact email, such as `*`, is refused.
+    pub fn with_password_session_emails(
+        mut self,
+        emails: impl IntoIterator<Item = impl AsRef<str>>,
+    ) -> Result<Self, ExternalConsoleConfigError> {
+        let mut accepted = Vec::new();
+        for email in emails {
+            let email = email.as_ref().trim();
+            if email.is_empty() {
+                continue;
+            }
+            if !is_exact_email(email) {
+                return Err(ExternalConsoleConfigError::InvalidPasswordSessionEmail(
+                    email.to_owned(),
+                ));
+            }
+            accepted.push(email.to_owned());
+        }
+        accepted.sort();
+        accepted.dedup();
+        if accepted.len() > MAX_PASSWORD_SESSION_EMAILS {
+            return Err(ExternalConsoleConfigError::TooManyPasswordSessionEmails);
+        }
+        self.password_session_emails = accepted;
+        Ok(self)
+    }
+
     pub fn from_env() -> Result<Self, ExternalConsoleConfigError> {
         Self::from_vars(
             std::env::var(TRUSTED_ORIGINS_ENV),
             std::env::var(PROVIDER_NAME_ENV),
             std::env::var(LOGOUT_URL_ENV),
+            std::env::var(PASSWORD_SESSION_EMAILS_ENV),
         )
     }
 
@@ -244,6 +302,7 @@ impl ExternalConsoleSettings {
         trusted_origins: Result<String, std::env::VarError>,
         provider_name: Result<String, std::env::VarError>,
         logout_url: Result<String, std::env::VarError>,
+        password_session_emails: Result<String, std::env::VarError>,
     ) -> Result<Self, ExternalConsoleConfigError> {
         let value = |name, value: Result<String, std::env::VarError>| match value {
             Ok(value) => Ok(value),
@@ -255,6 +314,7 @@ impl ExternalConsoleSettings {
         let trusted_origins = value(TRUSTED_ORIGINS_ENV, trusted_origins)?;
         let provider_name = value(PROVIDER_NAME_ENV, provider_name)?;
         let logout_url = value(LOGOUT_URL_ENV, logout_url)?;
+        let password_session_emails = value(PASSWORD_SESSION_EMAILS_ENV, password_session_emails)?;
 
         let mut settings = Self::new(trusted_origins.split(','))?;
         if !provider_name.trim().is_empty() {
@@ -263,7 +323,7 @@ impl ExternalConsoleSettings {
         if !logout_url.trim().is_empty() {
             settings = settings.with_logout_url(logout_url)?;
         }
-        Ok(settings)
+        settings.with_password_session_emails(password_session_emails.split(','))
     }
 
     pub fn provider_name(&self) -> &str {
@@ -277,6 +337,35 @@ impl ExternalConsoleSettings {
     pub fn trusted_origins(&self) -> &[String] {
         &self.trusted_origins
     }
+
+    /// The accounts listed in [`PASSWORD_SESSION_EMAILS_ENV`], sorted.
+    pub fn password_session_emails(&self) -> &[String] {
+        &self.password_session_emails
+    }
+
+    /// Whether `email` exactly matches an account listed in
+    /// [`PASSWORD_SESSION_EMAILS_ENV`]. Emails are compared exactly, as the
+    /// login and the console's identity mapping compare them.
+    pub fn allows_password_session(&self, email: &str) -> bool {
+        self.password_session_emails
+            .binary_search_by(|listed| listed.as_str().cmp(email))
+            .is_ok()
+    }
+}
+
+/// One exact address: a single `@` with text on both sides, no whitespace,
+/// separators or wildcard characters. Deliverability is not checked; the
+/// address only has to name a local account exactly.
+fn is_exact_email(email: &str) -> bool {
+    let Some((local, domain)) = email.split_once('@') else {
+        return false;
+    };
+    !local.is_empty()
+        && !domain.is_empty()
+        && !domain.contains('@')
+        && !email
+            .chars()
+            .any(|c| c.is_whitespace() || c.is_control() || matches!(c, '*' | '?' | ',' | ';'))
 }
 
 /// `scheme://host[:port]` exactly as a browser sends it in `Origin`: `http`
@@ -346,8 +435,10 @@ impl fmt::Debug for ExternalConsole {
 
 /// How a console gate resolved a request in external mode.
 pub(crate) enum ExternalConsoleAuth {
-    /// Not a console request: the console gates refuse; the native gate may
-    /// still accept a service credential.
+    /// Not a console request: the console gates refuse unless some account
+    /// is listed for password sessions, and then accept only a listed
+    /// account's session; the native gate may still accept a service
+    /// credential.
     NotConsole,
     /// The verified identity's SPACE user and organization.
     Principal(Box<(User, Organization)>),

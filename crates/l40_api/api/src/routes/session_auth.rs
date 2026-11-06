@@ -13,8 +13,8 @@ use uuid::Uuid;
 
 use super::AppState;
 use crate::{
-    auth::{generate_session_token, hash_token, verify_password},
-    external_console::ConsoleAuthConfig,
+    auth::{generate_session_token, hash_token},
+    external_console::{ConsoleAuthConfig, is_console_request},
     middleware::auth::{AuthOrg, AuthUser, bearer_token, require_auth},
     models::{Cluster, LoginRequest, LoginResponse, Organization, User},
 };
@@ -50,14 +50,17 @@ enum AuthRouteError {
     InvalidCredentials,
     #[error("Missing or invalid Authorization header")]
     MissingBearerToken,
-    /// External console mode: identity comes from the console's sign-in
-    /// provider, so this process issues no password sessions.
+    /// External console mode, for a console request or an account not
+    /// listed for password sessions: identity comes from the console's
+    /// sign-in provider, so this process issues it no password session.
     #[error("Password sign-in is disabled; sign in through the console's identity provider")]
     PasswordLoginDisabled,
     #[error("Internal server error")]
     Internal(#[source] sqlx::Error),
     #[error("Internal server error")]
     Password(#[from] bcrypt::BcryptError),
+    #[error("Internal server error")]
+    Verifier(#[from] crate::auth::VerifierUnavailable),
     /// A statement lost a race for a lock. The login path reads `users` and
     /// inserts a `sessions` row, and the session delete takes a row lock, so
     /// any of them can abort with `55P03` under the role-level bound; the
@@ -88,7 +91,9 @@ impl AuthRouteError {
         match self {
             Self::InvalidCredentials | Self::MissingBearerToken => StatusCode::UNAUTHORIZED,
             Self::PasswordLoginDisabled => StatusCode::FORBIDDEN,
-            Self::Internal(_) | Self::Password(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::Internal(_) | Self::Password(_) | Self::Verifier(_) => {
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
             Self::Contended => StatusCode::SERVICE_UNAVAILABLE,
         }
     }
@@ -148,14 +153,32 @@ async fn auth_config(State(state): State<AppState>) -> Response {
 
 async fn create_session(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(request): Json<LoginRequest>,
 ) -> Result<Json<LoginResponse>, AuthRouteError> {
-    if state.external_console.is_some() {
+    if state.external_console.is_none() {
+        return Ok(Json(
+            create_session_for_password(&state.pool, request).await?,
+        ));
+    }
+    // A console request in external mode authenticates with its assertion
+    // alone, so it never obtains a password session. Any other login must
+    // name a listed account; that is decided before the database is read, so
+    // an unlisted email is refused the same way and in the same time whether
+    // or not the account exists.
+    if is_console_request(&headers) || !state.password_session_allowed(&request.email) {
+        pplx_space_metrics::auth::external_console_password_session("login_refused");
         return Err(AuthRouteError::PasswordLoginDisabled);
     }
-    Ok(Json(
-        create_session_for_password(&state.pool, request).await?,
-    ))
+    let result = create_session_for_password(&state.pool, request).await;
+    match &result {
+        Ok(_) => pplx_space_metrics::auth::external_console_password_session("login_accepted"),
+        Err(AuthRouteError::InvalidCredentials) => {
+            pplx_space_metrics::auth::external_console_password_session("login_invalid");
+        }
+        Err(_) => {}
+    }
+    Ok(Json(result?))
 }
 
 async fn me(
@@ -178,11 +201,16 @@ async fn delete_current_session(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<StatusCode, AuthRouteError> {
-    // External console mode has no SPACE session to revoke: the console ends
-    // the provider session through its logout URL. A bearer token sent
-    // anyway is left alone, because this request did not authenticate with
-    // it.
-    if state.external_console.is_some() {
+    // A console request in external mode has no SPACE session to revoke: the
+    // console ends the provider session through its logout URL. A bearer
+    // token sent anyway is left alone, because this request did not
+    // authenticate with it. With accounts listed for password sessions, a
+    // request without the console header authenticated with a listed
+    // account's bearer session in `require_auth`, so that session is the one
+    // to revoke.
+    if state.external_console.is_some()
+        && (is_console_request(&headers) || !state.password_sessions_possible())
+    {
         return Ok(StatusCode::NO_CONTENT);
     }
     let token = bearer_token(&headers).ok_or(AuthRouteError::MissingBearerToken)?;
@@ -194,6 +222,9 @@ async fn create_session_for_password(
     pool: &PgPool,
     request: LoginRequest,
 ) -> Result<LoginResponse, AuthRouteError> {
+    // Taken before the transaction, so a login waiting for a slot holds no
+    // connection or lock; released when the password check ends.
+    let slot = crate::auth::password_verification_slot().await?;
     let mut tx = pool.begin().await?;
     // Hold the password read through session insertion so resets revoke every
     // session authenticated with the old password.
@@ -207,7 +238,12 @@ async fn create_session_for_password(
     };
 
     if !user.password_login_configured()
-        || !verify_password(&request.password, &user.password_hash)?
+        || !crate::auth::verify_password_blocking(
+            request.password,
+            user.password_hash.clone(),
+            slot,
+        )
+        .await??
     {
         return Err(AuthRouteError::InvalidCredentials);
     }

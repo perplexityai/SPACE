@@ -20,8 +20,8 @@ use uuid::Uuid;
 use super::{
     AuthenticateFuture, CONSOLE_REQUEST_HEADER, ConsoleAuthConfig, ExternalConsole,
     ExternalConsoleAssertion, ExternalConsoleAuthenticator, ExternalConsoleConfigError,
-    ExternalConsoleIdentity, ExternalConsoleRejection, ExternalConsoleSettings, OriginRefusal,
-    is_console_request,
+    ExternalConsoleIdentity, ExternalConsoleRejection, ExternalConsoleSettings,
+    MAX_PASSWORD_SESSION_EMAILS, OriginRefusal, is_console_request,
 };
 use crate::routes::AppState;
 
@@ -45,13 +45,13 @@ fn unset() -> Result<String, std::env::VarError> {
 fn settings_require_at_least_one_trusted_origin() {
     for value in ["", " ", ",", " , "] {
         assert_eq!(
-            ExternalConsoleSettings::from_vars(var(value), unset(), unset()),
+            ExternalConsoleSettings::from_vars(var(value), unset(), unset(), unset()),
             Err(ExternalConsoleConfigError::NoTrustedOrigins),
             "{value:?}"
         );
     }
     assert_eq!(
-        ExternalConsoleSettings::from_vars(unset(), unset(), unset()),
+        ExternalConsoleSettings::from_vars(unset(), unset(), unset(), unset()),
         Err(ExternalConsoleConfigError::NoTrustedOrigins)
     );
 }
@@ -102,6 +102,7 @@ fn settings_parse_the_environment_contract() -> TestResult {
         var(" https://a.example.test , https://b.example.test,https://a.example.test "),
         var("  Company SSO  "),
         var(" /sso/logout "),
+        var(" smoke@local , ,robot@example.test,smoke@local "),
     )?;
     assert_eq!(
         settings.trusted_origins(),
@@ -109,10 +110,82 @@ fn settings_parse_the_environment_contract() -> TestResult {
     );
     assert_eq!(settings.provider_name(), "Company SSO");
     assert_eq!(settings.logout_url(), Some("/sso/logout"));
+    assert_eq!(
+        settings.password_session_emails(),
+        ["robot@example.test", "smoke@local"]
+    );
+    assert!(settings.allows_password_session("smoke@local"));
+    assert!(settings.allows_password_session("robot@example.test"));
+    // Exact match only, as the login and the identity mapping compare.
+    for email in [
+        "Smoke@local",
+        " smoke@local",
+        "smoke@local.",
+        "other@local",
+        "",
+    ] {
+        assert!(!settings.allows_password_session(email), "{email:?}");
+    }
 
-    let defaults = ExternalConsoleSettings::from_vars(var(CONSOLE_ORIGIN), unset(), var(" "))?;
+    let defaults =
+        ExternalConsoleSettings::from_vars(var(CONSOLE_ORIGIN), unset(), var(" "), unset())?;
     assert_eq!(defaults.provider_name(), "Single sign-on");
     assert_eq!(defaults.logout_url(), None);
+    assert!(defaults.password_session_emails().is_empty());
+    assert!(
+        ExternalConsoleSettings::new([CONSOLE_ORIGIN])?
+            .password_session_emails()
+            .is_empty(),
+        "no account keeps password sessions unless listed"
+    );
+    for value in ["", " ", " , ,"] {
+        let settings =
+            ExternalConsoleSettings::from_vars(var(CONSOLE_ORIGIN), unset(), unset(), var(value))?;
+        assert!(settings.password_session_emails().is_empty(), "{value:?}");
+    }
+    Ok(())
+}
+
+#[test]
+fn settings_refuse_password_session_entries_that_are_not_exact_emails() -> TestResult {
+    let parse = |value: &str| {
+        ExternalConsoleSettings::from_vars(var(CONSOLE_ORIGIN), unset(), unset(), var(value))
+            .map(|settings| settings.password_session_emails().to_vec())
+    };
+    // A wildcard or a malformed entry must fail startup rather than list
+    // more, or other, accounts than intended.
+    for entry in [
+        "*",
+        "*@example.test",
+        "smoke@*",
+        "smoke?@local",
+        "smoke",
+        "@local",
+        "smoke@",
+        "smoke@local@local",
+        "smoke @local",
+        "smoke@local;robot@local",
+        "smoke\t@local",
+    ] {
+        assert_eq!(
+            parse(&format!("ok@local,{entry}")),
+            Err(ExternalConsoleConfigError::InvalidPasswordSessionEmail(
+                entry.trim().to_owned()
+            )),
+            "{entry:?}"
+        );
+    }
+    let many = (0..=MAX_PASSWORD_SESSION_EMAILS)
+        .map(|n| format!("robot-{n}@local"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        parse(&many.join(",")),
+        Err(ExternalConsoleConfigError::TooManyPasswordSessionEmails)
+    );
+    assert_eq!(
+        parse(&many[1..].join(",")).map(|emails| emails.len()),
+        Ok(MAX_PASSWORD_SESSION_EMAILS)
+    );
     Ok(())
 }
 
@@ -346,6 +419,7 @@ struct Seeded {
     member_id: UserId,
     member_password: String,
     member_session: String,
+    admin_password: String,
     locked_member_email: String,
     federated_email: String,
     disabled_service_email: String,
@@ -356,6 +430,8 @@ struct Seeded {
 struct Fixture {
     password_state: AppState,
     external_state: AppState,
+    /// External mode with password sessions for the member account only.
+    mixed_state: AppState,
     seeded: Seeded,
     _db: TestDb,
 }
@@ -384,6 +460,34 @@ impl Fixture {
     fn password_shared(&self) -> Router {
         crate::routes::shared_host_router(self.password_state.clone())
     }
+
+    fn mixed_public(&self) -> Router {
+        crate::routes::router(self.mixed_state.clone())
+    }
+
+    fn mixed_admin(&self) -> Router {
+        crate::routes::dedicated_admin_router(self.mixed_state.clone())
+    }
+
+    fn mixed_shared(&self) -> Router {
+        crate::routes::shared_host_router(self.mixed_state.clone())
+    }
+
+    /// External mode with password sessions for exactly `emails`, over the
+    /// same database as the other states.
+    fn listing(&self, emails: &[&str]) -> TestResult<AppState> {
+        let mut state = self.password_state.clone();
+        state.external_console = Some(console(
+            external_settings()?.with_password_session_emails(emails)?,
+        ));
+        Ok(state)
+    }
+}
+
+fn external_settings() -> TestResult<ExternalConsoleSettings> {
+    Ok(ExternalConsoleSettings::new([CONSOLE_ORIGIN])?
+        .with_provider_name("Company SSO")?
+        .with_logout_url("/sso/logout")?)
 }
 
 async fn fixture() -> TestResult<Fixture> {
@@ -439,16 +543,16 @@ async fn fixture() -> TestResult<Fixture> {
 
     let password_state = AppState::from_pool(pool.clone()).await?;
     let mut external_state = password_state.clone();
-    external_state.external_console = Some(ExternalConsole::new(
-        Arc::new(HeaderAuthenticator),
-        ExternalConsoleSettings::new([CONSOLE_ORIGIN])?
-            .with_provider_name("Company SSO")?
-            .with_logout_url("/sso/logout")?,
+    external_state.external_console = Some(console(external_settings()?));
+    let mut mixed_state = password_state.clone();
+    mixed_state.external_console = Some(console(
+        external_settings()?.with_password_session_emails([member_email.as_str()])?,
     ));
 
     Ok(Fixture {
         password_state,
         external_state,
+        mixed_state,
         seeded: Seeded {
             admin_email,
             admin_id,
@@ -457,6 +561,7 @@ async fn fixture() -> TestResult<Fixture> {
             member_id,
             member_password,
             member_session,
+            admin_password,
             locked_member_email,
             federated_email,
             disabled_service_email,
@@ -565,6 +670,15 @@ async fn session_exists(pool: &PgPool, token: &str) -> TestResult<bool> {
     .bind(crate::auth::hash_token(token))
     .fetch_one(pool)
     .await?)
+}
+
+async fn session_count(pool: &PgPool, user_id: UserId) -> TestResult<i64> {
+    Ok(
+        sqlx::query_scalar::<_, i64>(sql!("SELECT COUNT(*) FROM sessions WHERE user_id = $1"))
+            .bind(user_id)
+            .fetch_one(pool)
+            .await?,
+    )
 }
 
 /// One request: method, path, and headers.
@@ -1122,6 +1236,506 @@ async fn machine_credentials_keep_working_in_external_mode() -> TestResult {
         .send(fixture.public())
         .await?;
     assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_empty_list_allows_no_password_session() -> TestResult {
+    let fixture = fixture().await?;
+    let seeded = &fixture.seeded;
+    // Failure messages name each case by its label. Passwords are looked up
+    // apart from the cases, so no message is built from a value holding one.
+    let cases = [
+        ("admin", seeded.admin_email.as_str()),
+        ("member", seeded.member_email.as_str()),
+        ("unknown", "nobody@example.test"),
+    ];
+    let password_for = |label: &str| match label {
+        "admin" => seeded.admin_password.as_str(),
+        "member" => seeded.member_password.as_str(),
+        _ => "any-password",
+    };
+
+    // Every way a deployment can end up with no listed account: the variable
+    // unset, empty, or only separators, and the builder given nothing. None
+    // may mean "every account".
+    let mut states = Vec::new();
+    for value in [None, Some(""), Some(" "), Some(" , ,")] {
+        let settings = ExternalConsoleSettings::from_vars(
+            var(CONSOLE_ORIGIN),
+            unset(),
+            unset(),
+            value.map_or_else(unset, var),
+        )?;
+        assert!(settings.password_session_emails().is_empty(), "{value:?}");
+        for (label, email) in cases {
+            assert!(
+                !settings.allows_password_session(email),
+                "{value:?}: {label}"
+            );
+        }
+        for probe in ["", "*", "@", ","] {
+            assert!(
+                !settings.allows_password_session(probe),
+                "{value:?}: {probe:?}"
+            );
+        }
+        let mut state = fixture.password_state.clone();
+        state.external_console = Some(console(settings));
+        states.push(state);
+    }
+    states.push(fixture.listing(&[])?);
+    states.push(fixture.listing(&["", " "])?);
+
+    for state in states {
+        assert!(!state.password_sessions_possible());
+        let routers = [
+            crate::routes::router(state.clone()),
+            crate::routes::dedicated_admin_router(state.clone()),
+            crate::routes::shared_host_router(state.clone()),
+        ];
+        // Login is refused for every account, right password or not.
+        for app in &routers {
+            for (label, email) in cases {
+                let password = password_for(label);
+                let (status, body) = Call::new(Method::POST, "/auth/v1/sessions")
+                    .json(serde_json::json!({ "email": email, "password": password }))
+                    .send(app.clone())
+                    .await?;
+                assert_eq!(status, StatusCode::FORBIDDEN, "{label}: {body}");
+                assert!(body.get("token").is_none(), "{body}");
+            }
+        }
+        // Existing sessions of every account authenticate nothing.
+        for (app, uri) in [
+            (&routers[0], "/auth/v1/me"),
+            (&routers[0], "/auth/v1/cluster"),
+            (&routers[0], "/api/v1/sandboxes"),
+            (&routers[1], "/auth/v1/me"),
+            (&routers[1], "/admin/api/v1/orgs"),
+            (&routers[2], "/api/v1/sandboxes"),
+            (&routers[2], "/admin/api/v1/orgs"),
+        ] {
+            for token in [&seeded.admin_session, &seeded.member_session] {
+                let (status, body) = Call::get(uri).bearer(token).send(app.clone()).await?;
+                assert_eq!(status, StatusCode::UNAUTHORIZED, "{uri}: {body}");
+            }
+        }
+        // Logout with a session revokes nothing.
+        let (status, _) = Call::new(Method::DELETE, "/auth/v1/session")
+            .bearer(&seeded.admin_session)
+            .send(routers[0].clone())
+            .await?;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+    assert_eq!(
+        session_count(&fixture.password_state.pool, seeded.admin_id).await?,
+        1
+    );
+    assert_eq!(
+        session_count(&fixture.password_state.pool, seeded.member_id).await?,
+        1
+    );
+    assert!(session_exists(&fixture.password_state.pool, &seeded.admin_session).await?);
+    Ok(())
+}
+
+#[tokio::test]
+async fn listed_password_sessions_work_beside_external_sign_in() -> TestResult {
+    let fixture = fixture().await?;
+    let seeded = &fixture.seeded;
+    let both = fixture.listing(&[&seeded.member_email, &seeded.admin_email])?;
+
+    // The console still chooses the external flow.
+    for app in [
+        fixture.mixed_public(),
+        fixture.mixed_admin(),
+        fixture.mixed_shared(),
+    ] {
+        let (status, body) = Call::get("/auth/v1/config").send(app).await?;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["mode"], "external", "{body}");
+    }
+
+    let (status, body) = Call::new(Method::POST, "/auth/v1/sessions")
+        .json(serde_json::json!({
+            "email": seeded.member_email,
+            "password": seeded.member_password,
+        }))
+        .send(fixture.mixed_public())
+        .await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let issued = body["token"]
+        .as_str()
+        .ok_or("login returned no token")?
+        .to_owned();
+
+    for (app, uri, token, expected) in [
+        (
+            fixture.mixed_public(),
+            "/auth/v1/me",
+            &issued,
+            StatusCode::OK,
+        ),
+        (
+            fixture.mixed_public(),
+            "/auth/v1/cluster",
+            &issued,
+            StatusCode::OK,
+        ),
+        (
+            fixture.mixed_public(),
+            "/api/v1/sandboxes",
+            &issued,
+            StatusCode::OK,
+        ),
+        (
+            fixture.mixed_shared(),
+            "/api/v1/sandboxes",
+            &issued,
+            StatusCode::OK,
+        ),
+        // A listed administrator's session reaches the admin API.
+        (
+            crate::routes::dedicated_admin_router(both.clone()),
+            "/auth/v1/me",
+            &seeded.admin_session,
+            StatusCode::OK,
+        ),
+        (
+            crate::routes::dedicated_admin_router(both.clone()),
+            "/admin/api/v1/orgs",
+            &seeded.admin_session,
+            StatusCode::OK,
+        ),
+        (
+            crate::routes::shared_host_router(both.clone()),
+            "/admin/api/v1/orgs",
+            &seeded.admin_session,
+            StatusCode::OK,
+        ),
+        // The session's own role still authorizes the request.
+        (
+            fixture.mixed_admin(),
+            "/admin/api/v1/orgs",
+            &issued,
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            fixture.mixed_public(),
+            "/auth/v1/me",
+            &"not-a-session".to_owned(),
+            StatusCode::UNAUTHORIZED,
+        ),
+    ] {
+        let (status, body) = Call::get(uri).bearer(token).send(app).await?;
+        assert_eq!(status, expected, "{uri}: {body}");
+    }
+    let (status, body) = Call::get("/auth/v1/me")
+        .bearer(&issued)
+        .send(fixture.mixed_public())
+        .await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(user_id_of(&body), Some(seeded.member_id.to_string()));
+
+    // The authenticator is not consulted for a request without the console
+    // header, so a listed account's session works whatever a proxy attached:
+    // the provider's policy does not apply to listed accounts.
+    for assertion in ["forbidden", "invalid", "unavailable"] {
+        let (status, body) = Call::get("/auth/v1/me")
+            .machine_assertion(assertion)
+            .bearer(&issued)
+            .send(fixture.mixed_public())
+            .await?;
+        assert_eq!(status, StatusCode::OK, "{assertion}: {body}");
+    }
+
+    // Machine credentials are unaffected.
+    let (status, body) = Call::get("/api/v1/sandboxes")
+        .bearer(&seeded.native_key)
+        .send(fixture.mixed_public())
+        .await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = Call::get("/e2b/api/sandboxes")
+        .header("x-api-key", seeded.ecw_key.clone())
+        .send(fixture.mixed_shared())
+        .await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // A session issued while allowed stops authenticating once it is not.
+    let (status, body) = Call::get("/auth/v1/me")
+        .bearer(&issued)
+        .send(fixture.public())
+        .await?;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+
+    // Logout without the console header revokes the session it used.
+    let (status, body) = Call::new(Method::DELETE, "/auth/v1/session")
+        .bearer(&issued)
+        .send(fixture.mixed_public())
+        .await?;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    assert!(!session_exists(&fixture.mixed_state.pool, &issued).await?);
+    let (status, _) = Call::get("/auth/v1/me")
+        .bearer(&issued)
+        .send(fixture.mixed_public())
+        .await?;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    Ok(())
+}
+
+#[tokio::test]
+async fn unlisted_accounts_get_no_password_sessions() -> TestResult {
+    let fixture = fixture().await?;
+    let seeded = &fixture.seeded;
+
+    // An unlisted account is refused before its password is checked, the
+    // same way whether the password is right, wrong, or the account does
+    // not exist, and with or without an assertion beside it.
+    let mut refusals = Vec::new();
+    // Failure messages name each case by its label. Passwords are looked up
+    // apart from the cases, so no message is built from a value holding one.
+    let password_for = |label: &str| match label {
+        "admin, right password" => seeded.admin_password.as_str(),
+        _ => "wrong-password",
+    };
+    for (label, email) in [
+        ("admin, right password", seeded.admin_email.as_str()),
+        ("admin, wrong password", seeded.admin_email.as_str()),
+        ("unknown", "nobody@example.test"),
+    ] {
+        let password = password_for(label);
+        for assertion in [None, Some("forbidden")] {
+            for app in [
+                fixture.mixed_public(),
+                fixture.mixed_admin(),
+                fixture.mixed_shared(),
+            ] {
+                let mut call = Call::new(Method::POST, "/auth/v1/sessions");
+                if let Some(assertion) = assertion {
+                    call = call.machine_assertion(assertion);
+                }
+                let (status, body) = call
+                    .json(serde_json::json!({ "email": email, "password": password }))
+                    .send(app)
+                    .await?;
+                assert_eq!(status, StatusCode::FORBIDDEN, "{label}: {body}");
+                assert!(body.get("token").is_none(), "{body}");
+                refusals.push(body);
+            }
+        }
+    }
+    assert!(
+        refusals.windows(2).all(|pair| pair[0] == pair[1]),
+        "{refusals:?}"
+    );
+    assert_eq!(
+        session_count(&fixture.mixed_state.pool, seeded.admin_id).await?,
+        1
+    );
+
+    // A listed account still needs its own password.
+    let (status, body) = Call::new(Method::POST, "/auth/v1/sessions")
+        .json(serde_json::json!({
+            "email": seeded.member_email,
+            "password": seeded.admin_password,
+        }))
+        .send(fixture.mixed_public())
+        .await?;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+
+    // An unlisted account's existing session authenticates nothing, with
+    // or without an assertion a proxy attached.
+    for assertion in [None, Some("forbidden")] {
+        for (app, uri) in [
+            (fixture.mixed_public(), "/auth/v1/me"),
+            (fixture.mixed_public(), "/auth/v1/cluster"),
+            (fixture.mixed_public(), "/api/v1/sandboxes"),
+            (fixture.mixed_shared(), "/api/v1/sandboxes"),
+            (fixture.mixed_admin(), "/auth/v1/me"),
+            (fixture.mixed_admin(), "/admin/api/v1/orgs"),
+            (fixture.mixed_shared(), "/admin/api/v1/orgs"),
+        ] {
+            let mut call = Call::get(uri);
+            if let Some(assertion) = assertion {
+                call = call.machine_assertion(assertion);
+            }
+            let (status, body) = call.bearer(&seeded.admin_session).send(app).await?;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{uri}: {body}");
+        }
+    }
+    // Logout with it revokes nothing.
+    let (status, _) = Call::new(Method::DELETE, "/auth/v1/session")
+        .bearer(&seeded.admin_session)
+        .send(fixture.mixed_public())
+        .await?;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert!(session_exists(&fixture.mixed_state.pool, &seeded.admin_session).await?);
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_list_is_checked_on_every_request() -> TestResult {
+    let fixture = fixture().await?;
+    let seeded = &fixture.seeded;
+
+    let (status, body) = Call::new(Method::POST, "/auth/v1/sessions")
+        .json(serde_json::json!({
+            "email": seeded.member_email,
+            "password": seeded.member_password,
+        }))
+        .send(fixture.mixed_public())
+        .await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let issued = body["token"]
+        .as_str()
+        .ok_or("login returned no token")?
+        .to_owned();
+
+    // Removing the account from the list ends its sessions at once.
+    let without_member = fixture.listing(&[&seeded.admin_email])?;
+    for token in [&issued, &seeded.member_session] {
+        for app in [
+            crate::routes::router(without_member.clone()),
+            crate::routes::dedicated_admin_router(without_member.clone()),
+            crate::routes::shared_host_router(without_member.clone()),
+        ] {
+            let (status, body) = Call::get("/auth/v1/me").bearer(token).send(app).await?;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+        }
+    }
+    let (status, body) = Call::get("/auth/v1/me")
+        .bearer(&seeded.admin_session)
+        .send(crate::routes::router(without_member))
+        .await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // Listing it again revives its unexpired sessions: the documented
+    // reason to set a listed account's password when listing it.
+    let (status, body) = Call::get("/auth/v1/me")
+        .bearer(&issued)
+        .send(fixture.mixed_public())
+        .await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn listed_password_sessions_leave_console_requests_assertion_only() -> TestResult {
+    let fixture = fixture().await?;
+    let seeded = &fixture.seeded;
+
+    // The console header without an assertion is refused even with a valid
+    // session beside it.
+    for (app, uri, token) in [
+        (
+            fixture.mixed_public(),
+            "/auth/v1/me",
+            &seeded.member_session,
+        ),
+        (
+            fixture.mixed_public(),
+            "/api/v1/sandboxes",
+            &seeded.member_session,
+        ),
+        (fixture.mixed_admin(), "/auth/v1/me", &seeded.admin_session),
+        (
+            fixture.mixed_admin(),
+            "/admin/api/v1/orgs",
+            &seeded.admin_session,
+        ),
+    ] {
+        let (status, body) = Call::get(uri).console().bearer(token).send(app).await?;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{uri}: {body}");
+    }
+
+    // A refused assertion is final.
+    for (assertion, expected) in [
+        ("invalid", StatusCode::UNAUTHORIZED),
+        ("forbidden", StatusCode::FORBIDDEN),
+        ("unavailable", StatusCode::SERVICE_UNAVAILABLE),
+    ] {
+        for (app, uri, token) in [
+            (
+                fixture.mixed_public(),
+                "/auth/v1/me",
+                &seeded.member_session,
+            ),
+            (
+                fixture.mixed_public(),
+                "/api/v1/sandboxes",
+                &seeded.member_session,
+            ),
+            (
+                fixture.mixed_public(),
+                "/api/v1/sandboxes",
+                &seeded.native_key,
+            ),
+            (
+                fixture.mixed_admin(),
+                "/admin/api/v1/orgs",
+                &seeded.admin_session,
+            ),
+        ] {
+            let (status, body) = Call::get(uri)
+                .assertion(assertion)
+                .bearer(token)
+                .send(app)
+                .await?;
+            assert_eq!(status, expected, "{assertion} {uri}: {body}");
+        }
+    }
+
+    // An admitted assertion is still the identity: a member's session cannot
+    // lift a member to admin, and the native API refuses the combination.
+    let (status, body) = Call::get("/admin/api/v1/orgs")
+        .signed_in_as(&seeded.member_email)
+        .bearer(&seeded.admin_session)
+        .send(fixture.mixed_admin())
+        .await?;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    let (status, body) = Call::get("/api/v1/sandboxes")
+        .signed_in_as(&seeded.member_email)
+        .bearer(&seeded.member_session)
+        .send(fixture.mixed_public())
+        .await?;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+
+    // A console request never obtains a password session, with or without
+    // an assertion.
+    for call in [
+        Call::new(Method::POST, "/auth/v1/sessions").console(),
+        Call::new(Method::POST, "/auth/v1/sessions")
+            .signed_in_as(&seeded.member_email)
+            .console_origin(),
+    ] {
+        let (status, body) = call
+            .json(serde_json::json!({
+                "email": seeded.member_email,
+                "password": seeded.member_password,
+            }))
+            .send(fixture.mixed_public())
+            .await?;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert!(body.get("token").is_none(), "{body}");
+    }
+
+    // A console logout still revokes nothing.
+    let (status, _) = Call::new(Method::DELETE, "/auth/v1/session")
+        .signed_in_as(&seeded.member_email)
+        .console_origin()
+        .bearer(&seeded.member_session)
+        .send(fixture.mixed_public())
+        .await?;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert!(session_exists(&fixture.mixed_state.pool, &seeded.member_session).await?);
+
+    // The CSRF rule still covers console writes.
+    let (status, body) = Call::new(Method::DELETE, "/auth/v1/session")
+        .signed_in_as(&seeded.member_email)
+        .send(fixture.mixed_public())
+        .await?;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
     Ok(())
 }
 

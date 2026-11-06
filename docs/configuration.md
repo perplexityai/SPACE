@@ -499,6 +499,7 @@ admin API.
 | `SPACE_EXTERNAL_CONSOLE_TRUSTED_ORIGINS` | **required** with an authenticator | Comma-separated exact origins (`scheme://host[:port]`, at most 16) the console is served from. State-changing console requests must send a matching `Origin`. Invalid or empty fails startup. |
 | `SPACE_EXTERNAL_CONSOLE_PROVIDER_NAME` | `Single sign-on` | Name the console shows on its sign-in card. At most 64 characters, no control characters. |
 | `SPACE_EXTERNAL_CONSOLE_LOGOUT_URL` | unset | Where the console sends the browser to end the provider session: a same-origin absolute path or an `https` URL. |
+| `SPACE_EXTERNAL_CONSOLE_PASSWORD_SESSION_EMAILS` | unset (no account) | Comma-separated exact emails (at most 16) of local accounts that keep password login and password sessions for requests without the console header. Only takes effect with an authenticator installed; password mode always uses passwords. Meant for test automation accounts, such as smoke tests that sign in with a password; leave it unset in production. Entries are trimmed and compared exactly; an entry that is not a single exact email, such as `*`, fails startup. |
 
 With an authenticator installed:
 
@@ -519,11 +520,57 @@ With an authenticator installed:
 - Password login (`POST /auth/v1/sessions`) is refused with 403 and existing
   password session tokens no longer authenticate, so an old session cannot
   bypass the mode. `DELETE /auth/v1/session` revokes nothing; the console
-  ends the provider session through the logout URL instead.
+  ends the provider session through the logout URL instead. Accounts listed
+  in `SPACE_EXTERNAL_CONSOLE_PASSWORD_SESSION_EMAILS` are the one exception
+  (below).
 - Requests without the console header are machine requests. The native API
   authenticates them with API keys exactly as before and never consults an
   assertion the proxy attached; console-gated routes refuse them. Session
-  tokens are not accepted as native API credentials in this mode.
+  tokens are not accepted as native API credentials in this mode, except a
+  listed account's.
+- Each account listed in `SPACE_EXTERNAL_CONSOLE_PASSWORD_SESSION_EMAILS` is
+  exempt from the two rules above for requests without the console header
+  only: its password login issues a session, that session authenticates the
+  console-gated, admin and native routes as in password mode, and
+  `DELETE /auth/v1/session` revokes it. Console requests are unchanged and
+  still authenticate with the assertion alone: password login with the console
+  header is refused with 403, and a missing or rejected assertion never falls
+  back to a session. Every other account is refused with the same 403 before
+  its password is checked, whether or not it exists. Keep in mind:
+  - Whether an email is listed is observable: a listed account with a wrong
+    password gets 401 after the password check, an unlisted one 403 at once.
+    Treat the list as known to anyone who can reach the API and guess an
+    email.
+  - A listed account's sign-in bypasses the proxy: its admission policy,
+    multi-factor and device checks, and offboarding do not apply. List only
+    automation accounts with the least role they need, not people or shared
+    administrator accounts.
+  - The list is checked at login and on every request, so removing an email
+    suspends that account's sessions on each API process once it restarts
+    with the new list; access has ended only when every process serving the
+    API has. The sessions are not deleted: listing the email again revives
+    those that have not expired (they last 7 days). To end them for good,
+    set the account's password, which deletes all of its sessions; do so
+    before listing an email again.
+  - Password login is served by every API surface, including the admin API,
+    and is not rate limited per account or client. Each process verifies at
+    most half its cores' worth of passwords at once, off the request
+    workers, so a flood of login attempts slows other logins but not other
+    requests. The exception is the targeted account: a login holds a shared
+    lock on its user row while it checks the password, so setting that
+    account's password waits for its in-flight logins to finish. Give listed
+    accounts strong random passwords and keep the API reachable only
+    through the proxy or trusted networks.
+  - Any local user's password can be set or rotated in this mode, from the
+    console's user page or `PATCH /admin/api/v1/users/{id}`; it only takes
+    effect for listed accounts. The console stays signed in, because its own
+    session comes from the provider.
+- Password logins and sessions in this mode increment
+  `auth.external_console.password_session` with `result` `login_accepted`,
+  `login_refused`, `login_invalid`, `session_accepted` or `session_refused`.
+  The gauge `auth.external_console.password_session_accounts`, reported every
+  minute while an authenticator is installed, is the number of listed
+  accounts; alert on it being nonzero where the list must stay empty.
 - Each console decision increments `auth.external_console.decision` with
   `result` `accepted`, `missing_assertion`, `unauthenticated`, `forbidden`,
   `unavailable`, `csrf_rejected`, `no_user` or `lookup_failed`.
