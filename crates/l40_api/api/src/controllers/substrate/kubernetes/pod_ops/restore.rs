@@ -221,7 +221,7 @@ impl KubernetesSubstrate {
     pub(in crate::controllers::substrate::kubernetes) async fn suspend_restore_plan(
         &self,
         sandbox: &Sandbox,
-        evacuation: bool,
+        snapshot: RestoreSnapshotChoice,
     ) -> Result<SuspendRestorePlan, SubstrateError> {
         let existing = self
             .existing_suspend_restore_annotations(sandbox.id)
@@ -235,11 +235,11 @@ impl KubernetesSubstrate {
                 // snapshot) and survives a failed restore attempt's placement
                 // bump (see `selected_suspend_restore_storage_uri`).
                 self.store
-                    .selected_suspend_restore_storage_uri(sandbox, evacuation)
+                    .selected_suspend_restore_storage_uri(sandbox, snapshot)
                     .await?
             }
         };
-        if evacuation {
+        if snapshot == RestoreSnapshotChoice::NewestRemote {
             return storage_uri
                 .map(|storage_uri| SuspendRestorePlan {
                     source_node_name: None,

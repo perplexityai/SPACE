@@ -3,6 +3,22 @@
 
 use super::*;
 
+/// Which suspend snapshot a restore selects when no existing restore pod
+/// already names one, and whether its source node's local copy counts.
+/// `K8sStore::selected_suspend_restore_storage_uri` holds the full rule.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::controllers::substrate::kubernetes) enum RestoreSnapshotChoice {
+    /// The source node's local copy, or the remote snapshot the user-restore
+    /// rule selects: the current local artifact's, a placement-fresh one, or
+    /// on a retry the one the restore started from.
+    SourceNodeOrFresh,
+    /// A remote snapshot only, never the source node: the restore lands
+    /// elsewhere. A row that records its current local artifact restores that
+    /// artifact's snapshot; a row without one restores only the newest full
+    /// snapshot, once it is ready, so it can't read a stale prior-cycle one.
+    NewestRemote,
+}
+
 impl K8sStore {
     pub(in crate::controllers::substrate::kubernetes) async fn restore_source_node_name(
         &self,
@@ -156,11 +172,11 @@ impl K8sStore {
     pub(in crate::controllers::substrate::kubernetes) async fn selected_suspend_restore_storage_uri(
         &self,
         sandbox: &Sandbox,
-        evacuation: bool,
+        snapshot: RestoreSnapshotChoice,
     ) -> Result<Option<String>, SubstrateError> {
         // Three snapshot-selection modes:
         //
-        // * **Suspended user restore** (`evacuation = false`): the placement-
+        // * **Suspended user restore** (`SourceNodeOrFresh`): the placement-
         //   freshness gate — only a snapshot newer than the last placement is
         //   canonical, so a `wake → modify → re-suspend` cycle can't restore
         //   stale bytes.
@@ -173,17 +189,18 @@ impl K8sStore {
         //   must not strand the original source snapshot. When current local
         //   artifact identity exists, legacy markerless snapshots are not
         //   enough proof that the remote row belongs to this restore source.
-        // * **Node-drain cohort restore** (`evacuation = true`): require the
+        // * **Node-drain cohort restore** (`NewestRemote`): require the
         //   selected snapshot to be the **newest** full snapshot for the same
         //   stale-prior-cycle and failed-placement reasons.
         let restore_retry = sandbox.lifecycle.trim().eq_ignore_ascii_case("restoring");
-        let snapshot_guard = if restore_retry && !evacuation {
+        let newest_remote = snapshot == RestoreSnapshotChoice::NewestRemote;
+        let snapshot_guard = if restore_retry && !newest_remote {
             format!(
                 "AND {}",
                 restore_retry_source_snapshot_is_current("s", "sn")
             )
         } else {
-            let legacy_snapshot_guard = if evacuation {
+            let legacy_snapshot_guard = if newest_remote {
                 no_newer_full_snapshot("s", "sn")
             } else {
                 fresh_ready_snapshot_exists("s")

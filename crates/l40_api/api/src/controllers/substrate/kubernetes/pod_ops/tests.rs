@@ -1446,7 +1446,9 @@ mod stopped_restore_plan_tests {
     /// The drain's own re-placement of the same row still goes through: it
     /// claims the row and creates a pod the scheduler places from the pinned
     /// disk artifact, with no node pre-bound. A guard that the refusal stays
-    /// on the user path; it passes without the refusal too.
+    /// on the user path; it passes without the refusal too. With a rollout
+    /// cohort, the pod also carries the cohort's toleration and its required
+    /// node affinity.
     #[tokio::test(flavor = "current_thread")]
     async fn the_drains_re_placement_of_a_backed_off_stopped_evacuation_still_places_a_pod()
     -> TestResult {
@@ -1459,6 +1461,8 @@ mod stopped_restore_plan_tests {
         );
         let uri = "s3://space-test/re-placed-backoff-disk?region=us-east-1";
         let sandbox_id = stopped_re_placement_backoff_row(&pool, &substrate, uri).await?;
+        let cohort = EvacuationPlacement::from_parts("space.example/cohort", "blue")
+            .expect("a non-empty cohort is a placement");
 
         // The mock never runs the pod, so the restore can't complete; what
         // matters is that it got past the claim and planned the pod.
@@ -1467,7 +1471,7 @@ mod stopped_restore_plan_tests {
                 pplx_space_metrics::sandbox::api::SandboxApiMetricIdentity::ecw("evacuation"),
                 sandbox_id,
                 BLOCKING_START,
-                None,
+                Some(&cohort),
                 SandboxLifecycle::Stopped,
             )
             .await;
@@ -1493,6 +1497,40 @@ mod stopped_restore_plan_tests {
             Some(uri),
             "the re-placement pod restores from the pinned disk artifact"
         );
+        let cohort_toleration = serde_json::json!({
+            "key": "space.example/cohort",
+            "operator": "Equal",
+            "value": "blue",
+            "effect": "NoSchedule",
+        });
+        assert!(
+            pod.pointer("/spec/tolerations")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|tolerations| tolerations.contains(&cohort_toleration)),
+            "the re-placement pod tolerates the rollout cohort: {:?}",
+            pod.pointer("/spec/tolerations")
+        );
+        let cohort_match = serde_json::json!({
+            "key": "space.example/cohort",
+            "operator": "In",
+            "values": ["blue"],
+        });
+        let terms = pod
+            .pointer(
+                "/spec/affinity/nodeAffinity/requiredDuringSchedulingIgnoredDuringExecution\
+                 /nodeSelectorTerms",
+            )
+            .and_then(serde_json::Value::as_array)
+            .expect("the re-placement pod has required node affinity");
+        assert!(!terms.is_empty(), "the required node affinity has terms");
+        for term in terms {
+            assert!(
+                term.get("matchExpressions")
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(|expressions| expressions.contains(&cohort_match)),
+                "every required term matches the rollout cohort: {term}"
+            );
+        }
         Ok(())
     }
 }

@@ -70,9 +70,9 @@ use cancel_rate_tracker::CancelRateTracker;
 use restore_waiters::RestoreWaiters;
 use store::{
     ActiveExecutionState, K8sStore, NodeLifecycleState, NodeStateWrite, PlacementClock,
-    PreparedWakeSandbox, RestoreClaim, RestoreClaimRevert, SandboxExecutionRow,
-    StartedRecoveryClaim, StartedRecoveryCompletion, StartedRecoveryObservation,
-    UserRestoreObservation,
+    PreparedWakeSandbox, RestoreClaim, RestoreClaimRevert, RestoreSnapshotChoice,
+    SandboxExecutionRow, StartedRecoveryClaim, StartedRecoveryCompletion,
+    StartedRecoveryObservation, UserRestoreObservation,
 };
 
 use crate::{
@@ -1289,6 +1289,7 @@ mod node_sync;
 mod per_sandbox_setup;
 mod pod_ops;
 mod pool;
+mod restore_intent;
 mod runtime_upgrade;
 #[cfg(test)]
 pub(crate) mod scripted_test_doubles;
@@ -1300,8 +1301,10 @@ pub(crate) mod tests;
 mod wait_ready;
 
 pub use adapter::{GenerationTeardownEvidence, observe_generation_teardown_with_node_api};
+use execution::WakeTarget;
 pub use node_sync::SyncNodeInventoryError;
 use pod_ops::ExecutionHydrationOutcome;
 use pod_ops::{ActivationAttemptAssignment, PodMaterializationOwnership, StartedRecoveryOwnership};
+use restore_intent::{RestoreClaimMode, RestoreIntent, RestorePodPlacement};
 #[cfg(any(test, feature = "test-hooks"))]
 pub use test_substrate::{TEST_SANDBOX_NAMESPACE, retire_executions_predating_current_stop};

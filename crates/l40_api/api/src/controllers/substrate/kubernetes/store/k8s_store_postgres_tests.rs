@@ -5194,7 +5194,7 @@ async fn forget_pod_tracking_recovers_markerless_restoring_with_ready_snapshot(
     let sandbox = fixture.store.require_sandbox(sandbox_id).await?;
     let selected_uri = fixture
         .store
-        .selected_suspend_restore_storage_uri(&sandbox, false)
+        .selected_suspend_restore_storage_uri(&sandbox, RestoreSnapshotChoice::SourceNodeOrFresh)
         .await?;
     assert_eq!(selected_uri.as_deref(), Some(uri));
 
@@ -5347,7 +5347,7 @@ async fn forget_pod_tracking_keeps_restoring_with_late_branch_artifact(
     let sandbox = fixture.store.require_sandbox(sandbox_id).await?;
     let selected_uri = fixture
         .store
-        .selected_suspend_restore_storage_uri(&sandbox, false)
+        .selected_suspend_restore_storage_uri(&sandbox, RestoreSnapshotChoice::SourceNodeOrFresh)
         .await?;
     assert_eq!(selected_uri.as_deref(), Some(source_uri));
 
@@ -5492,7 +5492,7 @@ async fn forget_pod_tracking_recovers_started_suspended_by_node_after_current_ba
     let sandbox = fixture.store.require_sandbox(sandbox_id).await?;
     let selected_uri = fixture
         .store
-        .selected_suspend_restore_storage_uri(&sandbox, false)
+        .selected_suspend_restore_storage_uri(&sandbox, RestoreSnapshotChoice::SourceNodeOrFresh)
         .await?;
     assert_eq!(selected_uri.as_deref(), Some(uri));
     let source_node = fixture.store.restore_source_node_name(&sandbox).await?;
@@ -7058,7 +7058,7 @@ async fn creating_snapshot_does_not_select_stale_remote_uri_until_ready(
 
     let uri_while_creating = fixture
         .store
-        .selected_suspend_restore_storage_uri(&sandbox, false)
+        .selected_suspend_restore_storage_uri(&sandbox, RestoreSnapshotChoice::SourceNodeOrFresh)
         .await?;
 
     assert_eq!(uri_while_creating, None);
@@ -7070,7 +7070,7 @@ async fn creating_snapshot_does_not_select_stale_remote_uri_until_ready(
     // change since the previous wake (the data-loss bug this guards).
     let evac_uri_while_creating = fixture
         .store
-        .selected_suspend_restore_storage_uri(&sandbox, true)
+        .selected_suspend_restore_storage_uri(&sandbox, RestoreSnapshotChoice::NewestRemote)
         .await?;
     assert_eq!(
         evac_uri_while_creating, None,
@@ -7084,7 +7084,7 @@ async fn creating_snapshot_does_not_select_stale_remote_uri_until_ready(
 
     let uri_after_ready = fixture
         .store
-        .selected_suspend_restore_storage_uri(&sandbox, false)
+        .selected_suspend_restore_storage_uri(&sandbox, RestoreSnapshotChoice::SourceNodeOrFresh)
         .await?;
 
     assert_eq!(
@@ -7096,7 +7096,7 @@ async fn creating_snapshot_does_not_select_stale_remote_uri_until_ready(
     // `ready`, so the evacuation path selects it (not the stale one).
     let evac_uri_after_ready = fixture
         .store
-        .selected_suspend_restore_storage_uri(&sandbox, true)
+        .selected_suspend_restore_storage_uri(&sandbox, RestoreSnapshotChoice::NewestRemote)
         .await?;
     assert_eq!(
         evac_uri_after_ready.as_deref(),
@@ -7144,7 +7144,7 @@ async fn restoring_sandbox_selects_newest_ready_snapshot_after_placement_bump(
 
     let uri = fixture
         .store
-        .selected_suspend_restore_storage_uri(&sandbox, false)
+        .selected_suspend_restore_storage_uri(&sandbox, RestoreSnapshotChoice::SourceNodeOrFresh)
         .await?;
 
     assert_eq!(
@@ -7191,7 +7191,7 @@ async fn suspend_restore_selector_ignores_orphaned_storage_locations(
 
     let fallback = fixture
         .store
-        .selected_suspend_restore_storage_uri(&sandbox, false)
+        .selected_suspend_restore_storage_uri(&sandbox, RestoreSnapshotChoice::SourceNodeOrFresh)
         .await?;
     assert_eq!(
         fallback.as_deref(),
@@ -7218,7 +7218,7 @@ async fn suspend_restore_selector_ignores_orphaned_storage_locations(
     .await?;
     let newest_live = fixture
         .store
-        .selected_suspend_restore_storage_uri(&sandbox, false)
+        .selected_suspend_restore_storage_uri(&sandbox, RestoreSnapshotChoice::SourceNodeOrFresh)
         .await?;
     assert_eq!(
         newest_live.as_deref(),
@@ -7275,7 +7275,7 @@ async fn restoring_retry_uses_pre_restore_snapshot_when_late_branch_publishes_ar
     // Act.
     let uri = fixture
         .store
-        .selected_suspend_restore_storage_uri(&sandbox, false)
+        .selected_suspend_restore_storage_uri(&sandbox, RestoreSnapshotChoice::SourceNodeOrFresh)
         .await?;
 
     // Assert.
@@ -7327,7 +7327,7 @@ async fn restoring_retry_refuses_prior_placement_snapshot_after_late_branch_arti
     // Act.
     let uri = fixture
         .store
-        .selected_suspend_restore_storage_uri(&sandbox, false)
+        .selected_suspend_restore_storage_uri(&sandbox, RestoreSnapshotChoice::SourceNodeOrFresh)
         .await?;
 
     // Assert.
@@ -7375,7 +7375,7 @@ async fn restoring_retry_refuses_markerless_snapshot_after_late_branch_artifact(
     // Act.
     let uri = fixture
         .store
-        .selected_suspend_restore_storage_uri(&sandbox, false)
+        .selected_suspend_restore_storage_uri(&sandbox, RestoreSnapshotChoice::SourceNodeOrFresh)
         .await?;
 
     // Assert.
@@ -7561,7 +7561,7 @@ async fn forget_pod_tracking_recovers_started_with_current_suspend_backup(
     let sandbox = fixture.store.require_sandbox(sandbox_id).await?;
     let selected_uri = fixture
         .store
-        .selected_suspend_restore_storage_uri(&sandbox, false)
+        .selected_suspend_restore_storage_uri(&sandbox, RestoreSnapshotChoice::SourceNodeOrFresh)
         .await?;
     assert_eq!(selected_uri.as_deref(), Some(uri));
     Ok(())
@@ -7639,7 +7639,7 @@ async fn forget_pod_tracking_clears_stale_marker_for_newest_current_suspend_back
     let sandbox = fixture.store.require_sandbox(sandbox_id).await?;
     let selected_uri = fixture
         .store
-        .selected_suspend_restore_storage_uri(&sandbox, false)
+        .selected_suspend_restore_storage_uri(&sandbox, RestoreSnapshotChoice::SourceNodeOrFresh)
         .await?;
     assert_eq!(selected_uri.as_deref(), Some(current_uri));
     Ok(())

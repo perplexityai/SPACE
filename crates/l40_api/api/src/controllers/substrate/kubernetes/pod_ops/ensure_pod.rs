@@ -149,19 +149,27 @@ impl KubernetesSubstrate {
     /// plan [`Self::ensure_pod_exists`] selects when its caller passes
     /// neither. A plan that can't be resolved yet answers `false`, leaving
     /// that answer to the selection after the claim.
-    async fn restore_plan_sweeps(&self, sandbox: &Sandbox, evacuation: bool) -> bool {
+    async fn restore_plan_sweeps(
+        &self,
+        sandbox: &Sandbox,
+        snapshot: RestoreSnapshotChoice,
+    ) -> bool {
         let plan = match normalize_lifecycle(&sandbox.lifecycle).as_str() {
-            "suspended" | "restoring" => self.suspend_restore_plan(sandbox, evacuation).await,
+            "suspended" | "restoring" => self.suspend_restore_plan(sandbox, snapshot).await,
             "stopped" => self.stopped_restore_plan(sandbox).await,
             _ => return false,
         };
         plan.is_ok()
     }
 
+    /// `restore` is the intent of the executor wake this pod materializes
+    /// for, a restore or a started recovery. `None` (the start and access
+    /// paths) selects a restore plan when one is needed and places the pod as
+    /// a user restore does.
     pub(in crate::controllers::substrate::kubernetes) async fn ensure_pod_exists(
         &self,
         sandbox: &Sandbox,
-        evacuation_placement: Option<Option<&EvacuationPlacement>>,
+        restore: Option<&RestoreIntent>,
         suspend_restore_source_node: Option<&str>,
         suspend_restore_storage_uri: Option<&str>,
         ownership: PodMaterializationOwnership,
@@ -241,7 +249,7 @@ impl KubernetesSubstrate {
             && (suspend_restore_source_node.is_some()
                 || suspend_restore_storage_uri.is_some()
                 || self
-                    .restore_plan_sweeps(&sandbox, evacuation_placement.is_some())
+                    .restore_plan_sweeps(&sandbox, RestoreIntent::snapshot_or_default(restore))
                     .await)
         {
             self.sweep_lingering_prior_generation_pods(sandbox_id, generation)
@@ -276,7 +284,7 @@ impl KubernetesSubstrate {
         {
             match normalize_lifecycle(&sandbox.lifecycle).as_str() {
                 "suspended" | "restoring" => self
-                    .suspend_restore_plan(&sandbox, evacuation_placement.is_some())
+                    .suspend_restore_plan(&sandbox, RestoreIntent::snapshot_or_default(restore))
                     .await
                     .map(Some),
                 "stopped" => self.stopped_restore_plan(&sandbox).await.map(Some),
@@ -358,13 +366,20 @@ impl KubernetesSubstrate {
             });
 
         // Materialize the evacuation toleration up front so it lives long
-        // enough for `SandboxPodRequest::Restore`'s borrowed slots. The
-        // outer `Option` flags "this is the evacuation path"; the inner
-        // `Option` is whether a target cohort is active (a two-MNG
-        // rollout in flight). With no rollout, evacuation still happens —
-        // we just drop the source-node pin and emit no extra placement.
+        // enough for `SandboxPodRequest::Restore`'s borrowed slots. An
+        // evacuation carries a cohort while a target cohort is active (a
+        // two-MNG rollout in flight). With no rollout, evacuation still
+        // happens — we just drop the source-node pin and emit no extra
+        // placement.
         let evacuation_toleration_slot: Option<[PodToleration; 1]> =
-            evacuation_placement.and_then(|placement| placement.map(|p| [p.to_toleration()]));
+            match restore.map(|intent| &intent.pod_placement) {
+                Some(RestorePodPlacement::Evacuation {
+                    cohort: Some(cohort),
+                }) => Some([cohort.to_toleration()]),
+                Some(RestorePodPlacement::Evacuation { cohort: None })
+                | Some(RestorePodPlacement::SourceAffine)
+                | None => None,
+            };
         // A stopped re-placement stays off every node an earlier execution ran
         // on; see `stopped_replacement_excluded_nodes`.
         let stopped_replacement_excluded_nodes = match stopped_materialization_artifact_id {
@@ -375,19 +390,24 @@ impl KubernetesSubstrate {
             }
             None => Vec::new(),
         };
-        let evacuation_context = evacuation_placement.map(|placement| EvacuationContext {
-            extra_tolerations: evacuation_toleration_slot
-                .as_ref()
-                .map(|slot| slot.as_slice())
-                .unwrap_or(&[]),
-            extra_required_affinity: placement.map(EvacuationPlacement::to_required_affinity),
-            stopped_materialization: stopped_materialization_artifact_id.map(|artifact_id| {
-                StoppedMaterialization {
-                    artifact_id,
-                    excluded_node_names: &stopped_replacement_excluded_nodes,
-                }
+        let evacuation_context = match restore.map(|intent| &intent.pod_placement) {
+            Some(RestorePodPlacement::Evacuation { cohort }) => Some(EvacuationContext {
+                extra_tolerations: evacuation_toleration_slot
+                    .as_ref()
+                    .map(|slot| slot.as_slice())
+                    .unwrap_or(&[]),
+                extra_required_affinity: cohort
+                    .as_ref()
+                    .map(EvacuationPlacement::to_required_affinity),
+                stopped_materialization: stopped_materialization_artifact_id.map(|artifact_id| {
+                    StoppedMaterialization {
+                        artifact_id,
+                        excluded_node_names: &stopped_replacement_excluded_nodes,
+                    }
+                }),
             }),
-        });
+            Some(RestorePodPlacement::SourceAffine) | None => None,
+        };
 
         let mut pod_name = claim.row.pod_name.clone();
         // Interrupted source-pinned restore recovery. A prior attempt can create
