@@ -67,6 +67,11 @@ assert_needed true rust shim/env_contract_generated.go
 # The shim's commands run without GOWORK=off.
 assert_needed true go go.work
 
+# The admin console needs only ui/.
+assert_needed true console ui/src/lib/api.ts
+assert_needed true console ui/package-lock.json
+assert_needed false console crates/l40_api/api/src/lib.rs docs/api/openapi.json scripts/console-loop/src/loop.ts
+
 # Anything not listed as unread runs the check: Rust reads infra/, db/,
 # templates/ and scripts/.
 assert_needed true rust infra/space/identity/node-identities.sh
@@ -96,11 +101,12 @@ assert_needed false rust "ui/src/app/café.tsx"
 assert_needed false rust "docs/release notes.md"
 
 # A change to CI itself, or to the CI image's inputs, runs every check: the
-# Go scope would otherwise skip all of these.
+# Go and console scopes would otherwise skip all of these.
 assert_needed true go .github/workflows/pull-ci.yml
 assert_needed true go ci/scripts/run-shim-checks.sh
 assert_needed true go rust-toolchain.toml
 assert_needed true go docker/build-btrfs-progs.sh
+assert_needed true console .github/workflows/common-ci.yml
 
 # The change is tree to tree: a later console-only commit does not hide an
 # earlier Rust one.
