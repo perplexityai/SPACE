@@ -19,20 +19,22 @@ use pplx_space_sandbox_portability::{
     drain_gate_blockers_for_node, inflight_suspend_upload_exists,
     snapshot_durable_for_source_release,
 };
-use pplx_space_sandbox_residency::{
-    ResidencyEvidence, active_resident_predicate, non_resident_lifecycle_exclusion,
-};
+use pplx_space_sandbox_residency::{ResidencyEvidence, active_resident_predicate};
 #[cfg(test)]
 use pplx_space_sandbox_residency::{
-    node_heartbeat_fresh, occupies_node_predicate, resident_lifecycle,
+    node_heartbeat_fresh, non_resident_lifecycle_exclusion, occupies_node_predicate,
+    resident_lifecycle,
 };
+use pplx_space_sandbox_store::admin_occupancy;
 use serde::Serialize;
 use sqlx::{FromRow, PgPool, Postgres, Transaction};
 use std::time::Duration;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
+#[cfg(test)]
 mod fleet_occupancy;
+#[cfg(test)]
 mod single_node_occupancy;
 
 #[derive(Debug, Clone, FromRow)]
@@ -199,6 +201,7 @@ pub(super) struct TerminateOccupancy {
 ///
 /// `alias` is the SQL alias for the `sandboxes` row in the calling query — pass
 /// the bare table name (`"sandboxes"`) when no alias is set.
+#[cfg(test)]
 fn active_occupancy_lifecycles(alias: &str) -> String {
     format!("({})", non_resident_lifecycle_exclusion(alias))
 }
@@ -250,6 +253,31 @@ struct OccupancyRow {
     heartbeat_fresh: bool,
 }
 
+impl From<admin_occupancy::NodeOccupancyCounts> for OccupancyRow {
+    fn from(counts: admin_occupancy::NodeOccupancyCounts) -> Self {
+        let admin_occupancy::NodeOccupancyCounts {
+            node_id,
+            active,
+            local_snapshots,
+            terminate_blockers,
+            live_residents,
+            live_long_runners,
+            drain_blockers,
+            heartbeat_fresh,
+        } = counts;
+        Self {
+            node_id,
+            active,
+            local_snapshots,
+            terminate_blockers,
+            live_residents,
+            live_long_runners,
+            drain_blockers,
+            heartbeat_fresh,
+        }
+    }
+}
+
 /// Everything one occupancy read reports for a node. `live` is `Some` only
 /// when the caller asked for the drainability counters; both halves then come
 /// from a single statement, which is what lets a caller subtract one from the
@@ -293,6 +321,7 @@ pub(super) struct NodeOccupancy {
 /// temporary storage. The ordinary listing path — which asks for no drainability
 /// counters at all — must therefore keep the streaming shape it had before the
 /// ranking existed.
+#[cfg(test)]
 fn row_cte_materialization(ranking_requested: bool, residency: ResidencyEvidence) -> &'static str {
     if ranking_requested && residency.discounts_absent_rows() {
         " MATERIALIZED"
@@ -516,28 +545,33 @@ impl AdminNodeStore {
         if node_ids.is_empty() {
             return Ok(HashMap::new());
         }
+        let long_runner_age_secs = long_runner_age.map(long_runner_age_secs).unwrap_or(0);
+        let ranked = long_runner_age.is_some();
         let rows = match node_ids {
-            [node_id] => {
-                let query = single_node_occupancy::query(long_runner_age.is_some(), residency);
-                let row =
-                    sqlx::query_as::<_, OccupancyRow>(sqlx::AssertSqlSafe(sql!(query.as_str())))
-                        .bind(node_id)
-                        .bind(long_runner_age.map(long_runner_age_secs).unwrap_or(0))
-                        .fetch_one(&self.pool)
-                        .await?;
-                vec![row]
-            }
+            [node_id] => vec![
+                admin_occupancy::node_occupancy(
+                    &self.pool,
+                    *node_id,
+                    long_runner_age_secs,
+                    ranked,
+                    residency,
+                )
+                .await?,
+            ],
             _ => {
-                let query = fleet_occupancy::query(long_runner_age.is_some(), residency);
-                sqlx::query_as::<_, OccupancyRow>(sqlx::AssertSqlSafe(sql!(query.as_str())))
-                    .bind(node_ids)
-                    .bind(long_runner_age.map(long_runner_age_secs).unwrap_or(0))
-                    .fetch_all(&self.pool)
-                    .await?
+                admin_occupancy::fleet_occupancy(
+                    &self.pool,
+                    node_ids,
+                    long_runner_age_secs,
+                    ranked,
+                    residency,
+                )
+                .await?
             }
         };
         Ok(rows
             .into_iter()
+            .map(OccupancyRow::from)
             .map(|row| {
                 (
                     row.node_id,

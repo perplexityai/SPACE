@@ -1072,6 +1072,23 @@ fn only_census_aware_ranking_materializes_the_per_row_cte() {
         "three aggregates over an inlined census predicate is three \
          evaluations of the absence proof per row"
     );
+
+    // The fleet statements spell the fence out; pin each shape to the
+    // decision above.
+    for ranked in [false, true] {
+        for residency in [
+            ResidencyEvidence::LifecycleOnly,
+            ResidencyEvidence::NodeCensusAware,
+        ] {
+            assert_eq!(
+                super::fleet_occupancy::query(ranked, residency)
+                    .contains("active_rows AS MATERIALIZED ("),
+                ranked && residency == ResidencyEvidence::NodeCensusAware,
+                "the fleet statement fences active_rows only for census-aware ranking \
+                 (ranked {ranked}, {residency:?})"
+            );
+        }
+    }
 }
 
 /// A node holding **no sandbox row at all** is the best gentle-drain candidate

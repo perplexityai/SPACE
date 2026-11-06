@@ -14,10 +14,6 @@ use std::collections::HashMap;
 use pplx_space_common_core::sql;
 use pplx_space_common_core::types::NodeGroupId;
 use pplx_space_common_core::types::{NodeGroupName, NodeGroupTemplatePolicy, TemplateVisibility};
-use pplx_space_sandbox_portability::{
-    inflight_suspend_upload_from_node_exists, snapshot_durable_for_source_release,
-};
-use pplx_space_sandbox_residency::non_resident_lifecycle_exclusion;
 use sqlx::{FromRow, PgPool, Postgres, Transaction};
 use time::OffsetDateTime;
 
@@ -226,57 +222,17 @@ pub(super) async fn group_occupancy_in_tx(
     tx: &mut Transaction<'_, Postgres>,
     node_group_id: NodeGroupId,
 ) -> Result<SandboxOccupancy, sqlx::Error> {
-    let snapshot_exists = snapshot_durable_for_source_release("sandboxes");
-    let inflight_from_group = inflight_suspend_upload_from_node_exists(
-        "sandboxes",
-        "ANY(SELECT id FROM nodes WHERE node_group_id = $1)",
-    );
     // Shares the lifecycle scope but deliberately *not* the census discount its
     // node-level sibling now applies: nothing drives group teardown
     // automatically the way `space-rollout-mng.py` drives `:terminate`, so the
     // phantom-refusal wedge does not arise here, and counting every row stays
     // the conservative reading for an operator-initiated teardown.
-    let non_resident = non_resident_lifecycle_exclusion("sandboxes");
-    let query = format!(
-        "SELECT
-             COUNT(*) FILTER (
-                 WHERE (
-                         active_node_id IN (SELECT id FROM nodes WHERE node_group_id = $1)
-                         AND {non_resident}
-                       )
-                    -- An in-flight restore/suspend pins a sandbox to a group
-                    -- node via target_node_id while active_node_id is still
-                    -- NULL (begin_restore_lifecycle clears active_node_id but
-                    -- leaves target_node_id on the source). Mirror the
-                    -- node-drain blocker (drain_blocking_sandboxes_query):
-                    -- `suspending` always occupies; `restoring` occupies for
-                    -- non-evacuation restores.
-                    OR (
-                         target_node_id IN (SELECT id FROM nodes WHERE node_group_id = $1)
-                         AND (
-                             lifecycle = 'suspending'
-                             OR (lifecycle = 'restoring'
-                                 AND evacuation_restore_target IS NULL)
-                         )
-                       )
-             )::BIGINT AS active,
-             COUNT(*) FILTER (
-                 WHERE (
-                         lifecycle = 'suspended'
-                         AND target_node_id IN (SELECT id FROM nodes WHERE node_group_id = $1)
-                         AND NOT {snapshot_exists}
-                       )
-                    OR ({inflight_from_group} AND NOT {snapshot_exists})
-             )::BIGINT AS local_snapshots
-         FROM sandboxes"
-    );
-    let row: (i64, i64) = sqlx::query_as(sqlx::AssertSqlSafe(sql!(query.as_str())))
-        .bind(node_group_id)
-        .fetch_one(&mut **tx)
-        .await?;
+    let counts =
+        pplx_space_sandbox_store::admin_occupancy::group_occupancy(&mut **tx, node_group_id)
+            .await?;
     Ok(SandboxOccupancy {
-        active: row.0,
-        local_snapshots: row.1,
+        active: counts.active,
+        local_snapshots: counts.local_snapshots,
     })
 }
 
