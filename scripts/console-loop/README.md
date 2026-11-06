@@ -160,13 +160,16 @@ through `--kube-context` (a `kind-*` context whose API server is on this host)
 before draining, and removes it once the node is undrained. Before either,
 each step cordons and uncordons the worker through the API and stops unless
 the cordon shows up on that Node, which shows the context and the API are one
-cluster. A `space.pplx.net/drain-keep` annotation the Node already had is
-left in place, unless its value is `console-loop`, which an interrupted
-earlier run left. A step stopped part-way can leave the node cordoned, drained
-or annotated. Undrain a drained node with
-`space-admin-cli undrain-node <node id>`, which also uncordons it; uncordon a
-node with no drain phase with Uncordon on its node page; and remove an
-annotation the step added with
+cluster. A step refuses a worker that already carries a
+`space.pplx.net/drain-keep` annotation, whatever its value, and leaves it in
+place; an interrupted run's own annotation (`console-loop-<run id>`) has to be
+removed by hand. Runs against one stack aren't meant to overlap, and because
+each run claims the annotation with its own run id through an annotate that
+fails when the key exists, two runs can't drain the same worker. A step stopped
+part-way can leave the node cordoned, drained or annotated. Undrain a drained
+node with `space-admin-cli undrain-node <node id>`, which also uncordons it;
+uncordon a node with no drain phase with Uncordon on its node page; and remove
+the annotation with
 `kubectl --context <context> annotate node <node> space.pplx.net/drain-keep-`,
 where `<context>` is the run's `--kube-context` or `CONSOLE_LOOP_KUBE_CONTEXT`
 (`kind-space-local` by default).

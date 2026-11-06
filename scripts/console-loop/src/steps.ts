@@ -14,7 +14,7 @@ import { TERMINAL_OPERATION_STATES } from './api.ts';
 import { verifyFixtures } from './fixtures.ts';
 import { SYNTHETIC_HEADER } from './recorder.ts';
 import { orgDisplayName, recordCreated } from './seed.ts';
-import { DRAIN_KEEP_ANNOTATION, DRAIN_KEEP_VALUE, KindNodes, drainCandidate, type AdminNode } from './nodes.ts';
+import { DRAIN_KEEP_ANNOTATION, DRAIN_KEEP_TOKEN, KindNodes, drainCandidate, type AdminNode } from './nodes.ts';
 
 export interface Step {
   name: string;
@@ -1379,10 +1379,10 @@ async function cordonReachesNode(c: Ctx, node: AdminNode, kube: KindNodes): Prom
   return released;
 }
 
-// Picks a worker, proves the kube context reads the API's cluster, sets the
-// drain-keep override unless the Node already has one the loop did not set,
-// runs `body`, then undrains it if it is still in a drain phase and drops the
-// override it set.
+// Picks a worker, proves the kube context reads the API's cluster, claims the
+// drain-keep override with this run's token, refusing a worker that already
+// has one, runs `body`, then undrains it if it is still in a drain phase and
+// drops the override while it still carries the token.
 // Records why when there is no worker it may drain; that is not a pass.
 async function withDrainableWorker(c: Ctx, body: (node: AdminNode, kube: KindNodes) => Promise<void>): Promise<void> {
   const picked = drainCandidate(await adminNodes(c));
@@ -1395,13 +1395,12 @@ async function withDrainableWorker(c: Ctx, body: (node: AdminNode, kube: KindNod
   const kube = new KindNodes(c.config.kubeContext);
   kube.requireLocalNode(name);
   if (!(await cordonReachesNode(c, node, kube))) return;
-  c.rec.note(`draining worker ${name} (${node.id}), which holds no sandboxes`);
-  // DRAIN_KEEP_VALUE is the loop's own, left by an interrupted run.
-  const found = kube.drainKeep(name);
-  const keptBefore = found === DRAIN_KEEP_VALUE ? null : found;
-  if (found === DRAIN_KEEP_VALUE) c.rec.note(`${name} carries ${DRAIN_KEEP_ANNOTATION}=${found} from an earlier run; this step removes it at the end`);
-  if (keptBefore === null) kube.setDrainKeep(name);
-  else c.rec.note(`${name} already carries ${DRAIN_KEEP_ANNOTATION}=${keptBefore}; it is left as it is`);
+  const held = kube.claimDrainKeep(name);
+  if (held !== null) {
+    c.rec.check(false, `${name} already carries ${DRAIN_KEEP_ANNOTATION}=${held}; it is left as it is and nothing is drained`);
+    return;
+  }
+  c.rec.note(`draining worker ${name} (${node.id}), which holds no sandboxes, under ${DRAIN_KEEP_ANNOTATION}=${DRAIN_KEEP_TOKEN}`);
   try {
     await body(node, kube);
   } finally {
@@ -1412,12 +1411,10 @@ async function withDrainableWorker(c: Ctx, body: (node: AdminNode, kube: KindNod
     }
     const left = await waitForPhase(c, node.id, [null], 30_000);
     c.rec.check(left === null, 'the worker is left with no drain phase');
-    if (keptBefore !== null) {
-      // Not this step's annotation: it stays.
-    } else if (left === null) {
-      kube.clearDrainKeep(name);
-    } else {
+    if (left !== null) {
       c.rec.note(`the drain-keep override stays on ${name} because the node is still ${left}`);
+    } else {
+      c.rec.check(kube.releaseDrainKeep(name), `the drain-keep override on ${name} still carried this run's token and was removed`);
     }
   }
 }

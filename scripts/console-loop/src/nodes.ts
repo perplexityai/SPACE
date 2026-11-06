@@ -7,11 +7,15 @@
 // before any drain and remove it only after the node is undrained, as the
 // `local.forced_drain_evacuates_sandbox` smoke does.
 import { execFileSync } from 'node:child_process';
+import { randomBytes } from 'node:crypto';
 
 import { isLoopback } from './config.ts';
 
 export const DRAIN_KEEP_ANNOTATION = 'space.pplx.net/drain-keep';
 export const DRAIN_KEEP_VALUE = 'console-loop';
+// This run's override value, picked once per run, so two runs against one
+// stack never write the same value.
+export const DRAIN_KEEP_TOKEN = `${DRAIN_KEEP_VALUE}-${randomBytes(6).toString('hex')}`;
 
 // The admin node fields the steps read.
 export interface AdminNode {
@@ -76,12 +80,29 @@ export class KindNodes {
     return node.metadata?.annotations?.[DRAIN_KEEP_ANNOTATION] ?? null;
   }
 
-  setDrainKeep(name: string): void {
-    this.kubectl('annotate', 'node', name, `${DRAIN_KEEP_ANNOTATION}=${DRAIN_KEEP_VALUE}`, '--overwrite');
+  // Sets the override to this run's token. Without `--overwrite` the
+  // annotate fails when the key exists, so a run never takes over another
+  // run's or an operator's override. Returns null once claimed, or the value
+  // the Node already carries.
+  claimDrainKeep(name: string): string | null {
+    try {
+      this.kubectl('annotate', 'node', name, `${DRAIN_KEEP_ANNOTATION}=${DRAIN_KEEP_TOKEN}`);
+      return null;
+    } catch (error) {
+      const held = this.drainKeep(name);
+      if (held === null) throw error;
+      return held;
+    }
   }
 
-  clearDrainKeep(name: string): void {
+  // Removes the override only while it carries this run's token; returns
+  // whether it did. The read and the removal are two calls, so this can only
+  // race a run that overwrote the token in between, which `claimDrainKeep`
+  // never does.
+  releaseDrainKeep(name: string): boolean {
+    if (this.drainKeep(name) !== DRAIN_KEEP_TOKEN) return false;
     this.kubectl('annotate', 'node', name, `${DRAIN_KEEP_ANNOTATION}-`);
+    return true;
   }
 
   unschedulable(name: string): boolean {
