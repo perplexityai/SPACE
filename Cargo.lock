@@ -7963,6 +7963,7 @@ dependencies = [
  "pplx-space-state-reconciliation",
  "pplx-space-stopwatch",
  "pplx-space-template-mgr-client",
+ "pplx-space-template-mgr-store",
  "pplx-space-test-env",
  "pplx-space-uds-peer-auth",
  "pplx-space-unix-socket-bind",
@@ -8026,6 +8027,10 @@ dependencies = [
 [[package]]
 name = "pplx-space-template-mgr-store"
 version = "0.8.1"
+dependencies = [
+ "pplx-space-sql-locator",
+ "rusqlite",
+]
 
 [[package]]
 name = "pplx-space-template-mgr-svc"

@@ -7,6 +7,7 @@ use pplx_space_common_core::sql;
 use pplx_space_common_core::types::AutoLifecyclePolicy;
 pub use pplx_space_common_core::types::PolicyAuthority;
 use pplx_space_net_common::NetworkPolicyV1;
+use pplx_space_template_mgr_store::node_dirty_refs::{self, NodeDirtyRefRow};
 
 pub const DB_PATH: &str = pplx_space_common_core::host::linux::paths::TEMPLATE_MANAGER_DB;
 
@@ -1036,46 +1037,11 @@ fn enqueue_node_dirty_template_inventory_tx(
     Ok(changed != 0)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NodeDirtyRefRow {
-    pub facet: i32,
-    pub element_kind: String,
-    pub element_value: String,
-}
-
-pub fn list_node_dirty_refs(conn: &Connection, limit: usize) -> Result<Vec<NodeDirtyRefRow>> {
-    let mut stmt = conn.prepare(
-        "SELECT facet, element_kind, element_value
-         FROM node_dirty_refs
-         ORDER BY requested_at ASC
-         LIMIT ?1",
-    )?;
-    let rows = stmt.query_map(params![limit_to_i64(limit)], |row| {
-        Ok(NodeDirtyRefRow {
-            facet: row.get(0)?,
-            element_kind: row.get(1)?,
-            element_value: row.get(2)?,
-        })
-    })?;
-    rows.collect()
-}
-
+/// Acknowledge only the obligations read before sending. A newer enqueue, even
+/// for a previously deleted key, remains pending for the worker's next retry.
 pub fn delete_node_dirty_refs(conn: &Connection, refs: &[NodeDirtyRefRow]) -> Result<usize> {
     let tx = immediate_transaction(conn)?;
-    let mut deleted = 0;
-    for reference in refs {
-        deleted += tx.execute(
-            "DELETE FROM node_dirty_refs
-             WHERE facet = ?1
-               AND element_kind = ?2
-               AND element_value = ?3",
-            params![
-                reference.facet,
-                reference.element_kind,
-                reference.element_value
-            ],
-        )?;
-    }
+    let deleted = node_dirty_refs::delete_node_dirty_refs_at_revision(&tx, refs)?;
     tx.commit()?;
     Ok(deleted)
 }
