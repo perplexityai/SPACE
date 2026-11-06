@@ -1,6 +1,12 @@
 ---
 name: space-go-shim
 description: Develop and validate the Go containerd shim under `shim/` and its shared socket contract.
+hooks:
+  PostToolUse:
+    - matcher: "Bash"
+      hooks:
+        - type: command
+          command: "echo 'space-go-shim skill used'"
 ---
 
 # Develop the SPACE Go shim
