@@ -76,7 +76,10 @@ organizations (one nested), six users across roles and organizations, two API
 keys in the managing organization, and sandboxes that are running, paused,
 suspended and stopped, one in a tenant organization, and one created and
 deleted. Every name and organization display name carries the prefix, so
-runs under two prefixes can share a stack. Seeding sandboxes boots
+runs under two prefixes can share a stack. One `flows` step is the
+exception: `sandboxes-search-hex-name` needs a name of hex digits and dashes,
+which no prefix can start, so it names its sandbox `e2e-` and six random hex
+digits, records it in the state, and deletes it again. Seeding sandboxes boots
 Firecracker VMs and takes a minute or two; `--skip-sandboxes` leaves them out.
 
 The state is `out/seed-<prefix>.json`: the stack it was seeded on, the
