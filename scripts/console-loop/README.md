@@ -174,6 +174,21 @@ the annotation with
 where `<context>` is the run's `--kube-context` or `CONSOLE_LOOP_KUBE_CONTEXT`
 (`kind-space-local` by default).
 
+Two read-only `nodes` steps cover what holds a node. Both pick the worker
+the admin API's `GET /v1/nodes/{id}/holds` reports the most holds for, a node
+in a drain phase first. `node-holds-panel` checks that the node page's "What
+holds this node" panel lists every row of the holds answer the page received,
+in the five groups in order, each with a sentence and exactly the gates that
+count it, under the residency evidence the answer reports. It also checks that Upload local snapshots
+sits beside the local-only rows exactly when the API accepts that action, and
+that a node no term counts reads "Nothing holds this node" in the panel and
+the Drain section. `node-history-filters` opens the collapsed History and
+checks the lifecycle filter and, on a draining node, "Failed during this
+drain" against the requests the page sends, and that after the Reload and the
+toggle the History shows the answer's sandboxes in its order, newest change
+first. The loop seeds no holds: on a stack where nothing holds a node, the
+panel step notes that and checks only the empty panel.
+
 Each run writes `out/runs/<time>[-<label>]/`:
 
 - `summary.json`: per step, its URL, screenshot, duration, events (each with a
