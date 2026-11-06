@@ -150,3 +150,22 @@ fn rejection_error_is_retryable_and_not_a_node_mgr_outage() {
     // A node-mgr outage defers pod cleanup; a refused pod must be deleted now.
     assert!(!super::super::support::is_nodemgr_unreachable(&error));
 }
+
+#[test]
+fn index_is_bounded_during_a_refusal_burst() {
+    let index = SandboxCreateRejections::empty();
+    let rejection = SandboxCreateRejection {
+        pod_uid: None,
+        node_name: None,
+        message: String::new(),
+    };
+    for i in 0..=MAX_ENTRIES {
+        index.record(format!("pod-{i}"), rejection.clone());
+    }
+    assert!(index.rejection_for("pod-0", None).is_some());
+    assert!(
+        index
+            .rejection_for(&format!("pod-{MAX_ENTRIES}"), None)
+            .is_none()
+    );
+}

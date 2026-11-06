@@ -998,7 +998,7 @@ impl KubernetesSubstrate {
             sandbox_id,
             PodProxyWaitTarget {
                 pod_name: &execution.pod_name,
-                pod_uid: None,
+                pod_uid: execution.pod_uid.as_ref().map(PodUid::as_str),
                 generation: execution.generation,
             },
             "wake",
@@ -1062,8 +1062,9 @@ pub(super) fn node_admission_rejected_error(
 /// stays under clippy's `too_many_arguments` ceiling as knobs are added.
 pub(super) struct PodProxyWaitTarget<'a> {
     pub pod_name: &'a str,
-    /// Becomes the binding's `execution_object_id` when present; the wake
-    /// path passes `None` (the binding it produces is discarded).
+    /// Becomes the binding's `execution_object_id` when present (the wake
+    /// path discards its binding), and keeps a recorded admission rejection
+    /// of an earlier pod with the same name from matching.
     pub pod_uid: Option<&'a str>,
     pub generation: i64,
 }

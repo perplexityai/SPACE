@@ -46,6 +46,10 @@ const REJECTION_TTL: Duration = Duration::from_secs(15 * 60);
 const PRUNE_THRESHOLD: usize = 4096;
 const PRUNE_INTERVAL: Duration = Duration::from_secs(60);
 
+/// Hard bound on the index. A burst of distinct refusals within the TTL that
+/// fills it drops further ones, so those creates fall back to the wait budget.
+const MAX_ENTRIES: usize = 16 * 1024;
+
 /// Env flag enabling the fail-fast (default off). Needs list/watch on
 /// `events` in the sandbox namespace for the API's service account.
 const FAIL_FAST_ENV: &str = "SPACE_CREATE_FAIL_FAST_ON_NODE_REJECTION";
@@ -158,6 +162,10 @@ impl SandboxCreateRejections {
                 .entries
                 .retain(|_, entry| now.duration_since(entry.recorded_at) < REJECTION_TTL);
             inner.last_pruned = Some(now);
+        }
+        if inner.entries.len() >= MAX_ENTRIES && !inner.entries.contains_key(&pod_name) {
+            tracing::debug!(%pod_name, "sandbox create rejection index full; dropping rejection");
+            return;
         }
         inner.entries.insert(
             pod_name,
