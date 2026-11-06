@@ -609,8 +609,9 @@ message NetworkPoolStatusResponse {
   uint64 sandbox_guest_memory_max_mib = 17;
   uint64 sandbox_memory_headroom_mib = 18;
   uint64 sandbox_cgroup_total_memory_mib = 19;
-  // How many more sandboxes of `sandbox_cgroup_memory_mib` node memory
-  // admission would accept right now, by the same rule `Allocate` applies.
+  // How many more sandboxes node memory admission would accept right now, by
+  // the same rule `Allocate` applies, each sized like the largest active lease
+  // (at least `sandbox_cgroup_memory_mib`).
   // Absent when node memory could not be read. Node-ctl clamps the advertised
   // network-slot capacity with it so kube-scheduler stops placing pods that
   // memory admission would refuse.
