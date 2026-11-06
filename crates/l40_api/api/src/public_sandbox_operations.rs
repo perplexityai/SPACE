@@ -24,6 +24,9 @@ use tracing::Instrument;
 use crate::controllers::TemplateReleaseMiss;
 use crate::controllers::sandbox::FederatedSandboxCreateContext;
 use crate::controllers::sandbox::lifecycle::SandboxAction;
+use crate::controllers::sandbox::lifecycle::user_admission::{
+    UserLifecycleRequest, admit_user_lifecycle,
+};
 use crate::controllers::sandbox::{SandboxController, fetch_sandbox};
 use crate::controllers::substrate::ExecutionActivityKind;
 use crate::controllers::{ControllerError, SnapshotUploadCheck, SnapshotUploadInFlight};
@@ -747,6 +750,7 @@ impl SandboxLifecycleOperationExecutor {
         }
 
         if payload.action == SandboxLifecycleAction::Delete {
+            admit_user_lifecycle(sandbox_uuid.into(), UserLifecycleRequest::Delete);
             if sandbox.is_none() && operation.api_product != ApiProduct::Admin {
                 return Ok(lifecycle_success_result(
                     payload.sandbox_id,
@@ -804,6 +808,7 @@ impl SandboxLifecycleOperationExecutor {
             ));
         }
         if payload.action == SandboxLifecycleAction::Rollback {
+            admit_user_lifecycle(sandbox_uuid.into(), UserLifecycleRequest::Rollback);
             let rollback = payload
                 .rollback
                 .ok_or(SandboxLifecycleExecutionError::MissingRollbackRequest)?;

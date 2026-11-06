@@ -8,6 +8,9 @@ use pplx_space_public_api::{
     SandboxLifecycleAction as PublicSandboxLifecycleAction,
 };
 
+use crate::controllers::sandbox::lifecycle::user_admission::{
+    UserLifecycleRequest, admit_user_lifecycle,
+};
 use crate::public_operations::{
     CreatePublicOperationResult, PublicOperationStore, PublicOperationStoreError,
 };
@@ -531,6 +534,7 @@ pub(super) async fn delete_sandbox(
     }
     .into_json();
     let target_id = public_sandbox_id.to_string();
+    admit_user_lifecycle(sandbox.id, UserLifecycleRequest::Delete);
     let store = PublicOperationStore::new(state.pool.clone());
     let created = store
         // The scope check above authorizes the caller; the store anchors and

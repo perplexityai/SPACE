@@ -15,6 +15,7 @@ use pplx_space_sandbox_store::delete::{mark_deleting, restore_lifecycle_from_del
 use pplx_space_sandbox_store::fork_source_lifecycle::{
     active_fork_source_operation_exists, lock_fork_source_lifecycle,
 };
+use user_admission::{UserLifecycleRequest, admit_user_lifecycle};
 
 const FINALIZE_SANDBOX_DB_DELETE_ATTEMPTS: usize = 4;
 const FINALIZE_SANDBOX_DB_DELETE_BASE_DELAY_MS: u64 = 50;
@@ -1459,6 +1460,7 @@ impl SandboxController {
         action: SandboxAction,
         activation: Option<SandboxActivationRequest>,
     ) -> Result<serde_json::Value, ControllerError> {
+        admit_user_lifecycle(id, UserLifecycleRequest::Action(action));
         let Some(sandbox) = sandbox else {
             return self
                 .untracked_action(id, metric_identity, action, activation)
@@ -2373,6 +2375,8 @@ impl SandboxController {
         Ok(stats)
     }
 }
+
+pub(crate) mod user_admission;
 
 #[cfg(test)]
 mod tests;

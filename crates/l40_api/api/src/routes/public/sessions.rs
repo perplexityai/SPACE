@@ -23,7 +23,14 @@ use serde::Deserialize;
 use time::OffsetDateTime;
 
 use crate::{
-    controllers::{ControllerError, substrate::ExecutionActivityKind},
+    controllers::{
+        ControllerError,
+        sandbox::lifecycle::{
+            SandboxAction,
+            user_admission::{UserLifecycleRequest, admit_user_lifecycle},
+        },
+        substrate::ExecutionActivityKind,
+    },
     inline_operations::InlineLifecycle,
     middleware::auth::{AuthOrg, AuthUser},
     models::Sandbox,
@@ -362,6 +369,10 @@ async fn enqueue_implicit_wake(
     activity: ExecutionActivityKind,
     record_activity: bool,
 ) -> Result<(), PublicApiError> {
+    admit_user_lifecycle(
+        sandbox_id.into(),
+        UserLifecycleRequest::Action(SandboxAction::ImplicitWake(activity)),
+    );
     let payload = SandboxLifecycleOperationPayload {
         sandbox_id,
         action: SandboxLifecycleAction::Wake,

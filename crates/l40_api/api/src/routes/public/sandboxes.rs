@@ -43,6 +43,7 @@ use crate::{
         ControllerError,
         sandbox::{
             AdmissionPoolPlan, SandboxController, fetch_sandbox,
+            lifecycle::user_admission::{UserLifecycleRequest, admit_user_lifecycle},
             list_page::{ListPage, PageWalkParams, SANDBOX_LIST_ROW_OVERHEAD_BYTES, page_rows_cte},
         },
         substrate::AdmissionPoolClaim,
@@ -1035,6 +1036,7 @@ async fn enqueue_lifecycle_operation(
     if !found {
         return Err(PublicApiError::not_found("sandbox not found"));
     }
+    admit_user_lifecycle(sandbox_id.into(), UserLifecycleRequest::from(action));
     let sandbox_id_string = sandbox_id.to_string();
     let payload_json = SandboxLifecycleOperationPayload {
         sandbox_id,

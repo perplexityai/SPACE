@@ -23,6 +23,9 @@ use sha2::{Digest, Sha256};
 
 use super::audit::{self, AdminAuditTarget, AdminSandboxAuditEntry};
 use super::sandbox_id::{AdminSandboxIdError, parse_admin_sandbox_id};
+use crate::controllers::sandbox::lifecycle::user_admission::{
+    UserLifecycleRequest, admit_user_lifecycle,
+};
 use crate::middleware::auth::AuthUser;
 use crate::models::{Sandbox, SandboxResponse, User};
 use crate::public_operations::{
@@ -754,6 +757,7 @@ async fn enqueue_admin_lifecycle_operation(
         wake_activity: None,
     }
     .into_json();
+    admit_user_lifecycle(target.public_id.into(), UserLifecycleRequest::from(action));
     let store = PublicOperationStore::new(pool.clone());
     let result = store
         .create_operation(CreatePublicOperation {
