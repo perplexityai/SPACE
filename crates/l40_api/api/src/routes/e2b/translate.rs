@@ -160,6 +160,7 @@ pub(super) fn translate_create_request(
             // sandbox is command-ready so those follow-ups don't race the
             // sbx-mgr `Starting → Started` transition.
             wait_until_ready: true,
+            command_ready_wait: None,
             network_policy,
             // Placement is an internal/operator-only knob; ECW/E2B never pins.
             node_pool: None,

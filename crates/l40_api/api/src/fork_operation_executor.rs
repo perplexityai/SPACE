@@ -1610,6 +1610,7 @@ fn create_request(
             requested_timeout.get(),
         )),
         wait_until_ready: true,
+        command_ready_wait: None,
         network_policy: config.network_policy.clone(),
         node_pool: None,
     }

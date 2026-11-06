@@ -1408,6 +1408,12 @@ pub(super) fn remaining_ready_window(phase_deadline: Instant) -> Duration {
     phase_deadline.saturating_duration_since(Instant::now())
 }
 
+/// How long a create waits for its guest to answer: the substrate's
+/// `create_command_ready_timeout`, or the caller's shorter `requested` cap.
+pub(super) fn command_ready_bound(substrate: Duration, requested: Option<Duration>) -> Duration {
+    requested.map_or(substrate, |requested| requested.min(substrate))
+}
+
 /// Build the [`SubstrateError::Timeout`] for a command-readiness wait that
 /// exhausted its deadline. `phase` attributes the timeout to the step that
 /// actually stalled: `PodNeverReady` when no pod IP ever resolved,

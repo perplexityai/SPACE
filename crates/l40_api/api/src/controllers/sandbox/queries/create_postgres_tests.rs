@@ -638,6 +638,7 @@ fn pooled_create_request(
         file_changes: None,
         auto_lifecycle: None,
         wait_until_ready: false,
+        command_ready_wait: None,
         network_policy,
         node_pool: None,
     }

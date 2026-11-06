@@ -59,6 +59,7 @@ fn assert_cold_matches_adoption(
         disk_io_limits: Default::default(),
         restore_from: None,
         wait_until_ready: true,
+        command_ready_wait: None,
         volume_encryption: false,
         node_pool: None,
     };

@@ -225,6 +225,7 @@ impl CreateInputs {
             template_network_policy_generation: 1,
             restore_from: None,
             wait_until_ready: false,
+            command_ready_wait: None,
             volume_encryption: false,
             node_pool: None,
         }

@@ -151,19 +151,32 @@ impl SubstrateAdapter for KubernetesSubstrate {
                         phase_deadline,
                     )
                     .await?;
+                // A guest that does not answer within the create's wait leaves
+                // the joined create returning the owner's reachable pod as
+                // started, not command-ready, as a create that owns its pod
+                // does. An error here would make the caller delete its sandbox
+                // row, and with it the execution the owner is still starting.
                 let binding = if request.wait_until_ready {
-                    self.poll_until_command_ready(
-                        sandbox_id,
-                        request.metric_identity,
-                        self.k8s
-                            .create_command_ready_timeout
+                    match self
+                        .poll_until_command_ready(
+                            sandbox_id,
+                            request.metric_identity,
+                            command_ready_bound(
+                                self.k8s.create_command_ready_timeout,
+                                request.command_ready_wait,
+                            )
                             .min(remaining_ready_window(phase_deadline)),
-                        CommandReadyPod::PreResolved(pod_ip),
-                        Some(request.template_ref.template.as_str()),
-                    )
-                    .await?
+                            CommandReadyPod::PreResolved(pod_ip),
+                            Some(request.template_ref.template.as_str()),
+                        )
+                        .await
+                    {
+                        Ok(binding) => Some(binding),
+                        Err(SubstrateError::Timeout { .. }) => None,
+                        Err(error) => return Err(error),
+                    }
                 } else {
-                    binding
+                    Some(binding)
                 };
                 let joined_pod = match self.lookup_sandbox_pod(&execution.pod_name) {
                     Some(pod) => Some(pod),
@@ -189,11 +202,11 @@ impl SubstrateAdapter for KubernetesSubstrate {
                 return Ok(CreateExecutionOutcome {
                     lease_completion: None,
                     sandbox_id,
-                    binding: Some(binding),
+                    command_ready: binding.is_some(),
+                    binding,
                     initial_lifecycle: "started",
                     initial_placement: "on_node",
                     active_node_id: Some(active_node_id),
-                    command_ready: true,
                 });
             }
             Err(error) => return Err(error),
@@ -485,9 +498,11 @@ impl SubstrateAdapter for KubernetesSubstrate {
                 self.poll_until_command_ready(
                     sandbox_id,
                     request.metric_identity,
-                    self.k8s
-                        .create_command_ready_timeout
-                        .min(remaining_ready_window(phase_deadline)),
+                    command_ready_bound(
+                        self.k8s.create_command_ready_timeout,
+                        request.command_ready_wait,
+                    )
+                    .min(remaining_ready_window(phase_deadline)),
                     CommandReadyPod::PreResolved(pod_ip),
                     Some(request.template_ref.template.as_str()),
                 )

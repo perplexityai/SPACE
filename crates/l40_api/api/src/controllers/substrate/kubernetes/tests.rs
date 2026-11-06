@@ -11583,6 +11583,7 @@ mod kubernetes_tests {
                 },
             ),
             wait_until_ready: false,
+            command_ready_wait: None,
             volume_encryption: false,
             node_pool: None,
         };

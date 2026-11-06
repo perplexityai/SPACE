@@ -437,6 +437,10 @@ pub struct CreateExecutionRequest<'a> {
     pub template_network_policy_generation: u64,
     pub restore_from: Option<SnapshotRef<'a>>,
     pub wait_until_ready: bool,
+    /// The caller's cap on a `wait_until_ready` create's wait for its guest,
+    /// below the substrate's own bound; see
+    /// [`crate::models::CreateSandboxRequest::command_ready_wait`].
+    pub command_ready_wait: Option<Duration>,
     /// BYOK: create this sandbox on dm-crypt encrypted volumes. Immutable for
     /// the sandbox's lifetime; the control plane stamps it on the `sandboxes`
     /// row and the substrate must carry it to the node create (or fail closed
