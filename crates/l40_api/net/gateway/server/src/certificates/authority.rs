@@ -25,7 +25,7 @@ use x509_parser::prelude::{FromDer, X509Certificate};
 
 use crate::ingress::ServicePortIngressState;
 use crate::state::{GatewayNetworkState, ReadinessObserver};
-use pplx_space_metrics::gateway::readiness::{self as metrics, Outcome};
+use pplx_space_sandbox_metrics::gateway_readiness::{self as metrics, Outcome};
 
 const MAX_CERTIFICATE_BYTES: usize = 16 * 1024;
 const LEAF_LIFETIME_SECS: i64 = 86_400;

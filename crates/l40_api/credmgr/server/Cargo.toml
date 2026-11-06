@@ -84,7 +84,7 @@ pplx-space-credential-injection-core = { workspace = true }
 pplx-space-credential-injection-store = { workspace = true }
 pplx-space-credential-provider-client = { workspace = true }
 pplx-space-credmgr-client = { workspace = true }
-pplx-space-metrics = { workspace = true }
+pplx-space-metrics-emit = { workspace = true }
 pplx-space-net-common = { workspace = true }
 
 [dev-dependencies]

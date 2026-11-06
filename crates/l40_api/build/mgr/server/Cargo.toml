@@ -48,7 +48,6 @@ pplx-space-build-mgr = { workspace = true }
 pplx-space-build-mgr-client = { workspace = true }
 pplx-space-common-jobs = { workspace = true }
 pplx-space-common-svc = { workspace = true }
-pplx-space-metrics = { workspace = true }
 
 [dev-dependencies]
 rcgen = { workspace = true, features = ["aws_lc_rs", "pem"] }

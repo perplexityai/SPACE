@@ -38,7 +38,7 @@ pplx-space-common-core = { workspace = true }
 pplx-space-common-grpc = { workspace = true }
 pplx-space-common-svc = { workspace = true }
 pplx-space-grpc-metrics = { workspace = true }
-pplx-space-metrics = { workspace = true }
+pplx-space-metrics-emit = { workspace = true }
 pplx-space-spaced-common = { workspace = true }
 prost-types = { workspace = true }
 

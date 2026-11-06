@@ -490,7 +490,7 @@ fn apply_to_devices(
 }
 
 fn emit_metrics(reservation: &ParentDiskIoReservation) {
-    use pplx_space_metrics::node_disk;
+    use crate::metrics::node_disk;
 
     node_disk::sandbox_io_reservation_configured(!matches!(
         reservation,

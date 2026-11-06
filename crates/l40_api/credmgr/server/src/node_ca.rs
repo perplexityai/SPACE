@@ -436,7 +436,7 @@ impl IntermediateCache {
                 if let Err(error) = outcome
                     && let Some(reason) = error.unavailable_reason()
                 {
-                    pplx_space_metrics::credmgr::node_ca_reprobe(reason);
+                    crate::metrics::node_ca_reprobe(reason);
                     tracing::warn!(
                         reason,
                         %error,

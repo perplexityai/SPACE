@@ -397,7 +397,7 @@ impl SandboxManagerService {
             return Ok(());
         }
         if start.provisional_activation_attempt {
-            use pplx_space_metrics::sandbox::worker::{
+            use crate::metrics::sandbox::worker::{
                 RouteIdentityAdoptionOutcome, RouteIdentityAdoptionReason, route_identity_adoption,
             };
             route_identity_adoption(

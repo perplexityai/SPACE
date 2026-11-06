@@ -232,12 +232,12 @@ pub(super) async fn reconcile_sandbox_port_exposures<A: SandboxPortExposureAppli
                     // repairs durable state; periodic desired-state sync then
                     // re-applies anything that becomes actionable.
                     terminal_failure = true;
-                    pplx_space_metrics::reconcile::DesiredStateApplyResult::Terminal
+                    crate::metrics::reconcile::DesiredStateApplyResult::Terminal
                 } else {
                     record_element_error(element_errors, sandbox_id, &error);
-                    pplx_space_metrics::reconcile::DesiredStateApplyResult::Retryable
+                    crate::metrics::reconcile::DesiredStateApplyResult::Retryable
                 };
-                pplx_space_metrics::reconcile::desired_state_apply(result_kind);
+                crate::metrics::reconcile::desired_state_apply(result_kind);
                 (
                     SandboxPortApplyStateKind::SandboxPortApplyStateFailed,
                     Some(error),

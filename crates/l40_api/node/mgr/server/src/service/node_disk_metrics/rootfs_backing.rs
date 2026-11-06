@@ -165,7 +165,7 @@ fn collect(sandboxes: &Path, templates: &Path) -> io::Result<Inventory> {
 }
 
 pub(super) fn emit_inventory(sandboxes: &Path, templates: &Path) {
-    use pplx_space_metrics::node_disk;
+    use crate::metrics::node_disk;
 
     let observed_at = SystemTime::now();
     match collect(sandboxes, templates) {

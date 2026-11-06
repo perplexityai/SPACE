@@ -426,7 +426,7 @@ impl TransferExecutor {
         let artifact = transfer_artifact_tag(snapshot_artifact);
         let block_bytes = materialization_block_bytes(snapshot_artifact);
         let Some(admission) = self.try_acquire_sparse_shadow_admission() else {
-            pplx_space_metrics::volume_manager::transfer_materialization_shadow_comparison(
+            crate::metrics::transfer_materialization_shadow_comparison(
                 artifact,
                 ShadowComparisonOutcome::SkippedBusy.as_str(),
             );
@@ -439,7 +439,7 @@ impl TransferExecutor {
             return None;
         };
         let Ok(metadata) = tokio::fs::metadata(local_path).await else {
-            pplx_space_metrics::volume_manager::transfer_materialization_shadow_comparison(
+            crate::metrics::transfer_materialization_shadow_comparison(
                 artifact,
                 ShadowComparisonOutcome::Error.as_str(),
             );
@@ -463,7 +463,7 @@ impl TransferExecutor {
         let has_disk_headroom = disk_status
             .is_some_and(|status| sparse_shadow_has_disk_headroom(status, logical_bytes));
         if !has_disk_headroom {
-            pplx_space_metrics::volume_manager::transfer_materialization_shadow_comparison(
+            crate::metrics::transfer_materialization_shadow_comparison(
                 artifact,
                 ShadowComparisonOutcome::SkippedDisk.as_str(),
             );
@@ -482,7 +482,7 @@ impl TransferExecutor {
         let snapshot_started_at = Instant::now();
         if let Err(error) = crate::staging::reflink_only(local_path, &snapshot_path).await {
             remove_sparse_shadow_snapshot(&snapshot_path, "reflink failed").await;
-            pplx_space_metrics::volume_manager::transfer_materialization_shadow_comparison(
+            crate::metrics::transfer_materialization_shadow_comparison(
                 artifact,
                 ShadowComparisonOutcome::Error.as_str(),
             );
@@ -567,11 +567,11 @@ impl TransferExecutor {
 
             match result {
                 Ok(Ok(observation)) => {
-                    pplx_space_metrics::volume_manager::transfer_materialization_shadow_comparison(
+                    crate::metrics::transfer_materialization_shadow_comparison(
                         artifact,
                         ShadowComparisonOutcome::Match.as_str(),
                     );
-                    pplx_space_metrics::volume_manager::transfer_materialization_allocation(
+                    crate::metrics::transfer_materialization_allocation(
                         "pull",
                         artifact,
                         MaterializationMode::Shadow,
@@ -606,7 +606,7 @@ impl TransferExecutor {
                     } else {
                         ShadowComparisonOutcome::Error
                     };
-                    pplx_space_metrics::volume_manager::transfer_materialization_shadow_comparison(
+                    crate::metrics::transfer_materialization_shadow_comparison(
                         artifact,
                         outcome.as_str(),
                     );
@@ -621,7 +621,7 @@ impl TransferExecutor {
                     None
                 }
                 Err(error) => {
-                    pplx_space_metrics::volume_manager::transfer_materialization_shadow_comparison(
+                    crate::metrics::transfer_materialization_shadow_comparison(
                         artifact,
                         ShadowComparisonOutcome::Error.as_str(),
                     );

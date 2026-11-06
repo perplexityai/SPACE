@@ -196,7 +196,7 @@ impl PgIntermediateKeyIdentityLookup {
             (Some(_), None) => "org_wide",
             (None, _) => "none",
         };
-        pplx_space_metrics::credmgr::federated_grant_identity_source(source);
+        crate::metrics::federated_grant_identity_source(source);
         Ok(grant)
     }
 }

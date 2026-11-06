@@ -122,7 +122,7 @@ impl RetainedSourceCheck {
             Self::Invalid { .. } => "invalid",
             Self::Unavailable { .. } => "unavailable",
         };
-        pplx_space_metrics::snapshot::retained_source_inspection(
+        crate::metrics::snapshot::retained_source_inspection(
             outcome,
             code.map(code_tag)
                 .filter(|_| matches!(self, Self::Unavailable { .. })),
@@ -413,10 +413,7 @@ impl PendingRetainedSources {
             .map(|(first, _)| now.saturating_duration_since(*first))
             .max()
             .unwrap_or_default();
-        pplx_space_metrics::snapshot::retained_source_pending(
-            self.seen.len(),
-            oldest.as_secs_f64(),
-        );
+        crate::metrics::snapshot::retained_source_pending(self.seen.len(), oldest.as_secs_f64());
     }
 }
 

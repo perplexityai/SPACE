@@ -158,10 +158,7 @@ impl ReservedDnsCore {
         );
         // Leaders are counted inside the shared lookup once it holds its slot.
         if role == LookupRole::Follower {
-            pplx_space_metrics::gateway::reserved_dns_lookup_coalesce(
-                resolver.as_str(),
-                role.as_str(),
-            );
+            crate::metrics::reserved_dns_lookup_coalesce(resolver.as_str(), role.as_str());
         }
         // Policy cancellation detaches only this waiter; the shared lookup
         // keeps running for any other waiter and is dropped with the last one.

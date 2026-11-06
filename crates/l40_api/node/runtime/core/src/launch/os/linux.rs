@@ -856,7 +856,7 @@ fn run_jailer_command(
     jailer_args: &[String],
     timeout: Duration,
 ) -> Result<(), String> {
-    use pplx_space_metrics::runtime_supervisor::{JailerOutcome, jailer_finished};
+    use crate::metrics::{JailerOutcome, jailer_finished};
     let label = format!("jailer for {sandbox_id}");
     let mut cmd = direct_jailer_command(jailer, jailer_args)
         .map_err(|error| format!("prepare jailer execution: {error}"))?;

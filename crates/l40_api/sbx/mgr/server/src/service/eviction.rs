@@ -290,7 +290,7 @@ impl SandboxManagerService {
             let reason = proven
                 .err()
                 .unwrap_or(crate::sandbox_eviction::SkipReason::LocalArtifactAwaitingBackup);
-            pplx_space_metrics::sandbox_eviction::skipped(reason.as_str());
+            crate::metrics::sandbox_eviction::skipped(reason.as_str());
             let held_because =
                 if reason == crate::sandbox_eviction::SkipReason::LocalArtifactStampFailed {
                     "the cluster proved another local artifact of the sandbox backed, but its \
@@ -319,7 +319,7 @@ impl SandboxManagerService {
             let reason = backed
                 .err()
                 .unwrap_or(crate::sandbox_eviction::SkipReason::NoBackedCopy);
-            pplx_space_metrics::sandbox_eviction::skipped(reason.as_str());
+            crate::metrics::sandbox_eviction::skipped(reason.as_str());
             tracing::warn!(
                 sandbox_id,
                 %execution_generation,
@@ -375,7 +375,7 @@ impl SandboxManagerService {
                     Some(still_driving && pending)
                 });
                 if awaiting_backup == Some(true) {
-                    pplx_space_metrics::sandbox_eviction::skipped(
+                    crate::metrics::sandbox_eviction::skipped(
                         crate::sandbox_eviction::SkipReason::LocalArtifactAwaitingBackup.as_str(),
                     );
                     tracing::warn!(
@@ -859,7 +859,7 @@ impl SandboxManagerService {
                 ) => result,
             };
             if result.is_ok() {
-                pplx_space_metrics::sandbox_eviction::logical_bytes_freed(reason.as_str(), bytes);
+                crate::metrics::sandbox_eviction::logical_bytes_freed(reason.as_str(), bytes);
                 tracing::info!(
                     sandbox_id = %sandbox_id,
                     reason = reason.as_str(),

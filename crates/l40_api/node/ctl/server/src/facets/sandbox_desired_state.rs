@@ -215,8 +215,8 @@ pub(super) async fn refresh_sandbox_desired_state(
                 Ok(_) => {
                     evicted = evicted.saturating_add(1);
                     stats.sandboxes_applied = stats.sandboxes_applied.saturating_add(1);
-                    pplx_space_metrics::reconcile::cluster_deleted_evict(
-                        pplx_space_metrics::reconcile::ClusterDeletedEvictResult::Evicted,
+                    crate::metrics::reconcile::cluster_deleted_evict(
+                        crate::metrics::reconcile::ClusterDeletedEvictResult::Evicted,
                     );
                     continue;
                 }
@@ -225,8 +225,8 @@ pub(super) async fn refresh_sandbox_desired_state(
             match cluster_deleted_evict_refusal_disposition(status, sync_interval) {
                 ClusterDeletedEvictDisposition::RetryNextSync => {
                     deferred = deferred.saturating_add(1);
-                    pplx_space_metrics::reconcile::cluster_deleted_evict(
-                        pplx_space_metrics::reconcile::ClusterDeletedEvictResult::Deferred,
+                    crate::metrics::reconcile::cluster_deleted_evict(
+                        crate::metrics::reconcile::ClusterDeletedEvictResult::Deferred,
                     );
                     tracing::debug!(
                         sandbox_id,
@@ -238,8 +238,8 @@ pub(super) async fn refresh_sandbox_desired_state(
                     deferred = deferred.saturating_add(1);
                     CLUSTER_DELETED_EVICT_BACKOFF_UNTIL
                         .insert(sandbox_id.to_string(), std::time::Instant::now() + backoff);
-                    pplx_space_metrics::reconcile::cluster_deleted_evict(
-                        pplx_space_metrics::reconcile::ClusterDeletedEvictResult::Deferred,
+                    crate::metrics::reconcile::cluster_deleted_evict(
+                        crate::metrics::reconcile::ClusterDeletedEvictResult::Deferred,
                     );
                     tracing::debug!(
                         sandbox_id,
@@ -251,8 +251,8 @@ pub(super) async fn refresh_sandbox_desired_state(
                 ClusterDeletedEvictDisposition::Failed(backoff) => {
                     CLUSTER_DELETED_EVICT_BACKOFF_UNTIL
                         .insert(sandbox_id.to_string(), std::time::Instant::now() + backoff);
-                    pplx_space_metrics::reconcile::cluster_deleted_evict(
-                        pplx_space_metrics::reconcile::ClusterDeletedEvictResult::Failed,
+                    crate::metrics::reconcile::cluster_deleted_evict(
+                        crate::metrics::reconcile::ClusterDeletedEvictResult::Failed,
                     );
                     tracing::warn!(
                         sandbox_id,
@@ -427,7 +427,7 @@ pub(super) fn handle_local_desired_state_apply(
             %error,
             "terminal sandbox desired-state apply; completing ref until state changes"
         );
-        pplx_space_metrics::reconcile::DesiredStateApplyResult::Terminal
+        crate::metrics::reconcile::DesiredStateApplyResult::Terminal
     } else {
         tracing::warn!(
             sandbox_id,
@@ -435,7 +435,7 @@ pub(super) fn handle_local_desired_state_apply(
             "retryable sandbox desired-state apply failure"
         );
         record_element_error(element_errors, sandbox_id, &error.to_string());
-        pplx_space_metrics::reconcile::DesiredStateApplyResult::Retryable
+        crate::metrics::reconcile::DesiredStateApplyResult::Retryable
     };
-    pplx_space_metrics::reconcile::desired_state_apply(result_kind);
+    crate::metrics::reconcile::desired_state_apply(result_kind);
 }
