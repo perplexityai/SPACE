@@ -2121,7 +2121,8 @@ pub struct PublicErrorEnvelope {
     /// `not_found`, including a missing or unowned sandbox, carries none. A
     /// `conflict` from replaying a session create whose session has ended
     /// carries `{"key": "reason", "value": "session_ended"}`. A `conflict`
-    /// refusing a command because the sandbox is not running carries `reason`
+    /// refusing a command, or a file or process request, because the sandbox
+    /// is not running carries `reason`
     /// (`sandbox_not_running`), `state` (the sandbox's lifecycle state) and,
     /// unless the sandbox is deleting or failed, `wake` (the request that
     /// returns it to running). An `invalid_request` for a command streamed

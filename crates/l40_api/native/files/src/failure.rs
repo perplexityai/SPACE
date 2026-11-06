@@ -3,6 +3,7 @@
 use std::{fmt, time::Duration};
 
 use http::StatusCode;
+use pplx_space_common_core::types::{SandboxId, SandboxLifecycle};
 
 /// A failed call to the sandbox, as [`file_call_error`] reads it.
 pub trait FileCallFailure: fmt::Display {
@@ -16,6 +17,11 @@ pub trait FileCallFailure: fmt::Display {
     fn is_refused_before_start(&self) -> bool;
     /// A statement in the answering server's own database lost a lock race.
     fn is_lock_contention(&self) -> bool;
+    /// The sandbox was refused the call because it is at rest and its wake
+    /// policy does not let this request wake it, with the state it was in.
+    fn sandbox_not_running(&self) -> Option<(SandboxId, SandboxLifecycle)> {
+        None
+    }
 }
 
 /// A worker's gRPC status, read as an HTTP failure.
@@ -138,6 +144,12 @@ pub enum FileCallErrorKind {
     PathNotFound(String),
     NotFound(String),
     Conflict(String),
+    /// The sandbox is at rest and this request may not wake it; answered
+    /// with the details `createCommand` gives the same refusal.
+    SandboxNotRunning {
+        sandbox_id: SandboxId,
+        lifecycle: SandboxLifecycle,
+    },
     FailedPrecondition(String),
     RateLimited {
         message: String,
@@ -177,6 +189,13 @@ pub fn file_call_error(failure: &impl FileCallFailure) -> FileCallError {
     // would attribute it to the cluster or the node.
     if failure.is_lock_contention() {
         return FileCallErrorKind::LockContention.into();
+    }
+    if let Some((sandbox_id, lifecycle)) = failure.sandbox_not_running() {
+        return FileCallErrorKind::SandboxNotRunning {
+            sandbox_id,
+            lifecycle,
+        }
+        .into();
     }
     let retry_after = failure.retry_after();
     let kind = match failure.status() {

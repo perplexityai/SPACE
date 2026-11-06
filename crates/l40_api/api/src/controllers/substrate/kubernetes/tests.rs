@@ -266,6 +266,39 @@ mod kubernetes_tests {
         );
     }
 
+    /// Access to a sandbox at rest whose wake policy does not let it wake is
+    /// refused naming the sandbox and its state, which the Native routes
+    /// answer with `createCommand`'s `sandbox_not_running` details.
+    #[test]
+    fn a_disallowed_access_wake_names_the_sandbox_at_rest() {
+        for lifecycle in [
+            SandboxLifecycle::Created,
+            SandboxLifecycle::Stopped,
+            SandboxLifecycle::Paused,
+            SandboxLifecycle::Suspended,
+        ] {
+            let sandbox = test_sandbox_with_lifecycle(lifecycle.as_str());
+            let error = KubernetesSubstrate::should_allow_access_recovery(
+                &sandbox,
+                ExecutionActivityKind::Access,
+            )
+            .expect_err("the disabled policy does not wake on access");
+            assert_eq!(
+                error.status(),
+                axum::http::StatusCode::CONFLICT,
+                "{lifecycle}"
+            );
+            assert_eq!(
+                error.sandbox_not_running_refusal(),
+                Some(crate::controllers::SandboxNotRunning {
+                    sandbox_id: sandbox.id,
+                    lifecycle,
+                }),
+                "{lifecycle}"
+            );
+        }
+    }
+
     #[test]
     fn paused_restore_does_not_join_started_recovery() {
         let should_join = should_join_started_recovery(
