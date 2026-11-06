@@ -37,6 +37,7 @@ mod public_operation_dispatcher;
 mod public_operation_retention;
 mod reconcile_queue_gc;
 mod reconcilers;
+mod retired_execution_pod_gc;
 mod snapshot_retention_sweeper;
 mod snapshot_storage_sweeper;
 mod stuck_container_creating_gc;
