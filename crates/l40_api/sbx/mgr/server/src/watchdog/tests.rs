@@ -143,6 +143,7 @@ fn flag_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
 
 fn restart_test_info(sandbox_id: &str) -> SidecarInfo {
     SidecarInfo {
+        template: "seed".to_string(),
         guest_image: Default::default(),
         node_execution_id: None,
         sandbox_id: sandbox_id.to_string(),
@@ -289,6 +290,7 @@ async fn clear_netgtw_probe_state_drops_cached_process_observations() {
     );
     watchdog
         .add_sandbox(SidecarInfo {
+            template: "seed".to_string(),
             guest_image: Default::default(),
             node_execution_id: None,
             sandbox_id: "0199c1e0-0000-7000-8000-000000000001".to_string(),
@@ -1312,8 +1314,10 @@ async fn lifecycle_edge_preserves_status_and_discards_in_flight_probe() {
             Some(crate::state::SandboxState::Started),
             0,
             ComposedProbeResult {
+                template: "seed".to_string(),
                 observations,
                 guest_status: None,
+                memory_used_bytes: None,
             },
         ))),
     )
@@ -1331,6 +1335,176 @@ async fn lifecycle_edge_preserves_status_and_discards_in_flight_probe() {
             .all(|observation| observation.lifecycle_epoch == 0)),
         "the stale probe must not append observations in the new epoch"
     );
+}
+
+/// An accepted probe yields its guest's used memory only for a `started`
+/// sandbox, including idle warm-pool members; a discarded probe yields
+/// nothing. Memory never moves health:
+/// each case's status matches the same probe without it.
+#[tokio::test]
+async fn accepted_probe_yields_guest_memory_only_for_a_running_sandbox() {
+    use crate::state::SandboxState::{Paused, Quarantined, Started};
+
+    struct Case {
+        name: &'static str,
+        row: Option<crate::state::SandboxState>,
+        warm_pool_member: bool,
+        lifecycle: Option<crate::state::SandboxState>,
+        stale: bool,
+        removed: bool,
+        guest: HealthProbeOutcome,
+        memory: Option<u64>,
+        /// `None` when the probe is discarded.
+        expected: Option<Option<u64>>,
+    }
+    let case = |name, memory, expected| Case {
+        name,
+        row: Some(Started),
+        warm_pool_member: false,
+        lifecycle: Some(Started),
+        stale: false,
+        removed: false,
+        guest: HealthProbeOutcome::Success,
+        memory,
+        expected,
+    };
+    let used = 512 << 20;
+    let cases = [
+        case("running workload", Some(used), Some(Some(used))),
+        case("nothing used", Some(0), Some(Some(0))),
+        case("guest without the field", None, Some(None)),
+        Case {
+            guest: HealthProbeOutcome::Unavailable,
+            ..case("failed ping", None, Some(None))
+        },
+        Case {
+            stale: true,
+            ..case("older lifecycle epoch", Some(used), None)
+        },
+        Case {
+            removed: true,
+            ..case("sandbox retired during probe", Some(used), None)
+        },
+        Case {
+            lifecycle: None,
+            ..case("unknown lifecycle", Some(used), Some(None))
+        },
+        Case {
+            row: Some(Paused),
+            lifecycle: Some(Paused),
+            ..case("paused", Some(used), Some(None))
+        },
+        Case {
+            row: Some(Quarantined),
+            lifecycle: Some(Quarantined),
+            ..case("quarantined", Some(used), Some(None))
+        },
+        Case {
+            warm_pool_member: true,
+            ..case("idle warm-pool member", Some(used), Some(Some(used)))
+        },
+        Case {
+            row: None,
+            ..case(
+                "no database row needed for memory",
+                Some(used),
+                Some(Some(used)),
+            )
+        },
+    ];
+
+    for case in cases {
+        let apply = |memory_used_bytes| {
+            let sandbox_id = SandboxId::new().to_string();
+            let conn = crate::db::test_conn();
+            if let Some(row) = case.row {
+                insert_test_sandbox(&conn, &sandbox_id, row);
+            }
+            if case.warm_pool_member {
+                conn.execute(
+                    "UPDATE sandboxes SET pool_template = 'seed' WHERE id = ?1",
+                    crate::db::fixture::params![sandbox_id],
+                )
+                .expect("pool template update");
+            }
+            let mut health = test_health();
+            health.lifecycle_epoch = u64::from(case.stale);
+            let state = Arc::new(Mutex::new(HashMap::from([(sandbox_id.clone(), health)])));
+            let db = crate::db::SharedConnection::new(conn);
+            let mut observations = std::array::from_fn(|_| sample(HealthProbeOutcome::Success));
+            observations[2] = sample(case.guest);
+            async move {
+                if case.removed {
+                    state.lock().await.remove(&sandbox_id);
+                }
+                let accepted = apply_composed_health_result(
+                    &state,
+                    &db,
+                    Some(Ok((
+                        sandbox_id.clone(),
+                        case.lifecycle,
+                        0,
+                        ComposedProbeResult {
+                            template: "seed".to_string(),
+                            observations,
+                            guest_status: None,
+                            memory_used_bytes,
+                        },
+                    ))),
+                )
+                .await;
+                let status = state
+                    .lock()
+                    .await
+                    .get(&sandbox_id)
+                    .map(|health| health.health_status);
+                (accepted.map(|accepted| accepted.memory_used_bytes), status)
+            }
+        };
+
+        let (guest_memory, status) = apply(case.memory).await;
+        let (_, status_without_memory) = apply(None).await;
+
+        assert_eq!(guest_memory, case.expected, "{}", case.name);
+        assert_eq!(status, status_without_memory, "{}", case.name);
+    }
+}
+
+/// A sample belongs to the probe that carried it: a later accepted probe
+/// without a reading yields none, rather than the last one again.
+#[tokio::test]
+async fn guest_memory_is_not_replayed_by_a_later_probe() {
+    let sandbox_id = SandboxId::new().to_string();
+    let conn = crate::db::test_conn();
+    insert_test_sandbox(&conn, &sandbox_id, crate::state::SandboxState::Started);
+    let db = crate::db::SharedConnection::new(conn);
+    let state = Arc::new(Mutex::new(HashMap::from([(
+        sandbox_id.clone(),
+        test_health(),
+    )])));
+    let probe = |memory_used_bytes| {
+        Some(Ok((
+            sandbox_id.clone(),
+            Some(crate::state::SandboxState::Started),
+            0,
+            ComposedProbeResult {
+                template: "seed".to_string(),
+                observations: std::array::from_fn(|_| sample(HealthProbeOutcome::Success)),
+                guest_status: None,
+                memory_used_bytes,
+            },
+        )))
+    };
+
+    let first = apply_composed_health_result(&state, &db, probe(Some(1 << 20)))
+        .await
+        .expect("current probe is accepted");
+    let later = apply_composed_health_result(&state, &db, probe(None))
+        .await
+        .expect("current probe is accepted");
+
+    assert_eq!(first.memory_used_bytes, Some(1 << 20));
+    assert_eq!(later.memory_used_bytes, None);
 }
 
 #[tokio::test]
@@ -1352,6 +1526,7 @@ async fn missing_guest_uptime_preserves_last_observation() {
             Some(crate::state::SandboxState::Started),
             0,
             ComposedProbeResult {
+                template: "seed".to_string(),
                 observations: std::array::from_fn(|_| sample(HealthProbeOutcome::Success)),
                 guest_status: Some(pplx_space_spaced_host_client::proto::GetStatusResponse {
                     ready: false,
@@ -1359,6 +1534,7 @@ async fn missing_guest_uptime_preserves_last_observation() {
                     host_version: None,
                     guest_version: None,
                 }),
+                memory_used_bytes: None,
             },
         ))),
     )
@@ -1474,6 +1650,7 @@ async fn successful_health_probes_leave_failed_lifecycle_unchanged() {
                 Some(crate::state::SandboxState::Failed),
                 0,
                 ComposedProbeResult {
+                    template: "seed".to_string(),
                     observations: [
                         firecracker,
                         sample(HealthProbeOutcome::Success),
@@ -1486,6 +1663,7 @@ async fn successful_health_probes_leave_failed_lifecycle_unchanged() {
                         host_version: None,
                         guest_version: None,
                     }),
+                    memory_used_bytes: None,
                 },
             ))),
         )
@@ -1642,6 +1820,7 @@ impl DeadGatewayFixture {
                 Some(crate::state::SandboxState::Started),
                 0,
                 ComposedProbeResult {
+                    template: "seed".to_string(),
                     observations: [
                         firecracker,
                         sample(HealthProbeOutcome::Success),
@@ -1649,6 +1828,7 @@ impl DeadGatewayFixture {
                         net_gateway,
                     ],
                     guest_status: None,
+                    memory_used_bytes: None,
                 },
             ))),
         )
