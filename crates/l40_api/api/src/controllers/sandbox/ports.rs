@@ -343,15 +343,19 @@ impl SandboxController {
         // which restores/recreates it — charge the cluster activation limiter
         // for that implicit wake (no-op for a live sandbox with a ready pod,
         // which returns early above).
-        super::lifecycle::charge_implicit_access_activation(
+        let live = super::lifecycle::charge_implicit_access_activation(
             self.cluster_admission.as_ref(),
             &sandbox,
             ExecutionActivityKind::Access,
         )
         .await?;
 
-        match self.apply_open_sandbox_port(&sandbox, port).await {
+        match self
+            .apply_open_sandbox_port(&sandbox, port, live.is_some())
+            .await
+        {
             Ok(observation) => {
+                super::lifecycle::keep_live(live);
                 let exposure = mark_sandbox_port_exposure_applied(
                     pool,
                     sandbox.id,
@@ -608,10 +612,13 @@ impl SandboxController {
         }
     }
 
+    /// `reserved`: this request holds the live-cap reservation for waking a
+    /// dormant sandbox.
     async fn apply_open_sandbox_port(
         &self,
         sandbox: &Sandbox,
         port: u16,
+        reserved: bool,
     ) -> Result<SandboxPortExposureApplyObservation, SandboxPortExposureApplyError> {
         let mut client = self
             .substrate
@@ -623,6 +630,7 @@ impl SandboxController {
                 super::lifecycle::implicit_activation_charge(
                     self.cluster_admission.as_ref(),
                     sandbox,
+                    reserved,
                 ),
             )
             .await?;

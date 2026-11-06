@@ -255,6 +255,7 @@ fn reconnect_tags_classify_deferred_restore_admission_rejection() {
             message: "cluster activation admission rejected".to_string(),
             retry_after: Some(std::time::Duration::from_secs(1)),
             rate_limited,
+            live_cap: false,
         };
         let (outcome, terminal_phase, reason) = reconnect_error_outcome("suspended", &err);
         assert_eq!(
@@ -301,6 +302,7 @@ fn reconnect_tags_classify_a_lost_database_lock_race() {
         message: "cluster activation admission rejected".to_string(),
         retry_after: Some(std::time::Duration::from_secs(1)),
         rate_limited: true,
+        live_cap: false,
     };
     let (admission_outcome, _, admission_reason) = reconnect_error_outcome("suspended", &admission);
     assert_eq!(admission_outcome.as_str(), outcome.as_str());
@@ -351,4 +353,58 @@ fn reconnect_controller_tags_classify_a_lost_database_lock_race() {
     let (fleet_outcome, _, fleet_reason) = reconnect_controller_error_outcome("suspended", &fleet);
     assert_eq!(fleet_outcome.as_str(), "wake_failed");
     assert_eq!(fleet_reason.as_str(), "unavailable");
+}
+
+#[test]
+fn reconnect_tags_classify_a_live_cap_refusal_apart_from_cluster_saturation() {
+    // A wake refused at the client's live cap records as a per-client
+    // refusal, like the concurrency limiter's, not as the `wait_budget`
+    // cluster-saturation tag a bare 429 with a Retry-After gets.
+    let refused = ControllerError::live_cap_refused(
+        "client at its live sandbox cap",
+        Some(std::time::Duration::from_secs(5)),
+    );
+    assert_eq!(
+        tags_for_controller_error(
+            SandboxApiMetricIdentity::ecw("connect"),
+            "suspended",
+            refused
+        ),
+        ("rejected", "api", "rate_limited", "connect", "suspended")
+    );
+    let saturated = ControllerError::cluster_admission_rejected(
+        "no eligible node",
+        Some(std::time::Duration::from_secs(5)),
+        false,
+    );
+    assert_eq!(
+        tags_for_controller_error(
+            SandboxApiMetricIdentity::ecw("connect"),
+            "suspended",
+            saturated
+        ),
+        ("exhausted", "api", "wait_budget", "connect", "suspended")
+    );
+}
+
+#[test]
+fn reconnect_tags_classify_a_substrate_live_cap_refusal_as_rate_limited() {
+    // The pod-create check's refusal reaches the reconnect series as a
+    // substrate error; it records as the same per-client refusal as the
+    // entry check's, and converts to the live-cap error kind.
+    let refused = SubstrateError::AdmissionRejected {
+        message: "client at its live sandbox cap".to_string(),
+        retry_after: Some(std::time::Duration::from_secs(5)),
+        rate_limited: false,
+        live_cap: true,
+    };
+    let (outcome, terminal_phase, reason) = reconnect_error_outcome("suspended", &refused);
+    assert_eq!(
+        (outcome.as_str(), terminal_phase.as_str(), reason.as_str()),
+        ("rejected", "api", "rate_limited")
+    );
+    let converted = ControllerError::from(refused);
+    assert!(converted.is_live_cap_refusal());
+    assert!(!converted.is_cluster_admission_rejection());
+    assert_eq!(converted.retry_after_cause(), None);
 }

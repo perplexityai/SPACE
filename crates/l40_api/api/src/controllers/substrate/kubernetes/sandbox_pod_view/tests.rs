@@ -259,7 +259,14 @@ fn apply(writer: &mut SandboxPodWriter, event: watcher::Event<Pod>) {
 fn network_slots_track_bound_active_requests_per_node() {
     use watcher::Event;
 
-    let (_, slots, mut writer) = seeded_sandbox_pod_cache([
+    let (
+        _,
+        SandboxPodIndexes {
+            network_slots: slots,
+            ..
+        },
+        mut writer,
+    ) = seeded_sandbox_pod_cache([
         slot_pod("a", Some("node-a"), 2, "Running", false),
         slot_pod("b", Some("node-a"), 1, "Pending", false),
         slot_pod("c", Some("node-b"), 4, "Running", false),
@@ -324,8 +331,14 @@ fn network_slots_track_bound_active_requests_per_node() {
 fn network_slots_swap_in_a_relist_only_when_it_completes() {
     use watcher::Event;
 
-    let (store, slots, mut writer) =
-        seeded_sandbox_pod_cache([slot_pod("stale", Some("node-a"), 2, "Running", false)]);
+    let (
+        store,
+        SandboxPodIndexes {
+            network_slots: slots,
+            ..
+        },
+        mut writer,
+    ) = seeded_sandbox_pod_cache([slot_pod("stale", Some("node-a"), 2, "Running", false)]);
     // The index follows the store's re-list semantics; kube's store is the
     // oracle for which pods a completed list leaves behind.
     let cached = || {
@@ -404,7 +417,14 @@ fn an_overflowing_slot_request_saturates_without_corrupting_the_node_total() {
         u64::MAX
     );
 
-    let (_, slots, mut writer) = seeded_sandbox_pod_cache([
+    let (
+        _,
+        SandboxPodIndexes {
+            network_slots: slots,
+            ..
+        },
+        mut writer,
+    ) = seeded_sandbox_pod_cache([
         greedy.clone(),
         slot_pod("other", Some("node-a"), 1, "Running", false),
     ]);

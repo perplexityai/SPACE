@@ -70,6 +70,11 @@ enum ControllerErrorKind {
     /// so request metrics can count the refusal without reading the retry
     /// cause, which only the rate-limited case sets.
     ClusterAdmissionRejection,
+    /// The client's live-sandbox cap refused this activation. Carried so the
+    /// reconnect series records a per-client refusal as `rate_limited`, like
+    /// the concurrency limiter's, rather than as the cluster saturation a
+    /// bare 429 with a `Retry-After` would read as.
+    LiveCapRefusal,
 }
 
 /// Why a template the caller may use resolved to no release.
@@ -412,6 +417,27 @@ impl ControllerError {
     /// Whether cluster activation admission refused this request.
     pub(crate) const fn is_cluster_admission_rejection(&self) -> bool {
         matches!(self.kind, ControllerErrorKind::ClusterAdmissionRejection)
+    }
+
+    /// A 429 from the client's live-sandbox cap, at request entry or where
+    /// the substrate creates a pod, with its header-only `Retry-After`. It
+    /// carries no retry cause: a cap lifts when the client releases a
+    /// sandbox, so the async dispatcher retries it against its budget.
+    pub(crate) fn live_cap_refused(
+        message: impl Into<String>,
+        retry_after: Option<Duration>,
+    ) -> Self {
+        let mut error = Self::rate_limited(message);
+        if let Some(retry_after) = retry_after {
+            error = error.with_retry_after_header(retry_after);
+        }
+        error.kind = ControllerErrorKind::LiveCapRefusal;
+        error
+    }
+
+    /// Whether the client's live-sandbox cap refused this request.
+    pub(crate) const fn is_live_cap_refusal(&self) -> bool {
+        matches!(self.kind, ControllerErrorKind::LiveCapRefusal)
     }
 }
 
