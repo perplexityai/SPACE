@@ -235,6 +235,9 @@ impl ProcessSupervision {
 /// tracked owner task runs it, so it completes even if the request goes away.
 struct ProcessLaunch {
     command: Command,
+    /// The directory the child starts in, which a failed spawn is checked
+    /// against to tell the caller which request field to fix.
+    working_dir: std::path::PathBuf,
     prepared_pty: Option<PreparedPty>,
     stdin_enabled: bool,
     /// What `list` reports; the pid is filled in once the child exists.
@@ -347,6 +350,7 @@ impl ProcessLaunch {
     async fn publish(self) -> Result<LaunchedProcess, Status> {
         let ProcessLaunch {
             command,
+            working_dir,
             prepared_pty,
             stdin_enabled,
             mut info,
@@ -377,7 +381,7 @@ impl ProcessLaunch {
             );
         }
         let (spawn_result, mut prepared_pty) = spawned?;
-        let mut child = spawn_result.map_err(map_io_error)?;
+        let mut child = spawn_result.map_err(|error| spawn_error_status(error, &working_dir))?;
         let Some(pid) = child.id() else {
             terminate_and_reap_failed_start(child, process_reservation, &inner.process_tasks);
             return Err(Status::internal("spawned child has no pid"));
@@ -896,6 +900,41 @@ struct PreparedPty {
 // so no concurrent fork can inherit a PTY during the openpty→fcntl window.
 #[cfg(not(target_os = "linux"))]
 static PTY_INHERITANCE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// The status of a spawn that failed: its errno's, tagged with the request
+/// field to fix when that is certain. The kernel reports a missing working
+/// directory and a missing executable with the same ENOENT, so the directory
+/// is looked at after the fact. A permission error stays untagged: either
+/// could be what the account may not use.
+fn spawn_error_status(error: io::Error, working_dir: &std::path::Path) -> Status {
+    let errno = error.raw_os_error();
+    let status = map_io_error(error);
+    let working_dir_usable = std::fs::metadata(working_dir).is_ok_and(|metadata| metadata.is_dir());
+    let reason = if !working_dir_usable {
+        Some(pplx_space_common_core::spaced::PROCESS_START_CWD)
+    } else if matches!(errno, Some(libc::ENOENT | libc::ENOEXEC | libc::ENOTDIR)) {
+        Some(pplx_space_common_core::spaced::PROCESS_START_COMMAND)
+    } else {
+        None
+    };
+    match reason {
+        Some(reason) => with_start_reason(status, reason),
+        None => status,
+    }
+}
+
+/// Tag a failed start with the request field it is about, unless the status
+/// already names a reason of its own (a full disk, say).
+fn with_start_reason(mut status: Status, reason: &'static str) -> Status {
+    let metadata = status.metadata_mut();
+    if !metadata.contains_key(pplx_space_common_core::spaced::ERROR_REASON_METADATA_KEY) {
+        metadata.insert(
+            pplx_space_common_core::spaced::ERROR_REASON_METADATA_KEY,
+            tonic::metadata::MetadataValue::from_static(reason),
+        );
+    }
+    status
+}
 
 fn spawn_child(command: &mut Command) -> io::Result<tokio::process::Child> {
     #[cfg(not(target_os = "linux"))]
@@ -2282,8 +2321,18 @@ impl Process for ExecutionService {
             self.inner.process_payload_slots.clone(),
             ingress,
             move || {
-                GuestAccount::resolve(account_name)
-                    .map_err(crate::identity::ResolveGuestAccountError::into_status)
+                GuestAccount::resolve(account_name).map_err(|error| {
+                    let not_found = error.is_not_found();
+                    let status = error.into_status();
+                    if not_found {
+                        with_start_reason(
+                            status,
+                            pplx_space_common_core::spaced::PROCESS_START_USER,
+                        )
+                    } else {
+                        status
+                    }
+                })
             },
         )
         .await?;
@@ -2361,12 +2410,15 @@ impl Process for ExecutionService {
         if !uses_pty {
             command.process_group(0);
         }
+        let working_dir = cwd
+            .as_ref()
+            .map(|cwd| std::path::Path::new(cwd.expose()))
+            .unwrap_or(account.home())
+            .to_path_buf();
         account.configure_child_credentials(
             &mut command,
             self.inner.identity_policy,
-            cwd.as_ref()
-                .map(|cwd| std::path::Path::new(cwd.expose()))
-                .unwrap_or(account.home()),
+            &working_dir,
         )?;
         let mut prepared_pty = pty_config
             .map(|pty_config| prepare_pty(pty_config.size))
@@ -2452,6 +2504,7 @@ impl Process for ExecutionService {
         let request_lifetime = _start_admission.request_lifetime();
         let launch = ProcessLaunch {
             command,
+            working_dir,
             prepared_pty,
             stdin_enabled,
             info: ProcessInfo {

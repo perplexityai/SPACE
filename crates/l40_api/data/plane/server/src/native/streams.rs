@@ -3,7 +3,7 @@
 
 use super::*;
 use pplx_space_common_core::types::SandboxLifecycle;
-use pplx_space_public_api::SandboxLifecycleState;
+use pplx_space_public_api::{CommandStartField, SandboxLifecycleState};
 
 /// What the attach that may start a process can do with its input.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -301,38 +301,24 @@ pub(super) fn process_stream_start_http_error(
     // Guest spawn failures are terminal for this command. Retrying a missing
     // executable or working directory cannot repair it; route identity repair
     // and transport failures must keep their existing retry contract.
-    let permanent = match error {
-        StreamBridgeError::BackendStatus(status)
-            if pplx_space_common_grpc::is_terminal_guest_process_error(status) =>
-        {
-            match status.code() {
-                tonic::Code::NotFound => {
-                    Some((StatusCode::NOT_FOUND, DataPlaneHttpErrorCode::NotFound))
-                }
-                tonic::Code::InvalidArgument
-                | tonic::Code::OutOfRange
-                | tonic::Code::FailedPrecondition
-                | tonic::Code::ResourceExhausted => Some((
-                    StatusCode::BAD_REQUEST,
-                    DataPlaneHttpErrorCode::InvalidRequest,
-                )),
-                tonic::Code::PermissionDenied => {
-                    Some((StatusCode::FORBIDDEN, DataPlaneHttpErrorCode::Forbidden))
-                }
-                _ => None,
-            }
-        }
-        _ => None,
-    };
-    if let Some((status, code)) = permanent {
-        return data_plane_http_error(
-            status,
-            code,
-            "command could not be started",
-            false,
+    if let Some(not_started) = CommandNotStarted::from_error(error) {
+        observe_data_plane_http_error(
+            StatusCode::BAD_REQUEST,
             ResponseOrigin::Node,
-            ResponseKind::BackendTransport,
+            ResponseKind::BackendStatus,
         );
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(DataPlaneHttpErrorEnvelope {
+                error: DataPlaneHttpError {
+                    code: DataPlaneHttpErrorCode::InvalidRequest,
+                    message: not_started.message(),
+                    retryable: false,
+                    details: not_started.details(),
+                },
+            }),
+        )
+            .into_response();
     }
     data_plane_http_error(
         StatusCode::SERVICE_UNAVAILABLE,
@@ -342,6 +328,96 @@ pub(super) fn process_stream_start_http_error(
         ResponseOrigin::Node,
         ResponseKind::BackendTransport,
     )
+}
+
+/// A command the sandbox refused to start for good: its executable, working
+/// directory or user cannot be used. It is the caller's request to fix, so it
+/// answers `invalid_request`, never `not_found` (which reads as the session)
+/// or `forbidden` (which reads as the token). The guest's own wording stays in
+/// the logs; the message names the cause from the field the guest tags and
+/// the status code, which guests from older templates send untagged.
+pub(super) struct CommandNotStarted {
+    field: Option<CommandStartField>,
+    code: tonic::Code,
+}
+
+impl CommandNotStarted {
+    pub(super) fn from_error(error: &StreamBridgeError) -> Option<Self> {
+        let StreamBridgeError::BackendStatus(status) = error else {
+            return None;
+        };
+        if !pplx_space_common_grpc::is_terminal_guest_process_error(status) {
+            return None;
+        }
+        let code = status.code();
+        if !matches!(
+            code,
+            tonic::Code::NotFound
+                | tonic::Code::InvalidArgument
+                | tonic::Code::OutOfRange
+                | tonic::Code::FailedPrecondition
+                | tonic::Code::PermissionDenied
+        ) {
+            return None;
+        }
+        let field = match status
+            .metadata()
+            .get(pplx_space_common_core::spaced::ERROR_REASON_METADATA_KEY)
+            .and_then(|value| value.to_str().ok())
+        {
+            Some(pplx_space_common_core::spaced::PROCESS_START_COMMAND) => {
+                Some(CommandStartField::Command)
+            }
+            Some(pplx_space_common_core::spaced::PROCESS_START_CWD) => Some(CommandStartField::Cwd),
+            Some(pplx_space_common_core::spaced::PROCESS_START_USER) => {
+                Some(CommandStartField::User)
+            }
+            _ => None,
+        };
+        Some(Self { field, code })
+    }
+
+    pub(super) fn message(&self) -> String {
+        let cause = match (self.field, self.code) {
+            (Some(CommandStartField::User), _) => "the user does not exist",
+            (Some(CommandStartField::Cwd), _) => {
+                "the working directory does not exist or is not a directory"
+            }
+            (Some(CommandStartField::Command), tonic::Code::NotFound) => {
+                "the executable was not found"
+            }
+            (Some(CommandStartField::Command), _) => "the executable cannot be run",
+            (None, tonic::Code::NotFound) => "the executable or working directory was not found",
+            (None, tonic::Code::PermissionDenied) => "permission denied",
+            (None, tonic::Code::FailedPrecondition) => {
+                "the executable or working directory cannot be used"
+            }
+            (None, _) => "the command, user, working directory or environment is invalid",
+        };
+        format!("command could not be started: {cause}")
+    }
+
+    pub(super) fn details(&self) -> Vec<pplx_space_public_api::PublicErrorDetail> {
+        [
+            Some((
+                pplx_space_public_api::CONFLICT_REASON_DETAIL_KEY,
+                pplx_space_public_api::INVALID_REQUEST_REASON_COMMAND_NOT_STARTED,
+            )),
+            self.field.map(|field| {
+                (
+                    pplx_space_public_api::INVALID_REQUEST_FIELD_DETAIL_KEY,
+                    field.as_str(),
+                )
+            }),
+        ]
+        .into_iter()
+        .flatten()
+        .map(|(key, value)| pplx_space_public_api::PublicErrorDetail {
+            key: key.to_string(),
+            value: value.to_string(),
+        })
+        .collect()
+    }
 }
 
 /// Public messages for the error frames that report a backend or internal
@@ -360,6 +436,14 @@ pub(super) fn stream_start_error_frame(
 ) -> DataPlaneServerFrame {
     if let Some(refusal) = sandbox_not_running(error, sandbox_id) {
         return refusal.frame();
+    }
+    if let Some(not_started) = CommandNotStarted::from_error(error) {
+        return DataPlaneServerFrame::Error {
+            code: DataPlaneErrorCode::BackendStreamError,
+            message: not_started.message(),
+            retryable: false,
+            details: not_started.details(),
+        };
     }
     // A refusal made before anything started is retryable here as on SSE.
     if let StreamBridgeError::BackendStatus(status) = error
