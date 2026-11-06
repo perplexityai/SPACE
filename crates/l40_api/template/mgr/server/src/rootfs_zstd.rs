@@ -294,9 +294,9 @@ pub(crate) fn compress_rootfs(
 ///
 /// With `expected_rootfs_hash` set, the decoded digest is checked before
 /// the output is renamed into place: bytes that disagree never appear at
-/// `rootfs_path`. That matters because disk recovery adopts whatever file
-/// sits there without rehashing it, so a check that ran after publishing
-/// would still leave the bad bytes recoverable until cleanup caught up.
+/// `rootfs_path`, the path sandboxes boot from, so a check that ran after
+/// publishing would still leave the bad bytes there until cleanup caught
+/// up.
 #[tracing::instrument(skip_all, err, fields(
     decoded_bytes = tracing::field::Empty,
     compressed_bytes = tracing::field::Empty,

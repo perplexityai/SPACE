@@ -1394,9 +1394,8 @@ fn build_disk_usage_with_snapshots(
 /// subvolume root behaves like a plain directory. A cleanup failure
 /// past all of that (e.g. a write-protected parent dir) leaves at most
 /// a wiped-out digest dir; the helper still returns Ok so Phase 3
-/// finalizes the row, and the next `do_pull`'s `digest_dir_existed`
-/// adoption path re-uses any leftover subvol root, writing fresh bytes
-/// into it.
+/// finalizes the row. Pulls then refuse any leftover dir, which has no
+/// row, until startup recovery removes it.
 fn fallback_delete_build_artifacts(
     store: &TemplateArtifactStore,
     name: &str,
@@ -1416,9 +1415,9 @@ fn fallback_delete_build_artifacts(
         Err(err) => {
             // Soft success: the RO flag was already cleared and the
             // recursive file-removal ran, so what remains is at most
-            // an empty btrfs subvolume root, which `do_pull`'s
-            // `digest_dir_existed` adoption path re-uses on the next
-            // access. The alternative — surfacing Err from here —
+            // an empty btrfs subvolume root without a row. Pulls refuse
+            // it until startup recovery removes it. The
+            // alternative — surfacing Err from here —
             // would skip Phase 3 finalize and leave the row in
             // `state='deleting'`, which is the bug this helper exists
             // to prevent. The stuck-deleting reaper in `gc_tick`
@@ -1434,9 +1433,8 @@ fn fallback_delete_build_artifacts(
                 content_hash,
                 error = %err,
                 dir = %build_dir.display(),
-                "fallback cleanup: local subvolume removal incomplete; leaving any \
-                 leftover subvol root for the next do_pull's digest_dir_existed path \
-                 to adopt",
+                "fallback cleanup: local subvolume removal incomplete; pulls refuse the \
+                 leftover rowless dir until startup recovery removes it",
             );
             Ok(())
         }
@@ -2392,9 +2390,9 @@ impl TemplateManagerService {
             validate_retained_environment_binding(&manifest, &incoming)?;
             let metadata_path = digest_path.join("metadata.json");
             if !template_file_replacement_is_unchanged(&metadata_path, Some(bytes))? {
-                std::fs::write(&metadata_path, bytes).map_err(|error| {
-                    Status::internal(format!("write {}: {error}", metadata_path.display()))
-                })?;
+                // Atomic, so a crash mid-write never leaves a partly
+                // written file for the next startup's recovery to read.
+                write_template_manifest_atomic(&metadata_path, bytes)?;
                 normalize_template_cache_tree(digest_path)?;
             }
         }

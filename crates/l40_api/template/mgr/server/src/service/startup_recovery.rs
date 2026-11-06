@@ -17,6 +17,19 @@
 //!   is set are stored only in object storage and are not required
 //!   locally; entries without compression are required locally at the
 //!   declared size.
+//! - A read that fails in a way that can clear (an I/O error reading the
+//!   manifest or `metadata.json`, stating a file or hashing the bootable
+//!   artifact) never deletes the dir: recovery drops the build's row and
+//!   keeps the dir, which the next startup verifies from scratch. Until
+//!   then pulls refuse the dir retryably, since a pull never adopts or
+//!   writes into a build dir that has no row.
+//! - `metadata.json` that's absent or empty means the build has none; one
+//!   that reads but doesn't parse is a permanent rejection.
+//! - Leftover transient dirs (`.old` template dirs, import and republish
+//!   staging, interrupted replacements) are reaped before the socket
+//!   binds, by [`TemplateManagerService::clean_transient_dirs_before_serving`],
+//!   since the per-dir pass runs once requests flow and a live import's
+//!   staging dir looks the same.
 
 use super::*;
 
@@ -29,17 +42,23 @@ fn lock_recovery_db<'a>(
         .map_err(|_| "template DB mutex poisoned".to_string())
 }
 
-/// Reasons a digest dir fails reconciliation and should be removed.
+/// Reasons a digest dir fails reconciliation.
 ///
-/// Transient errors (DB unavailable, I/O hiccup during stat) are not
-/// represented here; those are handled by leaving the digest dir alone
-/// for the next reconcile pass.
+/// A permanent rejection removes the dir. A transient one, an I/O error
+/// reading the manifest or metadata, stating a file or hashing the bootable
+/// artifact that can clear without any change to the dir, drops only the
+/// build's row and keeps the dir, so the next startup verifies it from
+/// scratch; see [`DigestDirRejection::is_transient`].
 #[derive(Debug, thiserror::Error)]
 enum DigestDirRejection {
-    #[error("manifest.json read failed: {0}")]
-    ManifestUnreadable(String),
+    #[error("manifest.json read failed: {error}")]
+    ManifestUnreadable { error: String, transient: bool },
     #[error("manifest.json parse failed: {0}")]
     ManifestUnparseable(String),
+    #[error("metadata.json read failed: {error}")]
+    MetadataUnreadable { error: String, transient: bool },
+    #[error("metadata.json parse failed: {0}")]
+    MetadataUnparseable(String),
     #[error("manifest filename {filename:?} is unsafe: {reason}")]
     ManifestFilenamesUnsafe {
         filename: String,
@@ -64,27 +83,85 @@ enum DigestDirRejection {
         recorded: u64,
     },
     #[error("could not stat {filename:?}: {error}")]
-    StatFailed { filename: String, error: String },
-    #[error("could not hash bootable artifact: {0}")]
-    BootableArtifactUnreadable(String),
+    StatFailed {
+        filename: String,
+        error: String,
+        transient: bool,
+    },
+    #[error("could not hash bootable artifact: {error}")]
+    BootableArtifactUnreadable { error: String, transient: bool },
     #[error("bootable artifact sha256 {computed:?} does not match digest dir name {expected:?}")]
     BootableArtifactHashMismatch { computed: String, expected: String },
+}
+
+impl DigestDirRejection {
+    /// Whether reading the dir failed in a way that can clear without any
+    /// change to it. Deleting such a dir would lose an installed build a
+    /// later startup could verify.
+    fn is_transient(&self) -> bool {
+        matches!(
+            self,
+            Self::ManifestUnreadable {
+                transient: true,
+                ..
+            } | Self::MetadataUnreadable {
+                transient: true,
+                ..
+            } | Self::StatFailed {
+                transient: true,
+                ..
+            } | Self::BootableArtifactUnreadable {
+                transient: true,
+                ..
+            }
+        )
+    }
+}
+
+/// Whether an I/O error reading a build's files can clear without any change
+/// to them, as an I/O error from the device can. A missing file, one that
+/// isn't valid UTF-8, and a path that's a directory, runs through a file,
+/// loops or is invalid stay that way.
+///
+/// A permission error counts as transient, by decision: a deploy with the
+/// wrong user or security profile fails every read with EACCES, and treating
+/// that as permanent would delete every node's cache with no way back short
+/// of re-pulling it once the deploy is fixed. As transient, an EACCES that
+/// never clears keeps the dir without a row, so every pull of its digest is
+/// refused until it clears or a startup finds it readable. That's where this
+/// differs from `host::path_errors::host_path_io_error_is_transient`, whose
+/// permanent answer fails a sandbox create rather than deleting a build.
+fn io_error_is_transient(error: &std::io::Error) -> bool {
+    use std::io::ErrorKind;
+    let permanent = matches!(
+        error.kind(),
+        ErrorKind::NotFound
+            | ErrorKind::InvalidData
+            | ErrorKind::InvalidInput
+            | ErrorKind::InvalidFilename
+            | ErrorKind::IsADirectory
+            | ErrorKind::NotADirectory
+    ) || error.raw_os_error() == Some(rustix::io::Errno::LOOP.raw_os_error());
+    !permanent
 }
 
 fn parse_manifest_from_digest_dir(
     digest_dir: &Path,
 ) -> Result<(TemplateManifest, String), DigestDirRejection> {
     let manifest_path = digest_dir.join("manifest.json");
-    let manifest_json = std::fs::read_to_string(&manifest_path)
-        .map_err(|error| DigestDirRejection::ManifestUnreadable(error.to_string()))?;
+    let manifest_json = std::fs::read_to_string(&manifest_path).map_err(|error| {
+        DigestDirRejection::ManifestUnreadable {
+            transient: io_error_is_transient(&error),
+            error: error.to_string(),
+        }
+    })?;
     let manifest: TemplateManifest = serde_json::from_str(&manifest_json)
         .map_err(|error| DigestDirRejection::ManifestUnparseable(error.to_string()))?;
     // The on-disk manifest is whatever the last writer left, which in
     // crash-recovery scenarios may be the raw object from an interrupted
     // pull. Sanitize filenames before they reach `Path::join` — without
     // this, `bootable_artifact: "../escape"` or an absolute path slips
-    // straight into `fs::metadata`. Matches the defense `volume.rs`
-    // applies on its recovery path.
+    // straight into `fs::metadata`.
     manifest
         .validate_filenames()
         .map_err(|error| DigestDirRejection::ManifestFilenamesUnsafe {
@@ -94,12 +171,32 @@ fn parse_manifest_from_digest_dir(
     Ok((manifest, manifest_json))
 }
 
-fn parse_metadata_from_digest_dir(digest_dir: &Path) -> TemplateMetadata {
-    // Metadata is informational here (arch fallback); failures degrade
-    // gracefully to the manifest-derived defaults.
-    let metadata_json =
-        std::fs::read_to_string(digest_dir.join("metadata.json")).unwrap_or_default();
-    serde_json::from_str(&metadata_json).unwrap_or_default()
+/// A build's metadata.json, or the default when it has none: registration
+/// copies it only when the source has one, and install treats an empty file
+/// as none (`validate_guest_documents`). It carries the build's arch and
+/// execution metadata, so a file that's there but can't be read or parsed is
+/// a rejection, never the default, which would register the build with the
+/// wrong ones.
+fn parse_metadata_from_digest_dir(
+    digest_dir: &Path,
+) -> Result<TemplateMetadata, DigestDirRejection> {
+    let metadata_json = match std::fs::read_to_string(digest_dir.join("metadata.json")) {
+        Ok(json) => json,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(TemplateMetadata::default());
+        }
+        Err(error) => {
+            return Err(DigestDirRejection::MetadataUnreadable {
+                transient: io_error_is_transient(&error),
+                error: error.to_string(),
+            });
+        }
+    };
+    if metadata_json.is_empty() {
+        return Ok(TemplateMetadata::default());
+    }
+    serde_json::from_str(&metadata_json)
+        .map_err(|error| DigestDirRejection::MetadataUnparseable(error.to_string()))
 }
 
 /// Confirm manifest invariants that don't require I/O: content_hash
@@ -164,6 +261,7 @@ fn verify_local_files_against_manifest(
             Err(error) => {
                 return Err(DigestDirRejection::StatFailed {
                     filename: filename.clone(),
+                    transient: io_error_is_transient(&error),
                     error: error.to_string(),
                 });
             }
@@ -190,15 +288,23 @@ async fn verify_bootable_artifact_hash(
 ) -> Result<(), DigestDirRejection> {
     let path = digest_dir.join(bootable_filename);
     let path_str = path.display().to_string();
-    let algorithm = content_hash_algorithm(expected_hash)
-        .map_err(|error| DigestDirRejection::BootableArtifactUnreadable(error.to_string()))?;
+    let algorithm = content_hash_algorithm(expected_hash).map_err(|error| {
+        DigestDirRejection::BootableArtifactUnreadable {
+            error: error.to_string(),
+            transient: false,
+        }
+    })?;
     let computed =
         tokio::task::spawn_blocking(move || compute_content_hash(&path_str, algorithm, read_mode))
             .await
-            .map_err(|error| {
-                DigestDirRejection::BootableArtifactUnreadable(format!("hash task failed: {error}"))
+            .map_err(|error| DigestDirRejection::BootableArtifactUnreadable {
+                error: format!("hash task failed: {error}"),
+                transient: false,
             })?
-            .map_err(|error| DigestDirRejection::BootableArtifactUnreadable(error.to_string()))?;
+            .map_err(|error| DigestDirRejection::BootableArtifactUnreadable {
+                transient: io_error_is_transient(&error),
+                error: error.to_string(),
+            })?;
     if computed != expected_hash {
         return Err(DigestDirRejection::BootableArtifactHashMismatch {
             computed,
@@ -279,27 +385,88 @@ async fn delete_stale_build_row(
     .map_err(|error| format!("db::delete_build: {error}"))
 }
 
-async fn remove_digest_dir_from_disk(digest_dir: &Path) {
-    match tokio::fs::remove_dir_all(digest_dir).await {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => {
-            tracing::warn!(
+/// Remove an invalid build dir under `template_root`. Installed builds are
+/// read-only btrfs subvolumes that only node-manager can delete; the local
+/// subvolume-aware cleanup is the fallback, as on the pull path. A dir that
+/// survives both stays without a row, and the next startup rejects it and
+/// tries again.
+///
+/// Node-manager resolves `(name, hash)` under `TEMPLATE_DIR`, so the RPC is
+/// sent only when that's the root being recovered; under any other root it
+/// would delete the canonical cache's build of the same name and hash, and
+/// only the local cleanup runs.
+async fn remove_digest_dir_from_disk(
+    template_root: &Path,
+    name: &str,
+    hash_name: &str,
+    digest_dir: &Path,
+) {
+    let canonical_root = template_root == Path::new(TEMPLATE_DIR);
+    let dir = digest_dir.to_path_buf();
+    let take_rpc_leg = canonical_root
+        && tokio::task::spawn_blocking(move || {
+            pplx_space_common_core::host::btrfs::is_subvolume(&dir)
+        })
+        .await
+        .unwrap_or(false);
+    if take_rpc_leg {
+        match crate::btrfs_via_nodemgr::delete_template_subvolume(name, hash_name).await {
+            Ok(()) => return,
+            Err(error) => tracing::warn!(
                 dir = %digest_dir.display(),
                 %error,
-                "failed to remove digest dir during startup recovery"
-            );
+                "node-manager could not delete digest dir during startup recovery; trying local cleanup"
+            ),
         }
+    }
+    let dir = digest_dir.to_path_buf();
+    let removed = tokio::task::spawn_blocking(move || crate::volume::cleanup_digest_dir_sync(&dir))
+        .await
+        .map_err(std::io::Error::other)
+        .flatten();
+    if let Err(error) = removed {
+        tracing::warn!(
+            dir = %digest_dir.display(),
+            %error,
+            "failed to remove digest dir during startup recovery"
+        );
     }
 }
 
 async fn drop_invalid_digest_dir(
-    db: &Arc<Mutex<rusqlite::Connection>>,
+    service: &TemplateManagerService,
     name: &str,
     hash_name: &str,
     digest_dir: &Path,
     rejection: &DigestDirRejection,
 ) {
+    let db = &service.db;
+    if rejection.is_transient() {
+        // Never delete an installed build over a read that can clear. Its
+        // row goes, so the build isn't served unverified, and pulls refuse
+        // the dir without a row until the next startup verifies it from
+        // scratch. If the row can't be dropped, the build stays served
+        // as it was, and the next startup checks it against that row.
+        tracing::warn!(
+            template = %name,
+            content_hash = %hash_name,
+            dir = %digest_dir.display(),
+            reason = %rejection,
+            "could not verify digest dir; dropping its row and keeping it for the next startup"
+        );
+        if let Err(error) = delete_stale_build_row(db, name, hash_name).await {
+            tracing::warn!(
+                template = %name,
+                content_hash = %hash_name,
+                %error,
+                "could not drop the row of an unverified digest dir"
+            );
+        }
+        // The node no longer serves the build; the cluster hears of it now
+        // rather than at the next periodic reconcile.
+        crate::node_state_sync::mark_template_dirty(db, name);
+        return;
+    }
     tracing::warn!(
         template = %name,
         content_hash = %hash_name,
@@ -307,7 +474,7 @@ async fn drop_invalid_digest_dir(
         reason = %rejection,
         "dropping invalid digest dir during startup recovery"
     );
-    remove_digest_dir_from_disk(digest_dir).await;
+    remove_digest_dir_from_disk(&service.artifact_store.root, name, hash_name, digest_dir).await;
     if let Err(error) = delete_stale_build_row(db, name, hash_name).await {
         tracing::warn!(
             template = %name,
@@ -336,18 +503,18 @@ async fn reconcile_digest_dir_against_db(
     let (manifest, manifest_json) = match parse_manifest_from_digest_dir(digest_dir) {
         Ok(parsed) => parsed,
         Err(rejection) => {
-            drop_invalid_digest_dir(&service.db, name, hash_name, digest_dir, &rejection).await;
+            drop_invalid_digest_dir(service, name, hash_name, digest_dir, &rejection).await;
             return;
         }
     };
 
     if let Err(rejection) = validate_manifest_self_consistency(hash_name, &manifest) {
-        drop_invalid_digest_dir(&service.db, name, hash_name, digest_dir, &rejection).await;
+        drop_invalid_digest_dir(service, name, hash_name, digest_dir, &rejection).await;
         return;
     }
 
     if let Err(rejection) = verify_local_files_against_manifest(digest_dir, &manifest) {
-        drop_invalid_digest_dir(&service.db, name, hash_name, digest_dir, &rejection).await;
+        drop_invalid_digest_dir(service, name, hash_name, digest_dir, &rejection).await;
         return;
     }
 
@@ -373,6 +540,16 @@ async fn reconcile_digest_dir_against_db(
         return;
     }
 
+    // Only a build without a row is registered from its metadata, so only
+    // its metadata.json is read.
+    let metadata = match parse_metadata_from_digest_dir(digest_dir) {
+        Ok(metadata) => metadata,
+        Err(rejection) => {
+            drop_invalid_digest_dir(service, name, hash_name, digest_dir, &rejection).await;
+            return;
+        }
+    };
+
     if let Err(rejection) = verify_bootable_artifact_hash(
         digest_dir,
         &manifest.bootable_artifact,
@@ -381,7 +558,7 @@ async fn reconcile_digest_dir_against_db(
     )
     .await
     {
-        drop_invalid_digest_dir(&service.db, name, hash_name, digest_dir, &rejection).await;
+        drop_invalid_digest_dir(service, name, hash_name, digest_dir, &rejection).await;
         return;
     }
 
@@ -395,7 +572,6 @@ async fn reconcile_digest_dir_against_db(
         return;
     }
 
-    let metadata = parse_metadata_from_digest_dir(digest_dir);
     let build_date = manifest.build_date.clone();
     let runtime = if manifest.runtime.is_empty() {
         RUNTIME_FIRECRACKER_ALIAS.to_string()
@@ -413,7 +589,7 @@ async fn reconcile_digest_dir_against_db(
         let rejection = DigestDirRejection::FileSizeNotDeclared {
             filename: manifest.bootable_artifact.clone(),
         };
-        drop_invalid_digest_dir(&service.db, name, hash_name, digest_dir, &rejection).await;
+        drop_invalid_digest_dir(service, name, hash_name, digest_dir, &rejection).await;
         return;
     };
 
@@ -446,8 +622,8 @@ async fn reconcile_digest_dir_against_db(
     }
 }
 
-fn cleanup_transient_template_name_dirs() {
-    let Ok(entries) = std::fs::read_dir(TEMPLATE_DIR) else {
+fn cleanup_transient_template_name_dirs(template_root: &Path) {
+    let Ok(entries) = std::fs::read_dir(template_root) else {
         return;
     };
     for entry in entries.flatten() {
@@ -458,8 +634,8 @@ fn cleanup_transient_template_name_dirs() {
         let Some(base) = name.strip_suffix(".old") else {
             continue;
         };
-        let final_dir = format!("{TEMPLATE_DIR}/{base}");
-        if !Path::new(&final_dir).exists() {
+        let final_dir = template_root.join(base);
+        if !final_dir.exists() {
             tracing::info!(
                 dir = %entry.path().display(),
                 template = %base,
@@ -477,8 +653,8 @@ fn cleanup_transient_template_name_dirs() {
     }
 }
 
-fn cleanup_transient_digest_staging_dirs() {
-    let Ok(entries) = std::fs::read_dir(TEMPLATE_DIR) else {
+fn cleanup_transient_digest_staging_dirs(template_root: &Path) {
+    let Ok(entries) = std::fs::read_dir(template_root) else {
         return;
     };
     for entry in entries.flatten() {
@@ -766,7 +942,9 @@ impl TemplateManagerService {
         }
     }
 
-    /// Spawn startup recovery without delaying the template-manager gRPC bind.
+    /// Spawn startup recovery once the socket is bound. Requests are served
+    /// while it runs; only a request for the build recovery is checking at
+    /// that moment waits for that check.
     ///
     /// Heavy validation work (hashing unrecognized digest dirs, deleting
     /// invalid ones) runs off the service startup path so local dependents
@@ -796,11 +974,22 @@ impl TemplateManagerService {
         });
     }
 
-    /// Reconcile DB with disk and recover background loops needed after startup.
-    pub async fn run_startup_recovery(&self) {
-        cleanup_transient_template_name_dirs();
-        cleanup_transient_digest_staging_dirs();
+    /// Reap the transient dirs a previous process left: `.old` template
+    /// dirs, import and republish staging, stale build staging, and
+    /// interrupted replacements. Call before the socket binds, while no
+    /// pull, import or registration can own one; a live import's staging
+    /// dir carries the same names, so reaping them once requests flow
+    /// would race it.
+    pub fn clean_transient_dirs_before_serving(&self) {
+        cleanup_transient_template_name_dirs(&self.artifact_store.root);
+        cleanup_transient_digest_staging_dirs(&self.artifact_store.root);
+    }
 
+    /// Reconcile DB with disk and recover background loops needed after
+    /// startup. Runs once requests flow, so it leaves transient dirs alone;
+    /// [`Self::clean_transient_dirs_before_serving`] reaped the stale ones.
+    pub async fn run_startup_recovery(&self) {
+        let mut held_at_scan = Vec::new();
         if let Ok(entries) = std::fs::read_dir(&self.artifact_store.root) {
             for entry in entries.flatten() {
                 if !entry.path().is_dir() {
@@ -834,17 +1023,16 @@ impl TemplateManagerService {
                         {
                             continue;
                         }
-                        // Requests flow by now: skip a digest a pull,
-                        // import, registration or delete holds rather than
-                        // verify it alongside them. A complete dir one of
-                        // them leaves without a row is checked at the next
-                        // startup, or recovered sooner by a pull of the
-                        // digest when its release is published.
+                        // Requests flow by now: a digest a pull, import,
+                        // registration or delete holds isn't verified
+                        // alongside them. It's checked once they let go,
+                        // after the scan.
+                        let digest_dir = digest_entry.path();
                         let Some(_claim) = self.volume_puller.try_claim_digest(&name, &hash_name)
                         else {
+                            held_at_scan.push((name.clone(), hash_name, digest_dir));
                             continue;
                         };
-                        let digest_dir = digest_entry.path();
                         reconcile_digest_dir_against_db(self, &name, &hash_name, &digest_dir).await;
                     }
                 }
@@ -856,16 +1044,26 @@ impl TemplateManagerService {
         self.prune_stale_template_artifact_db_rows().await;
 
         {
-            let Ok(mut handle) = self.pool_handle.lock() else {
-                tracing::warn!(
+            match self.pool_handle.lock() {
+                Ok(mut handle) if handle.is_none() => {
+                    let db = Arc::clone(&self.db);
+                    *handle = Some(tokio::spawn(crate::pool_manager::pool_loop(db)));
+                    tracing::debug!("pool manager loop started");
+                }
+                Ok(_) => {}
+                Err(_) => tracing::warn!(
                     "pool manager handle mutex poisoned; startup recovery cannot spawn pool loop"
-                );
-                return;
-            };
-            if handle.is_none() {
-                let db = Arc::clone(&self.db);
-                *handle = Some(tokio::spawn(crate::pool_manager::pool_loop(db)));
-                tracing::debug!("pool manager loop started");
+                ),
+            }
+        }
+
+        // A pull refuses a dir without a row while holding its digest, so a
+        // dir held during the scan may be one only this pass can verify:
+        // wait for each holder, then check the dir if it's still there.
+        for (name, hash_name, digest_dir) in held_at_scan {
+            let _claim = self.volume_puller.claim_digest(&name, &hash_name).await;
+            if digest_dir.is_dir() {
+                reconcile_digest_dir_against_db(self, &name, &hash_name, &digest_dir).await;
             }
         }
     }

@@ -522,240 +522,6 @@ async fn populate_orphaned_digest_dir(digest_dir: &Path) {
     .unwrap();
 }
 
-#[tokio::test]
-async fn cancelled_request_leaves_recoverable_state_for_next_caller() {
-    // The user-facing contract of the recovery design: if a previous
-    // GetTemplate caller's future was dropped right before the DB
-    // upsert, the disk artifacts they wrote are sufficient for the
-    // NEXT GetTemplate to register the build without re-downloading
-    // or re-decompressing anything. This test stands in for the
-    // hard-to-fixture "vol-mgr finished the pull, our spawn_blocking
-    // finished the decompress, caller's future was then dropped"
-    // sequence by constructing the resulting on-disk shape directly
-    // and calling the recovery helper.
-
-    // Fresh in-memory DB with the production schema.
-    let conn = crate::db::test_conn();
-    let db = Arc::new(Mutex::new(conn));
-
-    // Build the post-cancel disk state.
-    let tmp = tempfile::tempdir().unwrap();
-    let digest_dir = tmp.path();
-    populate_orphaned_digest_dir(digest_dir).await;
-
-    let name = "seed";
-    let content_hash = "sha256:cancellation-residue";
-
-    // Sanity: nothing in the DB yet.
-    assert!(
-        crate::db::get_build(&db.lock().unwrap(), name, content_hash)
-            .unwrap()
-            .is_none(),
-        "precondition: cancelled caller never wrote the row"
-    );
-
-    // The "next GetTemplate" calls recovery.
-    let rootfs_size = recover_from_digest_dir(&db, name, content_hash, digest_dir)
-        .await
-        .expect("orphaned digest dir must recover");
-    assert_eq!(
-        rootfs_size,
-        b"decompressed rootfs bytes (test fixture)".len() as u64
-    );
-
-    // The DB row is now present and the manifest is normalized — even
-    // though the on-disk manifest the cancelled caller left behind was
-    // the raw vol-mgr-pulled object.
-    let row = crate::db::get_build(&db.lock().unwrap(), name, content_hash)
-        .unwrap()
-        .expect("recovery must commit the row");
-    assert_eq!(row.state, "ready");
-    assert_eq!(row.artifact_size_bytes, rootfs_size);
-    let stored: serde_json::Value = serde_json::from_str(&row.manifest_json).unwrap();
-    assert_eq!(stored["name"], name);
-    assert_eq!(stored["content_hash"], content_hash);
-    assert_eq!(stored["bootable_artifact"], TEMPLATE_ROOTFS_FILE);
-    assert_eq!(
-        stored["files"][TEMPLATE_ROOTFS_FILE]["digest"], content_hash,
-        "normalize_template_manifest must have run on the recovered manifest"
-    );
-
-    // The on-disk manifest was also rewritten atomically so a future
-    // recovery (or any other reader of the digest dir) sees the
-    // normalized form.
-    let on_disk = tokio::fs::read_to_string(digest_dir.join("manifest.json"))
-        .await
-        .unwrap();
-    let on_disk: serde_json::Value = serde_json::from_str(&on_disk).unwrap();
-    assert_eq!(on_disk["content_hash"], content_hash);
-    assert_eq!(on_disk["bootable_artifact"], TEMPLATE_ROOTFS_FILE);
-}
-
-#[tokio::test]
-async fn partial_disk_state_does_not_recover() {
-    // Mid-pull cancellation that interrupts BEFORE the decompress
-    // completes leaves a digest dir without rootfs.ext4 — recovery
-    // MUST decline so the caller falls through to the normal pull
-    // path, which uses vol-mgr's skip-if-present to elide re-downloads
-    // and runs the missing decompress.
-
-    let conn = crate::db::test_conn();
-    let db = Arc::new(Mutex::new(conn));
-
-    let tmp = tempfile::tempdir().unwrap();
-    let digest_dir = tmp.path();
-    // Three source files present, but NO rootfs.ext4 — the residue of
-    // a pull that was cancelled after the downloads finished but
-    // before decompress ran.
-    tokio::fs::write(digest_dir.join("metadata.json"), b"{}")
-        .await
-        .unwrap();
-    tokio::fs::write(digest_dir.join("manifest.json"), b"{}")
-        .await
-        .unwrap();
-    tokio::fs::write(digest_dir.join(TEMPLATE_ROOTFS_ZSTD_FILE), b"zstd")
-        .await
-        .unwrap();
-
-    let outcome = recover_from_digest_dir(&db, "seed", "sha256:partial", digest_dir).await;
-    assert!(
-        outcome.is_err(),
-        "recovery must decline when rootfs.ext4 is absent"
-    );
-    assert!(
-        crate::db::get_build(&db.lock().unwrap(), "seed", "sha256:partial")
-            .unwrap()
-            .is_none(),
-        "DB row must not be created on partial-state recovery"
-    );
-}
-
-#[tokio::test]
-async fn recovery_accepts_legacy_manifest_without_zst_on_disk() {
-    // Legacy templates published before the zstd format only carry
-    // `rootfs.ext4` in `manifest.files`. After a successful pull the
-    // digest dir likewise has no `rootfs.ext4.zst`. Manifest-driven
-    // recovery must honor that and accept the directory even though
-    // the compressed sibling is absent on disk.
-
-    let conn = crate::db::test_conn();
-    let db = Arc::new(Mutex::new(conn));
-
-    let tmp = tempfile::tempdir().unwrap();
-    let digest_dir = tmp.path();
-    let content_hash = "sha256:legacy-recovery";
-
-    // Legacy on-disk shape: metadata + manifest listing only
-    // rootfs.ext4 + the rootfs itself. No .zst sibling.
-    tokio::fs::write(digest_dir.join("metadata.json"), br#"{"arch":"aarch64"}"#)
-        .await
-        .unwrap();
-    let legacy_manifest = format!(
-        r#"{{
-            "name": "seed",
-            "content_hash": "{content_hash}",
-            "build_date": "2026-05-12T19:10:53+00:00",
-            "runtime": "fc",
-            "arch": "x86_64",
-            "config": {{}},
-            "bootable_artifact": "rootfs.ext4",
-            "files": {{
-                "rootfs.ext4": {{ "digest": "{content_hash}", "size": 470163456 }}
-            }}
-        }}"#
-    );
-    tokio::fs::write(digest_dir.join("manifest.json"), legacy_manifest.as_bytes())
-        .await
-        .unwrap();
-    tokio::fs::write(
-        digest_dir.join(TEMPLATE_ROOTFS_FILE),
-        b"legacy rootfs bytes (test fixture)",
-    )
-    .await
-    .unwrap();
-    // Deliberately no rootfs.ext4.zst.
-
-    let rootfs_size = recover_from_digest_dir(&db, "seed", content_hash, digest_dir)
-        .await
-        .expect("legacy on-disk shape must recover without a .zst sibling");
-    assert_eq!(
-        rootfs_size,
-        b"legacy rootfs bytes (test fixture)".len() as u64
-    );
-
-    let row = crate::db::get_build(&db.lock().unwrap(), "seed", content_hash)
-        .unwrap()
-        .expect("legacy recovery must commit the row");
-    assert_eq!(row.state, "ready");
-    let stored: serde_json::Value = serde_json::from_str(&row.manifest_json).unwrap();
-    assert!(
-        stored["files"].get(TEMPLATE_ROOTFS_ZSTD_FILE).is_none(),
-        "normalized manifest must not invent a .zst entry the legacy template never had"
-    );
-}
-
-#[tokio::test]
-async fn recovery_declines_when_manifest_requires_zst_but_disk_lacks_it() {
-    // Inverse of the legacy case: when the manifest declares both
-    // rootfs.ext4 AND rootfs.ext4.zst (new format), recovery must
-    // require both on disk. A residue with the .zst sibling missing
-    // means the pull was interrupted before vol-mgr finished
-    // writing it; recovery must decline so the next caller's pull
-    // path re-fetches whatever's missing.
-
-    let conn = crate::db::test_conn();
-    let db = Arc::new(Mutex::new(conn));
-
-    let tmp = tempfile::tempdir().unwrap();
-    let digest_dir = tmp.path();
-    let content_hash = "sha256:new-format-partial";
-
-    tokio::fs::write(digest_dir.join("metadata.json"), br#"{"arch":"x86_64"}"#)
-        .await
-        .unwrap();
-    let new_format_manifest = format!(
-        r#"{{
-            "name": "seed",
-            "content_hash": "{content_hash}",
-            "build_date": "2026-05-19T19:28:29+00:00",
-            "runtime": "fc",
-            "arch": "x86_64",
-            "config": {{}},
-            "bootable_artifact": "rootfs.ext4",
-            "files": {{
-                "rootfs.ext4":     {{ "digest": "{content_hash}", "size": 474472448 }},
-                "rootfs.ext4.zst": {{
-                    "digest": "sha256:abcdef",
-                    "size": 118171754,
-                    "compression": {{ "codec": "zstd", "level": 3 }}
-                }}
-            }}
-        }}"#
-    );
-    tokio::fs::write(
-        digest_dir.join("manifest.json"),
-        new_format_manifest.as_bytes(),
-    )
-    .await
-    .unwrap();
-    tokio::fs::write(digest_dir.join(TEMPLATE_ROOTFS_FILE), b"rootfs bytes")
-        .await
-        .unwrap();
-    // No rootfs.ext4.zst — the manifest demands it, recovery must decline.
-
-    let outcome = recover_from_digest_dir(&db, "seed", content_hash, digest_dir).await;
-    assert!(
-        outcome.is_err(),
-        "manifest-listed file missing on disk must abort recovery"
-    );
-    assert!(
-        crate::db::get_build(&db.lock().unwrap(), "seed", content_hash)
-            .unwrap()
-            .is_none(),
-        "DB row must not be created when a manifest-listed file is missing"
-    );
-}
-
 #[test]
 fn build_manifest_pull_plan_dedups_zst_pair() {
     use pplx_space_common_core::types::{
@@ -1228,22 +994,17 @@ fn normalize_rejects_conflicting_execution_metadata() {
 }
 
 #[tokio::test]
-async fn hash_mismatch_cleanup_removes_digest_dir_so_recovery_declines() {
+async fn hash_mismatch_cleanup_removes_digest_dir() {
     // Hash mismatch is the cluster-metadata-vs-S3 inconsistency signal.
     // The bad bytes have already been atomically renamed onto
-    // rootfs.ext4 by `decompress_rootfs` before we hash-verify, so if
-    // we leave the digest dir intact, the NEXT GetTemplate for this
-    // `(name, content_hash)` will hit `try_recover_from_disk`, find
-    // all four artifacts, and silently upsert a `state=ready` row
-    // pointing at unverified bytes. The cleanup MUST clear the dir
-    // before returning `HashMismatch`.
-
-    let conn = crate::db::test_conn();
-    let db = Arc::new(Mutex::new(conn));
-
+    // rootfs.ext4 by `decompress_rootfs` before we hash-verify, so the
+    // cleanup MUST clear the dir before returning `HashMismatch`: a dir
+    // left without a row blocks every later pull of the build until
+    // startup recovery drops it.
     let tmp = tempfile::tempdir().unwrap();
-    let digest_dir = tmp.path();
-    populate_orphaned_digest_dir(digest_dir).await;
+    let digest_dir = tmp.path().join("digest");
+    tokio::fs::create_dir_all(&digest_dir).await.unwrap();
+    populate_orphaned_digest_dir(&digest_dir).await;
     assert!(digest_dir.join(TEMPLATE_ROOTFS_FILE).exists());
 
     // Simulate the cleanup that runs on hash mismatch in
@@ -1252,35 +1013,78 @@ async fn hash_mismatch_cleanup_removes_digest_dir_so_recovery_declines() {
     // sync helper is what nodemgr's handler effectively runs
     // on the privileged side and is what we exercise here in
     // tests (no nodemgr running in this unit-test context).
-    cleanup_digest_dir_sync(digest_dir).unwrap();
+    cleanup_digest_dir_sync(&digest_dir).unwrap();
 
-    // Recovery MUST decline now — the bad rootfs.ext4 is gone.
-    let outcome = recover_from_digest_dir(&db, "seed", "sha256:mismatched", digest_dir).await;
-    assert!(
-        outcome.is_err(),
-        "post-mismatch recovery must decline; otherwise bad bytes get committed to DB"
-    );
-    assert!(
-        crate::db::get_build(&db.lock().unwrap(), "seed", "sha256:mismatched")
-            .unwrap()
-            .is_none(),
-        "no DB row may be created from a hash-mismatched pull"
-    );
+    assert!(!digest_dir.exists());
 }
 
-// PullCleanupGuard unit tests were removed when the cleanup
-// path moved to node-manager: Drop now spawns an async
-// `BtrfsDeleteTemplateSubvolume` RPC, which can't usefully be
-// tested without a running nodemgr. The on-disk-cleanup
-// behavior the old tests covered is exercised by the typed
-// `local.template_cache_lru_eviction_reclaims` smoke on kind
-// against a real nodemgr.
+/// A failed storage location's build dir is gone before the next location's
+/// attempt starts, since a pull refuses a build dir that exists when it
+/// starts. The cleanup the guard spawns lands in the attempt's slot and the
+/// failover loop waits for it. With no node-manager here, the guard removes
+/// the dir locally, as its fallback does.
+#[tokio::test(flavor = "current_thread")]
+async fn a_failed_location_s_cleanup_finishes_before_the_next_attempt() {
+    let tmp = tempfile::tempdir().unwrap();
+    let content_hash = format!("sha256:{}", "e".repeat(64));
+    let digest_dir = tmp.path().join("seed").join(&content_hash);
+    tokio::fs::create_dir_all(&digest_dir).await.unwrap();
+    populate_orphaned_digest_dir(&digest_dir).await;
+    let slot = PullCleanupSlot::default();
+
+    let mut guard = PullCleanupGuard::new("seed", &content_hash, &digest_dir, &slot);
+    guard.remove = |_, _, dir| {
+        Box::pin(async move {
+            cleanup_digest_dir_local_fallback(dir).await.unwrap();
+        })
+    };
+    drop(guard);
+    slot.finish().await;
+
+    assert!(!digest_dir.exists());
+    // Nothing left to wait for.
+    slot.finish().await;
+}
+
+/// A pull that finds a build dir on disk without a catalog row refuses
+/// retryably and leaves the dir as it found it: it neither adopts the dir
+/// nor downloads into it.
+#[tokio::test]
+async fn a_pull_refuses_a_rowless_build_dir_and_deletes_nothing() {
+    let root = tempfile::tempdir().unwrap();
+    let content_hash = format!("sha256:{}", "c".repeat(64));
+    let dir = root.path().join("seed").join(&content_hash);
+    tokio::fs::create_dir_all(&dir).await.unwrap();
+    for file in ["manifest.json", "metadata.json", TEMPLATE_ROOTFS_FILE] {
+        tokio::fs::write(dir.join(file), b"kept").await.unwrap();
+    }
+
+    let (outcome, _) = pull_resolved_owner(
+        root.path(),
+        Arc::new(Mutex::new(crate::db::test_conn())),
+        "seed",
+        &content_hash,
+        &[],
+        &[],
+        None,
+        RootfsBackingPolicy::Inherit,
+    )
+    .await;
+
+    assert!(
+        matches!(&outcome, PullOutcome::Retryable(status) if status.code() == tonic::Code::Unavailable),
+        "{outcome:?}"
+    );
+    for file in ["manifest.json", "metadata.json", TEMPLATE_ROOTFS_FILE] {
+        assert_eq!(tokio::fs::read(dir.join(file)).await.unwrap(), b"kept");
+    }
+}
 
 /// A credential that can write the artifact prefix can replace the compressed
 /// rootfs and keep the manifest's declared expanded digest equal to the
 /// release hash. The bytes that would boot must be rehashed and refused, and
-/// they must never reach the rootfs path: disk recovery adopts whatever sits
-/// there, so a refusal that published first would still be recoverable.
+/// they must never reach the rootfs path, where a refusal that published
+/// first would leave unverified bytes at the path sandboxes boot from.
 #[rstest::rstest]
 #[case(pplx_space_common_core::types::HashAlg::Sha256)]
 #[case(pplx_space_common_core::types::HashAlg::Blake3)]
@@ -1359,7 +1163,7 @@ async fn materialize_rootfs_rejects_decoded_bytes_that_disagree_with_the_release
     }
     assert!(
         !rootfs_path.exists(),
-        "replaced bytes must not be published at the rootfs path, or recovery could adopt them"
+        "replaced bytes must not be published at the rootfs path"
     );
 }
 

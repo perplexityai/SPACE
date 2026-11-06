@@ -67,7 +67,7 @@ fn parses_minimal_legacy_manifest_with_only_required_fields() {
 fn parses_empty_manifest_via_serde_defaults() {
     // An empty object exercises the `#[serde(default)]` on every
     // field — guards against a missing-field-fails-the-parse
-    // regression that would break disk recovery's
+    // regression that would break startup recovery's
     // "manifest exists but is partial" path.
     let m: TemplateManifest =
         serde_json::from_str("{}").expect("empty manifest must parse via defaults");

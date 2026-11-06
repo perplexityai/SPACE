@@ -241,8 +241,8 @@ fn execute_one_skips_active_added_between_plan_and_execute() {
 
 /// Disk-delete failure must NOT clear the DB row. The build row
 /// stays so the next tick can retry; an orphaned digest dir on
-/// disk is the existing failure mode the recovery path already
-/// handles (`try_recover_from_disk`). The opposite — DB cleared,
+/// disk is the failure mode startup recovery already handles. The
+/// opposite — DB cleared,
 /// disk full — would leak bytes forever.
 #[test]
 fn execute_one_keeps_db_row_when_disk_delete_fails() {
@@ -1213,8 +1213,8 @@ async fn gc_tick_recovers_stuck_deleting_row_when_disk_intact() {
 /// rather than reset it to `'ready'`, otherwise a sandbox-create
 /// against the half-wiped build would fail at `launch_prepare`'s
 /// `cp --reflink` step with a confusing "no such file" error.
-/// `do_pull` will re-materialize the build on the next access via
-/// its existing `digest_dir_existed` path.
+/// Startup recovery then removes any wiped dir left, and a pull
+/// re-materializes the build.
 ///
 /// **Will fail on current main**: no reaper exists, so the row
 /// stays `'deleting'` forever.

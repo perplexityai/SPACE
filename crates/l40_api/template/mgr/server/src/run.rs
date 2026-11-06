@@ -187,6 +187,17 @@ async fn run_service(
         .with_production_hash_algorithm(production_hash_algorithm)
         .with_feature_flags(pplx_space_feature_flags::FeatureFlagClient::from_env());
 
+    // Before any background job resumes and before the socket binds, so
+    // nothing in this process can own a staging dir yet. Build-manager's
+    // staging dirs outlive restarts; the cleanup reaps only stale ones.
+    {
+        let service = service.clone();
+        if let Err(error) =
+            tokio::task::spawn_blocking(move || service.clean_transient_dirs_before_serving()).await
+        {
+            tracing::warn!(%error, "pre-serving transient dir cleanup panicked");
+        }
+    }
     // Re-arm any durable background jobs that were in flight (i.e.
     // `status='running'`) when the previous tmplmgr exited. Without
     // this, a tmplmgr restart mid-job would leave the row stuck in

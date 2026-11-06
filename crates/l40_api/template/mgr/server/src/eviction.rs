@@ -738,9 +738,9 @@ pub(crate) enum ReaperDiskState {
     /// The digest dir is gone or `rootfs.ext4` is missing. Phase 2
     /// partially succeeded — contents wiped — but Phase 3 didn't
     /// commit (typically the post-cleanup `rmdir` on a btrfs subvol
-    /// root failed and surfaced as Err). The row is dropped; a future
-    /// `do_pull` re-fetches via the existing `digest_dir_existed`
-    /// path that re-uses the leftover subvol root.
+    /// root failed and surfaced as Err). The row is dropped; pulls
+    /// refuse a leftover dir without a row until startup recovery
+    /// removes it, and then re-fetch the build.
     Missing,
 }
 
@@ -770,9 +770,9 @@ pub(crate) type ReaperDiskProbeFn = Arc<
 ///   replans the build for eviction; if pins or sandboxes attached
 ///   while it was stuck, the planner's filters keep it alive.
 /// - **Disk missing** ⇒ drop the row. `resolve_template` reports
-///   NotFound; `do_pull` on the next access writes fresh bytes into
-///   the leftover btrfs subvol root via its existing
-///   `digest_dir_existed` adoption path.
+///   NotFound. A pull refuses a leftover btrfs subvol root, which has
+///   no row, until startup recovery removes it, then re-fetches the
+///   build.
 ///
 /// **Race safety:** called at the start of `gc_tick`, before any
 /// candidate enters `execute_precheck`. `execute_precheck`'s Phase 1 CAS
