@@ -10,7 +10,7 @@ async fn admission_wait_cleanup_runs_when_wait_is_cancelled() {
         },
     ));
     let held_permit = limiter
-        .acquire(ActivationAdmissionKind::Cold, "sandbox-held")
+        .acquire(LimitedActivationKind::Cold, "sandbox-held")
         .await
         .unwrap();
     let task_limiter = Arc::clone(&limiter);
@@ -25,7 +25,7 @@ async fn admission_wait_cleanup_runs_when_wait_is_cancelled() {
             },
         );
         task_limiter
-            .acquire(ActivationAdmissionKind::Cold, "sandbox-waiting")
+            .acquire(LimitedActivationKind::Cold, "sandbox-waiting")
             .await
             .unwrap();
     });
@@ -98,7 +98,7 @@ async fn restore_activation_cleanup_runs_before_admitted_permit_is_released() {
             },
         );
         let permit = task_limiter
-            .acquire(ActivationAdmissionKind::Restore, "sandbox-1")
+            .acquire(LimitedActivationKind::Restore, "sandbox-1")
             .await
             .unwrap();
         cleanup_guard.admit(permit);
@@ -141,7 +141,7 @@ async fn activation_cleanup_remains_armed_after_permit_release() {
             },
         );
         let permit = task_limiter
-            .acquire(ActivationAdmissionKind::Restore, "sandbox-1")
+            .acquire(LimitedActivationKind::Restore, "sandbox-1")
             .await
             .unwrap();
         cleanup_guard.admit(permit);
@@ -217,7 +217,7 @@ async fn activation_success_atomically_releases_admission_and_disarms_cleanup() 
         },
     );
     let permit = limiter
-        .acquire(ActivationAdmissionKind::Restore, "sandbox-1")
+        .acquire(LimitedActivationKind::Restore, "sandbox-1")
         .await
         .unwrap();
     cleanup_guard.admit(permit);
@@ -316,4 +316,64 @@ async fn stage_helpers_use_stage_as_the_exported_resource_name() {
         *names.0.lock().expect("span capture lock poisoned"),
         vec![stage; 3]
     );
+}
+
+/// `admit_vm_activation` meters a cold boot and a restore through the limiter
+/// under their own kinds, and admits a resident resume on its first poll while
+/// the limiter has no free slot.
+#[tokio::test]
+async fn admit_vm_activation_meters_cold_and_restore_but_not_a_resident_resume() {
+    use futures_util::FutureExt;
+
+    let scratch = tempfile::tempdir().unwrap();
+    let mut service = crate::service::SandboxManagerService::new_with_options(
+        crate::db::test_conn(),
+        crate::service::SandboxManagerServiceOptions::for_test_in(scratch.path()),
+    );
+    service.activation_admission_limiter = Arc::new(ActivationAdmissionLimiter::with_config(
+        ActivationAdmissionConfig {
+            max_concurrent_activations: 2,
+            refill_rps: 100.0,
+            burst: 100.0,
+        },
+    ));
+    let limiter = Arc::clone(&service.activation_admission_limiter);
+
+    let cold = service
+        .admit_vm_activation(ActivationAdmissionKind::Cold, "sandbox-cold")
+        .await
+        .expect("a free slot admits a cold boot");
+    assert!(matches!(cold, ActivationAdmissionPermit::Limited(_)));
+    assert_eq!(limiter.in_flight_for(LimitedActivationKind::Cold), 1);
+    assert_eq!(limiter.in_flight_for(LimitedActivationKind::Restore), 0);
+
+    let restore = service
+        .admit_vm_activation(ActivationAdmissionKind::Restore, "sandbox-restore")
+        .await
+        .expect("a free slot admits a restore");
+    assert!(matches!(restore, ActivationAdmissionPermit::Limited(_)));
+    assert_eq!(limiter.in_flight_for(LimitedActivationKind::Restore), 1);
+    assert_eq!(limiter.in_flight(), 2);
+
+    // Both slots are held, so a resume the limiter metered could not finish on
+    // its first poll.
+    let resume = service
+        .admit_vm_activation(ActivationAdmissionKind::ResidentResume, "sandbox-resume")
+        .now_or_never()
+        .expect("a resident resume is admitted on its first poll")
+        .expect("a resident resume is never refused");
+    assert!(matches!(resume, ActivationAdmissionPermit::Unlimited));
+    assert_eq!(limiter.in_flight(), 2);
+
+    drop(resume);
+    assert_eq!(limiter.in_flight(), 2);
+    drop(cold);
+    drop(restore);
+    assert_eq!(limiter.in_flight(), 0);
+
+    service.shutdown_token.cancel();
+    service.task_tracker.close();
+    tokio::time::timeout(Duration::from_secs(30), service.task_tracker.wait())
+        .await
+        .expect("service tasks stop within 30 seconds of shutdown");
 }

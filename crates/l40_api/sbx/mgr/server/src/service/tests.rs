@@ -18489,13 +18489,13 @@ pub(crate) mod service_tests {
         ));
         let spent = service
             .activation_admission_limiter
-            .try_acquire(ActivationAdmissionKind::Restore)
+            .try_acquire(LimitedActivationKind::Restore)
             .expect("test setup should spend the only launch token");
         drop(spent);
         assert!(
             service
                 .activation_admission_limiter
-                .try_acquire(ActivationAdmissionKind::Cold)
+                .try_acquire(LimitedActivationKind::Cold)
                 .is_err(),
             "the launch gate must actually be shut, or an absence assertion below proves nothing"
         );
@@ -18979,7 +18979,7 @@ pub(crate) mod service_tests {
 
         let spent = service
             .activation_admission_limiter
-            .try_acquire(ActivationAdmissionKind::Restore)
+            .try_acquire(LimitedActivationKind::Restore)
             .expect("test setup should spend the only restore token");
         drop(spent);
 
@@ -19009,7 +19009,7 @@ pub(crate) mod service_tests {
         ));
         let held = service
             .activation_admission_limiter
-            .try_acquire(ActivationAdmissionKind::Restore)
+            .try_acquire(LimitedActivationKind::Restore)
             .expect("test setup should fill the only activation slot");
 
         let result = tokio::time::timeout(
@@ -19586,7 +19586,7 @@ pub(crate) mod service_tests {
         cleanup_guard.admit(
             service
                 .activation_admission_limiter
-                .acquire(ActivationAdmissionKind::Cold, &sandbox_id)
+                .acquire(LimitedActivationKind::Cold, &sandbox_id)
                 .await
                 .unwrap(),
         );
@@ -19661,7 +19661,7 @@ pub(crate) mod service_tests {
         ));
         let held = service
             .activation_admission_limiter
-            .try_acquire(ActivationAdmissionKind::Restore)
+            .try_acquire(LimitedActivationKind::Restore)
             .expect("test setup should fill the only process launch slot");
         assert_eq!(service.activation_admission_limiter.in_flight(), 1);
 
@@ -22041,13 +22041,13 @@ pub(crate) mod service_tests {
         let limiter =
             ActivationAdmissionLimiter::with_config(activation_admission_config(1, 100.0, 100.0));
         let held = limiter
-            .try_acquire(ActivationAdmissionKind::Cold)
+            .try_acquire(LimitedActivationKind::Cold)
             .expect("first activation holds the only slot");
-        assert_eq!(limiter.in_flight_for(ActivationAdmissionKind::Cold), 1);
-        assert_eq!(limiter.in_flight_for(ActivationAdmissionKind::Restore), 0);
+        assert_eq!(limiter.in_flight_for(LimitedActivationKind::Cold), 1);
+        assert_eq!(limiter.in_flight_for(LimitedActivationKind::Restore), 0);
 
         let error = limiter
-            .try_acquire(ActivationAdmissionKind::Restore)
+            .try_acquire(LimitedActivationKind::Restore)
             .expect_err("second concurrent activation should reject");
         assert_eq!(error.code(), tonic::Code::ResourceExhausted);
         assert_eq!(limiter.in_flight(), 1);
@@ -22062,7 +22062,7 @@ pub(crate) mod service_tests {
 
         drop(held);
         assert_eq!(limiter.in_flight(), 0);
-        assert_eq!(limiter.in_flight_for(ActivationAdmissionKind::Cold), 0);
+        assert_eq!(limiter.in_flight_for(LimitedActivationKind::Cold), 0);
     }
 
     #[test]
@@ -22070,12 +22070,12 @@ pub(crate) mod service_tests {
         let limiter =
             ActivationAdmissionLimiter::with_config(activation_admission_config(100, 1e-20, 1.0));
         let first = limiter
-            .try_acquire(ActivationAdmissionKind::Cold)
+            .try_acquire(LimitedActivationKind::Cold)
             .expect("first burst token");
         drop(first);
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            limiter.try_acquire(ActivationAdmissionKind::Restore)
+            limiter.try_acquire(LimitedActivationKind::Restore)
         }));
         assert!(result.is_ok(), "retry-after calculation must not panic");
         let error = result
@@ -22098,14 +22098,14 @@ pub(crate) mod service_tests {
             activation_admission_config(1, 0.001, 100.0),
         ));
         let held = limiter
-            .try_acquire(ActivationAdmissionKind::Cold)
+            .try_acquire(LimitedActivationKind::Cold)
             .expect("first activation holds the only slot");
         let waiter = {
             let limiter = Arc::clone(&limiter);
             tokio::spawn(async move {
                 limiter
                     .acquire(
-                        ActivationAdmissionKind::Restore,
+                        LimitedActivationKind::Restore,
                         "019ee08a-5c80-7e81-9241-01aeb9ec9d83",
                     )
                     .await

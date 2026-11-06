@@ -7,6 +7,7 @@ use super::network_policy::EffectiveNetworkPolicy;
 use super::network_runtime::{network_policy_refresh_error_to_status, refresh_network_policy};
 use super::spaced_bridge::StreamPresenceTouch;
 use super::spaced_bridge_policy::SpacedBridgePolicy;
+use super::start_support::ActivationAdmissionKind;
 use super::tail_support::*;
 use super::*;
 
@@ -21,6 +22,7 @@ use pplx_space_api_route::{
     ed25519::SpaceApiRouteEd25519Verifier, ed25519::space_api_route_ed25519_token_from_metadata,
 };
 use pplx_space_common_core::types::{GuestPort, SandboxId, SpaceApiRouteIdentity};
+use pplx_space_metrics::sandbox::admission::AdmissionPermitOutcome;
 use pplx_space_metrics::sandbox::worker::SpaceApiRouteTokenAuthorizationResult;
 use pplx_space_net_common::{EffectiveNetworkPolicyRef, NetworkPolicy};
 use tonic::metadata::MetadataMap;
@@ -799,6 +801,9 @@ impl SandboxManagerService {
         // policy is unchanged.
         self.apply_network_policy_before_wake(sandbox_id, "resume")
             .await?;
+        let activation_admission_permit = self
+            .admit_vm_activation(ActivationAdmissionKind::ResidentResume, &sandbox.id)
+            .await?;
         self.begin_resident_resume(&sandbox.id, activation_policy)
             .await?;
         self.watchdog.record_lifecycle_edge(&sandbox.id).await;
@@ -845,13 +850,18 @@ impl SandboxManagerService {
             }
         }
 
-        if let Err(e) = node_client
+        let resumed = node_client
             .resume_sandbox(ResumeSandboxRequest {
                 execution_fence: sandbox.node_execution_fence(),
                 sandbox_id: sandbox.id.clone(),
             })
-            .await
-        {
+            .await;
+        activation_admission_permit.finish(if resumed.is_ok() {
+            AdmissionPermitOutcome::Succeeded
+        } else {
+            AdmissionPermitOutcome::Failed
+        });
+        if let Err(e) = resumed {
             let reason = format!("resume failed: {e}");
             let observation = observe_vm_state(
                 &sandbox_id_typed,

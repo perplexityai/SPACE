@@ -115,7 +115,7 @@ impl ActivationCleanupGuard {
 
     pub(super) fn mark_permit_failed(&mut self) {
         if let Some(permit) = self.permit.as_mut() {
-            permit.outcome = AdmissionPermitOutcome::Failed;
+            permit.mark_failed();
         }
     }
 
@@ -265,9 +265,28 @@ impl SandboxStartExecutionPath {
 pub(super) enum ActivationAdmissionKind {
     Cold,
     Restore,
+    ResidentResume,
 }
 
 impl ActivationAdmissionKind {
+    /// The limiter class that meters this kind, if one does.
+    const fn limited(self) -> Option<LimitedActivationKind> {
+        match self {
+            Self::Cold => Some(LimitedActivationKind::Cold),
+            Self::Restore => Some(LimitedActivationKind::Restore),
+            Self::ResidentResume => None,
+        }
+    }
+}
+
+/// The activation kinds [`ActivationAdmissionLimiter`] meters.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum LimitedActivationKind {
+    Cold,
+    Restore,
+}
+
+impl LimitedActivationKind {
     fn as_str(self) -> &'static str {
         match self {
             Self::Cold => "cold_activation",
@@ -290,6 +309,45 @@ impl ActivationAdmissionKind {
     }
 }
 
+#[cfg(test)]
+tokio::task_local! {
+    /// Records each kind [`SandboxManagerService::admit_vm_activation`] is
+    /// asked to admit, so a test can see which launch path reached it.
+    pub(super) static REQUESTED_VM_ACTIVATIONS: Arc<std::sync::Mutex<Vec<ActivationAdmissionKind>>>;
+}
+
+impl SandboxManagerService {
+    /// The launch-time admission for a cold boot, a snapshot restore and the
+    /// resume of a resident paused VM. Each path calls this before it sends
+    /// node-manager `LaunchSandbox` (cold boot, restore) or `ResumeSandbox`
+    /// (resident resume), and holds the permit across that request. A
+    /// restore's permit ends before the restore loads the snapshot and resumes
+    /// the VM. Two resumes do not pass here: a checkpoint's resume of the VM it
+    /// paused, and a stop's resume of a paused VM so its guest can flush.
+    ///
+    /// Cold boots and restores wait for [`ActivationAdmissionLimiter`]
+    /// capacity and are refused when it stays exhausted. A resident resume
+    /// takes an [`ActivationAdmissionPermit::Unlimited`] permit at once.
+    pub(super) async fn admit_vm_activation(
+        &self,
+        kind: ActivationAdmissionKind,
+        sandbox_id: &str,
+    ) -> Result<ActivationAdmissionPermit, Status> {
+        #[cfg(test)]
+        if let Ok(admitted) = REQUESTED_VM_ACTIVATIONS.try_with(Arc::clone) {
+            admitted.lock().unwrap().push(kind);
+        }
+        match kind.limited() {
+            Some(limited) => {
+                self.activation_admission_limiter
+                    .acquire(limited, sandbox_id)
+                    .await
+            }
+            None => Ok(ActivationAdmissionPermit::Unlimited),
+        }
+    }
+}
+
 #[derive(Debug)]
 struct ActivationInFlight {
     cold: AtomicUsize,
@@ -297,10 +355,10 @@ struct ActivationInFlight {
 }
 
 impl ActivationInFlight {
-    fn counter(&self, kind: ActivationAdmissionKind) -> &AtomicUsize {
+    fn counter(&self, kind: LimitedActivationKind) -> &AtomicUsize {
         match kind {
-            ActivationAdmissionKind::Cold => &self.cold,
-            ActivationAdmissionKind::Restore => &self.restore,
+            LimitedActivationKind::Cold => &self.cold,
+            LimitedActivationKind::Restore => &self.restore,
         }
     }
 }
@@ -326,14 +384,14 @@ struct ActivationAdmissionRejection {
 }
 
 struct AdmissionQueueMetricGuard {
-    kind: ActivationAdmissionKind,
+    kind: LimitedActivationKind,
     started_at: Instant,
     outcome: AdmissionQueueOutcome,
     reason: AdmissionRejectReason,
 }
 
 impl AdmissionQueueMetricGuard {
-    fn new(kind: ActivationAdmissionKind, started_at: Instant) -> Self {
+    fn new(kind: LimitedActivationKind, started_at: Instant) -> Self {
         Self {
             kind,
             started_at,
@@ -397,13 +455,13 @@ impl ActivationAdmissionLimiter {
     }
 
     #[cfg(test)]
-    pub(super) fn in_flight_for(&self, kind: ActivationAdmissionKind) -> usize {
+    pub(super) fn in_flight_for(&self, kind: LimitedActivationKind) -> usize {
         self.in_flight_by_kind.counter(kind).load(Ordering::SeqCst)
     }
 
     pub(super) async fn acquire(
         &self,
-        kind: ActivationAdmissionKind,
+        kind: LimitedActivationKind,
         sandbox_id: &str,
     ) -> Result<ActivationAdmissionPermit, Status> {
         self.acquire_with_timeout(kind, sandbox_id, DEFAULT_WAIT_TIMEOUT)
@@ -412,7 +470,7 @@ impl ActivationAdmissionLimiter {
 
     async fn acquire_with_timeout(
         &self,
-        kind: ActivationAdmissionKind,
+        kind: LimitedActivationKind,
         sandbox_id: &str,
         wait_timeout: Duration,
     ) -> Result<ActivationAdmissionPermit, Status> {
@@ -476,7 +534,7 @@ impl ActivationAdmissionLimiter {
     #[cfg(test)]
     pub(super) fn try_acquire(
         &self,
-        kind: ActivationAdmissionKind,
+        kind: LimitedActivationKind,
     ) -> Result<ActivationAdmissionPermit, Status> {
         match self.try_acquire_inner(kind) {
             Ok(permit) => Ok(permit),
@@ -489,7 +547,7 @@ impl ActivationAdmissionLimiter {
 
     fn try_acquire_inner(
         &self,
-        kind: ActivationAdmissionKind,
+        kind: LimitedActivationKind,
     ) -> Result<ActivationAdmissionPermit, ActivationAdmissionRejection> {
         let metric_class = kind.metric_class();
         let permit = match self.semaphore.clone().try_acquire_owned() {
@@ -540,17 +598,19 @@ impl ActivationAdmissionLimiter {
             metric_class,
             operation_in_flight,
         );
-        Ok(ActivationAdmissionPermit {
-            _permit: permit,
-            in_flight: self.in_flight.clone(),
-            in_flight_by_kind: Arc::clone(&self.in_flight_by_kind),
-            kind,
-            started_at: Instant::now(),
-            outcome: AdmissionPermitOutcome::Cancelled,
-        })
+        Ok(ActivationAdmissionPermit::Limited(
+            LimitedActivationPermit {
+                _permit: permit,
+                in_flight: self.in_flight.clone(),
+                in_flight_by_kind: Arc::clone(&self.in_flight_by_kind),
+                kind,
+                started_at: Instant::now(),
+                outcome: AdmissionPermitOutcome::Cancelled,
+            },
+        ))
     }
 
-    fn emit_rejection(&self, kind: ActivationAdmissionKind, reason: AdmissionRejectReason) {
+    fn emit_rejection(&self, kind: LimitedActivationKind, reason: AdmissionRejectReason) {
         pplx_space_metrics::sandbox::admission::node_refill_rps(self.config.refill_rps);
         pplx_space_metrics::sandbox::admission::node_decision(
             kind.metric_class(),
@@ -580,23 +640,47 @@ impl ActivationAdmissionLimiter {
     }
 }
 
+/// Launch-time admission for one VM launch or resume, from
+/// [`SandboxManagerService::admit_vm_activation`].
 #[derive(Debug)]
-pub(super) struct ActivationAdmissionPermit {
+pub(super) enum ActivationAdmissionPermit {
+    /// Holds a slot of [`ActivationAdmissionLimiter`] until dropped.
+    Limited(LimitedActivationPermit),
+    /// Holds no limiter capacity.
+    Unlimited,
+}
+
+impl ActivationAdmissionPermit {
+    pub(super) fn finish(self, outcome: AdmissionPermitOutcome) {
+        if let Self::Limited(permit) = self {
+            permit.finish(outcome);
+        }
+    }
+
+    fn mark_failed(&mut self) {
+        if let Self::Limited(permit) = self {
+            permit.outcome = AdmissionPermitOutcome::Failed;
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(super) struct LimitedActivationPermit {
     _permit: OwnedSemaphorePermit,
     in_flight: Arc<AtomicUsize>,
     in_flight_by_kind: Arc<ActivationInFlight>,
-    kind: ActivationAdmissionKind,
+    kind: LimitedActivationKind,
     started_at: Instant,
     outcome: AdmissionPermitOutcome,
 }
 
-impl ActivationAdmissionPermit {
-    pub(super) fn finish(mut self, outcome: AdmissionPermitOutcome) {
+impl LimitedActivationPermit {
+    fn finish(mut self, outcome: AdmissionPermitOutcome) {
         self.outcome = outcome;
     }
 }
 
-impl Drop for ActivationAdmissionPermit {
+impl Drop for LimitedActivationPermit {
     fn drop(&mut self) {
         let in_flight = self
             .in_flight
