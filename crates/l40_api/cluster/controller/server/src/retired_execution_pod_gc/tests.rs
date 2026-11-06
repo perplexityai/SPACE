@@ -302,6 +302,7 @@ impl PodBackend for Arc<FakePods> {
 struct FakeStore {
     rows: Mutex<HashMap<String, ExecutionRow>>,
     fail: Mutex<bool>,
+    hang: Mutex<bool>,
 }
 
 impl ExecutionStore for Arc<FakeStore> {
@@ -311,6 +312,9 @@ impl ExecutionStore for Arc<FakeStore> {
     ) -> Result<HashMap<String, ExecutionRow>, sqlx::Error> {
         if *self.fail.lock().expect("fail") {
             return Err(sqlx::Error::PoolClosed);
+        }
+        if *self.hang.lock().expect("hang") {
+            std::future::pending::<()>().await;
         }
         let rows = self.rows.lock().expect("rows");
         Ok(pod_names
@@ -478,7 +482,7 @@ async fn verify_get_that_finds_a_different_pod_does_not_delete() {
     assert!(h.deletes().is_empty());
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_pod_that_stops_classifying_restarts_its_clock() {
     let mut h = Harness::new(false, 60);
     let sid = SandboxId::new();
@@ -497,6 +501,18 @@ async fn a_pod_that_stops_classifying_restarts_its_clock() {
     assert_eq!(
         after.too_young, 1,
         "the clock restarted after the failed scan"
+    );
+
+    // So does a lookup that outlives the tick budget.
+    *h.store.hang.lock().expect("hang") = true;
+    h.advance(PAST_THRESHOLD);
+    assert!(h.reconciler.tick().await.lookup_failed);
+    *h.store.hang.lock().expect("hang") = false;
+    h.advance(PAST_THRESHOLD);
+    assert_eq!(
+        h.reconciler.tick().await.too_young,
+        1,
+        "the clock restarted after the slow scan"
     );
 
     // So does a tick on which the pod stops classifying as reapable.
