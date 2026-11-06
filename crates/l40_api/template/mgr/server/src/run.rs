@@ -61,8 +61,8 @@ pub enum RunTemplateMgrError {
     RootfsBacking(#[source] crate::RootfsBackingConfigError),
     #[error("template cache cannot honor the rootfs backing policy: {0}")]
     RootfsBackingFilesystem(#[source] std::io::Error),
-    #[error("failed to bind the template-manager health socket: {0}")]
-    HealthSocket(#[source] pplx_space_unix_socket_bind::BindUnixSocketError),
+    #[error("failed to start the template-manager health server: {0}")]
+    HealthSocket(#[source] pplx_space_local_health::LocalHealthServerError),
     #[error("failed to acquire the template-manager service mutex: {0}")]
     ServiceMutex(#[source] pplx_space_service_mutex::AcquireError),
     #[error("failed to migrate the template-manager SQLite database: {0}")]

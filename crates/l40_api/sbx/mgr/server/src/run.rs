@@ -561,8 +561,8 @@ pub enum RunSbxMgrError {
     Config(#[source] crate::config::ConfigLoadError),
     #[error("invalid or missing SPACE API route verification configuration: {0}")]
     RouteVerificationBundle(#[source] pplx_space_api_route::ed25519::SpaceApiRouteEd25519Error),
-    #[error("failed to bind the sandbox-manager health socket: {0}")]
-    HealthSocket(#[source] pplx_space_unix_socket_bind::BindUnixSocketError),
+    #[error("failed to start the sandbox-manager health server: {0}")]
+    HealthSocket(#[source] pplx_space_local_health::LocalHealthServerError),
     #[error("failed to acquire the sandbox-manager service mutex: {0}")]
     ServiceMutex(#[source] pplx_space_service_mutex::AcquireError),
     #[error("failed to migrate the sandbox-manager database: {0}")]

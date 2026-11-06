@@ -282,8 +282,8 @@ pub enum RunVolmgrError {
         #[source]
         source: std::io::Error,
     },
-    #[error("bind local health socket")]
-    BindHealthSocket(#[source] BindUnixSocketError),
+    #[error("start local health server")]
+    BindHealthSocket(#[source] pplx_space_local_health::LocalHealthServerError),
     #[error("acquire service mutex {}", SERVICE_MUTEX_PATH)]
     AcquireServiceMutex(#[from] ServiceMutexAcquireError),
     #[error("create parent directory {path}")]
