@@ -433,3 +433,29 @@ fn intent_less_reads_tell_a_failed_cleanup_from_its_lifecycle() {
         );
     }
 }
+
+#[test]
+fn a_cleanup_row_decodes_its_status_and_the_lifecycle_under_it() {
+    let conn = test_conn();
+    for (completion, lifecycle) in [
+        (CleanupCompletion::DeleteRow, SandboxState::Deleting),
+        (CleanupCompletion::MarkStopped, SandboxState::Stopping),
+    ] {
+        let id = state_write_fixtures::insert_row(&conn, SandboxState::Stopping);
+        mark_cleanup_required(&conn, &id, !completion.deletes_row(), completion, "handoff")
+            .unwrap();
+        let row = get_sandbox(&conn, &id).unwrap().unwrap();
+        assert_eq!(
+            (row.state, row.lifecycle),
+            (SandboxState::CleanupRequired, lifecycle),
+            "{completion}"
+        );
+    }
+
+    let id = state_write_fixtures::insert_row(&conn, SandboxState::Started);
+    let row = get_sandbox(&conn, &id).unwrap().unwrap();
+    assert_eq!(
+        (row.state, row.lifecycle),
+        (SandboxState::Started, SandboxState::Started)
+    );
+}

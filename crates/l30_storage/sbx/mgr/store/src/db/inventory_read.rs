@@ -94,7 +94,7 @@ impl UnaryListUsage {
     }
 }
 
-const LIST_COLUMNS: &str = "id, legacy_state, template, template_hash, user, runtime, created_at, pool_template, \
+const LIST_COLUMNS: &str = "id, state, legacy_state, template, template_hash, user, runtime, created_at, pool_template, \
      cleanup_completion";
 
 db_private_outside_tests! {
@@ -123,7 +123,10 @@ pub enum ListPageRow {
     Decoded(super::SandboxListRow),
     Undecodable {
         id: String,
+        /// The combined status label, when it reads as text.
         state: Option<String>,
+        /// The stored lifecycle label, without the cleanup `state` folds in.
+        lifecycle: Option<String>,
         error: Error,
     },
 }
@@ -229,6 +232,7 @@ db_private_outside_tests! {
                 Err(error) => ListPageRow::Undecodable {
                     id: row.get("id")?,
                     state: row.get::<_, String>("legacy_state").ok(),
+                    lifecycle: row.get::<_, String>("state").ok(),
                     error: error.into(),
                 },
             });

@@ -735,14 +735,20 @@ impl SandboxManagerService {
                 let db = self.db_conn()?;
                 crate::db::read::sandbox(&db, &id)
                     .map_err(|e| Status::internal(format!("db error: {e}")))?
-                    .map(|row| (row.state, row.cleanup_completion))
+                    .map(|row| (row.state, row.lifecycle, row.cleanup_completion))
             };
 
-            if let Some((state, completion)) = state {
+            if let Some((state, lifecycle, completion)) = state {
                 if state.completes_wait() {
                     return Ok(Response::new(WaitResponse {
                         sandbox_id: id,
-                        lifecycle: Some(crate::proto::SandboxLifecycleState::from(state) as i32),
+                        lifecycle: Some(crate::proto::SandboxLifecycleState::from(
+                            super::grpc_state_snapshot::published_lifecycle(
+                                self.config.publish_native_lifecycle,
+                                state,
+                                lifecycle,
+                            ),
+                        ) as i32),
                         cleanup: super::grpc_state_snapshot::cleanup_observation(
                             super::grpc_state_snapshot::cleanup_owner(state),
                             completion,
@@ -754,10 +760,24 @@ impl SandboxManagerService {
                 if let Some(timeout) = timeout
                     && start.elapsed() >= timeout
                 {
+                    // Name the status as the response would have published it.
+                    let published = super::grpc_state_snapshot::published_lifecycle(
+                        self.config.publish_native_lifecycle,
+                        state,
+                        lifecycle,
+                    );
+                    let current = if published == state {
+                        state.as_str().to_owned()
+                    } else {
+                        format!(
+                            "{}, cleanup {}",
+                            published.as_str(),
+                            state.event_cleanup_state()
+                        )
+                    };
                     return Err(Status::deadline_exceeded(format!(
-                        "sandbox {id} did not reach terminal state within {}s (current: {})",
+                        "sandbox {id} did not reach terminal state within {}s (current: {current})",
                         timeout.as_secs(),
-                        state.as_str()
                     )));
                 }
             } else {

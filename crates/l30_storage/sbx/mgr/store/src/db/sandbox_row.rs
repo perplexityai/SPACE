@@ -26,7 +26,11 @@ pub struct SandboxRow {
     pub node_execution_id: Option<SandboxActivationAttemptId>,
     pub id: String,
     pub uuid8: SandboxRuntimeLabel,
+    /// The combined status: the lifecycle, or `CleanupRequired` /
+    /// `CleanupFailed` while a cleanup owns the row.
     pub state: SandboxState,
+    /// The stored lifecycle, without the cleanup `state` folds in.
+    pub lifecycle: SandboxState,
     pub restore_operation: Option<RestoreOperation>,
     pub failure_reason: Option<String>,
     pub template: String,
@@ -92,6 +96,8 @@ impl SandboxRow {
 pub struct SandboxListRow {
     pub id: String,
     pub state: SandboxState,
+    /// The stored lifecycle, without the cleanup `state` folds in.
+    pub lifecycle: SandboxState,
     pub template: String,
     pub template_hash: Option<String>,
     pub user: SandboxOwner,
@@ -105,6 +111,7 @@ pub(super) fn row_to_list_sandbox(row: &rusqlite::Row) -> rusqlite::Result<Sandb
     Ok(SandboxListRow {
         id: row.get("id")?,
         state: state_column(row)?,
+        lifecycle: lifecycle_column(row)?,
         template: row.get("template")?,
         template_hash: row
             .get::<_, Option<String>>("template_hash")?
@@ -137,6 +144,22 @@ fn state_column(row: &rusqlite::Row<'_>) -> rusqlite::Result<SandboxState> {
     })
 }
 
+/// The row's stored lifecycle, which a row select reads as `state`.
+fn lifecycle_column(row: &rusqlite::Row<'_>) -> rusqlite::Result<SandboxState> {
+    let state_str: String = row.get("state")?;
+    state_str.parse::<SandboxState>().map_err(|_| {
+        column_error(
+            row,
+            "state",
+            Type::Text,
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("unknown sandbox lifecycle {state_str:?}"),
+            )),
+        )
+    })
+}
+
 fn user_column(row: &rusqlite::Row<'_>) -> rusqlite::Result<SandboxOwner> {
     SandboxOwner::parse(row.get::<_, String>("user")?)
         .map_err(|error| column_error(row, "user", Type::Text, Box::new(error)))
@@ -162,6 +185,7 @@ pub(super) fn row_to_sandbox(row: &rusqlite::Row) -> rusqlite::Result<SandboxRow
     let uuid8 = SandboxRuntimeLabel::parse(row.get::<_, String>("uuid8")?)
         .map_err(|error| column_error(row, "uuid8", Type::Text, Box::new(error)))?;
     let state = state_column(row)?;
+    let lifecycle = lifecycle_column(row)?;
     let user = user_column(row)?;
     let process_env_json: String = row.get("process_env_json")?;
     let process_env = serde_json::from_str(&process_env_json)
@@ -325,6 +349,7 @@ pub(super) fn row_to_sandbox(row: &rusqlite::Row) -> rusqlite::Result<SandboxRow
         id,
         uuid8,
         state,
+        lifecycle,
         restore_operation,
         failure_reason: row.get("failure_reason")?,
         template: row.get("template")?,

@@ -6,7 +6,10 @@ use super::*;
 /// a newer lifecycle label cannot be decoded by this binary.
 #[derive(Debug)]
 pub struct RawSandboxLifecycle {
+    /// The combined status label.
     pub state: String,
+    /// The stored lifecycle label, without the cleanup `state` folds in.
+    pub lifecycle: String,
     pub state_changed_at: String,
     /// The recorded cleanup completion, absent when none is recorded or its
     /// label can't be decoded. A consumer that must not mistake a failed stop
@@ -18,11 +21,13 @@ pub struct RawSandboxLifecycle {
 db_private_outside_tests! {
     fn raw_sandbox_lifecycle(conn: &Connection, id: &str) -> Result<Option<RawSandboxLifecycle>> {
         conn.query_row(
-            "SELECT legacy_state, state_changed_at, cleanup_completion FROM sandboxes WHERE id = ?1",
+            "SELECT legacy_state, state_changed_at, cleanup_completion, state
+             FROM sandboxes WHERE id = ?1",
             [id],
             |row| {
                 Ok(RawSandboxLifecycle {
                     state: row.get(0)?,
+                    lifecycle: row.get(3)?,
                     state_changed_at: timestamps::diagnostic_column(row, 1)?,
                     cleanup_completion: row
                         .get::<_, Option<String>>(2)
@@ -1319,7 +1324,7 @@ db_private_outside_tests! {
 }
 
 pub(super) const GET_SANDBOX_SQL: &str =
-        "SELECT id, uuid8, legacy_state, template, template_hash, user, runtime, uid, slot, guest_cid, pid,
+        "SELECT id, uuid8, state, legacy_state, template, template_hash, user, runtime, uid, slot, guest_cid, pid,
          spaced_host_pid, netgtw_pid, vsock_uds_path, api_socket_path, created_at, updated_at, snapshots_enabled, rootfs_size_mb, pool_template, guest_uptime_secs, process_env_json, auto_lifecycle_json, auto_lifecycle_state_json, next_auto_event_at, failure_reason, cleanup_completion, cleanup_keep_filesystem, network_policy_override_json, network_tx_bytes, network_rx_bytes, network_policy_generation, applied_network_policy_generation, applied_network_policy_source, network_policy_authority, auto_lifecycle_authority, current_local_artifact_id, current_local_artifact_kind, current_local_artifact_origin, execution_metadata_json, volume_encryption, space_api_route_generation, space_api_route_node_id, space_api_route_execution_generation, space_api_route_pod_uid, restore_origin, restore_phase, restore_storage_uri, space_api_route_substrate_kind, space_api_route_activation_attempt_id, spaced_endpoint_proof_json, disk_io_max_operations_per_sec, disk_io_max_bandwidth_mib_per_sec, node_execution_id, guest_image_contract_json
          FROM sandboxes WHERE id = ?1";
 
@@ -1355,7 +1360,7 @@ db_private_outside_tests! {
 }
 
 const LIST_SANDBOXES_SQL: &str =
-    "SELECT id, uuid8, legacy_state, template, template_hash, user, runtime, uid, slot, guest_cid, pid,
+    "SELECT id, uuid8, state, legacy_state, template, template_hash, user, runtime, uid, slot, guest_cid, pid,
          spaced_host_pid, netgtw_pid, vsock_uds_path, api_socket_path, created_at, updated_at, snapshots_enabled, rootfs_size_mb, pool_template, guest_uptime_secs, process_env_json, auto_lifecycle_json, auto_lifecycle_state_json, next_auto_event_at, failure_reason, cleanup_completion, cleanup_keep_filesystem, network_policy_override_json, network_tx_bytes, network_rx_bytes, network_policy_generation, applied_network_policy_generation, applied_network_policy_source, network_policy_authority, auto_lifecycle_authority, current_local_artifact_id, current_local_artifact_kind, current_local_artifact_origin, execution_metadata_json, volume_encryption, space_api_route_generation, space_api_route_node_id, space_api_route_execution_generation, space_api_route_pod_uid, restore_origin, restore_phase, restore_storage_uri, space_api_route_substrate_kind, space_api_route_activation_attempt_id, spaced_endpoint_proof_json, disk_io_max_operations_per_sec, disk_io_max_bandwidth_mib_per_sec, node_execution_id, guest_image_contract_json
          FROM sandboxes ORDER BY created_at";
 
@@ -1518,7 +1523,7 @@ db_private_outside_tests! {
         uid: u32,
     ) -> Result<Vec<SandboxRow>> {
         let mut stmt = conn.prepare(
-            "SELECT id, uuid8, legacy_state, template, template_hash, user, runtime, uid, slot, guest_cid, pid,
+            "SELECT id, uuid8, state, legacy_state, template, template_hash, user, runtime, uid, slot, guest_cid, pid,
          spaced_host_pid, netgtw_pid, vsock_uds_path, api_socket_path, created_at, updated_at, snapshots_enabled, rootfs_size_mb, pool_template, guest_uptime_secs, process_env_json, auto_lifecycle_json, auto_lifecycle_state_json, next_auto_event_at, failure_reason, cleanup_completion, cleanup_keep_filesystem, network_policy_override_json, network_tx_bytes, network_rx_bytes, network_policy_generation, applied_network_policy_generation, applied_network_policy_source, network_policy_authority, auto_lifecycle_authority, current_local_artifact_id, current_local_artifact_kind, current_local_artifact_origin, execution_metadata_json, volume_encryption, space_api_route_generation, space_api_route_node_id, space_api_route_execution_generation, space_api_route_pod_uid, restore_origin, restore_phase, restore_storage_uri, space_api_route_substrate_kind, space_api_route_activation_attempt_id, spaced_endpoint_proof_json, disk_io_max_operations_per_sec, disk_io_max_bandwidth_mib_per_sec, node_execution_id, guest_image_contract_json
          FROM sandboxes
          WHERE netgtw_pid = ?1 AND uid = ?2

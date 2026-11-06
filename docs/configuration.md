@@ -136,6 +136,21 @@ because disabling it by mistake would leave every create queued forever.
 | `SPACE_SUSPEND_DEFAULT_FORMAT` | `btrfs-send` | Set `full` to roll the suspend codec default back. |
 | `SPACE_CLUSTER_CONTROLLER_LEADER_ELECTION_ENABLED` | on | Kill switch. On, the cluster controller contends for its leader Lease when it runs in a Kubernetes pod (`KUBERNETES_SERVICE_HOST` and `KUBERNETES_SERVICE_PORT` both set) or uses the Kubernetes substrate, and otherwise runs the reconcilers without a lease. Off runs them without a lease everywhere. Running without a lease is only safe with one replica. |
 
+A node-local cleanup that owns a sandbox is not a lifecycle state. Sandbox
+manager publishes it as `cleanup.state` (`REQUIRED` or `FAILED`) on `State`,
+`List` and `ListBuildReferencingSandboxes`, and by default also folds it into
+the lifecycle as `CLEANUP_REQUIRED` or `CLEANUP_FAILED`. `Wait` answers only
+once the wait completes, which a cleanup does only when it has failed, so it
+reports `FAILED` and never `REQUIRED`. `publish_native_lifecycle = true` in
+the node's `/space/etc/sandbox.toml` publishes the lifecycle the cleanup is
+over instead (`STOPPING`, `DELETING` or `SUSPENDING`) on all four RPCs.
+`SPACE_SBXMGR_PUBLISH_NATIVE_LIFECYCLE`, set to a flag value, overrides the
+file; the sandbox-manager chart sets it to `true` when
+`nativeLifecyclePublication.enabled` is on. Sandbox manager reads both at
+startup, so a change takes effect when it restarts on that node. Turn it on
+only once every reader of those RPCs decides from `cleanup.state`; turning it
+off again, and restarting, restores the folded lifecycle.
+
 ## API, admission and limits
 
 | Variable | Default | Notes |
