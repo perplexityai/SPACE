@@ -44,7 +44,7 @@ pub struct ControllerError {
     guest_path_not_found: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum ControllerErrorKind {
     General,
     SandboxAlreadyExists,
@@ -70,6 +70,19 @@ enum ControllerErrorKind {
     /// so request metrics can count the refusal without reading the retry
     /// cause, which only the rate-limited case sets.
     ClusterAdmissionRejection,
+    /// Work refused because the sandbox is at rest and its wake policy does
+    /// not let this request wake it. Carried so the Native translators can
+    /// answer with the details `createCommand` gives the same refusal. Boxed
+    /// to keep `ControllerError` small: it rides in other errors' variants.
+    SandboxNotRunning(Box<SandboxNotRunning>),
+}
+
+/// The sandbox a [`ControllerError::sandbox_not_running`] refusal is about,
+/// in the lifecycle state it was refused in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SandboxNotRunning {
+    pub(crate) sandbox_id: pplx_space_common_core::types::SandboxId,
+    pub(crate) lifecycle: pplx_space_common_core::types::SandboxLifecycle,
 }
 
 /// Why a template the caller may use resolved to no release.
@@ -363,6 +376,27 @@ impl ControllerError {
 
     pub(crate) const fn is_sandbox_already_exists(&self) -> bool {
         matches!(self.kind, ControllerErrorKind::SandboxAlreadyExists)
+    }
+
+    /// A 409 for access the sandbox cannot serve until the caller wakes or
+    /// starts it: it is at rest and its wake policy does not let the request
+    /// wake it.
+    pub(crate) fn sandbox_not_running(
+        refusal: SandboxNotRunning,
+        message: impl Into<String>,
+    ) -> Self {
+        let mut error = Self::conflict(message);
+        error.kind = ControllerErrorKind::SandboxNotRunning(Box::new(refusal));
+        error
+    }
+
+    /// The sandbox this error refused access to because it is not running,
+    /// if that is what it is.
+    pub(crate) fn sandbox_not_running_refusal(&self) -> Option<SandboxNotRunning> {
+        match &self.kind {
+            ControllerErrorKind::SandboxNotRunning(refusal) => Some(**refusal),
+            _ => None,
+        }
     }
 
     pub(crate) fn snapshot_upload_in_flight(

@@ -1157,3 +1157,67 @@ async fn delete_without_any_node_placement_stays_unavailable() -> TestResult {
     );
     Ok(())
 }
+
+/// An implicit access wake the sandbox's own policy does not allow is refused
+/// before it reaches the node, naming the sandbox and the state it rests in,
+/// which the Native routes answer with `createCommand`'s refusal details.
+#[tokio::test(flavor = "current_thread")]
+async fn an_access_wake_the_sandbox_policy_refuses_names_the_sandbox_at_rest() -> TestResult {
+    if !crate::test_support::enter_sim_worker_process() {
+        return Ok(());
+    }
+    let Some(fixture) = postgres_fixture().await? else {
+        return Ok(());
+    };
+    let sandbox_id = SandboxId::new();
+    let node_id = NodeId::new();
+    let (server, state) = start_sim_worker(node_id).await?;
+    seed_idle_suspended(
+        &fixture.pool,
+        &state,
+        sandbox_id,
+        node_id,
+        server.endpoint(),
+    )
+    .await?;
+    sqlx::query(sql!(
+        "UPDATE sandboxes SET auto_lifecycle_json = $2 WHERE id = $1"
+    ))
+    .bind(sandbox_id)
+    .bind(sqlx::types::Json(crate::e2b::auto_lifecycle_policy(
+        60, true, false,
+    )))
+    .execute(&fixture.pool)
+    .await?;
+    let sandbox = crate::controllers::sandbox::fetch_sandbox(&fixture.pool, sandbox_id)
+        .await?
+        .expect("sandbox row");
+
+    let error = match Box::pin(fixture.substrate.access_runtime_client(
+        pplx_space_metrics::sandbox::api::SandboxApiMetricIdentity::native("files_read"),
+        &sandbox,
+        ExecutionActivityKind::Access,
+        Duration::from_secs(5),
+        crate::controllers::substrate::RecoveryCharge::Exempt,
+    ))
+    .await
+    {
+        Ok(_) => panic!("a policy that does not wake on access must not restore"),
+        Err(error) => error,
+    };
+
+    assert_eq!(error.status(), axum::http::StatusCode::CONFLICT);
+    assert_eq!(
+        error.sandbox_not_running_refusal(),
+        Some(crate::controllers::SandboxNotRunning {
+            sandbox_id,
+            lifecycle: SandboxLifecycle::Suspended,
+        })
+    );
+    assert_eq!(
+        state.get(&sandbox_id.to_string()).await?.status,
+        "suspended"
+    );
+    drop(server);
+    Ok(())
+}

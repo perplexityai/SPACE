@@ -570,6 +570,16 @@ impl FileCallFailure for ControllerError {
     fn is_lock_contention(&self) -> bool {
         ControllerError::is_lock_contention(self)
     }
+
+    fn sandbox_not_running(
+        &self,
+    ) -> Option<(
+        pplx_space_common_core::types::SandboxId,
+        pplx_space_common_core::types::SandboxLifecycle,
+    )> {
+        self.sandbox_not_running_refusal()
+            .map(|refusal| (refusal.sandbox_id, refusal.lifecycle))
+    }
 }
 
 pub(crate) mod access;

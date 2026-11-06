@@ -264,6 +264,12 @@ pub(in crate::routes::public) fn controller_error(error: ControllerError) -> Pub
     if error.is_lock_contention() {
         return PublicApiError::lock_contention();
     }
+    if let Some(refusal) = error.sandbox_not_running_refusal() {
+        return PublicApiError::sandbox_not_running(
+            refusal.sandbox_id.into(),
+            &refusal.lifecycle.into(),
+        );
+    }
     let retry_after = error.retry_after_header();
     match error.status() {
         StatusCode::BAD_REQUEST => PublicApiError::bad_request(error.to_string()),

@@ -410,7 +410,7 @@ impl SandboxController {
                     SandboxEventSource::Api,
                 )
                 .emit_with(details);
-                Err(error.error)
+                Err(*error.error)
             }
         }
     }

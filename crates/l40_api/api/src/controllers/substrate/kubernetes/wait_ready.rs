@@ -156,10 +156,24 @@ impl KubernetesSubstrate {
         if is_dormant_lifecycle(&sandbox.lifecycle)
             && !activity.allows_implicit_wake(&sandbox.auto_lifecycle.0)
         {
-            return Err(ControllerError::new(
-                axum::http::StatusCode::CONFLICT,
-                "sandbox is not running",
-            ));
+            return Err(
+                match sandbox
+                    .lifecycle
+                    .parse::<pplx_space_common_core::types::SandboxLifecycle>()
+                {
+                    Ok(lifecycle) => ControllerError::sandbox_not_running(
+                        crate::controllers::SandboxNotRunning {
+                            sandbox_id: sandbox.id,
+                            lifecycle,
+                        },
+                        "sandbox is not running",
+                    ),
+                    Err(_) => ControllerError::new(
+                        axum::http::StatusCode::CONFLICT,
+                        "sandbox is not running",
+                    ),
+                },
+            );
         }
 
         if !is_wake_recovery_lifecycle(&sandbox.lifecycle) {

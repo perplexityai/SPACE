@@ -4885,12 +4885,15 @@ impl SubstrateAdapter for DirectSubstrate {
         timeout: Duration,
         _charge: crate::controllers::substrate::RecoveryCharge,
     ) -> Result<RuntimeClient, ControllerError> {
-        if matches!(
-            sandbox.lifecycle.parse::<SandboxLifecycle>(),
-            Ok(SandboxLifecycle::Suspended | SandboxLifecycle::Restoring)
-        ) {
+        if let Ok(lifecycle @ (SandboxLifecycle::Suspended | SandboxLifecycle::Restoring)) =
+            sandbox.lifecycle.parse::<SandboxLifecycle>()
+        {
             if !activity.allows_implicit_wake(&sandbox.auto_lifecycle.0) {
-                return Err(ControllerError::conflict(
+                return Err(ControllerError::sandbox_not_running(
+                    crate::controllers::SandboxNotRunning {
+                        sandbox_id: sandbox.id,
+                        lifecycle,
+                    },
                     "automatic access wake is disabled",
                 ));
             }
