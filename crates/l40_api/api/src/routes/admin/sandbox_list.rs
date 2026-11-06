@@ -14,6 +14,7 @@ use axum::{
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use pplx_space_common_core::types::{NodeId, OrgId, SandboxId, TemplateName, UserId};
+use pplx_space_sandbox_store::StoredSandboxLifecycle;
 use serde::de::{self, DeserializeOwned};
 use serde::{Deserialize, Deserializer, Serialize};
 use time::OffsetDateTime;
@@ -21,8 +22,8 @@ use time::OffsetDateTime;
 use super::support::{self, ContentionScope, api_error, require_managing_org_admin};
 use crate::controllers::sandbox::SandboxPageCursor;
 use crate::controllers::sandbox::list_page::admin::{
-    AdminSandboxFilter, AdminStoredLifecycle, NodeAssignment, PageBudget, SandboxPrefix,
-    SandboxSearch, SpacedVersionCount,
+    AdminSandboxFilter, NodeAssignment, PageBudget, SandboxPrefix, SandboxSearch,
+    SpacedVersionCount,
 };
 use crate::middleware::auth::AuthUser;
 use crate::models::{Sandbox, SandboxResponse};
@@ -254,10 +255,18 @@ where
     }
 }
 
-fn parse_lifecycles(value: &str) -> Result<Vec<AdminStoredLifecycle>, QueryError> {
+/// Values no writer stores any more that the filter still takes, for one
+/// release, so an older console or a saved link gets an empty page rather
+/// than a 400. They match no row. Remove them when the cleanup states retire.
+const RETIRED_LIFECYCLES: [&str; 1] = ["cleanup_required"];
+
+fn parse_lifecycles(value: &str) -> Result<Vec<StoredSandboxLifecycle>, QueryError> {
     let mut lifecycles = Vec::new();
     for part in value.split(',') {
-        let lifecycle = AdminStoredLifecycle::from_str(part)
+        if RETIRED_LIFECYCLES.contains(&part.trim().to_ascii_lowercase().as_str()) {
+            continue;
+        }
+        let lifecycle = StoredSandboxLifecycle::from_str(part)
             .map_err(|_| bad_request(format!("unknown lifecycle {part:?}")))?;
         if !lifecycles.contains(&lifecycle) {
             lifecycles.push(lifecycle);
