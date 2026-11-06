@@ -162,7 +162,7 @@ each step cordons and uncordons the worker through the API and stops unless
 the cordon shows up on that Node, which shows the context and the API are one
 cluster. A step refuses a worker that already carries a
 `space.pplx.net/drain-keep` annotation, whatever its value, and leaves it in
-place; an interrupted run's own annotation (`console-loop-<run id>`) has to be
+place; an interrupted run's own annotation (`console-loop-<run id>-<attempt>`) has to be
 removed by hand. Runs against one stack aren't meant to overlap, and because
 each run claims the annotation with its own run id through an annotate that
 fails when the key exists, two runs can't drain the same worker. A step stopped
