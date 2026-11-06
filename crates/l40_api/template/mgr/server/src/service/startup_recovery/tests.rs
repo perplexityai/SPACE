@@ -1034,11 +1034,14 @@ async fn the_gc_tick_enqueues_the_inventory_of_a_build_it_restores() {
         TemplateManagerService::new_with_template_root(crate::db::test_conn(), root.path())
             .unwrap();
     let dirty = || {
-        crate::db::list_node_dirty_refs(&service.db.lock().unwrap(), 100)
-            .unwrap()
-            .into_iter()
-            .map(|row| row.element_value)
-            .collect::<Vec<_>>()
+        pplx_space_template_mgr_store::node_dirty_refs::list_node_dirty_refs(
+            &service.db.lock().unwrap(),
+            100,
+        )
+        .unwrap()
+        .into_iter()
+        .map(|row| row.element_value)
+        .collect::<Vec<_>>()
     };
     assert!(!dirty().contains(&"seed".to_string()));
 
@@ -1334,9 +1337,12 @@ async fn the_gc_tick_skips_a_dir_removed_after_its_scan() {
     assert!(!service.verify_rowless_build_dir("seed", &hash, &dir).await);
 
     assert!(
-        crate::db::list_node_dirty_refs(&service.db.lock().unwrap(), 100)
-            .unwrap()
-            .is_empty()
+        pplx_space_template_mgr_store::node_dirty_refs::list_node_dirty_refs(
+            &service.db.lock().unwrap(),
+            100
+        )
+        .unwrap()
+        .is_empty()
     );
 }
 
