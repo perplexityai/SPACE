@@ -268,6 +268,8 @@ pub(crate) async fn create_native_sandbox_operation(
                 payload_json: CreateSandboxOperationPayload {
                     sandbox_id,
                     request: request.clone(),
+                    // Enable writes only after every executor accepts the new field.
+                    metric_client_id: None,
                     // Placement is operator-only (admin surface); the public API never pins.
                     node_pool: None,
                     federated_create: federated_create.clone(),

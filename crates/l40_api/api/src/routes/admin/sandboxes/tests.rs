@@ -810,6 +810,7 @@ async fn an_admin_create_reports_its_requester_apart_from_the_owner() -> TestRes
                 node_pool: None,
                 federated_create: None,
                 pool_claim: None,
+                metric_client_id: None,
                 requested_by_user_id: None,
             }
             .into_json(),

@@ -57,6 +57,7 @@ fn claimed_create_operation_for(
             node_pool: None,
             federated_create: None,
             pool_claim: None,
+            metric_client_id: None,
             requested_by_user_id: None,
         }
         .into_json(),
@@ -204,6 +205,7 @@ async fn native_create_executor_preserves_operator_policy_across_replacements(
             node_pool: None,
             federated_create: federated.then_some(context),
             pool_claim: None,
+            metric_client_id: None,
             requested_by_user_id: None,
         }
         .into_json();
@@ -495,6 +497,7 @@ async fn existing_row_create_persists_the_renewed_grant() -> TestResult {
                 crate::fork_operations::ForkFederatedCreateContext::from_request(&owner, &renewed),
             ),
             pool_claim: None,
+            metric_client_id: None,
             requested_by_user_id: None,
         }
         .into_json();
@@ -767,6 +770,7 @@ async fn seed_unpinned_create_operation(pool: &PgPool) -> ClaimedPublicOperation
             node_pool: None,
             federated_create: None,
             pool_claim: None,
+            metric_client_id: None,
             requested_by_user_id: None,
         }
         .into_json(),
@@ -861,6 +865,7 @@ fn create_operation_payload_is_wire_compatible_with_old_shape() {
         node_pool: None,
         federated_create: None,
         pool_claim: None,
+        metric_client_id: None,
         requested_by_user_id: None,
     };
     let value = serde_json::to_value(&unpinned).unwrap();
@@ -868,10 +873,35 @@ fn create_operation_payload_is_wire_compatible_with_old_shape() {
         value.get("node_pool").is_none(),
         "unpinned payload must omit node_pool: {value}"
     );
+    assert!(
+        value.get("metric_client_id").is_none(),
+        "unattributed payload must remain readable by old executors: {value}"
+    );
 
     // An old-shape payload (no key) deserializes via serde(default).
     let roundtrip: CreateSandboxOperationPayload = serde_json::from_value(value).unwrap();
     assert_eq!(roundtrip.node_pool, None);
+    assert_eq!(roundtrip.metric_client_id, None);
+
+    // Attributed, it round-trips, and an executor from before the field
+    // refuses it, so producers write it only once every executor reads it.
+    let attributed = CreateSandboxOperationPayload {
+        metric_client_id: Some("test-client".to_owned()),
+        ..unpinned
+    };
+    let attributed_value = serde_json::to_value(&attributed).unwrap();
+    assert_eq!(
+        attributed_value
+            .get("metric_client_id")
+            .and_then(|v| v.as_str()),
+        Some("test-client")
+    );
+    let roundtrip: CreateSandboxOperationPayload =
+        serde_json::from_value(attributed_value.clone()).unwrap();
+    assert_eq!(roundtrip.metric_client_id.as_deref(), Some("test-client"));
+    assert!(
+        serde_json::from_value::<PreRequesterCreateOperationPayload>(attributed_value).is_err()
+    );
 
     // A pin adds the key (rejected by an old deny_unknown_fields executor —
     // the consumer-first rollout precondition).
@@ -881,6 +911,7 @@ fn create_operation_payload_is_wire_compatible_with_old_shape() {
         node_pool: Some(NodePoolName::parse("isolated-test-pool").unwrap()),
         federated_create: None,
         pool_claim: None,
+        metric_client_id: None,
         requested_by_user_id: None,
     };
     let pinned_value = serde_json::to_value(&pinned).unwrap();
@@ -914,6 +945,7 @@ fn create_payload_without_a_requester_is_wire_compatible_with_old_shape() {
         node_pool: None,
         federated_create: None,
         pool_claim: None,
+        metric_client_id: None,
         requested_by_user_id,
     };
 
@@ -1273,6 +1305,7 @@ fn create_operation_payload_pool_claim_is_optional_on_the_wire() {
         node_pool: None,
         federated_create: None,
         pool_claim: None,
+        metric_client_id: None,
         requested_by_user_id: None,
     };
     let value = serde_json::to_value(&cold).unwrap();

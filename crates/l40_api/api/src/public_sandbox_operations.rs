@@ -10,7 +10,7 @@ use pplx_space_common_core::types::{
 use pplx_space_events::{
     SandboxEvent, SandboxEventDetails, SandboxEventSource, SandboxEventTrigger, SandboxEventType,
 };
-use pplx_space_metrics::sandbox::api::SandboxApiMetricIdentity;
+use pplx_space_metrics::sandbox::api::{SandboxApiMetricIdentity, scope_request_client_id};
 use pplx_space_public_api::{
     OperationKind, OperationState, PublicErrorCode, PublicOperationResult, PublicSandboxId,
     PublicSandboxOperationResult, RollbackSandboxRequest, SandboxLifecycleAction,
@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use tracing::Instrument;
 
+use crate::client_concurrency::persisted_client_id_tag;
 use crate::controllers::TemplateReleaseMiss;
 use crate::controllers::sandbox::FederatedSandboxCreateContext;
 use crate::controllers::sandbox::lifecycle::SandboxAction;
@@ -59,6 +60,10 @@ pub(crate) const SNAPSHOT_UPLOAD_WAIT_LIMIT: Duration = Duration::from_secs(10 *
 pub struct CreateSandboxOperationPayload {
     pub sandbox_id: PublicSandboxId,
     pub request: pplx_space_public_api::CreateSandboxRequest,
+    /// The admitting request's resolved client ID, so metrics from detached
+    /// execution keep its attribution. Older operations omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metric_client_id: Option<String>,
     /// Operator-only isolation node pool pin, carried from the admin create
     /// surface. Absent (`None`) on every public/E2B create.
     ///
@@ -460,6 +465,15 @@ impl CreateSandboxOperationExecutor {
         let payload: CreateSandboxOperationPayload =
             serde_json::from_value(operation.payload.clone())
                 .map_err(CreateSandboxExecutionError::InvalidPayload)?;
+        let client_id = persisted_client_id_tag(payload.metric_client_id.as_deref());
+        scope_request_client_id(client_id, self.execute_create(operation, payload)).await
+    }
+
+    async fn execute_create(
+        &self,
+        operation: &ClaimedPublicOperation,
+        payload: CreateSandboxOperationPayload,
+    ) -> Result<PublicOperationExecutionResult, CreateSandboxExecutionError> {
         let target_id = operation
             .target_id
             .as_deref()
