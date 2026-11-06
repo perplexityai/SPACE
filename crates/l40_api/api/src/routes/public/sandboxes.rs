@@ -18,6 +18,7 @@ use pplx_space_common_core::types::{
     AutoLifecyclePolicy, IdempotencyKey, SandboxLifecycle, SubstrateKind,
 };
 use pplx_space_metrics::operations::InlineAdmissionPath;
+use pplx_space_metrics::sandbox::api::{ClientIdTag, request_client_id};
 use pplx_space_metrics::warm_pool::AdmissionClaimOutcome;
 use pplx_space_public_api::{
     ConditionStatus, CreateSandboxRequest, OperationId, OperationKind, OperationState,
@@ -249,6 +250,11 @@ pub(crate) async fn create_native_sandbox_operation(
         }
     };
 
+    let metric_client_id =
+        crate::public_sandbox_operations::native_create_client_attribution_enabled()
+            .then(request_client_id)
+            .filter(|client_id| *client_id != ClientIdTag::UNKNOWN)
+            .map(|client_id| client_id.as_str().to_owned());
     let store = PublicOperationStore::new(pool.clone());
     let idempotency = CreatePublicOperationIdempotency {
         method: HttpOperationMethod::Post,
@@ -269,8 +275,7 @@ pub(crate) async fn create_native_sandbox_operation(
                 payload_json: CreateSandboxOperationPayload {
                     sandbox_id,
                     request: request.clone(),
-                    // Enable writes only after every executor accepts the new field.
-                    metric_client_id: None,
+                    metric_client_id: metric_client_id.clone(),
                     // Placement is operator-only (admin surface); the public API never pins.
                     node_pool: None,
                     federated_create: federated_create.clone(),
