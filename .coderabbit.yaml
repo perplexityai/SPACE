@@ -80,6 +80,10 @@ reviews:
           - "**/hooks.json"
           - ".agents/plugins/**/hooks/**"
           - ".agents/plugins/**/scripts/**"
+          - ".agents/plugins/**/commands/**"
+          - ".agents/plugins/**/agents/**"
+          - ".claude/commands/**"
+          - ".claude/agents/**"
           - "**/marketplace.json"
           # CI workflows, CI scripts, images and selection, and repository
           # guards.
@@ -460,16 +464,24 @@ reviews:
       - name: Agent tooling runs no new commands
         mode: error
         instructions: |
-          Agent plugin manifests and skills are approved without a person, so
-          this check holds back anything in them that makes agent tools start
-          a process or connect to a server on a developer's machine. Fail if
-          the diff adds or changes hooks, MCP servers, LSP servers, or any
-          other entry that runs a command or starts a server, whether inline
-          in a plugin manifest (plugin.json, plugin.yaml) or in a file one
-          refers to. Also fail if a SKILL.md frontmatter block gains or changes
-          any key other than `name` and `description`, such as `hooks` or
-          `allowed-tools`. Edits to a manifest's name, description, version, or
-          skill list, and to a skill's text below its frontmatter, pass. Pass
+          Agent plugin manifests, skills, and guideline files are approved
+          without a person, so this check holds back anything in them that
+          agent tools run rather than read, or that makes them start a process
+          or connect to a server on a developer's machine. Fail if the diff
+          adds or changes:
+          - hooks, MCP servers, LSP servers, or any other entry that runs a
+            command or starts a server, inline in a plugin manifest
+            (plugin.json, plugin.yaml) or in a file one refers to;
+          - a SKILL.md frontmatter key other than `name` and `description`,
+            such as `hooks` or `allowed-tools`;
+          - an inline shell substitution in a skill or command file: `!` at
+            the start of a word followed by a backtick-quoted command, such as
+            !`git status`, which Claude Code runs when the file loads. A Rust
+            macro in a code span, such as `sql!`, and a fenced code block are
+            not substitutions;
+          - any other content that agent tools run rather than read.
+          Edits to a manifest's name, description, version, or skill list, and
+          prose and fenced code in skills and guideline files, pass. Pass
           otherwise. When failing, list each item with its file and line.
 
       - name: Public-safe content
