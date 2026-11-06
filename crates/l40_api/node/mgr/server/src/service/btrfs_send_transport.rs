@@ -42,8 +42,8 @@ type Body = Pin<Box<dyn tokio_stream::Stream<Item = Result<BtrfsSendChunk, Statu
 /// retries the whole transfer with a fresh send.
 #[cfg(target_os = "linux")]
 fn framing_status(error: framing::FramingError) -> Status {
+    use crate::metrics::node_manager::BtrfsSendStreamRejection as Rejection;
     use framing::FramingError;
-    use pplx_space_metrics::node_manager::BtrfsSendStreamRejection as Rejection;
     let reason = match error {
         FramingError::BadMagic => Rejection::BadMagic,
         FramingError::Version(_) => Rejection::Version,
@@ -53,7 +53,7 @@ fn framing_status(error: framing::FramingError) -> Status {
         FramingError::DataAfterEnd { .. } => Rejection::DataAfterEnd,
         FramingError::Truncated { .. } => Rejection::Truncated,
     };
-    pplx_space_metrics::node_manager::btrfs_send_stream_rejected(reason);
+    crate::metrics::node_manager::btrfs_send_stream_rejected(reason);
     tracing::warn!(%error, "rejected btrfs send stream before forwarding it");
     Status::aborted(format!("btrfs send stream rejected: {error}"))
 }

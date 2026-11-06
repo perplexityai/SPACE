@@ -67,7 +67,7 @@ struct CopyAdmissionPermit {
 impl Drop for CopyAdmissionPermit {
     fn drop(&mut self) {
         let active = self.active.fetch_sub(1, Ordering::AcqRel) - 1;
-        pplx_space_metrics::snapshot::fork_copy_queue_depth("active", active);
+        crate::metrics::snapshot::fork_copy_queue_depth("active", active);
     }
 }
 
@@ -78,7 +78,7 @@ struct CopyAdmissionWaiter {
 impl Drop for CopyAdmissionWaiter {
     fn drop(&mut self) {
         let waiting = self.waiting.fetch_sub(1, Ordering::AcqRel) - 1;
-        pplx_space_metrics::snapshot::fork_copy_queue_depth("waiting", waiting);
+        crate::metrics::snapshot::fork_copy_queue_depth("waiting", waiting);
     }
 }
 
@@ -491,7 +491,7 @@ async fn acquire_copy_permit(
         pplx_space_common_grpc::SlotRequest::Admitted(permit) => permit,
         pplx_space_common_grpc::SlotRequest::Queued(queued) => {
             let waiting = waiting_count.fetch_add(1, Ordering::AcqRel) + 1;
-            pplx_space_metrics::snapshot::fork_copy_queue_depth("waiting", waiting);
+            crate::metrics::snapshot::fork_copy_queue_depth("waiting", waiting);
             let _waiter = CopyAdmissionWaiter {
                 waiting: waiting_count,
             };
@@ -499,9 +499,9 @@ async fn acquire_copy_permit(
         }
         pplx_space_common_grpc::SlotRequest::Rejected => return Err(busy()),
     };
-    pplx_space_metrics::snapshot::fork_copy_queue_wait(started_at);
+    crate::metrics::snapshot::fork_copy_queue_wait(started_at);
     let active = active_count.fetch_add(1, Ordering::AcqRel) + 1;
-    pplx_space_metrics::snapshot::fork_copy_queue_depth("active", active);
+    crate::metrics::snapshot::fork_copy_queue_depth("active", active);
     Ok(CopyAdmissionPermit {
         _permit: permit,
         active: active_count,
@@ -705,15 +705,15 @@ async fn bounded_transfer<T>(
     let started_at = Instant::now();
     match tokio::time::timeout(deadline, future).await {
         Ok(Ok(value)) => {
-            pplx_space_metrics::snapshot::fork_copy_transfer(operation, "success", started_at);
+            crate::metrics::snapshot::fork_copy_transfer(operation, "success", started_at);
             Ok(value)
         }
         Ok(Err(error)) => {
-            pplx_space_metrics::snapshot::fork_copy_transfer(operation, "error", started_at);
+            crate::metrics::snapshot::fork_copy_transfer(operation, "error", started_at);
             Err(error)
         }
         Err(_) => {
-            pplx_space_metrics::snapshot::fork_copy_transfer(operation, "timeout", started_at);
+            crate::metrics::snapshot::fork_copy_transfer(operation, "timeout", started_at);
             Err(Status::deadline_exceeded(format!(
                 "fork copy {operation} exceeded {} seconds",
                 deadline.as_secs()

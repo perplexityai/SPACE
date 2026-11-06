@@ -454,11 +454,7 @@ impl VolumePuller {
         };
         let outcome = pull_inner(self, db, spec, &base_tags, &mut path_taken, scope).await;
 
-        pplx_space_metrics::template::pull_duration(
-            &base_tags,
-            outcome_label(&outcome, path_taken),
-            started,
-        );
+        crate::metrics::pull_duration(&base_tags, outcome_label(&outcome, path_taken), started);
 
         outcome
     }
@@ -494,11 +490,7 @@ impl VolumePuller {
             .await;
         let outcome = result.outcome.into_outcome();
 
-        pplx_space_metrics::template::pull_duration(
-            &tags,
-            outcome_label(&outcome, result.path),
-            started,
-        );
+        crate::metrics::pull_duration(&tags, outcome_label(&outcome, result.path), started);
 
         outcome
     }
@@ -563,7 +555,7 @@ impl VolumePuller {
             match flight.wait_for_result().await {
                 Some(mut result) => {
                     if !started && result.mark_coalesced_if_materialized() {
-                        pplx_space_metrics::template::pull_coalesced(base_tags);
+                        crate::metrics::pull_coalesced(base_tags);
                     }
                     return result;
                 }
@@ -976,7 +968,7 @@ fn pull_metric_tags(
     req_tag: &str,
     trigger: PullTrigger,
 ) -> Vec<String> {
-    pplx_space_metrics::template::request_tags(name, req_hash, req_tag, trigger.as_tag())
+    crate::metrics::request_tags(name, req_hash, req_tag, trigger.as_tag())
 }
 
 fn outcome_label(outcome: &PullOutcome, path: PullPath) -> &'static str {
@@ -994,7 +986,7 @@ fn outcome_label(outcome: &PullOutcome, path: PullPath) -> &'static str {
 }
 
 fn record_phase(base_tags: &[String], phase: &'static str, result: &'static str, started: Instant) {
-    pplx_space_metrics::template::pull_s3_phase(base_tags, phase, result, started);
+    crate::metrics::pull_s3_phase(base_tags, phase, result, started);
 }
 
 /// Why a pull refuses a build dir that's on disk without a catalog row.
@@ -1121,7 +1113,7 @@ async fn find_release(
             | FindReleaseError::Status(_),
         ) => "error",
     };
-    pplx_space_metrics::template::pull_find_release(base_tags, result_label, started);
+    crate::metrics::pull_find_release(base_tags, result_label, started);
     // Propagate the ResolvedRelease (hash + storage URIs + template
     // visibility) as-is; pull_inner reads `.visibility` for the prefetch
     // final-resolve gate and destructures the rest. FindReleaseError is
@@ -1703,8 +1695,8 @@ async fn try_pull_from(
     // verifies or removes the dir.
     let (meta_bytes, man_bytes) = tokio::join!(metadata_fut, manifest_fut);
     let (meta_bytes, man_bytes) = (meta_bytes?, man_bytes?);
-    pplx_space_metrics::template::pull_s3_bytes(base_tags, Some(&parts.region), meta_bytes);
-    pplx_space_metrics::template::pull_s3_bytes(base_tags, Some(&parts.region), man_bytes);
+    crate::metrics::pull_s3_bytes(base_tags, Some(&parts.region), meta_bytes);
+    crate::metrics::pull_s3_bytes(base_tags, Some(&parts.region), man_bytes);
 
     // 2. Read + parse the manifest from disk so the rest of `do_pull`
     //    decides what to pull based on what the manifest actually
@@ -1827,7 +1819,7 @@ async fn try_pull_from(
         .into_iter()
         .collect::<Result<Vec<_>, _>>()?;
     for bytes in &pull_bytes {
-        pplx_space_metrics::template::pull_s3_bytes(base_tags, Some(&parts.region), *bytes);
+        crate::metrics::pull_s3_bytes(base_tags, Some(&parts.region), *bytes);
     }
     let manifest_wire_bytes: u64 = pull_bytes.iter().sum();
     info!(

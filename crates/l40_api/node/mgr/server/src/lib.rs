@@ -14,6 +14,7 @@ pub mod lifecycle_limiter;
 #[cfg(target_os = "linux")]
 pub mod loop_devices;
 pub mod memory_admission;
+pub mod metrics;
 pub mod net;
 mod node_state_sync;
 #[cfg(target_os = "linux")]

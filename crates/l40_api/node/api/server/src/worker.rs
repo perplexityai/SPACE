@@ -89,7 +89,7 @@ fn prepare_wait_ready_forward<T>(request: &mut Request<T>) {
     let policy = classify_wait_ready_caller(request);
     let route_token = space_api_route_capability_presence(request.metadata());
     take_wait_ready_call_purpose(request.metadata_mut());
-    pplx_space_metrics::auth::node_api_wait_ready_policy(policy.as_str(), route_token.as_str());
+    crate::metrics::auth::node_api_wait_ready_policy(policy.as_str(), route_token.as_str());
     set_space_api_bridge_caller_policy(request.metadata_mut(), policy);
 }
 

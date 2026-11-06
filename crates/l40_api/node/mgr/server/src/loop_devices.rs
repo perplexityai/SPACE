@@ -508,20 +508,20 @@ fn emit_capacity_telemetry(
 ) {
     match outcome {
         Ok(report) => {
-            pplx_space_metrics::node_manager::loop_device_capacity(report.present(), report.target);
-            pplx_space_metrics::node_manager::loop_devices_created(
+            crate::metrics::node_manager::loop_device_capacity(report.present(), report.target);
+            crate::metrics::node_manager::loop_devices_created(
                 report.kernel_devices_added,
                 report.device_nodes_created,
             );
         }
         Err(error) => {
-            pplx_space_metrics::node_manager::loop_device_capacity_failed(error.phase().as_str());
+            crate::metrics::node_manager::loop_device_capacity_failed(error.phase().as_str());
             let present = match error {
                 LoopCapacityError::CapacityNotReached { present, .. } => Some(*present),
                 _ => present_fallback(),
             };
             if let Some(present) = present {
-                pplx_space_metrics::node_manager::loop_device_capacity(present, target.get());
+                crate::metrics::node_manager::loop_device_capacity(present, target.get());
             }
         }
     }

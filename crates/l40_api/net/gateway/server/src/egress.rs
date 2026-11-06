@@ -142,7 +142,7 @@ pub(crate) fn admit_udp(
     if decision.is_allowed()
         && let Some(reason) = dns_allow_required(destination, policy)
     {
-        pplx_space_metrics::gateway::domain_binding("udp", "unavailable", "host_unavailable", None);
+        crate::metrics::domain_binding("udp", "unavailable", "host_unavailable", None);
         decision = EgressDecision::Deny { reason };
     }
     let context = EgressContext::Admission(EgressProtocol::Udp);
@@ -238,7 +238,7 @@ pub(crate) fn dns_allow_required(
 /// milliseconds would report zero almost every time and hide regressions as the
 /// rule set grows.
 fn record_latency(context: EgressContext, started_at: Instant) {
-    pplx_space_metrics::gateway::policy_decision_latency_ms(
+    crate::metrics::policy_decision_latency_ms(
         context.protocol().as_str(),
         context.phase().as_str(),
         started_at.elapsed().as_secs_f64() * 1_000.0,
@@ -252,8 +252,8 @@ fn record_decision(
     decision: EgressDecision,
     interception: pplx_space_net_common::TlsInterception,
 ) {
-    pplx_space_metrics::gateway::policy_decision(
-        pplx_space_metrics::gateway::PolicyDecisionKind::DnsAttributed,
+    crate::metrics::policy_decision(
+        crate::metrics::PolicyDecisionKind::DnsAttributed,
         context.protocol().as_str(),
         context.phase().as_str(),
         "v1",

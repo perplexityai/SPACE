@@ -184,7 +184,7 @@ fn bounded_control_connections(
     bounded_control_connections_from_stream(
         UnixListenerStream::new(listener),
         shutdown_token,
-        pplx_space_metrics::gateway::control_accept_backoff,
+        crate::metrics::control_accept_backoff,
     )
 }
 
@@ -203,10 +203,10 @@ where
         ConnectionAdmissionConfig::new("net-gateway-control", MAX_CONTROL_CONNECTIONS),
         move |_listener, observation| match observation.event() {
             ConnectionAdmissionEvent::CapacityExhausted => {
-                pplx_space_metrics::gateway::control_connection_limit_wait();
+                crate::metrics::control_connection_limit_wait();
             }
             ConnectionAdmissionEvent::AcceptError(reason) => {
-                pplx_space_metrics::gateway::control_accept_error(reason.as_str());
+                crate::metrics::control_accept_error(reason.as_str());
             }
             ConnectionAdmissionEvent::AcceptBackoff(reason) => {
                 record_backoff(reason.as_str());

@@ -262,7 +262,7 @@ impl TransferExecutor {
             max_decoded_bytes = CLASS_BYPASS_MAX_DECODED_BYTES,
             "unadmitted decode exceeded its output cap; restarting under codec admission"
         );
-        pplx_space_metrics::volume_manager::transfer_decode_bypass_overflow(&job.kind, artifact);
+        crate::metrics::transfer_decode_bypass_overflow(&job.kind, artifact);
         // The overflow proved this object is not the small artifact its
         // class implies, so the restart takes a permit unconditionally,
         // whatever size the frame header pledges.

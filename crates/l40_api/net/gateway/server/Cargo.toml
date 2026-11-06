@@ -38,6 +38,7 @@ hyper = { workspace = true, features = ["client", "server", "http1", "http2"] }
 hyper-util = { workspace = true, features = ["tokio", "server", "server-auto", "http1", "http2"] }
 libc = { workspace = true }
 lru = { workspace = true }
+metrics = { workspace = true }
 parking_lot = { workspace = true }
 rand = { workspace = true }
 socket2 = { workspace = true }
@@ -59,7 +60,8 @@ pplx-space-common-grpc = { workspace = true }
 pplx-space-common-svc = { workspace = true }
 pplx-space-credmgr-client = { workspace = true }
 pplx-space-credential-injection-core = { workspace = true }
-pplx-space-metrics = { workspace = true }
+pplx-space-metrics-emit = { workspace = true }
+pplx-space-sandbox-metrics = { workspace = true }
 pplx-space-observability = { workspace = true, default-features = false }
 pplx-space-net-gateway-client = { workspace = true }
 pplx-space-spaced-common = { workspace = true }

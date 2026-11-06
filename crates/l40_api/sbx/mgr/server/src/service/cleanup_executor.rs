@@ -743,7 +743,7 @@ impl SandboxManagerService {
                     .map_err(|error| Status::internal(format!("encode cleanup result: {error}")))?;
                     cleanup_jobs::retry_running(db, &id, &failure, delay)
                         .map_err(storage_status)?;
-                    pplx_space_metrics::sandbox::worker::cleanup_retry();
+                    crate::metrics::sandbox::worker::cleanup_retry();
                 }
             }
             Ok(())

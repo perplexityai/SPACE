@@ -573,27 +573,25 @@ impl LimiterMetricScope {
 
     fn record_in_flight(self, value: usize) {
         match self {
-            Self::Control => pplx_space_metrics::node_api::uds_per_sandbox_in_flight(value),
+            Self::Control => crate::metrics::node_api::uds_per_sandbox_in_flight(value),
             Self::ServicePortIngress => {
-                pplx_space_metrics::node_api::service_port_ingress_in_flight(value);
+                crate::metrics::node_api::service_port_ingress_in_flight(value);
             }
         }
     }
 
     fn record_rejected(self, scope: SlotScope) {
         match self {
-            Self::Control => pplx_space_metrics::node_api::uds_per_sandbox_rejected(scope.as_str()),
-            Self::ServicePortIngress => {
-                pplx_space_metrics::node_api::service_port_ingress_rejected()
-            }
+            Self::Control => crate::metrics::node_api::uds_per_sandbox_rejected(scope.as_str()),
+            Self::ServicePortIngress => crate::metrics::node_api::service_port_ingress_rejected(),
         }
     }
 
     fn record_handler_ms(self, value_ms: f64) {
         match self {
-            Self::Control => pplx_space_metrics::node_api::uds_per_sandbox_handler_ms(value_ms),
+            Self::Control => crate::metrics::node_api::uds_per_sandbox_handler_ms(value_ms),
             Self::ServicePortIngress => {
-                pplx_space_metrics::node_api::service_port_ingress_handler_ms(value_ms);
+                crate::metrics::node_api::service_port_ingress_handler_ms(value_ms);
             }
         }
     }

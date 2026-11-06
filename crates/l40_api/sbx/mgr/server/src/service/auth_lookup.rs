@@ -10,6 +10,7 @@ use super::spaced_bridge_policy::SpacedBridgePolicy;
 use super::tail_support::*;
 use super::*;
 
+use crate::metrics::sandbox::worker::SpaceApiRouteTokenAuthorizationResult;
 use pplx_space_common_core::types::{GuestPort, SandboxId, SpaceApiRouteIdentity};
 use pplx_space_common_svc::space_api_route::{
     RouteIdentityRemediation, SpaceApiBridgeCallerPolicy, SpaceApiRouteCapabilityPresence,
@@ -21,7 +22,6 @@ use pplx_space_common_svc::space_api_route_ed25519::{
     SpaceApiRouteEd25519Claims, SpaceApiRouteEd25519Error, SpaceApiRouteEd25519Verifier,
     space_api_route_ed25519_token_from_metadata,
 };
-use pplx_space_metrics::sandbox::worker::SpaceApiRouteTokenAuthorizationResult;
 use pplx_space_net_common::{EffectiveNetworkPolicyRef, NetworkPolicy};
 use tonic::metadata::MetadataMap;
 
@@ -239,7 +239,7 @@ fn record_space_api_route_token_authorization(
     operation: &str,
     result: SpaceApiRouteTokenAuthorizationResult,
 ) {
-    pplx_space_metrics::sandbox::worker::space_api_route_token_authorization(operation, result);
+    crate::metrics::sandbox::worker::space_api_route_token_authorization(operation, result);
 }
 
 impl SandboxManagerService {

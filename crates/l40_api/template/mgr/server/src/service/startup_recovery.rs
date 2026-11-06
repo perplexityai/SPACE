@@ -902,7 +902,7 @@ async fn prune_catalog_rows_missing_on_disk(
             .prune_without_local_builds()
         {
             Ok(pruned) if pruned > 0 => {
-                pplx_space_metrics::template::digest_pins_pruned(pruned as u64);
+                crate::metrics::digest_pins_pruned(pruned as u64);
                 tracing::info!(
                     pruned,
                     "pruned template digest pins without local builds"

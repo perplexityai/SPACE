@@ -136,7 +136,7 @@ pub(super) fn fail_stream_writeback_budget(
         .swap(true, std::sync::atomic::Ordering::AcqRel);
     budget.available.notify_all();
     if !was_failed {
-        pplx_space_metrics::volume_manager::stream_writeback_failure(operation.as_str());
+        crate::metrics::stream_writeback_failure(operation.as_str());
     }
 }
 
@@ -158,7 +158,7 @@ pub(super) fn emit_stream_writeback_outstanding_if_due(
     if !should_emit_stream_writeback_outstanding(last_emitted_at.elapsed(), force) {
         return;
     }
-    pplx_space_metrics::volume_manager::stream_writeback_outstanding_bytes(outstanding);
+    crate::metrics::stream_writeback_outstanding_bytes(outstanding);
     *last_emitted_at = Instant::now();
 }
 
@@ -203,9 +203,7 @@ pub(super) fn retire_stream_writeback_range(
             length = range.length,
             "streamed output range cache advice failed; disabling cache advice"
         );
-        pplx_space_metrics::volume_manager::stream_writeback_failure(
-            StreamWritebackFailureOperation::Advice.as_str(),
-        );
+        crate::metrics::stream_writeback_failure(StreamWritebackFailureOperation::Advice.as_str());
         *cache_advice_enabled = false;
     }
     release_stream_writeback_budget(budget, range.debt_bytes);
@@ -617,7 +615,7 @@ impl StreamWritebackCoordinator {
             }
         }
         *outstanding = outstanding.saturating_add(bytes);
-        pplx_space_metrics::volume_manager::stream_writeback_producer_blocked_ms(
+        crate::metrics::stream_writeback_producer_blocked_ms(
             reserve_started_at.elapsed().as_secs_f64() * 1000.0,
             priority_class.as_str(),
         );

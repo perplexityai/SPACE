@@ -114,7 +114,7 @@ impl NodeManagerService {
     ) -> Result<Response<PrepareEncryptedRootfsResponse>, Status> {
         // Counted before any request validation so the attempted/failed rate
         // covers parameter rejections too; the guard's drop arm records them.
-        let metric = DeviceOpMetric::prepare(pplx_space_metrics::byok::OP_ROOTFS);
+        let metric = DeviceOpMetric::prepare(crate::metrics::byok::OP_ROOTFS);
         self.check_execution(&sandbox_id.to_string(), req.execution_fence.as_ref(), false)?;
 
         let instance_dir = PathBuf::from(paths::sandbox_instance_dir(&sandbox_id.to_string()));
@@ -154,7 +154,7 @@ impl NodeManagerService {
             .transpose()?;
         let target_key = fetch_sandbox_volume_key(&sandbox_id, None)
             .await
-            .inspect_err(|_| metric.failed(pplx_space_metrics::byok::PHASE_DEK))?;
+            .inspect_err(|_| metric.failed(crate::metrics::byok::PHASE_DEK))?;
 
         let restore_cow_source = if let Some(source_id) = fork_source {
             // A published child COW is already independent of the source. Do
@@ -249,7 +249,7 @@ impl NodeManagerService {
         // The caller degrades a failure here to the plaintext rootfs file
         // with only a warn log, so this series is the ONLY place a node whose
         // pool fills all fail is visible.
-        let metric = DeviceOpMetric::prepare(pplx_space_metrics::byok::OP_POOL_ROOTFS);
+        let metric = DeviceOpMetric::prepare(crate::metrics::byok::OP_POOL_ROOTFS);
         let instance_dir = PathBuf::from(paths::sandbox_instance_dir(&sandbox_id.to_string()));
 
         let origin_path = instance_dir.join(ROOTFS_ORIGIN_FILE);
@@ -297,7 +297,7 @@ impl NodeManagerService {
         sandbox_id: SandboxId,
         req: PrepareEncryptedVolumeRequest,
     ) -> Result<Response<PrepareEncryptedVolumeResponse>, Status> {
-        let metric = DeviceOpMetric::prepare(pplx_space_metrics::byok::OP_SNAPSHOT_VOLUME);
+        let metric = DeviceOpMetric::prepare(crate::metrics::byok::OP_SNAPSHOT_VOLUME);
         self.check_execution(&sandbox_id.to_string(), req.execution_fence.as_ref(), false)?;
         let volume_name = validate_volume_name(&req.volume_name)?;
 
@@ -334,7 +334,7 @@ impl NodeManagerService {
         // volume is prepared). The caller never handles a KEK or wrap.
         let plaintext_dek = fetch_sandbox_volume_dek(&sandbox_id, None)
             .await
-            .inspect_err(|_| metric.failed(pplx_space_metrics::byok::PHASE_DEK))?;
+            .inspect_err(|_| metric.failed(crate::metrics::byok::PHASE_DEK))?;
 
         let volume_name = volume_name.to_string();
         let operation_sandbox_id = sandbox_id;
@@ -387,7 +387,7 @@ impl NodeManagerService {
         sandbox_id: SandboxId,
         req: ReleaseEncryptedVolumeRequest,
     ) -> Result<Response<ReleaseEncryptedVolumeResponse>, Status> {
-        let metric = DeviceOpMetric::release(pplx_space_metrics::byok::OP_SNAPSHOT_VOLUME);
+        let metric = DeviceOpMetric::release(crate::metrics::byok::OP_SNAPSHOT_VOLUME);
         self.check_execution(&sandbox_id.to_string(), req.execution_fence.as_ref(), false)?;
         let volume_name = validate_volume_name(&req.volume_name)?.to_string();
         let mount_dir = volume_mount_dir(&sandbox_id, &volume_name);
@@ -424,7 +424,7 @@ impl NodeManagerService {
                     req.stage_dir.trim(),
                     "stage_dir",
                 )
-                .inspect_err(|_| metric.failed(pplx_space_metrics::byok::PHASE_STAGE))?;
+                .inspect_err(|_| metric.failed(crate::metrics::byok::PHASE_STAGE))?;
                 // `sync` first so any in-flight writes are durable before the
                 // copy. Best-effort: a failed sync degrades durability of the
                 // staged copy, not correctness of the sealed volume.
@@ -440,12 +440,12 @@ impl NodeManagerService {
                         &artifact.src_path,
                         "stage_artifacts.src_path",
                     )
-                    .inspect_err(|_| metric.failed(pplx_space_metrics::byok::PHASE_STAGE))?;
+                    .inspect_err(|_| metric.failed(crate::metrics::byok::PHASE_STAGE))?;
                     let dst_name = validate_stage_dst_name(&artifact.dst_name)
-                        .inspect_err(|_| metric.failed(pplx_space_metrics::byok::PHASE_STAGE))?;
+                        .inspect_err(|_| metric.failed(crate::metrics::byok::PHASE_STAGE))?;
                     stage_contained(&operation_sandbox_id, src, stage_dir.join(dst_name))
                         .await
-                        .inspect_err(|_| metric.failed(pplx_space_metrics::byok::PHASE_STAGE))?;
+                        .inspect_err(|_| metric.failed(crate::metrics::byok::PHASE_STAGE))?;
                 }
             }
             metric.succeeded();
@@ -621,7 +621,7 @@ async fn fetch_sandbox_volume_key(
     sandbox_id: &SandboxId,
     expected_org: Option<OrgId>,
 ) -> Result<VolumeKey, Status> {
-    use pplx_space_metrics::byok;
+    use crate::metrics::byok;
 
     byok::dek_fetch_attempted();
     let started = std::time::Instant::now();
@@ -674,7 +674,7 @@ fn credmgr_status_with_context(status: Status) -> Status {
 /// KEK is revoked, and no amount of retrying helps, while the rest are
 /// availability problems that resolve on their own.
 fn dek_failure_reason(code: tonic::Code) -> &'static str {
-    use pplx_space_metrics::byok;
+    use crate::metrics::byok;
     match code {
         tonic::Code::FailedPrecondition
         | tonic::Code::PermissionDenied
@@ -710,7 +710,7 @@ fn dmcrypt_error_to_status(e: rootfs_dmcrypt::DmCryptError) -> Status {
 /// is the only place the typed distinction survives. A new variant fails to
 /// compile here rather than landing silently in a catch-all.
 fn dmcrypt_error_phase(e: &rootfs_dmcrypt::DmCryptError) -> &'static str {
-    use pplx_space_metrics::byok;
+    use crate::metrics::byok;
     use rootfs_dmcrypt::DmCryptError;
     match e {
         DmCryptError::KernelUnsupported(_) => byok::PHASE_KERNEL,
@@ -750,12 +750,12 @@ struct DeviceOpMetric {
 
 impl DeviceOpMetric {
     fn prepare(op: &'static str) -> Self {
-        pplx_space_metrics::byok::device_prepare_attempted(op);
+        crate::metrics::byok::device_prepare_attempted(op);
         Self::new(op, DeviceOpKind::Prepare)
     }
 
     fn release(op: &'static str) -> Self {
-        pplx_space_metrics::byok::device_release_attempted(op);
+        crate::metrics::byok::device_release_attempted(op);
         Self::new(op, DeviceOpKind::Release)
     }
 
@@ -773,12 +773,8 @@ impl DeviceOpMetric {
             return;
         }
         match self.kind {
-            DeviceOpKind::Prepare => {
-                pplx_space_metrics::byok::device_prepare_failed(self.op, phase)
-            }
-            DeviceOpKind::Release => {
-                pplx_space_metrics::byok::device_release_failed(self.op, phase)
-            }
+            DeviceOpKind::Prepare => crate::metrics::byok::device_prepare_failed(self.op, phase),
+            DeviceOpKind::Release => crate::metrics::byok::device_release_failed(self.op, phase),
         }
     }
 
@@ -787,14 +783,14 @@ impl DeviceOpMetric {
             return;
         }
         if matches!(self.kind, DeviceOpKind::Prepare) {
-            pplx_space_metrics::byok::device_prepare_duration(self.op, self.started);
+            crate::metrics::byok::device_prepare_duration(self.op, self.started);
         }
     }
 }
 
 impl Drop for DeviceOpMetric {
     fn drop(&mut self) {
-        self.failed(pplx_space_metrics::byok::PHASE_PARAMS);
+        self.failed(crate::metrics::byok::PHASE_PARAMS);
     }
 }
 

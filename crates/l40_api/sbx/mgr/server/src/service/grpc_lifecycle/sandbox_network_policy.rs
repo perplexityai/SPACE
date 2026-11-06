@@ -131,7 +131,7 @@ impl SandboxManagerService {
             .map_err(|e| Status::internal(format!("db network_policy update failed: {e}")))?
         };
         if outcome.decision == crate::db::NetworkPolicyOverrideUpdate::Conflict {
-            pplx_space_metrics::reconcile::apply_conflict(FACET_NETWORK_POLICY);
+            crate::metrics::reconcile::apply_conflict(FACET_NETWORK_POLICY);
             emit_sandbox_event(
                 &sandbox.id,
                 SandboxEventType::NetworkPolicyUpdateFailed,
@@ -146,13 +146,13 @@ impl SandboxManagerService {
         }
         match outcome.decision {
             crate::db::NetworkPolicyOverrideUpdate::Apply => {
-                pplx_space_metrics::reconcile::apply_applied(FACET_NETWORK_POLICY, "apply");
+                crate::metrics::reconcile::apply_applied(FACET_NETWORK_POLICY, "apply");
             }
             crate::db::NetworkPolicyOverrideUpdate::Repair => {
-                pplx_space_metrics::reconcile::apply_applied(FACET_NETWORK_POLICY, "repair");
+                crate::metrics::reconcile::apply_applied(FACET_NETWORK_POLICY, "repair");
             }
             crate::db::NetworkPolicyOverrideUpdate::Skip => {
-                pplx_space_metrics::reconcile::apply_skipped(FACET_NETWORK_POLICY, "idempotent");
+                crate::metrics::reconcile::apply_skipped(FACET_NETWORK_POLICY, "idempotent");
             }
             crate::db::NetworkPolicyOverrideUpdate::Conflict => unreachable!("handled above"),
         }

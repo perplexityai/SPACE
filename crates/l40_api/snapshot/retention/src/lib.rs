@@ -120,6 +120,7 @@ use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::metrics as sweeper_metrics;
 use futures_util::{
     StreamExt,
     stream::{self, FuturesUnordered},
@@ -128,12 +129,12 @@ use pplx_space_common_core::types::SandboxId;
 use pplx_space_events::{
     SandboxEvent, SandboxEventDetails, SandboxEventSource, SandboxEventTrigger, SandboxEventType,
 };
-use pplx_space_metrics::snapshot_retention_sweeper as sweeper_metrics;
 use uuid::Uuid;
 
 use backend::{DeletePrefixError, DeletePrefixOutcome, StorageBackendRegistry};
 
 pub mod backend;
+pub mod metrics;
 pub mod store;
 
 #[cfg(test)]
@@ -275,7 +276,7 @@ pub trait RetentionSink: Send + Sync + 'static {
     ) -> impl std::future::Future<Output = Result<PruneFinalize, sqlx::Error>> + Send;
 }
 
-pub use pplx_space_metrics::snapshot_retention_sweeper::ClaimRefusalReason;
+pub use crate::metrics::ClaimRefusalReason;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClaimOutcome {
