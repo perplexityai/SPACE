@@ -163,13 +163,14 @@ function isIdSearch(typed: string): boolean {
   return digits >= MIN_ID_SEARCH_DIGITS && digits <= MAX_ID_SEARCH_DIGITS;
 }
 
-// What the search box does on each list shape. `serverSearch` says the
-// server takes `search`. While it does, an ID's hex digits (`isIdSearch`)
-// go there; all other text is matched as on a server without it.
+// What the search box does on each list shape. Every text is matched as on
+// a server without `search`; `serverSearch` says the server takes it, and
+// then text that is also an ID's hex digits (`isIdSearch`) carries
+// `idSearch` too: it is sent as `search`, in a request of its own, and its
+// matches are listed after the page with the `fragment` request's. So a
+// name made only of hex digits and dashes, such as `e2e-1`, is still found
+// by its name, and the ID column's label by the end of its ID.
 // - `ref`: a full identifier in any accepted form, looked up directly.
-// - `search`: an ID's hex digits, sent to a server that takes `search`,
-//   trimmed. A name made only of hex digits and dashes, such as `e2e-1`,
-//   is searched this way too, so it is not found by its name.
 // - `prefix`: sent to a paging server as typed. It matches the start of
 //   names case-sensitively, and the start of IDs: an `sbx_` ID prefix, or a
 //   dashed one in the UUID's layout, with hex digits in either case. The
@@ -186,23 +187,28 @@ function isIdSearch(typed: string): boolean {
 // - `page`: matched within the loaded rows, ignoring case, anywhere in the ID
 //   or name. On a paging server this is only text no name can start with. A
 //   sampled list matches all free text this way, as it did before paging.
-// The `prefix`, `fragment` and `page` matches are those of a server without
-// `search`, and of every text other than an ID's hex digits.
+// `idSearch`, when set, is the trimmed text, sent as `search` on a paging
+// server that takes it.
 export type SandboxSearch =
   | { kind: 'empty' }
   | { kind: 'ref'; ref: SandboxRef }
-  | { kind: 'search'; text: string }
-  | { kind: 'prefix'; prefix: string }
-  | { kind: 'fragment'; prefix: string; query: Extract<SandboxQuery, { kind: 'text' }> }
-  | { kind: 'page'; query: Extract<SandboxQuery, { kind: 'text' }> };
+  | { kind: 'prefix'; prefix: string; idSearch?: string }
+  | { kind: 'fragment'; prefix: string; query: Extract<SandboxQuery, { kind: 'text' }>; idSearch?: string }
+  | { kind: 'page'; query: Extract<SandboxQuery, { kind: 'text' }>; idSearch?: string };
 
 export function sandboxSearch(input: string, mode: ListMode, serverSearch = false): SandboxSearch {
+  const search = searchWithoutServerSearch(input, mode);
+  if (!serverSearch || mode !== 'paged' || search.kind === 'empty' || search.kind === 'ref') return search;
+  const typed = input.trim();
+  return isIdSearch(typed) ? { ...search, idSearch: typed } : search;
+}
+
+function searchWithoutServerSearch(input: string, mode: ListMode): SandboxSearch {
   const query = sandboxQuery(input);
   if (query.kind === 'empty') return query;
   if (query.kind === 'ref') return query;
   if (mode === 'sampled') return { kind: 'page', query };
   const typed = input.trim();
-  if (serverSearch && isIdSearch(typed)) return { kind: 'search', text: typed };
   const lower = typed.toLowerCase();
   // As typed: lowercasing would lose a name such as `sbx_AB-worker`.
   const afterMarker = typed.slice(PUBLIC_SANDBOX_ID_PREFIX.length);

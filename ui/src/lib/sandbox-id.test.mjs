@@ -167,37 +167,53 @@ test('a full identifier is a lookup on either list, and a sampled list matches a
   }
 });
 
-test('on a server that takes search, ID digits are searched there and other text as without it', () => {
+test('on a server that takes search, text is matched as without it, and ID digits are searched as IDs too', () => {
   const label = sandboxLabelOrId(sandbox.id);
-  // An ID's end from 4 digits, and its start from 8, behind sbx_ and with
-  // dashes or without. A name made only of hex digits and dashes is one too.
-  for (const typed of [label, label.toUpperCase(), '72e0', 'ae1d-72e0', 'e2e-1', 'cafe', 'sbx_2abc', '01a19089394a', '01a19089-394a', 'sbx_01a19089-394a-70', 'SBX_01A19089']) {
-    assert.deepEqual(sandboxSearch(` ${typed} `, 'paged', true), { kind: 'search', text: typed }, typed);
+  // An ID's hex digits keep the match they had and add the ID search: a
+  // hex-looking name such as e2e-1 is still a prefix and matched within the
+  // page, and the label is also searched as the end of an ID.
+  for (const [typed, kind] of [
+    [label, 'fragment'],
+    [label.toUpperCase(), 'fragment'],
+    ['72e0', 'fragment'],
+    ['cafe', 'fragment'],
+    ['deadbeef', 'fragment'],
+    ['e2e-1', 'fragment'],
+    ['ae1d-72e0', 'fragment'],
+    ['01a19089394a', 'fragment'],
+    ['01a19089-394a', 'prefix'],
+    ['sbx_2abc', 'prefix'],
+    ['SBX_01A19089', 'prefix'],
+    ['sbx_01a19089-394a-70', 'prefix'],
+  ]) {
+    const searched = sandboxSearch(` ${typed} `, 'paged', true);
+    assert.equal(searched.kind, kind, typed);
+    assert.deepEqual(searched, { ...sandboxSearch(` ${typed} `, 'paged'), idSearch: typed }, typed);
   }
-  // Everything else is matched as on a server without search: a
-  // case-sensitive prefix, hex digits too few for an ID within the page as
-  // well, and text no name can start with within the page only.
+  // Other text is exactly what it is without search, with no ID search.
   for (const [typed, kind] of [
     ['Build-', 'prefix'],
     ['BUILD cache', 'prefix'],
     ['loop-suspended', 'prefix'],
+    ['e2e-test', 'prefix'],
     ['sbx_x1', 'prefix'],
     ['sbx_2ab', 'prefix'],
+    ['0a1g', 'prefix'],
     ['abc', 'fragment'],
     ['e2e', 'fragment'],
-    ['0a1g', 'prefix'],
     ['f'.repeat(33), 'fragment'],
     ['build\0', 'page'],
     ['n'.repeat(300), 'page'],
   ]) {
     const searched = sandboxSearch(typed, 'paged', true);
     assert.equal(searched.kind, kind, typed);
+    assert.equal(searched.idSearch, undefined, typed);
     assert.deepEqual(searched, sandboxSearch(typed, 'paged'), typed);
   }
   // A full identifier is still a lookup, and a sampled list still matches
-  // within its rows: a server without paging has no search either.
+  // within its rows only: a server without paging has no search either.
   assert.equal(sandboxSearch(sandbox.id, 'paged', true).kind, 'ref');
-  assert.equal(sandboxSearch(label, 'sampled', true).kind, 'page');
+  assert.deepEqual(sandboxSearch(label, 'sampled', true), sandboxSearch(label, 'sampled'));
 });
 
 test('an empty query matches everything', () => {

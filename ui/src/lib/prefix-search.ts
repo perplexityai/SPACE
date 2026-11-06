@@ -35,8 +35,21 @@ export class PrefixRequests {
   }
 }
 
-// The prefix matches the main table does not already show.
-export function supplementalMatches<T extends { id: string }>(matches: readonly T[], shown: readonly { id: string }[]): T[] {
-  const shownIds = new Set(shown.map((row) => row.id));
-  return matches.filter((row) => !shownIds.has(row.id));
+// The server's matches the main table does not already show, from each of
+// its answers (the fragment search's prefix request and the ID search's),
+// once per sandbox ID, newest first as the list orders them: by creation
+// time, then ID. A row without a creation time sorts last.
+export function supplementalMatches<T extends { id: string; created_at?: string | null }>(
+  answers: readonly (readonly T[])[],
+  shown: readonly { id: string }[],
+): T[] {
+  const seen = new Set(shown.map((row) => row.id));
+  const merged: T[] = [];
+  for (const row of answers.flat()) {
+    if (seen.has(row.id)) continue;
+    seen.add(row.id);
+    merged.push(row);
+  }
+  const created = (row: T) => Date.parse(row.created_at ?? '') || 0;
+  return merged.sort((a, b) => created(b) - created(a) || (a.id < b.id ? 1 : a.id > b.id ? -1 : 0));
 }

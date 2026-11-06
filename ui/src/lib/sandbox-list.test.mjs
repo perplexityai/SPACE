@@ -11,6 +11,7 @@ import {
   continuationFor,
   createdBounds,
   fragmentSearchScope,
+  idSearchScope,
   isSearchUnsupported,
   listRequestQuery,
   listScope,
@@ -210,10 +211,6 @@ test('a fragment search reads the first page of the selected filters with it as 
   // The list itself is read without it.
   assert.equal(parse(listRequestQuery(selected, NOW)).prefix, undefined);
   assert.equal(fragmentSearchScope(listScope('sampled', NO_FILTERS, { limit: 1000, cursor: '' }), 'e2e-1'), null);
-  // A fragment search is how a server without `search` is searched, so it
-  // never sends one, even before the list's own filters drop it.
-  const unsupported = scopeOf({ search: 'e2e-1' });
-  assert.equal(parse(listRequestQuery(fragmentSearchScope(unsupported, 'e2e-1'), NOW)).search, undefined);
 });
 
 test('an answer for a filter undone before it arrived is dropped, and the rows on screen are kept', () => {
@@ -317,39 +314,16 @@ test('Next follows the page shown, and a failed load of another page leaves it o
   assert.equal(selection.goTo(selection.previousPosition()), false);
 });
 
-test('a search an API refuses returns to the page it was typed on', async () => {
-  const selection = newSelection({ template: 'alpha' });
-  await selection.load(selection.selected, reads(page('c1')).read);
-  selection.goTo(selection.nextPosition());
-  await selection.load(selection.selected, reads(page('c2')).read);
-  const onPage2 = selection.selected;
-  // Sending the search restarts at the first page, as any filter does.
-  selection.select({ filters: { ...NO_FILTERS, template: 'alpha', search: '9b10b406' }, pageSize: 50, sampleSize: 1000 });
-  assert.equal(selection.selected.cursor, '');
-  const unsupported = Object.assign(new Error('unknown query parameter "search"'), { status: 400 });
-  assert.equal((await selection.load(selection.selected, reads(unsupported).read)).kind, 'failed');
-  // The fallback goes back to the filters it was typed under, and to page 2,
-  // where the console matches within the page as it did before.
-  const plan = selection.select({ filters: { ...NO_FILTERS, template: 'alpha' }, pageSize: 50, sampleSize: 1000 }, { refusedSearch: true });
-  assert.equal(plan, 'load');
-  assert.equal(selection.selected.key, onPage2.key);
-  assert.equal(selection.selected.cursor, 'c1');
-});
-
-test('a search cleared or changed by the operator restarts at the first page', async () => {
-  const selection = newSelection({ template: 'alpha' });
-  await selection.load(selection.selected, reads(page('c1')).read);
-  selection.goTo(selection.nextPosition());
-  selection.select({ filters: { ...NO_FILTERS, template: 'alpha', search: '0a1b' }, pageSize: 50, sampleSize: 1000 });
-  // Cleared by the operator: no fallback, so the first page.
-  selection.select({ filters: { ...NO_FILTERS, template: 'alpha' }, pageSize: 50, sampleSize: 1000 });
-  assert.equal(selection.selected.cursor, '');
-  // A fallback under other filters than the search was typed under starts
-  // at their first page.
-  selection.goTo({ cursors: ['', 'c1'], index: 1 });
-  selection.select({ filters: { ...NO_FILTERS, template: 'alpha', search: '0a1b' }, pageSize: 50, sampleSize: 1000 });
-  selection.select({ filters: { ...NO_FILTERS, template: 'beta' }, pageSize: 50, sampleSize: 1000 }, { refusedSearch: true });
-  assert.equal(selection.selected.cursor, '');
+test('an ID search reads the first page of the selected filters with it as search, without the prefix', () => {
+  const selected = listScope('paged', { ...NO_FILTERS, template: 'alpha', prefix: 'e2e-1' }, { limit: 25, cursor: 'djE6MTo' });
+  const scope = idSearchScope(selected, 'e2e-1');
+  assert.deepEqual(parse(listRequestQuery(scope, NOW)), { limit: '25', cursor: '', template: 'alpha', search: 'e2e-1' });
+  // Its own scope: neither the list's nor the fragment search's.
+  assert.ok(!sameScope(scope, selected));
+  assert.ok(!sameScope(scope, fragmentSearchScope(selected, 'e2e-1')));
+  // The fragment search does not send it.
+  assert.equal(parse(listRequestQuery(fragmentSearchScope(selected, 'e2e-1'), NOW)).search, undefined);
+  assert.equal(idSearchScope(listScope('sampled', NO_FILTERS, { limit: 1000, cursor: '' }), 'e2e-1'), null);
 });
 
 test('a failed refresh of the page on screen keeps its rows and its Next', async () => {

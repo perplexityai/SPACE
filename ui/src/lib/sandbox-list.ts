@@ -62,7 +62,8 @@ export interface SandboxListFilters {
   // An ID's hex digits, trimmed, for a server that takes `search` (see
   // `isSearchUnsupported`): 4 to 32 once dashes and a leading `sbx_` are left
   // out. It matches IDs that end with them, and from 8 digits IDs that start
-  // with them.
+  // with them. Only the request of `idSearchScope` sends it; the list itself
+  // never does.
   search: string;
 }
 
@@ -102,10 +103,10 @@ export function sandboxListQuery(
 
 // The answer of a server that predates `search` to a paged request carrying
 // it: a 400 naming the parameter, since a paging server refuses an unknown
-// one once `cursor` is present. The console then searches as it did before
+// one once `cursor` is present. The console then stops sending it
 // (`sandboxSearch` without `serverSearch`) for as long as the list page stays
-// mounted: a reload, or leaving the page and coming back, tries `search`
-// again.
+// mounted, and searches as it did before; a reload, or leaving the page and
+// coming back, tries `search` again.
 export function isSearchUnsupported(error: unknown): boolean {
   const { status, message } = (error ?? {}) as { status?: unknown; message?: unknown };
   return status === 400 && typeof message === 'string' && message.includes('unknown query parameter "search"');
@@ -278,12 +279,19 @@ export class ListRequests {
 // filters with the search as `prefix`, read from the first page at the page
 // size. The list itself is read without it, so the search still matches ID
 // suffixes, such as the ID column's label, within the page on screen. Null on
-// a sampled list, which sends no prefix. It never sends `search`: it is how a
-// server without it is searched, and the selected filters can still carry the
-// search that server refused until the search box's pause has passed.
+// a sampled list, which sends no prefix.
 export function fragmentSearchScope(selected: ListScope, prefix: string): ListScope | null {
   if (selected.mode !== 'paged') return null;
   return listScope('paged', { ...selected.filters, prefix, search: '' }, { limit: selected.limit, cursor: '' });
+}
+
+// The request for an ID search (`SandboxSearch`'s `idSearch`): the selected
+// filters with the text as `search` and without the search box's `prefix`,
+// read from the first page at the page size. Its matches are listed after
+// the page with the fragment search's. Null on a sampled list.
+export function idSearchScope(selected: ListScope, text: string): ListScope | null {
+  if (selected.mode !== 'paged') return null;
+  return listScope('paged', { ...selected.filters, prefix: '', search: text }, { limit: selected.limit, cursor: '' });
 }
 
 // After the selection changes: the rows on screen are kept when they are the
@@ -383,9 +391,6 @@ export class ListSelection {
   private pageSize: number;
   private sampleSize: number;
   private continuation: Continuation | null = null;
-  // The scope and page position on screen when the filters started sending
-  // `search`, until they stop.
-  private searchOrigin: { key: string; position: PagePosition } | null = null;
   private readonly requests = new ListRequests();
 
   constructor({ filters, pageSize, sampleSize }: {
@@ -403,33 +408,17 @@ export class ListSelection {
     return listScope(this.mode, this.filters, { limit, cursor: pageCursor(this.position) });
   }
 
-  // A change of the filters or sizes. It restarts at the first page, except
-  // for the fallback after an API refused `search` (`refusedSearch`): that
-  // returns to the page the search was typed on (`searchOrigin`) when the
-  // filters are back to those it was typed under, so a match within the page
-  // is made on that page, as it was before the console sent `search`. When
+  // A change of the filters or sizes. It restarts at the first page. When
   // the selected request is the same (a sampled list sends only the org and
   // the sample size) nothing else changes. Otherwise the loads in flight are
   // invalidated; the rows on screen are kept when they are the new scope's
   // (a change undone before its answer arrived), and otherwise it is loaded.
-  select(
-    next: { filters: SandboxListFilters; pageSize: number; sampleSize: number },
-    { refusedSearch = false }: { refusedSearch?: boolean } = {},
-  ): 'unchanged' | 'keep' | 'load' {
+  select(next: { filters: SandboxListFilters; pageSize: number; sampleSize: number }): 'unchanged' | 'keep' | 'load' {
     const before = this.selected;
-    if (!before.filters.search.trim() && next.filters.search.trim()) {
-      this.searchOrigin = { key: before.key, position: this.position };
-    }
     this.filters = next.filters;
     this.pageSize = next.pageSize;
     this.sampleSize = next.sampleSize;
     this.position = FIRST_PAGE;
-    const origin = this.searchOrigin;
-    if (refusedSearch && origin) {
-      this.position = origin.position;
-      if (this.selected.key !== origin.key) this.position = FIRST_PAGE;
-    }
-    if (!next.filters.search.trim()) this.searchOrigin = null;
     if (sameScope(before, this.selected)) return 'unchanged';
     this.requests.invalidate();
     return scopeChangePlan(this.shown, this.selected);
