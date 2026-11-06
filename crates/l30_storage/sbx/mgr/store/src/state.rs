@@ -26,6 +26,31 @@ pub enum SandboxState {
     Failed,
 }
 
+/// A cleanup that owns a sandbox row, stored in `sandboxes.cleanup_state`
+/// over the row's lifecycle. It is not a lifecycle state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CleanupState {
+    Required,
+    Failed,
+}
+
+impl CleanupState {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Required => "required",
+            Self::Failed => "failed",
+        }
+    }
+
+    /// The combined status a row this cleanup owns reads as.
+    pub const fn legacy_status(self) -> SandboxState {
+        match self {
+            Self::Required => SandboxState::CleanupRequired,
+            Self::Failed => SandboxState::CleanupFailed,
+        }
+    }
+}
+
 impl SandboxState {
     /// Wait completion is not evidence that a VM or its resources were removed.
     /// Quarantine completes the wait while preserving uncertain resources.
@@ -40,9 +65,16 @@ impl SandboxState {
         )
     }
 
+    /// The RPC-admission machine, over lifecycle states. A cleanup is not a
+    /// lifecycle state: a row a cleanup owns admits only Delete and
+    /// quarantine, and a cleanup moving between required and failed is a
+    /// cleanup edge (`db::edges::CLEANUP_EDGES`), not a lifecycle transition.
     pub(crate) fn can_transition_to(&self, target: SandboxState) -> bool {
         if target == SandboxState::Quarantined {
             return *self != SandboxState::Failed;
+        }
+        if self.cleanup_label().is_some() {
+            return target == SandboxState::Deleting;
         }
 
         use SandboxState::*;
@@ -90,12 +122,8 @@ impl SandboxState {
             | (Suspending, Deleting)
             | (Restoring, Deleting)
             | (Checkpointing, Deleting)
-            | (CleanupRequired, Deleting)
-            | (CleanupFailed, Deleting)
             // Recovery
             | (Failed, Deleting)
-            | (CleanupRequired, CleanupFailed)
-            | (CleanupFailed, CleanupRequired)
             | (Quarantined, Deleting)
         )
     }

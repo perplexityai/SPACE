@@ -1,4 +1,4 @@
-use super::SandboxState::*;
+use super::SandboxState::{self, *};
 
 #[test]
 fn pause_admission_retries_in_flight_lifecycle_but_rejects_invalid_stable_states() {
@@ -89,15 +89,19 @@ fn quarantined_can_transition_only_to_itself_or_deleting() {
     assert!(!Quarantined.can_transition_to(Failed));
 }
 
+/// A cleanup is not a lifecycle state: a row it owns admits only Delete and
+/// quarantine, and required and failed are cleanup edges, not admissions.
 #[test]
-fn cleanup_required_can_transition_to_cleanup_failed() {
-    assert!(CleanupRequired.can_transition_to(CleanupFailed));
-}
-
-#[test]
-fn cleanup_failed_can_transition_to_deleting_or_retry() {
-    assert!(CleanupFailed.can_transition_to(Deleting));
-    assert!(CleanupFailed.can_transition_to(CleanupRequired));
+fn a_cleanup_owned_row_admits_only_delete_and_quarantine() {
+    for owned in [CleanupRequired, CleanupFailed] {
+        for target in SandboxState::all() {
+            assert_eq!(
+                owned.can_transition_to(target),
+                matches!(target, Deleting | Quarantined),
+                "{owned} -> {target}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -244,7 +248,7 @@ fn failed_is_readable_and_only_explicit_deletion_can_exit_it() {
 fn status_event_details_carry_the_cleanup_each_status_folds_in() {
     use pplx_space_events::SandboxEventDetails;
 
-    use super::{SandboxState, SandboxStatusEventDetails};
+    use super::SandboxStatusEventDetails;
 
     for (status, cleanup_state) in [
         (SandboxState::Stopping, "none"),

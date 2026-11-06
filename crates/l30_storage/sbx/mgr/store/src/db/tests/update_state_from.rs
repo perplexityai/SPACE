@@ -145,13 +145,7 @@ fn a_from_set_without_the_row_state_refuses_and_keeps_every_row(
 
 fn writable(edge: &crate::db::Edge) -> bool {
     !edge.from().is_empty()
-        && !matches!(
-            edge.to(),
-            SandboxState::Quarantined
-                | SandboxState::Failed
-                | SandboxState::CleanupRequired
-                | SandboxState::CleanupFailed
-        )
+        && !matches!(edge.to(), SandboxState::Quarantined | SandboxState::Failed)
 }
 
 #[rstest::rstest]
@@ -179,8 +173,8 @@ fn an_edge_writes_its_target_only_from_its_sources(
     }
 }
 
-/// Inserts and quarantine, failure or cleanup targets are refused before the
-/// row is read. Each is tried over `started`.
+/// Inserts and quarantine or failure targets are refused before the row is
+/// read. Each is tried over `started`.
 #[test]
 fn insert_and_rejected_target_edges_are_refused() {
     let refused: Vec<_> = EDGES.iter().filter(|edge| !writable(edge)).collect();
