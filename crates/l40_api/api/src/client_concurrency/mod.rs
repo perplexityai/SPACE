@@ -450,6 +450,23 @@ fn is_reserved_client_id(id: &str) -> bool {
         .any(|reserved| id.eq_ignore_ascii_case(reserved))
 }
 
+/// The client ids the quotas flag's `overrides` map lists, decoded exactly as
+/// the limiter decodes the flag, so the live cap and the limiter agree on
+/// which override keys are listed while the flag resolves: `None` when the
+/// flag doesn't decode as
+/// [`QuotaOverrides`] (the limiter then applies no override), and otherwise
+/// only the keys that may name a client.
+pub(crate) fn override_ids(value: &serde_json::Value) -> Option<BTreeSet<String>> {
+    let overrides = serde_json::from_value::<QuotaOverrides>(value.clone()).ok()?;
+    Some(
+        overrides
+            .overrides
+            .into_keys()
+            .filter(|id| check_client_id(id).is_ok())
+            .collect(),
+    )
+}
+
 /// Why a key-set entry can't name a client of its own.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RejectedClientId {
