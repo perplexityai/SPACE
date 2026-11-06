@@ -43,6 +43,9 @@
 //!   `pplx-space-cluster-pool` for the slots; the observed-state delete and
 //!   the snapshot-storage detach are written inline, although
 //!   `snapshot_storage_locations` belongs to `pplx-space-snapshot-store`.
+//!   [`lost::write_off_lost_sandboxes`] reaches past the row too: it deletes
+//!   the gone node's backup-queue rows and retires the active execution of
+//!   the sandboxes it unplaces.
 //!   A transition that is one statement whose CTEs also write a sibling
 //!   table, as several in [`ingest`] do, stays one statement: splitting it
 //!   would change what it does.

@@ -3,7 +3,6 @@ use pplx_space_common_core::types::SnapshotId;
 use pplx_space_common_core::types::SubstrateKind;
 
 use pplx_space_common_core::sql;
-use std::time::Duration;
 
 use pplx_space_common_core::types::SandboxId;
 use pplx_space_events::{SandboxEventDetails, SandboxEventTrigger};
@@ -11,12 +10,11 @@ use pplx_space_sandbox_portability::{
     drain_gate_blockers_for_node, snapshot_durable_for_source_release,
 };
 use pplx_space_sandbox_residency::{self as sandbox_residency, ResidencyEvidence};
-use pplx_space_sandbox_store::lost;
+use pplx_space_sandbox_store::lost::{self, DEAD_UPLOAD_SETTLE, write_off_lost_sandboxes};
+use pplx_space_snapshot_store::lost::fail_quiet_full_uploads_from_node;
 use sqlx::PgPool;
 
-use crate::gone_node_write_off::{
-    emit_lost_and_failed, node_identity_holds, write_off_lost_sandboxes,
-};
+use crate::gone_node_write_off::{emit_lost_and_failed, node_identity_holds};
 
 use super::{
     DRAIN_KEEP_ANNOTATION, DrainKeepAnnotationLookup, DrainKeepStatus, DrainedNodeTerminatorSink,
@@ -206,19 +204,6 @@ pub(crate) fn delete_refusal_diagnostics_query(residency: ResidencyEvidence) -> 
                WHERE {resident_predicate}) AS active_residents"
     )
 }
-
-/// Quiet period a same-node `creating` snapshot row must have sat without a
-/// worker heartbeat (`COALESCE(last_attempt_at, timestamp)`) before the
-/// mark-lost give-up treats it as provably dead. EC2 `terminated` already
-/// proves the upload *worker* died with the instance — what it cannot bound
-/// is a `FinalizeArtifactBackup(READY)` RPC that left the node before the
-/// instance died and is still queued in the API path with all bytes already
-/// durable in S3. Such an RPC lives for seconds (gRPC deadline), so ten
-/// quiet minutes is overwhelmingly past it: a row still inside the window
-/// defers the flip (the sandbox stays parked and the next ticks re-check);
-/// one quiet for longer can no longer become `ready` and is finalized
-/// `failed` so the reap converges.
-pub(crate) const DEAD_UPLOAD_SETTLE: Duration = Duration::from_mins(10);
 
 /// `$1` = node id. The give-up candidate claim: the node's pinned `suspended`
 /// rows that have no durable copy, locked in `id` order.
@@ -551,7 +536,8 @@ impl DrainedNodeTerminatorSink for NodeDbStore {
         )
         .await?;
         if !ids.is_empty() {
-            write_off_lost_sandboxes(&mut tx, node_id, &ids, DEAD_UPLOAD_SETTLE).await?;
+            fail_quiet_full_uploads_from_node(&mut tx, node_id, &ids, DEAD_UPLOAD_SETTLE).await?;
+            write_off_lost_sandboxes(&mut tx, node_id, &ids).await?;
         }
         tx.commit().await?;
         let node_label = node_id.to_string();

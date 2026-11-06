@@ -7,14 +7,14 @@ use std::sync::LazyLock;
 use pplx_space_common_core::sql;
 use pplx_space_events::{SandboxEventDetails, SandboxEventTrigger};
 use pplx_space_sandbox_portability::started_restore_source_absent;
-use pplx_space_sandbox_store::lost::mark_started_lost;
+use pplx_space_sandbox_store::lost::{
+    DEAD_UPLOAD_SETTLE, mark_started_lost, write_off_lost_sandboxes,
+};
+use pplx_space_snapshot_store::lost::fail_quiet_full_uploads_from_node;
 use sqlx::PgPool;
 
 use super::{LostCandidate, LostStartedSink, SourceNode};
-use crate::drained_node_terminator::store::DEAD_UPLOAD_SETTLE;
-use crate::gone_node_write_off::{
-    emit_lost_and_failed, node_identity_holds, write_off_lost_sandboxes,
-};
+use crate::gone_node_write_off::{emit_lost_and_failed, node_identity_holds};
 
 type CandidateRow = (SandboxId, i64, NodeId, bool, Option<String>, Option<String>);
 
@@ -195,13 +195,14 @@ impl LostStartedSink for LostStartedDbStore {
             tx.rollback().await?;
             return Ok(false);
         }
-        write_off_lost_sandboxes(
+        fail_quiet_full_uploads_from_node(
             &mut tx,
             node_id,
             &[candidate.sandbox_id],
             DEAD_UPLOAD_SETTLE,
         )
         .await?;
+        write_off_lost_sandboxes(&mut tx, node_id, &[candidate.sandbox_id]).await?;
         tx.commit().await?;
 
         let details = SandboxEventDetails::default()

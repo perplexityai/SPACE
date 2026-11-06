@@ -19,6 +19,7 @@ use sqlx::types::Json;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
+pub mod lost;
 mod placement;
 pub use placement::{SnapshotStoragePlacement, storage_placements};
 

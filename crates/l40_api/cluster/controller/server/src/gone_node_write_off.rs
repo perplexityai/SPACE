@@ -4,12 +4,13 @@
 //!
 //! Each caller owns its own candidate claim and terminal flip. What they share
 //! is the identity re-check that keeps a same-name replacement node from
-//! inheriting the dead node's verdict, and the rows a lost sandbox leaves
-//! behind that nothing else would clean up.
+//! inheriting the dead node's verdict, and the events a committed flip emits.
+//! The rows a lost sandbox leaves behind that nothing else would clean up are
+//! written off by the stores:
+//! [`pplx_space_snapshot_store::lost::fail_quiet_full_uploads_from_node`], then
+//! [`pplx_space_sandbox_store::lost::write_off_lost_sandboxes`].
 
 use pplx_space_common_core::types::{NodeId, SandboxId, SubstrateKind};
-
-use std::time::Duration;
 
 use pplx_space_common_core::sql;
 use pplx_space_events::{SandboxEvent, SandboxEventDetails, SandboxEventSource, SandboxEventType};
@@ -52,74 +53,6 @@ pub(crate) async fn node_identity_holds(
     .fetch_optional(&mut **tx)
     .await?;
     Ok(uid.is_some())
-}
-
-/// Clean up after `ids` were flipped to `failed` in this transaction because
-/// `node_id` is gone. Run it after the flip, in the flip's transaction.
-///
-/// - **Dead uploads.** A `creating` snapshot from the gone node, quiet past
-///   `dead_upload_settle`, can never finalize: its upload worker died with the
-///   instance. Left `creating`, it reads as a live upload forever, and the
-///   drained-node snapshot guard would refuse the reap on it. It's finalized
-///   `failed`, as the worker's own failure path does.
-/// - **The backup queue.** A gone node sends no census to replace its
-///   `node_local_backup_pending` set, and the table's only foreign key is on
-///   `sandbox_id`, so the rows would stay until the sandbox row is deleted.
-///   Scoped to `node_id`: a sandbox can hold a queue row on a live node too,
-///   and that row is the live node's pending work. Lock order is
-///   sandboxes-then-queue, while the census publish takes the queue row first;
-///   that can only deadlock against a census from the gone node itself.
-/// - **Executions.** The active execution is written off as `forgotten`, the
-///   pod-tracking write-off state: its pod, if one ran, died with the node.
-/// - **Placement.** Released through
-///   [`pplx_space_sandbox_store::lost::release_lost_placement`], so the row
-///   stops pinning the gone node.
-///
-/// Port exposures are left alone: re-queueing them for a terminal sandbox
-/// would only create work that can never apply.
-pub(crate) async fn write_off_lost_sandboxes(
-    tx: &mut Transaction<'_, Postgres>,
-    node_id: NodeId,
-    ids: &[SandboxId],
-    dead_upload_settle: Duration,
-) -> Result<(), sqlx::Error> {
-    sqlx::query(sql!(
-        "UPDATE snapshots
-            SET state = 'failed'
-          WHERE sandbox_id = ANY($1)
-            AND source_node_id = $2
-            AND type = 'full'
-            AND state = 'creating'
-            AND COALESCE(last_attempt_at, timestamp)
-                < NOW() - make_interval(secs => $3::BIGINT)"
-    ))
-    .bind(ids)
-    .bind(node_id)
-    .bind(dead_upload_settle.as_secs().cast_signed())
-    .execute(&mut **tx)
-    .await?;
-    sqlx::query(sql!(
-        "DELETE FROM node_local_backup_pending
-          WHERE node_id = $1 AND sandbox_id = ANY($2)"
-    ))
-    .bind(node_id)
-    .bind(ids)
-    .execute(&mut **tx)
-    .await?;
-    sqlx::query(sql!(
-        "UPDATE sandbox_k8s_executions
-            SET active = FALSE,
-                state = 'forgotten',
-                pod_ip = NULL,
-                terminated_at = COALESCE(terminated_at, NOW()),
-                updated_at = NOW()
-          WHERE sandbox_id = ANY($1)
-            AND active"
-    ))
-    .bind(ids)
-    .execute(&mut **tx)
-    .await?;
-    pplx_space_sandbox_store::lost::release_lost_placement(tx, ids).await
 }
 
 /// Emit the `sandbox_lost` and `sandbox_failed` pair for a committed flip. The
