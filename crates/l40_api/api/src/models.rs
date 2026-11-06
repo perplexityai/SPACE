@@ -851,6 +851,11 @@ pub struct TemplateBuildRequest {
     pub publish_tags: Vec<String>,
     #[serde(default)]
     pub client: Option<TemplateBuildClientContext>,
+    /// Organization the template is built for and registered under, as if
+    /// one of its members had submitted the build. Omitted: the cluster's
+    /// managing org, as before.
+    #[serde(default)]
+    pub org_id: Option<OrgId>,
 }
 
 #[derive(Debug, Deserialize)]
