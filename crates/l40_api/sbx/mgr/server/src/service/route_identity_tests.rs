@@ -684,11 +684,11 @@ async fn resident_resume_refusal_status_for_every_state() {
             RouteIdentityProvenance::Unfenced,
         )
         .unwrap();
-        conn.execute(
-            "UPDATE sandboxes SET state = ?1 WHERE id = ?2",
-            crate::db::fixture::params![state.as_str(), sandbox_id.to_string()],
-        )
-        .unwrap();
+        crate::db::test_fixtures::state_write_fixtures::write_status(
+            &conn,
+            &sandbox_id.to_string(),
+            state,
+        );
         let service = RouteTestService::new(conn);
 
         let error = service

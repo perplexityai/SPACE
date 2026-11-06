@@ -1260,7 +1260,8 @@ async fn the_second_stopped_boundary_sits_after_the_pending_cleanup() {
     // the cleanup will move to `suspended` — not to `stopped`.
     conn.execute(
         "UPDATE sandboxes
-         SET state = 'cleanup_required',
+         SET state = 'stopping',
+             cleanup_state = 'required',
              cleanup_completion = 'mark_suspended',
              cleanup_keep_filesystem = 1
          WHERE id = ?1",

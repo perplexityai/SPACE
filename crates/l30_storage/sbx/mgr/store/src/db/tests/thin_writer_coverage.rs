@@ -686,11 +686,16 @@ fn orphan_restore_adoption_rewrites_only_a_synthetic_orphan() {
         .into_iter()
         .filter(|state| !matches!(state, SandboxState::Quarantined | SandboxState::Restoring))
         .map(|state| {
+            // A cleanup-owned status is stored as its lifecycle plus the
+            // cleanup over it.
+            let cleanup_state = state
+                .cleanup_label()
+                .map_or_else(|| "NULL".to_owned(), |label| format!("'{label}'"));
             (
                 format!("orphan in {state}"),
                 format!(
-                    "UPDATE sandboxes SET state = '{}' WHERE id = ?1",
-                    state.as_str()
+                    "UPDATE sandboxes SET state = '{}', cleanup_state = {cleanup_state} WHERE id = ?1",
+                    state.inserted_lifecycle()
                 ),
             )
         })
@@ -938,11 +943,7 @@ fn quarantine_adoption_binds_the_quarantined_full_suspend_pin_and_generation() {
             continue;
         }
         let (id, _, claimed) = insert_claimed_adoptable(&conn);
-        conn.execute(
-            "UPDATE sandboxes SET state = ?2 WHERE id = ?1",
-            params![id, state.as_str()],
-        )
-        .unwrap();
+        crate::db::test_fixtures::state_write_fixtures::write_status(&conn, &id, state);
         refuses(
             state.as_str(),
             &conn,

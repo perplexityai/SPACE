@@ -225,7 +225,7 @@ pub fn claim_teardown_suspend_failed_sandbox_for_eviction(
          SET state = 'deleting',
              state_changed_at = ?1,
              updated_at = ?1
-         WHERE id = ?2 AND state = 'suspending'
+         WHERE id = ?2 AND legacy_state = 'suspending'
            AND failure_reason = ?3
            AND current_local_artifact_id = ?4
            AND state_changed_at = ?5",
@@ -283,7 +283,7 @@ pub fn claim_retired_teardown_execution_for_release(
          SET state = 'deleting',
              state_changed_at = ?1,
              updated_at = ?1
-         WHERE id = ?2 AND state = 'suspending'
+         WHERE id = ?2 AND legacy_state = 'suspending'
            AND current_local_artifact_id = ?3
            AND NOT EXISTS (
                SELECT 1 FROM local_artifacts a

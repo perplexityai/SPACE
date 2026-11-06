@@ -7255,11 +7255,7 @@ pub(crate) mod service_tests {
         )
         .unwrap();
         if state != SandboxState::Started {
-            conn.execute(
-                "UPDATE sandboxes SET state = ?1 WHERE id = ?2",
-                crate::db::fixture::params![state.as_str(), id],
-            )
-            .unwrap();
+            crate::db::test_fixtures::state_write_fixtures::write_status(conn, id, state);
         }
     }
 
@@ -11087,7 +11083,7 @@ pub(crate) mod service_tests {
             .lock()
             .expect("mutex poisoned")
             .query_row(
-                "SELECT state FROM sandboxes WHERE id = ?1",
+                "SELECT legacy_state FROM sandboxes WHERE id = ?1",
                 [&sandbox_id_string],
                 |row| row.get::<_, String>(0),
             )
@@ -18791,7 +18787,7 @@ pub(crate) mod service_tests {
             }
             // Reconstruct a persisted Failed row with an unfinished older operation.
             conn.execute(
-                "UPDATE sandboxes SET state = 'failed' WHERE id = ?1",
+                "UPDATE sandboxes SET state = 'failed', cleanup_state = NULL WHERE id = ?1",
                 [&sandbox_id],
             )
             .unwrap();

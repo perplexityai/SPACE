@@ -636,11 +636,22 @@ async fn first_request_of_a_staged_capture_carries_the_teardown_generation() {
                 }
                 // The route names another generation, so only the teardown's
                 // own can be what the request carries.
+                // A cleanup-owned row is stored as its lifecycle plus the
+                // cleanup over it.
+                let (lifecycle, cleanup_state) = match state {
+                    "cleanup_required" => ("stopping", Some("required")),
+                    other => (other, None),
+                };
                 conn.execute(
                     "UPDATE sandboxes
-                        SET state = ?1, space_api_route_execution_generation = ?2
+                        SET state = ?1, cleanup_state = ?4, space_api_route_execution_generation = ?2
                       WHERE id = ?3",
-                    crate::db::fixture::params![state, GENERATION + 92, sandbox_id_string],
+                    crate::db::fixture::params![
+                        lifecycle,
+                        GENERATION + 92,
+                        sandbox_id_string,
+                        cleanup_state
+                    ],
                 )
                 .unwrap();
                 let (service, _dispatched) = service_recording_cleanup(conn);

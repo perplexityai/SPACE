@@ -423,7 +423,7 @@ async fn row_cleanup_retires_policy_only_after_identity_is_deleted() {
                         // Model a newer identity visible when the old remote
                         // cleanup returns; its maps and obligation must survive.
                         service.db.lock().unwrap().execute(
-                            "UPDATE sandboxes SET state = 'started', space_api_route_execution_generation = 2 WHERE id = ?1",
+                            "UPDATE sandboxes SET state = 'started', cleanup_state = NULL, space_api_route_execution_generation = 2 WHERE id = ?1",
                             [&id],
                         ).unwrap();
                         service.watchdog.rearm_sandbox_from_db(&id).await;

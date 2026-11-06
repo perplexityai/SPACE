@@ -60,24 +60,24 @@ pub(super) type Grid = [&'static str; 18];
 pub(super) const PLAIN: Grid = [
     // to:         cre crd stg std stp spd del pau psd res chk ssg ssd rst crq crf qua fai
     /* creating */
-    "A   A   A   A   A   A   A   A   A   A   A   A   A   A   A   A   X   X",
-    /* created  */ "A   A   A   A   A   A   A   A   A   A   A   A   A   A   A   A   X   X",
-    /* starting */ "A   A   A   A   A   A   A   A   A   A   A   A   A   A   A   A   X   X",
-    /* started  */ "A   A   A   A   A   A   A   A   A   A   A   A   A   A   A   A   X   X",
-    /* stopping */ "A   A   A   S   A   A   A   S   S   S   S   A   A   A   A   A   X   X",
-    /* stopped  */ "A   A   A   A   A   A   A   A   A   A   A   A   A   A   A   A   X   X",
-    /* deleting */ "S   S   S   S   S   S   A   S   S   S   S   S   S   S   S   S   X   X",
-    /* pausing  */ "A   A   A   A   A   A   A   A   A   A   A   A   A   A   A   A   X   X",
-    /* paused   */ "A   A   A   A   A   A   A   A   A   A   A   A   A   A   A   A   X   X",
-    /* resuming */ "A   A   A   A   A   A   A   A   A   A   A   A   A   A   A   A   X   X",
-    /* checkpt  */ "A   A   A   A   A   A   A   A   A   A   A   A   A   A   A   A   X   X",
-    /* susping  */ "A   A   A   A   A   A   A   A   A   A   A   A   A   A   A   A   X   X",
-    /* susped   */ "A   A   A   A   A   A   A   A   A   A   A   A   A   A   A   A   X   X",
-    /* restorng */ "A   A   A   A   A   A   A   A   A   A   A   A   A   A   A   A   X   X",
-    /* clean_rq */ "A   A   A   S   A   A   A   S   S   S   S   A   A   A   A   A   X   X",
-    /* clean_fl */ "A   A   A   S   A   A   A   S   S   S   S   A   A   A   A   A   X   X",
-    /* quarant  */ "Q   Q   Q   Q   Q   Q   A   Q   Q   Q   Q   Q   Q   Q   Q   Q   X   X",
-    /* failed   */ "A   A   A   A   A   A   A   A   A   A   A   A   A   A   A   A   X   X",
+    "A   A   A   A   A   A   A   A   A   A   A   A   A   A   X   X   X   X",
+    /* created  */ "A   A   A   A   A   A   A   A   A   A   A   A   A   A   X   X   X   X",
+    /* starting */ "A   A   A   A   A   A   A   A   A   A   A   A   A   A   X   X   X   X",
+    /* started  */ "A   A   A   A   A   A   A   A   A   A   A   A   A   A   X   X   X   X",
+    /* stopping */ "A   A   A   S   A   A   A   S   S   S   S   A   A   A   X   X   X   X",
+    /* stopped  */ "A   A   A   A   A   A   A   A   A   A   A   A   A   A   X   X   X   X",
+    /* deleting */ "S   S   S   S   S   S   A   S   S   S   S   S   S   S   X   X   X   X",
+    /* pausing  */ "A   A   A   A   A   A   A   A   A   A   A   A   A   A   X   X   X   X",
+    /* paused   */ "A   A   A   A   A   A   A   A   A   A   A   A   A   A   X   X   X   X",
+    /* resuming */ "A   A   A   A   A   A   A   A   A   A   A   A   A   A   X   X   X   X",
+    /* checkpt  */ "A   A   A   A   A   A   A   A   A   A   A   A   A   A   X   X   X   X",
+    /* susping  */ "A   A   A   A   A   A   A   A   A   A   A   A   A   A   X   X   X   X",
+    /* susped   */ "A   A   A   A   A   A   A   A   A   A   A   A   A   A   X   X   X   X",
+    /* restorng */ "A   A   A   A   A   A   A   A   A   A   A   A   A   A   X   X   X   X",
+    /* clean_rq */ "A   A   A   S   A   A   A   S   S   S   S   A   A   A   X   X   X   X",
+    /* clean_fl */ "A   A   A   S   A   A   A   S   S   S   S   A   A   A   X   X   X   X",
+    /* quarant  */ "Q   Q   Q   Q   Q   Q   A   Q   Q   Q   Q   Q   Q   Q   X   X   X   X",
+    /* failed   */ "A   A   A   A   A   A   A   A   A   A   A   A   A   A   X   X   X   X",
 ];
 
 /// A `delete_row` row intent with no episode. The armed create episode, which
@@ -86,24 +86,24 @@ pub(super) const PLAIN: Grid = [
 const DELETE_ROW_INTENT: Grid = [
     // to:         cre crd stg std stp spd del pau psd res chk ssg ssd rst crq crf qua fai
     /* creating */
-    "A   A   A   A   A   A   A   A   A   A   A   A   A   A   A   A   X   X",
-    /* created  */ "A   A   A   A   A   A   A   A   A   A   A   A   A   A   A   A   X   X",
-    /* starting */ "A   A   A   A   A   A   A   A   A   A   A   A   A   A   A   A   X   X",
-    /* started  */ "A   A   A   A   A   A   A   A   A   A   A   A   A   A   A   A   X   X",
-    /* stopping */ "A   A   A   S   A   A   A   S   S   S   S   A   A   A   A   A   X   X",
-    /* stopped  */ "A   A   A   A   A   A   A   A   A   A   A   A   A   A   A   A   X   X",
-    /* deleting */ "S   S   S   S   S   S   A   S   S   S   S   S   S   S   S   S   X   X",
-    /* pausing  */ "A   A   A   A   A   A   A   A   A   A   A   A   A   A   A   A   X   X",
-    /* paused   */ "A   A   A   A   A   A   A   A   A   A   A   A   A   A   A   A   X   X",
-    /* resuming */ "A   A   A   A   A   A   A   A   A   A   A   A   A   A   A   A   X   X",
-    /* checkpt  */ "A   A   A   A   A   A   A   A   A   A   A   A   A   A   A   A   X   X",
-    /* susping  */ "A   A   A   A   A   A   A   A   A   A   A   A   A   A   A   A   X   X",
-    /* susped   */ "A   A   A   A   A   A   A   A   A   A   A   A   A   A   A   A   X   X",
-    /* restorng */ "A   A   A   A   A   A   A   A   A   A   A   A   A   A   A   A   X   X",
-    /* clean_rq */ "S   S   S   S   S   S   A   S   S   S   S   S   S   S   S   S   X   X",
-    /* clean_fl */ "S   S   S   S   S   S   A   S   S   S   S   S   S   S   S   S   X   X",
-    /* quarant  */ "Q   Q   Q   Q   Q   Q   A   Q   Q   Q   Q   Q   Q   Q   Q   Q   X   X",
-    /* failed   */ "A   A   A   A   A   A   A   A   A   A   A   A   A   A   A   A   X   X",
+    "A   A   A   A   A   A   A   A   A   A   A   A   A   A   X   X   X   X",
+    /* created  */ "A   A   A   A   A   A   A   A   A   A   A   A   A   A   X   X   X   X",
+    /* starting */ "A   A   A   A   A   A   A   A   A   A   A   A   A   A   X   X   X   X",
+    /* started  */ "A   A   A   A   A   A   A   A   A   A   A   A   A   A   X   X   X   X",
+    /* stopping */ "A   A   A   S   A   A   A   S   S   S   S   A   A   A   X   X   X   X",
+    /* stopped  */ "A   A   A   A   A   A   A   A   A   A   A   A   A   A   X   X   X   X",
+    /* deleting */ "S   S   S   S   S   S   A   S   S   S   S   S   S   S   X   X   X   X",
+    /* pausing  */ "A   A   A   A   A   A   A   A   A   A   A   A   A   A   X   X   X   X",
+    /* paused   */ "A   A   A   A   A   A   A   A   A   A   A   A   A   A   X   X   X   X",
+    /* resuming */ "A   A   A   A   A   A   A   A   A   A   A   A   A   A   X   X   X   X",
+    /* checkpt  */ "A   A   A   A   A   A   A   A   A   A   A   A   A   A   X   X   X   X",
+    /* susping  */ "A   A   A   A   A   A   A   A   A   A   A   A   A   A   X   X   X   X",
+    /* susped   */ "A   A   A   A   A   A   A   A   A   A   A   A   A   A   X   X   X   X",
+    /* restorng */ "A   A   A   A   A   A   A   A   A   A   A   A   A   A   X   X   X   X",
+    /* clean_rq */ "S   S   S   S   S   S   A   S   S   S   S   S   S   S   X   X   X   X",
+    /* clean_fl */ "S   S   S   S   S   S   A   S   S   S   S   S   S   S   X   X   X   X",
+    /* quarant  */ "Q   Q   Q   Q   Q   Q   A   Q   Q   Q   Q   Q   Q   Q   X   X   X   X",
+    /* failed   */ "A   A   A   A   A   A   A   A   A   A   A   A   A   A   X   X   X   X",
 ];
 
 /// An episode that does not delete the row (an armed cold-start `mark_stopped`
@@ -112,33 +112,33 @@ const DELETE_ROW_INTENT: Grid = [
 const CLEANUP_OWNED: Grid = [
     // to:         cre crd stg std stp spd del pau psd res chk ssg ssd rst crq crf qua fai
     /* creating */
-    "S   S   S   S   S   S   S   S   S   S   S   S   S   S   S   S   X   X",
-    /* created  */ "S   S   S   S   S   S   S   S   S   S   S   S   S   S   S   S   X   X",
-    /* starting */ "S   S   S   S   S   S   S   S   S   S   S   S   S   S   S   S   X   X",
-    /* started  */ "S   S   S   S   S   S   S   S   S   S   S   S   S   S   S   S   X   X",
-    /* stopping */ "S   S   S   S   S   S   S   S   S   S   S   S   S   S   S   S   X   X",
-    /* stopped  */ "S   S   S   S   S   S   S   S   S   S   S   S   S   S   S   S   X   X",
-    /* deleting */ "S   S   S   S   S   S   S   S   S   S   S   S   S   S   S   S   X   X",
-    /* pausing  */ "S   S   S   S   S   S   S   S   S   S   S   S   S   S   S   S   X   X",
-    /* paused   */ "S   S   S   S   S   S   S   S   S   S   S   S   S   S   S   S   X   X",
-    /* resuming */ "S   S   S   S   S   S   S   S   S   S   S   S   S   S   S   S   X   X",
-    /* checkpt  */ "S   S   S   S   S   S   S   S   S   S   S   S   S   S   S   S   X   X",
-    /* susping  */ "S   S   S   S   S   S   S   S   S   S   S   S   S   S   S   S   X   X",
-    /* susped   */ "S   S   S   S   S   S   S   S   S   S   S   S   S   S   S   S   X   X",
-    /* restorng */ "S   S   S   S   S   S   S   S   S   S   S   S   S   S   S   S   X   X",
-    /* clean_rq */ "S   S   S   S   S   S   S   S   S   S   S   S   S   S   S   S   X   X",
-    /* clean_fl */ "S   S   S   S   S   S   S   S   S   S   S   S   S   S   S   S   X   X",
-    /* quarant  */ "Q   Q   Q   Q   Q   Q   S   Q   Q   Q   Q   Q   Q   Q   Q   Q   X   X",
-    /* failed   */ "S   S   S   S   S   S   S   S   S   S   S   S   S   S   S   S   X   X",
+    "S   S   S   S   S   S   S   S   S   S   S   S   S   S   X   X   X   X",
+    /* created  */ "S   S   S   S   S   S   S   S   S   S   S   S   S   S   X   X   X   X",
+    /* starting */ "S   S   S   S   S   S   S   S   S   S   S   S   S   S   X   X   X   X",
+    /* started  */ "S   S   S   S   S   S   S   S   S   S   S   S   S   S   X   X   X   X",
+    /* stopping */ "S   S   S   S   S   S   S   S   S   S   S   S   S   S   X   X   X   X",
+    /* stopped  */ "S   S   S   S   S   S   S   S   S   S   S   S   S   S   X   X   X   X",
+    /* deleting */ "S   S   S   S   S   S   S   S   S   S   S   S   S   S   X   X   X   X",
+    /* pausing  */ "S   S   S   S   S   S   S   S   S   S   S   S   S   S   X   X   X   X",
+    /* paused   */ "S   S   S   S   S   S   S   S   S   S   S   S   S   S   X   X   X   X",
+    /* resuming */ "S   S   S   S   S   S   S   S   S   S   S   S   S   S   X   X   X   X",
+    /* checkpt  */ "S   S   S   S   S   S   S   S   S   S   S   S   S   S   X   X   X   X",
+    /* susping  */ "S   S   S   S   S   S   S   S   S   S   S   S   S   S   X   X   X   X",
+    /* susped   */ "S   S   S   S   S   S   S   S   S   S   S   S   S   S   X   X   X   X",
+    /* restorng */ "S   S   S   S   S   S   S   S   S   S   S   S   S   S   X   X   X   X",
+    /* clean_rq */ "S   S   S   S   S   S   S   S   S   S   S   S   S   S   X   X   X   X",
+    /* clean_fl */ "S   S   S   S   S   S   S   S   S   S   S   S   S   S   X   X   X   X",
+    /* quarant  */ "Q   Q   Q   Q   Q   Q   S   Q   Q   Q   Q   Q   Q   Q   X   X   X   X",
+    /* failed   */ "S   S   S   S   S   S   S   S   S   S   S   S   S   S   X   X   X   X",
 ];
 
 /// A row the production quarantine writer moved to `quarantined`, with its
 /// `sandbox_quarantine_*` episode: only deletion passes.
 const QUARANTINE_EPISODE: &str =
-    "Q   Q   Q   Q   Q   Q   A   Q   Q   Q   Q   Q   Q   Q   Q   Q   X   X";
+    "Q   Q   Q   Q   Q   Q   A   Q   Q   Q   Q   Q   Q   Q   X   X   X   X";
 
 /// No row at all.
-const MISSING: &str = "M   M   M   M   M   M   M   M   M   M   M   M   M   M   M   M   X   X";
+const MISSING: &str = "M   M   M   M   M   M   M   M   M   M   M   M   M   M   X   X   X   X";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum Expected {

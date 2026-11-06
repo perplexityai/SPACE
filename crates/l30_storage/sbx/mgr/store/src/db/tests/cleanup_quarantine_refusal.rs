@@ -155,13 +155,7 @@ fn requested_start(conn: &Connection, id: &str, label: &str) -> CleanupEpisode {
 // predicate without another writer's side effects.
 
 fn set_state(conn: &Connection, id: &str, state: SandboxState) {
-    let changed = conn
-        .execute(
-            "UPDATE sandboxes SET state = ?2 WHERE id = ?1",
-            params![id, state.as_str()],
-        )
-        .unwrap();
-    assert_eq!(changed, 1);
+    crate::db::test_fixtures::state_write_fixtures::write_status(conn, id, state);
 }
 
 /// The row keeps its keep-filesystem flag but no longer the episode's

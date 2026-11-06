@@ -117,12 +117,13 @@ pub(super) fn row_to_list_sandbox(row: &rusqlite::Row) -> rusqlite::Result<Sandb
     })
 }
 
+/// The row's combined status, which a row select reads as `legacy_state`.
 fn state_column(row: &rusqlite::Row<'_>) -> rusqlite::Result<SandboxState> {
-    let state_str: String = row.get("state")?;
+    let state_str: String = row.get("legacy_state")?;
     state_str.parse::<SandboxState>().map_err(|_| {
         column_error(
             row,
-            "state",
+            "legacy_state",
             Type::Text,
             Box::new(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,

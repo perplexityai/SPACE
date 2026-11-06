@@ -92,7 +92,7 @@ pub fn settle_startup_resident(
     // Preserve a matching healthy acknowledgement across recovery, but retire
     // every receipt on quarantine in the same transaction as its evidence.
     tx.execute(
-        "UPDATE sandboxes SET state = ?1, failure_reason = ?2,
+        "UPDATE sandboxes SET state = ?1, cleanup_state = NULL, failure_reason = ?2,
              transition_receipt_id = CASE
                  WHEN ?1 != 'quarantined' AND ?1 = transition_receipt_target_state THEN transition_receipt_id
                  ELSE NULL

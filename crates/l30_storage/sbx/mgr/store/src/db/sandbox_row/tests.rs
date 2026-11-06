@@ -49,7 +49,7 @@ fn projection_order_does_not_change_values_or_corrupt_column_diagnostics() {
     let mut statement = conn
         .prepare(
             "SELECT process_env_json, network_policy_generation, rootfs_size_mb,
-                    state, uuid8, user, template, template_hash, runtime,
+                    state, legacy_state, uuid8, user, template, template_hash, runtime,
                     uid, slot, guest_cid, pid, spaced_host_pid, netgtw_pid,
                     vsock_uds_path, api_socket_path, created_at, updated_at,
                     snapshots_enabled, pool_template, guest_uptime_secs,
@@ -180,7 +180,9 @@ fn absent_or_malformed_counters_fail_closed_instead_of_decoding_zero() {
 /// projection.
 fn sandbox_projection(conn: &Connection, omitted: Option<&str>) -> String {
     let mut statement = conn
-        .prepare("SELECT name FROM pragma_table_info('sandboxes')")
+        // `table_xinfo`, unlike `table_info`, lists the generated
+        // `legacy_state` the row decoder reads.
+        .prepare("SELECT name FROM pragma_table_xinfo('sandboxes')")
         .unwrap();
     let all = statement
         .query_map([], |row| row.get::<_, String>(0))

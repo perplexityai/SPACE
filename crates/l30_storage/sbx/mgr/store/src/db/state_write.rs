@@ -539,7 +539,8 @@ pub enum StateWriteOutcome {
 /// `IMMEDIATE` transaction, so the guard reads, the write and the job failure
 /// commit together; it never nests one.
 ///
-/// Inserts and `quarantined` or `failed` targets are `InvalidQuery`. A write
+/// Inserts and `quarantined`, `failed`, `cleanup_required` or
+/// `cleanup_failed` targets are `InvalidQuery`. A write
 /// that matches no row although the row was read in a source state is
 /// `StatementChangedRows(0)`.
 pub fn update_state_from(
@@ -617,7 +618,10 @@ fn write_state_from(
     from: StateSet,
     to: SandboxState,
 ) -> Result<StateWriteOutcome> {
-    if matches!(to, SandboxState::Quarantined | SandboxState::Failed) {
+    // A cleanup is not a lifecycle state: only the cleanup writers record one.
+    if matches!(to, SandboxState::Quarantined | SandboxState::Failed)
+        || to.cleanup_label().is_some()
+    {
         return Err(Error::invalid_query());
     }
     if conn.is_autocommit() {
@@ -650,10 +654,14 @@ fn write_state_from_in_transaction(
     let from_labels =
         serde_json::to_string(&from.iter().map(|state| state.as_str()).collect::<Vec<_>>())
             .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+    // The generic writer only writes lifecycle states, so it also clears a
+    // cleanup state the row held. `legacy_state` is the combined status the
+    // source set and the timestamp compare, as before the split.
     let changed = conn.execute(
         "UPDATE sandboxes
          SET state = ?1,
-             state_changed_at = CASE WHEN state IS NOT ?1 THEN ?2 ELSE state_changed_at END,
+             cleanup_state = NULL,
+             state_changed_at = CASE WHEN legacy_state IS NOT ?1 THEN ?2 ELSE state_changed_at END,
              failure_reason = NULL,
              restore_origin = CASE WHEN ?1 = 'restoring' THEN restore_origin ELSE NULL END,
              restore_phase = CASE WHEN ?1 = 'restoring' THEN restore_phase ELSE NULL END,
@@ -684,7 +692,7 @@ fn write_state_from_in_transaction(
              END,
              updated_at = ?2
          WHERE id = ?3
-           AND state IN (SELECT value FROM json_each(?4))",
+           AND legacy_state IN (SELECT value FROM json_each(?4))",
         params![to.as_str(), now()?, id, from_labels],
     )?;
     if changed == 0 {

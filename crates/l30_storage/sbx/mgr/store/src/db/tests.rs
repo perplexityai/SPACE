@@ -387,7 +387,9 @@ fn every_allowed_state_transition_tracks_the_change_time() {
 
     for (from_index, from) in SandboxState::all().into_iter().enumerate() {
         for (to_index, to) in SandboxState::all().into_iter().enumerate() {
-            if from == to || !from.can_transition_to(to) {
+            // Only the cleanup writers record a cleanup; their timestamps are
+            // pinned in `cleanup_state_split`.
+            if from == to || !from.can_transition_to(to) || to.cleanup_label().is_some() {
                 continue;
             }
             let sandbox_id = format!("edge-{from_index}-{to_index}");
@@ -424,7 +426,7 @@ fn every_allowed_state_transition_tracks_the_change_time() {
             // Assert
             let (state, state_changed_at, updated_at): (String, String, String) = conn
                 .query_row(
-                    "SELECT state, state_changed_at, updated_at
+                    "SELECT legacy_state, state_changed_at, updated_at
                      FROM sandboxes
                      WHERE id = ?1",
                     params![sandbox_id],
@@ -485,7 +487,7 @@ fn specialized_state_writers_track_the_change_time() {
     ] {
         let (state, state_changed_at, updated_at): (String, String, String) = conn
             .query_row(
-                "SELECT state, state_changed_at, updated_at
+                "SELECT legacy_state, state_changed_at, updated_at
                  FROM sandboxes
                  WHERE id = ?1",
                 params![id],
@@ -2473,7 +2475,7 @@ fn materializing_a_stopped_sandbox_keeps_the_artifact_pin_it_was_evacuated_with(
 
     let (state, pin, kind, origin): (String, Option<String>, Option<String>, Option<String>) = conn
         .query_row(
-            "SELECT state, current_local_artifact_id, current_local_artifact_kind,
+            "SELECT legacy_state, current_local_artifact_id, current_local_artifact_kind,
                     current_local_artifact_origin
              FROM sandboxes WHERE id = 'sandbox-1'",
             [],
@@ -2759,7 +2761,7 @@ fn materializing_a_stopped_sandbox_replaces_a_row_already_holding_that_artifact(
     assert_eq!(row.local_path, stop_path);
     assert_eq!(
         conn.query_row(
-            "SELECT state FROM sandboxes WHERE id = 'sandbox-1'",
+            "SELECT legacy_state FROM sandboxes WHERE id = 'sandbox-1'",
             [],
             |row| row.get::<_, String>(0),
         )
@@ -2825,7 +2827,7 @@ fn materializing_a_stopped_sandbox_refuses_a_row_that_left_restoring() {
     assert!(error.is_no_rows(), "{error:?}");
     let state: String = conn
         .query_row(
-            "SELECT state FROM sandboxes WHERE id = 'sandbox-1'",
+            "SELECT legacy_state FROM sandboxes WHERE id = 'sandbox-1'",
             [],
             |row| row.get(0),
         )
@@ -2926,7 +2928,7 @@ fn restored_disk_as_new_becomes_a_stopped_sandbox_without_donor_runtime_identity
         Option<String>,
     ) = conn
         .query_row(
-            "SELECT state, pid, space_api_route_generation, restore_storage_uri
+            "SELECT legacy_state, pid, space_api_route_generation, restore_storage_uri
              FROM sandboxes WHERE id = 'sandbox-1'",
             [],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
@@ -4652,7 +4654,7 @@ fn a_publishing_orphan_restore_never_becomes_an_adoption_candidate() {
     );
     let state: String = conn
         .query_row(
-            "SELECT state FROM sandboxes WHERE id = ?1",
+            "SELECT legacy_state FROM sandboxes WHERE id = ?1",
             params![sandbox_id.to_string()],
             |row| row.get(0),
         )
@@ -6049,7 +6051,7 @@ fn orphan_quarantine_recovery_clears_staging_failure() {
     );
     let (state, failure_reason): (String, Option<String>) = conn
         .query_row(
-            "SELECT state, failure_reason FROM sandboxes WHERE id = ?1",
+            "SELECT legacy_state, failure_reason FROM sandboxes WHERE id = ?1",
             params![sandbox_id_string],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
@@ -7189,7 +7191,7 @@ fn pause_failed_quarantine_recovers_to_definitive_runtime_state() {
         assert!(recover_pause_failed_quarantine(&conn, &sandbox_id, target).unwrap());
         let recovered: (String, Option<String>, Option<String>, Option<String>, bool) = conn
             .query_row(
-                "SELECT s.state,
+                "SELECT s.legacy_state,
                         s.failure_reason,
                         history.action,
                         history.next_action,
@@ -8270,7 +8272,7 @@ fn publishing_a_recovered_orphan_leaves_no_quarantine_row() {
     // sandbox as quarantined.
     let state: String = conn
         .query_row(
-            "SELECT state FROM sandboxes WHERE id = ?1",
+            "SELECT legacy_state FROM sandboxes WHERE id = ?1",
             params![sandbox_id.to_string()],
             |row| row.get(0),
         )
@@ -10191,6 +10193,7 @@ mod accepted_shapes_cleanup_episodes;
 mod accepted_shapes_quarantine;
 mod accepted_shapes_single_statement;
 mod cleanup_quarantine_refusal;
+mod cleanup_state_split;
 mod local_network_policy_clear;
 mod network_policy_live_gateway;
 mod pinned_artifact_capture;

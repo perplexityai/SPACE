@@ -624,11 +624,7 @@ async fn requested_id_create_reuses_only_a_compatible_settled_row() {
                 &SandboxOwner::parse(OWNER.to_owned()).unwrap(),
                 None,
             );
-            conn.execute(
-                "UPDATE sandboxes SET state = ?1 WHERE id = ?2",
-                crate::db::fixture::params![case.state.as_str(), &id],
-            )
-            .unwrap();
+            crate::db::test_fixtures::state_write_fixtures::write_status(conn, &id, case.state);
         });
         let build = TemplateBuild::new();
         let fixture = Fixture::new(conn, build.resolver(BUILD), FakeNodeManager::default());
