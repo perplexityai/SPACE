@@ -359,6 +359,12 @@ impl SandboxState {
         }
     }
 
+    /// The cleanup this status records, as sandbox events carry it in
+    /// `from_cleanup_state`/`to_cleanup_state`.
+    pub fn event_cleanup_state(self) -> &'static str {
+        self.cleanup_label().unwrap_or("none")
+    }
+
     /// The `sandboxes.state` a row inserted with this status stores. A
     /// cleanup-owned row's lifecycle is the teardown transition its intent
     /// names; an insert records no intent yet, so it starts `stopping`, and
@@ -485,6 +491,26 @@ impl From<StateTransitionError> for tonic::Status {
 impl fmt::Display for SandboxState {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
+    }
+}
+
+/// Sets a sandbox event's status label together with the cleanup state it
+/// folds in, so `from_state` and `from_cleanup_state` (or the `to_` pair)
+/// always describe one status.
+pub trait SandboxStatusEventDetails {
+    fn with_from_status(self, status: SandboxState) -> Self;
+    fn with_to_status(self, status: SandboxState) -> Self;
+}
+
+impl SandboxStatusEventDetails for pplx_space_events::SandboxEventDetails {
+    fn with_from_status(self, status: SandboxState) -> Self {
+        self.with_from_state(status.as_str())
+            .from_cleanup_state(status.event_cleanup_state())
+    }
+
+    fn with_to_status(self, status: SandboxState) -> Self {
+        self.with_to_state(status.as_str())
+            .to_cleanup_state(status.event_cleanup_state())
     }
 }
 

@@ -55,7 +55,7 @@ use super::{
 use crate::{
     db::CleanupCompletion,
     proto::{StartRequest, StartResponse},
-    state::SandboxState,
+    state::{SandboxState, SandboxStatusEventDetails},
 };
 use pplx_space_common_core::types::{
     SandboxCleanupEpisodeId, SandboxId, SandboxOwnerKind, SandboxQuarantineReasonCode,
@@ -2265,7 +2265,7 @@ impl SandboxManagerService {
                     .trigger(SandboxEventTrigger::System)
                     .operation("cold_activation")
                     .reason("start_entry_cas_lost")
-                    .with_from_state(sandbox.state.to_string())
+                    .with_from_status(sandbox.state)
                     .target_state(SandboxState::Starting.to_string())
                     .rows_affected("0"),
             );

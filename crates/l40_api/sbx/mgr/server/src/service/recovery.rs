@@ -503,8 +503,8 @@ impl SandboxManagerService {
                     .reason("startup_recovery_runtime_state_observed")
                     .operation("recover_interrupted_pause_state")
                     .trigger(SandboxEventTrigger::System)
-                    .with_from_state(SandboxState::Pausing.as_str())
-                    .with_to_state(target.sandbox_state().as_str()),
+                    .with_from_status(SandboxState::Pausing)
+                    .with_to_status(target.sandbox_state()),
             );
         }
         Ok(crate::db::StartupRecoveryRecord {
@@ -1038,7 +1038,7 @@ impl SandboxManagerService {
                             .reason(origin.event_reason())
                             .error(error.to_string())
                             .logged_by_caller()
-                            .with_from_state(row.state.to_string())
+                            .with_from_status(row.state)
                             .local_artifact_id(staged.local_artifact_id.to_string())
                             .artifact_kind("full")
                             .artifact_origin("suspend")
@@ -1089,8 +1089,8 @@ impl SandboxManagerService {
                         SandboxEventDetails::default()
                             .trigger(SandboxEventTrigger::System)
                             .reason(origin.runtime_live_event_reason())
-                            .with_from_state(row.state.to_string())
-                            .with_to_state(SandboxState::Paused.to_string()),
+                            .with_from_status(row.state)
+                            .with_to_status(SandboxState::Paused),
                     );
                     return Ok(crate::db::StartupRecoveryRecord {
                         id: row.id,
@@ -1138,8 +1138,8 @@ impl SandboxManagerService {
                     SandboxEventDetails::default()
                         .trigger(SandboxEventTrigger::System)
                         .reason(crate::db::SUSPEND_PUBLISH_FAILED_NO_ARTIFACT_RUNTIME_GONE)
-                        .with_from_state(row.state.to_string())
-                        .with_to_state(SandboxState::Quarantined.to_string()),
+                        .with_from_status(row.state)
+                        .with_to_status(SandboxState::Quarantined),
                 );
                 Ok(crate::db::StartupRecoveryRecord {
                     id: row.id,
@@ -1200,8 +1200,8 @@ impl SandboxManagerService {
             SandboxEventDetails::default()
                 .trigger(SandboxEventTrigger::System)
                 .reason(origin.event_reason())
-                .with_from_state(row.state.to_string())
-                .with_to_state(SandboxState::CleanupRequired.to_string())
+                .with_from_status(row.state)
+                .with_to_status(SandboxState::CleanupRequired)
                 .local_artifact_id(local_artifact_id.to_string())
                 .artifact_kind("full")
                 .artifact_origin("suspend")

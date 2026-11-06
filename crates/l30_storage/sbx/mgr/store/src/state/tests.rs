@@ -239,3 +239,24 @@ fn failed_is_readable_and_only_explicit_deletion_can_exit_it() {
         );
     }
 }
+
+#[test]
+fn status_event_details_carry_the_cleanup_each_status_folds_in() {
+    use pplx_space_events::SandboxEventDetails;
+
+    use super::{SandboxState, SandboxStatusEventDetails};
+
+    for (status, cleanup_state) in [
+        (SandboxState::Stopping, "none"),
+        (SandboxState::CleanupRequired, "required"),
+        (SandboxState::CleanupFailed, "failed"),
+    ] {
+        let details = SandboxEventDetails::default()
+            .with_from_status(status)
+            .with_to_status(status);
+        assert_eq!(details.from_state.as_deref(), Some(status.as_str()));
+        assert_eq!(details.to_state.as_deref(), Some(status.as_str()));
+        assert_eq!(details.from_cleanup_state.as_deref(), Some(cleanup_state));
+        assert_eq!(details.to_cleanup_state.as_deref(), Some(cleanup_state));
+    }
+}

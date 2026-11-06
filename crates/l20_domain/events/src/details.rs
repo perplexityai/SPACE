@@ -22,6 +22,13 @@ pub struct SandboxEventDetails {
     pub trigger: Option<String>,
     pub from_state: Option<String>,
     pub to_state: Option<String>,
+    /// The cleanup that owned the sandbox before and after the transition
+    /// (`none`, `required`, `failed`, or `unknown` when the emitter could not
+    /// read it). Sandbox-manager sets these next to `from_state`/`to_state`,
+    /// which still fold an owning cleanup into `cleanup_required` or
+    /// `cleanup_failed`.
+    pub from_cleanup_state: Option<String>,
+    pub to_cleanup_state: Option<String>,
     pub target_state: Option<String>,
     pub lifecycle_state: Option<String>,
     pub placement: Option<String>,
@@ -167,6 +174,8 @@ impl SandboxEventDetails {
         error_kind,
         operation,
         reason,
+        from_cleanup_state,
+        to_cleanup_state,
         target_state,
         lifecycle_state,
         placement,

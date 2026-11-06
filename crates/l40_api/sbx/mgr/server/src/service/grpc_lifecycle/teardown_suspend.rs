@@ -410,7 +410,7 @@ impl SandboxManagerService {
                 SandboxEventType::ExecutionSuspendRequested,
                 SandboxEventSource::SbxManager,
                 teardown_suspend_event_details(execution_generation, event_trigger)
-                    .with_from_state(SandboxState::Suspended.to_string()),
+                    .with_from_status(SandboxState::Suspended),
             );
         }
         if status.is_durable_for(execution_generation) {
@@ -1240,7 +1240,7 @@ impl SandboxManagerService {
                 SandboxEventSource::SbxManager,
                 teardown_suspend_event_details(execution_generation, event_trigger)
                     .result("durable")
-                    .with_to_state(SandboxState::Suspended.to_string()),
+                    .with_to_status(SandboxState::Suspended),
             );
         }
         Ok(())

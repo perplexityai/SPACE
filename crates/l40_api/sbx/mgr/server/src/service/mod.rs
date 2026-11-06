@@ -153,7 +153,7 @@ use crate::proto::{
     WaitRequest, WaitResponse, WakeRequest, WakeResponse, WakeTransition, spaced_write_request,
 };
 use crate::runtime_reconciliation::{mark_quarantined_best_effort, observe_vm_state};
-use crate::state::SandboxState;
+use crate::state::{SandboxState, SandboxStatusEventDetails};
 use pplx_space_node_runtime_core::vm_state::VmState;
 
 type BoxedStatusStream<T> = Pin<Box<dyn tokio_stream::Stream<Item = Result<T, Status>> + Send>>;

@@ -401,7 +401,7 @@ impl SandboxManagerService {
             sandbox_id,
             reason,
             pplx_space_events::SandboxEventDetails::default()
-                .with_from_state(crate::state::SandboxState::Suspending.as_str())
+                .with_from_status(crate::state::SandboxState::Suspending)
                 .local_artifact_id(staged_artifact.to_string())
                 .execution_generation(execution_generation.to_string()),
             &result,
@@ -873,7 +873,7 @@ impl SandboxManagerService {
                 &sandbox_id,
                 reason,
                 pplx_space_events::SandboxEventDetails::default()
-                    .with_from_state(state_before.as_str())
+                    .with_from_status(state_before)
                     .local_path(cache_dir),
                 &result,
                 "cluster-deleted eviction: local delete failed; row left in deleting for \
