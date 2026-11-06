@@ -9009,12 +9009,13 @@ async fn set_drain_state(
         .bind(node_id)
         .fetch_one(pool)
         .await?;
-        assert!(
-            stored.drain_phase.is_none()
-                && stored.drain_mode.is_none()
-                && stored.drain_started_at.is_none()
-                && stored.drain_last_error.is_some(),
-            "only drain_last_error must be set before the upsert: {stored:?}"
+        assert_eq!(
+            stored,
+            NodeDrainColumns {
+                drain_last_error: Some("uncordon failed after undrain".to_owned()),
+                ..NodeDrainColumns::CLEARED
+            },
+            "only drain_last_error must be set before the upsert"
         );
         return Ok(stored);
     };
@@ -9032,12 +9033,17 @@ async fn set_drain_state(
     .bind(NODE_DRAIN_MODE_GENTLE)
     .fetch_one(pool)
     .await?;
-    assert!(
-        stored.drain_phase.is_some()
-            && stored.drain_mode.is_some()
-            && stored.drain_started_at.is_some()
-            && stored.drain_last_error.is_some(),
-        "every drain column must be set before the upsert: {stored:?}"
+    assert_eq!(
+        stored,
+        NodeDrainColumns {
+            drain_phase: Some(phase.as_str().to_owned()),
+            drain_mode: Some(NODE_DRAIN_MODE_GENTLE.to_owned()),
+            drain_started_at: Some(
+                OffsetDateTime::from_unix_timestamp(1_704_067_200).expect("2024-01-01T00:00:00Z"),
+            ),
+            drain_last_error: Some("pre-existing operator note".to_owned()),
+        },
+        "every drain column must hold its seeded value before the upsert"
     );
     Ok(stored)
 }
