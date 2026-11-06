@@ -649,9 +649,11 @@ impl ProcessSseState {
     /// outside the retained output, behind one
     /// `resync_required(cursor_out_of_window)` for the gap: from the start of
     /// the output when the cursor was past its end, and from the oldest output
-    /// the guest still retains when it reports it. The stream follows the live
-    /// tail instead when the guest does not report it, or when the stream
-    /// already moved there and fell behind again before any output. After
+    /// the guest still retains when it reports it, or, from a guest too old to
+    /// report it, when the process has exited and the stream can find it
+    /// ([`exited_process_retained_start`]). The stream follows the live tail
+    /// instead when neither applies, or when the stream already moved to the
+    /// oldest output and fell behind again before any output. After
     /// [`PROCESS_OUTPUT_WINDOW_REOPENS_WITHOUT_PROGRESS`] reopens, a cursor
     /// past the output, or a live tail that falls behind, ends the stream.
     async fn reopen_after_window_miss(&mut self, status: tonic::Status, miss: OutputWindowMiss) {
@@ -674,6 +676,28 @@ impl ProcessSseState {
             ) if first > cursor && !self.at_oldest_retained => {
                 self.continue_after_gap(Some(first), "output_evicted");
                 self.at_oldest_retained = true;
+            }
+            (
+                OutputWindowMiss::Evicted {
+                    first_retained: None,
+                },
+                Some(cursor),
+            ) if !self.at_oldest_retained => {
+                let first = tokio::time::timeout(
+                    RETAINED_START_SEARCH_TIMEOUT,
+                    exited_process_retained_start(
+                        &mut self.client,
+                        &self.attached.sandbox_id,
+                        &process_id,
+                        self.attached.space_api_route_token.as_ref(),
+                        cursor,
+                    ),
+                )
+                .await
+                .ok()
+                .flatten();
+                self.continue_after_gap(first, "output_evicted");
+                self.at_oldest_retained = first.is_some();
             }
             (OutputWindowMiss::Evicted { .. }, Some(_)) => {
                 self.continue_after_gap(None, "output_evicted");
@@ -1026,6 +1050,120 @@ fn output_window_miss(status: &tonic::Status) -> Option<OutputWindowMiss> {
             })
         }
         _ => None,
+    }
+}
+
+/// How long one answer of [`exited_process_retained_start`] may take, and how
+/// long its whole search may: a few dozen connects at most, each a round trip
+/// to the guest, so a guest slower than this follows the live tail instead.
+const RETAINED_START_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+const RETAINED_START_SEARCH_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Where the output that an exited process still retains starts, asked of a
+/// guest too old to say so: it ends a stream from an evicted cursor with a
+/// RESOURCE_EXHAUSTED that names no position. Once the process has exited
+/// that output no longer changes, so its start is the lowest cursor the guest
+/// does not answer as evicted, and `evicted`, a cursor it did, is below it.
+/// The search doubles a step from `evicted` until a cursor is retained (or
+/// past the output, which such a guest answers with the exit), then bisects,
+/// one connect per cursor. Such a guest lists only running processes, so one
+/// it lists is still running; that, or any answer other than these, gives
+/// `None`, and the stream follows the live tail as before.
+async fn exited_process_retained_start(
+    client: &mut WorkerApiClient<GrpcClientTrace<Channel>>,
+    sandbox_id: &SandboxId,
+    process_id: &ProcessId,
+    route_token: Option<&SpaceApiRouteTokenState>,
+    evicted: u64,
+) -> Option<u64> {
+    let request = node_api_request_with_timeout_and_route_token_state(
+        SpacedListProcessesRequest {
+            sandbox_id: sandbox_id.to_string(),
+            operation: Some(ListProcessesRequest {
+                include_exited: false,
+                process_id: Some(process_id.to_string()),
+            }),
+        },
+        RETAINED_START_PROBE_TIMEOUT,
+        route_token,
+    )
+    .ok()?;
+    let running = client
+        .spaced_list_processes(request)
+        .await
+        .ok()?
+        .into_inner();
+    if running
+        .processes
+        .iter()
+        .any(|process| process.process_id == process_id.as_str())
+    {
+        return None;
+    }
+    let mut below = evicted;
+    let mut step = 1_u64;
+    let mut retained = loop {
+        let cursor = below
+            .checked_add(step)
+            .filter(|cursor| *cursor <= PROCESS_EVENT_ID_MAX_POSITION)?;
+        if output_retained_at(client, sandbox_id, process_id, route_token, cursor).await? {
+            break cursor;
+        }
+        below = cursor;
+        step = step.checked_mul(2)?;
+    };
+    while retained - below > 1 {
+        let cursor = below + (retained - below) / 2;
+        if output_retained_at(client, sandbox_id, process_id, route_token, cursor).await? {
+            retained = cursor;
+        } else {
+            below = cursor;
+        }
+    }
+    tracing::info!(
+        evicted,
+        first_retained = retained,
+        "located an exited process's retained output on a guest that does not report it"
+    );
+    Some(retained)
+}
+
+/// Whether a guest that does not name its retained output keeps the output at
+/// `cursor` of an exited process: `Some(false)` when it answers as evicted,
+/// `Some(true)` when it sends output, the exit, or says the cursor is past
+/// the output, and `None` for any other answer.
+async fn output_retained_at(
+    client: &mut WorkerApiClient<GrpcClientTrace<Channel>>,
+    sandbox_id: &SandboxId,
+    process_id: &ProcessId,
+    route_token: Option<&SpaceApiRouteTokenState>,
+    cursor: u64,
+) -> Option<bool> {
+    let mut stream = tokio::time::timeout(
+        RETAINED_START_PROBE_TIMEOUT,
+        connect_process_stream(client, sandbox_id, process_id, Some(cursor), route_token),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    loop {
+        let event = tokio::time::timeout(RETAINED_START_PROBE_TIMEOUT, stream.next())
+            .await
+            .ok()??;
+        match event {
+            Ok(event) => match event.event {
+                Some(spaced_process_event::Event::Started(_))
+                | Some(spaced_process_event::Event::Connected(_)) => {}
+                Some(_) => return Some(true),
+                None => return None,
+            },
+            Err(status) => {
+                return match output_window_miss(&status)? {
+                    OutputWindowMiss::Evicted { .. } => Some(false),
+                    OutputWindowMiss::CursorAhead => Some(true),
+                };
+            }
+        }
     }
 }
 
