@@ -1072,28 +1072,32 @@ func releaseLegacyTaskTeardown(ctx context.Context, client pb.SandboxManagerClie
 	if err != nil {
 		return false, err
 	}
+	owned, err := cleanupOwned(sandbox, lifecycle)
+	if err != nil {
+		return false, err
+	}
 	stop := false
-	switch lifecycle {
-	case pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_STOPPED,
-		pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_STOPPING:
-		stop = true
-	case pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_CLEANUP_REQUIRED,
-		pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_CLEANUP_FAILED:
+	switch {
+	case owned:
 		// The recorded completion says what the cleanup returns the row to.
 		// MARK_SUSPENDED releases the task, and MARK_STOPPED does unless this
 		// task's own Kill issued the stop. Every other completion, and a node
 		// too old to report one, still falls through to the destructive call.
-		// Only these states read it: on other rows a completion can be an
-		// armed activation's rollback target, published while the start runs.
+		// Only cleanup-owned rows read it: on other rows a completion can be
+		// an armed activation's rollback target, published while the start
+		// runs.
 		switch sandbox.GetCleanup().GetCompletion() {
 		case pb.SandboxCleanupCompletion_SANDBOX_CLEANUP_COMPLETION_MARK_STOPPED:
 			stop = true
 		case pb.SandboxCleanupCompletion_SANDBOX_CLEANUP_COMPLETION_MARK_SUSPENDED:
 			return true, nil
 		}
-	case pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_SUSPENDING,
-		pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_SUSPENDED,
-		pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_RESTORING:
+	case lifecycle == pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_STOPPED,
+		lifecycle == pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_STOPPING:
+		stop = true
+	case lifecycle == pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_SUSPENDING,
+		lifecycle == pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_SUSPENDED,
+		lifecycle == pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_RESTORING:
 		return true, nil
 	}
 	// Any cleanup that returns the row to STOPPED (a user's STOP, an
@@ -1133,6 +1137,24 @@ func releaseLegacyTaskTeardown(ctx context.Context, client pb.SandboxManagerClie
 	return false, nil
 }
 
+// cleanupOwned reports whether a node-local cleanup owns the row: the
+// lifecycle says so, as older nodes publish it, or the cleanup state does,
+// whatever teardown transition the lifecycle names. A cleanup state this
+// build doesn't know can't authorize teardown, as an unknown lifecycle can't
+// (observedSandboxLifecycle), so it is an error.
+func cleanupOwned(sandbox *pb.SandboxInfo, lifecycle pb.SandboxLifecycleState) (bool, error) {
+	state := sandbox.GetCleanup().GetState()
+	if _, known := pb.SandboxCleanupState_name[int32(state)]; !known {
+		return false, status.Errorf(codes.FailedPrecondition, "unknown sandbox cleanup state value %d", state)
+	}
+	switch lifecycle {
+	case pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_CLEANUP_REQUIRED,
+		pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_CLEANUP_FAILED:
+		return true, nil
+	}
+	return state != pb.SandboxCleanupState_SANDBOX_CLEANUP_STATE_UNSPECIFIED, nil
+}
+
 func firstSandboxState(resp *pb.StateResponse) *pb.SandboxInfo {
 	if resp == nil {
 		return nil
@@ -1165,6 +1187,15 @@ func stoppedRestartCheckpoint(ctx context.Context, client pb.SandboxManagerClien
 		lifecycle, err := observedSandboxLifecycle(sandbox)
 		if err != nil {
 			return nil, err
+		}
+		owned, err := cleanupOwned(sandbox, lifecycle)
+		if err != nil {
+			return nil, err
+		}
+		if owned {
+			// A cleanup owns the row whatever transition it reports, so it
+			// is refused as CLEANUP_REQUIRED and CLEANUP_FAILED always were.
+			return nil, status.Errorf(codes.FailedPrecondition, "stopped restart cannot use local lifecycle %s", lifecycle)
 		}
 		switch lifecycle {
 		case pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_STOPPED:
