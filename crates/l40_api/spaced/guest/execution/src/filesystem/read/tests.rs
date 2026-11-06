@@ -35,8 +35,8 @@ async fn fifo_read_rejects_without_a_writer_and_returns_admission() {
             .expect("release blocked reader");
     }
     assert!(
-        matches!(result, Ok(Err(_))),
-        "FIFO must fail without waiting for a writer"
+        matches!(&result, Ok(Err(status)) if refused_for_its_kind(status)),
+        "FIFO must be refused for its kind without waiting for a writer"
     );
     assert_eq!(slots.available_permits(), 1);
     let regular = directory.path().join("regular");
@@ -61,6 +61,39 @@ async fn fifo_read_rejects_without_a_writer_and_returns_admission() {
     );
     assert!(stream.next().await.is_none());
     assert_eq!(slots.available_permits(), 1);
+}
+
+// A socket cannot be opened as a file; the read is refused for the path's
+// kind, not reported as a guest fault, and returns its admission.
+#[tokio::test]
+async fn socket_read_is_refused_as_a_precondition() {
+    let directory = tempfile::tempdir().expect("directory");
+    let path = directory.path().join("socket");
+    let _listener = std::os::unix::net::UnixListener::bind(&path).expect("socket");
+    let slots = Arc::new(tokio::sync::Semaphore::new(1));
+    let status = read_stream(
+        GuestPath::parse(path.display().to_string()).expect("path"),
+        0,
+        None,
+        slots.clone().try_acquire_owned().expect("admission"),
+        tokio_util::task::TaskTracker::new(),
+        tokio_util::sync::CancellationToken::new(),
+    )
+    .await
+    .err()
+    .expect("a socket is not read");
+    assert!(refused_for_its_kind(&status), "{status:?}");
+    assert_eq!(slots.available_permits(), 1);
+}
+
+/// A FAILED_PRECONDITION the guest marks as its refusal of the path's kind.
+fn refused_for_its_kind(status: &tonic::Status) -> bool {
+    status.code() == tonic::Code::FailedPrecondition
+        && status
+            .metadata()
+            .get(pplx_space_common_core::spaced::ERROR_REASON_METADATA_KEY)
+            .and_then(|reason| reason.to_str().ok())
+            == Some(pplx_space_common_core::spaced::GUEST_PATH_REFUSED)
 }
 
 // A read whose reader has stopped taking chunks still ends when `ended`

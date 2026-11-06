@@ -9,16 +9,17 @@ use axum::{
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
 };
-use futures_util::{StreamExt, stream};
+use futures_util::{Stream, StreamExt, stream};
 use pplx_space_common_core::types::IdempotencyKey;
 use pplx_space_metrics::sandbox::api::SandboxApiMetricIdentity;
 use pplx_space_native_files::{
     BatchEntry, FileCallFailure, admit_list_entry, decode_write_batch_entries, decode_write_chunks,
     guest_key, list_depth, parse_guest_path, parse_guest_user, public_file_info,
-    shared_spaced_write_requests, spaced_write_requests, validate_modified_filters,
+    shared_spaced_write_requests, spaced_write_requests, start_read, validate_modified_filters,
     validate_read_length, validate_tracking_enabled, validate_write_batch_shape,
     write_creating_parents,
 };
+use pplx_space_node_api_client::NodeApiOperationBudget;
 use pplx_space_public_api::routes::{
     CREATE_DIRECTORY, REMOVE_FILE, RENAME_FILE, WRITE_FILE, WRITE_FILE_BATCH,
 };
@@ -28,7 +29,9 @@ use pplx_space_public_api::{
     FileReadRequest, FileRemoveRequest, FileRenameRequest, FileStatRequest, FileStatResponse,
     FileWriteBatchRequest, FileWriteBatchResponse, FileWriteRequest, FileWriteResponse,
 };
-use pplx_space_sbx_mgr_client::proto::{SpacedMkdirRequest, SpacedWriteBatchEntry};
+use pplx_space_sbx_mgr_client::proto::{
+    SpacedFileChunk, SpacedMkdirRequest, SpacedWriteBatchEntry,
+};
 
 use crate::{
     controllers::ControllerError, middleware::auth::AuthOrg, models::Sandbox, routes::AppState,
@@ -138,6 +141,22 @@ pub async fn read_file(
         )
         .await
         .map_err(controller_error)?;
+    read_response(stream).await
+}
+
+/// The response to a read whose stream the sandbox opened. It starts once the
+/// first chunk arrives, so a read refused before then answers with its
+/// failure rather than a 200.
+async fn read_response(
+    stream: impl Stream<Item = Result<SpacedFileChunk, tonic::Status>> + Send + Unpin + 'static,
+) -> Result<Response, PublicApiError> {
+    let stream = start_read(
+        stream,
+        NodeApiOperationBudget::FilesystemTransferOpen.timeout(),
+    )
+    .await
+    .map_err(ControllerError::from)
+    .map_err(controller_error)?;
     let stream = stream.map(|chunk| {
         chunk.map(|chunk| chunk.data).map_err(|status| {
             // The 200 and part of the body are already sent, so only the

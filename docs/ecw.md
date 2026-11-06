@@ -313,6 +313,12 @@ Stdin input and signals have no such protection, and resending them can
 deliver them twice. A sandbox at capacity still refuses before starting
 anything with `429` and `Retry-After`.
 
+`GET /files` starts its `200` once the guest sends the file's first bytes,
+waiting up to 120 seconds for them, so a read that fails before then answers
+with that failure instead of an aborted body. A path the guest cannot read as a
+file, such as a directory, a FIFO or a socket, answers `400` with the guest's
+reason.
+
 `POST /files` accepts `multipart/form-data` and `application/octet-stream`
 uploads of up to 256 MiB per request, which the data plane streams to a spool
 file rather than holding in memory. For multipart, the 256 MiB includes part

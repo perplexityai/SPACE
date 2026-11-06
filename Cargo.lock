@@ -6183,6 +6183,7 @@ name = "pplx-space-native-files"
 version = "0.8.1"
 dependencies = [
  "base64 0.23.1",
+ "futures-util",
  "hex",
  "http 1.5.0",
  "pplx-space-common-core",
@@ -6196,6 +6197,7 @@ dependencies = [
  "sha2 0.11.0",
  "thiserror 2.0.20",
  "time",
+ "tokio",
  "tonic",
  "tracing",
 ]

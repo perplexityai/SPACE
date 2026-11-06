@@ -12,12 +12,14 @@ workspace = true
 
 [dependencies]
 base64 = { workspace = true }
+futures-util = { workspace = true }
 hex = { workspace = true }
 http = { workspace = true }
 prost-types = { workspace = true }
 sha2 = { workspace = true }
 thiserror = { workspace = true }
 time = { workspace = true, features = ["formatting", "parsing"] }
+tokio = { workspace = true, features = ["time"] }
 tonic = { workspace = true }
 tracing = { workspace = true }
 
@@ -29,3 +31,6 @@ pplx-space-metrics = { workspace = true }
 pplx-space-public-api = { workspace = true }
 pplx-space-public-api-http = { workspace = true }
 pplx-space-sbx-mgr-protocol = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "test-util"] }

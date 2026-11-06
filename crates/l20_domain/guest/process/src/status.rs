@@ -13,6 +13,12 @@ pub const GUEST_STORAGE_FULL: &str = "guest-storage-full";
 /// as opposed to the sandbox or its runtime being unknown to a hop.
 pub const GUEST_PATH_NOT_FOUND: &str = "guest-path-not-found";
 
+/// [`ERROR_REASON_METADATA_KEY`] value of a FAILED_PRECONDITION that is the
+/// guest filesystem refusing to read the requested path for what it is (a
+/// FIFO, a terminal or a socket), as opposed to a hop finding the sandbox
+/// unable to take the call.
+pub const GUEST_PATH_REFUSED: &str = "guest-path-refused";
+
 /// [`ERROR_REASON_METADATA_KEY`] value of an OUT_OF_RANGE that ends a
 /// process output stream whose cursor is past the output the process has
 /// written, as opposed to a message too large for a hop to decode.
