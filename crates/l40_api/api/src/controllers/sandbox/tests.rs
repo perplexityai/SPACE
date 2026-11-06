@@ -1382,6 +1382,7 @@ mod response_tests {
             id: SandboxId::from_uuid(Uuid::nil()),
             name: None,
             user_id: UserId::from_uuid(Uuid::nil()),
+            user_email: None,
             org_id: OrgId::from_uuid(Uuid::nil()),
             owner_source: SandboxOwnerSource::Local,
             upstream_issuer: None,
@@ -1537,7 +1538,7 @@ mod response_tests {
         let mut observed = observed_network_policy("template", 1);
         observed.pool_template = Some("seed".to_string());
 
-        let response = observed_only_sandbox_response(&observed);
+        let response = observed_only_sandbox_response(&observed, None);
 
         assert_eq!(response.resource_type, SandboxResourceType::PoolSlot);
     }
@@ -1547,7 +1548,7 @@ mod response_tests {
         let mut observed = observed_network_policy("template", 1);
         observed.image_hash = Some("sha256:observed".to_string());
 
-        let response = observed_only_sandbox_response(&observed);
+        let response = observed_only_sandbox_response(&observed, None);
 
         assert_eq!(response.content_hash.as_deref(), Some("sha256:observed"));
     }
@@ -1557,7 +1558,7 @@ mod response_tests {
         let mut observed = observed_network_policy("template", 1);
         observed.release_tags = vec!["latest".to_string(), "stable".to_string()];
 
-        let response = observed_only_sandbox_response(&observed);
+        let response = observed_only_sandbox_response(&observed, None);
 
         assert_eq!(response.release_tags, observed.release_tags);
     }
@@ -1567,7 +1568,7 @@ mod response_tests {
         let mut observed = observed_network_policy("template", 1);
         observed.observed_created_at = Some("60".to_string());
 
-        let response = observed_only_sandbox_response(&observed);
+        let response = observed_only_sandbox_response(&observed, None);
 
         assert_eq!(response.resource_type, SandboxResourceType::ObservedLocal);
         assert_eq!(

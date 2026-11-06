@@ -7,10 +7,25 @@
 //! budget the same way. The admin route's legacy unpaged array has no cursor
 //! to continue from, so it runs a plain list statement with the same filters
 //! and no size walk.
+//!
+//! A [`SandboxSearch`] runs its own pair of statements, the same filters
+//! with the search required rather than optional. The other filters are
+//! written `$n IS NULL OR ...`, which a generic plan cannot drop, so it reads
+//! the list in `created_at` order and tests every row. That is cheap for a
+//! filter most rows pass and for a page that fills early, but a search
+//! usually matches a few rows of a large table, and walking the table to find
+//! them reads all of it. Required, the search's two ranges are index
+//! conditions on `idx_sandboxes_id_suffix` and the primary key under either
+//! plan. They are read first, in a `MATERIALIZED` CTE, and the other filters
+//! and the cursor apply to those rows only: unfenced, a generic plan ANDs the
+//! search's bitmap with one for the cursor's `created_at` bound, which on the
+//! first page holds every row. So a search reads the rows it matches and
+//! sorts those (`search_plan_tests`).
 
 use std::str::FromStr;
 use std::sync::LazyLock;
 
+use pplx_space_cluster_pool::WarmPoolStore;
 use pplx_space_common_core::sql;
 use pplx_space_common_core::types::{
     NodeId, OrgId, SandboxId, SandboxLifecycle, SandboxLifecycleParseError, SemVer, TemplateName,
@@ -26,7 +41,7 @@ use super::super::org::{ScopedPageRow, scoped_page_sql};
 use super::{ListPage, PageWalkParams, SANDBOX_LIST_ROW_OVERHEAD_BYTES};
 use crate::controllers::sandbox::{SandboxController, SandboxPageCursor, sandbox_query};
 use crate::controllers::substrate::direct::reported_node::{reported_on_a_node, reported_on_node};
-use crate::controllers::{ControllerError, db_contention_error};
+use crate::controllers::{ControllerError, db_contention_error, pool_store_error};
 use crate::models::{Sandbox, SandboxResourceType};
 
 const DELETED_LIFECYCLE: &str = "deleted";
@@ -88,6 +103,8 @@ pub struct AdminSandboxFilter {
     pub created_before: Option<OffsetDateTime>,
     /// Sandbox rows only: a prefix can start a node-reported row's ID, but
     /// like every filter it leaves those rows out.
+    pub prefix: Option<SandboxPrefix>,
+    /// Sandbox rows only, as `prefix`.
     pub search: Option<SandboxSearch>,
 }
 
@@ -108,6 +125,7 @@ impl AdminSandboxFilter {
             user_id,
             created_after,
             created_before,
+            prefix,
             search,
         } = self;
         org_id.is_none()
@@ -117,6 +135,7 @@ impl AdminSandboxFilter {
             && user_id.is_none()
             && created_after.is_none()
             && created_before.is_none()
+            && prefix.is_none()
             && search.is_none()
     }
 }
@@ -138,7 +157,7 @@ pub enum NodeAssignment {
 /// where a UUID has them, is the start of its ID. The node-reported rows
 /// never match (see [`AdminSandboxFilter::is_unfiltered`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SandboxSearch {
+pub struct SandboxPrefix {
     prefix: String,
     /// The lowest and highest IDs that start with the prefix, when it can
     /// start an ID. Postgres compares UUIDs byte by byte, so a hex prefix is
@@ -146,11 +165,109 @@ pub struct SandboxSearch {
     id_range: Option<(SandboxId, SandboxId)>,
 }
 
-impl SandboxSearch {
+impl SandboxPrefix {
     pub fn new(prefix: String) -> Self {
         let id_range = id_prefix_range(&prefix);
         Self { prefix, id_range }
     }
+}
+
+/// What the console's search box finds: a sandbox row whose ID ends or starts
+/// with the text's hex digits. The ID's end is what the console labels a
+/// sandbox with, since a UUIDv7 starts with its creation time. Names are
+/// matched by [`SandboxPrefix`] instead.
+///
+/// The text is trimmed, and its hex digits are those left after an optional
+/// `sbx_` in either case and its dashes; any other character, or fewer than
+/// [`MIN_ID_SUFFIX_DIGITS`] or more than 32 digits, is [`NotAnIdSearch`]. IDs
+/// that end with them match from [`MIN_ID_SUFFIX_DIGITS`] digits, which are
+/// random. IDs that start with them match from [`MIN_ID_PREFIX_DIGITS`]: a
+/// UUIDv7 starts with its creation time in milliseconds, so four digits span
+/// about 50 days of sandboxes and eight about a minute. The node-reported
+/// rows never match (see [`AdminSandboxFilter::is_unfiltered`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SandboxSearch {
+    /// The IDs ending in the digits, as a range of their undashed hex
+    /// reversed (`idx_sandboxes_id_suffix`): at least the reversed digits and
+    /// below them with their last digit incremented.
+    id_suffix: (String, String),
+    /// The lowest and highest IDs that start with the digits, when there are
+    /// at least [`MIN_ID_PREFIX_DIGITS`] of them.
+    id_prefix: Option<(SandboxId, SandboxId)>,
+}
+
+/// A search text that, once trimmed, is not [`MIN_ID_SUFFIX_DIGITS`] to 32
+/// of an ID's hex digits (see [`SandboxSearch`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "search takes {MIN_ID_SUFFIX_DIGITS} to {UNDASHED_UUID_LEN} hex digits of a sandbox ID, after \
+     an optional sbx_ and with dashes left out: IDs that end with them match, and from \
+     {MIN_ID_PREFIX_DIGITS} digits IDs that start with them too. To match the start of a name, \
+     use prefix, which is case-sensitive"
+)]
+pub struct NotAnIdSearch;
+
+impl SandboxSearch {
+    /// `None` for a text that is empty once trimmed, which is no search.
+    pub fn new(text: &str) -> Result<Option<Self>, NotAnIdSearch> {
+        let text = text.trim();
+        if text.is_empty() {
+            return Ok(None);
+        }
+        let hex = id_hex(text).ok_or(NotAnIdSearch)?;
+        let id_prefix = if hex.len() >= MIN_ID_PREFIX_DIGITS {
+            hex_prefix_range(&hex)
+        } else {
+            None
+        };
+        Ok(Some(Self {
+            id_suffix: id_suffix_range(&hex),
+            id_prefix,
+        }))
+    }
+}
+
+const MIN_ID_SUFFIX_DIGITS: usize = 4;
+const MIN_ID_PREFIX_DIGITS: usize = 8;
+
+/// The text's hex digits, lowercased, when after an optional `sbx_` and
+/// without its dashes it is [`MIN_ID_SUFFIX_DIGITS`] to 32 of them.
+fn id_hex(text: &str) -> Option<String> {
+    let marker = PUBLIC_SANDBOX_ID_PREFIX.len();
+    let id = match (text.get(..marker), text.get(marker..)) {
+        (Some(prefix), Some(rest)) if prefix.eq_ignore_ascii_case(PUBLIC_SANDBOX_ID_PREFIX) => rest,
+        _ => text,
+    };
+    let hex = id
+        .chars()
+        .filter(|character| *character != '-')
+        .map(|character| character.to_ascii_lowercase())
+        .collect::<String>();
+    ((MIN_ID_SUFFIX_DIGITS..=UNDASHED_UUID_LEN).contains(&hex.len())
+        && hex.chars().all(|character| character.is_ascii_hexdigit()))
+    .then_some(hex)
+}
+
+/// The reversed digits, and the least key above every key that starts with
+/// them. The digits are ASCII, so that is them with their last byte
+/// incremented: `9` becomes `:` and `f` becomes `g`.
+fn id_suffix_range(hex: &str) -> (String, String) {
+    let low = hex.bytes().rev().collect::<Vec<_>>();
+    let mut high = low.clone();
+    if let Some(last) = high.last_mut() {
+        *last += 1;
+    }
+    let text = |bytes: Vec<u8>| bytes.into_iter().map(char::from).collect::<String>();
+    (text(low), text(high))
+}
+
+fn hex_prefix_range(hex: &str) -> Option<(SandboxId, SandboxId)> {
+    let bound = |fill: char| {
+        let mut digits = hex.to_string();
+        digits.extend(std::iter::repeat_n(fill, UNDASHED_UUID_LEN - hex.len()));
+        Uuid::try_parse(&digits).ok().map(SandboxId::from_uuid)
+    };
+    Some((bound('0')?, bound('f')?))
 }
 
 const DASHED_UUID_DASH_POSITIONS: [usize; 4] = [8, 13, 18, 23];
@@ -254,6 +371,100 @@ static ADMIN_LIST_SQL: LazyLock<String> = LazyLock::new(|| {
     ))
 });
 
+/// [`ADMIN_CANDIDATE_ROWS`] with a [`SandboxSearch`] ($12-$15) required: the
+/// sandboxes whose ID ends or starts with its hex digits.
+///
+/// The suffix arm reads `idx_sandboxes_id_suffix` in [$12, $13), the
+/// reversed digits' range; the prefix arm reads the primary key in [$14,
+/// $15], which is NULL for too few digits to start an ID with (see
+/// [`SandboxSearch`]).
+static ADMIN_SEARCH_CANDIDATE_ROWS: LazyLock<String> = LazyLock::new(|| {
+    let on_node = reported_on_node("s", "$10");
+    let on_a_node = reported_on_a_node("s");
+    format!(
+        "WITH matches AS MATERIALIZED (
+             SELECT matched.id
+             FROM sandboxes matched
+             WHERE (reverse(replace(matched.id::text, '-', '')) COLLATE \"C\" >= $12
+                    AND reverse(replace(matched.id::text, '-', '')) COLLATE \"C\" < $13)
+                OR matched.id BETWEEN $14::UUID AND $15::UUID
+         )
+         SELECT s.id, s.created_at
+         FROM matches
+         JOIN sandboxes s ON s.id = matches.id
+         WHERE ($1::UUID IS NULL OR s.org_id = $1)
+           AND ($2::TEXT[] IS NULL OR s.lifecycle = ANY($2::TEXT[]))
+           AND ($3::TEXT IS NULL OR s.template_id = $3)
+           AND ($4::UUID IS NULL OR s.user_id = $4)
+           AND ($5::TIMESTAMPTZ IS NULL OR s.created_at > $5)
+           AND ($6::TIMESTAMPTZ IS NULL OR s.created_at < $6)
+           AND ($7::TEXT IS NULL
+                OR starts_with(s.name, $7)
+                OR s.id BETWEEN $8::UUID AND $9::UUID)
+           AND ($10::UUID IS NULL OR {on_node})
+           AND ($11::BOOLEAN IS NULL OR {on_a_node} = $11)
+           AND {{after_cursor}}
+         ORDER BY s.created_at DESC, s.id DESC
+         LIMIT {{max_rows}}"
+    )
+});
+
+static ADMIN_SEARCH_PAGE_SQL: LazyLock<String> = LazyLock::new(|| {
+    scoped_page_sql(
+        &ADMIN_SEARCH_CANDIDATE_ROWS,
+        &PageWalkParams {
+            cursor_created_at: "$16",
+            cursor_id: "$17",
+            max_rows: "$18",
+            max_bytes: "$19",
+            row_overhead_bytes: "$20",
+            lists_env: false,
+        },
+    )
+});
+
+/// [`ADMIN_LIST_SQL`] with a [`SandboxSearch`] required, as
+/// [`ADMIN_SEARCH_CANDIDATE_ROWS`] matches it ($12-$15): at most $16
+/// sandboxes. `listed` picks them by ID before their full rows are joined,
+/// as the page walk does, so a search that matches many rows sorts their IDs
+/// rather than their joined rows.
+static ADMIN_SEARCH_LIST_SQL: LazyLock<String> = LazyLock::new(|| {
+    let on_node = reported_on_node("s", "$10");
+    let on_a_node = reported_on_a_node("s");
+    sandbox_query(&format!(
+        "WITH matches AS MATERIALIZED (
+             SELECT matched.id
+             FROM sandboxes matched
+             WHERE (reverse(replace(matched.id::text, '-', '')) COLLATE \"C\" >= $12
+                    AND reverse(replace(matched.id::text, '-', '')) COLLATE \"C\" < $13)
+                OR matched.id BETWEEN $14::UUID AND $15::UUID
+         ),
+         listed AS MATERIALIZED (
+             SELECT s.id, s.created_at
+             FROM matches
+             JOIN sandboxes s ON s.id = matches.id
+             WHERE ($1::UUID IS NULL OR s.org_id = $1)
+               AND ($2::TEXT[] IS NULL OR s.lifecycle = ANY($2::TEXT[]))
+               AND ($3::TEXT IS NULL OR s.template_id = $3)
+               AND ($4::UUID IS NULL OR s.user_id = $4)
+               AND ($5::TIMESTAMPTZ IS NULL OR s.created_at > $5)
+               AND ($6::TIMESTAMPTZ IS NULL OR s.created_at < $6)
+               AND ($7::TEXT IS NULL
+                    OR starts_with(s.name, $7)
+                    OR s.id BETWEEN $8::UUID AND $9::UUID)
+               AND ($10::UUID IS NULL OR {on_node})
+               AND ($11::BOOLEAN IS NULL OR {on_a_node} = $11)
+             ORDER BY s.created_at DESC, s.id DESC
+             LIMIT $16
+         )
+         SELECT {{sandbox_columns}}
+         FROM listed
+         JOIN sandboxes s ON s.id = listed.id
+         {{sandbox_join_tail}}
+         ORDER BY listed.created_at DESC, listed.id DESC"
+    ))
+});
+
 /// Whether a page stops at the list byte budget.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PageBudget {
@@ -291,6 +502,84 @@ struct SpacedVersionCountRow {
     count: i64,
 }
 
+/// The values of the filters every admin list statement binds as $1-$11.
+struct FilterBinds<'a> {
+    org_id: Option<OrgId>,
+    lifecycles: Option<Vec<&'static str>>,
+    template: Option<&'a str>,
+    user_id: Option<UserId>,
+    created_after: Option<OffsetDateTime>,
+    created_before: Option<OffsetDateTime>,
+    prefix: Option<&'a str>,
+    prefix_id_range: Option<(SandboxId, SandboxId)>,
+    node_id: Option<NodeId>,
+    assigned: Option<bool>,
+}
+
+impl<'a> FilterBinds<'a> {
+    fn new(filter: &'a AdminSandboxFilter) -> Self {
+        let (node_id, assigned) = match filter.node {
+            Some(NodeAssignment::Node(node_id)) => (Some(node_id), None),
+            Some(NodeAssignment::Assigned) => (None, Some(true)),
+            Some(NodeAssignment::Unassigned) => (None, Some(false)),
+            None => (None, None),
+        };
+        Self {
+            org_id: filter.org_id,
+            lifecycles: filter.lifecycles.as_ref().map(|lifecycles| {
+                lifecycles
+                    .iter()
+                    .map(|lifecycle| lifecycle.as_str())
+                    .collect()
+            }),
+            template: filter.template.as_ref().map(TemplateName::as_str),
+            user_id: filter.user_id,
+            created_after: filter.created_after,
+            created_before: filter.created_before,
+            prefix: filter.prefix.as_ref().map(|prefix| prefix.prefix.as_str()),
+            prefix_id_range: filter.prefix.as_ref().and_then(|prefix| prefix.id_range),
+            node_id,
+            assigned,
+        }
+    }
+
+    fn bind<'q, O>(
+        self,
+        query: sqlx::query::QueryAs<'q, sqlx::Postgres, O, sqlx::postgres::PgArguments>,
+    ) -> sqlx::query::QueryAs<'q, sqlx::Postgres, O, sqlx::postgres::PgArguments>
+    where
+        'a: 'q,
+    {
+        query
+            .bind(self.org_id)
+            .bind(self.lifecycles)
+            .bind(self.template)
+            .bind(self.user_id)
+            .bind(self.created_after)
+            .bind(self.created_before)
+            .bind(self.prefix)
+            .bind(self.prefix_id_range.map(|(low, _)| low))
+            .bind(self.prefix_id_range.map(|(_, high)| high))
+            .bind(self.node_id)
+            .bind(self.assigned)
+    }
+}
+
+impl SandboxSearch {
+    /// Binds the search's ranges as a search statement's $12-$15.
+    fn bind<'q, O>(
+        &'q self,
+        query: sqlx::query::QueryAs<'q, sqlx::Postgres, O, sqlx::postgres::PgArguments>,
+    ) -> sqlx::query::QueryAs<'q, sqlx::Postgres, O, sqlx::postgres::PgArguments> {
+        let (suffix_low, suffix_high) = &self.id_suffix;
+        query
+            .bind(suffix_low.as_str())
+            .bind(suffix_high.as_str())
+            .bind(self.id_prefix.map(|(low, _)| low))
+            .bind(self.id_prefix.map(|(_, high)| high))
+    }
+}
+
 impl SandboxController {
     /// One admin list page matching `filter`, newest first by `(created_at,
     /// id)`, after `cursor`: at most `limit` rows, and whether more follow.
@@ -304,63 +593,65 @@ impl SandboxController {
         limit: u32,
         budget: PageBudget,
     ) -> Result<ListPage<Sandbox>, sqlx::Error> {
-        let lifecycles = filter.lifecycles.as_ref().map(|lifecycles| {
-            lifecycles
-                .iter()
-                .map(|lifecycle| lifecycle.as_str())
-                .collect::<Vec<_>>()
-        });
-        let id_range = filter.search.as_ref().and_then(|search| search.id_range);
-        let template = filter.template.as_ref().map(TemplateName::as_str);
-        let prefix = filter.search.as_ref().map(|search| search.prefix.as_str());
-        let (node_id, assigned) = match filter.node {
-            Some(NodeAssignment::Node(node_id)) => (Some(node_id), None),
-            Some(NodeAssignment::Assigned) => (None, Some(true)),
-            Some(NodeAssignment::Unassigned) => (None, Some(false)),
-            None => (None, None),
-        };
-        if budget == PageBudget::Unbounded {
-            let rows =
-                sqlx::query_as::<_, Sandbox>(sqlx::AssertSqlSafe(sql!(ADMIN_LIST_SQL.as_str())))
-                    .bind(filter.org_id)
-                    .bind(lifecycles)
-                    .bind(template)
-                    .bind(filter.user_id)
-                    .bind(filter.created_after)
-                    .bind(filter.created_before)
-                    .bind(prefix)
-                    .bind(id_range.map(|(low, _)| low))
-                    .bind(id_range.map(|(_, high)| high))
-                    .bind(node_id)
-                    .bind(assigned)
+        let binds = FilterBinds::new(filter);
+        let rows = match (budget, &filter.search) {
+            (PageBudget::Unbounded, None) => {
+                let rows = binds
+                    .bind(sqlx::query_as::<_, Sandbox>(sqlx::AssertSqlSafe(sql!(
+                        ADMIN_LIST_SQL.as_str()
+                    ))))
                     .bind(i64::from(limit))
                     .fetch_all(pool)
                     .await?;
-            return Ok(ListPage {
-                rows,
-                has_more: false,
-            });
-        }
-        let rows =
-            sqlx::query_as::<_, ScopedPageRow>(sqlx::AssertSqlSafe(sql!(ADMIN_PAGE_SQL.as_str())))
-                .bind(filter.org_id)
-                .bind(lifecycles)
-                .bind(template)
-                .bind(filter.user_id)
-                .bind(filter.created_after)
-                .bind(filter.created_before)
-                .bind(prefix)
-                .bind(id_range.map(|(low, _)| low))
-                .bind(id_range.map(|(_, high)| high))
-                .bind(node_id)
-                .bind(assigned)
-                .bind(cursor.map(|cursor| cursor.created_at))
-                .bind(cursor.map(|cursor| cursor.id))
-                .bind(i64::from(limit.saturating_add(1)))
-                .bind(self.list_page_max_bytes)
-                .bind(SANDBOX_LIST_ROW_OVERHEAD_BYTES)
-                .fetch_all(pool)
-                .await?;
+                return Ok(ListPage {
+                    rows,
+                    has_more: false,
+                });
+            }
+            (PageBudget::Unbounded, Some(search)) => {
+                let rows = search
+                    .bind(
+                        binds.bind(sqlx::query_as::<_, Sandbox>(sqlx::AssertSqlSafe(sql!(
+                            ADMIN_SEARCH_LIST_SQL.as_str()
+                        )))),
+                    )
+                    .bind(i64::from(limit))
+                    .fetch_all(pool)
+                    .await?;
+                return Ok(ListPage {
+                    rows,
+                    has_more: false,
+                });
+            }
+            (PageBudget::Bounded, None) => {
+                binds
+                    .bind(sqlx::query_as::<_, ScopedPageRow>(sqlx::AssertSqlSafe(
+                        sql!(ADMIN_PAGE_SQL.as_str()),
+                    )))
+                    .bind(cursor.map(|cursor| cursor.created_at))
+                    .bind(cursor.map(|cursor| cursor.id))
+                    .bind(i64::from(limit.saturating_add(1)))
+                    .bind(self.list_page_max_bytes)
+                    .bind(SANDBOX_LIST_ROW_OVERHEAD_BYTES)
+                    .fetch_all(pool)
+                    .await?
+            }
+            (PageBudget::Bounded, Some(search)) => {
+                search
+                    .bind(
+                        binds.bind(sqlx::query_as::<_, ScopedPageRow>(sqlx::AssertSqlSafe(
+                            sql!(ADMIN_SEARCH_PAGE_SQL.as_str()),
+                        ))),
+                    )
+                    .bind(cursor.map(|cursor| cursor.created_at))
+                    .bind(cursor.map(|cursor| cursor.id))
+                    .bind(i64::from(limit.saturating_add(1)))
+                    .bind(self.list_page_max_bytes)
+                    .bind(SANDBOX_LIST_ROW_OVERHEAD_BYTES)
+                    .fetch_all(pool)
+                    .await?
+            }
+        };
         let page = ListPage::from_rows(rows, limit as usize, |row| row.has_next);
         Ok(ListPage {
             rows: page.rows.into_iter().map(|row| row.sandbox).collect(),
@@ -389,6 +680,32 @@ impl SandboxController {
         pool: &PgPool,
         org_id: Option<OrgId>,
     ) -> Result<Vec<SpacedVersionCount>, ControllerError> {
+        // A row nodes report with no sandbox row is a pool slot as
+        // `observed_only_sandbox_response` decides it: by its node's
+        // `pool_template`, or by a warm-pool slot reserving its ID. The
+        // org-scoped count has no such rows. A row that appears between the
+        // two reads counts as observed-local until the next count.
+        let pool_reserved = if org_id.is_none() {
+            let rowless = sqlx::query_scalar::<_, SandboxId>(sql!(
+                "SELECT sos.sandbox_id
+                 FROM sandbox_observed_states sos
+                 WHERE NOT EXISTS (SELECT 1 FROM sandboxes s WHERE s.id = sos.sandbox_id)"
+            ))
+            .fetch_all(pool)
+            .await
+            .map_err(|err| db_contention_error("list the rowless observed sandboxes", &err))?;
+            WarmPoolStore::new(pool.clone())
+                .pool_reservations(&rowless)
+                .await
+                .map_err(|err| {
+                    pool_store_error("query the warm-pool slots of node-reported sandboxes", &err)
+                })?
+                .into_iter()
+                .map(|reservation| reservation.sandbox_id)
+                .collect()
+        } else {
+            Vec::new()
+        };
         let rows = sqlx::query_as::<_, SpacedVersionCountRow>(sql!(
             "SELECT counted.template,
                     counted.spaced_version,
@@ -402,7 +719,9 @@ impl SandboxController {
                         sos.spaced_version,
                         COALESCE(sos.status, s.lifecycle) AS status,
                         s.id IS NOT NULL AS has_row,
-                        s.id IS NULL AND sos.pool_template IS NOT NULL AS pool_slot
+                        s.id IS NULL
+                            AND (sos.pool_template IS NOT NULL
+                                 OR sos.sandbox_id IN (SELECT unnest($3::UUID[]))) AS pool_slot
                  FROM sandboxes s
                  FULL JOIN sandbox_observed_states sos ON sos.sandbox_id = s.id
                  LEFT JOIN LATERAL (
@@ -422,6 +741,7 @@ impl SandboxController {
         ))
         .bind(org_id)
         .bind(DELETED_LIFECYCLE)
+        .bind(pool_reserved)
         .fetch_all(pool)
         .await
         .map_err(|err| db_contention_error("count sandboxes by spaced version", &err))?;
@@ -442,5 +762,7 @@ impl SandboxController {
     }
 }
 
+#[cfg(test)]
+mod search_plan_tests;
 #[cfg(test)]
 pub(crate) mod tests;

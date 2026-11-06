@@ -20,7 +20,7 @@ use pplx_space_events::{
 use pplx_space_net_common::TlsInterception;
 use pplx_space_public_api::OperationId;
 use pplx_space_sandbox_store::{self as sandbox_store, delete::delete_with_dependents};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
@@ -894,11 +894,7 @@ impl SandboxController {
             .collect::<Vec<_>>();
         if include_observed_only {
             let observed_only = fetch_observed_only_sandboxes(pool, &ids).await?;
-            responses.extend(
-                observed_only
-                    .into_iter()
-                    .map(|observed| observed_only_sandbox_response(&observed)),
-            );
+            responses.extend(observed_only_responses(pool, &observed_only).await?);
         }
         Ok(responses)
     }
@@ -2778,8 +2774,42 @@ impl SandboxController {
         id: SandboxId,
     ) -> Result<Option<SandboxResponse>, ControllerError> {
         let observed = fetch_sandbox_observed_states(pool, &[id]).await?;
-        Ok(observed.get(&id).map(observed_only_sandbox_response))
+        let observed = observed.into_values().collect::<Vec<_>>();
+        Ok(observed_only_responses(pool, &observed).await?.pop())
     }
+}
+
+/// The responses of sandboxes nodes report with no sandbox row, each with the
+/// warm pool whose slot reserves its ID, read for all of them at once.
+async fn observed_only_responses(
+    pool: &PgPool,
+    observed: &[SandboxObservedState],
+) -> Result<Vec<SandboxResponse>, ControllerError> {
+    if observed.is_empty() {
+        return Ok(Vec::new());
+    }
+    let ids = observed
+        .iter()
+        .map(|observed| observed.sandbox_id)
+        .collect::<Vec<_>>();
+    let pool_ids = WarmPoolStore::new(pool.clone())
+        .pool_reservations(&ids)
+        .await
+        .map_err(|error| {
+            pool_store_error(
+                "query the warm-pool slots of node-reported sandboxes",
+                &error,
+            )
+        })?
+        .into_iter()
+        .map(|reservation| (reservation.sandbox_id, reservation.config_id))
+        .collect::<HashMap<_, _>>();
+    Ok(observed
+        .iter()
+        .map(|observed| {
+            observed_only_sandbox_response(observed, pool_ids.get(&observed.sandbox_id).copied())
+        })
+        .collect())
 }
 
 fn sanitize_create_env(env: &BTreeMap<String, String>) -> BTreeMap<String, String> {

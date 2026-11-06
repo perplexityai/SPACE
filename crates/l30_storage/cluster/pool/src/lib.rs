@@ -23,7 +23,7 @@ pub use models::{
     AutoscaleRead, AutoscaleRun, ClaimedPoolSlot, ClaimedSlotBindSource, DeletedDisabledWarmPools,
     FailedAutoscaleCandidate, InvalidAutoscaleRow, InvalidPoolConfigRow, ManualPoolConfigSpec,
     NewPoolSlot, OpenPoolSlotDeleteLock, PoolAssignment, PoolConfig, PoolConfigRead,
-    PoolConfigWithCounts, PoolSlot, PoolSlotCounts, ProtectedTemplateRelease,
+    PoolConfigWithCounts, PoolReservation, PoolSlot, PoolSlotCounts, ProtectedTemplateRelease,
     ReleasePoolConfigWithCounts, ReservedPoolSlot, TEMPLATE_USAGE_SANDBOX_ID_LIMIT,
     TemplateWarmPoolUsage, WarmPoolConfigRef, WarmPoolPolicyShape,
 };

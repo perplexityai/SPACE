@@ -21,8 +21,8 @@ use time::OffsetDateTime;
 use super::support::{self, ContentionScope, api_error, require_managing_org_admin};
 use crate::controllers::sandbox::SandboxPageCursor;
 use crate::controllers::sandbox::list_page::admin::{
-    AdminSandboxFilter, AdminStoredLifecycle, NodeAssignment, PageBudget, SandboxSearch,
-    SpacedVersionCount,
+    AdminSandboxFilter, AdminStoredLifecycle, NodeAssignment, PageBudget, SandboxPrefix,
+    SandboxSearch, SpacedVersionCount,
 };
 use crate::middleware::auth::AuthUser;
 use crate::models::{Sandbox, SandboxResponse};
@@ -35,7 +35,7 @@ const CURSOR_VERSION: &str = "v1";
 /// The list's query parameters. With `cursor` any other parameter is
 /// refused; without it, other parameters are ignored, as they were before
 /// paging existed, so callers written against that list keep working.
-const LIST_PARAMETERS: [&str; 11] = [
+const LIST_PARAMETERS: [&str; 12] = [
     "limit",
     "org_id",
     "cursor",
@@ -47,6 +47,7 @@ const LIST_PARAMETERS: [&str; 11] = [
     "created_after",
     "created_before",
     "prefix",
+    "search",
 ];
 const NANOSECONDS_PER_MICROSECOND: i128 = 1_000;
 /// The Unix nanoseconds Postgres's `timestamptz` holds, at its microsecond
@@ -82,6 +83,8 @@ pub struct AdminSandboxListQuery {
     #[serde(default, deserialize_with = "empty_as_unset")]
     created_before: Option<String>,
     prefix: Option<String>,
+    /// The end or start of an ID's hex digits; see `SandboxSearch`.
+    search: Option<String>,
 }
 
 /// One page of the list, served when the request carries `cursor`.
@@ -200,12 +203,21 @@ impl AdminSandboxListQuery {
             user_id: self.user_id,
             created_after,
             created_before,
-            search: match self.prefix {
+            prefix: match self.prefix {
                 Some(prefix) if prefix.contains('\0') => {
                     return Err(bad_request("prefix must not contain a NUL character"));
                 }
-                Some(prefix) if !prefix.is_empty() => Some(SandboxSearch::new(prefix)),
+                Some(prefix) if !prefix.is_empty() => Some(SandboxPrefix::new(prefix)),
                 _ => None,
+            },
+            search: match self.search {
+                Some(search) if search.contains('\0') => {
+                    return Err(bad_request("search must not contain a NUL character"));
+                }
+                Some(search) => {
+                    SandboxSearch::new(&search).map_err(|error| bad_request(error.to_string()))?
+                }
+                None => None,
             },
         };
         Ok(ListRequest {

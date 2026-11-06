@@ -15,9 +15,9 @@ use crate::{
     AutoscaleRead, AutoscaleRun, ClaimedPoolSlot, ClaimedSlotBindSource, DeletedDisabledWarmPools,
     FailedAutoscaleCandidate, InvalidAutoscaleRow, ManualPoolConfigSpec, NewPoolSlot,
     OpenPoolSlotDeleteLock, PoolConfigOwner, PoolConfigRead, PoolConfigWithCounts, PoolError,
-    PoolSlot, PoolSlotCounts, PoolSlotState, ProtectedTemplateRelease, ReleasePoolConfigWithCounts,
-    ReservedPoolSlot, Result, TEMPLATE_USAGE_SANDBOX_ID_LIMIT, TemplateWarmPoolUsage,
-    WarmPoolConfigRef, WarmPoolPolicyShape,
+    PoolReservation, PoolSlot, PoolSlotCounts, PoolSlotState, ProtectedTemplateRelease,
+    ReleasePoolConfigWithCounts, ReservedPoolSlot, Result, TEMPLATE_USAGE_SANDBOX_ID_LIMIT,
+    TemplateWarmPoolUsage, WarmPoolConfigRef, WarmPoolPolicyShape,
     models::{
         PoolAutoscaleCandidate, PoolObservedDemand, PoolPolicyRelease, memory_to_mib_i32,
         vcpu_to_i32,
@@ -1564,14 +1564,20 @@ impl WarmPoolStore {
         Ok(pending)
     }
 
-    /// Which of the given sandbox ids are reserved by a pool slot, in any
-    /// state. Deliberately state-free: a slot row's existence means the pool
-    /// created that reserved sandbox id (or still holds its receipt), which
-    /// is what drain-time published state needs to avoid misclassifying a
-    /// pool-reserved id as deleted.
-    pub async fn reserved_sandbox_ids(&self, sandbox_ids: &[SandboxId]) -> Result<Vec<SandboxId>> {
-        let rows = sqlx::query_scalar::<_, SandboxId>(sql!(
-            "SELECT reserved_sandbox_id
+    /// The pool slots, in any state, that reserve one of the given sandbox
+    /// ids, each with the pool config it belongs to. Deliberately
+    /// state-free: a slot row's existence means the pool created that
+    /// reserved sandbox id (or still holds its receipt). Drain-time published
+    /// state needs that to avoid misclassifying a pool-reserved id as
+    /// deleted, and the admin sandbox list to call a sandbox its node reports
+    /// with no row a pool slot: the slot's pod runs under its reserved id
+    /// before a claim creates the row.
+    pub async fn pool_reservations(
+        &self,
+        sandbox_ids: &[SandboxId],
+    ) -> Result<Vec<PoolReservation>> {
+        let rows = sqlx::query_as::<_, PoolReservation>(sql!(
+            "SELECT reserved_sandbox_id AS sandbox_id, config_id
              FROM kubernetes_pool_slots
              WHERE reserved_sandbox_id = ANY($1)"
         ))

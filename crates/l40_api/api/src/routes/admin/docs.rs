@@ -852,10 +852,11 @@ fn insert_admin_sandbox_create_paths(paths: &mut Map<String, Value>) {
                     { "name": "user_id", "in": "query", "required": false, "schema": { "type": "string" } },
                     { "name": "created_after", "in": "query", "required": false, "description": "RFC 3339; exclusive", "schema": { "type": "string" } },
                     { "name": "created_before", "in": "query", "required": false, "description": "RFC 3339; exclusive, later than created_after", "schema": { "type": "string" } },
-                    { "name": "prefix", "in": "query", "required": false, "description": "Case-sensitive name prefix, or an ID prefix with optional sbx_ and dashes where a UUID has them. Like every filter, it searches sandbox rows only: the node-reported pool slots and observed-local sandboxes never match, whatever their ID", "schema": { "type": "string" } }
+                    { "name": "prefix", "in": "query", "required": false, "description": "Case-sensitive name prefix, or an ID prefix with optional sbx_ and dashes where a UUID has them. Like every filter, it searches sandbox rows only: the node-reported pool slots and observed-local sandboxes never match, whatever their ID", "schema": { "type": "string" } },
+                    { "name": "search", "in": "query", "required": false, "description": "Matches a sandbox whose ID ends or starts with the text's hex digits. The text is trimmed; empty or blank, it is unset. After an optional sbx_ in either case and with its dashes left out, it must be 4 to 32 hex digits in either case, or the request answers 400. IDs that end with them match, such as the last eight digits the console labels a sandbox with, and from 8 digits IDs that start with them too (a UUIDv7 starts with its creation time, so fewer digits would match days of sandboxes); a full ID matches itself. It does not match names: use prefix, a case-sensitive name prefix. Combines with prefix and the other filters, and like them leaves out the node-reported rows. A server that predates this parameter answers 400 for it when cursor is set and ignores it otherwise", "schema": { "type": "string" } }
                 ],
                 "responses": {
-                    "200": { "description": "Sandbox array, or {sandboxes, next_cursor} when cursor is set" },
+                    "200": { "description": "Sandbox array, or {sandboxes, next_cursor} when cursor is set. Each sandbox carries user_email, the email its owner (user_id) has when the list is read, null on the node-reported rows and for a sandbox owned by a federated user; and resource_type, which is pool_slot for a node-reported sandbox its node reports as a pool member or that a warm-pool slot reserves, with pool_id naming that warm pool, the id of its GET /warm-pools entry, when it is a Kubernetes slot, null otherwise" },
                     "400": { "description": "Invalid cursor or filter" }
                 }
             },
@@ -898,7 +899,7 @@ fn insert_admin_sandbox_create_paths(paths: &mut Map<String, Value>) {
                     { "name": "sandbox_id", "in": "path", "required": true, "description": "sbx_<uuid>, a dashed or undashed UUID in either case, or the sandbox pod name (space-sbx-<undashed uuid>, optionally with its -g<generation> suffix); surrounding whitespace is ignored", "schema": { "type": "string" } }
                 ],
                 "responses": {
-                    "200": { "description": "Sandbox" },
+                    "200": { "description": "Sandbox, in the list's shape, user_email and pool_id included" },
                     "400": { "description": "Invalid sandbox id" },
                     "404": { "description": "Sandbox not found" }
                 }

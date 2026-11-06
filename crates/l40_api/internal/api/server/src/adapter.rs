@@ -1188,11 +1188,12 @@ impl ClusterApi for ClusterApiService {
         // the sandboxes read — a slot claimed between the two reads is
         // then present in at least one of them, never in neither.
         let pool_reserved = pplx_space_cluster_pool::WarmPoolStore::new(self.pool.clone())
-            .reserved_sandbox_ids(&sandbox_ids)
+            .pool_reservations(&sandbox_ids)
             .await
             .map_err(|err| Status::internal(format!("query pool slot reservations: {err}")))?;
         let pool_reserved = pool_reserved
             .into_iter()
+            .map(|reservation| reservation.sandbox_id)
             .collect::<std::collections::BTreeSet<_>>();
 
         // Deliberately unfiltered by node: one consistent read partitions

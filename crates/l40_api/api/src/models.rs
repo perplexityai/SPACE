@@ -158,6 +158,11 @@ pub struct Sandbox {
     /// SPACE user row that owns the sandbox. Federated owners map onto local
     /// user/org rows so downstream paths keep the normal sandbox FK shape.
     pub user_id: UserId,
+    /// The current email of `user_id`'s user, read with the row. A federated
+    /// owner's user row holds a generated placeholder, which no response
+    /// shows (see `SandboxResponse::user_email`).
+    #[serde(default)]
+    pub user_email: Option<String>,
     pub org_id: OrgId,
     pub owner_source: SandboxOwnerSource,
     pub upstream_issuer: Option<String>,
@@ -372,6 +377,15 @@ pub struct SandboxResponse {
     pub resource_type: SandboxResourceType,
     pub name: Option<String>,
     pub user_id: Option<UserId>,
+    /// The email `user_id`'s user has when the sandbox is read; null for the
+    /// node-reported rows, which have no owner, and for a federated owner,
+    /// whose user row holds only a generated placeholder.
+    ///
+    /// Admin-only: the admin surface serializes this type, while the native
+    /// and ECW surfaces translate it into their own response types, which
+    /// carry no owner identity. Keep it out of them: every API key of an org
+    /// would otherwise read each member's email.
+    pub user_email: Option<String>,
     pub org_id: Option<OrgId>,
     /// Rendered from `state_input`, as is `status`.
     pub lifecycle: Option<String>,
@@ -415,6 +429,10 @@ pub struct SandboxResponse {
     pub snapshots_enabled_desired: bool,
     pub snapshots_enabled: Option<bool>,
     pub pool_template: Option<String>,
+    /// The warm pool whose slot a `pool_slot` row is: the `id` of its
+    /// `GET /warm-pools` entry. Null on every other row and on Direct, whose
+    /// pools have no ID.
+    pub pool_id: Option<uuid::Uuid>,
     pub disk_usage_bytes: Option<u64>,
     pub failure_reason: Option<String>,
     pub age: Option<String>,

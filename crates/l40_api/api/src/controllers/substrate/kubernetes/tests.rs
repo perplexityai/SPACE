@@ -7335,6 +7335,7 @@ mod kubernetes_tests {
             id: SandboxId::from_uuid(Uuid::nil()),
             name: None,
             user_id: UserId::from_uuid(Uuid::nil()),
+            user_email: None,
             org_id: OrgId::from_uuid(Uuid::nil()),
             owner_source: SandboxOwnerSource::Local,
             upstream_issuer: None,

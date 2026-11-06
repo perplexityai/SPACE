@@ -22,6 +22,7 @@ const SANDBOX_COLUMNS: &str = "
     s.id,
     s.name,
     s.user_id,
+    owner_user.email AS user_email,
     s.org_id,
     owner_user.owner_source AS owner_source,
     owner_user.upstream_issuer AS upstream_issuer,
@@ -679,14 +680,22 @@ fn observed_template(observed: &SandboxObservedState) -> Option<String> {
         .or_else(|| observed.pool_template.clone())
 }
 
-pub(super) fn observed_only_sandbox_response(observed: &SandboxObservedState) -> SandboxResponse {
+/// A sandbox a node reports with no sandbox row. It is a pool slot when the
+/// node says so (`pool_template`, which Direct nodes report) or when a
+/// warm-pool slot reserves its ID (`pool_id`, Kubernetes, whose nodes report
+/// no pool membership).
+pub(super) fn observed_only_sandbox_response(
+    observed: &SandboxObservedState,
+    pool_id: Option<uuid::Uuid>,
+) -> SandboxResponse {
     let mut response = SandboxResponse {
         id: observed.sandbox_id,
-        resource_type: if observed.pool_template.is_some() {
+        resource_type: if observed.pool_template.is_some() || pool_id.is_some() {
             SandboxResourceType::PoolSlot
         } else {
             SandboxResourceType::ObservedLocal
         },
+        pool_id,
         placement: Some("observed".to_string()),
         active_node_id: None,
         active_node: None,
@@ -747,6 +756,10 @@ pub fn sandbox_to_response(sandbox: &Sandbox, live: Option<&SandboxInfo>) -> San
         resource_type: SandboxResourceType::Sandbox,
         name: sandbox.name.clone(),
         user_id: Some(sandbox.user_id),
+        user_email: match sandbox.owner_source {
+            pplx_space_common_core::types::SandboxOwnerSource::Local => sandbox.user_email.clone(),
+            pplx_space_common_core::types::SandboxOwnerSource::FederatedIdentity => None,
+        },
         org_id: Some(sandbox.org_id),
         lifecycle: state_input.reported_lifecycle(),
         placement: Some(if live.is_some() {
@@ -796,6 +809,7 @@ pub fn sandbox_to_response(sandbox: &Sandbox, live: Option<&SandboxInfo>) -> San
         snapshots_enabled: live.map(|info| info.snapshots_enabled),
         snapshots_enabled_desired: sandbox.snapshots_enabled_desired,
         pool_template: live.and_then(|info| info.pool_template.clone()),
+        pool_id: None,
         disk_usage_bytes: None,
         failure_reason: live.and_then(|info| info.failure_reason.clone()),
         age: live

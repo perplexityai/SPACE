@@ -3,7 +3,9 @@ use axum::body::Body;
 use axum::http::{Method, Request};
 use pplx_space_common_core::sql;
 use pplx_space_common_core::types::NodeId;
-use pplx_space_db_test_fixtures::{TestDb, TestDbResult, insert_ready_worker_node, pg_test_db};
+use pplx_space_db_test_fixtures::{
+    TestDb, TestDbResult, insert_pool_slot_receipt, insert_ready_worker_node, pg_test_db,
+};
 use pplx_space_public_api::PublicSandboxId;
 use serde_json::{Value, json};
 use sqlx::PgPool;
@@ -12,7 +14,7 @@ use uuid::Uuid;
 
 use super::*;
 use crate::controllers::sandbox::list_page::admin::tests::{
-    SeedObservation, SeedSandbox, seed_observation, seed_owner, seed_sandbox,
+    Owner, SeedObservation, SeedSandbox, seed_observation, seed_owner, seed_sandbox,
 };
 
 const SEED_ORG: Uuid = pplx_space_db_test_fixtures::SEED_ORG_ID;
@@ -188,11 +190,18 @@ async fn the_list_pages_by_cursor_and_keeps_the_unpaged_array(
             assert_eq!(ids(&filtered["sandboxes"]), seeded);
             assert_eq!(filtered["next_cursor"], Value::Null);
 
-            // The node filters reach the list, and they and `prefix` leave out the
-            // node-reported row as every filter does, even its own ID's prefix.
+            // The node filters reach the list, and they, `prefix` and `search`
+            // leave out the node-reported row as every filter does, even its
+            // own ID's prefix or suffix.
+            let node_only_label = node_only
+                .replace('-', "")
+                .chars()
+                .skip(24)
+                .collect::<String>();
             for (label, query, expected) in [
                 ("node_id", format!("node_id={node_id}"), Vec::new()),
                 ("prefix", format!("prefix={node_only}"), Vec::new()),
+                ("search", format!("search={node_only_label}"), Vec::new()),
                 ("assigned", "assigned=true".to_string(), Vec::new()),
                 ("unassigned", "assigned=false".to_string(), seeded.clone()),
             ] {
@@ -269,6 +278,14 @@ async fn malformed_list_parameters_answer_400() -> TestDbResult<()> {
         ),
         ("cursor=&node=x", "unknown query parameter \"node\""),
         ("prefix=a%00b", "NUL"),
+        ("search=a%00b", "NUL"),
+        // `search` takes an ID's hex digits only, and points a name at
+        // `prefix`.
+        ("search=0a1", "4 to 32 hex digits"),
+        ("cursor=&search=%200a1%20", "4 to 32 hex digits"),
+        ("search=worker-1", "use prefix"),
+        ("cursor=&search=Alpha", "use prefix"),
+        ("cursor=&search=sbx_0a1b2c3g", "use prefix"),
         ("cursor=bm90LWEtY3Vyc29y", "invalid cursor"),
         ("cursor=%%%", "invalid"),
         (&out_of_range_cursor, "invalid cursor"),
@@ -339,7 +356,8 @@ async fn an_empty_filter_parameter_is_unset(
         "user_id",
         "created_after",
         "created_before",
-        "prefix"
+        "prefix",
+        "search"
     )]
     name: &str,
 ) -> TestDbResult<()> {
@@ -385,6 +403,144 @@ async fn an_empty_filter_parameter_is_unset(
             "{name}{paging}: empty is unset"
         );
     }
+    harness.pool.close().await;
+    Ok(())
+}
+
+/// The list, paged or not, and the sandbox read name each sandbox's owner by
+/// the email the user has when it is read, from the same statement; a
+/// node-reported row has no owner and no email, and a federated owner's
+/// placeholder email is not shown.
+#[tokio::test]
+async fn the_list_and_the_sandbox_name_the_owner_by_email() -> TestDbResult<()> {
+    let Some(harness) = harness().await? else {
+        return Ok(());
+    };
+    let owner = seed_owner(&harness.pool).await?;
+    let sandbox_id = seed_sandbox(&harness.pool, owner, SeedSandbox::default()).await?;
+    let renamed = format!("renamed-{}@example.invalid", owner.user_id);
+    sqlx::query(sql!("UPDATE users SET email = $1 WHERE id = $2"))
+        .bind(&renamed)
+        .bind(owner.user_id)
+        .execute(&harness.pool)
+        .await?;
+    // A federated owner's user row holds a generated placeholder email.
+    let federated = Owner {
+        org_id: owner.org_id,
+        user_id: UserId::new(),
+    };
+    sqlx::query(sql!(
+        "INSERT INTO users (
+             id, email, password_hash, display_name, org_id, role,
+             owner_source, upstream_issuer, upstream_subject_id
+         )
+         VALUES ($1, $2, 'synthetic-password-hash', 'Federated owner', $3, 'member',
+                 'federated_identity', 'https://issuer.example.test', $4)"
+    ))
+    .bind(federated.user_id)
+    .bind(format!("federated-{}@space.invalid", federated.user_id))
+    .bind(federated.org_id)
+    .bind(federated.user_id.to_string())
+    .execute(&harness.pool)
+    .await?;
+    let federated_sandbox = seed_sandbox(&harness.pool, federated, SeedSandbox::default()).await?;
+    let node_id = NodeId::new();
+    insert_ready_worker_node(&harness.pool, node_id).await?;
+    let node_only = SandboxId::new();
+    seed_observation(
+        &harness.pool,
+        node_only,
+        node_id,
+        SeedObservation::default(),
+    )
+    .await?;
+    let email_of = |rows: &Value, id: String| {
+        rows.as_array()
+            .expect("sandbox array")
+            .iter()
+            .find(|row| row["id"] == json!(id))
+            .map(|row| row["user_email"].clone())
+    };
+
+    let (status, unpaged) = harness.get("/sandboxes").await;
+    assert_eq!(status, StatusCode::OK, "unpaged list: status");
+    assert_eq!(
+        email_of(&unpaged, sandbox_id.to_string()),
+        Some(json!(renamed))
+    );
+    assert_eq!(email_of(&unpaged, node_only.to_string()), Some(Value::Null));
+    assert_eq!(
+        email_of(&unpaged, federated_sandbox.to_string()),
+        Some(Value::Null)
+    );
+    let (status, page) = harness.get("/sandboxes?cursor=").await;
+    assert_eq!(status, StatusCode::OK, "first page: status");
+    assert_eq!(
+        email_of(&page["sandboxes"], sandbox_id.to_string()),
+        Some(json!(renamed))
+    );
+    let (status, sandbox) = harness
+        .get(&format!("/sandboxes/{}", PublicSandboxId::from(sandbox_id)))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{sandbox}");
+    assert_eq!(sandbox["user_email"], json!(renamed));
+    let (status, sandbox) = harness
+        .get(&format!(
+            "/sandboxes/{}",
+            PublicSandboxId::from(federated_sandbox)
+        ))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{sandbox}");
+    assert_eq!(sandbox["user_email"], Value::Null);
+    harness.pool.close().await;
+    Ok(())
+}
+
+/// The sandbox read of a sandbox its node reports with no row reports a
+/// Kubernetes warm-pool slot as the list does: `pool_slot`, with its pool.
+#[tokio::test]
+async fn the_sandbox_read_names_a_kubernetes_pool_slot() -> TestDbResult<()> {
+    let Some(harness) = harness().await? else {
+        return Ok(());
+    };
+    let node_id = NodeId::new();
+    insert_ready_worker_node(&harness.pool, node_id).await?;
+    let (slot, observed_local) = (SandboxId::new(), SandboxId::new());
+    for sandbox_id in [slot, observed_local] {
+        seed_observation(
+            &harness.pool,
+            sandbox_id,
+            node_id,
+            SeedObservation {
+                status: Some("started"),
+                ..SeedObservation::default()
+            },
+        )
+        .await?;
+    }
+    insert_pool_slot_receipt(&harness.pool, slot, "ready").await?;
+    let pool_id: Uuid = sqlx::query_scalar(sql!(
+        "SELECT config_id FROM kubernetes_pool_slots WHERE reserved_sandbox_id = $1"
+    ))
+    .bind(slot)
+    .fetch_one(&harness.pool)
+    .await?;
+
+    let (status, body) = harness
+        .get(&format!("/sandboxes/{}", PublicSandboxId::from(slot)))
+        .await;
+    assert_eq!(status, StatusCode::OK, "pool slot detail: status");
+    assert_eq!(body["resource_type"], json!("pool_slot"));
+    assert_eq!(body["pool_id"], json!(pool_id));
+    let (status, body) = harness
+        .get(&format!(
+            "/sandboxes/{}",
+            PublicSandboxId::from(observed_local)
+        ))
+        .await;
+    assert_eq!(status, StatusCode::OK, "observed local detail: status");
+    assert_eq!(body["resource_type"], json!("observed_local"));
+    assert_eq!(body["pool_id"], Value::Null);
     harness.pool.close().await;
     Ok(())
 }
