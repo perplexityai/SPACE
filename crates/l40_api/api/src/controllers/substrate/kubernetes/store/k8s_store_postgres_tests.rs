@@ -9204,6 +9204,50 @@ async fn upsert_preserves_drain_state_when_k8s_node_uid_unchanged(
             "{phase:?}: a same-UID upsert must not touch drain state"
         );
     }
+
+    // Partial drain state: the sweep above sets every drain column, so a
+    // terminating node with only its phase and start time set is seeded here.
+    let node_id = NodeId::new();
+    let node_name = format!("space-test-node-{}", node_id.as_uuid().simple());
+    let register = || {
+        fixture.store.persist_k8s_node_inventory(
+            &node_name,
+            "uid-A",
+            node_id,
+            NodeRole::Worker,
+            Some("10.0.0.2"),
+            NodeStateWrite::Manage(NodeLifecycleState::Ready),
+        )
+    };
+    register().await?;
+    let seeded: NodeDrainColumns = sqlx::query_as(sql!(
+        "UPDATE nodes
+         SET drain_phase = $2,
+             drain_started_at = TIMESTAMPTZ '2024-01-01 00:00:00+00'
+         WHERE id = $1
+         RETURNING drain_phase, drain_mode, drain_started_at, drain_last_error"
+    ))
+    .bind(node_id)
+    .bind(NodeDrainPhase::Terminating.as_str())
+    .fetch_one(&fixture.pool)
+    .await?;
+    assert!(
+        seeded.drain_phase.as_deref() == Some(NodeDrainPhase::Terminating.as_str())
+            && seeded.drain_started_at.is_some()
+            && seeded.drain_mode.is_none()
+            && seeded.drain_last_error.is_none(),
+        "only drain_phase and drain_started_at must be set before the upsert: {seeded:?}"
+    );
+
+    assert!(
+        !register().await?,
+        "partial drain state: an unchanged re-observation reports no change"
+    );
+    assert_eq!(
+        node_drain_columns(&fixture.pool, node_id).await?,
+        seeded,
+        "partial drain state: a same-UID upsert must not touch drain state"
+    );
     Ok(())
 }
 
