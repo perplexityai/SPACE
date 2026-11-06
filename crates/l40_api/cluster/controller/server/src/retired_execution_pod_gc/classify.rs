@@ -47,8 +47,11 @@ pub struct PodSnapshot {
     pub terminating: bool,
     pub is_restore: bool,
     /// `status.podIP` is set. The sandbox network comes up with the VM in
-    /// `RunPodSandbox`, so a pod without an IP never got a running sandbox.
+    /// `RunPodSandbox`.
     pub has_pod_ip: bool,
+    /// Kubelet reports `PodReadyToStartContainers=False`: `RunPodSandbox`
+    /// has not succeeded, so the shim has no VM for this pod.
+    pub sandbox_not_ready: bool,
     pub phase: PodPhase,
     /// Every app, init and ephemeral container has terminated, and there is at
     /// least one app container status to say so.
@@ -82,6 +85,7 @@ impl PodSnapshot {
             terminating: pod.is_deleting(),
             is_restore: pod.has_restore_annotation(),
             has_pod_ip: pod.pod_ip().is_some_and(|ip| !ip.is_empty()),
+            sandbox_not_ready: pod.is_sandbox_not_ready(),
             phase: PodPhase::parse(pod.phase()),
             all_containers_terminated,
         }
@@ -113,7 +117,8 @@ pub enum ReapReason {
     /// superseded.
     TerminalRetired,
     /// The execution was retired as `replaced` and its fresh-create pod is
-    /// still `Pending` with no pod IP: its sandbox never came up, and
+    /// still `Pending` with no pod IP and kubelet reporting
+    /// `PodReadyToStartContainers=False`: its sandbox never came up, and
     /// sandbox-manager refuses to start it. The node-published
     /// activation-rollback shape.
     ReplacedNeverStarted,
@@ -179,7 +184,12 @@ pub fn classify(pod: &PodSnapshot, row: Option<&ExecutionRow>) -> Disposition {
         PodPhase::Succeeded | PodPhase::Failed if pod.all_containers_terminated => {
             Disposition::Reap(ReapReason::TerminalRetired)
         }
-        PodPhase::Pending if row.state == "replaced" && !pod.is_restore && !pod.has_pod_ip => {
+        PodPhase::Pending
+            if row.state == "replaced"
+                && !pod.is_restore
+                && !pod.has_pod_ip
+                && pod.sandbox_not_ready =>
+        {
             Disposition::Reap(ReapReason::ReplacedNeverStarted)
         }
         _ => Disposition::Skip(SkipReason::RetiredNotProvablyIdle),

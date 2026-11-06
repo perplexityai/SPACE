@@ -160,6 +160,7 @@ pub struct SandboxPodView {
     phase: Option<Box<str>>,
     pod_ip: Option<Box<str>>,
     ready: bool,
+    sandbox_not_ready: bool,
     unschedulable_message: Option<Box<str>>,
     container_statuses: SandboxContainerStatuses,
 }
@@ -258,6 +259,12 @@ impl SandboxPodView {
         self.ready
     }
 
+    /// Kubelet reports `PodReadyToStartContainers=False`: the pod's runtime
+    /// sandbox is not up. An absent condition is not that signal.
+    pub fn is_sandbox_not_ready(&self) -> bool {
+        self.sandbox_not_ready
+    }
+
     /// The scheduler marked the pod `PodScheduled=False, reason=Unschedulable`:
     /// the condition's message, or its reason when the message is absent.
     pub fn unschedulable_message(&self) -> Option<&str> {
@@ -341,6 +348,9 @@ impl From<Pod> for SandboxPodView {
             ready: conditions
                 .iter()
                 .any(|condition| condition.type_ == "Ready" && condition.status == "True"),
+            sandbox_not_ready: conditions.iter().any(|condition| {
+                condition.type_ == "PodReadyToStartContainers" && condition.status == "False"
+            }),
             unschedulable_message: conditions
                 .into_iter()
                 .find(is_unschedulable)

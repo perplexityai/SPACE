@@ -32,6 +32,7 @@ fn pod(name: &str, uid_raw: &str, sandbox_id: SandboxId, phase: PodPhase) -> Pod
         terminating: false,
         is_restore: false,
         has_pod_ip: !matches!(phase, PodPhase::Pending),
+        sandbox_not_ready: matches!(phase, PodPhase::Pending),
         phase,
         all_containers_terminated: matches!(phase, PodPhase::Succeeded | PodPhase::Failed),
     }
@@ -141,6 +142,15 @@ fn leaves_retired_pods_that_may_still_hold_a_vm() {
     };
     assert_eq!(
         classify(&sandbox_up, Some(&row(sid, false, "replaced"))),
+        Disposition::Skip(SkipReason::RetiredNotProvablyIdle)
+    );
+    // No IP, but kubelet hasn't reported the sandbox as not ready.
+    let sandbox_unknown = PodSnapshot {
+        sandbox_not_ready: false,
+        ..pod("p", "u", sid, PodPhase::Pending)
+    };
+    assert_eq!(
+        classify(&sandbox_unknown, Some(&row(sid, false, "replaced"))),
         Disposition::Skip(SkipReason::RetiredNotProvablyIdle)
     );
     // Unknown phase.
