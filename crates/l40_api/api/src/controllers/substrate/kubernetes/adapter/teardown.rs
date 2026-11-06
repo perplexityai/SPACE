@@ -36,6 +36,27 @@ fn fenced_runtime_pod_ip(
     assigned_pod_ip(live_pod).ok().flatten()
 }
 
+/// Whether the node reports `sandbox_id` outside `deleting` after a blocking
+/// delete outlasted the teardown's wait budget, meaning sbx-mgr has not yet
+/// run the delete's admission refusals. An absent row was deleted. A failed or
+/// slow probe tells nothing, so it reads as admitted, as an unreachable node
+/// does.
+async fn node_delete_not_yet_admitted(client: &mut RuntimeClient, sandbox_id: SandboxId) -> bool {
+    use pplx_space_sbx_mgr_client::proto::{SandboxLifecycleState, StateRequest};
+    let probe = client.sandbox_state(StateRequest {
+        sandbox_ids: vec![sandbox_id.to_string()],
+    });
+    let Ok(Ok(response)) = tokio::time::timeout(TEARDOWN_NODE_DELETE_ADMISSION_PROBE, probe).await
+    else {
+        return false;
+    };
+    response
+        .into_inner()
+        .sandboxes
+        .iter()
+        .any(|sandbox| sandbox.lifecycle() != SandboxLifecycleState::Deleting)
+}
+
 /// Project the world as it is now into the same shape the fence carries, so
 /// the two can be compared as whole values rather than field by field. One
 /// constructor, so the comparison and every database guard read the same
@@ -550,36 +571,72 @@ impl KubernetesSubstrate {
                         }
                     }
                 }
-                if mode.sends_sandbox_delete()
-                    && let Err(error) = client
-                        .delete_sandbox(pplx_space_sbx_mgr_client::proto::DeleteRequest {
+                if mode.sends_sandbox_delete() {
+                    let node_delete_wait = self.budgets.teardown_node_delete_wait;
+                    let node_delete = tokio::time::timeout(
+                        node_delete_wait,
+                        client.delete_sandbox(pplx_space_sbx_mgr_client::proto::DeleteRequest {
                             sandbox_id: sandbox_id.to_string(),
                             template_filter: None,
                             blocking: true,
-                        })
-                        .await
-                {
-                    match classify_sandbox_delete_rpc_error(&error) {
-                        SandboxDeleteRpcErrorDisposition::DeferTeardown => {
-                            return Err(SubstrateError::SuspendInFlight {
-                                message: format!(
-                                    "sandbox {sandbox_id} node-local delete deferred while suspend publication is pending: {error}"
-                                ),
-                            });
-                        }
-                        SandboxDeleteRpcErrorDisposition::RetainedFilesystemOnlyCopy => {
-                            return Err(SubstrateError::RetainedFilesystemOnlyCopy {
-                                message: format!(
-                                    "sandbox {sandbox_id} node-local delete refused because the retained filesystem may be the only copy: {error}"
-                                ),
-                            });
-                        }
-                        SandboxDeleteRpcErrorDisposition::ContinueTeardown => {
+                        }),
+                    )
+                    .await;
+                    let error = match node_delete {
+                        Ok(Ok(_)) => None,
+                        Ok(Err(error)) => Some(error),
+                        Err(_elapsed) => {
+                            // sbx-mgr checks its admission refusals (suspend
+                            // pending, retained only copy) when it moves the
+                            // row to `deleting`, before the cleanup work. A
+                            // delete admitted past them is cleanup progress
+                            // that sbx-mgr's durable cleanup job owns, so the
+                            // teardown continues as it does for the
+                            // UNAVAILABLE a node at its cgroup deadline
+                            // returns. A delete still queued for a cleanup
+                            // permit or fence has not been checked yet, so the
+                            // teardown defers and retries rather than skip the
+                            // refusals.
+                            if node_delete_not_yet_admitted(&mut client, sandbox_id).await {
+                                return Err(SubstrateError::SuspendInFlight {
+                                    message: format!(
+                                        "sandbox {sandbox_id} node-local delete was not admitted within the {}ms teardown wait budget; retry the delete",
+                                        node_delete_wait.as_millis()
+                                    ),
+                                });
+                            }
                             tracing::warn!(
                                 sandbox_id = %sandbox_id,
-                                error = %error,
-                                "best-effort sandbox delete RPC failed during execution teardown"
+                                wait_budget_ms = node_delete_wait.as_millis() as u64,
+                                "node-local sandbox delete exceeded the teardown wait budget; \
+                                 continuing teardown while sbx-mgr durable cleanup finishes"
                             );
+                            None
+                        }
+                    };
+                    if let Some(error) = error {
+                        match classify_sandbox_delete_rpc_error(&error) {
+                            SandboxDeleteRpcErrorDisposition::DeferTeardown => {
+                                return Err(SubstrateError::SuspendInFlight {
+                                    message: format!(
+                                        "sandbox {sandbox_id} node-local delete deferred while suspend publication is pending: {error}"
+                                    ),
+                                });
+                            }
+                            SandboxDeleteRpcErrorDisposition::RetainedFilesystemOnlyCopy => {
+                                return Err(SubstrateError::RetainedFilesystemOnlyCopy {
+                                    message: format!(
+                                        "sandbox {sandbox_id} node-local delete refused because the retained filesystem may be the only copy: {error}"
+                                    ),
+                                });
+                            }
+                            SandboxDeleteRpcErrorDisposition::ContinueTeardown => {
+                                tracing::warn!(
+                                    sandbox_id = %sandbox_id,
+                                    error = %error,
+                                    "best-effort sandbox delete RPC failed during execution teardown"
+                                );
+                            }
                         }
                     }
                 }
