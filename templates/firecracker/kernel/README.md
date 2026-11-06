@@ -78,3 +78,10 @@ check without writing anything.
 publishing immutable bundles. Non-PR main builds require a comma-separated list
 of destination buckets in `SPACE_GUEST_KERNEL_BUCKETS`. Pull-request and
 non-main builds validate without publishing.
+
+Set `SPACE_GUEST_KERNEL_ARTIFACT_VERSION` to publish a different configuration of
+the same Linux release under a distinct artifact version. The override changes
+the manifest and S3 prefix, not the kernel release or build directory. Stage the
+new version alongside the previous one before selecting it for templates; do not
+reuse an existing node's version label for a different kernel. Omitting the
+override retains the default artifact name. Fleet-default aliases are rejected.
