@@ -112,9 +112,12 @@ impl SandboxCreateRejections {
             let mut reported_error = false;
             while let Some(event) = stream.next().await {
                 match event {
-                    Ok(event) => writer.observe_event(&event),
+                    Ok(event) => {
+                        reported_error = false;
+                        writer.observe_event(&event);
+                    }
                     // Usually missing list/watch on `events`, which leaves the
-                    // fail-fast inert: say so loudly once.
+                    // fail-fast inert: say so loudly once per outage.
                     Err(error) if !reported_error => {
                         reported_error = true;
                         tracing::error!(
