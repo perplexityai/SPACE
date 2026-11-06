@@ -536,6 +536,30 @@ fn key_set_entries_that_cant_name_a_client_are_ignored() {
 }
 
 #[test]
+fn persisted_client_id_resolves_to_a_bounded_tag() {
+    // Interned up front, as the API's allowlist is at startup, so the shared
+    // runtime cap can't turn this into overflow.
+    let _ = KnownClients::new(&known_set(&["persisted-client"]));
+    assert_eq!(
+        persisted_client_id_tag(Some("persisted-client")).as_str(),
+        "persisted-client"
+    );
+    for unattributed in [
+        None,
+        Some(" "),
+        Some("Unknown"),
+        Some("native"),
+        Some("a,b"),
+    ] {
+        assert_eq!(
+            persisted_client_id_tag(unattributed),
+            ClientIdTag::UNKNOWN,
+            "{unattributed:?}"
+        );
+    }
+}
+
+#[test]
 fn override_only_ids_keep_their_bucket_past_the_interning_cap() {
     let config = ClientConcurrencyConfig {
         known_clients: BTreeSet::new(),

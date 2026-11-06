@@ -1138,9 +1138,17 @@ middleware resolves the request's `X-Client-ID` against the static list only
 (never the runtime overrides, so an override-only caller reads `unknown` there)
 and scopes it over the handler, so these metrics need no per-call-site
 stamping. A value the handler stamps itself, such as connect's limiter-resolved
-ID, wins. Work a request hands to another task leaves the scope and reports
+ID, wins. The native create executor restores this scope from the operation's
+optional `metric_client_id`, covering inline execution, dispatcher retries and
+warm-pool adoption; admission does not write that field yet. The field holds
+an ID admission already resolved, so the executing process interns it under the
+same runtime cap as override keys instead of consulting the allowlist. An
+operation without attribution reports `unknown`.
+
+Other work a request hands to another task leaves the scope and reports
 `unknown`, as do the gRPC server metrics and the background reconciler,
-wake-completion and limiter-gauge metrics.
+wake-completion and limiter-gauge metrics. Native lifecycle operations other than
+create do not yet persist client attribution.
 Deployments that filter tags by key must keep `client_id` on these metrics.
 
 Two independent signals describe a restore:

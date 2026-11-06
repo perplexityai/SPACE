@@ -364,7 +364,9 @@ fn parse_known_clients(raw: &str) -> BTreeSet<String> {
 /// [`MAX_RUNTIME_CLIENT_IDS`] of them are interned; past that, an override-only
 /// client keeps its own bucket but reports [`ClientIdTag::OVERFLOW`]. Which ones
 /// fit is first-come per process, so replicas can name different override-only
-/// clients once the cap fills.
+/// clients once the cap fills. An ID persisted on an operation counts as a
+/// key-set entry: admission resolved it from one, and
+/// [`persisted_client_id_tag`] interns it under the same cap.
 static INTERNED_CLIENT_IDS: LazyLock<RwLock<InternedClientIds>> = LazyLock::new(RwLock::default);
 
 /// The most override-only client IDs a process interns over its lifetime.
@@ -390,6 +392,19 @@ fn intern_static_client_id(id: &str) -> &'static str {
 /// [`MAX_RUNTIME_CLIENT_IDS`] runtime IDs are interned.
 fn intern_override_client_id(id: &str) -> Option<&'static str> {
     intern_client_id(id, true)
+}
+
+/// The `client_id` tag for an ID admission persisted on an operation, for
+/// work that runs outside the admitting request's scope. Admission persists
+/// only an ID it already resolved, so the executing process need not hold the
+/// allowlist; the ID is interned like an override key, under the same cap.
+pub(crate) fn persisted_client_id_tag(client_id: Option<&str>) -> ClientIdTag {
+    match ClientKey::normalize(client_id) {
+        Some(id) if check_client_id(id).is_ok() => {
+            intern_override_client_id(id).map_or(ClientIdTag::OVERFLOW, ClientIdTag::allowlisted)
+        }
+        _ => ClientIdTag::UNKNOWN,
+    }
 }
 
 fn intern_client_id(id: &str, runtime: bool) -> Option<&'static str> {

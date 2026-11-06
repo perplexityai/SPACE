@@ -311,6 +311,7 @@ async fn create_sandbox_for_org(
         node_pool: request.node_pool,
         federated_create: None,
         pool_claim: None,
+        metric_client_id: None,
         requested_by_user_id: requested_by,
     }
     .into_json();
