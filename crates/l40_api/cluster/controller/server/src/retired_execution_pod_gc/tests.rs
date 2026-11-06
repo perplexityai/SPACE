@@ -90,7 +90,13 @@ fn reaps_a_pending_fresh_create_pod_retired_as_replaced() {
 #[test]
 fn never_reaps_a_pod_whose_execution_is_active() {
     let sid = SandboxId::new();
-    for phase in [PodPhase::Pending, PodPhase::Succeeded, PodPhase::Failed] {
+    for phase in [
+        PodPhase::Pending,
+        PodPhase::Running,
+        PodPhase::Succeeded,
+        PodPhase::Failed,
+        PodPhase::Other,
+    ] {
         let pod = pod("p", "u", sid, phase);
         assert_eq!(
             classify(&pod, Some(&row(sid, true, "creating"))),
@@ -481,6 +487,27 @@ async fn a_pod_that_stops_classifying_restarts_its_clock() {
     assert_eq!(
         after.too_young, 1,
         "the clock restarted after the failed scan"
+    );
+
+    // So does a tick on which the pod stops classifying as reapable.
+    let set_active = |active: bool| {
+        h.store
+            .rows
+            .lock()
+            .expect("rows")
+            .get_mut("space-sbx-e-g1")
+            .expect("row")
+            .active = active;
+    };
+    h.advance(PAST_THRESHOLD);
+    set_active(true);
+    h.reconciler.tick().await;
+    set_active(false);
+    h.advance(PAST_THRESHOLD);
+    let resumed = h.reconciler.tick().await;
+    assert_eq!(
+        resumed.too_young, 1,
+        "the clock restarted after the pod stopped classifying"
     );
     assert!(h.deletes().is_empty());
 }
