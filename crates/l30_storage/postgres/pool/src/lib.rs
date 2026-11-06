@@ -13,10 +13,7 @@ use sqlx::ConnectOptions as _;
 use sqlx::PgPool;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 
-/// Classification of the SQLSTATEs a query on these pools returns when it
-/// lost a race and can succeed on retry. Part of this crate's API: callers
-/// write `pplx_space_postgres_pool::contention::…`.
-pub use pplx_space_postgres_contention as contention;
+pub mod contention;
 pub mod identity;
 
 const POOL_METRICS_INTERVAL: Duration = Duration::from_secs(10);

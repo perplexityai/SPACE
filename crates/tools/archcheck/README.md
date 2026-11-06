@@ -799,9 +799,9 @@ so a new table is declared by its owner before its migration lands (see
 ### Limits
 
 - The checks see direct dependencies only. An edge through a re-export, such
-  as a `legacy` crate's or a store's, is not seen. Only `stale_entries` looks
-  one crate further: a store user that depends on a `legacy` crate depending
-  on the store still uses it, so its entry stays.
+  as a `legacy` crate's, is not seen. Only `stale_entries` looks one crate
+  further: a store user that depends on a `legacy` crate depending on the
+  store still uses it, so its entry stays.
 - A Foundation crate that gains a required driver dependency gets a
   `storage_access` finding until it is added to `helpers`, and is no helper
   before: its dependents get `storage_access` findings only once it is

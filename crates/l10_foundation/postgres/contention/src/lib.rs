@@ -19,7 +19,7 @@
 //!
 //! It is its own crate because it depends only on SQLx's error types, so a
 //! crate that classifies these errors does not need `pplx-space-postgres-pool`,
-//! which re-exports it as `contention`. It is a classification helper,
+//! whose `contention` module delegates to it. It is a classification helper,
 //! not a storage layer: it owns no table and runs no statement, so the store
 //! boundary rules do not apply to it.
 

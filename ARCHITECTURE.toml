@@ -479,9 +479,6 @@ helpers = [
   "pplx-space-common-jobs",
   "pplx-space-migration-checksums",
   "pplx-space-object-store",
-  # Also reached through pplx-space-postgres-pool's `contention` re-export, an
-  # edge archcheck doesn't see: api, credmgr and internal-api-server classify
-  # the sqlx errors of their own baselined direct sqlx use with it.
   "pplx-space-postgres-contention",
   # The HTTP connector and per-operation tracing that plug into an
   # aws-sdk-s3 client's configuration, without depending on aws-sdk-s3: the
