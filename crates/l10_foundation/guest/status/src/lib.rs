@@ -54,3 +54,16 @@ pub const REQUEST_REFUSED: &str = "request-refused";
 /// sandbox is deleting or failed. Repeating the request cannot help until
 /// the caller wakes or replaces the sandbox.
 pub const SANDBOX_NOT_RUNNING: &str = "sandbox-not-running";
+
+/// [`ERROR_REASON_METADATA_KEY`] value of a process start that failed
+/// because of its `command`: the executable is missing, not executable, or
+/// in a format the kernel cannot run.
+pub const PROCESS_START_COMMAND: &str = "process-start-command";
+
+/// [`ERROR_REASON_METADATA_KEY`] value of a process start that failed
+/// because its working directory is missing or not a directory.
+pub const PROCESS_START_CWD: &str = "process-start-cwd";
+
+/// [`ERROR_REASON_METADATA_KEY`] value of a process start that failed
+/// because the account it asked to run as does not exist.
+pub const PROCESS_START_USER: &str = "process-start-user";
