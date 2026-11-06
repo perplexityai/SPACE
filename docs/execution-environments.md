@@ -1506,34 +1506,19 @@ environment in the `runtime_environments` catalog that isn't retired, read
 through the catalog store in
 `crates/l30_storage/runtime/environment/catalog/store`. Each row is an
 environment a node build has published as certified, and an operator retires
-one by setting `retired_at`. An authenticated registered node's publication now
-records its validated `environments.known` definitions in that catalog in the
-same transaction as its inventory. It does not wait for `usable`: a fresh
-node must advertise its compiled definitions before it can install their
-bytes. Missing or unavailable observations never erase the catalog, and a
-malformed definition or graph refuses the publication before catalog writes.
-Catalog publication is independent of the recipe cohort gate; enabling that
-gate starts installation, not certification collection.
+one by setting `retired_at`. Authenticated node publications validate and record
+`environments.known` in the inventory transaction, even before any environment is
+usable. Missing or unavailable observations do not erase the catalog.
 
-Upgrade and memory edges are a conservative intersection of **all accepted
-historical certifications**, not a last-writer-wins view or a set of live
-builds. Repeated identical reports do not rewrite catalog rows. A subsequent
-build can remove an edge but replaying an older report cannot add it back.
-Disagreement about a version ordering removes that ordering. There is no
-automatic expiry/regrowth protocol: expanding existing certifications needs
-separate operator-reviewed work. Publications never modify `retired_at`.
-Runtime-neutral definitions may omit a kernel or persisted-state format; their
-metadata columns are nullable, while the reference still covers the complete
-immutable descriptor. The additive metadata migration must land before the
-publisher application change.
+Compatibility edges intersect across accepted historical reports: older reports
+cannot restore removed edges, and conflicting version ordering becomes unknown.
+Identical reports do not rewrite rows; operator retirement is never changed.
+Expanding certifications requires separate reviewed work. Deploy the optional
+kernel/state-format metadata migration before this publisher.
 
-This repairs background provisioning intent, not request-driven preparation.
-An enabled cohort starts asynchronous installs on a later node-ctl pass;
-publishing a known definition does not mean the host is already usable.
-Execution permission, template selection, and scheduler readiness are
-unchanged. Roll out the publisher with awareness that already-enabled cohorts
-will begin receiving the populated catalog; no cohort flag is changed by the
-publisher.
+Already-enabled provisioning cohorts receive populated recipes after deployment.
+Installation remains asynchronous; publication does not grant execution
+permission or establish scheduler readiness. No cohort gate is changed.
 
 The recipe ignores execution policy: an environment
 with no state, or a blocked one, stays installed, so a later policy change finds

@@ -31,8 +31,6 @@ pub mod bootstrap_roles;
 pub mod migration_retry;
 #[cfg(test)]
 mod pg_test_support;
-#[cfg(test)]
-mod runtime_environment_metadata_tests;
 pub mod user_password;
 
 static POSTGRES_MIGRATOR: Migrator = sqlx::migrate!("../../../../db/postgres");

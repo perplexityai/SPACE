@@ -35,8 +35,6 @@ slow-timeout = { period = "30s", terminate-after = 4 }
 # only cost them their own container and their own copy of the template. Its
 # postgres_baseline_tests take the raw fixture too, and without the shared
 # server they would need a Docker socket the default CI job does not have.
-# Runtime-environment metadata compatibility tests clone the migrated template
-# and need the shared server for the same reason.
 # Spaced host tests use only local sockets; common-svc's dev dependency
 # otherwise pulls them into this transitive fixture selection.
 filter = '''
@@ -47,7 +45,6 @@ or test(postgres_collision_repair_tests)
 or test(postgres_lock_retry_tests)
 or (package(pplx-space-db-migrate) and test(user_password::))
 or (package(pplx-space-db-migrate) and test(postgres_baseline_tests::))
-or (package(pplx-space-db-migrate) and test(runtime_environment_metadata_tests::))
 '''
 setup = "postgres"
 
