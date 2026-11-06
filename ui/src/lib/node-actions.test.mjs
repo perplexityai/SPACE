@@ -89,6 +89,7 @@ test('the direct substrate keeps only undrain, and other roles get nothing', () 
         assert.deepEqual(names(node(phase, mode, role), 'space'), expected, `${role}, phase ${phase}, mode ${mode}`);
       }
       assert.deepEqual(names(node(phase, mode, 'cluster'), 'k8s'), [], `cluster node, phase ${phase}`);
+      assert.deepEqual(names(node(phase, mode, 'control'), 'k8s'), [], `unknown role, phase ${phase}, mode ${mode}`);
     }
   }
   assert.ok(names(node('drained', 'gentle', 'builder'), 'k8s').includes('terminate'));
