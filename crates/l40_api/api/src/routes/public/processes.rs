@@ -11,8 +11,8 @@ use pplx_space_common_core::types::{ProcessId, ProcessSignal};
 use pplx_space_metrics::response::{ResponseKind, ResponseOrigin};
 use pplx_space_metrics::sandbox::api::SandboxApiMetricIdentity;
 use pplx_space_public_api::{
-    DataPlaneProcessExitStatus, ProcessMutationResponse, ProcessSignalRequest, ProcessState,
-    PublicPage, PublicProcess, PublicSandboxId,
+    DataPlaneProcessExitStatus, DataPlaneSessionId, ProcessMutationResponse, ProcessSignalRequest,
+    ProcessState, PublicPage, PublicProcess, PublicSandboxId, process_id_for_session,
 };
 use pplx_space_sbx_mgr_client::operations as spaced_ops;
 use pplx_space_sbx_mgr_client::proto::{SpacedKillProcessRequest, SpacedSendSignalRequest};
@@ -60,8 +60,9 @@ pub async fn list_processes(
 ) -> Result<Json<PublicPage<PublicProcess>>, PublicApiError> {
     let cursor = query.cursor()?;
     let limit = query.limit();
-    let processes =
-        fetch_public_processes(authorized, &state, org.id, &sandbox_id, false, None).await?;
+    let sandbox = ensure_sandbox_owner(authorized, &state, org.id, &sandbox_id).await?;
+    let processes = fetch_public_processes(&state, &sandbox, false, None).await?;
+    let processes = list_under_session_ids(&state, org.id, &sandbox, processes).await?;
 
     Ok(Json(process_page(processes, cursor.as_ref(), limit)?))
 }
@@ -102,26 +103,23 @@ pub async fn get_process(
 ) -> Result<Json<PublicProcess>, PublicApiError> {
     let process_id = ProcessId::parse(process_id)
         .map_err(|_| PublicApiError::bad_request("invalid process id"))?;
+    let sandbox = ensure_sandbox_owner(authorized, &state, org.id, &sandbox_id).await?;
+    let guest_process_id = guest_process_id(&state, org.id, &sandbox, &process_id).await?;
     // Also an exited process the sandbox still retains, with its exit; the
     // list stays running-only. A guest that predates the filter lists every
     // process, so this still selects the one asked for.
-    let processes = fetch_public_processes(
-        authorized,
-        &state,
-        org.id,
-        &sandbox_id,
-        true,
-        Some(&process_id),
-    )
-    .await?;
+    let processes = fetch_public_processes(&state, &sandbox, true, Some(&guest_process_id)).await?;
     let Some(process) = processes
         .into_iter()
-        .find(|process| process.process_id == process_id)
+        .find(|process| process.process_id == guest_process_id)
     else {
         return Err(PublicApiError::not_found("process not found"));
     };
 
-    Ok(Json(process))
+    Ok(Json(PublicProcess {
+        process_id,
+        ..process
+    }))
 }
 
 pub async fn apply_process_action(
@@ -158,6 +156,7 @@ async fn apply_process_signal(
     signal: ProcessSignal,
 ) -> Result<Json<ProcessMutationResponse>, PublicApiError> {
     let sandbox = ensure_sandbox_owner(authorized, &state, org_id, &sandbox_id).await?;
+    let process_id = guest_process_id(&state, org_id, &sandbox, &process_id).await?;
     state
         .sandbox_controller
         .spaced_send_signal(
@@ -185,6 +184,7 @@ async fn apply_process_kill(
     process_id: ProcessId,
 ) -> Result<Json<ProcessMutationResponse>, PublicApiError> {
     let sandbox = ensure_sandbox_owner(authorized, &state, org_id, &sandbox_id).await?;
+    let process_id = guest_process_id(&state, org_id, &sandbox, &process_id).await?;
     state
         .sandbox_controller
         .spaced_kill_process(
@@ -221,21 +221,18 @@ fn parse_process_action_segment(value: &str) -> Result<(ProcessId, ProcessAction
 }
 
 async fn fetch_public_processes(
-    authorized: Option<Extension<AuthorizedSandbox>>,
     state: &AppState,
-    org_id: OrgId,
-    sandbox_id: &str,
+    sandbox: &Sandbox,
     include_exited: bool,
     process_id: Option<&ProcessId>,
 ) -> Result<Vec<PublicProcess>, PublicApiError> {
-    let sandbox = ensure_sandbox_owner(authorized, state, org_id, sandbox_id).await?;
     let sandbox_id = PublicSandboxId::from(sandbox.id);
 
     let response = state
         .sandbox_controller
         .spaced_list_processes(
             &state.pool,
-            &sandbox,
+            sandbox,
             SandboxApiMetricIdentity::native("process_list"),
             sandbox_id.into(),
             include_exited,
@@ -245,6 +242,62 @@ async fn fetch_public_processes(
         .map_err(controller_error)?;
 
     response.processes.into_iter().map(public_process).collect()
+}
+
+/// The id the sandbox's guest knows `process_id` by.
+///
+/// A session's process id is its session id, which the data plane assigns
+/// the guest process it starts. Guests that predate assigned ids ignore it
+/// and mint their own, which the data plane binds to the session, so a
+/// session id resolves through that binding. Any other id, and a session id
+/// the guest kept, is the guest's own.
+async fn guest_process_id(
+    state: &AppState,
+    org_id: OrgId,
+    sandbox: &Sandbox,
+    process_id: &ProcessId,
+) -> Result<ProcessId, PublicApiError> {
+    let Ok(session_id) = process_id.as_str().parse::<DataPlaneSessionId>() else {
+        return Ok(process_id.clone());
+    };
+    let bound = state
+        .public_session_store()
+        .bound_process_id(org_id, PublicSandboxId::from(sandbox.id), session_id)
+        .await?;
+    match bound {
+        Some(bound) => parse_guest_process_id(bound),
+        None => Ok(process_id.clone()),
+    }
+}
+
+/// Lists each process a guest that predates assigned ids started for a
+/// session under that session's id, the id the session returned, as a
+/// current guest lists it.
+async fn list_under_session_ids(
+    state: &AppState,
+    org_id: OrgId,
+    sandbox: &Sandbox,
+    mut processes: Vec<PublicProcess>,
+) -> Result<Vec<PublicProcess>, PublicApiError> {
+    let minted: Vec<String> = processes
+        .iter()
+        .map(|process| process.process_id.as_str())
+        .filter(|process_id| process_id.parse::<DataPlaneSessionId>().is_err())
+        .map(str::to_string)
+        .collect();
+    if minted.is_empty() {
+        return Ok(processes);
+    }
+    let sessions = state
+        .public_session_store()
+        .sessions_bound_to_processes(org_id, PublicSandboxId::from(sandbox.id), &minted)
+        .await?;
+    for process in &mut processes {
+        if let Some(session_id) = sessions.get(process.process_id.as_str()) {
+            process.process_id = process_id_for_session(*session_id);
+        }
+    }
+    Ok(processes)
 }
 
 async fn ensure_sandbox_owner(
@@ -290,12 +343,16 @@ pub(in crate::routes::public) fn controller_error(error: ControllerError) -> Pub
     }
 }
 
-fn public_process(info: spaced_ops::ProcessInfo) -> Result<PublicProcess, PublicApiError> {
-    let process_id = ProcessId::parse(info.process_id).map_err(|error| {
+fn parse_guest_process_id(process_id: String) -> Result<ProcessId, PublicApiError> {
+    ProcessId::parse(process_id).map_err(|error| {
         tracing::warn!(%error, "sandbox runtime returned an invalid process id");
         PublicApiError::internal()
             .with_classification(ResponseOrigin::Node, ResponseKind::BackendStatus)
-    })?;
+    })
+}
+
+fn public_process(info: spaced_ops::ProcessInfo) -> Result<PublicProcess, PublicApiError> {
+    let process_id = parse_guest_process_id(info.process_id)?;
     // A running process keeps its earlier wire shape: every exit field,
     // `state` included, is absent until the process has exited.
     let exit = info.exit.as_ref();
