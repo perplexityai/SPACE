@@ -288,8 +288,7 @@ impl KubernetesSubstrate {
         &self,
         metric_identity: pplx_space_metrics::sandbox::api::SandboxApiMetricIdentity,
         sandbox_id: SandboxId,
-        generation: i64,
-        pod_name: &str,
+        target: &PodProxyWaitTarget<'_>,
         deadline: Instant,
         phase: &'static str,
     ) -> Result<Option<PodIp>, SubstrateError> {
@@ -299,6 +298,56 @@ impl KubernetesSubstrate {
             return Ok(Some(pod_ip));
         }
 
+        // A node that refuses the pod at admission (memory, slots) leaves it
+        // Pending with no IP while kubelet retries the same node every ~15s;
+        // the refusal is visible only as a kubelet Event. Answer it now
+        // rather than at `deadline`, so the caller tears the pod down and the
+        // client retries onto a node with room.
+        let rejections = self.k8s.caches.sandbox_create_rejections.clone();
+        let wait = self.wait_for_assigned_pod_ip(
+            metric_identity,
+            sandbox_id,
+            target,
+            deadline,
+            phase,
+            started_at,
+        );
+        tokio::select! {
+            biased;
+            outcome = wait => outcome,
+            rejection = rejections.wait_for_rejection(target.pod_name, target.pod_uid) => {
+                pplx_space_metrics::sandbox::api::create_step_error(
+                    sandbox_id,
+                    metric_identity,
+                    "fc",
+                    None,
+                    "execution_watch",
+                    "node_admission_rejected",
+                    Some(phase),
+                );
+                tracing::warn!(
+                    sandbox_id = %sandbox_id,
+                    pod_name = %target.pod_name,
+                    node = rejection.node_name.as_deref().unwrap_or("unknown"),
+                    waited_ms = started_at.elapsed().as_millis() as u64,
+                    reason = %rejection.message,
+                    "sandbox node refused the pod at admission; failing the wait fast"
+                );
+                Err(node_admission_rejected_error(&rejection))
+            }
+        }
+    }
+
+    async fn wait_for_assigned_pod_ip(
+        &self,
+        metric_identity: pplx_space_metrics::sandbox::api::SandboxApiMetricIdentity,
+        sandbox_id: SandboxId,
+        target: &PodProxyWaitTarget<'_>,
+        deadline: Instant,
+        phase: &'static str,
+        started_at: Instant,
+    ) -> Result<Option<PodIp>, SubstrateError> {
+        let (generation, pod_name) = (target.generation, target.pod_name);
         match timeout_at(
             deadline,
             self.watch_until_pod_ip_assigned(sandbox_id, generation, pod_name)
@@ -388,14 +437,7 @@ impl KubernetesSubstrate {
         let sandbox_id_string = sandbox_id.to_string();
 
         let Some(pod_ip) = self
-            .wait_for_pod_ip_assignment(
-                metric_identity,
-                sandbox_id,
-                target.generation,
-                target.pod_name,
-                deadline,
-                phase,
-            )
+            .wait_for_pod_ip_assignment(metric_identity, sandbox_id, &target, deadline, phase)
             .instrument(tracing::info_span!(
                 "substrate.k8s.wait_pod_ip",
                 sandbox_id = %sandbox_id,
@@ -985,6 +1027,23 @@ pub(super) struct SwallowedCommandProbes {
     pub(super) deadline_exceeded: usize,
     /// The latest status a probe returned.
     pub(super) last_status: Option<tonic::Status>,
+}
+
+/// The create/wake wait's error when the pod's node refused it at admission.
+/// `Unavailable` (503, retryable) like an unschedulable pod: the create path
+/// deletes the pod synchronously and the client's retry is placed again. The
+/// message must not read as a node-mgr outage (`is_nodemgr_unreachable`),
+/// which would defer cleanup of a pod that still exists.
+pub(super) fn node_admission_rejected_error(
+    rejection: &super::sandbox_create_rejections::SandboxCreateRejection,
+) -> SubstrateError {
+    SubstrateError::Unavailable {
+        message: format!(
+            "sandbox node {} refused the pod at admission: {}",
+            rejection.node_name.as_deref().unwrap_or("unknown"),
+            rejection.message
+        ),
+    }
 }
 
 /// Identity of the execution pod a proxy-reachability wait targets. Groups
