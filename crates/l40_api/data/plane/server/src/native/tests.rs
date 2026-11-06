@@ -734,6 +734,43 @@ async fn process_exit_is_reported_only_after_its_binding_commits() {
     read_until(&mut chunks, &mut seen, "backend_closed").await;
 }
 
+/// A stream, SSE or WebSocket, records the bound process's exit before it
+/// reports the exit, so a client that reads the session after
+/// `process_exited` finds it closed; a reattach that reads the exit again
+/// records it again.
+#[tokio::test]
+async fn process_exit_is_recorded_before_the_client_sees_it() {
+    if !binding_fake_test_process() {
+        return;
+    }
+    let session_id = DataPlaneSessionId::new_for_kind(SessionKind::Process);
+    let fake = spawn_journal_fake(
+        session_id,
+        true,
+        Arc::new(|_, open| journal_replay(&JOURNAL, open)),
+    )
+    .await;
+    let process_id = pplx_space_public_api::process_id_for_session(session_id).to_string();
+
+    let (_state, mut chunks) = open_process_events(&fake.endpoint, session_id, None).await;
+    let mut seen = String::new();
+    read_until(&mut chunks, &mut seen, "process_exited").await;
+    assert_eq!(
+        *fake.exited_process_ids.lock().unwrap(),
+        std::slice::from_ref(&process_id),
+        "{seen}"
+    );
+
+    let mut tcp = attach_native_websocket(&fake.endpoint, session_id).await;
+    let mut seen = String::new();
+    read_websocket_until(&mut tcp, &mut seen, "process_exited").await;
+    assert_eq!(
+        *fake.exited_process_ids.lock().unwrap(),
+        [process_id.clone(), process_id],
+        "{seen}"
+    );
+}
+
 #[tokio::test]
 async fn failed_binding_ends_the_process_stream_with_a_retryable_error() {
     if !binding_fake_test_process() {
@@ -2364,6 +2401,8 @@ struct ProcessFake {
     release: Arc<tokio::sync::Semaphore>,
     bind_started: Arc<tokio::sync::Notify>,
     bound_process_ids: Arc<std::sync::Mutex<Vec<String>>>,
+    /// The process id of each exit a stream recorded, in order.
+    exited_process_ids: Arc<std::sync::Mutex<Vec<String>>>,
     calls: Arc<std::sync::Mutex<Vec<String>>>,
     started_stdin: Arc<std::sync::Mutex<Vec<bool>>>,
 }
@@ -2413,6 +2452,7 @@ async fn spawn_process_fake(
         release: Arc::new(tokio::sync::Semaphore::new(0)),
         bind_started: Arc::new(tokio::sync::Notify::new()),
         bound_process_ids: Arc::new(std::sync::Mutex::new(Vec::new())),
+        exited_process_ids: Arc::new(std::sync::Mutex::new(Vec::new())),
         calls: Arc::new(std::sync::Mutex::new(Vec::new())),
         started_stdin: Arc::new(std::sync::Mutex::new(Vec::new())),
     };
@@ -2423,6 +2463,7 @@ async fn spawn_process_fake(
     let release = Arc::clone(&fake.release);
     let bind_started = Arc::clone(&fake.bind_started);
     let bound_process_ids = Arc::clone(&fake.bound_process_ids);
+    let exited_process_ids = Arc::clone(&fake.exited_process_ids);
     let service = axum::Router::new().fallback(move |request: Request<Body>| {
         let mut route = route.clone();
         let process_id = process_id.clone();
@@ -2432,6 +2473,7 @@ async fn spawn_process_fake(
         let release = Arc::clone(&release);
         let bind_started = Arc::clone(&bind_started);
         let bound_process_ids = Arc::clone(&bound_process_ids);
+        let exited_process_ids = Arc::clone(&exited_process_ids);
         let calls = Arc::clone(&calls);
         let started_stdin = Arc::clone(&started_stdin);
         let route_lookups = Arc::clone(&route_lookups);
@@ -2465,6 +2507,13 @@ async fn spawn_process_fake(
                 return crate::tests::grpc_test_response(Vec::new());
             }
             if path.ends_with("/RecordDataPlaneSessionReconnect") {
+                return crate::tests::grpc_test_response(Vec::new());
+            }
+            if path.ends_with("/RecordDataPlaneSessionProcessExited") {
+                let body = request.into_body().collect().await.unwrap().to_bytes();
+                let request =
+                    RecordDataPlaneSessionProcessExitedRequest::decode(&body[5..]).unwrap();
+                exited_process_ids.lock().unwrap().push(request.process_id);
                 return crate::tests::grpc_test_response(Vec::new());
             }
             let open = if path.ends_with("/SpacedWatch") {

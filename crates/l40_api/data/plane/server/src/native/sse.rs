@@ -921,10 +921,19 @@ async fn next_process_sse_frame(state: &mut ProcessSseState) -> Option<Event> {
                             .frames
                             .iter()
                             .any(|frame| matches!(frame, DataPlaneServerFrame::ProcessExited { .. }))
-                            && let Err(error) = settle_process_binding(&mut state.binding).await
                         {
-                            state.finish_with_error(error);
-                            return state.pending.pop_front();
+                            if let Err(error) = settle_process_binding(&mut state.binding).await {
+                                state.finish_with_error(error);
+                                return state.pending.pop_front();
+                            }
+                            if let Some(process_id) = state.process_id.as_ref() {
+                                record_session_process_exited(
+                                    &state.state,
+                                    state.session_id,
+                                    process_id,
+                                )
+                                .await;
+                            }
                         }
                         record_process_output_bytes(state.session_id.kind().as_str(), &batch);
                         for frame in batch.frames {

@@ -1414,6 +1414,16 @@ impl ClusterApi for ClusterApiService {
         Ok(Response::new(response))
     }
 
+    async fn record_data_plane_session_process_exited(
+        &self,
+        request: Request<RecordDataPlaneSessionProcessExitedRequest>,
+    ) -> Result<Response<RecordDataPlaneSessionProcessExitedResponse>, Status> {
+        let response =
+            data_plane_sessions::record_session_process_exited(&self.pool, request.into_inner())
+                .await?;
+        Ok(Response::new(response))
+    }
+
     async fn record_data_plane_session_reconnect(
         &self,
         request: Request<RecordDataPlaneSessionReconnectRequest>,
