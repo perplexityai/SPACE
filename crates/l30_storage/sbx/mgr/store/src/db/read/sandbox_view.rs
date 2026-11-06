@@ -26,7 +26,7 @@ use pplx_space_node_mgr_protocol::execution_fence::ExecutionFence;
 use rusqlite::params;
 
 use crate::auto_lifecycle_delete_receipts::AutoLifecycleDeleteReceipt;
-use crate::db::guest_health_scan::HealthProbeContextRead;
+use crate::db::guest_health_scan::StateLabelRead;
 use crate::db::inventory_read::InventoryReadError;
 use crate::db::local_artifact_leases::NamedArtifactPublication;
 use crate::db::route_activation_claims::OpenRouteActivationClaim;
@@ -486,10 +486,10 @@ pub struct SandboxViews<'c> {
 }
 
 impl<'c> SandboxViews<'c> {
-    /// Each sandbox's health-probe context, `None` without a row, through
+    /// Each sandbox's `state` label as stored, `None` without a row, through
     /// one prepared statement. Only preparing it fails the whole read; each
     /// id's read fails on its own.
-    pub fn health_probe_contexts(self) -> Result<Vec<(&'c String, HealthProbeContextRead)>> {
-        crate::db::guest_health_scan::health_probe_contexts_for_ids(self.conn, self.ids)
+    pub fn state_labels(self) -> Result<Vec<(&'c String, StateLabelRead)>> {
+        crate::db::guest_health_scan::state_labels_for_ids(self.conn, self.ids)
     }
 }

@@ -1233,21 +1233,16 @@ the distribution `sandbox.resource.memory.guest_used_bytes`: the guest's
 reports it on the bridge `Ping` the health probe already sends about every 24
 to 37 seconds, so there is no separate schedule.
 
-The template tag travels with the probe from the existing lifecycle lookup
-at dispatch. Recording the memory sample does not perform another database read.
-
-| Tag | Values |
-| --- | --- |
-| `template` | The sandbox's template |
-
-Deployment dimensions such as `cluster_id` and `env` come from the metrics
-sink. No sandbox ID, host or `client_id` is attached.
+Recording the memory sample does not perform another database read or require
+template metadata. No explicit tags are attached: deployment dimensions such
+as `cluster_id` and `env` come from the metrics sink. Template attribution is
+not currently supported, and no sandbox ID, host or `client_id` is attached.
 
 A sample is recorded once per probe whose result sandbox-manager accepts: a
 probe that crossed a lifecycle edge, or whose sandbox was removed, is
 discarded. Every `started` sandbox contributes, including unclaimed warm-pool
 members; paused, quarantined and other sandboxes do not. Pool and workload
-readings share the same template distribution. A guest that predates the field,
+readings share the same distribution. A guest that predates the field,
 the Windows guest, a guest that cannot read or make sense of `/proc/meminfo`,
 and a failed `Ping` report nothing, and nothing is recorded for that probe;
 zero is a valid sample. A reading is never kept or repeated.

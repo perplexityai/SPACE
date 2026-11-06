@@ -424,18 +424,14 @@ impl Seeded {
     }
 }
 
-type ProbeContexts<'a> = crate::db::Result<
-    Vec<(
-        &'a String,
-        crate::db::guest_health_scan::HealthProbeContextRead,
-    )>,
->;
+type Labels<'a> =
+    crate::db::Result<Vec<(&'a String, crate::db::guest_health_scan::StateLabelRead)>>;
 
 /// The old batch reader keyed one id; the view's answer for that id.
-fn first_probe_context(result: ProbeContexts<'_>) -> Answer {
+fn first_label(result: Labels<'_>) -> Answer {
     match result {
-        Ok(contexts) => match contexts.into_iter().next() {
-            Some((_, context)) => opt(context),
+        Ok(labels) => match labels.into_iter().next() {
+            Some((_, label)) => opt(label),
             None => N,
         },
         Err(_) => E,
@@ -552,12 +548,10 @@ fn cases() -> Vec<Case> {
             expected: [T, T, F, T],
         },
         Case {
-            accessor: "health_probe_contexts",
-            view: |s| {
-                first_probe_context(sandbox_views(&s.conn, &s.main_ids).health_probe_contexts())
-            },
+            accessor: "state_labels",
+            view: |s| first_label(sandbox_views(&s.conn, &s.main_ids).state_labels()),
             old: |s| {
-                first_probe_context(crate::db::guest_health_scan::health_probe_contexts_for_ids(
+                first_label(crate::db::guest_health_scan::state_labels_for_ids(
                     &s.conn,
                     &s.main_ids,
                 ))

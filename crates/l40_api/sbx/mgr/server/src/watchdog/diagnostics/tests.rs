@@ -4,7 +4,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tokio::sync::Mutex;
 
-use super::super::tests::{sample, test_health, test_probe_context};
+use super::super::tests::{sample, test_health};
 use super::super::{ComposedProbeResult, apply_composed_health_result};
 use super::*;
 
@@ -26,7 +26,7 @@ async fn apply_guest_outcome(
         db,
         Some(Ok((
             sandbox_id.to_string(),
-            Some(test_probe_context(crate::state::SandboxState::Started)),
+            Some(crate::state::SandboxState::Started),
             0,
             ComposedProbeResult {
                 observations,

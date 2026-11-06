@@ -5,13 +5,6 @@ use pplx_space_common_core::types::{
     SandboxRuntimeLabel, SpaceApiRouteIdentity,
 };
 
-pub(super) fn test_probe_context(state: crate::state::SandboxState) -> SandboxHealthProbeContext {
-    SandboxHealthProbeContext {
-        state,
-        template: Some("seed".to_owned()),
-    }
-}
-
 #[tokio::test]
 async fn gateway_metric_registry_forgets_retired_builds() {
     let state = Arc::new(Mutex::new(HashMap::new()));
@@ -1288,7 +1281,7 @@ async fn lifecycle_edge_preserves_status_and_discards_in_flight_probe() {
         &db,
         Some(Ok((
             sandbox_id.clone(),
-            Some(test_probe_context(crate::state::SandboxState::Started)),
+            Some(crate::state::SandboxState::Started),
             0,
             ComposedProbeResult {
                 observations,
@@ -1314,8 +1307,8 @@ async fn lifecycle_edge_preserves_status_and_discards_in_flight_probe() {
 }
 
 /// An accepted probe yields its guest's used memory only for a `started`
-/// sandbox, including idle warm-pool members, with the sandbox's own
-/// template; a discarded probe yields nothing. Memory never moves health:
+/// sandbox, including idle warm-pool members; a discarded probe yields
+/// nothing. Memory never moves health:
 /// each case's status matches the same probe without it.
 #[tokio::test]
 async fn accepted_probe_yields_guest_memory_only_for_a_running_sandbox() {
@@ -1328,7 +1321,6 @@ async fn accepted_probe_yields_guest_memory_only_for_a_running_sandbox() {
         lifecycle: Option<crate::state::SandboxState>,
         stale: bool,
         removed: bool,
-        poisoned_after_dispatch: bool,
         guest: HealthProbeOutcome,
         memory: Option<u64>,
         /// `None` when the probe is discarded.
@@ -1341,7 +1333,6 @@ async fn accepted_probe_yields_guest_memory_only_for_a_running_sandbox() {
         lifecycle: Some(Started),
         stale: false,
         removed: false,
-        poisoned_after_dispatch: false,
         guest: HealthProbeOutcome::Success,
         memory,
         expected,
@@ -1351,14 +1342,6 @@ async fn accepted_probe_yields_guest_memory_only_for_a_running_sandbox() {
         case("running workload", Some(used), Some(Some(used))),
         case("nothing used", Some(0), Some(Some(0))),
         case("guest without the field", None, Some(None)),
-        Case {
-            poisoned_after_dispatch: true,
-            ..case(
-                "database unavailable after dispatch",
-                Some(used),
-                Some(Some(used)),
-            )
-        },
         Case {
             guest: HealthProbeOutcome::Unavailable,
             ..case("failed ping", None, Some(None))
@@ -1391,7 +1374,11 @@ async fn accepted_probe_yields_guest_memory_only_for_a_running_sandbox() {
         },
         Case {
             row: None,
-            ..case("row gone", Some(used), Some(None))
+            ..case(
+                "no database row needed for memory",
+                Some(used),
+                Some(Some(used)),
+            )
         },
     ];
 
@@ -1413,21 +1400,6 @@ async fn accepted_probe_yields_guest_memory_only_for_a_running_sandbox() {
             health.lifecycle_epoch = u64::from(case.stale);
             let state = Arc::new(Mutex::new(HashMap::from([(sandbox_id.clone(), health)])));
             let db = crate::db::SharedConnection::new(conn);
-            let context = sandbox_probe_contexts_for_ids(&db, std::slice::from_ref(&sandbox_id))
-                .expect("dispatch lookup")
-                .remove(&sandbox_id)
-                .filter(|_| case.lifecycle.is_some());
-            if case.poisoned_after_dispatch {
-                let db = db.clone();
-                assert!(
-                    std::thread::spawn(move || {
-                        let _guard = db.lock().expect("database available at dispatch");
-                        panic!("simulate a database failure while the probe is in flight");
-                    })
-                    .join()
-                    .is_err()
-                );
-            }
             let mut observations = std::array::from_fn(|_| sample(HealthProbeOutcome::Success));
             observations[2] = sample(case.guest);
             async move {
@@ -1439,7 +1411,7 @@ async fn accepted_probe_yields_guest_memory_only_for_a_running_sandbox() {
                     &db,
                     Some(Ok((
                         sandbox_id.clone(),
-                        context,
+                        case.lifecycle,
                         0,
                         ComposedProbeResult {
                             observations,
@@ -1454,23 +1426,14 @@ async fn accepted_probe_yields_guest_memory_only_for_a_running_sandbox() {
                     .await
                     .get(&sandbox_id)
                     .map(|health| health.health_status);
-                (accepted.map(|accepted| accepted.guest_memory), status)
+                (accepted.map(|accepted| accepted.memory_used_bytes), status)
             }
         };
 
         let (guest_memory, status) = apply(case.memory).await;
         let (_, status_without_memory) = apply(None).await;
 
-        assert_eq!(
-            guest_memory,
-            case.expected
-                .map(|bytes| bytes.map(|used_bytes| GuestMemorySample {
-                    template: "seed".to_owned(),
-                    used_bytes,
-                })),
-            "{}",
-            case.name
-        );
+        assert_eq!(guest_memory, case.expected, "{}", case.name);
         assert_eq!(status, status_without_memory, "{}", case.name);
     }
 }
@@ -1490,7 +1453,7 @@ async fn guest_memory_is_not_replayed_by_a_later_probe() {
     let probe = |memory_used_bytes| {
         Some(Ok((
             sandbox_id.clone(),
-            Some(test_probe_context(crate::state::SandboxState::Started)),
+            Some(crate::state::SandboxState::Started),
             0,
             ComposedProbeResult {
                 observations: std::array::from_fn(|_| sample(HealthProbeOutcome::Success)),
@@ -1507,11 +1470,8 @@ async fn guest_memory_is_not_replayed_by_a_later_probe() {
         .await
         .expect("current probe is accepted");
 
-    assert_eq!(
-        first.guest_memory.map(|sample| sample.used_bytes),
-        Some(1 << 20)
-    );
-    assert_eq!(later.guest_memory, None);
+    assert_eq!(first.memory_used_bytes, Some(1 << 20));
+    assert_eq!(later.memory_used_bytes, None);
 }
 
 #[tokio::test]
@@ -1530,7 +1490,7 @@ async fn missing_guest_uptime_preserves_last_observation() {
         &db,
         Some(Ok((
             sandbox_id.clone(),
-            Some(test_probe_context(crate::state::SandboxState::Started)),
+            Some(crate::state::SandboxState::Started),
             0,
             ComposedProbeResult {
                 observations: std::array::from_fn(|_| sample(HealthProbeOutcome::Success)),
@@ -1653,7 +1613,7 @@ async fn successful_health_probes_leave_failed_lifecycle_unchanged() {
             &db,
             Some(Ok((
                 sandbox_id.clone(),
-                Some(test_probe_context(crate::state::SandboxState::Failed)),
+                Some(crate::state::SandboxState::Failed),
                 0,
                 ComposedProbeResult {
                     observations: [
@@ -1819,7 +1779,7 @@ impl DeadGatewayFixture {
             &self.db,
             Some(Ok((
                 self.sandbox_id.to_owned(),
-                Some(test_probe_context(crate::state::SandboxState::Started)),
+                Some(crate::state::SandboxState::Started),
                 0,
                 ComposedProbeResult {
                     observations: [

@@ -258,16 +258,14 @@ class TelemetryDeliveryAssertions:
         )
 
     def expect_guest_memory_used(
-        self, *, template: str, total_bytes: int, used_bytes: int
+        self, *, total_bytes: int, used_bytes: int
     ) -> None:
         """Fresh watchdog byte counts agree with this idle guest's meminfo."""
 
         metric = "space_sandbox_resource_memory_guest_used_bytes"
         self._fixture.verify(self._node is not None, "the shim's spans named no Kind node")
-        selector = (
-            f"{metric}{{template={json.dumps(template)},"
-            f"k8s_node_name={json.dumps(self._node)}}}"
-        )
+        # An empty label matcher selects series without template attribution.
+        selector = f'{metric}{{template="",k8s_node_name={json.dumps(self._node)}}}'
         queries = {
             part: f"sum(histogram_{part}({selector}))"
             for part in ("count", "sum")

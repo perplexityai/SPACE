@@ -51,7 +51,6 @@ def telemetry_reaches_local_backends(test: smoke.KindEcw) -> None:
         test.verify(0 < used <= total, "guest meminfo is not a valid memory observation")
         test.record("guest_meminfo_bytes", {"total": total, "used": used})
         telemetry.expect_guest_memory_used(
-            template=test.sandbox_template_name().partition("@")[0],
             total_bytes=total,
             used_bytes=used,
         )
