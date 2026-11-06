@@ -2134,6 +2134,10 @@ fn system_template_recipe(
     })
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the build request's fields plus its target; bundling them only moves the list"
+)]
 async fn submit_admin_template_build(
     state: AppState,
     target: TemplateBuildTarget,
