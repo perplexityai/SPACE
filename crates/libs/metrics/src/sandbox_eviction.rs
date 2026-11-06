@@ -39,6 +39,9 @@ pub fn tick(result: &str, started_at: Instant, candidates: u64) {
 ///   nothing can restore the bytes.
 /// - `execution_retired` — the cluster refused a teardown suspend's
 ///   backup because it had retired the execution that captured it.
+/// - `stale_upgrade_copy` — a runtime upgrade decided from another
+///   checkpoint found this suspended copy, proven backed for its exact
+///   pinned artifact, and evicted it to stage the decided checkpoint.
 pub fn evicted(reason: &str) {
     counter("sandbox.evict.evicted", 1, &[tag("reason", reason)]);
 }

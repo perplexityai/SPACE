@@ -217,10 +217,9 @@ impl EvictionConfig {
 }
 
 /// Why a candidate is evictable. Doubles as the `reason` tag on
-/// `sandbox.evict.evicted` and the sandbox event detail. There is
-/// deliberately only one reason: every eviction must carry a proof
-/// tied to the exact bytes being deleted ("a newer generation exists
-/// elsewhere" is not such a proof and was removed).
+/// `sandbox.evict.evicted` and the sandbox event detail. Each reason
+/// names a proof tied to the exact bytes being deleted ("a newer
+/// generation exists elsewhere" is not such a proof and was removed).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum EvictReason {
     /// The bytes on disk are provably backed: the pinned artifact's
@@ -241,6 +240,11 @@ pub(crate) enum EvictReason {
     /// restore can adopt, so it's discarded unpublished. Driven by the
     /// teardown driver, not by this loop.
     ExecutionRetired,
+    /// A runtime upgrade decided from another checkpoint found this suspended
+    /// copy, and the copy's pinned artifact was proven backed for its exact
+    /// id, so it makes way for the decided checkpoint's staging. Driven by the
+    /// upgrade, not by this loop.
+    StaleUpgradeCopy,
 }
 
 impl EvictReason {
@@ -249,6 +253,7 @@ impl EvictReason {
             EvictReason::LatestBackedIdle => "latest_backed_idle",
             EvictReason::ClusterRowAbsent => "cluster_row_absent",
             EvictReason::ExecutionRetired => "execution_retired",
+            EvictReason::StaleUpgradeCopy => "stale_upgrade_copy",
         }
     }
 }
@@ -927,6 +932,38 @@ async fn prove_pinned_artifact(
     Ok(true)
 }
 
+/// A cluster-api client for one sandbox's backup readiness `check`; a
+/// failure to connect is [`SkipReason::RpcTransportError`], logged as the
+/// check's.
+async fn connect_cluster(
+    sandbox_id: &str,
+    check: &'static str,
+) -> Result<pplx_space_node_api_client::cluster::AuthenticatedClusterApiClient, SkipReason> {
+    pplx_space_node_api_client::cluster::connect_from_env()
+        .await
+        .map_err(|error| {
+            warn!(sandbox_id, %error, "{check} could not reach cluster-api");
+            SkipReason::RpcTransportError
+        })
+}
+
+/// Whether `pinned` is proven backed by the same evidence eviction acts on:
+/// its local `backup_completed_at` marker, or else the cluster's exact-artifact
+/// readiness check ([`prove_pinned_artifact`]). `Ok(false)` when the cluster
+/// has no ready backup of it; a failure to get an answer is its classified
+/// reason.
+pub(crate) async fn prove_pinned_backup(
+    service: &SandboxManagerService,
+    sandbox_id: &str,
+    pinned: &PinnedArtifact,
+) -> Result<bool, SkipReason> {
+    if pinned.backup_marker {
+        return Ok(true);
+    }
+    let mut cluster = connect_cluster(sandbox_id, "pinned artifact backup proof").await?;
+    prove_pinned_artifact(&mut cluster, service, sandbox_id, pinned).await
+}
+
 /// Stamp `artifact_id`'s `backup_completed_at` marker after the cluster proved
 /// its backup ready. Returns whether the stamp was written; a failure is
 /// logged. Eviction needs only the proof and re-proves next tick; the
@@ -996,12 +1033,7 @@ pub(crate) async fn prove_local_artifact_backups(
     if artifacts.is_empty() {
         return Ok(true);
     }
-    let mut cluster = pplx_space_node_api_client::cluster::connect_from_env()
-        .await
-        .map_err(|error| {
-            warn!(sandbox_id, %error, "local artifact backup proof could not reach cluster-api");
-            SkipReason::RpcTransportError
-        })?;
+    let mut cluster = connect_cluster(sandbox_id, "local artifact backup proof").await?;
     for artifact in artifacts {
         if !backup_ready(
             &mut cluster,
@@ -1025,12 +1057,7 @@ pub(crate) async fn prove_local_artifact_backups(
 /// sandbox that isn't restorable.
 pub(crate) async fn sandbox_has_backed_copy(sandbox_id: &str) -> Result<bool, SkipReason> {
     use pplx_space_node_api_client::proto::backup_readiness_query::Artifact;
-    let mut cluster = pplx_space_node_api_client::cluster::connect_from_env()
-        .await
-        .map_err(|error| {
-            warn!(sandbox_id, %error, "backed-copy check could not reach cluster-api");
-            SkipReason::RpcTransportError
-        })?;
+    let mut cluster = connect_cluster(sandbox_id, "backed-copy check").await?;
     backup_ready(&mut cluster, sandbox_id, Artifact::DurablyRestorable(true)).await
 }
 

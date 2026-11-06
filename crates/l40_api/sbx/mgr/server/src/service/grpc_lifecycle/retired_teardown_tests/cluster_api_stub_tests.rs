@@ -305,8 +305,26 @@ where
 /// Serves `stub` and runs `test` in an isolated child process whose
 /// cluster-api client wiring points at it, with a synthetic snapshot upload
 /// destination configured.
-pub(in crate::service::grpc_lifecycle) async fn with_cluster_api<S>(
+pub(in crate::service) async fn with_cluster_api<S>(stub: S, test: impl AsyncFnOnce())
+where
+    S: tower::Service<
+            http::Request<tonic::body::Body>,
+            Response = http::Response<tonic::body::Body>,
+            Error = std::convert::Infallible,
+        > + tonic::server::NamedService
+        + Clone
+        + Send
+        + Sync
+        + 'static,
+    S::Future: Send + 'static,
+{
+    with_cluster_api_and_env(stub, &[], test).await;
+}
+
+/// [`with_cluster_api`], with the child's environment also setting `extra`.
+pub(in crate::service) async fn with_cluster_api_and_env<S>(
     stub: S,
+    extra: &[(&str, Option<&std::ffi::OsStr>)],
     test: impl AsyncFnOnce(),
 ) where
     S: tower::Service<
@@ -339,7 +357,7 @@ pub(in crate::service::grpc_lifecycle) async fn with_cluster_api<S>(
     std::fs::write(token.path(), "synthetic-backup-test-token").unwrap();
     let admitted = tempfile::NamedTempFile::new().unwrap();
     let finalized = tempfile::NamedTempFile::new().unwrap();
-    let child = pplx_space_test_env::enter_test_process(&[
+    let mut vars = vec![
         ADMITTED_REGISTRATIONS.serve_into(&admitted),
         FINALIZED_BACKUPS.serve_into(&finalized),
         ("SPACE_INTERNAL_RPC_INSECURE_DEV", Some(OsStr::new("1"))),
@@ -361,7 +379,9 @@ pub(in crate::service::grpc_lifecycle) async fn with_cluster_api<S>(
         // environment; keep the child off any provider the host configures.
         ("EPPO_SDK_KEY", None),
         ("SPACE_FLAGD_ENABLED", None),
-    ]);
+    ];
+    vars.extend_from_slice(extra);
+    let child = pplx_space_test_env::enter_test_process(&vars);
     if child {
         test().await;
     }
@@ -388,4 +408,38 @@ pub(super) fn bound_upload_payload(
     );
     payload.execution_generation = Some(generation(GENERATION));
     payload
+}
+
+/// A gRPC handler answering one request type, for [`answer`].
+struct Answer<F, Resp>(std::sync::Arc<F>, std::marker::PhantomData<fn() -> Resp>);
+
+impl<Req, Resp, F> tonic::server::UnaryService<Req> for Answer<F, Resp>
+where
+    F: Fn(Req) -> Result<Resp, tonic::Status>,
+{
+    type Response = Resp;
+    type Future = std::future::Ready<Result<tonic::Response<Resp>, tonic::Status>>;
+
+    fn call(&mut self, request: tonic::Request<Req>) -> Self::Future {
+        std::future::ready((self.0)(request.into_inner()).map(tonic::Response::new))
+    }
+}
+
+/// Answer one gRPC `request` with `handler`, for a stub's `tower::Service`.
+pub(in crate::service) async fn answer<B, Req, Resp>(
+    request: http::Request<B>,
+    handler: impl Fn(Req) -> Result<Resp, tonic::Status>,
+) -> http::Response<tonic::body::Body>
+where
+    B: http_body::Body + Send + 'static,
+    B::Error: Into<tonic::codegen::StdError> + Send + 'static,
+    Req: prost::Message + Default + Send + 'static,
+    Resp: prost::Message + Send + 'static,
+{
+    tonic::server::Grpc::new(tonic_prost::ProstCodec::<Resp, Req>::default())
+        .unary(
+            Answer(std::sync::Arc::new(handler), std::marker::PhantomData),
+            request,
+        )
+        .await
 }

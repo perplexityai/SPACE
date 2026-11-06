@@ -268,6 +268,38 @@ fn direct_route_identity(
     })
 }
 
+/// The newest activation generation a row retains, route or execution, which
+/// a requested activation must be newer than to pass the generation fence.
+pub(super) fn retained_activation_generation(
+    provenance: &crate::db::ActivationRouteProvenance,
+) -> Option<u64> {
+    [
+        provenance
+            .retained_route_generation
+            .map(RouteGeneration::get),
+        provenance
+            .retained_execution_generation
+            .and_then(|value| u64::try_from(value.get()).ok()),
+    ]
+    .into_iter()
+    .flatten()
+    .max()
+}
+
+/// The oldest generation, route or execution, an activation identity names,
+/// which the generation fence holds against [`retained_activation_generation`].
+pub(super) fn requested_activation_generation(identity: &SpaceApiRouteIdentity) -> Option<u64> {
+    [
+        identity.route_generation.map(RouteGeneration::get),
+        identity
+            .execution_generation
+            .and_then(|value| u64::try_from(value.get()).ok()),
+    ]
+    .into_iter()
+    .flatten()
+    .min()
+}
+
 fn resolved_requested_runtime_activation_identity(
     requested: SpaceApiRouteIdentity,
     identity_free_pool_donor: bool,
@@ -449,6 +481,48 @@ impl SandboxManagerService {
         )
     }
 
+    /// Refuse an activation identity that names another node.
+    fn require_identity_on_this_node(
+        &self,
+        identity: &SpaceApiRouteIdentity,
+    ) -> Result<(), Status> {
+        if let Some(requested_node_id) = identity.current_node_id {
+            let local_node_id = self.local_node_id.or_else(local_space_node_id).ok_or_else(|| {
+                Status::failed_precondition(
+                    "runtime activation identity validation requires SPACE_NODE_ID or a populated /space/etc/node-id",
+                )
+            })?;
+            if requested_node_id != local_node_id {
+                return Err(Status::failed_precondition(format!(
+                    "runtime activation identity targets node {requested_node_id}, but this sandbox-manager is node {local_node_id}",
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// The identity [`Self::resolve_runtime_activation_identity`] admits for
+    /// `sandbox_id` once this node holds no row of it, which could supply
+    /// provenance or a retained generation. A caller about to remove the row
+    /// checks it first, so an identity the stage that follows would refuse
+    /// removes nothing.
+    pub(super) fn resolve_rowless_activation_identity(
+        &self,
+        sandbox_id: &str,
+        requested: SpaceApiRouteIdentity,
+    ) -> Result<SpaceApiRouteIdentity, Status> {
+        validate_route_identity_sandbox(&requested, sandbox_id)?;
+        let identity =
+            resolved_requested_runtime_activation_identity(requested, false, self.local_node_id)
+                .ok_or_else(|| {
+                    pplx_space_sbx_mgr_client::authoritative_route_identity_required_status(
+                        "identity-free activation has no local route provenance; supply an authoritative route identity",
+                    )
+                })?;
+        self.require_identity_on_this_node(&identity.identity)?;
+        Ok(identity.identity)
+    }
+
     pub(super) fn resolve_runtime_activation_identity_with_authority(
         &self,
         sandbox_id: &str,
@@ -467,18 +541,7 @@ impl SandboxManagerService {
         ) {
             let generation_fence_enabled =
                 pplx_space_common_svc::space_api_route::space_api_route_generation_fence_enabled();
-            if let Some(requested_node_id) = identity.identity.current_node_id {
-                let local_node_id = self.local_node_id.or_else(local_space_node_id).ok_or_else(|| {
-                    Status::failed_precondition(
-                        "runtime activation identity validation requires SPACE_NODE_ID or a populated /space/etc/node-id",
-                    )
-                })?;
-                if requested_node_id != local_node_id {
-                    return Err(Status::failed_precondition(format!(
-                        "runtime activation identity targets node {requested_node_id}, but this sandbox-manager is node {local_node_id}",
-                    )));
-                }
-            }
+            self.require_identity_on_this_node(&identity.identity)?;
             let provenance = {
                 let db = self.db_conn()?;
                 match crate::db::read::sandbox_view(&db, sandbox_id).activation_route_provenance() {
@@ -528,27 +591,8 @@ impl SandboxManagerService {
                 }
             };
             if let Some(provenance) = provenance {
-                let retained_generation = [
-                    provenance
-                        .retained_route_generation
-                        .map(RouteGeneration::get),
-                    provenance
-                        .retained_execution_generation
-                        .and_then(|value| u64::try_from(value.get()).ok()),
-                ]
-                .into_iter()
-                .flatten()
-                .max();
-                let requested_generation = [
-                    identity.identity.route_generation.map(RouteGeneration::get),
-                    identity
-                        .identity
-                        .execution_generation
-                        .and_then(|value| u64::try_from(value.get()).ok()),
-                ]
-                .into_iter()
-                .flatten()
-                .min();
+                let retained_generation = retained_activation_generation(&provenance);
+                let requested_generation = requested_activation_generation(&identity.identity);
                 if let (Some(retained), Some(requested)) =
                     (retained_generation, requested_generation)
                     && requested <= retained

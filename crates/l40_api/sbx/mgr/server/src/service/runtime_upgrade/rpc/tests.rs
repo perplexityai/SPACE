@@ -46,7 +46,7 @@ fn pod_identity(sandbox_id: &str, pod_uid: &str, generation: i64) -> SpaceApiRou
 
 /// The `UpgradeRuntime` a runtime upgrade pod's shim sends: the pod's own
 /// cold start, with its namespace and route identity.
-fn pod_upgrade(
+pub(in crate::service::runtime_upgrade) fn pod_upgrade(
     sandbox_id: &str,
     target: &ExecutionMetadata,
     operation_id: RuntimeUpgradeOperationId,
@@ -70,11 +70,11 @@ fn pod_upgrade(
     }
 }
 
-fn operation() -> RuntimeUpgradeOperationId {
+pub(in crate::service::runtime_upgrade) fn operation() -> RuntimeUpgradeOperationId {
     RuntimeUpgradeOperationId::from_uuid(uuid::Uuid::now_v7())
 }
 
-fn authorization() -> RuntimeUpgradeAuthorization {
+pub(in crate::service::runtime_upgrade) fn authorization() -> RuntimeUpgradeAuthorization {
     RuntimeUpgradeAuthorization {
         authorization_id: "environment-block-e0".into(),
         reason: "e0 runs a blocked runtime".into(),
@@ -114,7 +114,7 @@ impl Fixture {
     }
 }
 
-async fn upgrade(
+pub(in crate::service::runtime_upgrade) async fn upgrade(
     service: &SandboxManagerService,
     request: UpgradeRuntimeRequest,
 ) -> Result<crate::proto::UpgradeRuntimeResponse, Status> {
