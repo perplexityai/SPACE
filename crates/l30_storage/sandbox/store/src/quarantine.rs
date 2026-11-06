@@ -14,8 +14,8 @@ use pplx_space_common_core::types::{NodeId, SandboxId, SandboxTransitionTargetSt
 ///
 /// `clear_placement_changed_at` also clears `placement_changed_at`, as a
 /// retired restore's revert does. The write re-checks that the row is still on
-/// `node_id` and outside the `quarantined`, `deleted`, `deleting` and
-/// `cleanup_required` lifecycles, compared exactly, and checks no execution:
+/// `node_id` and outside the `quarantined`, `deleted` and `deleting`
+/// lifecycles, compared exactly, and checks no execution:
 /// the caller fences the receipt by first retiring the exact execution
 /// generation and activation attempt it names, and its candidate selection
 /// holds the row `FOR UPDATE` in the same transaction. The caller treats
@@ -38,7 +38,7 @@ pub async fn converge_activation_rollback(
                     placement_changed_at = CASE WHEN $4 THEN NULL ELSE placement_changed_at END
               WHERE id = $1
                 AND active_node_id = $2
-                AND lifecycle NOT IN ('quarantined', 'deleted', 'deleting', 'cleanup_required')"
+                AND lifecycle NOT IN ('quarantined', 'deleted', 'deleting')"
     ))
     .bind(sandbox_id)
     .bind(node_id)

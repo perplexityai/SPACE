@@ -31,7 +31,7 @@ pub(super) struct SandboxPopulationRow {
     /// counted rather than failing the read.
     pub(super) lifecycle: String,
     /// Whether these sandboxes can run again, by the repo's live-work rule:
-    /// not `cleanup_required` or `deleting`, and not `failed` unless it looks live (an
+    /// not `deleting`, and not `failed` unless it looks live (an
     /// observation or Kubernetes execution the repair loop reads as live) or
     /// the repair loop can revert it to `suspended`
     /// (`failed_repair_revert_eligibility`).
@@ -61,7 +61,7 @@ static SANDBOX_POPULATION_QUERY: LazyLock<String> = LazyLock::new(|| {
                 binding.recorded,
                 sb.lifecycle,
                 CASE
-                    WHEN sb.lifecycle IN ('cleanup_required', 'deleting') THEN FALSE
+                    WHEN sb.lifecycle = 'deleting' THEN FALSE
                     WHEN sb.lifecycle = 'failed'
                         THEN sos.sandbox_id IS NOT NULL
                              OR (sb.managed_by = $2 AND (live.execution OR {repairable}))

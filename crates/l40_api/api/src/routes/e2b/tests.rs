@@ -3238,7 +3238,7 @@ fn connect_touch_recovery_does_not_wake_teardown_state() {
     let mut paused_native = native_sandbox_response(SandboxId::new());
     paused_native.set_state(SandboxStateInput::stored("paused"));
 
-    for lifecycle in ["stopping", "deleting", "cleanup_required", "deleted"] {
+    for lifecycle in ["stopping", "deleting", "deleted"] {
         let mut sandbox = test_sandbox();
         sandbox.lifecycle = lifecycle.to_string();
 
@@ -3270,13 +3270,12 @@ fn connect_touch_recovery_does_not_wake_teardown_state() {
     }
 }
 
-/// Connect re-reads the row before a retried touch: both delete tombstones
-/// are gone there too, while a teardown still in flight is not ready yet.
+/// Connect re-reads the row before a retried touch: a delete tombstone is
+/// gone there too, while a teardown still in flight is not ready yet.
 #[test]
 fn connect_teardown_check_answers_tombstones_not_found() {
     for (lifecycle, expected) in [
         ("deleted", StatusCode::NOT_FOUND),
-        ("cleanup_required", StatusCode::NOT_FOUND),
         ("stopping", StatusCode::CONFLICT),
         ("deleting", StatusCode::CONFLICT),
     ] {
@@ -3985,13 +3984,6 @@ async fn connect_route_extends_deadline_without_replacing_policy(
     "on_node",
     ConnectRouteActiveNode::ReadyWorker,
     StatusCode::CONFLICT,
-))]
-#[case::cleanup_required_teardown_row(ConnectRouteDbShape::error(
-    "cleanup_required teardown row",
-    "cleanup_required",
-    "unplaced",
-    ConnectRouteActiveNode::None,
-    StatusCode::NOT_FOUND,
 ))]
 #[case::deleted_teardown_row(ConnectRouteDbShape::error(
     "deleted teardown row",
@@ -5617,7 +5609,7 @@ fn grant_offer_outcome(stored: StoredSandboxLifecycle, route: &str) -> GrantOffe
     };
     let lifecycle = match stored {
         StoredSandboxLifecycle::Live(lifecycle) => lifecycle,
-        StoredSandboxLifecycle::Deleted | StoredSandboxLifecycle::CleanupRequired => {
+        StoredSandboxLifecycle::Deleted => {
             return GrantOfferOutcome::Refused(StatusCode::NOT_FOUND);
         }
     };

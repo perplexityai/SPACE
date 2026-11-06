@@ -20,8 +20,8 @@ use sqlx::{Postgres, Transaction};
 /// fork-source lifecycle lock, the check that no fork of the sandbox is
 /// queued or running, and the row's `FOR UPDATE` read, which returns the
 /// lifecycle to restore if the delete fails. The API's delete parses that
-/// read as a [`SandboxLifecycle`], which has no `deleted` or
-/// `cleanup_required` variant, so those rows are refused before this write
+/// read as a [`SandboxLifecycle`], which has no `deleted` variant, so those
+/// rows are refused before this write
 /// runs; a caller that skips the parse would overwrite them.
 ///
 /// Once committed, `deleting` fences some writers and not others. Fork

@@ -786,7 +786,6 @@ async fn restore_lease_claim_and_release_move_only_restore_lifecycles() -> TestR
         "quarantined      .      .          .",
         "failed           .      .          .",
         "deleted          .      .          .",
-        "cleanup_required .      .          .",
         "bogus            .      .          .",
         "_Suspended_      A      .          .",
     ];

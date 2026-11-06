@@ -272,8 +272,7 @@ async fn population_counts_each_sandbox_by_the_record_it_runs_from() -> TestResu
     // observation of the execution that recovery would resume (E1).
     let quarantined = insert_sandbox(&h.db.pool, "quarantined").await?;
     observe_sandbox(&h.db.pool, quarantined, node, Some(metadata(Some(e1)))).await?;
-    // Bound for cleanup, or mid-delete: reported, but neither runs again.
-    insert_sandbox(&h.db.pool, "cleanup_required").await?;
+    // Mid-delete: reported, but it doesn't run again.
     insert_sandbox(&h.db.pool, "deleting").await?;
     // Metadata that isn't an object: unreadable, not legacy, though it has
     // no `environment` key to read.
@@ -336,9 +335,9 @@ async fn population_counts_each_sandbox_by_the_record_it_runs_from() -> TestResu
                 "template_releases": 1, "template_releases_in_use": 0,
             },
             "unrecorded": {
-                "sandboxes": 8,
-                "sandboxes_by_lifecycle": {"cleanup_required": 1, "creating": 1, "deleting": 1, "failed": 3, "suspended": 2},
-                    "sandboxes_not_runnable": 4,
+                "sandboxes": 7,
+                "sandboxes_by_lifecycle": {"creating": 1, "deleting": 1, "failed": 3, "suspended": 2},
+                    "sandboxes_not_runnable": 3,
                 "template_releases": 0, "template_releases_in_use": 0,
             },
             "invalid": {"sandboxes": 1, "sandboxes_by_lifecycle": {"started": 1},

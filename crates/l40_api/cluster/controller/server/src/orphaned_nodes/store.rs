@@ -35,7 +35,7 @@ use super::{OrphanCandidate, OrphanedNodesSink};
 /// *non-terminal* placements. `quarantined` deliberately remains
 /// non-terminal here: it preserves the node association until an operator or
 /// healer can inspect and release the sandbox.
-const TERMINAL_PLACEMENT_LIFECYCLES: &str = "('failed', 'cleanup_required', 'deleted')";
+const TERMINAL_PLACEMENT_LIFECYCLES: &str = "('failed', 'deleted')";
 
 pub struct NodeDbStore {
     pool: PgPool,

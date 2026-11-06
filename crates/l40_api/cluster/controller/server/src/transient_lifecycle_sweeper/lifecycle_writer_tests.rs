@@ -1295,7 +1295,6 @@ async fn failed_active_repair_moves_only_failed_rows() -> TestResult {
         "quarantined       .",
         "failed            A",
         "deleted           .",
-        "cleanup_required  .",
         "bogus             .",
         "_Suspended_       .",
     ];

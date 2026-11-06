@@ -7,7 +7,7 @@ use pplx_space_common_core::types::{NodeId, SandboxLifecycle};
 /// (`public_sandbox_projection`).
 ///
 /// Both stay raw strings. Rows carry lifecycles outside `SandboxLifecycle`
-/// (`deleted`, `cleanup_required`), and the renders read padded, mixed-case
+/// (`deleted`, or stray text), and the renders read padded, mixed-case
 /// and unknown node statuses as they come.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SandboxStateInput {
@@ -86,8 +86,8 @@ impl SandboxStateInput {
             .map(str::to_string)
     }
 
-    /// Whether the row is a delete tombstone, `deleted` or `cleanup_required`:
-    /// terminal, and outside `SandboxLifecycle`.
+    /// Whether the row is a delete tombstone, `deleted`: terminal, and outside
+    /// `SandboxLifecycle`.
     pub fn is_tombstone(&self) -> bool {
         self.stored_lifecycle()
             .is_some_and(|stored| is_tombstone(&stored.trim().to_ascii_lowercase()))
@@ -112,7 +112,7 @@ impl SandboxStateInput {
 
 /// Whether the stored lifecycle decides what ECW callers see, whatever the
 /// node last observed: the terminal states (`failed`, `quarantined` and the
-/// two delete tombstones) and the at-rest ones (`stopped`, `suspended`). The
+/// `deleted` tombstone) and the at-rest ones (`stopped`, `suspended`). The
 /// control plane writes these, so the row is the authority for them, and a
 /// node still reporting a running execution is usually behind it. When the
 /// row is the one behind, for example a `failed` row whose VM still runs or a
@@ -148,15 +148,15 @@ fn stored_lifecycle_decides(stored: &str) -> bool {
     }
 }
 
-/// Whether `lifecycle` is a delete tombstone, `deleted` or `cleanup_required`:
-/// the stored lifecycles outside `SandboxLifecycle`. It matches the column's
-/// form exactly; a caller that accepts padded or mixed-case values normalizes
-/// first. The SQL list filters spell the same set as `lifecycle NOT IN
-/// ('deleted', 'cleanup_required')`: the native reads in
+/// Whether `lifecycle` is a delete tombstone, `deleted`: the stored lifecycle
+/// outside `SandboxLifecycle`. It matches the column's form exactly; a caller
+/// that accepts padded or mixed-case values normalizes first. The SQL list
+/// filters spell the same set as `lifecycle NOT IN ('deleted')`: the native
+/// reads in
 /// `routes/public/sandboxes.rs` and the ECW list's candidate rows in
 /// `controllers/sandbox/org.rs`.
 pub fn is_tombstone(lifecycle: &str) -> bool {
-    matches!(lifecycle, "deleted" | "cleanup_required")
+    lifecycle == "deleted"
 }
 
 #[cfg(test)]

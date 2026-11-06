@@ -2034,11 +2034,10 @@ impl SandboxLifecycle {
     /// same limitation.
     ///
     /// Not every value `sandboxes.lifecycle` can hold: `deleted` is a tombstone
-    /// written by raw SQL and `cleanup_required` is a node-local
-    /// sandbox-manager state, neither of which is a variant here. A test that
-    /// sweeps the column uses `StoredSandboxLifecycle::all` from
-    /// `pplx-space-sandbox-store`'s `test-support`, which lists this one and then
-    /// those two. That crate's tests catch an entry dropped from this list, a
+    /// written by raw SQL, which is not a variant here. A test that sweeps the
+    /// column uses `StoredSandboxLifecycle::all` from `pplx-space-sandbox-store`'s
+    /// `test-support`, which lists this one and then the tombstone. That crate's
+    /// tests catch an entry dropped from this list, a
     /// list out of declaration order and a variant declared between two
     /// listed ones (it renumbers the later variants); a variant appended after
     /// `Failed` still has to be added here by hand.

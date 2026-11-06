@@ -118,7 +118,6 @@ async fn create_finalization_finalizes_only_the_lifecycle_its_create_owns() -> T
         "quarantined        .        .        .",
         "failed             .        .        .",
         "deleted            .        .        .",
-        "cleanup_required   .        .        .",
         "bogus              .        .        .",
         "_Suspended_        .        .        .",
     ];

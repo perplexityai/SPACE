@@ -23,8 +23,8 @@ use uuid::Uuid;
 ///
 /// Writes an **operation step**: it ends the wake. The `WHERE` refuses a row
 /// in a lifecycle the wake must not resurrect (`failed`, `quarantined`,
-/// `stopped`, `stopping`, `suspending`, `deleting`, `deleted`,
-/// `cleanup_required`), compared case- and whitespace-insensitively. With
+/// `stopped`, `stopping`, `suspending`, `deleting`, `deleted`), compared
+/// case- and whitespace-insensitively. With
 /// `enforce_published_suspend_fence` it also refuses `suspended`, for a
 /// substrate whose restore-shaped wakes claim `restoring` before the node call
 /// and leave `restoring -> started` to this write; without it a `suspended`
@@ -48,8 +48,7 @@ pub async fn complete_wake(
                 'stopping',
                 'suspending',
                 'deleting',
-                'deleted',
-                'cleanup_required'
+                'deleted'
             )
             AND (
                 LOWER(TRIM(lifecycle)) <> 'suspended'

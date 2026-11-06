@@ -132,7 +132,6 @@ pub async fn mark_published_failed(
                    'failed',
                    'quarantined',
                    'deleted',
-                   'cleanup_required',
                    'deleting'
                )
              FOR NO KEY UPDATE OF s
@@ -648,7 +647,7 @@ pub async fn release_completed_activations(
            FROM released
           WHERE sandbox.id = released.sandbox_id
             AND LOWER(TRIM(sandbox.lifecycle)) NOT IN (
-                'suspending', 'suspended', 'quarantined', 'deleting', 'deleted', 'cleanup_required'
+                'suspending', 'suspended', 'quarantined', 'deleting', 'deleted'
             )
          RETURNING sandbox.id"
     );

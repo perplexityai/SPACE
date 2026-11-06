@@ -843,7 +843,6 @@ async fn gone_node_mark_lost_fails_only_suspended_rows() -> TestResult {
         "quarantined          .        .",
         "failed               .        .",
         "deleted              .        .",
-        "cleanup_required     .        .",
         "bogus                .        .",
         "_Suspended_          .        .",
     ];
@@ -959,7 +958,6 @@ async fn failed_on_node_give_up_claims_only_started_or_paused_residents() -> Tes
         "quarantined          .        .",
         "failed               .        .",
         "deleted              .        .",
-        "cleanup_required     .        .",
         "bogus                .        .",
         "_Suspended_          .        .",
     ];
@@ -1021,7 +1019,6 @@ async fn abandon_stale_claims_only_aged_unmarked_transients_of_the_node() -> Tes
         "quarantined          .        .",
         "failed               .        .",
         "deleted              .        .",
-        "cleanup_required     .        .",
         "bogus                .        .",
         "_Suspended_          .        .",
     ];

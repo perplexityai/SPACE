@@ -50,7 +50,7 @@ async fn insert_sandbox(pool: &PgPool, template: &str, lifecycle: &str) -> TestR
 /// `suspended` (restorable), and `failed` rows that carry a durable,
 /// repair-eligible suspend snapshot (the failed-restorable repair loop can
 /// revert those to `suspended`). Rows that are genuinely gone —
-/// `cleanup_required`, `deleted`, and a `failed` row with no restorable
+/// `deleted`, and a `failed` row with no restorable
 /// snapshot — do not count. The `failed` rows seeded here have no snapshot,
 /// so this case pins the exclusion of unrecoverable-failed; the positive
 /// failed+snapshot path is covered by the shared

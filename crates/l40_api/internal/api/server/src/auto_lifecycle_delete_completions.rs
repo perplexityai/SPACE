@@ -583,11 +583,6 @@ async fn apply_receipt(
                 AutoLifecycleDeleteCompletionReason::DeletedTombstone,
             ));
         }
-        StoredSandboxLifecycle::CleanupRequired => {
-            return Ok(ReceiptOutcome::AcknowledgedNoop(
-                AutoLifecycleDeleteCompletionReason::CleanupRequired,
-            ));
-        }
         StoredSandboxLifecycle::Live(lifecycle) => lifecycle,
     };
     let current_policy =

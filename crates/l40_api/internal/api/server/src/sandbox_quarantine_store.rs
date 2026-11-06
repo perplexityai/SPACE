@@ -374,7 +374,7 @@ pub(super) async fn select_activation_rollback_candidates(
             AND input.published_lifecycle = input.transition_receipt_target_state
             AND input.transition_receipt_target_state IN ('created', 'stopped', 'suspended')
             AND LOWER(TRIM(s.lifecycle)) NOT IN (
-                'quarantined', 'deleted', 'deleting', 'cleanup_required'
+                'quarantined', 'deleted', 'deleting'
             )
           FOR UPDATE OF s, execution"
     );

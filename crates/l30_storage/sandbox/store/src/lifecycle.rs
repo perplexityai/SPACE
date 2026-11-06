@@ -2,27 +2,28 @@
 //!
 //! [`SandboxLifecycle`] is the shared *live-state* vocabulary: every state a
 //! running control-plane path may act on. The Postgres column can also hold
-//! two terminal tombstone values — `deleted` and `cleanup_required` — that the
-//! shared enum deliberately omits because no live-state consumer may act on
-//! them. [`StoredSandboxLifecycle`] closes that gap at the database boundary:
-//! it is the shared boundary type for consumers that must handle both live
-//! states and tombstones, so raw lifecycle strings do not travel past those
-//! SQL boundaries.
+//! the terminal tombstone `deleted`, which the shared enum deliberately omits
+//! because no live-state consumer may act on it. [`StoredSandboxLifecycle`]
+//! closes that gap at the database boundary: it is the shared boundary type
+//! for consumers that must handle both live states and the tombstone, so raw
+//! lifecycle strings do not travel past those SQL boundaries.
+//!
+//! `cleanup_required` is not a stored value. It is a node-local
+//! sandbox-manager cleanup status that no control-plane writer has stored, so a
+//! row holding it parses as an unknown lifecycle like any other stray text.
 
 use std::str::FromStr;
 
 use pplx_space_common_core::types::{SandboxLifecycle, SandboxLifecycleParseError};
 
 /// A `sandboxes.lifecycle` value as stored in Postgres: a live
-/// [`SandboxLifecycle`] state or one of the two terminal tombstones.
+/// [`SandboxLifecycle`] state or the terminal tombstone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum StoredSandboxLifecycle {
     Live(SandboxLifecycle),
     /// Terminal tombstone: the sandbox was deleted; the row survives only for
     /// idempotent delete replies and tombstone retention.
     Deleted,
-    /// Terminal tombstone: delete-side cleanup is still owed for the sandbox.
-    CleanupRequired,
 }
 
 impl StoredSandboxLifecycle {
@@ -32,16 +33,15 @@ impl StoredSandboxLifecycle {
         match self {
             Self::Live(lifecycle) => lifecycle.as_str(),
             Self::Deleted => "deleted",
-            Self::CleanupRequired => "cleanup_required",
         }
     }
 
     /// The live-state view: `Some` for shared-vocabulary states, `None` for
-    /// the terminal tombstones.
+    /// the terminal tombstone.
     pub const fn live(self) -> Option<SandboxLifecycle> {
         match self {
             Self::Live(lifecycle) => Some(lifecycle),
-            Self::Deleted | Self::CleanupRequired => None,
+            Self::Deleted => None,
         }
     }
 }
@@ -62,7 +62,6 @@ impl FromStr for StoredSandboxLifecycle {
         let normalized = value.trim().to_ascii_lowercase();
         match normalized.as_str() {
             "deleted" => Ok(Self::Deleted),
-            "cleanup_required" => Ok(Self::CleanupRequired),
             other => other.parse().map(Self::Live),
         }
     }

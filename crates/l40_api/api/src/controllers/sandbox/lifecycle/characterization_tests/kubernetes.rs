@@ -274,8 +274,7 @@ async fn wake_refuses_teardown_and_terminal_lifecycles_before_admission(
                 | SandboxLifecycle::Quarantined
                 | SandboxLifecycle::Failed,
             )
-            | StoredSandboxLifecycle::Deleted
-            | StoredSandboxLifecycle::CleanupRequired => WakeRefusal::EntryGuard,
+            | StoredSandboxLifecycle::Deleted => WakeRefusal::EntryGuard,
             StoredSandboxLifecycle::Live(
                 SandboxLifecycle::Created
                 | SandboxLifecycle::Restoring

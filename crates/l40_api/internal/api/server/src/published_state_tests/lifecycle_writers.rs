@@ -257,12 +257,7 @@ async fn failed_report_moves_every_live_k8s_lifecycle_to_failed(
         let fails = managed_by == "k8s"
             && !matches!(
                 stored,
-                "failed"
-                    | "quarantined"
-                    | "deleting"
-                    | "deleted"
-                    | "cleanup_required"
-                    | " Quarantined "
+                "failed" | "quarantined" | "deleting" | "deleted" | " Quarantined "
             );
         let mut expected = before.clone();
         if fails {
@@ -294,8 +289,6 @@ async fn failed_report_moves_every_live_k8s_lifecycle_to_failed(
 /// canonical one is, and an unknown value is quarantined and recorded as
 /// stored. Placement, both node columns and the execution are left as they
 /// were.
-///
-/// `cleanup_required` is not swept: no Postgres writer stores it.
 #[rstest::rstest]
 #[case::k8s("k8s")]
 #[case::space("space")]
@@ -309,9 +302,6 @@ async fn quarantined_report_moves_every_unquarantined_lifecycle_and_records_it(
 
     let mut mismatches = Vec::new();
     for stored in StoredSandboxLifecycle::all_as_str().chain([" Quarantined ", "bogus"]) {
-        if stored == "cleanup_required" {
-            continue;
-        }
         let sandbox_id = SandboxId::new();
         insert_active_sandbox_with_managed_by(pool, sandbox_id, node_id, stored, managed_by)
             .await?;
@@ -400,13 +390,7 @@ async fn activation_completion_receipt_projects_its_target_outside_the_suspend_w
             expected.activation_attempt_id = None;
             let projects = !matches!(
                 stored,
-                "suspending"
-                    | "suspended"
-                    | "quarantined"
-                    | "deleting"
-                    | "deleted"
-                    | "cleanup_required"
-                    | " Suspended "
+                "suspending" | "suspended" | "quarantined" | "deleting" | "deleted" | " Suspended "
             );
             if projects {
                 expected.lifecycle = target.to_owned();
@@ -550,7 +534,7 @@ async fn activation_rollback_receipt_converges_its_target_out_of_every_live_life
 
         let converges = !matches!(
             stored,
-            "quarantined" | "deleting" | "deleted" | "cleanup_required" | " Quarantined " | "bogus"
+            "quarantined" | "deleting" | "deleted" | " Quarantined " | "bogus"
         );
         let mut expected = before.clone();
         let mut expected_exposures = exposures_before.clone();
@@ -1032,7 +1016,6 @@ async fn absent_report_deletes_only_a_stopped_direct_row() -> TestResult {
         "quarantined      .     .",
         "failed           .     .",
         "deleted          .     .",
-        "cleanup_required .     .",
         "bogus            .     .",
         "_Suspended_      .     .",
     ];

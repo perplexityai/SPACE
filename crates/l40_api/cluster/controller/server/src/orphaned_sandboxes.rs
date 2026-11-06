@@ -135,8 +135,7 @@ fn emit_orphan_reconcile_event(
     .emit_with(details.reason(reason).trigger(SandboxEventTrigger::System));
 }
 
-const ORPHAN_RECONCILER_STOP_LIFECYCLES: &[&str] =
-    &["failed", "quarantined", "cleanup_required", "deleted"];
+const ORPHAN_RECONCILER_STOP_LIFECYCLES: &[&str] = &["failed", "quarantined", "deleted"];
 
 /// Lifecycle set the `Forgotten` path operates on. A row's *latest*
 /// execution being `state='forgotten'` is the orphan signal, but only when

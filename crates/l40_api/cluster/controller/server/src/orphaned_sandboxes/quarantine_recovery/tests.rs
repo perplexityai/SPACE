@@ -200,7 +200,6 @@ async fn publication_quarantine_repair_recovers_only_a_row_still_quarantined() -
         "quarantined       A",
         "failed            .",
         "deleted           .",
-        "cleanup_required  .",
         "bogus             .",
         "_Suspended_       .",
     ];
