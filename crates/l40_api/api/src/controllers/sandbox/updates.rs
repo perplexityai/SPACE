@@ -321,6 +321,12 @@ fn access_idle_deadline_request(
     Ok(request)
 }
 
+/// How many times a create rollback sends its node-local delete while the node
+/// has not admitted it. Each attempt waits up to the teardown's node-delete
+/// wait and admission probe, so together they span about the node RPC
+/// timeout that bounds any single node call.
+const ROLLBACK_NODE_DELETE_ATTEMPTS: usize = 12;
+
 impl SandboxController {
     pub async fn update(
         &self,
@@ -1138,19 +1144,24 @@ impl SandboxController {
         // individual worker stop/delete RPCs), and the ALB idle timeout is far
         // higher (see `ALB_IDLE_TIMEOUT_SECS`). Cancelling a slow delete would
         // leak the backing instance (on direct, with no orphan GC, a running VM
-        // invisibly), so the unbounded delete is the safe choice.
+        // invisibly), so the unbounded delete is the safe choice. A fresh
+        // create has nothing for the node to refuse, but a backlogged node may
+        // not admit the delete within the teardown's wait budget, which keeps
+        // the pod; retry it rather than drop the row that tracks the pod.
         let teardown = self.live_teardown(sandbox_id).await;
-        let deleted = self.substrate.delete_execution(sandbox_id).await;
-        // As for a delete: only a confirmed teardown, or a node that had no
-        // such sandbox, uncounts it; after a failed one its pod may still
-        // exist, so its pending member stays to lapse.
-        if matches!(
-            deleted,
-            Ok(()) | Err(crate::controllers::substrate::SubstrateError::NotFound { .. })
-        ) {
+        let mut result = self.substrate.delete_execution(sandbox_id).await;
+        for _ in 1..ROLLBACK_NODE_DELETE_ATTEMPTS {
+            if !matches!(result, Err(SubstrateError::NodeDeleteNotAdmitted { .. })) {
+                break;
+            }
+            result = self.substrate.delete_execution(sandbox_id).await;
+        }
+        // Only a confirmed teardown, or an absent sandbox, uncounts it.
+        // Otherwise its pending live-cap member stays to lapse.
+        if matches!(result, Ok(()) | Err(SubstrateError::NotFound { .. })) {
             self.forget_live_sandbox(teardown).await;
         }
-        if let Err(err) = deleted {
+        if let Err(err) = result {
             tracing::warn!(
                 sandbox_id = %sandbox_id,
                 error = %err,

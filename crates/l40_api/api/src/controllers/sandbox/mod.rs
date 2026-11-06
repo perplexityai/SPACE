@@ -638,11 +638,13 @@ fn reconnect_error_outcome(
             ReconnectTerminalPhase::Api,
             ReconnectReason::WaitBudget,
         ),
-        // Only suspend returns `SandboxNoPod`, so a wake never sees it; it
-        // shares `Unavailable`'s arm, as it shares its 503.
+        // Only suspend returns `SandboxNoPod` and only a Delete teardown
+        // returns `NodeDeleteNotAdmitted`, so a wake never sees either; they
+        // share `Unavailable`'s arm, as they share its 503.
         SubstrateError::Unavailable { .. }
         | SubstrateError::SandboxNoPod { .. }
-        | SubstrateError::Unschedulable { .. } => (
+        | SubstrateError::Unschedulable { .. }
+        | SubstrateError::NodeDeleteNotAdmitted { .. } => (
             ReconnectOutcome::WakeFailed,
             initial_lifecycle_terminal_phase(initial_lifecycle),
             ReconnectReason::Unavailable,

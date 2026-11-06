@@ -373,6 +373,9 @@ enum TeardownCase {
     /// reports the sandbox outside `deleting`: sbx-mgr has not yet run the
     /// delete's refusals.
     DeleteNotAdmittedWithinWaitBudget,
+    /// The node-local delete outlasts the wait budget and the node cannot say
+    /// whether it admitted it.
+    DeleteAdmissionUnconfirmed,
 }
 
 /// A teardown whose node-side preservation step fails or is refused keeps the
@@ -384,6 +387,7 @@ enum TeardownCase {
 #[case::delete_defers_to_suspend_publication(TeardownCase::DeleteDefersToSuspendPublication)]
 #[case::delete_refuses_retained_only_copy(TeardownCase::DeleteRefusesRetainedOnlyCopy)]
 #[case::delete_not_admitted_within_wait_budget(TeardownCase::DeleteNotAdmittedWithinWaitBudget)]
+#[case::delete_admission_unconfirmed(TeardownCase::DeleteAdmissionUnconfirmed)]
 #[tokio::test(flavor = "current_thread")]
 async fn teardown_keeps_execution_tracked_when_the_node_cannot_finish(
     #[case] case: TeardownCase,
@@ -436,11 +440,21 @@ async fn teardown_keeps_execution_tracked_when_the_node_cannot_finish(
                 ),
             ),
         )),
-        TeardownCase::DeleteNotAdmittedWithinWaitBudget => {
+        TeardownCase::DeleteNotAdmittedWithinWaitBudget
+        | TeardownCase::DeleteAdmissionUnconfirmed => {
             Some(("WorkerApi/DeleteSandbox", ScriptedReply::Hang))
         }
     };
-    let worker = start_scripted_worker(ScriptedWorkerConfig::new(reply)).await?;
+    let state_reply = matches!(case, TeardownCase::DeleteAdmissionUnconfirmed).then(|| {
+        (
+            "WorkerApi/SandboxState",
+            ScriptedReply::Status(tonic::Status::unavailable("scripted state failure")),
+        )
+    });
+    let worker = start_scripted_worker(ScriptedWorkerConfig::new(
+        reply.into_iter().chain(state_reply),
+    ))
+    .await?;
     worker
         .sim
         .ensure_default_running(&sandbox_id.to_string())
@@ -476,9 +490,8 @@ async fn teardown_keeps_execution_tracked_when_the_node_cannot_finish(
         | TeardownCase::RetireBackupFails => retire(&substrate, sandbox_id).await.map(|_| ()),
         TeardownCase::DeleteDefersToSuspendPublication
         | TeardownCase::DeleteRefusesRetainedOnlyCopy
-        | TeardownCase::DeleteNotAdmittedWithinWaitBudget => {
-            substrate.delete_execution(sandbox_id).await
-        }
+        | TeardownCase::DeleteNotAdmittedWithinWaitBudget
+        | TeardownCase::DeleteAdmissionUnconfirmed => substrate.delete_execution(sandbox_id).await,
     };
 
     match (case, &outcome) {
@@ -489,9 +502,13 @@ async fn teardown_keeps_execution_tracked_when_the_node_cannot_finish(
             Err(SubstrateError::Failed { .. }),
         )
         | (
-            TeardownCase::DeleteDefersToSuspendPublication
-            | TeardownCase::DeleteNotAdmittedWithinWaitBudget,
+            TeardownCase::DeleteDefersToSuspendPublication,
             Err(SubstrateError::SuspendInFlight { .. }),
+        )
+        | (
+            TeardownCase::DeleteNotAdmittedWithinWaitBudget
+            | TeardownCase::DeleteAdmissionUnconfirmed,
+            Err(SubstrateError::NodeDeleteNotAdmitted { .. }),
         )
         | (
             TeardownCase::DeleteRefusesRetainedOnlyCopy,
