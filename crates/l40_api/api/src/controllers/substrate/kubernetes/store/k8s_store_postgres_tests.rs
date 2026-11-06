@@ -4,8 +4,8 @@ use pplx_space_common_core::types::{
 
 use std::time::Duration;
 
-use pplx_space_k8s_node_id::space_k8s_node_id;
 use pplx_space_db_test_fixtures::{TestDb, pg_test_db_with_max_connections};
+use pplx_space_k8s_node_id::space_k8s_node_id;
 use pplx_space_sandbox_portability::portable_for_restore_affinity;
 use time::OffsetDateTime;
 
