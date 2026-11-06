@@ -72,6 +72,8 @@ export interface Heartbeat {
   state: HeartbeatState;
   // Since the newer of the status snapshot's `observed_at` and
   // `last_heartbeat`, as the nodes list's "seen" age; null when neither is set.
+  // An unreachable status was observed at the failed poll, not at an answer,
+  // so it counts from `last_heartbeat` alone.
   ageMs: number | null;
   // The node's own window, `stale_after - observed_at`; null without a status.
   windowMs: number | null;
@@ -100,7 +102,8 @@ export function heartbeat(
 ): Heartbeat {
   const staleAfter = ms(node.status?.stale_after);
   const observed = ms(node.status?.observed_at);
-  const beats = [observed, ms(node.last_heartbeat)].filter((at): at is number => at !== null);
+  const answered = node.status?.reachable === false ? null : observed;
+  const beats = [answered, ms(node.last_heartbeat)].filter((at): at is number => at !== null);
   const ageMs = beats.length ? Math.max(0, nowMs - Math.max(...beats)) : null;
   if (staleAfter === null) return { state: 'no-status', ageMs, windowMs: null };
   return {

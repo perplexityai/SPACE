@@ -106,6 +106,13 @@ test('the heartbeat age runs from the newer of observed_at and last_heartbeat', 
   assert.equal(beat.state, 'fresh');
 });
 
+test('an unreachable status does not count as a heartbeat', () => {
+  const failed = { ...status('2026-01-01T11:59:55Z', '2026-01-01T12:02:10Z'), reachable: false };
+  const beat = heartbeat({ last_heartbeat: '2026-01-01T11:50:00Z', status: failed }, NOW);
+  assert.equal(beat.ageMs, 600_000);
+  assert.equal(heartbeat({ last_heartbeat: null, status: failed }, NOW).ageMs, null);
+});
+
 test('durations read in the two largest units', () => {
   assert.equal(formatDuration(0), '0s');
   assert.equal(formatDuration(45_900), '45s');

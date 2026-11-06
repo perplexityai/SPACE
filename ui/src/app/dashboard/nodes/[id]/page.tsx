@@ -213,8 +213,10 @@ export default function NodeDetailPage() {
   // The poll reads the page of sandboxes the operator is on. Set from an
   // effect, since a ref must not be written during render.
   const pollSandboxesRef = useRef(() => {});
+  const cursorRef = useRef<string | undefined>(undefined);
   useEffect(() => {
     pollSandboxesRef.current = () => void loadSandboxes(cursor, 'poll');
+    cursorRef.current = cursor;
   }, [id, cursor]);
 
   useEffect(() => {
@@ -318,7 +320,9 @@ export default function NodeDetailPage() {
     } finally {
       // Some actions commit and then report an error: always reload, and
       // keep the actions disabled until that read settles.
-      void loadSandboxes();
+      // The page the operator is on now, not the one at the click. An empty
+      // string is the first page: undefined would fall back to the closure's.
+      void loadSandboxes(cursorRef.current ?? '');
       void loadCounts();
       void loadEvents();
       await loadNode();

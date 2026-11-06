@@ -7,6 +7,7 @@ const node = (drain_phase = null, drain_mode = null, role = 'worker') => ({ role
 
 const labels = (node, substrate = 'k8s') => nodeActions(node, substrate).map((a) => a.label);
 const forced = (node, substrate = 'k8s') => nodeActions(node, substrate).find((a) => a.label === 'Forced drain');
+const forcesDrain = (node, substrate = 'k8s') => nodeActions(node, substrate).some((a) => a.action === 'drain' && a.body?.mode === 'forced');
 
 test('an idle worker offers cordon, uncordon, a gentle drain and a forced drain', () => {
   assert.deepEqual(labels(node()), ['Cordon', 'Uncordon', 'Drain', 'Forced drain']);
@@ -34,9 +35,13 @@ test('forced drain escalates a gentle drain, including one with no recorded mode
     assert.match(action.confirm, /in place/);
   }
   assert.equal(forced(node('draining', 'forced')), undefined);
+  assert.ok(!forcesDrain(node('draining', 'forced')), 'draining + forced');
   for (const role of ['worker', 'builder']) {
     for (const phase of ['drained', 'terminating']) {
-      for (const mode of [null, 'gentle', 'forced']) assert.equal(forced(node(phase, mode, role)), undefined, `${role}, phase ${phase}, mode ${mode}`);
+      for (const mode of [null, 'gentle', 'forced']) {
+        assert.equal(forced(node(phase, mode, role)), undefined, `${role}, phase ${phase}, mode ${mode}`);
+        assert.ok(!forcesDrain(node(phase, mode, role)), `${role}, phase ${phase}, mode ${mode}: no forced drain action`);
+      }
     }
   }
 });
