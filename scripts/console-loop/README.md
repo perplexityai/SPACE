@@ -76,7 +76,10 @@ organizations (one nested), six users across roles and organizations, two API
 keys in the managing organization, and sandboxes that are running, paused,
 suspended and stopped, one in a tenant organization, and one created and
 deleted. Every name and organization display name carries the prefix, so
-runs under two prefixes can share a stack. Seeding sandboxes boots
+runs under two prefixes can share a stack. One `flows` step is the
+exception: `sandboxes-search-hex-name` needs a name of hex digits and dashes,
+which no prefix can start, so it names its sandbox `e2e-` and six random hex
+digits, records it in the state, and deletes it again. Seeding sandboxes boots
 Firecracker VMs and takes a minute or two; `--skip-sandboxes` leaves them out.
 
 The state is `out/seed-<prefix>.json`: the stack it was seeded on, the
@@ -162,6 +165,10 @@ Every setting is a flag or an environment variable:
 | `--out` | `CONSOLE_LOOP_OUT` | `./out` |
 | `--prefix` | `CONSOLE_LOOP_PREFIX` | `loop` |
 | `--template` (seed) | `CONSOLE_LOOP_TEMPLATE` | `seed:latest` |
+
+`SPACE_UI_DATADOG_LOGS_URL` has no flag: set it in the loop's environment to
+what the console under test has, and the detail step then requires the
+"Datadog logs" link (only whether it is set is read, not its value).
 
 A prefix is up to 32 lowercase letters, digits and dashes. `npm run seed`
 also takes `--skip-sandboxes`, and `npm run clean` takes `--delete-orgs`.

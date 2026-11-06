@@ -27,6 +27,9 @@ export interface Config {
   outDir: string;
   // Names of seeded objects start with this.
   prefix: string;
+  // Whether SPACE_UI_DATADOG_LOGS_URL is set (non-empty) in this environment,
+  // which should match the console under test; its value is never read.
+  datadogLogsConfigured: boolean;
   // Set by --allow-remote: act on a stack that is not on this host.
   allowRemote: boolean;
 }
@@ -48,6 +51,7 @@ export function loadConfig(args: string[]): Config {
     password: option(args, 'password', env.CONSOLE_LOOP_PASSWORD ?? env.SPACE_CONSOLE_PASSWORD ?? 'password')!,
     outDir: path.resolve(option(args, 'out', env.CONSOLE_LOOP_OUT ?? path.join(PACKAGE_DIR, 'out'))!),
     prefix,
+    datadogLogsConfigured: (env.SPACE_UI_DATADOG_LOGS_URL ?? '').trim() !== '',
     allowRemote: flag(args, 'allow-remote'),
   };
 }

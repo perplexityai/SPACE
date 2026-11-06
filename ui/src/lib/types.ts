@@ -74,6 +74,8 @@ export interface Sandbox {
   resource_type: 'sandbox' | 'pool_slot' | 'observed_local';
   name: string | null;
   user_id: string | null;
+  // The owner's email; absent from servers that do not report it.
+  user_email?: string | null;
   org_id: string | null;
   managed_by: string | null;
   lifecycle: string | null;
@@ -100,6 +102,9 @@ export interface Sandbox {
   snapshots_enabled_desired: boolean;
   snapshots_enabled: boolean | null;
   pool_template: string | null;
+  // The warm pool of a Kubernetes pool slot; absent from servers that do not
+  // report it, null on other rows.
+  pool_id?: string | null;
   disk_usage_bytes: number | null;
   failure_reason: string | null;
   age: string | null;

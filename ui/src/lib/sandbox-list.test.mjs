@@ -11,6 +11,8 @@ import {
   continuationFor,
   createdBounds,
   fragmentSearchScope,
+  idSearchScope,
+  isSearchUnsupported,
   listRequestQuery,
   listScope,
   listSections,
@@ -25,6 +27,7 @@ import {
   previousPage,
   sameScope,
   sandboxListQuery,
+  sandboxUserLabel,
   scopeChangePlan,
   showsOlderFormat,
   splitNodeReported,
@@ -67,6 +70,7 @@ test('every set filter maps to its list parameter on a paged request', () => {
     createdWithin: '30d',
     olderThan: '24h',
     prefix: '  Build-  ',
+    search: ' 9b10B406\0 ',
   }, { limit: 50, cursor: 'djE6MTo', now: NOW });
   assert.deepEqual(parse(query), {
     limit: '50',
@@ -79,7 +83,34 @@ test('every set filter maps to its list parameter on a paged request', () => {
     created_before: '2026-11-02T12:00:00.000Z',
     // Trimmed, case kept: a name prefix is case-sensitive.
     prefix: 'Build-',
+    // Trimmed, without the NUL the server refuses.
+    search: '9b10B406',
   });
+});
+
+test('a search is part of the scope, and a sampled request does not send it', () => {
+  const searched = listScope('paged', { ...NO_FILTERS, search: 'e2e-1' }, { limit: 50, cursor: '' });
+  assert.ok(!sameScope(searched, listScope('paged', NO_FILTERS, { limit: 50, cursor: '' })));
+  assert.ok(!sameScope(searched, listScope('paged', { ...NO_FILTERS, prefix: 'e2e-1' }, { limit: 50, cursor: '' })));
+  assert.equal(parse(sandboxListQuery('sampled', { ...NO_FILTERS, search: 'e2e-1' }, { limit: 1000, now: NOW })).search, undefined);
+});
+
+test('only a 400 naming search shows a server without it', () => {
+  const refused = (status, message) => Object.assign(new Error(message), { status });
+  assert.equal(isSearchUnsupported(refused(400, 'unknown query parameter "search"')), true);
+  assert.equal(isSearchUnsupported(refused(400, 'unknown query parameter "prefix"')), false);
+  assert.equal(isSearchUnsupported(refused(400, 'search must not contain a NUL character')), false);
+  assert.equal(isSearchUnsupported(refused(503, 'unknown query parameter "search"')), false);
+  assert.equal(isSearchUnsupported(null), false);
+});
+
+test('the User column shows the email, else the reported owner, else the user ID', () => {
+  const userId = '0193a000-0000-7000-8000-000000000002';
+  assert.equal(sandboxUserLabel({ user_id: userId, user: 'root', user_email: 'dev@example.test' }), 'dev@example.test');
+  // A server that does not report emails.
+  assert.equal(sandboxUserLabel({ user_id: userId, user: 'root' }), 'root');
+  assert.equal(sandboxUserLabel({ user_id: userId, user: null, user_email: null }), '0193a000');
+  assert.equal(sandboxUserLabel({ user_id: null, user: null, user_email: null }), '—');
 });
 
 test('the first page sends an empty cursor, and unset filters send nothing', () => {
@@ -281,6 +312,18 @@ test('Next follows the page shown, and a failed load of another page leaves it o
   assert.equal(selection.goTo(selection.previousPosition()), true);
   assert.equal(selection.selected.cursor, '');
   assert.equal(selection.goTo(selection.previousPosition()), false);
+});
+
+test('an ID search reads the first page of the selected filters with it as search, without the prefix', () => {
+  const selected = listScope('paged', { ...NO_FILTERS, template: 'alpha', prefix: 'e2e-1' }, { limit: 25, cursor: 'djE6MTo' });
+  const scope = idSearchScope(selected, 'e2e-1');
+  assert.deepEqual(parse(listRequestQuery(scope, NOW)), { limit: '25', cursor: '', template: 'alpha', search: 'e2e-1' });
+  // Its own scope: neither the list's nor the fragment search's.
+  assert.ok(!sameScope(scope, selected));
+  assert.ok(!sameScope(scope, fragmentSearchScope(selected, 'e2e-1')));
+  // The fragment search does not send it.
+  assert.equal(parse(listRequestQuery(fragmentSearchScope(selected, 'e2e-1'), NOW)).search, undefined);
+  assert.equal(idSearchScope(listScope('sampled', NO_FILTERS, { limit: 1000, cursor: '' }), 'e2e-1'), null);
 });
 
 test('a failed refresh of the page on screen keeps its rows and its Next', async () => {

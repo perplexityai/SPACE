@@ -59,10 +59,16 @@ export interface SandboxListFilters {
   olderThan: CreatedAge | null;
   // A name prefix (case-sensitive) or ID prefix, as typed.
   prefix: string;
+  // An ID's hex digits, trimmed, for a server that takes `search` (see
+  // `isSearchUnsupported`): 4 to 32 once dashes and a leading `sbx_` are left
+  // out. It matches IDs that end with them, and from 8 digits IDs that start
+  // with them. Only the request of `idSearchScope` sends it; the list itself
+  // never does.
+  search: string;
 }
 
 export const NO_FILTERS: SandboxListFilters = {
-  org: null, lifecycles: [], template: null, userId: null, createdWithin: null, olderThan: null, prefix: '',
+  org: null, lifecycles: [], template: null, userId: null, createdWithin: null, olderThan: null, prefix: '', search: '',
 };
 
 // The query string of one list request. A sampled request is the first page
@@ -90,7 +96,26 @@ export function sandboxListQuery(
   // The server refuses a NUL, which no typed prefix needs.
   const prefix = filters.prefix.trim().replaceAll('\0', '');
   if (prefix) params.set('prefix', prefix);
+  const search = filters.search.trim().replaceAll('\0', '');
+  if (search) params.set('search', search);
   return params.toString();
+}
+
+// The answer of a server that predates `search` to a paged request carrying
+// it: a 400 naming the parameter, since a paging server refuses an unknown
+// one once `cursor` is present. The console then stops sending it
+// (`sandboxSearch` without `serverSearch`) for as long as the list page stays
+// mounted, and searches as it did before; a reload, or leaving the page and
+// coming back, tries `search` again.
+export function isSearchUnsupported(error: unknown): boolean {
+  const { status, message } = (error ?? {}) as { status?: unknown; message?: unknown };
+  return status === 400 && typeof message === 'string' && message.includes('unknown query parameter "search"');
+}
+
+// The User column's label: the owner's email when the server sends one,
+// else the node-reported owner, else the start of the user ID.
+export function sandboxUserLabel(row: Pick<Sandbox, 'user_id' | 'user' | 'user_email'>): string {
+  return row.user_email || row.user || (row.user_id ? row.user_id.slice(0, 8) : '—');
 }
 
 // What one list request asks for: the list shape, the page size or sample
@@ -125,6 +150,7 @@ export function listScope(
     within: sent.createdWithin ?? '',
     older: sent.olderThan ?? '',
     prefix: sent.prefix.trim().replaceAll('\0', ''),
+    search: sent.search.trim().replaceAll('\0', ''),
   }).toString();
   return { mode, limit, cursor: at, filters: sent, key };
 }
@@ -256,7 +282,16 @@ export class ListRequests {
 // a sampled list, which sends no prefix.
 export function fragmentSearchScope(selected: ListScope, prefix: string): ListScope | null {
   if (selected.mode !== 'paged') return null;
-  return listScope('paged', { ...selected.filters, prefix }, { limit: selected.limit, cursor: '' });
+  return listScope('paged', { ...selected.filters, prefix, search: '' }, { limit: selected.limit, cursor: '' });
+}
+
+// The request for an ID search (`SandboxSearch`'s `idSearch`): the selected
+// filters with the text as `search` and without the search box's `prefix`,
+// read from the first page at the page size. Its matches are listed after
+// the page with the fragment search's. Null on a sampled list.
+export function idSearchScope(selected: ListScope, text: string): ListScope | null {
+  if (selected.mode !== 'paged') return null;
+  return listScope('paged', { ...selected.filters, prefix: '', search: text }, { limit: selected.limit, cursor: '' });
 }
 
 // After the selection changes: the rows on screen are kept when they are the

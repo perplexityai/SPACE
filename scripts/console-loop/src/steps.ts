@@ -2,6 +2,8 @@
 // checks what an operator relies on; the runner records everything else
 // (errors, failed and slow requests, screenshots). Steps that create or
 // change something are marked `mutates` and clean up after themselves.
+import { randomBytes } from 'node:crypto';
+
 import type { Page, Request, Response, Route } from 'playwright';
 
 import {
@@ -10,6 +12,7 @@ import {
 } from './browser.ts';
 import { TERMINAL_OPERATION_STATES } from './api.ts';
 import { verifyFixtures } from './fixtures.ts';
+import { SYNTHETIC_HEADER } from './recorder.ts';
 import { orgDisplayName, recordCreated } from './seed.ts';
 
 export interface Step {
@@ -287,6 +290,365 @@ step('sandboxes-search-id', ['sandboxes'], async (c) => {
   await content(c.page).locator('input[placeholder*="ID"]').first().fill(id);
   await c.page.waitForTimeout(1500);
   c.rec.check(await content(c.page).locator('tbody tr.ant-table-row', { hasText: shortLabel(id) }).count() === 1, 'searching a full sbx_ ID finds the sandbox');
+});
+
+// The search box matches as it does on `main`: a case-sensitive `prefix`
+// request, and for hex digits and dashes a match within the page as well.
+// Text that is also an ID's hex digits (4 to 32, after an optional `sbx_`)
+// adds a `search` request of its own, for IDs that end with them (such as
+// the ID column's label) or, from 8 digits, start with them; its matches
+// beyond the page are listed after it, with the prefix request's, once per
+// sandbox. An API without `search` refuses that request with a 400 naming
+// the parameter, and the console stops sending it. `server` and `fallback`
+// are those two answers to the `search` request; anything else, a timeout
+// included, or a `prefix` request left unanswered, is `failed`, and fails
+// the step. Other text never sends `search` (`sandboxes-search-name-prefix`).
+type SearchAnswer = { kind: 'server' | 'fallback' | 'failed' };
+const isListRequest = (url: URL) => url.pathname.endsWith('/admin/api/v1/sandboxes');
+const UNKNOWN_SEARCH = 'unknown query parameter "search"';
+
+const typeSearch = async (c: Ctx, typed: string): Promise<SearchAnswer> => {
+  const searches: string[] = [];
+  const onRequest = (req: Request) => {
+    const url = new URL(req.url());
+    if (isListRequest(url) && url.searchParams.get('search') === typed) searches.push(url.search);
+  };
+  const answered = c.page.waitForResponse((res) => {
+    const url = new URL(res.url());
+    return isListRequest(url) && url.searchParams.get('search') === typed;
+  }, { timeout: 10_000 }).catch(() => null);
+  const prefixAnswered = c.page.waitForResponse((res) => {
+    const url = new URL(res.url());
+    return isListRequest(url) && !url.searchParams.has('search') && url.searchParams.get('prefix') === typed;
+  }, { timeout: 15_000 }).catch(() => null);
+  c.page.on('request', onRequest);
+  let answer: SearchAnswer = { kind: 'failed' };
+  let res: Response | null = null;
+  try {
+    await content(c.page).locator('input[placeholder*="ID"]').first().fill(typed);
+    res = await answered;
+    if (res?.ok()) answer = { kind: 'server' };
+    else if (res?.status() === 400 && (await res.json().catch(() => null))?.error === UNKNOWN_SEARCH) answer = { kind: 'fallback' };
+    const prefixRes = await prefixAnswered;
+    c.rec.check(prefixRes?.ok() === true, `"${typed}" was also sent as prefix, as on main, and answered (${prefixRes ? prefixRes.status() : 'no answer'})`);
+    await settle(c.page, 1500);
+  } finally {
+    c.page.off('request', onRequest);
+  }
+  c.rec.check(answer.kind !== 'failed', `"${typed}" was answered as search, or refused as an unknown parameter (${res ? res.status() : 'no answer'})`);
+  if (answer.kind === 'fallback') {
+    c.rec.note(`an API without search refused "${typed}"; the console searched as before`);
+    c.rec.check(searches.length === 1, `the refused search was not sent again (${searches.length} sent)`);
+  } else if (answer.kind === 'server') {
+    c.rec.note(`the server answered "${typed}" as search`);
+  }
+  return answer;
+};
+
+// The ID labels the main table lists, in order.
+const listedLabels = async (c: Ctx): Promise<string[]> =>
+  (await content(c.page).locator('.ant-table').first().locator('tbody tr.ant-table-row td:first-child').allInnerTexts())
+    .map((text) => text.trim());
+// The ID labels listed under "More matches beyond this page", if shown.
+const beyondLabels = async (c: Ctx): Promise<string[]> =>
+  (await content(c.page).locator('xpath=//h5[starts-with(normalize-space(.), "More matches beyond this page")]/..')
+    .locator('tbody tr.ant-table-row td:first-child').allInnerTexts())
+    .map((text) => text.trim());
+const timesListed = (labels: string[], label: string) => labels.filter((shown) => shown === label).length;
+
+// The cursor of the page after `row`, as the admin list encodes one:
+// `v1:<created_at in Unix nanoseconds>:<id>`, base64url without padding.
+const cursorAfter = (row: { id: string; created_at: string }): string => {
+  const [, seconds, fraction = ''] = /^(.*?:\d\d)(?:\.(\d+))?Z$/.exec(row.created_at) ?? [];
+  const nanos = BigInt(Date.parse(`${seconds}Z`) / 1000) * 1_000_000_000n + BigInt(fraction.padEnd(9, '0').slice(0, 9) || '0');
+  return Buffer.from(`v1:${nanos}:${row.id}`).toString('base64url');
+};
+
+// Plays a list whose first page holds one sandbox, so the rest are beyond
+// it: the list's first page (no `prefix` or `search`) is cut to the first
+// sandbox `keep` accepts, with the cursor after it. With `refuseSearch` it
+// also plays an API without `search`, answering any request carrying it
+// with that API's 400. The `prefix` and `search` requests reach the server.
+const withOneRowFirstPage = async (
+  c: Ctx,
+  { keep = () => true, refuseSearch = false }: { keep?: (row: { id: string }) => boolean; refuseSearch?: boolean },
+  run: () => Promise<void>,
+) => {
+  const handler = async (route: Route) => {
+    const url = new URL(route.request().url());
+    if (!isListRequest(url)) return route.continue();
+    if (refuseSearch && url.searchParams.has('search')) {
+      return route.fulfill({
+        status: 400,
+        contentType: 'application/json',
+        headers: { [SYNTHETIC_HEADER]: '1' },
+        body: JSON.stringify({ error: UNKNOWN_SEARCH }),
+      });
+    }
+    if (url.searchParams.get('cursor') !== '' || url.searchParams.has('prefix') || url.searchParams.has('search')) return route.continue();
+    const res = await fetchWithoutRedirect(route);
+    if (!res) return;
+    const body = await res.json().catch(() => null);
+    const rows = (body?.sandboxes ?? []).filter((row: { id: string; resource_type?: string }) => row.resource_type === 'sandbox' && keep(row));
+    if (!rows.length) return route.fulfill({ response: res });
+    return route.fulfill({
+      response: res,
+      headers: { ...res.headers(), [SYNTHETIC_HEADER]: '1' },
+      json: { sandboxes: [rows[0]], next_cursor: cursorAfter(rows[0]) },
+    });
+  };
+  await c.page.route('**/admin/api/v1/sandboxes?*', handler);
+  try {
+    await run();
+  } finally {
+    await c.page.unroute('**/admin/api/v1/sandboxes?*', handler);
+  }
+};
+
+// The ID column's label of a row on the page: matched within the page as on
+// `main`, and, as the end of an ID, by the server search, which finds the
+// same sandbox, listed once.
+step('sandboxes-search-label', ['sandboxes'], async (c) => {
+  const id = sandboxId(c, 'running');
+  if (!id) return c.rec.check(false, 'the seed has a running sandbox');
+  await visit(c, '/dashboard/sandboxes?age=all&page_size=25', 2000);
+  const label = shortLabel(id);
+  // The match within the page lists exactly the rows of this page that
+  // carry the label.
+  const onPage = (await listedLabels(c)).filter((shown) => shown.includes(label));
+  await typeSearch(c, label);
+  const labels = await listedLabels(c);
+  const beyond = await beyondLabels(c);
+  c.rec.check(JSON.stringify(labels) === JSON.stringify(onPage), `the page lists its rows that carry the label, as on main (${labels.join(', ')}; expected ${onPage.join(', ')})`);
+  c.rec.check(timesListed([...labels, ...beyond], label) === 1, `the sandbox is listed once (page: ${labels.join(', ')}; beyond: ${beyond.join(', ')})`);
+});
+
+// A label beyond the page: the first page holds one other sandbox. The
+// server search finds it by the end of its ID and lists it after the page,
+// once; an API without `search` finds it nowhere, as on `main`.
+step('sandboxes-search-label-beyond-page', ['sandboxes'], async (c) => {
+  const running = sandboxId(c, 'running');
+  const paused = sandboxId(c, 'paused');
+  if (!running || !paused) return c.rec.check(false, 'the seed has a running and a paused sandbox');
+  await withOneRowFirstPage(c, {}, async () => {
+    await visit(c, '/dashboard/sandboxes?age=all&page_size=25', 2500);
+    const page1 = await listedLabels(c);
+    const label = [shortLabel(running), shortLabel(paused)].find((candidate) => !page1.includes(candidate))!;
+    const answer = await typeSearch(c, label);
+    const labels = await listedLabels(c);
+    const beyond = await beyondLabels(c);
+    c.rec.check(!labels.includes(label), `the page, which does not hold it, does not list ${label} (${labels.join(', ')})`);
+    if (answer.kind === 'server') {
+      c.rec.check(timesListed(beyond, label) === 1, `the server search lists ${label} once after the page (${beyond.join(', ')})`);
+    } else if (answer.kind === 'fallback') {
+      c.rec.check(!beyond.includes(label), `without search, ${label} is found nowhere, as on main (${beyond.join(', ')})`);
+    }
+  });
+});
+
+// An ID start. Its first 8 hex digits, the fewest the server matches an ID
+// start with, are matched within the page and sent as `prefix` as on
+// `main`, and searched as an ID start too: the sandbox is listed once. The
+// dashed first 12, an ID prefix on `main`, list it alone.
+step('sandboxes-search-id-start', ['sandboxes'], async (c) => {
+  const id = sandboxId(c, 'running');
+  if (!id) return c.rec.check(false, 'the seed has a running sandbox');
+  const uuid = id.replace(/^sbx_/, '');
+  const label = shortLabel(id);
+  await visit(c, '/dashboard/sandboxes?age=all&page_size=25', 2000);
+  const start = uuid.slice(0, 8);
+  await typeSearch(c, start);
+  const all = [...await listedLabels(c), ...await beyondLabels(c)];
+  c.rec.check(timesListed(all, label) === 1, `the 8-digit ID start ${start} lists the sandbox once (${all.join(', ')})`);
+  c.rec.check(new Set(all).size === all.length, 'no sandbox is listed twice');
+  // Again from a fresh page: after a fallback the page sends no `search`
+  // until it is reloaded.
+  await visit(c, '/dashboard/sandboxes?age=all&page_size=25', 2000);
+  const dashed = uuid.slice(0, 13);
+  await typeSearch(c, dashed);
+  const labels = await listedLabels(c);
+  const beyond = await beyondLabels(c);
+  c.rec.check(labels.length === 1 && labels[0] === label && !beyond.includes(label), `the ID start ${dashed} lists that sandbox alone, once (page: ${labels.join(', ')}; beyond: ${beyond.join(', ')})`);
+});
+
+// A name goes to `prefix`, case-sensitive, as on `main`, and never to
+// `search`, which matches IDs only. Typed as named, the seeded name lists its
+// sandbox alone; in upper case it lists nothing. Hex digits too few for an
+// ID search, such as three of a label, are matched within the page as well,
+// so a row on the page whose label carries them is listed.
+step('sandboxes-search-name-prefix', ['sandboxes'], async (c) => {
+  const suspended = sandboxId(c, 'suspended');
+  const running = sandboxId(c, 'running');
+  if (!suspended || !running) return c.rec.check(false, 'the seed has a suspended and a running sandbox');
+  await visit(c, '/dashboard/sandboxes?age=all&page_size=25', 2000);
+  const runningOnPage = (await listedLabels(c)).includes(shortLabel(running));
+  const searched: string[] = [];
+  const onRequest = (req: Request) => {
+    const url = new URL(req.url());
+    if (isListRequest(url) && url.searchParams.has('search')) searched.push(url.searchParams.get('search') ?? '');
+  };
+  const typePrefix = async (typed: string) => {
+    const answered = c.page.waitForResponse((res) => {
+      const url = new URL(res.url());
+      return isListRequest(url) && url.searchParams.get('prefix') === typed;
+    }, { timeout: 10_000 }).catch(() => null);
+    await content(c.page).locator('input[placeholder*="ID"]').first().fill(typed);
+    const res = await answered;
+    await settle(c.page, 1500);
+    c.rec.check(res?.ok() === true, `"${typed}" was sent as prefix and answered (${res ? res.status() : 'no answer'})`);
+    return listedLabels(c);
+  };
+  c.page.on('request', onRequest);
+  try {
+    const name = `${c.config.prefix}-suspended`;
+    let labels = await typePrefix(name);
+    c.rec.check(labels.length === 1 && labels[0] === shortLabel(suspended), `searching ${name} lists it alone (${labels.join(', ')})`);
+    labels = await typePrefix(name.toUpperCase());
+    c.rec.check(labels.length === 0, `the name prefix is case-sensitive: ${name.toUpperCase()} lists nothing (${labels.join(', ')})`);
+    const piece = shortLabel(running).slice(-3);
+    labels = await typePrefix(piece);
+    if (runningOnPage) {
+      c.rec.check(labels.includes(shortLabel(running)), `"${piece}", too few digits for an ID search, is matched within the page (${labels.join(', ')})`);
+    } else {
+      c.rec.note('the running sandbox is not on the first page, so the match within the page is not checked');
+    }
+  } finally {
+    c.page.off('request', onRequest);
+  }
+  c.rec.check(searched.length === 0, `no name or short text was sent as search (${searched.join(', ')})`);
+});
+
+// A hex-looking name, such as a test sandbox's `e2e-…`: it is an ID's hex
+// digits too, so it is searched as an ID, but it is still found by its name,
+// as on `main`. The step creates a sandbox named `e2e-` and six random hex
+// digits (no prefix can be hex, so this name alone does not carry it; the
+// state records it, so `clean` deletes it if this step does not). Typed, the
+// name lists it once: on the page, and with the first page holding another
+// sandbox, after the page, found by its `prefix`.
+step('sandboxes-search-hex-name', ['sandboxes', 'flows'], async (c) => {
+  const name = `e2e-${randomBytes(3).toString('hex')}`;
+  await visit(c, '/dashboard/sandboxes', 3000);
+  const card = c.page.locator('.ant-card', { hasText: 'Create sandbox' });
+  await card.getByPlaceholder('Name').fill(name);
+  const managing = seeded(c).managingOrgId;
+  const response = nextPost(c.page, (p) => p.endsWith('/v1/sandboxes'));
+  await card.locator('button[type=submit]').click();
+  const accepted = await jsonOf(await response);
+  if (typeof accepted?.sandbox_id !== 'string') return c.rec.check(false, `creating ${name} from the form is accepted`);
+  const id = sbxId(accepted.sandbox_id);
+  recordCreated(c.config, { kind: 'sandbox', id, name, orgId: managing });
+  // The create's answer can come before the row exists.
+  const deadline = Date.now() + 60_000;
+  let exists = false;
+  while (!exists && Date.now() < deadline) {
+    exists = (await adminFetch(c.page, 'GET', `/admin/api/v1/sandboxes/${id}`)).status === 200;
+    if (!exists) await c.page.waitForTimeout(2000);
+  }
+  if (!exists) return c.rec.check(false, `${name} appears in the list`);
+  const label = shortLabel(id);
+  try {
+    await visit(c, '/dashboard/sandboxes?age=all&page_size=25', 2000);
+    await typeSearch(c, name);
+    let all = [...await listedLabels(c), ...await beyondLabels(c)];
+    c.rec.check(timesListed(all, label) === 1, `${name} is found by its name, once (${all.join(', ')})`);
+    await withOneRowFirstPage(c, { keep: (row) => shortLabel(row.id) !== label }, async () => {
+      await visit(c, '/dashboard/sandboxes?age=all&page_size=25', 2500);
+      await typeSearch(c, name);
+      const labels = await listedLabels(c);
+      const beyond = await beyondLabels(c);
+      all = [...labels, ...beyond];
+      c.rec.check(!labels.includes(label) && timesListed(beyond, label) === 1, `beyond the page, ${name} is listed once after it, found by its prefix (page: ${labels.join(', ')}; beyond: ${beyond.join(', ')})`);
+    });
+  } finally {
+    await visit(c, `/dashboard/sandboxes/${id}`, 2000);
+    await c.page.locator('.ant-card', { hasText: 'Controls' }).getByRole('button', { name: /Delete/ }).click();
+    await confirmPopover(c.page);
+    await c.page.waitForURL(/\/dashboard\/sandboxes$/, { timeout: 120_000 }).catch(() => {});
+    await settle(c.page, 1000);
+  }
+  c.rec.check(/\/dashboard\/sandboxes$/.test(c.page.url()), `${name} is deleted again`);
+}, true);
+
+// The fallback after an API refuses `search` is `main`'s search, on the
+// page it was typed on. The step plays an API without `search`, with the
+// first page cut to one sandbox so page 2 holds the others. It types the
+// label of page 2's first row on page 2: the page stays on page 2, the row
+// is listed there, and the refused search is not sent again.
+step('sandboxes-search-fallback-page', ['sandboxes'], async (c) => {
+  await withOneRowFirstPage(c, { refuseSearch: true }, async () => {
+    await visit(c, '/dashboard/sandboxes?age=all&page_size=25', 2500);
+    await content(c.page).getByRole('button', { name: /Next/ }).first().click();
+    await settle(c.page, 2500);
+    const page2 = await listedLabels(c);
+    if (!page2.length) return c.rec.check(false, 'page 2 lists the seeded sandboxes');
+    const known = page2[0];
+    const answer = await typeSearch(c, known);
+    c.rec.check(answer.kind === 'fallback', 'the played API refused the search');
+    const labels = await listedLabels(c);
+    c.rec.check(/Page 2/.test(await text(c.page)), 'the fallback stays on page 2');
+    c.rec.check(labels.length === 1 && labels[0] === known, `the fallback lists ${known}, the page-2 row typed (${labels.join(', ')})`);
+  });
+});
+
+// The API reports `user_email` in the same change that adds `search`, so the
+// search probe tells the two versions apart: an API without `search` predates
+// owner emails and the step skips; one that takes it must report the email,
+// and an inconclusive probe fails. The API fetch is only the oracle for the
+// browser check; the API contract is tested where the API lives. The seeded
+// running sandbox is owned by the password-signed-in admin, a local user, who
+// always has an email.
+step('sandboxes-user-email', ['sandboxes'], async (c) => {
+  const id = sandboxId(c, 'running');
+  if (!id) return c.rec.check(false, 'the seed has a running sandbox');
+  await visit(c, '/dashboard/sandboxes?age=all&page_size=25', 2000);
+  const probe = await typeSearch(c, shortLabel(id));
+  if (probe.kind === 'fallback') return c.rec.note('the API predates owner emails (it refused search); the User column check is skipped');
+  if (probe.kind === 'failed') return c.rec.check(false, "the API's version is known (search answered or refused as unknown), to tell whether it reports owner emails");
+  const api = await adminFetch(c.page, 'GET', `/admin/api/v1/sandboxes/${id}`);
+  const userEmail = api.json?.user_email;
+  const present = typeof userEmail === 'string' && userEmail.length > 0;
+  c.rec.check(present, "the local owner's email is present to check the User column");
+  if (!present) return;
+  // Its full ID, which the list looks up wherever the sandbox is.
+  await visit(c, `/dashboard/sandboxes?age=all&id=${id}`, 3000);
+  const row = content(c.page).locator('tbody tr.ant-table-row', { hasText: shortLabel(id) });
+  c.rec.check((await row.innerText()).includes(userEmail), "the User column shows the owner's email");
+});
+
+// The create form has no runtime control: none of its selects offers a
+// runtime, open or closed.
+step('sandboxes-create-form', ['sandboxes'], async (c) => {
+  await visit(c, '/dashboard/sandboxes', 2000);
+  const card = c.page.locator('.ant-card', { hasText: 'Create sandbox' });
+  const runtimes = /Firecracker|gVisor|Cloud Hypervisor|Hyper-V/;
+  c.rec.check(await card.locator('.ant-select', { hasText: runtimes }).count() === 0, 'no select of the create form shows a runtime');
+  const selects = card.locator('.ant-select');
+  const offered: string[] = [];
+  for (let i = 0; i < await selects.count(); i += 1) {
+    await selects.nth(i).click();
+    await c.page.waitForTimeout(400);
+    offered.push(...await c.page.locator('.ant-select-dropdown:visible .ant-select-item-option').allInnerTexts());
+    await c.page.keyboard.press('Escape');
+  }
+  c.rec.check(offered.length > 0, `the create form's selects open (${offered.length} options)`);
+  c.rec.check(!offered.some((option) => runtimes.test(option)), 'no select of the create form offers a runtime');
+});
+
+// The Datadog logs button shows only where SPACE_UI_DATADOG_LOGS_URL is set on
+// the console; the loop reads whether it is set from its own environment, so
+// run it with the console's value. Unset, the link must be absent; set, it must
+// be shown and link to an HTTPS URL that queries the sandbox.
+step('sandbox-detail-datadog', ['sandboxes'], async (c) => {
+  const id = sandboxId(c, 'running');
+  if (!id) return c.rec.check(false, 'the seed has a running sandbox');
+  await visit(c, `/dashboard/sandboxes/${id}`, 3000);
+  const logs = c.page.getByRole('link', { name: 'Datadog logs' });
+  const shown = await logs.count() > 0;
+  if (!c.config.datadogLogsConfigured) return c.rec.check(!shown, 'no Datadog logs link, as SPACE_UI_DATADOG_LOGS_URL is unset');
+  c.rec.check(shown, 'the Datadog logs link is shown, as SPACE_UI_DATADOG_LOGS_URL is set');
+  if (!shown) return;
+  const href = new URL((await logs.first().getAttribute('href')) ?? '', c.config.baseUrl);
+  c.rec.check(href.protocol === 'https:' && (href.searchParams.get('query') ?? '').includes(id.replace(/^sbx_/, '')), 'the Datadog logs button queries the sandbox on an HTTPS URL');
 });
 
 for (const key of ['running', 'paused', 'suspended', 'stopped', 'acme-running']) {

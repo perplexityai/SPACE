@@ -46,6 +46,8 @@ import {
   PAGE_SIZE_OPTIONS,
   createdAgeMs,
   fragmentSearchScope,
+  idSearchScope,
+  isSearchUnsupported,
   listRequestQuery,
   listSections,
   loadedRowFilter,
@@ -53,6 +55,7 @@ import {
   parseListLink,
   parsePageSize,
   sameScope,
+  sandboxUserLabel,
   showsOlderFormat,
   templateFilterOptions,
   type AgeWindow,
@@ -139,6 +142,24 @@ class ShownListError extends Error {}
 const alreadyReported = (err: unknown) => err instanceof RefreshSkipped || err instanceof ShownListError;
 const REFRESH_CLICK_COOLDOWN_MS = 3000;
 
+// The caption of the matches listed after the page: what the server was
+// asked for, the fragment search's `prefix`, the ID search's `search`, or
+// both. Without an ID search it is the caption from before the console sent
+// `search`.
+function beyondPageSearched(prefix: string | null, idSearch: string | null): string {
+  if (idSearch === null) {
+    return `Names and IDs starting with "${prefix}", not already listed above. Searched on the server with the filters above: names that start with it, case-sensitively, and IDs that start with it. Names and IDs that contain it elsewhere, such as an ID ending in the ID column's label, match on the page above only.`;
+  }
+  const ids = `IDs that end with the hex digits of "${idSearch}" or, from 8 digits, start with them`;
+  if (prefix === null) return `Matches not already listed above. Searched on the server with the filters above: ${ids}.`;
+  return `Matches not already listed above. Searched on the server with the filters above: names and IDs that start with "${prefix}", case-sensitively, and ${ids}. Names and IDs that contain it elsewhere match on the page above only.`;
+}
+// Firecracker, the only runtime a control-plane create can place: nodes refuse
+// a Cloud Hypervisor create that carries a control-plane sandbox ID until
+// cluster placement can qualify a node for it. So the create form offers no
+// choice.
+const SANDBOX_RUNTIME = 'fc';
+
 // No age limit by default: long-running sandboxes are the ones support
 // cases tend to be about.
 const DEFAULT_AGE_WINDOW: AgeWindow = 'all';
@@ -190,6 +211,8 @@ function serverFilters(inputs: FilterInputs): SandboxListFilters {
     createdWithin: ageWindowAge(inputs.age),
     olderThan: olderThanAge(inputs.older),
     prefix: inputs.prefix,
+    // Only the ID search's own request sends `search` (`idSearchScope`).
+    search: '',
   };
 }
 
@@ -322,7 +345,11 @@ function isPoolSandbox(sandbox: Sandbox) {
 function sandboxResourceTag(sandbox: Sandbox) {
   switch (sandbox.resource_type) {
     case 'pool_slot':
-      return <Tag color="cyan" style={{ marginInlineEnd: 0 }}>Pool slot</Tag>;
+      return (
+        <Tooltip title={sandbox.pool_id ? `Warm-pool slot of pool ${sandbox.pool_id}` : 'Warm-pool slot'}>
+          <Tag color="cyan" style={{ marginInlineEnd: 0 }}>Pool slot</Tag>
+        </Tooltip>
+      );
     case 'observed_local':
       return <Tag color="default" style={{ marginInlineEnd: 0 }}>Observed local</Tag>;
     default:
@@ -763,15 +790,22 @@ function SandboxesPage() {
   // Applied by the admin API (`org_id`) on either list shape.
   const [orgFilter, setOrgFilter] = useState<string | null>(() => parseOrgParam(searchParams.get('org')));
   const query = useMemo(() => sandboxQuery(idFilter), [idFilter]);
+  // Whether the API takes `search`. Assumed until the ID search's request is
+  // refused as an unknown parameter (`isSearchUnsupported`), as an API from
+  // before it answers; the page then sends no ID search while it stays
+  // mounted, and searches only as it did before. A reload, or leaving the
+  // page and coming back, tries `search` again.
+  const [serverSearch, setServerSearch] = useState(true);
   // The selected statuses this list applies, and those it cannot.
   const statusSplit = useMemo(() => splitStatusFilter(listMode === 'paged', statusFilter), [listMode, statusFilter]);
   // What the search box does on this list's shape: a direct lookup, a prefix
   // the server matches, a match within the loaded rows, or both of the last
-  // two for hex digits and dashes.
-  const search = useMemo(() => sandboxSearch(idFilter, listMode), [idFilter, listMode]);
+  // two for hex digits and dashes; and, for an ID's hex digits, an ID search
+  // the server matches as well.
+  const search = useMemo(() => sandboxSearch(idFilter, listMode, serverSearch), [idFilter, listMode, serverSearch]);
   // The filters are those of a paged request whatever the shape on screen;
   // a sampled request sends only the org (`listScope`).
-  const pagedSearch = useMemo(() => sandboxSearch(idFilter, 'paged'), [idFilter]);
+  const pagedSearch = useMemo(() => sandboxSearch(idFilter, 'paged', serverSearch), [idFilter, serverSearch]);
   const filterInputs: FilterInputs = {
     org: orgFilter,
     statuses: splitStatusFilter(true, statusFilter).applied,
@@ -828,6 +862,15 @@ function SandboxesPage() {
   const prefixRequestsRef = useRef<PrefixRequests | null>(null);
   if (!prefixRequestsRef.current) prefixRequestsRef.current = new PrefixRequests();
   const prefixRequests = prefixRequestsRef.current;
+  // The IDs that end or start with an ID search's digits (`idSearch`), from
+  // a request of its own (`idSearchScope`), keyed as above.
+  const [idMatches, setIdMatches] = useState<
+    { key: string; sandboxes: Sandbox[]; more: boolean; error: string | null } | null
+  >(null);
+  const idTargetRef = useRef<string | null>(null);
+  const idRequestsRef = useRef<PrefixRequests | null>(null);
+  if (!idRequestsRef.current) idRequestsRef.current = new PrefixRequests();
+  const idRequests = idRequestsRef.current;
 
   useEffect(() => {
     const params = new URLSearchParams();
@@ -1023,7 +1066,6 @@ function SandboxesPage() {
     name?: string;
     org_id?: string;
     template: string;
-    runtime: string;
     snapshots?: boolean;
   }) => {
     if (creatingRef.current) return;
@@ -1033,7 +1075,7 @@ function SandboxesPage() {
       const payload = {
         name: values.name || null,
         template: values.template,
-        runtime: values.runtime,
+        runtime: SANDBOX_RUNTIME,
         env: {},
         metadata: {},
         resources: null,
@@ -1063,10 +1105,7 @@ function SandboxesPage() {
         snapshotsOff: isHiddenOperationError,
       });
       form.resetFields();
-      form.setFieldsValue({
-        runtime: 'fc',
-        template: templates[0]?.name,
-      });
+      form.setFieldsValue({ template: templates[0]?.name });
       setCustomCreateAutoLifecycle(null);
       createLifecycleForm.resetFields();
       refreshAndReport();
@@ -1399,11 +1438,68 @@ function SandboxesPage() {
     };
   }, [fragmentScope?.key, listGeneration, listStopped]);
 
+  const idSearch = search.kind === 'empty' || search.kind === 'ref' ? undefined : search.idSearch;
+  const idScope = useMemo(
+    () => (idSearch && shapeDecided ? idSearchScope(selectedScope, idSearch) : null),
+    [idSearch, selectedScope, shapeDecided],
+  );
+  idTargetRef.current = idScope?.key ?? null;
+
+  useEffect(() => {
+    if (!idScope || listStopped) return;
+    const scope = idScope;
+    // Waits for a pause and refreshes with the list, as the request above.
+    const timer = setTimeout(() => {
+      const ticket = idRequests.begin(scope.key);
+      getConsoleSandboxList(listRequestQuery(scope, Date.now()), ticket.signal)
+        .then((response) => {
+          if (!idRequests.applies(ticket, idTargetRef.current)) return;
+          const note = selection.noteAnswer('paged', response.mode);
+          if (note.kind === 'stopped') return stopList(note.kept);
+          if (note.kind === 'undecided') throw new Error('the list has not loaded yet; retrying');
+          if (response.mode !== 'paged') throw new OlderFormatAnswer();
+          setIdMatches({ key: scope.key, sandboxes: response.sandboxes, more: response.nextCursor !== null, error: null });
+        })
+        .catch((err: any) => {
+          if (!idRequests.applies(ticket, idTargetRef.current)) return;
+          // An API from before `search`: stop sending it. The fragment
+          // search's and the page's matches are those it always had.
+          if (isSearchUnsupported(err)) {
+            setServerSearch(false);
+            return;
+          }
+          const message = err?.message || 'search failed';
+          setIdMatches((prev) =>
+            prev?.key === scope.key ? { ...prev, error: message } : { key: scope.key, sandboxes: [], more: false, error: message });
+        });
+    }, 300);
+    return () => {
+      clearTimeout(timer);
+      idRequests.cancel();
+    };
+  }, [idScope?.key, listGeneration, listStopped]);
+
   const fragmentAnswer = fragmentScope && fragmentMatches?.key === fragmentScope.key ? fragmentMatches : null;
+  const idAnswer = idScope && idMatches?.key === idScope.key ? idMatches : null;
+  // The section after the page: the fragment search's and the ID search's
+  // matches. `answered` once every request it sends has answered.
+  const beyondPage = fragmentScope || idScope
+    ? {
+      answered: (!fragmentScope || !!fragmentAnswer) && (!idScope || !!idAnswer),
+      more: !!fragmentAnswer?.more || !!idAnswer?.more,
+      answers: [fragmentAnswer?.sandboxes ?? [], idAnswer?.sandboxes ?? []],
+      errors: [
+        fragmentScope && fragmentAnswer?.error
+          ? `Could not search names and IDs starting with "${fragmentScope.filters.prefix}": ${fragmentAnswer.error}` : null,
+        idScope && idAnswer?.error ? `Could not search IDs ending or starting with "${idSearch}": ${idAnswer.error}` : null,
+      ].filter((error): error is string => error !== null),
+    }
+    : null;
   // The server applied every filter but the node filter.
-  // Matches the main table already shows are left out of it.
+  // Matches the main table already shows are left out of it, and a sandbox
+  // both requests found is listed once.
   const fragmentRows = useMemo(
-    () => supplementalMatches(fragmentAnswer?.sandboxes ?? [], shownRows.sandboxes).filter(loadedRowFilter('paged', {
+    () => supplementalMatches(beyondPage?.answers ?? [], shownRows.sandboxes).filter(loadedRowFilter('paged', {
       matchesSearch: null,
       template: null,
       statuses: [],
@@ -1414,11 +1510,11 @@ function SandboxesPage() {
       olderThan: null,
       now: Date.now(),
     })),
-    [fragmentAnswer, nodeFilter, shownRows.sandboxes],
+    [fragmentAnswer, idAnswer, nodeFilter, shownRows.sandboxes],
   );
-  // The matches the answer returned, which can be fewer than the page size
-  // when the server's byte budget ends the page early.
-  const fragmentMatched = fragmentAnswer?.sandboxes.length ?? 0;
+  // The distinct matches the answers returned, which can be fewer than the
+  // page size when the server's byte budget ends a page early.
+  const fragmentMatched = supplementalMatches(beyondPage?.answers ?? [], []).length;
 
   // The window and the "older than" bound must leave a range between them;
   // a window that would not drops the bound.
@@ -1461,7 +1557,8 @@ function SandboxesPage() {
 
   const userFilterLabel = useMemo(() => {
     if (!userFilter) return null;
-    return sandboxes.find((s) => s.user_id === userFilter)?.user || userFilter.slice(0, 8);
+    const row = sandboxes.find((s) => s.user_id === userFilter);
+    return row ? sandboxUserLabel(row) : userFilter.slice(0, 8);
   }, [sandboxes, userFilter]);
 
   const clearFilters = () => {
@@ -1601,13 +1698,14 @@ function SandboxesPage() {
     {
       title: 'User',
       dataIndex: 'user',
-      width: 95,
+      width: 170,
       ellipsis: true,
       render: (v: string, record) => {
         if (!record.user_id) return v || '—';
         const userId = record.user_id;
+        const label = sandboxUserLabel(record);
         return (
-          <Tooltip title={`Show only ${v || 'this user'}'s sandboxes`}>
+          <Tooltip title={`Show only ${label}'s sandboxes (user ${userId})`}>
             <Button
               type="link"
               size="small"
@@ -1617,7 +1715,7 @@ function SandboxesPage() {
                 setUserFilter(userId);
               }}
             >
-              {v || userId.slice(0, 8)}
+              {label}
             </Button>
           </Tooltip>
         );
@@ -1674,9 +1772,6 @@ function SandboxesPage() {
           form={form}
           layout="inline"
           onFinish={handleCreate}
-          initialValues={{
-            runtime: 'fc',
-          }}
         >
           <div style={{ display: 'flex', alignItems: 'center', gap: 8, width: '100%', flexWrap: 'wrap' }}>
             <Text strong>Create sandbox</Text>
@@ -1695,14 +1790,6 @@ function SandboxesPage() {
             )}
             <Form.Item name="name" style={{ marginBottom: 0 }}>
               <Input placeholder="Name" style={{ width: 150 }} />
-            </Form.Item>
-            <Form.Item name="runtime" style={{ marginBottom: 0 }}>
-              <Select style={{ width: 130 }}>
-                <Select.Option value="fc">Firecracker</Select.Option>
-                <Select.Option value="gvisor" disabled>gVisor</Select.Option>
-                <Select.Option value="ch" disabled>Cloud Hypervisor</Select.Option>
-                <Select.Option value="hyperv" disabled>Hyper-V</Select.Option>
-              </Select>
             </Form.Item>
             <Form.Item name="template" rules={[{ required: true }]} style={{ marginBottom: 0 }}>
               <Select placeholder="Template" style={{ width: 150 }}>
@@ -1736,13 +1823,17 @@ function SandboxesPage() {
             <Input
               allowClear
               size="small"
-              placeholder={paged ? 'Case-sensitive name prefix, ID prefix or full ID' : 'ID, pod name or name'}
+              placeholder={!paged ? 'ID, pod name or name' : serverSearch ? 'Case-sensitive name prefix, ID prefix or label' : 'Case-sensitive name prefix, ID prefix or full ID'}
               value={idFilter}
               onChange={(e) => setIdFilter(e.target.value)}
               style={{ width: 290 }}
               aria-label="Search sandboxes"
             />
-            {paged ? (
+            {paged && serverSearch ? (
+              <Tooltip title="A name or ID prefix is searched on the server as typed. Names match case-sensitively; an ID prefix starts with sbx_ or is a dashed UUID start, and its hex matches in either case. Hex digits and dashes alone, such as the ID column's label or a name like e2e-1, are matched two ways: anywhere in the IDs and names of this page, ignoring case, and on the server as the start of any name or ID, listed after this page. When the text is also an ID's hex digits (4 to 32, once dashes and a leading sbx_ are left out), the server is also searched for IDs that end with them, such as the ID column's label, and, from 8 digits, IDs that start with them; those matches are listed after this page too. A full ID or pod name is looked up directly.">
+                <QuestionCircleOutlined aria-label="About the search" style={{ color: 'rgba(0, 0, 0, 0.45)' }} />
+              </Tooltip>
+            ) : paged ? (
               <Tooltip title="A name or ID prefix is searched on the server as typed. Names match case-sensitively; an ID prefix starts with sbx_ or is a dashed UUID start, and its hex matches in either case. Hex digits and dashes alone, such as the ID column's label or a name like e2e-1, are matched two ways: anywhere in the IDs and names of this page, ignoring case, and on the server as the start of any name or ID, listed after this page. A full ID or pod name is looked up directly.">
                 <QuestionCircleOutlined aria-label="About the search" style={{ color: 'rgba(0, 0, 0, 0.45)' }} />
               </Tooltip>
@@ -1909,7 +2000,7 @@ function SandboxesPage() {
           type="info"
           showIcon
           style={{ marginBottom: 12 }}
-          title={`"${idFilter.trim()}" matches IDs and names anywhere within page ${position.index + 1}, ignoring case, in the table below. Names and IDs that start with it are searched across the whole list and listed after this page; paste the full ID to look it up.`}
+          title={`"${idFilter.trim()}" matches IDs and names anywhere within page ${position.index + 1}, ignoring case, in the table below. ${search.idSearch ? 'Names and IDs that start with it, and IDs that end with it, are' : 'Names and IDs that start with it are'} searched across the whole list and listed after this page; paste the full ID to look it up.`}
         />
       ) : paged && search.kind === 'page' ? (
         <Alert
@@ -2005,21 +2096,21 @@ function SandboxesPage() {
 
       {/* Left out once an answer leaves nothing to show beyond the main table
           and has no older matches; with older ones it says to narrow the search. */}
-      {paged && !listStopped && search.kind === 'fragment'
-        && !(fragmentAnswer && !fragmentAnswer.error && fragmentRows.length === 0 && !fragmentAnswer.more) ? (
+      {paged && !listStopped && beyondPage
+        && !(beyondPage.answered && beyondPage.errors.length === 0 && fragmentRows.length === 0 && !beyondPage.more) ? (
         <div style={{ marginTop: 24 }}>
           <Title level={5} style={{ marginTop: 0 }}>
-            More matches beyond this page{fragmentAnswer && fragmentRows.length > 0 ? ` (${fragmentRows.length}${fragmentAnswer.more ? '+' : ''})` : ''}
+            More matches beyond this page{beyondPage.answered && fragmentRows.length > 0 ? ` (${fragmentRows.length}${beyondPage.more ? '+' : ''})` : ''}
           </Title>
           <Text type="secondary" style={{ display: 'block', fontSize: 12, marginBottom: 8 }}>
-            {`Names and IDs starting with "${search.prefix}", not already listed above. Searched on the server with the filters above: names that start with it, case-sensitively, and IDs that start with it. Names and IDs that contain it elsewhere, such as an ID ending in the ID column's label, match on the page above only.${fragmentAnswer?.more && fragmentRows.length > 0 ? ` Showing the first ${fragmentMatched}, newest first; type more of the name or ID to narrow them.` : ''}`}
+            {`${beyondPageSearched(fragmentScope?.filters.prefix ?? null, idSearch ?? null)}${beyondPage.more && fragmentRows.length > 0 ? ` Showing the first ${fragmentMatched}, newest first; type more of the name or ID to narrow them.` : ''}`}
           </Text>
-          {fragmentAnswer?.error ? (
-            <Alert type="warning" showIcon style={{ marginBottom: 8 }} title={`Could not search names and IDs starting with "${search.prefix}": ${fragmentAnswer.error}`} />
-          ) : null}
-          {fragmentAnswer && fragmentAnswer.more && fragmentRows.length === 0 ? (
+          {beyondPage.errors.map((error) => (
+            <Alert key={error} type="warning" showIcon style={{ marginBottom: 8 }} title={error} />
+          ))}
+          {beyondPage.answered && beyondPage.more && fragmentRows.length === 0 ? (
             <Text style={{ display: 'block' }}>
-              {supplementalMatches(fragmentAnswer.sandboxes, shownRows.sandboxes).length === 0
+              {supplementalMatches(beyondPage.answers, shownRows.sandboxes).length === 0
                 ? `${fragmentMatched === 1 ? 'The first match is' : `All of the first ${fragmentMatched} matches are`} on this page; type more of the name or ID to find older ones.`
                 : `${fragmentMatched === 1 ? 'The first match is' : `The first ${fragmentMatched} matches are`} on this page or left out by the node filter; type more of the name or ID to find older ones.`}
             </Text>
@@ -2028,7 +2119,7 @@ function SandboxesPage() {
               columns={columns}
               dataSource={fragmentRows}
               rowKey="id"
-              loading={!fragmentAnswer}
+              loading={!beyondPage.answered}
               size="small"
               pagination={false}
               scroll={{ x: 1280 }}

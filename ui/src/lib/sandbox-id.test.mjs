@@ -167,6 +167,55 @@ test('a full identifier is a lookup on either list, and a sampled list matches a
   }
 });
 
+test('on a server that takes search, text is matched as without it, and ID digits are searched as IDs too', () => {
+  const label = sandboxLabelOrId(sandbox.id);
+  // An ID's hex digits keep the match they had and add the ID search: a
+  // hex-looking name such as e2e-1 is still a prefix and matched within the
+  // page, and the label is also searched as the end of an ID.
+  for (const [typed, kind] of [
+    [label, 'fragment'],
+    [label.toUpperCase(), 'fragment'],
+    ['72e0', 'fragment'],
+    ['cafe', 'fragment'],
+    ['deadbeef', 'fragment'],
+    ['e2e-1', 'fragment'],
+    ['ae1d-72e0', 'fragment'],
+    ['01a19089394a', 'fragment'],
+    ['01a19089-394a', 'prefix'],
+    ['sbx_2abc', 'prefix'],
+    ['SBX_01A19089', 'prefix'],
+    ['sbx_01a19089-394a-70', 'prefix'],
+  ]) {
+    const searched = sandboxSearch(` ${typed} `, 'paged', true);
+    assert.equal(searched.kind, kind, typed);
+    assert.deepEqual(searched, { ...sandboxSearch(` ${typed} `, 'paged'), idSearch: typed }, typed);
+  }
+  // Other text is exactly what it is without search, with no ID search.
+  for (const [typed, kind] of [
+    ['Build-', 'prefix'],
+    ['BUILD cache', 'prefix'],
+    ['loop-suspended', 'prefix'],
+    ['e2e-test', 'prefix'],
+    ['sbx_x1', 'prefix'],
+    ['sbx_2ab', 'prefix'],
+    ['0a1g', 'prefix'],
+    ['abc', 'fragment'],
+    ['e2e', 'fragment'],
+    ['f'.repeat(33), 'fragment'],
+    ['build\0', 'page'],
+    ['n'.repeat(300), 'page'],
+  ]) {
+    const searched = sandboxSearch(typed, 'paged', true);
+    assert.equal(searched.kind, kind, typed);
+    assert.equal(searched.idSearch, undefined, typed);
+    assert.deepEqual(searched, sandboxSearch(typed, 'paged'), typed);
+  }
+  // A full identifier is still a lookup, and a sampled list still matches
+  // within its rows only: a server without paging has no search either.
+  assert.equal(sandboxSearch(sandbox.id, 'paged', true).kind, 'ref');
+  assert.deepEqual(sandboxSearch(label, 'sampled', true), sandboxSearch(label, 'sampled'));
+});
+
 test('an empty query matches everything', () => {
   assert.equal(sandboxQuery('  ').kind, 'empty');
   assert.equal(matchesSandboxQuery(sandboxQuery(''), other), true);
