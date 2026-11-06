@@ -1954,6 +1954,16 @@ impl TemplateManagerService {
 
         tokio::spawn(async move {
             let _inflight_guard = RootfsZstdGenerationInflightGuard { digest_path };
+            // The compressor rewrites the build's manifest and row, so it
+            // owns the digest while it runs. It waits for the registration
+            // or import that spawned it to let go, then queues for the
+            // node's one compression slot still holding it. A delete that
+            // runs first and finishes leaves it no rootfs, and it fails
+            // without writing.
+            let _claim = service
+                .volume_puller
+                .claim_digest(&template_id, &content_hash)
+                .await;
             if let Err(error) = service
                 .ensure_template_compressed_rootfs_metadata(
                     &template_id,

@@ -16,6 +16,12 @@ service TemplateManager {
   rpc PoolStatus(PoolStatusRequest) returns (PoolStatusResponse);
 
   // Delete a template (all builds, snapshots, and tags).
+  // Refuses with a retryable ABORTED while a pull, import, registration,
+  // compression, delete or startup check holds any of its builds; pulls,
+  // imports and compressions that reach a build's claim meanwhile wait for
+  // the delete instead. A registration of the template that hasn't written
+  // its row when the delete removes the template's directory fails, because
+  // its staging directory is under it.
   rpc DeleteTemplate(DeleteTemplateRequest) returns (DeleteTemplateResponse);
 
   // Delete a template's cached builds the way the cache GC evicts one, only
@@ -45,6 +51,9 @@ service TemplateManager {
   rpc GetTemplate(GetTemplateRequest) returns (GetTemplateResponse);
 
   // Delete a specific build (refuses if referenced by sandboxes/pools).
+  // Refuses with a retryable ABORTED while a pull, import, registration,
+  // compression, delete or startup check holds the digest; pulls, imports
+  // and registrations of it wait for a running delete instead.
   rpc DeleteTemplateBuild(DeleteTemplateBuildRequest) returns (DeleteTemplateBuildResponse);
 
   // Update operational template settings.

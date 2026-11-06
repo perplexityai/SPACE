@@ -13,6 +13,23 @@ impl TemplateManagerService {
         let template = &request.get_ref().template;
         validate_template_name(template)?;
         let publish_node_state = !crate::node_state_sync::should_skip_node_publish(&request);
+        // Held until the delete returns, so no pull, import, compression or
+        // startup recovery's per-dir check of any of the template's builds
+        // overlaps it: a pull, import or compression that reaches a build's
+        // claim meanwhile waits, and startup recovery skips the build. A
+        // registration claims only after copying and hashing its rootfs in a
+        // staging dir under the template's dir, so it can overlap the delete:
+        // once the delete removes that dir, the registration fails, whether
+        // it was still hashing or already waiting for the claim.
+        let _claim = self
+            .volume_puller
+            .try_claim_template(template)
+            .ok_or_else(|| {
+                Status::aborted(format!(
+                    "a build of {template} is busy (a pull, import, registration, compression, \
+                     delete or startup check holds it); retry the delete"
+                ))
+            })?;
 
         if !self.artifact_store.template_exists(template) {
             if !self.template_local_state_exists(template).await? {
@@ -677,6 +694,16 @@ impl TemplateManagerService {
             .map(|m| m.len())
             .map_err(|e| Status::internal(format!("stat rootfs {}: {e}", rootfs_path.display())))?;
 
+        // Held from here until the row is written: no pull, import,
+        // DeleteTemplateBuild or startup recovery's per-dir check of the digest overlaps
+        // the existence check, the publish and the row. A delete that holds
+        // it first finishes before this one publishes; one that comes later
+        // refuses retryably.
+        let digest = self
+            .volume_puller
+            .claim_digest(template_id, &content_hash)
+            .await;
+
         let digest_dir = build_artifacts_dir(&self.artifact_store.root, template_id, &content_hash)
             .display()
             .to_string();
@@ -695,6 +722,7 @@ impl TemplateManagerService {
                     requested_network_policy: requested_network_policy.as_ref(),
                     publish_node_state,
                     register_source: &register_source,
+                    claim: digest,
                 })
                 .await;
         }
@@ -724,9 +752,11 @@ impl TemplateManagerService {
         normalize_template_cache_tree(staging_path)?;
         match std::fs::rename(&staging_dir, &digest_dir) {
             Ok(()) => {}
-            // A concurrent registration of identical content can create the
-            // digest dir between the existence check above and this rename;
-            // renaming onto a non-empty directory then fails deterministically.
+            // The digest claim keeps other registrations, imports and pulls
+            // out, but a writer outside it, such as startup recovery restoring
+            // a replaced build dir, can still create the digest dir between
+            // the existence check above and this rename; renaming onto a
+            // non-empty directory then fails deterministically.
             // Treat that exactly like the up-front short-circuit — the content
             // is already registered. The guard reaps our staging copy on drop.
             Err(_) if std::path::Path::new(&digest_dir).exists() => {
@@ -740,6 +770,7 @@ impl TemplateManagerService {
                         requested_network_policy: requested_network_policy.as_ref(),
                         publish_node_state,
                         register_source: &register_source,
+                        claim: digest,
                     })
                     .await;
             }
@@ -793,6 +824,8 @@ impl TemplateManagerService {
             digest_dir.clone(),
             "register",
         );
+        // The row is written; the base-snapshot reconcile can take minutes.
+        drop(digest);
 
         let outcome = self.reconcile_desired_base_snapshot(template_id).await;
         if let Some(error) = outcome.error {
@@ -820,7 +853,8 @@ impl TemplateManagerService {
     /// refreshes the digest metadata, removes the registration source,
     /// converges the DB row, and reports the existing build. Reached both via
     /// the up-front digest-existence check and via the staging→digest rename
-    /// race, where a concurrent same-content registration won the rename.
+    /// race, where a writer outside the digest claim created the digest dir
+    /// first.
     pub(super) async fn finish_register_with_existing_digest(
         &self,
         registration: ExistingDigestRegistration<'_>,
@@ -833,6 +867,7 @@ impl TemplateManagerService {
             requested_network_policy,
             publish_node_state,
             register_source,
+            claim,
         } = registration;
         self.refresh_register_existing_expanded_build(
             template_id,
@@ -868,6 +903,8 @@ impl TemplateManagerService {
                 ))
             })?
         };
+        // The row is converged; the base-snapshot reconcile can take minutes.
+        drop(claim);
         let outcome = self.reconcile_desired_base_snapshot(template_id).await;
         if let Some(error) = outcome.error {
             tracing::warn!(
@@ -918,6 +955,8 @@ pub(super) struct ExistingDigestRegistration<'a> {
     pub(super) requested_network_policy: Option<&'a NetworkPolicyV1>,
     pub(super) publish_node_state: bool,
     pub(super) register_source: &'a RegisterSource,
+    /// The digest's claim, let go once the row is converged.
+    pub(super) claim: crate::volume::DigestClaim,
 }
 
 /// Validates the wire `staging_dir` value: a single safe path component that

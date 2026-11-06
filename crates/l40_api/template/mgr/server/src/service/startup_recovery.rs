@@ -801,7 +801,7 @@ impl TemplateManagerService {
         cleanup_transient_template_name_dirs();
         cleanup_transient_digest_staging_dirs();
 
-        if let Ok(entries) = std::fs::read_dir(TEMPLATE_DIR) {
+        if let Ok(entries) = std::fs::read_dir(&self.artifact_store.root) {
             for entry in entries.flatten() {
                 if !entry.path().is_dir() {
                     continue;
@@ -834,6 +834,16 @@ impl TemplateManagerService {
                         {
                             continue;
                         }
+                        // Requests flow by now: skip a digest a pull,
+                        // import, registration or delete holds rather than
+                        // verify it alongside them. A complete dir one of
+                        // them leaves without a row is checked at the next
+                        // startup, or recovered sooner by a pull of the
+                        // digest when its release is published.
+                        let Some(_claim) = self.volume_puller.try_claim_digest(&name, &hash_name)
+                        else {
+                            continue;
+                        };
                         let digest_dir = digest_entry.path();
                         reconcile_digest_dir_against_db(self, &name, &hash_name, &digest_dir).await;
                     }

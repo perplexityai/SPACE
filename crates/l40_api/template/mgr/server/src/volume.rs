@@ -335,6 +335,13 @@ pub enum PullOutcome {
 /// content_hash)`, after tag/hash lookup, so all callers that need the same
 /// digest wait on one materialization task. Entries are removed on task
 /// completion or drop; this is not a cache.
+///
+/// The map is also the digest claim: registration, imports, background rootfs
+/// compression, `DeleteTemplateBuild` and startup recovery's per-dir pass
+/// hold a [`DigestClaim`] in it while they write or remove the digest's dirs
+/// and rows, and `DeleteTemplate` holds one for the whole template, so no
+/// two of them, and no pull, hold the same digest at once. Eviction coordinates
+/// through the eviction gate and the row's `deleting` state instead.
 #[derive(Clone, Default)]
 pub struct VolumePuller {
     pub(crate) backing_policy: RootfsBackingPolicy,
@@ -548,6 +555,12 @@ impl VolumePuller {
                     }
                     .in_current_span(),
                 );
+            } else if flight.claim {
+                info!(
+                    template = %name,
+                    content_hash = %resolved_hash,
+                    "waiting for a digest claim before pulling"
+                );
             } else {
                 info!(
                     template = %name,
@@ -563,24 +576,108 @@ impl VolumePuller {
                     }
                     return result;
                 }
+                // A claim always ends without a result; a pull only when its
+                // owner task died.
+                None if flight.claim => {
+                    debug!(
+                        template = %name,
+                        content_hash = %resolved_hash,
+                        "digest claim released; retrying the pull"
+                    );
+                }
                 None => {
                     warn!(
                         template = %name,
                         content_hash = %resolved_hash,
-                        "in-flight template pull ended without a result; retrying as owner"
+                        "in-flight template pull ended without a result; retrying"
                     );
                 }
             }
         }
     }
 
+    /// Whether a pull or a digest [`DigestClaim`] has `(name, content_hash)`'s
+    /// own entry. A claim of the whole template doesn't count.
+    #[cfg(test)]
+    pub(crate) fn is_claimed(&self, name: &str, content_hash: &str) -> bool {
+        lock_or_recover(&self.in_flight, "template pull in-flight map")
+            .contains_key(&PullKey::new(name, content_hash))
+    }
+
+    /// Claim `(name, content_hash)` the way a pull does, for work that must
+    /// not overlap one, such as deleting the digest's dirs. `None` while a
+    /// pull or another claim holds it. A pull that starts meanwhile waits for
+    /// the claim to go and then retries, as the owner or joined to another
+    /// pull that got there first.
+    pub(crate) fn try_claim_digest(&self, name: &str, content_hash: &str) -> Option<DigestClaim> {
+        self.claim_or_holder(PullKey::new(name, content_hash)).ok()
+    }
+
+    /// Claim every digest of template `name` at once, for `DeleteTemplate`.
+    /// `None` while a pull or a claim holds any of its digests, or the
+    /// template. While it's held, pulls and claims of any of the template's
+    /// digests, including ones not yet on disk, wait for it to go.
+    pub(crate) fn try_claim_template(&self, name: &str) -> Option<DigestClaim> {
+        self.claim_or_holder(PullKey::template(name)).ok()
+    }
+
+    /// [`Self::try_claim_digest`], waiting for the current holder to let go
+    /// instead of giving up.
+    pub(crate) async fn claim_digest(&self, name: &str, content_hash: &str) -> DigestClaim {
+        let key = PullKey::new(name, content_hash);
+        loop {
+            match self.claim_or_holder(key.clone()) {
+                Ok(claim) => return claim,
+                // Returns once the holder finishes or lets go. A finished
+                // pull reports its result just before it leaves the map, so
+                // yield between retries rather than spin hot through that
+                // window.
+                Err(holder) => {
+                    holder.wait_for_result().await;
+                    tokio::task::yield_now().await;
+                }
+            }
+        }
+    }
+
+    fn claim_or_holder(&self, key: PullKey) -> Result<DigestClaim, Arc<InFlightPull>> {
+        let (flight, started) = self.start_or_join_flight_as(key.clone(), true);
+        if !started {
+            return Err(flight);
+        }
+        Ok(DigestClaim {
+            _guard: PullFlightGuard::new(key, flight, Arc::clone(&self.in_flight)),
+        })
+    }
+
+    /// Join whatever holds `key`, or start a flight that owns it. A digest is
+    /// held by its own entry or by its template's; a template, by its own
+    /// entry or by any of its digests'.
     fn start_or_join_flight(&self, key: PullKey) -> (Arc<InFlightPull>, bool) {
+        self.start_or_join_flight_as(key, false)
+    }
+
+    /// [`Self::start_or_join_flight`], marking a started flight as a claim
+    /// when `claim` is set.
+    fn start_or_join_flight_as(&self, key: PullKey, claim: bool) -> (Arc<InFlightPull>, bool) {
         let mut in_flight = lock_or_recover(&self.in_flight, "template pull in-flight map");
-        if let Some(existing) = in_flight.get(&key) {
+        let holder = match key.content_hash {
+            Some(_) => in_flight
+                .get(&key)
+                .or_else(|| in_flight.get(&PullKey::template(&key.name))),
+            None => in_flight
+                .iter()
+                .find(|(held, _)| held.name == key.name)
+                .map(|(_, flight)| flight),
+        };
+        if let Some(existing) = holder {
             return (Arc::clone(existing), false);
         }
 
-        let flight = Arc::new(InFlightPull::new());
+        let flight = Arc::new(InFlightPull {
+            claim,
+            ..InFlightPull::default()
+        });
         in_flight.insert(key, Arc::clone(&flight));
         (flight, true)
     }
@@ -589,14 +686,22 @@ impl VolumePuller {
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct PullKey {
     name: String,
-    content_hash: String,
+    /// `None` keys the whole template, for `DeleteTemplate`.
+    content_hash: Option<String>,
 }
 
 impl PullKey {
     fn new(name: impl Into<String>, content_hash: impl Into<String>) -> Self {
         Self {
             name: name.into(),
-            content_hash: content_hash.into(),
+            content_hash: Some(content_hash.into()),
+        }
+    }
+
+    fn template(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            content_hash: None,
         }
     }
 }
@@ -673,13 +778,11 @@ impl From<&PullOutcome> for PullOutcomeSnapshot {
 struct InFlightPull {
     notify: Notify,
     state: Mutex<InFlightPullState>,
+    /// A [`DigestClaim`], which ends without a result, rather than a pull.
+    claim: bool,
 }
 
 impl InFlightPull {
-    fn new() -> Self {
-        Self::default()
-    }
-
     async fn wait_for_result(&self) -> Option<PullTaskResult> {
         loop {
             let mut notified = std::pin::pin!(self.notify.notified());
@@ -702,6 +805,14 @@ impl InFlightPull {
 struct InFlightPullState {
     result: Option<PullTaskResult>,
     released: bool,
+}
+
+/// A digest's claim in the pull in-flight map, from
+/// [`VolumePuller::try_claim_digest`] or [`VolumePuller::claim_digest`], or a
+/// whole template's, from [`VolumePuller::try_claim_template`]. Held until
+/// dropped.
+pub(crate) struct DigestClaim {
+    _guard: PullFlightGuard,
 }
 
 struct PullFlightGuard {

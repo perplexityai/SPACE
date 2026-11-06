@@ -379,9 +379,21 @@ impl TemplateManagerService {
             }
         };
 
+        // The digest's claim, held while the import writes, so no pull,
+        // registration, DeleteTemplateBuild or startup recovery's per-dir check of it
+        // runs alongside. It waits for a holder rather than refusing:
+        // node-api's PullTemplate maps any import error to INTERNAL, so a
+        // retryable refusal here would reach its caller as a hard failure.
+        let digest = self
+            .volume_puller
+            .claim_digest(template_id, content_hash)
+            .await;
+
         let response = self
             .do_import(template_id, content_hash, &header, &mut stream)
             .await?;
+        // The base-snapshot reconcile below can take minutes.
+        drop(digest);
         if header.block_on_snapshot_policy_achieved.unwrap_or(false) {
             let outcome = self.reconcile_desired_base_snapshot(template_id).await;
             if let Some(error) = outcome.error {
