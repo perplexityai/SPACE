@@ -157,19 +157,23 @@ impl<P: PodBackend, S: ExecutionStore> Reconciler<P, S> {
         let names: Vec<String> = pods.iter().map(|pod| pod.pod_name.clone()).collect();
         let mut rows = HashMap::new();
         for chunk in names.chunks(self.config.batch_size.max(1) as usize) {
-            match self.store.rows_for_pods(chunk).await {
-                Ok(found) => rows.extend(found),
-                Err(err) => {
-                    tracing::warn!(
-                        error = %err,
-                        "retired_execution_pod_gc: execution-row lookup failed; tick skipped"
-                    );
-                    // A failed scan breaks continuity like a cold cache.
-                    self.first_seen.clear();
-                    report.lookup_failed = true;
-                    return report;
-                }
-            }
+            let failure =
+                match tokio::time::timeout_at(deadline, self.store.rows_for_pods(chunk)).await {
+                    Ok(Ok(found)) => {
+                        rows.extend(found);
+                        continue;
+                    }
+                    Ok(Err(err)) => err.to_string(),
+                    Err(_) => "ran past the tick budget".to_owned(),
+                };
+            tracing::warn!(
+                error = %failure,
+                "retired_execution_pod_gc: execution-row lookup failed; tick skipped"
+            );
+            // A failed scan breaks continuity like a cold cache.
+            self.first_seen.clear();
+            report.lookup_failed = true;
+            return report;
         }
 
         let now = (self.clock)();
