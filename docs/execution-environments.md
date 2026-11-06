@@ -1512,11 +1512,28 @@ usable. Missing or unavailable observations do not erase the catalog.
 
 Compatibility edges intersect across accepted historical reports: older reports
 cannot restore removed edges, and conflicting version ordering becomes unknown.
-Identical reports do not rewrite rows; operator retirement is never changed.
-Expanding certifications requires separate reviewed work. Deploy the optional
-kernel/state-format metadata migration before this publisher.
+Identical reports neither rewrite nor update-lock catalog rows; operator
+retirement is never changed. Admission serializes only reports containing new
+references and bounds the persisted unretired catalog by the recipe limit.
+At capacity, new references are deferred without rejecting inventory; existing
+certifications still intersect. An operator must retire entries to free space.
+This bounds automatic growth; it does not replace trust in registered nodes or
+reserve capacity for future releases. Expanding certifications requires separate
+reviewed work.
 
-Already-enabled provisioning cohorts receive populated recipes after deployment.
+Deploy the optional kernel/state-format metadata migration before this publisher.
+The legacy activation catalog reader ignores profiles lacking kernel or
+snapshot-format metadata, rather than failing unrelated activations. Before
+rolling this publisher into a cluster with runtime upgrades enabled, set
+`SPACE_RUNTIME_UPGRADE_AT_ACTIVATION_ENABLED=false` on all API/controller replicas and
+verify the old replicas have exited. Deploy the null-safe reader everywhere,
+then deploy the publisher; only then re-enable runtime upgrades. Rolling back
+to an old reader also requires disabling upgrades first: stopping publication
+does not remove durable nullable rows.
+
+An already-enabled provisioning cohort receives a populated recipe once at
+least one non-retired known environment has been successfully published.
+An empty catalog stays empty when nodes report no `environments.known`.
 Installation remains asynchronous; publication does not grant execution
 permission or establish scheduler readiness. No cohort gate is changed.
 

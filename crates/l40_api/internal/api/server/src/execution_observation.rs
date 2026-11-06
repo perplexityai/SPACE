@@ -133,17 +133,19 @@ pub(super) async fn publish(
         publish_inventory(tx, node_id, inventory).await?;
         if let Some(environments) = environments {
             // The enclosing registered-node publication owns the transaction.
-            // Iterate in reference order to keep cross-node row locks ordered.
-            for environment in environments.known() {
-                pplx_space_runtime_environment_catalog_store::publish_known(
-                    &mut **tx,
-                    environment,
+            // Admit new rows before taking any per-environment update locks.
+            let deferred = pplx_space_runtime_environment_catalog_store::publish_known(
+                    tx,
+                    environments.known(),
+                    pplx_space_node_api_client::MAX_RECIPE_ENVIRONMENTS,
                 )
                 .await
                 .map_err(|error| {
                     tracing::error!(%error, %node_id, "failed to publish certified runtime environment");
                     Status::internal("failed to publish certified runtime environment")
                 })?;
+            if deferred != 0 {
+                tracing::warn!(%node_id, deferred, "runtime catalog full; new environments deferred until operator retirement");
             }
         }
     }

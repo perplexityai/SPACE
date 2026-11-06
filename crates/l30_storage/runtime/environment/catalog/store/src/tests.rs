@@ -26,6 +26,13 @@ fn certification(
     KnownEnvironment::new(definition(), sort_key, upgrade_edges, memory_edges).unwrap()
 }
 
+async fn publish_known(pool: &PgPool, environment: &KnownEnvironment) -> TestResult {
+    let mut tx = pool.begin().await?;
+    assert_eq!(super::publish_known(&mut tx, [environment], 32).await?, 0);
+    tx.commit().await?;
+    Ok(())
+}
+
 #[derive(Debug, PartialEq, sqlx::FromRow)]
 struct CertificationRow {
     upgrade_edges: Vec<String>,
@@ -146,10 +153,94 @@ async fn publication_rolls_back_with_its_callers_transaction() -> TestResult {
         return Ok(());
     };
     let mut tx = db.pool.begin().await?;
-    publish_known(&mut *tx, &certification([], [], None)).await?;
+    super::publish_known(&mut tx, [&certification([], [], None)], 32).await?;
     assert_eq!(list_unretired(&mut *tx).await?.len(), 1);
     tx.rollback().await?;
     assert!(list_unretired(&db.pool).await?.is_empty());
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn unchanged_publications_do_not_wait_for_another_publishers_commit() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let known = certification([], [], None);
+    publish_known(&db.pool, &known).await?;
+    let mut first = db.pool.begin().await?;
+    super::publish_known(&mut first, [&known], 32).await?;
+    let mut second = db.pool.begin().await?;
+    sqlx::query(sql!("SET LOCAL lock_timeout = '250ms'"))
+        .execute(&mut *second)
+        .await?;
+    // The first publisher is still open. A replay must not wait for it.
+    assert_eq!(super::publish_known(&mut second, [&known], 32).await?, 0);
+    second.commit().await?;
+    first.rollback().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn admission_is_bounded_across_concurrent_reports_and_preserves_existing_updates()
+-> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let make_known = |version: &str| -> KnownEnvironment {
+        let mut spec = definition().descriptor().spec().clone();
+        let RuntimeBinding::ManagedRelease(release) = &mut spec.runtime;
+        release.runtime.version = version.parse().unwrap();
+        KnownEnvironment::new(
+            EnvironmentDefinition::new(spec.try_into().unwrap()),
+            Some(VersionSortKey::new(vec![1]).unwrap()),
+            [],
+            [],
+        )
+        .unwrap()
+    };
+    let publish = |known: KnownEnvironment| {
+        let pool = db.pool.clone();
+        async move {
+            let mut tx = pool.begin().await?;
+            let deferred = super::publish_known(&mut tx, [&known], 2).await?;
+            tx.commit().await?;
+            Ok::<_, PublishKnownError>(deferred)
+        }
+    };
+    let (a, b, c) = tokio::join!(
+        publish(make_known("1.0.0")),
+        publish(make_known("2.0.0")),
+        publish(make_known("3.0.0")),
+    );
+    assert_eq!(a? + b? + c?, 1);
+    assert_eq!(list_unretired(&db.pool).await?.len(), 2);
+    // Repeated distinct reports cannot grow the persisted catalog.
+    assert_eq!(publish(make_known("4.0.0")).await?, 1);
+    let admitted = list_unretired(&db.pool).await?;
+    let existing = ["1.0.0", "2.0.0", "3.0.0"]
+        .into_iter()
+        .map(make_known)
+        .find(|known| known.reference() == admitted[0])
+        .unwrap();
+    let reduced = KnownEnvironment::new(existing.definition().clone(), None, [], [])?;
+    let mut tx = db.pool.begin().await?;
+    assert_eq!(super::publish_known(&mut tx, [&reduced], 2).await?, 0);
+    tx.commit().await?;
+    let sort_key: Option<Vec<i32>> = sqlx::query_scalar(sql!(
+        "SELECT version_sort_key FROM runtime_environments WHERE environment_ref = $1"
+    ))
+    .bind(reduced.reference().to_string())
+    .fetch_one(&db.pool)
+    .await?;
+    assert!(sort_key.is_none());
+    sqlx::query(sql!(
+        "UPDATE runtime_environments SET retired_at = now() WHERE environment_ref = $1"
+    ))
+    .bind(reduced.reference().to_string())
+    .execute(&db.pool)
+    .await?;
+    assert_eq!(publish(make_known("4.0.0")).await?, 0);
+    assert_eq!(list_unretired(&db.pool).await?.len(), 2);
     Ok(())
 }
 
@@ -180,6 +271,7 @@ async fn runtime_neutral_definitions_need_not_have_kernel_or_state_format() -> T
     .await?;
     assert_eq!(metadata, (None, None, None));
     assert_eq!(list_unretired(&db.pool).await?, vec![reference]);
+    assert!(list_legacy_upgrade_candidates(&db.pool).await?.is_empty());
     Ok(())
 }
 

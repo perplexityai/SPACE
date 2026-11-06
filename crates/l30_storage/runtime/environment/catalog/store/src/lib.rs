@@ -35,10 +35,62 @@ pub enum PublishKnownError {
 /// row. An absent/old build cannot silently re-enable an edge another build
 /// refused. Expanding certifications needs a separate operator-reviewed
 /// protocol, not last-writer-wins. Retirement is never changed here.
-pub async fn publish_known(
-    executor: impl sqlx::PgExecutor<'_>,
+///
+/// New rows are admitted only while the persisted unretired count is below
+/// `capacity`; the result counts deferred entries, not failed inventory
+/// reports. Existing certifications are still intersected at capacity.
+/// The caller supplies the recipe protocol's bound. Admission is serialized
+/// before reference-ordered row updates; identical existing
+/// publications acquire neither the admission lock nor row update locks.
+/// The transaction must use READ COMMITTED so admission sees commits from
+/// earlier holders of the admission lock.
+pub async fn publish_known<'a>(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    environments: impl IntoIterator<Item = &'a KnownEnvironment>,
+    capacity: usize,
+) -> Result<usize, PublishKnownError> {
+    let mut environments = environments.into_iter().collect::<Vec<_>>();
+    environments.sort_unstable_by_key(|environment| environment.reference());
+    let references = environments
+        .iter()
+        .map(|environment| environment.reference().to_string())
+        .collect::<Vec<_>>();
+    let has_new: bool = sqlx::query_scalar(sql!(
+        "SELECT EXISTS (
+             SELECT 1 FROM unnest($1::text[]) AS reported(reference)
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM runtime_environments
+                 WHERE environment_ref = reported.reference
+             )
+         )"
+    ))
+    .bind(&references)
+    .fetch_one(&mut **tx)
+    .await?;
+    if has_new {
+        // Only admission takes this lock, before any catalog row locks.
+        // Serialize the count-and-insert across reports, not steady-state
+        // replays. The transaction owns it through commit.
+        sqlx::query(sql!(
+            "SELECT pg_advisory_xact_lock(hashtextextended('runtime-environment-catalog-admission', 0))"
+        ))
+        .execute(&mut **tx)
+        .await?;
+    }
+    let mut deferred = 0;
+    for environment in environments {
+        if !publish_one(tx, environment, capacity).await? {
+            deferred += 1;
+        }
+    }
+    Ok(deferred)
+}
+
+async fn publish_one(
+    connection: &mut sqlx::PgConnection,
     environment: &KnownEnvironment,
-) -> Result<(), PublishKnownError> {
+    capacity: usize,
+) -> Result<bool, PublishKnownError> {
     let spec = environment.definition().descriptor().spec();
     let RuntimeBinding::ManagedRelease(release) = &spec.runtime;
     let sort_key = environment.runtime_version_sort_key().map(|key| {
@@ -69,43 +121,62 @@ pub async fn publish_known(
              environment_ref, runtime, runtime_version, version_sort_key,
              kernel_version, state_format_name, state_format_version,
              upgrade_edges, memory_edges
-         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-         ON CONFLICT (environment_ref) DO UPDATE SET
+         ) SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9
+         WHERE (SELECT count(*) FROM runtime_environments WHERE retired_at IS NULL) < $10
+         ON CONFLICT (environment_ref) DO NOTHING"
+    ))
+    .bind(environment.reference().to_string())
+    .bind(release.runtime.kind.as_str())
+    .bind(release.runtime.version.as_str())
+    .bind(&sort_key)
+    .bind(kernel)
+    .bind(state_format.map(|format| format.format.as_str()))
+    .bind(state_format.map(|format| format.version.as_str()))
+    .bind(&upgrade_edges)
+    .bind(&memory_edges)
+    .bind(i64::try_from(capacity).unwrap_or(i64::MAX))
+    .execute(&mut *connection)
+    .await?;
+    // A separate statement sees a concurrent insert after ON CONFLICT waits.
+    // Unlike an upsert, UPDATE's predicate takes no tuple lock on a replay.
+    sqlx::query(sql!(
+        "UPDATE runtime_environments SET
              version_sort_key = CASE
-                 WHEN runtime_environments.version_sort_key = EXCLUDED.version_sort_key
+                 WHEN version_sort_key = $2
                  THEN runtime_environments.version_sort_key
                  ELSE NULL
              END,
              upgrade_edges = ARRAY(
                  SELECT target FROM unnest(runtime_environments.upgrade_edges) AS old(target)
                  INTERSECT
-                 SELECT target FROM unnest(EXCLUDED.upgrade_edges) AS new(target)
+                 SELECT target FROM unnest($3::text[]) AS new(target)
                  ORDER BY target
              ),
              memory_edges = ARRAY(
                  SELECT target FROM unnest(runtime_environments.memory_edges) AS old(target)
                  INTERSECT
-                 SELECT target FROM unnest(EXCLUDED.memory_edges) AS new(target)
+                 SELECT target FROM unnest($4::text[]) AS new(target)
                  ORDER BY target
              ),
              updated_at = now()
-         WHERE NOT runtime_environments.upgrade_edges <@ EXCLUDED.upgrade_edges
-            OR NOT runtime_environments.memory_edges <@ EXCLUDED.memory_edges
+         WHERE environment_ref = $1 AND (
+                NOT runtime_environments.upgrade_edges <@ $3::text[]
+            OR NOT runtime_environments.memory_edges <@ $4::text[]
             OR (runtime_environments.version_sort_key IS NOT NULL
-                AND runtime_environments.version_sort_key IS DISTINCT FROM EXCLUDED.version_sort_key)"
+                AND runtime_environments.version_sort_key IS DISTINCT FROM $2::integer[]))"
     ))
     .bind(environment.reference().to_string())
-    .bind(release.runtime.kind.as_str())
-    .bind(release.runtime.version.as_str())
     .bind(sort_key)
-    .bind(kernel)
-    .bind(state_format.map(|format| format.format.as_str()))
-    .bind(state_format.map(|format| format.version.as_str()))
     .bind(upgrade_edges)
     .bind(memory_edges)
-    .execute(executor)
+    .execute(&mut *connection)
     .await?;
-    Ok(())
+    Ok(sqlx::query_scalar(sql!(
+        "SELECT EXISTS (SELECT 1 FROM runtime_environments WHERE environment_ref = $1)"
+    ))
+    .bind(environment.reference().to_string())
+    .fetch_one(&mut *connection)
+    .await?)
 }
 
 /// Reading the catalog failed. Every variant fails closed: the caller gets no
@@ -144,6 +215,46 @@ pub async fn list_unretired(
                 .map_err(|source| ListUnretiredError::InvalidEnvironmentReference { value, source })
         })
         .collect()
+}
+
+/// The legacy activation planner can attribute only Linux/snapshot profiles
+/// carrying all three historical metadata fields. Other profiles still belong
+/// in provisioning recipes, but cannot be inferred from that legacy evidence.
+#[derive(sqlx::FromRow)]
+pub struct LegacyUpgradeCandidate {
+    pub environment_ref: String,
+    pub runtime: String,
+    pub runtime_version: String,
+    pub kernel_version: String,
+    pub state_format_name: String,
+    pub state_format_version: String,
+    pub upgrade_edges: Vec<String>,
+    pub memory_edges: Vec<String>,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ListLegacyUpgradeCandidatesError {
+    #[error(transparent)]
+    Database(#[from] sqlx::Error),
+}
+
+/// Read supported legacy attribution candidates without allowing an unrelated
+/// runtime-neutral row's optional metadata to fail the entire catalog read.
+pub async fn list_legacy_upgrade_candidates(
+    executor: impl sqlx::PgExecutor<'_>,
+) -> Result<Vec<LegacyUpgradeCandidate>, ListLegacyUpgradeCandidatesError> {
+    Ok(sqlx::query_as(sql!(
+        "SELECT environment_ref, runtime, runtime_version, kernel_version,
+                state_format_name, state_format_version, upgrade_edges, memory_edges
+         FROM runtime_environments
+         WHERE retired_at IS NULL
+           AND kernel_version IS NOT NULL
+           AND state_format_name IS NOT NULL
+           AND state_format_version IS NOT NULL
+         ORDER BY environment_ref"
+    ))
+    .fetch_all(executor)
+    .await?)
 }
 
 #[cfg(test)]

@@ -4865,6 +4865,7 @@ dependencies = [
  "pplx-space-placement",
  "pplx-space-public-api",
  "pplx-space-public-api-http",
+ "pplx-space-runtime-environment-catalog-store",
  "pplx-space-runtime-environment-policy-store",
  "pplx-space-sandbox-portability",
  "pplx-space-sandbox-store",

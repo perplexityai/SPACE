@@ -730,10 +730,13 @@ async fn malformed_environment_publications_never_partially_write_the_catalog() 
             }
             _ => unreachable!(),
         }
-        assert!(
-            commit_inventory(&db.pool, node_id, inventory)
-                .await
-                .is_err()
+        let error = commit_inventory(&db.pool, node_id, inventory)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<Status>().map(Status::code),
+            Some(tonic::Code::InvalidArgument),
+            "case {change} must be rejected as malformed input"
         );
         assert!(projection_rows(&db.pool, node_id).await?.is_empty());
         assert!(
