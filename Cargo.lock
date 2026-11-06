@@ -7010,6 +7010,7 @@ version = "0.8.1"
 dependencies = [
  "pplx-space-common-core",
  "pplx-space-db-test-fixtures",
+ "pplx-space-execution-common",
  "pplx-space-test-env",
  "sqlx",
  "thiserror 2.0.20",
