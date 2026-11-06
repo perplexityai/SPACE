@@ -1,7 +1,93 @@
 use super::store::PlacementRetryDisposition;
 use super::support::*;
 use super::*;
+use k8s_openapi::api::core::v1::Event;
 use pplx_space_api_route::wait_ready_lifecycle_request;
+
+/// The kubelet event reason for a pod sandbox the runtime failed to start.
+const FAILED_CREATE_POD_SANDBOX_REASON: &str = "FailedCreatePodSandBox";
+
+/// The marker `annotateStatus` in `shim/space.go` writes for node-manager's
+/// `InvalidArgument`: the request fails identically on every node. sbx-mgr's
+/// `failure_status` decides which node-manager codes reach the shim intact.
+const INVALID_ARGUMENT_MARKER: &str = "[space-err=InvalidArgument]";
+
+/// How long a create waiting for its pod's IP waits to watch that pod's
+/// events again after a watch ended or failed. A watch from `"0"` replays the
+/// events already recorded, so a refusal recorded in between is not missed.
+const POD_SANDBOX_REJECTION_REWATCH_DELAY: Duration = Duration::from_secs(1);
+
+/// The node's reason from a `FailedCreatePodSandBox` event message that
+/// carries the shim's `InvalidArgument` marker.
+fn rejected_pod_sandbox_reason(event_message: &str) -> Option<&str> {
+    let (_, reason) = event_message.split_once(INVALID_ARGUMENT_MARKER)?;
+    Some(reason.trim_start_matches(':').trim())
+}
+
+/// Why a watch of a pod's sandbox refusals ended without one.
+struct RejectionWatchFailure {
+    /// The apiserver's HTTP status, when it answered with one.
+    code: Option<u16>,
+    message: String,
+}
+
+impl RejectionWatchFailure {
+    fn from_kube(error: kube::Error) -> Self {
+        let code = match &error {
+            kube::Error::Api(response) => Some(response.code),
+            _ => None,
+        };
+        Self {
+            code,
+            message: error.to_string(),
+        }
+    }
+
+    /// A client error that another watch would get again: anything in 4xx
+    /// but a request timeout, an expired resource version or throttling.
+    fn is_permanent(&self) -> bool {
+        self.code
+            .is_some_and(|code| (400..500).contains(&code) && !matches!(code, 408 | 410 | 429))
+    }
+}
+
+/// Watch `params`' events from `"0"` until one carries a refusal, as the
+/// node's reason, or the watch ends (`None`).
+async fn watch_pod_sandbox_rejection(
+    events: &Api<Event>,
+    params: &WatchParams,
+) -> Result<Option<String>, RejectionWatchFailure> {
+    let stream = events
+        .watch(params, "0")
+        .await
+        .map_err(RejectionWatchFailure::from_kube)?;
+    pin_mut!(stream);
+    while let Some(event) = stream
+        .try_next()
+        .await
+        .map_err(RejectionWatchFailure::from_kube)?
+    {
+        match event {
+            WatchEvent::Added(event) | WatchEvent::Modified(event) => {
+                if let Some(reason) = event
+                    .message
+                    .as_deref()
+                    .and_then(rejected_pod_sandbox_reason)
+                {
+                    return Ok(Some(reason.to_owned()));
+                }
+            }
+            WatchEvent::Deleted(_) | WatchEvent::Bookmark(_) => {}
+            WatchEvent::Error(status) => {
+                return Err(RejectionWatchFailure {
+                    code: Some(status.code),
+                    message: status.message.clone(),
+                });
+            }
+        }
+    }
+    Ok(None)
+}
 
 #[derive(Clone, Copy)]
 pub(super) enum CommandReadyPod<'a> {
@@ -387,7 +473,7 @@ impl KubernetesSubstrate {
             (Instant::now() + self.k8s.create_data_plane_ready_timeout).min(phase_deadline);
         let sandbox_id_string = sandbox_id.to_string();
 
-        let Some(pod_ip) = self
+        let pod_ip_assignment = self
             .wait_for_pod_ip_assignment(
                 metric_identity,
                 sandbox_id,
@@ -401,9 +487,18 @@ impl KubernetesSubstrate {
                 sandbox_id = %sandbox_id,
                 pod_name = %target.pod_name,
                 namespace = %self.k8s.sandbox_namespace,
-            ))
-            .await?
-        else {
+            ));
+        // A pod whose sandbox the node refuses never gets an IP: kubelet
+        // retries it until the wait's deadline. Only a wait that knows its
+        // pod's UID can tell that pod's refusal from an earlier pod's.
+        let pod_ip = match target.pod_uid {
+            Some(pod_uid) => tokio::select! {
+                pod_ip = pod_ip_assignment => pod_ip?,
+                rejection = self.pod_sandbox_rejection(pod_uid) => return Err(rejection),
+            },
+            None => pod_ip_assignment.await?,
+        };
+        let Some(pod_ip) = pod_ip else {
             record_pod_proxy_wait_timeout(metric_identity, sandbox_id, started_at);
             // Pod never reached scheduled / IP-assigned in the window. No
             // node-mgr probe ran on this path, so the message names only
@@ -475,6 +570,63 @@ impl KubernetesSubstrate {
             }
 
             sleep(start_wait_poll_interval(started_at)).await;
+        }
+    }
+
+    /// Resolve once the node has refused to start `pod_uid`'s pod sandbox
+    /// with a verdict no retry or other node can change, as that error;
+    /// otherwise never. Kubelet records each refusal as a pod event, and the
+    /// shim marks node-manager's `InvalidArgument` verdict in its message.
+    ///
+    /// A watch the apiserver refuses outright, with a client error other than
+    /// a timeout, throttling or an expired version (such as a missing `watch`
+    /// grant), leaves the wait to its deadline. Any other failure, and a watch
+    /// that ends, is watched again after
+    /// [`POD_SANDBOX_REJECTION_REWATCH_DELAY`].
+    async fn pod_sandbox_rejection(&self, pod_uid: &str) -> SubstrateError {
+        let events: Api<Event> =
+            Api::namespaced(self.k8s.client.clone(), &self.k8s.sandbox_namespace);
+        // A watch from "0", as `watch_until_pod_ip_assigned` does for the
+        // pod: the apiserver serves it from its watch cache, replays the
+        // refusals already recorded as `Added` and pushes later ones. A LIST
+        // would read the namespace's Events from etcd on every poll, since
+        // field selectors on Events are not indexed. It is bounded to one
+        // pod's UID and one reason, and runs only while a create waits for
+        // that pod's IP.
+        let params = WatchParams::default()
+            .fields(&format!(
+                "involvedObject.uid={pod_uid},reason={FAILED_CREATE_POD_SANDBOX_REASON}"
+            ))
+            .timeout(POD_IP_WATCH_TIMEOUT_SECS);
+        let mut warned = false;
+        loop {
+            match watch_pod_sandbox_rejection(&events, &params).await {
+                Ok(Some(reason)) => {
+                    return SubstrateError::InvalidRequest {
+                        message: format!("the node refused to start the sandbox: {reason}"),
+                    };
+                }
+                Ok(None) => {}
+                Err(failure) if failure.is_permanent() => {
+                    tracing::warn!(
+                        pod_uid,
+                        error = %failure.message,
+                        "sandbox pod events cannot be watched; waiting for the pod IP without them"
+                    );
+                    return std::future::pending().await;
+                }
+                Err(failure) => {
+                    if !warned {
+                        warned = true;
+                        tracing::warn!(
+                            pod_uid,
+                            error = %failure.message,
+                            "failed to watch sandbox pod events; watching them again"
+                        );
+                    }
+                }
+            }
+            sleep(POD_SANDBOX_REJECTION_REWATCH_DELAY).await;
         }
     }
 
