@@ -71,10 +71,16 @@ reviews:
           - "coderabbit.yaml"
           - "coderabbit.yml"
           - ".coderabbit.config.ts"
-          # Agent configuration that runs commands: hooks and MCP servers.
+          # Agent configuration that runs commands: hooks, MCP servers, the
+          # scripts skills and hooks run, and the marketplaces that choose
+          # plugin sources. Manifest entries that run commands fail the
+          # "Agent tooling runs no new commands" check below.
           - ".claude/settings*.json"
           - "**/.mcp.json"
           - "**/hooks.json"
+          - ".agents/plugins/**/hooks/**"
+          - ".agents/plugins/**/scripts/**"
+          - "**/marketplace.json"
           # CI workflows, CI scripts, images and selection, and repository
           # guards.
           - ".github/**"
@@ -445,6 +451,19 @@ reviews:
             skill under .agents/, CONTRIBUTING.md, or docs/rust/. Updating
             the names and paths a rule refers to does not loosen it.
           Pass otherwise. When failing, list each item with its file and line.
+
+      - name: Agent tooling runs no new commands
+        mode: error
+        instructions: |
+          Agent plugin manifests and skills are approved without a person, so
+          this check holds back anything in them that makes agent tools start
+          a process or connect to a server on a developer's machine. Fail if
+          the diff adds or changes hooks, MCP servers, LSP servers, or any
+          other entry that runs a command or starts a server, whether inline
+          in a plugin manifest (plugin.json, plugin.yaml) or in a file one
+          refers to. Edits to a manifest's name, description, version, or
+          skill list, and changes to skill text, pass. Pass otherwise. When
+          failing, list each item with its file and line.
 
       - name: Public-safe content
         mode: error
