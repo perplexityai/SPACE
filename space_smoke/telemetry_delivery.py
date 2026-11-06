@@ -13,6 +13,8 @@ scenario's own sandbox, never for whatever an earlier scenario left behind:
 - Prometheus holds the shim's create latency from a shim process that started
   after the scenario did, on the node that trace names, and a space-api create
   count that grew after the scenario's start;
+- fresh guest-memory observations agree with the idle guest's meminfo, with
+  only the scenario's workload contributing during the measurement window;
 - Loki holds a SPACE pod log line that names the sandbox.
 
 Each check records what it read, at the scenario's start and at its last poll
@@ -28,6 +30,7 @@ about 11 s after its spans end.
 
 from __future__ import annotations
 
+import json
 import time
 from collections.abc import Callable, Mapping
 from typing import TYPE_CHECKING, Any
@@ -252,6 +255,77 @@ class TelemetryDeliveryAssertions:
             bool(found),
             f"Loki holds no SPACE pod log line naming {sandbox_id}",
             failure_evidence=space_lines,
+        )
+
+    def expect_guest_memory_used(
+        self, *, total_bytes: int, used_bytes: int
+    ) -> None:
+        """Fresh watchdog byte counts agree with this idle guest's meminfo."""
+
+        metric = "space_sandbox_resource_memory_guest_used_bytes"
+        self._fixture.verify(self._node is not None, "the shim's spans named no Kind node")
+        template = self._fixture.sandbox_template_name()
+        selector = (
+            f"{metric}{{template={json.dumps(template)},"
+            f"k8s_node_name={json.dumps(self._node)}}}"
+        )
+        queries = {
+            part: f"sum(histogram_{part}({selector}))"
+            for part in ("count", "sum")
+        }
+
+        def read() -> dict[str, float]:
+            # There is deliberately no sandbox-id metric tag. A second
+            # sandbox, including a pool member, could satisfy this assertion
+            # while ours reports nothing.
+            self._fixture.verify(
+                self._control.sandbox_pod_count(include_pool=True) == 1,
+                "guest-memory verification requires exactly one sandbox, including pool members",
+            )
+            at = int(time.time())
+            values = {}
+            for part, query in queries.items():
+                samples = self._prometheus(query, at)
+                values[part] = float(samples[0]["value"][1]) if samples else 0.0
+            return values
+
+        baseline = read()
+        # Two fresh observations prove continued periodic delivery, not merely
+        # a retained sample. Allow two 24–37 s probe intervals, scheduler ticks,
+        # and exporter delay.
+        final = self._poll(
+            read,
+            lambda now: now["count"] - baseline["count"] >= 2,
+            budget=120.0,
+        )
+        count = final["count"] - baseline["count"]
+        used = final["sum"] - baseline["sum"]
+        self._fixture.record(
+            "guest_memory_delivery",
+            {
+                "queries": queries,
+                "template": template,
+                "baseline": baseline,
+                "final": final,
+                "new_observations": count,
+                "average_used_bytes": used / count if count > 0 else None,
+                "guest_total_bytes": total_bytes,
+                "guest_used_bytes": used_bytes,
+            },
+        )
+        self._fixture.verify(
+            count >= 2,
+            "Prometheus did not receive two fresh guest-memory observations",
+        )
+        self._fixture.verify(
+            0 < used / count <= total_bytes,
+            "Guest-memory observations are outside the guest's physical-memory bounds",
+        )
+        # The guest is idle, but meminfo and the watchdog sample at different
+        # instants. Allow 25% variation, not a unit conversion or placeholder.
+        self._fixture.verify(
+            abs(used / count - used_bytes) <= used_bytes * 0.25,
+            "Exported guest-memory bytes disagree with the guest's meminfo",
         )
 
     def _prometheus(self, query: str, at: int) -> list[dict[str, Any]]:
