@@ -35,8 +35,13 @@ where
 pub(crate) fn token_from_headers(headers: &HeaderMap) -> Result<Option<String>, AttachError> {
     token_from_headers_with_source(headers)
         .map(|token| token.map(|(token, _source)| token))
-        .map_err(AttachError::BadRequest)
+        .map_err(|MalformedToken| AttachError::Unauthorized(INVALID_TOKEN_MESSAGE))
 }
+
+/// The answer to a token the data plane does not accept: malformed, unknown,
+/// expired, or issued for another session. A client cannot act on the
+/// difference, so all of them are one 401.
+pub(crate) const INVALID_TOKEN_MESSAGE: &str = "invalid or expired data-plane token";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum HeaderTokenSource {
@@ -44,15 +49,31 @@ pub(crate) enum HeaderTokenSource {
     WebSocketProtocol,
 }
 
+/// A presented data-plane token that is not one in shape, such as a
+/// management API key sent to the data plane. It is a credential the data
+/// plane does not accept, as an unknown token is, not a malformed request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct MalformedToken;
+
+/// The credentials of an `Authorization: Bearer` header. The scheme is
+/// case-insensitive (RFC 7235 section 2.1); other schemes carry no
+/// data-plane token and are left to the proxied service.
+fn bearer_credentials(value: &str) -> Option<&str> {
+    let (scheme, credentials) = value.trim().split_once(' ')?;
+    scheme
+        .eq_ignore_ascii_case("bearer")
+        .then(|| credentials.trim())
+}
+
 pub(crate) fn token_from_headers_with_source(
     headers: &HeaderMap,
-) -> Result<Option<(String, HeaderTokenSource)>, &'static str> {
+) -> Result<Option<(String, HeaderTokenSource)>, MalformedToken> {
     if let Some(token) = headers
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.trim().strip_prefix("Bearer "))
+        .and_then(bearer_credentials)
     {
-        validate_token_shape(token)?;
+        validate_token_shape(token).map_err(|_| MalformedToken)?;
         return Ok(Some((token.to_string(), HeaderTokenSource::Authorization)));
     }
 
@@ -64,7 +85,7 @@ pub(crate) fn token_from_headers_with_source(
             .map(str::trim)
             .find(|value| value.starts_with(DATA_PLANE_TOKEN_PREFIX))
     {
-        validate_token_shape(token)?;
+        validate_token_shape(token).map_err(|_| MalformedToken)?;
         return Ok(Some((
             token.to_string(),
             HeaderTokenSource::WebSocketProtocol,
@@ -256,7 +277,7 @@ pub(crate) fn route_resolution_http_error(error: RouteResolutionError) -> Respon
         RouteResolutionError::Unauthenticated => data_plane_http_error(
             StatusCode::UNAUTHORIZED,
             DataPlaneHttpErrorCode::Unauthorized,
-            "invalid or expired data-plane token",
+            INVALID_TOKEN_MESSAGE,
             false,
             origin,
             kind,
