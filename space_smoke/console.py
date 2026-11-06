@@ -34,12 +34,14 @@ delete anything it did not create.
 from __future__ import annotations
 
 import re
+import tempfile
 import time
 import uuid
 from collections import Counter
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from urllib.parse import quote, urlsplit
 
@@ -409,6 +411,140 @@ class ConsoleAssertions:
         return collect
 
     # --- accounts -----------------------------------------------------------
+
+    def build_seed_with_qualified_pair(self, session: ConsoleSession) -> None:
+        """A real UI request builds a digest, does not promote it, and boots it."""
+        catalog = self._api("GET", "/admin/api/v1/system-template-environments")["environments"]
+        candidates = [
+            entry for entry in catalog
+            if entry["runtime"] == "firecracker" and entry["runtime_version"] == "1.17.0"
+            and entry["kernel_version"] == "6.1.155" and entry["architecture"] == "x86_64"
+        ]
+        self._fixture.verify(len(candidates) == 1, "the server catalog must qualify the tested pair", candidates=candidates)
+        selected = candidates[0]
+        releases_before = self._api("GET", "/admin/api/v1/template-releases")
+        prior_ids = {entry["id"] for entry in releases_before}
+        latest_before = {
+            entry["template_name"]: entry["content_hash"]
+            for entry in releases_before if "latest" in entry.get("tags", [])
+        }
+        page = session.page
+        session.open("/dashboard/templates?tab=system")
+        page.get_by_role("button", name="Build seed", exact=True).click()
+        dialog = page.get_by_role("dialog", name="Build seed", exact=True)
+        dialog.get_by_role("combobox", name="Runtime/kernel pair").click()
+        page.get_by_text("Firecracker 1.17.0 · Linux 6.1.155 · x86_64", exact=True).click()
+        dialog.get_by_text("Build only, no promotion", exact=True).click()
+        page.locator(".ant-select-dropdown").wait_for(state="hidden")
+        screenshot = Path(tempfile.gettempdir()) / f"{self._run}-seed-runtime-kernel-selector.png"
+        page.screenshot(path=str(screenshot), full_page=True)
+        self._fixture.record("seed_build_selector_screenshot", str(screenshot))
+        with page.expect_response(
+            lambda response: response.request.method == "POST"
+            and response.url.endswith("/v1/system-templates/seed/builds"),
+            timeout=90_000,
+        ) as started:
+            dialog.get_by_role("button", name="Build seed", exact=True).click()
+        response = started.value
+        submitted = response.request.post_data_json
+        self._fixture.verify(
+            response.status == 202 and submitted.get("environment") == selected["environment"]
+            and submitted.get("publish_tags") == [],
+            "the UI must submit the selected pair without promotion",
+            status=response.status, submitted=submitted,
+        )
+        job_id = response.json()["job_id"]
+        self._scope.defer(
+            "delete unpromoted seed release",
+            lambda: self._cleanup_seed_build_release(job_id, prior_ids),
+        )
+        deadline = time.monotonic() + 1200
+        status: dict[str, Any] = {}
+        while time.monotonic() < deadline:
+            status = self._api("GET", f"/admin/api/v1/templates/seed/builds/{job_id}")
+            if status["state"] in {"succeeded", "failed", "publish_failed"}:
+                break
+            self._wait(2)
+        self._fixture.verify(status.get("state") == "succeeded", "the selected seed build must succeed", build=status)
+        self._fixture.record("seed_build", {**status, "environment": selected["environment"]})
+        releases = self._api("GET", "/admin/api/v1/template-releases")
+        latest_after = {
+            entry["template_name"]: entry["content_hash"]
+            for entry in releases if "latest" in entry.get("tags", [])
+        }
+        self._fixture.verify(latest_after == latest_before, "building must leave every latest tag unchanged")
+        with page.expect_response(
+            lambda answer: answer.request.method == "POST" and answer.url.endswith("/sandboxes"),
+            timeout=90_000,
+        ) as created:
+            page.get_by_role("button", name="Create a test sandbox", exact=True).click()
+        answer = created.value
+        self._fixture.verify(answer.status in {200, 201, 202}, "the seed test sandbox must be accepted", status=answer.status)
+        sandbox = answer.json()
+        sandbox_id = sandbox.get("sandbox_id") or sandbox.get("id")
+        self._fixture.verify(isinstance(sandbox_id, str), "a seed test must return its sandbox ID", sandbox=sandbox)
+        self._scope.defer("delete seed test sandbox", lambda: self._force_delete(sandbox_id))
+        running = self._await_status(sandbox_id, "started")
+        self._fixture.record("seed_test_sandbox", running)
+        self._fixture.verify(status["content_hash"] in str(answer.request.post_data_json),
+                             "the boot test must pin the newly built seed digest")
+        runtime_version = self._control.console_runtime_version(sandbox_id)
+        self._fixture.verify(
+            runtime_version == "Firecracker v1.17.0",
+            "the real sandbox process must use the selected Firecracker release",
+            runtime_version=runtime_version,
+        )
+        self._fixture.record("seed_runtime_executable_version", runtime_version)
+        guest = self._control.console_sandbox(sandbox_id)
+        marker = f"seed-runtime-{self._run}"
+        result = guest.run(
+            f"uname -r; printf '%s' '{marker}' > /tmp/seed-runtime-smoke; cat /tmp/seed-runtime-smoke"
+        )
+        self._fixture.verify(
+            result.exit_code == 0 and "6.1.155" in result.stdout and marker in result.stdout,
+            "the built seed must execute commands and write files under the selected kernel",
+            command={"exit_code": result.exit_code, "stdout": result.stdout, "stderr": result.stderr},
+        )
+        self._fixture.record("seed_guest_before_suspend", {
+            "exit_code": result.exit_code, "stdout": result.stdout, "stderr": result.stderr,
+        })
+        guest.suspend()
+        guest.wake()
+        restored = guest.run("uname -r; cat /tmp/seed-runtime-smoke")
+        self._fixture.verify(
+            restored.exit_code == 0 and "6.1.155" in restored.stdout and marker in restored.stdout,
+            "the selected seed must restore its snapshot and preserve the guest filesystem",
+            command={"exit_code": restored.exit_code, "stdout": restored.stdout, "stderr": restored.stderr},
+        )
+        self._fixture.record("seed_guest_after_restore", {
+            "exit_code": restored.exit_code, "stdout": restored.stdout, "stderr": restored.stderr,
+        })
+        self._fixture.verify(
+            self._control.console_runtime_version(sandbox_id) == runtime_version,
+            "snapshot restore must retain the selected runtime release",
+        )
+        page.get_by_role("button", name="Promote seed…", exact=True).click()
+        promotion = page.get_by_role("dialog", name=re.compile(r"Assign tag to seed@"))
+        promotion.wait_for(state="visible")
+        self._fixture.verify(
+            "code-runtime" not in promotion.inner_text(),
+            "seed promotion must not require or promote code-runtime",
+        )
+        promotion.get_by_role("button", name="Cancel", exact=True).click()
+        promotion.wait_for(state="hidden")
+        completed_screenshot = Path(tempfile.gettempdir()) / f"{self._run}-seed-runtime-kernel-built.png"
+        page.screenshot(path=str(completed_screenshot), full_page=True)
+        self._fixture.record("seed_build_completed_screenshot", str(completed_screenshot))
+
+    def _cleanup_seed_build_release(self, job_id: str, prior_ids: set[str]) -> None:
+        status = self._api("GET", f"/admin/api/v1/templates/seed/builds/{job_id}")
+        if status.get("state") not in {"succeeded", "failed", "publish_failed"}:
+            raise SmokeConfigurationError(f"seed build {job_id} is still active; inspect its release after completion")
+        for entry in self._api("GET", "/admin/api/v1/template-releases"):
+            if (entry["template_name"] == "seed" and entry["content_hash"] == status.get("content_hash")
+                    and entry["id"] not in prior_ids
+                    and set(entry.get("tags", [])) <= {entry["content_hash"]}):
+                self._delete(f"/admin/api/v1/template-releases/{entry['id']}")
 
     def sign_in_operator(self) -> ConsoleSession:
         """The bench's seeded operator, signed in through the login page."""
