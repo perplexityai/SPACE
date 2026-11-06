@@ -3,9 +3,6 @@
 //! route-identity rejections, the scheme-neutral route capability
 //! (`capability`), and Ed25519-signed, incarnation-bound route tokens
 //! (`ed25519`).
-//!
-//! It is its own crate so services can mint and verify route capabilities
-//! without depending on the rest of `pplx-space-common-svc`.
 
 pub mod capability;
 pub mod ed25519;

@@ -29,7 +29,7 @@ Read only the references that match the task:
 - Reuse a noun from the crate that owns it before creating a local parallel
   type, and extend it there instead of forking it. Put a new shared type in the
   crate that owns the concept or a new single-responsibility crate, never in
-  `pplx-space-common-core` or `pplx-space-common-svc`.
+  `pplx-space-common-core`.
 - Model closed vocabularies as exhaustive enums. Implement `as_str`, `Display`,
   and `FromStr`; put predicates on the enum; match variants rather than string
   literals. The types reference defines the complete pattern.
@@ -68,7 +68,7 @@ Read only the references that match the task:
   lock when an invariant spans multiple operations.
 - Delete dead code instead of adding `#[allow(dead_code)]`.
 - The common service initializer (`init_service` in
-  `crates/libs/common/svc/src/lib.rs`, which installs the notifier from
+  `crates/l40_api/service/host/src/lib.rs`, which installs the notifier from
   `crates/l10_foundation/systemd/watchdog`) arms the systemd watchdog before slow
   startup work and sends an initial notification immediately. Keep that
   ordering when refactoring startup code; direct deployments run

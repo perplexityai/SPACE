@@ -27,7 +27,7 @@ fn launcher_mode_runs_before_telemetry_is_initialized() {
     }
 
     assert_ne!(
-        pplx_space_common_svc::current_service_name(),
+        pplx_space_common_grpc::current_service_name(),
         SERVICE_NAME,
         "launcher mode must not initialize service telemetry"
     );

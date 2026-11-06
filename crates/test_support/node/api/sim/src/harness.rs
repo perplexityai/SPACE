@@ -118,7 +118,7 @@ impl SimWorkerHarnessBuilder {
         let server_shutdown = shutdown.clone();
         let service = SimWorkerApiService::new(state.clone());
 
-        let (health_reporter, health_service) = pplx_space_common_svc::grpc_health_service();
+        let (health_reporter, health_service) = pplx_space_grpc_server::grpc_health_service();
         if self.activation_policy_support {
             health_reporter
                 .set_service_status(

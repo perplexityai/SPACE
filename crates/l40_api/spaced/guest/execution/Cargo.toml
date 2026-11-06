@@ -12,9 +12,9 @@ workspace = true
 
 [features]
 test-hooks = ["pplx-space-common-core/test-hooks"]
-telemetry = ["dep:pplx-space-common-svc"]
-otel = ["telemetry", "pplx-space-common-svc/otel"]
-datadog = ["otel", "pplx-space-common-svc/datadog"]
+telemetry = ["dep:pplx-space-observability", "dep:pplx-space-service-host"]
+otel = ["telemetry", "pplx-space-service-host/otel"]
+datadog = ["otel", "pplx-space-service-host/datadog"]
 
 [dependencies]
 dashmap = { workspace = true }
@@ -37,8 +37,9 @@ uuid = { workspace = true, features = ["v7"] }
 # internal
 pplx-space-common-core = { workspace = true }
 pplx-space-common-grpc = { workspace = true }
-pplx-space-common-svc = { workspace = true, optional = true }
 pplx-space-metrics = { workspace = true }
+pplx-space-observability = { workspace = true, optional = true }
+pplx-space-service-host = { workspace = true, optional = true }
 pplx-space-spaced-guest-protocol = { workspace = true }
 prost = { workspace = true }
 prost-types = { workspace = true }

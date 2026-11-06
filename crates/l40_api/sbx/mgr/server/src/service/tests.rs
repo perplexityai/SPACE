@@ -37,7 +37,7 @@ use pplx_space_events::SandboxEventTrigger;
 
 /// Isolate route policy overrides from the host and from other tests.
 pub(crate) fn enter_route_test_process(overrides: &[(&str, Option<&std::ffi::OsStr>)]) -> bool {
-    use pplx_space_common_svc::space_api_route::SPACE_API_ROUTE_GENERATION_FENCE_ENABLED_ENV;
+    use pplx_space_api_route::SPACE_API_ROUTE_GENERATION_FENCE_ENABLED_ENV;
     let mut vars = vec![
         (SPACE_API_ROUTE_GENERATION_FENCE_ENABLED_ENV, None),
         ("SPACE_NODE_ID", None),
@@ -264,6 +264,17 @@ pub(crate) mod service_tests {
         SuspendSnapshotPublicationDecision, canonical_suspend_snapshot_dir,
         suspend_snapshot_staging_dir, write_deferred_suspend_artifact, write_full_suspend_artifact,
     };
+    use pplx_space_api_route::{
+        SPACE_API_ROUTE_ED25519_TOKEN_METADATA_KEY, SpaceApiBridgeCallerPolicy,
+        set_space_api_bridge_caller_policy,
+    };
+    use pplx_space_api_route::{
+        ed25519::SpaceApiRouteEd25519Claims, ed25519::SpaceApiRouteEd25519Issuer,
+        ed25519::SpaceApiRouteEd25519KeyId, ed25519::SpaceApiRouteEd25519Signer,
+        ed25519::SpaceApiRouteEd25519Token, ed25519::SpaceApiRouteEd25519VerificationBundle,
+        ed25519::SpaceApiRouteEd25519VerificationGeneration,
+        ed25519::insert_space_api_route_ed25519_token,
+    };
     use pplx_space_common_core::host::linux::identities::{user_names, users};
     use pplx_space_common_core::types::{
         ArtifactKind, ArtifactOrigin, AutoLifecycleConditionSet, AutoLifecycleConditionSetId,
@@ -273,17 +284,7 @@ pub(crate) mod service_tests {
         SandboxQuarantineHistoryAction, SandboxQuarantineNextAction, SandboxQuarantineReasonCode,
         SandboxQuarantineSource, SandboxRouteIdentity, SpaceApiRouteIdentity,
     };
-    use pplx_space_common_svc::space_api_route::{
-        SPACE_API_ROUTE_ED25519_TOKEN_METADATA_KEY, SpaceApiBridgeCallerPolicy,
-        set_space_api_bridge_caller_policy,
-    };
-    use pplx_space_common_svc::space_api_route_ed25519::{
-        SpaceApiRouteEd25519Claims, SpaceApiRouteEd25519Issuer, SpaceApiRouteEd25519KeyId,
-        SpaceApiRouteEd25519Signer, SpaceApiRouteEd25519Token,
-        SpaceApiRouteEd25519VerificationBundle, SpaceApiRouteEd25519VerificationGeneration,
-        insert_space_api_route_ed25519_token,
-    };
-    use pplx_space_common_svc::types::k8s::space_k8s_node_id;
+    use pplx_space_k8s_node_id::space_k8s_node_id;
 
     use prost::Message as _;
 
@@ -3814,7 +3815,7 @@ pub(crate) mod service_tests {
                     execution_generation: ExecutionGeneration::new(3).unwrap(),
                     route_activation_id: SandboxActivationAttemptId::new(),
                     policy_fingerprint:
-                        pplx_space_common_svc::types::AutoLifecyclePolicyFingerprint::for_policy(
+                        pplx_space_auto_lifecycle_receipt::AutoLifecyclePolicyFingerprint::for_policy(
                             &AutoLifecyclePolicy::disabled(),
                         ),
                 },
@@ -3884,7 +3885,7 @@ pub(crate) mod service_tests {
             execution_generation: ExecutionGeneration::new(4).unwrap(),
             route_activation_id: attempt,
             policy_fingerprint:
-                pplx_space_common_svc::types::AutoLifecyclePolicyFingerprint::for_policy(
+                pplx_space_auto_lifecycle_receipt::AutoLifecyclePolicyFingerprint::for_policy(
                     &AutoLifecyclePolicy::disabled(),
                 ),
         };
@@ -7422,7 +7423,7 @@ pub(crate) mod service_tests {
                 sandbox_id,
                 crate::auto_lifecycle_delete_receipts::AutoLifecycleDeleteExpectation {
                     policy_fingerprint:
-                        pplx_space_common_svc::types::AutoLifecyclePolicyFingerprint::for_policy(
+                        pplx_space_auto_lifecycle_receipt::AutoLifecyclePolicyFingerprint::for_policy(
                             &policy,
                         ),
                     authority: crate::db::PolicyAuthority::Cluster,
@@ -8815,7 +8816,7 @@ pub(crate) mod service_tests {
             execution_generation: generation,
             route_activation_id: SandboxActivationAttemptId::new(),
             policy_fingerprint:
-                pplx_space_common_svc::types::AutoLifecyclePolicyFingerprint::for_policy(
+                pplx_space_auto_lifecycle_receipt::AutoLifecyclePolicyFingerprint::for_policy(
                     &AutoLifecyclePolicy::disabled(),
                 ),
         };
@@ -8869,7 +8870,7 @@ pub(crate) mod service_tests {
                 execution_generation: generation,
                 route_activation_id: receipt_attempt,
                 policy_fingerprint:
-                    pplx_space_common_svc::types::AutoLifecyclePolicyFingerprint::for_policy(
+                    pplx_space_auto_lifecycle_receipt::AutoLifecyclePolicyFingerprint::for_policy(
                         &AutoLifecyclePolicy::disabled(),
                     ),
             },
@@ -10115,7 +10116,7 @@ pub(crate) mod service_tests {
         // Exercise the production span declaration as well as the handler: a
         // record() call silently drops fields absent from the span's metadata.
         let traced = tower::Layer::layer(
-            &pplx_space_common_svc::bootstrap::grpc_trace_layer(),
+            &pplx_space_grpc_server::grpc_trace_layer(),
             tower::service_fn(move |_: http::Request<tonic::body::Body>| {
                 let service = service.clone();
                 async move {
@@ -10515,7 +10516,7 @@ pub(crate) mod service_tests {
             execution_generation: receipt_generation,
             route_activation_id: SandboxActivationAttemptId::new(),
             policy_fingerprint:
-                pplx_space_common_svc::types::AutoLifecyclePolicyFingerprint::for_policy(
+                pplx_space_auto_lifecycle_receipt::AutoLifecyclePolicyFingerprint::for_policy(
                     &AutoLifecyclePolicy::disabled(),
                 ),
         };
@@ -11390,7 +11391,7 @@ pub(crate) mod service_tests {
                 sandbox_id,
                 crate::auto_lifecycle_delete_receipts::AutoLifecycleDeleteExpectation {
                     policy_fingerprint:
-                        pplx_space_common_svc::types::AutoLifecyclePolicyFingerprint::for_policy(
+                        pplx_space_auto_lifecycle_receipt::AutoLifecyclePolicyFingerprint::for_policy(
                             &policy,
                         ),
                     authority: crate::db::PolicyAuthority::Cluster,
@@ -16510,7 +16511,7 @@ pub(crate) mod service_tests {
                 cluster_id.clone(),
                 identity,
                 port,
-                pplx_space_common_svc::space_api_route::SpaceApiRouteProtocol::Tcp,
+                pplx_space_api_route::SpaceApiRouteProtocol::Tcp,
             ),
             None => SpaceApiRouteEd25519Claims::space_api_bridge(
                 issuer.clone(),
@@ -18920,7 +18921,7 @@ pub(crate) mod service_tests {
             execution_generation: ExecutionGeneration::new(4).unwrap(),
             route_activation_id: SandboxActivationAttemptId::new(),
             policy_fingerprint:
-                pplx_space_common_svc::types::AutoLifecyclePolicyFingerprint::for_policy(
+                pplx_space_auto_lifecycle_receipt::AutoLifecyclePolicyFingerprint::for_policy(
                     &AutoLifecyclePolicy::disabled(),
                 ),
         };

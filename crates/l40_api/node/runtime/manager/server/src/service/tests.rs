@@ -1,10 +1,10 @@
-use pplx_space_common_svc::PeerIdentity;
 use pplx_space_node_runtime_core::runtime_inventory::RuntimeInstallationRoot;
 use pplx_space_node_runtime_manager_client::execution::RuntimeKind;
 use pplx_space_node_runtime_manager_client::proto::{
     ArtifactLocation, ArtifactManagement, ArtifactProvenance, ArtifactProvider,
     ExecutionArtifactStatus, ScanIssueKind, ScanRootPresence,
 };
+use pplx_space_uds_peer_auth::PeerIdentity;
 
 use super::*;
 use std::os::unix::fs::MetadataExt as _;
@@ -490,7 +490,7 @@ async fn artifact_mutations_require_an_operator_and_an_enabled_installer() {
         "runtime-manager-test",
         [
             UdsPeerAccount::with_fallback_uid(users::SPACE_NODECTL.name, users::SPACE_NODECTL.uid),
-            pplx_space_common_svc::UdsPeerAccount::role_with_fallback_uid(
+            pplx_space_uds_peer_auth::UdsPeerAccount::role_with_fallback_uid(
                 "rtmgr-test-observer",
                 LocalRole::Observer,
                 40_001,

@@ -63,9 +63,7 @@ pub(crate) const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 #[derive(Debug, thiserror::Error)]
 pub enum ReconcilerRuntimeError {
     #[error("federated identity configuration failed: {0}")]
-    FederatedIdentity(
-        #[from] pplx_space_common_svc::federated_identity::FederatedIdentityPolicyError,
-    ),
+    FederatedIdentity(#[from] pplx_space_federated_identity::FederatedIdentityPolicyError),
     /// A spawned reconciler task exited (returned or panicked) before the
     /// shutdown token fired — a dead cluster-singleton loop.
     #[error("a reconciler task exited before shutdown was requested")]
@@ -76,9 +74,7 @@ pub enum ReconcilerRuntimeError {
     )]
     InvalidTerminatorKind(String),
     #[error("invalid or missing SPACE API route signing configuration: {0}")]
-    RouteSigningConfiguration(
-        #[from] pplx_space_common_svc::space_api_route_ed25519::SpaceApiRouteEd25519Error,
-    ),
+    RouteSigningConfiguration(#[from] pplx_space_api_route::ed25519::SpaceApiRouteEd25519Error),
 }
 
 /// How [`run_reconcilers`] wound down on a requested shutdown — whether every
@@ -216,8 +212,7 @@ pub async fn run_reconcilers(
                 pool.clone(),
                 substrate.as_ref().clone(),
                 feature_flags.clone(),
-                pplx_space_common_svc::federated_identity::FederatedIdentityPolicy::from_env()?
-                    .grant_audience,
+                pplx_space_federated_identity::FederatedIdentityPolicy::from_env()?.grant_audience,
                 tls_interception_exemptions,
                 egress_profiles,
             )

@@ -105,7 +105,7 @@ async fn execution_inspection_reads_retained_authority_without_a_lease_or_host_p
         });
         request
             .extensions_mut()
-            .insert(pplx_space_common_svc::PeerIdentity::new(0, 0, None));
+            .insert(pplx_space_uds_peer_auth::PeerIdentity::new(0, 0, None));
         let response = service.inspect_sandbox(request).await.unwrap();
         assert_eq!(
             response.into_inner().execution_fence,
@@ -192,7 +192,7 @@ async fn allocation_waits_for_previous_cleanup_before_entering_activation() {
     });
     request
         .extensions_mut()
-        .insert(pplx_space_common_svc::PeerIdentity::new(0, 0, None));
+        .insert(pplx_space_uds_peer_auth::PeerIdentity::new(0, 0, None));
 
     let mut allocation = Box::pin(service.allocate(request));
     assert!(futures_util::poll!(allocation.as_mut()).is_pending());
@@ -217,7 +217,7 @@ async fn cancelled_allocation_keeps_cleanup_excluded_while_queued() {
     });
     request
         .extensions_mut()
-        .insert(pplx_space_common_svc::PeerIdentity::new(0, 0, None));
+        .insert(pplx_space_uds_peer_auth::PeerIdentity::new(0, 0, None));
     let mut allocation = Box::pin(service.allocate(request));
     assert!(futures_util::poll!(allocation.as_mut()).is_pending());
     drop(allocation);
@@ -324,7 +324,7 @@ async fn stopped_unbound_snapshot_reaches_filesystem_without_allocating() {
     });
     request
         .extensions_mut()
-        .insert(pplx_space_common_svc::PeerIdentity::new(0, 0, None));
+        .insert(pplx_space_uds_peer_auth::PeerIdentity::new(0, 0, None));
     let error = service.create_btrfs_snapshot(request).await.unwrap_err();
     assert_eq!(error.code(), tonic::Code::NotFound, "{error}");
     assert!(error.message().contains("instance dir not found"));
@@ -367,7 +367,7 @@ async fn canonical_artifact_rpcs_reject_missing_or_superseded_execution_before_h
         let mut request = Request::new(payload);
         request
             .extensions_mut()
-            .insert(pplx_space_common_svc::PeerIdentity::new(0, 0, None));
+            .insert(pplx_space_uds_peer_auth::PeerIdentity::new(0, 0, None));
         request
     }
     for fence in [None, Some(old)] {

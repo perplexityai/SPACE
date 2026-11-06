@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 
 use crate::db::{Connection, OptionalExtension};
+use pplx_space_auto_lifecycle_receipt::AutoLifecyclePolicyFingerprint;
 use pplx_space_common_core::types::{
     AutoLifecycleConditionSet, AutoLifecycleConditionSetId, AutoLifecycleDeleteReceiptId,
     AutoLifecycleIdleAction, AutoLifecyclePolicy, AutoLifecycleStage, AutoLifecycleWakePolicy,
@@ -8,7 +9,6 @@ use pplx_space_common_core::types::{
     SandboxActivationAttemptId, SandboxId, SandboxOwner, SandboxRuntimeLabel,
     SpaceApiRouteIdentity,
 };
-use pplx_space_common_svc::types::AutoLifecyclePolicyFingerprint;
 
 use super::*;
 use crate::auto_lifecycle_delete_receipts::*;

@@ -88,13 +88,9 @@ pub async fn run(
 ) -> Result<(), RunBuildMgrError> {
     // Validate listener identity before starting durable work or background tasks.
     let server = pplx_space_common_grpc::internal_transport::server_builder()?
-        .timeout(pplx_space_common_svc::bootstrap::GRPC_REQUEST_TIMEOUT)
-        .http2_keepalive_interval(Some(
-            pplx_space_common_svc::bootstrap::GRPC_HTTP2_KEEPALIVE_INTERVAL,
-        ))
-        .http2_keepalive_timeout(Some(
-            pplx_space_common_svc::bootstrap::GRPC_HTTP2_KEEPALIVE_TIMEOUT,
-        ));
+        .timeout(pplx_space_grpc_server::GRPC_REQUEST_TIMEOUT)
+        .http2_keepalive_interval(Some(pplx_space_grpc_server::GRPC_HTTP2_KEEPALIVE_INTERVAL))
+        .http2_keepalive_timeout(Some(pplx_space_grpc_server::GRPC_HTTP2_KEEPALIVE_TIMEOUT));
     if let Some(parent) = std::path::Path::new(&config.db_path)
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -136,7 +132,7 @@ pub async fn run(
             .run_terminal_job_pruner(background_token.clone()),
     );
     let blob_reaper = tokio::spawn(service.clone().run_blob_reaper(background_token.clone()));
-    let (health_reporter, health_service) = pplx_space_common_svc::grpc_health_service();
+    let (health_reporter, health_service) = pplx_space_grpc_server::grpc_health_service();
     health_reporter
         .set_serving::<BuildManagerServer<BuildManagerDaemonService>>()
         .await;
@@ -210,7 +206,7 @@ pub async fn run(
         .max_decoding_message_size(GRPC_MESSAGE_SIZE_LIMIT_BYTES)
         .max_encoding_message_size(GRPC_MESSAGE_SIZE_LIMIT_BYTES);
     server
-        .layer(pplx_space_common_svc::grpc_trace_layer())
+        .layer(pplx_space_grpc_server::grpc_trace_layer())
         .layer(auth_layer)
         .add_service(health_service)
         .add_service(build_manager_server)

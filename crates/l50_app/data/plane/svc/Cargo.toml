@@ -13,12 +13,12 @@ workspace = true
 [features]
 default = []
 otel = [
-    "pplx-space-common-svc/otel",
+    "pplx-space-service-host/otel",
     "pplx-space-data-plane-server/otel",
 ]
 datadog = [
     "otel",
-    "pplx-space-common-svc/datadog",
+    "pplx-space-service-host/datadog",
     "pplx-space-data-plane-server/datadog",
 ]
 # Deprecated for one release; use otel and datadog.
@@ -35,8 +35,9 @@ clap = { workspace = true, features = ["derive", "env"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
 # internal
-pplx-space-common-svc = { workspace = true }
 pplx-space-data-plane-server = { workspace = true }
+pplx-space-service-host = { workspace = true }
+pplx-space-service-lifecycle = { workspace = true }
 
 # jemalloc on glibc Linux targets: multipart uploads buffer whole request
 # bodies, and glibc arenas keep the peak of each upload burst resident.

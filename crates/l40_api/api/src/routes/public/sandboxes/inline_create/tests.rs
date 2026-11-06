@@ -21,7 +21,7 @@ mod postgres {
     use pplx_space_public_api::{OperationId, OperationKind, OperationState, PublicErrorCode};
     use tokio::sync::Notify;
 
-    use pplx_space_common_svc::DrainSignal;
+    use pplx_space_service_lifecycle::DrainSignal;
     use tokio_util::task::TaskTracker;
 
     use super::*;

@@ -1,6 +1,6 @@
 use super::*;
 
-use pplx_space_common_svc::page_cache;
+use pplx_space_page_cache as page_cache;
 
 /// RAII guard that removes a key from the importing_templates set on drop.
 pub(super) struct ImportGuard {

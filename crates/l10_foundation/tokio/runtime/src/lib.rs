@@ -1,8 +1,8 @@
 //! Builds the services' multi-thread Tokio runtime from the `WORKER_THREADS`
 //! setting and samples the runtime's health into `pplx-space-metrics`.
 //!
-//! It lives apart from `pplx-space-common-svc` so a binary can build its
-//! runtime without depending on the rest of the service host.
+//! It is its own crate so a binary can build its runtime without depending
+//! on the service host.
 
 use std::env::VarError;
 use std::num::{NonZeroUsize, ParseIntError};

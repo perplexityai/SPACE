@@ -5,8 +5,11 @@ use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::os::unix::net::{SocketAddr, UnixListener};
 use std::path::{Component, Path};
 
-use pplx_space_common_svc::core::host::linux::identities::{gids, group_names, users};
-use pplx_space_common_svc::{SocketGroup, UnixSocketOptions, apply_unix_socket_permissions};
+use pplx_space_common_core::{
+    host::linux::identities::gids, host::linux::identities::group_names,
+    host::linux::identities::users,
+};
+use pplx_space_unix_socket_bind::{SocketGroup, UnixSocketOptions, apply_unix_socket_permissions};
 
 pub(super) fn options() -> UnixSocketOptions {
     UnixSocketOptions::new(0o660)

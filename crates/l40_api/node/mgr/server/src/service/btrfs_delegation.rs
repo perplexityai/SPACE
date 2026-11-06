@@ -27,8 +27,8 @@
 
 use std::path::{Path, PathBuf};
 
-use pplx_space_common_svc::UdsPeerPrincipal;
-use pplx_space_common_svc::core::host::linux::identities::user_names;
+use pplx_space_common_core::host::linux::identities::user_names;
+use pplx_space_uds_peer_auth::UdsPeerPrincipal;
 use tonic::{Request, Response, Status};
 
 use crate::proto::{
@@ -43,7 +43,7 @@ use crate::proto::{
 };
 
 use pplx_space_common_core::host::linux::paths::TEMPLATE_CACHE_DIR_MODE;
-use pplx_space_common_svc::core::host::linux::identities::{gids, users};
+use pplx_space_common_core::{host::linux::identities::gids, host::linux::identities::users};
 
 use super::validation::validate_sandbox_id;
 use super::{CACHE_DIR, NodeManagerService, TEMPLATE_DIR};
@@ -51,13 +51,13 @@ use super::{artifact_fs, trusted_paths};
 
 const ALLOW_NODEMGR_ADMIN_OR_TMPLMGR: &[UdsPeerPrincipal] = &[
     UdsPeerPrincipal::Root,
-    UdsPeerPrincipal::Role(pplx_space_common_svc::LocalRole::Admin),
+    UdsPeerPrincipal::Role(pplx_space_uds_peer_auth::LocalRole::Admin),
     UdsPeerPrincipal::Service(user_names::SPACE_TMPLMGR),
 ];
 
 const ALLOW_NODEMGR_ADMIN_OR_SBXMGR: &[UdsPeerPrincipal] = &[
     UdsPeerPrincipal::Root,
-    UdsPeerPrincipal::Role(pplx_space_common_svc::LocalRole::Admin),
+    UdsPeerPrincipal::Role(pplx_space_uds_peer_auth::LocalRole::Admin),
     UdsPeerPrincipal::Service(user_names::SPACE_SBXMGR),
 ];
 

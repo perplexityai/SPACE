@@ -106,16 +106,16 @@ fn main() -> anyhow::Result<()> {
     #[cfg(target_os = "linux")]
     let signals = pplx_space_node_mgr::process_signals::ProcessShutdownSignals::install()
         .context("failed to route node-manager shutdown signals")?;
-    let runtime = pplx_space_common_svc::tokio_runtime::build_multi_thread_runtime()
+    let runtime = pplx_space_tokio_runtime::build_multi_thread_runtime()
         .context("failed to configure node-manager Tokio runtime")?;
     runtime.block_on(async {
-        let telemetry = pplx_space_common_svc::init_service(SERVICE_NAME)?;
+        let telemetry = pplx_space_service_host::init_service(SERVICE_NAME)?;
         #[cfg(target_os = "linux")]
         let shutdown_token = signals.shutdown_token();
         #[cfg(not(target_os = "linux"))]
-        let shutdown_token = pplx_space_common_svc::shutdown_token();
+        let shutdown_token = pplx_space_service_lifecycle::shutdown::shutdown_token();
         let result = pplx_space_node_mgr::run(cli.into(), shutdown_token).await;
-        pplx_space_common_svc::shutdown_telemetry(telemetry).await;
+        pplx_space_service_host::shutdown_telemetry(telemetry).await;
         Ok(result?)
     })
 }

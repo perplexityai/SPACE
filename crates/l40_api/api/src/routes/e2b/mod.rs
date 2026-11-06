@@ -6,7 +6,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use base64::Engine;
-use pplx_space_common_svc::ecw_credential::EcwCredentialKind;
+use pplx_space_ecw_credential::EcwCredentialKind;
 use pplx_space_metrics::sandbox::api::SandboxApiMetricIdentity;
 use serde_json::Value;
 use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};

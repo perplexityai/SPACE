@@ -2,10 +2,10 @@ use pplx_space_common_core::types::NodeId;
 
 use std::collections::BTreeMap;
 
-use pplx_space_common_svc::types::{
+use pplx_space_db_test_fixtures::{insert_ready_worker_node, try_pg_test_db};
+use pplx_space_state_reconciliation::{
     FACET_NETWORK_POLICY, FACET_NODE_STATUS, FACET_SANDBOX_DESIRED_STATE, FACET_TEMPLATE_INVENTORY,
 };
-use pplx_space_db_test_fixtures::{insert_ready_worker_node, try_pg_test_db};
 
 use super::*;
 

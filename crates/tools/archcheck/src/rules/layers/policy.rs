@@ -164,7 +164,7 @@ pub(super) fn stale_entries(
 }
 
 /// Whether `user` uses `store`: a normal or build dependency on it, or on a
-/// legacy crate that has one, as `common-svc` re-exports stores. The list
+/// legacy crate that has one, as a legacy crate may re-export a store. The list
 /// says who uses the store today, so an entry without such an edge is
 /// stale.
 fn uses(config: &LayersConfig, graph: &Graph<'_>, user: &str, store: &str) -> bool {

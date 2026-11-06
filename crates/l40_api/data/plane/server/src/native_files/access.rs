@@ -8,9 +8,11 @@ use axum::{
     http::{HeaderName, HeaderValue, StatusCode, header, request::Parts},
     response::{IntoResponse, Response},
 };
+use pplx_space_bearer_token::{SpaceBearerToken, insert_space_bearer_token};
 use pplx_space_common_grpc::internal_transport::{ClientTransport, Service, TransportError};
-use pplx_space_common_svc::bearer_token::{SpaceBearerToken, insert_space_bearer_token};
-use pplx_space_common_svc::bootstrap::{GrpcClientTrace, wrap_grpc_client_channel};
+use pplx_space_common_grpc::{
+    GrpcClientTrace, trace_grpc_client_transport as wrap_grpc_client_channel,
+};
 use pplx_space_native_files::FileOperation;
 use pplx_space_node_api_client::proto::{
     AuthorizeNativeFileRequestRequest, NativeFileAuthorization, NativeFileOperation,

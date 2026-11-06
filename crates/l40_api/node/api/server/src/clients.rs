@@ -59,7 +59,7 @@ impl BackendClients {
     /// Every backend client on one channel, for tests that serve a fake backend.
     #[cfg(test)]
     pub(crate) fn with_channel(channel: tonic::transport::Channel) -> Self {
-        use pplx_space_common_svc::bootstrap::wrap_grpc_client_channel;
+        use pplx_space_common_grpc::trace_grpc_client_transport as wrap_grpc_client_channel;
         Self {
             sbx: SandboxManagerGrpcClient::new(wrap_grpc_client_channel(channel.clone())),
             node: NodeManagerGrpcClient::new(wrap_grpc_client_channel(channel.clone())),

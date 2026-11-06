@@ -6,11 +6,11 @@ use std::sync::Mutex;
 use std::sync::atomic::AtomicU64;
 use std::time::{Duration as StdDuration, SystemTime, UNIX_EPOCH};
 
-use pplx_space_common_core::types::SpaceApiRouteIdentity;
-use pplx_space_common_svc::space_api_route::SpaceApiRoutePurpose as CommonSpaceApiRoutePurpose;
-use pplx_space_common_svc::space_api_route_ed25519::{
-    SpaceApiRouteEd25519Token, decode_unverified_space_api_route_ed25519_claims,
+use pplx_space_api_route::SpaceApiRoutePurpose as CommonSpaceApiRoutePurpose;
+use pplx_space_api_route::{
+    ed25519::SpaceApiRouteEd25519Token, ed25519::decode_unverified_space_api_route_ed25519_claims,
 };
+use pplx_space_common_core::types::SpaceApiRouteIdentity;
 use pplx_space_node_api_client::proto::SpaceApiRouteToken as ProtoSpaceApiRouteToken;
 
 use super::*;
@@ -192,7 +192,7 @@ fn space_api_route_token_expiry_instant(
 
 fn validate_unverified_space_api_route_ed25519_claims(
     route_source: SpaceApiRouteTokenRouteSource,
-    claims: &pplx_space_common_svc::space_api_route_ed25519::SpaceApiRouteEd25519Claims,
+    claims: &pplx_space_api_route::ed25519::SpaceApiRouteEd25519Claims,
 ) -> Result<(), ProtoSpaceApiRouteTokenError> {
     let purpose_is_valid = match route_source {
         SpaceApiRouteTokenRouteSource::DataPlaneSession => matches!(

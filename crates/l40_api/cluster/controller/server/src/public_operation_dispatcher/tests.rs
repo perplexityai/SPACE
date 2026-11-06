@@ -4,12 +4,13 @@ use pplx_space_common_core::types::UserId;
 use super::*;
 use pplx_space_api::public_operations::{ApiProduct, CompleteClaimedPublicOperation};
 use pplx_space_api::public_sandbox_operations::CreateSandboxOperationPayload;
+use pplx_space_api_route::{
+    ed25519::SPACE_API_ROUTE_ED25519_ISSUER_ENV,
+    ed25519::SPACE_API_ROUTE_ED25519_SIGNING_KEY_ID_ENV,
+    ed25519::SPACE_API_ROUTE_ED25519_SIGNING_KEY_PATH_ENV, ed25519::SpaceApiRouteEd25519Authority,
+};
 use pplx_space_common_core::sql;
 use pplx_space_common_core::types::{RuntimeKind, TemplateId, TemplateReference};
-use pplx_space_common_svc::space_api_route_ed25519::{
-    SPACE_API_ROUTE_ED25519_ISSUER_ENV, SPACE_API_ROUTE_ED25519_SIGNING_KEY_ID_ENV,
-    SPACE_API_ROUTE_ED25519_SIGNING_KEY_PATH_ENV, SpaceApiRouteEd25519Authority,
-};
 use pplx_space_public_api::{
     OperationId, OperationTargetType, PublicOperationEventType, PublicSandboxId, SandboxResources,
 };
@@ -62,8 +63,7 @@ fn direct_native_executor(
             FeatureFlagClient::disabled(),
         ),
         test_route_ed25519_authority(),
-        pplx_space_common_svc::federated_identity::FederatedIdentityPolicy::default()
-            .grant_audience,
+        pplx_space_federated_identity::FederatedIdentityPolicy::default().grant_audience,
         tls_interception_exemptions,
         egress_profiles,
     )
@@ -1541,7 +1541,7 @@ fn test_route_ed25519_authority() -> Arc<SpaceApiRouteEd25519Authority> {
         env.set("SPACE_CLUSTER_ID", "testing");
         env.set(
             SPACE_API_ROUTE_ED25519_SIGNING_KEY_PATH_ENV,
-            pplx_space_common_svc::space_api_route_ed25519::test_signing_key_path()
+            pplx_space_api_route::ed25519::test_signing_key_path()
                 .to_str()
                 .unwrap(),
         );

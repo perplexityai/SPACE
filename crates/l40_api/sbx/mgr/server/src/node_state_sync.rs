@@ -1,11 +1,9 @@
-use pplx_space_common_svc::{
-    core::types::SandboxId,
-    types::{FACET_NETWORK_POLICY, FACET_SANDBOX_INVENTORY},
-};
+use pplx_space_common_core::types::SandboxId;
 use pplx_space_node_api_client::proto::{
     FacetRef, MarkFacetDirtyRequest, NetworkPolicyTargetRef, ReconcileFacet, facet_ref,
     network_policy_target_ref,
 };
+use pplx_space_state_reconciliation::{FACET_NETWORK_POLICY, FACET_SANDBOX_INVENTORY};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::sync::OnceLock;

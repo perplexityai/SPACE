@@ -918,7 +918,7 @@ pub(crate) enum FilesystemWorkerError {
     CreateRuntime(#[source] std::io::Error),
     #[cfg(feature = "telemetry")]
     #[error("failed to initialize filesystem worker telemetry: {0}")]
-    Telemetry(#[source] pplx_space_common_svc::ObservabilityError),
+    Telemetry(#[source] pplx_space_observability::ObservabilityError),
     #[error("failed to adopt filesystem worker stream: {0}")]
     AdoptStream(#[source] std::io::Error),
     #[error("filesystem worker gRPC server failed: {0}")]
@@ -990,14 +990,15 @@ fn run_worker(
         // The credential switch must precede all exporter threads, and OTLP
         // requires an entered runtime. Workers do not own a systemd watchdog.
         #[cfg(feature = "telemetry")]
-        let telemetry = pplx_space_common_svc::init_service_subprocess(crate::WORKER_SERVICE_NAME)
-            .map_err(FilesystemWorkerError::Telemetry)?;
+        let telemetry =
+            pplx_space_service_host::init_service_subprocess(crate::WORKER_SERVICE_NAME)
+                .map_err(FilesystemWorkerError::Telemetry)?;
         let result = serve_worker_stream(stream, account).await;
         // Keep this current-thread runtime driving network I/O while the
         // shared guard performs its bounded metrics and trace shutdown.
         // Supervisor SIGKILL bypasses destructors and can lose pending data.
         #[cfg(feature = "telemetry")]
-        pplx_space_common_svc::shutdown_telemetry(telemetry).await;
+        pplx_space_service_host::shutdown_telemetry(telemetry).await;
         result
     })
 }

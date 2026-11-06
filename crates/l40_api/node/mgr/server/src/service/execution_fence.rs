@@ -147,7 +147,7 @@ pub(super) fn pin_caller<T>(
     if !fenced {
         return Ok(None);
     }
-    let pid = pplx_space_common_svc::peer_identity_from_tonic_request(request)
+    let pid = pplx_space_uds_peer_auth::peer_identity_from_tonic_request(request)
         .and_then(|peer| peer.pid())
         .and_then(|pid| u32::try_from(pid).ok())
         .ok_or_else(|| {

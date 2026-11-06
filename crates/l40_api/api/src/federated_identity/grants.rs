@@ -4,11 +4,11 @@ use sqlx::{PgPool, Postgres};
 
 use super::{FederatedOwner, FederatedServiceGrant};
 
-pub use pplx_space_common_svc::federated_identity::{
-    DEFAULT_FEDERATED_GRANT_AUDIENCE, FEDERATED_OWNER_GRANT_PURPOSE,
-};
 pub use pplx_space_federated_grant_store::FederatedGrantStoreError;
 use pplx_space_federated_grant_store::{FederatedGrantOwnerRef, FederatedServiceGrantRef};
+pub use pplx_space_federated_identity::{
+    DEFAULT_FEDERATED_GRANT_AUDIENCE, FEDERATED_OWNER_GRANT_PURPOSE,
+};
 
 pub async fn upsert_sandbox_federated_service_grant(
     pool: &PgPool,

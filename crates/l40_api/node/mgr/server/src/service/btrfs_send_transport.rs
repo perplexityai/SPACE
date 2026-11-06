@@ -4,7 +4,7 @@ use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 
-use pplx_space_common_svc::{LocalRole, UdsPeerPrincipal};
+use pplx_space_uds_peer_auth::{LocalRole, UdsPeerPrincipal};
 use tonic::{Request, Response, Status};
 use uuid::Uuid;
 

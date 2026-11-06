@@ -16,8 +16,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use pplx_space_common_connection_admission::ConnectionAdmissionFailure;
-use pplx_space_common_svc::core::host::linux::identities::{user_names, users};
-use pplx_space_common_svc::{UdsPeerAccount, UdsPeerAuthorizer, UdsPeerPrincipal};
+use pplx_space_common_core::{host::linux::identities::user_names, host::linux::identities::users};
 use pplx_space_spaced_common::proto::bridge_guest::filesystem_client::FilesystemClient as BridgeGuestFilesystemClient;
 use pplx_space_spaced_common::proto::bridge_guest::meta_client::MetaClient as BridgeGuestClient;
 use pplx_space_spaced_common::proto::bridge_guest::networking_client::NetworkingClient as BridgeGuestNetworkingClient;
@@ -58,6 +57,7 @@ use pplx_space_spaced_common::{
     parse_env, parse_globs, proto_duration, proto_env, proto_globs, validate_duration,
     validate_optional_duration, validate_optional_timeout,
 };
+use pplx_space_uds_peer_auth::{UdsPeerAccount, UdsPeerAuthorizer, UdsPeerPrincipal};
 use proto::filesystem_server::{Filesystem, FilesystemServer};
 use proto::meta_server::{Meta, MetaServer};
 use proto::networking_server::{Networking, NetworkingServer};

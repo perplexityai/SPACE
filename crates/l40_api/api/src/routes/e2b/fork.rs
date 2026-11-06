@@ -393,7 +393,7 @@ fn fork_store_error(context: &'static str, error: PublicOperationStoreError) -> 
 }
 
 fn render_fork_outcome(
-    keyring: &pplx_space_common_svc::ecw_credential::EcwCredentialKeyring,
+    keyring: &pplx_space_ecw_credential::EcwCredentialKeyring,
     outcome: ForkOperationOutcome,
 ) -> Result<(StatusCode, Json<serde_json::Value>), E2bApiError> {
     match outcome {

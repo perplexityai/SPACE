@@ -173,7 +173,7 @@ pub(super) async fn recover(pool: &PgPool, expected: &Candidate) -> Result<bool,
     pplx_space_sandbox_teardown::delete_reconcile_state_for_elements(
         &mut tx,
         &[
-            pplx_space_common_svc::types::ReconcileElementRef::sandbox_desired_state(
+            pplx_space_state_reconciliation::ReconcileElementRef::sandbox_desired_state(
                 expected.sandbox_id,
             ),
         ],

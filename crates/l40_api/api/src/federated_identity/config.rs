@@ -1,4 +1,4 @@
-pub use pplx_space_common_svc::federated_identity::{
+pub use pplx_space_federated_identity::{
     DEFAULT_FEDERATED_IDENTITY_ISSUER, FederatedIdentityPolicy, FederatedIdentityPolicyError,
 };
 

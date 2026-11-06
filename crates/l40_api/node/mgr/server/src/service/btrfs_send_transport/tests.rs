@@ -1,6 +1,6 @@
 use super::*;
 use crate::btrfs;
-use pplx_space_common_svc::PeerIdentity;
+use pplx_space_uds_peer_auth::PeerIdentity;
 use tokio_util::sync::CancellationToken;
 
 fn authorized<T>(message: T) -> Request<T> {

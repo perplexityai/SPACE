@@ -433,7 +433,7 @@ async fn enqueue_template_delete_reconcile(
     enqueue_triggers(
         pool,
         node_ids.iter().copied(),
-        pplx_space_common_svc::types::ReconcileReason::TemplateDesiredStateUpdated,
+        pplx_space_state_reconciliation::ReconcileReason::TemplateDesiredStateUpdated,
     )
     .await?;
     Ok(())

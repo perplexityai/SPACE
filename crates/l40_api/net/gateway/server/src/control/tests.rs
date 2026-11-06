@@ -12,7 +12,7 @@ fn root_request<T>(message: T) -> tonic::Request<T> {
     let mut request = tonic::Request::new(message);
     request
         .extensions_mut()
-        .insert(pplx_space_common_svc::PeerIdentity::new(
+        .insert(pplx_space_uds_peer_auth::PeerIdentity::new(
             0,
             0,
             Some(std::process::id().try_into().unwrap()),

@@ -12,16 +12,17 @@ use aws_sdk_sts::error::{ConnectorError, ProvideErrorMetadata, SdkError};
 use aws_sdk_sts::operation::assume_role::AssumeRoleError;
 use aws_sdk_sts::operation::assume_role_with_web_identity::AssumeRoleWithWebIdentityError;
 use aws_smithy_types::retry::ErrorKind;
-use pplx_space_common_svc::core::host::linux::identities::{user_names, users};
-use pplx_space_common_svc::core::host::linux::paths;
-use pplx_space_common_svc::core::types::{
-    KekProvider, MasterKeyIdentifier, OrgId, SandboxId, volume_wrap_aad,
+use pplx_space_common_core::host::linux::paths;
+use pplx_space_common_core::{host::linux::identities::user_names, host::linux::identities::users};
+use pplx_space_common_core::{
+    types::KekProvider, types::MasterKeyIdentifier, types::OrgId, types::SandboxId,
+    types::volume_wrap_aad,
 };
-use pplx_space_common_svc::{
+use pplx_space_postgres_pool::contention;
+use pplx_space_uds_peer_auth::{
     ContentAddressedInstalls, PeerProcessCheckMode, UdsPeerAccount, UdsPeerAuthorizer,
     UdsPeerPrincipal, capability,
 };
-use pplx_space_postgres_pool::contention;
 use tonic::{Request, Response, Status};
 
 use crate::auth::{CallerResolver, ClientService, ResolvedCaller};

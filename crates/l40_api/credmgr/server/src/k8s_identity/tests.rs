@@ -4,8 +4,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use k8s_openapi::api::authentication::v1::UserInfo;
 use kube::client::{Body, ClientBuilder};
 use pplx_space_common_core::types::NodeId;
-use pplx_space_common_svc::sql;
 use pplx_space_db_test_fixtures::{TestDb, TestDbResult, insert_ready_worker_node, pg_test_db};
+use pplx_space_sql_locator::sql;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
 const TEST_POD_NAME: &str = "caller-pod";

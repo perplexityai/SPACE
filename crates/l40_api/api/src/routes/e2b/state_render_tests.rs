@@ -31,7 +31,7 @@ use crate::{
     controllers::sandbox::fetch_sandbox, e2b::schema::SandboxStateE2b, routes::AppState,
     routes::public::sandboxes::read_public_sandbox,
 };
-use pplx_space_common_svc::ecw_credential::EcwCredentialKeyring;
+use pplx_space_ecw_credential::EcwCredentialKeyring;
 
 /// A padded terminal value, which the CHECK-less `sandboxes.lifecycle` column
 /// can hold alongside `NON_CANONICAL_ROWS`.

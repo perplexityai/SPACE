@@ -70,7 +70,7 @@ use pplx_space_common_core::types::{
     ContentHash, OrgId, StorageUri, SubjectId, TEMPLATE_ROOTFS_FILE, TemplateName,
     ZSTD_FILENAME_SUFFIX,
 };
-use pplx_space_common_svc::bootstrap::GrpcClientTrace;
+use pplx_space_common_grpc::GrpcClientTrace;
 use pplx_space_node_api_client::cluster::connect_from_env as connect_cluster_api_from_env;
 use pplx_space_node_api_client::proto::{
     FindTemplateReleaseByHashRequest, FindTemplateReleaseRequest,

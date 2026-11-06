@@ -1379,8 +1379,8 @@ impl ClusterApi for ClusterApiService {
             .get("grpc-timeout")
             .and_then(|value| value.to_str().ok())
             .and_then(pplx_space_common_core::types::parse_grpc_timeout)
-            .unwrap_or(pplx_space_common_svc::ingress_admission::preparation_timeout())
-            .min(pplx_space_common_svc::ingress_admission::preparation_timeout());
+            .unwrap_or(pplx_space_ingress_admission::preparation_timeout())
+            .min(pplx_space_ingress_admission::preparation_timeout());
         let refresh_authority = request
             .extensions()
             .get::<pplx_space_rpc_auth::NodeApiAuthenticatedCaller>()
@@ -1440,8 +1440,8 @@ impl ClusterApi for ClusterApiService {
             .get("grpc-timeout")
             .and_then(|value| value.to_str().ok())
             .and_then(pplx_space_common_core::types::parse_grpc_timeout)
-            .unwrap_or(pplx_space_common_svc::ingress_admission::preparation_timeout())
-            .min(pplx_space_common_svc::ingress_admission::preparation_timeout());
+            .unwrap_or(pplx_space_ingress_admission::preparation_timeout())
+            .min(pplx_space_ingress_admission::preparation_timeout());
         let response = tokio::time::timeout(
             budget,
             data_plane_sessions::unstable_resolve_sandbox_service_route(

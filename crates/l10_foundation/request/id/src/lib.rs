@@ -3,10 +3,6 @@
 //! [`request_id_from_headers`] reads the id a caller sends with a request
 //! (`x-request-id`, or `x-correlation-id`) and accepts it only in a bounded,
 //! log-safe shape, so HTTP and gRPC servers can record it on request spans.
-//!
-//! It is its own crate so that code can read a request id without depending
-//! on `pplx-space-common-svc`. `pplx-space-common-svc` re-exports it from
-//! `bootstrap`.
 
 use http::HeaderMap;
 

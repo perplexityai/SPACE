@@ -6,9 +6,8 @@
 //! the facet and element references a reconcile trigger names, the facet and
 //! claim generation counters, and network-policy targets. It depends only on
 //! common-core's sandbox and template identifiers, sqlx and thiserror, so a
-//! crate that needs only this vocabulary can depend on it without the service
-//! runtime in `pplx-space-common-svc`, which re-exports it as
-//! `types::reconcile`.
+//! crate that needs only this vocabulary can depend on it without a service
+//! runtime.
 
 use std::{fmt, str::FromStr};
 

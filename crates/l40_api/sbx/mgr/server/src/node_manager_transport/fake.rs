@@ -199,9 +199,7 @@ fn endpoint() -> tonic::transport::Endpoint {
 }
 
 fn client(channel: tonic::transport::Channel) -> NodeManagerGrpcClient {
-    NodeManagerGrpcClient::new(pplx_space_common_svc::bootstrap::wrap_grpc_client_channel(
-        channel,
-    ))
+    NodeManagerGrpcClient::new(pplx_space_common_grpc::trace_grpc_client_transport(channel))
 }
 
 struct Unbound(PathBuf);

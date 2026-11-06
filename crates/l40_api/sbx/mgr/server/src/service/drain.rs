@@ -5,10 +5,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use pplx_space_common_svc::{
+use pplx_space_dependency_drain::{
     DependencyDrainError, DependencyDrainParticipant, DependencyWorkLease,
-    SERVICE_MUTEX_POLL_INTERVAL,
 };
+use pplx_space_service_mutex::SERVICE_MUTEX_POLL_INTERVAL;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 use tonic::Status;

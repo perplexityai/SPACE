@@ -75,10 +75,10 @@ impl From<Cli> for ApiRunConfig {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let config = ApiRunConfig::from(Cli::parse());
-    let telemetry = pplx_space_common_svc::init_service(config.service_name())?;
-    let shutdown_token = pplx_space_common_svc::shutdown_token();
+    let telemetry = pplx_space_service_host::init_service(config.service_name())?;
+    let shutdown_token = pplx_space_service_lifecycle::shutdown::shutdown_token();
 
     let result = pplx_space_api::run(config, shutdown_token).await;
-    pplx_space_common_svc::shutdown_telemetry(telemetry).await;
+    pplx_space_service_host::shutdown_telemetry(telemetry).await;
     Ok(result?)
 }

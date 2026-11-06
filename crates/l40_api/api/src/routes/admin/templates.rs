@@ -562,7 +562,7 @@ async fn enqueue_template_refs_for_nodes_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     node_ids: Vec<NodeId>,
     refs: &[ReconcileRef],
-    reason: pplx_space_common_svc::types::ReconcileReason,
+    reason: pplx_space_state_reconciliation::ReconcileReason,
 ) -> Result<(), sqlx::Error> {
     if node_ids.is_empty() {
         return Ok(());
@@ -583,7 +583,7 @@ async fn enqueue_template_refs_for_nodes_tx(
 async fn enqueue_template_refs_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     refs: &[ReconcileRef],
-    reason: pplx_space_common_svc::types::ReconcileReason,
+    reason: pplx_space_state_reconciliation::ReconcileReason,
 ) -> Result<(), sqlx::Error> {
     let node_ids = reconcile_target_node_ids(tx).await?;
     enqueue_template_refs_for_nodes_tx(tx, node_ids, refs, reason).await
@@ -591,9 +591,9 @@ async fn enqueue_template_refs_tx(
 
 fn template_refs(template_name: TemplateName) -> [ReconcileRef; 3] {
     [
-        ReconcileRef::network_policy(pplx_space_common_svc::types::NetworkPolicyTarget::template(
-            template_name.clone(),
-        )),
+        ReconcileRef::network_policy(
+            pplx_space_state_reconciliation::NetworkPolicyTarget::template(template_name.clone()),
+        ),
         ReconcileRef::template_desired_state(template_name.clone()),
         ReconcileRef::template_base_snapshot_policy(template_name),
     ]
@@ -739,7 +739,7 @@ pub async fn create_template(
         enqueue_template_refs_tx(
             &mut tx,
             &refs,
-            pplx_space_common_svc::types::ReconcileReason::TemplateDesiredStateUpdated,
+            pplx_space_state_reconciliation::ReconcileReason::TemplateDesiredStateUpdated,
         )
         .await?;
         tx.commit().await?;
@@ -916,7 +916,7 @@ pub async fn update_template(
             &mut tx,
             node_ids,
             &refs,
-            pplx_space_common_svc::types::ReconcileReason::TemplateDesiredStateUpdated,
+            pplx_space_state_reconciliation::ReconcileReason::TemplateDesiredStateUpdated,
         )
         .await
         .map_err(|error| (ContentionScope::Writing, error))?;
@@ -1282,7 +1282,7 @@ pub async fn delete_template(
             enqueue_template_refs_tx(
                 &mut tx,
                 &[ReconcileRef::template_desired_state(template_name.clone())],
-                pplx_space_common_svc::types::ReconcileReason::TemplateDesiredStateUpdated,
+                pplx_space_state_reconciliation::ReconcileReason::TemplateDesiredStateUpdated,
             )
             .await?;
         }
@@ -2560,7 +2560,7 @@ pub async fn tag_template_release(
                 enqueue_template_refs_tx(
                     &mut tx,
                     &[ReconcileRef::template_desired_state(template_name)],
-                    pplx_space_common_svc::types::ReconcileReason::TemplateDesiredStateUpdated,
+                    pplx_space_state_reconciliation::ReconcileReason::TemplateDesiredStateUpdated,
                 )
                 .await?;
                 tx.commit().await?;
@@ -2966,7 +2966,7 @@ pub async fn update_base_snapshot_policy(
                 ReconcileRef::template_base_snapshot_policy(template_name.clone()),
                 ReconcileRef::template_desired_state(template_name.clone()),
             ],
-            pplx_space_common_svc::types::ReconcileReason::TemplateBaseSnapshotPolicyUpdated,
+            pplx_space_state_reconciliation::ReconcileReason::TemplateBaseSnapshotPolicyUpdated,
         )
         .await?;
         tx.commit().await?;
@@ -3041,7 +3041,7 @@ pub async fn reconcile_base_snapshot_policy(
                 ReconcileRef::template_base_snapshot_policy(template_name.clone()),
                 ReconcileRef::template_desired_state(template_name.clone()),
             ],
-            pplx_space_common_svc::types::ReconcileReason::TemplateBaseSnapshotPolicyUpdated,
+            pplx_space_state_reconciliation::ReconcileReason::TemplateBaseSnapshotPolicyUpdated,
         )
         .await?;
         tx.commit().await
@@ -3136,7 +3136,7 @@ pub async fn upsert_template_pool(
         enqueue_template_refs_tx(
             &mut tx,
             &refs,
-            pplx_space_common_svc::types::ReconcileReason::TemplatePoolPolicyUpdated,
+            pplx_space_state_reconciliation::ReconcileReason::TemplatePoolPolicyUpdated,
         )
         .await?;
         tx.commit().await?;
@@ -3192,7 +3192,7 @@ pub async fn delete_template_pool(
         enqueue_template_refs_tx(
             &mut tx,
             &[ReconcileRef::template_desired_state(template_name.clone())],
-            pplx_space_common_svc::types::ReconcileReason::TemplatePoolPolicyDeleted,
+            pplx_space_state_reconciliation::ReconcileReason::TemplatePoolPolicyDeleted,
         )
         .await?;
         tx.commit().await

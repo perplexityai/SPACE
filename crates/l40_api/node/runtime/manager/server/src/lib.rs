@@ -10,6 +10,7 @@ mod installs;
 mod protection;
 mod run;
 mod service;
+pub mod service_name;
 
 #[cfg(feature = "github")]
 pub use installs::GitHubReleaseSourceError;

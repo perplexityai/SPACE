@@ -3,7 +3,7 @@
 
 use pplx_space_common_core::types::{OrgId, SandboxId, UserId};
 
-use pplx_space_common_svc::sql;
+use pplx_space_sql_locator::sql;
 
 /// The owner identity a sandbox's credentials are resolved against.
 #[derive(Debug, Clone, Copy)]

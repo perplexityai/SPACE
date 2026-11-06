@@ -16,23 +16,24 @@ use crate::proto::{
     SandboxServiceRouteTransport,
 };
 
+use pplx_space_api_route::SpaceApiRoutePurpose;
+use pplx_space_api_route::{
+    ed25519::SPACE_API_ROUTE_ED25519_ISSUER_ENV,
+    ed25519::SPACE_API_ROUTE_ED25519_SIGNING_KEY_ID_ENV,
+    ed25519::SPACE_API_ROUTE_ED25519_SIGNING_KEY_PATH_ENV, ed25519::SpaceApiRouteEd25519Authority,
+    ed25519::SpaceApiRouteEd25519Claims, ed25519::SpaceApiRouteEd25519Token,
+    ed25519::decode_unverified_space_api_route_ed25519_claims,
+};
 use pplx_space_common_core::{
     sql,
     types::{EcwCredentialEpoch, ExecutionGeneration, GuestPort, SandboxId},
 };
 use pplx_space_common_grpc::SandboxServiceRouteNotReady;
-use pplx_space_common_svc::ecw_credential::{EcwCredentialKeyring, EcwCredentialKind};
-use pplx_space_common_svc::space_api_route::SpaceApiRoutePurpose;
-use pplx_space_common_svc::space_api_route_ed25519::{
-    SPACE_API_ROUTE_ED25519_ISSUER_ENV, SPACE_API_ROUTE_ED25519_SIGNING_KEY_ID_ENV,
-    SPACE_API_ROUTE_ED25519_SIGNING_KEY_PATH_ENV, SpaceApiRouteEd25519Authority,
-    SpaceApiRouteEd25519Claims, SpaceApiRouteEd25519Token,
-    decode_unverified_space_api_route_ed25519_claims,
-};
 use pplx_space_db_test_fixtures::{
     SEED_ORG_ID as SEEDED_ORG_ID, SEED_USER_ID as SEEDED_USER_ID, TestDb, insert_ready_worker_node,
     try_pg_test_db_with_max_connections,
 };
+use pplx_space_ecw_credential::{EcwCredentialKeyring, EcwCredentialKind};
 use pplx_space_node_api_sim::SimWorkerHarness;
 use sha2::{Digest, Sha256};
 use tonic::Code;
@@ -52,7 +53,7 @@ pub(crate) fn test_route_ed25519_authority() -> std::sync::Arc<SpaceApiRouteEd25
         env.set("SPACE_CLUSTER_ID", "testing");
         env.set(
             SPACE_API_ROUTE_ED25519_SIGNING_KEY_PATH_ENV,
-            pplx_space_common_svc::space_api_route_ed25519::test_signing_key_path()
+            pplx_space_api_route::ed25519::test_signing_key_path()
                 .to_str()
                 .unwrap(),
         );

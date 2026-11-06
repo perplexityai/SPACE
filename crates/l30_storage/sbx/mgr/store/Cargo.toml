@@ -55,9 +55,9 @@ tracing = { workspace = true }
 uuid = { workspace = true, features = ["v7"] }
 
 # internal
+pplx-space-auto-lifecycle-receipt = { workspace = true }
 pplx-space-common-core = { workspace = true, features = ["serde"] }
 pplx-space-common-jobs = { workspace = true }
-pplx-space-common-svc = { workspace = true }
 pplx-space-sqlite = { workspace = true }
 pplx-space-events = { workspace = true }
 pplx-space-metrics = { workspace = true }

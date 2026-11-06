@@ -41,7 +41,7 @@ pub enum RunSpacedGuestError {
     Telemetry {
         service: &'static str,
         #[source]
-        source: pplx_space_common_svc::ObservabilityError,
+        source: pplx_space_observability::ObservabilityError,
     },
     #[error(transparent)]
     FilesystemWorker(#[from] RunFilesystemWorkerError),
@@ -87,7 +87,7 @@ pub fn run(config: SpacedGuestRunConfig) -> Result<(), RunSpacedGuestError> {
     block_on_bounded(
         async move {
             let telemetry =
-                pplx_space_common_svc::init_service(SERVICE_NAME).map_err(|source| {
+                pplx_space_service_host::init_service(SERVICE_NAME).map_err(|source| {
                     RunSpacedGuestError::Telemetry {
                         service: SERVICE_NAME,
                         source,
@@ -95,12 +95,12 @@ pub fn run(config: SpacedGuestRunConfig) -> Result<(), RunSpacedGuestError> {
                 })?;
             // The guest's own logs reach no collector; the host's health probe
             // drains its WARN and ERROR callsites over the bridge instead.
-            pplx_space_common_svc::observability::warning_tap::enable();
-            let shutdown = pplx_space_common_svc::shutdown_token();
+            pplx_space_observability::warning_tap::enable();
+            let shutdown = pplx_space_service_lifecycle::shutdown::shutdown_token();
             let result = serve(config, shutdown).await;
             if tokio::time::timeout(
                 TELEMETRY_SHUTDOWN_TIMEOUT,
-                pplx_space_common_svc::shutdown_telemetry(telemetry),
+                pplx_space_service_host::shutdown_telemetry(telemetry),
             )
             .await
             .is_err()

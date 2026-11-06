@@ -1,13 +1,15 @@
 use std::sync::{Arc, RwLock};
 
-use pplx_space_common_svc::core::types::ClusterId;
-use pplx_space_common_svc::space_api_route_ed25519::{
-    SpaceApiRouteEd25519Error, SpaceApiRouteEd25519Issuer, SpaceApiRouteEd25519KeyId,
-    SpaceApiRouteEd25519Token, SpaceApiRouteEd25519VerificationBundle,
-    SpaceApiRouteEd25519VerificationBundleUpdate,
-    SpaceApiRouteEd25519VerificationBundleUpdateError, SpaceApiRouteEd25519VerificationGeneration,
-    SpaceApiRouteEd25519VerificationKey,
+use pplx_space_api_route::{
+    ed25519::SpaceApiRouteEd25519Error, ed25519::SpaceApiRouteEd25519Issuer,
+    ed25519::SpaceApiRouteEd25519KeyId, ed25519::SpaceApiRouteEd25519Token,
+    ed25519::SpaceApiRouteEd25519VerificationBundle,
+    ed25519::SpaceApiRouteEd25519VerificationBundleUpdate,
+    ed25519::SpaceApiRouteEd25519VerificationBundleUpdateError,
+    ed25519::SpaceApiRouteEd25519VerificationGeneration,
+    ed25519::SpaceApiRouteEd25519VerificationKey,
 };
+use pplx_space_common_core::types::ClusterId;
 
 #[derive(Clone, Debug, Default)]
 pub struct RouteVerificationState {
@@ -107,10 +109,8 @@ impl RouteVerificationState {
     pub fn verify(
         &self,
         token: &SpaceApiRouteEd25519Token,
-    ) -> Result<
-        pplx_space_common_svc::space_api_route_ed25519::SpaceApiRouteEd25519Claims,
-        SpaceApiRouteEd25519Error,
-    > {
+    ) -> Result<pplx_space_api_route::ed25519::SpaceApiRouteEd25519Claims, SpaceApiRouteEd25519Error>
+    {
         let verifier = self
             .inner
             .read()

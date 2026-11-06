@@ -4,9 +4,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use pplx_space_common_jobs::{BackgroundWorker, Job, JobError, JobExecutor, WorkerConfig};
-use pplx_space_common_svc::{
-    AcquireOutcome, LocalHealthLiveness, LocalHealthServer, ServiceMutex, UnixSocketOptions,
-};
+use pplx_space_local_health::{LocalHealthLiveness, LocalHealthServer};
+use pplx_space_service_mutex::{AcquireOutcome, ServiceMutex};
+use pplx_space_unix_socket_bind::UnixSocketOptions;
 use tokio_stream::wrappers::UnixListenerStream;
 use tokio_util::sync::CancellationToken;
 use tonic_health::pb::HealthCheckRequest;
@@ -73,11 +73,12 @@ async fn spawn_production_health(
     path: &Path,
     token: CancellationToken,
 ) -> tokio::task::JoinHandle<Result<(), tonic::transport::Error>> {
-    let listener = pplx_space_common_svc::bind_unix_socket(path, UnixSocketOptions::new(0o600))
-        .expect("bind production health");
-    let (_, service) = pplx_space_common_svc::grpc_health_service();
+    let listener =
+        pplx_space_unix_socket_bind::bind_unix_socket(path, UnixSocketOptions::new(0o600))
+            .expect("bind production health");
+    let (_, service) = pplx_space_grpc_server::grpc_health_service();
     tokio::spawn(
-        pplx_space_common_svc::grpc_server_builder()
+        pplx_space_grpc_server::grpc_server_builder()
             .add_service(service)
             .serve_with_incoming_shutdown(UnixListenerStream::new(listener), async move {
                 token.cancelled().await
@@ -442,7 +443,7 @@ async fn mutex_timeout_never_transfers_ownership() {
     .expect_err("successor must time out while predecessor owns service");
     assert!(matches!(
         error,
-        pplx_space_common_svc::ServiceMutexAcquireError::Timeout { .. }
+        pplx_space_service_mutex::AcquireError::Timeout { .. }
     ));
 
     let still_blocked = ServiceMutex::acquire_with_timeout(
@@ -453,7 +454,7 @@ async fn mutex_timeout_never_transfers_ownership() {
     .await;
     assert!(matches!(
         still_blocked,
-        Err(pplx_space_common_svc::ServiceMutexAcquireError::Timeout { .. })
+        Err(pplx_space_service_mutex::AcquireError::Timeout { .. })
     ));
     drop(predecessor_mutex);
 }

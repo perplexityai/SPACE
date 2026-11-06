@@ -282,7 +282,7 @@ service: `sbx-mgr` beside `sbx-mgr-client` is at
 directories are listed by layer in `[rules.layers.unmoved]` until they move;
 a new crate goes in a layer directory, and a crate changes layer by moving
 into that layer's directory, not by editing its entry. `[rules.layers]
-legacy` names the crates being dissolved, such as `pplx-space-common-svc`,
+legacy` names the crates being dissolved, such as `pplx-space-common-core`,
 which predate the layers and mix SPACE-specific code in until they are split
 up: every check covers them like any other crate, with today's edges
 baselined.
@@ -314,7 +314,7 @@ drivers = ["sqlx", "rusqlite"]         # packages that reach a database or objec
 helpers = ["pplx-space-s3-http-client", "pplx-space-sqlite"]  # every storage helper
 
 [rules.layers]
-legacy = ["pplx-space-common-svc"]     # crates being dissolved; see Storage access below
+legacy = ["pplx-space-common-core"]    # crates being dissolved; see Storage access below
 protocols = ["pplx-space-events"]      # protocols without a *-protocol or *-proto name; see Domain
 
 [rules.layers.domain_fences]           # packages no Domain crate depends on, by family

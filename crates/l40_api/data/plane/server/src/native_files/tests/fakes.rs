@@ -9,8 +9,8 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
 use futures_util::Stream;
+use pplx_space_api_route::ed25519::SPACE_API_ROUTE_ED25519_TOKEN_METADATA_KEY as ROUTE_TOKEN_METADATA;
 use pplx_space_common_core::types::{OrgId, SandboxId};
-use pplx_space_common_svc::space_api_route_ed25519::SPACE_API_ROUTE_ED25519_TOKEN_METADATA_KEY as ROUTE_TOKEN_METADATA;
 use pplx_space_node_api_client::proto::{
     AuthorizeNativeFileRequestRequest, AuthorizeNativeFileRequestResponse,
     DataPlaneBackendEndpoint, NativeFileAuthorization, NativeFileRequest, NativeFileRouteGrant,

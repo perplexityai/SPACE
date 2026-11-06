@@ -30,7 +30,7 @@ fn wait_ready_policy_requires_authenticated_authority_and_lifecycle_purpose() {
 
 #[test]
 fn wait_ready_forward_replaces_caller_supplied_policy() {
-    let mut request = pplx_space_common_svc::space_api_route::wait_ready_lifecycle_request(());
+    let mut request = pplx_space_api_route::wait_ready_lifecycle_request(());
     set_space_api_bridge_caller_policy(
         request.metadata_mut(),
         SpaceApiBridgeCallerPolicy::TrustedLifecycle,
@@ -39,8 +39,7 @@ fn wait_ready_forward_replaces_caller_supplied_policy() {
     prepare_wait_ready_forward(&mut request);
 
     assert_eq!(
-        pplx_space_common_svc::space_api_route::space_api_bridge_caller_policy(request.metadata())
-            .unwrap(),
+        pplx_space_api_route::space_api_bridge_caller_policy(request.metadata()).unwrap(),
         Some(SpaceApiBridgeCallerPolicy::RouteTokenRequired)
     );
     assert_eq!(

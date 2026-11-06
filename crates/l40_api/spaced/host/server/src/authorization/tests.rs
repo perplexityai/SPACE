@@ -71,8 +71,8 @@ async fn mounted_authorization_precedes_decoding_even_for_new_methods() {
 #[tokio::test]
 async fn enforced_authorization_accepts_real_uds_provenance_through_the_host_listener() {
     use super::super::{BridgeGuestConnector, SPACE_SBXMGR_ACCOUNT, SpacedHostServiceConfig};
-    use pplx_space_common_svc::{UdsPeerAccount, UdsPeerAuthorizer};
     use pplx_space_spaced_host_client::{SpacedHostClient, SpacedHostClientConfig};
+    use pplx_space_uds_peer_auth::{UdsPeerAccount, UdsPeerAuthorizer};
     use std::time::Duration;
 
     let directory = tempfile::tempdir().expect("host sockets");

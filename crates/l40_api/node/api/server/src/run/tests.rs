@@ -20,12 +20,12 @@ async fn spawn_sandbox_manager_health(
     advertise_output_cursor: bool,
     advertise_operation_receipt: bool,
 ) -> (HealthReporter, CancellationToken, JoinHandle<()>) {
-    let listener = pplx_space_common_svc::bind_unix_socket(
+    let listener = pplx_space_unix_socket_bind::bind_unix_socket(
         socket_path,
-        pplx_space_common_svc::UnixSocketOptions::new(0o600),
+        pplx_space_unix_socket_bind::UnixSocketOptions::new(0o600),
     )
     .unwrap();
-    let (reporter, health) = pplx_space_common_svc::grpc_health_service();
+    let (reporter, health) = pplx_space_grpc_server::grpc_health_service();
     reporter
         .set_service_status("", ReporterServingStatus::Serving)
         .await;
@@ -482,7 +482,7 @@ async fn shutdown_releases_listener_while_accepted_connections_drain() {
     let addr = listener.local_addr().unwrap();
     let shutdown_token = CancellationToken::new();
     let server_shutdown = shutdown_token.clone();
-    let (_, health_service) = pplx_space_common_svc::grpc_health_service();
+    let (_, health_service) = pplx_space_grpc_server::grpc_health_service();
     struct PlaintextDev;
     impl pplx_space_common_core::env::Environment for PlaintextDev {
         fn var_os(&self, name: &str) -> Option<std::ffi::OsString> {

@@ -25,6 +25,7 @@ use pplx_space_api::node_group_placement::{
     NodeGroupPlacementResolveError, NodeGroupPlacementResolver, PlacementSubject,
     ResolvePath as NodeGroupResolvePath, ResolvedPlacement,
 };
+use pplx_space_api_route::wait_ready_lifecycle_request;
 use pplx_space_cluster_pool::{
     AutoscaleRun, InvalidPoolConfigRow, NewPoolSlot, PoolConfig, PoolConfigRead, PoolSlot,
     PoolSlotCounts, PoolSlotState, WarmPoolStore,
@@ -38,7 +39,6 @@ use pplx_space_common_core::{
     },
     types::{SandboxId, TemplateArtifactDigest, TemplateReference},
 };
-use pplx_space_common_svc::space_api_route::wait_ready_lifecycle_request;
 use pplx_space_metrics::warm_pool::{
     ProbeOutcome, ProbeStep, ProbeStepOutcome, PromoteOutcome, SlotDeleteReason,
 };

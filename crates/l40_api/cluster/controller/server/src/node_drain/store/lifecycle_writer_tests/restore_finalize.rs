@@ -187,7 +187,7 @@ async fn start_node_api(wake: impl WorkerApiInternal) -> TestResult<NodeApi> {
         state_dir.path().join("sandboxes"),
         WORKER_NODE.to_owned(),
     );
-    let (health, health_service) = pplx_space_common_svc::grpc_health_service();
+    let (health, health_service) = pplx_space_grpc_server::grpc_health_service();
     for service in [
         pplx_space_sbx_mgr_client::ACTIVATION_POLICY_HEALTH_SERVICE,
         pplx_space_sbx_mgr_client::OPERATION_ACTIVATION_RECEIPT_HEALTH_SERVICE,
@@ -305,7 +305,7 @@ async fn restore_finalize_moves_only_a_row_still_restoring(
     }
     let db = pg_test_db().await?;
     let pool = &db.pool;
-    let node_id = pplx_space_common_svc::types::k8s::space_k8s_node_id(WORKER_NODE, "worker");
+    let node_id = pplx_space_k8s_node_id::space_k8s_node_id(WORKER_NODE, "worker");
     let timeout = PositiveDuration::new(Duration::from_secs(10)).expect("non-zero");
 
     let mut mismatches = Vec::new();
@@ -1066,7 +1066,7 @@ async fn released_stopped_evacuation(
     prior_hosts: &[Option<&str>],
 ) -> TestResult<StoppedReplacement> {
     let pod_ip = Ipv4Addr::LOCALHOST;
-    let node_id = pplx_space_common_svc::types::k8s::space_k8s_node_id(WORKER_NODE, "worker");
+    let node_id = pplx_space_k8s_node_id::space_k8s_node_id(WORKER_NODE, "worker");
     sqlx::query(sql!(
         "INSERT INTO nodes (id, address, role, managed_by, state)
          VALUES ($1, $2::INET, 'worker', 'k8s', 'ready')"

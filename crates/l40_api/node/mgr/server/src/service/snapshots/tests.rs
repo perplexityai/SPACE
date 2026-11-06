@@ -872,7 +872,7 @@ async fn instance_restore_accepts_only_internal_snapshots() {
         });
         request
             .extensions_mut()
-            .insert(pplx_space_common_svc::PeerIdentity::new(0, 0, None));
+            .insert(pplx_space_uds_peer_auth::PeerIdentity::new(0, 0, None));
         let error = service
             .restore_instance_snapshot(request)
             .await

@@ -155,13 +155,14 @@ impl Cli {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let config = Cli::parse().into_config()?;
-    let telemetry = pplx_space_common_svc::init_service_with_log_context(
+    let telemetry = pplx_space_service_host::init_service_with_log_context(
         SERVICE_NAME,
-        pplx_space_common_svc::LogContext::default().with_sandbox_id(config.sandbox_id.to_string()),
+        pplx_space_observability::LogContext::default()
+            .with_sandbox_id(config.sandbox_id.to_string()),
     )?;
-    let shutdown_token = pplx_space_common_svc::shutdown_token();
+    let shutdown_token = pplx_space_service_lifecycle::shutdown::shutdown_token();
     let result = pplx_space_net_gateway::run(config, shutdown_token).await;
-    pplx_space_common_svc::shutdown_telemetry(telemetry).await;
+    pplx_space_service_host::shutdown_telemetry(telemetry).await;
     Ok(result?)
 }
 

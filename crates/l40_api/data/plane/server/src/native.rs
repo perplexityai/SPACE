@@ -570,11 +570,10 @@ pub(super) async fn proxy_session(
         return Ok(native_draining_response(session_id.kind().as_str()));
     }
     let mut preparation = pplx_space_metrics::data_plane::IngressPreparationObservation::default();
-    let mut waiter =
-        pplx_space_common_svc::ingress_admission::IngressPreparationPermit::acquire(None)
-            .map_err(|_| ProxyError::Upstream("ingress preparation capacity exhausted"))?;
-    let deadline = tokio::time::Instant::now()
-        + pplx_space_common_svc::ingress_admission::preparation_timeout();
+    let mut waiter = pplx_space_ingress_admission::IngressPreparationPermit::acquire(None)
+        .map_err(|_| ProxyError::Upstream("ingress preparation capacity exhausted"))?;
+    let deadline =
+        tokio::time::Instant::now() + pplx_space_ingress_admission::preparation_timeout();
     let mut attached =
         tokio::time::timeout_at(deadline, resolve_session_route(&state, session_id, &token))
             .await

@@ -20,7 +20,7 @@ use pplx_space_common_core::types::{
     AutoLifecycleConditionSetId, AutoLifecycleIdleAction, AutoLifecyclePolicy, AutoLifecycleStage,
     AutoLifecycleWakePolicy, AutoLifecycleWakeSource, EcwCredentialEpoch, SandboxId,
 };
-use pplx_space_common_svc::ecw_credential::{EcwCredentialKeyring, EcwCredentialKind};
+use pplx_space_ecw_credential::{EcwCredentialKeyring, EcwCredentialKind};
 use pplx_space_metrics::response::{ResponseKind, ResponseOrigin};
 use pplx_space_net_common::{EgressDestinationV1, IpCidr};
 use serde::{Deserialize, Serialize};

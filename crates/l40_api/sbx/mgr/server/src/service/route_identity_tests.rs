@@ -15,17 +15,18 @@ use aws_lc_rs::rand::SystemRandom;
 use aws_lc_rs::signature::Ed25519KeyPair;
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use pplx_space_api_route::{
+    ed25519::SPACE_API_ROUTE_ED25519_VERIFICATION_BUNDLE_ENV,
+    ed25519::SPACE_API_ROUTE_ED25519_VERIFICATION_BUNDLE_PATH_ENV,
+    ed25519::SpaceApiRouteEd25519Claims, ed25519::SpaceApiRouteEd25519Issuer,
+    ed25519::SpaceApiRouteEd25519KeyId, ed25519::SpaceApiRouteEd25519Signer,
+    ed25519::insert_space_api_route_ed25519_token,
+};
 use pplx_space_common_core::types::{
     AutoLifecycleConditionSet, AutoLifecycleConditionSetId, AutoLifecycleIdleAction,
     AutoLifecyclePolicy, AutoLifecycleStage, CLUSTER_ID_ENV, ClusterId, ExecutionGeneration,
     NodeId, NodeManagedBy, PodUid, RouteGeneration, SandboxActivationAttemptId, SandboxId,
     SandboxOwner, SandboxRouteIdentity, SandboxRuntimeLabel, SpaceApiRouteIdentity,
-};
-use pplx_space_common_svc::space_api_route_ed25519::{
-    SPACE_API_ROUTE_ED25519_VERIFICATION_BUNDLE_ENV,
-    SPACE_API_ROUTE_ED25519_VERIFICATION_BUNDLE_PATH_ENV, SpaceApiRouteEd25519Claims,
-    SpaceApiRouteEd25519Issuer, SpaceApiRouteEd25519KeyId, SpaceApiRouteEd25519Signer,
-    insert_space_api_route_ed25519_token,
 };
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
@@ -325,7 +326,7 @@ async fn identity_equal_adoption_does_not_overwrite_an_owned_execution() {
                         execution_generation: identity.execution_generation.unwrap(),
                         route_activation_id: identity.activation_attempt_id.unwrap(),
                         policy_fingerprint:
-                            pplx_space_common_svc::types::AutoLifecyclePolicyFingerprint::for_policy(
+                            pplx_space_auto_lifecycle_receipt::AutoLifecyclePolicyFingerprint::for_policy(
                                 &AutoLifecyclePolicy::disabled(),
                             ),
                     },

@@ -14,7 +14,7 @@ use crate::{
     worker::WorkerApiService,
 };
 use axum::{Router, body::Body, routing::any};
-use pplx_space_common_svc::bootstrap::wrap_grpc_client_channel;
+use pplx_space_common_grpc::trace_grpc_client_transport as wrap_grpc_client_channel;
 use pplx_space_net_common::{NetworkPolicyV1, proto::PolicyAuthority};
 use pplx_space_rpc_auth::{NodeApiAuthConfig, NodeApiAuthLayer, NodeRole};
 use pplx_space_sbx_mgr_client::proto as sbx;

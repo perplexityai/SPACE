@@ -9,16 +9,16 @@
 //! names an artifact by what it is, never by a path. A catalog that cannot
 //! be loaded safely refuses the request, not node-manager's startup.
 
+use pplx_space_common_core::host::linux::identities::user_names;
 use pplx_space_common_core::types::{
     Arch, ArtifactVersion, ComponentIdentity, RuntimeIdentity, RuntimeVersion,
 };
-use pplx_space_common_svc::UdsPeerPrincipal;
-use pplx_space_common_svc::core::host::linux::identities::user_names;
 use pplx_space_node_runtime_core::artifact_store::{
     ArtifactStore, Publication, PublishError, PublishOutcome, RemoveError, RemoveOutcome,
     StagedName,
 };
 use pplx_space_node_runtime_core::catalog::{InitialEnvironment, RuntimeCatalog};
+use pplx_space_uds_peer_auth::UdsPeerPrincipal;
 use tonic::{Request, Response, Status};
 
 use crate::proto::{

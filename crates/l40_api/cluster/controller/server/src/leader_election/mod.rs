@@ -151,7 +151,7 @@
 //! The outcome contract — an `Option` budget where `None` waits forever,
 //! shutdown outranking the budget, and exiting rather than sitting indefinitely
 //! passive while health reports OK — is the cluster-scoped twin of
-//! `pplx_space_common_svc::service_mutex`'s node-local one.
+//! `pplx_space_service_mutex`'s node-local one.
 //!
 //! # Safety model and its limits
 //!

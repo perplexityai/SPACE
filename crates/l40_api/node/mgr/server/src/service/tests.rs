@@ -50,9 +50,9 @@ pub(super) mod service_tests {
     use crate::service::runtime::{
         AllocateNewLeaseError, registered_firecracker_pid_with_vm_processes,
     };
+    use pplx_space_common_core::host::linux::identities::users;
     use pplx_space_common_core::types::{LinuxPid, SandboxId};
-    use pplx_space_common_svc::PeerIdentity;
-    use pplx_space_common_svc::core::host::linux::identities::users;
+    use pplx_space_uds_peer_auth::PeerIdentity;
     use std::str::FromStr;
 
     #[test]

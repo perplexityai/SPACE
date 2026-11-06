@@ -87,7 +87,7 @@ async fn artifact_mutation_cancellation_retains_target_until_blocking_work_exits
             let mut request = tonic::Request::new(message);
             request
                 .extensions_mut()
-                .insert(pplx_space_common_svc::PeerIdentity::new(0, 0, None));
+                .insert(pplx_space_uds_peer_auth::PeerIdentity::new(0, 0, None));
             request
         }
         let request = root_request(crate::proto::DeleteCacheArtifactRequest {

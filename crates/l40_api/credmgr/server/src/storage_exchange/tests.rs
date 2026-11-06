@@ -2,9 +2,9 @@ use pplx_space_common_core::types::SnapshotId;
 
 use std::collections::HashMap;
 
-use pplx_space_common_svc::core::types::{
-    ContentHash, K8sNodeName, K8sNodeUid, OrgId, SandboxId, StorageUri, TemplateName,
-    snapshot_shard,
+use pplx_space_common_core::{
+    types::ContentHash, types::K8sNodeName, types::K8sNodeUid, types::OrgId, types::SandboxId,
+    types::StorageUri, types::TemplateName, types::snapshot_shard,
 };
 
 use super::*;
@@ -628,7 +628,7 @@ fn actor_claims_are_accepted_only_from_the_node_agent() {
         (users::SPACE_TMPLMGR.uid, ClientService::TemplateManager),
     ] {
         let peer =
-            ResolvedCaller::UdsPeer(pplx_space_common_svc::PeerIdentity::new(uid, uid, None));
+            ResolvedCaller::UdsPeer(pplx_space_uds_peer_auth::PeerIdentity::new(uid, uid, None));
         assert_eq!(
             parse_request(&peer, template_request(&template, STORAGE_READ_SCOPE))
                 .unwrap()
@@ -643,7 +643,7 @@ fn actor_claims_are_accepted_only_from_the_node_agent() {
 
     for uid in [0, users::SPACE_SBXMGR.uid] {
         let peer =
-            ResolvedCaller::UdsPeer(pplx_space_common_svc::PeerIdentity::new(uid, uid, None));
+            ResolvedCaller::UdsPeer(pplx_space_uds_peer_auth::PeerIdentity::new(uid, uid, None));
         assert!(matches!(
             parse_request(&peer, template_request(&template, STORAGE_READ_SCOPE)).unwrap_err(),
             StorageExchangeError::UnauthorizedActor
@@ -707,7 +707,7 @@ fn requested_exchange_parses_each_part_independently() {
         "worker-a-uid",
     );
     let uds =
-        |uid| ResolvedCaller::UdsPeer(pplx_space_common_svc::PeerIdentity::new(uid, uid, None));
+        |uid| ResolvedCaller::UdsPeer(pplx_space_uds_peer_auth::PeerIdentity::new(uid, uid, None));
 
     let cases = [
         (

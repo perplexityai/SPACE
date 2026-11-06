@@ -49,7 +49,7 @@ fn node_local_config() -> CredmgrRunConfig {
         allow_plaintext: false,
         no_uds: false,
         health_socket_path: None,
-        service_mutex_timeout: pplx_space_common_svc::DEFAULT_SERVICE_MUTEX_TIMEOUT,
+        service_mutex_timeout: pplx_space_service_lifecycle::DEFAULT_SERVICE_MUTEX_TIMEOUT,
     }
 }
 

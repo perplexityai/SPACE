@@ -41,7 +41,7 @@ fn allow_port_request_params(req: &AllowPortRequest) -> String {
     let protocol = NetworkProtocol::try_from(req.protocol)
         .map(|protocol| protocol.as_str_name().to_ascii_lowercase())
         .unwrap_or_else(|_| req.protocol.to_string());
-    pplx_space_common_svc::format_grpc_request_params([
+    pplx_space_grpc_server::format_grpc_request_params([
         ("sandbox_id", req.sandbox_id.clone()),
         ("port", req.port.to_string()),
         ("protocol", protocol),
@@ -489,7 +489,7 @@ impl NodeManagerService {
     ) -> Result<Response<AllowPortResponse>, Status> {
         let req = request.get_ref();
         let request_params = allow_port_request_params(req);
-        pplx_space_common_svc::record_safe_grpc_request_params(&request_params);
+        pplx_space_grpc_server::record_safe_grpc_request_params(&request_params);
 
         let result = (|| {
             self.authorize_peer(&request, "AllowPort", ALLOW_NODE_ADMIN_OR_NODEAPI)?;
@@ -574,7 +574,7 @@ impl NodeManagerService {
             Ok(Response::new(AllowPortResponse {}))
         })();
         if let Err(status) = &result {
-            pplx_space_common_svc::log_failed_grpc_request_params(status, &request_params);
+            pplx_space_grpc_server::log_failed_grpc_request_params(status, &request_params);
         }
         result
     }

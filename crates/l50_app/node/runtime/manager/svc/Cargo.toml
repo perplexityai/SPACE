@@ -27,6 +27,9 @@ clap = { workspace = true, features = ["derive", "env"] }
 
 # internal
 pplx-space-common-core = { workspace = true }
-pplx-space-common-svc = { workspace = true }
 pplx-space-node-runtime-core = { workspace = true }
 pplx-space-node-runtime-manager = { workspace = true, features = ["github"] }
+pplx-space-service-host = { workspace = true }
+pplx-space-service-lifecycle = { workspace = true }
+pplx-space-tokio-runtime = { workspace = true }
+pplx-space-unix-socket-path = { workspace = true }

@@ -2,13 +2,13 @@
 
 use std::sync::Arc;
 
-use pplx_space_common_svc::core::host::linux::identities::{user_names, users};
-use pplx_space_common_svc::{
-    AuthorizedUdsPeer, LocalRole, UdsPeerAccount, UdsPeerAuthorizer, UdsPeerPrincipal,
-};
+use pplx_space_common_core::{host::linux::identities::user_names, host::linux::identities::users};
 use pplx_space_net_common::{
     EffectiveNetworkPolicyRef, EffectiveNetworkPolicyRefParseError, TlsInterception,
     proto::NetworkPolicyV1 as ProtoNetworkPolicyV1,
+};
+use pplx_space_uds_peer_auth::{
+    AuthorizedUdsPeer, LocalRole, UdsPeerAccount, UdsPeerAuthorizer, UdsPeerPrincipal,
 };
 use tokio_util::sync::CancellationToken;
 use tonic::{Request, Response, Status, metadata::MetadataValue};
@@ -269,18 +269,16 @@ impl NetGatewayControl for NetGatewayControlService {
             .service_port_ingress
             .route_verification()
             .update(
-                request
-                    .generation
-                    .try_into()
-                    .map_err(|error: pplx_space_common_svc::space_api_route_ed25519::SpaceApiRouteEd25519Error| {
+                request.generation.try_into().map_err(
+                    |error: pplx_space_api_route::ed25519::SpaceApiRouteEd25519Error| {
                         Status::invalid_argument(error.to_string())
-                    })?,
-                request
-                    .issuer
-                    .parse()
-                    .map_err(|error: pplx_space_common_svc::space_api_route_ed25519::SpaceApiRouteEd25519Error| {
+                    },
+                )?,
+                request.issuer.parse().map_err(
+                    |error: pplx_space_api_route::ed25519::SpaceApiRouteEd25519Error| {
                         Status::invalid_argument(error.to_string())
-                    })?,
+                    },
+                )?,
                 cluster_id,
                 keys,
             )

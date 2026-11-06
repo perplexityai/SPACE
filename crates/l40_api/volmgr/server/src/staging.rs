@@ -29,7 +29,7 @@ use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use pplx_space_common_svc::page_cache;
+use pplx_space_page_cache as page_cache;
 use uuid::Uuid;
 
 /// Vol-mgr's staging area for in-flight push sources. One file per active

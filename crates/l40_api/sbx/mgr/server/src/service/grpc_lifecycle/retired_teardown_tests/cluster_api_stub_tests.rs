@@ -348,7 +348,7 @@ pub(in crate::service::grpc_lifecycle) async fn with_cluster_api<S>(
             Some(OsStr::new(&endpoint)),
         ),
         (
-            pplx_space_common_svc::bearer_token::SPACE_CLUSTER_API_TOKEN_PATH_ENV,
+            pplx_space_bearer_token::SPACE_CLUSTER_API_TOKEN_PATH_ENV,
             Some(token.path().as_os_str()),
         ),
         (

@@ -6,9 +6,12 @@ use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwapOption;
 use pplx_space_common_core::types::SandboxId;
-use pplx_space_common_svc::core::host::linux::identities::{gids, group_names, user_names};
-use pplx_space_common_svc::{LocalRole, UdsPeerAccount, UdsPeerAuthorizer, UdsPeerPrincipal};
+use pplx_space_common_core::{
+    host::linux::identities::gids, host::linux::identities::group_names,
+    host::linux::identities::user_names,
+};
 use pplx_space_node_runtime_core::runtime_inventory::{RuntimeInventory, RuntimeInventoryError};
+use pplx_space_uds_peer_auth::{LocalRole, UdsPeerAccount, UdsPeerAuthorizer, UdsPeerPrincipal};
 use tonic::{Request, Response, Status};
 
 use crate::disk_admission::DiskAdmission;
@@ -354,7 +357,7 @@ impl NodeManagerService {
         settings: crate::config::ServiceSettings,
         task_tracker: tokio_util::task::TaskTracker,
         shutdown_token: tokio_util::sync::CancellationToken,
-        startup_ownership: std::sync::Arc<pplx_space_common_svc::service_mutex::ServiceMutex>,
+        startup_ownership: std::sync::Arc<pplx_space_service_mutex::ServiceMutex>,
     ) -> Result<Self, crate::slot_pool::PoolOpenError> {
         // Compiled pins are immutable for the lifetime of this process. Retain
         // unsupported-host errors for execution and mutation admission as well.

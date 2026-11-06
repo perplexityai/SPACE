@@ -514,7 +514,7 @@ async fn redrive_completion_enqueues_pending_open_port_exposures() -> TestResult
          )"
     ))
     .bind(sandbox_id.to_string())
-    .bind(pplx_space_common_svc::types::ReconcileFacet::SandboxDesiredState.as_str())
+    .bind(pplx_space_state_reconciliation::ReconcileFacet::SandboxDesiredState.as_str())
     .fetch_one(pool)
     .await?;
     assert!(
@@ -565,7 +565,7 @@ async fn redrive_observed_started_enqueues_pending_open_port_exposures() -> Test
          )"
     ))
     .bind(sandbox_id.to_string())
-    .bind(pplx_space_common_svc::types::ReconcileFacet::SandboxDesiredState.as_str())
+    .bind(pplx_space_state_reconciliation::ReconcileFacet::SandboxDesiredState.as_str())
     .fetch_one(pool)
     .await?;
     assert!(

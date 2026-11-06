@@ -7,7 +7,6 @@ use std::time::Duration;
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
 use pplx_space_common_core::types::{ProcessSignal, SandboxId};
-use pplx_space_common_svc::{UdsPeerAccount, UdsPeerAuthorizer, UdsPeerPrincipal};
 use pplx_space_node_runtime_core::cgroup::{self, CgroupLimits};
 use pplx_space_node_runtime_core::launch;
 use pplx_space_node_runtime_core::launch_admission::runtime_operation_status;
@@ -17,6 +16,7 @@ use pplx_space_node_runtime_core::proto::{
     StopProcessResponse, StopSandboxRuntimeRequest, StopSandboxRuntimeResponse,
     UpdateCgroupRequest, UpdateCgroupResponse,
 };
+use pplx_space_uds_peer_auth::{UdsPeerAccount, UdsPeerAuthorizer, UdsPeerPrincipal};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
 use tonic::{Request, Response, Status};

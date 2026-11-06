@@ -4,10 +4,10 @@ use pplx_space_common_core::types::SnapshotId;
 
 use std::fmt;
 
-use pplx_space_common_svc::core::host::linux::identities::users;
-use pplx_space_common_svc::core::types::{
-    ContentHash, OrgId, SandboxId, SnapshotArtifact, SubjectId, TemplateArtifact, TemplateName,
-    snapshot_shard,
+use pplx_space_common_core::host::linux::identities::users;
+use pplx_space_common_core::{
+    types::ContentHash, types::OrgId, types::SandboxId, types::SnapshotArtifact, types::SubjectId,
+    types::TemplateArtifact, types::TemplateName, types::snapshot_shard,
 };
 use pplx_space_credmgr_client::{
     AWS_CREDENTIALS_TOKEN_TYPE, BUILD_INPUT_SHA256_TOKEN_TYPE, SERVICE_ACTOR_TOKEN_TYPE,

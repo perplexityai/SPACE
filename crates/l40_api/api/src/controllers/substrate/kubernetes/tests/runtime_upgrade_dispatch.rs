@@ -271,7 +271,7 @@ async fn a_stopped_start_off_a_blocked_environment_wakes_by_the_upgrade(
     let pool = db.pool.clone();
     let sandbox_id = SandboxId::new();
     insert_test_sandbox_row(&pool, sandbox_id, lifecycle).await?;
-    let node_id = pplx_space_common_svc::types::k8s::space_k8s_node_id("node-a", "worker");
+    let node_id = pplx_space_k8s_node_id::space_k8s_node_id("node-a", "worker");
     pplx_space_db_test_fixtures::insert_ready_worker_node(&pool, node_id).await?;
     sqlx::query(sql!(
         "UPDATE sandboxes SET active_node_id = $2 WHERE id = $1"

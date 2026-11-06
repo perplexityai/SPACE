@@ -46,8 +46,8 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
 # internal
+pplx-space-api-route = { workspace = true }
 pplx-space-common-core = { workspace = true }
-pplx-space-common-svc = { workspace = true }
 pplx-space-credential-injection-core = { workspace = true }
 pplx-space-spaced-common = { workspace = true }
 pplx-space-net-common = { workspace = true, features = ["serde"] }

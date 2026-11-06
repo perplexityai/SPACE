@@ -1695,7 +1695,7 @@ async fn publish_status_from(target: PublishTarget) -> tonic::Status {
             Ok(request)
         });
     let mut client = pplx_space_node_api_client::proto::cluster_api_client::ClusterApiClient::new(
-        pplx_space_common_svc::bootstrap::wrap_grpc_client_channel(channel),
+        pplx_space_common_grpc::trace_grpc_client_transport(channel),
     );
     client
         .publish_node_state(PublishNodeStateRequest::default())

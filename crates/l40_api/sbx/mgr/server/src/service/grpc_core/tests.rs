@@ -1,8 +1,8 @@
 use super::*;
 use crate::service::tests::service_tests::insert_test_sandbox;
 use pplx_space_common_core::host::linux::identities::users;
-use pplx_space_common_svc::PeerIdentity;
 use pplx_space_template_mgr_client::proto::TemplateFullInfo;
+use pplx_space_uds_peer_auth::PeerIdentity;
 
 fn peer_request<T>(message: T, peer: Option<PeerIdentity>) -> Request<T> {
     let mut request = Request::new(message);
@@ -808,7 +808,7 @@ fn auto_lifecycle_expectation(
 ) -> crate::auto_lifecycle_delete_receipts::AutoLifecycleDeleteExpectation {
     crate::auto_lifecycle_delete_receipts::AutoLifecycleDeleteExpectation {
         policy_fingerprint:
-            pplx_space_common_svc::types::AutoLifecyclePolicyFingerprint::for_policy(policy),
+            pplx_space_auto_lifecycle_receipt::AutoLifecyclePolicyFingerprint::for_policy(policy),
         authority: crate::db::PolicyAuthority::Cluster,
     }
 }

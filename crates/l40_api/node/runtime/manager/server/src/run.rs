@@ -2,10 +2,11 @@ use std::path::PathBuf;
 use std::sync::LazyLock;
 use std::time::Duration;
 
+use crate::service_name::ServiceName;
 use pplx_space_common_core::host::linux::identities::group_names;
-use pplx_space_common_svc::types::{ServiceName, UnixSocketPath};
 use pplx_space_node_runtime_core::runtime_inventory::diagnostic::{ScanLimits, ScanRoots};
 use pplx_space_node_runtime_manager_client::proto::runtime_manager_server::RuntimeManagerServer;
+use pplx_space_unix_socket_path::UnixSocketPath;
 use tokio_stream::wrappers::UnixListenerStream;
 use tokio_util::sync::CancellationToken;
 
@@ -206,7 +207,7 @@ pub enum RunRuntimeManagerError {
     BindSocket {
         path: PathBuf,
         #[source]
-        source: pplx_space_common_svc::bootstrap::BindUnixSocketError,
+        source: pplx_space_unix_socket_bind::BindUnixSocketError,
     },
     #[error("runtime-manager gRPC server failed: {0}")]
     Serve(#[source] tonic::transport::Error),
@@ -231,16 +232,17 @@ pub async fn run(
     config: RuntimeManagerRunConfig,
     shutdown_token: CancellationToken,
 ) -> Result<(), RunRuntimeManagerError> {
-    let listener = pplx_space_common_svc::bind_unix_socket(
+    let listener = pplx_space_unix_socket_bind::bind_unix_socket(
         config.socket_path.as_path(),
-        pplx_space_common_svc::UnixSocketOptions::new(0o770)
-            .with_group(pplx_space_common_svc::SocketGroup::Required(SOCKET_GROUP)),
+        pplx_space_unix_socket_bind::UnixSocketOptions::new(0o770).with_group(
+            pplx_space_unix_socket_bind::SocketGroup::Required(SOCKET_GROUP),
+        ),
     )
     .map_err(|source| RunRuntimeManagerError::BindSocket {
         path: config.socket_path.as_path().to_path_buf(),
         source,
     })?;
-    let (_, health_service) = pplx_space_common_svc::grpc_health_service();
+    let (_, health_service) = pplx_space_grpc_server::grpc_health_service();
     let mut kernel_source = crate::installs::source::KernelSources::default();
     for source in config.kernel_sources {
         kernel_source.insert(source.into_source()?)?;
@@ -382,8 +384,8 @@ pub async fn run(
         shutdown_token.cancelled().await;
         tracing::warn!("space-rtmgr shutting down");
     };
-    let served = pplx_space_common_svc::grpc_server_builder()
-        .layer(pplx_space_common_svc::grpc_trace_layer())
+    let served = pplx_space_grpc_server::grpc_server_builder()
+        .layer(pplx_space_grpc_server::grpc_trace_layer())
         .add_service(health_service)
         .add_service(RuntimeManagerServer::new(service))
         .serve_with_incoming_shutdown(UnixListenerStream::new(listener), shutdown)

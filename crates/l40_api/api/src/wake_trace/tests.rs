@@ -29,7 +29,7 @@ async fn server_fields_include_cancelled_waits_and_placement_without_guessing_mi
     let _subscriber =
         tracing::subscriber::set_default(tracing_subscriber::registry().with(fields.clone()));
     let request = axum::http::Request::new(());
-    let server = pplx_space_common_svc::HttpServerMakeSpan::default().make_span(&request);
+    let server = pplx_space_http_server::HttpServerMakeSpan::default().make_span(&request);
     let trace = server.in_scope(WakeTrace::new);
     assert_eq!(
         fields.0.lock().expect("recorded fields lock poisoned")["restore_kind"],

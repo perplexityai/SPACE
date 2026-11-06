@@ -1,8 +1,6 @@
 use super::*;
 use axum::extract::ws::Message;
-use pplx_space_common_svc::space_api_route::{
-    RouteIdentityRemediation, set_route_identity_rejection_metadata,
-};
+use pplx_space_api_route::{RouteIdentityRemediation, set_route_identity_rejection_metadata};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 

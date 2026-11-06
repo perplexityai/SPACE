@@ -5,7 +5,6 @@ use anyhow::Context as _;
 use clap::Parser;
 use pplx_space_common_core::host::linux::paths;
 use pplx_space_common_core::types::{RuntimeKind, StorageUri};
-use pplx_space_common_svc::types::{UnixSocketPath, UnixSocketPathParseError};
 use pplx_space_node_runtime_core::runtime_inventory::RuntimeInstallationRoot;
 use pplx_space_node_runtime_core::runtime_inventory::diagnostic::{ScanLimits, ScanRoots};
 use pplx_space_node_runtime_manager::{
@@ -14,6 +13,7 @@ use pplx_space_node_runtime_manager::{
     ReleaseSourceConfig, ReleaseUrl, RuntimeManagerInstallConfig, RuntimeManagerReleaseConfig,
     RuntimeManagerRunConfig, SERVICE_NAME,
 };
+use pplx_space_unix_socket_path::{UnixSocketPath, UnixSocketPathParseError};
 
 #[derive(Parser)]
 #[command(
@@ -258,13 +258,13 @@ impl clap::builder::TypedValueParser for ReleaseSourceParser {
 
 fn main() -> anyhow::Result<()> {
     let config = RuntimeManagerRunConfig::try_from(Cli::parse())?;
-    pplx_space_common_svc::tokio_runtime::build_multi_thread_runtime()
+    pplx_space_tokio_runtime::build_multi_thread_runtime()
         .context("failed to configure runtime-manager Tokio runtime")?
         .block_on(async {
-            let telemetry = pplx_space_common_svc::init_service(SERVICE_NAME.as_str())?;
-            let shutdown_token = pplx_space_common_svc::shutdown_token();
+            let telemetry = pplx_space_service_host::init_service(SERVICE_NAME.as_str())?;
+            let shutdown_token = pplx_space_service_lifecycle::shutdown::shutdown_token();
             let result = pplx_space_node_runtime_manager::run(config, shutdown_token).await;
-            pplx_space_common_svc::shutdown_telemetry(telemetry).await;
+            pplx_space_service_host::shutdown_telemetry(telemetry).await;
             Ok(result?)
         })
 }

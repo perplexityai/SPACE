@@ -51,7 +51,7 @@ fn handoff_mutex_probe() {
     if expect_busy {
         assert!(matches!(
             result,
-            Err(pplx_space_common_svc::service_mutex::AcquireError::Timeout { .. })
+            Err(pplx_space_service_mutex::AcquireError::Timeout { .. })
         ));
     } else {
         assert!(

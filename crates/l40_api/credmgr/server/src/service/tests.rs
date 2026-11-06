@@ -2,7 +2,7 @@ use pplx_space_common_core::types::{OrgId, SandboxId, UserId};
 
 use std::collections::HashMap;
 
-use pplx_space_common_svc::PeerIdentity;
+use pplx_space_uds_peer_auth::PeerIdentity;
 use uuid::Uuid;
 use zeroize::Zeroizing;
 

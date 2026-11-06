@@ -58,11 +58,7 @@ pub(crate) async fn unstable_resolve_sandbox_service_route(
         .await?;
 
         let _waiter = if transport == SandboxServiceRouteTransport::ServicePortIngress {
-            Some(
-                pplx_space_common_svc::ingress_admission::IngressPreparationPermit::acquire(Some(
-                    sandbox_id,
-                ))?,
-            )
+            Some(pplx_space_ingress_admission::IngressPreparationPermit::acquire(Some(sandbox_id))?)
         } else {
             None
         };

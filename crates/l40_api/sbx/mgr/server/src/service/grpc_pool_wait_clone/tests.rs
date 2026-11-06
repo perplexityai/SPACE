@@ -738,7 +738,7 @@ async fn pool_clone_cleanup_never_falls_back_and_holds_unsafe_or_exhausted_dispo
             .await
             .unwrap();
         let mut client = pplx_space_node_mgr_client::NodeManagerGrpcClient::new(
-            pplx_space_common_svc::bootstrap::wrap_grpc_client_channel(channel),
+            pplx_space_common_grpc::trace_grpc_client_transport(channel),
         );
         let result = match admit_prepared_clone_disposal_attempt(&service.db, &id, Some(&job_id)) {
             Err(error) => Err(error),
@@ -853,7 +853,7 @@ async fn pool_clone_admission_precedes_all_durable_allocation() {
                     .await
                     .unwrap();
                 Ok(pplx_space_node_mgr_client::NodeManagerGrpcClient::new(
-                    pplx_space_common_svc::bootstrap::wrap_grpc_client_channel(channel),
+                    pplx_space_common_grpc::trace_grpc_client_transport(channel),
                 ))
             };
             // A supported peer reaches donor validation; all other cases must

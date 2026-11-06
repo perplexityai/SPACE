@@ -1,3 +1,5 @@
+//! The cache disk's admission state, refreshed on a timer, and its metrics.
+
 use std::sync::Arc;
 use std::time::Duration;
 

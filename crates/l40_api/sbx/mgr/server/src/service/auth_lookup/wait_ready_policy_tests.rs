@@ -1,10 +1,10 @@
 use super::*;
 use crate::service::activation_support::sandbox_peer_authorizer;
-use pplx_space_common_core::host::linux::identities::users;
-use pplx_space_common_svc::space_api_route::{
+use pplx_space_api_route::{
     SPACE_API_ROUTE_ED25519_TOKEN_METADATA_KEY, SpaceApiBridgeCallerPolicy,
     set_space_api_bridge_caller_policy,
 };
+use pplx_space_common_core::host::linux::identities::users;
 
 fn service() -> SandboxManagerService {
     SandboxManagerService::for_test(crate::db::Connection::open_in_memory())

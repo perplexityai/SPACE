@@ -84,9 +84,7 @@ fn simulated_kubernetes_identity_fills_a_canonical_node_id() {
     let actual = sim_direct_route_identity("sim-node", Some(requested));
     assert_eq!(
         actual.current_node_id,
-        Some(
-            pplx_space_common_svc::types::k8s::space_k8s_node_id("sim-node", "worker").to_string()
-        )
+        Some(pplx_space_k8s_node_id::space_k8s_node_id("sim-node", "worker").to_string())
     );
 }
 
@@ -909,9 +907,8 @@ async fn resident_kubernetes_wake_acknowledges_and_records_requested_identity() 
             } as i32
         );
         let mut expected = requested;
-        expected.current_node_id = Some(
-            pplx_space_common_svc::types::k8s::space_k8s_node_id("node-a", "worker").to_string(),
-        );
+        expected.current_node_id =
+            Some(pplx_space_k8s_node_id::space_k8s_node_id("node-a", "worker").to_string());
         assert_eq!(wake.route_identity, Some(expected.clone()));
         assert_eq!(
             state

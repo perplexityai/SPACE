@@ -11,11 +11,11 @@ use pplx_space_sandbox_store::fork_source_lifecycle::{
     active_fork_source_operation_exists, lock_fork_source_lifecycle,
 };
 
-pub use pplx_space_common_svc::types::{
-    NetworkPolicyTarget, ReconcileElementRef, ReconcileFacet, ReconcileReason, ReconcileRef,
-};
 pub use pplx_space_sandbox_teardown::{
     delete_reconcile_state_for_elements, sandbox_reconcile_cleanup_refs,
+};
+pub use pplx_space_state_reconciliation::{
+    NetworkPolicyTarget, ReconcileElementRef, ReconcileFacet, ReconcileReason, ReconcileRef,
 };
 
 use crate::reconcile_trigger::{enqueue_triggers, enqueue_triggers_tx};

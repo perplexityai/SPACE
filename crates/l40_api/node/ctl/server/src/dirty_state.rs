@@ -2,15 +2,15 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-pub use pplx_space_common_svc::types::{
-    FACET_NETWORK_POLICY, FACET_NODE_STATUS, FACET_RUNTIME_PROVISIONING,
-    FACET_SANDBOX_DESIRED_STATE, FACET_SANDBOX_INVENTORY, FACET_TEMPLATE_BASE_SNAPSHOT_POLICY,
-    FACET_TEMPLATE_DESIRED_STATE, FACET_TEMPLATE_INVENTORY, NetworkPolicyTarget, ReconcileFacet,
-};
 use pplx_space_node_api_client::proto::{
     FacetDirection, FacetQueueItem, FacetRef as ProtoFacetRef, FacetSyncOverride,
     NetworkPolicyTargetRef, ReconcileFacet as ProtoReconcileFacet, facet_ref,
     network_policy_target_ref,
+};
+pub use pplx_space_state_reconciliation::{
+    FACET_NETWORK_POLICY, FACET_NODE_STATUS, FACET_RUNTIME_PROVISIONING,
+    FACET_SANDBOX_DESIRED_STATE, FACET_SANDBOX_INVENTORY, FACET_TEMPLATE_BASE_SNAPSHOT_POLICY,
+    FACET_TEMPLATE_DESIRED_STATE, FACET_TEMPLATE_INVENTORY, NetworkPolicyTarget, ReconcileFacet,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 
@@ -161,13 +161,13 @@ fn proto_facet_element(
 fn network_policy_target_from_proto(target: NetworkPolicyTargetRef) -> Result<String, String> {
     match target.target {
         Some(network_policy_target_ref::Target::Template(template)) => {
-            let template = pplx_space_common_svc::core::types::TemplateName::parse(template)
+            let template = pplx_space_common_core::types::TemplateName::parse(template)
                 .map_err(|error| error.to_string())?;
             Ok(NetworkPolicyTarget::template(template).as_element_string())
         }
         Some(network_policy_target_ref::Target::SandboxId(sandbox_id)) => {
             let sandbox_id = sandbox_id
-                .parse::<pplx_space_common_svc::core::types::SandboxId>()
+                .parse::<pplx_space_common_core::types::SandboxId>()
                 .map_err(|error| error.to_string())?;
             Ok(NetworkPolicyTarget::sandbox(sandbox_id).as_element_string())
         }

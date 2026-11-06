@@ -27,14 +27,16 @@ use futures_util::{SinkExt, StreamExt};
 use http_body_util::BodyExt;
 use hyper::client::conn::http1;
 use hyper_util::rt::TokioIo;
+use pplx_space_bearer_token::{SpaceBearerToken, insert_space_bearer_token};
 use pplx_space_common_core::types::cluster::process_cluster_id;
 use pplx_space_common_core::types::{NodeId, OrgId, ProcessId, SandboxId, SimpleDuration};
-use pplx_space_common_svc::bearer_token::{SpaceBearerToken, insert_space_bearer_token};
-use pplx_space_common_svc::bootstrap::{GrpcClientTrace, wrap_grpc_client_channel};
-use pplx_space_common_svc::{HttpServerMakeSpan, HttpSpanMetadata};
+use pplx_space_common_grpc::{
+    GrpcClientTrace, trace_grpc_client_transport as wrap_grpc_client_channel,
+};
 use pplx_space_feature_flags::{
     Attributes, FeatureFlagClient, SPACE_CLUSTER_API_CLIENT_SIDE_BALANCING_FLAG,
 };
+use pplx_space_http_server::{HttpServerMakeSpan, HttpSpanMetadata};
 use pplx_space_metrics::data_plane::{
     BackendRpcResult, BackendRpcSurface, ResponseKind, ResponseOrigin, ResponseSurface,
     RouteRepairResult, RouteRepairSurface, ServicePortIngressOpenReason,
@@ -439,10 +441,10 @@ pub enum RunDataPlaneError {
 /// waiting on a stream without a deadline can still be stopped.
 pub async fn run(
     config: DataPlaneConfig,
-    stop: pplx_space_common_svc::StopTokens,
+    stop: pplx_space_service_lifecycle::shutdown::StopTokens,
 ) -> Result<(), RunDataPlaneError> {
     config.validate()?;
-    let pplx_space_common_svc::StopTokens {
+    let pplx_space_service_lifecycle::shutdown::StopTokens {
         shutdown: shutdown_token,
         forced: force_token,
     } = stop;
@@ -538,7 +540,7 @@ const DATA_PLANE_TCP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
 const DATA_PLANE_TCP_KEEPALIVE_RETRIES: u32 = 3;
 
 type DataPlaneListener = axum::serve::TapIo<
-    pplx_space_common_svc::http_listener::NodelayListener,
+    pplx_space_http_server::http_listener::NodelayListener,
     fn(&mut tokio::net::TcpStream),
 >;
 
@@ -567,7 +569,7 @@ fn data_plane_listener(listener: tokio::net::TcpListener) -> DataPlaneListener {
         }
     }
     axum::serve::ListenerExt::tap_io(
-        pplx_space_common_svc::http_listener::nodelay(listener),
+        pplx_space_http_server::http_listener::nodelay(listener),
         set_dead_peer_detection as fn(&mut tokio::net::TcpStream),
     )
 }
@@ -790,7 +792,7 @@ fn router(state: DataPlaneState) -> Router {
         ))
         .with_state(state)
         .layer(middleware::from_fn(close_draining_http1_connections))
-        .layer(pplx_space_common_svc::http_trace_layer(
+        .layer(pplx_space_http_server::http_trace_layer(
             HttpServerMakeSpan::new(http_span_metadata),
         ))
         .layer(CorsLayer::permissive())
@@ -872,7 +874,7 @@ impl HttpSpanMetadata for DataPlaneHttpSpanMetadata {
         matched_route: Option<&'a str>,
     ) -> (Cow<'a, str>, Cow<'a, str>) {
         if self.ecw_hosts.parse_sandbox_host(headers).is_some() {
-            let route = matched_route.unwrap_or(pplx_space_common_svc::REDACTED_HTTP_PATH_VALUE);
+            let route = matched_route.unwrap_or(pplx_space_http_server::REDACTED_HTTP_PATH_VALUE);
             return (Cow::Borrowed(route), Cow::Borrowed(route));
         }
 
@@ -910,7 +912,7 @@ impl HttpSpanMetadata for DataPlaneHttpSpanMetadata {
         raw_path: &str,
     ) -> bool {
         self.ecw_hosts.parse_sandbox_host(headers).is_none()
-            && pplx_space_common_svc::is_probe_request(method, raw_path)
+            && pplx_space_http_server::is_probe_request(method, raw_path)
     }
 }
 
@@ -936,14 +938,13 @@ async fn ecw_service_proxy(
         ServiceRouteTransport::ServicePortIngress,
     );
     let mut preparation = pplx_space_metrics::data_plane::IngressPreparationObservation::default();
-    let _waiter = pplx_space_common_svc::ingress_admission::IngressPreparationPermit::acquire(
-        Some(target.sandbox_id),
-    )
-    .map_err(|_| {
-        EcwProxyError::too_many_attached_streams(TooManyRequestsReason::IngressPreparation)
-    })?;
-    let deadline = tokio::time::Instant::now()
-        + pplx_space_common_svc::ingress_admission::preparation_timeout();
+    let _waiter =
+        pplx_space_ingress_admission::IngressPreparationPermit::acquire(Some(target.sandbox_id))
+            .map_err(|_| {
+                EcwProxyError::too_many_attached_streams(TooManyRequestsReason::IngressPreparation)
+            })?;
+    let deadline =
+        tokio::time::Instant::now() + pplx_space_ingress_admission::preparation_timeout();
     let request_headers = request.headers().clone();
     let prepared = before_stream_deadline(
         &state.stream_shutdown_token,

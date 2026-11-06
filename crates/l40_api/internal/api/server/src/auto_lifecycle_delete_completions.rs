@@ -3,6 +3,12 @@ use std::{
     str::FromStr,
 };
 
+use pplx_space_auto_lifecycle_receipt::{
+    AUTO_LIFECYCLE_DELETE_COMPLETION_BATCH_SIZE, AUTO_LIFECYCLE_DELETE_COMPLETION_LOCK_TIMEOUT,
+    AUTO_LIFECYCLE_DELETE_COMPLETION_OWNERSHIP_GRACE,
+    AUTO_LIFECYCLE_DELETE_COMPLETION_REQUEST_LIMIT, AutoLifecyclePolicyFingerprint,
+    AutoLifecyclePolicyFingerprintParseError,
+};
 use pplx_space_common_core::{
     sql,
     types::{
@@ -11,12 +17,6 @@ use pplx_space_common_core::{
         SandboxId, SandboxIdParseError, SandboxLifecycle, SandboxQuarantineReasonCode,
         SandboxQuarantineSource,
     },
-};
-use pplx_space_common_svc::types::{
-    AUTO_LIFECYCLE_DELETE_COMPLETION_BATCH_SIZE, AUTO_LIFECYCLE_DELETE_COMPLETION_LOCK_TIMEOUT,
-    AUTO_LIFECYCLE_DELETE_COMPLETION_OWNERSHIP_GRACE,
-    AUTO_LIFECYCLE_DELETE_COMPLETION_REQUEST_LIMIT, AutoLifecyclePolicyFingerprint,
-    AutoLifecyclePolicyFingerprintParseError,
 };
 use pplx_space_metrics::sandbox::publication::{
     AutoLifecycleDeleteCompletionDisposition, AutoLifecycleDeleteCompletionReason,

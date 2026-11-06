@@ -1618,7 +1618,7 @@ mod service {
     use super::*;
     use crate::service::{SandboxManagerService, SandboxManagerServiceOptions};
     use pplx_space_common_core::host::linux::identities::users;
-    use pplx_space_common_svc::PeerIdentity;
+    use pplx_space_uds_peer_auth::PeerIdentity;
 
     fn root<T>(message: T) -> tonic::Request<T> {
         let mut request = tonic::Request::new(message);

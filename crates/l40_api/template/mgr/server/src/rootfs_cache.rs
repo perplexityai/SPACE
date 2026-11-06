@@ -66,7 +66,7 @@ impl ExpandedRootfsError {
 }
 
 use pplx_space_common_core::types::{TEMPLATE_ROOTFS_FILE, TemplateManifest, TemplateMetadata};
-use pplx_space_common_svc::page_cache;
+use pplx_space_page_cache as page_cache;
 
 /// Expand the template rootfs to the size declared in `metadata.json`.
 /// Returns `Some((path, final_size_bytes))` when metadata declares a size,

@@ -185,7 +185,7 @@ impl std::fmt::Display for LeaseToken {
 /// A durable artifact a placement can restore from: a durable full snapshot
 /// row, or a node-published local artifact
 /// (`sandboxes.current_local_artifact_id`). The portability predicates in
-/// `common-svc` decide which backs a row.
+/// `pplx-space-sandbox-portability` decide which backs a row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArtifactRef {
     Snapshot(SnapshotId),

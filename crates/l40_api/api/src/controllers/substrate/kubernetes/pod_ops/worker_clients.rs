@@ -82,7 +82,7 @@ impl KubernetesSubstrate {
         };
         let policy_health_channel = crate::controllers::substrate::node_api_channel(
             channel.clone(),
-            pplx_space_common_svc::bearer_token::SpaceBearerToken::NodeApiInternal,
+            pplx_space_bearer_token::SpaceBearerToken::NodeApiInternal,
         );
         crate::controllers::substrate::require_activation_policy_support(
             policy_health_channel,
@@ -96,13 +96,13 @@ impl KubernetesSubstrate {
             return Ok(Some(WorkerApiInternalClient::new(
                 crate::controllers::substrate::node_api_channel(
                     channel,
-                    pplx_space_common_svc::bearer_token::SpaceBearerToken::NodeApiInternal,
+                    pplx_space_bearer_token::SpaceBearerToken::NodeApiInternal,
                 ),
             )));
         }
         let health_channel = crate::controllers::substrate::node_api_channel(
             channel.clone(),
-            pplx_space_common_svc::bearer_token::SpaceBearerToken::NodeApiInternal,
+            pplx_space_bearer_token::SpaceBearerToken::NodeApiInternal,
         );
         // This is the producer's proof that it reached a node-api which can
         // preserve the separate operation owner. Bound the local probe by the
@@ -147,7 +147,7 @@ impl KubernetesSubstrate {
         Ok(Some(WorkerApiInternalClient::new(
             crate::controllers::substrate::node_api_channel(
                 channel,
-                pplx_space_common_svc::bearer_token::SpaceBearerToken::NodeApiInternal,
+                pplx_space_bearer_token::SpaceBearerToken::NodeApiInternal,
             ),
         )))
     }
@@ -185,7 +185,7 @@ impl KubernetesSubstrate {
         Ok(BuilderClient::new(
             crate::controllers::substrate::node_api_channel(
                 channel,
-                pplx_space_common_svc::bearer_token::SpaceBearerToken::NodeApi,
+                pplx_space_bearer_token::SpaceBearerToken::NodeApi,
             ),
         ))
     }

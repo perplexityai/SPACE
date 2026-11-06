@@ -65,14 +65,15 @@ async fn ingress_stream_holds_admission_until_stream_drop() {
 
 use aws_lc_rs::rand::SystemRandom;
 use aws_lc_rs::signature::Ed25519KeyPair;
-use pplx_space_common_svc::core::types::{
-    ClusterId, ExecutionGeneration, NodeManagedBy, RouteGeneration, SandboxActivationAttemptId,
-    SandboxRouteIdentity,
+use pplx_space_api_route::{
+    ed25519::SpaceApiRouteEd25519Claims, ed25519::SpaceApiRouteEd25519Issuer,
+    ed25519::SpaceApiRouteEd25519KeyId, ed25519::SpaceApiRouteEd25519Signer,
+    ed25519::SpaceApiRouteEd25519VerificationGeneration,
+    ed25519::insert_space_api_route_ed25519_token,
 };
-use pplx_space_common_svc::space_api_route_ed25519::{
-    SpaceApiRouteEd25519Claims, SpaceApiRouteEd25519Issuer, SpaceApiRouteEd25519KeyId,
-    SpaceApiRouteEd25519Signer, SpaceApiRouteEd25519VerificationGeneration,
-    insert_space_api_route_ed25519_token,
+use pplx_space_common_core::{
+    types::ClusterId, types::ExecutionGeneration, types::NodeManagedBy, types::RouteGeneration,
+    types::SandboxActivationAttemptId, types::SandboxRouteIdentity,
 };
 use pplx_space_net_common::{EffectiveNetworkPolicyRef, EffectiveNetworkPolicyRefScope};
 use tonic::metadata::MetadataMap;

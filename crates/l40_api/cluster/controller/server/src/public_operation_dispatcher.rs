@@ -233,10 +233,9 @@ impl NativePublicOperationExecutor {
         grant_audience: pplx_space_common_core::types::FederatedGrantAudience,
         tls_interception_exemptions: Option<TlsInterceptionExemptions>,
         egress_profiles: EgressProfiles,
-    ) -> Result<Self, pplx_space_common_svc::space_api_route_ed25519::SpaceApiRouteEd25519Error>
-    {
+    ) -> Result<Self, pplx_space_api_route::ed25519::SpaceApiRouteEd25519Error> {
         let route_ed25519_authority = Arc::new(
-            pplx_space_common_svc::space_api_route_ed25519::SpaceApiRouteEd25519Authority::load_required_from_env()?,
+            pplx_space_api_route::ed25519::SpaceApiRouteEd25519Authority::load_required_from_env()?,
         );
         Ok(Self::with_cluster_admission(
             pool,
@@ -257,9 +256,7 @@ impl NativePublicOperationExecutor {
         pool: PgPool,
         substrate: Substrate,
         cluster_admission: ClusterSandboxAdmission,
-        route_ed25519_authority: Arc<
-            pplx_space_common_svc::space_api_route_ed25519::SpaceApiRouteEd25519Authority,
-        >,
+        route_ed25519_authority: Arc<pplx_space_api_route::ed25519::SpaceApiRouteEd25519Authority>,
         grant_audience: pplx_space_common_core::types::FederatedGrantAudience,
         tls_interception_exemptions: Option<TlsInterceptionExemptions>,
         egress_profiles: EgressProfiles,

@@ -6,7 +6,7 @@ use clap::Parser;
 use pplx_space_build_mgr_server::{
     BuildMgrRunConfig, DEFAULT_DRAIN_TIMEOUT_SECONDS, DEFAULT_LISTEN, SERVICE_NAME,
 };
-use pplx_space_common_svc::core::host::linux::paths::BUILD_MANAGER_DB;
+use pplx_space_common_core::host::linux::paths::BUILD_MANAGER_DB;
 
 #[derive(Parser)]
 #[command(
@@ -46,13 +46,13 @@ impl From<Cli> for BuildMgrRunConfig {
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    pplx_space_common_svc::tokio_runtime::build_multi_thread_runtime()
+    pplx_space_tokio_runtime::build_multi_thread_runtime()
         .context("failed to configure build-manager Tokio runtime")?
         .block_on(async {
-            let telemetry = pplx_space_common_svc::init_service(SERVICE_NAME)?;
-            let shutdown_token = pplx_space_common_svc::shutdown_token();
+            let telemetry = pplx_space_service_host::init_service(SERVICE_NAME)?;
+            let shutdown_token = pplx_space_service_lifecycle::shutdown::shutdown_token();
             let result = pplx_space_build_mgr_server::run(cli.into(), shutdown_token).await;
-            pplx_space_common_svc::shutdown_telemetry(telemetry).await;
+            pplx_space_service_host::shutdown_telemetry(telemetry).await;
             Ok(result?)
         })
 }

@@ -3,6 +3,7 @@
 
 #![cfg(test)]
 
+use pplx_space_auto_lifecycle_receipt::AutoLifecyclePolicyFingerprint;
 use pplx_space_common_core::types::{LocalArtifactId, NodeId, SnapshotId};
 use pplx_space_common_core::{
     sql,
@@ -13,11 +14,6 @@ use pplx_space_common_core::{
         SandboxId, SandboxLifecycle, SandboxQuarantineHistoryAction, SandboxQuarantineNextAction,
         SandboxQuarantineReasonCode, SandboxQuarantineSource,
     },
-};
-use pplx_space_common_svc::types::{
-    AutoLifecyclePolicyFingerprint, FACET_NETWORK_POLICY, FACET_SANDBOX_DESIRED_STATE,
-    NetworkPolicyTarget, SANDBOX_FAILURE_ACTIVATION_ATTEMPT_ID_KEY, SANDBOX_FAILURE_EPISODE_KEY,
-    SANDBOX_FAILURE_EXECUTION_GENERATION_KEY, SANDBOX_LOCAL_SUSPEND_KEY,
 };
 use pplx_space_db_test_fixtures::{
     insert_pool_slot_receipt, insert_ready_worker_node, pg_test_db, pool_slot_receipt_state,
@@ -32,6 +28,11 @@ use pplx_space_internal_api_server::{
     publish_sandbox_states, publish_sandbox_states_with_retirement,
 };
 use pplx_space_net_common::proto::NetworkPolicySource;
+use pplx_space_state_reconciliation::{
+    FACET_NETWORK_POLICY, FACET_SANDBOX_DESIRED_STATE, NetworkPolicyTarget,
+    SANDBOX_FAILURE_ACTIVATION_ATTEMPT_ID_KEY, SANDBOX_FAILURE_EPISODE_KEY,
+    SANDBOX_FAILURE_EXECUTION_GENERATION_KEY, SANDBOX_LOCAL_SUSPEND_KEY,
+};
 use pplx_space_test_env::TestResult;
 use sqlx::PgPool;
 use tonic::Request;

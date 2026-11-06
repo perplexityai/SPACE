@@ -82,6 +82,6 @@ pub(super) fn always(status: fn() -> Status) -> Reply {
 pub(super) async fn dial(path: PathBuf) -> Result<NodeManagerGrpcClient, ConnectError> {
     let channel = pplx_space_common_grpc::connect_uds_channel("node-manager-test", &path).await?;
     Ok(NodeManagerGrpcClient::new(
-        pplx_space_common_svc::bootstrap::wrap_grpc_client_channel(channel),
+        pplx_space_common_grpc::trace_grpc_client_transport(channel),
     ))
 }

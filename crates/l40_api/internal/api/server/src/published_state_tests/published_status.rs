@@ -12,10 +12,10 @@
 
 use pplx_space_common_core::sql;
 use pplx_space_common_core::types::{NodeId, SandboxId, SandboxQuarantineReasonCode};
-use pplx_space_common_svc::types::{
+use pplx_space_db_test_fixtures::{insert_ready_worker_node, pg_test_db};
+use pplx_space_state_reconciliation::{
     FACET_SANDBOX_DESIRED_STATE, SANDBOX_FAILURE_EPISODE_KEY, SANDBOX_LOCAL_SUSPEND_KEY,
 };
-use pplx_space_db_test_fixtures::{insert_ready_worker_node, pg_test_db};
 use pplx_space_test_env::TestResult;
 use sqlx::PgPool;
 use uuid::Uuid;

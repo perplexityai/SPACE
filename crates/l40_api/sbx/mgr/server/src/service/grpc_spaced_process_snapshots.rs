@@ -600,9 +600,7 @@ impl SandboxManagerService {
             "ServicePortIngress",
             ALLOW_SANDBOX_NETWORK_POLICY_OPERATOR,
         )?;
-        let mut metadata = pplx_space_common_svc::space_api_route::space_api_route_token_metadata(
-            request.metadata(),
-        );
+        let mut metadata = pplx_space_api_route::space_api_route_token_metadata(request.metadata());
         // Temporary rollout opt-in; older workers strip it and select fallback.
         if let Some(value) = request
             .metadata()
@@ -655,7 +653,7 @@ impl SandboxManagerService {
             Some(route_auth.clone()),
             &sandbox_id_str,
             true,
-            Some(pplx_space_common_svc::ingress_admission::preparation_timeout()),
+            Some(pplx_space_ingress_admission::preparation_timeout()),
             GuestActivityKind::Access,
             "ServicePortIngress",
         )
@@ -668,7 +666,7 @@ impl SandboxManagerService {
         } = self
             .admit_ingress(
                 &sandbox_id_str,
-                pplx_space_common_svc::ingress_admission::preparation_timeout(),
+                pplx_space_ingress_admission::preparation_timeout(),
                 |sandbox| route_auth.authorize_service_port(sandbox, port),
             )
             .await?;

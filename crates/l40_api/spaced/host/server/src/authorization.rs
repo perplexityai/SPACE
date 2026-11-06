@@ -39,7 +39,7 @@ impl SpacedHostService {
             .get::<tonic::transport::server::UdsConnectInfo>()
             .and_then(|info| info.peer_cred)
             .ok_or_else(|| Status::unauthenticated("UDS peer credentials missing"))?;
-        let identity = pplx_space_common_svc::PeerIdentity::new(
+        let identity = pplx_space_uds_peer_auth::PeerIdentity::new(
             credentials.uid(),
             credentials.gid(),
             credentials.pid(),

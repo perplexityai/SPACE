@@ -10,17 +10,17 @@ use super::spaced_bridge_policy::SpacedBridgePolicy;
 use super::tail_support::*;
 use super::*;
 
-use pplx_space_common_core::types::{GuestPort, SandboxId, SpaceApiRouteIdentity};
-use pplx_space_common_svc::space_api_route::{
+use pplx_space_api_route::{
     RouteIdentityRemediation, SpaceApiBridgeCallerPolicy, SpaceApiRouteCapabilityPresence,
     SpaceApiRouteIdentityDimension, SpaceApiRouteIdentityMatchError, SpaceApiRoutePurpose,
     match_present_route_identity_dimensions, set_route_identity_rejection_metadata,
     space_api_bridge_caller_policy, space_api_route_capability_presence,
 };
-use pplx_space_common_svc::space_api_route_ed25519::{
-    SpaceApiRouteEd25519Claims, SpaceApiRouteEd25519Error, SpaceApiRouteEd25519Verifier,
-    space_api_route_ed25519_token_from_metadata,
+use pplx_space_api_route::{
+    ed25519::SpaceApiRouteEd25519Claims, ed25519::SpaceApiRouteEd25519Error,
+    ed25519::SpaceApiRouteEd25519Verifier, ed25519::space_api_route_ed25519_token_from_metadata,
 };
+use pplx_space_common_core::types::{GuestPort, SandboxId, SpaceApiRouteIdentity};
 use pplx_space_metrics::sandbox::worker::SpaceApiRouteTokenAuthorizationResult;
 use pplx_space_net_common::{EffectiveNetworkPolicyRef, NetworkPolicy};
 use tonic::metadata::MetadataMap;

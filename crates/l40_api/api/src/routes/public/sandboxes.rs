@@ -17,11 +17,6 @@ use axum::{
 use pplx_space_common_core::types::{
     AutoLifecyclePolicy, IdempotencyKey, SandboxLifecycle, SubstrateKind,
 };
-use pplx_space_common_svc::types::{
-    FACET_SANDBOX_DESIRED_STATE, SANDBOX_FAILURE_ACTIVATION_ATTEMPT_ID_KEY,
-    SANDBOX_FAILURE_EPISODE_KEY, SANDBOX_FAILURE_EXECUTION_GENERATION_KEY,
-    SANDBOX_FAILURE_POD_UID_KEY,
-};
 use pplx_space_metrics::operations::InlineAdmissionPath;
 use pplx_space_metrics::warm_pool::AdmissionClaimOutcome;
 use pplx_space_public_api::{
@@ -32,6 +27,11 @@ use pplx_space_public_api::{
     SandboxFailureCode, SandboxIdleAction, SandboxLifecycleAction, SandboxLifecycleState,
     SandboxOperationResponse, SandboxResources, SandboxStatsResponse, UpdateSandboxRequest,
     routes as native_routes,
+};
+use pplx_space_state_reconciliation::{
+    FACET_SANDBOX_DESIRED_STATE, SANDBOX_FAILURE_ACTIVATION_ATTEMPT_ID_KEY,
+    SANDBOX_FAILURE_EPISODE_KEY, SANDBOX_FAILURE_EXECUTION_GENERATION_KEY,
+    SANDBOX_FAILURE_POD_UID_KEY,
 };
 use serde::Deserialize;
 use sha2::{Digest, Sha256};

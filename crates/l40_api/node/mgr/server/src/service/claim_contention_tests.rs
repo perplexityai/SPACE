@@ -16,7 +16,7 @@ use super::tests::service_tests::service_for_unit_tests;
 use super::*;
 use futures_util::future::BoxFuture;
 use pplx_space_common_core::host::linux::paths::{NET_GATEWAY_SVC_BIN, SPACED_HOST_SVC_BIN};
-use pplx_space_common_svc::PeerIdentity;
+use pplx_space_uds_peer_auth::PeerIdentity;
 
 const WORK_REFUSED: &str = "sandbox cleanup or reset is in progress; retry";
 const MUTATION_REFUSED: &str = "sandbox host mutation or reset is in progress; retry";

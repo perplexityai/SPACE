@@ -4,10 +4,10 @@ use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::time::Duration;
 
-use pplx_space_common_svc::types::{ReconcileReason, normalize_reconcile_reason};
 use pplx_space_node_api_client::proto::{
     StateReconciliationReason, TriggerStateReconciliationRequest,
 };
+use pplx_space_state_reconciliation::{ReconcileReason, normalize_reconcile_reason};
 use tokio::sync::{Mutex as TokioMutex, mpsc};
 use tonic::Status;
 

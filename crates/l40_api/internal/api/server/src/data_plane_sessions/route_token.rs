@@ -53,7 +53,7 @@ pub(super) fn space_api_route_token(
             params
                 .service_port
                 .expect("ServicePort ingress claims require a port"),
-            pplx_space_common_svc::space_api_route::SpaceApiRouteProtocol::Tcp,
+            pplx_space_api_route::SpaceApiRouteProtocol::Tcp,
         ),
     }
     .map_err(|error| Status::internal(format!("mint SPACE API route token: {error}")))?;

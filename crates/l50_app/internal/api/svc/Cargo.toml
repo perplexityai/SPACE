@@ -22,12 +22,12 @@ default = []
 # to the server's `kubernetes` feature, which enables `rpc-auth`'s `k8s`.
 k8s = ["pplx-space-internal-api-server/kubernetes"]
 otel = [
-    "pplx-space-common-svc/otel",
+    "pplx-space-service-host/otel",
     "pplx-space-internal-api-server/otel",
 ]
 datadog = [
     "otel",
-    "pplx-space-common-svc/datadog",
+    "pplx-space-service-host/datadog",
     "pplx-space-internal-api-server/datadog",
 ]
 # Deprecated for one release; use otel and datadog.
@@ -39,7 +39,9 @@ clap = { workspace = true, features = ["derive"] }
 
 # internal
 pplx-space-internal-api-server = { workspace = true }
-pplx-space-common-svc = { workspace = true }
+pplx-space-service-host = { workspace = true }
+pplx-space-service-lifecycle = { workspace = true }
+pplx-space-tokio-runtime = { workspace = true }
 
 # jemalloc on glibc Linux targets: node inventories publish multi-megabyte
 # requests every poll tick, and glibc arenas retain those peaks.

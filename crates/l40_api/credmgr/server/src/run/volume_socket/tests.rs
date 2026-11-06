@@ -156,8 +156,8 @@ fn exercise(case: &str) -> io::Result<()> {
         let error = result.expect_err(case);
         if case == "missing-group" {
             assert!(matches!(
-                error.get_ref().and_then(|source| source.downcast_ref::<pplx_space_common_svc::bootstrap::ApplyUnixSocketPermissionsError>()),
-                Some(pplx_space_common_svc::bootstrap::ApplyUnixSocketPermissionsError::SetGroup { .. })
+                error.get_ref().and_then(|source| source.downcast_ref::<pplx_space_unix_socket_bind::ApplyUnixSocketPermissionsError>()),
+                Some(pplx_space_unix_socket_bind::ApplyUnixSocketPermissionsError::SetGroup { .. })
             ), "the real chgrp must fail: {error:?}");
         }
     }

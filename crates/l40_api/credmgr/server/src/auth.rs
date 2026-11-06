@@ -32,13 +32,15 @@ use std::pin::Pin;
 use std::str::FromStr;
 use std::task::{Context, Poll};
 
-use pplx_space_common_svc::UdsPeerAccount;
-use pplx_space_common_svc::core::host::linux::identities::{user_names, users};
+use pplx_space_common_core::{host::linux::identities::user_names, host::linux::identities::users};
+use pplx_space_uds_peer_auth::UdsPeerAccount;
 use tonic::{Request, Status};
 use tower::{Layer, Service};
 
-use pplx_space_common_svc::core::types::{K8sNodeName, K8sNodeUid, PodName, PodUid};
-use pplx_space_common_svc::{
+use pplx_space_common_core::{
+    types::K8sNodeName, types::K8sNodeUid, types::PodName, types::PodUid,
+};
+use pplx_space_uds_peer_auth::{
     PeerIdentity, UdsPeerAuthorizer, UdsPeerPrincipal, peer_identity_from_tonic_request,
 };
 

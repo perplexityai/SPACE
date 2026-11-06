@@ -3,10 +3,6 @@
 //! Each daemon can override these via its own CLI flags, but the defaults
 //! sit here so the SPACE rollout shape (`terminationGracePeriodSeconds`,
 //! mutex acquire budgets, drain budgets) stays consistent across services.
-//!
-//! It is its own crate so a service can share these defaults and the drain
-//! helpers, or the stop-signal handling in [`shutdown`], without the rest of
-//! `pplx-space-common-svc`.
 
 pub mod shutdown;
 

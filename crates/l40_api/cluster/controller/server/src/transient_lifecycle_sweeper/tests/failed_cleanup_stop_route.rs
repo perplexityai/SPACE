@@ -132,7 +132,7 @@ async fn insert_failed_resident(
     sandbox_id: SandboxId,
     execution_node: Option<&str>,
 ) -> TestResult<(String, serde_json::Value)> {
-    let node_id = pplx_space_common_svc::types::k8s::space_k8s_node_id(WORKER_NODE, "worker");
+    let node_id = pplx_space_k8s_node_id::space_k8s_node_id(WORKER_NODE, "worker");
     sqlx::query(sql!(
         "INSERT INTO nodes (id, address, role, managed_by, state)
          VALUES ($1, '127.0.0.1'::INET, 'worker', 'k8s', 'ready')

@@ -216,7 +216,7 @@ pub(crate) fn node_api_request_with_route_token_state<T>(
 ) -> Result<tonic::Request<T>, tonic::Status> {
     let mut request = node_api_request(message)?;
     if let Some(route_token) = route_token {
-        pplx_space_common_svc::space_api_route_ed25519::insert_space_api_route_ed25519_token(
+        pplx_space_api_route::ed25519::insert_space_api_route_ed25519_token(
             request.metadata_mut(),
             route_token.token(),
         )

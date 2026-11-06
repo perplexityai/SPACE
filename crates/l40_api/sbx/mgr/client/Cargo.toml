@@ -15,7 +15,7 @@ default = []
 # Exposes `test_support`, the shared quarantine/recovery `SandboxInfo`
 # fixtures, to other crates' test suites. Unit tests in this crate get it
 # automatically under `cfg(test)`; external consumers (sbx-mgr, node-ctl) opt
-# in with this feature as a dev-dependency. Mirrors `pplx-space-common-svc`'s
+# in with this feature as a dev-dependency. Mirrors `pplx-space-rpc-auth`'s
 # `test-support`.
 test-support = []
 

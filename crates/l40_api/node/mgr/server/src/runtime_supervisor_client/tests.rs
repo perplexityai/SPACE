@@ -143,7 +143,7 @@ where
     let incoming = UnixListenerStream::new(listener);
     let (shutdown, shutdown_receiver) = oneshot::channel();
     let task = tokio::spawn(async move {
-        let (_, health_service) = pplx_space_common_svc::grpc_health_service();
+        let (_, health_service) = pplx_space_grpc_server::grpc_health_service();
         tonic::transport::Server::builder()
             .add_service(health_service)
             .add_service(proto::runtime_supervisor_server::RuntimeSupervisorServer::new(service))
@@ -310,7 +310,7 @@ where
                     let (client, server) = tokio::io::duplex(64 * 1024);
                     let service = service.clone();
                     tokio::spawn(async move {
-                        let (_, health_service) = pplx_space_common_svc::grpc_health_service();
+                        let (_, health_service) = pplx_space_grpc_server::grpc_health_service();
                         tonic::transport::Server::builder()
                             .add_service(health_service)
                             .add_service(

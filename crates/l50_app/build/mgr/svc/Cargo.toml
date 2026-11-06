@@ -20,12 +20,12 @@ k8s = ["pplx-space-build-mgr-server/k8s"]
 aws-ecr = ["pplx-space-build-mgr-server/aws-ecr"]
 otel = [
     "pplx-space-build-mgr-server/otel",
-    "pplx-space-common-svc/otel",
+    "pplx-space-service-host/otel",
 ]
 datadog = [
     "otel",
     "pplx-space-build-mgr-server/datadog",
-    "pplx-space-common-svc/datadog",
+    "pplx-space-service-host/datadog",
 ]
 # Deprecated for one release; use otel and datadog.
 datadog-otel = ["otel", "datadog"]
@@ -36,4 +36,7 @@ clap = { workspace = true, features = ["derive"] }
 
 # internal
 pplx-space-build-mgr-server = { workspace = true }
-pplx-space-common-svc = { workspace = true }
+pplx-space-common-core = { workspace = true }
+pplx-space-service-host = { workspace = true }
+pplx-space-service-lifecycle = { workspace = true }
+pplx-space-tokio-runtime = { workspace = true }

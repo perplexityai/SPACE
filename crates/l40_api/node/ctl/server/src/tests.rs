@@ -37,7 +37,7 @@ async fn mutex_timeout_never_transfers_ownership() {
     .expect_err("successor must time out while predecessor owns service");
     assert!(matches!(
         error,
-        pplx_space_common_svc::ServiceMutexAcquireError::Timeout { .. }
+        pplx_space_service_mutex::AcquireError::Timeout { .. }
     ));
     drop(predecessor_mutex);
 }

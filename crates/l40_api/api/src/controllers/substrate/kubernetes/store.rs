@@ -19,7 +19,6 @@ use pplx_space_common_core::types::{
     NodeRole, PodUid, SandboxActivationAttemptId, SandboxId, SandboxLifecycle, SandboxOwner,
     SandboxTransitionTargetState, SnapshotState, StorageUri, UserId,
 };
-use pplx_space_common_svc::types::{FACET_SANDBOX_DESIRED_STATE, SANDBOX_LOCAL_SUSPEND_KEY};
 use pplx_space_events::{
     SandboxEvent, SandboxEventDetails, SandboxEventSource, SandboxEventTrigger, SandboxEventType,
 };
@@ -30,6 +29,7 @@ use pplx_space_sandbox_portability::{
     restore_retry_source_snapshot_is_current, restore_retry_suspended_revert_snapshot_exists,
     snapshot_is_current_local_artifact,
 };
+use pplx_space_state_reconciliation::{FACET_SANDBOX_DESIRED_STATE, SANDBOX_LOCAL_SUSPEND_KEY};
 use sqlx::{PgConnection, PgPool, Postgres, Row, Transaction, postgres::PgRow};
 use uuid::Uuid;
 

@@ -1,4 +1,4 @@
-use pplx_space_common_svc::{PeerProcessCheckMode, UdsPeerAccount};
+use pplx_space_uds_peer_auth::{PeerProcessCheckMode, UdsPeerAccount};
 
 use super::*;
 
@@ -215,7 +215,7 @@ fn uds_peer_process_checks_reject_when_enforcing() {
 
 /// Root classifies ahead of any account match, so a root-owned test process
 /// can never reach a per-account check through the resolver. The
-/// allowlist-reaching half runs in common-svc against the snapshot's own uid,
+/// allowlist-reaching half runs in uds-peer-auth against the snapshot's own uid,
 /// which root cannot divert. Classification reads only the presented uid, so
 /// this needs no root.
 #[test]

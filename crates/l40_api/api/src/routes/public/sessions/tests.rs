@@ -1230,7 +1230,7 @@ mod not_running {
                 ..Default::default()
             },
             tasks,
-            pplx_space_common_svc::DrainSignal::new(),
+            pplx_space_service_lifecycle::DrainSignal::new(),
             OperationExecutionConfig::default(),
             true,
         )

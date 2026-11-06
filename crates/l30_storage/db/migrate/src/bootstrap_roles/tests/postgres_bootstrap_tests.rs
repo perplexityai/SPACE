@@ -895,7 +895,7 @@ async fn assuming_the_migrator_role_installs_its_role_level_timeouts() -> TestRe
 
 #[tokio::test]
 async fn credential_references_enforce_triggers_and_grants() -> TestResult {
-    use pplx_space_common_svc::core::types::CredentialReferenceId;
+    use pplx_space_common_core::types::CredentialReferenceId;
     use pplx_space_db_test_fixtures::SEED_ORG_ID;
     let Some(fixture) = postgres_fixture().await? else {
         return Ok(());

@@ -12,8 +12,8 @@ workspace = true
 
 [features]
 default = []
-otel = ["pplx-space-common-svc/otel"]
-datadog = ["otel", "pplx-space-common-svc/datadog"]
+otel = ["pplx-space-observability/otel"]
+datadog = ["otel", "pplx-space-observability/datadog"]
 # Deprecated for one release; use otel and datadog.
 datadog-otel = ["otel", "datadog"]
 # Compiles in the test-only environment hooks; never enabled for release builds.
@@ -49,7 +49,11 @@ zeroize = { workspace = true }
 pplx-space-common-core = { workspace = true }
 pplx-space-common-grpc = { workspace = true }
 pplx-space-common-io = { workspace = true, features = ["reflink"] }
-pplx-space-common-svc = { workspace = true }
+pplx-space-grpc-rate-limiter = { workspace = true }
+pplx-space-grpc-server = { workspace = true }
+pplx-space-local-health = { workspace = true }
+pplx-space-service-lifecycle = { workspace = true }
+pplx-space-service-mutex = { workspace = true }
 pplx-space-sqlite = { workspace = true }
 pplx-space-credmgr-client = { workspace = true }
 pplx-space-events = { workspace = true }
@@ -60,6 +64,8 @@ pplx-space-node-ctl-client = { workspace = true }
 pplx-space-node-mgr-client = { workspace = true }
 pplx-space-node-runtime-core = { workspace = true, features = ["artifact-store", "host-runtime"] }
 pplx-space-observability = { workspace = true, default-features = false }
+pplx-space-uds-peer-auth = { workspace = true }
+pplx-space-unix-socket-bind = { workspace = true }
 sqlx = { workspace = true, features = ["macros", "migrate"] }
 uuid = { workspace = true }
 
@@ -77,5 +83,5 @@ pplx-space-metrics = { workspace = true, features = ["test-capture"] }
 hyper-util = { workspace = true, features = ["tokio"] }
 pplx-space-test-env = { workspace = true }
 tempfile = { workspace = true }
-tokio = { workspace = true, features = ["test-util"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "test-util"] }
 tower = { workspace = true }
