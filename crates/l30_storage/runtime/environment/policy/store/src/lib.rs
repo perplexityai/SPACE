@@ -8,7 +8,10 @@
 //! policy and states from another. The write verbs ([`set_default`],
 //! [`set_environment_state`], [`set_legacy_unbound_allowed`]) take the
 //! caller's open transaction, lock the policy row first, and increment the
-//! generation in the same transaction as the change.
+//! generation in the same transaction as the change. They don't tell nodes
+//! about the change: the admin API's write handlers queue the node
+//! reconciles in that same transaction. [`set_legacy_unbound_allowed`] has no
+//! handler yet; the one that calls it has to queue them too.
 //!
 //! # Rules the store enforces
 //!

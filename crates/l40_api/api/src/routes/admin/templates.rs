@@ -58,7 +58,10 @@ use crate::{
         ResponseReservation,
     },
     public_template_operations::{DeleteTemplateOperationPayload, TemplateInUse},
-    reconcile_queue::{ReconcileFacet, ReconcileRef, enqueue_node_reconcile_refs_for_nodes_tx},
+    reconcile_queue::{
+        ReconcileFacet, ReconcileRef, enqueue_node_reconcile_refs_for_nodes_tx,
+        requeue_node_reconcile_refs_for_nodes_tx,
+    },
     reconcile_trigger::enqueue_triggers_tx,
     routes::{
         AppState,
@@ -587,6 +590,31 @@ async fn enqueue_template_refs_tx(
 ) -> Result<(), sqlx::Error> {
     let node_ids = reconcile_target_node_ids(tx).await?;
     enqueue_template_refs_for_nodes_tx(tx, node_ids, refs, reason).await
+}
+
+/// The fan-out for a runtime environment policy write (`runtime_environments`):
+/// `refs` and a trigger on every node [`reconcile_target_node_ids`] picks, in
+/// the caller's transaction, so the policy writes read Direct's tables through
+/// an existing query instead of adding one. Classified as
+/// [`enqueue_template_refs_tx`] is: the caller has already written.
+///
+/// Unlike the template writes, a ref already queued is queued again as a new
+/// request ([`requeue_node_reconcile_refs_for_nodes_tx`]), due at once with
+/// its attempts reset; one a node holds a claim on runs again once the claim
+/// is released. A changed policy is new desired state, so it shouldn't
+/// wait out the backoff of a ref that was failing to apply the old one.
+pub(super) async fn requeue_reconcile_targets_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    refs: &[ReconcileRef],
+    reason: pplx_space_state_reconciliation::ReconcileReason,
+) -> Result<(), sqlx::Error> {
+    let node_ids = reconcile_target_node_ids(tx).await?;
+    if node_ids.is_empty() {
+        return Ok(());
+    }
+    requeue_node_reconcile_refs_for_nodes_tx(tx, node_ids.clone(), refs).await?;
+    enqueue_triggers_tx(tx, node_ids, reason).await?;
+    Ok(())
 }
 
 fn template_refs(template_name: TemplateName) -> [ReconcileRef; 3] {

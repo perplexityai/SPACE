@@ -20,7 +20,9 @@ const TRIGGER_FAILURE_BACKOFF_MAX_SECS: i32 = 60;
 #[derive(Debug, Clone, FromRow)]
 struct ClaimedStateReconciliationTriggerRow {
     node_id: NodeId,
-    reasons: Vec<ReconcileReason>,
+    /// Text, not the enum, so a value a newer build added doesn't fail the
+    /// decode, and with it the whole claim batch.
+    reasons: Vec<String>,
     diagnostic_reason: String,
 }
 
@@ -206,7 +208,7 @@ pub async fn claim_triggers(
          FROM picked
          WHERE t.node_id = picked.node_id
          RETURNING t.node_id,
-                   t.reasons AS reasons,
+                   t.reasons::TEXT[] AS reasons,
                    t.reason AS diagnostic_reason"
     ))
     .bind(i64::from(limit))
@@ -562,13 +564,15 @@ pub fn normalize_trigger_reason(reason: &str) -> String {
     normalize_shared_reconcile_reason(reason)
 }
 
-fn coalesced_reasons(
-    raw_reasons: Vec<ReconcileReason>,
-    diagnostic_reason: &str,
-) -> Vec<ReconcileReason> {
+/// Each reason of `raw_reasons` this build knows, once, in order; a value a
+/// newer build added is dropped. With none left, the reasons the diagnostic
+/// text names, as for a row from before the array, and a trigger with none
+/// still fires with that text.
+fn coalesced_reasons(raw_reasons: Vec<String>, diagnostic_reason: &str) -> Vec<ReconcileReason> {
     let mut seen = BTreeSet::new();
     let reasons = raw_reasons
-        .into_iter()
+        .iter()
+        .filter_map(|reason| ReconcileReason::parse(reason))
         .filter(|reason| seen.insert(*reason))
         .collect::<Vec<_>>();
     if reasons.is_empty() {
