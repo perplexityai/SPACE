@@ -433,6 +433,11 @@ pub struct SandboxHealth {
     /// sandbox cannot repeat them more often than
     /// `diagnostics::CONSOLE_TAIL_MIN_INTERVAL`.
     last_console_tail_at: Option<Instant>,
+    /// Opened when a probe result moves guest health to `Degraded`, and
+    /// closed by the next probe result that finds it `Healthy`, whether or
+    /// not that result changed it, so the recovery event can say how long the
+    /// episode lasted.
+    guest_unresponsive: Option<diagnostics::GuestUnresponsiveEpisode>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -870,6 +875,7 @@ impl SandboxWatchdog {
             next_health_probe_at: now + initial_health_probe_delay(&id),
             health_probe_sequence: 0,
             last_console_tail_at: None,
+            guest_unresponsive: None,
         });
     }
 

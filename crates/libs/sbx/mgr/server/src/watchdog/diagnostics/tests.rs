@@ -109,6 +109,194 @@ async fn only_degrading_transitions_gather_evidence_and_console_tails_are_rate_l
     );
 }
 
+#[tokio::test]
+async fn guest_health_episode_emits_unresponsive_then_recovered_events() {
+    use tracing_subscriber::layer::SubscriberExt as _;
+
+    let sandbox_id = pplx_space_common_core::types::SandboxId::new().to_string();
+    let state = Arc::new(Mutex::new(HashMap::from([(
+        sandbox_id.clone(),
+        test_health(),
+    )])));
+    let db = crate::db::SharedConnection::new(crate::db::test_conn());
+    let queue = EvidenceQueue::new(admission::EVIDENCE_QUEUE_CAPACITY);
+    let capture = crate::service::tests::service_tests::SandboxEventCapture::default();
+    let _subscriber =
+        tracing::subscriber::set_default(tracing_subscriber::registry().with(capture.clone()));
+    let mut emitted = Vec::new();
+    for guest in [
+        HealthProbeOutcome::Success,
+        HealthProbeOutcome::Success,
+        HealthProbeOutcome::Timeout,
+        HealthProbeOutcome::Timeout,
+        HealthProbeOutcome::Timeout,
+        HealthProbeOutcome::Timeout,
+        HealthProbeOutcome::Success,
+        HealthProbeOutcome::Success,
+    ] {
+        if let Some(transition) = apply_guest_outcome(&state, &db, &sandbox_id, guest).await {
+            report_transition(&queue, &transition);
+        }
+        emitted.push(std::mem::take(&mut *capture.events.lock().unwrap()));
+    }
+
+    let event_types = emitted
+        .iter()
+        .map(|events| {
+            events
+                .iter()
+                .map(|event| event["event_type"].as_str())
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let none = Vec::<&str>::new();
+    assert_eq!(
+        event_types,
+        vec![
+            none.clone(),
+            // The composed status changes here, but guest health does not.
+            none.clone(),
+            none.clone(),
+            none.clone(),
+            vec!["guest_unresponsive"],
+            none.clone(),
+            vec!["guest_recovered"],
+            none,
+        ]
+    );
+
+    let field =
+        |event: &std::collections::BTreeMap<String, String>, name: &str| event.get(name).cloned();
+    let unresponsive = &emitted[4][0];
+    assert_eq!(field(unresponsive, "sandbox_id"), Some(sandbox_id.clone()));
+    assert_eq!(
+        field(unresponsive, "consecutive_failures").as_deref(),
+        Some("3")
+    );
+    assert_eq!(field(unresponsive, "result").as_deref(), Some("timeout"));
+    assert_eq!(
+        field(unresponsive, "lifecycle_state").as_deref(),
+        Some("started")
+    );
+    assert!(
+        field(unresponsive, "age_secs").is_some_and(|age| !age.is_empty()),
+        "the guest answered before it degraded"
+    );
+    let recovered = &emitted[6][0];
+    assert_eq!(field(recovered, "sandbox_id"), Some(sandbox_id.clone()));
+    // The failure after the event still counts toward the episode.
+    assert_eq!(
+        field(recovered, "consecutive_failures").as_deref(),
+        Some("4")
+    );
+    assert!(field(recovered, "elapsed_ms").is_some_and(|elapsed| !elapsed.is_empty()));
+    assert!(
+        state.lock().await[&sandbox_id].guest_unresponsive.is_none(),
+        "recovery closes the episode"
+    );
+}
+
+/// The sidecar sweep, not the probe, writes `spaced_host_alive`, and each
+/// probe result compares against the state the sweep already updated. A stall
+/// that outlives a spaced-host restart therefore never shows the probe a
+/// `Degraded` to `Healthy` change; the healthy probe after it must still close
+/// the episode, or the next stall goes unreported.
+#[tokio::test]
+async fn guest_health_episode_closes_when_a_probe_finds_the_guest_healthy_after_a_sweep() {
+    let sandbox_id = pplx_space_common_core::types::SandboxId::new().to_string();
+    let state = Arc::new(Mutex::new(HashMap::from([(
+        sandbox_id.clone(),
+        test_health(),
+    )])));
+    let db = crate::db::SharedConnection::new(crate::db::test_conn());
+    let set_spaced_host_alive = async |alive| {
+        state
+            .lock()
+            .await
+            .get_mut(&sandbox_id)
+            .expect("registered sandbox")
+            .spaced_host_alive = alive;
+    };
+    let guest_event = async |guest| {
+        apply_guest_outcome(&state, &db, &sandbox_id, guest)
+            .await
+            .and_then(|transition| transition.guest_health_event())
+            .map(|(event_type, _)| event_type)
+    };
+
+    let mut stall = Vec::new();
+    for _ in 0..3 {
+        stall.push(guest_event(HealthProbeOutcome::Timeout).await);
+    }
+    assert_eq!(
+        stall,
+        vec![None, None, Some(SandboxEventType::GuestUnresponsive)]
+    );
+
+    set_spaced_host_alive(false).await;
+    assert_eq!(
+        guest_event(HealthProbeOutcome::Success).await,
+        None,
+        "the guest is still degraded while spaced-host is down"
+    );
+
+    set_spaced_host_alive(true).await;
+    assert_eq!(
+        guest_event(HealthProbeOutcome::Success).await,
+        Some(SandboxEventType::GuestRecovered)
+    );
+    assert!(
+        state.lock().await[&sandbox_id].guest_unresponsive.is_none(),
+        "recovery closes the episode"
+    );
+
+    let mut stall = Vec::new();
+    for _ in 0..3 {
+        stall.push(guest_event(HealthProbeOutcome::Timeout).await);
+    }
+    assert_eq!(
+        stall,
+        vec![None, None, Some(SandboxEventType::GuestUnresponsive)],
+        "a later stall opens its own episode"
+    );
+}
+
+/// The episode rule on its own, with the categories one probe result can
+/// compare. The sweep, not the probe, changes `runtime_alive`, so a probe
+/// never sees guest health move into or out of `Unreachable`.
+#[test]
+fn guest_health_episode_opens_on_a_change_to_degraded_and_closes_on_healthy() {
+    use GuestHealthCategory::{Degraded, Healthy, Unreachable};
+
+    let start = Instant::now();
+    let mut episode = None;
+    let mut edge = |previous, current, failures, at| {
+        GuestHealthEdge::observe(&mut episode, previous, current, failures, at)
+    };
+    // A stall that begins while guest health is already `Degraded`, as when
+    // spaced-host is down, is not reported.
+    assert_eq!(edge(Degraded, Degraded, 3, start), None);
+    assert_eq!(edge(Healthy, Healthy, 0, start), None);
+    assert_eq!(
+        edge(Healthy, Degraded, 3, start),
+        Some(GuestHealthEdge::Unresponsive {
+            consecutive_failures: 3
+        })
+    );
+    assert_eq!(edge(Degraded, Degraded, 4, start), None);
+    assert_eq!(edge(Unreachable, Unreachable, 4, start), None);
+    // Recovery is timed from the episode's start, whether or not this probe
+    // changed guest health.
+    assert_eq!(
+        edge(Healthy, Healthy, 0, start + Duration::from_secs(90)),
+        Some(GuestHealthEdge::Recovered {
+            peak_consecutive_failures: 3,
+            unresponsive_for: Duration::from_secs(90),
+        })
+    );
+    assert_eq!(edge(Healthy, Healthy, 0, start), None);
+}
+
 #[derive(Clone, Copy)]
 enum FakeGuest {
     Acknowledge,
