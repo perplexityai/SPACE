@@ -73,10 +73,12 @@ fn sync_guest_clock_impl(_host_time: prost_types::Timestamp) -> Result<ClockSync
     ))
 }
 
-fn parse_mem_total_bytes(meminfo: &str) -> Option<u64> {
+/// The first `/proc/meminfo` line starting with `label`, a count of `kB`, in
+/// bytes.
+fn parse_meminfo_bytes(meminfo: &str, label: &str) -> Option<u64> {
     let mut fields = meminfo
         .lines()
-        .find(|line| line.starts_with("MemTotal:"))?
+        .find(|line| line.starts_with(label))?
         .split_ascii_whitespace();
     let _label = fields.next()?;
     let kibibytes = fields.next()?.parse::<u64>().ok()?;
@@ -85,10 +87,29 @@ fn parse_mem_total_bytes(meminfo: &str) -> Option<u64> {
         .flatten()
 }
 
+fn parse_mem_total_bytes(meminfo: &str) -> Option<u64> {
+    parse_meminfo_bytes(meminfo, "MemTotal:")
+}
+
+/// `MemTotal - MemAvailable` of one read, in bytes. `None` when either is
+/// missing or malformed, the total is zero, or more is available than the
+/// total.
+fn parse_memory_used_bytes(meminfo: &str) -> Option<u64> {
+    let total = parse_mem_total_bytes(meminfo).filter(|&total| total > 0)?;
+    let available = parse_meminfo_bytes(meminfo, "MemAvailable:")?;
+    total.checked_sub(available)
+}
+
+fn read_meminfo() -> Option<String> {
+    std::fs::read_to_string("/proc/meminfo").ok()
+}
+
 pub(crate) fn guest_mem_total_bytes() -> Option<u64> {
-    std::fs::read_to_string("/proc/meminfo")
-        .ok()
-        .and_then(|meminfo| parse_mem_total_bytes(&meminfo))
+    read_meminfo().and_then(|meminfo| parse_mem_total_bytes(&meminfo))
+}
+
+pub(crate) fn guest_memory_used_bytes() -> Option<u64> {
+    read_meminfo().and_then(|meminfo| parse_memory_used_bytes(&meminfo))
 }
 
 fn guest_vcpu_count() -> Option<u32> {
@@ -220,8 +241,16 @@ impl BridgeGuestMeta for SpacedGuestService {
         if !request.into_inner().drain_diagnostics {
             return Ok(Response::new(BridgeGuestPingResponse::default()));
         }
+        // Only the watchdog requests diagnostics; readiness and connection
+        // checks need no memory read. Unavailable telemetry never fails Ping.
+        let read_memory = self.inner.guest_memory_used_source;
+        let memory_used_bytes = tokio::task::spawn_blocking(read_memory)
+            .await
+            .ok()
+            .flatten();
         let drained = pplx_space_observability::warning_tap::drain();
         Ok(Response::new(BridgeGuestPingResponse {
+            memory_used_bytes,
             diagnostics: drained
                 .callsites
                 .into_iter()

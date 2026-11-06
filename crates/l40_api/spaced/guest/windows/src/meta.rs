@@ -28,6 +28,7 @@ impl meta_server::Meta for Meta {
         Ok(Response::new(PingResponse {
             diagnostics: vec![],
             diagnostics_dropped: 0,
+            memory_used_bytes: None,
         }))
     }
     async fn wait_ready(

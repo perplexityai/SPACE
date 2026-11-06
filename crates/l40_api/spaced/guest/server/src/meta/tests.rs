@@ -45,3 +45,48 @@ async fn cancelled_flush_retains_execution_slot_until_worker_finishes() {
         .await
         .expect("settled flush releases admission");
 }
+
+/// Only diagnostic-draining Pings read memory; an unavailable reading does
+/// not fail the health check.
+/// The handler is called directly because a drain takes the process-wide
+/// warning record, which another test in the same binary may be reading.
+#[tokio::test]
+async fn bridge_ping_reports_used_memory_without_depending_on_it() {
+    let sources: [fn() -> Option<u64>; 5] = [
+        || Some(512 << 20),
+        || Some(0),
+        || None,
+        || panic!("memory reader failed"),
+        || panic!("non-draining Ping must not read memory"),
+    ];
+    for (source, (drain_diagnostics, expected)) in sources.into_iter().zip([
+        (true, Some(512 << 20)),
+        (true, Some(0)),
+        (true, None),
+        (true, None),
+        (false, None),
+    ]) {
+        let service = SpacedGuestService::with_config(
+            CancellationToken::new(),
+            SpacedGuestServiceConfig {
+                host_connector_type: HostConnectorType::Uds(PathBuf::from("unused.sock")),
+                local_socket_path: None,
+                bridge_socket_path: None,
+                guest_memory_used_source: source,
+                ..Default::default()
+            },
+        )
+        .expect("guest service");
+        let response = BridgeGuestMeta::ping(
+            &service,
+            Request::new(BridgeGuestPingRequest { drain_diagnostics }),
+        )
+        .await
+        .expect("ping succeeds")
+        .into_inner();
+        assert_eq!(
+            response.memory_used_bytes, expected,
+            "drain_diagnostics={drain_diagnostics}"
+        );
+    }
+}
