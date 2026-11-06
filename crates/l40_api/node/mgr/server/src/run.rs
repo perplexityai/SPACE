@@ -22,7 +22,7 @@ use tokio_util::task::TaskTracker;
 #[cfg(target_os = "linux")]
 use crate::disk_io_reservation::AwsImdsInstanceTypeProvider;
 use crate::disk_io_reservation::DiskIoReservationConfig;
-use crate::memory_admission::MemoryAdmissionConfig;
+use crate::memory_admission::{MAX_MEMORY_ADMISSION_COMMIT_PERCENT, MemoryAdmissionConfig};
 use crate::proto::node_manager_server::NodeManagerServer;
 use crate::service::NodeManagerService;
 use crate::slot_pool::{
@@ -168,6 +168,8 @@ pub enum RunNodeMgrError {
         #[source]
         source: ServicePortIngressIsolationParseError,
     },
+    #[error("memory_admission.commit_percent must be at most 100, got {commit_percent}")]
+    MemoryAdmissionCommitPercentAbove100 { commit_percent: u64 },
     #[error("sandbox_cgroup.vcpu_count must be greater than 0")]
     SandboxCgroupVcpuCountZero,
     #[error(
@@ -260,6 +262,7 @@ struct SandboxCgroupFileConfig {
 #[serde(default, deny_unknown_fields)]
 struct MemoryAdmissionFileConfig {
     reserve_mib: Option<u64>,
+    commit_percent: Option<u64>,
 }
 
 fn read_node_config(path: &Path) -> Result<NodeConfig, RunNodeMgrError> {
@@ -469,7 +472,7 @@ fn resolve_memory_admission_config(
     cli: &NodeMgrRunConfig,
     file: &MemoryAdmissionFileConfig,
 ) -> Result<MemoryAdmissionConfig, RunNodeMgrError> {
-    Ok(MemoryAdmissionConfig {
+    let config = MemoryAdmissionConfig {
         reserve_mib: setting(
             "memory_admission.reserve_mib",
             cli.memory_admission_reserve_mib,
@@ -477,7 +480,20 @@ fn resolve_memory_admission_config(
             file.reserve_mib,
             MemoryAdmissionConfig::default().reserve_mib,
         ),
-    })
+        commit_percent: setting(
+            "memory_admission.commit_percent",
+            None,
+            None,
+            file.commit_percent,
+            MemoryAdmissionConfig::default().commit_percent,
+        ),
+    };
+    if config.commit_percent > MAX_MEMORY_ADMISSION_COMMIT_PERCENT {
+        return Err(RunNodeMgrError::MemoryAdmissionCommitPercentAbove100 {
+            commit_percent: config.commit_percent,
+        });
+    }
+    Ok(config)
 }
 
 fn resolve_disk_io_reservation_config(
@@ -842,6 +858,7 @@ pub async fn run(
             sandbox_guest_memory_max_mib,
             sandbox_memory_headroom_mib,
             memory_admission_reserve_mib = memory_admission_config.reserve_mib,
+            memory_admission_commit_percent = memory_admission_config.commit_percent,
             sandbox_cgroup_parent_cpu_reserved_count = sandbox_parent_cpu_limit.reserved_count,
             sandbox_cgroup_parent_cpu_max = sandbox_parent_cpu_limit.cpu_max,
             host_memory_bytes = sandbox_parent_memory_limit.host_memory_bytes,

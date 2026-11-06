@@ -533,7 +533,7 @@ pub(super) mod service_tests {
         let mut service = service_for_unit_tests().await;
         service.pool = NetworkPool::open_in_memory_for_test(NetworkPoolConfig::new(2));
         service.pool.set_all_slots_ready_for_test();
-        service.memory_admission_config = MemoryAdmissionConfig { reserve_mib: 1024 };
+        service.memory_admission_config = MemoryAdmissionConfig::default();
         service.memory_admission_sources = MemoryAdmissionSources::new(meminfo_path, cgroup_base);
         let first_id = SandboxId::from_str("019d84bd-280d-7331-99c6-b63377f3a3a2").unwrap();
         let second_id = SandboxId::from_str("019d84bd-280d-7331-99c6-b63377f3b4b5").unwrap();

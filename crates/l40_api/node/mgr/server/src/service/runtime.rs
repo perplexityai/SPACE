@@ -318,6 +318,25 @@ impl NodeManagerService {
                             "rejecting new sandbox allocation because measured memory demand exceeds node capacity"
                         );
                     }
+                    MemoryAdmissionError::InsufficientParentCgroupCapacity {
+                        parent_cgroup_used_mib,
+                        parent_cgroup_max_mib,
+                        existing_growth_reserve_mib,
+                        sandbox_cgroup_memory_mib,
+                        reserve_mib,
+                        required_mib,
+                    } => {
+                        tracing::info!(
+                            sandbox_id = %sandbox_id,
+                            parent_cgroup_used_mib,
+                            existing_growth_reserve_mib,
+                            sandbox_cgroup_memory_mib,
+                            reserve_mib,
+                            required_mib,
+                            parent_cgroup_max_mib,
+                            "rejecting new sandbox allocation because measured memory demand exceeds the sandbox parent cgroup limit"
+                        );
+                    }
                     MemoryAdmissionError::RequirementOverflow {
                         node_used_mib,
                         existing_growth_reserve_mib,
@@ -340,7 +359,10 @@ impl NodeManagerService {
                 // A capacity refusal is normal operation. An overflow means the
                 // reservation state is corrupt or saturated, so it stays a WARN.
                 let details = match &error {
-                    MemoryAdmissionError::InsufficientCapacity { .. } => details.routine(),
+                    MemoryAdmissionError::InsufficientCapacity { .. }
+                    | MemoryAdmissionError::InsufficientParentCgroupCapacity { .. } => {
+                        details.routine()
+                    }
                     MemoryAdmissionError::RequirementOverflow { .. } => details,
                 };
                 SandboxEvent::new(
