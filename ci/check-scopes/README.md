@@ -25,7 +25,7 @@ What counts as the change:
   makes the check run, so an omission costs time, never coverage.
 - `<scope>.run` lists the only paths the check reads, and the check runs when
   a changed path matches one of them. Use it only for a check whose inputs
-  are self-contained: today, the Go shim.
+  are self-contained: today, the Go shim and the admin console.
 - `run-all.txt` lists paths that make every check run: the workflows, the CI
   scripts, these files and the CI image's inputs.
 - The scope `always`, used by the two documentation jobs, has no file: those

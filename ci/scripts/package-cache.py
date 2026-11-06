@@ -76,9 +76,14 @@ KEY_PREFIX = "space-packages-v1-"
 FAMILIES = {
     "cargo": ("Cargo.lock",),
     "go": ("shim/go.mod", "shim/go.sum"),
-    # The SPACE Guide job installs both: the docs' Mermaid bundle and the
-    # console loop's checks.
-    "npm": ("docs/api/package-lock.json", "scripts/console-loop/package-lock.json"),
+    # The SPACE Guide job, which saves this cache, installs all three: the
+    # docs' Mermaid bundle, the console loop's checks and, on main, the admin
+    # console's packages, which the console job installs on every run.
+    "npm": (
+        "docs/api/package-lock.json",
+        "scripts/console-loop/package-lock.json",
+        "ui/package-lock.json",
+    ),
     "uv-python": ("uv.lock", "pyproject.toml", "ci/scripts/run-python-tests.sh"),
     "uv-shell": (
         "uv.lock",

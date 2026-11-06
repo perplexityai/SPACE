@@ -163,6 +163,15 @@ jobs:
           npm run typecheck
           npm test
 
+      # The console job installs ui/'s packages from this cache but does not
+      # save it, so on main this job fetches them too, and a copy it saves
+      # holds them.
+      - name: Fetch the console's packages
+        if: >-
+          ${{ steps.scope.outputs.needed == 'true' && (github.event_name == 'push' && github.ref == 'refs/heads/main') }}
+        working-directory: ui
+        run: npm ci --ignore-scripts --no-fund --no-audit
+
       - name: Report the npm cache
         id: report-npm-cache
         if: ${{ steps.scope.outputs.needed == 'true' && (always()) }}
@@ -183,7 +192,7 @@ jobs:
           PACKAGE_CACHE: ${{ runner.temp }}/space-ci-helpers/package-cache.py
         run: >-
           python3 -I "${PACKAGE_CACHE}" trim npm "${HOME}/.npm"
-          docs/api/package-lock.json scripts/console-loop/package-lock.json
+          docs/api/package-lock.json scripts/console-loop/package-lock.json ui/package-lock.json
 
       - name: Save the npm cache
         if: ${{ steps.scope.outputs.needed == 'true' && (steps.prepare-npm-upload.outcome == 'success') }}
@@ -191,6 +200,90 @@ jobs:
         with:
           path: ~/.npm
           key: ${{ steps.npm-cache-key.outputs.key }}
+
+  # The admin console's unit tests, type check and production build. Two
+  # console changes can each pass alone and break the console together; this
+  # catches that before the merge. The build needs no network or secrets: its
+  # API rewrites default to local addresses.
+  console:
+    if: github.repository == 'perplexityai/SPACE'
+    name: Admin console
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    env:
+      NEXT_TELEMETRY_DISABLED: '1'
+    steps:
+      - name: Check out SPACE
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Pull CI and the merge queue skip a check the change cannot affect,
+      # and Main CI, which passes no base, runs it (ci/check-scopes/README.md).
+      - name: Decide whether this change needs the check
+        id: scope
+        shell: bash
+        env:
+          SCOPE: console
+          SCOPE_BASE: ${{ inputs.scope_base }}
+          # Set only for pull requests, whose change is the synthetic merge
+          # against its first parent.
+          PULL_REQUEST_HEAD: ${{ github.event.pull_request.head.sha }}
+        # Only an explicit answer reaches the gates: anything else fails.
+        run: |
+          set -euo pipefail
+          decision="$(bash ci/scripts/check-needed.sh "${SCOPE}" "${SCOPE_BASE}" "${PULL_REQUEST_HEAD}")"
+          if [[ ! "${decision}" =~ ^needed=(true|false)($'\n'base=[0-9a-f]{40})?$ ]]; then
+            echo "check-needed.sh answered '${decision}'" >&2
+            exit 1
+          fi
+          printf '%s\n' "${decision}" >>"${GITHUB_OUTPUT}"
+
+      - *copy-package-cache-helper
+
+      # The Node version the console image builds with (docker/Dockerfile.ui).
+      # The SPACE Guide saves the npm cache this job restores.
+      - name: Set up Node
+        if: steps.scope.outputs.needed == 'true'
+        uses: actions/setup-node@6044e13b5dc448c55e2357c09f80417699197238 # v6.2.0
+        with:
+          node-version: '22.23.3'
+
+      - *name-npm-cache
+
+      - *restore-npm-cache
+
+      - *prepare-npm-cache
+
+      - name: Install the console's packages
+        if: steps.scope.outputs.needed == 'true'
+        working-directory: ui
+        run: npm ci --ignore-scripts --no-fund --no-audit
+
+      - name: Run the console's unit tests
+        if: steps.scope.outputs.needed == 'true'
+        working-directory: ui
+        run: npm test
+
+      # --no-install: without the installed TypeScript, npx would fetch the
+      # unrelated `tsc` package instead of failing.
+      - name: Type-check the console
+        if: steps.scope.outputs.needed == 'true'
+        working-directory: ui
+        run: npx --no-install tsc --noEmit -p .
+
+      - name: Build the console
+        if: steps.scope.outputs.needed == 'true'
+        working-directory: ui
+        run: npm run build
+
+      - name: Report the npm cache
+        if: ${{ steps.scope.outputs.needed == 'true' && (always()) }}
+        env:
+          PACKAGE_CACHE: ${{ runner.temp }}/space-ci-helpers/package-cache.py
+        run: python3 -I "${PACKAGE_CACHE}" report npm "${HOME}/.npm"
 
   api_reference:
     if: github.repository == 'perplexityai/SPACE'
