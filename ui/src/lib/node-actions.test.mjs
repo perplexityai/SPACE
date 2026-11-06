@@ -10,6 +10,7 @@ const forced = (node, substrate = 'k8s') => nodeActions(node, substrate).find((a
 
 test('an idle worker offers cordon, uncordon, a gentle drain and a forced drain', () => {
   assert.deepEqual(labels(node()), ['Cordon', 'Uncordon', 'Drain', 'Forced drain']);
+  assert.deepEqual(names(node()), ['cordon', 'uncordon', 'drain', 'drain']);
   const drain = nodeActions(node(), 'k8s').find((a) => a.label === 'Drain');
   assert.deepEqual(drain.body, { mode: 'gentle' });
   assert.ok(drain.confirm.includes(DRAIN_TERMINATES));

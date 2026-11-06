@@ -14,7 +14,7 @@ import { TERMINAL_OPERATION_STATES } from './api.ts';
 import { verifyFixtures } from './fixtures.ts';
 import { SYNTHETIC_HEADER } from './recorder.ts';
 import { orgDisplayName, recordCreated } from './seed.ts';
-import { DRAIN_KEEP_ANNOTATION, KindNodes, drainCandidate, type AdminNode } from './nodes.ts';
+import { DRAIN_KEEP_ANNOTATION, DRAIN_KEEP_VALUE, KindNodes, drainCandidate, type AdminNode } from './nodes.ts';
 
 export interface Step {
   name: string;
@@ -1354,11 +1354,12 @@ async function waitForUnschedulable(c: Ctx, kube: KindNodes, name: string, want:
 
 // Cordons and uncordons the worker through the API and checks that the
 // cordon shows up on the Node the kube context reads, which shows the context
-// and the API are one cluster. The uncordon runs whatever happens, so the
-// probe never leaves the worker cordoned.
+// and the API are one cluster. The uncordon is sent on every path once the
+// cordon has been; if it is refused or does not reach the Node, the step fails
+// and the worker may stay cordoned.
 async function cordonReachesNode(c: Ctx, node: AdminNode, kube: KindNodes): Promise<boolean> {
   const name = node.k8s_node_name!;
-  if (kube.unschedulable(name)) {
+  if (node.cordoned === true || kube.unschedulable(name)) {
     c.rec.check(false, 'the worker is already cordoned');
     return false;
   }
@@ -1379,8 +1380,9 @@ async function cordonReachesNode(c: Ctx, node: AdminNode, kube: KindNodes): Prom
 }
 
 // Picks a worker, proves the kube context reads the API's cluster, sets the
-// drain-keep override unless the Node already has one, runs `body`, then
-// undrains it if it is still in a drain phase and drops the override it set.
+// drain-keep override unless the Node already has one the loop did not set,
+// runs `body`, then undrains it if it is still in a drain phase and drops the
+// override it set.
 // Records why when there is no worker it may drain; that is not a pass.
 async function withDrainableWorker(c: Ctx, body: (node: AdminNode, kube: KindNodes) => Promise<void>): Promise<void> {
   const picked = drainCandidate(await adminNodes(c));
@@ -1394,7 +1396,10 @@ async function withDrainableWorker(c: Ctx, body: (node: AdminNode, kube: KindNod
   kube.requireLocalNode(name);
   if (!(await cordonReachesNode(c, node, kube))) return;
   c.rec.note(`draining worker ${name} (${node.id}), which holds no sandboxes`);
-  const keptBefore = kube.drainKeep(name);
+  // DRAIN_KEEP_VALUE is the loop's own, left by an interrupted run.
+  const found = kube.drainKeep(name);
+  const keptBefore = found === DRAIN_KEEP_VALUE ? null : found;
+  if (found === DRAIN_KEEP_VALUE) c.rec.note(`${name} carries ${DRAIN_KEEP_ANNOTATION}=${found} from an earlier run; this step removes it at the end`);
   if (keptBefore === null) kube.setDrainKeep(name);
   else c.rec.note(`${name} already carries ${DRAIN_KEEP_ANNOTATION}=${keptBefore}; it is left as it is`);
   try {

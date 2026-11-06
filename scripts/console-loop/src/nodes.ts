@@ -22,6 +22,7 @@ export interface AdminNode {
   drain_phase: string | null;
   drain_mode: string | null;
   k8s_node_name: string | null;
+  cordoned: boolean | null;
   sandboxes_active: number | null;
   sandboxes_local_snapshots: number | null;
 }
