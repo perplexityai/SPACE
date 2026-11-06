@@ -52,15 +52,17 @@ async fn cancelled_flush_retains_execution_slot_until_worker_finishes() {
 /// warning record, which another test in the same binary may be reading.
 #[tokio::test]
 async fn bridge_ping_reports_used_memory_without_depending_on_it() {
-    let sources: [fn() -> Option<u64>; 4] = [
+    let sources: [fn() -> Option<u64>; 5] = [
         || Some(512 << 20),
         || Some(0),
         || None,
+        || panic!("memory reader failed"),
         || panic!("non-draining Ping must not read memory"),
     ];
     for (source, (drain_diagnostics, expected)) in sources.into_iter().zip([
         (true, Some(512 << 20)),
         (true, Some(0)),
+        (true, None),
         (true, None),
         (false, None),
     ]) {

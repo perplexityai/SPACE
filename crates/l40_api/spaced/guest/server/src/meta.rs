@@ -243,7 +243,11 @@ impl BridgeGuestMeta for SpacedGuestService {
         }
         // Only the watchdog requests diagnostics; readiness and connection
         // checks need no memory read. Unavailable telemetry never fails Ping.
-        let memory_used_bytes = (self.inner.guest_memory_used_source)();
+        let read_memory = self.inner.guest_memory_used_source;
+        let memory_used_bytes = tokio::task::spawn_blocking(read_memory)
+            .await
+            .ok()
+            .flatten();
         let drained = pplx_space_observability::warning_tap::drain();
         Ok(Response::new(BridgeGuestPingResponse {
             memory_used_bytes,
