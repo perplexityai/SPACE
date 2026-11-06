@@ -262,6 +262,9 @@ pub(crate) struct ProcessSseState {
     /// `resync_required(cursor_out_of_window)` was sent and no output has
     /// followed it, so another gap before any output is the same one.
     gap_reported: bool,
+    /// The stream skipped output the guest wrote, which its
+    /// `process_exited` reports as `output_truncated`.
+    output_skipped: bool,
     /// The stream moved to the oldest output the guest retains after an
     /// eviction, and no output has followed. Falling behind again before any
     /// does is a race the stream keeps losing, so it follows the live tail.
@@ -547,6 +550,7 @@ impl ProcessSseState {
             binding: None,
             started_sent: false,
             gap_reported: false,
+            output_skipped: false,
             at_oldest_retained: false,
             window_reopens_without_progress: 0,
             revocation_tick,
@@ -576,6 +580,12 @@ impl ProcessSseState {
             to = ?position,
             "process event stream continues after an output gap"
         );
+        // A restart from the start of the output repeats output rather than
+        // skipping it; the live tail, or a later position, skips some.
+        self.output_skipped |= match (self.backend_output_cursor, position) {
+            (Some(from), Some(to)) => to > from,
+            _ => true,
+        };
         self.backend_output_cursor = position;
         if let Some(position) = position {
             self.output_seq = position;
@@ -589,10 +599,13 @@ impl ProcessSseState {
         }
     }
 
-    fn push_frame(&mut self, frame: DataPlaneServerFrame) {
-        match frame {
+    fn push_frame(&mut self, mut frame: DataPlaneServerFrame) {
+        match &mut frame {
             DataPlaneServerFrame::ProcessStarted { .. } if self.started_sent => return,
             DataPlaneServerFrame::ProcessStarted { .. } => self.started_sent = true,
+            DataPlaneServerFrame::ProcessExited {
+                output_truncated, ..
+            } => *output_truncated = self.output_skipped,
             _ => {}
         }
         let id = process_frame_has_event_id(&frame).then(|| {

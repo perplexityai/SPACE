@@ -960,6 +960,13 @@ pub enum DataPlaneServerFrame {
         process_id: String,
         exit_code: i32,
         status: DataPlaneProcessExitStatus,
+        /// Whether this stream skipped output the process wrote: since it
+        /// opened, it sent `resync_required` with reason
+        /// `cursor_out_of_window` or `process_stream_reconnected`, so the
+        /// output it delivered is missing some. The exit result alone does
+        /// not say the output is whole. Older data planes omit it.
+        #[cfg_attr(feature = "serde", serde(default))]
+        output_truncated: bool,
     },
     FileEvent {
         seq: u64,

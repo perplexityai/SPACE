@@ -3919,6 +3919,7 @@ fn process_events_map_to_native_data_plane_frames() {
                 process_id: "proc-1".to_string(),
                 exit_code,
                 status,
+                output_truncated: false,
             }]
         );
     }
@@ -3986,6 +3987,7 @@ fn process_output_frames_are_the_only_backend_cursor_frames() {
             process_id: "proc-1".to_string(),
             exit_code: 0,
             status: DataPlaneProcessExitStatus::Exited,
+            output_truncated: false,
         }
     ));
     assert!(!process_frame_advances_backend_cursor(
