@@ -73,9 +73,6 @@ pplx-space-common-core = [
   "pplx-space-k8s-ids/sqlx",
   "pplx-space-semver/sqlx",
 ]
-pplx-space-common-svc = [
-  "pplx-space-common-core/sqlx",
-]
 pplx-space-credmgr = [
   "pplx-space-common-core/sqlx",
 ]
@@ -103,13 +100,9 @@ pplx-space-common-svc = [
   "pplx-space-auto-lifecycle-receipt",
   "pplx-space-common-core",
   "pplx-space-ecw-credential",
-  "pplx-space-federated-grant-store",
   "pplx-space-federated-identity",
   "pplx-space-ingress-admission",
   "pplx-space-k8s-node-id",
-  "pplx-space-node-registration-store",
-  "pplx-space-sandbox-quarantine-store",
-  "pplx-space-sandbox-routability",
   "pplx-space-state-reconciliation",
 ]
 pplx-space-metrics = [
@@ -170,9 +163,7 @@ pplx-space-common-core = [
   "sqlx",
 ]
 pplx-space-common-svc = [
-  "pplx-space-postgres-contention",
   "pplx-space-valkey",
-  "sqlx",
 ]
 pplx-space-credmgr = [
   "sqlx",

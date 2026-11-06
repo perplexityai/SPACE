@@ -14,10 +14,8 @@ use pplx_space_common_core::types::{NodeId, SandboxId, SubstrateKind};
 use std::time::Duration;
 
 use pplx_space_common_core::sql;
-use pplx_space_common_svc::sql::sandbox_residency::{
-    CENSUS_INVENTORY_MAX_AGE, CENSUS_PLACEMENT_SETTLE,
-};
 use pplx_space_db_test_fixtures::try_pg_test_db;
+use pplx_space_sandbox_residency::{CENSUS_INVENTORY_MAX_AGE, CENSUS_PLACEMENT_SETTLE};
 use sqlx::PgPool;
 
 use super::{

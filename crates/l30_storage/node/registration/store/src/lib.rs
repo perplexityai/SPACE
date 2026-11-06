@@ -2,8 +2,7 @@
 //!
 //! The registration check on `node_k8s`: whether a Kubernetes node name and
 //! UID map to a SPACE node. Other `node_k8s` reads and its writers stay with
-//! their callers. It is its own crate so a caller can make the check without
-//! `pplx-space-common-svc`, which re-exports it as `sql::node_registration`.
+//! their callers.
 
 use pplx_space_common_core::types::{K8sNodeName, K8sNodeUid, NodeId};
 use pplx_space_sql_locator::sql;

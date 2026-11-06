@@ -620,7 +620,7 @@ const TRANSIENT_SQLSTATES: &[&str] = &[
     // sqlx-postgres 0.9.0 has no handling for it (`clear_cached_statements` is
     // an explicit `Connection` method nothing calls here), so a poisoned
     // connection keeps raising it until the pool recycles it. That bound is set
-    // by `postgres_pool_options` (`common/svc/src/sql/mod.rs:214`), which this
+    // by `postgres_pool_options` (`postgres/pool/src/lib.rs:235`), which this
     // pool goes through and which overrides *both* of sqlx's defaults: idle
     // connections are reclaimed at `DEFAULT_IDLE_TIMEOUT_SECS` (300s), and
     // `max_lifetime` is set to `None` — sqlx's acquire-time enforcement is

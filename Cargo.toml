@@ -122,6 +122,8 @@ members = [
     "crates/l10_foundation/common/work/coalescer",
     "crates/libs/common/svc",
     "crates/l40_api/rpc/auth",
+    "crates/l30_storage/postgres/pool",
+    "crates/l30_storage/sandbox/residency",
     "crates/l10_foundation/content/digest",
     "crates/l10_foundation/cpu/arch",
     "crates/l40_api/data/plane/server",
@@ -456,6 +458,7 @@ pplx-space-cluster-pool = { path = "crates/l30_storage/cluster/pool" }
 pplx-space-cluster-reconciler = { path = "crates/l40_api/cluster/reconciler" }
 pplx-space-cluster-trigger-queue = { path = "crates/l30_storage/cluster/trigger/queue" }
 pplx-space-sandbox-portability = { path = "crates/l30_storage/sandbox/portability" }
+pplx-space-sandbox-residency = { path = "crates/l30_storage/sandbox/residency" }
 pplx-space-sandbox-quarantine-store = { path = "crates/l30_storage/sandbox/quarantine/store" }
 pplx-space-sandbox-routability = { path = "crates/l30_storage/sandbox/routability" }
 pplx-space-sandbox-store = { path = "crates/l30_storage/sandbox/store" }
@@ -469,6 +472,7 @@ pplx-space-sbx-mgr = { path = "crates/l40_api/sbx/mgr/server" }
 pplx-space-sbx-mgr-client = { path = "crates/l40_api/sbx/mgr/client" }
 pplx-space-sbx-mgr-protocol = { path = "crates/l20_domain/sbx/mgr/protocol" }
 pplx-space-sbx-mgr-store = { path = "crates/l30_storage/sbx/mgr/store" }
+pplx-space-postgres-pool = { path = "crates/l30_storage/postgres/pool" }
 pplx-space-rustls-provider = { path = "crates/l10_foundation/rustls/provider" }
 pplx-space-semver = { path = "crates/l10_foundation/semver" }
 pplx-space-sql-locator = { path = "crates/l10_foundation/sql/locator" }

@@ -621,7 +621,7 @@ fn ensure_byok_enable_allowed(
 }
 
 async fn active_kek_provider(
-    credentials_pool: &pplx_space_common_svc::sql::CredentialsPool,
+    credentials_pool: &pplx_space_postgres_pool::CredentialsPool,
     org_id: OrgId,
 ) -> Result<Option<KekProvider>, IdentityAdminError> {
     let provider: Option<String> = sqlx::query_scalar(sql!(

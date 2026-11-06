@@ -147,7 +147,7 @@ postgres:
   bootstrapMigratorPassword: space-dev-migrator
   # POSTGRES_POOL_MAX_CONNECTIONS for space-api and space-admin-api, each of
   # whose two pools (space_user and space_creds) it sizes
-  # (crates/libs/common/svc/src/sql/mod.rs). The api tier runs a pool far
+  # (crates/l30_storage/postgres/pool/src/lib.rs). The api tier runs a pool far
   # above the binary's default of 25, as deployed. The space-postgres chart's
   # max_connections is sized to hold every replica's pools.
   poolMaxConnections: 100

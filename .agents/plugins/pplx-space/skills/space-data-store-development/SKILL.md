@@ -46,7 +46,15 @@ Exemplar: `crates/l30_storage/sandbox/store` (`pplx-space-sandbox-store`, the
   re-spelling it: a second copy of that rule is how deletion paths and drain
   gates drift apart. Build the statement once (a `LazyLock<String>`), bind every
   value, and keep the rest of the statement whole at its query site.
-- The other is the column list of one row type read from one table: a shared
+- Another is a whole fragment from `pplx_space_sandbox_residency`
+  (`occupies_node_predicate`, `resident_lifecycle`,
+  `non_resident_lifecycle_exclusion` and its other gates), the single
+  definition of whether a sandbox row still occupies its node for node-release
+  decisions. Interpolate it as built rather than re-spelling its lifecycle
+  sets: a drain gate and the drained-node terminator that disagree park a node
+  in `drained`. Build the statement once, bind every value, and keep the rest
+  of the statement whole at its query site.
+- The last is the column list of one row type read from one table: a shared
   constant of that table's bare column names, with no expressions, aliases, or
   joined columns, matching one `FromRow` struct field for field. Interpolate it
   only as the entire `SELECT` list of a statement whose only `FROM` item is that

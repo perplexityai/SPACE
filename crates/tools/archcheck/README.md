@@ -799,19 +799,18 @@ so a new table is declared by its owner before its migration lands (see
 ### Limits
 
 - The checks see direct dependencies only. An edge through a re-export, such
-  as `common-svc` re-exporting a store, is not seen until the legacy crates
-  that re-export go. Only `stale_entries` looks one crate further: a store
-  user that depends on a `legacy` crate depending on the store still uses
-  it, so its entry stays.
+  as a `legacy` crate's, is not seen. Only `stale_entries` looks one crate
+  further: a store user that depends on a `legacy` crate depending on the
+  store still uses it, so its entry stays.
 - A Foundation crate that gains a required driver dependency gets a
   `storage_access` finding until it is added to `helpers`, and is no helper
   before: its dependents get `storage_access` findings only once it is
   listed. Stores, other helpers, test support and tools, and
   `l10_foundation` crates whose dependency on it is optional are exempt.
 - `codec_features` reads the feature requests in each crate's own manifest,
-  not the features Cargo unifies for a build. `common-svc` enables
-  `common-core/sqlx`, so its dependents build against `common-core`'s `sqlx`
-  impls whatever they request; one that drops `"sqlx"` from its own
+  not the features Cargo unifies for a build. A crate that enables
+  `common-core/sqlx` makes its dependents build against `common-core`'s
+  `sqlx` impls whatever they request; one that drops `"sqlx"` from its own
   manifest loses its baseline entry, which `stale_entries` reports, but
   keeps the impls.
 - The drivers are a hand-kept list, and `cargo metadata` runs with

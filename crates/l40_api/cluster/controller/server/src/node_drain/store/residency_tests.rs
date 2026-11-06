@@ -13,9 +13,7 @@ use pplx_space_common_core::types::{NodeId, SandboxId};
 
 use std::time::Duration;
 
-use pplx_space_common_svc::sql::sandbox_residency::{
-    CENSUS_INVENTORY_MAX_AGE, CENSUS_PLACEMENT_SETTLE,
-};
+use pplx_space_sandbox_residency::{CENSUS_INVENTORY_MAX_AGE, CENSUS_PLACEMENT_SETTLE};
 
 use super::*;
 

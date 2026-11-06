@@ -17,8 +17,8 @@
 
 use pplx_space_common_core::types::{NodeId, SandboxId};
 
-use pplx_space_common_svc::sql::sandbox_residency::CENSUS_PLACEMENT_SETTLE;
 use pplx_space_placement::StoredSandboxLifecycle;
+use pplx_space_sandbox_residency::CENSUS_PLACEMENT_SETTLE;
 
 use crate::drained_node_terminator::store::mark_terminating_query;
 

@@ -84,9 +84,12 @@ pplx-space-credential-injection-core = { workspace = true }
 pplx-space-credential-injection-store = { workspace = true }
 pplx-space-credential-provider-client = { workspace = true }
 pplx-space-credmgr-client = { workspace = true }
+pplx-space-federated-grant-store = { workspace = true }
 pplx-space-kube-client = { workspace = true }
 pplx-space-metrics = { workspace = true }
 pplx-space-net-common = { workspace = true }
+pplx-space-node-registration-store = { workspace = true }
+pplx-space-postgres-pool = { workspace = true }
 pplx-space-rpc-auth = { workspace = true }
 
 [dev-dependencies]

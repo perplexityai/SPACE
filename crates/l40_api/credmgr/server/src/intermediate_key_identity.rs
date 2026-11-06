@@ -17,7 +17,7 @@
 use pplx_space_common_svc::core::types::{FederatedGrantAudience, OrgId, SandboxId};
 use pplx_space_common_svc::federated_identity::FEDERATED_OWNER_GRANT_PURPOSE;
 use pplx_space_common_svc::sql;
-use pplx_space_common_svc::sql::federated_service_grants::{
+use pplx_space_federated_grant_store::{
     FreshestLiveFederatedGrant, FreshestLiveFederatedGrantError, freshest_live_federated_grant,
     live_federated_grant_prefer_sandbox,
 };

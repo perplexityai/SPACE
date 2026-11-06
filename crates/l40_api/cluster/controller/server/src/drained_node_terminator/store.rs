@@ -6,11 +6,11 @@ use pplx_space_common_core::sql;
 use std::time::Duration;
 
 use pplx_space_common_core::types::SandboxId;
-use pplx_space_common_svc::sql::sandbox_residency::{self, ResidencyEvidence};
 use pplx_space_events::{SandboxEventDetails, SandboxEventTrigger};
 use pplx_space_sandbox_portability::{
     drain_gate_blockers_for_node, snapshot_durable_for_source_release,
 };
+use pplx_space_sandbox_residency::{self as sandbox_residency, ResidencyEvidence};
 use pplx_space_sandbox_store::lost;
 use sqlx::PgPool;
 
@@ -58,7 +58,7 @@ fn snapshot_blockers_for_node() -> String {
 /// [`delete_refusal_diagnostics_query`] (the count form) so the guard and its
 /// diagnosis can't drift.
 ///
-/// The predicate itself lives in `pplx-space-common-svc` because node-drain's
+/// The predicate itself lives in `pplx-space-sandbox-residency` because node-drain's
 /// `draining → drained` advance counts the same rows: a node this guard would
 /// refuse is held in `draining` rather than converging to `drained` and parking
 /// where nothing looks at it. Its docs carry the per-lifecycle rationale —

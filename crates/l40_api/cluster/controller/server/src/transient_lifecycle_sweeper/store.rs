@@ -16,11 +16,11 @@ use pplx_space_common_core::types::{
     NodeManagedBy, NodeRole, PodName, PodUid, PositiveDuration, SandboxActivationAttemptId,
     SandboxId, SandboxLifecycle, SubstrateKind,
 };
-use pplx_space_common_svc::sql::sandbox_routability::routable_execution_or_non_k8s;
 use pplx_space_metrics::cluster_reconciler::{HydrationOutcome, OutcomeEvent};
 use pplx_space_sandbox_portability::{
     fresh_ready_snapshot_exists, restore_retry_source_snapshot_exists,
 };
+use pplx_space_sandbox_routability::routable_execution_or_non_k8s;
 use pplx_space_sandbox_store::sweeper::{
     self, evacuation_guards, restoring_episode_overdue, restoring_unowned,
     unrestorable_restoring_guards,

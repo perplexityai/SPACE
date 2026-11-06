@@ -157,7 +157,7 @@ pub enum RunCredmgrError {
     )]
     PlaintextTcpRefused { addr: SocketAddr },
     #[error("failed to initialize the credential-manager space_creds pool: {0}")]
-    DatabasePool(#[source] pplx_space_common_svc::sql::DatabaseConnectOptionsError),
+    DatabasePool(#[source] pplx_space_postgres_pool::DatabaseConnectOptionsError),
     #[error("invalid intermediate-key broker URL {url:?}: {source}")]
     IntermediateKeyBrokerUrl {
         url: String,
@@ -543,7 +543,7 @@ async fn initialize_authority_service(
     let pool = match std::env::var("DATABASE_URL") {
         Ok(url) if !url.is_empty() => {
             let credentials_pool =
-                pplx_space_common_svc::sql::CredentialsPool::connect_lazy(&url, SERVICE_NAME)
+                pplx_space_postgres_pool::CredentialsPool::connect_lazy(&url, SERVICE_NAME)
                     .map_err(RunCredmgrError::DatabasePool)?;
             tracing::info!("prepared lazy space_creds credential-manager database pool");
             Some(credentials_pool.pool().clone())

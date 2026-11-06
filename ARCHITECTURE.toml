@@ -370,7 +370,7 @@ l20_domain = [
 
 # Each store's users: the l40_api and l30_storage crates that own its state
 # and use the store today, directly or through a legacy crate's re-exports
-# (see `legacy` below), such as common-svc's.
+# (see `legacy` below).
 [rules.layers.store_users]
 pplx-space-cluster-pool = [
   "pplx-space-api",
@@ -387,6 +387,12 @@ pplx-space-credential-injection-store = ["pplx-space-api", "pplx-space-credmgr"]
 pplx-space-federated-grant-store = ["pplx-space-api", "pplx-space-credmgr"]
 pplx-space-node-registration-store = ["pplx-space-credmgr"]
 pplx-space-placement = ["pplx-space-internal-api-server", "pplx-space-placement-executor"]
+pplx-space-postgres-pool = [
+  "pplx-space-api",
+  "pplx-space-cluster-controller-server",
+  "pplx-space-credmgr",
+  "pplx-space-internal-api-server",
+]
 pplx-space-runtime-environment-catalog-store = [
   "pplx-space-cluster-controller-server",
   "pplx-space-internal-api-server",
@@ -404,13 +410,16 @@ pplx-space-sandbox-portability = [
   "pplx-space-snapshot-store",
 ]
 pplx-space-sandbox-quarantine-store = [
-  "pplx-space-cluster-controller-server",
-  "pplx-space-internal-api-server",
-]
-pplx-space-sandbox-routability = [
   "pplx-space-api",
   "pplx-space-cluster-controller-server",
   "pplx-space-internal-api-server",
+]
+pplx-space-sandbox-residency = [
+  "pplx-space-api",
+  "pplx-space-cluster-controller-server",
+]
+pplx-space-sandbox-routability = [
+  "pplx-space-cluster-controller-server",
   "pplx-space-sandbox-store",
 ]
 pplx-space-sandbox-store = [

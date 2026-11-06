@@ -177,11 +177,13 @@ pub(crate) async fn run_up(
     policy: LockRetryPolicy,
 ) -> Result<u32, MigrationRunFailed> {
     let budget = policy.attempts.get();
-    let checksums = pplx_space_common_svc::sql::migration_checksums::AcceptedChecksums::embedded()
-        .map_err(|source| MigrationRunFailed {
-            attempt: 1,
-            budget,
-            source,
+    let checksums =
+        pplx_space_migration_checksums::AcceptedChecksums::embedded().map_err(|source| {
+            MigrationRunFailed {
+                attempt: 1,
+                budget,
+                source,
+            }
         })?;
 
     // Pin one connection for every attempt, and keep passing `&mut *conn` so

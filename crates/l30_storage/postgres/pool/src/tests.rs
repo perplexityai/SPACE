@@ -2,7 +2,7 @@ use super::{
     DatabaseConnectOptionsError, connect_postgres_lazy_as, connect_postgres_lazy_as_capped,
     database_connect_options, jittered_lifetime, pool_utilization, postgres_pool_options,
 };
-use crate::core::types::DatabaseIdentity;
+use pplx_space_db_identity::DatabaseIdentity;
 use std::time::Duration;
 
 const ADMIN_DATABASE_URL: &str =

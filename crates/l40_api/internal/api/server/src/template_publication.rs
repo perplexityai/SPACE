@@ -188,7 +188,7 @@ pub(super) fn missing_tenant_publication_grant() -> Status {
 /// Contention aborts the transaction and permits retrying the publication.
 pub(super) fn storage_status(context: &str, error: &sqlx::Error) -> Status {
     let message = format!("{context}: {error}");
-    if pplx_space_common_svc::sql::contention::is_lock_contention(error) {
+    if pplx_space_postgres_pool::contention::is_lock_contention(error) {
         pplx_space_node_api_client::cluster::PublicationNotCommitted.into_status(message)
     } else {
         Status::internal(message)

@@ -583,7 +583,7 @@ pub(super) async fn delete_sandbox(
 fn delete_admission_error(error: &PublicOperationStoreError) -> E2bApiError {
     match error {
         PublicOperationStoreError::Sql(error)
-            if pplx_space_common_svc::sql::contention::is_lock_contention(error) =>
+            if pplx_space_postgres_pool::contention::is_lock_contention(error) =>
         {
             E2bApiError::lock_contention()
         }

@@ -7,7 +7,7 @@ use axum::{
     http::{HeaderMap, StatusCode, header},
     response::IntoResponse,
 };
-use pplx_space_common_svc::sql::contention;
+use pplx_space_postgres_pool::contention;
 use time::OffsetDateTime;
 
 use crate::models::User;
@@ -128,7 +128,7 @@ impl ContentionScope {
 /// answer.
 ///
 /// Every SQLSTATE in the contention set is retryable — that is what
-/// `sql::contention` means by the word — so all three get a retryable status
+/// `pplx_space_postgres_pool::contention` means by the word — so all three get a retryable status
 /// here regardless of scope. `scope` chooses only *which* retryable status.
 ///
 /// `40001`/`40P01` on a [`ContentionScope::Writing`] statement is the AB-BA

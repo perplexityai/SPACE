@@ -192,7 +192,7 @@ use tokio_util::sync::CancellationToken;
 use crate::env_config;
 use crate::warn_pacer::PerNodeWarnPacer;
 
-pub use pplx_space_common_svc::sql::sandbox_residency::ResidencyEvidence;
+pub use pplx_space_sandbox_residency::ResidencyEvidence;
 
 // Reuse the drained-node-terminator's EC2 cross-check vocabulary verbatim
 // (which itself reuses `orphaned_nodes`' fail-closed verdict types) so the
@@ -243,13 +243,13 @@ pub(crate) const PHASE_TERMINATING: &str = "terminating";
 /// (pausing/suspending/checkpointing). The reconciler waits on transient
 /// states to settle into a suspendable state on subsequent ticks.
 ///
-/// Defined in `pplx-space-common-svc` alongside the residency predicate, so
+/// Defined in `pplx-space-sandbox-residency` alongside the residency predicate, so
 /// anything that predicts this reconciler's behaviour counts exactly the rows
 /// it will wait on — a predictor scoped to a different set names the wrong
 /// nodes. That module's docs carry the per-lifecycle exclusion reasons,
 /// including why `created` and `stopped` are absent.
 #[cfg(test)]
-pub(crate) use pplx_space_common_svc::sql::sandbox_residency::RESIDENT_LIFECYCLES;
+pub(crate) use pplx_space_sandbox_residency::RESIDENT_LIFECYCLES;
 
 /// [`SandboxLifecycle`] values the evacuation pipeline can service while
 /// preserving user-visible semantics. Source of the SQL `lifecycle = ANY($1)`

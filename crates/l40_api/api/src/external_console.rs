@@ -532,7 +532,7 @@ impl ExternalConsole {
             }
             Err(error) => {
                 ConsoleDecision::LookupFailed.record();
-                if pplx_space_common_svc::sql::contention::is_lock_contention(&error) {
+                if pplx_space_postgres_pool::contention::is_lock_contention(&error) {
                     tracing::warn!(%error, "external console user lookup lost a lock race; retryable");
                     return ExternalConsoleAuth::Denied(PublicApiError::lock_contention());
                 }

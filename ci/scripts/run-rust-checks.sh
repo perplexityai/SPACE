@@ -378,18 +378,6 @@ run_clippy_checks() {
         -- \
         -D warnings
 
-    # Built alone, so a sqlx feature common-svc's migration-checksums feature
-    # needs but only gets through unification with the rest of the workspace
-    # fails here.
-    echo "--- :rust: Running common-svc migration-checksums clippy"
-    CARGO_TARGET_DIR="${target_dir}" cargo clippy \
-        --locked \
-        -p pplx-space-common-svc \
-        --no-default-features \
-        --features migration-checksums \
-        -- \
-        -D warnings
-
     # Pull CI and the merge queue run these only when the change can affect
     # the crates they lint (lint_affects_any in lib/rust-isolated-crates.sh).
     if lint_affects_any "${target_dir}" "${SBXMGR_PRODUCTION_CRATES[@]}"; then
@@ -439,8 +427,8 @@ run_clippy_checks() {
         done
     done
 
-    # The crates split out of common-core and common-svc, and the other
-    # libraries beside them, are linted alone by run_isolated_crate_checks in
+    # The libraries that reach common-core at most directly, and those its
+    # ALSO list names, are linted alone by run_isolated_crate_checks in
     # lib/rust-isolated-crates.sh (the isolated-crates mode), which finds them
     # in the workspace metadata. A new crate needs no step here.
 }

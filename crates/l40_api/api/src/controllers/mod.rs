@@ -520,7 +520,7 @@ pub(crate) fn db_contention_error(message: &str, error: &sqlx::Error) -> Control
     // unjittered one-second tick, re-arriving as a synchronised wave against a
     // pool that is still exhausted. That is the failure this bound exists to
     // prevent, made self-amplifying. A pool timeout stays a 500.
-    if pplx_space_common_svc::sql::contention::is_lock_contention(error) {
+    if pplx_space_postgres_pool::contention::is_lock_contention(error) {
         tracing::warn!(%error, message, "database statement lost a lock race; retryable");
         return ControllerError::lock_contention();
     }

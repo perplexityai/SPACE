@@ -20,18 +20,12 @@ use pplx_space_common_core::types::{
     SandboxTransitionReceipt, SandboxTransitionReceiptInvariantError, SandboxTransitionReceiptKind,
     SandboxTransitionTargetState, SemVer,
 };
-use pplx_space_common_svc::{
-    sql::sandbox_quarantine::{
-        quarantine_history_insert_columns, quarantine_state_conflict_assignments,
-        quarantine_state_insert_columns,
-    },
-    types::{
-        FACET_NETWORK_POLICY, FACET_SANDBOX_DESIRED_STATE, FACET_TEMPLATE_BASE_SNAPSHOT_POLICY,
-        FACET_TEMPLATE_DESIRED_STATE, NetworkPolicyTarget, ReconcileReason,
-        SANDBOX_FAILURE_ACTIVATION_ATTEMPT_ID_KEY, SANDBOX_FAILURE_EPISODE_KEY,
-        SANDBOX_FAILURE_EXECUTION_GENERATION_KEY, SANDBOX_FAILURE_POD_UID_KEY,
-        SANDBOX_LOCAL_SUSPEND_KEY,
-    },
+use pplx_space_common_svc::types::{
+    FACET_NETWORK_POLICY, FACET_SANDBOX_DESIRED_STATE, FACET_TEMPLATE_BASE_SNAPSHOT_POLICY,
+    FACET_TEMPLATE_DESIRED_STATE, NetworkPolicyTarget, ReconcileReason,
+    SANDBOX_FAILURE_ACTIVATION_ATTEMPT_ID_KEY, SANDBOX_FAILURE_EPISODE_KEY,
+    SANDBOX_FAILURE_EXECUTION_GENERATION_KEY, SANDBOX_FAILURE_POD_UID_KEY,
+    SANDBOX_LOCAL_SUSPEND_KEY,
 };
 use pplx_space_events::{
     SandboxEvent, SandboxEventDetails, SandboxEventSource, SandboxEventTrigger, SandboxEventType,
@@ -39,6 +33,10 @@ use pplx_space_events::{
 use pplx_space_net_common::proto::NetworkPolicySource;
 use pplx_space_sandbox_portability::{
     started_suspend_revert_eligibility, suspended_projection_lifecycle_eligible,
+};
+use pplx_space_sandbox_quarantine_store::{
+    quarantine_history_insert_columns, quarantine_state_conflict_assignments,
+    quarantine_state_insert_columns,
 };
 use pplx_space_sbx_mgr_client::proto::{
     QuarantineRecoveryObservedOwner, SnapshotDetail, SnapshotType,

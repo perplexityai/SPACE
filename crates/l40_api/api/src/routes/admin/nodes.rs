@@ -16,7 +16,7 @@ use pplx_space_common_core::types::admin::{
 use pplx_space_common_core::types::{
     NodeDrainMode, NodeDrainPhase, NodeDrainState, NodeManagedBy, SandboxId,
 };
-use pplx_space_common_svc::sql::sandbox_residency::{NODE_CENSUS_RESIDENCY_ENV, ResidencyEvidence};
+use pplx_space_sandbox_residency::{NODE_CENSUS_RESIDENCY_ENV, ResidencyEvidence};
 use std::num::NonZeroUsize;
 use std::str::FromStr;
 use std::sync::OnceLock;

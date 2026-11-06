@@ -64,8 +64,8 @@ use std::time::Duration;
 
 use pplx_space_common_core::sql;
 use pplx_space_common_core::types::{OrgId, UserId};
-use pplx_space_common_svc::sql::contention;
 use pplx_space_metrics::operations as metrics;
+use pplx_space_postgres_pool::contention;
 use pplx_space_public_api::OperationKind;
 use sqlx::{Postgres, Transaction};
 

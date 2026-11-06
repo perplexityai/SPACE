@@ -17,12 +17,12 @@
 
 use pplx_space_common_core::sql;
 use pplx_space_common_core::types::NodeId;
-use pplx_space_common_svc::sql::sandbox_residency::ResidencyEvidence;
 use pplx_space_db_test_fixtures::try_pg_test_db;
 use pplx_space_sandbox_portability::{
     drain_gate_blockers_for_node, inflight_suspend_upload_from_node_exists,
     snapshot_durable_for_source_release,
 };
+use pplx_space_sandbox_residency::ResidencyEvidence;
 use pplx_space_test_env::TestResult;
 use sqlx::PgPool;
 use uuid::Uuid;

@@ -38,13 +38,15 @@ import sys
 
 COMMON_CORE, COMMON_SVC = "pplx-space-common-core", "pplx-space-common-svc"
 # Reach common-core, besides directly, only through crates that are linted
-# alone themselves (pplx-space-metrics, and for rpc-auth also
-# pplx-space-api-route), and build quickly alone, so they are linted as well.
-# rpc-auth is here so that its build without `k8s` is linted: no binary's
-# release build leaves that feature off. Each entry must be a workspace
-# library the rule leaves out for reaching common-core through another crate.
+# alone themselves (pplx-space-metrics, for rpc-auth also pplx-space-api-route,
+# for postgres-pool also pplx-space-state-reconciliation), and build quickly
+# alone, so they are linted as well. rpc-auth is here so that its build without
+# `k8s` is linted: no binary's release build leaves that feature off. Each
+# entry must be a workspace library the rule leaves out for reaching
+# common-core through another crate.
 ALSO = {
     "pplx-space-ingress-admission",
+    "pplx-space-postgres-pool",
     "pplx-space-rpc-auth",
     "pplx-space-tokio-runtime",
     "pplx-space-uds-peer-auth",

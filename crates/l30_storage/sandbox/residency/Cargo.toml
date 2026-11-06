@@ -1,0 +1,17 @@
+[package]
+name = "pplx-space-sandbox-residency"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[package.metadata.space.state]
+postgres = []
+
+[lints]
+workspace = true
+
+[dependencies]
+pplx-space-common-core = { workspace = true }

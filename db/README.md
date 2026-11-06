@@ -471,7 +471,7 @@ legitimately needs to wait.
 
 The bound converts lock waits into `55P03` (`lock_not_available`) errors, so
 every path that can block needs a disposition for it.
-`pplx_space_common_svc::sql::contention` is where the codes live for the
+`pplx_space_postgres_pool::contention` is where the codes live for the
 services: callers use `is_lock_contention` (`40001` / `40P01` / `55P03`),
 `is_lock_not_available` (`55P03` only) or `is_query_canceled` (`57014`) rather
 than open-coding a SQLSTATE list, because a hand-written
@@ -591,7 +591,7 @@ Two shapes need care when adding code:
 ### Application pools
 
 Long-running services connect only as the managed logins, with no selector
-and no fallback to the connecting admin. `pplx-space-common-svc::sql`
+and no fallback to the connecting admin. `pplx-space-postgres-pool`
 exposes three constructors: `connect_space_user_pool` (the service's
 general-purpose pool, as `space_user`), `CredentialsPool::connect` (the
 credential-fenced lane, as `space_creds`), and

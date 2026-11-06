@@ -120,11 +120,11 @@ pub enum RunInternalApiError {
         source: std::io::Error,
     },
     #[error("failed to initialize the cluster API space_user pool")]
-    Pool(#[source] pplx_space_common_svc::sql::DatabaseConnectOptionsError),
+    Pool(#[source] pplx_space_postgres_pool::DatabaseConnectOptionsError),
     #[error("failed to initialize the cluster API template-visibility pool")]
-    VisibilityPool(#[source] pplx_space_common_svc::sql::DatabaseConnectOptionsError),
+    VisibilityPool(#[source] pplx_space_postgres_pool::DatabaseConnectOptionsError),
     #[error("failed to initialize the cluster API runtime environment catalog pool")]
-    RuntimeCatalogPool(#[source] pplx_space_common_svc::sql::DatabaseConnectOptionsError),
+    RuntimeCatalogPool(#[source] pplx_space_postgres_pool::DatabaseConnectOptionsError),
     #[error("failed to build the cluster API reflection service")]
     Reflection(#[from] tonic_reflection::server::Error),
     #[error("failed to initialize ClusterApiService")]
@@ -302,9 +302,8 @@ pub async fn run(
         }
     })?;
     tracing::info!(listen = %config.listen, "space-internal-api-svc listening");
-    let pool =
-        pplx_space_common_svc::sql::connect_space_user_pool_lazy(&database_url, SERVICE_NAME)
-            .map_err(RunInternalApiError::Pool)?;
+    let pool = pplx_space_postgres_pool::connect_space_user_pool_lazy(&database_url, SERVICE_NAME)
+        .map_err(RunInternalApiError::Pool)?;
     tracing::info!("prepared lazy space_user cluster API database pool");
 
     // Sideline pool for the best-effort template-visibility lookup. It reads
@@ -315,7 +314,7 @@ pub async fn run(
     // failure stays inside the lookup, which degrades to UNSPECIFIED, and given
     // its own short `statement_timeout` so a blocked lookup is cancelled
     // server-side instead of adding the role's 10s bound to a create pull.
-    let visibility_pool = pplx_space_common_svc::sql::connect_space_user_sideline_pool_lazy(
+    let visibility_pool = pplx_space_postgres_pool::connect_space_user_sideline_pool_lazy(
         &database_url,
         VISIBILITY_POOL_APPLICATION_NAME,
         VISIBILITY_POOL_MAX_CONNECTIONS,
@@ -361,14 +360,13 @@ pub async fn run(
     // pool still keeps its minimum connections open, and with the setting off
     // nothing reads the catalog.
     if svc.serves_provisioning_recipes() {
-        let runtime_catalog_pool =
-            pplx_space_common_svc::sql::connect_space_user_sideline_pool_lazy(
-                &database_url,
-                RUNTIME_CATALOG_POOL_APPLICATION_NAME,
-                RUNTIME_CATALOG_POOL_MAX_CONNECTIONS,
-                Some(RUNTIME_CATALOG_POOL_STATEMENT_TIMEOUT),
-            )
-            .map_err(RunInternalApiError::RuntimeCatalogPool)?;
+        let runtime_catalog_pool = pplx_space_postgres_pool::connect_space_user_sideline_pool_lazy(
+            &database_url,
+            RUNTIME_CATALOG_POOL_APPLICATION_NAME,
+            RUNTIME_CATALOG_POOL_MAX_CONNECTIONS,
+            Some(RUNTIME_CATALOG_POOL_STATEMENT_TIMEOUT),
+        )
+        .map_err(RunInternalApiError::RuntimeCatalogPool)?;
         tracing::info!(
             max_connections = RUNTIME_CATALOG_POOL_MAX_CONNECTIONS,
             statement_timeout_ms = RUNTIME_CATALOG_POOL_STATEMENT_TIMEOUT.as_millis(),

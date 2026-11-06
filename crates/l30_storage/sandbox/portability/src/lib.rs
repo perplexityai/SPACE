@@ -2208,7 +2208,7 @@ pub fn portable_for_restore_affinity(sandbox_alias: &str) -> String {
 /// over `sandboxes`, forcing a full table scan for each node.
 ///
 /// It is deliberately kept: this is where the gate's *meaning* is written down
-/// — `pplx_space_common_svc`'s residency docs point here for it — and it is the
+/// — `pplx_space_sandbox_residency`'s docs point here for it — and it is the
 /// oracle the executed forms are differentially tested against in
 /// `drain_gate_differential_tests`. Neither of those needs `pub`, since that
 /// test is in this crate; what does is `pplx-space-api`'s

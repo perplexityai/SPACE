@@ -7,10 +7,8 @@ use super::{FederatedOwner, FederatedServiceGrant};
 pub use pplx_space_common_svc::federated_identity::{
     DEFAULT_FEDERATED_GRANT_AUDIENCE, FEDERATED_OWNER_GRANT_PURPOSE,
 };
-pub use pplx_space_common_svc::sql::federated_service_grants::FederatedGrantStoreError;
-use pplx_space_common_svc::sql::federated_service_grants::{
-    FederatedGrantOwnerRef, FederatedServiceGrantRef,
-};
+pub use pplx_space_federated_grant_store::FederatedGrantStoreError;
+use pplx_space_federated_grant_store::{FederatedGrantOwnerRef, FederatedServiceGrantRef};
 
 pub async fn upsert_sandbox_federated_service_grant(
     pool: &PgPool,
@@ -20,7 +18,7 @@ pub async fn upsert_sandbox_federated_service_grant(
     grant_audience: &str,
     grant_purpose: &str,
 ) -> Result<(), FederatedGrantStoreError> {
-    pplx_space_common_svc::sql::federated_service_grants::upsert_sandbox_federated_service_grant(
+    pplx_space_federated_grant_store::upsert_sandbox_federated_service_grant(
         pool,
         sandbox_id,
         owner_ref(owner),
@@ -39,7 +37,7 @@ pub async fn upsert_sandbox_federated_service_grant_tx(
     grant_audience: &str,
     grant_purpose: &str,
 ) -> Result<(), FederatedGrantStoreError> {
-    pplx_space_common_svc::sql::federated_service_grants::upsert_sandbox_federated_service_grant_tx(
+    pplx_space_federated_grant_store::upsert_sandbox_federated_service_grant_tx(
         tx,
         sandbox_id,
         owner_ref(owner),
