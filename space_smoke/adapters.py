@@ -4174,19 +4174,56 @@ ON CONFLICT (key_hash) DO NOTHING;
         _require_ok(result, "read the sandbox pod")
         return _newest_pod_render(result.stdout)
 
-    def sandbox_pod_count(self, *, include_pool: bool = False) -> int:
-        selector = (
-            "app.kubernetes.io/name=space-sandbox"
-            if include_pool
-            else KIND_SANDBOX_POD_SELECTOR
-        )
+    def sandbox_pod_count(self) -> int:
         result = self.kubectl(
-            "get", "pods", "-l", selector, "-o", "json", timeout=15,
+            "get", "pods", "-l", KIND_SANDBOX_POD_SELECTOR, "-o", "json", timeout=15,
             namespace=KIND_SANDBOX_NAMESPACE,
         )
         _require_ok(result, "count sandbox pods")
         items = json.loads(result.stdout or "{}").get("items", [])
         return sum(1 for item in items if not (item.get("metadata") or {}).get("deletionTimestamp"))
+
+    def telemetry_sandbox_pod_count(self) -> int:
+        """Include pool and deleting pods; exclude only confirmed retired sandboxes."""
+
+        result = self.kubectl(
+            "get", "pods", "-l", "app.kubernetes.io/name=space-sandbox", "-o", "json",
+            timeout=15, namespace=KIND_SANDBOX_NAMESPACE,
+        )
+        items = json.loads(_require_ok(result, "list telemetry sandbox pods")).get("items", [])
+        count = len(items)
+        by_sandbox: dict[str, list[dict[str, Any]]] = {}
+        for item in items:
+            labels = (item.get("metadata") or {}).get("labels") or {}
+            try:
+                sandbox_id = _sql_uuid(labels.get("space.pplx.net/sandbox-id", ""))
+            except ValueError:
+                # An unidentified pod is not evidence of an absent sandbox.
+                continue
+            by_sandbox.setdefault(sandbox_id, []).append(item)
+
+        workers: set[str] | None = None
+        for sandbox_id, pods in by_sandbox.items():
+            if any((pod.get("status") or {}).get("phase") not in _TERMINAL_POD_PHASES for pod in pods):
+                continue
+            pod_nodes = {(pod.get("spec") or {}).get("nodeName", "") for pod in pods}
+            if not all(pod_nodes):
+                continue
+            if self._psql(
+                SANDBOX_LIVE_SQL.format(sandbox_id=sandbox_id), action="probe telemetry sandbox liveness"
+            ).strip():
+                continue
+            if workers is None:
+                workers = set(self.sandbox_pool_nodes())
+            # A terminal pod cannot recreate its row, but an older execution
+            # can still exist on another worker. Failed reads must not become
+            # proof of retirement; the existing readers raise on failure.
+            if all(
+                self.node_sandbox_state(node, sandbox_id) is None
+                for node in sorted(workers | pod_nodes)
+            ):
+                count -= len(pods)
+        return count
 
     def native_create_sandbox(self, *, template: str, metadata: Mapping[str, str]) -> str:
         self._require_isolated_kind("native create")
