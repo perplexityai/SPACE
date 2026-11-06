@@ -107,6 +107,13 @@ service ClusterApi {
   // source of truth for the current backend endpoint.
   rpc RecordDataPlaneSessionReconnect(RecordDataPlaneSessionReconnectRequest) returns (RecordDataPlaneSessionReconnectResponse);
 
+  // Record that a data-plane stream reported the exit of the process bound to
+  // a terminal or process session, which moves the session's public state to
+  // `closed`. Idempotent, and a state update only: a later attach still
+  // resolves the session and reads the exit. Leaves a revoked session, or one
+  // bound to another process, as it is.
+  rpc RecordDataPlaneSessionProcessExited(RecordDataPlaneSessionProcessExitedRequest) returns (RecordDataPlaneSessionProcessExitedResponse);
+
   // Read the current revocation epoch/status for a protocol session without
   // returning route backend or credential material.
   rpc GetDataPlaneSessionRevocationState(GetDataPlaneSessionRevocationStateRequest) returns (GetDataPlaneSessionRevocationStateResponse);
@@ -701,6 +708,18 @@ message RecordDataPlaneSessionReconnectResponse {
   optional string protocol_session_id = 2;
   uint64 reconnect_count = 3;
   DataPlaneReconnectReason last_reconnect_reason = 4;
+}
+
+message RecordDataPlaneSessionProcessExitedRequest {
+  string session_id = 1;
+  optional string protocol_session_id = 2;
+  string process_id = 3;
+}
+
+message RecordDataPlaneSessionProcessExitedResponse {
+  // Whether this call closed the session; false when it was already closed,
+  // revoked, or bound to another process.
+  bool closed = 1;
 }
 
 message GetDataPlaneSessionRevocationStateRequest {

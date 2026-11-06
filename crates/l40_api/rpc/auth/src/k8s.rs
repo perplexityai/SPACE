@@ -681,6 +681,7 @@ fn guest_bridge_method(role: NodeRole, path: &str) -> bool {
             "ResolveDataPlaneSessionRoute"
                 | "BindDataPlaneSessionProcess"
                 | "RecordDataPlaneSessionReconnect"
+                | "RecordDataPlaneSessionProcessExited"
                 | "GetDataPlaneSessionRevocationState"
                 | "GetDataPlaneOrgRevocationEpoch"
                 | "GetSandboxRuntimeAccess"
