@@ -5,7 +5,7 @@ use crate::sandbox_quarantine_store;
 use pplx_space_common_core::sql;
 use pplx_space_common_core::types::{LocalArtifactId, NodeId, SandboxId};
 use pplx_space_db_test_fixtures::{insert_ready_worker_node, pg_test_db, try_pg_test_db};
-use pplx_space_placement::StoredSandboxLifecycle;
+use pplx_space_sandbox_store::StoredSandboxLifecycle;
 use pplx_space_test_env::TestResult;
 use sqlx::PgPool;
 

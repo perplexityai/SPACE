@@ -113,6 +113,7 @@ pub mod drain;
 pub mod fork_source_lifecycle;
 pub mod ingest;
 pub mod intent;
+mod lifecycle;
 pub mod lost;
 pub mod orphan;
 pub mod pod_tracking;
@@ -122,10 +123,13 @@ pub mod restore_lease;
 pub mod stuck;
 pub mod suspend;
 pub mod sweeper;
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
 pub mod tombstone;
 pub mod wake;
 
 pub use create::{SandboxCreate, insert_pooled, insert_unplaced};
+pub use lifecycle::StoredSandboxLifecycle;
 
 /// The `sandboxes.metadata` document: caller-supplied labels, untyped by
 /// design. Distinct from the validated `SandboxMetadata` newtype in

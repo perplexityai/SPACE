@@ -1,6 +1,6 @@
 use pplx_space_common_core::types::{SandboxId, SandboxLifecycle};
 use pplx_space_net_common::NetworkPolicyV1;
-use pplx_space_placement::StoredSandboxLifecycle;
+use pplx_space_sandbox_store::StoredSandboxLifecycle;
 use uuid::Uuid;
 
 use super::ArtifactComponentProjection;

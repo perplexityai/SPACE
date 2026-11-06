@@ -9,7 +9,7 @@
 //! row to each stored lifecycle with a plain update, as a concurrent writer
 //! would, and then completes it.
 
-use pplx_space_placement::StoredSandboxLifecycle;
+use pplx_space_sandbox_store::StoredSandboxLifecycle;
 
 use super::*;
 

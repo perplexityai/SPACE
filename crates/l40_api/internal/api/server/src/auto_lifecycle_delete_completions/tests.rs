@@ -8,7 +8,7 @@ use pplx_space_common_core::{
     },
 };
 use pplx_space_db_test_fixtures::{insert_ready_worker_node, pg_test_db, try_pg_test_db};
-use pplx_space_placement::test_support::stored_lifecycle_matrix;
+use pplx_space_sandbox_store::test_support::stored_lifecycle_matrix;
 
 use super::*;
 

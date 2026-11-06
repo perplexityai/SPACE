@@ -616,15 +616,15 @@ same name elsewhere. The manifest diff is where review sees it;
 `layers.policy_changed` does not.
 
 A store that must write a table another store owns, an approved exception
-such as placement claiming a sandbox, is its co-writer by a grant in
-`ARCHITECTURE.toml`, not in its own manifest, so that adding one is a policy
-change `layers.policy_changed` reports for review:
+such as the sandbox store orphaning a snapshot's storage location, is its
+co-writer by a grant in `ARCHITECTURE.toml`, not in its own manifest, so that
+adding one is a policy change `layers.policy_changed` reports for review:
 
 ```toml
 [rules.layers.state.co_writers.postgres]     # or .sqlite.<database>
-# Placement's commit puts a sandbox on its node. Temporary: the write folds
-# into sandbox-store.
-sandboxes = ["pplx-space-placement"]          # table = the stores granted it
+# Deleting a sandbox orphans its snapshots' storage locations for cleanup.
+# Temporary: the write folds into snapshot-store.
+snapshot_storage_locations = ["pplx-space-sandbox-store"]   # table = the stores granted it
 ```
 
 Each grant has a comment saying why the store writes another store's table

@@ -866,7 +866,7 @@ async fn the_node_filters_match_the_node_the_response_reports() -> TestDbResult<
 /// vocabulary normalizes it, and nothing else.
 #[test]
 fn the_lifecycle_filter_takes_exactly_the_stored_lifecycles() {
-    for stored in pplx_space_placement::StoredSandboxLifecycle::all() {
+    for stored in pplx_space_sandbox_store::StoredSandboxLifecycle::all() {
         let value = stored.as_str();
         for spelling in [
             value.to_string(),
@@ -880,7 +880,7 @@ fn the_lifecycle_filter_takes_exactly_the_stored_lifecycles() {
                 "{spelling:?}"
             );
             assert_eq!(
-                spelling.parse::<pplx_space_placement::StoredSandboxLifecycle>(),
+                spelling.parse::<pplx_space_sandbox_store::StoredSandboxLifecycle>(),
                 Ok(*stored),
                 "{spelling:?}"
             );
@@ -893,7 +893,7 @@ fn the_lifecycle_filter_takes_exactly_the_stored_lifecycles() {
         );
         assert!(
             unknown
-                .parse::<pplx_space_placement::StoredSandboxLifecycle>()
+                .parse::<pplx_space_sandbox_store::StoredSandboxLifecycle>()
                 .is_err(),
             "{unknown:?}"
         );
