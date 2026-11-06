@@ -69,7 +69,7 @@ pub struct AdminNodeResponse {
     pub deleted_at: Option<String>,
     /// None on inventory-only responses; never interpret unknown as zero.
     /// Sandboxes still occupying placement on this node — anything that has
-    /// not terminated (`failed`/`cleanup_required`/`deleted`) and has not
+    /// not terminated (`failed`/`deleted`) and has not
     /// migrated off (`suspended`). This is the count the drain reconciler
     /// uses as the threshold for advancing `draining → drained`.
     pub sandboxes_active: Option<i64>,

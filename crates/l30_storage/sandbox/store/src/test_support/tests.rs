@@ -1,6 +1,6 @@
 use super::*;
 
-const TABLE: [&str; 20] = [
+const TABLE: [&str; 19] = [
     "created          A  .",
     "creating         .  .",
     "starting         .  .",
@@ -18,7 +18,6 @@ const TABLE: [&str; 20] = [
     "quarantined      .  .",
     "failed           .  .",
     "deleted          .  .",
-    "cleanup_required A  A",
     "bogus            .  .",
     "_Suspended_      A  .",
 ];
@@ -53,12 +52,11 @@ fn ordinal(stored: StoredSandboxLifecycle) -> usize {
         S::Live(L::Quarantined) => 14,
         S::Live(L::Failed) => 15,
         S::Deleted => 16,
-        S::CleanupRequired => 17,
     }
 }
 
 /// The number of arms in [`ordinal`], kept by hand.
-const STORED_VARIANTS: usize = 18;
+const STORED_VARIANTS: usize = 17;
 
 #[test]
 fn the_vocabulary_lists_every_variant_in_declaration_order() {
@@ -88,7 +86,6 @@ fn a_matrix_reads_one_row_per_stored_lifecycle_and_non_canonical_value() {
             ("created", [Expect::Applies, Expect::Refuses]),
             ("started", [Expect::Refuses, Expect::Applies]),
             ("suspended", [Expect::Refuses, Expect::KnownDefect]),
-            ("cleanup_required", [Expect::Applies, Expect::Applies]),
             (" Suspended ", [Expect::Applies, Expect::Refuses]),
         ]
     );
@@ -98,7 +95,8 @@ fn a_matrix_reads_one_row_per_stored_lifecycle_and_non_canonical_value() {
 #[test]
 #[should_panic(expected = "one row per stored lifecycle")]
 fn a_matrix_missing_a_stored_lifecycle_is_refused() {
-    stored_lifecycle_matrix(["first", "second"], &TABLE[..19]);
+    // Without `created`, the first stored lifecycle; both non-canonical rows stay.
+    stored_lifecycle_matrix(["first", "second"], &TABLE[1..]);
 }
 
 #[test]

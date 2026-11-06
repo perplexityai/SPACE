@@ -627,10 +627,8 @@ async fn node_publication_converges_only_from_its_source_lifecycles(
                     after_stopped.as_str(),
                 )
             }
-            // The stored tombstones; no report moves them.
-            StoredSandboxLifecycle::Deleted | StoredSandboxLifecycle::CleanupRequired => {
-                (stored.as_str(), stored.as_str(), stored.as_str())
-            }
+            // The stored tombstone; no report moves it.
+            StoredSandboxLifecycle::Deleted => (stored.as_str(), stored.as_str(), stored.as_str()),
         })
         // Values outside the vocabulary. Both convergences compare
         // `LOWER(TRIM(lifecycle))`, so a padded member of their source sets

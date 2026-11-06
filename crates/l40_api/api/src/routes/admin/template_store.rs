@@ -110,7 +110,7 @@ pub(super) async fn lock_template_for_update(
 }
 
 /// Sandboxes still referencing the template: anything not terminally gone
-/// (`failed` / `cleanup_required` / `deleted`). Suspended sandboxes count —
+/// (`failed` / `deleted`). Suspended sandboxes count —
 /// they can be restored later, and a restore after a narrowing flip would
 /// cross the isolation boundary the flip is trying to establish.
 ///
@@ -141,7 +141,7 @@ pub(super) async fn template_sandboxes_in_use_in_tx(
            FROM sandboxes s
           WHERE s.template_id = $1
             AND (
-                 s.lifecycle NOT IN ('failed', 'cleanup_required', 'deleted')
+                 s.lifecycle NOT IN ('failed', 'deleted')
                  OR (s.lifecycle = 'failed' AND {eligible})
             )"
     );

@@ -1163,7 +1163,6 @@ async fn delete_completion_applies_only_from_settled_owned_lifecycles() -> TestR
         "quarantined        .        .",
         "failed             A        .",
         "deleted            .        .",
-        "cleanup_required   .        .",
         "bogus              .        .",
         "_Suspended_        A        A",
     ];

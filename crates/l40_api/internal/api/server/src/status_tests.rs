@@ -499,7 +499,6 @@ async fn complete_inventory_tombstones_every_stored_lifecycle_but_the_delete_sta
         "quarantined       A",
         "failed            A",
         "deleted           .",
-        "cleanup_required  A",
         "bogus             A",
         "_Suspended_       A",
     ];

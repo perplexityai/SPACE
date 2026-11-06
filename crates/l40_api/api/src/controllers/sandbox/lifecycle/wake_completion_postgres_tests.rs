@@ -110,9 +110,8 @@ async fn wake_completion_cas_outcome_for_every_prior_lifecycle() -> TestResult {
                     | SandboxLifecycle::Quarantined
                     | SandboxLifecycle::Failed,
                 )
-                // The stored values that are not `SandboxLifecycle` variants.
-                | StoredSandboxLifecycle::Deleted
-                | StoredSandboxLifecycle::CleanupRequired => Lost,
+                // The stored value that is not a `SandboxLifecycle` variant.
+                | StoredSandboxLifecycle::Deleted => Lost,
             };
             cases.push((stored.as_str().to_owned(), substrate, fence, expected));
         }

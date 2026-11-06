@@ -362,7 +362,7 @@ async fn each_filter_returns_exactly_its_rows() -> TestDbResult<()> {
             SeedSandbox {
                 id: Some(fixed_id("50000000-0000-7000-8000-000000000000")),
                 name: Some("Alpha-caps"),
-                lifecycle: Some("cleanup_required"),
+                lifecycle: Some("stopped"),
                 template: Some("node"),
                 active_node_id: Some(node_two),
                 created_at: Some(at(5)),
@@ -415,9 +415,9 @@ async fn each_filter_returns_exactly_its_rows() -> TestDbResult<()> {
             &[1, 2],
         ),
         (
-            "tombstones",
+            "a tombstone and a live lifecycle",
             AdminSandboxFilter {
-                lifecycles: lifecycles(&["deleted", "cleanup_required"]),
+                lifecycles: lifecycles(&["deleted", "stopped"]),
                 ..AdminSandboxFilter::default()
             },
             &[3, 5],
@@ -863,7 +863,7 @@ async fn the_node_filters_match_the_node_the_response_reports() -> TestDbResult<
 }
 
 /// The filter takes every value `sandboxes.lifecycle` holds, as the stored
-/// vocabulary normalizes it, and nothing else.
+/// vocabulary normalizes it, and otherwise only the retired values.
 #[test]
 fn the_lifecycle_filter_takes_exactly_the_stored_lifecycles() {
     for stored in pplx_space_sandbox_store::StoredSandboxLifecycle::all() {
@@ -886,6 +886,16 @@ fn the_lifecycle_filter_takes_exactly_the_stored_lifecycles() {
             );
         }
     }
+    // A retired value is still taken, though no row stores it.
+    assert_eq!(
+        " Cleanup_Required "
+            .parse::<AdminStoredLifecycle>()
+            .map(AdminStoredLifecycle::as_str),
+        Ok("cleanup_required")
+    );
+    "cleanup_required"
+        .parse::<pplx_space_sandbox_store::StoredSandboxLifecycle>()
+        .unwrap_err();
     for unknown in ["", "delete", "cleanup-required", "live"] {
         assert!(
             unknown.parse::<AdminStoredLifecycle>().is_err(),
@@ -1220,12 +1230,7 @@ async fn the_count_is_the_tally_of_the_full_list() -> TestDbResult<()> {
         // `started`, so the console's tally counts it, and so must the count.
         (owner, Some("py"), "deleted", Some(started(Some("1.2.0")))),
         // The node's status wins over the stored lifecycle, as in the list.
-        (
-            owner,
-            Some("py"),
-            "cleanup_required",
-            Some(started(Some("1.2.0"))),
-        ),
+        (owner, Some("py"), "stopped", Some(started(Some("1.2.0")))),
         (
             owner,
             Some("py"),

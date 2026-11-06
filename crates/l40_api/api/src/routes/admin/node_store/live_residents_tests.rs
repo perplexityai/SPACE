@@ -355,7 +355,7 @@ async fn non_resident_lifecycles_are_excluded_even_when_reported() -> TestResult
     let pool = &db.pool;
     let node = insert_node(pool, Heartbeat::Fresh).await?;
 
-    for lifecycle in ["failed", "cleanup_required", "deleted", "suspended"] {
+    for lifecycle in ["failed", "deleted", "suspended"] {
         let sandbox = insert_sandbox(pool, node, lifecycle, Duration::from_secs(60)).await?;
         observe_on_node(pool, sandbox, node, lifecycle).await?;
     }

@@ -23,11 +23,11 @@ export const SANDBOX_STATUS_FILTER_STATES = [
 
 // What the paged list's lifecycle filter offers and sends: the stored
 // lifecycle (`sandboxes.lifecycle`), every `SandboxLifecycle` state and the
-// two tombstones. It is not the State column, which shows the node's reported
+// `deleted` tombstone. It is not the State column, which shows the node's reported
 // state when there is one, so a row can match one lifecycle and show another
 // state. The node-only states above are never stored, and the server refuses
 // them.
-export const STORED_LIFECYCLE_FILTER_STATES = [...SANDBOX_LIFECYCLE_STATES, 'deleted', 'cleanup_required'] as const;
+export const STORED_LIFECYCLE_FILTER_STATES = [...SANDBOX_LIFECYCLE_STATES, 'deleted'] as const;
 
 const STORED_LIFECYCLES: ReadonlySet<string> = new Set(STORED_LIFECYCLE_FILTER_STATES);
 

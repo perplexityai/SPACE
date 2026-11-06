@@ -259,8 +259,7 @@ async fn wake_refuses_teardown_and_terminal_lifecycles_before_admission() -> Tes
                 | SandboxLifecycle::Quarantined
                 | SandboxLifecycle::Failed,
             )
-            | StoredSandboxLifecycle::Deleted
-            | StoredSandboxLifecycle::CleanupRequired => true,
+            | StoredSandboxLifecycle::Deleted => true,
             StoredSandboxLifecycle::Live(
                 SandboxLifecycle::Created
                 | SandboxLifecycle::Creating
@@ -809,7 +808,6 @@ async fn post_action_stamps_write_only_over_an_in_flight_lifecycle() -> TestResu
         "quarantined       .        .           .",
         "failed            .        .           .",
         "deleted           .        .           .",
-        "cleanup_required  .        .           .",
         "bogus             .        .           .",
         "_Suspended_       .        .           .",
     ];
@@ -1741,7 +1739,6 @@ async fn delete_intent_and_its_compensations_over_every_stored_lifecycle() -> Te
         "quarantined       A       .       .",
         "failed            A       .       .",
         "deleted           .       .       .",
-        "cleanup_required  .       .       .",
         "bogus             .       .       .",
         "_Suspended_       .       .       .",
     ];

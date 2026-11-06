@@ -313,20 +313,17 @@ pub fn resident_lifecycle(sandbox_alias: &str) -> String {
 /// `active_node_id` names — the exclusion list [`active_resident_predicate`]
 /// renders.
 ///
-/// `&[&str]` rather than `&[SandboxLifecycle]` because two of the four are not
-/// enum variants and should not become ones: `deleted` is a tombstone written
+/// `&[&str]` rather than `&[SandboxLifecycle]` because one of the three is not
+/// an enum variant and should not become one: `deleted` is a tombstone written
 /// by raw SQL in the internal API's status handler and pruned later by
-/// `tombstone_retention`, and `cleanup_required` is a node-local
-/// sandbox-manager state that reaches this column from nowhere. Adding variants
-/// for either would force every `match` in the repo to handle a lifecycle the
-/// cluster never assigns.
+/// `tombstone_retention`. Adding a variant for it would force every `match` in
+/// the repo to handle a lifecycle no live path acts on.
 ///
 /// A constant rather than a literal inside the `format!` so this set is the same
 /// kind of thing as the include-list it is deliberately not
 /// ([`RESIDENT_LIFECYCLES`], in this module), and so the difference between them
 /// can be computed rather than described.
-pub const NON_RESIDENT_LIFECYCLES: &[&str] =
-    &["failed", "cleanup_required", "deleted", "suspended"];
+pub const NON_RESIDENT_LIFECYCLES: &[&str] = &["failed", "deleted", "suspended"];
 
 /// Renders [`NON_RESIDENT_LIFECYCLES`] as a `lifecycle NOT IN (…)` fragment for
 /// the `sandboxes` row aliased `sandbox_alias`.

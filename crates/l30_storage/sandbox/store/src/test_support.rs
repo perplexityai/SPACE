@@ -77,10 +77,7 @@ const STORED_LIFECYCLES: [StoredSandboxLifecycle;
 
 /// The stored values outside the live vocabulary, in `tombstone_position`
 /// order. A new stored-only variant has to be listed here by hand.
-const TOMBSTONES: [StoredSandboxLifecycle; 2] = [
-    StoredSandboxLifecycle::Deleted,
-    StoredSandboxLifecycle::CleanupRequired,
-];
+const TOMBSTONES: [StoredSandboxLifecycle; 1] = [StoredSandboxLifecycle::Deleted];
 
 /// Each tombstone's position in [`TOMBSTONES`], which the build of
 /// [`STORED_LIFECYCLES`] checks for every listed tombstone. Wildcard-free over
@@ -91,7 +88,6 @@ const fn tombstone_position(lifecycle: StoredSandboxLifecycle) -> Option<usize> 
     match lifecycle {
         StoredSandboxLifecycle::Live(_) => None,
         StoredSandboxLifecycle::Deleted => Some(0),
-        StoredSandboxLifecycle::CleanupRequired => Some(1),
     }
 }
 

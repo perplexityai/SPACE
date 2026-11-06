@@ -310,9 +310,7 @@ fn active_resident_is_an_exclusion_list_carrying_the_census_term() {
     // The exact clause, not four `contains` checks: a fifth exclusion silently
     // released a whole lifecycle's worth of nodes, and `contains` would pass.
     assert!(
-        fragment.contains(
-            "sandboxes.lifecycle NOT IN ('failed', 'cleanup_required', 'deleted', 'suspended')"
-        ),
+        fragment.contains("sandboxes.lifecycle NOT IN ('failed', 'deleted', 'suspended')"),
         "an include-list, a reordering, or a fifth exclusion all change which \
          nodes get released: {fragment}"
     );

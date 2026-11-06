@@ -111,7 +111,8 @@ impl SandboxRestoreState {
 /// The owning row's lifecycle as far as this loop can vouch for it.
 ///
 /// `sandboxes.lifecycle` can hold values `SandboxLifecycle` has no variant for
-/// (e.g. the node-local `cleanup_required`), and `managed_by` can name a
+/// (the `deleted` tombstone, or stray text in the CHECK-less column), and
+/// `managed_by` can name a
 /// substrate other than Kubernetes. Decoding either straight into the enum — or
 /// filtering such rows out of the query — is wrong for a destructive loop: a
 /// decode error fails the whole batch every tick (silently disabling the

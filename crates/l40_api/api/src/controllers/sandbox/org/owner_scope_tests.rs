@@ -410,10 +410,10 @@ async fn scoped_sandbox_page_bounds_the_bytes_it_returns() -> TestResult {
     Ok(())
 }
 
-/// ECW reads both delete tombstones as not found, so they take no place on a
-/// list page: with tombstones between the live rows, every page but the last
-/// is full of live rows, and following the cursor visits each live row once,
-/// in order. The federated walk crosses both arms of its statement.
+/// ECW reads a `deleted` tombstone as not found, so tombstones take no place
+/// on a list page: with tombstones between the live rows, every page but the
+/// last is full of live rows, and following the cursor visits each live row
+/// once, in order. The federated walk crosses both arms of its statement.
 #[tokio::test]
 async fn scoped_sandbox_pages_leave_out_tombstones() -> TestResult {
     let fixture = scope_fixture().await?;
@@ -423,15 +423,15 @@ async fn scoped_sandbox_pages_leave_out_tombstones() -> TestResult {
     let lifecycles = [
         "started",
         "deleted",
-        "cleanup_required",
+        "deleted",
         "suspended",
         "started",
         "deleted",
         "deleted",
-        "cleanup_required",
+        "deleted",
         "started",
         "paused",
-        "cleanup_required",
+        "deleted",
         "started",
     ];
     let mut live = Vec::new();

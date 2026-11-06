@@ -73,23 +73,22 @@ fn counted_by(lifecycle: SandboxLifecycle) -> CountedBy {
 ///   API's status handler and pruned later by `tombstone_retention`. It has to
 ///   stay outside this gate: tombstones outlive the sandbox by design, so
 ///   counting one would hold its node in `draining` until retention ran.
-/// * `cleanup_required` — a node-local sandbox-manager state. Nothing writes it
-///   to this column, but the terminator's guard excludes it, so the exclusion
-///   is exercised rather than argued.
 fn stored_counted_by(stored: StoredSandboxLifecycle) -> CountedBy {
     match stored {
         StoredSandboxLifecycle::Live(lifecycle) => counted_by(lifecycle),
-        StoredSandboxLifecycle::Deleted | StoredSandboxLifecycle::CleanupRequired => {
-            CountedBy::NeitherGate
-        }
+        StoredSandboxLifecycle::Deleted => CountedBy::NeitherGate,
     }
 }
 
-/// `cleanup_failed` stands in for *any* value neither list knows. An
-/// exclusion list is fail-closed for those: it counts them, so an unmodelled
-/// lifecycle holds the node instead of silently releasing it.
-const UNMODELLED_LIFECYCLES: &[(&str, CountedBy)] =
-    &[("cleanup_failed", CountedBy::TerminatorOnly)];
+/// Values neither list knows. An exclusion list is fail-closed for those: it
+/// counts them, so an unmodelled lifecycle holds the node instead of silently
+/// releasing it. `cleanup_required` and `cleanup_failed` are node-local
+/// sandbox-manager labels that no control-plane writer stores; they stand in
+/// for any stray value.
+const UNMODELLED_LIFECYCLES: &[(&str, CountedBy)] = &[
+    ("cleanup_required", CountedBy::TerminatorOnly),
+    ("cleanup_failed", CountedBy::TerminatorOnly),
+];
 
 /// A node in `draining`. `heartbeat` decides whether the control plane can see
 /// it, which is what decides whether the census discount is even available —

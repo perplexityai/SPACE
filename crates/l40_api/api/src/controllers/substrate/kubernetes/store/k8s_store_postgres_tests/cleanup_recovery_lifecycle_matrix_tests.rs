@@ -45,7 +45,6 @@ const EXPECTED: &[&str] = &[
     "quarantined        .         .",
     "failed             .         .",
     "deleted            .         .",
-    "cleanup_required   .         .",
     "bogus              .         .",
     "_Suspended_        .         .",
 ];

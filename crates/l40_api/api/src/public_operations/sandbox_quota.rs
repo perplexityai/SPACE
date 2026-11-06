@@ -4,8 +4,8 @@
 //! A create is held to its organization's limit, which counts every live
 //! sandbox of the org whoever owns it, and, for a federated-identity caller,
 //! to a per-subject limit that counts the subject's own. "Live" excludes the
-//! terminal set the lifecycle guards use (`failed`, `quarantined`, `deleted`,
-//! `cleanup_required`); queued or running native creates without a live row
+//! terminal set the lifecycle guards use (`failed`, `quarantined`,
+//! `deleted`); queued or running native creates without a live row
 //! count too. A create targets its public sandbox id, the row's id with the
 //! public prefix, so one past its row insert is counted once.
 //!
@@ -411,7 +411,7 @@ const SANDBOXES_HELD: &str = sql!(
             SELECT s.user_id
               FROM sandboxes s
              WHERE s.org_id = $1
-               AND s.lifecycle NOT IN ('failed', 'quarantined', 'deleted', 'cleanup_required')
+               AND s.lifecycle NOT IN ('failed', 'quarantined', 'deleted')
             UNION ALL
             SELECT op.actor_user_id
               FROM public_operations op
@@ -431,7 +431,7 @@ const SANDBOXES_HELD: &str = sql!(
                               THEN substr(op.target_id, length($5) + 1)::uuid
                           END
                       AND s.org_id = $1
-                      AND s.lifecycle NOT IN ('failed', 'quarantined', 'deleted', 'cleanup_required')
+                      AND s.lifecycle NOT IN ('failed', 'quarantined', 'deleted')
                )
        ) held"
 );

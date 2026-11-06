@@ -166,13 +166,11 @@ pub(super) struct TerminateOccupancy {
 }
 
 /// The lifecycle scope of the `active` occupancy count: everything that has
-/// neither terminated (`failed` / `cleanup_required` / `deleted`) nor migrated
-/// off the node (`suspended`).
+/// neither terminated (`failed` / `deleted`) nor migrated off the node
+/// (`suspended`).
 ///
-/// `cleanup_required` and `deleted` are not values `SandboxLifecycle` produces
-/// today — the column is TEXT and they are retained defensively for rows an
-/// older schema may have written. Keeping them costs nothing and dropping them
-/// would silently start counting any such row as occupancy.
+/// `deleted` is not a value `SandboxLifecycle` produces: it is the tombstone
+/// raw SQL writes into the TEXT column.
 ///
 /// Shared by the batched listing count and this module's in-transaction
 /// `:terminate` guard, so the *lifecycle scope* an operator reads and the one

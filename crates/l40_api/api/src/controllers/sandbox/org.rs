@@ -46,14 +46,15 @@ pub(super) struct ScopedPageRow {
 }
 
 /// The local org's sandboxes ($1) after the cursor, matching the metadata
-/// filter $5. ECW reads both delete tombstones as not found, so they are left
-/// out before the page and its lookahead, as the native list leaves them out.
+/// filter $5. ECW reads a `deleted` tombstone as not found, so tombstones are
+/// left out before the page and its lookahead, as the native list leaves them
+/// out.
 const LOCAL_ORG_CANDIDATE_ROWS: &str = "SELECT s.id, s.created_at
     FROM sandboxes s
     JOIN users owner_user ON owner_user.id = s.user_id
     WHERE owner_user.owner_source = 'local'
       AND s.org_id = $1
-      AND s.lifecycle NOT IN ('deleted', 'cleanup_required')
+      AND s.lifecycle NOT IN ('deleted')
       AND {after_cursor}
       AND ($5::jsonb IS NULL OR s.metadata @> $5::jsonb)
     ORDER BY s.created_at DESC, s.id DESC
@@ -89,7 +90,7 @@ const FEDERATED_SUBJECT_CANDIDATE_ROWS: &str = "SELECT candidate.id, candidate.c
            AND owner_org.upstream_issuer = $1
            AND owner_org.upstream_org_id = $2
            AND owner_user.upstream_subject_id = $3
-           AND s.lifecycle NOT IN ('deleted', 'cleanup_required')
+           AND s.lifecycle NOT IN ('deleted')
            AND {after_cursor}
            AND ($7::jsonb IS NULL OR s.metadata @> $7::jsonb)
          ORDER BY s.created_at DESC, s.id DESC
@@ -100,7 +101,7 @@ const FEDERATED_SUBJECT_CANDIDATE_ROWS: &str = "SELECT candidate.id, candidate.c
          JOIN users owner_user ON owner_user.id = s.user_id
          WHERE owner_user.owner_source = 'local'
            AND s.org_id = $8
-           AND s.lifecycle NOT IN ('deleted', 'cleanup_required')
+           AND s.lifecycle NOT IN ('deleted')
            AND {after_cursor}
            AND ($7::jsonb IS NULL OR s.metadata @> $7::jsonb)
          ORDER BY s.created_at DESC, s.id DESC

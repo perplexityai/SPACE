@@ -12,9 +12,8 @@ use serde::Serialize;
 pub(super) enum PublishedStatus {
     /// A stored `sandboxes.lifecycle` value, spelled with any ASCII case and
     /// surrounding whitespace. This is the stored vocabulary, not the
-    /// node's: a node's `cleanup_failed` is `Unrecognized`, and its
-    /// `cleanup_required` reads as the stored tombstone. No ingest decision
-    /// compares either.
+    /// node's: a node's `cleanup_required` and `cleanup_failed` are
+    /// `Unrecognized`. No ingest decision compares either.
     Known(StoredSandboxLifecycle),
     /// Any other text, trimmed. It names no lifecycle, so every ingest
     /// decision on the lifecycle treats it like any status other than the one

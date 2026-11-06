@@ -244,7 +244,7 @@ fn sandbox_row(
         // repair snapshot). An unrecorded one is runnable only with a live
         // execution, which the route tests cover; here it's the dead case.
         runnable: match lifecycle {
-            "cleanup_required" | "deleting" => false,
+            "deleting" => false,
             "failed" => recorded,
             _ => true,
         },
@@ -425,9 +425,9 @@ fn sandboxes_that_cant_run_are_reported_but_never_gate() {
     let (e0, e1) = (environment(0), environment(1));
     let dead = Population::from_rows(
         vec![
-            sandbox_row(Some(e0.to_string()), true, "cleanup_required", 2),
-            sandbox_row(None, false, "cleanup_required", 1),
-            sandbox_row(Some("x".into()), true, "cleanup_required", 1),
+            sandbox_row(Some(e0.to_string()), true, "deleting", 2),
+            sandbox_row(None, false, "deleting", 1),
+            sandbox_row(Some("x".into()), true, "deleting", 1),
         ],
         vec![],
     );
@@ -443,7 +443,7 @@ fn sandboxes_that_cant_run_are_reported_but_never_gate() {
     // run is the query's rule; the population route test covers it.)
     let mixed = Population::from_rows(
         vec![
-            sandbox_row(Some(e0.to_string()), true, "cleanup_required", 2),
+            sandbox_row(Some(e0.to_string()), true, "deleting", 2),
             sandbox_row(Some(e0.to_string()), true, "stopped", 1),
         ],
         vec![],

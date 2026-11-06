@@ -71,7 +71,6 @@ async fn the_org_limit_counts_every_owner_and_a_subject_limit_its_own() -> TestR
         (local, org_id, SandboxId::new(), "deleted"),
         (local, org_id, SandboxId::new(), "failed"),
         (local, org_id, SandboxId::new(), "quarantined"),
-        (local, org_id, SandboxId::new(), "cleanup_required"),
         (subject_a, org_id, SandboxId::new(), "started"),
         (subject_b, org_id, SandboxId::new(), "suspended"),
         (other_org_user, other_org_id, SandboxId::new(), "started"),

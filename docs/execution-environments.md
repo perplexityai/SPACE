@@ -1056,8 +1056,8 @@ resolve to, or an enabled pool config pins it, which keeps creating slots. An
 in-use release counts when it's bound to an environment that stops, or when its
 environment can't be told, since new creates from it may run there. A superseded
 release doesn't count: it strands work only through the sandboxes made from it,
-which do count. Nor do sandboxes that can't run again: `cleanup_required` and
-`deleting` ones, and failed ones with no evidence the repair loop reads as live
+which do count. Nor do sandboxes that can't run again: `deleting` ones, and
+failed ones with no evidence the repair loop reads as live
 (an observation with a non-failed status, a pid or a node assignment, or an
 execution still active or holding a pod IP) that the repair loop, which runs
 only on Kubernetes, has nothing to revert to. Later defaults stop nothing, and

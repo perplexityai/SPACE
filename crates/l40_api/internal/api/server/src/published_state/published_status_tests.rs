@@ -32,11 +32,10 @@ fn padding_and_ascii_case_do_not_change_the_lifecycle() {
     ] {
         assert_eq!(PublishedStatus::parse(Some(raw)), started, "{raw:?}");
     }
+    // A node's cleanup status is not a stored lifecycle.
     assert_eq!(
         PublishedStatus::parse(Some(" Cleanup_Required ")),
-        Some(PublishedStatus::Known(
-            StoredSandboxLifecycle::CleanupRequired
-        ))
+        Some(PublishedStatus::Unrecognized("Cleanup_Required".to_owned()))
     );
 }
 

@@ -26,7 +26,7 @@
 //! (a node's `started` receipt, a Kubernetes restore owner's `started`).
 //! Every other value is refused, except where a bullet below says otherwise:
 //!
-//! * `failed`, `quarantined`, `deleted` and `cleanup_required`: the safety
+//! * `failed`, `quarantined` and `deleted`: the safety
 //!   contract with the transient-lifecycle sweeper. If the sweeper failed the
 //!   row (and tore its execution down) while the substrate call was in
 //!   flight, the stamp must not resurrect it as live.

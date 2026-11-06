@@ -245,7 +245,6 @@ async fn store_prunes_only_expired_deleted_sandboxes_of_every_stored_lifecycle()
         "quarantined       .",
         "failed            .",
         "deleted           A",
-        "cleanup_required  .",
         "bogus             .",
         "_Suspended_       .",
     ];

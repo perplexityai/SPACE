@@ -933,8 +933,8 @@ struct PopulationCounts {
     sandboxes: u64,
     /// `sandboxes`, split by raw `sandboxes.lifecycle`.
     sandboxes_by_lifecycle: BTreeMap<String, u64>,
-    /// How many of `sandboxes` can't run again: `cleanup_required` or
-    /// `deleting`, or `failed` with no live evidence and nothing the repair
+    /// How many of `sandboxes` can't run again: `deleting`, or `failed`
+    /// with no live evidence and nothing the repair
     /// loop could revert to.
     sandboxes_not_runnable: u64,
     template_releases: u64,

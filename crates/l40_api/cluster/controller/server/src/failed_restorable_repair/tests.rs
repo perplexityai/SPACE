@@ -565,7 +565,6 @@ async fn f4b_repair_reverts_only_a_row_still_failed() -> TestResult {
         "quarantined       .",
         "failed            A",
         "deleted           .",
-        "cleanup_required  .",
         "bogus             .",
         "_Suspended_       .",
     ];
