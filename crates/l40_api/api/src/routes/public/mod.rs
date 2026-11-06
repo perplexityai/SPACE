@@ -377,3 +377,7 @@ mod tests;
 #[cfg(test)]
 #[path = "native_data_plane_tests.rs"]
 mod native_data_plane_tests;
+
+#[cfg(test)]
+#[path = "body_validation_tests.rs"]
+mod body_validation_tests;

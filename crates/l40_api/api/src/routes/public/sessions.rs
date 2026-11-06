@@ -1,4 +1,5 @@
 use pplx_space_accounts::{OrgId, UserId};
+use pplx_space_public_api_http::PublicJson;
 
 use crate::metrics::operations::InlineAdmissionPath;
 use axum::{
@@ -71,7 +72,7 @@ pub async fn create_terminal_session(
     Extension(AuthUser(actor)): Extension<AuthUser>,
     headers: HeaderMap,
     Path(sandbox_id): Path<String>,
-    Json(request): Json<CreateTerminalSessionRequest>,
+    PublicJson(request): PublicJson<CreateTerminalSessionRequest>,
 ) -> Result<(StatusCode, Json<PublicSession>), PublicApiError> {
     validate_terminal_size(request.size.as_ref())?;
     let sandbox_id = parse_public_sandbox_id(&sandbox_id)?;
@@ -144,7 +145,7 @@ pub async fn create_process_session(
     Extension(AuthUser(actor)): Extension<AuthUser>,
     headers: HeaderMap,
     Path(sandbox_id): Path<String>,
-    Json(request): Json<CreateProcessRequest>,
+    PublicJson(request): PublicJson<CreateProcessRequest>,
 ) -> Result<(StatusCode, Json<PublicSession>), PublicApiError> {
     validate_process_request(&request)?;
     let sandbox_id = parse_public_sandbox_id(&sandbox_id)?;
@@ -203,7 +204,7 @@ pub async fn create_command(
     Extension(AuthUser(actor)): Extension<AuthUser>,
     headers: HeaderMap,
     Path(sandbox_id): Path<String>,
-    Json(request): Json<CreateCommandRequest>,
+    PublicJson(request): PublicJson<CreateCommandRequest>,
 ) -> Result<Response, PublicApiError> {
     let sandbox_id = parse_public_sandbox_id(&sandbox_id)?;
     let sandbox = ensure_sandbox_owner(authorized, &state.pool, org.id, sandbox_id).await?;
@@ -558,7 +559,7 @@ pub async fn create_file_watch_session(
     Extension(AuthUser(actor)): Extension<AuthUser>,
     headers: HeaderMap,
     Path(sandbox_id): Path<String>,
-    Json(request): Json<CreateFileWatchSessionRequest>,
+    PublicJson(request): PublicJson<CreateFileWatchSessionRequest>,
 ) -> Result<(StatusCode, Json<PublicSession>), PublicApiError> {
     if request.path.is_empty() {
         return Err(PublicApiError::bad_request("path must not be empty"));
@@ -606,7 +607,7 @@ pub async fn create_port_session(
     Extension(AuthUser(actor)): Extension<AuthUser>,
     headers: HeaderMap,
     Path(sandbox_id): Path<String>,
-    Json(request): Json<CreatePortSessionRequest>,
+    PublicJson(request): PublicJson<CreatePortSessionRequest>,
 ) -> Result<(StatusCode, Json<PublicSession>), PublicApiError> {
     if request.port == 0 {
         return Err(PublicApiError::bad_request(
@@ -670,7 +671,7 @@ pub async fn create_protocol_session(
     Extension(AuthUser(actor)): Extension<AuthUser>,
     headers: HeaderMap,
     Path(sandbox_id): Path<String>,
-    Json(request): Json<CreateProtocolSessionRequest>,
+    PublicJson(request): PublicJson<CreateProtocolSessionRequest>,
 ) -> Result<(StatusCode, Json<PublicSession>), PublicApiError> {
     if request.port == 0 {
         return Err(PublicApiError::bad_request(
