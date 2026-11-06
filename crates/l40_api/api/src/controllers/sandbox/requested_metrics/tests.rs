@@ -1,4 +1,5 @@
 use super::*;
+use crate::controllers::substrate::ActivationRejectionKind;
 
 #[test]
 fn only_a_request_shape_is_not_defaulted() {
@@ -54,12 +55,16 @@ fn only_cluster_admission_refusals_are_rejected() {
     let ok: Result<(), ControllerError> = Ok(());
     assert_eq!(admission(&ok), Some(AdmissionDecision::Accepted));
 
-    for rate_limited in [true, false] {
-        let error = ControllerError::cluster_admission_rejected("refused", None, rate_limited);
+    for kind in [
+        ActivationRejectionKind::RateLimited,
+        ActivationRejectionKind::EmptyCluster,
+        ActivationRejectionKind::NoFreeSlot,
+    ] {
+        let error = kind.controller_error("refused".into(), None);
         assert_eq!(
             admission::<()>(&Err(error)),
             Some(AdmissionDecision::Rejected),
-            "rate_limited:{rate_limited}"
+            "{kind:?}"
         );
     }
 

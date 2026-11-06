@@ -32,7 +32,9 @@ fn cluster_delete_miss_reason(err: &SubstrateError) -> &'static str {
         // set does not name a registered worker), or the node is unreachable.
         // The node was never contacted, so any local state definitely
         // survives.
-        SubstrateError::Unavailable { .. } => "node_unavailable",
+        SubstrateError::Unavailable { .. } | SubstrateError::Unschedulable { .. } => {
+            "node_unavailable"
+        }
         // The node was reached but the delete RPC failed / timed out / was
         // cancelled — local teardown is unconfirmed.
         SubstrateError::Failed { .. } => "node_delete_failed",
@@ -664,30 +666,6 @@ impl TryFrom<pplx_space_public_api::SandboxLifecycleAction> for SandboxAction {
 #[error("Unknown action: {0}")]
 pub struct UnknownSandboxActionError(pub String);
 
-fn cluster_admission_controller_error(
-    error: crate::cluster_admission::ClusterAdmissionError,
-) -> ControllerError {
-    // Admission only errors when out of capacity (fail-open cases are handled
-    // inside `admit_activation` and never reach here). Both map to a 429 +
-    // Retry-After, but only the rate-limit case carries the
-    // `ClusterActivationAdmission` cause that the async dispatcher treats as
-    // indefinite backpressure. Empty-cluster omits the cause so the dispatcher
-    // gives it a *bounded* retry (counted against the transient-error budget) —
-    // a durable capacity outage must eventually terminate the create rather than
-    // re-queue forever.
-    use crate::cluster_admission::ClusterAdmissionError;
-    match error {
-        ClusterAdmissionError::RateLimited {
-            message,
-            retry_after,
-        } => ControllerError::cluster_admission_rejected(message, Some(retry_after), true),
-        ClusterAdmissionError::EmptyCluster {
-            message,
-            retry_after,
-        } => ControllerError::cluster_admission_rejected(message, Some(retry_after), false),
-    }
-}
-
 /// Classify the cluster-activation cost of *implicitly* waking a sandbox from
 /// its currently-observed lifecycle. Covers the data-plane access path
 /// (`access_runtime_client`) and the control-plane `control_runtime_client`
@@ -734,7 +712,7 @@ async fn charge_implicit_activation(
     admission
         .admit_activation(class)
         .await
-        .map_err(cluster_admission_controller_error)
+        .map_err(ControllerError::from)
 }
 
 /// Access-path admission charge. The substrate honors the sandbox's auto-wake
@@ -822,7 +800,20 @@ impl SandboxController {
         admission
             .admit_activation(class)
             .await
-            .map_err(cluster_admission_controller_error)
+            .map_err(ControllerError::from)
+    }
+
+    /// [`Self::admit_cluster_activation`] for a cold create, the one activation
+    /// that always builds a new pod kube-scheduler places, which the slot check
+    /// also reads.
+    pub(super) async fn admit_cluster_cold_create(&self) -> Result<(), ControllerError> {
+        let Some(admission) = self.cluster_admission.as_ref() else {
+            return Ok(());
+        };
+        admission
+            .admit_cold_create()
+            .await
+            .map_err(ControllerError::from)
     }
 
     async fn admit_action_cluster_activation(

@@ -48,12 +48,7 @@ async fn control_runtime_client_wakes_only_kubernetes_rows_after_an_unreachable_
             Substrate::from_direct(crate::controllers::substrate::direct::DirectSubstrate::new(
                 pool.clone(),
             )),
-            crate::cluster_admission::ClusterSandboxAdmissionConfig {
-                enabled: true,
-                refill_rps: 6.0,
-                burst: 60.0,
-                redis_url: None,
-            },
+            crate::test_support::enabled_config(),
             pplx_space_feature_flags::FeatureFlagClient::disabled(),
         );
         let controller = crate::controllers::sandbox::SandboxController::with_cluster_admission(

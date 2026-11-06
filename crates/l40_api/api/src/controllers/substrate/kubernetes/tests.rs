@@ -24,6 +24,7 @@ pub(crate) use kubernetes_tests::{
 
 mod native_pod_failover;
 mod runtime_upgrade_dispatch;
+mod slot_headroom;
 mod substrate_scope;
 
 mod kubernetes_tests {
@@ -6341,10 +6342,9 @@ mod kubernetes_tests {
                 crate::controllers::substrate::direct::DirectSubstrate::new(pool.clone()),
             ),
             crate::cluster_admission::ClusterSandboxAdmissionConfig {
-                enabled: true,
                 refill_rps: 1.0,
                 burst: 1.0,
-                redis_url: None,
+                ..crate::test_support::enabled_config()
             },
             pplx_space_feature_flags::FeatureFlagClient::disabled(),
         )
@@ -9937,12 +9937,7 @@ mod kubernetes_tests {
                 Substrate::from_direct(
                     crate::controllers::substrate::direct::DirectSubstrate::new(pool),
                 ),
-                crate::cluster_admission::ClusterSandboxAdmissionConfig {
-                    enabled: true,
-                    refill_rps: 6.0,
-                    burst: 60.0,
-                    redis_url: None,
-                },
+                crate::test_support::enabled_config(),
                 pplx_space_feature_flags::FeatureFlagClient::disabled(),
             ),
         );
@@ -10001,12 +9996,7 @@ mod kubernetes_tests {
                 Substrate::from_direct(
                     crate::controllers::substrate::direct::DirectSubstrate::new(pool.clone()),
                 ),
-                crate::cluster_admission::ClusterSandboxAdmissionConfig {
-                    enabled: true,
-                    refill_rps: 6.0,
-                    burst: 60.0,
-                    redis_url: None,
-                },
+                crate::test_support::enabled_config(),
                 pplx_space_feature_flags::FeatureFlagClient::disabled(),
             ),
         );
@@ -10079,12 +10069,7 @@ mod kubernetes_tests {
                 Substrate::from_direct(
                     crate::controllers::substrate::direct::DirectSubstrate::new(pool.clone()),
                 ),
-                crate::cluster_admission::ClusterSandboxAdmissionConfig {
-                    enabled: true,
-                    refill_rps: 6.0,
-                    burst: 60.0,
-                    redis_url: None,
-                },
+                crate::test_support::enabled_config(),
                 pplx_space_feature_flags::FeatureFlagClient::disabled(),
             ),
         );
@@ -10146,12 +10131,7 @@ mod kubernetes_tests {
                 Substrate::from_direct(
                     crate::controllers::substrate::direct::DirectSubstrate::new(pool.clone()),
                 ),
-                crate::cluster_admission::ClusterSandboxAdmissionConfig {
-                    enabled: true,
-                    refill_rps: 6.0,
-                    burst: 60.0,
-                    redis_url: None,
-                },
+                crate::test_support::enabled_config(),
                 pplx_space_feature_flags::FeatureFlagClient::disabled(),
             ),
         );
@@ -10209,12 +10189,7 @@ mod kubernetes_tests {
             Substrate::from_direct(crate::controllers::substrate::direct::DirectSubstrate::new(
                 pool.clone(),
             )),
-            crate::cluster_admission::ClusterSandboxAdmissionConfig {
-                enabled: true,
-                refill_rps: 6.0,
-                burst: 60.0,
-                redis_url: None,
-            },
+            crate::test_support::enabled_config(),
             pplx_space_feature_flags::FeatureFlagClient::disabled(),
         );
         let controller = crate::controllers::sandbox::SandboxController::with_cluster_admission(
@@ -11085,7 +11060,7 @@ mod kubernetes_tests {
         let message = pod
             .unschedulable_message()
             .expect("pod should be unschedulable");
-        let err = SubstrateError::Unavailable {
+        let err = SubstrateError::Unschedulable {
             message: format!("sandbox pod is unschedulable: {message}"),
         };
 
