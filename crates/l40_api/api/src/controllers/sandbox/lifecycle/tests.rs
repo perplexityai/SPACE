@@ -68,59 +68,81 @@ fn cluster_delete_miss_reason_classifies_by_substrate_error() {
     );
 }
 
-/// Admission refusals at request entry and those the substrate charges later
-/// share one constructor, which marks them as admission refusals. Only a
-/// rate-limited refusal carries the backpressure cause the async dispatcher
-/// re-queues behind; an empty cluster keeps its bounded retry.
 #[test]
 fn requested_size_kind_classifies_by_action_and_entry_lifecycle() {
-    let access = SandboxAction::ImplicitWake(ExecutionActivityKind::Access);
-    for (action, lifecycle, expected) in [
+    use SandboxAction::*;
+    use SandboxLifecycle::{Created, Paused, Stopped, Suspended};
+
+    // Each row lists the dormant states that require activation and the
+    // resident states that only resume. Every other lifecycle must be excluded,
+    // including already-running, in-flight and terminal sandboxes.
+    for (action, activations, resumes, without_lifecycle) in [
         (
-            SandboxAction::Start,
-            SandboxLifecycle::Stopped,
+            Start,
+            &[Created, Stopped, Suspended][..],
+            &[][..],
             Some(RequestedKind::Activate),
         ),
         (
-            SandboxAction::Wake,
-            SandboxLifecycle::Suspended,
+            Wake,
+            &[Created, Stopped, Suspended][..],
+            &[Paused][..],
+            None,
+        ),
+        (
+            ImplicitWake(ExecutionActivityKind::Access),
+            &[Created, Stopped, Suspended][..],
+            &[Paused][..],
+            None,
+        ),
+        (Resume, &[][..], &[Paused][..], None),
+        (
+            Restore,
+            &[Suspended][..],
+            &[][..],
             Some(RequestedKind::Activate),
         ),
-        (
-            SandboxAction::Restore,
-            SandboxLifecycle::Suspended,
-            Some(RequestedKind::Activate),
-        ),
-        (
-            SandboxAction::Resume,
-            SandboxLifecycle::Paused,
-            Some(RequestedKind::Resume),
-        ),
-        // An ECW connect wakes, so un-pausing through it counts as a resume.
-        (
-            SandboxAction::Wake,
-            SandboxLifecycle::Paused,
-            Some(RequestedKind::Resume),
-        ),
-        (
-            access,
-            SandboxLifecycle::Paused,
-            Some(RequestedKind::Resume),
-        ),
-        (SandboxAction::Wake, SandboxLifecycle::Started, None),
-        (SandboxAction::Resume, SandboxLifecycle::Started, None),
-        (SandboxAction::Restore, SandboxLifecycle::Started, None),
-        (SandboxAction::Stop, SandboxLifecycle::Started, None),
-        (SandboxAction::Pause, SandboxLifecycle::Started, None),
+        (Suspend, &[][..], &[][..], None),
+        (Stop, &[][..], &[][..], None),
+        (Kill, &[][..], &[][..], None),
+        (Pause, &[][..], &[][..], None),
+        (Checkpoint, &[][..], &[][..], None),
+        (EnableSnapshots, &[][..], &[][..], None),
+        (DisableSnapshots, &[][..], &[][..], None),
+        (Stats, &[][..], &[][..], None),
+        (OpenPort, &[][..], &[][..], None),
+        (Rollback, &[][..], &[][..], None),
+        (Spaced, &[][..], &[][..], None),
+        (Update, &[][..], &[][..], None),
     ] {
+        for &lifecycle in SandboxLifecycle::all() {
+            let expected = if activations.contains(&lifecycle) {
+                Some(RequestedKind::Activate)
+            } else if resumes.contains(&lifecycle) {
+                Some(RequestedKind::Resume)
+            } else {
+                None
+            };
+            assert_eq!(
+                action.requested_size_kind(Some(lifecycle)),
+                expected,
+                "{action:?} from {lifecycle:?}"
+            );
+        }
+        // Start and Restore conservatively classify missing context as an
+        // activation; Wake needs a known dormant state and Resume a paused one.
         assert_eq!(
-            action.requested_size_kind(Some(lifecycle)),
-            expected,
-            "{action:?} from {lifecycle:?}"
+            action.requested_size_kind(None),
+            without_lifecycle,
+            "{action:?} without lifecycle context"
         );
     }
 }
 
+/// Admission refusals at request entry and those the substrate charges later
+/// share one constructor, which marks them as admission refusals. Only a
+/// rate-limited refusal carries the backpressure cause the async dispatcher
+/// re-queues behind; an empty cluster keeps its bounded retry.
 #[test]
 fn admission_refusals_keep_their_dispatcher_retry_causes() {
     use crate::cluster_admission::ClusterAdmissionError;
