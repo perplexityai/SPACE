@@ -95,7 +95,12 @@ db_private_outside_tests! {
              SELECT 1 FROM jobs j
              WHERE j.kind = 'snapshot_upload'
                AND j.subject_id = s.id
-               AND j.status IN ('pending', 'running')
+               AND j.status IN ('pending', 'running', 'cancelling')
+           )
+           AND NOT EXISTS (
+             SELECT 1 FROM sandbox_runtime_upgrades u
+             WHERE u.sandbox_id = s.id
+               AND u.phase IN ('fenced', 'preserved', 'booting', 'verified')
            )
          ORDER BY {IDLE_WITNESS_SQL} ASC, s.id ASC
          LIMIT ?4"

@@ -41,6 +41,15 @@ pub(crate) enum EvictionClaim {
     /// exact pinned artifact the eviction decision proved backed, or `None`
     /// asserting the row is still unpinned.
     SuspendedPinned(Option<LocalArtifactId>),
+    /// `suspended → deleting` for a copy a runtime upgrade replaces with the
+    /// checkpoint it was decided from: the proven pin, no upgrade owning the
+    /// row and no upload in flight, as for [`Self::SuspendedPinned`], and, in
+    /// place of a row version, the activation generations the upgrade checked
+    /// its activation against, since removing the row removes their fence.
+    StaleUpgradeCopy {
+        pin: LocalArtifactId,
+        generations: crate::db::ActivationGenerations,
+    },
     /// `restoring → deleting` for a row a failed cross-node restore retained
     /// "for retry" (`failure_reason` persisted, state left `restoring`).
     /// Only meaningful once the cluster reports the sandbox deleted — a
@@ -144,6 +153,25 @@ pub(crate) enum EvictionClaim {
     },
 }
 
+/// What still holds a suspended row that its eviction claim waits for: a
+/// runtime upgrade that still owns it, or an upload of its artifacts that may
+/// still read them. `None` when nothing does.
+fn suspended_eviction_hold(
+    db: &crate::db::Connection,
+    sandbox_id: &str,
+) -> Result<Option<String>, Status> {
+    let read_error = |error: crate::db::Error| Status::internal(format!("db read failed: {error}"));
+    if let Some(operation) =
+        crate::db::read::unretired_runtime_upgrade(db, sandbox_id).map_err(read_error)?
+    {
+        return Ok(Some(format!("runtime upgrade {operation}")));
+    }
+    if crate::db::read::snapshot_upload_in_flight(db, sandbox_id).map_err(read_error)? {
+        return Ok(Some("an upload of its artifacts".to_string()));
+    }
+    Ok(None)
+}
+
 impl SandboxManagerService {
     /// Remove a sandbox's entire local presence: claim the row with the
     /// CAS `claim` describes (see [`EvictionClaim`]), then run the standard `DeleteRow` cleanup to
@@ -167,7 +195,11 @@ impl SandboxManagerService {
     ///   with a persisted failure or `quarantined` at the version read, or not `suspending`
     ///   with the terminal teardown-backup marker, the same staged artifact
     ///   and the same `state_changed_at` (a concurrent resume / re-suspend /
-    ///   retry won the race); nothing was changed.
+    ///   retry won the race); a `suspended` row a runtime upgrade or an
+    ///   artifact upload still holds, or, for a stale upgrade copy, whose
+    ///   activation generations moved since they were read; nothing was
+    ///   changed. A cleanup the claim handed off can fail with this code too,
+    ///   and then the row is `deleting`.
     /// - other statuses — the claim succeeded but cleanup failed; the
     ///   row stays in `deleting` and the cleanup machinery converges on
     ///   retry (the same contract a failed Delete RPC has).
@@ -456,6 +488,7 @@ impl SandboxManagerService {
                     })?,
             ),
             EvictionClaim::SuspendedPinned(_)
+            | EvictionClaim::StaleUpgradeCopy { .. }
             | EvictionClaim::TeardownSuspendPermanentlyFailed { .. }
             | EvictionClaim::TeardownExecutionRetired { .. } => None,
         };
@@ -469,6 +502,14 @@ impl SandboxManagerService {
                         sandbox_id,
                         pin.as_deref(),
                         expected_updated_at,
+                    )
+                }
+                EvictionClaim::StaleUpgradeCopy { pin, generations } => {
+                    crate::db::claim_stale_upgrade_copy_for_eviction(
+                        &db,
+                        sandbox_id,
+                        &pin.to_string(),
+                        generations,
                     )
                 }
                 EvictionClaim::Stopped => crate::db::claim_stopped_sandbox_for_eviction(
@@ -528,7 +569,13 @@ impl SandboxManagerService {
                     format!("sandbox {sandbox_id} is no longer stopped at the observed row version")
                 }
                 EvictionClaim::SuspendedPinned(_) => format!(
-                    "sandbox {sandbox_id} is no longer suspended with the proven artifact pinned"
+                    "sandbox {sandbox_id} is no longer suspended with the proven artifact \
+                     pinned, or a runtime upgrade or an artifact upload still holds it"
+                ),
+                EvictionClaim::StaleUpgradeCopy { .. } => format!(
+                    "sandbox {sandbox_id} is no longer suspended with the proven artifact \
+                     pinned at the activation generations checked, or a runtime upgrade or an \
+                     artifact upload still holds it"
                 ),
                 EvictionClaim::FailedRestoring => format!(
                     "sandbox {sandbox_id} is no longer a failed cross-node restore at the \
@@ -617,8 +664,12 @@ impl SandboxManagerService {
     ///   `suspending`, not since the backup was refused) for the terminal
     ///   teardown suspend, whose row is touched by live loops without
     ///   changing (see [`EvictionClaim::TeardownSuspendPermanentlyFailed`]);
+    /// - a `suspended` row a runtime upgrade still owns, or whose artifacts an
+    ///   upload may still read, is refused as `Aborted`, so the caller retries
+    ///   on its next sync: the hold ends on its own, by the upgrade's
+    ///   recovery or the upload's last attempt;
     /// - the teardown CAS (`suspended → deleting` with the pinned-artifact
-    ///   identity re-asserted, `restoring/quarantined → deleting` at the exact row
+    ///   identity re-asserted and no such hold, `restoring/quarantined → deleting` at the exact row
     ///   version read, or `suspending → deleting` with the marker, staged
     ///   artifact and `state_changed_at` re-asserted) closes the remaining
     ///   window.
@@ -649,7 +700,7 @@ impl SandboxManagerService {
         // Both reads come off the same connection back to back, and every
         // claim re-asserts what it decided against, so a row that moves
         // between them fails its CAS rather than being acted on.
-        let (row, state_changed_at) = {
+        let (row, state_changed_at, held) = {
             let db = self.db_conn()?;
             let row = crate::db::read::sandbox(&db, &sandbox_id)
                 .map_err(|e| Status::internal(format!("db sandbox lookup failed: {e}")))?
@@ -657,11 +708,21 @@ impl SandboxManagerService {
             let state_changed_at = crate::db::read::state_changed_at_witness(&db, &sandbox_id)
                 .map_err(|e| Status::internal(format!("db sandbox lookup failed: {e}")))?
                 .ok_or_else(|| Status::not_found(format!("sandbox {sandbox_id} not found")))?;
-            (row, state_changed_at)
+            let held = suspended_eviction_hold(&db, &sandbox_id)?;
+            (row, state_changed_at, held)
         };
         let claim = match row.state {
             crate::state::SandboxState::Stopped => EvictionClaim::Stopped,
             crate::state::SandboxState::Quarantined => EvictionClaim::Quarantined,
+            // The claim refuses the row while an upgrade or an upload holds it,
+            // and such a hold ends on its own, so it's answered as a pull in
+            // flight is: retry on the next sync, not after a back-off.
+            crate::state::SandboxState::Suspended if let Some(hold) = held => {
+                return Err(Status::aborted(format!(
+                    "sandbox {sandbox_id} is held by {hold}; retry the cluster-deleted eviction \
+                     on the next sync"
+                )));
+            }
             crate::state::SandboxState::Suspended => {
                 EvictionClaim::SuspendedPinned(row.current_local_artifact_id)
             }
@@ -749,9 +810,11 @@ impl SandboxManagerService {
             | EvictionClaim::SuspendedPinned(_)
             | EvictionClaim::FailedRestoring
             | EvictionClaim::Quarantined => ("updated_at", row.updated_at.as_str()),
-            EvictionClaim::TeardownExecutionRetired { .. } => {
+            EvictionClaim::TeardownExecutionRetired { .. }
+            | EvictionClaim::StaleUpgradeCopy { .. } => {
                 return Err(Status::internal(
-                    "a cluster-deleted eviction never claims a retired teardown execution",
+                    "a cluster-deleted eviction never claims a retired teardown execution or a \
+                     runtime upgrade's stale copy",
                 ));
             }
         };
@@ -810,6 +873,7 @@ impl SandboxManagerService {
         } else {
             tracing::Span::none()
         };
+        let suspended_claim = matches!(claim, EvictionClaim::SuspendedPinned(_));
         let teardown = async move {
             let reason = crate::sandbox_eviction::EvictReason::ClusterRowAbsent;
             // Size estimate before the directory disappears; log/event
@@ -857,6 +921,25 @@ impl SandboxManagerService {
                     // updated_at moves without the row changing.
                     Some(&checked_updated_at),
                 ) => result,
+            };
+            // A hold that appeared after the check above refused the claim
+            // the same way; answer it as the check would have.
+            let result = match result {
+                Err(status)
+                    if suspended_claim && status.code() == tonic::Code::FailedPrecondition =>
+                {
+                    let held = service
+                        .db_conn()
+                        .and_then(|db| suspended_eviction_hold(&db, &sandbox_id))?;
+                    Err(match held {
+                        Some(hold) => Status::aborted(format!(
+                            "sandbox {sandbox_id} is held by {hold}; retry the cluster-deleted \
+                             eviction on the next sync"
+                        )),
+                        None => status,
+                    })
+                }
+                result => result,
             };
             if result.is_ok() {
                 pplx_space_metrics::sandbox_eviction::logical_bytes_freed(reason.as_str(), bytes);

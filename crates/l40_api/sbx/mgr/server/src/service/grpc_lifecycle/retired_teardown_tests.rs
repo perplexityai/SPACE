@@ -22,10 +22,13 @@ use crate::service::tests::service_tests::{
 use crate::snapshot_upload_jobs::RegistrationProbe;
 use crate::state::SandboxState;
 pub(super) use cluster_api_stub_tests::{
-    FinalizedBackup, finalized_backups, record_finalized_backup, with_cluster_api,
+    FinalizedBackup, finalized_backups, record_finalized_backup,
 };
 use cluster_api_stub_tests::{
     RETIRING, RetiringClusterApi, admitted_registrations, bound_upload_payload,
+};
+pub(in crate::service) use cluster_api_stub_tests::{
+    answer, with_cluster_api, with_cluster_api_and_env,
 };
 
 const GENERATION: i64 = 7;
