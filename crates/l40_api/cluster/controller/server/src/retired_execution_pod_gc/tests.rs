@@ -31,6 +31,7 @@ fn pod(name: &str, uid_raw: &str, sandbox_id: SandboxId, phase: PodPhase) -> Pod
         node_name: Some("node-1".to_string()),
         terminating: false,
         is_restore: false,
+        has_pod_ip: !matches!(phase, PodPhase::Pending),
         phase,
         all_containers_terminated: matches!(phase, PodPhase::Succeeded | PodPhase::Failed),
     }
@@ -63,6 +64,15 @@ fn reaps_a_terminal_pod_of_a_suspended_execution() {
     };
     assert_eq!(
         classify(&failed, Some(&row(sid, false, "deleted"))),
+        Disposition::Reap(ReapReason::TerminalRetired)
+    );
+    // A suspended sandbox's terminal restore pod is reaped too.
+    let restore = PodSnapshot {
+        is_restore: true,
+        ..failed
+    };
+    assert_eq!(
+        classify(&restore, Some(&row(sid, false, "suspended"))),
         Disposition::Reap(ReapReason::TerminalRetired)
     );
 }
@@ -116,6 +126,15 @@ fn leaves_retired_pods_that_may_still_hold_a_vm() {
     };
     assert_eq!(
         classify(&restore, Some(&row(sid, false, "replaced"))),
+        Disposition::Skip(SkipReason::RetiredNotProvablyIdle)
+    );
+    // Pending, but its sandbox came up (it has an IP), so a VM may exist.
+    let sandbox_up = PodSnapshot {
+        has_pod_ip: true,
+        ..pod("p", "u", sid, PodPhase::Pending)
+    };
+    assert_eq!(
+        classify(&sandbox_up, Some(&row(sid, false, "replaced"))),
         Disposition::Skip(SkipReason::RetiredNotProvablyIdle)
     );
     // Unknown phase.
