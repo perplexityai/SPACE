@@ -1,4 +1,5 @@
 use pplx_space_common_core::types::OrgId;
+use pplx_space_public_api_http::PublicJson;
 
 use std::str::FromStr;
 
@@ -129,13 +130,13 @@ pub async fn apply_process_action(
     Extension(AuthOrg(org)): Extension<AuthOrg>,
     authorized: Option<Extension<AuthorizedSandbox>>,
     Path((sandbox_id, process_id_and_action)): Path<(String, String)>,
-    body: Option<Json<Value>>,
+    body: Option<PublicJson<Value>>,
 ) -> Result<Json<ProcessMutationResponse>, PublicApiError> {
     let (process_id, action) = parse_process_action_segment(&process_id_and_action)?;
     match action {
         ProcessAction::Signal => {
             let request = body
-                .map(|Json(value)| serde_json::from_value::<ProcessSignalRequest>(value))
+                .map(|PublicJson(value)| serde_json::from_value::<ProcessSignalRequest>(value))
                 .transpose()
                 .map_err(|_| PublicApiError::bad_request("invalid signal request"))?
                 .ok_or_else(|| PublicApiError::bad_request("signal request body is required"))?;
