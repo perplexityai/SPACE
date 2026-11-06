@@ -45,3 +45,39 @@ async fn cancelled_flush_retains_execution_slot_until_worker_finishes() {
         .await
         .expect("settled flush releases admission");
 }
+
+/// Every Ping carries the guest's used memory, draining or not, and a guest
+/// that cannot read it still answers: the value is telemetry, not health.
+/// The handler is called directly because a drain takes the process-wide
+/// warning record, which another test in the same binary may be reading.
+#[tokio::test]
+async fn bridge_ping_reports_used_memory_without_depending_on_it() {
+    let sources: [fn() -> Option<u64>; 3] = [|| Some(512 << 20), || Some(0), || None];
+    for source in sources {
+        let service = SpacedGuestService::with_config(
+            CancellationToken::new(),
+            SpacedGuestServiceConfig {
+                host_connector_type: HostConnectorType::Uds(PathBuf::from("unused.sock")),
+                local_socket_path: None,
+                bridge_socket_path: None,
+                guest_memory_used_source: source,
+                ..Default::default()
+            },
+        )
+        .expect("guest service");
+        for drain_diagnostics in [false, true] {
+            let response = BridgeGuestMeta::ping(
+                &service,
+                Request::new(BridgeGuestPingRequest { drain_diagnostics }),
+            )
+            .await
+            .expect("ping succeeds")
+            .into_inner();
+            assert_eq!(
+                response.memory_used_bytes,
+                source(),
+                "drain_diagnostics={drain_diagnostics}"
+            );
+        }
+    }
+}

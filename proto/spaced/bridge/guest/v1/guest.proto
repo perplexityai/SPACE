@@ -71,6 +71,10 @@ message PingResponse {
   repeated GuestDiagnosticCallsite diagnostics = 1;
   // Events at callsites past the guest's bound, counted but not listed.
   uint64 diagnostics_dropped = 2;
+  // Guest MemTotal - MemAvailable, in bytes, read on every Ping whether or not
+  // it drains. Absent when unsupported or unavailable, and from guests that
+  // predate it.
+  optional uint64 memory_used_bytes = 3;
 }
 
 message GuestDiagnosticCallsite {
