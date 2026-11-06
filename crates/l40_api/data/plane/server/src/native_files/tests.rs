@@ -5,6 +5,7 @@
 mod drain;
 mod fakes;
 mod mutations;
+mod transport_failure;
 mod write;
 
 use std::sync::{

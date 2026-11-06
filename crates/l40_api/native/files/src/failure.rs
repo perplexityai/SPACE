@@ -18,6 +18,10 @@ pub trait FileCallFailure: fmt::Display {
     fn is_lock_contention(&self) -> bool;
 }
 
+/// How long a caller waits before sending again a call whose connection to
+/// the runtime failed: a new connection is dialed for the next call.
+const TRANSPORT_FAILURE_RETRY_AFTER: Duration = Duration::from_secs(1);
+
 /// A worker's gRPC status, read as an HTTP failure.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkerFailure {
@@ -38,6 +42,19 @@ impl WorkerFailure {
                 message: format!("sandbox storage is full: {}", status.message()),
                 retry_after: None,
                 refused_before_start: false,
+                guest_path_not_found: false,
+            };
+        }
+        if pplx_space_common_grpc::is_client_transport_failure(status) {
+            // The client's own connection to the runtime failed before the
+            // runtime answered: the runtime could not be reached, which a
+            // retry over a new connection can fix. A call that was never sent
+            // was refused before it started.
+            return Self {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                message: status.message().to_owned(),
+                retry_after: Some(TRANSPORT_FAILURE_RETRY_AFTER),
+                refused_before_start: pplx_space_common_grpc::is_client_connect_failure(status),
                 guest_path_not_found: false,
             };
         }

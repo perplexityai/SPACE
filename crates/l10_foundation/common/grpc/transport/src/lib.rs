@@ -100,6 +100,7 @@ pub use status::{
     uds_per_sandbox_limit_exceeded_status, with_retry_after,
 };
 pub use trace::{
-    CLIENT_SERVICE_METADATA_KEY, ExpectedGrpcStatus, GrpcClientTrace, current_service_name,
-    is_untraced_grpc_path, set_current_service_name, trace_grpc_client_transport,
+    CLIENT_SERVICE_METADATA_KEY, ExpectedGrpcStatus, GrpcClientTrace, RetriedOnTransportFailure,
+    current_service_name, is_untraced_grpc_path, set_current_service_name,
+    trace_grpc_client_transport,
 };

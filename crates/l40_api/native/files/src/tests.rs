@@ -59,3 +59,47 @@ fn every_files_route_is_one_operation() {
     operations.sort_unstable();
     assert_eq!(operations, routes);
 }
+
+/// A status the client made because its connection failed, with `error` as
+/// its source, as tonic makes one.
+fn client_transport_status(
+    mut status: tonic::Status,
+    error: impl std::error::Error + Send + Sync + 'static,
+) -> tonic::Status {
+    status.set_source(std::sync::Arc::new(error));
+    status
+}
+
+#[test]
+fn a_runtime_the_connection_to_failed_is_answered_as_unreachable_and_retryable() {
+    use http::StatusCode;
+
+    // The connection failed with the call on it: the runtime may have
+    // received it.
+    let broke = WorkerFailure::from_status(&client_transport_status(
+        tonic::Status::unknown("transport error"),
+        std::io::Error::from(std::io::ErrorKind::ConnectionReset),
+    ));
+    assert_eq!(broke.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(broke.retry_after(), Some(std::time::Duration::from_secs(1)));
+    assert!(!broke.is_refused_before_start());
+    assert!(matches!(
+        file_call_error(&broke).kind,
+        FileCallErrorKind::Unavailable { .. }
+    ));
+    // Not unprotected-mutation retryable: it may have taken effect.
+    assert!(unprotected_mutation_error(&broke).not_retryable);
+
+    // No connection was opened, so the call was never sent.
+    let not_sent = WorkerFailure::from_status(&client_transport_status(
+        tonic::Status::unavailable("tcp connect error"),
+        std::io::Error::from(std::io::ErrorKind::ConnectionRefused),
+    ));
+    assert_eq!(not_sent.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(not_sent.is_refused_before_start());
+    assert!(!unprotected_mutation_error(&not_sent).not_retryable);
+
+    // The same code and words from the runtime itself are its own answer.
+    let answered = WorkerFailure::from_status(&tonic::Status::unknown("transport error"));
+    assert_eq!(answered.status(), StatusCode::INTERNAL_SERVER_ERROR);
+}
