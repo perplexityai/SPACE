@@ -515,6 +515,169 @@ async fn create_readiness_failure_keeps_or_releases_only_what_its_arm_owns(
     Ok(())
 }
 
+// ── node refusal ────────────────────────────────────────────────────────────
+
+const EVENTS_PATH: &str = "/api/v1/namespaces/space/events";
+
+/// Kubelet's event for a sandbox whose disk is smaller than its template's
+/// rootfs, as the shim and node-manager word it.
+const INVALID_DISK_REFUSAL: &str = "Failed to create pod sandbox: rpc error: code = \
+    InvalidArgument desc = failed to start sandbox \"0123\": failed to create containerd task: \
+    failed to create shim task: sbx-manager Wake [space-err=InvalidArgument]: prepare sandbox \
+    failed: code: 'Client specified an invalid argument', message: \"rootfs_size_mb=300 is \
+    smaller than cloned rootfs size 451 MiB\"";
+
+/// A refusal another attempt can get past.
+const RETRYABLE_REFUSAL: &str = "Failed to create pod sandbox: rpc error: code = Unavailable \
+    desc = failed to create shim task: sbx-manager Wake [space-err=Unavailable]: node-manager \
+    is restarting";
+
+/// A create whose node refuses its pod sandbox as invalid fails with the
+/// node's reason once kubelet records the refusal, instead of waiting out the
+/// readiness budget for a pod IP that never comes; its pod is deleted and its
+/// execution retired. Any other refusal leaves the wait to its deadline.
+#[rstest::rstest]
+#[case::invalid_request_fails_the_create(INVALID_DISK_REFUSAL)]
+#[case::other_refusals_wait_for_the_deadline(RETRYABLE_REFUSAL)]
+#[tokio::test(flavor = "current_thread")]
+async fn create_fails_when_its_node_refuses_the_pod_as_invalid(
+    #[case] refusal: &'static str,
+) -> TestResult {
+    if !crate::test_support::enter_sim_worker_process_with_owned_token_files() {
+        return Ok(());
+    }
+    let fails_fast = refusal == INVALID_DISK_REFUSAL;
+    let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+    let sandbox_id = SandboxId::new();
+    insert_test_sandbox_row(&db.pool, sandbox_id, "creating").await?;
+    let worker = start_scripted_worker(ScriptedWorkerConfig::new([(
+        SPACED_WAIT_READY,
+        ScriptedReply::Hang,
+    )]))
+    .await?;
+
+    let pod_name: Arc<Mutex<Option<String>>> = Arc::default();
+    let reply_pod_name = Arc::clone(&pod_name);
+    let (client, log) = scripted_kube_client_async(move |request| {
+        let pod_name = Arc::clone(&reply_pod_name);
+        async move {
+            let name = pod_name.lock().unwrap().clone();
+            let pending = |name: &str| {
+                pod_reply(&sandbox_pod(
+                    name,
+                    &format!("{name}-uid"),
+                    sandbox_id,
+                    1,
+                    "Pending",
+                    None,
+                ))
+            };
+            match request.method {
+                Method::POST if request.path == PODS_PATH => {
+                    let name = requested_pod_name(&request);
+                    *pod_name.lock().unwrap() = Some(name.clone());
+                    pending(&name)
+                }
+                // The per-pod watch never reports an IP.
+                Method::GET if request.path == PODS_PATH => KubeReply::Hang,
+                Method::GET if name.as_deref().map(pod_path).as_ref() == Some(&request.path) => {
+                    pending(name.as_deref().expect("the pod was created"))
+                }
+                Method::GET if request.path == EVENTS_PATH => {
+                    let name = name.expect("events are listed after the pod is created");
+                    KubeReply::Json(
+                        StatusCode::OK,
+                        serde_json::json!({
+                            "apiVersion": "v1",
+                            "kind": "EventList",
+                            "metadata": {},
+                            "items": [{
+                                "metadata": { "name": format!("{name}.1"), "namespace": "space" },
+                                "involvedObject": {
+                                    "kind": "Pod",
+                                    "name": name,
+                                    "uid": format!("{name}-uid"),
+                                },
+                                "reason": "FailedCreatePodSandBox",
+                                "message": refusal,
+                                "type": "Warning",
+                            }],
+                        }),
+                    )
+                }
+                Method::DELETE if name.as_deref().map(pod_path).as_ref() == Some(&request.path) => {
+                    kube_status(StatusCode::OK, "Success")
+                }
+                _ => kube_status(StatusCode::BAD_REQUEST, "BadRequest"),
+            }
+        }
+    });
+    let mut substrate = substrate_on(db.pool.clone(), client, &worker);
+    substrate.k8s.create_data_plane_ready_timeout = Duration::from_secs(60);
+    if fails_fast {
+        // Only the refusal can end the wait inside the test's bound.
+        substrate.budgets = phase_ending_budgets(substrate.budgets);
+    } else {
+        // Long enough for the events to be listed more than once.
+        substrate.budgets.create_ready = Duration::from_secs(6);
+    }
+    let inputs = CreateInputs::new();
+    let template_ref = inputs.template_ref();
+
+    let started = Instant::now();
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(15),
+        substrate.create_execution(inputs.create_request(sandbox_id, &template_ref)),
+    )
+    .await
+    .map_err(|_| "the create must end")?;
+    let error = outcome.err().ok_or("the pod never got an IP")?;
+    assert!(
+        !requests_matching(&log, &Method::GET)
+            .iter()
+            .filter(|request| request.path == EVENTS_PATH)
+            .collect::<Vec<_>>()
+            .is_empty(),
+        "the wait lists its pod's events"
+    );
+    if !fails_fast {
+        assert!(
+            matches!(error, SubstrateError::Timeout { .. }),
+            "expected the readiness deadline, got {error:?}"
+        );
+        return Ok(());
+    }
+
+    let SubstrateError::InvalidRequest { message } = &error else {
+        panic!("expected the node's refusal, got {error:?}");
+    };
+    assert!(
+        message.contains("smaller than cloned rootfs size 451 MiB"),
+        "the error carries the node's reason: {message}"
+    );
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "the refusal, not the readiness budget, ends the create: {elapsed:?}"
+    );
+    let pod_name = pod_name
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("the pod was created");
+    let deletes = requests_matching(&log, &Method::DELETE);
+    let [delete] = deletes.as_slice() else {
+        panic!("expected one pod delete, got {deletes:?}");
+    };
+    assert_eq!(delete.path, pod_path(&pod_name));
+    assert_eq!(
+        active_execution_count(&db.pool, sandbox_id).await?,
+        0,
+        "the execution must be retired"
+    );
+    Ok(())
+}
+
 // ── joined create ───────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy)]

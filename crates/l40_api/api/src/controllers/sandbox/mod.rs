@@ -603,6 +603,7 @@ fn reconnect_error_outcome(
         }
         SubstrateError::Conflict { .. }
         | SubstrateError::FailedPrecondition { .. }
+        | SubstrateError::InvalidRequest { .. }
         | SubstrateError::RetainedFilesystemOnlyCopy { .. }
         | SubstrateError::EvacuationClaimLost { .. } => (
             ReconnectOutcome::Rejected,

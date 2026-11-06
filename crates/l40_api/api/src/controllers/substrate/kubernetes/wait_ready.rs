@@ -1,7 +1,26 @@
 use super::store::PlacementRetryDisposition;
 use super::support::*;
 use super::*;
+use k8s_openapi::api::core::v1::Event;
+use kube::api::ListParams;
 use pplx_space_common_svc::space_api_route::wait_ready_lifecycle_request;
+
+/// The kubelet event reason for a pod sandbox the runtime failed to start.
+const FAILED_CREATE_POD_SANDBOX_REASON: &str = "FailedCreatePodSandBox";
+
+/// The marker `annotateStatus` in `shim/space.go` writes for node-manager's
+/// `InvalidArgument`: the request fails identically on every node.
+const INVALID_ARGUMENT_MARKER: &str = "[space-err=InvalidArgument]";
+
+/// How often a create waiting for its pod's IP lists that pod's events.
+const POD_SANDBOX_REJECTION_POLL_INTERVAL: Duration = Duration::from_secs(2);
+
+/// The node's reason from a `FailedCreatePodSandBox` event message that
+/// carries the shim's `InvalidArgument` marker.
+fn rejected_pod_sandbox_reason(event_message: &str) -> Option<&str> {
+    let (_, reason) = event_message.split_once(INVALID_ARGUMENT_MARKER)?;
+    Some(reason.trim_start_matches(':').trim())
+}
 
 #[derive(Clone, Copy)]
 pub(super) enum CommandReadyPod<'a> {
@@ -387,7 +406,7 @@ impl KubernetesSubstrate {
             (Instant::now() + self.k8s.create_data_plane_ready_timeout).min(phase_deadline);
         let sandbox_id_string = sandbox_id.to_string();
 
-        let Some(pod_ip) = self
+        let pod_ip_assignment = self
             .wait_for_pod_ip_assignment(
                 metric_identity,
                 sandbox_id,
@@ -401,9 +420,18 @@ impl KubernetesSubstrate {
                 sandbox_id = %sandbox_id,
                 pod_name = %target.pod_name,
                 namespace = %self.k8s.sandbox_namespace,
-            ))
-            .await?
-        else {
+            ));
+        // A pod whose sandbox the node refuses never gets an IP: kubelet
+        // retries it until the wait's deadline. Only a wait that knows its
+        // pod's UID can tell that pod's refusal from an earlier pod's.
+        let pod_ip = match target.pod_uid {
+            Some(pod_uid) => tokio::select! {
+                pod_ip = pod_ip_assignment => pod_ip?,
+                rejection = self.pod_sandbox_rejection(pod_uid) => return Err(rejection),
+            },
+            None => pod_ip_assignment.await?,
+        };
+        let Some(pod_ip) = pod_ip else {
             record_pod_proxy_wait_timeout(metric_identity, sandbox_id, started_at);
             // Pod never reached scheduled / IP-assigned in the window. No
             // node-mgr probe ran on this path, so the message names only
@@ -475,6 +503,48 @@ impl KubernetesSubstrate {
             }
 
             sleep(start_wait_poll_interval(started_at)).await;
+        }
+    }
+
+    /// Resolve once the node has refused to start `pod_uid`'s pod sandbox
+    /// with a verdict no retry or other node can change, as that error;
+    /// otherwise never. Kubelet records each refusal as a pod event, and the
+    /// shim marks node-manager's `InvalidArgument` verdict in its message.
+    /// Events that cannot be listed leave the wait to its deadline, as before
+    /// this check existed.
+    async fn pod_sandbox_rejection(&self, pod_uid: &str) -> SubstrateError {
+        let events: Api<Event> =
+            Api::namespaced(self.k8s.client.clone(), &self.k8s.sandbox_namespace);
+        // A LIST rather than a reflector read: nothing caches Events. It is
+        // bounded to one pod's UID and one reason, and runs only while a
+        // create waits for that pod's IP.
+        let params = ListParams::default().fields(&format!(
+            "involvedObject.uid={pod_uid},reason={FAILED_CREATE_POD_SANDBOX_REASON}"
+        ));
+        loop {
+            sleep(POD_SANDBOX_REJECTION_POLL_INTERVAL).await;
+            match events.list(&params).await {
+                Ok(events) => {
+                    if let Some(reason) = events
+                        .items
+                        .iter()
+                        .filter_map(|event| event.message.as_deref())
+                        .find_map(rejected_pod_sandbox_reason)
+                    {
+                        return SubstrateError::InvalidRequest {
+                            message: format!("the node refused to start the sandbox: {reason}"),
+                        };
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        pod_uid,
+                        error = %error,
+                        "failed to list sandbox pod events; waiting for the pod IP without them"
+                    );
+                    return std::future::pending().await;
+                }
+            }
         }
     }
 
