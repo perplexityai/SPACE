@@ -1,27 +1,31 @@
 //! Guarded writes the cluster controller's transient-lifecycle sweeper makes
 //! to `sandboxes`: aging wedged rows out, converging or reverting an
 //! abandoned restore, repairing a stale `failed` row, and the compensations
-//! that put a sweep's own write back.
+//! that put a sweep's own write back. Also its aged-transient candidate
+//! select ([`list_aged_transient`]), which reads the node drain's
+//! [`EvacuationRestoreTarget`] marker.
 //!
-//! The sweeper keeps everything around them: the candidate selects, the
+//! The sweeper keeps everything around them: its other candidate selects, the
 //! sandbox and execution row locks (`SELECT ... FOR UPDATE`), the
-//! transactions, and the execution and port-exposure writes beside the
-//! revert. Every write function runs on the executor its caller passes, so
-//! it composes into the caller's transaction when there is one;
-//! [`unplace_reverted_restore`] requires that transaction, since its
-//! predicate is the id alone.
+//! transactions, every decision about a listed row, and the execution and
+//! port-exposure writes beside the revert. Every function runs on the
+//! executor its caller passes, so it composes into the caller's transaction
+//! when there is one; [`unplace_reverted_restore`] requires that transaction,
+//! since its predicate is the id alone.
 //!
 //! A sweep write that returns a write token (`RETURNING`
 //! [`LIFECYCLE_WRITE_TOKEN`]) is undone only by the compensation bound to that
 //! token, so an undo never reaches past its own transition.
 //!
-//! The guard fragments here, [`evacuation_guards`] among them, are also
-//! interpolated by the statements that stay with the sweeper: its candidate
-//! selects. They are public so that each guard keeps one definition while
-//! those statements live elsewhere.
+//! One guard fragment, [`unrestorable_restoring_guards`], is also
+//! interpolated by a statement that stays with the sweeper: its
+//! unrestorable-`restoring` candidate select. It is public so that the guard
+//! keeps one definition while that statement lives elsewhere. The others,
+//! [`evacuation_guards`] among them, are interpolated only here.
 //!
 //! [`HEAL_COMMAND_READY_PENDING_SQL`], [`REAP_COMMAND_READY_PENDING_SQL`],
-//! [`REPAIR_FAILED_ACTIVE_EXECUTION_SQL`] and the [`fail_candidate_query`],
+//! [`REPAIR_FAILED_ACTIVE_EXECUTION_SQL`] and the
+//! [`list_aged_transient_query`], [`fail_candidate_query`],
 //! [`converge_restoring_query`], [`revert_to_suspended_query`],
 //! [`undo_revert_to_suspended_query`] and
 //! [`fail_unrestorable_restoring_query`] builders are public only because
@@ -30,10 +34,17 @@
 
 use pplx_space_common_core::types::{PositiveDuration, SandboxId, SandboxLifecycle, SubstrateKind};
 
+use std::fmt;
+use std::str::FromStr;
+
 use pplx_space_common_core::sql;
+use pplx_space_common_core::types::{
+    PodUid, SandboxActivationAttemptId, SandboxLifecycleParseError,
+};
 use pplx_space_sandbox_portability::{
-    inflight_suspend_upload_exists, recoverable_suspend_snapshot_exists,
-    restore_retry_source_snapshot_exists, restore_retry_suspended_revert_snapshot_exists,
+    fresh_ready_snapshot_exists, inflight_suspend_upload_exists,
+    recoverable_suspend_snapshot_exists, restore_retry_source_snapshot_exists,
+    restore_retry_suspended_revert_snapshot_exists,
 };
 use pplx_space_sandbox_routability::{
     routable_execution_or_non_k8s, routable_k8s_execution_exists,
@@ -249,8 +260,8 @@ pub const fn is_activation_owned(lifecycle: SandboxLifecycle) -> bool {
 }
 
 /// Shared evacuation-aware guards layered on top of the plain age predicate.
-/// Used identically by the sweeper's `list_aged_transient_query` (the
-/// probe-first select) and [`fail_candidate_query`] (the per-row fail CAS), so
+/// Used identically by [`list_aged_transient_query`] (the probe-first
+/// select) and [`fail_candidate_query`] (the per-row fail CAS), so
 /// a row can never be failed under a guard the select did not apply:
 ///
 /// 1. `(evacuation_restore_target IS NULL OR lifecycle = 'suspending')` exempts
@@ -307,6 +318,247 @@ pub fn evacuation_guards(
         "AND (sandboxes.evacuation_restore_target IS NULL OR sandboxes.lifecycle = 'suspending')
             AND sandboxes.lifecycle_changed_at < NOW() - make_interval(secs => $3::BIGINT){recoverable_snapshot_guard}{ownership_guards}"
     )
+}
+
+/// The `sandboxes.evacuation_restore_target` marker: the lifecycle a node
+/// drain's evacuation leaves a sandbox in once it has moved it off its node.
+/// A suspend evacuation records the pre-evacuation lifecycle, `started` or
+/// `paused`, and a stopped resident's re-placement records `stopped`
+/// ([`crate::drain`]). These are the values the column's CHECK admits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum EvacuationRestoreTarget {
+    Started,
+    Paused,
+    Stopped,
+}
+
+impl EvacuationRestoreTarget {
+    /// The stored string, which [`FromStr`] accepts back.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Started => "started",
+            Self::Paused => "paused",
+            Self::Stopped => "stopped",
+        }
+    }
+
+    /// The lifecycle the marker names.
+    pub const fn lifecycle(self) -> SandboxLifecycle {
+        match self {
+            Self::Started => SandboxLifecycle::Started,
+            Self::Paused => SandboxLifecycle::Paused,
+            Self::Stopped => SandboxLifecycle::Stopped,
+        }
+    }
+}
+
+impl fmt::Display for EvacuationRestoreTarget {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// A stored marker that isn't an [`EvacuationRestoreTarget`].
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum EvacuationRestoreTargetParseError {
+    /// Not a lifecycle at all. Displays as [`SandboxLifecycle`]'s own parse
+    /// error.
+    #[error(transparent)]
+    UnknownLifecycle(#[from] SandboxLifecycleParseError),
+    /// A lifecycle the marker never holds.
+    #[error("sandbox lifecycle '{0}' is not an evacuation restore target")]
+    NotATarget(SandboxLifecycle),
+}
+
+/// Parses as [`SandboxLifecycle`] does, exactly and without trimming or case
+/// folding, then keeps the three lifecycles the marker holds.
+impl FromStr for EvacuationRestoreTarget {
+    type Err = EvacuationRestoreTargetParseError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.parse::<SandboxLifecycle>()? {
+            SandboxLifecycle::Started => Ok(Self::Started),
+            SandboxLifecycle::Paused => Ok(Self::Paused),
+            SandboxLifecycle::Stopped => Ok(Self::Stopped),
+            other => Err(EvacuationRestoreTargetParseError::NotATarget(other)),
+        }
+    }
+}
+
+/// The candidate select's binds ([`list_aged_transient_query`]) for
+/// [`restoring_episode_overdue`].
+const LIST_EPISODE_DEADLINE: EpisodeDeadlineBinds = EpisodeDeadlineBinds {
+    deadline: "$6",
+    kubernetes: "$5",
+};
+
+/// Snapshot fact for the candidate select, chosen per lifecycle to match
+/// `sandbox_portability`'s guidance:
+///
+/// * `restoring` — the same pre-restore source window used by restore retry
+///   selection. A failed restore branch can publish a later artifact; the
+///   sweeper must treat the pre-restore source as recoverable without treating
+///   that late branch as a safe suspended restore source.
+/// * every other lifecycle — placement-freshness
+///   (`fresh_ready_snapshot_exists`). The fact is diagnostic only there: the
+///   decision table never reverts a non-`restoring` row, because a backup
+///   matched by the never-cleared-on-wake artifact pointer is the previous
+///   suspend cycle's bytes (see the sweeper's `classify::decide`).
+fn ready_snapshot_predicate(lifecycle: SandboxLifecycle) -> String {
+    if lifecycle == SandboxLifecycle::Restoring {
+        restore_retry_source_snapshot_exists("sandboxes")
+    } else {
+        fresh_ready_snapshot_exists("sandboxes")
+    }
+}
+
+/// Build the candidate select for `lifecycle`: aged rows listed **without**
+/// flipping anything. Bind order: `$1` = `managed_by`, `$2` = lifecycle
+/// string, `$3` = age threshold seconds (`BIGINT`), `$4` = batch limit, `$5` =
+/// `SubstrateKind::Kubernetes` (the routability fragment's substrate), `$6` =
+/// the restoring-episode deadline in seconds (`BIGINT`, NULL when off).
+///
+/// A `restoring` row whose episode is overdue ([`restoring_episode_overdue`])
+/// is listed whatever its restore lease and activation attempt say. It
+/// reports `episode_overdue` when those would have spared it.
+///
+/// Carries everything classification needs: the row's actual age, the
+/// evacuation wake target, the per-lifecycle ready-snapshot fact
+/// (`ready_snapshot_predicate` — both branches keep the artifact-identity
+/// guard for rows that carry `current_local_artifact_id`, so only an
+/// exact-artifact backup counts), and the node from the row's **active
+/// execution** (`sandbox_k8s_executions`), not `sandboxes.active_node_id`,
+/// which is NULL for this population.
+///
+/// It also carries that execution's `(pod_name, pod_uid)`, which becomes the
+/// retire's pod-identity fence. Capturing it here — before the probe, before
+/// the act-phase CAS — is what makes it evidence: a fence read at retire time
+/// would describe whatever replaced the pod, which is precisely the thing the
+/// fence has to refuse.
+///
+/// Ordered by `random()`, not oldest-first: deferred/inconclusive candidates
+/// stay in the set across ticks, so a strict oldest-first `LIMIT` would let a
+/// batch of unreachable rows permanently starve the resolvable ones behind
+/// them. Same rationale as the sweeper's command-ready-pending list.
+///
+/// Extracted as a builder so the production query string is the exact one
+/// exercised by the Postgres-backed tests, with no drift between them.
+pub fn list_aged_transient_query(lifecycle: SandboxLifecycle) -> String {
+    let guards = evacuation_guards(lifecycle, Some(LIST_EPISODE_DEADLINE));
+    // Reported only when the deadline is what let the row through, so the
+    // outcome it labels is a revert that overrode a live owner.
+    let episode_overdue = if lifecycle == SandboxLifecycle::Restoring {
+        let overdue = restoring_episode_overdue(LIST_EPISODE_DEADLINE);
+        let unowned = restoring_unowned("$3");
+        format!("({overdue} AND NOT ({unowned}))")
+    } else {
+        // Referenced either way, so every lifecycle's select takes the same
+        // binds.
+        "($6::BIGINT IS NULL AND FALSE)".to_owned()
+    };
+    let ready_snapshot = ready_snapshot_predicate(lifecycle);
+    // The same routability contract the node published-state handler gates
+    // its own `restoring -> started` convergence on: `started` in the K8s
+    // substrate promises an active running execution with a pod IP, so the
+    // converge arm needs this fact to avoid asserting it blindly.
+    let routable_execution = routable_execution_or_non_k8s("sandboxes", "$5");
+    format!(
+        "SELECT sandboxes.id,
+                EXTRACT(EPOCH FROM (NOW() - sandboxes.lifecycle_changed_at))::BIGINT AS age_secs,
+                sandboxes.evacuation_restore_target,
+                ({ready_snapshot}) AS ready_snapshot,
+                sandboxes.preserve_local_artifact_on_restore_failure AS fork_restore,
+                e.k8s_node_name,
+                e.pod_name,
+                e.activation_attempt_id,
+                NULLIF(BTRIM(e.pod_uid), '') AS pod_uid,
+                e.route_activation_id,
+                e.generation,
+                ({routable_execution}) AS routable_execution,
+                COALESCE(
+                    e.activation_attempt_expires_at <
+                        NOW() - make_interval(secs => $3::BIGINT),
+                    FALSE
+                ) AS activation_abandoned,
+                {episode_overdue} AS episode_overdue
+           FROM sandboxes
+           LEFT JOIN sandbox_k8s_executions e
+             ON e.sandbox_id = sandboxes.id AND e.active
+          WHERE sandboxes.managed_by = $1
+            AND sandboxes.lifecycle = $2
+            {guards}
+          ORDER BY random()
+          LIMIT $4"
+    )
+}
+
+/// One row of [`list_aged_transient_query`]. Columns are read by name, so
+/// reordering the `SELECT` list cannot shift values into the wrong fields.
+pub struct AgedTransientRow {
+    pub id: SandboxId,
+    pub age_secs: i64,
+    /// `None` when the row carries no marker. An `Err` is a stored value
+    /// that doesn't parse, which the column's CHECK rules out; it fails
+    /// neither the row nor the select, and the caller decides what it means.
+    pub evacuation_restore_target:
+        Option<Result<EvacuationRestoreTarget, EvacuationRestoreTargetParseError>>,
+    pub ready_snapshot: bool,
+    pub fork_restore: bool,
+    pub k8s_node_name: Option<String>,
+    pub routable_execution: bool,
+    pub activation_abandoned: bool,
+    pub episode_overdue: bool,
+    pub pod_name: Option<String>,
+    pub activation_attempt_id: Option<SandboxActivationAttemptId>,
+    pub generation: Option<i64>,
+    pub pod_uid: Option<PodUid>,
+    pub route_activation_id: Option<SandboxActivationAttemptId>,
+}
+
+impl<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> for AgedTransientRow {
+    fn from_row(row: &'r sqlx::postgres::PgRow) -> Result<Self, sqlx::Error> {
+        use sqlx::Row;
+        let evacuation_restore_target: Option<String> = row.try_get("evacuation_restore_target")?;
+        Ok(Self {
+            id: row.try_get("id")?,
+            age_secs: row.try_get("age_secs")?,
+            evacuation_restore_target: evacuation_restore_target.map(|raw| raw.parse()),
+            ready_snapshot: row.try_get("ready_snapshot")?,
+            fork_restore: row.try_get("fork_restore")?,
+            k8s_node_name: row.try_get("k8s_node_name")?,
+            routable_execution: row.try_get("routable_execution")?,
+            activation_abandoned: row.try_get("activation_abandoned")?,
+            episode_overdue: row.try_get("episode_overdue")?,
+            pod_name: row.try_get("pod_name")?,
+            activation_attempt_id: row.try_get("activation_attempt_id")?,
+            generation: row.try_get("generation")?,
+            pod_uid: row.try_get("pod_uid")?,
+            route_activation_id: row.try_get("route_activation_id")?,
+        })
+    }
+}
+
+/// List up to `limit` aged `lifecycle` rows of the `managed_by` substrate
+/// ([`list_aged_transient_query`]), changing nothing. A
+/// `restoring_episode_deadline` of `None` turns the deadline off.
+pub async fn list_aged_transient(
+    executor: impl sqlx::PgExecutor<'_>,
+    managed_by: &str,
+    lifecycle: SandboxLifecycle,
+    age: PositiveDuration,
+    limit: i64,
+    restoring_episode_deadline: Option<PositiveDuration>,
+) -> Result<Vec<AgedTransientRow>, sqlx::Error> {
+    let query = list_aged_transient_query(lifecycle);
+    sqlx::query_as(sqlx::AssertSqlSafe(sql!(query.as_str())))
+        .bind(managed_by)
+        .bind(lifecycle.to_string())
+        .bind(secs_bind(age))
+        .bind(limit)
+        .bind(SubstrateKind::Kubernetes)
+        .bind(restoring_episode_deadline.map(secs_bind))
+        .fetch_all(executor)
+        .await
 }
 
 /// Heal query: clear the marker on a probe-confirmed-ready row. Bind order:

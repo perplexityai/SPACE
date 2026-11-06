@@ -93,6 +93,7 @@
 //! - R20 `r20_stranded_stopping_row_without_a_node_is_selected_fenced_and_failed`
 //! - R21 `r21_failed_cleanup_statements_skip_direct_rows`
 //! - R22 `r22_failed_cleanup_runs_only_on_the_kubernetes_substrate`
+//! - R23 `r23_unparseable_evacuation_marker_reads_as_unset`
 
 use std::collections::BTreeSet;
 use std::collections::HashMap;
@@ -2815,8 +2816,8 @@ mod failed_cleanup_stop_route;
 mod postgres_backed {
 
     use super::super::store::{
-        AgedTransientRow, LIST_COMMAND_READY_PENDING_SQL, LIST_FAILED_ACTIVE_EXECUTIONS_SQL,
-        NOTE_FAILED_CLEANUP_ATTEMPT_SQL, failed_active_execution_scope, list_aged_transient_query,
+        LIST_COMMAND_READY_PENDING_SQL, LIST_FAILED_ACTIVE_EXECUTIONS_SQL,
+        NOTE_FAILED_CLEANUP_ATTEMPT_SQL, failed_active_execution_scope,
         list_unrestorable_restoring_query,
     };
     use super::*;
@@ -2824,9 +2825,9 @@ mod postgres_backed {
     use pplx_space_common_core::types::{NodeId, SandboxId, SnapshotId, SubstrateKind};
     use pplx_space_db_test_fixtures::try_pg_test_db;
     use pplx_space_sandbox_store::sweeper::{
-        HEAL_COMMAND_READY_PENDING_SQL, REAP_COMMAND_READY_PENDING_SQL,
+        AgedTransientRow, HEAL_COMMAND_READY_PENDING_SQL, REAP_COMMAND_READY_PENDING_SQL,
         REPAIR_FAILED_ACTIVE_EXECUTION_SQL, converge_restoring_query, fail_candidate_query,
-        fail_unrestorable_restoring_query, revert_to_suspended_query,
+        fail_unrestorable_restoring_query, list_aged_transient_query, revert_to_suspended_query,
         undo_revert_to_suspended_query,
     };
     use sqlx::PgPool;
@@ -3996,6 +3997,49 @@ mod postgres_backed {
             "a wedged evacuation-marked suspending row with no in-flight upload must still be \
              a candidate — nothing else recovers it"
         );
+        Ok(())
+    }
+
+    /// R23: a stored marker that doesn't parse reads as unset on the
+    /// candidate and still lists the row, beside an unmarked and a marked
+    /// control. The column's CHECK refuses such a value, so this test's
+    /// database drops it first.
+    #[tokio::test(flavor = "current_thread")]
+    async fn r23_unparseable_evacuation_marker_reads_as_unset() -> TestResult {
+        use super::super::lifecycle_writer_tests::{age, direct_sink};
+        use std::collections::BTreeMap;
+
+        let Some(db) = try_pg_test_db().await? else {
+            return Ok(());
+        };
+        let pool = &db.pool;
+        sqlx::query(
+            "ALTER TABLE sandboxes DROP CONSTRAINT sandboxes_evacuation_restore_target_check",
+        )
+        .execute(pool)
+        .await?;
+
+        let mut expected = BTreeMap::new();
+        for (marker, target) in [
+            (None, None),
+            (Some("paused"), Some(SandboxLifecycle::Paused)),
+            (Some("hibernating"), None),
+        ] {
+            let id = SandboxId::new();
+            insert_sandbox_with_lifecycle(pool, id, SandboxLifecycle::Suspending, 300).await?;
+            if let Some(marker) = marker {
+                set_evacuation_marker(pool, id, marker).await?;
+            }
+            expected.insert(id, target);
+        }
+
+        let listed: BTreeMap<_, _> = direct_sink(pool)
+            .list_aged_transient(SandboxLifecycle::Suspending, age())
+            .await?
+            .into_iter()
+            .map(|candidate| (candidate.sandbox_id, candidate.evacuation_restore_target))
+            .collect();
+        assert_eq!(listed, expected);
         Ok(())
     }
 

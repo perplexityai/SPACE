@@ -17,19 +17,11 @@ use pplx_space_common_core::types::{
     SandboxId, SandboxLifecycle, SubstrateKind,
 };
 use pplx_space_metrics::cluster_reconciler::{HydrationOutcome, OutcomeEvent};
-use pplx_space_sandbox_portability::{
-    fresh_ready_snapshot_exists, restore_retry_source_snapshot_exists,
-};
-use pplx_space_sandbox_routability::routable_execution_or_non_k8s;
-use pplx_space_sandbox_store::sweeper::{
-    self, evacuation_guards, restoring_episode_overdue, restoring_unowned,
-    unrestorable_restoring_guards,
-};
+use pplx_space_sandbox_store::sweeper::{self, unrestorable_restoring_guards};
 use sqlx::PgPool;
 
 use super::classify::{ExecutionRoutability, ProbeObservation};
 use super::probe::{ProbeNodeError, SweepCandidate};
-use super::restoring_episode::LIST_EPISODE_DEADLINE;
 use super::{
     CommandReadyPendingCandidate, FailGuard, FailedCleanupCandidate, FirstActivation,
     RevertedToSuspended, SweepSink, is_activation_owned,
@@ -220,27 +212,6 @@ struct CommandReadyPendingRow {
     route_activation_id: Option<SandboxActivationAttemptId>,
 }
 
-/// Raw row shape of [`list_aged_transient_query`]. Fields map to the
-/// select's output columns by name (`sqlx::FromRow`), so reordering the
-/// SELECT list cannot silently shift values into the wrong slots.
-#[derive(sqlx::FromRow)]
-pub(crate) struct AgedTransientRow {
-    pub(crate) id: SandboxId,
-    pub(crate) age_secs: i64,
-    pub(crate) evacuation_restore_target: Option<String>,
-    pub(crate) ready_snapshot: bool,
-    pub(crate) fork_restore: bool,
-    pub(crate) k8s_node_name: Option<String>,
-    pub(crate) routable_execution: bool,
-    pub(crate) activation_abandoned: bool,
-    pub(crate) episode_overdue: bool,
-    pub(crate) pod_name: Option<String>,
-    pub(crate) activation_attempt_id: Option<SandboxActivationAttemptId>,
-    pub(crate) generation: Option<i64>,
-    pub(crate) pod_uid: Option<PodUid>,
-    pub(crate) route_activation_id: Option<SandboxActivationAttemptId>,
-}
-
 /// Build the retire fence for a candidate from its active execution row's
 /// `(pod_name, pod_uid)`.
 ///
@@ -376,106 +347,6 @@ async fn observe_candidate_pods(
         return HashMap::new();
     }
     substrate.observe_pod_identities(&names).await
-}
-
-/// Snapshot fact for the candidate select and the revert CAS, chosen per
-/// lifecycle to match `sandbox_portability`'s guidance:
-///
-/// * `restoring` — the same pre-restore source window used by restore retry
-///   selection. A failed restore branch can publish a later artifact; the
-///   sweeper must treat the pre-restore source as recoverable without treating
-///   that late branch as a safe suspended restore source.
-/// * every other lifecycle — placement-freshness
-///   (`fresh_ready_snapshot_exists`). The fact is diagnostic only there: the
-///   decision table never reverts a non-`restoring` row, because a backup
-///   matched by the never-cleared-on-wake artifact pointer is the previous
-///   suspend cycle's bytes (see `classify::decide`).
-fn ready_snapshot_predicate(lifecycle: SandboxLifecycle) -> String {
-    if lifecycle == SandboxLifecycle::Restoring {
-        restore_retry_source_snapshot_exists("sandboxes")
-    } else {
-        fresh_ready_snapshot_exists("sandboxes")
-    }
-}
-
-/// Build the candidate select for `lifecycle`: aged rows listed **without**
-/// flipping anything. Bind order: `$1` = `managed_by`, `$2` = lifecycle
-/// string, `$3` = age threshold seconds (`BIGINT`), `$4` = batch limit, `$5` =
-/// `SubstrateKind::Kubernetes` (the routability fragment's substrate), `$6` =
-/// the restoring-episode deadline in seconds (`BIGINT`, NULL when off).
-///
-/// A `restoring` row whose episode is overdue ([`restoring_episode_overdue`])
-/// is listed whatever its restore lease and activation attempt say. It
-/// reports `episode_overdue` when those would have spared it.
-///
-/// Carries everything classification needs: the row's actual age, the
-/// evacuation wake target, the per-lifecycle ready-snapshot fact
-/// ([`ready_snapshot_predicate`] — both branches keep the artifact-identity
-/// guard for rows that carry `current_local_artifact_id`, so only an
-/// exact-artifact backup counts), and the node from the row's **active
-/// execution** (`sandbox_k8s_executions`), not `sandboxes.active_node_id`,
-/// which is NULL for this population.
-///
-/// It also carries that execution's `(pod_name, pod_uid)`, which becomes the
-/// retire's pod-identity fence. Capturing it here — before the probe, before
-/// the act-phase CAS — is what makes it evidence: a fence read at retire time
-/// would describe whatever replaced the pod, which is precisely the thing the
-/// fence has to refuse.
-///
-/// Ordered by `random()`, not oldest-first: deferred/inconclusive candidates
-/// stay in the set across ticks, so a strict oldest-first `LIMIT` would let a
-/// batch of unreachable rows permanently starve the resolvable ones behind
-/// them. Same rationale as the command-ready-pending list.
-///
-/// Extracted as a builder so the production query string is the exact one
-/// exercised by the Postgres-backed tests, with no drift between them.
-pub(crate) fn list_aged_transient_query(lifecycle: SandboxLifecycle) -> String {
-    let guards = evacuation_guards(lifecycle, Some(LIST_EPISODE_DEADLINE));
-    // Reported only when the deadline is what let the row through, so the
-    // outcome it labels is a revert that overrode a live owner.
-    let episode_overdue = if lifecycle == SandboxLifecycle::Restoring {
-        let overdue = restoring_episode_overdue(LIST_EPISODE_DEADLINE);
-        let unowned = restoring_unowned("$3");
-        format!("({overdue} AND NOT ({unowned}))")
-    } else {
-        // Referenced either way, so every lifecycle's select takes the same
-        // binds.
-        "($6::BIGINT IS NULL AND FALSE)".to_owned()
-    };
-    let ready_snapshot = ready_snapshot_predicate(lifecycle);
-    // The same routability contract the node published-state handler gates
-    // its own `restoring -> started` convergence on: `started` in the K8s
-    // substrate promises an active running execution with a pod IP, so the
-    // converge arm needs this fact to avoid asserting it blindly.
-    let routable_execution = routable_execution_or_non_k8s("sandboxes", "$5");
-    format!(
-        "SELECT sandboxes.id,
-                EXTRACT(EPOCH FROM (NOW() - sandboxes.lifecycle_changed_at))::BIGINT AS age_secs,
-                sandboxes.evacuation_restore_target,
-                ({ready_snapshot}) AS ready_snapshot,
-                sandboxes.preserve_local_artifact_on_restore_failure AS fork_restore,
-                e.k8s_node_name,
-                e.pod_name,
-                e.activation_attempt_id,
-                NULLIF(BTRIM(e.pod_uid), '') AS pod_uid,
-                e.route_activation_id,
-                e.generation,
-                ({routable_execution}) AS routable_execution,
-                COALESCE(
-                    e.activation_attempt_expires_at <
-                        NOW() - make_interval(secs => $3::BIGINT),
-                    FALSE
-                ) AS activation_abandoned,
-                {episode_overdue} AS episode_overdue
-           FROM sandboxes
-           LEFT JOIN sandbox_k8s_executions e
-             ON e.sandbox_id = sandboxes.id AND e.active
-          WHERE sandboxes.managed_by = $1
-            AND sandboxes.lifecycle = $2
-            {guards}
-          ORDER BY random()
-          LIMIT $4"
-    )
 }
 
 /// Lock an activation-owned row before a CAS re-checks its owner. Bind order:
@@ -705,11 +576,6 @@ impl SubstrateSweepSink {
     fn age_secs_bind(age: PositiveDuration) -> i64 {
         i64::try_from(age.get().as_secs()).unwrap_or(i64::MAX)
     }
-
-    /// The restoring-episode deadline bind: NULL when it's off.
-    fn episode_deadline_bind(&self) -> Option<i64> {
-        self.restoring_episode_deadline.map(Self::age_secs_bind)
-    }
 }
 
 impl SweepSink for SubstrateSweepSink {
@@ -736,7 +602,8 @@ impl SweepSink for SubstrateSweepSink {
     /// suspend snapshot is still recoverable (`creating` or `ready`); once
     /// that snapshot terminalizes `failed` (or never existed) the backstop
     /// lists it, because nothing else recovers a crashed/hung suspend with no
-    /// durable copy. See [`list_aged_transient_query`] for the full rationale.
+    /// durable copy. See [`sweeper::list_aged_transient_query`] for the full
+    /// rationale.
     async fn list_aged_transient(
         &self,
         lifecycle: SandboxLifecycle,
@@ -757,16 +624,15 @@ impl SweepSink for SubstrateSweepSink {
             "age threshold {secs}s exceeds i64::MAX; will saturate to i64::MAX (effectively disabling the sweep for this lifecycle)"
         );
         let managed_by = self.substrate.managed_by();
-        let query = list_aged_transient_query(lifecycle);
-        let rows: Vec<AgedTransientRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql!(query.as_str())))
-            .bind(managed_by)
-            .bind(lifecycle.to_string())
-            .bind(Self::age_secs_bind(age))
-            .bind(SWEEP_CANDIDATE_BATCH)
-            .bind(SubstrateKind::Kubernetes)
-            .bind(self.episode_deadline_bind())
-            .fetch_all(&self.pool)
-            .await?;
+        let rows = sweeper::list_aged_transient(
+            &self.pool,
+            managed_by,
+            lifecycle,
+            age,
+            SWEEP_CANDIDATE_BATCH,
+            self.restoring_episode_deadline,
+        )
+        .await?;
         let observed = observe_candidate_pods(
             &self.substrate,
             rows.iter().filter_map(|row| row.pod_name.as_deref()),
@@ -777,8 +643,8 @@ impl SweepSink for SubstrateSweepSink {
             .map(|row| {
                 let evacuation_restore_target =
                     row.evacuation_restore_target
-                        .and_then(|raw| match raw.parse() {
-                            Ok(target) => Some(target),
+                        .and_then(|parsed| match parsed {
+                            Ok(target) => Some(target.lifecycle()),
                             Err(err) => {
                                 // The column CHECK pins values to
                                 // 'started'/'paused'/'stopped'; reaching this

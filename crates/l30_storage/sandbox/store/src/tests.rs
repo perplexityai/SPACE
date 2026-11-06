@@ -1,6 +1,7 @@
+use crate::StoredSandboxLifecycle;
 use pplx_space_common_core::sql;
 use pplx_space_common_core::types::{LocalArtifactId, OrgId, UserId};
-use pplx_space_common_core::types::{NodeId, SandboxId, SubstrateKind};
+use pplx_space_common_core::types::{NodeId, SandboxId, SandboxLifecycle, SubstrateKind};
 use pplx_space_db_test_fixtures::try_pg_test_db;
 use pplx_space_test_env::TestResult;
 use sqlx::PgPool;
@@ -11,6 +12,8 @@ use super::{
     SandboxMetadataValue, UserSandboxRows, any_undescribed_artifact_owner, durably_restorable, get,
     update_desired_state, user_sandbox_rows,
 };
+
+use super::sweeper::{EvacuationRestoreTarget, EvacuationRestoreTargetParseError};
 
 mod create_finish_tests;
 mod insert_unplaced_tests;
@@ -954,5 +957,72 @@ async fn user_sandbox_rows_reports_when_deleted_rows_leave_retention() -> TestRe
         user_sandbox_rows(&db.pool, user).await?,
         UserSandboxRows::Live
     );
+    Ok(())
+}
+
+/// Whether the `evacuation_restore_target` CHECK admits `raw`, written to
+/// row `id` in a transaction that is rolled back.
+async fn column_admits_marker(pool: &PgPool, id: Uuid, raw: &str) -> TestResult<bool> {
+    let mut tx = pool.begin().await?;
+    let written = sqlx::query(sql!(
+        "UPDATE sandboxes SET evacuation_restore_target = $2 WHERE id = $1"
+    ))
+    .bind(id)
+    .bind(raw)
+    .execute(&mut *tx)
+    .await;
+    tx.rollback().await?;
+    match written {
+        Ok(done) => {
+            assert_eq!(done.rows_affected(), 1, "{raw:?}");
+            Ok(true)
+        }
+        Err(sqlx::Error::Database(database))
+            if database.constraint() == Some("sandboxes_evacuation_restore_target_check") =>
+        {
+            Ok(false)
+        }
+        Err(err) => Err(err.into()),
+    }
+}
+
+/// The marker parses exactly the values its column's CHECK admits, each to
+/// the lifecycle a plain [`SandboxLifecycle`] parse gives, and round-trips
+/// through `as_str`. A value that isn't a lifecycle at all reports the
+/// lifecycle parse's own error, so nothing is trimmed or case-folded. Sweeps
+/// every stored lifecycle and the three targets in other spellings.
+#[tokio::test(flavor = "current_thread")]
+async fn evacuation_restore_target_parses_exactly_what_its_column_admits() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let id = insert_sandbox(&db.pool, None, "suspended").await?;
+    let respelled = ["Started", "PAUSED", " stopped", "stopped\n", ""];
+    let mut parsed_values = Vec::new();
+    for raw in StoredSandboxLifecycle::all_as_str().chain(respelled) {
+        let admitted = column_admits_marker(&db.pool, id, raw).await?;
+        match (
+            raw.parse::<EvacuationRestoreTarget>(),
+            raw.parse::<SandboxLifecycle>(),
+        ) {
+            (Ok(target), Ok(lifecycle)) => {
+                assert!(admitted, "{raw:?} parses but the column refuses it");
+                assert_eq!(target.lifecycle(), lifecycle, "{raw:?}");
+                assert_eq!(target.as_str(), raw);
+                assert_eq!(target.to_string(), raw);
+                parsed_values.push(raw);
+            }
+            (Err(EvacuationRestoreTargetParseError::NotATarget(rejected)), Ok(lifecycle)) => {
+                assert!(!admitted, "the column admits {raw:?} but it doesn't parse");
+                assert_eq!(rejected, lifecycle);
+            }
+            (Err(EvacuationRestoreTargetParseError::UnknownLifecycle(err)), Err(expected)) => {
+                assert!(!admitted, "the column admits {raw:?} but it doesn't parse");
+                assert_eq!(err, expected);
+            }
+            mismatch => panic!("{raw:?}: {mismatch:?}"),
+        }
+    }
+    assert_eq!(parsed_values, ["started", "paused", "stopped"]);
     Ok(())
 }
