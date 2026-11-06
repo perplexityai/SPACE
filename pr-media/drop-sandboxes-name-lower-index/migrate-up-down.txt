@@ -1,0 +1,25 @@
+space-db-migrator control-plane, built at ac/drop-sandboxes-name-lower-index (514661d0), on a disposable postgres:16-alpine.
+"-- index:" is idx_sandboxes_name_lower's pg_indexes definition and pg_index.indisvalid (empty: no such index);
+"-- latest:" the three newest _sqlx_migrations versions; "-- id_suffix:" whether idx_sandboxes_id_suffix exists.
+
+## up from empty
+WARN pplx_space_db_migrate::bootstrap_roles: space_migrator does not exist; control-plane migrations run as the connecting role — run `space-db-migrator bootstrap-roles` first to provision it current_user=postgres
+-- index:  valid=
+-- latest: 20261105161135,20261105161136,20261106034255
+-- id_suffix: 1
+## down
+WARN pplx_space_db_migrate::bootstrap_roles: space_migrator does not exist; control-plane migrations run as the connecting role — run `space-db-migrator bootstrap-roles` first to provision it current_user=postgres
+rolled back migration 20261106034255 to 20261105161136
+-- index: CREATE INDEX idx_sandboxes_name_lower ON public.sandboxes USING btree ("left"(lower(name), 256) COLLATE "C") valid=t
+-- latest: 20261102233332,20261105161135,20261105161136
+-- id_suffix: 1
+## up again
+WARN pplx_space_db_migrate::bootstrap_roles: space_migrator does not exist; control-plane migrations run as the connecting role — run `space-db-migrator bootstrap-roles` first to provision it current_user=postgres
+-- index:  valid=
+-- latest: 20261105161135,20261105161136,20261106034255
+-- id_suffix: 1
+## down, then the index dropped by hand, then up (IF EXISTS)
+rolled back migration 20261106034255 to 20261105161136
+DROP INDEX
+rc=0
+-- index count: 0 latest: 20261106034255
