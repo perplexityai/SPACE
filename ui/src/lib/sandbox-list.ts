@@ -84,7 +84,7 @@ export function sandboxListQuery(
   filters: SandboxListFilters,
   { limit, cursor = '', now }: { limit: number; cursor?: string; now: number },
 ): string {
-  const params = new URLSearchParams({ limit: String(limit), cursor: mode === 'paged' ? cursor : '' });
+  const params = new URLSearchParams({ limit, cursor: mode === 'paged' ? cursor : '' });
   if (filters.org) params.set('org_id', filters.org);
   if (mode === 'sampled') return params.toString();
   if (filters.lifecycles.length) params.set('lifecycle', filters.lifecycles.join(','));
