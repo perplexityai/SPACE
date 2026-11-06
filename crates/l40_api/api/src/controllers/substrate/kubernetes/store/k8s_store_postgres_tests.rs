@@ -1,7 +1,10 @@
-use pplx_space_common_core::types::{LocalArtifactId, NodeId, SandboxId, SnapshotId};
+use pplx_space_common_core::types::{
+    LocalArtifactId, NODE_DRAIN_MODE_GENTLE, NodeDrainPhase, NodeId, SandboxId, SnapshotId,
+};
 
 use std::time::Duration;
 
+use pplx_space_common_svc::types::k8s::space_k8s_node_id;
 use pplx_space_db_test_fixtures::{TestDb, pg_test_db_with_max_connections};
 use pplx_space_sandbox_portability::portable_for_restore_affinity;
 use time::OffsetDateTime;
@@ -13,6 +16,7 @@ use pplx_space_test_env::TestResult;
 mod cleanup_recovery_lifecycle_matrix_tests;
 mod lifecycle_writer_tests;
 mod materialization_record_tests;
+mod node_registration_tests;
 mod owned_restore_completion_tests;
 mod restore_revert_tests;
 mod runtime_upgrade_evidence_tests;
@@ -21,6 +25,9 @@ mod stopped_evacuation_claim_tests;
 mod stopped_restore_selector_tests;
 mod substrate_scope_tests;
 mod suspend_lifecycle_matrix_tests;
+use node_registration_tests::{
+    RegistrationCaller, RegistrationFootprint, insert_placeable_sandbox, registration_footprint,
+};
 use owned_restore_completion_tests::owned_restore_completion_requires_its_lease_and_a_routable_execution;
 use restore_revert_tests::{
     failed_restore_revert_retires_only_its_own_proven_execution,
@@ -1467,7 +1474,7 @@ mod k8s_store_postgres_behaviors {
         upsert_preserves_drain_state_when_k8s_node_uid_unchanged,
         persist_k8s_node_inventory_repairs_missing_and_stale_address,
         azrebalance_variant_uid_change_does_not_leak_stale_drain_state_or_drain_started_at,
-        persist_k8s_node_inventory_refuses_when_tombstoned,
+        node_registration_refuses_when_tombstoned,
         clear_command_ready_pending_is_a_cas_against_the_reaper,
         wake_signal_classifies_post_wake_flip_by_recency_not_lease,
         post_wake_update_does_not_resurrect_quarantined_sandbox,
@@ -1929,6 +1936,9 @@ async fn pod_placement_survives_concurrent_insert_of_same_node() -> TestResult {
     // A concurrent writer inserts the node as `ready` but holds the
     // transaction open, so the row is not yet visible to other snapshots.
     let mut inserter = fixture.pool.begin().await?;
+    let inserter_pid: i32 = sqlx::query_scalar(sql!("SELECT pg_backend_pid()"))
+        .fetch_one(&mut *inserter)
+        .await?;
     sqlx::query(sql!(
         "INSERT INTO nodes (id, address, role, managed_by, state)
          VALUES ($1, $2::INET, $3, 'k8s', 'ready')"
@@ -1956,12 +1966,7 @@ async fn pod_placement_survives_concurrent_insert_of_same_node() -> TestResult {
             )
             .await
     });
-    wait_for_blocked_query(
-        &fixture.pool,
-        "%INSERT INTO nodes (id, address, role, managed_by, state)%",
-        None,
-    )
-    .await?;
+    wait_until_blocked_by(&fixture.pool, inserter_pid).await?;
 
     // Act. Release the concurrent insert; placement's ON CONFLICT now
     // resolves against a row invisible to its statement snapshot.
@@ -1989,6 +1994,35 @@ async fn wait_for_blocked_query(
     alternate_pattern: Option<&str>,
 ) -> TestResult {
     wait_for_blocked_query_count(pool, query_pattern, alternate_pattern, 1).await
+}
+
+/// Waits until a backend in this test's database is waiting on a lock that
+/// `holder_pid` holds. Unlike `wait_for_blocked_query`, it does not read the
+/// waiting statement's SQL text, so a rewrite of that statement cannot break
+/// the wait.
+async fn wait_until_blocked_by(pool: &PgPool, holder_pid: i32) -> TestResult {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let blocked: bool = sqlx::query_scalar(sql!(
+                "SELECT EXISTS (
+                     SELECT 1
+                       FROM pg_stat_activity
+                      WHERE datname = current_database()
+                        AND wait_event_type = 'Lock'
+                        AND $1 = ANY(pg_blocking_pids(pid))
+                 )"
+            ))
+            .bind(holder_pid)
+            .fetch_one(pool)
+            .await?;
+            if blocked {
+                return Ok::<(), sqlx::Error>(());
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await??;
+    Ok(())
 }
 
 async fn wait_for_blocked_query_count(
@@ -8871,29 +8905,151 @@ async fn restored_generation_accepts_late_pod_metadata(fixture: &PostgresStore) 
 }
 
 /// Kube inventory callers pass typed roles; the DB stores the canonical label.
+///
+/// Every caller derives the node id from `(node name, role)`, so one
+/// Kubernetes Node serving every role is one row per role, each carrying its
+/// own role and the same Kubernetes name.
 async fn persist_k8s_node_inventory_stores_canonical_role(fixture: &PostgresStore) -> TestResult {
-    let node_id = NodeId::new();
-    let node_name = format!("space-test-node-role-{}", node_id.as_uuid().simple());
+    let node_name = format!("space-test-node-role-{}", Uuid::now_v7().simple());
+    let roles = [NodeRole::Worker, NodeRole::Builder, NodeRole::Cluster];
+    for role in roles {
+        // Adding a role fails this match until `roles` lists it.
+        match role {
+            NodeRole::Worker | NodeRole::Builder | NodeRole::Cluster => {}
+        }
+        fixture
+            .store
+            .persist_k8s_node_inventory(
+                &node_name,
+                "uid-A",
+                space_k8s_node_id(&node_name, role.as_str()),
+                role,
+                Some("10.0.0.12"),
+                NodeStateWrite::Manage(NodeLifecycleState::Ready),
+            )
+            .await?;
+    }
 
-    fixture
-        .store
-        .persist_k8s_node_inventory(
-            &node_name,
-            "uid-A",
-            node_id,
-            NodeRole::Builder,
-            Some("10.0.0.12"),
-            NodeStateWrite::Manage(NodeLifecycleState::Ready),
-        )
-        .await?;
-
-    let role: String = sqlx::query_scalar(sql!("SELECT role FROM nodes WHERE id = $1"))
-        .bind(node_id)
-        .fetch_one(&fixture.pool)
-        .await?;
-    assert_eq!(role, NodeRole::Builder.as_str());
+    let rows: Vec<(NodeId, String, String)> = sqlx::query_as(sql!(
+        "SELECT n.id, n.role, nk.k8s_node_name
+         FROM nodes n
+         JOIN node_k8s nk ON nk.node_id = n.id
+         WHERE nk.k8s_node_name = $1
+         ORDER BY n.role"
+    ))
+    .bind(&node_name)
+    .fetch_all(&fixture.pool)
+    .await?;
+    let mut expected = roles
+        .map(|role| {
+            (
+                space_k8s_node_id(&node_name, role.as_str()),
+                role.as_str().to_string(),
+                node_name.clone(),
+            )
+        })
+        .to_vec();
+    expected.sort_by(|left, right| left.1.cmp(&right.1));
+    assert_eq!(rows, expected);
 
     Ok(())
+}
+
+/// Every `NodeDrainPhase`, plus no phase: `nodes_drain_phase_check` also
+/// admits NULL, and an `:undrain` whose uncordon fails leaves a node with no
+/// phase and only a `drain_last_error`.
+fn every_drain_phase() -> [NodeDrainPhase; 3] {
+    let all = [
+        NodeDrainPhase::Draining,
+        NodeDrainPhase::Drained,
+        NodeDrainPhase::Terminating,
+    ];
+    for phase in all {
+        // Adding a phase fails this match until `all` lists it.
+        match phase {
+            NodeDrainPhase::Draining | NodeDrainPhase::Drained | NodeDrainPhase::Terminating => {}
+        }
+    }
+    all
+}
+
+/// The drain columns a same-name Kubernetes Node UID change clears.
+#[derive(Debug, PartialEq, Eq, sqlx::FromRow)]
+struct NodeDrainColumns {
+    drain_phase: Option<String>,
+    drain_mode: Option<String>,
+    drain_started_at: Option<OffsetDateTime>,
+    drain_last_error: Option<String>,
+}
+
+impl NodeDrainColumns {
+    const CLEARED: Self = Self {
+        drain_phase: None,
+        drain_mode: None,
+        drain_started_at: None,
+        drain_last_error: None,
+    };
+}
+
+/// Puts `node_id` in a drain state and returns what was stored: mid-drain in
+/// `phase` with every drain column set, or, with no phase, only a
+/// `drain_last_error`, the state an `:undrain` whose uncordon failed leaves.
+async fn set_drain_state(
+    pool: &PgPool,
+    node_id: NodeId,
+    phase: Option<NodeDrainPhase>,
+) -> TestResult<NodeDrainColumns> {
+    let Some(phase) = phase else {
+        let stored: NodeDrainColumns = sqlx::query_as(sql!(
+            "UPDATE nodes
+             SET drain_last_error = 'uncordon failed after undrain'
+             WHERE id = $1
+             RETURNING drain_phase, drain_mode, drain_started_at, drain_last_error"
+        ))
+        .bind(node_id)
+        .fetch_one(pool)
+        .await?;
+        assert!(
+            stored.drain_phase.is_none()
+                && stored.drain_mode.is_none()
+                && stored.drain_started_at.is_none()
+                && stored.drain_last_error.is_some(),
+            "only drain_last_error must be set before the upsert: {stored:?}"
+        );
+        return Ok(stored);
+    };
+    let stored: NodeDrainColumns = sqlx::query_as(sql!(
+        "UPDATE nodes
+         SET drain_phase = $2,
+             drain_mode = $3,
+             drain_started_at = TIMESTAMPTZ '2024-01-01 00:00:00+00',
+             drain_last_error = 'pre-existing operator note'
+         WHERE id = $1
+         RETURNING drain_phase, drain_mode, drain_started_at, drain_last_error"
+    ))
+    .bind(node_id)
+    .bind(phase.as_str())
+    .bind(NODE_DRAIN_MODE_GENTLE)
+    .fetch_one(pool)
+    .await?;
+    assert!(
+        stored.drain_phase.is_some()
+            && stored.drain_mode.is_some()
+            && stored.drain_started_at.is_some()
+            && stored.drain_last_error.is_some(),
+        "every drain column must be set before the upsert: {stored:?}"
+    );
+    Ok(stored)
+}
+
+async fn node_drain_columns(pool: &PgPool, node_id: NodeId) -> TestResult<NodeDrainColumns> {
+    Ok(sqlx::query_as(sql!(
+        "SELECT drain_phase, drain_mode, drain_started_at, drain_last_error
+         FROM nodes WHERE id = $1"
+    ))
+    .bind(node_id)
+    .fetch_one(pool)
+    .await?)
 }
 
 /// When the inventory reflector observes a same-name kube Node with
@@ -8906,156 +9062,148 @@ async fn persist_k8s_node_inventory_stores_canonical_role(fixture: &PostgresStor
 /// against the original. Solution B: the inventory upsert clears
 /// drain state when the UID changes; in-progress drains are
 /// abandoned (visible in tracing) and the operator can re-drain.
+///
+/// Swept over every drain phase and no phase. A control node in the same
+/// drain state, whose UID does not change, keeps all of it, and its
+/// `node_k8s.updated_at` does not move.
 async fn upsert_clears_drain_state_when_k8s_node_uid_changes(
     fixture: &PostgresStore,
 ) -> TestResult {
-    let node_id = NodeId::new();
-    let node_name = format!("space-test-node-{}", node_id.as_uuid().simple());
-
-    // Register the node, then put it into a mid-drain state.
-    fixture
-        .store
-        .persist_k8s_node_inventory(
-            &node_name,
-            "uid-A",
-            node_id,
-            NodeRole::Worker,
-            Some("10.0.0.1"),
-            NodeStateWrite::Manage(NodeLifecycleState::Ready),
-        )
-        .await?;
-    sqlx::query(sql!(
-        "UPDATE nodes
-         SET drain_phase = 'draining',
-             drain_mode = 'gentle',
-             drain_started_at = NOW(),
-             drain_last_error = 'pre-existing operator note'
-         WHERE id = $1"
-    ))
-    .bind(node_id)
-    .execute(&fixture.pool)
-    .await?;
-
-    // Sanity: drain state is what we set.
-    let (phase, mode, started_some, err): (Option<String>, Option<String>, bool, Option<String>) =
-        sqlx::query_as(sql!(
-            "SELECT drain_phase, drain_mode, drain_started_at IS NOT NULL, drain_last_error
-         FROM nodes WHERE id = $1"
-        ))
-        .bind(node_id)
-        .fetch_one(&fixture.pool)
-        .await?;
-    assert_eq!(phase.as_deref(), Some("draining"));
-    assert_eq!(mode.as_deref(), Some("gentle"));
-    assert!(started_some);
-    assert_eq!(err.as_deref(), Some("pre-existing operator note"));
-
-    // The replacement node arrives: same name, new UID. This call
-    // is the inventory reflector's normal upsert path.
-    fixture
-        .store
-        .persist_k8s_node_inventory(
-            &node_name,
-            "uid-B",
-            node_id,
-            NodeRole::Worker,
-            Some("10.0.0.1"),
-            NodeStateWrite::Manage(NodeLifecycleState::Ready),
-        )
-        .await?;
-
-    // node_k8s now holds the new UID.
-    let stored_uid: String =
-        sqlx::query_scalar(sql!("SELECT k8s_node_uid FROM node_k8s WHERE node_id = $1"))
-            .bind(node_id)
-            .fetch_one(&fixture.pool)
+    for phase in every_drain_phase().map(Some).into_iter().chain([None]) {
+        let node_id = NodeId::new();
+        let node_name = format!("space-test-node-{}", node_id.as_uuid().simple());
+        let control_id = NodeId::new();
+        let control_name = format!("space-test-control-{}", control_id.as_uuid().simple());
+        for (id, name, uid) in [
+            (node_id, node_name.as_str(), "uid-A"),
+            (control_id, control_name.as_str(), "uid-control"),
+        ] {
+            fixture
+                .store
+                .persist_k8s_node_inventory(
+                    name,
+                    uid,
+                    id,
+                    NodeRole::Worker,
+                    Some("10.0.0.1"),
+                    NodeStateWrite::Manage(NodeLifecycleState::Ready),
+                )
+                .await?;
+        }
+        set_drain_state(&fixture.pool, node_id, phase).await?;
+        let control_drain = set_drain_state(&fixture.pool, control_id, phase).await?;
+        for id in [node_id, control_id] {
+            sqlx::query(sql!(
+                "UPDATE node_k8s SET updated_at = $2 WHERE node_id = $1"
+            ))
+            .bind(id)
+            .bind(OffsetDateTime::UNIX_EPOCH)
+            .execute(&fixture.pool)
             .await?;
-    assert_eq!(stored_uid, "uid-B");
+        }
 
-    // Drain state must be cleared atomically with the UID change — *all* of it.
-    let (phase, mode, started_some, err): (Option<String>, Option<String>, bool, Option<String>) =
-        sqlx::query_as(sql!(
-            "SELECT drain_phase, drain_mode, drain_started_at IS NOT NULL, drain_last_error
-         FROM nodes WHERE id = $1"
-        ))
-        .bind(node_id)
-        .fetch_one(&fixture.pool)
-        .await?;
-    assert!(
-        phase.is_none(),
-        "drain_phase must be NULL after same-name UID replacement; got {phase:?}"
-    );
-    assert!(
-        mode.is_none(),
-        "drain_mode must be NULL after same-name UID replacement; got {mode:?}. \
-         A mode outliving its phase makes the admin API and CLI report a node as \
-         draining gently when it is not draining at all"
-    );
-    assert!(
-        !started_some,
-        "drain_started_at must be NULL after same-name UID replacement"
-    );
-    assert!(
-        err.is_none(),
-        "drain_last_error must be NULL after same-name UID replacement; got {err:?}"
-    );
+        // The replacement node arrives: same name, new UID. This call
+        // is the inventory reflector's normal upsert path.
+        let changed = fixture
+            .store
+            .persist_k8s_node_inventory(
+                &node_name,
+                "uid-B",
+                node_id,
+                NodeRole::Worker,
+                Some("10.0.0.1"),
+                NodeStateWrite::Manage(NodeLifecycleState::Ready),
+            )
+            .await?;
+        assert!(changed, "{phase:?}: a UID replacement must report changed");
+
+        let stored_uid: String =
+            sqlx::query_scalar(sql!("SELECT k8s_node_uid FROM node_k8s WHERE node_id = $1"))
+                .bind(node_id)
+                .fetch_one(&fixture.pool)
+                .await?;
+        assert_eq!(stored_uid, "uid-B", "{phase:?}");
+
+        // Drain state must be cleared atomically with the UID change — *all*
+        // of it. A `drain_mode` outliving its phase makes the admin API and
+        // CLI report a node as draining gently when it is not draining at all.
+        assert_eq!(
+            node_drain_columns(&fixture.pool, node_id).await?,
+            NodeDrainColumns::CLEARED,
+            "{phase:?}: every drain column must be NULL after same-name UID replacement"
+        );
+        assert_eq!(
+            node_drain_columns(&fixture.pool, control_id).await?,
+            control_drain,
+            "{phase:?}: another node's drain state must survive"
+        );
+
+        let updated_at = |id: NodeId| {
+            sqlx::query_scalar::<_, OffsetDateTime>(sql!(
+                "SELECT updated_at FROM node_k8s WHERE node_id = $1"
+            ))
+            .bind(id)
+            .fetch_one(&fixture.pool)
+        };
+        assert!(
+            updated_at(node_id).await? > OffsetDateTime::UNIX_EPOCH,
+            "{phase:?}: the replaced node's node_k8s.updated_at must move"
+        );
+        assert_eq!(
+            updated_at(control_id).await?,
+            OffsetDateTime::UNIX_EPOCH,
+            "{phase:?}: the control's node_k8s.updated_at must not move"
+        );
+    }
     Ok(())
 }
 
 /// Idempotency sanity check: an inventory upsert that observes the
 /// SAME UID (the steady-state case, fired many times per minute)
-/// must NOT clear drain state. Without this guarantee a drain
-/// would be reset by every reflector tick.
+/// must NOT clear drain state, and reports no change. Without this
+/// guarantee a drain would be reset by every reflector tick.
 async fn upsert_preserves_drain_state_when_k8s_node_uid_unchanged(
     fixture: &PostgresStore,
 ) -> TestResult {
-    let node_id = NodeId::new();
-    let node_name = format!("space-test-node-{}", node_id.as_uuid().simple());
+    for phase in every_drain_phase().map(Some).into_iter().chain([None]) {
+        let node_id = NodeId::new();
+        let node_name = format!("space-test-node-{}", node_id.as_uuid().simple());
 
-    fixture
-        .store
-        .persist_k8s_node_inventory(
-            &node_name,
-            "uid-A",
-            node_id,
-            NodeRole::Worker,
-            Some("10.0.0.2"),
-            NodeStateWrite::Manage(NodeLifecycleState::Ready),
-        )
-        .await?;
-    sqlx::query(sql!(
-        "UPDATE nodes
-         SET drain_phase = 'terminating',
-             drain_started_at = NOW()
-         WHERE id = $1"
-    ))
-    .bind(node_id)
-    .execute(&fixture.pool)
-    .await?;
-
-    // Re-observation with the same UID (every reflector tick).
-    fixture
-        .store
-        .persist_k8s_node_inventory(
-            &node_name,
-            "uid-A",
-            node_id,
-            NodeRole::Worker,
-            Some("10.0.0.2"),
-            NodeStateWrite::Manage(NodeLifecycleState::Ready),
-        )
-        .await?;
-
-    let phase: Option<String> =
-        sqlx::query_scalar(sql!("SELECT drain_phase FROM nodes WHERE id = $1"))
-            .bind(node_id)
-            .fetch_one(&fixture.pool)
+        fixture
+            .store
+            .persist_k8s_node_inventory(
+                &node_name,
+                "uid-A",
+                node_id,
+                NodeRole::Worker,
+                Some("10.0.0.2"),
+                NodeStateWrite::Manage(NodeLifecycleState::Ready),
+            )
             .await?;
-    assert_eq!(
-        phase.as_deref(),
-        Some("terminating"),
-        "same-UID upsert must NOT touch drain_phase"
-    );
+        let drain = set_drain_state(&fixture.pool, node_id, phase).await?;
+
+        // Re-observation with the same UID (every reflector tick).
+        let changed = fixture
+            .store
+            .persist_k8s_node_inventory(
+                &node_name,
+                "uid-A",
+                node_id,
+                NodeRole::Worker,
+                Some("10.0.0.2"),
+                NodeStateWrite::Manage(NodeLifecycleState::Ready),
+            )
+            .await?;
+        assert!(
+            !changed,
+            "{phase:?}: an unchanged re-observation reports no change"
+        );
+        assert_eq!(
+            node_drain_columns(&fixture.pool, node_id).await?,
+            drain,
+            "{phase:?}: a same-UID upsert must not touch drain state"
+        );
+    }
     Ok(())
 }
 
@@ -9248,50 +9396,46 @@ async fn azrebalance_variant_uid_change_does_not_leak_stale_drain_state_or_drain
     Ok(())
 }
 
-/// The bootstrap gate alone is not enough: `kube_node_sync` and the
-/// late-pod-placement path also reach the upsert and would otherwise
-/// re-create the row under the same deterministic id. Asserts that
-/// `persist_k8s_node_inventory` refuses when a tombstone exists.
-async fn persist_k8s_node_inventory_refuses_when_tombstoned(fixture: &PostgresStore) -> TestResult {
-    let node_id = NodeId::new();
-    let node_name = format!(
-        "space-test-tombstoned-inventory-{}",
-        node_id.as_uuid().simple()
-    );
-    sqlx::query(sql!(
-        "INSERT INTO node_k8s_tombstones (node_id, k8s_node_name, role, reason)
-         VALUES ($1, $2, 'worker', 'admin-terminate')"
-    ))
-    .bind(node_id)
-    .bind(&node_name)
-    .execute(&fixture.pool)
-    .await?;
-
-    let err = fixture
-        .store
-        .persist_k8s_node_inventory(
-            &node_name,
-            "instance-uid",
-            node_id,
-            NodeRole::Worker,
-            Some("10.0.0.21"),
-            NodeStateWrite::Manage(NodeLifecycleState::Ready),
-        )
-        .await
-        .expect_err("inventory upsert must refuse tombstoned node");
-    assert!(
-        err.to_string().contains("tombstoned"),
-        "error must mention tombstone: {err}",
-    );
-
-    let nodes_count: i64 = sqlx::query_scalar(sql!("SELECT COUNT(*) FROM nodes WHERE id = $1"))
+/// The bootstrap gate alone is not enough: `kube_node_sync`, the admin
+/// inventory listing, and the late-pod-placement path also reach the upsert
+/// and would otherwise re-create the row under the same deterministic id.
+/// Asserts that each refuses when a tombstone exists and writes nothing.
+async fn node_registration_refuses_when_tombstoned(fixture: &PostgresStore) -> TestResult {
+    for caller in RegistrationCaller::ALL {
+        let node_id = NodeId::new();
+        let node_name = format!(
+            "space-test-refused-inventory-{}",
+            node_id.as_uuid().simple()
+        );
+        sqlx::query(sql!(
+            "INSERT INTO node_k8s_tombstones (node_id, k8s_node_name, role, reason)
+             VALUES ($1, $2, 'worker', 'admin-terminate')"
+        ))
         .bind(node_id)
-        .fetch_one(&fixture.pool)
+        .bind(&node_name)
+        .execute(&fixture.pool)
         .await?;
-    assert_eq!(
-        nodes_count, 0,
-        "tombstoned upsert must not leave a nodes row"
-    );
+        let sandbox_id = insert_placeable_sandbox(fixture).await?;
+
+        let result = caller
+            .register(&fixture.store, sandbox_id, &node_name, node_id)
+            .await;
+        assert!(
+            matches!(result, Err(SubstrateError::NodeTombstoned { .. })),
+            "{caller:?} must refuse a tombstoned node: {result:?}"
+        );
+        if let Err(err) = &result {
+            assert!(
+                err.to_string().contains("tombstoned"),
+                "{caller:?}: the error must mention the tombstone: {err}"
+            );
+        }
+        assert_eq!(
+            registration_footprint(&fixture.pool, node_id, sandbox_id).await?,
+            RegistrationFootprint::NONE,
+            "{caller:?}: a tombstoned registration must write nothing"
+        );
+    }
     Ok(())
 }
 
