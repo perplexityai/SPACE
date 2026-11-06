@@ -1,5 +1,11 @@
 {
   "name": "pplx-space",
   "description": "SPACE development, validation, infrastructure, and operations workflows.",
-  "version": "0.2.47"
+  "version": "0.2.48",
+  "mcpServers": {
+    "space-notes": {
+      "command": "python3",
+      "args": ["-m", "space_notes_mcp"]
+    }
+  }
 }
