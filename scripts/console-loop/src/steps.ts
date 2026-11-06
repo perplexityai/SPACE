@@ -14,7 +14,7 @@ import { TERMINAL_OPERATION_STATES } from './api.ts';
 import { verifyFixtures } from './fixtures.ts';
 import { SYNTHETIC_HEADER } from './recorder.ts';
 import { orgDisplayName, recordCreated } from './seed.ts';
-import { DRAIN_KEEP_ANNOTATION, DRAIN_KEEP_TOKEN, KindNodes, drainCandidate, type AdminNode } from './nodes.ts';
+import { DRAIN_KEEP_ANNOTATION, KindNodes, drainCandidate, type AdminNode } from './nodes.ts';
 
 export interface Step {
   name: string;
@@ -1380,9 +1380,8 @@ async function cordonReachesNode(c: Ctx, node: AdminNode, kube: KindNodes): Prom
 }
 
 // Picks a worker, proves the kube context reads the API's cluster, claims the
-// drain-keep override with this run's token, refusing a worker that already
-// has one, runs `body`, then undrains it if it is still in a drain phase and
-// drops the override while it still carries the token.
+// drain-keep override with a token of its own, refusing a worker that already
+// has one, runs `body`, then cleans up with `releaseDrainableWorker`.
 // Records why when there is no worker it may drain; that is not a pass.
 async function withDrainableWorker(c: Ctx, body: (node: AdminNode, kube: KindNodes) => Promise<void>): Promise<void> {
   const picked = drainCandidate(await adminNodes(c));
@@ -1395,27 +1394,57 @@ async function withDrainableWorker(c: Ctx, body: (node: AdminNode, kube: KindNod
   const kube = new KindNodes(c.config.kubeContext);
   kube.requireLocalNode(name);
   if (!(await cordonReachesNode(c, node, kube))) return;
-  const held = kube.claimDrainKeep(name);
-  if (held !== null) {
-    c.rec.check(false, `${name} already carries ${DRAIN_KEEP_ANNOTATION}=${held}; it is left as it is and nothing is drained`);
+  const claim = kube.claimDrainKeep(name);
+  if ('held' in claim) {
+    c.rec.check(false, `${name} already carries ${DRAIN_KEEP_ANNOTATION}=${claim.held}; it is left as it is and nothing is drained`);
     return;
   }
-  c.rec.note(`draining worker ${name} (${node.id}), which holds no sandboxes, under ${DRAIN_KEEP_ANNOTATION}=${DRAIN_KEEP_TOKEN}`);
+  c.rec.note(`draining worker ${name} (${node.id}), which holds no sandboxes, under ${DRAIN_KEEP_ANNOTATION}=${claim.token}`);
   try {
     await body(node, kube);
   } finally {
-    const now = await adminNode(c, node.id);
-    if (now?.drain_phase === 'draining' || now?.drain_phase === 'drained') {
+    await releaseDrainableWorker(c, node, kube, claim.token);
+  }
+}
+
+// Undrains the worker unless the API shows it with no drain phase, then
+// removes the override once it does. It runs however the body ended, so it
+// records each error as a failed check and goes on where that is safe, and
+// never throws: the body's own error stays the step's error.
+async function releaseDrainableWorker(c: Ctx, node: AdminNode, kube: KindNodes, token: string): Promise<void> {
+  const name = node.k8s_node_name!;
+  const failed = (what: string, error: unknown) =>
+    c.rec.check(false, `cleanup: ${what} failed: ${error instanceof Error ? error.message.split('\n')[0] : String(error)}`);
+  let phase: string | null | undefined;
+  try {
+    phase = (await adminNode(c, node.id))?.drain_phase;
+  } catch (error) {
+    failed('reading the node', error);
+  }
+  // A phase that could not be read may still be a drain.
+  if (phase === undefined || phase === 'draining' || phase === 'drained') {
+    try {
       const undrain = await adminFetch(c.page, 'POST', `/admin/api/v1/nodes/${node.id}:undrain`);
       c.rec.note(`cleanup undrain answered ${undrain.status}`);
+    } catch (error) {
+      failed('the undrain', error);
     }
-    const left = await waitForPhase(c, node.id, [null], 30_000);
-    c.rec.check(left === null, 'the worker is left with no drain phase');
-    if (left !== null) {
-      c.rec.note(`the drain-keep override stays on ${name} because the node is still ${left}`);
-    } else {
-      c.rec.check(kube.releaseDrainKeep(name), `the drain-keep override on ${name} still carried this run's token and was removed`);
-    }
+  }
+  let left: string | null | undefined;
+  try {
+    left = await waitForPhase(c, node.id, [null], 30_000);
+  } catch (error) {
+    failed('reading the drain phase', error);
+  }
+  c.rec.check(left === null, 'the worker is left with no drain phase');
+  if (left !== null) {
+    c.rec.note(`the drain-keep override ${token} stays on ${name} because ${left === undefined ? 'the API did not report the node' : `the node is still ${left}`}`);
+    return;
+  }
+  try {
+    c.rec.check(kube.releaseDrainKeep(name, token), `the drain-keep override on ${name} still carried this claim's token and was removed`);
+  } catch (error) {
+    failed('removing the drain-keep override', error);
   }
 }
 

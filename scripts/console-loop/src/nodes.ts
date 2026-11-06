@@ -13,9 +13,10 @@ import { isLoopback } from './config.ts';
 
 export const DRAIN_KEEP_ANNOTATION = 'space.pplx.net/drain-keep';
 export const DRAIN_KEEP_VALUE = 'console-loop';
-// This run's override value, picked once per run, so two runs against one
-// stack never write the same value.
-export const DRAIN_KEEP_TOKEN = `${DRAIN_KEEP_VALUE}-${randomBytes(6).toString('hex')}`;
+// This run's id, picked once per run. Each claim's token adds a counter, so
+// two runs, or two steps of one run, never write the same value.
+const RUN_ID = randomBytes(6).toString('hex');
+let claims = 0;
 
 // The admin node fields the steps read.
 export interface AdminNode {
@@ -80,27 +81,30 @@ export class KindNodes {
     return node.metadata?.annotations?.[DRAIN_KEEP_ANNOTATION] ?? null;
   }
 
-  // Sets the override to this run's token. Without `--overwrite` the
-  // annotate fails when the key exists, so a run never takes over another
-  // run's or an operator's override. Returns null once claimed, or the value
-  // the Node already carries.
-  claimDrainKeep(name: string): string | null {
+  // Sets the override to a token new to this claim. Without `--overwrite` the
+  // annotate fails when the key exists, so a claim never takes over another
+  // run's, an earlier step's or an operator's override. An annotate that
+  // reached the server but whose answer was lost reads back as this claim's
+  // token, which counts as won. Returns the claim's token, or the value the
+  // Node already carries.
+  claimDrainKeep(name: string): { token: string } | { held: string } {
+    const token = `${DRAIN_KEEP_VALUE}-${RUN_ID}-${++claims}`;
     try {
-      this.kubectl('annotate', 'node', name, `${DRAIN_KEEP_ANNOTATION}=${DRAIN_KEEP_TOKEN}`);
-      return null;
+      this.kubectl('annotate', 'node', name, `${DRAIN_KEEP_ANNOTATION}=${token}`);
+      return { token };
     } catch (error) {
       const held = this.drainKeep(name);
+      if (held === token) return { token };
       if (held === null) throw error;
-      return held;
+      return { held };
     }
   }
 
-  // Removes the override only while it carries this run's token; returns
-  // whether it did. The read and the removal are two calls, so this can only
-  // race a run that overwrote the token in between, which `claimDrainKeep`
-  // never does.
-  releaseDrainKeep(name: string): boolean {
-    if (this.drainKeep(name) !== DRAIN_KEEP_TOKEN) return false;
+  // Removes the override only while it carries `token`; returns whether it
+  // did. The read and the removal are two calls, so this can only race a run
+  // that overwrote the token in between, which `claimDrainKeep` never does.
+  releaseDrainKeep(name: string, token: string): boolean {
+    if (this.drainKeep(name) !== token) return false;
     this.kubectl('annotate', 'node', name, `${DRAIN_KEEP_ANNOTATION}-`);
     return true;
   }
