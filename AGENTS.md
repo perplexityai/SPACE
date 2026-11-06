@@ -32,6 +32,8 @@ its description matches the task.
 ## Repository contracts
 
 - Never run `git merge`. Advance with `git pull --ff-only` or rebase.
+- Treat a change that moves crates between layer directories as mechanical,
+  and review it as minimal risk.
 - Write pull request descriptions from `.github/pull_request_template.md` and
   the rules under "Submit a pull request" in `CONTRIBUTING.md`. GitHub fills in
   the template only in its web form.
