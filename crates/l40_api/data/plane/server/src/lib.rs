@@ -677,14 +677,16 @@ fn router(state: DataPlaneState) -> Router {
             on(
                 native_method_filter(native_routes::ATTACH_SESSION.method()),
                 attach_session,
-            ),
+            )
+            .fallback(native_method_not_allowed),
         )
         .route(
             native_routes::STREAM_SESSION_EVENTS.runtime_path(),
             on(
                 native_method_filter(native_routes::STREAM_SESSION_EVENTS.method()),
                 session_events,
-            ),
+            )
+            .fallback(native_method_not_allowed),
         )
         .route(
             native_routes::PROXY_SESSION.runtime_path(),
@@ -825,7 +827,42 @@ async fn record_request_latency(
     response
 }
 
-async fn unsupported_ecw_envd_endpoint() -> Response {
+/// A request that matches no data-plane route and names no ECW sandbox host
+/// is a Native client's, so it is answered in the Native data-plane envelope.
+/// One for an ECW sandbox host keeps the ECW error shape its SDK reads.
+fn native_route_not_found() -> Response {
+    data_plane_http_error(
+        StatusCode::NOT_FOUND,
+        DataPlaneHttpErrorCode::NotFound,
+        "route not found",
+        false,
+        ResponseOrigin::Client,
+        ResponseKind::Validation,
+    )
+}
+
+/// A Native route's answer to a method it does not serve. The method router
+/// adds the `Allow` header to it.
+async fn native_method_not_allowed() -> Response {
+    data_plane_http_error(
+        StatusCode::METHOD_NOT_ALLOWED,
+        DataPlaneHttpErrorCode::InvalidRequest,
+        "this HTTP method is not supported for this route",
+        false,
+        ResponseOrigin::Client,
+        ResponseKind::Validation,
+    )
+}
+
+/// envd endpoints SPACE does not serve. They exist only on an ECW sandbox
+/// host; anywhere else the path is just not a data-plane route.
+async fn unsupported_ecw_envd_endpoint(
+    State(state): State<DataPlaneState>,
+    headers: HeaderMap,
+) -> Response {
+    if state.ecw_hosts.parse_sandbox_host(&headers).is_none() {
+        return native_route_not_found();
+    }
     EcwProxyError::new(
         StatusCode::NOT_IMPLEMENTED,
         "This E2B envd endpoint is not supported by SPACE ECW",
@@ -918,10 +955,9 @@ async fn ecw_service_proxy(
     State(state): State<DataPlaneState>,
     request: Request<Body>,
 ) -> Result<Response, EcwProxyError> {
-    let target = state
-        .ecw_hosts
-        .parse_sandbox_host(request.headers())
-        .ok_or_else(|| EcwProxyError::not_found("Endpoint"))?;
+    let Some(target) = state.ecw_hosts.parse_sandbox_host(request.headers()) else {
+        return Ok(native_route_not_found());
+    };
     validate_ecw_sandbox_headers(request.headers(), &target)?;
 
     if target.port == ECW_ENVD_PORT {
