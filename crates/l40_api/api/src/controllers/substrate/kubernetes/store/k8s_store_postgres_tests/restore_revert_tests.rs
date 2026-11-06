@@ -354,7 +354,10 @@ pub(super) async fn failed_restore_revert_retires_only_its_own_proven_execution(
                 .expect("sandbox row exists");
             fixture
                 .store
-                .selected_suspend_restore_storage_uri(&sandbox, false)
+                .selected_suspend_restore_storage_uri(
+                    &sandbox,
+                    RestoreSnapshotChoice::SourceNodeOrFresh,
+                )
                 .await?
         };
         // A reverted, proven row whose active execution is gone has its

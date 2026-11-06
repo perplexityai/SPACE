@@ -950,7 +950,10 @@ impl SubstrateAdapter for KubernetesSubstrate {
             normalize_lifecycle(&sandbox.lifecycle).as_str(),
             "suspended" | "restoring"
         ) {
-            Some(self.suspend_restore_plan(&sandbox, false).await?)
+            Some(
+                self.suspend_restore_plan(&sandbox, RestoreSnapshotChoice::SourceNodeOrFresh)
+                    .await?,
+            )
         } else {
             None
         };
@@ -1231,9 +1234,10 @@ impl SubstrateAdapter for KubernetesSubstrate {
             metric_identity,
             sandbox_id,
             options,
-            None,
-            pplx_space_common_core::types::SandboxLifecycle::Started,
-            charge,
+            RestoreIntent::user(
+                charge,
+                WakeTarget::Explicit(pplx_space_common_core::types::SandboxLifecycle::Started),
+            ),
         )
         .await
     }

@@ -219,16 +219,13 @@ fn left_restoring_error(sandbox: &Sandbox) -> SubstrateError {
 struct RestoreClaimHandling {
     preclaimed: Option<RestoreClaim>,
     cleanup_on_failure: bool,
-    /// Deferred activation charge the claim-winner pays. Preclaimed callers
-    /// pass [`RecoveryCharge::Exempt`]: their claim was charged upstream.
-    charge: RecoveryCharge,
 }
 
 /// Implicit wake always targets Started and retains its policy source through
 /// detached activation and recovery; explicit evacuation can target Paused or
 /// Stopped.
 #[derive(Clone, Copy)]
-enum WakeTarget {
+pub(super) enum WakeTarget {
     Explicit(SandboxLifecycle),
     Implicit(ExecutionActivityKind),
 }
@@ -254,27 +251,24 @@ struct PreparedWakeDrive {
     prepared: PreparedWakeSandbox,
     timeout: Duration,
     metric_identity: pplx_space_metrics::sandbox::api::SandboxApiMetricIdentity,
-    evacuation_placement: Option<Option<EvacuationPlacement>>,
-    target: WakeTarget,
+    intent: RestoreIntent,
     cleanup_on_failure: bool,
     join_deadline: Instant,
-    charge: RecoveryCharge,
 }
 
 impl RestoreClaimHandling {
+    /// The caller charged `claim` itself; the wake drops its intent's charge.
     fn preclaimed_with_cleanup(claim: RestoreClaim) -> Self {
         Self {
             preclaimed: Some(claim),
             cleanup_on_failure: true,
-            charge: RecoveryCharge::Exempt,
         }
     }
 
-    fn claim_and_cleanup_on_failure(charge: RecoveryCharge) -> Self {
+    fn claim_and_cleanup_on_failure() -> Self {
         Self {
             preclaimed: None,
             cleanup_on_failure: true,
-            charge,
         }
     }
 }
@@ -668,9 +662,8 @@ impl KubernetesSubstrate {
                 sandbox,
                 remaining_ready_window(join_deadline),
                 metric_identity,
-                None,
-                WakeTarget::started(wake_activity),
-                RestoreClaimHandling::claim_and_cleanup_on_failure(charge),
+                &RestoreIntent::user(charge, WakeTarget::started(wake_activity)),
+                RestoreClaimHandling::claim_and_cleanup_on_failure(),
             )
             .await
         })
@@ -887,8 +880,7 @@ impl KubernetesSubstrate {
             &sandbox,
             remaining_ready_window(join_deadline),
             metric_identity,
-            None,
-            WakeTarget::started(None),
+            &RestoreIntent::user(RecoveryCharge::Exempt, WakeTarget::started(None)),
             RestoreClaimHandling::preclaimed_with_cleanup(restore_claim),
         )
         .await
@@ -1243,20 +1235,17 @@ impl KubernetesSubstrate {
             metric_identity,
             sandbox_id,
             options,
-            Some(placement),
-            target_state,
-            RecoveryCharge::Exempt,
+            RestoreIntent::drain(placement.cloned(), target_state),
         )
         .await
         .map(|_| ())
     }
 
     /// Shared lifecycle bookkeeping for both [`SubstrateAdapter::restore_execution`]
-    /// (user-API restore, `evacuation_placement = None`) and
+    /// (user-API restore, [`RestoreIntent::user`]) and
     /// [`Self::restore_evacuated_execution`] (cluster-controller drain
-    /// evacuation, `evacuation_placement = Some(_)` — the outer `Some`
-    /// flags the evacuation path; the inner `Option<&EvacuationPlacement>`
-    /// is the optional cohort pin). Keeping the suspend-on-failure revert
+    /// evacuation, [`RestoreIntent::drain`]); `intent` carries every decision
+    /// in which the two differ. Keeping the suspend-on-failure revert
     /// and the begin/wake sequence in one place so the two paths can't
     /// drift the next time the lifecycle bookkeeping changes.
     pub(super) async fn restore_execution_inner(
@@ -1264,10 +1253,9 @@ impl KubernetesSubstrate {
         metric_identity: pplx_space_metrics::sandbox::api::SandboxApiMetricIdentity,
         sandbox_id: SandboxId,
         options: ActivationOptions,
-        evacuation_placement: Option<Option<&EvacuationPlacement>>,
-        target_state: SandboxLifecycle,
-        charge: RecoveryCharge,
+        intent: RestoreIntent,
     ) -> Result<ActivationCompletion, SubstrateError> {
+        let target_state = intent.target.state();
         if !options.blocking {
             return Err(SubstrateError::Conflict {
                 message: "kubernetes substrate requires blocking=true for restore".to_string(),
@@ -1281,17 +1269,19 @@ impl KubernetesSubstrate {
         // Only the drain re-places a sandbox as `stopped`: the stopped arm
         // reads the evacuation's disk artifact and the claim it needs is the
         // evacuation claim. A user restore asking for it is a caller bug.
-        if target_state == SandboxLifecycle::Stopped && evacuation_placement.is_none() {
+        if target_state == SandboxLifecycle::Stopped
+            && intent.claim != RestoreClaimMode::EvacuationMarker
+        {
             return Err(SubstrateError::Conflict {
                 message: "a stopped restore target is only valid for an evacuation restore"
                     .to_string(),
             });
         }
-        // Evacuation restore (`evacuation_placement` outer `Some`) claims the
+        // Evacuation restore (`RestoreClaimMode::EvacuationMarker`) claims the
         // suspended (or released stopped) → restoring transition atomically on the
         // `evacuation_restore_target` marker, so it can't restore a sandbox a
         // concurrent user restore just cleared the marker on. The user
-        // restore path (`None`) claims without the marker — it's allowed to
+        // restore path (`UserLease`) claims without the marker — it's allowed to
         // restore regardless and is what clears the marker.
         //
         // A user restore that loses the lease CAS joins the owner's attempt
@@ -1301,18 +1291,20 @@ impl KubernetesSubstrate {
         let (_, join_deadline) = ready_wait_bounds(options.ready_timeout);
         let mut join_backoff = RecoveryJoinBackoff::new(self.recovery_join_backoff);
         let restore_claim = loop {
-            let claim = match evacuation_placement {
-                Some(_) => {
+            let claim = match intent.claim {
+                RestoreClaimMode::EvacuationMarker => {
                     self.store
                         .begin_evacuation_restore_lifecycle(sandbox_id, target_state)
                         .await
                 }
-                None => self.store.begin_restore_lifecycle(sandbox_id, false).await,
+                RestoreClaimMode::UserLease { .. } => {
+                    self.store.begin_restore_lifecycle(sandbox_id, false).await
+                }
             };
             match claim {
                 Ok(restore_claim) => break restore_claim,
                 Err(err @ SubstrateError::RestoreInFlight { .. })
-                    if evacuation_placement.is_some() =>
+                    if !intent.claim.joins_in_flight() =>
                 {
                     return Err(err);
                 }
@@ -1339,7 +1331,9 @@ impl KubernetesSubstrate {
                         }
                     }
                 }
-                Err(err @ SubstrateError::Conflict { .. }) if evacuation_placement.is_none() => {
+                Err(err @ SubstrateError::Conflict { .. })
+                    if intent.claim.joins_completed_on_conflict() =>
+                {
                     if self
                         .completed_user_restore_binding(sandbox_id)
                         .await?
@@ -1352,7 +1346,7 @@ impl KubernetesSubstrate {
                 Err(err) => return Err(err),
             }
         };
-        if let Err(err) = charge.charge_restore_claim().await {
+        if let Err(err) = intent.charge.clone().charge_restore_claim().await {
             self.release_rejected_restore_claim(sandbox_id, restore_claim)
                 .await;
             return Err(err);
@@ -1363,8 +1357,7 @@ impl KubernetesSubstrate {
                 &sandbox,
                 remaining_ready_window(join_deadline),
                 metric_identity,
-                evacuation_placement,
-                WakeTarget::Explicit(target_state),
+                &intent,
                 RestoreClaimHandling::preclaimed_with_cleanup(restore_claim),
             )
             .await?;
@@ -1400,9 +1393,8 @@ impl KubernetesSubstrate {
             sandbox,
             timeout,
             metric_identity,
-            None,
-            WakeTarget::started(wake_activity),
-            RestoreClaimHandling::claim_and_cleanup_on_failure(charge),
+            &RestoreIntent::user(charge, WakeTarget::started(wake_activity)),
+            RestoreClaimHandling::claim_and_cleanup_on_failure(),
         )
         .await
     }
@@ -1416,15 +1408,15 @@ impl KubernetesSubstrate {
     /// sandbox: joiners hold a watch receiver instead of a connection, and
     /// cross-pod arbitration stays with the DB lease exactly as before.
     ///
-    /// Preclaimed and evacuation callers bypass the gate: the drain owns its
-    /// own retry loop and must keep fail-fast claim semantics.
+    /// Preclaimed callers and intents that don't coalesce (the drain's)
+    /// bypass the gate: the drain owns its own retry loop and must keep
+    /// fail-fast claim semantics.
     async fn wake_execution_inner(
         &self,
         sandbox: &Sandbox,
         timeout: Duration,
         metric_identity: pplx_space_metrics::sandbox::api::SandboxApiMetricIdentity,
-        evacuation_placement: Option<Option<&EvacuationPlacement>>,
-        target: WakeTarget,
+        intent: &RestoreIntent,
         restore_claim_handling: RestoreClaimHandling,
     ) -> Result<ExecutionActivation, SubstrateError> {
         // Fail terminal lifecycles fast, before joining a run some other
@@ -1440,16 +1432,15 @@ impl KubernetesSubstrate {
             lifecycle,
             SandboxLifecycle::Suspended | SandboxLifecycle::Restoring
         ) && restore_claim_handling.preclaimed.is_none()
-            && evacuation_placement.is_none()
-            && target.activity().is_none();
+            && intent.coalesces
+            && intent.target.activity().is_none();
         if !coalesce {
             return self
                 .wake_execution_uncoalesced(
                     sandbox,
                     timeout,
                     metric_identity,
-                    evacuation_placement,
-                    target,
+                    intent,
                     restore_claim_handling,
                 )
                 .await;
@@ -1467,6 +1458,7 @@ impl KubernetesSubstrate {
                     let substrate = self.clone();
                     let run_sandbox = wake_sandbox.clone();
                     let handling = restore_claim_handling.clone();
+                    let intent = intent.clone();
                     let wake_trace = crate::wake_trace::current();
                     // The run is detached, so it re-enters the owner's retry
                     // deferral explicitly, as it does the wake trace.
@@ -1479,8 +1471,7 @@ impl KubernetesSubstrate {
                                     &run_sandbox,
                                     timeout,
                                     metric_identity,
-                                    None,
-                                    target,
+                                    &intent,
                                     handling,
                                 )
                                 .await
@@ -1594,8 +1585,7 @@ impl KubernetesSubstrate {
         sandbox: &Sandbox,
         timeout: Duration,
         metric_identity: pplx_space_metrics::sandbox::api::SandboxApiMetricIdentity,
-        evacuation_placement: Option<Option<&EvacuationPlacement>>,
-        target: WakeTarget,
+        intent: &RestoreIntent,
         restore_claim_handling: RestoreClaimHandling,
     ) -> Result<ExecutionActivation, SubstrateError> {
         let sandbox_id = sandbox.id;
@@ -1631,7 +1621,7 @@ impl KubernetesSubstrate {
                 Ok(prepared) => break prepared,
                 Err(err @ SubstrateError::RestoreInFlight { .. })
                     if restore_claim_handling.preclaimed.is_some()
-                        || evacuation_placement.is_some() =>
+                        || !intent.claim.joins_in_flight() =>
                 {
                     return Err(err);
                 }
@@ -1664,7 +1654,7 @@ impl KubernetesSubstrate {
                 }
                 Err(err @ SubstrateError::Conflict { .. })
                     if restore_claim_handling.preclaimed.is_none()
-                        && evacuation_placement.is_none() =>
+                        && intent.claim.joins_completed_on_conflict() =>
                 {
                     if let Some(binding) = self.completed_user_restore_binding(sandbox_id).await? {
                         return Ok(ExecutionActivation::joined(binding));
@@ -1721,12 +1711,11 @@ impl KubernetesSubstrate {
             };
             pplx_space_metrics::sandbox::api::restore_claim_lap(metric_identity, lap);
         };
-        let charge = restore_claim_handling.charge.clone();
         // The claim-winner pays the deferred activation charge; a rejection
         // releases the claim it just won so another caller can take over.
         if restore_claim_handling.preclaimed.is_none()
             && let Some(won_claim) = prepared.restore_claim
-            && let Err(err) = restore_claim_handling.charge.charge_restore_claim().await
+            && let Err(err) = intent.charge.clone().charge_restore_claim().await
         {
             self.release_rejected_restore_claim(sandbox_id, won_claim)
                 .await;
@@ -1741,7 +1730,12 @@ impl KubernetesSubstrate {
         // task also means followers parked above retain only their watch
         // receiver rather than storage for the materialization state machine.
         let substrate = self.clone();
-        let evacuation_placement = evacuation_placement.map(|placement| placement.cloned());
+        let mut intent = intent.clone();
+        // A preclaimed caller paid for its claim itself, so the drive must not
+        // charge this activation again.
+        if restore_claim_handling.preclaimed.is_some() {
+            intent.charge = RecoveryCharge::Exempt;
+        }
         let cleanup_on_failure = restore_claim_handling.cleanup_on_failure;
         let shutdown_token = self.shutdown_token.clone();
         let sandbox_id = prepared.sandbox.id;
@@ -1749,17 +1743,16 @@ impl KubernetesSubstrate {
         let wake_trace = crate::wake_trace::current();
         let leader = self.task_tracker.spawn(
             crate::wake_trace::scope(wake_trace, async move {
-                let drive = substrate.drive_prepared_wake(PreparedWakeDrive {
+                // Boxed: `drive_prepared_wake` is the largest future on this
+                // path, so only a pointer to it moves with the task.
+                let mut drive = Box::pin(substrate.drive_prepared_wake(PreparedWakeDrive {
                     prepared,
                     timeout,
                     metric_identity,
-                    evacuation_placement,
-                    target,
+                    intent,
                     cleanup_on_failure,
                     join_deadline,
-                    charge,
-                });
-                tokio::pin!(drive);
+                }));
                 tokio::select! {
                     result = &mut drive => result,
                     _ = shutdown_token.cancelled() => {
@@ -1795,17 +1788,12 @@ impl KubernetesSubstrate {
             prepared,
             timeout,
             metric_identity,
-            evacuation_placement,
-            target,
+            intent,
             cleanup_on_failure,
             join_deadline,
-            charge,
         } = drive;
-        let target_state = target.state();
-        let wake_activity = target.activity();
-        let evacuation_placement = evacuation_placement
-            .as_ref()
-            .map(|placement| placement.as_ref());
+        let target_state = intent.target.state();
+        let wake_activity = intent.target.activity();
         let sandbox_id = prepared.sandbox.id;
         // A takeover consumed part of the caller's readiness window inside the
         // join; the remaining wake work gets only what is left of it, so the
@@ -1832,7 +1820,7 @@ impl KubernetesSubstrate {
                             retired_generation,
                             join_deadline,
                             metric_identity,
-                            charge,
+                            intent.charge.clone(),
                             wake_activity,
                         )
                         .await;
@@ -1889,10 +1877,7 @@ impl KubernetesSubstrate {
             } else if prepared.restore_started
                 || normalize_lifecycle(&sandbox.lifecycle) == "restoring"
             {
-                Some(
-                    self.suspend_restore_plan(&sandbox, evacuation_placement.is_some())
-                        .await?,
-                )
+                Some(self.suspend_restore_plan(&sandbox, intent.snapshot).await?)
             } else {
                 None
             };
@@ -1901,7 +1886,7 @@ impl KubernetesSubstrate {
             // started lifecycle except a drain's evacuation, which keeps the
             // sandbox's lifecycle and its environment.
             let runtime_upgrade = match &restore_plan {
-                Some(plan) if evacuation_placement.is_none() => {
+                Some(plan) if intent.allows_runtime_upgrade => {
                     self.activation_runtime_upgrade(
                         sandbox_id,
                         UpgradeActivation::Restore,
@@ -1916,7 +1901,7 @@ impl KubernetesSubstrate {
             let (activation_attempt_id, joined_attempt_id) = match Box::pin(
                 self.ensure_pod_exists(
                     &sandbox,
-                    evacuation_placement,
+                    Some(&intent),
                     restore_plan
                         .as_ref()
                         .and_then(|plan| plan.source_node_name.as_deref()),
@@ -2184,7 +2169,7 @@ impl KubernetesSubstrate {
             Ok((binding, owned_attempt))
         };
         let result = if let Some(generation) = started_recovery_generation
-            && evacuation_placement.is_none()
+            && intent.redrives_started_recovery
         {
             tokio::select! {
                 result = tokio::time::timeout(wait_budget, wait) => match result {
@@ -2215,7 +2200,7 @@ impl KubernetesSubstrate {
                             Some(generation),
                             join_deadline,
                             metric_identity,
-                            charge.clone(),
+                            intent.charge.clone(),
                             wake_activity,
                         )
                         .await;
@@ -2243,7 +2228,7 @@ impl KubernetesSubstrate {
         if matches!(result, Err(SubstrateError::SuspendInFlight { .. }))
             && !wake_dispatch.was_dispatched()
             && started_recovery_generation.is_some()
-            && evacuation_placement.is_none()
+            && intent.redrives_started_recovery
         {
             // The exact old Pod stopped after materialization, while its
             // local suspend backup is still publishing. Keep recovery owned
@@ -2263,7 +2248,7 @@ impl KubernetesSubstrate {
 
         if result.is_err()
             && let Some(generation) = started_recovery_generation
-            && evacuation_placement.is_none()
+            && intent.redrives_started_recovery
             && let Some(sandbox) = self.suspended_or_restoring_sandbox(sandbox_id).await?
         {
             if let Some((activation_attempt_id, generation)) = activation_assignment.assigned() {
@@ -2281,7 +2266,7 @@ impl KubernetesSubstrate {
                     Some(generation),
                     join_deadline,
                     metric_identity,
-                    charge,
+                    intent.charge.clone(),
                     wake_activity,
                 )
                 .await;
@@ -2367,7 +2352,7 @@ impl KubernetesSubstrate {
         // the node's published state, which those requests then wait for.
         if result.is_ok()
             && target_state == SandboxLifecycle::Started
-            && evacuation_placement.is_none()
+            && intent.owner_commits_started
             && let Some(restore_lease_token) = prepared
                 .restore_claim
                 .and_then(RestoreClaim::restore_lease_token)

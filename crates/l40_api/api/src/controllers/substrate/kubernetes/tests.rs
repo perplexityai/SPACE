@@ -4606,9 +4606,10 @@ mod kubernetes_tests {
                     blocking: true,
                     ready_timeout: Duration::from_secs(5),
                 },
-                None,
-                pplx_space_common_core::types::SandboxLifecycle::Started,
-                crate::controllers::substrate::RecoveryCharge::Exempt,
+                RestoreIntent::user(
+                    crate::controllers::substrate::RecoveryCharge::Exempt,
+                    WakeTarget::Explicit(pplx_space_common_core::types::SandboxLifecycle::Started),
+                ),
             )
             .await?;
 
@@ -4636,9 +4637,10 @@ mod kubernetes_tests {
                     blocking: true,
                     ready_timeout: Duration::from_secs(5),
                 },
-                None,
-                pplx_space_common_core::types::SandboxLifecycle::Started,
-                crate::controllers::substrate::RecoveryCharge::Exempt,
+                RestoreIntent::user(
+                    crate::controllers::substrate::RecoveryCharge::Exempt,
+                    WakeTarget::Explicit(pplx_space_common_core::types::SandboxLifecycle::Started),
+                ),
             )
             .await
             .expect_err("an unroutable started sandbox must remain a conflict");
@@ -4688,9 +4690,14 @@ mod kubernetes_tests {
                         blocking: true,
                         ready_timeout: Duration::from_secs(2),
                     },
-                    evacuation.then_some(None),
-                    target,
-                    crate::controllers::substrate::RecoveryCharge::Exempt,
+                    if evacuation {
+                        RestoreIntent::drain(None, target)
+                    } else {
+                        RestoreIntent::user(
+                            crate::controllers::substrate::RecoveryCharge::Exempt,
+                            WakeTarget::Explicit(target),
+                        )
+                    },
                 )
                 .await
                 .expect_err("an unservable restore target must be refused");
@@ -4798,9 +4805,10 @@ mod kubernetes_tests {
                     blocking: true,
                     ready_timeout: Duration::from_secs(5),
                 },
-                None,
-                pplx_space_common_core::types::SandboxLifecycle::Started,
-                crate::controllers::substrate::RecoveryCharge::Exempt,
+                RestoreIntent::user(
+                    crate::controllers::substrate::RecoveryCharge::Exempt,
+                    WakeTarget::Explicit(pplx_space_common_core::types::SandboxLifecycle::Started),
+                ),
             )
             .await?;
         completer.await??;
@@ -10723,7 +10731,7 @@ mod kubernetes_tests {
             .prepare_wake_sandbox(&stale_sandbox, sandbox_id, Some(restore_claim))
             .await?;
         let restore_plan = substrate
-            .suspend_restore_plan(&prepared.sandbox, false)
+            .suspend_restore_plan(&prepared.sandbox, RestoreSnapshotChoice::SourceNodeOrFresh)
             .await?;
         substrate
             .ensure_pod_exists(

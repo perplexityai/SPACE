@@ -638,7 +638,10 @@ async fn sweeper_revert_cleanup_deletes_a_restore_pod_that_bound_after_its_check
     assert_eq!(
         substrate
             .store
-            .selected_suspend_restore_storage_uri(&sandbox, false)
+            .selected_suspend_restore_storage_uri(
+                &sandbox,
+                RestoreSnapshotChoice::SourceNodeOrFresh
+            )
             .await?
             .as_deref(),
         Some(source_uri),
