@@ -12,11 +12,12 @@ use axum::{
 };
 use pplx_space_common_core::types::{CredentialReferenceId, IdempotencyKey};
 use pplx_space_public_api::credential_references as wire;
+use pplx_space_public_api_http::PublicJson;
 
 pub(crate) async fn register(
     State(state): State<AppState>,
     Extension(AuthOrg(org)): Extension<AuthOrg>,
-    Json(request): Json<wire::RegisterCredentialReferenceRequest>,
+    PublicJson(request): PublicJson<wire::RegisterCredentialReferenceRequest>,
 ) -> Result<(StatusCode, Json<wire::CredentialReference>), PublicApiError> {
     let definition = admission::definition(&request).map_err(reference_error)?;
     let request_id = IdempotencyKey::parse(request.request_id())

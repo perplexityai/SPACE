@@ -231,6 +231,22 @@ impl PublicApiError {
         rejected
     }
 
+    /// Name the request field this error is about in `details`.
+    pub(crate) fn with_field(mut self, field: String) -> Self {
+        self.details.push(PublicErrorDetail {
+            key: pplx_space_public_api::INVALID_REQUEST_FIELD_DETAIL_KEY.to_string(),
+            value: field,
+        });
+        self
+    }
+
+    /// Answer with `status` rather than the code's own: a framework
+    /// rejection keeps the status it was made with.
+    pub(crate) fn with_status(mut self, status: StatusCode) -> Self {
+        self.status = status;
+        self
+    }
+
     pub fn with_retry_after(mut self, retry_after: Duration) -> Self {
         self.retry_after = Some(retry_after);
         self
