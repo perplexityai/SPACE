@@ -1192,6 +1192,10 @@ fn published_sandbox_state_uses_batched_enrichment() {
                 seconds: 20,
                 nanos: 0,
             }),
+            next_auto_event_at: Some(prost_types::Timestamp {
+                seconds: 40,
+                nanos: 0,
+            }),
             ..Default::default()
         }),
         execution: Some(execution.clone()),
@@ -1268,6 +1272,13 @@ fn published_sandbox_state_uses_batched_enrichment() {
         state.last_command_at,
         Some(prost_types::Timestamp {
             seconds: 20,
+            nanos: 0,
+        })
+    );
+    assert_eq!(
+        state.next_auto_event_at,
+        Some(prost_types::Timestamp {
+            seconds: 40,
             nanos: 0,
         })
     );
