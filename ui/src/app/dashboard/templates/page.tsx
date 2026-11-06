@@ -114,7 +114,7 @@ function TemplatesPage() {
     }, {
       key: 'system',
       label: 'System templates',
-      children: <SystemTemplates data={data} />,
+      children: <SystemTemplates data={data} actions={actions} />,
     }] : []),
   ];
 

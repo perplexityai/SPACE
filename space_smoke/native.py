@@ -114,6 +114,12 @@ class NativeSandboxFactory:
             ) from None
         return NativeSandboxFactory(replace(self._config, token=token))
 
+    def connect(self, sandbox_id: str) -> DurableLifecycleSandbox:
+        """Attach without transferring ownership of an existing sandbox."""
+        sandbox = _NativeSandbox(self, sandbox_id)
+        sandbox.get_info()
+        return sandbox
+
     def create(
         self, metadata: Mapping[str, str] | None = None
     ) -> DurableLifecycleSandbox:

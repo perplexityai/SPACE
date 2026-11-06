@@ -146,6 +146,7 @@ runpy.run_module("space_smoke", run_name="__main__")
                 "local.console_operator_suspends_another_orgs_sandbox",
                 "local.console_sandbox_detail_complete_in_every_state",
                 "local.console_sandbox_lookup_accepts_every_id_form",
+                "local.console_seed_runtime_pair",
                 "local.console_turns_away_non_operators",
                 "local.deferred_btrfs_send_capture_restores_cross_node",
                 "local.ecw_template_build_from_oci_boots",
