@@ -387,7 +387,10 @@ pplx-space-credential-injection-store = ["pplx-space-api", "pplx-space-credmgr"]
 pplx-space-federated-grant-store = ["pplx-space-api", "pplx-space-credmgr"]
 pplx-space-node-registration-store = ["pplx-space-credmgr"]
 pplx-space-placement = ["pplx-space-internal-api-server", "pplx-space-placement-executor"]
-pplx-space-runtime-environment-catalog-store = ["pplx-space-internal-api-server"]
+pplx-space-runtime-environment-catalog-store = [
+  "pplx-space-cluster-controller-server",
+  "pplx-space-internal-api-server",
+]
 pplx-space-runtime-environment-policy-store = [
   "pplx-space-api",
   "pplx-space-internal-api-server",

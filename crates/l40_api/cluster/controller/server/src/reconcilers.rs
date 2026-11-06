@@ -25,6 +25,7 @@ use tokio_util::sync::CancellationToken;
 use crate::admin_audit_retention;
 use crate::data_plane_session_retention;
 use crate::drained_node_terminator;
+use crate::environment_edge_recompute;
 use crate::failed_restorable_repair;
 use crate::kube_node_sync;
 use crate::lost_started_sandboxes;
@@ -256,6 +257,10 @@ pub async fn run_reconcilers(
         )),
         tokio::spawn(tombstone_retention::run_with_pool(
             tombstone_retention::ReconcilerConfig::from_env(),
+            pool.clone(),
+            shutdown_token.child_token(),
+        )),
+        tokio::spawn(environment_edge_recompute::run_with_pool(
             pool.clone(),
             shutdown_token.child_token(),
         )),
