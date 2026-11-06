@@ -243,7 +243,7 @@ async fn close_retries_only_busy_refusals_and_records_first_and_last() {
         outcome: Option<&'static str>,
         elapsed: std::time::Duration,
     }
-    use pplx_space_metrics::byok;
+    use crate::metrics::byok;
     let cases = [
         Case {
             refusals: vec![None],

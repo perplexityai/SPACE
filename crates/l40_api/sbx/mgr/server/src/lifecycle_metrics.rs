@@ -81,7 +81,7 @@ pub(crate) async fn run(db: crate::db::SharedConnection, shutdown_token: Cancell
             }
         };
         sampler.emit_sample(&counts, |bucket, count| {
-            pplx_space_metrics::sandbox::worker::lifecycle_count(
+            crate::metrics::sandbox::worker::lifecycle_count(
                 count,
                 &bucket.state,
                 bucket.runtime,

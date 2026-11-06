@@ -330,8 +330,8 @@ impl RestoreError {
     /// variant is listed so a new one is classified rather than defaulted.
     /// The variants a restore reports under a reason of their own map to
     /// `Other`: they never reach that label.
-    pub(crate) fn stage_error_kind(&self) -> pplx_space_metrics::snapshot::RestoreStageErrorKind {
-        use pplx_space_metrics::snapshot::RestoreStageErrorKind as Kind;
+    pub(crate) fn stage_error_kind(&self) -> crate::metrics::snapshot::RestoreStageErrorKind {
+        use crate::metrics::snapshot::RestoreStageErrorKind as Kind;
         match self {
             Self::RestoreOperationBusy { .. } => Kind::Busy,
             Self::SnapshotIdentityMismatch { .. }
@@ -2226,8 +2226,8 @@ pub enum RestoreCodec {
 impl RestoreCodec {
     fn as_str(self) -> &'static str {
         match self {
-            Self::Full => pplx_space_metrics::snapshot::CODEC_FULL,
-            Self::BtrfsSendV1 => pplx_space_metrics::snapshot::CODEC_BTRFS_SEND_V1,
+            Self::Full => crate::metrics::snapshot::CODEC_FULL,
+            Self::BtrfsSendV1 => crate::metrics::snapshot::CODEC_BTRFS_SEND_V1,
         }
     }
 }

@@ -156,7 +156,7 @@ impl JobExecutor for SnapshotUploadExecutor {
                 .as_deref()
                 .and_then(|started_at| sqlite_duration_ms(&job.created_at, started_at))
         {
-            pplx_space_metrics::snapshot::delivery_duration_ms(
+            crate::metrics::snapshot::delivery_duration_ms(
                 "snapshot_queue",
                 origin,
                 None,
@@ -329,7 +329,7 @@ impl JobExecutor for SnapshotUploadExecutor {
         let finalize_result =
             finalize_with_cluster_api_ready(&snapshot_id, vm_total_bytes, suspend_uncommitted)
                 .await;
-        pplx_space_metrics::snapshot::delivery_duration_ms(
+        crate::metrics::snapshot::delivery_duration_ms(
             "cluster_finalize",
             origin,
             None,
@@ -366,7 +366,7 @@ impl JobExecutor for SnapshotUploadExecutor {
         // codec-specific tile on every dashboard that splits on
         // `(codec, artifact)`. The polled list ends with the `metadata` slot,
         // so the metadata job's bytes are attributed there.
-        let codec = pplx_space_metrics::snapshot::codec_tag_from_diff_format(
+        let codec = crate::metrics::snapshot::codec_tag_from_diff_format(
             payload.meta.rootfs_diff_format.as_deref(),
         );
         // The sealed artifacts' own recorded fact; this job runs off the
@@ -383,7 +383,7 @@ impl JobExecutor for SnapshotUploadExecutor {
                 .map(|a| a.metric_tag())
                 .unwrap_or("unknown");
             if let Some(duration_ms) = observation.queue_duration_ms {
-                pplx_space_metrics::snapshot::delivery_duration_ms(
+                crate::metrics::snapshot::delivery_duration_ms(
                     "artifact_queue",
                     origin,
                     Some(artifact_tag),
@@ -392,7 +392,7 @@ impl JobExecutor for SnapshotUploadExecutor {
                 );
             }
             if let Some(duration_ms) = observation.transfer_duration_ms {
-                pplx_space_metrics::snapshot::delivery_duration_ms(
+                crate::metrics::snapshot::delivery_duration_ms(
                     "artifact_transfer",
                     origin,
                     Some(artifact_tag),
@@ -400,7 +400,7 @@ impl JobExecutor for SnapshotUploadExecutor {
                     duration_ms,
                 );
             }
-            pplx_space_metrics::snapshot::create_bytes(
+            crate::metrics::snapshot::create_bytes(
                 create_kind,
                 codec,
                 encrypted,
@@ -409,7 +409,7 @@ impl JobExecutor for SnapshotUploadExecutor {
             );
         }
         if let Some(duration_ms) = elapsed_since_rfc3339_ms(&payload.meta.created_at) {
-            pplx_space_metrics::snapshot::delivery_duration_ms(
+            crate::metrics::snapshot::delivery_duration_ms(
                 "remote_total",
                 origin,
                 None,
@@ -499,7 +499,7 @@ pub(crate) fn spawn_backup_bookkeeping(
         Ok(writer) => writer,
         Err(error) => {
             if stream_reclaim_applies(&payload.meta) {
-                pplx_space_metrics::snapshot::stream_reclaim_skipped("admission_refused");
+                crate::metrics::snapshot::stream_reclaim_skipped("admission_refused");
             }
             tracing::info!(
                 snapshot_id = %payload.snapshot_id,
@@ -551,7 +551,7 @@ pub(crate) fn spawn_backup_bookkeeping(
         };
         if let Err(error) = &result {
             if stream_reclaim_applies(&payload.meta) {
-                pplx_space_metrics::snapshot::stream_reclaim_skipped("db_error");
+                crate::metrics::snapshot::stream_reclaim_skipped("db_error");
             }
             tracing::warn!(
                 sandbox_id = %payload.meta.sandbox_id,
@@ -911,7 +911,7 @@ fn stream_reclaim_due(
     if !crate::db::read::sandbox_view(conn, sandbox_id)
         .suspended_with_pinned_artifact(&local_artifact_id.to_string())?
     {
-        pplx_space_metrics::snapshot::stream_reclaim_skipped("not_pinned_suspended");
+        crate::metrics::snapshot::stream_reclaim_skipped("not_pinned_suspended");
         tracing::info!(
             sandbox_id,
             backup_attempt_id = %payload.snapshot_id,
@@ -925,7 +925,7 @@ fn stream_reclaim_due(
         .join(ROOTFS_BTRFS_SEND_FILENAME)
         .exists()
     {
-        pplx_space_metrics::snapshot::stream_reclaim_skipped("missing");
+        crate::metrics::snapshot::stream_reclaim_skipped("missing");
         return Ok(false);
     }
     Ok(true)
@@ -951,7 +951,7 @@ fn reclaim_stream(
     if !crate::db::read::sandbox_view(conn, sandbox_id)
         .suspended_with_pinned_artifact(&local_artifact_id.to_string())?
     {
-        pplx_space_metrics::snapshot::stream_reclaim_skipped("not_pinned_suspended");
+        crate::metrics::snapshot::stream_reclaim_skipped("not_pinned_suspended");
         tracing::info!(
             sandbox_id,
             backup_attempt_id,
@@ -965,13 +965,13 @@ fn reclaim_stream(
     let bytes = std::fs::metadata(&stream_path).map(|m| m.len());
     if payload.meta.rootfs_send_source_id.is_some() {
         let Some(image) = reclaim_image else {
-            pplx_space_metrics::snapshot::stream_reclaim_skipped("source_unverified");
+            crate::metrics::snapshot::stream_reclaim_skipped("source_unverified");
             return Ok(());
         };
         if bytes.is_ok()
             && let Err(error) = rewrite_sidecar_for_reclaim(&payload.snapshot_dir, image)
         {
-            pplx_space_metrics::snapshot::stream_reclaim_skipped("sidecar_rewrite_failed");
+            crate::metrics::snapshot::stream_reclaim_skipped("sidecar_rewrite_failed");
             tracing::warn!(
                 sandbox_id,
                 backup_attempt_id,
@@ -984,7 +984,7 @@ fn reclaim_stream(
     }
     match bytes.and_then(|bytes| std::fs::remove_file(&stream_path).map(|()| bytes)) {
         Ok(bytes) => {
-            pplx_space_metrics::snapshot::stream_reclaimed(bytes);
+            crate::metrics::snapshot::stream_reclaimed(bytes);
             tracing::info!(
                 sandbox_id,
                 backup_attempt_id,
@@ -1004,10 +1004,10 @@ fn reclaim_stream(
             );
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            pplx_space_metrics::snapshot::stream_reclaim_skipped("missing");
+            crate::metrics::snapshot::stream_reclaim_skipped("missing");
         }
         Err(error) => {
-            pplx_space_metrics::snapshot::stream_reclaim_skipped("io_error");
+            crate::metrics::snapshot::stream_reclaim_skipped("io_error");
             tracing::warn!(
                 sandbox_id,
                 backup_attempt_id,
@@ -1677,7 +1677,7 @@ pub fn backfill_backup_completed_markers(
         ("missing_artifact_id", report.payload_missing_artifact_id),
     ] {
         if count > 0 {
-            pplx_space_metrics::snapshot::backup_marker_repair_unidentifiable(reason, count as u64);
+            crate::metrics::snapshot::backup_marker_repair_unidentifiable(reason, count as u64);
         }
     }
     Ok(report)

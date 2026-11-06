@@ -1,8 +1,8 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use pplx_space_build_mgr::metrics::TemplateBuildResult;
 use pplx_space_build_mgr::{SystemPublicationGrantId, TemplateOrg, TenantPublicationGrantId};
 use pplx_space_build_mgr_client::proto::BuildState;
-use pplx_space_metrics::template::TemplateBuildResult;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 

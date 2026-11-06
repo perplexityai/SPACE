@@ -97,7 +97,7 @@ impl InflightLookups {
             // Emitted only once the slot is held, so `role=leader` counts
             // upstream lookups actually started (a leader rejected for
             // capacity is not one).
-            pplx_space_metrics::gateway::reserved_dns_lookup_coalesce(
+            crate::metrics::reserved_dns_lookup_coalesce(
                 resolver.as_str(),
                 LookupRole::Leader.as_str(),
             );

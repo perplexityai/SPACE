@@ -216,7 +216,7 @@ fn check_tcp(
         | ClientHelloScan::Malformed => ("tls_sni", "host_missing", Err(fail_closed_reason)),
     };
     if matches!(context, EgressContext::Admission(_)) {
-        pplx_space_metrics::gateway::domain_binding("tcp", evidence, outcome, None);
+        crate::metrics::domain_binding("tcp", evidence, outcome, None);
     }
     result
 }

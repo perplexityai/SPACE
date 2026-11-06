@@ -1,0 +1,33 @@
+[package]
+name = "pplx-space-metrics-workload"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+# The OTLP exporter the workload validates. Off by default, and required by
+# the binary, so that a workspace build does not have to compile it.
+otlp-metrics = ["pplx-space-observability/otlp-metrics"]
+
+# The OTLP pipeline validation workload in scripts/tests/observability/metrics.
+[[bin]]
+name = "metrics_workload"
+path = "src/main.rs"
+required-features = ["otlp-metrics"]
+
+[dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+tracing = { workspace = true }
+
+# internal
+pplx-space-common-core = { workspace = true }
+pplx-space-metrics = { workspace = true }
+pplx-space-node-mgr = { workspace = true }
+pplx-space-observability = { workspace = true, default-features = false }
+pplx-space-sbx-mgr = { workspace = true }

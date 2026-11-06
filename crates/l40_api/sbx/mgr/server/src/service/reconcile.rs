@@ -313,7 +313,7 @@ impl SandboxManagerService {
                         "auto-suspend retry budget exhausted; slow-retrying ~every 6h \
                          (sandbox left running, self-heals when the cause clears)"
                     );
-                    pplx_space_metrics::sandbox::worker::auto_lifecycle_retries_exhausted(
+                    crate::metrics::sandbox::worker::auto_lifecycle_retries_exhausted(
                         AutoLifecycleIdleAction::Suspend,
                     );
                 }
@@ -378,7 +378,7 @@ impl SandboxManagerService {
         if let Some(protection) = self.ingress_protection(&sandbox)? {
             let (count, released, _) = protection.observation();
             if count > 0 {
-                pplx_space_metrics::sandbox::worker::ingress_lifecycle_deferred();
+                crate::metrics::sandbox::worker::ingress_lifecycle_deferred();
                 self.defer_gated_auto_lifecycle_row(&sandbox.id, now)?;
                 return Ok(());
             }
@@ -443,7 +443,7 @@ impl SandboxManagerService {
         // Join the writer set only after wake arbitration and due-policy
         // revalidation; keep the supervisor pinned through the transition.
         let _state_writer = self.state_writer_lease("AutoLifecycle")?;
-        pplx_space_metrics::sandbox::worker::auto_lifecycle_transition_lateness(
+        crate::metrics::sandbox::worker::auto_lifecycle_transition_lateness(
             now.saturating_sub(due_at),
             action,
         );
@@ -644,10 +644,10 @@ impl SandboxManagerService {
                     count += active;
                     oldest = oldest.max(age.map_or(0.0, |age| age.as_secs_f64()));
                 }
-                pplx_space_metrics::sandbox::worker::ingress_protection(count, oldest);
+                crate::metrics::sandbox::worker::ingress_protection(count, oldest);
             }
             let available = AUTO_LIFECYCLE_RECONCILE_CONCURRENCY.saturating_sub(tasks.len());
-            pplx_space_metrics::sandbox::worker::auto_lifecycle_scheduler_saturated(available == 0);
+            crate::metrics::sandbox::worker::auto_lifecycle_scheduler_saturated(available == 0);
             if available == 0 {
                 continue;
             }
@@ -961,9 +961,9 @@ impl SandboxManagerService {
             set_network_no_identity(&sandbox.id, "reconcile")
                 .await
                 .inspect_err(|_| {
-                    pplx_space_metrics::reconcile::apply_failed(FACET_NETWORK_POLICY, "gateway");
+                    crate::metrics::reconcile::apply_failed(FACET_NETWORK_POLICY, "gateway");
                 })?;
-            pplx_space_metrics::reconcile::apply_applied(FACET_NETWORK_POLICY, "pool");
+            crate::metrics::reconcile::apply_applied(FACET_NETWORK_POLICY, "pool");
             return Ok(ApplyDecisionKind::Apply);
         }
         let route_verification_bundle = self.route_ed25519_verification_bundle.load_full();
@@ -1008,10 +1008,7 @@ impl SandboxManagerService {
                             &effective_policy_ref.to_string(),
                         ) =>
                 {
-                    pplx_space_metrics::reconcile::apply_skipped(
-                        FACET_NETWORK_POLICY,
-                        "idempotent",
-                    );
+                    crate::metrics::reconcile::apply_skipped(FACET_NETWORK_POLICY, "idempotent");
                     return Ok(ApplyDecisionKind::Skip);
                 }
                 Ok(_) => ApplyDecisionKind::Repair,
@@ -1035,14 +1032,14 @@ impl SandboxManagerService {
         )
         .await
         .inspect_err(|_| {
-            pplx_space_metrics::reconcile::apply_failed(FACET_NETWORK_POLICY, "gateway");
+            crate::metrics::reconcile::apply_failed(FACET_NETWORK_POLICY, "gateway");
         })?;
         self.mark_network_policy_applied(
             &sandbox.id,
             effective_policy.inherited,
             effective_policy.generation,
         )?;
-        pplx_space_metrics::reconcile::apply_applied(FACET_NETWORK_POLICY, decision.as_str());
+        crate::metrics::reconcile::apply_applied(FACET_NETWORK_POLICY, decision.as_str());
         Ok(decision)
     }
 

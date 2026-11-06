@@ -53,7 +53,7 @@ pplx-space-common-core = { workspace = true, features = ["serde"] }
 pplx-space-common-grpc = { workspace = true, features = ["internal-tls"] }
 pplx-space-common-svc = { workspace = true }
 pplx-space-grpc-metrics = { workspace = true }
-pplx-space-metrics = { workspace = true }
+pplx-space-metrics-emit = { workspace = true }
 pplx-space-net-common = { workspace = true, features = ["serde"] }
 pplx-space-net-gateway-client = { workspace = true }
 pplx-space-node-api-client = { workspace = true }

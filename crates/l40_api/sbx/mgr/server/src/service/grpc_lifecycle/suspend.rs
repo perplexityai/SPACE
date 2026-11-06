@@ -327,7 +327,7 @@ impl SandboxManagerService {
             blocking = context.blocking,
             "snapshot create started"
         );
-        pplx_space_metrics::snapshot::create_started(
+        crate::metrics::snapshot::create_started(
             create_kind,
             context.create_codec,
             sandbox.volume_encryption,
@@ -337,7 +337,7 @@ impl SandboxManagerService {
         if sandbox.state == SandboxState::Started {
             let pause_started_at = std::time::Instant::now();
             let mut node_client = connect_node(&self.node_manager).await.map_err(|e| {
-                pplx_space_metrics::snapshot::create_failed(
+                crate::metrics::snapshot::create_failed(
                     create_kind,
                     context.create_codec,
                     sandbox.volume_encryption,
@@ -381,7 +381,7 @@ impl SandboxManagerService {
                 ) {
                     tracing::warn!(sandbox_id = %sandbox.id, %error, "failed to roll back checkpoint pause state");
                 }
-                pplx_space_metrics::snapshot::create_failed(
+                crate::metrics::snapshot::create_failed(
                     create_kind,
                     context.create_codec,
                     sandbox.volume_encryption,
@@ -431,7 +431,7 @@ impl SandboxManagerService {
                     Err(StateWriteRejected::Missing) => SandboxState::Started,
                 };
                 let reason = format!("auto-pause failed; sandbox reconciled to {pause_state}");
-                pplx_space_metrics::snapshot::create_failed(
+                crate::metrics::snapshot::create_failed(
                     create_kind,
                     context.create_codec,
                     sandbox.volume_encryption,
@@ -460,7 +460,7 @@ impl SandboxManagerService {
                     "complete checkpoint pause",
                 )?;
             }
-            pplx_space_metrics::snapshot::create_step(
+            crate::metrics::snapshot::create_step(
                 create_kind,
                 context.create_codec,
                 sandbox.volume_encryption,
@@ -468,7 +468,7 @@ impl SandboxManagerService {
                 pause_started_at,
             );
         } else if sandbox.state != SandboxState::Paused {
-            pplx_space_metrics::snapshot::create_failed(
+            crate::metrics::snapshot::create_failed(
                 create_kind,
                 context.create_codec,
                 sandbox.volume_encryption,

@@ -1,8 +1,8 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use crate::metrics::TcpConnectionFault;
 use hickory_resolver::proto::op::Message;
-use pplx_space_metrics::gateway::TcpConnectionFault;
 use pplx_space_net_common::DomainName;
 use tracing::{debug, error, info};
 

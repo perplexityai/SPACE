@@ -23,7 +23,7 @@ use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::PathBuf;
 use std::time::SystemTime;
 
-use pplx_space_metrics::sandbox::vm::{VmDiagnosticLevel, VmDiagnosticOutcome, VmDiagnosticSource};
+use crate::metrics::sandbox::vm::{VmDiagnosticLevel, VmDiagnosticOutcome, VmDiagnosticSource};
 
 use super::{LogBudget, sanitized};
 
@@ -159,7 +159,7 @@ fn created_since(metadata: &std::fs::Metadata, instant: SystemTime) -> bool {
 
 fn forward_error(sandbox_id: &str, message: &str, budget: &mut LogBudget) {
     let Some(suppressed) = budget.admit() else {
-        pplx_space_metrics::sandbox::vm::vm_diagnostics(
+        crate::metrics::sandbox::vm::vm_diagnostics(
             VmDiagnosticSource::Firecracker,
             VmDiagnosticLevel::Error,
             VmDiagnosticOutcome::RateLimited,
@@ -167,7 +167,7 @@ fn forward_error(sandbox_id: &str, message: &str, budget: &mut LogBudget) {
         );
         return;
     };
-    pplx_space_metrics::sandbox::vm::vm_diagnostics(
+    crate::metrics::sandbox::vm::vm_diagnostics(
         VmDiagnosticSource::Firecracker,
         VmDiagnosticLevel::Error,
         VmDiagnosticOutcome::Logged,

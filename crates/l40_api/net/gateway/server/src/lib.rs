@@ -6,6 +6,7 @@ pub mod egress;
 pub mod ingress;
 pub mod inherited;
 pub mod known_egress;
+pub mod metrics;
 pub mod reserved_dns;
 pub mod resource_budget;
 pub mod route_verification;

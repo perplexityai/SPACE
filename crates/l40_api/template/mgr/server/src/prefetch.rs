@@ -473,7 +473,7 @@ pub async fn run_loop(pins: PinnedDigestsStore, volume_puller: VolumePuller, cfg
             Ok(()) => "ok",
             Err(_) => "error",
         };
-        pplx_space_metrics::template::prefetch_tick(result_label, started);
+        crate::metrics::prefetch_tick(result_label, started);
         if let Err(err) = result {
             warn!(error = %err, "template prefetch tick failed");
         }
@@ -1426,11 +1426,11 @@ fn dispatch_pull(
 }
 
 fn record_tag_candidate(template: &str, tag: &str, outcome: &'static str) {
-    pplx_space_metrics::template::prefetch_tag_candidate(template, tag, outcome);
+    crate::metrics::prefetch_tag_candidate(template, tag, outcome);
 }
 
 fn record_release_candidate(template: &str, content_hash: &str, outcome: &'static str) {
-    pplx_space_metrics::template::prefetch_release_candidate(template, content_hash, outcome);
+    crate::metrics::prefetch_release_candidate(template, content_hash, outcome);
 }
 
 #[cfg(test)]

@@ -140,19 +140,16 @@ impl CertificateProvider {
             .collect();
         for key in stale {
             cache.ready.pop(&key);
-            pplx_space_metrics::gateway::certificate_cache_event("pruned_ready");
+            crate::metrics::certificate_cache_event("pruned_ready");
         }
         let pending_before = cache.pending.len();
         cache
             .pending
             .retain(|_, entry| entry.upgrade().is_some_and(|entry| entry.current()));
         for _ in cache.pending.len()..pending_before {
-            pplx_space_metrics::gateway::certificate_cache_event("pruned_pending");
+            crate::metrics::certificate_cache_event("pruned_pending");
         }
-        pplx_space_metrics::gateway::certificate_cache_entries(
-            cache.ready.len(),
-            cache.ready.cap().get(),
-        );
+        crate::metrics::certificate_cache_entries(cache.ready.len(), cache.ready.cap().get());
         Ok(())
     }
 
@@ -201,7 +198,7 @@ impl CertificateProvider {
             })?;
             if cache.ready.peek(&key).is_some_and(|e| !e.current()) {
                 cache.ready.pop(&key);
-                pplx_space_metrics::gateway::certificate_cache_event("stale_pop");
+                crate::metrics::certificate_cache_event("stale_pop");
             }
             if let Some(entry) = cache.ready.get(&key) {
                 (entry.clone(), "ready_hit")
@@ -269,16 +266,13 @@ impl CertificateProvider {
             // entry displaced by the capacity bound. Detect that displacement
             // before inserting so cache pressure stays distinguishable from churn.
             if cache.ready.len() == cache.ready.cap().get() && !cache.ready.contains(&key) {
-                pplx_space_metrics::gateway::certificate_cache_event("evicted");
+                crate::metrics::certificate_cache_event("evicted");
             }
             cache.ready.put(key, entry);
         }
-        pplx_space_metrics::gateway::certificate_cache_entries(
-            cache.ready.len(),
-            cache.ready.cap().get(),
-        );
+        crate::metrics::certificate_cache_entries(cache.ready.len(), cache.ready.cap().get());
         drop(cache);
-        pplx_space_metrics::gateway::certificate_lookup(source);
+        crate::metrics::certificate_lookup(source);
         Ok(certificate)
     }
 
@@ -385,7 +379,7 @@ impl SigningTimer {
     }
 
     fn record(&self, result: &str) {
-        pplx_space_metrics::gateway::certificate_signing_duration_ms(
+        crate::metrics::certificate_signing_duration_ms(
             result,
             self.started_at.elapsed().as_secs_f64() * 1_000.0,
         );
@@ -405,7 +399,7 @@ impl Drop for SigningTimer {
 /// outage from the local concurrency, rate and cache bounds that share
 /// `RESOURCE_EXHAUSTED`.
 fn lookup_failed(result: &'static str, status: Status) -> Status {
-    pplx_space_metrics::gateway::certificate_lookup(result);
+    crate::metrics::certificate_lookup(result);
     status
 }
 

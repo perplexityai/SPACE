@@ -12,8 +12,8 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::metrics::TcpConnectionFault;
 use pplx_space_common_connection_admission::AcceptErrors;
-use pplx_space_metrics::gateway::TcpConnectionFault;
 use pplx_space_net_common::DomainName;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
@@ -342,7 +342,7 @@ impl TcpProxy {
                 Err(error) => {
                     drop(permit);
                     let action = accept_errors.record(&error);
-                    pplx_space_metrics::gateway::tcp_accept_error(action.reason.as_str());
+                    crate::metrics::tcp_accept_error(action.reason.as_str());
                     if action.log {
                         warn!(
                             sandbox_id = self.sandbox_id,
@@ -357,7 +357,7 @@ impl TcpProxy {
                         return Err(error);
                     }
                     if !action.pause.is_zero() {
-                        pplx_space_metrics::gateway::tcp_accept_backoff(action.reason.as_str());
+                        crate::metrics::tcp_accept_backoff(action.reason.as_str());
                         tokio::select! {
                             _ = self.shutdown_token.cancelled() => return Ok(None),
                             _ = tokio::time::sleep(action.pause) => {}
@@ -370,15 +370,13 @@ impl TcpProxy {
 
     async fn acquire_permit(&self, limit: &Arc<Semaphore>) -> Option<OwnedSemaphorePermit> {
         let permit = limit.clone().try_acquire_owned();
-        pplx_space_metrics::gateway::tcp_in_flight(
-            MAX_ACTIVE_TCP_CONNECTIONS - limit.available_permits(),
-        );
+        crate::metrics::tcp_in_flight(MAX_ACTIVE_TCP_CONNECTIONS - limit.available_permits());
         match permit {
             Ok(permit) => Some(permit),
             // At capacity, stop accepting: connections queue in the kernel
             // rather than being accepted and then stalled.
             Err(TryAcquireError::NoPermits) => {
-                pplx_space_metrics::gateway::tcp_connection_limit_wait();
+                crate::metrics::tcp_connection_limit_wait();
                 tokio::select! {
                     _ = self.shutdown_token.cancelled() => None,
                     permit = limit.clone().acquire_owned() => permit.ok(),
@@ -662,7 +660,7 @@ impl TcpProxy {
 
     fn record(&self, dst: SocketAddr, host: Option<&DomainName>, outcome: FlowOutcome) -> bool {
         let (status, detail) = outcome.metric_tags();
-        pplx_space_metrics::gateway::tcp_connection(status, detail, outcome.metric_fault());
+        crate::metrics::tcp_connection(status, detail, outcome.metric_fault());
         let reported = host.is_some_and(|host| self.report_known_egress(dst, host, &outcome));
 
         match outcome {
@@ -676,12 +674,7 @@ impl TcpProxy {
                 | RelayFailure::ReservedDns(_),
             ) => {}
             FlowOutcome::RelayFailed(RelayFailure::Inspected(error)) => {
-                pplx_space_metrics::gateway::domain_binding(
-                    "tcp",
-                    "tls_transport",
-                    error.as_str(),
-                    None,
-                );
+                crate::metrics::domain_binding("tcp", "tls_transport", error.as_str(), None);
             }
             FlowOutcome::HandledDns {
                 messages,
@@ -690,8 +683,8 @@ impl TcpProxy {
             } => {
                 self.stats.tcp_total.fetch_add(1, Ordering::Relaxed);
                 self.stats.add_network_bytes(wire_tx, wire_rx);
-                pplx_space_metrics::gateway::tcp_bytes("tx", wire_tx);
-                pplx_space_metrics::gateway::tcp_bytes("rx", wire_rx);
+                crate::metrics::tcp_bytes("tx", wire_tx);
+                crate::metrics::tcp_bytes("rx", wire_rx);
                 debug!(
                     sandbox_id = self.sandbox_id,
                     %dst,
@@ -702,18 +695,12 @@ impl TcpProxy {
             FlowOutcome::RelayFailed(RelayFailure::Plaintext(error)) => match error {
                 http_host::Failure::Setup(error)
                     if matches!(error.as_ref(), upstream::Error::Connect(_)) => {}
-                http_host::Failure::Setup(_) => pplx_space_metrics::gateway::domain_binding(
-                    "tcp",
-                    "http_host",
-                    "upstream_http_failed",
-                    None,
-                ),
-                http_host::Failure::GuestHttp(_) => pplx_space_metrics::gateway::domain_binding(
-                    "tcp",
-                    "http_host",
-                    "guest_http_failed",
-                    None,
-                ),
+                http_host::Failure::Setup(_) => {
+                    crate::metrics::domain_binding("tcp", "http_host", "upstream_http_failed", None)
+                }
+                http_host::Failure::GuestHttp(_) => {
+                    crate::metrics::domain_binding("tcp", "http_host", "guest_http_failed", None)
+                }
             },
             FlowOutcome::Rejected(Rejection::PolicyMissing(reason)) => {
                 debug!(
@@ -724,8 +711,8 @@ impl TcpProxy {
                 );
                 // `evaluate_egress` meters every other verdict, but it cannot
                 // run without a policy. No policy also means no version to tag.
-                pplx_space_metrics::gateway::policy_decision(
-                    pplx_space_metrics::gateway::PolicyDecisionKind::DnsAttributed,
+                crate::metrics::policy_decision(
+                    crate::metrics::PolicyDecisionKind::DnsAttributed,
                     EgressProtocol::Tcp.as_str(),
                     EgressPhase::Admission.as_str(),
                     "unknown",
@@ -745,12 +732,7 @@ impl TcpProxy {
             }
             FlowOutcome::Rejected(Rejection::TlsInterception(error)) => {
                 let detail = interception_detail(&error);
-                pplx_space_metrics::gateway::domain_binding(
-                    "tcp",
-                    "tls_transport",
-                    error.as_str(),
-                    detail,
-                );
+                crate::metrics::domain_binding("tcp", "tls_transport", error.as_str(), detail);
                 // Every arm here is a fail-closed guest breakage, so the cause
                 // has to survive a production log level. Certificate refusals
                 // previously carried their gRPC code only in the message.
@@ -779,8 +761,8 @@ impl TcpProxy {
             }
             FlowOutcome::Relayed(Relay::Tunnelled { wire_tx, wire_rx }) => {
                 self.stats.add_network_bytes(wire_tx, wire_rx);
-                pplx_space_metrics::gateway::tcp_bytes("tx", wire_tx);
-                pplx_space_metrics::gateway::tcp_bytes("rx", wire_rx);
+                crate::metrics::tcp_bytes("tx", wire_tx);
+                crate::metrics::tcp_bytes("rx", wire_rx);
             }
             FlowOutcome::Relayed(Relay::HostBoundHttp {
                 requests,
@@ -800,8 +782,8 @@ impl TcpProxy {
                     "validated plaintext HTTP hosts on a DNS-authorized flow"
                 );
                 self.stats.add_network_bytes(wire_tx, wire_rx);
-                pplx_space_metrics::gateway::tcp_bytes("tx", wire_tx);
-                pplx_space_metrics::gateway::tcp_bytes("rx", wire_rx);
+                crate::metrics::tcp_bytes("tx", wire_tx);
+                crate::metrics::tcp_bytes("rx", wire_rx);
             }
         }
         reported
