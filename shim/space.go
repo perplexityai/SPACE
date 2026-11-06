@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -41,6 +42,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
 	healthpb "google.golang.org/grpc/health/grpc_health_v1"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/anypb"
 	"google.golang.org/protobuf/types/known/durationpb"
@@ -936,11 +938,30 @@ func releaseTaskAfterGenerationTeardown(ctx context.Context, client pb.SandboxMa
 	}
 }
 
-// stopOutcomeUnknown reports whether a failed Stop may still have been
-// admitted: its context ended, or the connection failed (Unavailable), which
-// a transport drop after admission and a few sbx-manager refusals share.
-func stopOutcomeUnknown(err error) bool {
-	return endedByContext(err) || status.Code(err) == codes.Unavailable
+// sbx-manager's markers for a Stop it answered before admitting it
+// (crates/l20_domain/sbx/mgr/protocol/src/lib.rs): STOP_NOT_ADMITTED_METADATA
+// from the Stop handler, and RESTART_RETRY_ON_SUCCESSOR_METADATA from the
+// restart drain, which refuses before any handler runs.
+const (
+	stopNotAdmittedTrailer  = "x-space-stop-not-admitted"
+	retryOnSuccessorTrailer = "x-space-retry-on-successor"
+)
+
+// stopRefused reports whether a failed Stop was certainly not admitted. A
+// Stop sbx-manager marks as not admitted was refused, whatever its code. An
+// unmarked call that ended on this side, or that failed with Unavailable,
+// may have been admitted unseen: a transport drop after admission reports
+// Unavailable too, as do refusals from an sbx-manager that predates the mark.
+// Any other answer is sbx-manager refusing the stop.
+func stopRefused(err error, trailer metadata.MD) bool {
+	if err == nil {
+		return false
+	}
+	if slices.Contains(trailer.Get(stopNotAdmittedTrailer), "true") ||
+		slices.Contains(trailer.Get(retryOnSuccessorTrailer), "true") {
+		return true
+	}
+	return !endedByContext(err) && status.Code(err) != codes.Unavailable
 }
 
 // endedByContext reports whether an RPC failed because its context ended
@@ -1090,12 +1111,11 @@ func releaseLegacyTaskTeardown(ctx context.Context, client pb.SandboxManagerClie
 		if recordStopIssued != nil {
 			recordStopIssued(true)
 		}
-		_, err = client.Stop(ctx, &pb.StopRequest{SandboxId: identity.sandboxID})
-		// A call that ended on this side, or a dropped connection, may have
-		// been admitted unseen, so it keeps the ownership. Any other answer is
-		// sbx-manager refusing the stop, and treating a refused Stop as this
-		// task's would turn a later user STOP into DELETE.
-		if err != nil && !stopOutcomeUnknown(err) && recordStopIssued != nil {
+		var trailer metadata.MD
+		_, err = client.Stop(ctx, &pb.StopRequest{SandboxId: identity.sandboxID}, grpc.Trailer(&trailer))
+		// A Stop that may have been admitted keeps the ownership. Treating a
+		// refused Stop as this task's would turn a later user STOP into DELETE.
+		if stopRefused(err, trailer) && recordStopIssued != nil {
 			recordStopIssued(identity.legacyStopIssued)
 		}
 	case "delete":

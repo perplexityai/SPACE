@@ -329,6 +329,45 @@ async fn delete_admission_answers_every_source_state() {
     sweep_every_source_state(Cleanup::Delete).await;
 }
 
+/// A Stop sandbox-manager refuses while shutting down answers `Unavailable`,
+/// as a dropped connection does, so it carries the not-admitted mark that
+/// lets the shim tell the two apart.
+#[tokio::test(flavor = "current_thread")]
+async fn stop_refused_before_admission_is_marked_not_admitted() {
+    if !crate::service::tests::enter_route_test_process(&[
+        ("EPPO_SDK_KEY", None),
+        ("SPACE_FLAGD_ENABLED", None),
+    ]) {
+        return;
+    }
+    let conn = crate::db::test_conn();
+    let sandbox_id = insert_row(&conn, SandboxState::Started);
+    let scratch = tempfile::tempdir().unwrap();
+    let service = isolated_service(conn, scratch.path());
+    service.shutdown_token.cancel();
+    let mut request = Request::new(StopRequest {
+        sandbox_id: sandbox_id.to_string(),
+        template_filter: None,
+        blocking: false,
+        immediate_kill: false,
+    });
+    request
+        .extensions_mut()
+        .insert(PeerIdentity::new(0, 0, None));
+
+    let status = tokio::time::timeout(WAIT, service.stop(request))
+        .await
+        .expect("a refused Stop answers at once")
+        .unwrap_err();
+
+    assert_eq!(status.code(), tonic::Code::Unavailable, "{status:?}");
+    assert!(
+        pplx_space_sbx_mgr_client::is_stop_not_admitted(&status),
+        "{status:?}"
+    );
+    shutdown(service).await;
+}
+
 /// The Stop RPC selects nothing without a live runtime, whatever the row's
 /// state, and admits nothing. A live runtime is admitted, as
 /// `stop_selects_only_a_live_runtime_and_both_treat_an_empty_template_filter_as_none`
