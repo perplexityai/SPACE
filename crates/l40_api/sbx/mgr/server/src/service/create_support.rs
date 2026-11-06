@@ -726,6 +726,7 @@ pub(super) async fn resolve_template_paths(
     let mut request =
         tonic::Request::new(pplx_space_template_mgr_client::proto::GetTemplateRequest {
             caller_org_id: None,
+            cached_only: false,
             template: Some(template_ref),
             vcpu: None,
             memory_mib: None,

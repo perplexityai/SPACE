@@ -164,6 +164,7 @@ async fn probe_cached_template(
     let mut request =
         tonic::Request::new(pplx_space_template_mgr_client::proto::GetTemplateRequest {
             caller_org_id: None,
+            cached_only: false,
             template: Some(pplx_space_template_mgr_client::proto::TemplateRef {
                 name: pull.template_id.clone(),
                 content_hash: Some(hash.to_owned()),

@@ -153,22 +153,233 @@ fn validate_import_sandbox_header(
     })
 }
 
-fn ensure_delta_template_available(
-    header: &crate::proto::ImportSandboxHeader,
-) -> Result<(), Status> {
-    if header.is_delta && !header.template_id.is_empty() && !header.content_hash.is_empty() {
-        let template_dir = pplx_space_common_core::host::linux::paths::template_build_dir(
-            &header.template_id,
-            &header.content_hash,
+/// How long a transfer waits for one delta-base lookup, dial included. Exports
+/// and a sandbox import's check before its body look the base up before
+/// taking the sandbox's wake lock, artifact lock and cleanup fence. A delta
+/// import's apply makes two more while it holds them, one just before it
+/// applies the diff and one after ([`apply_delta_to_verified_base`]); a
+/// snapshot import makes only those, after its body, since it can't tell a
+/// delta import from a full one before then.
+pub(super) const DELTA_BASE_LOOKUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Why a transfer has no delta base.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum NoDeltaBase {
+    /// This node holds no ready build of the digest: template-manager
+    /// answered `NOT_FOUND`, or the transfer names no template build. Pulling
+    /// the template can supply one.
+    Absent,
+    /// A ready build is there but can't serve as a base, or template-manager
+    /// refused the lookup itself: its rootfs fails the size check or isn't a
+    /// regular file, the hash is invalid, or the answer came for another
+    /// lookup scope. Retrying or pulling won't help.
+    Unusable(String),
+    /// Template-manager didn't answer within [`DELTA_BASE_LOOKUP_TIMEOUT`],
+    /// couldn't be reached, or failed transiently, so whether this node holds
+    /// a usable build is unknown.
+    Unanswered(String),
+}
+
+/// Lookup statuses that leave the answer unknown, as opposed to ones that
+/// say this lookup can't succeed.
+fn unanswered(code: tonic::Code) -> bool {
+    matches!(
+        code,
+        tonic::Code::Unavailable
+            | tonic::Code::DeadlineExceeded
+            | tonic::Code::ResourceExhausted
+            | tonic::Code::Aborted
+            | tonic::Code::Cancelled
+            | tonic::Code::Internal
+            | tonic::Code::Unknown
+    )
+}
+
+/// The rootfs of a ready build of `template@content_hash` on this node, the
+/// only safe base for a rootfs delta. A build dir alone says nothing: one can
+/// exist without a catalog row, as a transient recovery failure or an
+/// interrupted pull leaves it. So the base comes from a `cached_only` lookup,
+/// which answers from a ready row whose rootfs passes template-manager's
+/// checks and never pulls, bounded by [`DELTA_BASE_LOOKUP_TIMEOUT`].
+pub(super) async fn verify_delta_base(
+    templates: &dyn crate::template_resolver::TemplateResolver,
+    template: &str,
+    content_hash: &str,
+) -> Result<std::path::PathBuf, NoDeltaBase> {
+    if template.is_empty() || content_hash.is_empty() {
+        return Err(NoDeltaBase::Absent);
+    }
+    let mut request =
+        tonic::Request::new(pplx_space_template_mgr_client::proto::GetTemplateRequest {
+            template: Some(pplx_space_template_mgr_client::proto::TemplateRef {
+                name: template.to_string(),
+                content_hash: Some(content_hash.to_string()),
+                tag: None,
+            }),
+            vcpu: None,
+            memory_mib: None,
+            caller_org_id: None,
+            cached_only: true,
+        });
+    let scope = pplx_space_rpc_auth::template_lookup::TemplateLookupScope::LocalExecution;
+    scope.attach(&mut request);
+    let Ok(lookup) =
+        tokio::time::timeout(DELTA_BASE_LOOKUP_TIMEOUT, templates.get_template(request)).await
+    else {
+        tracing::warn!(
+            template,
+            content_hash,
+            "no verified delta base: template lookup timed out"
         );
-        if !std::path::Path::new(&template_dir).is_dir() {
-            return Err(Status::failed_precondition(format!(
-                "delta import requires template '{}' with hash '{}' on this node. Pull the template first, or use full transfer.",
-                header.template_id, header.content_hash
-            )));
+        return Err(NoDeltaBase::Unanswered(format!(
+            "no answer within {DELTA_BASE_LOOKUP_TIMEOUT:?}"
+        )));
+    };
+    match lookup {
+        Ok(response) => {
+            if let Err(status) = scope.observe_response(&response) {
+                tracing::warn!(
+                    template,
+                    content_hash,
+                    %status,
+                    "no verified delta base: template lookup answered for another scope"
+                );
+                return Err(NoDeltaBase::Unusable(status.message().to_string()));
+            }
+            let response = response.into_inner();
+            // A template-manager that predates `cached_only` ignores it and
+            // answers an ordinary lookup, which skips the checks a delta base
+            // needs. Only its echo says they ran.
+            if !response.cached_only {
+                tracing::warn!(
+                    template,
+                    content_hash,
+                    "no verified delta base: template-manager doesn't support cached_only lookups"
+                );
+                return Err(NoDeltaBase::Unusable(
+                    "template-manager answered without cached_only checks; upgrade it".to_string(),
+                ));
+            }
+            Ok(std::path::Path::new(&response.template_dir)
+                .join(pplx_space_common_core::types::TEMPLATE_ROOTFS_FILE))
+        }
+        Err(crate::template_resolver::TemplateLookupError::Rpc(status))
+            if status.code() == tonic::Code::NotFound =>
+        {
+            tracing::info!(
+                template,
+                content_hash,
+                "no verified delta base: no ready build on this node"
+            );
+            Err(NoDeltaBase::Absent)
+        }
+        Err(crate::template_resolver::TemplateLookupError::Rpc(status))
+            if !unanswered(status.code()) =>
+        {
+            tracing::warn!(
+                template,
+                content_hash,
+                %status,
+                "no verified delta base: template-manager refused the build or the lookup"
+            );
+            Err(NoDeltaBase::Unusable(status.message().to_string()))
+        }
+        Err(error) => {
+            tracing::warn!(
+                template,
+                content_hash,
+                %error,
+                "no verified delta base: template lookup failed"
+            );
+            Err(NoDeltaBase::Unanswered(error.to_string()))
         }
     }
-    Ok(())
+}
+
+/// [`verify_delta_base`] for an export, which sends the full rootfs whatever
+/// the reason there's no base.
+pub(super) async fn verified_template_rootfs(
+    templates: &dyn crate::template_resolver::TemplateResolver,
+    template: &str,
+    content_hash: &str,
+) -> Option<std::path::PathBuf> {
+    verify_delta_base(templates, template, content_hash)
+        .await
+        .ok()
+}
+
+/// A delta base looked up before a transfer takes its sandbox's locks, for
+/// the build the sandbox pinned then.
+pub(super) struct EarlyDeltaBase {
+    template: String,
+    content_hash: String,
+    rootfs: std::path::PathBuf,
+}
+
+impl EarlyDeltaBase {
+    /// The verified base of `template@content_hash`, when `wanted` and the
+    /// sandbox pins a build.
+    pub(super) async fn look_up(
+        templates: &dyn crate::template_resolver::TemplateResolver,
+        wanted: bool,
+        template: &str,
+        content_hash: Option<&str>,
+    ) -> Option<Self> {
+        let content_hash = content_hash.filter(|_| wanted)?;
+        let rootfs = verified_template_rootfs(templates, template, content_hash).await?;
+        Some(Self {
+            template: template.to_string(),
+            content_hash: content_hash.to_string(),
+            rootfs,
+        })
+    }
+
+    /// The base, if the sandbox, read again under its locks, still pins the
+    /// build it was looked up for.
+    pub(super) fn for_pinned(
+        base: Option<Self>,
+        template: &str,
+        content_hash: &str,
+    ) -> Option<std::path::PathBuf> {
+        base.filter(|base| base.template == template && base.content_hash == content_hash)
+            .map(|base| base.rootfs)
+    }
+}
+
+async fn delta_import_base(
+    templates: &dyn crate::template_resolver::TemplateResolver,
+    header: &crate::proto::ImportSandboxHeader,
+) -> Result<Option<std::path::PathBuf>, Status> {
+    if !header.is_delta {
+        return Ok(None);
+    }
+    required_delta_base(templates, &header.template_id, &header.content_hash)
+        .await
+        .map(Some)
+}
+
+/// The verified base a delta import applies its diff to. `FAILED_PRECONDITION`
+/// when this node holds no ready build, or holds one that can't serve as a
+/// base, each with its own message; a retryable `UNAVAILABLE` with the cause
+/// when template-manager couldn't say.
+pub(super) async fn required_delta_base(
+    templates: &dyn crate::template_resolver::TemplateResolver,
+    template: &str,
+    content_hash: &str,
+) -> Result<std::path::PathBuf, Status> {
+    verify_delta_base(templates, template, content_hash)
+        .await
+        .map_err(|reason| match reason {
+            NoDeltaBase::Absent => Status::failed_precondition(format!(
+                "delta import requires template '{template}' with hash '{content_hash}' on this node. Pull the template first, or use full transfer."
+            )),
+            NoDeltaBase::Unusable(reason) => Status::failed_precondition(format!(
+                "template '{template}' with hash '{content_hash}' can't serve as a delta base on this node: {reason}. Use full transfer."
+            )),
+            NoDeltaBase::Unanswered(cause) => Status::unavailable(format!(
+                "template-manager didn't confirm a delta base for '{template}' with hash '{content_hash}': {cause}. Retry, or use full transfer."
+            )),
+        })
 }
 
 pub(super) mod receive;
@@ -237,6 +448,16 @@ async fn receive_sandbox_import_body(
     Ok(has_snapshot)
 }
 
+/// Applies a delta import's diff to the verified base. The base is looked up
+/// again here, not reused from the check before the body arrived. What keeps a
+/// build from eviction while a transfer reads it is the LRU touch a
+/// `cached_only` hit makes: template-manager's eviction planner skips builds
+/// touched within its grace period (1800 s; overridable only in test-hook
+/// builds). The body can take until the import deadline, an hour, so the first
+/// touch can lapse; this lookup touches the build again just before the read.
+/// The touch is best effort: a GC tick that planned the build's eviction
+/// before it can still remove the build, which
+/// [`apply_delta_to_verified_base`] catches.
 async fn apply_sandbox_delta_import(
     service: &SandboxManagerService,
     header: &crate::proto::ImportSandboxHeader,
@@ -245,35 +466,160 @@ async fn apply_sandbox_delta_import(
     if !header.is_delta {
         return Ok(());
     }
-
     let diff_file = format!("{}/rootfs.ext4.diff", paths.instance_staging);
     if !std::path::Path::new(&diff_file).exists() {
         return Err(Status::data_loss(
             "delta import: rootfs.ext4.diff not found in stream",
         ));
     }
-
-    let dest_file = format!("{}/rootfs.ext4", paths.instance_staging);
-    let template_rootfs = pplx_space_common_core::host::linux::paths::template_rootfs_path(
+    apply_delta_to_verified_base(
+        service,
         &header.template_id,
         &header.content_hash,
-    );
-    let diff_file_for_apply = diff_file.clone();
-    service
-        .blocking_artifact_io(move |_| {
-            pplx_space_node_runtime_core::file_delta::apply_diff_with_limit(
-                std::path::Path::new(&template_rootfs),
-                std::path::Path::new(&diff_file_for_apply),
-                std::path::Path::new(&dest_file),
-                pplx_space_common_core::sandbox_storage::MAX_SANDBOX_ROOTFS_BYTES,
-            )
-            .map_err(|error| Status::failed_precondition(format!("apply rootfs delta: {error}")))?;
-            Ok(())
-        })
-        .await?;
-
+        std::path::PathBuf::from(&diff_file),
+        std::path::PathBuf::from(format!("{}/rootfs.ext4", paths.instance_staging)),
+        pplx_space_common_core::sandbox_storage::MAX_SANDBOX_ROOTFS_BYTES,
+    )
+    .await?;
     let _ = tokio::fs::remove_file(diff_file).await;
     Ok(())
+}
+
+/// Applies a delta import's `diff` over the verified base of `template` at
+/// `content_hash`, writing `dest`, and keeps the result only if the base it
+/// read was that verified build.
+///
+/// The apply reads the base through a [`PinnedDeltaBase`], and the build is
+/// looked up again after; anything but a lookup that vouches for the pinned
+/// file is `ABORTED`, retryable, and `dest` stays unpublished in its staging
+/// directory.
+pub(super) async fn apply_delta_to_verified_base(
+    service: &SandboxManagerService,
+    template: &str,
+    content_hash: &str,
+    diff: std::path::PathBuf,
+    dest: std::path::PathBuf,
+    max_output_bytes: u64,
+) -> Result<(), Status> {
+    let templates = service.template_resolver.as_ref();
+    let base = required_delta_base(templates, template, content_hash).await?;
+    let pin = service
+        .blocking_artifact_io(move |_| {
+            let pin = PinnedDeltaBase::open(base).map_err(|error| {
+                Status::failed_precondition(format!("apply rootfs delta: {error}"))
+            })?;
+            pplx_space_node_runtime_core::file_delta::apply_diff_with_limit(
+                pin.path(),
+                &diff,
+                &dest,
+                max_output_bytes,
+            )
+            .map_err(|error| Status::failed_precondition(format!("apply rootfs delta: {error}")))?;
+            Ok(pin)
+        })
+        .await?;
+    let after = required_delta_base(templates, template, content_hash).await?;
+    let vouched = tokio::task::spawn_blocking(move || pin.vouched_by(&after))
+        .await
+        .map_err(|error| Status::internal(format!("spawn_blocking: {error}")))?;
+    if !vouched {
+        tracing::warn!(
+            template,
+            content_hash,
+            "delta base changed while the diff was applied"
+        );
+        return Err(Status::aborted(format!(
+            "the delta base for template '{template}' with hash '{content_hash}' changed while the diff was applied. Retry."
+        )));
+    }
+    Ok(())
+}
+
+/// A delta base's `rootfs.ext4` held open while a transfer reads it by path,
+/// so a lookup made after the read can tell whether the read saw the build
+/// the catalog vouches for.
+///
+/// The build can be evicted and pulled again between a lookup and the read.
+/// A pull renames `rootfs.ext4` into place before it checks the digest, and
+/// writes the build's row only after the check passes; a failed check
+/// deletes the file. So the file at the path can briefly be unverified, but
+/// never while a ready row vouches for it. The open descriptor keeps the
+/// pinned inode allocated, so no later file can reuse its device and inode
+/// numbers, and nothing links an unlinked file back into place. A path that
+/// still names the pinned inode after the read named it throughout, and a
+/// ready row then means those were verified bytes.
+pub(super) struct PinnedDeltaBase {
+    path: std::path::PathBuf,
+    _file: std::fs::File,
+    identity: (u64, u64),
+}
+
+impl PinnedDeltaBase {
+    /// Opens `path`, refusing one that doesn't name the file it opened, such
+    /// as a symlink.
+    pub(super) fn open(path: std::path::PathBuf) -> std::io::Result<Self> {
+        let file = std::fs::File::open(&path)?;
+        let identity = identity_of(&file.metadata()?);
+        if identity_of(&std::fs::symlink_metadata(&path)?) != identity {
+            return Err(std::io::Error::other(format!(
+                "{} changed while it was opened",
+                path.display()
+            )));
+        }
+        Ok(Self {
+            path,
+            _file: file,
+            identity,
+        })
+    }
+
+    pub(super) fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+
+    /// Whether `answer`, the base a lookup made after the read answered
+    /// with, is this pinned file at the same path.
+    pub(super) fn vouched_by(&self, answer: &std::path::Path) -> bool {
+        answer == self.path
+            && std::fs::symlink_metadata(answer)
+                .is_ok_and(|metadata| identity_of(&metadata) == self.identity)
+    }
+}
+
+fn identity_of(metadata: &std::fs::Metadata) -> (u64, u64) {
+    use std::os::unix::fs::MetadataExt;
+    (metadata.dev(), metadata.ino())
+}
+
+/// Computes a delta export's diff of `current` against the verified base
+/// `base`, written to `diff`, and keeps it only if a lookup after the
+/// computation vouches for the base file it read ([`PinnedDeltaBase`]).
+/// Returns whether to send the diff; otherwise `diff` is removed and the
+/// export sends the full rootfs. Runs on a blocking thread, and makes its
+/// lookup on `runtime`.
+pub(super) fn diff_against_verified_base(
+    runtime: &tokio::runtime::Handle,
+    templates: &dyn crate::template_resolver::TemplateResolver,
+    (template, content_hash): (&str, &str),
+    base: std::path::PathBuf,
+    current: &std::path::Path,
+    diff: &std::path::Path,
+) -> bool {
+    let kept = PinnedDeltaBase::open(base).is_ok_and(|pin| {
+        pplx_space_node_runtime_core::file_delta::compute_diff(pin.path(), current, diff).is_ok()
+            && runtime
+                .block_on(verified_template_rootfs(templates, template, content_hash))
+                .is_some_and(|after| pin.vouched_by(&after))
+    });
+    if !kept {
+        tracing::warn!(
+            template,
+            content_hash,
+            "delta export sends the full rootfs: no diff against a base the catalog still vouches for"
+        );
+        let _ = std::fs::remove_file(diff);
+    }
+    kept
 }
 
 async fn publish_imported_instance(
@@ -365,7 +711,15 @@ impl SandboxManagerService {
     ) -> Result<Response<SbxExportSandboxStream>, Status> {
         self.authorize_peer(&request, "ExportSandbox", ALLOW_LOCAL_ARTIFACT_OPERATOR)?;
         let req = request.into_inner();
-        let id = self.lookup_sandbox(&req.sandbox_id)?.id;
+        let pinned = self.lookup_sandbox(&req.sandbox_id)?;
+        let early_base = EarlyDeltaBase::look_up(
+            self.template_resolver.as_ref(),
+            req.use_delta,
+            &pinned.template,
+            pinned.template_hash.as_deref(),
+        )
+        .await;
+        let id = pinned.id;
         let wake = self.auto_lifecycle.wake_lock(&id).lock_owned().await;
         let artifact = self.auto_lifecycle.artifact_lock(&id).lock_owned().await;
         let CleanupLockTryResult::Acquired(fence) = self.try_cleanup_fence(&id) else {
@@ -423,7 +777,7 @@ impl SandboxManagerService {
         let guest_uptime_secs = sandbox.guest_uptime_secs;
         let process_env = sandbox.process_env.clone();
         let rootfs_size_mb = sandbox.rootfs_size_mb;
-        let use_delta = req.use_delta;
+        let delta_base = EarlyDeltaBase::for_pinned(early_base, &template, &template_hash);
         let include_snapshot = sandbox.state == SandboxState::Suspended;
         let writer = self.state_writer_lease("ExportSandbox")?;
         let lease = sandbox
@@ -445,6 +799,8 @@ impl SandboxManagerService {
 
         let service = self.clone();
         let errors = tx.clone();
+        let resolver = Arc::clone(&self.template_resolver);
+        let lookup_runtime = tokio::runtime::Handle::current();
         self.task_tracker
             .spawn(super::drain::with_state_writer(writer, async move {
                 let result = service
@@ -475,29 +831,21 @@ impl SandboxManagerService {
                                     }
                                 }
                             }
-                            let template_rootfs =
-                                pplx_space_common_core::host::linux::paths::template_rootfs_path(
-                                    &template,
-                                    &template_hash,
-                                );
-                            let can_delta = use_delta
-                                && std::path::Path::new(&template_rootfs).exists()
-                                && std::path::Path::new(&sandbox_rootfs).exists();
-
                             // If delta is possible, compute it to a temp file
-                            let (diff_path, is_delta) = if can_delta {
+                            let (diff_path, is_delta) = if let Some(template_rootfs) = delta_base {
                                 let diff_id = uuid::Uuid::now_v7();
                                 let diff = format!("{instance_dir}/../.rootfs.diff.{diff_id}.tmp");
-                                match pplx_space_node_runtime_core::file_delta::compute_diff(
-                                    std::path::Path::new(&template_rootfs),
+                                if diff_against_verified_base(
+                                    &lookup_runtime,
+                                    resolver.as_ref(),
+                                    (&template, &template_hash),
+                                    template_rootfs,
                                     std::path::Path::new(&sandbox_rootfs),
                                     std::path::Path::new(&diff),
                                 ) {
-                                    Ok(_stats) => (Some(diff), true),
-                                    Err(_) => {
-                                        let _ = std::fs::remove_file(&diff);
-                                        (None, false)
-                                    }
+                                    (Some(diff), true)
+                                } else {
+                                    (None, false)
                                 }
                             } else {
                                 (None, false)
@@ -763,6 +1111,23 @@ impl SandboxManagerService {
         )?;
         header.sandbox_id = validated.sandbox_id.to_string();
         let sandbox_id = header.sandbox_id.clone();
+        // A delta import without a verified base is refused before its body
+        // arrives, and before taking the sandbox's locks. Ahead of that
+        // lookup, a cleanup in progress still answers ABORTED and an existing
+        // sandbox ALREADY_EXISTS, as they would without a delta, so a retry of
+        // an import that already landed isn't told to pull its template. Both
+        // checks run again under the locks below, which stay authoritative.
+        if header.is_delta {
+            if !matches!(
+                self.try_cleanup_fence(&sandbox_id),
+                CleanupLockTryResult::Acquired(_)
+            ) {
+                return Err(Status::aborted("sandbox cleanup is in progress"));
+            }
+            self.reject_existing_sandbox_import(validated.sandbox_id)
+                .await?;
+            delta_import_base(self.template_resolver.as_ref(), &header).await?;
+        }
         let _wake = super::restart_admission::wait_for_activation_admission(
             &sandbox_id,
             self.auto_lifecycle.wake_lock(&sandbox_id).lock_owned(),
@@ -778,7 +1143,6 @@ impl SandboxManagerService {
         };
         self.reject_existing_sandbox_import(validated.sandbox_id)
             .await?;
-        ensure_delta_template_available(&header)?;
 
         let paths = SandboxImportPaths::new(&sandbox_id);
         let cleanup_id = SandboxCleanupEpisodeId::new();
@@ -861,5 +1225,7 @@ impl SandboxManagerService {
     }
 }
 
+#[cfg(test)]
+mod delta_e2e_tests;
 #[cfg(test)]
 mod tests;

@@ -127,6 +127,7 @@ async fn ensure_template(
 ) -> Result<EnsuredTemplate, Status> {
     let mut request = Request::new(GetTemplateRequest {
         caller_org_id: None,
+        cached_only: false,
         template: Some(TemplateRef {
             name: template.to_string(),
             content_hash: content_hash.map(ToOwned::to_owned),

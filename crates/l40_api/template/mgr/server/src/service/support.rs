@@ -297,6 +297,8 @@ pub(super) async fn build_get_template_response(
             network_policy_generation: default_network_policy_generation,
             network_policy_authority: default_network_policy_authority.as_proto_i32(),
             auto_lifecycle_authority: default_auto_lifecycle_authority.as_proto_i32(),
+            // Set by the `cached_only` lookup once its checks pass.
+            cached_only: false,
         })
     })
     .await

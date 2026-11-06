@@ -387,6 +387,31 @@ must supply the destination RPC's existing import header and file chunks.
 Source lifecycle, encryption restrictions, and destination validation still
 apply. The node-api service account cannot invoke these local artifact methods.
 
+A transfer with `use_delta` sends the rootfs as a delta against the cached
+template build it was created from. A build directory alone says nothing about
+that rootfs: one can exist without a catalog row, as a transient recovery
+failure or an interrupted pull leaves it. So sandbox-manager takes the delta
+base, for sandbox and snapshot export and import, from a `GetTemplate` lookup
+with `cached_only` set. Template-manager answers it from a ready catalog row
+whose rootfs has the size its build declares and is a regular file, never
+pulls, and marks its answer as a `cached_only` one; sandbox-manager takes no
+base from an answer without that mark. Each lookup is bounded at 5 seconds.
+Exports, and a sandbox import's check before its body arrives, look the base up
+before taking the sandbox's locks. A delta import, sandbox or snapshot, looks
+it up again under the sandbox's locks just before it applies the diff, and once
+more after: it keeps the result only if the build still answers and its rootfs
+is the file the apply read, held open throughout, and is refused with a
+retryable `ABORTED` otherwise. A snapshot import makes only those two lookups,
+after its body. An export likewise looks the base up again after computing its
+diff and keeps the diff only for the file it read. Without a verified base an
+export sends the full rootfs. A delta import is refused with
+`FAILED_PRECONDITION` when template-manager answers that the node has no such
+build, holds one that can't serve as a base, or refuses the lookup, and with a
+retryable `UNAVAILABLE` when template-manager can't be reached, doesn't answer
+in time or fails transiently. A delta import of a sandbox that already exists,
+or whose cleanup is in progress, is refused with `ALREADY_EXISTS` or `ABORTED`
+before any lookup.
+
 ## TLS interception exemptions
 
 `NetworkPolicyV1.tls_interception_exemptions` uses the same destination selectors

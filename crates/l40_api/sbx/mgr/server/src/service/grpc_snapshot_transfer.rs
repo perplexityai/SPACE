@@ -86,7 +86,15 @@ impl SandboxManagerService {
     ) -> Result<Response<SbxExportSnapshotStream>, Status> {
         self.authorize_peer(&request, "ExportSnapshot", ALLOW_LOCAL_ARTIFACT_OPERATOR)?;
         let req = request.into_inner();
-        let id = self.lookup_sandbox(&req.sandbox_id)?.id;
+        let pinned = self.lookup_sandbox(&req.sandbox_id)?;
+        let early_base = super::grpc_sandbox_transfer::EarlyDeltaBase::look_up(
+            self.template_resolver.as_ref(),
+            req.include_rootfs && req.use_delta,
+            &pinned.template,
+            pinned.template_hash.as_deref(),
+        )
+        .await;
+        let id = pinned.id;
         let wake = self.auto_lifecycle.wake_lock(&id).lock_owned().await;
         let artifact = self.auto_lifecycle.artifact_lock(&id).lock_owned().await;
         let CleanupLockTryResult::Acquired(fence) = self.try_cleanup_fence(&id) else {
@@ -130,7 +138,11 @@ impl SandboxManagerService {
             Status::failed_precondition("sandbox has no pinned template content hash")
         })?;
         let include_rootfs = req.include_rootfs;
-        let use_delta = req.use_delta;
+        let delta_base = super::grpc_sandbox_transfer::EarlyDeltaBase::for_pinned(
+            early_base,
+            &template,
+            &template_hash,
+        );
         let writer = self.state_writer_lease("ExportSnapshot")?;
         let snapshot_key = snapshot_name
             .parse::<pplx_space_common_core::types::SnapshotName>()
@@ -152,6 +164,8 @@ impl SandboxManagerService {
 
         let service = self.clone();
         let errors = tx.clone();
+        let resolver = std::sync::Arc::clone(&self.template_resolver);
+        let lookup_runtime = tokio::runtime::Handle::current();
         self.task_tracker
             .spawn(super::drain::with_state_writer(writer, async move {
                 let result = service
@@ -223,32 +237,24 @@ impl SandboxManagerService {
                                     return;
                                 }
 
-                                if use_delta && std::path::Path::new(&rootfs_path).exists() {
-                                    let template_rootfs =
-                        pplx_space_common_core::host::linux::paths::template_rootfs_path(
-                            &template,
-                            &template_hash,
-                        );
-                                    if std::path::Path::new(&template_rootfs).exists() {
-                                        let diff_id = uuid::Uuid::now_v7();
-                                        let diff_path =
-                                            format!("{snapshot_dir}/.rootfs.diff.{diff_id}.tmp");
-                                        _rootfs_diff_guard = DiffCleanup(Some(diff_path.clone()));
-                                        if pplx_space_node_runtime_core::file_delta::compute_diff(
-                                            std::path::Path::new(&template_rootfs),
-                                            std::path::Path::new(&rootfs_path),
-                                            std::path::Path::new(&diff_path),
-                                        )
-                                        .is_ok()
-                                        {
-                                            files.push(("rootfs.ext4.diff", diff_path, true));
-                                        } else {
-                                            files.push(("rootfs.ext4", rootfs_path, true));
-                                        }
+                                if let Some(template_rootfs) = delta_base {
+                                    let diff_id = uuid::Uuid::now_v7();
+                                    let diff_path =
+                                        format!("{snapshot_dir}/.rootfs.diff.{diff_id}.tmp");
+                                    _rootfs_diff_guard = DiffCleanup(Some(diff_path.clone()));
+                                    if super::grpc_sandbox_transfer::diff_against_verified_base(
+                                        &lookup_runtime,
+                                        resolver.as_ref(),
+                                        (&template, &template_hash),
+                                        template_rootfs,
+                                        std::path::Path::new(&rootfs_path),
+                                        std::path::Path::new(&diff_path),
+                                    ) {
+                                        files.push(("rootfs.ext4.diff", diff_path, true));
                                     } else {
                                         files.push(("rootfs.ext4", rootfs_path, true));
                                     }
-                                } else if std::path::Path::new(&rootfs_path).exists() {
+                                } else {
                                     files.push(("rootfs.ext4", rootfs_path, true));
                                 }
                             }
@@ -473,28 +479,19 @@ impl SandboxManagerService {
                 }
             }
             if receiver.contains("rootfs.ext4.diff") {
-                let template = pplx_space_common_core::host::linux::paths::template_rootfs_path(
+                let diff = format!("{staging}/rootfs.ext4.diff");
+                super::grpc_sandbox_transfer::apply_delta_to_verified_base(
+                    self,
                     &header.template_id,
                     &header.content_hash,
-                );
-                let diff = format!("{staging}/rootfs.ext4.diff");
-                let dest = format!("{staging}/rootfs.ext4");
-                self.blocking_artifact_io(move |_| {
-                    pplx_space_node_runtime_core::file_delta::apply_diff_with_limit(
-                        std::path::Path::new(&template),
-                        std::path::Path::new(&diff),
-                        std::path::Path::new(&dest),
-                        receive::MAX_TRANSFER_FILE_BYTES,
-                    )
-                    .map_err(|error| {
-                        Status::failed_precondition(format!("apply rootfs delta: {error}"))
-                    })?;
-                    std::fs::remove_file(diff).map_err(|error| {
-                        Status::internal(format!("remove rootfs delta: {error}"))
-                    })?;
-                    Ok(())
-                })
+                    std::path::PathBuf::from(&diff),
+                    std::path::PathBuf::from(format!("{staging}/rootfs.ext4")),
+                    receive::MAX_TRANSFER_FILE_BYTES,
+                )
                 .await?;
+                tokio::fs::remove_file(diff)
+                    .await
+                    .map_err(|error| Status::internal(format!("remove rootfs delta: {error}")))?;
             }
             let binding = crate::db::transfer::TransferBinding {
                 sandbox_id: sandbox_id.clone(),

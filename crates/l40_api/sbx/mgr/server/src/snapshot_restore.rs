@@ -2873,6 +2873,7 @@ async fn ensure_local_template(
         let mut request =
             tonic::Request::new(pplx_space_template_mgr_client::proto::GetTemplateRequest {
                 caller_org_id: None,
+                cached_only: false,
                 template: Some(pplx_space_template_mgr_client::proto::TemplateRef {
                     name: template_name.to_string(),
                     content_hash: Some(content_hash.to_string()),

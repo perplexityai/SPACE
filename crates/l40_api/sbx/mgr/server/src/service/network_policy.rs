@@ -136,6 +136,7 @@ pub(crate) async fn fetch_template_default_network_policy(
     let mut request =
         tonic::Request::new(pplx_space_template_mgr_client::proto::GetTemplateRequest {
             caller_org_id: None,
+            cached_only: false,
             template: Some(pplx_space_template_mgr_client::proto::TemplateRef {
                 name: template.to_string(),
                 content_hash: None,
