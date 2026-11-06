@@ -151,7 +151,9 @@ schema and Python SDK 2.62.0 do not expose CPU, memory, or disk overrides.
 Provided values must be positive integers no larger than 2,147,483,647; actual
 allocation remains subject to runtime and available capacity. `disk_mib`
 overrides the template's disk size; it must be at least the template rootfs
-size, and a value above 128 GiB returns HTTP 400. Malformed JSON, unknown
+size, and a value above 128 GiB returns HTTP 400. A smaller value fails the
+create with HTTP 400 naming the rootfs size once the node refuses to start it,
+usually within seconds. Malformed JSON, unknown
 fields, and invalid values return HTTP 400. Omitted fields retain the normal
 create defaults. ECW consumes `space.resources`, so it does not appear in the
 sandbox's stored metadata; other metadata is preserved.
