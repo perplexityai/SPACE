@@ -58,6 +58,25 @@ async fn handle_health(client: &mut SandboxClient, sandbox_id: SandboxSelector) 
     println!("{table}");
 }
 
+/// A listed sandbox that State no longer finds, shown from what List said,
+/// including the cleanup that owns it.
+fn listed_sandbox_info(
+    listed: &pplx_space_sbx_mgr_client::proto::SandboxListElement,
+) -> SandboxInfo {
+    SandboxInfo {
+        sandbox_id: listed.sandbox_id.clone(),
+        template: listed.template.clone(),
+        lifecycle: listed.lifecycle,
+        cleanup: listed.cleanup,
+        owner: listed.owner.clone(),
+        image_hash: listed.image_hash.clone(),
+        created_at: listed.created_at.clone(),
+        runtime: listed.runtime.clone(),
+        pool_template: listed.pool_template.clone(),
+        ..Default::default()
+    }
+}
+
 async fn handle_list(client: &mut SandboxClient) {
     let template_hashes = template_hashes(client).await;
     let listed = pplx_space_sbx_mgr_client::list_all_sandboxes(client)
@@ -86,17 +105,7 @@ async fn handle_list(client: &mut SandboxClient) {
     let mut sandboxes = state.sandboxes;
     for missing_id in state.missing_ids {
         if let Some(listed) = listed_by_id.get(&missing_id) {
-            sandboxes.push(SandboxInfo {
-                sandbox_id: listed.sandbox_id.clone(),
-                template: listed.template.clone(),
-                lifecycle: listed.lifecycle,
-                owner: listed.owner.clone(),
-                image_hash: listed.image_hash.clone(),
-                created_at: listed.created_at.clone(),
-                runtime: listed.runtime.clone(),
-                pool_template: listed.pool_template.clone(),
-                ..Default::default()
-            });
+            sandboxes.push(listed_sandbox_info(listed));
         }
     }
     let disk_usage = client

@@ -56,3 +56,26 @@ fn sandbox_health_renders_composed_status_for_running_states() {
     };
     assert_eq!(sandbox_health(&stopped), "-");
 }
+
+#[test]
+fn a_listed_sandbox_state_no_longer_finds_keeps_its_cleanup() {
+    use pplx_space_sbx_mgr_client::proto::{
+        SandboxCleanup, SandboxCleanupCompletion, SandboxCleanupState, SandboxLifecycleState,
+        SandboxListElement,
+    };
+    let cleanup = SandboxCleanup {
+        completion: SandboxCleanupCompletion::DeleteRow as i32,
+        state: SandboxCleanupState::Failed as i32,
+    };
+    let info = listed_sandbox_info(&SandboxListElement {
+        sandbox_id: "sbx".to_owned(),
+        lifecycle: Some(SandboxLifecycleState::CleanupFailed as i32),
+        cleanup: Some(cleanup),
+        ..Default::default()
+    });
+    assert_eq!(
+        info.lifecycle,
+        Some(SandboxLifecycleState::CleanupFailed as i32)
+    );
+    assert_eq!(info.cleanup, Some(cleanup));
+}

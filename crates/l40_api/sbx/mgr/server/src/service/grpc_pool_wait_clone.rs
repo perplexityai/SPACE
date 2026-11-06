@@ -735,15 +735,18 @@ impl SandboxManagerService {
                 let db = self.db_conn()?;
                 crate::db::read::sandbox(&db, &id)
                     .map_err(|e| Status::internal(format!("db error: {e}")))?
-                    .map(|row| row.state)
+                    .map(|row| (row.state, row.cleanup_completion))
             };
 
-            if let Some(state) = state {
+            if let Some((state, completion)) = state {
                 if state.completes_wait() {
                     return Ok(Response::new(WaitResponse {
                         sandbox_id: id,
                         lifecycle: Some(crate::proto::SandboxLifecycleState::from(state) as i32),
-                        cleanup: None,
+                        cleanup: super::grpc_state_snapshot::cleanup_observation(
+                            super::grpc_state_snapshot::cleanup_owner(state),
+                            completion,
+                        ),
                     }));
                 }
 
