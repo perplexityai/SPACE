@@ -3357,6 +3357,7 @@ impl NodeDrainSink for SubstrateSink {
                 | SubstrateError::RestoreInFlight { message, .. }
                 | SubstrateError::SuspendInFlight { message }
                 | SubstrateError::RetainedFilesystemOnlyCopy { message }
+                | SubstrateError::NodeDeleteNotAdmitted { message }
                 | SubstrateError::ActivationInFlight { message, .. }
                 | SubstrateError::AdmissionRejected { message, .. }
                 | SubstrateError::Cancelled { message }
