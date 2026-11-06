@@ -42,6 +42,11 @@ fn write_cgroup(
         (maximum_mib * BYTES_PER_MIB).to_string(),
     )
     .unwrap();
+    std::fs::write(
+        cgroup_path.join("memory.stat"),
+        "active_file 0\ninactive_file 0\n",
+    )
+    .unwrap();
 }
 
 fn lease(sandbox_id: SandboxId) -> ActiveLeaseMemoryReservation {
@@ -63,7 +68,7 @@ async fn low_usage_running_vm_receives_only_configured_growth_reserve() {
     let sandbox_id = sandbox_id("019d84bd-280d-7331-99c6-b63377f3a3a2");
     write_cgroup(&sources, sandbox_id, 256, 8320);
 
-    let measurement = MemoryAdmissionConfig { reserve_mib: 1024 }
+    let measurement = MemoryAdmissionConfig::default()
         .evaluate_new_allocation(8320, &[lease(sandbox_id)], &sources)
         .await
         .unwrap();
@@ -77,7 +82,7 @@ async fn running_vm_growth_reserve_is_capped_at_remaining_maximum() {
     let sandbox_id = sandbox_id("019d84bd-280d-7331-99c6-b63377f3a3a2");
     write_cgroup(&sources, sandbox_id, 8000, 8320);
 
-    let measurement = MemoryAdmissionConfig { reserve_mib: 1024 }
+    let measurement = MemoryAdmissionConfig::default()
         .evaluate_new_allocation(8320, &[lease(sandbox_id)], &sources)
         .await
         .unwrap();
@@ -90,7 +95,7 @@ async fn invisible_active_lease_is_charged_its_persisted_cap() {
     let (_root, sources) = sources(20_000, 20_000);
     let sandbox_id = sandbox_id("019d84bd-280d-7331-99c6-b63377f3a3a2");
 
-    let measurement = MemoryAdmissionConfig { reserve_mib: 1024 }
+    let measurement = MemoryAdmissionConfig::default()
         .evaluate_new_allocation(8320, &[lease(sandbox_id)], &sources)
         .await
         .unwrap();
@@ -101,7 +106,7 @@ async fn invisible_active_lease_is_charged_its_persisted_cap() {
 #[tokio::test]
 async fn lease_committed_after_observation_is_charged_its_persisted_cap() {
     let (_root, sources) = sources(17_663, 17_663);
-    let admission = MemoryAdmissionConfig { reserve_mib: 1024 };
+    let admission = MemoryAdmissionConfig::default();
     let observation = admission
         .observe_active_leases(&[], &sources)
         .await
@@ -124,7 +129,7 @@ async fn lease_committed_after_observation_is_charged_its_persisted_cap() {
 #[tokio::test]
 async fn replacement_lease_generation_is_charged_after_observation() {
     let (_root, sources) = sources(17_663, 17_663);
-    let admission = MemoryAdmissionConfig { reserve_mib: 1024 };
+    let admission = MemoryAdmissionConfig::default();
     let sandbox_id = sandbox_id("019d84bd-280d-7331-99c6-b63377f3a3a2");
     write_cgroup(&sources, sandbox_id, 8000, 8320);
     let observation = admission
@@ -164,7 +169,7 @@ async fn replacement_lease_generation_is_charged_after_observation() {
 #[tokio::test]
 async fn exact_capacity_boundary_admits_and_one_mib_over_rejects() {
     let (_root, exact_sources) = sources(10_000, 9344);
-    let admission = MemoryAdmissionConfig { reserve_mib: 1024 };
+    let admission = MemoryAdmissionConfig::default();
 
     let exact = admission
         .evaluate_new_allocation(8320, &[], &exact_sources)
@@ -195,7 +200,7 @@ async fn malformed_visible_cgroup_falls_back_to_persisted_cap() {
     std::fs::write(cgroup_path.join("memory.current"), "not-a-number\n").unwrap();
     std::fs::write(cgroup_path.join("memory.max"), "8724152320\n").unwrap();
 
-    let measurement = MemoryAdmissionConfig { reserve_mib: 1024 }
+    let measurement = MemoryAdmissionConfig::default()
         .evaluate_new_allocation(8320, &[lease(sandbox_id)], &sources)
         .await
         .unwrap();
@@ -211,7 +216,7 @@ async fn unreadable_meminfo_fails_admission_closed() {
         root.path().join("cgroups"),
     );
 
-    let error = MemoryAdmissionConfig { reserve_mib: 1024 }
+    let error = MemoryAdmissionConfig::default()
         .evaluate_new_allocation(8320, &[], &sources)
         .await
         .unwrap_err();
@@ -230,7 +235,7 @@ async fn admittable_count_matches_admission_at_the_boundary() {
     let (_root, sources) = sources(100_000, 80_000);
     let sandbox_id = sandbox_id("019d84bd-280d-7331-99c6-b63377f3a3a2");
     write_cgroup(&sources, sandbox_id, 256, 8320);
-    let admission = MemoryAdmissionConfig { reserve_mib: 1024 };
+    let admission = MemoryAdmissionConfig::default();
     let leases = [lease(sandbox_id)];
     let observation = admission
         .observe_active_leases(&leases, &sources)
@@ -251,7 +256,7 @@ async fn admittable_count_matches_admission_at_the_boundary() {
 #[tokio::test]
 async fn admittable_count_is_bounded_by_the_slot_limit() {
     let (_root, sources) = sources(1_000_000, 1_000_000);
-    let admission = MemoryAdmissionConfig { reserve_mib: 1024 };
+    let admission = MemoryAdmissionConfig::default();
     let observation = admission
         .observe_active_leases(&[], &sources)
         .await
@@ -269,7 +274,7 @@ async fn full_node_admits_no_new_sandbox() {
     // 90_000 MiB used plus 9_000 MiB growth reserve: an 8320 MiB sandbox
     // needs 108_344 MiB of 100_000.
     let (_root, sources) = sources(100_000, 10_000);
-    let admission = MemoryAdmissionConfig { reserve_mib: 1024 };
+    let admission = MemoryAdmissionConfig::default();
     let mut observation = admission
         .observe_active_leases(&[], &sources)
         .await
@@ -280,4 +285,180 @@ async fn full_node_admits_no_new_sandbox() {
         admission.admittable_new_sandboxes(8320, &observation, 64),
         0
     );
+}
+
+fn write_parent_cgroup(
+    sources: &MemoryAdmissionSources,
+    current_mib: u64,
+    maximum: &str,
+    file_cache_mib: u64,
+) {
+    let base = &sources.firecracker_cgroup_base;
+    std::fs::write(
+        base.join("memory.current"),
+        (current_mib * BYTES_PER_MIB).to_string(),
+    )
+    .unwrap();
+    std::fs::write(base.join("memory.max"), format!("{maximum}\n")).unwrap();
+    std::fs::write(
+        base.join("memory.stat"),
+        format!(
+            "anon 0\nfile {0}\nactive_file {0}\ninactive_file 0\nshmem 0\n",
+            file_cache_mib * BYTES_PER_MIB
+        ),
+    )
+    .unwrap();
+}
+
+#[tokio::test]
+async fn parent_cgroup_limit_refuses_while_host_reports_room() {
+    // The host has 60_000 MiB available, but the sandbox parent cgroup is
+    // 1_000 MiB below its memory.max.
+    let (_root, sources) = sources(100_000, 60_000);
+    write_parent_cgroup(&sources, 89_000, &(90_000 * BYTES_PER_MIB).to_string(), 0);
+
+    let error = MemoryAdmissionConfig::default()
+        .evaluate_new_allocation(8320, &[], &sources)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        MemoryAdmissionEvaluationError::Admission(
+            MemoryAdmissionError::InsufficientParentCgroupCapacity {
+                parent_cgroup_used_mib: 89_000,
+                parent_cgroup_max_mib: 90_000,
+                required_mib: 98_344,
+                ..
+            }
+        )
+    ));
+}
+
+#[tokio::test]
+async fn parent_cgroup_file_cache_counts_as_reclaimable() {
+    let (_root, sources) = sources(100_000, 60_000);
+    write_parent_cgroup(
+        &sources,
+        89_000,
+        &(90_000 * BYTES_PER_MIB).to_string(),
+        20_000,
+    );
+
+    MemoryAdmissionConfig::default()
+        .evaluate_new_allocation(8320, &[], &sources)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn unlimited_parent_cgroup_leaves_only_the_host_check() {
+    let (_root, sources) = sources(100_000, 60_000);
+    write_parent_cgroup(&sources, 89_000, "max", 0);
+
+    MemoryAdmissionConfig::default()
+        .evaluate_new_allocation(8320, &[], &sources)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn placement_count_follows_the_parent_cgroup_limit() {
+    // 30_000 MiB under the parent limit less the 1024 MiB reserve fits three
+    // 8320 MiB sandboxes; the host alone would fit seven.
+    let (_root, sources) = sources(100_000, 60_000);
+    write_parent_cgroup(&sources, 60_000, &(90_000 * BYTES_PER_MIB).to_string(), 0);
+    let admission = MemoryAdmissionConfig::default();
+    let observation = admission
+        .observe_active_leases(&[], &sources)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        admission.admittable_new_sandboxes(8320, &observation, 64),
+        3
+    );
+}
+
+#[tokio::test]
+async fn commit_percent_charges_running_sandboxes_up_to_their_committed_share() {
+    let (_root, sources) = sources(100_000, 100_000);
+    let sandbox_id = sandbox_id("019d84bd-280d-7331-99c6-b63377f3a3a2");
+    write_cgroup(&sources, sandbox_id, 256, 8320);
+
+    // 0 keeps the reserve-only growth charge; above it each running sandbox
+    // is charged up to its share of memory.max, never past memory.max.
+    for (commit_percent, growth_mib) in [(0, 1024), (50, 4160 - 256), (100, 8320 - 256)] {
+        let measurement = MemoryAdmissionConfig {
+            commit_percent,
+            ..MemoryAdmissionConfig::default()
+        }
+        .evaluate_new_allocation(8320, &[lease(sandbox_id)], &sources)
+        .await
+        .unwrap();
+        assert_eq!(
+            measurement.existing_growth_reserve_mib, growth_mib,
+            "commit_percent {commit_percent}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn unreadable_parent_cgroup_leaves_only_the_host_check() {
+    let (_root, sources) = sources(100_000, 60_000);
+    write_parent_cgroup(&sources, 89_000, &(90_000 * BYTES_PER_MIB).to_string(), 0);
+    std::fs::write(sources.firecracker_cgroup_base.join("memory.stat"), "").unwrap();
+
+    MemoryAdmissionConfig::default()
+        .evaluate_new_allocation(8320, &[], &sources)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn running_sandbox_growth_includes_its_reclaimable_cache() {
+    // 4096 MiB anonymous plus 4096 MiB cache in an 8320 MiB sandbox: the
+    // cache counts as free, so the sandbox can still grow by 4224 MiB.
+    let (_root, sources) = sources(100_000, 100_000);
+    let sandbox_id = sandbox_id("019d84bd-280d-7331-99c6-b63377f3a3a2");
+    write_cgroup(&sources, sandbox_id, 8192, 8320);
+    std::fs::write(
+        sources
+            .firecracker_cgroup_base
+            .join(sandbox_id.to_string())
+            .join("memory.stat"),
+        format!("active_file {}\ninactive_file 0\n", 4096 * BYTES_PER_MIB),
+    )
+    .unwrap();
+
+    let measurement = MemoryAdmissionConfig {
+        commit_percent: 100,
+        ..MemoryAdmissionConfig::default()
+    }
+    .evaluate_new_allocation(8320, &[lease(sandbox_id)], &sources)
+    .await
+    .unwrap();
+
+    assert_eq!(measurement.existing_growth_reserve_mib, 8320 - 4096);
+}
+
+#[tokio::test]
+async fn running_sandbox_without_memory_stat_is_charged_its_full_reservation() {
+    let (_root, sources) = sources(100_000, 100_000);
+    let sandbox_id = sandbox_id("019d84bd-280d-7331-99c6-b63377f3a3a2");
+    write_cgroup(&sources, sandbox_id, 256, 8320);
+    std::fs::remove_file(
+        sources
+            .firecracker_cgroup_base
+            .join(sandbox_id.to_string())
+            .join("memory.stat"),
+    )
+    .unwrap();
+
+    let measurement = MemoryAdmissionConfig::default()
+        .evaluate_new_allocation(8320, &[lease(sandbox_id)], &sources)
+        .await
+        .unwrap();
+
+    assert_eq!(measurement.existing_growth_reserve_mib, 8320);
 }
