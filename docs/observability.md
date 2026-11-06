@@ -1233,6 +1233,9 @@ the distribution `sandbox.resource.memory.guest_used_bytes`: the guest's
 reports it on the bridge `Ping` the health probe already sends about every 24
 to 37 seconds, so there is no separate schedule.
 
+The template tag travels with the probe from the existing lifecycle lookup
+at dispatch. Recording the memory sample does not perform another database read.
+
 | Tag | Values |
 | --- | --- |
 | `template` | The sandbox's template |

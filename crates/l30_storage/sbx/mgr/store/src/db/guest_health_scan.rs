@@ -44,26 +44,52 @@ db_private_outside_tests! {
     }
 }
 
-/// One sandbox's `state` label, `None` without a row.
-pub(crate) type StateLabelRead = Result<Option<String>>;
+/// Metadata captured together when the watchdog dispatches a health probe.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SandboxHealthProbeContext {
+    pub state: crate::state::SandboxState,
+    /// An unreadable template omits telemetry without suppressing health probes.
+    pub template: Option<String>,
+}
+
+pub(crate) type HealthProbeContextRead = Result<Option<SandboxHealthProbeContext>>;
 
 db_private_outside_tests! {
-    /// The `state` label of each of `sandbox_ids` through one prepared
+    /// The probe context of each of `sandbox_ids` through one prepared
     /// statement, `None` for a sandbox without a row. Only preparing the
     /// statement fails the whole lookup; each id's read fails on its own.
-    fn state_labels_for_ids<'a>(
+    fn health_probe_contexts_for_ids<'a>(
         conn: &Connection,
         sandbox_ids: &'a [String],
-    ) -> Result<Vec<(&'a String, StateLabelRead)>> {
-        let mut statement = conn.prepare("SELECT state FROM sandboxes WHERE id = ?1")?;
+    ) -> Result<Vec<(&'a String, HealthProbeContextRead)>> {
+        let mut statement =
+            conn.prepare(sql!("SELECT state, template FROM sandboxes WHERE id = ?1"))?;
         Ok(sandbox_ids
             .iter()
             .map(|sandbox_id| {
-                let label = statement
-                    .query_row([sandbox_id], |row| row.get::<_, String>(0))
+                let context = statement
+                    .query_row([sandbox_id], |row| {
+                        let state_value = row.get::<_, String>(0)?;
+                        let state = state_value
+                            .parse::<crate::state::SandboxState>()
+                            .map_err(|_| {
+                                rusqlite::Error::FromSqlConversionFailure(
+                                    0,
+                                    Type::Text,
+                                    Box::new(SandboxStateParseError { value: state_value }),
+                                )
+                            })?;
+                        let template = row
+                            .get::<_, String>(1)
+                            .inspect_err(|error| {
+                                tracing::debug!(sandbox_id, %error, "unreadable sandbox template; skipping guest memory");
+                            })
+                            .ok();
+                        Ok(SandboxHealthProbeContext { state, template })
+                    })
                     .optional()
                     .map_err(Error::from);
-                (sandbox_id, label)
+                (sandbox_id, context)
             })
             .collect())
     }

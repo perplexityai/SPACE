@@ -28,7 +28,7 @@ use pplx_space_metrics::sandbox::worker::{
 use pplx_space_node_runtime_core::vm_state::VmState;
 
 use crate::auto_lifecycle::AutoLifecycleCoordinator;
-use crate::db::guest_health_scan::SandboxGuestHealthRow;
+use crate::db::guest_health_scan::{SandboxGuestHealthRow, SandboxHealthProbeContext};
 use crate::node_manager_transport::NodeManagerConnector;
 use crate::node_state_sync::mark_sandbox_dirty;
 use crate::service::network_policy::NetworkPolicyReconcileQueue;
@@ -2211,41 +2211,37 @@ async fn emit_net_gateway_route_verification_gauges(
     }
 }
 
-fn sandbox_states_for_ids(
+fn sandbox_probe_contexts_for_ids(
     db: &crate::db::SharedConnection,
     sandbox_ids: &[String],
-) -> Option<HashMap<String, crate::state::SandboxState>> {
+) -> Option<HashMap<String, SandboxHealthProbeContext>> {
     let db = match db.lock() {
         Ok(db) => db,
         Err(error) => {
-            tracing::warn!(%error, "sandbox database mutex poisoned while loading watchdog probe states");
+            tracing::warn!(%error, "sandbox database mutex poisoned while loading watchdog probe contexts");
             return None;
         }
     };
-    let labels = match crate::db::read::sandbox_views(&db, sandbox_ids).state_labels() {
-        Ok(labels) => labels,
+    let rows = match crate::db::read::sandbox_views(&db, sandbox_ids).health_probe_contexts() {
+        Ok(rows) => rows,
         Err(error) => {
-            tracing::warn!(%error, "failed to prepare watchdog probe-state lookup");
+            tracing::warn!(%error, "failed to prepare watchdog probe-context lookup");
             return None;
         }
     };
-    let mut states = HashMap::with_capacity(sandbox_ids.len());
-    for (sandbox_id, label) in labels {
-        let state = match label {
-            Ok(Some(state)) => state,
+    let mut contexts = HashMap::with_capacity(sandbox_ids.len());
+    for (sandbox_id, context) in rows {
+        let context = match context {
+            Ok(Some(context)) => context,
             Ok(None) => continue,
             Err(error) => {
-                tracing::warn!(sandbox_id, %error, "failed to load watchdog probe state");
+                tracing::warn!(sandbox_id, %error, "failed to load watchdog probe context");
                 continue;
             }
         };
-        let Ok(state) = state.parse::<crate::state::SandboxState>() else {
-            tracing::warn!(sandbox_id, state, "watchdog found an unknown sandbox state");
-            continue;
-        };
-        states.insert(sandbox_id.clone(), state);
+        contexts.insert(sandbox_id.clone(), context);
     }
-    Some(states)
+    Some(contexts)
 }
 
 fn guest_health_gauge_counts(
@@ -2534,7 +2530,7 @@ async fn composed_health_loop(
             .iter()
             .map(|(sandbox_id, _, _)| sandbox_id.clone())
             .collect::<Vec<_>>();
-        let Some(sandbox_states) = sandbox_states_for_ids(&db, &due_ids) else {
+        let Some(mut sandbox_contexts) = sandbox_probe_contexts_for_ids(&db, &due_ids) else {
             let retry_at = Instant::now() + HEALTH_SCHEDULER_TICK;
             let mut map = state.lock().await;
             for sandbox_id in due_ids {
@@ -2547,7 +2543,8 @@ async fn composed_health_loop(
 
         let mut pending = tokio::task::JoinSet::new();
         for (sandbox_id, lifecycle_epoch, info) in due_sidecars {
-            let lifecycle = sandbox_states.get(&sandbox_id).copied();
+            let context = sandbox_contexts.remove(&sandbox_id);
+            let lifecycle = context.as_ref().map(|context| context.state);
             if !health_probe_lifecycle_is_eligible(lifecycle) {
                 continue;
             }
@@ -2575,7 +2572,7 @@ async fn composed_health_loop(
                     &restored_guests,
                 )
                 .await;
-                (sandbox_id, lifecycle, lifecycle_epoch, result)
+                (sandbox_id, context, lifecycle_epoch, result)
             });
         }
         while !pending.is_empty() {
@@ -2930,7 +2927,7 @@ fn bounded_health_detail(mut detail: String) -> String {
 type CompletedHealthProbe = Result<
     (
         String,
-        Option<crate::state::SandboxState>,
+        Option<SandboxHealthProbeContext>,
         u64,
         ComposedProbeResult,
     ),
@@ -2979,7 +2976,10 @@ async fn apply_and_reconcile_composed_health_result(
     let pause_failed_recovery = match result.as_ref() {
         Some(Ok((
             sandbox_id,
-            Some(crate::state::SandboxState::Quarantined),
+            Some(SandboxHealthProbeContext {
+                state: crate::state::SandboxState::Quarantined,
+                ..
+            }),
             lifecycle_epoch,
             _,
         ))) => sandbox_id
@@ -3016,9 +3016,10 @@ async fn apply_composed_health_result(
     db: &crate::db::SharedConnection,
     result: Option<CompletedHealthProbe>,
 ) -> Option<AcceptedHealthResult> {
-    let Some(Ok((sandbox_id, lifecycle, lifecycle_epoch, result))) = result else {
+    let Some(Ok((sandbox_id, context, lifecycle_epoch, result))) = result else {
         return None;
     };
+    let lifecycle = context.as_ref().map(|context| context.state);
     let ComposedProbeResult {
         observations,
         guest_status,
@@ -3111,34 +3112,15 @@ async fn apply_composed_health_result(
     // lifecycle edge since dispatch discarded it all.
     let guest_memory = memory_used_bytes
         .filter(|_| lifecycle == Some(crate::state::SandboxState::Started))
-        .and_then(|used_bytes| {
-            guest_memory_template(db, &sandbox_id).map(|template| GuestMemorySample {
-                template,
-                used_bytes,
-            })
+        .zip(context.and_then(|context| context.template))
+        .map(|(used_bytes, template)| GuestMemorySample {
+            template,
+            used_bytes,
         });
     Some(AcceptedHealthResult {
         transition,
         guest_memory,
     })
-}
-
-/// The template tag for a guest memory sample. A missing or unreadable row
-/// skips only the memory sample.
-fn guest_memory_template(db: &crate::db::SharedConnection, sandbox_id: &str) -> Option<String> {
-    let conn = db
-        .lock()
-        .inspect_err(|error| {
-            tracing::debug!(sandbox_id, %error, "sandbox database mutex poisoned; skipping guest memory");
-        })
-        .ok()?;
-    match crate::db::read::sandbox(&conn, sandbox_id) {
-        Ok(row) => row.map(|row| row.template),
-        Err(error) => {
-            tracing::debug!(sandbox_id, %error, "failed to read sandbox template; skipping guest memory");
-            None
-        }
-    }
 }
 
 async fn reconcile_pause_failed_quarantine(
