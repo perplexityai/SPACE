@@ -1,7 +1,9 @@
 //! Guarded writes of the Kubernetes substrate's restore lease on `sandboxes`:
 //! the user and evacuation restore claims, the markerless re-drive's lease
 //! claim, the owned completion and the lease release, and the reverts of an
-//! abandoned claim.
+//! abandoned claim. Also the reads of the restore gate behind them: the
+//! ownership snapshot a caller reads when a claim matches nothing, and the
+//! batched observation of user restores in flight.
 //!
 //! The restore lease is the pair `restore_lease_expires_at` /
 //! `restore_lease_token`. A user claim writes both; the evacuation claim is
@@ -11,9 +13,9 @@
 //!
 //! The Kubernetes store keeps everything around these statements: the
 //! revert's row lock (`SELECT ... FOR UPDATE`) and its evidence read, the
-//! transactions, the execution retirement beside the revert, and the
-//! ownership snapshot it reads when a claim matches nothing. A claim or
-//! completion that matches no row is an outcome, not an error.
+//! transactions, the execution retirement beside the revert, and what it
+//! decides from the gate reads. A claim or completion that matches no row is
+//! an outcome, not an error.
 
 use pplx_space_common_core::types::{SandboxId, SandboxLifecycle, SubstrateKind};
 
@@ -356,4 +358,165 @@ pub async fn revert_restore_claim_lifecycle(
     .execute(&mut **tx)
     .await?;
     Ok(())
+}
+
+/// What [`restore_ownership_snapshot`] reads of one row: its lifecycle and
+/// evacuation marker, and the seconds left on its restore lease and on its
+/// active execution's ownership window, each floored at zero.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RestoreOwnershipSnapshot {
+    pub lifecycle: String,
+    pub evacuation_restore_target: Option<String>,
+    pub lease_remaining_secs: f64,
+    pub execution_remaining_secs: f64,
+}
+
+/// Read the restore gate of one row, as a caller does after a restore claim
+/// matched nothing. `None` when no row exists.
+///
+/// The execution's window counts only an active execution in `creating`,
+/// `created`, `recovering` or `running`, and runs
+/// `execution_ownership_ttl_secs` past its `updated_at`. A plain read: it
+/// takes no lock, and both remainders are against the database's `NOW()`.
+pub async fn restore_ownership_snapshot(
+    executor: impl PgExecutor<'_>,
+    sandbox_id: SandboxId,
+    execution_ownership_ttl_secs: i64,
+) -> Result<Option<RestoreOwnershipSnapshot>, sqlx::Error> {
+    let row: Option<(String, Option<String>, f64, f64)> = sqlx::query_as(sql!(
+        "SELECT lifecycle,
+                    evacuation_restore_target,
+                    GREATEST(
+                        EXTRACT(EPOCH FROM (restore_lease_expires_at - NOW())),
+                        0.0
+                    )::float8,
+                    GREATEST(
+                        CASE
+                          WHEN e.state IN ('creating', 'created', 'recovering', 'running')
+                          THEN EXTRACT(EPOCH FROM (
+                              e.updated_at + make_interval(secs => $2) - NOW()
+                          ))
+                          ELSE 0.0
+                        END,
+                        0.0
+                    )::float8
+               FROM sandboxes s
+               LEFT JOIN sandbox_k8s_executions e
+                 ON e.sandbox_id = s.id AND e.active
+              WHERE s.id = $1"
+    ))
+    .bind(sandbox_id.as_uuid())
+    .bind(execution_ownership_ttl_secs)
+    .fetch_optional(executor)
+    .await?;
+    Ok(row.map(
+        |(lifecycle, evacuation_restore_target, lease_remaining_secs, execution_remaining_secs)| {
+            RestoreOwnershipSnapshot {
+                lifecycle,
+                evacuation_restore_target,
+                lease_remaining_secs,
+                execution_remaining_secs,
+            }
+        },
+    ))
+}
+
+/// What [`observe_user_restores`] reads of one row: the
+/// [`RestoreOwnershipSnapshot`] fields, and the active execution's
+/// generation, state, pod name and pod IP (`host(pod_ip)`), all `None`
+/// without one.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UserRestoreObservationRow {
+    pub sandbox_id: SandboxId,
+    pub lifecycle: String,
+    pub evacuation_restore_target: Option<String>,
+    pub lease_remaining_secs: f64,
+    pub execution_remaining_secs: f64,
+    pub generation: Option<i64>,
+    pub execution_state: Option<String>,
+    pub pod_name: Option<String>,
+    pub pod_ip: Option<String>,
+}
+
+/// Read the restore gate and active execution of every row in `sandbox_ids`,
+/// in one statement, so each row's lifecycle, lease, marker and execution
+/// are read together. Rows that don't exist are missing from the result.
+///
+/// The remainders are as [`restore_ownership_snapshot`] computes them. A
+/// plain read: it takes no lock.
+pub async fn observe_user_restores(
+    executor: impl PgExecutor<'_>,
+    sandbox_ids: &[SandboxId],
+    execution_ownership_ttl_secs: i64,
+) -> Result<Vec<UserRestoreObservationRow>, sqlx::Error> {
+    type Row = (
+        Uuid,
+        String,
+        Option<String>,
+        f64,
+        f64,
+        Option<i64>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    );
+    let rows = sqlx::query_as::<_, Row>(sql!(
+        "SELECT s.id,
+                    s.lifecycle,
+                    s.evacuation_restore_target,
+                    GREATEST(EXTRACT(EPOCH FROM (s.restore_lease_expires_at - NOW())), 0.0)::float8,
+                    GREATEST(
+                        CASE
+                          WHEN e.state IN ('creating', 'created', 'recovering', 'running')
+                          THEN EXTRACT(EPOCH FROM (
+                              e.updated_at + make_interval(secs => $2) - NOW()
+                          ))
+                          ELSE 0.0
+                        END,
+                        0.0
+                    )::float8,
+                    e.generation,
+                    e.state,
+                    e.pod_name,
+                    host(e.pod_ip)
+               FROM sandboxes s
+               LEFT JOIN sandbox_k8s_executions e
+                 ON e.sandbox_id = s.id AND e.active
+              WHERE s.id = ANY($1)"
+    ))
+    .bind(
+        sandbox_ids
+            .iter()
+            .map(|sandbox_id| sandbox_id.as_uuid())
+            .collect::<Vec<_>>(),
+    )
+    .bind(execution_ownership_ttl_secs)
+    .fetch_all(executor)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(
+            |(
+                sandbox_id,
+                lifecycle,
+                evacuation_restore_target,
+                lease_remaining_secs,
+                execution_remaining_secs,
+                generation,
+                execution_state,
+                pod_name,
+                pod_ip,
+            )| UserRestoreObservationRow {
+                sandbox_id: SandboxId::from_uuid(sandbox_id),
+                lifecycle,
+                evacuation_restore_target,
+                lease_remaining_secs,
+                execution_remaining_secs,
+                generation,
+                execution_state,
+                pod_name,
+                pod_ip,
+            },
+        )
+        .collect())
 }

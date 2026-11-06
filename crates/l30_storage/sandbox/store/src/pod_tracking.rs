@@ -1,7 +1,8 @@
 //! Guarded writes the Kubernetes substrate makes to `sandboxes` when it
 //! forgets a sandbox's tracked pod: unplacing the row, and recovering a
 //! `restoring` or `started` row to `suspended` once its execution's cleanup
-//! leaves nothing running.
+//! leaves nothing running. Also the read that decides whether retiring the
+//! executions a `stopped` row's stop left active must refuse.
 //!
 //! The Kubernetes store keeps everything around these statements: the
 //! sandbox row lock (`SELECT ... FOR UPDATE`), the transaction, the
@@ -279,4 +280,58 @@ async fn recover_started_with_current_suspend_snapshot(
         .execute(&mut **tx)
         .await?;
     Ok(result.rows_affected() > 0)
+}
+
+/// Whether retiring the executions a `stopped` row's stop left active must
+/// refuse. Reads only.
+///
+/// It refuses when any of these holds:
+///
+/// * an active execution that doesn't predate the row's current stop: the row
+///   is no longer `stopped`, or the execution was created after its
+///   `lifecycle_changed_at`;
+/// * an active execution holding an activation attempt that hasn't expired,
+///   or that has no expiry;
+/// * no row carries the `'stopped'` evacuation marker. A start moves the
+///   lifecycle, and `sandboxes_clear_evacuation_restore_target` clears the
+///   marker on any lifecycle change to a value other than `suspending`,
+///   `suspended` or `restoring`, so a start→stop cycle since the drain's last
+///   read refuses here.
+///
+/// The caller holds the sandbox row lock that execution creation also takes,
+/// and retires in the same transaction, so the answer holds until it commits.
+pub async fn stopped_execution_retirement_refused(
+    tx: &mut Transaction<'_, Postgres>,
+    sandbox_id: SandboxId,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar(sql!(
+        "SELECT EXISTS (
+                        SELECT 1
+                          FROM sandbox_k8s_executions execution
+                          JOIN sandboxes sandbox ON sandbox.id = execution.sandbox_id
+                         WHERE execution.sandbox_id = $1
+                           AND execution.active
+                           AND NOT (
+                               sandbox.lifecycle = 'stopped'
+                               AND execution.created_at <= sandbox.lifecycle_changed_at
+                           )
+                    )
+                 OR EXISTS (
+                        SELECT 1
+                          FROM sandbox_k8s_executions execution
+                         WHERE execution.sandbox_id = $1
+                           AND execution.active
+                           AND execution.activation_attempt_id IS NOT NULL
+                           AND COALESCE(execution.activation_attempt_expires_at > NOW(), TRUE)
+                    )
+                 OR NOT EXISTS (
+                        SELECT 1
+                          FROM sandboxes
+                         WHERE id = $1
+                           AND evacuation_restore_target = 'stopped'
+                    )"
+    ))
+    .bind(sandbox_id)
+    .fetch_one(&mut **tx)
+    .await
 }
