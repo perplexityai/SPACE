@@ -89,7 +89,8 @@ pub(super) const TEARDOWN_SUSPEND_DURABILITY_BUDGET: Duration = Duration::from_s
 pub(super) const TEARDOWN_NODE_DELETE_WAIT_BUDGET: Duration = Duration::from_secs(10);
 /// How long a Delete teardown whose node delete outlasted its wait budget asks
 /// sbx-mgr whether the delete was admitted. The state read takes no cleanup
-/// permit, so a healthy node answers in milliseconds.
+/// request permit, only a turn at sbx-mgr's storage, so a node that answers
+/// slower than this is treated as not having admitted the delete.
 pub(super) const TEARDOWN_NODE_DELETE_ADMISSION_PROBE: Duration = Duration::from_secs(2);
 const MAX_LOGGED_SUSPEND_PENDING_REASON_BYTES: usize = 512;
 const MAX_SUSPEND_PENDING_REASON_LOGS: u8 = 3;

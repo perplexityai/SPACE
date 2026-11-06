@@ -37,6 +37,7 @@ fn cluster_delete_miss_reason(err: &SubstrateError) -> &'static str {
         // cancelled — local teardown is unconfirmed.
         SubstrateError::Failed { .. } => "node_delete_failed",
         SubstrateError::RetainedFilesystemOnlyCopy { .. } => "retained_filesystem_only_copy",
+        SubstrateError::NodeDeleteNotAdmitted { .. } => "node_delete_not_admitted",
         SubstrateError::Timeout { .. } => "node_delete_timeout",
         SubstrateError::Cancelled { .. } => "node_delete_cancelled",
         // The node had no such sandbox — local state is already gone (not an
@@ -55,7 +56,9 @@ fn cluster_delete_miss_reason(err: &SubstrateError) -> &'static str {
 fn cluster_delete_must_defer_control_plane(err: &SubstrateError) -> bool {
     matches!(
         err,
-        SubstrateError::SuspendInFlight { .. } | SubstrateError::RetainedFilesystemOnlyCopy { .. }
+        SubstrateError::SuspendInFlight { .. }
+            | SubstrateError::RetainedFilesystemOnlyCopy { .. }
+            | SubstrateError::NodeDeleteNotAdmitted { .. }
     )
 }
 

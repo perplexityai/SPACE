@@ -36,12 +36,12 @@ fn fenced_runtime_pod_ip(
     assigned_pod_ip(live_pod).ok().flatten()
 }
 
-/// Whether the node reports `sandbox_id` outside `deleting` after a blocking
-/// delete outlasted the teardown's wait budget, meaning sbx-mgr has not yet
-/// run the delete's admission refusals. An absent row was deleted. A failed or
-/// slow probe tells nothing, so it reads as admitted, as an unreachable node
-/// does.
-async fn node_delete_not_yet_admitted(client: &mut RuntimeClient, sandbox_id: SandboxId) -> bool {
+/// Whether the node reports a blocking delete that outlasted the teardown's
+/// wait budget as admitted: the row is in `deleting`, which sbx-mgr enters
+/// only after the delete's refusals pass, or it is gone. Anything else,
+/// including a probe that fails or does not answer in time, means the refusals
+/// may not have run.
+async fn node_delete_admitted(client: &mut RuntimeClient, sandbox_id: SandboxId) -> bool {
     use pplx_space_sbx_mgr_client::proto::{SandboxLifecycleState, StateRequest};
     let probe = client.sandbox_state(StateRequest {
         sandbox_ids: vec![sandbox_id.to_string()],
@@ -54,7 +54,7 @@ async fn node_delete_not_yet_admitted(client: &mut RuntimeClient, sandbox_id: Sa
         .into_inner()
         .sandboxes
         .iter()
-        .any(|sandbox| sandbox.lifecycle() != SandboxLifecycleState::Deleting)
+        .all(|sandbox| sandbox.lifecycle() == SandboxLifecycleState::Deleting)
 }
 
 /// Project the world as it is now into the same shape the fence carries, so
@@ -586,21 +586,22 @@ impl KubernetesSubstrate {
                         Ok(Ok(_)) => None,
                         Ok(Err(error)) => Some(error),
                         Err(_elapsed) => {
-                            // sbx-mgr checks its admission refusals (suspend
+                            // sbx-mgr runs the delete's refusals (suspend
                             // pending, retained only copy) when it moves the
-                            // row to `deleting`, before the cleanup work. A
-                            // delete admitted past them is cleanup progress
-                            // that sbx-mgr's durable cleanup job owns, so the
-                            // teardown continues as it does for the
-                            // UNAVAILABLE a node at its cgroup deadline
-                            // returns. A delete still queued for a cleanup
-                            // permit or fence has not been checked yet, so the
-                            // teardown defers and retries rather than skip the
-                            // refusals.
-                            if node_delete_not_yet_admitted(&mut client, sandbox_id).await {
-                                return Err(SubstrateError::SuspendInFlight {
+                            // row to `deleting`. Past that point its cleanup
+                            // executor owns the work: dropping this request
+                            // drops only the waiter, and the executor's
+                            // recovery scan adopts a `deleting` row whose job
+                            // was not yet persisted. So an admitted delete
+                            // continues, as the UNAVAILABLE a node at its
+                            // cgroup deadline does. A delete still queued for
+                            // a cleanup permit or fence has not been checked,
+                            // so the teardown defers and the operation retries
+                            // it within its retry budget.
+                            if !node_delete_admitted(&mut client, sandbox_id).await {
+                                return Err(SubstrateError::NodeDeleteNotAdmitted {
                                     message: format!(
-                                        "sandbox {sandbox_id} node-local delete was not admitted within the {}ms teardown wait budget; retry the delete",
+                                        "sandbox {sandbox_id} node-local delete was not confirmed admitted within the {}ms teardown wait budget; retry the delete",
                                         node_delete_wait.as_millis()
                                     ),
                                 });
