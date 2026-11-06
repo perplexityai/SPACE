@@ -218,7 +218,7 @@ impl SandboxManagerService {
             let template = &req.template;
             let runtime = &req.runtime;
 
-            use pplx_space_common_svc::template_lookup::TemplateLookupScope;
+            use pplx_space_rpc_auth::template_lookup::TemplateLookupScope;
             let mut scope = template_lookup_scope(&sandbox_owner, req.sandbox_id.as_deref())?;
             if peer.principal() == UdsPeerPrincipal::Service(user_names::SPACE_NODEAPI) {
                 scope = match (scope, TemplateLookupScope::from_request(&request)?) {

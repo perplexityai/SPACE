@@ -1,5 +1,5 @@
 use pplx_space_common_core::types::OrgId;
-use pplx_space_common_svc::template_lookup::TemplateLookupScope;
+use pplx_space_rpc_auth::template_lookup::TemplateLookupScope;
 
 use super::metadata::*;
 use super::status::*;
@@ -89,10 +89,10 @@ impl ClusterApiService {
         request: &Request<T>,
     ) -> Result<super::template_releases_store::TemplateReadScope, Status> {
         use super::template_releases_store::TemplateReadScope;
-        use pplx_space_common_svc::auth::{
+        use pplx_space_metrics::auth::{TemplateNodeBinding, template_node_binding};
+        use pplx_space_rpc_auth::{
             AuthenticatedNodeIdentity, NodeApiAuthenticatedCaller, TemplateReleaseReadAuthority,
         };
-        use pplx_space_metrics::auth::{TemplateNodeBinding, template_node_binding};
 
         let Some(caller) = request.extensions().get::<NodeApiAuthenticatedCaller>() else {
             return Ok(TemplateReadScope::Unscoped);
@@ -152,7 +152,7 @@ impl ClusterApi for ClusterApiService {
         &self,
         request: Request<CreateSystemTemplatePublicationGrantRequest>,
     ) -> Result<Response<CreateSystemTemplatePublicationGrantResponse>, Status> {
-        pplx_space_common_svc::auth::build::authorize_system_publication_grant(&request)?;
+        pplx_space_rpc_auth::build::authorize_system_publication_grant(&request)?;
         let template = template_publication::parse_template_name(&request.get_ref().template_name)?;
         let mut tx = self.pool.begin().await.map_err(|error| {
             Status::internal(format!("begin system publication grant: {error}"))
@@ -196,17 +196,16 @@ impl ClusterApi for ClusterApiService {
         &self,
         request: Request<RegisterTemplateRequest>,
     ) -> Result<Response<RegisterTemplateResponse>, Status> {
-        pplx_space_common_svc::auth::build::authorize_template_build(
+        pplx_space_rpc_auth::build::authorize_template_build(
             &request,
             request.get_ref().org_id.as_deref(),
         )?;
         let requires_grant =
-            pplx_space_common_svc::auth::build::system_publication_requires_grant(&request);
+            pplx_space_rpc_auth::build::system_publication_requires_grant(&request);
         let requires_tenant_grant =
-            pplx_space_common_svc::auth::build::tenant_publication_requires_grant(&request);
+            pplx_space_rpc_auth::build::tenant_publication_requires_grant(&request);
         let publisher_addr = request.remote_addr();
-        let publisher_node =
-            pplx_space_common_svc::auth::build::publication_node(&request).cloned();
+        let publisher_node = pplx_space_rpc_auth::build::publication_node(&request).cloned();
         let request = request.into_inner();
         let name = template_publication::parse_template_name(&request.name)?;
         let description = optional_trimmed(request.description.as_deref());
@@ -301,17 +300,16 @@ impl ClusterApi for ClusterApiService {
         &self,
         request: Request<RegisterTemplateReleaseRequest>,
     ) -> Result<Response<RegisterTemplateReleaseResponse>, Status> {
-        pplx_space_common_svc::auth::build::authorize_template_build(
+        pplx_space_rpc_auth::build::authorize_template_build(
             &request,
             request.get_ref().org_id.as_deref(),
         )?;
         let requires_grant =
-            pplx_space_common_svc::auth::build::system_publication_requires_grant(&request);
+            pplx_space_rpc_auth::build::system_publication_requires_grant(&request);
         let requires_tenant_grant =
-            pplx_space_common_svc::auth::build::tenant_publication_requires_grant(&request);
+            pplx_space_rpc_auth::build::tenant_publication_requires_grant(&request);
         let publisher_addr = request.remote_addr();
-        let publisher_node =
-            pplx_space_common_svc::auth::build::publication_node(&request).cloned();
+        let publisher_node = pplx_space_rpc_auth::build::publication_node(&request).cloned();
         let request = request.into_inner();
         let template_name = template_publication::parse_template_name(&request.template_name)?;
         let runtime = validated_template_runtime(&request.runtime)?;
@@ -1385,9 +1383,9 @@ impl ClusterApi for ClusterApiService {
             .min(pplx_space_common_svc::ingress_admission::preparation_timeout());
         let refresh_authority = request
             .extensions()
-            .get::<pplx_space_common_svc::auth::NodeApiAuthenticatedCaller>()
+            .get::<pplx_space_rpc_auth::NodeApiAuthenticatedCaller>()
             .map(
-                pplx_space_common_svc::auth::NodeApiAuthenticatedCaller::data_plane_session_refresh_authority,
+                pplx_space_rpc_auth::NodeApiAuthenticatedCaller::data_plane_session_refresh_authority,
             );
         let response = tokio::time::timeout(
             budget,

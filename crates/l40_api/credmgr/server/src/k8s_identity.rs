@@ -267,7 +267,7 @@ impl CredmgrTokenReviewer {
         let rate_limiter = Arc::new(ReviewRateLimiter::new(config.review_rate_per_sec));
         let pod_api = kube::Api::namespaced(client.clone(), config.namespace());
         let (pods, writer) = reflector::store();
-        pplx_space_common_svc::kube_client::spawn_reflector(
+        pplx_space_kube_client::spawn_reflector(
             "credential-manager caller pods",
             writer,
             pod_api,

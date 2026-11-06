@@ -61,7 +61,7 @@ impl ClusterApiService {
     pub(super) async fn publisher_nodes(
         &self,
         remote_addr: Option<std::net::SocketAddr>,
-        node: Option<&pplx_space_common_svc::auth::build::AuthenticatedBuildNode>,
+        node: Option<&pplx_space_rpc_auth::build::AuthenticatedBuildNode>,
     ) -> Result<Vec<NodeId>, Status> {
         use super::template_releases_store::TemplateReadScope;
         if let Some(node) = node {

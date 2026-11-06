@@ -7,7 +7,6 @@ use std::sync::{
 };
 
 use pplx_space_common_core::sql;
-use pplx_space_common_svc::auth::{NodeApiAuthenticatedCaller, build::BuildAuthenticatedCaller};
 use pplx_space_credmgr::{
     auth::{ClientService, K8sIdentity},
     in_memory::InMemoryKeyWrapper,
@@ -19,6 +18,7 @@ use pplx_space_credmgr::{
 use pplx_space_db_test_fixtures::{SEED_ORG_ID, pg_test_db};
 use pplx_space_internal_api_server::ClusterApiService;
 use pplx_space_node_api_client::proto::cluster_api_server::ClusterApiServer;
+use pplx_space_rpc_auth::{NodeApiAuthenticatedCaller, build::BuildAuthenticatedCaller};
 use pplx_space_test_env::{TestResult, enter_test_process};
 use tokio_stream::wrappers::{TcpListenerStream, UnixListenerStream};
 use tokio_util::sync::CancellationToken;

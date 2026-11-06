@@ -1,6 +1,6 @@
 use pplx_space_build_mgr_client::proto::build_manager_server::BuildManagerServer;
-use pplx_space_common_svc::auth::build::BuildAuthLayer;
-use pplx_space_common_svc::auth::test_support::{
+use pplx_space_rpc_auth::build::BuildAuthLayer;
+use pplx_space_rpc_auth::test_support::{
     TokenReviewStatus, kubeconfig_for_endpoint, projected_token, service_account_status,
     token_review_service,
 };

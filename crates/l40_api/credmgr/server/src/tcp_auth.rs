@@ -114,7 +114,7 @@ impl CredmgrTcpAuthLayer {
         database_pool: sqlx::PgPool,
         shutdown: CancellationToken,
     ) -> Result<Self, K8sAuthConfigError> {
-        let client = pplx_space_common_svc::kube_client::traced_kube_client_from_env().await?;
+        let client = pplx_space_kube_client::traced_kube_client_from_env().await?;
         let reviewer = CredmgrTokenReviewer::new(config, client, database_pool, shutdown);
         tracing::info!(
             mode = "k8s_token_review",

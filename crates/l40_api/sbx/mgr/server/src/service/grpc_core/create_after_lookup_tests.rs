@@ -124,7 +124,7 @@ impl TemplateBuild {
         let response = self.response(build);
         Arc::new(FakeTemplateResolver::new(move || {
             let mut response = tonic::Response::new(response.clone());
-            pplx_space_common_svc::template_lookup::TemplateLookupScope::LocalExecution
+            pplx_space_rpc_auth::template_lookup::TemplateLookupScope::LocalExecution
                 .receipt(&mut response);
             Ok(response)
         }))

@@ -27,7 +27,7 @@ kubernetes = [
     "dep:k8s-openapi",
     "dep:kube",
     "pplx-space-common-core/kubernetes",
-    "pplx-space-common-svc/k8s",
+    "dep:pplx-space-kube-client",
 ]
 
 [dependencies]
@@ -35,9 +35,11 @@ dashmap = { workspace = true }
 futures-util = { workspace = true }
 k8s-openapi = { workspace = true, features = ["v1_32"], optional = true }
 kube = { workspace = true, default-features = false, features = ["aws-lc-rs", "client", "config", "rustls-tls"], optional = true }
+pplx-space-bearer-token = { workspace = true }
 pplx-space-common-core = { workspace = true }
 pplx-space-common-grpc = { workspace = true, features = ["internal-tls"] }
 pplx-space-common-svc = { workspace = true }
+pplx-space-kube-client = { workspace = true, optional = true }
 pplx-space-sqlite = { workspace = true }
 pplx-space-execution-common = { workspace = true }
 pplx-space-net-common = { workspace = true }

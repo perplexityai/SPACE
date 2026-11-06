@@ -12,8 +12,8 @@ use super::{
     AuthenticatedBuildNode, BuildAuthError, BuildAuthenticatedCaller, BuildSurface,
     SystemTemplateAuthority, TenantTemplateAuthority,
 };
-use crate::auth::is_jwt_shaped;
-use crate::auth::k8s::{
+use crate::is_jwt_shaped;
+use crate::k8s::{
     InFlightState, K8sTokenAuthConfig, Lookup, TokenCacheKey, TokenReviewCache,
     accepted_token_cache_expiry,
 };
@@ -158,7 +158,7 @@ impl BuildTokenReviewer {
             .unwrap_or(50)
             .max(1);
         Ok(Self {
-            reviews: kube::Api::all(crate::kube_client::traced_kube_client_from_env().await?),
+            reviews: kube::Api::all(pplx_space_kube_client::traced_kube_client_from_env().await?),
             policy,
             surface,
             permits: tokio::sync::Semaphore::new(config.max_inflight_reviews),

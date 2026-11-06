@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use pplx_space_build_mgr_client::GRPC_MESSAGE_SIZE_LIMIT_BYTES;
 use pplx_space_build_mgr_client::proto::build_manager_server::BuildManagerServer;
-use pplx_space_common_svc::auth::build::BuildAuthLayer;
+use pplx_space_rpc_auth::build::BuildAuthLayer;
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 use tonic::transport::server::TcpIncoming;
@@ -68,7 +68,7 @@ pub enum RunBuildMgrError {
     #[error("failed to resolve the build-manager internal bearer token: {message}")]
     AuthToken { message: String },
     #[error("failed to configure build-manager authentication: {0}")]
-    AuthConfig(#[from] pplx_space_common_svc::auth::build::BuildAuthError),
+    AuthConfig(#[from] pplx_space_rpc_auth::build::BuildAuthError),
     #[error("failed to bind the build-manager TCP listener {listen}: {source}")]
     BindListener {
         listen: SocketAddr,
@@ -115,12 +115,11 @@ pub async fn run(
     let service =
         BuildManagerDaemonService::new(&config.db_path, config.max_concurrent_builds.max(1))
             .map_err(RunBuildMgrError::InitService)?;
-    let auth_token = pplx_space_common_svc::auth::required_bearer_token(
-        pplx_space_common_svc::auth::SPACE_INTERNAL_TOKEN_ENV,
-    )
-    .map_err(|status| RunBuildMgrError::AuthToken {
-        message: status.message().to_owned(),
-    })?;
+    let auth_token =
+        pplx_space_rpc_auth::required_bearer_token(pplx_space_rpc_auth::SPACE_INTERNAL_TOKEN_ENV)
+            .map_err(|status| RunBuildMgrError::AuthToken {
+            message: status.message().to_owned(),
+        })?;
     let auth_layer = BuildAuthLayer::for_build_manager(auth_token).await?;
     service.recover_jobs();
     let background_token = CancellationToken::new();

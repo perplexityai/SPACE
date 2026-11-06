@@ -1,7 +1,7 @@
 use tonic::{Request, Status};
 
 use super::NodeApiAuthenticatedCaller;
-use crate::peer_auth::UdsPeerPrincipal;
+use pplx_space_uds_peer_auth::UdsPeerPrincipal;
 
 const TRANSFER_AUTHORITY_HEADER: &str = "x-space-template-transfer-authority";
 
@@ -47,7 +47,7 @@ pub fn authorize_forwarded_template_export<T>(
 ) -> Result<(), Status> {
     if peer
         == UdsPeerPrincipal::Service(
-            crate::core::host::linux::identities::user_names::SPACE_NODEAPI,
+            pplx_space_common_core::host::linux::identities::user_names::SPACE_NODEAPI,
         )
         && request
             .metadata()

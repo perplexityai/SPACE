@@ -11,7 +11,7 @@ publish.workspace = true
 workspace = true
 
 [features]
-test-hooks = ["pplx-space-common-svc/test-hooks"]
+test-hooks = ["pplx-space-rpc-auth/test-hooks"]
 default = []
 otel = ["pplx-space-template-mgr-client/otel"]
 datadog = ["otel", "pplx-space-template-mgr-client/datadog"]
@@ -20,9 +20,9 @@ datadog-otel = ["otel", "datadog"]
 # Opt-in Kubernetes projected-token (TokenReview) auth, which pulls in the kube
 # stack. Off by default so the workspace builds without kube for non-k8s
 # deployments (dev box, UTM, self-deploy); prod image builds enable it. Forwards
-# to `common-svc`'s `k8s` feature, which is where the node-api auth layer this
+# to `rpc-auth`'s `k8s` feature, which is where the node-api auth layer this
 # crate installs reads its TokenReview configuration.
-k8s = ["pplx-space-common-svc/k8s", "dep:kube"]
+k8s = ["pplx-space-rpc-auth/k8s", "dep:kube"]
 
 [dependencies]
 bytes = { workspace = true }
@@ -58,6 +58,7 @@ pplx-space-net-common = { workspace = true, features = ["serde"] }
 pplx-space-net-gateway-client = { workspace = true }
 pplx-space-node-api-client = { workspace = true }
 pplx-space-node-mgr-client = { workspace = true }
+pplx-space-rpc-auth = { workspace = true }
 pplx-space-sbx-mgr-client = { workspace = true }
 pplx-space-template-mgr-client = { workspace = true }
 
@@ -65,8 +66,8 @@ pplx-space-template-mgr-client = { workspace = true }
 prost = { workspace = true }
 rstest = { workspace = true }
 axum = { workspace = true }
+pplx-space-rpc-auth = { workspace = true, features = ["test-hooks", "test-support"] }
 pplx-space-test-env = { workspace = true }
-pplx-space-common-svc = { workspace = true, features = ["test-support", "test-hooks"] }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt", "time", "test-util"] }
 tonic = { workspace = true }

@@ -121,6 +121,7 @@ members = [
     "crates/l10_foundation/common/proto/build",
     "crates/l10_foundation/common/work/coalescer",
     "crates/libs/common/svc",
+    "crates/l40_api/rpc/auth",
     "crates/l10_foundation/content/digest",
     "crates/l10_foundation/cpu/arch",
     "crates/l40_api/data/plane/server",
@@ -445,6 +446,7 @@ pplx-space-linux-ids = { path = "crates/l10_foundation/linux/ids" }
 pplx-space-network-roles = { path = "crates/l20_domain/network/roles" }
 pplx-space-auto-lifecycle = { path = "crates/l20_domain/auto/lifecycle/policy" }
 pplx-space-pii = { path = "crates/l10_foundation/pii" }
+pplx-space-rpc-auth = { path = "crates/l40_api/rpc/auth" }
 pplx-space-rpc-contracts = { path = "crates/l20_domain/rpc/contracts" }
 pplx-space-btrfs = { path = "crates/l10_foundation/btrfs" }
 pplx-space-db-identity = { path = "crates/l20_domain/db/identity" }

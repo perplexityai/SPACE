@@ -7,7 +7,7 @@ use crate::proto::{
 use pplx_space_build_mgr_client::proto as build_proto;
 use pplx_space_common_core::types::{NodeId, SystemTemplate};
 use pplx_space_common_grpc::{RequestAdmission, fwd_retry};
-use pplx_space_common_svc::auth::build::authorize_template_build;
+use pplx_space_rpc_auth::build::authorize_template_build;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 use tonic::{Code, Request, Response, Status};
@@ -75,7 +75,7 @@ impl BuilderApi for BuilderApiService {
         r: Request<pplx_space_template_mgr_client::proto::DeleteTemplateRequest>,
     ) -> Result<Response<pplx_space_template_mgr_client::proto::DeleteTemplateResponse>, Status>
     {
-        pplx_space_common_svc::auth::template::require_template_mutation_authority(&r)?;
+        pplx_space_rpc_auth::template::require_template_mutation_authority(&r)?;
         fwd!(self.clients.tmpl(), delete_template, r)
     }
 
@@ -84,7 +84,7 @@ impl BuilderApi for BuilderApiService {
         r: Request<pplx_space_template_mgr_client::proto::DeleteTemplateBuildRequest>,
     ) -> Result<Response<pplx_space_template_mgr_client::proto::DeleteTemplateBuildResponse>, Status>
     {
-        pplx_space_common_svc::auth::template::require_template_mutation_authority(&r)?;
+        pplx_space_rpc_auth::template::require_template_mutation_authority(&r)?;
         fwd!(self.clients.tmpl(), delete_template_build, r)
     }
 
@@ -108,7 +108,7 @@ impl BuilderApi for BuilderApiService {
         r: Request<pplx_space_template_mgr_client::proto::ExportTemplateRequest>,
     ) -> Result<Response<Self::NodeExportTemplateStream>, Status> {
         let mut r = r;
-        pplx_space_common_svc::auth::template_transfer::prepare_template_export(&mut r)?;
+        pplx_space_rpc_auth::template_transfer::prepare_template_export(&mut r)?;
         Ok(self.clients.tmpl().export_template(r).await?)
     }
 
@@ -116,7 +116,7 @@ impl BuilderApi for BuilderApiService {
         &self,
         mut r: Request<crate::proto::PullTemplateRequest>,
     ) -> Result<Response<crate::proto::PullTemplateResponse>, Status> {
-        pplx_space_common_svc::auth::template_transfer::require_template_transfer_authority(&r)?;
+        pplx_space_rpc_auth::template_transfer::require_template_transfer_authority(&r)?;
         let scope = crate::template_lookup::bind_caller_scope(&mut r)?;
         let req = r.into_inner();
         let resp = crate::transfer::pull_template(&mut self.clients.tmpl(), &req, scope).await?;

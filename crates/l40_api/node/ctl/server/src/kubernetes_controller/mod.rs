@@ -48,7 +48,7 @@ impl Controller {
             return Ok(None);
         };
 
-        let kube = pplx_space_common_svc::kube_client::traced_kube_client_from_env().await?;
+        let kube = pplx_space_kube_client::traced_kube_client_from_env().await?;
         let node_cache = node_watch::spawn(kube.clone(), node_name.clone(), shutdown.child_token());
 
         tracing::info!(%node_name, "space Kubernetes node-local controller starting");

@@ -1535,8 +1535,8 @@ async fn serve_tcp_until(
                 %addr,
                 "credential manager TCP listener using static-token auth only (k8sAuth disabled)"
             );
-            let static_token = pplx_space_common_svc::auth::required_bearer_token(
-                pplx_space_common_svc::auth::SPACE_INTERNAL_TOKEN_ENV,
+            let static_token = pplx_space_rpc_auth::required_bearer_token(
+                pplx_space_rpc_auth::SPACE_INTERNAL_TOKEN_ENV,
             )
             .map_err(ServeError::InternalToken)?;
             crate::tcp_auth::CredmgrTcpAuthLayer::static_token(static_token)

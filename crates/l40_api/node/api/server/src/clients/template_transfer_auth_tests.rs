@@ -4,7 +4,7 @@ use std::sync::{
 };
 
 use pplx_space_common_core::types::NodeId;
-use pplx_space_common_svc::auth::NodeRole;
+use pplx_space_rpc_auth::NodeRole;
 use pplx_space_template_mgr_client::proto as tmpl;
 use rstest::rstest;
 use tokio_stream::wrappers::TcpListenerStream;

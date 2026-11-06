@@ -14,11 +14,9 @@ use crate::{
     worker::WorkerApiService,
 };
 use axum::{Router, body::Body, routing::any};
-use pplx_space_common_svc::{
-    auth::{NodeApiAuthConfig, NodeApiAuthLayer, NodeRole},
-    bootstrap::wrap_grpc_client_channel,
-};
+use pplx_space_common_svc::bootstrap::wrap_grpc_client_channel;
 use pplx_space_net_common::{NetworkPolicyV1, proto::PolicyAuthority};
+use pplx_space_rpc_auth::{NodeApiAuthConfig, NodeApiAuthLayer, NodeRole};
 use pplx_space_sbx_mgr_client::proto as sbx;
 use pplx_space_template_mgr_client::proto as tmpl;
 
@@ -227,7 +225,7 @@ async fn policy_rpc_authentication_reaches_handlers() {
                         .map(|_| ()),
                 };
                 if matches!(rpc, Rpc::Create) && result.is_ok() {
-                    use pplx_space_common_svc::template_lookup::TemplateLookupScope;
+                    use pplx_space_rpc_auth::template_lookup::TemplateLookupScope;
                     let expected = if trusted {
                         TemplateLookupScope::Cluster
                     } else {

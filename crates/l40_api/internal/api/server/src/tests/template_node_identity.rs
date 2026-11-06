@@ -1,6 +1,6 @@
 use super::*;
 use crate::proto::{cluster_api_client::ClusterApiClient, cluster_api_server::ClusterApiServer};
-use pplx_space_common_svc::auth::{
+use pplx_space_rpc_auth::{
     NodeApiAuthConfig, NodeApiAuthLayer, NodeRole,
     test_support::{
         pod_bound_service_account_status, projected_token, serve_token_reviews,

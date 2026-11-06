@@ -13,7 +13,7 @@ use kube::{
     },
 };
 use pplx_space_common_core::types::NodeRole as SpaceNodeRole;
-use pplx_space_common_svc::kube_client::spawn_reflector;
+use pplx_space_kube_client::spawn_reflector;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 

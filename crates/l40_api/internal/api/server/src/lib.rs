@@ -4,15 +4,15 @@
 //!
 //! Proto types and the generated `ClusterApi` service come from the shared
 //! `pplx-space-node-api-client` crate; auth helpers come from
-//! `pplx-space-common-svc`. Both are re-exported as `crate::proto` / `crate::auth`
+//! `pplx-space-rpc-auth`. Both are re-exported as `crate::proto` / `crate::auth`
 //! so the moved modules resolve those paths unchanged.
 //!
 //! This crate is the whole service. The `space-internal-api-svc` binary is a
 //! thin `main` that parses flags, initializes telemetry, and calls [`run`], so
 //! a deployment that needs private wiring can supply its own `main` against
 //! this library without copying any of the service.
-pub use pplx_space_common_svc::auth;
 pub use pplx_space_node_api_client::proto;
+pub use pplx_space_rpc_auth as auth;
 
 mod api_key_store;
 pub mod node_info;

@@ -1,12 +1,12 @@
 use crate::volume::{PullFailure, PullOutcome, PullTrigger, VolumePuller};
 use pplx_space_common_core::types::OrgId;
-use pplx_space_common_svc::auth::{NodeApiAuthConfig, NodeApiAuthLayer, NodeRole};
-use pplx_space_common_svc::template_lookup::TemplateLookupScope;
 use pplx_space_internal_api_server::ClusterApiService;
 use pplx_space_node_api_client::proto::{
     RegisterTemplateReleaseRequest, RegisterTemplateRequest, TemplateVisibility,
     cluster_api_server::{ClusterApi, ClusterApiServer},
 };
+use pplx_space_rpc_auth::template_lookup::TemplateLookupScope;
+use pplx_space_rpc_auth::{NodeApiAuthConfig, NodeApiAuthLayer, NodeRole};
 use pplx_space_test_env::{TestEnv, TestResult, enter_test_process};
 use std::ffi::OsStr;
 use std::sync::{Arc, Mutex};
@@ -32,9 +32,9 @@ impl Drop for Catalog {
 
 fn publisher<T>(body: T) -> tonic::Request<T> {
     let mut request = tonic::Request::new(body);
-    request.extensions_mut().insert(
-        pplx_space_common_svc::auth::build::BuildAuthenticatedCaller::trusted_by_configuration(),
-    );
+    request
+        .extensions_mut()
+        .insert(pplx_space_rpc_auth::build::BuildAuthenticatedCaller::trusted_by_configuration());
     request
 }
 
@@ -186,11 +186,11 @@ async fn assert_pull_outcome(visibility: TemplateVisibility, trigger: PullTrigge
 
 #[tokio::test]
 async fn catalog_receipts_preserve_legacy_org_checks() -> TestResult {
-    use pplx_space_common_svc::template_lookup::TemplateLookupScope;
     use pplx_space_node_api_client::proto::{
         FindTemplateReleaseByHashRequest, FindTemplateReleaseRequest,
         cluster_api_client::ClusterApiClient,
     };
+    use pplx_space_rpc_auth::template_lookup::TemplateLookupScope;
     let catalog = Catalog::start(TemplateVisibility::OrgSpecific).await?;
     let mut client = ClusterApiClient::connect(catalog.endpoint.clone()).await?;
     let digest = format!("sha256:{}", "a".repeat(64));

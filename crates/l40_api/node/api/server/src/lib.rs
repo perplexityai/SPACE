@@ -20,11 +20,11 @@ pub mod transfer;
 pub mod uds_per_sandbox_limiter;
 pub mod worker;
 
-// `auth` (generic gRPC bearer plumbing) now lives in `pplx-space-common-svc`.
+// `auth` (generic gRPC bearer plumbing) now lives in `pplx-space-rpc-auth`.
 // Re-exported here so `crate::auth::…` and `node_api_server::auth` keep resolving.
-pub use pplx_space_common_svc::auth;
 pub use pplx_space_node_api_client::proto;
 pub use pplx_space_node_mgr_client::{NetworkPoolStatusReader, NodeResourceStatusReader};
+pub use pplx_space_rpc_auth as auth;
 pub use run::{
     BindListenerError, DEFAULT_SHUTDOWN_GRACE_SECS, NodeApiRunConfig, NodeIdError, RunNodeApiError,
     SERVICE_NAME, run,

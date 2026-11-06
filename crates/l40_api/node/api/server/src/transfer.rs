@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use pplx_space_common_svc::bootstrap::wrap_grpc_client_channel;
-use pplx_space_common_svc::template_lookup::TemplateLookupScope;
+use pplx_space_rpc_auth::template_lookup::TemplateLookupScope;
 use tokio_stream::StreamExt;
 use tonic::Status;
 use tonic::codegen::InterceptedService;

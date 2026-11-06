@@ -23,7 +23,8 @@ kubernetes = [
     "dep:k8s-openapi",
     "dep:pplx-space-common-work-coalescer",
     "pplx-space-common-core/kubernetes",
-    "pplx-space-common-svc/k8s",
+    "dep:pplx-space-kube-client",
+    "pplx-space-rpc-auth/k8s",
 ]
 otel = ["pplx-space-observability/otel"]
 datadog = ["otel", "pplx-space-observability/datadog"]
@@ -83,6 +84,7 @@ pplx-space-credmgr-client = { workspace = true }
 pplx-space-credential-injection-core = { workspace = true }
 pplx-space-credential-injection-store = { workspace = true }
 pplx-space-feature-flags = { workspace = true }
+pplx-space-kube-client = { workspace = true, optional = true }
 pplx-space-node-api-client = { workspace = true }
 pplx-space-node-mgr-client = { workspace = true }
 pplx-space-cluster-trigger-queue = { workspace = true }
@@ -99,6 +101,7 @@ pplx-space-sandbox-grpc = { workspace = true }
 pplx-space-common-work-coalescer = { workspace = true, optional = true }
 pplx-space-cluster-pool = { workspace = true }
 pplx-space-net-common = { workspace = true, features = ["serde"] }
+pplx-space-rpc-auth = { workspace = true }
 pplx-space-sandbox-portability = { workspace = true }
 pplx-space-runtime-environment-policy-store = { workspace = true }
 pplx-space-sandbox-store = { workspace = true }
@@ -108,11 +111,12 @@ pplx-space-snapshot-store = { workspace = true }
 pplx-space-template-mgr-client = { workspace = true }
 
 [dev-dependencies]
+pplx-space-api-route = { workspace = true, features = ["test-support"] }
+pplx-space-ecw-credential = { workspace = true, features = ["test-support"] }
 pplx-space-internal-api-server = { workspace = true }
 pplx-space-common-core = { workspace = true, features = ["serde", "sqlx", "test-hooks"] }
 insta = { workspace = true, features = ["json", "yaml", "redactions"] }
 jsonschema = { workspace = true }
-pplx-space-common-svc = { workspace = true, features = ["test-support"] }
 pplx-space-common-grpc = { workspace = true, features = ["internal-tls", "test-support"] }
 pplx-space-db-test-fixtures = { workspace = true }
 pplx-space-placement = { workspace = true, features = ["test-support"] }

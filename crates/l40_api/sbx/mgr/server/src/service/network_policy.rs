@@ -144,7 +144,7 @@ pub(crate) async fn fetch_template_default_network_policy(
             vcpu: None,
             memory_mib: None,
         });
-    let scope = pplx_space_common_svc::template_lookup::TemplateLookupScope::LocalExecution;
+    let scope = pplx_space_rpc_auth::template_lookup::TemplateLookupScope::LocalExecution;
     scope.attach(&mut request);
     let response = match templates.get_template_on_shared_channel(request).await {
         Ok(response) => {

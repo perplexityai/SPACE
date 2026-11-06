@@ -45,8 +45,8 @@ crates/l40_api/api/src/controllers/substrate/kubernetes/node_sync/**
 crates/l40_api/api/src/controllers/substrate/kubernetes/store/node_inventory.rs
 crates/l40_api/build/mgr/**
 crates/l40_api/cluster/controller/**
-crates/libs/common/svc/src/auth/build.rs
-crates/libs/common/svc/src/auth/build/**
+crates/l40_api/rpc/auth/src/build.rs
+crates/l40_api/rpc/auth/src/build/**
 crates/l40_api/internal/api/server/src/adapter.rs
 crates/l40_api/internal/api/server/src/metadata.rs
 crates/l40_api/internal/api/server/src/template_*.rs
