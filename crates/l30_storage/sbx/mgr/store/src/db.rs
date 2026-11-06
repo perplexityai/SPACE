@@ -56,7 +56,7 @@ pub mod transfer;
 
 use crate::endpoint_proof::SpacedEndpointProof;
 use crate::restore_operation::{RemoteRestoreOperation, RestoreOrigin};
-use crate::state::{SandboxState, StateTransitionError};
+use crate::state::{SandboxState, SandboxStatusEventDetails, StateTransitionError};
 use pplx_space_common_core::types::{PodUid, RouteGeneration, SpaceApiRouteIdentity};
 
 const DB_PATH: &str = pplx_space_common_core::host::linux::paths::SANDBOX_MANAGER_DB;
@@ -426,9 +426,16 @@ fn emit_sandbox_state_event(
         .reason(reason)
         .operation(operation)
         .trigger(SandboxEventTrigger::System)
-        .with_to_state(to_state.as_str());
+        .with_to_status(to_state);
     if let Some(from_state) = from_state {
-        details = details.with_from_state(from_state);
+        // The label was read back from the row; one this binary can't parse
+        // has no known cleanup state.
+        let from_cleanup_state = from_state
+            .parse::<SandboxState>()
+            .map_or("unknown", SandboxState::event_cleanup_state);
+        details = details
+            .with_from_state(from_state)
+            .from_cleanup_state(from_cleanup_state);
     }
     if let Some(error) = error {
         details = details.error(error);

@@ -257,8 +257,7 @@ impl SandboxManagerService {
                 "runtime {runtime} does not support pause"
             )));
         }
-        let mut event_details =
-            SandboxEventDetails::default().with_from_state(sandbox.state.to_string());
+        let mut event_details = SandboxEventDetails::default().with_from_status(sandbox.state);
         if let Some(trigger) = sandbox_event_trigger(&request) {
             event_details = event_details.trigger(trigger);
         }
@@ -375,7 +374,7 @@ impl SandboxManagerService {
             &sandbox.id,
             SandboxEventType::PauseCompleted,
             SandboxEventSource::SbxManager,
-            SandboxEventDetails::default().with_to_state(SandboxState::Paused.to_string()),
+            SandboxEventDetails::default().with_to_status(SandboxState::Paused),
         );
         Ok(Response::new(PauseResponse {}))
     }

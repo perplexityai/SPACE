@@ -465,7 +465,7 @@ impl CommittedOrphanRowMaterialization {
                         .reason("recovered_local_suspend_artifact")
                         .operation("inventory_reconcile")
                         .trigger(pplx_space_events::SandboxEventTrigger::System)
-                        .with_to_state(SandboxState::Suspended.to_string())
+                        .with_to_status(SandboxState::Suspended)
                         .local_artifact_id(local_artifact_id.to_string()),
                 );
             }
@@ -484,7 +484,7 @@ impl CommittedOrphanRowMaterialization {
                             .trigger(pplx_space_events::SandboxEventTrigger::System)
                             .result("restoring_row_reconstructed")
                             .error(detail)
-                            .with_to_state(SandboxState::Restoring.to_string())
+                            .with_to_status(SandboxState::Restoring)
                             .restored_snapshot_local_artifact_id(local_artifact_id.to_string()),
                     ),
                 );

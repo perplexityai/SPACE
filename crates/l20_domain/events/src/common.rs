@@ -42,6 +42,8 @@ macro_rules! sandbox_event {
             trigger = detail_str(&$details.trigger),
             from_state = detail_str(&$details.from_state),
             to_state = detail_str(&$details.to_state),
+            from_cleanup_state = detail_str(&$details.from_cleanup_state),
+            to_cleanup_state = detail_str(&$details.to_cleanup_state),
             target_state = detail_str(&$details.target_state),
             lifecycle_state = detail_str(&$details.lifecycle_state),
             placement = detail_str(&$details.placement),

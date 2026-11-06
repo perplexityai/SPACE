@@ -164,8 +164,7 @@ impl SandboxManagerService {
                 self.auto_lifecycle.last_wake_completed_at(&sandbox.id),
             )
         {
-            let mut details =
-                SandboxEventDetails::default().with_from_state(sandbox.state.to_string());
+            let mut details = SandboxEventDetails::default().with_from_status(sandbox.state);
             if let Some(trigger) = context.event_trigger {
                 details = details.trigger(trigger);
             }
@@ -277,7 +276,7 @@ impl SandboxManagerService {
         // suspend and restore code path and is immutable, so a timeline that
         // omits it cannot say which path ran.
         let mut suspend_event_details = SandboxEventDetails::default()
-            .with_from_state(sandbox.state.to_string())
+            .with_from_status(sandbox.state)
             .bool_field(
                 SandboxEventBoolField::VolumeEncryption,
                 sandbox.volume_encryption,

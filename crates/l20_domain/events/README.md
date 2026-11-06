@@ -139,6 +139,11 @@ context. Keep event names domain-level: prefer `pause_requested` or
 - For network policy enforcement events, include `operation` to distinguish
   `tproxy_setup` from `initial_policy_hydration`, plus `netns`,
   `installed_network_policy_ref`, `network_state`, and errors when available.
+- Sandbox-manager transitions carry `from_cleanup_state` and
+  `to_cleanup_state` (`none`, `required`, `failed`, or `unknown`) next to
+  `from_state`/`to_state`. A node-local cleanup is not a lifecycle state;
+  `from_state`/`to_state` still report it as `cleanup_required` or
+  `cleanup_failed`, so read the cleanup fields to tell the two apart.
 - Add new event types only when they describe a domain transition or durable
   handoff that helps reconstruct sandbox state. Put implementation details in
   `source`, `reason`, or other detail fields.

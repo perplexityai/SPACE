@@ -862,7 +862,7 @@ impl SandboxManagerService {
                     .trigger(SandboxEventTrigger::System)
                     .operation("restore_activation")
                     .reason("restore_entry_cas_lost")
-                    .with_from_state(original_state.to_string())
+                    .with_from_status(original_state)
                     .target_state(SandboxState::Restoring.to_string())
                     .rows_affected("0"),
             );

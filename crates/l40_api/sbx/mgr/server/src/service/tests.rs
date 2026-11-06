@@ -8984,6 +8984,72 @@ pub(crate) mod service_tests {
         );
     }
 
+    /// The store's own writer events report the cleanup beside the status:
+    /// a plain stop's first failure and a required cleanup that fails.
+    #[test]
+    fn store_writer_events_carry_the_cleanup_state_beside_the_status() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let conn = crate::db::test_conn();
+        let plain = SandboxId::new().to_string();
+        insert_test_sandbox(&conn, &plain, SandboxState::Stopping);
+        let required = SandboxId::new().to_string();
+        insert_test_sandbox(&conn, &required, SandboxState::Stopping);
+        crate::db::mark_cleanup_required(
+            &conn,
+            &required,
+            true,
+            CleanupCompletion::MarkStopped,
+            "handoff",
+        )
+        .unwrap();
+        let capture = SandboxEventCapture::default();
+        let subscriber = tracing_subscriber::registry().with(capture.clone());
+        let guard = tracing::subscriber::set_default(subscriber);
+
+        for id in [&plain, &required] {
+            assert!(
+                crate::db::mark_cleanup_failed(
+                    &conn,
+                    id,
+                    true,
+                    CleanupCompletion::MarkStopped,
+                    "teardown failed",
+                )
+                .unwrap()
+            );
+        }
+        drop(guard);
+
+        let events = capture.events.lock().unwrap();
+        for (id, from_state, from_cleanup_state) in [
+            (&plain, "stopping", "none"),
+            (&required, "cleanup_required", "required"),
+        ] {
+            let event = events
+                .iter()
+                .find(|event| {
+                    event.get("sandbox_id").is_some_and(|value| value == id)
+                        && event
+                            .get("event_type")
+                            .is_some_and(|value| value == "cleanup_failed")
+                })
+                .unwrap_or_else(|| panic!("no cleanup_failed event for {id}: {events:?}"));
+            for (field, expected) in [
+                ("from_state", from_state),
+                ("from_cleanup_state", from_cleanup_state),
+                ("to_state", "cleanup_failed"),
+                ("to_cleanup_state", "failed"),
+            ] {
+                assert_eq!(
+                    event.get(field).map(String::as_str),
+                    Some(expected),
+                    "{id} {field}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn restore_success_cas_emits_completed_event() {
         use tracing_subscriber::layer::SubscriberExt as _;

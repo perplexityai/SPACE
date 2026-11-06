@@ -486,3 +486,23 @@ fn guest_health_failure_count_reaches_the_emitted_event() {
         "consecutive_failures carried {failures:?}"
     );
 }
+
+#[test]
+fn transition_cleanup_states_reach_the_emitted_event() {
+    let captured = emitted_fields(
+        SandboxEventType::CleanupFailed,
+        SandboxEventDetails::default()
+            .with_from_state("cleanup_required")
+            .with_to_state("cleanup_failed")
+            .from_cleanup_state("required")
+            .to_cleanup_state("failed"),
+    );
+
+    for (field, value) in [
+        ("from_cleanup_state", "required"),
+        ("to_cleanup_state", "failed"),
+    ] {
+        let emitted = emitted_field(&captured, field);
+        assert!(emitted.contains(value), "{field} carried {emitted:?}");
+    }
+}
