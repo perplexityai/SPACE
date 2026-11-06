@@ -275,10 +275,11 @@ class TelemetryDeliveryAssertions:
 
         def read() -> dict[str, float]:
             # There is deliberately no sandbox-id metric tag. A second
-            # workload could satisfy this assertion while ours reports nothing.
+            # sandbox, including a pool member, could satisfy this assertion
+            # while ours reports nothing.
             self._fixture.verify(
-                self._control.sandbox_pod_count() == 1,
-                "guest-memory verification requires exactly one workload sandbox",
+                self._control.sandbox_pod_count(include_pool=True) == 1,
+                "guest-memory verification requires exactly one sandbox, including pool members",
             )
             at = int(time.time())
             values = {}

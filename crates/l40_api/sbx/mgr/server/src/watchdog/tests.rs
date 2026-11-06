@@ -1307,11 +1307,11 @@ async fn lifecycle_edge_preserves_status_and_discards_in_flight_probe() {
 }
 
 /// An accepted probe yields its guest's used memory only for a `started`
-/// sandbox that is not an idle warm-pool member, with the sandbox's own
+/// sandbox, including idle warm-pool members, with the sandbox's own
 /// template; a discarded probe yields nothing. Memory never moves health:
 /// each case's status matches the same probe without it.
 #[tokio::test]
-async fn accepted_probe_yields_guest_memory_only_for_a_running_workload() {
+async fn accepted_probe_yields_guest_memory_only_for_a_running_sandbox() {
     use crate::state::SandboxState::{Paused, Quarantined, Started};
 
     struct Case {
@@ -1370,7 +1370,7 @@ async fn accepted_probe_yields_guest_memory_only_for_a_running_workload() {
         },
         Case {
             warm_pool_member: true,
-            ..case("idle warm-pool member", Some(used), Some(None))
+            ..case("idle warm-pool member", Some(used), Some(Some(used)))
         },
         Case {
             row: None,

@@ -4174,9 +4174,14 @@ ON CONFLICT (key_hash) DO NOTHING;
         _require_ok(result, "read the sandbox pod")
         return _newest_pod_render(result.stdout)
 
-    def sandbox_pod_count(self) -> int:
+    def sandbox_pod_count(self, *, include_pool: bool = False) -> int:
+        selector = (
+            "app.kubernetes.io/name=space-sandbox"
+            if include_pool
+            else KIND_SANDBOX_POD_SELECTOR
+        )
         result = self.kubectl(
-            "get", "pods", "-l", KIND_SANDBOX_POD_SELECTOR, "-o", "json", timeout=15,
+            "get", "pods", "-l", selector, "-o", "json", timeout=15,
             namespace=KIND_SANDBOX_NAMESPACE,
         )
         _require_ok(result, "count sandbox pods")

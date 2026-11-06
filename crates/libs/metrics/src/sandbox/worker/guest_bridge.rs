@@ -142,11 +142,11 @@ pub fn guest_observed_specs(template: &str, mem_total_bytes: Option<u64>, vcpu_c
     }
 }
 
-/// One guest memory reading of a running workload, in bytes.
+/// One guest memory reading of a running sandbox, in bytes.
 ///
 /// Reports `MemTotal - MemAvailable`, tagged only by `template`; deployment
 /// dimensions come from the sink. The watchdog emits one sample per accepted
-/// probe of a started workload, excluding idle warm-pool members.
+/// probe of a started sandbox, including idle warm-pool members.
 /// Do not attach sandbox IDs or other per-sandbox identifiers.
 pub fn guest_memory_used(template: &str, used_bytes: u64) {
     distribution(

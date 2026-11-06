@@ -3112,7 +3112,7 @@ async fn apply_composed_health_result(
     let guest_memory = memory_used_bytes
         .filter(|_| lifecycle == Some(crate::state::SandboxState::Started))
         .and_then(|used_bytes| {
-            running_workload_template(db, &sandbox_id).map(|template| GuestMemorySample {
+            guest_memory_template(db, &sandbox_id).map(|template| GuestMemorySample {
                 template,
                 used_bytes,
             })
@@ -3123,10 +3123,9 @@ async fn apply_composed_health_result(
     })
 }
 
-/// The template of `sandbox_id` unless it is an idle warm-pool member, whose
-/// memory is not a workload's. `None` also when the row is gone or does not
-/// read, which skips only the memory sample.
-fn running_workload_template(db: &crate::db::SharedConnection, sandbox_id: &str) -> Option<String> {
+/// The template tag for a guest memory sample. A missing or unreadable row
+/// skips only the memory sample.
+fn guest_memory_template(db: &crate::db::SharedConnection, sandbox_id: &str) -> Option<String> {
     let conn = db
         .lock()
         .inspect_err(|error| {
@@ -3134,9 +3133,7 @@ fn running_workload_template(db: &crate::db::SharedConnection, sandbox_id: &str)
         })
         .ok()?;
     match crate::db::read::sandbox(&conn, sandbox_id) {
-        Ok(row) => row
-            .filter(|row| row.pool_template.is_none())
-            .map(|row| row.template),
+        Ok(row) => row.map(|row| row.template),
         Err(error) => {
             tracing::debug!(sandbox_id, %error, "failed to read sandbox template; skipping guest memory");
             None
