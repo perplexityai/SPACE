@@ -1,0 +1,21 @@
+search_plan_tests::a_search_reads_only_the_rows_it_matches at 76671ceb, with SANDBOXES = 300_000 (temporary local edit, not committed).
+Rows handled across each plan (plan_explain::rows_handled). Columns: statement | search | plan_cache_mode | rows handled.
+
+page | an eight-digit ID start | force_custom_plan | 204
+page | an eight-digit ID start | force_generic_plan | 204
+page | an ID label | force_custom_plan | 40
+page | an ID label | force_generic_plan | 40
+page | digits no ID starts or ends with | force_custom_plan | 9
+page | digits no ID starts or ends with | force_generic_plan | 9
+page | the shortest ID end, four digits | force_custom_plan | 167
+page | the shortest ID end, four digits | force_generic_plan | 172
+page | without idx_sandboxes_id_suffix | force_generic_plan | 300039
+unpaged list | an eight-digit ID start | force_custom_plan | 144
+unpaged list | an eight-digit ID start | force_generic_plan | 144
+unpaged list | an ID label | force_custom_plan | 24
+unpaged list | an ID label | force_generic_plan | 24
+unpaged list | digits no ID starts or ends with | force_custom_plan | 0
+unpaged list | digits no ID starts or ends with | force_generic_plan | 0
+unpaged list | the shortest ID end, four digits | force_custom_plan | 115
+unpaged list | the shortest ID end, four digits | force_generic_plan | 120
+unpaged list | without idx_sandboxes_id_suffix | force_generic_plan | 300023
