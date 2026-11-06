@@ -52,9 +52,8 @@ const TOMBSTONE_LIFECYCLES: [&str; 2] = [DELETED_LIFECYCLE, "cleanup_required"];
 /// A stored lifecycle (`sandboxes.lifecycle`) the admin list filters on: a
 /// [`SandboxLifecycle`] state or a tombstone, in the column's form.
 ///
-/// `pplx-space-placement`'s `StoredSandboxLifecycle` names the same values,
-/// but this crate is not one of that store's users; the tests pin this parse
-/// to it.
+/// `pplx-space-sandbox-store`'s `StoredSandboxLifecycle` names the same values
+/// and normalizes them the same way; the tests pin this parse to it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AdminStoredLifecycle(&'static str);
 

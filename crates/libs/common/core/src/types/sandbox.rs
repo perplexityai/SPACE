@@ -2037,7 +2037,7 @@ impl SandboxLifecycle {
     /// written by raw SQL and `cleanup_required` is a node-local
     /// sandbox-manager state, neither of which is a variant here. A test that
     /// sweeps the column uses `StoredSandboxLifecycle::all` from
-    /// `pplx-space-placement`'s `test-support`, which lists this one and then
+    /// `pplx-space-sandbox-store`'s `test-support`, which lists this one and then
     /// those two. That crate's tests catch an entry dropped from this list, a
     /// list out of declaration order and a variant declared between two
     /// listed ones (it renumbers the later variants); a variant appended after

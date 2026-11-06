@@ -1,5 +1,5 @@
 use pplx_space_common_core::types::SandboxLifecycle;
-use pplx_space_placement::StoredSandboxLifecycle;
+use pplx_space_sandbox_store::StoredSandboxLifecycle;
 use serde::Serialize;
 
 /// The `status` a node published for a sandbox, parsed once where the

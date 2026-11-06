@@ -7,10 +7,10 @@
 
 use std::collections::BTreeMap;
 
+use crate::StoredSandboxLifecycle;
 use pplx_space_common_core::types::{
     AutoLifecyclePolicy, AutoLifecycleWakePolicy, AutoLifecycleWakeSource, DiskIoLimits,
 };
-use pplx_space_placement::StoredSandboxLifecycle;
 use sqlx::types::JsonValue;
 
 use super::*;

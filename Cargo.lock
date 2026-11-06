@@ -4873,7 +4873,6 @@ dependencies = [
  "pplx-space-node-mgr-client",
  "pplx-space-node-registration-store",
  "pplx-space-observability",
- "pplx-space-placement",
  "pplx-space-postgres-pool",
  "pplx-space-public-api",
  "pplx-space-public-api-http",
@@ -5211,7 +5210,6 @@ dependencies = [
  "pplx-space-node-api-client",
  "pplx-space-node-api-sim",
  "pplx-space-observability",
- "pplx-space-placement",
  "pplx-space-postgres-pool",
  "pplx-space-public-api",
  "pplx-space-runtime-environment-catalog-store",
@@ -6069,7 +6067,6 @@ dependencies = [
  "pplx-space-node-api-sim",
  "pplx-space-node-mgr-client",
  "pplx-space-observability",
- "pplx-space-placement",
  "pplx-space-postgres-pool",
  "pplx-space-public-api",
  "pplx-space-rpc-auth",
@@ -7039,32 +7036,6 @@ name = "pplx-space-pii"
 version = "0.8.1"
 
 [[package]]
-name = "pplx-space-placement"
-version = "0.8.1"
-dependencies = [
- "futures-util",
- "jiff",
- "pplx-space-common-core",
- "pplx-space-db-test-fixtures",
- "pplx-space-test-env",
- "sqlx",
- "thiserror 2.0.20",
- "tokio",
- "uuid",
-]
-
-[[package]]
-name = "pplx-space-placement-executor"
-version = "0.8.1"
-dependencies = [
- "futures-util",
- "jiff",
- "pplx-space-common-core",
- "pplx-space-placement",
- "thiserror 2.0.20",
-]
-
-[[package]]
 name = "pplx-space-postgres-contention"
 version = "0.8.1"
 dependencies = [
@@ -7270,7 +7241,6 @@ dependencies = [
  "pplx-space-cluster-pool",
  "pplx-space-common-core",
  "pplx-space-db-test-fixtures",
- "pplx-space-placement",
  "pplx-space-sandbox-portability",
  "pplx-space-sandbox-routability",
  "pplx-space-sandbox-teardown",

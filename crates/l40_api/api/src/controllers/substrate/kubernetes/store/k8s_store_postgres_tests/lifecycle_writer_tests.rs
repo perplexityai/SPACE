@@ -8,7 +8,7 @@
 //! revert's execution-proof and snapshot guards are pinned by the
 //! `failed_started_recovery_*` behaviours in the parent module.
 
-use pplx_space_placement::StoredSandboxLifecycle;
+use pplx_space_sandbox_store::StoredSandboxLifecycle;
 
 use super::*;
 

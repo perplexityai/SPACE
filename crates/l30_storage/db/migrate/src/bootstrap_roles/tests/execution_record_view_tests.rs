@@ -85,9 +85,8 @@ const STORAGE_VEND_NODE_LOOKUP: &str = sql!(
      WHERE k.k8s_node_uid IS NOT NULL"
 );
 
-/// Both execution claims' generation allocation (`execution_rows.rs` in the api
-/// crate, `postgres.rs` in the placement crate), which reads through the
-/// view.
+/// The execution claim's generation allocation (`execution_rows.rs` in the api
+/// crate), which reads through the view.
 const EXECUTION_GENERATION_ALLOCATION: &str = sql!(
     "SELECT COALESCE(MAX(generation), 0) + 1
      FROM sandbox_k8s_executions
@@ -527,7 +526,7 @@ async fn views_hide_other_substrates_rows_but_their_unique_indexes_still_arbitra
 
     // A retired hidden row at generation 1 on a sandbox with no Kubernetes
     // execution: the view's allocation picks 1 again on every attempt, the
-    // claim skips, and the claims' follow-up read finds no active execution.
+    // claim skips, and the claim's follow-up read finds no active execution.
     let fresh_sandbox = seed_sandbox(&mut conn, &node_id).await?;
     sqlx::query(sql!(
         "INSERT INTO sandbox_execution_records (sandbox_id, generation, state, active, managed_by)

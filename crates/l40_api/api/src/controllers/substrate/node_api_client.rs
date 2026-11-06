@@ -203,10 +203,12 @@ pub type BuilderClient =
 /// The 150s timeout leaves a 135s blocking budget after reserving 15s for
 /// completing the response.
 ///
-/// The value lives in `common-core`'s `restore_ownership` module because the
-/// placement crate's restore lease TTL must equal it; deriving both from one
-/// constant is what keeps a future timeout bump from silently splitting the
-/// lease-outlives-RPC invariant across crates.
+/// The value comes from `common-core`'s `restore_ownership` module, which
+/// compile-asserts that the restore execution-ownership window outlives it.
+/// The Direct and Kubernetes restore lease claims pass this timeout as their
+/// lease TTL, and other crates derive their own timeouts and windows from the
+/// module, so a future timeout bump reaches every use of it and fails the
+/// build if it would reach the ownership window.
 pub(crate) const NODE_RPC_TIMEOUT: Duration =
     pplx_space_common_core::restore_ownership::NODE_RPC_TIMEOUT;
 

@@ -172,11 +172,10 @@ mode = "required"
 # after a `\n`, `\r` or `\t` escape in a one-line string).
 # Not caught: a statement head split across lines (`UPDATE` and `sandboxes` on
 # different lines) or built at run time (`format!("UPDATE {table} ...")`); a
-# `COPY sandboxes FROM ...`; a statement in a non-`.rs` file, such as the
-# placement state machine's `include_str!` claim statements under
-# `postgres/sql/`; a head right after an escape other than `\n`, `\r` or
-# `\t` (`\0`, `\x0a`); database triggers; scripts and smoke harnesses outside
-# workspace members' `src/`.
+# `COPY sandboxes FROM ...`; a statement in a non-`.rs` file, such as one
+# loaded with `include_str!`; a head right after an escape other than `\n`,
+# `\r` or `\t` (`\0`, `\x0a`); database triggers; scripts and smoke harnesses
+# outside workspace members' `src/`.
 # False positives: the same text in a trailing `//` or `/* */` comment, in
 # `#[doc = "..."]`, in a SQL `--` comment or in an ordinary string such as an
 # error message ("failed to update sandboxes"); a statement on another
@@ -385,7 +384,6 @@ pplx-space-cluster-trigger-queue = [
 pplx-space-credential-injection-store = ["pplx-space-api", "pplx-space-credmgr"]
 pplx-space-federated-grant-store = ["pplx-space-api", "pplx-space-credmgr"]
 pplx-space-node-registration-store = ["pplx-space-credmgr"]
-pplx-space-placement = ["pplx-space-internal-api-server", "pplx-space-placement-executor"]
 pplx-space-postgres-pool = [
   "pplx-space-api",
   "pplx-space-cluster-controller-server",
@@ -696,9 +694,6 @@ common = [
 # writes the table and whether that is permanent or temporary; a temporary
 # grant names the work that removes it.
 [rules.layers.state.co_writers.postgres]
-# Placement's commit puts a sandbox on its node. Temporary: the write folds
-# into sandbox-store.
-sandboxes = ["pplx-space-placement"]
 # Deleting a sandbox orphans its snapshots' storage locations for cleanup.
 # Temporary: the write folds into snapshot-store.
 snapshot_storage_locations = ["pplx-space-sandbox-store"]

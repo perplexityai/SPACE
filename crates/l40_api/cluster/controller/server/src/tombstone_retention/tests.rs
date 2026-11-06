@@ -6,7 +6,7 @@ use pplx_space_db_test_fixtures::{
     SEED_ORG_ID, SEED_USER_ID, insert_pool_slot_receipt, pg_test_db, pool_slot_receipt_state,
     try_pg_test_db,
 };
-use pplx_space_placement::test_support::stored_lifecycle_matrix;
+use pplx_space_sandbox_store::test_support::stored_lifecycle_matrix;
 use uuid::Uuid;
 
 use super::*;

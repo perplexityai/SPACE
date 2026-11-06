@@ -29,8 +29,8 @@ use std::sync::{Arc, Mutex};
 
 use pplx_space_common_core::types::{LocalArtifactId, NodeId, SandboxId, SandboxLifecycle};
 use pplx_space_db_test_fixtures::{pg_test_db, pg_test_db_with_max_connections};
-use pplx_space_placement::StoredSandboxLifecycle;
-use pplx_space_placement::test_support::stored_lifecycle_matrix;
+use pplx_space_sandbox_store::StoredSandboxLifecycle;
+use pplx_space_sandbox_store::test_support::stored_lifecycle_matrix;
 use pplx_space_test_env::TestResult;
 use sqlx::PgPool;
 

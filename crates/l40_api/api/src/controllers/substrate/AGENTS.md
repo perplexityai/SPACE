@@ -44,10 +44,9 @@ failure exits, repair, drain and evacuation are core logic. It belongs once,
 in shared code outside `direct.rs` and `kubernetes/` that calls the adapter,
 such as the sandbox controller (`controllers/sandbox/`) and
 `pplx-space-sandbox-store`. Much of it still lives in the adapters: Direct's
-worker and restore-candidate retries and its restore lease, Kubernetes'
-restore leases, started recovery and redrive, and the Kubernetes-only
-`pplx-space-placement` machine. That code is debt: don't extend it, and put
-new core logic in shared code.
+worker and restore-candidate retries and its restore lease, and Kubernetes'
+restore leases, started recovery and redrive. That code is debt: don't extend
+it, and put new core logic in shared code.
 
 `Substrate::from_env_with_lifecycle` returns Kubernetes only when built with
 the `kubernetes` feature and `SPACE_K8S_CONTROL_PLANE` is truthy; an unset,

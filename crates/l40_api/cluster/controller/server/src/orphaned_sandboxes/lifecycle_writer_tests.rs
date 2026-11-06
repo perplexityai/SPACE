@@ -10,7 +10,7 @@
 
 use pplx_space_common_core::types::{NodeId, SandboxId};
 use pplx_space_db_test_fixtures::pg_test_db;
-use pplx_space_placement::StoredSandboxLifecycle;
+use pplx_space_sandbox_store::StoredSandboxLifecycle;
 use pplx_space_test_env::TestResult;
 use sqlx::PgPool;
 

@@ -99,8 +99,6 @@ members = [
     "crates/l10_foundation/object/store",
     "crates/l10_foundation/page/cache",
     "crates/l10_foundation/postgres/contention",
-    "crates/l40_api/placement/executor",
-    "crates/l30_storage/placement",
     "crates/l20_domain/public/api",
     "crates/l40_api/native/files",
     "crates/l40_api/public/api/http",
@@ -430,7 +428,6 @@ pplx-space-metrics = { path = "crates/libs/metrics" }
 pplx-space-metrics-emit = { path = "crates/l10_foundation/metrics/emit" }
 pplx-space-grpc-metrics = { path = "crates/l10_foundation/grpc/metrics" }
 pplx-space-observability = { path = "crates/l10_foundation/observability", default-features = false }
-pplx-space-placement = { path = "crates/l30_storage/placement" }
 pplx-space-internal-api-server = { path = "crates/l40_api/internal/api/server" }
 pplx-space-internal-api-svc = { path = "crates/l50_app/internal/api/svc" }
 pplx-space-k8s-ids = { path = "crates/l10_foundation/k8s/ids" }

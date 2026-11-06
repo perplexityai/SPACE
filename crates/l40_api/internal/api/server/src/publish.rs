@@ -5,7 +5,7 @@ use crate::auto_lifecycle_delete_completions::consume_auto_lifecycle_delete_comp
 use crate::node_local_backup_pending::{self, PendingLocalBackupCensus};
 use pplx_space_metrics::internal_api::{LocalBackupQueueOutcome, local_backup_queue_reconcile};
 use pplx_space_node_api_client::node_status_freshness::reported_freshness;
-use pplx_space_placement::StoredSandboxLifecycle;
+use pplx_space_sandbox_store::StoredSandboxLifecycle;
 
 impl ClusterApiService {
     pub(super) async fn publish_node_state(

@@ -172,8 +172,8 @@ const DEFAULT_K8S_BLOCKING_DELETE_TIMEOUT: Duration = Duration::from_secs(10);
 /// API-to-node request can remain active. The same window decides when a
 /// missing creating Pod is stale enough for generation replacement. Derived
 /// from `common-core`'s `restore_ownership` module (which compile-asserts it
-/// outlives the node-RPC timeout) so this window and the placement crate's
-/// cannot drift apart.
+/// outlives the node-RPC timeout) so every deriver of this window reads one
+/// value.
 const RESTORE_EXECUTION_OWNERSHIP_TTL_SECS: i64 =
     pplx_space_common_core::restore_ownership::RESTORE_EXECUTION_OWNERSHIP_TTL.as_secs() as i64;
 /// Activation ownership must outlive every bounded API-to-node operation. A

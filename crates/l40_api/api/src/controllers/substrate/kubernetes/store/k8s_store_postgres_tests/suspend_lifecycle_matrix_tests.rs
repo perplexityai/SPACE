@@ -8,7 +8,7 @@
 //! written out rather than derived from the statements.
 
 use pplx_space_common_core::types::{ArtifactKind, LocalArtifactId, SandboxId};
-use pplx_space_placement::test_support::stored_lifecycle_matrix;
+use pplx_space_sandbox_store::test_support::stored_lifecycle_matrix;
 
 use super::*;
 
