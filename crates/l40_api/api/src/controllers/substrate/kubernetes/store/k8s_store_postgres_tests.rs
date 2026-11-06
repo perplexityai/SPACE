@@ -1355,6 +1355,76 @@ async fn selected_route_pod_ip_refresh_is_fenced_by_complete_route(
     Ok(())
 }
 
+/// A stopped sandbox's start learns its new pod's IP only through the
+/// selected route. The execution it leaves behind must be one suspend can
+/// claim, as a created sandbox's is.
+async fn selected_route_pod_ip_makes_a_started_execution_suspendable(
+    fixture: &PostgresStore,
+) -> TestResult {
+    let route = SandboxActivationAttemptId::new();
+    let pod_uid = PodUid::parse("started-pod-uid")?;
+    let mut sandboxes = Vec::new();
+    for state in ["created", "recovering"] {
+        let sandbox_id = SandboxId::new();
+        let pod_name = format!("{state}-pod");
+        insert_sandbox(&fixture.pool, sandbox_id, "started").await?;
+        sqlx::query(sql!(
+            "INSERT INTO sandbox_k8s_executions (
+                 sandbox_id, generation, pod_name, pod_namespace, pod_uid,
+                 state, active, activation_attempt_id, route_activation_id
+             ) VALUES ($1, 4, $2, 'space', $3, $4, TRUE, $5, $5)"
+        ))
+        .bind(sandbox_id)
+        .bind(&pod_name)
+        .bind(pod_uid.as_str())
+        .bind(state)
+        .bind(route.as_uuid())
+        .execute(&fixture.pool)
+        .await?;
+        assert!(
+            fixture
+                .store
+                .persist_selected_route_pod_ip(
+                    sandbox_id,
+                    4,
+                    &pod_name,
+                    route,
+                    &pod_uid,
+                    PodIp::parse("10.90.0.10")?,
+                )
+                .await?
+        );
+        sandboxes.push((state, sandbox_id));
+    }
+
+    let generation = ExecutionGeneration::new(4)?;
+    for (state, sandbox_id) in sandboxes {
+        let claim = fixture
+            .store
+            .claim_suspend_execution(sandbox_id, generation, &pod_uid)
+            .await;
+        let stored: String = sqlx::query_scalar(sql!(
+            "SELECT state FROM sandbox_k8s_executions WHERE sandbox_id = $1 AND active"
+        ))
+        .bind(sandbox_id)
+        .fetch_one(&fixture.pool)
+        .await?;
+        if state == "created" {
+            assert!(
+                matches!(claim, Ok(SuspendExecutionClaim::Claimed)),
+                "a started execution with a pod IP must be claimable: {claim:?}"
+            );
+            assert_eq!(stored, "running");
+        } else {
+            // The recovery flow owns promoting its own execution.
+            assert!(claim.is_err(), "{claim:?}");
+            assert_eq!(stored, "recovering");
+        }
+    }
+
+    Ok(())
+}
+
 /// Each behavior runs against a store of its own, so none can depend on
 /// rows another left behind.
 mod k8s_store_postgres_behaviors {
@@ -1404,6 +1474,7 @@ mod k8s_store_postgres_behaviors {
         suspend_superseded_activation_abandons_only_the_canonical_attempt,
         stale_generation_cannot_complete_or_abandon_reused_attempt,
         selected_route_pod_ip_refresh_is_fenced_by_complete_route,
+        selected_route_pod_ip_makes_a_started_execution_suspendable,
         replacement_handler_claims_g7_after_lagging_g6_is_replaced,
         stale_generation_pod_metadata_does_not_update_new_active_execution,
         blank_pod_uid_decodes_as_absent_for_active_execution,
