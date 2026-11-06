@@ -147,6 +147,7 @@ export interface Template {
   built_at: string | null;
   content_hash: string | null;
   runtime: string | null;
+  runtime_version?: string | null;
   arch: string | null;
   has_base_snapshot: boolean | null;
   pool_target: number | null;

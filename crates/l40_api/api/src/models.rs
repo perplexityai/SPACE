@@ -487,6 +487,7 @@ pub struct TemplateResponse {
     pub built_at: Option<String>,
     pub content_hash: Option<String>,
     pub runtime: Option<String>,
+    pub runtime_version: Option<String>,
     pub arch: Option<String>,
     pub has_base_snapshot: Option<bool>,
     pub pool_target: Option<u32>,
