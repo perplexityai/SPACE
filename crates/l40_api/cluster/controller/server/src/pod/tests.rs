@@ -505,6 +505,7 @@ fn evacuation_runtime(_sandbox_owner: &SandboxOwner) -> SandboxRuntimePodMetadat
         memory_mib: None,
         disk_mib: None,
         disk_io_limits: Default::default(),
+        client_id: None,
     }
 }
 

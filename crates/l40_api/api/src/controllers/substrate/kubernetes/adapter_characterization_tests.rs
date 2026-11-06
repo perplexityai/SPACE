@@ -227,6 +227,7 @@ impl CreateInputs {
             wait_until_ready: false,
             volume_encryption: false,
             node_pool: None,
+            client_id: None,
         }
     }
 }

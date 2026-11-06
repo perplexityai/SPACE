@@ -5,7 +5,9 @@ use super::support::{
 use super::wait_ready::CommandReadyPod;
 use super::*;
 use crate::controllers::substrate::runtime_upgrade::UpgradeActivation;
-use crate::controllers::substrate::{ActivationOptions, RecoveryCharge};
+use crate::controllers::substrate::{
+    ActivationAttribution, ActivationOptions, CapPolicy, RecoveryCharge,
+};
 use pplx_space_common_core::kubernetes::EvacuationPlacement;
 use pplx_space_common_core::types::{
     SandboxActivationAttemptId, SandboxLifecycle, SandboxTransitionTargetState,
@@ -220,7 +222,7 @@ struct RestoreClaimHandling {
     preclaimed: Option<RestoreClaim>,
     cleanup_on_failure: bool,
     /// Deferred activation charge the claim-winner pays. Preclaimed callers
-    /// pass [`RecoveryCharge::Exempt`]: their claim was charged upstream.
+    /// pass their charge after paying it: their claim was charged upstream.
     charge: RecoveryCharge,
 }
 
@@ -262,11 +264,12 @@ struct PreparedWakeDrive {
 }
 
 impl RestoreClaimHandling {
-    fn preclaimed_with_cleanup(claim: RestoreClaim) -> Self {
+    /// `charge` is the one the claim was charged with.
+    fn preclaimed_with_cleanup(claim: RestoreClaim, charge: &RecoveryCharge) -> Self {
         Self {
             preclaimed: Some(claim),
             cleanup_on_failure: true,
-            charge: RecoveryCharge::Exempt,
+            charge: charge.after_charge(),
         }
     }
 
@@ -487,7 +490,7 @@ impl KubernetesSubstrate {
                     .await
             }
             // Unreachable as written: only the evacuation claim produces this
-            // variant, and evacuation restores are `RecoveryCharge::Exempt`,
+            // variant, and evacuation restores are exempt,
             // so no deferred charge can reject one. If it ever is, leaving
             // the row `restoring` is the release, for the reason
             // `RestoreClaim::FreshFromStopped` gives.
@@ -889,7 +892,7 @@ impl KubernetesSubstrate {
             metric_identity,
             None,
             WakeTarget::started(None),
-            RestoreClaimHandling::preclaimed_with_cleanup(restore_claim),
+            RestoreClaimHandling::preclaimed_with_cleanup(restore_claim, &charge),
         )
         .await
         .map_err(ControllerError::from)?;
@@ -1066,6 +1069,7 @@ impl KubernetesSubstrate {
         let activation_assignment = ActivationAttemptAssignment::new(
             requested_attempt_id,
             SandboxTransitionTargetState::Started,
+            charge.attribution().key().clone(),
         );
         let wait = async {
             // Boxed: `ensure_pod_exists` is a large future; inlining it here
@@ -1197,7 +1201,7 @@ impl KubernetesSubstrate {
                     Some(generation),
                     join_deadline,
                     metric_identity,
-                    RecoveryCharge::Exempt,
+                    charge.after_charge(),
                 )
                 .await;
         }
@@ -1245,7 +1249,9 @@ impl KubernetesSubstrate {
             options,
             Some(placement),
             target_state,
-            RecoveryCharge::Exempt,
+            // A drain evacuation: nobody charges it, and the restored pod is
+            // labeled from the sandbox's record.
+            RecoveryCharge::exempt(CapPolicy::Skip, ActivationAttribution::inherit_unresolved()),
         )
         .await
         .map(|_| ())
@@ -1365,7 +1371,7 @@ impl KubernetesSubstrate {
                 metric_identity,
                 evacuation_placement,
                 WakeTarget::Explicit(target_state),
-                RestoreClaimHandling::preclaimed_with_cleanup(restore_claim),
+                RestoreClaimHandling::preclaimed_with_cleanup(restore_claim, &charge),
             )
             .await?;
         Ok(activation.completion)
@@ -1876,6 +1882,7 @@ impl KubernetesSubstrate {
         let activation_assignment = ActivationAttemptAssignment::new(
             requested_attempt_id,
             restore_transition_target_state(target_state)?,
+            charge.attribution().key().clone(),
         );
         // Error variants alone cannot prove whether runtime work exists. Keep
         // dispatch evidence outside the timed future so outer cancellation,
