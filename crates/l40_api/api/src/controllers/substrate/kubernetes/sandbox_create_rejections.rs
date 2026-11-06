@@ -176,9 +176,10 @@ impl SandboxCreateRejections {
         );
     }
 
-    /// The node's admission rejection of `pod_name`, if one was observed. A
-    /// recorded uid that differs from `pod_uid` belongs to an earlier pod with
-    /// the same name and does not match.
+    /// The node's admission rejection of `pod_name`, if one was observed. With
+    /// `pod_uid`, only a rejection recorded for that uid matches; one for
+    /// another (or an unknown) uid may belong to an earlier pod with the same
+    /// name.
     pub fn rejection_for(
         &self,
         pod_name: &str,
@@ -192,8 +193,11 @@ impl SandboxCreateRejections {
         if entry.recorded_at.elapsed() >= REJECTION_TTL {
             return None;
         }
-        if let (Some(expected), Some(recorded)) = (pod_uid, entry.rejection.pod_uid.as_deref())
-            && expected != recorded
+        // A known uid must match a recorded one exactly; only a wait that
+        // doesn't know its pod's uid yet matches by name (pod names carry the
+        // execution generation).
+        if let Some(expected) = pod_uid
+            && entry.rejection.pod_uid.as_deref() != Some(expected)
         {
             return None;
         }

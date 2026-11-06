@@ -109,6 +109,15 @@ fn lookup_matches_name_and_rejects_a_different_uid() {
             .is_none()
     );
     assert!(index.rejection_for("space-sbx-other-g1", None).is_none());
+
+    let mut without_uid = event(FAILED_CREATE_POD_SANDBOX_REASON, "Pod", MEMORY_REJECTION);
+    without_uid.involved_object.uid = None;
+    index.observe_event(&without_uid);
+    assert!(
+        index
+            .rejection_for("space-sbx-01a1-g1", Some("61a90a93"))
+            .is_none()
+    );
 }
 
 #[tokio::test(start_paused = true)]
