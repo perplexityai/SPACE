@@ -1076,8 +1076,8 @@ class NodeSelectorExtrasControl(Protocol):
         """The sandbox's execution pods by label, including terminating ones."""
         ...
 
-    def sandbox_pod_count(self, *, include_pool: bool = False) -> int:
-        """Non-terminating sandbox pods, excluding pool members unless requested."""
+    def sandbox_pod_count(self) -> int:
+        """Non-pool, non-terminating pods in the sandbox namespace."""
         ...
 
     def native_create_sandbox(self, *, template: str, metadata: Mapping[str, str]) -> str:
@@ -2450,8 +2450,8 @@ class TelemetryBackendControl(Protocol):
         """The decoded JSON body of `GET <path>?<params>` on `prometheus`, `tempo` or `loki`."""
         ...
 
-    def sandbox_pod_count(self, *, include_pool: bool = False) -> int:
-        """Non-terminating sandbox pods, excluding pool members unless requested."""
+    def telemetry_sandbox_pod_count(self) -> int:
+        """Sandbox pods, including pool and deleting pods, except confirmed retired sandboxes."""
         ...
 
     def telemetry_mode(self) -> str:

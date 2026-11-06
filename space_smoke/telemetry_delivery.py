@@ -279,8 +279,8 @@ class TelemetryDeliveryAssertions:
             # sandbox, including a pool member, could satisfy this assertion
             # while ours reports nothing.
             self._fixture.verify(
-                self._control.sandbox_pod_count(include_pool=True) == 1,
-                "guest-memory verification requires exactly one sandbox, including pool members",
+                self._control.telemetry_sandbox_pod_count() == 1,
+                "guest-memory verification requires exactly one potentially reporting sandbox pod",
             )
             at = int(time.time())
             values = {}
