@@ -19,6 +19,18 @@ pub(crate) enum RuntimeStateReadError {
     Timeout { timeout_ms: u64 },
 }
 
+impl RuntimeStateReadError {
+    /// Whether the read ran out of time, here or in node-manager, whose own
+    /// Firecracker deadline answers `DEADLINE_EXCEEDED` before ours expires.
+    pub(crate) fn is_timeout(&self) -> bool {
+        match self {
+            Self::Timeout { .. } => true,
+            Self::Rpc(status) => status.code() == tonic::Code::DeadlineExceeded,
+            Self::UnsupportedState(_) => false,
+        }
+    }
+}
+
 async fn get_vm_state_inner(
     sandbox_id: SandboxId,
     node_manager: &NodeManagerConnector,
