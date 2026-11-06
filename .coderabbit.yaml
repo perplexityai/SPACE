@@ -407,12 +407,20 @@ reviews:
         owning layer. A genuinely new deployed-platform contract still
         belongs in typed space_smoke; browser rendering and interaction
         assertions are not a reason to duplicate that platform contract.
-        Still flag vacuous assertions, missing required oracle data,
-        unconditional compatibility skips, and fixed sleeps that can race
-        observable readiness. For a coverage defect, name a concrete wrong
-        result the assertion would accept and the smallest assertion or
-        owning-layer test that would reject it; do not demand a new scenario
-        merely because an existing assertion needs correction.
+
+        Review assertions against their claimed contract and the behavior
+        changed by the diff, not every stronger check one could imagine.
+        Before flagging a coverage gap, identify the missing contract clause,
+        its independent oracle, and a concrete wrong result that would pass.
+        Check existing coverage first. Do not request a test of the smoke
+        test, or a values mirror that merely compares configured inputs with
+        rendered output; follow test-economy's configuration stop rule.
+
+        Still flag vacuous assertions, missing oracle data needed for the
+        claimed check, unconditional compatibility skips, and fixed sleeps
+        that can race observable readiness. Prefer the smallest correction
+        to an existing assertion or its owning-layer coverage, not another
+        scenario merely because the existing assertion needs correction.
 
   pre_merge_checks:
     # Only requested reviewers can tick "Ignore failed checks". Any
