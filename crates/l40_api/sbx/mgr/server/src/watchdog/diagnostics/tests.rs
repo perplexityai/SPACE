@@ -29,12 +29,15 @@ async fn apply_guest_outcome(
             Some(crate::state::SandboxState::Started),
             0,
             ComposedProbeResult {
+                template: "seed".to_string(),
                 observations,
                 guest_status: None,
+                memory_used_bytes: None,
             },
         ))),
     )
     .await
+    .and_then(|accepted| accepted.transition)
 }
 
 #[tokio::test]
