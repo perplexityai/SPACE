@@ -7210,6 +7210,97 @@ pub(crate) mod service_tests {
         }
     }
 
+    /// Wait and List publish the cleanup that owns a row beside its
+    /// lifecycle, from the same read: a failed delete with its completion, an
+    /// intent-less required cleanup with none, and nothing for a plain row.
+    #[tokio::test(start_paused = true)]
+    async fn wait_and_list_publish_the_row_s_cleanup_beside_its_lifecycle() {
+        use crate::proto::{
+            SandboxCleanupCompletion as Completion, SandboxCleanupState as Owner,
+            SandboxLifecycleState as Lifecycle,
+        };
+        let conn = crate::db::test_conn();
+        let failed_delete = SandboxId::new().to_string();
+        insert_test_sandbox(&conn, &failed_delete, SandboxState::CleanupFailed);
+        crate::db::set_cleanup_intent(
+            &conn,
+            &failed_delete,
+            false,
+            crate::db::CleanupCompletion::DeleteRow,
+        )
+        .unwrap();
+        let required = SandboxId::new().to_string();
+        insert_test_sandbox(&conn, &required, SandboxState::CleanupRequired);
+        let stopped = SandboxId::new().to_string();
+        insert_test_sandbox(&conn, &stopped, SandboxState::Stopped);
+        let service = service_for_teardown_test(conn);
+        let pair = |cleanup: Option<(Completion, Owner)>| {
+            cleanup.map(|(completion, owner)| (completion as i32, owner as i32))
+        };
+
+        // Wait completes for a failed cleanup and a stop, never a required one.
+        for (id, lifecycle, cleanup) in [
+            (
+                &failed_delete,
+                Lifecycle::CleanupFailed,
+                Some((Completion::DeleteRow, Owner::Failed)),
+            ),
+            (&stopped, Lifecycle::Stopped, None),
+        ] {
+            let response = tokio::time::timeout(
+                Duration::from_secs(2),
+                service.wait(internal_request(WaitRequest {
+                    sandbox_id: id.clone(),
+                    timeout_secs: None,
+                })),
+            )
+            .await
+            .expect("Wait completes")
+            .unwrap()
+            .into_inner();
+            assert_eq!(response.lifecycle, Some(lifecycle as i32), "{id}");
+            assert_eq!(
+                response
+                    .cleanup
+                    .map(|cleanup| (cleanup.completion, cleanup.state)),
+                pair(cleanup),
+                "{id}"
+            );
+        }
+
+        let listed: std::collections::HashMap<_, _> = list_all_pages(&service, false, 128)
+            .await
+            .into_iter()
+            .flatten()
+            .map(|element| {
+                (
+                    element.sandbox_id.clone(),
+                    (
+                        element.lifecycle,
+                        element
+                            .cleanup
+                            .map(|cleanup| (cleanup.completion, cleanup.state)),
+                    ),
+                )
+            })
+            .collect();
+        for (id, lifecycle, cleanup) in [
+            (
+                &failed_delete,
+                Lifecycle::CleanupFailed,
+                Some((Completion::DeleteRow, Owner::Failed)),
+            ),
+            (
+                &required,
+                Lifecycle::CleanupRequired,
+                Some((Completion::Unspecified, Owner::Required)),
+            ),
+            (&stopped, Lifecycle::Stopped, None),
+        ] {
+            assert_eq!(listed[id], (Some(lifecycle as i32), pair(cleanup)), "{id}");
+        }
+    }
+
     pub(crate) use crate::db::fixture::{insert_test_sandbox, insert_test_sandbox_with_policy};
 
     fn mark_test_remote_restore_artifact_staging(conn: &crate::db::Connection, id: &str) {
@@ -15919,23 +16010,43 @@ pub(crate) mod service_tests {
 
     #[tokio::test]
     async fn build_sandbox_info_publishes_the_failed_cleanup_completion() {
+        use crate::proto::{SandboxCleanupCompletion as Completion, SandboxCleanupState as Owner};
         let conn = crate::db::test_conn();
         let sandbox_id = SandboxId::new().to_string();
         insert_test_sandbox(&conn, &sandbox_id, SandboxState::Stopped);
         let service = service_with_runtime_probe(conn, false);
-        for (completion, expected) in [
-            (None, None),
+        for (state, completion, expected) in [
+            // An intent-less cleanup row still publishes its owning cleanup.
             (
+                SandboxState::CleanupFailed,
+                None,
+                Some((Completion::Unspecified, Owner::Failed)),
+            ),
+            (
+                SandboxState::CleanupFailed,
                 Some(crate::db::CleanupCompletion::MarkStopped),
-                Some(crate::proto::SandboxCleanupCompletion::MarkStopped),
+                Some((Completion::MarkStopped, Owner::Failed)),
             ),
             (
+                SandboxState::CleanupFailed,
                 Some(crate::db::CleanupCompletion::DeleteRow),
-                Some(crate::proto::SandboxCleanupCompletion::DeleteRow),
+                Some((Completion::DeleteRow, Owner::Failed)),
             ),
+            (
+                SandboxState::CleanupRequired,
+                Some(crate::db::CleanupCompletion::DeleteRow),
+                Some((Completion::DeleteRow, Owner::Required)),
+            ),
+            // An armed activation's rollback target: a completion, no owner.
+            (
+                SandboxState::Starting,
+                Some(crate::db::CleanupCompletion::MarkStopped),
+                Some((Completion::MarkStopped, Owner::Unspecified)),
+            ),
+            (SandboxState::Stopped, None, None),
         ] {
             let mut sandbox = service.lookup_sandbox(&sandbox_id).unwrap();
-            sandbox.state = SandboxState::CleanupFailed;
+            sandbox.state = state;
             sandbox.cleanup_completion = completion;
 
             let info = service
@@ -15944,9 +16055,35 @@ pub(crate) mod service_tests {
                 .unwrap();
 
             assert_eq!(
-                info.cleanup.map(|cleanup| cleanup.completion),
-                expected.map(|completion| completion as i32),
-                "{completion:?}"
+                info.cleanup
+                    .map(|cleanup| (cleanup.completion, cleanup.state)),
+                expected.map(|(completion, owner)| (completion as i32, owner as i32)),
+                "{state} {completion:?}"
+            );
+        }
+
+        // Without a recorded completion, only the two cleanup statuses
+        // publish a cleanup, and each names its own owner.
+        for state in SandboxState::all() {
+            let mut sandbox = service.lookup_sandbox(&sandbox_id).unwrap();
+            sandbox.state = state;
+            sandbox.cleanup_completion = None;
+
+            let info = service
+                .build_sandbox_info(sandbox, None, None, None, None)
+                .await
+                .unwrap();
+
+            let owner = match state {
+                SandboxState::CleanupRequired => Some(Owner::Required),
+                SandboxState::CleanupFailed => Some(Owner::Failed),
+                _ => None,
+            };
+            assert_eq!(
+                info.cleanup
+                    .map(|cleanup| (cleanup.completion, cleanup.state)),
+                owner.map(|owner| (Completion::Unspecified as i32, owner as i32)),
+                "{state}"
             );
         }
     }

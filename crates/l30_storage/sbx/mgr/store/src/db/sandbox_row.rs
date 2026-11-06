@@ -98,6 +98,7 @@ pub struct SandboxListRow {
     pub runtime: String,
     pub created_at: String,
     pub pool_template: Option<String>,
+    pub cleanup_completion: Option<CleanupCompletion>,
 }
 
 pub(super) fn row_to_list_sandbox(row: &rusqlite::Row) -> rusqlite::Result<SandboxListRow> {
@@ -114,6 +115,9 @@ pub(super) fn row_to_list_sandbox(row: &rusqlite::Row) -> rusqlite::Result<Sandb
             .get::<_, super::timestamps::EpochSeconds>("created_at")?
             .to_string(),
         pool_template: row.get("pool_template")?,
+        cleanup_completion: row
+            .get::<_, Option<String>>("cleanup_completion")?
+            .and_then(|value| value.parse().ok()),
     })
 }
 

@@ -94,8 +94,8 @@ impl UnaryListUsage {
     }
 }
 
-const LIST_COLUMNS: &str =
-    "id, legacy_state, template, template_hash, user, runtime, created_at, pool_template";
+const LIST_COLUMNS: &str = "id, legacy_state, template, template_hash, user, runtime, created_at, pool_template, \
+     cleanup_completion";
 
 db_private_outside_tests! {
     fn list(
