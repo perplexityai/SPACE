@@ -2545,6 +2545,90 @@ async fn publish_sandbox_state_updates_activity_clocks_without_touching_updated_
     Ok(())
 }
 
+async fn sandbox_idle_deadline(pool: &PgPool, sandbox_id: SandboxId) -> TestResult<Option<i64>> {
+    Ok(
+        sqlx::query_scalar("SELECT next_auto_event_at FROM sandboxes WHERE id = $1")
+            .bind(sandbox_id)
+            .fetch_one(pool)
+            .await?,
+    )
+}
+
+/// The publisher's idle deadline is recorded for `getSandbox`'s `expires_at`.
+/// A later deadline is recorded only once it has moved a minute, an earlier
+/// one at once, a cleared one is cleared, and none of it reads as a change to
+/// the sandbox or is taken from another node.
+#[tokio::test(flavor = "current_thread")]
+async fn publish_sandbox_state_records_the_idle_deadline_without_touching_updated_at() -> TestResult
+{
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let node_id = NodeId::new();
+    let sandbox_id = SandboxId::new();
+    let original_updated_at = time::OffsetDateTime::from_unix_timestamp(1_700_000_000)?;
+    insert_ready_worker_node(&db.pool, node_id).await?;
+    insert_active_sandbox(&db.pool, sandbox_id, node_id, "started").await?;
+    set_sandbox_updated_at_for_test(&db.pool, sandbox_id, original_updated_at).await?;
+
+    for (published, recorded, reason) in [
+        (
+            Some(1_800_000_000),
+            Some(1_800_000_000),
+            "a first deadline is recorded",
+        ),
+        (
+            Some(1_800_000_059),
+            Some(1_800_000_000),
+            "use within the minute is not rewritten",
+        ),
+        (
+            Some(1_800_000_060),
+            Some(1_800_000_060),
+            "a deadline a minute later is recorded",
+        ),
+        (
+            Some(1_800_000_010),
+            Some(1_800_000_010),
+            "an earlier deadline is recorded at once",
+        ),
+        (None, None, "a cleared deadline is cleared"),
+    ] {
+        let mut state = published_sandbox_state(sandbox_id, "started");
+        state.next_auto_event_at = published.map(timestamp);
+        let mut conn = db.pool.acquire().await?;
+        publish_sandbox_states(&mut conn, node_id, &[state]).await?;
+        drop(conn);
+        assert_eq!(
+            sandbox_idle_deadline(&db.pool, sandbox_id).await?,
+            recorded,
+            "{reason}"
+        );
+    }
+
+    let foreign_node = NodeId::new();
+    insert_ready_worker_node(&db.pool, foreign_node).await?;
+    let mut foreign_state = published_sandbox_state(sandbox_id, "started");
+    foreign_state.next_auto_event_at = Some(timestamp(1_900_000_000));
+    let mut conn = db.pool.acquire().await?;
+    publish_sandbox_states(&mut conn, foreign_node, &[foreign_state]).await?;
+    drop(conn);
+    assert_eq!(
+        sandbox_idle_deadline(&db.pool, sandbox_id).await?,
+        None,
+        "a foreign publisher cannot set the sandbox's idle deadline"
+    );
+
+    assert_eq!(
+        sandbox_updated_at(&db.pool, sandbox_id)
+            .await?
+            .unix_timestamp(),
+        original_updated_at.unix_timestamp(),
+        "publishing an idle deadline must not make the sandbox look updated"
+    );
+    Ok(())
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn publish_sandbox_state_throttles_central_last_used_at() -> TestResult {
     let Some(db) = try_pg_test_db().await? else {

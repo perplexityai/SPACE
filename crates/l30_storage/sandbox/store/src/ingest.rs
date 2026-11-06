@@ -519,6 +519,53 @@ pub async fn advance_published_activity(
     Ok(())
 }
 
+/// Record the idle deadline (`next_auto_event_at`, Unix seconds) the
+/// publisher reported for each of its rows. **Observed projection**: the node
+/// reported when it will next run an automatic lifecycle transition.
+///
+/// `rows` is a recordset of `{sandbox_id, next_auto_event_at}`, with a NULL
+/// deadline when none is scheduled. The deadline moves later each time the
+/// sandbox is used, so a later one is written only once it is a minute or more
+/// past the stored one. An earlier one is written at once, so the stored
+/// deadline is never later than the last one published. The
+/// `sandboxes_set_updated_at` trigger ignores this column. The write re-checks
+/// only that the row is on `node_id`.
+pub async fn record_published_idle_deadlines(
+    executor: impl sqlx::PgExecutor<'_>,
+    node_id: NodeId,
+    rows: Json<JsonValue>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(sql!(
+        "WITH input AS (
+             SELECT *
+               FROM jsonb_to_recordset($2::jsonb) AS input(
+                   sandbox_id UUID,
+                   next_auto_event_at TIMESTAMPTZ
+               )
+         ),
+         deadline AS (
+             SELECT sandbox_id,
+                    FLOOR(EXTRACT(EPOCH FROM next_auto_event_at))::BIGINT AS next_auto_event_at
+               FROM input
+         )
+         UPDATE sandboxes s
+            SET next_auto_event_at = deadline.next_auto_event_at
+           FROM deadline
+          WHERE s.id = deadline.sandbox_id
+            AND s.active_node_id = $1
+            AND (
+                (s.next_auto_event_at IS NULL) <> (deadline.next_auto_event_at IS NULL)
+                OR deadline.next_auto_event_at < s.next_auto_event_at
+                OR deadline.next_auto_event_at >= s.next_auto_event_at + 60
+            )"
+    ))
+    .bind(node_id)
+    .bind(rows)
+    .execute(executor)
+    .await?;
+    Ok(())
+}
+
 /// Converge the publisher's rows it published `stopped` to
 /// `lifecycle = 'stopped'`, returning the ids that converged. **Observed
 /// projection**: the node reported the runtime stopped.

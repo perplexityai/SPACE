@@ -1553,8 +1553,17 @@ fn public_sandbox_from_row(sandbox: PublicSandboxRow) -> Result<PublicSandbox, P
     let failure_code = sandbox
         .has_current_failure
         .then_some(SandboxFailureCode::RuntimeFailure);
+    // The deadline is the one the sandbox's node last published, and only a
+    // node holding the sandbox's runtime schedules one. A suspended or stopped
+    // sandbox keeps the deadline it had when it left its node, so it reports
+    // none.
+    let resident = matches!(
+        state,
+        SandboxLifecycleState::Running | SandboxLifecycleState::Paused
+    );
     let expires_at = sandbox
         .next_auto_event_at
+        .filter(|_| resident)
         .map(OffsetDateTime::from_unix_timestamp)
         .transpose()
         .map_err(|error| {

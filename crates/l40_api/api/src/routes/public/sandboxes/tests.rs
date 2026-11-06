@@ -585,6 +585,27 @@ fn sandbox_idle_deadline_is_nullable_and_serialized_as_rfc3339() {
 }
 
 #[test]
+fn only_a_resident_sandbox_reports_its_idle_deadline() {
+    for (lifecycle, reported) in [
+        ("started", true),
+        ("paused", true),
+        ("suspended", false),
+        ("stopped", false),
+        ("failed", false),
+    ] {
+        let mut row = public_sandbox_row(OffsetDateTime::UNIX_EPOCH, SandboxId::new());
+        row.lifecycle = lifecycle.to_string();
+        row.next_auto_event_at = Some(1_700_000_000);
+        let sandbox = public_sandbox_from_row(row).unwrap();
+        assert_eq!(
+            sandbox.expires_at.map(|time| time.unix_timestamp()),
+            reported.then_some(1_700_000_000),
+            "{lifecycle}"
+        );
+    }
+}
+
+#[test]
 fn sandbox_idle_configuration_requires_one_access_idle_delete_or_suspend_stage() {
     let default_policy = with_native_create_defaults(create_request_with_auto_lifecycle(None))
         .auto_lifecycle
@@ -973,9 +994,10 @@ async fn sandbox_reads_exclude_deleted_tombstones_before_pagination() -> TestDbR
             let row = row.expect("visible sandbox");
             assert_eq!(row.lifecycle, lifecycle);
             let sandbox = public_sandbox_from_row(row).unwrap();
+            // Only a resident sandbox reports its node's idle deadline.
             assert_eq!(
                 sandbox.expires_at.map(|time| time.unix_timestamp()),
-                deadline
+                deadline.filter(|_| lifecycle == "started")
             );
             assert_eq!(sandbox.idle_timeout.as_deref(), Some("21600s"));
             assert_eq!(sandbox.idle_action, Some(SandboxIdleAction::Suspend));
@@ -1001,8 +1023,8 @@ async fn sandbox_reads_exclude_deleted_tombstones_before_pagination() -> TestDbR
     let page = sandboxes_page(rows, 1).expect("visible lifecycles project normally");
     assert_eq!(page.data.len(), 1);
     assert_eq!(
-        page.data[0].expires_at.unwrap().unix_timestamp(),
-        1_800_021_602
+        page.data[0].expires_at, None,
+        "a quarantined sandbox reports no idle deadline"
     );
     assert_eq!(page.data[0].idle_timeout.as_deref(), Some("21600s"));
     assert_eq!(page.data[0].idle_action, Some(SandboxIdleAction::Suspend));

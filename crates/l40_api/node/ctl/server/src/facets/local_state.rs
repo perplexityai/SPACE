@@ -429,6 +429,10 @@ pub(super) fn published_sandbox_state(
         last_used_at: sandbox_last_used_at(sandbox),
         last_access_at: sandbox_last_access_at(sandbox),
         last_command_at: sandbox_last_command_at(sandbox),
+        next_auto_event_at: sandbox
+            .auto_lifecycle_status
+            .as_ref()
+            .and_then(|status| status.next_auto_event_at),
         spaced_version: sandbox_spaced_version(sandbox),
     }
 }

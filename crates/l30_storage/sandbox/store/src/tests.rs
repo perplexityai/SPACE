@@ -504,6 +504,42 @@ async fn update_desired_state_leaves_updated_at_to_the_trigger() -> TestResult {
     Ok(())
 }
 
+/// The idle deadline a node publishes moves whenever the sandbox is used, so
+/// like the activity clocks it is an observation, not a change: writing it
+/// leaves `updated_at` alone, while a real change still stamps it.
+#[tokio::test(flavor = "current_thread")]
+async fn writing_the_idle_deadline_leaves_updated_at_alone() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let id = insert_sandbox(&db.pool, Some("idle-deadline"), "started").await?;
+    let before = read_updated_at(&db.pool, id).await?;
+
+    sqlx::query(sql!(
+        "UPDATE sandboxes SET next_auto_event_at = 1893456000 WHERE id = $1"
+    ))
+    .bind(id)
+    .execute(&db.pool)
+    .await?;
+    assert_eq!(
+        read_updated_at(&db.pool, id).await?,
+        before,
+        "a published idle deadline must not bump updated_at"
+    );
+
+    sqlx::query(sql!(
+        "UPDATE sandboxes SET name = 'idle-deadline-renamed' WHERE id = $1"
+    ))
+    .bind(id)
+    .execute(&db.pool)
+    .await?;
+    assert!(
+        read_updated_at(&db.pool, id).await? > before,
+        "a real change must bump updated_at"
+    );
+    Ok(())
+}
+
 /// The write must compose into a caller's open transaction — the controller
 /// paths that will adopt it write and enqueue their reconcile in one tx.
 #[tokio::test(flavor = "current_thread")]

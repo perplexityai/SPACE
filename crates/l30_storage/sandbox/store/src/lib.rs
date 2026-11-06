@@ -561,8 +561,8 @@ pub struct SandboxDesiredStatePatch<'a> {
 ///
 /// `updated_at` is deliberately not assigned here. The
 /// `sandboxes_set_updated_at` trigger stamps it, and only when a column
-/// outside `{updated_at, last_used_at, last_access_at, last_command_at}`
-/// actually changed; writing it explicitly makes the trigger return early
+/// outside `{updated_at, last_used_at, last_access_at, last_command_at,
+/// next_auto_event_at}` actually changed; writing it explicitly makes the trigger return early
 /// and defeats that no-op detection.
 ///
 /// This row carries four further `BEFORE UPDATE` triggers, two of which

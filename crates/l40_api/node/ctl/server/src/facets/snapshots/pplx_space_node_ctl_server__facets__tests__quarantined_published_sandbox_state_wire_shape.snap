@@ -1,5 +1,6 @@
 ---
 source: crates/l40_api/node/ctl/server/src/facets/tests.rs
+assertion_line: 1298
 expression: state
 ---
 PublishedSandboxState {
@@ -56,4 +57,5 @@ PublishedSandboxState {
     state_changed_at: None,
     quarantine_recovery: None,
     activation_attempt_id: None,
+    next_auto_event_at: None,
 }

@@ -1751,6 +1751,11 @@ pub async fn publish_sandbox_states_with_retirement(
                     .as_ref()
                     .map(|timestamp| proto_timestamp_to_rfc3339(timestamp, "last_command_at"))
                     .transpose()?,
+                next_auto_event_at: state
+                    .next_auto_event_at
+                    .as_ref()
+                    .map(|timestamp| proto_timestamp_to_rfc3339(timestamp, "next_auto_event_at"))
+                    .transpose()?,
                 network_tx_bytes: state
                     .network_tx_bytes
                     .map(|value| u64_to_i64(value, "network_tx_bytes"))
@@ -2187,6 +2192,7 @@ pub async fn publish_sandbox_states_with_retirement(
     }));
     reconcile_recovery_observations(conn, node_id, &rows).await?;
     update_activity_timestamps(conn, node_id, &rows).await?;
+    record_idle_deadlines(conn, node_id, &rows).await?;
 
     let first_seen_sandbox_ids = accepted_rows
         .iter()
@@ -3539,6 +3545,30 @@ async fn update_activity_timestamps(
     )
     .await
     .map_err(|err| Status::internal(format!("update sandbox last_used_at from publish: {err}")))?;
+    Ok(())
+}
+
+/// Record the publishing node's idle deadlines, which `getSandbox` reports as
+/// `expires_at`.
+async fn record_idle_deadlines(
+    conn: &mut sqlx::PgConnection,
+    node_id: NodeId,
+    rows: &[PublishedSandboxRow],
+) -> Result<(), Status> {
+    let deadline_rows = rows
+        .iter()
+        .map(PublishedSandboxRow::idle_deadline_projection)
+        .collect::<Vec<_>>();
+    let deadline_rows = Json(serde_json::to_value(deadline_rows).map_err(|error| {
+        Status::internal(format!("serialize published idle deadlines: {error}"))
+    })?);
+    pplx_space_sandbox_store::ingest::record_published_idle_deadlines(
+        &mut *conn,
+        node_id,
+        deadline_rows,
+    )
+    .await
+    .map_err(|err| Status::internal(format!("record published idle deadlines: {err}")))?;
     Ok(())
 }
 
