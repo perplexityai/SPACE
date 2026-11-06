@@ -290,14 +290,16 @@ step('sandboxes-search-id', ['sandboxes'], async (c) => {
   c.rec.check(await content(c.page).locator('tbody tr.ant-table-row', { hasText: shortLabel(id) }).count() === 1, 'searching a full sbx_ ID finds the sandbox');
 });
 
-// The search box's text goes to the server's `search` (a name prefix
-// ignoring case, or the end or start of an ID's hex digits, such as the ID
-// column's label), so a match beyond the loaded page is found. An API
+// An ID's hex digits typed in the search box go to the server's `search`,
+// which matches the end of an ID (such as the ID column's label) or, from 8
+// digits, its start, so a match beyond the loaded page is found. An API
 // without `search` refuses it with a 400 naming the parameter, and the
 // console then searches as before: a case-sensitive `prefix` request, and a
-// match within the page for hex text. `server` and `fallback` are those two
-// answers; anything else, a timeout included, is `failed`, and fails the
-// step. A fallback carries the answer to its `prefix` request, once rendered.
+// match within the page for hex digits alone. `server` and `fallback` are
+// those two answers; anything else, a timeout included, is `failed`, and
+// fails the step. A fallback carries the answer to its `prefix` request,
+// once rendered. Other text never goes to `search`
+// (`sandboxes-search-name-prefix`).
 type SearchAnswer =
   | { kind: 'server' | 'failed' }
   | { kind: 'fallback'; prefixAnswer: { sandboxes: { resource_type?: string }[] } | null };
@@ -355,21 +357,85 @@ step('sandboxes-search-label', ['sandboxes'], async (c) => {
   }
 });
 
-step('sandboxes-search-name-case', ['sandboxes'], async (c) => {
-  const id = sandboxId(c, 'suspended');
-  if (!id) return c.rec.check(false, 'the seed has a suspended sandbox');
+// An ID start goes to `search` too. Its first 8 hex digits, the fewest the
+// server matches an ID start with, list what the API answers for them, the
+// sandbox among them. Typed as the dashed first 12, a millisecond of
+// creation time, they list the sandbox alone. On an API without `search`
+// the fallback sends the dashed start as an ID prefix, which lists the
+// sandbox among the IDs it starts.
+step('sandboxes-search-id-start', ['sandboxes'], async (c) => {
+  const id = sandboxId(c, 'running');
+  if (!id) return c.rec.check(false, 'the seed has a running sandbox');
   await visit(c, '/dashboard/sandboxes?age=all&page_size=25', 2000);
-  const name = `${c.config.prefix}-suspended`;
-  const typed = name.toUpperCase();
-  const answer = await typeSearch(c, typed);
+  const uuid = id.replace(/^sbx_/, '');
+  const label = shortLabel(id);
+  const start = uuid.slice(0, 8);
+  const shortest = await typeSearch(c, start);
+  if (shortest.kind === 'server') {
+    const api = await adminFetch(c.page, 'GET', `/admin/api/v1/sandboxes?limit=25&cursor=&search=${start}`);
+    const answered = ((api.json?.sandboxes ?? []) as { id: string }[]).map((row) => shortLabel(row.id));
+    const labels = await listedLabels(c);
+    c.rec.check(answered.includes(label), `the API's answer to the 8-digit ID start ${start} holds the sandbox (${answered.join(', ')})`);
+    c.rec.check(JSON.stringify(labels) === JSON.stringify(answered), `the 8-digit ID start lists the API's answer (${labels.join(', ')})`);
+  }
+  // Again from a fresh page: after a fallback the page sends no `search`
+  // until it is reloaded.
+  await visit(c, '/dashboard/sandboxes?age=all&page_size=25', 2000);
+  const dashed = uuid.slice(0, 13);
+  const answer = await typeSearch(c, dashed);
   const labels = await listedLabels(c);
   if (answer.kind === 'server') {
-    c.rec.check(labels.length === 1 && labels[0] === shortLabel(id), `searching ${typed} lists ${name} alone (${labels.join(', ')})`);
-  } else if (answer.kind === 'fallback' && answer.prefixAnswer) {
-    // A case-sensitive prefix, as before: the table lists what it answered.
-    const answeredRows = answer.prefixAnswer.sandboxes.filter((row) => row.resource_type === 'sandbox').length;
-    c.rec.check(labels.length === answeredRows, `the fallback lists the ${answeredRows} rows its case-sensitive prefix answered (${labels.length})`);
+    c.rec.check(labels.length === 1 && labels[0] === label, `searching the ID start ${dashed} lists that sandbox alone (${labels.join(', ')})`);
+  } else if (answer.kind === 'fallback') {
+    c.rec.check(labels.includes(label), `the fallback's ID prefix ${dashed} lists the sandbox (${labels.join(', ')})`);
   }
+});
+
+// A name goes to `prefix`, case-sensitive, as on a server without `search`,
+// and never to `search`, which matches IDs only. Typed as named, the seeded
+// name lists its sandbox alone; in upper case it lists nothing. Hex digits
+// too few for an ID search, such as three of a label, are matched within the
+// page as well, so a row on the page whose label carries them is listed.
+step('sandboxes-search-name-prefix', ['sandboxes'], async (c) => {
+  const suspended = sandboxId(c, 'suspended');
+  const running = sandboxId(c, 'running');
+  if (!suspended || !running) return c.rec.check(false, 'the seed has a suspended and a running sandbox');
+  await visit(c, '/dashboard/sandboxes?age=all&page_size=25', 2000);
+  const runningOnPage = (await listedLabels(c)).includes(shortLabel(running));
+  const searched: string[] = [];
+  const onRequest = (req: Request) => {
+    const url = new URL(req.url());
+    if (isListRequest(url) && url.searchParams.has('search')) searched.push(url.searchParams.get('search') ?? '');
+  };
+  const typePrefix = async (typed: string) => {
+    const answered = c.page.waitForResponse((res) => {
+      const url = new URL(res.url());
+      return isListRequest(url) && url.searchParams.get('prefix') === typed;
+    }, { timeout: 10_000 }).catch(() => null);
+    await content(c.page).locator('input[placeholder*="ID"]').first().fill(typed);
+    const res = await answered;
+    await settle(c.page, 1500);
+    c.rec.check(res?.ok() === true, `"${typed}" was sent as prefix and answered (${res ? res.status() : 'no answer'})`);
+    return listedLabels(c);
+  };
+  c.page.on('request', onRequest);
+  try {
+    const name = `${c.config.prefix}-suspended`;
+    let labels = await typePrefix(name);
+    c.rec.check(labels.length === 1 && labels[0] === shortLabel(suspended), `searching ${name} lists it alone (${labels.join(', ')})`);
+    labels = await typePrefix(name.toUpperCase());
+    c.rec.check(labels.length === 0, `the name prefix is case-sensitive: ${name.toUpperCase()} lists nothing (${labels.join(', ')})`);
+    const piece = shortLabel(running).slice(-3);
+    labels = await typePrefix(piece);
+    if (runningOnPage) {
+      c.rec.check(labels.includes(shortLabel(running)), `"${piece}", too few digits for an ID search, is matched within the page (${labels.join(', ')})`);
+    } else {
+      c.rec.note('the running sandbox is not on the first page, so the match within the page is not checked');
+    }
+  } finally {
+    c.page.off('request', onRequest);
+  }
+  c.rec.check(searched.length === 0, `no name or short text was sent as search (${searched.join(', ')})`);
 });
 
 // The cursor of the page after `row`, as the admin list encodes one:
