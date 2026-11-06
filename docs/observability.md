@@ -759,6 +759,26 @@ resume notice, and since a restore that ends paused sends none, sandbox-manager
 also drops the first drain after every restore. A guest that predates the
 field sends none.
 
+## Sandbox OOM kills
+
+When a sandbox cgroup is removed, the node reads its hierarchical
+`memory.events` and, if the kernel OOM killer ended any process in it, counts
+them once. The cause depends on whose `memory.max` was reached:
+
+- `sandbox_limit`: the sandbox cgroup, or one inside it, reached its own
+  limit. For the `vm` cgroup that is the guest memory plus the per-sandbox
+  headroom.
+- `node_pressure`: the sandbox never reached its own limit, so the kill came
+  from above it: the shared sandbox parent's cap or a host-wide OOM.
+
+| Metric | Type | Tags |
+| --- | --- | --- |
+| `node_memory.sandbox_oom_kills` | counter | `cgroup` (`vm`, `sidecar`), `cause` (`sandbox_limit`, `node_pressure`) |
+
+Each counted cgroup also logs a `sandbox cgroup had OOM kills` warning with
+the sandbox id, cause, kill count, and limit hits. An OOM kill inside the
+guest happens in the guest kernel and is not counted here.
+
 ## Sandbox identity
 
 Telemetry names a sandbox by one canonical value, its bare lowercase UUID

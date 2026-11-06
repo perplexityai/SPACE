@@ -35,6 +35,7 @@ pub mod node_group_labeler;
 pub mod node_group_mirror;
 pub mod node_group_placement;
 pub mod node_manager;
+pub mod node_memory;
 pub mod node_network;
 pub mod node_service_readiness;
 pub mod object_store;
