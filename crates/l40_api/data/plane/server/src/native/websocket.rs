@@ -608,6 +608,10 @@ pub(crate) async fn bridge_process_session(
                                 matches!(frame, DataPlaneServerFrame::ProcessExited { .. })
                             }) {
                                 settle_process_binding(&mut binding).await?;
+                                if let Some(process_id) = process_id.as_ref() {
+                                    record_session_process_exited(&state, session_id, process_id)
+                                        .await;
+                                }
                             }
                             record_process_output_bytes(attached.kind.as_str(), &batch);
                             for mut frame in batch.frames {

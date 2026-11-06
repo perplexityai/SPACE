@@ -1,4 +1,5 @@
-//! Binding a session to its process and recording reconnects.
+//! Binding a session to its process, recording its exit, and recording
+//! reconnects.
 
 use super::*;
 
@@ -50,6 +51,9 @@ pub(crate) async fn bind_session_process(
                      WHEN d.backend_process_id IS NULL THEN NOW()
                      ELSE d.backend_process_bound_at
                  END,
+                 -- The bound process has started: the session is open until
+                 -- a stream reports its exit or the session is revoked.
+                 state = CASE WHEN d.state = 'pending' THEN 'open' ELSE d.state END,
                  updated_at = NOW()
              FROM target
              WHERE d.session_id = target.session_id
@@ -102,6 +106,39 @@ pub(crate) async fn bind_session_process(
             "process-backed data-plane session not found",
         )),
     }
+}
+
+/// Closes a terminal or process session whose bound process a stream saw
+/// exit. Only a pending or open session bound to `process_id` closes: a
+/// revoked one stays revoked, and a stale report about another process
+/// changes nothing. Repeating it is a no-op that reports `closed: false`.
+pub(crate) async fn record_session_process_exited(
+    pool: &sqlx::PgPool,
+    request: RecordDataPlaneSessionProcessExitedRequest,
+) -> Result<RecordDataPlaneSessionProcessExitedResponse, Status> {
+    let session_id = required(&request.session_id, "session_id")?;
+    let protocol_session_id = optional(request.protocol_session_id.as_deref());
+    let process_id = required(&request.process_id, "process_id")?;
+    let closed = sqlx::query(sql!(
+        "UPDATE data_plane_sessions
+         SET state = 'closed',
+             updated_at = NOW()
+         WHERE session_id = $1
+           AND ($2::TEXT IS NULL OR protocol_session_id = $2)
+           AND kind IN ('terminal', 'process')
+           AND backend_process_id = $3
+           AND state IN ('pending', 'open')
+           AND (expires_at IS NULL OR expires_at > NOW())"
+    ))
+    .bind(&session_id)
+    .bind(protocol_session_id.as_deref())
+    .bind(&process_id)
+    .execute(pool)
+    .await
+    .map_err(|error| Status::internal(format!("record data-plane session exit: {error}")))?
+    .rows_affected()
+        > 0;
+    Ok(RecordDataPlaneSessionProcessExitedResponse { closed })
 }
 
 pub(crate) async fn record_session_reconnect(

@@ -2056,8 +2056,12 @@ pub struct PublicCommand {
         schemars(schema_with = "schema::public_sandbox_id")
     )]
     pub sandbox_id: PublicSandboxId,
-    /// Session state, not proof of command success. Read the process_exited
-    /// event and exit result from the command's stream.
+    /// Session state, not proof of command success: `pending` until an
+    /// attach starts the command, `open` while it runs, and `closed` once an
+    /// event stream has delivered its `process_exited`. A command that exits
+    /// while no stream is attached stays `open` until a reattach delivers the
+    /// exit. A revoked session is `revoked`. Read the process_exited event and
+    /// exit result from the command's stream.
     pub state: SessionState,
     /// Attachment destination and credentials when available.
     pub attach: Option<DataPlaneAttachInfo>,
