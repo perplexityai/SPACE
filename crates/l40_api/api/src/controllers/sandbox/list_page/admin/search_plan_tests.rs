@@ -2,20 +2,20 @@
 //!
 //! Which rows a search lists is covered in `tests`; this covers how many it
 //! reads. A search usually matches a few sandboxes of a large table, so the
-//! statement has to find them through the indexes on the lowercased name and
-//! the reversed ID rather than walk the table in list order. A cached
-//! statement can switch to a generic plan, which knows neither the text nor
-//! its ID range, so the bound has to hold under both plan modes.
+//! statement has to find them through the index on the reversed ID and the
+//! primary key rather than walk the table in list order. A cached statement
+//! can switch to a generic plan, which knows none of its ID ranges, so the
+//! bound has to hold under both plan modes.
 //!
 //! [`a_search_reads_only_the_rows_it_matches`] explains the page statement
-//! and the unpaged one for a name prefix in another case, at full length and
-//! at the three characters a search needs, an ID label, an eight-digit ID
-//! start of UUIDv7-shaped IDs spread over time, and a text nothing matches, under both modes, and bounds the rows every plan
-//! node handles by [`MAX_ROWS_HANDLED`]. The fixture is many times larger, so
-//! a plan that reads the table fails. To show that the bound is what the
-//! indexes buy, it then drops both and requires the generic plan of each
-//! statement to exceed it. It reads rows off the plan through
-//! [`crate::public_operations::plan_explain`].
+//! and the unpaged one for an ID label, the four digits of the shortest ID
+//! end, an eight-digit ID start of UUIDv7-shaped IDs spread over time, and
+//! digits no ID starts or ends with, under both modes, and bounds the rows
+//! every plan node handles by [`MAX_ROWS_HANDLED`]. The fixture is many times
+//! larger, so a plan that reads the table fails. To show that the bound is
+//! what the ID-end index buys, it then drops it and requires the generic plan
+//! of each statement to exceed the bound for the label. It reads rows off the
+//! plan through [`crate::public_operations::plan_explain`].
 
 use futures_util::future::try_join_all;
 use pplx_space_common_core::sql;
@@ -39,9 +39,8 @@ const MAX_ROWS_HANDLED: f64 = 500.0;
 const FIRST_CREATED_MS: i64 = 1_790_000_000_000;
 const CREATED_EVERY_MS: i64 = 10_000;
 
-/// The fixture's sandboxes: [`SANDBOXES`] with names sharing one prefix, of
-/// which three are named `Needle-…`, with UUIDv7-shaped IDs, and one more
-/// with a known ID.
+/// The fixture's sandboxes: [`SANDBOXES`] with UUIDv7-shaped IDs, and one
+/// more with a known ID.
 struct Fixture {
     /// The console's label for `labelled`: its ID's last eight hex digits.
     label: String,
@@ -57,11 +56,13 @@ async fn a_search_reads_only_the_rows_it_matches() -> TestResult {
     let pool = &db.pool;
     let fixture = seed(pool).await?;
     let searches = [
-        ("a name prefix in another case", "nEEDLE".to_string()),
-        ("the shortest name prefix, three letters", "NEE".to_string()),
         ("an ID label", fixture.label.clone()),
+        (
+            "the shortest ID end, four digits",
+            fixture.label.chars().skip(4).collect(),
+        ),
         ("an eight-digit ID start", fixture.id_start.clone()),
-        ("a text nothing matches", "no-such-sandbox".to_string()),
+        ("digits no ID starts or ends with", "00000000".to_string()),
     ];
     let statements = [
         ("page", Statement::Page),
@@ -88,18 +89,16 @@ async fn a_search_reads_only_the_rows_it_matches() -> TestResult {
         );
     }
 
-    sqlx::query(sql!(
-        "DROP INDEX idx_sandboxes_id_suffix, idx_sandboxes_name_lower"
-    ))
-    .execute(pool)
-    .await?;
+    sqlx::query(sql!("DROP INDEX idx_sandboxes_id_suffix"))
+        .execute(pool)
+        .await?;
     for (statement_label, statement) in statements {
         let plan = explain(pool, statement, &fixture.label, "force_generic_plan").await?;
         let handled = plan.rows_handled();
         assert!(
             handled > MAX_ROWS_HANDLED,
-            "{statement_label} without the indexes: handled {handled} rows, within the bound \
-             the indexes are to buy. Rows handled by node:{}",
+            "{statement_label} without the ID-end index: handled {handled} rows, within the \
+             bound the index is to buy. Rows handled by node:{}",
             plan.outline()
         );
     }
@@ -122,23 +121,18 @@ async fn explain(
     plan_cache_mode: &str,
 ) -> TestResult<PlanNode> {
     let search = SandboxSearch::new(text)?.ok_or("an empty search")?;
-    let binds = SearchBinds::new(pool, &search).await?;
-    let literal = |value: Option<String>| {
-        value.map_or("NULL".to_string(), |value| {
-            format!("'{}'", value.replace('\'', "''"))
-        })
-    };
+    // Hex digits, `:`, `g` and a UUID's text: nothing to quote.
+    let literal =
+        |value: Option<String>| value.map_or("NULL".to_string(), |value| format!("'{value}'"));
+    let (suffix_low, suffix_high) = &search.id_suffix;
     let search_values = [
-        literal(Some(binds.text.to_string())),
-        literal(Some(binds.name_key.0.clone())),
-        literal(Some(binds.name_key.1.clone())),
-        literal(binds.id_suffix.map(|(low, _)| low.clone())),
-        literal(binds.id_suffix.map(|(_, high)| high.clone())),
-        literal(binds.id_prefix.map(|(low, _)| low.to_string())),
-        literal(binds.id_prefix.map(|(_, high)| high.to_string())),
+        literal(Some(suffix_low.clone())),
+        literal(Some(suffix_high.clone())),
+        literal(search.id_prefix.map(|(low, _)| low.to_string())),
+        literal(search.id_prefix.map(|(_, high)| high.to_string())),
     ]
     .join(", ");
-    let search_types = "text, text, text, text, text, uuid, uuid";
+    let search_types = "text, text, uuid, uuid";
     let filters = "NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL";
     let filter_types =
         "uuid, text[], text, uuid, timestamptz, timestamptz, text, uuid, uuid, uuid, boolean";
@@ -175,7 +169,7 @@ async fn seed(pool: &PgPool) -> TestResult<Fixture> {
              (id, name, user_id, org_id, managed_by, lifecycle, network_policy_generation)
          SELECT (lpad(to_hex($4 + g * $5), 12, '0') || '7' || substr(md5(g::text), 1, 3)
                  || '8' || substr(md5(g::text), 4, 15))::UUID,
-                CASE WHEN g <= 3 THEN 'Needle-' || g ELSE 'sandbox-' || g END,
+                'sandbox-' || g,
                 $1, $2, 'k8s', 'started', 1
            FROM generate_series(1, $3) g"
     ))

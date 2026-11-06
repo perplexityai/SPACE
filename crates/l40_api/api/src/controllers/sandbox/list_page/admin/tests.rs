@@ -536,14 +536,6 @@ async fn each_filter_returns_exactly_its_rows() -> TestDbResult<()> {
             &[],
         ),
         (
-            "search ignores the name's case",
-            AdminSandboxFilter {
-                search: search("ALPHA"),
-                ..AdminSandboxFilter::default()
-            },
-            &[0, 1, 5],
-        ),
-        (
             "search for the console's label, the ID's last eight digits",
             AdminSandboxFilter {
                 search: search("00000001"),
@@ -566,14 +558,6 @@ async fn each_filter_returns_exactly_its_rows() -> TestDbResult<()> {
                 ..AdminSandboxFilter::default()
             },
             &[0, 2, 3, 4, 5],
-        ),
-        (
-            "search for fewer digits is a name prefix only",
-            AdminSandboxFilter {
-                search: search("000"),
-                ..AdminSandboxFilter::default()
-            },
-            &[],
         ),
         (
             "search matches the start of an ID too, without its dashes",
@@ -618,7 +602,7 @@ async fn each_filter_returns_exactly_its_rows() -> TestDbResult<()> {
         (
             "search is trimmed",
             AdminSandboxFilter {
-                search: search("  beta  "),
+                search: search("  2abc0000  "),
                 ..AdminSandboxFilter::default()
             },
             &[2],
@@ -626,20 +610,20 @@ async fn each_filter_returns_exactly_its_rows() -> TestDbResult<()> {
         (
             "search with a template",
             AdminSandboxFilter {
-                search: search("alpha"),
+                search: search("0000"),
                 template: template("node"),
                 ..AdminSandboxFilter::default()
             },
-            &[5],
+            &[2, 5],
         ),
         (
             "search with a user",
             AdminSandboxFilter {
-                search: search("alpha"),
+                search: search("0000"),
                 user_id: Some(first_user.user_id),
                 ..AdminSandboxFilter::default()
             },
-            &[0, 1],
+            &[0, 3],
         ),
         (
             "search with a node",
@@ -660,9 +644,9 @@ async fn each_filter_returns_exactly_its_rows() -> TestDbResult<()> {
             &[2, 3],
         ),
         (
-            "search and prefix both apply",
+            "search and a name prefix both apply",
             AdminSandboxFilter {
-                search: search("alpha"),
+                search: search("sbx_10000000"),
                 prefix: prefix("alpha-t"),
                 ..AdminSandboxFilter::default()
             },
@@ -671,11 +655,11 @@ async fn each_filter_returns_exactly_its_rows() -> TestDbResult<()> {
         (
             "search with another filter",
             AdminSandboxFilter {
-                search: search("alpha"),
+                search: search("0000"),
                 lifecycles: lifecycles(&["started", "paused"]),
                 ..AdminSandboxFilter::default()
             },
-            &[0, 1],
+            &[0, 4],
         ),
         // Without its node filter the unassigned case lists rows 0, 1 and 3,
         // and the on-a-node case rows 1 and 3, so the node filter decides each
@@ -959,26 +943,54 @@ fn an_id_prefix_is_the_range_of_ids_it_starts() {
     }
 }
 
+/// A search is an ID's hex digits, trimmed: 4 to 32 of them after an
+/// optional `sbx_` in either case, with any dashes. Anything else, a name
+/// included, is refused.
 #[test]
-fn a_search_is_trimmed_and_at_least_three_characters() {
-    assert_eq!(SandboxSearch::new(""), Ok(None));
-    assert_eq!(SandboxSearch::new("   "), Ok(None));
-    assert_eq!(SandboxSearch::new("ab"), Err(SearchTooShort));
-    assert_eq!(SandboxSearch::new(" ab "), Err(SearchTooShort));
-    assert_eq!(SandboxSearch::new("é\u{10FFFF}"), Err(SearchTooShort));
-    let search = SandboxSearch::new("  abc ")
-        .expect("valid")
-        .expect("a search");
-    assert_eq!(search.text, "abc");
-    assert_eq!(
-        search.id_suffix, None,
-        "three digits are a name prefix only"
-    );
+fn a_search_takes_only_an_ids_hex_digits() {
+    for blank in ["", "   "] {
+        assert_eq!(SandboxSearch::new(blank), Ok(None), "{blank:?}");
+    }
+    let longest = "f".repeat(32);
+    for accepted in [
+        "0a1b",
+        " 0a1b ",
+        "SBX_0a1b",
+        "sbx_0A-1B",
+        "0a1b2c3d",
+        &longest,
+    ] {
+        assert!(
+            matches!(SandboxSearch::new(accepted), Ok(Some(_))),
+            "{accepted:?}"
+        );
+    }
+    let too_long = "f".repeat(33);
+    for refused in [
+        // Three digits, one too few for an ID's end.
+        "0a1",
+        "sbx_0a1",
+        "beta",
+        "alpha-one",
+        "worker 0a1b",
+        "0a1g",
+        "sbx_",
+        "----",
+        "sbx-0a1b",
+        "\u{10FFFF}0a1b",
+        &too_long,
+    ] {
+        assert_eq!(
+            SandboxSearch::new(refused),
+            Err(NotAnIdSearch),
+            "{refused:?}"
+        );
+    }
 }
 
 #[test]
 fn an_id_search_is_the_ranges_its_hex_digits_start_and_end() {
-    let suffix = |low: &str, high: &str| Some((low.to_string(), high.to_string()));
+    let suffix = |low: &str, high: &str| (low.to_string(), high.to_string());
     let prefix = |low: &str, high: &str| Some((fixed_id(low), fixed_id(high)));
     let cases = [
         (
@@ -1012,90 +1024,12 @@ fn an_id_search_is_the_ranges_its_hex_digits_start_and_end() {
                 "0123abcd-ef01-2345-6789-abcdef012345",
             ),
         ),
-        ("abc", None, None),
-        ("sbx_abc", None, None),
-        ("beta", None, None),
-        ("0123abcdef0123456789abcdef0123456", None, None),
     ];
     for (text, expected_suffix, expected_prefix) in cases {
         let search = SandboxSearch::new(text).expect("valid").expect("a search");
         assert_eq!(search.id_suffix, expected_suffix, "{text:?} suffix");
         assert_eq!(search.id_prefix, expected_prefix, "{text:?} prefix");
     }
-}
-
-#[test]
-fn a_key_range_ends_at_the_least_string_above_every_key_it_starts() {
-    let max = char::MAX.to_string();
-    let cases = [
-        ("abc".to_string(), "abd".to_string()),
-        ("ab9".to_string(), "ab:".to_string()),
-        (format!("ab{max}"), "ac".to_string()),
-        (format!("ab{max}{max}"), "ac".to_string()),
-        ("a\u{D7FF}".to_string(), "a\u{E000}".to_string()),
-        (max.repeat(3), max.repeat(NAME_KEY_CHARS + 1)),
-    ];
-    for (key, high) in cases {
-        assert_eq!(name_key_range(key.clone()), (key.clone(), high), "{key:?}");
-    }
-}
-
-/// A name search's range ends at its key's successor, so a name that
-/// continues past the text with U+10FFFF, the greatest character, matches,
-/// and so does a text that ends in it; on the page and the unpaged list.
-#[tokio::test]
-async fn a_name_search_finds_names_continuing_with_the_greatest_character() -> TestDbResult<()> {
-    let db = pg_test_db().await?;
-    let owner = seed_owner(&db.pool).await?;
-    let at = |minutes: i64| base_time() + Duration::minutes(minutes);
-    let mut ids = Vec::new();
-    for (minute, name) in [
-        (0, "Edge\u{10FFFF}one"),
-        (1, "edge\u{10FFFF}\u{10FFFF}"),
-        (2, "edgf"),
-        (3, "edge"),
-    ] {
-        let id = SandboxId::new();
-        sqlx::query(sql!(
-            "INSERT INTO sandboxes (
-                 id, name, user_id, org_id, managed_by, lifecycle, placement,
-                 network_policy_generation, created_at
-             )
-             VALUES ($1, $2, $3, $4, $5, 'started', 'placed', 1, $6)"
-        ))
-        .bind(id)
-        .bind(name)
-        .bind(owner.user_id)
-        .bind(owner.org_id)
-        .bind(SubstrateKind::Kubernetes)
-        .bind(at(minute))
-        .execute(&db.pool)
-        .await?;
-        ids.push(id);
-    }
-    for (text, expected) in [
-        ("EDGE", vec![ids[3], ids[1], ids[0]]),
-        ("edge\u{10FFFF}", vec![ids[1], ids[0]]),
-        ("edge\u{10FFFF}\u{10FFFF}", vec![ids[1]]),
-        ("edg", vec![ids[3], ids[2], ids[1], ids[0]]),
-    ] {
-        let filter = AdminSandboxFilter {
-            search: SandboxSearch::new(text).expect("valid"),
-            ..AdminSandboxFilter::default()
-        };
-        assert_eq!(
-            listed_ids(&db.pool, &filter).await?,
-            expected,
-            "{text:?}: page"
-        );
-        assert_eq!(
-            unpaged_ids(&db.pool, &filter).await?,
-            expected,
-            "{text:?}: unpaged"
-        );
-    }
-    db.pool.close().await;
-    Ok(())
 }
 
 /// A list walked a page at a time with the cursor returns its unpaged rows,
@@ -1107,21 +1041,30 @@ async fn a_list_walks_by_cursor_to_its_unpaged_rows() -> TestDbResult<()> {
     let db = pg_test_db().await?;
     let owner = seed_owner(&db.pool).await?;
     let at = |minutes: i64| base_time() + Duration::minutes(minutes);
-    for (minute, name) in [
-        (0, "walk-a"),
-        (1, "other"),
-        (1, "Walk-b"),
-        (1, "WALK-c"),
-        (1, "walk-d"),
-        (2, "walk-e"),
-        (3, "elsewhere"),
-        (4, "walk-f"),
-    ] {
+    // The searched rows' IDs end in `c0ffee00`; the others' do not.
+    for (index, (minute, searched)) in [
+        (0, true),
+        (1, false),
+        (1, true),
+        (1, true),
+        (1, true),
+        (2, true),
+        (3, false),
+        (4, true),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let tail = if searched {
+            "0000c0ffee00"
+        } else {
+            "000000000000"
+        };
         seed_sandbox(
             &db.pool,
             owner,
             SeedSandbox {
-                name: Some(name),
+                id: Some(fixed_id(&format!("{index:08x}-0000-7000-8000-{tail}"))),
                 created_at: Some(at(minute)),
                 ..SeedSandbox::default()
             },
@@ -1132,7 +1075,7 @@ async fn a_list_walks_by_cursor_to_its_unpaged_rows() -> TestDbResult<()> {
         (
             "search",
             AdminSandboxFilter {
-                search: SandboxSearch::new("walk-").expect("valid"),
+                search: SandboxSearch::new("c0ffee00").expect("valid"),
                 ..AdminSandboxFilter::default()
             },
         ),

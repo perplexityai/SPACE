@@ -83,7 +83,7 @@ pub struct AdminSandboxListQuery {
     #[serde(default, deserialize_with = "empty_as_unset")]
     created_before: Option<String>,
     prefix: Option<String>,
-    /// A name prefix ignoring case, or an ID suffix; see `SandboxSearch`.
+    /// The end or start of an ID's hex digits; see `SandboxSearch`.
     search: Option<String>,
 }
 

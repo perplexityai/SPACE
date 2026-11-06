@@ -15,14 +15,12 @@
 //! filter most rows pass and for a page that fills early, but a search
 //! usually matches a few rows of a large table, and walking the table to find
 //! them reads all of it. Required, the search's two ranges are index
-//! conditions on `idx_sandboxes_name_lower` and `idx_sandboxes_id_suffix`
-//! under either plan. They are read first, in a `MATERIALIZED` CTE, and the
-//! other filters and the cursor apply to those rows only: unfenced, a generic
-//! plan ANDs the search's bitmap with one for the cursor's `created_at`
-//! bound, which on the first page holds every row. So a search reads the
-//! rows it matches and sorts those (`search_plan_tests`). A text that starts
-//! most names reads most of the table, under either plan, where a list in
-//! `created_at` order could stop at the page.
+//! conditions on `idx_sandboxes_id_suffix` and the primary key under either
+//! plan. They are read first, in a `MATERIALIZED` CTE, and the other filters
+//! and the cursor apply to those rows only: unfenced, a generic plan ANDs the
+//! search's bitmap with one for the cursor's `created_at` bound, which on the
+//! first page holds every row. So a search reads the rows it matches and
+//! sorts those (`search_plan_tests`).
 
 use std::str::FromStr;
 use std::sync::LazyLock;
@@ -174,67 +172,63 @@ impl SandboxPrefix {
     }
 }
 
-/// What the console's search box finds: a sandbox row whose name starts with
-/// the text, ignoring case, or whose ID ends or starts with the text, when the
-/// text is an ID's hex digits. The ID's end is what the console labels a
-/// sandbox with, since a UUIDv7 starts with its creation time.
+/// What the console's search box finds: a sandbox row whose ID ends or starts
+/// with the text's hex digits. The ID's end is what the console labels a
+/// sandbox with, since a UUIDv7 starts with its creation time. Names are
+/// matched by [`SandboxPrefix`] instead.
 ///
-/// The text is trimmed and must be at least [`MIN_SEARCH_CHARS`] characters:
-/// a shorter name prefix matches too many rows for the search to read and
-/// sort on every page. The text's hex digits are those left after an
-/// optional `sbx_` in either case and its dashes, when nothing else is left.
-/// IDs that end with them match from [`MIN_ID_SUFFIX_DIGITS`] digits, which
-/// are random. IDs that start with them match from [`MIN_ID_PREFIX_DIGITS`]:
-/// a UUIDv7 starts with its creation time in milliseconds, so four digits
-/// span about 50 days of sandboxes and eight about a minute. Both sides of the name match are lowercased by Postgres's
-/// `lower()`, the one the index is built with, so the text is bound as
-/// given; the controller reads its index key back before it searches
-/// ([`name_key_range`]). The node-reported rows never match (see
-/// [`AdminSandboxFilter::is_unfiltered`]).
+/// The text is trimmed, and its hex digits are those left after an optional
+/// `sbx_` in either case and its dashes; any other character, or fewer than
+/// [`MIN_ID_SUFFIX_DIGITS`] or more than 32 digits, is [`NotAnIdSearch`]. IDs
+/// that end with them match from [`MIN_ID_SUFFIX_DIGITS`] digits, which are
+/// random. IDs that start with them match from [`MIN_ID_PREFIX_DIGITS`]: a
+/// UUIDv7 starts with its creation time in milliseconds, so four digits span
+/// about 50 days of sandboxes and eight about a minute. The node-reported
+/// rows never match (see [`AdminSandboxFilter::is_unfiltered`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SandboxSearch {
-    text: String,
-    /// The IDs ending in the text, as a range of their undashed hex reversed
-    /// (`idx_sandboxes_id_suffix`): at least the reversed suffix and below
-    /// it with its last digit incremented.
-    id_suffix: Option<(String, String)>,
-    /// The lowest and highest IDs that start with the text's hex digits,
-    /// when there are at least [`MIN_ID_PREFIX_DIGITS`] of them.
+    /// The IDs ending in the digits, as a range of their undashed hex
+    /// reversed (`idx_sandboxes_id_suffix`): at least the reversed digits and
+    /// below them with their last digit incremented.
+    id_suffix: (String, String),
+    /// The lowest and highest IDs that start with the digits, when there are
+    /// at least [`MIN_ID_PREFIX_DIGITS`] of them.
     id_prefix: Option<(SandboxId, SandboxId)>,
 }
 
-/// A search text shorter than [`MIN_SEARCH_CHARS`] once trimmed.
+/// A search text that, once trimmed, is not [`MIN_ID_SUFFIX_DIGITS`] to 32
+/// of an ID's hex digits (see [`SandboxSearch`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-#[error("search must be at least {MIN_SEARCH_CHARS} characters")]
-pub struct SearchTooShort;
+#[error(
+    "search takes {MIN_ID_SUFFIX_DIGITS} to {UNDASHED_UUID_LEN} hex digits of a sandbox ID, after \
+     an optional sbx_ and with dashes left out: IDs that end with them match, and from \
+     {MIN_ID_PREFIX_DIGITS} digits IDs that start with them too. To match the start of a name, \
+     use prefix, which is case-sensitive"
+)]
+pub struct NotAnIdSearch;
 
 impl SandboxSearch {
     /// `None` for a text that is empty once trimmed, which is no search.
-    pub fn new(text: &str) -> Result<Option<Self>, SearchTooShort> {
+    pub fn new(text: &str) -> Result<Option<Self>, NotAnIdSearch> {
         let text = text.trim();
         if text.is_empty() {
             return Ok(None);
         }
-        if text.chars().count() < MIN_SEARCH_CHARS {
-            return Err(SearchTooShort);
-        }
-        let hex = id_hex(text);
+        let hex = id_hex(text).ok_or(NotAnIdSearch)?;
+        let id_prefix = if hex.len() >= MIN_ID_PREFIX_DIGITS {
+            hex_prefix_range(&hex)
+        } else {
+            None
+        };
         Ok(Some(Self {
-            text: text.to_string(),
-            id_suffix: hex.as_deref().map(id_suffix_range),
-            id_prefix: hex
-                .as_deref()
-                .filter(|hex| hex.len() >= MIN_ID_PREFIX_DIGITS)
-                .and_then(hex_prefix_range),
+            id_suffix: id_suffix_range(&hex),
+            id_prefix,
         }))
     }
 }
 
-pub const MIN_SEARCH_CHARS: usize = 3;
 const MIN_ID_SUFFIX_DIGITS: usize = 4;
 const MIN_ID_PREFIX_DIGITS: usize = 8;
-/// The characters of a lowercased name `idx_sandboxes_name_lower` keeps.
-const NAME_KEY_CHARS: usize = 256;
 
 /// The text's hex digits, lowercased, when after an optional `sbx_` and
 /// without its dashes it is [`MIN_ID_SUFFIX_DIGITS`] to 32 of them.
@@ -254,9 +248,17 @@ fn id_hex(text: &str) -> Option<String> {
     .then_some(hex)
 }
 
+/// The reversed digits, and the least key above every key that starts with
+/// them. The digits are ASCII, so that is them with their last byte
+/// incremented: `9` becomes `:` and `f` becomes `g`.
 fn id_suffix_range(hex: &str) -> (String, String) {
-    let low = hex.chars().rev().collect::<String>();
-    (low.clone(), successor(&low))
+    let low = hex.bytes().rev().collect::<Vec<_>>();
+    let mut high = low.clone();
+    if let Some(last) = high.last_mut() {
+        *last += 1;
+    }
+    let text = |bytes: Vec<u8>| bytes.into_iter().map(char::from).collect::<String>();
+    (text(low), text(high))
 }
 
 fn hex_prefix_range(hex: &str) -> Option<(SandboxId, SandboxId)> {
@@ -266,35 +268,6 @@ fn hex_prefix_range(hex: &str) -> Option<(SandboxId, SandboxId)> {
         Uuid::try_parse(&digits).ok().map(SandboxId::from_uuid)
     };
     Some((bound('0')?, bound('f')?))
-}
-
-/// The range of `idx_sandboxes_name_lower` keys that start with `key`, the
-/// text's own key (`left(lower(text), 256)`, read from Postgres): at least
-/// `key` and below its successor.
-fn name_key_range(key: String) -> (String, String) {
-    let high = successor(&key);
-    (key, high)
-}
-
-/// The least string above every string that starts with `key`, in the
-/// code-point order "C" sorts UTF-8 text in: `key` with its last character
-/// that has a next one replaced by that next one, and the characters after
-/// it, all U+10FFFF, dropped. Surrogates are not characters, so U+D7FF is
-/// followed by U+E000. When every character is U+10FFFF there is no such
-/// string; one U+10FFFF longer than any key sorts above them all.
-fn successor(key: &str) -> String {
-    let mut characters = key.chars().collect::<Vec<_>>();
-    while let Some(last) = characters.pop() {
-        let next = match last {
-            '\u{D7FF}' => Some('\u{E000}'),
-            last => char::from_u32(u32::from(last) + 1),
-        };
-        if let Some(next) = next {
-            characters.push(next);
-            return characters.into_iter().collect();
-        }
-    }
-    std::iter::repeat_n(char::MAX, NAME_KEY_CHARS + 1).collect()
 }
 
 const DASHED_UUID_DASH_POSITIONS: [usize; 4] = [8, 13, 18, 23];
@@ -398,17 +371,13 @@ static ADMIN_LIST_SQL: LazyLock<String> = LazyLock::new(|| {
     ))
 });
 
-/// [`ADMIN_CANDIDATE_ROWS`] with a [`SandboxSearch`] ($12-$18) required: the
-/// sandboxes whose name starts with $12, ignoring case, or whose ID ends or
-/// starts with its hex digits.
+/// [`ADMIN_CANDIDATE_ROWS`] with a [`SandboxSearch`] ($12-$15) required: the
+/// sandboxes whose ID ends or starts with its hex digits.
 ///
-/// The name arm reads `idx_sandboxes_name_lower`, the first 256 characters of
-/// the lowercased name, in [$13, $14): every key that starts with $12's own
-/// key ([`name_key_range`]). `starts_with` then checks the whole name, which
-/// the key may cut. The suffix arm reads `idx_sandboxes_id_suffix` in [$15,
-/// $16), the reversed suffix's range; the prefix arm reads the primary key
-/// in [$17, $18]. Each ID arm is NULL when $12 is not an ID's hex digits or
-/// too few of them for it (see [`SandboxSearch`]).
+/// The suffix arm reads `idx_sandboxes_id_suffix` in [$12, $13), the
+/// reversed digits' range; the prefix arm reads the primary key in [$14,
+/// $15], which is NULL for too few digits to start an ID with (see
+/// [`SandboxSearch`]).
 static ADMIN_SEARCH_CANDIDATE_ROWS: LazyLock<String> = LazyLock::new(|| {
     let on_node = reported_on_node("s", "$10");
     let on_a_node = reported_on_a_node("s");
@@ -416,12 +385,9 @@ static ADMIN_SEARCH_CANDIDATE_ROWS: LazyLock<String> = LazyLock::new(|| {
         "WITH matches AS MATERIALIZED (
              SELECT matched.id
              FROM sandboxes matched
-             WHERE (left(lower(matched.name), 256) COLLATE \"C\" >= $13
-                    AND left(lower(matched.name), 256) COLLATE \"C\" < $14
-                    AND starts_with(lower(matched.name), lower($12)))
-                OR (reverse(replace(matched.id::text, '-', '')) COLLATE \"C\" >= $15
-                    AND reverse(replace(matched.id::text, '-', '')) COLLATE \"C\" < $16)
-                OR matched.id BETWEEN $17::UUID AND $18::UUID
+             WHERE (reverse(replace(matched.id::text, '-', '')) COLLATE \"C\" >= $12
+                    AND reverse(replace(matched.id::text, '-', '')) COLLATE \"C\" < $13)
+                OR matched.id BETWEEN $14::UUID AND $15::UUID
          )
          SELECT s.id, s.created_at
          FROM matches
@@ -447,18 +413,18 @@ static ADMIN_SEARCH_PAGE_SQL: LazyLock<String> = LazyLock::new(|| {
     scoped_page_sql(
         &ADMIN_SEARCH_CANDIDATE_ROWS,
         &PageWalkParams {
-            cursor_created_at: "$19",
-            cursor_id: "$20",
-            max_rows: "$21",
-            max_bytes: "$22",
-            row_overhead_bytes: "$23",
+            cursor_created_at: "$16",
+            cursor_id: "$17",
+            max_rows: "$18",
+            max_bytes: "$19",
+            row_overhead_bytes: "$20",
             lists_env: false,
         },
     )
 });
 
 /// [`ADMIN_LIST_SQL`] with a [`SandboxSearch`] required, as
-/// [`ADMIN_SEARCH_CANDIDATE_ROWS`] matches it ($12-$18): at most $19
+/// [`ADMIN_SEARCH_CANDIDATE_ROWS`] matches it ($12-$15): at most $16
 /// sandboxes. `listed` picks them by ID before their full rows are joined,
 /// as the page walk does, so a search that matches many rows sorts their IDs
 /// rather than their joined rows.
@@ -469,12 +435,9 @@ static ADMIN_SEARCH_LIST_SQL: LazyLock<String> = LazyLock::new(|| {
         "WITH matches AS MATERIALIZED (
              SELECT matched.id
              FROM sandboxes matched
-             WHERE (left(lower(matched.name), 256) COLLATE \"C\" >= $13
-                    AND left(lower(matched.name), 256) COLLATE \"C\" < $14
-                    AND starts_with(lower(matched.name), lower($12)))
-                OR (reverse(replace(matched.id::text, '-', '')) COLLATE \"C\" >= $15
-                    AND reverse(replace(matched.id::text, '-', '')) COLLATE \"C\" < $16)
-                OR matched.id BETWEEN $17::UUID AND $18::UUID
+             WHERE (reverse(replace(matched.id::text, '-', '')) COLLATE \"C\" >= $12
+                    AND reverse(replace(matched.id::text, '-', '')) COLLATE \"C\" < $13)
+                OR matched.id BETWEEN $14::UUID AND $15::UUID
          ),
          listed AS MATERIALIZED (
              SELECT s.id, s.created_at
@@ -492,7 +455,7 @@ static ADMIN_SEARCH_LIST_SQL: LazyLock<String> = LazyLock::new(|| {
                AND ($10::UUID IS NULL OR {on_node})
                AND ($11::BOOLEAN IS NULL OR {on_a_node} = $11)
              ORDER BY s.created_at DESC, s.id DESC
-             LIMIT $19
+             LIMIT $16
          )
          SELECT {{sandbox_columns}}
          FROM listed
@@ -602,44 +565,16 @@ impl<'a> FilterBinds<'a> {
     }
 }
 
-/// The values a search statement binds as $12-$18.
-struct SearchBinds<'a> {
-    text: &'a str,
-    name_key: (String, String),
-    id_suffix: Option<&'a (String, String)>,
-    id_prefix: Option<(SandboxId, SandboxId)>,
-}
-
-impl<'a> SearchBinds<'a> {
-    /// Reads the text's `idx_sandboxes_name_lower` key from Postgres, so the
-    /// name range is lowercased exactly as the index is.
-    async fn new(pool: &PgPool, search: &'a SandboxSearch) -> Result<Self, sqlx::Error> {
-        let key = sqlx::query_scalar::<_, String>(sql!("SELECT left(lower($1), 256)"))
-            .bind(&search.text)
-            .fetch_one(pool)
-            .await?;
-        Ok(Self {
-            text: &search.text,
-            name_key: name_key_range(key),
-            id_suffix: search.id_suffix.as_ref(),
-            id_prefix: search.id_prefix,
-        })
-    }
-
+impl SandboxSearch {
+    /// Binds the search's ranges as a search statement's $12-$15.
     fn bind<'q, O>(
-        self,
+        &'q self,
         query: sqlx::query::QueryAs<'q, sqlx::Postgres, O, sqlx::postgres::PgArguments>,
-    ) -> sqlx::query::QueryAs<'q, sqlx::Postgres, O, sqlx::postgres::PgArguments>
-    where
-        'a: 'q,
-    {
-        let (name_low, name_high) = self.name_key;
+    ) -> sqlx::query::QueryAs<'q, sqlx::Postgres, O, sqlx::postgres::PgArguments> {
+        let (suffix_low, suffix_high) = &self.id_suffix;
         query
-            .bind(self.text)
-            .bind(name_low)
-            .bind(name_high)
-            .bind(self.id_suffix.map(|(low, _)| low.as_str()))
-            .bind(self.id_suffix.map(|(_, high)| high.as_str()))
+            .bind(suffix_low.as_str())
+            .bind(suffix_high.as_str())
             .bind(self.id_prefix.map(|(low, _)| low))
             .bind(self.id_prefix.map(|(_, high)| high))
     }
@@ -659,11 +594,7 @@ impl SandboxController {
         budget: PageBudget,
     ) -> Result<ListPage<Sandbox>, sqlx::Error> {
         let binds = FilterBinds::new(filter);
-        let search = match &filter.search {
-            Some(search) => Some(SearchBinds::new(pool, search).await?),
-            None => None,
-        };
-        let rows = match (budget, search) {
+        let rows = match (budget, &filter.search) {
             (PageBudget::Unbounded, None) => {
                 let rows = binds
                     .bind(sqlx::query_as::<_, Sandbox>(sqlx::AssertSqlSafe(sql!(

@@ -279,8 +279,13 @@ async fn malformed_list_parameters_answer_400() -> TestDbResult<()> {
         ("cursor=&node=x", "unknown query parameter \"node\""),
         ("prefix=a%00b", "NUL"),
         ("search=a%00b", "NUL"),
-        ("search=ab", "at least 3 characters"),
-        ("cursor=&search=%20ab%20", "at least 3 characters"),
+        // `search` takes an ID's hex digits only, and points a name at
+        // `prefix`.
+        ("search=0a1", "4 to 32 hex digits"),
+        ("cursor=&search=%200a1%20", "4 to 32 hex digits"),
+        ("search=worker-1", "use prefix"),
+        ("cursor=&search=Alpha", "use prefix"),
+        ("cursor=&search=sbx_0a1b2c3g", "use prefix"),
         ("cursor=bm90LWEtY3Vyc29y", "invalid cursor"),
         ("cursor=%%%", "invalid"),
         (&out_of_range_cursor, "invalid cursor"),
