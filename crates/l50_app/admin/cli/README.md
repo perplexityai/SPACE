@@ -259,8 +259,10 @@ pod can't be evacuated, so it keeps the node in `draining`. Find it like this:
   `DRAIN ERROR` column carries the last recorded error.
 - `get-node <node> --diagnostics` shows counts only (`Drain Gate Blockers`,
   `Live Residents`). The sandbox IDs come from
-  `GET /admin/api/v1/nodes/{node_id}/sandboxes`, 100 per page, continued with
-  `?after=`, or from the controller logs below.
+  `GET /admin/api/v1/nodes/{node_id}/holds`, which lists the rows those counts
+  count with the reason each holds the node, or from the controller logs
+  below. `GET /admin/api/v1/nodes/{node_id}/sandboxes` lists every row that
+  names the node, history included, 100 per page.
 - With the pod-less give-up off (the default), the controller logs
   `node_drain: sandbox evacuation (suspend) failed; will retry on next tick`
   every tick, with an error such as `sandbox is not assigned to a pod`, and
