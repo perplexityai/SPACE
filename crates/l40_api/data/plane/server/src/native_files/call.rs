@@ -12,7 +12,8 @@ use pplx_space_api_route::{
 };
 use pplx_space_common_core::types::SandboxId;
 use pplx_space_common_grpc::{
-    GrpcClientTrace, trace_grpc_client_transport as wrap_grpc_client_channel,
+    GrpcClientTrace, RetriedOnTransportFailure,
+    trace_grpc_client_transport as wrap_grpc_client_channel,
 };
 use pplx_space_guest_process::IdempotencyKey;
 use pplx_space_native_files::{
@@ -111,8 +112,15 @@ impl Grant {
 /// once, as the API's spaced client does.
 #[derive(Clone, Copy, Debug)]
 pub(super) enum Reconnect {
-    /// The node-api is draining: unary calls.
+    /// The node-api is draining: unary calls that change something, which a
+    /// connection that failed under them may already have delivered.
     WhenDraining,
+    /// The node-api is draining, or this client's connection failed before
+    /// the call was answered: read-only unary calls, which can be sent again
+    /// whatever the first one reached. A connection kept to a sandbox
+    /// endpoint can be dead by the time it is used, as when the endpoint is a
+    /// pod address a later pod was given.
+    ReadOnly,
     /// The node-api is draining or the connection closed before the stream
     /// opened: stream opens.
     BeforeStream,
@@ -122,8 +130,17 @@ impl Reconnect {
     fn applies(self, status: &tonic::Status) -> bool {
         match self {
             Self::WhenDraining => pplx_space_node_api_client::is_node_api_draining_status(status),
+            Self::ReadOnly => {
+                pplx_space_node_api_client::is_node_api_draining_status(status)
+                    || pplx_space_common_grpc::is_client_transport_failure(status)
+            }
             Self::BeforeStream => pplx_space_node_api_client::should_reconnect_stream_open(status),
         }
+    }
+
+    /// Whether a first attempt whose connection fails is sent again.
+    fn retries_transport_failures(self) -> bool {
+        matches!(self, Self::ReadOnly | Self::BeforeStream)
     }
 }
 
@@ -172,7 +189,7 @@ impl<'a> SandboxCall<'a> {
         Call: Fn(WorkerClient, tonic::Request<Msg>) -> Fut,
         Fut: Future<Output = Result<tonic::Response<Resp>, tonic::Status>>,
     {
-        self.attempt(operation, None, message, &call)
+        self.attempt(operation, None, message, &call, false)
             .await
             .map_err(CallFailure::Worker)
     }
@@ -194,7 +211,13 @@ impl<'a> SandboxCall<'a> {
         Fut: Future<Output = Result<tonic::Response<Resp>, tonic::Status>>,
     {
         match self
-            .attempt(operation, budget, message.clone(), &call)
+            .attempt(
+                operation,
+                budget,
+                message.clone(),
+                &call,
+                reconnect.retries_transport_failures(),
+            )
             .await
         {
             Err(WorkerCallError::Status(status)) if reconnect.applies(&status) => {
@@ -211,7 +234,7 @@ impl<'a> SandboxCall<'a> {
                     .grant
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner) = grant;
-                self.attempt(operation, budget, message, &call)
+                self.attempt(operation, budget, message, &call, false)
                     .await
                     .map_err(CallFailure::Worker)
             }
@@ -219,12 +242,15 @@ impl<'a> SandboxCall<'a> {
         }
     }
 
+    /// Send `message` once. `retried` marks it as a call sent again if its
+    /// connection fails before it is answered.
     async fn attempt<Msg, Resp, Call, Fut>(
         &self,
         operation: &'static str,
         budget: Option<NodeApiOperationBudget>,
         message: Msg,
         call: &Call,
+        retried: bool,
     ) -> Result<Resp, WorkerCallError>
     where
         Call: Fn(WorkerClient, tonic::Request<Msg>) -> Fut,
@@ -245,9 +271,13 @@ impl<'a> SandboxCall<'a> {
                 );
                 WorkerCallError::NotSent("sandbox runtime is not reachable".to_owned())
             })?;
+        let mut request = grant.request(message)?;
+        if retried {
+            RetriedOnTransportFailure.mark(&mut request);
+        }
         let pending = call(
             WorkerApiClient::new(wrap_grpc_client_channel(channel)),
-            grant.request(message)?,
+            request,
         );
         let response = match budget {
             Some(budget) => tokio::time::timeout(budget.timeout(), pending)
