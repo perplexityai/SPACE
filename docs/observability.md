@@ -1196,7 +1196,8 @@ fell back to the platform default shape; those events omit `vcpu` and
 
 The API records the vCPU and guest memory each sandbox will run with, after
 template and warm-pool defaults are applied, and its configured disk size, as
-distributions with the same tags:
+distributions with shared call-context tags. Only vCPU and memory samples on
+creates carry the additional `defaulted` tag:
 
 | Metric | Value |
 | --- | --- |
@@ -1214,9 +1215,10 @@ distributions with the same tags:
 | `client_id` | The request's bounded caller, as described above |
 
 Each eligible recorded create, activation or resume contributes one sample to
-each distribution whose size the API knows. Retries that reach a recording
-point add another sample; the distribution count is not the total number of
-incoming calls.
+the vCPU and memory distributions when both values are known and positive,
+and independently to the disk distribution when its value is known and positive.
+Retries that reach a recording point add another sample; the distribution
+count is not the total number of incoming calls.
 
 Native creates (`/v1` and admin) are re-queued by the dispatcher when cluster
 admission refuses them, and each retry that reaches admission adds another
