@@ -36,20 +36,38 @@ export function uploadLeftOut(result: Pick<ForceUploadResponse, 'deferred' | 'tr
   return notes;
 }
 
+// What a forced drain does beyond a gentle one (`NodeDrainMode::Forced` and
+// `space-admin-cli drain-node --forced`): it evacuates residents now, gates
+// user calls against them, and enables the stale-transient sweep.
+export const FORCED_DRAIN_EVACUATES =
+  'Every running or paused sandbox on the node is suspended and restored on another node right away, and user calls against those sandboxes are refused until the drain ends; the disruption grows with the number of live sandboxes. Sandboxes stuck in a transitional state (creating, starting, resuming and similar) for longer than the cluster\'s abandon age are marked failed, which cannot be undone.';
+
+// `:terminate` (`routes/admin/nodes.rs`) moves a drained node to
+// `terminating`; the node-drain reconciler then terminates it through the
+// cluster's configured terminator and deletes its row. `:undrain` refuses a
+// terminating node, and the `drain-keep` annotation only holds back the
+// automatic terminator.
+export const TERMINATE_ENDS =
+  'The node moves to terminating, and the node-drain reconciler then terminates it and removes it from SPACE. A terminating node cannot be undrained. The `space.pplx.net/drain-keep` annotation does not stop this. Whether a replacement node is started was fixed when the drain began. The API refuses while sandboxes still occupy the node or are held for it.';
+
 export type NodeAction = {
   action: string;
   label: string;
   body?: unknown;
   dangerous?: boolean;
+  // The operator types the node's name (or ID) before the action is sent.
+  typed?: boolean;
   confirm: string;
 };
 
-// The node page's actions follow the nodes list's rules: only
-// worker and builder nodes, and drain-family actions only on substrates that
-// support node drain (the Direct substrate answers 501), except undrain,
-// which clears a phase an earlier drain left. Forced drain and terminate stay
-// CLI actions (`space-admin-cli drain-node --forced`, `terminate-node`), not
-// dashboard buttons one misclick away from evacuating or ending a node.
+// The node page's and the nodes list's actions: only worker and builder
+// nodes, and drain-family actions only on substrates that support node drain
+// (the Direct substrate answers 501), except undrain, which clears a phase an
+// earlier drain left. Forced drain and terminate need a typed confirmation.
+// Forced drain is offered on an idle node and on a gentle drain, which the
+// API escalates in place; the API refuses to downgrade a forced drain.
+// Terminate is offered only on a drained node, the one phase the API accepts
+// it from.
 export function nodeActions(
   n: Pick<AdminNodeResponse, 'role' | 'drain_phase' | 'drain_mode'>,
   substrate: string | null,
@@ -67,12 +85,26 @@ export function nodeActions(
       { action: 'uncordon', label: 'Uncordon', confirm: 'The node accepts new sandboxes again. Has no effect if it is not cordoned.' },
       {
         action: 'drain', label: 'Drain', body: { mode: 'gentle' }, dangerous: true,
-        confirm: `Cordons the node and waits for its sandboxes to leave on their own. ${DRAIN_TERMINATES} Use \`space-admin-cli drain-node --forced\` to evacuate sandboxes immediately instead.`,
+        confirm: `Cordons the node and waits for its sandboxes to leave on their own. ${DRAIN_TERMINATES} Use Forced drain to evacuate sandboxes immediately instead.`,
+      },
+      {
+        action: 'drain', label: 'Forced drain', body: { mode: 'forced' }, dangerous: true, typed: true,
+        confirm: `Cordons the node and evacuates its sandboxes now. ${FORCED_DRAIN_EVACUATES} ${DRAIN_TERMINATES}`,
       },
     );
   }
+  // A missing mode on a draining node is gentle, as everywhere else.
+  if (supportsDrain && n.drain_phase === 'draining' && n.drain_mode !== 'forced') {
+    actions.push({
+      action: 'drain', label: 'Forced drain', body: { mode: 'forced' }, dangerous: true, typed: true,
+      confirm: `Switches this gentle drain to forced in place: the node stays cordoned and the drain keeps its start time. ${FORCED_DRAIN_EVACUATES} A forced drain cannot be switched back to gentle; Undrain cancels it. ${DRAIN_TERMINATES}`,
+    });
+  }
   if (n.drain_phase === 'draining' || n.drain_phase === 'drained') {
     actions.push({ action: 'undrain', label: 'Undrain', confirm: 'The drain is cancelled and the node accepts new sandboxes again.' });
+  }
+  if (supportsDrain && n.drain_phase === 'drained') {
+    actions.push({ action: 'terminate', label: 'Terminate', dangerous: true, typed: true, confirm: TERMINATE_ENDS });
   }
   // The API accepts this only while the drain gate blocks wakes: drained,
   // terminating, or a forced drain.

@@ -145,6 +145,26 @@ through the admin terminal route, and type into it. They create no objects,
 but they open terminal sessions, and the admin route records an admin audit
 row for each of the second's, so `--no-mutate` skips them too. The steps are in [`src/steps.ts`](src/steps.ts).
 
+Two `nodes` steps are `flows` that drain a node: `node-forced-drain-undrain`
+forced-drains a Kind worker through the node page and undrains it, and
+`node-terminate-refused` drains one, shows a terminate refusal the step
+answers itself (nothing is sent), then undrains the node while the terminate
+confirmation is open so the API refuses the terminate it sends; a route guard
+aborts that request unless the API reports the node undrained. Each drains
+only a Kubernetes worker that holds no sandboxes or local snapshots, while no
+node is in a drain phase and another worker exists, and records a failed check
+instead when there is none. The Kind stack's drained-node terminator deletes
+a drained node's Kubernetes Node unless it carries the
+`space.pplx.net/drain-keep` annotation, so each step sets it with `kubectl`
+through `--kube-context` (a `kind-*` context whose API server is on this host)
+before draining, and removes it once the node is undrained. Before either,
+each step cordons and uncordons the worker through the API and stops unless
+the cordon shows up on that Node, which shows the context and the API are one
+cluster. A `space.pplx.net/drain-keep` annotation the Node already had is
+left in place. A step stopped part-way can leave the node drained or annotated: undrain it with
+`space-admin-cli undrain-node` and run
+`kubectl --context kind-space-local annotate node <node> space.pplx.net/drain-keep-`.
+
 Each run writes `out/runs/<time>[-<label>]/`:
 
 - `summary.json`: per step, its URL, screenshot, duration, events (each with a
@@ -165,6 +185,7 @@ Every setting is a flag or an environment variable:
 | `--out` | `CONSOLE_LOOP_OUT` | `./out` |
 | `--prefix` | `CONSOLE_LOOP_PREFIX` | `loop` |
 | `--template` (seed) | `CONSOLE_LOOP_TEMPLATE` | `seed:latest` |
+| `--kube-context` | `CONSOLE_LOOP_KUBE_CONTEXT` | `kind-space-local` |
 
 `SPACE_UI_DATADOG_LOGS_URL` has no flag: set it in the loop's environment to
 what the console under test has, and the detail step then requires the

@@ -198,6 +198,11 @@ export class Recorder {
     this.noteNow(message);
   }
 
+  // The running step's name, for the extra screenshots a step takes.
+  stepName(): string {
+    return this.step.name;
+  }
+
   begin(name: string): void {
     this.step = { name, events: [], notes: this.carried, open: true };
     this.carried = [];
