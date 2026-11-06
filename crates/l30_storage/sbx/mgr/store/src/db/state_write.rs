@@ -4,11 +4,14 @@
 //! column is a named specialized writer in `src/db`.
 //!
 //! `SandboxState::can_transition_to` is the RPC-admission machine. `EDGES`
-//! is a separate inventory of the transitions the database writers implement:
-//! one entry per writer purpose, naming the writer functions and their
-//! callers. Constructors are private, and `update_state_from` takes a
-//! `&'static Edge`, so its call sites cannot invent one. Nothing checks the
-//! table against the specialized writers.
+//! is a separate inventory of the lifecycle transitions the database writers
+//! implement: one entry per writer purpose, naming the writer functions and
+//! their callers. A cleanup is not a lifecycle state: `CLEANUP_EDGES` lists
+//! the writers that hand a row to cleanup or record its failure, and a
+//! lifecycle edge from `OWNED` rows is a cleanup's completion. Constructors
+//! are private, and `update_state_from` takes a `&'static Edge`, so its call
+//! sites cannot invent one. Nothing checks the table against the specialized
+//! writers.
 //!
 //! The table follows these conventions:
 //! - A specialized compare-and-set writer's from-set is its SQL predicate,
@@ -22,6 +25,7 @@
 //! - Writers with only test callers are excluded.
 
 use super::*;
+use crate::state::CleanupState;
 
 /// A set of lifecycle states, as a bitset in `SandboxState::all()` order.
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -112,22 +116,140 @@ pub enum EdgeKind {
     Recovery,
 }
 
-/// One family of persisted transitions: every state in `from` to `to`.
+/// The rows an edge writes over: rows in a lifecycle state no cleanup owns,
+/// and rows a listed cleanup owns, whatever teardown transition the cleanup
+/// is over.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub struct EdgeSources {
+    lifecycle: StateSet,
+    required: bool,
+    failed: bool,
+}
+
+impl EdgeSources {
+    pub(super) const EMPTY: Self = Self {
+        lifecycle: StateSet::EMPTY,
+        required: false,
+        failed: false,
+    };
+
+    /// Every row: each lifecycle state, and rows any cleanup owns.
+    pub(super) const ALL: Self = Self {
+        lifecycle: StateSet::ALL
+            .without(SandboxState::CleanupRequired)
+            .without(SandboxState::CleanupFailed),
+        required: true,
+        failed: true,
+    };
+
+    /// These sources without rows read as the combined status `status`.
+    pub(super) const fn without(self, status: SandboxState) -> Self {
+        match status {
+            SandboxState::CleanupRequired => Self {
+                required: false,
+                ..self
+            },
+            SandboxState::CleanupFailed => Self {
+                failed: false,
+                ..self
+            },
+            _ => Self {
+                lifecycle: self.lifecycle.without(status),
+                ..self
+            },
+        }
+    }
+
+    /// Rows in the lifecycle `states` that no cleanup owns.
+    pub(super) const fn of(states: &[SandboxState]) -> Self {
+        let lifecycle = StateSet::of(states);
+        assert!(
+            !lifecycle.contains(SandboxState::CleanupRequired)
+                && !lifecycle.contains(SandboxState::CleanupFailed),
+            "a cleanup is not a lifecycle source: use `or_owned_by`"
+        );
+        Self {
+            lifecycle,
+            ..Self::EMPTY
+        }
+    }
+
+    /// These sources and the rows `cleanup` owns.
+    pub(super) const fn or_owned_by(self, cleanup: CleanupState) -> Self {
+        match cleanup {
+            CleanupState::Required => Self {
+                required: true,
+                ..self
+            },
+            CleanupState::Failed => Self {
+                failed: true,
+                ..self
+            },
+        }
+    }
+
+    /// Whether a row read as the combined status `status` is a source.
+    pub const fn contains(self, status: SandboxState) -> bool {
+        self.legacy().contains(status)
+    }
+
+    /// Empty for an insert.
+    pub(super) const fn is_empty(self) -> bool {
+        self.legacy().is_empty()
+    }
+
+    /// The sources as the combined statuses `legacy_state` reads, which the
+    /// generic writer's predicate compares.
+    pub(super) const fn legacy(self) -> StateSet {
+        let mut set = self.lifecycle;
+        if self.required {
+            set = set.with(SandboxState::CleanupRequired);
+        }
+        if self.failed {
+            set = set.with(SandboxState::CleanupFailed);
+        }
+        set
+    }
+}
+
+impl fmt::Debug for EdgeSources {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&self.legacy(), f)
+    }
+}
+
+/// One family of persisted lifecycle transitions: every source to `to`, a
+/// lifecycle state. Writing one ends any cleanup that owned the row.
 #[derive(Debug)]
 pub struct Edge {
     name: &'static str,
-    from: StateSet,
+    from: EdgeSources,
     to: SandboxState,
     kind: EdgeKind,
 }
 
 impl Edge {
+    const fn new(name: &'static str, from: EdgeSources, to: SandboxState, kind: EdgeKind) -> Self {
+        assert!(
+            !matches!(
+                to,
+                SandboxState::CleanupRequired | SandboxState::CleanupFailed
+            ),
+            "a cleanup is not a lifecycle target: declare a cleanup edge"
+        );
+        Self {
+            name,
+            from,
+            to,
+            kind,
+        }
+    }
+
     pub(super) const fn name(&self) -> &'static str {
         self.name
     }
 
-    /// Empty for an insert.
-    pub const fn from(&self) -> StateSet {
+    pub const fn from(&self) -> EdgeSources {
         self.from
     }
 
@@ -140,32 +262,83 @@ impl Edge {
     }
 }
 
+/// One family of persisted cleanup transitions: a cleanup takes ownership of
+/// each source row, or records that it failed. The row's lifecycle becomes the
+/// teardown transition its intent names, as the cleanup writers store it.
+#[derive(Debug)]
+pub struct CleanupEdge {
+    name: &'static str,
+    from: EdgeSources,
+    to: CleanupState,
+    kind: EdgeKind,
+}
+
+impl CleanupEdge {
+    pub const fn name(&self) -> &'static str {
+        self.name
+    }
+
+    pub const fn from(&self) -> EdgeSources {
+        self.from
+    }
+
+    pub const fn to(&self) -> CleanupState {
+        self.to
+    }
+
+    pub const fn kind(&self) -> EdgeKind {
+        self.kind
+    }
+}
+
 macro_rules! edge_table {
-    ($($(#[doc = $doc:literal])+ $name:ident: $kind:ident, $from:expr => $to:ident;)+) => {
+    (
+        $($(#[doc = $doc:literal])+ $name:ident: $kind:ident, $from:expr => $to:ident;)+
+        cleanup:
+        $($(#[doc = $cdoc:literal])+ $cname:ident: $ckind:ident, $cfrom:expr => $cto:ident;)+
+    ) => {
         /// The persisted-edge constants. Each names its writer functions.
         pub mod edges {
-            use super::{Edge, EdgeKind, StateSet};
+            use super::{CleanupEdge, Edge, EdgeKind, EdgeSources};
+            use crate::state::CleanupState;
             use crate::state::SandboxState::*;
 
-            const fn of(states: &[crate::state::SandboxState]) -> StateSet {
-                StateSet::of(states)
+            const fn of(states: &[crate::state::SandboxState]) -> EdgeSources {
+                EdgeSources::of(states)
             }
 
-            const INSERT: StateSet = StateSet::EMPTY;
+            const INSERT: EdgeSources = EdgeSources::EMPTY;
+
+            const ALL: EdgeSources = EdgeSources::ALL;
+
+            /// Rows any cleanup owns.
+            const OWNED: EdgeSources = EdgeSources::EMPTY
+                .or_owned_by(CleanupState::Required)
+                .or_owned_by(CleanupState::Failed);
 
             $(
                 $(#[doc = $doc])+
-                pub const $name: Edge = Edge {
-                    name: stringify!($name),
-                    from: $from,
-                    to: $to,
-                    kind: EdgeKind::$kind,
+                pub const $name: Edge =
+                    Edge::new(stringify!($name), $from, $to, EdgeKind::$kind);
+            )+
+
+            $(
+                $(#[doc = $cdoc])+
+                pub const $cname: CleanupEdge = CleanupEdge {
+                    name: stringify!($cname),
+                    from: $cfrom,
+                    to: CleanupState::$cto,
+                    kind: EdgeKind::$ckind,
                 };
             )+
 
-            /// Every persisted edge, in declaration order.
+            /// Every persisted lifecycle edge, in declaration order.
             #[cfg(test)]
             pub const EDGES: &[Edge] = &[$($name),+];
+
+            /// Every persisted cleanup edge, in declaration order.
+            #[cfg(test)]
+            pub const CLEANUP_EDGES: &[CleanupEdge] = &[$($cname),+];
         }
     };
 }
@@ -296,7 +469,7 @@ edge_table! {
     /// row has none. Kill admits only `started` and `paused` through the same
     /// writer, and the generic guards refuse `deleting` and `quarantined`.
     STOP_ADMISSION: Request,
-        StateSet::ALL
+        ALL
             .without(Creating)
             .without(Stopping)
             .without(Deleting)
@@ -312,7 +485,7 @@ edge_table! {
     /// `update_state_superseding_activation_in_transaction(Deleting)` and
     /// `write_cleanup_admission_state`, from the Delete RPC and auto-lifecycle
     /// Delete.
-    DELETE_ADMISSION: Request, StateSet::ALL.without(Deleting) => Deleting;
+    DELETE_ADMISSION: Request, ALL.without(Deleting) => Deleting;
     /// The eviction claims: `claim_stopped_sandbox_for_eviction`,
     /// `claim_suspended_sandbox_for_eviction`,
     /// `claim_failed_restoring_sandbox_for_eviction`,
@@ -322,45 +495,23 @@ edge_table! {
     EVICTION_CLAIM: Request,
         of(&[Stopped, Suspended, Restoring, Suspending, Quarantined]) => Deleting;
 
-    // Cleanup hand-off and completion.
+    // Cleanup completion: the cleanup that owned the row ends, and the row
+    // settles its intent's target.
 
-    /// `request_cleanup_episode`: the activation cleanup guard
-    /// (`schedule_activation_cleanup`), startup recovery and cleanup recovery
-    /// hand an armed episode to cleanup. Create's guard can fire after its own
-    /// `created` write, or after the base-snapshot `suspended` write when
-    /// `complete_create` fails.
-    ACTIVATION_CLEANUP_REQUEST: Recovery,
-        of(&[Creating, Created, Starting, Suspended, Restoring]) => CleanupRequired;
-    /// `mark_cleanup_required` from startup recovery (interrupted
-    /// `starting`, `stopping`, `deleting`, `suspending` and `restoring` rows),
-    /// cleanup recovery, and a restore that finds a pending `mark_suspended`
-    /// intent; `mark_cleanup_required_if_no_intent` for an ambiguous restore
-    /// retry; `mark_cleanup_required_if_no_intent_in_state` from cleanup
-    /// recovery.
-    CLEANUP_HANDOFF: Recovery,
-        of(&[Starting, Stopping, Deleting, Suspending, Restoring, CleanupFailed])
-            => CleanupRequired;
-    /// `pin_suspended_artifact_for_cleanup`: startup suspend recovery pins a
-    /// staged artifact and hands the row to cleanup.
-    SUSPEND_ARTIFACT_CLEANUP: Recovery, of(&[Suspending]) => CleanupRequired;
-    /// `mark_cleanup_failed` (from `mark_async_cleanup_failed`, for rows whose
-    /// intent the completion owns) and `record_cleanup_episode_failure`.
-    CLEANUP_FAILURE: Recovery,
-        of(&[Stopping, Suspending, Deleting, CleanupRequired]) => CleanupFailed;
     /// `complete_cleanup_episode_for_job` and
     /// `complete_row_intent_cleanup_for_job` through `apply_cleanup_state`
     /// for a `mark_created` completion.
-    CLEANUP_COMPLETE_CREATED: Recovery, of(&[CleanupRequired, CleanupFailed]) => Created;
+    CLEANUP_COMPLETE_CREATED: Recovery, OWNED => Created;
     /// As above for `mark_stopped`, which drops the row's artifact pin, and
     /// `publish_stopped_artifact` for a cleanup row with a `mark_stopped`
     /// intent.
-    CLEANUP_COMPLETE_STOPPED: Recovery, of(&[CleanupRequired, CleanupFailed]) => Stopped;
+    CLEANUP_COMPLETE_STOPPED: Recovery, OWNED => Stopped;
     /// As above for `mark_suspended`.
-    CLEANUP_COMPLETE_SUSPENDED: Recovery, of(&[CleanupRequired, CleanupFailed]) => Suspended;
+    CLEANUP_COMPLETE_SUSPENDED: Recovery, OWNED => Suspended;
     /// `quarantine_cleanup_episode_for_job`, and `apply_cleanup_state` for a
     /// `quarantine` completion or a `mark_suspended` completion without a
     /// suspend artifact.
-    CLEANUP_QUARANTINE: Recovery, of(&[CleanupRequired, CleanupFailed]) => Quarantined;
+    CLEANUP_QUARANTINE: Recovery, OWNED => Quarantined;
 
     // Quarantine entry and exit.
 
@@ -386,12 +537,6 @@ edge_table! {
     PAUSE_FAILED_QUARANTINE_RECOVERY_STARTED: Recovery, of(&[Quarantined]) => Started;
     /// `recover_pause_failed_quarantine` with a paused VM.
     PAUSE_FAILED_QUARANTINE_RECOVERY_PAUSED: Recovery, of(&[Quarantined]) => Paused;
-    /// `adopt_quarantine_cleanup_episode`: quarantine recovery hands a pinned
-    /// suspend artifact to cleanup.
-    QUARANTINE_CLEANUP_ADOPTION: Recovery, of(&[Quarantined]) => CleanupRequired;
-    /// `rearm_prepared_clone_disposal`: Delete of a quarantined pool clone
-    /// re-requests its disposal episode instead of writing `deleting`.
-    POOL_CLONE_DISPOSAL_REARM: Request, of(&[Quarantined]) => CleanupRequired;
     /// `restore_adopt_orphan_or_insert_sandbox_in_transaction`'s conflict
     /// branch: orphan materialization or a cross-node restore insert adopts
     /// the synthetic orphan row an earlier pass quarantined.
@@ -421,19 +566,51 @@ edge_table! {
     /// `recover_interrupted_startup_states`, and
     /// `publish_orphan_quarantine_recovered_artifact`.
     INTERRUPTED_RESTORE_RECOVERY: Recovery, of(&[Restoring]) => Suspended;
-    /// Orphan materialization: `insert_sandbox` of a `cleanup_required` row,
-    /// which `mark_cleanup_required` then gives its intent.
-    ORPHAN_CLEANUP_INSERT: Recovery, INSERT => CleanupRequired;
     /// `insert_recovered_suspended_sandbox_in_transaction` from orphan
     /// materialization.
     ORPHAN_SUSPENDED_INSERT: Recovery, INSERT => Suspended;
     /// `restore_adopt_orphan_or_insert_sandbox_in_transaction`'s insert
     /// branch from orphan materialization of an interrupted restore.
     ORPHAN_RESTORE_INSERT: Recovery, INSERT => Restoring;
+
+    cleanup:
+
+    /// `request_cleanup_episode`: the activation cleanup guard
+    /// (`schedule_activation_cleanup`), startup recovery and cleanup recovery
+    /// hand an armed episode to cleanup. Create's guard can fire after its own
+    /// `created` write, or after the base-snapshot `suspended` write when
+    /// `complete_create` fails.
+    ACTIVATION_CLEANUP_REQUEST: Recovery,
+        of(&[Creating, Created, Starting, Suspended, Restoring]) => Required;
+    /// `mark_cleanup_required` from startup recovery (interrupted
+    /// `starting`, `stopping`, `deleting`, `suspending` and `restoring` rows),
+    /// cleanup recovery, and a restore that finds a pending `mark_suspended`
+    /// intent; `mark_cleanup_required_if_no_intent` for an ambiguous restore
+    /// retry; `mark_cleanup_required_if_no_intent_in_state` from cleanup
+    /// recovery. Re-requesting a failed cleanup retries it.
+    CLEANUP_HANDOFF: Recovery,
+        of(&[Starting, Stopping, Deleting, Suspending, Restoring])
+            .or_owned_by(CleanupState::Failed) => Required;
+    /// `pin_suspended_artifact_for_cleanup`: startup suspend recovery pins a
+    /// staged artifact and hands the row to cleanup.
+    SUSPEND_ARTIFACT_CLEANUP: Recovery, of(&[Suspending]) => Required;
+    /// `mark_cleanup_failed` (from `mark_async_cleanup_failed`, for rows whose
+    /// intent the completion owns) and `record_cleanup_episode_failure`.
+    CLEANUP_FAILURE: Recovery,
+        of(&[Stopping, Suspending, Deleting]).or_owned_by(CleanupState::Required) => Failed;
+    /// `adopt_quarantine_cleanup_episode`: quarantine recovery hands a pinned
+    /// suspend artifact to cleanup.
+    QUARANTINE_CLEANUP_ADOPTION: Recovery, of(&[Quarantined]) => Required;
+    /// `rearm_prepared_clone_disposal`: Delete of a quarantined pool clone
+    /// re-requests its disposal episode instead of writing `deleting`.
+    POOL_CLONE_DISPOSAL_REARM: Request, of(&[Quarantined]) => Required;
+    /// Orphan materialization: `insert_sandbox` of a cleanup-owned row, which
+    /// `mark_cleanup_required` then gives its intent.
+    ORPHAN_CLEANUP_INSERT: Recovery, INSERT => Required;
 }
 
 #[cfg(test)]
-pub use edges::EDGES;
+pub use edges::{CLEANUP_EDGES, EDGES};
 
 /// A generic guard that refused a write.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -551,7 +728,7 @@ pub fn update_state_from(
     if edge.from.is_empty() {
         return Err(Error::invalid_query());
     }
-    write_state_from(conn, id, edge.from, edge.to)
+    write_state_from(conn, id, edge.from.legacy(), edge.to)
 }
 
 /// [`update_state_from`] over an arbitrary from-set, for tests that sweep

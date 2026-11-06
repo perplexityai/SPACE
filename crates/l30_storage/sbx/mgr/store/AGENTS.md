@@ -27,8 +27,10 @@ there, but not a build or dev dependency, nor `libsqlite3-sys`.
 - Write `sandboxes.state` only through `update_state_from` with an explicit
   edge, or through a named specialized writer. A new edge in
   `src/db/state_write.rs` needs a kind and a doc comment naming its writer;
-  add any new disagreement with `can_transition_to`, with a reason, to
-  `ALLOWLIST` in `src/db/tests/state_write_table.rs`. Nothing checks the table
+  a writer that hands a row to cleanup or records its failure is a cleanup
+  edge, not a lifecycle edge. Add any new disagreement with
+  `can_transition_to`, with a reason, to `ALLOWLIST` in
+  `src/db/tests/state_write_table.rs`. Nothing checks the table
   against the writers; the `&'static Edge` argument does that at call sites. A
   refused write must leave every row unchanged.
 - `sandboxes.state` holds lifecycle states only; `cleanup_state` (`required`,

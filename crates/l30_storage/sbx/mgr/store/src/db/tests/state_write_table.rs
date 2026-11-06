@@ -1,5 +1,7 @@
 //! The persisted-edge table of the node-local SQLite `sandboxes.state` against
-//! `SandboxState::can_transition_to`, the RPC-admission machine.
+//! `SandboxState::can_transition_to`, the RPC-admission machine. A cleanup edge
+//! is compared as the combined status its rows read as, `cleanup_required` or
+//! `cleanup_failed`.
 //!
 //! Every pair on which the two disagree is listed in [`ALLOWLIST`] with a
 //! reason, so a new writer edge, a changed from-set, or a changed state
@@ -7,7 +9,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::db::{EDGES, EdgeKind};
+use crate::db::{CLEANUP_EDGES, EDGES, EdgeKind};
 use crate::state::SandboxState::{self, *};
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -104,13 +106,13 @@ const ALLOWLIST: &[(SandboxState, SandboxState, Disagreement, &str)] = &[
     (CleanupRequired, Stopping,        RequestForbidden,    STOP_RUNTIME_OWNER),
     (CleanupRequired, Stopped,         WriteForbidden,      CLEANUP_SETTLES_INTENT),
     (CleanupRequired, Suspended,       WriteForbidden,      "cleanup completion settles a mark_suspended intent"),
-    (CleanupRequired, CleanupFailed,   AllowedNotRequested, "only cleanup records its own failure"),
+    (CleanupRequired, CleanupFailed,   WriteForbidden,      "only cleanup records its own failure"),
     (CleanupRequired, Quarantined,     AllowedNotRequested, RECOVERY_QUARANTINE),
     (CleanupFailed,   Created,         WriteForbidden,      CLEANUP_SETTLES_INTENT),
     (CleanupFailed,   Stopping,        RequestForbidden,    STOP_RUNTIME_OWNER),
     (CleanupFailed,   Stopped,         WriteForbidden,      CLEANUP_SETTLES_INTENT),
     (CleanupFailed,   Suspended,       WriteForbidden,      "cleanup completion settles a mark_suspended intent"),
-    (CleanupFailed,   CleanupRequired, AllowedNotRequested, "only cleanup recovery re-requests cleanup"),
+    (CleanupFailed,   CleanupRequired, WriteForbidden,      "only cleanup recovery re-requests cleanup"),
     (CleanupFailed,   Quarantined,     AllowedNotRequested, RECOVERY_QUARANTINE),
     (Quarantined,     Started,         WriteForbidden,      "pause-failed quarantine recovery"),
     (Quarantined,     Paused,          WriteForbidden,      "pause-failed quarantine recovery"),
@@ -127,11 +129,15 @@ fn position(state: SandboxState) -> usize {
 }
 
 fn classify(from: SandboxState, to: SandboxState) -> Option<Disagreement> {
-    let kinds: Vec<EdgeKind> = EDGES
+    let lifecycle = EDGES
         .iter()
         .filter(|edge| edge.to() == to && edge.from().contains(from))
-        .map(|edge| edge.kind())
-        .collect();
+        .map(|edge| edge.kind());
+    let cleanup = CLEANUP_EDGES
+        .iter()
+        .filter(|edge| edge.to().legacy_status() == to && edge.from().contains(from))
+        .map(|edge| edge.kind());
+    let kinds: Vec<EdgeKind> = lifecycle.chain(cleanup).collect();
     let requested = kinds.contains(&EdgeKind::Request);
     match (from.can_transition_to(to), requested, !kinds.is_empty()) {
         (true, true, _) | (false, false, false) => None,
@@ -193,4 +199,119 @@ fn no_edge_lists_its_own_target_as_a_source() {
             edge.name()
         );
     }
+    for edge in CLEANUP_EDGES {
+        assert!(
+            !edge.from().contains(edge.to().legacy_status()),
+            "{}: rewriting a row in its target state is not a transition",
+            edge.name()
+        );
+    }
+}
+
+/// Every edge's sources and target, as the combined statuses its rows read as,
+/// in declaration order. `classify` merges edges that share a pair, so this
+/// pins each edge: a dropped edge, or one widened into a pair another edge
+/// already writes, fails here.
+#[rustfmt::skip]
+const EDGE_SOURCES: &[(&str, &[SandboxState], SandboxState)] = &[
+    ("CREATE_INSERT", &[], Creating),
+    ("CREATE_COMPLETE", &[Creating], Created),
+    ("CREATE_BASE_SNAPSHOT_COMPLETE", &[Created], Suspended),
+    ("CLONE_OR_IMPORT_COMPLETE_SUSPENDED", &[Creating], Suspended),
+    ("IMPORT_COMPLETE_STOPPED", &[Creating], Stopped),
+    ("COLD_START_BEGIN", &[Created, Stopped, Suspended], Starting),
+    ("RESTORE_BEGIN", &[Suspended], Restoring),
+    ("WARM_START_RESTAGE", &[Created, Stopped], Suspended),
+    ("CROSS_NODE_RESTORE_INSERT", &[], Restoring),
+    ("START_COMPLETE", &[Starting], Started),
+    ("RESTORE_COMPLETE_STARTED", &[Restoring], Started),
+    ("RESTORE_COMPLETE_PAUSED", &[Restoring], Paused),
+    ("CROSS_NODE_RESTORE_PUBLISHED", &[Restoring], Suspended),
+    ("RESTORED_DISK_AS_NEW", &[Restoring], Stopped),
+    ("START_ROLLBACK_CREATED", &[Starting], Created),
+    ("START_ROLLBACK_STOPPED", &[Starting], Stopped),
+    ("START_ROLLBACK_SUSPENDED", &[Starting], Suspended),
+    ("RESTORE_ROLLBACK", &[Restoring], Suspended),
+    ("PAUSE_BEGIN", &[Started], Pausing),
+    ("PAUSE_COMPLETE", &[Pausing], Paused),
+    ("PAUSE_ROLLBACK", &[Pausing], Started),
+    ("RESUME_BEGIN", &[Paused], Resuming),
+    ("RESUME_COMPLETE", &[Resuming], Started),
+    ("RESUME_ROLLBACK", &[Resuming], Paused),
+    ("CHECKPOINT_BEGIN", &[Started, Paused], Checkpointing),
+    ("TEMPLATE_SNAPSHOT_BEGIN", &[Paused], Checkpointing),
+    ("CHECKPOINT_COMPLETE_STARTED", &[Checkpointing], Started),
+    ("CHECKPOINT_COMPLETE_PAUSED", &[Checkpointing], Paused),
+    ("CHECKPOINT_ROLLBACK_STARTED", &[Checkpointing], Started),
+    ("CHECKPOINT_ROLLBACK_PAUSED", &[Checkpointing], Paused),
+    ("SUSPEND_BEGIN", &[Paused], Suspending),
+    ("SUSPEND_COMPLETE", &[Suspending], Suspended),
+    ("SUSPEND_ROLLBACK", &[Suspending], Paused),
+    ("PROCESS_SNAPSHOT_ROLLBACK_RESTAGE", &[Stopped], Suspended),
+    ("STOP_ADMISSION", &[Created, Starting, Started, Stopped, Pausing, Paused, Resuming, Checkpointing, Suspending, Suspended, Restoring, CleanupRequired, CleanupFailed, Failed], Stopping),
+    ("STOP_COMPLETE", &[Stopping], Stopped),
+    ("AUTO_LIFECYCLE_STOP_SUSPENDED", &[Suspended], Stopped),
+    ("DELETE_ADMISSION", &[Creating, Created, Starting, Started, Stopping, Stopped, Pausing, Paused, Resuming, Checkpointing, Suspending, Suspended, Restoring, CleanupRequired, CleanupFailed, Quarantined, Failed], Deleting),
+    ("EVICTION_CLAIM", &[Stopped, Suspending, Suspended, Restoring, Quarantined], Deleting),
+    ("CLEANUP_COMPLETE_CREATED", &[CleanupRequired, CleanupFailed], Created),
+    ("CLEANUP_COMPLETE_STOPPED", &[CleanupRequired, CleanupFailed], Stopped),
+    ("CLEANUP_COMPLETE_SUSPENDED", &[CleanupRequired, CleanupFailed], Suspended),
+    ("CLEANUP_QUARANTINE", &[CleanupRequired, CleanupFailed], Quarantined),
+    ("IN_FLIGHT_QUARANTINE", &[Stopping, Pausing, Resuming, Checkpointing], Quarantined),
+    ("SUSPEND_QUARANTINE", &[Suspending], Quarantined),
+    ("STARTUP_RESIDENT_QUARANTINE", &[Started, Paused, Resuming, Checkpointing], Quarantined),
+    ("ORPHAN_QUARANTINE_INSERT", &[], Quarantined),
+    ("PAUSE_FAILED_QUARANTINE_RECOVERY_STARTED", &[Quarantined], Started),
+    ("PAUSE_FAILED_QUARANTINE_RECOVERY_PAUSED", &[Quarantined], Paused),
+    ("ORPHAN_RESTORE_ADOPTION", &[Quarantined], Restoring),
+    ("INTERRUPTED_CREATE_RECOVERY", &[Creating], Created),
+    ("UNLAUNCHED_START_RECOVERY_STOPPED", &[Starting], Stopped),
+    ("UNLAUNCHED_START_RECOVERY_CREATED", &[Starting], Created),
+    ("INTERRUPTED_PAUSE_RECOVERY_STARTED", &[Pausing], Started),
+    ("INTERRUPTED_PAUSE_RECOVERY_PAUSED", &[Pausing], Paused),
+    ("STARTUP_RESIDENT_STARTED", &[Resuming, Checkpointing], Started),
+    ("STARTUP_RESIDENT_PAUSED", &[Resuming], Paused),
+    ("STARTUP_SUSPEND_ROLLBACK", &[Suspending], Paused),
+    ("INTERRUPTED_RESTORE_RECOVERY", &[Restoring], Suspended),
+    ("ORPHAN_SUSPENDED_INSERT", &[], Suspended),
+    ("ORPHAN_RESTORE_INSERT", &[], Restoring),
+    ("ACTIVATION_CLEANUP_REQUEST", &[Creating, Created, Starting, Suspended, Restoring], CleanupRequired),
+    ("CLEANUP_HANDOFF", &[Starting, Stopping, Deleting, Suspending, Restoring, CleanupFailed], CleanupRequired),
+    ("SUSPEND_ARTIFACT_CLEANUP", &[Suspending], CleanupRequired),
+    ("CLEANUP_FAILURE", &[Stopping, Deleting, Suspending, CleanupRequired], CleanupFailed),
+    ("QUARANTINE_CLEANUP_ADOPTION", &[Quarantined], CleanupRequired),
+    ("POOL_CLONE_DISPOSAL_REARM", &[Quarantined], CleanupRequired),
+    ("ORPHAN_CLEANUP_INSERT", &[], CleanupRequired),
+];
+
+#[test]
+fn each_edge_reads_exactly_its_listed_sources() {
+    let sources = |contains: &dyn Fn(SandboxState) -> bool| -> Vec<SandboxState> {
+        SandboxState::all()
+            .into_iter()
+            .filter(|state| contains(*state))
+            .collect()
+    };
+    let actual: Vec<(&str, Vec<SandboxState>, SandboxState)> = EDGES
+        .iter()
+        .map(|edge| {
+            (
+                edge.name(),
+                sources(&|state| edge.from().contains(state)),
+                edge.to(),
+            )
+        })
+        .chain(CLEANUP_EDGES.iter().map(|edge| {
+            (
+                edge.name(),
+                sources(&|state| edge.from().contains(state)),
+                edge.to().legacy_status(),
+            )
+        }))
+        .collect();
+    let expected: Vec<_> = EDGE_SOURCES
+        .iter()
+        .map(|(name, from, to)| (*name, from.to_vec(), *to))
+        .collect();
+    assert_eq!(actual, expected);
 }

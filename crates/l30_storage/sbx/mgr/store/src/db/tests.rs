@@ -387,9 +387,7 @@ fn every_allowed_state_transition_tracks_the_change_time() {
 
     for (from_index, from) in SandboxState::all().into_iter().enumerate() {
         for (to_index, to) in SandboxState::all().into_iter().enumerate() {
-            // Only the cleanup writers record a cleanup; their timestamps are
-            // pinned in `cleanup_state_split`.
-            if from == to || !from.can_transition_to(to) || to.cleanup_label().is_some() {
+            if from == to || !from.can_transition_to(to) {
                 continue;
             }
             let sandbox_id = format!("edge-{from_index}-{to_index}");
