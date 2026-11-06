@@ -1132,3 +1132,38 @@ mod write_creating_parents {
         assert_eq!(guest.writes.borrow().len(), 2, "retried once only");
     }
 }
+
+/// A read the guest refuses before its first chunk, as it refuses a
+/// directory, answers with that refusal instead of a 200 and an aborted body;
+/// a read that starts streams every chunk.
+#[tokio::test]
+async fn a_read_refused_before_its_first_chunk_answers_with_the_refusal() {
+    use http_body_util::BodyExt;
+    use pplx_space_public_api::{PublicErrorCode, PublicErrorEnvelope};
+    use pplx_space_sbx_mgr_client::proto::SpacedFileChunk;
+
+    let refused = stream::iter([Err(tonic::Status::failed_precondition(
+        "Is a directory (os error 21)",
+    ))]);
+    let response = read_response(refused)
+        .await
+        .expect_err("the refusal is the answer")
+        .into_response();
+    assert_eq!(response.status(), StatusCode::PRECONDITION_FAILED);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let envelope: PublicErrorEnvelope = serde_json::from_slice(&body).unwrap();
+    assert_eq!(envelope.code, PublicErrorCode::FailedPrecondition);
+    assert_eq!(envelope.message, "Is a directory (os error 21)");
+
+    let chunk = |data: &'static [u8]| {
+        Ok(SpacedFileChunk {
+            data: data.to_vec().into(),
+        })
+    };
+    let response = read_response(stream::iter([chunk(b"hel"), chunk(b"lo")]))
+        .await
+        .expect("a read whose first chunk arrives starts");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(body.as_ref(), b"hello");
+}

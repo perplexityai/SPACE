@@ -1324,3 +1324,44 @@ async fn watch_stream_ends_unavailable_when_the_drain_deadline_passes() {
     drop(stream);
     assert_eq!(limiter.active_total(), 0);
 }
+
+// A read the guest refuses for its path answers 400, as envd answers a read of
+// a directory, whether the guest refused the open (a FIFO or socket, which it
+// marks) or the first read (a directory, which a guest of any release fails
+// only then). Every other refusal keeps its answer: an unmarked open failure
+// and a fenced stream read as the sandbox not running.
+#[test]
+fn a_read_refused_for_its_path_is_a_bad_request() {
+    let marked = || {
+        let mut status = tonic::Status::failed_precondition("Illegal seek (os error 29)");
+        status.metadata_mut().insert(
+            pplx_space_common_core::spaced::ERROR_REASON_METADATA_KEY,
+            tonic::metadata::MetadataValue::from_static(
+                pplx_space_common_core::spaced::GUEST_PATH_REFUSED,
+            ),
+        );
+        status
+    };
+    for error in [
+        file_read_open_error(marked()),
+        file_read_start_error(marked()),
+    ] {
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        assert_eq!(error.message, "Illegal seek (os error 29)");
+    }
+    let directory = file_read_start_error(tonic::Status::failed_precondition(
+        "Is a directory (os error 21)",
+    ));
+    assert_eq!(directory.status, StatusCode::BAD_REQUEST);
+    assert_eq!(directory.message, "Is a directory (os error 21)");
+
+    for unchanged in [
+        file_read_open_error(tonic::Status::failed_precondition("sandbox is stopping")),
+        file_read_start_error(tonic::Status::aborted(
+            "sandbox lifecycle teardown closed the stream",
+        )),
+    ] {
+        assert_eq!(unchanged.status, StatusCode::BAD_GATEWAY);
+        assert_eq!(unchanged.message, "Sandbox is not running");
+    }
+}

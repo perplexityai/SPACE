@@ -1,7 +1,7 @@
 //! Native `files:*` request handling for every server that answers it: the
 //! size limits and field checks, the worker requests each operation sends,
-//! how a failed sandbox call reads to the client, and what a request means to
-//! its idempotency key.
+//! how a failed sandbox call reads to the client, when a read's response
+//! starts, and what a request means to its idempotency key.
 //!
 //! The key's meaning is persisted or replayed by key: the binding lives in
 //! the control plane's idempotency records, and the sandbox remembers the
@@ -14,6 +14,7 @@ pub mod limits;
 mod operation;
 mod parents;
 mod public_error;
+mod read;
 mod request;
 mod worker;
 
@@ -23,6 +24,7 @@ pub use failure::{
 };
 pub use operation::FileOperation;
 pub use parents::{deepest_parent_directories, write_creating_parents, write_parent_directory};
+pub use read::start_read;
 pub use request::{
     FileRequestError, admit_list_entry, decode_write_batch_entries, decode_write_chunks,
     decode_write_payload, list_depth, parse_guest_path, parse_guest_user,
