@@ -159,10 +159,10 @@ db_private_outside_tests! {
         // LIMIT applies to raw index entries, before identity/metadata eligibility.
         if fresh_slots > 0 {
             let mut statement = conn.prepare(&sql!(format!(
-                "SELECT rowid, id, next_auto_event_at, state
+                "SELECT rowid, id, next_auto_event_at, legacy_state
              FROM sandboxes INDEXED BY idx_sandboxes_next_auto_event_at
              WHERE next_auto_event_at <= ?1
-               AND state NOT IN {AUTO_LIFECYCLE_NEVER_ACTIONABLE_STATES_SQL}
+               AND legacy_state NOT IN {AUTO_LIFECYCLE_NEVER_ACTIONABLE_STATES_SQL}
              ORDER BY next_auto_event_at DESC, created_at DESC LIMIT 32"
             )))?;
             let mut rows = statement.query([now])?;
@@ -179,7 +179,7 @@ db_private_outside_tests! {
         // position, not a work list), so they stay in the result set of this
         // statement and are filtered by `eligible`, not by SQL.
         let mut statement = conn.prepare(sql!(
-            "SELECT rowid, id, next_auto_event_at, state
+            "SELECT rowid, id, next_auto_event_at, legacy_state
          FROM sandboxes WHERE rowid > ?1 ORDER BY rowid LIMIT 128"
         ))?;
         let mut rows = statement.query([cursor.after])?;

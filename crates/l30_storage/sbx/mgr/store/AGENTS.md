@@ -31,6 +31,14 @@ there, but not a build or dev dependency, nor `libsqlite3-sys`.
   `ALLOWLIST` in `src/db/tests/state_write_table.rs`. Nothing checks the table
   against the writers; the `&'static Edge` argument does that at call sites. A
   refused write must leave every row unchanged.
+- `sandboxes.state` holds lifecycle states only; `cleanup_state` (`required`,
+  `failed`) records a cleanup that owns the row, over the teardown transition
+  its intent names. Decide from the combined status by reading the generated
+  `legacy_state`, except where an index needs `state` and the triggers make
+  the two equal. A write of a lifecycle state clears `cleanup_state`, and a
+  cleanup write sets both in one statement; the triggers in
+  `db/sandbox-manager/20261105142930_sandbox_cleanup_state.up.sql` reject
+  any other shape.
 - Only some child tables declare `ON DELETE CASCADE`: register a new sandbox
   child table in `delete_sandbox_child_rows` (`src/db.rs`).
 - Fixtures that sbx-mgr's other test suites share live in `db::fixture` and

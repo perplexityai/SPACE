@@ -309,7 +309,7 @@ fn a_pin_minted_with_its_stop_shares_the_stop_stamp() {
 
         let (state, stopped_since): (String, String) = conn
             .query_row(
-                "SELECT state, state_changed_at FROM sandboxes WHERE id = ?1",
+                "SELECT legacy_state, state_changed_at FROM sandboxes WHERE id = ?1",
                 params![id],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )

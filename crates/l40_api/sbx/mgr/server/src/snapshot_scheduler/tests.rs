@@ -137,11 +137,13 @@ fn snapshot_names_use_utc_calendar_time() {
 fn checkpoint_context(state: SandboxState) -> (CheckpointContext, String) {
     let conn = crate::db::test_conn();
     let sandbox_id = SandboxId::new().to_string();
+    let (lifecycle, cleanup_state) =
+        crate::db::test_fixtures::state_write_fixtures::stored_columns(state);
     conn.execute(
-        "INSERT INTO sandboxes (id, uuid8, state, template, user, created_at, updated_at)
-         VALUES (?1, 'runtime1', ?2, 'seed',
+        "INSERT INTO sandboxes (id, uuid8, state, cleanup_state, template, user, created_at, updated_at)
+         VALUES (?1, 'runtime1', ?2, ?3, 'seed',
                  'user:00000000-0000-0000-0000-000000000001', '1', '1')",
-        crate::db::fixture::params![sandbox_id, state.as_str()],
+        crate::db::fixture::params![sandbox_id, lifecycle, cleanup_state],
     )
     .unwrap();
     (

@@ -1297,20 +1297,23 @@ fn suspend_uncommitted_follows_the_row_state_and_its_pin() {
     ];
     let conn = crate::db::test_conn();
     for (index, (state, pin, _)) in cases.iter().enumerate() {
+        let (lifecycle, cleanup_state) =
+            crate::db::test_fixtures::state_write_fixtures::stored_columns(*state);
         conn.execute(
             "INSERT INTO sandboxes (
-                 id, uuid8, state, template, user, runtime, created_at, updated_at,
-                 process_env_json, auto_lifecycle_json, auto_lifecycle_state_json,
+                 id, uuid8, state, cleanup_state, template, user, runtime, created_at,
+                 updated_at, process_env_json, auto_lifecycle_json, auto_lifecycle_state_json,
                  current_local_artifact_id, current_local_artifact_kind,
                  current_local_artifact_origin
-             ) VALUES (?1, 'uuid8', ?2, 'seed', 'u', 'fc', '0', '0',
+             ) VALUES (?1, 'uuid8', ?2, ?6, 'seed', 'u', 'fc', '0', '0',
                        '{}', '{}', '{}', ?3, ?4, ?5)",
             crate::db::fixture::params![
                 format!("sbx-{index}"),
-                state.as_str(),
+                lifecycle,
                 pin,
                 pin.map(|_| "full"),
                 pin.map(|_| "suspend"),
+                cleanup_state,
             ],
         )
         .unwrap();

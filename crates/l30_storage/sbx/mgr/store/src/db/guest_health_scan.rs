@@ -22,7 +22,7 @@ struct SandboxStateParseError {
 
 db_private_outside_tests! {
     fn list_guest_health_rows(conn: &Connection) -> Result<Vec<SandboxGuestHealthRow>> {
-        let mut stmt = conn.prepare(sql!("SELECT id, state, template_hash FROM sandboxes"))?;
+        let mut stmt = conn.prepare(sql!("SELECT id, legacy_state, template_hash FROM sandboxes"))?;
         let rows = stmt.query_map([], |row| {
             let state_value = row.get::<_, String>(1)?;
             let state = state_value
@@ -55,7 +55,7 @@ db_private_outside_tests! {
         conn: &Connection,
         sandbox_ids: &'a [String],
     ) -> Result<Vec<(&'a String, StateLabelRead)>> {
-        let mut statement = conn.prepare("SELECT state FROM sandboxes WHERE id = ?1")?;
+        let mut statement = conn.prepare("SELECT legacy_state FROM sandboxes WHERE id = ?1")?;
         Ok(sandbox_ids
             .iter()
             .map(|sandbox_id| {

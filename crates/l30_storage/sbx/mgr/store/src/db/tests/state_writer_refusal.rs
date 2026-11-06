@@ -146,11 +146,7 @@ fn insert_with_episode(
         )
     });
     inserted.unwrap();
-    conn.execute(
-        "UPDATE sandboxes SET state = ?1 WHERE id = ?2",
-        params![state.as_str(), id],
-    )
-    .unwrap();
+    crate::db::test_fixtures::state_write_fixtures::write_status(conn, &id, state);
     assert_eq!(row(conn, &id).state, state);
     (id, cleanup_id)
 }

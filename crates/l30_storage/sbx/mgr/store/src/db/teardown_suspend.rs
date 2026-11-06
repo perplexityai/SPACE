@@ -290,7 +290,7 @@ pub fn stage_teardown_suspend_artifact(
              suspend_predecessor_artifact_id = NULL,
              updated_at = ?2
          WHERE id = ?3
-           AND state = 'suspending'",
+           AND legacy_state = 'suspending'",
         params![local_artifact_id.to_string(), now()?, id],
     )?;
     if changed != 1 {
@@ -424,7 +424,7 @@ pub(crate) fn teardown_owned_suspending_rows(
         "SELECT s.id, j.payload, j.status, s.space_api_route_execution_generation
            FROM sandboxes AS s
            JOIN jobs AS j ON j.subject_id = s.id
-          WHERE s.state = 'suspending'
+          WHERE s.legacy_state = 'suspending'
             AND j.kind = ?1
             AND j.status IN ('pending', 'running')
           ORDER BY s.id, j.created_at, j.job_id"
@@ -615,7 +615,7 @@ db_private_outside_tests! {
     ) -> Result<Option<TeardownSuspendStatus>> {
         let status = conn
             .query_row(
-                "SELECT s.state,
+                "SELECT s.legacy_state,
                 s.current_local_artifact_id,
                 s.current_local_artifact_kind,
                 s.current_local_artifact_origin,

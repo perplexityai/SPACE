@@ -191,7 +191,7 @@ db_private_outside_tests! {
                FROM sandboxes
                JOIN sandbox_quarantine_state qs ON qs.sandbox_id = sandboxes.id
               WHERE sandboxes.id = ?1
-                AND sandboxes.state = ?2
+                AND sandboxes.legacy_state = ?2
                 AND sandboxes.current_local_artifact_id IS NULL
                 AND qs.source = ?3
                 AND qs.reason_code = ?4
@@ -1467,13 +1467,14 @@ pub fn adopt_quarantine_cleanup_episode(
     let generation = execution_generation.get();
     let adopt_sql = format!(
         "UPDATE sandboxes
-            SET state = 'cleanup_required',
+            SET state = 'stopping',
+                cleanup_state = 'required',
                 cleanup_completion = 'mark_suspended',
                 cleanup_keep_filesystem = TRUE,
                 space_api_route_execution_generation = :generation,
                 failure_reason = :message,
                 state_changed_at = CASE
-                    WHEN state != 'cleanup_required' THEN :timestamp
+                    WHEN legacy_state != 'cleanup_required' THEN :timestamp
                     ELSE state_changed_at
                 END,
                 updated_at = :timestamp

@@ -267,7 +267,7 @@ async fn exchanged_restore_cleanup_failure_retains_scope_until_retry() {
         let conn = db.lock().unwrap();
         assert_eq!(
             conn.query_row(
-                "SELECT state FROM sandboxes WHERE id = ?1",
+                "SELECT legacy_state FROM sandboxes WHERE id = ?1",
                 [&sandbox_id],
                 |row| row.get::<_, String>(0),
             )
@@ -315,7 +315,7 @@ async fn exchanged_restore_cleanup_failure_retains_scope_until_retry() {
     let conn = db.lock().unwrap();
     assert_eq!(
         conn.query_row(
-            "SELECT state FROM sandboxes WHERE id = ?1",
+            "SELECT legacy_state FROM sandboxes WHERE id = ?1",
             [&sandbox_id],
             |row| row.get::<_, String>(0),
         )
@@ -387,7 +387,7 @@ fn interrupted_restore_as_new_publishes_metadata_and_finalizes_as_stopped() {
     );
     assert_eq!(
         conn.query_row(
-            "SELECT state FROM sandboxes WHERE id = ?1",
+            "SELECT legacy_state FROM sandboxes WHERE id = ?1",
             [&sandbox_id],
             |row| row.get::<_, String>(0),
         )
@@ -614,7 +614,7 @@ fn an_unexpected_artifact_leaves_the_row_alone() {
 
     assert_eq!(
         conn.query_row(
-            "SELECT state FROM sandboxes WHERE id = ?1",
+            "SELECT legacy_state FROM sandboxes WHERE id = ?1",
             [&sandbox_id],
             |row| row.get::<_, String>(0),
         )
@@ -646,7 +646,7 @@ fn materializing_a_stopped_sandbox_lands_stopped_with_its_pin() {
 
     assert_eq!(
         conn.query_row(
-            "SELECT state FROM sandboxes WHERE id = ?1",
+            "SELECT legacy_state FROM sandboxes WHERE id = ?1",
             [&sandbox_id],
             |row| row.get::<_, String>(0),
         )
@@ -751,7 +751,7 @@ fn each_finalize_arm_is_selected_by_the_request_not_by_the_artifact() {
     );
     assert_eq!(
         conn.query_row(
-            "SELECT state FROM sandboxes WHERE id = ?1",
+            "SELECT legacy_state FROM sandboxes WHERE id = ?1",
             [&checkpointed],
             |row| row.get::<_, String>(0),
         )
@@ -1446,7 +1446,7 @@ fn an_adoption_inside_the_claim_transaction_commits_the_row() {
 
     let state: String = conn
         .query_row(
-            "SELECT state FROM sandboxes WHERE id = ?1",
+            "SELECT legacy_state FROM sandboxes WHERE id = ?1",
             [orphan_id.to_string()],
             |row| row.get(0),
         )
@@ -1569,7 +1569,7 @@ fn a_sandbox_that_left_an_activatable_state_is_refused_before_adoption() {
     );
     let state: String = conn
         .query_row(
-            "SELECT state FROM sandboxes WHERE id = ?1",
+            "SELECT legacy_state FROM sandboxes WHERE id = ?1",
             [sandbox_id.to_string()],
             |row| row.get(0),
         )

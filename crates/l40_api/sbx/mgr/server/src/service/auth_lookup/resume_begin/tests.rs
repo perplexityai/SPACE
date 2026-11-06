@@ -158,6 +158,9 @@ fn move_row(conn: &crate::db::Connection, id: &str, found: Found) {
     match state {
         SandboxState::Paused => {}
         SandboxState::Stopped => crate::db::test_fixtures::state_write_fixtures::stop(conn, id),
+        SandboxState::CleanupRequired | SandboxState::CleanupFailed => {
+            crate::db::test_fixtures::state_write_fixtures::write_status(conn, id, state);
+        }
         state => {
             // The schema ties the restore columns to `restoring`.
             conn.execute(

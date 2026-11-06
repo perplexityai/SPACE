@@ -71,13 +71,14 @@ pub fn snapshot(conn: &Connection) -> Snapshot {
                 let rows = statement
                     .query_map([], |row| {
                         let rowid: i64 = row.get(0)?;
-                        let values = names
+                        let mut values = names
                             .iter()
                             .enumerate()
                             .map(|(index, name)| {
                                 Ok((name.clone(), row.get::<_, Value>(index + 1)?))
                             })
                             .collect::<rusqlite::Result<Row>>()?;
+                        fold_sandbox_status(&table, &mut values);
                         let identity = if key.is_empty() {
                             format!("rowid {rowid}")
                         } else {
@@ -373,19 +374,76 @@ pub fn insert_row(conn: &Connection, state: SandboxState) -> String {
 
 /// Move a seeded row to `state` without any writer's side effects. A
 /// `restoring` row carries a remote restore's three restore columns, which the
-/// table's `CHECK` ties to that state.
+/// table's `CHECK` ties to that state. A cleanup status is stored as its
+/// cleanup state over the teardown transition the row's intent names.
 pub fn force_state(conn: &Connection, id: &str, state: SandboxState) {
     let restoring = state == SandboxState::Restoring;
     conn.execute(
         "UPDATE sandboxes
-            SET state = ?1,
+            SET state = CASE
+                    WHEN ?5 IS NULL THEN ?1
+                    WHEN cleanup_completion IN ('delete_row', 'delete_pool_clone') THEN 'deleting'
+                    WHEN cleanup_completion = 'mark_suspended' AND state = 'suspending'
+                        THEN 'suspending'
+                    ELSE 'stopping'
+                END,
+                cleanup_state = ?5,
                 restore_origin = CASE WHEN ?2 THEN 'remote' END,
                 restore_phase = CASE WHEN ?2 THEN 'metadata_staging' END,
                 restore_storage_uri = CASE WHEN ?2 THEN ?4 END
           WHERE id = ?3",
-        params![state.as_str(), restoring, id, RESTORE_STORAGE_URI],
+        params![
+            state.as_str(),
+            restoring,
+            id,
+            RESTORE_STORAGE_URI,
+            state.cleanup_label()
+        ],
     )
     .unwrap();
+}
+
+/// The `(state, cleanup_state)` columns a row inserted with `status` stores,
+/// for fixtures that insert rows with their own SQL.
+pub fn stored_columns(status: SandboxState) -> (&'static str, Option<&'static str>) {
+    (status.inserted_lifecycle(), status.cleanup_label())
+}
+
+/// Store `state` on a seeded row without any writer's side effects: a
+/// lifecycle state as itself, a cleanup status as its cleanup state over the
+/// teardown transition the row's intent names.
+pub fn write_status(conn: &Connection, id: &str, state: SandboxState) {
+    let changed = conn
+        .execute(
+            "UPDATE sandboxes
+                SET state = CASE
+                        WHEN ?2 IS NULL THEN ?1
+                        WHEN cleanup_completion IN ('delete_row', 'delete_pool_clone')
+                            THEN 'deleting'
+                        WHEN cleanup_completion = 'mark_suspended' AND state = 'suspending'
+                            THEN 'suspending'
+                        ELSE 'stopping'
+                    END,
+                    cleanup_state = ?2
+              WHERE id = ?3",
+            params![state.as_str(), state.cleanup_label(), id],
+        )
+        .unwrap();
+    assert_eq!(changed, 1, "{id}");
+}
+
+/// A snapshot shows a `sandboxes` row's combined status as `state`, as rows
+/// stored it before cleanup ownership moved to its own column, so a write's
+/// expected diff names one status. The split columns are pinned by the
+/// migration and writer tests.
+fn fold_sandbox_status(table: &str, values: &mut Row) {
+    if table != "sandboxes" {
+        return;
+    }
+    if let Some(status) = values.remove("legacy_state") {
+        values.insert("state".to_owned(), status);
+    }
+    values.remove("cleanup_state");
 }
 
 /// Write `edge` with `update_state_from`, which must apply.

@@ -1,5 +1,9 @@
 use std::fmt;
 
+/// A sandbox row's combined status: its lifecycle, or `CleanupRequired` /
+/// `CleanupFailed` while a cleanup owns it. The row stores the two apart, the
+/// lifecycle in `sandboxes.state` and cleanup ownership in `cleanup_state`;
+/// reads decode this status from the generated `legacy_state`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SandboxState {
     Creating,
@@ -341,6 +345,28 @@ impl SandboxState {
             CleanupFailed => "cleanup_failed",
             Quarantined => "quarantined",
             Failed => "failed",
+        }
+    }
+
+    /// The `sandboxes.cleanup_state` this status is stored with. A row stores
+    /// its lifecycle in `state` and, apart from it, whether a cleanup owns the
+    /// row; `legacy_state` rebuilds this combined status from the two.
+    pub(crate) fn cleanup_label(self) -> Option<&'static str> {
+        match self {
+            Self::CleanupRequired => Some("required"),
+            Self::CleanupFailed => Some("failed"),
+            _ => None,
+        }
+    }
+
+    /// The `sandboxes.state` a row inserted with this status stores. A
+    /// cleanup-owned row's lifecycle is the teardown transition its intent
+    /// names; an insert records no intent yet, so it starts `stopping`, and
+    /// the writer that records a row-deleting intent moves it to `deleting`.
+    pub(crate) fn inserted_lifecycle(self) -> &'static str {
+        match self {
+            Self::CleanupRequired | Self::CleanupFailed => "stopping",
+            other => other.as_str(),
         }
     }
 

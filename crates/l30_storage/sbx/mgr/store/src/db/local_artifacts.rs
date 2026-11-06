@@ -72,7 +72,7 @@ pub fn pin_suspended_artifact_for_cleanup(
     upsert_suspend_local_artifact(&tx, id, local_artifact_id, local_path)?;
     let changed = tx.execute(
         "UPDATE sandboxes
-         SET state = 'cleanup_required',
+         SET cleanup_state = 'required',
              current_local_artifact_id = ?1,
              current_local_artifact_kind = ?2,
              current_local_artifact_origin = ?3,
@@ -81,12 +81,12 @@ pub fn pin_suspended_artifact_for_cleanup(
              cleanup_keep_filesystem = TRUE,
              failure_reason = NULL,
              state_changed_at = CASE
-                 WHEN state != 'cleanup_required' THEN ?5
+                 WHEN legacy_state != 'cleanup_required' THEN ?5
                  ELSE state_changed_at
              END,
              updated_at = ?5
          WHERE id = ?6
-           AND state = 'suspending'",
+           AND legacy_state = 'suspending'",
         params![
             local_artifact_id.to_string(),
             ArtifactKind::Full.as_str(),
@@ -596,6 +596,7 @@ pub fn publish_stopped_artifact(
     let changed = tx.execute(
         "UPDATE sandboxes
          SET state = 'stopped',
+             cleanup_state = NULL,
              current_local_artifact_id = ?1,
              current_local_artifact_kind = ?2,
              current_local_artifact_origin = ?3,
@@ -619,13 +620,13 @@ pub fn publish_stopped_artifact(
              cleanup_completion = NULL,
              cleanup_keep_filesystem = NULL,
              failure_reason = NULL,
-             state_changed_at = CASE WHEN state != 'stopped' THEN ?4 ELSE state_changed_at END,
+             state_changed_at = CASE WHEN legacy_state != 'stopped' THEN ?4 ELSE state_changed_at END,
              updated_at = ?4
          WHERE id = ?5
            AND (
-               state = 'stopping'
+               legacy_state = 'stopping'
                OR (
-                   state IN ('cleanup_required', 'cleanup_failed')
+                   legacy_state IN ('cleanup_required', 'cleanup_failed')
                    AND cleanup_completion = 'mark_stopped'
                )
                OR (

@@ -173,16 +173,19 @@ fn open_test_db() -> Connection {
 }
 
 fn insert_sandbox(conn: &Connection, id: &str, state: &str, updated_at_secs: u64) {
+    let (lifecycle, cleanup_state) =
+        crate::db::test_fixtures::state_write_fixtures::stored_columns(state.parse().unwrap());
     conn.execute(
         "INSERT INTO sandboxes (
-             id, uuid8, state, template, user, runtime, created_at, updated_at,
+             id, uuid8, state, cleanup_state, template, user, runtime, created_at, updated_at,
              process_env_json, auto_lifecycle_json, auto_lifecycle_state_json
-         ) VALUES (?1, ?2, ?3, 'seed', 'u', 'fc', '0', ?4, '{}', '{}', '{}')",
+         ) VALUES (?1, ?2, ?3, ?5, 'seed', 'u', 'fc', '0', ?4, '{}', '{}', '{}')",
         params![
             id,
             id.get(..8.min(id.len())).unwrap_or(id),
-            state,
-            updated_at_secs.to_string()
+            lifecycle,
+            updated_at_secs.to_string(),
+            cleanup_state
         ],
     )
     .unwrap();
@@ -1319,7 +1322,7 @@ fn claim_cas_binds_to_the_checked_updated_at() {
     );
     let state: String = conn
         .query_row(
-            "SELECT state FROM sandboxes WHERE id = 'sbx-version'",
+            "SELECT legacy_state FROM sandboxes WHERE id = 'sbx-version'",
             [],
             |r| r.get(0),
         )
@@ -1345,7 +1348,7 @@ fn claim_cas_rejects_non_suspended_rows() {
     );
     let state: String = conn
         .query_row(
-            "SELECT state FROM sandboxes WHERE id = 'sbx-claim'",
+            "SELECT legacy_state FROM sandboxes WHERE id = 'sbx-claim'",
             [],
             |r| r.get(0),
         )
@@ -1375,7 +1378,7 @@ fn claim_cas_binds_the_proven_pin() {
     );
     let state: String = conn
         .query_row(
-            "SELECT state FROM sandboxes WHERE id = 'sbx-bind'",
+            "SELECT legacy_state FROM sandboxes WHERE id = 'sbx-bind'",
             [],
             |r| r.get(0),
         )

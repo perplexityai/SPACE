@@ -153,7 +153,7 @@ pub fn reconcile_terminal_teardown_suspend_jobs(conn: &Connection) -> Result<usi
              SELECT 1 FROM jobs j LEFT JOIN sandboxes s ON s.id = j.subject_id
               WHERE j.kind = ?1 AND j.status IN ('pending', 'running', 'cancelling')
                 AND j.status != 'cancelling'
-                AND (s.id IS NULL OR s.state IN ('quarantined', 'deleting'))
+                AND (s.id IS NULL OR s.legacy_state IN ('quarantined', 'deleting'))
          )"
         ),
         params![super::TEARDOWN_SUSPEND_JOB_KIND],
@@ -167,7 +167,7 @@ pub fn reconcile_terminal_teardown_suspend_jobs(conn: &Connection) -> Result<usi
         "SELECT j.job_id FROM jobs j LEFT JOIN sandboxes s ON s.id = j.subject_id
           WHERE j.kind = ?1 AND j.status IN ('pending', 'running', 'cancelling')
             AND j.status != 'cancelling'
-            AND (s.id IS NULL OR s.state IN ('quarantined', 'deleting'))
+            AND (s.id IS NULL OR s.legacy_state IN ('quarantined', 'deleting'))
           LIMIT 128"
     ))?;
     let jobs = statement

@@ -2808,9 +2808,11 @@ async fn suspend_publication_failure_after_staging_preserves_only_owned_evidence
                 .db
                 .lock()
                 .unwrap()
-                .query_row("SELECT state FROM sandboxes WHERE id = ?1", [&id], |row| {
-                    row.get(0)
-                })
+                .query_row(
+                    "SELECT legacy_state FROM sandboxes WHERE id = ?1",
+                    [&id],
+                    |row| row.get(0),
+                )
                 .unwrap();
             assert_eq!(raw_state, SandboxState::Suspending.as_str(), "{case}");
         } else {
