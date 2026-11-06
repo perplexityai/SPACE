@@ -203,3 +203,31 @@ export function createCuriosityTheme({
     },
   };
 }
+
+// The sandbox terminal stays dark in both modes, so its colors come from the
+// dark palette whatever the console's mode; ANSI hues follow its tag colors.
+const terminalPalette = palettes.dark;
+const brighten = (hex: string) => composite(hex, '#ffffff', 0.25);
+export const terminalColors = {
+  background: terminalPalette.sidebar,
+  foreground: terminalPalette.text,
+  cursor: terminalPalette.accent,
+  cursorAccent: terminalPalette.sidebar,
+  selectionBackground: translucent(terminalPalette.accent, 0.35),
+  black: terminalPalette.surface,
+  red: terminalPalette.tags.red[0],
+  green: terminalPalette.tags.green[0],
+  yellow: terminalPalette.tags.gold[0],
+  blue: terminalPalette.tags.blue[0],
+  magenta: terminalPalette.tags.purple[0],
+  cyan: terminalPalette.tags.cyan[0],
+  white: terminalPalette.text,
+  brightBlack: composite(terminalPalette.sidebar, terminalPalette.text, 0.5),
+  brightRed: brighten(terminalPalette.tags.red[0]),
+  brightGreen: brighten(terminalPalette.tags.green[0]),
+  brightYellow: brighten(terminalPalette.tags.gold[0]),
+  brightBlue: brighten(terminalPalette.tags.blue[0]),
+  brightMagenta: brighten(terminalPalette.tags.purple[0]),
+  brightCyan: brighten(terminalPalette.tags.cyan[0]),
+  brightWhite: '#ffffff',
+} as const;

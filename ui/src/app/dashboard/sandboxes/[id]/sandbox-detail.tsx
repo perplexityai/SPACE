@@ -19,6 +19,9 @@ import {
   theme,
 } from 'antd';
 import type { ColumnsType } from 'antd/es/table';
+import type { Terminal as XtermTerminal } from '@xterm/xterm';
+import type { FitAddon } from '@xterm/addon-fit';
+import '@xterm/xterm/css/xterm.css';
 import {
   ArrowLeftOutlined,
   CameraOutlined,
@@ -35,7 +38,6 @@ import {
   RightOutlined,
   RollbackOutlined,
   SaveOutlined,
-  SendOutlined,
   StopOutlined,
   ThunderboltOutlined,
 } from '@ant-design/icons';
@@ -46,6 +48,23 @@ import {
   type TerminalConnection,
   type TerminalSessionEvent,
 } from '@/lib/data-plane-terminal';
+import {
+  binaryStringToBytes,
+  debounce,
+  isMacPlatform,
+  keepCurrentConnection,
+  shouldEndSessionOnDisable,
+  TERMINAL_ENV,
+  TERMINAL_RESIZE_DEBOUNCE_MS,
+  TERMINAL_SHELL_COMMAND,
+  TerminalInputGate,
+  terminalEventText,
+  terminalKeyAction,
+  terminalLinkUrl,
+  terminalNotice,
+  type TerminalInput,
+} from '@/lib/terminal-pane';
+import { terminalColors } from '@/lib/curiosity-theme';
 import { isHiddenOperationError } from '@/lib/hidden-operations';
 import {
   forceConsoleSandboxAction,
@@ -351,11 +370,14 @@ function CollapsibleCard({
   extra,
   children,
   defaultOpen = true,
+  keepMounted = false,
 }: {
   title: React.ReactNode;
   extra?: React.ReactNode;
   children: React.ReactNode;
   defaultOpen?: boolean;
+  // Hide the collapsed body instead of unmounting it.
+  keepMounted?: boolean;
 }) {
   const [open, setOpen] = useState(defaultOpen);
   return (
@@ -374,7 +396,7 @@ function CollapsibleCard({
       )}
       extra={extra}
     >
-      {open ? children : null}
+      {keepMounted ? <div hidden={!open}>{children}</div> : (open ? children : null)}
     </Card>
   );
 }
@@ -888,111 +910,227 @@ function ExecCard({ sandbox }: { sandbox: Sandbox }) {
 
 type TerminalStatus = 'disconnected' | 'connecting' | 'attached' | 'closed' | 'error';
 
-type TerminalLine = {
-  id: number;
-  stream: 'stdout' | 'stderr' | 'system';
-  text: string;
+type TerminalView = {
+  term: XtermTerminal;
+  fit: FitAddon;
 };
+
+// Fits the terminal to its pane. A collapsed card's pane has no size, so the
+// terminal keeps its last one.
+function fitTerminal(view: TerminalView) {
+  const proposed = view.fit.proposeDimensions();
+  if (!proposed || !Number.isFinite(proposed.cols) || !Number.isFinite(proposed.rows)) return;
+  if (proposed.cols < 2 || proposed.rows < 1) return;
+  if (proposed.cols === view.term.cols && proposed.rows === view.term.rows) return;
+  view.term.resize(proposed.cols, proposed.rows);
+}
+
+// Without the async clipboard (an insecure origin, or a refusal), a copy
+// command carries the text instead.
+function copyText(text: string) {
+  const legacy = () => {
+    const onCopy = (event: ClipboardEvent) => {
+      event.clipboardData?.setData('text/plain', text);
+      event.preventDefault();
+    };
+    document.addEventListener('copy', onCopy, { capture: true, once: true });
+    try {
+      document.execCommand('copy');
+    } finally {
+      document.removeEventListener('copy', onCopy, { capture: true });
+    }
+  };
+  if (window.isSecureContext && navigator.clipboard) {
+    navigator.clipboard.writeText(text).catch(legacy);
+  } else {
+    legacy();
+  }
+}
+
+// Sandbox output is untrusted: only an http(s) link opens, in a new tab that
+// gets neither this page as its opener nor its URL as the referrer.
+function openTerminalLink(text: string) {
+  const url = terminalLinkUrl(text);
+  if (url) window.open(url, '_blank', 'noopener,noreferrer');
+}
 
 function TerminalCard({ sandbox, ownOrg }: { sandbox: Sandbox; ownOrg: boolean }) {
   const { token } = theme.useToken();
   const [status, setStatus] = useState<TerminalStatus>('disconnected');
-  const [input, setInput] = useState('');
-  const [lines, setLines] = useState<TerminalLine[]>([]);
   const [sessionId, setSessionId] = useState<string | null>(null);
+  const [view, setView] = useState<TerminalView | null>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [loadAttempt, setLoadAttempt] = useState(0);
   const connectionRef = useRef<TerminalConnection | null>(null);
-  const lineIdRef = useRef(0);
-  const outputRef = useRef<HTMLPreElement | null>(null);
+  // The data plane takes input and resizes once the shell has started; what
+  // is typed before then is held and sent in order.
+  const gateRef = useRef(new TerminalInputGate());
+  // Each Connect starts a generation; a superseded session's late events and
+  // connection are dropped.
+  const generationRef = useRef(0);
+  const paneRef = useRef<HTMLDivElement | null>(null);
   const enabled = sandbox.status === 'started' || sandbox.status === 'running';
   const versionStatus = terminalVersionStatus(sandbox);
   const terminalEnabled = enabled && versionStatus.supported;
   const connecting = status === 'connecting';
-  const attached = status === 'attached';
-  const active = connecting || attached;
+  const active = connecting || status === 'attached';
 
-  const appendLine = (stream: TerminalLine['stream'], text: string) => {
-    if (!text) return;
-    lineIdRef.current += 1;
-    const line = { id: lineIdRef.current, stream, text };
-    setLines((current) => [...current.slice(-400), line]);
+  const endSession = () => {
+    generationRef.current += 1;
+    gateRef.current.close();
+    connectionRef.current?.close();
+    connectionRef.current = null;
   };
 
-  const handleTerminalEvent = (event: TerminalSessionEvent) => {
+  useEffect(() => {
+    const pane = paneRef.current;
+    if (!pane) return;
+    let disposed = false;
+    const disposers: Array<() => void> = [];
+    const disposeAll = () => {
+      for (const dispose of disposers.splice(0).reverse()) dispose();
+    };
+    void (async () => {
+      try {
+        // xterm touches the DOM as it loads, so it is imported in the browser only.
+        const [{ Terminal }, { FitAddon }, { WebLinksAddon }] = await Promise.all([
+          import('@xterm/xterm'),
+          import('@xterm/addon-fit'),
+          import('@xterm/addon-web-links'),
+        ]);
+        if (disposed) return;
+        const term = new Terminal({
+          cursorBlink: true,
+          fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace',
+          fontSize: 13,
+          scrollback: 5000,
+          theme: terminalColors,
+          // OSC 8 hyperlinks open as the addon's plain-text links do.
+          linkHandler: { activate: (_event, text) => openTerminalLink(text) },
+        });
+        disposers.push(() => term.dispose());
+        const fit = new FitAddon();
+        term.loadAddon(fit);
+        term.loadAddon(new WebLinksAddon((_event, uri) => openTerminalLink(uri)));
+        const mac = isMacPlatform(navigator.platform || navigator.userAgent);
+        term.attachCustomKeyEventHandler((event) => {
+          const action = terminalKeyAction(event, term.hasSelection(), mac);
+          if (action === 'terminal') return true;
+          if (event.type === 'keydown' && action !== 'paste') {
+            // A copy chord with nothing selected still must not reach the
+            // browser, where Ctrl+Shift+C opens the DevTools picker.
+            event.preventDefault();
+            if (action === 'copy') {
+              copyText(term.getSelection());
+              term.clearSelection();
+            }
+          }
+          return false;
+        });
+        term.open(pane);
+        const next = { term, fit };
+        fitTerminal(next);
+        term.write('\x1b[2mConnect to open an interactive shell.\x1b[22m\r\n');
+        const send = (input: TerminalInput) => {
+          const now = gateRef.current.write(input);
+          if (now === 'discarded') term.write(terminalNotice('input typed before the shell started was discarded'));
+          else if (now) connectionRef.current?.sendInput(now.data);
+        };
+        term.onData((data) => send({ kind: 'text', data }));
+        term.onBinary((data) => send({ kind: 'bytes', data: binaryStringToBytes(data) }));
+        term.onResize(({ cols, rows }) => {
+          if (gateRef.current.started) connectionRef.current?.resize(cols, rows);
+        });
+        const refit = debounce(() => fitTerminal(next), TERMINAL_RESIZE_DEBOUNCE_MS);
+        const observer = new ResizeObserver(() => refit.schedule());
+        observer.observe(pane);
+        disposers.push(() => refit.cancel(), () => observer.disconnect());
+        setView(next);
+      } catch (err: any) {
+        disposeAll();
+        pane.replaceChildren();
+        if (!disposed) setLoadError(err?.message || String(err));
+      }
+    })();
+    return () => {
+      disposed = true;
+      endSession();
+      disposeAll();
+    };
+  }, [loadAttempt]);
+
+  useEffect(() => {
+    if (shouldEndSessionOnDisable(terminalEnabled, connectionRef.current !== null, connecting)) {
+      endSession();
+      setStatus('closed');
+    }
+  }, [terminalEnabled]);
+
+  const handleTerminalEvent = (generation: number, event: TerminalSessionEvent) => {
+    if (generation !== generationRef.current || !view) return;
+    const text = terminalEventText(event);
+    if (text) view.term.write(text);
     switch (event.type) {
       case 'status':
-        setStatus(event.status === 'closed' ? 'closed' : event.status);
-        if (event.message) appendLine('system', `\n[${event.message}]\n`);
+        setStatus(event.status);
+        if (event.status === 'attached') view.term.focus();
+        if (event.status === 'closed') endSession();
         break;
       case 'started':
-        appendLine('system', `[process ${event.processId}${event.pid ? ` pid ${event.pid}` : ''}]\n`);
-        break;
-      case 'output':
-        appendLine(event.stream, event.text);
-        break;
-      case 'accepted':
+        // The pane may have changed size while the session opened.
+        fitTerminal(view);
+        connectionRef.current?.resize(view.term.cols, view.term.rows);
+        for (const input of gateRef.current.start()) connectionRef.current?.sendInput(input.data);
         break;
       case 'exited':
-        appendLine('system', `\n[process exited: ${event.status} ${event.exitCode}]\n`);
+        endSession();
         setStatus('closed');
-        connectionRef.current = null;
-        break;
-      case 'reconnecting':
-        appendLine('system', `\n[${event.message}]\n`);
         break;
       case 'error':
-        appendLine('system', `\n[error: ${event.message}]\n`);
         setStatus('error');
         break;
     }
   };
 
-  useEffect(() => {
-    outputRef.current?.scrollTo({ top: outputRef.current.scrollHeight });
-  }, [lines]);
-
-  useEffect(() => {
-    if (!terminalEnabled && connectionRef.current) {
-      connectionRef.current.close();
-      connectionRef.current = null;
-      setStatus('closed');
-    }
-  }, [terminalEnabled]);
-
-  useEffect(() => () => {
-    connectionRef.current?.close();
-    connectionRef.current = null;
-  }, []);
-
   const connect = async () => {
-    if (!terminalEnabled || active) return;
+    if (!terminalEnabled || active || !view) return;
+    // A session left open by a retryable error is replaced, not leaked.
+    endSession();
+    const generation = generationRef.current;
+    gateRef.current.open();
     setStatus('connecting');
-    setLines([]);
     setSessionId(null);
+    view.term.reset();
+    fitTerminal(view);
+    view.term.focus();
     try {
-      const connection = await openSandboxTerminal(sandbox.id, handleTerminalEvent, {
-        cols: 100,
-        rows: 30,
-        ownOrg,
-      });
-      connectionRef.current = connection;
-      setSessionId(connection.sessionId);
+      const connection = await openSandboxTerminal(
+        sandbox.id,
+        (event) => handleTerminalEvent(generation, event),
+        {
+          cols: view.term.cols,
+          rows: view.term.rows,
+          command: TERMINAL_SHELL_COMMAND,
+          env: TERMINAL_ENV,
+          ownOrg,
+        },
+      );
+      const current = keepCurrentConnection(connection, generation, generationRef.current);
+      if (!current) return;
+      connectionRef.current = current;
+      setSessionId(current.sessionId);
     } catch (err: any) {
+      if (generation !== generationRef.current) return;
+      endSession();
       setStatus('error');
-      appendLine('system', `[error: ${err.message || 'failed to open terminal'}]\n`);
+      view.term.write(terminalNotice(`error: ${err.message || 'failed to open terminal'}`));
     }
   };
 
   const disconnect = () => {
-    connectionRef.current?.close();
-    connectionRef.current = null;
+    endSession();
     setStatus('closed');
-  };
-
-  const sendInput = () => {
-    const connection = connectionRef.current;
-    if (!connection || !input) return;
-    connection.sendInput(`${input}\n`);
-    setInput('');
+    view?.term.write(terminalNotice('disconnected'));
   };
 
   const shortSessionId = sessionId && sessionId.length > 24
@@ -1006,6 +1144,8 @@ function TerminalCard({ sandbox, ownOrg }: { sandbox: Sandbox; ownOrg: boolean }
 
   return (
     <CollapsibleCard
+      // The emulator and its session survive a collapse.
+      keepMounted
       title={<Space><DesktopOutlined /> Terminal</Space>}
       extra={(
         <Space>
@@ -1013,8 +1153,11 @@ function TerminalCard({ sandbox, ownOrg }: { sandbox: Sandbox; ownOrg: boolean }
           <Button
             size="small"
             icon={<ClearOutlined />}
-            onClick={() => setLines([])}
-            disabled={lines.length === 0}
+            onClick={() => {
+              view?.term.clear();
+              view?.term.focus();
+            }}
+            disabled={!view}
           >
             Clear
           </Button>
@@ -1033,7 +1176,7 @@ function TerminalCard({ sandbox, ownOrg }: { sandbox: Sandbox; ownOrg: boolean }
               type="primary"
               icon={<PlayCircleOutlined />}
               onClick={connect}
-              disabled={!terminalEnabled}
+              disabled={!terminalEnabled || !view}
             >
               Connect
             </Button>
@@ -1056,61 +1199,34 @@ function TerminalCard({ sandbox, ownOrg }: { sandbox: Sandbox; ownOrg: boolean }
               )}
             />
           ) : null}
-          <pre
-            ref={outputRef}
-            style={{
-              background: '#101418',
-              color: '#e6edf3',
-              border: '1px solid rgba(255,255,255,0.08)',
-              borderRadius: 4,
-              fontSize: 12,
-              lineHeight: 1.5,
-              minHeight: 260,
-              maxHeight: 420,
-              overflow: 'auto',
-              padding: 12,
-              whiteSpace: 'pre-wrap',
-              wordBreak: 'break-word',
-            }}
-          >
-            {lines.length === 0 ? 'Connect to open an interactive shell.\n' : lines.map((line) => (
-              <span
-                key={line.id}
-                style={{
-                  color: line.stream === 'stderr'
-                    ? '#ffb4a8'
-                    : line.stream === 'system'
-                      ? '#8ab4f8'
-                      : '#e6edf3',
-                }}
-              >
-                {line.text}
-              </span>
-            ))}
-          </pre>
-          <Space.Compact block>
-            <Space.Addon>$</Space.Addon>
-            <Input
-              value={input}
-              onChange={(event) => setInput(event.target.value)}
-              onPressEnter={(event) => {
-                event.preventDefault();
-                sendInput();
-              }}
-              disabled={!attached || !terminalEnabled}
-              placeholder="Type shell input and press Enter"
-              suffix={(
+          {loadError ? (
+            <Alert
+              type="error"
+              showIcon
+              title={`The terminal could not load: ${loadError}`}
+              action={(
                 <Button
-                  type="text"
                   size="small"
-                  icon={<SendOutlined />}
-                  disabled={!attached || !terminalEnabled || !input}
-                  onClick={sendInput}
-                  aria-label="Send terminal input"
-                />
+                  onClick={() => {
+                    setLoadError(null);
+                    setLoadAttempt((attempt) => attempt + 1);
+                  }}
+                >
+                  Retry
+                </Button>
               )}
             />
-          </Space.Compact>
+          ) : null}
+          <div
+            style={{
+              background: terminalColors.background,
+              border: `1px solid ${token.colorBorder}`,
+              borderRadius: token.borderRadiusSM,
+              padding: 8,
+            }}
+          >
+            <div ref={paneRef} style={{ height: 420 }} />
+          </div>
         </Space>
         {!versionStatus.supported ? (
           <div
