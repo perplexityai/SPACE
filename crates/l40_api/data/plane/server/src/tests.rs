@@ -151,6 +151,54 @@ async fn proxy_session_routes_extract_path_parameters() {
     }
 }
 
+/// A credential that is not a data-plane token answers as an invalid token,
+/// a 401, before any route lookup. The WebSocket attach reads the header
+/// through the same `token_from_headers`, but needs a real upgrade to reach.
+#[tokio::test]
+async fn malformed_data_plane_token_is_unauthorized_on_every_native_route() {
+    if !pplx_space_test_env::enter_test_process(&[(
+        "SPACE_INTERNAL_RPC_INSECURE_DEV",
+        Some(std::ffi::OsStr::new("true")),
+    )]) {
+        return;
+    }
+
+    let app = router(test_data_plane_state().await);
+    let process = DataPlaneSessionId::Process(Default::default());
+    let port = DataPlaneSessionId::Port(Default::default());
+    // The proxy answers its errors without the `error` wrapper.
+    for (path, code) in [
+        (format!("/v1/sessions/{process}/events"), "/error/code"),
+        (format!("/v1/sessions/{port}/proxy"), "/code"),
+        (format!("/v1/sessions/{port}/proxy/api"), "/code"),
+    ] {
+        for authorization in ["Bearer spk_management_api_key", "bearer dpt_short"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::get(&path)
+                        .header(header::AUTHORIZATION, authorization)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "{path} {authorization}"
+            );
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let body = serde_json::from_slice::<serde_json::Value>(&body).unwrap();
+            assert_eq!(
+                body.pointer(code),
+                Some(&serde_json::json!("unauthorized")),
+                "{path} {authorization}"
+            );
+        }
+    }
+}
+
 pub(crate) fn backend_endpoint(value: &str) -> BackendEndpoint {
     value.parse().expect("valid backend endpoint")
 }
@@ -2780,12 +2828,35 @@ async fn attach_error_uses_structured_data_plane_error() {
 #[test]
 fn header_token_accepts_authorization_and_subprotocol() {
     let token = format!("{DATA_PLANE_TOKEN_PREFIX}{}", "a".repeat(64));
+    // The scheme is case-insensitive (RFC 7235 section 2.1).
+    for authorization in [
+        format!("Bearer {token}"),
+        format!("bearer {token}"),
+        format!("BEARER  {token} "),
+    ] {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::AUTHORIZATION, authorization.parse().unwrap());
+        assert_eq!(
+            token_from_headers_with_source(&headers).unwrap(),
+            Some((token.clone(), HeaderTokenSource::Authorization)),
+            "{authorization}"
+        );
+    }
+    // Another scheme carries no data-plane token.
     let mut headers = HeaderMap::new();
-    headers.insert(
-        header::AUTHORIZATION,
-        format!("Bearer {token}").parse().unwrap(),
-    );
-    assert_eq!(token_from_headers(&headers).unwrap(), Some(token.clone()));
+    headers.insert(header::AUTHORIZATION, "Basic Zm9vOmJhcg==".parse().unwrap());
+    assert_eq!(token_from_headers_with_source(&headers).unwrap(), None);
+    // A bearer credential that is not a data-plane token is one the data
+    // plane does not accept, not a malformed request.
+    for authorization in ["Bearer sk-not-a-data-plane-token", "bearer dpt_short"] {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::AUTHORIZATION, authorization.parse().unwrap());
+        assert_eq!(
+            token_from_headers_with_source(&headers),
+            Err(MalformedToken),
+            "{authorization}"
+        );
+    }
 
     let mut headers = HeaderMap::new();
     headers.insert(

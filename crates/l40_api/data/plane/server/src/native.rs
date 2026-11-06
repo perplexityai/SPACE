@@ -564,7 +564,7 @@ pub(super) async fn proxy_session(
         .parse::<DataPlaneSessionId>()
         .map_err(|_| ProxyError::BadRequest("invalid session id"))?;
     let (token, token_source) = token_from_headers_with_source(request.headers())
-        .map_err(ProxyError::BadRequest)?
+        .map_err(|MalformedToken| ProxyError::Unauthorized(INVALID_TOKEN_MESSAGE))?
         .ok_or(ProxyError::Unauthorized("data-plane token is required"))?;
     if is_upgrade_request(request.headers()) && state.drain_started.is_cancelled() {
         return Ok(native_draining_response(session_id.kind().as_str()));

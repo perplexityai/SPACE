@@ -120,14 +120,15 @@ use drain::{
 };
 #[cfg(test)]
 use native::{
-    CdpProxyBase, HeaderTokenSource, MAX_LAST_EVENT_ID, StreamBridgeError, UpgradedProxyClose,
-    attached_json, attached_session_from_route_response, file_event_frame, file_event_kind,
-    file_watch_request, last_event_id, native_requested_transport, process_event_frames,
-    process_frame_advances_backend_cursor, process_start_request, proto_reconnect_reason,
-    proxy_path_and_query, proxy_streams, reconnect_reason_for_route_change,
+    CdpProxyBase, HeaderTokenSource, MAX_LAST_EVENT_ID, MalformedToken, StreamBridgeError,
+    UpgradedProxyClose, attached_json, attached_session_from_route_response, file_event_frame,
+    file_event_kind, file_watch_request, last_event_id, native_requested_transport,
+    process_event_frames, process_frame_advances_backend_cursor, process_start_request,
+    proto_reconnect_reason, proxy_path_and_query, proxy_streams, reconnect_reason_for_route_change,
     refresh_file_watch_attached_if_route_token_stale_with, reject_query_tokens,
     resume_resync_frame, rewrite_cdp_discovery_value, server_frame_event_name, server_frame_json,
     stream_bridge_error_label, strip_data_plane_auth_headers, token_from_headers,
+    token_from_headers_with_source,
 };
 use native::{
     RouteResolutionError, attach_session, data_plane_http_error, is_upgrade_request,
