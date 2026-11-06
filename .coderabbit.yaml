@@ -451,9 +451,13 @@ reviews:
           1. A summary that says what merging the change does.
           2. Validation that names what was run and its result, or says
              "CI on this head".
-          3. A severity (or "does not apply") and a risk.
-          4. An AI assistance disclosure: "None", or the tool and the parts
-             it drafted or changed.
+          3. A severity value, or an explicit statement that severity does
+             not apply.
+          4. A risk statement. This is required even when severity does not
+             apply; severity alone does not satisfy the risk requirement.
+          5. An explicitly identified AI assistance disclosure: "None" for
+             no AI assistance, or the tool and the parts it drafted or
+             changed. An unrelated "None" does not satisfy this item.
           Equivalent headings, split sections, and capitalization pass; for
           example, "Other validation" can contain the validation evidence.
           Fail only for missing or empty information, and name it. Do not
@@ -465,7 +469,7 @@ reviews:
         instructions: |
           This applies only when the pull request fixes a defect in
           application behavior under crates/, shim/, or ui/. Pass if the
-          Validation section names a test that fails without the fix and
+          validation evidence names a test that fails without the fix and
           passes with it, or explains why such a test cannot be written or
           which existing test already covers the behavior. Fail if it does
           neither. Pass any pull request that is not an application bug fix.
