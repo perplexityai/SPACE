@@ -215,6 +215,7 @@ pub(super) async fn verify_delta_base(
                 name: template.to_string(),
                 content_hash: Some(content_hash.to_string()),
                 tag: None,
+                environment: None,
             }),
             vcpu: None,
             memory_mib: None,

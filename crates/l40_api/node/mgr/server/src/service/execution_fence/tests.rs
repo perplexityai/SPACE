@@ -415,6 +415,7 @@ async fn canonical_artifact_rpcs_reject_missing_or_superseded_execution_before_h
                     target: target.clone(),
                     template_name: "test".into(),
                     content_hash: format!("sha256:{}", "a".repeat(64)),
+                    environment_build: None,
                 }))
                 .await
                 .map(|_| ()),

@@ -60,6 +60,7 @@ async fn export_enforces_forwarded_authority(
             name: TEMPLATE.into(),
             content_hash: Some(digest.clone()),
             tag: None,
+            environment: None,
         }),
         ..Default::default()
     });
@@ -128,6 +129,7 @@ async fn export_resolves_catalog_tag(
                 name: TEMPLATE.into(),
                 content_hash: None,
                 tag: Some(tag.into()),
+                environment: None,
             }),
             ..Default::default()
         }))
@@ -183,6 +185,7 @@ async fn export_refuses_unsupported_or_corrupt_documents_before_streaming() {
                     name: TEMPLATE.into(),
                     content_hash: Some(digest),
                     tag: None,
+                    environment: None,
                 }),
                 ..Default::default()
             }))

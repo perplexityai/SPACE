@@ -99,6 +99,7 @@ impl ImportFixture {
             name: "register-refresh-test".into(),
             content_hash: Some(content_hash.clone()),
             tag: None,
+            environment: None,
         };
         let directory = build_artifacts_dir(&root, &template.name, &content_hash);
         std::fs::create_dir_all(directory.parent().unwrap()).unwrap();

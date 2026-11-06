@@ -119,6 +119,7 @@ async fn a_registration_racing_a_delete_never_succeeds_over_or_loses_a_build() {
                 name: "race-b".into(),
                 content_hash: Some(hash.clone()),
                 tag: None,
+                environment: None,
             }),
         })),
     )

@@ -55,6 +55,7 @@ pub async fn create_template_subvolume(
         .btrfs_create_template_subvolume(BtrfsCreateTemplateSubvolumeRequest {
             template_name: name.to_string(),
             content_hash: content_hash.to_string(),
+            environment_build: None,
         })
         .await
     {
@@ -95,6 +96,7 @@ pub async fn finalize_template_subvolume(
         .btrfs_finalize_template_subvolume(BtrfsFinalizeTemplateSubvolumeRequest {
             template_name: name.to_string(),
             content_hash: content_hash.to_string(),
+            environment_build: None,
         })
         .await
         .map_err(|status| BtrfsViaNodemgrError::Rpc {
@@ -123,6 +125,7 @@ pub async fn delete_template_subvolume(
         .btrfs_delete_template_subvolume(BtrfsDeleteTemplateSubvolumeRequest {
             template_name: name.to_string(),
             content_hash: content_hash.to_string(),
+            environment_build: None,
         })
         .await
         .map_err(|status| BtrfsViaNodemgrError::Rpc {

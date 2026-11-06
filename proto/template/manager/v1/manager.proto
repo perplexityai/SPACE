@@ -165,6 +165,14 @@ message TemplateRef {
   string name = 1;
   optional string content_hash = 2;     // exact build hash
   optional string tag = 3;              // build alias
+  // Reserved for template caches keyed by execution environment, where one
+  // rootfs can be cached once per environment it's bound to: in requests, the
+  // environment whose build a lookup prefers; in responses, the resolved
+  // build's binding. Template-manager doesn't key its cache by environment
+  // yet. It keeps every build in one shared layout, ignores the field in
+  // requests, including DeleteTemplateBuild's, and never sets it in
+  // responses; callers read an unset value as that shared build.
+  optional string environment = 4;
 }
 
 message SnapshotInfo {

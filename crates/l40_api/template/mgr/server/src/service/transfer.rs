@@ -172,6 +172,7 @@ impl TemplateManagerService {
                             name: tmpl_name,
                             content_hash: Some(tmpl_hash),
                             tag: None,
+                            environment: None,
                         }),
                         metadata_json,
                         includes_snapshot: has_snapshot,

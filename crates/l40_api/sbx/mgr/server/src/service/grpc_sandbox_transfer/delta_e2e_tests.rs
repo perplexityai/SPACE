@@ -141,6 +141,7 @@ fn template_rootfs(scenario: &Scenario) -> PathBuf {
     Path::new(&paths::template_build_dir(
         &scenario.template,
         &scenario.content_hash,
+        pplx_space_common_core::types::TemplateCachePartition::Legacy,
     ))
     .join("rootfs.ext4")
 }

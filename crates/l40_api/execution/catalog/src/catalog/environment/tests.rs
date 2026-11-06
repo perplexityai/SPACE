@@ -388,3 +388,28 @@ fn existing_linux_profile_survives_catalog_retirement_but_launch_does_not() {
     );
     crate::guest::GuestProfile::resolve(&execution, image).unwrap_err();
 }
+
+#[test]
+fn template_cache_partition_keeps_e0_in_the_legacy_layout() {
+    // E0 builds belong to the legacy cache partition by this reference, so
+    // existing E0 caches keep their directories and received_uuid values.
+    // Changing it moves every E0 build out of the legacy layout.
+    let e0 = initial_environment_reference();
+    assert_eq!(
+        e0.to_string(),
+        "sha256:3168c96b5719ce62543ae53e6641a4eb80416a9f01e5585f6f76c3c70111fa0b"
+    );
+    assert_eq!(
+        template_cache_partition(Some(e0)),
+        TemplateCachePartition::Legacy
+    );
+    assert_eq!(
+        template_cache_partition(None),
+        TemplateCachePartition::Legacy
+    );
+    let other = EnvironmentReference::new(Digest::sha256([9; 32]));
+    assert_eq!(
+        template_cache_partition(Some(other)),
+        TemplateCachePartition::Environment(other)
+    );
+}

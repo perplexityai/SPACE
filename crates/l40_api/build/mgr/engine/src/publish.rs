@@ -218,18 +218,32 @@ pub async fn register_build_template(
     ensure_cluster_template(&mut cluster_api, &template, publication).await
 }
 
+/// Template-manager's cache directory of a registered build: the cache
+/// partition of the `environment` it's bound to.
+pub(crate) fn published_build_dir(
+    template: &TemplateName,
+    content_hash: &ContentHash,
+    environment: Option<pplx_space_common_core::types::EnvironmentReference>,
+) -> PathBuf {
+    PathBuf::from(template_build_dir(
+        template.as_str(),
+        &content_hash.to_string(),
+        pplx_space_node_runtime_core::catalog::template_cache_partition(environment),
+    ))
+}
+
+/// Publishes a registered build from its template-manager cache directory,
+/// which is the cache partition of the `environment` it's bound to.
 pub async fn publish_build(
     template_id: &str,
     content_hash: &str,
+    environment: Option<pplx_space_common_core::types::EnvironmentReference>,
     publish_tags: &[String],
     publication: TemplatePublication,
 ) -> Result<(), PublishError> {
     let template = TemplateName::parse(template_id.to_string())?;
     let content_hash = content_hash.parse::<ContentHash>()?;
-    let build_dir = PathBuf::from(template_build_dir(
-        template.as_str(),
-        &content_hash.to_string(),
-    ));
+    let build_dir = published_build_dir(&template, &content_hash, environment);
     let mut cluster_api = match connect_cluster_api_from_env().await {
         Ok(client) => client,
         Err(ConnectClusterApiError::MissingEndpoint | ConnectClusterApiError::MissingToken(_)) => {

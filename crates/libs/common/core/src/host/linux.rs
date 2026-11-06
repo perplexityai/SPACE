@@ -379,19 +379,59 @@ pub mod paths {
         format!("{}/control.sock", isolated_net_gateway_run_dir(sandbox_id))
     }
 
-    /// Returns the build artifact directory for a template/content hash.
-    pub fn template_build_dir(template: &str, content_hash: &str) -> String {
-        format!("{TEMPLATE_DIR}/{template}/{content_hash}")
+    /// Returns the build artifact directory for a template build.
+    pub fn template_build_dir(
+        template: &str,
+        content_hash: &str,
+        partition: crate::types::TemplateCachePartition,
+    ) -> String {
+        let build = partition.build_dir_name(content_hash);
+        format!("{TEMPLATE_DIR}/{template}/{build}")
     }
 
-    /// Returns the snapshot directory for a template/content hash and compute shape.
+    /// Returns the snapshot directory for a template build and compute shape.
     pub fn template_snapshot_dir(
         template: &str,
         content_hash: &str,
+        partition: crate::types::TemplateCachePartition,
         vcpu: u32,
         memory_mib: u32,
     ) -> String {
-        format!("{TEMPLATE_DIR}/{template}/snapshots/{content_hash}/{vcpu}vcpu-{memory_mib}mib")
+        let build = partition.build_dir_name(content_hash);
+        format!("{TEMPLATE_DIR}/{template}/snapshots/{build}/{vcpu}vcpu-{memory_mib}mib")
+    }
+
+    /// Cache partitions holding a build dir for a template digest under
+    /// `template_root`, legacy first; none when the template dir doesn't
+    /// exist. A dir's presence says nothing about whether its build is
+    /// verified; only template-manager's catalog does. Any other read error
+    /// is returned rather than read as no dirs, since callers act on a
+    /// partition's absence: a delete would report success over it.
+    pub fn cached_template_partitions_in(
+        template_root: &std::path::Path,
+        template: &str,
+        content_hash: &str,
+    ) -> std::io::Result<Vec<crate::types::TemplateCachePartition>> {
+        let entries = match std::fs::read_dir(template_root.join(template)) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error),
+        };
+        let mut partitions = Vec::new();
+        for entry in entries {
+            let name = entry?.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            if let Some((hash, partition)) =
+                crate::types::TemplateCachePartition::parse_build_dir_name(name)
+                && hash == content_hash
+            {
+                partitions.push(partition);
+            }
+        }
+        partitions.sort();
+        Ok(partitions)
     }
 
     /// Applies the shared SPACE template cache rwx bits to one path.

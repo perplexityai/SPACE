@@ -270,12 +270,15 @@ impl SandboxManagerService {
 
             // Resolve template to content-addressed paths via template-manager.
             // If caller pinned a content_hash, use it; otherwise resolve newest.
+            // A selected environment states a preference for its own build of
+            // the rootfs; whatever build comes back is checked below.
             let mut resolved_template = resolve_template_paths(
                 self.template_resolver.as_ref(),
                 pplx_space_template_mgr_client::proto::TemplateRef {
                     name: template.to_string(),
                     content_hash: req.content_hash.clone(),
                     tag: None,
+                    environment: environment.map(|reference| reference.to_string()),
                 },
                 scope,
             )

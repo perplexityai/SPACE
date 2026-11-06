@@ -112,6 +112,35 @@ impl InitialEnvironment {
     }
 }
 
+/// Reference of the Linux/x86_64 initial environment, computed once from the
+/// compiled pins.
+///
+/// # Panics
+///
+/// When the compiled pins can't describe the initial environment. That is a
+/// broken build, which the catalog's golden tests rule out, and treating it as
+/// "no initial environment" would silently move every initial-environment
+/// build out of the legacy cache partition.
+pub fn initial_environment_reference() -> EnvironmentReference {
+    static INITIAL: std::sync::OnceLock<EnvironmentReference> = std::sync::OnceLock::new();
+    *INITIAL.get_or_init(|| {
+        InitialEnvironment::for_architecture(Arch::X86_64)
+            .map_err(|error| error.to_string())
+            .and_then(|initial| initial.definition().map_err(|error| error.to_string()))
+            .map(|definition| definition.reference())
+            .expect("compiled pins describe the initial environment")
+    })
+}
+
+/// Node-local template cache partition of a build bound to `environment`.
+/// Unbound and initial-environment builds share the legacy partition; see
+/// [`TemplateCachePartition`].
+pub fn template_cache_partition(
+    environment: Option<EnvironmentReference>,
+) -> TemplateCachePartition {
+    TemplateCachePartition::for_environment(environment, Some(initial_environment_reference()))
+}
+
 fn definition_from_pins(
     release: &PinnedRelease,
     kernel: &PinnedKernel,

@@ -1099,11 +1099,32 @@ message DenyPortResponse {}
 
 // ─── Btrfs delegation messages ─────────────────────────────────────────
 
+// A template build bound to an environment other than the initial one. Its
+// node-local cache partition is `{content_hash}@{environment}`, separate from
+// the legacy `{content_hash}` build of the same rootfs, and its subvolume's
+// received_uuid covers the environment too. Unbound and initial-environment
+// builds keep using the legacy `content_hash` field.
+//
+// Template subvolume requests (create, finalize, delete) carrying this
+// message leave their legacy `content_hash` empty, so a node-manager that
+// predates partitions rejects them instead of acting on the legacy build.
+// Servers reject one that sets both. Sandbox codec requests carry it beside
+// `content_hash` instead; see BtrfsEncodeRootfsSendRequest.environment_build.
+// Every request rejects one whose environment selects the legacy partition:
+// legacy builds are named by `content_hash` alone.
+message EnvironmentTemplateBuild {
+  string content_hash = 1;
+  string environment = 2;
+}
+
 message BtrfsCreateTemplateSubvolumeRequest {
   // Template identifiers — nodemgr derives the canonical digest dir
   // path from these. Callers do NOT pass arbitrary paths.
   string template_name = 1;
   string content_hash = 2;  // "sha256:..."
+  // Set instead of `content_hash` for a build in an environment's cache
+  // partition; see EnvironmentTemplateBuild.
+  EnvironmentTemplateBuild environment_build = 3;
 }
 message BtrfsCreateTemplateSubvolumeResponse {
   // The path nodemgr created, returned for logging / sanity-checking
@@ -1115,6 +1136,9 @@ message BtrfsCreateTemplateSubvolumeResponse {
 message BtrfsFinalizeTemplateSubvolumeRequest {
   string template_name = 1;
   string content_hash = 2;
+  // Set instead of `content_hash` for a build in an environment's cache
+  // partition; see EnvironmentTemplateBuild.
+  EnvironmentTemplateBuild environment_build = 3;
 }
 message BtrfsFinalizeTemplateSubvolumeResponse {
   // The UUIDv5 nodemgr stamped, returned so the caller can log it
@@ -1127,6 +1151,9 @@ message BtrfsFinalizeTemplateSubvolumeResponse {
 message BtrfsDeleteTemplateSubvolumeRequest {
   string template_name = 1;
   string content_hash = 2;
+  // Set instead of `content_hash` for a build in an environment's cache
+  // partition; see EnvironmentTemplateBuild.
+  EnvironmentTemplateBuild environment_build = 3;
 }
 message BtrfsDeleteTemplateSubvolumeResponse {}
 
@@ -1150,6 +1177,20 @@ message BtrfsEncodeRootfsSendRequest {
   // Requires retain_source. The response's source_id acknowledges support;
   // old servers still materialize the file. stream_bytes is zero when deferred.
   bool defer_send = 7;
+  // The build's cache partition, for a sandbox bound to an environment
+  // outside the legacy layout. content_hash stays set, so a node-manager that
+  // predates the field resolves the legacy build as before; this one requires
+  // the two hashes to agree. Absent for a legacy-partition build.
+  //
+  // With the field set, the parent is chosen from candidates, most specific
+  // first: this partition's build, then the legacy build, then the digest's
+  // other cached partitions, since a sandbox bound to an environment can
+  // descend from a build of another partition. The encodes take the first
+  // candidate the instance descends from, by their lineage checks; a restore
+  // receive takes the first stamped subvolume, and `btrfs receive` finds the
+  // stream's parent by its received UUID. A request without the field names
+  // the legacy build only, as before the field existed.
+  EnvironmentTemplateBuild environment_build = 8;
 }
 message BtrfsEncodeRootfsSendResponse {
   // Size of the produced rootfs.btrfs-send stream, returned so the
@@ -1176,6 +1217,8 @@ message BtrfsEncodeSnapshotRootfsSendRequest {
   // Requires retain_source. The response's source_id acknowledges support;
   // old servers still materialize the file. stream_bytes is zero when deferred.
   bool defer_send = 7;
+  // As BtrfsEncodeRootfsSendRequest.environment_build.
+  EnvironmentTemplateBuild environment_build = 8;
 }
 message BtrfsEncodeSnapshotRootfsSendResponse {
   uint64 stream_bytes = 1;
@@ -1215,6 +1258,8 @@ message BtrfsReceiveInstanceRequest {
   string template_name = 2;
   string content_hash = 3;
   InstanceTarget target = 4;
+  // As BtrfsEncodeRootfsSendRequest.environment_build.
+  EnvironmentTemplateBuild environment_build = 5;
 }
 message BtrfsReceiveInstanceResponse {}
 

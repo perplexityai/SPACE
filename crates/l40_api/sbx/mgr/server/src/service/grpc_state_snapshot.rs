@@ -2006,6 +2006,7 @@ impl SandboxManagerService {
             let snapshot_dir = pplx_space_common_core::host::linux::paths::template_snapshot_dir(
                 &sandbox.template,
                 &content_hash,
+                pplx_space_common_core::types::TemplateCachePartition::Legacy,
                 req.vcpu,
                 snapshot_memory_mib,
             );
