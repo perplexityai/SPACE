@@ -147,6 +147,63 @@ impl KubernetesSubstrate {
 }
 
 impl KubernetesSubstrate {
+    /// With the environment placement gate on, whether warm pod `pod`'s node
+    /// publishes the environment the slot's build of `template` at
+    /// `content_hash` is bound to, as a cold-built pod would require. A pod
+    /// built while the gate was off or shadow carries no requirement, and node
+    /// affinity is ignored once a pod runs, so a node can lose the label under
+    /// a pod it already holds. Unbound work, and every mode but on, admits.
+    /// A node the cache doesn't have is [`PooledPodEnvironment::Unknown`], as
+    /// for the node-group check: a cold Node reflector says nothing about the
+    /// node.
+    pub(super) async fn pooled_pod_environment(
+        &self,
+        template: &str,
+        content_hash: &str,
+        pod: Option<&SandboxPodView>,
+    ) -> Result<PooledPodEnvironment, SubstrateError> {
+        if !self.k8s.environment_placement.refuses() {
+            return Ok(PooledPodEnvironment::Admitted);
+        }
+        let Some(environment) = self
+            .template_pod_environment(template, content_hash)
+            .await?
+        else {
+            return Ok(PooledPodEnvironment::Admitted);
+        };
+        let Some(node) = pod
+            .and_then(SandboxPodView::node_name)
+            .and_then(|name| self.k8s.caches.node_by_name(name))
+        else {
+            return Ok(PooledPodEnvironment::Unknown);
+        };
+        let published = node.metadata.labels.as_ref().is_some_and(|labels| {
+            pplx_space_common_core::kubernetes::node_publishes_environment(
+                labels,
+                &environment.reference,
+            )
+        });
+        Ok(if published {
+            PooledPodEnvironment::Admitted
+        } else {
+            PooledPodEnvironment::NotPublished
+        })
+    }
+}
+
+/// What [`KubernetesSubstrate::pooled_pod_environment`] says of a warm pod's
+/// node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PooledPodEnvironment {
+    /// The node publishes the work's environment, or nothing is gated.
+    Admitted,
+    /// The node's labels don't publish the work's environment.
+    NotPublished,
+    /// The cache doesn't have the pod's node.
+    Unknown,
+}
+
+impl KubernetesSubstrate {
     pub(super) async fn apply_pooled_execution_auto_lifecycle_with_client(
         client: &mut RetryingWorkerApiClient<'_>,
         claim: &PooledExecutionClaim,

@@ -47,7 +47,7 @@ use crate::dirty_state::{
 use crate::{InboundFacetResult, ReconcileStats, connect_cluster_api, local_manager_request, util};
 
 mod cluster_deleted_eviction;
-mod execution_inventory;
+pub(crate) mod execution_inventory;
 mod inbound_sandbox_listing;
 mod inventory_publish;
 mod local_state;

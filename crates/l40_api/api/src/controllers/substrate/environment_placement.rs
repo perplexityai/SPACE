@@ -26,6 +26,12 @@
 //!   projections and, for a create or a pool adoption, the legacy kernel
 //!   check; every other recorded component is still checked.
 //!
+//! On Kubernetes, kube-scheduler picks the node, so the gate reaches placement
+//! through the pod instead: `pod_environment` records the work's environment
+//! on the pod in shadow and on, and on adds a required node affinity on the
+//! label node-ctl writes for it. Kubernetes refuses on at startup for now
+//! ([`EnvironmentPlacementGate::check_kubernetes_support`]).
+//!
 //! The gate reads only what nodes publish. It doesn't apply the cluster's
 //! execution policy, and it doesn't exclude a node that lags a narrowing
 //! policy change.
@@ -33,12 +39,15 @@
 use std::fmt;
 use std::str::FromStr;
 
+use crate::metrics::environment_placement::EnvironmentPlacementPath;
 use pplx_space_common_core::env::Environment;
+#[cfg(feature = "kubernetes")]
+use pplx_space_common_core::kubernetes::PodEnvironment;
+#[cfg(feature = "kubernetes")]
+use pplx_space_common_core::types::EnvironmentReference;
 use pplx_space_common_core::types::NodeId;
 use pplx_space_node_status_store::EnvironmentRefusal;
 use sqlx::PgPool;
-
-use crate::metrics::environment_placement::EnvironmentPlacementPath;
 
 #[cfg(test)]
 mod tests;
@@ -92,23 +101,19 @@ impl EnvironmentPlacementGate {
         matches!(self, Self::Shadow)
     }
 
-    /// Kubernetes pods aren't gated yet (the gap table in
-    /// `kubernetes/mod.rs`): `on` would claim enforcement nothing provides,
-    /// so it's refused at startup, and `shadow`, which places as `off`
-    /// anyway, only logs that it counts nothing.
+    /// Whether the Kubernetes substrate supports this mode (the gap table in
+    /// `kubernetes/mod.rs`). `off` and `shadow` are, since shadow places as
+    /// off. `on` is refused at startup: a Kubernetes create names no cache
+    /// partition, so the worker boots the digest's legacy-partition build
+    /// whatever environment the pod's affinity required, and the requirement
+    /// would claim enforcement the worker doesn't provide.
     pub fn check_kubernetes_support(self) -> Result<(), super::SubstrateError> {
         match self {
-            Self::Off => Ok(()),
-            Self::Shadow => {
-                tracing::warn!(
-                    "the environment placement gate's shadow mode counts nothing on the \
-                     Kubernetes substrate yet"
-                );
-                Ok(())
-            }
+            Self::Off | Self::Shadow => Ok(()),
             Self::On => Err(super::SubstrateError::Unsupported {
                 message: format!(
-                    "{}=on isn't supported on the Kubernetes substrate yet",
+                    "{}=on isn't supported on the Kubernetes substrate yet: the worker doesn't \
+                     yet boot the environment a pod requires; use shadow",
                     Self::ENV
                 ),
             }),
@@ -296,4 +301,99 @@ async fn build_binding(
                 .await
         }
     }
+}
+
+/// Reading the environment some work is bound to failed.
+#[derive(Debug, thiserror::Error)]
+pub enum BoundEnvironmentError {
+    #[error("{subject} is bound to an invalid environment {value:?}")]
+    Invalid {
+        subject: String,
+        value: String,
+        #[source]
+        source: pplx_space_common_core::types::DigestParseError,
+    },
+    #[error(transparent)]
+    Database(#[from] sqlx::Error),
+}
+
+/// Parse the environment `subject` records as its binding. A record that
+/// names one the control plane can't parse fails, rather than placing as
+/// unbound work.
+#[cfg(feature = "kubernetes")]
+pub(crate) fn parse_bound_environment(
+    subject: impl fmt::Display,
+    value: String,
+) -> Result<EnvironmentReference, BoundEnvironmentError> {
+    value
+        .parse()
+        .map_err(|source| BoundEnvironmentError::Invalid {
+            subject: subject.to_string(),
+            value,
+            source,
+        })
+}
+
+/// The environment a pod running `reference` renders under `gate`: recorded
+/// while the gate evaluates, and required while it's on.
+#[cfg(feature = "kubernetes")]
+pub fn pod_environment(
+    gate: EnvironmentPlacementGate,
+    reference: EnvironmentReference,
+) -> Option<PodEnvironment> {
+    gate.evaluates().then_some(PodEnvironment {
+        reference,
+        required: gate.refuses(),
+    })
+}
+
+/// The environment a pod of work whose record names `value` renders under
+/// `gate` ([`pod_environment`]); `None` for unbound work. A binding that
+/// doesn't parse fails with the gate on, rather than place bound work as
+/// unbound. In shadow it's logged and reads as unbound, so shadow places
+/// exactly as off, as [`work_environment`] does for a failed read.
+#[cfg(feature = "kubernetes")]
+pub(crate) fn bound_pod_environment(
+    gate: EnvironmentPlacementGate,
+    subject: impl fmt::Display,
+    value: Option<String>,
+) -> Result<Option<PodEnvironment>, BoundEnvironmentError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    match parse_bound_environment(subject, value) {
+        Ok(reference) => Ok(pod_environment(gate, reference)),
+        Err(error) if !gate.refuses() => {
+            tracing::warn!(
+                %error,
+                "environment placement gate couldn't parse the work's environment; shadow \
+                 places as off"
+            );
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// The environment a warm-pool pod of `template` at `content_hash` renders
+/// under `gate` ([`work_environment`], [`bound_pod_environment`]); `None`
+/// while the gate is off or for unbound work.
+#[cfg(feature = "kubernetes")]
+pub async fn pool_pod_environment(
+    gate: EnvironmentPlacementGate,
+    pool: &sqlx::PgPool,
+    template: &str,
+    content_hash: &str,
+) -> Result<Option<PodEnvironment>, BoundEnvironmentError> {
+    // A pod may land on any node, so no candidate's own inventory row can
+    // gate it: the build's holders have to agree.
+    let value = work_environment(
+        gate,
+        pool,
+        template,
+        Some(content_hash),
+        BindingScope::ReleaseOrHolders,
+    )
+    .await?;
+    bound_pod_environment(gate, format_args!("template {template}"), value)
 }
