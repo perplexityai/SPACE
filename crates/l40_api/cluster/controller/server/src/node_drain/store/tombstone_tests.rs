@@ -1,3 +1,4 @@
+use pplx_space_common_core::types::NodeDrainEngine;
 use pplx_space_common_core::types::NodeId;
 
 use std::time::Duration;
@@ -56,7 +57,9 @@ async fn delete_terminating_node_inserts_tombstone() -> TestResult {
     let node_name = format!("space-test-node-{}", node_id.as_uuid().simple());
     insert_terminating_k8s_node(&db.pool, node_id, &node_name).await?;
 
-    let deleted = delete_terminating_node_and_record_tombstone(&db.pool, node_id).await?;
+    let deleted =
+        delete_terminating_node_and_record_tombstone(&db.pool, node_id, NodeDrainEngine::V1)
+            .await?;
     assert!(deleted, "expected terminating row to be deleted");
 
     let remaining: i64 = sqlx::query_scalar(sql!("SELECT COUNT(*) FROM nodes WHERE id = $1"))
@@ -94,7 +97,9 @@ async fn delete_terminating_node_is_noop_when_phase_drifted() -> TestResult {
     .execute(&db.pool)
     .await?;
 
-    let deleted = delete_terminating_node_and_record_tombstone(&db.pool, node_id).await?;
+    let deleted =
+        delete_terminating_node_and_record_tombstone(&db.pool, node_id, NodeDrainEngine::V1)
+            .await?;
     assert!(!deleted, "phase != terminating must be a no-op");
 
     let still_present: i64 = sqlx::query_scalar(sql!("SELECT COUNT(*) FROM nodes WHERE id = $1"))
@@ -139,7 +144,10 @@ async fn terminating_direct_node_is_neither_listed_nor_deleted() -> TestResult {
         .await?;
     assert_eq!(listed, vec![k8s_node]);
 
-    assert!(!delete_terminating_node_and_record_tombstone(&db.pool, direct_node).await?);
+    assert!(
+        !delete_terminating_node_and_record_tombstone(&db.pool, direct_node, NodeDrainEngine::V1)
+            .await?
+    );
     let (present, tombstones): (i64, i64) = sqlx::query_as(sql!(
         "SELECT (SELECT COUNT(*) FROM nodes WHERE id = $1),
                 (SELECT COUNT(*) FROM node_k8s_tombstones WHERE node_id = $1)"
@@ -153,7 +161,10 @@ async fn terminating_direct_node_is_neither_listed_nor_deleted() -> TestResult {
         "the direct node is left alone"
     );
 
-    assert!(delete_terminating_node_and_record_tombstone(&db.pool, k8s_node).await?);
+    assert!(
+        delete_terminating_node_and_record_tombstone(&db.pool, k8s_node, NodeDrainEngine::V1)
+            .await?
+    );
     Ok(())
 }
 
@@ -189,7 +200,9 @@ async fn delete_racing_managed_by_write(
 
     let delete = tokio::spawn({
         let pool = db.pool.clone();
-        async move { delete_terminating_node_and_record_tombstone(&pool, node_id).await }
+        async move {
+            delete_terminating_node_and_record_tombstone(&pool, node_id, NodeDrainEngine::V1).await
+        }
     });
     wait_for_backend_blocked_by(&db.pool, writer_pid).await?;
     writer.commit().await?;

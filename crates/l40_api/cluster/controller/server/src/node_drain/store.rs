@@ -834,14 +834,17 @@ pub(crate) const DRAIN_RECONCILER_SUBSTRATE: SubstrateKind = SubstrateKind::Kube
 pub(crate) fn draining_nodes_query() -> &'static str {
     sql!(
         "SELECT id, drain_mode FROM nodes
-          WHERE drain_phase = $1 AND managed_by = $2"
+          WHERE drain_phase = $1 AND managed_by = $2 AND drain_engine IS NULL"
     )
 }
 
 /// `$1` = drain phase (`terminating`), `$2` = [`DRAIN_RECONCILER_SUBSTRATE`].
 /// The terminating-node work list, scoped like [`draining_nodes_query`].
 pub(crate) fn terminating_nodes_query() -> &'static str {
-    sql!("SELECT id FROM nodes WHERE drain_phase = $1 AND managed_by = $2")
+    sql!(
+        "SELECT id FROM nodes
+          WHERE drain_phase = $1 AND managed_by = $2 AND drain_engine IS NULL"
+    )
 }
 
 /// Per-call ceiling on [`pinned_local_only_sandboxes_query`]'s enumeration.
@@ -5001,7 +5004,12 @@ impl NodeDrainSink for SubstrateSink {
     }
 
     async fn delete_terminating_node(&self, node_id: NodeId) -> Result<bool, sqlx::Error> {
-        let deleted = delete_terminating_node_and_record_tombstone(&self.pool, node_id).await?;
+        let deleted = delete_terminating_node_and_record_tombstone(
+            &self.pool,
+            node_id,
+            pplx_space_common_core::types::NodeDrainEngine::V1,
+        )
+        .await?;
         if deleted {
             self.evict_promotion_node_api_client(node_id).await;
         }
@@ -5214,9 +5222,13 @@ async fn connect_restore_listener(
 /// `shutting-down` (the `m5d.metal` shutdown is slow), and for a recycled-IP
 /// fresh EC2 instance that joins under the same hostname before an operator
 /// clears the tombstone.
+///
+/// `engine` is the drain engine whose terminating node this deletes: each
+/// engine's terminate path deletes only its own rows.
 pub(crate) async fn delete_terminating_node_and_record_tombstone(
     pool: &PgPool,
     node_id: NodeId,
+    engine: pplx_space_common_core::types::NodeDrainEngine,
 ) -> Result<bool, sqlx::Error> {
     let mut tx = pool.begin().await?;
     let snapshot: Option<(String, Option<String>)> = sqlx::query_as(sql!(
@@ -5225,10 +5237,12 @@ pub(crate) async fn delete_terminating_node_and_record_tombstone(
          LEFT JOIN node_k8s nk ON nk.node_id = n.id
          WHERE n.id = $1
            AND n.drain_phase = 'terminating'
-           AND n.managed_by = $2"
+           AND n.managed_by = $2
+           AND n.drain_engine IS NOT DISTINCT FROM $3"
     ))
     .bind(node_id)
     .bind(SubstrateKind::Kubernetes)
+    .bind(engine.column())
     .fetch_optional(&mut *tx)
     .await?;
     let Some((role, k8s_node_name)) = snapshot else {
@@ -5238,10 +5252,12 @@ pub(crate) async fn delete_terminating_node_and_record_tombstone(
         "DELETE FROM nodes
          WHERE id = $1
            AND drain_phase = 'terminating'
-           AND managed_by = $2"
+           AND managed_by = $2
+           AND drain_engine IS NOT DISTINCT FROM $3"
     ))
     .bind(node_id)
     .bind(SubstrateKind::Kubernetes)
+    .bind(engine.column())
     .execute(&mut *tx)
     .await?;
     if result.rows_affected() == 0 {
@@ -5281,6 +5297,9 @@ mod tests;
 
 #[cfg(test)]
 mod tombstone_tests;
+
+#[cfg(test)]
+mod v2_skip_tests;
 
 /// Postgres-backed regression tests for the durable-upload drain gate: a node
 /// must not be reclaimed (nor its sandbox marked `failed`) while a

@@ -4847,3 +4847,88 @@ async fn observed_demand_release_matching_characterization() -> TestResult {
     }
     Ok(())
 }
+
+/// A ready slot on a node in any drain phase is never claimed, though it is
+/// the oldest; the slot on an undrained node is, and with only drain-phase
+/// slots left the claim finds none.
+#[tokio::test(flavor = "current_thread")]
+async fn a_slot_on_a_draining_node_is_never_claimed() -> TestResult {
+    let fixture = postgres_fixture().await?;
+    let template = TemplateName::parse("seed")?;
+    let (template_release_id, config_id, content_hash) =
+        seed_pool_config(&fixture.pool, 0x12).await?;
+    let (vcpu, memory) = default_shape()?;
+    // Oldest first: every drain phase, then the control.
+    let nodes = [
+        ("worker-draining", Some("draining")),
+        ("worker-drained", Some("drained")),
+        ("worker-terminating", Some("terminating")),
+        ("worker-undrained", None),
+    ];
+    let mut slots = Vec::new();
+    for (index, (node_name, phase)) in nodes.into_iter().enumerate() {
+        let node_id = Uuid::now_v7();
+        sqlx::query(
+            "INSERT INTO nodes (id, address, role, managed_by, state, drain_phase)
+             VALUES ($1, '10.0.0.50', 'worker', 'k8s', 'registered', $2)",
+        )
+        .bind(node_id)
+        .bind(phase)
+        .execute(&fixture.pool)
+        .await?;
+        sqlx::query("INSERT INTO node_k8s (node_id, k8s_node_name) VALUES ($1, $2)")
+            .bind(node_id)
+            .bind(node_name)
+            .execute(&fixture.pool)
+            .await?;
+        let slot = fixture
+            .store
+            .insert_warming_slot(NewPoolSlot {
+                reserved_sandbox_id: SandboxId::new(),
+                ..new_slot(
+                    config_id,
+                    template_release_id,
+                    &template,
+                    content_hash,
+                    vcpu,
+                    memory,
+                    &format!("space-sbx-drain-{index}-g1"),
+                )
+            })
+            .await?;
+        sqlx::query(
+            "UPDATE kubernetes_pool_slots
+             SET state = 'ready',
+                 ready_at = NOW() - make_interval(secs => 10 - $2),
+                 pod_uid = 'pod-uid',
+                 pod_ip = '10.90.0.8',
+                 k8s_node_name = $3
+             WHERE id = $1",
+        )
+        .bind(slot.id)
+        .bind(index as i32)
+        .bind(node_name)
+        .execute(&fixture.pool)
+        .await?;
+        slots.push(slot.id);
+    }
+
+    let claim = || async {
+        let mut tx = fixture.pool.begin().await?;
+        let claimed = WarmPoolStore::claim_ready_slot(
+            &mut tx,
+            template_release_id,
+            vcpu,
+            memory,
+            "space",
+            Uuid::now_v7(),
+            false,
+        )
+        .await?;
+        tx.commit().await?;
+        TestResult::Ok(claimed.map(|slot| slot.id))
+    };
+    assert_eq!(claim().await?, Some(slots[3]), "the undrained node's slot");
+    assert_eq!(claim().await?, None, "only drain-phase slots are left");
+    Ok(())
+}

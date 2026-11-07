@@ -1211,6 +1211,16 @@ impl WarmPoolStore {
                AND s.disk_io_max_bandwidth_mib_per_sec = c.disk_io_max_bandwidth_mib_per_sec
                AND s.pod_ip IS NOT NULL
                AND s.pod_namespace = $4
+               -- A slot on a node in any drain phase is never claimed: a
+               -- draining node's VMs are leaving, and a sealed one refuses
+               -- the claim's activation.
+               AND NOT EXISTS (
+                   SELECT 1
+                     FROM node_k8s nk
+                     JOIN nodes n ON n.id = nk.node_id
+                    WHERE nk.k8s_node_name = s.k8s_node_name
+                      AND n.drain_phase IS NOT NULL
+               )
              ORDER BY s.ready_at ASC
              FOR UPDATE OF s SKIP LOCKED
              LIMIT 1"
@@ -1260,6 +1270,14 @@ impl WarmPoolStore {
                AND s.disk_io_max_bandwidth_mib_per_sec = c.disk_io_max_bandwidth_mib_per_sec
                AND s.pod_ip IS NOT NULL
                AND s.pod_namespace = $2
+               -- As `claim_ready_slot`: never a slot on a draining node.
+               AND NOT EXISTS (
+                   SELECT 1
+                     FROM node_k8s nk
+                     JOIN nodes n ON n.id = nk.node_id
+                    WHERE nk.k8s_node_name = s.k8s_node_name
+                      AND n.drain_phase IS NOT NULL
+               )
              ORDER BY s.ready_at ASC
              FOR UPDATE OF s SKIP LOCKED
              LIMIT 1"
