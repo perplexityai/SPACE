@@ -115,6 +115,7 @@ pplx-space-cluster-pool = { workspace = true }
 pplx-space-net-common = { workspace = true, features = ["serde"] }
 pplx-space-rpc-auth = { workspace = true }
 pplx-space-sandbox-portability = { workspace = true }
+pplx-space-runtime-environment-catalog-store = { workspace = true }
 pplx-space-runtime-environment-policy-store = { workspace = true }
 pplx-space-sandbox-quarantine-store = { workspace = true }
 pplx-space-sandbox-residency = { workspace = true }

@@ -4878,6 +4878,7 @@ dependencies = [
  "pplx-space-public-api",
  "pplx-space-public-api-http",
  "pplx-space-rpc-auth",
+ "pplx-space-runtime-environment-catalog-store",
  "pplx-space-runtime-environment-policy-store",
  "pplx-space-rustls-provider",
  "pplx-space-sandbox-grpc",
@@ -5211,10 +5212,13 @@ dependencies = [
  "pplx-space-metrics-emit",
  "pplx-space-node-api-client",
  "pplx-space-node-api-sim",
+ "pplx-space-node-status-store",
  "pplx-space-observability",
  "pplx-space-postgres-pool",
  "pplx-space-public-api",
  "pplx-space-runtime-environment-catalog-store",
+ "pplx-space-runtime-environment-policy-store",
+ "pplx-space-runtime-upgrade-campaign-store",
  "pplx-space-sandbox-portability",
  "pplx-space-sandbox-quarantine-store",
  "pplx-space-sandbox-residency",
@@ -6974,6 +6978,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "pplx-space-node-status-store"
+version = "0.8.1"
+dependencies = [
+ "pplx-space-common-core",
+ "pplx-space-db-test-fixtures",
+ "pplx-space-test-env",
+ "sqlx",
+ "tokio",
+]
+
+[[package]]
 name = "pplx-space-object-store"
 version = "0.8.1"
 dependencies = [
@@ -7183,6 +7198,21 @@ dependencies = [
  "sqlx",
  "thiserror 2.0.20",
  "time",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "pplx-space-runtime-upgrade-campaign-store"
+version = "0.8.1"
+dependencies = [
+ "pplx-space-common-core",
+ "pplx-space-db-test-fixtures",
+ "pplx-space-node-status-store",
+ "pplx-space-test-env",
+ "serde_json",
+ "sqlx",
+ "thiserror 2.0.20",
  "tokio",
  "uuid",
 ]

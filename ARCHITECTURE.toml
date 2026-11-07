@@ -382,6 +382,7 @@ pplx-space-cluster-trigger-queue = [
 ]
 pplx-space-credential-injection-store = ["pplx-space-api", "pplx-space-credmgr"]
 pplx-space-federated-grant-store = ["pplx-space-api", "pplx-space-credmgr"]
+pplx-space-node-status-store = ["pplx-space-runtime-upgrade-campaign-store"]
 pplx-space-node-registration-store = ["pplx-space-api", "pplx-space-credmgr"]
 pplx-space-postgres-pool = [
   "pplx-space-api",
@@ -390,13 +391,16 @@ pplx-space-postgres-pool = [
   "pplx-space-internal-api-server",
 ]
 pplx-space-runtime-environment-catalog-store = [
+  "pplx-space-api",
   "pplx-space-cluster-controller-server",
   "pplx-space-internal-api-server",
 ]
 pplx-space-runtime-environment-policy-store = [
   "pplx-space-api",
+  "pplx-space-cluster-controller-server",
   "pplx-space-internal-api-server",
 ]
+pplx-space-runtime-upgrade-campaign-store = ["pplx-space-cluster-controller-server"]
 pplx-space-sandbox-portability = [
   "pplx-space-api",
   "pplx-space-cluster-controller-server",
