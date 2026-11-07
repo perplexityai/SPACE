@@ -201,12 +201,7 @@ where
                     Ok(request) => forward(request, upstream, &binding).await,
                     Err(_) => {
                         let outcome = BindingOutcome::InvalidHeaders;
-                        pplx_space_metrics::gateway::domain_binding(
-                            "tcp",
-                            "http_host",
-                            outcome.as_str(),
-                            None,
-                        );
+                        crate::metrics::domain_binding("tcp", "http_host", outcome.as_str(), None);
                         (refusal(outcome.refusal_status()), outcome, None)
                     }
                 };
@@ -264,7 +259,7 @@ where
     let authority = match authorization {
         Ok(authority) => authority,
         Err(outcome) => {
-            pplx_space_metrics::gateway::domain_binding("tcp", "http_host", outcome.as_str(), None);
+            crate::metrics::domain_binding("tcp", "http_host", outcome.as_str(), None);
             return (refusal(outcome.refusal_status()), outcome, None);
         }
     };
@@ -272,12 +267,12 @@ where
     // can turn an upgrade into an ordinary request to the origin.
     if request.headers().contains_key(header::UPGRADE) {
         let outcome = BindingOutcome::UpgradeUnsupported;
-        pplx_space_metrics::gateway::domain_binding("tcp", "http_host", outcome.as_str(), None);
+        crate::metrics::domain_binding("tcp", "http_host", outcome.as_str(), None);
         return (refusal(outcome.refusal_status()), outcome, None);
     }
     if normalize_upstream_routing(&mut request, &authority).is_err() {
         let outcome = BindingOutcome::InvalidHost;
-        pplx_space_metrics::gateway::domain_binding("tcp", "http_host", outcome.as_str(), None);
+        crate::metrics::domain_binding("tcp", "http_host", outcome.as_str(), None);
         return (refusal(outcome.refusal_status()), outcome, None);
     }
 
@@ -302,7 +297,7 @@ where
                 ?error_kind,
                 "plaintext HTTP upstream connection failed"
             );
-            pplx_space_metrics::gateway::domain_binding("tcp", "http_host", outcome.as_str(), None);
+            crate::metrics::domain_binding("tcp", "http_host", outcome.as_str(), None);
             return (
                 refusal(outcome.refusal_status()),
                 outcome,
@@ -314,18 +309,18 @@ where
         Ok(sender) => sender,
         Err(_) => {
             let outcome = BindingOutcome::UpstreamFailed;
-            pplx_space_metrics::gateway::domain_binding("tcp", "http_host", outcome.as_str(), None);
+            crate::metrics::domain_binding("tcp", "http_host", outcome.as_str(), None);
             return (refusal(outcome.refusal_status()), outcome, None);
         }
     };
     let (response, outcome) = match sender.send(request).await {
         Ok(response) if response.status() == StatusCode::SWITCHING_PROTOCOLS => {
             let outcome = BindingOutcome::UpstreamFailed;
-            pplx_space_metrics::gateway::domain_binding("tcp", "http_host", outcome.as_str(), None);
+            crate::metrics::domain_binding("tcp", "http_host", outcome.as_str(), None);
             (refusal(outcome.refusal_status()), outcome)
         }
         Ok(response) => {
-            pplx_space_metrics::gateway::domain_binding(
+            crate::metrics::domain_binding(
                 "tcp",
                 "http_host",
                 BindingOutcome::Allowed.as_str(),
@@ -335,7 +330,7 @@ where
         }
         Err(_) => {
             let outcome = BindingOutcome::UpstreamFailed;
-            pplx_space_metrics::gateway::domain_binding("tcp", "http_host", outcome.as_str(), None);
+            crate::metrics::domain_binding("tcp", "http_host", outcome.as_str(), None);
             (refusal(outcome.refusal_status()), outcome)
         }
     };

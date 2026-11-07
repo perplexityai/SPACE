@@ -731,7 +731,7 @@ fn record_candidate_skip(
     now: Instant,
 ) -> CandidateFlow {
     report.skipped += 1;
-    pplx_space_metrics::sandbox_eviction::skipped(reason.as_str());
+    crate::metrics::sandbox_eviction::skipped(reason.as_str());
     if reason.should_back_off() {
         scan_state.back_off(sandbox_id, now);
     }
@@ -860,7 +860,7 @@ pub(crate) fn report_eviction_outcome(
     let details = details.reason(reason.as_str());
     match result {
         Ok(()) => {
-            pplx_space_metrics::sandbox_eviction::evicted(reason.as_str());
+            crate::metrics::sandbox_eviction::evicted(reason.as_str());
             emit_eviction_event(
                 sandbox_id,
                 pplx_space_events::SandboxEventType::LocalEvictionCompleted,
@@ -873,7 +873,7 @@ pub(crate) fn report_eviction_outcome(
                 tonic::Code::FailedPrecondition | tonic::Code::NotFound
             ) => {}
         Err(status) => {
-            pplx_space_metrics::sandbox_eviction::failed();
+            crate::metrics::sandbox_eviction::failed();
             warn!(
                 sandbox_id,
                 reason = reason.as_str(),
@@ -1121,7 +1121,7 @@ fn record_reupload_failure(
     match classify_reupload_failure(status) {
         Ok(reason) => {
             report.skipped += 1;
-            pplx_space_metrics::sandbox_eviction::legacy_repair_skipped(reason.as_str());
+            crate::metrics::sandbox_eviction::legacy_repair_skipped(reason.as_str());
             warn!(
                 sandbox_id,
                 code = %status.code(),
@@ -1133,7 +1133,7 @@ fn record_reupload_failure(
         }
         Err(reason) => {
             report.failed += 1;
-            pplx_space_metrics::sandbox_eviction::legacy_repair_failed(reason.as_str());
+            crate::metrics::sandbox_eviction::legacy_repair_failed(reason.as_str());
             warn!(
                 sandbox_id,
                 code = %status.code(),
@@ -1157,7 +1157,7 @@ async fn enqueue_legacy_reupload(
     {
         Ok(job_id) => {
             report.queued += 1;
-            pplx_space_metrics::sandbox_eviction::legacy_repair_queued();
+            crate::metrics::sandbox_eviction::legacy_repair_queued();
             info!(
                 sandbox_id,
                 job_id = %job_id, "sandbox eviction: legacy repair reupload queued",
@@ -1212,13 +1212,13 @@ async fn repair_legacy_reupload_candidates(
     })
     .await
     .map_err(|e| {
-        pplx_space_metrics::sandbox_eviction::legacy_repair_failed(
+        crate::metrics::sandbox_eviction::legacy_repair_failed(
             LegacyRepairFailureReason::LocalRead.as_str(),
         );
         format!("list_legacy_reupload_candidates spawn_blocking: {e}")
     })?
     .map_err(|e| {
-        pplx_space_metrics::sandbox_eviction::legacy_repair_failed(
+        crate::metrics::sandbox_eviction::legacy_repair_failed(
             LegacyRepairFailureReason::LocalRead.as_str(),
         );
         format!("list_legacy_reupload_candidates: {e}")
@@ -1229,7 +1229,7 @@ async fn repair_legacy_reupload_candidates(
         candidates: attempts.len(),
         ..Default::default()
     };
-    pplx_space_metrics::sandbox_eviction::legacy_repair_candidates(report.candidates as u64);
+    crate::metrics::sandbox_eviction::legacy_repair_candidates(report.candidates as u64);
 
     for sandbox_id in attempts {
         let outcome = enqueue_legacy_reupload(service, &mut report, &sandbox_id).await;
@@ -1259,10 +1259,10 @@ async fn evict_tick(
     })
     .await
     .map_err(|e| format!("eviction row counts spawn_blocking: {e}"))??;
-    pplx_space_metrics::sandbox_eviction::malformed_updated_at(malformed_updated_at as u64);
+    crate::metrics::sandbox_eviction::malformed_updated_at(malformed_updated_at as u64);
     // Counted before the disk check so a tick that can't read disk usage
     // still reports the population.
-    pplx_space_metrics::sandbox_eviction::resident_rows(resident_rows as u64);
+    crate::metrics::sandbox_eviction::resident_rows(resident_rows as u64);
     if malformed_updated_at > 0 {
         warn!(
             malformed_updated_at,
@@ -1534,17 +1534,17 @@ async fn evict_tick(
                 report.evicted += 1;
                 report.logical_bytes_freed = report.logical_bytes_freed.saturating_add(bytes);
                 let age_secs = now.saturating_sub(idle_witness_secs);
-                pplx_space_metrics::sandbox_eviction::evicted(reason.as_str());
-                pplx_space_metrics::sandbox_eviction::evicted_age_secs(age_secs);
+                crate::metrics::sandbox_eviction::evicted(reason.as_str());
+                crate::metrics::sandbox_eviction::evicted_age_secs(age_secs);
                 if let Some((suspended_at_secs, proof)) = suspend_age {
-                    pplx_space_metrics::sandbox_eviction::evicted_suspend_age_secs(
+                    crate::metrics::sandbox_eviction::evicted_suspend_age_secs(
                         now.saturating_sub(suspended_at_secs),
                         proof.as_str(),
                     );
                 }
-                pplx_space_metrics::sandbox_eviction::logical_bytes_freed(reason.as_str(), bytes);
+                crate::metrics::sandbox_eviction::logical_bytes_freed(reason.as_str(), bytes);
                 if age_secs < EvictionConfig::RETENTION_WARNING_SECS {
-                    pplx_space_metrics::sandbox_eviction::retention_pressure(1);
+                    crate::metrics::sandbox_eviction::retention_pressure(1);
                     report.young_evictions += 1;
                     report.youngest_eviction_age_secs = Some(
                         report
@@ -1602,7 +1602,7 @@ async fn evict_tick(
             Err(status) => {
                 scan_state.complete_candidate(cursor);
                 report.failed += 1;
-                pplx_space_metrics::sandbox_eviction::failed();
+                crate::metrics::sandbox_eviction::failed();
                 warn!(
                     sandbox_id = %sandbox_id,
                     code = %status.code(),
@@ -1654,7 +1654,7 @@ pub async fn run_loop(
         let tick_started = Instant::now();
         let disk = crate::disk_usage::read_cache_disk_usage();
         if let Some(disk) = disk {
-            pplx_space_metrics::sandbox_eviction::disk_usage_fraction(disk.fraction());
+            crate::metrics::sandbox_eviction::disk_usage_fraction(disk.fraction());
         }
         let tick_result = tokio::select! {
             biased;
@@ -1687,7 +1687,7 @@ pub async fn run_loop(
                     logical_bytes_freed = report.logical_bytes_freed,
                     "sandbox eviction tick complete",
                 );
-                pplx_space_metrics::sandbox_eviction::tick(
+                crate::metrics::sandbox_eviction::tick(
                     "ok",
                     tick_started,
                     report.candidates as u64,
@@ -1695,7 +1695,7 @@ pub async fn run_loop(
             }
             Err(error) => {
                 warn!(%error, "sandbox eviction tick failed");
-                pplx_space_metrics::sandbox_eviction::tick("error", tick_started, 0);
+                crate::metrics::sandbox_eviction::tick("error", tick_started, 0);
             }
         }
 

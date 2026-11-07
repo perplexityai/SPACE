@@ -1297,7 +1297,7 @@ impl NodeManagerService {
             .await
             .inspect_err(|status| {
                 if status.code() != tonic::Code::Cancelled {
-                    pplx_space_metrics::node_manager::btrfs_receive_failed();
+                    crate::metrics::node_manager::btrfs_receive_failed();
                     tracing::warn!(
                         sandbox_id,
                         template = %template.name,
@@ -1310,7 +1310,7 @@ impl NodeManagerService {
                 }
             })?;
         if let Some(offset) = salvaged {
-            pplx_space_metrics::node_manager::btrfs_receive_stream_salvaged();
+            crate::metrics::node_manager::btrfs_receive_stream_salvaged();
             tracing::warn!(
                 sandbox_id,
                 template = %template.name,

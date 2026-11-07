@@ -357,7 +357,7 @@ impl CredmgrTokenReviewer {
         peer: Option<IpAddr>,
     ) {
         let result_tag = if result.is_ok() { "allow" } else { "deny" };
-        pplx_space_metrics::credmgr::pod_authorization(check, result_tag);
+        crate::metrics::pod_authorization(check, result_tag);
         if let Err(error) = result {
             tracing::warn!(check, result = result_tag,
                 reason = error.message(), pod_uid = %caller.pod().pod_uid(),

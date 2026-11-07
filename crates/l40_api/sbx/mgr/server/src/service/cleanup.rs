@@ -2937,8 +2937,8 @@ impl SandboxManagerService {
 
         match persist() {
             Ok(crate::db::CleanupEpisodeRequestOutcome::Requested) => {
-                pplx_space_metrics::sandbox::worker::activation_cleanup(
-                    pplx_space_metrics::sandbox::worker::ActivationCleanupOutcome::Requested,
+                crate::metrics::sandbox::worker::activation_cleanup(
+                    crate::metrics::sandbox::worker::ActivationCleanupOutcome::Requested,
                 );
                 self.schedule_async_cleanup(request);
             }
@@ -2950,8 +2950,8 @@ impl SandboxManagerService {
                 );
             }
             Ok(crate::db::CleanupEpisodeRequestOutcome::Superseded) => {
-                pplx_space_metrics::sandbox::worker::activation_cleanup(
-                    pplx_space_metrics::sandbox::worker::ActivationCleanupOutcome::Superseded,
+                crate::metrics::sandbox::worker::activation_cleanup(
+                    crate::metrics::sandbox::worker::ActivationCleanupOutcome::Superseded,
                 );
                 tracing::warn!(
                     sandbox_id = %request.sandbox_id,
@@ -2985,8 +2985,8 @@ impl SandboxManagerService {
                             });
                         match persisted {
                             Ok(crate::db::CleanupEpisodeRequestOutcome::Requested) => {
-                                pplx_space_metrics::sandbox::worker::activation_cleanup(
-                                    pplx_space_metrics::sandbox::worker::ActivationCleanupOutcome::Requested,
+                                crate::metrics::sandbox::worker::activation_cleanup(
+                                    crate::metrics::sandbox::worker::ActivationCleanupOutcome::Requested,
                                 );
                                 service.schedule_async_cleanup(request);
                                 return;
@@ -3042,9 +3042,9 @@ impl SandboxManagerService {
         )
         .await;
         match flushed {
-            Ok(()) => pplx_space_metrics::sandbox::worker::stop_guest_flush("flushed"),
+            Ok(()) => crate::metrics::sandbox::worker::stop_guest_flush("flushed"),
             Err(error) => {
-                pplx_space_metrics::sandbox::worker::stop_guest_flush("failed");
+                crate::metrics::sandbox::worker::stop_guest_flush("failed");
                 tracing::warn!(
                     %sandbox_id,
                     %error,

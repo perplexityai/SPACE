@@ -5,11 +5,11 @@ use super::cleanup_support::CleanupLockGuard;
 use super::cleanup_support::CleanupLockTryResult;
 use super::*;
 
-use pplx_space_common_core::types::SandboxQuarantineReasonCode;
-use pplx_space_metrics::sandbox::worker::{
+use crate::metrics::sandbox::worker::{
     InventoryReconcileOperation, InventoryReconcileOutcome, InventoryReconcileReason,
     inventory_reconcile,
 };
+use pplx_space_common_core::types::SandboxQuarantineReasonCode;
 use pplx_space_node_mgr_client::execution_fence::ExecutionFence;
 
 mod periodic;
@@ -448,7 +448,7 @@ enum OrphanRowMaterializationEvent {
 }
 
 struct CommittedOrphanRowMaterialization {
-    disposition: pplx_space_metrics::sandbox::worker::OrphanRowDisposition,
+    disposition: crate::metrics::sandbox::worker::OrphanRowDisposition,
     event: Option<OrphanRowMaterializationEvent>,
 }
 
@@ -529,7 +529,8 @@ fn insert_orphaned_sandbox_row_in_transaction(
                     },
                 )?;
                 Ok(CommittedOrphanRowMaterialization {
-                    disposition: pplx_space_metrics::sandbox::worker::OrphanRowDisposition::RecoveredSuspended,
+                    disposition:
+                        crate::metrics::sandbox::worker::OrphanRowDisposition::RecoveredSuspended,
                     event: Some(OrphanRowMaterializationEvent::RecoveredSuspended {
                         local_artifact_id: artifact.local_artifact_id,
                     }),
@@ -559,7 +560,8 @@ fn insert_orphaned_sandbox_row_in_transaction(
                     },
                 )?;
                 Ok(CommittedOrphanRowMaterialization {
-                    disposition: pplx_space_metrics::sandbox::worker::OrphanRowDisposition::RecoveredRestoring,
+                    disposition:
+                        crate::metrics::sandbox::worker::OrphanRowDisposition::RecoveredRestoring,
                     event: Some(OrphanRowMaterializationEvent::RecoveredRestoring {
                         detail,
                         local_artifact_id,
@@ -601,7 +603,7 @@ fn insert_orphaned_sandbox_row_in_transaction(
                 )?;
                 Ok(CommittedOrphanRowMaterialization {
                     disposition:
-                        pplx_space_metrics::sandbox::worker::OrphanRowDisposition::QuarantinedRow,
+                        crate::metrics::sandbox::worker::OrphanRowDisposition::QuarantinedRow,
                     event: Some(OrphanRowMaterializationEvent::Quarantined { reason_code }),
                 })
             }
@@ -644,7 +646,7 @@ fn insert_orphaned_sandbox_row_in_transaction(
             crate::db::CleanupCompletion::Quarantine,
             &reason,
         )?;
-        pplx_space_metrics::sandbox::worker::OrphanRowDisposition::CleanupQuarantine
+        crate::metrics::sandbox::worker::OrphanRowDisposition::CleanupQuarantine
     } else if !has_cache_root {
         crate::db::mark_cleanup_required(
             conn,
@@ -653,7 +655,7 @@ fn insert_orphaned_sandbox_row_in_transaction(
             crate::db::CleanupCompletion::DeleteRow,
             &reason,
         )?;
-        pplx_space_metrics::sandbox::worker::OrphanRowDisposition::DeleteRow
+        crate::metrics::sandbox::worker::OrphanRowDisposition::DeleteRow
     } else {
         unreachable!("cache-only orphans return through the quarantine branch")
     };
@@ -1270,7 +1272,7 @@ where
                     InventoryReconcileReason::Materialized,
                 );
                 committed.emit_event(*sandbox_id);
-                pplx_space_metrics::sandbox::worker::orphan_row_materialized(
+                crate::metrics::sandbox::worker::orphan_row_materialized(
                     source.as_str(),
                     committed.disposition,
                 );

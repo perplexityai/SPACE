@@ -506,9 +506,9 @@ impl JobExecutor for BuildExecutor {
                                     publication,
                                 )
                                 .await;
-                            let step_result = pplx_space_metrics::template::TemplateBuildStepResult::from_ok(result.is_ok());
+                            let step_result = pplx_space_build_mgr::metrics::TemplateBuildStepResult::from_ok(result.is_ok());
                             let result_tag = step_result.as_str();
-                            pplx_space_metrics::template::build_step_completed(
+                            pplx_space_build_mgr::metrics::build_step_completed(
                                 &template_id,
                                 BuildPhase::Publish.as_str(),
                                 step_result,
@@ -601,7 +601,7 @@ impl JobExecutor for BuildExecutor {
             };
 
             let result = build_result.state.as_metric_result();
-            pplx_space_metrics::template::build_completed(
+            pplx_space_build_mgr::metrics::build_completed(
                 &template_id,
                 result,
                 error_kind,

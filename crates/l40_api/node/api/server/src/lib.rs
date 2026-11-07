@@ -11,6 +11,7 @@ pub mod builder;
 mod client_stream;
 pub mod clients;
 pub mod drain;
+pub mod metrics;
 pub mod node_ctl;
 pub mod node_info;
 mod restart_handoff;

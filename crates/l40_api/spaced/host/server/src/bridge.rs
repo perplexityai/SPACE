@@ -1,4 +1,5 @@
 use super::*;
+use crate::metrics as worker_metrics;
 use crate::protocol::*;
 use pplx_space_common_connection_admission::{
     ConnectionAdmissionConfig, ConnectionAdmissionObservation, admit_connections,
@@ -7,7 +8,6 @@ use pplx_space_common_core::{
     operation_budget::RuntimeOperationBudget,
     types::{GuestPath, GuestUserName, IdempotencyKey, ReadyTimeout},
 };
-use pplx_space_metrics::sandbox::worker as worker_metrics;
 use pplx_space_spaced_common::lazy_client::FailedGeneration;
 use pplx_space_spaced_common::status_is_request_deadline_exceeded;
 const READY_WAIT_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(5);

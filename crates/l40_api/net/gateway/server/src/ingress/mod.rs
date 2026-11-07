@@ -4,6 +4,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
+use crate::metrics::{ServicePortIngressCloseReason, ServicePortIngressOpenResult};
 use pplx_space_api_route::{
     SpaceApiRouteIdentityDimension, SpaceApiRouteIdentityMatchError, SpaceApiRouteProtocol,
     SpaceApiRoutePurpose, match_present_route_identity_dimensions,
@@ -18,7 +19,6 @@ use pplx_space_common_core::{
     types::PodUid, types::RouteGeneration, types::SandboxActivationAttemptId, types::SandboxId,
     types::SpaceApiRouteIdentity,
 };
-use pplx_space_metrics::gateway::{ServicePortIngressCloseReason, ServicePortIngressOpenResult};
 use pplx_space_net_gateway_client::SERVICE_PORT_INGRESS_START_TIMEOUT;
 use pplx_space_net_gateway_client::proto::{
     NetworkState, SandboxSubstrateKind, ServicePortIngressFrame, ServicePortIngressStart,
@@ -117,7 +117,7 @@ impl ServicePortIngressState {
 
     fn try_acquire_stream_slot(&self) -> Result<OwnedSemaphorePermit, Status> {
         self.stream_slots.clone().try_acquire_owned().map_err(|_| {
-            pplx_space_metrics::gateway::service_port_ingress_open(
+            crate::metrics::service_port_ingress_open(
                 ServicePortIngressOpenResult::CapacityExceeded,
             );
             Status::resource_exhausted("too many active service port ingress streams")
@@ -467,7 +467,7 @@ pub async fn open_service_port_ingress(
             match result {
                 Ok(result) => result?,
                 Err(_) => {
-                    pplx_space_metrics::gateway::service_port_ingress_open(
+                    crate::metrics::service_port_ingress_open(
                         ServicePortIngressOpenResult::StartTimeout,
                     );
                     return Err(Status::deadline_exceeded(
@@ -478,17 +478,13 @@ pub async fn open_service_port_ingress(
         }
     }
     .ok_or_else(|| {
-        pplx_space_metrics::gateway::service_port_ingress_open(
-            ServicePortIngressOpenResult::InvalidStart,
-        );
+        crate::metrics::service_port_ingress_open(ServicePortIngressOpenResult::InvalidStart);
         Status::invalid_argument("service port ingress start frame is required")
     })?;
     let start = match first.message {
         Some(service_port_ingress_frame::Message::Start(start)) => start,
         _ => {
-            pplx_space_metrics::gateway::service_port_ingress_open(
-                ServicePortIngressOpenResult::InvalidStart,
-            );
+            crate::metrics::service_port_ingress_open(ServicePortIngressOpenResult::InvalidStart);
             return Err(Status::invalid_argument(
                 "service port ingress first frame must be start",
             ));
@@ -502,7 +498,7 @@ pub async fn open_service_port_ingress(
         authorize_service_port_ingress(&state, &network_state, &metadata, &start).await?;
     trace_context.record(&tracing::Span::current());
     let upstream = connect_guest_endpoint(port, &trace_context).await?;
-    pplx_space_metrics::gateway::service_port_ingress_open(ServicePortIngressOpenResult::Ok);
+    crate::metrics::service_port_ingress_open(ServicePortIngressOpenResult::Ok);
 
     let (tx, rx) = tokio::sync::mpsc::channel(INGRESS_CHANNEL_CAPACITY);
     let idle_timeout = service_port_ingress_idle_timeout_from_env();
@@ -517,9 +513,7 @@ pub async fn open_service_port_ingress(
             downstream_completion,
         )
         .await;
-        pplx_space_metrics::gateway::service_port_ingress_closed(
-            service_port_ingress_close_reason(&result),
-        );
+        crate::metrics::service_port_ingress_closed(service_port_ingress_close_reason(&result));
         if let Err(error) = result {
             let _ = tx.send(Err(error)).await;
         }
@@ -551,49 +545,35 @@ async fn authorize_service_port_ingress(
     // earlier gateway refused ingress whenever the CA was missing, but only
     // because a closed traffic gate demoted this mode to PendingPolicy.
     if network_snapshot.mode != NetworkState::Ready {
-        pplx_space_metrics::gateway::service_port_ingress_open(
-            ServicePortIngressOpenResult::PolicyNotReady,
-        );
+        crate::metrics::service_port_ingress_open(ServicePortIngressOpenResult::PolicyNotReady);
         return Err(Status::failed_precondition("network policy is not ready"));
     }
     let sandbox_id = start.sandbox_id.parse::<SandboxId>().map_err(|_| {
-        pplx_space_metrics::gateway::service_port_ingress_open(
-            ServicePortIngressOpenResult::InvalidStart,
-        );
+        crate::metrics::service_port_ingress_open(ServicePortIngressOpenResult::InvalidStart);
         Status::invalid_argument("sandbox_id must be a UUID")
     })?;
     let port = GuestPort::try_from_u16(u16::try_from(start.port).map_err(|_| {
-        pplx_space_metrics::gateway::service_port_ingress_open(
-            ServicePortIngressOpenResult::InvalidStart,
-        );
+        crate::metrics::service_port_ingress_open(ServicePortIngressOpenResult::InvalidStart);
         Status::invalid_argument("service port out of range")
     })?)
     .map_err(|error| {
-        pplx_space_metrics::gateway::service_port_ingress_open(
-            ServicePortIngressOpenResult::InvalidStart,
-        );
+        crate::metrics::service_port_ingress_open(ServicePortIngressOpenResult::InvalidStart);
         Status::invalid_argument(format!("service port {error}"))
     })?;
     let (local_identity, identity_token) = state.identity_with_epoch()?;
 
     let token = space_api_route_ed25519_token_from_metadata(metadata).map_err(|error| {
-        pplx_space_metrics::gateway::service_port_ingress_open(
-            ServicePortIngressOpenResult::InvalidToken,
-        );
+        crate::metrics::service_port_ingress_open(ServicePortIngressOpenResult::InvalidToken);
         Status::permission_denied(format!("invalid SPACE API route token: {error}"))
     })?;
     let Some(token) = token else {
-        pplx_space_metrics::gateway::service_port_ingress_open(
-            ServicePortIngressOpenResult::MissingToken,
-        );
+        crate::metrics::service_port_ingress_open(ServicePortIngressOpenResult::MissingToken);
         return Err(Status::permission_denied(
             "ServicePortIngress requires a SPACE API route token",
         ));
     };
     let claims = state.route_verification().verify(&token).map_err(|error| {
-        pplx_space_metrics::gateway::service_port_ingress_open(route_token_ed25519_error_label(
-            &error,
-        ));
+        crate::metrics::service_port_ingress_open(route_token_ed25519_error_label(&error));
         Status::permission_denied(format!("invalid SPACE API route token: {error}"))
     })?;
     authorize_service_port_ingress_claims(local_identity.as_ref(), sandbox_id, port, &claims)?;
@@ -613,7 +593,7 @@ fn authorize_service_port_ingress_claims(
     claims: &SpaceApiRouteEd25519Claims,
 ) -> Result<(), Status> {
     let rejected = |result, message: &str| {
-        pplx_space_metrics::gateway::service_port_ingress_open(result);
+        crate::metrics::service_port_ingress_open(result);
         Err(Status::permission_denied(message))
     };
     if claims.route_identity.sandbox_id() != sandbox_id {
@@ -641,25 +621,19 @@ fn authorize_service_port_ingress_claims(
         );
     }
     let local_identity = local_identity.ok_or_else(|| {
-        pplx_space_metrics::gateway::service_port_ingress_open(
-            ServicePortIngressOpenResult::IdentityMissing,
-        );
+        crate::metrics::service_port_ingress_open(ServicePortIngressOpenResult::IdentityMissing);
         Status::permission_denied("ServicePortIngress has no local route identity")
     })?;
     match_present_route_identity_dimensions(local_identity, &claims.route_identity).map_err(
         |error| {
-            pplx_space_metrics::gateway::service_port_ingress_open(
-                service_port_identity_mismatch_result(error),
-            );
+            crate::metrics::service_port_ingress_open(service_port_identity_mismatch_result(error));
             Status::permission_denied(format!(
                 "ServicePortIngress route identity is not authorized: {error}"
             ))
         },
     )?;
     local_identity.clone().try_into_complete().map_err(|_| {
-        pplx_space_metrics::gateway::service_port_ingress_open(
-            ServicePortIngressOpenResult::IdentityMissing,
-        );
+        crate::metrics::service_port_ingress_open(ServicePortIngressOpenResult::IdentityMissing);
         Status::permission_denied("ServicePortIngress local route identity is incomplete")
     })?;
     Ok(())
@@ -746,7 +720,7 @@ async fn connect_guest_endpoint(
         Ok(Err(error)) => {
             let status = pplx_space_common_grpc::guest_service_connect_status(&error);
             let refused = pplx_space_common_grpc::record_guest_service_status(&status, &span);
-            pplx_space_metrics::gateway::service_port_ingress_open(if refused {
+            crate::metrics::service_port_ingress_open(if refused {
                 ServicePortIngressOpenResult::GuestConnectionRefused
             } else {
                 ServicePortIngressOpenResult::UpstreamConnectError
@@ -758,7 +732,7 @@ async fn connect_guest_endpoint(
             Err(status)
         }
         Err(_) => {
-            pplx_space_metrics::gateway::service_port_ingress_open(
+            crate::metrics::service_port_ingress_open(
                 ServicePortIngressOpenResult::UpstreamConnectError,
             );
             span.record("otel.status_code", "ERROR");

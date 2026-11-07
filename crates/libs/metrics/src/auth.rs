@@ -5,16 +5,6 @@
 
 use crate::emit::{counter, gauge, tag};
 
-/// Classification applied before node-api forwards SpacedWaitReady to the
-/// local sandbox-manager.
-pub fn node_api_wait_ready_policy(policy: &str, route_token: &str) {
-    counter(
-        "auth.node_api.wait_ready_policy",
-        1,
-        &[tag("policy", policy), tag("route_token", route_token)],
-    );
-}
-
 /// Outcome of binding a reviewed pod token to registered template-catalog nodes.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TemplateNodeBinding {

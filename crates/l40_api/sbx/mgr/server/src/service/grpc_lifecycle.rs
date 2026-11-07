@@ -270,14 +270,14 @@ impl SuspendRequestContext {
             other => other,
         };
         // Codec tag for the `snapshot.create.*` metric family. Mirrors
-        // the closed vocabulary in `pplx_space_metrics::snapshot`:
+        // the closed vocabulary in `crate::metrics::snapshot`:
         // `full` and `btrfs_send_v1` (note underscore for the tag value
         // vs hyphen in the wire vocabulary).
         let create_codec = match suspend_format {
             pplx_space_sbx_mgr_client::proto::SuspendSnapshotFormat::BtrfsSend => {
-                pplx_space_metrics::snapshot::CODEC_BTRFS_SEND_V1
+                crate::metrics::snapshot::CODEC_BTRFS_SEND_V1
             }
-            _ => pplx_space_metrics::snapshot::CODEC_FULL,
+            _ => crate::metrics::snapshot::CODEC_FULL,
         };
 
         Self {

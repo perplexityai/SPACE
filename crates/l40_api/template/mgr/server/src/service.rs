@@ -2495,7 +2495,7 @@ async fn expand_template_rootfs(
     .await
     {
         Ok(Ok(Some((path, size_bytes)))) => {
-            pplx_space_metrics::template::rootfs_expansion(template_id, trigger, size_bytes);
+            crate::metrics::rootfs_expansion(template_id, trigger, size_bytes);
             tracing::info!(
                 template = %template_id,
                 content_hash,
@@ -2507,11 +2507,7 @@ async fn expand_template_rootfs(
         }
         Ok(Ok(None)) => Ok(()),
         Ok(Err(error)) => {
-            pplx_space_metrics::template::rootfs_expansion_error(
-                template_id,
-                trigger,
-                error.reason(),
-            );
+            crate::metrics::rootfs_expansion_error(template_id, trigger, error.reason());
             tracing::warn!(
                 template = %template_id,
                 content_hash,
@@ -2523,7 +2519,7 @@ async fn expand_template_rootfs(
             )))
         }
         Err(error) => {
-            pplx_space_metrics::template::rootfs_expansion_error(template_id, trigger, "task_join");
+            crate::metrics::rootfs_expansion_error(template_id, trigger, "task_join");
             tracing::warn!(
                 template = %template_id,
                 content_hash,

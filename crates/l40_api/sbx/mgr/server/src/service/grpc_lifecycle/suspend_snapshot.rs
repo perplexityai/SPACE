@@ -501,7 +501,7 @@ impl SandboxManagerService {
         let mut monitoring_guard = SuspendMonitoringGuard::new(self, &sandbox);
         let create_kind = "suspend";
         let mut node_client = connect_node(&self.node_manager).await.map_err(|e| {
-            pplx_space_metrics::snapshot::create_failed(
+            crate::metrics::snapshot::create_failed(
                 create_kind,
                 create_codec,
                 sandbox.volume_encryption,
@@ -530,7 +530,7 @@ impl SandboxManagerService {
         {
             let reason = format!("host rootfs sync failed: {e}");
             self.record_suspend_snapshot_publication_failure_after_begin(&sandbox.id, &reason);
-            pplx_space_metrics::snapshot::create_failed(
+            crate::metrics::snapshot::create_failed(
                 create_kind,
                 create_codec,
                 sandbox.volume_encryption,
@@ -547,7 +547,7 @@ impl SandboxManagerService {
             );
             return Err(Status::internal(reason));
         }
-        pplx_space_metrics::snapshot::create_step(
+        crate::metrics::snapshot::create_step(
             create_kind,
             create_codec,
             sandbox.volume_encryption,
@@ -560,7 +560,7 @@ impl SandboxManagerService {
         let staging_parent = suspend_snapshot_staging_parent_dir(&sandbox_dir);
         let staging_dir = suspend_snapshot_staging_dir(&sandbox_dir, local_artifact_id);
         let record_artifact_stage_failure = |reason: &str| {
-            pplx_space_metrics::snapshot::create_failed(
+            crate::metrics::snapshot::create_failed(
                 create_kind,
                 create_codec,
                 sandbox.volume_encryption,
@@ -743,7 +743,7 @@ impl SandboxManagerService {
                     &reason,
                     runtime_live,
                 );
-                pplx_space_metrics::snapshot::create_failed(
+                crate::metrics::snapshot::create_failed(
                     create_kind,
                     create_codec,
                     sandbox.volume_encryption,
@@ -760,7 +760,7 @@ impl SandboxManagerService {
                 );
                 return Err(Status::internal(reason));
             }
-            pplx_space_metrics::snapshot::create_step(
+            crate::metrics::snapshot::create_step(
                 create_kind,
                 create_codec,
                 sandbox.volume_encryption,
@@ -805,7 +805,7 @@ impl SandboxManagerService {
                         staging_guard.disarm();
                     }
                     if matches!(error, EncryptedCaptureSealError::Metadata(_)) {
-                        pplx_space_metrics::snapshot::create_failed(
+                        crate::metrics::snapshot::create_failed(
                             create_kind,
                             create_codec,
                             sandbox.volume_encryption,
@@ -863,7 +863,7 @@ impl SandboxManagerService {
                 match encode_result {
                     Ok(captured) => {
                         captured_rootfs = Some(captured);
-                        pplx_space_metrics::snapshot::create_step(
+                        crate::metrics::snapshot::create_step(
                             create_kind,
                             create_codec,
                             sandbox.volume_encryption,
@@ -885,12 +885,12 @@ impl SandboxManagerService {
                             sandbox_id = %sandbox.id,
                             template = %sandbox.template,
                             template_hash = sandbox.template_hash.as_deref().unwrap_or(""),
-                            from_codec = pplx_space_metrics::snapshot::CODEC_BTRFS_SEND_V1,
-                            to_codec = pplx_space_metrics::snapshot::CODEC_FULL,
+                            from_codec = crate::metrics::snapshot::CODEC_BTRFS_SEND_V1,
+                            to_codec = crate::metrics::snapshot::CODEC_FULL,
                             reason = %status.message(),
                             "btrfs-send precondition not met; suspending with Full codec instead"
                         );
-                        pplx_space_metrics::snapshot::create_failed(
+                        crate::metrics::snapshot::create_failed(
                             create_kind,
                             create_codec,
                             sandbox.volume_encryption,
@@ -898,7 +898,7 @@ impl SandboxManagerService {
                             "fallback_to_full",
                             btrfs_step_started_at,
                         );
-                        create_codec = pplx_space_metrics::snapshot::CODEC_FULL;
+                        create_codec = crate::metrics::snapshot::CODEC_FULL;
                         published_format =
                             pplx_space_sbx_mgr_client::proto::SuspendSnapshotFormat::Full;
                     }
@@ -913,7 +913,7 @@ impl SandboxManagerService {
                             sandbox_id = %sandbox.id,
                             template = %sandbox.template,
                             template_hash = sandbox.template_hash.as_deref().unwrap_or(""),
-                            codec = pplx_space_metrics::snapshot::CODEC_BTRFS_SEND_V1,
+                            codec = crate::metrics::snapshot::CODEC_BTRFS_SEND_V1,
                             code = %status.code(),
                             error = %status.message(),
                             "btrfs-send rootfs encode failed; suspend snapshot wire-shape \
@@ -923,7 +923,7 @@ impl SandboxManagerService {
                         // a paused sandbox it can retry with `format=full`.
                         let reason = format!("btrfs-send encode failed: {status}");
                         self.record_suspend_snapshot_publication_failure_after_begin(&sandbox.id, &reason);
-                        pplx_space_metrics::snapshot::create_failed(
+                        crate::metrics::snapshot::create_failed(
                             create_kind,
                             create_codec,
                             sandbox.volume_encryption,
@@ -995,7 +995,7 @@ impl SandboxManagerService {
                 ) {
                     let reason = format!("local artifact metadata creation failed: {error}");
                     self.record_suspend_snapshot_publication_failure_after_begin(&sandbox.id, &reason);
-                    pplx_space_metrics::snapshot::create_failed(
+                    crate::metrics::snapshot::create_failed(
                         create_kind,
                         create_codec,
                         sandbox.volume_encryption,
@@ -1059,7 +1059,7 @@ impl SandboxManagerService {
                 {
                     staging_guard.disarm();
                 }
-                pplx_space_metrics::snapshot::create_failed(
+                crate::metrics::snapshot::create_failed(
                     create_kind,
                     create_codec,
                     sandbox.volume_encryption,
@@ -1077,7 +1077,7 @@ impl SandboxManagerService {
                 return Err(Status::internal(reason));
             }
             staging_guard.disarm();
-            pplx_space_metrics::snapshot::create_step(
+            crate::metrics::snapshot::create_step(
                 create_kind,
                 create_codec,
                 sandbox.volume_encryption,
@@ -1147,7 +1147,7 @@ impl SandboxManagerService {
                     .await;
                 self.require_node_local_backup_handoff(&sandbox.id, local_artifact_id, enqueue_result)?;
             }
-            pplx_space_metrics::snapshot::create_step(
+            crate::metrics::snapshot::create_step(
                 create_kind,
                 create_codec,
                 sandbox.volume_encryption,
@@ -1167,7 +1167,7 @@ impl SandboxManagerService {
                 )
                 .await
             {
-                pplx_space_metrics::snapshot::create_failed(
+                crate::metrics::snapshot::create_failed(
                     create_kind,
                     create_codec,
                     sandbox.volume_encryption,
@@ -1184,7 +1184,7 @@ impl SandboxManagerService {
                 );
                 return Err(error);
             }
-            pplx_space_metrics::snapshot::create_step(
+            crate::metrics::snapshot::create_step(
                 create_kind,
                 create_codec,
                 sandbox.volume_encryption,
@@ -1196,7 +1196,7 @@ impl SandboxManagerService {
                 mark_sandbox_dirty(&self.db, &sandbox.id);
             }
 
-            pplx_space_metrics::snapshot::create_completed(
+            crate::metrics::snapshot::create_completed(
                 create_kind,
                 create_codec,
                 sandbox.volume_encryption,

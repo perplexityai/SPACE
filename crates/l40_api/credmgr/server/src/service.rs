@@ -830,7 +830,7 @@ impl CredentialManager for CredentialManagerService {
         // failure class and the latency of an issuance that polls for seconds.
         let started = Instant::now();
         let issued = self.issue_intermediate(request.into_inner()).await;
-        pplx_space_metrics::credmgr::intermediate_ca_issue(
+        crate::metrics::intermediate_ca_issue(
             intermediate_result_tag(&issued),
             started.elapsed().as_secs_f64() * 1000.0,
         );
@@ -843,7 +843,7 @@ impl CredentialManager for CredentialManagerService {
 }
 
 impl CredentialManagerService {
-    /// Everything [`intermediate_ca_issue`](pplx_space_metrics::credmgr::intermediate_ca_issue)
+    /// Everything [`intermediate_ca_issue`](crate::metrics::intermediate_ca_issue)
     /// meters: the backend precondition, request validation, and the issuance
     /// itself. Separated from the handler so a refused request is counted like
     /// any other failed issuance instead of returning before the metric.

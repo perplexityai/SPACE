@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use pplx_space_metrics::sandbox::vm::{
+use crate::metrics::sandbox::vm::{
     FIRECRACKER_ERRORS, FirecrackerBlockOp, FirecrackerComponent, FirecrackerError,
     FirecrackerFlushOutcome, FirecrackerOperation, FirecrackerTelemetryStream,
 };
@@ -93,7 +93,7 @@ impl MetricsReader {
         if self.line.len() > MAX_LINE_BYTES {
             self.line = Vec::new();
             self.discarding = true;
-            pplx_space_metrics::sandbox::vm::firecracker_metrics_flush(
+            crate::metrics::sandbox::vm::firecracker_metrics_flush(
                 FirecrackerFlushOutcome::Oversized,
             );
         }
@@ -110,12 +110,12 @@ impl FlushState {
     fn observe_line(&mut self, line: &[u8]) {
         match serde_json::from_slice::<Value>(line) {
             Ok(flush) if flush.is_object() => {
-                pplx_space_metrics::sandbox::vm::firecracker_metrics_flush(
+                crate::metrics::sandbox::vm::firecracker_metrics_flush(
                     FirecrackerFlushOutcome::Parsed,
                 );
                 self.observe(&flush);
             }
-            _ => pplx_space_metrics::sandbox::vm::firecracker_metrics_flush(
+            _ => crate::metrics::sandbox::vm::firecracker_metrics_flush(
                 FirecrackerFlushOutcome::Unparsable,
             ),
         }
@@ -133,7 +133,7 @@ impl FlushState {
                 value
             };
             if count > 0 {
-                pplx_space_metrics::sandbox::vm::firecracker_errors(*error, count);
+                crate::metrics::sandbox::vm::firecracker_errors(*error, count);
             }
         }
         // `block` aggregates every drive; per-drive `block_<id>` entries are
@@ -151,7 +151,7 @@ impl FlushState {
             if let Some(total_us) = total_us
                 && requests > 0
             {
-                pplx_space_metrics::sandbox::vm::firecracker_block_mean_latency(
+                crate::metrics::sandbox::vm::firecracker_block_mean_latency(
                     op,
                     total_us as f64 / requests as f64 / 1_000.0,
                 );
@@ -176,7 +176,7 @@ impl FlushState {
             // Stored until the next operation of the same kind overwrites it.
             let previous = self.stored.insert(("latencies_us", name), duration_us);
             if duration_us > 0 && previous != Some(duration_us) {
-                pplx_space_metrics::sandbox::vm::firecracker_operation_duration(
+                crate::metrics::sandbox::vm::firecracker_operation_duration(
                     operation,
                     duration_us as f64 / 1_000.0,
                 );
@@ -185,14 +185,14 @@ impl FlushState {
         let missed_metrics = field(flush, "logger", "missed_metrics_count").unwrap_or(0)
             + field(flush, "logger", "metrics_fails").unwrap_or(0);
         if missed_metrics > 0 {
-            pplx_space_metrics::sandbox::vm::firecracker_telemetry_dropped(
+            crate::metrics::sandbox::vm::firecracker_telemetry_dropped(
                 FirecrackerTelemetryStream::Metrics,
                 missed_metrics,
             );
         }
         let missed_log = field(flush, "logger", "missed_log_count").unwrap_or(0);
         if missed_log > 0 {
-            pplx_space_metrics::sandbox::vm::firecracker_telemetry_dropped(
+            crate::metrics::sandbox::vm::firecracker_telemetry_dropped(
                 FirecrackerTelemetryStream::Log,
                 missed_log,
             );

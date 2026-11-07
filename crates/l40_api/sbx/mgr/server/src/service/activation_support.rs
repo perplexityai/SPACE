@@ -975,9 +975,10 @@ pub(super) async fn wait_ready_via_spaced_host(
     timeout: Duration,
     reason: &'static str,
 ) -> Result<pplx_space_spaced_host_client::proto::WaitReadyResponse, Status> {
-    use pplx_space_metrics::gateway::readiness::Outcome;
+    use pplx_space_sandbox_metrics::gateway_readiness::Outcome;
 
-    let mut observation = pplx_space_metrics::sandbox::worker::spaced_guest_readiness_wait(reason);
+    let mut observation =
+        pplx_space_sandbox_metrics::gateway_readiness::spaced_guest_readiness_wait(reason);
     let result = tokio::time::timeout(timeout, async {
         let config = pplx_space_spaced_host_client::SpacedHostClientConfig::default()
             .with_socket_path(spaced_host_socket_path(sandbox_id));
@@ -1076,11 +1077,7 @@ where
                     "activation environment deadline exceeded",
                 ))
             });
-        pplx_space_metrics::sandbox::worker::activation_env_attempt(
-            phase,
-            index == 0,
-            result.is_ok(),
-        );
+        crate::metrics::sandbox::worker::activation_env_attempt(phase, index == 0, result.is_ok());
         match result {
             Err(status)
                 if index + 1 < ACTIVATION_ENV_ATTEMPTS
@@ -1462,16 +1459,16 @@ where
     let ready_elapsed = t0.elapsed();
     let policy = match policy_task {
         Some(task) if ready.is_ok() => {
-            let mut observation = pplx_space_metrics::gateway::readiness::after_guest_wait();
+            let mut observation = pplx_space_sandbox_metrics::gateway_readiness::after_guest_wait();
             let result = task.await.unwrap_or_else(|join_error| {
                 Err(Status::internal(format!(
                     "network policy task failed: {join_error}"
                 )))
             });
             observation.outcome = if result.is_ok() {
-                pplx_space_metrics::gateway::readiness::Outcome::Ready
+                pplx_space_sandbox_metrics::gateway_readiness::Outcome::Ready
             } else {
-                pplx_space_metrics::gateway::readiness::Outcome::Failed
+                pplx_space_sandbox_metrics::gateway_readiness::Outcome::Failed
             };
             Some(result)
         }
@@ -1646,11 +1643,7 @@ fn emit_guest_observed_specs(
         ),
         (None, None) => return,
     }
-    pplx_space_metrics::sandbox::worker::guest_observed_specs(
-        template,
-        mem_total_bytes,
-        vcpu_count,
-    );
+    crate::metrics::sandbox::worker::guest_observed_specs(template, mem_total_bytes, vcpu_count);
 }
 
 /// Check the restored guest against this host before publishing Started, with a

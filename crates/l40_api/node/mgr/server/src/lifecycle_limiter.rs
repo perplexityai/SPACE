@@ -209,10 +209,7 @@ impl LifecycleLimiter {
             armed: true,
         };
         if prev >= slot.limits.reject_threshold() {
-            pplx_space_metrics::node_manager::lifecycle_rejected(
-                method.as_metric_tag(),
-                "queue_full",
-            );
+            crate::metrics::node_manager::lifecycle_rejected(method.as_metric_tag(), "queue_full");
             drop(enqueue_guard);
             self.report_gauges(slot);
             return Err(Status::resource_exhausted(format!(
@@ -231,10 +228,7 @@ impl LifecycleLimiter {
             .acquire_owned()
             .await
             .map_err(|error| {
-                pplx_space_metrics::node_manager::lifecycle_rejected(
-                    method.as_metric_tag(),
-                    "closed",
-                );
+                crate::metrics::node_manager::lifecycle_rejected(method.as_metric_tag(), "closed");
                 Status::unavailable(format!("lifecycle limiter closed: {error}"))
             })?;
         let in_flight = slot.in_flight.clone();
@@ -244,10 +238,7 @@ impl LifecycleLimiter {
             armed: true,
         };
         self.report_gauges(slot);
-        pplx_space_metrics::node_manager::lifecycle_acquired(
-            method.as_metric_tag(),
-            acquire_started,
-        );
+        crate::metrics::node_manager::lifecycle_acquired(method.as_metric_tag(), acquire_started);
         let lifecycle_permit = LifecyclePermit {
             _inner: Arc::new(LifecyclePermitInner {
                 _task: self.task_tracker.token(),
@@ -265,7 +256,7 @@ impl LifecycleLimiter {
     }
 
     fn report_gauges(&self, slot: &MethodSlot) {
-        pplx_space_metrics::node_manager::lifecycle_depth(
+        crate::metrics::node_manager::lifecycle_depth(
             slot.method.as_metric_tag(),
             slot.in_flight.load(Ordering::SeqCst),
             slot.enqueued.load(Ordering::SeqCst),
@@ -342,11 +333,11 @@ impl Drop for LifecyclePermitInner {
         let _ = self.held_permit.take(); // release semaphore
         self.in_flight.fetch_sub(1, Ordering::SeqCst);
         self.enqueued.fetch_sub(1, Ordering::SeqCst);
-        pplx_space_metrics::node_manager::lifecycle_released(
+        crate::metrics::node_manager::lifecycle_released(
             self.method.as_metric_tag(),
             self.acquired_at,
         );
-        pplx_space_metrics::node_manager::lifecycle_depth(
+        crate::metrics::node_manager::lifecycle_depth(
             self.method.as_metric_tag(),
             self.in_flight.load(Ordering::SeqCst),
             self.enqueued.load(Ordering::SeqCst),

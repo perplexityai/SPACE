@@ -13,11 +13,7 @@ struct RpcWait {
 impl Drop for RpcWait {
     fn drop(&mut self) {
         self.span.record("outcome", self.outcome);
-        pplx_space_metrics::node_manager::rpc_wait_finished(
-            self.method,
-            self.outcome,
-            self.started,
-        );
+        crate::metrics::node_manager::rpc_wait_finished(self.method, self.outcome, self.started);
     }
 }
 

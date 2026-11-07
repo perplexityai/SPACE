@@ -48,7 +48,6 @@ pplx-space-build-mgr = { workspace = true }
 pplx-space-build-mgr-client = { workspace = true }
 pplx-space-common-jobs = { workspace = true }
 pplx-space-grpc-server = { workspace = true }
-pplx-space-metrics = { workspace = true }
 pplx-space-observability = { workspace = true }
 pplx-space-rpc-auth = { workspace = true }
 

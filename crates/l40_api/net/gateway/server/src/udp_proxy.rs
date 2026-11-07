@@ -17,8 +17,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
+use crate::metrics::{DnsAttributionCacheObservationSource, UdpDatagramRoute};
 use lru::LruCache;
-use pplx_space_metrics::gateway::{DnsAttributionCacheObservationSource, UdpDatagramRoute};
 use pplx_space_net_common::{EgressDecision, NetworkPolicyV1};
 use pplx_space_net_gateway_client::OUTBOUND_MARK;
 use tokio::io::Interest;
@@ -178,8 +178,8 @@ impl PendingUdpQueue {
         self.evict_expired(now, sandbox_id, stats);
         let flow_count = self.per_flow.get(&flow).copied().unwrap_or_default();
         if flow_count >= UDP_PENDING_MAX_DATAGRAMS_PER_FLOW {
-            pplx_space_metrics::gateway::udp_pending_buffer("drop_flow_limit");
-            pplx_space_metrics::gateway::pending_udp_flow_dropped("datagram_limit");
+            crate::metrics::udp_pending_buffer("drop_flow_limit");
+            crate::metrics::pending_udp_flow_dropped("datagram_limit");
             debug!(
                 sandbox_id,
                 ?flow,
@@ -188,8 +188,8 @@ impl PendingUdpQueue {
             return;
         }
         if self.datagrams.len() >= UDP_PENDING_MAX_DATAGRAMS {
-            pplx_space_metrics::gateway::udp_pending_buffer("drop_gateway_datagram_limit");
-            pplx_space_metrics::gateway::pending_udp_datagram("drop_gateway_datagram_limit");
+            crate::metrics::udp_pending_buffer("drop_gateway_datagram_limit");
+            crate::metrics::pending_udp_datagram("drop_gateway_datagram_limit");
             debug!(
                 sandbox_id,
                 "dropped pending UDP datagram at gateway datagram limit"
@@ -197,11 +197,8 @@ impl PendingUdpQueue {
             return;
         }
         if self.bytes.saturating_add(bytes.len()) > UDP_PENDING_MAX_BYTES {
-            pplx_space_metrics::gateway::udp_pending_buffer("drop_gateway_byte_limit");
-            pplx_space_metrics::gateway::pending_udp_bytes_dropped(
-                "gateway_byte_limit",
-                bytes.len() as u64,
-            );
+            crate::metrics::udp_pending_buffer("drop_gateway_byte_limit");
+            crate::metrics::pending_udp_bytes_dropped("gateway_byte_limit", bytes.len() as u64);
             debug!(
                 sandbox_id,
                 "dropped pending UDP datagram at gateway byte limit"
@@ -216,8 +213,8 @@ impl PendingUdpQueue {
             bytes: bytes.to_vec(),
             received_at: now,
         });
-        pplx_space_metrics::gateway::udp_pending_buffer("buffered");
-        pplx_space_metrics::gateway::pending_udp_datagram("queued");
+        crate::metrics::udp_pending_buffer("buffered");
+        crate::metrics::pending_udp_datagram("queued");
         self.update_stats(stats);
     }
 
@@ -251,9 +248,9 @@ impl PendingUdpQueue {
         self.bytes = 0;
         if dropped.datagrams > 0 {
             let reason = reason.as_str();
-            pplx_space_metrics::gateway::udp_pending_buffer(reason);
-            pplx_space_metrics::gateway::pending_udp_datagrams(reason, dropped.datagrams);
-            pplx_space_metrics::gateway::pending_udp_bytes_dropped(reason, dropped.bytes);
+            crate::metrics::udp_pending_buffer(reason);
+            crate::metrics::pending_udp_datagrams(reason, dropped.datagrams);
+            crate::metrics::pending_udp_bytes_dropped(reason, dropped.bytes);
         }
         self.update_stats(stats);
         dropped
@@ -274,12 +271,9 @@ impl PendingUdpQueue {
                     &datagram.bytes,
                     "pending_policy_timeout",
                 );
-                pplx_space_metrics::gateway::pending_timeout("udp");
-                pplx_space_metrics::gateway::pending_udp_datagram("expired");
-                pplx_space_metrics::gateway::pending_udp_bytes_dropped(
-                    "expired",
-                    datagram.bytes.len() as u64,
-                );
+                crate::metrics::pending_timeout("udp");
+                crate::metrics::pending_udp_datagram("expired");
+                crate::metrics::pending_udp_bytes_dropped("expired", datagram.bytes.len() as u64);
                 debug!(
                     sandbox_id,
                     flow = ?datagram.flow,
@@ -299,7 +293,7 @@ impl PendingUdpQueue {
         stats
             .udp_pending_bytes
             .store(self.bytes as u64, Ordering::Relaxed);
-        pplx_space_metrics::gateway::udp_pending(self.datagrams.len() as u64, self.bytes as u64);
+        crate::metrics::udp_pending(self.datagrams.len() as u64, self.bytes as u64);
     }
 }
 
@@ -427,7 +421,7 @@ impl UdpProxy {
             )
         })?;
         let pending_udp = PendingUdpQueue::new(known_egress_state.clone());
-        pplx_space_metrics::gateway::udp_active_sessions(0);
+        crate::metrics::udp_active_sessions(0);
         Ok(Self {
             sandbox_id,
             started_at: Instant::now(),
@@ -587,8 +581,8 @@ impl UdpProxy {
                 );
                 // No policy to run through the evaluator yet: this is a live
                 // flow dropped because the policy is not ready.
-                pplx_space_metrics::gateway::policy_decision(
-                    pplx_space_metrics::gateway::PolicyDecisionKind::DnsAttributed,
+                crate::metrics::policy_decision(
+                    crate::metrics::PolicyDecisionKind::DnsAttributed,
                     EgressProtocol::Udp.as_str(),
                     EgressPhase::Admission.as_str(),
                     // No policy installed yet, so no version.
@@ -635,8 +629,8 @@ impl UdpProxy {
                 break;
             };
             replayed = true;
-            pplx_space_metrics::gateway::udp_pending_buffer("replayed");
-            pplx_space_metrics::gateway::pending_udp_datagram("replayed");
+            crate::metrics::udp_pending_buffer("replayed");
+            crate::metrics::pending_udp_datagram("replayed");
             self.forward_udp_datagram(datagram, policy, &reserved_policy_cancellation)
                 .await;
         }
@@ -676,7 +670,7 @@ impl UdpProxy {
                 policy.as_ref(),
             )
         };
-        pplx_space_metrics::gateway::udp_datagram(route, decision.is_allowed());
+        crate::metrics::udp_datagram(route, decision.is_allowed());
         if !decision.is_allowed() {
             self.known_egress_state.report_dns_failure(
                 self.sandbox_id,
@@ -728,7 +722,7 @@ impl UdpProxy {
                 }
             }
             Err(error) => {
-                pplx_space_metrics::gateway::udp_socket_error("send_upstream");
+                crate::metrics::udp_socket_error("send_upstream");
                 self.known_egress_state.report_dns_failure(
                     self.sandbox_id,
                     flow.orig_dst,
@@ -757,7 +751,7 @@ impl UdpProxy {
     ) {
         let slots = self.reserved_dns_task_slots.get(resolver);
         let permit = Arc::clone(slots).try_acquire_owned();
-        pplx_space_metrics::gateway::reserved_dns_udp_in_flight(
+        crate::metrics::reserved_dns_udp_in_flight(
             resolver.as_str(),
             MAX_ACTIVE_RESERVED_DNS_DATAGRAMS_PER_RESOLVER - slots.available_permits(),
         );
@@ -780,9 +774,7 @@ impl UdpProxy {
                     match sent {
                         Ok(sent) => self.stats.add_network_rx_bytes(sent as u64),
                         Err(error) => {
-                            pplx_space_metrics::gateway::udp_socket_error(
-                                "reserved_dns_capacity_response",
-                            );
+                            crate::metrics::udp_socket_error("reserved_dns_capacity_response");
                             debug!(
                                 sandbox_id = self.sandbox_id,
                                 %error,
@@ -797,7 +789,7 @@ impl UdpProxy {
         let response_socket = match response_socket_factory(flow.orig_dst) {
             Ok(socket) => socket,
             Err(error) => {
-                pplx_space_metrics::gateway::udp_socket_error("reserved_dns_response");
+                crate::metrics::udp_socket_error("reserved_dns_response");
                 debug!(
                     sandbox_id = self.sandbox_id,
                     %error,
@@ -833,7 +825,7 @@ impl UdpProxy {
                 return;
             }
             let accepted = dns_allow_cache.observe_response(&reply, policy.as_ref());
-            pplx_space_metrics::gateway::dns_attribution_cache_observation(
+            crate::metrics::dns_attribution_cache_observation(
                 DnsAttributionCacheObservationSource::ReservedDns,
                 accepted,
             );
@@ -935,7 +927,7 @@ impl UdpProxy {
                 self.record_session_limit_drop();
                 return None;
             }
-            pplx_space_metrics::gateway::udp_session_capacity_eviction();
+            crate::metrics::udp_session_capacity_eviction();
             debug!(
                 sandbox_id = self.sandbox_id,
                 limit = MAX_ACTIVE_UDP_SESSIONS,
@@ -1022,14 +1014,14 @@ impl UdpProxy {
             // The key was absent and capacity was reclaimed above, so this is
             // defensive containment if those invariants ever diverge.
             replaced.stop(UdpSessionOutcome::CapacityEviction).await;
-            pplx_space_metrics::gateway::udp_session_capacity_eviction();
+            crate::metrics::udp_session_capacity_eviction();
         }
         update_udp_active_sessions(&self.sessions, &self.stats);
         Some(upstream_socket)
     }
 
     fn record_session_limit_drop(&self) {
-        pplx_space_metrics::gateway::udp_session_limit_drop();
+        crate::metrics::udp_session_limit_drop();
         debug!(
             sandbox_id = self.sandbox_id,
             limit = MAX_ACTIVE_UDP_SESSIONS,
@@ -1042,10 +1034,10 @@ impl UdpProxy {
         stage: UdpSessionSocketStage,
         error: &io::Error,
     ) -> &'static str {
-        pplx_space_metrics::gateway::udp_socket_error(stage.socket_error_operation());
+        crate::metrics::udp_socket_error(stage.socket_error_operation());
         let stage = stage.as_str();
         let reason = udp_session_create_error_reason(error);
-        pplx_space_metrics::gateway::udp_session_create_error(stage, reason);
+        crate::metrics::udp_session_create_error(stage, reason);
         let now = Instant::now();
         let should_warn = self.last_session_create_warning.is_none_or(|last_warning| {
             now.duration_since(last_warning) >= UDP_SESSION_CREATE_WARNING_INTERVAL
@@ -1141,7 +1133,7 @@ fn update_udp_active_sessions(sessions: &LruCache<FlowKey, Session>, stats: &Pro
     stats
         .udp_active
         .store(sessions.len() as u64, Ordering::Relaxed);
-    pplx_space_metrics::gateway::udp_active_sessions(sessions.len() as u64);
+    crate::metrics::udp_active_sessions(sessions.len() as u64);
 }
 
 async fn wait_for_udp_session_tasks(tasks: Vec<tokio::task::JoinHandle<()>>) {
@@ -1214,7 +1206,7 @@ fn record_udp_session(
     outcome: UdpSessionOutcome,
 ) {
     let (status, detail) = outcome.metric_tags();
-    pplx_space_metrics::gateway::udp_connection(status, detail);
+    crate::metrics::udp_connection(status, detail);
 
     match outcome {
         UdpSessionOutcome::Idle | UdpSessionOutcome::CapacityEviction => {
@@ -1235,7 +1227,7 @@ fn record_udp_session(
             );
         }
         UdpSessionOutcome::ReceiveUpstreamFailed { error } => {
-            pplx_space_metrics::gateway::udp_socket_error("recv_upstream");
+            crate::metrics::udp_socket_error("recv_upstream");
             debug!(
                 sandbox_id,
                 ?flow,
@@ -1371,7 +1363,7 @@ impl ResponseTask {
                                 if let Err(error) =
                                     response_socket.send_to(datagram, flow.guest_src).await
                                 {
-                                    pplx_space_metrics::gateway::udp_socket_error("send_guest");
+                                    crate::metrics::udp_socket_error("send_guest");
                                     debug!(
                                         sandbox_id,
                                         ?flow,
@@ -1382,7 +1374,7 @@ impl ResponseTask {
                             }
                             Err(error) => {
                                 if is_recoverable_udp_recv_error(&error) {
-                                    pplx_space_metrics::gateway::udp_socket_error(
+                                    crate::metrics::udp_socket_error(
                                         "recv_upstream_transient",
                                     );
                                     debug!(
@@ -1408,7 +1400,7 @@ impl ResponseTask {
                                         mpsc::error::TrySendError::Full(_) => "full",
                                         mpsc::error::TrySendError::Closed(_) => "closed",
                                     };
-                                    pplx_space_metrics::gateway::udp_session_event_drop(reason);
+                                    crate::metrics::udp_session_event_drop(reason);
                                     debug!(
                                         sandbox_id,
                                         ?flow,
@@ -1476,7 +1468,7 @@ fn create_connected_upstream_socket(orig_dst: SocketAddr) -> std::io::Result<Udp
     socket
         .connect(&socket2::SockAddr::from(orig_dst))
         .inspect_err(|_| {
-            pplx_space_metrics::gateway::udp_socket_error("connect");
+            crate::metrics::udp_socket_error("connect");
         })?;
     let std_socket: std::net::UdpSocket = socket.into();
     UdpSocket::from_std(std_socket)
@@ -1488,15 +1480,15 @@ fn create_response_socket(addr: SocketAddr) -> std::io::Result<UdpSocket> {
     orig_dst::set_ip_transparent(&socket)?;
     orig_dst::set_so_mark(&socket, OUTBOUND_MARK)?;
     orig_dst::set_ip_freebind(&socket).inspect_err(|_| {
-        pplx_space_metrics::gateway::udp_socket_error("setsockopt_ip_freebind");
+        crate::metrics::udp_socket_error("setsockopt_ip_freebind");
     })?;
     socket.set_reuse_address(true).inspect_err(|_| {
-        pplx_space_metrics::gateway::udp_socket_error("setsockopt_reuseaddr");
+        crate::metrics::udp_socket_error("setsockopt_reuseaddr");
     })?;
     socket
         .bind(&socket2::SockAddr::from(addr))
         .inspect_err(|_| {
-            pplx_space_metrics::gateway::udp_socket_error("bind");
+            crate::metrics::udp_socket_error("bind");
         })?;
     let std_socket: std::net::UdpSocket = socket.into();
     UdpSocket::from_std(std_socket)
@@ -1509,10 +1501,10 @@ fn create_udp_socket() -> std::io::Result<socket2::Socket> {
         Some(socket2::Protocol::UDP),
     )
     .inspect_err(|_| {
-        pplx_space_metrics::gateway::udp_socket_error("socket");
+        crate::metrics::udp_socket_error("socket");
     })?;
     socket.set_nonblocking(true).inspect_err(|_| {
-        pplx_space_metrics::gateway::udp_socket_error("set_nonblocking");
+        crate::metrics::udp_socket_error("set_nonblocking");
     })?;
     Ok(socket)
 }

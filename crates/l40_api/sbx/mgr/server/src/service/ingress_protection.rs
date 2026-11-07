@@ -101,7 +101,7 @@ impl super::SandboxManagerService {
             .map_err(|_| {
                 tonic::Status::deadline_exceeded("ingress lifecycle admission timed out")
             })?;
-        pplx_space_metrics::sandbox::worker::ingress_admission_wait(started);
+        crate::metrics::sandbox::worker::ingress_admission_wait(started);
         let sandbox = self.lookup_guest_bridge_sandbox(sandbox_id)?;
         authorize(&sandbox)?;
         if sandbox.state != crate::state::SandboxState::Started {

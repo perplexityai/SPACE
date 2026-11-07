@@ -193,8 +193,8 @@ pub(super) fn relay(
                 (outcome, report.first_eof, report.fault, report.read)
             }
         };
-        pplx_space_metrics::gateway::domain_binding("tcp", binding, outcome, None);
-        pplx_space_metrics::gateway::relay_duration_ms(
+        crate::metrics::domain_binding("tcp", binding, outcome, None);
+        crate::metrics::relay_duration_ms(
             protocol,
             outcome,
             first_eof,

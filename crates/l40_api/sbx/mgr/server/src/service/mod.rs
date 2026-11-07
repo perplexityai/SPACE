@@ -622,7 +622,7 @@ fn persisted_route_stream_epoch(
 #[derive(Clone)]
 pub(super) struct RouteStreamFence {
     token: CancellationToken,
-    close_reason: Arc<Mutex<Option<pplx_space_metrics::sandbox::worker::RouteStreamCloseReason>>>,
+    close_reason: Arc<Mutex<Option<crate::metrics::sandbox::worker::RouteStreamCloseReason>>>,
 }
 
 impl RouteStreamFence {
@@ -644,7 +644,7 @@ impl RouteStreamFence {
         self.token.child_token()
     }
 
-    fn cancel(&self, reason: pplx_space_metrics::sandbox::worker::RouteStreamCloseReason) {
+    fn cancel(&self, reason: crate::metrics::sandbox::worker::RouteStreamCloseReason) {
         if let Ok(mut close_reason) = self.close_reason.lock()
             && close_reason.is_none()
         {
@@ -657,14 +657,12 @@ impl RouteStreamFence {
         self.token.cancelled().await;
     }
 
-    pub(super) fn close_reason(
-        &self,
-    ) -> pplx_space_metrics::sandbox::worker::RouteStreamCloseReason {
+    pub(super) fn close_reason(&self) -> crate::metrics::sandbox::worker::RouteStreamCloseReason {
         self.close_reason
             .lock()
             .ok()
             .and_then(|reason| *reason)
-            .unwrap_or(pplx_space_metrics::sandbox::worker::RouteStreamCloseReason::IdentityChanged)
+            .unwrap_or(crate::metrics::sandbox::worker::RouteStreamCloseReason::IdentityChanged)
     }
 
     pub(super) fn is_cancelled(&self) -> bool {
@@ -709,8 +707,8 @@ impl ServicePortIngressAdmission {
             })
             .clone();
         let permit = slots.clone().try_acquire_owned().map_err(|_| {
-            pplx_space_metrics::sandbox::worker::service_port_ingress_rejected(
-                pplx_space_metrics::sandbox::worker::ServicePortIngressRejectionReason::Capacity,
+            crate::metrics::sandbox::worker::service_port_ingress_rejected(
+                crate::metrics::sandbox::worker::ServicePortIngressRejectionReason::Capacity,
             );
             pplx_space_common_grpc::uds_per_sandbox_limit_exceeded_status(
                 "ServicePortIngress per-sandbox concurrency limit exceeded",
@@ -797,8 +795,8 @@ enum RouteVerificationBundleRefreshError {
 impl RouteVerificationBundleRefreshError {
     fn metric_result(
         &self,
-    ) -> pplx_space_metrics::sandbox::worker::RouteVerificationBundleReloadResult {
-        use pplx_space_metrics::sandbox::worker::RouteVerificationBundleReloadResult;
+    ) -> crate::metrics::sandbox::worker::RouteVerificationBundleReloadResult {
+        use crate::metrics::sandbox::worker::RouteVerificationBundleReloadResult;
         match self {
             Self::Invalid(_) => RouteVerificationBundleReloadResult::Invalid,
             Self::Missing { .. } => RouteVerificationBundleReloadResult::Missing,
@@ -986,8 +984,8 @@ fn map_runtime_fields_update_error(error: crate::db::Error) -> Status {
 
 fn route_identity_adoption_write_rejection_reason(
     error: &crate::db::Error,
-) -> pplx_space_metrics::sandbox::worker::RouteIdentityAdoptionReason {
-    use pplx_space_metrics::sandbox::worker::RouteIdentityAdoptionReason;
+) -> crate::metrics::sandbox::worker::RouteIdentityAdoptionReason {
+    use crate::metrics::sandbox::worker::RouteIdentityAdoptionReason;
     if crate::db::auto_lifecycle_delete_receipts::is_pending_receipt_execution_fence(error) {
         RouteIdentityAdoptionReason::PendingReceiptOwnsExecution
     } else if crate::db::auto_lifecycle_delete_receipts::is_lifecycle_execution_fence(error) {
@@ -1009,9 +1007,9 @@ fn install_authoritative_route_epoch(
     match epochs.get_mut(&sandbox_id) {
         Some(current) if current.identity == identity => {}
         Some(current) => {
-            current.fence.cancel(
-                pplx_space_metrics::sandbox::worker::RouteStreamCloseReason::IdentityChanged,
-            );
+            current
+                .fence
+                .cancel(crate::metrics::sandbox::worker::RouteStreamCloseReason::IdentityChanged);
             *current = RouteStreamEpoch::new(identity);
         }
         None => {
@@ -1175,10 +1173,10 @@ impl SandboxManagerService {
             Ok(RouteVerificationBundleRefresh::Updated(generation)) => {
                 self.watchdog
                     .set_expected_route_verification_key_generation(generation.get());
-                pplx_space_metrics::sandbox::worker::route_verification_bundle_reload(
-                    pplx_space_metrics::sandbox::worker::RouteVerificationBundleReloadResult::Updated,
+                crate::metrics::sandbox::worker::route_verification_bundle_reload(
+                    crate::metrics::sandbox::worker::RouteVerificationBundleReloadResult::Updated,
                 );
-                pplx_space_metrics::sandbox::worker::route_verification_bundle_generation(
+                crate::metrics::sandbox::worker::route_verification_bundle_generation(
                     generation.get(),
                 );
                 tracing::info!(
@@ -1188,22 +1186,22 @@ impl SandboxManagerService {
                 true
             }
             Ok(RouteVerificationBundleRefresh::Unchanged(generation)) => {
-                pplx_space_metrics::sandbox::worker::route_verification_bundle_reload(
-                    pplx_space_metrics::sandbox::worker::RouteVerificationBundleReloadResult::Unchanged,
+                crate::metrics::sandbox::worker::route_verification_bundle_reload(
+                    crate::metrics::sandbox::worker::RouteVerificationBundleReloadResult::Unchanged,
                 );
-                pplx_space_metrics::sandbox::worker::route_verification_bundle_generation(
+                crate::metrics::sandbox::worker::route_verification_bundle_generation(
                     generation.get(),
                 );
                 false
             }
             Ok(RouteVerificationBundleRefresh::Absent) => {
-                pplx_space_metrics::sandbox::worker::route_verification_bundle_reload(
-                    pplx_space_metrics::sandbox::worker::RouteVerificationBundleReloadResult::Absent,
+                crate::metrics::sandbox::worker::route_verification_bundle_reload(
+                    crate::metrics::sandbox::worker::RouteVerificationBundleReloadResult::Absent,
                 );
                 false
             }
             Err(error) => {
-                pplx_space_metrics::sandbox::worker::route_verification_bundle_reload(
+                crate::metrics::sandbox::worker::route_verification_bundle_reload(
                     error.metric_result(),
                 );
                 tracing::warn!(
@@ -1247,7 +1245,7 @@ impl SandboxManagerService {
         sandbox_id: SandboxId,
         incoming: &SpaceApiRouteIdentity,
     ) -> Result<(), Status> {
-        use pplx_space_metrics::sandbox::worker::{
+        use crate::metrics::sandbox::worker::{
             RouteIdentityAdoptionOutcome, RouteIdentityAdoptionReason, route_identity_adoption,
         };
         if incoming.is_absent() {
@@ -1633,9 +1631,9 @@ impl SandboxManagerService {
                     None => true,
                 });
         if should_cancel && let Some(epoch) = epochs.remove(&sandbox_id) {
-            epoch.fence.cancel(
-                pplx_space_metrics::sandbox::worker::RouteStreamCloseReason::LifecycleTeardown,
-            );
+            epoch
+                .fence
+                .cancel(crate::metrics::sandbox::worker::RouteStreamCloseReason::LifecycleTeardown);
         }
         Ok(())
     }
@@ -1645,9 +1643,9 @@ impl SandboxManagerService {
             Status::internal(format!("route stream epoch mutex poisoned: {error}"))
         })?;
         if let Some(epoch) = epochs.remove(&sandbox_id) {
-            epoch.fence.cancel(
-                pplx_space_metrics::sandbox::worker::RouteStreamCloseReason::LifecycleTeardown,
-            );
+            epoch
+                .fence
+                .cancel(crate::metrics::sandbox::worker::RouteStreamCloseReason::LifecycleTeardown);
         }
         Ok(())
     }
@@ -1774,7 +1772,7 @@ impl SandboxManagerService {
         );
         let local_artifacts = crate::local_artifacts::LocalArtifacts::new(db.clone());
         let teardown_suspend_driver_concurrency = TEARDOWN_SUSPEND_DRIVER_CONCURRENCY;
-        pplx_space_metrics::sandbox::worker::teardown_suspend_driver_capacity(
+        crate::metrics::sandbox::worker::teardown_suspend_driver_capacity(
             teardown_suspend_driver_concurrency,
         );
         let credential_manager_endpoint =
@@ -2044,7 +2042,7 @@ async fn prune_local_artifact_metadata_once(
     {
         Ok(Ok(pruned)) => {
             if pruned > 0 {
-                pplx_space_metrics::sandbox::worker::local_artifact_metadata_pruned(pruned as u64);
+                crate::metrics::sandbox::worker::local_artifact_metadata_pruned(pruned as u64);
                 tracing::info!(pruned, "pruned stale local artifact metadata rows");
             }
         }

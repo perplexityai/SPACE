@@ -1,18 +1,18 @@
 use super::*;
+use crate::metrics::sandbox::worker::{
+    NetGatewayRouteSecurityPushOperation as Operation,
+    NetGatewayRouteSecurityPushOutcome as Outcome, net_gateway_route_security_push,
+};
 use pplx_space_common_core::types::SpaceApiRouteIdentity;
 use pplx_space_events::{
     SandboxEventDetails, SandboxEventSource, SandboxEventType, emit_sandbox_event,
 };
-use pplx_space_metrics::gateway::readiness::{
-    self as readiness_metrics, Outcome as ReadinessOutcome,
-};
-use pplx_space_metrics::sandbox::worker::{
-    NetGatewayRouteSecurityPushOperation as Operation,
-    NetGatewayRouteSecurityPushOutcome as Outcome, net_gateway_route_security_push,
-};
 use pplx_space_net_common::{
     DomainName, EffectiveNetworkPolicyRef, NetworkPolicy, NetworkPolicyValidationError,
     effective_network_policy_refs_match,
+};
+use pplx_space_sandbox_metrics::gateway_readiness::{
+    self as readiness_metrics, Outcome as ReadinessOutcome,
 };
 
 const MAX_KNOWN_EGRESS_DOMAINS: usize = 64;
@@ -751,7 +751,7 @@ where
                     )
                 {
                     observation.outcome = ReadinessOutcome::Ready;
-                    pplx_space_metrics::reconcile::network_policy_push("ok");
+                    crate::metrics::reconcile::network_policy_push("ok");
                     // Ready + matching ref is the whole start gate. The
                     // gateway reports TLS-interception dependency readiness
                     // separately; when it is not ready the sandbox still
@@ -768,9 +768,7 @@ where
                             pplx_space_net_gateway_client::proto::InterceptionReadiness::Unspecified,
                         );
                     if interception_readiness.blocks_admission() {
-                        pplx_space_metrics::reconcile::network_policy_interception_not_ready(
-                            reason,
-                        );
+                        crate::metrics::reconcile::network_policy_interception_not_ready(reason);
                     }
                     tracing::info!(
                         sandbox_id,
@@ -810,7 +808,7 @@ where
         }
     }
 
-    pplx_space_metrics::reconcile::network_policy_push("error");
+    crate::metrics::reconcile::network_policy_push("error");
     let error = if let Some(reason) = abandon_reason {
         observation.outcome = ReadinessOutcome::Abandoned;
         NetworkPolicyRefreshError::Abandoned(reason)
@@ -1281,8 +1279,8 @@ pub(super) enum NetGatewayRouteVerificationKeyPushOutcome {
 impl NetGatewayRouteVerificationKeyPushOutcome {
     const fn metric_outcome(
         self,
-    ) -> pplx_space_metrics::sandbox::worker::NetGatewayRouteSecurityPushOutcome {
-        use pplx_space_metrics::sandbox::worker::NetGatewayRouteSecurityPushOutcome as Outcome;
+    ) -> crate::metrics::sandbox::worker::NetGatewayRouteSecurityPushOutcome {
+        use crate::metrics::sandbox::worker::NetGatewayRouteSecurityPushOutcome as Outcome;
         match self {
             Self::Applied => Outcome::Applied,
         }

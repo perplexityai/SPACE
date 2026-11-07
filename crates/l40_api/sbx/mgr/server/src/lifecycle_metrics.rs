@@ -123,7 +123,7 @@ pub(crate) async fn run(db: crate::db::SharedConnection, shutdown_token: Cancell
         match lifecycle_counts {
             Ok(counts) => {
                 lifecycle_sampler.emit_sample(&counts, |bucket: &LifecycleBucket, count| {
-                    pplx_space_metrics::sandbox::worker::lifecycle_count(
+                    crate::metrics::sandbox::worker::lifecycle_count(
                         count,
                         &bucket.state,
                         bucket.runtime,
@@ -137,7 +137,7 @@ pub(crate) async fn run(db: crate::db::SharedConnection, shutdown_token: Cancell
         }
         match status_counts {
             Ok(counts) => status_sampler.emit_sample(&counts, |bucket: &StatusBucket, count| {
-                pplx_space_metrics::sandbox::worker::lifecycle_status_count(
+                crate::metrics::sandbox::worker::lifecycle_status_count(
                     count,
                     &bucket.state,
                     &bucket.cleanup_state,

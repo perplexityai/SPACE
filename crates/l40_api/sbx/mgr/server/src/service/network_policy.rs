@@ -269,8 +269,8 @@ impl TemplateNetworkPolicyCache {
         F: FnOnce(String) -> Fut + Send + 'static,
         Fut: std::future::Future<Output = Result<EffectiveNetworkPolicy, Status>> + Send,
     {
-        use pplx_space_metrics::reconcile::NetworkPolicyWaitOutcome;
-        let mut observation = pplx_space_metrics::reconcile::network_policy_wait();
+        use crate::metrics::reconcile::NetworkPolicyWaitOutcome;
+        let mut observation = crate::metrics::reconcile::network_policy_wait();
         let result = tokio::time::timeout(
             TEMPLATE_NETWORK_POLICY_WAIT_TIMEOUT,
             self.resolve_with(template, fetch, &mut observation),
@@ -301,13 +301,13 @@ impl TemplateNetworkPolicyCache {
         &self,
         template: &str,
         fetch: F,
-        observation: &mut pplx_space_metrics::reconcile::NetworkPolicyWait,
+        observation: &mut crate::metrics::reconcile::NetworkPolicyWait,
     ) -> Result<EffectiveNetworkPolicy, Status>
     where
         F: FnOnce(String) -> Fut + Send + 'static,
         Fut: std::future::Future<Output = Result<EffectiveNetworkPolicy, Status>> + Send,
     {
-        use pplx_space_metrics::reconcile::NetworkPolicyWaitPath;
+        use crate::metrics::reconcile::NetworkPolicyWaitPath;
         let mut permit = None;
         loop {
             let mut state = self.inner.lock().await;
@@ -352,7 +352,7 @@ impl TemplateNetworkPolicyCache {
             let shutdown = self.shutdown_token.clone();
             let fetch_template = template.to_string();
             let pending = async move {
-                use pplx_space_metrics::reconcile::NetworkPolicyFetchOutcome;
+                use crate::metrics::reconcile::NetworkPolicyFetchOutcome;
                 let started = std::time::Instant::now();
                 let (result, outcome) = tokio::select! {
                     biased;
@@ -381,7 +381,7 @@ impl TemplateNetworkPolicyCache {
                         }
                     }
                 };
-                pplx_space_metrics::reconcile::network_policy_fetch(outcome, started);
+                crate::metrics::reconcile::network_policy_fetch(outcome, started);
                 cache.complete_fetch(fetch_template, &owner_claim, result).await
             }.boxed().shared();
             let Some(weak) = pending.downgrade() else {

@@ -5,6 +5,7 @@ mod blob_storage;
 mod egress;
 mod environment;
 mod execution_binding;
+pub mod metrics;
 pub mod object_store;
 pub mod oci;
 pub mod publish;
@@ -24,6 +25,7 @@ use std::process::{Command, Stdio};
 use std::str::FromStr;
 use std::time::{Duration, Instant};
 
+pub use crate::metrics::TemplateBuildErrorKind;
 use pplx_space_common_core::{
     host::linux::identities::group_names,
     types::{
@@ -31,7 +33,6 @@ use pplx_space_common_core::{
         PolicyAuthority, TemplateBuildId,
     },
 };
-pub use pplx_space_metrics::template::TemplateBuildErrorKind;
 pub use pplx_space_net_common::NetworkPolicyV1;
 use pplx_space_net_common::proto::NetworkPolicyV1 as NetworkPolicyV1Proto;
 use pplx_space_node_mgr_client::proto::{
@@ -305,10 +306,9 @@ where
             "build phase started"
         );
         let result = future.await;
-        let step_result =
-            pplx_space_metrics::template::TemplateBuildStepResult::from_ok(result.is_ok());
+        let step_result = crate::metrics::TemplateBuildStepResult::from_ok(result.is_ok());
         let result_tag = step_result.as_str();
-        pplx_space_metrics::template::build_step_completed(
+        crate::metrics::build_step_completed(
             template_id,
             phase.as_str(),
             step_result,
@@ -1032,9 +1032,9 @@ impl TemplateBuilder {
                 })
             };
             let step_metric_result =
-                pplx_space_metrics::template::TemplateBuildStepResult::from_ok(step_result.is_ok());
+                crate::metrics::TemplateBuildStepResult::from_ok(step_result.is_ok());
             let result_tag = step_metric_result.as_str();
-            pplx_space_metrics::template::build_step_completed(
+            crate::metrics::build_step_completed(
                 template_id,
                 BuildPhase::RecipeStep.as_str(),
                 step_metric_result,

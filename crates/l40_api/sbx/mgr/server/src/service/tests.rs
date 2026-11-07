@@ -4000,7 +4000,7 @@ pub(crate) mod service_tests {
 
     #[test]
     fn route_identity_adoption_rejection_reasons_distinguish_write_fences() {
-        use pplx_space_metrics::sandbox::worker::RouteIdentityAdoptionReason;
+        use crate::metrics::sandbox::worker::RouteIdentityAdoptionReason;
 
         assert_eq!(
             route_identity_adoption_write_rejection_reason(&crate::db::Error::no_rows()),

@@ -624,8 +624,8 @@ impl SandboxManagerService {
             ) => match result {
                 Ok(result) => result?,
                 Err(_) => {
-                    pplx_space_metrics::sandbox::worker::service_port_ingress_rejected(
-                        pplx_space_metrics::sandbox::worker::ServicePortIngressRejectionReason::StartTimeout,
+                    crate::metrics::sandbox::worker::service_port_ingress_rejected(
+                        crate::metrics::sandbox::worker::ServicePortIngressRejectionReason::StartTimeout,
                     );
                     return Err(Status::deadline_exceeded(
                         "service port ingress start frame timed out",
