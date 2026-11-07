@@ -1461,21 +1461,29 @@ pub(super) fn host_without_port(host: &str) -> &str {
 #[derive(Debug)]
 pub(super) enum AttachError {
     BadRequest(&'static str),
+    Unauthorized(&'static str),
 }
 
 impl IntoResponse for AttachError {
     fn into_response(self) -> Response {
-        let (status, message) = match self {
-            Self::BadRequest(message) => (StatusCode::BAD_REQUEST, message),
-        };
-        data_plane_http_error(
-            status,
-            DataPlaneHttpErrorCode::InvalidRequest,
-            message,
-            false,
-            ResponseOrigin::Client,
-            ResponseKind::Validation,
-        )
+        match self {
+            Self::BadRequest(message) => data_plane_http_error(
+                StatusCode::BAD_REQUEST,
+                DataPlaneHttpErrorCode::InvalidRequest,
+                message,
+                false,
+                ResponseOrigin::Client,
+                ResponseKind::Validation,
+            ),
+            Self::Unauthorized(message) => data_plane_http_error(
+                StatusCode::UNAUTHORIZED,
+                DataPlaneHttpErrorCode::Unauthorized,
+                message,
+                false,
+                ResponseOrigin::Client,
+                ResponseKind::Auth,
+            ),
+        }
     }
 }
 
@@ -1517,7 +1525,7 @@ impl IntoResponse for ProxyError {
                     RouteResolutionError::Unauthenticated => (
                         StatusCode::UNAUTHORIZED,
                         DataPlaneHttpErrorCode::Unauthorized,
-                        "invalid or expired data-plane token",
+                        crate::native::INVALID_TOKEN_MESSAGE,
                         origin,
                         kind,
                     ),
@@ -1592,6 +1600,7 @@ impl From<AttachError> for ProxyError {
     fn from(error: AttachError) -> Self {
         match error {
             AttachError::BadRequest(message) => Self::BadRequest(message),
+            AttachError::Unauthorized(message) => Self::Unauthorized(message),
         }
     }
 }
