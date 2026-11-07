@@ -109,14 +109,16 @@ impl TemplateLookupScope {
     pub fn observe_response<T>(self, response: &Response<T>) -> Result<(), Status> {
         match response.metadata().get(RECEIPT_HEADER) {
             None => {
-                crate::template_lookup::metrics::template_lookup_compatibility("missing_receipt");
+                crate::lookup_scope::metrics::template_lookup_compatibility("missing_receipt");
+                // The target from before the module left rpc-auth, which log filters may name.
                 tracing::warn!(
+                    target: "pplx_space_rpc_auth::template_lookup",
                     "template lookup peer has no scope receipt; retaining legacy behavior"
                 );
                 Ok(())
             }
             Some(value) if value.to_str().ok() == Some(self.to_string().as_str()) => {
-                crate::template_lookup::metrics::template_lookup_compatibility("received");
+                crate::lookup_scope::metrics::template_lookup_compatibility("received");
                 Ok(())
             }
             Some(_) => Err(Status::failed_precondition(

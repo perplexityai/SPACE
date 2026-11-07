@@ -5,8 +5,8 @@ use pplx_space_node_api_client::proto::{
     RegisterTemplateReleaseRequest, RegisterTemplateRequest, TemplateVisibility,
     cluster_api_server::{ClusterApi, ClusterApiServer},
 };
-use pplx_space_rpc_auth::template_lookup::TemplateLookupScope;
 use pplx_space_rpc_auth::{NodeApiAuthConfig, NodeApiAuthLayer, NodeRole};
+use pplx_space_template_mgr_client::lookup_scope::TemplateLookupScope;
 use pplx_space_test_env::{TestEnv, TestResult, enter_test_process};
 use std::ffi::OsStr;
 use std::sync::{Arc, Mutex};
@@ -190,7 +190,7 @@ async fn catalog_receipts_preserve_legacy_org_checks() -> TestResult {
         FindTemplateReleaseByHashRequest, FindTemplateReleaseRequest,
         cluster_api_client::ClusterApiClient,
     };
-    use pplx_space_rpc_auth::template_lookup::TemplateLookupScope;
+    use pplx_space_template_mgr_client::lookup_scope::TemplateLookupScope;
     let catalog = Catalog::start(TemplateVisibility::OrgSpecific).await?;
     let mut client = ClusterApiClient::connect(catalog.endpoint.clone()).await?;
     let digest = format!("sha256:{}", "a".repeat(64));

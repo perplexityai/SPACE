@@ -7340,7 +7340,6 @@ dependencies = [
  "pplx-space-node-runtime-core",
  "pplx-space-observability",
  "pplx-space-reconcile-metrics",
- "pplx-space-rpc-auth",
  "pplx-space-sandbox-grpc",
  "pplx-space-sandbox-metrics",
  "pplx-space-sbx-mgr-client",
@@ -8043,6 +8042,7 @@ dependencies = [
  "pplx-space-common-grpc",
  "pplx-space-common-proto-build",
  "pplx-space-execution-common",
+ "pplx-space-metrics-emit",
  "pplx-space-net-common",
  "pplx-space-observability",
  "pplx-space-sbx-mgr-protocol",
@@ -8051,6 +8051,7 @@ dependencies = [
  "tonic",
  "tonic-prost",
  "tonic-prost-build",
+ "tracing",
 ]
 
 [[package]]

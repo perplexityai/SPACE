@@ -56,7 +56,7 @@
 //!   addressing.
 
 use crate::rootfs_backing::RootfsBackingPolicy;
-use pplx_space_rpc_auth::template_lookup::TemplateLookupScope;
+use pplx_space_template_mgr_client::lookup_scope::TemplateLookupScope;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};

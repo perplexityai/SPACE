@@ -222,7 +222,7 @@ pub(super) async fn verify_delta_base(
             caller_org_id: None,
             cached_only: true,
         });
-    let scope = pplx_space_rpc_auth::template_lookup::TemplateLookupScope::LocalExecution;
+    let scope = pplx_space_template_mgr_client::lookup_scope::TemplateLookupScope::LocalExecution;
     scope.attach(&mut request);
     let Ok(lookup) =
         tokio::time::timeout(DELTA_BASE_LOOKUP_TIMEOUT, templates.get_template(request)).await

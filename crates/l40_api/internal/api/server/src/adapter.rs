@@ -1,5 +1,5 @@
 use pplx_space_common_core::types::OrgId;
-use pplx_space_rpc_auth::template_lookup::TemplateLookupScope;
+use pplx_space_template_mgr_client::lookup_scope::TemplateLookupScope;
 
 use super::metadata::*;
 use super::status::*;
@@ -429,7 +429,7 @@ impl ClusterApi for ClusterApiService {
         let scope = self.template_read_scope(&request).await?;
         let delegation = TemplateLookupScope::from_request(&request)?;
         if delegation.is_none() {
-            pplx_space_rpc_auth::template_lookup::metrics::template_lookup_compatibility(
+            pplx_space_template_mgr_client::lookup_scope::metrics::template_lookup_compatibility(
                 "missing_scope",
             );
         }
@@ -514,7 +514,7 @@ impl ClusterApi for ClusterApiService {
         let scope = self.template_read_scope(&request).await?;
         let delegation = TemplateLookupScope::from_request(&request)?;
         if delegation.is_none() {
-            pplx_space_rpc_auth::template_lookup::metrics::template_lookup_compatibility(
+            pplx_space_template_mgr_client::lookup_scope::metrics::template_lookup_compatibility(
                 "missing_scope",
             );
         }

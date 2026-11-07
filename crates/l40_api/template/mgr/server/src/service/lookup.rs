@@ -1,5 +1,5 @@
 use pplx_space_common_core::types::OrgId;
-use pplx_space_rpc_auth::template_lookup::TemplateLookupScope;
+use pplx_space_template_mgr_client::lookup_scope::TemplateLookupScope;
 
 use super::*;
 
@@ -20,7 +20,7 @@ impl TemplateManagerService {
     ) -> Result<Response<crate::proto::GetTemplateResponse>, Status> {
         let scope = TemplateLookupScope::from_request(&request)?;
         if scope.is_none() {
-            pplx_space_rpc_auth::template_lookup::metrics::template_lookup_compatibility(
+            pplx_space_template_mgr_client::lookup_scope::metrics::template_lookup_compatibility(
                 "missing_scope",
             );
         }

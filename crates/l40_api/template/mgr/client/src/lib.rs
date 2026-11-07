@@ -1,3 +1,5 @@
+pub mod lookup_scope;
+
 pub mod proto {
     tonic::include_proto!("space.template.manager.v1");
 }
