@@ -1633,8 +1633,9 @@ class DrainV2Control(NodeDrainControl, Protocol):
 
         `kube-delete` deletes the Node and the controller tombstones the row,
         which keeps the worker out for good: drop that tombstone, restart the
-        worker's kubelet so it registers the Node again, and wait for the row
-        and the worker's operator shell. Idempotent.
+        worker's kubelet so it registers the Node again, label it a sandbox
+        worker as the Kind bootstrap did, and wait for the row and the
+        worker's operator shell. Idempotent.
         """
         ...
 

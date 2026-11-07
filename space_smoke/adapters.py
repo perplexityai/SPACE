@@ -635,6 +635,7 @@ REDIS_REPLICAS_ANNOTATION = "space.pplx.net/smoke-redis-replicas"
 FAST_ROLLOUT_STANDING_ANNOTATION = "space.pplx.net/smoke-fast-rollout-standing"
 FAST_ROLLOUT_MAX_SURGE = "100%"
 DRAIN_KEEP_ANNOTATION = "space.pplx.net/drain-keep"
+SANDBOX_WORKER_LABEL = "node.kubernetes.io/space-enabled"
 NODE_GROUP_BOUNDARY_LABEL = "node-restriction.kubernetes.io/space-node-group"
 NODE_GROUP_GATE_ENV = "SPACE_SANDBOX_NODE_GROUP_PLACEMENT"
 NODE_GROUP_LABELER_ENV = "SPACE_NODE_GROUP_LABELER_ENABLED"
@@ -5299,10 +5300,20 @@ ON CONFLICT (key_hash) DO NOTHING;
                 f"restart kubelet on {node}",
             )
         deadline = time.monotonic() + 300
+        while not self.kube_node_exists(node):
+            if time.monotonic() >= deadline:
+                raise RuntimeError(f"terminated worker {node} never registered its Node again")
+            time.sleep(3)
+        # The Kind bootstrap's label (Tiltfile `label-kind-workers`), which
+        # sandbox pods select on: a Node the kubelet registers again lacks it.
+        _require_ok(
+            self.kubectl(
+                "label", "node", node, f"{SANDBOX_WORKER_LABEL}=true", "--overwrite", timeout=30
+            ),
+            f"label {node} a sandbox worker again",
+        )
         while True:
-            registered = self.kube_node_exists(node) and any(
-                n.k8s_node_name == node for n in self.admin_nodes()
-            )
+            registered = any(n.k8s_node_name == node for n in self.admin_nodes())
             if registered:
                 try:
                     self._node_shell_pod(node)
