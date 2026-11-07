@@ -5,8 +5,9 @@ use pplx_space_common_core::ids::sandbox_label_or_id as sandbox_label;
 use pplx_space_common_core::types::{
     AutoLifecycleConditionSet, AutoLifecycleConditionSetId, AutoLifecycleIdleBreakSource,
     AutoLifecyclePolicy, AutoLifecycleStageChain, AutoLifecycleWakePolicy, AutoLifecycleWakeSource,
-    GuestUserName, PolicyAuthority, SandboxId, SandboxSelector, SimpleDuration,
+    GuestUserName, SandboxId, SandboxSelector, SimpleDuration,
 };
+use pplx_space_policy_authority::PolicyAuthority;
 use prost_types::Timestamp;
 use std::collections::{BTreeMap, HashMap};
 

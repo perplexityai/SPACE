@@ -241,7 +241,7 @@ impl RouteEvidence {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AutoLifecycleDeleteExpectation {
     pub policy_fingerprint: AutoLifecyclePolicyFingerprint,
-    pub authority: pplx_space_common_core::types::PolicyAuthority,
+    pub authority: pplx_space_policy_authority::PolicyAuthority,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

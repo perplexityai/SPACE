@@ -14,13 +14,14 @@ use crate::node_group_placement::{
 };
 use pplx_space_common_core::kubernetes::{EvacuationPlacement, NodeGroupPlacement, PodToleration};
 use pplx_space_common_core::types::{
-    ExecutionGeneration, NodeRole as SpaceNodeRole, PodUid, PolicyAuthority,
-    SandboxActivationAttemptId, SandboxLifecycle, SandboxOwner, SandboxTransitionTargetState,
+    ExecutionGeneration, NodeRole as SpaceNodeRole, PodUid, SandboxActivationAttemptId,
+    SandboxLifecycle, SandboxOwner, SandboxTransitionTargetState,
 };
 use pplx_space_events::{
     SandboxEvent, SandboxEventBoolField, SandboxEventDetails, SandboxEventSource, SandboxEventType,
     SandboxRestoreProvenance,
 };
+use pplx_space_policy_authority::PolicyAuthority;
 use rand::RngExt;
 
 mod create_request;

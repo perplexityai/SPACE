@@ -16,9 +16,9 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::types::{
-    MemorySize, NodePoolName, PolicyAuthority, ROOT_SANDBOX_OWNER, SandboxOwner, TemplateReference,
-    VcpuCount,
+    MemorySize, NodePoolName, ROOT_SANDBOX_OWNER, SandboxOwner, TemplateReference, VcpuCount,
 };
+use pplx_space_policy_authority::PolicyAuthority;
 
 #[path = "k8s/placement.rs"]
 pub mod placement;

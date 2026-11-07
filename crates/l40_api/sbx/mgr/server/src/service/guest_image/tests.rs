@@ -1,8 +1,9 @@
 use super::*;
 use crate::node_manager_transport::fake::FakeNodeManager;
 use pplx_space_common_core::types::guest_image::{GuestDiskLayout, GuestNetwork, GuestReadiness};
-use pplx_space_common_core::types::{PolicyAuthority, SandboxOwner, SandboxRuntimeLabel};
+use pplx_space_common_core::types::{SandboxOwner, SandboxRuntimeLabel};
 use pplx_space_node_mgr_client::proto::{ProbeGuestServiceRequest, ProbeGuestServiceResponse};
+use pplx_space_policy_authority::PolicyAuthority;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 fn image() -> GuestImageContract {

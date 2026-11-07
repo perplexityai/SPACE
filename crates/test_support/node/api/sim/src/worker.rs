@@ -15,7 +15,7 @@
 use std::{collections::HashMap, pin::Pin, sync::Arc};
 
 use pplx_space_common_core::types::{
-    BackupAttemptId, EnvMap, EnvSanitizationIssue, LocalArtifactId, NodeManagedBy, PolicyAuthority,
+    BackupAttemptId, EnvMap, EnvSanitizationIssue, LocalArtifactId, NodeManagedBy,
 };
 use pplx_space_net_gateway_client::proto::{ServicePortIngressFrame, service_port_ingress_frame};
 use pplx_space_node_api_client::proto::worker_api_internal_server::WorkerApiInternal;
@@ -24,6 +24,7 @@ use pplx_space_node_api_client::proto::{
     ListNodeTemplatesRequest, ListNodeTemplatesResponse, PullTemplateRequest, PullTemplateResponse,
     TriggerStateReconciliationRequest, TriggerStateReconciliationResponse,
 };
+use pplx_space_policy_authority::PolicyAuthority;
 use pplx_space_sbx_mgr_client::proto as sbx;
 use pplx_space_template_mgr_client::proto as tmpl;
 use tokio::sync::Mutex;
@@ -1630,7 +1631,7 @@ async fn sim_install_activation_policy(
             .map_err(Status::from)?;
         let encoded = policy.encode_to_vec();
         let record = state.get(sandbox_id).await.map_err(map_state_error)?;
-        if record.auto_lifecycle_authority != pplx_space_common_core::types::PolicyAuthority::Local
+        if record.auto_lifecycle_authority != pplx_space_policy_authority::PolicyAuthority::Local
             && record.access_idle_policy != encoded
         {
             state
@@ -1702,7 +1703,7 @@ async fn sim_wake(
             let policy = match activation_policy.as_ref() {
                 Some(policy)
                     if record.auto_lifecycle_authority
-                        != pplx_space_common_core::types::PolicyAuthority::Local =>
+                        != pplx_space_policy_authority::PolicyAuthority::Local =>
                 {
                     policy.clone()
                 }

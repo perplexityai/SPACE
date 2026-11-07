@@ -34,6 +34,7 @@ pplx-space-linux-ids = { workspace = true }
 pplx-space-net-common = { workspace = true }
 pplx-space-network-roles = { workspace = true }
 pplx-space-pii = { workspace = true }
+pplx-space-policy-authority = { workspace = true, optional = true }
 pplx-space-rpc-contracts = { workspace = true }
 pplx-space-semver = { workspace = true }
 pplx-space-sql-locator = { workspace = true }
@@ -53,7 +54,14 @@ tempfile = { workspace = true }
 [features]
 default = []
 archive = ["dep:aws-lc-rs"]
-kubernetes = ["dep:base64", "dep:k8s-openapi", "dep:sha2", "serde", "pplx-space-net-common/serde"]
+kubernetes = [
+    "dep:base64",
+    "dep:k8s-openapi",
+    "dep:pplx-space-policy-authority",
+    "dep:sha2",
+    "serde",
+    "pplx-space-net-common/serde",
+]
 serde = [
     "dep:serde",
     "dep:serde_json",

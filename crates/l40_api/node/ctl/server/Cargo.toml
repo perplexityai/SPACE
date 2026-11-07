@@ -55,6 +55,7 @@ pplx-space-node-api-client = { workspace = true }
 pplx-space-node-mgr-client = { workspace = true }
 pplx-space-node-runtime-core = { workspace = true }
 pplx-space-node-runtime-manager-client = { workspace = true }
+pplx-space-policy-authority = { workspace = true }
 pplx-space-sbx-mgr-client = { workspace = true }
 pplx-space-state-reconciliation = { workspace = true }
 pplx-space-template-mgr-client = { workspace = true }

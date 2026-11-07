@@ -6,7 +6,7 @@ use std::time::Duration;
 use pplx_space_common_core::port_exposure_signals::{
     EXPOSE_TERMINAL_REASON_METADATA_KEY, EXPOSE_TERMINAL_REASON_STALE_POD_NETNS,
 };
-use pplx_space_common_core::types::{PolicyAuthority, SandboxId, SandboxOwner, SemVer};
+use pplx_space_common_core::types::{SandboxId, SandboxOwner, SemVer};
 use pplx_space_net_common::proto::{
     NetworkPolicyApplyDecision, NetworkPolicySource, NetworkPolicyV1 as ProtoNetworkPolicyV1,
 };
@@ -23,6 +23,7 @@ use pplx_space_node_mgr_client::proto::{
     AllowPortRequest, DenyPortRequest, ExposePortRequest, ListNetworkLeasesRequest,
     NetworkProtocol, NetworkSlotState, UnexposePortRequest,
 };
+use pplx_space_policy_authority::PolicyAuthority;
 use pplx_space_sbx_mgr_client::proto::{
     AcknowledgeAutoLifecycleDeleteReceiptsRequest, DisableSnapshotsRequest, EnableSnapshotsRequest,
     EvictClusterDeletedSandboxRequest, GetDiskUsageRequest as SbxGetDiskUsageRequest,
