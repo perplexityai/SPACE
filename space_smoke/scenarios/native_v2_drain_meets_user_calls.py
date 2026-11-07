@@ -30,6 +30,8 @@ def v2_drain_meets_user_calls(test: smoke.CommandSandboxFixture) -> None:
     usual. The node reaches `drained`."""
 
     drain = test.drain_v2
+    control = test._drain_v2_control  # noqa: SLF001
+    assert control is not None
     restores = DrainRestoreAssertions(
         cast(smoke.KindEcw, test), cast(DrainRestoreControl, test._drain_v2_control),  # noqa: SLF001
         test._context.scope,  # noqa: SLF001
@@ -66,12 +68,15 @@ def v2_drain_meets_user_calls(test: smoke.CommandSandboxFixture) -> None:
 
     with test.phase("the deleted resident is gone and the node drains"):
         report = drain.expect_drained()
+        # The node may have made it durable before the delete landed, and so
+        # report it evacuated; the controller then enqueues no restore, or one
+        # the delete supersedes. None lands it.
+        restores = control.drain_restore_states(drain.bare_id(deleted.sandbox_id))
+        test.record("deleted_resident_restores", restores)
         test.verify(
-            all(
-                entry.get("sandbox_id") != drain.bare_id(deleted.sandbox_id)
-                for entry in report.get("evacuated", [])
-            ),
-            "the node reported the deleted resident evacuated",
+            "succeeded" not in restores,
+            "a drain restore brought the deleted resident back",
+            restores=restores,
             report=report,
         )
 

@@ -5285,6 +5285,16 @@ ON CONFLICT (key_hash) DO NOTHING;
             f"mark the drain's test-quarantined sandboxes on {node_name}",
         )
 
+    def drain_restore_states(self, sandbox_id: str) -> list[str]:
+        rows = self._psql(
+            "SELECT state FROM public_operations"
+            " WHERE kind = 'drain_restore_sandbox' AND target_type = 'sandbox'"
+            f" AND target_id = 'sbx_{_sql_uuid(sandbox_id)}'"
+            " ORDER BY requested_at, operation_id;\n",
+            action="read the sandbox's drain restore operations",
+        )
+        return [line.strip() for line in rows.splitlines() if line.strip()]
+
     def restore_terminated_worker(self, node_name: str, node_id: str) -> None:
         self._require_isolated_kind("restoring a terminated worker")
         node = _kube_node_name(node_name)
