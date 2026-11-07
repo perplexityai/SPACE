@@ -4,6 +4,12 @@ use pplx_space_common_core::activation_seal_signals::ACTIVATIONS_SEALED_MARKER;
 
 const SANDBOX: &str = "sandbox-1";
 
+fn last_cancelled_epoch(db: &crate::db::SharedConnection) -> Option<u64> {
+    crate::db::read::activation_seal(&db.lock().unwrap())
+        .unwrap()
+        .and_then(|record| record.last_cancelled_epoch)
+}
+
 /// Sealing again under the current epoch changes nothing; a later epoch
 /// replaces it with a later seal; an earlier epoch is refused, to seal or to
 /// cancel, and leaves the seal as it was; a zero or unstorable epoch is
@@ -73,7 +79,7 @@ fn a_cancelled_epoch_never_seals_again() {
     seal.seal(&db, 5).unwrap();
     seal.unseal(&db, 5).unwrap();
     assert_eq!(seal.status().sealed, None);
-    assert_eq!(seal.last_cancelled_epoch(), Some(5));
+    assert_eq!(last_cancelled_epoch(&db), Some(5));
     seal.unseal(&db, 5).unwrap();
     for stale in [4, 5] {
         assert_eq!(
@@ -94,14 +100,9 @@ fn a_cancelled_epoch_never_seals_again() {
     assert_eq!(seal.seal(&db, 10).unwrap().epoch, 10);
     seal.unseal(&db, 12).unwrap();
     assert_eq!(seal.status().sealed, None);
-    assert_eq!(seal.last_cancelled_epoch(), Some(12));
+    assert_eq!(last_cancelled_epoch(&db), Some(12));
 
     let reloaded = ActivationSeal::load(&db.lock().unwrap());
-    assert_eq!(
-        reloaded.last_cancelled_epoch(),
-        Some(12),
-        "a restart keeps the cancel"
-    );
     assert_eq!(
         reloaded.seal(&db, 11).unwrap_err().code(),
         tonic::Code::FailedPrecondition
@@ -188,75 +189,6 @@ fn an_unreadable_seal_refuses_activations() {
         "{refused:?}"
     );
     assert_eq!(seal.seal(&db, 1).unwrap_err().code(), tonic::Code::Internal);
-}
-
-/// A seal with work in flight answers `quiesced: false` with that work, oldest
-/// first, once its wait runs out, and `quiesced: true` once the work has
-/// finished. A continuation counts like an activation.
-#[tokio::test(start_paused = true)]
-async fn seal_waits_for_in_flight_work_and_lists_what_is_left() {
-    let db = crate::db::SharedConnection::new(crate::db::test_conn());
-    let seal = Arc::new(ActivationSeal::load(&db.lock().unwrap()));
-    let restore = seal
-        .admit(InFlightActivationKind::Restore, "sandbox-a")
-        .unwrap();
-    tokio::time::advance(Duration::from_secs(4)).await;
-    let checkpoint = seal.continuation(InFlightActivationKind::Checkpoint, "sandbox-b");
-    tokio::time::advance(Duration::from_secs(1)).await;
-
-    let outcome = seal
-        .seal_and_wait(&db, 5, Duration::from_secs(10), &CancellationToken::new())
-        .await
-        .unwrap();
-    assert!(!outcome.quiesced);
-    assert_eq!(
-        outcome.status.in_flight,
-        vec![
-            InFlightActivation {
-                kind: InFlightActivationKind::Restore,
-                sandbox_id: "sandbox-a".into(),
-                age: Duration::from_secs(15),
-            },
-            InFlightActivation {
-                kind: InFlightActivationKind::Checkpoint,
-                sandbox_id: "sandbox-b".into(),
-                age: Duration::from_secs(11),
-            },
-        ]
-    );
-
-    let waiting = tokio::spawn({
-        let seal = Arc::clone(&seal);
-        let db = db.clone();
-        async move {
-            seal.seal_and_wait(&db, 5, MAX_SEAL_WAIT, &CancellationToken::new())
-                .await
-        }
-    });
-    tokio::time::advance(Duration::from_secs(1)).await;
-    drop(restore);
-    tokio::time::advance(Duration::from_secs(1)).await;
-    assert!(!waiting.is_finished(), "the checkpoint is still in flight");
-    drop(checkpoint);
-    let outcome = waiting.await.unwrap().unwrap();
-    assert!(outcome.quiesced);
-    assert!(outcome.status.in_flight.is_empty());
-    assert_eq!(
-        outcome.status.sealed.map(|sealed| sealed.epoch),
-        Some(5),
-        "the re-seal under the same epoch only waited"
-    );
-
-    let too_long = seal
-        .seal_and_wait(
-            &db,
-            5,
-            MAX_SEAL_WAIT + Duration::from_millis(1),
-            &CancellationToken::new(),
-        )
-        .await
-        .unwrap_err();
-    assert_eq!(too_long.code(), tonic::Code::InvalidArgument);
 }
 
 /// The token ends its work's in-flight count however the work ends: it

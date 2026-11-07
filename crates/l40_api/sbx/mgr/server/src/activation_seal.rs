@@ -1,5 +1,5 @@
-//! The node's activation seal, and the activation work in flight that a seal
-//! waits for.
+//! The node's activation seal, and the activation work in flight that a
+//! drain waits for.
 //!
 //! While sealed under an epoch, [`ActivationSeal::admit`] refuses every VM
 //! activation: the cold boot of a sandbox, the restore of one from a snapshot
@@ -22,14 +22,9 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use pplx_space_common_core::activation_seal_signals::ACTIVATIONS_SEALED_MARKER;
-use tokio::sync::watch;
-use tokio_util::sync::CancellationToken;
 use tonic::Status;
 
 use crate::db::activation_seal::{ActivationSealRecord, write_activation_seal};
-
-/// The longest a `SealActivations` call waits for in-flight work.
-pub(crate) const MAX_SEAL_WAIT: Duration = Duration::from_secs(300);
 
 /// What a piece of in-flight activation work is.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
@@ -46,15 +41,6 @@ pub(crate) enum InFlightActivationKind {
 }
 
 impl InFlightActivationKind {
-    #[cfg(test)]
-    pub(crate) const ALL: [Self; 5] = [
-        Self::Cold,
-        Self::Restore,
-        Self::ResidentResume,
-        Self::Checkpoint,
-        Self::StopFlush,
-    ];
-
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::Cold => "cold",
@@ -98,20 +84,12 @@ pub(crate) struct InFlightActivation {
     pub(crate) age: Duration,
 }
 
-/// The seal, the admission count and the work in flight, read together.
+/// The seal and the work in flight, read together.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ActivationSealStatus {
     pub(crate) sealed: Option<Sealed>,
-    pub(crate) activations_admitted: u64,
     /// Oldest first.
     pub(crate) in_flight: Vec<InFlightActivation>,
-}
-
-/// What `SealActivations` answers.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct SealOutcome {
-    pub(crate) status: ActivationSealStatus,
-    pub(crate) quiesced: bool,
 }
 
 pub(crate) struct ActivationSeal {
@@ -124,7 +102,6 @@ struct SealState {
     /// failed. An unreadable seal refuses every activation; startup fails on
     /// it before the service serves (see [`ActivationSeal::load_error`]).
     record: Result<Option<ActivationSealRecord>, String>,
-    admitted: u64,
 }
 
 impl SealState {
@@ -146,10 +123,7 @@ impl ActivationSeal {
             error.to_string()
         });
         let seal = Self {
-            state: Mutex::new(SealState {
-                record,
-                admitted: 0,
-            }),
+            state: Mutex::new(SealState { record }),
             in_flight: Arc::new(InFlightRegistry::default()),
         };
         let state = seal.lock_state();
@@ -171,10 +145,7 @@ impl ActivationSeal {
     #[cfg(test)]
     pub(crate) fn unsealed() -> Self {
         Self {
-            state: Mutex::new(SealState {
-                record: Ok(None),
-                admitted: 0,
-            }),
+            state: Mutex::new(SealState { record: Ok(None) }),
             in_flight: Arc::new(InFlightRegistry::default()),
         }
     }
@@ -201,9 +172,8 @@ impl ActivationSeal {
         sandbox_id: &str,
     ) -> Result<ActivationInFlightToken, Status> {
         debug_assert!(kind.is_activation(), "{kind} is not a VM activation");
-        let mut state = self.lock_state();
+        let state = self.lock_state();
         refuse_while_sealed(&state, kind, sandbox_id)?;
-        state.admitted = state.admitted.saturating_add(1);
         // Registered before the state lock is released, so a seal that
         // lands next finds it in flight.
         Ok(self.in_flight.register(kind, sandbox_id))
@@ -215,7 +185,7 @@ impl ActivationSeal {
     /// the operation began after the seal: a checkpoint's resume only undoes
     /// its own pause, and a stop goes on to end its VM, while refusing either
     /// resume would leave the VM paused and the operation unable to finish.
-    /// Counting it lets a seal wait for it.
+    /// Counting it keeps a drain from reporting the node done while it runs.
     pub(crate) fn continuation(
         &self,
         kind: InFlightActivationKind,
@@ -332,71 +302,12 @@ impl ActivationSeal {
         Ok(())
     }
 
-    /// The highest epoch cancelled on this node, if any.
-    #[cfg(test)]
-    pub(crate) fn last_cancelled_epoch(&self) -> Option<u64> {
-        self.lock_state()
-            .record
-            .as_ref()
-            .ok()
-            .copied()
-            .flatten()
-            .and_then(|record| record.last_cancelled_epoch)
-    }
-
     pub(crate) fn status(&self) -> ActivationSealStatus {
-        let state = self.lock_state();
-        let sealed = state.sealed();
-        let activations_admitted = state.admitted;
-        drop(state);
+        let sealed = self.lock_state().sealed();
         ActivationSealStatus {
             sealed,
-            activations_admitted,
             in_flight: self.in_flight.list(),
         }
-    }
-
-    /// Wait up to `timeout` for no activation work to be in flight; whether
-    /// none was when the wait ended.
-    pub(crate) async fn wait_quiesced(&self, timeout: Duration) -> bool {
-        let mut changed = self.in_flight.changed.subscribe();
-        let quiesced = async {
-            while !self.in_flight.is_empty() {
-                if changed.changed().await.is_err() {
-                    break;
-                }
-            }
-        };
-        tokio::time::timeout(timeout, quiesced).await.is_ok() && self.in_flight.is_empty()
-    }
-
-    /// Seal under `epoch` and wait up to `wait` for in-flight work, or until
-    /// `shutdown` is cancelled.
-    pub(crate) async fn seal_and_wait(
-        &self,
-        db: &crate::db::SharedConnection,
-        epoch: u64,
-        wait: Duration,
-        shutdown: &CancellationToken,
-    ) -> Result<SealOutcome, Status> {
-        if wait > MAX_SEAL_WAIT {
-            return Err(Status::invalid_argument(format!(
-                "wait_timeout is at most {}s",
-                MAX_SEAL_WAIT.as_secs()
-            )));
-        }
-        self.seal(db, epoch)?;
-        let quiesced = tokio::select! {
-            quiesced = self.wait_quiesced(wait) => quiesced,
-            // The process is ending, and the persisted seal outlives it;
-            // answer whether anything is in flight now.
-            () = shutdown.cancelled() => true,
-        };
-        let status = self.status();
-        Ok(SealOutcome {
-            quiesced: quiesced && status.in_flight.is_empty(),
-            status,
-        })
     }
 
     /// The service tests' leak check: fails while any activation work is
@@ -470,20 +381,10 @@ struct InFlightEntry {
     started_at: tokio::time::Instant,
 }
 
+#[derive(Default)]
 struct InFlightRegistry {
     entries: Mutex<BTreeMap<u64, InFlightEntry>>,
     next_id: AtomicU64,
-    changed: watch::Sender<()>,
-}
-
-impl Default for InFlightRegistry {
-    fn default() -> Self {
-        Self {
-            entries: Mutex::new(BTreeMap::new()),
-            next_id: AtomicU64::new(0),
-            changed: watch::Sender::new(()),
-        }
-    }
 }
 
 impl InFlightRegistry {
@@ -504,7 +405,6 @@ impl InFlightRegistry {
         );
         emit_in_flight(&entries, kind);
         drop(entries);
-        self.changed.send_replace(());
         ActivationInFlightToken {
             registry: Arc::clone(self),
             id,
@@ -516,12 +416,6 @@ impl InFlightRegistry {
         if let Some(entry) = entries.remove(&id) {
             emit_in_flight(&entries, entry.kind);
         }
-        drop(entries);
-        self.changed.send_replace(());
-    }
-
-    fn is_empty(&self) -> bool {
-        self.lock_entries().is_empty()
     }
 
     fn list(&self) -> Vec<InFlightActivation> {

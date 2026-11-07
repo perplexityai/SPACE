@@ -929,7 +929,6 @@ async fn a_sealed_node_refuses_an_autostarted_pool_claim_before_adopting(
         assert_eq!(response.sandbox_id, donor);
         assert_eq!(created.fixture.row(&donor).unwrap().user.as_str(), OWNER);
     }
-    assert_eq!(service.activation_seal.status().activations_admitted, 0);
     created.shutdown().await;
 }
 

@@ -1829,6 +1829,22 @@ class DrainV2Control(DeadNodeControl, DrainRestoreControl, Protocol):
         """`POST :terminate`; the HTTP status it answered."""
         ...
 
+    def seal_activations(self, node_name: str, epoch: int) -> int | None:
+        """`space-sbxmgr drain-node --epoch` on the worker, under the caller's
+        worker-cordon Lease; the epoch it answers sealed under.
+
+        The seal is recorded on the Lease before it is sent, and a successful
+        unseal clears it, so the Lease's next holder unseals a worker a killed
+        run left sealed.
+        """
+        ...
+
+    def unseal_activations(self, node_name: str, epoch: int) -> int | None:
+        """`space-sbxmgr drain-node --cancel` on the worker; the epoch it is
+        still sealed under, None once unsealed. An unsealed worker stays
+        unsealed."""
+        ...
+
     def mark_drain_test_quarantined(self, node_name: str, sandbox_ids: Sequence[str]) -> None:
         """Have the worker's drain read `sandbox_ids` as quarantined (a test-hooks file)."""
         ...
@@ -1923,67 +1939,6 @@ class StoppedReplacementControl(NodeDrainControl, Protocol):
         since_time: str,
     ) -> list[str]:
         """The worker sandbox-managers' recent lines naming the sandbox. Failure evidence only."""
-        ...
-
-
-@dataclass(frozen=True)
-class InFlightActivationView:
-    """One `in_flight=` line of a `space-sbxmgr` activation-seal answer."""
-
-    kind: str
-    sandbox_id: str
-    age_ms: int
-
-
-@dataclass(frozen=True)
-class ActivationSealReport:
-    """What a worker's sandbox-manager answers about its activation seal.
-
-    The `space-sbxmgr` seal commands' `key=value` lines: `sealed_epoch` is None
-    while unsealed, `quiesced` is set only by `seal-activations`, and
-    `activations_admitted` counts the VM activations the sandbox-manager
-    process admitted since it started.
-    """
-
-    sealed_epoch: int | None
-    sealed_since: str | None
-    activations_admitted: int
-    in_flight: tuple[InFlightActivationView, ...]
-    quiesced: bool | None = None
-
-
-class ActivationSealControl(NodeFaultControl, Protocol):
-    """Kind-only control of one worker's sandbox-manager activation seal.
-
-    The seal is a node-local sandbox-manager RPC with no control-plane route
-    yet, so the harness reaches it through the worker's `space-sbxmgr` in the
-    operator shell. The worker cordon from [`NodeFaultControl`] keeps the
-    scenario's creates and restores on the sealed worker.
-    """
-
-    def sandbox_pool_nodes(self) -> list[str]: ...
-
-    def sandbox_pod_placement(self, sandbox_id: str) -> SandboxPodPlacement | None: ...
-
-    def sandbox_residency(self, sandbox_id: str) -> SandboxResidency: ...
-
-    def seal_activations(
-        self, node_name: str, epoch: int, *, wait_seconds: int
-    ) -> ActivationSealReport:
-        """`space-sbxmgr seal-activations` on the worker, under the caller's worker-cordon Lease.
-
-        The seal is recorded on the Lease before it is sent, and a successful
-        unseal clears it, so the Lease's next holder unseals a worker a killed
-        run left sealed.
-        """
-        ...
-
-    def unseal_activations(self, node_name: str, epoch: int) -> ActivationSealReport:
-        """`space-sbxmgr unseal-activations` on the worker; an unsealed worker stays unsealed."""
-        ...
-
-    def activation_seal_state(self, node_name: str) -> ActivationSealReport:
-        """`space-sbxmgr activation-seal` on the worker; changes nothing."""
         ...
 
 

@@ -19,7 +19,6 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from space_smoke.capabilities import (
-    ActivationSealControl,
     DrainV2Control,
     ConcurrentRestoreControl,
     ConsoleControl,
@@ -103,7 +102,6 @@ from space_smoke.adapters import (
     SUSPEND_ROOTFS_OBJECTS,
     template_received_uuid,
 )
-from space_smoke.activation_seal import ActivationSealAssertions
 from space_smoke.drain_v2 import DrainV2Assertions
 from space_smoke.concurrent_restore import ConcurrentRestoreAssertions
 from space_smoke.node_drain import NodeDrainAssertions
@@ -894,7 +892,6 @@ class CommandSandboxFixture:
     _local_cleanup_control: ColdEvictionControl | None = None
     _encrypted_resuspend_control: EncryptedResuspendControl | None = None
     _stopped_replacement_control: StoppedReplacementControl | None = None
-    _activation_seal_control: ActivationSealControl | None = None
     _drain_v2_control: DrainV2Control | None = None
     _create_sandbox: Callable[[], DurableLifecycleSandbox] | None = None
     _processes: ProcessSandbox | None = None
@@ -941,23 +938,6 @@ class CommandSandboxFixture:
             )
         return StoppedReplacementAssertions(
             self, self._stopped_replacement_control, self._context.scope
-        )
-
-    @property
-    def activation_seal(self) -> ActivationSealAssertions:
-        """Seal the sandbox's worker and judge what its sandbox-manager admits.
-
-        Each access builds fresh assertions that own the scenario's cordon and
-        unseal compensations, so a scenario takes it once.
-        """
-
-        if self._activation_seal_control is None or self._create_sandbox is None:
-            raise SmokeConfigurationError(
-                "activation seal control is only available on the kind backend "
-                "with a native sandbox collection"
-            )
-        return ActivationSealAssertions(
-            self, self._activation_seal_control, self._create_sandbox, self._context.scope
         )
 
     @property

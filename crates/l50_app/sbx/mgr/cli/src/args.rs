@@ -333,24 +333,17 @@ pub(super) enum Commands {
     List,
     /// Clean up dead sandboxes (mark as failed)
     Cleanup,
-    /// Seal this node's VM activations under an epoch and wait for the
-    /// activation work in flight; prints one `key=value` per line
-    SealActivations {
-        /// Nonzero seal epoch
+    /// Drain this node under an epoch: seal its VM activations and make
+    /// every resident durable; prints the node's report, one `key=value` per
+    /// line
+    DrainNode {
+        /// Nonzero drain epoch; epochs only move forward
         #[arg(long)]
         epoch: u64,
-        /// Seconds to wait for in-flight activation work (at most 300)
-        #[arg(long, default_value_t = 0)]
-        wait_secs: u64,
-    },
-    /// Clear the activation seal if it is under this epoch
-    UnsealActivations {
-        /// The epoch the node is sealed under
+        /// Cancel the drain under this epoch instead, unsealing the node
         #[arg(long)]
-        epoch: u64,
+        cancel: bool,
     },
-    /// Show the activation seal and the activation work in flight
-    ActivationSeal,
     /// Show per-sandbox resource stats (network, cgroup CPU/memory/PIDs)
     Stats {
         /// Sandbox ID, long UUID prefix, or short label

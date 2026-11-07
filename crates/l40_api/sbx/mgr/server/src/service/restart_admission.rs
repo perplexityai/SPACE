@@ -216,11 +216,6 @@ restart_rpcs! {
     SandboxListAutoLifecycleDeleteReceipts => ("/space.sandbox.manager.v1.SandboxManager/ListAutoLifecycleDeleteReceipts", ReadOnlyWithNarrowStateWrites),
     SandboxAcknowledgeAutoLifecycleDeleteReceipts => ("/space.sandbox.manager.v1.SandboxManager/AcknowledgeAutoLifecycleDeleteReceipts", StateWriter),
     SandboxListPendingLocalBackups => ("/space.sandbox.manager.v1.SandboxManager/ListPendingLocalBackups", ReadOnly),
-    // The seal writes only its own row, never a sandbox's, and a seal's wait
-    // for in-flight work must not hold a restart drain open.
-    SandboxSealActivations => ("/space.sandbox.manager.v1.SandboxManager/SealActivations", ReadOnlyWithNarrowStateWrites),
-    SandboxUnsealActivations => ("/space.sandbox.manager.v1.SandboxManager/UnsealActivations", ReadOnlyWithNarrowStateWrites),
-    SandboxActivationSealState => ("/space.sandbox.manager.v1.SandboxManager/ActivationSealState", ReadOnly),
     // The drain's own writes are the seal row and its evacuation record; each
     // suspend or upload it starts takes its own state-writer lease.
     SandboxDrainNode => ("/space.sandbox.manager.v1.SandboxManager/DrainNode", ReadOnlyWithNarrowStateWrites),

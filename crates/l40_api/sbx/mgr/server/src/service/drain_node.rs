@@ -405,6 +405,12 @@ pub(super) fn classify_orphan_page(
 }
 
 impl SandboxManagerService {
+    /// Why the seal could not be read at startup; `run` refuses to serve
+    /// then, so only a service built some other way can answer with it.
+    pub fn activation_seal_load_error(&self) -> Option<String> {
+        self.activation_seal.load_error()
+    }
+
     pub(super) async fn drain_node(
         &self,
         request: Request<DrainNodeRequest>,
@@ -809,11 +815,18 @@ fn report(
     debris: Vec<String>,
     done: bool,
 ) -> DrainNodeResponse {
-    let wire = super::grpc_activation_seal::status_to_wire(status.clone());
     DrainNodeResponse {
-        sealed_epoch: wire.sealed_epoch,
-        sealed_since: wire.sealed_since,
-        in_flight: wire.in_flight,
+        sealed_epoch: status.sealed.map(|sealed| sealed.epoch),
+        sealed_since: status.sealed.map(sealed_since_to_wire),
+        in_flight: status
+            .in_flight
+            .iter()
+            .map(|in_flight| crate::proto::InFlightActivation {
+                kind: in_flight_kind_to_wire(in_flight.kind) as i32,
+                sandbox_id: in_flight.sandbox_id.clone(),
+                age: prost_types::Duration::try_from(in_flight.age).ok(),
+            })
+            .collect(),
         evacuated: plan
             .evacuated
             .into_iter()
@@ -835,6 +848,29 @@ fn report(
             .collect(),
         debris,
         done,
+    }
+}
+
+fn sealed_since_to_wire(sealed: crate::activation_seal::Sealed) -> prost_types::Timestamp {
+    // Below `i64::MAX` milliseconds by the store's write.
+    let since_ms = i64::try_from(sealed.since_ms).unwrap_or(i64::MAX);
+    prost_types::Timestamp {
+        seconds: since_ms.div_euclid(1_000),
+        nanos: i32::try_from(since_ms.rem_euclid(1_000) * 1_000_000).unwrap_or(0),
+    }
+}
+
+const fn in_flight_kind_to_wire(
+    kind: crate::activation_seal::InFlightActivationKind,
+) -> crate::proto::InFlightActivationKind {
+    use crate::activation_seal::InFlightActivationKind as Kind;
+    use crate::proto::InFlightActivationKind as Wire;
+    match kind {
+        Kind::Cold => Wire::Cold,
+        Kind::Restore => Wire::Restore,
+        Kind::ResidentResume => Wire::ResidentResume,
+        Kind::Checkpoint => Wire::Checkpoint,
+        Kind::StopFlush => Wire::StopFlush,
     }
 }
 

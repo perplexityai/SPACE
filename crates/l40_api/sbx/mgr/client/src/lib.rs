@@ -136,22 +136,6 @@ pub async fn connect_for_memory_clone(
     Ok(MemoryCloneClient(client_from_channel(channel)))
 }
 
-/// Connect with each request allowed `request_timeout` instead of the shared
-/// budget, for a call that waits on the server longer than [`connect`]'s
-/// requests may.
-pub async fn connect_with_request_timeout(
-    request_timeout: std::time::Duration,
-) -> Result<SandboxManagerGrpcClient, ConnectError> {
-    let channel = pplx_space_common_grpc::connect_uds_channel_with_endpoint_with_retry(
-        "sandbox-manager",
-        Path::new(SOCKET_PATH),
-        configured_endpoint()?.timeout(request_timeout),
-        DEFAULT_CONNECT_RETRY_POLICY,
-    )
-    .await?;
-    Ok(client_from_channel(channel))
-}
-
 /// Dial a fresh, uncached connection to the sandbox-manager socket.
 ///
 /// During a sandbox-manager restart handoff, a shared channel's established
