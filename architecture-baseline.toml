@@ -67,7 +67,6 @@ pplx-space-cluster-controller-server = [
   "pplx-space-common-core/sqlx",
 ]
 pplx-space-common-core = [
-  "pplx-space-accounts/rusqlite",
   "pplx-space-accounts/sqlx",
   "pplx-space-k8s-ids/sqlx",
   "pplx-space-semver/sqlx",
@@ -78,14 +77,8 @@ pplx-space-credmgr = [
 pplx-space-internal-api-server = [
   "pplx-space-common-core/sqlx",
 ]
-pplx-space-node-runtime-manager = [
-  "pplx-space-common-core/rusqlite",
-]
 pplx-space-snapshot-retention = [
   "pplx-space-common-core/sqlx",
-]
-pplx-space-volmgr = [
-  "pplx-space-common-core/rusqlite",
 ]
 
 [layers.dev_direction]
@@ -123,7 +116,6 @@ pplx-space-spaced-common = [
 
 [layers.storage_access]
 pplx-space-accounts = [
-  "rusqlite",
   "sqlx",
 ]
 pplx-space-api = [
@@ -145,7 +137,6 @@ pplx-space-cluster-reconciler = [
   "sqlx",
 ]
 pplx-space-common-core = [
-  "rusqlite",
   "sqlx",
 ]
 pplx-space-credmgr = [
