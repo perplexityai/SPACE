@@ -70,7 +70,7 @@ async fn captures_obey_the_startup_settings_not_the_cluster_policy() {
 
 #[test]
 fn legacy_capture_cannot_bypass_non_default_environment_binding() {
-    use pplx_space_common_core::types::Digest;
+    use pplx_space_content_digest::Digest;
     use pplx_space_cpu_arch::Arch;
     let environments =
         pplx_space_node_runtime_core::catalog::CompiledEnvironment::for_architecture(Arch::X86_64)

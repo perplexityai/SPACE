@@ -2,10 +2,10 @@
 
 use pplx_space_common_core::types::{
     ArtifactComponentKind, ArtifactComponentMetadata, ArtifactComponentRole, ArtifactFormat,
-    ArtifactVersion, Digest, ExecutionMetadata, GuestOperatingSystem, GuestPlatform,
-    RuntimeIdentity, RuntimeKind, RuntimeVersion, StateFormatIdentity, StateFormatName,
-    StateFormatVersion,
+    ArtifactVersion, ExecutionMetadata, GuestOperatingSystem, GuestPlatform, RuntimeIdentity,
+    RuntimeKind, RuntimeVersion, StateFormatIdentity, StateFormatName, StateFormatVersion,
 };
+use pplx_space_content_digest::Digest;
 use pplx_space_cpu_arch::Arch;
 
 pub mod environment;
@@ -52,7 +52,7 @@ pub enum ExecutionProtoError {
     #[error("invalid artifact version: {0}")]
     ArtifactVersion(#[from] pplx_space_common_core::types::ArtifactVersionParseError),
     #[error("invalid artifact digest: {0}")]
-    Digest(#[from] pplx_space_common_core::types::DigestParseError),
+    Digest(#[from] pplx_space_content_digest::DigestParseError),
     #[error("invalid artifact format: {0}")]
     ArtifactFormat(#[from] pplx_space_common_core::types::ArtifactFormatParseError),
 }

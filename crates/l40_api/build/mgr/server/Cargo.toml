@@ -52,6 +52,7 @@ pplx-space-observability = { workspace = true }
 pplx-space-rpc-auth = { workspace = true }
 
 [dev-dependencies]
+pplx-space-content-digest = { workspace = true, features = ["serde"] }
 rcgen = { workspace = true, features = ["aws_lc_rs", "pem"] }
 rustls = { workspace = true, features = ["aws_lc_rs"] }
 sqlx = { workspace = true, features = ["macros", "migrate"] }

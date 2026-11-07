@@ -2,10 +2,11 @@ use pplx_space_accounts::OrgId;
 use pplx_space_common_core::{
     sql,
     types::{
-        ContentHash, RuntimeKind, TemplateArtifactDigest, TemplateDesiredState, TemplateName,
-        TemplateReference, TemplateSelector, TemplateTag, TemplateVisibility,
+        RuntimeKind, TemplateArtifactDigest, TemplateDesiredState, TemplateName, TemplateReference,
+        TemplateSelector, TemplateTag, TemplateVisibility,
     },
 };
+use pplx_space_content_digest::ContentHash;
 use sqlx::PgExecutor;
 use uuid::Uuid;
 
@@ -106,7 +107,7 @@ pub(crate) enum ResolveBaseError {
     #[error("resolve base template: {0}")]
     Database(#[from] sqlx::Error),
     #[error("invalid stored base digest: {0}")]
-    Digest(#[from] pplx_space_common_core::types::DigestParseError),
+    Digest(#[from] pplx_space_content_digest::DigestParseError),
 }
 
 pub(crate) async fn resolve_base(

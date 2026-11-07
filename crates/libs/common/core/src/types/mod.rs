@@ -92,17 +92,15 @@ pub use size::*;
 pub use snapshot::*;
 pub use subject::{SubjectId, SubjectIdParseError, SubjectKind};
 pub use template::{
-    BuildRunId, BuildRunIdParseError, ContentHash, DEFAULT_DIGEST_PREFIX_HEX_LEN,
-    DEFAULT_TEMPLATE_TAG, Digest, DigestParseError, DigestPrefix, DigestPrefixParseError,
-    DigestPrefixResolveError, HashAlg, HashAlgParseError, MIN_DIGEST_PREFIX_HEX_LEN,
-    ORPHANED_SANDBOX_TEMPLATE, OwnerType, ResolvedTemplateReference, ResolvedTemplateVariant,
-    RuntimeScopedTemplateReference, SystemTemplate, SystemTemplateParseError,
-    TemplateArtifactDigest, TemplateArtifactDigestPrefix, TemplateBuildId, TemplateBuildJobState,
-    TemplateBuildJobStateParseError, TemplateBuildState, TemplateCachePartition,
-    TemplateDesiredState, TemplateDesiredStateParseError, TemplateId, TemplateIndexDigest,
-    TemplateIndexDigestPrefix, TemplateName, TemplateParseError, TemplateReference,
-    TemplateReferenceParseError, TemplateReferenceResolveError, TemplateSelector, TemplateTag,
-    TemplateTagParseError, TemplateVisibility, TemplateVisibilityParseError,
+    BuildRunId, BuildRunIdParseError, DEFAULT_TEMPLATE_TAG, ORPHANED_SANDBOX_TEMPLATE, OwnerType,
+    ResolvedTemplateReference, ResolvedTemplateVariant, RuntimeScopedTemplateReference,
+    SystemTemplate, SystemTemplateParseError, TemplateArtifactDigest, TemplateArtifactDigestPrefix,
+    TemplateBuildId, TemplateBuildJobState, TemplateBuildJobStateParseError, TemplateBuildState,
+    TemplateCachePartition, TemplateDesiredState, TemplateDesiredStateParseError, TemplateId,
+    TemplateIndexDigest, TemplateIndexDigestPrefix, TemplateName, TemplateParseError,
+    TemplateReference, TemplateReferenceParseError, TemplateReferenceResolveError,
+    TemplateSelector, TemplateTag, TemplateTagParseError, TemplateVisibility,
+    TemplateVisibilityParseError,
 };
 pub use time::*;
 pub use transport_vsock::*;

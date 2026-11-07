@@ -1,8 +1,7 @@
 use pplx_space_common_core::types::SandboxId;
 
-use pplx_space_common_core::types::{
-    ContentHash, DiskIoLimits, MemorySize, TemplateName, VcpuCount,
-};
+use pplx_space_common_core::types::{DiskIoLimits, MemorySize, TemplateName, VcpuCount};
+use pplx_space_content_digest::ContentHash;
 use time::OffsetDateTime;
 use uuid::Uuid;
 

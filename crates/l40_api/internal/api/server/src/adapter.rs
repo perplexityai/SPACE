@@ -528,7 +528,7 @@ impl ClusterApi for ClusterApiService {
         let bare_hash = hash
             .strip_prefix(&format!(
                 "{}:",
-                pplx_space_common_core::types::HashAlg::Sha256.as_str()
+                pplx_space_content_digest::HashAlg::Sha256.as_str()
             ))
             .unwrap_or(&hash)
             .to_string();

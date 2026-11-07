@@ -29,7 +29,8 @@ fn stamp_payload_written_before_partitions_is_a_legacy_job() {
 
 #[test]
 fn stamp_payload_round_trips_an_environment_partition() {
-    use pplx_space_common_core::types::{Digest, EnvironmentReference, TemplateCachePartition};
+    use pplx_space_common_core::types::{EnvironmentReference, TemplateCachePartition};
+    use pplx_space_content_digest::Digest;
     let environment = EnvironmentReference::new(Digest::sha256([9; 32]));
     let payload = StampPayload::new(
         "seed",

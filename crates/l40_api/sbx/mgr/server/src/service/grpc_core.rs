@@ -1289,7 +1289,7 @@ fn project_template_catalog(
                 build.name
             ))
         })?;
-        hash.parse::<pplx_space_common_core::types::ContentHash>()
+        hash.parse::<pplx_space_content_digest::ContentHash>()
             .map_err(|error| {
                 Status::data_loss(format!("invalid template catalog digest: {error}"))
             })?;

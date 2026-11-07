@@ -230,7 +230,7 @@ pub(super) enum Commands {
     Create {
         /// Exact published template content digest.
         #[arg(long)]
-        content_hash: Option<pplx_space_common_core::types::ContentHash>,
+        content_hash: Option<pplx_space_content_digest::ContentHash>,
         /// Exact environment; must match the template's immutable binding.
         #[arg(long)]
         environment: Option<pplx_space_common_core::types::EnvironmentReference>,

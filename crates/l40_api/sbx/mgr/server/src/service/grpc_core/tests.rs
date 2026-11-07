@@ -1231,7 +1231,8 @@ fn template_catalog_preserves_owner_identity_with_corrupt_supplemental_metadata(
 /// cache partition's dir.
 #[test]
 fn template_catalog_reads_a_twin_s_metadata_from_its_partition() {
-    use pplx_space_common_core::types::{Digest, EnvironmentReference, TemplateCachePartition};
+    use pplx_space_common_core::types::{EnvironmentReference, TemplateCachePartition};
+    use pplx_space_content_digest::Digest;
     let cache = tempfile::tempdir().unwrap();
     let hash = format!("sha256:{}", "a".repeat(64));
     let twin = EnvironmentReference::new(Digest::sha256([2; 32]));

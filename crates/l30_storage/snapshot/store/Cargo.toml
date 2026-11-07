@@ -28,6 +28,7 @@ uuid = { workspace = true }
 # internal
 pplx-space-accounts = { workspace = true, features = ["serde", "sqlx"] }
 pplx-space-common-core = { workspace = true, features = ["serde", "sqlx"] }
+pplx-space-content-digest = { workspace = true, features = ["serde"] }
 pplx-space-sandbox-portability = { workspace = true }
 
 [dev-dependencies]

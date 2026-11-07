@@ -1,5 +1,6 @@
 use super::*;
-use pplx_space_common_core::types::{ContentHash, Digest, EnvironmentReference, TemplateName};
+use pplx_space_common_core::types::{EnvironmentReference, TemplateName};
+use pplx_space_content_digest::{ContentHash, Digest};
 use pplx_space_template_mgr_client::proto::RegisterTemplateResponse;
 
 fn hash() -> String {

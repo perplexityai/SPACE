@@ -11,9 +11,10 @@ use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use pplx_space_accounts::SandboxOwner;
 use pplx_space_cluster_pool::{PoolSlot, PoolSlotState};
 use pplx_space_common_core::types::{
-    ContentHash, Digest, MemorySize, NodeGroup, NodeGroupId, NodeGroupName, NodeGroupPolicy,
-    TemplateCompatSpec, TemplateName, TemplateVisibility, VcpuCount,
+    MemorySize, NodeGroup, NodeGroupId, NodeGroupName, NodeGroupPolicy, TemplateCompatSpec,
+    TemplateName, TemplateVisibility, VcpuCount,
 };
+use pplx_space_content_digest::{ContentHash, Digest};
 use pplx_space_policy_authority::PolicyAuthority;
 use pplx_space_sandbox_pod::{
     DEFAULT_SANDBOX_INTERNAL_CONTROL_TOKEN_KEY, DEFAULT_SANDBOX_INTERNAL_SECRET_NAME,

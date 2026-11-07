@@ -25,9 +25,10 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
 use pplx_space_common_core::types::{
-    ArtifactComponentKind, ArtifactComponentRole, ArtifactVersion, Digest, RuntimeIdentity,
-    RuntimeKind, RuntimeVersion, StateFormatIdentity,
+    ArtifactComponentKind, ArtifactComponentRole, ArtifactVersion, RuntimeIdentity, RuntimeKind,
+    RuntimeVersion, StateFormatIdentity,
 };
+use pplx_space_content_digest::Digest;
 use pplx_space_cpu_arch::Arch;
 use pplx_space_host_layout::paths;
 use sha2::{Digest as _, Sha256};

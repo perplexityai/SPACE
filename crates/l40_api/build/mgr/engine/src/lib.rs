@@ -27,9 +27,8 @@ use std::time::{Duration, Instant};
 
 pub use crate::metrics::TemplateBuildErrorKind;
 use pplx_space_accounts::BUILDER_SANDBOX_OWNER;
-use pplx_space_common_core::types::{
-    ContentHash, DEFAULT_GUEST_USER, DEFAULT_TEMPLATE_TAG, TemplateBuildId,
-};
+use pplx_space_common_core::types::{DEFAULT_GUEST_USER, DEFAULT_TEMPLATE_TAG, TemplateBuildId};
+use pplx_space_content_digest::ContentHash;
 use pplx_space_host_layout::identities::group_names;
 pub use pplx_space_net_common::NetworkPolicyV1;
 use pplx_space_net_common::proto::NetworkPolicyV1 as NetworkPolicyV1Proto;

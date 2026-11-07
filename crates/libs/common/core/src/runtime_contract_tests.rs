@@ -13,7 +13,7 @@ fn template_cache_paths_preserve_space_layout() {
         "/space/cache/firecracker/templates/seed/abc"
     );
     let environment =
-        crate::types::EnvironmentReference::new(crate::types::Digest::sha256([2; 32]));
+        crate::types::EnvironmentReference::new(pplx_space_content_digest::Digest::sha256([2; 32]));
     assert_eq!(
         crate::types::template_snapshot_dir(
             "seed",

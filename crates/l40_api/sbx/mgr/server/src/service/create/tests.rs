@@ -150,9 +150,9 @@ async fn restore_selects_its_consumer_from_the_checkpoint(
 ) {
     use crate::node_manager_transport::fake::FakeNodeManager;
     use pplx_space_common_core::types::{
-        ContentHash, RuntimeKind, SandboxArtifactMetadata, SandboxRuntimeLabel,
-        SnapshotExecutionMetadata,
+        RuntimeKind, SandboxArtifactMetadata, SandboxRuntimeLabel, SnapshotExecutionMetadata,
     };
+    use pplx_space_content_digest::ContentHash;
     use pplx_space_node_mgr_client::proto::{
         AllocateResponse, ExecutionEnvironmentSelection, NetworkPoolStatusResponse,
         ReleaseResponse, ResolveExecutionEnvironmentRequest, ResolveExecutionEnvironmentResponse,
@@ -325,9 +325,9 @@ async fn restore_selects_its_consumer_from_the_checkpoint(
 async fn a_runtime_upgrade_fence_refuses_a_concurrent_restore_before_allocation() {
     use crate::node_manager_transport::fake::FakeNodeManager;
     use pplx_space_common_core::types::{
-        ContentHash, RuntimeKind, SandboxArtifactMetadata, SandboxRuntimeLabel,
-        SnapshotExecutionMetadata,
+        RuntimeKind, SandboxArtifactMetadata, SandboxRuntimeLabel, SnapshotExecutionMetadata,
     };
+    use pplx_space_content_digest::ContentHash;
     use pplx_space_cpu_arch::Arch;
     use pplx_space_node_mgr_client::proto::{
         AllocateResponse, ExecutionEnvironmentSelection, NetworkPoolStatusResponse,
@@ -507,9 +507,10 @@ async fn suspend_restore_is_admitted_before_the_vm_launches() {
     use crate::node_manager_transport::fake::FakeNodeManager;
     use crate::service::start_support::{ActivationAdmissionKind, REQUESTED_VM_ACTIVATIONS};
     use pplx_space_common_core::types::{
-        AutoLifecyclePolicy, ContentHash, RuntimeKind, SandboxArtifactMetadata,
-        SandboxRuntimeLabel, SnapshotExecutionMetadata,
+        AutoLifecyclePolicy, RuntimeKind, SandboxArtifactMetadata, SandboxRuntimeLabel,
+        SnapshotExecutionMetadata,
     };
+    use pplx_space_content_digest::ContentHash;
     use pplx_space_cpu_arch::Arch;
     use pplx_space_node_mgr_client::proto::{
         AllocateRequest, AllocateResponse, ExecutionEnvironmentSelection, LaunchSandboxResponse,

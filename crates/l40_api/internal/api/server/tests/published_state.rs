@@ -981,8 +981,9 @@ async fn quarantine_recovery_observation_persists_and_clears_without_central_san
 async fn publish_updates_observed_state_without_writing_component_rows() -> TestResult {
     use pplx_space_common_core::types::{
         ArtifactComponentKind, ArtifactComponentMetadata, ArtifactComponentRole, ArtifactFormat,
-        ArtifactVersion, Digest,
+        ArtifactVersion,
     };
+    use pplx_space_content_digest::Digest;
 
     let Some(db) = try_pg_test_db().await? else {
         return Ok(());

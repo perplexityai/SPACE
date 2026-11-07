@@ -11,10 +11,11 @@ use std::fmt;
 use std::str::FromStr;
 
 use pplx_space_common_core::types::{
-    ContentHash, DEFAULT_TEMPLATE_TAG, Digest, RuntimeKind, TemplateArtifactDigest,
-    TemplateArtifactDigestPrefix, TemplateIndexDigest, TemplateName, TemplateReference,
-    TemplateReferenceParseError, TemplateSelector, TemplateTag,
+    DEFAULT_TEMPLATE_TAG, RuntimeKind, TemplateArtifactDigest, TemplateArtifactDigestPrefix,
+    TemplateIndexDigest, TemplateName, TemplateReference, TemplateReferenceParseError,
+    TemplateSelector, TemplateTag,
 };
+use pplx_space_content_digest::{ContentHash, Digest};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ResolvedTemplateSelection {

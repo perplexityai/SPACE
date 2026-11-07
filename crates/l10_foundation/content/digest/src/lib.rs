@@ -3,9 +3,9 @@
 //! errors and prefix-length constants.
 //!
 //! These are generic digest values; the template-specific wrappers live in
-//! `pplx-space-common-core`, which also re-exports these types at their former
-//! paths. Template, execution, object-store and archive code all name them, so
-//! they live in their own crate rather than in common-core's template module.
+//! `pplx-space-common-core`. Template, execution, object-store and archive code
+//! all name them, so they live in their own crate rather than in common-core's
+//! template module: import them from here.
 
 use std::fmt;
 use std::str::FromStr;

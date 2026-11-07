@@ -12,6 +12,7 @@ workspace = true
 
 [dependencies]
 pplx-space-common-core = { workspace = true }
+pplx-space-content-digest = { workspace = true }
 pplx-space-net-common = { workspace = true }
 regex = { workspace = true, optional = true }
 schemars = { workspace = true, optional = true }
@@ -26,4 +27,4 @@ uuid = { workspace = true, features = ["v7"] }
 [features]
 default = []
 schema = ["dep:regex", "dep:schemars", "serde"]
-serde = ["dep:serde", "pplx-space-common-core/serde", "pplx-space-net-common/serde"]
+serde = ["dep:serde", "pplx-space-common-core/serde", "pplx-space-content-digest/serde", "pplx-space-net-common/serde"]

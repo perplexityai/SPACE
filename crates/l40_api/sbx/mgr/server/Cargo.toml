@@ -76,6 +76,7 @@ pplx-space-file-io = { workspace = true }
 pplx-space-common-jobs = { workspace = true }
 pplx-space-lru-reaper = { workspace = true }
 pplx-space-env-vars = { workspace = true }
+pplx-space-content-digest = { workspace = true, features = ["serde"] }
 pplx-space-cpu-arch = { workspace = true, features = ["serde"] }
 pplx-space-sandbox-grpc = { workspace = true }
 pplx-space-credential-injection = { workspace = true }

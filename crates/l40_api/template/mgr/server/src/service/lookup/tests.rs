@@ -2,7 +2,8 @@
 /// can't be listed is an error, never read as none.
 #[test]
 fn cached_template_partitions_report_a_dir_they_cannot_list() {
-    use pplx_space_common_core::types::{Digest, EnvironmentReference, TemplateCachePartition};
+    use pplx_space_common_core::types::{EnvironmentReference, TemplateCachePartition};
+    use pplx_space_content_digest::Digest;
     let root = tempfile::tempdir().unwrap();
     let hash = format!("sha256:{}", "b".repeat(64));
     assert!(

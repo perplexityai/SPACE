@@ -1,4 +1,5 @@
 use super::*;
+use pplx_space_content_digest::Digest;
 
 #[test]
 fn compiled_pins_produce_the_e0_golden_definition() {

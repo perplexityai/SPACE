@@ -115,7 +115,7 @@ impl NodeManagerService {
             .reference
             .map(|reference| reference.parse())
             .transpose()
-            .map_err(|error: pplx_space_common_core::types::DigestParseError| {
+            .map_err(|error: pplx_space_content_digest::DigestParseError| {
                 Status::invalid_argument(error.to_string())
             })?;
         let (definition, execution) = self
@@ -307,8 +307,8 @@ const MAX_ARTIFACT_FILE_BYTES: u64 = 512 * 1024 * 1024;
 /// An artifact a request names.
 #[derive(Clone, Debug)]
 enum Artifact {
-    Release(RuntimeIdentity, pplx_space_common_core::types::Digest),
-    Kernel(ArtifactVersion, pplx_space_common_core::types::Digest),
+    Release(RuntimeIdentity, pplx_space_content_digest::Digest),
+    Kernel(ArtifactVersion, pplx_space_content_digest::Digest),
     Boot(ComponentIdentity),
 }
 

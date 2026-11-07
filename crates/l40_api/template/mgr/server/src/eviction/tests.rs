@@ -2224,7 +2224,7 @@ fn twin_build(hash: &str, size: u64, used: u64) -> BuildSnapshot {
     BuildSnapshot {
         cache_partition: crate::db::TemplateCachePartition::Environment(
             pplx_space_common_core::types::EnvironmentReference::new(
-                pplx_space_common_core::types::Digest::sha256([2; 32]),
+                pplx_space_content_digest::Digest::sha256([2; 32]),
             ),
         ),
         ..build("seed", hash, size, 0, used)

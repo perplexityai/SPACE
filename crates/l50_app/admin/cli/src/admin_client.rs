@@ -299,7 +299,7 @@ pub(crate) enum CliError {
     Build {
         job_id: String,
         state: pplx_space_common_core::types::TemplateBuildJobState,
-        content_hash: Option<pplx_space_common_core::types::ContentHash>,
+        content_hash: Option<pplx_space_content_digest::ContentHash>,
         error: String,
     },
 }

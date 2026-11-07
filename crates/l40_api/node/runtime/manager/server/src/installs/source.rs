@@ -17,9 +17,10 @@ use std::time::Duration;
 
 use futures_util::Stream;
 use pplx_space_common_core::types::{
-    ArtifactVersion, Digest, RuntimeIdentity, RuntimeKind, RuntimeVersion,
-    RuntimeVersionParseError, StorageUri,
+    ArtifactVersion, RuntimeIdentity, RuntimeKind, RuntimeVersion, RuntimeVersionParseError,
+    StorageUri,
 };
+use pplx_space_content_digest::Digest;
 use pplx_space_cpu_arch::Arch;
 
 /// Firecracker's public CI artifact bucket. Path-style, because the bucket's

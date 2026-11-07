@@ -9,10 +9,11 @@ use pplx_space_accounts::{
 };
 use pplx_space_common_core::types::template_build_dir;
 use pplx_space_common_core::types::{
-    ContentHash, RUNTIME_FIRECRACKER_ALIAS, StorageUri, TEMPLATE_ROOTFS_ZSTD_CODEC,
-    TEMPLATE_ROOTFS_ZSTD_FILE, TEMPLATE_ROOTFS_ZSTD_LEVEL, TemplateArtifact, TemplateName,
-    template_object_key, template_object_prefix,
+    RUNTIME_FIRECRACKER_ALIAS, StorageUri, TEMPLATE_ROOTFS_ZSTD_CODEC, TEMPLATE_ROOTFS_ZSTD_FILE,
+    TEMPLATE_ROOTFS_ZSTD_LEVEL, TemplateArtifact, TemplateName, template_object_key,
+    template_object_prefix,
 };
+use pplx_space_content_digest::ContentHash;
 use pplx_space_node_api_client::cluster::{
     AuthenticatedClusterApiClient, ConnectClusterApiError,
     connect_from_env as connect_cluster_api_from_env,
@@ -100,7 +101,7 @@ pub enum PublishError {
     #[error(transparent)]
     InvalidTemplateName(#[from] pplx_space_common_core::types::TemplateParseError),
     #[error(transparent)]
-    InvalidContentHash(#[from] pplx_space_common_core::types::DigestParseError),
+    InvalidContentHash(#[from] pplx_space_content_digest::DigestParseError),
     #[error(transparent)]
     ObjectStoreConfig(#[from] ObjectStoreConfigError),
     #[error("required build artifact is missing: {path}")]

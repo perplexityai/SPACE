@@ -21,8 +21,9 @@ use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 
 use pplx_space_common_core::types::{
-    ArtifactVersion, Digest, DigestPrefix, RuntimeIdentity, RuntimeKind, RuntimeVersion,
+    ArtifactVersion, RuntimeIdentity, RuntimeKind, RuntimeVersion,
 };
+use pplx_space_content_digest::{Digest, DigestPrefix};
 use pplx_space_cpu_arch::Arch;
 use sha2::{Digest as _, Sha256};
 

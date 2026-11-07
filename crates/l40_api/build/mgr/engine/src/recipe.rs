@@ -4,9 +4,10 @@ use std::str::FromStr;
 use oci_spec::distribution::{ParseError as OciReferenceParseError, Reference as OciReference};
 use pplx_space_build_mgr_client::proto as build_proto;
 use pplx_space_common_core::types::{
-    ArtifactVersion, ArtifactVersionParseError, Digest, DigestParseError, EnvKey, EnvMap,
-    EnvParseError, TemplateReference, TemplateReferenceParseError, TemplateSelector,
+    ArtifactVersion, ArtifactVersionParseError, EnvKey, EnvMap, EnvParseError, TemplateReference,
+    TemplateReferenceParseError, TemplateSelector,
 };
+use pplx_space_content_digest::{Digest, DigestParseError};
 use pplx_space_template_runtime::{TemplateRuntime, TemplateRuntimeError};
 use serde::Deserialize;
 

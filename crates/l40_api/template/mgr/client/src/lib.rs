@@ -72,7 +72,7 @@ impl proto::TemplateFullInfo {
         &self,
     ) -> Result<
         Option<pplx_space_common_core::types::EnvironmentReference>,
-        pplx_space_common_core::types::DigestParseError,
+        pplx_space_content_digest::DigestParseError,
     > {
         self.execution
             .as_ref()

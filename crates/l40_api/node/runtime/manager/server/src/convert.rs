@@ -40,7 +40,7 @@ pub(crate) fn mark_managed_store(
 
 pub(crate) fn runtime_identity(
     runtime: &pplx_space_common_core::types::RuntimeIdentity,
-    digest: pplx_space_common_core::types::Digest,
+    digest: pplx_space_content_digest::Digest,
 ) -> proto::ArtifactIdentity {
     proto::ArtifactIdentity {
         artifact: Some(proto::artifact_identity::Artifact::Runtime(

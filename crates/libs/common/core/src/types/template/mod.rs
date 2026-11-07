@@ -57,11 +57,6 @@ pub use digest::{
     TemplateArtifactDigest, TemplateArtifactDigestPrefix, TemplateIndexDigest,
     TemplateIndexDigestPrefix,
 };
-pub use hash::{
-    ContentHash, DEFAULT_DIGEST_PREFIX_HEX_LEN, Digest, DigestParseError, DigestPrefix,
-    DigestPrefixParseError, DigestPrefixResolveError, HashAlg, HashAlgParseError,
-    MIN_DIGEST_PREFIX_HEX_LEN,
-};
 pub use identity::{
     DEFAULT_TEMPLATE_TAG, ORPHANED_SANDBOX_TEMPLATE, TemplateId, TemplateName, TemplateParseError,
     TemplateTag, TemplateTagParseError,

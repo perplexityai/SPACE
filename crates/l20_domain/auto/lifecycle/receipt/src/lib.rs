@@ -12,8 +12,8 @@ use std::{fmt, str::FromStr, time::Duration};
 
 use pplx_space_common_core::types::{
     AutoLifecycleConditionSet, AutoLifecyclePolicy, AutoLifecycleStage, AutoLifecycleWakePolicy,
-    Digest, DigestParseError,
 };
+use pplx_space_content_digest::{Digest, DigestParseError};
 use sha2::{Digest as _, Sha256};
 
 const AUTO_LIFECYCLE_POLICY_FINGERPRINT_VERSION: &str = "v1";

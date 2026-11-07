@@ -28,4 +28,5 @@ pplx-space-policy-authority = { workspace = true }
 
 [dev-dependencies]
 insta = { workspace = true, features = ["yaml"] }
+pplx-space-content-digest = { workspace = true }
 pplx-space-net-common = { workspace = true, features = ["serde"] }

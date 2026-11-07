@@ -17,5 +17,6 @@ tracing = { workspace = true }
 pplx-space-common-core = { workspace = true }
 
 [dev-dependencies]
+pplx-space-content-digest = { workspace = true }
 pplx-space-cpu-arch = { workspace = true }
 tracing-subscriber = { workspace = true }

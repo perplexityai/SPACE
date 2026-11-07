@@ -13,7 +13,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use pplx_space_common_core::types::{ComponentIdentity, Digest, RuntimeIdentity};
+use pplx_space_common_core::types::{ComponentIdentity, RuntimeIdentity};
+use pplx_space_content_digest::Digest;
 use pplx_space_node_mgr_client::proto as node;
 use pplx_space_node_runtime_core::artifact_store::StagedName;
 use pplx_space_node_runtime_core::catalog::{CatalogError, RuntimeCatalog};

@@ -10,8 +10,9 @@ use super::source::{KernelVersion, RuntimeLine, SourceError, VerifiableKernel};
 use super::staging::{self, PrepareStagingError};
 use super::store::{self, JobOutcome, JobResult, StoreError};
 use pplx_space_accounts::JobId;
-use pplx_space_common_core::types::{ComponentIdentity, Digest, RuntimeIdentity};
+use pplx_space_common_core::types::{ComponentIdentity, RuntimeIdentity};
 use pplx_space_common_jobs::{BackgroundWorker, Job, JobStatus, ParseJobStatusError, WorkerConfig};
+use pplx_space_content_digest::Digest;
 use pplx_space_node_runtime_core::catalog::{CatalogError, PinnedBootArtifact};
 use tokio_util::sync::CancellationToken;
 
