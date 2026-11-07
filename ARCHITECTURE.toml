@@ -496,7 +496,7 @@ legacy = ["pplx-space-common-core"]
 # lists it; every other one is a model, which never depends on a protocol.
 # These five are protocols without such a name. The mixed crates, which hold
 # model and wire code until they are split, count as models: api-route,
-# credential-injection-core, net-common and spaced-common.
+# credential-injection, net-common and spaced-common.
 protocols = [
   "pplx-space-auto-lifecycle-receipt",
   "pplx-space-events",

@@ -15,7 +15,7 @@ use pplx_space_api_route::{
 use pplx_space_common_core::types::{
     ClusterId, GuestPort, SandboxRouteIdentity, SpaceApiRouteIdentity,
 };
-use pplx_space_credential_injection_core::proto::ResolvedNetworkCredential;
+use pplx_space_credential_injection::proto::ResolvedNetworkCredential;
 use pplx_space_net_common::{
     CredentialHeaderBindingV1, EffectiveNetworkPolicyRef, EffectiveNetworkPolicyRefScope,
     EgressDefaultAction, EgressDestinationV1, EgressPolicyV1, NetworkCredentialDestinationV1,

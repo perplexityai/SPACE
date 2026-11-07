@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::service::interceptor::InterceptedService;
 
-use pplx_space_credential_injection_core::proto::ResolvedNetworkCredential;
+use pplx_space_credential_injection::proto::ResolvedNetworkCredential;
 
 use crate::proto::{
     ResolveNetworkCredentialsRequest as ResolveRequest,

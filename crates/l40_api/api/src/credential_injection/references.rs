@@ -1,6 +1,6 @@
 use super::idempotency;
 use pplx_space_common_core::types::{CredentialReferenceId, IdempotencyKey, OrgId};
-use pplx_space_credential_injection_core::validation::{
+use pplx_space_credential_injection::validation::{
     ReferenceValidationError, ValidatedCredentialReference,
 };
 use pplx_space_credential_injection_store::references::{self as store, ReferenceState};

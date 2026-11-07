@@ -63,7 +63,7 @@
 "pplx-space-auto-lifecycle" = { to = "crates/l20_domain/auto/lifecycle/policy" }  # leaf: pplx-space-auto-lifecycle-receipt nest in l20_domain/auto/lifecycle
 "pplx-space-auto-lifecycle-receipt" = { to = "crates/l20_domain/auto/lifecycle/receipt" }
 "pplx-space-cluster-id" = { to = "crates/l20_domain/cluster/id" }
-"pplx-space-credential-injection-core" = { to = "crates/l20_domain/credential/injection/core" }
+"pplx-space-credential-injection-core" = { to = "crates/l20_domain/credential/injection", rename = "pplx-space-credential-injection" }  # renamed
 "pplx-space-credential-provider-proto" = { to = "crates/l20_domain/credential/provider/proto" }
 "pplx-space-db-identity" = { to = "crates/l20_domain/db/identity" }
 "pplx-space-ecw-credential" = { to = "crates/l20_domain/ecw/credential" }

@@ -179,7 +179,7 @@ members = [
     "crates/l40_api/template/publisher",
     "crates/l40_api/credmgr/client",
     "crates/l40_api/credmgr/server",
-    "crates/l20_domain/credential/injection/core",
+    "crates/l20_domain/credential/injection",
     "crates/l40_api/credential/provider/client",
     "crates/l20_domain/credential/provider/proto",
     "crates/l50_app/volmgr/svc",
@@ -401,7 +401,7 @@ pplx-space-federated-grant-store = { path = "crates/l30_storage/federated/grant/
 pplx-space-ingress-admission = { path = "crates/l40_api/ingress/admission" }
 pplx-space-credmgr = { path = "crates/l40_api/credmgr/server" }
 pplx-space-credmgr-client = { path = "crates/l40_api/credmgr/client" }
-pplx-space-credential-injection-core = { path = "crates/l20_domain/credential/injection/core" }
+pplx-space-credential-injection = { path = "crates/l20_domain/credential/injection" }
 pplx-space-credential-injection-store = { path = "crates/l30_storage/credential/injection/store" }
 pplx-space-credential-provider-client = { path = "crates/l40_api/credential/provider/client" }
 pplx-space-credential-provider-proto = { path = "crates/l20_domain/credential/provider/proto" }
