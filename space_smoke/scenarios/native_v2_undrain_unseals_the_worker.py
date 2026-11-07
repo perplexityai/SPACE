@@ -20,27 +20,28 @@ def v2_undrain_unseals_the_worker(test: smoke.CommandSandboxFixture) -> None:
 
     drain = test.drain_v2
 
-    with test.phase("pin a resident to one worker"):
-        drain.pin_to_resident_worker()
-        resident = drain.create_resident()
-        drain.release_other_worker()
+    with drain.v2_controller():
+        with test.phase("pin a resident to one worker"):
+            drain.pin_to_resident_worker()
+            resident = drain.create_resident()
+            drain.release_other_worker()
 
-    with test.phase("drain with engine v2; the node reports sealed under the epoch"):
-        epoch = drain.drain()
-        drain.wait_for_report(
-            lambda report: report.get("sealed_epoch") == epoch,
-            "the node never reported sealed under the drain's epoch",
-            timeout=180,
-        )
+        with test.phase("drain with engine v2; the node reports sealed under the epoch"):
+            epoch = drain.drain()
+            drain.wait_for_report(
+                lambda report: report.get("sealed_epoch") == epoch,
+                "the node never reported sealed under the drain's epoch",
+                timeout=180,
+            )
 
-    with test.phase("undrain: the epoch is cancelled on the node and the worker unsealed"):
-        drain.undrain_and_expect_cancelled()
+        with test.phase("undrain: the epoch is cancelled on the node and the worker unsealed"):
+            drain.undrain_and_expect_cancelled()
 
-    with test.phase("activations are accepted again"):
-        resident.suspend()
-        resident.wake()
-        observed = drain.run_on(resident, "true")
-        test.verify(observed.exit_code == 0, "the unsealed worker did not run a restored sandbox")
+        with test.phase("activations are accepted again"):
+            resident.suspend()
+            resident.wake()
+            observed = drain.run_on(resident, "true")
+            test.verify(observed.exit_code == 0, "the unsealed worker did not run a restored sandbox")
 
-    with test.phase("a seal under the cancelled epoch is refused"):
-        drain.expect_stale_epoch_refused()
+        with test.phase("a seal under the cancelled epoch is refused"):
+            drain.expect_stale_epoch_refused()

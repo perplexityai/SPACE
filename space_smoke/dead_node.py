@@ -25,7 +25,7 @@ The worker is started again in the scenario's last phase, under a new
 providerID, as a same-name replacement would be; the start is armed as a
 compensation before the stop.
 
-The observables are state: the admin route `GET /dead-node-status`, the node
+The observables are state: the admin node listing's `dead_node_status`, the node
 row and the sandbox rows. The controller's log line per node is evidence
 only.
 """
@@ -56,10 +56,12 @@ MODE_ENV = "SPACE_DEAD_NODE_MODE"
 TICK_ENV = "SPACE_DEAD_NODE_TEST_TICK_SECS"
 ABSENCE_WINDOW_ENV = "SPACE_DEAD_NODE_TEST_ABSENCE_WINDOW_SECS"
 UPLOAD_SETTLE_ENV = "SPACE_DEAD_NODE_TEST_UPLOAD_SETTLE_SECS"
-INSTANCE_AUTHORITY_ENV = "SPACE_DEAD_NODE_TEST_INSTANCE_AUTHORITY"
-# The node-drain terminator, which the v2 drain scenario switches to `aws`
-# against Kind's fake EC2 for its terminate.
+# The node-drain terminator: `aws` gives the verb Kind's fake EC2 to judge by,
+# and the v2 drain its terminate.
 TERMINATOR_KIND_ENV = "SPACE_NODE_DRAIN_TERMINATOR_KIND"
+# The drain's v2, which the controller runs only with the verb `live` and the
+# `aws` terminator.
+DRAIN_V2_ENABLED_ENV = "SPACE_DRAIN_V2_ENABLED"
 
 # The only controller env this scenario may touch, and the closed vocabulary
 # its overrides come from.
@@ -68,12 +70,12 @@ DEAD_NODE_ENV_KEYS: tuple[str, ...] = (
     TICK_ENV,
     ABSENCE_WINDOW_ENV,
     UPLOAD_SETTLE_ENV,
-    INSTANCE_AUTHORITY_ENV,
     TERMINATOR_KIND_ENV,
+    DRAIN_V2_ENABLED_ENV,
 )
 _MODE_VALUES = frozenset({"off", "dry-run", "live"})
-_AUTHORITY_VALUES = frozenset({"ec2"})
 _TERMINATOR_VALUES = frozenset({"aws", "kube-delete"})
+_FLAG_VALUES = frozenset({"true", "false"})
 _SECONDS_VALUE = re.compile(r"[1-9][0-9]{0,3}")
 
 # Sandbox actions the harness may ask the native API for.
@@ -146,6 +148,63 @@ def fake_provider_id() -> tuple[str, str]:
     return f"aws:///kind-a/{instance_id}", instance_id
 
 
+def await_recorded_instance(
+    fixture: KindEcw, control: DeadNodeControl, node_name: str, node_id: str, instance_id: str,
+    *, timeout: float,
+) -> None:
+    """Wait until the node's row records `instance_id`."""
+
+    deadline = time.monotonic() + timeout
+    while control.node_recorded_instance(node_id) != instance_id:
+        fixture.verify(
+            time.monotonic() < deadline,
+            "node registration never recorded the worker's fake instance",
+            worker=node_name,
+            expected=instance_id,
+            recorded=control.node_recorded_instance(node_id),
+        )
+        fixture.wait(3)
+
+
+def register_fake_instance(
+    fixture: KindEcw, control: DeadNodeControl, node_name: str, node_id: str, *, timeout: float = 300
+) -> str:
+    """Re-register the worker under a new fake AWS providerID and wait until
+    its row records the instance; returns it. Re-registering deletes the
+    pods on the worker."""
+
+    provider_id, instance_id = fake_provider_id()
+    labels = control.kind_node_labels(node_name)
+    control.set_kind_worker_provider_id(node_name, provider_id, labels, timeout=timeout)
+    await_recorded_instance(fixture, control, node_name, node_id, instance_id, timeout=timeout)
+    return instance_id
+
+
+@contextmanager
+def scoped_dead_node_env(
+    fixture: KindEcw, control: DeadNodeControl, scope: ResourceScope
+) -> Iterator[Callable[[Mapping[str, str]], None]]:
+    """Hold the controller-mutation Lease, capture the standing dead-node env,
+    and put it back when the body ends; yields the setter, so the body can
+    switch configs inside the scope."""
+
+    release = control.acquire_controller_mutation()
+    lease = scope.defer("release the controller mutation lease", release)
+    standing = control.dead_node_env()
+    fixture.record("standing_dead_node_env", standing)
+    restore = scope.defer(
+        "put the standing dead-node env back",
+        lambda: control.restore_dead_node_env(standing),
+        critical=True,
+    )
+    try:
+        yield control.set_dead_node_env
+    finally:
+        with fixture.phase("put the standing dead-node env back"):
+            restore.release()
+            lease.release()
+
+
 def validate_dead_node_keys(values: Mapping[str, object]) -> None:
     unknown = sorted(set(values) - set(DEAD_NODE_ENV_KEYS))
     if unknown:
@@ -157,8 +216,8 @@ def validate_dead_node_overrides(overrides: Mapping[str, str]) -> None:
     for key, value in overrides.items():
         if key == MODE_ENV:
             allowed = value in _MODE_VALUES
-        elif key == INSTANCE_AUTHORITY_ENV:
-            allowed = value in _AUTHORITY_VALUES
+        elif key == DRAIN_V2_ENABLED_ENV:
+            allowed = value in _FLAG_VALUES
         elif key == TERMINATOR_KIND_ENV:
             allowed = value in _TERMINATOR_VALUES
         else:
@@ -239,29 +298,10 @@ class DeadNodeAssertions:
         self._fixture.record("reference_worker", self._reference.k8s_node_name)
         return self._node
 
-    def _register_fake_instance(self, node: AdminNodeView, *, timeout: float = 300) -> str:
-        provider_id, instance_id = fake_provider_id()
-        labels = self._control.kind_node_labels(node.k8s_node_name)
-        self._control.set_kind_worker_provider_id(
-            node.k8s_node_name, provider_id, labels, timeout=timeout
-        )
-        self._await_recorded_instance(node, instance_id, timeout=timeout)
+    def _register_fake_instance(self, node: AdminNodeView) -> str:
+        instance_id = register_fake_instance(self._fixture, self._control, node.k8s_node_name, node.id)
         self._instances[node.k8s_node_name] = instance_id
         return instance_id
-
-    def _await_recorded_instance(
-        self, node: AdminNodeView, instance_id: str, *, timeout: float
-    ) -> None:
-        deadline = time.monotonic() + timeout
-        while self._control.node_recorded_instance(node.id) != instance_id:
-            self._fixture.verify(
-                time.monotonic() < deadline,
-                "node registration never recorded the worker's fake instance",
-                worker=node.k8s_node_name,
-                expected=instance_id,
-                recorded=self._control.node_recorded_instance(node.id),
-            )
-            self._fixture.wait(3)
 
     def give_fake_instances(self) -> None:
         """Re-register the chosen worker and the reference under fake AWS
@@ -466,33 +506,20 @@ class DeadNodeAssertions:
 
     @contextmanager
     def scoped_config(self) -> Iterator[Callable[[Mapping[str, str]], None]]:
-        """Capture the standing dead-node env and put it back when the body ends.
+        """The standing dead-node env, put back when the body ends
+        (`scoped_dead_node_env`).
 
-        Yields the setter, so the body can switch configs inside the scope.
-        Each call first reads the database clock, so `expect_status` accepts
-        only an entry written under that config.
+        Each config the body sets first reads the database clock, so
+        `expect_status` accepts only an entry written under that config.
         """
 
-        release = self._control.acquire_controller_mutation()
-        lease = self._scope.defer("release the controller mutation lease", release)
-        standing = self._control.dead_node_env()
-        self._fixture.record("standing_dead_node_env", standing)
-        restore = self._scope.defer(
-            "put the standing dead-node env back",
-            lambda: self._control.restore_dead_node_env(standing),
-            critical=True,
-        )
+        with scoped_dead_node_env(self._fixture, self._control, self._scope) as set_env:
 
-        def configure(overrides: Mapping[str, str]) -> None:
-            self._configured_at = self._control.database_now()
-            self._control.set_dead_node_env(overrides)
+            def configure(overrides: Mapping[str, str]) -> None:
+                self._configured_at = self._control.database_now()
+                set_env(overrides)
 
-        try:
             yield configure
-        finally:
-            with self._fixture.phase("put the standing dead-node env back"):
-                restore.release()
-                lease.release()
 
     # --- verdicts -------------------------------------------------------------
 
@@ -609,7 +636,10 @@ class DeadNodeAssertions:
         if self._restart is None:
             raise RuntimeError("kill_worker() must run first")
         self._restart.release()
-        self._await_recorded_instance(self.node, self.instance, timeout=timeout)
+        await_recorded_instance(
+            self._fixture, self._control, self.node.k8s_node_name, self.node.id, self.instance,
+            timeout=timeout,
+        )
         return self.instance
 
     def adopt_replacement_sandbox(self, sandbox_id: str) -> None:

@@ -23,7 +23,6 @@ from space_smoke.capabilities import (
     DrainV2Control,
     ConcurrentRestoreControl,
     ConsoleControl,
-    DrainRestoreControl,
     DrainGateControl,
     NodeDrainControl,
     NodeGroupControl,
@@ -107,7 +106,6 @@ from space_smoke.adapters import (
 from space_smoke.activation_seal import ActivationSealAssertions
 from space_smoke.drain_v2 import DrainV2Assertions
 from space_smoke.concurrent_restore import ConcurrentRestoreAssertions
-from space_smoke.drain_restore import DrainRestoreAssertions
 from space_smoke.node_drain import NodeDrainAssertions
 from space_smoke.node_groups import NodeGroupAssertions
 from space_smoke.node_fence import NodeFenceAssertions
@@ -2852,27 +2850,6 @@ class KindEcw(Ecw):
                 self, self._concurrent_restore_control, self._context.scope
             )
         return self._concurrent_restore_assertions
-
-    _drain_restore_control: DrainRestoreControl | None = None
-    _drain_restore_assertions: DrainRestoreAssertions | None = None
-
-    @property
-    def drain_restore(self) -> DrainRestoreAssertions:
-        """Privileged assertions for the system's drain restore operation.
-
-        One instance per fixture: the assertions carry the deferred
-        controller-env restore across accesses.
-        """
-
-        if self._drain_restore_control is None:
-            raise SmokeConfigurationError(
-                "drain restore control is only available on the kind backend"
-            )
-        if self._drain_restore_assertions is None:
-            self._drain_restore_assertions = DrainRestoreAssertions(
-                self, self._drain_restore_control, self._context.scope
-            )
-        return self._drain_restore_assertions
 
     _node_drain_control: NodeDrainControl | None = None
     _node_drain_assertions: NodeDrainAssertions | None = None

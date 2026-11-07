@@ -1603,7 +1603,7 @@ class NodeDrainControl(NodeFaultControl, Protocol):
 
 @dataclass(frozen=True)
 class DeadNodeStatus:
-    """One node's entry in `GET /admin/api/v1/dead-node-status`.
+    """One node's `dead_node_status` in `GET /admin/api/v1/nodes`.
 
     `observed_at` is when the controller wrote the entry, by the database
     clock. `instances` maps each instance asked about to `dead`, `live` or
@@ -1653,7 +1653,7 @@ class DeadNodeControl(NodeDrainControl, Protocol):
     worker's container, delete its Kubernetes Node and mark its instance
     terminated in the fake EC2; then start the container again, under a new
     providerID for a same-name replacement. The observables are the admin
-    dead-node status route, the node rows and the sandbox rows.
+    node listing's `dead_node_status`, the node rows and the sandbox rows.
     """
 
     def acquire_controller_mutation(self) -> Callable[[], None]:
@@ -1673,7 +1673,7 @@ class DeadNodeControl(NodeDrainControl, Protocol):
         ...
 
     def dead_node_statuses(self) -> list[DeadNodeStatus]:
-        """`GET /admin/api/v1/dead-node-status`."""
+        """Each node's `dead_node_status` from `GET /admin/api/v1/nodes`."""
         ...
 
     def kind_node_provider_id(self, node_name: str) -> str:
@@ -1775,6 +1775,35 @@ class DeadNodeControl(NodeDrainControl, Protocol):
         ...
 
 
+class DrainRestoreControl(Protocol):
+    """The drain restore operation's test hold on Kind.
+
+    A scoped override of one cluster-controller env key (closed key list,
+    bounded integer seconds), under the controller-mutation Lease the
+    retention, GC, dead-node and stopped-replacement scenarios share.
+    """
+
+    def acquire_controller_mutation(self) -> Callable[[], None]:
+        """Take the cluster-visible controller-deployment Lease; returns its release."""
+        ...
+
+    def drain_restore_hold_env(self) -> dict[str, str | None]:
+        """The hold's literal on the controller Deployment, None if unset."""
+        ...
+
+    def running_controller_drain_restore_hold_envs(self) -> list[dict[str, str | None]]:
+        """The same literal on every running, not-terminating controller pod."""
+        ...
+
+    def set_drain_restore_hold_env(self, overrides: Mapping[str, str]) -> None:
+        """Apply the hold and await the controller rollout; refuses keys or values off the lists."""
+        ...
+
+    def restore_drain_restore_hold_env(self, standing: Mapping[str, str | None]) -> None:
+        """Put the captured literal back (None unsets) and await the controller rollout."""
+        ...
+
+
 @dataclass(frozen=True)
 class DrainV2Status:
     """`nodes.drain_engine` and `nodes.drain_status` of one node; `status` is the JSON object."""
@@ -1783,9 +1812,10 @@ class DrainV2Status:
     status: dict[str, Any] | None
 
 
-class DrainV2Control(DeadNodeControl, Protocol):
+class DrainV2Control(DeadNodeControl, DrainRestoreControl, Protocol):
     """Kind-only operations for the drain v2 scenarios, with the dead-node
-    verb's config and the Kind worker's instance, stop and replacement."""
+    verb's config, the drain restore hold, and the Kind worker's instance,
+    stop and replacement."""
 
     def drain_node_v2(self, node_id: str) -> None:
         """`POST :drain` with `mode: forced` and `engine: v2`."""
@@ -1803,9 +1833,12 @@ class DrainV2Control(DeadNodeControl, Protocol):
         """Have the worker's drain read `sandbox_ids` as quarantined (a test-hooks file)."""
         ...
 
-    def drain_restore_states(self, sandbox_id: str) -> list[str]:
-        """The state of each `drain_restore_sandbox` operation of the sandbox, oldest first."""
+    def drain_restore_operations(self, sandbox_id: str) -> list[tuple[str, int]]:
+        """Each `drain_restore_sandbox` operation of the sandbox, oldest first:
+        its state and attempts."""
         ...
+
+    def stopped_residency(self, sandbox_id: str) -> StoppedResidency: ...
 
     def node_tombstoned(self, node_id: str) -> bool:
         """Whether `node_k8s_tombstones` holds a tombstone for the node id."""
@@ -2180,91 +2213,6 @@ class EcwLifecycleProbe(Protocol):
     def lifecycle_request(self, action: str, *, timeout: float) -> RestoreCallerOutcome:
         """`POST /sandboxes/{id}/<action>` with no body; `action` is `pause` or `resume`."""
         ...
-
-
-@dataclass(frozen=True)
-class DrainRestoreObservation:
-    """One read of a drain restore operation and its sandbox, in one statement.
-
-    `operation_state` is None when no such operation row exists, and
-    `lifecycle` None when the sandbox row is gone. `restore_episode_target`
-    reads None on a schema without the column, so the read also serves a
-    base build as control evidence. `active_executions` counts the sandbox's
-    `sandbox_k8s_executions` rows with `active` set.
-    """
-
-    operation_state: str | None
-    attempts: int
-    terminal_error_code: str | None
-    progress_message: str
-    lifecycle: str | None
-    restore_episode_target: str | None
-    evacuation_restore_target: str | None
-    active_executions: int
-
-    def evidence(self) -> dict[str, object]:
-        return {
-            "operation_state": self.operation_state,
-            "operation_attempts": self.attempts,
-            "operation_terminal_error_code": self.terminal_error_code,
-            "operation_progress_message": self.progress_message,
-            "sandbox_lifecycle": self.lifecycle,
-            "restore_episode_target": self.restore_episode_target,
-            "evacuation_restore_target": self.evacuation_restore_target,
-            "active_executions": self.active_executions,
-        }
-
-
-class DrainRestoreControl(Protocol):
-    """Kind-only operations for the drain restore operation scenario.
-
-    Nothing in production enqueues a `drain_restore_sandbox` operation yet,
-    so the one enqueue is a named insert that mirrors the API's own
-    (`enqueue_drain_restore`: the sandbox queue's advisory lock, then the row
-    and its `operation.created` event). The reads are the operation row, the
-    sandbox row's lifecycle and episode target, and its active executions.
-    The test hold is a scoped override of one cluster-controller env key
-    (closed key list, bounded integer seconds), under the controller-mutation
-    Lease the retention, GC and stopped-replacement scenarios share.
-    """
-
-    def acquire_controller_mutation(self) -> Callable[[], None]:
-        """Take the cluster-visible controller-deployment Lease; returns its release."""
-        ...
-
-    def drain_restore_hold_env(self) -> dict[str, str | None]:
-        """The hold's literal on the controller Deployment, None if unset."""
-        ...
-
-    def running_controller_drain_restore_hold_envs(self) -> list[dict[str, str | None]]:
-        """The same literal on every running, not-terminating controller pod."""
-        ...
-
-    def set_drain_restore_hold_env(self, overrides: Mapping[str, str]) -> None:
-        """Apply the hold and await the controller rollout; refuses keys or values off the lists."""
-        ...
-
-    def restore_drain_restore_hold_env(self, standing: Mapping[str, str | None]) -> None:
-        """Put the captured literal back (None unsets) and await the controller rollout."""
-        ...
-
-    def drain_restore_source_snapshot(self, sandbox_id: str) -> str | None:
-        """The sandbox's newest `ready` full snapshot with a live storage location, or None."""
-        ...
-
-    def enqueue_drain_restore(
-        self, sandbox_id: str, *, target: str, snapshot_id: str, due_in_seconds: int
-    ) -> str:
-        """Queue a drain restore of the sandbox toward `target` from `snapshot_id`; returns its id.
-
-        `due_in_seconds` sets `next_attempt_at` that far past the insert, so
-        a positive value keeps the dispatcher from claiming it meanwhile.
-        """
-        ...
-
-    def drain_restore_observation(
-        self, operation_id: str, sandbox_id: str
-    ) -> DrainRestoreObservation: ...
 
 
 @dataclass(frozen=True)

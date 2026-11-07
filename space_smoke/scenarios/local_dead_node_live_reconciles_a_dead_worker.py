@@ -4,13 +4,14 @@ import space_smoke as smoke
 from space_smoke.dead_node import (
     ABSENCE_WINDOW_ENV,
     EXPECTED_OUTCOME,
-    INSTANCE_AUTHORITY_ENV,
     MODE_ENV,
     PAUSED,
     STOPPED,
     SUSPENDING_LOCAL,
     SUSPENDED_REMOTE,
+    TERMINATOR_KIND_ENV,
     TICK_ENV,
+    UNSELECTED,
     UPLOAD_SETTLE_ENV,
     created_states,
 )
@@ -40,15 +41,17 @@ REPLACEMENT_TICKS = 6
     test_hooks=(
         "SPACE_DEAD_NODE_TEST_TICK_SECS, SPACE_DEAD_NODE_TEST_ABSENCE_WINDOW_SECS and "
         "SPACE_DEAD_NODE_TEST_UPLOAD_SETTLE_SECS, which shorten the verb's tick and windows "
-        "to seconds, and SPACE_DEAD_NODE_TEST_INSTANCE_AUTHORITY, which selects its EC2 arm"
+        "to seconds"
     ),
     ignored="stops a Kind worker and replaces it, too invasive for the per-merge set",
 )
 def dead_node_live_reconciles_a_dead_worker(test: smoke.KindEcw) -> None:
     """With a worker's container stopped, its Node deleted and its fake AWS
-    instance terminated, the dead-node verb against Kind's fake EC2 reports
-    the worker `lost` in `dry-run` with every row's predicted outcome and no
-    row changed; in `live` it leaves each row in its rule's state (started,
+    instance terminated, the dead-node verb in `dry-run` judges the worker
+    `unknown` (`no_instance_authority`) on Kind's `kube-delete` terminator,
+    selecting no row; with the `aws` terminator, against Kind's fake EC2, it
+    reports the worker `lost` with every row's predicted outcome, and no row
+    changes in either; in `live` it leaves each row in its rule's state (started,
     paused, stopped and suspending with the node's only copy `failed`, the
     worker kept as their last target; suspended with a durable snapshot
     `suspended` and unplaced) and deletes the worker's node row. Started
@@ -82,16 +85,26 @@ def dead_node_live_reconciles_a_dead_worker(test: smoke.KindEcw) -> None:
         dead.kill_worker()
 
     with dead.scoped_config() as configure:
-        with test.phase("dry-run against Kind's fake EC2: lost, each row as predicted, none changed"):
+        with test.phase("dry-run with the kube-delete terminator: unknown, no row selected"):
             configure(
                 {
                     MODE_ENV: "dry-run",
                     TICK_ENV: str(TICK_SECONDS),
                     ABSENCE_WINDOW_ENV: WINDOW_SECONDS,
                     UPLOAD_SETTLE_ENV: WINDOW_SECONDS,
-                    INSTANCE_AUTHORITY_ENV: "ec2",
+                    TERMINATOR_KIND_ENV: "kube-delete",
                 }
             )
+            dead.expect_status(
+                mode="dry-run",
+                verdict="unknown",
+                reason="no_instance_authority",
+                outcome_of=lambda _state: UNSELECTED,
+            )
+            dead.expect_rows_unchanged()
+
+        with test.phase("dry-run against Kind's fake EC2: lost, each row as predicted, none changed"):
+            configure({TERMINATOR_KIND_ENV: "aws"})
             dead.expect_status(
                 mode="dry-run",
                 verdict="lost",
