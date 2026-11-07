@@ -1429,14 +1429,14 @@ pub(super) async fn node_api_target(
 }
 
 pub(super) async fn drain_v2_columns(
-    tx: &mut Transaction<'_, Postgres>,
+    executor: impl sqlx::PgExecutor<'_>,
     node_id: NodeId,
 ) -> Result<DrainV2Columns, sqlx::Error> {
     let (engine, status): (Option<String>, Option<serde_json::Value>) = sqlx::query_as(sql!(
         "SELECT drain_engine, drain_status FROM nodes WHERE id = $1"
     ))
     .bind(node_id)
-    .fetch_one(&mut **tx)
+    .fetch_one(executor)
     .await?;
     Ok(DrainV2Columns {
         engine: pplx_space_common_core::types::NodeDrainEngine::from_column(engine.as_deref()),

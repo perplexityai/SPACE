@@ -1399,6 +1399,32 @@ async fn apply_drain_action(
     // recoverable: the node-drain reconciler observes `drain_phase` and
     // re-asserts cordon state, and `drain_last_error` captures the failure
     // for the operator.
+    // A v2 node's `:terminate` asks the node, under its stored report's
+    // epoch, before the row is locked: the call can take seconds, and the
+    // lock would hold the v2 loop's and registration's writes to the row
+    // that long. Under the lock below, the row must still carry that report.
+    let v2_probe = if matches!(action, DrainAction::Terminate) {
+        match node_store::drain_v2_columns(&state.pool, node_id).await {
+            Ok(columns) if columns.engine == NodeDrainEngine::V2 => {
+                match drain_v2_terminable(columns.status.as_ref()) {
+                    Some(epoch) => Some((
+                        epoch,
+                        state
+                            .v2_drain_probe
+                            .drain_node(&state, node_id, epoch)
+                            .await
+                            .is_ok_and(|fresh| fresh.done && fresh.sealed_epoch == Some(epoch)),
+                    )),
+                    None => None,
+                }
+            }
+            Ok(_) => None,
+            Err(err) => return db_error(err).into_response(),
+        }
+    } else {
+        None
+    };
+
     let mut tx = match state.pool.begin().await {
         Ok(tx) => tx,
         Err(err) => return db_error(err).into_response(),
@@ -1559,7 +1585,7 @@ async fn apply_drain_action(
 
     // The drain v2 engine: refuse what it can't run, and decide its write,
     // under the same lock as the phase write.
-    let v2_columns = match node_store::drain_v2_columns(&mut tx, node_id).await {
+    let v2_columns = match node_store::drain_v2_columns(&mut *tx, node_id).await {
         Ok(columns) => columns,
         Err(err) => return db_error(err).into_response(),
     };
@@ -1595,16 +1621,13 @@ async fn apply_drain_action(
     };
     // A v2 node is terminable once it reports, under its drain's epoch, that
     // everything on it is durable elsewhere: the stored report says so, and
-    // a fresh `DrainNode` call says so again now. Its rows don't gate it.
+    // the fresh `DrainNode` call made before the lock said so again under
+    // the same epoch. Its rows don't gate it.
     let v2_terminable =
         if matches!(action, DrainAction::Terminate) && v2_columns.engine == NodeDrainEngine::V2 {
-            match drain_v2_terminable(v2_columns.status.as_ref()) {
-                Some(epoch) => state
-                    .v2_drain_probe
-                    .drain_node(&state, node_id, epoch)
-                    .await
-                    .is_ok_and(|fresh| fresh.done && fresh.sealed_epoch == Some(epoch)),
-                None => false,
+            match (drain_v2_terminable(v2_columns.status.as_ref()), v2_probe) {
+                (Some(epoch), Some((probed, fresh_done))) => epoch == probed && fresh_done,
+                _ => false,
             }
         } else {
             true

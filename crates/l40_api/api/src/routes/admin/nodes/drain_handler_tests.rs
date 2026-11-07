@@ -1159,3 +1159,68 @@ async fn a_node_reads_back_its_drain_engine_status_and_dead_node_result() -> Tes
     assert_eq!(response.dead_node_status, Some(verdict));
     Ok(())
 }
+
+/// A [`V2DrainProbe`] that answers `done` for `epoch` only if it can take
+/// the node row's lock at once: the handler must not hold it while it asks.
+struct LockCheckingProbe(u64);
+
+impl V2DrainProbe for LockCheckingProbe {
+    fn drain_node<'a>(
+        &'a self,
+        state: &'a AppState,
+        node_id: NodeId,
+        _epoch: u64,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<V2DrainReport, String>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            let mut tx = state.pool.begin().await.map_err(|e| e.to_string())?;
+            sqlx::query(sql!("SELECT 1 FROM nodes WHERE id = $1 FOR UPDATE NOWAIT"))
+                .bind(node_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|error| format!("the node row is locked: {error}"))?;
+            tx.rollback().await.map_err(|e| e.to_string())?;
+            Ok(V2DrainReport {
+                sealed_epoch: Some(self.0),
+                done: true,
+            })
+        })
+    }
+}
+
+/// `:terminate` asks a v2 node before it locks the node's row, so the call
+/// holds up no write to the row; the node then moves to `terminating`.
+#[tokio::test(flavor = "current_thread")]
+async fn terminate_asks_the_node_before_it_locks_the_row() -> TestResult {
+    if !enter_direct_test_process() {
+        return Ok(());
+    }
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let actor = managing_org_admin(&db.pool).await?;
+    let mut state = kubernetes_state(&db.pool).await?;
+    state.v2_drain_probe = std::sync::Arc::new(LockCheckingProbe(42));
+    let node_id = insert_k8s_node(
+        &db.pool,
+        Some("drained"),
+        Some("v2"),
+        Some(serde_json::json!({"epoch": 42, "report": {"sealed_epoch": 42, "done": true}})),
+    )
+    .await?;
+    let answer = post_drain(
+        &state,
+        &actor,
+        node_id,
+        DrainAction::Terminate,
+        DrainRequest::default(),
+    )
+    .await;
+    assert_eq!(
+        v2_columns(&db.pool, node_id).await?.0.as_deref(),
+        Some("terminating"),
+        "{answer}"
+    );
+    Ok(())
+}
