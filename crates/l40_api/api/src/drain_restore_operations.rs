@@ -44,21 +44,6 @@ use crate::public_operations::{
 use crate::public_sandbox_operations::PublicOperationExecutionResult;
 use crate::public_sandbox_projection::public_lifecycle_state;
 
-/// Whether this process runs with the drain's v2 on (`SPACE_DRAIN_V2_ENABLED`),
-/// set once at startup. Off, nothing enqueues a drain restore, so a user's
-/// call skips looking for one to supersede.
-static DRAIN_V2_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-/// Record at startup whether the drain's v2 is on in this process.
-pub fn set_drain_v2_enabled(enabled: bool) {
-    DRAIN_V2_ENABLED.store(enabled, std::sync::atomic::Ordering::Relaxed);
-}
-
-/// Whether the drain's v2 is on in this process ([`set_drain_v2_enabled`]).
-pub fn drain_v2_enabled() -> bool {
-    DRAIN_V2_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
-}
-
 /// What a drain restore operation carries.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]

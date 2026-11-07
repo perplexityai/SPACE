@@ -1471,10 +1471,10 @@ impl SandboxController {
                 .await;
         };
         // A drain restore waits only while the row is `suspended`; once it
-        // holds the row, the call meets its restore instead. Without the
-        // drain's v2 nothing enqueues one.
+        // holds the row, the call meets its restore instead. Whether new v2
+        // drains are admitted doesn't matter: a persisted one still enqueues
+        // restores.
         if action_supersedes_drain_restore(action)
-            && crate::drain_restore_operations::drain_v2_enabled()
             && sandbox.lifecycle.parse::<SandboxLifecycle>().ok()
                 == Some(SandboxLifecycle::Suspended)
         {

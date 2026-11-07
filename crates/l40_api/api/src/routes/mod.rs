@@ -260,7 +260,6 @@ impl AppState {
 
         let drain_v2_enabled =
             pplx_space_common_core::env::env_flag_var(admin::nodes::DRAIN_V2_ENABLED_ENV, false);
-        crate::drain_restore_operations::set_drain_v2_enabled(drain_v2_enabled);
         Ok(Self {
             pool,
             credentials_pool,

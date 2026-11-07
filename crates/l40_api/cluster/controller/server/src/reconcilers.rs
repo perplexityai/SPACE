@@ -510,12 +510,13 @@ pub async fn run_reconcilers(
                 dead_node_config.as_ref(),
                 dead_node_authority,
             );
-            let drain_v2_enabled = drain_v2_enabled(
+            // Admission is the API's; here the flag is only checked against
+            // what a v2 drain needs.
+            drain_v2_enabled(
                 &pplx_space_common_core::env::ProcessEnvironment,
                 dead_node_live,
                 node_drain::ReconcilerConfig::from_env().enabled,
             )?;
-            pplx_space_api::drain_restore_operations::set_drain_v2_enabled(drain_v2_enabled);
             let warm_pool_token = shutdown_token.child_token();
             let warm_pool_store = WarmPoolStore::new(pool.clone());
             let warm_pool_kube = kube.k8s.client.clone();
