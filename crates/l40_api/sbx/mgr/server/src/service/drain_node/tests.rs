@@ -370,7 +370,7 @@ async fn done_needs_one_continuous_seal_under_the_calls_epoch() {
 /// prior lifecycle and its durable pin, and the seal and the record survive a
 /// restart of the service.
 #[tokio::test]
-async fn a_durable_evacuation_is_recorded_and_survives_a_restart() {
+async fn a_recorded_evacuation_survives_a_restart() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("manager.sqlite");
     let mut conn = crate::db::Connection::open_at(&path).unwrap();
@@ -728,4 +728,335 @@ async fn a_failed_record_write_blocks_the_suspend() {
         service.lookup_sandbox(&id).unwrap().state,
         SandboxState::Started
     );
+}
+
+fn service_with_node_manager(
+    conn: crate::db::Connection,
+    node_manager: &crate::node_manager_transport::fake::ServedNodeManager,
+) -> SandboxManagerService {
+    SandboxManagerService::new_with_options(
+        conn,
+        crate::service::SandboxManagerServiceOptions {
+            node_manager: node_manager.connector(),
+            ..crate::service::SandboxManagerServiceOptions::for_test()
+        },
+    )
+}
+
+fn orphan_inventory(
+    page: pplx_space_node_mgr_client::proto::ListOrphanCandidatesResponse,
+) -> crate::node_manager_transport::fake::ServedNodeManager {
+    crate::node_manager_transport::fake::FakeNodeManager::default()
+        .unary(
+            "ListOrphanCandidates",
+            move |_: pplx_space_node_mgr_client::proto::ListOrphanCandidatesRequest| {
+                Ok(page.clone())
+            },
+        )
+        .serve()
+}
+
+fn drain_request(epoch: u64, cancel: bool) -> Request<DrainNodeRequest> {
+    crate::service::activation_support::internal_request(DrainNodeRequest { epoch, cancel })
+}
+
+/// The whole call, through node-manager's inventory: a node with nothing on
+/// it is sealed and done; a run directory no row accounts for, or a failed
+/// scan of run directories, blocks it; a cancel unseals it.
+#[tokio::test]
+async fn drain_node_seals_reads_the_inventory_and_reports() {
+    let clean = orphan_inventory(Default::default());
+    let service = service_with_node_manager(crate::db::test_conn(), &clean);
+    let report = service
+        .drain_node(drain_request(7, false))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(report.done, "{report:?}");
+    assert_eq!(report.sealed_epoch, Some(7));
+    assert!(
+        clean
+            .calls()
+            .iter()
+            .any(|call| call.ends_with("ListOrphanCandidates")),
+        "{:?}",
+        clean.calls()
+    );
+
+    let leftovers = orphan_inventory(
+        pplx_space_node_mgr_client::proto::ListOrphanCandidatesResponse {
+            orphaned_run_dirs: vec!["/run/sandboxes/sbx-gone".into()],
+            warnings: vec!["RunDirs: permission denied".into()],
+            ..Default::default()
+        },
+    );
+    let service = service_with_node_manager(crate::db::test_conn(), &leftovers);
+    let report = service
+        .drain_node(drain_request(7, false))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!report.done);
+    let blocked: Vec<_> = report
+        .blocked
+        .iter()
+        .map(|entry| (entry.sandbox_id.as_deref(), entry.reason.as_str()))
+        .collect();
+    assert_eq!(
+        blocked,
+        [
+            (
+                None,
+                "orphan inventory scan failed: RunDirs: permission denied"
+            ),
+            (
+                Some("sbx-gone"),
+                "orphan run directory /run/sandboxes/sbx-gone"
+            ),
+        ]
+    );
+
+    let cancelled = service
+        .drain_node(drain_request(7, true))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(cancelled.sealed_epoch, None);
+    assert!(!cancelled.done);
+    assert_eq!(
+        service
+            .drain_node(drain_request(7, false))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::FailedPrecondition,
+        "a cancelled epoch never seals again"
+    );
+}
+
+/// A node-manager whose inventory never answers costs the call its deadline,
+/// not the control plane's timeout, and blocks the drain.
+#[tokio::test(start_paused = true)]
+async fn an_inventory_that_never_answers_blocks_within_the_deadline() {
+    let stalled = crate::node_manager_transport::fake::FakeNodeManager::default()
+        .unary_async(
+            "ListOrphanCandidates",
+            |_: pplx_space_node_mgr_client::proto::ListOrphanCandidatesRequest| {
+                std::future::pending::<
+                    Result<pplx_space_node_mgr_client::proto::ListOrphanCandidatesResponse, Status>,
+                >()
+            },
+        )
+        .serve();
+    let service = service_with_node_manager(crate::db::test_conn(), &stalled);
+    let started = tokio::time::Instant::now();
+    let report = service
+        .drain_node(drain_request(7, false))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(started.elapsed() < ORPHAN_INVENTORY_DEADLINE + Duration::from_secs(1));
+    assert!(!report.done);
+    assert_eq!(
+        report
+            .blocked
+            .iter()
+            .map(|entry| entry.reason.as_str())
+            .collect::<Vec<_>>(),
+        ["orphan inventory didn't finish within 20s"]
+    );
+}
+
+/// Only root and node-api, which relays the control plane's drain, may
+/// drain the node; node-ctl, which may read sandbox state, may not.
+#[tokio::test]
+async fn only_root_and_node_api_drain_the_node() {
+    let clean = orphan_inventory(Default::default());
+    let service = service_with_node_manager(crate::db::test_conn(), &clean);
+    let refused = service
+        .drain_node(crate::service::tests::service_tests::node_ctl_request(
+            DrainNodeRequest {
+                epoch: 7,
+                cancel: false,
+            },
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code(), tonic::Code::PermissionDenied);
+    assert_eq!(
+        service.activation_seal.status().sealed_epoch,
+        None,
+        "a refused call seals nothing"
+    );
+    let relayed = service
+        .drain_node(
+            crate::service::tests::service_tests::node_api_trusted_lifecycle_request(
+                DrainNodeRequest {
+                    epoch: 7,
+                    cancel: false,
+                },
+            ),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(relayed.sealed_epoch, Some(7));
+    service.drain_node(drain_request(8, false)).await.unwrap();
+}
+
+/// Every drain action holds a state-writer lease while it runs, so a
+/// restart handoff waits for it.
+#[tokio::test]
+async fn a_drain_action_runs_as_a_state_writer() {
+    let conn = crate::db::test_conn();
+    let id = pplx_space_common_core::types::SandboxId::new().to_string();
+    crate::service::tests::service_tests::insert_test_sandbox(&conn, &id, SandboxState::Started);
+    let (service, first) = sealed_service_with(conn, 7);
+    // The suspend waits on the wake lock this test holds.
+    let wake_lock = service.auto_lifecycle.wake_lock(&id);
+    let held = wake_lock.lock_owned().await;
+    let report = service.finish_drain(7, &first, DrainScans::default());
+    assert_eq!(report.pending.len(), 1, "{report:?}");
+    assert!(
+        service
+            .active_state_transition_methods()
+            .contains(&("NodeDrain", 1)),
+        "{:?}",
+        service.active_state_transition_methods()
+    );
+    // Another epoch takes over before the suspend gets the lock; it writes
+    // nothing.
+    service.activation_seal.seal(&service.db, 8).unwrap();
+    drop(held);
+    service.drain_actions.wait_idle().await;
+    assert!(service.active_state_transition_methods().is_empty());
+    assert!(
+        crate::db::read::drain_evacuations(&service.db.lock().unwrap())
+            .unwrap()
+            .is_empty()
+    );
+}
+
+fn sealed_service_with(
+    conn: crate::db::Connection,
+    epoch: u64,
+) -> (SandboxManagerService, ActivationSealStatus) {
+    let service = SandboxManagerService::for_test(conn);
+    service.activation_seal.seal(&service.db, epoch).unwrap();
+    let first = service.activation_seal.status();
+    (service, first)
+}
+
+/// A drain suspend acts only on a row still started or paused, and only
+/// under the call's own seal: a row something else suspended first, or a
+/// seal another epoch replaced, gets no record and no suspend. One that
+/// fails leaves no record behind, and the row is planned again.
+#[tokio::test]
+async fn a_drain_suspend_acts_only_on_its_own_resident_under_its_own_seal() {
+    let records = |service: &SandboxManagerService| {
+        crate::db::read::drain_evacuations(&service.db.lock().unwrap())
+            .unwrap()
+            .len()
+    };
+    let node_manager = crate::node_manager_transport::fake::FakeNodeManager::default().serve();
+    for (state, epoch) in [(SandboxState::Suspended, 7), (SandboxState::Started, 8)] {
+        let conn = crate::db::test_conn();
+        let id = pplx_space_common_core::types::SandboxId::new().to_string();
+        crate::service::tests::service_tests::insert_test_sandbox(&conn, &id, state);
+        let service = service_with_node_manager(conn, &node_manager);
+        service.activation_seal.seal(&service.db, epoch).unwrap();
+        service.drain_suspend(7, &id).await.unwrap();
+        assert_eq!(records(&service), 0, "{state} under {epoch}");
+        assert_eq!(service.lookup_sandbox(&id).unwrap().state, state);
+    }
+    assert_eq!(node_manager.calls(), Vec::<String>::new());
+
+    let conn = crate::db::test_conn();
+    let id = pplx_space_common_core::types::SandboxId::new().to_string();
+    crate::service::tests::service_tests::insert_test_sandbox(&conn, &id, SandboxState::Started);
+    let service = service_with_node_manager(conn, &node_manager);
+    service.activation_seal.seal(&service.db, 7).unwrap();
+    service.drain_suspend(7, &id).await.unwrap_err();
+    assert_eq!(records(&service), 0, "a failed suspend forgets its record");
+    assert_eq!(
+        service.lookup_sandbox(&id).unwrap().state,
+        SandboxState::Started
+    );
+    let first = service.activation_seal.status();
+    let report = service.finish_drain(7, &first, DrainScans::default());
+    assert_eq!(
+        report.pending,
+        [DrainPending {
+            sandbox_id: id,
+            action: "suspend".into(),
+        }]
+    );
+}
+
+/// A drain action doesn't run once the node is no longer sealed under its
+/// epoch: a stopped sandbox's disk isn't published for a drain a cancel
+/// ended.
+#[tokio::test]
+async fn a_drain_action_rechecks_its_seal() {
+    let node_manager = crate::node_manager_transport::fake::FakeNodeManager::default().serve();
+    let conn = crate::db::test_conn();
+    let id = pplx_space_common_core::types::SandboxId::new().to_string();
+    crate::service::tests::service_tests::insert_test_sandbox(&conn, &id, SandboxState::Stopped);
+    let service = service_with_node_manager(conn, &node_manager);
+    service.activation_seal.seal(&service.db, 7).unwrap();
+    service.activation_seal.unseal(&service.db, 7).unwrap();
+    service
+        .run_drain_action(7, PlannedAction::PublishDisk { sandbox_id: id })
+        .await
+        .unwrap();
+    assert_eq!(node_manager.calls(), Vec::<String>::new());
+}
+
+/// A suspended sandbox the drain suspended, whose snapshot is still
+/// uploading, is pending; once the upload completes it is evacuated with its
+/// prior lifecycle and the node is done.
+#[tokio::test]
+async fn a_pending_upload_becomes_an_evacuation() {
+    let conn = crate::db::test_conn();
+    conn.execute(
+        "INSERT INTO sandboxes (
+             id, uuid8, state, template, user, runtime, created_at, updated_at,
+             process_env_json, auto_lifecycle_json, auto_lifecycle_state_json,
+             current_local_artifact_id, current_local_artifact_kind,
+             current_local_artifact_origin
+         ) VALUES ('sbx-a', 'uuid8', 'suspended', 'seed', 'u', 'fc', '0', '0',
+                   '{}', '{}', '{}', ?1, 'full', 'suspend')",
+        crate::db::fixture::params![FULL_ARTIFACT],
+    )
+    .unwrap();
+    insert_artifact(&conn, FULL_ARTIFACT, ("suspend", None), false, "ready");
+    crate::db::activation_seal::record_drain_suspend(&conn, "sbx-a", DrainPrior::Paused).unwrap();
+    let (service, first) = sealed_service_with(conn, 7);
+
+    let report = service.finish_drain(7, &first, DrainScans::default());
+    assert!(!report.done);
+    assert!(report.evacuated.is_empty());
+    assert_eq!(
+        report.pending,
+        [DrainPending {
+            sandbox_id: "sbx-a".into(),
+            action: "upload".into(),
+        }]
+    );
+    service.drain_actions.wait_idle().await;
+
+    service
+        .local_artifacts()
+        .mark_backup_completed(FULL_ARTIFACT.parse().unwrap())
+        .unwrap();
+    let report = service.finish_drain(7, &first, DrainScans::default());
+    assert_eq!(
+        report.evacuated,
+        [DrainEvacuated {
+            sandbox_id: "sbx-a".into(),
+            prior: crate::proto::DrainPrior::Paused as i32,
+            artifact_id: FULL_ARTIFACT.into(),
+        }]
+    );
+    assert!(report.done, "{report:?}");
 }
