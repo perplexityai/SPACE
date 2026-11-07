@@ -14,7 +14,7 @@ import (
 
 // The annotations of a runtime upgrade pod beyond its checkpoint; see
 // runtimeUpgradeCheckpoint. They mirror the constants of the same names in
-// crates/libs/common/core/src/k8s/runtime_upgrade.rs, which renders them.
+// crates/l40_api/sandbox/pod/src/runtime_upgrade.rs, which renders them.
 const (
 	sandboxRuntimeUpgradeOperationIDAnnotation          = "space.pplx.net/runtime-upgrade-operation-id"
 	sandboxRuntimeUpgradeTargetEnvironmentAnnotation    = "space.pplx.net/runtime-upgrade-target-environment"

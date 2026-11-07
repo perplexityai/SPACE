@@ -196,8 +196,4 @@ impl SandboxPodConfigValues {
 }
 
 #[cfg(test)]
-// Explicit because this module is itself reached through `#[path]`, so rustc
-// would resolve a bare `mod tests;` to `k8s/tests.rs` — which already exists
-// as the parent module's own test file.
-#[path = "node_selector/tests.rs"]
 mod tests;

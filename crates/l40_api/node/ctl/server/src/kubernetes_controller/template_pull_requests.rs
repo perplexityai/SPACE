@@ -4,10 +4,8 @@ use std::time::Duration;
 use k8s_openapi::api::core::v1::Node;
 use kube::api::{Patch, PatchParams};
 use kube::{Api, Client};
-use pplx_space_common_core::kubernetes::{
-    is_template_write_annotation_key, parse_template_write_annotation,
-};
 use pplx_space_common_core::types::{DEFAULT_TEMPLATE_TAG, TemplateReference, TemplateSelector};
+use pplx_space_sandbox_pod::{is_template_write_annotation_key, parse_template_write_annotation};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 

@@ -11,7 +11,7 @@ use pplx_space_common_core::types::SandboxId;
 use pplx_space_public_api::PUBLIC_SANDBOX_ID_PREFIX;
 use uuid::Uuid;
 
-/// The prefix of the names `pplx_space_common_core::kubernetes::sandbox_pod_name`
+/// The prefix of the names `pplx_space_sandbox_pod::sandbox_pod_name`
 /// gives sandbox pods: `space-sbx-<undashed uuid>-g<execution generation>`.
 const SANDBOX_POD_NAME_PREFIX: &str = "space-sbx-";
 const SANDBOX_POD_GENERATION_PREFIX: &str = "-g";

@@ -1,0 +1,30 @@
+[package]
+name = "pplx-space-sandbox-pod"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+base64 = { workspace = true }
+k8s-openapi = { workspace = true, features = ["v1_32"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true, features = ["serde"] }
+
+# internal
+pplx-space-common-core = { workspace = true, features = ["serde"] }
+pplx-space-env-vars = { workspace = true }
+pplx-space-policy-authority = { workspace = true }
+
+[dev-dependencies]
+insta = { workspace = true, features = ["yaml"] }
+pplx-space-net-common = { workspace = true, features = ["serde"] }

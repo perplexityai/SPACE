@@ -34,15 +34,11 @@ use pplx_space_cluster_pool::{
     AutoscaleRun, InvalidPoolConfigRow, NewPoolSlot, PoolConfig, PoolConfigRead, PoolSlot,
     PoolSlotCounts, PoolSlotState, WarmPoolStore,
 };
-use pplx_space_common_core::kubernetes::NodeGroupPlacement;
-use pplx_space_common_core::kubernetes::PodEnvironment;
-use pplx_space_common_core::{
-    kubernetes::{
-        DEFAULT_SANDBOX_PROXY_PORT, SANDBOX_POOL_ROLE_WARM, SandboxPodConfigValues,
-        TEMPLATE_PRESENT_LABEL_VALUE, template_build_presence_label_key,
-        template_write_annotation_key_for,
-    },
-    types::{SandboxId, TemplateArtifactDigest, TemplateReference},
+use pplx_space_common_core::types::{SandboxId, TemplateArtifactDigest, TemplateReference};
+use pplx_space_sandbox_pod::{
+    DEFAULT_SANDBOX_PROXY_PORT, NodeGroupPlacement, PodEnvironment, SANDBOX_POOL_ROLE_WARM,
+    SandboxPodConfigValues, TEMPLATE_PRESENT_LABEL_VALUE, template_build_presence_label_key,
+    template_write_annotation_key_for,
 };
 use pplx_space_sandbox_store::delete::delete_with_dependents;
 use pplx_space_sbx_mgr_client::proto::SpacedWaitReadyRequest;
@@ -67,7 +63,7 @@ use crate::pod::{build_pool_pod, pool_pod_name, ready_pod_metadata};
 #[derive(Debug, thiserror::Error)]
 pub enum WarmPoolError {
     #[error(transparent)]
-    PodConfig(#[from] pplx_space_common_core::kubernetes::NodeSelectorLabelsParseError),
+    PodConfig(#[from] pplx_space_sandbox_pod::NodeSelectorLabelsParseError),
     #[error("warm slot create semaphore closed")]
     CreatePermitsClosed(#[source] tokio::sync::AcquireError),
     #[error("warm pool config reconcile worker panicked: {0}")]

@@ -3,8 +3,8 @@ use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
 
-use pplx_space_common_core::kubernetes::template_build_presence_label_key;
 use pplx_space_common_grpc::{GrpcClient, GrpcRetryContext};
+use pplx_space_sandbox_pod::template_build_presence_label_key;
 use pplx_space_template_mgr_client::TemplateManagerGrpcClient;
 use pplx_space_template_mgr_client::proto::{
     GetTemplateRequest, ListTemplatesRequest, TemplateRef,

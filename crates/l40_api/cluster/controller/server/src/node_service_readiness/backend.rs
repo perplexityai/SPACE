@@ -218,9 +218,7 @@ pub(super) fn node_label_state(node: &Node) -> Option<NodeLabelState> {
         .metadata
         .labels
         .as_ref()
-        .and_then(|labels| {
-            labels.get(pplx_space_common_core::kubernetes::NODE_SERVICES_READY_LABEL)
-        })
+        .and_then(|labels| labels.get(pplx_space_sandbox_pod::NODE_SERVICES_READY_LABEL))
         .cloned();
     Some(NodeLabelState { name, current })
 }

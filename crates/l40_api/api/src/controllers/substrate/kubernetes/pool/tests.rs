@@ -1285,7 +1285,7 @@ fn pod_patch_reply(status: StatusCode) -> super::super::scripted_test_doubles::K
 fn patched_client_label(
     request: &super::super::scripted_test_doubles::KubeRequest,
 ) -> Option<Option<String>> {
-    use pplx_space_common_core::kubernetes::SANDBOX_CLIENT_ID_LABEL;
+    use pplx_space_sandbox_pod::SANDBOX_CLIENT_ID_LABEL;
     let value = request
         .body
         .as_ref()?

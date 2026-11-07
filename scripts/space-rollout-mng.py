@@ -184,7 +184,7 @@ DEFAULT_COHORT_TAINT_KEY = "space.pplx.net/rollout-cohort"
 ROLLOUT_KINDS = ("lt", "instance_type", "eks_version", "capacity_type", "az", "other")
 
 # Label every sandbox pod (user-create, restore, evacuation, pooled) carries
-# via `build_sandbox_pod` (`crates/libs/common/core/src/k8s.rs`). Used to
+# via `build_sandbox_pod` (`crates/l40_api/sandbox/pod/src/lib.rs`). Used to
 # scope the cluster-wide Pending-pod query for the
 # `node_drain.evacuation_pods_pending` derived gauge.
 SANDBOX_POD_LABEL_SELECTOR = "app.kubernetes.io/name=space-sandbox"

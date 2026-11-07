@@ -285,11 +285,10 @@ attribute, rustc resolves its children in the host's **own directory**, not in
 a `<host-stem>/` subdirectory. A bare `mod tests;` in such a file would land
 the tests as a confusing top-level sibling. Put an explicit
 `#[path = "<host-stem>/tests.rs"]` on the declaration (with a one-line comment
-saying why) so the file still lands where this table predicts —
-`crates/libs/common/core/src/k8s.rs` (loaded as `mod kubernetes` via
-`#[path]`) is the worked example. This is the one *correct* use of `#[path]`
-on a test declaration: it exists to land on the convention, unlike the legacy
-flat variant at the end of this section, which exists to dodge it.
+saying why) so the file still lands where this table predicts. This is the
+one *correct* use of `#[path]` on a test declaration: it exists to land on the
+convention, unlike the legacy flat variant at the end of this section, which
+exists to dodge it.
 
 One module, one file. A src file with two named test modules gets two sibling
 files, not one file with two `mod` blocks inside it. Nesting follows Rust's
@@ -400,8 +399,8 @@ enables it on its own dev-dependency.
   which also drops the trailing commas vertical layouts carry. The diff is
   AST-identical; don't hand-rewrap to fight it, and don't mistake it for a
   content change in review.
-- **`insta::with_settings!({ snapshot_path => "fixtures" })` is file-relative
-  too** (`crates/libs/common/core/src/k8s.rs`,
+- **`insta::with_settings!({ snapshot_path => "../fixtures" })` is
+  file-relative too** (`crates/l40_api/sandbox/pod/src/tests.rs`,
   `crates/l40_api/node/mgr/server/src/firewall.rs`). Either move the fixture
   directory with the tests or adjust the setting; a stale relative path fails as
   a missing snapshot, not as a compile error.

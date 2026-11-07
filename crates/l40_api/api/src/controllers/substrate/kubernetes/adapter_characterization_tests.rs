@@ -19,14 +19,12 @@ mod restoring_access;
 use std::collections::BTreeMap;
 
 use crate::metrics::sandbox::api::SandboxApiMetricIdentity;
-use pplx_space_common_core::kubernetes::{
-    SANDBOX_EXECUTION_GENERATION_ANNOTATION, SANDBOX_ID_ANNOTATION,
-};
 use pplx_space_common_core::sql;
 use pplx_space_common_core::types::{
     AutoLifecyclePolicy, Email, OrgId, SandboxId, TemplateName, UserId,
 };
 use pplx_space_net_common::NetworkPolicyV1;
+use pplx_space_sandbox_pod::{SANDBOX_EXECUTION_GENERATION_ANNOTATION, SANDBOX_ID_ANNOTATION};
 use sqlx::PgPool;
 
 use super::scripted_test_doubles::{BoxError, WORKER_NODE};

@@ -3,7 +3,7 @@
 
 use std::time::Duration;
 
-use pplx_space_common_core::kubernetes::SANDBOX_VCPU_ANNOTATION;
+use pplx_space_sandbox_pod::SANDBOX_VCPU_ANNOTATION;
 
 use super::*;
 use crate::controllers::substrate::{

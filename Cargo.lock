@@ -4918,6 +4918,7 @@ dependencies = [
  "pplx-space-rustls-provider",
  "pplx-space-sandbox-grpc",
  "pplx-space-sandbox-metrics",
+ "pplx-space-sandbox-pod",
  "pplx-space-sandbox-portability",
  "pplx-space-sandbox-quarantine-store",
  "pplx-space-sandbox-residency",
@@ -5258,6 +5259,7 @@ dependencies = [
  "pplx-space-postgres-pool",
  "pplx-space-public-api",
  "pplx-space-runtime-environment-catalog-store",
+ "pplx-space-sandbox-pod",
  "pplx-space-sandbox-portability",
  "pplx-space-sandbox-quarantine-store",
  "pplx-space-sandbox-residency",
@@ -5377,9 +5379,6 @@ name = "pplx-space-common-core"
 version = "0.8.2"
 dependencies = [
  "aws-lc-rs",
- "base64 0.23.1",
- "insta",
- "k8s-openapi",
  "libc",
  "nix 0.31.3",
  "pplx-space-accounts",
@@ -5400,13 +5399,11 @@ dependencies = [
  "pplx-space-net-common",
  "pplx-space-network-roles",
  "pplx-space-pii",
- "pplx-space-policy-authority",
  "pplx-space-rpc-contracts",
  "pplx-space-semver",
  "pplx-space-sql-locator",
  "serde",
  "serde_json",
- "sha2 0.11.0",
  "sqlx",
  "tempfile",
  "thiserror 2.0.20",
@@ -6659,6 +6656,7 @@ dependencies = [
  "pplx-space-observability",
  "pplx-space-policy-authority",
  "pplx-space-reconcile-metrics",
+ "pplx-space-sandbox-pod",
  "pplx-space-sbx-mgr-client",
  "pplx-space-service-lifecycle",
  "pplx-space-service-mutex",
@@ -7277,6 +7275,25 @@ dependencies = [
  "pplx-space-k8s-ids",
  "pplx-space-metrics-emit",
  "pplx-space-observability",
+]
+
+[[package]]
+name = "pplx-space-sandbox-pod"
+version = "0.8.2"
+dependencies = [
+ "base64 0.23.1",
+ "insta",
+ "k8s-openapi",
+ "pplx-space-common-core",
+ "pplx-space-env-vars",
+ "pplx-space-net-common",
+ "pplx-space-policy-authority",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "thiserror 2.0.20",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]

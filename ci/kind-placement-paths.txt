@@ -2,8 +2,7 @@
 # contract can change. Read by the existing kind-pull-needed.sh selector; a
 # match also requires Kind when no routine path matched. Patterns cover both
 # renderers, shared selector parsing, eligibility and chart configuration.
-crates/libs/common/core/src/k8s.rs
-crates/libs/common/core/src/k8s/**
+crates/l40_api/sandbox/pod/src/**
 crates/l40_api/api/src/controllers/substrate/**
 crates/l40_api/api/src/cluster_admission.rs
 crates/l40_api/api/src/cluster_admission/**

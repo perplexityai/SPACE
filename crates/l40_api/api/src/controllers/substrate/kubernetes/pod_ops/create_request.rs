@@ -227,10 +227,7 @@ impl KubernetesSubstrate {
             context.direct_node_name(),
         ) && let Some(node) = self.k8s.caches.node_by_name(node_name)
             && !node.metadata.labels.as_ref().is_some_and(|labels| {
-                pplx_space_common_core::kubernetes::node_publishes_environment(
-                    labels,
-                    &required.reference,
-                )
+                pplx_space_sandbox_pod::node_publishes_environment(labels, &required.reference)
             })
         {
             return Err(SubstrateError::Conflict {

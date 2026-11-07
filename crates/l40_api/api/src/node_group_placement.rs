@@ -53,7 +53,7 @@
 //!   hardware. It is the data-isolation guarantee, and it is per (org,
 //!   template) rather than cluster-wide.
 //!
-//! [`SANDBOX_NODE_GROUP_PLACEMENT_ENV`]: pplx_space_common_core::kubernetes::SANDBOX_NODE_GROUP_PLACEMENT_ENV
+//! [`SANDBOX_NODE_GROUP_PLACEMENT_ENV`]: pplx_space_sandbox_pod::SANDBOX_NODE_GROUP_PLACEMENT_ENV
 
 use pplx_space_common_core::types::SandboxId;
 
@@ -61,10 +61,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::metrics::node_group_placement as metrics;
 use k8s_openapi::api::core::v1::Node;
-use pplx_space_common_core::kubernetes::{
+use pplx_space_common_core::types::{NodeGroup, OrgId, TemplateVisibility};
+use pplx_space_sandbox_pod::{
     NodeGroupPlacement, NodeGroupPlacementError, SANDBOX_NODE_GROUP_PLACEMENT_ENV, node_group_label,
 };
-use pplx_space_common_core::types::{NodeGroup, OrgId, TemplateVisibility};
 use sqlx::PgPool;
 
 mod store;

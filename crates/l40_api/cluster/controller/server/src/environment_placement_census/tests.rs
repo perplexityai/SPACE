@@ -1,6 +1,6 @@
 use k8s_openapi::api::core::v1::{Pod, PodSpec, PodStatus};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{ObjectMeta, Time};
-use pplx_space_common_core::kubernetes::{
+use pplx_space_sandbox_pod::{
     ENVIRONMENT_USABLE_LABEL_VALUE, SANDBOX_ENVIRONMENT_ANNOTATION, environment_label_key,
 };
 

@@ -28,14 +28,14 @@ use tracing_subscriber::{Layer, layer::Context, prelude::*};
 use uuid::Uuid;
 
 #[cfg(feature = "kubernetes")]
-use pplx_space_common_core::kubernetes::SANDBOX_SUSPEND_RESTORE_STORAGE_URI_ANNOTATION;
-#[cfg(feature = "kubernetes")]
 use pplx_space_common_core::types::SnapshotId;
 use pplx_space_common_core::types::{
     AutoLifecycleIdleAction, AutoLifecyclePolicy, AutoLifecycleRuntimeState, DEFAULT_TEMPLATE_TAG,
     SandboxLifecycle, SandboxOwnerSource, TemplateVisibility,
 };
 use pplx_space_ecw_credential::EcwCredentialKeyring;
+#[cfg(feature = "kubernetes")]
+use pplx_space_sandbox_pod::SANDBOX_SUSPEND_RESTORE_STORAGE_URI_ANNOTATION;
 
 use super::{
     ConnectTouchRecovery, ECW_DEFAULT_CREATE_TIMEOUT_SECS, ECW_DEFAULT_TEMPLATE_ID,
@@ -5072,9 +5072,7 @@ async fn connect_route_labels_the_restore_pod_with_the_connecting_client(
             panic!("expected one restore pod, got {}", pod_creates.len());
         };
         pod.pointer("/metadata/labels")
-            .and_then(|labels| {
-                labels.get(pplx_space_common_core::kubernetes::SANDBOX_CLIENT_ID_LABEL)
-            })
+            .and_then(|labels| labels.get(pplx_space_sandbox_pod::SANDBOX_CLIENT_ID_LABEL))
             .and_then(serde_json::Value::as_str)
             .map(str::to_string)
     };

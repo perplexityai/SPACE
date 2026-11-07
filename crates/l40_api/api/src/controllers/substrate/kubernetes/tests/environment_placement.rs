@@ -10,7 +10,7 @@ use pplx_space_db_test_fixtures::{SEED_ORG_ID, insert_ready_worker_node};
 
 use super::*;
 use crate::controllers::substrate::environment_placement::EnvironmentPlacementGate;
-use pplx_space_common_core::kubernetes::PodEnvironment;
+use pplx_space_sandbox_pod::PodEnvironment;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -361,7 +361,7 @@ async fn a_release_without_a_binding_takes_its_environment_from_the_build_invent
 /// `common` through, so a dropped field renders an unbound pod.
 #[tokio::test(flavor = "current_thread")]
 async fn every_pod_build_path_renders_the_environment() {
-    use pplx_space_common_core::kubernetes::{
+    use pplx_space_sandbox_pod::{
         SANDBOX_ENVIRONMENT_ANNOTATION, build_sandbox_pod, environment_label_key,
     };
     let substrate = substrate_with_unreachable_store();
@@ -462,12 +462,10 @@ async fn a_stopped_replacement_requires_its_pinned_disk_environment_while_restor
         })
     };
     let pinned = || {
-        evacuation(Some(
-            pplx_space_common_core::kubernetes::StoppedMaterialization {
-                artifact_id,
-                excluded_node_names: &excluded,
-            },
-        ))
+        evacuation(Some(pplx_space_sandbox_pod::StoppedMaterialization {
+            artifact_id,
+            excluded_node_names: &excluded,
+        }))
     };
     assert_eq!(
         substrate
@@ -543,7 +541,7 @@ fn pod_environment_follows_the_gate() {
 pub(in crate::controllers::substrate::kubernetes) fn created_pod_environment(
     pod: &serde_json::Value,
 ) -> (Option<String>, bool) {
-    use pplx_space_common_core::kubernetes::SANDBOX_ENVIRONMENT_ANNOTATION;
+    use pplx_space_sandbox_pod::SANDBOX_ENVIRONMENT_ANNOTATION;
     let annotation = pod
         .pointer("/metadata/annotations")
         .and_then(|annotations| annotations.get(SANDBOX_ENVIRONMENT_ANNOTATION))
@@ -557,7 +555,7 @@ pub(in crate::controllers::substrate::kubernetes) fn created_pod_environment(
         .cloned()
         .unwrap_or_default();
     let required = annotation.as_deref().is_some_and(|recorded| {
-        let key = pplx_space_common_core::kubernetes::environment_label_key(&reference(recorded));
+        let key = pplx_space_sandbox_pod::environment_label_key(&reference(recorded));
         !terms.is_empty()
             && terms.iter().all(|term| {
                 term.get("matchExpressions")
@@ -650,7 +648,7 @@ async fn a_materialized_on_demand_pod_requires_its_release_environment() -> Resu
     assert_eq!(
         pod.pointer("/metadata/annotations")
             .and_then(|annotations| {
-                annotations.get(pplx_space_common_core::kubernetes::SANDBOX_CHECKPOINT_ANNOTATION)
+                annotations.get(pplx_space_sandbox_pod::SANDBOX_CHECKPOINT_ANNOTATION)
             }),
         None,
         "an on-demand pod restores no checkpoint"
@@ -790,7 +788,7 @@ async fn a_stopped_start_requires_its_disk_environment_after_the_published_execu
 #[tokio::test(flavor = "current_thread")]
 async fn a_pinned_restore_is_refused_before_its_pod_when_the_source_node_lacks_the_environment()
 -> Result<(), BoxError> {
-    use pplx_space_common_core::kubernetes::{
+    use pplx_space_sandbox_pod::{
         ENVIRONMENT_USABLE_LABEL_VALUE, SandboxPodConfigValues, environment_label_key,
     };
     let db = pplx_space_db_test_fixtures::pg_test_db().await?;

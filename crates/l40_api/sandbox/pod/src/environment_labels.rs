@@ -15,7 +15,7 @@ use std::collections::BTreeMap;
 
 use k8s_openapi::api::core::v1::NodeSelectorRequirement;
 
-use crate::types::EnvironmentReference;
+use pplx_space_common_core::types::EnvironmentReference;
 
 /// Every environment label's key starts with this.
 pub const ENVIRONMENT_LABEL_KEY_PREFIX: &str = "space.pplx.net/env-";
@@ -89,8 +89,5 @@ pub fn node_publishes_any_environment(labels: &BTreeMap<String, String>) -> bool
     })
 }
 
-// Explicit because this module is itself reached through `#[path]`, so rustc
-// would resolve a bare `mod tests;` to `k8s/tests.rs`.
 #[cfg(test)]
-#[path = "environment_labels/tests.rs"]
 mod tests;

@@ -38,8 +38,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use pplx_space_api::controllers::substrate::kubernetes::KubernetesSubstrate;
-use pplx_space_common_core::kubernetes::NODE_GROUP_LABEL;
 use pplx_space_common_core::types::NodeGroupId;
+use pplx_space_sandbox_pod::NODE_GROUP_LABEL;
 use sqlx::PgPool;
 use tokio_util::sync::CancellationToken;
 

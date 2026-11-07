@@ -46,7 +46,7 @@ pub(crate) fn full_cluster_slot_check_admission(
     use crate::controllers::substrate::kubernetes::tests::{
         node_with_network_slots, sandbox_pod_on_node, substrate_with_inventory_caches_and_pool,
     };
-    use pplx_space_common_core::kubernetes::SandboxPodConfigValues;
+    use pplx_space_sandbox_pod::SandboxPodConfigValues;
     let labels = SandboxPodConfigValues::default()
         .base_node_selector()
         .into_labels();

@@ -860,7 +860,7 @@ mod pod_classification {
             metadata: kube::api::ObjectMeta {
                 name: Some("worker-a".to_string()),
                 labels: Some(std::collections::BTreeMap::from([(
-                    pplx_space_common_core::kubernetes::NODE_SERVICES_READY_LABEL.to_string(),
+                    pplx_space_sandbox_pod::NODE_SERVICES_READY_LABEL.to_string(),
                     "false".to_string(),
                 )])),
                 ..Default::default()
@@ -890,11 +890,11 @@ mod pod_classification {
 fn label_values_match_the_published_vocabulary() {
     assert_eq!(
         NodeServicesReady::Ready.as_str(),
-        pplx_space_common_core::kubernetes::NODE_SERVICES_READY_VALUE
+        pplx_space_sandbox_pod::NODE_SERVICES_READY_VALUE
     );
     assert_eq!(
         NodeServicesReady::NotReady.as_str(),
-        pplx_space_common_core::kubernetes::NODE_SERVICES_NOT_READY_VALUE
+        pplx_space_sandbox_pod::NODE_SERVICES_NOT_READY_VALUE
     );
     assert_eq!(
         node_label_apply("worker-a", NodeServicesReady::NotReady),

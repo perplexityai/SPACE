@@ -7,13 +7,13 @@ use super::*;
 use crate::controllers::substrate::runtime_upgrade::UpgradeActivation;
 use crate::controllers::substrate::{ActivationOptions, RecoveryCharge};
 use crate::metrics::sandbox::api::{RestoreClaimLap, WakeCoalesceOutcome};
-use pplx_space_common_core::kubernetes::EvacuationPlacement;
 use pplx_space_common_core::types::{
     SandboxActivationAttemptId, SandboxLifecycle, SandboxTransitionTargetState,
 };
 use pplx_space_events::{
     SandboxEvent, SandboxEventBoolField, SandboxEventDetails, SandboxEventSource, SandboxEventType,
 };
+use pplx_space_sandbox_pod::EvacuationPlacement;
 use pplx_space_work_coalescer::{
     JoinError as CoalesceJoinError, Role as CoalesceRole, WorkOutcome,
 };

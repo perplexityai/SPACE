@@ -4,11 +4,11 @@
 
 use std::sync::{Arc, Mutex};
 
-use pplx_space_common_core::kubernetes::SANDBOX_CLIENT_ID_LABEL;
 use pplx_space_common_core::sql;
 use pplx_space_common_core::types::{
     ClientId, SandboxActivationAttemptId, SandboxId, SandboxTransitionTargetState,
 };
+use pplx_space_sandbox_pod::SANDBOX_CLIENT_ID_LABEL;
 use pplx_space_test_env::TestResult;
 use uuid::Uuid;
 

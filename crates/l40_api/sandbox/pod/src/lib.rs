@@ -1,5 +1,6 @@
-//! Kubernetes metadata naming helpers shared by SPACE control-plane and node
-//! services.
+//! The Kubernetes sandbox pod: [`build_sandbox_pod`] and its node-group
+//! [`placement`], plus the node and pod label, annotation and resource
+//! vocabulary that the api, the cluster controller and node-ctl share.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -15,12 +16,11 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use crate::types::{
+use pplx_space_common_core::types::{
     MemorySize, NodePoolName, ROOT_SANDBOX_OWNER, SandboxOwner, TemplateReference, VcpuCount,
 };
 use pplx_space_policy_authority::PolicyAuthority;
 
-#[path = "k8s/placement.rs"]
 pub mod placement;
 pub use placement::{
     DEDICATED_NODE_GROUP_PREFERENCE_WEIGHT, DEDICATED_NODE_TAINT_KEY,
@@ -28,15 +28,12 @@ pub use placement::{
     SANDBOX_NODE_GROUP_LABEL, SANDBOX_NODE_GROUP_PLACEMENT_ENV, node_group_label,
 };
 
-#[path = "k8s/node_selector.rs"]
 pub mod node_selector;
 pub use node_selector::SandboxNodeSelector;
 
-#[path = "k8s/runtime_upgrade.rs"]
 mod runtime_upgrade;
 pub use runtime_upgrade::*;
 
-#[path = "k8s/environment_labels.rs"]
 pub mod environment_labels;
 pub use environment_labels::{
     ENVIRONMENT_LABEL_KEY_PREFIX, ENVIRONMENT_USABLE_LABEL_VALUE, PodEnvironment,
@@ -109,7 +106,7 @@ pub const SANDBOX_USER_ANNOTATION: &str = "space.pplx.net/sandbox-user";
 pub const SANDBOX_VOLUME_ENCRYPTION_ANNOTATION: &str = "space.pplx.net/volume-encryption";
 pub const SANDBOX_OWNER_ID_LABEL: &str = "space.pplx.net/user-id";
 pub const SANDBOX_ORG_ID_LABEL: &str = "space.pplx.net/org-id";
-/// The [`crate::types::ClientId`] whose activation created the pod. Set when
+/// The [`ClientId`](pplx_space_common_core::types::ClientId) whose activation created the pod. Set when
 /// the pod is created and never changed, except that a warm-pool pod, built
 /// before it has an adopter, is labeled when it's adopted. An activation
 /// with no client id to attribute (one inheriting an empty record) leaves the
@@ -136,7 +133,7 @@ pub const MAX_SANDBOX_NETWORK_POLICY_ANNOTATION_BYTES: usize = 128 * 1024;
 /// request and limit are both `1` and the resource is never overcommitted.
 pub const SANDBOX_NETWORK_SLOTS_RESOURCE: &str = "space.pplx.net/network-slots";
 
-/// Node label carrying the node's [`HostCpu`](crate::types::HostCpu) identity,
+/// Node label carrying the node's [`HostCpu`](pplx_space_common_core::types::HostCpu) identity,
 /// published by the node-local controller from `/proc/cpuinfo`.
 ///
 /// It's the same derivation the sandbox manager records as a suspend
@@ -420,7 +417,7 @@ pub fn parse_node_selector_labels(
 impl SandboxPodConfigValues {
     pub fn from_env() -> Result<Self, NodeSelectorLabelsParseError> {
         Ok(Self {
-            node_group_placement: crate::env::env_flag_var(
+            node_group_placement: pplx_space_env_vars::env_flag_var(
                 SANDBOX_NODE_GROUP_PLACEMENT_ENV,
                 DEFAULT_SANDBOX_NODE_GROUP_PLACEMENT,
             ),
@@ -445,11 +442,11 @@ impl SandboxPodConfigValues {
             internal_token_key: DEFAULT_SANDBOX_INTERNAL_TOKEN_KEY.to_string(),
             internal_control_token_key: DEFAULT_SANDBOX_INTERNAL_CONTROL_TOKEN_KEY.to_string(),
             ssd_headroom_tier_affinity: DEFAULT_SANDBOX_SSD_HEADROOM_TIER_AFFINITY,
-            restore_source_node_hard_pin: crate::env::env_flag_var(
+            restore_source_node_hard_pin: pplx_space_env_vars::env_flag_var(
                 SANDBOX_RESTORE_SOURCE_NODE_HARD_PIN_ENV,
                 DEFAULT_SANDBOX_RESTORE_SOURCE_NODE_HARD_PIN,
             ),
-            node_services_ready_affinity: crate::env::env_flag_var(
+            node_services_ready_affinity: pplx_space_env_vars::env_flag_var(
                 SANDBOX_NODE_SERVICES_READY_AFFINITY_ENV,
                 DEFAULT_SANDBOX_NODE_SERVICES_READY_AFFINITY,
             ),
@@ -504,14 +501,14 @@ pub struct SandboxPoolPodMetadata {
     pub vcpu: VcpuCount,
     pub memory: MemorySize,
     pub disk_mib: Option<u32>,
-    pub disk_io_limits: crate::types::DiskIoLimits,
+    pub disk_io_limits: pplx_space_common_core::types::DiskIoLimits,
 }
 
 pub struct SandboxPodCommon<'a> {
     pub pod_name: &'a str,
-    pub sandbox_id: crate::types::SandboxId,
+    pub sandbox_id: pplx_space_common_core::types::SandboxId,
     pub execution_generation: i64,
-    pub activation_attempt_id: Option<crate::types::SandboxActivationAttemptId>,
+    pub activation_attempt_id: Option<pplx_space_common_core::types::SandboxActivationAttemptId>,
     pub template: &'a str,
     pub content_hash: Option<&'a str>,
     pub env: &'a BTreeMap<String, String>,
@@ -525,10 +522,10 @@ pub struct SandboxPodCommon<'a> {
 #[derive(Debug, Clone, Copy)]
 pub struct SandboxRuntimePodMetadata<'a> {
     pub sandbox_owner: &'a SandboxOwner,
-    pub user_id: crate::types::UserId,
-    pub org_id: crate::types::OrgId,
+    pub user_id: pplx_space_common_core::types::UserId,
+    pub org_id: pplx_space_common_core::types::OrgId,
     /// Rendered as [`SANDBOX_CLIENT_ID_LABEL`] when `Some`.
-    pub client_id: Option<&'a crate::types::ClientId>,
+    pub client_id: Option<&'a pplx_space_common_core::types::ClientId>,
     pub auto_lifecycle_json: &'a str,
     pub auto_lifecycle_authority: PolicyAuthority,
     pub network_policy_json: &'a str,
@@ -537,7 +534,7 @@ pub struct SandboxRuntimePodMetadata<'a> {
     pub vcpu: Option<u32>,
     pub memory_mib: Option<u32>,
     pub disk_mib: Option<u32>,
-    pub disk_io_limits: crate::types::DiskIoLimits,
+    pub disk_io_limits: pplx_space_common_core::types::DiskIoLimits,
     /// BYOK: render the [`SANDBOX_VOLUME_ENCRYPTION_ANNOTATION`] so the shim
     /// creates the node sandbox with its immutable encrypted-volumes flag.
     pub volume_encryption: bool,
@@ -572,7 +569,7 @@ pub enum SandboxPodRequest<'a> {
         /// Disk restarts use retained rootfs; full restores resume VM memory.
         /// The shim translates the disk marker into a cold Start or a retry
         /// attachment after observing the local sandbox state.
-        artifact_kind: crate::types::ArtifactKind,
+        artifact_kind: pplx_space_common_core::types::ArtifactKind,
         common: SandboxPodCommon<'a>,
         runtime: SandboxRuntimePodMetadata<'a>,
         /// Node-group placement recomputed from the *current* template
@@ -749,7 +746,10 @@ impl EvacuationPlacement {
     }
 }
 
-pub fn sandbox_pod_name(sandbox_id: crate::types::SandboxId, execution_generation: i64) -> String {
+pub fn sandbox_pod_name(
+    sandbox_id: pplx_space_common_core::types::SandboxId,
+    execution_generation: i64,
+) -> String {
     format!(
         "space-sbx-{}-g{execution_generation}",
         sandbox_id.as_uuid().simple()
@@ -764,7 +764,7 @@ pub struct StoppedMaterialization<'a> {
     /// [`STOPPED_MATERIALIZATION_CHECKPOINT`] in place of the checkpoint the
     /// artifact kind would select, and names the artifact in
     /// [`SANDBOX_STOPPED_MATERIALIZATION_ARTIFACT_ID_ANNOTATION`].
-    pub artifact_id: crate::types::LocalArtifactId,
+    pub artifact_id: pplx_space_common_core::types::LocalArtifactId,
     /// Workers the pod must not be placed on, rendered as one required
     /// `matchFields: metadata.name NotIn` per node: the nodes the sandbox's
     /// retired executions record. A local `stopped` row for the sandbox can
@@ -857,8 +857,8 @@ pub fn build_sandbox_pod(config: &SandboxPodConfig<'_>, request: SandboxPodReque
                         STOPPED_MATERIALIZATION_CHECKPOINT
                     } else {
                         match artifact_kind {
-                            crate::types::ArtifactKind::Full => "suspend",
-                            crate::types::ArtifactKind::Disk => "stopped",
+                            pplx_space_common_core::types::ArtifactKind::Full => "suspend",
+                            pplx_space_common_core::types::ArtifactKind::Disk => "stopped",
                         }
                     })
             };
@@ -1991,10 +1991,5 @@ pub fn parse_template_write_annotation(key: &str, value: &str) -> Option<Templat
     TemplateReference::from_str(value).ok()
 }
 
-// This file is itself loaded via `#[path = "k8s.rs"]` (as `mod kubernetes`
-// in lib.rs), so rustc resolves its children in `src/` rather than under a
-// `k8s/` directory. The explicit path keeps the test file where the
-// sibling-file convention expects it without renaming the module.
 #[cfg(test)]
-#[path = "k8s/tests.rs"]
 mod tests;
