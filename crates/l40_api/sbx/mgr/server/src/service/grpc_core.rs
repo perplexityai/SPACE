@@ -349,19 +349,6 @@ impl SandboxManagerService {
             let mut resp_from_pool = None;
             if matches!(intent, SandboxCreateIntent::AdoptPool) {
                 super::validation::validate_execution_lifecycle_policy(Some(&resolved_template.execution), &auto_lifecycle)?;
-                // An autostarted claim resumes the member it adopts, and a
-                // sealed node refuses that resume. Refuse the claim before
-                // it adopts anything, rather than leave the member adopted
-                // and paused for a create that failed. Admission at the
-                // resume stays the enforcement point: a seal that lands
-                // between this read and that admission still refuses the
-                // resume after the adoption, and leaves the member so.
-                if req.autostart {
-                    self.activation_seal.check(
-                        crate::activation_seal::InFlightActivationKind::ResidentResume,
-                        &format!("adopted from pool {template}"),
-                    )?;
-                }
                 let adopt_req = internal_request(pool_adoption_request(
                     req,
                     template.clone(),

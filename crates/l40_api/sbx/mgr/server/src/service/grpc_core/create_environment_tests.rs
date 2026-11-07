@@ -875,63 +875,6 @@ async fn pool_adoption_skips_a_refused_donor_for_the_next_admitted_one() {
     created.shutdown().await;
 }
 
-/// On a sealed node, a create that would claim a pool member and resume it is
-/// refused with the seal's marker before it adopts anything: the donor stays
-/// paused, unclaimed and next in line. A claim without autostart resumes
-/// nothing, so the seal leaves it alone and it adopts the donor.
-#[rstest::rstest]
-#[tokio::test]
-async fn a_sealed_node_refuses_an_autostarted_pool_claim_before_adopting(
-    #[values(true, false)] autostart: bool,
-) {
-    if !enter_isolated_test_process() {
-        return;
-    }
-    let conn = crate::db::test_conn();
-    let donor = insert_pool_donor(&conn, BUILD);
-    let e0 = bound(&definition("e0"));
-    crate::db::upsert_sandbox_execution_metadata(&conn, &donor, &e0).unwrap();
-    let build = bound_template(&e0);
-    let created = Created::new(
-        conn,
-        build.resolver(BUILD),
-        node_manager(&definition("e0"), Node::Executes),
-    );
-    let service = &created.fixture.service;
-    service.activation_seal.seal(&service.db, 3).unwrap();
-    let before = created.fixture.row(&donor).unwrap();
-
-    let result = created
-        .fixture
-        .create(CreateRequest {
-            boot_mode: BootMode::Pool as i32,
-            autostart,
-            ..create_request()
-        })
-        .await;
-
-    if autostart {
-        let refused = result.expect_err("a sealed node refuses the claim's resume");
-        assert_eq!(
-            refused.code(),
-            tonic::Code::FailedPrecondition,
-            "{refused:?}"
-        );
-        assert!(
-            refused.message().contains(
-                pplx_space_common_core::activation_seal_signals::ACTIVATIONS_SEALED_MARKER
-            ),
-            "{refused:?}"
-        );
-        assert_donor_untouched(&created.fixture, &before);
-    } else {
-        let response = result.expect("a claim that resumes nothing is not an activation");
-        assert_eq!(response.sandbox_id, donor);
-        assert_eq!(created.fixture.row(&donor).unwrap().user.as_str(), OWNER);
-    }
-    created.shutdown().await;
-}
-
 /// The AdoptPoolSandbox RPC reports a pool whose donors the node all refuses
 /// the way it reports an empty one, which its callers boot past.
 #[tokio::test]
