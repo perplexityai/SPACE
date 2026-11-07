@@ -2,10 +2,11 @@ use std::path::{Path, PathBuf};
 
 use pplx_space_accounts::SandboxOwner;
 use pplx_space_common_core::types::{
-    ArtifactKind, ArtifactOrigin, DEFAULT_GUEST_USER, ExecutionGeneration, ExecutionMetadata,
-    LocalArtifactId, RuntimeKind, SandboxId, SandboxRuntimeLabel, TemplateName,
+    ArtifactKind, ArtifactOrigin, ExecutionGeneration, ExecutionMetadata, LocalArtifactId,
+    RuntimeKind, SandboxId, SandboxRuntimeLabel, TemplateName,
 };
 use pplx_space_content_digest::ContentHash;
+use pplx_space_guest_process::DEFAULT_GUEST_USER;
 
 use crate::retained_source::{
     RetainedSource, RetainedSourceCheck, RetainedSourceVerdicts, RootfsArtifact,

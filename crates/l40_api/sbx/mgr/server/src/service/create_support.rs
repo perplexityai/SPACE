@@ -8,11 +8,11 @@ use super::validation::{
     template_metadata_arch, template_metadata_spaced_compatibility, template_runtime_defaults,
 };
 use super::*;
-use pplx_space_common_core::types::{EnvMap, EnvSanitizationIssue};
 use pplx_space_events::{
     SandboxEventDetails, SandboxEventSource, SandboxEventType, SandboxRestoreProvenance,
     emit_sandbox_event,
 };
+use pplx_space_guest_process::{EnvMap, EnvSanitizationIssue};
 use pplx_space_template_mgr_client::lookup_scope::TemplateLookupScope;
 
 pub(super) struct ResolvedTemplatePaths {

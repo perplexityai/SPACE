@@ -11,7 +11,7 @@ use axum::{
     http::StatusCode,
 };
 use pplx_space_accounts::CredentialReferenceId;
-use pplx_space_common_core::types::IdempotencyKey;
+use pplx_space_guest_process::IdempotencyKey;
 use pplx_space_public_api::credential_references as wire;
 
 pub(crate) async fn register(

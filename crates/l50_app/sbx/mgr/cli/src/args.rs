@@ -61,7 +61,7 @@ pub(super) fn parse_env_vars(values: Vec<String>) -> BTreeMap<String, String> {
             exit_error(format!("duplicate env key '{key}'"));
         }
     }
-    let (env, issues) = pplx_space_common_core::types::EnvMap::sanitize(env);
+    let (env, issues) = pplx_space_guest_process::EnvMap::sanitize(env);
     for issue in issues {
         eprintln!("WARNING: env sanitized: {issue:?}");
     }

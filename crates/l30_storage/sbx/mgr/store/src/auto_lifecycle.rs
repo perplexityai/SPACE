@@ -27,7 +27,7 @@ pub const TEST_GUEST_ACTIVITY_HOLD_CAP: std::time::Duration =
 
 #[cfg(any(test, feature = "test-support"))]
 #[allow(clippy::unwrap_used)]
-pub fn test_guest_activity_hold_cap() -> pplx_space_common_core::types::SimpleDuration {
+pub fn test_guest_activity_hold_cap() -> pplx_space_durations::SimpleDuration {
     TEST_GUEST_ACTIVITY_HOLD_CAP.try_into().unwrap()
 }
 

@@ -10,7 +10,7 @@
 use std::future::Future;
 use std::time::{Duration, Instant};
 
-use pplx_space_common_core::types::time::format_simple_duration;
+use pplx_space_durations::format_simple_duration;
 use pplx_space_public_api::{OperationId, OperationKind, OperationState, PublicErrorCode};
 use tokio::time::MissedTickBehavior;
 

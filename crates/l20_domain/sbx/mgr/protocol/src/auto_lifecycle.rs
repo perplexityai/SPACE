@@ -4,7 +4,7 @@ use pplx_space_auto_lifecycle::{
     AutoLifecyclePolicy, AutoLifecycleRuntimeState, AutoLifecycleStage, AutoLifecycleStatus,
     AutoLifecycleTransition, AutoLifecycleWakePolicy, AutoLifecycleWakeSource,
 };
-use pplx_space_common_core::types::SimpleDuration;
+use pplx_space_durations::SimpleDuration;
 use prost_types::{Duration as ProtoDuration, Timestamp as ProtoTimestamp};
 
 use crate::proto;

@@ -37,6 +37,7 @@ pplx-space-execution-common = { workspace = true }
 pplx-space-grpc-server = { workspace = true }
 pplx-space-host-layout = { workspace = true }
 pplx-space-host-linux = { workspace = true }
+pplx-space-guest-process = { workspace = true }
 pplx-space-linux-ids = { workspace = true }
 pplx-space-node-runtime-core = { workspace = true, features = ["host-runtime", "artifact-store"] }
 pplx-space-observability = { workspace = true }

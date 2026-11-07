@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use pplx_space_common_core::types::{
+use pplx_space_guest_process::{
     GuestPath, GuestUserName, normalize_linux_guest_path, validate_linux_guest_path_input,
 };
 use pplx_space_spaced_guest_protocol::invalid_argument_status;

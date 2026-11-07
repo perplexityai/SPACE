@@ -31,8 +31,8 @@ use pplx_space_common_core::types::{SandboxId, SnapshotId};
 
 use std::time::Duration;
 
-use pplx_space_common_core::types::PositiveDuration;
 use pplx_space_db_test_fixtures::{SEED_ORG_ID, SEED_USER_ID, pg_test_db, try_pg_test_db};
+use pplx_space_durations::PositiveDuration;
 use pplx_space_sandbox_portability::fresh_ready_snapshot_exists;
 use pplx_space_sandbox_store::test_support::stored_lifecycle_matrix;
 use sqlx::PgPool;

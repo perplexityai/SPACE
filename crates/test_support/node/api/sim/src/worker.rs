@@ -14,9 +14,8 @@
 
 use std::{collections::HashMap, pin::Pin, sync::Arc};
 
-use pplx_space_common_core::types::{
-    BackupAttemptId, EnvMap, EnvSanitizationIssue, LocalArtifactId, NodeManagedBy,
-};
+use pplx_space_common_core::types::{BackupAttemptId, LocalArtifactId, NodeManagedBy};
+use pplx_space_guest_process::{EnvMap, EnvSanitizationIssue};
 use pplx_space_net_gateway_client::proto::{ServicePortIngressFrame, service_port_ingress_frame};
 use pplx_space_node_api_client::proto::worker_api_internal_server::WorkerApiInternal;
 use pplx_space_node_api_client::proto::worker_api_server::WorkerApi;

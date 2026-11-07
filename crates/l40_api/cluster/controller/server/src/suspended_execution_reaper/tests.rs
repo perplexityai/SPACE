@@ -44,7 +44,7 @@ use k8s_openapi::api::core::v1::{
     PodStatus,
 };
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
-use pplx_space_common_core::types::PositiveDuration;
+use pplx_space_durations::PositiveDuration;
 use uuid::Uuid;
 
 use super::*;

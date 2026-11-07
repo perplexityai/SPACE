@@ -1,4 +1,4 @@
-use pplx_space_common_core::types::SimpleDuration;
+use pplx_space_durations::SimpleDuration;
 
 use crate::PublicApiParseError;
 
@@ -34,7 +34,7 @@ where
 
     Option::<String>::deserialize(deserializer)?
         .map(|value| {
-            let seconds = pplx_space_common_core::types::parse_simple_duration_secs(&value)
+            let seconds = pplx_space_durations::parse_simple_duration_secs(&value)
                 .map_err(serde::de::Error::custom)?;
             let timeout = SimpleDuration::new(std::time::Duration::from_secs(seconds))
                 .map_err(serde::de::Error::custom)?;

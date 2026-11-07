@@ -2,7 +2,7 @@
 
 use std::{process::Stdio, time::Duration};
 
-use pplx_space_common_core::types::GuestUserName;
+use pplx_space_guest_process::GuestUserName;
 use pplx_space_spaced_guest_server::{
     FilesystemExecutionMode, HostConnectorType, SpacedGuestService, SpacedGuestServiceConfig,
 };
@@ -84,10 +84,10 @@ async fn read_run_and_connect_preserve_bytes_without_waiting_for_process_exit() 
     let mut started = client
         .start_process_stream_with_options(StartProcessOptions {
             idempotency_key: Some(
-                pplx_space_common_core::types::IdempotencyKey::parse("cli-output").unwrap(),
+                pplx_space_guest_process::IdempotencyKey::parse("cli-output").unwrap(),
             ),
             ..pplx_space_spaced_host_client::StartProcessOptions::new(
-                pplx_space_common_core::types::ProcessCommand::new(command.clone()).unwrap(),
+                pplx_space_guest_process::ProcessCommand::new(command.clone()).unwrap(),
             )
         })
         .await

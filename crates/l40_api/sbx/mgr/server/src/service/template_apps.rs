@@ -1,6 +1,6 @@
 //! Snapshot-only app observation. This never starts, stops, or resets an app.
 use super::*;
-use pplx_space_common_core::types::ProcessCommand;
+use pplx_space_guest_process::ProcessCommand;
 use pplx_space_spaced_host_client::{SpacedHostClient, StartProcessOptions};
 use pplx_space_template_runtime::{
     MAX_TEMPLATE_RUNTIME_BYTES, RuntimeStartupPolicy, TemplateRuntime,

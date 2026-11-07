@@ -1,5 +1,5 @@
 use super::*;
-use pplx_space_common_core::types::{
+use pplx_space_guest_process::{
     GuestUserName, IdempotencyKey, ProcessCommand, ProcessId, ProcessSignal,
     validate_guest_path_input as validate_path_text,
 };

@@ -5,7 +5,7 @@ use crate::bridge::{
     record_bridge_rpc_unbounded_outcome,
 };
 use crate::protocol::*;
-use pplx_space_common_core::types::RelativeGuestPath;
+use pplx_space_guest_process::RelativeGuestPath;
 use pplx_space_pii::Pii;
 
 // Bound an opaque owner identifier independently of the streamed list budget.
@@ -135,8 +135,7 @@ fn host_modified_file(
     file: pplx_space_spaced_guest_protocol::proto::bridge_guest::ModifiedFile,
 ) -> Result<proto::ModifiedFile, Status> {
     if !file.root.is_empty() {
-        pplx_space_common_core::types::GuestPath::parse(&file.root)
-            .map_err(invalid_argument_status)?;
+        pplx_space_guest_process::GuestPath::parse(&file.root).map_err(invalid_argument_status)?;
     }
     let path = RelativeGuestPath::parse(file.path).map_err(invalid_argument_status)?;
     Ok(proto::ModifiedFile {
@@ -502,7 +501,7 @@ impl Filesystem for SpacedHostService {
         let user = request
             .into_inner()
             .user
-            .map(pplx_space_common_core::types::GuestUserName::parse)
+            .map(pplx_space_guest_process::GuestUserName::parse)
             .transpose()
             .map_err(invalid_argument_status)?;
         self.call_bridge_guest_filesystem_once(
@@ -530,7 +529,7 @@ impl Filesystem for SpacedHostService {
         let user = request
             .user
             .clone()
-            .map(pplx_space_common_core::types::GuestUserName::parse)
+            .map(pplx_space_guest_process::GuestUserName::parse)
             .transpose()
             .map_err(invalid_argument_status)?;
         let response = self

@@ -7,7 +7,7 @@ use bridge_guest::process_exit::Outcome as ProcessExitOutcome;
 use bridge_guest::process_server::Process;
 use futures_util::StreamExt;
 use nix::unistd::{Uid, User};
-use pplx_space_common_core::types::DEFAULT_GUEST_USER;
+use pplx_space_guest_process::DEFAULT_GUEST_USER;
 use pplx_space_spaced_guest_protocol::proto::bridge_guest;
 use pplx_space_spaced_guest_server::SpacedGuestServiceConfig;
 
@@ -417,7 +417,7 @@ async fn bridge_guest_process_start_rejects_unknown_user() {
 #[tokio::test]
 async fn process_start_honors_configured_default_and_explicit_user_override() {
     use bridge_guest::StartRequest;
-    use pplx_space_common_core::types::GuestUserName;
+    use pplx_space_guest_process::GuestUserName;
     use pplx_space_spaced_guest_server::SpacedGuestService;
     let current = User::from_uid(Uid::current()).unwrap().unwrap();
     let shutdown = tokio_util::sync::CancellationToken::new();

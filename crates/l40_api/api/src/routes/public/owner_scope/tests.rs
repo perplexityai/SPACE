@@ -1512,7 +1512,7 @@ async fn a_same_key_retry_racing_an_early_delete_replays_it() -> TestDbResult<()
     use crate::routes::public::sandboxes::{
         lifecycle_method, lifecycle_path_template, lifecycle_request_fingerprint,
     };
-    use pplx_space_common_core::types::IdempotencyKey;
+    use pplx_space_guest_process::IdempotencyKey;
     use pplx_space_public_api::{OperationKind, OperationTargetType, SandboxLifecycleAction};
 
     let fixture = fixture().await?;

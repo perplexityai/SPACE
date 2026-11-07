@@ -23,11 +23,12 @@ use pplx_space_auto_lifecycle::{
     AutoLifecycleRuntimeState, AutoLifecycleTransition,
 };
 use pplx_space_common_core::types::{
-    ExecutionGeneration, GuestUserName, IncompleteSandboxRouteIdentityError, NodeManagedBy,
-    NodeRole, ORPHANED_SANDBOX_TEMPLATE, RuntimeKind, SandboxCleanupEpisodeId, SandboxId,
+    ExecutionGeneration, IncompleteSandboxRouteIdentityError, NodeManagedBy, NodeRole,
+    ORPHANED_SANDBOX_TEMPLATE, RuntimeKind, SandboxCleanupEpisodeId, SandboxId,
     SandboxQuarantineReasonCode, SandboxRouteIdentity, SandboxRuntimeLabel, SpaceApiRouteIdentity,
-    parse_grpc_timeout,
 };
+use pplx_space_durations::parse_grpc_timeout;
+use pplx_space_guest_process::GuestUserName;
 use pplx_space_host_layout::identities::user_names;
 use pplx_space_host_layout::paths::TEMPLATE_CACHE_DIR_MODE;
 use pplx_space_net_common::{NetworkPolicyV1, proto::NetworkPolicyApplyDecision};

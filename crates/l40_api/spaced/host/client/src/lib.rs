@@ -7,7 +7,7 @@
 //! Dropping a process response stream does not terminate the guest process.
 
 use futures_util::StreamExt;
-use pplx_space_common_core::types::{
+use pplx_space_guest_process::{
     GuestPath, GuestUserName, IdempotencyKey, ProcessCommand, ProcessId, ProcessSignal,
     ReadyTimeout, RelativeGlobPattern, WatchRoot,
 };
@@ -83,7 +83,7 @@ pub struct SpacedHostClient {
 pub struct StartProcessOptions {
     pub command: ProcessCommand,
     pub cwd: Option<GuestPath>,
-    pub env: pplx_space_common_core::types::EnvMap,
+    pub env: pplx_space_guest_process::EnvMap,
     pub user: Option<GuestUserName>,
     pub timeout: Option<std::time::Duration>,
     pub background: bool,

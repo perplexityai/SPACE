@@ -92,14 +92,11 @@ async fn process_start_relays_to_guest_bridge() {
     let mut stream = client
         .start_process_stream_with_options(pplx_space_spaced_host_client::StartProcessOptions {
             idempotency_key: Some(
-                pplx_space_common_core::types::IdempotencyKey::parse("start-key").unwrap(),
+                pplx_space_guest_process::IdempotencyKey::parse("start-key").unwrap(),
             ),
             ..pplx_space_spaced_host_client::StartProcessOptions::new(
-                pplx_space_common_core::types::ProcessCommand::new(vec![
-                    "echo".into(),
-                    "hello".into(),
-                ])
-                .unwrap(),
+                pplx_space_guest_process::ProcessCommand::new(vec!["echo".into(), "hello".into()])
+                    .unwrap(),
             )
         })
         .await
@@ -127,19 +124,16 @@ async fn process_start_forwards_assigned_process_id_to_guest_bridge() {
         .await
         .expect("wait ready response");
 
-    let assigned = pplx_space_common_core::types::ProcessId::parse("assigned-proc").unwrap();
+    let assigned = pplx_space_guest_process::ProcessId::parse("assigned-proc").unwrap();
     let mut stream = client
         .start_process_stream_with_options(pplx_space_spaced_host_client::StartProcessOptions {
             idempotency_key: Some(
-                pplx_space_common_core::types::IdempotencyKey::parse("start-key").unwrap(),
+                pplx_space_guest_process::IdempotencyKey::parse("start-key").unwrap(),
             ),
             process_id: Some(assigned.clone()),
             ..pplx_space_spaced_host_client::StartProcessOptions::new(
-                pplx_space_common_core::types::ProcessCommand::new(vec![
-                    "echo".into(),
-                    "hello".into(),
-                ])
-                .unwrap(),
+                pplx_space_guest_process::ProcessCommand::new(vec!["echo".into(), "hello".into()])
+                    .unwrap(),
             )
         })
         .await

@@ -19,7 +19,8 @@ use axum::{
     },
 };
 use pplx_space_auto_lifecycle::AutoLifecyclePolicy;
-use pplx_space_common_core::types::{IdempotencyKey, SandboxLifecycle, SubstrateKind};
+use pplx_space_common_core::types::{SandboxLifecycle, SubstrateKind};
+use pplx_space_guest_process::IdempotencyKey;
 use pplx_space_public_api::{
     ConditionStatus, CreateSandboxRequest, OperationId, OperationKind, OperationState,
     OperationTargetType, PageCursor, PublicErrorCode, PublicOperationRecord, PublicPage,

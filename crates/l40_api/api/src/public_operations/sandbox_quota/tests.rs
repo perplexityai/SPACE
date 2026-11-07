@@ -2,8 +2,9 @@ use std::time::{Duration, Instant};
 
 use pplx_space_accounts::{OrgId, UserId};
 use pplx_space_common_core::sql;
-use pplx_space_common_core::types::{IdempotencyKey, SandboxId};
+use pplx_space_common_core::types::SandboxId;
 use pplx_space_db_test_fixtures::try_pg_test_db_with_max_connections;
+use pplx_space_guest_process::IdempotencyKey;
 use pplx_space_public_api::{
     OperationKind, OperationTargetType, PublicSandboxId, RequestFingerprint,
 };

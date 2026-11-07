@@ -3568,7 +3568,7 @@ fn cold_create_env_reaches_infra_pod_contract() {
             env = (0..256)
                 .map(|i| (format!("K{i:0127}"), "\u{1}".repeat(128)))
                 .collect();
-            pplx_space_common_core::types::EnvMap::try_from(env.clone()).unwrap();
+            pplx_space_guest_process::EnvMap::try_from(env.clone()).unwrap();
         }
         let runtime = test_runtime(&owner, &auto, &network);
         let common = test_common("space-sbx-env-g1", TEST_SANDBOX_ID, 1, &env);

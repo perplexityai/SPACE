@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 
 use pplx_space_common_core::sandbox_storage::MAX_SANDBOX_ROOTFS_BYTES;
-use pplx_space_common_core::types::{
+use pplx_space_guest_process::{
     MAX_ENV_ENTRIES, MAX_ENV_KEY_BYTES, MAX_ENV_TOTAL_BYTES, MAX_ENV_VALUE_BYTES,
 };
 
@@ -52,17 +52,17 @@ pub const MAX_SANDBOX_DISK_MIB: u32 = (MAX_SANDBOX_ROOTFS_BYTES / (1024 * 1024))
 /// Maximum byte length of a native `Idempotency-Key` header, which the API
 /// checks with `IdempotencyKey::parse_header`.
 pub const MAX_IDEMPOTENCY_KEY_BYTES: usize =
-    pplx_space_common_core::types::MAX_IDEMPOTENCY_KEY_HEADER_BYTES;
+    pplx_space_guest_process::MAX_IDEMPOTENCY_KEY_HEADER_BYTES;
 
 /// Why an `Idempotency-Key` header value was rejected.
-pub use pplx_space_common_core::types::IdempotencyKeyHeaderError as IdempotencyKeyError;
+pub use pplx_space_guest_process::IdempotencyKeyHeaderError as IdempotencyKeyError;
 
 /// Checks a native `Idempotency-Key` header value with
 /// `IdempotencyKey::parse_header`: 1 to [`MAX_IDEMPOTENCY_KEY_BYTES`] bytes of
 /// printable ASCII, space or tab.
-#[deprecated(note = "use `pplx_space_common_core::types::IdempotencyKey::parse_header`")]
+#[deprecated(note = "use `pplx_space_public_api::IdempotencyKey::parse_header`")]
 pub fn validate_idempotency_key(value: &[u8]) -> Result<&str, IdempotencyKeyError> {
-    pplx_space_common_core::types::IdempotencyKey::parse_header(value)?;
+    pplx_space_guest_process::IdempotencyKey::parse_header(value)?;
     std::str::from_utf8(value).map_err(|_| IdempotencyKeyError::InvalidEncoding)
 }
 

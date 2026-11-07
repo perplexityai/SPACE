@@ -7,7 +7,7 @@ use axum::{
     http::{HeaderMap, StatusCode},
 };
 use pplx_space_common_core::sql;
-use pplx_space_common_core::types::IdempotencyKey;
+use pplx_space_guest_process::IdempotencyKey;
 use pplx_space_public_api::{
     ClosePortExposureRequest, ListPortExposuresResponse, OpenPortExposureRequest, PortExposure,
     PortExposureApplyState, PortExposureDesiredState, PortExposureProtocol, PortExposureResponse,

@@ -6,7 +6,7 @@ use crate::service::recovery_cross_node::{
 };
 
 use pplx_space_accounts::{SandboxOwner, SandboxOwnerKind, TEMPLATE_MANAGER_SANDBOX_OWNER};
-use pplx_space_common_core::types::DEFAULT_GUEST_USER;
+use pplx_space_guest_process::DEFAULT_GUEST_USER;
 
 fn snapshot_meta_with_sandbox(
     sandbox: Option<crate::snapshot_upload::SnapshotSandbox>,

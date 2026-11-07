@@ -32,7 +32,8 @@
 //! the sweeper's Postgres tests run them directly. Production code calls the
 //! function here that binds each one.
 
-use pplx_space_common_core::types::{PositiveDuration, SandboxId, SandboxLifecycle, SubstrateKind};
+use pplx_space_common_core::types::{SandboxId, SandboxLifecycle, SubstrateKind};
+use pplx_space_durations::PositiveDuration;
 
 use std::fmt;
 use std::str::FromStr;

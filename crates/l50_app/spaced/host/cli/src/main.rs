@@ -1,5 +1,5 @@
 use clap::Parser;
-use pplx_space_common_core::types::GuestUserName;
+use pplx_space_guest_process::GuestUserName;
 use pplx_space_spaced_host_client::StartProcessOptions;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -271,10 +271,10 @@ async fn run() -> anyhow::Result<()> {
                 .start_process_stream_with_options(StartProcessOptions {
                     background,
                     idempotency_key: idempotency_key
-                        .map(pplx_space_common_core::types::IdempotencyKey::parse)
+                        .map(pplx_space_guest_process::IdempotencyKey::parse)
                         .transpose()?,
                     user,
-                    ..StartProcessOptions::new(pplx_space_common_core::types::ProcessCommand::new(
+                    ..StartProcessOptions::new(pplx_space_guest_process::ProcessCommand::new(
                         command,
                     )?)
                 })
