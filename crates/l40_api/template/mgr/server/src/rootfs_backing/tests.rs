@@ -86,7 +86,7 @@ fn materialization_preserves_bytes_sparsity_and_clone_isolation() {
                 .unwrap();
             } else {
                 if inherited_flags.contains(IFlags::NOCOW) {
-                    let mut writer = pplx_space_common_io::sparse::SparseFileWriter::new(
+                    let mut writer = pplx_space_file_io::sparse::SparseFileWriter::new(
                         File::create(&output).unwrap(),
                         64 * 1024,
                     )

@@ -114,7 +114,7 @@ members = [
     "crates/l10_foundation/connection/admission",
     "crates/l10_foundation/common/grpc/transport",
     "crates/l10_foundation/grpc/lb",
-    "crates/l10_foundation/common/io",
+    "crates/l10_foundation/file/io",
     "crates/l10_foundation/common/jobs",
     "crates/l10_foundation/lru/reaper",
     "crates/l10_foundation/common/proto/build",
@@ -373,7 +373,7 @@ pplx-space-common-cli = { path = "crates/l10_foundation/common/cli" }
 pplx-space-connection-admission = { path = "crates/l10_foundation/connection/admission" }
 pplx-space-common-grpc = { path = "crates/l10_foundation/common/grpc/transport" }
 pplx-space-grpc-lb = { path = "crates/l10_foundation/grpc/lb" }
-pplx-space-common-io = { path = "crates/l10_foundation/common/io" }
+pplx-space-file-io = { path = "crates/l10_foundation/file/io" }
 pplx-space-common-jobs = { path = "crates/l10_foundation/common/jobs" }
 pplx-space-lru-reaper = { path = "crates/l10_foundation/lru/reaper" }
 pplx-space-common-proto-build = { path = "crates/l10_foundation/common/proto/build" }

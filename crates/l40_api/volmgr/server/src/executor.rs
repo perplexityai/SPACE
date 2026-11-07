@@ -35,10 +35,10 @@ use pplx_space_common_core::types::{
     KekProvider, MasterKeyIdentifier, MaterializationLayout, MaterializationMode, OrgId, SandboxId,
     SnapshotArtifact, StorageUri, SubjectId, SubjectIdParseError, TransferScopeId,
 };
-use pplx_space_common_io::sparse::{SparseDataRange, SparseFileWriter, SparseMaterialization};
 use pplx_space_common_jobs::{
     Job, JobError, JobExecutor, JobFailureKind, JobFailureReason, JobPriority,
 };
+use pplx_space_file_io::sparse::{SparseDataRange, SparseFileWriter, SparseMaterialization};
 use pplx_space_object_store::{
     ObjectMeta, ObjectStore, ObjectStoreError, ObjectTarget, S3ObjectStore,
 };

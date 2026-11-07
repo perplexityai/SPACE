@@ -29,7 +29,7 @@
 [pattern_ratchet.rootfs_copy]
 # Privileged builder copies are deferred; builders stay CoW.
 "crates/l40_api/build/mgr/engine/src/lib.rs" = 1
-# Non-Linux fallbacks; Linux paths use common-io's reflink helper.
+# Non-Linux fallbacks; Linux paths use file-io's reflink helper.
 "crates/l40_api/node/runtime/core/src/lib.rs" = 2
 "crates/l40_api/template/mgr/server/src/service.rs" = 3
 "crates/l40_api/volmgr/server/src/staging.rs" = 2
@@ -292,7 +292,6 @@ postgres = [
 pplx-space-common-cli = "crates/l10_foundation/common/cli"
 pplx-space-common-core = "crates/libs/common/core"
 pplx-space-common-grpc = "crates/l10_foundation/common/grpc/transport"
-pplx-space-common-io = "crates/l10_foundation/common/io"
 pplx-space-common-jobs = "crates/l10_foundation/common/jobs"
 pplx-space-common-proto-build = "crates/l10_foundation/common/proto/build"
 pplx-space-credential-injection-core = "crates/l20_domain/credential/injection/core"

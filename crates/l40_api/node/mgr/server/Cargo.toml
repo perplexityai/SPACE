@@ -48,7 +48,7 @@ zeroize = { workspace = true }
 # internal
 pplx-space-common-core = { workspace = true }
 pplx-space-common-grpc = { workspace = true }
-pplx-space-common-io = { workspace = true, features = ["reflink"] }
+pplx-space-file-io = { workspace = true, features = ["reflink"] }
 pplx-space-grpc-rate-limiter = { workspace = true }
 pplx-space-grpc-server = { workspace = true }
 pplx-space-local-health = { workspace = true }
