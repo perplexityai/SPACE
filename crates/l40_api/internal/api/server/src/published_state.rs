@@ -19,7 +19,7 @@ use pplx_space_common_core::types::{
     SandboxId, SandboxLifecycle, SandboxQuarantineHistoryAction, SandboxQuarantineNextAction,
     SandboxQuarantineReasonCode, SandboxQuarantineSource, SandboxTransitionReceipt,
     SandboxTransitionReceiptInvariantError, SandboxTransitionReceiptKind,
-    SandboxTransitionTargetState, SemVer,
+    SandboxTransitionTargetState,
 };
 use pplx_space_events::{
     SandboxEvent, SandboxEventDetails, SandboxEventSource, SandboxEventTrigger, SandboxEventType,
@@ -36,6 +36,7 @@ use pplx_space_sandbox_quarantine_store::{
 use pplx_space_sbx_mgr_client::proto::{
     QuarantineRecoveryObservedOwner, SnapshotDetail, SnapshotType,
 };
+use pplx_space_semver::SemVer;
 use pplx_space_state_reconciliation::{
     FACET_NETWORK_POLICY, FACET_SANDBOX_DESIRED_STATE, FACET_TEMPLATE_BASE_SNAPSHOT_POLICY,
     FACET_TEMPLATE_DESIRED_STATE, NetworkPolicyTarget, ReconcileReason,

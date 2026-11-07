@@ -27,6 +27,7 @@ kubernetes = [
     "dep:k8s-openapi",
     "dep:kube",
     "dep:pplx-space-sandbox-pod",
+    "pplx-space-semver/serde",
     "dep:pplx-space-kube-client",
 ]
 
@@ -46,6 +47,7 @@ pplx-space-kube-client = { workspace = true, optional = true }
 pplx-space-sandbox-pod = { workspace = true, optional = true }
 pplx-space-local-health = { workspace = true }
 pplx-space-observability = { workspace = true }
+pplx-space-semver = { workspace = true }
 pplx-space-service-lifecycle = { workspace = true }
 pplx-space-service-mutex = { workspace = true }
 pplx-space-sqlite = { workspace = true }

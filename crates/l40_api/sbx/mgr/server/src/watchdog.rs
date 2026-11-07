@@ -24,8 +24,9 @@ use tokio_util::task::TaskTracker;
 use crate::metrics::sandbox::worker::{
     NetGatewayRouteVerificationStatus, NetGatewayTlsInterceptionMode,
 };
-use pplx_space_common_core::types::{LinuxPid, SandboxId, SemVer};
+use pplx_space_common_core::types::{LinuxPid, SandboxId};
 use pplx_space_node_runtime_core::vm_state::VmState;
+use pplx_space_semver::SemVer;
 
 use crate::auto_lifecycle::AutoLifecycleCoordinator;
 use crate::db::guest_health_scan::SandboxGuestHealthRow;

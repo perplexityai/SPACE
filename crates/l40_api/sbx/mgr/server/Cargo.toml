@@ -89,6 +89,7 @@ pplx-space-grpc-server = { workspace = true }
 pplx-space-ingress-admission = { workspace = true }
 pplx-space-k8s-node-id = { workspace = true }
 pplx-space-local-health = { workspace = true }
+pplx-space-semver = { workspace = true, features = ["serde"] }
 pplx-space-service-lifecycle = { workspace = true }
 pplx-space-service-mutex = { workspace = true }
 pplx-space-state-reconciliation = { workspace = true }

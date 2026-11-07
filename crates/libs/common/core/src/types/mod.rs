@@ -57,7 +57,6 @@ pub mod subject;
 pub mod template;
 pub mod time;
 pub mod transport_vsock;
-pub use pplx_space_semver as version;
 
 #[cfg(feature = "serde")]
 pub use admin::*;
@@ -110,4 +109,3 @@ pub use template::{
 };
 pub use time::*;
 pub use transport_vsock::*;
-pub use version::{SemVer, SemVerParseError};

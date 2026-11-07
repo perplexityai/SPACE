@@ -72,6 +72,7 @@ pplx-space-public-api = { workspace = true }
 pplx-space-execution-common = { workspace = true }
 pplx-space-policy-authority = { workspace = true }
 pplx-space-sbx-mgr-client = { workspace = true }
+pplx-space-semver = { workspace = true, features = ["serde"] }
 pplx-space-snapshot-store = { workspace = true }
 pplx-space-runtime-environment-catalog-store = { workspace = true }
 pplx-space-runtime-environment-policy-store = { workspace = true }
