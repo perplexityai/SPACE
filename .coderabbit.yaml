@@ -381,9 +381,53 @@ reviews:
 
     - path: "ui/**"
       instructions: |
-        Admin console. Flag requests or fields that do not match the API in
-        crates/l40_api/api, error and empty states that hide a failed request,
-        and authorization enforced only in the browser. Skip styling.
+        Admin console. Before reporting a regression, trace the changed
+        component's callers, render conditions, data source, and API contract
+        in crates/l40_api/api. Give a reachable operator action, the relevant
+        state or response, and the incorrect result; a causal path established
+        from code is sufficient, without a live reproduction. A plausible
+        improvement without a demonstrated broken contract is not a defect.
+
+        A deliberately removed control or narrowed workflow is not a
+        regression merely because the previous UI offered it. Check the
+        replacement path and supported states against the diff and API;
+        still report a supported operation that becomes unreachable or
+        unsafe. Where relevant, check fresh or empty clusters, failed reads,
+        and existing resources. Do not treat a description's claim of intent
+        as proof, or an old comment as the sole contract.
+
+        Flag requests or fields that do not match the API, error and empty
+        states that conceal failed reads, stale responses that overwrite
+        newer state, and authorization enforced only in the browser. Skip
+        styling and optional UX improvements.
+
+    - path: "scripts/console-loop/**"
+      instructions: |
+        Apply space-code-quality and its test-economy reference before
+        demanding typed space_smoke coverage. Identify the distinct contract
+        added by the diff and compare it with the existing browser check and
+        lower-layer coverage. New lines, API reads used as an independent
+        oracle, stronger assertions, and bounded readiness waits do not by
+        themselves constitute a new deployment smoke test.
+
+        Do not demand another scenario for a contract already covered at its
+        owning layer. A genuinely new deployed-platform contract still
+        belongs in typed space_smoke; browser rendering and interaction
+        assertions are not a reason to duplicate that platform contract.
+
+        Review assertions against their claimed contract and the behavior
+        changed by the diff, not every stronger check one could imagine.
+        Before flagging a coverage gap, identify the missing contract clause,
+        its independent oracle, and a concrete wrong result that would pass.
+        Check existing coverage first. Do not request a test of the smoke
+        test, or a values mirror that merely compares configured inputs with
+        rendered output; follow test-economy's configuration stop rule.
+
+        Still flag vacuous assertions, missing oracle data needed for the
+        claimed check, unconditional compatibility skips, and fixed sleeps
+        that can race observable readiness. Prefer the smallest correction
+        to an existing assertion or its owning-layer coverage, not another
+        scenario merely because the existing assertion needs correction.
 
   pre_merge_checks:
     # Only requested reviewers can tick "Ignore failed checks". Any
@@ -408,24 +452,31 @@ reviews:
       - name: Description follows the PR template
         mode: error
         instructions: |
-          Pass only if the description contains all of the following, each
-          with real content and not only the template's HTML comments:
-          1. A "## Summary" section that says what merging the change does.
-          2. A "## Validation" section that names what was run and its result,
-             or says "CI on this head".
-          3. A "## Severity and risk" section that gives a severity (or "does
-             not apply") and a risk.
-          4. A line starting with "AI assistance:" followed by "None", or by
-             the tool and the parts it drafted or changed.
-          Otherwise fail, and name each missing or empty item. Judge presence
-          only, not quality or length.
+          Require the template's information, not exact heading spelling.
+          Pass only if the description contains all of the following with
+          real content, not only the template's HTML comments:
+          1. A summary that says what merging the change does.
+          2. Validation that names what was run and its result, or says
+             "CI on this head".
+          3. A severity value, or an explicit statement that severity does
+             not apply.
+          4. A risk statement. This is required even when severity does not
+             apply; severity alone does not satisfy the risk requirement.
+          5. An explicitly identified AI assistance disclosure: "None" for
+             no AI assistance, or the tool and the parts it drafted or
+             changed. An unrelated "None" does not satisfy this item.
+          Equivalent headings, split sections, and capitalization pass; for
+          example, "Other validation" can contain the validation evidence.
+          Fail only for missing or empty information, and name it. Do not
+          judge writing style, quality, or length, or claim this presence
+          check verifies that the reported validation actually ran.
 
       - name: Bug fixes name a regression test
         mode: warning
         instructions: |
           This applies only when the pull request fixes a defect in
           application behavior under crates/, shim/, or ui/. Pass if the
-          Validation section names a test that fails without the fix and
+          validation evidence names a test that fails without the fix and
           passes with it, or explains why such a test cannot be written or
           which existing test already covers the behavior. Fail if it does
           neither. Pass any pull request that is not an application bug fix.
