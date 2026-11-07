@@ -10,7 +10,10 @@
 //   - DescribeInstances filtered on instance-id, with paging, which the
 //     dead-node verb asks for the exact instances a node's rows ran on. Kind
 //     workers carry a fake AWS providerID (aws:///<zone>/i-<17 hex>), set by
-//     the stack's bring-up, so their instances have IDs to ask about.
+//     the stack's bring-up, so their instances have IDs to ask about;
+//   - Auto Scaling's TerminateInstanceInAutoScalingGroup, which the
+//     node-drain `aws` terminator calls through AWS_ENDPOINT_URL_AUTO_SCALING
+//     (the same listener) for the instance behind a Node's providerID.
 //
 // A Node's instance is the ID its AWS providerID names, or, without one, an
 // ID derived from the Node's UID. Its state:
@@ -24,16 +27,17 @@
 //     aged out of DescribeInstances;
 //   - a Kubernetes API error is an EC2 error (Unavailable, HTTP 503).
 //
-// TerminateInstances only marks instances terminated: the harness that calls
-// it stops the worker's container itself. The marks and the instances seen
+// TerminateInstances and TerminateInstanceInAutoScalingGroup only mark
+// instances terminated: the harness stops the worker's container itself,
+// once it sees the termination the controller recorded. The marks and the instances seen
 // live in memory, so a restart of the fixture forgets them.
 //
 // The test control listens on loopback only, in plain HTTP, so only a
 // process in the pod reaches it: `space-kind-fake-ec2 terminate <id>...`,
 // run through `kubectl exec`, posts to it.
 //
-// It checks that a request is signed for EC2 in the cluster's region, but
-// not the signature itself, and refuses every other action, parameter and
+// It checks that a request is signed for EC2, or for Auto Scaling, in the
+// cluster's region, but not the signature itself, and refuses every other action, parameter and
 // filter, so a call the controller starts making shows up as an error rather
 // than a made-up answer. Each request is logged, which is the record that the
 // controller's calls stayed in the cluster.
@@ -71,6 +75,8 @@ import (
 const (
 	ec2NS          = "http://ec2.amazonaws.com/doc/2016-11-15/"
 	ec2Version     = "2016-11-15"
+	asgNS          = "http://autoscaling.amazonaws.com/doc/2011-01-01/"
+	asgVersion     = "2011-01-01"
 	serviceAccount = "/var/run/secrets/kubernetes.io/serviceaccount"
 )
 
@@ -363,12 +369,17 @@ func (f *fakeEC2) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		fail(http.StatusBadRequest, "InvalidParameterValue", "unreadable form body: "+err.Error())
 		return
 	}
-	if scope := credentialScope(r.Header.Get("Authorization")); scope != f.region+"/ec2/aws4_request" {
-		fail(http.StatusUnauthorized, "AuthFailure", fmt.Sprintf("request is not signed for ec2 in %s (scope %q)", f.region, scope))
-		return
-	}
 	form := r.PostForm
 	entry = append(entry, "action", form.Get("Action"))
+	switch scope := credentialScope(r.Header.Get("Authorization")); scope {
+	case f.region + "/ec2/aws4_request":
+	case f.region + "/autoscaling/aws4_request":
+		f.serveAutoScaling(w, form, reqID, entry, fail)
+		return
+	default:
+		fail(http.StatusUnauthorized, "AuthFailure", fmt.Sprintf("request is not signed for ec2 or autoscaling in %s (scope %q)", f.region, scope))
+		return
+	}
 	if form.Get("Version") != ec2Version {
 		fail(http.StatusBadRequest, "InvalidAction", "this fake answers only version "+ec2Version)
 		return
@@ -391,6 +402,58 @@ func (f *fakeEC2) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 type failFunc func(status int, code, message string)
+
+type terminateInAutoScalingGroupResponse struct {
+	XMLName  xml.Name `xml:"TerminateInstanceInAutoScalingGroupResponse"`
+	Xmlns    string   `xml:"xmlns,attr"`
+	Activity struct {
+		ActivityID  string `xml:"ActivityId"`
+		Description string `xml:"Description"`
+		StatusCode  string `xml:"StatusCode"`
+	} `xml:"TerminateInstanceInAutoScalingGroupResult>Activity"`
+	RequestID string `xml:"ResponseMetadata>RequestId"`
+}
+
+// serveAutoScaling answers the one Auto Scaling call the fixture takes:
+// TerminateInstanceInAutoScalingGroup for one instance, marked terminated as
+// TerminateInstances marks it.
+func (f *fakeEC2) serveAutoScaling(w http.ResponseWriter, form url.Values, reqID string, entry []any, fail failFunc) {
+	if form.Get("Version") != asgVersion {
+		fail(http.StatusBadRequest, "InvalidAction", "this fake answers Auto Scaling only at version "+asgVersion)
+		return
+	}
+	if form.Get("Action") != "TerminateInstanceInAutoScalingGroup" {
+		fail(http.StatusBadRequest, "InvalidAction", "this fake answers only TerminateInstanceInAutoScalingGroup for Auto Scaling")
+		return
+	}
+	for param := range form {
+		switch param {
+		case "Action", "Version", "InstanceId", "ShouldDecrementDesiredCapacity":
+		default:
+			fail(http.StatusBadRequest, "ValidationError", "unsupported parameter "+param)
+			return
+		}
+	}
+	id := form.Get("InstanceId")
+	if !instanceIDForm.MatchString(id) {
+		fail(http.StatusBadRequest, "ValidationError", "not an instance ID: "+id)
+		return
+	}
+	switch decrement := form.Get("ShouldDecrementDesiredCapacity"); decrement {
+	case "true", "false":
+	default:
+		fail(http.StatusBadRequest, "ValidationError", "ShouldDecrementDesiredCapacity must be true or false, not "+strconv.Quote(decrement))
+		return
+	}
+	before := f.terminate(id)
+	resp := terminateInAutoScalingGroupResponse{Xmlns: asgNS, RequestID: reqID}
+	resp.Activity.ActivityID = reqID
+	resp.Activity.Description = "Terminating EC2 instance: " + id
+	resp.Activity.StatusCode = "InProgress"
+	f.log.Info("terminated in auto scaling group", append(entry, "status", http.StatusOK, "instance_id", id,
+		"previous_state", before.Name, "decrement_capacity", form.Get("ShouldDecrementDesiredCapacity"))...)
+	writeXML(w, http.StatusOK, resp)
+}
 
 // describeByPrivateDNS answers a filter on one private-dns-name from the Node
 // of that name.

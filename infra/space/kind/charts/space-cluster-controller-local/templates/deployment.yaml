@@ -48,15 +48,16 @@ spec:
       priorityClassName: {{ .Values.priorityClassName }}
       serviceAccountName: {{ .Values.serviceAccount.name }}
       {{- if .Values.ec2.fakeEndpoint.enabled }}
-      # Without AWS_ENDPOINT_URL_EC2, the EC2 client signs to
-      # https://ec2.<AWS_REGION>.amazonaws.com/, the one public endpoint it
-      # can build (AwsQueryClient::endpoint). Pinning that name to loopback
+      # Without AWS_ENDPOINT_URL_EC2 (or _AUTO_SCALING), the client signs to
+      # https://ec2.<AWS_REGION>.amazonaws.com/ (or autoscaling.), the one
+      # public endpoint it can build (AwsQueryClient::endpoint). Pinning that name to loopback
       # here makes a lost override fail to connect, which the GC reads as an
       # unknown answer and keeps the refs, instead of reaching AWS.
       hostAliases:
         - ip: 127.0.0.1
           hostnames:
             - ec2.{{ .Values.snapshotRegion }}.amazonaws.com
+            - autoscaling.{{ .Values.snapshotRegion }}.amazonaws.com
       {{- end }}
       terminationGracePeriodSeconds: 30
       containers:
@@ -156,6 +157,10 @@ spec:
             # The fake EC2 endpoint; see `ec2` in values.yaml.
             - name: AWS_ENDPOINT_URL_EC2
               value: {{ required "ec2.fakeEndpoint.url must name the Kind fake EC2 endpoint" .Values.ec2.fakeEndpoint.url | quote }}
+            # The same fake answers the node-drain `aws` terminator's Auto
+            # Scaling call, which a scenario selects for itself.
+            - name: AWS_ENDPOINT_URL_AUTO_SCALING
+              value: {{ .Values.ec2.fakeEndpoint.url | quote }}
             # The EC2 client's HTTPS trusts the platform roots
             # (rustls-platform-verifier, through rustls-native-certs), which
             # read SSL_CERT_DIR: the image's bundle plus the internal RPC CA
