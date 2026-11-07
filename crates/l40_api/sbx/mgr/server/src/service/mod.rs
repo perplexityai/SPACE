@@ -290,12 +290,11 @@ const ALLOW_LOCAL_BACKUP_INVENTORY: &[UdsPeerPrincipal] = &[
     UdsPeerPrincipal::Root,
     UdsPeerPrincipal::Service(user_names::SPACE_NODECTL),
 ];
-// A drain seals the node and evacuates every resident. node-api relays it
-// for the control plane and authorizes that caller first; root and the
-// local admin role may drive it by hand.
+// A drain seals the node and evacuates every resident, and its cancel
+// unseals it. node-api relays it for the control plane and authorizes that
+// caller first; root may drive it by hand.
 const ALLOW_NODE_DRAIN: &[UdsPeerPrincipal] = &[
     UdsPeerPrincipal::Root,
-    UdsPeerPrincipal::Role(LocalRole::Admin),
     UdsPeerPrincipal::Service(user_names::SPACE_NODEAPI),
 ];
 const ALLOW_SANDBOX_ADMIN_OR_TMPLMGR: &[UdsPeerPrincipal] = &[

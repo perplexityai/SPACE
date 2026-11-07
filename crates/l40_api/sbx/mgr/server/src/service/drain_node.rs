@@ -6,8 +6,9 @@
 //! through the paths the node already owns: the suspend of a started or paused
 //! VM is the idle auto-suspend's (a full snapshot published and uploaded under
 //! node-local durability), a stopped sandbox's disk is published through
-//! `EnqueueArtifactBackup`, and a local-only artifact's upload is finished the
-//! same way. The control plane learns of each artifact as it always does,
+//! `EnqueueArtifactBackup`, and the upload of every artifact without a
+//! durable copy, named snapshots included, is finished the same way. Each
+//! runs as a detached state writer and checks the seal again first. The control plane learns of each artifact as it always does,
 //! through the backup it registers; the drain only reports the artifact, the
 //! row's durable pin, once it is durable, with the lifecycle the sandbox had.
 //! A drain suspend records that lifecycle (`drain_evacuations`) under the
@@ -20,7 +21,9 @@
 //! when nothing is left: no VM, nothing pending or blocked, every scan that
 //! can reveal a resident or an artifact succeeded, and the seal held, under
 //! the call's epoch, from before the walk to its end, with no activation in
-//! flight at its first read.
+//! flight at its first read. Every row that keeps `done` false says why: work
+//! that keeps failing, and a row stuck in a transition the drain doesn't
+//! drive, turn from `pending` into `blocked` after a bound.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;

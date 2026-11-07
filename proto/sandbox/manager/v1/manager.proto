@@ -205,10 +205,14 @@ service SandboxManager {
   // sandbox-manager.
   //
   // The call then walks every row: a started or paused VM is suspended with a
-  // full snapshot and uploaded, a stopped sandbox's disk is published, and a
-  // local-only artifact's upload is finished. That work runs after the call
-  // answers; a later call reports it. Idempotent: a call repeats nothing in
-  // progress or done.
+  // full snapshot and uploaded, a stopped sandbox's disk is published, and the
+  // upload of every artifact without a durable copy, named snapshots
+  // included, is finished. That work runs after the call answers; a later call
+  // reports it. Idempotent: a call repeats nothing in progress or done. Work
+  // that keeps failing, and a row that sits in a transition the drain doesn't
+  // drive, are reported blocked after a bound. The call reads node-manager's
+  // orphan inventory within a deadline well under a minute, and reports it
+  // blocked when it runs out.
   //
   // Epochs only move forward: an epoch below the current one is refused with
   // `FailedPrecondition`, and so is the epoch of a cancelled drain. With
@@ -221,9 +225,12 @@ service SandboxManager {
   // `done` means the node may be terminated: sealed under `epoch` from before
   // this call's walk to its end, no activation in flight at the walk's first
   // read, no VM, nothing pending or blocked, and every scan that can reveal a
-  // resident or an artifact (sandbox-manager's rows, cache and run
-  // directories, node-manager's untracked processes, cache and run
-  // directories) succeeded.
+  // resident or an artifact (sandbox-manager's rows and artifact registry,
+  // node-manager's untracked processes, cache and run directories)
+  // succeeded. A sandbox the drain suspended is reported evacuated once its
+  // snapshot is durable, with the lifecycle it had; a stopped one once its
+  // disk is. A `failed` row is not reported, and blocks nothing once its
+  // artifacts are durable.
   rpc DrainNode(DrainNodeRequest) returns (DrainNodeResponse);
 
   // Get the resolved effective network policy for a sandbox.
