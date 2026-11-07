@@ -69,6 +69,7 @@ pplx-space-sandbox-quarantine-store = { workspace = true }
 pplx-space-sandbox-store = { workspace = true }
 pplx-space-public-api = { workspace = true }
 pplx-space-execution-common = { workspace = true }
+pplx-space-policy-authority = { workspace = true }
 pplx-space-sbx-mgr-client = { workspace = true }
 pplx-space-snapshot-store = { workspace = true }
 pplx-space-runtime-environment-catalog-store = { workspace = true }

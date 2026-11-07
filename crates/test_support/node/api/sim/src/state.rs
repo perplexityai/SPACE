@@ -41,7 +41,7 @@ pub struct SandboxRecord {
     #[serde(default)]
     pub access_idle_policy: Vec<u8>,
     #[serde(default)]
-    pub auto_lifecycle_authority: pplx_space_common_core::types::PolicyAuthority,
+    pub auto_lifecycle_authority: pplx_space_policy_authority::PolicyAuthority,
     #[serde(default)]
     pub route_substrate_kind: Option<NodeManagedBy>,
     /// Activation attempt the simulator last reported with the generations

@@ -4909,6 +4909,7 @@ dependencies = [
  "pplx-space-node-registration-store",
  "pplx-space-node-status-store",
  "pplx-space-observability",
+ "pplx-space-policy-authority",
  "pplx-space-postgres-pool",
  "pplx-space-public-api",
  "pplx-space-public-api-http",
@@ -5086,6 +5087,7 @@ dependencies = [
  "pplx-space-node-runtime-core",
  "pplx-space-object-store",
  "pplx-space-page-cache",
+ "pplx-space-policy-authority",
  "pplx-space-rpc-auth",
  "pplx-space-sbx-mgr-client",
  "pplx-space-spaced-common",
@@ -5252,6 +5254,7 @@ dependencies = [
  "pplx-space-node-api-client",
  "pplx-space-node-api-sim",
  "pplx-space-observability",
+ "pplx-space-policy-authority",
  "pplx-space-postgres-pool",
  "pplx-space-public-api",
  "pplx-space-runtime-environment-catalog-store",
@@ -5397,6 +5400,7 @@ dependencies = [
  "pplx-space-net-common",
  "pplx-space-network-roles",
  "pplx-space-pii",
+ "pplx-space-policy-authority",
  "pplx-space-rpc-contracts",
  "pplx-space-semver",
  "pplx-space-sql-locator",
@@ -6094,6 +6098,7 @@ dependencies = [
  "pplx-space-node-api-sim",
  "pplx-space-node-mgr-client",
  "pplx-space-observability",
+ "pplx-space-policy-authority",
  "pplx-space-postgres-pool",
  "pplx-space-public-api",
  "pplx-space-reconcile-metrics",
@@ -6558,6 +6563,7 @@ dependencies = [
  "pplx-space-net-gateway-client",
  "pplx-space-node-api-client",
  "pplx-space-node-mgr-client",
+ "pplx-space-policy-authority",
  "pplx-space-sbx-mgr-client",
  "pplx-space-template-mgr-client",
  "prost",
@@ -6651,6 +6657,7 @@ dependencies = [
  "pplx-space-node-runtime-core",
  "pplx-space-node-runtime-manager-client",
  "pplx-space-observability",
+ "pplx-space-policy-authority",
  "pplx-space-reconcile-metrics",
  "pplx-space-sbx-mgr-client",
  "pplx-space-service-lifecycle",
@@ -7083,6 +7090,15 @@ name = "pplx-space-pii"
 version = "0.8.2"
 
 [[package]]
+name = "pplx-space-policy-authority"
+version = "0.8.2"
+dependencies = [
+ "pplx-space-net-common",
+ "serde",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "pplx-space-postgres-contention"
 version = "0.8.2"
 dependencies = [
@@ -7379,6 +7395,7 @@ dependencies = [
  "pplx-space-node-mgr-client",
  "pplx-space-node-runtime-core",
  "pplx-space-observability",
+ "pplx-space-policy-authority",
  "pplx-space-reconcile-metrics",
  "pplx-space-sandbox-grpc",
  "pplx-space-sandbox-metrics",
@@ -7435,6 +7452,7 @@ dependencies = [
  "pplx-space-net-common",
  "pplx-space-net-gateway-client",
  "pplx-space-node-api-client",
+ "pplx-space-policy-authority",
  "pplx-space-sbx-mgr-client",
  "pplx-space-spaced-common",
  "pplx-space-spaced-update",
@@ -7502,6 +7520,7 @@ dependencies = [
  "pplx-space-net-common",
  "pplx-space-node-mgr-protocol",
  "pplx-space-observability",
+ "pplx-space-policy-authority",
  "pplx-space-sbx-mgr-migrations",
  "pplx-space-sbx-mgr-protocol",
  "pplx-space-spaced-update",
@@ -8068,6 +8087,7 @@ dependencies = [
  "pplx-space-node-runtime-core",
  "pplx-space-observability",
  "pplx-space-page-cache",
+ "pplx-space-policy-authority",
  "pplx-space-reconcile-metrics",
  "pplx-space-rpc-auth",
  "pplx-space-sbx-mgr-client",
@@ -8115,6 +8135,7 @@ dependencies = [
  "pplx-space-common-core",
  "pplx-space-net-common",
  "pplx-space-node-api-client",
+ "pplx-space-policy-authority",
  "pplx-space-sbx-mgr-client",
  "pplx-space-template-mgr-client",
  "tokio",

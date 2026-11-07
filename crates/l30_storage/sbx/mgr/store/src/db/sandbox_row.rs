@@ -8,11 +8,12 @@ use std::collections::BTreeMap;
 
 use pplx_space_common_core::types::{
     ArtifactKind, ArtifactOrigin, AutoLifecyclePolicy, AutoLifecycleRuntimeState,
-    ExecutionGeneration, ExecutionMetadata, LocalArtifactId, NodeManagedBy, PolicyAuthority,
-    RouteGeneration, SandboxActivationAttemptId, SandboxId, SandboxOwner, SandboxRuntimeLabel,
+    ExecutionGeneration, ExecutionMetadata, LocalArtifactId, NodeManagedBy, RouteGeneration,
+    SandboxActivationAttemptId, SandboxId, SandboxOwner, SandboxRuntimeLabel,
     SpaceApiRouteIdentity,
 };
 use pplx_space_net_common::{NetworkPolicy, NetworkPolicyV1};
+use pplx_space_policy_authority::PolicyAuthority;
 use rusqlite::types::Type;
 
 use super::{CleanupCompletion, NetworkPolicyAppliedSource, parse_policy_authority};

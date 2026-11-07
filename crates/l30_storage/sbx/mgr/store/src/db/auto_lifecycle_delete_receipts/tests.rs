@@ -5,10 +5,10 @@ use pplx_space_auto_lifecycle_receipt::AutoLifecyclePolicyFingerprint;
 use pplx_space_common_core::types::{
     AutoLifecycleConditionSet, AutoLifecycleConditionSetId, AutoLifecycleDeleteReceiptId,
     AutoLifecycleIdleAction, AutoLifecyclePolicy, AutoLifecycleStage, AutoLifecycleWakePolicy,
-    ExecutionGeneration, NodeManagedBy, NodeRole, PolicyAuthority, RuntimeKind,
-    SandboxActivationAttemptId, SandboxId, SandboxOwner, SandboxRuntimeLabel,
-    SpaceApiRouteIdentity,
+    ExecutionGeneration, NodeManagedBy, NodeRole, RuntimeKind, SandboxActivationAttemptId,
+    SandboxId, SandboxOwner, SandboxRuntimeLabel, SpaceApiRouteIdentity,
 };
+use pplx_space_policy_authority::PolicyAuthority;
 
 use super::*;
 use crate::auto_lifecycle_delete_receipts::*;
