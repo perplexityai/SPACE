@@ -5,8 +5,8 @@ use rusqlite::{Connection, Result, params, types::Type};
 
 use pplx_space_common_core::sql;
 use pplx_space_common_core::types::AutoLifecyclePolicy;
-pub use pplx_space_common_core::types::PolicyAuthority;
 use pplx_space_net_common::NetworkPolicyV1;
+pub use pplx_space_policy_authority::PolicyAuthority;
 
 pub const DB_PATH: &str = pplx_space_common_core::host::linux::paths::TEMPLATE_MANAGER_DB;
 
@@ -292,7 +292,7 @@ fn invalid_build_upsert(message: &'static str) -> rusqlite::Error {
 }
 
 pub fn upsert_build(conn: &Connection, b: &BuildUpsert<'_>) -> Result<()> {
-    let manifest: pplx_space_common_core::types::TemplateManifest =
+    let manifest: pplx_space_template_manifest::TemplateManifest =
         serde_json::from_str(b.manifest_json)
             .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
     let execution = manifest

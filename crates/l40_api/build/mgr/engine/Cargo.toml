@@ -53,9 +53,11 @@ pplx-space-node-mgr-client = { workspace = true }
 pplx-space-node-runtime-core = { workspace = true }
 pplx-space-object-store = { workspace = true }
 pplx-space-page-cache = { workspace = true }
+pplx-space-policy-authority = { workspace = true }
 pplx-space-rpc-auth = { workspace = true }
 pplx-space-sbx-mgr-client = { workspace = true }
 pplx-space-spaced-common = { workspace = true }
+pplx-space-template-manifest = { workspace = true }
 pplx-space-template-mgr-client = { workspace = true }
 
 [dev-dependencies]

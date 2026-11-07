@@ -3,9 +3,8 @@
 
 use super::*;
 use crate::db::TemplateCachePartition;
-use pplx_space_common_core::types::{
-    Arch, EnvironmentReference, ExecutionMetadata, TemplateManifest,
-};
+use pplx_space_common_core::types::{Arch, EnvironmentReference, ExecutionMetadata};
+use pplx_space_template_manifest::TemplateManifest;
 
 const NAME: &str = "seed";
 
@@ -628,7 +627,7 @@ fn imports_target_the_partition_their_manifest_binds() {
 
     // A manifest without execution metadata takes the header metadata's
     // binding, which registration copies into it.
-    let mut metadata = pplx_space_common_core::types::TemplateMetadata::default();
+    let mut metadata = pplx_space_template_manifest::TemplateMetadata::default();
     metadata.set_execution_metadata(
         ExecutionMetadata::initial_firecracker(Arch::X86_64, vec![])
             .with_environment(twin_environment()),

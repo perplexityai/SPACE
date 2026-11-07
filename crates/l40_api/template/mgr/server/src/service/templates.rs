@@ -714,7 +714,7 @@ impl TemplateManagerService {
         let build_date = metadata.built_at.clone();
         // No manifest on disk yet during register — the empty default is
         // the equivalent of the previous `serde_json::Value::Null`.
-        let empty_manifest = pplx_space_common_core::types::TemplateManifest::default();
+        let empty_manifest = pplx_space_template_manifest::TemplateManifest::default();
         let arch = template_arch(&metadata, &empty_manifest);
 
         expand_template_rootfs(template_id, "pending", &staging_dir, "register").await?;
@@ -772,12 +772,12 @@ impl TemplateManagerService {
                 .await;
         }
 
-        let seed_manifest = pplx_space_common_core::types::TemplateManifest {
+        let seed_manifest = pplx_space_template_manifest::TemplateManifest {
             name: template_id.clone(),
             content_hash: content_hash.clone(),
             build_date: build_date.clone(),
             arch: arch.clone(),
-            ..pplx_space_common_core::types::TemplateManifest::default()
+            ..pplx_space_template_manifest::TemplateManifest::default()
         };
         let manifest = normalize_template_manifest(
             seed_manifest,

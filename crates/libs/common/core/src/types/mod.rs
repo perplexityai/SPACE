@@ -28,7 +28,6 @@ pub mod auto_lifecycle;
 pub mod balloon;
 pub mod cluster;
 pub mod compute;
-pub mod data;
 pub use pplx_space_db_identity as database;
 pub mod disk_io;
 pub mod env;
@@ -70,7 +69,6 @@ pub use auto_lifecycle::*;
 pub use balloon::*;
 pub use cluster::*;
 pub use compute::*;
-pub use data::*;
 pub use database::*;
 pub use disk_io::*;
 pub use env::*;
@@ -115,14 +113,6 @@ pub use template::{
     TemplateReference, TemplateReferenceParseError, TemplateReferenceResolveError,
     TemplateSelector, TemplateTag, TemplateTagParseError, TemplateVisibility,
     TemplateVisibilityParseError,
-};
-#[cfg(feature = "serde")]
-pub use template::{
-    BOUND_TEMPLATE_MANIFEST_SCHEMA_VERSION, BOUND_TEMPLATE_METADATA_SCHEMA_VERSION,
-    TEMPLATE_MANIFEST_SCHEMA_VERSION, TEMPLATE_METADATA_SCHEMA_VERSION, TemplateManifest,
-    TemplateManifestCompression, TemplateManifestFile, TemplateManifestFilenameError,
-    TemplateManifestSchemaError, TemplateMetadata, TemplateMetadataSchemaError, ZSTD_CODEC,
-    ZSTD_FILENAME_SUFFIX,
 };
 pub use time::*;
 pub use transport_vsock::*;

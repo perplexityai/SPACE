@@ -106,7 +106,8 @@ pub(super) fn template_execution_metadata(
     template_dir: &str,
     fallback_arch: &str,
 ) -> Result<pplx_space_common_core::types::ExecutionMetadata, Status> {
-    use pplx_space_common_core::types::{Arch, ExecutionMetadata, TemplateMetadata};
+    use pplx_space_common_core::types::{Arch, ExecutionMetadata};
+    use pplx_space_template_manifest::TemplateMetadata;
 
     let metadata_path = std::path::Path::new(template_dir).join("metadata.json");
     let metadata = match std::fs::read(&metadata_path) {

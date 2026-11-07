@@ -9,7 +9,7 @@ struct TemplateExportFile {
 
 fn compressed_template_export_files(
     build_path: &Path,
-    manifest: &pplx_space_common_core::types::TemplateManifest,
+    manifest: &pplx_space_template_manifest::TemplateManifest,
 ) -> Option<Vec<TemplateExportFile>> {
     let compressed_rootfs_path = build_path.join(TEMPLATE_ROOTFS_ZSTD_FILE);
     if !compressed_rootfs_path.is_file() || !manifest_has_compressed_rootfs_entry(manifest) {
@@ -131,7 +131,7 @@ impl TemplateManagerService {
                 "firmware templates cannot be exported or distributed",
             ));
         }
-        let manifest: pplx_space_common_core::types::TemplateManifest =
+        let manifest: pplx_space_template_manifest::TemplateManifest =
             serde_json::from_slice(&manifest_json)
                 .map_err(|error| Status::data_loss(error.to_string()))?;
         let (rootfs_hash, mut files) = if let Some(files) =

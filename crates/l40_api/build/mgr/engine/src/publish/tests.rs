@@ -1,6 +1,7 @@
 use super::*;
-use pplx_space_common_core::types::{
-    Arch, ExecutionMetadata, TEMPLATE_MANIFEST_SCHEMA_VERSION, TEMPLATE_METADATA_SCHEMA_VERSION,
+use pplx_space_common_core::types::{Arch, ExecutionMetadata};
+use pplx_space_template_manifest::{
+    TEMPLATE_MANIFEST_SCHEMA_VERSION, TEMPLATE_METADATA_SCHEMA_VERSION,
 };
 
 #[cfg(unix)]
@@ -126,7 +127,7 @@ fn release_execution_metadata_comes_from_digest_stable_manifest() {
     );
     write_metadata(dir.path(), Arch::Aarch64);
     let path = dir.path().join("manifest.json");
-    let mut manifest: pplx_space_common_core::types::TemplateManifest =
+    let mut manifest: pplx_space_template_manifest::TemplateManifest =
         serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
     let reference = pplx_space_common_core::types::EnvironmentReference::new(
         pplx_space_common_core::types::Digest::sha256([1; 32]),
