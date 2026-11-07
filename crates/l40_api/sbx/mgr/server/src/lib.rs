@@ -3,6 +3,7 @@
 #![forbid(unsafe_code)]
 #![cfg_attr(not(test), deny(clippy::expect_used))]
 
+pub(crate) mod activation_seal;
 pub(crate) mod btrfs_via_nodemgr;
 pub(crate) mod byok;
 pub(crate) mod capture_record;

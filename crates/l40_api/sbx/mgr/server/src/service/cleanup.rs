@@ -10,6 +10,7 @@ use super::cleanup_support::{
 use super::start_support::{ActivationAdmissionPermit, ActivationCleanupGuard};
 use super::tail_support::*;
 use super::*;
+use crate::activation_seal::{ActivationInFlightToken, InFlightActivationKind};
 use crate::db::cleanup_jobs::CleanupOutcome;
 use pplx_space_events::{
     SandboxEventDetails, SandboxEventSource, SandboxEventTrigger, SandboxEventType,
@@ -2415,6 +2416,9 @@ impl SandboxManagerService {
                     },
                     None => Some(GuestShutdown::AgentFlush),
                 };
+                // A flush's in-flight token, held until the node cleanup
+                // below returns.
+                let mut stop_flush = None;
                 let shutdown = match shutdown_policy {
                     Some(GuestShutdown::Acpi) => Some(
                         self.stop_firmware_guest(
@@ -2427,7 +2431,8 @@ impl SandboxManagerService {
                         .await?,
                     ),
                     Some(GuestShutdown::AgentFlush) => {
-                        self.flush_guest_before_termination(sandbox_id, guest_flush)
+                        stop_flush = self
+                            .flush_guest_before_termination(sandbox_id, guest_flush)
                             .await;
                         None
                     }
@@ -2459,6 +2464,7 @@ impl SandboxManagerService {
                     context,
                 )
                 .await?;
+                drop(stop_flush);
                 if let Some(outcome) = shutdown {
                     let mut details = SandboxEventDetails::default().operation("runtime_termination").reason(outcome.as_str());
                     if let Some(row) = row
@@ -2772,7 +2778,9 @@ impl SandboxManagerService {
             request,
             &admission,
             || async move {
-                self.flush_guest_before_termination(dispatch_sandbox_id, dispatch_guest_flush)
+                // Held until the node cleanup below returns.
+                let _stop_flush = self
+                    .flush_guest_before_termination(dispatch_sandbox_id, dispatch_guest_flush)
                     .await;
                 let mut node_client = connect_node(&self.node_manager).await.map_err(|error| {
                     Status::internal(format!(
@@ -3025,22 +3033,28 @@ fn guest_flush_is_qualified(
 impl SandboxManagerService {
     /// Attempt the guest flush an ordinary stop asked for, immediately before
     /// terminating its VM. A failed flush is recorded, and the stop proceeds.
+    ///
+    /// Answers the token that counts a resume for the flush as in flight; the
+    /// caller holds it until its node cleanup of the VM returns, since a
+    /// resume the budget cut off may still be running the VM until then.
+    #[must_use = "the stop counts as in flight until its node cleanup returns"]
     async fn flush_guest_before_termination(
         &self,
         sandbox_id: &str,
         guest_flush: crate::db::cleanup_jobs::GuestFlush,
-    ) {
+    ) -> Option<ActivationInFlightToken> {
         if guest_flush != crate::db::cleanup_jobs::GuestFlush::BeforeTermination {
-            return;
+            return None;
         }
         if self.lookup_sandbox(sandbox_id).is_ok_and(|sandbox| {
             !guest_flush_is_qualified(sandbox.guest_image, sandbox.execution_metadata.as_ref())
         }) {
-            return;
+            return None;
         }
+        let mut in_flight = None;
         let flushed = within_stop_flush_budget(
             crate::guest_filesystem_flush::GUEST_FILESYSTEM_FLUSH_TIMEOUT,
-            self.resume_paused_vm_before_flush(sandbox_id),
+            self.resume_paused_vm_before_flush(sandbox_id, &mut in_flight),
             || crate::guest_filesystem_flush::flush_guest_root_filesystem_before_stop(sandbox_id),
         )
         .await;
@@ -3063,11 +3077,24 @@ impl SandboxManagerService {
                 );
             }
         }
+        in_flight
     }
 
     /// Resume a paused VM so the stop's flush can reach its guest; see
-    /// [`BeforeStopFlush`].
-    async fn resume_paused_vm_before_flush(&self, sandbox_id: &str) -> Result<(), StopFlushError> {
+    /// [`BeforeStopFlush`]. Before it sends the resume, it puts the token
+    /// that counts the stop as in flight into `in_flight`, which the caller
+    /// owns, so a budget that ends this future mid-resume leaves the token
+    /// held until the stop is done with the VM.
+    ///
+    /// The resume doesn't pass VM activation admission: it runs a VM the
+    /// stop is about to terminate, only so the guest can flush, and a sealed
+    /// node must still be able to stop its sandboxes without losing their
+    /// writes. The token lets a seal wait for it.
+    async fn resume_paused_vm_before_flush(
+        &self,
+        sandbox_id: &str,
+        in_flight: &mut Option<ActivationInFlightToken>,
+    ) -> Result<(), StopFlushError> {
         let id = SandboxId::from_str(sandbox_id).map_err(StopFlushError::SandboxId)?;
         let state = crate::runtime_via_nodemgr::get_vm_state(id, &self.node_manager).await;
         if let Err(error) = &state {
@@ -3077,6 +3104,10 @@ impl SandboxManagerService {
             BeforeStopFlush::Flush => Ok(()),
             BeforeStopFlush::NotRunning => Err(StopFlushError::VmNotRunning),
             BeforeStopFlush::ResumeThenFlush => {
+                *in_flight = Some(
+                    self.activation_seal
+                        .continuation(InFlightActivationKind::StopFlush, sandbox_id),
+                );
                 let execution_fence = {
                     let db = self.db_conn().map_err(StopFlushError::Database)?;
                     crate::db::read::sandbox_view(&db, sandbox_id)
@@ -3170,3 +3201,5 @@ impl BeforeStopFlush {
 
 #[cfg(test)]
 mod stop_admission_tests;
+#[cfg(test)]
+mod stop_flush_tests;

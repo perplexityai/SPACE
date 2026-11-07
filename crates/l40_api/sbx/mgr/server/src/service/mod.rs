@@ -290,6 +290,13 @@ const ALLOW_LOCAL_BACKUP_INVENTORY: &[UdsPeerPrincipal] = &[
     UdsPeerPrincipal::Root,
     UdsPeerPrincipal::Service(user_names::SPACE_NODECTL),
 ];
+// Sealing refuses every activation on the node, so only root and the local
+// admin role may set or clear it until a node service is given the drain
+// that drives it.
+const ALLOW_ACTIVATION_SEAL_OPERATOR: &[UdsPeerPrincipal] = &[
+    UdsPeerPrincipal::Root,
+    UdsPeerPrincipal::Role(LocalRole::Admin),
+];
 const ALLOW_SANDBOX_ADMIN_OR_TMPLMGR: &[UdsPeerPrincipal] = &[
     UdsPeerPrincipal::Root,
     UdsPeerPrincipal::Role(LocalRole::Admin),
@@ -393,6 +400,9 @@ pub struct SandboxManagerService {
     /// Node-wide admission for Firecracker process launches. Cold starts and
     /// restores share one capacity bucket.
     activation_admission_limiter: Arc<ActivationAdmissionLimiter>,
+    /// Refuses every VM activation while the node is sealed, and counts the
+    /// activation work in flight a seal waits for.
+    activation_seal: Arc<crate::activation_seal::ActivationSeal>,
     /// At most one in-process driver may advance a persisted teardown suspend
     /// for a sandbox. The durable operation itself lives in SQLite; this map
     /// only bounds concurrent reattachment attempts from shim polling.
@@ -1720,6 +1730,8 @@ impl SandboxManagerService {
                 ),
             }
         }
+        // Read before anything is spawned that could admit an activation.
+        let activation_seal = Arc::new(crate::activation_seal::ActivationSeal::load(&conn));
         let db = crate::db::SharedConnection::new(conn);
         let auto_lifecycle = AutoLifecycleCoordinator::default();
         let network_policy_reconcile_queue = NetworkPolicyReconcileQueue::default();
@@ -1735,6 +1747,7 @@ impl SandboxManagerService {
             auto_lifecycle: auto_lifecycle.clone(),
             health_lifecycle: health_lifecycle.clone(),
             node_manager: options.node_manager.clone(),
+            activation_seal: Arc::clone(&activation_seal),
         });
         let snapshot_scheduler = Arc::new(
             crate::snapshot_scheduler::SnapshotScheduler::new_with_ownership(
@@ -1816,6 +1829,7 @@ impl SandboxManagerService {
                 recovery::QUARANTINE_RECOVERY_ORPHAN_RESTORE_PERMITS,
             )),
             activation_admission_limiter: Arc::new(ActivationAdmissionLimiter::from_env()),
+            activation_seal,
             teardown_suspend_drivers: Arc::new(dashmap::DashMap::new()),
             teardown_suspend_driver_sem: Arc::new(tokio::sync::Semaphore::new(
                 teardown_suspend_driver_concurrency,
@@ -2084,6 +2098,7 @@ pub(crate) mod drain;
 mod eviction;
 pub(crate) mod snapshot_capture;
 pub(crate) use eviction::EvictionClaim;
+mod grpc_activation_seal;
 mod grpc_auto_lifecycle_delete_receipts;
 mod grpc_core;
 mod grpc_lifecycle;

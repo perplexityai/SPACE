@@ -234,6 +234,8 @@ fn encrypted_restore_snapshot_error_preserves_invalid_key_status() {
 }
 
 #[cfg(test)]
+mod activation_seal_teardown_tests;
+#[cfg(test)]
 mod cancelled_cleanup_rpc_tests;
 
 #[cfg(test)]

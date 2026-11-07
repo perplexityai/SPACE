@@ -2296,7 +2296,7 @@ impl SandboxManagerService {
                 return Err(error);
             }
         };
-        activation_cleanup.admit(activation_admission_permit);
+        activation_cleanup.admit_activation(activation_admission_permit);
         let mut node_client = start_stage_timeout(
             "fresh.connect_node_mgr",
             START_NODE_METADATA_TIMEOUT,

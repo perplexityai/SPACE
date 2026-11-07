@@ -569,6 +569,11 @@ pub enum RunSbxMgrError {
     Migrate(#[source] crate::db::OpenError),
     #[error("failed to open the sandbox-manager database: {0}")]
     OpenDatabase(#[source] crate::db::OpenError),
+    /// The persisted activation seal could not be read. Serving would
+    /// either ignore a seal a drain relies on or refuse every activation
+    /// without one, so startup fails and process supervision retries.
+    #[error("failed to read the activation seal: {0}")]
+    ActivationSeal(String),
     #[error("invalid {SPACE_NODE_ROLE_ENV} {role:?}: {source}")]
     NodeRole {
         role: String,
@@ -833,6 +838,11 @@ pub async fn run(
         },
         service_config,
     );
+    if let Some(error) = service.activation_seal_load_error() {
+        let error = RunSbxMgrError::ActivationSeal(error);
+        report_active_failure(&error);
+        return Err(error);
+    }
     service.refresh_route_ed25519_verification_bundle_now();
     service
         .enable_dependency_restart_drain(

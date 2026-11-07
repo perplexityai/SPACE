@@ -37,7 +37,7 @@ fn roll_back_pause_best_effort(
 }
 
 #[cfg(test)]
-pub(super) type GuestPreparation = Arc<
+pub(in crate::service) type GuestPreparation = Arc<
     dyn Fn(
             String,
         ) -> futures_util::future::BoxFuture<
@@ -52,7 +52,7 @@ tokio::task_local! {
     /// Replaces the guest snapshot preparation of pause and the suspend
     /// auto-pause, which dials the host's per-sandbox spaced-host socket, and
     /// lets a test act between their state writes.
-    pub(super) static GUEST_PREPARATION: GuestPreparation;
+    pub(in crate::service) static GUEST_PREPARATION: GuestPreparation;
 }
 
 pub(super) async fn prepare_guest_for_pause(

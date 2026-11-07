@@ -152,6 +152,7 @@ fn checkpoint_context(state: SandboxState) -> (CheckpointContext, String) {
             auto_lifecycle: crate::auto_lifecycle::AutoLifecycleCoordinator::default(),
             health_lifecycle: crate::watchdog::HealthLifecycleEpochs::default(),
             node_manager: crate::node_manager_transport::fake::unbound_in_absent_dir(),
+            activation_seal: Arc::new(crate::activation_seal::ActivationSeal::unsealed()),
         },
         sandbox_id,
     )
@@ -1637,4 +1638,85 @@ fn gc_staging_ids_are_canonical() {
             "{name}"
         );
     }
+}
+
+/// While the node is sealed, a checkpoint of a running VM still resumes the
+/// VM it paused, after a capture and in the rollback after a failed one, and
+/// the resume is in flight under the checkpoint's token, which ends once the
+/// checkpoint returns.
+#[rstest::rstest]
+#[tokio::test]
+async fn a_sealed_checkpoint_resumes_the_vm_it_paused_under_its_token(
+    #[values(true, false)] capture_succeeds: bool,
+) {
+    use crate::activation_seal::{ActivationSeal, InFlightActivationKind};
+    use crate::node_manager_transport::fake::FakeNodeManager;
+    use pplx_space_node_mgr_client::proto::{
+        CaptureVmStateResponse, CreateBtrfsSnapshotRequest, CreateBtrfsSnapshotResponse,
+        PauseSandboxResponse, ResumeSandboxResponse, SyncGuestResponse,
+    };
+
+    let (mut ctx, sandbox_id) = checkpoint_context(SandboxState::Started);
+    let seal = Arc::new(ActivationSeal::load(&ctx.db.lock().unwrap()));
+    seal.seal(&ctx.db, 1).unwrap();
+    ctx.activation_seal = Arc::clone(&seal);
+    let in_flight_at_resume = Arc::new(std::sync::Mutex::new(None));
+    let node = FakeNodeManager::default()
+        .unary("PauseSandbox", |_: PauseSandboxRequest| {
+            Ok(PauseSandboxResponse {})
+        })
+        .unary("SyncGuest", |_: SyncGuestRequest| Ok(SyncGuestResponse {}))
+        .unary("CreateBtrfsSnapshot", |_: CreateBtrfsSnapshotRequest| {
+            Ok(CreateBtrfsSnapshotResponse::default())
+        })
+        .unary("CaptureVmState", move |_: CaptureVmStateRequest| {
+            if capture_succeeds {
+                Ok(CaptureVmStateResponse::default())
+            } else {
+                Err(tonic::Status::internal("capture refused by the test"))
+            }
+        })
+        .unary("ResumeSandbox", {
+            let seal = Arc::clone(&seal);
+            let in_flight_at_resume = Arc::clone(&in_flight_at_resume);
+            move |_: ResumeSandboxRequest| {
+                *in_flight_at_resume.lock().unwrap() = Some(
+                    seal.status()
+                        .in_flight
+                        .into_iter()
+                        .map(|in_flight| (in_flight.kind, in_flight.sandbox_id))
+                        .collect::<Vec<_>>(),
+                );
+                Ok(ResumeSandboxResponse {})
+            }
+        })
+        .serve();
+    ctx.node_manager = node.connector();
+
+    let result = CHECKPOINT_GUEST_PREPARED
+        .scope(
+            (),
+            do_checkpoint(&ctx, &sandbox_id, "f-manual-20261106T000000Z"),
+        )
+        .await;
+
+    assert_eq!(result.is_ok(), capture_succeeds, "{result:?}");
+    assert_eq!(
+        *in_flight_at_resume.lock().unwrap(),
+        Some(vec![(
+            InFlightActivationKind::Checkpoint,
+            sandbox_id.clone()
+        )]),
+        "node-manager calls: {:?}",
+        node.calls()
+    );
+    assert_eq!(
+        crate::db::get_sandbox(&ctx.db.lock().unwrap(), &sandbox_id)
+            .unwrap()
+            .unwrap()
+            .state,
+        SandboxState::Started
+    );
+    assert_eq!(seal.status().sealed.map(|sealed| sealed.epoch), Some(1));
+    seal.assert_quiesced();
 }

@@ -1103,6 +1103,7 @@ async fn pause_failed_recovery_fixture(
             auto_lifecycle: auto_lifecycle.clone(),
             health_lifecycle: lifecycle_epochs.clone(),
             node_manager: crate::node_manager_transport::fake::unbound_in_absent_dir(),
+            activation_seal: Arc::new(crate::activation_seal::ActivationSeal::unsealed()),
         },
     )));
     snapshot_scheduler

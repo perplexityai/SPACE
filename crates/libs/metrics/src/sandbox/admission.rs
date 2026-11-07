@@ -210,6 +210,27 @@ pub fn node_refill_rps(value: f64) {
     );
 }
 
+/// 1 while sandbox-manager's VM activations are sealed, 0 while they are
+/// not. Written at startup and on every seal and unseal.
+pub fn node_activation_seal_sealed(sealed: bool) {
+    gauge(
+        "node.sandbox_admission.activation_seal.sealed",
+        if sealed { 1.0 } else { 0.0 },
+        &[],
+    );
+}
+
+/// Activation work sandbox-manager has in flight, by `activation_kind`
+/// (`cold`, `restore`, `resident_resume`, `checkpoint`, `stop_flush`): what
+/// an activation seal waits for. Written whenever the count changes.
+pub fn node_activation_seal_in_flight(activation_kind: &'static str, value: usize) {
+    gauge(
+        "node.sandbox_admission.activation_seal.in_flight",
+        value as f64,
+        &[tag("activation_kind", activation_kind)],
+    );
+}
+
 pub fn cluster_decision(
     operation_class: AdmissionOperationClass,
     decision: AdmissionDecision,

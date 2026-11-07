@@ -926,3 +926,84 @@ async fn snapshot_rpcs_refuse_gc_staging() {
         .collect();
     assert_eq!(*deletions.lock().unwrap(), by_name_then_all);
 }
+
+/// On a sealed node, a rollback that would restart its sandbox is refused
+/// with the seal's marker, under the activation its restart would be, before
+/// it reaches node-manager or stops anything. The same rollback without the
+/// restart is not refused by the seal and goes on to the checks after it.
+#[tokio::test]
+async fn a_sealed_node_refuses_an_auto_restarting_rollback_before_stopping_anything() {
+    use pplx_space_common_core::activation_seal_signals::ACTIVATIONS_SEALED_MARKER;
+
+    let node_manager = crate::node_manager_transport::fake::FakeNodeManager::default().serve();
+    let scratch = tempfile::tempdir().unwrap();
+    let conn = crate::db::test_conn();
+    let sandbox = SandboxId::new().to_string();
+    crate::db::fixture::insert_test_sandbox(&conn, &sandbox, SandboxState::Started);
+    // A root-owned sandbox, which a root caller may restart without the
+    // control plane.
+    conn.execute(
+        "UPDATE sandboxes SET user = ?1 WHERE id = ?2",
+        [
+            pplx_space_common_core::types::ROOT_SANDBOX_OWNER.as_str(),
+            sandbox.as_str(),
+        ],
+    )
+    .unwrap();
+    let service = SandboxManagerService::new_with_options(
+        conn,
+        SandboxManagerServiceOptions {
+            node_manager: node_manager.connector(),
+            ..SandboxManagerServiceOptions::for_test_in(scratch.path())
+        },
+    );
+    service.activation_seal.seal(&service.db, 9).unwrap();
+    let rollback = |snapshot_name: &str, auto_restart: bool| {
+        service.rollback(crate::service::activation_support::internal_request(
+            RollbackRequest {
+                sandbox_id: sandbox.clone(),
+                snapshot_name: snapshot_name.to_owned(),
+                auto_restart,
+                ..Default::default()
+            },
+        ))
+    };
+
+    for (snapshot_name, restart) in [("d-sealed", "cold"), ("f-sealed", "restore")] {
+        let refused = rollback(snapshot_name, true).await.unwrap_err();
+        assert_eq!(
+            refused.code(),
+            tonic::Code::FailedPrecondition,
+            "{refused:?}"
+        );
+        assert!(
+            refused.message().contains(ACTIVATIONS_SEALED_MARKER)
+                && refused
+                    .message()
+                    .contains(&format!("refusing the {restart} activation")),
+            "{snapshot_name}: {refused:?}"
+        );
+
+        let not_refused = rollback(snapshot_name, false).await.unwrap_err();
+        assert!(
+            !not_refused.message().contains(ACTIVATIONS_SEALED_MARKER),
+            "{snapshot_name}: a rollback that restarts nothing is not the seal's: {not_refused:?}"
+        );
+        assert!(
+            not_refused.message().contains("rootfs.ext4"),
+            "{snapshot_name}: the fixture has no snapshot files: {not_refused:?}"
+        );
+    }
+    assert!(
+        node_manager.calls().is_empty(),
+        "{:?}",
+        node_manager.calls()
+    );
+    assert_eq!(
+        sandbox_state(&service.db.lock().unwrap(), &sandbox),
+        SandboxState::Started
+    );
+    service.shutdown_token.cancel();
+    service.task_tracker.close();
+    service.task_tracker.wait().await;
+}

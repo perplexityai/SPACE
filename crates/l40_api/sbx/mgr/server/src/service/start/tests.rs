@@ -1777,9 +1777,10 @@ async fn the_second_stopped_boundary_fences_the_request_too() {
 }
 
 /// A cold boot of a `created` row passes the VM launch-time admission as a
-/// cold activation. The row's local owner holds no route identity, so the
-/// start is refused at the route-identity check that follows admission,
-/// before it claims the row.
+/// cold activation. While the node is sealed the admission refuses it, and
+/// the row stays `created`. After the unseal the row's local owner holds no
+/// route identity, so the start is refused at the route-identity check that
+/// follows admission, before it claims the row.
 #[tokio::test]
 async fn cold_boot_is_admitted_as_a_cold_activation() {
     use crate::service::start_support::REQUESTED_VM_ACTIVATIONS;
@@ -1822,8 +1823,8 @@ async fn cold_boot_is_admitted_as_a_cold_activation() {
     );
 
     let admitted = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let error = REQUESTED_VM_ACTIVATIONS
-        .scope(
+    let start = || {
+        REQUESTED_VM_ACTIVATIONS.scope(
             Arc::clone(&admitted),
             service.start_sandbox(
                 StartRequest {
@@ -1833,6 +1834,29 @@ async fn cold_boot_is_admitted_as_a_cold_activation() {
                 false,
             ),
         )
+    };
+    service.activation_seal.seal(&service.db, 1).unwrap();
+    let sealed = start()
+        .await
+        .expect_err("a sealed node refuses the cold boot");
+    assert_eq!(sealed.code(), tonic::Code::FailedPrecondition, "{sealed:?}");
+    assert!(
+        sealed
+            .message()
+            .contains(pplx_space_common_core::activation_seal_signals::ACTIVATIONS_SEALED_MARKER),
+        "{sealed:?}"
+    );
+    assert_eq!(
+        service.lookup_sandbox(&sandbox_id).unwrap().state,
+        SandboxState::Created
+    );
+    assert_eq!(
+        std::mem::take(&mut *admitted.lock().unwrap()),
+        vec![ActivationAdmissionKind::Cold]
+    );
+
+    service.activation_seal.unseal(&service.db, 1).unwrap();
+    let error = start()
         .await
         .expect_err("a local owner's start has no route identity to activate with");
 
@@ -1850,4 +1874,5 @@ async fn cold_boot_is_admitted_as_a_cold_activation() {
         service.lookup_sandbox(&sandbox_id).unwrap().state,
         SandboxState::Created
     );
+    service.activation_seal.assert_quiesced();
 }

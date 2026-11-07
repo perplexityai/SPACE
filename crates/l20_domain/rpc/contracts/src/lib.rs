@@ -24,6 +24,20 @@ pub mod wake_signals {
         "wake start context has no network namespace; re-place via restore";
 }
 
+/// The marker sandbox-manager puts in the status it refuses a VM activation
+/// with while the node's activations are sealed, for callers that must tell
+/// a sealed node from other refusals.
+pub mod activation_seal_signals {
+    /// Substring of the `FailedPrecondition` message sandbox-manager answers a
+    /// cold boot, a snapshot restore or a resident resume with while its
+    /// activations are sealed. The node refuses the same activation until it is
+    /// unsealed, so a caller that receives it places the work on another node
+    /// or waits for the unseal rather than retrying here. On the Kubernetes
+    /// substrate a refused create or restore goes to the kubelet, which retries
+    /// the pod regardless.
+    pub const ACTIVATIONS_SEALED_MARKER: &str = "node activations are sealed";
+}
+
 /// Machine-readable markers node-manager attaches to `ExposePort` failures and
 /// node-ctl classifies on. Producer (node-manager) and consumer (node-ctl)
 /// must reference these constants, never the literals.

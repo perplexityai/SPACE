@@ -28,8 +28,8 @@ pub mod env;
 pub mod guest;
 pub mod host;
 pub use pplx_space_rpc_contracts::{
-    artifact_backup_signals, inventory, node_drain_signals, operation_budget,
-    port_exposure_signals, restore_ownership, wake_signals,
+    activation_seal_signals, artifact_backup_signals, inventory, node_drain_signals,
+    operation_budget, port_exposure_signals, restore_ownership, wake_signals,
 };
 pub use pplx_space_sql_locator::sql;
 

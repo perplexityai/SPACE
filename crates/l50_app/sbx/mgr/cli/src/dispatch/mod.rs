@@ -1,5 +1,6 @@
 use super::*;
 
+mod activation_seal;
 mod admin;
 mod core;
 mod diagnostics;
@@ -27,6 +28,9 @@ pub(super) async fn dispatch(
         | Commands::NetworkDebug { .. }
         | Commands::CycleNetGateway { .. }
         | Commands::Cleanup => admin::handle(command, client).await,
+        Commands::SealActivations { .. }
+        | Commands::UnsealActivations { .. }
+        | Commands::ActivationSeal => activation_seal::handle(command, client).await,
         Commands::Pause { .. }
         | Commands::Resume { .. }
         | Commands::Suspend { .. }

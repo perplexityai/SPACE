@@ -801,9 +801,13 @@ impl SandboxManagerService {
         // policy is unchanged.
         self.apply_network_policy_before_wake(sandbox_id, "resume")
             .await?;
-        let activation_admission_permit = self
+        // The in-flight token is held to the end of the resume: past the
+        // permit, through guest setup and the rollback pause a failed setup
+        // takes.
+        let (activation_admission_permit, _in_flight) = self
             .admit_vm_activation(ActivationAdmissionKind::ResidentResume, &sandbox.id)
-            .await?;
+            .await?
+            .into_parts();
         self.begin_resident_resume(&sandbox.id, activation_policy)
             .await?;
         self.watchdog.record_lifecycle_edge(&sandbox.id).await;
