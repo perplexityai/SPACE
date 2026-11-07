@@ -722,7 +722,8 @@ fn insert_file_mutation_paths(paths: &mut Map<String, Value>, idempotency_key_pa
                     "200": { "description": "Path removed or already absent" },
                     "400": { "description": "Invalid sandbox id, or a non-idempotent remove mode" },
                     "404": { "description": "Sandbox not found" },
-                    "409": { "description": "Idempotency conflict" }
+                    "409": { "description": "Idempotency conflict" },
+                    "412": { "description": "The path is a directory with entries and `recursive` is not set; nothing is removed" }
                 }
             }
         }),
