@@ -16,7 +16,7 @@
 use std::future::Future;
 use std::time::Duration;
 
-use pplx_space_common_core::env::{env_flag_var, parse_positive_f64_env, valid_positive_f64};
+use pplx_space_env_vars::{env_flag_var, parse_positive_f64_env, valid_positive_f64};
 use pplx_space_feature_flags::{FeatureFlagClient, SPACE_CLUSTER_RATE_LIMITER_FLAG};
 use pplx_space_sandbox_metrics::admission::{
     AdmissionDecision, AdmissionOperationClass, AdmissionRejectReason,
@@ -189,7 +189,7 @@ impl ClusterSandboxAdmissionConfig {
         Self {
             enabled: env_flag_var(ENABLED_ENV, defaults.enabled),
             refill_rps: parse_positive_f64_env(REFILL_RPS_ENV, defaults.refill_rps),
-            burst: pplx_space_common_core::env::test_hook_var(BURST_ENV)
+            burst: pplx_space_test_hooks::test_hook_var(BURST_ENV)
                 .and_then(|raw| raw.trim().parse::<f64>().ok())
                 .filter(|burst| burst.is_finite() && *burst >= 1.0)
                 .unwrap_or(defaults.burst),

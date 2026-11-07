@@ -1,7 +1,7 @@
-use pplx_space_common_core::env::{Environment, ProcessEnvironment};
 use pplx_space_common_core::types::{
     LocalArtifactId, NodeId, OrgId, SandboxId, SnapshotId, UserId,
 };
+use pplx_space_env_vars::{Environment, ProcessEnvironment};
 
 use std::error::Error;
 use std::fmt::Display;

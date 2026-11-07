@@ -542,7 +542,7 @@ async fn admin_pinned_create_follows_the_running_substrate() -> TestResult {
     // chooses from the process environment Direct whatever the host sets.
     if !pplx_space_test_env::enter_test_process(&[
         (
-            pplx_space_common_core::env::SANDBOX_ALLOW_PLACEMENT_ENV,
+            SANDBOX_ALLOW_PLACEMENT_ENV,
             Some(std::ffi::OsStr::new("true")),
         ),
         (

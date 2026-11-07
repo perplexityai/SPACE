@@ -484,7 +484,7 @@ async fn shutdown_releases_listener_while_accepted_connections_drain() {
     let server_shutdown = shutdown_token.clone();
     let (_, health_service) = pplx_space_grpc_server::grpc_health_service();
     struct PlaintextDev;
-    impl pplx_space_common_core::env::Environment for PlaintextDev {
+    impl pplx_space_env_vars::Environment for PlaintextDev {
         fn var_os(&self, name: &str) -> Option<std::ffi::OsString> {
             (name == pplx_space_common_grpc::internal_transport::INSECURE_DEV_ENV)
                 .then(|| "true".into())

@@ -872,10 +872,10 @@ impl ReconcilerConfig {
     /// Read config from env vars. Helm renders these under
     /// `clusterController.reconcilers.node_drain.*`.
     pub fn from_env() -> Self {
-        Self::from_environment(&pplx_space_common_core::env::ProcessEnvironment)
+        Self::from_environment(&pplx_space_env_vars::ProcessEnvironment)
     }
 
-    pub(crate) fn from_environment(env: &dyn pplx_space_common_core::env::Environment) -> Self {
+    pub(crate) fn from_environment(env: &dyn pplx_space_env_vars::Environment) -> Self {
         let config = env_config::EnvConfig(env);
         let default = Self::default();
         Self {
@@ -944,7 +944,7 @@ impl ReconcilerConfig {
 /// whitespace-only — the two-MNG rollout is opt-in and never required for
 /// the reconciler to make forward progress.
 fn env_evacuation_placement(
-    env: &dyn pplx_space_common_core::env::Environment,
+    env: &dyn pplx_space_env_vars::Environment,
     value_var: &str,
 ) -> Option<EvacuationPlacement> {
     let value = env.var(value_var).ok().unwrap_or_default();

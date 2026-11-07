@@ -88,7 +88,7 @@ WRAPPER = "fn test_raw(var: &str) -> Option<String> { test_hook_var(var) }\n"
         {LIB: WRAPPER + "fn test_parsed<T>(v: &str) -> T { test_raw(v) }\n"
          'let n = config.test_parsed::<u32>("SPACE_EXAMPLE_LIMIT");'},
         # Through an import alias of a hook.
-        {LIB: "use pplx_space_common_core::env::test_hook_var as hook;\n"
+        {LIB: "use pplx_space_test_hooks::test_hook_var as hook;\n"
          'let n = hook("SPACE_EXAMPLE_LIMIT");'},
         # The reading file's constant wins over a same-named one elsewhere.
         {
@@ -295,7 +295,7 @@ READ = 'test_hook_var("SPACE_EXAMPLE_LIMIT")'
                '    test_hook(&service.env_for(env), "SPACE_EXAMPLE_TICK_SECS")\n}'},
           id="parameter-starts-argument"),
         # Imports, fields and mentions in strings and comments aren't reads.
-        P({LIB: "use pplx_space_common_core::env::{\n    env_flag,\n    test_hook_var,\n};"},
+        P({LIB: "use pplx_space_test_hooks::{\n    test_hook,\n    test_hook_var,\n};"},
           id="multi-line-import"),
         P({LIB: "struct C { test_hook: bool }\nfn f(c: C) -> bool { c.test_hook }"}, id="field"),
         P({LIB: 'fn f() { tracing::info!(r#"call test_hook_var("SPACE_EXAMPLE_LIMIT")"#); }'},
@@ -336,7 +336,7 @@ READ = 'test_hook_var("SPACE_EXAMPLE_LIMIT")'
         # A crate-private wrapper's name and an alias mean nothing in another crate.
         P({
             "crates/libs/one/Cargo.toml": "",
-            "crates/libs/one/src/lib.rs": "use pplx_space_common_core::env::test_hook_var as var;\n" + WRAPPER,
+            "crates/libs/one/src/lib.rs": "use pplx_space_test_hooks::test_hook_var as var;\n" + WRAPPER,
             "crates/libs/two/Cargo.toml": "",
             "crates/libs/two/src/lib.rs": "fn read(name: &str) { std::env::var(name) }\n"
             'let n = std::env::var("SPACE_EXAMPLE_LIMIT");\n'

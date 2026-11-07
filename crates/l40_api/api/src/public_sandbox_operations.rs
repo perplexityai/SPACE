@@ -220,7 +220,7 @@ pub(crate) const IMPLICIT_WAKE_ACTIVITY_ENV: &str = "SPACE_IMPLICIT_WAKE_ACTIVIT
 /// Whether the API records the activity on the system's wakes it queues; see
 /// [`IMPLICIT_WAKE_ACTIVITY_ENV`].
 pub(crate) fn implicit_wake_activity_enabled() -> bool {
-    pplx_space_common_core::env::env_flag_var(IMPLICIT_WAKE_ACTIVITY_ENV, false)
+    pplx_space_env_vars::env_flag_var(IMPLICIT_WAKE_ACTIVITY_ENV, false)
 }
 
 /// The switch for recording
@@ -244,7 +244,7 @@ pub(crate) const ADMIN_CREATE_REQUESTED_BY_ENV: &str = "SPACE_ADMIN_CREATE_REQUE
 /// Whether admin creates record their requester; see
 /// [`ADMIN_CREATE_REQUESTED_BY_ENV`].
 pub(crate) fn admin_create_requested_by_enabled() -> bool {
-    pplx_space_common_core::env::env_flag_var(ADMIN_CREATE_REQUESTED_BY_ENV, true)
+    pplx_space_env_vars::env_flag_var(ADMIN_CREATE_REQUESTED_BY_ENV, true)
 }
 
 /// The switch for recording [`CreateSandboxOperationPayload::metric_client_id`]
@@ -265,7 +265,7 @@ pub(crate) const NATIVE_CREATE_CLIENT_ATTRIBUTION_ENV: &str =
 /// Whether native creates record their client; see
 /// [`NATIVE_CREATE_CLIENT_ATTRIBUTION_ENV`].
 pub(crate) fn native_create_client_attribution_enabled() -> bool {
-    pplx_space_common_core::env::env_flag_var(NATIVE_CREATE_CLIENT_ATTRIBUTION_ENV, false)
+    pplx_space_env_vars::env_flag_var(NATIVE_CREATE_CLIENT_ATTRIBUTION_ENV, false)
 }
 
 impl SandboxLifecycleOperationPayload {

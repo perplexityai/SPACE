@@ -21720,7 +21720,7 @@ pub(crate) mod service_tests {
     /// Tests for suspend-vs-wake arbitration: the ordering predicate that
     /// decides whether a suspend queued behind a concurrent wake. (The
     /// kill-switch value vocabulary is the shared
-    /// `pplx_space_common_core::env::env_flag`, tested in common-core.)
+    /// `pplx_space_env_vars::env_flag`, tested in env-vars.)
     mod suspend_wake_arbitration {
         use std::time::{Duration, Instant};
 

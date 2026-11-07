@@ -166,7 +166,7 @@ impl Default for OperationExecutionConfig {
 
 impl OperationExecutionConfig {
     pub fn from_env() -> Self {
-        Self::from_environment(&pplx_space_common_core::env::ProcessEnvironment)
+        Self::from_environment(&pplx_space_env_vars::ProcessEnvironment)
     }
 
     /// The settings every executor of claimed operations runs under: the
@@ -175,11 +175,10 @@ impl OperationExecutionConfig {
     /// its deadline the same way whichever of them runs it. The staleness
     /// and deadline overrides are test hooks; the retry-deferral switch is a
     /// deployment setting. A malformed override keeps the default.
-    pub fn from_environment(env: &dyn pplx_space_common_core::env::Environment) -> Self {
+    pub fn from_environment(env: &dyn pplx_space_env_vars::Environment) -> Self {
         let default = Self::default();
         let test_secs = |name| {
-            pplx_space_common_core::env::test_hook(env, name)
-                .and_then(|raw| raw.parse::<u64>().ok())
+            pplx_space_test_hooks::test_hook(env, name).and_then(|raw| raw.parse::<u64>().ok())
         };
         Self {
             claim_stale_after: test_secs(CLAIM_STALE_SECS_ENV)

@@ -35,7 +35,7 @@ const LEAF_COMMON_NAME: &str = "SPACE Gateway";
 // or idempotency contract applies to a certificate signed locally by that node.
 
 fn launch_capability(
-    env: &dyn pplx_space_common_core::env::Environment,
+    env: &dyn pplx_space_env_vars::Environment,
 ) -> Result<zeroize::Zeroizing<Vec<u8>>, Status> {
     parse_launch_capability(
         env.var(pplx_space_common_core::host::linux::gateway::LAUNCH_CAPABILITY_ENV),
@@ -357,7 +357,7 @@ impl GatewayAuthority {
         shutdown: CancellationToken,
     ) -> Self {
         Self::from_environment_impl(
-            &pplx_space_common_core::env::ProcessEnvironment,
+            &pplx_space_env_vars::ProcessEnvironment,
             socket,
             identity,
             shutdown,
@@ -365,7 +365,7 @@ impl GatewayAuthority {
     }
     #[cfg(any(test, feature = "test-support"))]
     pub fn from_environment(
-        env: &dyn pplx_space_common_core::env::Environment,
+        env: &dyn pplx_space_env_vars::Environment,
         socket: PathBuf,
         identity: ServicePortIngressState,
         shutdown: CancellationToken,
@@ -374,7 +374,7 @@ impl GatewayAuthority {
     }
 
     fn from_environment_impl(
-        env: &dyn pplx_space_common_core::env::Environment,
+        env: &dyn pplx_space_env_vars::Environment,
         socket: PathBuf,
         identity: ServicePortIngressState,
         shutdown: CancellationToken,

@@ -313,7 +313,7 @@ consume twelve concurrent runners; queue time remains a separate constraint.
 
 Every Kind binary is normally built with the `test-hooks` feature (see
 [Default workflow: Tilt](#default-workflow-tilt)), so each environment variable
-read through `pplx_space_common_core::env::test_hook` takes effect, and the
+read through `pplx_space_test_hooks::test_hook` takes effect, and the
 charts set several on every run. `SPACE_KIND_RUST_BUILD=release`
 (`lib/rust-build.sh`; the default is `test-hooks`) builds, deploys and smokes
 the Kind services with no crate's `test-hooks` feature enabled:

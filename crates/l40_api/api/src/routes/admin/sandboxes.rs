@@ -8,10 +8,8 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
 };
-use pplx_space_common_core::env::{
-    DEFAULT_SANDBOX_ALLOW_PLACEMENT, SANDBOX_ALLOW_PLACEMENT_ENV, env_flag_var,
-};
 use pplx_space_common_core::types::{IdempotencyKey, NodePoolName, OrgId, SandboxId, UserId};
+use pplx_space_env_vars::env_flag_var;
 use pplx_space_public_api::{
     CreateSandboxRequest as PublicCreateSandboxRequest, OperationId, OperationKind,
     OperationTargetType, PublicSandboxId, RequestFingerprint, RollbackSandboxRequest,
@@ -46,6 +44,11 @@ use pplx_space_public_api::routes as native_routes;
 
 mod guest_access;
 pub use guest_access::{create_command, create_terminal_session, list_snapshots};
+
+/// Admission gate for create-time sandbox node-pool placement.
+const SANDBOX_ALLOW_PLACEMENT_ENV: &str = "SPACE_ALLOW_SANDBOX_PLACEMENT";
+/// Placement is operator-only and remains disabled unless explicitly enabled.
+const DEFAULT_SANDBOX_ALLOW_PLACEMENT: bool = false;
 
 const ADMIN_SANDBOX_ACTION_PREFIX: &str = "force-";
 /// Distinct from the public `/v1/sandboxes` template so admin and public

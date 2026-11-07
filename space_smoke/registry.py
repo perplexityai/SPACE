@@ -136,7 +136,7 @@ def scenario(
     known mode that the runner did not ask for. `storage_credentials` does the
     same for the Kind storage credentials mode the scenario exercises
     (SPACE_KIND_STORAGE_CREDENTIALS).
-    `test_hooks` names the test hooks (`pplx_space_common_core::env::test_hook`)
+    `test_hooks` names the test hooks (`pplx_space_test_hooks::test_hook`)
     the scenario cannot pass without; implicit selection skips it, visibly, on
     a bench of release binaries (SPACE_KIND_RUST_BUILD=release), which read
     none.
