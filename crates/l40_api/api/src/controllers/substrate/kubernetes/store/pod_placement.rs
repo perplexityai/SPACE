@@ -179,6 +179,7 @@ impl K8sStore {
         Ok(Some(resulting_state))
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(in crate::controllers::substrate::kubernetes) async fn persist_pod_node_placement(
         &self,
         sandbox_id: SandboxId,
@@ -187,6 +188,7 @@ impl K8sStore {
         node_id: NodeId,
         role: NodeRole,
         address: Option<&str>,
+        instance_id: Option<&str>,
     ) -> Result<(), SubstrateError> {
         let mut tx = self
             .pool
@@ -203,6 +205,7 @@ impl K8sStore {
                 role,
                 address,
                 state: NodeStateWrite::InsertOnly(NodeLifecycleState::Registered),
+                instance_id,
             },
         )
         .await?;
@@ -261,9 +264,18 @@ impl K8sStore {
             node_id,
             role,
             address,
+            instance_id,
         } = placement;
         let result = self
-            .persist_pod_node_placement(sandbox_id, node_name, node_uid, node_id, role, address)
+            .persist_pod_node_placement(
+                sandbox_id,
+                node_name,
+                node_uid,
+                node_id,
+                role,
+                address,
+                instance_id,
+            )
             .await;
         match retry {
             PlacementRetryDisposition::RetryDuplicatesExecution => {

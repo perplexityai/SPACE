@@ -969,6 +969,7 @@ mod stopped_restore_plan_tests {
                 node_id,
                 NodeRole::Worker,
                 None,
+                None,
             )
             .await?;
         sqlx::query(
@@ -1117,6 +1118,7 @@ mod stopped_restore_plan_tests {
                 "drained-node-uid",
                 node_id,
                 NodeRole::Worker,
+                None,
                 None,
             )
             .await?;
@@ -1353,6 +1355,7 @@ mod stopped_restore_plan_tests {
                 "drained-node-uid",
                 node_id,
                 NodeRole::Worker,
+                None,
                 None,
             )
             .await?;

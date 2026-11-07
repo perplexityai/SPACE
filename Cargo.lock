@@ -6793,9 +6793,11 @@ name = "pplx-space-node-registration-store"
 version = "0.8.1"
 dependencies = [
  "pplx-space-common-core",
+ "pplx-space-db-test-fixtures",
  "pplx-space-sql-locator",
  "sqlx",
  "thiserror 2.0.20",
+ "tokio",
 ]
 
 [[package]]

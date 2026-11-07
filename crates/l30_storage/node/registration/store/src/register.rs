@@ -1,6 +1,8 @@
 //! Registering a Kubernetes node: its `nodes` row and its `node_k8s` row, in
 //! the caller's transaction.
 
+use crate::instance::{InstanceRecorded, record_k8s_node_instance};
+
 use pplx_space_common_core::types::{NodeId, NodeRole, SubstrateKind};
 use pplx_space_sql_locator::sql;
 use sqlx::PgConnection;
@@ -19,6 +21,9 @@ pub struct K8sNodeRegistration<'a> {
     /// Whether registering an existing row also writes `state`. Only the
     /// node's lifecycle owner does; every other writer leaves it alone.
     pub manage_state: bool,
+    /// The EC2 instance the Node's `providerID` names. `None` leaves a
+    /// recorded instance alone.
+    pub instance_id: Option<&'a str>,
 }
 
 /// The statement of [`register_k8s_node`] that failed.
@@ -32,6 +37,8 @@ pub enum K8sNodeRegistrationStep {
     RecheckOwnership,
     /// Clearing drain state when the Kubernetes Node UID changed.
     ClearDrain,
+    /// Recording a different instance on an existing `node_k8s` row.
+    RecordInstance,
     /// The `node_k8s` upsert.
     UpsertNodeK8s,
     /// The tombstone re-check after the upserts.
@@ -45,6 +52,7 @@ impl K8sNodeRegistrationStep {
             Self::UpsertNode => "upsert node",
             Self::RecheckOwnership => "re-check ownership",
             Self::ClearDrain => "clear drain state",
+            Self::RecordInstance => "record instance",
             Self::UpsertNodeK8s => "upsert node_k8s",
             Self::RecheckTombstone => "re-check tombstone",
         }
@@ -90,7 +98,9 @@ impl<T> Step<T> for Result<T, sqlx::Error> {
 }
 
 /// Register a Kubernetes node: refuse a tombstoned node, upsert its `nodes`
-/// row, clear its drain state when its Kubernetes Node UID changed, upsert its
+/// row, clear its drain state when its Kubernetes Node UID changed, record a
+/// different instance on an existing `node_k8s` row (see
+/// [`record_k8s_node_instance`]), upsert its
 /// `node_k8s` row, and refuse it again if a tombstone committed meanwhile.
 /// Returns whether any of those writes changed a row.
 ///
@@ -110,6 +120,7 @@ pub async fn register_k8s_node(
         address,
         state,
         manage_state,
+        instance_id,
     } = registration;
 
     // Tombstone gate. Inventory upserts (kube_node_sync, late pod placement
@@ -229,9 +240,25 @@ pub async fn register_k8s_node(
         on_drain_cleared();
     }
 
+    // Before the upsert below overwrites `k8s_node_uid`, so a superseded
+    // instance is kept with the UID the row held when another instance was
+    // reported. Every registration path passes the instance its Node names, so
+    // that is the UID the instance ran under, unless the replacement Node had
+    // no `providerID` yet or an api from before this change wrote its UID
+    // first. A row that doesn't exist yet is inserted with the instance below.
+    // The `nodes` upsert above locked the node's row, so a concurrent
+    // registration of this node id waits for this transaction and then finds
+    // the row it committed.
+    let instance_recorded = match instance_id {
+        Some(instance_id) => record_k8s_node_instance(conn, node_id, instance_id)
+            .await
+            .step(K8sNodeRegistrationStep::RecordInstance)?,
+        None => InstanceRecorded::Unchanged,
+    };
+
     let node_k8s_changed = sqlx::query(sql!(
-        "INSERT INTO node_k8s (node_id, k8s_node_name, k8s_node_uid)
-             VALUES ($1, $2, $3)
+        "INSERT INTO node_k8s (node_id, k8s_node_name, k8s_node_uid, instance_id)
+             VALUES ($1, $2, $3, $4)
              ON CONFLICT (node_id) DO UPDATE
              SET k8s_node_name = EXCLUDED.k8s_node_name,
                  k8s_node_uid = EXCLUDED.k8s_node_uid,
@@ -242,6 +269,7 @@ pub async fn register_k8s_node(
     .bind(node_id)
     .bind(node_name)
     .bind(node_uid)
+    .bind(instance_id)
     .execute(&mut *conn)
     .await
     .step(K8sNodeRegistrationStep::UpsertNodeK8s)?
@@ -259,7 +287,7 @@ pub async fn register_k8s_node(
     {
         return Err(K8sNodeRegistrationError::TombstonedDuringRegistration);
     }
-    Ok(node_changed || drain_cleared > 0 || node_k8s_changed)
+    Ok(node_changed || drain_cleared > 0 || instance_recorded.changed() || node_k8s_changed)
 }
 
 async fn is_node_k8s_tombstoned(

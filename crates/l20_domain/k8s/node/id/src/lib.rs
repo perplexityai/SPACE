@@ -1,7 +1,8 @@
 //! SPACE node identity derived from a Kubernetes node: the role-scoped node
 //! UUID that node-local daemons and the control plane compute from
-//! `(k8s node name, SPACE node role)`, and the parser that accepts either a
-//! direct node UUID or a Kubernetes node name.
+//! `(k8s node name, SPACE node role)`, the parser that accepts either a
+//! direct node UUID or a Kubernetes node name, and the EC2 instance a
+//! Kubernetes node runs on, read from its `providerID`.
 //!
 //! It cannot live in `pplx-space-k8s-ids`, which holds only
 //! Kubernetes' own identifiers: it returns `NodeId` and reads `NodeRole`,
@@ -31,6 +32,41 @@ pub fn space_node_id(value: &str, role: NodeRole) -> Result<NodeId, K8sNodeNameP
     }
     let node_name = K8sNodeName::parse(value)?;
     Ok(space_k8s_node_id(node_name.as_str(), role.as_str()))
+}
+
+/// The EC2 instance ID a Kubernetes Node's AWS `providerID` names: an `i-`
+/// prefix and no `/`. Not further validated; it is what the Node says, and
+/// EC2 is the authority on whether such an instance exists.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Ec2InstanceId(String);
+
+impl Ec2InstanceId {
+    /// The instance ID in `aws:///<az>/<instance-id>`, the canonical pointer
+    /// from a Kubernetes Node back to its EC2 instance. Everything before the
+    /// final `/` is bookkeeping for the cloud-provider layer. `None` for any
+    /// other provider (Kind's `kind://…`, for one) or a last segment that is
+    /// not an instance ID.
+    pub fn from_provider_id(provider_id: &str) -> Option<Self> {
+        provider_id
+            .strip_prefix("aws:///")
+            .and_then(|rest| rest.rsplit('/').next())
+            .and_then(Self::parse)
+    }
+
+    /// The last segment of an AWS `providerID`, when it is an instance ID.
+    fn parse(value: &str) -> Option<Self> {
+        value.starts_with("i-").then(|| Self(value.to_owned()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for Ec2InstanceId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
 }
 
 #[cfg(test)]

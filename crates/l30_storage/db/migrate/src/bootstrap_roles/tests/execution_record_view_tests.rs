@@ -38,10 +38,12 @@ const MIGRATED_TEMPLATE: &str = "execution_record_pins_template";
 /// among the pins sharing a server.
 const TEMPLATE_LOCK: i64 = 0x7069_6e73;
 
-/// The node inventory's upsert (`store/node_inventory.rs` in the api crate).
+/// Kubernetes node registration's `node_k8s` upsert (`register.rs` in
+/// `pplx-space-node-registration-store`), bound as a caller without an
+/// instance binds it.
 const NODE_INVENTORY_UPSERT: &str = sql!(
-    "INSERT INTO node_k8s (node_id, k8s_node_name, k8s_node_uid)
-     VALUES ($1::uuid, $2, $3)
+    "INSERT INTO node_k8s (node_id, k8s_node_name, k8s_node_uid, instance_id)
+     VALUES ($1::uuid, $2, $3, $4)
      ON CONFLICT (node_id) DO UPDATE
      SET k8s_node_name = EXCLUDED.k8s_node_name,
          k8s_node_uid = EXCLUDED.k8s_node_uid,
@@ -259,6 +261,7 @@ async fn upsert_node_identity(
         .bind(node_id)
         .bind(name)
         .bind(uid)
+        .bind(None::<&str>)
         .execute(&mut *conn)
         .await?
         .rows_affected())

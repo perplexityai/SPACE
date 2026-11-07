@@ -245,3 +245,96 @@ async fn sync_binds_a_registered_builder_to_its_node_uid() -> pplx_space_test_en
     );
     Ok(())
 }
+
+/// Node sync records the EC2 instance each Node's AWS `providerID` names.
+/// A Node with Kind's `providerID` or none records nothing, and leaves an
+/// instance its row already names.
+#[tokio::test(flavor = "current_thread")]
+async fn sync_records_the_instance_an_aws_provider_id_names() -> pplx_space_test_env::TestResult {
+    use crate::controllers::substrate::kubernetes::tests::substrate_with_store_client_pods_and_nodes;
+    use axum::http::{Request, Response, StatusCode};
+    use kube::client::{Body, ClientBuilder};
+    use pplx_space_common_core::sql;
+
+    type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
+
+    let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+    let with_provider_id = |name: &str, provider_id: Option<&str>| {
+        let mut node = node_json(name, &format!("{name}-uid"));
+        if let Some(provider_id) = provider_id {
+            node["spec"] = serde_json::json!({"providerID": provider_id});
+        }
+        node
+    };
+    let items = vec![
+        with_provider_id("worker-aws", Some("aws:///us-west-2a/i-0aws")),
+        with_provider_id("worker-kind", Some("kind://docker/space/worker-kind")),
+        with_provider_id("worker-none", None),
+        with_provider_id("worker-kept", None),
+    ];
+    let service = tower::service_fn(move |req: Request<Body>| {
+        let items = items.clone();
+        async move {
+            assert_eq!(req.uri().path(), "/api/v1/nodes");
+            let body = serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "NodeList",
+                "metadata": {},
+                "items": items
+            });
+            Ok::<_, BoxError>(
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&body)?))?,
+            )
+        }
+    });
+    let substrate = substrate_with_store_client_pods_and_nodes(
+        db.pool.clone(),
+        ClientBuilder::new(service, "space").build(),
+        Vec::new(),
+        Vec::new(),
+    );
+
+    // A row that already names an instance, from an earlier registration.
+    let kept_id = space_k8s_node_id("worker-kept", NodeRole::Worker.as_str());
+    sqlx::query(sql!(
+        "INSERT INTO nodes (id, address, role, managed_by, state)
+         VALUES ($1, '10.0.0.5'::INET, 'worker', 'k8s', 'ready')"
+    ))
+    .bind(kept_id)
+    .execute(&db.pool)
+    .await?;
+    sqlx::query(sql!(
+        "INSERT INTO node_k8s (node_id, k8s_node_name, k8s_node_uid, instance_id)
+         VALUES ($1, 'worker-kept', 'worker-kept-uid', 'i-0kept')"
+    ))
+    .bind(kept_id)
+    .execute(&db.pool)
+    .await?;
+
+    substrate
+        .sync_labeled_nodes_to_db(Duration::from_secs(600), 10)
+        .await?;
+
+    for (name, expected) in [
+        ("worker-aws", Some("i-0aws")),
+        ("worker-kind", None),
+        ("worker-none", None),
+        ("worker-kept", Some("i-0kept")),
+    ] {
+        let instance_id: Option<String> =
+            sqlx::query_scalar(sql!("SELECT instance_id FROM node_k8s WHERE node_id = $1"))
+                .bind(space_k8s_node_id(name, NodeRole::Worker.as_str()))
+                .fetch_one(&db.pool)
+                .await?;
+        assert_eq!(instance_id.as_deref(), expected, "{name}");
+    }
+    let superseded: i64 =
+        sqlx::query_scalar(sql!("SELECT COUNT(*) FROM node_k8s_superseded_instances"))
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(superseded, 0);
+    Ok(())
+}

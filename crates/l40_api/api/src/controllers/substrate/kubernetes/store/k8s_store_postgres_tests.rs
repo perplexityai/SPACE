@@ -900,6 +900,7 @@ async fn missing_k8s_inventory_demotes_only_stale_ready_nodes() -> TestResult {
                 NodeRole::Worker,
                 Some("10.0.0.20"),
                 NodeStateWrite::Manage(NodeLifecycleState::Ready),
+                None,
             )
             .await?;
     }
@@ -1013,6 +1014,7 @@ async fn inventory_listing_insert_only_does_not_downgrade_ready_node() -> TestRe
             NodeRole::Worker,
             Some("10.0.0.50"),
             NodeStateWrite::Manage(NodeLifecycleState::Ready),
+            None,
         )
         .await?;
 
@@ -1027,6 +1029,7 @@ async fn inventory_listing_insert_only_does_not_downgrade_ready_node() -> TestRe
             NodeRole::Worker,
             Some("10.0.0.50"),
             NodeStateWrite::InsertOnly(NodeLifecycleState::from_ready(false)),
+            None,
         )
         .await?;
 
@@ -1064,6 +1067,7 @@ async fn pod_placement_does_not_downgrade_ready_node_state() -> TestResult {
             NodeRole::Worker,
             Some("10.0.0.30"),
             NodeStateWrite::Manage(NodeLifecycleState::Ready),
+            None,
         )
         .await?;
 
@@ -1080,6 +1084,7 @@ async fn pod_placement_does_not_downgrade_ready_node_state() -> TestResult {
             node_id,
             NodeRole::Worker,
             Some("10.0.0.30"),
+            None,
         )
         .await?;
 
@@ -1105,6 +1110,7 @@ async fn pod_placement_does_not_downgrade_ready_node_state() -> TestResult {
             node_id,
             NodeRole::Worker,
             Some("10.0.0.99"),
+            None,
         )
         .await?;
     let (state, address): (String, String) =
@@ -1136,6 +1142,7 @@ async fn pod_placement_does_not_downgrade_ready_node_state() -> TestResult {
             fresh_id,
             NodeRole::Worker,
             Some("10.0.0.31"),
+            None,
         )
         .await?;
     let fresh_state: String = sqlx::query_scalar(sql!("SELECT state FROM nodes WHERE id = $1"))
@@ -1874,6 +1881,7 @@ async fn concurrent_pod_placement_and_cleanup_do_not_deadlock() -> TestResult {
                 node_id,
                 NodeRole::Worker,
                 Some("10.90.0.11"),
+                None,
             )
             .await
     });
@@ -1963,6 +1971,7 @@ async fn pod_placement_survives_concurrent_insert_of_same_node() -> TestResult {
                 node_id,
                 NodeRole::Worker,
                 Some("10.0.0.40"),
+                None,
             )
             .await
     });
@@ -3278,6 +3287,7 @@ async fn failed_started_recovery_with_node_placement_stays_started(
             node_id,
             NodeRole::Worker,
             Some("10.90.0.10"),
+            None,
         )
         .await?;
 
@@ -5448,6 +5458,7 @@ async fn forget_pod_tracking_recovers_started_suspended_by_node_after_current_ba
             node_id,
             NodeRole::Worker,
             Some("10.90.0.10"),
+            None,
         )
         .await?;
     sqlx::query(sql!(
@@ -5689,6 +5700,7 @@ async fn unchanged_pod_node_placement_does_not_touch_current_rows(
             node_id,
             NodeRole::Worker,
             Some("10.0.0.9"),
+            None,
         )
         .await?;
     sqlx::query(sql!(
@@ -5717,6 +5729,7 @@ async fn unchanged_pod_node_placement_does_not_touch_current_rows(
             node_id,
             NodeRole::Worker,
             Some("10.0.0.9"),
+            None,
         )
         .await?;
 
@@ -8926,6 +8939,7 @@ async fn persist_k8s_node_inventory_stores_canonical_role(fixture: &PostgresStor
                 role,
                 Some("10.0.0.12"),
                 NodeStateWrite::Manage(NodeLifecycleState::Ready),
+                None,
             )
             .await?;
     }
@@ -9093,6 +9107,7 @@ async fn upsert_clears_drain_state_when_k8s_node_uid_changes(
                     NodeRole::Worker,
                     Some("10.0.0.1"),
                     NodeStateWrite::Manage(NodeLifecycleState::Ready),
+                    None,
                 )
                 .await?;
         }
@@ -9119,6 +9134,7 @@ async fn upsert_clears_drain_state_when_k8s_node_uid_changes(
                 NodeRole::Worker,
                 Some("10.0.0.1"),
                 NodeStateWrite::Manage(NodeLifecycleState::Ready),
+                None,
             )
             .await?;
         assert!(changed, "{phase:?}: a UID replacement must report changed");
@@ -9184,6 +9200,7 @@ async fn upsert_preserves_drain_state_when_k8s_node_uid_unchanged(
                 NodeRole::Worker,
                 Some("10.0.0.2"),
                 NodeStateWrite::Manage(NodeLifecycleState::Ready),
+                None,
             )
             .await?;
         let drain = set_drain_state(&fixture.pool, node_id, phase).await?;
@@ -9198,6 +9215,7 @@ async fn upsert_preserves_drain_state_when_k8s_node_uid_unchanged(
                 NodeRole::Worker,
                 Some("10.0.0.2"),
                 NodeStateWrite::Manage(NodeLifecycleState::Ready),
+                None,
             )
             .await?;
         assert!(
@@ -9223,6 +9241,7 @@ async fn upsert_preserves_drain_state_when_k8s_node_uid_unchanged(
             NodeRole::Worker,
             Some("10.0.0.2"),
             NodeStateWrite::Manage(NodeLifecycleState::Ready),
+            None,
         )
     };
     register().await?;
@@ -9272,6 +9291,7 @@ async fn persist_k8s_node_inventory_repairs_missing_and_stale_address(
             NodeRole::Worker,
             None,
             NodeStateWrite::Manage(NodeLifecycleState::Registered),
+            None,
         )
         .await?;
     assert!(changed, "initial inventory insert must report changed");
@@ -9292,6 +9312,7 @@ async fn persist_k8s_node_inventory_repairs_missing_and_stale_address(
             NodeRole::Worker,
             Some("10.0.0.33"),
             NodeStateWrite::Manage(NodeLifecycleState::Ready),
+            None,
         )
         .await?;
     assert!(changed, "address and state backfill must report changed");
@@ -9322,6 +9343,7 @@ async fn persist_k8s_node_inventory_repairs_missing_and_stale_address(
             NodeRole::Worker,
             Some("10.0.0.33"),
             NodeStateWrite::Manage(NodeLifecycleState::Ready),
+            None,
         )
         .await?;
     assert!(
@@ -9348,6 +9370,7 @@ async fn persist_k8s_node_inventory_repairs_missing_and_stale_address(
             NodeRole::Worker,
             Some("10.0.0.44"),
             NodeStateWrite::Manage(NodeLifecycleState::Ready),
+            None,
         )
         .await?;
     assert!(changed, "stale address repair must report changed");
@@ -9390,6 +9413,7 @@ async fn azrebalance_variant_uid_change_does_not_leak_stale_drain_state_or_drain
             NodeRole::Worker,
             Some("10.0.0.20"),
             NodeStateWrite::Manage(NodeLifecycleState::Ready),
+            None,
         )
         .await?;
     sqlx::query(sql!(
@@ -9412,6 +9436,7 @@ async fn azrebalance_variant_uid_change_does_not_leak_stale_drain_state_or_drain
             NodeRole::Worker,
             Some("10.0.0.20"),
             NodeStateWrite::Manage(NodeLifecycleState::Ready),
+            None,
         )
         .await?;
 
@@ -9689,6 +9714,7 @@ async fn placement_retryability_follows_the_operation_not_the_statement() -> Tes
                 node_id,
                 role: NodeRole::Worker,
                 address: Some("10.0.0.1"),
+                instance_id: None,
             },
             retry,
         )

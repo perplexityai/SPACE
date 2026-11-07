@@ -23,6 +23,7 @@ pub(crate) use kubernetes_tests::{
 };
 
 mod native_pod_failover;
+mod node_instance;
 mod runtime_upgrade_dispatch;
 mod substrate_scope;
 
