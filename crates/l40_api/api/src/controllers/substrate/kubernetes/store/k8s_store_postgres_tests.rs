@@ -14,6 +14,7 @@ use super::*;
 use pplx_space_test_env::TestResult;
 
 mod cleanup_recovery_lifecycle_matrix_tests;
+mod execution_node_instance_tests;
 mod lifecycle_writer_tests;
 mod materialization_record_tests;
 mod node_registration_tests;

@@ -248,32 +248,74 @@ impl K8sStore {
             .transpose()
     }
 
+    /// Record the active execution's node and the EC2 instance its Node names,
+    /// and report whether the sandbox has an active execution.
+    ///
+    /// A pod's node never changes once it is bound, so for one node name the
+    /// instance is set once: `None` leaves a recorded instance alone, and a
+    /// different instance is refused and logged, since the Node it came from
+    /// replaced the one the pod was bound to. A different node name means a
+    /// different pod, so it replaces the instance, with `None` when this Node
+    /// names none. Recording only the instance leaves `updated_at` alone; it
+    /// changes nothing the row's state readers see.
     pub(super) async fn update_active_execution_node_name(
         &self,
         conn: &mut PgConnection,
         sandbox_id: SandboxId,
         node_name: &str,
+        instance_id: Option<&str>,
     ) -> Result<bool, SubstrateError> {
-        sqlx::query_scalar::<_, bool>(sql!(
+        // The final SELECT reads the rows as they were before the UPDATE.
+        let (active, kept_instance_id) = sqlx::query_as::<_, (bool, Option<String>)>(sql!(
             "WITH updated AS (
                 UPDATE sandbox_k8s_executions
                 SET k8s_node_name = $1::TEXT,
-                    updated_at = CASE WHEN state = 'recovering' THEN updated_at ELSE NOW() END
+                    node_instance_id = CASE
+                        WHEN k8s_node_name IS DISTINCT FROM $1::TEXT THEN $3::TEXT
+                        ELSE COALESCE(node_instance_id, $3::TEXT)
+                    END,
+                    updated_at = CASE
+                        WHEN state = 'recovering' THEN updated_at
+                        WHEN k8s_node_name IS NOT DISTINCT FROM $1::TEXT THEN updated_at
+                        ELSE NOW()
+                    END
                 WHERE sandbox_id = $2 AND active
-                  AND k8s_node_name IS DISTINCT FROM $1::TEXT
+                  AND (
+                    k8s_node_name IS DISTINCT FROM $1::TEXT
+                    OR (node_instance_id IS NULL AND $3::TEXT IS NOT NULL)
+                  )
                 RETURNING 1
              )
              SELECT EXISTS (
-                SELECT 1
-                FROM sandbox_k8s_executions
-                WHERE sandbox_id = $2 AND active
-             )"
+                        SELECT 1
+                        FROM sandbox_k8s_executions
+                        WHERE sandbox_id = $2 AND active
+                    ),
+                    (
+                        SELECT node_instance_id
+                        FROM sandbox_k8s_executions
+                        WHERE sandbox_id = $2 AND active
+                          AND k8s_node_name = $1::TEXT
+                          AND node_instance_id <> $3::TEXT
+                    )"
         ))
         .bind(node_name)
         .bind(sandbox_id)
+        .bind(instance_id)
         .fetch_one(conn)
         .await
-        .db_context("failed to persist sandbox pod node name")
+        .db_context("failed to persist sandbox pod node name")?;
+        if let Some(kept_instance_id) = kept_instance_id {
+            tracing::warn!(
+                sandbox_id = %sandbox_id,
+                k8s_node_name = %node_name,
+                recorded_instance_id = %kept_instance_id,
+                reported_instance_id = instance_id.unwrap_or_default(),
+                "pod placement read a different EC2 instance for the execution's node; \
+                 keeping the instance recorded when its pod was placed"
+            );
+        }
+        Ok(active)
     }
 
     pub(super) async fn finish_active_execution_in(

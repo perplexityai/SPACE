@@ -4,6 +4,7 @@ use pplx_space_cluster_pool::{
 };
 use pplx_space_common_core::sql;
 use pplx_space_common_core::types::{MemorySize, NodeId, PodUid, SandboxId, VcpuCount};
+use pplx_space_k8s_node_id::Ec2InstanceId;
 use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
@@ -513,10 +514,13 @@ async fn claim_ready_pool_slot(
         .map_err(|err| pool_store_error("failed to claim pool slot", &err))
 }
 
+/// `node_instance_id` answers the EC2 instance of the Node the slot's pod is
+/// bound to, by the node name the slot records; the slot records no instance.
 pub(super) async fn persist_pooled_execution_claim(
     tx: &mut Transaction<'_, Postgres>,
     _request: &PooledExecutionClaimRequest<'_>,
     claim: &PooledExecutionClaim,
+    node_instance_id: impl FnOnce(&str) -> Option<Ec2InstanceId>,
 ) -> Result<(), ControllerError> {
     let route_activation_id = pooled_route_activation_id(claim)?;
 
@@ -538,15 +542,18 @@ pub(super) async fn persist_pooled_execution_claim(
         .ok_or_else(|| {
             ControllerError::internal("claimed pool slot missing during execution bind")
         })?;
+    let instance_id = source.k8s_node_name.as_deref().and_then(node_instance_id);
 
     sqlx::query(sql!(
         "INSERT INTO sandbox_k8s_executions (
              sandbox_id, generation, pod_name, pod_namespace, pod_uid, pod_ip,
-             k8s_node_name, state, active, route_activation_id, pod_materialized_at
+             k8s_node_name, state, active, route_activation_id, pod_materialized_at,
+             node_instance_id
          )
          VALUES (
              $1, 1, $2, $3, $4, $5::inet, $6, 'running', TRUE, $7,
-             CASE WHEN NULLIF(BTRIM($4::TEXT), '') IS NOT NULL THEN NOW() END
+             CASE WHEN NULLIF(BTRIM($4::TEXT), '') IS NOT NULL THEN NOW() END,
+             $8
          )"
     ))
     .bind(claim.sandbox_id)
@@ -556,6 +563,7 @@ pub(super) async fn persist_pooled_execution_claim(
     .bind(source.pod_ip.as_deref())
     .bind(source.k8s_node_name.as_deref())
     .bind(route_activation_id)
+    .bind(instance_id.as_ref().map(Ec2InstanceId::as_str))
     .execute(&mut **tx)
     .await
     .map_err(|err| db_contention_error("failed to bind pool execution", &err))?;

@@ -22,6 +22,7 @@ pub(crate) use kubernetes_tests::{
     substrate_with_store_client_proxy_port_and_pods, substrate_with_unreachable_store,
 };
 
+mod execution_node_instance;
 mod native_pod_failover;
 mod node_instance;
 mod runtime_upgrade_dispatch;

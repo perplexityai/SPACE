@@ -12,6 +12,10 @@ use pplx_space_net_common::NetworkPolicyV1;
 use sqlx::PgPool;
 
 use pplx_space_test_env::TestResult;
+
+use crate::controllers::substrate::SubstrateAdapter;
+use crate::controllers::substrate::kubernetes::tests::substrate_with_inventory_caches_and_pool;
+use k8s_openapi::api::core::v1::{Node, NodeSpec};
 type PooledExecutionRow = (
     i64,
     String,
@@ -392,7 +396,7 @@ async fn postgres_claim_and_bind_pool_slot() -> TestResult {
 
     let mut tx = db.pool.begin().await?;
     insert_claimed_sandbox(&mut tx, &claim, slot.user_id, slot.org_id).await?;
-    persist_pooled_execution_claim(&mut tx, &request, &claim).await?;
+    persist_pooled_execution_claim(&mut tx, &request, &claim, |_| None).await?;
     tx.commit().await?;
 
     let (state, claim_id): (String, Option<Uuid>) = sqlx::query_as(sql!(
@@ -446,6 +450,69 @@ async fn postgres_claim_and_bind_pool_slot() -> TestResult {
         "an execution born with its slot's pod records that it materialized one"
     );
 
+    Ok(())
+}
+
+/// The Node the API's reflector holds under the slot's node name, and the
+/// instance the bound execution records. The slot records no instance, and the
+/// claim asks no apiserver: a Node the reflector hasn't seen, or one with no
+/// AWS `providerID`, leaves it unknown.
+#[tokio::test(flavor = "current_thread")]
+async fn postgres_pool_bind_records_the_instance_of_the_reflected_node() -> TestResult {
+    let reflected = |provider_id: &str| Node {
+        metadata: kube::api::ObjectMeta {
+            name: Some("pool-node-1".to_string()),
+            uid: Some("node-uid".to_string()),
+            ..Default::default()
+        },
+        spec: Some(NodeSpec {
+            provider_id: Some(provider_id.to_string()),
+            ..Default::default()
+        }),
+        status: None,
+    };
+    let cases = [
+        (
+            vec![reflected("aws:///us-west-2a/i-0pool")],
+            Some("i-0pool"),
+        ),
+        (vec![reflected("kind://docker/space/pool-node-1")], None),
+        (Vec::new(), None),
+    ];
+    for (nodes, expected) in cases {
+        let db = pg_test_db().await?;
+        let slot = insert_ready_pool_slot(&db.pool).await?;
+        let (actor, env, auto_lifecycle, template_network_policy) = claim_test_context(&slot)?;
+        let request = pooled_claim_request(&actor, &env, &auto_lifecycle, &template_network_policy);
+        let claim = claim_pooled_execution(&db.pool, &request, "space")
+            .await?
+            .claim
+            .expect("ready pool slot should be claimed");
+        let substrate =
+            substrate_with_inventory_caches_and_pool(Vec::new(), nodes, db.pool.clone());
+
+        let mut tx = db.pool.begin().await?;
+        insert_claimed_sandbox(&mut tx, &claim, slot.user_id, slot.org_id).await?;
+        SubstrateAdapter::persist_pooled_execution_claim(&substrate, &mut tx, &request, &claim)
+            .await?;
+        tx.commit().await?;
+
+        let recorded: (Option<String>, Option<String>) = sqlx::query_as(sql!(
+            "SELECT k8s_node_name, node_instance_id FROM sandbox_k8s_executions
+             WHERE sandbox_id = $1"
+        ))
+        .bind(slot.sandbox_id)
+        .fetch_one(&db.pool)
+        .await?;
+        assert_eq!(
+            recorded,
+            (
+                Some("pool-node-1".to_string()),
+                expected.map(str::to_string)
+            ),
+            "{expected:?}"
+        );
+    }
     Ok(())
 }
 
@@ -664,7 +731,7 @@ async fn postgres_claim_blank_pool_slot_pod_uid_as_absent() -> TestResult {
 
     let mut tx = db.pool.begin().await?;
     insert_claimed_sandbox(&mut tx, &claim, slot.user_id, slot.org_id).await?;
-    persist_pooled_execution_claim(&mut tx, &request, &claim).await?;
+    persist_pooled_execution_claim(&mut tx, &request, &claim, |_| None).await?;
     tx.commit().await?;
 
     let execution_pod_uid: Option<String> = sqlx::query_scalar(sql!(
@@ -1033,7 +1100,7 @@ async fn postgres_admitted_claim_adopts_and_binds_the_exact_slot() -> TestResult
 
     let mut tx = db.pool.begin().await?;
     insert_claimed_sandbox(&mut tx, &claim, slot.user_id, slot.org_id).await?;
-    persist_pooled_execution_claim(&mut tx, &request, &claim).await?;
+    persist_pooled_execution_claim(&mut tx, &request, &claim, |_| None).await?;
     tx.commit().await?;
 
     assert_eq!(
