@@ -305,11 +305,22 @@ fn the_orphan_inventory_blocks_only_on_what_can_hold_a_resident() {
     let mut findings = OrphanFindings::default();
     classify_orphan_page(&page, gateway_root, &mut findings);
     assert_eq!(
+        findings.dirs,
+        [
+            (
+                "z".to_owned(),
+                "orphan cache directory /cache/z recovery can't adopt".to_owned()
+            ),
+            (
+                "x".to_owned(),
+                "orphan run directory /run/sandboxes/x recovery can't adopt".to_owned()
+            ),
+        ]
+    );
+    assert_eq!(
         findings.blocked,
         [
             "untracked runtime process 42:sbx",
-            "orphan cache directory /cache/z recovery can't adopt",
-            "orphan run directory /run/sandboxes/x recovery can't adopt",
             "orphan inventory scan failed: RunDirs: denied",
             "orphan inventory scan failed: CacheDirs: denied",
             "orphan inventory scan failed: Processes: denied",
@@ -461,6 +472,34 @@ async fn a_durable_evacuation_is_recorded_and_survives_a_restart() {
     )];
     assert_eq!(evacuated(&report), expected);
     assert!(report.done, "{report:?}");
+
+    // node-manager knows only its slots, so it names the suspended row's
+    // cache directory a candidate; the row accounts for it. A directory with
+    // no row blocks.
+    let report = service.finish_drain(
+        7,
+        &first,
+        DrainScans {
+            orphan_dirs: vec![
+                ("sbx-a".into(), "orphan cache directory /cache/sbx-a".into()),
+                (
+                    "sbx-gone".into(),
+                    "orphan cache directory /cache/sbx-gone".into(),
+                ),
+            ],
+            ..DrainScans::default()
+        },
+    );
+    assert!(!report.done);
+    let blocked: Vec<_> = report
+        .blocked
+        .iter()
+        .map(|entry| (entry.sandbox_id.as_deref(), entry.reason.as_str()))
+        .collect();
+    assert_eq!(
+        blocked,
+        [(Some("sbx-gone"), "orphan cache directory /cache/sbx-gone")]
+    );
     drop(service);
 
     // Once the restore elsewhere has the snapshot, the node's row no longer

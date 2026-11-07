@@ -325,6 +325,10 @@ pub(super) fn plan(
 #[derive(Clone, Debug, Default)]
 pub(super) struct DrainScans {
     pub(super) blocked: Vec<(Option<String>, String)>,
+    /// node-manager's sandbox directory candidates, by the sandbox they're
+    /// named for. node-manager knows only its slots: a directory whose
+    /// sandbox has a row here is the row's, and the plan accounts for it.
+    pub(super) orphan_dirs: Vec<(String, String)>,
     pub(super) debris: Vec<String>,
 }
 
@@ -332,7 +336,17 @@ pub(super) struct DrainScans {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(super) struct OrphanFindings {
     pub(super) blocked: Vec<String>,
+    /// Cache and run directories, by the sandbox they're named for.
+    pub(super) dirs: Vec<(String, String)>,
     pub(super) debris: Vec<String>,
+}
+
+/// The sandbox a node-manager directory candidate is named for.
+fn dir_sandbox(dir: &str) -> String {
+    Path::new(dir).file_name().map_or_else(
+        || dir.to_owned(),
+        |name| name.to_string_lossy().into_owned(),
+    )
 }
 
 /// The inventory's scanners that can reveal a resident or an artifact: an
@@ -353,17 +367,19 @@ pub(super) fn classify_orphan_page(
             .push(format!("untracked runtime process {process}"));
     }
     for dir in &page.orphaned_cache_dirs {
-        findings
-            .blocked
-            .push(format!("orphan cache directory {dir} recovery can't adopt"));
+        findings.dirs.push((
+            dir_sandbox(dir),
+            format!("orphan cache directory {dir} recovery can't adopt"),
+        ));
     }
     for dir in &page.orphaned_run_dirs {
         if Path::new(dir).starts_with(gateway_run_root) {
             findings.debris.push(format!("gateway run directory {dir}"));
         } else {
-            findings
-                .blocked
-                .push(format!("orphan run directory {dir} recovery can't adopt"));
+            findings.dirs.push((
+                dir_sandbox(dir),
+                format!("orphan run directory {dir} recovery can't adopt"),
+            ));
         }
     }
     for leftover in page
@@ -416,6 +432,7 @@ impl SandboxManagerService {
         scans
             .blocked
             .extend(orphans.blocked.into_iter().map(|reason| (None, reason)));
+        scans.orphan_dirs = orphans.dirs;
         scans.debris = orphans.debris;
         Ok(Response::new(self.finish_drain(epoch, &first, scans)))
     }
@@ -430,16 +447,25 @@ impl SandboxManagerService {
         first: &ActivationSealStatus,
         scans: DrainScans,
     ) -> DrainNodeResponse {
-        let mut plan = match self.read_drain_plan() {
-            Ok(plan) => plan,
-            Err(reason) => DrainPlan {
-                blocked: vec![(None, reason)],
-                vm: true,
-                ..DrainPlan::default()
-            },
+        let (mut plan, rows) = match self.read_drain_plan() {
+            Ok(read) => read,
+            Err(reason) => (
+                DrainPlan {
+                    blocked: vec![(None, reason)],
+                    vm: true,
+                    ..DrainPlan::default()
+                },
+                BTreeSet::new(),
+            ),
         };
         self.record_and_start(epoch, &mut plan);
-        plan.blocked.splice(0..0, scans.blocked);
+        let orphan_dirs = scans
+            .orphan_dirs
+            .into_iter()
+            .filter(|(sandbox_id, _)| !rows.contains(sandbox_id))
+            .map(|(sandbox_id, reason)| (Some(sandbox_id), reason));
+        plan.blocked
+            .splice(0..0, scans.blocked.into_iter().chain(orphan_dirs));
 
         let last = self.activation_seal.status();
         let continuous =
@@ -522,8 +548,9 @@ impl SandboxManagerService {
     }
 
     /// Read every row, the pending backups and the evacuation record, and
-    /// plan. An error is the scan that failed, which blocks the drain.
-    fn read_drain_plan(&self) -> Result<DrainPlan, String> {
+    /// plan, with the ids of the rows read. An error is the scan that failed,
+    /// which blocks the drain.
+    fn read_drain_plan(&self) -> Result<(DrainPlan, BTreeSet<String>), String> {
         let (sandboxes, evacuations) = {
             let conn = self
                 .db_conn()
@@ -573,11 +600,15 @@ impl SandboxManagerService {
             .into_iter()
             .map(|evacuation| (evacuation.sandbox_id.clone(), evacuation))
             .collect();
-        Ok(plan(
-            &rows,
-            &pending_backups,
-            &evacuations,
-            &self.drain_actions.running(),
+        let ids = rows.iter().map(|row| row.sandbox_id.clone()).collect();
+        Ok((
+            plan(
+                &rows,
+                &pending_backups,
+                &evacuations,
+                &self.drain_actions.running(),
+            ),
+            ids,
         ))
     }
 
