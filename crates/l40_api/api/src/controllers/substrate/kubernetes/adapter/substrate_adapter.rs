@@ -930,6 +930,14 @@ impl SubstrateAdapter for KubernetesSubstrate {
                 )
                 .await;
         }
+        // A stopped sandbox a drain released, or the dead-node verb kept
+        // `stopped`, is on no node: its disk is materialized first.
+        let sandbox = if normalize_lifecycle(&sandbox.lifecycle) == "stopped" {
+            self.materialize_unplaced_stopped(metric_identity, sandbox, options)
+                .await?
+        } else {
+            sandbox
+        };
         // A stopped sandbox boots under the environment it last ran under
         // unless the policy moves it. Decided before admission is charged or
         // a pod exists, so a stranded sandbox costs nothing and places nothing.

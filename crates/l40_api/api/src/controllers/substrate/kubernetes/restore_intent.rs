@@ -7,7 +7,7 @@ use super::execution::WakeTarget;
 use crate::controllers::substrate::RecoveryCharge;
 use pplx_space_common_core::kubernetes::EvacuationPlacement;
 use pplx_space_common_core::types::SandboxLifecycle;
-use pplx_space_sandbox_store::drain_restore::DrainRestoreTarget;
+use pplx_space_sandbox_store::sweeper::EvacuationRestoreTarget;
 use uuid::Uuid;
 
 /// The restore a drain restore operation asks for: the lifecycle it lands
@@ -15,13 +15,27 @@ use uuid::Uuid;
 /// claims under.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DrainRestore {
-    pub target: DrainRestoreTarget,
+    /// `started` or `paused`.
+    pub target: EvacuationRestoreTarget,
     /// S, the snapshot the drain's suspend left. The claim takes the row only
     /// while the restore selector would load it.
     pub snapshot_id: Uuid,
-    /// The lease token every attempt of the operation claims under, so the
-    /// operation can revert an episode an earlier attempt left.
+    /// The lease token every attempt of the operation claims under: the
+    /// operation's own id.
     pub restore_lease_token: Uuid,
+}
+
+/// What one drain restore attempt did
+/// (`KubernetesSubstrate::restore_drained_execution`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DrainRestoreAttempt {
+    /// The sandbox is in its target.
+    Landed,
+    /// The node reached the target, but something moved the row before the
+    /// commit: the next attempt reads it again.
+    Lost,
+    /// The claim took nothing, for this reason; nothing was written.
+    Refused(pplx_space_sandbox_store::drain_restore::DrainRestoreRefusal),
 }
 
 /// How a restore claims the sandbox row, and what it does when the claim is
@@ -48,11 +62,11 @@ pub(super) enum RestoreClaimMode {
     /// retry loop.
     EvacuationMarker,
     /// The drain restore operation's claim
-    /// (`begin_drain_restore_lifecycle`): a `suspended` row whose restore
-    /// selector loads the snapshot, or a `restoring` row in the same
-    /// target's episode whose lease has lapsed. It opens or takes back an
-    /// episode under the operation's lease, joins nothing and fails fast: the
-    /// operation owns its retries.
+    /// (`pplx_space_sandbox_store::drain_restore::claim_drain_restore`),
+    /// which the operation's attempt takes before the activation: a
+    /// `suspended` row whose restore selector loads the snapshot, moved to
+    /// `restoring` under the operation's lease. It joins nothing and fails
+    /// fast: the operation owns its retries.
     DrainOperation(DrainRestore),
 }
 
@@ -165,16 +179,18 @@ impl RestoreIntent {
     }
 
     /// The drain restore operation's restore, placed as the drain's
-    /// evacuation is ([`Self::drain`]) and exempt from the charge. Its caller
-    /// commits the target.
+    /// evacuation is ([`Self::drain`]) and exempt from the charge. It wakes
+    /// the VM `started` whatever the target: a restore pod's VM comes up
+    /// running, so the row lands in what the VM is, and its caller pauses a
+    /// `paused` target and commits it.
     pub(super) fn drain_operation(
         cohort: Option<EvacuationPlacement>,
         restore: DrainRestore,
     ) -> Self {
         Self {
-            target: WakeTarget::Explicit(restore.target.lifecycle()),
+            target: WakeTarget::Explicit(SandboxLifecycle::Started),
             claim: RestoreClaimMode::DrainOperation(restore),
-            ..Self::drain(cohort, restore.target.lifecycle())
+            ..Self::drain(cohort, SandboxLifecycle::Started)
         }
     }
 

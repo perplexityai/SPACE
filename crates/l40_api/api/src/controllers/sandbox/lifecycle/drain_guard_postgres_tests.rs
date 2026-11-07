@@ -840,3 +840,75 @@ async fn missing_sandbox_has_no_drain_state() -> TestResult {
     assert_eq!(statements.len(), 2, "{statements:#?}");
     Ok(())
 }
+
+/// A stopped sandbox a drain released, unplaced with its disk pinned and
+/// stored, starts though the node it last ran on is drained: its start
+/// places it afresh. Without a stored disk it is still held there.
+#[tokio::test(flavor = "current_thread")]
+async fn a_released_stopped_sandbox_starts_off_its_drained_node() -> TestResult {
+    let db = pg_test_db().await?;
+    let node_id = NodeId::new();
+    let sandbox_id = SandboxId::new();
+    insert_node(&db.pool, node_id, Some("drained")).await?;
+    sqlx::query(sql!(
+        "INSERT INTO node_k8s (node_id, k8s_node_name) VALUES ($1, 'worker-released')"
+    ))
+    .bind(node_id)
+    .execute(&db.pool)
+    .await?;
+    insert_sandbox(&db.pool, sandbox_id, "stopped", None, None).await?;
+    sqlx::query(sql!(
+        "INSERT INTO sandbox_k8s_executions (
+             sandbox_id, generation, pod_name, pod_namespace,
+             k8s_node_name, state, active
+         )
+         VALUES ($1, 1, 'pod-before-the-drain', 'space', 'worker-released', 'terminated', false)"
+    ))
+    .bind(sandbox_id)
+    .execute(&db.pool)
+    .await?;
+    let artifact = uuid::Uuid::now_v7();
+    sqlx::query(sql!(
+        "UPDATE sandboxes
+            SET current_local_artifact_id = $2, current_local_artifact_kind = 'disk',
+                current_local_artifact_origin = 'stop'
+          WHERE id = $1"
+    ))
+    .bind(sandbox_id)
+    .bind(artifact)
+    .execute(&db.pool)
+    .await?;
+    let snapshot_id = pplx_space_common_core::types::SnapshotId::new();
+    sqlx::query(sql!(
+        "INSERT INTO snapshots (
+             id, sandbox_id, type, state, timestamp, local_artifact_id, artifact_kind,
+             artifact_origin
+         )
+         VALUES ($1, $2, 'disk', 'creating', NOW(), $3, 'disk', 'stop')"
+    ))
+    .bind(snapshot_id)
+    .bind(sandbox_id)
+    .bind(artifact)
+    .execute(&db.pool)
+    .await?;
+    sqlx::query(sql!(
+        "INSERT INTO snapshot_storage_locations (snapshot_id, storage_connection_string)
+         VALUES ($1, $2)"
+    ))
+    .bind(snapshot_id)
+    .bind(format!("s3://test-bucket/{snapshot_id}"))
+    .execute(&db.pool)
+    .await?;
+
+    let err = ensure_resolved_node_not_draining(&db.pool, sandbox_id, SandboxAction::Start)
+        .await
+        .expect_err("a disk not yet stored keeps the drained node's hold");
+    assert_eq!(err.into_response().status(), StatusCode::CONFLICT);
+
+    sqlx::query(sql!("UPDATE snapshots SET state = 'ready' WHERE id = $1"))
+        .bind(snapshot_id)
+        .execute(&db.pool)
+        .await?;
+    ensure_resolved_node_not_draining(&db.pool, sandbox_id, SandboxAction::Start).await?;
+    Ok(())
+}

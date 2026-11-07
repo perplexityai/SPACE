@@ -788,6 +788,34 @@ pub async fn artifact_backup_ready(
     .await?)
 }
 
+/// The newest ready, stored full snapshot of local artifact
+/// `local_artifact_id` of `sandbox_id`: the snapshot a restore from that
+/// artifact loads. `None` while none is.
+pub async fn ready_full_snapshot_of_artifact(
+    executor: impl sqlx::PgExecutor<'_>,
+    sandbox_id: SandboxId,
+    local_artifact_id: LocalArtifactId,
+) -> Result<Option<SnapshotId>, sqlx::Error> {
+    sqlx::query_scalar(sql!(
+        "SELECT s.id
+           FROM snapshots s
+          WHERE s.sandbox_id = $1
+            AND s.local_artifact_id = $2
+            AND s.type = 'full'
+            AND s.state = 'ready'
+            AND EXISTS (
+              SELECT 1 FROM snapshot_storage_locations ssl
+               WHERE ssl.snapshot_id = s.id AND ssl.orphaned_at IS NULL
+            )
+          ORDER BY s.timestamp DESC
+          LIMIT 1"
+    ))
+    .bind(sandbox_id)
+    .bind(local_artifact_id.as_uuid())
+    .fetch_optional(executor)
+    .await
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum CheckArtifactRegistrationError {
     #[error(transparent)]

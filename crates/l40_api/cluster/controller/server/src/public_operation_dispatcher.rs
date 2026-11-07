@@ -289,16 +289,15 @@ impl NativePublicOperationExecutor {
             tls_interception_exemptions,
             egress_profiles,
         )
-        .with_drain_restore(pool, drain_restore))
+        .with_drain_restore(drain_restore))
     }
 
     /// Run drain restores as `wiring` says. Until this, an executor fails
     /// every drain restore, as one built for Direct does.
-    fn with_drain_restore(mut self, pool: PgPool, wiring: DrainRestoreWiring) -> Self {
+    fn with_drain_restore(mut self, wiring: DrainRestoreWiring) -> Self {
         #[cfg(feature = "kubernetes")]
         {
             self.drain_restore = DrainRestoreOperationExecutor::new(
-                pool,
                 wiring.kubernetes,
                 crate::node_drain::drain_evacuation_placement(
                     &pplx_space_common_core::env::ProcessEnvironment,
@@ -307,7 +306,7 @@ impl NativePublicOperationExecutor {
             );
         }
         #[cfg(not(feature = "kubernetes"))]
-        let _ = (pool, wiring);
+        let _ = wiring;
         self
     }
 
@@ -337,7 +336,6 @@ impl NativePublicOperationExecutor {
             delete_template: DeleteTemplateOperationExecutor::new(pool.clone()),
             #[cfg(feature = "kubernetes")]
             drain_restore: DrainRestoreOperationExecutor::new(
-                pool.clone(),
                 None,
                 None,
                 DrainRestoreRetry::with_max_attempts(1),

@@ -1171,6 +1171,11 @@ impl SandboxController {
         self.substrate.managed_by()
     }
 
+    /// The substrate this controller drives.
+    pub fn substrate(&self) -> &Substrate {
+        &self.substrate
+    }
+
     pub fn substrate_capabilities(&self) -> super::substrate::SubstrateCapabilities {
         self.substrate.capabilities()
     }

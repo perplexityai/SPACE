@@ -120,7 +120,7 @@ async fn a_suspended_evacuation_enqueues_its_restore_once() -> TestResult {
     let s = catalog(pool, id, artifact, "full", "ready").await?;
     for _ in 0..2 {
         assert_eq!(
-            record_v2_evacuation(pool, node, id, DrainRestoreTarget::Paused, artifact).await?,
+            record_v2_evacuation(pool, node, id, EvacuationRestoreTarget::Paused, artifact).await?,
             EvacuationRecord::Recorded
         );
     }
@@ -131,30 +131,68 @@ async fn a_suspended_evacuation_enqueues_its_restore_once() -> TestResult {
     Ok(())
 }
 
-/// A stopped evacuation records its published disk as the row's stop pin and
-/// enqueues its restore toward `stopped`, in one transaction. A row that pins
-/// another artifact no longer needs it: nothing is pinned or enqueued.
+/// A stopped evacuation pins the disk the node published and releases the
+/// node, enqueuing nothing: the row stays `stopped`, unplaced, for its next
+/// start. A row that pins another disk is not yet recorded, never settled,
+/// and keeps its pin and its home.
 #[tokio::test(flavor = "current_thread")]
-async fn a_stopped_evacuation_pins_its_disk_and_enqueues_its_restore() -> TestResult {
+async fn a_stopped_evacuation_pins_its_disk_and_releases_the_node() -> TestResult {
     let Some(db) = try_pg_test_db().await? else {
         return Ok(());
     };
     let pool = &db.pool;
     let node = v2_node(pool, Some("draining"), serde_json::json!({"epoch": 5})).await?;
-    let id = sandbox(pool, "stopped", Some(node)).await?;
+    let name = format!("node-{node}");
+    sqlx::query(sql!(
+        "INSERT INTO node_k8s (node_id, k8s_node_name) VALUES ($1, $2)"
+    ))
+    .bind(node)
+    .bind(&name)
+    .execute(pool)
+    .await?;
+    let stopped_at_home = |pool: PgPool| {
+        let name = name.clone();
+        async move {
+            let id = sandbox(&pool, "stopped", Some(node)).await?;
+            sqlx::query(sql!(
+                "UPDATE sandboxes SET lifecycle_changed_at = NOW() - INTERVAL '1 hour'
+                  WHERE id = $1"
+            ))
+            .bind(id)
+            .execute(&pool)
+            .await?;
+            sqlx::query(sql!(
+                "INSERT INTO sandbox_k8s_executions
+                     (sandbox_id, generation, pod_name, pod_namespace, state, k8s_node_name,
+                      created_at)
+                 VALUES ($1, 1, $2, 'space', 'running', $3, NOW() - INTERVAL '2 hours')"
+            ))
+            .bind(id)
+            .bind(format!("pod-{id}"))
+            .bind(&name)
+            .execute(&pool)
+            .await?;
+            TestResult::Ok(id)
+        }
+    };
+
+    let id = stopped_at_home(pool.clone()).await?;
     let disk = Uuid::now_v7();
-    let s = catalog(pool, id, disk, "disk", "ready").await?;
+    catalog(pool, id, disk, "disk", "ready").await?;
     assert_eq!(
-        record_v2_evacuation(pool, node, id, DrainRestoreTarget::Stopped, disk).await?,
+        record_v2_evacuation(pool, node, id, EvacuationRestoreTarget::Stopped, disk).await?,
         EvacuationRecord::Recorded
     );
     assert_eq!(pin(pool, id).await?, (Some(disk), Some("disk".to_owned())));
-    assert_eq!(
-        restores(pool, id).await?,
-        [("stopped".to_owned(), s.to_string())]
-    );
+    let home: Option<NodeId> =
+        sqlx::query_scalar(sql!("SELECT active_node_id FROM sandboxes WHERE id = $1"))
+            .bind(id)
+            .fetch_one(pool)
+            .await?;
+    assert_eq!(home, None);
+    assert!(restores(pool, id).await?.is_empty());
 
-    let other = sandbox(pool, "stopped", Some(node)).await?;
+    let other = stopped_at_home(pool.clone()).await?;
     let disk = Uuid::now_v7();
     catalog(pool, other, disk, "disk", "ready").await?;
     let newer = Uuid::now_v7();
@@ -167,21 +205,27 @@ async fn a_stopped_evacuation_pins_its_disk_and_enqueues_its_restore() -> TestRe
     .bind(newer)
     .execute(pool)
     .await?;
-    assert_eq!(
-        record_v2_evacuation(pool, node, other, DrainRestoreTarget::Stopped, disk).await?,
-        EvacuationRecord::Settled
-    );
+    assert!(matches!(
+        record_v2_evacuation(pool, node, other, EvacuationRestoreTarget::Stopped, disk).await?,
+        EvacuationRecord::NotYet(_)
+    ));
     assert_eq!(
         pin(pool, other).await?,
         (Some(newer), Some("disk".to_owned()))
     );
-    assert!(restores(pool, other).await?.is_empty());
+    let home: Option<NodeId> =
+        sqlx::query_scalar(sql!("SELECT active_node_id FROM sandboxes WHERE id = $1"))
+            .bind(other)
+            .fetch_one(pool)
+            .await?;
+    assert_eq!(home, Some(node));
     Ok(())
 }
 
 /// An evacuation waits while the catalog doesn't hold its artifact ready, or
-/// while the node's suspend isn't projected onto a row still on the node;
-/// a sandbox a user moved on, or deleted, needs no restore.
+/// while the node's suspend isn't projected onto a row still on the node, or
+/// while a running row has no execution elsewhere; a sandbox a user woke on
+/// another node, or deleted, needs no restore.
 #[tokio::test(flavor = "current_thread")]
 async fn an_evacuation_waits_for_its_catalog_and_projection_and_skips_what_moved_on() -> TestResult
 {
@@ -199,26 +243,38 @@ async fn an_evacuation_waits_for_its_catalog_and_projection_and_skips_what_moved
     catalog(pool, unprojected, artifact, "full", "ready").await?;
     let woken = sandbox(pool, "started", Some(elsewhere)).await?;
     catalog(pool, woken, artifact, "full", "ready").await?;
+    sqlx::query(sql!(
+        "INSERT INTO sandbox_k8s_executions
+             (sandbox_id, generation, pod_name, pod_namespace, state, k8s_node_name)
+         VALUES ($1, 1, $2, 'space', 'running', 'elsewhere')"
+    ))
+    .bind(woken)
+    .bind(format!("pod-{woken}"))
+    .execute(pool)
+    .await?;
+    let stale = sandbox(pool, "started", Some(elsewhere)).await?;
+    catalog(pool, stale, artifact, "full", "ready").await?;
     let control = sandbox(pool, "suspended", None).await?;
     catalog(pool, control, artifact, "full", "ready").await?;
     for (case, id, expected) in [
         ("uploading", uploading, "not yet"),
         ("unprojected", unprojected, "not yet"),
-        ("woken elsewhere", woken, "settled"),
-        ("deleted", SandboxId::new(), "settled"),
+        ("woken elsewhere", woken, "recorded"),
+        ("placed elsewhere, running nowhere", stale, "not yet"),
+        ("deleted", SandboxId::new(), "recorded"),
         ("control", control, "recorded"),
     ] {
         let record =
-            record_v2_evacuation(pool, node, id, DrainRestoreTarget::Started, artifact).await?;
+            record_v2_evacuation(pool, node, id, EvacuationRestoreTarget::Started, artifact)
+                .await?;
         let read = match record {
             EvacuationRecord::Recorded => "recorded",
-            EvacuationRecord::Settled => "settled",
             EvacuationRecord::NotYet(_) => "not yet",
         };
         assert_eq!(read, expected, "{case}");
         assert_eq!(
             restores(pool, id).await?.len(),
-            usize::from(expected == "recorded"),
+            usize::from(case == "control"),
             "{case}"
         );
     }
@@ -293,94 +349,24 @@ async fn the_cancel_clears_only_an_undrained_row_of_its_epoch() -> TestResult {
     Ok(())
 }
 
-/// The termination is recorded once, against the identity the tick read, on
-/// a terminating node of the epoch whose `done` report `:terminate` let go;
-/// anything else about the row refuses it and leaves it as it was.
+/// The termination is flagged on a terminating node of the row's epoch, so
+/// the loop doesn't terminate it again; any other row is left as it was.
 #[tokio::test(flavor = "current_thread")]
-async fn the_termination_is_recorded_once_for_the_identity_and_epoch_it_let_go() -> TestResult {
+async fn the_termination_is_flagged_on_its_epochs_terminating_node() -> TestResult {
     let Some(db) = try_pg_test_db().await? else {
         return Ok(());
     };
     let pool = &db.pool;
-    let let_go = serde_json::json!({
-        "epoch": 7,
-        "report": {"sealed_epoch": 7, "done": true},
-        "terminate": {"epoch": 7},
-    });
-    let instance = "i-0123456789abcdef0";
-    // (case, phase, drain_status, epoch, uid, recorded)
-    type Case<'a> = (
-        &'a str,
-        Option<&'a str>,
-        serde_json::Value,
-        i64,
-        &'a str,
-        bool,
-    );
-    let mut cases: Vec<Case> = vec![
-        (
-            "recorded",
-            Some("terminating"),
-            let_go.clone(),
-            7,
-            "uid-1",
-            true,
-        ),
-        (
-            "another epoch",
-            Some("terminating"),
-            let_go.clone(),
-            8,
-            "uid-1",
-            false,
-        ),
-        (
-            "another uid",
-            Some("terminating"),
-            let_go.clone(),
-            7,
-            "uid-2",
-            false,
-        ),
-        (
-            "still drained",
-            Some("drained"),
-            let_go.clone(),
-            7,
-            "uid-1",
-            false,
-        ),
-    ];
-    let mut without_terminate = let_go.clone();
-    without_terminate
-        .as_object_mut()
-        .unwrap()
-        .remove("terminate");
-    cases.push((
-        "not let go",
-        Some("terminating"),
-        without_terminate,
-        7,
-        "uid-1",
-        false,
-    ));
-    let mut not_done = let_go.clone();
-    not_done["report"]["done"] = serde_json::json!(false);
-    cases.push(("not done", Some("terminating"), not_done, 7, "uid-1", false));
-    for (case, phase, status, epoch, uid, recorded) in cases {
+    let status = serde_json::json!({"epoch": 7});
+    for (case, phase, epoch, flagged) in [
+        ("flagged", Some("terminating"), 7, true),
+        ("another epoch", Some("terminating"), 8, false),
+        ("still drained", Some("drained"), 7, false),
+    ] {
         let node_id = v2_node(pool, phase, status.clone()).await?;
-        sqlx::query(sql!(
-            "INSERT INTO node_k8s (node_id, k8s_node_name, k8s_node_uid, instance_id)
-             VALUES ($1, $2, 'uid-1', $3)"
-        ))
-        .bind(node_id)
-        .bind(format!("node-{node_id}"))
-        .bind(instance)
-        .execute(pool)
-        .await?;
         assert_eq!(
-            record_v2_terminated(pool, node_id, epoch, Some(uid), Some(instance)).await?,
-            recorded,
+            record_v2_terminated(pool, node_id, epoch).await?,
+            flagged,
             "{case}"
         );
         let stored: serde_json::Value =
@@ -388,41 +374,14 @@ async fn the_termination_is_recorded_once_for_the_identity_and_epoch_it_let_go()
                 .bind(node_id)
                 .fetch_one(pool)
                 .await?;
-        if recorded {
-            let terminated = &stored["terminated"];
-            assert_eq!(
-                (
-                    &terminated["epoch"],
-                    &terminated["k8s_node_uid"],
-                    &terminated["instance_id"]
-                ),
-                (
-                    &serde_json::json!(7),
-                    &serde_json::json!("uid-1"),
-                    &serde_json::json!(instance)
-                ),
-                "{case}"
-            );
-            assert!(terminated["at_ms"].is_i64(), "{case}");
-            // Once.
-            assert!(
-                !record_v2_terminated(pool, node_id, epoch, Some(uid), Some(instance)).await?,
-                "{case}: recorded twice"
-            );
-            let listed = list_v2_nodes(pool)
-                .await?
-                .into_iter()
-                .find(|node| node.id == node_id)
-                .expect("listed");
-            assert!(listed.terminated, "{case}");
-            assert_eq!(
-                (
-                    listed.k8s_node_uid.as_deref(),
-                    listed.instance_id.as_deref()
-                ),
-                (Some("uid-1"), Some(instance)),
-                "{case}"
-            );
+        let listed = list_v2_nodes(pool)
+            .await?
+            .into_iter()
+            .find(|node| node.id == node_id)
+            .expect("listed");
+        assert_eq!(listed.terminated, flagged, "{case}");
+        if flagged {
+            assert_eq!(stored, serde_json::json!({"epoch": 7, "terminated": true}));
         } else {
             assert_eq!(stored, status, "{case}: wrote");
         }

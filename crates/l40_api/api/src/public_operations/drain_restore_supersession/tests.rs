@@ -1,5 +1,5 @@
 //! A user's request supersedes a drain restore that waits, at admission and
-//! when the restore's attempt ends, and spares one whose episode is open.
+//! when the restore's attempt ends, and spares one an attempt holds.
 
 use std::time::Duration;
 
@@ -20,60 +20,17 @@ use super::supersedes_drain_restore;
 
 const ORG: OrgId = OrgId::from_uuid(Uuid::from_u128(1));
 
-/// Each kind's rule, written out: the lifecycle kinds and a delete
-/// supersede, metadata, checkpoints, sessions, templates and the drain
-/// restore itself don't.
-#[test]
-fn every_kind_has_its_supersession_rule() {
-    let expected = |kind: OperationKind| match kind {
-        OperationKind::CreateSandbox => true,
-        OperationKind::ForkSandbox => false,
-        OperationKind::UpdateSandbox => false,
-        OperationKind::DeleteSandbox => true,
-        OperationKind::StartSandbox => true,
-        OperationKind::StopSandbox => true,
-        OperationKind::PauseSandbox => true,
-        OperationKind::ResumeSandbox => true,
-        OperationKind::SuspendSandbox => true,
-        OperationKind::RestoreSandbox => true,
-        OperationKind::WakeSandbox => true,
-        OperationKind::KillSandbox => true,
-        OperationKind::CheckpointSandbox => false,
-        OperationKind::EnableSandboxSnapshots => false,
-        OperationKind::DisableSandboxSnapshots => false,
-        OperationKind::RollbackSandbox => true,
-        OperationKind::DeleteTemplate => false,
-        OperationKind::CreateSession => false,
-    };
-    for kind in OperationKind::ALL {
-        assert_eq!(
-            supersedes_drain_restore(StoredOperationKind::Public(*kind)),
-            expected(*kind),
-            "{kind}"
-        );
-    }
-    assert!(!supersedes_drain_restore(
-        StoredOperationKind::DrainRestoreSandbox
-    ));
-}
-
-/// A sandbox row in `lifecycle`, holding `episode_target`.
-async fn sandbox(
-    pool: &PgPool,
-    lifecycle: &str,
-    episode_target: Option<&str>,
-) -> TestResult<(SandboxId, String)> {
+/// A sandbox row in `lifecycle`.
+async fn sandbox(pool: &PgPool, lifecycle: &str) -> TestResult<(SandboxId, String)> {
     let id = SandboxId::new();
     sqlx::query(sql!(
         "INSERT INTO sandboxes
-             (id, user_id, org_id, lifecycle, placement, managed_by, network_policy_generation,
-              restore_episode_target)
-         VALUES ($1, '00000000-0000-0000-0000-000000000010', $2, $3, 'unplaced', 'k8s', 1, $4)"
+             (id, user_id, org_id, lifecycle, placement, managed_by, network_policy_generation)
+         VALUES ($1, '00000000-0000-0000-0000-000000000010', $2, $3, 'unplaced', 'k8s', 1)"
     ))
     .bind(id)
     .bind(ORG)
     .bind(lifecycle)
-    .bind(episode_target)
     .execute(pool)
     .await?;
     Ok((id, PublicSandboxId::from(id).to_string()))
@@ -142,7 +99,7 @@ async fn admitting_each_kind_cancels_a_waiting_drain_restore_by_its_rule() -> Te
     let pool = &db.pool;
     let store = PublicOperationStore::new(pool.clone());
     for kind in OperationKind::ALL {
-        let (_, target_id) = sandbox(pool, "suspended", None).await?;
+        let (_, target_id) = sandbox(pool, "suspended").await?;
         let restore = create(pool, StoredOperationKind::DrainRestoreSandbox, &target_id).await?;
         back_off(pool, restore).await?;
 
@@ -164,32 +121,14 @@ async fn admitting_each_kind_cancels_a_waiting_drain_restore_by_its_rule() -> Te
     Ok(())
 }
 
-/// A waiting drain restore whose episode is open is made due instead of
-/// canceled, since nothing else settles the episode; one a claim holds is
-/// left to its attempt, and one that ended stays as it ended.
+/// A drain restore a claim holds is left to its attempt, and one that ended
+/// stays as it ended.
 #[tokio::test(flavor = "current_thread")]
-async fn admission_spares_an_open_episode_and_a_claimed_restore() -> TestResult {
+async fn admission_spares_a_claimed_restore() -> TestResult {
     let db = pg_test_db().await?;
     let pool = &db.pool;
 
-    let (_, target_id) = sandbox(pool, "restoring", Some("started")).await?;
-    let restore = create(pool, StoredOperationKind::DrainRestoreSandbox, &target_id).await?;
-    back_off(pool, restore).await?;
-    assert_eq!(state_of(pool, restore).await?, ("queued".into(), false));
-    create(pool, OperationKind::WakeSandbox.into(), &target_id).await?;
-    assert_eq!(
-        state_of(pool, restore).await?,
-        ("queued".into(), true),
-        "the open episode's restore is hastened, not canceled"
-    );
-    sqlx::query(sql!(
-        "UPDATE public_operations SET state = 'succeeded' WHERE operation_id = $1"
-    ))
-    .bind(restore.as_uuid())
-    .execute(pool)
-    .await?;
-
-    let (_, target_id) = sandbox(pool, "suspended", None).await?;
+    let (_, target_id) = sandbox(pool, "suspended").await?;
     let restore = create(pool, StoredOperationKind::DrainRestoreSandbox, &target_id).await?;
     let (_, claimed) = claim_drain_restore(pool).await?;
     assert_eq!(claimed, restore);
@@ -227,38 +166,22 @@ async fn claim_drain_restore(pool: &PgPool) -> TestResult<(String, OperationId)>
 
 /// Releasing a drain restore's attempt cancels it when a user's operation
 /// that supersedes it queued meanwhile, and requeues it otherwise: when
-/// nothing queued, when what queued doesn't supersede it, and when its
-/// episode is open.
+/// nothing queued, and when what queued doesn't supersede it.
 #[tokio::test(flavor = "current_thread")]
 async fn release_cancels_a_restore_a_user_operation_queued_behind() -> TestResult {
     let db = pg_test_db().await?;
     let pool = &db.pool;
     let store = PublicOperationStore::new(pool.clone());
-    for (case, lifecycle, episode, queued, canceled) in [
-        (
-            "a wake queued",
-            "suspended",
-            None,
-            Some(OperationKind::WakeSandbox),
-            true,
-        ),
-        ("nothing queued", "suspended", None, None, false),
+    for (case, queued, canceled) in [
+        ("a wake queued", Some(OperationKind::WakeSandbox), true),
+        ("nothing queued", None, false),
         (
             "an update queued",
-            "suspended",
-            None,
             Some(OperationKind::UpdateSandbox),
             false,
         ),
-        (
-            "a wake queued, episode open",
-            "restoring",
-            Some("started"),
-            Some(OperationKind::WakeSandbox),
-            false,
-        ),
     ] {
-        let (_, target_id) = sandbox(pool, lifecycle, episode).await?;
+        let (_, target_id) = sandbox(pool, "suspended").await?;
         let restore = create(pool, StoredOperationKind::DrainRestoreSandbox, &target_id).await?;
         let (claim_token, _) = claim_drain_restore(pool).await?;
         let later = match queued {
@@ -304,30 +227,18 @@ async fn release_cancels_a_restore_a_user_operation_queued_behind() -> TestResul
 }
 
 /// A lifecycle call that records no operation cancels the sandbox's waiting
-/// drain restores, and spares one whose episode is open.
+/// drain restore.
 #[tokio::test(flavor = "current_thread")]
 async fn a_call_without_an_operation_cancels_a_waiting_restore() -> TestResult {
     let db = pg_test_db().await?;
     let pool = &db.pool;
     let store = PublicOperationStore::new(pool.clone());
-    for (lifecycle, episode, canceled, hastened) in [
-        ("suspended", None, 1, 0),
-        ("restoring", Some("started"), 0, 1),
-    ] {
-        let (id, target_id) = sandbox(pool, lifecycle, episode).await?;
-        let restore = create(pool, StoredOperationKind::DrainRestoreSandbox, &target_id).await?;
-
-        let outcome = store
-            .cancel_drain_restores_for_action(ORG, id, "pause")
-            .await?;
-
-        assert_eq!(
-            (outcome.canceled, outcome.hastened),
-            (canceled, hastened),
-            "{lifecycle}"
-        );
-        let expected = if canceled == 1 { "canceled" } else { "queued" };
-        assert_eq!(state_of(pool, restore).await?.0, expected, "{lifecycle}");
-    }
+    let (id, target_id) = sandbox(pool, "suspended").await?;
+    let restore = create(pool, StoredOperationKind::DrainRestoreSandbox, &target_id).await?;
+    let outcome = store
+        .cancel_drain_restores_for_action(ORG, id, "pause")
+        .await?;
+    assert_eq!(outcome.canceled, 1);
+    assert_eq!(state_of(pool, restore).await?.0, "canceled");
     Ok(())
 }

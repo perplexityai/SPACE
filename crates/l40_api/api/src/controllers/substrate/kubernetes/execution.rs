@@ -1249,24 +1249,106 @@ impl KubernetesSubstrate {
         .map(|_| ())
     }
 
-    /// The drain restore operation's restore of a sandbox a forced drain
-    /// suspended, toward `restore.target`, placed as the drain's evacuation
-    /// is ([`Self::restore_evacuated_execution`]). Once the node reached the
-    /// target, it lands the row there under the claim's lease
-    /// ([`K8sStore::complete_drain_restore`]) and returns whether that moved
-    /// it. A claim it cannot take fails with `EvacuationClaimLost`.
+    /// Place an unplaced stopped sandbox whose pinned disk is durable on a
+    /// node before its start boots it: what a v2 drain's release, or the
+    /// dead-node verb's, leaves. It marks the row a pending stopped
+    /// re-placement
+    /// ([`pplx_space_sandbox_store::drain_restore::mark_unplaced_stopped_for_materialization`])
+    /// and runs v1's stopped re-placement ([`Self::restore_evacuated_execution`]
+    /// toward `stopped`, on any node, from the disk's exact URI): the node
+    /// stages the disk without booting it. Then it lands the row `stopped`
+    /// on that node and releases the placeholder pod, best effort, as v1's
+    /// drain does, and returns the row the ordinary start boots. Any other
+    /// row is returned as it was. A re-placement that fails before its claim
+    /// takes the marker back, so the next start tries again.
+    pub(super) async fn materialize_unplaced_stopped(
+        &self,
+        metric_identity: crate::metrics::sandbox::api::SandboxApiMetricIdentity,
+        sandbox: Sandbox,
+        options: ActivationOptions,
+    ) -> Result<Sandbox, SubstrateError> {
+        use crate::controllers::substrate::DbContext as _;
+        let sandbox_id = sandbox.id;
+        if !pplx_space_sandbox_store::drain_restore::mark_unplaced_stopped_for_materialization(
+            self.store.pool(),
+            sandbox_id,
+        )
+        .await
+        .db_context("failed to mark an unplaced stopped sandbox for materialization")?
+        {
+            return Ok(sandbox);
+        }
+        if let Err(error) = self
+            .restore_evacuated_execution(
+                metric_identity,
+                sandbox_id,
+                options,
+                None,
+                SandboxLifecycle::Stopped,
+            )
+            .await
+        {
+            if let Err(unmark) = pplx_space_sandbox_store::drain_restore::unmark_unplaced_stopped(
+                self.store.pool(),
+                sandbox_id,
+            )
+            .await
+            {
+                tracing::warn!(
+                    sandbox_id = %sandbox_id,
+                    error = %unmark,
+                    "failed to take back an unplaced stopped sandbox's materialization marker"
+                );
+            }
+            return Err(error);
+        }
+        if !pplx_space_sandbox_store::drain::finalize_evacuation_restore(
+            self.store.pool(),
+            sandbox_id,
+            SandboxLifecycle::Stopped,
+        )
+        .await
+        .db_context("failed to land a materialized stopped sandbox")?
+        {
+            return Err(SubstrateError::Unavailable {
+                message: format!(
+                    "stopped sandbox {sandbox_id} moved while its disk was materialized; retry"
+                ),
+            });
+        }
+        // Best effort: a failure costs the node the pod's slot until the
+        // start below replaces it, and nothing about the sandbox's data.
+        if let Err(error) = self.release_stopped_materialization_pod(sandbox_id).await {
+            tracing::warn!(
+                sandbox_id = %sandbox_id,
+                %error,
+                "failed to delete a materialized stopped sandbox's placeholder pod"
+            );
+        }
+        self.store.require_sandbox(sandbox_id).await
+    }
+
+    /// One attempt of the drain restore operation's restore of a sandbox a
+    /// forced drain suspended, toward `restore.target`, placed as the
+    /// drain's evacuation is ([`Self::restore_evacuated_execution`]). It
+    /// claims the row first, as a user's restore does
+    /// ([`K8sStore::claim_drain_restore`]); a row it can't claim answers
+    /// [`DrainRestoreAttempt::Refused`] with why, and nothing was written.
+    /// Once the node reached the target it lands the row there under the
+    /// claim's lease ([`K8sStore::complete_drain_restore`]).
     ///
-    /// A restore pod's VM always comes up running: the node restores it in
-    /// the pod's sandbox creation, before the Wake that names the target, and
-    /// a Wake toward `paused` leaves a running VM running. So a `paused`
-    /// target pauses the VM through the node's `PauseSandbox`, as a user's
-    /// pause does, before the commit. A pause that fails reverts the episode
-    /// and fails the attempt.
+    /// The VM always wakes `started`: a restore pod's VM comes up running,
+    /// so the row lands in what the VM is. A `paused` target then pauses it
+    /// through the node's `PauseSandbox`, as a user's pause does, before the
+    /// commit; a pause that fails fails the attempt, leaving the sandbox
+    /// `started`, or reverted to `suspended` if the receipt hadn't landed.
     ///
+    /// A failed activation reverts the claim to `suspended`, as a failed
+    /// user restore's does, so the operation's next attempt claims afresh.
     /// The commit also accepts a row the node's activation receipt already
-    /// landed in the target on this restore's own execution. Every exit
-    /// releases the activation attempt the restore ran under: the commit
-    /// releases it with a landed row, and a failed pause after its revert.
+    /// landed on this restore's own execution. Every exit releases the
+    /// activation attempt the restore ran under: the commit with a landed
+    /// row, a failed pause after its revert.
     pub async fn restore_drained_execution(
         &self,
         metric_identity: crate::metrics::sandbox::api::SandboxApiMetricIdentity,
@@ -1274,7 +1356,14 @@ impl KubernetesSubstrate {
         options: ActivationOptions,
         placement: Option<&EvacuationPlacement>,
         restore: DrainRestore,
-    ) -> Result<bool, SubstrateError> {
+    ) -> Result<DrainRestoreAttempt, SubstrateError> {
+        use pplx_space_sandbox_store::drain_restore::DrainRestoreClaim;
+        match self.store.claim_drain_restore(sandbox_id, restore).await? {
+            DrainRestoreClaim::Claimed => {}
+            DrainRestoreClaim::Refused(refusal) => {
+                return Ok(DrainRestoreAttempt::Refused(refusal));
+            }
+        }
         let activation = match self
             .restore_execution_activation(
                 metric_identity,
@@ -1306,12 +1395,19 @@ impl KubernetesSubstrate {
             .lease_completion
             .filter(|completion| completion.generation == generation)
             .map(|completion| completion.attempt_id);
-        if restore.target == pplx_space_sandbox_store::drain_restore::DrainRestoreTarget::Paused
+        if restore.target == pplx_space_sandbox_store::sweeper::EvacuationRestoreTarget::Paused
             && let Err(error) = self
                 .pause_drain_restored_execution(sandbox_id, &activation.binding)
                 .await
         {
-            self.revert_drain_restore_episode(sandbox_id, restore).await;
+            self.revert_failed_restore_claim(
+                sandbox_id,
+                RestoreClaim::FreshFromSuspended {
+                    restore_lease_token: Some(restore.restore_lease_token),
+                },
+                None,
+            )
+            .await;
             if let Some(attempt) = attempt {
                 self.store
                     .release_finished_activation_attempt_best_effort(
@@ -1321,11 +1417,18 @@ impl KubernetesSubstrate {
             }
             return Err(error);
         }
-        Ok(self
-            .store
-            .complete_drain_restore(sandbox_id, restore, generation, attempt)
-            .await?
-            .landed())
+        Ok(
+            if self
+                .store
+                .complete_drain_restore(sandbox_id, restore, generation, attempt)
+                .await?
+                .landed()
+            {
+                DrainRestoreAttempt::Landed
+            } else {
+                DrainRestoreAttempt::Lost
+            },
+        )
     }
 
     /// Pause the running VM a drain restore toward `paused` brought up, on
@@ -1379,38 +1482,6 @@ impl KubernetesSubstrate {
         Ok(())
     }
 
-    /// End an episode a drain restore operation left open under its lease, as
-    /// a failed restore's cleanup does: back to `suspended`, retiring the
-    /// execution the episode created when the snapshot it restores from
-    /// still proves the revert safe. A row another writer moved on, or one
-    /// under another lease, is left alone.
-    pub async fn revert_drain_restore_episode(&self, sandbox_id: SandboxId, restore: DrainRestore) {
-        if restore.target == pplx_space_sandbox_store::drain_restore::DrainRestoreTarget::Stopped {
-            // Back to `stopped`, from its published disk: unplaced once the
-            // release ran, which a later start re-places from the pin.
-            if let Err(error) = self
-                .store
-                .revert_stopped_drain_restore(sandbox_id, restore)
-                .await
-            {
-                tracing::warn!(
-                    sandbox_id = %sandbox_id,
-                    %error,
-                    "failed to revert a stopped drain restore episode"
-                );
-            }
-            return;
-        }
-        self.revert_failed_restore_claim(
-            sandbox_id,
-            RestoreClaim::FreshFromSuspended {
-                restore_lease_token: Some(restore.restore_lease_token),
-            },
-            None,
-        )
-        .await;
-    }
-
     /// Shared lifecycle bookkeeping for both [`SubstrateAdapter::restore_execution`]
     /// (user-API restore, [`RestoreIntent::user`]) and
     /// [`Self::restore_evacuated_execution`] (cluster-controller drain
@@ -1460,10 +1531,7 @@ impl KubernetesSubstrate {
         // reads the evacuation's disk artifact and the claim it needs is the
         // evacuation claim. A user restore asking for it is a caller bug.
         if target_state == SandboxLifecycle::Stopped
-            && !matches!(
-                intent.claim,
-                RestoreClaimMode::EvacuationMarker | RestoreClaimMode::DrainOperation(_)
-            )
+            && !matches!(intent.claim, RestoreClaimMode::EvacuationMarker)
         {
             return Err(SubstrateError::Conflict {
                 message: "a stopped restore target is only valid for an evacuation restore"
@@ -1493,11 +1561,10 @@ impl KubernetesSubstrate {
                 RestoreClaimMode::UserLease { .. } => {
                     self.store.begin_restore_lifecycle(sandbox_id, false).await
                 }
-                RestoreClaimMode::DrainOperation(restore) => {
-                    self.store
-                        .begin_drain_restore_lifecycle(sandbox_id, restore)
-                        .await
-                }
+                // Claimed by `restore_drained_execution` before this.
+                RestoreClaimMode::DrainOperation(restore) => Ok(RestoreClaim::FreshFromSuspended {
+                    restore_lease_token: Some(restore.restore_lease_token),
+                }),
             };
             match claim {
                 Ok(restore_claim) => break restore_claim,
@@ -1550,7 +1617,7 @@ impl KubernetesSubstrate {
             return Err(err);
         }
         // Holds a claimed drain restore before any node work, so a test can
-        // act while the episode is open.
+        // act while it holds the row.
         #[cfg(feature = "test-hooks")]
         if matches!(intent.claim, RestoreClaimMode::DrainOperation(_))
             && let Some(hold) =
@@ -1558,24 +1625,6 @@ impl KubernetesSubstrate {
                     .and_then(|secs| secs.parse::<u64>().ok())
         {
             tokio::time::sleep(Duration::from_secs(hold)).await;
-        }
-        // A drain restore toward `stopped` re-places the sandbox, so its claim
-        // releases the drained node first, as v1's stopped evacuation does
-        // before its re-placement: the pre-stop execution is retired and its
-        // pod deleted, fenced against a start, and the row unplaced.
-        if matches!(intent.claim, RestoreClaimMode::DrainOperation(_))
-            && target_state == SandboxLifecycle::Stopped
-            && !self
-                .delete_execution_retired_by_current_stop(sandbox_id)
-                .await?
-        {
-            self.release_rejected_restore_claim(sandbox_id, restore_claim)
-                .await;
-            return Err(SubstrateError::EvacuationClaimLost {
-                message: format!(
-                    "a start holds stopped sandbox {sandbox_id}; its drain restore leaves it"
-                ),
-            });
         }
         let sandbox = self.store.require_sandbox(sandbox_id).await?;
         let activation = self
@@ -1787,7 +1836,7 @@ impl KubernetesSubstrate {
                         .fetch_restore_ownership_snapshot(sandbox_id)
                         .await
                         .ok()
-                        .map(|(_, _, _, remaining_secs)| remaining_secs)
+                        .map(|(_, _, remaining_secs)| remaining_secs)
                         .filter(|remaining_secs| *remaining_secs > 0.0)
                         .map(Duration::from_secs_f64);
                     return Err(SubstrateError::RestoreInFlight {

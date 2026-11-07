@@ -5,11 +5,9 @@
 //! records no operation (`SandboxController::action`), and the release of a
 //! drain restore's attempt when a user's operation has queued behind it.
 //!
-//! None cancels a drain restore whose restore episode is open (the row is
-//! `restoring` toward its target): nothing but a drain restore settles that
-//! episode, since the transient sweeper leaves it alone. Such a restore is
-//! made due at once instead, so it settles the episode and the user's
-//! operation, queued behind it, runs next.
+//! None cancels a restore whose attempt holds the row: the keyed queue runs
+//! the user's operation after it. Between attempts the row is `suspended`, so
+//! a canceled restore leaves nothing behind.
 
 use pplx_space_common_core::sql;
 use pplx_space_common_core::types::{OrgId, SandboxId};
@@ -17,7 +15,6 @@ use pplx_space_public_api::{
     OperationId, OperationKind, OperationState, OperationTargetType, PublicErrorCode,
     PublicOperationEventType, PublicSandboxId,
 };
-use pplx_space_sandbox_store::drain_restore::drain_restore_episode_open;
 use sqlx::types::Json;
 use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
@@ -87,8 +84,6 @@ pub enum DrainRestoreSupersededBy {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct DrainRestoreSupersession {
     pub canceled: usize,
-    /// Restores left to settle an open episode, made due at once.
-    pub hastened: usize,
 }
 
 /// Cancel the drain restores of `target_id` that `by` supersedes and that
@@ -129,13 +124,6 @@ pub(super) async fn cancel_drain_restores_superseded_tx(
     if unclaimed.is_empty() {
         return Ok(outcome);
     }
-    if episode_open(tx, target_id).await? {
-        for operation in unclaimed {
-            hasten_drain_restore_tx(tx, operation).await?;
-            outcome.hastened += 1;
-        }
-        return Ok(outcome);
-    }
     for operation in unclaimed {
         cancel_superseded_drain_restore_tx(tx, operation, by).await?;
         outcome.canceled += 1;
@@ -165,15 +153,14 @@ pub(super) async fn cancel_drain_restores_for_action(
 }
 
 /// The earliest user's operation on the sandbox of drain restore
-/// `operation_id`, requested after it and still active, that supersedes it,
-/// unless its restore episode is open. The caller holds the restore's row
-/// lock.
+/// `operation_id`, requested after it and still active, that supersedes it.
+/// The caller holds the restore's row lock.
 pub(super) async fn superseding_user_operation_tx(
     tx: &mut Transaction<'_, Postgres>,
     operation_id: OperationId,
 ) -> Result<Option<OperationId>, PublicOperationStoreError> {
-    let superseding = sqlx::query_as::<_, (Uuid, String)>(sql!(
-        "SELECT later.operation_id, restore.target_id
+    let superseding = sqlx::query_scalar::<_, Uuid>(sql!(
+        "SELECT later.operation_id
          FROM public_operations restore
          JOIN public_operations later
            ON later.org_id = restore.org_id
@@ -196,42 +183,7 @@ pub(super) async fn superseding_user_operation_tx(
     .bind(OperationState::Running.as_str())
     .fetch_optional(&mut **tx)
     .await?;
-    let Some((later, target_id)) = superseding else {
-        return Ok(None);
-    };
-    if episode_open(tx, &target_id).await? {
-        return Ok(None);
-    }
-    Ok(Some(OperationId::from_uuid(later)))
-}
-
-/// Whether the sandbox `target_id` names is mid-episode of a drain restore.
-/// A target that names no sandbox has none.
-async fn episode_open(
-    tx: &mut Transaction<'_, Postgres>,
-    target_id: &str,
-) -> Result<bool, PublicOperationStoreError> {
-    let Ok(sandbox_id) = target_id.parse::<PublicSandboxId>() else {
-        return Ok(false);
-    };
-    Ok(drain_restore_episode_open(&mut **tx, sandbox_id.into()).await?)
-}
-
-/// Make queued drain restore `operation_id` due now.
-async fn hasten_drain_restore_tx(
-    tx: &mut Transaction<'_, Postgres>,
-    operation_id: OperationId,
-) -> Result<(), PublicOperationStoreError> {
-    sqlx::query(sql!(
-        "UPDATE public_operations
-         SET next_attempt_at = LEAST(next_attempt_at, NOW()),
-             updated_at = NOW()
-         WHERE operation_id = $1"
-    ))
-    .bind(operation_id.as_uuid())
-    .execute(&mut **tx)
-    .await?;
-    Ok(())
+    Ok(superseding.map(OperationId::from_uuid))
 }
 
 /// Record drain restore `operation_id`, whose row this transaction has

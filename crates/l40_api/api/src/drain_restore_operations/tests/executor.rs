@@ -1,5 +1,4 @@
-//! The drain restore executor against Postgres: what each attempt ends as,
-//! and that ending reverts an episode the operation left open.
+//! The drain restore executor against Postgres: what each attempt ends as.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -7,7 +6,7 @@ use std::time::Duration;
 use pplx_space_common_core::sql;
 use pplx_space_common_core::types::{OrgId, SandboxId};
 use pplx_space_public_api::{OperationState, PublicOperationResult, SandboxLifecycleState};
-use pplx_space_sandbox_store::drain_restore::DrainRestoreTarget;
+use pplx_space_sandbox_store::sweeper::EvacuationRestoreTarget;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -116,15 +115,11 @@ async fn enqueue_payload(
 }
 
 fn payload(id: SandboxId, s: Uuid) -> serde_json::Value {
-    DrainRestoreOperationPayload::new(id, DrainRestoreTarget::Started, s).into_json()
+    DrainRestoreOperationPayload::new(id, EvacuationRestoreTarget::Started, s).into_json()
 }
 
-fn executor(
-    pool: &PgPool,
-    kubernetes: Option<KubernetesSubstrate>,
-) -> DrainRestoreOperationExecutor {
+fn executor(kubernetes: Option<KubernetesSubstrate>) -> DrainRestoreOperationExecutor {
     DrainRestoreOperationExecutor::new(
-        pool.clone(),
         kubernetes.map(Arc::new),
         None,
         DrainRestoreRetry::with_max_attempts(MAX_ATTEMPTS),
@@ -142,20 +137,21 @@ fn outcome(result: &PublicOperationExecutionResult) -> (OperationState, Option<S
     (result.state.clone(), reason)
 }
 
-/// An attempt that finds nothing to restore ends without touching the row:
+/// An attempt whose claim takes nothing ends without touching the row:
 /// canceled when the restore is no longer the system's (the sandbox moved
 /// on, or is being deleted), deferred while S uploads, failed when S is lost
-/// or the payload is unreadable. A claimable row on a substrate without a
-/// drain restore fails.
+/// or the payload is unreadable or names `stopped`. A claimable row on a
+/// substrate without a drain restore fails.
 #[tokio::test(flavor = "current_thread")]
-async fn each_gate_ends_the_attempt_as_it_says() -> Result<(), BoxError> {
+async fn each_refused_claim_ends_the_attempt_as_it_says() -> Result<(), BoxError> {
     let db = pplx_space_db_test_fixtures::pg_test_db().await?;
     let pool = &db.pool;
     struct Case {
         name: &'static str,
         lifecycle: &'static str,
         source_state: &'static str,
-        valid_payload: bool,
+        payload: &'static str,
+        kubernetes: bool,
         expected: (OperationState, Option<&'static str>),
     }
     let cases = [
@@ -163,42 +159,56 @@ async fn each_gate_ends_the_attempt_as_it_says() -> Result<(), BoxError> {
             name: "started",
             lifecycle: "started",
             source_state: "ready",
-            valid_payload: true,
-            expected: (OperationState::Canceled, Some("lifecycle_changed")),
+            payload: "valid",
+            kubernetes: true,
+            expected: (OperationState::Canceled, Some("superseded")),
         },
         Case {
             name: "deleting",
             lifecycle: "deleting",
             source_state: "ready",
-            valid_payload: true,
+            payload: "valid",
+            kubernetes: true,
             expected: (OperationState::Canceled, Some("sandbox_deleted")),
         },
         Case {
             name: "S uploading",
             lifecycle: "suspended",
             source_state: "creating",
-            valid_payload: true,
+            payload: "valid",
+            kubernetes: true,
             expected: (OperationState::Queued, None),
         },
         Case {
             name: "S failed",
             lifecycle: "suspended",
             source_state: "failed",
-            valid_payload: true,
+            payload: "valid",
+            kubernetes: true,
             expected: (OperationState::Failed, Some("restore_source_unavailable")),
         },
         Case {
             name: "unreadable payload",
             lifecycle: "suspended",
             source_state: "ready",
-            valid_payload: false,
+            payload: "suspended",
+            kubernetes: true,
+            expected: (OperationState::Failed, Some("invalid_payload")),
+        },
+        Case {
+            name: "a stopped target",
+            lifecycle: "suspended",
+            source_state: "ready",
+            payload: "stopped",
+            kubernetes: true,
             expected: (OperationState::Failed, Some("invalid_payload")),
         },
         Case {
             name: "claimable without Kubernetes",
             lifecycle: "suspended",
             source_state: "ready",
-            valid_payload: true,
+            payload: "valid",
+            kubernetes: false,
             expected: (OperationState::Failed, Some("unsupported_substrate")),
         },
     ];
@@ -211,15 +221,17 @@ async fn each_gate_ends_the_attempt_as_it_says() -> Result<(), BoxError> {
             .execute(pool)
             .await?;
         let target_id = pplx_space_public_api::PublicSandboxId::from(id).to_string();
-        let body = if case.valid_payload {
-            payload(id, s)
-        } else {
-            serde_json::json!({ "sandbox_id": target_id, "target": "suspended", "snapshot_id": s })
+        let body = match case.payload {
+            "valid" => payload(id, s),
+            target => {
+                serde_json::json!({ "sandbox_id": target_id, "target": target, "snapshot_id": s })
+            }
         };
         let operation = claimed(pool, body, &target_id, 0).await?;
         let before = row_image(pool, id).await?;
 
-        let result = executor(pool, None).execute(&operation).await;
+        let kubernetes = case.kubernetes.then(|| substrate_with_store(pool.clone()));
+        let result = executor(kubernetes).execute(&operation).await;
 
         let (state, reason) = outcome(&result);
         assert_eq!(
@@ -231,7 +243,7 @@ async fn each_gate_ends_the_attempt_as_it_says() -> Result<(), BoxError> {
         if case.expected.0 == OperationState::Queued {
             assert_eq!(
                 result.requeue_reason,
-                PublicOperationRequeueReason::RetryDeferred,
+                PublicOperationRequeueReason::WorkflowProgress,
                 "{}",
                 case.name
             );
@@ -259,71 +271,6 @@ async fn end(pool: &PgPool, operation: &ClaimedPublicOperation) -> Result<(), Bo
     Ok(())
 }
 
-/// Ending an attempt as superseded or failed reverts the episode the
-/// operation left open under its own lease, back to `suspended` with the
-/// target cleared; an episode under another lease is left alone.
-#[tokio::test(flavor = "current_thread")]
-async fn ending_reverts_an_episode_the_operation_left_open() -> Result<(), BoxError> {
-    let db = pplx_space_db_test_fixtures::pg_test_db().await?;
-    let pool = &db.pool;
-    for (case, own_lease) in [("own lease", true), ("another lease", false)] {
-        let id = SandboxId::new();
-        let s = drained(pool, id, "suspended").await?;
-        let target_id = pplx_space_public_api::PublicSandboxId::from(id).to_string();
-        let operation = claimed(pool, payload(id, s), &target_id, 0).await?;
-        let token = if own_lease {
-            operation.id.as_uuid()
-        } else {
-            Uuid::now_v7()
-        };
-        // An earlier attempt reached the node and released its lease; S
-        // has since failed.
-        sqlx::query(sql!(
-            "UPDATE sandboxes
-                SET lifecycle = 'restoring',
-                    restore_episode_target = 'started',
-                    restore_lease_token = $2,
-                    restore_lease_expires_at = NOW() - INTERVAL '1 minute'
-              WHERE id = $1"
-        ))
-        .bind(id)
-        .bind(token)
-        .execute(pool)
-        .await?;
-        sqlx::query(sql!("UPDATE snapshots SET state = 'failed' WHERE id = $1"))
-            .bind(s)
-            .execute(pool)
-            .await?;
-
-        let result = executor(pool, Some(substrate_with_store(pool.clone())))
-            .execute(&operation)
-            .await;
-
-        assert_eq!(
-            outcome(&result),
-            (
-                OperationState::Failed,
-                Some("restore_source_unavailable".to_owned())
-            ),
-            "{case}"
-        );
-        let row: (String, Option<String>) = sqlx::query_as(sql!(
-            "SELECT lifecycle, restore_episode_target FROM sandboxes WHERE id = $1"
-        ))
-        .bind(id)
-        .fetch_one(pool)
-        .await?;
-        let expected = if own_lease {
-            ("suspended".to_owned(), None)
-        } else {
-            ("restoring".to_owned(), Some("started".to_owned()))
-        };
-        assert_eq!(row, expected, "{case}");
-        end(pool, &operation).await?;
-    }
-    Ok(())
-}
-
 /// A failed attempt retries with the drain's backoff, spending an attempt;
 /// the attempt that reaches the budget fails instead, so the restore stops
 /// and says why. The claim the attempt took is reverted either way.
@@ -347,7 +294,7 @@ async fn a_failing_restore_retries_until_its_attempts_are_spent() -> Result<(), 
         let operation = claimed(pool, payload(id, s), &target_id, earlier_attempts).await?;
         let (substrate, pod_creates) = substrate_with_failed_pod_creates(pool.clone());
 
-        let result = executor(pool, Some(substrate)).execute(&operation).await;
+        let result = executor(Some(substrate)).execute(&operation).await;
 
         assert_eq!(outcome(&result), expected, "attempt {}", operation.attempts);
         assert_eq!(pod_creates.load(std::sync::atomic::Ordering::SeqCst), 1);
@@ -376,7 +323,7 @@ fn a_landed_restore_reports_a_restore() {
     let id = SandboxId::new();
     let request = super::super::DrainRestoreRequest {
         sandbox_id: id,
-        target: DrainRestoreTarget::Paused,
+        target: EvacuationRestoreTarget::Paused,
         snapshot_id: Uuid::now_v7(),
         restore_lease_token: Uuid::now_v7(),
     };
