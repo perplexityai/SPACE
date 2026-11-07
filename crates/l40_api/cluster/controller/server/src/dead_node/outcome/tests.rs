@@ -32,6 +32,7 @@ async fn outcomes_on(
             k8s_node_name: Some(name),
             managed_by: SubstrateKind::Kubernetes,
         },
+        None,
         DEAD_UPLOAD_SETTLE,
         10_000,
     )
@@ -94,7 +95,9 @@ const MATRIX: &[(&str, [&str; 3], &str)] = &[
 
 /// Every stored lifecycle × {covered, uncovered ready, no snapshot} ×
 /// {pending upload, none} × {active, target, both}, each with a control row
-/// on a live node, gets the matrix's outcome, and no control row is read.
+/// on a live node, gets the matrix's outcome, and no control row is read. A
+/// `failed` row or tombstone only the target pins is settled and not read
+/// at all.
 #[tokio::test(flavor = "current_thread")]
 async fn every_stored_lifecycle_gets_the_matrix_outcome_and_live_rows_stay_out() -> TestResult {
     let Some(db) = try_pg_test_db().await? else {
@@ -127,8 +130,13 @@ async fn every_stored_lifecycle_gets_the_matrix_outcome_and_live_rows_stay_out()
                         // Selected three ways, read once.
                         insert_execution(pool, id, Some(DEAD_NAME), true).await?;
                     }
-                    let outcome = mark(if upload { with_upload } else { without_upload });
-                    expected.insert(id, outcome);
+                    // A terminal row only the target pins is settled and not
+                    // read.
+                    let settled = matches!(*lifecycle, "failed" | "deleted") && pin == Pin::Target;
+                    if !settled {
+                        let outcome = mark(if upload { with_upload } else { without_upload });
+                        expected.insert(id, outcome);
+                    }
 
                     let control = insert_pinned(pool, lifecycle, pin, live).await?;
                     seed_snapshot(pool, control, snapshot).await?;
@@ -374,6 +382,7 @@ async fn the_source_execution_is_the_latest_one_when_it_ran_on_the_node() -> Tes
             k8s_node_name: Some(DEAD_NAME),
             managed_by: SubstrateKind::Kubernetes,
         },
+        None,
         DEAD_UPLOAD_SETTLE,
         100,
     )

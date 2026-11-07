@@ -13,6 +13,8 @@ struct FakeSink {
     responses: HashMap<(NodeId, bool), Result<DrainNodeResponse, String>>,
     records: HashMap<String, EvacuationRecord>,
     calls: Mutex<Vec<String>>,
+    /// When set, each `DrainNode` call waits here before it answers.
+    barrier: Option<tokio::sync::Barrier>,
 }
 
 impl FakeSink {
@@ -42,6 +44,9 @@ impl DrainV2Sink for FakeSink {
         cancel: bool,
     ) -> Result<DrainNodeResponse, String> {
         self.log(format!("drain_node {node_id} {epoch} cancel={cancel}"));
+        if let Some(barrier) = &self.barrier {
+            barrier.wait().await;
+        }
         self.responses
             .get(&(node_id, cancel))
             .cloned()
@@ -85,11 +90,8 @@ impl DrainV2Sink for FakeSink {
         self.log(format!("error {node_id} {message}"));
     }
 
-    async fn record_terminated(&self, node: &V2Node, epoch: u64) -> Result<bool, String> {
-        self.log(format!(
-            "terminated {} {epoch} {:?} {:?}",
-            node.id, node.k8s_node_uid, node.instance_id
-        ));
+    async fn record_terminated(&self, node_id: NodeId, epoch: u64) -> Result<bool, String> {
+        self.log(format!("terminated {node_id} {epoch}"));
         Ok(true)
     }
 }
@@ -122,8 +124,6 @@ fn node(phase: Option<&str>, epoch: Option<u64>, cancel: bool) -> V2Node {
         epoch,
         cancel,
         terminated: false,
-        k8s_node_uid: Some("uid-1".into()),
-        instance_id: Some("i-0123456789abcdef0".into()),
     }
 }
 
@@ -155,6 +155,31 @@ async fn a_v2_node_without_an_epoch_gets_no_call() {
     assert!(sink.calls().is_empty(), "{:?}", sink.calls());
 }
 
+/// A tick calls its nodes at once: two nodes whose `DrainNode` calls each
+/// wait for the other both answer.
+#[tokio::test]
+async fn a_tick_calls_its_nodes_at_once() {
+    let nodes = vec![
+        node(Some("draining"), Some(1), false),
+        node(Some("draining"), Some(1), false),
+    ];
+    let sink = FakeSink {
+        responses: nodes
+            .iter()
+            .map(|node| ((node.id, false), Ok(response(Some(1), false, &[]))))
+            .collect(),
+        nodes,
+        barrier: Some(tokio::sync::Barrier::new(2)),
+        ..FakeSink::default()
+    };
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        tick(&sink, &FakeTerminator::ok()),
+    )
+    .await
+    .expect("the two calls wait for each other");
+}
+
 /// A draining node advances only on a `done` report under its own epoch with
 /// every evacuation recorded: not on a stale seal's report, a report that
 /// isn't done, or an evacuation still waiting. The control advances.
@@ -165,12 +190,6 @@ async fn draining_advances_only_on_a_done_report_under_its_epoch() {
             "control",
             response(Some(5), true, &["a"]),
             EvacuationRecord::Recorded,
-            true,
-        ),
-        (
-            "settled",
-            response(Some(5), true, &["a"]),
-            EvacuationRecord::Settled,
             true,
         ),
         (
@@ -303,9 +322,9 @@ async fn an_undrained_node_is_cancelled_until_unsealed() {
     assert!(sink.calls().is_empty());
 }
 
-/// A terminating node is terminated, then the termination recorded against
-/// the identity the tick read; a failed terminate records nothing, and a node
-/// already recorded is neither terminated nor recorded again.
+/// A terminating node is terminated, then flagged; a failed terminate flags
+/// nothing, and a node already flagged is neither terminated nor flagged
+/// again.
 #[tokio::test]
 async fn a_terminating_node_is_terminated_then_recorded_once() {
     for (case, terminator, recorded) in [
@@ -331,10 +350,7 @@ async fn a_terminating_node_is_terminated_then_recorded_once() {
             "{case}"
         );
         assert_eq!(report.terminated == [terminating.id], recorded, "{case}");
-        let expected = format!(
-            "terminated {} 5 Some(\"uid-1\") Some(\"i-0123456789abcdef0\")",
-            terminating.id
-        );
+        let expected = format!("terminated {} 5", terminating.id);
         assert_eq!(
             sink.calls().contains(&expected),
             recorded,

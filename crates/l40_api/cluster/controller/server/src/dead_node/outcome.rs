@@ -21,9 +21,6 @@ pub enum RowOutcome {
     /// holding the sandbox: a live machine has its state, so it is never
     /// written off.
     HeldByPublication,
-    /// A drain restore operation's episode is open on the row; the operation
-    /// owns it.
-    HeldByRestore,
     /// `deleting`: the delete finishes; nothing on the node is needed.
     FinishDelete,
     /// `suspended` and covered by a durable snapshot: stays `suspended`,
@@ -62,7 +59,6 @@ impl RowOutcome {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::HeldByPublication => "held_by_publication",
-            Self::HeldByRestore => "held_by_restore",
             Self::FinishDelete => "finish_delete",
             Self::StaysSuspended => "stays_suspended",
             Self::StaysStopped => "stays_stopped",
@@ -88,11 +84,9 @@ impl RowOutcome {
             | Self::LostSnapshotRetained
             | Self::Lost
             | Self::ReferencesCleared => true,
-            Self::HeldByPublication
-            | Self::HeldByRestore
-            | Self::Wait
-            | Self::HeldByExecution
-            | Self::Unselected => false,
+            Self::HeldByPublication | Self::Wait | Self::HeldByExecution | Self::Unselected => {
+                false
+            }
         }
     }
 }
@@ -106,8 +100,7 @@ impl fmt::Display for RowOutcome {
 /// The outcome of `row`, which a verdict selected.
 ///
 /// - A row a node with a fresh, complete publication reports holding is
-///   held by that publication, and one with an open drain restore episode by
-///   the restore, whatever else holds.
+///   held by that publication, whatever else holds.
 /// - `deleting` finishes its delete, whatever else holds.
 /// - A row with an active execution off the node, including one whose pod is
 ///   not scheduled yet, is held by that execution: `held_by_execution`, not
@@ -137,9 +130,6 @@ pub fn row_outcome(row: &DeadNodeRow) -> RowOutcome {
     };
     if row.reported_by_live_node {
         return RowOutcome::HeldByPublication;
-    }
-    if row.restore_owned {
-        return RowOutcome::HeldByRestore;
     }
     if row.lifecycle == Some(StoredSandboxLifecycle::Live(L::Deleting)) {
         return RowOutcome::FinishDelete;

@@ -14,13 +14,14 @@
 //!   transaction and at most once per snapshot. The report is stored in
 //!   `drain_status`. A `draining` node moves to `drained` once the report is
 //!   `done` under the row's own epoch and every evacuation is recorded.
-//! - **`terminating`**: `:terminate` moved it here, gated on that report, and
-//!   recorded the epoch it let go (`drain_status.terminate`). Terminate it
-//!   through the cluster's terminator, then record that it did, with the
-//!   Kubernetes uid and instance it acted on (`drain_status.terminated`). The
-//!   row stays, with no tombstone: the dead-node verb takes the node as dead
-//!   by that record, reconciles what is left on it and deletes the row
-//!   (`dead_node`). A node with the record is not terminated again.
+//! - **`terminating`**: `:terminate` moved it here, gated on a fresh `done`
+//!   report under the row's epoch. Terminate it through the cluster's
+//!   terminator, then flag that it did (`drain_status.terminated`), so it is
+//!   not terminated again. The row stays, with no tombstone: the dead-node
+//!   verb, which a v2 cluster runs `live` with EC2 as its authority, judges
+//!   the node by the ordinary evidence (heartbeat stale, Node gone, instance
+//!   terminated), reconciles what is left on it and deletes the row
+//!   (`dead_node`).
 //! - **undrained** (no phase, `drain_status.cancel`): cancel the epoch on the
 //!   node until it is unsealed, then clear the v2 columns.
 //!
@@ -46,28 +47,23 @@ pub struct V2Node {
     pub cancel: bool,
     /// `drain_status.terminated`: the terminator acted on the node.
     pub terminated: bool,
-    /// `node_k8s.k8s_node_uid` and `node_k8s.instance_id` as the tick read
-    /// them: the identity a termination is recorded against.
-    pub k8s_node_uid: Option<String>,
-    pub instance_id: Option<String>,
 }
 
 /// What recording one reported evacuation found.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EvacuationRecord {
-    /// The restore is enqueued, by this call or an earlier one.
+    /// Nothing more to do for it: its restore is enqueued or its stopped row
+    /// released, by this call or an earlier one, or the sandbox has moved on.
     Recorded,
-    /// No restore is needed: the sandbox was deleted, or a user call moved it
-    /// on.
-    Settled,
-    /// Not yet: the catalog doesn't hold the artifact as ready, or the
-    /// node's suspend isn't projected onto the row yet.
+    /// Not yet, and why: the catalog doesn't hold the artifact as ready, the
+    /// node's suspend isn't projected onto the row yet, or the row can't
+    /// take the report.
     NotYet(String),
 }
 
 impl EvacuationRecord {
     pub const fn is_recorded(&self) -> bool {
-        matches!(self, Self::Recorded | Self::Settled)
+        matches!(self, Self::Recorded)
     }
 }
 
@@ -117,12 +113,11 @@ pub trait DrainV2Sink: Send + Sync + 'static {
         node_id: NodeId,
         message: &str,
     ) -> impl std::future::Future<Output = ()> + Send;
-    /// Record that the terminator acted on `node` under `epoch`, against the
-    /// uid and instance the tick read; false when the row is no longer that
-    /// epoch's terminating v2 node with that identity, or already records it.
+    /// Flag that the terminator acted on `node_id` under `epoch`; false when
+    /// the row is no longer that epoch's terminating v2 node.
     fn record_terminated(
         &self,
-        node: &V2Node,
+        node_id: NodeId,
         epoch: u64,
     ) -> impl std::future::Future<Output = Result<bool, String>> + Send;
 }
@@ -175,8 +170,21 @@ pub fn report_json(
     })
 }
 
-/// One pass over every v2 node.
+/// How many v2 nodes one tick calls at once: each call waits on its node,
+/// and a slow node must not hold up the rest.
+const NODE_CONCURRENCY: usize = 8;
+
+/// What one tick did to a node.
+enum NodeStep {
+    Cancelled,
+    Drained,
+    Terminated,
+}
+
+/// One pass over every v2 node, [`NODE_CONCURRENCY`] at a time.
 pub async fn tick<S: DrainV2Sink, T: InstanceTerminator>(sink: &S, terminator: &T) -> V2TickReport {
+    use futures_util::StreamExt as _;
+
     let mut report = V2TickReport::default();
     let nodes = match sink.list_v2_nodes().await {
         Ok(nodes) => nodes,
@@ -185,38 +193,51 @@ pub async fn tick<S: DrainV2Sink, T: InstanceTerminator>(sink: &S, terminator: &
             return report;
         }
     };
-    for node in nodes {
-        let Some(epoch) = node.epoch else {
-            // The admin route writes the epoch with the phase; a row without
-            // one gets no call, sealed under nothing.
-            tracing::warn!(node_id = %node.id, "node_drain v2: drain_status has no epoch");
-            continue;
-        };
-        match node.phase.as_deref() {
-            None if node.cancel => {
-                if cancel(sink, node.id, epoch).await {
-                    report.cancelled.push(node.id);
-                }
-            }
+    let steps: Vec<_> = futures_util::stream::iter(nodes)
+        .map(|node| async move { (node.id, step(sink, terminator, &node).await) })
+        .buffered(NODE_CONCURRENCY)
+        .collect()
+        .await;
+    for (node_id, step) in steps {
+        match step {
+            Some(NodeStep::Cancelled) => report.cancelled.push(node_id),
+            Some(NodeStep::Drained) => report.drained.push(node_id),
+            Some(NodeStep::Terminated) => report.terminated.push(node_id),
             None => {}
-            Some("draining") | Some("drained") => {
-                if drain(sink, &node, epoch).await {
-                    report.drained.push(node.id);
-                }
-            }
-            // Terminated already: the dead-node verb owns it now.
-            Some("terminating") if node.terminated => {}
-            Some("terminating") => {
-                if terminate(sink, terminator, &node, epoch).await {
-                    report.terminated.push(node.id);
-                }
-            }
-            Some(other) => {
-                tracing::warn!(node_id = %node.id, phase = other, "node_drain v2: unknown phase");
-            }
         }
     }
     report
+}
+
+async fn step<S: DrainV2Sink, T: InstanceTerminator>(
+    sink: &S,
+    terminator: &T,
+    node: &V2Node,
+) -> Option<NodeStep> {
+    let Some(epoch) = node.epoch else {
+        // The admin route writes the epoch with the phase; a row without
+        // one gets no call, sealed under nothing.
+        tracing::warn!(node_id = %node.id, "node_drain v2: drain_status has no epoch");
+        return None;
+    };
+    match node.phase.as_deref() {
+        None if node.cancel => cancel(sink, node.id, epoch)
+            .await
+            .then_some(NodeStep::Cancelled),
+        None => None,
+        Some("draining") | Some("drained") => {
+            drain(sink, node, epoch).await.then_some(NodeStep::Drained)
+        }
+        // Terminated already: the dead-node verb owns it now.
+        Some("terminating") if node.terminated => None,
+        Some("terminating") => terminate(sink, terminator, node.id, epoch)
+            .await
+            .then_some(NodeStep::Terminated),
+        Some(other) => {
+            tracing::warn!(node_id = %node.id, phase = other, "node_drain v2: unknown phase");
+            None
+        }
+    }
 }
 
 /// Ask the node, record what it reports, and advance a `draining` node that
@@ -243,6 +264,23 @@ async fn drain<S: DrainV2Sink>(sink: &S, node: &V2Node, epoch: u64) -> bool {
         records.push((evacuated.sandbox_id.clone(), record));
     }
     let all_recorded = records.iter().all(|(_, record)| record.is_recorded());
+    let unrecorded = records
+        .iter()
+        .filter(|(_, record)| !record.is_recorded())
+        .count();
+    crate::metrics::node_drain::v2_report(
+        &node.id.to_string(),
+        response.blocked.len() as u64,
+        (response.pending.len() + unrecorded) as u64,
+    );
+    if !response.blocked.is_empty() {
+        tracing::warn!(
+            node_id = %node.id,
+            blocked = response.blocked.len(),
+            "node_drain v2: the node reports residents it can't make durable; the drain \
+             can't end until they are resolved"
+        );
+    }
     match sink
         .record_report(node.id, epoch, report_json(&response, &records))
         .await
@@ -298,16 +336,15 @@ async fn cancel<S: DrainV2Sink>(sink: &S, node_id: NodeId, epoch: u64) -> bool {
     }
 }
 
-/// Terminate a v2 node and record it. Returns whether the record was written.
+/// Terminate a v2 node and flag it. Returns whether the flag was written.
 async fn terminate<S: DrainV2Sink, T: InstanceTerminator>(
     sink: &S,
     terminator: &T,
-    node: &V2Node,
+    node_id: NodeId,
     epoch: u64,
 ) -> bool {
-    let node_id = node.id;
     match terminator.terminate(node_id).await {
-        Ok(()) => match sink.record_terminated(node, epoch).await {
+        Ok(()) => match sink.record_terminated(node_id, epoch).await {
             Ok(recorded) => recorded,
             Err(error) => {
                 sink.record_error(

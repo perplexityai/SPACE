@@ -6,7 +6,8 @@
 //! `dry_run` or `live`.
 //!
 //! Each judgment adds the node's rows again, so a sum over time counts a row
-//! once per judgment; `GET /dead-node-status` has each node's last counts.
+//! once per judgment; the admin node listing's `dead_node_status` has each
+//! node's last counts.
 
 use pplx_space_metrics_emit::{counter, tag};
 

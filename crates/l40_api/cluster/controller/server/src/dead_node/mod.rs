@@ -35,7 +35,9 @@
 //!
 //! ## Which nodes
 //!
-//! Nodes of the running substrate outside any drain phase whose heartbeat is
+//! Nodes of the running substrate outside any drain phase, or a v2 drain's
+//! node in `terminating` (judged by the same evidence: the drain's v2 needs
+//! this verb `live` to delete the row a terminate leaves), whose heartbeat is
 //! stale by the API's node-status rule
 //! (`pplx_space_sandbox_residency::node_heartbeat_fresh`), or which hold a
 //! non-terminal row whose latest execution on the node is stamped with an
@@ -63,19 +65,6 @@
 //! recorded uid changes), a direct GET of the Node's name returns 404, and
 //! its recorded instance is dead.
 //!
-//! A node a v2 drain let go is judged by the drain's record instead
-//! ([`verdict::drain_terminated_verdict`]): in `terminating` under
-//! `drain_engine = 'v2'`, with `:terminate`'s record of the epoch it let go,
-//! the node's `done` report under that epoch, and the controller's record
-//! that it terminated the node under that epoch against the uid and instance
-//! `node_k8s` still holds (`node_drain::store::v2_sink::v2_terminated_record`).
-//! It is lost by that record once its heartbeat is stale, with no EC2 call
-//! and no Kubernetes evidence read; its recorded instance is dead with it,
-//! and any other instance its rows name is not asked about. Its rows then
-//! follow the same rules, so a row a drain restore operation owns stays with
-//! it, and live mode deletes the node row under the same guards, the record
-//! re-read. Nothing writes a tombstone for it.
-//!
 //! ## Which rows
 //!
 //! A row whose latest execution on the node is stamped with an instance is
@@ -85,9 +74,8 @@
 //! reports, or one a drain restore operation owns.
 //!
 //! Kind's fake EC2 answers instance IDs from the Kubernetes Nodes' fake AWS
-//! `providerID`s and the instances its test control marked terminated; the
-//! smoke-only `SPACE_DEAD_NODE_TEST_INSTANCE_AUTHORITY=ec2` test hook selects
-//! the EC2 arm there, where the terminator is `kube-delete`.
+//! `providerID`s and the instances terminated through it; a scenario selects
+//! the `aws` terminator there to judge by it.
 
 use pplx_space_common_core::types::{NodeId, SandboxId, SubstrateKind};
 
@@ -128,8 +116,7 @@ pub use store::DeadNodeDbStore;
 use outcome::{RowOutcome, row_outcome};
 use verdict::{
     DirectGet, Heartbeat, InstanceEvidence, InstanceVerdict, KubeEvidence, NodeVerdictInputs,
-    Verdict, drain_terminated_instance_verdict, drain_terminated_verdict, instance_verdict,
-    node_verdict, well_formed_instance_id,
+    Verdict, instance_verdict, node_verdict, well_formed_instance_id,
 };
 
 pub(crate) const MODE_ENV: &str = "SPACE_DEAD_NODE_MODE";
@@ -207,9 +194,6 @@ pub struct ReconcilerConfig {
     pub max_nodes_per_tick: u32,
     pub max_rows_per_node: u32,
     pub max_writes_per_tick: u32,
-    /// Judge with EC2 whatever the terminator. Only the smoke harness sets it,
-    /// through a test hook, so Kind can run the EC2 arm against its fake EC2.
-    pub force_ec2: bool,
 }
 
 impl ReconcilerConfig {
@@ -222,7 +206,6 @@ impl ReconcilerConfig {
             max_nodes_per_tick: MAX_NODES_PER_TICK,
             max_rows_per_node: MAX_ROWS_PER_NODE,
             max_writes_per_tick: MAX_WRITES_PER_TICK,
-            force_ec2: false,
         }
     }
 
@@ -250,9 +233,6 @@ impl ReconcilerConfig {
                 "SPACE_DEAD_NODE_TEST_UPLOAD_SETTLE_SECS",
                 default.upload_settle,
             ),
-            force_ec2: config
-                .test_raw("SPACE_DEAD_NODE_TEST_INSTANCE_AUTHORITY")
-                .is_some_and(|raw| raw.trim() == "ec2"),
             ..default
         })
     }
@@ -275,10 +255,9 @@ pub struct CandidateNode {
     /// reported.
     pub instance_id: Option<String>,
     pub heartbeat: Heartbeat,
-    /// The epoch of the v2 drain whose record selected the node
-    /// ([`verdict::drain_terminated_verdict`]); `None` for a node outside any
-    /// drain.
-    pub drain_terminated_epoch: Option<i64>,
+    /// A v2 drain's node in `terminating`: the controller's terminator has
+    /// it, and this verb deletes its row once it is lost.
+    pub v2_terminating: bool,
 }
 
 /// A fresh node that may serve as the instance lookup's reference.
@@ -324,10 +303,9 @@ pub struct RowWrite<'a> {
 
 /// Postgres-side surface. Production impl: [`DeadNodeDbStore`].
 pub trait DeadNodeSink: Send + Sync + 'static {
-    /// Up to `limit` nodes of `managed_by` with `nodes.id > after`, by id:
+    /// Up to `limit` nodes of `managed_by` with `nodes.id > after`, by id,
     /// outside any drain phase, whose heartbeat is stale or which hold a row
-    /// stamped with an instance other than their recorded one; or a v2
-    /// drain's node the controller terminated, by the drain's record.
+    /// stamped with an instance other than their recorded one.
     fn candidate_nodes(
         &self,
         managed_by: SubstrateKind,
@@ -343,10 +321,12 @@ pub trait DeadNodeSink: Send + Sync + 'static {
         limit: u32,
     ) -> impl Future<Output = Result<Vec<ReferenceNode>, sqlx::Error>> + Send;
 
-    /// Up to `limit` sandbox rows `node` holds, with their facts.
+    /// Up to `limit` sandbox rows `node` holds, by id after `after`, with
+    /// their facts.
     fn rows_on_node(
         &self,
         node: &CandidateNode,
+        after: Option<SandboxId>,
         upload_settle: Duration,
         limit: u32,
     ) -> impl Future<Output = Result<Vec<DeadNodeRow>, sqlx::Error>> + Send;
@@ -361,8 +341,7 @@ pub trait DeadNodeSink: Send + Sync + 'static {
         upload_settle: Duration,
     ) -> impl Future<Output = Result<WriteResult, sqlx::Error>> + Send;
 
-    /// Delete the lost node's row, guarded by its drain phase (or, for a
-    /// drain-terminated node, the drain's record under the same epoch), stale
+    /// Delete the lost node's row, guarded by its drain phase, stale
     /// heartbeat, uid and recorded instance, and by no live row pinning it.
     /// Returns whether it was deleted.
     fn delete_node(
@@ -391,21 +370,6 @@ pub trait NodeMembership: Send + Sync + 'static {
         &self,
         node_name: String,
     ) -> impl Future<Output = Result<bool, Self::LookupError>> + Send;
-}
-
-/// Membership for a substrate without Kubernetes Nodes: always unknown.
-pub struct NoNodeMembership;
-
-impl NodeMembership for NoNodeMembership {
-    type LookupError = std::convert::Infallible;
-
-    fn live_node_uids(&self) -> Option<HashSet<String>> {
-        None
-    }
-
-    async fn node_exists(&self, _node_name: String) -> Result<bool, Self::LookupError> {
-        Ok(true)
-    }
 }
 
 /// EC2 `DescribeInstances` by an `instance-id` filter. The impl forwards to
@@ -562,6 +526,10 @@ pub struct Reconciler<S: DeadNodeSink, K: NodeMembership> {
     /// again, restarted when the recorded uid changes, and cleared entirely
     /// on a tick whose membership is unknown.
     absent_since: HashMap<NodeId, (String, Instant)>,
+    /// Where each node's next row read starts, after a read the cap cut
+    /// short: the next tick reads the rows after it, so a node holding more
+    /// than the cap is worked through rather than read from the start again.
+    row_cursor: HashMap<NodeId, SandboxId>,
 }
 
 /// One tick's shared state: the reference instance, looked up once, and the
@@ -587,6 +555,7 @@ impl<S: DeadNodeSink, K: NodeMembership> Reconciler<S, K> {
             managed_by,
             scan_after: None,
             absent_since: HashMap::new(),
+            row_cursor: HashMap::new(),
         }
     }
 
@@ -655,9 +624,15 @@ impl<S: DeadNodeSink, K: NodeMembership> Reconciler<S, K> {
         report: &mut TickReport,
     ) {
         let cap = self.config.max_rows_per_node;
+        let after = self.row_cursor.get(&node.node_id).copied();
         let mut rows = match self
             .sink
-            .rows_on_node(node, self.config.upload_settle, cap.saturating_add(1))
+            .rows_on_node(
+                node,
+                after,
+                self.config.upload_settle,
+                cap.saturating_add(1),
+            )
             .await
         {
             Ok(rows) => rows,
@@ -673,54 +648,15 @@ impl<S: DeadNodeSink, K: NodeMembership> Reconciler<S, K> {
         };
         let rows_truncated = rows.len() > cap as usize;
         rows.truncate(cap as usize);
+        match rows.last() {
+            Some(last) if rows_truncated => {
+                self.row_cursor.insert(node.node_id, last.sandbox_id);
+            }
+            _ => {
+                self.row_cursor.remove(&node.node_id);
+            }
+        }
 
-        let (verdict, instances) = if node.drain_terminated_epoch.is_some() {
-            Self::drain_terminated_evidence(node, &rows)
-        } else {
-            self.instance_and_node_evidence(node, &rows, live_uids, state)
-                .await
-        };
-        self.reconcile_node(
-            node,
-            rows,
-            rows_truncated,
-            verdict,
-            instances,
-            state,
-            report,
-        )
-        .await;
-    }
-
-    /// A drain-terminated node's verdicts, by the drain's record alone.
-    fn drain_terminated_evidence(
-        node: &CandidateNode,
-        rows: &[DeadNodeRow],
-    ) -> (Verdict, BTreeMap<String, InstanceVerdict>) {
-        let recorded = node.instance_id.as_deref();
-        let instances = rows
-            .iter()
-            .filter_map(stamped_instance)
-            .chain(recorded)
-            .map(|id| {
-                (
-                    id.to_owned(),
-                    drain_terminated_instance_verdict(id, recorded, node.heartbeat),
-                )
-            })
-            .collect();
-        (drain_terminated_verdict(node.heartbeat), instances)
-    }
-
-    /// A node's verdicts from its heartbeat, Kubernetes and the instance
-    /// authority.
-    async fn instance_and_node_evidence(
-        &mut self,
-        node: &CandidateNode,
-        rows: &[DeadNodeRow],
-        live_uids: Option<&HashSet<String>>,
-        state: &mut TickState,
-    ) -> (Verdict, BTreeMap<String, InstanceVerdict>) {
         // The instances to ask about: every stamp on the rows, and the
         // recorded instance while the heartbeat is stale. A fresh heartbeat
         // comes from the recorded instance, which is live without asking.
@@ -763,20 +699,7 @@ impl<S: DeadNodeSink, K: NodeMembership> Reconciler<S, K> {
                 .as_ref()
                 .and_then(|id| instances.get(id).copied()),
         });
-        (verdict, instances)
-    }
 
-    #[allow(clippy::too_many_arguments)]
-    async fn reconcile_node(
-        &mut self,
-        node: &CandidateNode,
-        rows: Vec<DeadNodeRow>,
-        rows_truncated: bool,
-        verdict: Verdict,
-        instances: BTreeMap<String, InstanceVerdict>,
-        state: &mut TickState,
-        report: &mut TickReport,
-    ) {
         let mut counts: BTreeMap<RowOutcome, u64> = BTreeMap::new();
         let mut applied: BTreeMap<RowOutcome, u64> = BTreeMap::new();
         let mut samples: BTreeMap<RowOutcome, Vec<DeadNodeSample>> = BTreeMap::new();

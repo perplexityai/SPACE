@@ -1,8 +1,8 @@
 use super::{
     ReconcilerRuntimeError, Supervision, TerminatorKind, build_if_enabled,
-    dead_node_authority_kind, supervise_reconcilers,
+    dead_node_replaces_the_gone_node_loops, drain_v2_enabled, supervise_reconcilers,
 };
-use crate::dead_node::AuthorityKind;
+use crate::dead_node::{self, AuthorityKind};
 use std::future::Future;
 use tokio::task::JoinError;
 use tokio_util::sync::CancellationToken;
@@ -129,29 +129,56 @@ fn terminator_kind_rejects_unrecognized_value() {
     ));
 }
 
-/// The dead-node verb asks EC2 only on `aws` or when the test hook forces it;
-/// `kube-delete`, `noop` and a kind that does not parse name no authority, so
-/// an unexpected death there reads unknown. Every terminator kind, the
-/// unrecognized one, and each with and without the hook.
+/// The dead-node verb takes over from the loops it replaces only `live`, and
+/// only with EC2 to judge by: a verb that can only answer unknown leaves them
+/// running.
 #[test]
-fn dead_node_authority_follows_the_terminator_kind() {
-    for (raw, unforced) in [
-        (Some("aws"), AuthorityKind::Ec2),
-        (None, AuthorityKind::Ec2),
-        (Some("kube-delete"), AuthorityKind::None),
-        (Some("noop"), AuthorityKind::None),
-        (Some("kube_delete"), AuthorityKind::None),
+fn the_dead_node_verb_replaces_the_gone_node_loops_only_live_with_ec2() {
+    let mut env = pplx_space_test_env::TestEnv::default();
+    for (mode, authority, replaces) in [
+        (None, AuthorityKind::Ec2, false),
+        (Some("dry-run"), AuthorityKind::Ec2, false),
+        (Some("live"), AuthorityKind::None, false),
+        (Some("live"), AuthorityKind::Ec2, true),
     ] {
-        let terminator = TerminatorKind::parse(raw).ok();
+        match mode {
+            Some(mode) => env.set(dead_node::MODE_ENV, mode),
+            None => env.remove(dead_node::MODE_ENV),
+        }
+        let config = dead_node::ReconcilerConfig::from_environment(&env);
         assert_eq!(
-            dead_node_authority_kind(terminator, false),
-            unforced,
-            "{raw:?}"
+            dead_node_replaces_the_gone_node_loops(config.as_ref(), authority),
+            replaces,
+            "{mode:?} {authority:?}"
         );
-        assert_eq!(
-            dead_node_authority_kind(terminator, true),
-            AuthorityKind::Ec2,
-            "{raw:?} forced"
-        );
+    }
+}
+
+/// The drain's v2 starts only with the dead-node verb replacing the gone-node
+/// loops; off, it starts whatever the verb does.
+#[test]
+fn the_drain_v2_runs_only_with_the_dead_node_verb_live() {
+    let mut env = pplx_space_test_env::TestEnv::default();
+    for (flag, dead_node_live, expected) in [
+        (None, false, Some(false)),
+        (Some("false"), false, Some(false)),
+        (Some("true"), false, None),
+        (Some("true"), true, Some(true)),
+    ] {
+        match flag {
+            Some(flag) => env.set(
+                pplx_space_api::routes::admin::nodes::DRAIN_V2_ENABLED_ENV,
+                flag,
+            ),
+            None => env.remove(pplx_space_api::routes::admin::nodes::DRAIN_V2_ENABLED_ENV),
+        }
+        let got = drain_v2_enabled(&env, dead_node_live);
+        match expected {
+            Some(enabled) => assert_eq!(got.ok(), Some(enabled), "{flag:?} {dead_node_live}"),
+            None => assert!(
+                matches!(got, Err(ReconcilerRuntimeError::DrainV2NeedsDeadNodeLive)),
+                "{flag:?} {dead_node_live}"
+            ),
+        }
     }
 }

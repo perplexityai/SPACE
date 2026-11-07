@@ -634,9 +634,10 @@ async fn candidate_scan_lists_missing_pod_without_node_observation() -> TestResu
 }
 
 /// Where the dead-node verb runs live, a row on a node with a stale heartbeat
-/// or one the verb judged lost is left to it; a row on a fresh node with no
-/// such verdict, or one with only an `unknown` verdict, is still listed.
-/// Without the verb live every row is listed.
+/// is left to it; a row on a fresh node is still listed, whatever verdict a
+/// node with that id once had: a `lost` status left from before a same-IP
+/// replacement registered doesn't hide the replacement's rows. Without the
+/// verb live every row is listed.
 #[tokio::test(flavor = "current_thread")]
 async fn candidate_scan_leaves_dead_node_rows_to_the_live_verb() -> TestResult {
     let Some(db) = try_pg_test_db().await? else {
@@ -647,7 +648,7 @@ async fn candidate_scan_leaves_dead_node_rows_to_the_live_verb() -> TestResult {
     let mut expected_listed = Vec::new();
     for (heartbeat_fresh, verdict, left_out) in [
         (false, None, true),
-        (true, Some("lost"), true),
+        (true, Some("lost"), false),
         (true, None, false),
         (true, Some("unknown"), false),
     ] {

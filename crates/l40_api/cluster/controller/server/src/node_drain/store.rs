@@ -448,7 +448,8 @@ fn set_drain_phase_query(residency: ResidencyEvidence, scope: GuardScope) -> Str
             SET drain_phase = $2,
                 drain_last_error = $3
           WHERE id = $1
-            AND drain_phase = $4{resident_guard}"
+            AND drain_phase = $4
+            AND drain_engine IS NULL{resident_guard}"
     )
 }
 
@@ -2032,6 +2033,19 @@ impl SubstrateSink {
             evacuate_stopped_residents,
             replace_stopped_evacuations,
         }
+    }
+
+    /// The v2 drain loop's sink ([`super::v2::DrainV2Sink`]). It reads none
+    /// of v1's drain configuration, so it carries the defaults.
+    pub fn v2(pool: PgPool, substrate: Arc<KubernetesSubstrate>) -> Self {
+        Self::new(
+            pool,
+            substrate,
+            ResidencyEvidence::default(),
+            false,
+            false,
+            false,
+        )
     }
 
     #[cfg(test)]

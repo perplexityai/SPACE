@@ -105,7 +105,8 @@ async fn one_status_per_node_lives_and_dies_with_the_node() -> TestResult {
     Ok(())
 }
 
-/// The row read stops at its limit, in id order.
+/// The row read stops at its limit, in id order, continues after a cursor,
+/// and leaves out settled terminal rows.
 #[tokio::test(flavor = "current_thread")]
 async fn rows_on_node_stops_at_its_limit_in_id_order() -> TestResult {
     let Some(db) = try_pg_test_db().await? else {
@@ -139,6 +140,7 @@ async fn rows_on_node_stops_at_its_limit_in_id_order() -> TestResult {
             k8s_node_name: None,
             managed_by: SubstrateKind::Kubernetes,
         },
+        None,
         crate::lost::DEAD_UPLOAD_SETTLE,
         2,
     )
@@ -147,6 +149,31 @@ async fn rows_on_node_stops_at_its_limit_in_id_order() -> TestResult {
     .map(|row| row.sandbox_id)
     .collect();
     assert_eq!(read, ids[..2]);
+
+    // The next page starts after the cursor.
+    let node = NodeRef {
+        node_id,
+        k8s_node_name: None,
+        managed_by: SubstrateKind::Kubernetes,
+    };
+    let page = |after: Option<SandboxId>| async move {
+        TestResult::Ok(
+            rows_on_node(pool, node, after, crate::lost::DEAD_UPLOAD_SETTLE, 10)
+                .await?
+                .into_iter()
+                .map(|row| row.sandbox_id)
+                .collect::<Vec<_>>(),
+        )
+    };
+    assert_eq!(page(Some(ids[1])).await?, ids[2..]);
+
+    // A terminal row that only keeps the node as its last place is settled
+    // and not read; one the node still holds active is.
+    let settled = insert_sandbox(pool, "failed", None, Some(node_id)).await?;
+    let held = insert_sandbox(pool, "failed", Some(node_id), Some(node_id)).await?;
+    let read = page(None).await?;
+    assert!(!read.contains(&settled), "{read:?}");
+    assert!(read.contains(&held), "{read:?}");
     Ok(())
 }
 
@@ -313,27 +340,16 @@ async fn each_write_changes_the_row_only_under_its_guard() -> TestResult {
     for (lifecycle, guard, flipped) in [("started", "started", true), ("started", "paused", false)]
     {
         let id = insert_sandbox(pool, lifecycle, Some(node), Some(node)).await?;
-        sqlx::query(sql!(
-            "UPDATE sandboxes SET restore_episode_target = 'started' WHERE id = $1"
-        ))
-        .bind(id)
-        .execute(pool)
-        .await?;
         let mut tx = pool.begin().await?;
         assert_eq!(mark_lost(&mut tx, id, guard).await?, flipped, "{guard}");
         tx.commit().await?;
-        let (stored, episode): (String, Option<String>) = sqlx::query_as(sql!(
-            "SELECT lifecycle, restore_episode_target FROM sandboxes WHERE id = $1"
-        ))
-        .bind(id)
-        .fetch_one(pool)
-        .await?;
-        let expected = if flipped {
-            ("failed".to_owned(), None)
-        } else {
-            (lifecycle.to_owned(), Some("started".to_owned()))
-        };
-        assert_eq!((stored, episode), expected, "{guard}");
+        let stored: String =
+            sqlx::query_scalar(sql!("SELECT lifecycle FROM sandboxes WHERE id = $1"))
+                .bind(id)
+                .fetch_one(pool)
+                .await?;
+        let expected = if flipped { "failed" } else { lifecycle };
+        assert_eq!(stored, expected, "{guard}");
     }
 
     let id = insert_sandbox(pool, "started", Some(node), Some(node)).await?;

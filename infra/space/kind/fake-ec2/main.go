@@ -18,7 +18,7 @@
 // A Node's instance is the ID its AWS providerID names, or, without one, an
 // ID derived from the Node's UID. Its state:
 //
-//   - terminated once TerminateInstances or the test control named it;
+//   - terminated once the Auto Scaling terminate or the test control named it;
 //   - running when its Node's Ready condition is True;
 //   - stopped for any other Node (NotReady, Unknown), and for an instance the
 //     fixture has seen on a Node that is gone and that nobody terminated: the
@@ -27,8 +27,7 @@
 //     aged out of DescribeInstances;
 //   - a Kubernetes API error is an EC2 error (Unavailable, HTTP 503).
 //
-// TerminateInstances and TerminateInstanceInAutoScalingGroup only mark
-// instances terminated: the harness stops the worker's container itself,
+// TerminateInstanceInAutoScalingGroup only marks the instance terminated: the harness stops the worker's container itself,
 // once it sees the termination the controller recorded. The marks and the instances seen
 // live in memory, so a restart of the fixture forgets them.
 //
@@ -323,19 +322,6 @@ type instance struct {
 	PrivateDNSName string        `xml:"privateDnsName"`
 }
 
-type terminateInstancesResponse struct {
-	XMLName   xml.Name           `xml:"TerminateInstancesResponse"`
-	Xmlns     string             `xml:"xmlns,attr"`
-	RequestID string             `xml:"requestId"`
-	Instances []stateChangeEntry `xml:"instancesSet>item"`
-}
-
-type stateChangeEntry struct {
-	InstanceID    string        `xml:"instanceId"`
-	CurrentState  instanceState `xml:"currentState"`
-	PreviousState instanceState `xml:"previousState"`
-}
-
 type reservation struct {
 	ReservationID string     `xml:"reservationId"`
 	Instances     []instance `xml:"instancesSet>item"`
@@ -394,10 +380,8 @@ func (f *fakeEC2) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		default:
 			fail(http.StatusBadRequest, "InvalidParameterValue", "this fake answers only a private-dns-name or instance-id filter")
 		}
-	case "TerminateInstances":
-		f.terminateInstances(w, form, reqID, entry, fail)
 	default:
-		fail(http.StatusBadRequest, "InvalidAction", "this fake answers only DescribeInstances and TerminateInstances")
+		fail(http.StatusBadRequest, "InvalidAction", "this fake answers only DescribeInstances for EC2")
 	}
 }
 
@@ -416,7 +400,7 @@ type terminateInAutoScalingGroupResponse struct {
 
 // serveAutoScaling answers the one Auto Scaling call the fixture takes:
 // TerminateInstanceInAutoScalingGroup for one instance, marked terminated as
-// TerminateInstances marks it.
+// the test control marks it.
 func (f *fakeEC2) serveAutoScaling(w http.ResponseWriter, form url.Values, reqID string, entry []any, fail failFunc) {
 	if form.Get("Version") != asgVersion {
 		fail(http.StatusBadRequest, "InvalidAction", "this fake answers Auto Scaling only at version "+asgVersion)
@@ -567,39 +551,6 @@ func (f *fakeEC2) describeByInstanceID(w http.ResponseWriter, form url.Values, r
 	}
 	f.log.Info("answered", append(entry, "status", http.StatusOK, "instance_ids", strings.Join(ids, ","),
 		"answer", strings.Join(answer, ","), "next_token", resp.NextToken)...)
-	writeXML(w, http.StatusOK, resp)
-}
-
-// terminateInstances marks each named instance terminated. It does not stop
-// the worker behind it; the harness does.
-func (f *fakeEC2) terminateInstances(w http.ResponseWriter, form url.Values, reqID string, entry []any, fail failFunc) {
-	ids, ok := indexedValues(form, "InstanceId.")
-	if !ok || len(ids) == 0 {
-		fail(http.StatusBadRequest, "InvalidParameterValue", "TerminateInstances takes InstanceId.1 onward")
-		return
-	}
-	for param := range form {
-		if param != "Action" && param != "Version" && !strings.HasPrefix(param, "InstanceId.") {
-			fail(http.StatusBadRequest, "InvalidParameterValue", "unsupported parameter "+param)
-			return
-		}
-	}
-	for _, id := range ids {
-		if !instanceIDForm.MatchString(id) {
-			fail(http.StatusBadRequest, "InvalidInstanceID.Malformed", "not an instance ID: "+id)
-			return
-		}
-	}
-	resp := terminateInstancesResponse{Xmlns: ec2NS, RequestID: reqID}
-	for _, id := range ids {
-		before := f.terminate(id)
-		resp.Instances = append(resp.Instances, stateChangeEntry{
-			InstanceID:    id,
-			CurrentState:  instanceState{Code: 32, Name: "shutting-down"},
-			PreviousState: before,
-		})
-	}
-	f.log.Info("terminated", append(entry, "status", http.StatusOK, "instance_ids", strings.Join(ids, ","))...)
 	writeXML(w, http.StatusOK, resp)
 }
 

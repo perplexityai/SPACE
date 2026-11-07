@@ -246,7 +246,7 @@ async fn live_tick_leaves_each_row_in_its_rules_state() -> TestResult {
             heartbeat_fresh: bool,
             census_age_secs: Option<i64>,
         },
-        RestoreEpisode,
+        RestoreLease,
         ExecutionElsewhere,
     }
     let cases: &[(&str, Snapshot, Extra, After)] = &[
@@ -311,7 +311,7 @@ async fn live_tick_leaves_each_row_in_its_rules_state() -> TestResult {
         (
             "restoring",
             Snapshot::Covered,
-            Extra::RestoreEpisode,
+            Extra::RestoreLease,
             After::Untouched,
         ),
         (
@@ -400,9 +400,12 @@ async fn live_tick_leaves_each_row_in_its_rules_state() -> TestResult {
                 }
                 observe(pool, id, reporter).await?;
             }
-            Extra::RestoreEpisode => {
+            Extra::RestoreLease => {
                 sqlx::query(sql!(
-                    "UPDATE sandboxes SET restore_episode_target = 'started' WHERE id = $1"
+                    "UPDATE sandboxes
+                        SET restore_lease_token = gen_random_uuid(),
+                            restore_lease_expires_at = NOW() + INTERVAL '1 minute'
+                      WHERE id = $1"
                 ))
                 .bind(id)
                 .execute(pool)

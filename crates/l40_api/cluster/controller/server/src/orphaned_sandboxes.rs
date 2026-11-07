@@ -1751,16 +1751,12 @@ static LIST_CANDIDATES_AFTER: std::sync::LazyLock<String> = std::sync::LazyLock:
                     )
               )
               -- Where the dead-node verb runs live ($10), a row on a node
-              -- whose heartbeat is stale or which the verb judged lost is
-              -- the verb's to reconcile.
+              -- whose heartbeat is stale is the verb's to reconcile.
               AND NOT ($10 AND EXISTS (
                   SELECT 1
                   FROM nodes dn
                   WHERE (dn.id = s.active_node_id OR dn.id = s.target_node_id)
-                    AND (
-                        NOT {fresh}
-                        OR dn.dead_node_status ->> 'verdict' = 'lost'
-                    )
+                    AND NOT {fresh}
               ))
               AND ($2::uuid IS NULL OR s.id > $2)
               AND s.id <= $3

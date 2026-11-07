@@ -10,7 +10,6 @@ use std::sync::{Arc, Mutex};
 
 use pplx_space_sandbox_store::StoredSandboxLifecycle;
 use pplx_space_sandbox_store::dead_node::SourceExecution;
-use pplx_space_test_env::TestEnv;
 
 use super::verdict::{DeadReason, LostReason, UnknownReason};
 use super::*;
@@ -100,10 +99,17 @@ impl DeadNodeSink for Arc<FakeSink> {
     async fn rows_on_node(
         &self,
         _node: &CandidateNode,
+        after: Option<SandboxId>,
         _upload_settle: Duration,
         limit: u32,
     ) -> Result<Vec<DeadNodeRow>, sqlx::Error> {
-        Ok(self.rows.iter().take(limit as usize).cloned().collect())
+        Ok(self
+            .rows
+            .iter()
+            .filter(|row| after.is_none_or(|after| row.sandbox_id > after))
+            .take(limit as usize)
+            .cloned()
+            .collect())
     }
 
     async fn write_row(
@@ -255,7 +261,7 @@ fn dead_node(uid: &str) -> CandidateNode {
         k8s_node_uid: Some(uid.to_owned()),
         instance_id: Some(DEAD_INSTANCE.to_owned()),
         heartbeat: Heartbeat::Stale,
-        drain_terminated_epoch: None,
+        v2_terminating: false,
     }
 }
 
@@ -287,7 +293,6 @@ fn row(lifecycle: SandboxLifecycle, stamp: Option<Option<&str>>) -> DeadNodeRow 
             active: true,
         }),
         reported_by_live_node: false,
-        restore_owned: false,
     }
 }
 
@@ -339,52 +344,6 @@ const LOST: Verdict = Verdict::Lost(LostReason::InstanceAndNodeGone);
 // -----------------------------------------------------------------
 // Config
 // -----------------------------------------------------------------
-
-/// Off unless set to `dry-run` or `live`, and off has no config: unset,
-/// empty, `off`, a value for a mode that doesn't exist, or a typo. The
-/// windows move only through the test hooks.
-#[test]
-fn mode_is_off_unless_dry_run_or_live_and_windows_move_only_by_test_hook() {
-    let mut env = TestEnv::default();
-    assert!(ReconcilerConfig::from_environment(&env).is_none(), "unset");
-    for raw in ["off", "", "write", "dry_run", "true", "Live", "live-ish"] {
-        env.set(MODE_ENV, raw);
-        assert!(
-            ReconcilerConfig::from_environment(&env).is_none(),
-            "{raw:?}"
-        );
-    }
-    for (raw, mode) in [
-        ("dry-run", Mode::DryRun),
-        (" dry-run ", Mode::DryRun),
-        ("live", Mode::Live),
-        (" live ", Mode::Live),
-    ] {
-        env.set(MODE_ENV, raw);
-        let parsed = ReconcilerConfig::from_environment(&env).expect(raw);
-        assert_eq!(parsed.mode, mode, "{raw:?}");
-        assert_eq!(parsed.is_live(), mode == Mode::Live, "{raw:?}");
-        assert_eq!(parsed.tick, DEFAULT_TICK);
-        assert_eq!(parsed.absence_window, DEFAULT_ABSENCE_GRACE);
-        assert_eq!(parsed.upload_settle, DEAD_UPLOAD_SETTLE);
-        assert_eq!(parsed.max_writes_per_tick, MAX_WRITES_PER_TICK);
-        assert!(!parsed.force_ec2);
-    }
-    env.set("SPACE_DEAD_NODE_TEST_TICK_SECS", "5");
-    env.set("SPACE_DEAD_NODE_TEST_ABSENCE_WINDOW_SECS", "20");
-    env.set("SPACE_DEAD_NODE_TEST_UPLOAD_SETTLE_SECS", "30");
-    env.set("SPACE_DEAD_NODE_TEST_INSTANCE_AUTHORITY", "ec2");
-    let hooked = ReconcilerConfig::from_environment(&env).expect("live");
-    assert_eq!(hooked.tick, Duration::from_secs(5));
-    assert_eq!(hooked.absence_window, Duration::from_secs(20));
-    assert_eq!(hooked.upload_settle, Duration::from_secs(30));
-    assert!(hooked.force_ec2);
-    env.set(MODE_ENV, "off");
-    assert!(
-        ReconcilerConfig::from_environment(&env).is_none(),
-        "hooked, off"
-    );
-}
 
 // -----------------------------------------------------------------
 // Node verdict evidence
@@ -779,7 +738,7 @@ async fn live_mode_writes_what_a_dry_run_only_reports() {
     let mut held = started(Some(DEAD_INSTANCE));
     held.reported_by_live_node = true;
     let mut restoring = row(SandboxLifecycle::Restoring, Some(Some(DEAD_INSTANCE)));
-    restoring.restore_owned = true;
+    restoring.execution_elsewhere = true;
     let lost = started(Some(DEAD_INSTANCE));
     let rows = vec![held, restoring, lost.clone()];
     let mut counts = None;
@@ -798,7 +757,7 @@ async fn live_mode_writes_what_a_dry_run_only_reports() {
         assert_eq!(node.verdict, LOST, "{mode:?}");
         let decided = BTreeMap::from([
             (RowOutcome::HeldByPublication, 1),
-            (RowOutcome::HeldByRestore, 1),
+            (RowOutcome::HeldByExecution, 1),
             (RowOutcome::Lost, 1),
         ]);
         assert_eq!(node.counts, decided, "{mode:?}");
@@ -905,8 +864,10 @@ async fn rows_past_the_cap_are_reported_truncated_and_block_the_delete() {
         ..FakeSink::with_node(dead_node(DEAD_UID))
     });
     let mut reconciler = ec2_reconciler(Mode::Live, &sink, &FakeEc2::dead_instances());
+    // The first tick reads the first page; the second reads the rest.
     reconciler.tick().await;
     tokio::time::advance(WINDOW).await;
+    reconciler.tick().await;
     sink.deletes.lock().unwrap().clear();
     let report = reconciler.tick().await;
     let node = &report.nodes[0];
@@ -954,111 +915,43 @@ async fn nodes_past_the_cap_wait_for_the_next_tick() {
     assert_eq!(reconciler.scan_after, None);
 }
 
-/// A node its v2 drain let go is lost by the drain's record once its
-/// heartbeat is stale, with no EC2 call and no Kubernetes evidence read:
-/// here the reflector still lists its Node and EC2 would call its instance
-/// running. Its rows follow the same rules, by the recorded instance's death
-/// or the node's: a row a drain restore owns stays with it, and a row stamped
-/// with another instance is not asked about. With a fresh heartbeat it waits
-/// and nothing is written.
+/// A node holding more rows than the read cap is worked through across
+/// ticks: each tick reads the rows after the last one the previous tick
+/// read, rather than the same prefix, and the read that reaches the end
+/// starts the next sweep from the beginning.
 #[tokio::test(start_paused = true)]
-async fn a_drain_terminated_node_is_lost_by_the_drains_record_without_asking_ec2() {
-    let node = CandidateNode {
-        drain_terminated_epoch: Some(7),
-        ..dead_node(DEAD_UID)
+async fn rows_past_the_read_cap_are_read_on_the_next_tick() {
+    let mut rows: Vec<DeadNodeRow> = (0..3).map(|_| started(Some(DEAD_INSTANCE))).collect();
+    rows.sort_by_key(|row| row.sandbox_id);
+    let ids: Vec<SandboxId> = rows.iter().map(|row| row.sandbox_id).collect();
+    let sink = Arc::new(FakeSink {
+        rows,
+        ..FakeSink::with_node(dead_node(DEAD_UID))
+    });
+    let mut reconciler = Reconciler::new(
+        ReconcilerConfig {
+            max_rows_per_node: 2,
+            ..config(Mode::DryRun)
+        },
+        sink.clone(),
+        FakeMembership::dead_node_gone(),
+        InstanceAuthority::Ec2(FakeEc2::dead_instances()),
+        SubstrateKind::Kubernetes,
+    );
+    let read = |report: &TickReport| -> Vec<SandboxId> {
+        report.nodes[0]
+            .samples
+            .values()
+            .flatten()
+            .map(|sample| sample.sandbox_id)
+            .collect()
     };
-    let stamped = started(Some(DEAD_INSTANCE));
-    let unstamped = row(SandboxLifecycle::Started, None);
-    let restore_owned = DeadNodeRow {
-        restore_owned: true,
-        ..row(SandboxLifecycle::Suspended, Some(Some(DEAD_INSTANCE)))
-    };
-    let predecessor = started(Some(OLDER_INSTANCE));
-    for (heartbeat, lost) in [(Heartbeat::Stale, true), (Heartbeat::Fresh, false)] {
-        let sink = Arc::new(FakeSink {
-            rows: vec![
-                stamped.clone(),
-                unstamped.clone(),
-                restore_owned.clone(),
-                predecessor.clone(),
-            ],
-            ..FakeSink::with_node(CandidateNode {
-                heartbeat,
-                ..node.clone()
-            })
-        });
-        let membership = FakeMembership::dead_node_gone();
-        membership.set_uids(Some(&[DEAD_UID, REFERENCE_UID]));
-        membership.set_exists(DEAD_NAME, Ok(true));
-        let ec2 = FakeEc2::dead_instances();
-        ec2.list(DEAD_INSTANCE, &["running"]);
-        let mut reconciler = reconciler(
-            Mode::Live,
-            &sink,
-            membership,
-            InstanceAuthority::Ec2(ec2.clone()),
-        );
-        let report = reconciler.tick().await;
-        assert!(ec2.calls().is_empty(), "{heartbeat:?}: asked EC2");
-        let judged = &report.nodes[0];
-        let instances: Vec<(&str, InstanceVerdict)> = judged
-            .instances
-            .iter()
-            .map(|(id, verdict)| (id.as_str(), *verdict))
-            .collect();
-        if lost {
-            assert_eq!(judged.verdict, Verdict::Lost(LostReason::DrainTerminated));
-            assert_eq!(
-                instances,
-                [
-                    (
-                        OLDER_INSTANCE,
-                        InstanceVerdict::Unknown(UnknownReason::InstanceNotAsked)
-                    ),
-                    (
-                        DEAD_INSTANCE,
-                        InstanceVerdict::Dead(DeadReason::DrainTerminated)
-                    ),
-                ]
-            );
-            assert_eq!(
-                sink.writes(),
-                [
-                    RecordedWrite {
-                        sandbox_id: stamped.sandbox_id,
-                        outcome: RowOutcome::Lost,
-                        basis: WriteBasis::InstanceDead,
-                    },
-                    RecordedWrite {
-                        sandbox_id: unstamped.sandbox_id,
-                        outcome: RowOutcome::Lost,
-                        basis: WriteBasis::NodeLost,
-                    },
-                ]
-            );
-            assert_eq!(judged.counts.get(&RowOutcome::HeldByRestore), Some(&1));
-            assert_eq!(judged.counts.get(&RowOutcome::Unselected), Some(&1));
-            assert!(judged.deleted);
-            assert_eq!(*sink.deletes.lock().unwrap(), [node.node_id]);
-        } else {
-            assert_eq!(
-                judged.verdict,
-                Verdict::Unknown(UnknownReason::HeartbeatFresh)
-            );
-            assert_eq!(
-                judged.instances.get(DEAD_INSTANCE),
-                Some(&InstanceVerdict::Live)
-            );
-            assert!(sink.writes().is_empty());
-            assert!(sink.deletes.lock().unwrap().is_empty());
-            assert_eq!(
-                *sink.statuses.lock().unwrap(),
-                [(
-                    "live".to_owned(),
-                    "unknown".to_owned(),
-                    "heartbeat_fresh".to_owned()
-                )]
-            );
-        }
-    }
+    let first = reconciler.tick().await;
+    assert!(first.nodes[0].rows_truncated);
+    assert_eq!(read(&first), ids[..2]);
+    let second = reconciler.tick().await;
+    assert!(!second.nodes[0].rows_truncated);
+    assert_eq!(read(&second), ids[2..]);
+    let third = reconciler.tick().await;
+    assert_eq!(read(&third), ids[..2], "the next sweep starts over");
 }

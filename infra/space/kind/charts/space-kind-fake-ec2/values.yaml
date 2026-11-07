@@ -1,11 +1,13 @@
 # The in-repo fake EC2 endpoint (infra/space/kind/fake-ec2), standing in for
 # the EC2 API a deployment's cluster-controller asks whether an instance is
 # gone: the reconcile-queue GC (Ec2Detector, reconcile_queue_gc/detector.rs)
-# by private-dns-name, and the dead-node verb by instance-id. The controller
-# reaches it through AWS_ENDPOINT_URL_EC2 (charts/space-cluster-controller-local).
-# It answers from the Nodes and their fake AWS providerIDs: Ready is running,
-# not Ready is stopped, absent is no instance, and an instance
-# TerminateInstances or the loopback test control
+# by private-dns-name, and the dead-node verb by instance-id; and the `aws`
+# node-drain terminator's Auto Scaling terminate. The controller reaches it
+# through AWS_ENDPOINT_URL_EC2 and AWS_ENDPOINT_URL_AUTO_SCALING
+# (charts/space-cluster-controller-local). It answers from the Nodes and
+# their fake AWS providerIDs: Ready is running, not Ready is stopped, absent
+# is no instance, and an instance the Auto Scaling terminate or the loopback
+# test control
 # (`kubectl exec ... -- space-kind-fake-ec2 terminate <id>`) named is
 # terminated.
 
