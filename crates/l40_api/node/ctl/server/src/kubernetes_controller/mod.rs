@@ -3,6 +3,7 @@ use pplx_space_common_core::kubernetes::SPACE_K8S_NODE_NAME_ENV;
 use pplx_space_node_mgr_client::NodeResourceStatusReader;
 use tokio_util::sync::CancellationToken;
 
+mod environment_labels;
 mod host_cpu;
 mod network_slots;
 mod node_watch;
@@ -102,6 +103,22 @@ impl Controller {
         }
 
         result
+    }
+
+    pub async fn reconcile_environment_labels(
+        &mut self,
+    ) -> Result<(), environment_labels::EnvironmentLabelsReconcileError> {
+        if self.node_cache.metadata().is_none() {
+            tracing::debug!(node_name = %self.node_name, "Kubernetes Node metadata cache is not ready; skipping environment-label reconcile");
+            return Ok(());
+        }
+
+        environment_labels::reconcile_environment_labels(
+            &self.kube,
+            &self.node_cache,
+            &self.node_name,
+        )
+        .await
     }
 
     pub async fn reconcile_network_slot_capacity(

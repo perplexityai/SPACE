@@ -1030,7 +1030,7 @@ replica runs this build.
 ### Placing work by environment
 
 `SPACE_ENVIRONMENT_PLACEMENT_GATE` (`off`, `shadow` or `on`; `off` by default)
-decides whether Direct placement reads what nodes publish. Work is bound when
+decides whether placement reads what nodes publish. Work is bound when
 its record names an environment in `execution_metadata.environment`. For a
 create or a warm-pool adoption that's the binding of the build each
 candidate holds, from its own inventory row, or the template release's when
@@ -1110,10 +1110,88 @@ catalog edge `A -> B` can stand while a node's build abstained on it because
 it doesn't know `B`, so a caller choosing a node to run that upgrade on has
 to require the node's own certification row for `A` to list `B`.
 
+#### On Kubernetes
+
+kube-scheduler places sandbox pods, so the evidence reaches it as Node
+labels. node-ctl labels its own Node with
+`space.pplx.net/env-<algorithm>-<digest prefix>=usable` (`environment_label_key`:
+`sha256-` and the digest's first 52 hex digits, to fit a label name) for each
+environment in its latest complete
+inventory's `usable_environments`, by server-side apply under its own field
+manager, so a label it stops sending is removed. A complete inventory with no
+valid observation removes them all; an unavailable one changes nothing. A
+chart that fences node-ctl's Node writes has to allow the
+`space.pplx.net/env-` label prefix, as the Kind chart's `nodeFence` does, or
+the fence refuses every apply and no node carries a label.
+
+While the gate evaluates, each bound pod records its environment in the
+`space.pplx.net/environment` annotation: the template build's binding for a
+create, a warm-pool pod or a materialized on-demand pod (its release's, or
+when the release records none, the one every node holding the build that
+names a binding reports, as for a Direct pull-on-create), the source snapshot's for a fork, which
+boots that snapshot's disk artifact, the checkpoint's for a suspended
+sandbox's restore, and, for a stopped sandbox's start, its current disk
+artifact's. A drain's stopped re-placement takes its pinned disk artifact's.
+A disk's record outlives the node it was written on, and the execution the
+sandbox last published stands in only when the disk records none. With the gate `on`, the pod also requires its
+environment's label in every node-affinity term, so a node without it can't
+take the pod, and a pre-bound restore pod is refused by kubelet. With the
+gate `on`, a binding that can't be read or doesn't parse fails the pod build
+before any pod exists, and on the warm pool it stops that config from growing
+until the next tick. In `shadow` it's logged and the pod places as with `off`.
+A restore pinned to its source node skips kube-scheduler, and kubelet's
+refusal there is terminal for a restore whose bytes are on that node, so with
+the gate `on` it's refused before any pod exists, as a conflict, when the Node
+reflector shows the source node not publishing the environment. A node the reflector doesn't
+have keeps the pin, with kubelet as the backstop.
+With the gate `on`, a create adopts a warm pod only from a node that publishes
+the environment of the pod's build: a warm pod built while the gate was off
+carries no requirement, and a node can lose its label under a pod it already
+runs. A refused slot leaves the pool, and the warm pool replaces it with a pod
+that requires the label.
+
+The labels say what node-ctl last observed, not how fresh that is: a node
+whose node-ctl stops reconciling keeps its labels. They also don't drop
+retired environments, which the cluster filters out of
+`usable_environment_refs` only.
+
+On Kubernetes, `on` fails startup for now (see "Not covered"), so what
+follows describes what it does once it's supported. It has no fleet-wide
+fallback and no E0 exemption. If every node lacks the
+labels at once, as on a new cluster or after node-managers roll out an
+observation this node-ctl can't decode, kube-scheduler can place no new bound
+pod, E0 included, and every restore pinned to its source node is refused: by
+the API before its pod exists when the Node reflector has the node, and by
+kubelet otherwise. A pod kubelet refuses fails, and neither census gauge
+counts a failed pod, so the census misses those restores. Pods already
+running keep running and count as `no_evidence` in
+`environment_placement.running_pods`, and the pods held back count as
+`no_evidence` in `environment_placement.pending_pods` (see "Environment
+placement shadow" in [observability.md](observability.md)). Switching the
+gate to `shadow` stops new pods from requiring the label.
+
+#### Not covered
+
+On Kubernetes, `on` fails startup with `SubstrateError::Unsupported` until the
+worker takes the pod's environment as its cache-partition preference. Today a
+Kubernetes create passes no preference, so template-manager boots the digest's
+legacy-partition build when the node holds one, whatever environment the pod's
+affinity required: a node that publishes the required environment can boot
+another environment's build of the same digest. A runtime-upgrade activation's
+pod also requires the recorded environment rather than the upgrade's target.
+`shadow` runs: it records, labels and counts without changing placement.
+
 The gate doesn't yet:
 
-- apply to Kubernetes, whose pods carry no environment affinity. There, `on`
-  fails startup and `shadow` places as `off` and counts nothing;
+- align the build a Kubernetes worker boots with the environment its pod
+  requires (above);
+- gate a Kubernetes pod whose release records no binding while the nodes
+  holding its build report different ones. Direct gates each candidate by its
+  own inventory row, but a pod requires one label, so with no agreed binding
+  it places as unbound work;
+- cover Kubernetes runtime-upgrade pods. The API renders none yet; when it
+  does, such a pod's environment is the upgrade's target, not its
+  checkpoint's producer;
 - read the cluster's execution policy or exclude a node lagging a narrowing
   policy change;
 - admit a restore whose checkpoint loads under another environment through a

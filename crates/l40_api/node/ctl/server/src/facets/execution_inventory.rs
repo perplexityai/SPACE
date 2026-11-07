@@ -17,7 +17,7 @@ use crate::local_manager_request;
 const COLLECTION_BUDGET: Duration = Duration::from_secs(5);
 
 #[derive(Debug)]
-pub(super) enum CollectedExecutionInventory {
+pub(crate) enum CollectedExecutionInventory {
     Complete(NodeExecutionInventory),
     Unavailable,
 }
@@ -48,7 +48,7 @@ enum CollectionError {
     Read(#[from] tonic::Status),
 }
 
-pub(super) async fn collect(node_role: Option<NodeRole>) -> Option<CollectedExecutionInventory> {
+pub(crate) async fn collect(node_role: Option<NodeRole>) -> Option<CollectedExecutionInventory> {
     bounded_collection(node_role, async {
         let mut manager = pplx_space_node_mgr_client::lazy();
         let mut request = local_manager_request(GetExecutionInventoryRequest {}, false);
