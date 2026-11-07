@@ -261,7 +261,10 @@ pod can't be evacuated, so it keeps the node in `draining`. Find it like this:
   `Live Residents`). The sandbox IDs come from
   `GET /admin/api/v1/nodes/{node_id}/holds`, which lists the rows those counts
   count with the reason each holds the node, or from the controller logs
-  below. `GET /admin/api/v1/nodes/{node_id}/sandboxes` lists every row that
+  below. The holds list also carries rows the node's census discounts, with
+  every `terms` field false; compare only the rows whose `counted_by` names a
+  gate.
+  `GET /admin/api/v1/nodes/{node_id}/sandboxes` lists every row that
   names the node, history included, 100 per page.
 - With the pod-less give-up off (the default), the controller logs
   `node_drain: sandbox evacuation (suspend) failed; will retry on next tick`
