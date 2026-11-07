@@ -3,11 +3,11 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use kube::client::{Body as KubeBody, ClientBuilder};
-use pplx_space_common_core::kubernetes::NODE_GROUP_LABEL;
 use pplx_space_common_core::types::{NodeGroupId, NodeId, SubstrateKind};
 use pplx_space_db_test_fixtures::{
     TestDbResult, try_pg_test_db, try_pg_test_db_with_max_connections,
 };
+use pplx_space_sandbox_pod::NODE_GROUP_LABEL;
 use serde_json::{Value, json};
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::{Connection, PgPool};

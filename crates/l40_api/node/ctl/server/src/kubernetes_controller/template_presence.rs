@@ -3,9 +3,7 @@ use std::collections::BTreeMap;
 use k8s_openapi::api::core::v1::Node;
 use kube::api::{Patch, PatchParams};
 use kube::{Api, Client};
-use pplx_space_common_core::kubernetes::{
-    TEMPLATE_PRESENT_LABEL_VALUE, is_template_presence_metadata_key,
-};
+use pplx_space_sandbox_pod::{TEMPLATE_PRESENT_LABEL_VALUE, is_template_presence_metadata_key};
 
 use super::{node_watch, template_manager};
 

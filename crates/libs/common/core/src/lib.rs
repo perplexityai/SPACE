@@ -149,9 +149,5 @@ pub mod spaced {
     pub use pplx_space_guest_process::status::*;
 }
 
-#[cfg(feature = "kubernetes")]
-#[path = "k8s.rs"]
-pub mod kubernetes;
-
 #[cfg(test)]
 mod runtime_contract_tests;

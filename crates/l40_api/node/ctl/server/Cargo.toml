@@ -26,7 +26,7 @@ datadog-otel = ["otel", "datadog"]
 kubernetes = [
     "dep:k8s-openapi",
     "dep:kube",
-    "pplx-space-common-core/kubernetes",
+    "dep:pplx-space-sandbox-pod",
     "dep:pplx-space-kube-client",
 ]
 
@@ -41,6 +41,7 @@ pplx-space-common-grpc = { workspace = true, features = ["internal-tls"] }
 pplx-space-grpc-rate-limiter = { workspace = true }
 pplx-space-grpc-server = { workspace = true }
 pplx-space-kube-client = { workspace = true, optional = true }
+pplx-space-sandbox-pod = { workspace = true, optional = true }
 pplx-space-local-health = { workspace = true }
 pplx-space-observability = { workspace = true }
 pplx-space-service-lifecycle = { workspace = true }

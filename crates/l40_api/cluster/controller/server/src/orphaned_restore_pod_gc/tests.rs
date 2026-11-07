@@ -744,7 +744,7 @@ fn unrecognized_row_is_skipped_even_when_otherwise_superseded() {
 #[test]
 fn from_pod_rejects_non_positive_generation() {
     use k8s_openapi::api::core::v1::Pod;
-    use pplx_space_common_core::kubernetes::{
+    use pplx_space_sandbox_pod::{
         SANDBOX_EXECUTION_GENERATION_ANNOTATION, SANDBOX_ID_ANNOTATION,
         SANDBOX_SUSPEND_RESTORE_STORAGE_URI_ANNOTATION,
     };

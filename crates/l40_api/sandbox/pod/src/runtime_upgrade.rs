@@ -50,14 +50,14 @@ pub const SANDBOX_RUNTIME_UPGRADE_CHECKPOINT_LOCAL_ARTIFACT_ID_ANNOTATION: &str 
 #[derive(Debug, Clone, Copy)]
 pub struct PodRuntimeUpgrade<'a> {
     pub operation_id: uuid::Uuid,
-    pub target_environment: crate::types::EnvironmentReference,
+    pub target_environment: pplx_space_common_core::types::EnvironmentReference,
     pub authorization_id: &'a str,
     pub authorization_reason: &'a str,
     pub memory_loss: bool,
     pub target_state: PodRuntimeUpgradeTargetState,
     /// Required for a suspended source, which the node refuses to upgrade
     /// from any other checkpoint; absent for a stopped one.
-    pub checkpoint_local_artifact_id: Option<crate::types::LocalArtifactId>,
+    pub checkpoint_local_artifact_id: Option<pplx_space_common_core::types::LocalArtifactId>,
 }
 
 /// The lifecycle a pod's runtime upgrade leaves the sandbox in. `Started`

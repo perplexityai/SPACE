@@ -4,7 +4,7 @@ use k8s_openapi::api::core::v1::Node;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 
 use super::*;
-use crate::kubernetes::{
+use crate::{
     DEFAULT_SANDBOX_INTERNAL_CONTROL_TOKEN_KEY, DEFAULT_SANDBOX_INTERNAL_SECRET_NAME,
     DEFAULT_SANDBOX_INTERNAL_TOKEN_KEY, DEFAULT_SANDBOX_NODE_GROUP_PLACEMENT,
     DEFAULT_SANDBOX_NODE_SERVICES_READY_AFFINITY, DEFAULT_SANDBOX_POD_IMAGE,

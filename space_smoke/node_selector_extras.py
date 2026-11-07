@@ -2,7 +2,7 @@
 
 The base selector is the worker discriminator label plus every configured
 extra (`SPACE_SANDBOX_NODE_SELECTOR_LABELS`), composed in
-`crates/libs/common/core/src/k8s/node_selector.rs`. The bench leaves the
+`crates/l40_api/sandbox/pod/src/node_selector.rs`. The bench leaves the
 variable unset, so every other scenario renders a one-entry selector and the
 merge — and the *enforcement* of extras, the part that does any work — had
 unit coverage only. `smoke-kind-node-selector-extras.sh` configured extras for

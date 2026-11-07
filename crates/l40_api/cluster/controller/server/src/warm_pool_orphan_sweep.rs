@@ -67,11 +67,11 @@ use kube::Client;
 use kube::api::{Api, DeleteParams, Preconditions};
 use pplx_space_api::controllers::substrate::kubernetes::{SandboxPodKey, SandboxPodView};
 use pplx_space_cluster_pool::WarmPoolStore;
-use pplx_space_common_core::kubernetes::SANDBOX_POOL_ROLE_WARM;
 use pplx_space_common_core::types::{PodUid, SandboxId};
 use pplx_space_events::{
     SandboxEvent, SandboxEventDetails, SandboxEventSource, SandboxEventTrigger, SandboxEventType,
 };
+use pplx_space_sandbox_pod::SANDBOX_POOL_ROLE_WARM;
 use uuid::Uuid;
 
 use crate::env_config;

@@ -23,18 +23,16 @@ use kube::{
     runtime::{reflector, watcher::Event},
 };
 use pplx_space_api::controllers::substrate::direct::DirectSubstrate;
-use pplx_space_common_core::{
-    kubernetes::{
-        DEFAULT_SANDBOX_INTERNAL_CONTROL_TOKEN_KEY, DEFAULT_SANDBOX_INTERNAL_SECRET_NAME,
-        DEFAULT_SANDBOX_INTERNAL_TOKEN_KEY, DEFAULT_SANDBOX_NODE_SELECTOR_KEY,
-        DEFAULT_SANDBOX_NODE_SELECTOR_VALUE, DEFAULT_SANDBOX_POD_IMAGE,
-        DEFAULT_SANDBOX_RUNTIME_CLASS, SANDBOX_INTERNAL_SECRET_NAME_ENV,
-        SANDBOX_NODE_SELECTOR_LABELS_ENV, SANDBOX_NODE_SELECTOR_VALUE_ENV, SANDBOX_POD_IMAGE_ENV,
-        SANDBOX_POOL_CONFIG_ID_KEY, SANDBOX_POOL_ROLE_KEY,
-    },
-    types::{ContentHash, Digest, MemorySize, TemplateName, VcpuCount},
-};
+use pplx_space_common_core::types::{ContentHash, Digest, MemorySize, TemplateName, VcpuCount};
 use pplx_space_db_test_fixtures::{TestDb, pg_test_db};
+use pplx_space_sandbox_pod::{
+    DEFAULT_SANDBOX_INTERNAL_CONTROL_TOKEN_KEY, DEFAULT_SANDBOX_INTERNAL_SECRET_NAME,
+    DEFAULT_SANDBOX_INTERNAL_TOKEN_KEY, DEFAULT_SANDBOX_NODE_SELECTOR_KEY,
+    DEFAULT_SANDBOX_NODE_SELECTOR_VALUE, DEFAULT_SANDBOX_POD_IMAGE, DEFAULT_SANDBOX_RUNTIME_CLASS,
+    SANDBOX_INTERNAL_SECRET_NAME_ENV, SANDBOX_NODE_SELECTOR_LABELS_ENV,
+    SANDBOX_NODE_SELECTOR_VALUE_ENV, SANDBOX_POD_IMAGE_ENV, SANDBOX_POOL_CONFIG_ID_KEY,
+    SANDBOX_POOL_ROLE_KEY,
+};
 
 use time::OffsetDateTime;
 use tokio::{net::TcpListener, sync::oneshot};

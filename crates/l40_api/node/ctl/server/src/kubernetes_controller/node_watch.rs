@@ -5,7 +5,7 @@ use futures_util::{StreamExt, TryStreamExt};
 use k8s_openapi::api::core::v1::Node;
 use kube::Client;
 use kube::api::{Api, WatchEvent, WatchParams};
-use pplx_space_common_core::kubernetes::SANDBOX_NETWORK_SLOTS_RESOURCE;
+use pplx_space_sandbox_pod::SANDBOX_NETWORK_SLOTS_RESOURCE;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 

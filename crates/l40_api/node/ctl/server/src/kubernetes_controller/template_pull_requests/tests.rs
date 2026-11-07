@@ -1,6 +1,6 @@
 use std::str::FromStr;
 
-use pplx_space_common_core::kubernetes::template_write_annotation_key;
+use pplx_space_sandbox_pod::template_write_annotation_key;
 
 use super::*;
 

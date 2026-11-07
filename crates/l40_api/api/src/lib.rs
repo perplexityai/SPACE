@@ -28,7 +28,8 @@ pub mod middleware;
 pub mod models;
 pub mod native_sandbox_limits;
 // Resolving a node-group candidate set produces a `NodeGroupPlacement`, which
-// lives behind common-core's `kubernetes` feature.
+// lives in `pplx-space-sandbox-pod`, an optional dependency that this crate's
+// `kubernetes` feature enables.
 mod credential_injection;
 mod ingress_activation;
 mod native_file_access;

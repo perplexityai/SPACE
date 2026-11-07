@@ -8,7 +8,12 @@ use std::str::FromStr;
 use k8s_openapi::api::core::v1::{NodeSelectorRequirement, PodCondition, PodSpec, PodStatus};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use pplx_space_cluster_pool::{PoolSlot, PoolSlotState};
-use pplx_space_common_core::kubernetes::{
+use pplx_space_common_core::types::{
+    ContentHash, Digest, MemorySize, NodeGroup, NodeGroupId, NodeGroupName, NodeGroupPolicy,
+    SandboxOwner, TemplateCompatSpec, TemplateName, TemplateVisibility, VcpuCount,
+};
+use pplx_space_policy_authority::PolicyAuthority;
+use pplx_space_sandbox_pod::{
     DEFAULT_SANDBOX_INTERNAL_CONTROL_TOKEN_KEY, DEFAULT_SANDBOX_INTERNAL_SECRET_NAME,
     DEFAULT_SANDBOX_INTERNAL_TOKEN_KEY, DEFAULT_SANDBOX_POD_IMAGE, DEFAULT_SANDBOX_RUNTIME_CLASS,
     PodToleration, SANDBOX_ACTIVATION_ATTEMPT_ID_ANNOTATION, SANDBOX_AUTO_LIFECYCLE_ANNOTATION,
@@ -18,11 +23,6 @@ use pplx_space_common_core::kubernetes::{
     SANDBOX_POOL_ROLE_KEY, SANDBOX_POOL_ROLE_WARM, SANDBOX_POOL_SLOT_ID_KEY,
     SANDBOX_TEMPLATE_ANNOTATION, SANDBOX_VCPU_ANNOTATION, SandboxRuntimePodMetadata,
 };
-use pplx_space_common_core::types::{
-    ContentHash, Digest, MemorySize, NodeGroup, NodeGroupId, NodeGroupName, NodeGroupPolicy,
-    SandboxOwner, TemplateCompatSpec, TemplateName, TemplateVisibility, VcpuCount,
-};
-use pplx_space_policy_authority::PolicyAuthority;
 use time::OffsetDateTime;
 
 use super::*;
@@ -529,7 +529,7 @@ fn evacuation_common<'a>(
 /// so the selector it composes must equal the `nodeSelector` this module
 /// actually renders. Both sides now go through `base_node_selector`, so the
 /// composition itself cannot drift — that half is covered by
-/// `common/core/src/k8s/node_selector/tests.rs`.
+/// `crates/l40_api/sandbox/pod/src/node_selector/tests.rs`.
 ///
 /// This is not therefore tautological. `build_sandbox_pod` seeds its map from
 /// `base_node_selector().into_labels()` and then keeps writing to it, so the
