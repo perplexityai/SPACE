@@ -8,7 +8,7 @@ use pplx_space_common_core::types::AutoLifecyclePolicy;
 use pplx_space_net_common::NetworkPolicyV1;
 pub use pplx_space_policy_authority::PolicyAuthority;
 
-pub const DB_PATH: &str = pplx_space_common_core::host::linux::paths::TEMPLATE_MANAGER_DB;
+pub const DB_PATH: &str = pplx_space_host_layout::paths::TEMPLATE_MANAGER_DB;
 
 pub fn open() -> Result<Connection, pplx_space_sqlite::SqliteError> {
     pplx_space_sqlite::open_rusqlite(

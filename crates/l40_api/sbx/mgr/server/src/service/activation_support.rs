@@ -2,7 +2,6 @@ use super::network_runtime::{network_policy_refresh_error_to_status, refresh_net
 use super::spaced_bridge::cleanup_restored_snapshot_dir_async;
 use super::start_support::ActivationCleanupGuard;
 use super::*;
-use pplx_space_common_core::host::linux::identities::users;
 use pplx_space_common_core::types::{
     ExecutionGeneration, NodeId, NodeRole as SpaceNodeRole, PodUid, RouteGeneration,
     SandboxActivationAttemptId, SandboxQuarantineReasonCode, SpaceApiRouteIdentity,
@@ -11,6 +10,7 @@ use pplx_space_common_core::wake_signals::MISSING_RUNTIME_CONTEXT_MARKER;
 use pplx_space_events::{
     SandboxEventDetails, SandboxEventSource, SandboxEventType, emit_sandbox_event,
 };
+use pplx_space_host_layout::identities::users;
 use pplx_space_k8s_node_id::space_node_id;
 
 const NODE_ID_PATH: &str = "/space/etc/node-id";
@@ -964,7 +964,7 @@ pub(super) fn wake_ready_timeout_secs(
 pub(super) fn spaced_host_socket_path(sandbox_id: &str) -> String {
     format!(
         "{RUN_DIR}/{sandbox_id}/{}",
-        pplx_space_common_core::host::linux::paths::SPACED_HOST_SOCKET_FILE
+        pplx_space_host_layout::paths::SPACED_HOST_SOCKET_FILE
     )
 }
 

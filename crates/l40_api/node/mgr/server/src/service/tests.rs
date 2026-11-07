@@ -50,8 +50,8 @@ pub(super) mod service_tests {
     use crate::service::runtime::{
         AllocateNewLeaseError, registered_firecracker_pid_with_vm_processes,
     };
-    use pplx_space_common_core::host::linux::identities::users;
     use pplx_space_common_core::types::{LinuxPid, SandboxId};
+    use pplx_space_host_layout::identities::users;
     use pplx_space_uds_peer_auth::PeerIdentity;
     use std::str::FromStr;
 
@@ -382,7 +382,7 @@ pub(super) mod service_tests {
                 sandbox_id: id.to_string(),
                 artifact_dir: format!(
                     "{}/{id}/snapshot",
-                    pplx_space_common_core::host::linux::paths::SANDBOX_CACHE_DIR
+                    pplx_space_host_layout::paths::SANDBOX_CACHE_DIR
                 ),
                 source_id: uuid::Uuid::now_v7().to_string(),
             });
@@ -763,7 +763,7 @@ pub(super) mod service_tests {
             ),
             disk_admission: std::sync::Arc::new(
                 crate::disk_admission::DiskAdmission::new(
-                    pplx_space_common_core::host::disk_admission::CacheDiskAdmissionConfig {
+                    pplx_space_node_disk_admission::CacheDiskAdmissionConfig {
                         enabled: false,
                         ..Default::default()
                     },
@@ -2388,17 +2388,17 @@ table inet space {
         let sandbox_uid = 10_042;
         let args = vec![
             "--socket".to_string(),
-            pplx_space_common_core::host::linux::paths::spaced_host_socket(sandbox_id),
+            pplx_space_host_layout::paths::spaced_host_socket(sandbox_id),
             "--sandbox-id".to_string(),
             sandbox_id.to_string(),
             "--vsock-uds".to_string(),
             format!("{JAIL_DIR}/firecracker/{sandbox_id}/root/v.sock"),
             "--host-control-socket".to_string(),
-            pplx_space_common_core::host::linux::paths::SANDBOX_HOST_CONTROL_SOCKET.to_string(),
+            pplx_space_host_layout::paths::SANDBOX_HOST_CONTROL_SOCKET.to_string(),
         ];
 
         let prepared = prepare_sidecar_launch_args(
-            pplx_space_common_core::host::linux::paths::SPACED_HOST_SVC_BIN,
+            pplx_space_host_layout::paths::SPACED_HOST_SVC_BIN,
             sandbox_id,
             &args,
             Some(ExpectedSpacedHostPeer::new(
@@ -2411,7 +2411,7 @@ table inet space {
         assert_eq!(
             require_launch_arg(
                 &prepared,
-                pplx_space_common_core::host::linux::paths::SPACED_HOST_SVC_BIN,
+                pplx_space_host_layout::paths::SPACED_HOST_SVC_BIN,
                 "--firecracker-pid",
             )
             .unwrap(),
@@ -2420,14 +2420,14 @@ table inet space {
         assert_eq!(
             require_launch_arg(
                 &prepared,
-                pplx_space_common_core::host::linux::paths::SPACED_HOST_SVC_BIN,
+                pplx_space_host_layout::paths::SPACED_HOST_SVC_BIN,
                 "--firecracker-uid",
             )
             .unwrap(),
             sandbox_uid.to_string()
         );
         use pplx_space_common_core::types::guest_image::QualifiedGuestAgent;
-        let program = pplx_space_common_core::host::linux::paths::SPACED_HOST_SVC_BIN;
+        let program = pplx_space_host_layout::paths::SPACED_HOST_SVC_BIN;
         require_launch_arg(&prepared, program, "--guest-agent").unwrap_err();
         let mut ch_args = args.clone();
         ch_args[5] = pplx_space_node_runtime_core::control::guest_socket_path(
@@ -2481,7 +2481,7 @@ table inet space {
         let sandbox_id = "sbx-123";
         let args = vec![
             "--socket".to_string(),
-            pplx_space_common_core::host::linux::paths::spaced_host_socket(sandbox_id),
+            pplx_space_host_layout::paths::spaced_host_socket(sandbox_id),
             "--sandbox-id".to_string(),
             sandbox_id.to_string(),
             "--vsock-uds".to_string(),
@@ -2491,11 +2491,11 @@ table inet space {
             "--firecracker-uid".to_string(),
             "10042".to_string(),
             "--host-control-socket".to_string(),
-            pplx_space_common_core::host::linux::paths::SANDBOX_HOST_CONTROL_SOCKET.to_string(),
+            pplx_space_host_layout::paths::SANDBOX_HOST_CONTROL_SOCKET.to_string(),
         ];
 
         let error = prepare_sidecar_launch_args(
-            pplx_space_common_core::host::linux::paths::SPACED_HOST_SVC_BIN,
+            pplx_space_host_layout::paths::SPACED_HOST_SVC_BIN,
             sandbox_id,
             &args,
             Some(ExpectedSpacedHostPeer::new(
@@ -2515,7 +2515,7 @@ table inet space {
         let sandbox_uid = 10_042;
         let args = vec![
             "--socket".to_string(),
-            pplx_space_common_core::host::linux::paths::spaced_host_socket(sandbox_id),
+            pplx_space_host_layout::paths::spaced_host_socket(sandbox_id),
             "--sandbox-id".to_string(),
             sandbox_id.to_string(),
             "--vsock-uds".to_string(),
@@ -2526,11 +2526,11 @@ table inet space {
             "--firecracker-uid".to_string(),
             sandbox_uid.to_string(),
             "--host-control-socket".to_string(),
-            pplx_space_common_core::host::linux::paths::SANDBOX_HOST_CONTROL_SOCKET.to_string(),
+            pplx_space_host_layout::paths::SANDBOX_HOST_CONTROL_SOCKET.to_string(),
         ];
 
         let error = prepare_sidecar_launch_args(
-            pplx_space_common_core::host::linux::paths::SPACED_HOST_SVC_BIN,
+            pplx_space_host_layout::paths::SPACED_HOST_SVC_BIN,
             sandbox_id,
             &args,
             Some(ExpectedSpacedHostPeer::new(
@@ -2584,13 +2584,13 @@ table inet space {
         let sandbox_id = "sbx-123";
         let args = vec![
             "--socket".to_string(),
-            pplx_space_common_core::host::linux::paths::net_gateway_control_socket("sbx-other"),
+            pplx_space_host_layout::paths::net_gateway_control_socket("sbx-other"),
             "--sandbox-id".to_string(),
             sandbox_id.to_string(),
         ];
 
         let err = prepare_sidecar_launch_args(
-            pplx_space_common_core::host::linux::paths::NET_GATEWAY_SVC_BIN,
+            pplx_space_host_layout::paths::NET_GATEWAY_SVC_BIN,
             sandbox_id,
             &args,
             None,

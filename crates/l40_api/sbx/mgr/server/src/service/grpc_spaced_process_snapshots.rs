@@ -29,7 +29,7 @@ const LOG_TARGET: &str = module_path!();
 
 const CURRENT_INSTANCE_DISK_ARTIFACT_PREFIX: &str = "d-stop-";
 const OPERATION_DISK_ARTIFACT_PREFIX: &str =
-    pplx_space_common_core::host::linux::paths::INTERNAL_OPERATION_SNAPSHOT_PREFIX;
+    pplx_space_host_layout::paths::INTERNAL_OPERATION_SNAPSHOT_PREFIX;
 
 /// A snapshot directory users can't list, delete, roll back to, export or
 /// back up: sbx-mgr's own disk artifacts, and GC staging (logically deleted
@@ -954,8 +954,7 @@ async fn list_snapshots_for_sandbox(
         let publications = artifacts
             .list_named_publications(&sandbox_id)
             .map_err(|error| error.into_status())?;
-        let snapshots_dir =
-            pplx_space_common_core::host::linux::paths::sandbox_snapshots_dir(&sandbox_id);
+        let snapshots_dir = pplx_space_host_layout::paths::sandbox_snapshots_dir(&sandbox_id);
         project_snapshot_inventory(
             &sandbox_id,
             &template,
@@ -1197,10 +1196,8 @@ impl SandboxManagerService {
             // Older locally created snapshots may predate the artifact catalog.
             return Ok(None);
         };
-        let expected_path = pplx_space_common_core::host::linux::paths::sandbox_snapshot_dir(
-            sandbox_id,
-            snapshot_name,
-        );
+        let expected_path =
+            pplx_space_host_layout::paths::sandbox_snapshot_dir(sandbox_id, snapshot_name);
         if publication.local_path != expected_path {
             return Err(Status::failed_precondition(
                 "rollback publication path differs",
@@ -1291,10 +1288,8 @@ impl SandboxManagerService {
                  been restored",
             ));
         }
-        let transferred_path = pplx_space_common_core::host::linux::paths::sandbox_snapshot_dir(
-            &sandbox.id,
-            snapshot_name,
-        );
+        let transferred_path =
+            pplx_space_host_layout::paths::sandbox_snapshot_dir(&sandbox.id, snapshot_name);
         // GC owns a catalog lease, not the per-sandbox artifact lock. Checkout
         // before any destructive RPC, and retain it through the last file read.
         let snapshot_lease = self.checkout_rollback_snapshot(&sandbox.id, snapshot_name)?;

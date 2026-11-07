@@ -3,7 +3,7 @@
 // Delegates to sbx-manager for sandbox lifecycle (Create/Start/Stop/Delete),
 // which in turn delegates privileged operations to node-manager.
 
-pub(crate) const TEMPLATE_DIR: &str = pplx_space_common_core::host::linux::paths::TEMPLATE_DIR;
+pub(crate) const TEMPLATE_DIR: &str = pplx_space_host_layout::paths::TEMPLATE_DIR;
 
 /// Fixed guest IP — same for every sandbox, isolation via namespace NAT.
 pub(crate) const GUEST_IP: std::net::Ipv4Addr = pplx_space_net_common::guest_link::GUEST;

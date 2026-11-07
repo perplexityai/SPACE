@@ -1,83 +1,52 @@
-//! SPACE Linux node host contracts.
+//! SPACE's node layout as data: the node's well-known paths and sockets
+//! ([`paths`]), its users and groups ([`identities`]), the slot-derived
+//! sandbox and gateway uids ([`gateway`]) and the sandbox process limits. It
+//! does no I/O; the Linux mechanisms that act on it live in
+//! `pplx-space-host-linux`.
 
 pub mod gateway;
 
-/// Signal the process pinned by a pidfd, including Linux real-time signals.
-/// The kernel rejects descriptors that are not pidfds. The protocol accepts
-/// numeric signals beyond nix's named variants; rustix also requires an unsafe
-/// constructor for these values, with additional libc-reserved-signal constraints.
-#[cfg(target_os = "linux")]
-pub fn signal_pidfd(
-    pidfd: impl std::os::fd::AsFd,
-    signal: crate::types::ProcessSignal,
-) -> std::io::Result<()> {
-    use std::os::fd::AsRawFd;
-    // SAFETY: the descriptor stays borrowed, ProcessSignal validates the
-    // signal number, and a null siginfo is permitted with flags = 0.
-    let result = unsafe {
-        libc::syscall(
-            libc::SYS_pidfd_send_signal,
-            pidfd.as_fd().as_raw_fd(),
-            signal.as_i32(),
-            std::ptr::null::<libc::siginfo_t>(),
-            0u32,
-        )
-    };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
-}
-
 /// File-descriptor limit applied to Firecracker and sandbox sidecar processes.
 pub const SANDBOX_PROCESS_NOFILE_LIMIT: u64 = 4096;
-
-/// Mark the calling process as the host OOM killer's first choice by setting
-/// its `oom_score_adj` to the maximum, 1000. Firecracker and sandbox sidecars
-/// run with this score so host memory pressure kills sandboxes before node
-/// services. Raising the score needs no privilege.
-///
-/// Async-signal-safe: it calls only `open`, `write` and `close` on a static
-/// path and buffer, so it may run in a `pre_exec` hook.
-#[cfg(target_os = "linux")]
-pub fn prefer_for_oom_kill() -> std::io::Result<()> {
-    const SCORE: &[u8] = b"1000";
-    // SAFETY: the path is a static NUL-terminated string.
-    let fd = unsafe {
-        libc::open(
-            c"/proc/self/oom_score_adj".as_ptr(),
-            libc::O_WRONLY | libc::O_CLOEXEC,
-        )
-    };
-    if fd < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    // SAFETY: `fd` is open and the buffer is a static slice.
-    let written = unsafe { libc::write(fd, SCORE.as_ptr().cast(), SCORE.len()) };
-    let result = match usize::try_from(written) {
-        Ok(len) if len == SCORE.len() => Ok(()),
-        Ok(_) => Err(std::io::ErrorKind::WriteZero.into()),
-        Err(_) => Err(std::io::Error::last_os_error()),
-    };
-    // SAFETY: `fd` is open and owned here; nothing uses it after close.
-    unsafe { libc::close(fd) };
-    result
-}
 
 /// SPACE node Linux filesystem paths.
 pub mod paths {
     use std::path::{Path, PathBuf};
 
-    #[cfg(unix)]
-    use std::os::unix::fs::PermissionsExt;
+    /// Default root for runtime state on a node.
+    pub const SPACE_RUN_DIR: &str = "/space/run";
+    /// Prefix used when validating paths that must live below `/space/run`.
+    pub const SPACE_RUN_PREFIX: &str = "/space/run/";
+    /// Default root for cached node artifacts.
+    pub const SPACE_CACHE_DIR: &str = "/space/cache";
+    /// Firecracker runtime state root.
+    pub const FIRECRACKER_RUN_DIR: &str = "/space/run/firecracker";
+    /// Firecracker cache root.
+    pub const FIRECRACKER_CACHE_DIR: &str = "/space/cache/firecracker";
+    /// Prefix used when validating paths that must live below the Firecracker cache.
+    pub const FIRECRACKER_CACHE_PREFIX: &str = "/space/cache/firecracker/";
+    /// Per-sandbox Firecracker runtime directory root.
+    pub const SANDBOX_RUN_DIR: &str = "/space/run/firecracker/sandboxes";
+    /// Per-sandbox Firecracker cache directory root.
+    pub const SANDBOX_CACHE_DIR: &str = "/space/cache/firecracker/sandboxes";
+    /// Reserved staging directory for cross-sandbox durable artifact copies.
+    pub const FORK_COPY_STAGING_DIR_NAME: &str = ".fork-copies";
+    /// Firecracker jail directory root.
+    pub const FIRECRACKER_JAIL_DIR: &str = "/space/cache/firecracker/jails";
+    /// Firecracker's log file, in its jail root.
+    pub const FIRECRACKER_LOG_FILE: &str = "fc.log";
+    /// The FIFO Firecracker writes its metrics flushes to, in its jail root.
+    pub const FIRECRACKER_METRICS_FIFO: &str = "fc-metrics.fifo";
 
-    pub use crate::types::node_fs::{
-        FIRECRACKER_CACHE_DIR, FIRECRACKER_CACHE_PREFIX, FIRECRACKER_JAIL_DIR,
-        FIRECRACKER_LOG_FILE, FIRECRACKER_METRICS_FIFO, FIRECRACKER_RUN_DIR,
-        FORK_COPY_STAGING_DIR_NAME, SANDBOX_CACHE_DIR, SANDBOX_RUN_DIR, SPACE_CACHE_DIR,
-        SPACE_RUN_DIR, SPACE_RUN_PREFIX, TEMPLATE_DIR, jail_root,
-    };
+    /// A sandbox's jail root, the chroot the jailer builds under
+    /// [`FIRECRACKER_JAIL_DIR`] as `<chroot base>/<exec file name>/<id>/root`.
+    pub fn jail_root(sandbox_id: &str) -> PathBuf {
+        PathBuf::from(format!(
+            "{FIRECRACKER_JAIL_DIR}/firecracker/{sandbox_id}/root"
+        ))
+    }
+    /// Template artifact directory root.
+    pub const TEMPLATE_DIR: &str = "/space/cache/firecracker/templates";
 
     /// Directory that contains SPACE binaries on a node.
     pub const SPACE_BIN_DIR: &str = "/space/bin";
@@ -222,26 +191,21 @@ pub mod paths {
     pub const SPACED_HOST_SOCKET_DIR: &str = SPACE_RUN_DIR;
     pub const SPACED_HOST_SOCKET_FILE: &str = "spaced-host.sock";
 
-    /// Returns the default host-side UDS path for a socket file.
+    /// Returns the host-side UDS path for a socket file in `socket_dir`:
+    /// [`SPACED_HOST_SOCKET_DIR`] on a Linux node, or a directory the caller
+    /// picks elsewhere.
     ///
     /// # Examples
     ///
     /// ```rust
-    /// # use pplx_space_common_core::host::linux::paths::default_host_uds_path;
-    /// assert!(default_host_uds_path("spaced-host.sock").ends_with("spaced-host.sock"));
+    /// # use pplx_space_host_layout::paths::{SPACED_HOST_SOCKET_DIR, host_uds_path};
+    /// assert_eq!(
+    ///     host_uds_path(SPACED_HOST_SOCKET_DIR, "spaced-host.sock"),
+    ///     std::path::Path::new("/space/run/spaced-host.sock"),
+    /// );
     /// ```
-    pub fn default_host_uds_path(socket_file: &str) -> PathBuf {
-        default_uds_path(SPACED_HOST_SOCKET_DIR, socket_file)
-    }
-
-    /// Returns a platform-appropriate default UDS path.
-    pub fn default_uds_path(linux_socket_dir: &str, socket_file: &str) -> PathBuf {
-        if cfg!(target_os = "linux") {
-            PathBuf::from(linux_socket_dir)
-        } else {
-            std::env::temp_dir()
-        }
-        .join(socket_file)
+    pub fn host_uds_path(socket_dir: impl AsRef<Path>, socket_file: &str) -> PathBuf {
+        socket_dir.as_ref().join(socket_file)
     }
 
     /// Normalizes a sandbox id to the canonical on-disk form.
@@ -377,133 +341,6 @@ pub mod paths {
     /// the existing control path as an alias for compatibility with clients.
     pub fn isolated_net_gateway_control_socket(sandbox_id: &str) -> String {
         format!("{}/control.sock", isolated_net_gateway_run_dir(sandbox_id))
-    }
-
-    /// Returns the build artifact directory for a template build.
-    pub fn template_build_dir(
-        template: &str,
-        content_hash: &str,
-        partition: crate::types::TemplateCachePartition,
-    ) -> String {
-        let build = partition.build_dir_name(content_hash);
-        format!("{TEMPLATE_DIR}/{template}/{build}")
-    }
-
-    /// Returns the snapshot directory for a template build and compute shape.
-    pub fn template_snapshot_dir(
-        template: &str,
-        content_hash: &str,
-        partition: crate::types::TemplateCachePartition,
-        vcpu: u32,
-        memory_mib: u32,
-    ) -> String {
-        let build = partition.build_dir_name(content_hash);
-        format!("{TEMPLATE_DIR}/{template}/snapshots/{build}/{vcpu}vcpu-{memory_mib}mib")
-    }
-
-    /// Cache partitions holding a build dir for a template digest under
-    /// `template_root`, legacy first; none when the template dir doesn't
-    /// exist. A dir's presence says nothing about whether its build is
-    /// verified; only template-manager's catalog does. Any other read error
-    /// is returned rather than read as no dirs, since callers act on a
-    /// partition's absence: a delete would report success over it.
-    pub fn cached_template_partitions_in(
-        template_root: &std::path::Path,
-        template: &str,
-        content_hash: &str,
-    ) -> std::io::Result<Vec<crate::types::TemplateCachePartition>> {
-        let entries = match std::fs::read_dir(template_root.join(template)) {
-            Ok(entries) => entries,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(error) => return Err(error),
-        };
-        let mut partitions = Vec::new();
-        for entry in entries {
-            let name = entry?.file_name();
-            let Some(name) = name.to_str() else {
-                continue;
-            };
-            if let Some((hash, partition)) =
-                crate::types::TemplateCachePartition::parse_build_dir_name(name)
-                && hash == content_hash
-            {
-                partitions.push(partition);
-            }
-        }
-        partitions.sort();
-        Ok(partitions)
-    }
-
-    /// Applies the shared SPACE template cache rwx bits to one path.
-    ///
-    /// Runtime services run with `RestrictSUIDSGID=true`, so they only manage
-    /// normal rwx bits. Cache parent setgid bits come from provisioning, and
-    /// on a freshly created child the kernel propagates that setgid bit from
-    /// the parent inode (so the child also inherits the parent's group). We
-    /// must preserve those inherited special bits when rewriting the rwx
-    /// triplet — clobbering them strips the setgid from new staging dirs,
-    /// which in turn breaks group inheritance for any file copied in
-    /// afterward (the file gets the creator's primary group instead of
-    /// `space-cache-rw`, leaving the sibling sandbox-manager service
-    /// unable to read it).
-    #[cfg(unix)]
-    pub fn set_template_cache_permissions(
-        path: impl AsRef<Path>,
-        mode: u32,
-    ) -> std::io::Result<()> {
-        let path = path.as_ref();
-        let metadata = std::fs::symlink_metadata(path)?;
-        let current_mode = metadata.permissions().mode() & 0o7777;
-        let desired_rwx = mode & 0o777;
-        if current_mode & 0o777 == desired_rwx {
-            return Ok(());
-        }
-
-        // Splice the new rwx triplet into the existing mode without touching
-        // setuid/setgid/sticky bits.
-        let desired_mode = (current_mode & !0o777) | desired_rwx;
-        let mut permissions = metadata.permissions();
-        permissions.set_mode(desired_mode);
-        match std::fs::set_permissions(path, permissions) {
-            Ok(()) => Ok(()),
-            // Template artifacts can be owned by either space-tmplmgr or space-sbxmgr.
-            // If the sibling service already left a safe superset of the requested mode,
-            // do not fail just because this service is not the inode owner.
-            Err(error)
-                if error.kind() == std::io::ErrorKind::PermissionDenied
-                    && current_mode & desired_rwx == desired_rwx =>
-            {
-                Ok(())
-            }
-            Err(error) => Err(error),
-        }
-    }
-
-    /// Normalizes template cache directory/file rwx bits.
-    ///
-    /// Runtime services leave special bits such as setgid to provisioning or
-    /// root-owned producers.
-    #[cfg(unix)]
-    pub fn normalize_template_cache_tree(path: impl AsRef<Path>) -> std::io::Result<()> {
-        let path = path.as_ref();
-        let metadata = std::fs::symlink_metadata(path)?;
-
-        if metadata.is_dir() {
-            set_template_cache_permissions(path, TEMPLATE_CACHE_DIR_MODE)?;
-            for entry in std::fs::read_dir(path)? {
-                let entry = entry?;
-                let file_type = entry.file_type()?;
-                if file_type.is_dir() {
-                    normalize_template_cache_tree(entry.path())?;
-                } else if file_type.is_file() {
-                    set_template_cache_permissions(entry.path(), TEMPLATE_CACHE_FILE_MODE)?;
-                }
-            }
-        } else if metadata.is_file() {
-            set_template_cache_permissions(path, TEMPLATE_CACHE_FILE_MODE)?;
-        }
-
-        Ok(())
     }
 }
 

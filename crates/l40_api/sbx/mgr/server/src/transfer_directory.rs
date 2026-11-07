@@ -5,7 +5,7 @@ use std::path::{Component, Path};
 use nix::fcntl::{OFlag, open, openat};
 use nix::sys::stat::{Mode, mkdirat};
 use nix::unistd::{Gid, fchown, geteuid};
-use pplx_space_common_core::host::linux::{identities::groups, paths};
+use pplx_space_host_layout::{identities::groups, paths};
 
 /// Sandbox-manager creates the destination; volume-manager writes the pull.
 /// Establish shared access even when the cache does not inherit its group.

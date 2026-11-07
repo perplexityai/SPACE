@@ -197,7 +197,7 @@ fn source_status(error: SourceError) -> Status {
         | SourceError::Metadata { source, .. } => Some(source),
         _ => None,
     };
-    if io.is_some_and(pplx_space_common_core::host::path_errors::host_path_io_error_is_transient) {
+    if io.is_some_and(pplx_space_host_linux::path_errors::host_path_io_error_is_transient) {
         Status::internal(error.to_string())
     } else {
         Status::failed_precondition(error.to_string())

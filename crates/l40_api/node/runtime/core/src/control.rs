@@ -179,11 +179,9 @@ pub fn socket_path(
 /// implementations need not expose a chroot or a Unix guest transport.
 pub fn isolation_root(runtime: RuntimeKind, sandbox_id: &str) -> Result<PathBuf, ControlError> {
     match runtime {
-        RuntimeKind::Firecracker => Ok(pplx_space_common_core::types::node_fs::jail_root(
-            sandbox_id,
-        )),
+        RuntimeKind::Firecracker => Ok(pplx_space_host_layout::paths::jail_root(sandbox_id)),
         RuntimeKind::CloudHypervisor => Ok(std::path::Path::new(
-            pplx_space_common_core::host::linux::paths::FIRECRACKER_JAIL_DIR,
+            pplx_space_host_layout::paths::FIRECRACKER_JAIL_DIR,
         )
         .join(runtime.as_str())
         .join(sandbox_id)

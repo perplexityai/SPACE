@@ -1,8 +1,8 @@
 use super::*;
 use crate::node_state_sync::tests::RecordingNodeStatusDirtySink;
 use crate::service::tests::service_tests::{root_request, service_for_unit_tests};
-use pplx_space_common_core::host::linux::identities::users;
 use pplx_space_common_core::types::Arch;
+use pplx_space_host_layout::identities::users;
 use pplx_space_node_runtime_core::catalog::CompiledEnvironment;
 use pplx_space_node_runtime_core::runtime_inventory::ExecutionSelectionMode;
 use pplx_space_uds_peer_auth::PeerIdentity;

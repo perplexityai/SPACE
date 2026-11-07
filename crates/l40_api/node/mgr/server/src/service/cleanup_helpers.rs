@@ -1,5 +1,5 @@
 use super::*;
-use pplx_space_common_core::host::linux::paths;
+use pplx_space_host_layout::paths;
 use std::path::{Path, PathBuf};
 
 pub(super) fn validate_sandbox_uid(
@@ -386,7 +386,7 @@ impl CleanupCommandRunner for SystemCleanupCommandRunner {
             prune_snapshots,
             uid,
             0,
-            pplx_space_common_core::host::linux::identities::gids::SPACE_CACHE_RW,
+            pplx_space_host_layout::identities::gids::SPACE_CACHE_RW,
         )
         .map_err(|source| CleanupCommandError::Execution {
             program: "cache ownership rewrite".into(),

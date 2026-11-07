@@ -13,7 +13,7 @@ fn owned_walk_prunes_snapshots_and_never_mutates_link_targets() {
     let old_uid = 100_042;
     assert_owned_walk(OwnedWalk {
         old_uid,
-        cache_gid: pplx_space_common_core::host::linux::identities::gids::SPACE_CACHE_RW,
+        cache_gid: pplx_space_host_layout::identities::gids::SPACE_CACHE_RW,
         // Keep the bundle's owner distinct from the retired UID so
         // verification must descend to find that UID, rather than return at
         // the boundary.

@@ -829,7 +829,7 @@ impl TemplateManagerService {
             build_artifacts_dir(&self.artifact_store.root, name, content_hash, partition);
         let is_subvol = tokio::task::spawn_blocking({
             let build_dir = build_dir.clone();
-            move || pplx_space_common_core::host::btrfs::is_subvolume(&build_dir)
+            move || pplx_space_btrfs::is_subvolume(&build_dir)
         })
         .await
         .map_err(|e| {
@@ -990,12 +990,7 @@ pub(super) fn cached_partition_dirs(
     content_hash: &str,
 ) -> Result<Vec<crate::db::TemplateCachePartition>, Status> {
     let list = |dir: &Path, template: &str| {
-        pplx_space_common_core::host::linux::paths::cached_template_partitions_in(
-            dir,
-            template,
-            content_hash,
-        )
-        .map_err(|error| {
+        cached_template_partitions_in(dir, template, content_hash).map_err(|error| {
             Status::unavailable(format!(
                 "list cached builds of {name}@{content_hash} under {}: {error}",
                 dir.join(template).display()
@@ -1006,6 +1001,39 @@ pub(super) fn cached_partition_dirs(
     // Base-snapshot dirs under `{name}/snapshots/` carry the same build dir
     // names.
     partitions.extend(list(&template_artifacts_dir(root, name), "snapshots")?);
+    Ok(partitions)
+}
+
+/// Cache partitions holding a build dir for a template digest under
+/// `template_root`, legacy first; none when the template dir doesn't
+/// exist. A dir's presence says nothing about whether its build is
+/// verified; only template-manager's catalog does. Any other read error
+/// is returned rather than read as no dirs, since callers act on a
+/// partition's absence: a delete would report success over it.
+fn cached_template_partitions_in(
+    template_root: &std::path::Path,
+    template: &str,
+    content_hash: &str,
+) -> std::io::Result<Vec<pplx_space_common_core::types::TemplateCachePartition>> {
+    let entries = match std::fs::read_dir(template_root.join(template)) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+    let mut partitions = Vec::new();
+    for entry in entries {
+        let name = entry?.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if let Some((hash, partition)) =
+            pplx_space_common_core::types::TemplateCachePartition::parse_build_dir_name(name)
+            && hash == content_hash
+        {
+            partitions.push(partition);
+        }
+    }
+    partitions.sort();
     Ok(partitions)
 }
 
@@ -1043,3 +1071,6 @@ pub(super) fn cached_builds_to_delete(
     }
     Ok(builds)
 }
+
+#[cfg(test)]
+mod tests;

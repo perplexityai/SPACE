@@ -7,7 +7,7 @@
 //! guest socket while its gRPC transport is counted in the control budget.
 
 pub const PROCESS_NOFILE_LIMIT: usize =
-    pplx_space_common_core::host::linux::SANDBOX_PROCESS_NOFILE_LIMIT as usize;
+    pplx_space_host_layout::SANDBOX_PROCESS_NOFILE_LIMIT as usize;
 pub const MAX_ACTIVE_TCP_CONNECTIONS: usize = 1744;
 /// Each active flow owns an upstream socket and a response task with a 64 KiB
 /// receive buffer. At 128 flows those buffers use 8 MiB and worst-case distinct

@@ -53,7 +53,7 @@ fn enter_private_root(root: &std::path::Path) {
 
 #[cfg(target_os = "linux")]
 async fn connect_through_the_fixed_paths() {
-    use pplx_space_common_core::host::linux::paths;
+    use pplx_space_host_layout::paths;
     use std::path::Path;
     use std::time::Duration;
     use tokio::net::UnixListener;

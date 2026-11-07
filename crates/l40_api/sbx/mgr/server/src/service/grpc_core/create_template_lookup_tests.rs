@@ -7,7 +7,7 @@ use super::*;
 use crate::node_manager_transport::fake::FakeNodeManager;
 use crate::template_resolver::TemplateLookupError;
 use crate::template_resolver::fake::{FakeTemplateResolver, LookupChannel};
-use pplx_space_common_core::host::linux::identities::users;
+use pplx_space_host_layout::identities::users;
 use pplx_space_net_common::proto::PolicyAuthority;
 use pplx_space_template_mgr_client::lookup_scope::TemplateLookupScope;
 use pplx_space_template_mgr_client::proto::{GetTemplateRequest, TemplateRef};

@@ -4,7 +4,6 @@ use pplx_space_common_core::types::SnapshotId;
 
 use std::fmt;
 
-use pplx_space_common_core::host::linux::identities::users;
 use pplx_space_common_core::{
     types::ContentHash, types::OrgId, types::SandboxId, types::SnapshotArtifact, types::SubjectId,
     types::TemplateArtifact, types::TemplateName, types::snapshot_shard,
@@ -14,6 +13,7 @@ use pplx_space_credmgr_client::{
     STORAGE_READ_SCOPE, STORAGE_SESSION_TTL_SECONDS, STORAGE_TOKEN_AUDIENCE, STORAGE_WRITE_SCOPE,
     SUBJECT_ID_TOKEN_TYPE, TOKEN_EXCHANGE_GRANT_TYPE,
 };
+use pplx_space_host_layout::identities::users;
 
 use crate::auth::{ClientService, ResolvedCaller};
 use crate::proto::ExchangeTokenRequest;

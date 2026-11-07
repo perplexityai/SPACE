@@ -248,7 +248,7 @@ impl TemplateManagerService {
                 entries
                     .flatten()
                     .map(|entry| entry.path())
-                    .filter(|path| pplx_space_common_core::host::btrfs::is_subvolume(path))
+                    .filter(|path| pplx_space_btrfs::is_subvolume(path))
                     .collect()
             }
         })

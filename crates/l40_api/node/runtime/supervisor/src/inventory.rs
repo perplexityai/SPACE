@@ -5,8 +5,8 @@
 use std::fs;
 use std::os::unix::fs as unix_fs;
 
-use pplx_space_common_core::host::linux::paths::SANDBOX_RUN_DIR;
 use pplx_space_common_core::types::SandboxId;
+use pplx_space_host_layout::paths::SANDBOX_RUN_DIR;
 use pplx_space_node_runtime_core::cgroup;
 use pplx_space_node_runtime_core::launch;
 use tonic::Status;

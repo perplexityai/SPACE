@@ -37,10 +37,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::metrics::sandbox::worker::{SandboxHealthEvidenceOutcome, SandboxRawVsockCheckOutcome};
-use pplx_space_common_core::host::linux::paths;
 use pplx_space_events::{
     SandboxEventDetails, SandboxEventSource, SandboxEventType, emit_sandbox_event,
 };
+use pplx_space_host_layout::paths;
 use pplx_space_spaced_common::ExpectedUdsPeer;
 use tokio::sync::{Mutex, Semaphore};
 use tokio_util::sync::CancellationToken;

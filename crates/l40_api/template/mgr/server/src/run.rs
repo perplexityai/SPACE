@@ -10,7 +10,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use pplx_space_common_core::host::linux::identities::group_names;
+use pplx_space_host_layout::identities::group_names;
 use pplx_space_local_health::LocalHealthServer;
 use pplx_space_service_lifecycle::DEFAULT_DRAIN_TIMEOUT;
 use pplx_space_service_mutex::{AcquireOutcome, ServiceMutex};
@@ -156,7 +156,7 @@ async fn run_service(
     let backing_policy = crate::rootfs_backing::RootfsBackingPolicy::from_env()
         .map_err(RunTemplateMgrError::RootfsBacking)?;
     if backing_policy == crate::rootfs_backing::RootfsBackingPolicy::NoCow {
-        let root = std::path::Path::new(pplx_space_common_core::host::linux::paths::TEMPLATE_DIR);
+        let root = std::path::Path::new(pplx_space_host_layout::paths::TEMPLATE_DIR);
         tokio::fs::create_dir_all(root)
             .await
             .map_err(RunTemplateMgrError::RootfsBackingFilesystem)?;

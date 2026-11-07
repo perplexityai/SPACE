@@ -37,9 +37,7 @@ const LEAF_COMMON_NAME: &str = "SPACE Gateway";
 fn launch_capability(
     env: &dyn pplx_space_env_vars::Environment,
 ) -> Result<zeroize::Zeroizing<Vec<u8>>, Status> {
-    parse_launch_capability(
-        env.var(pplx_space_common_core::host::linux::gateway::LAUNCH_CAPABILITY_ENV),
-    )
+    parse_launch_capability(env.var(pplx_space_host_layout::gateway::LAUNCH_CAPABILITY_ENV))
 }
 
 fn parse_launch_capability(

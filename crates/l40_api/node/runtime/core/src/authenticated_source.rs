@@ -54,7 +54,7 @@ impl AuthenticationError {
         match self {
             Self::Directory(error) => error.is_transient(),
             Self::Verity(VerityError::Io { source, .. }) | Self::Io { source, .. } => {
-                pplx_space_common_core::host::path_errors::host_path_io_error_is_transient(source)
+                pplx_space_host_linux::path_errors::host_path_io_error_is_transient(source)
             }
             _ => false,
         }

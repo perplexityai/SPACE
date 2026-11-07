@@ -826,7 +826,7 @@ fn uuid_v7_epoch_secs(id: Uuid) -> Option<u64> {
 pub(crate) fn sandbox_cache_dir(sandbox_id: &str) -> String {
     format!(
         "{}/{sandbox_id}",
-        pplx_space_common_core::host::linux::paths::SANDBOX_CACHE_DIR
+        pplx_space_host_layout::paths::SANDBOX_CACHE_DIR
     )
 }
 

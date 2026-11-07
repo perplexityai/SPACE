@@ -60,7 +60,7 @@ PROFILES = ("build", "alloc-free", "file-heavy", "idle")
 MIB = 1024 * 1024
 DISK_RE = re.compile(r"^(nvme\d+n\d+|sd[a-z]+|xvd[a-z]+|vd[a-z]+)$")
 
-# Host paths owned by the SPACE node layout (see crates/libs/common/core/src/types/node_fs.rs).
+# Host paths owned by the SPACE node layout (see crates/l20_domain/host/layout/src/lib.rs).
 DEFAULT_SANDBOX_CACHE_DIR = "/space/cache/firecracker/sandboxes"
 DEFAULT_SANDBOX_RUN_DIR = "/space/run/firecracker/sandboxes"
 DEFAULT_JAIL_DIR = "/space/cache/firecracker/jails"

@@ -57,6 +57,7 @@ pplx-space-api-route = { workspace = true }
 pplx-space-connection-admission = { workspace = true }
 pplx-space-common-core = { workspace = true }
 pplx-space-env-vars = { workspace = true }
+pplx-space-host-layout = { workspace = true }
 pplx-space-events = { workspace = true }
 pplx-space-grpc-rate-limiter = { workspace = true }
 pplx-space-grpc-server = { workspace = true }

@@ -130,8 +130,7 @@ pub(super) fn validate_create_snapshot_dest(
 }
 
 fn validate_create_snapshot_dest_path(sandbox_id: &str, path: PathBuf) -> Result<PathBuf, Status> {
-    let sandbox_root =
-        Path::new(pplx_space_common_core::host::linux::paths::SANDBOX_CACHE_DIR).join(sandbox_id);
+    let sandbox_root = Path::new(pplx_space_host_layout::paths::SANDBOX_CACHE_DIR).join(sandbox_id);
     let allowed_roots = [
         sandbox_root.join("snapshot"),
         sandbox_root.join("snapshots"),
@@ -142,7 +141,7 @@ fn validate_create_snapshot_dest_path(sandbox_id: &str, path: PathBuf) -> Result
 }
 
 fn validate_load_snapshot_source(sandbox_id: &str, path: PathBuf) -> Result<PathBuf, Status> {
-    let expected = Path::new(pplx_space_common_core::host::linux::paths::SANDBOX_CACHE_DIR)
+    let expected = Path::new(pplx_space_host_layout::paths::SANDBOX_CACHE_DIR)
         .join(sandbox_id)
         .join("snapshot");
     if path != expected {

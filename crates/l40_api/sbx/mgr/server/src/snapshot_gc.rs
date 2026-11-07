@@ -596,7 +596,7 @@ async fn gc_tick(
 /// other services' private directories, such as node-mgr's root-only
 /// `.btrfs-send-staging`, and warned about each on every pass. Tests drive
 /// bounded discovery through a tempdir.
-const CACHE_ROOT_FOR_SWEEP: &str = pplx_space_common_core::host::linux::paths::SANDBOX_CACHE_DIR;
+const CACHE_ROOT_FOR_SWEEP: &str = pplx_space_host_layout::paths::SANDBOX_CACHE_DIR;
 
 /// Maximum directory-walk depth below [`CACHE_ROOT_FOR_SWEEP`]. Staging
 /// directories sit at `<sandbox_id>/.gc-pending-<id>` and

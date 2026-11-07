@@ -42,6 +42,9 @@ tracing = { workspace = true }
 
 # internal
 pplx-space-common-core = { workspace = true, features = ["serde"] }
+pplx-space-host-layout = { workspace = true }
+pplx-space-host-linux = { workspace = true }
+pplx-space-node-disk-admission = { workspace = true }
 pplx-space-common-grpc = { workspace = true }
 pplx-space-file-io = { workspace = true, features = ["reflink"] }
 pplx-space-common-jobs = { workspace = true }

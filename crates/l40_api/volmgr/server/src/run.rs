@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::Duration;
 
-use pplx_space_common_core::host::linux::identities::group_names;
+use pplx_space_host_layout::identities::group_names;
 use pplx_space_local_health::{LocalHealthLiveness, LocalHealthServer};
 use pplx_space_service_mutex::{
     AcquireError as ServiceMutexAcquireError, AcquireOutcome, SERVICE_MUTEX_POLL_INTERVAL,

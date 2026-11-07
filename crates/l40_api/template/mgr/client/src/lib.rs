@@ -11,7 +11,7 @@ use pplx_space_common_grpc::{
 use tonic::transport::{Channel, Endpoint};
 
 /// Unix socket path for the template-manager gRPC service.
-pub const SOCKET_PATH: &str = pplx_space_common_core::host::linux::paths::TEMPLATE_MANAGER_SOCKET;
+pub const SOCKET_PATH: &str = pplx_space_host_layout::paths::TEMPLATE_MANAGER_SOCKET;
 /// Server request budget, including cold-cache artifact materialization in GetTemplate.
 pub const GRPC_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(10);
 const LOCAL_ENDPOINT_URI: &str = "http://[::]:50051";

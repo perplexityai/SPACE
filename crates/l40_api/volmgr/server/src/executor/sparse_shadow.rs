@@ -367,14 +367,14 @@ pub(super) struct SparseShadowAdmission {
 }
 
 pub(super) fn sparse_shadow_disk_floor_bytes(
-    status: pplx_space_common_core::host::disk::DiskStatus,
+    status: pplx_space_host_linux::disk::DiskStatus,
 ) -> u64 {
-    pplx_space_common_core::host::disk_admission::CacheDiskAdmissionConfig::default()
+    pplx_space_node_disk_admission::CacheDiskAdmissionConfig::default()
         .hard_floor_bytes(status.total_bytes)
 }
 
 pub(super) fn sparse_shadow_has_disk_headroom(
-    status: pplx_space_common_core::host::disk::DiskStatus,
+    status: pplx_space_host_linux::disk::DiskStatus,
     logical_bytes: u64,
 ) -> bool {
     status.available_bytes >= sparse_shadow_disk_floor_bytes(status).saturating_add(logical_bytes)
@@ -456,9 +456,9 @@ impl TransferExecutor {
         let disk_status = self
             .shadow_staging_dir
             .to_str()
-            .and_then(pplx_space_common_core::host::disk::statvfs_status);
+            .and_then(pplx_space_host_linux::disk::statvfs_status);
         #[cfg(not(unix))]
-        let disk_status: Option<pplx_space_common_core::host::disk::DiskStatus> = None;
+        let disk_status: Option<pplx_space_host_linux::disk::DiskStatus> = None;
         let disk_floor_bytes = disk_status.map_or(0, sparse_shadow_disk_floor_bytes);
         let has_disk_headroom = disk_status
             .is_some_and(|status| sparse_shadow_has_disk_headroom(status, logical_bytes));

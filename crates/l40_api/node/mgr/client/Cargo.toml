@@ -18,6 +18,7 @@ tonic = { workspace = true }
 pplx-space-common-core = { workspace = true }
 pplx-space-common-grpc = { workspace = true }
 pplx-space-execution-common = { workspace = true }
+pplx-space-host-layout = { workspace = true }
 pplx-space-node-mgr-protocol = { workspace = true }
 
 [dev-dependencies]

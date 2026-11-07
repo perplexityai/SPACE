@@ -76,7 +76,7 @@ impl NodeManagerService {
             .get(&request.sandbox_id)
             .map_err(slot_store_status)?
             .ok_or_else(|| Status::permission_denied("gateway has no registered sandbox lease"))?;
-        let expected_uid = pplx_space_common_core::host::linux::gateway::gateway_uid(
+        let expected_uid = pplx_space_host_layout::gateway::gateway_uid(
             pplx_space_common_core::types::LinuxUid::new(lease.sandbox_uid),
         );
         if expected_uid.map(|uid| uid.get()) != Some(request.uid)

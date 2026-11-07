@@ -8,8 +8,8 @@ use axum::{
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use futures_util::Stream;
 use http_body_util::BodyExt;
-use pplx_space_common_core::host::disk_admission::CacheDiskAdmissionReason;
 use pplx_space_common_grpc::{GuestCapabilityUnsupported, UdsPerSandboxLimitExceeded};
+use pplx_space_node_disk_admission::CacheDiskAdmissionReason;
 use pplx_space_sbx_mgr_client::proto::{
     SpacedProcessEvent, spaced_process_event, spaced_process_exit,
 };

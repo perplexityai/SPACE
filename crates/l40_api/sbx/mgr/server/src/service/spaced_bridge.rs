@@ -24,7 +24,7 @@ pub(super) async fn launch_spaced_host_via_node(
         .launch(LaunchRequest {
             execution_fence: Some(execution_fence.into()),
             sandbox_id: sandbox_id.to_string(),
-            program: pplx_space_common_core::host::linux::paths::SPACED_HOST_SVC_BIN.to_string(),
+            program: pplx_space_host_layout::paths::SPACED_HOST_SVC_BIN.to_string(),
             args: vec![
                 "--socket".to_string(),
                 spaced_host_socket_path(sandbox_id),
@@ -58,7 +58,7 @@ pub(super) async fn launch_spaced_host_via_node(
                 SandboxEventDetails::default()
                     .boot_type(boot_type)
                     .pid(response.pid.to_string())
-                    .program(pplx_space_common_core::host::linux::paths::SPACED_HOST_SVC_BIN),
+                    .program(pplx_space_host_layout::paths::SPACED_HOST_SVC_BIN),
             );
             Ok(response)
         }
@@ -69,7 +69,7 @@ pub(super) async fn launch_spaced_host_via_node(
                 SandboxEventSource::SbxManager,
                 SandboxEventDetails::default()
                     .boot_type(boot_type)
-                    .program(pplx_space_common_core::host::linux::paths::SPACED_HOST_SVC_BIN)
+                    .program(pplx_space_host_layout::paths::SPACED_HOST_SVC_BIN)
                     .error(error.to_string()),
             );
             Err(Status::internal(format!(

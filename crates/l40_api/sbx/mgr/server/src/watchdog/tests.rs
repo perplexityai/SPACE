@@ -1403,13 +1403,13 @@ fn spaced_host_restart_args_preserve_control_socket_and_only_notify_qualified_gu
             args,
             vec![
                 "--socket".to_string(),
-                pplx_space_common_core::host::linux::paths::spaced_host_socket(sandbox_id),
+                pplx_space_host_layout::paths::spaced_host_socket(sandbox_id),
                 "--sandbox-id".to_string(),
                 sandbox_id.to_string(),
                 "--vsock-uds".to_string(),
                 format!("{RUN_DIR}/{sandbox_id}/root/v.sock"),
                 "--host-control-socket".to_string(),
-                pplx_space_common_core::host::linux::paths::SANDBOX_HOST_CONTROL_SOCKET.to_string(),
+                pplx_space_host_layout::paths::SANDBOX_HOST_CONTROL_SOCKET.to_string(),
                 "--boot-type".to_string(),
                 boot_type.to_string(),
             ]

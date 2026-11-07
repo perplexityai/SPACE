@@ -6,11 +6,6 @@ use std::{
     sync::{Arc, Mutex, MutexGuard, OnceLock},
 };
 
-use pplx_space_common_core::host::linux::identities::{user_names, users};
-use pplx_space_common_core::host::linux::paths::{
-    TEMPLATE_CACHE_DIR_MODE, normalize_template_cache_tree as normalize_template_cache_tree_io,
-    set_template_cache_permissions as set_template_cache_permissions_io,
-};
 use pplx_space_common_core::types::{
     AutoLifecyclePolicy, DEFAULT_BASE_SNAPSHOT_MEMORY_MIB, DEFAULT_BASE_SNAPSHOT_VCPU, Digest,
     HashAlg, MIN_BASE_SNAPSHOT_MEMORY_MIB, MIN_BASE_SNAPSHOT_VCPU, RUNTIME_FIRECRACKER_ALIAS,
@@ -18,11 +13,17 @@ use pplx_space_common_core::types::{
     TEMPLATE_ROOTFS_ZSTD_LEVEL, TemplateCachePartition,
 };
 use pplx_space_feature_flags::FeatureFlagClient;
+use pplx_space_host_layout::identities::{user_names, users};
+use pplx_space_host_layout::paths::TEMPLATE_CACHE_DIR_MODE;
 use pplx_space_net_common::{
     NetworkPolicyV1,
     proto::{NetworkPolicyApplyDecision, NetworkPolicyV1 as NetworkPolicyProto},
 };
 use pplx_space_sbx_mgr_client::proto as sbx_proto;
+use pplx_space_template_cache_permissions::{
+    normalize_template_cache_tree as normalize_template_cache_tree_io,
+    set_template_cache_permissions as set_template_cache_permissions_io,
+};
 use pplx_space_uds_peer_auth::{
     AuthorizedUdsPeer, LocalRole, PeerIdentity, UdsPeerAccount, UdsPeerAuthorizer, UdsPeerPrincipal,
 };
@@ -41,7 +42,7 @@ use crate::proto::{
 };
 use uuid::Uuid;
 
-const TEMPLATE_DIR: &str = pplx_space_common_core::host::linux::paths::TEMPLATE_DIR;
+const TEMPLATE_DIR: &str = pplx_space_host_layout::paths::TEMPLATE_DIR;
 const SPACE_NODEAPI_ACCOUNT: &str = user_names::SPACE_NODEAPI;
 const SPACE_SBXMGR_ACCOUNT: &str = user_names::SPACE_SBXMGR;
 const SPACE_K8S_NODE_CONTROLLER_ACCOUNT: &str = user_names::SPACE_K8S_NODE_CONTROLLER;
@@ -303,13 +304,13 @@ impl Drop for ImportStagingGuard {
 /// makes Drop robust against the import pipeline failing at any step
 /// between subvolume creation and the atomic rename.
 fn remove_staging_path(path: &Path) -> std::io::Result<()> {
-    if pplx_space_common_core::host::btrfs::is_subvolume(path) {
+    if pplx_space_btrfs::is_subvolume(path) {
         // Clear RO first if some future import path stamps it pre-
         // rename — today nothing does, but `btrfs subvolume delete`
         // rejects RO targets and we want this helper to stay correct
         // if that ever changes.
-        let _ = pplx_space_common_core::host::btrfs::set_readonly(path, false);
-        match pplx_space_common_core::host::btrfs::delete_subvolume_if_present(path) {
+        let _ = pplx_space_btrfs::set_readonly(path, false);
+        match pplx_space_btrfs::delete_subvolume_if_present(path) {
             Ok(()) => return Ok(()),
             Err(err) => {
                 tracing::warn!(
@@ -443,7 +444,7 @@ pub struct TemplateManagerService {
 /// where `build_dir` is the content hash plus `@{environment}` outside the
 /// legacy cache partition.
 fn build_dir(name: &str, content_hash: &str, partition: TemplateCachePartition) -> String {
-    pplx_space_common_core::host::linux::paths::template_build_dir(name, content_hash, partition)
+    pplx_space_common_core::types::template_build_dir(name, content_hash, partition)
 }
 
 /// Path to the snapshots directory for a build: `{TEMPLATE_DIR}/{name}/snapshots/{build_dir}/{vcpu}vcpu-{memory_mib}mib/`
@@ -454,7 +455,7 @@ fn snapshot_dir(
     vcpu: u32,
     memory_mib: u32,
 ) -> String {
-    pplx_space_common_core::host::linux::paths::template_snapshot_dir(
+    pplx_space_common_core::types::template_snapshot_dir(
         name,
         content_hash,
         partition,

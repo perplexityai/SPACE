@@ -68,9 +68,9 @@ pub(crate) fn run(config: Config, stream: UnixStream) -> Result<(), String> {
 /// Called only by launcher mode, before Tokio or telemetry creates threads.
 fn prepare_and_exec(config: &Config, stream: &mut Option<UnixStream>) -> Result<(), Error> {
     use nix::mount::{MsFlags, mount};
-    if pplx_space_common_core::host::linux::gateway::gateway_uid(
-        pplx_space_common_core::types::LinuxUid::new(config.uid),
-    )
+    if pplx_space_host_layout::gateway::gateway_uid(pplx_space_common_core::types::LinuxUid::new(
+        config.uid,
+    ))
     .is_none()
         || config.uid != config.gid
     {
@@ -200,8 +200,7 @@ fn prepare_and_exec(config: &Config, stream: &mut Option<UnixStream>) -> Result<
     let proc_directory = private_mountpoint("proc")?;
     // Host procfs disappears at the pivot. Set the policy before forking so
     // both the runner and runtime inherit it, without procfs in privilege drop.
-    pplx_space_common_core::host::linux::prefer_for_oom_kill()
-        .map_err(io("prefer runtime for OOM kill"))?;
+    pplx_space_host_linux::prefer_for_oom_kill().map_err(io("prefer runtime for OOM kill"))?;
     nix::unistd::pivot_root(".", ".").map_err(sys("pivot isolation root"))?;
     nix::mount::umount2(".", nix::mount::MntFlags::MNT_DETACH)
         .map_err(sys("detach host mount tree"))?;
@@ -354,8 +353,8 @@ fn drop_privileges(uid: u32, gid: u32) -> Result<(), Error> {
     setrlimit(Resource::RLIMIT_CORE, 0, 0).map_err(sys("disable core dumps"))?;
     setrlimit(
         Resource::RLIMIT_NOFILE,
-        pplx_space_common_core::host::linux::SANDBOX_PROCESS_NOFILE_LIMIT,
-        pplx_space_common_core::host::linux::SANDBOX_PROCESS_NOFILE_LIMIT,
+        pplx_space_host_layout::SANDBOX_PROCESS_NOFILE_LIMIT,
+        pplx_space_host_layout::SANDBOX_PROCESS_NOFILE_LIMIT,
     )
     .map_err(sys("bound open files"))?;
     nix::unistd::setgroups(&[]).map_err(sys("drop supplementary groups"))?;
@@ -474,8 +473,7 @@ fn open_registration_directory(path: &Path, sandbox_uid: u32) -> Result<File, Er
     if ![0, sandbox_uid].contains(&metadata.uid())
         || metadata.mode() & 0o002 != 0
         || (metadata.mode() & 0o020 != 0
-            && metadata.gid()
-                != pplx_space_common_core::host::linux::identities::gids::SPACE_SIDECARCLIENTS)
+            && metadata.gid() != pplx_space_host_layout::identities::gids::SPACE_SIDECARCLIENTS)
     {
         return Err(Error::Invalid(
             "runtime registration directory has unsafe ownership or mode",

@@ -259,7 +259,7 @@ pub enum VerifyError {
 
 impl VerifyError {
     pub fn is_transient(&self) -> bool {
-        matches!(self, Self::Io { source, .. } if pplx_space_common_core::host::path_errors::host_path_io_error_is_transient(source))
+        matches!(self, Self::Io { source, .. } if pplx_space_host_linux::path_errors::host_path_io_error_is_transient(source))
     }
 }
 
@@ -338,7 +338,7 @@ impl PublishError {
         match self {
             Self::ExistingArtifact(error) => error.is_transient(),
             Self::Io { source, .. } | Self::Source { source, .. } => {
-                pplx_space_common_core::host::path_errors::host_path_io_error_is_transient(source)
+                pplx_space_host_linux::path_errors::host_path_io_error_is_transient(source)
             }
             _ => false,
         }
@@ -370,7 +370,7 @@ impl RemoveError {
     /// Whether the same request can succeed later without anyone changing
     /// the store: only an I/O failure can.
     pub fn is_transient(&self) -> bool {
-        matches!(self, Self::Io { source, .. } if pplx_space_common_core::host::path_errors::host_path_io_error_is_transient(source))
+        matches!(self, Self::Io { source, .. } if pplx_space_host_linux::path_errors::host_path_io_error_is_transient(source))
     }
 }
 

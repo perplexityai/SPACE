@@ -323,7 +323,7 @@ fn validate_resource_status_response(
 }
 
 /// Unix socket path for the node-manager gRPC service.
-pub const SOCKET_PATH: &str = pplx_space_common_core::host::linux::paths::NODE_MANAGER_SOCKET;
+pub const SOCKET_PATH: &str = pplx_space_host_layout::paths::NODE_MANAGER_SOCKET;
 const LOCAL_ENDPOINT_URI: &str = "http://[::]:50051";
 
 pub type NodeManagerGrpcClient =

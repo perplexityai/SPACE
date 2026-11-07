@@ -273,7 +273,7 @@ async fn run(
                 "server-side copy must not require bulk disk staging admission"
             );
             Ok(CacheDiskMeasurement {
-                status: pplx_space_common_core::host::disk::DiskStatus {
+                status: pplx_space_host_linux::disk::DiskStatus {
                     total_bytes: 1 << 40,
                     free_bytes: 1 << 39,
                     available_bytes: 1 << 39,

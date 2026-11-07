@@ -35,7 +35,7 @@ anyhow = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
 
 # internal
-pplx-space-common-core = { workspace = true }
+pplx-space-host-layout = { workspace = true }
 pplx-space-sbx-mgr = { workspace = true }
 pplx-space-service-host = { workspace = true }
 pplx-space-service-lifecycle = { workspace = true }

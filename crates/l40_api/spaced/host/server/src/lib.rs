@@ -15,8 +15,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use pplx_space_common_core::{host::linux::identities::user_names, host::linux::identities::users};
 use pplx_space_connection_admission::ConnectionAdmissionFailure;
+use pplx_space_host_layout::{identities::user_names, identities::users};
 use pplx_space_spaced_common::proto::bridge_guest::filesystem_client::FilesystemClient as BridgeGuestFilesystemClient;
 use pplx_space_spaced_common::proto::bridge_guest::meta_client::MetaClient as BridgeGuestClient;
 use pplx_space_spaced_common::proto::bridge_guest::networking_client::NetworkingClient as BridgeGuestNetworkingClient;
@@ -163,15 +163,22 @@ pub struct SpacedHostServiceConfig {
 impl Default for SpacedHostServiceConfig {
     fn default() -> Self {
         Self {
-            socket_path: pplx_space_common_core::host::linux::paths::default_host_uds_path(
-                pplx_space_common_core::host::linux::paths::SPACED_HOST_SOCKET_FILE,
+            // Under the node layout on Linux; other hosts have none, so the
+            // socket goes in the temporary directory.
+            socket_path: pplx_space_host_layout::paths::host_uds_path(
+                if cfg!(target_os = "linux") {
+                    std::path::PathBuf::from(pplx_space_host_layout::paths::SPACED_HOST_SOCKET_DIR)
+                } else {
+                    std::env::temp_dir()
+                },
+                pplx_space_host_layout::paths::SPACED_HOST_SOCKET_FILE,
             ),
             bridge_host_socket_path: pplx_space_spaced_common::default_bridge_host_uds_path(),
             // Legacy Linux service configuration; new runtime policy comes from node-manager.
             guest_agent: pplx_space_common_core::types::guest_image::QualifiedGuestAgent::LinuxV1,
             bridge_guest_connector: BridgeGuestConnector::default(),
             host_control_socket_path: PathBuf::from(
-                pplx_space_common_core::host::linux::paths::SANDBOX_HOST_CONTROL_SOCKET,
+                pplx_space_host_layout::paths::SANDBOX_HOST_CONTROL_SOCKET,
             ),
             host_peer_authorization: SpacedHostPeerAuthorization::Enforce,
         }

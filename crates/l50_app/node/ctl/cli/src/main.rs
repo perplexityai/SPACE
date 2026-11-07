@@ -26,7 +26,7 @@ struct Cli {
     #[arg(short = 'v', long = "version", action = clap::ArgAction::Version)]
     _version: (),
 
-    #[arg(long, default_value = pplx_space_common_core::host::linux::paths::NODE_CTL_SOCKET)]
+    #[arg(long, default_value = pplx_space_host_layout::paths::NODE_CTL_SOCKET)]
     socket: PathBuf,
 
     #[command(subcommand)]

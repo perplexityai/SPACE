@@ -48,7 +48,7 @@ async fn rollback_checkout_excludes_gc_and_rejects_existing_delete_owner() {
             artifact,
             ArtifactKind::Full,
             &name.parse().unwrap(),
-            &pplx_space_common_core::host::linux::paths::sandbox_snapshot_dir(&sandbox, name),
+            &pplx_space_host_layout::paths::sandbox_snapshot_dir(&sandbox, name),
         )
         .unwrap();
     let reader = service

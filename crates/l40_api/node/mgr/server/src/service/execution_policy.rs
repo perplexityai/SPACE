@@ -23,7 +23,7 @@ use crate::proto::{ApplyExecutionPolicyRequest, ApplyExecutionPolicyResponse};
 const ALLOW_POLICY_WRITER: &[pplx_space_uds_peer_auth::UdsPeerPrincipal] = &[
     pplx_space_uds_peer_auth::UdsPeerPrincipal::Root,
     pplx_space_uds_peer_auth::UdsPeerPrincipal::Service(
-        pplx_space_common_core::host::linux::identities::user_names::SPACE_NODECTL,
+        pplx_space_host_layout::identities::user_names::SPACE_NODECTL,
     ),
 ];
 /// Twice the 4 MiB request bound of node-manager's gRPC server (tonic's

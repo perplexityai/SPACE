@@ -6,15 +6,15 @@ use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsE
 use std::path::{Path, PathBuf};
 
 use aws_lc_rs::rand::{SecureRandom, SystemRandom};
-use pplx_space_common_core::host::linux::paths;
 use pplx_space_common_core::types::SandboxId;
+use pplx_space_host_layout::paths;
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::launch::ProcessHandle;
 
-pub use pplx_space_common_core::host::linux::gateway::LAUNCH_CAPABILITY_ENV as CAPABILITY_ENV;
+pub use pplx_space_host_layout::gateway::LAUNCH_CAPABILITY_ENV as CAPABILITY_ENV;
 const MAX_WITNESS_BYTES: u64 = 16 * 1024;
 
 #[derive(Debug, thiserror::Error)]

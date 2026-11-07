@@ -93,7 +93,7 @@ async fn import_rejects_reserved_owner_before_reserving_identity_or_waiting_for_
 async fn import_rejects_local_network_policy_from_forwarded_service_peer() {
     use crate::service::activation_support::sandbox_peer_authorizer;
     use crate::service::tests::service_tests::service_for_teardown_test;
-    use pplx_space_common_core::host::linux::identities::users;
+    use pplx_space_host_layout::identities::users;
     use pplx_space_net_common::{NetworkPolicyV1, proto::PolicyAuthority};
 
     let service = service_for_teardown_test(crate::db::test_conn());
@@ -136,7 +136,7 @@ async fn import_rejects_local_network_policy_from_forwarded_service_peer() {
 async fn import_rejects_local_auto_lifecycle_from_forwarded_service_peer() {
     use crate::service::activation_support::sandbox_peer_authorizer;
     use crate::service::tests::service_tests::service_for_teardown_test;
-    use pplx_space_common_core::host::linux::identities::users;
+    use pplx_space_host_layout::identities::users;
     use pplx_space_net_common::proto::PolicyAuthority;
 
     let service = service_for_teardown_test(crate::db::test_conn());

@@ -1,7 +1,7 @@
 use super::service_tests::{insert_test_sandbox, node_ctl_request};
 use super::*;
-use pplx_space_common_core::host::linux::identities::users;
 use pplx_space_common_core::types::{LocalArtifactId, SandboxId};
+use pplx_space_host_layout::identities::users;
 
 fn pin_artifact(
     service: &SandboxManagerService,

@@ -522,7 +522,7 @@ async fn pool_clone_requires_a_stable_donor_and_pins_its_template_revision() {
 
 #[tokio::test]
 async fn pool_clone_and_adoption_keep_donor_ownership_exclusive() {
-    use pplx_space_common_core::host::linux::identities::users;
+    use pplx_space_host_layout::identities::users;
 
     let (service, id, cleanup_id) = armed_clone();
     let id = id.to_string();
