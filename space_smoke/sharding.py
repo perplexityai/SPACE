@@ -73,6 +73,12 @@ _DURATION_SECONDS = {
         "local.console_sandbox_lookup_accepts_every_id_form": 18,
         "local.console_turns_away_non_operators": 15,
         "local.deferred_btrfs_send_capture_restores_cross_node": 14,
+        # Not measured here: an estimate from its five durable suspends and
+        # four restores (the concurrent-restore scenario's take seconds each),
+        # two cluster-controller rollouts at the charts' pace (the
+        # orphaned-restore-pod GC scenario's two take most of its 127 s) and
+        # two 25 s holds.
+        "local.drain_restore_operation_lands_in_its_target": 240,
         "local.ecw_template_build_from_oci_boots": 39,
         "local.encrypted_disk_fork": 46,
         "local.encrypted_live_disk_fork": 33,

@@ -58,6 +58,7 @@ from space_smoke.capabilities import (
     AdminNodeView,
     SandboxResidency,
     StoppedResidency,
+    DrainRestoreObservation,
     EncryptedSnapshotObservation,
     ExecutionRow,
     RestoreCallerOutcome,
@@ -124,6 +125,12 @@ from space_smoke.orphaned_restore_pod_gc import (
     build_planted_orphan,
     validate_gc_keys,
     validate_gc_overrides,
+)
+from space_smoke.drain_restore import (
+    DRAIN_RESTORE_HOLD_ENV_KEYS,
+    DRAIN_RESTORE_TARGETS,
+    validate_drain_restore_hold_keys,
+    validate_drain_restore_hold_overrides,
 )
 from space_smoke.stopped_replacement import (
     STOPPED_REPLACEMENT_ENV_KEYS,
@@ -630,6 +637,64 @@ SELECT lifecycle, coalesce(active_node_id::text, '') FROM sandboxes WHERE id = '
 STOPPED_RESIDENCY_SQL = """\
 SELECT lifecycle, coalesce(active_node_id::text, ''), placement, coalesce(evacuation_restore_target, '')
 FROM sandboxes WHERE id = '{sandbox_id}'::uuid;
+"""
+# The suspend snapshot a drain restore names, S: the newest `ready` full
+# snapshot with a storage location that is not orphaned (`space_smoke.drain_restore`).
+DRAIN_RESTORE_SOURCE_SNAPSHOT_SQL = """\
+SELECT sn.id
+  FROM snapshots sn
+ WHERE sn.sandbox_id = '{sandbox_id}'::uuid
+   AND sn.type = 'full'
+   AND sn.state = 'ready'
+   AND EXISTS (
+       SELECT 1
+         FROM snapshot_storage_locations ssl
+        WHERE ssl.snapshot_id = sn.id
+          AND ssl.orphaned_at IS NULL)
+ ORDER BY sn.timestamp DESC, sn.id DESC
+ LIMIT 1;
+"""
+# The API's own enqueue (`enqueue_drain_restore` through `create_operation_tx`):
+# the sandbox queue's advisory lock taken last before the insert, so the
+# dispatcher's per-sandbox order is commit order; `requested_at` stamped at
+# insert; and the `operation.created` event under the public kind clients see.
+# The org comes from the sandbox row, which every sandbox operation is anchored to.
+ENQUEUE_DRAIN_RESTORE_SQL = """\
+BEGIN;
+SELECT pg_advisory_xact_lock(hashtextextended(org_id::text || ':{target_id}:queue', 0))
+  FROM sandboxes WHERE id = '{sandbox_id}'::uuid;
+INSERT INTO public_operations (
+       operation_id, org_id, api_product, kind, state, target_type, target_id,
+       payload_json, requested_at, next_attempt_at)
+SELECT '{operation_id}'::uuid, s.org_id, 'native', 'drain_restore_sandbox', 'queued',
+       'sandbox', '{target_id}', '{payload}'::jsonb, clock_timestamp(),
+       clock_timestamp() + make_interval(secs => {due_in_seconds})
+  FROM sandboxes s
+ WHERE s.id = '{sandbox_id}'::uuid
+RETURNING operation_id;
+INSERT INTO public_operation_events (operation_id, sequence, event_type, event_json)
+SELECT operation_id, 1, 'operation.created', '{{"kind":"restore_sandbox","state":"queued"}}'::jsonb
+  FROM public_operations
+ WHERE operation_id = '{operation_id}'::uuid;
+COMMIT;
+"""
+# One statement, so the operation and the sandbox are read at one instant.
+# `restore_episode_target` is read through `to_jsonb` so the read still
+# answers (NULL) on a schema that predates the column: the control run on a
+# base build must report the operation and lifecycle, not a SQL error.
+DRAIN_RESTORE_OBSERVATION_SQL = """\
+SELECT coalesce(o.state, ''),
+       coalesce(o.attempts, 0),
+       coalesce(o.terminal_error_code, ''),
+       coalesce(s.lifecycle, ''),
+       coalesce(to_jsonb(s) ->> 'restore_episode_target', ''),
+       coalesce(s.evacuation_restore_target, ''),
+       (SELECT count(*) FROM sandbox_k8s_executions e
+         WHERE e.sandbox_id = '{sandbox_id}'::uuid AND e.active),
+       replace(coalesce(o.progress_message, ''), E'\\n', ' ')
+  FROM (SELECT 1) one
+  LEFT JOIN public_operations o ON o.operation_id = '{operation_id}'::uuid
+  LEFT JOIN sandboxes s ON s.id = '{sandbox_id}'::uuid;
 """
 DISK_SNAPSHOT_IDS_SQL = """\
 SELECT id FROM snapshots
@@ -5660,6 +5725,15 @@ ON CONFLICT (key_hash) DO NOTHING;
         )
 
     def running_controller_stopped_replacement_envs(self) -> list[dict[str, str | None]]:
+        return self._running_controller_env_literals(
+            STOPPED_REPLACEMENT_ENV_KEYS, value_from_refusal="; the scenario reads only literal flags"
+        )
+
+    def _running_controller_env_literals(
+        self, keys: Sequence[str], *, value_from_refusal: str
+    ) -> list[dict[str, str | None]]:
+        """The literals of `keys` on every running, not-terminating controller pod."""
+
         listing = self.kubectl(
             "get", "pods", "-l", KIND_CONTROLLER_SELECTOR, "-o", "json", timeout=15
         )
@@ -5675,9 +5749,9 @@ ON CONFLICT (key_hash) DO NOTHING;
             envs.append(
                 _env_literals(
                     containers[0].get("env") or [],
-                    STOPPED_REPLACEMENT_ENV_KEYS,
+                    keys,
                     owner=str(metadata.get("name", "a cluster-controller pod")),
-                    value_from_refusal="; the scenario reads only literal flags",
+                    value_from_refusal=value_from_refusal,
                 )
             )
         return envs
@@ -5702,6 +5776,102 @@ ON CONFLICT (key_hash) DO NOTHING;
             )
         self._assert_lease_owned(ownership, "a stopped-replacement controller deployment write")
         self._set_deployment_env(self._controller_deployment(), values, timeout=180)
+
+    # --- drain restore operation ---------------------------------------------
+    #
+    # Thin wrappers; the key list, the value bounds and the verdicts live in
+    # `space_smoke.drain_restore`. The controller-mutation Lease is
+    # `acquire_controller_mutation` above.
+
+    def drain_restore_hold_env(self) -> dict[str, str | None]:
+        return self._deployment_env_literals(
+            self._controller_deployment(), DRAIN_RESTORE_HOLD_ENV_KEYS
+        )
+
+    def running_controller_drain_restore_hold_envs(self) -> list[dict[str, str | None]]:
+        return self._running_controller_env_literals(
+            DRAIN_RESTORE_HOLD_ENV_KEYS, value_from_refusal="; the scenario reads only a literal hold"
+        )
+
+    def set_drain_restore_hold_env(self, overrides: Mapping[str, str]) -> None:
+        validate_drain_restore_hold_overrides(overrides)
+        self._apply_drain_restore_hold_env(overrides)
+
+    def restore_drain_restore_hold_env(self, standing: Mapping[str, str | None]) -> None:
+        # The captured literal goes back verbatim: the hook ignores a value it
+        # cannot parse, and restoring must not change what it reads.
+        validate_drain_restore_hold_keys(standing)
+        self._apply_drain_restore_hold_env(standing)
+
+    def _apply_drain_restore_hold_env(self, values: Mapping[str, str | None]) -> None:
+        self._require_isolated_kind("drain-restore hold controller env override")
+        ownership = self._retention_lease_ownership
+        if ownership is None:
+            raise SmokeConfigurationError(
+                "refusing a drain-restore hold controller deployment write without the "
+                "caller's live mutation Lease"
+            )
+        self._assert_lease_owned(ownership, "a drain-restore hold controller deployment write")
+        self._set_deployment_env(self._controller_deployment(), values, timeout=180)
+
+    def drain_restore_source_snapshot(self, sandbox_id: str) -> str | None:
+        out = self._psql(
+            DRAIN_RESTORE_SOURCE_SNAPSHOT_SQL.format(sandbox_id=_sql_uuid(sandbox_id)),
+            action="read the sandbox's drain restore source snapshot",
+        )
+        return _sql_uuid(out) if out else None
+
+    def enqueue_drain_restore(
+        self, sandbox_id: str, *, target: str, snapshot_id: str, due_in_seconds: int
+    ) -> str:
+        self._require_isolated_kind("drain restore operation enqueue")
+        if target not in DRAIN_RESTORE_TARGETS:
+            raise ValueError(f"refusing drain restore target {target!r}")
+        if not 0 <= due_in_seconds <= 3600:
+            raise ValueError(f"refusing drain restore due offset {due_in_seconds!r}")
+        sandbox = _sql_uuid(sandbox_id)
+        target_id = f"sbx_{sandbox}"
+        operation_id = str(uuid.uuid4())
+        payload = json.dumps(
+            {"sandbox_id": target_id, "target": target, "snapshot_id": _sql_uuid(snapshot_id)},
+            separators=(",", ":"),
+        )
+        out = self._psql(
+            ENQUEUE_DRAIN_RESTORE_SQL.format(
+                sandbox_id=sandbox,
+                target_id=target_id,
+                operation_id=operation_id,
+                payload=payload,
+                due_in_seconds=int(due_in_seconds),
+            ),
+            action="enqueue a drain restore operation",
+        )
+        if operation_id not in (line.strip() for line in out.splitlines()):
+            raise RuntimeError(f"sandbox {sandbox} has no row to enqueue a drain restore for")
+        return operation_id
+
+    def drain_restore_observation(
+        self, operation_id: str, sandbox_id: str
+    ) -> DrainRestoreObservation:
+        row = self._psql(
+            DRAIN_RESTORE_OBSERVATION_SQL.format(
+                operation_id=_sql_uuid(operation_id), sandbox_id=_sql_uuid(sandbox_id)
+            ),
+            action="read the drain restore operation and its sandbox",
+        )
+        (
+            state, attempts, error_code, lifecycle, episode, marker, active, progress
+        ) = row.split("|", 7)
+        return DrainRestoreObservation(
+            operation_state=state or None,
+            attempts=int(attempts),
+            terminal_error_code=error_code or None,
+            progress_message=progress[:500],
+            lifecycle=lifecycle or None,
+            restore_episode_target=episode or None,
+            evacuation_restore_target=marker or None,
+            active_executions=int(active),
+        )
 
     def stopped_residency(self, sandbox_id: str) -> StoppedResidency:
         row = self._psql(
@@ -8119,6 +8289,20 @@ class _SdkSandbox:
             method="POST",
         )
         return _race_request(request, timeout=timeout, gate=gate)
+
+    def lifecycle_request(self, action: str, *, timeout: float) -> RestoreCallerOutcome:
+        # Bodiless for the reason `race_connect` gives: `resume`'s optional
+        # body would also rewrite the auto-lifecycle policy.
+        if action not in ("pause", "resume"):
+            raise ValueError(f"refusing ECW lifecycle action {action!r}")
+        headers = {k: v for k, v in self._config.api_headers().items() if k != "Content-Type"}
+        request = Request(
+            self._config.api_endpoint(f"/sandboxes/{quote(self.sandbox_id, safe='')}/{action}"),
+            data=None,
+            headers=headers,
+            method="POST",
+        )
+        return _race_request(request, timeout=timeout, gate=None)
 
     def fork_response(
         self, *, timeout: int, idempotency_key: str | None = None
