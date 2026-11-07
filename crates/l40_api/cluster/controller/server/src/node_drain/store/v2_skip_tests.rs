@@ -1,8 +1,9 @@
 //! Every v1 writer keyed on drain phase skips a v2 drain's node: the node
-//! drain's draining and terminating lists, the drained-node terminator's list,
-//! its reap and its orphan delete, and the terminating delete with its
-//! tombstone. Each test runs the writer against a v1 row and a v2 row in the
-//! same phase: the v1 row is the control the writer still takes.
+//! drain's draining and terminating lists and its phase write, the
+//! drained-node terminator's list, its reap and its orphan delete, and the
+//! terminating delete with its tombstone. Each writer runs against a v1 row
+//! and a v2 row in the same phase: the v1 row is the control the writer
+//! still takes.
 
 use pplx_space_common_core::sql;
 use pplx_space_common_core::types::{NodeDrainEngine, NodeId, SubstrateKind};
@@ -12,7 +13,8 @@ use pplx_space_test_env::TestResult;
 use sqlx::PgPool;
 
 use super::{
-    delete_terminating_node_and_record_tombstone, draining_nodes_query, terminating_nodes_query,
+    GuardScope, delete_terminating_node_and_record_tombstone, draining_nodes_query,
+    set_drain_phase_query, terminating_nodes_query,
 };
 use crate::drained_node_terminator::DrainedNodeTerminatorSink as _;
 use crate::drained_node_terminator::store::{
@@ -64,120 +66,125 @@ async fn listed(pool: &PgPool, statement: &str, phase: &str) -> TestResult<Vec<N
         .await?)
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn the_draining_list_skips_a_v2_node() -> TestResult {
-    let Some(db) = try_pg_test_db().await? else {
-        return Ok(());
-    };
-    let v1 = node(&db.pool, "draining", NodeDrainEngine::V1).await?;
-    let v2 = node(&db.pool, "draining", NodeDrainEngine::V2).await?;
-    let rows: Vec<(NodeId, Option<String>)> =
-        sqlx::query_as(sqlx::AssertSqlSafe(draining_nodes_query()))
-            .bind("draining")
-            .bind(SubstrateKind::Kubernetes)
-            .fetch_all(&db.pool)
-            .await?;
-    let ids: Vec<_> = rows.into_iter().map(|(id, _)| id).collect();
-    assert!(ids.contains(&v1) && !ids.contains(&v2), "{ids:?}");
-    Ok(())
+/// A v1 writer keyed on drain phase.
+#[derive(Clone, Copy, Debug)]
+enum Writer {
+    DrainingList,
+    PhaseWrite,
+    TerminatingList,
+    DrainedList,
+    Reap,
+    OrphanDelete,
+    TerminatingDelete,
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn the_terminating_list_skips_a_v2_node() -> TestResult {
-    let Some(db) = try_pg_test_db().await? else {
-        return Ok(());
-    };
-    let v1 = node(&db.pool, "terminating", NodeDrainEngine::V1).await?;
-    let v2 = node(&db.pool, "terminating", NodeDrainEngine::V2).await?;
-    let ids = listed(&db.pool, terminating_nodes_query(), "terminating").await?;
-    assert!(ids.contains(&v1) && !ids.contains(&v2), "{ids:?}");
-    Ok(())
+impl Writer {
+    const ALL: [Self; 7] = [
+        Self::DrainingList,
+        Self::PhaseWrite,
+        Self::TerminatingList,
+        Self::DrainedList,
+        Self::Reap,
+        Self::OrphanDelete,
+        Self::TerminatingDelete,
+    ];
+
+    /// The phase the writer reads its node in.
+    fn phase(self) -> &'static str {
+        match self {
+            Self::DrainingList | Self::PhaseWrite => "draining",
+            Self::TerminatingList | Self::TerminatingDelete => "terminating",
+            Self::DrainedList | Self::Reap | Self::OrphanDelete => "drained",
+        }
+    }
+
+    /// Run the writer over the node; whether it took it.
+    async fn takes(self, pool: &PgPool, node_id: NodeId) -> TestResult<bool> {
+        Ok(match self {
+            Self::DrainingList => {
+                let rows: Vec<(NodeId, Option<String>)> =
+                    sqlx::query_as(sqlx::AssertSqlSafe(draining_nodes_query()))
+                        .bind("draining")
+                        .bind(SubstrateKind::Kubernetes)
+                        .fetch_all(pool)
+                        .await?;
+                rows.iter().any(|(id, _)| *id == node_id)
+            }
+            Self::PhaseWrite => {
+                sqlx::query(sqlx::AssertSqlSafe(set_drain_phase_query(
+                    ResidencyEvidence::LifecycleOnly,
+                    GuardScope::None,
+                )))
+                .bind(node_id)
+                .bind("drained")
+                .bind(None::<String>)
+                .bind("draining")
+                .execute(pool)
+                .await?;
+                phase(pool, node_id).await?.as_deref() == Some("drained")
+            }
+            Self::TerminatingList => listed(pool, terminating_nodes_query(), "terminating")
+                .await?
+                .contains(&node_id),
+            Self::DrainedList => NodeDbStore::new(pool.clone(), ResidencyEvidence::default())
+                .list_drained_nodes()
+                .await?
+                .contains(&node_id),
+            Self::Reap => {
+                sqlx::query(sqlx::AssertSqlSafe(sql!(mark_terminating_query(
+                    ResidencyEvidence::default()
+                ))))
+                .bind(node_id)
+                .bind("terminating")
+                .bind("drained")
+                .execute(pool)
+                .await?;
+                phase(pool, node_id).await?.as_deref() == Some("terminating")
+            }
+            Self::OrphanDelete => {
+                sqlx::query(sqlx::AssertSqlSafe(sql!(
+                    delete_drained_node_if_orphan_query(ResidencyEvidence::default())
+                )))
+                .bind(node_id)
+                .bind(UID)
+                .bind(SubstrateKind::Kubernetes)
+                .execute(pool)
+                .await?;
+                phase(pool, node_id).await?.is_none()
+            }
+            Self::TerminatingDelete => {
+                let deleted = delete_terminating_node_and_record_tombstone(pool, node_id).await?;
+                let tombstoned: bool = sqlx::query_scalar(sql!(
+                    "SELECT EXISTS (SELECT 1 FROM node_k8s_tombstones WHERE node_id = $1)"
+                ))
+                .bind(node_id)
+                .fetch_one(pool)
+                .await?;
+                deleted || tombstoned || phase(pool, node_id).await?.is_none()
+            }
+        })
+    }
 }
 
+/// Each v1 writer takes the v1 node and leaves the v2 node in the same phase:
+/// a v2 node's row stays, with no tombstone, for the v2 loop and the
+/// dead-node verb.
 #[tokio::test(flavor = "current_thread")]
-async fn the_drained_terminators_list_skips_a_v2_node() -> TestResult {
+async fn every_v1_writer_skips_a_v2_node() -> TestResult {
     let Some(db) = try_pg_test_db().await? else {
         return Ok(());
     };
-    let v1 = node(&db.pool, "drained", NodeDrainEngine::V1).await?;
-    let v2 = node(&db.pool, "drained", NodeDrainEngine::V2).await?;
-    let ids = NodeDbStore::new(db.pool.clone(), ResidencyEvidence::default())
-        .list_drained_nodes()
-        .await?;
-    assert!(ids.contains(&v1) && !ids.contains(&v2), "{ids:?}");
-    Ok(())
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn the_drained_terminators_reap_skips_a_v2_node() -> TestResult {
-    let Some(db) = try_pg_test_db().await? else {
-        return Ok(());
-    };
-    for (engine, reaped) in [(NodeDrainEngine::V1, true), (NodeDrainEngine::V2, false)] {
-        let node_id = node(&db.pool, "drained", engine).await?;
-        sqlx::query(sqlx::AssertSqlSafe(sql!(mark_terminating_query(
-            ResidencyEvidence::default()
-        ))))
-        .bind(node_id)
-        .bind("terminating")
-        .bind("drained")
-        .execute(&db.pool)
-        .await?;
-        let expected = if reaped { "terminating" } else { "drained" };
-        assert_eq!(
-            phase(&db.pool, node_id).await?.as_deref(),
-            Some(expected),
-            "{engine:?}"
+    for writer in Writer::ALL {
+        let v1 = node(&db.pool, writer.phase(), NodeDrainEngine::V1).await?;
+        let v2 = node(&db.pool, writer.phase(), NodeDrainEngine::V2).await?;
+        assert!(
+            !writer.takes(&db.pool, v2).await?,
+            "{writer:?} took the v2 node"
+        );
+        assert!(
+            writer.takes(&db.pool, v1).await?,
+            "{writer:?} left the v1 control"
         );
     }
-    Ok(())
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn the_drained_terminators_orphan_delete_skips_a_v2_node() -> TestResult {
-    let Some(db) = try_pg_test_db().await? else {
-        return Ok(());
-    };
-    for (engine, deleted) in [(NodeDrainEngine::V1, true), (NodeDrainEngine::V2, false)] {
-        let node_id = node(&db.pool, "drained", engine).await?;
-        sqlx::query(sqlx::AssertSqlSafe(sql!(
-            delete_drained_node_if_orphan_query(ResidencyEvidence::default())
-        )))
-        .bind(node_id)
-        .bind(UID)
-        .bind(SubstrateKind::Kubernetes)
-        .execute(&db.pool)
-        .await?;
-        assert_eq!(
-            phase(&db.pool, node_id).await?.is_none(),
-            deleted,
-            "{engine:?}"
-        );
-    }
-    Ok(())
-}
-
-/// The terminating delete, and the tombstone it records, take only a v1
-/// drain's node: a v2 node's row stays, with no tombstone, for the dead-node
-/// verb to delete.
-#[tokio::test(flavor = "current_thread")]
-async fn the_terminating_delete_and_its_tombstone_skip_a_v2_node() -> TestResult {
-    let Some(db) = try_pg_test_db().await? else {
-        return Ok(());
-    };
-    let v1 = node(&db.pool, "terminating", NodeDrainEngine::V1).await?;
-    let v2 = node(&db.pool, "terminating", NodeDrainEngine::V2).await?;
-    assert!(!delete_terminating_node_and_record_tombstone(&db.pool, v2).await?);
-    assert!(delete_terminating_node_and_record_tombstone(&db.pool, v1).await?);
-    assert!(phase(&db.pool, v1).await?.is_none());
-    assert_eq!(phase(&db.pool, v2).await?.as_deref(), Some("terminating"));
-    let tombstoned: Vec<NodeId> = sqlx::query_scalar(sql!(
-        "SELECT node_id FROM node_k8s_tombstones WHERE node_id IN ($1, $2)"
-    ))
-    .bind(v1)
-    .bind(v2)
-    .fetch_all(&db.pool)
-    .await?;
-    assert_eq!(tombstoned, [v1]);
     Ok(())
 }

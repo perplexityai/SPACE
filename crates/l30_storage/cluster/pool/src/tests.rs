@@ -4849,10 +4849,17 @@ async fn observed_demand_release_matching_characterization() -> TestResult {
 }
 
 /// A ready slot on a node in any drain phase is never claimed, though it is
-/// the oldest; the slot on an undrained node is, and with only drain-phase
-/// slots left the claim finds none.
+/// the oldest, by a shape's claim or a release's; the slot on an undrained
+/// node is, and with only drain-phase slots left the claim finds none.
 #[tokio::test(flavor = "current_thread")]
 async fn a_slot_on_a_draining_node_is_never_claimed() -> TestResult {
+    for by_release in [false, true] {
+        a_slot_on_a_draining_node_is_never_claimed_by(by_release).await?;
+    }
+    Ok(())
+}
+
+async fn a_slot_on_a_draining_node_is_never_claimed_by(by_release: bool) -> TestResult {
     let fixture = postgres_fixture().await?;
     let template = TemplateName::parse("seed")?;
     let (template_release_id, config_id, content_hash) =
@@ -4915,20 +4922,39 @@ async fn a_slot_on_a_draining_node_is_never_claimed() -> TestResult {
 
     let claim = || async {
         let mut tx = fixture.pool.begin().await?;
-        let claimed = WarmPoolStore::claim_ready_slot(
-            &mut tx,
-            template_release_id,
-            vcpu,
-            memory,
-            "space",
-            Uuid::now_v7(),
-            false,
-        )
-        .await?;
+        let claimed = if by_release {
+            WarmPoolStore::claim_ready_slot_for_release(
+                &mut tx,
+                template_release_id,
+                "space",
+                Uuid::now_v7(),
+                false,
+            )
+            .await?
+        } else {
+            WarmPoolStore::claim_ready_slot(
+                &mut tx,
+                template_release_id,
+                vcpu,
+                memory,
+                "space",
+                Uuid::now_v7(),
+                false,
+            )
+            .await?
+        };
         tx.commit().await?;
         TestResult::Ok(claimed.map(|slot| slot.id))
     };
-    assert_eq!(claim().await?, Some(slots[3]), "the undrained node's slot");
-    assert_eq!(claim().await?, None, "only drain-phase slots are left");
+    assert_eq!(
+        claim().await?,
+        slots.get(3).copied(),
+        "by_release={by_release}: the undrained node's slot"
+    );
+    assert_eq!(
+        claim().await?,
+        None,
+        "by_release={by_release}: only drain-phase slots are left"
+    );
     Ok(())
 }

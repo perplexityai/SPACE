@@ -460,6 +460,7 @@ where
                          WHERE n.id = $2
                            AND n.drain_phase = $6
                            AND n.drain_mode = $7
+                           AND n.drain_engine IS NULL
                     )
                 ), FALSE) AS row_matches,
                 EXISTS (
