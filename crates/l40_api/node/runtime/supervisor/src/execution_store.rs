@@ -7,7 +7,8 @@ use std::io::{self, Read, Write};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::PathBuf;
 
-use pplx_space_common_core::types::{SandboxActivationAttemptId, SandboxId, VcpuCount};
+use pplx_space_common_core::types::{SandboxActivationAttemptId, SandboxId};
+use pplx_space_execution_spec::VcpuCount;
 
 #[cfg(test)]
 mod tests;

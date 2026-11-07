@@ -8,7 +8,8 @@
 //! `pplx-space-accounts`, and reads `NodeRole`, from `pplx-space-common-core`.
 
 use pplx_space_accounts::NodeId;
-use pplx_space_common_core::types::{K8sNodeName, K8sNodeNameParseError, NodeRole};
+use pplx_space_common_core::types::NodeRole;
+use pplx_space_k8s_ids::{K8sNodeName, K8sNodeNameParseError};
 use uuid::Uuid;
 
 const SPACE_K8S_NODE_ID_NAMESPACE: Uuid =

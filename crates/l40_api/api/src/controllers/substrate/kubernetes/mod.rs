@@ -14,9 +14,8 @@ use kube::{
     api::{DeleteParams, PostParams, WatchEvent, WatchParams},
     runtime::reflector::{ObjectRef, Store},
 };
-use pplx_space_common_core::types::{
-    NodeRole as SpaceNodeRole, PodName, PodResourceVersion, PodUid, SandboxId, StorageUri,
-};
+use pplx_space_common_core::types::{NodeRole as SpaceNodeRole, SandboxId, StorageUri};
+use pplx_space_k8s_ids::{PodName, PodResourceVersion, PodUid};
 use pplx_space_k8s_node_id::space_k8s_node_id;
 use pplx_space_node_api_client::{
     NodeApiClient, WorkerApiClient as RetryingWorkerApiClient,

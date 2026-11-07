@@ -1,6 +1,6 @@
 //! Runtime control owned by node-manager. Lifecycle services do not receive a
 //! VMM's host-path-capable control socket or interpret provider-specific states.
-use pplx_space_common_core::types::RuntimeKind;
+use pplx_space_execution_spec::RuntimeKind;
 use std::{future::Future, path::PathBuf, pin::Pin};
 
 #[cfg(feature = "host-runtime")]

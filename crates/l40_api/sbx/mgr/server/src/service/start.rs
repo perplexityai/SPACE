@@ -3,7 +3,8 @@
 //! Startup and periodic repair stay in `recovery`; this module owns activation
 //! request parsing, placement and memory-policy resolution, and launch sequencing.
 
-use pplx_space_common_core::types::{LocalArtifactId, RateLimiter, TokenBucket};
+use pplx_space_common_core::types::LocalArtifactId;
+use pplx_space_execution_spec::{RateLimiter, TokenBucket};
 
 use super::activation_support::{
     ActivationFailureStage, IdentityFreeDirectActivationAuthority, NodeIdentitySource,
@@ -94,7 +95,7 @@ fn resolve_missing_checkpoint_restore_route_identity(
 }
 
 struct StartSandboxContext {
-    activation_auto_lifecycle: Option<pplx_space_common_core::types::AutoLifecyclePolicy>,
+    activation_auto_lifecycle: Option<pplx_space_auto_lifecycle::AutoLifecyclePolicy>,
     operation_activation_attempt_id:
         Option<pplx_space_common_core::types::SandboxActivationAttemptId>,
     checkpoint: String,
@@ -1803,7 +1804,7 @@ impl SandboxManagerService {
             let execution = match sandbox.execution_metadata.as_ref() {
                 Some(execution) => execution,
                 None => {
-                    legacy = pplx_space_common_core::types::ExecutionMetadata::initial_firecracker(
+                    legacy = pplx_space_execution_spec::ExecutionMetadata::initial_firecracker(
                         super::tail_support::host_architecture()
                             .map_err(|error| Status::failed_precondition(error.to_string()))?,
                         vec![],
@@ -2442,9 +2443,9 @@ impl SandboxManagerService {
         })?;
         let boot = pplx_space_node_runtime_core::boot::GuestBoot {
             guest: prepare_source.execution.guest(),
-            cpus: pplx_space_common_core::types::VcpuCount::try_from_u32(vcpu).map_err(
-                |error| activation_cleanup.failure(Status::invalid_argument(error.to_string())),
-            )?,
+            cpus: pplx_space_execution_spec::VcpuCount::try_from_u32(vcpu).map_err(|error| {
+                activation_cleanup.failure(Status::invalid_argument(error.to_string()))
+            })?,
             memory_mib: std::num::NonZeroU64::new(u64::from(mem_mib)).ok_or_else(|| {
                 activation_cleanup
                     .failure(Status::invalid_argument("guest memory must be positive"))
@@ -2514,11 +2515,11 @@ impl SandboxManagerService {
                     metadata_json: super::tail_support::activation_metadata_json(
                         &sandbox,
                         Some(
-                            pplx_space_common_core::types::VcpuCount::try_from_u32(vcpu)
+                            pplx_space_execution_spec::VcpuCount::try_from_u32(vcpu)
                                 .map_err(|error| Status::invalid_argument(error.to_string()))?,
                         ),
                         Some(
-                            pplx_space_common_core::types::MemorySize::mib(u64::from(mem_mib))
+                            pplx_space_byte_size::MemorySize::mib(u64::from(mem_mib))
                                 .map_err(|error| Status::invalid_argument(error.to_string()))?,
                         ),
                     )?,
@@ -2541,7 +2542,7 @@ impl SandboxManagerService {
         // DHCP guests also need the persisted image contract so the gateway's
         // atomic ruleset includes the DHCP exception on its first launch.
         let (network_contract_ready, wait_for_network_contract) = if sandbox.guest_image.network()
-            == pplx_space_common_core::types::guest_image::GuestNetwork::SlotDhcpV1
+            == pplx_space_execution_spec::guest_image::GuestNetwork::SlotDhcpV1
         {
             let (sender, receiver) = tokio::sync::oneshot::channel();
             (Some(sender), Some(receiver))
@@ -2617,7 +2618,7 @@ impl SandboxManagerService {
                 )
             })?;
             let resolved_execution_metadata =
-                pplx_space_common_core::types::ExecutionMetadata::try_from(&resolved_execution)
+                pplx_space_execution_spec::ExecutionMetadata::try_from(&resolved_execution)
                     .map_err(|error| Status::internal(error.to_string()))?;
             super::validation::require_environment_acknowledgement(
                 &prepare_source.execution,
@@ -3049,7 +3050,7 @@ impl SandboxManagerService {
     pub(super) fn rootfs_rate_limiter(
         &self,
         is_builder: bool,
-        limits: pplx_space_common_core::types::DiskIoLimits,
+        limits: pplx_space_execution_spec::DiskIoLimits,
     ) -> Option<RateLimiter> {
         (!is_builder).then(|| RateLimiter::for_disk(limits, self.config.disk_io_burst_secs()))
     }

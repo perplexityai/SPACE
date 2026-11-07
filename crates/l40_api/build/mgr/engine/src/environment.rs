@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use pplx_space_common_core::types::{
+use pplx_space_guest_process::{
     EnvKey, EnvMap, EnvParseError, EnvValue, MAX_ENV_ENTRIES, MAX_ENV_TOTAL_BYTES,
 };
 

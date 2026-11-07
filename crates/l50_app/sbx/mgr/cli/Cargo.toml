@@ -25,9 +25,14 @@ tonic = { workspace = true }
 
 # internal
 pplx-space-accounts = { workspace = true }
+pplx-space-auto-lifecycle = { workspace = true }
 pplx-space-common-cli = { workspace = true }
 pplx-space-common-core = { workspace = true }
 pplx-space-host-layout = { workspace = true }
+pplx-space-content-digest = { workspace = true }
+pplx-space-durations = { workspace = true }
+pplx-space-execution-spec = { workspace = true }
+pplx-space-guest-process = { workspace = true }
 pplx-space-net-common = { workspace = true }
 pplx-space-net-gateway-client = { workspace = true }
 pplx-space-node-api-client = { workspace = true }

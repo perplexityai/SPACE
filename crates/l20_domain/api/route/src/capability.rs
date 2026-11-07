@@ -3,7 +3,8 @@
 use std::fmt;
 use std::str::FromStr;
 
-use pplx_space_common_core::types::{GuestPort, SandboxRouteIdentity};
+use pplx_space_common_core::types::SandboxRouteIdentity;
+use pplx_space_network_roles::GuestPort;
 use serde::{Deserialize, Serialize};
 use tonic::metadata::MetadataMap;
 

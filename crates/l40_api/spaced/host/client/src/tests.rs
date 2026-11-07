@@ -17,9 +17,10 @@ const SECRET_INPUT: &[u8] = b"secret";
 fn process_options_debug_redacts_environment_values() {
     let mut options =
         StartProcessOptions::new(ProcessCommand::new(vec!["true".to_owned()]).expect("command"));
-    options.env = pplx_space_common_core::types::EnvMap::try_from(std::collections::HashMap::from(
-        [("TOKEN".to_owned(), "spaced-test-secret-value".to_owned())],
-    ))
+    options.env = pplx_space_guest_process::EnvMap::try_from(std::collections::HashMap::from([(
+        "TOKEN".to_owned(),
+        "spaced-test-secret-value".to_owned(),
+    )]))
     .expect("valid environment");
     let rendered = format!("{options:?}");
     assert!(!rendered.contains("spaced-test-secret-value"));

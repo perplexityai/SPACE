@@ -24,8 +24,10 @@ use tokio_util::task::TaskTracker;
 use crate::metrics::sandbox::worker::{
     NetGatewayRouteVerificationStatus, NetGatewayTlsInterceptionMode,
 };
-use pplx_space_common_core::types::{LinuxPid, SandboxId, SemVer};
+use pplx_space_common_core::types::SandboxId;
+use pplx_space_linux_ids::LinuxPid;
 use pplx_space_node_runtime_core::vm_state::VmState;
+use pplx_space_semver::SemVer;
 
 use crate::auto_lifecycle::AutoLifecycleCoordinator;
 use crate::db::guest_health_scan::SandboxGuestHealthRow;
@@ -276,7 +278,7 @@ struct GuestHealthGaugeValue {
 
 #[derive(Clone)]
 pub struct SidecarInfo {
-    pub guest_image: pplx_space_common_core::types::guest_image::GuestImageContract,
+    pub guest_image: pplx_space_execution_spec::guest_image::GuestImageContract,
     pub node_execution_id: Option<pplx_space_common_core::types::SandboxActivationAttemptId>,
     pub sandbox_id: String,
     pub uid: Option<u32>,
@@ -3341,7 +3343,7 @@ async fn restart_spaced_host(
 fn spaced_host_restart_args(
     sandbox_id: &str,
     vsock_uds_path: String,
-    agent: pplx_space_common_core::types::guest_image::QualifiedGuestAgent,
+    agent: pplx_space_execution_spec::guest_image::QualifiedGuestAgent,
 ) -> Vec<String> {
     vec![
         "--socket".to_string(),

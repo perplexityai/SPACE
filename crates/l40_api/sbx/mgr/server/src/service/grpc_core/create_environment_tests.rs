@@ -9,8 +9,8 @@ use super::create_after_lookup_tests::{
 use super::*;
 use crate::node_manager_transport::fake::FakeNodeManager;
 use crate::template_resolver::fake::FakeTemplateResolver;
-use pplx_space_common_core::types::{ExecutionMetadata, SnapshotExecutionMetadata};
 use pplx_space_execution_common::environment::EnvironmentDefinition;
+use pplx_space_execution_spec::{ExecutionMetadata, SnapshotExecutionMetadata};
 use pplx_space_node_mgr_client::proto::{
     NetworkPoolStatusRequest, NetworkPoolStatusResponse, ResolveExecutionEnvironmentRequest,
     ResolveExecutionEnvironmentResponse,
@@ -26,7 +26,7 @@ const RESOLVE: &str = "ResolveExecutionEnvironment";
 /// reference is the one sandbox-manager's qualification checks recognize.
 fn definition(name: &str) -> EnvironmentDefinition {
     pplx_space_node_runtime_core::catalog::CompiledEnvironment::for_architecture(
-        pplx_space_common_core::types::Arch::X86_64,
+        pplx_space_cpu_arch::Arch::X86_64,
     )
     .unwrap()
     .into_iter()

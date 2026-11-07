@@ -4,22 +4,26 @@
 #![cfg(test)]
 
 use pplx_space_accounts::NodeId;
+use pplx_space_auto_lifecycle::{
+    AutoLifecycleConditionSet, AutoLifecycleConditionSetId, AutoLifecycleIdleAction,
+    AutoLifecyclePolicy, AutoLifecycleStage,
+};
 use pplx_space_auto_lifecycle_receipt::AutoLifecyclePolicyFingerprint;
 use pplx_space_common_core::types::{LocalArtifactId, SnapshotId};
 use pplx_space_common_core::{
     sql,
     types::{
-        AbandonedRestoreRetirement, Arch, AutoLifecycleConditionSet, AutoLifecycleConditionSetId,
-        AutoLifecycleDeleteReceiptId, AutoLifecycleIdleAction, AutoLifecyclePolicy,
-        AutoLifecycleStage, ExecutionMetadata, SandboxActivationAttemptId, SandboxId,
-        SandboxLifecycle, SandboxQuarantineHistoryAction, SandboxQuarantineNextAction,
+        AbandonedRestoreRetirement, AutoLifecycleDeleteReceiptId, SandboxActivationAttemptId,
+        SandboxId, SandboxLifecycle, SandboxQuarantineHistoryAction, SandboxQuarantineNextAction,
         SandboxQuarantineReasonCode, SandboxQuarantineSource,
     },
 };
+use pplx_space_cpu_arch::Arch;
 use pplx_space_db_test_fixtures::{
     insert_pool_slot_receipt, insert_ready_worker_node, pg_test_db, pool_slot_receipt_state,
     publish_ready_disk_artifact, try_pg_test_db, try_pg_test_db_with_max_connections,
 };
+use pplx_space_execution_spec::ExecutionMetadata;
 use pplx_space_internal_api_server::{
     ClusterApiService,
     proto::{
@@ -978,10 +982,9 @@ async fn quarantine_recovery_observation_persists_and_clears_without_central_san
 
 #[tokio::test(flavor = "current_thread")]
 async fn publish_updates_observed_state_without_writing_component_rows() -> TestResult {
-    use pplx_space_common_core::types::{
-        ArtifactComponentKind, ArtifactComponentMetadata, ArtifactComponentRole, ArtifactFormat,
-        ArtifactVersion, Digest,
-    };
+    use pplx_space_content_digest::Digest;
+    use pplx_space_execution_spec::{ArtifactComponentKind, ArtifactComponentMetadata};
+    use pplx_space_execution_spec::{ArtifactComponentRole, ArtifactFormat, ArtifactVersion};
 
     let Some(db) = try_pg_test_db().await? else {
         return Ok(());

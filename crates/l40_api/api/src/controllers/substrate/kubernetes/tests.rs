@@ -69,11 +69,12 @@ mod kubernetes_tests {
     use pplx_space_common_core::sql;
     use pplx_space_common_core::types::{
         ArtifactKind, ArtifactOrigin, ExecutionGeneration, NodeAddress, NodeGroup, NodeGroupName,
-        NodeGroupPolicy, NodeManagedBy as SpaceNodeManagedBy, NodeRole as SpaceNodeRole, PodName,
-        PodResourceVersion, PodUid, SandboxActivationAttemptId, SandboxLifecycle,
-        SandboxTransitionTargetState, TemplateCompatSpec, TemplateName, TemplateVisibility,
+        NodeGroupPolicy, NodeManagedBy as SpaceNodeManagedBy, NodeRole as SpaceNodeRole,
+        SandboxActivationAttemptId, SandboxLifecycle, SandboxTransitionTargetState,
+        TemplateCompatSpec, TemplateName, TemplateVisibility,
     };
     use pplx_space_internal_api_server::publish_sandbox_states;
+    use pplx_space_k8s_ids::{PodName, PodResourceVersion, PodUid};
     use pplx_space_node_api_client::proto::PublishedSandboxState;
     use pplx_space_node_api_client::proto::worker_api_internal_server::{
         WorkerApiInternal, WorkerApiInternalServer,
@@ -7378,10 +7379,10 @@ mod kubernetes_tests {
             env: sqlx::types::Json(BTreeMap::new()),
             metadata: sqlx::types::Json(BTreeMap::new()),
             auto_lifecycle: sqlx::types::Json(
-                pplx_space_common_core::types::AutoLifecyclePolicy::disabled(),
+                pplx_space_auto_lifecycle::AutoLifecyclePolicy::disabled(),
             ),
             auto_lifecycle_state: sqlx::types::Json(
-                pplx_space_common_core::types::AutoLifecycleRuntimeState::default(),
+                pplx_space_auto_lifecycle::AutoLifecycleRuntimeState::default(),
             ),
             network_policy: Some(sqlx::types::Json(
                 pplx_space_net_common::NetworkPolicyV1::default(),
@@ -9104,9 +9105,8 @@ mod kubernetes_tests {
         let encoded = pods[0]["metadata"]["annotations"]["space.pplx.net/auto-lifecycle"]
             .as_str()
             .expect("materialized pod must carry the auto-lifecycle policy");
-        let actual: pplx_space_common_core::types::AutoLifecyclePolicy =
-            serde_json::from_str(encoded)?;
-        let expected: pplx_space_common_core::types::AutoLifecyclePolicy =
+        let actual: pplx_space_auto_lifecycle::AutoLifecyclePolicy = serde_json::from_str(encoded)?;
+        let expected: pplx_space_auto_lifecycle::AutoLifecyclePolicy =
             serde_json::from_value(expected_policy)?;
         assert_eq!(
             actual, expected,
@@ -11535,7 +11535,7 @@ mod kubernetes_tests {
             disk_mib: None,
         };
         let env = BTreeMap::new();
-        let auto_lifecycle = pplx_space_common_core::types::AutoLifecyclePolicy::disabled();
+        let auto_lifecycle = pplx_space_auto_lifecycle::AutoLifecyclePolicy::disabled();
         let template_network_policy = pplx_space_net_common::NetworkPolicyV1::default();
         // Well past the annotation limit: each address serializes to more
         // than eight bytes.
@@ -12104,7 +12104,7 @@ mod kubernetes_tests {
         release_id: Uuid,
         actor: crate::controllers::substrate::ActorRef,
         env: BTreeMap<String, String>,
-        auto_lifecycle: pplx_space_common_core::types::AutoLifecyclePolicy,
+        auto_lifecycle: pplx_space_auto_lifecycle::AutoLifecyclePolicy,
         network_policy: pplx_space_net_common::NetworkPolicyV1,
     }
 
@@ -12157,8 +12157,10 @@ mod kubernetes_tests {
     }
 
     async fn pool_claim_fixture(pod: PooledSlotPod<'_>) -> Result<PoolClaimFixture, BoxError> {
+        use pplx_space_byte_size::MemorySize;
         use pplx_space_cluster_pool::{NewPoolSlot, WarmPoolStore};
-        use pplx_space_common_core::types::{ContentHash, Digest, MemorySize, VcpuCount};
+        use pplx_space_content_digest::{ContentHash, Digest};
+        use pplx_space_execution_spec::VcpuCount;
 
         use crate::controllers::substrate::ActorRef;
 
@@ -12281,7 +12283,7 @@ mod kubernetes_tests {
                 pplx_space_accounts::Email::parse("pool-claim@example.com")?,
             ),
             env: BTreeMap::new(),
-            auto_lifecycle: pplx_space_common_core::types::AutoLifecyclePolicy::disabled(),
+            auto_lifecycle: pplx_space_auto_lifecycle::AutoLifecyclePolicy::disabled(),
             network_policy: pplx_space_net_common::NetworkPolicyV1::default(),
         })
     }

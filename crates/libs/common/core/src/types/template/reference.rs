@@ -4,7 +4,7 @@ use std::str::FromStr;
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
-use crate::types::runtime::RuntimeKind;
+use pplx_space_execution_spec::runtime::RuntimeKind;
 
 use super::build::TemplateBuildId;
 use super::digest::{TemplateArtifactDigest, TemplateArtifactDigestPrefix, TemplateIndexDigest};

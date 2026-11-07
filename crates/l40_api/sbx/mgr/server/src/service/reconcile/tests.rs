@@ -43,7 +43,7 @@ fn insert_due_suspended_sandbox(
     storage_id: &str,
     overdue_by_secs: u64,
 ) {
-    use pplx_space_common_core::types::{
+    use pplx_space_auto_lifecycle::{
         AutoLifecycleConditionSet, AutoLifecycleConditionSetId, AutoLifecycleStage,
     };
 

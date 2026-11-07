@@ -1,7 +1,7 @@
 use std::sync::Mutex;
 
 use super::*;
-use pplx_space_common_core::types::HostOperatingSystem;
+use pplx_space_execution_spec::HostOperatingSystem;
 
 fn catalog() -> &'static [CompiledEnvironment] {
     CompiledEnvironment::cached_for_architecture(Arch::X86_64).unwrap()

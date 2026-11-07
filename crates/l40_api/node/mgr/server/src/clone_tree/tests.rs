@@ -379,7 +379,8 @@ fn clone_refuses_a_linked_producer_record() {
 
 #[test]
 fn clone_rebinds_disk_identity_without_losing_its_execution_contract() {
-    use pplx_space_common_core::types::{Arch, SandboxId};
+    use pplx_space_common_core::types::SandboxId;
+    use pplx_space_cpu_arch::Arch;
     for environment in
         pplx_space_node_runtime_core::catalog::CompiledEnvironment::for_architecture(Arch::X86_64)
             .unwrap()

@@ -25,9 +25,9 @@ pub(super) fn suspend_artifact_metadata(
 /// The execution metadata an artifact backup records. A disk artifact carries
 /// no vCPU state, so it has no capture CPU, whatever its metadata says.
 pub(super) fn artifact_backup_execution(
-    execution: pplx_space_common_core::types::SnapshotExecutionMetadata,
+    execution: pplx_space_execution_spec::SnapshotExecutionMetadata,
     artifact_kind: pplx_space_common_core::types::ArtifactKind,
-) -> pplx_space_common_core::types::SnapshotExecutionMetadata {
+) -> pplx_space_execution_spec::SnapshotExecutionMetadata {
     match artifact_kind {
         pplx_space_common_core::types::ArtifactKind::Full => execution,
         pplx_space_common_core::types::ArtifactKind::Disk => execution.with_host_cpu(None),
@@ -43,7 +43,7 @@ pub(super) fn captured_suspend_snapshot_metadata(
 ) -> Result<crate::snapshot_upload::SnapshotMeta, Status> {
     let mut metadata = suspend_snapshot_metadata(sandbox, format)?;
     metadata.execution = metadata.execution.map(|execution| {
-        execution.with_host_cpu(pplx_space_common_core::types::HostCpu::current().cloned())
+        execution.with_host_cpu(pplx_space_execution_spec::HostCpu::current().cloned())
     });
     Ok(metadata)
 }

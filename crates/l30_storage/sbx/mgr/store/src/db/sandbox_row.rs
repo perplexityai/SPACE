@@ -7,11 +7,13 @@
 use std::collections::BTreeMap;
 
 use pplx_space_accounts::SandboxOwner;
+use pplx_space_auto_lifecycle::{AutoLifecyclePolicy, AutoLifecycleRuntimeState};
 use pplx_space_common_core::types::{
-    ArtifactKind, ArtifactOrigin, AutoLifecyclePolicy, AutoLifecycleRuntimeState,
-    ExecutionGeneration, ExecutionMetadata, LocalArtifactId, NodeManagedBy, RouteGeneration,
-    SandboxActivationAttemptId, SandboxId, SandboxRuntimeLabel, SpaceApiRouteIdentity,
+    ArtifactKind, ArtifactOrigin, ExecutionGeneration, LocalArtifactId, NodeManagedBy,
+    RouteGeneration, SandboxActivationAttemptId, SandboxId, SandboxRuntimeLabel,
+    SpaceApiRouteIdentity,
 };
+use pplx_space_execution_spec::ExecutionMetadata;
 use pplx_space_net_common::{NetworkPolicy, NetworkPolicyV1};
 use pplx_space_policy_authority::PolicyAuthority;
 use rusqlite::types::Type;
@@ -23,7 +25,7 @@ use crate::state::SandboxState;
 
 #[derive(Clone)]
 pub struct SandboxRow {
-    pub guest_image: pplx_space_common_core::types::guest_image::GuestImageContract,
+    pub guest_image: pplx_space_execution_spec::guest_image::GuestImageContract,
     pub node_execution_id: Option<SandboxActivationAttemptId>,
     pub id: String,
     pub uuid8: SandboxRuntimeLabel,
@@ -50,7 +52,7 @@ pub struct SandboxRow {
     pub updated_at: String,
     pub snapshots_enabled: bool,
     pub rootfs_size_mb: Option<u32>,
-    pub disk_io_limits: pplx_space_common_core::types::DiskIoLimits,
+    pub disk_io_limits: pplx_space_execution_spec::DiskIoLimits,
     pub pool_template: Option<String>,
     /// BYOK: this sandbox runs on dm-crypt encrypted volumes. Immutable for
     /// the sandbox's lifetime — stamped at create by the control plane and
@@ -313,7 +315,7 @@ pub(super) fn row_to_sandbox(row: &rusqlite::Row) -> rusqlite::Result<SandboxRow
         .ok()
         .zip(u64::try_from(disk_io_bandwidth).ok())
         .and_then(|(operations, bandwidth)| {
-            pplx_space_common_core::types::DiskIoLimits::try_new(operations, bandwidth).ok()
+            pplx_space_execution_spec::DiskIoLimits::try_new(operations, bandwidth).ok()
         })
         .ok_or_else(|| {
             column_error(row, "disk_io_max_operations_per_sec",

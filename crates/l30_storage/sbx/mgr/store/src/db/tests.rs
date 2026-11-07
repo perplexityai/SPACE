@@ -138,12 +138,18 @@ fn node_execution_cleanup_acknowledgements_are_retryable_and_fenced() {
     );
 }
 use pplx_space_accounts::UserId;
-use pplx_space_common_core::types::{
-    Arch, ArtifactComponentKind, ArtifactComponentMetadata, ArtifactFormat, ArtifactVersion,
+use pplx_space_auto_lifecycle::{
     AutoLifecycleConditionSet, AutoLifecycleConditionSetId, AutoLifecycleIdleAction,
-    AutoLifecycleStage, Digest, ExecutionMetadata, LinuxPid, LinuxUid, SandboxActivationAttemptId,
-    SandboxId, VsockCid,
+    AutoLifecycleStage,
 };
+use pplx_space_common_core::types::{SandboxActivationAttemptId, SandboxId};
+use pplx_space_content_digest::Digest;
+use pplx_space_cpu_arch::Arch;
+use pplx_space_execution_spec::{
+    ArtifactComponentKind, ArtifactComponentMetadata, ExecutionMetadata,
+};
+use pplx_space_execution_spec::{ArtifactFormat, ArtifactVersion};
+use pplx_space_linux_ids::{LinuxPid, LinuxUid, VsockCid};
 use uuid::Uuid;
 
 #[test]
@@ -1979,7 +1985,7 @@ fn insert_sandbox_persists_only_explicit_rootfs_size_override() {
 #[test]
 fn insert_sandbox_persists_effective_disk_io_limits() {
     let conn = crate::db::test_conn();
-    let expected = pplx_space_common_core::types::DiskIoLimits::try_new(5_000, 200).unwrap();
+    let expected = pplx_space_execution_spec::DiskIoLimits::try_new(5_000, 200).unwrap();
 
     insert_test_sandbox(
         &conn,

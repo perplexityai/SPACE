@@ -1,8 +1,7 @@
 use std::path::PathBuf;
 
-use pplx_space_common_core::types::{
-    ExecutionGeneration, LinuxPid, LinuxUid, SandboxActivationAttemptId, SandboxId, VsockCid,
-};
+use pplx_space_common_core::types::{ExecutionGeneration, SandboxActivationAttemptId, SandboxId};
+use pplx_space_linux_ids::{LinuxPid, LinuxUid, VsockCid};
 use pplx_space_node_mgr_protocol::proto::{
     ProcessEndpointIdentity as WireProcessEndpointIdentity,
     SandboxEndpointProof as WireSandboxEndpointProof,

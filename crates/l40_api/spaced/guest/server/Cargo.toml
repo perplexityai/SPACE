@@ -65,6 +65,7 @@ tower = { workspace = true }
 uuid = { workspace = true, features = ["v7"] }
 
 # internal
+pplx-space-guest-process = { workspace = true }
 pplx-space-service-host = { workspace = true, optional = true }
 pplx-space-service-lifecycle = { workspace = true, optional = true }
 pplx-space-spaced-guest-execution = { workspace = true }

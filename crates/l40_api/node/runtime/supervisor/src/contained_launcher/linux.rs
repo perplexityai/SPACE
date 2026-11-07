@@ -68,10 +68,8 @@ pub(crate) fn run(config: Config, stream: UnixStream) -> Result<(), String> {
 /// Called only by launcher mode, before Tokio or telemetry creates threads.
 fn prepare_and_exec(config: &Config, stream: &mut Option<UnixStream>) -> Result<(), Error> {
     use nix::mount::{MsFlags, mount};
-    if pplx_space_host_layout::gateway::gateway_uid(pplx_space_common_core::types::LinuxUid::new(
-        config.uid,
-    ))
-    .is_none()
+    if pplx_space_host_layout::gateway::gateway_uid(pplx_space_linux_ids::LinuxUid::new(config.uid))
+        .is_none()
         || config.uid != config.gid
     {
         return Err(Error::Invalid(

@@ -12,7 +12,8 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use pplx_space_accounts::{NodeId, OrgId, UserId};
-use pplx_space_common_core::types::{IdempotencyKey, SandboxId};
+use pplx_space_common_core::types::SandboxId;
+use pplx_space_guest_process::IdempotencyKey;
 use pplx_space_native_files::{FileOperation, guest_key};
 use pplx_space_public_api::RequestFingerprint;
 

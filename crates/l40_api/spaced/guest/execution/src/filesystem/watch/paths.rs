@@ -5,7 +5,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tonic::Status;
 
 use crate::filesystem::map_io_error;
-use pplx_space_common_core::types::GuestPath;
+use pplx_space_guest_process::GuestPath;
 
 use super::filter::WatchFilter;
 use super::{MAX_LEDGER_ROOTS, MAX_SKIPPED_DIRECTORIES, MAX_WATCHED_DIRECTORIES};

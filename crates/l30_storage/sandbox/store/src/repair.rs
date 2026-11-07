@@ -12,7 +12,8 @@
 //! and the writes to the other tables the same repair touches (executions,
 //! port exposures, observed states, quarantine state).
 
-use pplx_space_common_core::types::{LocalArtifactId, PositiveDuration, SandboxId, SubstrateKind};
+use pplx_space_common_core::types::{LocalArtifactId, SandboxId, SubstrateKind};
+use pplx_space_durations::PositiveDuration;
 
 use std::sync::LazyLock;
 

@@ -279,14 +279,17 @@ pub(crate) mod service_tests {
         ed25519::SpaceApiRouteEd25519VerificationGeneration,
         ed25519::insert_space_api_route_ed25519_token,
     };
+    use pplx_space_auto_lifecycle::{
+        AutoLifecycleConditionSet, AutoLifecycleConditionSetId, AutoLifecycleStage,
+    };
     use pplx_space_common_core::types::{
-        ArtifactKind, ArtifactOrigin, AutoLifecycleConditionSet, AutoLifecycleConditionSetId,
-        AutoLifecycleStage, ClusterId, ExecutionGeneration, LocalArtifactId, NodeManagedBy, PodUid,
-        RouteGeneration, SandboxActivationAttemptId, SandboxQuarantineHistoryAction,
+        ArtifactKind, ArtifactOrigin, ClusterId, ExecutionGeneration, LocalArtifactId,
+        NodeManagedBy, RouteGeneration, SandboxActivationAttemptId, SandboxQuarantineHistoryAction,
         SandboxQuarantineNextAction, SandboxQuarantineReasonCode, SandboxQuarantineSource,
         SandboxRouteIdentity, SpaceApiRouteIdentity,
     };
     use pplx_space_host_layout::identities::{user_names, users};
+    use pplx_space_k8s_ids::PodUid;
     use pplx_space_k8s_node_id::space_k8s_node_id;
 
     use prost::Message as _;
@@ -2701,7 +2704,7 @@ pub(crate) mod service_tests {
         let service = service_for_teardown_test(conn);
 
         let node_id = NodeId::new();
-        let pod_uid: pplx_space_common_core::types::PodUid =
+        let pod_uid: pplx_space_k8s_ids::PodUid =
             "019f8000-0000-7000-8000-0000000000bb".parse().unwrap();
         // A pooled pod boots with no activation-attempt annotation, so the
         // runtime published a locally minted placeholder the control plane
@@ -2725,7 +2728,7 @@ pub(crate) mod service_tests {
         // Claiming the pod mints an attempt and wakes an already-Started VM.
         let claimed_attempt = SandboxActivationAttemptId::new();
         let stale_node_id = NodeId::new();
-        let stale_pod_uid: pplx_space_common_core::types::PodUid =
+        let stale_pod_uid: pplx_space_k8s_ids::PodUid =
             "019f8000-0000-7000-8000-0000000000cc".parse().unwrap();
         assert_ne!(claimed_attempt, placeholder_attempt);
         let start = WakeStartConfig {
@@ -5857,15 +5860,15 @@ pub(crate) mod service_tests {
 
         assert_eq!(
             execution.runtime().kind,
-            pplx_space_common_core::types::RuntimeKind::CloudHypervisor
+            pplx_space_execution_spec::RuntimeKind::CloudHypervisor
         );
         assert_eq!(
             execution.guest().os,
-            pplx_space_common_core::types::GuestOperatingSystem::Windows
+            pplx_space_execution_spec::GuestOperatingSystem::Windows
         );
         assert_eq!(
             execution.guest().architecture,
-            pplx_space_common_core::types::Arch::X86_64
+            pplx_space_cpu_arch::Arch::X86_64
         );
     }
 
@@ -5883,13 +5886,13 @@ pub(crate) mod service_tests {
 
         assert_eq!(
             execution.runtime().kind,
-            pplx_space_common_core::types::RuntimeKind::Firecracker
+            pplx_space_execution_spec::RuntimeKind::Firecracker
         );
         assert_eq!(execution.runtime().version.as_str(), "1.15.1");
         assert_eq!(execution.state_format().unwrap().version.as_str(), "9.0.0");
         assert_eq!(
             execution.guest().architecture,
-            pplx_space_common_core::types::Arch::Aarch64
+            pplx_space_cpu_arch::Arch::Aarch64
         );
     }
 
@@ -6487,8 +6490,8 @@ pub(crate) mod service_tests {
         let sandbox_id = SandboxId::new().to_string();
         let local_artifact_id = LocalArtifactId::new().to_string();
         let credential_marker = "runtime-restore-secret";
-        let execution = pplx_space_common_core::types::ExecutionMetadata::initial_firecracker(
-            pplx_space_common_core::types::Arch::Aarch64,
+        let execution = pplx_space_execution_spec::ExecutionMetadata::initial_firecracker(
+            pplx_space_cpu_arch::Arch::Aarch64,
             vec![],
         );
 
@@ -16901,7 +16904,7 @@ pub(crate) mod service_tests {
     fn route_authorized_service_for_port(
         conn: crate::db::Connection,
         sandbox_id: SandboxId,
-        port: Option<pplx_space_common_core::types::GuestPort>,
+        port: Option<pplx_space_network_roles::GuestPort>,
     ) -> (SandboxManagerService, SpaceApiRouteEd25519Token) {
         let identity = SandboxRouteIdentity::try_new(
             sandbox_id,
@@ -16985,7 +16988,7 @@ pub(crate) mod service_tests {
                 policy
                     .wake
                     .on
-                    .push(pplx_space_common_core::types::AutoLifecycleWakeSource::Access);
+                    .push(pplx_space_auto_lifecycle::AutoLifecycleWakeSource::Access);
             }
             insert_test_sandbox_with_policy(&conn, &id.to_string(), SandboxState::Paused, &policy);
             let (service, token) = route_authorized_service(conn, id);
@@ -17223,7 +17226,7 @@ pub(crate) mod service_tests {
             cluster_policy
                 .wake
                 .on
-                .push(pplx_space_common_core::types::AutoLifecycleWakeSource::Access);
+                .push(pplx_space_auto_lifecycle::AutoLifecycleWakeSource::Access);
             service
                 .set_auto_lifecycle_policy(internal_request(
                     crate::proto::SetAutoLifecyclePolicyRequest {
@@ -17284,7 +17287,7 @@ pub(crate) mod service_tests {
             policy
                 .wake
                 .on
-                .push(pplx_space_common_core::types::AutoLifecycleWakeSource::Access);
+                .push(pplx_space_auto_lifecycle::AutoLifecycleWakeSource::Access);
             insert_test_sandbox_with_policy(&conn, &id.to_string(), SandboxState::Paused, &policy);
             let (service, token) = route_authorized_service(conn, id);
             {
@@ -20335,7 +20338,7 @@ pub(crate) mod service_tests {
         let conn = crate::db::test_conn();
         let id = SandboxId::new();
         let key = id.to_string();
-        let port = pplx_space_common_core::types::GuestPort::try_from_u16(8080).unwrap();
+        let port = pplx_space_network_roles::GuestPort::try_from_u16(8080).unwrap();
         seed_due_access_idle_sandbox(&conn, &key, 120, 300);
         let (service, token) = route_authorized_service_for_port(conn, id, Some(port));
         let before = access_idle_last_touched(&service, &key);
@@ -21142,14 +21145,14 @@ pub(crate) mod service_tests {
         let policy = AutoLifecyclePolicy {
             wake: Default::default(),
             condition_sets: BTreeMap::from([(
-                pplx_space_common_core::types::AutoLifecycleConditionSetId::GuestActivity,
-                pplx_space_common_core::types::AutoLifecycleConditionSet::guest_activity(Some(
+                pplx_space_auto_lifecycle::AutoLifecycleConditionSetId::GuestActivity,
+                pplx_space_auto_lifecycle::AutoLifecycleConditionSet::guest_activity(Some(
                     test_guest_activity_hold_cap(),
                 )),
             )]),
-            stages: vec![pplx_space_common_core::types::AutoLifecycleStage {
+            stages: vec![pplx_space_auto_lifecycle::AutoLifecycleStage {
                 condition_set:
-                    pplx_space_common_core::types::AutoLifecycleConditionSetId::GuestActivity,
+                    pplx_space_auto_lifecycle::AutoLifecycleConditionSetId::GuestActivity,
                 at: 30,
                 action: AutoLifecycleIdleAction::Suspend,
             }],
@@ -21174,7 +21177,7 @@ pub(crate) mod service_tests {
         let condition = row
             .auto_lifecycle_state
             .conditions
-            .get(&pplx_space_common_core::types::AutoLifecycleConditionSetId::GuestActivity)
+            .get(&pplx_space_auto_lifecycle::AutoLifecycleConditionSetId::GuestActivity)
             .expect("guest activity condition");
         let epoch_at = condition.epoch_at.expect("future guest idle epoch");
         assert!(condition.armed);
@@ -21195,12 +21198,12 @@ pub(crate) mod service_tests {
         let policy = AutoLifecyclePolicy {
             wake: Default::default(),
             condition_sets: BTreeMap::from([(
-                pplx_space_common_core::types::AutoLifecycleConditionSetId::GuestActivity,
-                pplx_space_common_core::types::AutoLifecycleConditionSet::guest_activity(None),
+                pplx_space_auto_lifecycle::AutoLifecycleConditionSetId::GuestActivity,
+                pplx_space_auto_lifecycle::AutoLifecycleConditionSet::guest_activity(None),
             )]),
-            stages: vec![pplx_space_common_core::types::AutoLifecycleStage {
+            stages: vec![pplx_space_auto_lifecycle::AutoLifecycleStage {
                 condition_set:
-                    pplx_space_common_core::types::AutoLifecycleConditionSetId::GuestActivity,
+                    pplx_space_auto_lifecycle::AutoLifecycleConditionSetId::GuestActivity,
                 at: 30,
                 action: AutoLifecycleIdleAction::Suspend,
             }],
@@ -21225,14 +21228,14 @@ pub(crate) mod service_tests {
         let policy = AutoLifecyclePolicy {
             wake: Default::default(),
             condition_sets: BTreeMap::from([(
-                pplx_space_common_core::types::AutoLifecycleConditionSetId::GuestActivity,
-                pplx_space_common_core::types::AutoLifecycleConditionSet::guest_activity(Some(
+                pplx_space_auto_lifecycle::AutoLifecycleConditionSetId::GuestActivity,
+                pplx_space_auto_lifecycle::AutoLifecycleConditionSet::guest_activity(Some(
                     test_guest_activity_hold_cap(),
                 )),
             )]),
-            stages: vec![pplx_space_common_core::types::AutoLifecycleStage {
+            stages: vec![pplx_space_auto_lifecycle::AutoLifecycleStage {
                 condition_set:
-                    pplx_space_common_core::types::AutoLifecycleConditionSetId::GuestActivity,
+                    pplx_space_auto_lifecycle::AutoLifecycleConditionSetId::GuestActivity,
                 at: 30,
                 action: AutoLifecycleIdleAction::Suspend,
             }],
@@ -21252,7 +21255,7 @@ pub(crate) mod service_tests {
         let condition = row
             .auto_lifecycle_state
             .conditions
-            .get(&pplx_space_common_core::types::AutoLifecycleConditionSetId::GuestActivity)
+            .get(&pplx_space_auto_lifecycle::AutoLifecycleConditionSetId::GuestActivity)
             .expect("guest activity condition");
         let epoch_at = condition.epoch_at.expect("future guest idle epoch");
         assert!(condition.armed);

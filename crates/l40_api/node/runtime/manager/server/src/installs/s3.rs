@@ -8,7 +8,9 @@
 
 use std::time::Duration;
 
-use pplx_space_common_core::types::{Arch, RuntimeKind, StorageUri};
+use pplx_space_common_core::types::StorageUri;
+use pplx_space_cpu_arch::Arch;
+use pplx_space_execution_spec::RuntimeKind;
 use pplx_space_s3_http_client::{DEFAULT_POOL_IDLE_TIMEOUT, S3ClientSpans, s3_http_client};
 
 use super::source::{

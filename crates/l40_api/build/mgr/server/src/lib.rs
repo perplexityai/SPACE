@@ -287,14 +287,14 @@ trait BuildBackend: Send + Sync {
         template_id: &str,
         job_id: &pplx_space_common_jobs::JobId,
         template_org: Option<TemplateOrg>,
-        environment: Option<pplx_space_common_core::types::EnvironmentReference>,
+        environment: Option<pplx_space_execution_spec::EnvironmentReference>,
     ) -> Result<BuildOutcome, BuildError>;
 
     async fn publish(
         &self,
         template_id: &str,
         content_hash: &str,
-        environment: Option<pplx_space_common_core::types::EnvironmentReference>,
+        environment: Option<pplx_space_execution_spec::EnvironmentReference>,
         publish_tags: &[String],
         publication: TemplatePublication,
     ) -> Result<(), PublishError>;
@@ -326,7 +326,7 @@ impl BuildBackend for RuntimeBuildBackend {
         template_id: &str,
         job_id: &pplx_space_common_jobs::JobId,
         template_org: Option<TemplateOrg>,
-        environment: Option<pplx_space_common_core::types::EnvironmentReference>,
+        environment: Option<pplx_space_execution_spec::EnvironmentReference>,
     ) -> Result<BuildOutcome, BuildError> {
         TemplateBuilder::new()
             .with_environment(environment)
@@ -340,7 +340,7 @@ impl BuildBackend for RuntimeBuildBackend {
         &self,
         template_id: &str,
         content_hash: &str,
-        environment: Option<pplx_space_common_core::types::EnvironmentReference>,
+        environment: Option<pplx_space_execution_spec::EnvironmentReference>,
         publish_tags: &[String],
         publication: TemplatePublication,
     ) -> Result<(), PublishError> {
@@ -845,7 +845,7 @@ impl BuildManager for BuildManagerDaemonService {
                 Some(
                     input
                         .reference
-                        .parse::<pplx_space_common_core::types::EnvironmentReference>()
+                        .parse::<pplx_space_execution_spec::EnvironmentReference>()
                         .map_err(|error| Status::invalid_argument(error.to_string()))?,
                 ),
             ),

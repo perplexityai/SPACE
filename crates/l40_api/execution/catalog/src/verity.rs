@@ -1,4 +1,4 @@
-use pplx_space_common_core::types::{Digest, DigestParseError};
+use pplx_space_content_digest::{Digest, DigestParseError};
 
 /// SHA-256 fs-verity descriptor digest: 4096-byte blocks, no salt, version 1.
 /// This is distinct from SHA-256 over the file's contents.

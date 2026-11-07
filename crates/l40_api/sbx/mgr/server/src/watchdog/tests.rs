@@ -1,10 +1,12 @@
 use super::*;
 use pplx_space_accounts::NodeId;
+use pplx_space_auto_lifecycle::AutoLifecyclePolicy;
 use pplx_space_common_core::types::{
-    AutoLifecyclePolicy, ExecutionGeneration, PodUid, RouteGeneration, SandboxId,
-    SandboxQuarantineNextAction, SandboxQuarantineReasonCode, SandboxQuarantineSource,
-    SandboxRuntimeLabel, SpaceApiRouteIdentity,
+    ExecutionGeneration, RouteGeneration, SandboxId, SandboxQuarantineNextAction,
+    SandboxQuarantineReasonCode, SandboxQuarantineSource, SandboxRuntimeLabel,
+    SpaceApiRouteIdentity,
 };
+use pplx_space_k8s_ids::PodUid;
 
 #[tokio::test]
 async fn gateway_metric_registry_forgets_retired_builds() {
@@ -1388,7 +1390,7 @@ fn inapplicable_guest_components_do_not_block_composed_health() {
 
 #[test]
 fn spaced_host_restart_args_preserve_control_socket_and_only_notify_qualified_guests() {
-    use pplx_space_common_core::types::guest_image::QualifiedGuestAgent;
+    use pplx_space_execution_spec::guest_image::QualifiedGuestAgent;
     let sandbox_id = "sbx-123";
     let vsock_uds_path = format!("{RUN_DIR}/{sandbox_id}/root/v.sock");
 

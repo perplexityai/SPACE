@@ -15,9 +15,10 @@ use futures_util::StreamExt as _;
 use pplx_space_build_mgr_client::proto as build_proto;
 use pplx_space_cluster_pool::WarmPoolStore;
 use pplx_space_common_core::types::{
-    BuildRunId, IdempotencyKey, SubstrateKind, SystemTemplate, TemplateDesiredState, TemplateId,
-    TemplateName, TemplateTag,
+    BuildRunId, SubstrateKind, SystemTemplate, TemplateDesiredState, TemplateId, TemplateName,
+    TemplateTag,
 };
+use pplx_space_guest_process::IdempotencyKey;
 use pplx_space_net_common::NetworkPolicyV1;
 use pplx_space_public_api::{
     OperationKind, OperationTargetType, PublicErrorCode, PublicErrorDetail, PublicErrorEnvelope,
@@ -99,7 +100,7 @@ struct TemplateRow {
     vcpu: Option<i32>,
     memory_mib: Option<i32>,
     disk_size_mb: Option<i32>,
-    default_auto_lifecycle: Option<SqlxJson<pplx_space_common_core::types::AutoLifecyclePolicy>>,
+    default_auto_lifecycle: Option<SqlxJson<pplx_space_auto_lifecycle::AutoLifecyclePolicy>>,
     network_policy: SqlxJson<NetworkPolicyV1>,
     observed_network_policy_generation: Option<i64>,
     observed_network_policy_authority: Option<String>,
@@ -1644,7 +1645,7 @@ pub async fn list_system_template_environments(
     if let Err(error) = require_template_admin(&state.pool, &actor).await {
         return error.into_response();
     }
-    use pplx_space_common_core::types::Arch;
+    use pplx_space_cpu_arch::Arch;
     use pplx_space_execution_catalog::catalog::CompiledEnvironment;
     let mut environments = Vec::new();
     for architecture in [Arch::X86_64, Arch::Aarch64] {
@@ -1762,7 +1763,7 @@ const _: () =
 
 /// A validated system template build request.
 struct SystemTemplateBuild {
-    environment: Option<pplx_space_common_core::types::EnvironmentReference>,
+    environment: Option<pplx_space_execution_spec::EnvironmentReference>,
     managing_org_id: OrgId,
     template: SystemTemplate,
     base: Option<String>,
@@ -2016,7 +2017,7 @@ fn system_template_build_fingerprint(
     base: Option<&str>,
     force: bool,
     publish_tags: &[String],
-    environment: Option<pplx_space_common_core::types::EnvironmentReference>,
+    environment: Option<pplx_space_execution_spec::EnvironmentReference>,
 ) -> Result<RequestFingerprint, ApiErrorResponse> {
     let mut body = serde_json::Map::from_iter([
         (
@@ -2110,7 +2111,7 @@ async fn submit_admin_template_build(
     force: bool,
     publish_tags: Vec<String>,
     client: Option<TemplateBuildClientContext>,
-    environment: Option<pplx_space_common_core::types::EnvironmentReference>,
+    environment: Option<pplx_space_execution_spec::EnvironmentReference>,
 ) -> axum::response::Response {
     let managing_org_id = match managing_org_id(
         &state.pool,

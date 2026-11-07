@@ -14,9 +14,10 @@ use pplx_space_api::controllers::substrate::{
     sandbox_states_with_client,
 };
 use pplx_space_common_core::types::{
-    NodeManagedBy, NodeRole, PodName, PodUid, PositiveDuration, SandboxActivationAttemptId,
-    SandboxId, SandboxLifecycle, SubstrateKind,
+    NodeManagedBy, NodeRole, SandboxActivationAttemptId, SandboxId, SandboxLifecycle, SubstrateKind,
 };
+use pplx_space_durations::PositiveDuration;
+use pplx_space_k8s_ids::{PodName, PodUid};
 use pplx_space_sandbox_store::sweeper::{self, unrestorable_restoring_guards};
 use sqlx::PgPool;
 

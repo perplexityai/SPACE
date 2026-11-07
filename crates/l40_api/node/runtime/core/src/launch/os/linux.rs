@@ -5,7 +5,8 @@ use std::time::{Duration, Instant};
 
 use nix::fcntl::{FcntlArg, FdFlag, fcntl};
 use nix::sys::resource::{Resource, setrlimit as nix_setrlimit};
-use pplx_space_common_core::types::{LinuxPid, ProcessSignal};
+use pplx_space_guest_process::ProcessSignal;
+use pplx_space_linux_ids::LinuxPid;
 use serde::{Deserialize, Serialize};
 
 /// Check if a PID is alive.

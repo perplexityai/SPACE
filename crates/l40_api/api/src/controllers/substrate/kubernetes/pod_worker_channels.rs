@@ -30,8 +30,8 @@ use std::net::SocketAddr;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use pplx_space_common_core::types::PodUid;
 use pplx_space_common_grpc::ConnectionWatch;
+use pplx_space_k8s_ids::PodUid;
 use tonic::transport::Channel;
 
 use crate::controllers::ControllerError;

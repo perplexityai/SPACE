@@ -4,14 +4,16 @@ use crate::metrics::sandbox::api::{
 };
 use futures_core::Stream;
 use pplx_space_accounts::{Email, NodeId, OrgId};
-use pplx_space_common_core::sql;
 #[cfg(test)]
-use pplx_space_common_core::types::AutoLifecycleRuntimeState;
+use pplx_space_auto_lifecycle::AutoLifecycleRuntimeState;
+use pplx_space_auto_lifecycle::{AutoLifecyclePolicy, SandboxAutoLifecyclePatch};
+use pplx_space_common_core::sql;
 use pplx_space_common_core::types::{
-    AutoLifecyclePolicy, DEFAULT_TEMPLATE_TAG, EnvMap, EnvSanitizationIssue, RuntimeKind,
-    SandboxAutoLifecyclePatch, SandboxId, SandboxLifecycle, SemVer, TemplateDesiredState,
-    TemplateName, TemplateReference, TemplateTag, TemplateVisibility,
+    DEFAULT_TEMPLATE_TAG, SandboxId, SandboxLifecycle, TemplateDesiredState, TemplateName,
+    TemplateReference, TemplateTag, TemplateVisibility,
 };
+use pplx_space_execution_spec::RuntimeKind;
+use pplx_space_guest_process::{EnvMap, EnvSanitizationIssue};
 use pplx_space_net_common::{NetworkPolicy, NetworkPolicyV1, proto::NetworkPolicySource};
 use pplx_space_node_mgr_client::proto::{AllowPortRequest, ExposePortRequest, NetworkProtocol};
 use pplx_space_policy_authority::PolicyAuthority;
@@ -34,6 +36,7 @@ use pplx_space_sbx_mgr_client::proto::{
     SpacedWriteRequest, SpacedWriteResponse, StatsRequest, StopRequest, TouchAutoLifecycleRequest,
     TouchAutoLifecycleResponse, UpdateRequest, WakeRequest,
 };
+use pplx_space_semver::SemVer;
 use pplx_space_state_reconciliation::{NetworkPolicyTarget, ReconcileFacet};
 use sqlx::{FromRow, PgPool, Postgres, Transaction};
 use std::time::Duration;

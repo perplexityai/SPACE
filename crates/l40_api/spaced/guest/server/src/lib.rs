@@ -71,7 +71,7 @@ use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 use tonic::{Request, Response, Status};
 
-use pplx_space_common_core::types::GuestUserName;
+use pplx_space_guest_process::GuestUserName;
 const BRIDGE_HOST_CALL_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_CONCURRENT_BRIDGE_HOST_CALLS: usize = 32;
 const LOCAL_GUEST_SOCKET_MODE: u32 = 0o666;

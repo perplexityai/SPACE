@@ -1,5 +1,6 @@
 use super::*;
-use pplx_space_common_core::types::{Arch, SandboxId};
+use pplx_space_common_core::types::SandboxId;
+use pplx_space_cpu_arch::Arch;
 
 #[test]
 fn capture_keeps_non_default_producer_binding_and_sandbox_identity() {

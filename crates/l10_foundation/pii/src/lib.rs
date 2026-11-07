@@ -5,7 +5,7 @@
 //! the wrapped data by default.
 //!
 //! It is its own crate so that code can mark values as PII without depending
-//! on `pplx-space-common-core`, which re-exports it from `types::privacy`.
+//! on `pplx-space-common-core`: import [`Pii`] from here.
 
 use std::fmt;
 

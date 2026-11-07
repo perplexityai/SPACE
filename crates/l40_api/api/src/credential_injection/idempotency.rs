@@ -1,7 +1,8 @@
 //! Durable replies for credential reference registration.
 use pplx_space_accounts::OrgId;
-use pplx_space_common_core::{sql, types::IdempotencyKey};
+use pplx_space_common_core::sql;
 use pplx_space_credential_injection::validation::ValidatedCredentialReference;
+use pplx_space_guest_process::IdempotencyKey;
 use pplx_space_public_api::RequestFingerprint;
 use serde::{Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};

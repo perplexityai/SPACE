@@ -497,7 +497,9 @@ fn retention_keeps_newest_per_tier_without_waiting_for_the_whole_census() {
 /// test rather than letting it compare `None` with `None`.
 #[test]
 fn checkpoint_sidecar_execution_metadata_records_the_capturing_host_cpu() {
-    use pplx_space_common_core::types::{Arch, ExecutionMetadata, HostCpu, TemplateName};
+    use pplx_space_common_core::types::TemplateName;
+    use pplx_space_cpu_arch::Arch;
+    use pplx_space_execution_spec::{ExecutionMetadata, HostCpu};
 
     #[cfg(target_os = "linux")]
     assert!(
@@ -511,9 +513,7 @@ fn checkpoint_sidecar_execution_metadata_records_the_capturing_host_cpu() {
         TemplateName::parse("seed").unwrap(),
         None,
     )
-    .with_guest_memory(Some(
-        pplx_space_common_core::types::MemorySize::mib(2048).unwrap(),
-    ));
+    .with_guest_memory(Some(pplx_space_byte_size::MemorySize::mib(2048).unwrap()));
     let execution = checkpoint_sidecar_execution_metadata(metadata).unwrap();
 
     assert_eq!(execution.host_cpu(), HostCpu::current());

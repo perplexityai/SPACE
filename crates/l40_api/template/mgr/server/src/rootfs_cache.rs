@@ -1,4 +1,4 @@
-use pplx_space_common_core::types::guest_image::GuestDiskLayout;
+use pplx_space_execution_spec::guest_image::GuestDiskLayout;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, thiserror::Error)]

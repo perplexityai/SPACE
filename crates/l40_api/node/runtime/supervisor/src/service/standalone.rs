@@ -1,7 +1,7 @@
 //! Standalone VMM process admission. The runtime's control protocol and guest
 //! boot configuration remain owned by the node-manager adapter.
 use super::*;
-use pplx_space_common_core::types::{EnvironmentReference, RuntimeKind};
+use pplx_space_execution_spec::{EnvironmentReference, RuntimeKind};
 use pplx_space_node_runtime_core::{
     artifact_store::release_directory_names,
     authenticated_source::SourcePins,

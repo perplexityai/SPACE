@@ -2,7 +2,8 @@ use super::normalize_environment_input;
 use super::require_environment_acknowledgement;
 use super::template_base_snapshot_dir;
 use super::template_snapshot_partition;
-use pplx_space_common_core::types::{Arch, EnvironmentReference, ExecutionMetadata};
+use pplx_space_cpu_arch::Arch;
+use pplx_space_execution_spec::{EnvironmentReference, ExecutionMetadata};
 
 #[test]
 fn bound_execution_requires_positive_peer_acknowledgement() {
@@ -91,7 +92,7 @@ fn create_paths() -> Vec<(&'static str, crate::proto::CreateRequest, bool)> {
 
 #[test]
 fn compiled_environments_admit_the_create_paths_they_qualify_for_and_never_relabel_a_template() {
-    use pplx_space_common_core::types::Digest;
+    use pplx_space_content_digest::Digest;
     use pplx_space_node_runtime_core::catalog::CompiledEnvironment;
     for environment in CompiledEnvironment::for_architecture(Arch::X86_64).unwrap() {
         let reference = environment.definition().reference();
@@ -113,7 +114,7 @@ fn compiled_environments_admit_the_create_paths_they_qualify_for_and_never_relab
                     selector.is_some()
                 );
                 let unqualified_cluster = execution.runtime().kind
-                    == pplx_space_common_core::types::RuntimeKind::CloudHypervisor
+                    == pplx_space_execution_spec::RuntimeKind::CloudHypervisor
                     && (request.sandbox_id.is_some() || request.route_identity.is_some());
                 if unqualified_cluster
                     || (needs_memory_state && !environment.supports_memory_state())
@@ -144,7 +145,8 @@ fn compiled_environments_admit_the_create_paths_they_qualify_for_and_never_relab
 
 #[test]
 fn an_environment_without_memory_state_support_is_refused_on_memory_paths() {
-    use pplx_space_common_core::types::{Digest, RuntimeIdentity, RuntimeKind};
+    use pplx_space_content_digest::Digest;
+    use pplx_space_execution_spec::{RuntimeIdentity, RuntimeKind};
     let reference = EnvironmentReference::new(Digest::sha256([8; 32]));
     let execution = ExecutionMetadata::new(
         RuntimeIdentity {
@@ -203,7 +205,8 @@ fn a_selected_create_cannot_be_a_pool_member_but_an_empty_pool_names_none() {
 
 #[test]
 fn a_selected_create_boots_cold_so_only_its_snapshots_need_memory_state() {
-    use pplx_space_common_core::types::{Digest, RuntimeIdentity, RuntimeKind};
+    use pplx_space_content_digest::Digest;
+    use pplx_space_execution_spec::{RuntimeIdentity, RuntimeKind};
     let reference = EnvironmentReference::new(Digest::sha256([8; 32]));
     let cold_only = ExecutionMetadata::new(
         RuntimeIdentity {
@@ -238,7 +241,7 @@ fn only_node_local_cold_creation_selects_a_compatible_consumer() {
 
 #[test]
 fn a_non_default_base_snapshot_boots_only_under_its_producer_environment() {
-    use pplx_space_common_core::types::SnapshotExecutionMetadata;
+    use pplx_space_execution_spec::SnapshotExecutionMetadata;
     use pplx_space_node_runtime_core::catalog::CompiledEnvironment;
     let catalog = CompiledEnvironment::for_architecture(Arch::X86_64).unwrap();
     let execution = |name| {
@@ -404,7 +407,7 @@ fn selected_create_has_one_authority_and_old_wire_readers_reject_it() {
 
 #[test]
 fn memory_state_support_follows_complete_environment_identity() {
-    use pplx_space_common_core::types::Digest;
+    use pplx_space_content_digest::Digest;
     use pplx_space_node_runtime_core::catalog::CompiledEnvironment;
     let environments = CompiledEnvironment::for_architecture(Arch::X86_64).unwrap();
     let e0 = environments[0]
@@ -445,8 +448,8 @@ fn a_capture_publishes_under_the_partition_template_manager_names() {
     use pplx_space_common_core::types::TemplateCachePartition;
     let hash = format!("sha256:{}", "a".repeat(64));
     let initial = pplx_space_node_runtime_core::catalog::initial_environment_reference();
-    let twin = EnvironmentReference::new(pplx_space_common_core::types::Digest::sha256([2; 32]));
-    let other = EnvironmentReference::new(pplx_space_common_core::types::Digest::sha256([3; 32]));
+    let twin = EnvironmentReference::new(pplx_space_content_digest::Digest::sha256([2; 32]));
+    let other = EnvironmentReference::new(pplx_space_content_digest::Digest::sha256([3; 32]));
     let bound = |environment| {
         ExecutionMetadata::initial_firecracker(Arch::X86_64, vec![]).with_environment(environment)
     };
@@ -500,9 +503,10 @@ fn a_capture_publishes_under_the_partition_template_manager_names() {
 
 #[test]
 fn automatic_lifecycle_admission_respects_runtime_capabilities() {
-    use pplx_space_common_core::types::{
-        AutoLifecycleIdleAction, AutoLifecyclePolicy, AutoLifecycleStage, RuntimeKind,
+    use pplx_space_auto_lifecycle::{
+        AutoLifecycleIdleAction, AutoLifecyclePolicy, AutoLifecycleStage,
     };
+    use pplx_space_execution_spec::RuntimeKind;
     for action in [
         AutoLifecycleIdleAction::None,
         AutoLifecycleIdleAction::Pause,
@@ -512,8 +516,7 @@ fn automatic_lifecycle_admission_respects_runtime_capabilities() {
     ] {
         let policy = AutoLifecyclePolicy {
             stages: vec![AutoLifecycleStage {
-                condition_set:
-                    pplx_space_common_core::types::AutoLifecycleConditionSetId::AccessIdle,
+                condition_set: pplx_space_auto_lifecycle::AutoLifecycleConditionSetId::AccessIdle,
                 at: 60,
                 action,
             }],
@@ -522,7 +525,7 @@ fn automatic_lifecycle_admission_respects_runtime_capabilities() {
         super::validate_runtime_lifecycle_policy(RuntimeKind::Firecracker, &policy).unwrap();
         super::validate_runtime_lifecycle_policy(RuntimeKind::CloudHypervisor, &policy).unwrap();
         for entry in pplx_space_node_runtime_core::catalog::CompiledEnvironment::for_architecture(
-            pplx_space_common_core::types::Arch::X86_64,
+            pplx_space_cpu_arch::Arch::X86_64,
         )
         .unwrap()
         {
@@ -546,7 +549,7 @@ fn automatic_lifecycle_admission_respects_runtime_capabilities() {
 #[test]
 fn qualified_template_supports_local_snapshot_and_pool_creation_without_runtime_relabeling() {
     use crate::proto::{BootMode, CreateRequest};
-    use pplx_space_common_core::types::RuntimeKind;
+    use pplx_space_execution_spec::RuntimeKind;
     for environment in [Arch::X86_64, Arch::Aarch64]
         .into_iter()
         .flat_map(|arch| {

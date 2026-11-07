@@ -185,6 +185,7 @@ impl NodeSandboxRunDir {
 ///
 /// ```rust
 /// # use pplx_space_common_core::types::*;
+/// # use pplx_space_content_digest::{ContentHash, Digest};
 /// let root = NodeSpacePath::parse("/space")?;
 /// let template = TemplateName::parse("seed")?;
 /// let hash = ContentHash::new(Digest::sha256([0; 32]));
@@ -204,6 +205,7 @@ impl NodeTemplateRootfsPath {
     ///
     /// ```rust
     /// # use pplx_space_common_core::types::*;
+    /// # use pplx_space_content_digest::{ContentHash, Digest};
     /// let root = NodeSpacePath::parse("/space")?;
     /// let template = TemplateName::parse("seed")?;
     /// let hash = ContentHash::new(Digest::sha256([1; 32]));
@@ -228,6 +230,7 @@ impl NodeTemplateRootfsPath {
     ///
     /// ```rust
     /// # use pplx_space_common_core::types::*;
+    /// # use pplx_space_content_digest::{ContentHash, Digest};
     /// let root = NodeSpacePath::parse("/space")?;
     /// let template = TemplateName::parse("seed")?;
     /// let hash = ContentHash::new(Digest::sha256([2; 32]));

@@ -18,7 +18,7 @@ struct Environments {
 
 fn environments() -> Environments {
     let compiled = pplx_space_node_runtime_core::catalog::CompiledEnvironment::for_architecture(
-        pplx_space_common_core::types::Arch::X86_64,
+        pplx_space_cpu_arch::Arch::X86_64,
     )
     .unwrap();
     let executions: Vec<_> = compiled
@@ -944,8 +944,8 @@ async fn only_a_certified_upgrade_edge_is_followed() {
     // A historical contract no compiled environment describes has no edges.
     let h = harness(SandboxState::Stopped);
     let custom = ExecutionMetadata::new(
-        pplx_space_common_core::types::RuntimeIdentity {
-            kind: pplx_space_common_core::types::RuntimeKind::Firecracker,
+        pplx_space_execution_spec::RuntimeIdentity {
+            kind: pplx_space_execution_spec::RuntimeKind::Firecracker,
             version: "1.14.0".parse().unwrap(),
         },
         h.envs.source.guest(),

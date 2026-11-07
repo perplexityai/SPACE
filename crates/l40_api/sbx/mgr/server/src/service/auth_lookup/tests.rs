@@ -13,11 +13,10 @@ async fn gateway_identity_mapping_preserves_exact_pid_and_lifecycle_authority() 
     )
     .unwrap();
     let owner = 10_042;
-    let isolated = pplx_space_host_layout::gateway::gateway_uid(
-        pplx_space_common_core::types::LinuxUid::new(owner),
-    )
-    .unwrap()
-    .get();
+    let isolated =
+        pplx_space_host_layout::gateway::gateway_uid(pplx_space_linux_ids::LinuxUid::new(owner))
+            .unwrap()
+            .get();
     crate::db::update_netgtw_pid(&conn, &id, owner, 4242).unwrap();
     let service = SandboxManagerService::new_with_options(
         conn,

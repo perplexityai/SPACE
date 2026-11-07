@@ -6,7 +6,7 @@ use crate::service::recovery_cross_node::{
 };
 
 use pplx_space_accounts::{SandboxOwner, SandboxOwnerKind, TEMPLATE_MANAGER_SANDBOX_OWNER};
-use pplx_space_common_core::types::DEFAULT_GUEST_USER;
+use pplx_space_guest_process::DEFAULT_GUEST_USER;
 
 fn snapshot_meta_with_sandbox(
     sandbox: Option<crate::snapshot_upload::SnapshotSandbox>,
@@ -19,7 +19,7 @@ fn snapshot_meta_with_sandbox(
         rootfs_size_bytes: None,
         created_at: "2026-05-21T00:00:00Z".to_string(),
         source: crate::snapshot_upload::SnapshotSource {
-            runtime: pplx_space_common_core::types::RUNTIME_FIRECRACKER_ALIAS.to_string(),
+            runtime: pplx_space_execution_spec::RUNTIME_FIRECRACKER_ALIAS.to_string(),
             runtime_version: None,
             state_format_version: None,
             template_id: "seed".to_string(),
@@ -50,7 +50,7 @@ fn restore_meta_with_process_env(
         owner: "user".to_string(),
         snapshots_enabled: true,
         process_env,
-        auto_lifecycle: pplx_space_common_core::types::AutoLifecyclePolicy::disabled(),
+        auto_lifecycle: pplx_space_auto_lifecycle::AutoLifecyclePolicy::disabled(),
     }))
 }
 
@@ -84,7 +84,7 @@ pub(in crate::service) fn insert_suspended_test_sandbox(conn: &crate::db::Connec
             pool_template: Some("pool-template"),
             volume_encryption: false,
             process_env: &process_env,
-            auto_lifecycle: &pplx_space_common_core::types::AutoLifecyclePolicy::disabled(),
+            auto_lifecycle: &pplx_space_auto_lifecycle::AutoLifecyclePolicy::disabled(),
             network_policy_override: None,
             network_policy_generation: 0,
             network_policy_authority: crate::db::PolicyAuthority::Cluster,
@@ -102,7 +102,7 @@ fn recovered_sandbox_row_fields_defaults_missing_owner_block_to_legacy_guest_use
     assert!(missing.process_env.is_empty());
     assert_eq!(
         missing.auto_lifecycle,
-        pplx_space_common_core::types::AutoLifecyclePolicy::disabled()
+        pplx_space_auto_lifecycle::AutoLifecyclePolicy::disabled()
     );
 }
 
@@ -113,7 +113,7 @@ fn recovered_sandbox_row_fields_rejects_invalid_owner() {
             owner: String::new(),
             snapshots_enabled: true,
             process_env: std::collections::BTreeMap::new(),
-            auto_lifecycle: pplx_space_common_core::types::AutoLifecyclePolicy::disabled(),
+            auto_lifecycle: pplx_space_auto_lifecycle::AutoLifecyclePolicy::disabled(),
         },
     ))) {
         Ok(_) => panic!("empty sandbox owner must reject"),
@@ -133,7 +133,7 @@ fn recovered_sandbox_row_fields_preserves_template_manager_owner() {
             owner: TEMPLATE_MANAGER_SANDBOX_OWNER.to_string(),
             snapshots_enabled: true,
             process_env: std::collections::BTreeMap::new(),
-            auto_lifecycle: pplx_space_common_core::types::AutoLifecyclePolicy::disabled(),
+            auto_lifecycle: pplx_space_auto_lifecycle::AutoLifecyclePolicy::disabled(),
         },
     )))
     .unwrap();
@@ -297,7 +297,7 @@ fn restore_as_new_uses_target_disk_io_assignment() {
     let sandbox_id = "019d84bd-280d-7331-99c6-b63377f3a3a2";
     insert_quarantined_orphan(&conn, sandbox_id);
     let meta = restore_meta_with_process_env(std::collections::BTreeMap::new());
-    let target_limits = pplx_space_common_core::types::DiskIoLimits::try_new(5_000, 200).unwrap();
+    let target_limits = pplx_space_execution_spec::DiskIoLimits::try_new(5_000, 200).unwrap();
 
     insert_restoring_sandbox_row_from_snapshot(
         &conn,

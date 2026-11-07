@@ -219,7 +219,7 @@ async fn unpersisted_stop_and_delete_clean_up_through_node_manager_and_report_th
 async fn unpersisted_admission_preserves_flush_qualification_after_row_loss() {
     use crate::db::cleanup_jobs::GuestFlush;
     use crate::db::test_fixtures::state_write_fixtures::with_sandbox_params;
-    use pplx_space_common_core::types::guest_image::{
+    use pplx_space_execution_spec::guest_image::{
         GuestAgent, GuestDiskLayout, GuestImageContract, GuestNetwork, GuestReadiness,
     };
     let windows = GuestImageContract::new(
@@ -254,7 +254,7 @@ async fn unpersisted_admission_preserves_flush_qualification_after_row_loss() {
         if bound {
             let environments =
                 pplx_space_execution_catalog::catalog::CompiledEnvironment::for_architecture(
-                    pplx_space_common_core::types::Arch::X86_64,
+                    pplx_space_cpu_arch::Arch::X86_64,
                 )
                 .unwrap();
             let execution = environments

@@ -48,6 +48,7 @@ uuid = { workspace = true, features = ["v7"] }
 zstd = { workspace = true }
 
 # internal
+pplx-space-auto-lifecycle = { workspace = true, features = ["serde"] }
 pplx-space-common-core = { workspace = true, features = ["serde"] }
 pplx-space-btrfs = { workspace = true }
 pplx-space-host-layout = { workspace = true }
@@ -55,8 +56,12 @@ pplx-space-template-cache-permissions = { workspace = true }
 pplx-space-file-io = { workspace = true, features = ["reflink"] }
 pplx-space-common-jobs = { workspace = true }
 pplx-space-lru-reaper = { workspace = true }
+pplx-space-content-digest = { workspace = true, features = ["serde"] }
+pplx-space-cpu-arch = { workspace = true, features = ["serde"] }
+pplx-space-execution-spec = { workspace = true, features = ["serde"] }
 pplx-space-grpc-rate-limiter = { workspace = true }
 pplx-space-grpc-server = { workspace = true }
+pplx-space-guest-process = { workspace = true, features = ["serde"] }
 pplx-space-local-health = { workspace = true }
 pplx-space-page-cache = { workspace = true }
 pplx-space-rpc-auth = { workspace = true }

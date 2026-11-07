@@ -14,7 +14,8 @@
 //! guard keeps one definition while that read lives elsewhere.
 
 use pplx_space_accounts::NodeId;
-use pplx_space_common_core::types::{PodUid, SandboxId, SandboxLifecycle};
+use pplx_space_common_core::types::{SandboxId, SandboxLifecycle};
+use pplx_space_k8s_ids::PodUid;
 
 use pplx_space_common_core::sql;
 use pplx_space_sandbox_portability::orphan_recovery_revert_eligibility;

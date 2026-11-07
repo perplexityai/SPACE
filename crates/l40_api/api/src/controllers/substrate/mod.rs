@@ -41,16 +41,17 @@ use std::{
 use crate::metrics::sandbox::api::SandboxApiMetricIdentity;
 use pplx_space_accounts::{Email, NodeId, OrgId, SandboxOwner, UserId};
 use pplx_space_api_route::wait_ready_lifecycle_request;
+use pplx_space_auto_lifecycle::AutoLifecyclePolicy;
 use pplx_space_bearer_token::SpaceBearerToken;
 use pplx_space_common_core::types::{
-    ArtifactKind, ArtifactOrigin, AutoLifecyclePolicy, BackupAttemptId, BackupSource,
-    LocalArtifactId, NodeAddress, NodeManagedBy, NodePoolName, NodeRole, PodName,
-    PodResourceVersion, PodUid, SandboxActivationAttemptId, SandboxId, SandboxLifecycle,
+    ArtifactKind, ArtifactOrigin, BackupAttemptId, BackupSource, LocalArtifactId, NodeAddress,
+    NodeManagedBy, NodePoolName, NodeRole, SandboxActivationAttemptId, SandboxId, SandboxLifecycle,
     SandboxRouteIdentity, TemplateName,
 };
 use pplx_space_common_grpc::{
     GrpcClientTrace, trace_grpc_client_transport as wrap_grpc_client_channel,
 };
+use pplx_space_k8s_ids::{PodName, PodResourceVersion, PodUid};
 use pplx_space_net_common::NetworkPolicyV1;
 use pplx_space_net_common::proto::NetworkPolicyV1 as NetworkPolicyProto;
 use pplx_space_rpc_auth::SpaceBearerInterceptor;
@@ -429,7 +430,7 @@ pub struct CreateExecutionRequest<'a> {
     pub actor: &'a ActorRef,
     pub template_ref: &'a TemplateRef<'a>,
     pub resources: &'a SandboxResources,
-    pub disk_io_limits: pplx_space_common_core::types::DiskIoLimits,
+    pub disk_io_limits: pplx_space_execution_spec::DiskIoLimits,
     pub env: &'a BTreeMap<String, String>,
     pub auto_lifecycle: &'a AutoLifecyclePolicy,
     pub network_policy_override: Option<&'a NetworkPolicyV1>,

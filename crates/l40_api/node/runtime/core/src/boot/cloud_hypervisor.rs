@@ -1,5 +1,6 @@
 use super::{BootConfigError, BootSource, GuestBoot, object};
-use pplx_space_common_core::types::{Arch, RuntimeKind};
+use pplx_space_cpu_arch::Arch;
+use pplx_space_execution_spec::RuntimeKind;
 use serde_json::{Value, json};
 
 pub(super) fn configuration(input: &GuestBoot<'_>) -> Result<Value, BootConfigError> {
@@ -144,8 +145,8 @@ enum ImageType {
 #[serde(deny_unknown_fields)]
 struct Net {
     id: String,
-    tap: pplx_space_common_core::types::LinuxInterfaceName,
-    mac: pplx_space_common_core::types::MacAddress,
+    tap: pplx_space_linux_ids::LinuxInterfaceName,
+    mac: pplx_space_network_roles::MacAddress,
     num_queues: u16,
     #[serde(skip_serializing_if = "Option::is_none")]
     rate_limiter_config: Option<Limiter>,
@@ -167,7 +168,7 @@ struct Bucket {
 struct Vsock {
     #[serde(default)]
     id: VsockId,
-    cid: pplx_space_common_core::types::VsockCid,
+    cid: pplx_space_linux_ids::VsockCid,
     socket: String,
 }
 // CH restores a virtio device by ID. An omitted ID is auto-generated from
@@ -224,7 +225,7 @@ impl Configuration {
         Ok(())
     }
 
-    pub(super) fn set_disk_rate(&mut self, rate: pplx_space_common_core::types::RateLimiter) {
+    pub(super) fn set_disk_rate(&mut self, rate: pplx_space_execution_spec::RateLimiter) {
         self.disks[0].rate_limiter_config = Some(Limiter {
             bandwidth: Bucket {
                 size: rate.bandwidth.size,

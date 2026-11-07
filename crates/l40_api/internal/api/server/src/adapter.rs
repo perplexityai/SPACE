@@ -528,7 +528,7 @@ impl ClusterApi for ClusterApiService {
         let bare_hash = hash
             .strip_prefix(&format!(
                 "{}:",
-                pplx_space_common_core::types::HashAlg::Sha256.as_str()
+                pplx_space_content_digest::HashAlg::Sha256.as_str()
             ))
             .unwrap_or(&hash)
             .to_string();
@@ -1382,7 +1382,7 @@ impl ClusterApi for ClusterApiService {
             .metadata()
             .get("grpc-timeout")
             .and_then(|value| value.to_str().ok())
-            .and_then(pplx_space_common_core::types::parse_grpc_timeout)
+            .and_then(pplx_space_durations::parse_grpc_timeout)
             .unwrap_or(pplx_space_ingress_admission::preparation_timeout())
             .min(pplx_space_ingress_admission::preparation_timeout());
         let refresh_authority = request
@@ -1443,7 +1443,7 @@ impl ClusterApi for ClusterApiService {
             .metadata()
             .get("grpc-timeout")
             .and_then(|value| value.to_str().ok())
-            .and_then(pplx_space_common_core::types::parse_grpc_timeout)
+            .and_then(pplx_space_durations::parse_grpc_timeout)
             .unwrap_or(pplx_space_ingress_admission::preparation_timeout())
             .min(pplx_space_ingress_admission::preparation_timeout());
         let response = tokio::time::timeout(

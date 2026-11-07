@@ -56,10 +56,16 @@ uuid = { workspace = true, features = ["v7"] }
 
 # internal
 pplx-space-accounts = { workspace = true, features = ["serde"] }
+pplx-space-auto-lifecycle = { workspace = true, features = ["serde"] }
 pplx-space-auto-lifecycle-receipt = { workspace = true }
 pplx-space-common-core = { workspace = true, features = ["serde"] }
 pplx-space-host-layout = { workspace = true }
 pplx-space-common-jobs = { workspace = true }
+pplx-space-cpu-arch = { workspace = true, features = ["serde"] }
+pplx-space-durations = { workspace = true, features = ["serde"] }
+pplx-space-execution-spec = { workspace = true, features = ["serde"] }
+pplx-space-k8s-ids = { workspace = true, features = ["serde"] }
+pplx-space-linux-ids = { workspace = true, features = ["serde"] }
 pplx-space-sqlite = { workspace = true }
 pplx-space-events = { workspace = true }
 pplx-space-metrics-emit = { workspace = true }
@@ -74,6 +80,7 @@ pplx-space-sbx-mgr-migrations = { workspace = true }
 futures-util = { workspace = true }
 pplx-space-common-core = { workspace = true, features = ["serde"] }
 pplx-space-test-hooks = { workspace = true, features = ["test-hooks"] }
+pplx-space-content-digest = { workspace = true, features = ["serde"] }
 prost-types = { workspace = true }
 rstest = { workspace = true }
 rusqlite = { workspace = true, features = ["serialize"] }

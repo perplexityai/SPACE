@@ -238,8 +238,8 @@ async fn bounded_exchange_closes_stdin_and_limits_output_and_time() {
     ));
 }
 
-fn env_map(values: &[(&str, &str)]) -> pplx_space_common_core::types::EnvMap {
-    pplx_space_common_core::types::EnvMap::try_from(
+fn env_map(values: &[(&str, &str)]) -> pplx_space_guest_process::EnvMap {
+    pplx_space_guest_process::EnvMap::try_from(
         values
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))

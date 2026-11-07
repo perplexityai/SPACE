@@ -26,7 +26,7 @@ pub(super) fn parse_env_vars(values: Vec<String>) -> BTreeMap<String, String> {
             exit_error(format!("duplicate env key '{key}'"));
         }
     }
-    let (env, issues) = pplx_space_common_core::types::EnvMap::sanitize(env);
+    let (env, issues) = pplx_space_guest_process::EnvMap::sanitize(env);
     for issue in issues {
         eprintln!("WARNING: env sanitized: {issue:?}");
     }
@@ -230,10 +230,10 @@ pub(super) enum Commands {
     Create {
         /// Exact published template content digest.
         #[arg(long)]
-        content_hash: Option<pplx_space_common_core::types::ContentHash>,
+        content_hash: Option<pplx_space_content_digest::ContentHash>,
         /// Exact environment; must match the template's immutable binding.
         #[arg(long)]
-        environment: Option<pplx_space_common_core::types::EnvironmentReference>,
+        environment: Option<pplx_space_execution_spec::EnvironmentReference>,
         /// Legacy runtime selector; an environment determines its own runtime.
         #[arg(
             long,

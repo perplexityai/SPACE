@@ -20,7 +20,8 @@ use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 
-use pplx_space_common_core::types::{LinuxPid, SandboxId};
+use pplx_space_common_core::types::SandboxId;
+use pplx_space_linux_ids::LinuxPid;
 use pplx_space_net_gateway_client::{ConnectError, NetGatewayControlGrpcClient};
 use tokio::time::Instant;
 

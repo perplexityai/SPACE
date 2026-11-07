@@ -8,7 +8,7 @@ use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
 };
-use pplx_space_common_core::types::{ProcessId, ProcessSignal};
+use pplx_space_guest_process::{ProcessId, ProcessSignal};
 use pplx_space_public_api::{
     DataPlaneProcessExitStatus, ProcessMutationResponse, ProcessSignalRequest, ProcessState,
     PublicPage, PublicProcess, PublicSandboxId,

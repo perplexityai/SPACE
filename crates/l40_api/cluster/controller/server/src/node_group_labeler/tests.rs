@@ -86,7 +86,8 @@
 use pplx_space_common_core::types::NodeGroupId;
 use std::sync::Mutex;
 
-use pplx_space_common_core::types::{NodeGroupName, PositiveDuration};
+use pplx_space_common_core::types::NodeGroupName;
+use pplx_space_durations::PositiveDuration;
 use pplx_space_observability::test_capture::{CapturedEventsLayer, field_value};
 use tracing_subscriber::layer::SubscriberExt;
 

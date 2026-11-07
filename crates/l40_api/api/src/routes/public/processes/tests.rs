@@ -113,7 +113,7 @@ fn public_process_reports_an_exit_like_process_exited() {
 #[test]
 fn public_process_rejects_an_invalid_runtime_process_id() {
     let error = public_process(spaced_ops::ProcessInfo {
-        process_id: "x".repeat(pplx_space_common_core::types::MAX_PROCESS_ID_BYTES + 1),
+        process_id: "x".repeat(pplx_space_guest_process::MAX_PROCESS_ID_BYTES + 1),
         pid: 42,
         command: vec!["true".to_string()],
         cwd: None,

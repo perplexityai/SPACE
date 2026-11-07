@@ -1,9 +1,9 @@
 use super::cleanup_helpers::*;
 use super::disk::read_pid_from_symlink;
 use super::*;
-use pplx_space_common_core::types::LinuxUid;
 use pplx_space_host_layout::gateway;
 use pplx_space_host_layout::paths;
+use pplx_space_linux_ids::LinuxUid;
 
 pub(super) fn sidecar_launch_uid(
     program: &str,

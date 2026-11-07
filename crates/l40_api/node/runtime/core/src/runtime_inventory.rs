@@ -5,9 +5,11 @@ use std::io::Read;
 use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 
-use pplx_space_common_core::types::{
-    Arch, ArtifactComponentKind, ArtifactComponentMetadata, ArtifactComponentRole, ArtifactFormat,
-    ArtifactVersion, Digest, EnvironmentReference, ExecutionMetadata, ExecutionMetadataError,
+use pplx_space_content_digest::Digest;
+use pplx_space_cpu_arch::Arch;
+use pplx_space_execution_spec::{
+    ArtifactComponentKind, ArtifactComponentMetadata, ArtifactComponentRole, ArtifactFormat,
+    ArtifactVersion, EnvironmentReference, ExecutionMetadata, ExecutionMetadataError,
     FIRECRACKER_STATE_FORMAT, GuestOperatingSystem, GuestPlatform, RuntimeIdentity, RuntimeKind,
     RuntimeVersion, StateFormatIdentity, StateFormatName, StateFormatVersion, VersionSortKey,
 };
@@ -334,7 +336,7 @@ pub enum RuntimeInventoryError {
     #[error("kernel read returned {read} bytes for a {len}-byte buffer")]
     InvalidKernelReadBuffer { read: usize, len: usize },
     #[error("compiled environment has no auxiliary boot-file pin for {0:?}")]
-    MissingBootArtifactPin(pplx_space_common_core::types::ComponentIdentity),
+    MissingBootArtifactPin(pplx_space_execution_spec::ComponentIdentity),
     #[error("no installed artifact component matches {0:?}")]
     NoCompatibleComponent(ArtifactComponentMetadata),
     #[error("no {selection} {kind} component is installed")]

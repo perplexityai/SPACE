@@ -1,8 +1,9 @@
 use std::time::Duration;
 
 use pplx_space_common_core::types::{
-    BuildRunId, ContentHash, SystemTemplate, TemplateBuildJobState as BuildState,
+    BuildRunId, SystemTemplate, TemplateBuildJobState as BuildState,
 };
+use pplx_space_content_digest::ContentHash;
 use serde::{Deserialize, Serialize};
 
 use crate::{

@@ -10,8 +10,6 @@ use super::digest::TemplateArtifactDigest;
 use super::hash::ContentHash;
 use super::identity::TemplateName;
 
-pub use pplx_space_cpu_arch::{Arch, ArchParseError};
-
 /// Error returned when a build run UUID cannot be parsed.
 ///
 /// # Examples
@@ -32,7 +30,8 @@ pub enum BuildRunIdParseError {
 /// # Examples
 ///
 /// ```rust
-/// # use pplx_space_common_core::types::{ContentHash, Digest, TemplateBuildId, TemplateName};
+/// # use pplx_space_common_core::types::{TemplateBuildId, TemplateName};
+/// # use pplx_space_content_digest::{ContentHash, Digest};
 /// let template = TemplateName::parse("seed").unwrap();
 /// let hash = ContentHash::new(Digest::sha256([0xab; 32]));
 /// let build = TemplateBuildId::new(template, hash);
@@ -50,7 +49,8 @@ impl TemplateBuildId {
     /// # Examples
     ///
     /// ```rust
-    /// # use pplx_space_common_core::types::{ContentHash, Digest, TemplateBuildId, TemplateName};
+    /// # use pplx_space_common_core::types::{TemplateBuildId, TemplateName};
+    /// # use pplx_space_content_digest::{ContentHash, Digest};
     /// let template = TemplateName::parse("seed").unwrap();
     /// let hash = ContentHash::new(Digest::sha256([0xab; 32]));
     /// let build = TemplateBuildId::new(template, hash);
@@ -76,7 +76,8 @@ impl TemplateBuildId {
     /// # Examples
     ///
     /// ```rust
-    /// # use pplx_space_common_core::types::{ContentHash, Digest, TemplateBuildId, TemplateName};
+    /// # use pplx_space_common_core::types::{TemplateBuildId, TemplateName};
+    /// # use pplx_space_content_digest::{ContentHash, Digest};
     /// let template = TemplateName::parse("seed").unwrap();
     /// let build = TemplateBuildId::new(template, ContentHash::new(Digest::sha256([0xab; 32])));
     /// assert_eq!(build.template().as_str(), "seed");
@@ -95,7 +96,8 @@ impl TemplateBuildId {
     /// # Examples
     ///
     /// ```rust
-    /// # use pplx_space_common_core::types::{ContentHash, Digest, TemplateBuildId, TemplateName};
+    /// # use pplx_space_common_core::types::{TemplateBuildId, TemplateName};
+    /// # use pplx_space_content_digest::{ContentHash, Digest};
     /// let hash = ContentHash::new(Digest::sha256([0xab; 32]));
     /// let build = TemplateBuildId::new(TemplateName::parse("seed").unwrap(), hash);
     /// assert_eq!(build.content_hash(), hash);

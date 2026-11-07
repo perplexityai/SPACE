@@ -230,8 +230,8 @@ async fn executor_requires_begin_before_volume_staging() {
     let artifact = "01939e3e-eeee-7000-8000-000000000022";
     let mut payload = reclaim_fixture_payload(artifact, "/space/cache/snapshot".into());
     payload.meta.execution = Some(
-        pplx_space_common_core::types::SnapshotExecutionMetadata::new(
-            pplx_space_common_core::types::ExecutionMetadata::initial_firecracker(
+        pplx_space_execution_spec::SnapshotExecutionMetadata::new(
+            pplx_space_execution_spec::ExecutionMetadata::initial_firecracker(
                 std::env::consts::ARCH.parse().unwrap(),
                 vec![],
             ),
@@ -855,8 +855,8 @@ fn only_exact_prepared_intents_begin_in_the_worker() {
     let artifact = "01939e3e-eeee-7000-8000-000000000021";
     let mut prepared = reclaim_fixture_payload(artifact, "/space/cache/snapshot".into());
     prepared.meta.execution = Some(
-        pplx_space_common_core::types::SnapshotExecutionMetadata::new(
-            pplx_space_common_core::types::ExecutionMetadata::initial_firecracker(
+        pplx_space_execution_spec::SnapshotExecutionMetadata::new(
+            pplx_space_execution_spec::ExecutionMetadata::initial_firecracker(
                 std::env::consts::ARCH.parse().unwrap(),
                 vec![],
             ),
@@ -1188,9 +1188,9 @@ fn ready_backup_returns_before_the_retained_source_is_inspected() {
 /// verbatim, and carry nothing when the capture host was unknown.
 #[test]
 fn begin_request_carries_the_recorded_capture_host_cpu() {
-    use pplx_space_common_core::types::{
-        Arch, ArtifactKind, ArtifactOrigin, ExecutionMetadata, HostCpu, SnapshotExecutionMetadata,
-    };
+    use pplx_space_common_core::types::{ArtifactKind, ArtifactOrigin};
+    use pplx_space_cpu_arch::Arch;
+    use pplx_space_execution_spec::{ExecutionMetadata, HostCpu, SnapshotExecutionMetadata};
 
     let execution = SnapshotExecutionMetadata::new(ExecutionMetadata::initial_firecracker(
         Arch::X86_64,
@@ -1222,9 +1222,9 @@ fn begin_request_carries_the_recorded_capture_host_cpu() {
 /// verdict-only requests, left a row for the probe to close.
 #[test]
 fn verdict_only_begin_is_requested_and_its_echo_read() {
-    use pplx_space_common_core::types::{
-        Arch, ArtifactKind, ArtifactOrigin, ExecutionMetadata, SnapshotExecutionMetadata,
-    };
+    use pplx_space_common_core::types::{ArtifactKind, ArtifactOrigin};
+    use pplx_space_cpu_arch::Arch;
+    use pplx_space_execution_spec::{ExecutionMetadata, SnapshotExecutionMetadata};
 
     let execution = SnapshotExecutionMetadata::new(ExecutionMetadata::initial_firecracker(
         Arch::X86_64,

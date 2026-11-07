@@ -35,7 +35,8 @@ use std::os::unix::fs::{
 };
 use std::path::{Path, PathBuf};
 
-use pplx_space_common_core::types::{ArtifactVersion, Digest, RuntimeIdentity, RuntimeKind};
+use pplx_space_content_digest::Digest;
+use pplx_space_execution_spec::{ArtifactVersion, RuntimeIdentity, RuntimeKind};
 use rustix::fs::{Mode, OFlags};
 use sha2::{Digest as _, Sha256};
 

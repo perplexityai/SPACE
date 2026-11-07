@@ -10,7 +10,8 @@ use std::time::{Duration, Instant};
 
 use crate::metrics::cluster_reconciler::{self as metrics, OrphanedRestorePodOutcome as O};
 use pplx_space_api::controllers::substrate::kubernetes::KubernetesSubstrate;
-use pplx_space_common_core::types::{PodUid, SandboxId};
+use pplx_space_common_core::types::SandboxId;
+use pplx_space_k8s_ids::PodUid;
 use sqlx::PgPool;
 use tokio_util::sync::CancellationToken;
 

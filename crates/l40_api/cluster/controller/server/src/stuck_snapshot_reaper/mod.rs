@@ -86,7 +86,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::metrics::cluster_reconciler::{self as metrics, Loop, OutcomeEvent};
-use pplx_space_common_core::types::{PositiveDuration, SandboxId};
+use pplx_space_common_core::types::SandboxId;
+use pplx_space_durations::PositiveDuration;
 use pplx_space_events::{
     SandboxEvent, SandboxEventDetails, SandboxEventSource, SandboxEventTrigger, SandboxEventType,
 };

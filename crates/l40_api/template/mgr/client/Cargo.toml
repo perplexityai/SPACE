@@ -27,8 +27,10 @@ tracing = { workspace = true }
 # internal
 pplx-space-common-core = { workspace = true }
 pplx-space-common-grpc = { workspace = true }
+pplx-space-content-digest = { workspace = true }
 pplx-space-execution-common = { workspace = true }
 pplx-space-host-layout = { workspace = true }
+pplx-space-execution-spec = { workspace = true }
 pplx-space-metrics-emit = { workspace = true }
 pplx-space-net-common = { workspace = true }
 pplx-space-observability = { workspace = true, default-features = false }

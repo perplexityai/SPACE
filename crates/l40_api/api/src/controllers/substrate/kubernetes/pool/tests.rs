@@ -1,5 +1,6 @@
 use pplx_space_accounts::NodeId;
-use pplx_space_common_core::types::{DiskIoLimits, SandboxId};
+use pplx_space_common_core::types::SandboxId;
+use pplx_space_execution_spec::DiskIoLimits;
 
 use super::*;
 use std::collections::BTreeMap;
@@ -7,8 +8,8 @@ use std::collections::BTreeMap;
 use crate::controllers::substrate::ActorRef;
 use crate::metrics::sandbox::api::SandboxApiMetricIdentity;
 use pplx_space_accounts::{Email, OrgId, UserId};
+use pplx_space_auto_lifecycle::AutoLifecyclePolicy;
 use pplx_space_cluster_pool::PoolConfigOwner;
-use pplx_space_common_core::types::AutoLifecyclePolicy;
 use pplx_space_db_test_fixtures::pg_test_db;
 use pplx_space_net_common::NetworkPolicyV1;
 use sqlx::PgPool;

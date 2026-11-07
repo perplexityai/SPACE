@@ -7,7 +7,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use nix::sys::socket::{AddressFamily, SockFlag, SockType, socketpair};
-use pplx_space_common_core::types::{CLUSTER_ID_ENV, GuestUserName};
+use pplx_space_common_core::types::CLUSTER_ID_ENV;
+use pplx_space_guest_process::GuestUserName;
 use pplx_space_spaced_guest_protocol::proto::worker::worker_filesystem_client::WorkerFilesystemClient as FilesystemClient;
 use pplx_space_spaced_guest_protocol::proto::worker::worker_filesystem_server::WorkerFilesystemServer as FilesystemServer;
 use tokio::process::{Child, Command as ChildCommand};
@@ -903,7 +904,7 @@ pub(crate) enum FilesystemWorkerError {
     #[error("filesystem worker user is missing: {0}")]
     MissingUser(#[source] std::env::VarError),
     #[error("filesystem worker user is invalid: {0}")]
-    InvalidUser(#[source] pplx_space_common_core::types::ProcessParseError),
+    InvalidUser(#[source] pplx_space_guest_process::ProcessParseError),
     #[error("filesystem worker fd is missing: {0}")]
     MissingFd(#[source] std::env::VarError),
     #[error("filesystem worker fd is invalid: {0}")]

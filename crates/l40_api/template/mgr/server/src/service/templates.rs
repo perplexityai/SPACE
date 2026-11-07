@@ -1013,7 +1013,7 @@ pub(super) struct ExistingDigestRegistration<'a> {
 /// carries the build-manager staging prefix. Keeps digest dirs (`sha256:*`)
 /// and template-manager's own transient dirs unreachable through this field.
 pub(super) fn validate_build_staging_dir_name(name: &str) -> Result<String, Status> {
-    let component = pplx_space_common_core::types::SafePathComponent::parse(name)
+    let component = pplx_space_guest_process::SafePathComponent::parse(name)
         .map_err(|e| Status::invalid_argument(format!("invalid staging_dir: {e}")))?;
     if !is_build_staging_dir(component.as_str()) {
         return Err(Status::invalid_argument(format!(

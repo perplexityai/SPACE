@@ -1,6 +1,7 @@
-use pplx_space_common_core::types::{
-    ComputeParseError, DigestParseError, DiskIoLimitsError, SizeParseError, TemplateParseError,
-};
+use pplx_space_byte_size::SizeParseError;
+use pplx_space_common_core::types::TemplateParseError;
+use pplx_space_content_digest::DigestParseError;
+use pplx_space_execution_spec::{ComputeParseError, DiskIoLimitsError};
 use uuid::Uuid;
 
 #[derive(Debug, thiserror::Error)]

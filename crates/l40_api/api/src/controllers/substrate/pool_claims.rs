@@ -61,14 +61,14 @@ pub struct PooledExecutionPoolShape {
     pub vcpu: u32,
     pub memory_mib: u32,
     pub disk_mib: Option<u32>,
-    pub disk_io_limits: pplx_space_common_core::types::DiskIoLimits,
+    pub disk_io_limits: pplx_space_execution_spec::DiskIoLimits,
 }
 
 impl PooledExecutionPoolShape {
     pub const fn new(
         vcpu: u32,
         memory_mib: u32,
-        disk_io_limits: pplx_space_common_core::types::DiskIoLimits,
+        disk_io_limits: pplx_space_execution_spec::DiskIoLimits,
     ) -> Self {
         Self {
             vcpu,
@@ -82,7 +82,7 @@ impl PooledExecutionPoolShape {
         vcpu: u32,
         memory_mib: u32,
         disk_mib: Option<u32>,
-        disk_io_limits: pplx_space_common_core::types::DiskIoLimits,
+        disk_io_limits: pplx_space_execution_spec::DiskIoLimits,
     ) -> Self {
         Self {
             vcpu,
@@ -105,7 +105,7 @@ pub struct PooledExecutionClaim {
     pub vcpu: Option<u32>,
     pub memory_mib: Option<u32>,
     pub disk_mib: Option<u32>,
-    pub disk_io_limits: pplx_space_common_core::types::DiskIoLimits,
+    pub disk_io_limits: pplx_space_execution_spec::DiskIoLimits,
     pub active_node_id: Option<NodeId>,
     /// Authoritative route identity returned while claiming the execution.
     /// Substrates without route identity leave it unset.

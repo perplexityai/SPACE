@@ -62,8 +62,10 @@ pplx-space-host-layout = { workspace = true }
 pplx-space-events = { workspace = true }
 pplx-space-grpc-rate-limiter = { workspace = true }
 pplx-space-grpc-server = { workspace = true }
+pplx-space-k8s-ids = { workspace = true }
 pplx-space-net-common = { workspace = true }
 pplx-space-common-grpc = { workspace = true }
+pplx-space-network-roles = { workspace = true }
 pplx-space-sandbox-grpc = { workspace = true }
 pplx-space-credmgr-client = { workspace = true }
 pplx-space-credential-injection = { workspace = true }

@@ -8,13 +8,14 @@ use pplx_space_common_core::sql;
 use pplx_space_common_core::types::{
     ArtifactKind, ArtifactKindParseError, ArtifactOrigin, ArtifactOriginParseError,
     ExactStorageUri, ExecutionGeneration, ExecutionGenerationParseError, LocalArtifactId,
-    SandboxId, SnapshotContentHash, SnapshotExecutionMetadata, SnapshotId, SnapshotKind,
-    SnapshotKindParseError, SnapshotName, SnapshotParseError, SnapshotState,
-    SnapshotStateParseError, TemplateName, TemplateParseError,
+    SandboxId, SnapshotContentHash, SnapshotId, SnapshotKind, SnapshotKindParseError, SnapshotName,
+    SnapshotParseError, SnapshotState, SnapshotStateParseError, TemplateName, TemplateParseError,
 };
 use pplx_space_common_core::types::{
-    Digest, DigestParseError, SnapshotArtifact as SnapshotArtifactFile, SnapshotArtifactParseError,
+    SnapshotArtifact as SnapshotArtifactFile, SnapshotArtifactParseError,
 };
+use pplx_space_content_digest::{Digest, DigestParseError};
+use pplx_space_execution_spec::SnapshotExecutionMetadata;
 use sqlx::FromRow;
 use sqlx::types::Json;
 use time::OffsetDateTime;

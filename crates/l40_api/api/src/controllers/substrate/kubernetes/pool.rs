@@ -1,10 +1,13 @@
 use pplx_space_accounts::NodeId;
+use pplx_space_byte_size::MemorySize;
 use pplx_space_cluster_pool::{
     ClaimedPoolSlot, ManualPoolConfigSpec, PoolAssignment, PoolConfigWithCounts, PoolSlotState,
     ReservedPoolSlot, WarmPoolStore,
 };
 use pplx_space_common_core::sql;
-use pplx_space_common_core::types::{MemorySize, PodUid, SandboxId, VcpuCount};
+use pplx_space_common_core::types::SandboxId;
+use pplx_space_execution_spec::VcpuCount;
+use pplx_space_k8s_ids::PodUid;
 use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
 

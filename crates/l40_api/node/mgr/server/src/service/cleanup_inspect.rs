@@ -810,8 +810,8 @@ impl NodeManagerService {
         // Inspection reports filesystem presence, not execution authority.
         // Probe both owned adapter roots even when metadata is damaged.
         let jail_roots = [
-            pplx_space_common_core::types::RuntimeKind::Firecracker,
-            pplx_space_common_core::types::RuntimeKind::CloudHypervisor,
+            pplx_space_execution_spec::RuntimeKind::Firecracker,
+            pplx_space_execution_spec::RuntimeKind::CloudHypervisor,
         ]
         .into_iter()
         .map(|runtime| pplx_space_node_runtime_core::control::isolation_root(runtime, sandbox_id))

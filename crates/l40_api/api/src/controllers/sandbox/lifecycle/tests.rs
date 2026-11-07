@@ -611,7 +611,7 @@ async fn persisted_delete_intent_denies_later_fork_admission() -> TestResult {
 
     let source_sandbox_id = sandbox_id;
     let request = crate::fork_operations::ForkRequest::from_wire(Some(300), Some(1))?;
-    let key = pplx_space_common_core::types::IdempotencyKey::parse("fork-after-delete-intent")?;
+    let key = pplx_space_guest_process::IdempotencyKey::parse("fork-after-delete-intent")?;
     let store = crate::public_operations::PublicOperationStore::new(db.pool.clone());
     let admission = crate::fork_operations::begin_fork_operation_admission(
         &store,

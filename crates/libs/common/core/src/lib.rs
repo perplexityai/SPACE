@@ -2,8 +2,10 @@
 //!
 //! The crate contains dependency-light shared helpers:
 //!
-//! - [`types`] is the domain type catalog. Prefer it so raw strings, UUIDs,
-//!   sizes, paths, and IDs are parsed once at the boundary.
+//! - [`types`] holds the sandbox, template, snapshot and node domain types not
+//!   yet moved to their own crates, so raw strings, UUIDs and IDs are parsed
+//!   once at the boundary. Sizes, guest paths, execution specs and the other
+//!   moved value types come from their own `pplx-space-*` crates.
 //! - [`guest`] describes platform-specific SPACE runtime contracts.
 //! - [`ids`] contains legacy sandbox ID string helpers kept for compatibility.
 //!

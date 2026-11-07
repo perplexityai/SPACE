@@ -13,7 +13,7 @@ use super::super::tests::{
 };
 use super::*;
 use crate::controllers::substrate::{PodIdentityFence, RecordedExecution};
-use pplx_space_common_core::types::{PodName, PodResourceVersion, PodUid};
+use pplx_space_k8s_ids::{PodName, PodResourceVersion, PodUid};
 
 // ── create_execution ────────────────────────────────────────────────────────
 

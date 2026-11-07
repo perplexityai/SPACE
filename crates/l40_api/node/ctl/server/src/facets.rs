@@ -7,7 +7,7 @@ use pplx_space_accounts::SandboxOwner;
 use pplx_space_common_core::port_exposure_signals::{
     EXPOSE_TERMINAL_REASON_METADATA_KEY, EXPOSE_TERMINAL_REASON_STALE_POD_NETNS,
 };
-use pplx_space_common_core::types::{SandboxId, SemVer};
+use pplx_space_common_core::types::SandboxId;
 use pplx_space_net_common::proto::{
     NetworkPolicyApplyDecision, NetworkPolicySource, NetworkPolicyV1 as ProtoNetworkPolicyV1,
 };
@@ -33,6 +33,7 @@ use pplx_space_sbx_mgr_client::proto::{
     SetAutoLifecyclePolicyRequest, SetNetworkPolicyRequest, SnapshotDetail,
     StateRequest as SbxStateRequest, StateResponse as SbxStateResponse,
 };
+use pplx_space_semver::SemVer;
 use pplx_space_state_reconciliation::NetworkPolicyTarget;
 use pplx_space_template_mgr_client::proto::{
     CreatePoolRequest, DeleteIdleTemplateRequest, DeletePoolRequest, DeleteTemplateRequest,

@@ -7,9 +7,8 @@ use std::path::PathBuf;
 use crate::node_manager_transport::fake::{FakeNodeManager, ServedNodeManager};
 use crate::service::SandboxManagerServiceOptions;
 use pplx_space_common_core::types::{LocalArtifactId, SandboxActivationAttemptId};
-use pplx_space_common_core::types::{
-    SandboxArtifactMetadata, SandboxId, SnapshotExecutionMetadata,
-};
+use pplx_space_common_core::types::{SandboxArtifactMetadata, SandboxId};
+use pplx_space_execution_spec::SnapshotExecutionMetadata;
 use pplx_space_node_mgr_client::proto::{
     CreateBtrfsSnapshotResponse, DeleteBtrfsSnapshotResponse, RestoreInstanceSnapshotResponse,
 };
@@ -28,7 +27,7 @@ pub(in crate::service::runtime_upgrade) struct Fixture {
 pub(in crate::service::runtime_upgrade) fn environments() -> (ExecutionMetadata, ExecutionMetadata)
 {
     let compiled = pplx_space_node_runtime_core::catalog::CompiledEnvironment::for_architecture(
-        pplx_space_common_core::types::Arch::X86_64,
+        pplx_space_cpu_arch::Arch::X86_64,
     )
     .unwrap();
     (
@@ -748,7 +747,7 @@ pub(in crate::service::runtime_upgrade) fn certified_target(
 ) -> ExecutionMetadata {
     use pplx_space_node_runtime_core::catalog::CompiledEnvironment;
     let compiled =
-        CompiledEnvironment::for_architecture(pplx_space_common_core::types::Arch::X86_64).unwrap();
+        CompiledEnvironment::for_architecture(pplx_space_cpu_arch::Arch::X86_64).unwrap();
     let target = CompiledEnvironment::of_execution(&compiled, source)
         .unwrap()
         .upgrade_targets()[0];

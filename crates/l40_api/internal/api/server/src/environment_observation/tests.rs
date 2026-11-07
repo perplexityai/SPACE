@@ -2,15 +2,16 @@ use std::collections::BTreeSet;
 
 use pplx_space_accounts::NodeId;
 use pplx_space_common_core::sql;
-use pplx_space_common_core::types::{
-    Digest, EnvironmentReference, ExecutionCompatibilityProfile, RuntimeBinding,
-    StateFormatIdentity, VersionSortKey,
-};
+use pplx_space_content_digest::Digest;
 use pplx_space_db_test_fixtures::{insert_ready_worker_node, try_pg_test_db};
 use pplx_space_execution_common::environment::{
     EnvironmentDefinition, EnvironmentObservation, FIRECRACKER_MACHINE_CONTRACT, KnownEnvironment,
 };
 use pplx_space_execution_common::proto::NodeExecutionInventory;
+use pplx_space_execution_spec::{
+    EnvironmentReference, ExecutionCompatibilityProfile, RuntimeBinding, StateFormatIdentity,
+    VersionSortKey,
+};
 use pplx_space_test_env::TestResult;
 
 use crate::proto::{

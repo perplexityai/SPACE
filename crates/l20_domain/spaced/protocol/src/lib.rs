@@ -75,9 +75,9 @@ mod tests;
 /// Maximum operations qualified by an image, intersected with each connection's
 /// advertised operations. New wire operations receive no implicit permission.
 pub fn allowed_guest_operations(
-    agent: pplx_space_common_core::types::guest_image::QualifiedGuestAgent,
+    agent: pplx_space_execution_spec::guest_image::QualifiedGuestAgent,
 ) -> &'static [pplx_space_spaced_guest_protocol::proto::platform::GuestOperation] {
-    use pplx_space_common_core::types::guest_image::QualifiedGuestAgent;
+    use pplx_space_execution_spec::guest_image::QualifiedGuestAgent;
     use pplx_space_spaced_guest_protocol::proto::platform::GuestOperation::*;
     match agent {
         QualifiedGuestAgent::Absent => &[],

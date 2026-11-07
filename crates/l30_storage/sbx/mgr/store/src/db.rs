@@ -10,19 +10,21 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use pplx_space_accounts::{ORPHANED_SANDBOX_OWNER, SandboxOwner};
+use pplx_space_auto_lifecycle::{AutoLifecyclePolicy, AutoLifecycleRuntimeState};
 use pplx_space_common_core::types::{
-    ArtifactKind, ArtifactOrigin, AutoLifecyclePolicy, AutoLifecycleRuntimeState,
-    ExecutionGeneration, ExecutionMetadata, LocalArtifactId, NodeManagedBy,
-    ORPHANED_SANDBOX_TEMPLATE, RuntimeIdentity, RuntimeKind, RuntimeVersion,
-    SandboxActivationAttemptId, SandboxCleanupEpisodeId, SandboxId, SandboxQuarantineHistoryAction,
-    SandboxQuarantineNextAction, SandboxQuarantineReasonCode, SandboxQuarantineSource,
-    SandboxRuntimeLabel, SandboxTransitionReceipt, SandboxTransitionReceiptInvariantError,
-    SandboxTransitionReceiptKind, SandboxTransitionTargetState, SnapshotName,
+    ArtifactKind, ArtifactOrigin, ExecutionGeneration, LocalArtifactId, NodeManagedBy,
+    ORPHANED_SANDBOX_TEMPLATE, SandboxActivationAttemptId, SandboxCleanupEpisodeId, SandboxId,
+    SandboxQuarantineHistoryAction, SandboxQuarantineNextAction, SandboxQuarantineReasonCode,
+    SandboxQuarantineSource, SandboxRuntimeLabel, SandboxTransitionReceipt,
+    SandboxTransitionReceiptInvariantError, SandboxTransitionReceiptKind,
+    SandboxTransitionTargetState, SnapshotName,
 };
 use pplx_space_events::{
     SandboxEventDetails, SandboxEventSource, SandboxEventTrigger, SandboxEventType,
     emit_sandbox_event,
 };
+use pplx_space_execution_spec::RuntimeVersion;
+use pplx_space_execution_spec::{ExecutionMetadata, RuntimeIdentity, RuntimeKind};
 #[cfg(test)]
 use pplx_space_net_common::NetworkPolicyV1;
 use pplx_space_net_common::{NetworkPolicy, proto::NetworkPolicySource};
@@ -57,7 +59,8 @@ pub mod transfer;
 use crate::endpoint_proof::SpacedEndpointProof;
 use crate::restore_operation::{RemoteRestoreOperation, RestoreOrigin};
 use crate::state::{SandboxState, SandboxStatusEventDetails, StateTransitionError};
-use pplx_space_common_core::types::{PodUid, RouteGeneration, SpaceApiRouteIdentity};
+use pplx_space_common_core::types::{RouteGeneration, SpaceApiRouteIdentity};
+use pplx_space_k8s_ids::PodUid;
 
 const DB_PATH: &str = pplx_space_host_layout::paths::SANDBOX_MANAGER_DB;
 
@@ -727,7 +730,8 @@ pub mod fixture {
     use std::str::FromStr;
 
     use pplx_space_accounts::SandboxOwner;
-    use pplx_space_common_core::types::{AutoLifecyclePolicy, SandboxId, SandboxRuntimeLabel};
+    use pplx_space_auto_lifecycle::AutoLifecyclePolicy;
+    use pplx_space_common_core::types::{SandboxId, SandboxRuntimeLabel};
 
     use crate::state::SandboxState;
 

@@ -4,10 +4,10 @@
 use crate::runtime_inventory::{
     ExecutionSelectionMode, ResolvedExecutionEnvironment, RuntimeInventory,
 };
-use pplx_space_common_core::types::*;
 use pplx_space_execution_common::environment::{
     EnvironmentBindingError, EnvironmentDefinition, EnvironmentRequirementsError,
 };
+use pplx_space_execution_spec::{ExecutionMetadata, RuntimeBinding, RuntimeKind};
 
 mod policy;
 pub use policy::{

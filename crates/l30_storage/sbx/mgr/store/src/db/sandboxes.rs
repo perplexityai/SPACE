@@ -74,7 +74,7 @@ pub struct RuntimeFields<'a> {
 }
 
 pub struct InsertSandboxParams<'a> {
-    pub guest_image: pplx_space_common_core::types::guest_image::GuestImageContract,
+    pub guest_image: pplx_space_execution_spec::guest_image::GuestImageContract,
     pub id: &'a str,
     pub uuid8: &'a SandboxRuntimeLabel,
     pub state: SandboxState,
@@ -84,7 +84,7 @@ pub struct InsertSandboxParams<'a> {
     pub runtime: &'a str,
     pub snapshots_enabled: bool,
     pub rootfs_size_mb: Option<u32>,
-    pub disk_io_limits: pplx_space_common_core::types::DiskIoLimits,
+    pub disk_io_limits: pplx_space_execution_spec::DiskIoLimits,
     pub pool_template: Option<&'a str>,
     pub volume_encryption: bool,
     pub process_env: &'a BTreeMap<String, String>,
@@ -485,7 +485,7 @@ pub fn acknowledge_node_cleanup(
 pub fn upsert_sandbox_execution_metadata(
     conn: &Connection,
     sandbox_id: &str,
-    execution: &pplx_space_common_core::types::ExecutionMetadata,
+    execution: &pplx_space_execution_spec::ExecutionMetadata,
 ) -> Result<()> {
     let tx = immediate_transaction(conn)?;
     upsert_sandbox_execution_metadata_in_transaction(&tx, sandbox_id, execution)?;
@@ -496,7 +496,7 @@ pub fn upsert_sandbox_execution_metadata(
 pub(super) fn upsert_sandbox_execution_metadata_in_transaction(
     conn: &Connection,
     sandbox_id: &str,
-    execution: &pplx_space_common_core::types::ExecutionMetadata,
+    execution: &pplx_space_execution_spec::ExecutionMetadata,
 ) -> Result<()> {
     let runtime: String = conn.query_row(
         "SELECT runtime FROM sandboxes WHERE id = ?1",

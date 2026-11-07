@@ -8,7 +8,8 @@ use axum::{
     Extension, Json,
     extract::{Path, Query, State},
 };
-use pplx_space_common_core::types::{RuntimeKind, TemplateName, TemplateVisibility};
+use pplx_space_common_core::types::{TemplateName, TemplateVisibility};
+use pplx_space_execution_spec::RuntimeKind;
 use pplx_space_public_api::{
     PageCursor, PublicPage, PublicTemplate, PublicTemplateSnapshot, PublicTemplateVariant,
     SandboxResources,

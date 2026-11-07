@@ -24,7 +24,7 @@ pub(crate) fn mark_managed_store(
             }),
             ArtifactKind::Component(kind) => roots.managed_kernels.as_ref().is_some_and(|root| {
                 let root = match kind {
-                    pplx_space_common_core::types::ArtifactComponentKind::Firmware => {
+                    pplx_space_execution_spec::ArtifactComponentKind::Firmware => {
                         pplx_space_node_runtime_core::artifact_layout::boot_artifacts_root(root)
                     }
                     _ => root.clone(),
@@ -39,8 +39,8 @@ pub(crate) fn mark_managed_store(
 }
 
 pub(crate) fn runtime_identity(
-    runtime: &pplx_space_common_core::types::RuntimeIdentity,
-    digest: pplx_space_common_core::types::Digest,
+    runtime: &pplx_space_execution_spec::RuntimeIdentity,
+    digest: pplx_space_content_digest::Digest,
 ) -> proto::ArtifactIdentity {
     proto::ArtifactIdentity {
         artifact: Some(proto::artifact_identity::Artifact::Runtime(
@@ -53,7 +53,7 @@ pub(crate) fn runtime_identity(
     }
 }
 pub(crate) fn component_identity(
-    identity: pplx_space_common_core::types::ComponentIdentity,
+    identity: pplx_space_execution_spec::ComponentIdentity,
 ) -> proto::ArtifactIdentity {
     proto::ArtifactIdentity {
         artifact: Some(proto::artifact_identity::Artifact::Component(component(
@@ -63,7 +63,7 @@ pub(crate) fn component_identity(
 }
 
 pub(crate) fn component(
-    identity: pplx_space_common_core::types::ComponentIdentity,
+    identity: pplx_space_execution_spec::ComponentIdentity,
 ) -> proto::ComponentIdentity {
     proto::ComponentIdentity {
         kind: execution::ArtifactComponentKind::from(identity.kind) as i32,
@@ -79,15 +79,15 @@ pub(crate) fn operation(operation: &Operation) -> proto::Operation {
             component_identity(identity.clone())
         }
         InstallOperation::InstallKernel { kernel } => {
-            component_identity(pplx_space_common_core::types::ComponentIdentity {
-                kind: pplx_space_common_core::types::ArtifactComponentKind::Kernel,
+            component_identity(pplx_space_execution_spec::ComponentIdentity {
+                kind: pplx_space_execution_spec::ArtifactComponentKind::Kernel,
                 version: kernel.version.artifact_version().clone(),
                 digest: kernel.digest,
             })
         }
         InstallOperation::UninstallKernel { version, digest } => {
-            component_identity(pplx_space_common_core::types::ComponentIdentity {
-                kind: pplx_space_common_core::types::ArtifactComponentKind::Kernel,
+            component_identity(pplx_space_execution_spec::ComponentIdentity {
+                kind: pplx_space_execution_spec::ArtifactComponentKind::Kernel,
                 version: version.artifact_version().clone(),
                 digest: *digest,
             })

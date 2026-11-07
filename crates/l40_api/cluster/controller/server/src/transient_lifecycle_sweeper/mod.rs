@@ -197,7 +197,8 @@ use pplx_space_api::controllers::substrate::{
     AbandonedRestoreRetirement, CommandReadyProbe, PodFenceMismatch, RetireExecutionOutcome,
     RetireFence, RetireStopRoute, Substrate,
 };
-use pplx_space_common_core::types::{PositiveDuration, SandboxId, SandboxLifecycle};
+use pplx_space_common_core::types::{SandboxId, SandboxLifecycle};
+use pplx_space_durations::PositiveDuration;
 use pplx_space_events::{
     SandboxEvent, SandboxEventBoolField, SandboxEventDetails, SandboxEventSource,
     SandboxEventTrigger, SandboxEventType,

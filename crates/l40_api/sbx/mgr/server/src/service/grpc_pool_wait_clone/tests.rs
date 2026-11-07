@@ -11,7 +11,7 @@ fn armed_clone() -> (SandboxManagerService, SandboxId, SandboxCleanupEpisodeId) 
 }
 
 fn armed_clone_with_image(
-    guest_image: pplx_space_common_core::types::guest_image::GuestImageContract,
+    guest_image: pplx_space_execution_spec::guest_image::GuestImageContract,
 ) -> (SandboxManagerService, SandboxId, SandboxCleanupEpisodeId) {
     let conn = crate::db::test_conn();
     let id = SandboxId::new();
@@ -83,7 +83,7 @@ async fn cloning_preserves_guest_contract_and_requires_current_checkpoint() {
     }))
     .unwrap();
     let definition = pplx_space_execution_catalog::catalog::CompiledEnvironment::for_architecture(
-        pplx_space_common_core::types::Arch::X86_64,
+        pplx_space_cpu_arch::Arch::X86_64,
     )
     .unwrap()
     .into_iter()

@@ -2,7 +2,7 @@ use std::path::Path;
 use std::sync::{Arc, OnceLock};
 
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
-use pplx_space_common_core::types::RelativeGlobPattern;
+use pplx_space_guest_process::RelativeGlobPattern;
 use tonic::Status;
 
 const MAX_GLOB_PATTERNS: usize = 128;

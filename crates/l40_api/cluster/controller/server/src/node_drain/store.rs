@@ -24,8 +24,9 @@ use pplx_space_common_core::node_drain_signals::{
 };
 use pplx_space_common_core::types::{
     ArtifactKind, BackupSource, ExecutionGeneration, LocalArtifactId, NodeDrainMode, NodeManagedBy,
-    NodeRole, PositiveDuration, SandboxId, SubstrateKind,
+    NodeRole, SandboxId, SubstrateKind,
 };
+use pplx_space_durations::PositiveDuration;
 use pplx_space_events::{
     SandboxEvent, SandboxEventDetails, SandboxEventSource, SandboxEventTrigger, SandboxEventType,
 };

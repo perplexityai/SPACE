@@ -21,11 +21,12 @@ use crate::runtime_reconciliation::{mark_quarantined_best_effort, observe_vm_sta
 use crate::state::SandboxState;
 use pplx_space_common_core::types::{
     ArtifactKind, LocalArtifactId, SandboxArtifactMetadata, SandboxId, SandboxQuarantineReasonCode,
-    SnapshotExecutionMetadata, SnapshotName,
+    SnapshotName,
 };
 use pplx_space_events::{
     SandboxEventDetails, SandboxEventSource, SandboxEventType, emit_sandbox_event,
 };
+use pplx_space_execution_spec::SnapshotExecutionMetadata;
 use pplx_space_node_mgr_client::proto::{
     CaptureVmStateRequest, PauseSandboxRequest, ResumeSandboxRequest, SyncGuestRequest,
 };
@@ -139,11 +140,11 @@ fn write_snapshot_sidecar(
 /// `snapshot.json`, not `runtime.json`.
 fn checkpoint_sidecar_execution_metadata(
     metadata: SandboxArtifactMetadata,
-) -> Result<SnapshotExecutionMetadata, pplx_space_common_core::types::ExecutionMetadataError> {
+) -> Result<SnapshotExecutionMetadata, pplx_space_execution_spec::ExecutionMetadataError> {
     Ok(SnapshotExecutionMetadata::new(metadata.execution)?
         .with_cpu_budget(metadata.cpu_budget)
         .with_guest_memory(metadata.guest_memory)
-        .with_host_cpu(pplx_space_common_core::types::HostCpu::current().cloned()))
+        .with_host_cpu(pplx_space_execution_spec::HostCpu::current().cloned()))
 }
 
 fn write_snapshot_execution_sidecar(snapshot_dir: &str, sandbox_id: &str, snapshot_name: &str) {

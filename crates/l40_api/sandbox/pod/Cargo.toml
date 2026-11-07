@@ -22,10 +22,15 @@ uuid = { workspace = true, features = ["serde"] }
 
 # internal
 pplx-space-accounts = { workspace = true, features = ["serde"] }
+pplx-space-byte-size = { workspace = true, features = ["serde"] }
 pplx-space-common-core = { workspace = true, features = ["serde"] }
 pplx-space-env-vars = { workspace = true }
+pplx-space-execution-spec = { workspace = true, features = ["serde"] }
 pplx-space-policy-authority = { workspace = true }
 
 [dev-dependencies]
 insta = { workspace = true, features = ["yaml"] }
+pplx-space-auto-lifecycle = { workspace = true, features = ["serde"] }
+pplx-space-content-digest = { workspace = true }
+pplx-space-guest-process = { workspace = true }
 pplx-space-net-common = { workspace = true, features = ["serde"] }

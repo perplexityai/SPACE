@@ -171,7 +171,7 @@ fn create_refused_before_template_lookup() -> CreateRequest {
     CreateRequest {
         template: "seed".into(),
         owner: "root@local".into(),
-        runtime: pplx_space_common_core::types::RUNTIME_FIRECRACKER_ALIAS.into(),
+        runtime: pplx_space_execution_spec::RUNTIME_FIRECRACKER_ALIAS.into(),
         boot_mode: BootMode::Cold as i32,
         sandbox_id: Some(SandboxId::new().to_string()),
         auto_lifecycle: Some(Default::default()),
@@ -814,7 +814,7 @@ fn auto_lifecycle_expectation(
 }
 
 fn access_idle_delete_policy(at: u64) -> AutoLifecyclePolicy {
-    use pplx_space_common_core::types::{
+    use pplx_space_auto_lifecycle::{
         AutoLifecycleConditionSet, AutoLifecycleConditionSetId, AutoLifecycleStage,
     };
     AutoLifecyclePolicy {
@@ -905,7 +905,7 @@ async fn auto_lifecycle_delete_requires_one_canonical_id_and_the_expected_policy
                     pplx_space_common_core::types::SandboxActivationAttemptId::new(),
                 ),
                 substrate_kind: Some(NodeManagedBy::Kubernetes),
-                pod_uid: Some(pplx_space_common_core::types::PodUid::parse("pod-uid-7").unwrap()),
+                pod_uid: Some(pplx_space_k8s_ids::PodUid::parse("pod-uid-7").unwrap()),
                 ..Default::default()
             },
             crate::auto_lifecycle_delete_receipts::RouteIdentityProvenance::ClusterFenced,
@@ -1231,7 +1231,9 @@ fn template_catalog_preserves_owner_identity_with_corrupt_supplemental_metadata(
 /// cache partition's dir.
 #[test]
 fn template_catalog_reads_a_twin_s_metadata_from_its_partition() {
-    use pplx_space_common_core::types::{Digest, EnvironmentReference, TemplateCachePartition};
+    use pplx_space_common_core::types::TemplateCachePartition;
+    use pplx_space_content_digest::Digest;
+    use pplx_space_execution_spec::EnvironmentReference;
     let cache = tempfile::tempdir().unwrap();
     let hash = format!("sha256:{}", "a".repeat(64));
     let twin = EnvironmentReference::new(Digest::sha256([2; 32]));
@@ -1283,7 +1285,7 @@ fn template_catalog_reads_an_adopted_build_s_metadata_from_its_legacy_dir(
     )
     .unwrap();
     let e1 = pplx_space_execution_catalog::catalog::CompiledEnvironment::for_architecture(
-        pplx_space_common_core::types::Arch::X86_64,
+        pplx_space_cpu_arch::Arch::X86_64,
     )
     .unwrap()
     .iter()

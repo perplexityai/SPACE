@@ -135,7 +135,7 @@ impl TemplateBuild {
 /// The template's default auto-lifecycle policy, distinct from the disabled
 /// policy test rows start with.
 fn access_idle_suspend_policy() -> AutoLifecyclePolicy {
-    use pplx_space_common_core::types::{
+    use pplx_space_auto_lifecycle::{
         AutoLifecycleConditionSet, AutoLifecycleConditionSetId, AutoLifecycleStage,
     };
     AutoLifecyclePolicy {
@@ -232,7 +232,7 @@ pub(super) fn create_request() -> CreateRequest {
     CreateRequest {
         template: TEMPLATE.into(),
         owner: OWNER.into(),
-        runtime: pplx_space_common_core::types::RUNTIME_FIRECRACKER_ALIAS.into(),
+        runtime: pplx_space_execution_spec::RUNTIME_FIRECRACKER_ALIAS.into(),
         env: HashMap::from([("CREATE_ENV".to_owned(), "from-request".to_owned())]),
         ..Default::default()
     }
@@ -259,7 +259,7 @@ pub(super) fn insert_created_row(
             template: TEMPLATE,
             template_hash: Some(template_hash),
             user: owner,
-            runtime: pplx_space_common_core::types::RUNTIME_FIRECRACKER_ALIAS,
+            runtime: pplx_space_execution_spec::RUNTIME_FIRECRACKER_ALIAS,
             snapshots_enabled: false,
             rootfs_size_mb: None,
             disk_io_limits: Default::default(),
@@ -672,8 +672,9 @@ async fn requested_id_create_reuses_only_a_compatible_settled_row() {
 }
 
 fn protocol_test_environment() -> pplx_space_execution_common::environment::EnvironmentDefinition {
-    use pplx_space_common_core::types::{Arch, EnvironmentDescriptor, RuntimeBinding};
+    use pplx_space_cpu_arch::Arch;
     use pplx_space_execution_common::environment::EnvironmentDefinition;
+    use pplx_space_execution_spec::{EnvironmentDescriptor, RuntimeBinding};
     let initial =
         pplx_space_node_runtime_core::catalog::InitialEnvironment::for_architecture(Arch::X86_64)
             .unwrap()
@@ -739,8 +740,8 @@ async fn explicit_selection_checks_legacy_base_evidence_before_create() {
         request.boot_mode = BootMode::Cold as i32;
         pplx_space_sbx_mgr_client::environment::bind(
             &mut request,
-            pplx_space_common_core::types::EnvironmentReference::new(
-                pplx_space_common_core::types::Digest::sha256([1; 32]),
+            pplx_space_execution_spec::EnvironmentReference::new(
+                pplx_space_content_digest::Digest::sha256([1; 32]),
             ),
         );
         mutate(&mut request);
@@ -770,8 +771,7 @@ async fn explicit_selection_checks_legacy_base_evidence_before_create() {
         if !matches {
             evidence.components.clear();
         }
-        let evidence =
-            pplx_space_common_core::types::ExecutionMetadata::try_from(&evidence).unwrap();
+        let evidence = pplx_space_execution_spec::ExecutionMetadata::try_from(&evidence).unwrap();
         let mut metadata: serde_json::Value =
             serde_json::from_slice(&std::fs::read(build.dir.path().join("metadata.json")).unwrap())
                 .unwrap();
@@ -830,7 +830,7 @@ async fn selected_create_persists_the_binding_used_by_first_start() {
         return;
     }
     for environment in pplx_space_node_runtime_core::catalog::CompiledEnvironment::for_architecture(
-        pplx_space_common_core::types::Arch::X86_64,
+        pplx_space_cpu_arch::Arch::X86_64,
     )
     .unwrap()
     {
@@ -841,7 +841,7 @@ async fn selected_create_persists_the_binding_used_by_first_start() {
         let definition = environment.definition().clone();
         let execution = definition.execution_requirements().unwrap();
         let firecracker =
-            execution.runtime().kind == pplx_space_common_core::types::RuntimeKind::Firecracker;
+            execution.runtime().kind == pplx_space_execution_spec::RuntimeKind::Firecracker;
         let bound = definition.bind_execution(execution).unwrap();
         let mut wire = pplx_space_execution_common::proto::ExecutionMetadata::from(&bound);
         // Only Firecracker accepts historical, unbound disk evidence. Other
@@ -858,7 +858,7 @@ async fn selected_create_persists_the_binding_used_by_first_start() {
             wire.runtime.as_mut().unwrap().version = "1.15.1".into();
             wire.state_format.as_mut().unwrap().version = "9.0.0".into();
         }
-        let legacy = pplx_space_common_core::types::ExecutionMetadata::try_from(&wire).unwrap();
+        let legacy = pplx_space_execution_spec::ExecutionMetadata::try_from(&wire).unwrap();
         let build = TemplateBuild::new();
         let mut metadata: serde_json::Value =
             serde_json::from_slice(&std::fs::read(build.dir.path().join("metadata.json")).unwrap())
@@ -990,8 +990,7 @@ async fn selected_create_persists_the_binding_used_by_first_start() {
                 }
                 Evidence::Missing => {}
             }
-            let observed =
-                pplx_space_common_core::types::ExecutionMetadata::try_from(&wire).unwrap();
+            let observed = pplx_space_execution_spec::ExecutionMetadata::try_from(&wire).unwrap();
             let path = sandbox_dir.join("metadata.json");
             if matches!(evidence, Evidence::Missing) {
                 std::fs::remove_file(&path).unwrap();
@@ -1046,8 +1045,9 @@ async fn selected_create_persists_the_binding_used_by_first_start() {
 /// requiring exact permission for the revoked producer.
 #[tokio::test]
 async fn unpinned_create_selects_before_admitting_a_non_default_source() {
-    use pplx_space_common_core::types::{Digest, EnvironmentDescriptor, RuntimeBinding};
+    use pplx_space_content_digest::Digest;
     use pplx_space_execution_common::environment::EnvironmentDefinition;
+    use pplx_space_execution_spec::{EnvironmentDescriptor, RuntimeBinding};
     use pplx_space_node_mgr_client::proto::{
         ExecutionEnvironmentSelection, ResolveExecutionEnvironmentRequest,
         ResolveExecutionEnvironmentResponse, resolve_execution_environment_request::Compatible,
@@ -1085,7 +1085,7 @@ async fn unpinned_create_selects_before_admitting_a_non_default_source() {
                 return Err(Status::failed_precondition("source environment revoked"));
             };
             assert_eq!(
-                pplx_space_common_core::types::ExecutionMetadata::try_from(&observed).unwrap(),
+                pplx_space_execution_spec::ExecutionMetadata::try_from(&observed).unwrap(),
                 source
             );
             Ok(ResolveExecutionEnvironmentResponse {

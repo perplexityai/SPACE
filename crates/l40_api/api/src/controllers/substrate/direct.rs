@@ -85,12 +85,14 @@ use pplx_space_postgres_pool::contention;
 use std::{fmt, time::Duration};
 
 use pplx_space_accounts::NodeId;
+use pplx_space_auto_lifecycle::AutoLifecyclePolicy;
 use pplx_space_common_core::types::{
-    ArtifactOrigin, AutoLifecyclePolicy, ExecutionGeneration, ExecutionGenerationParseError,
-    NodeManagedBy, NodeRole as SpaceNodeRole, PodUid, PodUidParseError, RouteGeneration,
-    RouteGenerationParseError, SandboxActivationAttemptId, SandboxId, SandboxLifecycle,
-    SandboxRouteIdentity, SandboxRouteIdentityInvariantError, SubstrateKind,
+    ArtifactOrigin, ExecutionGeneration, ExecutionGenerationParseError, NodeManagedBy,
+    NodeRole as SpaceNodeRole, RouteGeneration, RouteGenerationParseError,
+    SandboxActivationAttemptId, SandboxId, SandboxLifecycle, SandboxRouteIdentity,
+    SandboxRouteIdentityInvariantError, SubstrateKind,
 };
+use pplx_space_k8s_ids::{PodUid, PodUidParseError};
 use pplx_space_net_common::{NetworkPolicyV1, proto::NetworkPolicyV1 as NetworkPolicyProto};
 use pplx_space_policy_authority::PolicyAuthority;
 use pplx_space_sandbox_portability::{
@@ -2152,7 +2154,7 @@ impl DirectSubstrate {
             (Some(vcpu), Some(memory_mib)) => Some(PooledExecutionPoolShape::new(
                 vcpu,
                 memory_mib,
-                pplx_space_common_core::types::DiskIoLimits::default(),
+                pplx_space_execution_spec::DiskIoLimits::default(),
             )),
             (None, None) => None,
             _ => {
@@ -4038,7 +4040,7 @@ impl SubstrateAdapter for DirectSubstrate {
                         vcpu,
                         memory_mib,
                         disk_mib: None,
-                        disk_io_limits: pplx_space_common_core::types::DiskIoLimits::default(),
+                        disk_io_limits: pplx_space_execution_spec::DiskIoLimits::default(),
                         active_node_id: Some(candidate.id),
                         route_identity: Some(route_identity),
                     };
