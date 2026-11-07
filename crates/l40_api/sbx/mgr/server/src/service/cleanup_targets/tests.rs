@@ -575,7 +575,7 @@ async fn a_stops_flush_attempt_ends_at_its_budget_whichever_step_stalls() {
 
     let failed_resume = within_stop_flush_budget(
         budget,
-        async { Err::<(), _>(StopFlushError::VmNotRunning) },
+        async { Err(StopFlushError::VmNotRunning) },
         || async { Ok::<(), StopFlushError>(()) },
     )
     .await;

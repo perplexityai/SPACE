@@ -1259,7 +1259,6 @@ impl SandboxManagerService {
                 auto_lifecycle: self.auto_lifecycle.clone(),
                 health_lifecycle: self.watchdog.lifecycle_epochs(),
                 node_manager: self.node_manager.clone(),
-                activation_seal: Arc::clone(&self.activation_seal),
             };
 
             let completion = crate::snapshot_scheduler::do_checkpoint(&ctx, id, &snapshot_name)

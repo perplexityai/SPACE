@@ -347,10 +347,10 @@ impl SandboxManagerService {
     /// (resident resume), and holds the permit across that request. A
     /// restore's permit ends before the restore loads the snapshot and resumes
     /// the VM. Two resumes do not pass here: a checkpoint's resume of the VM it
-    /// paused, and a stop's resume of a paused VM so its guest can flush.
-    ///
-    /// Each holds a [`crate::activation_seal::ActivationSeal::continuation`]
-    /// token instead.
+    /// paused, and a stop's resume of a paused VM so its guest can flush. The
+    /// seal refuses neither, and a drain need not count them in flight: each
+    /// runs while the sandbox's row is in a state that keeps the drain from
+    /// being done.
     ///
     /// Cold boots and restores wait for [`ActivationAdmissionLimiter`]
     /// capacity and are refused when it stays exhausted. A resident resume

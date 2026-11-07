@@ -228,7 +228,7 @@ async fn in_flight_tokens_are_released_on_error_cancellation_and_panic() {
     let panicked = tokio::spawn({
         let seal = Arc::clone(&seal);
         async move {
-            let _token = seal.continuation(InFlightActivationKind::StopFlush, SANDBOX);
+            let _token = seal.admit(InFlightActivationKind::Cold, SANDBOX).unwrap();
             panic!("activation step panicked");
         }
     });

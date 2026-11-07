@@ -869,8 +869,6 @@ const fn in_flight_kind_to_wire(
         Kind::Cold => Wire::Cold,
         Kind::Restore => Wire::Restore,
         Kind::ResidentResume => Wire::ResidentResume,
-        Kind::Checkpoint => Wire::Checkpoint,
-        Kind::StopFlush => Wire::StopFlush,
     }
 }
 

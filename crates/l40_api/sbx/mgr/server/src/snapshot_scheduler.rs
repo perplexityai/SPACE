@@ -12,7 +12,6 @@ use std::time::Duration;
 
 use tokio::sync::Mutex;
 
-use crate::activation_seal::InFlightActivationKind;
 use crate::guest_filesystem_flush::{
     GuestSnapshotPreparationBudget, flush_guest_filesystems_via_spaced_host,
     prepare_guest_for_vm_snapshot_via_spaced_host,
@@ -259,9 +258,6 @@ pub struct CheckpointContext {
     pub auto_lifecycle: crate::auto_lifecycle::AutoLifecycleCoordinator,
     pub health_lifecycle: crate::watchdog::HealthLifecycleEpochs,
     pub node_manager: crate::node_manager_transport::NodeManagerConnector,
-    /// Counts a checkpoint that pauses a running VM as in flight until it
-    /// has resumed it.
-    pub(crate) activation_seal: Arc<crate::activation_seal::ActivationSeal>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -818,27 +814,6 @@ fn finish_checkpoint_success(
     Ok(())
 }
 
-#[cfg(test)]
-tokio::task_local! {
-    /// Stands in for a checkpoint's guest snapshot preparation, which dials
-    /// the host's per-sandbox spaced-host socket, and succeeds.
-    static CHECKPOINT_GUEST_PREPARED: ();
-}
-
-async fn prepare_guest_for_checkpoint(
-    sandbox_id: &str,
-) -> Result<(), crate::guest_filesystem_flush::GuestFlushError> {
-    #[cfg(test)]
-    if CHECKPOINT_GUEST_PREPARED.try_with(|()| ()).is_ok() {
-        return Ok(());
-    }
-    prepare_guest_for_vm_snapshot_via_spaced_host(
-        sandbox_id,
-        GuestSnapshotPreparationBudget::Standard,
-    )
-    .await
-}
-
 /// Perform a full checkpoint: pause vCPUs, snapshot VM state + memory, then resume.
 /// On any error, try to resume the VM and restore its prior stable state. If
 /// the resume outcome is uncertain, preserve the runtime behind quarantine.
@@ -913,16 +888,6 @@ pub async fn do_checkpoint(
             sandbox.execution_metadata.clone(),
         )
     };
-    // A checkpoint of a running VM pauses it and resumes it, after the
-    // capture or after a failure. Those resumes don't pass VM activation
-    // admission: they return the VM to the running state the checkpoint
-    // found it in, and refusing them while the node is sealed would leave it
-    // paused. The checkpoint holds this token until it has resumed the VM or
-    // given up, so a seal waits for it.
-    let _resume_continuation = (previous_state == SandboxState::Started).then(|| {
-        ctx.activation_seal
-            .continuation(InFlightActivationKind::Checkpoint, sandbox_id)
-    });
     if previous_state == SandboxState::Started {
         ctx.health_lifecycle.record_edge(sandbox_id).await;
     }
@@ -939,7 +904,11 @@ pub async fn do_checkpoint(
     // 3. Flush and disconnect guest bridge clients, then pause vCPUs.
     // A VM that was already paused cannot service the preparation RPC.
     if previous_state == SandboxState::Started
-        && let Err(e) = prepare_guest_for_checkpoint(sandbox_id).await
+        && let Err(e) = prepare_guest_for_vm_snapshot_via_spaced_host(
+            sandbox_id,
+            GuestSnapshotPreparationBudget::Standard,
+        )
+        .await
     {
         restore_checkpoint_state_best_effort(ctx, sandbox_id, SandboxState::Started);
         return Err(format!(

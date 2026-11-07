@@ -10,11 +10,9 @@
 //!
 //! Each admitted activation holds an [`ActivationInFlightToken`] from
 //! admission until its last step finishes or fails, including the finalizer
-//! it detaches. So does a checkpoint or a stop that resumes a VM as part of
-//! its own work, whether it began before or after the seal (see
-//! [`ActivationSeal::continuation`]). The seal state lock orders every
-//! admission against every seal: an activation is admitted and registered
-//! entirely before a seal lands, and counts as in flight, or is refused.
+//! it detaches. The seal state lock orders every admission against every
+//! seal: an activation is admitted and registered entirely before a seal
+//! lands, and counts as in flight, or is refused.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -26,18 +24,12 @@ use tonic::Status;
 
 use crate::db::activation_seal::{ActivationSealRecord, write_activation_seal};
 
-/// What a piece of in-flight activation work is.
+/// What a VM activation in flight is.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub(crate) enum InFlightActivationKind {
     Cold,
     Restore,
     ResidentResume,
-    /// A full checkpoint of a running VM, from before it pauses the VM until
-    /// it has resumed it or given up.
-    Checkpoint,
-    /// A stop's resume of a paused VM so its guest can flush, until the
-    /// stop's node cleanup of the VM returns.
-    StopFlush,
 }
 
 impl InFlightActivationKind {
@@ -46,18 +38,6 @@ impl InFlightActivationKind {
             Self::Cold => "cold",
             Self::Restore => "restore",
             Self::ResidentResume => "resident_resume",
-            Self::Checkpoint => "checkpoint",
-            Self::StopFlush => "stop_flush",
-        }
-    }
-
-    /// Whether the seal refuses new work of this kind. The others are a
-    /// checkpoint's and a stop's own resumes, which run whether or not the
-    /// node is sealed.
-    pub(crate) const fn is_activation(self) -> bool {
-        match self {
-            Self::Cold | Self::Restore | Self::ResidentResume => true,
-            Self::Checkpoint | Self::StopFlush => false,
         }
     }
 }
@@ -171,28 +151,11 @@ impl ActivationSeal {
         kind: InFlightActivationKind,
         sandbox_id: &str,
     ) -> Result<ActivationInFlightToken, Status> {
-        debug_assert!(kind.is_activation(), "{kind} is not a VM activation");
         let state = self.lock_state();
         refuse_while_sealed(&state, kind, sandbox_id)?;
         // Registered before the state lock is released, so a seal that
         // lands next finds it in flight.
         Ok(self.in_flight.register(kind, sandbox_id))
-    }
-
-    /// Count a checkpoint's resume of the VM it paused, or a stop's resume of
-    /// a paused VM so its guest can flush, as in flight until the operation
-    /// is done with the VM. Never refused, and not an admission, even when
-    /// the operation began after the seal: a checkpoint's resume only undoes
-    /// its own pause, and a stop goes on to end its VM, while refusing either
-    /// resume would leave the VM paused and the operation unable to finish.
-    /// Counting it keeps a drain from reporting the node done while it runs.
-    pub(crate) fn continuation(
-        &self,
-        kind: InFlightActivationKind,
-        sandbox_id: &str,
-    ) -> ActivationInFlightToken {
-        debug_assert!(!kind.is_activation(), "{kind} is a VM activation");
-        self.in_flight.register(kind, sandbox_id)
     }
 
     /// Seal under `epoch`, persisted before the seal takes effect. The same
