@@ -1682,6 +1682,67 @@ class StoppedReplacementControl(NodeDrainControl, Protocol):
         ...
 
 
+@dataclass(frozen=True)
+class InFlightActivationView:
+    """One `in_flight=` line of a `space-sbxmgr` activation-seal answer."""
+
+    kind: str
+    sandbox_id: str
+    age_ms: int
+
+
+@dataclass(frozen=True)
+class ActivationSealReport:
+    """What a worker's sandbox-manager answers about its activation seal.
+
+    The `space-sbxmgr` seal commands' `key=value` lines: `sealed_epoch` is None
+    while unsealed, `quiesced` is set only by `seal-activations`, and
+    `activations_admitted` counts the VM activations the sandbox-manager
+    process admitted since it started.
+    """
+
+    sealed_epoch: int | None
+    sealed_since: str | None
+    activations_admitted: int
+    in_flight: tuple[InFlightActivationView, ...]
+    quiesced: bool | None = None
+
+
+class ActivationSealControl(NodeFaultControl, Protocol):
+    """Kind-only control of one worker's sandbox-manager activation seal.
+
+    The seal is a node-local sandbox-manager RPC with no control-plane route
+    yet, so the harness reaches it through the worker's `space-sbxmgr` in the
+    operator shell. The worker cordon from [`NodeFaultControl`] keeps the
+    scenario's creates and restores on the sealed worker.
+    """
+
+    def sandbox_pool_nodes(self) -> list[str]: ...
+
+    def sandbox_pod_placement(self, sandbox_id: str) -> SandboxPodPlacement | None: ...
+
+    def sandbox_residency(self, sandbox_id: str) -> SandboxResidency: ...
+
+    def seal_activations(
+        self, node_name: str, epoch: int, *, wait_seconds: int
+    ) -> ActivationSealReport:
+        """`space-sbxmgr seal-activations` on the worker, under the caller's worker-cordon Lease.
+
+        The seal is recorded on the Lease before it is sent, and a successful
+        unseal clears it, so the Lease's next holder unseals a worker a killed
+        run left sealed.
+        """
+        ...
+
+    def unseal_activations(self, node_name: str, epoch: int) -> ActivationSealReport:
+        """`space-sbxmgr unseal-activations` on the worker; an unsealed worker stays unsealed."""
+        ...
+
+    def activation_seal_state(self, node_name: str) -> ActivationSealReport:
+        """`space-sbxmgr activation-seal` on the worker; changes nothing."""
+        ...
+
+
 class RestoreStateRead(Protocol):
     """Control-plane reads about where and whether a sandbox can restore."""
 
