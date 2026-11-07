@@ -1,7 +1,10 @@
 //! Component qualification probe, run against an explicitly named VMM process.
 //! This does not admit a Windows image for SPACE lifecycle or tenant operations.
-use pplx_space_spaced_common::{
-    BRIDGE_GUEST_VSOCK_PORT, ExpectedUdsPeer, connect_firecracker_vsock_channel_with_expected_peer,
+use pplx_space_spaced_client::{
+    ExpectedUdsPeer, connect_firecracker_vsock_channel_with_expected_peer,
+};
+use pplx_space_spaced_guest_protocol::{
+    BRIDGE_GUEST_VSOCK_PORT,
     proto::{
         bridge_guest::{
             ClockSyncStatus, FlushFilesystemsRequest, NotifyResumeRequest, ResumeReason,

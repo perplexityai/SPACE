@@ -1,7 +1,7 @@
 use crate::guest_service::GuestFixture;
 use nix::unistd::{Uid, User};
-use pplx_space_spaced_common::proto::bridge_guest::filesystem_client::FilesystemClient as BridgeGuestFilesystemClient;
-use pplx_space_spaced_common::proto::bridge_guest::{
+use pplx_space_spaced_guest_protocol::proto::bridge_guest::filesystem_client::FilesystemClient as BridgeGuestFilesystemClient;
+use pplx_space_spaced_guest_protocol::proto::bridge_guest::{
     FileType, ListRequest, MkdirRequest, ReadRequest, RemoveRequest, RenameRequest, StatRequest,
     WriteOpen, WriteRequest,
 };
@@ -297,7 +297,7 @@ async fn bridge_guest_write_creates_file() {
     let messages = vec![
         WriteRequest {
             message: Some(
-                pplx_space_spaced_common::proto::bridge_guest::write_request::Message::Open(
+                pplx_space_spaced_guest_protocol::proto::bridge_guest::write_request::Message::Open(
                     WriteOpen {
                         path: file_path.display().to_string(),
                         append: false,
@@ -309,7 +309,7 @@ async fn bridge_guest_write_creates_file() {
         },
         WriteRequest {
             message: Some(
-                pplx_space_spaced_common::proto::bridge_guest::write_request::Message::Data(
+                pplx_space_spaced_guest_protocol::proto::bridge_guest::write_request::Message::Data(
                     b"hello".to_vec(),
                 ),
             ),
@@ -336,7 +336,7 @@ async fn bridge_guest_write_rejects_unknown_user() {
     let messages = vec![
         WriteRequest {
             message: Some(
-                pplx_space_spaced_common::proto::bridge_guest::write_request::Message::Open(
+                pplx_space_spaced_guest_protocol::proto::bridge_guest::write_request::Message::Open(
                     WriteOpen {
                         path: file_path.display().to_string(),
                         append: false,
@@ -348,7 +348,7 @@ async fn bridge_guest_write_rejects_unknown_user() {
         },
         WriteRequest {
             message: Some(
-                pplx_space_spaced_common::proto::bridge_guest::write_request::Message::Data(
+                pplx_space_spaced_guest_protocol::proto::bridge_guest::write_request::Message::Data(
                     b"hello".to_vec(),
                 ),
             ),
@@ -380,7 +380,7 @@ async fn bridge_guest_write_rejects_symlink_path() {
     let messages = vec![
         WriteRequest {
             message: Some(
-                pplx_space_spaced_common::proto::bridge_guest::write_request::Message::Open(
+                pplx_space_spaced_guest_protocol::proto::bridge_guest::write_request::Message::Open(
                     WriteOpen {
                         path: link_path.display().to_string(),
                         append: false,
@@ -392,7 +392,7 @@ async fn bridge_guest_write_rejects_symlink_path() {
         },
         WriteRequest {
             message: Some(
-                pplx_space_spaced_common::proto::bridge_guest::write_request::Message::Data(
+                pplx_space_spaced_guest_protocol::proto::bridge_guest::write_request::Message::Data(
                     b"replacement".to_vec(),
                 ),
             ),
@@ -421,7 +421,7 @@ async fn bridge_guest_write_requires_open_first() {
     let error = client
         .write(tokio_stream::iter(vec![WriteRequest {
             message: Some(
-                pplx_space_spaced_common::proto::bridge_guest::write_request::Message::Data(
+                pplx_space_spaced_guest_protocol::proto::bridge_guest::write_request::Message::Data(
                     b"hello".to_vec(),
                 ),
             ),
@@ -634,7 +634,7 @@ async fn bridge_guest_watch_reports_modified_file() {
 
     let mut stream = client
         .watch(
-            pplx_space_spaced_common::proto::bridge_guest::WatchRequest {
+            pplx_space_spaced_guest_protocol::proto::bridge_guest::WatchRequest {
                 path: watched.display().to_string(),
                 recursive: false,
                 include_metadata_events: true,
@@ -659,7 +659,7 @@ async fn bridge_guest_watch_reports_modified_file() {
                 .expect("watch event");
             if event.path == "file.txt"
                 && event.kind()
-                    == pplx_space_spaced_common::proto::bridge_guest::FileEventKind::Modified
+                    == pplx_space_spaced_guest_protocol::proto::bridge_guest::FileEventKind::Modified
             {
                 break event;
             }
@@ -670,7 +670,7 @@ async fn bridge_guest_watch_reports_modified_file() {
     assert_eq!(event.path, "file.txt");
     assert_eq!(
         event.kind(),
-        pplx_space_spaced_common::proto::bridge_guest::FileEventKind::Modified
+        pplx_space_spaced_guest_protocol::proto::bridge_guest::FileEventKind::Modified
     );
 
     fixture.stop().await;
@@ -686,14 +686,14 @@ async fn bridge_guest_write_batch_creates_files() {
     let second = temp_dir.path().join("b.txt");
     let response = client
         .write_batch(
-            pplx_space_spaced_common::proto::bridge_guest::WriteBatchRequest {
+            pplx_space_spaced_guest_protocol::proto::bridge_guest::WriteBatchRequest {
                 entries: vec![
-                    pplx_space_spaced_common::proto::bridge_guest::WriteBatchEntry {
+                    pplx_space_spaced_guest_protocol::proto::bridge_guest::WriteBatchEntry {
                         path: first.display().to_string(),
                         data: b"a".to_vec(),
                         append: false,
                     },
-                    pplx_space_spaced_common::proto::bridge_guest::WriteBatchEntry {
+                    pplx_space_spaced_guest_protocol::proto::bridge_guest::WriteBatchEntry {
                         path: second.display().to_string(),
                         data: b"b".to_vec(),
                         append: false,
@@ -721,14 +721,14 @@ async fn bridge_guest_write_batch_failure_replays_error_without_rewrite() {
 
     let first = temp_dir.path().join("partial.txt");
     let missing_parent = temp_dir.path().join("missing").join("b.txt");
-    let request = pplx_space_spaced_common::proto::bridge_guest::WriteBatchRequest {
+    let request = pplx_space_spaced_guest_protocol::proto::bridge_guest::WriteBatchRequest {
         entries: vec![
-            pplx_space_spaced_common::proto::bridge_guest::WriteBatchEntry {
+            pplx_space_spaced_guest_protocol::proto::bridge_guest::WriteBatchEntry {
                 path: first.display().to_string(),
                 data: b"a".to_vec(),
                 append: false,
             },
-            pplx_space_spaced_common::proto::bridge_guest::WriteBatchEntry {
+            pplx_space_spaced_guest_protocol::proto::bridge_guest::WriteBatchEntry {
                 path: missing_parent.display().to_string(),
                 data: b"b".to_vec(),
                 append: false,
@@ -771,7 +771,7 @@ async fn bridge_guest_watch_reports_created_file() {
 
     let mut stream = client
         .watch(
-            pplx_space_spaced_common::proto::bridge_guest::WatchRequest {
+            pplx_space_spaced_guest_protocol::proto::bridge_guest::WatchRequest {
                 path: watched.display().to_string(),
                 recursive: false,
                 include_metadata_events: true,
@@ -795,7 +795,7 @@ async fn bridge_guest_watch_reports_created_file() {
     assert_eq!(event.path, "created.txt");
     assert_eq!(
         event.kind(),
-        pplx_space_spaced_common::proto::bridge_guest::FileEventKind::Created
+        pplx_space_spaced_guest_protocol::proto::bridge_guest::FileEventKind::Created
     );
 
     fixture.stop().await;

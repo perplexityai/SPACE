@@ -1,5 +1,5 @@
 [package]
-name = "pplx-space-spaced-common"
+name = "pplx-space-spaced-client"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -11,35 +11,23 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
-pplx-space-spaced-guest-protocol = { workspace = true }
 rand = { workspace = true }
 hyper-util = { workspace = true, features = ["tokio"] }
-http = { workspace = true }
 pplx-space-common-core = { workspace = true }
-pplx-space-credential-injection = { workspace = true }
-pplx-space-net-common = { workspace = true }
-prost = { workspace = true }
-prost-types = { workspace = true }
-semver = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["net", "time", "io-util"] }
 tokio-stream = { workspace = true, features = ["net"] }
 tokio-util = { workspace = true }
 tokio-vsock = { workspace = true, features = ["tonic014"] }
 tonic = { workspace = true }
-tonic-prost = { workspace = true }
 tower = { workspace = true }
 tracing = { workspace = true }
-uuid = { workspace = true, features = ["v7"] }
-
-
-[build-dependencies]
-pplx-space-spaced-build = { workspace = true }
-anyhow = { workspace = true }
-pplx-space-common-proto-build = { workspace = true }
-tonic-prost-build = { workspace = true }
 
 [dev-dependencies]
 anyhow = { workspace = true }
 pplx-space-host-layout = { workspace = true }
+pplx-space-spaced-guest-protocol = { workspace = true }
+pplx-space-spaced-protocol = { workspace = true }
+prost-types = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt", "sync", "time", "test-util"] }
+uuid = { workspace = true, features = ["v7"] }

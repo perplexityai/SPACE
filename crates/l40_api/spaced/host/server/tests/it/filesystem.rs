@@ -34,7 +34,7 @@ async fn metadata_fallback_only_on_opening_unimplemented(
         // budget; observe that verdict once rather than once per client retry.
         let config = pplx_space_spaced_host_client::SpacedHostClientConfig::new()
             .with_socket_path(fixture.socket_path.clone())
-            .with_command_retry_policy(pplx_space_spaced_common::RetryPolicy::none());
+            .with_command_retry_policy(pplx_space_spaced_client::RetryPolicy::none());
         client = pplx_space_spaced_host_client::SpacedHostClient::new_with_config(config)
             .await
             .unwrap();
@@ -513,7 +513,7 @@ async fn lost_mutation_replies_are_not_replayed_by_host_or_client() {
 
 #[tokio::test]
 async fn windows_policy_dispatches_files_and_only_advertised_flush() {
-    use pplx_space_spaced_common::proto::platform::{
+    use pplx_space_spaced_guest_protocol::proto::platform::{
         GuestOperation, GuestOs, GuestPlatformDescriptor,
     };
     for advertises_flush in [false, true] {

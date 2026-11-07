@@ -574,7 +574,7 @@ behaviours above and a table keyed by package:
   the Domain crate plain values or a trait it defines; or move a crate that
   is not Domain code to its layer. `[layers.domain_dependencies]` maps each
   package to the fenced packages it depends on, such as
-  `pplx-space-spaced-common = ["tokio"]`. Dev-dependencies are not checked,
+  `pplx-space-net-common = ["tokio"]`. Dev-dependencies are not checked,
   and only declared dependencies are: a protocol's tonic brings tokio and
   hyper into its build regardless.
 - `model_protocol`: no model has a normal or build dependency on a protocol.

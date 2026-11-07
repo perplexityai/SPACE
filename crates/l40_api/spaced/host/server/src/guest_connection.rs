@@ -2,7 +2,7 @@
 use super::*;
 use pplx_space_common_core::types::guest_image::QualifiedGuestAgent;
 use pplx_space_common_grpc::{GuestCapability, guest_capability_unsupported_status};
-use pplx_space_spaced_common::proto::platform::GuestOs;
+use pplx_space_spaced_guest_protocol::proto::platform::GuestOs;
 
 /// Readiness probes and teardown must work before operation negotiation.
 #[derive(Clone, Copy)]
@@ -65,7 +65,7 @@ impl<C> OperationClient<C> {
                         nanos: 1_000_000,
                     }),
                     host_contract_revision:
-                        pplx_space_spaced_common::platform::HOST_CONTRACT_REVISION,
+                        pplx_space_spaced_guest_protocol::platform::HOST_CONTRACT_REVISION,
                 });
                 let response = negotiation_response(self.meta.clone().wait_ready(request))
                     .await?
@@ -83,9 +83,9 @@ impl<C> OperationClient<C> {
 // SPACED_COMPAT_REMOVE_WHEN_MIN_GUEST_0_8_1: capabilities shipped through 0.8.0.
 // Keep this independent of what the current Linux guest advertises.
 fn historical_linux_capabilities()
--> pplx_space_spaced_common::proto::platform::GuestPlatformDescriptor {
+-> pplx_space_spaced_guest_protocol::proto::platform::GuestPlatformDescriptor {
     use GuestOperation::*;
-    pplx_space_spaced_common::proto::platform::GuestPlatformDescriptor {
+    pplx_space_spaced_guest_protocol::proto::platform::GuestPlatformDescriptor {
         os: GuestOs::Linux as i32,
         operations: [
             Process,
@@ -120,7 +120,7 @@ impl GuestPlatformObservation {
         response: &BridgeGuestWaitReadyResponse,
         policy: QualifiedGuestAgent,
     ) -> Result<Self, Status> {
-        pplx_space_spaced_common::validate_spaced_guest_compatibility(
+        pplx_space_spaced_protocol::validate_spaced_guest_compatibility(
             Some(&response.version),
             Some(&response.compatibility_family),
         )
@@ -139,14 +139,14 @@ impl GuestPlatformObservation {
             Some(wire) => wire.clone(),
             // SPACED_COMPAT_REMOVE_WHEN_MIN_GUEST_0_8_1: Linux through 0.8.0 may omit the descriptor.
             None if expected == GuestOs::Linux
-                && !pplx_space_spaced_common::spaced_guest_requires_platform_descriptor(
+                && !pplx_space_spaced_protocol::spaced_guest_requires_platform_descriptor(
                     &response.version,
                 )
                 .map_err(|error| Status::failed_precondition(error.to_string()))? =>
             {
                 let mut wire = historical_linux_capabilities();
                 // SPACED_COMPAT_REMOVE_WHEN_MIN_GUEST_0_1_2: preserve the operation-specific upgrade advice.
-                if !pplx_space_spaced_common::spaced_guest_supports_interactive_process_control(
+                if !pplx_space_spaced_protocol::spaced_guest_supports_interactive_process_control(
                     &response.version,
                 )
                 .map_err(|error| Status::failed_precondition(error.to_string()))?
@@ -166,15 +166,18 @@ impl GuestPlatformObservation {
         };
         // Bound the received descriptor before filtering disallowed claims.
         let mut wire =
-            pplx_space_spaced_common::platform::GuestPlatform::parse(wire, expected)?.wire();
+            pplx_space_spaced_guest_protocol::platform::GuestPlatform::parse(wire, expected)?
+                .wire();
         // Both explicit claims and version-derived capabilities obey image policy.
         wire.operations.retain(|raw| {
             GuestOperation::try_from(*raw).is_ok_and(|operation| {
-                pplx_space_spaced_common::allowed_guest_operations(policy).contains(&operation)
+                pplx_space_spaced_protocol::allowed_guest_operations(policy).contains(&operation)
             })
         });
         Ok(Self {
-            platform: pplx_space_spaced_common::platform::GuestPlatform::parse(wire, expected)?,
+            platform: pplx_space_spaced_guest_protocol::platform::GuestPlatform::parse(
+                wire, expected,
+            )?,
             interactive_upgrade_version,
         })
     }

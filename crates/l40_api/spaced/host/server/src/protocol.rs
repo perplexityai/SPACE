@@ -246,11 +246,11 @@ pub(super) fn bridge_process_resize_pty_request(
 
 pub(super) fn bridge_process_kill_request(
     request: KillRequest,
-) -> Result<pplx_space_spaced_common::proto::bridge_guest::SendSignalRequest, Status> {
+) -> Result<pplx_space_spaced_guest_protocol::proto::bridge_guest::SendSignalRequest, Status> {
     let process_id = ProcessId::parse(request.process_id).map_err(invalid_argument_status)?;
     let signal = ProcessSignal::sigkill();
     Ok(
-        pplx_space_spaced_common::proto::bridge_guest::SendSignalRequest {
+        pplx_space_spaced_guest_protocol::proto::bridge_guest::SendSignalRequest {
             process_id: process_id.as_str().to_string(),
             signal: signal.as_i32(),
         },
@@ -282,9 +282,9 @@ pub(super) fn bridge_file_event_kind_to_host(value: i32) -> Result<i32, Status> 
     Ok(value)
 }
 
-pub(super) use pplx_space_spaced_common::validate_timeout;
+pub(super) use pplx_space_spaced_guest_protocol::validate_timeout;
 
-pub(super) use pplx_space_spaced_common::duration_to_proto;
+pub(super) use pplx_space_spaced_guest_protocol::duration_to_proto;
 
 #[cfg(test)]
 mod tests;

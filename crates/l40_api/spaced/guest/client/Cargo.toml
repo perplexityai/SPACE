@@ -21,5 +21,7 @@ tracing = { workspace = true }
 
 # internal
 pplx-space-common-core = { workspace = true }
-pplx-space-spaced-common = { workspace = true }
+pplx-space-spaced-guest-protocol = { workspace = true }
+pplx-space-spaced-protocol = { workspace = true }
+pplx-space-spaced-client = { workspace = true }
 

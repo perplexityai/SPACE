@@ -2,7 +2,7 @@ use super::*;
 
 #[test]
 fn batch_entry_budget_is_enforced_before_forwarding() {
-    use pplx_space_spaced_common::proto::operations::WriteBatchEntry;
+    use pplx_space_spaced_guest_protocol::proto::operations::WriteBatchEntry;
     let limit = pplx_space_common_core::spaced::MAX_WRITE_BATCH_ENTRIES;
     for count in [limit, limit + 1] {
         let result = bridge_write_batch_request(WriteBatchRequest {

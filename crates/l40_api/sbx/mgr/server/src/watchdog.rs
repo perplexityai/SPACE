@@ -2754,25 +2754,29 @@ async fn probe_spaced_guest_health(
     };
     let result = tokio::time::timeout(SPACED_GUEST_HEALTH_TIMEOUT, async {
         let (channel, _) =
-            pplx_space_spaced_common::connect_firecracker_vsock_channel_with_expected_peer(
+            pplx_space_spaced_client::connect_firecracker_vsock_channel_with_expected_peer(
                 "spaced guest health",
                 Path::new(vsock_uds_path),
-                pplx_space_spaced_common::BRIDGE_GUEST_VSOCK_PORT,
-                pplx_space_spaced_common::ExpectedUdsPeer::new(runtime_pid, uid),
+                pplx_space_spaced_guest_protocol::BRIDGE_GUEST_VSOCK_PORT,
+                pplx_space_spaced_client::ExpectedUdsPeer::new(runtime_pid, uid),
             )
             .await
             .map_err(|error| error.to_string())?;
         let mut client =
-            pplx_space_spaced_common::proto::bridge_guest::meta_client::MetaClient::new(channel)
-                .max_decoding_message_size(
-                    pplx_space_spaced_common::BRIDGE_GUEST_PING_MAX_DECODE_BYTES,
-                );
+            pplx_space_spaced_guest_protocol::proto::bridge_guest::meta_client::MetaClient::new(
+                channel,
+            )
+            .max_decoding_message_size(
+                pplx_space_spaced_client::BRIDGE_GUEST_PING_MAX_DECODE_BYTES,
+            );
         // This probe is the one host caller that drains the guest's
         // diagnostics; spaced-host's own pings leave them in place.
         client
-            .ping(pplx_space_spaced_common::proto::bridge_guest::PingRequest {
-                drain_diagnostics: true,
-            })
+            .ping(
+                pplx_space_spaced_guest_protocol::proto::bridge_guest::PingRequest {
+                    drain_diagnostics: true,
+                },
+            )
             .await
             .map_err(|error| error.to_string())
     })
@@ -3286,7 +3290,7 @@ async fn restart_spaced_host(
     let spaced_host =
         pplx_space_spaced_host_client::SpacedHostClient::new_with_config_and_expected_peer(
             config,
-            pplx_space_spaced_common::ExpectedUdsPeer::new(
+            pplx_space_spaced_client::ExpectedUdsPeer::new(
                 i32::try_from(pid).map_err(|_| SpacedHostRestartError::PidOutOfRange(pid))?,
                 uid,
             ),

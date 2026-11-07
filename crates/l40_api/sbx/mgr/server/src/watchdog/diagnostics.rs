@@ -41,7 +41,7 @@ use pplx_space_events::{
     SandboxEventDetails, SandboxEventSource, SandboxEventType, emit_sandbox_event,
 };
 use pplx_space_host_layout::paths;
-use pplx_space_spaced_common::ExpectedUdsPeer;
+use pplx_space_spaced_client::ExpectedUdsPeer;
 use tokio::sync::{Mutex, Semaphore};
 use tokio_util::sync::CancellationToken;
 
@@ -539,9 +539,9 @@ pub(super) async fn raw_vsock_check(
             .await
             .map_err(|error| (RawVsockOutcome::HostSocketUnavailable, error))?;
         peer = PeerCheck::of(&stream, expected_peer);
-        pplx_space_spaced_common::firecracker_vsock_handshake(
+        pplx_space_spaced_client::firecracker_vsock_handshake(
             &mut stream,
-            pplx_space_spaced_common::BRIDGE_GUEST_VSOCK_PORT,
+            pplx_space_spaced_guest_protocol::BRIDGE_GUEST_VSOCK_PORT,
         )
         .await
         .map_err(|error| {

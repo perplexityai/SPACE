@@ -1,13 +1,13 @@
 use nix::unistd::{Uid, User};
 use pplx_space_common_core::types::GuestUserName;
-use pplx_space_spaced_common::proto::bridge_host::meta_server::{Meta, MetaServer};
-use pplx_space_spaced_common::proto::bridge_host::{
+use pplx_space_spaced_guest_server::{
+    FilesystemExecutionMode, HostConnectorType, SpacedGuestService, SpacedGuestServiceConfig,
+};
+use pplx_space_spaced_protocol::proto::bridge_host::meta_server::{Meta, MetaServer};
+use pplx_space_spaced_protocol::proto::bridge_host::{
     RequestActiveForRequest, RequestActiveForResponse,
     RequestShutdownRequest as BridgeHostShutdownRequest, RequestShutdownResponse,
     SetActivityStateRequest, SetActivityStateResponse,
-};
-use pplx_space_spaced_guest_server::{
-    FilesystemExecutionMode, HostConnectorType, SpacedGuestService, SpacedGuestServiceConfig,
 };
 use std::time::Duration;
 use tokio::net::{UnixListener, UnixStream};
