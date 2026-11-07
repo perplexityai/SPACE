@@ -359,11 +359,59 @@ fn dir_sandbox(dir: &str) -> String {
     )
 }
 
-/// The inventory's scanners that can reveal a resident or an artifact: an
-/// untracked runtime process, or a cache or run directory no row accounts
-/// for. Their candidates and failures block the drain; every
-/// other scanner's leftovers hold neither, and are ignored.
-const BLOCKING_SCANNERS: [&str; 3] = ["RunDirs", "CacheDirs", "Processes"];
+/// A scanner of node-manager's orphan inventory, as its failure warnings
+/// name it (`<scanner>: <error>`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OrphanScanner {
+    Namespaces,
+    Cgroups,
+    RunDirs,
+    GatewayRunDirs,
+    CacheDirs,
+    Processes,
+    Nft,
+}
+
+impl OrphanScanner {
+    const ALL: [Self; 7] = [
+        Self::Namespaces,
+        Self::Cgroups,
+        Self::RunDirs,
+        Self::GatewayRunDirs,
+        Self::CacheDirs,
+        Self::Processes,
+        Self::Nft,
+    ];
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Namespaces => "Namespaces",
+            Self::Cgroups => "Cgroups",
+            Self::RunDirs => "RunDirs",
+            Self::GatewayRunDirs => "GatewayRunDirs",
+            Self::CacheDirs => "CacheDirs",
+            Self::Processes => "Processes",
+            Self::Nft => "Nft",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|scanner| scanner.as_str() == value)
+    }
+
+    /// Whether what this scanner finds can be a resident or an artifact: an
+    /// untracked runtime process, or a sandbox cache or run directory. The
+    /// others find network namespaces, cgroups, nft rules and gateway run
+    /// directories, which hold neither.
+    const fn can_hide_a_resident(self) -> bool {
+        match self {
+            Self::RunDirs | Self::CacheDirs | Self::Processes => true,
+            Self::Namespaces | Self::Cgroups | Self::GatewayRunDirs | Self::Nft => false,
+        }
+    }
+}
 
 /// Fold one inventory page into `findings`.
 pub(super) fn classify_orphan_page(
@@ -389,8 +437,13 @@ pub(super) fn classify_orphan_page(
         }
     }
     for warning in &page.warnings {
-        let scanner = warning.split_once(':').map_or("", |(scanner, _)| scanner);
-        if BLOCKING_SCANNERS.contains(&scanner) {
+        // A failure of a scanner this build doesn't know, or one it can't
+        // name, may have hidden a resident.
+        let harmless = warning
+            .split_once(':')
+            .and_then(|(scanner, _)| OrphanScanner::parse(scanner))
+            .is_some_and(|scanner| !scanner.can_hide_a_resident());
+        if !harmless {
             findings
                 .blocked
                 .push(format!("orphan inventory scan failed: {warning}"));
