@@ -1020,12 +1020,19 @@ async fn terminate_of_a_v2_node_needs_a_done_report_for_its_epoch() -> TestResul
             DrainRequest::default(),
         )
         .await;
-        let phase = v2_columns(&db.pool, node_id).await?.0;
+        let (phase, _, status, _) = v2_columns(&db.pool, node_id).await?;
+        let recorded = status
+            .as_ref()
+            .and_then(|status| status.get("terminate"))
+            .cloned();
         if terminable {
             assert_eq!(phase.as_deref(), Some("terminating"), "{case}: {answer}");
+            // The record the dead-node verb reads: the epoch the gate let go.
+            assert_eq!(recorded, Some(serde_json::json!({"epoch": 42})), "{case}");
         } else {
             assert_eq!(answer, StatusCode::CONFLICT, "{case}");
             assert_eq!(phase.as_deref(), Some("drained"), "{case}");
+            assert_eq!(recorded, None, "{case}");
         }
     }
     Ok(())

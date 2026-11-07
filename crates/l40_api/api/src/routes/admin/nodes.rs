@@ -1739,6 +1739,7 @@ async fn apply_drain_action(
         DrainV2Write::None => Ok(()),
         DrainV2Write::Start => node_store::start_v2_drain(&mut tx, node_id).await,
         DrainV2Write::Cancel => node_store::mark_v2_drain_cancel(&mut tx, node_id).await,
+        DrainV2Write::Terminate => node_store::record_v2_terminate(&mut tx, node_id).await,
     };
     if let Err(err) = v2_written {
         return db_error(err).into_response();
@@ -2278,6 +2279,8 @@ enum DrainV2Write {
     Start,
     /// Mark the epoch for the controller to cancel on the node.
     Cancel,
+    /// Record the epoch whose `done` report let the node be terminated.
+    Terminate,
 }
 
 /// Decide a request's drain v2 write, or refuse it. `starts_a_drain` is
@@ -2327,6 +2330,7 @@ fn drain_v2_write(
             _ => Ok(DrainV2Write::None),
         },
         DrainAction::Undrain if node_engine == NodeDrainEngine::V2 => Ok(DrainV2Write::Cancel),
+        DrainAction::Terminate if node_engine == NodeDrainEngine::V2 => Ok(DrainV2Write::Terminate),
         _ => Ok(DrainV2Write::None),
     }
 }

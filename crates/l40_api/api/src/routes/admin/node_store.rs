@@ -1430,6 +1430,31 @@ pub(super) async fn start_v2_drain(
     Ok(())
 }
 
+/// Record that `:terminate` let a v2 node go: the epoch whose `done` report
+/// the gate read, on a node this transaction has just moved to `terminating`.
+/// The dead-node verb takes the node as dead by this record once the
+/// controller has terminated it, so it is written only with that report.
+pub(super) async fn record_v2_terminate(
+    tx: &mut Transaction<'_, Postgres>,
+    node_id: NodeId,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(sql!(
+        "UPDATE nodes
+            SET drain_status = drain_status
+                || jsonb_build_object('terminate', jsonb_build_object('epoch', drain_status->'epoch'))
+          WHERE id = $1
+            AND drain_engine = 'v2'
+            AND drain_phase = 'terminating'
+            AND (drain_status->'report'->>'sealed_epoch')::BIGINT
+                = (drain_status->>'epoch')::BIGINT
+            AND COALESCE((drain_status->'report'->>'done')::BOOLEAN, FALSE)"
+    ))
+    .bind(node_id)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
 /// Mark an undrained v2 node's epoch for cancel. The controller cancels it on
 /// the node, then clears the drain columns.
 pub(super) async fn mark_v2_drain_cancel(
