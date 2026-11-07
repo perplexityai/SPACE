@@ -7,7 +7,7 @@ use pplx_space_api::controllers::substrate::connect_internal_node_api_client_for
 use pplx_space_api::drain_restore_operations::{
     DrainRestoreOperationPayload, enqueue_drain_restore_once,
 };
-use pplx_space_common_core::types::{NodeDrainEngine, OrgId};
+use pplx_space_common_core::types::OrgId;
 use pplx_space_sandbox_store::drain_restore::DrainRestoreTarget;
 use pplx_space_sbx_mgr_client::proto::{
     DrainEvacuated, DrainNodeRequest, DrainNodeResponse, DrainPrior,
@@ -20,28 +20,115 @@ use crate::node_drain::v2::{DrainV2Sink, EvacuationRecord, V2Node};
 /// How long one `DrainNode` call may take; the node answers without waiting.
 const DRAIN_NODE_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// Every v2 drain's node of the Kubernetes substrate.
+/// Every v2 drain's node of the Kubernetes substrate, with the Kubernetes
+/// identity a termination is recorded against.
 pub(crate) async fn list_v2_nodes(pool: &PgPool) -> Result<Vec<V2Node>, sqlx::Error> {
-    let rows: Vec<(NodeId, Option<String>, Option<i64>, bool)> = sqlx::query_as(sql!(
-        "SELECT id, drain_phase,
-                (drain_status->>'epoch')::BIGINT,
-                COALESCE((drain_status->>'cancel')::BOOLEAN, FALSE)
-           FROM nodes
-          WHERE drain_engine = 'v2' AND managed_by = $1
-          ORDER BY id"
+    type Row = (
+        NodeId,
+        Option<String>,
+        Option<i64>,
+        bool,
+        bool,
+        Option<String>,
+        Option<String>,
+    );
+    let rows: Vec<Row> = sqlx::query_as(sql!(
+        "SELECT n.id, n.drain_phase,
+                (n.drain_status->>'epoch')::BIGINT,
+                COALESCE((n.drain_status->>'cancel')::BOOLEAN, FALSE),
+                n.drain_status ? 'terminated',
+                k.k8s_node_uid, k.instance_id
+           FROM nodes n
+           LEFT JOIN node_k8s k ON k.node_id = n.id
+          WHERE n.drain_engine = 'v2' AND n.managed_by = $1
+          ORDER BY n.id"
     ))
     .bind(SubstrateKind::Kubernetes)
     .fetch_all(pool)
     .await?;
     Ok(rows
         .into_iter()
-        .map(|(id, phase, epoch, cancel)| V2Node {
-            id,
-            phase,
-            epoch: epoch.and_then(|epoch| u64::try_from(epoch).ok()),
-            cancel,
-        })
+        .map(
+            |(id, phase, epoch, cancel, terminated, k8s_node_uid, instance_id)| V2Node {
+                id,
+                phase,
+                epoch: epoch.and_then(|epoch| u64::try_from(epoch).ok()),
+                cancel,
+                terminated,
+                k8s_node_uid,
+                instance_id,
+            },
+        )
         .collect())
+}
+
+/// The SQL predicate that the `nodes` row aliased `n` is a v2 drain's node
+/// the controller terminated under its current epoch: `:terminate` recorded
+/// that epoch's `done` report (`drain_status.terminate`), the node reported
+/// `done` under it, and the termination was recorded under it against the
+/// uid and instance `node_k8s` still holds. The dead-node verb's evidence
+/// for such a node, read where it selects, writes and deletes.
+pub(crate) fn v2_terminated_record(n: &str) -> String {
+    format!(
+        "({n}.drain_engine = 'v2'
+          AND {n}.drain_phase = 'terminating'
+          AND ({n}.drain_status->'terminate'->>'epoch')::BIGINT
+              = ({n}.drain_status->>'epoch')::BIGINT
+          AND ({n}.drain_status->'report'->>'sealed_epoch')::BIGINT
+              = ({n}.drain_status->>'epoch')::BIGINT
+          AND COALESCE(({n}.drain_status->'report'->>'done')::BOOLEAN, FALSE)
+          AND ({n}.drain_status->'terminated'->>'epoch')::BIGINT
+              = ({n}.drain_status->>'epoch')::BIGINT
+          AND ({n}.drain_status->'terminated'->>'k8s_node_uid')
+              IS NOT DISTINCT FROM (SELECT k8s_node_uid FROM node_k8s WHERE node_id = {n}.id)
+          AND ({n}.drain_status->'terminated'->>'instance_id')
+              IS NOT DISTINCT FROM (SELECT instance_id FROM node_k8s WHERE node_id = {n}.id))"
+    )
+}
+
+/// Record that the terminator acted on the v2 node under `epoch`, against the
+/// uid and instance the tick read. Only a terminating node of that epoch,
+/// let go by `:terminate` on a `done` report, whose `node_k8s` still holds
+/// that identity, and only once.
+pub(crate) async fn record_v2_terminated(
+    pool: &PgPool,
+    node_id: NodeId,
+    epoch: i64,
+    k8s_node_uid: Option<&str>,
+    instance_id: Option<&str>,
+) -> Result<bool, sqlx::Error> {
+    Ok(sqlx::query(sql!(
+        "UPDATE nodes n
+            SET drain_status = n.drain_status || jsonb_build_object(
+                    'terminated', jsonb_build_object(
+                        'epoch', $2::BIGINT,
+                        'k8s_node_uid', $3::TEXT,
+                        'instance_id', $4::TEXT,
+                        'at_ms', (EXTRACT(EPOCH FROM NOW()) * 1000)::BIGINT
+                    )
+                ),
+                drain_last_error = NULL
+          WHERE n.id = $1
+            AND n.drain_engine = 'v2'
+            AND n.drain_phase = 'terminating'
+            AND NOT (n.drain_status ? 'terminated')
+            AND (n.drain_status->>'epoch')::BIGINT = $2
+            AND (n.drain_status->'terminate'->>'epoch')::BIGINT = $2
+            AND (n.drain_status->'report'->>'sealed_epoch')::BIGINT = $2
+            AND COALESCE((n.drain_status->'report'->>'done')::BOOLEAN, FALSE)
+            AND $3::TEXT IS NOT DISTINCT FROM
+                (SELECT k8s_node_uid FROM node_k8s WHERE node_id = n.id)
+            AND $4::TEXT IS NOT DISTINCT FROM
+                (SELECT instance_id FROM node_k8s WHERE node_id = n.id)"
+    ))
+    .bind(node_id)
+    .bind(epoch)
+    .bind(k8s_node_uid)
+    .bind(instance_id)
+    .execute(pool)
+    .await?
+    .rows_affected()
+        == 1)
 }
 
 /// Store the node's report under `epoch`. Returns false when the row is no
@@ -320,10 +407,17 @@ impl DrainV2Sink for SubstrateSink {
         tracing::warn!(node_id = %node_id, error = message, "node_drain v2");
     }
 
-    async fn delete_terminated(&self, node_id: NodeId) -> Result<bool, String> {
-        delete_terminating_node_and_record_tombstone(&self.pool, node_id, NodeDrainEngine::V2)
-            .await
-            .map_err(|error| error.to_string())
+    async fn record_terminated(&self, node: &V2Node, epoch: u64) -> Result<bool, String> {
+        let epoch = i64::try_from(epoch).map_err(|error| error.to_string())?;
+        record_v2_terminated(
+            &self.pool,
+            node.id,
+            epoch,
+            node.k8s_node_uid.as_deref(),
+            node.instance_id.as_deref(),
+        )
+        .await
+        .map_err(|error| error.to_string())
     }
 }
 

@@ -157,22 +157,27 @@ async fn the_drained_terminators_orphan_delete_skips_a_v2_node() -> TestResult {
     Ok(())
 }
 
-/// Each engine's terminating delete takes only its own rows.
+/// The terminating delete, and the tombstone it records, take only a v1
+/// drain's node: a v2 node's row stays, with no tombstone, for the dead-node
+/// verb to delete.
 #[tokio::test(flavor = "current_thread")]
-async fn the_terminating_delete_takes_only_its_engines_node() -> TestResult {
+async fn the_terminating_delete_and_its_tombstone_skip_a_v2_node() -> TestResult {
     let Some(db) = try_pg_test_db().await? else {
         return Ok(());
     };
     let v1 = node(&db.pool, "terminating", NodeDrainEngine::V1).await?;
     let v2 = node(&db.pool, "terminating", NodeDrainEngine::V2).await?;
-    assert!(
-        !delete_terminating_node_and_record_tombstone(&db.pool, v2, NodeDrainEngine::V1).await?
-    );
-    assert!(
-        !delete_terminating_node_and_record_tombstone(&db.pool, v1, NodeDrainEngine::V2).await?
-    );
-    assert!(phase(&db.pool, v1).await?.is_some() && phase(&db.pool, v2).await?.is_some());
-    assert!(delete_terminating_node_and_record_tombstone(&db.pool, v1, NodeDrainEngine::V1).await?);
-    assert!(delete_terminating_node_and_record_tombstone(&db.pool, v2, NodeDrainEngine::V2).await?);
+    assert!(!delete_terminating_node_and_record_tombstone(&db.pool, v2).await?);
+    assert!(delete_terminating_node_and_record_tombstone(&db.pool, v1).await?);
+    assert!(phase(&db.pool, v1).await?.is_none());
+    assert_eq!(phase(&db.pool, v2).await?.as_deref(), Some("terminating"));
+    let tombstoned: Vec<NodeId> = sqlx::query_scalar(sql!(
+        "SELECT node_id FROM node_k8s_tombstones WHERE node_id IN ($1, $2)"
+    ))
+    .bind(v1)
+    .bind(v2)
+    .fetch_all(&db.pool)
+    .await?;
+    assert_eq!(tombstoned, [v1]);
     Ok(())
 }

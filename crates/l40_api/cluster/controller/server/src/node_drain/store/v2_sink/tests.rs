@@ -292,3 +292,131 @@ async fn the_cancel_clears_only_an_undrained_row_of_its_epoch() -> TestResult {
     );
     Ok(())
 }
+
+/// The termination is recorded once, against the identity the tick read, on
+/// a terminating node of the epoch whose `done` report `:terminate` let go;
+/// anything else about the row refuses it and leaves it as it was.
+#[tokio::test(flavor = "current_thread")]
+async fn the_termination_is_recorded_once_for_the_identity_and_epoch_it_let_go() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let pool = &db.pool;
+    let let_go = serde_json::json!({
+        "epoch": 7,
+        "report": {"sealed_epoch": 7, "done": true},
+        "terminate": {"epoch": 7},
+    });
+    let instance = "i-0123456789abcdef0";
+    let mut cases: Vec<(&str, Option<&str>, serde_json::Value, i64, &str, bool)> = vec![
+        (
+            "recorded",
+            Some("terminating"),
+            let_go.clone(),
+            7,
+            "uid-1",
+            true,
+        ),
+        (
+            "another epoch",
+            Some("terminating"),
+            let_go.clone(),
+            8,
+            "uid-1",
+            false,
+        ),
+        (
+            "another uid",
+            Some("terminating"),
+            let_go.clone(),
+            7,
+            "uid-2",
+            false,
+        ),
+        (
+            "still drained",
+            Some("drained"),
+            let_go.clone(),
+            7,
+            "uid-1",
+            false,
+        ),
+    ];
+    let mut without_terminate = let_go.clone();
+    without_terminate
+        .as_object_mut()
+        .unwrap()
+        .remove("terminate");
+    cases.push((
+        "not let go",
+        Some("terminating"),
+        without_terminate,
+        7,
+        "uid-1",
+        false,
+    ));
+    let mut not_done = let_go.clone();
+    not_done["report"]["done"] = serde_json::json!(false);
+    cases.push(("not done", Some("terminating"), not_done, 7, "uid-1", false));
+    for (case, phase, status, epoch, uid, recorded) in cases {
+        let node_id = v2_node(pool, phase, status.clone()).await?;
+        sqlx::query(sql!(
+            "INSERT INTO node_k8s (node_id, k8s_node_name, k8s_node_uid, instance_id)
+             VALUES ($1, $2, 'uid-1', $3)"
+        ))
+        .bind(node_id)
+        .bind(format!("node-{node_id}"))
+        .bind(instance)
+        .execute(pool)
+        .await?;
+        assert_eq!(
+            record_v2_terminated(pool, node_id, epoch, Some(uid), Some(instance)).await?,
+            recorded,
+            "{case}"
+        );
+        let stored: serde_json::Value =
+            sqlx::query_scalar(sql!("SELECT drain_status FROM nodes WHERE id = $1"))
+                .bind(node_id)
+                .fetch_one(pool)
+                .await?;
+        if recorded {
+            let terminated = &stored["terminated"];
+            assert_eq!(
+                (
+                    &terminated["epoch"],
+                    &terminated["k8s_node_uid"],
+                    &terminated["instance_id"]
+                ),
+                (
+                    &serde_json::json!(7),
+                    &serde_json::json!("uid-1"),
+                    &serde_json::json!(instance)
+                ),
+                "{case}"
+            );
+            assert!(terminated["at_ms"].is_i64(), "{case}");
+            // Once.
+            assert!(
+                !record_v2_terminated(pool, node_id, epoch, Some(uid), Some(instance)).await?,
+                "{case}: recorded twice"
+            );
+            let listed = list_v2_nodes(pool)
+                .await?
+                .into_iter()
+                .find(|node| node.id == node_id)
+                .expect("listed");
+            assert!(listed.terminated, "{case}");
+            assert_eq!(
+                (
+                    listed.k8s_node_uid.as_deref(),
+                    listed.instance_id.as_deref()
+                ),
+                (Some("uid-1"), Some(instance)),
+                "{case}"
+            );
+        } else {
+            assert_eq!(stored, status, "{case}: wrote");
+        }
+    }
+    Ok(())
+}

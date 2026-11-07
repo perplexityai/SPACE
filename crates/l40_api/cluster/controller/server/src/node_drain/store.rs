@@ -5004,12 +5004,7 @@ impl NodeDrainSink for SubstrateSink {
     }
 
     async fn delete_terminating_node(&self, node_id: NodeId) -> Result<bool, sqlx::Error> {
-        let deleted = delete_terminating_node_and_record_tombstone(
-            &self.pool,
-            node_id,
-            pplx_space_common_core::types::NodeDrainEngine::V1,
-        )
-        .await?;
+        let deleted = delete_terminating_node_and_record_tombstone(&self.pool, node_id).await?;
         if deleted {
             self.evict_promotion_node_api_client(node_id).await;
         }
@@ -5223,12 +5218,12 @@ async fn connect_restore_listener(
 /// fresh EC2 instance that joins under the same hostname before an operator
 /// clears the tombstone.
 ///
-/// `engine` is the drain engine whose terminating node this deletes: each
-/// engine's terminate path deletes only its own rows.
+/// A v1 writer: a v2 drain's node is never deleted here and gets no
+/// tombstone. The dead-node verb deletes it once the controller has
+/// terminated it (`node_drain::v2`).
 pub(crate) async fn delete_terminating_node_and_record_tombstone(
     pool: &PgPool,
     node_id: NodeId,
-    engine: pplx_space_common_core::types::NodeDrainEngine,
 ) -> Result<bool, sqlx::Error> {
     let mut tx = pool.begin().await?;
     let snapshot: Option<(String, Option<String>)> = sqlx::query_as(sql!(
@@ -5238,11 +5233,10 @@ pub(crate) async fn delete_terminating_node_and_record_tombstone(
          WHERE n.id = $1
            AND n.drain_phase = 'terminating'
            AND n.managed_by = $2
-           AND n.drain_engine IS NOT DISTINCT FROM $3"
+           AND n.drain_engine IS NULL"
     ))
     .bind(node_id)
     .bind(SubstrateKind::Kubernetes)
-    .bind(engine.column())
     .fetch_optional(&mut *tx)
     .await?;
     let Some((role, k8s_node_name)) = snapshot else {
@@ -5253,11 +5247,10 @@ pub(crate) async fn delete_terminating_node_and_record_tombstone(
          WHERE id = $1
            AND drain_phase = 'terminating'
            AND managed_by = $2
-           AND drain_engine IS NOT DISTINCT FROM $3"
+           AND drain_engine IS NULL"
     ))
     .bind(node_id)
     .bind(SubstrateKind::Kubernetes)
-    .bind(engine.column())
     .execute(&mut *tx)
     .await?;
     if result.rows_affected() == 0 {
@@ -5301,7 +5294,7 @@ mod tombstone_tests;
 #[cfg(test)]
 mod v2_skip_tests;
 
-mod v2_sink;
+pub(crate) mod v2_sink;
 
 /// Postgres-backed regression tests for the durable-upload drain gate: a node
 /// must not be reclaimed (nor its sandbox marked `failed`) while a

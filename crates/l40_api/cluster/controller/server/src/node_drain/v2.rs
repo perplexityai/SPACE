@@ -14,9 +14,13 @@
 //!   transaction and at most once per snapshot. The report is stored in
 //!   `drain_status`. A `draining` node moves to `drained` once the report is
 //!   `done` under the row's own epoch and every evacuation is recorded.
-//! - **`terminating`**: `:terminate` moved it here, gated on that report.
-//!   Terminate it through the cluster's terminator and delete its row with a
-//!   tombstone.
+//! - **`terminating`**: `:terminate` moved it here, gated on that report, and
+//!   recorded the epoch it let go (`drain_status.terminate`). Terminate it
+//!   through the cluster's terminator, then record that it did, with the
+//!   Kubernetes uid and instance it acted on (`drain_status.terminated`). The
+//!   row stays, with no tombstone: the dead-node verb takes the node as dead
+//!   by that record, reconciles what is left on it and deletes the row
+//!   (`dead_node`). A node with the record is not terminated again.
 //! - **undrained** (no phase, `drain_status.cancel`): cancel the epoch on the
 //!   node until it is unsealed, then clear the v2 columns.
 //!
@@ -40,6 +44,12 @@ pub struct V2Node {
     pub epoch: Option<u64>,
     /// `drain_status.cancel`: the drain was undrained.
     pub cancel: bool,
+    /// `drain_status.terminated`: the terminator acted on the node.
+    pub terminated: bool,
+    /// `node_k8s.k8s_node_uid` and `node_k8s.instance_id` as the tick read
+    /// them: the identity a termination is recorded against.
+    pub k8s_node_uid: Option<String>,
+    pub instance_id: Option<String>,
 }
 
 /// What recording one reported evacuation found.
@@ -107,10 +117,13 @@ pub trait DrainV2Sink: Send + Sync + 'static {
         node_id: NodeId,
         message: &str,
     ) -> impl std::future::Future<Output = ()> + Send;
-    /// Delete a terminated v2 node's row, with its tombstone.
-    fn delete_terminated(
+    /// Record that the terminator acted on `node` under `epoch`, against the
+    /// uid and instance the tick read; false when the row is no longer that
+    /// epoch's terminating v2 node with that identity, or already records it.
+    fn record_terminated(
         &self,
-        node_id: NodeId,
+        node: &V2Node,
+        epoch: u64,
     ) -> impl std::future::Future<Output = Result<bool, String>> + Send;
 }
 
@@ -191,8 +204,10 @@ pub async fn tick<S: DrainV2Sink, T: InstanceTerminator>(sink: &S, terminator: &
                     report.drained.push(node.id);
                 }
             }
+            // Terminated already: the dead-node verb owns it now.
+            Some("terminating") if node.terminated => {}
             Some("terminating") => {
-                if terminate(sink, terminator, node.id).await {
+                if terminate(sink, terminator, &node, epoch).await {
                     report.terminated.push(node.id);
                 }
             }
@@ -283,18 +298,23 @@ async fn cancel<S: DrainV2Sink>(sink: &S, node_id: NodeId, epoch: u64) -> bool {
     }
 }
 
-/// Terminate a v2 node and delete its row. Returns whether the row went.
+/// Terminate a v2 node and record it. Returns whether the record was written.
 async fn terminate<S: DrainV2Sink, T: InstanceTerminator>(
     sink: &S,
     terminator: &T,
-    node_id: NodeId,
+    node: &V2Node,
+    epoch: u64,
 ) -> bool {
+    let node_id = node.id;
     match terminator.terminate(node_id).await {
-        Ok(()) => match sink.delete_terminated(node_id).await {
-            Ok(deleted) => deleted,
+        Ok(()) => match sink.record_terminated(node, epoch).await {
+            Ok(recorded) => recorded,
             Err(error) => {
-                sink.record_error(node_id, &format!("deleting the node row failed: {error}"))
-                    .await;
+                sink.record_error(
+                    node_id,
+                    &format!("recording the termination failed: {error}"),
+                )
+                .await;
                 false
             }
         },

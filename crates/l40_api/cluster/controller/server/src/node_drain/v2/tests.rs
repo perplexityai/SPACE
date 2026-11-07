@@ -85,8 +85,11 @@ impl DrainV2Sink for FakeSink {
         self.log(format!("error {node_id} {message}"));
     }
 
-    async fn delete_terminated(&self, node_id: NodeId) -> Result<bool, String> {
-        self.log(format!("delete {node_id}"));
+    async fn record_terminated(&self, node: &V2Node, epoch: u64) -> Result<bool, String> {
+        self.log(format!(
+            "terminated {} {epoch} {:?} {:?}",
+            node.id, node.k8s_node_uid, node.instance_id
+        ));
         Ok(true)
     }
 }
@@ -118,6 +121,9 @@ fn node(phase: Option<&str>, epoch: Option<u64>, cancel: bool) -> V2Node {
         phase: phase.map(str::to_owned),
         epoch,
         cancel,
+        terminated: false,
+        k8s_node_uid: Some("uid-1".into()),
+        instance_id: Some("i-0123456789abcdef0".into()),
     }
 }
 
@@ -297,11 +303,12 @@ async fn an_undrained_node_is_cancelled_until_unsealed() {
     assert!(sink.calls().is_empty());
 }
 
-/// A terminating node is terminated, then its row deleted; a failed
-/// terminate deletes nothing.
+/// A terminating node is terminated, then the termination recorded against
+/// the identity the tick read; a failed terminate records nothing, and a node
+/// already recorded is neither terminated nor recorded again.
 #[tokio::test]
-async fn a_terminating_node_is_terminated_then_deleted() {
-    for (case, terminator, deleted) in [
+async fn a_terminating_node_is_terminated_then_recorded_once() {
+    for (case, terminator, recorded) in [
         ("terminated", FakeTerminator::ok(), true),
         (
             "failed",
@@ -323,11 +330,29 @@ async fn a_terminating_node_is_terminated_then_deleted() {
             [terminating.id],
             "{case}"
         );
-        assert_eq!(report.terminated == [terminating.id], deleted, "{case}");
+        assert_eq!(report.terminated == [terminating.id], recorded, "{case}");
+        let expected = format!(
+            "terminated {} 5 Some(\"uid-1\") Some(\"i-0123456789abcdef0\")",
+            terminating.id
+        );
         assert_eq!(
-            sink.calls().iter().any(|call| call.starts_with("delete")),
-            deleted,
-            "{case}"
+            sink.calls().contains(&expected),
+            recorded,
+            "{case}: {:?}",
+            sink.calls()
         );
     }
+
+    let already = V2Node {
+        terminated: true,
+        ..node(Some("terminating"), Some(5), false)
+    };
+    let sink = FakeSink {
+        nodes: vec![already],
+        ..FakeSink::default()
+    };
+    let terminator = FakeTerminator::ok();
+    let report = tick(&sink, &terminator).await;
+    assert!(terminator.calls.lock().unwrap().is_empty());
+    assert!(report.terminated.is_empty() && sink.calls().is_empty());
 }
