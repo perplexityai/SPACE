@@ -33,7 +33,9 @@ reviews:
   profile: chill
 
   auto_approvals:
-    enabled: true
+    # Temporarily disable all approvals until contributor eligibility is enforced.
+    # Keep the risk policy below for when approvals are re-enabled.
+    enabled: false
     # Authors cannot run `@coderabbitai approve` or `@coderabbitai resolve` on
     # their own pull requests. Any other organization member can, and those
     # commands approve without passing pre-merge checks. Risk limits and the
