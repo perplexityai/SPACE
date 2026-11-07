@@ -97,10 +97,31 @@ impl K8sStore {
     /// under the same name, so the stop boundary still reads it as pre-stop
     /// and the row stays `stopped` with its marker until the start succeeds.
     /// What such a start does hold, from its claim until it finishes, is an
-    /// activation attempt (`ensure_active_execution_claim_in`) whose lease
-    /// outlives any node operation. An attempt with no expiry refuses as well,
+    /// activation attempt (`ensure_active_execution_claim_in`), and a live
+    /// one refuses. Its 300 s lease bounds how long a crashed owner holds the
+    /// execution, not every node call a start makes. An attempt with no
+    /// expiry refuses as well,
     /// so a row this can't read is left alone; an expired one, left by a
     /// crashed owner, doesn't.
+    ///
+    /// One execution newer than the stop is retired all the same: the one a
+    /// stay-stopped runtime upgrade claimed and recorded and didn't finish
+    /// (its upgrade recorded, its claim targeting `stopped`), once its lease
+    /// has ended (a live one refuses, below). The row stays `stopped`
+    /// throughout such an upgrade, so its execution postdates the stop, and
+    /// refusing it would hold the evacuation, and the drain, forever. The
+    /// evacuation took it over when it opened (`open_stopped_evacuation`):
+    /// nothing claims or takes over the upgrade while the marker is set, and
+    /// the evacuation deleted the upgrade's pod, and saw it gone, before it
+    /// minted the backup this teardown requires durable, and checks again
+    /// before it calls this teardown. That backup is of
+    /// the disk as the upgrade left it, so it stands in for the one the
+    /// upgrade may still owe, and it's confirmed before the record, retired
+    /// with the execution, is gone. An upgrade attempt still running once
+    /// its lease has ended places no boot, only retires its own execution
+    /// (`open_stopped_evacuation`). The node's own answer guards the rest:
+    /// the teardown releases nothing unless the node still pins the artifact
+    /// the evacuation minted, which any later boot would have dropped.
     ///
     /// The check and the retirement share one transaction under the
     /// execution-mutation lock execution creation also takes, so a start can't
@@ -271,6 +292,43 @@ impl K8sStore {
                 StartedSuspendRecoveryOperation::PodTrackingCleanup,
             );
         }
+        Ok(true)
+    }
+
+    /// Retire a stopped sandbox's runtime-upgrade execution, fenced like
+    /// [`Self::forget_fenced_pod_tracking`], and leave the row's placement
+    /// alone: `active_node_id` still names the node holding the disk.
+    ///
+    /// Clearing it, as a teardown does, would leave a `stopped` row no node
+    /// is recorded as holding. The drain finds a node's stopped sandboxes
+    /// only through `active_node_id`, so it would neither evacuate the disk
+    /// nor wait for it before terminating the node. The upgrade boots the
+    /// disk where it already lies and stops it again, so the placement is
+    /// as true afterwards as before, on every outcome. This is the shape
+    /// [`Self::retire_executions_predating_current_stop`] gives an ordinary
+    /// stop's execution.
+    pub(in crate::controllers::substrate::kubernetes) async fn retire_stopped_upgrade_execution(
+        &self,
+        sandbox_id: SandboxId,
+        identity: &ExecutionIdentity,
+    ) -> Result<bool, SubstrateError> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .db_context("failed to start stopped upgrade retirement transaction")?;
+        if !Self::lock_sandbox_for_execution_mutation_in(&mut tx, sandbox_id).await? {
+            return Ok(false);
+        }
+        if !self
+            .finish_fenced_execution_in(&mut tx, sandbox_id, identity, "forgotten")
+            .await?
+        {
+            return Ok(false);
+        }
+        tx.commit()
+            .await
+            .db_context("failed to commit stopped upgrade retirement")?;
         Ok(true)
     }
 

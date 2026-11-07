@@ -95,9 +95,13 @@ fn node_network_slot_capacity(node: &Node) -> Option<u64> {
         .or(Some(advertised))
 }
 
+/// Whether `node` has a network slot free for one more sandbox pod. `held`
+/// is what a pod the caller will reuse instead of creating already holds
+/// there: it's counted in the node's requests but takes no new slot.
 pub(in crate::controllers::substrate::kubernetes) fn node_network_slot_available(
     node: &Node,
     network_slots: &NodeNetworkSlots,
+    held: u64,
 ) -> bool {
     let Some(node_name) = node.metadata.name.as_deref() else {
         return false;
@@ -105,7 +109,7 @@ pub(in crate::controllers::substrate::kubernetes) fn node_network_slot_available
     let Some(capacity) = node_network_slot_capacity(node) else {
         return false;
     };
-    network_slots.requested_on(node_name) < capacity
+    network_slots.requested_on(node_name).saturating_sub(held) < capacity
 }
 
 pub(in crate::controllers::substrate::kubernetes) fn network_slot_capacity_preflight(

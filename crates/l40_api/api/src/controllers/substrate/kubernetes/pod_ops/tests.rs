@@ -31,17 +31,29 @@ fn activation_assignment_retains_the_database_canonical_id_across_clones() {
     let assignment =
         ActivationAttemptAssignment::new(requested_id, SandboxTransitionTargetState::Started);
 
-    assignment.clone().record_assigned(assigned_id, 1);
+    assignment
+        .clone()
+        .record_assigned(assigned_id, 1, "space-sbx-a-g1");
 
     assert_eq!(assignment.assigned_id(), Some(assigned_id));
     assert_eq!(assignment.assigned(), Some((assigned_id, 1)));
+    assert_eq!(
+        assignment.assigned_pod_name().as_deref(),
+        Some("space-sbx-a-g1")
+    );
     assert_eq!(assignment.assigned_or_requested(), assigned_id);
 
     let replacement_id = SandboxActivationAttemptId::new_after(assigned_id)
         .expect("test activation identity has a successor");
-    assignment.clone().record_assigned(replacement_id, 2);
+    assignment
+        .clone()
+        .record_assigned(replacement_id, 2, "space-sbx-a-g2");
     assert_eq!(assignment.assigned_id(), Some(replacement_id));
     assert_eq!(assignment.assigned(), Some((replacement_id, 2)));
+    assert_eq!(
+        assignment.assigned_pod_name().as_deref(),
+        Some("space-sbx-a-g2")
+    );
     assert_eq!(assignment.assigned_or_requested(), replacement_id);
 }
 
@@ -251,6 +263,7 @@ fn restore_placement_sample_reflects_pin_shape() {
         suspend_restore_source_node: Some("source-node"),
         direct_node_name: None,
         preferred_node_name: Some("source-node"),
+        runtime_upgrade: None,
     });
     let required = restore_placement_sample(&portable, true).unwrap();
     assert_eq!(required.placement, RestorePlacement::SameNode);
@@ -268,6 +281,7 @@ fn restore_placement_sample_reflects_pin_shape() {
         suspend_restore_source_node: Some("source-node"),
         direct_node_name: Some("source-node"),
         preferred_node_name: None,
+        runtime_upgrade: None,
     });
     let local_sample = restore_placement_sample(&local, true).unwrap();
     assert_eq!(local_sample.pin, SourcePin::NodeName);
@@ -279,6 +293,7 @@ fn restore_placement_sample_reflects_pin_shape() {
         suspend_restore_source_node: None,
         direct_node_name: None,
         preferred_node_name: None,
+        runtime_upgrade: None,
     });
     let cross = restore_placement_sample(&storage_only, true).unwrap();
     assert_eq!(cross.placement, RestorePlacement::CrossNode);
@@ -464,6 +479,7 @@ fn pre_bound_node_and_metric_path_are_reported_per_context() {
         suspend_restore_source_node: Some("source-node"),
         direct_node_name: Some("source-node"),
         preferred_node_name: None,
+        runtime_upgrade: None,
     });
     assert_eq!(local_restore.direct_node_name(), Some("source-node"));
     assert_eq!(
@@ -478,6 +494,7 @@ fn pre_bound_node_and_metric_path_are_reported_per_context() {
         suspend_restore_source_node: Some("source-node"),
         direct_node_name: None,
         preferred_node_name: Some("source-node"),
+        runtime_upgrade: None,
     });
     assert_eq!(portable_restore.direct_node_name(), None);
     // Both restore shapes book the same path: the pre-flight is what differs

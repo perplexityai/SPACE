@@ -313,7 +313,9 @@ pub fn v1_router(state: AppState) -> Router<AppState> {
             "/sandboxes/{spec}/snapshots",
             get(sandboxes::list_snapshots),
         )
-        .merge(debug::admin_v1_debug_router())
+        .merge(debug::admin_v1_debug_router(
+            state.runtime_upgrade_test_hook,
+        ))
         .layer(middleware::from_fn_with_state(state, require_admin_auth))
 }
 

@@ -54,6 +54,18 @@ fn begin(
     target: EnvironmentReference,
     memory_loss: bool,
 ) -> BeginRuntimeUpgrade {
+    begin_for_pod(conn, operation_id, sandbox_id, target, memory_loss, None)
+}
+
+/// [`begin`] for a request whose start names the pod `pod_uid`.
+fn begin_for_pod(
+    conn: &Connection,
+    operation_id: RuntimeUpgradeOperationId,
+    sandbox_id: &str,
+    target: EnvironmentReference,
+    memory_loss: bool,
+    pod_uid: Option<&str>,
+) -> BeginRuntimeUpgrade {
     let row = get_sandbox(conn, sandbox_id).unwrap();
     let observed = row.as_ref().map_or(
         ObservedSandbox {
@@ -78,6 +90,7 @@ fn begin(
                 .as_ref()
                 .and_then(|row| row.execution_metadata.as_ref())
                 .unwrap_or(&environments().source),
+            pod_uid,
         },
     )
     .unwrap()
@@ -155,6 +168,40 @@ fn begin_fences_a_stopped_sandbox_without_memory_loss_consent() {
 
     assert_eq!(record.source_state, SandboxState::Stopped);
     assert_eq!(record.checkpoint_artifact_id, None);
+}
+
+/// A stay-stopped upgrade still owing its retirement is found even while an
+/// older upgrade of the sandbox to another target state is unretired too:
+/// the target state is chosen before the oldest row is taken.
+#[test]
+fn an_unretired_stay_stopped_upgrade_is_found_behind_an_older_one() {
+    let conn = test_conn();
+    let envs = environments();
+    let id = sandbox(&conn, SandboxState::Stopped, &envs.source);
+    let stay_stopped = fenced(begin(&conn, operation(), &id, envs.target_reference, false));
+    // Created at the same instant, so the operation id breaks the tie and
+    // the smallest one is the oldest.
+    let older = RuntimeUpgradeOperationId::from_uuid(uuid::Uuid::from_u128(1));
+    conn.execute_batch(&format!(
+        "CREATE TEMP TABLE older_upgrade AS
+             SELECT * FROM sandbox_runtime_upgrades WHERE operation_id = '{stopped}';
+         UPDATE older_upgrade
+            SET operation_id = '{older}', target_state = 'started', phase = 'verified';
+         INSERT INTO sandbox_runtime_upgrades SELECT * FROM older_upgrade;
+         DROP TABLE older_upgrade;",
+        stopped = stay_stopped.operation_id,
+    ))
+    .unwrap();
+
+    assert_eq!(
+        crate::db::read::unretired_runtime_upgrade(&conn, &id).unwrap(),
+        Some(older),
+        "the older upgrade is the sandbox's oldest unretired one"
+    );
+    assert_eq!(
+        crate::db::read::unretired_stay_stopped_runtime_upgrade(&conn, &id).unwrap(),
+        Some(stay_stopped.operation_id)
+    );
 }
 
 #[test]
@@ -683,6 +730,7 @@ fn begin_refuses_a_sandbox_that_changed_since_it_was_inspected() {
                 authorization: &authorization(true),
                 checkpoint_dir_identity: None,
                 previous_execution: &envs.source,
+                pod_uid: None,
             },
         )
         .unwrap();
@@ -901,15 +949,17 @@ fn an_upgrade_that_found_its_target_reports_it_for_its_own_sandbox_only() {
     let operation_id = operation();
 
     assert!(
-        record_runtime_upgrade_already_on_target(&conn, &on_target(operation_id, &id)).unwrap()
+        record_runtime_upgrade_already_on_target(&conn, &on_target(operation_id, &id), None)
+            .unwrap()
     );
     assert!(
-        record_runtime_upgrade_already_on_target(&conn, &on_target(operation_id, &id)).unwrap()
+        record_runtime_upgrade_already_on_target(&conn, &on_target(operation_id, &id), None)
+            .unwrap()
     );
     // The same operation asking for another lifecycle records nothing.
     let mut started = on_target(operation_id, &id);
     started.target_state = RuntimeUpgradeTargetState::Started;
-    assert!(!record_runtime_upgrade_already_on_target(&conn, &started).unwrap());
+    assert!(!record_runtime_upgrade_already_on_target(&conn, &started, None).unwrap());
     let found = crate::db::read::runtime_upgrade_report(&conn, operation_id)
         .unwrap()
         .unwrap();
@@ -926,7 +976,8 @@ fn an_upgrade_that_found_its_target_reports_it_for_its_own_sandbox_only() {
     assert!(roll_back_runtime_upgrade(&conn, rolled_back, "boot failed").unwrap());
     assert!(finish_runtime_upgrade_rollback(&conn, rolled_back).unwrap());
     assert!(
-        !record_runtime_upgrade_already_on_target(&conn, &on_target(rolled_back, &other)).unwrap()
+        !record_runtime_upgrade_already_on_target(&conn, &on_target(rolled_back, &other), None)
+            .unwrap()
     );
     let kept = crate::db::read::runtime_upgrade_report(&conn, rolled_back)
         .unwrap()
@@ -940,6 +991,178 @@ fn an_upgrade_that_found_its_target_reports_it_for_its_own_sandbox_only() {
     );
 }
 
+fn report_with_pod(
+    conn: &Connection,
+    operation_id: RuntimeUpgradeOperationId,
+) -> Option<(RuntimeUpgradeStatus, Option<String>)> {
+    crate::db::read::runtime_upgrade_report(conn, operation_id)
+        .unwrap()
+        .map(|report| (report.status, report.pod_uid))
+}
+
+/// The pod an upgrade ran for is reported with its live row and kept with
+/// its rollback; a refusal is recorded for the pod it refused, replacing an
+/// earlier pod's rollback or refusal but never an already-on-target outcome,
+/// a live row, or another request's outcome, and only while the sandbox is
+/// on the node.
+#[test]
+fn the_report_names_the_pod_each_outcome_was_recorded_for() {
+    let conn = test_conn();
+    let envs = environments();
+    let id = sandbox(&conn, SandboxState::Stopped, &envs.source);
+    let operation_id = operation();
+    let identity = RuntimeUpgradeRequestIdentity {
+        target_environment: envs.target_reference,
+        ..on_target(operation_id, &id)
+    };
+
+    fenced(begin_for_pod(
+        &conn,
+        operation_id,
+        &id,
+        envs.target_reference,
+        false,
+        Some("pod-a"),
+    ));
+    assert_eq!(
+        report_with_pod(&conn, operation_id),
+        Some((
+            RuntimeUpgradeStatus::InProgress(RuntimeUpgradePhase::Fenced),
+            Some("pod-a".to_string())
+        ))
+    );
+    // No refusal while the live row stands.
+    assert!(!record_runtime_upgrade_refusal(&conn, &identity, "pod-b", "busy").unwrap());
+    assert!(roll_back_runtime_upgrade(&conn, operation_id, "boot failed").unwrap());
+    assert!(finish_runtime_upgrade_rollback(&conn, operation_id).unwrap());
+    assert_eq!(
+        report_with_pod(&conn, operation_id),
+        Some((
+            RuntimeUpgradeStatus::RolledBack {
+                failure: Some("boot failed".to_string())
+            },
+            Some("pod-a".to_string())
+        ))
+    );
+
+    // A later pod's refusal replaces the earlier pod's rollback.
+    assert!(record_runtime_upgrade_refusal(&conn, &identity, "pod-b", "cleanup owns it").unwrap());
+    let refused_for = |pod: &str, failure: &str| {
+        Some((
+            RuntimeUpgradeStatus::Refused {
+                failure: Some(failure.to_string()),
+            },
+            Some(pod.to_string()),
+        ))
+    };
+    assert_eq!(
+        report_with_pod(&conn, operation_id),
+        refused_for("pod-b", "cleanup owns it")
+    );
+    // Another request under the operation records nothing.
+    let mut started = identity.clone();
+    started.target_state = RuntimeUpgradeTargetState::Started;
+    assert!(!record_runtime_upgrade_refusal(&conn, &started, "pod-c", "other").unwrap());
+    assert_eq!(
+        report_with_pod(&conn, operation_id),
+        refused_for("pod-b", "cleanup owns it")
+    );
+
+    // A refusal never replaces an already-on-target outcome.
+    let found = operation();
+    let found_identity = RuntimeUpgradeRequestIdentity {
+        operation_id: found,
+        ..identity.clone()
+    };
+    assert!(
+        record_runtime_upgrade_already_on_target(&conn, &found_identity, Some("pod-a")).unwrap()
+    );
+    assert!(!record_runtime_upgrade_refusal(&conn, &found_identity, "pod-b", "busy").unwrap());
+    assert_eq!(
+        report_with_pod(&conn, found),
+        Some((
+            RuntimeUpgradeStatus::AlreadyOnTarget { activation: None },
+            Some("pod-a".to_string())
+        ))
+    );
+
+    // Nor is one recorded for a sandbox that isn't on the node.
+    let gone = RuntimeUpgradeRequestIdentity {
+        operation_id: operation(),
+        sandbox_id: SandboxId::new().to_string(),
+        ..identity
+    };
+    assert!(!record_runtime_upgrade_refusal(&conn, &gone, "pod-a", "missing").unwrap());
+    assert_eq!(report_with_pod(&conn, gone.operation_id), None);
+}
+
+/// The operation's report keeps only its latest outcome, but each pod keeps
+/// its own: a later pod's rollback or refusal never erases an earlier pod's,
+/// and a pod's first final outcome stays. A request that named no pod adds
+/// nothing, and deleting the sandbox deletes the history.
+#[test]
+fn each_pods_rollback_or_refusal_is_kept_for_that_pod() {
+    let conn = test_conn();
+    let envs = environments();
+    let id = sandbox(&conn, SandboxState::Stopped, &envs.source);
+    let operation_id = operation();
+    let identity = RuntimeUpgradeRequestIdentity {
+        target_environment: envs.target_reference,
+        ..on_target(operation_id, &id)
+    };
+    let pod_outcome =
+        |pod: &str| crate::db::read::runtime_upgrade_pod_outcome(&conn, operation_id, pod).unwrap();
+    let roll_back_for = |pod: Option<&str>, failure: &str| {
+        fenced(begin_for_pod(
+            &conn,
+            operation_id,
+            &id,
+            envs.target_reference,
+            false,
+            pod,
+        ));
+        assert!(roll_back_runtime_upgrade(&conn, operation_id, failure).unwrap());
+        assert!(finish_runtime_upgrade_rollback(&conn, operation_id).unwrap());
+    };
+
+    roll_back_for(Some("pod-a"), "a's boot failed");
+    roll_back_for(Some("pod-b"), "b's boot failed");
+    roll_back_for(None, "anonymous boot failed");
+    assert!(record_runtime_upgrade_refusal(&conn, &identity, "pod-c", "c refused").unwrap());
+    // A pod's first final outcome stays.
+    assert!(record_runtime_upgrade_refusal(&conn, &identity, "pod-a", "a refused").unwrap());
+
+    let rolled_back = |failure: &str| {
+        Some(RuntimeUpgradePodOutcome {
+            outcome: RecordedRuntimeUpgradeOutcome::RolledBack,
+            failure: Some(failure.to_string()),
+        })
+    };
+    assert_eq!(pod_outcome("pod-a"), rolled_back("a's boot failed"));
+    assert_eq!(pod_outcome("pod-b"), rolled_back("b's boot failed"));
+    assert_eq!(
+        pod_outcome("pod-c"),
+        Some(RuntimeUpgradePodOutcome {
+            outcome: RecordedRuntimeUpgradeOutcome::Refused,
+            failure: Some("c refused".to_string()),
+        })
+    );
+    assert_eq!(pod_outcome("pod-d"), None);
+    // The report is still the operation's latest outcome.
+    assert_eq!(
+        report_with_pod(&conn, operation_id),
+        Some((
+            RuntimeUpgradeStatus::Refused {
+                failure: Some("a refused".to_string())
+            },
+            Some("pod-a".to_string())
+        ))
+    );
+
+    delete_sandbox(&conn, &id).unwrap();
+    assert_eq!(pod_outcome("pod-b"), None);
+}
+
 #[test]
 fn deleting_the_sandbox_deletes_its_recorded_outcomes() {
     let conn = test_conn();
@@ -947,7 +1170,8 @@ fn deleting_the_sandbox_deletes_its_recorded_outcomes() {
     let id = sandbox(&conn, SandboxState::Stopped, &envs.source);
     let operation_id = operation();
     assert!(
-        record_runtime_upgrade_already_on_target(&conn, &on_target(operation_id, &id)).unwrap()
+        record_runtime_upgrade_already_on_target(&conn, &on_target(operation_id, &id), None)
+            .unwrap()
     );
 
     delete_sandbox(&conn, &id).unwrap();
@@ -965,7 +1189,8 @@ fn an_activation_is_claimed_once_on_its_already_on_target_outcome() {
     // Nothing to mark before the outcome exists, or for another sandbox.
     assert!(!claim_runtime_upgrade_activation(&conn, operation_id, &id, started()).unwrap());
     assert!(
-        record_runtime_upgrade_already_on_target(&conn, &on_target(operation_id, &id)).unwrap()
+        record_runtime_upgrade_already_on_target(&conn, &on_target(operation_id, &id), None)
+            .unwrap()
     );
     assert!(!claim_runtime_upgrade_activation(&conn, operation_id, &other, started()).unwrap());
 
@@ -974,7 +1199,8 @@ fn an_activation_is_claimed_once_on_its_already_on_target_outcome() {
     assert!(!claim_runtime_upgrade_activation(&conn, operation_id, &id, started()).unwrap());
     // A replay records the outcome again and keeps the activation.
     assert!(
-        record_runtime_upgrade_already_on_target(&conn, &on_target(operation_id, &id)).unwrap()
+        record_runtime_upgrade_already_on_target(&conn, &on_target(operation_id, &id), None)
+            .unwrap()
     );
     assert_eq!(
         report(&conn, operation_id),
@@ -998,7 +1224,8 @@ fn an_answer_with_a_running_execution_is_recorded_as_the_operations_activation()
     let id = sandbox(&conn, SandboxState::Started, &envs.source);
     let operation_id = operation();
     assert!(
-        record_runtime_upgrade_already_on_target(&conn, &on_target(operation_id, &id)).unwrap()
+        record_runtime_upgrade_already_on_target(&conn, &on_target(operation_id, &id), None)
+            .unwrap()
     );
 
     assert!(
@@ -1045,7 +1272,7 @@ fn a_recorded_outcome_keeps_what_its_operation_asked_for() {
         recorded_runtime_upgrade_request(&conn, found).unwrap(),
         None
     );
-    assert!(record_runtime_upgrade_already_on_target(&conn, &on_target(found, &id)).unwrap());
+    assert!(record_runtime_upgrade_already_on_target(&conn, &on_target(found, &id), None).unwrap());
     assert_eq!(
         recorded_runtime_upgrade_request(&conn, found).unwrap(),
         Some(on_target(found, &id))
@@ -1071,7 +1298,7 @@ fn an_operation_id_names_one_sandbox_across_both_tables() {
 
     // Recorded as an outcome for one sandbox, it can't fence another.
     let found = operation();
-    assert!(record_runtime_upgrade_already_on_target(&conn, &on_target(found, &id)).unwrap());
+    assert!(record_runtime_upgrade_already_on_target(&conn, &on_target(found, &id), None).unwrap());
     assert_eq!(
         begin(&conn, found, &other, envs.target_reference, false),
         BeginRuntimeUpgrade::OperationNamesAnother
@@ -1080,7 +1307,10 @@ fn an_operation_id_names_one_sandbox_across_both_tables() {
     // Fencing one sandbox, it can't be recorded for another.
     let fencing = operation();
     fenced(begin(&conn, fencing, &id, envs.target_reference, false));
-    assert!(!record_runtime_upgrade_already_on_target(&conn, &on_target(fencing, &other)).unwrap());
+    assert!(
+        !record_runtime_upgrade_already_on_target(&conn, &on_target(fencing, &other), None)
+            .unwrap()
+    );
     assert_eq!(
         recorded_runtime_upgrade_request(&conn, fencing).unwrap(),
         None
@@ -1129,5 +1359,110 @@ fn an_activation_decided_on_an_execution_refuses_a_sandbox_moved_off_it() {
     assert_eq!(
         get_sandbox(&conn, &id).unwrap().unwrap().state,
         SandboxState::Starting
+    );
+}
+
+/// A pod's refused create is recorded only for an operation that reached its
+/// target for that sandbox: retired, or already on target with no live row.
+/// One still in progress, rolled back or refused, another sandbox's, or one
+/// the node never saw records nothing, since the operation's own report
+/// already says what happened to the pod. The report names the latest pod
+/// refused, and deleting the sandbox deletes the record.
+#[test]
+fn a_refused_pod_is_recorded_only_for_an_operation_that_reached_its_target() {
+    let conn = test_conn();
+    let envs = environments();
+    let id = sandbox(&conn, SandboxState::Stopped, &envs.source);
+    let other = sandbox(&conn, SandboxState::Stopped, &envs.source);
+    let refuse = |operation_id, sandbox_id: &str, pod_uid: &str| {
+        record_runtime_upgrade_refused_pod(&conn, operation_id, sandbox_id, pod_uid, "refused")
+            .unwrap()
+    };
+    let refused_pod = |operation_id| {
+        crate::db::read::runtime_upgrade_report(&conn, operation_id)
+            .unwrap()
+            .and_then(|report| report.refused_pod)
+            .map(|refused| refused.pod_uid)
+    };
+
+    // Never seen, in progress, rolled back and refused: nothing recorded.
+    let unseen = operation();
+    assert!(!refuse(unseen, &id, "pod-a"));
+    let upgrading = operation();
+    fenced(begin(&conn, upgrading, &id, envs.target_reference, false));
+    assert!(
+        advance_runtime_upgrade(
+            &conn,
+            upgrading,
+            RuntimeUpgradePhase::Fenced,
+            RuntimeUpgradePhase::Preserved
+        )
+        .unwrap()
+    );
+    assert!(bind_runtime_upgrade_consumer(&conn, upgrading, &envs.target).unwrap());
+    assert!(
+        advance_runtime_upgrade(
+            &conn,
+            upgrading,
+            RuntimeUpgradePhase::Booting,
+            RuntimeUpgradePhase::Verified
+        )
+        .unwrap()
+    );
+    assert!(!refuse(upgrading, &id, "pod-a"), "verified isn't retired");
+    let refused = operation();
+    let rolled_back = operation();
+    fenced(begin(
+        &conn,
+        rolled_back,
+        &other,
+        envs.target_reference,
+        false,
+    ));
+    assert!(roll_back_runtime_upgrade(&conn, rolled_back, "boot failed").unwrap());
+    assert!(finish_runtime_upgrade_rollback(&conn, rolled_back).unwrap());
+    assert!(!refuse(rolled_back, &other, "pod-a"));
+    let refused_early = on_target(refused, &other);
+    assert!(record_runtime_upgrade_refusal(&conn, &refused_early, "pod-a", "busy").unwrap());
+    assert!(!refuse(refused, &other, "pod-a"));
+
+    // Retired: recorded, and only for its own sandbox.
+    assert!(
+        advance_runtime_upgrade(
+            &conn,
+            upgrading,
+            RuntimeUpgradePhase::Verified,
+            RuntimeUpgradePhase::Retired
+        )
+        .unwrap()
+    );
+    assert!(!refuse(upgrading, &other, "pod-a"));
+    assert!(refuse(upgrading, &id, "pod-a"));
+    assert_eq!(refused_pod(upgrading).as_deref(), Some("pod-a"));
+    assert_eq!(
+        crate::db::read::runtime_upgrade_refused_pod(&conn, upgrading, "pod-a").unwrap(),
+        Some(RuntimeUpgradeRefusedPod {
+            pod_uid: "pod-a".to_string(),
+            failure: Some("refused".to_string()),
+        })
+    );
+    assert_eq!(
+        crate::db::read::runtime_upgrade_refused_pod(&conn, upgrading, "pod-b").unwrap(),
+        None
+    );
+
+    // Already on target: recorded, and the latest pod is the one reported.
+    let found = operation();
+    assert!(
+        record_runtime_upgrade_already_on_target(&conn, &on_target(found, &other), None).unwrap()
+    );
+    assert!(refuse(found, &other, "pod-a"));
+    assert!(refuse(found, &other, "pod-b"));
+    assert_eq!(refused_pod(found).as_deref(), Some("pod-b"));
+
+    delete_sandbox(&conn, &other).unwrap();
+    assert_eq!(
+        crate::db::read::runtime_upgrade_refused_pod(&conn, found, "pod-a").unwrap(),
+        None
     );
 }

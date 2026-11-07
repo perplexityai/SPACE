@@ -615,6 +615,17 @@ pub(super) enum StalePodReason {
     LocalOnlyRestoreNowPortable,
     PodDeleting,
     TerminalPhase(TerminalPodPhase),
+    /// A stopped sandbox's runtime upgrade left the pod, a placeholder that
+    /// runs no microVM, and this materialization isn't that upgrade's retry.
+    StoppedRuntimeUpgradePlaceholder,
+    /// The materialization renders a runtime upgrade the pod doesn't carry,
+    /// so the pod boots something else: another environment, or another
+    /// operation the node may report instead.
+    RuntimeUpgradeNotCarried,
+    /// The pod carries a runtime upgrade that a start of the stopped sandbox
+    /// doesn't render: an earlier start's, which ended before the sandbox
+    /// left `stopped`, and which this start decided against.
+    RuntimeUpgradeNotRendered,
 }
 
 impl fmt::Display for StalePodReason {
@@ -627,6 +638,11 @@ impl fmt::Display for StalePodReason {
             }
             Self::PodDeleting => formatter.write_str("pod deleting"),
             Self::TerminalPhase(phase) => phase.fmt(formatter),
+            Self::StoppedRuntimeUpgradePlaceholder => {
+                formatter.write_str("stopped runtime upgrade placeholder")
+            }
+            Self::RuntimeUpgradeNotCarried => formatter.write_str("runtime upgrade not carried"),
+            Self::RuntimeUpgradeNotRendered => formatter.write_str("runtime upgrade not rendered"),
         }
     }
 }

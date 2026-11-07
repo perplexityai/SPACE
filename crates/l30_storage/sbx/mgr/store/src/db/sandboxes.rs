@@ -818,9 +818,7 @@ db_private_outside_tests! {
         if sandbox_ids.is_empty() {
             return Ok(HashMap::new());
         }
-        let placeholders = std::iter::repeat_n("?", sandbox_ids.len())
-            .collect::<Vec<_>>()
-            .join(", ");
+        let placeholders = crate::db::sql_placeholders(sandbox_ids.len());
         let query = format!(
             "SELECT id, state_changed_at
          FROM sandboxes
@@ -1272,9 +1270,7 @@ db_private_outside_tests! {
         if sandbox_ids.is_empty() {
             return Ok(HashMap::new());
         }
-        let placeholders = std::iter::repeat_n("?", sandbox_ids.len())
-            .collect::<Vec<_>>()
-            .join(", ");
+        let placeholders = crate::db::sql_placeholders(sandbox_ids.len());
         let query = format!(
             "SELECT id,
                 space_api_route_generation,

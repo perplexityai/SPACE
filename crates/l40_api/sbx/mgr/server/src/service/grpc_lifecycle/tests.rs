@@ -435,7 +435,26 @@ fn current_instance_backup_preserves_scoped_drain_signals() {
             );
             assert_eq!(result.is_ok(), valid, "{state:?}/{kind:?}");
             if let Err(error) = result {
-                assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+                // Only a state no retry leaves, or the other backup kind's
+                // state, is a lasting refusal; any other may still reach a
+                // backupable state, and callers may retry it.
+                let lasting = matches!(
+                    state,
+                    SandboxState::Stopped
+                        | SandboxState::Suspended
+                        | SandboxState::Failed
+                        | SandboxState::Deleting
+                        | SandboxState::Quarantined
+                ) || (state == SandboxState::Restoring && kind == ArtifactKind::Full);
+                assert_eq!(
+                    error.code(),
+                    if lasting {
+                        tonic::Code::FailedPrecondition
+                    } else {
+                        tonic::Code::Aborted
+                    },
+                    "{state:?}/{kind:?}"
+                );
                 for (marker, expected) in [
                     (
                         REUPLOAD_SANDBOX_RESTORING_MARKER,

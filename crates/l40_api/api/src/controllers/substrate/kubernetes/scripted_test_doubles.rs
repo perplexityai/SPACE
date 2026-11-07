@@ -349,6 +349,25 @@ impl ScriptedWorker {
 pub(super) async fn start_scripted_worker(
     config: ScriptedWorkerConfig,
 ) -> Result<ScriptedWorker, BoxError> {
+    let wake = SequencedWakeWorker {
+        wake_attempts: Arc::new(AtomicUsize::new(0)),
+        succeed_after_attempt: Some(config.wake_succeeds_from_attempt),
+        echo_route_identity: true,
+        received: Arc::default(),
+    };
+    start_scripted_worker_serving(config, wake).await
+}
+
+/// [`start_scripted_worker`] with `internal` answering the unscripted
+/// `WorkerApiInternal` calls, for a test whose node decides its replies as
+/// calls arrive. `config.wake_succeeds_from_attempt` goes unused.
+pub(super) async fn start_scripted_worker_serving<T>(
+    config: ScriptedWorkerConfig,
+    internal: T,
+) -> Result<ScriptedWorker, BoxError>
+where
+    T: pplx_space_node_api_client::proto::worker_api_internal_server::WorkerApiInternal,
+{
     let dir = tempfile::tempdir()?;
     let sim = SimState::new(
         dir.path().join("snapshots"),
@@ -388,12 +407,7 @@ pub(super) async fn start_scripted_worker(
         calls: Arc::clone(&calls),
     };
     let internal_api = RecordingGrpcFront {
-        inner: WorkerApiInternalServer::new(SequencedWakeWorker {
-            wake_attempts: Arc::new(AtomicUsize::new(0)),
-            succeed_after_attempt: Some(config.wake_succeeds_from_attempt),
-            echo_route_identity: true,
-            received: Arc::default(),
-        }),
+        inner: WorkerApiInternalServer::new(internal),
         replies: Arc::clone(&replies),
         observers: Arc::clone(&observers),
         calls: Arc::clone(&calls),

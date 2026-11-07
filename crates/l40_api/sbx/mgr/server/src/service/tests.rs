@@ -10594,6 +10594,117 @@ pub(crate) mod service_tests {
         assert!(service.route_stream_epochs.lock().unwrap().is_empty());
     }
 
+    /// The route identity a Kubernetes pod's shim sends in its start
+    /// (`routeIdentity` in `shim/space.go`): every dimension but the sandbox,
+    /// with `route_generation` defaulted to the execution generation, as the
+    /// shim does without its annotation. Converted the way the cold start
+    /// converts its request's identity.
+    fn shim_route_identity(generation: i64, pod_uid: &str) -> SpaceApiRouteIdentity {
+        let wire = crate::proto::SpaceApiRouteIdentity {
+            route_generation: Some(u64::try_from(generation).unwrap()),
+            current_node_id: Some(uuid::Uuid::from_u128(1).to_string()),
+            execution_generation: Some(generation),
+            pod_uid: Some(pod_uid.to_string()),
+            activation_attempt_id: Some(uuid::Uuid::now_v7().to_string()),
+            substrate_kind: crate::proto::SandboxSubstrateKind::Kubernetes as i32,
+            ..Default::default()
+        };
+        let start = StartRequest {
+            route_identity: Some(wire),
+            ..Default::default()
+        };
+        space_api_route_identity_for_runtime_activation(
+            space_api_route_identity_from_start_request(&start).unwrap(),
+        )
+        .identity
+    }
+
+    /// A Kubernetes sandbox whose execution of generation 1 ran in a pod and
+    /// stopped, with no route stream epoch cached.
+    fn stopped_kubernetes_sandbox(service: &SandboxManagerService) -> SandboxId {
+        let sandbox_id = SandboxId::new();
+        insert_test_sandbox(
+            &service.db_conn().unwrap(),
+            &sandbox_id.to_string(),
+            SandboxState::Paused,
+        );
+        let mut running = runtime_fields(ExecutionGeneration::new(1).unwrap(), 7);
+        running.space_api_route_identity =
+            shim_route_identity(1, &uuid::Uuid::now_v7().to_string());
+        service.update_runtime_fields(sandbox_id, running).unwrap();
+        let db = service.db_conn().unwrap();
+        crate::db::mark_cleanup_required(
+            &db,
+            &sandbox_id.to_string(),
+            true,
+            CleanupCompletion::MarkStopped,
+            "stopped execution",
+        )
+        .unwrap();
+        crate::db::complete_row_intent_cleanup(
+            &db,
+            &sandbox_id.to_string(),
+            CleanupCompletion::MarkStopped,
+            None,
+        )
+        .unwrap();
+        drop(db);
+        service.route_stream_epochs.lock().unwrap().clear();
+        sandbox_id
+    }
+
+    /// A runtime upgrade cold-boots a stopped Kubernetes sandbox from its new
+    /// pod. The stop kept the old execution's generation and pod UID, but no
+    /// route generation, as teardown proof; the boot's identity, which
+    /// carries all of them, replaces it when it's a newer execution.
+    #[tokio::test]
+    async fn cold_activation_replaces_a_stopped_kubernetes_executions_teardown_proof() {
+        let service = service_for_teardown_test(crate::db::test_conn());
+        for (generation, admitted) in [(1, false), (2, true)] {
+            let sandbox_id = stopped_kubernetes_sandbox(&service);
+            let retained = service
+                .lookup_sandbox(&sandbox_id.to_string())
+                .unwrap()
+                .space_api_route_identity;
+            assert!(
+                retained.pod_uid.is_some() && retained.route_generation.is_none(),
+                "the stop keeps the pod UID but no route generation: {retained:?}"
+            );
+            let mut boot = runtime_fields(ExecutionGeneration::new(generation).unwrap(), 8);
+            boot.space_api_route_identity =
+                shim_route_identity(generation, &uuid::Uuid::now_v7().to_string());
+            let incoming = boot.space_api_route_identity.clone();
+            let cleanup_id = {
+                let db = service.db_conn().unwrap();
+                crate::db::begin_activation(
+                    &db,
+                    &sandbox_id.to_string(),
+                    SandboxState::Stopped,
+                    crate::db::ActivationKind::ColdStart,
+                    incoming.execution_generation,
+                    incoming.activation_attempt_id,
+                )
+                .unwrap()
+                .unwrap()
+                .id
+            };
+            let result = service.update_runtime_fields_for_activation(sandbox_id, cleanup_id, boot);
+            let row = service.lookup_sandbox(&sandbox_id.to_string()).unwrap();
+            if admitted {
+                result.unwrap();
+                let expected = SpaceApiRouteIdentity {
+                    sandbox_id: Some(sandbox_id),
+                    ..incoming
+                };
+                assert_eq!(row.space_api_route_identity, expected);
+            } else {
+                let error = result.expect_err("a cold activation must advance the execution");
+                assert_eq!(error.code(), tonic::Code::Aborted, "{error}");
+                assert_eq!(row.space_api_route_identity, retained);
+            }
+        }
+    }
+
     #[tokio::test]
     async fn delayed_cleanup_cannot_remove_a_newer_runtime_generation() {
         for cached_epoch in [true, false] {
@@ -18164,6 +18275,108 @@ pub(crate) mod service_tests {
             "marker untouched"
         );
         assert_gated_row_deferred_not_repicked(&service, &sandbox_id, &runtime_state);
+    }
+
+    /// A started sandbox whose runtime upgrade must leave it stopped, booted
+    /// and verified but not yet retired: the upgrade stops it itself. Its
+    /// access-idle suspend is due. Answers the service, the sandbox id and
+    /// its auto-lifecycle runtime state.
+    fn sandbox_a_stay_stopped_upgrade_runs()
+    -> (SandboxManagerService, String, AutoLifecycleRuntimeState) {
+        let execution =
+            pplx_space_node_runtime_core::catalog::CompiledEnvironment::for_architecture(
+                pplx_space_common_core::types::Arch::X86_64,
+            )
+            .unwrap()
+            .first()
+            .unwrap()
+            .definition()
+            .execution_requirements()
+            .unwrap();
+        let conn = crate::db::test_conn();
+        let sandbox_id = SandboxId::new().to_string();
+        let policy = access_idle_policy(1);
+        insert_test_sandbox_with_policy(&conn, &sandbox_id, SandboxState::Stopped, &policy);
+        let mut runtime_state = initial_runtime_state(&policy, now_secs().saturating_sub(10));
+        recompute_runtime_state(&mut runtime_state, &policy);
+        crate::db::update_auto_lifecycle_state(&conn, &sandbox_id, &runtime_state).unwrap();
+        crate::db::upsert_sandbox_execution_metadata(&conn, &sandbox_id, &execution).unwrap();
+        let operation_id = crate::db::test_fixtures::fence_runtime_upgrade(
+            &conn,
+            &sandbox_id,
+            execution.environment().unwrap(),
+            crate::db::RuntimeUpgradeTargetState::Stopped,
+            None,
+        )
+        .operation_id;
+        conn.execute(
+            "UPDATE sandbox_runtime_upgrades SET phase = 'verified' WHERE operation_id = ?1",
+            crate::db::fixture::params![operation_id.to_string()],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE sandboxes SET state = 'started' WHERE id = ?1",
+            crate::db::fixture::params![sandbox_id],
+        )
+        .unwrap();
+        (
+            SandboxManagerService::for_test(conn),
+            sandbox_id,
+            runtime_state,
+        )
+    }
+
+    /// A due auto-suspend is held while a runtime upgrade that must leave the
+    /// sandbox stopped runs it, unretired: the upgrade stops the sandbox
+    /// itself, and a suspend in between would leave it suspended, which the
+    /// upgrade never reports. Nothing is recorded as fired, and the row is
+    /// reconsidered once the upgrade retires.
+    #[tokio::test]
+    async fn due_auto_suspend_is_held_while_a_stay_stopped_upgrade_runs() {
+        let (service, sandbox_id, runtime_state) = sandbox_a_stay_stopped_upgrade_runs();
+
+        service
+            .run_due_auto_lifecycle(&sandbox_id)
+            .await
+            .expect("a held suspend is skipped, not an error");
+
+        let row = service.lookup_sandbox(&sandbox_id).unwrap();
+        assert_eq!(row.state, SandboxState::Started, "state untouched");
+        assert_eq!(
+            row.auto_lifecycle_state, runtime_state,
+            "no stage may be recorded as fired"
+        );
+        assert_gated_row_deferred_not_repicked(&service, &sandbox_id, &runtime_state);
+    }
+
+    /// A user's Suspend while such an upgrade runs the sandbox is refused
+    /// retryably, before anything is captured.
+    #[tokio::test]
+    async fn suspend_is_refused_while_a_stay_stopped_upgrade_runs() {
+        let (service, sandbox_id, _) = sandbox_a_stay_stopped_upgrade_runs();
+
+        let error = service
+            .suspend(internal_request(SuspendRequest {
+                sandbox_id: sandbox_id.clone(),
+                blocking: true,
+                format: 0,
+            }))
+            .await
+            .expect_err("the suspend is refused");
+
+        assert_eq!(
+            error.code(),
+            tonic::Code::Unavailable,
+            "{}",
+            error.message()
+        );
+        assert!(
+            error.message().contains("is stopping this sandbox"),
+            "{}",
+            error.message()
+        );
+        let row = service.lookup_sandbox(&sandbox_id).unwrap();
+        assert_eq!(row.state, SandboxState::Started, "state untouched");
     }
 
     /// A gated row's scan deadline is pushed out by the grace — and only

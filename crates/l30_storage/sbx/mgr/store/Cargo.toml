@@ -21,6 +21,8 @@ sqlite.sandbox-manager = [
   "sandbox_quarantine_state",
   "sandbox_restore_transfer_scopes",
   "sandbox_runtime_upgrade_outcomes",
+  "sandbox_runtime_upgrade_pod_outcomes",
+  "sandbox_runtime_upgrade_refused_pods",
   "sandbox_runtime_upgrades",
   "sandboxes",
 ]

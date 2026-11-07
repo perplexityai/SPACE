@@ -45,6 +45,16 @@ artifactInstalls:
 # node image's staging reads its own /etc/space/kind-node.env, not this value.
 loopDeviceTarget: ""
 
+# node-manager's startup execution policy ("Explicit environment selection" in
+# docs/execution-environments.md): SPACE_ALLOWED_EXECUTION_ENVIRONMENTS, a
+# comma-separated list of compiled environment names plus `legacy`, and
+# SPACE_DEFAULT_EXECUTION_ENVIRONMENT, one of them. Empty renders no env var,
+# so the binary's defaults apply (`e0,legacy`, default E0). The Tiltfile maps
+# SPACE_KIND_ALLOWED_EXECUTION_ENVIRONMENTS and
+# SPACE_KIND_DEFAULT_EXECUTION_ENVIRONMENT onto these.
+allowedExecutionEnvironments: ""
+defaultExecutionEnvironment: ""
+
 # Optional per-rootfs operations/s ceiling; empty retains saved assignments.
 diskIoMaxOperationsPerSec: ""
 

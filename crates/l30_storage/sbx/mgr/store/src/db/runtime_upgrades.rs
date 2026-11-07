@@ -53,6 +53,14 @@ pub enum RuntimeUpgradePhase {
     Retired,
 }
 
+/// The phases in which a row refuses other activations of its sandbox; the
+/// queries that find a fencing row bind these.
+const FENCING_PHASES: [RuntimeUpgradePhase; 3] = [
+    RuntimeUpgradePhase::Fenced,
+    RuntimeUpgradePhase::Preserved,
+    RuntimeUpgradePhase::Booting,
+];
+
 impl RuntimeUpgradePhase {
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -66,8 +74,8 @@ impl RuntimeUpgradePhase {
     }
 
     /// Whether a row in this phase refuses other activations of its sandbox.
-    pub const fn fences_activation(self) -> bool {
-        matches!(self, Self::Fenced | Self::Preserved | Self::Booting)
+    pub fn fences_activation(self) -> bool {
+        FENCING_PHASES.contains(&self)
     }
 
     const fn can_advance_to(self, next: Self) -> bool {
@@ -172,6 +180,10 @@ pub struct RuntimeUpgradeRecord {
     pub boot_execution_id: Option<SandboxActivationAttemptId>,
     pub phase: RuntimeUpgradePhase,
     pub failure: Option<String>,
+    /// The Kubernetes pod the upgrade runs for: the pod UID the
+    /// `UpgradeRuntime` request that began it named, `None` for a request
+    /// that named none. Its rollback is recorded for that pod.
+    pub pod_uid: Option<String>,
 }
 
 impl RuntimeUpgradeRecord {
@@ -201,6 +213,8 @@ pub struct NewRuntimeUpgrade<'a> {
     /// The consumer a rollback restores; see
     /// [`RuntimeUpgradeRecord::previous_execution`].
     pub previous_execution: &'a ExecutionMetadata,
+    /// See [`RuntimeUpgradeRecord::pod_uid`].
+    pub pod_uid: Option<&'a str>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -257,6 +271,7 @@ fn record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RuntimeUpgradeRe
     let checkpoint: Option<String> = row.get(9)?;
     let phase: String = row.get(11)?;
     let boot_execution: Option<String> = row.get(13)?;
+    let pod_uid: Option<String> = row.get(14)?;
     Ok(RuntimeUpgradeRecord {
         operation_id: operation_id
             .parse()
@@ -291,6 +306,7 @@ fn record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RuntimeUpgradeRe
             .map(|id| id.parse())
             .transpose()
             .map_err(|error| conversion_error(13, Type::Text, error))?,
+        pod_uid,
     })
 }
 
@@ -299,7 +315,7 @@ fn record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RuntimeUpgradeRe
 const RECORD_COLUMNS: &str = "operation_id, sandbox_id, target_environment, target_state, \
     authorization_id, authorization_reason, memory_loss_authorized, source_state, \
     previous_execution_metadata_json, checkpoint_artifact_id, checkpoint_dir_identity, \
-    phase, failure, boot_execution_id";
+    phase, failure, boot_execution_id, pod_uid";
 
 db_private_outside_tests! {
     fn runtime_upgrade(
@@ -321,8 +337,8 @@ db_private_outside_tests! {
 }
 
 db_private_outside_tests! {
-    /// The upgrade that fences `sandbox_id`'s activations, if any. The phases
-    /// listed are those [`RuntimeUpgradePhase::fences_activation`] names.
+    /// The upgrade that fences `sandbox_id`'s activations, if any: one in a
+    /// phase of [`FENCING_PHASES`].
     fn fencing_runtime_upgrade(
         conn: &Connection,
         sandbox_id: &str,
@@ -332,10 +348,15 @@ db_private_outside_tests! {
                 "SELECT operation_id, phase
                    FROM sandbox_runtime_upgrades
                   WHERE sandbox_id = ?1
-                    AND phase IN ('fenced', 'preserved', 'booting')
+                    AND phase IN (?2, ?3, ?4)
                   ORDER BY created_at, operation_id
                   LIMIT 1",
-                params![sandbox_id],
+                params![
+                    sandbox_id,
+                    FENCING_PHASES[0].as_str(),
+                    FENCING_PHASES[1].as_str(),
+                    FENCING_PHASES[2].as_str(),
+                ],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?;
@@ -354,12 +375,55 @@ db_private_outside_tests! {
 }
 
 db_private_outside_tests! {
+    /// The execution each of `sandbox_ids` publishes while a runtime upgrade
+    /// fences it: the one the upgrade restores on a rollback
+    /// ([`RuntimeUpgradeRecord::previous_execution`]). Sandboxes no upgrade
+    /// fences are absent. The boot saves the target as the sandbox's
+    /// consumer before it runs, and a failed boot's cleanup stops the
+    /// sandbox with it still saved, so until the boot is verified the saved
+    /// consumer isn't what the sandbox runs under; the rollback's restore
+    /// commits with the end of the fence.
+    fn fenced_runtime_upgrade_publications(
+        conn: &Connection,
+        sandbox_ids: &[String],
+    ) -> Result<HashMap<String, ExecutionMetadata>> {
+        if sandbox_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let placeholders = crate::db::sql_placeholders(sandbox_ids.len());
+        // At most one upgrade fences a sandbox.
+        let query = format!(
+            "SELECT sandbox_id, previous_execution_metadata_json
+               FROM sandbox_runtime_upgrades
+              WHERE sandbox_id IN ({placeholders})
+                AND phase IN (?, ?, ?)"
+        );
+        let params = sandbox_ids
+            .iter()
+            .map(String::as_str)
+            .chain(FENCING_PHASES.map(RuntimeUpgradePhase::as_str));
+        let mut statement = conn.prepare(&query)?;
+        let rows = statement.query_map(rusqlite::params_from_iter(params), |row| {
+            let sandbox_id: String = row.get(0)?;
+            let previous: String = row.get(1)?;
+            let previous: ExecutionMetadata = serde_json::from_str(&previous)
+                .map_err(|error| conversion_error(1, Type::Text, error))?;
+            Ok((sandbox_id, previous))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+}
+
+db_private_outside_tests! {
     /// The upgrade of `sandbox_id` that hasn't retired the checkpoint it
     /// superseded yet, if any: a fencing one, or a verified one whose
-    /// retirement is pending.
+    /// retirement is pending. With `target_state`, only an upgrade to that
+    /// target state counts, chosen before the oldest is taken, so an older
+    /// unretired upgrade to another target can't hide it.
     fn unretired_runtime_upgrade(
         conn: &Connection,
         sandbox_id: &str,
+        target_state: Option<RuntimeUpgradeTargetState>,
     ) -> Result<Option<RuntimeUpgradeOperationId>> {
         let row: Option<String> = conn
             .query_row(
@@ -367,9 +431,10 @@ db_private_outside_tests! {
                    FROM sandbox_runtime_upgrades
                   WHERE sandbox_id = ?1
                     AND phase IN ('fenced', 'preserved', 'booting', 'verified')
+                    AND (?2 IS NULL OR target_state = ?2)
                   ORDER BY created_at, operation_id
                   LIMIT 1",
-                params![sandbox_id],
+                params![sandbox_id, target_state.map(RuntimeUpgradeTargetState::as_str)],
                 |row| row.get(0),
             )
             .optional()?;
@@ -506,8 +571,8 @@ pub fn begin_runtime_upgrade(
              operation_id, sandbox_id, target_environment, target_state,
              authorization_id, authorization_reason, memory_loss_authorized,
              source_state, previous_execution_metadata_json, checkpoint_artifact_id,
-             checkpoint_dir_identity, phase, failure, created_at, updated_at
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'fenced', NULL, ?12, ?12)",
+             checkpoint_dir_identity, phase, failure, created_at, updated_at, pod_uid
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'fenced', NULL, ?12, ?12, ?13)",
         params![
             new.operation_id.to_string(),
             new.sandbox_id,
@@ -521,6 +586,7 @@ pub fn begin_runtime_upgrade(
             checkpoint_artifact_id.map(|id| id.to_string()),
             new.checkpoint_dir_identity,
             now,
+            new.pod_uid,
         ],
     )?;
     let record = runtime_upgrade(&tx, new.operation_id)?.ok_or_else(Error::no_rows)?;
@@ -654,7 +720,9 @@ pub(super) fn verify_booting_runtime_upgrade(conn: &Connection, sandbox_id: &str
 }
 
 /// Delete a `rolled_back` row once its preserved disk is gone, keeping its
-/// failure as the operation's [`RecordedRuntimeUpgradeOutcome::RolledBack`] outcome.
+/// failure and its pod as the operation's
+/// [`RecordedRuntimeUpgradeOutcome::RolledBack`] outcome, and in the history
+/// of the pod it ran for, if it named one (see [`runtime_upgrade_pod_outcome`]).
 pub fn finish_runtime_upgrade_rollback(
     conn: &Connection,
     operation_id: RuntimeUpgradeOperationId,
@@ -663,18 +731,37 @@ pub fn finish_runtime_upgrade_rollback(
     tx.execute(
         "INSERT INTO sandbox_runtime_upgrade_outcomes (
              operation_id, sandbox_id, outcome, target_environment, target_state,
-             authorization_id, failure, recorded_at
+             authorization_id, failure, recorded_at, pod_uid
          )
          SELECT operation_id, sandbox_id, ?2, target_environment, target_state,
-                authorization_id, failure, ?3
+                authorization_id, failure, ?3, pod_uid
            FROM sandbox_runtime_upgrades
           WHERE operation_id = ?1
             AND phase = 'rolled_back'
          ON CONFLICT (operation_id) DO UPDATE
             SET outcome = excluded.outcome,
                 failure = excluded.failure,
-                recorded_at = excluded.recorded_at
+                recorded_at = excluded.recorded_at,
+                pod_uid = excluded.pod_uid
           WHERE sandbox_id = excluded.sandbox_id",
+        params![
+            operation_id.to_string(),
+            RecordedRuntimeUpgradeOutcome::RolledBack.as_str(),
+            now()?
+        ],
+    )?;
+    // The pod's own history: a later pod's outcome replaces this one above,
+    // but never this pod's finality.
+    tx.execute(
+        "INSERT INTO sandbox_runtime_upgrade_pod_outcomes (
+             operation_id, pod_uid, sandbox_id, outcome, failure, recorded_at
+         )
+         SELECT operation_id, pod_uid, sandbox_id, ?2, failure, ?3
+           FROM sandbox_runtime_upgrades
+          WHERE operation_id = ?1
+            AND phase = 'rolled_back'
+            AND pod_uid IS NOT NULL
+         ON CONFLICT (operation_id, pod_uid) DO NOTHING",
         params![
             operation_id.to_string(),
             RecordedRuntimeUpgradeOutcome::RolledBack.as_str(),
@@ -706,7 +793,8 @@ pub struct RuntimeUpgradeRequestIdentity {
 }
 
 /// Record that the operation `request` names found its sandbox already on
-/// its target and fenced nothing. False, recording nothing, when the node
+/// its target and fenced nothing, for the pod `pod_uid`, if the request named
+/// one. False, recording nothing, when the node
 /// already recorded the operation, as an outcome or a live upgrade, for
 /// another sandbox, or as an outcome for another target, target state or
 /// authorization.
@@ -716,13 +804,14 @@ pub struct RuntimeUpgradeRequestIdentity {
 pub fn record_runtime_upgrade_already_on_target(
     conn: &Connection,
     request: &RuntimeUpgradeRequestIdentity,
+    pod_uid: Option<&str>,
 ) -> Result<bool> {
     let changed = conn.execute(
         "INSERT INTO sandbox_runtime_upgrade_outcomes (
              operation_id, sandbox_id, outcome, target_environment, target_state,
-             authorization_id, failure, recorded_at
+             authorization_id, failure, recorded_at, pod_uid
          )
-         SELECT ?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7
+         SELECT ?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7, ?8
           WHERE NOT EXISTS (
                 SELECT 1
                   FROM sandbox_runtime_upgrades
@@ -732,7 +821,8 @@ pub fn record_runtime_upgrade_already_on_target(
          ON CONFLICT (operation_id) DO UPDATE
             SET outcome = excluded.outcome,
                 failure = NULL,
-                recorded_at = excluded.recorded_at
+                recorded_at = excluded.recorded_at,
+                pod_uid = excluded.pod_uid
           WHERE sandbox_id = excluded.sandbox_id
             AND target_environment = excluded.target_environment
             AND target_state = excluded.target_state
@@ -744,10 +834,127 @@ pub fn record_runtime_upgrade_already_on_target(
             request.target_environment.to_string(),
             request.target_state.as_str(),
             request.authorization_id,
-            now()?
+            now()?,
+            pod_uid,
         ],
     )?;
     Ok(changed == 1)
+}
+
+/// Record that the operation `request` names was refused for the pod
+/// `pod_uid` before it fenced anything, with `failure` as the reason, so the
+/// refusal is final for that pod as a rollback is: it becomes the operation's
+/// outcome and joins the pod's history (see [`runtime_upgrade_pod_outcome`]).
+/// The caller records only a refusal a retry can't change. False, recording nothing,
+/// when the sandbox is gone from the node, a live upgrade row exists for the
+/// operation, or its recorded outcome names another request or is one a
+/// refusal may not replace: an already-on-target outcome keeps the operation
+/// from ever booting, and its activation claim with it.
+pub fn record_runtime_upgrade_refusal(
+    conn: &Connection,
+    request: &RuntimeUpgradeRequestIdentity,
+    pod_uid: &str,
+    failure: &str,
+) -> Result<bool> {
+    let tx = immediate_transaction(conn)?;
+    let recorded_at = now()?;
+    let changed = tx.execute(
+        "INSERT INTO sandbox_runtime_upgrade_outcomes (
+             operation_id, sandbox_id, outcome, target_environment, target_state,
+             authorization_id, failure, recorded_at, pod_uid
+         )
+         SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9
+          WHERE EXISTS (SELECT 1 FROM sandboxes WHERE id = ?2)
+            AND NOT EXISTS (
+                SELECT 1
+                  FROM sandbox_runtime_upgrades
+                 WHERE operation_id = ?1
+          )
+         ON CONFLICT (operation_id) DO UPDATE
+            SET outcome = excluded.outcome,
+                failure = excluded.failure,
+                recorded_at = excluded.recorded_at,
+                pod_uid = excluded.pod_uid
+          WHERE sandbox_id = excluded.sandbox_id
+            AND target_environment = excluded.target_environment
+            AND target_state = excluded.target_state
+            AND authorization_id = excluded.authorization_id
+            AND outcome IN (?3, ?10)",
+        params![
+            request.operation_id.to_string(),
+            request.sandbox_id,
+            RecordedRuntimeUpgradeOutcome::Refused.as_str(),
+            request.target_environment.to_string(),
+            request.target_state.as_str(),
+            request.authorization_id,
+            failure,
+            recorded_at,
+            pod_uid,
+            RecordedRuntimeUpgradeOutcome::RolledBack.as_str(),
+        ],
+    )?;
+    if changed != 1 {
+        return Ok(false);
+    }
+    tx.execute(
+        "INSERT INTO sandbox_runtime_upgrade_pod_outcomes (
+             operation_id, pod_uid, sandbox_id, outcome, failure, recorded_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT (operation_id, pod_uid) DO NOTHING",
+        params![
+            request.operation_id.to_string(),
+            pod_uid,
+            request.sandbox_id,
+            RecordedRuntimeUpgradeOutcome::Refused.as_str(),
+            failure,
+            recorded_at,
+        ],
+    )?;
+    tx.commit()?;
+    Ok(true)
+}
+
+/// The rollback or refusal the operation recorded for the pod `pod_uid`
+/// (see [`finish_runtime_upgrade_rollback`] and
+/// [`record_runtime_upgrade_refusal`]).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuntimeUpgradePodOutcome {
+    /// [`RecordedRuntimeUpgradeOutcome::RolledBack`] or
+    /// [`RecordedRuntimeUpgradeOutcome::Refused`].
+    pub outcome: RecordedRuntimeUpgradeOutcome,
+    pub failure: Option<String>,
+}
+
+db_private_outside_tests! {
+    /// The rollback or refusal final for the pod `pod_uid` under
+    /// `operation_id`, `None` when none was recorded for it. Unlike the
+    /// operation's report, which keeps only its latest outcome, this is the
+    /// pod's own, whatever later pods' attempts recorded since.
+    fn runtime_upgrade_pod_outcome(
+        conn: &Connection,
+        operation_id: RuntimeUpgradeOperationId,
+        pod_uid: &str,
+    ) -> Result<Option<RuntimeUpgradePodOutcome>> {
+        let row: Option<(String, Option<String>)> = conn
+            .query_row(
+                "SELECT outcome, failure
+                   FROM sandbox_runtime_upgrade_pod_outcomes
+                  WHERE operation_id = ?1
+                    AND pod_uid = ?2",
+                params![operation_id.to_string(), pod_uid],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        row.map(|(outcome, failure)| {
+            Ok(RuntimeUpgradePodOutcome {
+                outcome: outcome
+                    .parse()
+                    .map_err(|error| conversion_error(0, Type::Text, error))?,
+                failure,
+            })
+        })
+        .transpose()
+    }
 }
 
 db_private_outside_tests! {
@@ -781,6 +988,108 @@ db_private_outside_tests! {
         })
         .transpose()
     }
+}
+
+/// Record that the operation `operation_id` refused the create of the pod
+/// `pod_uid` after it reached its target for `sandbox_id`: the node upgraded
+/// the sandbox (the live row is retired), or found it there already (no live
+/// row, an already-on-target outcome), but the pod's `UpgradeRuntime` for a
+/// started target failed, so the sandbox doesn't run for that pod. The
+/// refusal is final for that pod; `failure` says why. False, recording
+/// nothing, when the operation hasn't reached its target for that sandbox:
+/// its rollback or refusal is what the pod's report says then. The check and
+/// the write are one statement.
+pub fn record_runtime_upgrade_refused_pod(
+    conn: &Connection,
+    operation_id: RuntimeUpgradeOperationId,
+    sandbox_id: &str,
+    pod_uid: &str,
+    failure: &str,
+) -> Result<bool> {
+    let changed = conn.execute(
+        "INSERT INTO sandbox_runtime_upgrade_refused_pods (
+             operation_id, pod_uid, sandbox_id, failure, recorded_at
+         )
+         SELECT ?1, ?2, ?3, ?4, ?5
+          WHERE EXISTS (
+                SELECT 1
+                  FROM sandbox_runtime_upgrades
+                 WHERE operation_id = ?1
+                   AND sandbox_id = ?3
+                   AND phase = 'retired'
+          )
+             OR (
+                NOT EXISTS (
+                    SELECT 1 FROM sandbox_runtime_upgrades WHERE operation_id = ?1
+                )
+                AND EXISTS (
+                    SELECT 1
+                      FROM sandbox_runtime_upgrade_outcomes
+                     WHERE operation_id = ?1
+                       AND sandbox_id = ?3
+                       AND outcome = ?6
+                )
+          )
+         ON CONFLICT (operation_id, pod_uid) DO UPDATE
+            SET failure = excluded.failure,
+                recorded_at = excluded.recorded_at
+          WHERE sandbox_id = excluded.sandbox_id",
+        params![
+            operation_id.to_string(),
+            pod_uid,
+            sandbox_id,
+            failure,
+            now()?,
+            RecordedRuntimeUpgradeOutcome::AlreadyOnTarget.as_str(),
+        ],
+    )?;
+    Ok(changed == 1)
+}
+
+db_private_outside_tests! {
+    /// The pod `pod_uid`'s create the operation refused after reaching its
+    /// target (see [`record_runtime_upgrade_refused_pod`]), `None` when it
+    /// refused no such create.
+    fn runtime_upgrade_refused_pod(
+        conn: &Connection,
+        operation_id: RuntimeUpgradeOperationId,
+        pod_uid: &str,
+    ) -> Result<Option<RuntimeUpgradeRefusedPod>> {
+        conn.query_row(
+            "SELECT pod_uid, failure
+               FROM sandbox_runtime_upgrade_refused_pods
+              WHERE operation_id = ?1
+                AND pod_uid = ?2",
+            params![operation_id.to_string(), pod_uid],
+            refused_pod_from_row,
+        )
+        .optional()
+    }
+}
+
+/// The latest pod whose create the operation refused after reaching its
+/// target, `None` without one.
+fn latest_refused_pod(
+    conn: &Connection,
+    operation_id: RuntimeUpgradeOperationId,
+) -> Result<Option<RuntimeUpgradeRefusedPod>> {
+    conn.query_row(
+        "SELECT pod_uid, failure
+           FROM sandbox_runtime_upgrade_refused_pods
+          WHERE operation_id = ?1
+          ORDER BY CAST(recorded_at AS INTEGER) DESC, rowid DESC
+          LIMIT 1",
+        params![operation_id.to_string()],
+        refused_pod_from_row,
+    )
+    .optional()
+}
+
+fn refused_pod_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RuntimeUpgradeRefusedPod> {
+    Ok(RuntimeUpgradeRefusedPod {
+        pod_uid: row.get(0)?,
+        failure: row.get(1)?,
+    })
 }
 
 /// Record how `sandbox_id`'s already-on-target upgrade claims its
@@ -825,6 +1134,9 @@ pub enum RecordedRuntimeUpgradeOutcome {
     RolledBack,
     /// The sandbox was already on the target; nothing was fenced or booted.
     AlreadyOnTarget,
+    /// The request was refused before it fenced anything; recorded only for
+    /// a request that named its pod.
+    Refused,
 }
 
 impl RecordedRuntimeUpgradeOutcome {
@@ -832,6 +1144,7 @@ impl RecordedRuntimeUpgradeOutcome {
         match self {
             Self::RolledBack => "rolled_back",
             Self::AlreadyOnTarget => "already_on_target",
+            Self::Refused => "refused",
         }
     }
 }
@@ -853,6 +1166,7 @@ impl FromStr for RecordedRuntimeUpgradeOutcome {
         match value {
             "rolled_back" => Ok(Self::RolledBack),
             "already_on_target" => Ok(Self::AlreadyOnTarget),
+            "refused" => Ok(Self::Refused),
             other => Err(RecordedRuntimeUpgradeOutcomeParseError(other.to_string())),
         }
     }
@@ -864,6 +1178,22 @@ impl FromStr for RecordedRuntimeUpgradeOutcome {
 pub struct RuntimeUpgradeReport {
     pub sandbox_id: String,
     pub status: RuntimeUpgradeStatus,
+    /// The pod the reported attempt ran for, as its live row or recorded
+    /// outcome names it; `None` for a request that named no pod and for a
+    /// row written before the node recorded pods.
+    pub pod_uid: Option<String>,
+    /// The latest pod whose create the operation refused after it reached
+    /// its target, so the sandbox doesn't run for that pod; see
+    /// [`record_runtime_upgrade_refused_pod`]. Only an upgraded or
+    /// already-on-target operation refuses one.
+    pub refused_pod: Option<RuntimeUpgradeRefusedPod>,
+}
+
+/// A pod whose create an operation refused after it reached its target.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuntimeUpgradeRefusedPod {
+    pub pod_uid: String,
+    pub failure: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -875,6 +1205,8 @@ pub enum RuntimeUpgradeStatus {
     Upgraded,
     /// The old pair is back. The preserved copy may still await deletion.
     RolledBack { failure: Option<String> },
+    /// The request was refused before it fenced anything; `failure` says why.
+    Refused { failure: Option<String> },
     /// Nothing was fenced or booted. `activation` once the upgrade claimed
     /// its activation for a started target; a claimed start may still have
     /// failed.
@@ -913,7 +1245,8 @@ impl RuntimeUpgradeActivationClaim {
 db_private_outside_tests! {
     /// The report for `operation_id`, `None` when the node holds no record of
     /// it. The live row, when there is one, wins over a recorded outcome: a
-    /// retry after a rollback starts over under the same operation.
+    /// retry from a new pod after a rollback or a refusal starts over under
+    /// the same operation.
     fn runtime_upgrade_report(
         conn: &Connection,
         operation_id: RuntimeUpgradeOperationId,
@@ -929,20 +1262,38 @@ db_private_outside_tests! {
             return Ok(Some(RuntimeUpgradeReport {
                 sandbox_id: record.sandbox_id,
                 status,
+                pod_uid: record.pod_uid,
+                refused_pod: latest_refused_pod(conn, operation_id)?,
             }));
         }
-        type OutcomeRow = (String, String, Option<String>, Option<String>, Option<String>);
+        type OutcomeRow = (
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        );
         let row: Option<OutcomeRow> = conn
             .query_row(
                 "SELECT sandbox_id, outcome, failure, activation_claim_kind,
-                        activation_claimed_execution_id
+                        activation_claimed_execution_id, pod_uid
                    FROM sandbox_runtime_upgrade_outcomes
                   WHERE operation_id = ?1",
                 params![operation_id.to_string()],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
             )
             .optional()?;
-        row.map(|(sandbox_id, outcome, failure, claim_kind, claimed_execution)| {
+        row.map(|(sandbox_id, outcome, failure, claim_kind, claimed_execution, pod_uid)| {
             let from_execution = claimed_execution
                 .map(|id| id.parse())
                 .transpose()
@@ -965,11 +1316,17 @@ db_private_outside_tests! {
                 .map_err(|error| conversion_error(1, Type::Text, error))?
             {
                 RecordedRuntimeUpgradeOutcome::RolledBack => RuntimeUpgradeStatus::RolledBack { failure },
+                RecordedRuntimeUpgradeOutcome::Refused => RuntimeUpgradeStatus::Refused { failure },
                 RecordedRuntimeUpgradeOutcome::AlreadyOnTarget => {
                     RuntimeUpgradeStatus::AlreadyOnTarget { activation }
                 }
             };
-            Ok(RuntimeUpgradeReport { sandbox_id, status })
+            Ok(RuntimeUpgradeReport {
+                sandbox_id,
+                status,
+                pod_uid,
+                refused_pod: latest_refused_pod(conn, operation_id)?,
+            })
         })
         .transpose()
     }

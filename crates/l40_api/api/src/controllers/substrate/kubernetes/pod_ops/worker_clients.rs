@@ -36,6 +36,27 @@ impl KubernetesSubstrate {
             .map(|channel| crate::controllers::substrate::RuntimeClient::new(channel, endpoint))
     }
 
+    /// A client to the node-api on the Kubernetes worker `node_name`, and the
+    /// address it was dialed at, or why there's none.
+    pub(in crate::controllers::substrate::kubernetes) async fn node_worker_client(
+        &self,
+        node_name: &str,
+    ) -> Result<(String, crate::controllers::substrate::RuntimeClient), String> {
+        let target = NodeApiTarget {
+            managed_by: pplx_space_common_core::types::NodeManagedBy::Kubernetes,
+            role: pplx_space_common_core::types::NodeRole::Worker,
+            direct_endpoint: None,
+            substrate_node_id: Some(node_name),
+        };
+        let addr = self
+            .try_resolve_node_api_endpoint(&target)
+            .map_err(|error| format!("no node-api on node {node_name} ({error})"))?;
+        let client = Self::worker_client_at(&addr, self.budgets.teardown_worker_connect)
+            .await
+            .ok_or_else(|| format!("node-api at {addr} unreachable"))?;
+        Ok((addr, client))
+    }
+
     pub(in crate::controllers::substrate::kubernetes) async fn pod_worker_channel(
         pod_ip: PodIp,
         port: u16,

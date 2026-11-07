@@ -9,7 +9,12 @@
 //! suspended sandbox placed away from its checkpoint, upgrade, and for a
 //! started target hand back the running execution, activating a sandbox that
 //! was already on the target. The control plane can't see the response, so it
-//! reads the outcome from `GetRuntimeUpgrade`.
+//! reads the outcome from `GetRuntimeUpgrade`, which names the pod each
+//! outcome was recorded for. A rollback or refusal is final for that pod: a
+//! failed create leaves the pod pending, and kubelet's retries of it, under
+//! the same pod UID, get the recorded failure back (see the parent module).
+//! So is a started target's refused create once the operation reached its
+//! target: the node records the refusal for that pod and reports it.
 
 use tonic::metadata::MetadataMap;
 use tonic::{Extensions, Request, Response, Status};
@@ -111,7 +116,17 @@ impl crate::service::SandboxManagerService {
         }
         let upgrade = parse_request(message)?;
         let sandbox_id = upgrade.sandbox_id.clone();
+        let operation_id = upgrade.operation_id;
+        // The pod a started target's sandbox must run for, whose create this
+        // call's error refuses, and the start that names it.
+        let started_pod = (upgrade.target_state == RuntimeUpgradeTargetState::Started)
+            .then(|| upgrade.pod_uid().map(str::to_owned))
+            .flatten();
+        let pod_start = started_pod.as_ref().map(|_| upgrade.start.clone());
         let _guard = self.runtime_upgrade_guard(&sandbox_id).await?;
+        if let Some(pod_uid) = &started_pod {
+            self.refuse_refused_pod(operation_id, pod_uid)?;
+        }
         // Boxed: staging, the upgrade and an activation together are a large
         // future, which would otherwise sit on the stack of an unoptimized
         // build's RPC task.
@@ -122,8 +137,85 @@ impl crate::service::SandboxManagerService {
             stage_from.as_ref(),
         ))
         .await;
+        if let (Err(refusal), Some(pod_uid), Some(start)) = (&response, &started_pod, &pod_start) {
+            self.record_refused_pod(operation_id, pod_uid, start, refusal);
+        }
         crate::node_state_sync::mark_sandbox_dirty(&self.db, &sandbox_id);
         response.map(Response::new)
+    }
+
+    /// Answer a retry from a pod whose create the operation already refused
+    /// after reaching its target with that refusal, rather than activating
+    /// the sandbox for it: the control plane may already have settled on it
+    /// and deleted the pod. Only a new pod tries again.
+    fn refuse_refused_pod(
+        &self,
+        operation_id: crate::db::RuntimeUpgradeOperationId,
+        pod_uid: &str,
+    ) -> Result<(), Status> {
+        let refused =
+            crate::db::read::runtime_upgrade_refused_pod(&*self.db_conn()?, operation_id, pod_uid)
+                .map_err(|error| Status::internal(format!("read runtime upgrade: {error}")))?;
+        match refused {
+            None => Ok(()),
+            Some(refused) => Err(Status::failed_precondition(format!(
+                "runtime upgrade {operation_id} reached its target but refused pod {pod_uid}'s \
+                 create: {}; only a new pod retries it",
+                refused.failure.as_deref().unwrap_or("no reason recorded")
+            ))),
+        }
+    }
+
+    /// Record that this call's `refusal` refused the create of the pod
+    /// `pod_uid`, whose `start` asked for a started target, if the operation
+    /// reached its target: the node upgraded the sandbox, or found it there,
+    /// and the pod doesn't run it. Otherwise the operation's rollback or
+    /// refusal is the pod's report, or the node is still working on it. A
+    /// sandbox whose VM is resident for the pod's execution, started or
+    /// paused (a start that failed after its guest was ready, say, or a boot
+    /// paused since), is left to kubelet's retry, which is answered with it. Best effort: an unrecorded refusal leaves the control
+    /// plane waiting on the pod, as it did before refusals were recorded.
+    fn record_refused_pod(
+        &self,
+        operation_id: crate::db::RuntimeUpgradeOperationId,
+        pod_uid: &str,
+        start: &StartRequest,
+        refusal: &Status,
+    ) {
+        let sandbox_id = start.sandbox_id.as_str();
+        if self.lookup_sandbox(sandbox_id).is_ok_and(|sandbox| {
+            matches!(sandbox.state, SandboxState::Started | SandboxState::Paused)
+                && names_the_running_pod(&sandbox, start)
+        }) {
+            return;
+        }
+        let recorded = self.db_conn().and_then(|db| {
+            crate::db::record_runtime_upgrade_refused_pod(
+                &db,
+                operation_id,
+                sandbox_id,
+                pod_uid,
+                refusal.message(),
+            )
+            .map_err(|error| Status::internal(error.to_string()))
+        });
+        match recorded {
+            Ok(true) => tracing::info!(
+                sandbox_id,
+                %operation_id,
+                pod_uid,
+                refusal = refusal.message(),
+                "runtime upgrade reached its target but refused the pod's create; final for the pod"
+            ),
+            Ok(false) => {}
+            Err(error) => tracing::warn!(
+                sandbox_id,
+                %operation_id,
+                pod_uid,
+                %error,
+                "could not record the runtime upgrade's refusal of the pod's create"
+            ),
+        }
     }
 
     /// The RPC's work under the sandbox's upgrade lock.
@@ -139,10 +231,17 @@ impl crate::service::SandboxManagerService {
             // An operation id names one upgrade of one sandbox. A request that
             // reuses one another sandbox's upgrade recorded stages nothing.
             upgrader.refuse_another_request(&upgrade)?;
+            // Nor does a retry from a pod whose rollback or refusal is final.
+            upgrader.refuse_settled_for_pod(&upgrade)?;
             // Leaves a present sandbox alone, in any state; the upgrade's
             // checkpoint check decides whether its copy may be upgraded.
-            self.stage_missing_checkpoint(staging_start(&upgrade.start, stage_from))
-                .await?;
+            if let Err(refusal) = self
+                .stage_missing_checkpoint(staging_start(&upgrade.start, stage_from))
+                .await
+            {
+                upgrader.record_refusal(&upgrade, &refusal);
+                return Err(refusal);
+            }
         }
         let target_state = upgrade.target_state;
         let operation_id = upgrade.operation_id;
@@ -426,7 +525,16 @@ impl crate::service::SandboxManagerService {
                 "runtime upgrade {operation_id} names another sandbox"
             )));
         }
-        let mut response = GetRuntimeUpgradeResponse::default();
+        let (refused_pod_uid, refused_pod_failure) = report
+            .refused_pod
+            .map(|refused| (Some(refused.pod_uid), refused.failure))
+            .unwrap_or_default();
+        let mut response = GetRuntimeUpgradeResponse {
+            pod_uid: report.pod_uid,
+            refused_pod_uid,
+            refused_pod_failure,
+            ..Default::default()
+        };
         response.status = match report.status {
             RuntimeUpgradeStatus::InProgress(phase) => {
                 response.phase = match phase {
@@ -445,6 +553,10 @@ impl crate::service::SandboxManagerService {
             RuntimeUpgradeStatus::RolledBack { failure } => {
                 response.failure = failure;
                 Wire::RolledBack
+            }
+            RuntimeUpgradeStatus::Refused { failure } => {
+                response.failure = failure;
+                Wire::Refused
             }
             RuntimeUpgradeStatus::AlreadyOnTarget { activation } => {
                 response.activation_claimed = activation.is_some();

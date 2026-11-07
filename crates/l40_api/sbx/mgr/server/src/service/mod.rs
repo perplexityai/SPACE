@@ -533,13 +533,27 @@ fn execution_only_provenance(identity: &SpaceApiRouteIdentity) -> bool {
         && identity.activation_attempt_id.is_none()
 }
 
+/// The identity an ordinary stop retains as teardown proof
+/// (`apply_cleanup_state` in the store): the producing execution generation
+/// and, for a Kubernetes execution, its pod UID, which the row reads back as
+/// a Kubernetes substrate. Every routing dimension is cleared, so it names no
+/// attachable epoch.
+fn stop_teardown_provenance(identity: &SpaceApiRouteIdentity) -> bool {
+    identity.execution_generation.is_some()
+        && identity.route_generation.is_none()
+        && identity.current_node_id.is_none()
+        && identity.activation_attempt_id.is_none()
+        && identity.substrate_kind
+            == SpaceApiRouteIdentity::effective_substrate_kind_for(None, identity.pod_uid.as_ref())
+}
+
 fn validate_cold_start_provenance(
     sandbox: &crate::db::SandboxRow,
     incoming: &RouteStreamEpochIdentity,
 ) -> Result<(), Status> {
     let retained = &sandbox.space_api_route_identity;
     if sandbox.state == crate::state::SandboxState::Starting
-        && execution_only_provenance(retained)
+        && stop_teardown_provenance(retained)
         && incoming.execution_generation() <= retained.execution_generation
     {
         return Err(Status::aborted(
@@ -594,6 +608,8 @@ fn persisted_route_stream_epoch(
     }
     // Orphan recovery publishes a suspend artifact with only its producing
     // execution generation; it cannot recover the old pod or live route.
+    // Unlike a stop's provenance, this shape never carries a pod UID, so it
+    // stays the narrower execution-only check.
     // A complete replacement may supersede that exact provenance shape only
     // when it owns the persisted restore. The runtime write still checks the
     // producing execution generation, so this does not admit an older restore.
@@ -605,14 +621,17 @@ fn persisted_route_stream_epoch(
     if is_owned_recovered_execution_provenance {
         return Ok(None);
     }
-    // Stop clears the live route while retaining the producing execution as
-    // cleanup provenance. An owned cold activation may replace that exact
-    // partial identity after validate_cold_start_provenance requires a newer
-    // execution, independently of the process-local route cache.
+    // Stop clears the live route while retaining the producing execution,
+    // and a Kubernetes execution's pod UID, as cleanup provenance. An owned
+    // cold activation may replace that exact partial identity after
+    // validate_cold_start_provenance requires a newer execution,
+    // independently of the process-local route cache: every cold start of a
+    // stopped Kubernetes sandbox, a plain start as much as a runtime
+    // upgrade's boot, finds the pod UID there.
     let is_owned_cold_start_provenance = activation_replacement_authority
         == ActivationRouteReplacementAuthority::PersistedOwner
         && sandbox.state == crate::state::SandboxState::Starting
-        && execution_only_provenance(identity);
+        && stop_teardown_provenance(identity);
     if is_owned_cold_start_provenance {
         return Ok(None);
     }

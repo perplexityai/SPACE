@@ -429,6 +429,27 @@ impl SandboxManagerService {
         // one), so the row is neither re-picked every tick nor advanced; it
         // is reconsidered once it settles. `Delete` is not gated here: the
         // state machine force-deletes from transient states.
+        // A runtime upgrade that must leave the sandbox stopped runs it
+        // between its verified boot and its retirement, and stops it again
+        // itself; a suspend there would leave it suspended. Held like a
+        // non-actionable stage, so the suspend is reconsidered once the
+        // upgrade retires.
+        let stay_stopped_upgrade = if action == AutoLifecycleIdleAction::Suspend {
+            let db = self.db_conn()?;
+            super::runtime_upgrade::unretired_stay_stopped_upgrade(&db, &sandbox.id)?
+        } else {
+            None
+        };
+        if let Some(operation_id) = stay_stopped_upgrade {
+            tracing::debug!(
+                sandbox_id = %sandbox.id,
+                %operation_id,
+                "holding a due auto-suspend while a runtime upgrade that ends stopped \
+                 hasn't retired; nothing recorded"
+            );
+            self.defer_gated_auto_lifecycle_row(&sandbox.id, now)?;
+            return Ok(());
+        }
         if !crate::db::auto_lifecycle_action_can_act(action, sandbox.state) {
             tracing::debug!(
                 sandbox_id = %sandbox.id,

@@ -1343,19 +1343,32 @@ type RuntimeUpgradeStatus int32
 
 const (
 	RuntimeUpgradeStatus_RUNTIME_UPGRADE_STATUS_UNSPECIFIED RuntimeUpgradeStatus = 0
-	// The node holds no record of the operation: it never reached this node,
-	// it was refused before fencing anything, or the sandbox was deleted from
-	// this node since, with its upgrade records.
+	// The node holds no record of the operation: it never reached this node;
+	// every request for it was refused before fencing anything with no
+	// refusal recorded (one refused before the node read it, as malformed, as
+	// unauthorized, or before it could take the sandbox's upgrade lock; one
+	// that named no pod; one for a sandbox absent from the node; one a retry
+	// may not repeat, which is anything but FAILED_PRECONDITION or
+	// INVALID_ARGUMENT; or one whose refusal the node failed to write); or the
+	// sandbox was deleted from this node since, with its upgrade records.
 	RuntimeUpgradeStatus_RUNTIME_UPGRADE_STATUS_ABSENT RuntimeUpgradeStatus = 1
 	// The upgrade fences the sandbox, or its verified boot hasn't retired the
 	// old checkpoint yet. `phase` says which.
 	RuntimeUpgradeStatus_RUNTIME_UPGRADE_STATUS_IN_PROGRESS RuntimeUpgradeStatus = 2
 	// The sandbox booted under the target and its old checkpoint is retired.
 	RuntimeUpgradeStatus_RUNTIME_UPGRADE_STATUS_UPGRADED RuntimeUpgradeStatus = 3
-	// The old disk/checkpoint pair is back; `failure` says why.
+	// The old disk/checkpoint pair is back; `failure` says why. Final for the
+	// pod `pod_uid` names; see `UpgradeRuntime`.
 	RuntimeUpgradeStatus_RUNTIME_UPGRADE_STATUS_ROLLED_BACK RuntimeUpgradeStatus = 4
 	// The sandbox was already on the target; nothing was fenced or booted.
 	RuntimeUpgradeStatus_RUNTIME_UPGRADE_STATUS_ALREADY_ON_TARGET RuntimeUpgradeStatus = 5
+	// The request from the pod `pod_uid` names was refused before it fenced
+	// anything, with FAILED_PRECONDITION or INVALID_ARGUMENT; `failure` says
+	// why. Final for that pod, as a rollback is. Recorded only for a request
+	// that named its pod, on a node holding the sandbox; it replaces an earlier
+	// pod's rollback or refusal as the reported outcome (each stays final for
+	// its own pod), never an ALREADY_ON_TARGET outcome.
+	RuntimeUpgradeStatus_RUNTIME_UPGRADE_STATUS_REFUSED RuntimeUpgradeStatus = 6
 )
 
 // Enum value maps for RuntimeUpgradeStatus.
@@ -1367,6 +1380,7 @@ var (
 		3: "RUNTIME_UPGRADE_STATUS_UPGRADED",
 		4: "RUNTIME_UPGRADE_STATUS_ROLLED_BACK",
 		5: "RUNTIME_UPGRADE_STATUS_ALREADY_ON_TARGET",
+		6: "RUNTIME_UPGRADE_STATUS_REFUSED",
 	}
 	RuntimeUpgradeStatus_value = map[string]int32{
 		"RUNTIME_UPGRADE_STATUS_UNSPECIFIED":       0,
@@ -1375,6 +1389,7 @@ var (
 		"RUNTIME_UPGRADE_STATUS_UPGRADED":          3,
 		"RUNTIME_UPGRADE_STATUS_ROLLED_BACK":       4,
 		"RUNTIME_UPGRADE_STATUS_ALREADY_ON_TARGET": 5,
+		"RUNTIME_UPGRADE_STATUS_REFUSED":           6,
 	}
 )
 
@@ -6952,7 +6967,7 @@ type GetRuntimeUpgradeResponse struct {
 	Status RuntimeUpgradeStatus   `protobuf:"varint,1,opt,name=status,proto3,enum=space.sandbox.manager.v1.RuntimeUpgradeStatus" json:"status,omitempty"`
 	// Set with IN_PROGRESS.
 	Phase RuntimeUpgradePhase `protobuf:"varint,2,opt,name=phase,proto3,enum=space.sandbox.manager.v1.RuntimeUpgradePhase" json:"phase,omitempty"`
-	// Set with ROLLED_BACK when the node recorded a reason.
+	// Set with ROLLED_BACK or REFUSED when the node recorded a reason.
 	Failure *string `protobuf:"bytes,3,opt,name=failure,proto3,oneof" json:"failure,omitempty"`
 	// With ALREADY_ON_TARGET: the operation's `UpgradeRuntime` claimed its
 	// activation for a STARTED target, either by claiming the start of the
@@ -6966,6 +6981,27 @@ type GetRuntimeUpgradeResponse struct {
 	// operation id; a start refused before its activation claimed the sandbox
 	// may be retried under the same one.
 	ActivationClaimed bool `protobuf:"varint,4,opt,name=activation_claimed,json=activationClaimed,proto3" json:"activation_claimed,omitempty"`
+	// The pod the reported attempt ran for: the pod UID the `start` of the
+	// `UpgradeRuntime` request that began it, or that was refused or found the
+	// target, named. Unset for a request that named no pod and for anything
+	// recorded by a node that predates this field, which proves nothing about
+	// any pod. A ROLLED_BACK or REFUSED report is final for the pod it names
+	// only: a caller waiting on a pod settles on one only when it names that
+	// pod, since until a retry from a new pod reaches the node, the report is
+	// the earlier pod's.
+	PodUid *string `protobuf:"bytes,5,opt,name=pod_uid,json=podUid,proto3,oneof" json:"pod_uid,omitempty"`
+	// With UPGRADED or ALREADY_ON_TARGET: the latest pod whose `UpgradeRuntime`
+	// for a STARTED target the node answered with an error after the operation
+	// reached that status, so the sandbox doesn't run for that pod (its create
+	// failed and the pod stays pending while kubelet retries it). Final for that
+	// pod, as a rollback is: its retries get the recorded error back and never
+	// activate the sandbox, while a retry from a new pod tries again. A caller
+	// waiting on a pod settles on it only when it names that pod. Unset when no
+	// pod's create was refused that way, and from a node that predates the
+	// field.
+	RefusedPodUid *string `protobuf:"bytes,6,opt,name=refused_pod_uid,json=refusedPodUid,proto3,oneof" json:"refused_pod_uid,omitempty"`
+	// With `refused_pod_uid`: the error that pod's create got, when recorded.
+	RefusedPodFailure *string `protobuf:"bytes,7,opt,name=refused_pod_failure,json=refusedPodFailure,proto3,oneof" json:"refused_pod_failure,omitempty"`
 	unknownFields     protoimpl.UnknownFields
 	sizeCache         protoimpl.SizeCache
 }
@@ -7026,6 +7062,27 @@ func (x *GetRuntimeUpgradeResponse) GetActivationClaimed() bool {
 		return x.ActivationClaimed
 	}
 	return false
+}
+
+func (x *GetRuntimeUpgradeResponse) GetPodUid() string {
+	if x != nil && x.PodUid != nil {
+		return *x.PodUid
+	}
+	return ""
+}
+
+func (x *GetRuntimeUpgradeResponse) GetRefusedPodUid() string {
+	if x != nil && x.RefusedPodUid != nil {
+		return *x.RefusedPodUid
+	}
+	return ""
+}
+
+func (x *GetRuntimeUpgradeResponse) GetRefusedPodFailure() string {
+	if x != nil && x.RefusedPodFailure != nil {
+		return *x.RefusedPodFailure
+	}
+	return ""
 }
 
 type EnableSnapshotsRequest struct {
@@ -14261,14 +14318,21 @@ const file_sandbox_manager_v1_manager_proto_rawDesc = "" +
 	"\x18GetRuntimeUpgradeRequest\x12\x1d\n" +
 	"\n" +
 	"sandbox_id\x18\x01 \x01(\tR\tsandboxId\x12!\n" +
-	"\foperation_id\x18\x02 \x01(\tR\voperationId\"\x82\x02\n" +
+	"\foperation_id\x18\x02 \x01(\tR\voperationId\"\xba\x03\n" +
 	"\x19GetRuntimeUpgradeResponse\x12F\n" +
 	"\x06status\x18\x01 \x01(\x0e2..space.sandbox.manager.v1.RuntimeUpgradeStatusR\x06status\x12C\n" +
 	"\x05phase\x18\x02 \x01(\x0e2-.space.sandbox.manager.v1.RuntimeUpgradePhaseR\x05phase\x12\x1d\n" +
 	"\afailure\x18\x03 \x01(\tH\x00R\afailure\x88\x01\x01\x12-\n" +
-	"\x12activation_claimed\x18\x04 \x01(\bR\x11activationClaimedB\n" +
+	"\x12activation_claimed\x18\x04 \x01(\bR\x11activationClaimed\x12\x1c\n" +
+	"\apod_uid\x18\x05 \x01(\tH\x01R\x06podUid\x88\x01\x01\x12+\n" +
+	"\x0frefused_pod_uid\x18\x06 \x01(\tH\x02R\rrefusedPodUid\x88\x01\x01\x123\n" +
+	"\x13refused_pod_failure\x18\a \x01(\tH\x03R\x11refusedPodFailure\x88\x01\x01B\n" +
 	"\n" +
-	"\b_failure\"7\n" +
+	"\b_failureB\n" +
+	"\n" +
+	"\b_pod_uidB\x12\n" +
+	"\x10_refused_pod_uidB\x16\n" +
+	"\x14_refused_pod_failure\"7\n" +
 	"\x16EnableSnapshotsRequest\x12\x1d\n" +
 	"\n" +
 	"sandbox_id\x18\x01 \x01(\tR\tsandboxId\"\x19\n" +
@@ -15012,14 +15076,15 @@ const file_sandbox_manager_v1_manager_proto_rawDesc = "" +
 	"\x15RuntimeUpgradeOutcome\x12'\n" +
 	"#RUNTIME_UPGRADE_OUTCOME_UNSPECIFIED\x10\x00\x12$\n" +
 	" RUNTIME_UPGRADE_OUTCOME_UPGRADED\x10\x01\x12-\n" +
-	")RUNTIME_UPGRADE_OUTCOME_ALREADY_ON_TARGET\x10\x02*\x84\x02\n" +
+	")RUNTIME_UPGRADE_OUTCOME_ALREADY_ON_TARGET\x10\x02*\xa8\x02\n" +
 	"\x14RuntimeUpgradeStatus\x12&\n" +
 	"\"RUNTIME_UPGRADE_STATUS_UNSPECIFIED\x10\x00\x12!\n" +
 	"\x1dRUNTIME_UPGRADE_STATUS_ABSENT\x10\x01\x12&\n" +
 	"\"RUNTIME_UPGRADE_STATUS_IN_PROGRESS\x10\x02\x12#\n" +
 	"\x1fRUNTIME_UPGRADE_STATUS_UPGRADED\x10\x03\x12&\n" +
 	"\"RUNTIME_UPGRADE_STATUS_ROLLED_BACK\x10\x04\x12,\n" +
-	"(RUNTIME_UPGRADE_STATUS_ALREADY_ON_TARGET\x10\x05*\xca\x01\n" +
+	"(RUNTIME_UPGRADE_STATUS_ALREADY_ON_TARGET\x10\x05\x12\"\n" +
+	"\x1eRUNTIME_UPGRADE_STATUS_REFUSED\x10\x06*\xca\x01\n" +
 	"\x13RuntimeUpgradePhase\x12%\n" +
 	"!RUNTIME_UPGRADE_PHASE_UNSPECIFIED\x10\x00\x12 \n" +
 	"\x1cRUNTIME_UPGRADE_PHASE_FENCED\x10\x01\x12#\n" +

@@ -81,6 +81,7 @@ from space_smoke.capabilities import (
     ProcessSandbox,
     ResidentLifecycleSandbox,
     StoppableLifecycleSandbox,
+    RuntimeUpgradeControl,
     StoppedReplacementControl,
     RetentionSweeperConfig,
     SandboxInfo,
@@ -116,6 +117,7 @@ from space_smoke.drain_gate import DrainGateAssertions
 from space_smoke.rate_limiters import RateLimiterAssertions
 from space_smoke.sandbox_network_isolation import SandboxNetworkIsolationAssertions
 from space_smoke.storage_exchange import StorageExchangeScopingAssertions
+from space_smoke.runtime_upgrade import RuntimeUpgradeAssertions
 from space_smoke.stopped_replacement import StoppedReplacementAssertions
 from space_smoke.telemetry_delivery import TelemetryDeliveryAssertions
 from space_smoke.leader_election import LeaderElectionAssertions
@@ -888,6 +890,7 @@ class CommandSandboxFixture:
     _local_cleanup_control: ColdEvictionControl | None = None
     _encrypted_resuspend_control: EncryptedResuspendControl | None = None
     _stopped_replacement_control: StoppedReplacementControl | None = None
+    _runtime_upgrade_control: RuntimeUpgradeControl | None = None
     _processes: ProcessSandbox | None = None
 
     fixture_name: ClassVar[str] = "command_sandbox"
@@ -933,6 +936,21 @@ class CommandSandboxFixture:
         return StoppedReplacementAssertions(
             self, self._stopped_replacement_control, self._context.scope
         )
+
+    @property
+    def runtime_upgrade(self) -> RuntimeUpgradeAssertions:
+        """Scope the runtime-upgrade settings, catalog and policy; judge pod runtime upgrades.
+
+        Each access builds fresh assertions that own the scenario's
+        compensations, so a scenario takes it once.
+        """
+
+        if self._runtime_upgrade_control is None or self._stoppable_lifecycle is None:
+            raise SmokeConfigurationError(
+                "runtime upgrade control is only available on the kind backend with a "
+                "stop/start lifecycle"
+            )
+        return RuntimeUpgradeAssertions(self, self._runtime_upgrade_control, self._context.scope)
 
     def phase(self, name: str) -> AbstractContextManager[None]:
         return self._context.phase(name)

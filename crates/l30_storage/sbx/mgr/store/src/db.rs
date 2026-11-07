@@ -347,6 +347,12 @@ fn describe_raw_error(error: &rusqlite::Error) -> String {
     }
 }
 
+/// `n` comma-separated positional placeholders (`?, ?, ?`) for an `IN` list
+/// of bound values.
+pub(crate) fn sql_placeholders(n: usize) -> String {
+    std::iter::repeat_n("?", n).collect::<Vec<_>>().join(", ")
+}
+
 pub(crate) fn immediate_transaction(conn: &Connection) -> Result<Transaction<'_>> {
     Transaction::immediate(conn)
 }
@@ -536,6 +542,14 @@ fn delete_sandbox_child_rows(tx: &Connection, id: &str) -> Result<()> {
     )?;
     tx.execute(
         "DELETE FROM sandbox_runtime_upgrade_outcomes WHERE sandbox_id = ?1",
+        params![id],
+    )?;
+    tx.execute(
+        "DELETE FROM sandbox_runtime_upgrade_refused_pods WHERE sandbox_id = ?1",
+        params![id],
+    )?;
+    tx.execute(
+        "DELETE FROM sandbox_runtime_upgrade_pod_outcomes WHERE sandbox_id = ?1",
         params![id],
     )?;
     Ok(())

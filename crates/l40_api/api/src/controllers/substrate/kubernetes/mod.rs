@@ -1288,11 +1288,13 @@ mod execution;
 mod node_sync;
 mod per_sandbox_setup;
 mod pod_ops;
+mod pod_runtime_upgrade;
 mod pool;
 mod restore_intent;
 mod runtime_upgrade;
 #[cfg(test)]
 pub(crate) mod scripted_test_doubles;
+mod stopped_evacuation;
 mod support;
 #[cfg(any(test, feature = "test-hooks"))]
 mod test_substrate;
@@ -1306,5 +1308,9 @@ pub use node_sync::SyncNodeInventoryError;
 use pod_ops::ExecutionHydrationOutcome;
 use pod_ops::{ActivationAttemptAssignment, PodMaterializationOwnership, StartedRecoveryOwnership};
 use restore_intent::{RestoreClaimMode, RestoreIntent, RestorePodPlacement};
+pub use stopped_evacuation::{
+    LeftoverStoppedUpgrade, StoppedEvacuationOpening, leftover_stopped_upgrade,
+    open_stopped_evacuation,
+};
 #[cfg(any(test, feature = "test-hooks"))]
 pub use test_substrate::{TEST_SANDBOX_NAMESPACE, retire_executions_predating_current_stop};

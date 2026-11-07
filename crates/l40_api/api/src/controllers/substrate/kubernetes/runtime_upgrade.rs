@@ -2,35 +2,54 @@
 //!
 //! [`KubernetesSubstrate::activation_runtime_upgrade`] reads the policy, the
 //! sandbox's recorded execution and the environment catalog, and turns
-//! [`decide`]'s plan into the `WakeRequest.runtime_upgrade` the activation's
-//! Wake carries. Placement doesn't change: a restore pod placed on the node
-//! that holds the sandbox's checkpoint upgrades it there, and one placed
-//! elsewhere receives the checkpoint's storage URI in the Wake's start context,
-//! from which the node stages the disk before it upgrades it. A stopped
-//! sandbox's pod is bound to the node holding its disk, as for any start.
+//! [`decide`]'s plan into the [`PodUpgrade`] the activation's pod carries
+//! (`pod_runtime_upgrade.rs`): its shim runs the upgrade at container create,
+//! and the activation's Wake carries none. Placement doesn't change: a
+//! restore pod placed on the node that holds the sandbox's checkpoint
+//! upgrades it there, and one placed elsewhere carries the checkpoint's
+//! storage URI, from which the node stages the checkpoint before it upgrades
+//! it. A stopped sandbox's pod is bound to the node holding its disk, as for
+//! any start.
 
 use super::KubernetesSubstrate;
+use super::pod_runtime_upgrade::PodUpgrade;
 use crate::controllers::substrate::SubstrateError;
 use crate::controllers::substrate::runtime_upgrade::{
-    RuntimePlan, UpgradeActivation, attribute, decide, stranded_error,
+    EnvironmentMove, RuntimePlan, UpgradeActivation, attribute, decide, stranded_error,
 };
-use pplx_space_common_core::types::SandboxId;
+use pplx_space_common_core::kubernetes::PodRuntimeUpgradeTargetState;
+use pplx_space_common_core::types::{LocalArtifactId, SandboxId};
 use pplx_space_runtime_environment_policy_store::RuntimeEnvironmentState;
 
 impl KubernetesSubstrate {
-    /// The runtime upgrade an activation of `sandbox_id` asks the node for,
-    /// or `None` to start or restore as recorded. A stranded sandbox is
-    /// refused. `restore_storage_uri` is the restore's selected checkpoint,
-    /// when it has one.
+    /// The runtime upgrade an activation of `sandbox_id` renders on its pod,
+    /// leaving the sandbox started, or `None` to start or restore as
+    /// recorded. A stranded sandbox is refused. `restore_storage_uri` is the
+    /// restore's selected checkpoint, when it has one.
     pub(super) async fn activation_runtime_upgrade(
         &self,
         sandbox_id: SandboxId,
         activation: UpgradeActivation,
         restore_storage_uri: Option<&str>,
-    ) -> Result<Option<pplx_space_sbx_mgr_client::proto::WakeRuntimeUpgrade>, SubstrateError> {
+    ) -> Result<Option<PodUpgrade>, SubstrateError> {
         if !self.k8s.runtime_upgrade_at_activation.is_enabled() {
             return Ok(None);
         }
+        Ok(self
+            .decide_runtime_upgrade(sandbox_id, activation, restore_storage_uri)
+            .await?
+            .map(|decided| decided.pod_upgrade(sandbox_id, PodRuntimeUpgradeTargetState::Started)))
+    }
+
+    /// [`Self::activation_runtime_upgrade`]'s decision, whatever the
+    /// activation setting: the move and the upgrade that makes it, or `None`
+    /// to stay on the recorded environment. A stranded sandbox is refused.
+    pub(super) async fn decide_runtime_upgrade(
+        &self,
+        sandbox_id: SandboxId,
+        activation: UpgradeActivation,
+        restore_storage_uri: Option<&str>,
+    ) -> Result<Option<DecidedUpgrade>, SubstrateError> {
         let policy = self
             .runtime_policy
             .get(|| self.store.runtime_environment_policy())
@@ -93,21 +112,64 @@ impl KubernetesSubstrate {
         record(sandbox_id, activation, plan);
         match plan {
             RuntimePlan::AsRecorded | RuntimePlan::RestoreOnDefault(_) => Ok(None),
-            RuntimePlan::ColdBootUpgrade(to_default) => {
-                let upgrade = to_default.wake_upgrade(
-                    sandbox_id,
-                    activation,
-                    &recorded.subject,
-                    recorded.local_artifact_id,
-                );
-                tracing::info!(
-                    sandbox_id = %sandbox_id,
-                    operation_id = %upgrade.operation_id,
-                    "waking the sandbox by its runtime upgrade"
-                );
-                Ok(Some(upgrade))
-            }
+            RuntimePlan::ColdBootUpgrade(to_default) => Ok(Some(DecidedUpgrade {
+                movement: to_default,
+                activation,
+                subject: recorded.subject,
+                checkpoint: recorded.local_artifact_id,
+            })),
             RuntimePlan::Stranded(to_default) => Err(stranded_error(sandbox_id, to_default)),
+        }
+    }
+}
+
+/// A cold-boot upgrade [`KubernetesSubstrate::decide_runtime_upgrade`] chose.
+#[derive(Clone, Debug)]
+pub(super) struct DecidedUpgrade {
+    pub(super) movement: EnvironmentMove,
+    pub(super) activation: UpgradeActivation,
+    /// What is booted: the checkpoint for a restore, the recorded execution
+    /// for a start. It names the operation.
+    pub(super) subject: String,
+    /// The local artifact of the checkpoint a restore was decided from,
+    /// which the node must find pinned to boot it.
+    pub(super) checkpoint: Option<LocalArtifactId>,
+}
+
+impl DecidedUpgrade {
+    /// The upgrade as `sandbox_id`'s pod renders it, leaving the sandbox in
+    /// `target_state`. Each target state is its own operation (see
+    /// [`EnvironmentMove::stay_stopped_operation_id`]); every retry of one
+    /// names the same operation under the same authorization.
+    pub(super) fn pod_upgrade(
+        &self,
+        sandbox_id: SandboxId,
+        target_state: PodRuntimeUpgradeTargetState,
+    ) -> PodUpgrade {
+        let operation_id = match target_state {
+            PodRuntimeUpgradeTargetState::Started => {
+                self.movement
+                    .operation_id(sandbox_id, self.activation, &self.subject)
+            }
+            PodRuntimeUpgradeTargetState::Stopped => self
+                .movement
+                .stay_stopped_operation_id(sandbox_id, &self.subject),
+        };
+        let authorization = self.movement.authorization(self.activation);
+        tracing::info!(
+            sandbox_id = %sandbox_id,
+            %operation_id,
+            target_state = target_state.as_str(),
+            "booting the sandbox's pod through its runtime upgrade"
+        );
+        PodUpgrade {
+            operation_id,
+            target: self.movement.to,
+            authorization_id: authorization.authorization_id,
+            authorization_reason: authorization.reason,
+            memory_loss: authorization.memory_loss,
+            target_state,
+            checkpoint_local_artifact_id: self.checkpoint,
         }
     }
 }
@@ -115,10 +177,7 @@ impl KubernetesSubstrate {
 /// No recorded execution attributes the sandbox to a catalog environment. The
 /// node's execution policy still refuses a runtime that may not execute; this
 /// only means the control plane can't move it first.
-fn unattributed(
-    sandbox_id: SandboxId,
-    activation: UpgradeActivation,
-) -> Option<pplx_space_sbx_mgr_client::proto::WakeRuntimeUpgrade> {
+fn unattributed<T>(sandbox_id: SandboxId, activation: UpgradeActivation) -> Option<T> {
     tracing::info!(
         sandbox_id = %sandbox_id,
         activation = activation.as_str(),

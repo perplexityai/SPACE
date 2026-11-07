@@ -31,6 +31,10 @@ pub enum StatePageRow {
 }
 
 pub struct DecodedStateRow {
+    /// The row as the node publishes it: while a runtime upgrade fences the
+    /// sandbox, its `execution_metadata` is the execution the upgrade
+    /// restores on a rollback, not the target its boot saved (see
+    /// `fenced_runtime_upgrade_publications`).
     pub row: SandboxRow,
     /// `None` when the batch read no provenance for this id.
     pub route_provenance: Option<Result<ActivationRouteProvenance>>,
@@ -75,6 +79,8 @@ pub enum StatePageError {
     PinnedArtifactCreatedAt(Error),
     #[error("load quarantine recovery observations: {0}")]
     RecoveryObservations(Error),
+    #[error("load runtime upgrade fences: {0}")]
+    RuntimeUpgrades(Error),
 }
 
 /// Read one batch of `ids` for the State RPC, charging `budgets`.
@@ -149,17 +155,24 @@ pub fn state_page(
             .map_err(StatePageError::PinnedArtifactCreatedAt)?;
     let mut recovery_observations = crate::db::quarantine_recovery_observations(conn, &row_ids)
         .map_err(StatePageError::RecoveryObservations)?;
+    let mut fenced_publications = crate::db::fenced_runtime_upgrade_publications(conn, &row_ids)
+        .map_err(StatePageError::RuntimeUpgrades)?;
     Ok(page
         .into_iter()
         .map(|entry| match entry {
             PageEntry::Done(row) => *row,
-            PageEntry::Row(row) => StatePageRow::Decoded(Box::new(DecodedStateRow {
+            PageEntry::Row(mut row) => StatePageRow::Decoded(Box::new(DecodedStateRow {
                 route_provenance: route_provenance.remove(&row.id),
                 publication: publications.remove(&row.id),
                 state_changed_at: state_changed_at.remove(&row.id),
                 pinned_artifact_created_at: pinned_artifact_created_at.remove(&row.id),
                 recovery_observation: recovery_observations.remove(&row.id),
-                row: *row,
+                row: {
+                    if let Some(previous) = fenced_publications.remove(&row.id) {
+                        row.execution_metadata = Some(previous);
+                    }
+                    *row
+                },
             })),
         })
         .collect())

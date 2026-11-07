@@ -732,19 +732,7 @@ impl KubernetesSubstrate {
             RetireStopRoute::Node => {
                 let node_name =
                     node_name.ok_or_else(|| "the execution names no node".to_string())?;
-                let target = NodeApiTarget {
-                    managed_by: SpaceNodeManagedBy::Kubernetes,
-                    role: SpaceNodeRole::Worker,
-                    direct_endpoint: None,
-                    substrate_node_id: Some(node_name),
-                };
-                let endpoint_addr = self
-                    .try_resolve_node_api_endpoint(&target)
-                    .map_err(|error| format!("no node-api on node {node_name} ({error})"))?;
-                let client = Self::worker_client_at(&endpoint_addr, connect_timeout)
-                    .await
-                    .ok_or_else(|| format!("node-api at {endpoint_addr} unreachable"))?;
-                Ok((endpoint_addr, client))
+                self.node_worker_client(node_name).await
             }
         }
     }

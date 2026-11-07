@@ -48,7 +48,10 @@ fn contention_response(error: &sqlx::Error) -> Option<Response> {
 /// `Response` rather than `support`'s tuple. See
 /// `support::require_managing_org_admin` for why the contention arm classifies
 /// and why it is `ReadOnly`.
-async fn require_managing_org_admin(state: &AppState, actor: &User) -> Result<(), Box<Response>> {
+pub(super) async fn require_managing_org_admin(
+    state: &AppState,
+    actor: &User,
+) -> Result<(), Box<Response>> {
     match is_managing_org_admin(&state.pool, actor).await {
         Ok(true) => Ok(()),
         Ok(false) => Err(Box::new(api_error(

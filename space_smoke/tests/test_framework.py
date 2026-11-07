@@ -188,6 +188,7 @@ runpy.run_module("space_smoke", run_name="__main__")
                 "native.m1_generated_sdk_conformance",
                 "native.network_policy_live_update",
                 "native.resident_pause",
+                "native.runtime_upgrade_stopped_and_start",
                 "native.stopped_restart_preserves_rootfs",
                 "native_concurrency.command_idempotency",
                 "native_concurrency.create_idempotency",
@@ -258,6 +259,7 @@ runpy.run_module("space_smoke", run_name="__main__")
             ("ecw", "local", "native", "native_concurrency", "native_contract",
              "native_recovery", "network_policy", "node")
         )
+
 
     def test_external_scenario_package_extends_the_public_inventory(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

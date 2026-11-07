@@ -102,6 +102,33 @@ pub async fn restore_source_plan(
     ))
 }
 
+/// The Kubernetes node name registered for the node holding a row's local
+/// disk, `active_node_id`, for a caller that may act on that disk only where
+/// the placement record says it is. `None` when no row exists, the row holds
+/// no node, that node registered no Kubernetes node name (`node_k8s`, written
+/// at node registration), or a re-placement has chosen a different target.
+///
+/// Unlike [`restore_source_plan`], it never falls back to the newest execution
+/// that named a node, and it reads `active_node_id` alone rather than
+/// `COALESCE(target_node_id, active_node_id)`: a chosen target holds no local
+/// copy until the re-placement lands, and an execution's node is history, not
+/// where the disk is now.
+pub async fn disk_pin_node_name(
+    executor: impl PgExecutor<'_>,
+    sandbox_id: SandboxId,
+) -> Result<Option<String>, sqlx::Error> {
+    sqlx::query_scalar(sql!(
+        "SELECT nk.k8s_node_name
+           FROM sandboxes s
+           JOIN node_k8s nk ON nk.node_id = s.active_node_id
+          WHERE s.id = $1
+            AND (s.target_node_id IS NULL OR s.target_node_id = s.active_node_id)"
+    ))
+    .bind(sandbox_id)
+    .fetch_optional(executor)
+    .await
+}
+
 /// The disk artifact [`stopped_evacuation_restore_source`] selects: the
 /// storage location's connection string, unvalidated, and the row's pinned
 /// artifact id.
