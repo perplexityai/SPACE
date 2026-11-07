@@ -1007,7 +1007,7 @@ fn fork_operation_input<'a>(
         org_id: input.org_id,
         actor_user_id: input.actor_user_id,
         api_product: ApiProduct::Native,
-        kind: OperationKind::ForkSandbox,
+        kind: OperationKind::ForkSandbox.into(),
         target_type: Some(OperationTargetType::Sandbox),
         target_id: Some(&prepared.source_id),
         payload_json: prepared.payload_json.clone(),

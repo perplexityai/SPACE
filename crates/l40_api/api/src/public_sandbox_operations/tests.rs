@@ -26,7 +26,7 @@ fn claimed_create_operation() -> ClaimedPublicOperation {
         org_id: OrgId::new(),
         actor_user_id: Some(UserId::new()),
         api_product: ApiProduct::Native,
-        kind: OperationKind::CreateSandbox,
+        kind: OperationKind::CreateSandbox.into(),
         target_type: None,
         target_id: None,
         payload: serde_json::json!({}),
@@ -48,7 +48,7 @@ fn claimed_create_operation_for(
         org_id,
         actor_user_id: Some(actor_user_id),
         api_product: ApiProduct::Native,
-        kind: OperationKind::CreateSandbox,
+        kind: OperationKind::CreateSandbox.into(),
         target_type: None,
         target_id: Some(public_sandbox_id.to_string()),
         payload: CreateSandboxOperationPayload {
@@ -761,7 +761,7 @@ async fn seed_unpinned_create_operation(pool: &PgPool) -> ClaimedPublicOperation
         org_id,
         actor_user_id: Some(actor_user_id),
         api_product: ApiProduct::Native,
-        kind: OperationKind::CreateSandbox,
+        kind: OperationKind::CreateSandbox.into(),
         target_type: Some(OperationTargetType::Sandbox),
         target_id: Some(sandbox_id.to_string()),
         payload: CreateSandboxOperationPayload {
@@ -1417,7 +1417,7 @@ fn claimed_delete_operation(
         org_id,
         actor_user_id,
         api_product,
-        kind: OperationKind::DeleteSandbox,
+        kind: OperationKind::DeleteSandbox.into(),
         target_type: Some(OperationTargetType::Sandbox),
         target_id: Some(public_sandbox_id.to_string()),
         payload: serde_json::to_value(SandboxLifecycleOperationPayload {

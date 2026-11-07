@@ -1,12 +1,28 @@
 //! What a restore through the shared executor decides differently for the
-//! user restore and wake paths and for the node drain's evacuation, built
-//! once when the restore is asked for.
+//! user restore and wake paths, for the node drain's evacuation, and for the
+//! drain restore operation, built once when the restore is asked for.
 
 use super::RestoreSnapshotChoice;
 use super::execution::WakeTarget;
 use crate::controllers::substrate::RecoveryCharge;
 use pplx_space_common_core::kubernetes::EvacuationPlacement;
 use pplx_space_common_core::types::SandboxLifecycle;
+use pplx_space_sandbox_store::drain_restore::DrainRestoreTarget;
+use uuid::Uuid;
+
+/// The restore a drain restore operation asks for: the lifecycle it lands
+/// the sandbox in, the suspend snapshot it restores, and the restore lease it
+/// claims under.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DrainRestore {
+    pub target: DrainRestoreTarget,
+    /// S, the snapshot the drain's suspend left. The claim takes the row only
+    /// while the restore selector would load it.
+    pub snapshot_id: Uuid,
+    /// The lease token every attempt of the operation claims under, so the
+    /// operation can revert an episode an earlier attempt left.
+    pub restore_lease_token: Uuid,
+}
 
 /// How a restore claims the sandbox row, and what it does when the claim is
 /// taken.
@@ -31,6 +47,13 @@ pub(super) enum RestoreClaimMode {
     /// target may take. It joins nothing and fails fast: the drain owns its
     /// retry loop.
     EvacuationMarker,
+    /// The drain restore operation's claim
+    /// (`begin_drain_restore_lifecycle`): a `suspended` row whose restore
+    /// selector loads the snapshot, or a `restoring` row in the same
+    /// target's episode whose lease has lapsed. It opens or takes back an
+    /// episode under the operation's lease, joins nothing and fails fast: the
+    /// operation owns its retries.
+    DrainOperation(DrainRestore),
 }
 
 impl RestoreClaimMode {
@@ -138,6 +161,20 @@ impl RestoreIntent {
             coalesces: false,
             owner_commits_started: false,
             redrives_started_recovery: false,
+        }
+    }
+
+    /// The drain restore operation's restore, placed as the drain's
+    /// evacuation is ([`Self::drain`]) and exempt from the charge. Its caller
+    /// commits the target.
+    pub(super) fn drain_operation(
+        cohort: Option<EvacuationPlacement>,
+        restore: DrainRestore,
+    ) -> Self {
+        Self {
+            target: WakeTarget::Explicit(restore.target.lifecycle()),
+            claim: RestoreClaimMode::DrainOperation(restore),
+            ..Self::drain(cohort, restore.target.lifecycle())
         }
     }
 

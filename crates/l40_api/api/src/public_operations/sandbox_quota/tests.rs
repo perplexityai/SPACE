@@ -593,7 +593,7 @@ fn native_create<'a>(
         org_id,
         actor_user_id: Some(actor_id),
         api_product: ApiProduct::Native,
-        kind: OperationKind::CreateSandbox,
+        kind: OperationKind::CreateSandbox.into(),
         target_type: Some(OperationTargetType::Sandbox),
         target_id: Some(target_id),
         payload_json: serde_json::json!({}),

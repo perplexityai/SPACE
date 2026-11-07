@@ -564,7 +564,11 @@ const _: () = assert!(
 
 impl InlineExecutor for NativeInlineExecutor {
     fn execute(&self, operation: ClaimedPublicOperation) -> InlineExecution {
-        match NativeExecutorKind::for_kind(operation.kind) {
+        match operation
+            .kind
+            .as_public()
+            .and_then(NativeExecutorKind::for_kind)
+        {
             Some(NativeExecutorKind::Create) => InlineExecutor::execute(&self.create, operation),
             Some(NativeExecutorKind::Lifecycle) => {
                 InlineExecutor::execute(&self.lifecycle, operation)

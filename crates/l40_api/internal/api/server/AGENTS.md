@@ -39,8 +39,8 @@ table (`node_direct`, `sandbox_direct_route_*`), read the
   rows with no `active_node_id` are fenced by the latest execution.
 - New restoring-to-target convergence leaves alone rows with
   `evacuation_restore_target` set, which the node-drain redrive owns, and rows
-  with `restore_episode_target` set, which nothing re-drives yet except a
-  user's restore on Direct. It clears
+  with `restore_episode_target` set, which the drain restore operation
+  re-drives (a `stopped` one only a user's restore on Direct does). It clears
   `restore_episode_target` on the rows it moves.
 - New certification columns advance only on the server's own verdict.
   `node_status_snapshots.local_backup_inventory_reported_at` is also

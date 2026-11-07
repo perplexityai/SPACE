@@ -1241,6 +1241,46 @@ impl KubernetesSubstrate {
         .map(|_| ())
     }
 
+    /// The drain restore operation's restore of a sandbox a forced drain
+    /// suspended, toward `restore.target`, placed as the drain's evacuation
+    /// is ([`Self::restore_evacuated_execution`]). Once the node reached the
+    /// target, it lands the row there under the claim's lease
+    /// ([`K8sStore::complete_drain_restore`]) and returns whether that moved
+    /// it. A claim it cannot take fails with `EvacuationClaimLost`.
+    pub async fn restore_drained_execution(
+        &self,
+        metric_identity: pplx_space_metrics::sandbox::api::SandboxApiMetricIdentity,
+        sandbox_id: SandboxId,
+        options: ActivationOptions,
+        placement: Option<&EvacuationPlacement>,
+        restore: DrainRestore,
+    ) -> Result<bool, SubstrateError> {
+        self.restore_execution_inner(
+            metric_identity,
+            sandbox_id,
+            options,
+            RestoreIntent::drain_operation(placement.cloned(), restore),
+        )
+        .await?;
+        self.store.complete_drain_restore(sandbox_id, restore).await
+    }
+
+    /// End an episode a drain restore operation left open under its lease, as
+    /// a failed restore's cleanup does: back to `suspended`, retiring the
+    /// execution the episode created when the snapshot it restores from
+    /// still proves the revert safe. A row another writer moved on, or one
+    /// under another lease, is left alone.
+    pub async fn revert_drain_restore_episode(&self, sandbox_id: SandboxId, restore: DrainRestore) {
+        self.revert_failed_restore_claim(
+            sandbox_id,
+            RestoreClaim::FreshFromSuspended {
+                restore_lease_token: Some(restore.restore_lease_token),
+            },
+            None,
+        )
+        .await;
+    }
+
     /// Shared lifecycle bookkeeping for both [`SubstrateAdapter::restore_execution`]
     /// (user-API restore, [`RestoreIntent::user`]) and
     /// [`Self::restore_evacuated_execution`] (cluster-controller drain
@@ -1300,6 +1340,11 @@ impl KubernetesSubstrate {
                 RestoreClaimMode::UserLease { .. } => {
                     self.store.begin_restore_lifecycle(sandbox_id, false).await
                 }
+                RestoreClaimMode::DrainOperation(restore) => {
+                    self.store
+                        .begin_drain_restore_lifecycle(sandbox_id, restore)
+                        .await
+                }
             };
             match claim {
                 Ok(restore_claim) => break restore_claim,
@@ -1350,6 +1395,16 @@ impl KubernetesSubstrate {
             self.release_rejected_restore_claim(sandbox_id, restore_claim)
                 .await;
             return Err(err);
+        }
+        // Holds a claimed drain restore before any node work, so a test can
+        // act while the episode is open.
+        #[cfg(feature = "test-hooks")]
+        if matches!(intent.claim, RestoreClaimMode::DrainOperation(_))
+            && let Some(hold) =
+                pplx_space_common_core::env::test_hook_var("SPACE_DRAIN_RESTORE_TEST_HOLD_SECS")
+                    .and_then(|secs| secs.parse::<u64>().ok())
+        {
+            tokio::time::sleep(Duration::from_secs(hold)).await;
         }
         let sandbox = self.store.require_sandbox(sandbox_id).await?;
         let activation = self

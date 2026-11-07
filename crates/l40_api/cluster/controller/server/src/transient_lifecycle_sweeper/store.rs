@@ -598,9 +598,10 @@ impl SweepSink for SubstrateSweepSink {
     /// `restoring` rows with a non-NULL `evacuation_restore_target` or
     /// `restore_episode_target` are exempt. Node-drain's restore sweep owns
     /// re-driving rows with the marker, which legitimately run for the
-    /// evacuate-timeout window; nothing re-drives a row with a restore episode
-    /// target yet except a user's restore on Direct, whose claim ignores the
-    /// target. A marked `suspending` row is exempt only while its current
+    /// evacuate-timeout window; the drain restore operation re-drives a row
+    /// with a `started` or `paused` restore episode target, and nothing
+    /// re-drives a `stopped` one yet except a user's restore on Direct, whose
+    /// claim ignores the target. A marked `suspending` row is exempt only while its current
     /// suspend snapshot is still recoverable (`creating` or `ready`); once
     /// that snapshot terminalizes `failed` (or never existed) the backstop
     /// lists it, because nothing else recovers a crashed/hung suspend with no

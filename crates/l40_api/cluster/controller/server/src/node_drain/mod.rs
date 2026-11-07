@@ -917,10 +917,7 @@ impl ReconcilerConfig {
                 }),
             restore_backoff_base: default.restore_backoff_base,
             restore_backoff_cap: default.restore_backoff_cap,
-            drain_evacuation_placement: env_evacuation_placement(
-                env,
-                "SPACE_CLUSTER_CONTROLLER_DRAIN_EVACUATION_COHORT_VALUE",
-            ),
+            drain_evacuation_placement: drain_evacuation_placement(env),
         }
     }
 
@@ -937,6 +934,18 @@ impl ReconcilerConfig {
             && self.termination_blocking_gate
             && self.replace_stopped_evacuations
     }
+}
+
+/// The cohort evacuated sandboxes are restored into, when a node-group
+/// rollout names one: the drain's own restore sweep and the drain restore
+/// operation place by the same setting.
+pub(crate) fn drain_evacuation_placement(
+    env: &dyn pplx_space_common_core::env::Environment,
+) -> Option<EvacuationPlacement> {
+    env_evacuation_placement(
+        env,
+        "SPACE_CLUSTER_CONTROLLER_DRAIN_EVACUATION_COHORT_VALUE",
+    )
 }
 
 /// Parse a target-cohort placement from a `(cohort_key, cohort_value)` pair

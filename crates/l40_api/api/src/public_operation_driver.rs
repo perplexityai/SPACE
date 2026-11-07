@@ -18,6 +18,7 @@ use crate::public_operations::{
     ApiProduct, ClaimedPublicOperation, CompleteClaimedPublicOperation, ExpirePublicOperation,
     FailClaimedPublicOperation, OverdueQueuedPublicOperations, PublicOperationRequeueReason,
     PublicOperationStore, PublicOperationStoreError, ReleaseClaimedPublicOperation, ReleasedClaim,
+    StoredOperationKind,
 };
 use crate::public_sandbox_operations::PublicOperationExecutionResult;
 use crate::retry_deferral::RetryDeferral;
@@ -63,7 +64,7 @@ fn m1_deadline_message(max_age_seconds: u64) -> String {
 /// before it ran, with the reason a deadline failure carries.
 fn m1_expiry(
     operation_id: OperationId,
-    kind: OperationKind,
+    kind: StoredOperationKind,
     attempts: i32,
     max_age: Duration,
 ) -> ExpirePublicOperation {
@@ -74,7 +75,7 @@ fn m1_expiry(
         terminal_error_code: PublicErrorCode::OperationFailed,
         terminal_error_json: serde_json::json!({
             "operation_id": operation_id.to_string(),
-            "kind": kind.as_str(),
+            "kind": kind.public_kind().as_str(),
             "reason": "operation_deadline_exceeded",
             "max_age_seconds": max_age_seconds,
             "attempts": attempts,
@@ -82,8 +83,11 @@ fn m1_expiry(
     }
 }
 
-fn expires_unrun(api_product: ApiProduct, kind: OperationKind) -> bool {
-    api_product == ApiProduct::Native && NATIVE_M1_EXPIRING_KINDS.contains(&kind)
+fn expires_unrun(api_product: ApiProduct, kind: StoredOperationKind) -> bool {
+    api_product == ApiProduct::Native
+        && kind
+            .as_public()
+            .is_some_and(|kind| NATIVE_M1_EXPIRING_KINDS.contains(&kind))
 }
 
 /// The root span of one claimed attempt of an operation, linked to the
@@ -485,11 +489,38 @@ where
             }
             updated.then_some(ExecutionOutcome::Failed)
         }
+        // An executor that found its work superseded. Only the drain restore's
+        // returns this.
+        OperationState::Canceled => {
+            let terminal_error_code = result
+                .terminal_error_code
+                .unwrap_or(PublicErrorCode::OperationFailed);
+            let updated = store
+                .cancel_claimed_operation(FailClaimedPublicOperation {
+                    claim_token,
+                    operation_id,
+                    progress_message: result.progress_message,
+                    terminal_error_code,
+                    terminal_error_json: result
+                        .terminal_error_json
+                        .unwrap_or_else(|| serde_json::json!({})),
+                })
+                .await?;
+            if updated {
+                report.canceled += 1;
+                pplx_space_metrics::operations::completed_by(
+                    api_product_label,
+                    kind.as_str(),
+                    OperationState::Canceled.as_str(),
+                    executor,
+                );
+            }
+            updated.then_some(ExecutionOutcome::Canceled)
+        }
         // Executors only produce the known states; an `Other` here would be a
         // programming error, and releasing the claim is the safe reading.
         OperationState::Queued
         | OperationState::Running
-        | OperationState::Canceled
         | OperationState::Expired
         | OperationState::Other(_) => {
             let supported_requeue = result.state == OperationState::Queued;
@@ -553,7 +584,7 @@ where
                 let terminal_error_json = with_carried_error(
                     serde_json::json!({
                         "operation_id": operation_id.to_string(),
-                        "kind": kind.as_str(),
+                        "kind": kind.public_kind().as_str(),
                         "reason": "operation_deadline_exceeded",
                         "max_age_seconds": max_age_seconds,
                         "last_requeue_reason": last_requeue_reason,
@@ -611,7 +642,7 @@ where
                 let mut terminal_error_json = with_carried_error(
                     serde_json::json!({
                         "operation_id": operation_id.to_string(),
-                        "kind": kind.as_str(),
+                        "kind": kind.public_kind().as_str(),
                         "reason": "retry_attempts_exhausted",
                         "retry_reason": retry_reason,
                         "attempts": attempts,
@@ -739,6 +770,22 @@ where
                         );
                         Some(ExecutionOutcome::Canceled)
                     }
+                    ReleasedClaim::DrainRestoreSuperseded { by } => {
+                        report.canceled += 1;
+                        pplx_space_metrics::operations::completed_by(
+                            api_product_label,
+                            kind.as_str(),
+                            OperationState::Canceled.as_str(),
+                            executor,
+                        );
+                        tracing::info!(
+                            operation_id = %operation_id,
+                            superseding_operation_id = %by,
+                            "drain restore canceled instead of retried: a later user request \
+                             supersedes it"
+                        );
+                        Some(ExecutionOutcome::Canceled)
+                    }
                     ReleasedClaim::Lost => None,
                 }
             }
@@ -773,7 +820,7 @@ pub(crate) fn with_carried_error(
 fn record_lost_claim(
     report: &mut TickReport,
     api_product_label: &str,
-    kind: OperationKind,
+    kind: StoredOperationKind,
     executor: OperationExecutor,
     operation_id: OperationId,
 ) {
@@ -865,7 +912,7 @@ fn retry_budget_exhausted(attempts: i32, max_retry_attempts: i32) -> bool {
 
 /// The Native kinds bound by the M1 deadline while they retry: the kinds
 /// that expire unrun, and a delete.
-fn is_native_m1_terminalized_kind(api_product: ApiProduct, kind: OperationKind) -> bool {
+fn is_native_m1_terminalized_kind(api_product: ApiProduct, kind: StoredOperationKind) -> bool {
     expires_unrun(api_product, kind)
         || (api_product == ApiProduct::Native && kind == OperationKind::DeleteSandbox)
 }

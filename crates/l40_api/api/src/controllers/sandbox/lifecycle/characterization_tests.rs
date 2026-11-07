@@ -975,7 +975,7 @@ async fn native_start_overwrites_a_stopped_written_mid_flight_without_a_retry() 
         org_id: "00000000-0000-0000-0000-000000000001".parse()?,
         actor_user_id: Some("00000000-0000-0000-0000-000000000010".parse()?),
         api_product: ApiProduct::Native,
-        kind: OperationKind::StartSandbox,
+        kind: OperationKind::StartSandbox.into(),
         target_type: None,
         target_id: Some(PublicSandboxId::from(sandbox_id).to_string()),
         payload: SandboxLifecycleOperationPayload {
@@ -1369,7 +1369,7 @@ async fn a_system_wake_operation_runs_only_while_the_policy_allows_its_activity(
         org_id,
         actor_user_id: actor.then(system_wake_caller),
         api_product: ApiProduct::Native,
-        kind: OperationKind::WakeSandbox,
+        kind: OperationKind::WakeSandbox.into(),
         target_type: None,
         target_id: Some(PublicSandboxId::from(sandbox_id).to_string()),
         payload,

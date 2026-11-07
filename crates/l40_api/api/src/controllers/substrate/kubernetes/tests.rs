@@ -16,12 +16,14 @@ pub(crate) use kubernetes_tests::{
     insert_test_sandbox_row, mock_kubernetes_client, node_api_pod_on_node, node_with_network_slots,
     paused_restore_test_subject, running_pod_kubernetes_client,
     running_pod_kubernetes_client_with_create_barrier, sandbox_pod_on_node,
-    start_sequenced_wake_worker, substrate_with_inventory_caches_and_pool, substrate_with_store,
+    start_sequenced_wake_worker, substrate_with_failed_pod_creates,
+    substrate_with_inventory_caches_and_pool, substrate_with_store,
     substrate_with_store_and_client, substrate_with_store_client_pods_and_nodes,
     substrate_with_store_client_proxy_port_and_pod,
     substrate_with_store_client_proxy_port_and_pods, substrate_with_unreachable_store,
 };
 
+mod drain_restore;
 mod native_pod_failover;
 mod runtime_upgrade_dispatch;
 mod substrate_scope;
@@ -4473,7 +4475,9 @@ mod kubernetes_tests {
         Ok(())
     }
 
-    fn substrate_with_failed_pod_creates(pool: PgPool) -> (KubernetesSubstrate, Arc<AtomicUsize>) {
+    pub(crate) fn substrate_with_failed_pod_creates(
+        pool: PgPool,
+    ) -> (KubernetesSubstrate, Arc<AtomicUsize>) {
         let request_count = Arc::new(AtomicUsize::new(0));
         let client = blocking_failed_pod_create_kubernetes_client(
             Arc::clone(&request_count),

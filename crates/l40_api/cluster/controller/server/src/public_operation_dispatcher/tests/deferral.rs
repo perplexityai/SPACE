@@ -508,7 +508,7 @@ async fn native_delete_behind_an_upload(
             org_id,
             actor_user_id: Some(user_id),
             api_product: ApiProduct::Native,
-            kind: OperationKind::DeleteSandbox,
+            kind: OperationKind::DeleteSandbox.into(),
             target_type: Some(OperationTargetType::Sandbox),
             target_id: Some(&target_id),
             payload_json:

@@ -480,7 +480,7 @@ async fn capture_leader_election_spans_both_target_id_forms() {
             org_id,
             actor_user_id: None,
             api_product: crate::public_operations::ApiProduct::Native,
-            kind: pplx_space_public_api::OperationKind::ForkSandbox,
+            kind: pplx_space_public_api::OperationKind::ForkSandbox.into(),
             target_type: Some(pplx_space_public_api::OperationTargetType::Sandbox),
             target_id: Some(claimed_target.clone()),
             payload: payload_json.clone(),

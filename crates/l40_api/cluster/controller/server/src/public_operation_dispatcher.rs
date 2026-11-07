@@ -6,6 +6,8 @@ use async_trait::async_trait;
 use pplx_space_api::cluster_admission::{ClusterSandboxAdmission, ClusterSandboxAdmissionConfig};
 use pplx_space_api::controllers::sandbox::SandboxController;
 use pplx_space_api::controllers::substrate::Substrate;
+#[cfg(feature = "kubernetes")]
+use pplx_space_api::drain_restore_operations::{DrainRestoreOperationExecutor, DrainRestoreRetry};
 use pplx_space_api::egress_profiles::EgressProfiles;
 use pplx_space_api::fork_operation_executor::ForkSandboxOperationExecutor;
 #[cfg(test)]
@@ -21,7 +23,7 @@ pub use pplx_space_api::public_operation_driver::{OperationExecutionResult, Tick
 use pplx_space_api::public_operations::{
     ClaimLimits, ClaimPublicOperations, ClaimedPublicOperation, OrgSlotLimit, PublicOperationClaim,
     PublicOperationRequeueReason, PublicOperationStore, ReleaseClaimedPublicOperation,
-    ReleasedClaim, TEARDOWN_KINDS,
+    ReleasedClaim, StoredOperationKind,
 };
 use pplx_space_api::public_sandbox_operations::{
     CreateSandboxOperationExecutor, SandboxLifecycleOperationExecutor,
@@ -87,6 +89,11 @@ const HELD_BACK_CLAIM_BACKOFF: Duration = Duration::from_millis(250);
 /// in this process becomes claimable again.
 const BUSY_KEY_RETRY_AFTER: Duration = Duration::from_secs(1);
 const KEYED_CLAIM_ENABLED_ENV: &str = "SPACE_PUBLIC_OPERATION_DISPATCHER_KEYED_CLAIM_ENABLED";
+/// The most drain restores that run at once across the cluster. Each holds
+/// an execution slot for a whole restore, so this keeps a forced drain's
+/// restores from taking the slots user work needs.
+const DEFAULT_DRAIN_RESTORE_SLOTS: u32 = 4;
+const DRAIN_RESTORE_SLOTS_ENV: &str = "SPACE_PUBLIC_OPERATION_DISPATCHER_DRAIN_RESTORE_SLOTS";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReconcilerConfig {
@@ -110,6 +117,10 @@ pub struct ReconcilerConfig {
     pub org_slot_headroom: usize,
     /// Kill switch for the keyed work queue: off restores the unkeyed claim.
     pub keyed_claim_enabled: bool,
+    /// The most drain restores that run at once across every dispatcher,
+    /// when the executor runs them ([`PublicOperationExecutor::runs_drain_restores`]).
+    /// 0 claims none.
+    pub drain_restore_slots: u32,
     /// How long the loop waits after a claim that took nothing because work
     /// was held back; see [`HELD_BACK_CLAIM_BACKOFF`]. Not read from the
     /// environment: only tests shorten it.
@@ -134,6 +145,7 @@ impl Default for ReconcilerConfig {
             org_slot_limit: NonZeroU32::new(DEFAULT_ORG_SLOT_LIMIT),
             org_slot_headroom: DEFAULT_ORG_SLOT_HEADROOM as usize,
             keyed_claim_enabled: true,
+            drain_restore_slots: DEFAULT_DRAIN_RESTORE_SLOTS,
             held_back_claim_backoff: HELD_BACK_CLAIM_BACKOFF,
             execution: OperationExecutionConfig::default(),
         }
@@ -190,6 +202,11 @@ impl ReconcilerConfig {
             ) as usize,
             keyed_claim_enabled: config
                 .truthy_default(KEYED_CLAIM_ENABLED_ENV, default.keyed_claim_enabled),
+            drain_restore_slots: config.bounded_u32_allow_zero(
+                DRAIN_RESTORE_SLOTS_ENV,
+                DEFAULT_DRAIN_RESTORE_SLOTS,
+                MAX_EXECUTION_CONCURRENCY as u32,
+            ),
             held_back_claim_backoff: default.held_back_claim_backoff,
             // Shared with inline execution in the API, which must renew,
             // retry and bound an operation as this loop does.
@@ -202,11 +219,30 @@ impl ReconcilerConfig {
 pub trait PublicOperationExecutor: Send + Sync + 'static {
     fn supported_kinds(&self) -> &'static [OperationKind];
 
+    /// Whether this executor runs drain restores
+    /// ([`StoredOperationKind::DrainRestoreSandbox`]), which no client
+    /// requests, so the claim may take them.
+    fn runs_drain_restores(&self) -> bool {
+        false
+    }
+
     async fn execute(
         &self,
         claim_token: &str,
         operation: ClaimedPublicOperation,
     ) -> OperationExecutionResult;
+}
+
+/// What the drain restore executor needs from the process that builds it.
+pub struct DrainRestoreWiring {
+    /// The Kubernetes substrate, bound once by `run_reconcilers`; `None` on
+    /// Direct.
+    #[cfg(feature = "kubernetes")]
+    pub kubernetes:
+        Option<Arc<pplx_space_api::controllers::substrate::kubernetes::KubernetesSubstrate>>,
+    /// The dispatcher's retry budget ([`OperationExecutionConfig`]'s
+    /// `max_retry_attempts`).
+    pub max_attempts: i32,
 }
 
 #[derive(Clone)]
@@ -223,6 +259,8 @@ pub struct NativePublicOperationExecutor {
     sandbox_lifecycle: SandboxLifecycleOperationExecutor,
     delete_template: DeleteTemplateOperationExecutor,
     fork_sandbox: ForkSandboxOperationExecutor,
+    #[cfg(feature = "kubernetes")]
+    drain_restore: DrainRestoreOperationExecutor,
 }
 
 impl NativePublicOperationExecutor {
@@ -233,12 +271,13 @@ impl NativePublicOperationExecutor {
         grant_audience: pplx_space_common_core::types::FederatedGrantAudience,
         tls_interception_exemptions: Option<TlsInterceptionExemptions>,
         egress_profiles: EgressProfiles,
+        drain_restore: DrainRestoreWiring,
     ) -> Result<Self, pplx_space_api_route::ed25519::SpaceApiRouteEd25519Error> {
         let route_ed25519_authority = Arc::new(
             pplx_space_api_route::ed25519::SpaceApiRouteEd25519Authority::load_required_from_env()?,
         );
         Ok(Self::with_cluster_admission(
-            pool,
+            pool.clone(),
             substrate.clone(),
             ClusterSandboxAdmission::with_config(
                 substrate,
@@ -249,7 +288,27 @@ impl NativePublicOperationExecutor {
             grant_audience,
             tls_interception_exemptions,
             egress_profiles,
-        ))
+        )
+        .with_drain_restore(pool, drain_restore))
+    }
+
+    /// Run drain restores as `wiring` says. Until this, an executor fails
+    /// every drain restore, as one built for Direct does.
+    fn with_drain_restore(mut self, pool: PgPool, wiring: DrainRestoreWiring) -> Self {
+        #[cfg(feature = "kubernetes")]
+        {
+            self.drain_restore = DrainRestoreOperationExecutor::new(
+                pool,
+                wiring.kubernetes,
+                crate::node_drain::drain_evacuation_placement(
+                    &pplx_space_common_core::env::ProcessEnvironment,
+                ),
+                DrainRestoreRetry::with_max_attempts(wiring.max_attempts),
+            );
+        }
+        #[cfg(not(feature = "kubernetes"))]
+        let _ = (pool, wiring);
+        self
     }
 
     fn with_cluster_admission(
@@ -276,6 +335,13 @@ impl NativePublicOperationExecutor {
                 controller.clone(),
             ),
             delete_template: DeleteTemplateOperationExecutor::new(pool.clone()),
+            #[cfg(feature = "kubernetes")]
+            drain_restore: DrainRestoreOperationExecutor::new(
+                pool.clone(),
+                None,
+                None,
+                DrainRestoreRetry::with_max_attempts(1),
+            ),
             fork_sandbox: ForkSandboxOperationExecutor::new(pool, substrate, controller),
         }
     }
@@ -315,12 +381,25 @@ impl PublicOperationExecutor for NativePublicOperationExecutor {
         NATIVE_PUBLIC_OPERATION_KINDS
     }
 
+    fn runs_drain_restores(&self) -> bool {
+        cfg!(feature = "kubernetes")
+    }
+
     async fn execute(
         &self,
         claim_token: &str,
         operation: ClaimedPublicOperation,
     ) -> OperationExecutionResult {
-        match operation.kind {
+        let kind = match operation.kind {
+            #[cfg(feature = "kubernetes")]
+            StoredOperationKind::DrainRestoreSandbox => {
+                return self.drain_restore.execute(&operation).await.into();
+            }
+            #[cfg(not(feature = "kubernetes"))]
+            StoredOperationKind::DrainRestoreSandbox => return unhandled(&operation),
+            StoredOperationKind::Public(kind) => kind,
+        };
+        match kind {
             OperationKind::CreateSandbox => self.create_sandbox.execute(&operation).await.into(),
             OperationKind::UpdateSandbox => self.update_sandbox.execute(&operation).await.into(),
             OperationKind::DeleteTemplate => self.delete_template.execute(&operation).await.into(),
@@ -344,20 +423,27 @@ impl PublicOperationExecutor for NativePublicOperationExecutor {
             | OperationKind::RollbackSandbox => {
                 self.sandbox_lifecycle.execute(&operation).await.into()
             }
-            kind => OperationExecutionResult {
-                state: OperationState::Failed,
-                progress_message: format!("operation kind {kind} is not handled"),
-                result_json: None,
-                terminal_error_code: Some(PublicErrorCode::Internal),
-                terminal_error_json: Some(serde_json::json!({
-                    "operation_id": operation.id.to_string(),
-                    "kind": kind.as_str(),
-                    "reason": "unsupported_operation_kind",
-                })),
-                retry_after: None,
-                requeue_reason: PublicOperationRequeueReason::TransientFailure,
-            },
+            OperationKind::CreateSession => unhandled(&operation),
         }
+    }
+}
+
+/// The result for an operation of a kind this executor claims but has no
+/// executor for.
+fn unhandled(operation: &ClaimedPublicOperation) -> OperationExecutionResult {
+    let kind = operation.kind;
+    OperationExecutionResult {
+        state: OperationState::Failed,
+        progress_message: format!("operation kind {kind} is not handled"),
+        result_json: None,
+        terminal_error_code: Some(PublicErrorCode::Internal),
+        terminal_error_json: Some(serde_json::json!({
+            "operation_id": operation.id.to_string(),
+            "kind": kind.public_kind().as_str(),
+            "reason": "unsupported_operation_kind",
+        })),
+        retry_after: None,
+        requeue_reason: PublicOperationRequeueReason::TransientFailure,
     }
 }
 
@@ -505,7 +591,7 @@ pub async fn run<E>(
                             if let Some(key) = &key {
                                 busy_keys.insert(key.clone(), operation.id);
                             }
-                            let is_teardown = TEARDOWN_KINDS.contains(&operation.kind);
+                            let is_teardown = operation.kind.is_teardown();
                             let span = execution_span(&operation);
                             let execution = execute_claimed_operation(
                                 store.clone(),
@@ -632,6 +718,18 @@ async fn hand_back_busy_key(
                 operation_id = %operation.id,
                 delete_operation_id = %delete_id,
                 "public create canceled instead of handed back: a later delete supersedes it"
+            );
+        }
+        Ok(ReleasedClaim::DrainRestoreSuperseded { by }) => {
+            pplx_space_metrics::operations::completed(
+                operation.api_product.as_str(),
+                operation.kind.as_str(),
+                OperationState::Canceled.as_str(),
+            );
+            tracing::info!(
+                operation_id = %operation.id,
+                superseding_operation_id = %by,
+                "drain restore canceled instead of handed back: a later user request supersedes it"
             );
         }
         Ok(ReleasedClaim::Requeued | ReleasedClaim::Lost) => {}
@@ -775,6 +873,11 @@ where
             non_teardown: limit(slots.free_other, total),
             teardown_while_other_due: limit(slots.free_teardown_while_other_due, total),
             per_org_non_teardown: slots.org_slot_limit,
+            drain_restores: if executor.runs_drain_restores() {
+                config.drain_restore_slots
+            } else {
+                0
+            },
         },
         claim_stale_after: config.execution.claim_stale_after,
         claimable_kinds: executor.supported_kinds(),

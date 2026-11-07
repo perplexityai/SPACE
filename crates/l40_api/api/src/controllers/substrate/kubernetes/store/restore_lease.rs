@@ -385,6 +385,67 @@ impl K8sStore {
             .await
     }
 
+    /// The drain restore operation's claim
+    /// ([`pplx_space_sandbox_store::drain_restore::claim_drain_restore`]),
+    /// under the operation's own lease token. A miss is
+    /// `EvacuationClaimLost`, whatever the reason: the operation reads the
+    /// row again before its next attempt and decides from what it finds.
+    pub(in crate::controllers::substrate::kubernetes) async fn begin_drain_restore_lifecycle(
+        &self,
+        sandbox_id: SandboxId,
+        restore: crate::controllers::substrate::kubernetes::DrainRestore,
+    ) -> Result<RestoreClaim, SubstrateError> {
+        let claimed = pplx_space_sandbox_store::drain_restore::claim_drain_restore(
+            &self.pool,
+            sandbox_id,
+            restore.snapshot_id,
+            restore.target,
+            recovery_lease_ttl_secs(),
+            restore.restore_lease_token,
+            super::super::RESTORE_EXECUTION_OWNERSHIP_TTL_SECS,
+        )
+        .await
+        .db_context("failed to begin sandbox drain restore")?;
+        let Some(claimed) = claimed else {
+            return Err(SubstrateError::EvacuationClaimLost {
+                message: format!(
+                    "drain restore claim unavailable for sandbox {sandbox_id}: the row is not \
+                     suspended from the named snapshot, or a restore of it is in flight"
+                ),
+            });
+        };
+        let restore_lease_token = claimed.restore_lease_token;
+        match claimed.lifecycle.as_str() {
+            "suspended" => Ok(RestoreClaim::FreshFromSuspended {
+                restore_lease_token,
+            }),
+            "restoring" => Ok(RestoreClaim::RedroveRestoring {
+                restore_lease_token,
+            }),
+            lifecycle => Err(SubstrateError::Failed {
+                message: format!("drain restore claim returned unexpected lifecycle {lifecycle}"),
+            }),
+        }
+    }
+
+    /// Land a drain restore whose lease `restore_lease_token` holds in its
+    /// target ([`pplx_space_sandbox_store::drain_restore::complete_drain_restore`]).
+    /// Returns whether the row moved.
+    pub(in crate::controllers::substrate::kubernetes) async fn complete_drain_restore(
+        &self,
+        sandbox_id: SandboxId,
+        restore: crate::controllers::substrate::kubernetes::DrainRestore,
+    ) -> Result<bool, SubstrateError> {
+        pplx_space_sandbox_store::drain_restore::complete_drain_restore(
+            &self.pool,
+            sandbox_id,
+            restore.restore_lease_token,
+            restore.target,
+        )
+        .await
+        .db_context("failed to complete sandbox drain restore")
+    }
+
     async fn begin_restore_lifecycle_for(
         &self,
         sandbox_id: SandboxId,

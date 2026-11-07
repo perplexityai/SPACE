@@ -126,7 +126,7 @@ impl PublicOperationExecutor for HeldWork {
         _claim_token: &str,
         operation: ClaimedPublicOperation,
     ) -> OperationExecutionResult {
-        if self.hold_teardowns || !TEARDOWN_KINDS.contains(&operation.kind) {
+        if self.hold_teardowns || !operation.kind.is_teardown() {
             let running = self.running.fetch_add(1, Ordering::SeqCst) + 1;
             self.max_running.fetch_max(running, Ordering::SeqCst);
             self.release.cancelled().await;
@@ -936,7 +936,7 @@ async fn work_run_as_it_was_created_holds_no_slot_under_the_limit() -> TestResul
                 org_id: busy_org,
                 actor_user_id: None,
                 api_product: ApiProduct::Native,
-                kind: OperationKind::CreateSandbox,
+                kind: OperationKind::CreateSandbox.into(),
                 target_type: Some(OperationTargetType::Sandbox),
                 target_id: Some(target_id),
                 payload_json: serde_json::json!({}),

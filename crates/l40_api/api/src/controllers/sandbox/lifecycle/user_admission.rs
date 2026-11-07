@@ -66,3 +66,33 @@ pub(crate) fn admit_user_lifecycle(
 ) -> UserLifecycleAdmission {
     UserLifecycleAdmission::Admitted
 }
+
+/// Whether a user's lifecycle call `action` supersedes a drain restore of
+/// the sandbox, the same rule an operation's kind follows at admission
+/// ([`crate::public_operations::supersedes_drain_restore`]): it changes the
+/// lifecycle, or asks for one.
+pub(crate) fn action_supersedes_drain_restore(action: SandboxAction) -> bool {
+    match action {
+        SandboxAction::Start
+        | SandboxAction::Wake
+        | SandboxAction::ImplicitWake(_)
+        | SandboxAction::Resume
+        | SandboxAction::Restore
+        | SandboxAction::Suspend
+        | SandboxAction::Stop
+        | SandboxAction::Kill
+        | SandboxAction::Pause => true,
+        // A checkpoint answers unavailable on a suspended sandbox without
+        // waking it; the snapshot settings are metadata.
+        SandboxAction::Checkpoint
+        | SandboxAction::EnableSnapshots
+        | SandboxAction::DisableSnapshots => false,
+        // `action` refuses these; a rollback and an update run through their
+        // own operations, whose kinds are judged at admission.
+        SandboxAction::Stats
+        | SandboxAction::OpenPort
+        | SandboxAction::Rollback
+        | SandboxAction::Spaced
+        | SandboxAction::Update => false,
+    }
+}
