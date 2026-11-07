@@ -720,17 +720,18 @@ fn a_row_stuck_in_a_transition_blocks_past_the_bound() {
 }
 
 /// A row counts as unchanged once it has been in one lifecycle for the
-/// bound; a change of lifecycle, or a call that doesn't see the row, starts
-/// it over.
+/// bound under one epoch; a change of lifecycle, a call that doesn't see the
+/// row, or a call under another epoch starts it over.
 #[test]
 fn a_row_is_unchanged_only_after_the_bound_in_one_lifecycle() {
     let actions = DrainActions::default();
     let start = tokio::time::Instant::now();
     let created = [("a".to_owned(), SandboxState::Created)];
     let restoring = [("a".to_owned(), SandboxState::Restoring)];
-    let unchanged = |rows: &[(String, SandboxState)], at: Duration| {
-        actions.unchanged_since_bound(rows, start + at)
+    let unchanged_under = |epoch: u64, rows: &[(String, SandboxState)], at: Duration| {
+        actions.unchanged_since_bound(epoch, rows, start + at)
     };
+    let unchanged = |rows: &[(String, SandboxState)], at: Duration| unchanged_under(7, rows, at);
     let a = BTreeSet::from(["a".to_owned()]);
 
     assert!(unchanged(&created, Duration::ZERO).is_empty());
@@ -747,6 +748,11 @@ fn a_row_is_unchanged_only_after_the_bound_in_one_lifecycle() {
     assert!(
         unchanged(&restoring, SETTLE_BOUND * 3 - Duration::from_secs(1)).is_empty(),
         "a row the last call didn't see starts over"
+    );
+    assert_eq!(unchanged(&restoring, SETTLE_BOUND * 4), a);
+    assert!(
+        unchanged_under(8, &restoring, SETTLE_BOUND * 4).is_empty(),
+        "a new epoch starts the clock again"
     );
 }
 
@@ -1085,6 +1091,34 @@ async fn a_drain_suspend_that_failed_after_its_pause_keeps_the_started_record() 
             sandbox_id: id,
             prior: DrainPrior::Started,
         }]
+    );
+}
+
+/// A caller's suspend of a sandbox the drain holds a record for (an ECW
+/// pause among them) takes it back: the record goes, so the drain reports
+/// it suspended with no prior and nothing restores it started.
+#[tokio::test]
+async fn a_callers_suspend_takes_the_sandbox_back_from_the_drain() {
+    let node_manager = crate::node_manager_transport::fake::FakeNodeManager::default().serve();
+    let conn = crate::db::test_conn();
+    let id = pplx_space_common_core::types::SandboxId::new().to_string();
+    crate::service::tests::service_tests::insert_test_sandbox(&conn, &id, SandboxState::Paused);
+    crate::db::activation_seal::record_drain_suspend(&conn, &id, DrainPrior::Started).unwrap();
+    let service = service_with_node_manager(conn, &node_manager);
+    service.activation_seal.seal(&service.db, 7).unwrap();
+    // Whether the suspend itself lands doesn't matter here.
+    let _ = service
+        .suspend(crate::service::activation_support::internal_request(
+            crate::proto::SuspendRequest {
+                sandbox_id: id.clone(),
+                blocking: true,
+                format: crate::proto::SuspendSnapshotFormat::Unspecified as i32,
+            },
+        ))
+        .await;
+    assert_eq!(
+        crate::db::read::drain_evacuations(&service.db.lock().unwrap()).unwrap(),
+        []
     );
 }
 

@@ -85,6 +85,9 @@ impl DrainAction {
 /// last one's reason.
 pub(super) type DrainFailures = BTreeMap<(String, DrainAction), (u32, String)>;
 
+/// Each row's lifecycle as the drain last saw it, and since when.
+type SeenLifecycles = BTreeMap<String, (SandboxState, tokio::time::Instant)>;
+
 /// The drain's work in flight in this process, by sandbox, and what it
 /// remembers between calls.
 #[derive(Default)]
@@ -93,8 +96,10 @@ pub(super) struct DrainActions {
     /// The failures counted under the epoch they were counted under; a call
     /// under another epoch starts the count again.
     failures: Mutex<(Option<u64>, DrainFailures)>,
-    /// Each row's lifecycle as the drain last saw it, and since when.
-    seen: Mutex<BTreeMap<String, (SandboxState, tokio::time::Instant)>>,
+    /// Each row's lifecycle as the drain last saw it, and since when, under
+    /// the epoch it was seen under; a call under another epoch starts the
+    /// clock again.
+    seen: Mutex<(Option<u64>, SeenLifecycles)>,
 }
 
 impl DrainActions {
@@ -146,14 +151,20 @@ impl DrainActions {
             .retain(|(sandbox_id, _), _| working.contains(sandbox_id));
     }
 
-    /// Note each row's lifecycle at `now`, and answer the rows that have
-    /// been in the same one for [`SETTLE_BOUND`] or longer.
+    /// Note each row's lifecycle at `now` under `epoch`, and answer the rows
+    /// that have been in the same one for [`SETTLE_BOUND`] or longer under
+    /// it.
     fn unchanged_since_bound(
         &self,
+        epoch: u64,
         rows: &[(String, SandboxState)],
         now: tokio::time::Instant,
     ) -> BTreeSet<String> {
-        let mut seen = lock(&self.seen);
+        let mut guard = lock(&self.seen);
+        if guard.0 != Some(epoch) {
+            *guard = (Some(epoch), SeenLifecycles::new());
+        }
+        let seen = &mut guard.1;
         seen.retain(|sandbox_id, _| rows.iter().any(|(id, _)| id == sandbox_id));
         let mut unchanged = BTreeSet::new();
         for (sandbox_id, state) in rows {
@@ -721,9 +732,11 @@ impl SandboxManagerService {
             evacuations,
             running: self.drain_actions.running(),
             failures: self.drain_actions.failures(epoch),
-            unchanged: self
-                .drain_actions
-                .unchanged_since_bound(&lifecycles, tokio::time::Instant::now()),
+            unchanged: self.drain_actions.unchanged_since_bound(
+                epoch,
+                &lifecycles,
+                tokio::time::Instant::now(),
+            ),
         };
         let plan = plan(&rows, &inputs);
         // A failure counts toward the bound only while the drain still works
