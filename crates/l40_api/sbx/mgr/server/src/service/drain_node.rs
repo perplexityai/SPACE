@@ -320,8 +320,7 @@ pub(super) fn plan(
     plan
 }
 
-/// What the scans outside the rows found: orphan recovery and node-manager's
-/// orphan inventory.
+/// What node-manager's orphan inventory found.
 #[derive(Clone, Debug, Default)]
 pub(super) struct DrainScans {
     pub(super) blocked: Vec<(Option<String>, String)>,
@@ -348,8 +347,8 @@ fn dir_sandbox(dir: &str) -> String {
 }
 
 /// The inventory's scanners that can reveal a resident or an artifact: an
-/// untracked runtime process, or a cache or run directory recovery could not
-/// adopt as a row. Their candidates and failures block the drain; every
+/// untracked runtime process, or a cache or run directory no row accounts
+/// for. Their candidates and failures block the drain; every
 /// other scanner's leftovers hold neither, and are ignored.
 const BLOCKING_SCANNERS: [&str; 3] = ["RunDirs", "CacheDirs", "Processes"];
 
@@ -365,17 +364,15 @@ pub(super) fn classify_orphan_page(
             .push(format!("untracked runtime process {process}"));
     }
     for dir in &page.orphaned_cache_dirs {
-        findings.dirs.push((
-            dir_sandbox(dir),
-            format!("orphan cache directory {dir} recovery can't adopt"),
-        ));
+        findings
+            .dirs
+            .push((dir_sandbox(dir), format!("orphan cache directory {dir}")));
     }
     for dir in &page.orphaned_run_dirs {
         if !Path::new(dir).starts_with(gateway_run_root) {
-            findings.dirs.push((
-                dir_sandbox(dir),
-                format!("orphan run directory {dir} recovery can't adopt"),
-            ));
+            findings
+                .dirs
+                .push((dir_sandbox(dir), format!("orphan run directory {dir}")));
         }
     }
     for warning in &page.warnings {
@@ -411,13 +408,15 @@ impl SandboxManagerService {
         }
         self.activation_seal.seal(&self.db, epoch)?;
         let first = self.activation_seal.status();
-        let mut scans = DrainScans::default();
-        self.recover_orphans_for_drain(&mut scans.blocked);
         let orphans = self.read_orphan_inventory().await;
-        scans
-            .blocked
-            .extend(orphans.blocked.into_iter().map(|reason| (None, reason)));
-        scans.orphan_dirs = orphans.dirs;
+        let scans = DrainScans {
+            blocked: orphans
+                .blocked
+                .into_iter()
+                .map(|reason| (None, reason))
+                .collect(),
+            orphan_dirs: orphans.dirs,
+        };
         Ok(Response::new(self.finish_drain(epoch, &first, scans)))
     }
 
@@ -466,24 +465,6 @@ impl SandboxManagerService {
         let continuous = first.sealed_epoch == Some(epoch) && last.sealed_epoch == Some(epoch);
         let done = continuous && !plan.vm && plan.pending.is_empty() && plan.blocked.is_empty();
         report(first, plan, done)
-    }
-
-    /// Run the inventory reconcile that adopts recoverable orphan artifacts as
-    /// rows, after checking that the directories it reads can be read: its
-    /// own listing reads an unreadable directory as empty.
-    fn recover_orphans_for_drain(&self, blocked: &mut Vec<(Option<String>, String)>) {
-        for dir in [CACHE_DIR, RUN_DIR] {
-            if let Err(error) = std::fs::read_dir(dir) {
-                blocked.push((None, format!("can't scan {dir}: {error}")));
-            }
-        }
-        if !blocked.is_empty() {
-            return;
-        }
-        if let Err(error) = self.reconcile_sandbox_inventory(cache_cleanup::ReconcileSource::Drain)
-        {
-            blocked.push((None, format!("orphan recovery failed: {error}")));
-        }
     }
 
     /// Read node-manager's whole orphan inventory, one page at a time.
@@ -562,16 +543,11 @@ impl SandboxManagerService {
                 .or_default()
                 .insert(pending.local_artifact_id.to_string());
         }
-        let test_quarantined = test_quarantined_sandboxes();
         let rows: Vec<DrainRow> = sandboxes
             .iter()
             .map(|row| DrainRow {
                 sandbox_id: row.id.clone(),
-                lifecycle: if test_quarantined.contains(&row.id) {
-                    SandboxState::Quarantined
-                } else {
-                    row.lifecycle
-                },
+                lifecycle: row.lifecycle,
                 pool_member: row.pool_template.is_some(),
                 volume_encryption: row.volume_encryption,
                 pin: row
@@ -769,28 +745,6 @@ impl SandboxManagerService {
         drop(wake_guard);
         Ok(())
     }
-}
-
-/// Under `test-hooks`, the sandboxes the file `SPACE_DRAIN_NODE_TEST_QUARANTINED_FILE`
-/// names, one id a line, which the drain reads as `quarantined`: a Kind
-/// scenario's way to put a resident the node can't make durable on a worker,
-/// which has no other means to quarantine one. Empty in a release build.
-fn test_quarantined_sandboxes() -> BTreeSet<String> {
-    #[cfg(feature = "test-hooks")]
-    if let Some(path) =
-        pplx_space_common_core::env::test_hook_var("SPACE_DRAIN_NODE_TEST_QUARANTINED_FILE")
-    {
-        return std::fs::read_to_string(path)
-            .map(|ids| {
-                ids.lines()
-                    .map(str::trim)
-                    .filter(|id| !id.is_empty())
-                    .map(str::to_owned)
-                    .collect()
-            })
-            .unwrap_or_default();
-    }
-    BTreeSet::new()
 }
 
 fn report(status: &ActivationSealStatus, plan: DrainPlan, done: bool) -> DrainNodeResponse {

@@ -5228,15 +5228,6 @@ ON CONFLICT (key_hash) DO NOTHING;
         except HTTPError as error:
             return int(error.code)
 
-    def mark_drain_test_quarantined(self, node_name: str, sandbox_ids: Sequence[str]) -> None:
-        ids = "\n".join(_sql_uuid(sandbox_id) for sandbox_id in sandbox_ids)
-        path = "/space/cache/drain-node-test-quarantined"
-        script = f"rm -f {path}" if not ids else f"printf '%s\\n' {shlex.quote(ids)} > {path}"
-        _require_ok(
-            self._node_shell_exec(node_name, script, timeout=30),
-            f"mark the drain's test-quarantined sandboxes on {node_name}",
-        )
-
     def drain_restore_operations(self, sandbox_id: str) -> list[tuple[str, int]]:
         rows = self._psql(
             "SELECT state, attempts FROM public_operations"

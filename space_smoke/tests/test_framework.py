@@ -190,7 +190,6 @@ runpy.run_module("space_smoke", run_name="__main__")
                 "native.network_policy_live_update",
                 "native.resident_pause",
                 "native.stopped_restart_preserves_rootfs",
-                "native.v2_drain_blocks_on_a_quarantined_resident",
                 "native.v2_drain_evacuates_every_resident",
                 "native.v2_drain_meets_user_calls",
                 "native.v2_drain_terminates_its_worker",

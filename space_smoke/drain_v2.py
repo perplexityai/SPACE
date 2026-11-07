@@ -259,21 +259,6 @@ class DrainV2Assertions:
             compensation, self._uncordon_other = self._uncordon_other, None
             compensation.release()
 
-    def quarantine_for_drain(self, sandbox: DurableLifecycleSandbox) -> None:
-        """Have the pinned worker's drain read the sandbox as quarantined
-        (a test-hooks file); cleared when the run ends."""
-
-        node_name = self.node_name
-        self._scope.defer(
-            "clear the drain's test quarantine",
-            lambda: self._control.mark_drain_test_quarantined(node_name, []),
-            critical=True,
-        )
-        self._control.mark_drain_test_quarantined(node_name, [self.bare_id(sandbox.sandbox_id)])
-
-    def clear_quarantine(self) -> None:
-        self._control.mark_drain_test_quarantined(self.node_name, [])
-
     # --- the drain ------------------------------------------------------------
 
     def drain(self) -> int:
