@@ -251,7 +251,8 @@ fn a_pool_member_is_left_to_the_pool() {
 }
 
 /// The inventory's process, cache and run directory findings, and those
-/// scanners' failures, block; everything else is ignored.
+/// scanners' failures, block, and so does a failure that names no scanner
+/// this build knows; the other scanners' findings and failures are ignored.
 #[test]
 fn the_orphan_inventory_blocks_only_on_what_can_hold_a_resident() {
     let gateway_root = "/run/gateway";
@@ -270,6 +271,8 @@ fn the_orphan_inventory_blocks_only_on_what_can_hold_a_resident() {
             "RunDirs: denied".into(),
             "CacheDirs: denied".into(),
             "Processes: denied".into(),
+            "Volumes: denied".into(),
+            "unnamed failure".into(),
         ],
         ..Default::default()
     };
@@ -292,6 +295,8 @@ fn the_orphan_inventory_blocks_only_on_what_can_hold_a_resident() {
             "orphan inventory scan failed: RunDirs: denied",
             "orphan inventory scan failed: CacheDirs: denied",
             "orphan inventory scan failed: Processes: denied",
+            "orphan inventory scan failed: Volumes: denied",
+            "orphan inventory scan failed: unnamed failure",
         ]
     );
 
