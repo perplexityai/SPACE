@@ -12,10 +12,11 @@ workspace = true
 
 [features]
 default = []
-serde = ["dep:serde", "dep:serde_json", "pplx-space-common-core/serde", "pplx-space-cpu-arch/serde"]
+serde = ["dep:serde", "dep:serde_json", "pplx-space-common-core/serde", "pplx-space-content-digest/serde", "pplx-space-cpu-arch/serde"]
 
 [dependencies]
 aws-lc-rs = { workspace = true }
+pplx-space-content-digest = { workspace = true }
 pplx-space-cpu-arch = { workspace = true }
 serde = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }

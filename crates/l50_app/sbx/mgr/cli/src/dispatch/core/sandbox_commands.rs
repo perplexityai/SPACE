@@ -72,7 +72,7 @@ pub(super) async fn handle(command: Commands, client: &mut SandboxClient) {
 }
 
 struct CreateCommandInput {
-    content_hash: Option<pplx_space_common_core::types::ContentHash>,
+    content_hash: Option<pplx_space_content_digest::ContentHash>,
     environment: Option<pplx_space_common_core::types::EnvironmentReference>,
     runtime: Option<String>,
     template: String,

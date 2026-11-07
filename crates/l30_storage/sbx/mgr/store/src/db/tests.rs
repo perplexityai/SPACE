@@ -141,9 +141,10 @@ use pplx_space_accounts::UserId;
 use pplx_space_common_core::types::{
     ArtifactComponentKind, ArtifactComponentMetadata, ArtifactFormat, ArtifactVersion,
     AutoLifecycleConditionSet, AutoLifecycleConditionSetId, AutoLifecycleIdleAction,
-    AutoLifecycleStage, Digest, ExecutionMetadata, LinuxPid, LinuxUid, SandboxActivationAttemptId,
+    AutoLifecycleStage, ExecutionMetadata, LinuxPid, LinuxUid, SandboxActivationAttemptId,
     SandboxId, VsockCid,
 };
+use pplx_space_content_digest::Digest;
 use pplx_space_cpu_arch::Arch;
 use uuid::Uuid;
 

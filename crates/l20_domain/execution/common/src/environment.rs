@@ -3,6 +3,7 @@
 
 use aws_lc_rs::digest::{SHA256, digest};
 use pplx_space_common_core::types::*;
+use pplx_space_content_digest::{Digest, DigestParseError};
 use pplx_space_cpu_arch::Arch;
 
 use crate::{ExecutionProtoError, proto};

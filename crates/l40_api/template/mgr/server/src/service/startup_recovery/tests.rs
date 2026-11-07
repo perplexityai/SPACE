@@ -1658,7 +1658,7 @@ async fn a_dir_skipped_for_want_of_a_permit_comes_first_next_tick() {
 fn twin_partition() -> crate::db::TemplateCachePartition {
     crate::db::TemplateCachePartition::Environment(
         pplx_space_common_core::types::EnvironmentReference::new(
-            pplx_space_common_core::types::Digest::sha256([2; 32]),
+            pplx_space_content_digest::Digest::sha256([2; 32]),
         ),
     )
 }

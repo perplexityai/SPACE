@@ -311,7 +311,7 @@ pub enum BoundEnvironmentError {
         subject: String,
         value: String,
         #[source]
-        source: pplx_space_common_core::types::DigestParseError,
+        source: pplx_space_content_digest::DigestParseError,
     },
     #[error(transparent)]
     Database(#[from] sqlx::Error),

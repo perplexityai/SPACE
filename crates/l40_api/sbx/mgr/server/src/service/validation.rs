@@ -464,11 +464,13 @@ pub(super) fn normalize_environment_input(
     if !request.template.is_empty() || !request.runtime.is_empty() {
         return Err(Status::invalid_argument("provide exactly one create input"));
     }
-    let reference = input.reference.parse().map_err(
-        |error: pplx_space_common_core::types::DigestParseError| {
-            Status::invalid_argument(error.to_string())
-        },
-    )?;
+    let reference =
+        input
+            .reference
+            .parse()
+            .map_err(|error: pplx_space_content_digest::DigestParseError| {
+                Status::invalid_argument(error.to_string())
+            })?;
     request.template = input.template;
     Ok(Some(reference))
 }

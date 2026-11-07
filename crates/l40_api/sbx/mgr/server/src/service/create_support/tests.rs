@@ -487,7 +487,8 @@ fn restore_provenance_classifies_legacy_remote_metadata() {
 /// preference.
 #[tokio::test]
 async fn sandbox_starts_prefer_the_build_of_their_saved_environment() {
-    use pplx_space_common_core::types::{Digest, EnvironmentReference, ExecutionMetadata};
+    use pplx_space_common_core::types::{EnvironmentReference, ExecutionMetadata};
+    use pplx_space_content_digest::Digest;
     use pplx_space_cpu_arch::Arch;
     let cache = tempfile::tempdir().unwrap();
     let conn = crate::db::test_conn();

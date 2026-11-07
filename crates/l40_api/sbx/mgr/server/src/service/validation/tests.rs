@@ -92,7 +92,7 @@ fn create_paths() -> Vec<(&'static str, crate::proto::CreateRequest, bool)> {
 
 #[test]
 fn compiled_environments_admit_the_create_paths_they_qualify_for_and_never_relabel_a_template() {
-    use pplx_space_common_core::types::Digest;
+    use pplx_space_content_digest::Digest;
     use pplx_space_node_runtime_core::catalog::CompiledEnvironment;
     for environment in CompiledEnvironment::for_architecture(Arch::X86_64).unwrap() {
         let reference = environment.definition().reference();
@@ -145,7 +145,8 @@ fn compiled_environments_admit_the_create_paths_they_qualify_for_and_never_relab
 
 #[test]
 fn an_environment_without_memory_state_support_is_refused_on_memory_paths() {
-    use pplx_space_common_core::types::{Digest, RuntimeIdentity, RuntimeKind};
+    use pplx_space_common_core::types::{RuntimeIdentity, RuntimeKind};
+    use pplx_space_content_digest::Digest;
     let reference = EnvironmentReference::new(Digest::sha256([8; 32]));
     let execution = ExecutionMetadata::new(
         RuntimeIdentity {
@@ -204,7 +205,8 @@ fn a_selected_create_cannot_be_a_pool_member_but_an_empty_pool_names_none() {
 
 #[test]
 fn a_selected_create_boots_cold_so_only_its_snapshots_need_memory_state() {
-    use pplx_space_common_core::types::{Digest, RuntimeIdentity, RuntimeKind};
+    use pplx_space_common_core::types::{RuntimeIdentity, RuntimeKind};
+    use pplx_space_content_digest::Digest;
     let reference = EnvironmentReference::new(Digest::sha256([8; 32]));
     let cold_only = ExecutionMetadata::new(
         RuntimeIdentity {
@@ -405,7 +407,7 @@ fn selected_create_has_one_authority_and_old_wire_readers_reject_it() {
 
 #[test]
 fn memory_state_support_follows_complete_environment_identity() {
-    use pplx_space_common_core::types::Digest;
+    use pplx_space_content_digest::Digest;
     use pplx_space_node_runtime_core::catalog::CompiledEnvironment;
     let environments = CompiledEnvironment::for_architecture(Arch::X86_64).unwrap();
     let e0 = environments[0]
@@ -446,8 +448,8 @@ fn a_capture_publishes_under_the_partition_template_manager_names() {
     use pplx_space_common_core::types::TemplateCachePartition;
     let hash = format!("sha256:{}", "a".repeat(64));
     let initial = pplx_space_node_runtime_core::catalog::initial_environment_reference();
-    let twin = EnvironmentReference::new(pplx_space_common_core::types::Digest::sha256([2; 32]));
-    let other = EnvironmentReference::new(pplx_space_common_core::types::Digest::sha256([3; 32]));
+    let twin = EnvironmentReference::new(pplx_space_content_digest::Digest::sha256([2; 32]));
+    let other = EnvironmentReference::new(pplx_space_content_digest::Digest::sha256([3; 32]));
     let bound = |environment| {
         ExecutionMetadata::initial_firecracker(Arch::X86_64, vec![]).with_environment(environment)
     };

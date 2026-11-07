@@ -1,6 +1,7 @@
 use std::fmt;
 
-use crate::types::{DigestParseError, EnvironmentReference};
+use crate::types::EnvironmentReference;
+use pplx_space_content_digest::DigestParseError;
 
 /// Separates a rootfs digest from its environment in a partitioned build
 /// directory name. Digests and environment references never contain it.
@@ -23,6 +24,7 @@ const ENVIRONMENT_SEPARATOR: char = '@';
 ///
 /// ```rust
 /// # use pplx_space_common_core::types::*;
+/// # use pplx_space_content_digest::Digest;
 /// let initial = EnvironmentReference::new(Digest::sha256([1; 32]));
 /// let other = EnvironmentReference::new(Digest::sha256([2; 32]));
 ///
@@ -100,7 +102,7 @@ impl TemplateCachePartition {
             }
         };
         content_hash
-            .parse::<crate::types::Digest>()
+            .parse::<pplx_space_content_digest::Digest>()
             .ok()
             .map(|_| (content_hash, partition))
     }

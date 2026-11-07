@@ -10,8 +10,9 @@ use crate::protection::{self, AuditIdentity, PathRole};
 use crate::run::SERVICE_NAME;
 use pplx_space_accounts::JobId;
 use pplx_space_common_core::types::{
-    ComponentIdentity, Digest, RuntimeIdentity, RuntimeKind, RuntimeVersion,
+    ComponentIdentity, RuntimeIdentity, RuntimeKind, RuntimeVersion,
 };
+use pplx_space_content_digest::Digest;
 use pplx_space_execution_common::proto::{self as execution, ArtifactComponentKind};
 use pplx_space_host_layout::identities::{user_names, users};
 use pplx_space_node_runtime_core::runtime_inventory::diagnostic::{

@@ -8,7 +8,7 @@ fn release(runtime_kind: i32, version: &str) -> NodeArtifact {
             RuntimeReleaseArtifact {
                 runtime_kind,
                 version: version.to_string(),
-                digest: pplx_space_common_core::types::Digest::sha256([7; 32]).to_string(),
+                digest: pplx_space_content_digest::Digest::sha256([7; 32]).to_string(),
             },
         )),
     }
@@ -25,7 +25,7 @@ fn an_artifact_is_named_by_what_it_is() {
         artifact: Some(node_artifact::Artifact::Component(ComponentArtifact {
             version: "6.1.158".to_string(),
             kind: pplx_space_execution_common::proto::ArtifactComponentKind::Kernel as i32,
-            digest: pplx_space_common_core::types::Digest::sha256([7; 32]).to_string(),
+            digest: pplx_space_content_digest::Digest::sha256([7; 32]).to_string(),
         })),
     };
     assert!(matches!(
@@ -383,7 +383,8 @@ fn policy_checks_exact_admission_and_configured_default() {
 #[tokio::test]
 async fn legacy_custom_inputs_survive_unless_legacy_permission_is_removed() {
     use crate::service::tests::service_tests::{installed_runtime, service_for_unit_tests};
-    use pplx_space_common_core::types::{Digest, ExecutionMetadata, RuntimeKind};
+    use pplx_space_common_core::types::{ExecutionMetadata, RuntimeKind};
+    use pplx_space_content_digest::Digest;
     use pplx_space_node_runtime_core::runtime_inventory::{
         RuntimeInstallationRoot, RuntimeInventory,
     };

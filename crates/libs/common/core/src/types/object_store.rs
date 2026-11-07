@@ -15,6 +15,7 @@
 //!
 //! ```rust
 //! # use pplx_space_common_core::types::*;
+//! # use pplx_space_content_digest::{ContentHash, Digest};
 //! let template = TemplateName::parse("seed")?;
 //! let hash = ContentHash::new(Digest::sha256([0xab; 32]));
 //! let key = template_object_key("", &template, hash, TemplateArtifact::RootfsZstd);
@@ -25,7 +26,8 @@
 
 use std::str::FromStr;
 
-use crate::types::template::{ContentHash, TemplateName};
+use crate::types::template::TemplateName;
+use pplx_space_content_digest::ContentHash;
 
 /// Number of prefix shards under `suspend_snapshots/` in object storage.
 ///
@@ -119,6 +121,7 @@ impl TemplateArtifact {
 ///
 /// ```rust
 /// # use pplx_space_common_core::types::*;
+/// # use pplx_space_content_digest::{ContentHash, Digest};
 /// let template = TemplateName::parse("seed")?;
 /// let hash = ContentHash::new(Digest::sha256([0xab; 32]));
 /// let key = template_object_key("", &template, hash, TemplateArtifact::RootfsZstd);
@@ -153,6 +156,7 @@ pub fn template_object_key(
 ///
 /// ```rust
 /// # use pplx_space_common_core::types::*;
+/// # use pplx_space_content_digest::{ContentHash, Digest};
 /// let template = TemplateName::parse("seed")?;
 /// let hash = ContentHash::new(Digest::sha256([0xab; 32]));
 /// let prefix = template_object_prefix("", &template, hash);

@@ -13,8 +13,9 @@ use pplx_space_common_core::types::{
     SnapshotStateParseError, TemplateName, TemplateParseError,
 };
 use pplx_space_common_core::types::{
-    Digest, DigestParseError, SnapshotArtifact as SnapshotArtifactFile, SnapshotArtifactParseError,
+    SnapshotArtifact as SnapshotArtifactFile, SnapshotArtifactParseError,
 };
+use pplx_space_content_digest::{Digest, DigestParseError};
 use sqlx::FromRow;
 use sqlx::types::Json;
 use time::OffsetDateTime;

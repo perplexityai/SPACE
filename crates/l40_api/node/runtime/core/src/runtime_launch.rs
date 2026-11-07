@@ -7,9 +7,10 @@
 
 use crate::proto::{ArtifactIntegrityRequirement, LaunchRuntimeRequest};
 use pplx_space_common_core::types::{
-    DigestParseError, EnvironmentReference, NodePathError, NodeSpacePath,
-    SandboxActivationAttemptId, SandboxId, SandboxIdParseError,
+    EnvironmentReference, NodePathError, NodeSpacePath, SandboxActivationAttemptId, SandboxId,
+    SandboxIdParseError,
 };
+use pplx_space_content_digest::DigestParseError;
 use pplx_space_execution_common::proto::RuntimeKind;
 
 #[derive(Debug, thiserror::Error)]

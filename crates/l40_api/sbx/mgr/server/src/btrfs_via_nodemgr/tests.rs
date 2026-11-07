@@ -170,7 +170,7 @@ async fn a_sandbox_instance_is_created_as_a_subvolume_or_reported_unsupported() 
 fn codec_requests_name_the_partition_of_a_bound_sandbox_s_parent() {
     let hash = format!("sha256:{}", "c".repeat(64));
     let bound = pplx_space_common_core::types::EnvironmentReference::new(
-        pplx_space_common_core::types::Digest::sha256([2; 32]),
+        pplx_space_content_digest::Digest::sha256([2; 32]),
     );
     assert_eq!(
         super::codec_environment_build(&hash, Some(bound)),

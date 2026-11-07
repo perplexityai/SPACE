@@ -16,6 +16,7 @@ test-support = []
 
 [dependencies]
 pplx-space-common-core = { workspace = true, features = ["serde"] }
+pplx-space-content-digest = { workspace = true, features = ["serde"] }
 pplx-space-cpu-arch = { workspace = true, features = ["serde"] }
 pplx-space-execution-common = { workspace = true }
 serde = { workspace = true, features = ["derive"] }

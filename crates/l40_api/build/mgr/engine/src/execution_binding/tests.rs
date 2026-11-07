@@ -1,5 +1,6 @@
 use super::*;
 use pplx_space_common_core::types::*;
+use pplx_space_content_digest::Digest;
 use pplx_space_cpu_arch::Arch;
 use pplx_space_template_manifest::{
     BOUND_TEMPLATE_METADATA_SCHEMA_VERSION, TEMPLATE_METADATA_SCHEMA_VERSION,

@@ -727,7 +727,7 @@ async fn explicit_selection_checks_legacy_base_evidence_before_create() {
         pplx_space_sbx_mgr_client::environment::bind(
             &mut request,
             pplx_space_common_core::types::EnvironmentReference::new(
-                pplx_space_common_core::types::Digest::sha256([1; 32]),
+                pplx_space_content_digest::Digest::sha256([1; 32]),
             ),
         );
         mutate(&mut request);
@@ -1031,7 +1031,8 @@ async fn selected_create_persists_the_binding_used_by_first_start() {
 /// requiring exact permission for the revoked producer.
 #[tokio::test]
 async fn unpinned_create_selects_before_admitting_a_non_default_source() {
-    use pplx_space_common_core::types::{Digest, EnvironmentDescriptor, RuntimeBinding};
+    use pplx_space_common_core::types::{EnvironmentDescriptor, RuntimeBinding};
+    use pplx_space_content_digest::Digest;
     use pplx_space_execution_common::environment::EnvironmentDefinition;
     use pplx_space_node_mgr_client::proto::{
         ExecutionEnvironmentSelection, ResolveExecutionEnvironmentRequest,

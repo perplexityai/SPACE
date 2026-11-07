@@ -1359,7 +1359,7 @@ pub(super) fn unsupported_template_runtime(value: &str) -> Status {
 }
 
 /// Parses `hash` into a canonical
-/// [`pplx_space_common_core::types::ContentHash`]
+/// [`pplx_space_content_digest::ContentHash`]
 /// (`<algorithm>:<64 lowercase hex>`), tolerating a bare 64-hex digest by
 /// assuming SHA-256, and returns the canonical algorithm-prefixed string.
 /// Validating at insertion time means every consumer downstream —
@@ -1368,7 +1368,7 @@ pub(super) fn unsupported_template_runtime(value: &str) -> Status {
 /// path lets a digest stored bare round-trip back through prefetch.
 pub(super) fn validated_release_hash(value: &str) -> Result<String, Status> {
     let trimmed = trimmed_required(value, "hash")?;
-    let Ok(content_hash) = trimmed.parse::<pplx_space_common_core::types::ContentHash>() else {
+    let Ok(content_hash) = trimmed.parse::<pplx_space_content_digest::ContentHash>() else {
         return Err(Status::invalid_argument(format!(
             "hash '{trimmed}' must be formatted as 'sha256:<64 lowercase hex chars>' or 'blake3:<64 lowercase hex chars>'"
         )));

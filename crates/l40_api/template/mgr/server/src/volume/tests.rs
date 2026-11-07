@@ -1096,7 +1096,8 @@ fn probed_manifest(partition: &TemplateCachePartition) -> Vec<u8> {
 #[case::twin(true)]
 #[tokio::test]
 async fn a_pull_refuses_a_rowless_build_dir_and_deletes_nothing(#[case] twin: bool) {
-    use pplx_space_common_core::types::{Digest, EnvironmentReference};
+    use pplx_space_common_core::types::EnvironmentReference;
+    use pplx_space_content_digest::Digest;
     let root = tempfile::tempdir().unwrap();
     let content_hash = format!("sha256:{}", "c".repeat(64));
     let partition = if twin {
@@ -1125,7 +1126,8 @@ async fn a_pull_refuses_a_rowless_build_dir_and_deletes_nothing(#[case] twin: bo
 /// needs a volume manager, which these tests don't serve.
 #[tokio::test]
 async fn a_rowless_dir_in_another_partition_does_not_block_a_pull() {
-    use pplx_space_common_core::types::{Digest, EnvironmentReference};
+    use pplx_space_common_core::types::EnvironmentReference;
+    use pplx_space_content_digest::Digest;
     let root = tempfile::tempdir().unwrap();
     let content_hash = format!("sha256:{}", "d".repeat(64));
     let twin =
@@ -1151,11 +1153,11 @@ async fn a_rowless_dir_in_another_partition_does_not_block_a_pull() {
 /// they must never reach the rootfs path, where a refusal that published
 /// first would leave unverified bytes at the path sandboxes boot from.
 #[rstest::rstest]
-#[case(pplx_space_common_core::types::HashAlg::Sha256)]
-#[case(pplx_space_common_core::types::HashAlg::Blake3)]
+#[case(pplx_space_content_digest::HashAlg::Sha256)]
+#[case(pplx_space_content_digest::HashAlg::Blake3)]
 #[tokio::test(start_paused = true)]
 async fn materialize_rootfs_rejects_decoded_bytes_that_disagree_with_the_release_hash(
-    #[case] algorithm: pplx_space_common_core::types::HashAlg,
+    #[case] algorithm: pplx_space_content_digest::HashAlg,
 ) {
     use pplx_space_template_manifest::{
         TemplateManifest, TemplateManifestCompression, TemplateManifestFile,
@@ -1374,7 +1376,7 @@ fn digest_dir_partition_reads_build_dirs_only() {
     let hash = format!("sha256:{}", "7".repeat(64));
     let twin = TemplateCachePartition::Environment(
         pplx_space_common_core::types::EnvironmentReference::new(
-            pplx_space_common_core::types::Digest::sha256([2; 32]),
+            pplx_space_content_digest::Digest::sha256([2; 32]),
         ),
     );
     assert_eq!(
@@ -1409,7 +1411,8 @@ fn partition_probe_dirs_are_reaped_staging_dirs_not_builds() {
 /// one its metadata carries, as registration does.
 #[test]
 fn release_partition_reads_the_manifest_then_the_metadata_binding() {
-    use pplx_space_common_core::types::{Digest, EnvironmentReference, ExecutionMetadata};
+    use pplx_space_common_core::types::{EnvironmentReference, ExecutionMetadata};
+    use pplx_space_content_digest::Digest;
     use pplx_space_cpu_arch::Arch;
     use pplx_space_template_manifest::{TemplateManifest, TemplateMetadata};
     let environment = EnvironmentReference::new(Digest::sha256([2; 32]));

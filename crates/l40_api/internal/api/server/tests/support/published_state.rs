@@ -209,8 +209,9 @@ pub(super) fn published_sandbox_state(
 
 pub(super) fn test_execution() -> ExecutionMetadata {
     use pplx_space_common_core::types::{
-        ArtifactComponentKind, ArtifactComponentMetadata, ArtifactFormat, ArtifactVersion, Digest,
+        ArtifactComponentKind, ArtifactComponentMetadata, ArtifactFormat, ArtifactVersion,
     };
+    use pplx_space_content_digest::Digest;
 
     ExecutionMetadata::initial_firecracker(
         Arch::X86_64,

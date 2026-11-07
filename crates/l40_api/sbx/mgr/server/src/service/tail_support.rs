@@ -153,7 +153,7 @@ pub(super) fn activation_metadata_json(
         sandbox
             .template_hash
             .as_deref()
-            .map(str::parse::<pplx_space_common_core::types::ContentHash>)
+            .map(str::parse::<pplx_space_content_digest::ContentHash>)
             .transpose()
             .map_err(|error| invalid(error.to_string()))?,
     );

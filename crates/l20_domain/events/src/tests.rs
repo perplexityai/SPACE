@@ -341,10 +341,11 @@ fn sandbox_event_details_store_restore_provenance() {
 fn sandbox_event_details_project_execution_metadata() {
     use pplx_space_common_core::types::{
         ArtifactComponentKind, ArtifactComponentMetadata, ArtifactComponentRole, ArtifactFormat,
-        ArtifactVersion, Digest, ExecutionMetadata, FIRECRACKER_STATE_FORMAT, GuestOperatingSystem,
+        ArtifactVersion, ExecutionMetadata, FIRECRACKER_STATE_FORMAT, GuestOperatingSystem,
         GuestPlatform, RuntimeIdentity, RuntimeKind, RuntimeVersion, StateFormatIdentity,
         StateFormatName, StateFormatVersion,
     };
+    use pplx_space_content_digest::Digest;
     use pplx_space_cpu_arch::Arch;
 
     let execution = ExecutionMetadata::new(

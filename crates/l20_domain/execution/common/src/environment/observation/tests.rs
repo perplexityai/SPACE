@@ -1,4 +1,5 @@
 use pplx_space_common_core::types::*;
+use pplx_space_content_digest::Digest;
 use prost::Message;
 
 use super::*;

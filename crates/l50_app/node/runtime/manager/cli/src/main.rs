@@ -6,9 +6,9 @@ use std::fmt::Write as _;
 use comfy_table::{Table, presets::NOTHING};
 use pplx_space_accounts::JobId;
 use pplx_space_common_core::types::{
-    ArtifactComponentKind as ComponentKind, ArtifactVersion, Digest, RuntimeKind as Runtime,
-    RuntimeVersion,
+    ArtifactComponentKind as ComponentKind, ArtifactVersion, RuntimeKind as Runtime, RuntimeVersion,
 };
+use pplx_space_content_digest::Digest;
 use pplx_space_node_runtime_manager_client::execution::{ArtifactComponentKind, RuntimeKind};
 use pplx_space_node_runtime_manager_client::labels::label;
 use pplx_space_node_runtime_manager_client::proto::{self, *};

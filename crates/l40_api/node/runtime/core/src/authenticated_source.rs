@@ -9,7 +9,7 @@ use std::{
     path::Path,
 };
 
-use pplx_space_common_core::types::Digest;
+use pplx_space_content_digest::Digest;
 
 use crate::{
     artifact_store::{VerifyError, verify_execution_directory},

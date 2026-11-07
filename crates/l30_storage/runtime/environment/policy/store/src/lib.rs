@@ -46,7 +46,8 @@ use std::str::FromStr;
 
 use pplx_space_accounts::UserId;
 use pplx_space_common_core::sql;
-use pplx_space_common_core::types::{DigestParseError, EnvironmentReference};
+use pplx_space_common_core::types::EnvironmentReference;
+use pplx_space_content_digest::DigestParseError;
 
 mod write;
 

@@ -927,7 +927,7 @@ pub(super) fn validate_template_name(name: &str) -> Result<(), tonic::Status> {
 
 /// Validate an algorithm-prefixed content hash.
 pub(super) fn validate_content_hash(hash: &str) -> Result<(), tonic::Status> {
-    hash.parse::<pplx_space_common_core::types::ContentHash>()
+    hash.parse::<pplx_space_content_digest::ContentHash>()
         .map(|_| ())
         .map_err(|_| {
             tonic::Status::invalid_argument(format!(

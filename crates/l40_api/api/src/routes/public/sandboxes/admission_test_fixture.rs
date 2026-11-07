@@ -6,8 +6,9 @@ use pplx_space_accounts::{OrgId, UserId};
 use pplx_space_cluster_pool::{NewPoolSlot, WarmPoolStore};
 use pplx_space_common_core::sql;
 use pplx_space_common_core::types::{
-    ContentHash, Digest, IdempotencyKey, MemorySize, SandboxId, TemplateName, VcpuCount,
+    IdempotencyKey, MemorySize, SandboxId, TemplateName, VcpuCount,
 };
+use pplx_space_content_digest::{ContentHash, Digest};
 use pplx_space_db_test_fixtures::{TestDb, TestDbResult, pg_test_db_with_max_connections};
 use pplx_space_public_api::{CreateSandboxRequest, OperationId, SandboxOperationResponse};
 use sqlx::types::Json as SqlJson;

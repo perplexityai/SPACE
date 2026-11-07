@@ -139,8 +139,9 @@ async fn candidate_snapshot_admission_uses_durable_execution_before_checkpointin
     use crate::service::tests::service_tests::insert_test_sandbox;
     use pplx_space_accounts::SandboxOwnerKind;
     use pplx_space_common_core::types::{
-        Digest, EnvironmentReference, ExecutionMetadata, RuntimeIdentity, RuntimeKind,
+        EnvironmentReference, ExecutionMetadata, RuntimeIdentity, RuntimeKind,
     };
+    use pplx_space_content_digest::Digest;
     use pplx_space_cpu_arch::Arch;
     let conn = crate::db::test_conn();
     let id = SandboxId::new().to_string();

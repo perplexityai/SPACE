@@ -1077,7 +1077,7 @@ fn sandbox_pod_shapes_render_expected_yaml() {
     // stopped, the same source upgraded as it starts, and a suspended source
     // staged from its checkpoint elsewhere and upgraded as it resumes.
     let upgrade_target = pplx_space_common_core::types::EnvironmentReference::new(
-        pplx_space_common_core::types::Digest::sha256([7; 32]),
+        pplx_space_content_digest::Digest::sha256([7; 32]),
     );
     let runtime_upgrade = |target_state,
                            checkpoint_local_artifact_id: Option<

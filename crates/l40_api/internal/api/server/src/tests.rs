@@ -1234,7 +1234,8 @@ async fn register_template_release_allows_no_storage_locations() -> TestResult {
 /// metadata is backfilled by a later registration that has it.
 #[tokio::test(flavor = "current_thread")]
 async fn register_template_release_persists_execution_metadata_write_once() -> TestResult {
-    use pplx_space_common_core::types::{Digest, EnvironmentReference, ExecutionMetadata};
+    use pplx_space_common_core::types::{EnvironmentReference, ExecutionMetadata};
+    use pplx_space_content_digest::Digest;
     use pplx_space_cpu_arch::Arch;
 
     let Some(fixture) = cluster_fixture().await? else {
@@ -4743,7 +4744,7 @@ fn test_snapshot_execution_for_arch(
             ),
             digest: Some(
                 format!("sha256:{}", "c".repeat(64))
-                    .parse::<pplx_space_common_core::types::Digest>()
+                    .parse::<pplx_space_content_digest::Digest>()
                     .unwrap(),
             ),
             format: Some(pplx_space_common_core::types::ArtifactFormat::parse("vmlinux").unwrap()),

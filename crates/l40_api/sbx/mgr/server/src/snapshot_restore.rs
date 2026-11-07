@@ -120,7 +120,7 @@ pub enum RecoveredSandboxRowFieldsError {
     #[error("invalid runtime in snapshot metadata: {0}")]
     Runtime(#[from] pplx_space_common_core::types::RuntimeKindParseError),
     #[error("invalid template content hash in snapshot metadata: {0}")]
-    ContentHash(#[from] pplx_space_common_core::types::DigestParseError),
+    ContentHash(#[from] pplx_space_content_digest::DigestParseError),
     #[error("invalid sandbox owner in snapshot metadata: {0}")]
     Owner(#[from] pplx_space_accounts::AuthParseError),
     #[error("invalid disk I/O limits in snapshot metadata: {0}")]

@@ -1,6 +1,7 @@
 use pplx_space_common_core::types::{
-    ComputeParseError, DigestParseError, DiskIoLimitsError, SizeParseError, TemplateParseError,
+    ComputeParseError, DiskIoLimitsError, SizeParseError, TemplateParseError,
 };
+use pplx_space_content_digest::DigestParseError;
 use uuid::Uuid;
 
 #[derive(Debug, thiserror::Error)]

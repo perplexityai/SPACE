@@ -4,8 +4,9 @@ use std::collections::HashMap;
 
 use pplx_space_accounts::OrgId;
 use pplx_space_common_core::types::{
-    ContentHash, K8sNodeName, K8sNodeUid, SandboxId, StorageUri, TemplateName, snapshot_shard,
+    K8sNodeName, K8sNodeUid, SandboxId, StorageUri, TemplateName, snapshot_shard,
 };
+use pplx_space_content_digest::ContentHash;
 
 use super::*;
 use crate::auth::K8sIdentity;

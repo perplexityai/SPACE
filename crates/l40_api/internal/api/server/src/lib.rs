@@ -52,11 +52,12 @@ use tonic::{Request, Response, Status};
 use pplx_space_accounts::{NodeId, OrgId};
 use pplx_space_common_core::node_drain_signals::EVACUATION_RESTORE_READY_CHANNEL;
 use pplx_space_common_core::types::{
-    ArtifactKind, ArtifactOrigin, AutoLifecyclePolicy, BackupAttemptId, Digest, ExactStorageUri,
+    ArtifactKind, ArtifactOrigin, AutoLifecyclePolicy, BackupAttemptId, ExactStorageUri,
     ExecutionGeneration, LocalArtifactId, NodeRole as SpaceNodeRole, RuntimeKind, SandboxId,
     SnapshotArtifact as SnapshotArtifactFile, SnapshotContentHash, SnapshotId, SnapshotKind,
     SnapshotName, SnapshotState, SubstrateKind, TemplateName,
 };
+use pplx_space_content_digest::Digest;
 use pplx_space_events::{
     SandboxEvent, SandboxEventDetails, SandboxEventSource, SandboxEventTrigger, SandboxEventType,
 };

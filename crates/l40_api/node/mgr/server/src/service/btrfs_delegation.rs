@@ -107,7 +107,7 @@ fn validate_template_name(name: &str) -> Result<(), Status> {
 }
 
 fn validate_content_hash(hash: &str) -> Result<(), Status> {
-    hash.parse::<pplx_space_common_core::types::Digest>()
+    hash.parse::<pplx_space_content_digest::Digest>()
         .map(|_| ())
         .map_err(|error| {
             Status::invalid_argument(format!("invalid content_hash '{hash}': {error}"))

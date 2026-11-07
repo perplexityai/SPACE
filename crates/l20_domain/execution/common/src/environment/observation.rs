@@ -3,9 +3,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use pplx_space_common_core::types::{
-    DigestParseError, EnvironmentReference, VersionSortKey, VersionSortKeyError,
-};
+use pplx_space_common_core::types::{EnvironmentReference, VersionSortKey, VersionSortKeyError};
+use pplx_space_content_digest::DigestParseError;
 
 use super::{
     EnvironmentDecodeError, EnvironmentDefinition, RUNTIME_NEUTRAL_ENVIRONMENT_SCHEMA_VERSION,

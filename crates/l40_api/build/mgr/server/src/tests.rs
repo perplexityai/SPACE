@@ -668,7 +668,7 @@ async fn build_publish_carries_publication_authority() -> TestResult {
 #[tokio::test(flavor = "current_thread")]
 async fn publish_receives_the_registered_build_s_environment() -> TestResult {
     let environment = pplx_space_common_core::types::EnvironmentReference::new(
-        pplx_space_common_core::types::Digest::sha256([2; 32]),
+        pplx_space_content_digest::Digest::sha256([2; 32]),
     );
     let backend = MockBuildBackend::with_build_result(Ok(BuildOutcome {
         content_hash: Some(

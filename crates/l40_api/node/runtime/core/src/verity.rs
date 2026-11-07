@@ -164,7 +164,7 @@ pub fn measure(file: &File) -> Result<VerityDigest, VerityError> {
         return Err(VerityError::DigestFormat);
     }
     Ok(VerityDigest::new(
-        pplx_space_common_core::types::Digest::sha256(measurement.digest),
+        pplx_space_content_digest::Digest::sha256(measurement.digest),
     ))
 }
 

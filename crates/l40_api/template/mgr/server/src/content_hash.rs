@@ -1,4 +1,4 @@
-use pplx_space_common_core::types::{Digest, HashAlg};
+use pplx_space_content_digest::{Digest, HashAlg};
 use sha2::Digest as _;
 
 /// Streaming verification of the algorithm named by a template's identity.

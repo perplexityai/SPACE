@@ -17,3 +17,4 @@ thiserror = { workspace = true }
 
 # internal
 pplx-space-common-core = { workspace = true }
+pplx-space-content-digest = { workspace = true }

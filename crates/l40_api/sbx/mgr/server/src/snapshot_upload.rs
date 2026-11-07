@@ -420,7 +420,7 @@ pub enum SnapshotRuntimeMetadataError {
     #[error(transparent)]
     KernelRole(#[from] pplx_space_common_core::types::ArtifactComponentRoleParseError),
     #[error(transparent)]
-    KernelDigest(#[from] pplx_space_common_core::types::DigestParseError),
+    KernelDigest(#[from] pplx_space_content_digest::DigestParseError),
     #[error(transparent)]
     KernelFormat(#[from] pplx_space_common_core::types::ArtifactFormatParseError),
     #[error(transparent)]

@@ -7,10 +7,11 @@ use std::path::{Path, PathBuf};
 
 use pplx_space_common_core::types::{
     ArtifactComponentKind, ArtifactComponentMetadata, ArtifactComponentRole, ArtifactFormat,
-    ArtifactVersion, Digest, EnvironmentReference, ExecutionMetadata, ExecutionMetadataError,
+    ArtifactVersion, EnvironmentReference, ExecutionMetadata, ExecutionMetadataError,
     FIRECRACKER_STATE_FORMAT, GuestOperatingSystem, GuestPlatform, RuntimeIdentity, RuntimeKind,
     RuntimeVersion, StateFormatIdentity, StateFormatName, StateFormatVersion, VersionSortKey,
 };
+use pplx_space_content_digest::Digest;
 use pplx_space_cpu_arch::Arch;
 use sha2::{Digest as _, Sha256};
 

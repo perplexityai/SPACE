@@ -1,5 +1,5 @@
 use super::*;
-use crate::types::Digest;
+use pplx_space_content_digest::Digest;
 
 fn hash() -> String {
     Digest::blake3([7; 32]).to_string()

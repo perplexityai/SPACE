@@ -683,7 +683,7 @@ async fn write_imported_sandbox_metadata(
         .map_err(|error| Status::invalid_argument(error.to_string()))?;
     let content_hash = header
         .content_hash
-        .parse::<pplx_space_common_core::types::ContentHash>()
+        .parse::<pplx_space_content_digest::ContentHash>()
         .map_err(|error| Status::invalid_argument(error.to_string()))?;
     let sandbox_metadata = pplx_space_common_core::types::SandboxArtifactMetadata::new(
         parsed_sandbox_id,

@@ -1,5 +1,6 @@
 //! Validate portable policy observations without assigning approval authority.
-use pplx_space_common_core::types::{DigestParseError, ExecutionPolicyObservation};
+use pplx_space_common_core::types::ExecutionPolicyObservation;
+use pplx_space_content_digest::DigestParseError;
 
 #[derive(Debug, thiserror::Error)]
 pub enum PolicyObservationError {
