@@ -672,6 +672,41 @@ pub enum NodeDrainMode {
 #[error("unsupported node drain mode '{0}'; expected 'forced' or 'gentle'")]
 pub struct NodeDrainModeParseError(String);
 
+/// The engine a node drain runs under, as `:drain` names it and
+/// `nodes.drain_engine` records it (NULL is [`Self::V1`]).
+///
+/// `V1` evacuates each resident from the control plane. `V2` seals the node
+/// and lets it make its residents durable itself (sandbox-manager's
+/// `DrainNode`), records what it reports, and restores each sandbox through
+/// a restore operation; it runs forced drains on Kubernetes only.
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "lowercase"))]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
+pub enum NodeDrainEngine {
+    #[default]
+    V1,
+    V2,
+}
+
+impl NodeDrainEngine {
+    /// The `nodes.drain_engine` value: NULL for v1.
+    pub const fn column(self) -> Option<&'static str> {
+        match self {
+            Self::V1 => None,
+            Self::V2 => Some("v2"),
+        }
+    }
+
+    /// Read `nodes.drain_engine`: `v2` is v2, anything else v1.
+    pub fn from_column(value: Option<&str>) -> Self {
+        if value == Some("v2") {
+            Self::V2
+        } else {
+            Self::V1
+        }
+    }
+}
+
 impl NodeDrainMode {
     pub const fn as_str(self) -> &'static str {
         match self {

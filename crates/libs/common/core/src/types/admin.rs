@@ -579,6 +579,12 @@ pub struct DrainRequest {
     /// `deny_unknown_fields`), which fails closed.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub require_undrained: bool,
+    /// The drain engine to run; `None` keeps a drain in flight on its engine
+    /// and starts a new one on v1. Skipped when `None`, so a request that
+    /// doesn't name one stays byte-identical to what the previous release
+    /// accepts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine: Option<crate::types::NodeDrainEngine>,
 }
 
 impl DrainRequest {

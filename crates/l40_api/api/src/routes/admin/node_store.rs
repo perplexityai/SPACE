@@ -1384,3 +1384,65 @@ mod pinned_local_only_plan_tests;
 /// otherwise the agreement proves nothing.
 #[cfg(test)]
 mod terminate_gate_agreement_tests;
+
+/// A node's drain v2 columns, read under the caller's row lock.
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct DrainV2Columns {
+    pub(super) engine: pplx_space_common_core::types::NodeDrainEngine,
+    pub(super) status: Option<serde_json::Value>,
+}
+
+pub(super) async fn drain_v2_columns(
+    tx: &mut Transaction<'_, Postgres>,
+    node_id: NodeId,
+) -> Result<DrainV2Columns, sqlx::Error> {
+    let (engine, status): (Option<String>, Option<serde_json::Value>) = sqlx::query_as(sql!(
+        "SELECT drain_engine, drain_status FROM nodes WHERE id = $1"
+    ))
+    .bind(node_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    Ok(DrainV2Columns {
+        engine: pplx_space_common_core::types::NodeDrainEngine::from_column(engine.as_deref()),
+        status,
+    })
+}
+
+/// Start a v2 drain on a node `update_drain_phase` has just moved to
+/// `draining` in this transaction: record the engine and the epoch the node
+/// is sealed under, the drain's start in microseconds. A later drain starts
+/// later, so its epoch is larger: the node takes epochs only forward.
+pub(super) async fn start_v2_drain(
+    tx: &mut Transaction<'_, Postgres>,
+    node_id: NodeId,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(sql!(
+        "UPDATE nodes
+            SET drain_engine = 'v2',
+                drain_status = jsonb_build_object(
+                    'epoch', (EXTRACT(EPOCH FROM drain_started_at) * 1000000)::BIGINT
+                )
+          WHERE id = $1 AND drain_phase = 'draining' AND drain_started_at IS NOT NULL"
+    ))
+    .bind(node_id)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+/// Mark an undrained v2 node's epoch for cancel. The controller cancels it on
+/// the node, then clears the drain columns.
+pub(super) async fn mark_v2_drain_cancel(
+    tx: &mut Transaction<'_, Postgres>,
+    node_id: NodeId,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(sql!(
+        "UPDATE nodes
+            SET drain_status = drain_status || jsonb_build_object('cancel', TRUE)
+          WHERE id = $1 AND drain_engine = 'v2' AND drain_status IS NOT NULL"
+    ))
+    .bind(node_id)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
