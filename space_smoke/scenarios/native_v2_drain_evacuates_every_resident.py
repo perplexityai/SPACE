@@ -21,31 +21,42 @@ PATH = "/tmp/space-smoke-v2-drain.txt"
 # upload is still pending and a warm-pool member are planner rows only: Kind's
 # uploads land before a drain can see one pending, and it runs no warm pool.
 #
-# On Kind, `:terminate` is `kube-delete`: the worker keeps running, but its
-# Node is deleted and its row tombstoned. The run puts it back (drops the
-# tombstone, restarts its kubelet) and unseals it in cleanup; what it found is
-# recorded as `after_terminate`.
+# The terminate runs as production's does (`space_smoke.drain_v2`): the
+# controller's `aws` terminator against Kind's fake EC2, the harness stopping
+# the worker once the controller recorded it, and the dead-node verb, `live`,
+# deleting the node's row by the drain's record, with no tombstone. The worker
+# comes back as a same-name replacement; what it found is recorded as
+# `after_terminate`. It stops a worker, so it runs only by name.
 @smoke.scenario(
     "native.v2_drain_evacuates_every_resident",
     api_surfaces=("native",),
     substrates=("kubernetes",),
     # Three residents' suspends or disk publication, their uploads, three
     # restores, the drained edge and the terminate on a slow KVM bench.
-    timeout_minutes=45,
+    timeout_minutes=60,
+    test_hooks=(
+        "SPACE_DEAD_NODE_TEST_TICK_SECS, which shortens the dead-node verb's tick to seconds"
+    ),
+    ignored="stops a Kind worker and replaces it, too invasive for the per-merge set",
 )
 def v2_drain_evacuates_every_resident(test: smoke.CommandSandboxFixture) -> None:
     """A v2 `:drain` of a worker holding a started, a paused and a stopped
-    sandbox, beside a suspended one, seals it; the node suspends the VMs and
-    publishes the stopped disk itself, reports each evacuated with the
-    lifecycle it had, and the controller restores each, started, paused and
-    stopped, on the other worker. The node then reports `done` under the
-    drain's epoch and reaches `drained`; `:terminate` deletes its row. Each
-    sandbox's file is intact, and the suspended one stays suspended."""
+    sandbox seals it; the node suspends the VMs and publishes the stopped disk
+    itself, reports each evacuated with the lifecycle it had, and the
+    controller restores each, started, paused and stopped, on the other
+    worker. The node then reports `done` under the drain's epoch and reaches
+    `drained`. `:terminate` terminates its instance through the fake EC2, the
+    controller records it, and once the worker is stopped the dead-node verb
+    deletes the node's row with no tombstone. The worker comes back under the
+    same name with a new instance. Each sandbox's file is intact."""
 
     drain = test.drain_v2
 
+    with test.phase("pin the worker the fixture is not on, under a fake AWS instance"):
+        drain.pin_to_resident_worker(away_from_fixture=True)
+        drain.give_fake_instance()
+
     with test.phase("pin a started, a paused and a stopped resident to one worker"):
-        drain.pin_to_resident_worker()
         residents = {"started": drain.create_resident(), "paused": drain.create_resident(),
                      "stopped": drain.create_resident()}
         for lifecycle, sandbox in residents.items():
@@ -71,8 +82,9 @@ def v2_drain_evacuates_every_resident(test: smoke.CommandSandboxFixture) -> None
         for lifecycle, sandbox in residents.items():
             drain.expect_back_elsewhere(sandbox.sandbox_id, lifecycle)
 
-    with test.phase(":terminate deletes the drained node's row"):
-        drain.terminate()
+    with drain.terminating_like_production():
+        with test.phase(":terminate: the instance goes, the verb deletes the row, a replacement returns"):
+            drain.terminate()
 
     with test.phase("each sandbox's file survived"):
         cast(ResidentLifecycleSandbox, residents["paused"]).wake()

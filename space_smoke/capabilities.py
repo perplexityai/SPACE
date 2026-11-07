@@ -1602,49 +1602,6 @@ class NodeDrainControl(NodeFaultControl, Protocol):
 
 
 @dataclass(frozen=True)
-class DrainV2Status:
-    """`nodes.drain_engine` and `nodes.drain_status` of one node; `status` is the JSON object."""
-
-    engine: str | None
-    status: dict[str, Any] | None
-
-
-class DrainV2Control(NodeDrainControl, Protocol):
-    """Kind-only operations for the drain v2 scenarios."""
-
-    def drain_node_v2(self, node_id: str) -> None:
-        """`POST :drain` with `mode: forced` and `engine: v2`."""
-        ...
-
-    def drain_v2_status(self, node_id: str) -> DrainV2Status | None:
-        """The node's v2 drain columns; `None` once its row is gone."""
-        ...
-
-    def terminate_node(self, node_id: str) -> int:
-        """`POST :terminate`; the HTTP status it answered."""
-        ...
-
-    def mark_drain_test_quarantined(self, node_name: str, sandbox_ids: Sequence[str]) -> None:
-        """Have the worker's drain read `sandbox_ids` as quarantined (a test-hooks file)."""
-        ...
-
-    def drain_restore_states(self, sandbox_id: str) -> list[str]:
-        """The state of each `drain_restore_sandbox` operation of the sandbox, oldest first."""
-        ...
-
-    def restore_terminated_worker(self, node_name: str, node_id: str) -> None:
-        """Bring a Kind worker `:terminate` removed back as a SPACE node.
-
-        `kube-delete` deletes the Node and the controller tombstones the row,
-        which keeps the worker out for good: drop that tombstone, restart the
-        worker's kubelet so it registers the Node again, label it a sandbox
-        worker as the Kind bootstrap did, and wait for the row and the
-        worker's operator shell. Idempotent.
-        """
-        ...
-
-
-@dataclass(frozen=True)
 class DeadNodeStatus:
     """One node's entry in `GET /admin/api/v1/dead-node-status`.
 
@@ -1815,6 +1772,43 @@ class DeadNodeControl(NodeDrainControl, Protocol):
     def other_live_rows_on_node(self, node_id: str, sandbox_ids: Sequence[str]) -> list[str]:
         """Ids of rows pinned to the node, outside `sandbox_ids`, that are not
         `failed` or `deleted`."""
+        ...
+
+
+@dataclass(frozen=True)
+class DrainV2Status:
+    """`nodes.drain_engine` and `nodes.drain_status` of one node; `status` is the JSON object."""
+
+    engine: str | None
+    status: dict[str, Any] | None
+
+
+class DrainV2Control(DeadNodeControl, Protocol):
+    """Kind-only operations for the drain v2 scenarios, with the dead-node
+    verb's config and the Kind worker's instance, stop and replacement."""
+
+    def drain_node_v2(self, node_id: str) -> None:
+        """`POST :drain` with `mode: forced` and `engine: v2`."""
+        ...
+
+    def drain_v2_status(self, node_id: str) -> DrainV2Status | None:
+        """The node's v2 drain columns; `None` once its row is gone."""
+        ...
+
+    def terminate_node(self, node_id: str) -> int:
+        """`POST :terminate`; the HTTP status it answered."""
+        ...
+
+    def mark_drain_test_quarantined(self, node_name: str, sandbox_ids: Sequence[str]) -> None:
+        """Have the worker's drain read `sandbox_ids` as quarantined (a test-hooks file)."""
+        ...
+
+    def drain_restore_states(self, sandbox_id: str) -> list[str]:
+        """The state of each `drain_restore_sandbox` operation of the sandbox, oldest first."""
+        ...
+
+    def node_tombstoned(self, node_id: str) -> bool:
+        """Whether `node_k8s_tombstones` holds a tombstone for the node id."""
         ...
 
 

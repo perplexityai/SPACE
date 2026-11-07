@@ -57,6 +57,9 @@ TICK_ENV = "SPACE_DEAD_NODE_TEST_TICK_SECS"
 ABSENCE_WINDOW_ENV = "SPACE_DEAD_NODE_TEST_ABSENCE_WINDOW_SECS"
 UPLOAD_SETTLE_ENV = "SPACE_DEAD_NODE_TEST_UPLOAD_SETTLE_SECS"
 INSTANCE_AUTHORITY_ENV = "SPACE_DEAD_NODE_TEST_INSTANCE_AUTHORITY"
+# The node-drain terminator, which the v2 drain scenario switches to `aws`
+# against Kind's fake EC2 for its terminate.
+TERMINATOR_KIND_ENV = "SPACE_NODE_DRAIN_TERMINATOR_KIND"
 
 # The only controller env this scenario may touch, and the closed vocabulary
 # its overrides come from.
@@ -66,9 +69,11 @@ DEAD_NODE_ENV_KEYS: tuple[str, ...] = (
     ABSENCE_WINDOW_ENV,
     UPLOAD_SETTLE_ENV,
     INSTANCE_AUTHORITY_ENV,
+    TERMINATOR_KIND_ENV,
 )
 _MODE_VALUES = frozenset({"off", "dry-run", "live"})
 _AUTHORITY_VALUES = frozenset({"ec2"})
+_TERMINATOR_VALUES = frozenset({"aws", "kube-delete"})
 _SECONDS_VALUE = re.compile(r"[1-9][0-9]{0,3}")
 
 # Sandbox actions the harness may ask the native API for.
@@ -154,6 +159,8 @@ def validate_dead_node_overrides(overrides: Mapping[str, str]) -> None:
             allowed = value in _MODE_VALUES
         elif key == INSTANCE_AUTHORITY_ENV:
             allowed = value in _AUTHORITY_VALUES
+        elif key == TERMINATOR_KIND_ENV:
+            allowed = value in _TERMINATOR_VALUES
         else:
             allowed = _SECONDS_VALUE.fullmatch(value) is not None
         if not allowed:
