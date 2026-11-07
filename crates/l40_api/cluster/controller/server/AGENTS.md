@@ -19,8 +19,8 @@ Every table named here is in the control-plane Postgres store.
 - In dry-run, a loop classifies and reports through logs and dry-run-tagged
   metrics only: no writes and no `space.sandbox` events. Existing exceptions:
   `suspended_execution_reaper` emits its retire event tagged `dry_run`, and
-  `dead_node` keeps its last result per node in `dead_node_dry_runs` for the
-  admin API, which runs in another process.
+  `dead_node` keeps its last result per node in `nodes.dead_node_status` for
+  the admin API, which runs in another process.
 - Read a knob a deployment must change with a production `EnvConfig` reader
   (`src/env_config.rs`); its `test_*` readers return the default unless
   `test-hooks` is compiled in.

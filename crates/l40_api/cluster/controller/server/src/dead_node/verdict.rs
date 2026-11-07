@@ -1,11 +1,19 @@
-//! Whether a node is lost: one function over typed evidence.
+//! Whether an EC2 instance a node's rows ran on is dead, and whether the node
+//! itself is lost: two functions over typed evidence.
 //!
-//! The loop gathers the evidence and [`verdict`] decides. Every input that is
-//! missing, failed or ambiguous reads [`Verdict::Unknown`]; only evidence from
-//! independent sources that all agree reads [`Verdict::Lost`]. Swapping the
-//! instance lookup from private DNS names to instance IDs changes how
-//! [`InstanceEvidence::Ec2`] is gathered, not this function.
+//! The loop gathers the evidence and these decide. Every input that is
+//! missing, failed or ambiguous reads unknown; only evidence from independent
+//! sources that all agree reads dead or lost.
+//!
+//! An instance is judged by its exact ID ([`instance_verdict`]): the node's
+//! recorded `node_k8s.instance_id` and each execution stamp on its rows. A
+//! same-name replacement reuses the node id and the Kubernetes name, never
+//! the instance ID, so a dead instance's rows are told apart from its
+//! replacement's. The node is lost ([`node_verdict`]) when no live machine
+//! holds its id: its heartbeat is stale, its recorded Node is gone, and its
+//! recorded instance is dead.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::time::Duration;
 
@@ -47,57 +55,55 @@ pub enum DirectGet {
     Failed,
 }
 
-/// What the cluster's instance authority says about the node's machine.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// What the cluster's instance authority answered for one tick's question
+/// about a node: the instances its rows reference, asked together with a
+/// reference instance in one `DescribeInstances` call.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InstanceEvidence {
-    /// The cluster has no instance authority to ask and its terminator does
-    /// not delete Kubernetes Nodes (the `noop` terminator, or a Direct
-    /// substrate).
+    /// The cluster has no instance authority: its terminator is not `aws`,
+    /// or the substrate is Direct. An unexpected death there reads unknown.
     NoAuthority,
-    /// The cluster's terminator is `kube-delete`: a Node's absence from
-    /// Kubernetes is what removing its machine means there.
-    KubeDelete,
-    /// EC2 `DescribeInstances` for the node and for a reference node known to
-    /// be live, made the same way.
-    Ec2 {
-        node: InstanceLookup,
-        reference: ReferenceLookup,
+    /// No fresh node whose Node the reflector lists, with a well-formed
+    /// recorded instance, could serve as the reference, so no call was made.
+    ReferenceUnavailable,
+    /// The call failed or timed out.
+    LookupFailed,
+    /// EC2 answered. `listed` maps each instance in the answer to its state;
+    /// `reference` is the reference instance's ID, which was asked for too.
+    Answered {
+        listed: BTreeMap<String, String>,
+        reference: String,
     },
 }
 
-/// EC2's answer for the node's private DNS name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum InstanceLookup {
-    /// No match, or every match `terminated`.
-    NoLiveMatch,
-    /// A match in any other state, including one EC2 adds later.
+pub enum InstanceVerdict {
+    Dead(DeadReason),
+    /// EC2 lists the instance in a state other than `terminated`, or the
+    /// node's fresh heartbeat comes from it.
     Live,
-    Failed,
+    Unknown(UnknownReason),
 }
 
-/// EC2's answer for the reference node: the control that an empty answer for
-/// the node means the instance is gone rather than that the call asked the
-/// wrong region, account or filter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ReferenceLookup {
-    /// The reference appears `running`.
-    Running,
-    /// The reference does not appear, or not `running`.
-    NotRunning,
-    /// No fresh node whose Node the reflector lists could serve as a
-    /// reference.
-    Unavailable,
-    Failed,
+pub enum DeadReason {
+    /// EC2 lists the instance `terminated`.
+    Terminated,
+    /// EC2 doesn't list the instance while listing the reference: it
+    /// terminated long enough ago to be forgotten.
+    Absent,
 }
 
-/// Everything [`verdict`] reads.
+/// Everything [`node_verdict`] reads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct VerdictInputs {
+pub struct NodeVerdictInputs {
     pub heartbeat: Heartbeat,
     pub kube: KubeEvidence,
     /// How long the recorded Node must stay absent from the reflector.
     pub absence_window: Duration,
-    pub instance: InstanceEvidence,
+    /// The verdict on the node's recorded instance; `None` when it records
+    /// none.
+    pub recorded_instance: Option<InstanceVerdict>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -108,10 +114,9 @@ pub enum Verdict {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LostReason {
-    /// EC2 has no live instance, the reference is live, and the Node is gone.
+    /// The recorded instance is dead, the Node is gone and the heartbeat is
+    /// stale.
     InstanceAndNodeGone,
-    /// The Node is gone on a `kube-delete` cluster.
-    NodeDeleted,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -123,12 +128,14 @@ pub enum UnknownReason {
     KubeAbsenceSettling,
     KubeNodeFound,
     KubeNodeLookupFailed,
+    NoRecordedInstance,
+    MalformedInstanceId,
     NoInstanceAuthority,
     InstanceLive,
     InstanceLookupFailed,
     ReferenceUnavailable,
-    ReferenceNotRunning,
-    ReferenceLookupFailed,
+    ReferenceMissing,
+    ReferenceTerminated,
 }
 
 impl Verdict {
@@ -145,13 +152,22 @@ impl Verdict {
             Self::Unknown(reason) => reason.as_str(),
         }
     }
+
+    pub const fn is_lost(self) -> bool {
+        matches!(self, Self::Lost(_))
+    }
+}
+
+impl InstanceVerdict {
+    pub const fn is_dead(self) -> bool {
+        matches!(self, Self::Dead(_))
+    }
 }
 
 impl LostReason {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::InstanceAndNodeGone => "instance_and_node_gone",
-            Self::NodeDeleted => "node_deleted",
         }
     }
 }
@@ -166,12 +182,14 @@ impl UnknownReason {
             Self::KubeAbsenceSettling => "kube_absence_settling",
             Self::KubeNodeFound => "kube_node_found",
             Self::KubeNodeLookupFailed => "kube_node_lookup_failed",
+            Self::NoRecordedInstance => "no_recorded_instance",
+            Self::MalformedInstanceId => "malformed_instance_id",
             Self::NoInstanceAuthority => "no_instance_authority",
             Self::InstanceLive => "instance_live",
             Self::InstanceLookupFailed => "instance_lookup_failed",
             Self::ReferenceUnavailable => "reference_unavailable",
-            Self::ReferenceNotRunning => "reference_not_running",
-            Self::ReferenceLookupFailed => "reference_lookup_failed",
+            Self::ReferenceMissing => "reference_missing",
+            Self::ReferenceTerminated => "reference_terminated",
         }
     }
 }
@@ -182,13 +200,53 @@ impl fmt::Display for Verdict {
     }
 }
 
-/// Whether the node is lost. Lost only when the heartbeat is stale, the
-/// recorded Node has been absent from the reflector for the whole window and
-/// a direct GET returns 404, and the instance authority agrees: EC2 lists no
-/// live instance while listing the reference `running`, or the cluster's
-/// terminator is `kube-delete`. The first condition that fails names the
-/// reason.
-pub fn verdict(inputs: &VerdictInputs) -> Verdict {
+/// Whether `instance_id` is an EC2 instance ID: `i-` and 8 or 17 lowercase
+/// hex digits. Anything else is not asked about: an ID EC2 would not
+/// recognize is absent from any answer, which would read dead.
+pub fn well_formed_instance_id(instance_id: &str) -> bool {
+    instance_id.strip_prefix("i-").is_some_and(|hex| {
+        matches!(hex.len(), 8 | 17)
+            && hex
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    })
+}
+
+/// Whether `instance_id` is dead by `evidence`. Dead only when EC2 answered,
+/// listed the reference in a state other than `terminated`, and lists the
+/// instance `terminated` or not at all; listed in any other state, including
+/// one EC2 adds later, it is live. A malformed ID reads unknown before any
+/// evidence is read.
+pub fn instance_verdict(instance_id: &str, evidence: &InstanceEvidence) -> InstanceVerdict {
+    use UnknownReason as U;
+    if !well_formed_instance_id(instance_id) {
+        return InstanceVerdict::Unknown(U::MalformedInstanceId);
+    }
+    let (listed, reference) = match evidence {
+        InstanceEvidence::NoAuthority => return InstanceVerdict::Unknown(U::NoInstanceAuthority),
+        InstanceEvidence::ReferenceUnavailable => {
+            return InstanceVerdict::Unknown(U::ReferenceUnavailable);
+        }
+        InstanceEvidence::LookupFailed => return InstanceVerdict::Unknown(U::InstanceLookupFailed),
+        InstanceEvidence::Answered { listed, reference } => (listed, reference),
+    };
+    match listed.get(reference).map(String::as_str) {
+        None => return InstanceVerdict::Unknown(U::ReferenceMissing),
+        Some("terminated") => return InstanceVerdict::Unknown(U::ReferenceTerminated),
+        Some(_) => {}
+    }
+    match listed.get(instance_id).map(String::as_str) {
+        None => InstanceVerdict::Dead(DeadReason::Absent),
+        Some("terminated") => InstanceVerdict::Dead(DeadReason::Terminated),
+        Some(_) => InstanceVerdict::Live,
+    }
+}
+
+/// Whether the node is lost: no live machine holds its id. Lost only when the
+/// heartbeat is stale, the recorded Node has been absent from the reflector
+/// for the whole window and a direct GET returns 404, and the node's recorded
+/// instance is dead. The first condition that fails names the reason.
+pub fn node_verdict(inputs: &NodeVerdictInputs) -> Verdict {
     use UnknownReason as U;
     if inputs.heartbeat == Heartbeat::Fresh {
         return Verdict::Unknown(U::HeartbeatFresh);
@@ -206,25 +264,11 @@ pub fn verdict(inputs: &VerdictInputs) -> Verdict {
             DirectGet::Failed => return Verdict::Unknown(U::KubeNodeLookupFailed),
         },
     }
-    match inputs.instance {
-        InstanceEvidence::NoAuthority => Verdict::Unknown(U::NoInstanceAuthority),
-        InstanceEvidence::KubeDelete => Verdict::Lost(LostReason::NodeDeleted),
-        InstanceEvidence::Ec2 { node, reference } => match (node, reference) {
-            (InstanceLookup::Failed, _) => Verdict::Unknown(U::InstanceLookupFailed),
-            (InstanceLookup::Live, _) => Verdict::Unknown(U::InstanceLive),
-            (InstanceLookup::NoLiveMatch, ReferenceLookup::Failed) => {
-                Verdict::Unknown(U::ReferenceLookupFailed)
-            }
-            (InstanceLookup::NoLiveMatch, ReferenceLookup::Unavailable) => {
-                Verdict::Unknown(U::ReferenceUnavailable)
-            }
-            (InstanceLookup::NoLiveMatch, ReferenceLookup::NotRunning) => {
-                Verdict::Unknown(U::ReferenceNotRunning)
-            }
-            (InstanceLookup::NoLiveMatch, ReferenceLookup::Running) => {
-                Verdict::Lost(LostReason::InstanceAndNodeGone)
-            }
-        },
+    match inputs.recorded_instance {
+        None => Verdict::Unknown(U::NoRecordedInstance),
+        Some(InstanceVerdict::Dead(_)) => Verdict::Lost(LostReason::InstanceAndNodeGone),
+        Some(InstanceVerdict::Live) => Verdict::Unknown(U::InstanceLive),
+        Some(InstanceVerdict::Unknown(reason)) => Verdict::Unknown(reason),
     }
 }
 

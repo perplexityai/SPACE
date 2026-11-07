@@ -53,7 +53,7 @@ fn admin_route_patterns_are_valid() {
                         "/nodes/{node_id}/templates/{template_name}",
                         axum::routing::delete(h),
                     )
-                    .route("/dead-node-dry-runs", get(h))
+                    .route("/dead-node-status", get(h))
                     .route("/operations", get(h))
                     .route("/operations/{operation_id}", get(h))
                     .route("/audit-events", get(h))
@@ -128,7 +128,7 @@ fn admin_route_patterns_are_valid() {
                     "/nodes/{node_id}/templates/{template_name}",
                     axum::routing::delete(h),
                 )
-                .route("/dead-node-dry-runs", get(h))
+                .route("/dead-node-status", get(h))
                 .route("/operations", get(h))
                 .route("/operations/{operation_id}", get(h))
                 .route("/audit-events", get(h))

@@ -690,6 +690,33 @@ pub fn node_observes_sandbox(sandbox_alias: &str, node_expr: &str) -> String {
     )
 }
 
+/// Boolean SQL fragment: TRUE iff some node with a fresh heartbeat
+/// ([`node_heartbeat_fresh`]) and a fresh complete census
+/// ([`node_census_fresh`]) reports the sandbox aliased `sandbox_alias` in that
+/// census: a live machine says it holds the sandbox's state, whatever the row's
+/// placement says.
+///
+/// Only the TRUE direction is evidence. FALSE includes a reporter whose
+/// heartbeat or census has gone stale, which is what a dead node's last report
+/// looks like.
+///
+/// The census row is keyed by `sandbox_id`, so the subquery reads one row and
+/// probes that row's node; the per-row node column costs a lookup per sandbox,
+/// not a scan of `node_status_snapshots`.
+pub fn live_node_reports_sandbox(sandbox_alias: &str) -> String {
+    let heartbeat = node_heartbeat_fresh("lsos.node_id");
+    let census = node_census_fresh("lsos.node_id");
+    format!(
+        "EXISTS (\n\
+             SELECT 1\n\
+               FROM sandbox_observed_states lsos\n\
+              WHERE lsos.sandbox_id = {sandbox_alias}.id\n\
+                AND {heartbeat}\n\
+                AND {census}\n\
+         )"
+    )
+}
+
 /// Boolean SQL fragment: TRUE iff the sandbox row is **provably** no longer on
 /// `node_expr` — the node answered recently, and its answer did not include
 /// this sandbox.

@@ -6,8 +6,8 @@ use pplx_space_common_core::types::{NodeId, SandboxId, SubstrateKind};
 use std::collections::BTreeMap;
 
 use pplx_space_common_core::sql;
-use pplx_space_db_test_fixtures::{SEED_ORG_ID, SEED_USER_ID, try_pg_test_db};
-use pplx_space_sandbox_store::dead_node::rows_on_node;
+use pplx_space_db_test_fixtures::try_pg_test_db;
+use pplx_space_sandbox_store::dead_node::{NodeRef, SourceExecution, rows_on_node};
 use pplx_space_sandbox_store::lost::DEAD_UPLOAD_SETTLE;
 use pplx_space_sandbox_store::test_support::NON_CANONICAL_ROWS;
 use pplx_space_test_env::TestResult;
@@ -15,205 +15,10 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use super::*;
+use crate::dead_node::row_seed_tests::*;
 
 const DEAD_NAME: &str = "worker-dead.synthetic.internal";
 const LIVE_NAME: &str = "worker-live.synthetic.internal";
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Snapshot {
-    /// A durable full snapshot taken after the row's last placement: the
-    /// portability predicate covers it.
-    Covered,
-    /// A durable full snapshot from before the last placement: ready, not
-    /// covering.
-    Uncovered,
-    None,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Pin {
-    Active,
-    Target,
-    Both,
-}
-
-async fn insert_node(pool: &PgPool, name: &str) -> TestResult<NodeId> {
-    let node_id = NodeId::new();
-    sqlx::query(sql!(
-        "INSERT INTO nodes (id, address, role, managed_by)
-         VALUES ($1, '10.0.0.9'::INET, 'worker', 'k8s')"
-    ))
-    .bind(node_id)
-    .execute(pool)
-    .await?;
-    sqlx::query(sql!(
-        "INSERT INTO node_k8s (node_id, k8s_node_name, k8s_node_uid) VALUES ($1, $2, $3)"
-    ))
-    .bind(node_id)
-    .bind(name)
-    .bind(format!("uid-{name}"))
-    .execute(pool)
-    .await?;
-    Ok(node_id)
-}
-
-/// A row last placed two hours ago, its lifecycle changed an hour ago.
-async fn insert_row(
-    pool: &PgPool,
-    lifecycle: &str,
-    managed_by: SubstrateKind,
-    active: Option<NodeId>,
-    target: Option<NodeId>,
-) -> TestResult<SandboxId> {
-    let id = SandboxId::new();
-    sqlx::query(sql!(
-        "INSERT INTO sandboxes
-            (id, user_id, org_id, managed_by, lifecycle, placement,
-             active_node_id, target_node_id, network_policy_generation,
-             lifecycle_changed_at, placement_changed_at)
-         VALUES ($1, $2::UUID, $3::UUID, $4, $5,
-                 CASE WHEN $6::UUID IS NULL THEN 'unplaced' ELSE 'on_node' END,
-                 $6, $7, 1, NOW() - INTERVAL '1 hour', NOW() - INTERVAL '2 hours')"
-    ))
-    .bind(id)
-    .bind(SEED_USER_ID)
-    .bind(SEED_ORG_ID)
-    .bind(managed_by)
-    .bind(lifecycle)
-    .bind(active)
-    .bind(target)
-    .execute(pool)
-    .await?;
-    Ok(id)
-}
-
-async fn insert_pinned(
-    pool: &PgPool,
-    lifecycle: &str,
-    pin: Pin,
-    node: NodeId,
-) -> TestResult<SandboxId> {
-    let (active, target) = match pin {
-        Pin::Active => (Some(node), None),
-        Pin::Target => (None, Some(node)),
-        Pin::Both => (Some(node), Some(node)),
-    };
-    insert_row(pool, lifecycle, SubstrateKind::Kubernetes, active, target).await
-}
-
-/// One snapshot row. `age_secs` sets `timestamp`; `attempt_age_secs`, when
-/// given, sets `last_attempt_at`. A `ready` one gets a storage location.
-#[derive(Debug, Clone, Copy)]
-struct SnapshotSeed {
-    kind: &'static str,
-    state: &'static str,
-    source_node: Option<NodeId>,
-    age_secs: i64,
-    attempt_age_secs: Option<i64>,
-    artifact: Option<(Uuid, &'static str)>,
-}
-
-impl SnapshotSeed {
-    fn full(state: &'static str, age_secs: i64) -> Self {
-        Self {
-            kind: "full",
-            state,
-            source_node: None,
-            age_secs,
-            attempt_age_secs: None,
-            artifact: None,
-        }
-    }
-}
-
-async fn insert_snapshot(pool: &PgPool, sandbox_id: SandboxId, seed: SnapshotSeed) -> TestResult {
-    let snapshot_id = Uuid::now_v7();
-    let (artifact_id, artifact_origin) = match seed.artifact {
-        Some((id, origin)) => (Some(id), Some(origin)),
-        None => (None, None),
-    };
-    sqlx::query(sql!(
-        "INSERT INTO snapshots
-            (id, sandbox_id, org_id, type, state, source_node_id, timestamp,
-             last_attempt_at, local_artifact_id, artifact_kind, artifact_origin)
-         VALUES ($1, $2, $3::UUID, $4, $5, $6,
-                 NOW() - make_interval(secs => $7::BIGINT),
-                 NOW() - make_interval(secs => $8::BIGINT),
-                 $9, CASE WHEN $9::UUID IS NULL THEN NULL ELSE $4 END, $10)"
-    ))
-    .bind(snapshot_id)
-    .bind(sandbox_id)
-    .bind(SEED_ORG_ID)
-    .bind(seed.kind)
-    .bind(seed.state)
-    .bind(seed.source_node)
-    .bind(seed.age_secs)
-    .bind(seed.attempt_age_secs)
-    .bind(artifact_id)
-    .bind(artifact_origin)
-    .execute(pool)
-    .await?;
-    if seed.state == "ready" {
-        sqlx::query(sql!(
-            "INSERT INTO snapshot_storage_locations (snapshot_id, storage_connection_string)
-             VALUES ($1, $2)"
-        ))
-        .bind(snapshot_id)
-        .bind(format!("s3://synthetic-bucket/{snapshot_id}"))
-        .execute(pool)
-        .await?;
-    }
-    Ok(())
-}
-
-async fn seed_snapshot(pool: &PgPool, sandbox_id: SandboxId, snapshot: Snapshot) -> TestResult {
-    match snapshot {
-        Snapshot::Covered => {
-            insert_snapshot(pool, sandbox_id, SnapshotSeed::full("ready", 1800)).await
-        }
-        Snapshot::Uncovered => {
-            insert_snapshot(pool, sandbox_id, SnapshotSeed::full("ready", 3 * 3600)).await
-        }
-        Snapshot::None => Ok(()),
-    }
-}
-
-/// A `creating` full upload from `node` that started just now.
-async fn seed_pending_upload(pool: &PgPool, sandbox_id: SandboxId, node: NodeId) -> TestResult {
-    insert_snapshot(
-        pool,
-        sandbox_id,
-        SnapshotSeed {
-            source_node: Some(node),
-            ..SnapshotSeed::full("creating", 0)
-        },
-    )
-    .await
-}
-
-/// An execution of the sandbox on `node_name`; `None` is a pod not scheduled
-/// yet.
-async fn insert_execution(
-    pool: &PgPool,
-    sandbox_id: SandboxId,
-    node_name: Option<&str>,
-    active: bool,
-) -> TestResult {
-    sqlx::query(sql!(
-        "INSERT INTO sandbox_k8s_executions
-            (sandbox_id, generation, pod_name, pod_namespace, k8s_node_name, state, active,
-             terminated_at)
-         VALUES ($1, 1, $2, 'sandboxes', $3, 'running', $4,
-                 CASE WHEN $4 THEN NULL ELSE NOW() END)"
-    ))
-    .bind(sandbox_id)
-    .bind(format!("space-sbx-{}", sandbox_id.as_uuid().simple()))
-    .bind(node_name)
-    .bind(active)
-    .execute(pool)
-    .await?;
-    Ok(())
-}
 
 async fn outcomes_on(
     pool: &PgPool,
@@ -222,9 +27,11 @@ async fn outcomes_on(
 ) -> TestResult<BTreeMap<SandboxId, RowOutcome>> {
     let rows = rows_on_node(
         pool,
-        node,
-        Some(name),
-        SubstrateKind::Kubernetes,
+        NodeRef {
+            node_id: node,
+            k8s_node_name: Some(name),
+            managed_by: SubstrateKind::Kubernetes,
+        },
         DEAD_UPLOAD_SETTLE,
         10_000,
     )
@@ -505,5 +312,76 @@ async fn stop_artifacts_and_upload_windows_decide_the_edges() -> TestResult {
     }
 
     assert_eq!(outcomes_on(pool, dead, DEAD_NAME).await?, expected);
+    Ok(())
+}
+
+/// A row's source execution is its latest execution, by generation, when
+/// that ran on the node's name, with its stamp and whether it is active; an
+/// older execution on the node under a newer one elsewhere, or none, gives
+/// none.
+#[tokio::test(flavor = "current_thread")]
+async fn the_source_execution_is_the_latest_one_when_it_ran_on_the_node() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let pool = &db.pool;
+    let dead = insert_node(pool, DEAD_NAME).await?;
+    const STAMP: &str = "i-0123456789abcdef0";
+
+    // (executions oldest first as (node name, stamp, active), expected
+    // source as (generation, stamp, active)).
+    type Execution = (&'static str, Option<&'static str>, bool);
+    type Source = (i64, Option<&'static str>, bool);
+    let cases: [(&[Execution], Option<Source>); 5] = [
+        (
+            &[(DEAD_NAME, Some(STAMP), true)],
+            Some((1, Some(STAMP), true)),
+        ),
+        (&[(DEAD_NAME, None, false)], Some((1, None, false))),
+        (
+            &[(LIVE_NAME, None, false), (DEAD_NAME, Some(STAMP), false)],
+            Some((2, Some(STAMP), false)),
+        ),
+        (
+            &[(DEAD_NAME, Some(STAMP), false), (LIVE_NAME, None, true)],
+            None,
+        ),
+        (&[], None),
+    ];
+    let mut expected = BTreeMap::new();
+    for (executions, source) in cases {
+        let id = insert_pinned(pool, "suspended", Pin::Target, dead).await?;
+        let mut ids = Vec::new();
+        for (generation, (name, stamp, active)) in (1..).zip(executions) {
+            ids.push(
+                insert_stamped_execution(pool, id, generation, Some(name), *stamp, *active).await?,
+            );
+        }
+        expected.insert(
+            id,
+            source.map(|(generation, stamp, active)| SourceExecution {
+                id: ids[usize::try_from(generation - 1).unwrap()],
+                instance_id: stamp.map(str::to_owned),
+                active,
+            }),
+        );
+    }
+
+    let rows = rows_on_node(
+        pool,
+        NodeRef {
+            node_id: dead,
+            k8s_node_name: Some(DEAD_NAME),
+            managed_by: SubstrateKind::Kubernetes,
+        },
+        DEAD_UPLOAD_SETTLE,
+        100,
+    )
+    .await?;
+    let read: BTreeMap<SandboxId, Option<SourceExecution>> = rows
+        .into_iter()
+        .map(|row| (row.sandbox_id, row.source_execution))
+        .collect();
+    assert_eq!(read, expected);
     Ok(())
 }

@@ -336,6 +336,7 @@ fn config(grace_secs: u64, max_per_min: u32, dry_run: bool) -> ReconcilerConfig 
         max_new_quarantines_per_sweep: DEFAULT_MAX_NEW_QUARANTINES_PER_SWEEP,
         max_quarantine_percentage: DEFAULT_MAX_QUARANTINE_PERCENTAGE,
         dry_run,
+        leave_dead_node_rows: false,
     }
 }
 
@@ -595,8 +596,14 @@ async fn split_operation_expired_stopped_row_has_no_orphan_owner_proof() -> Test
     .execute(&db.pool)
     .await?;
     for _ in 0..3 {
-        let candidates =
-            list_candidates_after(&db.pool, None, SandboxId::from_uuid(Uuid::max()), 100).await?;
+        let candidates = list_candidates_after(
+            &db.pool,
+            None,
+            SandboxId::from_uuid(Uuid::max()),
+            100,
+            false,
+        )
+        .await?;
         assert!(candidates.iter().all(|row| row.sandbox_id != sandbox_id));
     }
     Ok(())
@@ -613,7 +620,7 @@ async fn candidate_scan_lists_missing_pod_without_node_observation() -> TestResu
     insert_started_sandbox_with_active_execution(&db.pool, sandbox_id, node_id).await?;
 
     let candidates =
-        list_candidates_after(&db.pool, None, SandboxId::from_uuid(Uuid::max()), 10).await?;
+        list_candidates_after(&db.pool, None, SandboxId::from_uuid(Uuid::max()), 10, false).await?;
 
     assert_eq!(candidates.len(), 1);
     assert_eq!(candidates[0].sandbox_id, sandbox_id);
@@ -623,6 +630,71 @@ async fn candidate_scan_lists_missing_pod_without_node_observation() -> TestResu
         candidates[0].pod_uid.as_ref().map(PodUid::as_str),
         Some(expected_pod_uid.as_str())
     );
+    Ok(())
+}
+
+/// Where the dead-node verb runs live, a row on a node with a stale heartbeat
+/// or one the verb judged lost is left to it; a row on a fresh node with no
+/// such verdict, or one with only an `unknown` verdict, is still listed.
+/// Without the verb live every row is listed.
+#[tokio::test(flavor = "current_thread")]
+async fn candidate_scan_leaves_dead_node_rows_to_the_live_verb() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let pool = &db.pool;
+    let mut expected_left_out = Vec::new();
+    let mut expected_listed = Vec::new();
+    for (heartbeat_fresh, verdict, left_out) in [
+        (false, None, true),
+        (true, Some("lost"), true),
+        (true, None, false),
+        (true, Some("unknown"), false),
+    ] {
+        let node_id = NodeId::new();
+        let sandbox_id = SandboxId::new();
+        insert_node(pool, node_id).await?;
+        insert_started_sandbox_with_active_execution(pool, sandbox_id, node_id).await?;
+        if heartbeat_fresh {
+            sqlx::query(sql!(
+                "INSERT INTO node_status_snapshots
+                    (node_id, observed_at, stale_after, reachable, services, updated_at)
+                 VALUES ($1, NOW(), NOW() + INTERVAL '1 minute', TRUE, '[]'::JSONB, NOW())"
+            ))
+            .bind(node_id)
+            .execute(pool)
+            .await?;
+        }
+        sqlx::query(sql!(
+            "UPDATE nodes SET dead_node_status = jsonb_build_object('verdict', $2::TEXT)
+              WHERE id = $1 AND $2::TEXT IS NOT NULL"
+        ))
+        .bind(node_id)
+        .bind(verdict)
+        .execute(pool)
+        .await?;
+        if left_out {
+            expected_left_out.push(sandbox_id);
+        } else {
+            expected_listed.push(sandbox_id);
+        }
+    }
+    let listed = |leave: bool| async move {
+        let rows = list_candidates_after(pool, None, SandboxId::from_uuid(Uuid::max()), 100, leave)
+            .await?;
+        let mut ids: Vec<SandboxId> = rows.iter().map(|row| row.sandbox_id).collect();
+        ids.sort();
+        Ok::<_, sqlx::Error>(ids)
+    };
+    let mut all: Vec<SandboxId> = expected_left_out
+        .iter()
+        .chain(&expected_listed)
+        .copied()
+        .collect();
+    all.sort();
+    expected_listed.sort();
+    assert_eq!(listed(false).await?, all);
+    assert_eq!(listed(true).await?, expected_listed);
     Ok(())
 }
 
@@ -684,7 +756,7 @@ async fn candidate_scan_skips_sandbox_with_node_observation() -> TestResult {
     insert_observed_sandbox_state(&db.pool, sandbox_id, node_id, 60).await?;
 
     let candidates =
-        list_candidates_after(&db.pool, None, SandboxId::from_uuid(Uuid::max()), 10).await?;
+        list_candidates_after(&db.pool, None, SandboxId::from_uuid(Uuid::max()), 10, false).await?;
 
     assert!(
         candidates.is_empty(),
@@ -705,7 +777,7 @@ async fn candidate_scan_defers_to_projection_gc_for_observed_rows() -> TestResul
     insert_observed_sandbox_state(&db.pool, sandbox_id, node_id, 3_600).await?;
 
     let candidates =
-        list_candidates_after(&db.pool, None, SandboxId::from_uuid(Uuid::max()), 10).await?;
+        list_candidates_after(&db.pool, None, SandboxId::from_uuid(Uuid::max()), 10, false).await?;
 
     assert!(
         candidates.is_empty(),
@@ -728,7 +800,7 @@ async fn candidate_scan_ignores_observation_from_other_node() -> TestResult {
     insert_observed_sandbox_state(&db.pool, sandbox_id, other_node_id, 60).await?;
 
     let candidates =
-        list_candidates_after(&db.pool, None, SandboxId::from_uuid(Uuid::max()), 10).await?;
+        list_candidates_after(&db.pool, None, SandboxId::from_uuid(Uuid::max()), 10, false).await?;
 
     assert_eq!(candidates.len(), 1);
     assert_eq!(candidates[0].sandbox_id, sandbox_id);
@@ -754,7 +826,7 @@ async fn candidate_scan_lists_legacy_deleting_row() -> TestResult {
     .await?;
 
     let candidates =
-        list_candidates_after(&db.pool, None, SandboxId::from_uuid(Uuid::max()), 10).await?;
+        list_candidates_after(&db.pool, None, SandboxId::from_uuid(Uuid::max()), 10, false).await?;
 
     assert_eq!(candidates.len(), 1);
     assert_eq!(candidates[0].sandbox_id, sandbox_id);
@@ -2918,7 +2990,7 @@ async fn direct_rows_do_not_bound_the_sweep_or_become_candidates() -> TestResult
     let upper = SandboxId::from_uuid(Uuid::max());
     assert_eq!(sink.current_max_sandbox_id().await?, Some(sandbox_id));
     assert_eq!(
-        list_candidates_after(&db.pool, None, upper, 10)
+        list_candidates_after(&db.pool, None, upper, 10, false)
             .await?
             .len(),
         1,
@@ -2933,7 +3005,7 @@ async fn direct_rows_do_not_bound_the_sweep_or_become_candidates() -> TestResult
     .await?;
     assert_eq!(sink.current_max_sandbox_id().await?, None);
     assert!(
-        list_candidates_after(&db.pool, None, upper, 10)
+        list_candidates_after(&db.pool, None, upper, 10, false)
             .await?
             .is_empty()
     );

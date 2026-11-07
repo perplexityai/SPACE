@@ -204,6 +204,11 @@ pub struct ReconcilerConfig {
     pub max_new_quarantines_per_sweep: u32,
     pub max_quarantine_percentage: u32,
     pub dry_run: bool,
+    /// The dead-node verb runs live, so rows on a node whose heartbeat is
+    /// stale or which the verb judged lost are its to reconcile, and this
+    /// loop leaves them alone. Set by the reconciler set, not the
+    /// environment.
+    pub leave_dead_node_rows: bool,
 }
 
 impl ReconcilerConfig {
@@ -247,6 +252,7 @@ impl ReconcilerConfig {
             // Dry-run defaults to true so a fresh deployment gets
             // observability before any writes happen.
             dry_run: config.truthy_default("SPACE_API_RECONCILER_DRY_RUN", true),
+            leave_dead_node_rows: false,
         }
     }
 }
@@ -1101,6 +1107,8 @@ fn pod_all_containers_terminated(pod: &SandboxPodView) -> bool {
 pub struct SubstrateActionSink {
     pool: PgPool,
     pod_cleaner: Option<Arc<dyn ProjectionPodCleaner>>,
+    /// [`ReconcilerConfig::leave_dead_node_rows`].
+    leave_dead_node_rows: bool,
 }
 
 impl SubstrateActionSink {
@@ -1108,7 +1116,15 @@ impl SubstrateActionSink {
         Self {
             pool,
             pod_cleaner: Some(substrate),
+            leave_dead_node_rows: false,
         }
+    }
+
+    /// Leave rows on nodes the dead-node verb reconciles out of the
+    /// candidate read ([`ReconcilerConfig::leave_dead_node_rows`]).
+    pub fn leaving_dead_node_rows(mut self, leave: bool) -> Self {
+        self.leave_dead_node_rows = leave;
+        self
     }
 
     #[cfg(test)]
@@ -1116,6 +1132,7 @@ impl SubstrateActionSink {
         Self {
             pool,
             pod_cleaner: None,
+            leave_dead_node_rows: false,
         }
     }
 
@@ -1123,6 +1140,7 @@ impl SubstrateActionSink {
     fn new_with_pod_cleaner(pool: PgPool, pod_cleaner: Arc<dyn ProjectionPodCleaner>) -> Self {
         Self {
             pool,
+            leave_dead_node_rows: false,
             pod_cleaner: Some(pod_cleaner),
         }
     }
@@ -1646,34 +1664,24 @@ impl SubstrateActionSink {
         upper_bound: SandboxId,
         limit: i64,
     ) -> Result<Vec<OrphanCandidateRow>, sqlx::Error> {
-        list_candidates_after(&self.pool, after_sandbox_id, upper_bound, limit).await
+        list_candidates_after(
+            &self.pool,
+            after_sandbox_id,
+            upper_bound,
+            limit,
+            self.leave_dead_node_rows,
+        )
+        .await
     }
 }
 
-async fn list_candidates_after(
-    pool: &PgPool,
-    after_sandbox_id: Option<SandboxId>,
-    upper_bound: SandboxId,
-    limit: i64,
-) -> Result<Vec<OrphanCandidateRow>, sqlx::Error> {
-    // The second predicate branch picks up "forgotten" rows: a sandbox
-    // whose **most recent** execution is `state='forgotten'` (set by
-    // `finish_active_execution_in(..., "forgotten")` inside
-    // `forget_pod_tracking`). The "most recent" qualifier is critical:
-    // if an old `forgotten` execution exists but a later execution
-    // succeeded (e.g. a recovery + suspend with `state='suspended'`),
-    // that newer execution carries recoverable on-disk state. Looking
-    // only for *any* `forgotten` would quarantine that recoverable
-    // sandbox and orphan its snapshot. Looking at the *latest*
-    // execution's state is the precise orphan signal.
-    //
-    // The final branch picks up rows stranded in `lifecycle='deleting'` by
-    // the old orphan cleanup path so their durable delete claim can complete.
-    //
-    // `s.id <= $3` bounds the sweep against new sandboxes created after
-    // the high-water mark was captured; the next sweep picks them up.
-    sqlx::query_as(sql!(
-        r"
+/// The candidate read: built once, interpolating only the shared heartbeat
+/// fragment; every value is bound.
+static LIST_CANDIDATES_AFTER: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    let fresh = pplx_space_sandbox_residency::node_heartbeat_fresh("dn.id");
+    sql!(
+        format!(
+            r"
             SELECT s.id AS sandbox_id,
                    e.pod_name,
                    NULLIF(BTRIM(e.pod_uid), '') AS pod_uid,
@@ -1742,23 +1750,65 @@ async fn list_candidates_after(
                         OR sos.node_id IS NOT DISTINCT FROM s.active_node_id
                     )
               )
+              -- Where the dead-node verb runs live ($10), a row on a node
+              -- whose heartbeat is stale or which the verb judged lost is
+              -- the verb's to reconcile.
+              AND NOT ($10 AND EXISTS (
+                  SELECT 1
+                  FROM nodes dn
+                  WHERE (dn.id = s.active_node_id OR dn.id = s.target_node_id)
+                    AND (
+                        NOT {fresh}
+                        OR dn.dead_node_status ->> 'verdict' = 'lost'
+                    )
+              ))
               AND ($2::uuid IS NULL OR s.id > $2)
               AND s.id <= $3
             ORDER BY s.id
             LIMIT $4
             "
-    ))
-    .bind(ORPHAN_RECONCILER_STOP_LIFECYCLES)
-    .bind(after_sandbox_id)
-    .bind(upper_bound)
-    .bind(limit)
-    .bind(LIVE_POD_REQUIRED_LIFECYCLES)
-    .bind(PENDING_POD_LIFECYCLES)
-    .bind(CREATE_AGE_THRESHOLD_SECS)
-    .bind(ACTIVE_EXECUTION_REQUIRED_LIFECYCLES)
-    .bind(SubstrateKind::Kubernetes)
-    .fetch_all(pool)
-    .await
+        )
+        .as_str()
+    )
+});
+
+async fn list_candidates_after(
+    pool: &PgPool,
+    after_sandbox_id: Option<SandboxId>,
+    upper_bound: SandboxId,
+    limit: i64,
+    leave_dead_node_rows: bool,
+) -> Result<Vec<OrphanCandidateRow>, sqlx::Error> {
+    // The second predicate branch picks up "forgotten" rows: a sandbox
+    // whose **most recent** execution is `state='forgotten'` (set by
+    // `finish_active_execution_in(..., "forgotten")` inside
+    // `forget_pod_tracking`). The "most recent" qualifier is critical:
+    // if an old `forgotten` execution exists but a later execution
+    // succeeded (e.g. a recovery + suspend with `state='suspended'`),
+    // that newer execution carries recoverable on-disk state. Looking
+    // only for *any* `forgotten` would quarantine that recoverable
+    // sandbox and orphan its snapshot. Looking at the *latest*
+    // execution's state is the precise orphan signal.
+    //
+    // The final branch picks up rows stranded in `lifecycle='deleting'` by
+    // the old orphan cleanup path so their durable delete claim can complete.
+    //
+    // `s.id <= $3` bounds the sweep against new sandboxes created after
+    // the high-water mark was captured; the next sweep picks them up. The
+    // statement is [`LIST_CANDIDATES_AFTER`].
+    sqlx::query_as(sqlx::AssertSqlSafe(LIST_CANDIDATES_AFTER.as_str()))
+        .bind(ORPHAN_RECONCILER_STOP_LIFECYCLES)
+        .bind(after_sandbox_id)
+        .bind(upper_bound)
+        .bind(limit)
+        .bind(LIVE_POD_REQUIRED_LIFECYCLES)
+        .bind(PENDING_POD_LIFECYCLES)
+        .bind(CREATE_AGE_THRESHOLD_SECS)
+        .bind(ACTIVE_EXECUTION_REQUIRED_LIFECYCLES)
+        .bind(SubstrateKind::Kubernetes)
+        .bind(leave_dead_node_rows)
+        .fetch_all(pool)
+        .await
 }
 
 /// Run the orphaned-sandbox reconcile loop on the current task until the
@@ -1781,6 +1831,7 @@ pub async fn run(
         max_new_quarantines_per_sweep = config.max_new_quarantines_per_sweep,
         max_quarantine_percentage = config.max_quarantine_percentage,
         dry_run = config.dry_run,
+        leave_dead_node_rows = config.leave_dead_node_rows,
         "starting orphaned-sandbox reconciler"
     );
     if !config.enabled {
@@ -1792,7 +1843,8 @@ pub async fn run(
 
     let mut quarantine_repair = quarantine_recovery::Repair::new(pool.clone(), kube.clone());
     let presence = ReflectorPresence::new(kube.clone());
-    let sink = SubstrateActionSink::new(pool, kube);
+    let sink =
+        SubstrateActionSink::new(pool, kube).leaving_dead_node_rows(config.leave_dead_node_rows);
     let mut reconciler = Reconciler::new(config.clone(), presence, sink);
 
     let mut interval = tokio::time::interval(config.interval);

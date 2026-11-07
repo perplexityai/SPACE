@@ -1,14 +1,18 @@
-//! Reads and the report row of the cluster controller's dead-node verb.
+//! Reads and writes of the cluster controller's dead-node verb.
 //!
-//! The verb judges whether a node is lost and decides, for every sandbox row
-//! the node still holds, what reconciling that row would do. Deciding is the
-//! controller's; this module supplies the facts each decision reads
-//! ([`rows_on_node`]) and keeps the verb's last result per node in
-//! `dead_node_dry_runs` ([`upsert_report`], [`reports`]) for the admin API,
-//! which runs in another process.
+//! The verb judges which EC2 instances a node's rows ran on are dead, decides
+//! for every sandbox row the node still holds what reconciling it does, and in
+//! live mode applies that. Deciding is the controller's; this module supplies
+//! the facts each decision reads ([`rows_on_node`], [`row_on_node`]), the
+//! guarded writes of each outcome ([`lock_row`], [`release_from_node`],
+//! [`mark_lost`], [`retire_source_execution`]; a `deleting` row finishes
+//! through [`crate::delete::delete_with_dependents`] and a lost one is written
+//! off through [`crate::lost::write_off_lost_sandbox`]), and the verb's last
+//! result per node in `nodes.dead_node_status` ([`write_status`],
+//! [`statuses`]) for the admin API, which runs in another process.
 //!
-//! [`rows_on_node`] writes nothing and takes no lock. The report is the only
-//! table the verb writes in its dry run.
+//! [`rows_on_node`] writes nothing and takes no lock. In a dry run the status
+//! is the only value the verb writes.
 
 use pplx_space_common_core::types::{NodeId, SandboxId, SubstrateKind};
 
@@ -22,9 +26,12 @@ use pplx_space_sandbox_portability::{
     fresh_ready_snapshot_exists, inflight_suspend_upload_from_other_node_exists,
     snapshot_has_durable_copy, stopped_artifact_durable,
 };
+use pplx_space_sandbox_residency::live_node_reports_sandbox;
 use serde::{Deserialize, Serialize};
 use sqlx::types::Json;
+use sqlx::{Postgres, Transaction};
 use time::OffsetDateTime;
+use uuid::Uuid;
 
 use crate::StoredSandboxLifecycle;
 
@@ -60,6 +67,27 @@ pub struct DeadNodeRow {
     /// An active `sandbox_k8s_executions` row runs off the node: on another
     /// Kubernetes node, or not scheduled yet (`k8s_node_name` NULL).
     pub execution_elsewhere: bool,
+    /// The sandbox's latest execution (highest generation), when it ran on
+    /// the node's Kubernetes name: the execution whose machine held the row's
+    /// current state, and the only one a write-off retires.
+    pub source_execution: Option<SourceExecution>,
+    /// A node with a fresh heartbeat and a fresh complete census reports
+    /// holding the sandbox
+    /// ([`pplx_space_sandbox_residency::live_node_reports_sandbox`]).
+    pub reported_by_live_node: bool,
+    /// A drain restore episode is open on the row
+    /// (`restore_episode_target` is set): the restore operation owns it.
+    pub restore_owned: bool,
+}
+
+/// A row's latest execution on the node.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceExecution {
+    pub id: Uuid,
+    /// `node_instance_id`: the EC2 instance its pod was bound to, `None` when
+    /// none was known.
+    pub instance_id: Option<String>,
+    pub active: bool,
 }
 
 /// The statement's row; [`DeadNodeRow`] parses the lifecycle.
@@ -72,6 +100,11 @@ struct FactsRow {
     stop_artifact_durable: bool,
     upload_pending: bool,
     execution_elsewhere: bool,
+    source_execution_id: Option<Uuid>,
+    source_instance_id: Option<String>,
+    source_active: Option<bool>,
+    reported_by_live_node: bool,
+    restore_owned: bool,
 }
 
 impl From<FactsRow> for DeadNodeRow {
@@ -85,13 +118,20 @@ impl From<FactsRow> for DeadNodeRow {
             stop_artifact_durable: row.stop_artifact_durable,
             upload_pending: row.upload_pending,
             execution_elsewhere: row.execution_elsewhere,
+            source_execution: row.source_execution_id.map(|id| SourceExecution {
+                id,
+                instance_id: row.source_instance_id,
+                active: row.source_active.unwrap_or(false),
+            }),
+            reported_by_live_node: row.reported_by_live_node,
+            restore_owned: row.restore_owned,
         }
     }
 }
 
 /// `$1` = node id, `$2` = the node's Kubernetes name (NULL for a Direct node),
 /// `$3` = the upload quiet window in seconds, `$4` = row limit, `$5` = the
-/// node's substrate.
+/// node's substrate, `$6` = one sandbox id to read, or NULL for all.
 ///
 /// The selection is three probes, so each walks its own index: the
 /// `active_node_id` and `target_node_id` indexes, and the active-execution
@@ -107,6 +147,7 @@ static ROWS_ON_NODE: LazyLock<String> = LazyLock::new(|| {
     let durable = snapshot_has_durable_copy("ready_snapshot");
     let stop_durable = stopped_artifact_durable("s");
     let inflight_elsewhere = inflight_suspend_upload_from_other_node_exists("s", "$1");
+    let reported = live_node_reports_sandbox("s");
     sql!(
         format!(
             "SELECT s.id,
@@ -135,9 +176,26 @@ static ROWS_ON_NODE: LazyLock<String> = LazyLock::new(|| {
                          WHERE e.sandbox_id = s.id
                            AND e.active
                            AND e.k8s_node_name IS DISTINCT FROM $2
-                    ) AS execution_elsewhere
+                    ) AS execution_elsewhere,
+                    latest.id AS source_execution_id,
+                    latest.node_instance_id AS source_instance_id,
+                    latest.active AS source_active,
+                    {reported} AS reported_by_live_node,
+                    s.restore_episode_target IS NOT NULL AS restore_owned
                FROM sandboxes s
+               LEFT JOIN LATERAL (
+                    SELECT e.id, e.node_instance_id, e.active
+                      FROM (
+                        SELECT id, node_instance_id, active, k8s_node_name
+                          FROM sandbox_k8s_executions
+                         WHERE sandbox_id = s.id
+                         ORDER BY generation DESC
+                         LIMIT 1
+                      ) e
+                     WHERE e.k8s_node_name = $2
+               ) latest ON TRUE
               WHERE s.managed_by = $5
+                AND ($6::UUID IS NULL OR s.id = $6)
                 AND s.id IN (
                     SELECT id FROM sandboxes WHERE active_node_id = $1
                     UNION
@@ -155,29 +213,176 @@ static ROWS_ON_NODE: LazyLock<String> = LazyLock::new(|| {
     )
 });
 
-/// Up to `limit` sandbox rows of `managed_by` that `node_id` holds, by id:
+/// The node a dead-node read is about.
+#[derive(Debug, Clone, Copy)]
+pub struct NodeRef<'a> {
+    pub node_id: NodeId,
+    /// `node_k8s.k8s_node_name`; `None` for a Direct node.
+    pub k8s_node_name: Option<&'a str>,
+    pub managed_by: SubstrateKind,
+}
+
+/// Up to `limit` sandbox rows of `node.managed_by` that `node` holds, by id:
 /// rows whose `active_node_id` or `target_node_id` names it, and rows with an
-/// active execution on `k8s_node_name`. `upload_settle` is the quiet window
-/// for [`DeadNodeRow::upload_pending`].
+/// active execution on its Kubernetes name. `upload_settle` is the quiet
+/// window for [`DeadNodeRow::upload_pending`].
 ///
 /// A read: it writes nothing and takes no lock.
 pub async fn rows_on_node(
     executor: impl sqlx::PgExecutor<'_>,
-    node_id: NodeId,
-    k8s_node_name: Option<&str>,
-    managed_by: SubstrateKind,
+    node: NodeRef<'_>,
     upload_settle: Duration,
     limit: u32,
 ) -> Result<Vec<DeadNodeRow>, sqlx::Error> {
+    read_rows(executor, node, upload_settle, limit, None).await
+}
+
+/// [`rows_on_node`] for one sandbox: its facts if `node` still holds it.
+/// Run after [`lock_row`] in the same transaction, so the facts a write
+/// decides on are the committed ones and stay so until it commits.
+pub async fn row_on_node(
+    tx: &mut Transaction<'_, Postgres>,
+    node: NodeRef<'_>,
+    sandbox_id: SandboxId,
+    upload_settle: Duration,
+) -> Result<Option<DeadNodeRow>, sqlx::Error> {
+    Ok(
+        read_rows(&mut **tx, node, upload_settle, 1, Some(sandbox_id))
+            .await?
+            .pop(),
+    )
+}
+
+async fn read_rows(
+    executor: impl sqlx::PgExecutor<'_>,
+    node: NodeRef<'_>,
+    upload_settle: Duration,
+    limit: u32,
+    sandbox_id: Option<SandboxId>,
+) -> Result<Vec<DeadNodeRow>, sqlx::Error> {
     let rows: Vec<FactsRow> = sqlx::query_as(sqlx::AssertSqlSafe(ROWS_ON_NODE.as_str()))
-        .bind(node_id)
-        .bind(k8s_node_name)
+        .bind(node.node_id)
+        .bind(node.k8s_node_name)
         .bind(upload_settle.as_secs().cast_signed())
         .bind(i64::from(limit))
-        .bind(managed_by)
+        .bind(node.managed_by)
+        .bind(sandbox_id)
         .fetch_all(executor)
         .await?;
     Ok(rows.into_iter().map(DeadNodeRow::from).collect())
+}
+
+/// Lock the sandbox row for a dead-node write, `FOR UPDATE`. Returns whether
+/// the row exists. Take the node's locks first (nodes, `node_k8s`, then
+/// sandboxes, the placement order), then re-read the row with
+/// [`row_on_node`] before writing.
+pub async fn lock_row(
+    tx: &mut Transaction<'_, Postgres>,
+    sandbox_id: SandboxId,
+) -> Result<bool, sqlx::Error> {
+    let locked: Option<i32> =
+        sqlx::query_scalar(sql!("SELECT 1 FROM sandboxes WHERE id = $1 FOR UPDATE"))
+            .bind(sandbox_id)
+            .fetch_optional(&mut **tx)
+            .await?;
+    Ok(locked.is_some())
+}
+
+/// Release the row from `node_id` keeping its lifecycle: clear
+/// `active_node_id` when it names the node, and `target_node_id` too unless
+/// `keep_target` (a `failed` row or tombstone keeps it as the last place it
+/// lived, as [`crate::lost::release_lost_placement`] does), leaving the row
+/// `unplaced` once nothing runs it. Guarded by the `stored_lifecycle` the
+/// caller re-read under [`lock_row`]; returns whether the row changed.
+///
+/// Writes an **inference**: the dead-node verb concluding the machine that
+/// held the row is gone, so a restore or start goes elsewhere.
+pub async fn release_from_node(
+    tx: &mut Transaction<'_, Postgres>,
+    sandbox_id: SandboxId,
+    node_id: NodeId,
+    stored_lifecycle: &str,
+    keep_target: bool,
+) -> Result<bool, sqlx::Error> {
+    let released = sqlx::query(sql!(
+        "UPDATE sandboxes
+            SET active_node_id = CASE WHEN active_node_id = $2 THEN NULL ELSE active_node_id END,
+                target_node_id = CASE
+                    WHEN target_node_id = $2 AND NOT $4 THEN NULL
+                    ELSE target_node_id
+                END,
+                placement = CASE
+                    WHEN active_node_id IS NULL OR active_node_id = $2 THEN 'unplaced'
+                    ELSE placement
+                END,
+                command_ready_pending = FALSE,
+                placement_changed_at = NULL
+          WHERE id = $1
+            AND lifecycle = $3
+            AND (active_node_id = $2 OR (target_node_id = $2 AND NOT $4))"
+    ))
+    .bind(sandbox_id)
+    .bind(node_id)
+    .bind(stored_lifecycle)
+    .bind(keep_target)
+    .execute(&mut **tx)
+    .await?
+    .rows_affected();
+    Ok(released == 1)
+}
+
+/// Flip the row to `failed` as lost, from the `stored_lifecycle` the caller
+/// re-read under [`lock_row`]; returns whether it flipped. Any snapshot is
+/// kept. The caller writes the row off in the same transaction with
+/// [`crate::lost::write_off_lost_sandbox`].
+///
+/// Writes an **inference**: the dead-node verb concluding the row's only
+/// current state died with its machine.
+pub async fn mark_lost(
+    tx: &mut Transaction<'_, Postgres>,
+    sandbox_id: SandboxId,
+    stored_lifecycle: &str,
+) -> Result<bool, sqlx::Error> {
+    let flipped = sqlx::query(sql!(
+        "UPDATE sandboxes
+            SET lifecycle = 'failed',
+                restore_episode_target = NULL
+          WHERE id = $1
+            AND lifecycle = $2"
+    ))
+    .bind(sandbox_id)
+    .bind(stored_lifecycle)
+    .execute(&mut **tx)
+    .await?
+    .rows_affected();
+    Ok(flipped == 1)
+}
+
+/// Retire `execution_id`, the row's source execution, as `forgotten`, the
+/// pod-tracking write-off state: its pod died with the machine. Only that
+/// execution, and only while it is active; returns whether it changed.
+pub async fn retire_source_execution(
+    tx: &mut Transaction<'_, Postgres>,
+    sandbox_id: SandboxId,
+    execution_id: Uuid,
+) -> Result<bool, sqlx::Error> {
+    let retired = sqlx::query(sql!(
+        "UPDATE sandbox_k8s_executions
+            SET active = FALSE,
+                state = 'forgotten',
+                pod_ip = NULL,
+                terminated_at = COALESCE(terminated_at, NOW()),
+                updated_at = NOW()
+          WHERE id = $2
+            AND sandbox_id = $1
+            AND active"
+    ))
+    .bind(sandbox_id)
+    .bind(execution_id)
+    .execute(&mut **tx)
+    .await?
+    .rows_affected();
+    Ok(retired == 1)
 }
 
 /// One sampled row of a dead-node report.
@@ -188,83 +393,77 @@ pub struct DeadNodeSample {
     pub lifecycle: String,
 }
 
-/// The verb's result for one node, as the controller writes it. Verdict,
-/// reason and outcome keys are the controller's vocabulary, stored as text.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DeadNodeReportWrite<'a> {
+/// The verb's result for one node, as the controller writes it. Mode,
+/// verdict, reason and outcome keys are the controller's vocabulary, stored
+/// as text.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DeadNodeStatusWrite<'a> {
     pub node_id: NodeId,
+    /// `dry-run` or `live`.
+    pub mode: &'a str,
     pub verdict: &'a str,
     pub reason: &'a str,
     /// The per-node row cap cut the read short; the counts are a lower bound.
     pub rows_truncated: bool,
+    /// Each instance the verb asked about, and its verdict (`dead`, `live`,
+    /// or `unknown:<reason>`).
+    pub instances: BTreeMap<&'a str, &'a str>,
+    /// Rows per outcome the verb decided.
     pub counts: BTreeMap<&'a str, u64>,
+    /// Rows per outcome whose write committed; empty in a dry run.
+    pub applied: BTreeMap<&'a str, u64>,
     pub samples: BTreeMap<&'a str, Vec<DeadNodeSample>>,
 }
 
 /// The stored result for one node.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DeadNodeReport {
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct DeadNodeStatus {
+    #[serde(skip)]
     pub node_id: NodeId,
+    #[serde(with = "time::serde::rfc3339")]
     pub observed_at: OffsetDateTime,
+    pub mode: String,
     pub verdict: String,
     pub reason: String,
     pub rows_truncated: bool,
+    pub instances: BTreeMap<String, String>,
     pub counts: BTreeMap<String, u64>,
+    pub applied: BTreeMap<String, u64>,
     pub samples: BTreeMap<String, Vec<DeadNodeSample>>,
 }
 
-#[derive(Debug, sqlx::FromRow)]
-struct ReportRow {
-    node_id: NodeId,
-    observed_at: OffsetDateTime,
-    verdict: String,
-    reason: String,
-    rows_truncated: bool,
-    counts: Json<BTreeMap<String, u64>>,
-    samples: Json<BTreeMap<String, Vec<DeadNodeSample>>>,
-}
-
-/// Replace `node_id`'s report with `report`, stamped with the database clock.
-///
-/// The node row's foreign key deletes the report with the node, and refuses a
-/// report for a node that is already gone; that refusal is an error here, and
-/// the next tick, which no longer lists the node, writes nothing for it.
-pub async fn upsert_report(
+/// Replace `nodes.dead_node_status` of `status.node_id` with `status`,
+/// stamped `observed_at` by the database clock. Only the verb writes the
+/// column. Returns whether the node row still exists: a node deleted since
+/// the verb read it gets no status, and the next tick no longer lists it.
+pub async fn write_status(
     executor: impl sqlx::PgExecutor<'_>,
-    report: &DeadNodeReportWrite<'_>,
-) -> Result<(), sqlx::Error> {
-    sqlx::query(sql!(
-        "INSERT INTO dead_node_dry_runs
-            (node_id, observed_at, verdict, reason, rows_truncated, counts, samples)
-         VALUES ($1, NOW(), $2, $3, $4, $5, $6)
-         ON CONFLICT (node_id) DO UPDATE
-            SET observed_at = EXCLUDED.observed_at,
-                verdict = EXCLUDED.verdict,
-                reason = EXCLUDED.reason,
-                rows_truncated = EXCLUDED.rows_truncated,
-                counts = EXCLUDED.counts,
-                samples = EXCLUDED.samples"
+    status: &DeadNodeStatusWrite<'_>,
+) -> Result<bool, sqlx::Error> {
+    let written = sqlx::query(sql!(
+        "UPDATE nodes
+            SET dead_node_status = $2::JSONB
+                || jsonb_build_object('observed_at', to_jsonb(NOW()))
+          WHERE id = $1"
     ))
-    .bind(report.node_id)
-    .bind(report.verdict)
-    .bind(report.reason)
-    .bind(report.rows_truncated)
-    .bind(Json(&report.counts))
-    .bind(Json(&report.samples))
+    .bind(status.node_id)
+    .bind(Json(status))
     .execute(executor)
-    .await?;
-    Ok(())
+    .await?
+    .rows_affected();
+    Ok(written == 1)
 }
 
-/// Up to `limit` stored reports, by node id.
-pub async fn reports(
+/// Up to `limit` stored statuses, by node id.
+pub async fn statuses(
     executor: impl sqlx::PgExecutor<'_>,
     limit: u32,
-) -> Result<Vec<DeadNodeReport>, sqlx::Error> {
-    let rows: Vec<ReportRow> = sqlx::query_as(sql!(
-        "SELECT node_id, observed_at, verdict, reason, rows_truncated, counts, samples
-           FROM dead_node_dry_runs
-          ORDER BY node_id
+) -> Result<Vec<DeadNodeStatus>, sqlx::Error> {
+    let rows: Vec<(NodeId, Json<DeadNodeStatus>)> = sqlx::query_as(sql!(
+        "SELECT id, dead_node_status
+           FROM nodes
+          WHERE dead_node_status IS NOT NULL
+          ORDER BY id
           LIMIT $1"
     ))
     .bind(i64::from(limit))
@@ -272,15 +471,7 @@ pub async fn reports(
     .await?;
     Ok(rows
         .into_iter()
-        .map(|row| DeadNodeReport {
-            node_id: row.node_id,
-            observed_at: row.observed_at,
-            verdict: row.verdict,
-            reason: row.reason,
-            rows_truncated: row.rows_truncated,
-            counts: row.counts.0,
-            samples: row.samples.0,
-        })
+        .map(|(node_id, Json(status))| DeadNodeStatus { node_id, ..status })
         .collect())
 }
 

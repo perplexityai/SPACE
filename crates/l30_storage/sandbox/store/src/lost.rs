@@ -161,6 +161,35 @@ pub async fn write_off_lost_sandboxes(
     release_lost_placement(tx, ids).await
 }
 
+/// [`write_off_lost_sandboxes`] for one sandbox the dead-node verb flipped to
+/// `failed` in this transaction, retiring only `source_execution`, the
+/// execution that ran on the dead machine, rather than every active one: an
+/// execution placed since then is not the verb's to retire, and the verb's
+/// re-read under the row lock refuses the flip while one is active elsewhere.
+/// `None` retires nothing (the row was pinned to the node with no execution
+/// there). Run it after
+/// `pplx_space_snapshot_store::lost::fail_quiet_full_uploads_from_node`, as
+/// [`write_off_lost_sandboxes`] is.
+pub async fn write_off_lost_sandbox(
+    tx: &mut Transaction<'_, Postgres>,
+    node_id: NodeId,
+    sandbox_id: SandboxId,
+    source_execution: Option<uuid::Uuid>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(sql!(
+        "DELETE FROM node_local_backup_pending
+          WHERE node_id = $1 AND sandbox_id = $2"
+    ))
+    .bind(node_id)
+    .bind(sandbox_id)
+    .execute(&mut **tx)
+    .await?;
+    if let Some(execution_id) = source_execution {
+        crate::dead_node::retire_source_execution(tx, sandbox_id, execution_id).await?;
+    }
+    release_lost_placement(tx, &[sandbox_id]).await
+}
+
 /// `$1` = node id, `$2` = the kube uid observed at the EC2 cross-check,
 /// `$3` = the candidate ids the caller has already `FOR UPDATE`-claimed in
 /// the same transaction (only those may flip — see the inline comment),

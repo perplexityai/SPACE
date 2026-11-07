@@ -129,16 +129,16 @@ fn terminator_kind_rejects_unrecognized_value() {
     ));
 }
 
-/// The dead-node verb asks EC2 only on `aws` or when the test hook forces it,
-/// and judges with the Node's absence only on `kube-delete`; `noop` and a kind
-/// that does not parse name no authority. Every terminator kind, the
+/// The dead-node verb asks EC2 only on `aws` or when the test hook forces it;
+/// `kube-delete`, `noop` and a kind that does not parse name no authority, so
+/// an unexpected death there reads unknown. Every terminator kind, the
 /// unrecognized one, and each with and without the hook.
 #[test]
 fn dead_node_authority_follows_the_terminator_kind() {
     for (raw, unforced) in [
         (Some("aws"), AuthorityKind::Ec2),
         (None, AuthorityKind::Ec2),
-        (Some("kube-delete"), AuthorityKind::KubeDelete),
+        (Some("kube-delete"), AuthorityKind::None),
         (Some("noop"), AuthorityKind::None),
         (Some("kube_delete"), AuthorityKind::None),
     ] {
