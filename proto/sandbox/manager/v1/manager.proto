@@ -2129,7 +2129,6 @@ message DrainNodeResponse {
   // The epoch the node is sealed under after this call; unset once
   // cancelled.
   optional uint64 sealed_epoch = 1;
-  google.protobuf.Timestamp sealed_since = 2;
   // Activation work in flight at the walk's first read.
   repeated InFlightActivation in_flight = 3;
   repeated DrainEvacuated evacuated = 4;

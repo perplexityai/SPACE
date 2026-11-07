@@ -516,11 +516,7 @@ async fn a_durable_evacuation_is_recorded_and_survives_a_restart() {
         .unwrap();
     let restarted = SandboxManagerService::for_test(reopened);
     assert_eq!(
-        restarted
-            .activation_seal
-            .status()
-            .sealed
-            .map(|sealed| sealed.epoch),
+        restarted.activation_seal.status().sealed_epoch,
         Some(7),
         "the seal survives the restart"
     );

@@ -474,8 +474,9 @@ impl SandboxManagerService {
             .splice(0..0, scans.blocked.into_iter().chain(orphan_dirs));
 
         let last = self.activation_seal.status();
-        let continuous =
-            first.sealed.is_some_and(|sealed| sealed.epoch == epoch) && first.sealed == last.sealed;
+        // A cancelled epoch is never sealed again, so the same epoch at both
+        // reads is one continuous seal.
+        let continuous = first.sealed_epoch == Some(epoch) && last.sealed_epoch == Some(epoch);
         let done = continuous
             && first.in_flight.is_empty()
             && !plan.vm
@@ -816,8 +817,7 @@ fn report(
     done: bool,
 ) -> DrainNodeResponse {
     DrainNodeResponse {
-        sealed_epoch: status.sealed.map(|sealed| sealed.epoch),
-        sealed_since: status.sealed.map(sealed_since_to_wire),
+        sealed_epoch: status.sealed_epoch,
         in_flight: status
             .in_flight
             .iter()
@@ -848,15 +848,6 @@ fn report(
             .collect(),
         debris,
         done,
-    }
-}
-
-fn sealed_since_to_wire(sealed: crate::activation_seal::Sealed) -> prost_types::Timestamp {
-    // Below `i64::MAX` milliseconds by the store's write.
-    let since_ms = i64::try_from(sealed.since_ms).unwrap_or(i64::MAX);
-    prost_types::Timestamp {
-        seconds: since_ms.div_euclid(1_000),
-        nanos: i32::try_from(since_ms.rem_euclid(1_000) * 1_000_000).unwrap_or(0),
     }
 }
 
