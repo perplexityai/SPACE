@@ -2383,7 +2383,7 @@ fn publish_rebound_artifact_snapshot_metadata(
 fn rebind_artifact_snapshot_identity(
     meta: &mut crate::snapshot_upload::SnapshotMeta,
     target_sandbox_id: &str,
-    target_owner: &pplx_space_common_core::types::SandboxOwner,
+    target_owner: &pplx_space_accounts::SandboxOwner,
 ) -> Result<(), crate::snapshot_restore::RestoreError> {
     if meta.encrypted && meta.rootfs_encryption_source.is_none() {
         meta.rootfs_encryption_source = Some(meta.sandbox_id.parse().map_err(|source| {
@@ -2463,7 +2463,7 @@ fn publish_rebound_sandbox_artifact_metadata(
 
 fn rebind_artifact_snapshot_owner(
     sandbox: Option<&mut crate::snapshot_upload::SnapshotSandbox>,
-    target_owner: &pplx_space_common_core::types::SandboxOwner,
+    target_owner: &pplx_space_accounts::SandboxOwner,
 ) -> Result<(), crate::snapshot_restore::RestoreError> {
     let sandbox =
         sandbox.ok_or(crate::snapshot_restore::RestoreError::MissingSandboxOwnershipMetadata)?;

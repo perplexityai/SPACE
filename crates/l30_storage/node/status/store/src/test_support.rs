@@ -1,7 +1,7 @@
 //! Seeding `node_status_snapshots` rows for tests.
 
+use pplx_space_accounts::NodeId;
 use pplx_space_common_core::sql;
-use pplx_space_common_core::types::NodeId;
 use sqlx::PgPool;
 
 /// A node status snapshot to seed, relative to the database clock. The

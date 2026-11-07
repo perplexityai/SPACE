@@ -37,5 +37,6 @@ time = { workspace = true, optional = true }
 uuid = { workspace = true, features = ["v7"], optional = true }
 
 [dev-dependencies]
+pplx-space-accounts = { workspace = true, features = ["serde", "sqlx"] }
 pplx-space-db-test-fixtures = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt"] }

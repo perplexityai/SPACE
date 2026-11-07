@@ -108,6 +108,7 @@ use std::time::Duration;
 
 use futures_util::StreamExt;
 
+use pplx_space_accounts::NodeId;
 use pplx_space_api::controllers::substrate::SubstrateError;
 use pplx_space_api::controllers::substrate::kubernetes::{
     GenerationTeardownEvidence, KubernetesSubstrate,
@@ -115,7 +116,7 @@ use pplx_space_api::controllers::substrate::kubernetes::{
 use pplx_space_cluster_pool::{PoolError, WarmPoolStore};
 use pplx_space_common_core::sql;
 use pplx_space_common_core::types::{
-    ExecutionGeneration, NodeDrainMode, NodeId, PositiveDuration, SandboxId, SandboxLifecycle,
+    ExecutionGeneration, NodeDrainMode, PositiveDuration, SandboxId, SandboxLifecycle,
     SubstrateKind,
 };
 use pplx_space_sandbox_portability::{

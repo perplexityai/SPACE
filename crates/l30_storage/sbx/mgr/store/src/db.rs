@@ -1,7 +1,7 @@
 //! Sandbox-manager persistence and guarded lifecycle transitions.
 #![cfg_attr(not(test), deny(clippy::expect_used, clippy::unwrap_used))]
 
-use pplx_space_common_core::types::JobId;
+use pplx_space_accounts::JobId;
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
@@ -9,15 +9,15 @@ use std::path::Path;
 use std::str::FromStr;
 use std::time::Duration;
 
+use pplx_space_accounts::{ORPHANED_SANDBOX_OWNER, SandboxOwner};
 use pplx_space_common_core::types::{
     ArtifactKind, ArtifactOrigin, AutoLifecyclePolicy, AutoLifecycleRuntimeState,
-    ExecutionGeneration, ExecutionMetadata, LocalArtifactId, NodeManagedBy, ORPHANED_SANDBOX_OWNER,
+    ExecutionGeneration, ExecutionMetadata, LocalArtifactId, NodeManagedBy,
     ORPHANED_SANDBOX_TEMPLATE, RuntimeIdentity, RuntimeKind, RuntimeVersion,
-    SandboxActivationAttemptId, SandboxCleanupEpisodeId, SandboxId, SandboxOwner,
-    SandboxQuarantineHistoryAction, SandboxQuarantineNextAction, SandboxQuarantineReasonCode,
-    SandboxQuarantineSource, SandboxRuntimeLabel, SandboxTransitionReceipt,
-    SandboxTransitionReceiptInvariantError, SandboxTransitionReceiptKind,
-    SandboxTransitionTargetState, SnapshotName,
+    SandboxActivationAttemptId, SandboxCleanupEpisodeId, SandboxId, SandboxQuarantineHistoryAction,
+    SandboxQuarantineNextAction, SandboxQuarantineReasonCode, SandboxQuarantineSource,
+    SandboxRuntimeLabel, SandboxTransitionReceipt, SandboxTransitionReceiptInvariantError,
+    SandboxTransitionReceiptKind, SandboxTransitionTargetState, SnapshotName,
 };
 use pplx_space_events::{
     SandboxEventDetails, SandboxEventSource, SandboxEventTrigger, SandboxEventType,
@@ -764,9 +764,8 @@ pub mod fixture {
     use std::collections::BTreeMap;
     use std::str::FromStr;
 
-    use pplx_space_common_core::types::{
-        AutoLifecyclePolicy, SandboxId, SandboxOwner, SandboxRuntimeLabel,
-    };
+    use pplx_space_accounts::SandboxOwner;
+    use pplx_space_common_core::types::{AutoLifecyclePolicy, SandboxId, SandboxRuntimeLabel};
 
     use crate::state::SandboxStatus;
 

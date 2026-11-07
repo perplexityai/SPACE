@@ -48,6 +48,7 @@ tracing = { workspace = true }
 uuid = { workspace = true, features = ["v7"] }
 
 # internal
+pplx-space-accounts = { workspace = true, features = ["serde"] }
 pplx-space-api-route = { workspace = true }
 pplx-space-bearer-token = { workspace = true }
 pplx-space-build-mgr-client = { workspace = true }

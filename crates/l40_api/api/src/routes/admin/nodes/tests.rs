@@ -1,5 +1,5 @@
-use pplx_space_common_core::types::OrgId;
-use pplx_space_common_core::types::UserId;
+use pplx_space_accounts::OrgId;
+use pplx_space_accounts::UserId;
 use uuid::Uuid;
 
 use super::*;
@@ -10,7 +10,8 @@ use pplx_space_db_test_fixtures::try_pg_test_db;
 use pplx_space_test_env::TestResult;
 use tower::ServiceExt;
 
-use pplx_space_common_core::types::{NodeAddress, NodeDrainMode, NodeId, NodeManagedBy, NodeRole};
+use pplx_space_accounts::NodeId;
+use pplx_space_common_core::types::{NodeAddress, NodeDrainMode, NodeManagedBy, NodeRole};
 
 fn test_admin_node_row() -> AdminNodeRow {
     AdminNodeRow {
@@ -1782,7 +1783,7 @@ fn inventory_test_actor(org_id: OrgId) -> User {
         display_name: "Inventory test".into(),
         org_id,
         role: UserRole::OrganizationAdmin,
-        owner_source: pplx_space_common_core::types::SandboxOwnerSource::Local,
+        owner_source: pplx_space_accounts::SandboxOwnerSource::Local,
         created_at: OffsetDateTime::UNIX_EPOCH,
         updated_at: OffsetDateTime::UNIX_EPOCH,
     }

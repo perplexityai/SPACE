@@ -29,8 +29,9 @@
 //! Recordset inputs are the JSON rows the internal API builds; each function
 //! names the record columns its statement reads.
 
+use pplx_space_accounts::NodeId;
 use pplx_space_common_core::types::{
-    ArtifactKind, ArtifactOrigin, ExecutionGeneration, LocalArtifactId, NodeId, PodUid, SandboxId,
+    ArtifactKind, ArtifactOrigin, ExecutionGeneration, LocalArtifactId, PodUid, SandboxId,
     SandboxQuarantineHistoryAction, SandboxQuarantineReasonCode, SandboxQuarantineSource,
     SandboxTransitionReceiptKind, SandboxTransitionTargetState, SubstrateKind,
 };

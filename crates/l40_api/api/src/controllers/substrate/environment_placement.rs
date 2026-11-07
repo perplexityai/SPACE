@@ -40,9 +40,9 @@ use std::fmt;
 use std::str::FromStr;
 
 use crate::metrics::environment_placement::EnvironmentPlacementPath;
+use pplx_space_accounts::NodeId;
 #[cfg(feature = "kubernetes")]
 use pplx_space_common_core::types::EnvironmentReference;
-use pplx_space_common_core::types::NodeId;
 use pplx_space_env_vars::Environment;
 use pplx_space_node_status_store::EnvironmentRefusal;
 #[cfg(feature = "kubernetes")]

@@ -14,7 +14,8 @@
 
 use crate::metrics::sandbox::api::{SandboxApiMetricIdentity, WakeCompletionAction};
 use axum::http::StatusCode;
-use pplx_space_common_core::types::{NodeId, NodeManagedBy, SandboxId, UserId};
+use pplx_space_accounts::{NodeId, UserId};
+use pplx_space_common_core::types::{NodeManagedBy, SandboxId};
 use pplx_space_db_test_fixtures::pg_test_db_with_max_connections;
 use pplx_space_node_api_sim::{SandboxRecord, SimState, SimWorkerHarness};
 use pplx_space_sandbox_store::StoredSandboxLifecycle;

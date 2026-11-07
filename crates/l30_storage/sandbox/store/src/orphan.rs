@@ -13,7 +13,8 @@
 //! interpolated by the reconciler's plan read. They are public so that each
 //! guard keeps one definition while that read lives elsewhere.
 
-use pplx_space_common_core::types::{NodeId, PodUid, SandboxId, SandboxLifecycle};
+use pplx_space_accounts::NodeId;
+use pplx_space_common_core::types::{PodUid, SandboxId, SandboxLifecycle};
 
 use pplx_space_common_core::sql;
 use pplx_space_sandbox_portability::orphan_recovery_revert_eligibility;

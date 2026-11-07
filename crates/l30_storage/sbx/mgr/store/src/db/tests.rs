@@ -137,11 +137,12 @@ fn node_execution_cleanup_acknowledgements_are_retryable_and_fenced() {
         Some(fourth.current())
     );
 }
+use pplx_space_accounts::UserId;
 use pplx_space_common_core::types::{
     Arch, ArtifactComponentKind, ArtifactComponentMetadata, ArtifactFormat, ArtifactVersion,
     AutoLifecycleConditionSet, AutoLifecycleConditionSetId, AutoLifecycleIdleAction,
     AutoLifecycleStage, Digest, ExecutionMetadata, LinuxPid, LinuxUid, SandboxActivationAttemptId,
-    SandboxId, UserId, VsockCid,
+    SandboxId, VsockCid,
 };
 use uuid::Uuid;
 
@@ -3621,7 +3622,7 @@ fn claim_pool_sandbox_claims_matching_required_user() {
     insert_test_sandbox(
         &conn,
         TestSandboxInsert {
-            user: pplx_space_common_core::types::TEMPLATE_MANAGER_SANDBOX_OWNER.to_string(),
+            user: pplx_space_accounts::TEMPLATE_MANAGER_SANDBOX_OWNER.to_string(),
             pool_template: Some("pool-seed".to_string()),
             ..TestSandboxInsert::new("tmplmgr-pool", "tmplpool", SandboxState::Paused)
         },
@@ -3643,7 +3644,7 @@ fn claim_pool_sandbox_claims_matching_required_user() {
         "tmplmgr-pool",
         "pool-seed",
         Some("hash"),
-        Some(&pplx_space_common_core::types::TEMPLATE_MANAGER_SANDBOX_OWNER),
+        Some(&pplx_space_accounts::TEMPLATE_MANAGER_SANDBOX_OWNER),
         &adopter_owner,
         &adopted_env,
     )
@@ -3683,7 +3684,7 @@ fn pool_adoption_rollback_restores_donor_route_identity() {
     insert_test_sandbox(
         &conn,
         TestSandboxInsert {
-            user: pplx_space_common_core::types::TEMPLATE_MANAGER_SANDBOX_OWNER.to_string(),
+            user: pplx_space_accounts::TEMPLATE_MANAGER_SANDBOX_OWNER.to_string(),
             pool_template: Some("pool-seed".to_string()),
             ..TestSandboxInsert::new(&sandbox_id, "tmplpool", SandboxState::Paused)
         },
@@ -3710,7 +3711,7 @@ fn pool_adoption_rollback_restores_donor_route_identity() {
         &sandbox_id,
         "pool-seed",
         Some("hash"),
-        Some(&pplx_space_common_core::types::TEMPLATE_MANAGER_SANDBOX_OWNER),
+        Some(&pplx_space_accounts::TEMPLATE_MANAGER_SANDBOX_OWNER),
         &adopter_owner,
         &BTreeMap::new(),
     )
@@ -3740,7 +3741,7 @@ fn pool_adoption_rollback_restores_donor_route_identity() {
         &sandbox_id,
         "pool-seed",
         Some("hash"),
-        Some(&pplx_space_common_core::types::TEMPLATE_MANAGER_SANDBOX_OWNER),
+        Some(&pplx_space_accounts::TEMPLATE_MANAGER_SANDBOX_OWNER),
         &adopter_owner,
         &BTreeMap::new(),
     )
@@ -3805,7 +3806,7 @@ fn claim_pool_sandbox_returns_none_without_required_user_match() {
         "tenant-pool",
         "pool-seed",
         Some("hash"),
-        Some(&pplx_space_common_core::types::TEMPLATE_MANAGER_SANDBOX_OWNER),
+        Some(&pplx_space_accounts::TEMPLATE_MANAGER_SANDBOX_OWNER),
         &adopter_owner,
         &BTreeMap::new(),
     )

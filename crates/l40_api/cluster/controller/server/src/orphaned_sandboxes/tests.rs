@@ -1,4 +1,5 @@
-use pplx_space_common_core::types::{NodeId, SnapshotId};
+use pplx_space_accounts::NodeId;
+use pplx_space_common_core::types::SnapshotId;
 
 use super::*;
 use k8s_openapi::api::core::v1::{

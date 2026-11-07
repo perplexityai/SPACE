@@ -32,7 +32,8 @@ mod substrate_scope;
 
 mod kubernetes_tests {
 
-    use pplx_space_common_core::types::{LocalArtifactId, SandboxId, UserId};
+    use pplx_space_accounts::UserId;
+    use pplx_space_common_core::types::{LocalArtifactId, SandboxId};
     use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
@@ -62,6 +63,7 @@ mod kubernetes_tests {
     use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
     use kube::client::{Body, ClientBuilder};
     use kube::runtime::{reflector, watcher::Event};
+    use pplx_space_accounts::{NodeId, OrgId, SandboxOwner, SandboxOwnerSource};
     use pplx_space_api_route::{
         ed25519::SPACE_API_ROUTE_ED25519_ISSUER_ENV,
         ed25519::SPACE_API_ROUTE_ED25519_SIGNING_KEY_ID_ENV,
@@ -71,10 +73,9 @@ mod kubernetes_tests {
     use pplx_space_common_core::sql;
     use pplx_space_common_core::types::{
         ArtifactKind, ArtifactOrigin, ExecutionGeneration, NodeAddress, NodeGroup, NodeGroupName,
-        NodeGroupPolicy, NodeId, NodeManagedBy as SpaceNodeManagedBy, NodeRole as SpaceNodeRole,
-        OrgId, PodName, PodResourceVersion, PodUid, SandboxActivationAttemptId, SandboxLifecycle,
-        SandboxOwner, SandboxOwnerSource, SandboxTransitionTargetState, TemplateCompatSpec,
-        TemplateName, TemplateVisibility,
+        NodeGroupPolicy, NodeManagedBy as SpaceNodeManagedBy, NodeRole as SpaceNodeRole, PodName,
+        PodResourceVersion, PodUid, SandboxActivationAttemptId, SandboxLifecycle,
+        SandboxTransitionTargetState, TemplateCompatSpec, TemplateName, TemplateVisibility,
     };
     use pplx_space_internal_api_server::publish_sandbox_states;
     use pplx_space_node_api_client::proto::PublishedSandboxState;
@@ -11541,7 +11542,7 @@ mod kubernetes_tests {
         let actor = crate::controllers::substrate::ActorRef::new(
             UserId::from_uuid(pplx_space_db_test_fixtures::SEED_USER_ID),
             OrgId::from_uuid(pplx_space_db_test_fixtures::SEED_ORG_ID),
-            pplx_space_common_core::types::Email::parse("early-create-exit@example.com")?,
+            pplx_space_accounts::Email::parse("early-create-exit@example.com")?,
         );
         let template = TemplateName::parse("seed")?;
         let template_ref = crate::controllers::substrate::TemplateRef {
@@ -12332,7 +12333,7 @@ mod kubernetes_tests {
             actor: ActorRef::new(
                 user_id,
                 org_id,
-                pplx_space_common_core::types::Email::parse("pool-claim@example.com")?,
+                pplx_space_accounts::Email::parse("pool-claim@example.com")?,
             ),
             env: BTreeMap::new(),
             auto_lifecycle: pplx_space_common_core::types::AutoLifecyclePolicy::disabled(),

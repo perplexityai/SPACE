@@ -6,7 +6,7 @@
 //! live here. The flip runs entirely under a `FOR UPDATE` lock on the
 //! template row so two operators cannot race the in-use guards.
 
-use pplx_space_common_core::types::OrgId;
+use pplx_space_accounts::OrgId;
 
 use pplx_space_common_core::sql;
 use pplx_space_common_core::types::{TemplateDesiredState, TemplateName, TemplateVisibility};

@@ -1,6 +1,7 @@
 use super::*;
+use pplx_space_accounts::NodeId;
 use pplx_space_common_core::types::{
-    AutoLifecyclePolicy, ExecutionGeneration, NodeId, PodUid, RouteGeneration, SandboxId,
+    AutoLifecyclePolicy, ExecutionGeneration, PodUid, RouteGeneration, SandboxId,
     SandboxQuarantineNextAction, SandboxQuarantineReasonCode, SandboxQuarantineSource,
     SandboxRuntimeLabel, SpaceApiRouteIdentity,
 };
@@ -31,8 +32,7 @@ fn insert_test_sandbox(conn: &crate::db::Connection, id: &str, state: crate::sta
         .unwrap_or_else(|_| {
             SandboxRuntimeLabel::parse(id).expect("test sandbox id must parse as runtime label")
         });
-    let user =
-        pplx_space_common_core::types::SandboxOwner::parse("user").expect("test owner must parse");
+    let user = pplx_space_accounts::SandboxOwner::parse("user").expect("test owner must parse");
     crate::db::insert_sandbox(
         conn,
         crate::db::InsertSandboxParams {

@@ -1,4 +1,5 @@
-use pplx_space_common_core::types::{NodeId, OrgId, SandboxId, UserId};
+use pplx_space_accounts::{NodeId, OrgId, UserId};
+use pplx_space_common_core::types::SandboxId;
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -27,11 +28,12 @@ use tower::util::ServiceExt;
 use tracing_subscriber::{Layer, layer::Context, prelude::*};
 use uuid::Uuid;
 
+use pplx_space_accounts::SandboxOwnerSource;
 #[cfg(feature = "kubernetes")]
 use pplx_space_common_core::types::SnapshotId;
 use pplx_space_common_core::types::{
     AutoLifecycleIdleAction, AutoLifecyclePolicy, AutoLifecycleRuntimeState, DEFAULT_TEMPLATE_TAG,
-    SandboxLifecycle, SandboxOwnerSource, TemplateVisibility,
+    SandboxLifecycle, TemplateVisibility,
 };
 use pplx_space_ecw_credential::EcwCredentialKeyring;
 #[cfg(feature = "kubernetes")]
@@ -1622,7 +1624,7 @@ async fn egress_profile_header_applies_only_to_federated_creates(
         .with_egress_profiles(crate::egress_profiles::EgressProfiles::from_config(
             r#"{"sensor":{"allow":[{"domain":"sensor.example.test"}]}}"#,
         )?);
-    use pplx_space_common_core::types::{UpstreamIssuer, UpstreamOrgId, UpstreamSubjectId};
+    use pplx_space_accounts::{UpstreamIssuer, UpstreamOrgId, UpstreamSubjectId};
     let owner = crate::federated_identity::FederatedOwner {
         issuer: UpstreamIssuer::parse("example-issuer")?,
         org_id: UpstreamOrgId::parse("example-org")?,
@@ -5903,7 +5905,7 @@ struct FederatedConnectFixture {
 /// A federated-owned sandbox behind the real e2b router, with the federated
 /// owner injected as the auth extension the middleware would attach.
 async fn federated_connect_fixture(db: &TestDb) -> TestResult<FederatedConnectFixture> {
-    use pplx_space_common_core::types::{UpstreamIssuer, UpstreamOrgId, UpstreamSubjectId};
+    use pplx_space_accounts::{UpstreamIssuer, UpstreamOrgId, UpstreamSubjectId};
 
     let sandbox_id = SandboxId::new();
     let org_id = OrgId::new();

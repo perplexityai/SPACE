@@ -4,7 +4,7 @@
 //! `managed_by` is `'space'`, so only the `managed_by` predicates decide
 //! which one the inventory statements act on.
 
-use pplx_space_common_core::types::NodeId;
+use pplx_space_accounts::NodeId;
 use tokio_util::task::AbortOnDropHandle;
 
 use super::*;

@@ -1,4 +1,5 @@
-use pplx_space_common_core::types::{OrgId, SandboxId, UserId};
+use pplx_space_accounts::{OrgId, UserId};
+use pplx_space_common_core::types::SandboxId;
 
 use serde::Serialize;
 use serde_json::{Map, Value};
@@ -6,7 +7,8 @@ use sqlx::types::Json as SqlxJson;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-use pplx_space_common_core::types::{NodeAddress, NodeId, NodeManagedBy, NodeRole, PodUid};
+use pplx_space_accounts::NodeId;
+use pplx_space_common_core::types::{NodeAddress, NodeManagedBy, NodeRole, PodUid};
 
 #[derive(Debug, Serialize)]
 #[serde(untagged)]

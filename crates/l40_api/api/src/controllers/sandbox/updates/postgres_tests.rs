@@ -10,8 +10,8 @@
 //! worker. `auto_lifecycle` and `network_policy` are untouched by this
 //! migration and keep their own SQL.
 
+use pplx_space_accounts::{OrgId, UserId};
 use pplx_space_common_core::types::SandboxId;
-use pplx_space_common_core::types::{OrgId, UserId};
 
 use super::*;
 use crate::models::{SandboxMetadata, SandboxMetadataValue, User};
@@ -94,7 +94,7 @@ async fn seed_timeout_sandbox(
     policy: &AutoLifecyclePolicy,
     managed_by: pplx_space_common_core::types::SubstrateKind,
     running_on: Option<(
-        pplx_space_common_core::types::NodeId,
+        pplx_space_accounts::NodeId,
         &pplx_space_node_api_sim::SimWorkerHarness,
     )>,
 ) -> TestResult<Sandbox> {
@@ -228,7 +228,7 @@ struct TimeoutLockFixture {
     absent: FeatureFlagClient,
     controller: SandboxController,
     policy: AutoLifecyclePolicy,
-    node: pplx_space_common_core::types::NodeId,
+    node: pplx_space_accounts::NodeId,
     worker: pplx_space_node_api_sim::SimWorkerHarness,
 }
 
@@ -245,7 +245,7 @@ async fn timeout_lock_fixture() -> TestResult<TimeoutLockFixture> {
     let absent = FeatureFlagClient::disabled();
     let controller = direct_sandbox_controller(&db.pool).with_feature_flags(enabled.clone());
     let policy = crate::e2b::auto_lifecycle_policy(90, true, false);
-    let node = pplx_space_common_core::types::NodeId::new();
+    let node = pplx_space_accounts::NodeId::new();
     let worker = pplx_space_node_api_sim::SimWorkerHarness::builder(node.to_string())
         .with_internal_api()
         .start()

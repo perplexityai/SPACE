@@ -1,5 +1,6 @@
+use pplx_space_accounts::NodeId;
 use pplx_space_common_core::types::{
-    LocalArtifactId, NODE_DRAIN_MODE_GENTLE, NodeDrainPhase, NodeId, SandboxId, SnapshotId,
+    LocalArtifactId, NODE_DRAIN_MODE_GENTLE, NodeDrainPhase, SandboxId, SnapshotId,
 };
 
 use std::time::Duration;

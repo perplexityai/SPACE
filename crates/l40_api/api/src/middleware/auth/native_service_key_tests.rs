@@ -1,7 +1,7 @@
 //! Native accepts a bearer service credential scoped to the native surface,
 //! and does so without inventing a user for it.
 
-use pplx_space_common_core::types::UserId;
+use pplx_space_accounts::UserId;
 
 use axum::{
     Extension, Router,

@@ -214,7 +214,7 @@ async fn programmatic_builder_preflights_before_connecting_to_services() {
             "synthetic",
             recipe(vec![vec!["MISSING_BUILD_TEST"]]),
             "example",
-            &pplx_space_common_core::types::JobId::new(),
+            &pplx_space_accounts::JobId::new(),
         )
         .await
         .err()

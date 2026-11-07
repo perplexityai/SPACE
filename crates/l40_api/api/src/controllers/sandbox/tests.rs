@@ -1362,6 +1362,8 @@ mod template_release_resolution_postgres_tests {
 mod response_tests {
 
     use super::*;
+    use pplx_space_accounts::{NodeId, SandboxOwnerSource};
+    use pplx_space_accounts::{OrgId, UserId};
     use pplx_space_api_route::{
         ed25519::SPACE_API_ROUTE_ED25519_ISSUER_ENV,
         ed25519::SPACE_API_ROUTE_ED25519_SIGNING_KEY_ID_ENV,
@@ -1369,8 +1371,7 @@ mod response_tests {
         ed25519::SpaceApiRouteEd25519Authority,
         ed25519::decode_unverified_space_api_route_ed25519_claims,
     };
-    use pplx_space_common_core::types::{NodeId, NodeManagedBy, SandboxId, SandboxOwnerSource};
-    use pplx_space_common_core::types::{OrgId, UserId};
+    use pplx_space_common_core::types::{NodeManagedBy, SandboxId};
 
     use sqlx::types::Json;
 

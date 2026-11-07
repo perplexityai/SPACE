@@ -137,9 +137,9 @@ async fn full_snapshot_capture_serializes_resume_on_wake_lock() {
 #[tokio::test]
 async fn candidate_snapshot_admission_uses_durable_execution_before_checkpointing() {
     use crate::service::tests::service_tests::insert_test_sandbox;
+    use pplx_space_accounts::SandboxOwnerKind;
     use pplx_space_common_core::types::{
         Arch, Digest, EnvironmentReference, ExecutionMetadata, RuntimeIdentity, RuntimeKind,
-        SandboxOwnerKind,
     };
     let conn = crate::db::test_conn();
     let id = SandboxId::new().to_string();
@@ -194,9 +194,8 @@ async fn candidate_snapshot_admission_uses_durable_execution_before_checkpointin
 #[tokio::test]
 async fn template_snapshot_refuses_its_partition_before_checkpointing() {
     use crate::service::tests::service_tests::insert_test_sandbox;
-    use pplx_space_common_core::types::{
-        Arch, ExecutionMetadata, RuntimeIdentity, RuntimeKind, SandboxOwnerKind,
-    };
+    use pplx_space_accounts::SandboxOwnerKind;
+    use pplx_space_common_core::types::{Arch, ExecutionMetadata, RuntimeIdentity, RuntimeKind};
     let conn = crate::db::test_conn();
     let id = SandboxId::new().to_string();
     insert_test_sandbox(&conn, &id, SandboxState::Paused);

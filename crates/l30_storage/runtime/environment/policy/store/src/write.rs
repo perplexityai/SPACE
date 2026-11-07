@@ -18,8 +18,9 @@
 //! statements under one row lock, which only a transaction the caller commits
 //! can hold.
 
+use pplx_space_accounts::UserId;
 use pplx_space_common_core::sql;
-use pplx_space_common_core::types::{EnvironmentReference, UserId};
+use pplx_space_common_core::types::EnvironmentReference;
 use sqlx::{Postgres, Transaction};
 
 use crate::{RuntimeEnvironmentState, UnknownRuntimeEnvironmentState};

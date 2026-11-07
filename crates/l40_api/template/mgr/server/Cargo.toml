@@ -20,6 +20,7 @@ datadog-otel = ["otel", "datadog"]
 test-hooks = ["pplx-space-test-hooks/test-hooks"]
 
 [dependencies]
+pplx-space-accounts = { workspace = true, features = ["serde"] }
 pplx-space-common-grpc = { workspace = true }
 pplx-space-env-vars = { workspace = true }
 pplx-space-execution-catalog = { workspace = true }

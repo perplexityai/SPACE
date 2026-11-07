@@ -43,7 +43,7 @@
 //! the operator opts into writes; the deployment itself is the master
 //! enable/disable.
 
-use pplx_space_common_core::types::NodeId;
+use pplx_space_accounts::NodeId;
 
 use pplx_space_common_core::sql;
 use pplx_space_sandbox_store::delete::delete_with_dependents;

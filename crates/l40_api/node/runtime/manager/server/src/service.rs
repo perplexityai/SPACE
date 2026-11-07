@@ -8,8 +8,9 @@ use crate::installs::{
 };
 use crate::protection::{self, AuditIdentity, PathRole};
 use crate::run::SERVICE_NAME;
+use pplx_space_accounts::JobId;
 use pplx_space_common_core::types::{
-    ComponentIdentity, Digest, JobId, RuntimeIdentity, RuntimeKind, RuntimeVersion,
+    ComponentIdentity, Digest, RuntimeIdentity, RuntimeKind, RuntimeVersion,
 };
 use pplx_space_execution_common::proto::{self as execution, ArtifactComponentKind};
 use pplx_space_host_layout::identities::{user_names, users};

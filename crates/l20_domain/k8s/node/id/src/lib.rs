@@ -4,10 +4,11 @@
 //! direct node UUID or a Kubernetes node name.
 //!
 //! It cannot live in `pplx-space-k8s-ids`, which holds only
-//! Kubernetes' own identifiers: it returns `NodeId` and reads `NodeRole`,
-//! which belong to `pplx-space-common-core`.
+//! Kubernetes' own identifiers: it returns `NodeId`, from
+//! `pplx-space-accounts`, and reads `NodeRole`, from `pplx-space-common-core`.
 
-use pplx_space_common_core::types::{K8sNodeName, K8sNodeNameParseError, NodeId, NodeRole};
+use pplx_space_accounts::NodeId;
+use pplx_space_common_core::types::{K8sNodeName, K8sNodeNameParseError, NodeRole};
 use uuid::Uuid;
 
 const SPACE_K8S_NODE_ID_NAMESPACE: Uuid =

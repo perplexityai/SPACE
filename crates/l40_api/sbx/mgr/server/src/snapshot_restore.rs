@@ -21,7 +21,8 @@
 //! Local file names match [`crate::snapshot_upload::VM_ARTIFACTS`].
 //! Sqlite row repopulation is performed by the caller, not here.
 
-use pplx_space_common_core::types::{JobId, SnapshotId};
+use pplx_space_accounts::JobId;
+use pplx_space_common_core::types::SnapshotId;
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -121,7 +122,7 @@ pub enum RecoveredSandboxRowFieldsError {
     #[error("invalid template content hash in snapshot metadata: {0}")]
     ContentHash(#[from] pplx_space_common_core::types::DigestParseError),
     #[error("invalid sandbox owner in snapshot metadata: {0}")]
-    Owner(#[from] pplx_space_common_core::types::AuthParseError),
+    Owner(#[from] pplx_space_accounts::AuthParseError),
     #[error("invalid disk I/O limits in snapshot metadata: {0}")]
     DiskIoLimits(#[from] pplx_space_common_core::types::DiskIoLimitsError),
 }
@@ -1354,7 +1355,7 @@ fn replacement_for_pull(local_path: &Path, s3_uri: &str, adopted: bool) -> PullR
 /// `Restoring` row and publishes that directory before the slow rootfs phase.
 pub async fn prepare_restore_dir(
     sandbox_id: &str,
-    owner: &pplx_space_common_core::types::SandboxOwner,
+    owner: &pplx_space_accounts::SandboxOwner,
     execution_fence: pplx_space_node_mgr_client::execution_fence::ExecutionFence,
     transfer_scope_id: pplx_space_common_core::types::TransferScopeId,
     node_manager: &crate::node_manager_transport::NodeManagerConnector,
@@ -1386,7 +1387,7 @@ pub async fn prepare_restore_dir(
 
 pub async fn prepare_restore_dir_from_uri(
     sandbox_id: &str,
-    owner: &pplx_space_common_core::types::SandboxOwner,
+    owner: &pplx_space_accounts::SandboxOwner,
     execution_fence: pplx_space_node_mgr_client::execution_fence::ExecutionFence,
     storage_uri: &str,
     transfer_scope_id: pplx_space_common_core::types::TransferScopeId,
@@ -1991,7 +1992,7 @@ fn preserve_attributed_metadata_retry(
 /// completed, verified files for the next retry.
 pub async fn restore_pull_rootfs(
     stage: &RestoreMetadataStaged,
-    owner: &pplx_space_common_core::types::SandboxOwner,
+    owner: &pplx_space_accounts::SandboxOwner,
     execution_fence: pplx_space_node_mgr_client::execution_fence::ExecutionFence,
     node_manager: &crate::node_manager_transport::NodeManagerConnector,
     templates: &dyn crate::template_resolver::TemplateResolver,
@@ -2716,7 +2717,7 @@ async fn stage_encrypted_restore(
 )]
 async fn stage_btrfs_send_restore(
     identity: RestoreTransferIdentity<'_>,
-    owner: &pplx_space_common_core::types::SandboxOwner,
+    owner: &pplx_space_accounts::SandboxOwner,
     config: &SnapshotUploadConfig,
     sidecar_path: &Path,
     snapshot_dir: &Path,
@@ -2878,7 +2879,7 @@ async fn run_btrfs_staging<'a>(
 async fn ensure_local_template(
     templates: &dyn crate::template_resolver::TemplateResolver,
     sandbox_id: &str,
-    owner: &pplx_space_common_core::types::SandboxOwner,
+    owner: &pplx_space_accounts::SandboxOwner,
     template_name: &str,
     content_hash: &str,
     environment: Option<pplx_space_common_core::types::EnvironmentReference>,

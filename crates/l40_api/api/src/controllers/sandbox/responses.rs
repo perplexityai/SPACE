@@ -758,8 +758,8 @@ pub fn sandbox_to_response(sandbox: &Sandbox, live: Option<&SandboxInfo>) -> San
         name: sandbox.name.clone(),
         user_id: Some(sandbox.user_id),
         user_email: match sandbox.owner_source {
-            pplx_space_common_core::types::SandboxOwnerSource::Local => sandbox.user_email.clone(),
-            pplx_space_common_core::types::SandboxOwnerSource::FederatedIdentity => None,
+            pplx_space_accounts::SandboxOwnerSource::Local => sandbox.user_email.clone(),
+            pplx_space_accounts::SandboxOwnerSource::FederatedIdentity => None,
         },
         org_id: Some(sandbox.org_id),
         lifecycle: state_input.reported_lifecycle(),
@@ -803,9 +803,7 @@ pub fn sandbox_to_response(sandbox: &Sandbox, live: Option<&SandboxInfo>) -> San
         uptime: live.and_then(|info| info.uptime.clone()),
         // Ownership is an immutable birth fact: the label derives from the
         // cluster's sandbox row, never from what a node reports.
-        user: Some(
-            pplx_space_common_core::types::SandboxOwner::platform_user(sandbox.user_id).to_string(),
-        ),
+        user: Some(pplx_space_accounts::SandboxOwner::platform_user(sandbox.user_id).to_string()),
         image_hash: live.and_then(|info| info.image_hash.clone()),
         snapshots_enabled: live.map(|info| info.snapshots_enabled),
         snapshots_enabled_desired: sandbox.snapshots_enabled_desired,

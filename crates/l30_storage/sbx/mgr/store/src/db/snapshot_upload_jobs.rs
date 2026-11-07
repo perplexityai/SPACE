@@ -2,7 +2,8 @@
 //! completed jobs prove.
 
 use crate::db::{Connection, Result};
-use pplx_space_common_core::types::{JobId, LocalArtifactId};
+use pplx_space_accounts::JobId;
+use pplx_space_common_core::types::LocalArtifactId;
 use rusqlite::params;
 
 /// The `jobs.kind` of the snapshot-upload pipeline's jobs.

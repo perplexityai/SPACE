@@ -15,14 +15,16 @@ workspace = true
 
 [features]
 # Snapshot seeding for other crates' tests; enable only from [dev-dependencies].
-test-support = ["dep:pplx-space-common-core", "dep:sqlx"]
+test-support = ["dep:pplx-space-accounts", "dep:pplx-space-common-core", "dep:sqlx"]
 
 [dependencies]
 thiserror = { workspace = true }
+pplx-space-accounts = { workspace = true, features = ["sqlx"], optional = true }
 pplx-space-common-core = { workspace = true, features = ["sqlx"], optional = true }
 sqlx = { workspace = true, features = ["postgres", "runtime-tokio", "tls-rustls-aws-lc-rs", "uuid"], optional = true }
 
 [dev-dependencies]
+pplx-space-accounts = { workspace = true, features = ["sqlx"] }
 pplx-space-common-core = { workspace = true, features = ["sqlx"] }
 pplx-space-db-test-fixtures = { workspace = true }
 sqlx = { workspace = true, features = ["postgres", "runtime-tokio", "tls-rustls-aws-lc-rs", "uuid"] }

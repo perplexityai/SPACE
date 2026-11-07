@@ -4,11 +4,12 @@ use pplx_space_common_core::sql;
 use tonic::transport::Endpoint;
 use tonic::{Code, Request, Status};
 
+use pplx_space_accounts::NodeId;
 use pplx_space_api_route::{
     ed25519::SpaceApiRouteEd25519Authority, ed25519::insert_space_api_route_ed25519_token,
 };
 use pplx_space_common_core::types::{
-    ExecutionGeneration, GuestPort, NodeDrainPhase, NodeDrainState, NodeId, NodeManagedBy, PodUid,
+    ExecutionGeneration, GuestPort, NodeDrainPhase, NodeDrainState, NodeManagedBy, PodUid,
     RouteGeneration, SandboxActivationAttemptId, SandboxId,
 };
 use pplx_space_common_grpc::sandbox_service_route_not_ready_status;

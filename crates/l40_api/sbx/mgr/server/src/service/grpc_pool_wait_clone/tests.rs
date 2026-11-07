@@ -25,7 +25,7 @@ fn armed_clone_with_image(
             state: SandboxState::Creating.into(),
             template: "seed",
             template_hash: Some("sha256:test"),
-            user: &pplx_space_common_core::types::SandboxOwner::parse("deploy").unwrap(),
+            user: &pplx_space_accounts::SandboxOwner::parse("deploy").unwrap(),
             runtime: if guest_image.legacy_transport() {
                 RuntimeKind::Firecracker.as_str()
             } else {

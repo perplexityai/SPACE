@@ -6,7 +6,7 @@
 //! with a trusted federated API key; on every other path the headers are rejected.
 
 use axum::http::HeaderMap;
-use pplx_space_common_core::types::{UpstreamIssuer, UpstreamOrgId, UpstreamSubjectId};
+use pplx_space_accounts::{UpstreamIssuer, UpstreamOrgId, UpstreamSubjectId};
 use time::OffsetDateTime;
 
 use super::FederatedIdentityConfig;

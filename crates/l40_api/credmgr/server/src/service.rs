@@ -1,6 +1,6 @@
 //! CredentialManager gRPC service implementation.
 
-use pplx_space_common_core::types::UserId;
+use pplx_space_accounts::UserId;
 
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -12,10 +12,8 @@ use aws_sdk_sts::error::{ConnectorError, ProvideErrorMetadata, SdkError};
 use aws_sdk_sts::operation::assume_role::AssumeRoleError;
 use aws_sdk_sts::operation::assume_role_with_web_identity::AssumeRoleWithWebIdentityError;
 use aws_smithy_types::retry::ErrorKind;
-use pplx_space_common_core::{
-    types::KekProvider, types::MasterKeyIdentifier, types::OrgId, types::SandboxId,
-    types::volume_wrap_aad,
-};
+use pplx_space_accounts::OrgId;
+use pplx_space_common_core::types::{KekProvider, MasterKeyIdentifier, SandboxId, volume_wrap_aad};
 use pplx_space_host_layout::paths;
 use pplx_space_host_layout::{identities::user_names, identities::users};
 use pplx_space_postgres_pool::contention;

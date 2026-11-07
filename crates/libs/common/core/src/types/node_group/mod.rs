@@ -25,8 +25,8 @@ use std::str::FromStr;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use super::auth::OrgId;
 use super::template::{TemplateName, TemplateVisibility};
+use pplx_space_accounts::OrgId;
 
 /// Maximum byte length of a [`NodeGroupName`].
 ///
@@ -336,6 +336,7 @@ impl TemplateCompatSpec {
     /// # Examples
     ///
     /// ```rust
+    /// # use pplx_space_accounts::OrgId;
     /// # use pplx_space_common_core::types::*;
     /// let org = OrgId::new();
     /// let template = TemplateCompatSpec {
@@ -465,6 +466,7 @@ impl NodeGroup {
     ///
     /// ```rust
     /// # use std::collections::BTreeSet;
+    /// # use pplx_space_accounts::OrgId;
     /// # use pplx_space_common_core::types::*;
     /// let shared = NodeGroup {
     ///     id: NodeGroupId::new(),

@@ -1,4 +1,4 @@
-use pplx_space_common_core::types::JobId;
+use pplx_space_accounts::JobId;
 
 use tonic::Status;
 
@@ -19,8 +19,9 @@ use crate::service::SandboxManagerService;
 use crate::service::suspend_snapshot_publication::publish_suspend_snapshot_dir;
 use crate::service::suspend_snapshot_publication::write_full_suspend_artifact;
 use crate::state::{SandboxState, SandboxStatus};
+use pplx_space_accounts::SandboxOwner;
 use pplx_space_common_core::types::{
-    AutoLifecyclePolicy, HostCpu, LocalArtifactId, SandboxId, SandboxOwner, SandboxRuntimeLabel,
+    AutoLifecyclePolicy, HostCpu, LocalArtifactId, SandboxId, SandboxRuntimeLabel,
 };
 use pplx_space_events::SandboxEventTrigger;
 use pplx_space_node_runtime_core::vm_state::VmState;

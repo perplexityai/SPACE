@@ -30,7 +30,7 @@
 //! | `SPACE_INTERNAL_API_ENDPOINT`     | no       | —           |
 //! | `SPACE_INTERNAL_TOKEN`            | no       | —           |
 
-use pplx_space_common_core::types::JobId;
+use pplx_space_accounts::JobId;
 
 use std::path::{Path, PathBuf};
 

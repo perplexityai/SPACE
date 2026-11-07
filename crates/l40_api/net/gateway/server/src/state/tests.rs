@@ -1,5 +1,5 @@
 use super::*;
-use pplx_space_common_core::types::CredentialReferenceId;
+use pplx_space_accounts::CredentialReferenceId;
 use pplx_space_net_common::EffectiveNetworkPolicyRefScope;
 use std::future::Future;
 use std::pin::Pin;

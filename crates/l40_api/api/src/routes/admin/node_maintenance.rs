@@ -8,8 +8,8 @@ use axum::{
     response::IntoResponse,
 };
 use futures_util::{StreamExt, stream};
+use pplx_space_accounts::NodeId;
 use pplx_space_bearer_token::SpaceBearerToken;
-use pplx_space_common_core::types::NodeId;
 use pplx_space_common_core::types::{NodeManagedBy, NodeRole, SubstrateKind, TemplateName};
 use pplx_space_node_api_client::proto::{
     GetNodeInfoRequest, NodeRole as ProtoNodeRole, NodeSource, PullTemplateRequest, TransferSource,

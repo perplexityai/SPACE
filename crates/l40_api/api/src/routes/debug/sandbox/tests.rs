@@ -1,5 +1,6 @@
 use super::*;
-use pplx_space_common_core::types::{OrgId, SandboxId, UserId};
+use pplx_space_accounts::{OrgId, UserId};
+use pplx_space_common_core::types::SandboxId;
 
 /// `GET /admin/api/v1/debug/sandbox/{id}` takes the lock wait as a retryable
 /// 503 and never takes the write conflict.
@@ -89,7 +90,7 @@ async fn the_debug_handler_answers_a_contended_read_with_a_503()
         display_name: "contention probe".to_string(),
         org_id: OrgId::from_uuid(SEED_ORG_ID),
         role: crate::user_role::UserRole::OrganizationAdmin,
-        owner_source: pplx_space_common_core::types::SandboxOwnerSource::Local,
+        owner_source: pplx_space_accounts::SandboxOwnerSource::Local,
         created_at: OffsetDateTime::now_utc(),
         updated_at: OffsetDateTime::now_utc(),
     };
@@ -132,8 +133,8 @@ async fn the_debug_handler_answers_a_contended_read_with_a_503()
 async fn the_debug_read_reports_quarantine_and_snapshot_storage()
 -> pplx_space_db_test_fixtures::TestDbResult<()> {
     use axum::extract::{Path, State};
+    use pplx_space_accounts::NodeId;
     use pplx_space_common_core::sql;
-    use pplx_space_common_core::types::NodeId;
     use pplx_space_db_test_fixtures::{SEED_ORG_ID, SEED_USER_ID, insert_ready_worker_node};
 
     let db = pplx_space_db_test_fixtures::pg_test_db().await?;
@@ -147,7 +148,7 @@ async fn the_debug_read_reports_quarantine_and_snapshot_storage()
         display_name: "debug read".to_string(),
         org_id: OrgId::from_uuid(SEED_ORG_ID),
         role: crate::user_role::UserRole::OrganizationAdmin,
-        owner_source: pplx_space_common_core::types::SandboxOwnerSource::Local,
+        owner_source: pplx_space_accounts::SandboxOwnerSource::Local,
         created_at: OffsetDateTime::now_utc(),
         updated_at: OffsetDateTime::now_utc(),
     };
@@ -315,7 +316,7 @@ async fn the_debug_response_lists_env_names_without_values()
         display_name: "debug reader".to_string(),
         org_id: OrgId::from_uuid(SEED_ORG_ID),
         role: crate::user_role::UserRole::OrganizationAdmin,
-        owner_source: pplx_space_common_core::types::SandboxOwnerSource::Local,
+        owner_source: pplx_space_accounts::SandboxOwnerSource::Local,
         created_at: OffsetDateTime::now_utc(),
         updated_at: OffsetDateTime::now_utc(),
     };

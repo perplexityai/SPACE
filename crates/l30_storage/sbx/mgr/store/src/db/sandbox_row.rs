@@ -6,11 +6,11 @@
 
 use std::collections::BTreeMap;
 
+use pplx_space_accounts::SandboxOwner;
 use pplx_space_common_core::types::{
     ArtifactKind, ArtifactOrigin, AutoLifecyclePolicy, AutoLifecycleRuntimeState,
     ExecutionGeneration, ExecutionMetadata, LocalArtifactId, NodeManagedBy, RouteGeneration,
-    SandboxActivationAttemptId, SandboxId, SandboxOwner, SandboxRuntimeLabel,
-    SpaceApiRouteIdentity,
+    SandboxActivationAttemptId, SandboxId, SandboxRuntimeLabel, SpaceApiRouteIdentity,
 };
 use pplx_space_net_common::{NetworkPolicy, NetworkPolicyV1};
 use pplx_space_policy_authority::PolicyAuthority;

@@ -8,7 +8,8 @@
 //! the direction wrong reads a node outage as an empty node, and an operator who
 //! drains on that reading terminates a host with running sandboxes on it.
 
-use pplx_space_common_core::types::{NodeId, SandboxId};
+use pplx_space_accounts::NodeId;
+use pplx_space_common_core::types::SandboxId;
 
 use pplx_space_common_core::sql;
 use pplx_space_db_test_fixtures::try_pg_test_db;

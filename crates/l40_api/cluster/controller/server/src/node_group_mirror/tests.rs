@@ -3,7 +3,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use kube::client::{Body as KubeBody, ClientBuilder};
-use pplx_space_common_core::types::{NodeGroupId, NodeId, SubstrateKind};
+use pplx_space_accounts::NodeId;
+use pplx_space_common_core::types::{NodeGroupId, SubstrateKind};
 use pplx_space_db_test_fixtures::{
     TestDbResult, try_pg_test_db, try_pg_test_db_with_max_connections,
 };

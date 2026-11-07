@@ -5,6 +5,7 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Duration;
 
+use pplx_space_accounts::NodeId;
 use pplx_space_api::controllers::substrate::ActivationOptions;
 use pplx_space_api::controllers::substrate::kubernetes::{
     GenerationTeardownEvidence, KubernetesSubstrate, observe_generation_teardown_with_node_api,
@@ -22,8 +23,8 @@ use pplx_space_common_core::node_drain_signals::{
     SUSPEND_SANDBOX_FAILED_MARKER,
 };
 use pplx_space_common_core::types::{
-    ArtifactKind, BackupSource, ExecutionGeneration, LocalArtifactId, NodeDrainMode, NodeId,
-    NodeManagedBy, NodeRole, PositiveDuration, SandboxId, SubstrateKind,
+    ArtifactKind, BackupSource, ExecutionGeneration, LocalArtifactId, NodeDrainMode, NodeManagedBy,
+    NodeRole, PositiveDuration, SandboxId, SubstrateKind,
 };
 use pplx_space_events::{
     SandboxEvent, SandboxEventDetails, SandboxEventSource, SandboxEventTrigger, SandboxEventType,

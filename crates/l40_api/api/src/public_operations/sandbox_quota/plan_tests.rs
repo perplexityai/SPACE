@@ -24,8 +24,8 @@
 //! four costs above exceeds that bound on its own. It reads rows off the
 //! plan through [`super::super::plan_explain`].
 
+use pplx_space_accounts::{OrgId, UserId};
 use pplx_space_common_core::sql;
-use pplx_space_common_core::types::{OrgId, UserId};
 use pplx_space_db_test_fixtures::try_pg_test_db;
 use pplx_space_test_env::TestResult;
 use sqlx::PgPool;

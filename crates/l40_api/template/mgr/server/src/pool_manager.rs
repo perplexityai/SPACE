@@ -8,8 +8,8 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use pplx_space_accounts::TEMPLATE_MANAGER_SANDBOX_OWNER;
 use pplx_space_common_core::ids::sandbox_label_or_id;
-use pplx_space_common_core::types::TEMPLATE_MANAGER_SANDBOX_OWNER;
 
 const BASE_TICK: u64 = 5;
 const MAX_TICK: u64 = 160;

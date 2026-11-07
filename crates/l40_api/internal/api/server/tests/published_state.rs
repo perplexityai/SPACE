@@ -3,8 +3,9 @@
 
 #![cfg(test)]
 
+use pplx_space_accounts::NodeId;
 use pplx_space_auto_lifecycle_receipt::AutoLifecyclePolicyFingerprint;
-use pplx_space_common_core::types::{LocalArtifactId, NodeId, SnapshotId};
+use pplx_space_common_core::types::{LocalArtifactId, SnapshotId};
 use pplx_space_common_core::{
     sql,
     types::{

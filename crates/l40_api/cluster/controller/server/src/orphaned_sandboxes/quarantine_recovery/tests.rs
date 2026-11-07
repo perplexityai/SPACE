@@ -1,7 +1,8 @@
 use super::*;
+use pplx_space_accounts::NodeId;
 use pplx_space_common_core::{
     sql,
-    types::{LocalArtifactId, NodeId, SnapshotId},
+    types::{LocalArtifactId, SnapshotId},
 };
 use pplx_space_db_test_fixtures::{SEED_ORG_ID, SEED_USER_ID, pg_test_db_with_max_connections};
 use pplx_space_sandbox_store::test_support::stored_lifecycle_matrix;

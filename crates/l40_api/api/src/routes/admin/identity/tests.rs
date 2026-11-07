@@ -1,6 +1,6 @@
 use super::*;
 use axum::body::to_bytes;
-use pplx_space_common_core::types::OrgId;
+use pplx_space_accounts::OrgId;
 
 #[tokio::test(flavor = "current_thread")]
 async fn password_update_revokes_existing_sessions_but_profile_update_does_not()
@@ -551,7 +551,7 @@ async fn delete_org_answers_conflict_naming_what_still_references_it()
     );
 
     // While a node still caches it, retention has no end to name.
-    let node_id = pplx_space_common_core::types::NodeId::new();
+    let node_id = pplx_space_accounts::NodeId::new();
     pplx_space_db_test_fixtures::insert_ready_worker_node(&db.pool, node_id).await?;
     sqlx::query(sql!(
         "INSERT INTO node_template_inventory (node_id, template_name) VALUES ($1, $2)"

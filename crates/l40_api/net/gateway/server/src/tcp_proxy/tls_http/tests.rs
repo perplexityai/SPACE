@@ -3,7 +3,7 @@ use super::forward::authorize_authority;
 use super::*;
 use crate::certificates::NetworkCredentialAccessError;
 use http::HeaderMap;
-use pplx_space_common_core::types::CredentialReferenceId;
+use pplx_space_accounts::CredentialReferenceId;
 
 #[test]
 fn authority_binds_every_http_routing_field_to_the_tls_origin() {

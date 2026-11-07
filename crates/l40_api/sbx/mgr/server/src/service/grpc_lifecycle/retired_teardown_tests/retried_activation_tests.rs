@@ -475,8 +475,9 @@ async fn a_rollback_receipt_for_another_generation_does_not_hold_a_retry_back() 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_retry_waiting_on_a_rollback_cleanup_sees_its_receipt() {
     use crate::node_manager_transport::fake::FakeNodeManager;
+    use pplx_space_accounts::SandboxOwner;
     use pplx_space_common_core::types::{
-        Arch, AutoLifecyclePolicy, ContentHash, RuntimeKind, SandboxArtifactMetadata, SandboxOwner,
+        Arch, AutoLifecyclePolicy, ContentHash, RuntimeKind, SandboxArtifactMetadata,
         SandboxRuntimeLabel, SnapshotExecutionMetadata,
     };
     use pplx_space_node_mgr_client::proto::{

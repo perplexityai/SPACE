@@ -9,7 +9,8 @@
 //! the entire KEK→DEK chain lives behind the credential service — callers
 //! never see a KEK or a wrap, only the resolved plaintext.
 
-use pplx_space_common_core::types::{OrgId, SandboxId};
+use pplx_space_accounts::OrgId;
+use pplx_space_common_core::types::SandboxId;
 
 use pplx_space_sql_locator::sql;
 use uuid::Uuid;

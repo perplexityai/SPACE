@@ -36,7 +36,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use crate::metrics::operations::{InlineAdmissionPath, InlineAdmissionReason};
-use pplx_space_common_core::types::OrgId;
+use pplx_space_accounts::OrgId;
 use pplx_space_feature_flags::{FeatureFlagClient, SPACE_NATIVE_INLINE_OPERATIONS_FLAG};
 use pplx_space_public_api::{OperationId, OperationKind, OperationState};
 use pplx_space_service_lifecycle::DrainSignal;

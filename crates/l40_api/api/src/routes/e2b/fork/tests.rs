@@ -1,6 +1,6 @@
-use pplx_space_common_core::types::{OrgId, UserId};
+use pplx_space_accounts::{OrgId, UserId};
 
-use pplx_space_common_core::types::{UpstreamIssuer, UpstreamOrgId, UpstreamSubjectId};
+use pplx_space_accounts::{UpstreamIssuer, UpstreamOrgId, UpstreamSubjectId};
 use pplx_space_db_test_fixtures::pg_test_db;
 use pplx_space_public_api::PublicErrorCode;
 
@@ -274,7 +274,7 @@ async fn completed_fork_is_observed_within_one_second_without_busy_polling() {
 /// semantics: no federated owner, so the child lands in the key's org.
 #[test]
 fn legacy_local_fork_source_drops_the_federated_owner() {
-    use pplx_space_common_core::types::SandboxOwnerSource;
+    use pplx_space_accounts::SandboxOwnerSource;
 
     let owner = crate::federated_identity::FederatedOwner {
         issuer: UpstreamIssuer::parse("example-issuer").unwrap(),
