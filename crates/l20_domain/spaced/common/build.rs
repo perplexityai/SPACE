@@ -32,7 +32,7 @@ fn main() -> anyhow::Result<()> {
         .extern_path(".space.net.policy.v1", "::pplx_space_net_common::proto")
         .extern_path(
             ".space.credential.manager.v1.ResolvedNetworkCredential",
-            "::pplx_space_credential_injection_core::proto::ResolvedNetworkCredential",
+            "::pplx_space_credential_injection::proto::ResolvedNetworkCredential",
         );
     pplx_space_common_proto_build::compile_protos(
         dependent_builder,

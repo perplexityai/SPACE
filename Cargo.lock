@@ -4847,7 +4847,7 @@ dependencies = [
  "pplx-space-cluster-trigger-queue",
  "pplx-space-common-core",
  "pplx-space-common-grpc",
- "pplx-space-credential-injection-core",
+ "pplx-space-credential-injection",
  "pplx-space-credential-injection-store",
  "pplx-space-credmgr-client",
  "pplx-space-db-test-fixtures",
@@ -5466,7 +5466,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "pplx-space-credential-injection-core"
+name = "pplx-space-credential-injection"
 version = "0.8.1"
 dependencies = [
  "anyhow",
@@ -5483,7 +5483,7 @@ name = "pplx-space-credential-injection-store"
 version = "0.8.1"
 dependencies = [
  "pplx-space-common-core",
- "pplx-space-credential-injection-core",
+ "pplx-space-credential-injection",
  "pplx-space-db-test-fixtures",
  "pplx-space-net-common",
  "serde",
@@ -5553,7 +5553,7 @@ dependencies = [
  "nix 0.31.3",
  "pplx-space-common-core",
  "pplx-space-common-grpc",
- "pplx-space-credential-injection-core",
+ "pplx-space-credential-injection",
  "pplx-space-credential-injection-store",
  "pplx-space-credential-provider-client",
  "pplx-space-credmgr-client",
@@ -5611,7 +5611,7 @@ dependencies = [
  "pplx-space-common-core",
  "pplx-space-common-grpc",
  "pplx-space-common-proto-build",
- "pplx-space-credential-injection-core",
+ "pplx-space-credential-injection",
  "pplx-space-rustls-provider",
  "pplx-space-test-env",
  "prost",
@@ -6292,7 +6292,7 @@ dependencies = [
  "pplx-space-common-core",
  "pplx-space-common-grpc",
  "pplx-space-connection-admission",
- "pplx-space-credential-injection-core",
+ "pplx-space-credential-injection",
  "pplx-space-credmgr-client",
  "pplx-space-events",
  "pplx-space-grpc-rate-limiter",
@@ -6339,7 +6339,7 @@ dependencies = [
  "jiff",
  "pplx-space-api-route",
  "pplx-space-common-core",
- "pplx-space-credential-injection-core",
+ "pplx-space-credential-injection",
  "pplx-space-net-common",
  "pplx-space-net-gateway",
  "pplx-space-net-gateway-client",
@@ -7299,7 +7299,7 @@ dependencies = [
  "pplx-space-common-core",
  "pplx-space-common-grpc",
  "pplx-space-common-jobs",
- "pplx-space-credential-injection-core",
+ "pplx-space-credential-injection",
  "pplx-space-credmgr",
  "pplx-space-credmgr-client",
  "pplx-space-dependency-drain",
@@ -7591,7 +7591,7 @@ dependencies = [
  "hyper-util",
  "pplx-space-common-core",
  "pplx-space-common-proto-build",
- "pplx-space-credential-injection-core",
+ "pplx-space-credential-injection",
  "pplx-space-net-common",
  "pplx-space-spaced-build",
  "pplx-space-spaced-guest-protocol",

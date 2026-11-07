@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use async_trait::async_trait;
-use pplx_space_credential_injection_core::secret_arn::SecretArn;
+use pplx_space_credential_injection::secret_arn::SecretArn;
 use zeroize::Zeroizing;
 
 use super::*;
