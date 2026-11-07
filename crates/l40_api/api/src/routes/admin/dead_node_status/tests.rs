@@ -1,7 +1,7 @@
 use super::*;
 use axum::http::Method;
 use pplx_space_common_core::sql;
-use pplx_space_sandbox_store::dead_node::{DeadNodeReportWrite, DeadNodeSample, upsert_report};
+use pplx_space_sandbox_store::dead_node::{DeadNodeSample, DeadNodeStatusWrite, write_status};
 use serde_json::{Value, json};
 
 use crate::routes::admin::test_fixtures::{TestResult, admin_router_harness};
@@ -29,22 +29,23 @@ fn without_observed_at(mut entry: Value) -> Value {
 }
 
 /// Operators only. Empty until the controller judges a node; then one entry
-/// per node by node id, with each verdict's reason, counts and samples as
-/// stored, and nothing for an outcome without rows.
+/// per node by node id, with each verdict's reason, instances, counts,
+/// applied writes and samples as stored, and nothing for an outcome without
+/// rows.
 #[tokio::test(flavor = "current_thread")]
-async fn dry_runs_list_each_judged_node_with_its_verdict_and_outcomes() -> TestResult {
+async fn status_lists_each_judged_node_with_its_verdict_and_outcomes() -> TestResult {
     let Some(harness) = admin_router_harness().await? else {
         return Ok(());
     };
     harness
-        .assert_refused_to_non_operators(Method::GET, "/dead-node-dry-runs", None)
+        .assert_refused_to_non_operators(Method::GET, "/dead-node-status", None)
         .await;
 
     let (status, body) = harness
-        .as_operator(Method::GET, "/dead-node-dry-runs", &[], None)
+        .as_operator(Method::GET, "/dead-node-status", &[], None)
         .await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body, json!({"dry_runs": []}));
+    assert_eq!(body, json!({"nodes": []}));
 
     let pool = &harness.db.pool;
     let mut lost_node = insert_node(pool).await?;
@@ -54,14 +55,17 @@ async fn dry_runs_list_each_judged_node_with_its_verdict_and_outcomes() -> TestR
     }
     let lost_sandbox = SandboxId::new();
     let stopped_sandbox = SandboxId::new();
-    upsert_report(
+    write_status(
         pool,
-        &DeadNodeReportWrite {
+        &DeadNodeStatusWrite {
             node_id: lost_node,
+            mode: "live",
             verdict: "lost",
-            reason: "node_deleted",
+            reason: "instance_and_node_gone",
             rows_truncated: true,
+            instances: [("i-0123456789abcdef0", "dead")].into(),
             counts: [("lost", 3), ("stays_stopped", 1)].into(),
+            applied: [("lost", 2)].into(),
             samples: [
                 (
                     "lost",
@@ -82,26 +86,29 @@ async fn dry_runs_list_each_judged_node_with_its_verdict_and_outcomes() -> TestR
         },
     )
     .await?;
-    upsert_report(
+    write_status(
         pool,
-        &DeadNodeReportWrite {
+        &DeadNodeStatusWrite {
             node_id: unknown_node,
+            mode: "dry-run",
             verdict: "unknown",
             reason: "kube_node_present",
             rows_truncated: false,
+            instances: BTreeMap::new(),
             counts: BTreeMap::new(),
+            applied: BTreeMap::new(),
             samples: BTreeMap::new(),
         },
     )
     .await?;
 
     let (status, body) = harness
-        .as_operator(Method::GET, "/dead-node-dry-runs", &[], None)
+        .as_operator(Method::GET, "/dead-node-status", &[], None)
         .await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    let entries: Vec<Value> = body["dry_runs"]
+    let entries: Vec<Value> = body["nodes"]
         .as_array()
-        .expect("dry_runs array")
+        .expect("nodes array")
         .iter()
         .cloned()
         .map(without_observed_at)
@@ -112,10 +119,13 @@ async fn dry_runs_list_each_judged_node_with_its_verdict_and_outcomes() -> TestR
             json!({
                 "node_id": lost_node,
                 "observed_at": "<observed_at>",
+                "mode": "live",
                 "verdict": "lost",
-                "reason": "node_deleted",
+                "reason": "instance_and_node_gone",
                 "rows_truncated": true,
+                "instances": {"i-0123456789abcdef0": "dead"},
                 "counts": {"lost": 3, "stays_stopped": 1},
+                "applied": {"lost": 2},
                 "samples": {
                     "lost": [{"sandbox_id": lost_sandbox, "lifecycle": "started"}],
                     "stays_stopped": [{"sandbox_id": stopped_sandbox, "lifecycle": "stopped"}],
@@ -124,10 +134,13 @@ async fn dry_runs_list_each_judged_node_with_its_verdict_and_outcomes() -> TestR
             json!({
                 "node_id": unknown_node,
                 "observed_at": "<observed_at>",
+                "mode": "dry-run",
                 "verdict": "unknown",
                 "reason": "kube_node_present",
                 "rows_truncated": false,
+                "instances": {},
                 "counts": {},
+                "applied": {},
                 "samples": {},
             }),
         ]

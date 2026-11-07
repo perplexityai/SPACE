@@ -144,16 +144,17 @@ impl TerminatorKind {
 
 /// The dead-node verb's instance authority for the cluster's terminator kind,
 /// `None` being a kind that did not parse: only `aws` asks EC2, unless the
-/// smoke-only test hook forces it, and a kind that names no authority judges
-/// every node unknown.
+/// smoke-only test hook forces it. `kube-delete`, `noop` and a kind that did
+/// not parse name no authority, so an unexpected death reads unknown.
 fn dead_node_authority_kind(
     terminator: Option<TerminatorKind>,
     force_ec2: bool,
 ) -> dead_node::AuthorityKind {
     match (terminator, force_ec2) {
         (_, true) | (Some(TerminatorKind::Aws), false) => dead_node::AuthorityKind::Ec2,
-        (Some(TerminatorKind::KubeDelete), false) => dead_node::AuthorityKind::KubeDelete,
-        (Some(TerminatorKind::Noop) | None, false) => dead_node::AuthorityKind::None,
+        (Some(TerminatorKind::KubeDelete | TerminatorKind::Noop) | None, false) => {
+            dead_node::AuthorityKind::None
+        }
     }
 }
 
@@ -448,6 +449,13 @@ pub async fn run_reconcilers(
             }
         }
         Some(kube) => {
+            // Read once: in `live` the verb replaces `lost_started_sandboxes`
+            // and `orphaned_nodes`, and `orphaned_sandboxes` leaves it the
+            // rows on nodes it reconciles.
+            let dead_node_config = dead_node::ReconcilerConfig::from_env();
+            let dead_node_live = dead_node_config
+                .as_ref()
+                .is_some_and(dead_node::ReconcilerConfig::is_live);
             let warm_pool_token = shutdown_token.child_token();
             let warm_pool_store = WarmPoolStore::new(pool.clone());
             let warm_pool_kube = kube.k8s.client.clone();
@@ -475,7 +483,10 @@ pub async fn run_reconcilers(
             handles.push(tokio::spawn(orphaned_sandboxes::run(
                 pool.clone(),
                 kube.clone(),
-                orphaned_sandboxes::ReconcilerConfig::from_env(),
+                orphaned_sandboxes::ReconcilerConfig {
+                    leave_dead_node_rows: dead_node_live,
+                    ..orphaned_sandboxes::ReconcilerConfig::from_env()
+                },
                 shutdown_token.child_token(),
             )));
 
@@ -792,7 +803,13 @@ pub async fn run_reconcilers(
             // startup or surface confusing errors in environments that
             // don't intend to use this path.
             let orphaned_nodes_config = orphaned_nodes::ReconcilerConfig::from_env();
-            if orphaned_nodes_config.enabled {
+            if orphaned_nodes_config.enabled && dead_node_live {
+                tracing::info!(
+                    variable = dead_node::MODE_ENV,
+                    "orphaned-nodes reconciler is enabled but the dead-node verb runs live \
+                     and deletes dead nodes' rows; not starting it"
+                );
+            } else if orphaned_nodes_config.enabled {
                 let aws_config =
                     aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
                 let ec2_client = pplx_space_aws_client::ec2::Client::from_config(&aws_config);
@@ -817,7 +834,13 @@ pub async fn run_reconcilers(
             // Kubernetes with no live EC2 instance). Opt-in; the AWS SDK is
             // only initialized when it's enabled, like `orphaned_nodes`.
             let lost_started_config = lost_started_sandboxes::ReconcilerConfig::from_env();
-            if lost_started_config.enabled {
+            if lost_started_config.enabled && dead_node_live {
+                tracing::info!(
+                    variable = dead_node::MODE_ENV,
+                    "lost_started_sandboxes is enabled but the dead-node verb runs live \
+                     and writes off dead machines' rows; not starting it"
+                );
+            } else if lost_started_config.enabled {
                 let aws_config =
                     aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
                 let ec2_client = pplx_space_aws_client::ec2::Client::from_config(&aws_config);
@@ -841,7 +864,7 @@ pub async fn run_reconcilers(
             // The dead-node verb reads the terminator kind only when it is on,
             // so its default leaves startup exactly as it was; and a kind that
             // does not parse judges every node unknown instead of failing it.
-            if let Some(dead_node_config) = dead_node::ReconcilerConfig::from_env() {
+            if let Some(dead_node_config) = dead_node_config {
                 let terminator = match TerminatorKind::from_env() {
                     Ok(kind) => Some(kind),
                     Err(err) => {
@@ -862,9 +885,6 @@ pub async fn run_reconcilers(
                             dead_node::InstanceAuthority::Ec2(Arc::new(
                                 pplx_space_aws_client::ec2::Client::from_config(&aws_config),
                             ))
-                        }
-                        dead_node::AuthorityKind::KubeDelete => {
-                            dead_node::InstanceAuthority::KubeDelete
                         }
                         dead_node::AuthorityKind::None => dead_node::InstanceAuthority::None,
                     };

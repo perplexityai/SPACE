@@ -1,5 +1,5 @@
-//! What reconciling one sandbox row of a lost node would do: one rule for
-//! every row the node holds.
+//! What reconciling one sandbox row a dead machine held does: one rule for
+//! every row the verb selects.
 //!
 //! The rule reads only [`DeadNodeRow`]'s facts, which
 //! `pplx_space_sandbox_store::dead_node::rows_on_node` reads with the shared
@@ -13,9 +13,17 @@ use std::fmt;
 use pplx_space_sandbox_store::StoredSandboxLifecycle;
 use pplx_space_sandbox_store::dead_node::DeadNodeRow;
 
-/// The outcome of one row. A dry run counts these; nothing applies them yet.
+/// The outcome of one row. A dry run counts these; live mode applies the
+/// ones that write ([`RowOutcome::writes`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum RowOutcome {
+    /// A node with a fresh heartbeat and a fresh complete census reports
+    /// holding the sandbox: a live machine has its state, so it is never
+    /// written off.
+    HeldByPublication,
+    /// A drain restore operation's episode is open on the row; the operation
+    /// owns it.
+    HeldByRestore,
     /// `deleting`: the delete finishes; nothing on the node is needed.
     FinishDelete,
     /// `suspended` and covered by a durable snapshot: stays `suspended`,
@@ -44,11 +52,17 @@ pub enum RowOutcome {
     /// An active execution off the node, placed or pending elsewhere, owns
     /// the row: nothing is lost with the node.
     HeldByExecution,
+    /// No verdict selects the row: its latest execution ran on an instance
+    /// that is live or not known dead, or it has no stamped execution on the
+    /// node and the node is not lost. [`row_outcome`] never returns it.
+    Unselected,
 }
 
 impl RowOutcome {
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::HeldByPublication => "held_by_publication",
+            Self::HeldByRestore => "held_by_restore",
             Self::FinishDelete => "finish_delete",
             Self::StaysSuspended => "stays_suspended",
             Self::StaysStopped => "stays_stopped",
@@ -59,6 +73,26 @@ impl RowOutcome {
             Self::ReferencesCleared => "references_cleared",
             Self::Wait => "wait",
             Self::HeldByExecution => "held_by_execution",
+            Self::Unselected => "unselected",
+        }
+    }
+
+    /// Whether live mode writes the row for this outcome.
+    pub const fn writes(self) -> bool {
+        match self {
+            Self::FinishDelete
+            | Self::StaysSuspended
+            | Self::StaysStopped
+            | Self::QuarantineKept
+            | Self::QuarantineLost
+            | Self::LostSnapshotRetained
+            | Self::Lost
+            | Self::ReferencesCleared => true,
+            Self::HeldByPublication
+            | Self::HeldByRestore
+            | Self::Wait
+            | Self::HeldByExecution
+            | Self::Unselected => false,
         }
     }
 }
@@ -69,8 +103,11 @@ impl fmt::Display for RowOutcome {
     }
 }
 
-/// The outcome of `row` on a lost node.
+/// The outcome of `row`, which a verdict selected.
 ///
+/// - A row a node with a fresh, complete publication reports holding is
+///   held by that publication, and one with an open drain restore episode by
+///   the restore, whatever else holds.
 /// - `deleting` finishes its delete, whatever else holds.
 /// - A row with an active execution off the node, including one whose pod is
 ///   not scheduled yet, is held by that execution: `held_by_execution`, not
@@ -98,6 +135,12 @@ pub fn row_outcome(row: &DeadNodeRow) -> RowOutcome {
     } else {
         RowOutcome::Lost
     };
+    if row.reported_by_live_node {
+        return RowOutcome::HeldByPublication;
+    }
+    if row.restore_owned {
+        return RowOutcome::HeldByRestore;
+    }
     if row.lifecycle == Some(StoredSandboxLifecycle::Live(L::Deleting)) {
         return RowOutcome::FinishDelete;
     }

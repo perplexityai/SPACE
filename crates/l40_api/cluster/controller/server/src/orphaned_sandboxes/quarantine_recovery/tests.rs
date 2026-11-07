@@ -57,7 +57,7 @@ async fn publication_quarantine_repair_preserves_identity_and_retires_stale_owne
     let c = fixture(&db.pool).await?;
     // The old orphan scan excludes this reachable shape entirely.
     assert!(
-        super::super::list_candidates_after(&db.pool, None, c.sandbox_id, 100)
+        super::super::list_candidates_after(&db.pool, None, c.sandbox_id, 100, false)
             .await?
             .is_empty()
     );
