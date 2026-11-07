@@ -294,7 +294,7 @@ fn unlinkat(dir: &File, name: &OsStr) -> io::Result<()> {
 /// the filesystem supports it, hole-preserving byte copy otherwise. The
 /// destination is a freshly created empty temp file.
 pub(crate) fn copy_on_descriptors(src: &File, dst: &File, len: u64) -> io::Result<()> {
-    pplx_space_common_io::reflink::copy_on_descriptors(src, dst, len).map(|_| ())
+    pplx_space_file_io::reflink::copy_on_descriptors(src, dst, len).map(|_| ())
 }
 
 #[cfg(test)]

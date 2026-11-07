@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::metrics::TcpConnectionFault;
-use pplx_space_common_connection_admission::AcceptErrors;
+use pplx_space_connection_admission::AcceptErrors;
 use pplx_space_net_common::DomainName;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};

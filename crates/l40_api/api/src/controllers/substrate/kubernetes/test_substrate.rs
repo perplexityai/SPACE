@@ -143,9 +143,9 @@ pub(super) fn assemble_substrate(
             TEST_RESTORE_POLL_INTERVAL,
         ),
         pod_worker_channels: Arc::default(),
-        wake_coalescer: Arc::new(
-            pplx_space_common_work_coalescer::WorkCoalescer::with_tracker(task_tracker.clone()),
-        ),
+        wake_coalescer: Arc::new(pplx_space_work_coalescer::WorkCoalescer::with_tracker(
+            task_tracker.clone(),
+        )),
         store: K8sStore::new(pool.clone(), TEST_SANDBOX_NAMESPACE.to_string()),
         pod_store,
         pod_network_slots,

@@ -2,7 +2,7 @@ use pplx_space_common_core::{
     sql,
     types::{CredentialReferenceId, OrgId},
 };
-use pplx_space_credential_injection_core::validation::ValidatedCredentialReference;
+use pplx_space_credential_injection::validation::ValidatedCredentialReference;
 use serde::{Deserialize, Serialize};
 use sqlx::types::Json;
 
@@ -34,7 +34,7 @@ impl Config {
         &self,
     ) -> Result<
         ValidatedCredentialReference,
-        pplx_space_credential_injection_core::validation::ReferenceValidationError,
+        pplx_space_credential_injection::validation::ReferenceValidationError,
     > {
         match self {
             Self::AwsSecretsManager { secret_arn } => {

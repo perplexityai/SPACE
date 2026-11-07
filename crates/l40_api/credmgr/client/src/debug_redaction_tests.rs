@@ -104,7 +104,7 @@ fn resolved_network_credentials_debug_output_is_redacted() {
         &ResolveNetworkCredentialsResponse {
             effective_network_policy_ref: "policy-ref".into(),
             credentials: vec![
-                pplx_space_credential_injection_core::proto::ResolvedNetworkCredential {
+                pplx_space_credential_injection::proto::ResolvedNetworkCredential {
                     credential_reference_id: "019d84bd-280d-7331-99c6-b63377f3a3a2".into(),
                     value: b"secret-header-value".to_vec(),
                 },

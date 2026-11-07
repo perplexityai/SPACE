@@ -1,5 +1,5 @@
 [package]
-name = "pplx-space-common-io"
+name = "pplx-space-file-io"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

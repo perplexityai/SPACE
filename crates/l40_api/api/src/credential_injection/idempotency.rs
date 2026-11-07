@@ -3,7 +3,7 @@ use pplx_space_common_core::{
     sql,
     types::{IdempotencyKey, OrgId},
 };
-use pplx_space_credential_injection_core::validation::ValidatedCredentialReference;
+use pplx_space_credential_injection::validation::ValidatedCredentialReference;
 use pplx_space_public_api::RequestFingerprint;
 use serde::{Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};

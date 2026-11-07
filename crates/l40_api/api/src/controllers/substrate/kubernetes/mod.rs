@@ -897,11 +897,7 @@ pub struct KubernetesSubstrate {
 
 /// Shared across substrate clones so every request on a pod sees one gate.
 type WakeCoalescer = Arc<
-    pplx_space_common_work_coalescer::WorkCoalescer<
-        SandboxId,
-        super::ExecutionActivation,
-        SubstrateError,
-    >,
+    pplx_space_work_coalescer::WorkCoalescer<SandboxId, super::ExecutionActivation, SubstrateError>,
 >;
 
 impl KubernetesSubstrate {
@@ -928,7 +924,7 @@ impl KubernetesSubstrate {
                     ),
                     pod_worker_channels: Arc::default(),
                     wake_coalescer: Arc::new(
-                        pplx_space_common_work_coalescer::WorkCoalescer::with_tracker(
+                        pplx_space_work_coalescer::WorkCoalescer::with_tracker(
                             task_tracker.clone(),
                         ),
                     ),

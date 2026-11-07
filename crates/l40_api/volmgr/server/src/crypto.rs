@@ -2,7 +2,7 @@
 //!
 //! The streaming AES-256-GCM *mechanics* (the SPACEAEA wire format,
 //! the chunked AEAD, the file/stream entry points) live in the
-//! domain-neutral [`pplx_space_common_io::fs`] crate so other
+//! domain-neutral [`pplx_space_file_io::fs`] crate so other
 //! consumers — and future btrfs full/diff stream handling — can reuse
 //! them without depending on vol-mgr. This module re-exports them and
 //! adds the BYOK-domain *policy*: which AAD binds a wrapped DEK and
@@ -10,9 +10,9 @@
 //!
 //! Volume Manager remains the orchestrator/authority: it owns the
 //! key lifecycle (credmgr `IssueDek`/`UnwrapDek`) and decides the AAD;
-//! `common-io` only knows "encrypt these bytes under this key+AAD".
+//! `file-io` only knows "encrypt these bytes under this key+AAD".
 
-pub use pplx_space_common_io::fs::{
+pub use pplx_space_file_io::fs::{
     CHUNK_SIZE, CryptoError, HEADER_LEN, KEY_LEN, decrypt_file_blocking, decrypt_stream_blocking,
     decrypted_sibling, encrypt_file_blocking, encrypt_stream_blocking, encrypted_sibling,
 };

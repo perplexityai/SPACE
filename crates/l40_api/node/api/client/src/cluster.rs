@@ -321,10 +321,10 @@ async fn cluster_api_channel(
     let Some(kubernetes_service) = configured_discovery_service(&uri, discovery) else {
         return rotating_channel(uri, transport).await;
     };
-    match pplx_space_common_grpc_lb::KubernetesEndpoints::connect(
+    match pplx_space_grpc_lb::KubernetesEndpoints::connect(
         CLUSTER_API_SERVICE_NAME,
         kubernetes_service,
-        pplx_space_common_grpc_lb::PortSelector::Sole,
+        pplx_space_grpc_lb::PortSelector::Sole,
     )
     .await
     {
@@ -338,7 +338,7 @@ async fn cluster_api_channel(
                 .connect()
                 .await
                 .map_err(ConnectClusterApiError::Transport)?;
-            let balanced = pplx_space_common_grpc_lb::balanced_channel(
+            let balanced = pplx_space_grpc_lb::balanced_channel(
                 CLUSTER_API_SERVICE_NAME,
                 uri,
                 move |uri| {

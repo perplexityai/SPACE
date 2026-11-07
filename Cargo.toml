@@ -111,14 +111,14 @@ members = [
     "crates/l10_foundation/durations",
     "crates/l10_foundation/stopwatch",
     "crates/l10_foundation/common/cli",
-    "crates/l10_foundation/common/connection/admission",
+    "crates/l10_foundation/connection/admission",
     "crates/l10_foundation/common/grpc/transport",
-    "crates/l10_foundation/common/grpc/lb",
-    "crates/l10_foundation/common/io",
+    "crates/l10_foundation/grpc/lb",
+    "crates/l10_foundation/file/io",
     "crates/l10_foundation/common/jobs",
-    "crates/l10_foundation/common/lru/reaper",
+    "crates/l10_foundation/lru/reaper",
     "crates/l10_foundation/common/proto/build",
-    "crates/l10_foundation/common/work/coalescer",
+    "crates/l10_foundation/work/coalescer",
     "crates/l40_api/rpc/auth",
     "crates/l40_api/grpc/server",
     "crates/l40_api/local/health",
@@ -177,7 +177,7 @@ members = [
     "crates/l40_api/template/publisher",
     "crates/l40_api/credmgr/client",
     "crates/l40_api/credmgr/server",
-    "crates/l20_domain/credential/injection/core",
+    "crates/l20_domain/credential/injection",
     "crates/l40_api/credential/provider/client",
     "crates/l20_domain/credential/provider/proto",
     "crates/l50_app/volmgr/svc",
@@ -370,14 +370,14 @@ pplx-space-common-core = { path = "crates/libs/common/core" }
 pplx-space-durations = { path = "crates/l10_foundation/durations" }
 pplx-space-stopwatch = { path = "crates/l10_foundation/stopwatch" }
 pplx-space-common-cli = { path = "crates/l10_foundation/common/cli" }
-pplx-space-common-connection-admission = { path = "crates/l10_foundation/common/connection/admission" }
+pplx-space-connection-admission = { path = "crates/l10_foundation/connection/admission" }
 pplx-space-common-grpc = { path = "crates/l10_foundation/common/grpc/transport" }
-pplx-space-common-grpc-lb = { path = "crates/l10_foundation/common/grpc/lb" }
-pplx-space-common-io = { path = "crates/l10_foundation/common/io" }
+pplx-space-grpc-lb = { path = "crates/l10_foundation/grpc/lb" }
+pplx-space-file-io = { path = "crates/l10_foundation/file/io" }
 pplx-space-common-jobs = { path = "crates/l10_foundation/common/jobs" }
-pplx-space-common-lru-reaper = { path = "crates/l10_foundation/common/lru/reaper" }
+pplx-space-lru-reaper = { path = "crates/l10_foundation/lru/reaper" }
 pplx-space-common-proto-build = { path = "crates/l10_foundation/common/proto/build" }
-pplx-space-common-work-coalescer = { path = "crates/l10_foundation/common/work/coalescer" }
+pplx-space-work-coalescer = { path = "crates/l10_foundation/work/coalescer" }
 pplx-space-content-digest = { path = "crates/l10_foundation/content/digest" }
 pplx-space-cpu-arch = { path = "crates/l10_foundation/cpu/arch" }
 pplx-space-data-plane-server = { path = "crates/l40_api/data/plane/server" }
@@ -397,7 +397,7 @@ pplx-space-federated-grant-store = { path = "crates/l30_storage/federated/grant/
 pplx-space-ingress-admission = { path = "crates/l40_api/ingress/admission" }
 pplx-space-credmgr = { path = "crates/l40_api/credmgr/server" }
 pplx-space-credmgr-client = { path = "crates/l40_api/credmgr/client" }
-pplx-space-credential-injection-core = { path = "crates/l20_domain/credential/injection/core" }
+pplx-space-credential-injection = { path = "crates/l20_domain/credential/injection" }
 pplx-space-credential-injection-store = { path = "crates/l30_storage/credential/injection/store" }
 pplx-space-credential-provider-client = { path = "crates/l40_api/credential/provider/client" }
 pplx-space-credential-provider-proto = { path = "crates/l20_domain/credential/provider/proto" }
