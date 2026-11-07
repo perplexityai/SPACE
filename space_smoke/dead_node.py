@@ -1,30 +1,39 @@
-"""The dead-node verb's dry run, proven against a Kind worker that really died.
+"""The dead-node verb, proven against a Kind worker that really died.
 
 The cluster-controller loop `dead_node`
-(crates/l40_api/cluster/controller/server/src/dead_node/) judges each node
-whose heartbeat is stale and reports, per outcome, what reconciling the
-sandbox rows it holds would do, without writing anything but its report. It
-ships off and reads its config once at startup, so the scenario scopes a
-`dry-run` config to itself: the controller Deployment's `SPACE_DEAD_NODE_*`
-env is captured, overridden (mode, and the test-hook tick, absence window,
-upload settle window and instance authority), and put back in a scenario
-phase, under the controller-mutation Lease the retention scenarios share.
+(crates/l40_api/cluster/controller/server/src/dead_node/) judges the exact
+EC2 instances each node's sandbox rows ran on and the node itself, reports
+per outcome what reconciling the rows does, and in `live` does it. It ships
+off and reads its config once at startup, so a scenario scopes its config to
+itself: the controller Deployment's `SPACE_DEAD_NODE_*` env is captured,
+overridden (mode, and the test-hook tick, absence window, upload settle
+window and instance authority), and put back in a scenario phase, under the
+controller-mutation Lease the retention scenarios share.
 
-The node fault is one Kind worker that runs no stack pod: its container is
-stopped and its Kubernetes Node deleted, so its heartbeat goes stale, the
-Node is gone from the reflector and from a direct GET, and Kind's fake EC2
-answers DescribeInstances for its name with no instance, since it derives
-every answer from the Node. The worker is started again in the scenario's
-last phase, and the start is armed as a compensation before the stop.
+Instances: Kind registers its workers with a `kind://` providerID, so the
+scenario re-registers the chosen worker and a reference worker under fake
+AWS providerIDs (`aws:///kind-a/i-<17 hex>`). Their instances are recorded
+in `node_k8s`, sandbox executions placed on them are stamped with them, and
+Kind's fake EC2 answers for them by ID. The providerIDs stay after the
+scenario: nothing on Kind reads them but the instance recording.
 
-The observables are state: the admin route `GET /dead-node-dry-runs`, and the
-sandbox rows, read before and after the dry run. The controller's log line
-per node is evidence only.
+The node fault is the chosen worker, which runs no stack pod: its container
+is stopped, its Kubernetes Node deleted and its instance marked terminated in
+the fake EC2, so its heartbeat goes stale, the Node is gone from the
+reflector and from a direct GET, and EC2 lists its instance `terminated`.
+The worker is started again in the scenario's last phase, under a new
+providerID, as a same-name replacement would be; the start is armed as a
+compensation before the stop.
+
+The observables are state: the admin route `GET /dead-node-status`, the node
+row and the sandbox rows. The controller's log line per node is evidence
+only.
 """
 
 from __future__ import annotations
 
 import re
+import secrets
 import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
@@ -35,7 +44,7 @@ from typing import TYPE_CHECKING
 from space_smoke.capabilities import (
     AdminNodeView,
     DeadNodeControl,
-    DeadNodeDryRun,
+    DeadNodeStatus,
     SandboxRowState,
 )
 from space_smoke.runtime import Compensation, ResourceScope
@@ -58,7 +67,7 @@ DEAD_NODE_ENV_KEYS: tuple[str, ...] = (
     UPLOAD_SETTLE_ENV,
     INSTANCE_AUTHORITY_ENV,
 )
-_MODE_VALUES = frozenset({"off", "dry-run"})
+_MODE_VALUES = frozenset({"off", "dry-run", "live"})
 _AUTHORITY_VALUES = frozenset({"ec2"})
 _SECONDS_VALUE = re.compile(r"[1-9][0-9]{0,3}")
 
@@ -87,6 +96,49 @@ EXPECTED_OUTCOME: Mapping[str, str] = {
 # Earlier runs leave `deleted` tombstones pinned to a worker; they are
 # reported apart from the outcomes this scenario creates.
 TOMBSTONE_OUTCOME = "references_cleared"
+# What a row selects to without an instance authority: nothing.
+UNSELECTED = "unselected"
+
+
+@dataclass(frozen=True)
+class LiveRow:
+    """The row a live reconcile leaves: its lifecycle, and whether it keeps
+    the dead node as its last target (a row written off does; a restorable
+    one is unplaced from it)."""
+
+    lifecycle: str
+    keeps_target: bool
+
+
+# What `live` leaves each created row as; the writes are
+# `pplx_space_sandbox_store::dead_node` and `::lost`.
+LIVE_ROW: Mapping[str, LiveRow] = {
+    STARTED: LiveRow("failed", keeps_target=True),
+    PAUSED: LiveRow("failed", keeps_target=True),
+    STOPPED: LiveRow("failed", keeps_target=True),
+    SUSPENDED_REMOTE: LiveRow("suspended", keeps_target=False),
+    SUSPENDING_LOCAL: LiveRow("failed", keeps_target=True),
+}
+
+_FAKE_INSTANCE = re.compile(r"i-[0-9a-f]{17}")
+_FAKE_PROVIDER = re.compile(r"aws:///kind-a/(i-[0-9a-f]{17})")
+
+
+def validate_fake_instance_id(instance_id: str) -> None:
+    if _FAKE_INSTANCE.fullmatch(instance_id) is None:
+        raise ValueError(f"refusing instance id {instance_id!r}")
+
+
+def validate_fake_provider_id(provider_id: str) -> None:
+    if _FAKE_PROVIDER.fullmatch(provider_id) is None:
+        raise ValueError(f"refusing providerID {provider_id!r}")
+
+
+def fake_provider_id() -> tuple[str, str]:
+    """A new fake AWS providerID and the instance it names."""
+
+    instance_id = "i-" + secrets.token_hex(9)[:17]
+    return f"aws:///kind-a/{instance_id}", instance_id
 
 
 def validate_dead_node_keys(values: Mapping[str, object]) -> None:
@@ -108,7 +160,7 @@ def validate_dead_node_overrides(overrides: Mapping[str, str]) -> None:
             raise ValueError(f"refusing {key}={value!r}")
 
 
-def _evidence(entry: DeadNodeDryRun) -> dict[str, object]:
+def _evidence(entry: DeadNodeStatus) -> dict[str, object]:
     """The entry as JSON-safe evidence."""
 
     return {**entry.__dict__, "observed_at": entry.observed_at.isoformat()}
@@ -128,7 +180,12 @@ class DeadNodeAssertions:
         self._control = control
         self._scope = scope
         self._node: AdminNodeView | None = None
+        self._reference: AdminNodeView | None = None
+        # The instance each worker's fake providerID names, by Kube name.
+        self._instances: dict[str, str] = {}
+        self._labels: dict[str, str] | None = None
         self._sandboxes: list[CreatedSandbox] = []
+        self._replacement_sandboxes: list[str] = []
         self._store_back: Compensation | None = None
         self._restart: Compensation | None = None
         self._rows_before: list[SandboxRowState] | None = None
@@ -146,7 +203,7 @@ class DeadNodeAssertions:
 
     def choose_worker(self) -> AdminNodeView:
         """A worker no stack pod runs on, on a fleet with no node mid-drain and
-        another worker to keep the stack running."""
+        another such worker to serve as the EC2 reference."""
 
         nodes = self._control.admin_nodes()
         draining = [n for n in nodes if n.drain_phase is not None]
@@ -159,14 +216,63 @@ class DeadNodeAssertions:
         workers = [n for n in nodes if n.k8s_node_name in pool]
         candidates = [n for n in workers if not self._control.node_stack_pods(n.k8s_node_name)]
         self._fixture.verify(
-            len(workers) >= 2 and bool(candidates),
-            "the scenario needs two sandbox workers, one of them running no stack pod, to stop one",
+            len(candidates) >= 2,
+            "the scenario needs two sandbox workers running no stack pod: one to stop, one to "
+            "re-register as the EC2 reference",
             workers={n.k8s_node_name: self._control.node_stack_pods(n.k8s_node_name) for n in workers},
         )
-        self._node = candidates[0]
+        # Re-registering a worker deletes the pods on it; prefer to stop the
+        # one the fixture's own sandbox doesn't run on.
+        fixture = self._control.sandbox_pod_placement(self._fixture.sandbox.sandbox_id)
+        hosting = None if fixture is None else fixture.node_name
+        candidates.sort(key=lambda n: n.k8s_node_name == hosting)
+        self._node, self._reference = candidates[0], candidates[1]
         self._fixture.record("dead_worker", self._node.k8s_node_name)
         self._fixture.record("dead_node_id", self._node.id)
+        self._fixture.record("reference_worker", self._reference.k8s_node_name)
         return self._node
+
+    def _register_fake_instance(self, node: AdminNodeView, *, timeout: float = 300) -> str:
+        provider_id, instance_id = fake_provider_id()
+        labels = self._control.kind_node_labels(node.k8s_node_name)
+        self._control.set_kind_worker_provider_id(
+            node.k8s_node_name, provider_id, labels, timeout=timeout
+        )
+        self._await_recorded_instance(node, instance_id, timeout=timeout)
+        self._instances[node.k8s_node_name] = instance_id
+        return instance_id
+
+    def _await_recorded_instance(
+        self, node: AdminNodeView, instance_id: str, *, timeout: float
+    ) -> None:
+        deadline = time.monotonic() + timeout
+        while self._control.node_recorded_instance(node.id) != instance_id:
+            self._fixture.verify(
+                time.monotonic() < deadline,
+                "node registration never recorded the worker's fake instance",
+                worker=node.k8s_node_name,
+                expected=instance_id,
+                recorded=self._control.node_recorded_instance(node.id),
+            )
+            self._fixture.wait(3)
+
+    def give_fake_instances(self) -> None:
+        """Re-register the chosen worker and the reference under fake AWS
+        providerIDs, and wait until their instances are recorded."""
+
+        if self._reference is None:
+            raise RuntimeError("choose_worker() must run first")
+        for node in (self.node, self._reference):
+            self._fixture.record(
+                f"instance_{node.k8s_node_name}", self._register_fake_instance(node)
+            )
+
+    @property
+    def instance(self) -> str:
+        instance = self._instances.get(self.node.k8s_node_name)
+        if instance is None:
+            raise RuntimeError("give_fake_instances() must run first")
+        return instance
 
     @contextmanager
     def only_worker_schedulable(self) -> Iterator[None]:
@@ -199,6 +305,13 @@ class DeadNodeAssertions:
     def adopt(self, sandbox_id: str, state: str) -> None:
         """Track a sandbox the body created, after checking it runs on the worker."""
 
+        self._expect_placed_and_stamped(sandbox_id)
+        self._sandboxes.append(CreatedSandbox(sandbox_id, state))
+
+    def _expect_placed_and_stamped(self, sandbox_id: str) -> None:
+        """The sandbox runs on the chosen worker, and its execution is stamped
+        with the worker's current instance."""
+
         placement = self._control.sandbox_pod_placement(sandbox_id)
         self._fixture.verify(
             placement is not None and placement.node_name == self.node.k8s_node_name,
@@ -207,15 +320,28 @@ class DeadNodeAssertions:
             placed_on=None if placement is None else placement.node_name,
             worker=self.node.k8s_node_name,
         )
-        self._sandboxes.append(CreatedSandbox(sandbox_id, state))
+        stamp = self._control.latest_execution_instance(sandbox_id)
+        self._fixture.verify(
+            stamp == self.instance,
+            "the sandbox's execution is not stamped with its worker's instance",
+            sandbox_id=sandbox_id,
+            stamp=stamp,
+            instance=self.instance,
+        )
 
     def adopt_fixture_sandbox_if_resident(self) -> None:
         """The fixture's own sandbox was created before the cordon; if it runs
-        on the chosen worker it is one more `started` row there."""
+        on the chosen worker it is one more `started` row there. The
+        re-registration deleted its pod with the Node, so it is a candidate
+        only if it was placed again since."""
 
         sandbox_id = self._fixture.sandbox.sandbox_id
         placement = self._control.sandbox_pod_placement(sandbox_id)
-        if placement is not None and placement.node_name == self.node.k8s_node_name:
+        if (
+            placement is not None
+            and placement.node_name == self.node.k8s_node_name
+            and self._control.latest_execution_instance(sandbox_id) == self.instance
+        ):
             self._sandboxes.append(CreatedSandbox(sandbox_id, STARTED))
             self._fixture.record("fixture_sandbox_on_dead_worker", sandbox_id)
 
@@ -294,9 +420,10 @@ class DeadNodeAssertions:
     # --- the fault ------------------------------------------------------------
 
     def kill_worker(self) -> None:
-        """Stop the worker and delete its Node, its restart armed first with
-        the Node's labels read before anything changes; then let uploads
-        through again, which the dead worker can no longer use."""
+        """Stop the worker, delete its Node and mark its instance terminated in
+        the fake EC2, its restart under a new providerID armed first with the
+        Node's labels read before anything changes; then let uploads through
+        again, which the dead worker can no longer use."""
 
         node = self.node
         others = [s.sandbox_id for s in self._sandboxes]
@@ -308,23 +435,34 @@ class DeadNodeAssertions:
             foreign=foreign,
         )
         labels = self._control.kind_node_labels(node.k8s_node_name)
+        self._labels = labels
+        provider_id, replacement = fake_provider_id()
+        self._fixture.record("replacement_instance", replacement)
+
+        def restart() -> None:
+            self._control.start_kind_worker(
+                node.k8s_node_name, labels, timeout=300, provider_id=provider_id
+            )
+            self._instances[node.k8s_node_name] = replacement
+
         self._restart = self._scope.defer(
-            f"start Kind worker {node.k8s_node_name} again",
-            lambda: self._control.start_kind_worker(node.k8s_node_name, labels, timeout=300),
+            f"start Kind worker {node.k8s_node_name} again as a replacement",
+            restart,
             critical=True,
         )
         self._control.stop_kind_worker(node.k8s_node_name)
+        self._control.fake_ec2_terminate(self.instance)
         if self._store_back is not None:
             self._store_back.release()
         self._rows_before = self._control.sandbox_row_states(others)
         self._fixture.record("rows_before", [row.__dict__ for row in self._rows_before])
 
     @contextmanager
-    def scoped_dry_run(self) -> Iterator[Callable[[Mapping[str, str]], None]]:
+    def scoped_config(self) -> Iterator[Callable[[Mapping[str, str]], None]]:
         """Capture the standing dead-node env and put it back when the body ends.
 
         Yields the setter, so the body can switch configs inside the scope.
-        Each call first reads the database clock, so `expect_dry_run` accepts
+        Each call first reads the database clock, so `expect_status` accepts
         only an entry written under that config.
         """
 
@@ -351,32 +489,41 @@ class DeadNodeAssertions:
 
     # --- verdicts -------------------------------------------------------------
 
-    def expect_dry_run(self, *, reason: str, timeout: float = 600) -> DeadNodeDryRun:
-        """The route reports the worker lost for `reason` in an entry written
-        after the latest config was applied, and every sandbox the scenario
-        created under the outcome its state predicts, with counts for exactly
-        those rows."""
+    def expect_status(
+        self,
+        *,
+        mode: str,
+        verdict: str,
+        reason: str,
+        outcome_of: Callable[[str], str],
+        timeout: float = 600,
+    ) -> DeadNodeStatus:
+        """The route reports the worker with `verdict` for `reason` in an entry
+        `mode` wrote after the latest config was applied, its instance judged,
+        and every sandbox the scenario created under `outcome_of(state)`, with
+        counts for exactly those rows."""
 
         node = self.node
         configured_at = self._configured_at
         if configured_at is None:
-            raise RuntimeError("configure a dry run in scoped_dry_run() first")
+            raise RuntimeError("configure the verb in scoped_config() first")
         deadline = time.monotonic() + timeout
         while True:
             entry = next(
-                (e for e in self._control.dead_node_dry_runs() if e.node_id == node.id), None
+                (e for e in self._control.dead_node_statuses() if e.node_id == node.id), None
             )
             if (
                 entry is not None
                 and entry.observed_at > configured_at
-                and entry.verdict == "lost"
+                and entry.mode == mode
+                and entry.verdict == verdict
                 and entry.reason == reason
             ):
                 break
             self._fixture.verify(
                 time.monotonic() < deadline,
-                "the dry run never judged the stopped worker lost under the latest config",
-                expected_reason=reason,
+                "the verb never judged the stopped worker as expected under the latest config",
+                expected=(mode, verdict, reason),
                 configured_at=configured_at.isoformat(),
                 entry=None if entry is None else _evidence(entry),
             )
@@ -384,7 +531,7 @@ class DeadNodeAssertions:
 
         expected_counts: dict[str, int] = {}
         for sandbox in self._sandboxes:
-            outcome = EXPECTED_OUTCOME[sandbox.state]
+            outcome = outcome_of(sandbox.state)
             expected_counts[outcome] = expected_counts.get(outcome, 0) + 1
         counted = {k: v for k, v in entry.counts.items() if k != TOMBSTONE_OUTCOME}
         listed = {
@@ -393,19 +540,109 @@ class DeadNodeAssertions:
             )
             for sandbox in self._sandboxes
         }
-        expected_listed = {s.sandbox_id: EXPECTED_OUTCOME[s.state] for s in self._sandboxes}
+        expected_listed = {s.sandbox_id: outcome_of(s.state) for s in self._sandboxes}
         self._fixture.verify(
-            not entry.rows_truncated and counted == expected_counts and listed == expected_listed,
-            "the dry run's outcomes are not the ones the scenario's sandbox states predict",
+            not entry.rows_truncated
+            and counted == expected_counts
+            and listed == expected_listed
+            and self.instance in entry.instances,
+            "the verb's outcomes are not the ones the scenario's sandbox states predict",
             expected_counts=expected_counts,
             counts=dict(entry.counts),
             expected_outcomes=expected_listed,
             listed_outcomes=listed,
+            instances=dict(entry.instances),
+            instance=self.instance,
             states={s.sandbox_id: s.state for s in self._sandboxes},
             rows_truncated=entry.rows_truncated,
         )
-        self._fixture.record(f"dry_run_{reason}", _evidence(entry))
+        self._fixture.record(f"status_{mode}_{reason}", _evidence(entry))
         return entry
+
+    def expect_live_reconciled(self, *, timeout: float = 600) -> None:
+        """Live mode leaves every created row as `LIVE_ROW` says, unplaced from
+        the dead worker, and then deletes the worker's node row."""
+
+        node = self.node
+        ids = [s.sandbox_id for s in self._sandboxes]
+        states = {s.sandbox_id: s.state for s in self._sandboxes}
+        deadline = time.monotonic() + timeout
+        while True:
+            rows = {row.sandbox_id: row for row in self._control.sandbox_row_states(ids)}
+            mismatched = {
+                sandbox_id: None if row is None else row.__dict__
+                for sandbox_id in ids
+                if not _reconciled(rows.get(sandbox_id), LIVE_ROW[states[sandbox_id]], node.id)
+                for row in [rows.get(sandbox_id)]
+            }
+            node_gone = not self._control.node_row_exists(node.id)
+            if not mismatched and node_gone:
+                break
+            self._fixture.verify(
+                time.monotonic() < deadline,
+                "live mode never left the dead worker's rows in their rules' states and "
+                "deleted its node row",
+                mismatched=mismatched,
+                states=states,
+                node_row_exists=not node_gone,
+                statuses=[
+                    _evidence(e) for e in self._control.dead_node_statuses() if e.node_id == node.id
+                ],
+            )
+            self._fixture.wait(5)
+        self._fixture.record(
+            "rows_after_live",
+            [row.__dict__ for row in self._control.sandbox_row_states(ids)],
+        )
+
+    def replace_worker(self, *, timeout: float = 600) -> str:
+        """Start the worker again under a new providerID, a same-name
+        replacement, and wait until its node row records the new instance."""
+
+        if self._restart is None:
+            raise RuntimeError("kill_worker() must run first")
+        self._restart.release()
+        self._await_recorded_instance(self.node, self.instance, timeout=timeout)
+        return self.instance
+
+    def adopt_replacement_sandbox(self, sandbox_id: str) -> None:
+        """Track a sandbox created on the replacement, stamped with its instance."""
+
+        self._expect_placed_and_stamped(sandbox_id)
+        self._replacement_sandboxes.append(sandbox_id)
+
+    def expect_replacement_untouched(self, *, ticks: int, tick_seconds: int) -> None:
+        """Over `ticks` live ticks the replacement's sandboxes keep every
+        column, and its node row stays and is never judged lost."""
+
+        node = self.node
+        before = self._control.sandbox_row_states(self._replacement_sandboxes)
+        self._fixture.verify(
+            len(before) == len(self._replacement_sandboxes)
+            and all(row.lifecycle == "started" for row in before),
+            "a sandbox created on the replacement is not started",
+            rows=[row.__dict__ for row in before],
+        )
+        for _ in range(ticks):
+            self._fixture.wait(tick_seconds, reason="let the live verb tick over the replacement")
+            entry = next(
+                (e for e in self._control.dead_node_statuses() if e.node_id == node.id), None
+            )
+            # The dead worker's row, and its status with it, were deleted;
+            # any `lost` entry now is about the replacement.
+            self._fixture.verify(
+                self._control.node_row_exists(node.id)
+                and (entry is None or entry.verdict != "lost"),
+                "the live verb judged the replacement lost or deleted its node row",
+                entry=None if entry is None else _evidence(entry),
+            )
+        after = self._control.sandbox_row_states(self._replacement_sandboxes)
+        self._fixture.verify(
+            after == before,
+            "a sandbox on the replacement changed while the verb ran live",
+            before=[row.__dict__ for row in before],
+            after=[row.__dict__ for row in after],
+        )
 
     def expect_rows_unchanged(self) -> None:
         """No sandbox row the scenario created changed after the worker died."""
@@ -422,7 +659,8 @@ class DeadNodeAssertions:
         )
 
     def restart_worker(self, *, delete_timeout: float = 1200) -> None:
-        """Start the worker again, and delete the sandbox whose suspend it held.
+        """Start the worker again as a replacement, and delete the sandbox
+        whose suspend it held.
 
         A delete conflicts while the suspend is in flight, and the suspend
         resolves only once the returning node finishes or gives up its upload,
@@ -433,6 +671,12 @@ class DeadNodeAssertions:
         if self._restart is None:
             raise RuntimeError("kill_worker() must run first")
         self._restart.release()
+        self.delete_suspending_local(delete_timeout=delete_timeout)
+
+    def delete_suspending_local(self, *, delete_timeout: float = 1200) -> None:
+        """Delete the sandbox whose suspend the dead worker held, asking again
+        each minute while the delete conflicts."""
+
         for sandbox in self._sandboxes:
             if sandbox.state != SUSPENDING_LOCAL:
                 continue
@@ -458,3 +702,13 @@ def created_states() -> Sequence[str]:
     """The states the scenario creates, in creation order."""
 
     return (STARTED, PAUSED, STOPPED, SUSPENDED_REMOTE, SUSPENDING_LOCAL)
+
+
+def _reconciled(row: SandboxRowState | None, expected: LiveRow, node_id: str) -> bool:
+    return (
+        row is not None
+        and row.lifecycle == expected.lifecycle
+        and row.placement == "unplaced"
+        and row.active_node_id is None
+        and row.target_node_id == (node_id if expected.keeps_target else None)
+    )

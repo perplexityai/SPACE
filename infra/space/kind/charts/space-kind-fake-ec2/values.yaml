@@ -1,10 +1,13 @@
 # The in-repo fake EC2 endpoint (infra/space/kind/fake-ec2), standing in for
-# the EC2 API a deployment's cluster-controller asks whether a non-ready
-# node's instance is gone (Ec2Detector, reconcile_queue_gc/detector.rs). The
-# controller's reconcile-queue GC reaches it through AWS_ENDPOINT_URL_EC2
-# (charts/space-cluster-controller-local); it answers DescribeInstances by
-# private-dns-name from the Node of that name: Ready is running, not Ready is
-# stopped, absent is no instance.
+# the EC2 API a deployment's cluster-controller asks whether an instance is
+# gone: the reconcile-queue GC (Ec2Detector, reconcile_queue_gc/detector.rs)
+# by private-dns-name, and the dead-node verb by instance-id. The controller
+# reaches it through AWS_ENDPOINT_URL_EC2 (charts/space-cluster-controller-local).
+# It answers from the Nodes and their fake AWS providerIDs: Ready is running,
+# not Ready is stopped, absent is no instance, and an instance
+# TerminateInstances or the loopback test control
+# (`kubectl exec ... -- space-kind-fake-ec2 terminate <id>`) named is
+# terminated.
 
 image:
   repository: space-kind-fake-ec2
@@ -30,8 +33,9 @@ tlsSecretName: space-kind-fake-ec2-tls
 # (`snapshotRegion` in charts/space-cluster-controller-local).
 region: us-east-1
 
-# Stateless: every answer is read from the API server. One replica, replaced
-# at will.
+# One replica: the instances it has seen and those marked terminated live in
+# its memory, and a restart forgets them. Every other answer is read from the
+# API server.
 replicas: 1
 
 resources:

@@ -1645,20 +1645,25 @@ class DrainV2Control(NodeDrainControl, Protocol):
 
 
 @dataclass(frozen=True)
-class DeadNodeDryRun:
-    """One node's entry in `GET /admin/api/v1/dead-node-dry-runs`.
+class DeadNodeStatus:
+    """One node's entry in `GET /admin/api/v1/dead-node-status`.
 
     `observed_at` is when the controller wrote the entry, by the database
-    clock. `counts` maps each outcome to its row count; `samples` maps it to
-    the sandbox ids the route lists for it.
+    clock. `instances` maps each instance asked about to `dead`, `live` or
+    `unknown:<reason>`. `counts` maps each outcome to its row count,
+    `applied` each to the rows whose write committed (empty in a dry run),
+    and `samples` each to the sandbox ids the route lists for it.
     """
 
     node_id: str
     observed_at: datetime
+    mode: str
     verdict: str
     reason: str
     rows_truncated: bool
+    instances: Mapping[str, str]
     counts: Mapping[str, int]
+    applied: Mapping[str, int]
     samples: Mapping[str, tuple[str, ...]]
 
 
@@ -1679,15 +1684,19 @@ class SandboxRowState:
 
 
 class DeadNodeControl(NodeDrainControl, Protocol):
-    """Kind-only operations for the dead-node dry-run scenario.
+    """Kind-only operations for the dead-node scenarios.
 
-    The verb ships off and reads its config at startup, so the scenario
+    The verb ships off and reads its config at startup, so a scenario
     overrides the cluster-controller Deployment's `SPACE_DEAD_NODE_*` env
     (closed key list, closed value vocabulary) under the controller-mutation
-    Lease, and puts the captured standing values back. The node fault is
-    named: stop one Kind worker's container and delete its Kubernetes Node,
-    then start the container again, which re-registers the Node. The
-    observables are the admin dry-run route and the sandbox rows.
+    Lease, and puts the captured standing values back. A Kind worker gets a
+    fake AWS providerID by re-registering its Node with the kubelet's
+    `--provider-id` rewritten, so its EC2 instance is recorded and Kind's
+    fake EC2 can answer for it. The node fault is named: stop one Kind
+    worker's container, delete its Kubernetes Node and mark its instance
+    terminated in the fake EC2; then start the container again, under a new
+    providerID for a same-name replacement. The observables are the admin
+    dead-node status route, the node rows and the sandbox rows.
     """
 
     def acquire_controller_mutation(self) -> Callable[[], None]:
@@ -1706,8 +1715,35 @@ class DeadNodeControl(NodeDrainControl, Protocol):
         """Put the captured literals back (None unsets) and await the controller rollout."""
         ...
 
-    def dead_node_dry_runs(self) -> list[DeadNodeDryRun]:
-        """`GET /admin/api/v1/dead-node-dry-runs`."""
+    def dead_node_statuses(self) -> list[DeadNodeStatus]:
+        """`GET /admin/api/v1/dead-node-status`."""
+        ...
+
+    def kind_node_provider_id(self, node_name: str) -> str:
+        """The Kind worker's Node `spec.providerID`."""
+        ...
+
+    def set_kind_worker_provider_id(
+        self, node_name: str, provider_id: str, labels: Mapping[str, str], *, timeout: float
+    ) -> None:
+        """Re-register the running Kind worker's Node under `provider_id`, a
+        fake AWS providerID: rewrite the kubelet's `--provider-id`, delete the
+        Node, restart the kubelet, put back `labels`, and wait for the Node
+        and its node services to be Ready."""
+        ...
+
+    def fake_ec2_terminate(self, instance_id: str) -> None:
+        """Mark the instance terminated in Kind's fake EC2, through its loopback test control."""
+        ...
+
+    def node_recorded_instance(self, node_id: str) -> str | None:
+        """`node_k8s.instance_id` of the node, None when it records none or has no row."""
+        ...
+
+    def node_row_exists(self, node_id: str) -> bool: ...
+
+    def latest_execution_instance(self, sandbox_id: str) -> str | None:
+        """The sandbox's latest execution's `node_instance_id`."""
         ...
 
     def database_now(self) -> datetime:
@@ -1734,12 +1770,18 @@ class DeadNodeControl(NodeDrainControl, Protocol):
         ...
 
     def start_kind_worker(
-        self, node_name: str, labels: Mapping[str, str], *, timeout: float
+        self,
+        node_name: str,
+        labels: Mapping[str, str],
+        *,
+        timeout: float,
+        provider_id: str | None = None,
     ) -> None:
-        """Start the Kind worker's container, put back the `labels` its
-        re-registered Node lacks as soon as it exists, then wait, each with
-        the whole `timeout`, for the Node and the node services on it to be
-        Ready."""
+        """Start the Kind worker's container, under `provider_id` when given
+        (the kubelet's `--provider-id` rewritten while it is stopped), put
+        back the `labels` its re-registered Node lacks as soon as it exists,
+        then wait, each with the whole `timeout`, for the Node and the node
+        services on it to be Ready."""
         ...
 
     def native_sandbox_action(self, sandbox_id: str, action: str) -> str:

@@ -1,7 +1,7 @@
 # Kind-only: the in-repo fake EC2 endpoint (infra/space/kind/fake-ec2), which
-# answers the cluster-controller reconcile-queue GC's DescribeInstances from
-# the cluster's Node objects (infra/space/kind/charts/space-kind-fake-ec2). It
-# stands in for EC2; never deploy it outside a local cluster.
+# answers the cluster-controller's DescribeInstances and TerminateInstances
+# from the cluster's Node objects (infra/space/kind/charts/space-kind-fake-ec2).
+# It stands in for EC2; never deploy it outside a local cluster.
 FROM public.ecr.aws/docker/library/golang:1.25-bookworm AS build
 
 WORKDIR /src
