@@ -1,5 +1,5 @@
 use crate::host_command::Command;
-use pplx_space_common_core::types::LinuxNetworkSlot;
+use pplx_space_linux_ids::LinuxNetworkSlot;
 use std::io;
 use std::process::{ExitStatus, Output};
 use std::sync::OnceLock;
@@ -446,12 +446,9 @@ impl NetId {
 }
 
 pub fn slot_label(slot: u32) -> String {
-    LinuxNetworkSlot::try_from_u32(
-        slot,
-        pplx_space_common_core::types::MAX_LINUX_NETWORK_SLOT + 1,
-    )
-    .map(|slot| slot.label())
-    .unwrap_or_else(|_| format!("{slot:06}"))
+    LinuxNetworkSlot::try_from_u32(slot, pplx_space_linux_ids::MAX_LINUX_NETWORK_SLOT + 1)
+        .map(|slot| slot.label())
+        .unwrap_or_else(|_| format!("{slot:06}"))
 }
 
 const SANDBOX_IPV4_BASE: std::net::Ipv4Addr = std::net::Ipv4Addr::new(10, 12, 0, 0);

@@ -283,7 +283,7 @@ pub(super) fn endpoint_runtime_identity_for_activation(
     guest_cid: u32,
     vsock_path: &str,
 ) -> Result<crate::endpoint_proof::SpacedEndpointRuntimeIdentity, Status> {
-    use pplx_space_common_core::types::{LinuxPid, LinuxUid, VsockCid};
+    use pplx_space_linux_ids::{LinuxPid, LinuxUid, VsockCid};
 
     Ok(crate::endpoint_proof::SpacedEndpointRuntimeIdentity {
         sandbox_id: sandbox_id.parse().map_err(|error| {

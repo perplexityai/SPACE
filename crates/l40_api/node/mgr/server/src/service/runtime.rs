@@ -3,8 +3,9 @@ use super::disk::*;
 use super::network_helpers::*;
 use super::validation::*;
 use super::*;
-use pplx_space_common_core::types::{LinuxPid, SandboxId};
+use pplx_space_common_core::types::SandboxId;
 use pplx_space_host_layout::paths;
+use pplx_space_linux_ids::LinuxPid;
 
 pub(super) fn registered_firecracker_pid(
     run_dir: &Path,

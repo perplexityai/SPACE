@@ -1,7 +1,8 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
-use pplx_space_common_core::types::{LinuxPid, SandboxId};
+use pplx_space_common_core::types::SandboxId;
+use pplx_space_linux_ids::LinuxPid;
 
 use super::KeptClients;
 

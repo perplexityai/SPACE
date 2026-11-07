@@ -1,5 +1,5 @@
 use super::*;
-use pplx_space_common_core::types::{LinuxPid, LinuxUid};
+use pplx_space_linux_ids::{LinuxPid, LinuxUid};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct ExpectedSpacedHostPeer {

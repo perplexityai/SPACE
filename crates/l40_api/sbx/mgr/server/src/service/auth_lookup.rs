@@ -1138,13 +1138,12 @@ impl SandboxManagerService {
         pid: u32,
         uid: u32,
     ) -> Result<crate::db::SandboxRow, Status> {
-        let uid = pplx_space_host_layout::gateway::sandbox_uid(
-            pplx_space_common_core::types::LinuxUid::new(uid),
-        )
-        .map(|owner| owner.get())
-        // Local runtimes and legacy gateways retain their registered identity.
-        // The exact PID/owner lookup below remains mandatory in either case.
-        .unwrap_or(uid);
+        let uid =
+            pplx_space_host_layout::gateway::sandbox_uid(pplx_space_linux_ids::LinuxUid::new(uid))
+                .map(|owner| owner.get())
+                // Local runtimes and legacy gateways retain their registered identity.
+                // The exact PID/owner lookup below remains mandatory in either case.
+                .unwrap_or(uid);
         let db = self.db_conn()?;
         let mut matches = crate::db::scan::by_peer(
             &db,
