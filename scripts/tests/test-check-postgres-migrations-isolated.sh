@@ -644,6 +644,22 @@ expect_guard_failure "${work_repo}" "migration-plus-non-sql-schema-variant-file"
 grep -F "${schema_variants_dir}/loader.rs" \
   "${tmp_dir}/migration-plus-non-sql-schema-variant-file.stderr" >/dev/null
 
+# A runtime file moved into the variants directory beside a migration is still a
+# runtime change: its old path is a deletion.
+git -C "${work_repo}" checkout --quiet -B runtime-query-seed "${base_commit}"
+write_file "${work_repo}/crates/example/src/queries/widgets.sql" "SELECT name FROM widgets;"
+commit_scenario "${work_repo}" "runtime query seed"
+git -C "${work_repo}" update-ref refs/remotes/origin/main HEAD
+git -C "${work_repo}" checkout --quiet -B migration-plus-runtime-file-moved-into-variants
+mkdir -p "${work_repo}/${schema_variants_dir}"
+git -C "${work_repo}" mv crates/example/src/queries/widgets.sql "${schema_variants_dir}/widgets.sql"
+write_file "${work_repo}/db/postgres/20260623000031_add_column.up.sql" "ALTER TABLE widgets ADD COLUMN name TEXT;"
+commit_scenario "${work_repo}" "migration plus runtime file moved into the variants directory"
+expect_guard_failure "${work_repo}" "migration-plus-runtime-file-moved-into-variants"
+grep -F "crates/example/src/queries/widgets.sql" \
+  "${tmp_dir}/migration-plus-runtime-file-moved-into-variants.stderr" >/dev/null
+git -C "${work_repo}" update-ref refs/remotes/origin/main "${base_commit}"
+
 git -C "${work_repo}" checkout --quiet -B migration-plus-guard-maintenance "${base_commit}"
 write_file "${work_repo}/db/postgres/20260623000005_add_column.up.sql" "ALTER TABLE widgets ADD COLUMN name TEXT;"
 write_file "${work_repo}/scripts/check-postgres-migrations-example.sh" "#!/usr/bin/env bash"

@@ -183,14 +183,11 @@ sapling_changed_files() {
 }
 
 git_status_changed_files() {
-  git status --porcelain \
+  git status --porcelain --no-renames \
     | while IFS= read -r line; do
         local status file
         status="${line:0:2}"
         file="${line:3}"
-        if [[ "${file}" == *" -> "* ]]; then
-          file="${file##* -> }"
-        fi
         if [[ "${status}" == "??" || "${status:0:1}" =~ [AMDRCT] || "${status:1:1}" =~ [AMDRCT] ]]; then
           printf '%s\n' "${file}"
         fi
@@ -225,14 +222,14 @@ changed_files() {
 
   if [[ -n "${comparison_base_commit}" ]]; then
     if [[ "${comparison_uses_merge_base}" == true ]]; then
-      git diff --name-only --diff-filter=ACMRTD "${comparison_base_commit}...HEAD"
+      git diff --name-only --no-renames --diff-filter=ACMRTD "${comparison_base_commit}...HEAD"
     else
       echo "WARN: no merge-base with $(base_ref); using a direct tree diff for changed files." >&2
       echo "      That diff reports every difference between the two trees, not" >&2
       echo "      what this branch added, so it can name files inherited from the" >&2
       echo "      base. A shallow checkout whose fork point is deeper than the" >&2
       echo "      fetch reached is the usual cause." >&2
-      git diff --name-only --diff-filter=ACMRTD "${comparison_base_commit}" HEAD
+      git diff --name-only --no-renames --diff-filter=ACMRTD "${comparison_base_commit}" HEAD
     fi
   else
     echo "WARN: could not establish a committed diff base for changed files." >&2
