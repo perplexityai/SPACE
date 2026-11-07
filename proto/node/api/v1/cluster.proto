@@ -1133,6 +1133,15 @@ message BeginArtifactBackupRequest {
   // snapshot. A server that predates the field registers the attempt and
   // leaves `fence_verdict_only` unset in its response.
   bool fence_verdict_only = 11;
+  // `execution_generation` is the generation of the execution that captured
+  // these bytes, by evidence the node holds: the registration of a capture the
+  // current execution just took, the capture's own record, or an earlier
+  // upload of the same bytes that carried this mark. Only then does
+  // the server record it as the backup's capture generation, which orders
+  // captures (`BackupReadinessQuery.captured_after`). A generation the node
+  // infers from a running teardown, or one a node that predates the field
+  // sends, fences the registration but orders nothing.
+  bool execution_generation_names_capture = 12;
 }
 
 message BeginArtifactBackupResponse {
@@ -1223,7 +1232,18 @@ message BackupReadinessQuery {
     // other two, it names no identity the caller holds, so any registered node
     // learns whether a sandbox it names is restorable. Must be true.
     bool durably_restorable = 3;
+    // Ready when both artifacts have a ready, non-orphaned backup recording
+    // the execution generation that captured it, and `later`'s is greater:
+    // a later execution captured it. Executions' generations only grow, so
+    // this orders captures whatever the nodes' clocks or the order their
+    // backups registered in. Not ready when either generation is missing.
+    LocalArtifactCapturedAfter captured_after = 4;
   }
+}
+
+message LocalArtifactCapturedAfter {
+  LocalArtifactBackupIdentity later = 1;
+  LocalArtifactBackupIdentity earlier = 2;
 }
 
 message LocalArtifactBackupIdentity {

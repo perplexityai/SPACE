@@ -313,39 +313,6 @@ async fn teardown_retry_seals_publishes_backs_up_and_completes_the_same_capture(
     server.await.unwrap().unwrap();
 }
 
-/// A gRPC handler answering one request type, for the fakes below.
-struct Answer<F, Resp>(std::sync::Arc<F>, std::marker::PhantomData<fn() -> Resp>);
-
-impl<Req, Resp, F> tonic::server::UnaryService<Req> for Answer<F, Resp>
-where
-    F: Fn(Req) -> Result<Resp, Status>,
-{
-    type Response = Resp;
-    type Future = std::future::Ready<Result<Response<Resp>, Status>>;
-
-    fn call(&mut self, request: Request<Req>) -> Self::Future {
-        std::future::ready((self.0)(request.into_inner()).map(Response::new))
-    }
-}
-
-async fn answer<B, Req, Resp>(
-    request: http::Request<B>,
-    handler: impl Fn(Req) -> Result<Resp, Status>,
-) -> http::Response<tonic::body::Body>
-where
-    B: http_body::Body + Send + 'static,
-    B::Error: Into<tonic::codegen::StdError> + Send + 'static,
-    Req: prost::Message + Default + Send + 'static,
-    Resp: prost::Message + Send + 'static,
-{
-    tonic::server::Grpc::new(tonic_prost::ProstCodec::<Resp, Req>::default())
-        .unary(
-            Answer(std::sync::Arc::new(handler), std::marker::PhantomData),
-            request,
-        )
-        .await
-}
-
 /// The sandbox whose artifact the control plane refuses to register. The
 /// stub serves from the parent test process, so its refusals are keyed by
 /// identities both processes know up front.

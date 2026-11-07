@@ -1395,7 +1395,13 @@ async fn a_database_holding_a_recorded_capture_reopens_at_startup() {
     );
     let artifact_dir = dir.path().join("suspend");
     std::fs::create_dir_all(&artifact_dir).unwrap();
-    crate::capture_record::write(&artifact_dir, staged, generation).unwrap();
+    crate::capture_record::write(
+        &artifact_dir,
+        staged,
+        generation,
+        crate::capture_record::RecordWriter::CapturingTeardown,
+    )
+    .unwrap();
     conn.execute(
         "UPDATE local_artifacts SET local_path = ?1 WHERE local_artifact_id = ?2",
         crate::db::fixture::params![artifact_dir.to_str().unwrap(), staged.to_string()],

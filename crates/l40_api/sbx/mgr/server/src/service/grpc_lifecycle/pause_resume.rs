@@ -623,9 +623,22 @@ impl SandboxManagerService {
         // to transition, and for a stopped target the whole table inverts
         // (`Stopped` is converged, `Restoring` needs driving, `Started` is a
         // refusal). Delegating keeps one owner for the rule.
+        //
+        // A runtime upgrade of a suspended row stages too: the staging first
+        // replaces a backed-up copy of another checkpoint, outside the Wake
+        // lock, and lays the decided checkpoint down in its place; a copy of
+        // the decided one is left as it is. Only when the Wake carries a
+        // checkpoint to stage, and never for an implicit wake, whose policy
+        // isn't known yet.
+        let present = self.lookup_sandbox(&sandbox_id);
+        let replaces_stale_copy = start.runtime_upgrade.is_some()
+            && start.suspend_restore_storage_uri.is_some()
+            && activity.is_none()
+            && matches!(present, Ok(ref row) if row.state == SandboxState::Suspended);
         let stage_from_checkpoint = target_state == SandboxState::Stopped
+            || replaces_stale_copy
             || matches!(
-                self.lookup_sandbox(&sandbox_id),
+                present,
                 Err(ref status) if status.code() == tonic::Code::NotFound
             );
         if stage_from_checkpoint {
@@ -674,10 +687,23 @@ impl SandboxManagerService {
             };
             // An upgrade boots the staged disk, so the checkpoint is staged
             // and left suspended rather than launched.
-            let staged = if start.runtime_upgrade.is_some() {
+            let staged = if let Some(upgrade) = start.runtime_upgrade.as_ref() {
                 // Boxed, like the upgrade it precedes: inlined, the staging
                 // future would grow every Wake's state machine.
-                Box::pin(self.stage_missing_checkpoint(staging_start)).await
+                Box::pin(async {
+                    if replaces_stale_copy {
+                        self.evict_stale_checkpoint_copy(
+                            &sandbox_id,
+                            upgrade.operation_id(),
+                            upgrade.checkpoint_local_artifact_id(),
+                            upgrade.memory_loss_authorized(),
+                            &staging_start,
+                        )
+                        .await?;
+                    }
+                    self.stage_missing_checkpoint(staging_start).await
+                })
+                .await
             } else {
                 self.start_sandbox_with_authority(
                     staging_start,

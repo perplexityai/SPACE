@@ -708,6 +708,32 @@ fn candidates_filter_state_idle_and_inflight_uploads() {
     // durability with the cluster.
     insert_sandbox(&conn, "sbx-pinned", "suspended", 3_000);
     insert_pinned_artifact(&conn, "sbx-pinned", &v7(3_000).to_string(), None);
+    // Pinned but still held, which the eviction claim would refuse after a
+    // proof: an upload still cancelling, and a runtime upgrade that owns the
+    // row — excluded.
+    insert_sandbox(&conn, "sbx-cancelling", "suspended", 3_000);
+    insert_pinned_artifact(&conn, "sbx-cancelling", &v7(3_001).to_string(), None);
+    insert_upload_job(
+        &conn,
+        "j-cancelling",
+        "sbx-cancelling",
+        "cancelling",
+        SnapshotId::from_uuid(v7(3_000)),
+        "2026-01-01 00:00:00",
+    );
+    insert_sandbox(&conn, "sbx-upgrading", "suspended", 3_000);
+    insert_pinned_artifact(&conn, "sbx-upgrading", &v7(3_002).to_string(), None);
+    conn.execute(
+        "INSERT INTO sandbox_runtime_upgrades (
+             operation_id, sandbox_id, target_environment, target_state,
+             authorization_id, authorization_reason, memory_loss_authorized,
+             source_state, previous_execution_metadata_json, phase,
+             created_at, updated_at)
+         VALUES (?1, 'sbx-upgrading', 'e1', 'started', 'a', 'r', 1,
+                 'suspended', '{}', 'verified', '1', '1')",
+        params![uuid::Uuid::now_v7().to_string()],
+    )
+    .unwrap();
 
     let got = candidate_ids(list_candidates(&conn, 5_000, None, 10).unwrap());
     assert_eq!(got, vec!["sbx-done".to_string(), "sbx-pinned".to_string()]);

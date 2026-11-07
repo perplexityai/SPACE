@@ -1327,7 +1327,9 @@ doesn't render it yet.
 - **`UpgradeRuntime`.** Under the sandbox's upgrade lock, a suspended sandbox
   absent from the node is staged from `stage_from` and left suspended, never
   launched; a stage interrupted after it adopted the row is resumed the same
-  way. A suspended sandbox is then upgraded only from the checkpoint
+  way. A suspended copy pinning another checkpoint is replaced first, as for
+  the Wake (see "Dispatch" under "Upgrading at resume and start"). A suspended
+  sandbox is then upgraded only from the checkpoint
   `checkpoint_local_artifact_id` names, which the upgrade checks for the RPC
   and the Wake alike. For a started target the response always carries the
   running execution. A sandbox already on the target is activated in place: a
@@ -1477,11 +1479,57 @@ populate it, every move off an environment that may not execute is stranded.
    one the upgrade was decided from: the Wake names that checkpoint's local
    artifact, and the row must pin it, as it does on the checkpoint's source
    node and after staging, so the check holds across retries. An upgrade of a
-   suspended sandbox that names no checkpoint is refused. A stale copy is
-   refused with `FailedPrecondition` and left alone, where a plain restore
-   would have staged the chosen backup over it. Staging an encrypted
-   checkpoint writes no plaintext rootfs, so an encrypted sandbox restored
-   away from its checkpoint is refused before the fence.
+   suspended sandbox that names no checkpoint is refused. A stale copy, a
+   suspended row pinning another checkpoint, is replaced when the Wake can
+   stage: if the pinned artifact is proven backed up, by its local backup
+   marker or the cluster's exact-artifact readiness check as eviction proves
+   it, sandbox-manager evicts the copy through the eviction executor outside
+   the Wake lock, stages the named checkpoint in its place and upgrades that.
+   An unproven copy may be the only one of something, so it's refused with
+   `FailedPrecondition` before any node work, as is an unpinned one, one the
+   named checkpoint wasn't captured after (the decision is stale, and staging
+   it would roll the sandbox back) and an encrypted one. Which checkpoint is
+   newer isn't read from the checkpoint ids, whose order depends on the clocks
+   of the nodes that minted them, nor from which backup registered last, since
+   a re-upload registers an old checkpoint again. A backup registration
+   records the generation of the execution that captured the bytes
+   (`snapshots.generation`) when the node has evidence it's the capture's
+   own: the running execution just took the capture, the record the
+   capturing teardown published with it names it, or an earlier upload of
+   the same bytes recorded it so
+   (`BeginArtifactBackupRequest.execution_generation_names_capture`). A
+   generation the node only infers fences the registration but records
+   nothing: one from a teardown still running when it re-uploads an
+   unrecorded capture, or one startup recovery recorded. A teardown that
+   crashed before publishing leaves the previous capture in the canonical
+   directory, and recovery adopts it under the active teardown's generation,
+   so its record fences without ordering, as do records written before the
+   two were told apart. After proving the copy's backup ready the
+   node asks cluster-api whether the named checkpoint's ready backup was
+   captured by a later execution than the copy's (`BackupReadinessQuery`'s
+   `captured_after`). Only a yes replaces the copy. A backup that records no
+   capture generation answers no, as do a Direct sandbox's captures, which
+   run under no execution generation, and backups registered before
+   generations were recorded: those copies are refused, as every copy pinning
+   another checkpoint was before replacement existed. A request whose
+   stage would be refused for its form or its route identity, whose
+   generation the row already retained, or whose authorization doesn't
+   accept memory loss, deletes nothing; the upgrade's
+   edge check reads the staged checkpoint, so it runs after the stage. A copy
+   another upgrade still fences or owes a retirement is left to that upgrade
+   with a retryable 503, one with an artifact upload pending, running or cancelling is
+   refused as retryable until the upload settles (when that upload is the
+   pin's own backup, the pin isn't proven yet, and it's refused as unproven
+   until the backup lands), and a sandbox the
+   operation already recorded an outcome for is left to that record. Once the
+   copy is gone the sandbox is absent, so a retry stages it as it would any
+   absent sandbox; the eviction's claim re-asserts the row's activation
+   generations rather than its `updated_at`, which is kept in whole seconds;
+   a cleanup that fails after the eviction's claim leaves the
+   row `deleting` until the cleanup machinery finishes it. Staging an
+   encrypted checkpoint writes no plaintext rootfs, so an encrypted sandbox
+   restored away from its checkpoint is refused before the fence, and an
+   encrypted stale copy is left in place.
 
 While an upgrade holds the sandbox, other activations get the retryable 503
 the restore and activation leases already give, and a Wake that meets the

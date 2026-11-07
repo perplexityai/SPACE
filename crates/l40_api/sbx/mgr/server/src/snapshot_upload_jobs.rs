@@ -761,9 +761,28 @@ async fn send_prepared_begin(
     >,
     JobError,
 > {
-    let local_artifact_id = payload.meta.local_artifact_id.ok_or_else(|| {
-        JobError::permanent("prepared snapshot upload is missing local_artifact_id")
-    })?;
+    let local_artifact_id = payload
+        .meta
+        .local_artifact_id
+        .ok_or_else(|| {
+            JobError::permanent("prepared snapshot upload is missing local_artifact_id")
+        })?
+        .to_string();
+    Ok(begin_with_cluster_api(prepared_begin(
+        payload,
+        &local_artifact_id,
+        fence_verdict_only,
+    )?)
+    .await)
+}
+
+/// The registration `payload` asks for, with `local_artifact_id` its
+/// artifact's id as text.
+fn prepared_begin<'a>(
+    payload: &'a SnapshotUploadJobs,
+    local_artifact_id: &'a str,
+    fence_verdict_only: bool,
+) -> Result<BeginArtifactBackup<'a>, JobError> {
     let artifact_origin = payload.meta.artifact_origin.ok_or_else(|| {
         JobError::permanent("prepared snapshot upload is missing artifact_origin")
     })?;
@@ -775,11 +794,9 @@ async fn send_prepared_begin(
         .artifact_snapshot_name
         .as_ref()
         .map(|name| name.as_str());
-    let local_artifact_id = local_artifact_id.to_string();
-
-    Ok(begin_with_cluster_api(BeginArtifactBackup {
+    Ok(BeginArtifactBackup {
         sandbox_id: &payload.meta.sandbox_id,
-        local_artifact_id: &local_artifact_id,
+        local_artifact_id,
         artifact_kind: artifact_kind_from_meta(&payload.meta),
         artifact_origin,
         snapshot_name,
@@ -787,9 +804,9 @@ async fn send_prepared_begin(
         storage_uri: &payload.storage_uri,
         execution,
         execution_generation: payload.execution_generation,
+        execution_generation_names_capture: payload.execution_generation_names_capture,
         fence_verdict_only,
     })
-    .await)
 }
 
 fn classify_begin_error(error: BeginArtifactBackupError) -> JobError {
@@ -1294,6 +1311,8 @@ pub(crate) struct BeginArtifactBackup<'a> {
     pub(crate) storage_uri: &'a str,
     pub(crate) execution: &'a pplx_space_common_core::types::SnapshotExecutionMetadata,
     pub(crate) execution_generation: Option<pplx_space_common_core::types::ExecutionGeneration>,
+    /// `execution_generation` is the capturing execution's by evidence.
+    pub(crate) execution_generation_names_capture: bool,
     /// Ask for the registration's verdict without persisting the attempt.
     pub(crate) fence_verdict_only: bool,
 }
@@ -1372,6 +1391,7 @@ fn begin_artifact_backup_request(
         execution_generation: request
             .execution_generation
             .map(pplx_space_common_core::types::ExecutionGeneration::get),
+        execution_generation_names_capture: request.execution_generation_names_capture,
         fence_verdict_only: request.fence_verdict_only,
     }
 }

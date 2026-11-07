@@ -315,6 +315,7 @@ edge_table! {
     DELETE_ADMISSION: Request, StateSet::ALL.without(Deleting) => Deleting;
     /// The eviction claims: `claim_stopped_sandbox_for_eviction`,
     /// `claim_suspended_sandbox_for_eviction`,
+    /// `claim_stale_upgrade_copy_for_eviction`,
     /// `claim_failed_restoring_sandbox_for_eviction`,
     /// `claim_teardown_suspend_failed_sandbox_for_eviction`,
     /// `claim_retired_teardown_execution_for_release` and

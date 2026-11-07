@@ -322,6 +322,11 @@ struct ArtifactBackupSubmission<'a> {
     handoff: ArtifactBackupHandoff,
     /// The teardown suspend's execution, for `BeginArtifactBackup`'s fence.
     execution_generation: Option<pplx_space_common_core::types::ExecutionGeneration>,
+    /// The caller holds evidence that `execution_generation` is the
+    /// capturing execution's: the capture was just taken by it, or an earlier
+    /// upload of the same bytes recorded it so. Without that, the capture's
+    /// own record can still show it (see `submit_artifact_backup`).
+    capture_vouched: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -469,6 +474,8 @@ pub(super) fn sidecar_rootfs_send_source_id(
 mod backup_policy_tests;
 #[cfg(test)]
 mod retired_teardown_tests;
+#[cfg(test)]
+pub(super) use self::retired_teardown_tests::{answer, with_cluster_api};
 #[cfg(test)]
 mod tests;
 

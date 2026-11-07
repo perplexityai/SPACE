@@ -78,7 +78,8 @@ fn node_local_suspend_registers_under_its_kubernetes_execution() {
 }
 
 /// The node-local suspend path end to end, up to the runtime it keeps: the
-/// upload it persists carries the sandbox's Kubernetes execution generation,
+/// upload it persists carries the sandbox's Kubernetes execution generation
+/// as the capture's own,
 /// the cluster's refusal of that generation comes back as a backup-fence
 /// failure, and that failure rolls the suspend back to `paused` with the
 /// runtime still resident.
@@ -136,6 +137,8 @@ async fn node_local_suspend_of_a_superseded_execution_rolls_back() {
         let payload: crate::snapshot_upload::SnapshotUploadJobs =
             serde_json::from_str(&payload).unwrap();
         assert_eq!(payload.execution_generation, Some(generation(GENERATION)));
+        // The running execution took this capture, with no record beside it.
+        assert!(payload.execution_generation_names_capture);
 
         service
             .require_node_local_backup_handoff(&sandbox_id, local_artifact_id, Err(refused))
@@ -261,13 +264,18 @@ async fn eviction_reupload_of_a_refused_capture_keeps_its_execution_generation()
             ..RETIRING
         },
         async || {
-            for (recorded, upload_retained, carried) in [
-                (true, false, Some(generation(GENERATION))),
-                (false, true, Some(generation(GENERATION))),
-                (false, false, None),
+            // The re-upload orders captures by its generation only when the
+            // capture's record names it or the earlier upload did.
+            for (recorded, upload_retained, upload_names_capture, carried, names_capture) in [
+                (true, false, false, Some(generation(GENERATION)), true),
+                (false, true, false, Some(generation(GENERATION)), false),
+                (false, true, true, Some(generation(GENERATION)), true),
+                (false, false, false, None, false),
             ] {
                 let refused = refused_teardown_with(|staged| {
-                    serde_json::to_string(&bound_upload_payload(staged)).unwrap()
+                    let mut payload = bound_upload_payload(staged);
+                    payload.execution_generation_names_capture = upload_names_capture;
+                    serde_json::to_string(&payload).unwrap()
                 })
                 .await;
                 let service = &refused.service;
@@ -317,6 +325,11 @@ async fn eviction_reupload_of_a_refused_capture_keeps_its_execution_generation()
                     payload.execution_generation, carried,
                     "recorded {recorded}, upload retained {upload_retained}"
                 );
+                assert_eq!(
+                    payload.execution_generation_names_capture, names_capture,
+                    "recorded {recorded}, upload retained {upload_retained}, earlier upload \
+                     names its capture {upload_names_capture}"
+                );
                 drain(service).await;
             }
         },
@@ -330,17 +343,22 @@ async fn eviction_reupload_of_a_refused_capture_keeps_its_execution_generation()
 /// earlier upload names that generation: after a retriable failure, and after
 /// the refused upload is pruned. The control plane, which superseded the
 /// generation, refuses it each time. A capture with no such evidence, as an
-/// earlier node-local suspend's has, still registers unfenced.
+/// earlier node-local suspend's has, still registers unfenced. The attempt
+/// marks the generation as the capture's own only when the record names it or
+/// the earlier upload marked it so.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_restart_suspended_teardown_capture_never_registers_unfenced() {
     with_cluster_api(RETIRING, async || {
-        for (recorded, upload_retained, fenced) in [
-            (true, false, true),
-            (false, true, true),
-            (false, false, false),
+        for (recorded, upload_retained, upload_names_capture, fenced, names_capture) in [
+            (true, false, false, true, true),
+            (false, true, false, true, false),
+            (false, true, true, true, true),
+            (false, false, false, false, false),
         ] {
             let refused = refused_teardown_with(|staged| {
-                serde_json::to_string(&bound_upload_payload(staged)).unwrap()
+                let mut payload = bound_upload_payload(staged);
+                payload.execution_generation_names_capture = upload_names_capture;
+                serde_json::to_string(&payload).unwrap()
             })
             .await;
             let service = &refused.service;
@@ -407,9 +425,164 @@ async fn a_restart_suspended_teardown_capture_never_registers_unfenced() {
                 };
                 result.expect_err("a refused registration can't make the suspend durable");
             }
+            let attempt = service
+                .snapshot_upload_worker
+                .find_job_by_dedup_key(
+                    crate::snapshot_upload_jobs::SNAPSHOT_UPLOAD_JOB_KIND,
+                    &staged,
+                )
+                .unwrap()
+                .expect("the drive persists an attempt")
+                .payload_as::<crate::snapshot_upload::SnapshotUploadJobs>()
+                .unwrap();
+            assert_ne!(
+                attempt.snapshot_id,
+                bound_upload_payload(refused.staged).snapshot_id,
+                "{case}: the drive must start a new attempt"
+            );
+            assert_eq!(
+                attempt.execution_generation_names_capture, names_capture,
+                "{case}, earlier upload names its capture {upload_names_capture}"
+            );
             drain(service).await;
         }
     })
+    .await;
+}
+
+/// The earlier upload vouches for a generation only when it marked that same
+/// generation as the capture's own.
+#[test]
+fn an_earlier_upload_vouches_only_for_the_generation_it_marked() {
+    let artifact = LocalArtifactId::new();
+    let job = |names_capture| {
+        let mut payload = bound_upload_payload(artifact);
+        payload.execution_generation_names_capture = names_capture;
+        crate::snapshot_upload_jobs::tests::job_fixture(
+            crate::snapshot_upload_jobs::SNAPSHOT_UPLOAD_JOB_KIND,
+            serde_json::to_string(&payload).unwrap(),
+        )
+    };
+    let vouches = super::super::artifact_backup::earlier_upload_vouches;
+    let marked = job(true);
+    assert!(vouches(Some(&marked), Some(generation(GENERATION))));
+    assert!(!vouches(Some(&marked), Some(generation(GENERATION + 1))));
+    assert!(!vouches(Some(&marked), None));
+    assert!(!vouches(Some(&job(false)), Some(generation(GENERATION))));
+    assert!(!vouches(None, Some(generation(GENERATION))));
+}
+
+/// A teardown that crashed before publishing its capture leaves the
+/// canonical directory holding the previous capture, A, which an earlier
+/// execution took. Startup recovery adopts A as the teardown's capture and
+/// records the teardown's generation for it, so its backup stays fenced under
+/// that generation, as before. That record doesn't make A the capture of the
+/// later execution: the drive's upload doesn't mark the generation as A's
+/// own, so cluster-api records no capture generation for it and A can't order
+/// as newer than a capture taken between the two executions.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_capture_recovery_adopts_after_a_crash_before_publish_orders_nothing() {
+    with_cluster_api(
+        RetiringClusterApi {
+            supersession_lapsed: true,
+            ..RETIRING
+        },
+        async || {
+            use crate::service::tests::service_tests::{insert_test_sandbox, runtime_fields};
+            let conn = crate::db::test_conn();
+            let sandbox_id = SandboxId::new().to_string();
+            insert_test_sandbox(&conn, &sandbox_id, SandboxState::Paused);
+            let mut fields = runtime_fields(generation(GENERATION), 7);
+            fields.space_api_route_identity.substrate_kind =
+                Some(pplx_space_common_core::types::NodeManagedBy::Kubernetes);
+            crate::db::update_runtime_fields(&conn, sandbox_id.parse().unwrap(), fields).unwrap();
+            // A, captured and published by the previous execution's teardown.
+            let cache_dir = tempfile::tempdir().unwrap();
+            let snapshot_dir =
+                crate::service::suspend_snapshot_publication::canonical_suspend_snapshot_dir(
+                    &cache_dir.path().join(&sandbox_id),
+                );
+            let earlier = LocalArtifactId::new();
+            crate::service::suspend_snapshot_publication::write_full_suspend_artifact(
+                &snapshot_dir,
+                &sandbox_id,
+                earlier,
+                b"earlier-capture",
+            );
+            crate::capture_record::write(
+                &snapshot_dir,
+                earlier,
+                generation(GENERATION - 1),
+                crate::capture_record::RecordWriter::CapturingTeardown,
+            )
+            .unwrap();
+            // This execution's teardown began, then the node went down before
+            // its capture was published.
+            crate::db::begin_teardown_suspend(&conn, &sandbox_id, generation(GENERATION)).unwrap();
+            let (service, _dispatched) = service_recording_cleanup(conn);
+            service
+                .recover_prelaunch_startup_states_in(cache_dir.path(), &Default::default())
+                .unwrap();
+
+            let row = service.lookup_sandbox(&sandbox_id).unwrap();
+            assert_eq!(row.current_local_artifact_id, Some(earlier));
+            assert_eq!(
+                crate::capture_record::read(&snapshot_dir, earlier).unwrap(),
+                Some(generation(GENERATION)),
+                "recovery's record fences A under the active teardown, as before"
+            );
+            assert_eq!(
+                crate::capture_record::read_capture_order(&snapshot_dir, earlier).unwrap(),
+                None,
+                "recovery's record must not order A"
+            );
+
+            let artifact = crate::db::LocalArtifactRow {
+                local_artifact_id: earlier,
+                sandbox_id: sandbox_id.clone(),
+                artifact_kind: ArtifactKind::Full,
+                artifact_origin: ArtifactOrigin::Suspend,
+                snapshot_name: None,
+                local_path: snapshot_dir.to_str().unwrap().to_string(),
+            };
+            let drive = tokio::time::timeout(
+                Duration::from_secs(3),
+                answered_or_admitted(
+                    earlier,
+                    service.ensure_teardown_suspend_backup(
+                        &row,
+                        TeardownSuspendBackup {
+                            execution_generation: generation(GENERATION),
+                            artifact: &artifact,
+                            format: SuspendSnapshotFormat::Full,
+                            origin: super::super::TeardownBackupOrigin::Captured,
+                        },
+                    ),
+                ),
+            )
+            .await
+            .expect("the drive registers or answers");
+            if let Drive::Answered(result) = &drive {
+                assert!(result.is_ok(), "the lapsed fence admits A: {result:?}");
+            }
+            let payload = service
+                .snapshot_upload_worker
+                .find_job_by_dedup_key(
+                    crate::snapshot_upload_jobs::SNAPSHOT_UPLOAD_JOB_KIND,
+                    &earlier.to_string(),
+                )
+                .unwrap()
+                .expect("the drive persists A's upload")
+                .payload_as::<crate::snapshot_upload::SnapshotUploadJobs>()
+                .unwrap();
+            assert_eq!(payload.execution_generation, Some(generation(GENERATION)));
+            assert!(
+                !payload.execution_generation_names_capture,
+                "the later execution's generation must not be recorded as A's capture"
+            );
+            drain(&service).await;
+        },
+    )
     .await;
 }
 
@@ -715,5 +888,11 @@ fn stage_refused_capture(
 /// Record [`GENERATION`] as the capture's execution generation in the
 /// capture's record at `snapshot_dir`, as a teardown suspend's capture does.
 fn record_capture_generation(snapshot_dir: &std::path::Path, artifact: LocalArtifactId) {
-    crate::capture_record::write(snapshot_dir, artifact, generation(GENERATION)).unwrap();
+    crate::capture_record::write(
+        snapshot_dir,
+        artifact,
+        generation(GENERATION),
+        crate::capture_record::RecordWriter::CapturingTeardown,
+    )
+    .unwrap();
 }

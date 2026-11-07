@@ -2,6 +2,9 @@
 
 use super::*;
 
+#[cfg(test)]
+mod tests;
+
 /// Atomically claim a `suspended` sandbox for cold-sandbox eviction by
 /// flipping it to `deleting`. The CAS guards two invariants at once:
 ///
@@ -25,6 +28,21 @@ use super::*;
 ///   state + pin contract for the disk-pressure loop, whose proof is
 ///   the pin itself.
 ///
+/// - no runtime upgrade still owns the row (it fences it, or still owes the
+///   retirement of the checkpoint it superseded): the upgrade's preserved
+///   disk and its recovery record live in the presence the eviction would
+///   delete. The fence doesn't move `state`, the pin or `updated_at`, so
+///   only this clause keeps an upgrade that began after the decision read
+///   from losing them. A rolled-back upgrade's preserved disk lives under
+///   the sandbox's cache directory, which the eviction's cleanup removes.
+/// - no upload of the sandbox's artifacts is pending, running or still
+///   cancelling: the
+///   eviction deletes every local artifact of the sandbox, not only the
+///   proven pin, and an upload that hasn't read its source yet would lose
+///   it. The disk-pressure loop's candidate scan skips such rows, and ones
+///   an upgrade owns, before paying for a proof; this holds both conditions
+///   through the claim, for every caller.
+///
 /// Returns `false` (and changes nothing) when any condition no longer
 /// holds.
 pub fn claim_suspended_sandbox_for_eviction(
@@ -34,46 +52,133 @@ pub fn claim_suspended_sandbox_for_eviction(
     expected_updated_at: Option<&str>,
 ) -> Result<bool> {
     let tx = immediate_transaction(conn)?;
-    let changed = match (expected_pin, expected_updated_at) {
-        (Some(pin), Some(updated_at)) => tx.execute(
-            "UPDATE sandboxes
-             SET state = 'deleting',
-                 state_changed_at = CASE WHEN state != 'deleting' THEN ?1 ELSE state_changed_at END,
-                 updated_at = ?1
-             WHERE id = ?2 AND state = 'suspended'
-               AND current_local_artifact_id = ?3
-               AND updated_at = ?4",
-            params![now()?, id, pin, updated_at],
-        )?,
-        (Some(pin), None) => tx.execute(
-            "UPDATE sandboxes
-             SET state = 'deleting',
-                 state_changed_at = CASE WHEN state != 'deleting' THEN ?1 ELSE state_changed_at END,
-                 updated_at = ?1
-             WHERE id = ?2 AND state = 'suspended'
-               AND current_local_artifact_id = ?3",
-            params![now()?, id, pin],
-        )?,
-        (None, Some(updated_at)) => tx.execute(
-            "UPDATE sandboxes
-             SET state = 'deleting',
-                 state_changed_at = CASE WHEN state != 'deleting' THEN ?1 ELSE state_changed_at END,
-                 updated_at = ?1
-             WHERE id = ?2 AND state = 'suspended'
-               AND current_local_artifact_id IS NULL
-               AND updated_at = ?3",
-            params![now()?, id, updated_at],
-        )?,
-        (None, None) => tx.execute(
-            "UPDATE sandboxes
-             SET state = 'deleting',
-                 state_changed_at = CASE WHEN state != 'deleting' THEN ?1 ELSE state_changed_at END,
-                 updated_at = ?1
-             WHERE id = ?2 AND state = 'suspended'
-               AND current_local_artifact_id IS NULL",
-            params![now()?, id],
-        )?,
-    };
+    // `IS` matches an unpinned row for a `None` pin, and the phases are those
+    // `unretired_runtime_upgrade` reads.
+    let changed = tx.execute(
+        "UPDATE sandboxes
+         SET state = 'deleting',
+             state_changed_at = CASE WHEN state != 'deleting' THEN ?1 ELSE state_changed_at END,
+             updated_at = ?1
+         WHERE id = ?2 AND state = 'suspended'
+           AND current_local_artifact_id IS ?3
+           AND (?4 IS NULL OR updated_at = ?4)
+           AND NOT EXISTS (
+             SELECT 1 FROM sandbox_runtime_upgrades
+             WHERE sandbox_id = ?2
+               AND phase IN ('fenced', 'preserved', 'booting', 'verified')
+           )
+           AND NOT EXISTS (
+             SELECT 1 FROM jobs
+             WHERE kind = 'snapshot_upload' AND subject_id = ?2
+               AND status IN ('pending', 'running', 'cancelling')
+           )",
+        params![now()?, id, expected_pin, expected_updated_at],
+    )?;
+    if changed == 1 {
+        teardown_jobs::fail_active(&tx, id, TeardownSuspendFailure::Deleting)?;
+    }
+    tx.commit()?;
+    Ok(changed == 1)
+}
+
+/// What a `sandboxes` row records of its activations' generations: the
+/// current and the retained route and execution generations, which an
+/// activation's generation fence reads. A claim re-asserts the whole witness:
+/// `updated_at` is kept in whole seconds, so an activation and its
+/// compensation within one second can move a generation and leave it
+/// unchanged.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ActivationGenerations([rusqlite::types::Value; 4]);
+
+/// `sandbox_id`'s [`ActivationGenerations`], `None` without a row.
+pub(crate) fn activation_generations(
+    conn: &Connection,
+    sandbox_id: &str,
+) -> Result<Option<ActivationGenerations>> {
+    conn.query_row(
+        "SELECT space_api_route_generation,
+                    space_api_route_execution_generation,
+                    last_observed_route_generation,
+                    last_observed_execution_generation
+               FROM sandboxes
+              WHERE id = ?1",
+        params![sandbox_id],
+        |row| {
+            Ok(ActivationGenerations([
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+            ]))
+        },
+    )
+    .optional()
+}
+
+/// Whether an upload of `sandbox_id`'s artifacts is pending, running or still
+/// cancelling, and so may still read its source.
+pub(crate) fn snapshot_upload_in_flight(conn: &Connection, sandbox_id: &str) -> Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS (
+             SELECT 1 FROM jobs
+             WHERE kind = 'snapshot_upload' AND subject_id = ?1
+               AND status IN ('pending', 'running', 'cancelling')
+         )",
+        params![sandbox_id],
+        |row| row.get(0),
+    )
+}
+
+/// Atomically claim a `suspended` copy a runtime upgrade replaces with the
+/// checkpoint it was decided from, flipping it to `deleting`. The CAS holds
+/// what [`claim_suspended_sandbox_for_eviction`] holds for a pinned row (the
+/// state, the proven pin, no upgrade owning the row, no upload in flight),
+/// and in place of a row version re-asserts `generations`: the upgrade
+/// checked its activation against them, and removing the row removes the
+/// fence they keep.
+///
+/// Returns `false` (and changes nothing) when any condition no longer
+/// holds.
+pub fn claim_stale_upgrade_copy_for_eviction(
+    conn: &Connection,
+    id: &str,
+    pin: &str,
+    generations: &ActivationGenerations,
+) -> Result<bool> {
+    let tx = immediate_transaction(conn)?;
+    let [route, execution, retained_route, retained_execution] = &generations.0;
+    // The phases are those `unretired_runtime_upgrade` reads.
+    let changed = tx.execute(
+        "UPDATE sandboxes
+         SET state = 'deleting',
+             state_changed_at = CASE WHEN state != 'deleting' THEN ?1 ELSE state_changed_at END,
+             updated_at = ?1
+         WHERE id = ?2 AND state = 'suspended'
+           AND current_local_artifact_id = ?3
+           AND space_api_route_generation IS ?4
+           AND space_api_route_execution_generation IS ?5
+           AND last_observed_route_generation IS ?6
+           AND last_observed_execution_generation IS ?7
+           AND NOT EXISTS (
+             SELECT 1 FROM sandbox_runtime_upgrades
+             WHERE sandbox_id = ?2
+               AND phase IN ('fenced', 'preserved', 'booting', 'verified')
+           )
+           AND NOT EXISTS (
+             SELECT 1 FROM jobs
+             WHERE kind = 'snapshot_upload' AND subject_id = ?2
+               AND status IN ('pending', 'running', 'cancelling')
+           )",
+        params![
+            now()?,
+            id,
+            pin,
+            route,
+            execution,
+            retained_route,
+            retained_execution
+        ],
+    )?;
     if changed == 1 {
         teardown_jobs::fail_active(&tx, id, TeardownSuspendFailure::Deleting)?;
     }

@@ -979,6 +979,10 @@ impl SandboxManagerService {
                     format,
                     handoff: ArtifactBackupHandoff::RestoreVisible,
                     execution_generation,
+                    capture_vouched: earlier_upload_vouches(
+                        previous_job.as_ref(),
+                        execution_generation,
+                    ),
                 },
             )
             .await
@@ -1207,6 +1211,10 @@ impl SandboxManagerService {
                     format: reupload_format,
                     handoff: ArtifactBackupHandoff::DurableWorker,
                     execution_generation,
+                    capture_vouched: earlier_upload_vouches(
+                        previous_job.as_ref(),
+                        execution_generation,
+                    ),
                 },
             )
             .await
@@ -1297,6 +1305,24 @@ impl SandboxManagerService {
             })
             .map(|operation| operation.execution_generation))
     }
+}
+
+/// Whether `previous_job`, the bytes' earlier upload, recorded `generation`
+/// as the capturing execution's, so a re-upload under it may order captures.
+pub(super) fn earlier_upload_vouches(
+    previous_job: Option<&pplx_space_common_jobs::Job>,
+    generation: Option<pplx_space_common_core::types::ExecutionGeneration>,
+) -> bool {
+    generation.is_some()
+        && previous_job
+            .and_then(|job| {
+                job.payload_as::<crate::snapshot_upload::SnapshotUploadJobs>()
+                    .ok()
+            })
+            .is_some_and(|payload| {
+                payload.execution_generation_names_capture
+                    && payload.execution_generation == generation
+            })
 }
 
 /// The execution generation the capture's record holds for the teardown

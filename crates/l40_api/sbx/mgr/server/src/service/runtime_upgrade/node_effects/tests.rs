@@ -146,6 +146,15 @@ impl Fixture {
 
     pub(in crate::service::runtime_upgrade) fn adopt_checkpoint(&self) -> LocalArtifactId {
         let artifact = LocalArtifactId::new();
+        self.adopt_checkpoint_as(artifact);
+        artifact
+    }
+
+    /// Pin `artifact` as the suspended sandbox's checkpoint.
+    pub(in crate::service::runtime_upgrade) fn adopt_checkpoint_as(
+        &self,
+        artifact: LocalArtifactId,
+    ) {
         assert!(
             crate::db::adopt_suspended_local_artifact(
                 &self.service.db.lock().unwrap(),
@@ -155,7 +164,6 @@ impl Fixture {
             )
             .unwrap()
         );
-        artifact
     }
 
     fn staged(&self, id: impl std::fmt::Display) -> PathBuf {
@@ -966,7 +974,7 @@ fn every_caller_allowed_a_wake_start_context_may_also_upgrade() {
 /// A suspended Wake upgrade naming another node as the checkpoint's source
 /// and a backup to stage, as the control plane sends for a pod placed away
 /// from the checkpoint.
-fn remote_upgrade_wake(
+pub(in crate::service::runtime_upgrade) fn remote_upgrade_wake(
     f: &Fixture,
     checkpoint: Option<LocalArtifactId>,
 ) -> crate::proto::WakeRequest {
@@ -976,25 +984,40 @@ fn remote_upgrade_wake(
     let mut request = upgrade_wake(&f.sandbox_id, Some(upgrade));
     let context = request.start_context.as_mut().unwrap();
     context.suspend_restore_source_node = Some("another-node".into());
-    context.suspend_restore_storage_uri = Some("s3://bucket/newer-checkpoint".into());
+    // From the control plane, for this node.
+    context.route_identity.as_mut().unwrap().current_node_id =
+        Some(crate::service::test_options::test_node_id().to_string());
+    context.suspend_restore_storage_uri =
+        Some("s3://bucket/newer-checkpoint?region=us-east-1".into());
     request
 }
 
 #[tokio::test]
 async fn a_wake_upgrade_never_boots_a_checkpoint_other_than_the_one_decided_on() {
     // A stale copy: the row pins another artifact than the checkpoint the
-    // upgrade was decided from. An upgrade naming no checkpoint has nothing
-    // to check the copy against, whatever placement says.
-    // (named checkpoint, whether the row pins a checkpoint of its own)
-    for (decided, pinned) in [
-        (Some(LocalArtifactId::new()), true),
-        (None, true),
-        (None, false),
+    // upgrade was decided from. It's replaced only once proven backed up,
+    // which this harness, with no cluster-api, can't do, so the Wake is
+    // retryably refused (see `stale_copy::tests` for the replacement). An
+    // upgrade naming no checkpoint has nothing to check the copy against,
+    // whatever placement says.
+    // (whether the upgrade names a checkpoint, minted after the row's own,
+    // whether the row pins a checkpoint of its own, the refusal's code and
+    // what it says)
+    for (names_one, pinned, code, says) in [
+        (true, true, tonic::Code::Unavailable, "backed up"),
+        (false, true, tonic::Code::FailedPrecondition, "decided from"),
+        (
+            false,
+            false,
+            tonic::Code::FailedPrecondition,
+            "decided from",
+        ),
     ] {
         let f = fixture(SandboxState::Suspended, false, FakeNodeManager::default());
         if pinned {
             f.adopt_checkpoint();
         }
+        let decided = names_one.then(LocalArtifactId::new);
         let error = f
             .service
             .wake(crate::service::activation_support::internal_request(
@@ -1003,8 +1026,8 @@ async fn a_wake_upgrade_never_boots_a_checkpoint_other_than_the_one_decided_on()
             .await
             .unwrap_err();
 
-        assert_eq!(error.code(), tonic::Code::FailedPrecondition, "{error}");
-        assert!(error.message().contains("decided from"), "{error}");
+        assert_eq!(error.code(), code, "{error}");
+        assert!(error.message().contains(says), "{error}");
         assert_eq!(f.row().state, SandboxState::Suspended);
         assert!(f._node.calls().is_empty(), "{:?}", f._node.calls());
         assert_eq!(

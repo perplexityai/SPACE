@@ -10,7 +10,13 @@ fn a_capture_record_reads_back_only_for_its_artifact() {
     assert_eq!(read(dir.path(), artifact).unwrap(), None);
 
     let generation = ExecutionGeneration::new(7).unwrap();
-    write(dir.path(), artifact, generation).unwrap();
+    write(
+        dir.path(),
+        artifact,
+        generation,
+        RecordWriter::CapturingTeardown,
+    )
+    .unwrap();
     assert_eq!(read(dir.path(), artifact).unwrap(), Some(generation));
     assert_eq!(
         read(dir.path(), LocalArtifactId::new()).unwrap(),
@@ -23,6 +29,49 @@ fn a_capture_record_reads_back_only_for_its_artifact() {
         read(dir.path(), artifact).unwrap_err().kind(),
         std::io::ErrorKind::InvalidData
     );
+}
+
+/// Every record fences, but only the capturing teardown's own orders
+/// captures: not recovery's, nor one written before writers were told apart,
+/// which reads like recovery's.
+#[test]
+fn only_the_capturing_teardowns_record_orders_captures() {
+    let dir = tempfile::tempdir().unwrap();
+    let artifact = LocalArtifactId::new();
+    let generation = ExecutionGeneration::new(7).unwrap();
+
+    write(
+        dir.path(),
+        artifact,
+        generation,
+        RecordWriter::CapturingTeardown,
+    )
+    .unwrap();
+    assert_eq!(read(dir.path(), artifact).unwrap(), Some(generation));
+    assert_eq!(
+        read_capture_order(dir.path(), artifact).unwrap(),
+        Some(generation)
+    );
+    assert_eq!(
+        read_capture_order(dir.path(), LocalArtifactId::new()).unwrap(),
+        None
+    );
+
+    write(dir.path(), artifact, generation, RecordWriter::Recovery).unwrap();
+    assert_eq!(read(dir.path(), artifact).unwrap(), Some(generation));
+    assert_eq!(read_capture_order(dir.path(), artifact).unwrap(), None);
+
+    std::fs::write(
+        dir.path().join(CAPTURE_RECORD_FILENAME),
+        serde_json::to_vec(&serde_json::json!({
+            "local_artifact_id": artifact,
+            "execution_generation": generation,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(read(dir.path(), artifact).unwrap(), Some(generation));
+    assert_eq!(read_capture_order(dir.path(), artifact).unwrap(), None);
 }
 
 /// The record is node-local: no upload, of any artifact kind or rootfs

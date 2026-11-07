@@ -7508,6 +7508,101 @@ pub(crate) mod service_tests {
         );
     }
 
+    /// A suspended row the eviction claim would refuse because an upload of
+    /// its artifacts or a runtime upgrade still holds it is answered
+    /// `Aborted`, which node-ctl retries on its next sync rather than after
+    /// its back-off, and is left as it is. Once nothing holds it, the same
+    /// eviction reclaims it.
+    #[tokio::test]
+    async fn evict_cluster_deleted_suspended_sandbox_is_retried_while_held() {
+        for hold in ["upload", "upgrade"] {
+            let conn = crate::db::test_conn();
+            let sandbox_id = SandboxId::new().to_string();
+            insert_platform_owned_sandbox(&conn, &sandbox_id, SandboxState::Suspended, None);
+            conn.execute(
+                "UPDATE sandboxes SET updated_at = '0' WHERE id = ?1",
+                crate::db::fixture::params![sandbox_id],
+            )
+            .unwrap();
+            let release = match hold {
+                "upload" => {
+                    conn.execute(
+                        "INSERT INTO jobs (job_id, kind, status, payload, subject_id, created_at)
+                         VALUES ('held-upload', 'snapshot_upload', 'running', '{}', ?1, '1')",
+                        crate::db::fixture::params![sandbox_id],
+                    )
+                    .unwrap();
+                    "UPDATE jobs SET status = 'completed' WHERE job_id = 'held-upload'"
+                }
+                _ => {
+                    let compiled =
+                        pplx_space_node_runtime_core::catalog::CompiledEnvironment::for_architecture(
+                            pplx_space_common_core::types::Arch::X86_64,
+                        )
+                        .unwrap();
+                    crate::db::upsert_sandbox_execution_metadata(
+                        &conn,
+                        &sandbox_id,
+                        &compiled[0].definition().execution_requirements().unwrap(),
+                    )
+                    .unwrap();
+                    crate::db::test_fixtures::fence_runtime_upgrade(
+                        &conn,
+                        &sandbox_id,
+                        compiled[1].definition().reference(),
+                        None,
+                    );
+                    "UPDATE sandbox_runtime_upgrades SET phase = 'rolled_back'"
+                }
+            };
+            conn.execute(
+                "UPDATE sandboxes SET updated_at = '0' WHERE id = ?1",
+                crate::db::fixture::params![sandbox_id],
+            )
+            .unwrap();
+            let service = service_with_runtime_probe(conn, false);
+            let dispatched = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let observed = Arc::clone(&dispatched);
+            *service.cleanup_executor.dispatch.lock().unwrap() = Some(Arc::new(move |id, kill| {
+                observed.lock().unwrap().push((id, kill));
+                Box::pin(async { Ok(()) })
+            }));
+
+            let error = service
+                .evict_cluster_deleted_sandbox(root_peer_request(&sandbox_id))
+                .await
+                .expect_err("a held row must not be evicted");
+            assert_eq!(error.code(), tonic::Code::Aborted, "{hold}: {error}");
+            assert!(error.message().contains("next sync"), "{hold}: {error}");
+            {
+                let db = service.db.lock().unwrap();
+                let row = crate::db::get_sandbox(&db, &sandbox_id).unwrap().unwrap();
+                assert_eq!(row.state, SandboxState::Suspended, "{hold}");
+            }
+            assert!(dispatched.lock().unwrap().is_empty(), "{hold}");
+
+            service.db.lock().unwrap().execute(release, []).unwrap();
+            let result = tokio::time::timeout(
+                Duration::from_secs(5),
+                service.evict_cluster_deleted_sandbox(root_peer_request(&sandbox_id)),
+            )
+            .await;
+            service.shutdown_token.cancel();
+            service.task_tracker.close();
+            tokio::time::timeout(Duration::from_secs(5), service.task_tracker.wait())
+                .await
+                .expect("eviction and cleanup tasks must drain");
+            result
+                .expect("eviction should complete")
+                .unwrap_or_else(|error| panic!("{hold}: an unheld row is reclaimed: {error}"));
+            assert_eq!(
+                *dispatched.lock().unwrap(),
+                vec![(sandbox_id.clone(), false)],
+                "{hold}"
+            );
+        }
+    }
+
     async fn assert_evict_refused_and_row_untouched(
         service: &SandboxManagerService,
         sandbox_id: &str,
@@ -15817,6 +15912,14 @@ pub(crate) mod service_tests {
             assert_eq!(
                 crate::capture_record::read(&snapshot_dir, local_artifact_id).unwrap(),
                 Some(teardown_generation()),
+                "staged: {staged}"
+            );
+            // Recovery can't tell the active teardown took this capture, so
+            // its record fences but orders nothing.
+            assert_eq!(
+                crate::capture_record::read_capture_order(&snapshot_dir, local_artifact_id)
+                    .unwrap(),
+                None,
                 "staged: {staged}"
             );
         }
