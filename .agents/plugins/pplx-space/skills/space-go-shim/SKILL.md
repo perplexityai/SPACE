@@ -7,7 +7,7 @@ description: Develop and validate the Go containerd shim under `shim/` and its s
 
 Keep the shim's `sbxMgrSocket` constant in `shim/space.go` synchronized with
 Rust's `SANDBOX_MANAGER_SOCKET` in
-`crates/libs/common/core/src/host/linux.rs`.
+`crates/l20_domain/host/layout/src/lib.rs`.
 
 Run all Go validation from `shim/` before committing or opening a PR:
 

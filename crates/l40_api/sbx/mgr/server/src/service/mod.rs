@@ -14,11 +14,6 @@ use pplx_space_api_route::{
     ed25519::SpaceApiRouteEd25519VerificationBundleUpdate,
     ed25519::SpaceApiRouteEd25519VerificationBundleUpdateError,
 };
-use pplx_space_common_core::host::linux::identities::user_names;
-use pplx_space_common_core::host::linux::paths::{
-    TEMPLATE_CACHE_DIR_MODE, normalize_template_cache_tree as normalize_template_cache_tree_io,
-    set_template_cache_permissions as set_template_cache_permissions_io,
-};
 use pplx_space_common_core::types::{
     AutoLifecycleActivitySource, AutoLifecycleIdleAction, AutoLifecyclePolicy,
     AutoLifecycleRuntimeState, AutoLifecycleTransition, ExecutionGeneration, GuestUserName,
@@ -28,6 +23,8 @@ use pplx_space_common_core::types::{
     SandboxQuarantineReasonCode, SandboxRouteIdentity, SandboxRuntimeLabel, SpaceApiRouteIdentity,
     TEMPLATE_MANAGER_SANDBOX_OWNER, format_reserved_sandbox_owner_kind_labels, parse_grpc_timeout,
 };
+use pplx_space_host_layout::identities::user_names;
+use pplx_space_host_layout::paths::TEMPLATE_CACHE_DIR_MODE;
 use pplx_space_net_common::{NetworkPolicyV1, proto::NetworkPolicyApplyDecision};
 use pplx_space_net_gateway_client::proto::{ServicePortIngressFrame, service_port_ingress_frame};
 use pplx_space_node_mgr_client::NodeManagerGrpcClient;
@@ -55,6 +52,10 @@ use pplx_space_spaced_common::proto::host_control::{
 use pplx_space_spaced_common::{validate_duration, validate_optional_reason};
 use pplx_space_spaced_host_client::proto as host_proto;
 use pplx_space_state_reconciliation::{ApplyDecisionKind, FACET_NETWORK_POLICY};
+use pplx_space_template_cache_permissions::{
+    normalize_template_cache_tree as normalize_template_cache_tree_io,
+    set_template_cache_permissions as set_template_cache_permissions_io,
+};
 use pplx_space_uds_peer_auth::{
     AuthorizedUdsPeer, LocalRole, PeerIdentity, UdsPeerAccount, UdsPeerAuthorizer, UdsPeerPrincipal,
 };
@@ -212,13 +213,13 @@ fn request_sandbox_ids(sandbox_ids: &[String]) -> Vec<String> {
     ids
 }
 
-const RUN_DIR: &str = pplx_space_common_core::host::linux::paths::SANDBOX_RUN_DIR;
-const CACHE_DIR: &str = pplx_space_common_core::host::linux::paths::SANDBOX_CACHE_DIR;
+const RUN_DIR: &str = pplx_space_host_layout::paths::SANDBOX_RUN_DIR;
+const CACHE_DIR: &str = pplx_space_host_layout::paths::SANDBOX_CACHE_DIR;
 
 /// Answers whether a sandbox's rootfs is on this node's disk; an error means
 /// presence couldn't be verified.
 pub type RootfsPresenceProbe = Arc<dyn Fn(&str) -> std::io::Result<bool> + Send + Sync>;
-const TEMPLATE_DIR: &str = pplx_space_common_core::host::linux::paths::TEMPLATE_DIR;
+const TEMPLATE_DIR: &str = pplx_space_host_layout::paths::TEMPLATE_DIR;
 const NET_GATEWAY_SIDECAR_PID_NAME: &str = "space-netgtw-svc";
 
 const MAX_WRITE_BATCH_ENTRIES: usize = pplx_space_common_core::spaced::MAX_WRITE_BATCH_ENTRIES;
@@ -1106,7 +1107,7 @@ impl Default for SandboxManagerServiceOptions {
         Self {
             automatic_guest_updates: true,
             host_control_socket_path: PathBuf::from(
-                pplx_space_common_core::host::linux::paths::SANDBOX_HOST_CONTROL_SOCKET,
+                pplx_space_host_layout::paths::SANDBOX_HOST_CONTROL_SOCKET,
             ),
             credential_manager_socket_path: PathBuf::from(
                 pplx_space_credmgr_client::CREDMGR_SOCKET,

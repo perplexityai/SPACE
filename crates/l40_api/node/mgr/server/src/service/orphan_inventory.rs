@@ -320,7 +320,7 @@ impl OrphanInventory {
                 RUN_DIR.into(),
                 CACHE_DIR.into(),
                 "/proc".into(),
-                pplx_space_common_core::host::linux::paths::NET_GATEWAY_RUN_DIR.into(),
+                pplx_space_host_layout::paths::NET_GATEWAY_RUN_DIR.into(),
             ],
             nft_candidates,
         )

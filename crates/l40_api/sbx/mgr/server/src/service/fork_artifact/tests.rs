@@ -381,10 +381,8 @@ async fn copy_admission_rejects_overflow_and_reuses_cancelled_queue_places() {
 
 #[test]
 fn copy_admission_reserves_the_full_staged_artifact() {
-    use pplx_space_common_core::host::disk::DiskStatus;
-    use pplx_space_common_core::host::disk_admission::{
-        CacheDiskAdmissionConfig, CacheDiskMeasurement,
-    };
+    use pplx_space_host_linux::disk::DiskStatus;
+    use pplx_space_node_disk_admission::{CacheDiskAdmissionConfig, CacheDiskMeasurement};
 
     let decision = copy_disk_admission_decision(
         CacheDiskAdmissionConfig {

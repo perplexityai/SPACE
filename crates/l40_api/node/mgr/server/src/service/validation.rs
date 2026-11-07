@@ -134,7 +134,7 @@ pub(super) fn validate_template_rootfs_under(
             "template root {} is not available: {error}",
             template_root.display()
         );
-        if pplx_space_common_core::host::path_errors::host_path_io_error_is_transient(&error) {
+        if pplx_space_host_linux::path_errors::host_path_io_error_is_transient(&error) {
             Status::internal(message)
         } else {
             Status::failed_precondition(message)
@@ -153,8 +153,7 @@ pub(super) fn validate_template_rootfs_under(
                 "template dir not found: {}",
                 template_dir.display()
             ))
-        } else if pplx_space_common_core::host::path_errors::host_path_io_error_is_transient(&error)
-        {
+        } else if pplx_space_host_linux::path_errors::host_path_io_error_is_transient(&error) {
             Status::internal(format!(
                 "cannot resolve template dir {}: {error}",
                 template_dir.display()
@@ -178,8 +177,7 @@ pub(super) fn validate_template_rootfs_under(
     let metadata = std::fs::symlink_metadata(&rootfs).map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
             Status::not_found(format!("template rootfs not found: {}", rootfs.display()))
-        } else if pplx_space_common_core::host::path_errors::host_path_io_error_is_transient(&error)
-        {
+        } else if pplx_space_host_linux::path_errors::host_path_io_error_is_transient(&error) {
             Status::internal(format!(
                 "cannot inspect template rootfs {}: {error}",
                 rootfs.display()
@@ -210,8 +208,8 @@ pub(super) fn validate_template_rootfs_under(
 
 /// Allowed program paths for the Launch RPC.
 pub(super) const ALLOWED_LAUNCH_PROGRAMS: &[&str] = &[
-    pplx_space_common_core::host::linux::paths::NET_GATEWAY_SVC_BIN,
-    pplx_space_common_core::host::linux::paths::SPACED_HOST_SVC_BIN,
+    pplx_space_host_layout::paths::NET_GATEWAY_SVC_BIN,
+    pplx_space_host_layout::paths::SPACED_HOST_SVC_BIN,
 ];
 
 pub(super) fn require_launch_arg<'a>(
@@ -283,18 +281,18 @@ pub(super) fn prepare_sidecar_launch_args(
     args: &[String],
     expected_spaced_host_peer: Option<ExpectedSpacedHostPeer>,
 ) -> Result<Vec<String>, Status> {
-    if program == pplx_space_common_core::host::linux::paths::NET_GATEWAY_SVC_BIN {
+    if program == pplx_space_host_layout::paths::NET_GATEWAY_SVC_BIN {
         require_launch_arg_eq(
             args,
             program,
             "--socket",
-            &pplx_space_common_core::host::linux::paths::net_gateway_control_socket(sandbox_id),
+            &pplx_space_host_layout::paths::net_gateway_control_socket(sandbox_id),
         )?;
         require_launch_arg_eq(args, program, "--sandbox-id", sandbox_id)?;
         return Ok(args.to_vec());
     }
 
-    if program == pplx_space_common_core::host::linux::paths::SPACED_HOST_SVC_BIN {
+    if program == pplx_space_host_layout::paths::SPACED_HOST_SVC_BIN {
         let expected_peer = expected_spaced_host_peer.ok_or_else(|| {
             Status::failed_precondition("spaced-host launch requires a running sandbox runtime")
         })?;
@@ -302,7 +300,7 @@ pub(super) fn prepare_sidecar_launch_args(
             args,
             program,
             "--socket",
-            &pplx_space_common_core::host::linux::paths::spaced_host_socket(sandbox_id),
+            &pplx_space_host_layout::paths::spaced_host_socket(sandbox_id),
         )?;
         require_launch_arg_eq(args, program, "--sandbox-id", sandbox_id)?;
         require_launch_arg_eq(
@@ -324,7 +322,7 @@ pub(super) fn prepare_sidecar_launch_args(
             args,
             program,
             "--host-control-socket",
-            pplx_space_common_core::host::linux::paths::SANDBOX_HOST_CONTROL_SOCKET,
+            pplx_space_host_layout::paths::SANDBOX_HOST_CONTROL_SOCKET,
         )?;
         // Node-manager derives and appends the peer itself. This keeps the
         // authorization input out of the caller's control and lets old and new

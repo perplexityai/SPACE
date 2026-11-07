@@ -3,7 +3,7 @@ use std::sync::LazyLock;
 use std::time::Duration;
 
 use crate::service_name::ServiceName;
-use pplx_space_common_core::host::linux::identities::group_names;
+use pplx_space_host_layout::identities::group_names;
 use pplx_space_node_runtime_core::runtime_inventory::diagnostic::{ScanLimits, ScanRoots};
 use pplx_space_node_runtime_manager_client::proto::runtime_manager_server::RuntimeManagerServer;
 use pplx_space_unix_socket_path::UnixSocketPath;

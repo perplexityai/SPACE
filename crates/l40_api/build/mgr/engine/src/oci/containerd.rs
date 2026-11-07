@@ -1097,8 +1097,8 @@ struct OpenStorageProbe;
 
 #[cfg(test)]
 impl StorageProbe for OpenStorageProbe {
-    fn status(&self, _root: &Path) -> Option<pplx_space_common_core::host::disk::DiskStatus> {
-        Some(pplx_space_common_core::host::disk::DiskStatus {
+    fn status(&self, _root: &Path) -> Option<pplx_space_host_linux::disk::DiskStatus> {
+        Some(pplx_space_host_linux::disk::DiskStatus {
             total_bytes: 4,
             free_bytes: 4,
             available_bytes: 4,

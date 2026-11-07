@@ -35,7 +35,7 @@ use tokio::sync::oneshot;
 #[tokio::test]
 async fn set_network_policy_rejects_local_authority_from_forwarded_service_peer() {
     use crate::service::tests::service_tests::insert_test_sandbox;
-    use pplx_space_common_core::host::linux::identities::users;
+    use pplx_space_host_layout::identities::users;
     use pplx_space_sbx_mgr_client::proto::SetNetworkPolicyRequest;
     use pplx_space_uds_peer_auth::PeerIdentity;
 
@@ -106,7 +106,7 @@ async fn set_network_policy_rejects_local_authority_from_forwarded_service_peer(
 #[tokio::test]
 async fn set_auto_lifecycle_policy_rejects_local_authority_from_forwarded_service_peer() {
     use crate::service::tests::service_tests::insert_test_sandbox;
-    use pplx_space_common_core::host::linux::identities::users;
+    use pplx_space_host_layout::identities::users;
     use pplx_space_sbx_mgr_client::proto::SetAutoLifecyclePolicyRequest;
     use pplx_space_uds_peer_auth::PeerIdentity;
 

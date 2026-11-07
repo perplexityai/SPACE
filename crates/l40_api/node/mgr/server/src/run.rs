@@ -10,7 +10,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use pplx_space_common_core::host::linux::identities::group_names;
+use pplx_space_host_layout::identities::group_names;
 use pplx_space_local_health::LocalHealthServer;
 use pplx_space_service_lifecycle::DEFAULT_DRAIN_TIMEOUT;
 use pplx_space_service_mutex::{AcquireOutcome, ServiceMutex};
@@ -659,7 +659,7 @@ pub async fn run(
 
     // Reject incompatible ownership before any host limit can shrink beneath
     // live sandboxes. Pool construction repeats this check before row repair.
-    let db_path = Path::new(pplx_space_common_core::host::linux::paths::NODE_MANAGER_DB);
+    let db_path = Path::new(pplx_space_host_layout::paths::NODE_MANAGER_DB);
     pplx_space_sqlite::migrate("node-manager", db_path, &NODE_MANAGER_MIGRATOR)
         .await
         .map_err(RunNodeMgrError::Migrate)?;

@@ -1,6 +1,6 @@
 //! Disjoint, slot-derived host identities for VM control and network gateways.
 
-use crate::types::{LinuxUid, MAX_LINUX_NETWORK_SLOT};
+use pplx_space_linux_ids::{LinuxUid, MAX_LINUX_NETWORK_SLOT};
 
 /// First UID in the existing VM/control identity range.
 pub const SANDBOX_UID_BASE: u32 = 10_000;

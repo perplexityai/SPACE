@@ -31,9 +31,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
-use pplx_space_common_core::host::linux::paths::{
-    FIRECRACKER_LOG_FILE, FIRECRACKER_METRICS_FIFO, jail_root,
-};
+use pplx_space_host_layout::paths::{FIRECRACKER_LOG_FILE, FIRECRACKER_METRICS_FIFO, jail_root};
 use tokio::sync::Notify;
 use tokio::time::Instant;
 use tokio_util::sync::{CancellationToken, DropGuard};

@@ -4,8 +4,8 @@ use std::path::Path;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use crate::host::btrfs::{BtrfsError, FilesystemUsage, read_filesystem_usage};
-use crate::host::disk::{DiskStatus, read_cache_disk_status};
+use pplx_space_btrfs::{BtrfsError, FilesystemUsage, read_filesystem_usage};
+use pplx_space_host_linux::disk::{DiskStatus, statvfs_status};
 
 const GIB: u64 = 1024 * 1024 * 1024;
 
@@ -308,7 +308,7 @@ fn retained_after_failed_refresh(
 
 pub fn read_cache_disk_measurement() -> Result<CacheDiskMeasurement, CacheDiskProbeError> {
     let status = read_cache_disk_status().ok_or(CacheDiskProbeError::Statvfs)?;
-    let path = Path::new(crate::host::linux::paths::SPACE_CACHE_DIR);
+    let path = Path::new(pplx_space_host_layout::paths::SPACE_CACHE_DIR);
     let btrfs = match read_filesystem_usage(path) {
         Ok(usage) => Some(usage),
         Err(error) if is_non_btrfs_usage_error(&error) => None,
@@ -445,6 +445,11 @@ fn unavailable_decision(
         hard_floor_bytes: config.min_available_bytes,
         stale_measurement: true,
     }
+}
+
+#[cfg(unix)]
+fn read_cache_disk_status() -> Option<DiskStatus> {
+    statvfs_status(pplx_space_host_layout::paths::SPACE_CACHE_DIR)
 }
 
 fn env_u64(name: &str, default: u64) -> u64 {

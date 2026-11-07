@@ -27,7 +27,7 @@
 
 use std::path::{Path, PathBuf};
 
-use pplx_space_common_core::host::linux::identities::user_names;
+use pplx_space_host_layout::identities::user_names;
 use pplx_space_uds_peer_auth::UdsPeerPrincipal;
 use tonic::{Request, Response, Status};
 
@@ -42,8 +42,8 @@ use crate::proto::{
     BtrfsReceiveInstanceRequest, BtrfsReceiveInstanceResponse, EnvironmentTemplateBuild,
 };
 
-use pplx_space_common_core::host::linux::paths::TEMPLATE_CACHE_DIR_MODE;
-use pplx_space_common_core::{host::linux::identities::gids, host::linux::identities::users};
+use pplx_space_host_layout::paths::TEMPLATE_CACHE_DIR_MODE;
+use pplx_space_host_layout::{identities::gids, identities::users};
 
 use super::validation::validate_sandbox_id;
 use super::{CACHE_DIR, NodeManagerService};
@@ -398,20 +398,15 @@ impl TemplateBuildTarget {
     }
 
     fn digest_dir(&self) -> PathBuf {
-        PathBuf::from(
-            pplx_space_common_core::host::linux::paths::template_build_dir(
-                &self.name,
-                &self.content_hash,
-                self.partition,
-            ),
-        )
+        PathBuf::from(pplx_space_common_core::types::template_build_dir(
+            &self.name,
+            &self.content_hash,
+            self.partition,
+        ))
     }
 
     fn received_uuid(&self) -> uuid::Uuid {
-        pplx_space_common_core::host::btrfs::deterministic_template_received_uuid(
-            &self.name,
-            &self.dir_name(),
-        )
+        pplx_space_btrfs::deterministic_template_received_uuid(&self.name, &self.dir_name())
     }
 }
 
@@ -659,8 +654,8 @@ impl LineageFallbackCause {
 
 fn validate_named_snapshot_lineage(
     template_uuid: uuid::Uuid,
-    instance: &pplx_space_common_core::host::btrfs::SubvolumeInfo,
-    snapshot: &pplx_space_common_core::host::btrfs::SubvolumeInfo,
+    instance: &pplx_space_btrfs::SubvolumeInfo,
+    snapshot: &pplx_space_btrfs::SubvolumeInfo,
 ) -> Result<(), Status> {
     if instance.parent_uuid != Some(template_uuid) {
         return Err(lineage_precondition(

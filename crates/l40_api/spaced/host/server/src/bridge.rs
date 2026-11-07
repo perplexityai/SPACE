@@ -113,7 +113,7 @@ pub(super) fn host_request_limiter() -> pplx_space_grpc_rate_limiter::GrpcRateLi
 }
 const _: () = assert!(
     MAX_HOST_SERVER_CONNECTIONS + MAX_BRIDGE_HOST_CONNECTIONS + MIN_NON_GRPC_DESCRIPTOR_RESERVE
-        <= pplx_space_common_core::host::linux::SANDBOX_PROCESS_NOFILE_LIMIT as usize
+        <= pplx_space_host_layout::SANDBOX_PROCESS_NOFILE_LIMIT as usize
 );
 
 fn observe_connection_admission(

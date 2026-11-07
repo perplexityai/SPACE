@@ -51,7 +51,7 @@ pub(super) use node_effects::NodeRuntimeUpgradeEffects;
 /// The preserved instance copy's name. The internal operation prefix keeps it
 /// out of users' snapshot listing, deletion and rollback.
 pub(super) fn preserved_disk_name(operation_id: RuntimeUpgradeOperationId) -> String {
-    let prefix = pplx_space_common_core::host::linux::paths::INTERNAL_OPERATION_SNAPSHOT_PREFIX;
+    let prefix = pplx_space_host_layout::paths::INTERNAL_OPERATION_SNAPSHOT_PREFIX;
     format!("{prefix}runtime-upgrade-{operation_id}")
 }
 

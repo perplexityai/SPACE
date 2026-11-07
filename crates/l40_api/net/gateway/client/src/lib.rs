@@ -87,7 +87,7 @@ pub const MAX_ACTIVE_SERVICE_PORT_INGRESS_STREAMS: usize = 64;
 /// The compatibility alias lives in the sandbox UID's writable directory and
 /// cannot authenticate a gateway. Clients must never fall back to that alias.
 pub fn control_socket_path(sandbox_id: &str) -> String {
-    pplx_space_common_core::host::linux::paths::isolated_net_gateway_control_socket(sandbox_id)
+    pplx_space_host_layout::paths::isolated_net_gateway_control_socket(sandbox_id)
 }
 
 #[derive(Debug, thiserror::Error)]

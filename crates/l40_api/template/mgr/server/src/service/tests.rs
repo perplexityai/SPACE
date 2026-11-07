@@ -1,7 +1,7 @@
 use pplx_space_common_core::types::OrgId;
 
 use super::*;
-use pplx_space_common_core::host::linux::identities::users;
+use pplx_space_host_layout::identities::users;
 use pplx_space_net_common::TlsInterception;
 use pplx_space_observability::test_capture::{CapturedEventsLayer, field_value};
 use std::{path::Path, sync::Arc};
@@ -1044,8 +1044,7 @@ impl BtrfsDeleteBench {
             snapshots_dir,
         };
 
-        if let Err(error) = pplx_space_common_core::host::btrfs::create_subvolume(&bench.digest_dir)
-        {
+        if let Err(error) = pplx_space_btrfs::create_subvolume(&bench.digest_dir) {
             eprintln!(
                 "skipping {test_label}: SPACE_TEST_BTRFS_DIR is not a writable btrfs \
                  mount ({error})"
@@ -1062,7 +1061,7 @@ impl BtrfsDeleteBench {
         // The install path finalizes the digest subvolume read-only;
         // the RO flag is what makes plain `remove_dir_all` fail with
         // EROFS.
-        pplx_space_common_core::host::btrfs::set_readonly(&bench.digest_dir, true).unwrap();
+        pplx_space_btrfs::set_readonly(&bench.digest_dir, true).unwrap();
         Some(bench)
     }
 }
@@ -1080,9 +1079,9 @@ impl Drop for BtrfsDeleteBench {
         if let Ok(entries) = std::fs::read_dir(&self.name_dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
-                if pplx_space_common_core::host::btrfs::is_subvolume(&path) {
-                    let _ = pplx_space_common_core::host::btrfs::set_readonly(&path, false);
-                    let _ = pplx_space_common_core::host::btrfs::delete_subvolume_if_present(&path);
+                if pplx_space_btrfs::is_subvolume(&path) {
+                    let _ = pplx_space_btrfs::set_readonly(&path, false);
+                    let _ = pplx_space_btrfs::delete_subvolume_if_present(&path);
                 }
             }
         }
@@ -1125,11 +1124,11 @@ fn delete_template_build_removes_read_only_btrfs_subvolume_build() {
     // pin both answers on a real btrfs mount (this test does not run
     // as root).
     assert!(
-        pplx_space_common_core::host::btrfs::is_subvolume(&bench.digest_dir),
+        pplx_space_btrfs::is_subvolume(&bench.digest_dir),
         "digest dir must be detected as a subvolume without privilege"
     );
     assert!(
-        !pplx_space_common_core::host::btrfs::is_subvolume(&bench.name_dir),
+        !pplx_space_btrfs::is_subvolume(&bench.name_dir),
         "plain directory on btrfs must not be detected as a subvolume"
     );
 
@@ -1187,9 +1186,9 @@ fn delete_template_removes_read_only_btrfs_subvolume_builds() {
             .name_dir
             .join(std::ffi::OsStr::from_bytes(b"stray-\xff-subvolume"))
     };
-    pplx_space_common_core::host::btrfs::create_subvolume(&stray_subvolume).unwrap();
+    pplx_space_btrfs::create_subvolume(&stray_subvolume).unwrap();
     std::fs::write(stray_subvolume.join("data"), b"bytes").unwrap();
-    pplx_space_common_core::host::btrfs::set_readonly(&stray_subvolume, true).unwrap();
+    pplx_space_btrfs::set_readonly(&stray_subvolume, true).unwrap();
 
     let conn = crate::db::test_conn();
     insert_ready_build(&conn, template, content_hash);

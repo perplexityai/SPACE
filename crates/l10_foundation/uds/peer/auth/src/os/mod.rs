@@ -1,8 +1,7 @@
 //! Platform-gated peer process inspection.
 //!
-//! Mirrors the `host::linux` / `host::other` split in
-//! `pplx-space-common-core`: every host has exactly one
-//! `read_peer_process` implementation, selected at compile time.
+//! Every host has exactly one `read_peer_process` implementation,
+//! selected at compile time.
 //! The Linux path reads `/proc/<pid>/{status,exe}`; every other host
 //! returns `io::ErrorKind::Unsupported` so opt-in process checks
 //! fail closed.

@@ -3,7 +3,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use pplx_space_common_core::host::disk_admission::{
+use pplx_space_node_disk_admission::{
     CacheDiskAdmissionConfig, CacheDiskAdmissionDecision, CacheDiskAdmissionMonitor,
     CacheDiskAdmissionReason, CacheDiskAdmissionState, CacheDiskRefreshKind,
 };

@@ -4,7 +4,7 @@
 //!
 //! - [`types`] is the domain type catalog. Prefer it so raw strings, UUIDs,
 //!   sizes, paths, and IDs are parsed once at the boundary.
-//! - [`host`] and [`guest`] describe platform-specific SPACE runtime contracts.
+//! - [`guest`] describes platform-specific SPACE runtime contracts.
 //! - [`ids`] contains legacy sandbox ID string helpers kept for compatibility.
 //!
 //! # Examples
@@ -25,7 +25,6 @@ pub mod types;
 pub mod archive;
 
 pub mod guest;
-pub mod host;
 pub use pplx_space_rpc_contracts::{
     artifact_backup_signals, inventory, node_drain_signals, operation_budget,
     port_exposure_signals, restore_ownership, wake_signals,

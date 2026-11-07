@@ -145,8 +145,7 @@ pub async fn connect(socket_path: &str) -> Result<CredentialManagerGrpcClient, C
 }
 
 /// Default socket path for credmgr.
-pub const CREDMGR_SOCKET: &str =
-    pplx_space_common_core::host::linux::paths::CREDENTIAL_MANAGER_SOCKET;
+pub const CREDMGR_SOCKET: &str = pplx_space_host_layout::paths::CREDENTIAL_MANAGER_SOCKET;
 
 /// Authority budget for network-credential resolution, including both state
 /// snapshots and provider work. Callers also need time for connection, local

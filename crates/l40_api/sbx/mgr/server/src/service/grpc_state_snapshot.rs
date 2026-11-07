@@ -227,10 +227,8 @@ fn disk_operation_snapshot_paths(
     sandbox_id: &str,
     snapshot_name: &pplx_space_common_core::types::SnapshotName,
 ) -> DiskOperationSnapshotPaths {
-    let capture = pplx_space_common_core::host::linux::paths::sandbox_snapshot_dir(
-        sandbox_id,
-        snapshot_name.as_str(),
-    );
+    let capture =
+        pplx_space_host_layout::paths::sandbox_snapshot_dir(sandbox_id, snapshot_name.as_str());
     DiskOperationSnapshotPaths {
         artifact: format!("{capture}-artifact"),
         capture,
@@ -1285,10 +1283,7 @@ impl SandboxManagerService {
         // Write label to sidecar JSON if provided (full snapshots only — disk snapshots
         // are read-only btrfs subvolumes, sidecar writes would fail silently)
         if !label.is_empty() && snap_type == "full" {
-            let snap_dir = pplx_space_common_core::host::linux::paths::sandbox_snapshot_dir(
-                id,
-                &snapshot_name,
-            );
+            let snap_dir = pplx_space_host_layout::paths::sandbox_snapshot_dir(id, &snapshot_name);
             let sidecar_path = format!("{snap_dir}/snapshot.json");
             // Read existing sidecar (written by do_checkpoint for full snapshots)
             let mut meta: serde_json::Value = std::fs::read_to_string(&sidecar_path)
@@ -1311,8 +1306,7 @@ impl SandboxManagerService {
         } else {
             crate::proto::SnapshotType::Disk
         };
-        let local_path =
-            pplx_space_common_core::host::linux::paths::sandbox_snapshot_dir(id, &snapshot_name);
+        let local_path = pplx_space_host_layout::paths::sandbox_snapshot_dir(id, &snapshot_name);
         let publish_result = {
             let db = self.db_conn()?;
             crate::db::publish_named_local_artifact(

@@ -26,7 +26,7 @@ struct Cli {
 
     /// Production node-ctl Unix socket. Bound only after the service mutex
     /// beside it, `service.mutex` in the same directory, is acquired.
-    #[arg(long, default_value = pplx_space_common_core::host::linux::paths::NODE_CTL_SOCKET)]
+    #[arg(long, default_value = pplx_space_host_layout::paths::NODE_CTL_SOCKET)]
     socket: PathBuf,
 
     /// Instance-local health Unix socket. When supplied, it is bound from
@@ -50,7 +50,7 @@ struct Cli {
     #[arg(long, default_value = DEFAULT_NODE_CTL_SOCKET_GROUP)]
     socket_group: String,
 
-    #[arg(long, default_value = pplx_space_common_core::host::linux::paths::NODE_CTL_DB)]
+    #[arg(long, default_value = pplx_space_host_layout::paths::NODE_CTL_DB)]
     db: PathBuf,
 
     #[arg(long)]

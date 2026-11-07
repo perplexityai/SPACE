@@ -32,6 +32,7 @@ tracing = { workspace = true }
 
 # internal
 pplx-space-common-core = { workspace = true }
+pplx-space-host-layout = { workspace = true }
 pplx-space-migration-checksums = { workspace = true }
 pplx-space-sql-locator = { workspace = true }
 pplx-space-sqlite = { workspace = true }

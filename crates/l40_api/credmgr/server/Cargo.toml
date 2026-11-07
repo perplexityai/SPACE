@@ -88,6 +88,7 @@ pplx-space-federated-grant-store = { workspace = true }
 pplx-space-federated-identity = { workspace = true }
 pplx-space-grpc-rate-limiter = { workspace = true }
 pplx-space-grpc-server = { workspace = true }
+pplx-space-host-layout = { workspace = true }
 pplx-space-k8s-node-id = { workspace = true }
 pplx-space-kube-client = { workspace = true }
 pplx-space-local-health = { workspace = true }

@@ -28,7 +28,7 @@ pub use pplx_space_sbx_mgr_protocol::{
 pub mod test_support;
 
 /// Unix socket path for the sbx-manager gRPC service.
-pub const SOCKET_PATH: &str = pplx_space_common_core::host::linux::paths::SANDBOX_MANAGER_SOCKET;
+pub const SOCKET_PATH: &str = pplx_space_host_layout::paths::SANDBOX_MANAGER_SOCKET;
 
 pub type SandboxManagerGrpcClient =
     proto::sandbox_manager_client::SandboxManagerClient<GrpcClientTrace<Channel>>;

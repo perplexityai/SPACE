@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use anyhow::Context as _;
 use clap::Parser;
-use pplx_space_common_core::host::linux::paths::{
+use pplx_space_host_layout::paths::{
     VOLUME_MANAGER_DB, VOLUME_MANAGER_SOCKET, VOLUME_MANAGER_STAGING_DIR,
 };
 use pplx_space_volmgr::executor::{

@@ -147,8 +147,7 @@ fn checkpoint_sidecar_execution_metadata(
 }
 
 fn write_snapshot_execution_sidecar(snapshot_dir: &str, sandbox_id: &str, snapshot_name: &str) {
-    let sandbox_metadata_path =
-        pplx_space_common_core::host::linux::paths::sandbox_metadata_path(sandbox_id);
+    let sandbox_metadata_path = pplx_space_host_layout::paths::sandbox_metadata_path(sandbox_id);
     let bytes = match std::fs::read(&sandbox_metadata_path) {
         Ok(bytes) => bytes,
         Err(error) => {
@@ -211,7 +210,7 @@ fn write_snapshot_execution_sidecar(snapshot_dir: &str, sandbox_id: &str, snapsh
     }
 }
 
-const CACHE_DIR: &str = pplx_space_common_core::host::linux::paths::SANDBOX_CACHE_DIR;
+const CACHE_DIR: &str = pplx_space_host_layout::paths::SANDBOX_CACHE_DIR;
 
 struct SandboxSnapshotState {
     tick_count: u64,
@@ -600,10 +599,8 @@ fn publish_named_artifact(
     let snapshot_name = SnapshotName::parse(snapshot_name.to_string())
         .map_err(|error| format!("generated scheduled snapshot name is invalid: {error}"))?;
     let local_artifact_id = LocalArtifactId::new();
-    let local_path = pplx_space_common_core::host::linux::paths::sandbox_snapshot_dir(
-        sandbox_id,
-        snapshot_name.as_str(),
-    );
+    let local_path =
+        pplx_space_host_layout::paths::sandbox_snapshot_dir(sandbox_id, snapshot_name.as_str());
     crate::local_artifacts::LocalArtifacts::new(ctx.db.clone())
         .publish_named_snapshot(
             sandbox_id,

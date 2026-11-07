@@ -613,9 +613,9 @@ async fn stage_restore_cow(
     source: &Path,
     cow_path: &Path,
 ) -> Result<(), DmCryptError> {
-    let root = PathBuf::from(
-        pplx_space_common_core::host::linux::paths::sandbox_cache_dir(&sandbox_id.to_string()),
-    );
+    let root = PathBuf::from(pplx_space_host_layout::paths::sandbox_cache_dir(
+        &sandbox_id.to_string(),
+    ));
     let source = source.to_path_buf();
     let cow_path = cow_path.to_path_buf();
     tokio::task::spawn_blocking(move || {

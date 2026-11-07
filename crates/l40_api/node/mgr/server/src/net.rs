@@ -7,8 +7,7 @@ use std::sync::OnceLock;
 pub use native::NAMESPACE_ICMP_RATEMASK;
 
 pub const DEFAULT_MAX_SLOTS: u32 = 300;
-pub const SANDBOX_UID_RANGE_START: u32 =
-    pplx_space_common_core::host::linux::gateway::SANDBOX_UID_BASE;
+pub const SANDBOX_UID_RANGE_START: u32 = pplx_space_host_layout::gateway::SANDBOX_UID_BASE;
 
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum NetworkProbeError {

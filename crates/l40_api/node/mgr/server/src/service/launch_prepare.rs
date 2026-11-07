@@ -1,10 +1,10 @@
 use super::cleanup_helpers::*;
 use super::validation::*;
 use super::*;
-use pplx_space_common_core::host::linux::paths;
-use pplx_space_common_core::host::linux::paths::{FIRECRACKER_LOG_FILE, FIRECRACKER_METRICS_FIFO};
 use pplx_space_common_core::sandbox_storage::{validate_rootfs_bytes, validate_rootfs_mib};
 use pplx_space_common_core::types::RuntimeKind;
+use pplx_space_host_layout::paths;
+use pplx_space_host_layout::paths::{FIRECRACKER_LOG_FILE, FIRECRACKER_METRICS_FIFO};
 use pplx_space_node_runtime_core::proto::{ArtifactIntegrityRequirement, VerifiedRuntimeLaunch};
 use pplx_space_node_runtime_core::runtime_inventory::{
     ExecutionSelectionMode, ExecutionSourceIntegrity, RuntimeFileRole, boot_component_role,
@@ -928,7 +928,7 @@ impl NodeManagerService {
         let sandbox_cache_dir_b = sandbox_cache_dir.clone();
         let snapshots_dir_b = snapshots_dir.clone();
         let sandbox_metadata_path_b =
-            pplx_space_common_core::host::linux::paths::sandbox_metadata_path(sandbox_id);
+            pplx_space_host_layout::paths::sandbox_metadata_path(sandbox_id);
         let sandbox_metadata = sandbox_metadata.clone();
         let vm_config_json = req.vm_config_json.clone();
         let rootfs_size_mb = req.rootfs_size_mb;
@@ -1258,7 +1258,7 @@ mod tests;
 /// than stalling the VMM, and readable by sandbox-manager's group.
 fn create_firecracker_metrics_fifo(path: &Path, sandbox_uid: u32) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt as _;
-    let sbxmgr_gid = pplx_space_common_core::host::linux::identities::groups::SPACE_SBXMGR.gid;
+    let sbxmgr_gid = pplx_space_host_layout::identities::groups::SPACE_SBXMGR.gid;
     nix::unistd::mkfifo(path, nix::sys::stat::Mode::from_bits_truncate(0o600))?;
     let configured = std::os::unix::fs::lchown(path, Some(sandbox_uid), Some(sbxmgr_gid))
         .and_then(|()| std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o640)));

@@ -106,7 +106,7 @@ impl NodeManagerService {
         use pplx_space_node_mgr_client::execution_fence::InstanceTarget;
         match target {
             InstanceTarget::RestoreScope(scope) => Ok(PathBuf::from(
-                pplx_space_common_core::host::linux::paths::sandbox_restore_staging_dir(
+                pplx_space_host_layout::paths::sandbox_restore_staging_dir(
                     sandbox_id,
                     &scope.to_string(),
                 ),

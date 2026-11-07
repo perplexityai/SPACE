@@ -2,11 +2,11 @@ use super::cleanup_helpers::*;
 use super::disk::*;
 use super::validation::*;
 use super::*;
-use pplx_space_common_core::host::linux::paths;
 use pplx_space_common_core::types::SandboxId;
 use pplx_space_events::{
     SandboxEvent, SandboxEventBoolField, SandboxEventDetails, SandboxEventSource, SandboxEventType,
 };
+use pplx_space_host_layout::paths;
 use tracing::Instrument as _;
 
 type CleanupOperationResult = Result<CleanupSandboxResponse, Status>;

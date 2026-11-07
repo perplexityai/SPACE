@@ -36,7 +36,7 @@ pub async fn node_ctl_status() -> NodeCtlStatus {
 }
 
 pub async fn node_ctl_status_if_present() -> Option<NodeCtlStatus> {
-    if !std::path::Path::new(pplx_space_common_core::host::linux::paths::NODE_CTL_SOCKET).exists() {
+    if !std::path::Path::new(pplx_space_host_layout::paths::NODE_CTL_SOCKET).exists() {
         return None;
     }
     Some(node_ctl_status().await)

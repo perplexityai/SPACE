@@ -167,6 +167,10 @@ members = [
     "crates/l20_domain/template/manifest",
     "crates/l20_domain/policy/authority",
     "crates/l10_foundation/linux/ids",
+    "crates/l10_foundation/host/linux",
+    "crates/l20_domain/host/layout",
+    "crates/l40_api/node/disk/admission",
+    "crates/l40_api/template/cache/permissions",
     "crates/l20_domain/network/roles",
     "crates/l20_domain/auto/lifecycle/policy",
     "crates/l10_foundation/pii",
@@ -462,6 +466,10 @@ pplx-space-template-runtime = { path = "crates/l20_domain/template/runtime" }
 pplx-space-template-manifest = { path = "crates/l20_domain/template/manifest" }
 pplx-space-policy-authority = { path = "crates/l20_domain/policy/authority" }
 pplx-space-linux-ids = { path = "crates/l10_foundation/linux/ids" }
+pplx-space-host-linux = { path = "crates/l10_foundation/host/linux" }
+pplx-space-host-layout = { path = "crates/l20_domain/host/layout" }
+pplx-space-node-disk-admission = { path = "crates/l40_api/node/disk/admission" }
+pplx-space-template-cache-permissions = { path = "crates/l40_api/template/cache/permissions" }
 pplx-space-network-roles = { path = "crates/l20_domain/network/roles" }
 pplx-space-auto-lifecycle = { path = "crates/l20_domain/auto/lifecycle/policy" }
 pplx-space-pii = { path = "crates/l10_foundation/pii" }

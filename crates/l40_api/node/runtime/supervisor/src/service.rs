@@ -798,8 +798,7 @@ impl RuntimeSupervisorService {
     ) -> Result<Response<LaunchSidecarResponse>, Status> {
         let sandbox_id = parse_sandbox_id(&req.sandbox_id)?;
         validate_sidecar_program(&req.program)?;
-        let is_gateway =
-            req.program == pplx_space_common_core::host::linux::paths::NET_GATEWAY_SVC_BIN;
+        let is_gateway = req.program == pplx_space_host_layout::paths::NET_GATEWAY_SVC_BIN;
         let program_filename = sidecar_program_filename(&req.program)?;
         let pid_filename = sidecar_pid_filename(&req.program)?;
         let launch_key = (sandbox_id, req.program.clone());

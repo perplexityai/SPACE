@@ -296,7 +296,7 @@ mode = "required"
 # migrations, its path and file name, and a default-path helper for it belong
 # to the store; the database migrator takes them from the store's
 # `db::migration::target()`. The migrations crate defines the migrators and
-# common-core the path. These names are specific enough to check
+# host-layout the path. These names are specific enough to check
 # workspace-wide. The layers rule does not see these uses: its storage checks
 # read only dependency edges, skip stores and helpers, and tolerate baselined
 # edges, and `state.writes` scans only stores' and helpers' write statements.
@@ -316,7 +316,7 @@ patterns = [
 allow = [
   "crates/l30_storage/sbx/mgr/store/src/**",
   "crates/l30_storage/sbx/mgr/migrations/src/**",
-  "crates/libs/common/core/src/host/linux.rs",
+  "crates/l20_domain/host/layout/src/lib.rs",
 ]
 
 [rules.pattern_ratchet.sbxmgr_sqlite_schema.no_crossing]
