@@ -6,8 +6,7 @@
 //! different things when configuring NAT, firewall rules, and guest interfaces.
 //!
 //! They are their own crate so that code can name them without depending on
-//! `pplx-space-common-core`, which re-exports them from `types::network` and
-//! `types`.
+//! `pplx-space-common-core`: import them from here.
 //!
 //! # Examples
 //!

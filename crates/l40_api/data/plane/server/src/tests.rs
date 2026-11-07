@@ -13,13 +13,13 @@ use pplx_space_api_route::{
     ed25519::SpaceApiRouteEd25519Token,
 };
 use pplx_space_common_core::types::{
-    ClusterId, EnvMap, ExecutionGeneration, GuestPort, PodUid, RouteGeneration,
-    SandboxActivationAttemptId, SandboxId, SandboxRouteIdentity, SimpleDuration,
-    SpaceApiRouteIdentity,
+    ClusterId, EnvMap, ExecutionGeneration, PodUid, RouteGeneration, SandboxActivationAttemptId,
+    SandboxId, SandboxRouteIdentity, SimpleDuration, SpaceApiRouteIdentity,
 };
 use pplx_space_net_gateway_client::proto::{
     ServicePortIngressFrame, ServicePortIngressStart, service_port_ingress_frame,
 };
+use pplx_space_network_roles::GuestPort;
 use pplx_space_node_api_client::proto::{
     DataPlaneBackendEndpoint, ResolveDataPlaneSessionRouteResponse,
     SandboxServiceRouteCredentialKind, SandboxServiceRouteCredentialProof, SandboxServiceRouteKind,

@@ -8,7 +8,8 @@ use std::str::FromStr;
 use aws_lc_rs::signature::{ED25519, Ed25519KeyPair, KeyPair, VerificationAlgorithm};
 use base64::Engine as _;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
-use pplx_space_common_core::types::{ClusterId, GuestPort, SandboxRouteIdentity};
+use pplx_space_common_core::types::{ClusterId, SandboxRouteIdentity};
+use pplx_space_network_roles::GuestPort;
 use serde::{Deserialize, Serialize};
 use tonic::metadata::{Ascii, MetadataMap, MetadataValue};
 

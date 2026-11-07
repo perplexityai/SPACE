@@ -14,11 +14,12 @@ use super::spaced_bridge::*;
 use super::tail_support::*;
 use super::*;
 use futures_util::StreamExt;
-use pplx_space_common_core::types::{GuestPort, SandboxId};
+use pplx_space_common_core::types::SandboxId;
 use pplx_space_events::{
     SandboxEventBoolField, SandboxEventDetails, SandboxEventSource, SandboxEventType,
     emit_sandbox_event,
 };
+use pplx_space_network_roles::GuestPort;
 use pplx_space_sbx_mgr_client::operations as spaced_ops;
 use rollback_state::restage_rolled_back_full_snapshot;
 use std::str::FromStr;

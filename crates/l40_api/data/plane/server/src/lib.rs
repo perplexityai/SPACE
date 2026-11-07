@@ -1232,7 +1232,7 @@ async fn open_service_port_ingress_io(
     // Enrichment must not change ingress admission or route-repair behavior.
     let trace_context = u16::try_from(port)
         .ok()
-        .and_then(|value| pplx_space_common_core::types::GuestPort::try_from_u16(value).ok())
+        .and_then(|value| pplx_space_network_roles::GuestPort::try_from_u16(value).ok())
         .map(|port| pplx_space_sandbox_grpc::SandboxTraceContext {
             sandbox_id: *sandbox_id,
             port,

@@ -1088,7 +1088,7 @@ impl WorkerApi for WorkerApiService {
                     .sandbox_id
                     .parse::<SandboxId>()
                     .map_err(|_| Status::invalid_argument("sandbox_id is invalid"))?,
-                pplx_space_common_core::types::GuestPort::try_from_u16(
+                pplx_space_network_roles::GuestPort::try_from_u16(
                     u16::try_from(start.port)
                         .map_err(|_| Status::invalid_argument("service port out of range"))?,
                 )
