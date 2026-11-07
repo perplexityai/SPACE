@@ -5,7 +5,8 @@ use crate::bridge::{
     record_bridge_rpc_unbounded_outcome,
 };
 use crate::protocol::*;
-use pplx_space_common_core::types::{Pii, RelativeGuestPath};
+use pplx_space_common_core::types::RelativeGuestPath;
+use pplx_space_pii::Pii;
 
 // Bound an opaque owner identifier independently of the streamed list budget.
 const MAX_GUEST_OWNER_SID_BYTES: usize = 1024;

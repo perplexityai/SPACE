@@ -1,8 +1,9 @@
 use super::*;
 use pplx_space_common_core::types::{
-    GuestUserName, IdempotencyKey, Pii, ProcessCommand, ProcessId, ProcessSignal,
+    GuestUserName, IdempotencyKey, ProcessCommand, ProcessId, ProcessSignal,
     validate_guest_path_input as validate_path_text,
 };
+use pplx_space_pii::Pii;
 
 pub(super) type HostFileInfoStream =
     std::pin::Pin<Box<dyn futures_util::Stream<Item = Result<FileInfo, Status>> + Send>>;

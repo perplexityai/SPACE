@@ -8,9 +8,10 @@
 
 use futures_util::StreamExt;
 use pplx_space_common_core::types::{
-    GuestPath, GuestUserName, IdempotencyKey, Pii, ProcessCommand, ProcessId, ProcessSignal,
+    GuestPath, GuestUserName, IdempotencyKey, ProcessCommand, ProcessId, ProcessSignal,
     ReadyTimeout, RelativeGlobPattern, WatchRoot,
 };
+use pplx_space_pii::Pii;
 use prost::Message as _;
 use proto::{
     ConfigureProcessEnvRequest, ConnectProcessRequest, CreateWatcherRequest,
