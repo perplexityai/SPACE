@@ -272,7 +272,7 @@ pub(crate) async fn create_native_sandbox_operation(
                 org_id,
                 actor_user_id: Some(actor_user_id),
                 api_product: ApiProduct::Native,
-                kind: OperationKind::CreateSandbox,
+                kind: OperationKind::CreateSandbox.into(),
                 target_type: Some(OperationTargetType::Sandbox),
                 target_id: Some(sandbox_id_string),
                 payload_json: CreateSandboxOperationPayload {
@@ -834,7 +834,7 @@ pub async fn update_sandbox(
             org_id: org.id,
             actor_user_id: Some(actor.id),
             api_product: ApiProduct::Native,
-            kind: OperationKind::UpdateSandbox,
+            kind: OperationKind::UpdateSandbox.into(),
             target_type: Some(OperationTargetType::Sandbox),
             target_id: Some(&sandbox_id_string),
             payload_json,
@@ -1059,7 +1059,7 @@ async fn enqueue_lifecycle_operation(
         org_id,
         actor_user_id: Some(actor_user_id),
         api_product: ApiProduct::Native,
-        kind: action.operation_kind(),
+        kind: action.operation_kind().into(),
         target_type: Some(OperationTargetType::Sandbox),
         target_id: Some(&sandbox_id_string),
         payload_json,
@@ -1070,7 +1070,7 @@ async fn enqueue_lifecycle_operation(
     let path = InlineAdmissionPath::LifecycleAction;
     let offered = inline.and_then(|inline| {
         inline
-            .offer(org_id, input.kind, path)
+            .offer(org_id, action.operation_kind(), path)
             .map(|offer| (inline, offer))
     });
     let result = match offered {

@@ -751,7 +751,7 @@ impl SandboxLifecycleOperationExecutor {
                 payload_sandbox_id: payload.sandbox_id,
             });
         }
-        if payload.action.operation_kind() != operation.kind {
+        if operation.kind != payload.action.operation_kind() {
             return Err(SandboxLifecycleExecutionError::KindMismatch {
                 operation_kind: operation.kind,
                 action: payload.action,
@@ -1227,7 +1227,7 @@ enum SandboxLifecycleExecutionError {
     },
     #[error("sandbox lifecycle operation kind '{operation_kind}' does not match action '{action}'")]
     KindMismatch {
-        operation_kind: OperationKind,
+        operation_kind: crate::public_operations::StoredOperationKind,
         action: SandboxLifecycleAction,
     },
     #[error("sandbox lifecycle operation target belongs to a different org")]

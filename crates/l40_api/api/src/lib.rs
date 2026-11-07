@@ -14,6 +14,8 @@ pub mod client_concurrency;
 pub mod cluster_admission;
 pub mod command_stream;
 pub mod controllers;
+#[cfg(feature = "kubernetes")]
+pub mod drain_restore_operations;
 pub mod e2b;
 pub mod egress_profiles;
 pub mod external_console;

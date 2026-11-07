@@ -808,7 +808,7 @@ async fn delete_replay_survives_target_removal_without_crossing_tenant_or_reques
             org_id,
             actor_user_id: Some(actor),
             api_product: ApiProduct::Native,
-            kind: action.operation_kind(),
+            kind: action.operation_kind().into(),
             target_type: Some(OperationTargetType::Sandbox),
             target_id: Some(&target),
             payload_json: SandboxLifecycleOperationPayload {

@@ -1194,7 +1194,7 @@ pub async fn delete_template(
             org_id: managing_org_id,
             actor_user_id: Some(actor.id),
             api_product: ApiProduct::Admin,
-            kind: OperationKind::DeleteTemplate,
+            kind: OperationKind::DeleteTemplate.into(),
             target_type: Some(OperationTargetType::Template),
             target_id: Some(&template_target),
             payload_json: DeleteTemplateOperationPayload::new(template_name.clone()).into_json(),

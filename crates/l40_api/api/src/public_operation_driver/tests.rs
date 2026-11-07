@@ -76,7 +76,7 @@ fn operation_input(kind: OperationKind, sandbox: &str) -> CreatePublicOperation<
         org_id: OrgId::from_uuid(SEED_ORG_ID),
         actor_user_id: None,
         api_product: ApiProduct::Native,
-        kind,
+        kind: kind.into(),
         target_type: Some(OperationTargetType::Sandbox),
         target_id: Some(sandbox),
         payload_json: serde_json::json!({}),
@@ -185,14 +185,24 @@ async fn each_exit_of_an_execution_returns_how_it_ended() -> TestDbResult<()> {
                     .create_operation(operation_input(OperationKind::DeleteSandbox, sandbox))
                     .await?;
                 let ended = run(&store, claim, config, executed(OperationState::Queued));
-                vec![(
-                    "superseded by a delete",
-                    ended.await?,
-                    TickReport {
-                        canceled: 1,
-                        ..TickReport::default()
-                    },
-                )]
+                let canceled = TickReport {
+                    canceled: 1,
+                    ..TickReport::default()
+                };
+                // An executor that found its work superseded.
+                let claim = claimed(&store, wake, "sbx_reports_canceled").await?;
+                let reported_id = claim.1.id;
+                let reported = run(&store, claim, config, executed(OperationState::Canceled));
+                let exits = vec![
+                    ("superseded by a delete", ended.await?, canceled.clone()),
+                    ("reported", reported.await?, canceled),
+                ];
+                let recorded = store
+                    .fetch_operation_admin(reported_id)
+                    .await?
+                    .ok_or("the canceled operation is visible")?;
+                assert_eq!(recorded.state, OperationState::Canceled);
+                exits
             }
             ExecutionOutcome::Lost => {
                 let mut exits = Vec::new();

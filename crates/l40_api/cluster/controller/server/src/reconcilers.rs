@@ -206,6 +206,9 @@ pub async fn run_reconcilers(
     } else {
         pplx_space_feature_flags::FeatureFlagClient::disabled()
     };
+    // The one binding of the Kubernetes substrate: the drain restore
+    // executor and the Kubernetes-only reconcilers below share it.
+    let kube = substrate.as_kubernetes().map(|kube| Arc::new(kube.clone()));
     let native_public_operation_executor =
         build_if_enabled(public_operation_dispatcher_config.enabled, || {
             public_operation_dispatcher::NativePublicOperationExecutor::new(
@@ -215,6 +218,12 @@ pub async fn run_reconcilers(
                 pplx_space_federated_identity::FederatedIdentityPolicy::from_env()?.grant_audience,
                 tls_interception_exemptions,
                 egress_profiles,
+                public_operation_dispatcher::DrainRestoreWiring {
+                    kubernetes: kube.clone(),
+                    max_attempts: public_operation_dispatcher_config
+                        .execution
+                        .max_retry_attempts,
+                },
             )
             .map_err(ReconcilerRuntimeError::from)
         })?;
@@ -400,12 +409,11 @@ pub async fn run_reconcilers(
         shutdown_token.child_token(),
     )));
 
-    match substrate.as_kubernetes() {
+    match kube {
         None => {
             tracing::info!("skipping Kubernetes-only reconcilers on direct substrate");
         }
         Some(kube) => {
-            let kube = Arc::new(kube.clone());
             let warm_pool_token = shutdown_token.child_token();
             let warm_pool_store = WarmPoolStore::new(pool.clone());
             let warm_pool_kube = kube.k8s.client.clone();

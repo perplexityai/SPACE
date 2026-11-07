@@ -1578,7 +1578,7 @@ async fn a_same_key_retry_racing_an_early_delete_replays_it() -> TestDbResult<()
             org_id: OrgId::from_uuid(SEED_ORG_ID),
             actor_user_id: actor.map(UserId::from_uuid),
             api_product: ApiProduct::Native,
-            kind: OperationKind::DeleteSandbox,
+            kind: OperationKind::DeleteSandbox.into(),
             target_type: Some(OperationTargetType::Sandbox),
             target_id: Some(&target_id),
             payload_json: SandboxLifecycleOperationPayload {

@@ -61,7 +61,7 @@
 //! | Retire fence | `retire_execution` ignores its fence, but still stops the sandbox and clears its routing | ac-pplx | A fence check against the Direct execution it names |
 //! | Stopped-disk backup on retire | `retire_execution` enqueues none; the stopped disk stays on the node (see below) | ac-pplx | A retried Direct retire (next row), then the enqueue |
 //! | Retire retry | Nothing retries a failed Direct retire (see below) | ac-pplx | The sweeper's failed-cleanup retry running for both substrates |
-//! | Drain and evacuation | [`SubstrateCapabilities::supports_node_drain`] is false. Admin `:drain`, `:terminate`, `:cordon`, `:uncordon` and `:force-upload-local-snapshots` return 501 before reading or writing the node. `:undrain` clears a `draining` or `drained` phase an earlier drain left, without a substrate call | ac-pplx | Core drain and evacuation for both substrates over a Direct `set_node_schedulability` |
+//! | Drain and evacuation | [`SubstrateCapabilities::supports_node_drain`] is false. Admin `:drain`, `:terminate`, `:cordon`, `:uncordon` and `:force-upload-local-snapshots` return 501 before reading or writing the node. `:undrain` clears a `draining` or `drained` phase an earlier drain left, without a substrate call. The dispatcher fails a drain restore operation (`unsupported_substrate`), which nothing enqueues on Direct | ac-pplx | Core drain and evacuation for both substrates over a Direct `set_node_schedulability` |
 //! | Drain, orphan, failed-row repair and node-sync loops | Not started on Direct (below) | ac-pplx | Those loops running for both substrates through the adapter |
 //!
 //! # Kubernetes-only reconcilers
