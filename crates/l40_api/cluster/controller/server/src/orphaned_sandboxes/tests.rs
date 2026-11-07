@@ -634,9 +634,9 @@ async fn candidate_scan_lists_missing_pod_without_node_observation() -> TestResu
 }
 
 /// Where the dead-node verb runs live, a row on a node with a stale heartbeat
-/// and a recorded instance is left to it; a row on a stale node with no
-/// recorded instance, which the verb can only judge unknown, is still
-/// listed, as is a row on a fresh node, whatever verdict a node with that id
+/// is left to it when the verb has an instance to judge it by, the node's or
+/// its latest execution's stamp; a row on a stale node with neither, which
+/// the verb can only judge unknown, is still listed, as is a row on a fresh node, whatever verdict a node with that id
 /// once had: a `lost` status left from before a same-IP replacement
 /// registered doesn't hide the replacement's rows. Without the verb live
 /// every row is listed.
@@ -648,12 +648,15 @@ async fn candidate_scan_leaves_dead_node_rows_to_the_live_verb() -> TestResult {
     let pool = &db.pool;
     let mut expected_left_out = Vec::new();
     let mut expected_listed = Vec::new();
-    for (heartbeat_fresh, instance, verdict, left_out) in [
-        (false, Some("i-0a1b2c3d"), None, true),
-        (false, None, None, false),
-        (true, Some("i-0a1b2c3d"), Some("lost"), false),
-        (true, None, None, false),
-        (true, None, Some("unknown"), false),
+    for (heartbeat_fresh, instance, stamp, verdict, left_out) in [
+        (false, Some("i-0a1b2c3d"), None, None, true),
+        (false, None, None, None, false),
+        // No recorded instance, but the execution the verb judges the row by
+        // is stamped: the verb's.
+        (false, None, Some("i-0b2c3d4e"), None, true),
+        (true, Some("i-0a1b2c3d"), None, Some("lost"), false),
+        (true, None, None, None, false),
+        (true, None, None, Some("unknown"), false),
     ] {
         let node_id = NodeId::new();
         let sandbox_id = SandboxId::new();
@@ -667,6 +670,15 @@ async fn candidate_scan_leaves_dead_node_rows_to_the_live_verb() -> TestResult {
         .execute(pool)
         .await?;
         insert_started_sandbox_with_active_execution(pool, sandbox_id, node_id).await?;
+        sqlx::query(sql!(
+            "UPDATE sandbox_k8s_executions SET k8s_node_name = $2, node_instance_id = $3
+              WHERE sandbox_id = $1"
+        ))
+        .bind(sandbox_id)
+        .bind(format!("worker-{node_id}"))
+        .bind(stamp)
+        .execute(pool)
+        .await?;
         if heartbeat_fresh {
             sqlx::query(sql!(
                 "INSERT INTO node_status_snapshots

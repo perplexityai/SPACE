@@ -1752,14 +1752,30 @@ static LIST_CANDIDATES_AFTER: std::sync::LazyLock<String> = std::sync::LazyLock:
               )
               -- Where the dead-node verb runs live ($10), a row on a node
               -- whose heartbeat is stale is the verb's to reconcile, if the
-              -- node has a recorded instance the verb can judge it by.
+              -- verb has an instance to judge it by: the node's recorded
+              -- one, or the one the row's latest execution there was
+              -- stamped with, which the verb judges the row by.
               AND NOT ($10 AND EXISTS (
                   SELECT 1
                   FROM nodes dn
                   JOIN node_k8s dk ON dk.node_id = dn.id
                   WHERE (dn.id = s.active_node_id OR dn.id = s.target_node_id)
-                    AND dk.instance_id IS NOT NULL
                     AND NOT {fresh}
+                    AND (
+                        dk.instance_id IS NOT NULL
+                        OR EXISTS (
+                            SELECT 1
+                              FROM (
+                                SELECT le.k8s_node_name, le.node_instance_id
+                                  FROM sandbox_k8s_executions le
+                                 WHERE le.sandbox_id = s.id
+                                 ORDER BY le.generation DESC
+                                 LIMIT 1
+                              ) latest
+                             WHERE latest.k8s_node_name = dk.k8s_node_name
+                               AND latest.node_instance_id IS NOT NULL
+                        )
+                    )
               ))
               AND ($2::uuid IS NULL OR s.id > $2)
               AND s.id <= $3
