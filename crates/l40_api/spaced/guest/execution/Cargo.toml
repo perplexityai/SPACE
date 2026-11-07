@@ -11,7 +11,7 @@ publish.workspace = true
 workspace = true
 
 [features]
-test-hooks = ["pplx-space-common-core/test-hooks"]
+test-hooks = ["pplx-space-test-hooks/test-hooks"]
 telemetry = ["dep:pplx-space-observability", "dep:pplx-space-service-host"]
 otel = ["telemetry", "pplx-space-service-host/otel"]
 datadog = ["otel", "pplx-space-service-host/datadog"]
@@ -37,17 +37,19 @@ uuid = { workspace = true, features = ["v7"] }
 # internal
 pplx-space-common-core = { workspace = true }
 pplx-space-common-grpc = { workspace = true }
+pplx-space-env-vars = { workspace = true }
 pplx-space-grpc-metrics = { workspace = true }
 pplx-space-observability = { workspace = true, optional = true }
 pplx-space-service-host = { workspace = true, optional = true }
 pplx-space-spaced-guest-protocol = { workspace = true }
+pplx-space-test-hooks = { workspace = true }
 prost = { workspace = true }
 prost-types = { workspace = true }
 
 [dev-dependencies]
 nix = { workspace = true, features = ["uio"] }
 pplx-space-test-env = { workspace = true }
-pplx-space-common-core = { workspace = true, features = ["test-hooks"] }
+pplx-space-test-hooks = { workspace = true, features = ["test-hooks"] }
 tempfile = { workspace = true }
 # Retention and cancellation tests advance virtual time.
 tokio = { workspace = true, features = ["test-util"] }

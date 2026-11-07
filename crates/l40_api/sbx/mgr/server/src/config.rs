@@ -90,7 +90,7 @@ pub fn load() -> Result<SandboxConfig, ConfigLoadError> {
 
 /// The environment's value when it is a flag, otherwise the file's.
 fn native_lifecycle_override(env: Option<&str>, file: bool) -> bool {
-    pplx_space_common_core::env::env_flag(env, file)
+    pplx_space_env_vars::env_flag(env, file)
 }
 
 fn load_from(path: &Path) -> Result<SandboxConfig, ConfigLoadError> {

@@ -98,11 +98,11 @@ impl EcwCredentialKeyring {
     }
 
     pub fn load_from_env() -> Result<Self, EcwCredentialError> {
-        Self::load_from_environment(&pplx_space_common_core::env::ProcessEnvironment)
+        Self::load_from_environment(&pplx_space_env_vars::ProcessEnvironment)
     }
 
     pub(crate) fn load_from_environment(
-        env: &dyn pplx_space_common_core::env::Environment,
+        env: &dyn pplx_space_env_vars::Environment,
     ) -> Result<Self, EcwCredentialError> {
         Ok(Self {
             current: load_key(
@@ -119,11 +119,11 @@ impl EcwCredentialKeyring {
     }
 
     pub fn load_required_from_env() -> Result<Self, EcwCredentialError> {
-        Self::load_required_from_environment(&pplx_space_common_core::env::ProcessEnvironment)
+        Self::load_required_from_environment(&pplx_space_env_vars::ProcessEnvironment)
     }
 
     pub(crate) fn load_required_from_environment(
-        env: &dyn pplx_space_common_core::env::Environment,
+        env: &dyn pplx_space_env_vars::Environment,
     ) -> Result<Self, EcwCredentialError> {
         let keyring = Self::load_from_environment(env)?;
         if keyring.current.is_none() {
@@ -210,7 +210,7 @@ fn lower_hex(bytes: &[u8]) -> String {
 }
 
 fn load_key(
-    source: &dyn pplx_space_common_core::env::Environment,
+    source: &dyn pplx_space_env_vars::Environment,
     env: &str,
     path_env: &str,
 ) -> Result<Option<Vec<u8>>, EcwCredentialError> {

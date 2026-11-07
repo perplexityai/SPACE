@@ -17,10 +17,11 @@ datadog = ["otel", "pplx-space-service-host/datadog"]
 # Deprecated for one release; use otel and datadog.
 datadog-otel = ["otel", "datadog"]
 # Compiles in the test-only environment hooks; never enabled for release builds.
-test-hooks = ["pplx-space-common-core/test-hooks"]
+test-hooks = ["pplx-space-test-hooks/test-hooks"]
 
 [dependencies]
 pplx-space-common-grpc = { workspace = true }
+pplx-space-env-vars = { workspace = true }
 pplx-space-execution-catalog = { workspace = true }
 rustix = { workspace = true, features = ["fs"] }
 async-trait = { workspace = true }
@@ -74,6 +75,7 @@ pplx-space-policy-authority = { workspace = true }
 pplx-space-sbx-mgr-client = { workspace = true }
 pplx-space-template-manifest = { workspace = true }
 pplx-space-template-mgr-client = { workspace = true }
+pplx-space-test-hooks = { workspace = true }
 pplx-space-uds-peer-auth = { workspace = true }
 pplx-space-unix-socket-bind = { workspace = true }
 pplx-space-volmgr-client = { workspace = true }
@@ -82,11 +84,12 @@ pplx-space-volmgr-client = { workspace = true }
 pplx-space-internal-api-server = { workspace = true }
 pplx-space-db-test-fixtures = { workspace = true }
 pplx-space-common-grpc = { workspace = true }
-pplx-space-common-core = { workspace = true, features = ["serde", "test-hooks"] }
+pplx-space-common-core = { workspace = true, features = ["serde"] }
 nix = { workspace = true, features = ["user"] }
 pplx-space-observability = { workspace = true, features = ["test-capture"] }
 pplx-space-rpc-auth = { workspace = true, features = ["test-support"] }
 pplx-space-test-env = { workspace = true }
+pplx-space-test-hooks = { workspace = true, features = ["test-hooks"] }
 rstest = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 tracing-subscriber = { workspace = true }

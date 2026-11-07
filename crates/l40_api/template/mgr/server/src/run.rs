@@ -150,7 +150,7 @@ async fn run_service(
     health_server.mark_starting();
 
     let production_hash_algorithm = crate::content_hash::production_algorithm_from_environment(
-        &pplx_space_common_core::env::ProcessEnvironment,
+        &pplx_space_env_vars::ProcessEnvironment,
     )
     .map_err(RunTemplateMgrError::TemplateHash)?;
     let backing_policy = crate::rootfs_backing::RootfsBackingPolicy::from_env()

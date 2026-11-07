@@ -211,14 +211,14 @@ const DEFAULT_RETRY_INTERVAL: Duration = Duration::from_secs(8);
 /// `MissedTickBehavior::Delay` leaves the ticker already due when a timed-out
 /// call returns, so the next attempt starts immediately.
 const DEFAULT_LEASE_FAILURE_GRACE: Duration = Duration::from_secs(600);
-/// Test hook (`pplx_space_common_core::env::test_hook`) for the budget
+/// Test hook (`pplx_space_test_hooks::test_hook`) for the budget
 /// [`Timings::derive`] is asked for, in whole seconds; it is bounded and
 /// spread like the default. Lets a Kind scenario wait out a budget at its
 /// floor instead of this default. Inert unless the `test-hooks` feature is
 /// compiled in.
 const LEASE_FAILURE_GRACE_TEST_ENV: &str =
     "SPACE_CLUSTER_CONTROLLER_LEADER_ELECTION_LEASE_FAILURE_GRACE_SECS";
-/// Test hook (`pplx_space_common_core::env::test_hook`) for the lease TTL
+/// Test hook (`pplx_space_test_hooks::test_hook`) for the lease TTL
 /// [`Timings::derive`] is asked for, in whole seconds; it is clamped into
 /// `MIN_LEASE_TTL..MAX_LEASE_TTL` like the default, and the retry interval
 /// and the budget's floor follow the resolved TTL. Lets a Kind scenario run
@@ -476,10 +476,10 @@ impl LeaderElectionConfig {
     }
 
     pub fn from_env() -> Self {
-        Self::from_environment(&pplx_space_common_core::env::ProcessEnvironment)
+        Self::from_environment(&pplx_space_env_vars::ProcessEnvironment)
     }
 
-    pub(crate) fn from_environment(env: &dyn pplx_space_common_core::env::Environment) -> Self {
+    pub(crate) fn from_environment(env: &dyn pplx_space_env_vars::Environment) -> Self {
         let config = crate::env_config::EnvConfig(env);
         let identity = election_identity(env);
         let requested_ttl = config.test_duration_secs(LEASE_TTL_TEST_ENV, DEFAULT_LEASE_TTL);
@@ -518,7 +518,7 @@ pub enum ProcessHost {
 
 impl ProcessHost {
     pub fn from_env() -> Self {
-        Self::from_environment(&pplx_space_common_core::env::ProcessEnvironment)
+        Self::from_environment(&pplx_space_env_vars::ProcessEnvironment)
     }
 
     /// A pod is recognised by the two service variables the kubelet injects
@@ -528,7 +528,7 @@ impl ProcessHost {
     /// included, and says nothing about how many replicas run. (A controller
     /// on a substrate that drives the Kubernetes API contends outside a pod
     /// anyway; [`LeaderElectionConfig::election`] decides that, not this.)
-    pub(crate) fn from_environment(env: &dyn pplx_space_common_core::env::Environment) -> Self {
+    pub(crate) fn from_environment(env: &dyn pplx_space_env_vars::Environment) -> Self {
         if env.var_os("KUBERNETES_SERVICE_HOST").is_some()
             && env.var_os("KUBERNETES_SERVICE_PORT").is_some()
         {
@@ -755,7 +755,7 @@ fn spread_across_replicas(grace: PositiveDuration, identity: &str) -> PositiveDu
 /// to the pod name), else a fresh UUID so two
 /// replicas can never accidentally share an identity and both believe they
 /// hold the lease.
-fn election_identity(env: &dyn pplx_space_common_core::env::Environment) -> String {
+fn election_identity(env: &dyn pplx_space_env_vars::Environment) -> String {
     if let Ok(value) = env.var("HOSTNAME") {
         let trimmed = value.trim();
         if !trimmed.is_empty() {

@@ -50,7 +50,7 @@ impl InlineCreate {
     /// Inline execution through the state's controller, or `None` when the
     /// kill switch is off.
     pub(crate) fn from_env(state: &AppState) -> Option<Self> {
-        if !pplx_space_common_core::env::env_flag_var(
+        if !pplx_space_env_vars::env_flag_var(
             NATIVE_CREATE_INLINE_ENV,
             DEFAULT_NATIVE_CREATE_INLINE_ENABLED,
         ) {

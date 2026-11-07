@@ -34,7 +34,7 @@ service-entrypoint = [
     "pplx-space-spaced-guest-execution/telemetry",
 ]
 # Compiles in the test-only environment hooks; never enabled for release builds.
-test-hooks = ["pplx-space-common-core/test-hooks", "pplx-space-spaced-guest-execution/test-hooks"]
+test-hooks = ["pplx-space-test-hooks/test-hooks", "pplx-space-spaced-guest-execution/test-hooks"]
 # Forwards to `service-host`'s telemetry pipeline. The entry point is where
 # this crate initializes telemetry, so the gate has to reach it rather than the
 # binary, and it implies the entry point it configures.
@@ -74,16 +74,17 @@ pplx-space-common-grpc = { workspace = true }
 pplx-space-grpc-metrics = { workspace = true }
 pplx-space-observability = { workspace = true }
 pplx-space-spaced-common = { workspace = true }
+pplx-space-test-hooks = { workspace = true }
 prost-types = { workspace = true }
 
 [dev-dependencies]
-pplx-space-common-core = { workspace = true, features = ["test-hooks"] }
 opentelemetry-proto = { workspace = true, features = ["gen-tonic", "metrics"] }
 pplx-space-spaced-guest-client = { workspace = true }
 pplx-space-observability = { workspace = true, features = ["test-capture"] }
 h2 = { workspace = true }
 prost = { workspace = true }
 pplx-space-test-env = { workspace = true }
+pplx-space-test-hooks = { workspace = true, features = ["test-hooks"] }
 tempfile = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

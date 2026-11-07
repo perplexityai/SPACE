@@ -2,7 +2,7 @@
 """Keep documented operator settings off the test-hook readers.
 
 `docs/configuration.md` lists every `SPACE_*` variable a release binary reads.
-Test hooks are the opposite: `pplx_space_common_core::env::test_hook` returns
+Test hooks are the opposite: `pplx_space_test_hooks::test_hook` returns
 `None` unless the `test-hooks` feature is compiled in, which release images
 never do, so a variable read through one is inert in production. A documented
 variable read through a hook is a setting operators are told they can change

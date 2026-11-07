@@ -52,7 +52,7 @@ impl CacheDiskAdmissionConfig {
             min_available_bytes: env_u64(ENV_MIN_AVAILABLE_BYTES, default.min_available_bytes),
             // Kind and tests shrink the reservation to fit a small cache
             // filesystem; release binaries never read it.
-            allocation_reservation_bytes: crate::env::test_hook_var(
+            allocation_reservation_bytes: pplx_space_test_hooks::test_hook_var(
                 TEST_HOOK_ALLOCATION_RESERVATION_BYTES,
             )
             .and_then(|value| value.trim().parse::<u64>().ok())

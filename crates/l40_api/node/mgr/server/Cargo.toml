@@ -17,7 +17,7 @@ datadog = ["otel", "pplx-space-observability/datadog"]
 # Deprecated for one release; use otel and datadog.
 datadog-otel = ["otel", "datadog"]
 # Compiles in the test-only environment hooks; never enabled for release builds.
-test-hooks = ["pplx-space-common-core/test-hooks"]
+test-hooks = ["pplx-space-test-hooks/test-hooks"]
 
 [dependencies]
 arc-swap = { workspace = true }
@@ -48,6 +48,7 @@ zeroize = { workspace = true }
 # internal
 pplx-space-common-core = { workspace = true }
 pplx-space-common-grpc = { workspace = true }
+pplx-space-env-vars = { workspace = true }
 pplx-space-file-io = { workspace = true, features = ["reflink"] }
 pplx-space-grpc-rate-limiter = { workspace = true }
 pplx-space-grpc-server = { workspace = true }
@@ -65,6 +66,7 @@ pplx-space-node-ctl-client = { workspace = true }
 pplx-space-node-mgr-client = { workspace = true }
 pplx-space-node-runtime-core = { workspace = true, features = ["artifact-store", "host-runtime"] }
 pplx-space-observability = { workspace = true, default-features = false }
+pplx-space-test-hooks = { workspace = true }
 pplx-space-uds-peer-auth = { workspace = true }
 pplx-space-unix-socket-bind = { workspace = true }
 sqlx = { workspace = true, features = ["macros", "migrate"] }
@@ -74,7 +76,6 @@ uuid = { workspace = true }
 rtnetlink = { workspace = true }
 
 [dev-dependencies]
-pplx-space-common-core = { workspace = true, features = ["test-hooks"] }
 insta = { workspace = true, features = ["json"] }
 rstest = { workspace = true }
 # test-capture lets the encrypted-volume tests assert which BYOK counters a
@@ -83,6 +84,7 @@ rstest = { workspace = true }
 pplx-space-metrics-emit = { workspace = true, features = ["test-capture"] }
 hyper-util = { workspace = true, features = ["tokio"] }
 pplx-space-test-env = { workspace = true }
+pplx-space-test-hooks = { workspace = true, features = ["test-hooks"] }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "test-util"] }
 tower = { workspace = true }

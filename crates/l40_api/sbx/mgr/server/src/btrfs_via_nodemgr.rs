@@ -345,7 +345,7 @@ fn retain_send_sources() -> bool {
 /// Capture still defers only when volume-manager and node-manager advertise
 /// the capabilities it needs.
 fn retain_send_sources_from(raw: Option<&str>) -> bool {
-    pplx_space_common_core::env::env_flag(raw, true)
+    pplx_space_env_vars::env_flag(raw, true)
 }
 
 pub(crate) async fn materialize_rootfs_send(

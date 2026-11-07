@@ -187,13 +187,11 @@ pub async fn serve(
 /// Firecracker/vsock auto-detect defaults untouched.
 fn service_config_from_environment() -> SpacedGuestServiceConfig {
     let mut config = SpacedGuestServiceConfig::default();
-    if let Some(path) =
-        pplx_space_common_core::env::test_hook_var("SPACE_SPACED_GUEST_BRIDGE_SOCKET")
-    {
+    if let Some(path) = pplx_space_test_hooks::test_hook_var("SPACE_SPACED_GUEST_BRIDGE_SOCKET") {
         config.bridge_socket_path = Some(std::path::PathBuf::from(path));
     }
     if let Some(path) =
-        pplx_space_common_core::env::test_hook_var("SPACE_SPACED_GUEST_HOST_BRIDGE_SOCKET")
+        pplx_space_test_hooks::test_hook_var("SPACE_SPACED_GUEST_HOST_BRIDGE_SOCKET")
     {
         config.host_connector_type = HostConnectorType::Uds(std::path::PathBuf::from(path));
     }

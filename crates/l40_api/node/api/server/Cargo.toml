@@ -72,6 +72,7 @@ pplx-space-unix-socket-bind = { workspace = true }
 prost = { workspace = true }
 rstest = { workspace = true }
 axum = { workspace = true }
+pplx-space-env-vars = { workspace = true }
 pplx-space-rpc-auth = { workspace = true, features = ["test-hooks", "test-support"] }
 pplx-space-test-env = { workspace = true }
 tempfile = { workspace = true }

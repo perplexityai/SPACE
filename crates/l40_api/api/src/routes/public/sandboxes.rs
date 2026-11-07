@@ -143,7 +143,7 @@ fn native_create_pool_claim_enabled(
     feature_flags: &pplx_space_feature_flags::FeatureFlagClient,
 ) -> bool {
     native_create_pool_claim_gate(
-        pplx_space_common_core::env::env_flag_var(
+        pplx_space_env_vars::env_flag_var(
             NATIVE_CREATE_POOL_CLAIM_ENV,
             DEFAULT_NATIVE_CREATE_POOL_CLAIM_ENABLED,
         ),

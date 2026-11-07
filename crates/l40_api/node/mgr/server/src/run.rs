@@ -583,7 +583,7 @@ fn activate_runtime_supervisor_on_start() -> Result<(), RunNodeMgrError> {
 }
 
 fn runtime_supervisor_activation_enabled(raw: Option<&str>) -> bool {
-    pplx_space_common_core::env::env_flag(raw, false)
+    pplx_space_env_vars::env_flag(raw, false)
 }
 
 /// Run node-manager until `shutdown_token` fires or a startup step fails.

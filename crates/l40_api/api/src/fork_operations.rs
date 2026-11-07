@@ -81,13 +81,13 @@ const FORK_ENABLED_ENV: &str = "SPACE_SANDBOX_FORK_ENABLED";
 
 impl ForkAvailabilityConfig {
     pub fn from_env() -> Result<Self, ForkAvailabilityError> {
-        Self::from_environment(&pplx_space_common_core::env::ProcessEnvironment)
+        Self::from_environment(&pplx_space_env_vars::ProcessEnvironment)
     }
 
     pub(crate) fn from_environment(
-        env: &dyn pplx_space_common_core::env::Environment,
+        env: &dyn pplx_space_env_vars::Environment,
     ) -> Result<Self, ForkAvailabilityError> {
-        if !pplx_space_common_core::env::env_flag(env.var(FORK_ENABLED_ENV).ok().as_deref(), true) {
+        if !pplx_space_env_vars::env_flag(env.var(FORK_ENABLED_ENV).ok().as_deref(), true) {
             return Err(ForkAvailabilityError::Disabled);
         }
         let hard_deadline = match env.var(FORK_HARD_DEADLINE_ENV) {
@@ -989,7 +989,7 @@ fn prepare_fork_operation(
     )?;
     let source_id = fork_operation_target_id(
         input.source_sandbox_id,
-        pplx_space_common_core::env::env_flag_var(FORK_PUBLIC_TARGET_ID_ENV, false),
+        pplx_space_env_vars::env_flag_var(FORK_PUBLIC_TARGET_ID_ENV, false),
     );
     let payload_json = serde_json::to_value(ForkSandboxPayload::v1(payload))?;
     Ok(PreparedForkOperation {

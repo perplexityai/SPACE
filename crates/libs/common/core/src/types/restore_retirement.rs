@@ -44,7 +44,7 @@ impl AbandonedRestoreRetirement {
     /// The switch as every component reads it, so they agree on what turns
     /// it on.
     pub fn from_env() -> Self {
-        Self::from_enabled(crate::env::env_flag_var(Self::ENV, false))
+        Self::from_enabled(pplx_space_env_vars::env_flag_var(Self::ENV, false))
     }
 
     pub fn is_enabled(self) -> bool {
