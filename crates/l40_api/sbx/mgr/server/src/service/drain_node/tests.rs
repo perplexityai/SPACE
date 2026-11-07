@@ -280,7 +280,7 @@ fn a_pool_member_and_a_rowless_backup() {
 }
 
 /// The inventory's process, cache and run directory findings, and those
-/// scanners' failures, block; everything else is debris.
+/// scanners' failures, block; everything else is ignored.
 #[test]
 fn the_orphan_inventory_blocks_only_on_what_can_hold_a_resident() {
     let gateway_root = "/run/gateway";
@@ -326,19 +326,6 @@ fn the_orphan_inventory_blocks_only_on_what_can_hold_a_resident() {
             "orphan inventory scan failed: Processes: denied",
         ]
     );
-    assert_eq!(
-        findings.debris,
-        [
-            "gateway run directory /run/gateway/y",
-            "ns-1",
-            "cg-1",
-            "sveth-1",
-            "orphan inventory scan failed: Nft: chain missing",
-            "orphan inventory scan failed: GatewayRunDirs: No such file or directory",
-            "orphan inventory scan failed: Namespaces: denied",
-            "orphan inventory scan failed: Cgroups: denied",
-        ]
-    );
 
     let mut clean = OrphanFindings::default();
     classify_orphan_page(&Default::default(), gateway_root, &mut clean);
@@ -353,21 +340,13 @@ fn sealed_service(epoch: u64) -> (SandboxManagerService, ActivationSealStatus) {
 }
 
 /// An empty node sealed under the call's epoch is done; a scan's failure
-/// makes it blocked and not done, and debris never does.
+/// makes it blocked and not done.
 #[tokio::test]
 async fn an_empty_sealed_node_is_done_unless_a_scan_failed() {
     let (service, first) = sealed_service(7);
-    let done = service.finish_drain(
-        7,
-        &first,
-        DrainScans {
-            debris: vec!["sveth-1".into()],
-            ..DrainScans::default()
-        },
-    );
+    let done = service.finish_drain(7, &first, DrainScans::default());
     assert!(done.done, "{done:?}");
     assert_eq!(done.sealed_epoch, Some(7));
-    assert_eq!(done.debris, ["sveth-1"]);
 
     let blocked = service.finish_drain(
         7,
@@ -381,23 +360,24 @@ async fn an_empty_sealed_node_is_done_unless_a_scan_failed() {
     assert_eq!(blocked.blocked.len(), 1);
 }
 
-/// Work an activation admitted before the seal still has in flight at the
-/// walk's first read keeps the drain from being done until it settles.
+/// An activation admitted before the seal and still in flight at the walk's
+/// first read is pending, and keeps the drain from being done until it
+/// settles.
 #[tokio::test]
 async fn an_activation_in_flight_before_the_seal_keeps_done_false() {
     let service = SandboxManagerService::for_test(crate::db::test_conn());
-    let token = service
-        .activation_seal
-        .admit(
-            crate::activation_seal::InFlightActivationKind::Restore,
-            "sbx-a",
-        )
-        .unwrap();
+    let token = service.activation_seal.admit("restore", "sbx-a").unwrap();
     service.activation_seal.seal(&service.db, 7).unwrap();
     let first = service.activation_seal.status();
     let report = service.finish_drain(7, &first, DrainScans::default());
     assert!(!report.done);
-    assert_eq!(report.in_flight.len(), 1);
+    assert_eq!(
+        report.pending,
+        [DrainPending {
+            sandbox_id: "sbx-a".into(),
+            action: "activation".into(),
+        }]
+    );
 
     drop(token);
     let first = service.activation_seal.status();

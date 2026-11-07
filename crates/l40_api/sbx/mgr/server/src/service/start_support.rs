@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use super::*;
-use crate::activation_seal::{ActivationInFlightToken, InFlightActivationKind};
+use crate::activation_seal::ActivationInFlightToken;
 use pplx_space_common_core::env::valid_positive_f64;
 use pplx_space_sandbox_metrics::admission::{
     AdmissionDecision, AdmissionOperationClass, AdmissionPermitOutcome, AdmissionQueueOutcome,
@@ -285,11 +285,11 @@ impl ActivationAdmissionKind {
     #[cfg(test)]
     pub(super) const ALL: [Self; 3] = [Self::Cold, Self::Restore, Self::ResidentResume];
 
-    pub(super) const fn in_flight_kind(self) -> InFlightActivationKind {
+    pub(super) const fn as_str(self) -> &'static str {
         match self {
-            Self::Cold => InFlightActivationKind::Cold,
-            Self::Restore => InFlightActivationKind::Restore,
-            Self::ResidentResume => InFlightActivationKind::ResidentResume,
+            Self::Cold => "cold",
+            Self::Restore => "restore",
+            Self::ResidentResume => "resident_resume",
         }
     }
 
@@ -376,8 +376,7 @@ impl SandboxManagerService {
             admitted.lock().unwrap().push(kind);
         }
         // Refuse before any limiter wait, which a sealed node has no use for.
-        self.activation_seal
-            .check(kind.in_flight_kind(), sandbox_id)?;
+        self.activation_seal.check(kind.as_str(), sandbox_id)?;
         let permit = match kind.limited() {
             Some(limited) => {
                 self.activation_admission_limiter
@@ -386,10 +385,7 @@ impl SandboxManagerService {
             }
             None => ActivationAdmissionPermit::Unlimited,
         };
-        match self
-            .activation_seal
-            .admit(kind.in_flight_kind(), sandbox_id)
-        {
+        match self.activation_seal.admit(kind.as_str(), sandbox_id) {
             Ok(in_flight) => Ok(VmActivationAdmission { permit, in_flight }),
             Err(refusal) => {
                 permit.finish(AdmissionPermitOutcome::Cancelled);

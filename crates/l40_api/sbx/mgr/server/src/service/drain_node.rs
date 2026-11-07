@@ -329,7 +329,6 @@ pub(super) struct DrainScans {
     /// named for. node-manager knows only its slots: a directory whose
     /// sandbox has a row here is the row's, and the plan accounts for it.
     pub(super) orphan_dirs: Vec<(String, String)>,
-    pub(super) debris: Vec<String>,
 }
 
 /// node-manager's orphan inventory, read as the drain needs it.
@@ -338,7 +337,6 @@ pub(super) struct OrphanFindings {
     pub(super) blocked: Vec<String>,
     /// Cache and run directories, by the sandbox they're named for.
     pub(super) dirs: Vec<(String, String)>,
-    pub(super) debris: Vec<String>,
 }
 
 /// The sandbox a node-manager directory candidate is named for.
@@ -352,7 +350,7 @@ fn dir_sandbox(dir: &str) -> String {
 /// The inventory's scanners that can reveal a resident or an artifact: an
 /// untracked runtime process, or a cache or run directory recovery could not
 /// adopt as a row. Their candidates and failures block the drain; every
-/// other scanner's are debris.
+/// other scanner's leftovers hold neither, and are ignored.
 const BLOCKING_SCANNERS: [&str; 3] = ["RunDirs", "CacheDirs", "Processes"];
 
 /// Fold one inventory page into `findings`.
@@ -373,32 +371,18 @@ pub(super) fn classify_orphan_page(
         ));
     }
     for dir in &page.orphaned_run_dirs {
-        if Path::new(dir).starts_with(gateway_run_root) {
-            findings.debris.push(format!("gateway run directory {dir}"));
-        } else {
+        if !Path::new(dir).starts_with(gateway_run_root) {
             findings.dirs.push((
                 dir_sandbox(dir),
                 format!("orphan run directory {dir} recovery can't adopt"),
             ));
         }
     }
-    for leftover in page
-        .orphaned_namespaces
-        .iter()
-        .chain(&page.orphaned_cgroups)
-        .chain(&page.orphaned_nft_rules)
-    {
-        findings.debris.push(leftover.clone());
-    }
     for warning in &page.warnings {
         let scanner = warning.split_once(':').map_or("", |(scanner, _)| scanner);
         if BLOCKING_SCANNERS.contains(&scanner) {
             findings
                 .blocked
-                .push(format!("orphan inventory scan failed: {warning}"));
-        } else {
-            findings
-                .debris
                 .push(format!("orphan inventory scan failed: {warning}"));
         }
     }
@@ -423,12 +407,7 @@ impl SandboxManagerService {
         if cancel {
             self.activation_seal.unseal(&self.db, epoch)?;
             let status = self.activation_seal.status();
-            return Ok(Response::new(report(
-                &status,
-                DrainPlan::default(),
-                Vec::new(),
-                false,
-            )));
+            return Ok(Response::new(report(&status, DrainPlan::default(), false)));
         }
         self.activation_seal.seal(&self.db, epoch)?;
         let first = self.activation_seal.status();
@@ -439,7 +418,6 @@ impl SandboxManagerService {
             .blocked
             .extend(orphans.blocked.into_iter().map(|reason| (None, reason)));
         scans.orphan_dirs = orphans.dirs;
-        scans.debris = orphans.debris;
         Ok(Response::new(self.finish_drain(epoch, &first, scans)))
     }
 
@@ -472,17 +450,22 @@ impl SandboxManagerService {
             .map(|(sandbox_id, reason)| (Some(sandbox_id), reason));
         plan.blocked
             .splice(0..0, scans.blocked.into_iter().chain(orphan_dirs));
+        // An activation admitted before the seal can still launch or resume a
+        // VM until it settles.
+        plan.pending.splice(
+            0..0,
+            first
+                .in_flight
+                .iter()
+                .map(|sandbox_id| (sandbox_id.clone(), "activation".to_owned())),
+        );
 
         let last = self.activation_seal.status();
         // A cancelled epoch is never sealed again, so the same epoch at both
         // reads is one continuous seal.
         let continuous = first.sealed_epoch == Some(epoch) && last.sealed_epoch == Some(epoch);
-        let done = continuous
-            && first.in_flight.is_empty()
-            && !plan.vm
-            && plan.pending.is_empty()
-            && plan.blocked.is_empty();
-        report(first, plan, scans.debris, done)
+        let done = continuous && !plan.vm && plan.pending.is_empty() && plan.blocked.is_empty();
+        report(first, plan, done)
     }
 
     /// Run the inventory reconcile that adopts recoverable orphan artifacts as
@@ -810,23 +793,9 @@ fn test_quarantined_sandboxes() -> BTreeSet<String> {
     BTreeSet::new()
 }
 
-fn report(
-    status: &ActivationSealStatus,
-    plan: DrainPlan,
-    debris: Vec<String>,
-    done: bool,
-) -> DrainNodeResponse {
+fn report(status: &ActivationSealStatus, plan: DrainPlan, done: bool) -> DrainNodeResponse {
     DrainNodeResponse {
         sealed_epoch: status.sealed_epoch,
-        in_flight: status
-            .in_flight
-            .iter()
-            .map(|in_flight| crate::proto::InFlightActivation {
-                kind: in_flight_kind_to_wire(in_flight.kind) as i32,
-                sandbox_id: in_flight.sandbox_id.clone(),
-                age: prost_types::Duration::try_from(in_flight.age).ok(),
-            })
-            .collect(),
         evacuated: plan
             .evacuated
             .into_iter()
@@ -846,20 +815,7 @@ fn report(
             .into_iter()
             .map(|(sandbox_id, reason)| DrainBlocked { sandbox_id, reason })
             .collect(),
-        debris,
         done,
-    }
-}
-
-const fn in_flight_kind_to_wire(
-    kind: crate::activation_seal::InFlightActivationKind,
-) -> crate::proto::InFlightActivationKind {
-    use crate::activation_seal::InFlightActivationKind as Kind;
-    use crate::proto::InFlightActivationKind as Wire;
-    match kind {
-        Kind::Cold => Wire::Cold,
-        Kind::Restore => Wire::Restore,
-        Kind::ResidentResume => Wire::ResidentResume,
     }
 }
 

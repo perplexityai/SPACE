@@ -150,9 +150,7 @@ fn an_unreadable_seal_refuses_activations() {
         .unwrap();
     let seal = ActivationSeal::load(&db.lock().unwrap());
     assert!(seal.load_error().is_some());
-    let refused = seal
-        .admit(InFlightActivationKind::Restore, SANDBOX)
-        .unwrap_err();
+    let refused = seal.admit("restore", SANDBOX).unwrap_err();
     assert_eq!(refused.code(), tonic::Code::FailedPrecondition);
     assert!(
         refused.message().contains(ACTIVATIONS_SEALED_MARKER),
@@ -171,7 +169,7 @@ async fn in_flight_tokens_are_released_on_error_cancellation_and_panic() {
     let failed = {
         let seal = Arc::clone(&seal);
         move || -> Result<(), &'static str> {
-            let _token = seal.admit(InFlightActivationKind::Cold, SANDBOX).unwrap();
+            let _token = seal.admit("cold", SANDBOX).unwrap();
             Err("launch failed")
         }
     };
@@ -182,9 +180,7 @@ async fn in_flight_tokens_are_released_on_error_cancellation_and_panic() {
     let cancelled = tokio::spawn({
         let seal = Arc::clone(&seal);
         async move {
-            let _token = seal
-                .admit(InFlightActivationKind::ResidentResume, SANDBOX)
-                .unwrap();
+            let _token = seal.admit("resident_resume", SANDBOX).unwrap();
             let _ = held_tx.send(());
             std::future::pending::<()>().await;
         }
@@ -198,7 +194,7 @@ async fn in_flight_tokens_are_released_on_error_cancellation_and_panic() {
     let panicked = tokio::spawn({
         let seal = Arc::clone(&seal);
         async move {
-            let _token = seal.admit(InFlightActivationKind::Cold, SANDBOX).unwrap();
+            let _token = seal.admit("cold", SANDBOX).unwrap();
             panic!("activation step panicked");
         }
     });
@@ -207,10 +203,7 @@ async fn in_flight_tokens_are_released_on_error_cancellation_and_panic() {
 
     seal.assert_quiesced();
     #[allow(clippy::mem_forget, reason = "the leak a forgotten token is")]
-    std::mem::forget(
-        seal.admit(InFlightActivationKind::Restore, SANDBOX)
-            .unwrap(),
-    );
+    std::mem::forget(seal.admit("restore", SANDBOX).unwrap());
     assert!(
         std::panic::catch_unwind(|| seal.assert_quiesced()).is_err(),
         "the leak check fails on a forgotten token"
