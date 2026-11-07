@@ -1,6 +1,6 @@
 use super::*;
 use crate::proto::{ComponentArtifact, RuntimeReleaseArtifact};
-use pplx_space_common_core::types::RuntimeKind;
+use pplx_space_execution_spec::RuntimeKind;
 
 fn release(runtime_kind: i32, version: &str) -> NodeArtifact {
     NodeArtifact {
@@ -181,7 +181,7 @@ async fn compiled_environment_removal_is_refused_even_without_inventory() {
     let candidate = RuntimeCatalog::compiled()
         .unwrap()
         .releases(
-            pplx_space_common_core::types::RuntimeKind::Firecracker,
+            pplx_space_execution_spec::RuntimeKind::Firecracker,
             host_arch().unwrap(),
         )
         .find(|pin| pin.release.version.as_str() == "1.17.0")
@@ -210,7 +210,7 @@ fn prototype_overlap_keeps_external_execution_but_refuses_mutations() {
     let selected = inventory
         .resolve(
             None,
-            pplx_space_common_core::types::RuntimeKind::Firecracker,
+            pplx_space_execution_spec::RuntimeKind::Firecracker,
             ExecutionSelectionMode::NewColdBoot,
         )
         .unwrap();
@@ -220,7 +220,7 @@ fn prototype_overlap_keeps_external_execution_but_refuses_mutations() {
 #[tokio::test]
 async fn publication_preserves_available_inventory_until_replacement_is_ready() {
     use crate::service::tests::service_tests::{installed_runtime, service_for_unit_tests};
-    use pplx_space_common_core::types::RuntimeKind;
+    use pplx_space_execution_spec::RuntimeKind;
     use pplx_space_node_runtime_core::runtime_inventory::{
         RuntimeInstallationRoot, RuntimeInventory,
     };
@@ -383,8 +383,8 @@ fn policy_checks_exact_admission_and_configured_default() {
 #[tokio::test]
 async fn legacy_custom_inputs_survive_unless_legacy_permission_is_removed() {
     use crate::service::tests::service_tests::{installed_runtime, service_for_unit_tests};
-    use pplx_space_common_core::types::{ExecutionMetadata, RuntimeKind};
     use pplx_space_content_digest::Digest;
+    use pplx_space_execution_spec::{ExecutionMetadata, RuntimeKind};
     use pplx_space_node_runtime_core::runtime_inventory::{
         RuntimeInstallationRoot, RuntimeInventory,
     };
@@ -486,12 +486,12 @@ async fn legacy_custom_inputs_survive_unless_legacy_permission_is_removed() {
 
         for version in ["1.16.0", "1.17.0"] {
             let requested = ExecutionMetadata::new(
-                pplx_space_common_core::types::RuntimeIdentity {
+                pplx_space_execution_spec::RuntimeIdentity {
                     kind: RuntimeKind::Firecracker,
                     version: version.parse().unwrap(),
                 },
                 legacy.guest(),
-                Some(pplx_space_common_core::types::StateFormatIdentity {
+                Some(pplx_space_execution_spec::StateFormatIdentity {
                     format: "firecracker-snapshot".parse().unwrap(),
                     version: if version == "1.16.0" {
                         "10.0.0"
@@ -554,7 +554,7 @@ async fn legacy_runtime_placement_is_not_hidden_by_a_compiled_environment() {
     use crate::service::tests::service_tests::{
         installed_runtime, root_request, service_for_unit_tests,
     };
-    use pplx_space_common_core::types::RuntimeKind;
+    use pplx_space_execution_spec::RuntimeKind;
     use pplx_space_node_runtime_core::runtime_inventory::{
         RuntimeInstallationRoot, RuntimeInventory,
     };

@@ -16,12 +16,12 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use futures_util::Stream;
-use pplx_space_common_core::types::{
-    ArtifactVersion, RuntimeIdentity, RuntimeKind, RuntimeVersion, RuntimeVersionParseError,
-    StorageUri,
-};
+use pplx_space_common_core::types::StorageUri;
 use pplx_space_content_digest::Digest;
 use pplx_space_cpu_arch::Arch;
+use pplx_space_execution_spec::{
+    ArtifactVersion, RuntimeIdentity, RuntimeKind, RuntimeVersion, RuntimeVersionParseError,
+};
 
 /// Firecracker's public CI artifact bucket. Path-style, because the bucket's
 /// name contains dots, which virtual-hosted TLS cannot serve.

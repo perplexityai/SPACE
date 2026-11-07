@@ -173,18 +173,18 @@ pub(super) fn bridge_enable_file_changes_request(
 
 pub(super) fn bridge_process_start_request(
     mut request: StartRequest,
-    guest_agent: pplx_space_common_core::types::guest_image::QualifiedGuestAgent,
+    guest_agent: pplx_space_execution_spec::guest_image::QualifiedGuestAgent,
 ) -> Result<StartRequest, Status> {
     let command = ProcessCommand::new(request.command).map_err(invalid_argument_status)?;
     request.command = Pii::new(&command).expose_pii().argv().to_vec();
     request.env = match guest_agent {
-        pplx_space_common_core::types::guest_image::QualifiedGuestAgent::WindowsV1 => {
+        pplx_space_execution_spec::guest_image::QualifiedGuestAgent::WindowsV1 => {
             pplx_space_guest_process::WindowsEnv::parse(request.env)
                 .map_err(invalid_argument_status)?
                 .into_map()
         }
-        pplx_space_common_core::types::guest_image::QualifiedGuestAgent::LinuxV1
-        | pplx_space_common_core::types::guest_image::QualifiedGuestAgent::Absent => {
+        pplx_space_execution_spec::guest_image::QualifiedGuestAgent::LinuxV1
+        | pplx_space_execution_spec::guest_image::QualifiedGuestAgent::Absent => {
             proto_env(&parse_env(request.env))
         }
     };

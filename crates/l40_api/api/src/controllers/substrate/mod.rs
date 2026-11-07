@@ -477,7 +477,7 @@ pub struct CreateExecutionRequest<'a> {
     pub actor: &'a ActorRef,
     pub template_ref: &'a TemplateRef<'a>,
     pub resources: &'a SandboxResources,
-    pub disk_io_limits: pplx_space_common_core::types::DiskIoLimits,
+    pub disk_io_limits: pplx_space_execution_spec::DiskIoLimits,
     pub env: &'a BTreeMap<String, String>,
     pub auto_lifecycle: &'a AutoLifecyclePolicy,
     pub network_policy_override: Option<&'a NetworkPolicyV1>,

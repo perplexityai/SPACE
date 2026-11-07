@@ -171,7 +171,7 @@ fn create_refused_before_template_lookup() -> CreateRequest {
     CreateRequest {
         template: "seed".into(),
         owner: "root@local".into(),
-        runtime: pplx_space_common_core::types::RUNTIME_FIRECRACKER_ALIAS.into(),
+        runtime: pplx_space_execution_spec::RUNTIME_FIRECRACKER_ALIAS.into(),
         boot_mode: BootMode::Cold as i32,
         sandbox_id: Some(SandboxId::new().to_string()),
         auto_lifecycle: Some(Default::default()),
@@ -1235,8 +1235,9 @@ fn template_catalog_preserves_owner_identity_with_corrupt_supplemental_metadata(
 /// cache partition's dir.
 #[test]
 fn template_catalog_reads_a_twin_s_metadata_from_its_partition() {
-    use pplx_space_common_core::types::{EnvironmentReference, TemplateCachePartition};
+    use pplx_space_common_core::types::TemplateCachePartition;
     use pplx_space_content_digest::Digest;
+    use pplx_space_execution_spec::EnvironmentReference;
     let cache = tempfile::tempdir().unwrap();
     let hash = format!("sha256:{}", "a".repeat(64));
     let twin = EnvironmentReference::new(Digest::sha256([2; 32]));

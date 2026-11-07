@@ -2,7 +2,8 @@
 //! contained VMM reads provider state; privileged code accepts a bounded, typed
 //! configuration and stages fresh inodes through pinned directories.
 use super::*;
-use pplx_space_common_core::types::{NodeSpacePath, RuntimeKind};
+use pplx_space_common_core::types::NodeSpacePath;
+use pplx_space_execution_spec::RuntimeKind;
 use pplx_space_node_runtime_core::{boot::BootSource, control::StateWorkspace};
 use std::io::{Read, Write};
 
@@ -249,7 +250,7 @@ impl NodeManagerService {
         lease: &SlotInfo,
         source: RestoreSource,
         boot_source: BootSource,
-        rootfs_limiter: Option<pplx_space_common_core::types::RateLimiter>,
+        rootfs_limiter: Option<pplx_space_execution_spec::RateLimiter>,
     ) -> Result<Response<RestoreVmStateResponse>, Status> {
         let req = request.into_inner();
         let (source, mount, workspace_kind) = match source {

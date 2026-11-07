@@ -1,9 +1,10 @@
 //! Fixtures shared by public publication behavior tests and private unit tests.
 
 use pplx_space_accounts::NodeId;
+use pplx_space_common_core::sql;
 use pplx_space_common_core::types::{LocalArtifactId, SandboxId, SnapshotId};
-use pplx_space_common_core::{sql, types::ExecutionMetadata};
 use pplx_space_cpu_arch::Arch;
+use pplx_space_execution_spec::ExecutionMetadata;
 use pplx_space_node_api_client::proto::PublishedSandboxState;
 use pplx_space_test_env::TestResult;
 use sqlx::PgPool;
@@ -208,10 +209,9 @@ pub(super) fn published_sandbox_state(
 }
 
 pub(super) fn test_execution() -> ExecutionMetadata {
-    use pplx_space_common_core::types::{
-        ArtifactComponentKind, ArtifactComponentMetadata, ArtifactFormat, ArtifactVersion,
-    };
     use pplx_space_content_digest::Digest;
+    use pplx_space_execution_spec::{ArtifactComponentKind, ArtifactComponentMetadata};
+    use pplx_space_execution_spec::{ArtifactFormat, ArtifactVersion};
 
     ExecutionMetadata::initial_firecracker(
         Arch::X86_64,

@@ -284,7 +284,7 @@ fn every_qualified_environment_has_pinned_verity_sources() {
             .components()
         {
             assert!(compiled_verity_digest(identity.digest).unwrap().is_some());
-            if identity.kind != pplx_space_common_core::types::ArtifactComponentKind::Kernel {
+            if identity.kind != pplx_space_execution_spec::ArtifactComponentKind::Kernel {
                 assert!(environment.boot_artifact(identity).is_some());
             }
         }
@@ -293,7 +293,7 @@ fn every_qualified_environment_has_pinned_verity_sources() {
 
 #[test]
 fn auxiliary_boot_pins_are_typed_and_cannot_conflict() {
-    use pplx_space_common_core::types::{ArtifactComponentKind, ComponentIdentity};
+    use pplx_space_execution_spec::{ArtifactComponentKind, ComponentIdentity};
     let dir = catalog_dir();
     let identity = ComponentIdentity {
         kind: ArtifactComponentKind::Firmware,

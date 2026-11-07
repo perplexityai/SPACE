@@ -11,8 +11,8 @@ use std::net::Ipv4Addr;
 use crate::proto::{RuntimeEnvironmentDesiredPolicy, RuntimeProvisioningRecipe};
 use crate::runtime_desired_state::RuntimeDesiredState;
 use crate::runtime_provisioning_cohort::{RuntimeProvisioningCohort, hash_bucket};
-use pplx_space_common_core::types::EnvironmentReference;
 use pplx_space_content_digest::Digest;
+use pplx_space_execution_spec::EnvironmentReference;
 use pplx_space_node_api_client::MAX_RECIPE_ENVIRONMENTS;
 use pplx_space_runtime_environment_policy_store::{
     self as policy_store, PolicyChange, PolicyChangeReason, RuntimeEnvironmentState,

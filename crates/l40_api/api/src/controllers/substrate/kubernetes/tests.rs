@@ -12203,8 +12203,8 @@ mod kubernetes_tests {
     ) -> Result<PoolClaimFixture, BoxError> {
         use pplx_space_byte_size::MemorySize;
         use pplx_space_cluster_pool::{NewPoolSlot, WarmPoolStore};
-        use pplx_space_common_core::types::VcpuCount;
         use pplx_space_content_digest::{ContentHash, Digest};
+        use pplx_space_execution_spec::VcpuCount;
 
         use crate::controllers::substrate::ActorRef;
 

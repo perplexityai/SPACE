@@ -21,6 +21,7 @@ tracing = { workspace = true }
 pplx-space-common-core = { workspace = true, features = ["serde"] }
 pplx-space-content-digest = { workspace = true, features = ["serde"] }
 pplx-space-execution-common = { workspace = true }
+pplx-space-execution-spec = { workspace = true, features = ["serde"] }
 pplx-space-node-api-client = { workspace = true }
 pplx-space-object-store = { workspace = true }
 pplx-space-template-manifest = { workspace = true }

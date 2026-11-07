@@ -11,7 +11,7 @@ fn armed_clone() -> (SandboxManagerService, SandboxId, SandboxCleanupEpisodeId) 
 }
 
 fn armed_clone_with_image(
-    guest_image: pplx_space_common_core::types::guest_image::GuestImageContract,
+    guest_image: pplx_space_execution_spec::guest_image::GuestImageContract,
 ) -> (SandboxManagerService, SandboxId, SandboxCleanupEpisodeId) {
     let conn = crate::db::test_conn();
     let id = SandboxId::new();

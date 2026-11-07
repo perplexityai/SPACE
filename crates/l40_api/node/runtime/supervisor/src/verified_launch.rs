@@ -3,7 +3,7 @@
 
 use std::path::{Path, PathBuf};
 
-use pplx_space_common_core::types::EnvironmentReference;
+use pplx_space_execution_spec::EnvironmentReference;
 use pplx_space_node_runtime_core::{
     artifact_store::VerifyError,
     catalog::{CompiledEnvironment, compiled_verity_digest},

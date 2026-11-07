@@ -420,8 +420,8 @@ fn disk_artifact_meta() -> (
         "d-operation-019f8000-0000-7000-8000-000000000006"
             .parse()
             .unwrap();
-    let execution = pplx_space_common_core::types::SnapshotExecutionMetadata::new(
-        pplx_space_common_core::types::ExecutionMetadata::initial_firecracker(
+    let execution = pplx_space_execution_spec::SnapshotExecutionMetadata::new(
+        pplx_space_execution_spec::ExecutionMetadata::initial_firecracker(
             std::env::consts::ARCH.parse().unwrap(),
             vec![],
         ),
@@ -436,7 +436,7 @@ fn disk_artifact_meta() -> (
             rootfs_size_bytes: None,
             created_at: "2026-07-31T00:00:00Z".to_string(),
             source: crate::snapshot_upload::SnapshotSource {
-                runtime: pplx_space_common_core::types::RUNTIME_FIRECRACKER_ALIAS.to_string(),
+                runtime: pplx_space_execution_spec::RUNTIME_FIRECRACKER_ALIAS.to_string(),
                 runtime_version: None,
                 state_format_version: None,
                 template_id: "seed".to_string(),

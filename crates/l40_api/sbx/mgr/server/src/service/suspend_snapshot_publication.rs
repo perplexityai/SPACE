@@ -2,10 +2,11 @@ use std::path::{Path, PathBuf};
 
 use pplx_space_accounts::SandboxOwner;
 use pplx_space_common_core::types::{
-    ArtifactKind, ArtifactOrigin, ExecutionGeneration, ExecutionMetadata, LocalArtifactId,
-    RuntimeKind, SandboxId, SandboxRuntimeLabel, TemplateName,
+    ArtifactKind, ArtifactOrigin, ExecutionGeneration, LocalArtifactId, SandboxId,
+    SandboxRuntimeLabel, TemplateName,
 };
 use pplx_space_content_digest::ContentHash;
+use pplx_space_execution_spec::{ExecutionMetadata, RuntimeKind};
 use pplx_space_guest_process::DEFAULT_GUEST_USER;
 
 use crate::retained_source::{
@@ -182,7 +183,7 @@ pub(super) struct RecoveredSandboxRowFields {
     pub(super) runtime: RuntimeKind,
     pub(super) snapshots_enabled: bool,
     pub(super) rootfs_size_mb: Option<u32>,
-    pub(super) disk_io_limits: pplx_space_common_core::types::DiskIoLimits,
+    pub(super) disk_io_limits: pplx_space_execution_spec::DiskIoLimits,
     // The artifact marker carries the immutable encryption setting across nodes.
     pub(super) volume_encryption: bool,
     pub(super) process_env: std::collections::BTreeMap<String, String>,
@@ -576,7 +577,7 @@ pub(super) fn recovered_sandbox_row_fields(
         runtime: RuntimeKind::parse(&metadata.source.runtime)?,
         snapshots_enabled,
         rootfs_size_mb: metadata.source.rootfs_size_mib,
-        disk_io_limits: pplx_space_common_core::types::DiskIoLimits::try_from_optional(
+        disk_io_limits: pplx_space_execution_spec::DiskIoLimits::try_from_optional(
             metadata.source.disk_io_max_operations_per_sec,
             metadata.source.disk_io_max_bandwidth_mib_per_sec,
         )?,
@@ -1586,10 +1587,10 @@ pub(super) fn write_full_suspend_artifact(
     sandbox_id: &str,
     local_artifact_id: LocalArtifactId,
     payload: &[u8],
-) -> pplx_space_common_core::types::ExecutionMetadata {
+) -> pplx_space_execution_spec::ExecutionMetadata {
     let architecture = std::env::consts::ARCH.parse().unwrap();
-    let execution = pplx_space_common_core::types::SnapshotExecutionMetadata::new(
-        pplx_space_common_core::types::ExecutionMetadata::initial_firecracker(architecture, vec![]),
+    let execution = pplx_space_execution_spec::SnapshotExecutionMetadata::new(
+        pplx_space_execution_spec::ExecutionMetadata::initial_firecracker(architecture, vec![]),
     )
     .unwrap();
     std::fs::create_dir_all(snapshot_dir).unwrap();

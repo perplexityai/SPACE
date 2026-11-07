@@ -34,7 +34,7 @@ impl SandboxManagerService {
         let profile = crate::service::guest_image::profile_for_sandbox(&sandbox)
             .map_err(|error| Status::failed_precondition(error.to_string()))?;
         if profile.agent_protocol()
-            == pplx_space_common_core::types::guest_image::QualifiedGuestAgent::WindowsV1
+            == pplx_space_execution_spec::guest_image::QualifiedGuestAgent::WindowsV1
         {
             // TemplateRuntime describes Linux systemd units. Windows images
             // use native agent readiness; probing a Linux path as root is not

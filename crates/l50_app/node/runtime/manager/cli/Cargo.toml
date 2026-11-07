@@ -25,6 +25,6 @@ tonic = { workspace = true }
 # internal
 pplx-space-accounts = { workspace = true }
 pplx-space-common-cli = { workspace = true }
-pplx-space-common-core = { workspace = true }
 pplx-space-content-digest = { workspace = true }
+pplx-space-execution-spec = { workspace = true }
 pplx-space-node-runtime-manager-client = { workspace = true }

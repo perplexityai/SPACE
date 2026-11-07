@@ -510,8 +510,8 @@ fn upload_config(bucket: &str) -> crate::snapshot_upload::SnapshotUploadConfig {
 /// Write a published artifact directory whose metadata names no artifact
 /// identity, so any identity in the durable intent came from the submission.
 fn write_artifact(dir: &std::path::Path, sandbox_id: &str, files: &[&str]) {
-    let execution = pplx_space_common_core::types::SnapshotExecutionMetadata::new(
-        pplx_space_common_core::types::ExecutionMetadata::initial_firecracker(
+    let execution = pplx_space_execution_spec::SnapshotExecutionMetadata::new(
+        pplx_space_execution_spec::ExecutionMetadata::initial_firecracker(
             std::env::consts::ARCH.parse().unwrap(),
             vec![],
         ),

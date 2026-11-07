@@ -68,7 +68,7 @@ impl SpacedHostBootType {
 #[derive(Clone, Debug, Default)]
 pub struct SpacedHostRunConfig {
     /// Trusted agent qualification supplied by node-manager.
-    pub guest_agent: pplx_space_common_core::types::guest_image::QualifiedGuestAgent,
+    pub guest_agent: pplx_space_execution_spec::guest_image::QualifiedGuestAgent,
     /// spaced-host's own gRPC Unix socket.
     pub socket: Option<PathBuf>,
     /// The sandbox host-control Unix socket spaced-host calls out on.

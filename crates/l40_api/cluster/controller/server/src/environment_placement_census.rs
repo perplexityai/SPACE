@@ -40,7 +40,7 @@ use pplx_space_api::controllers::substrate::kubernetes::{
 use pplx_space_api::metrics::environment_placement::{
     self as metrics, PendingPodReason, RunningPodPlacement,
 };
-use pplx_space_common_core::types::EnvironmentReference;
+use pplx_space_execution_spec::EnvironmentReference;
 use pplx_space_sandbox_pod::{node_publishes_any_environment, node_publishes_environment};
 use tokio::time::MissedTickBehavior;
 use tokio_util::sync::CancellationToken;

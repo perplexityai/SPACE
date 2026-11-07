@@ -2,11 +2,11 @@
 //! as an empty inventory. Existing placement projections remain unchanged.
 
 use pplx_space_accounts::NodeId;
-use pplx_space_common_core::{
-    sql,
-    types::{ArtifactComponentMetadata, GuestPlatform, RuntimeIdentity, StateFormatIdentity},
-};
+use pplx_space_common_core::sql;
 use pplx_space_execution_common::proto::NodeExecutionInventory;
+use pplx_space_execution_spec::{
+    ArtifactComponentMetadata, GuestPlatform, RuntimeIdentity, StateFormatIdentity,
+};
 use sqlx::types::Json;
 use tonic::Status;
 
@@ -105,7 +105,7 @@ pub(super) async fn prepare<'a>(
 
 pub(super) struct PublishedExecutionObservation {
     pub status: InventoryStatus,
-    pub policy: Option<pplx_space_common_core::types::ExecutionPolicyObservation>,
+    pub policy: Option<pplx_space_execution_spec::ExecutionPolicyObservation>,
     pub environments: crate::environment_observation::EnvironmentRefs,
 }
 
@@ -134,7 +134,7 @@ pub(super) async fn publish(
     let policy = inventory
         .and_then(|inventory| inventory.policy.as_ref())
         .and_then(|policy| {
-            match pplx_space_common_core::types::ExecutionPolicyObservation::try_from(policy) {
+            match pplx_space_execution_spec::ExecutionPolicyObservation::try_from(policy) {
                 Ok(policy) => Some(policy),
                 Err(error) => {
                     tracing::warn!(%error, %node_id, "invalid execution policy observation; withholding policy evidence");

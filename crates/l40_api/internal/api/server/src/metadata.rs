@@ -1408,7 +1408,7 @@ pub(super) fn validated_execution_metadata(
     let Some(execution) = execution else {
         return Ok(None);
     };
-    let execution = pplx_space_common_core::types::ExecutionMetadata::try_from(execution)
+    let execution = pplx_space_execution_spec::ExecutionMetadata::try_from(execution)
         .map_err(|error| Status::invalid_argument(error.to_string()))?;
     serde_json::to_value(&execution)
         .map(Some)

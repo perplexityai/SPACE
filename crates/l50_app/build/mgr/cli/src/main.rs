@@ -46,7 +46,7 @@ enum Commands {
 
         /// Exact compiled execution environment on this builder node.
         #[arg(long)]
-        environment: Option<pplx_space_common_core::types::EnvironmentReference>,
+        environment: Option<pplx_space_execution_spec::EnvironmentReference>,
 
         /// Extra release tag to register in addition to the immutable digest tag.
         #[arg(long = "publish-tag")]

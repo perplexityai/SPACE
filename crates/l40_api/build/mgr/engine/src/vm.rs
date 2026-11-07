@@ -14,9 +14,9 @@ pub(crate) const GUEST_IP: std::net::Ipv4Addr = pplx_space_net_common::guest_lin
 /// Flush first; the detached delay lets SSH acknowledge the request, and
 /// confirmed Stop remains the barrier before copying the rootfs.
 pub(crate) fn guest_exit_command(
-    runtime: pplx_space_common_core::types::RuntimeKind,
+    runtime: pplx_space_execution_spec::RuntimeKind,
 ) -> Result<&'static str, super::BuildError> {
-    use pplx_space_common_core::types::RuntimeKind;
+    use pplx_space_execution_spec::RuntimeKind;
     match runtime {
         RuntimeKind::Firecracker => Ok(
             "nohup sh -c 'sync; echo 1 > /proc/sys/kernel/sysrq 2>/dev/null || true; if [ -w /proc/sysrq-trigger ]; then echo s > /proc/sysrq-trigger; echo u > /proc/sysrq-trigger; sleep 1; echo b > /proc/sysrq-trigger; else reboot -f; fi' >/dev/null 2>&1 </dev/null &",

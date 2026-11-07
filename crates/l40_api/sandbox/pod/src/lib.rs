@@ -18,7 +18,8 @@ use uuid::Uuid;
 
 use pplx_space_accounts::{ROOT_SANDBOX_OWNER, SandboxOwner};
 use pplx_space_byte_size::MemorySize;
-use pplx_space_common_core::types::{NodePoolName, TemplateReference, VcpuCount};
+use pplx_space_common_core::types::{NodePoolName, TemplateReference};
+use pplx_space_execution_spec::VcpuCount;
 use pplx_space_policy_authority::PolicyAuthority;
 
 pub mod placement;
@@ -133,7 +134,7 @@ pub const MAX_SANDBOX_NETWORK_POLICY_ANNOTATION_BYTES: usize = 128 * 1024;
 /// request and limit are both `1` and the resource is never overcommitted.
 pub const SANDBOX_NETWORK_SLOTS_RESOURCE: &str = "space.pplx.net/network-slots";
 
-/// Node label carrying the node's [`HostCpu`](pplx_space_common_core::types::HostCpu) identity,
+/// Node label carrying the node's [`HostCpu`](pplx_space_execution_spec::HostCpu) identity,
 /// published by the node-local controller from `/proc/cpuinfo`.
 ///
 /// It's the same derivation the sandbox manager records as a suspend
@@ -501,7 +502,7 @@ pub struct SandboxPoolPodMetadata {
     pub vcpu: VcpuCount,
     pub memory: MemorySize,
     pub disk_mib: Option<u32>,
-    pub disk_io_limits: pplx_space_common_core::types::DiskIoLimits,
+    pub disk_io_limits: pplx_space_execution_spec::DiskIoLimits,
 }
 
 pub struct SandboxPodCommon<'a> {
@@ -534,7 +535,7 @@ pub struct SandboxRuntimePodMetadata<'a> {
     pub vcpu: Option<u32>,
     pub memory_mib: Option<u32>,
     pub disk_mib: Option<u32>,
-    pub disk_io_limits: pplx_space_common_core::types::DiskIoLimits,
+    pub disk_io_limits: pplx_space_execution_spec::DiskIoLimits,
     /// BYOK: render the [`SANDBOX_VOLUME_ENCRYPTION_ANNOTATION`] so the shim
     /// creates the node sandbox with its immutable encrypted-volumes flag.
     pub volume_encryption: bool,

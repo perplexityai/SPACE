@@ -395,7 +395,7 @@ async fn corrupt_record_admits_nothing_new_and_the_next_application_recovers() {
             let (_fixture, paths) = crate::service::tests::service_tests::installed_runtime();
             let inventory = pplx_space_node_runtime_core::runtime_inventory::RuntimeInventory::discover(
                 [pplx_space_node_runtime_core::runtime_inventory::RuntimeInstallationRoot::new(
-                    pplx_space_common_core::types::RuntimeKind::Firecracker,
+                    pplx_space_execution_spec::RuntimeKind::Firecracker,
                     &paths.vendor,
                 )],
                 &paths.assets,

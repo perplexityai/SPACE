@@ -2,9 +2,9 @@ use std::collections::BTreeMap;
 
 use pplx_space_accounts::UserId;
 use pplx_space_common_core::sql;
-use pplx_space_common_core::types::EnvironmentReference;
 use pplx_space_content_digest::Digest;
 use pplx_space_db_test_fixtures::{try_pg_test_db, try_pg_test_db_with_max_connections};
+use pplx_space_execution_spec::EnvironmentReference;
 use pplx_space_test_env::TestResult;
 use sqlx::PgPool;
 use uuid::Uuid;

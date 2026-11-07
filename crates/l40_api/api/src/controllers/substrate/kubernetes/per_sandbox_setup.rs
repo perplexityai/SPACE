@@ -32,7 +32,8 @@ use pplx_space_accounts::{OrgId, UserId};
 
 use pplx_space_accounts::SandboxOwner;
 use pplx_space_auto_lifecycle::AutoLifecyclePolicy;
-use pplx_space_common_core::types::{ClientId, DiskIoLimits};
+use pplx_space_common_core::types::ClientId;
+use pplx_space_execution_spec::DiskIoLimits;
 use pplx_space_guest_process::EnvMap;
 use pplx_space_net_common::NetworkPolicyV1;
 use pplx_space_policy_authority::PolicyAuthority;

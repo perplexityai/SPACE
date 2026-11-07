@@ -9,11 +9,11 @@ use std::{
 use pplx_space_auto_lifecycle::AutoLifecyclePolicy;
 use pplx_space_common_core::types::{
     DEFAULT_BASE_SNAPSHOT_MEMORY_MIB, DEFAULT_BASE_SNAPSHOT_VCPU, MIN_BASE_SNAPSHOT_MEMORY_MIB,
-    MIN_BASE_SNAPSHOT_VCPU, RUNTIME_FIRECRACKER_ALIAS, TEMPLATE_ROOTFS_FILE,
-    TEMPLATE_ROOTFS_ZSTD_CODEC, TEMPLATE_ROOTFS_ZSTD_FILE, TEMPLATE_ROOTFS_ZSTD_LEVEL,
-    TemplateCachePartition,
+    MIN_BASE_SNAPSHOT_VCPU, TEMPLATE_ROOTFS_FILE, TEMPLATE_ROOTFS_ZSTD_CODEC,
+    TEMPLATE_ROOTFS_ZSTD_FILE, TEMPLATE_ROOTFS_ZSTD_LEVEL, TemplateCachePartition,
 };
 use pplx_space_content_digest::{Digest, HashAlg};
+use pplx_space_execution_spec::RUNTIME_FIRECRACKER_ALIAS;
 use pplx_space_feature_flags::FeatureFlagClient;
 use pplx_space_host_layout::identities::{user_names, users};
 use pplx_space_host_layout::paths::TEMPLATE_CACHE_DIR_MODE;
@@ -823,7 +823,7 @@ pub(crate) fn manifest_cache_partition(
 pub(crate) fn effective_environment(
     manifest: &pplx_space_template_manifest::TemplateManifest,
     metadata: &pplx_space_template_manifest::TemplateMetadata,
-) -> Result<Option<pplx_space_common_core::types::EnvironmentReference>, String> {
+) -> Result<Option<pplx_space_execution_spec::EnvironmentReference>, String> {
     match manifest
         .execution_metadata()
         .map_err(|error| error.to_string())?
@@ -2830,10 +2830,10 @@ impl TemplateManagerService {
             // exact execution qualification still occurs at launch/restore.
             let runtime = build
                 .runtime
-                .parse::<pplx_space_common_core::types::RuntimeKind>()
+                .parse::<pplx_space_execution_spec::RuntimeKind>()
                 .map_err(|error| Status::failed_precondition(error.to_string()))?;
             if manifest.guest_image.unwrap_or_default().legacy_transport()
-                && runtime == pplx_space_common_core::types::RuntimeKind::Firecracker
+                && runtime == pplx_space_execution_spec::RuntimeKind::Firecracker
             {
                 return Ok(None);
             }

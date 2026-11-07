@@ -11,7 +11,7 @@ pub(super) fn requested_cache_partition(
     environment
         .map(|environment| {
             environment
-                .parse::<pplx_space_common_core::types::EnvironmentReference>()
+                .parse::<pplx_space_execution_spec::EnvironmentReference>()
                 .map(|environment| {
                     pplx_space_node_runtime_core::catalog::template_cache_partition(Some(
                         environment,

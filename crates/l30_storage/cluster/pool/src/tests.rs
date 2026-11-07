@@ -3,9 +3,10 @@ use pplx_space_accounts::{OrgId, UserId};
 use std::time::Duration;
 
 use pplx_space_byte_size::MemorySize;
-use pplx_space_common_core::types::{SandboxId, SandboxLifecycle, TemplateName, VcpuCount};
+use pplx_space_common_core::types::{SandboxId, SandboxLifecycle, TemplateName};
 use pplx_space_content_digest::{ContentHash, Digest};
 use pplx_space_db_test_fixtures::{TestDb, pg_test_db};
+use pplx_space_execution_spec::VcpuCount;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -2098,7 +2099,7 @@ async fn manual_pool_creation_uses_platform_limits_and_updates_preserve_assignme
     let id = WarmPoolStore::upsert_manual_config(&mut tx, release_id, &spec).await?;
     tx.commit().await?;
     let created = fixture.store.config_with_counts(id).await?.unwrap();
-    let defaults = pplx_space_common_core::types::DiskIoLimits::default();
+    let defaults = pplx_space_execution_spec::DiskIoLimits::default();
     assert_eq!(
         created.disk_io_max_operations_per_sec,
         i64::try_from(defaults.max_operations_per_sec())?

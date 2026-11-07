@@ -101,7 +101,7 @@ const TEMPLATE_DIR: &str = pplx_space_host_layout::paths::TEMPLATE_DIR;
 /// Default runtime passed to `FindTemplateRelease`. The cluster API accepts
 /// both full names and aliases, but the release column currently stores the
 /// legacy Firecracker alias `fc`, so this caller sends the stored spelling.
-pub(crate) const DEFAULT_RUNTIME: &str = pplx_space_common_core::types::RUNTIME_FIRECRACKER_ALIAS;
+pub(crate) const DEFAULT_RUNTIME: &str = pplx_space_execution_spec::RUNTIME_FIRECRACKER_ALIAS;
 
 fn lock_or_recover<'a, T>(mutex: &'a Mutex<T>, context: &'static str) -> MutexGuard<'a, T> {
     match mutex.lock() {
@@ -2077,7 +2077,7 @@ async fn try_pull_from(
     }
     let build_date = manifest.build_date.clone();
     let runtime = if manifest.runtime.is_empty() {
-        pplx_space_common_core::types::RUNTIME_FIRECRACKER_ALIAS.to_string()
+        pplx_space_execution_spec::RUNTIME_FIRECRACKER_ALIAS.to_string()
     } else {
         manifest.runtime.clone()
     };

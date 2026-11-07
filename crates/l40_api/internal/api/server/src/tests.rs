@@ -412,7 +412,7 @@ async fn register_release(
 async fn register_release_with_execution(
     service: &ClusterApiService,
     hash: &str,
-    execution: &pplx_space_common_core::types::ExecutionMetadata,
+    execution: &pplx_space_execution_spec::ExecutionMetadata,
 ) -> Result<RegisterTemplateReleaseResponse, tonic::Status> {
     Ok(service
         .register_template_release(publisher_request(RegisterTemplateReleaseRequest {
@@ -1235,9 +1235,9 @@ async fn register_template_release_allows_no_storage_locations() -> TestResult {
 /// metadata is backfilled by a later registration that has it.
 #[tokio::test(flavor = "current_thread")]
 async fn register_template_release_persists_execution_metadata_write_once() -> TestResult {
-    use pplx_space_common_core::types::{EnvironmentReference, ExecutionMetadata};
     use pplx_space_content_digest::Digest;
     use pplx_space_cpu_arch::Arch;
+    use pplx_space_execution_spec::{EnvironmentReference, ExecutionMetadata};
 
     let Some(fixture) = cluster_fixture().await? else {
         return Ok(());
@@ -1337,8 +1337,8 @@ async fn register_template_release_persists_execution_metadata_write_once() -> T
 /// as they were, including a `NULL` metadata column.
 #[tokio::test(flavor = "current_thread")]
 async fn tags_only_republication_leaves_locations_and_metadata_unchanged() -> TestResult {
-    use pplx_space_common_core::types::ExecutionMetadata;
     use pplx_space_cpu_arch::Arch;
+    use pplx_space_execution_spec::ExecutionMetadata;
 
     let Some(fixture) = cluster_fixture().await? else {
         return Ok(());
@@ -4733,22 +4733,18 @@ fn test_storage_uri(sandbox_id: SandboxId, snapshot_id: SnapshotId) -> String {
 fn test_snapshot_execution_for_arch(
     arch: pplx_space_cpu_arch::Arch,
 ) -> pplx_space_execution_common::proto::ExecutionMetadata {
-    let execution = pplx_space_common_core::types::ExecutionMetadata::initial_firecracker(
+    let execution = pplx_space_execution_spec::ExecutionMetadata::initial_firecracker(
         arch,
-        vec![pplx_space_common_core::types::ArtifactComponentMetadata {
-            kind: pplx_space_common_core::types::ArtifactComponentKind::Kernel,
-            role: Some(
-                pplx_space_common_core::types::ArtifactComponentRole::parse("boot").unwrap(),
-            ),
-            version: Some(
-                pplx_space_common_core::types::ArtifactVersion::parse("6.10.14").unwrap(),
-            ),
+        vec![pplx_space_execution_spec::ArtifactComponentMetadata {
+            kind: pplx_space_execution_spec::ArtifactComponentKind::Kernel,
+            role: Some(pplx_space_execution_spec::ArtifactComponentRole::parse("boot").unwrap()),
+            version: Some(pplx_space_execution_spec::ArtifactVersion::parse("6.10.14").unwrap()),
             digest: Some(
                 format!("sha256:{}", "c".repeat(64))
                     .parse::<pplx_space_content_digest::Digest>()
                     .unwrap(),
             ),
-            format: Some(pplx_space_common_core::types::ArtifactFormat::parse("vmlinux").unwrap()),
+            format: Some(pplx_space_execution_spec::ArtifactFormat::parse("vmlinux").unwrap()),
         }],
     );
     (&execution).into()

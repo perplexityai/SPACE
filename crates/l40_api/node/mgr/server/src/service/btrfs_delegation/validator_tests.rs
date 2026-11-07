@@ -158,10 +158,10 @@ fn fixture_hash() -> String {
     pplx_space_content_digest::Digest::blake3([7; 32]).to_string()
 }
 
-fn other_environment() -> pplx_space_common_core::types::EnvironmentReference {
-    pplx_space_common_core::types::EnvironmentReference::new(
-        pplx_space_content_digest::Digest::sha256([9; 32]),
-    )
+fn other_environment() -> pplx_space_execution_spec::EnvironmentReference {
+    pplx_space_execution_spec::EnvironmentReference::new(pplx_space_content_digest::Digest::sha256(
+        [9; 32],
+    ))
 }
 
 #[test]
@@ -428,10 +428,10 @@ fn sandbox_codec_parent_candidates_include_the_digest_s_other_cached_partitions(
     )
     .unwrap();
     // The digest's other partitions follow, in directory-name order.
-    let third = pplx_space_common_core::types::EnvironmentReference::new(
+    let third = pplx_space_execution_spec::EnvironmentReference::new(
         pplx_space_content_digest::Digest::sha256([3; 32]),
     );
-    let fourth = pplx_space_common_core::types::EnvironmentReference::new(
+    let fourth = pplx_space_execution_spec::EnvironmentReference::new(
         pplx_space_content_digest::Digest::sha256([1; 32]),
     );
     let mut listing = listing.to_vec();

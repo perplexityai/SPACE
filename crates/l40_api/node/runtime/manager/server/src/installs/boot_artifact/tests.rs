@@ -7,9 +7,9 @@ use crate::installs::{
     test_support::LocalPublisher,
 };
 use pplx_space_accounts::JobId;
-use pplx_space_common_core::types::{ArtifactComponentKind, ComponentIdentity};
 use pplx_space_common_jobs::{Job, JobExecutor as _};
 use pplx_space_content_digest::Digest;
+use pplx_space_execution_spec::{ArtifactComponentKind, ComponentIdentity};
 use pplx_space_node_runtime_core::{
     artifact_store::StagedName,
     catalog::{CatalogError, RuntimeCatalog},

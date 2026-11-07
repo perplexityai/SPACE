@@ -143,8 +143,8 @@ fn opaque_disk_growth_preserves_bytes_without_host_filesystem_tools() {
 
 #[test]
 fn opaque_metadata_selects_byte_growth_and_disagreement_refuses_before_write() {
-    use pplx_space_common_core::types::guest_image::{GuestImageContract, GuestReadiness};
     use pplx_space_cpu_arch::Arch;
+    use pplx_space_execution_spec::guest_image::{GuestImageContract, GuestReadiness};
     let temp = tempfile::tempdir().unwrap();
     let rootfs = temp.path().join("rootfs.ext4");
     std::fs::write(&rootfs, vec![0x5a; MIB as usize]).unwrap();
@@ -156,8 +156,8 @@ fn opaque_metadata_selects_byte_growth_and_disagreement_refuses_before_write() {
                 GuestReadiness::TcpService {
                     port: std::num::NonZeroU16::new(3389).unwrap(),
                 },
-                pplx_space_common_core::types::guest_image::GuestNetwork::SlotDhcpV1,
-                pplx_space_common_core::types::guest_image::GuestAgent::Absent,
+                pplx_space_execution_spec::guest_image::GuestNetwork::SlotDhcpV1,
+                pplx_space_execution_spec::guest_image::GuestAgent::Absent,
             )
             .unwrap(),
         ),

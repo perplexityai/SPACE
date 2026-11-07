@@ -4,10 +4,10 @@ use std::str::FromStr;
 use oci_spec::distribution::{ParseError as OciReferenceParseError, Reference as OciReference};
 use pplx_space_build_mgr_client::proto as build_proto;
 use pplx_space_common_core::types::{
-    ArtifactVersion, ArtifactVersionParseError, TemplateReference, TemplateReferenceParseError,
-    TemplateSelector,
+    TemplateReference, TemplateReferenceParseError, TemplateSelector,
 };
 use pplx_space_content_digest::{Digest, DigestParseError};
+use pplx_space_execution_spec::{ArtifactVersion, ArtifactVersionParseError};
 use pplx_space_guest_process::{EnvKey, EnvMap, EnvParseError};
 use pplx_space_template_runtime::{TemplateRuntime, TemplateRuntimeError};
 use serde::Deserialize;
@@ -172,7 +172,7 @@ pub struct BuildConfig {
     pub disk_size_mb: Option<u32>,
     /// Recorded in the built template's metadata for its sandboxes'
     /// cold boots; the build VM itself boots with its base's setting.
-    pub balloon: Option<pplx_space_common_core::types::BalloonConfig>,
+    pub balloon: Option<pplx_space_execution_spec::BalloonConfig>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -288,7 +288,7 @@ pub struct TomlRecipeMetadata {
     pub memory_mib: Option<u32>,
     pub disk_size_mb: Option<u32>,
     /// Same shape as template `metadata.json` `balloon`.
-    pub balloon: Option<pplx_space_common_core::types::BalloonConfig>,
+    pub balloon: Option<pplx_space_execution_spec::BalloonConfig>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
@@ -684,10 +684,10 @@ impl TryFrom<build_proto::recipe::BuildConfig> for BuildConfig {
 }
 
 pub fn balloon_proto(
-    balloon: pplx_space_common_core::types::BalloonConfig,
+    balloon: pplx_space_execution_spec::BalloonConfig,
 ) -> build_proto::recipe::Balloon {
     use build_proto::recipe::balloon::{FreePageHinting, FreePageReporting, Inflate, Mode};
-    use pplx_space_common_core::types::BalloonDevice;
+    use pplx_space_execution_spec::BalloonDevice;
     let mode = match balloon.device() {
         BalloonDevice::Inflate {
             amount_mib,
@@ -707,9 +707,9 @@ pub fn balloon_proto(
 
 fn balloon_from_proto(
     balloon: build_proto::recipe::Balloon,
-) -> Result<pplx_space_common_core::types::BalloonConfig, RecipeProtoError> {
+) -> Result<pplx_space_execution_spec::BalloonConfig, RecipeProtoError> {
     use build_proto::recipe::balloon::Mode;
-    use pplx_space_common_core::types::{BalloonConfig, BalloonDevice};
+    use pplx_space_execution_spec::{BalloonConfig, BalloonDevice};
     let device = match balloon.mode.ok_or(RecipeProtoError::MissingBalloonMode)? {
         Mode::Inflate(inflate) => BalloonDevice::Inflate {
             amount_mib: std::num::NonZeroU32::new(inflate.amount_mib)

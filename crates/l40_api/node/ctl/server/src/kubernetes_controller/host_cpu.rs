@@ -1,7 +1,7 @@
 use k8s_openapi::api::core::v1::Node;
 use kube::api::{Patch, PatchParams};
 use kube::{Api, Client};
-use pplx_space_common_core::types::HostCpu;
+use pplx_space_execution_spec::HostCpu;
 use pplx_space_sandbox_pod::HOST_CPU_LABEL;
 
 use super::node_watch;

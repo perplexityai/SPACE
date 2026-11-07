@@ -1,7 +1,7 @@
 use pplx_space_common_core::types::SandboxId;
 
-use pplx_space_common_core::types::{ExecutionMetadata, RuntimeKind};
 use pplx_space_cpu_arch::Arch;
+use pplx_space_execution_spec::{ExecutionMetadata, RuntimeKind};
 
 use super::{parse_runtime_request, prepare_sandbox_cache_paths, prepare_sandbox_owned_paths};
 
@@ -14,7 +14,7 @@ fn oversized_rootfs_resize_is_rejected_before_touching_disk() {
         let error = super::resize_guest_disk(
             rootfs.to_str().unwrap(),
             mib,
-            pplx_space_common_core::types::guest_image::GuestDiskLayout::Ext4Filesystem,
+            pplx_space_execution_spec::guest_image::GuestDiskLayout::Ext4Filesystem,
         )
         .unwrap_err();
         assert_eq!(error.code(), tonic::Code::InvalidArgument);

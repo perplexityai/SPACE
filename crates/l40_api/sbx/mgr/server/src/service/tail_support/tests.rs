@@ -21,7 +21,7 @@ fn checkpoint_execution_metadata_backfills_legacy_scheduled_snapshot_sidecar() {
 
     assert_eq!(
         execution.runtime().kind,
-        pplx_space_common_core::types::RuntimeKind::Firecracker
+        pplx_space_execution_spec::RuntimeKind::Firecracker
     );
     assert_eq!(execution.runtime().version.as_str(), "1.15.1");
     assert_eq!(execution.state_format().unwrap().version.as_str(), "9.0.0");
@@ -29,7 +29,7 @@ fn checkpoint_execution_metadata_backfills_legacy_scheduled_snapshot_sidecar() {
 
 #[test]
 fn checkpoint_budget_survives_runtime_and_suspend_metadata_roundtrips() {
-    use pplx_space_common_core::types::{SnapshotExecutionMetadata, VcpuCount};
+    use pplx_space_execution_spec::{SnapshotExecutionMetadata, VcpuCount};
     let directory = tempfile::tempdir().unwrap();
     let budget = Some(VcpuCount::try_from_u32(8).unwrap());
     let runtime = SnapshotExecutionMetadata::new(initial_firecracker_execution_metadata().unwrap())
@@ -77,7 +77,7 @@ fn checkpoint_budget_survives_runtime_and_suspend_metadata_roundtrips() {
 
 #[test]
 fn restore_uses_explicit_or_captured_allocation_without_inventing_legacy_evidence() {
-    use pplx_space_common_core::types::VcpuCount;
+    use pplx_space_execution_spec::VcpuCount;
     for (requested, captured, expected) in [
         (Some(8), Some(2), Some(8)),
         (Some(4), None, Some(4)),
@@ -104,8 +104,9 @@ fn restore_uses_explicit_or_captured_allocation_without_inventing_legacy_evidenc
 
 #[test]
 fn snapshot_identity_uses_durable_binding_when_artifact_metadata_is_missing_or_stale() {
-    use pplx_space_common_core::types::{SandboxArtifactMetadata, VcpuCount};
+    use pplx_space_common_core::types::SandboxArtifactMetadata;
     use pplx_space_cpu_arch::Arch;
+    use pplx_space_execution_spec::VcpuCount;
     let conn = crate::db::test_conn();
     let id = SandboxId::new().to_string();
     crate::service::tests::service_tests::insert_test_sandbox(&conn, &id, SandboxState::Paused);
@@ -170,8 +171,8 @@ fn snapshot_identity_uses_durable_binding_when_artifact_metadata_is_missing_or_s
 /// environment's build, not the legacy one.
 #[test]
 fn codec_environment_falls_back_to_the_row_binding_when_the_sidecar_is_unreadable() {
-    use pplx_space_common_core::types::SnapshotExecutionMetadata;
     use pplx_space_cpu_arch::Arch;
+    use pplx_space_execution_spec::SnapshotExecutionMetadata;
     let catalog =
         pplx_space_execution_catalog::catalog::CompiledEnvironment::for_architecture(Arch::X86_64)
             .unwrap();

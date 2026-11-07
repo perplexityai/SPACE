@@ -1,10 +1,11 @@
-//! Shared SPACE domain types.
+//! Shared SPACE sandbox, template, snapshot and node domain types.
 //!
 //! These newtypes turn repeated primitive values into named domain concepts:
-//! sandbox IDs are not template names, memory sizes are not disk sizes, and
-//! guest paths are not node paths. Boundary code should parse raw strings,
-//! integers, and UUIDs into these types once and pass the typed values through
-//! the rest of the call graph.
+//! sandbox IDs are not template names, node paths are not storage URIs, and
+//! snapshot names are not template references. Value types that have their own
+//! `pplx-space-*` crate are imported from that crate, not through `types`.
+//! Boundary code should parse raw strings, integers, and UUIDs into these
+//! types once and pass the typed values through the rest of the call graph.
 //!
 //! The module stays dependency-light. It intentionally does not depend on
 //! transport, database, web framework, or daemon-specific crates.
@@ -13,6 +14,7 @@
 //!
 //! ```rust
 //! # use pplx_space_common_core::types::*;
+//! # use pplx_space_execution_spec::{ComputeShape, CpuLimit};
 //! # use pplx_space_byte_size::MemorySize;
 //! let sandbox_id = SandboxId::new();
 //! let template = TemplateName::parse("seed").unwrap();
@@ -24,15 +26,8 @@
 //! ```
 
 pub mod admin;
-pub mod balloon;
 pub mod client_id;
 pub mod cluster;
-pub mod compute;
-pub mod disk_io;
-pub mod environment;
-pub use pplx_space_execution_spec::execution;
-pub use pplx_space_execution_spec::guest_image;
-pub use pplx_space_execution_spec::host_cpu;
 pub mod kek;
 pub mod node;
 pub mod node_fs;
@@ -41,7 +36,6 @@ pub mod object_store;
 #[cfg(feature = "sqlx")]
 mod postgres;
 pub mod restore_retirement;
-pub mod runtime;
 pub mod sandbox;
 #[cfg(feature = "serde")]
 pub mod sandbox_artifact;
@@ -51,26 +45,14 @@ pub mod template;
 
 #[cfg(feature = "serde")]
 pub use admin::*;
-pub use balloon::*;
 pub use client_id::*;
 pub use cluster::*;
-pub use compute::*;
-pub use disk_io::*;
-pub use environment::*;
-pub use execution::*;
-pub use host_cpu::*;
 pub use kek::*;
 pub use node::*;
 pub use node_fs::*;
 pub use node_group::*;
 pub use object_store::*;
 pub use restore_retirement::*;
-pub use runtime::{
-    EffectiveStartup, RUNTIME_CLOUD_HYPERVISOR, RUNTIME_CLOUD_HYPERVISOR_ALIAS,
-    RUNTIME_FIRECRACKER, RUNTIME_FIRECRACKER_ALIAS, RUNTIME_GVISOR, RUNTIME_GVISOR_ALIAS,
-    RuntimeCapabilities, RuntimeDeploymentId, RuntimeDeploymentIdParseError, RuntimeKind,
-    RuntimeKindParseError, StartupPolicy, UnsupportedStartupPolicyError,
-};
 pub use sandbox::*;
 #[cfg(feature = "serde")]
 pub use sandbox_artifact::*;

@@ -9,11 +9,10 @@ use crate::installs::{
 use crate::protection::{self, AuditIdentity, PathRole};
 use crate::run::SERVICE_NAME;
 use pplx_space_accounts::JobId;
-use pplx_space_common_core::types::{
-    ComponentIdentity, RuntimeIdentity, RuntimeKind, RuntimeVersion,
-};
 use pplx_space_content_digest::Digest;
 use pplx_space_execution_common::proto::{self as execution, ArtifactComponentKind};
+use pplx_space_execution_spec::RuntimeVersion;
+use pplx_space_execution_spec::{ComponentIdentity, RuntimeIdentity, RuntimeKind};
 use pplx_space_host_layout::identities::{user_names, users};
 use pplx_space_node_runtime_core::runtime_inventory::diagnostic::{
     self, ArtifactKinds, ArtifactScan, DigestCache, ScanLimits, ScanRoots, SystemScanClock,
@@ -172,10 +171,10 @@ fn parse_component(
         value.ok_or_else(|| Status::invalid_argument("a component identity is required"))?;
     let kind = match ArtifactComponentKind::try_from(value.kind) {
         Ok(ArtifactComponentKind::Kernel) => {
-            pplx_space_common_core::types::ArtifactComponentKind::Kernel
+            pplx_space_execution_spec::ArtifactComponentKind::Kernel
         }
         Ok(ArtifactComponentKind::Firmware) => {
-            pplx_space_common_core::types::ArtifactComponentKind::Firmware
+            pplx_space_execution_spec::ArtifactComponentKind::Firmware
         }
         Ok(ArtifactComponentKind::Unspecified) | Err(_) => {
             return Err(Status::invalid_argument("a component kind is required"));
@@ -538,7 +537,7 @@ impl RuntimeManager for RuntimeManagerService {
                     continue;
                 };
                 let identity = crate::convert::component_identity(ComponentIdentity {
-                    kind: pplx_space_common_core::types::ArtifactComponentKind::Kernel,
+                    kind: pplx_space_execution_spec::ArtifactComponentKind::Kernel,
                     version: pin.version.clone(),
                     digest: pin.sha256,
                 });
@@ -592,8 +591,7 @@ impl RuntimeManager for RuntimeManagerService {
                 .await
                 .map_err(submit_status)?,
             RequestedArtifact::Component(component)
-                if component.kind
-                    != pplx_space_common_core::types::ArtifactComponentKind::Kernel =>
+                if component.kind != pplx_space_execution_spec::ArtifactComponentKind::Kernel =>
             {
                 installer
                     .install_boot_artifact(component)
@@ -649,8 +647,7 @@ impl RuntimeManager for RuntimeManagerService {
                 installer.uninstall_release(release, digest).await
             }
             RequestedArtifact::Component(component)
-                if component.kind
-                    != pplx_space_common_core::types::ArtifactComponentKind::Kernel =>
+                if component.kind != pplx_space_execution_spec::ArtifactComponentKind::Kernel =>
             {
                 installer.uninstall_boot_artifact(component).await
             }

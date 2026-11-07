@@ -321,7 +321,7 @@ fn environment_build_partition(
 ) -> Result<pplx_space_common_core::types::TemplateCachePartition, Status> {
     let environment = build
         .environment
-        .parse::<pplx_space_common_core::types::EnvironmentReference>()
+        .parse::<pplx_space_execution_spec::EnvironmentReference>()
         .map_err(|error| {
             Status::invalid_argument(format!(
                 "invalid environment_build.environment '{}': {error}",

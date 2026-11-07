@@ -1355,7 +1355,7 @@ pub(super) fn endpoint_proof_after_readiness_for(
     sandbox: &crate::db::SandboxRow,
     route_identity: &pplx_space_common_core::types::SpaceApiRouteIdentity,
 ) -> Result<bool, Status> {
-    use pplx_space_common_core::types::{RuntimeKind, guest_image::QualifiedGuestAgent};
+    use pplx_space_execution_spec::{RuntimeKind, guest_image::QualifiedGuestAgent};
     Ok(sandbox
         .execution_metadata
         .as_ref()

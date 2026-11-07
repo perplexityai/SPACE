@@ -225,7 +225,7 @@ pub struct RuntimeDeploymentIdParseError;
 /// Opaque runtime deployment or cluster identifier.
 ///
 /// Use this when a sandbox needs to remember the concrete deployment that
-/// accepted placement. Common-core deliberately treats this as a bounded opaque
+/// accepted placement. This crate deliberately treats this as a bounded opaque
 /// string rather than claiming a provider-neutral naming format.
 ///
 /// # Examples

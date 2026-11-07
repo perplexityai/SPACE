@@ -25,6 +25,7 @@ pplx-space-accounts = { workspace = true, features = ["serde"] }
 pplx-space-byte-size = { workspace = true, features = ["serde"] }
 pplx-space-common-core = { workspace = true, features = ["serde"] }
 pplx-space-env-vars = { workspace = true }
+pplx-space-execution-spec = { workspace = true, features = ["serde"] }
 pplx-space-policy-authority = { workspace = true }
 
 [dev-dependencies]

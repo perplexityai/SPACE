@@ -71,7 +71,7 @@ impl proto::TemplateFullInfo {
     pub fn environment(
         &self,
     ) -> Result<
-        Option<pplx_space_common_core::types::EnvironmentReference>,
+        Option<pplx_space_execution_spec::EnvironmentReference>,
         pplx_space_content_digest::DigestParseError,
     > {
         self.execution

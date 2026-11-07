@@ -1,8 +1,8 @@
 //! Official Cloud Hypervisor EDK2 release. Firmware is an immutable boot input,
 //! distinct from both a guest kernel and the tenant's writable system disk.
 use super::{CatalogError, PinnedBootArtifact};
-use pplx_space_common_core::types::{ArtifactComponentKind, ComponentIdentity};
 use pplx_space_cpu_arch::Arch;
+use pplx_space_execution_spec::{ArtifactComponentKind, ComponentIdentity};
 
 pub(super) const VERSION: &str = "ch-97eeb7b09";
 

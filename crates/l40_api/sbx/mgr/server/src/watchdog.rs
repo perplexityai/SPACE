@@ -286,7 +286,7 @@ struct GuestHealthGaugeValue {
 
 #[derive(Clone)]
 pub struct SidecarInfo {
-    pub guest_image: pplx_space_common_core::types::guest_image::GuestImageContract,
+    pub guest_image: pplx_space_execution_spec::guest_image::GuestImageContract,
     pub node_execution_id: Option<pplx_space_common_core::types::SandboxActivationAttemptId>,
     pub sandbox_id: String,
     pub uid: Option<u32>,
@@ -3362,7 +3362,7 @@ async fn restart_spaced_host(
 fn spaced_host_restart_args(
     sandbox_id: &str,
     vsock_uds_path: String,
-    agent: pplx_space_common_core::types::guest_image::QualifiedGuestAgent,
+    agent: pplx_space_execution_spec::guest_image::QualifiedGuestAgent,
 ) -> Vec<String> {
     vec![
         "--socket".to_string(),

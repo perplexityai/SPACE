@@ -1,7 +1,7 @@
 //! Capture admission keeps an environment's restore requirement on the node.
 
 use super::super::*;
-use pplx_space_common_core::types::EnvironmentReference;
+use pplx_space_execution_spec::EnvironmentReference;
 use pplx_space_node_runtime_core::runtime_inventory::ExecutionSelectionMode;
 
 use super::super::node_artifacts::PolicyScope;

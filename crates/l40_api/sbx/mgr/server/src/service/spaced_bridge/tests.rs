@@ -669,10 +669,10 @@ async fn producer_panic_is_an_explicit_stream_error() {
 
 #[tokio::test]
 async fn windows_start_defers_proof_and_refuses_lazy_serving_capture() {
-    use pplx_space_common_core::types::guest_image::{
+    use pplx_space_cpu_arch::Arch;
+    use pplx_space_execution_spec::guest_image::{
         GuestAgent, GuestDiskLayout, GuestImageContract, GuestNetwork, GuestReadiness,
     };
-    use pplx_space_cpu_arch::Arch;
     let conn = crate::db::test_conn();
     let id = SandboxId::new().to_string();
     crate::db::fixture::insert_test_sandbox(&conn, &id, SandboxState::Starting);

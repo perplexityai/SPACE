@@ -1,7 +1,8 @@
 //! Derive runtime control from recorded execution, never a caller-selected socket.
 use super::validation::validate_sandbox_id;
 use super::*;
-use pplx_space_common_core::types::{ExecutionMetadata, SandboxArtifactMetadata};
+use pplx_space_common_core::types::SandboxArtifactMetadata;
+use pplx_space_execution_spec::ExecutionMetadata;
 use std::io::Read;
 
 pub(super) fn recorded_execution_blocking(
@@ -57,7 +58,7 @@ fn recorded_artifact_in(
 fn recorded_guest_network_in(
     cache: &Path,
     sandbox_id: &str,
-) -> Result<pplx_space_common_core::types::guest_image::GuestNetwork, Status> {
+) -> Result<pplx_space_execution_spec::guest_image::GuestNetwork, Status> {
     // Existing network intent survives catalog retirement. Parsing, file and
     // sandbox identity checks remain mandatory; only absence means legacy.
     Ok(recorded_artifact_in(cache, sandbox_id)?
@@ -69,7 +70,7 @@ impl NodeManagerService {
     pub(super) async fn recorded_guest_network(
         &self,
         sandbox_id: String,
-    ) -> Result<pplx_space_common_core::types::guest_image::GuestNetwork, Status> {
+    ) -> Result<pplx_space_execution_spec::guest_image::GuestNetwork, Status> {
         self.off_runtime("read recorded guest network", move || {
             recorded_guest_network_in(Path::new(CACHE_DIR), &sandbox_id)
         })
@@ -140,7 +141,7 @@ impl NodeManagerService {
 
     pub(super) async fn runtime_control(
         &self,
-        runtime: pplx_space_common_core::types::RuntimeKind,
+        runtime: pplx_space_execution_spec::RuntimeKind,
         sandbox_id: &str,
     ) -> Result<Box<dyn pplx_space_node_runtime_core::control::RuntimeControl>, Status> {
         let socket = pplx_space_node_runtime_core::control::socket_path(
@@ -150,7 +151,7 @@ impl NodeManagerService {
                 .map_err(|e| Status::invalid_argument(format!("sandbox id: {e}")))?,
         )
         .map_err(|e| Status::failed_precondition(e.to_string()))?;
-        let peer = if runtime == pplx_space_common_core::types::RuntimeKind::CloudHypervisor {
+        let peer = if runtime == pplx_space_execution_spec::RuntimeKind::CloudHypervisor {
             Some(self.pin_runtime_owner(sandbox_id).await?)
         } else {
             None
@@ -161,7 +162,7 @@ impl NodeManagerService {
 
     pub(super) async fn standalone_configuration(
         &self,
-        runtime: pplx_space_common_core::types::RuntimeKind,
+        runtime: pplx_space_execution_spec::RuntimeKind,
         path: PathBuf,
         source: pplx_space_node_runtime_core::boot::BootSource,
     ) -> Result<pplx_space_node_runtime_core::boot::StandaloneBoot, Status> {
@@ -187,7 +188,7 @@ impl NodeManagerService {
 
     pub(super) async fn boot_standalone(
         &self,
-        runtime: pplx_space_common_core::types::RuntimeKind,
+        runtime: pplx_space_execution_spec::RuntimeKind,
         sandbox_id: &str,
         socket: PathBuf,
         configuration: &pplx_space_node_runtime_core::boot::StandaloneBoot,

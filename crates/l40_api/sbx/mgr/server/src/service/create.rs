@@ -184,10 +184,10 @@ fn ensure_snapshot_memory_allowed(
 /// captured allocation. Legacy snapshots without either source stay unknown.
 pub(super) fn restore_cpu_budget(
     requested: Option<u32>,
-    captured: Option<pplx_space_common_core::types::VcpuCount>,
-) -> Result<Option<pplx_space_common_core::types::VcpuCount>, Status> {
+    captured: Option<pplx_space_execution_spec::VcpuCount>,
+) -> Result<Option<pplx_space_execution_spec::VcpuCount>, Status> {
     requested
-        .map(pplx_space_common_core::types::VcpuCount::try_from_u32)
+        .map(pplx_space_execution_spec::VcpuCount::try_from_u32)
         .transpose()
         .map(|requested| requested.or(captured))
         .map_err(|error| {
@@ -424,7 +424,7 @@ impl SandboxManagerService {
                     runtime,
                     snapshots_enabled: req.snapshots_enabled,
                     rootfs_size_mb: req.rootfs_size_mb,
-                    disk_io_limits: pplx_space_common_core::types::DiskIoLimits::try_from_optional(
+                    disk_io_limits: pplx_space_execution_spec::DiskIoLimits::try_from_optional(
                         req.disk_io_max_operations_per_sec,
                         req.disk_io_max_bandwidth_mib_per_sec,
                     )
@@ -995,7 +995,7 @@ impl SandboxManagerService {
             alloc.guest_mac, alloc.tap_device, guest_cid
         );
 
-        let vm_config = if runtime == pplx_space_common_core::types::RuntimeKind::CloudHypervisor {
+        let vm_config = if runtime == pplx_space_execution_spec::RuntimeKind::CloudHypervisor {
             let memory_mib = snapshot_memory_mib
                 .and_then(|mib| std::num::NonZeroU64::new(u64::from(mib)))
                 .ok_or_else(|| {
@@ -1085,7 +1085,7 @@ impl SandboxManagerService {
                     )
                 })?;
             let resolved_execution_metadata =
-                pplx_space_common_core::types::ExecutionMetadata::try_from(&resolved_execution)
+                pplx_space_execution_spec::ExecutionMetadata::try_from(&resolved_execution)
                     .map_err(|error| Status::internal(error.to_string()))?;
             super::validation::require_environment_acknowledgement(
                 &requested_execution,

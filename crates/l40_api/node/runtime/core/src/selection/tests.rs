@@ -1,6 +1,9 @@
 use super::*;
 use crate::catalog::CompiledEnvironment;
 use pplx_space_cpu_arch::Arch;
+use pplx_space_execution_spec::{
+    EnvironmentReference, GuestOperatingSystem, GuestPlatform, StateFormatIdentity,
+};
 
 #[test]
 fn policy_defaults_to_initial_and_rejects_ambiguous_configuration() {

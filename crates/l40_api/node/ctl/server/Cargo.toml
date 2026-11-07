@@ -30,6 +30,7 @@ kubernetes = [
     "pplx-space-content-digest/serde",
     "pplx-space-cpu-arch/serde",
     "pplx-space-semver/serde",
+    "pplx-space-execution-spec/serde",
     "dep:pplx-space-kube-client",
 ]
 
@@ -45,6 +46,7 @@ pplx-space-host-layout = { workspace = true }
 pplx-space-common-grpc = { workspace = true, features = ["internal-tls"] }
 pplx-space-content-digest = { workspace = true }
 pplx-space-cpu-arch = { workspace = true }
+pplx-space-execution-spec = { workspace = true }
 pplx-space-grpc-rate-limiter = { workspace = true }
 pplx-space-grpc-server = { workspace = true }
 pplx-space-kube-client = { workspace = true, optional = true }

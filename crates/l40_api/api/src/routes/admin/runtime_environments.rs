@@ -32,8 +32,9 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use pplx_space_accounts::{NodeId, UserId};
+use pplx_space_common_core::types::NodeRole;
 use pplx_space_common_core::types::admin::ListAdminNodesFilters;
-use pplx_space_common_core::types::{EnvironmentReference, ExecutionPolicyObservation, NodeRole};
+use pplx_space_execution_spec::{EnvironmentReference, ExecutionPolicyObservation};
 use pplx_space_runtime_environment_policy_store::{
     self as policy_store, GetPolicyError, PolicyChange, PolicyChangeReason, RecordedChange,
     RuntimeEnvironmentPolicy, RuntimeEnvironmentPolicyRecord, RuntimeEnvironmentState,

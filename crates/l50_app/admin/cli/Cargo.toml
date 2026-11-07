@@ -28,6 +28,7 @@ uuid = { workspace = true }
 pplx-space-common-cli = { workspace = true }
 pplx-space-common-core = { workspace = true, features = ["serde"] }
 pplx-space-content-digest = { workspace = true, features = ["serde"] }
+pplx-space-execution-spec = { workspace = true, features = ["serde"] }
 
 [target.'cfg(unix)'.dependencies]
 nix = { workspace = true, features = ["term"] }

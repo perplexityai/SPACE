@@ -1,6 +1,6 @@
 use hyper::body::Bytes;
 use hyper_util::rt::TokioIo;
-use pplx_space_common_core::types::{BalloonConfig, BalloonMode, RateLimiter, TokenBucket};
+use pplx_space_execution_spec::{BalloonConfig, BalloonMode, RateLimiter, TokenBucket};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;

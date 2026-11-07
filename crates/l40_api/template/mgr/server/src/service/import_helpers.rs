@@ -20,7 +20,7 @@ pub(super) struct ImportTarget<'a> {
     pub(super) template_id: &'a str,
     pub(super) content_hash: &'a str,
     pub(super) partition: crate::db::TemplateCachePartition,
-    pub(super) environment: Option<pplx_space_common_core::types::EnvironmentReference>,
+    pub(super) environment: Option<pplx_space_execution_spec::EnvironmentReference>,
 }
 
 impl<'a> ImportTarget<'a> {

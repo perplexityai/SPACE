@@ -52,7 +52,7 @@ struct RegisteredEndpointRuntime {
     guest_cid: u32,
     spaced_host_pid: u32,
     runtime_pid: u32,
-    runtime_kind: pplx_space_common_core::types::RuntimeKind,
+    runtime_kind: pplx_space_execution_spec::RuntimeKind,
     vsock_path: PathBuf,
 }
 
@@ -156,7 +156,7 @@ impl NodeManagerService {
             .recorded_execution(sandbox_id.to_owned())
             .await?
             .map_or(
-                pplx_space_common_core::types::RuntimeKind::Firecracker,
+                pplx_space_execution_spec::RuntimeKind::Firecracker,
                 |execution| execution.runtime().kind,
             );
         let vsock_path =

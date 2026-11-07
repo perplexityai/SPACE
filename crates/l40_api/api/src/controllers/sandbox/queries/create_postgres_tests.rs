@@ -1418,8 +1418,7 @@ async fn postgres_insert_pooled_sandbox_writes_api_row() -> TestResult {
     );
     let mut claim = pooled_claim(sandbox_id, node_id);
     claim.disk_mib = Some(32768);
-    claim.disk_io_limits =
-        pplx_space_common_core::types::DiskIoLimits::try_new(5_000, 200).unwrap();
+    claim.disk_io_limits = pplx_space_execution_spec::DiskIoLimits::try_new(5_000, 200).unwrap();
     let mut tx = db.pool.begin().await?;
 
     let inserted_id =
@@ -1850,7 +1849,7 @@ async fn postgres_pool_configured_resources_uses_enabled_release_shape() -> Test
     assert_eq!(resources.resources.disk_mib, Some(32768));
     assert_eq!(
         resources.disk_io_limits,
-        pplx_space_common_core::types::DiskIoLimits::try_new(6_000, 150)?
+        pplx_space_execution_spec::DiskIoLimits::try_new(6_000, 150)?
     );
     sqlx::query(sql!(
         "UPDATE kubernetes_pool_configs SET disk_mib = 131073
@@ -1917,7 +1916,7 @@ async fn postgres_template_build_shape_prefers_the_builder_inventory() -> TestRe
     assert_eq!(
         load("sha256:shape").await?,
         Some(TemplateBuildShape {
-            vcpu: pplx_space_common_core::types::VcpuCount::try_from_u32(4).unwrap(),
+            vcpu: pplx_space_execution_spec::VcpuCount::try_from_u32(4).unwrap(),
             memory: pplx_space_byte_size::MemorySize::mib(4096).unwrap(),
         })
     );

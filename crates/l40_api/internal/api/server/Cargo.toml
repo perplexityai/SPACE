@@ -55,6 +55,7 @@ pplx-space-content-digest = { workspace = true, features = ["serde"] }
 pplx-space-cpu-arch = { workspace = true, features = ["serde"] }
 pplx-space-durations = { workspace = true, features = ["serde"] }
 pplx-space-ecw-credential = { workspace = true }
+pplx-space-execution-spec = { workspace = true, features = ["serde"] }
 pplx-space-k8s-ids = { workspace = true, features = ["serde"] }
 pplx-space-network-roles = { workspace = true, features = ["serde"] }
 pplx-space-sandbox-grpc = { workspace = true }

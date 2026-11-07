@@ -3024,8 +3024,8 @@ impl SandboxManagerService {
 }
 
 fn guest_flush_is_qualified(
-    image: pplx_space_common_core::types::guest_image::GuestImageContract,
-    execution: Option<&pplx_space_common_core::types::ExecutionMetadata>,
+    image: pplx_space_execution_spec::guest_image::GuestImageContract,
+    execution: Option<&pplx_space_execution_spec::ExecutionMetadata>,
 ) -> bool {
     image.expects_agent()
         && pplx_space_execution_catalog::guest::GuestProfile::for_existing(execution, image)

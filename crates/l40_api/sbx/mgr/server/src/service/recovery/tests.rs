@@ -19,7 +19,7 @@ fn snapshot_meta_with_sandbox(
         rootfs_size_bytes: None,
         created_at: "2026-05-21T00:00:00Z".to_string(),
         source: crate::snapshot_upload::SnapshotSource {
-            runtime: pplx_space_common_core::types::RUNTIME_FIRECRACKER_ALIAS.to_string(),
+            runtime: pplx_space_execution_spec::RUNTIME_FIRECRACKER_ALIAS.to_string(),
             runtime_version: None,
             state_format_version: None,
             template_id: "seed".to_string(),
@@ -297,7 +297,7 @@ fn restore_as_new_uses_target_disk_io_assignment() {
     let sandbox_id = "019d84bd-280d-7331-99c6-b63377f3a3a2";
     insert_quarantined_orphan(&conn, sandbox_id);
     let meta = restore_meta_with_process_env(std::collections::BTreeMap::new());
-    let target_limits = pplx_space_common_core::types::DiskIoLimits::try_new(5_000, 200).unwrap();
+    let target_limits = pplx_space_execution_spec::DiskIoLimits::try_new(5_000, 200).unwrap();
 
     insert_restoring_sandbox_row_from_snapshot(
         &conn,

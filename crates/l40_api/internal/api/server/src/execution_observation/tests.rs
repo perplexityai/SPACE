@@ -503,9 +503,7 @@ async fn policy_receipts_clear_unknown_evidence_and_commit_atomically() -> TestR
         let read = || {
             sqlx::query_scalar::<
                 _,
-                Option<
-                    sqlx::types::Json<pplx_space_common_core::types::ExecutionPolicyObservation>,
-                >,
+                Option<sqlx::types::Json<pplx_space_execution_spec::ExecutionPolicyObservation>>,
             >(sql!(
                 "SELECT execution_policy FROM node_status_snapshots WHERE node_id = $1"
             ))
@@ -551,10 +549,10 @@ async fn policy_receipts_clear_unknown_evidence_and_commit_atomically() -> TestR
 /// What a current node publishes on top of `inventory`: E0 known and usable,
 /// and a sort key on each runtime.
 fn with_observation(mut inventory: NodeExecutionInventory) -> NodeExecutionInventory {
-    use pplx_space_common_core::types::VersionSortKey;
     use pplx_space_execution_common::environment::{
         EnvironmentDefinition, EnvironmentObservation, KnownEnvironment,
     };
+    use pplx_space_execution_spec::VersionSortKey;
     let e0 = EnvironmentDefinition::from_document(include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../../../../../proto/execution/v1/fixtures/e0.json"

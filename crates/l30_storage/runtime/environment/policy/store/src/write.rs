@@ -20,7 +20,7 @@
 
 use pplx_space_accounts::UserId;
 use pplx_space_common_core::sql;
-use pplx_space_common_core::types::EnvironmentReference;
+use pplx_space_execution_spec::EnvironmentReference;
 use sqlx::{Postgres, Transaction};
 
 use crate::{RuntimeEnvironmentState, UnknownRuntimeEnvironmentState};

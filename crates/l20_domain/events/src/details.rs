@@ -290,9 +290,9 @@ impl SandboxEventDetails {
 
     pub fn execution_metadata(
         mut self,
-        execution: &pplx_space_common_core::types::ExecutionMetadata,
+        execution: &pplx_space_execution_spec::ExecutionMetadata,
     ) -> Self {
-        use pplx_space_common_core::types::ArtifactComponentKind;
+        use pplx_space_execution_spec::ArtifactComponentKind;
 
         self.runtime = Some(execution.runtime().kind.alias().to_string());
         self.runtime_version = Some(execution.runtime().version.to_string());

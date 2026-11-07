@@ -9,11 +9,11 @@ use pplx_space_accounts::{
 };
 use pplx_space_common_core::types::template_build_dir;
 use pplx_space_common_core::types::{
-    RUNTIME_FIRECRACKER_ALIAS, StorageUri, TEMPLATE_ROOTFS_ZSTD_CODEC, TEMPLATE_ROOTFS_ZSTD_FILE,
-    TEMPLATE_ROOTFS_ZSTD_LEVEL, TemplateArtifact, TemplateName, template_object_key,
-    template_object_prefix,
+    StorageUri, TEMPLATE_ROOTFS_ZSTD_CODEC, TEMPLATE_ROOTFS_ZSTD_FILE, TEMPLATE_ROOTFS_ZSTD_LEVEL,
+    TemplateArtifact, TemplateName, template_object_key, template_object_prefix,
 };
 use pplx_space_content_digest::ContentHash;
+use pplx_space_execution_spec::RUNTIME_FIRECRACKER_ALIAS;
 use pplx_space_node_api_client::cluster::{
     AuthenticatedClusterApiClient, ConnectClusterApiError,
     connect_from_env as connect_cluster_api_from_env,
@@ -226,7 +226,7 @@ pub async fn register_build_template(
 pub(crate) fn published_build_dir(
     template: &TemplateName,
     content_hash: &ContentHash,
-    environment: Option<pplx_space_common_core::types::EnvironmentReference>,
+    environment: Option<pplx_space_execution_spec::EnvironmentReference>,
 ) -> PathBuf {
     PathBuf::from(template_build_dir(
         template.as_str(),
@@ -240,7 +240,7 @@ pub(crate) fn published_build_dir(
 pub async fn publish_build(
     template_id: &str,
     content_hash: &str,
-    environment: Option<pplx_space_common_core::types::EnvironmentReference>,
+    environment: Option<pplx_space_execution_spec::EnvironmentReference>,
     publish_tags: &[String],
     publication: TemplatePublication,
 ) -> Result<(), PublishError> {

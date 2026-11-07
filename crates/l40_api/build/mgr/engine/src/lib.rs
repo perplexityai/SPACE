@@ -87,7 +87,7 @@ use pplx_space_template_manifest::TemplateMetadata;
 
 pub struct TemplateBuilder {
     caller_org: Option<OrgId>,
-    environment: Option<pplx_space_common_core::types::EnvironmentReference>,
+    environment: Option<pplx_space_execution_spec::EnvironmentReference>,
     network_policy: NetworkPolicyV1,
 }
 
@@ -101,14 +101,14 @@ pub struct BuildOutcome {
     pub content_hash: Option<String>,
     /// Environment the registered build is bound to, which selects the
     /// template-manager cache partition its artifacts live in.
-    pub environment: Option<pplx_space_common_core::types::EnvironmentReference>,
+    pub environment: Option<pplx_space_execution_spec::EnvironmentReference>,
 }
 
 /// A build template-manager accepted.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct RegisteredBuild {
     content_hash: String,
-    environment: Option<pplx_space_common_core::types::EnvironmentReference>,
+    environment: Option<pplx_space_execution_spec::EnvironmentReference>,
 }
 
 impl From<RegisteredBuild> for BuildOutcome {
@@ -195,7 +195,7 @@ pub enum BuildError {
     #[error(transparent)]
     ExecutionBinding(#[from] BuildExecutionBindingError),
     #[error("no guest exit strategy for build runtime {0}")]
-    UnsupportedGuestExit(pplx_space_common_core::types::RuntimeKind),
+    UnsupportedGuestExit(pplx_space_execution_spec::RuntimeKind),
     #[error("recipe builds require an ext4 image with a guest agent; import opaque disks instead")]
     UnsupportedGuestImage,
     #[error(transparent)]
@@ -528,7 +528,7 @@ fn build_vm_create_request(
     base_template_name: String,
     base_content_hash: String,
     rootfs_size_mb: Option<u32>,
-    environment: Option<pplx_space_common_core::types::EnvironmentReference>,
+    environment: Option<pplx_space_execution_spec::EnvironmentReference>,
     network_policy: &NetworkPolicyV1,
 ) -> CreateRequest {
     let mut request = CreateRequest {
@@ -620,7 +620,7 @@ impl TemplateBuilder {
 
     pub fn with_environment(
         mut self,
-        environment: Option<pplx_space_common_core::types::EnvironmentReference>,
+        environment: Option<pplx_space_execution_spec::EnvironmentReference>,
     ) -> Self {
         self.environment = environment;
         self

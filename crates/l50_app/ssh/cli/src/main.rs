@@ -5,9 +5,8 @@ use std::process::{Command, exit};
 
 use clap::Parser;
 use pplx_space_common_core::ids::sandbox_label_or_id as sandbox_label;
-use pplx_space_common_core::types::{
-    ExecutionMetadata, GuestOperatingSystem, OneOrMany, SandboxId, SandboxSelector,
-};
+use pplx_space_common_core::types::{OneOrMany, SandboxId, SandboxSelector};
+use pplx_space_execution_spec::{ExecutionMetadata, GuestOperatingSystem};
 use pplx_space_guest_process::DEFAULT_GUEST_USER;
 
 const SSH_KEY: &str = "/root/.ssh/sandbox_ed25519";

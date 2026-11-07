@@ -587,7 +587,7 @@ impl RuntimeSupervisorService {
         &self,
         sandbox_id: SandboxId,
         execution: pplx_space_common_core::types::SandboxActivationAttemptId,
-        budget: pplx_space_common_core::types::VcpuCount,
+        budget: pplx_space_execution_spec::VcpuCount,
         sealed_launch: Option<crate::verified_launch::VerifiedLaunch>,
     ) -> Result<Option<crate::verified_launch::OpenedRuntime>, Status> {
         self.execution_io(move |store| {

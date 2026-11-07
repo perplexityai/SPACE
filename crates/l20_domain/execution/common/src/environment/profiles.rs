@@ -1,6 +1,7 @@
 //! Runtime-neutral profiles share a wire shape; their semantics are implemented
 //! and qualified by the catalog/adapter, never inferred from a profile's spelling.
 use super::*;
+use pplx_space_execution_spec::{BootArtifact, ComponentIdentity};
 
 #[cfg(test)]
 mod tests;

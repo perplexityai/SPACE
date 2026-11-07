@@ -1,6 +1,6 @@
 use crate::catalog::*;
-use pplx_space_common_core::types::*;
 use pplx_space_cpu_arch::Arch;
+use pplx_space_execution_spec::{ExecutionMetadata, RuntimeKind};
 
 #[test]
 fn initial_identity_and_legacy_restore_do_not_depend_on_display_name() {

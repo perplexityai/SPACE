@@ -1077,7 +1077,7 @@ fn sandbox_pod_shapes_render_expected_yaml() {
     // `Start`. A stopped source upgraded in place on its node and left
     // stopped, the same source upgraded as it starts, and a suspended source
     // staged from its checkpoint elsewhere and upgraded as it resumes.
-    let upgrade_target = pplx_space_common_core::types::EnvironmentReference::new(
+    let upgrade_target = pplx_space_execution_spec::EnvironmentReference::new(
         pplx_space_content_digest::Digest::sha256([7; 32]),
     );
     let runtime_upgrade = |target_state,
@@ -1669,7 +1669,7 @@ fn sandbox_pod_renders_local_policy_authorities_and_disk_io_limits() {
             runtime: SandboxRuntimePodMetadata {
                 auto_lifecycle_authority: PolicyAuthority::Local,
                 network_policy_authority: PolicyAuthority::Local,
-                disk_io_limits: pplx_space_common_core::types::DiskIoLimits::try_new(5_000, 200)
+                disk_io_limits: pplx_space_execution_spec::DiskIoLimits::try_new(5_000, 200)
                     .unwrap(),
                 ..test_runtime(&sandbox_owner, &auto_lifecycle_json, &network_policy_json)
             },
@@ -3741,7 +3741,7 @@ fn render_stopped_re_placement(stopped_materialization: Option<StoppedMaterializ
 }
 
 fn environment_requirement(
-    reference: &pplx_space_common_core::types::EnvironmentReference,
+    reference: &pplx_space_execution_spec::EnvironmentReference,
 ) -> NodeSelectorRequirement {
     NodeSelectorRequirement {
         key: environment_label_key(reference),
@@ -3750,7 +3750,7 @@ fn environment_requirement(
     }
 }
 
-fn bound_environment() -> pplx_space_common_core::types::EnvironmentReference {
+fn bound_environment() -> pplx_space_execution_spec::EnvironmentReference {
     format!("sha256:{}", "e".repeat(64)).parse().unwrap()
 }
 

@@ -1,7 +1,7 @@
 use std::fmt;
 
-use crate::types::EnvironmentReference;
 use pplx_space_content_digest::DigestParseError;
+use pplx_space_execution_spec::EnvironmentReference;
 
 /// Separates a rootfs digest from its environment in a partitioned build
 /// directory name. Digests and environment references never contain it.
@@ -24,6 +24,7 @@ const ENVIRONMENT_SEPARATOR: char = '@';
 ///
 /// ```rust
 /// # use pplx_space_common_core::types::*;
+/// # use pplx_space_execution_spec::EnvironmentReference;
 /// # use pplx_space_content_digest::Digest;
 /// let initial = EnvironmentReference::new(Digest::sha256([1; 32]));
 /// let other = EnvironmentReference::new(Digest::sha256([2; 32]));

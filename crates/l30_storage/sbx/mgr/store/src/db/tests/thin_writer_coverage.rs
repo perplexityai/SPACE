@@ -5,9 +5,10 @@
 use crate::db::Connection;
 use crate::state::SandboxStatus;
 use pplx_space_common_core::types::{
-    LocalArtifactId, RuntimeKind, SandboxCleanupEpisodeId, SandboxId, SandboxQuarantineNextAction,
+    LocalArtifactId, SandboxCleanupEpisodeId, SandboxId, SandboxQuarantineNextAction,
     SandboxQuarantineReasonCode, SandboxQuarantineSource, TransferScopeId,
 };
+use pplx_space_execution_spec::RuntimeKind;
 use rusqlite::params;
 
 use super::accepted_shapes_quarantine::{adoptable, insert_claimed_adoptable};
