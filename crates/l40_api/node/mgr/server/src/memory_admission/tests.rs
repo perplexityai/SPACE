@@ -221,3 +221,63 @@ async fn unreadable_meminfo_fails_admission_closed() {
         MemoryAdmissionEvaluationError::NodeMemory(NodeMemoryCapacityError::Read { .. })
     ));
 }
+
+#[tokio::test]
+async fn admittable_count_matches_admission_at_the_boundary() {
+    // 100_000 MiB total, 20_000 used, one running VM with 1024 MiB growth
+    // reserve, 1024 MiB reserve: 100_000 - 20_000 - 1024 - 1024 = 77_952 MiB
+    // free for new demand, i.e. 9 sandboxes of 8320 MiB (74_880), not 10.
+    let (_root, sources) = sources(100_000, 80_000);
+    let sandbox_id = sandbox_id("019d84bd-280d-7331-99c6-b63377f3a3a2");
+    write_cgroup(&sources, sandbox_id, 256, 8320);
+    let admission = MemoryAdmissionConfig { reserve_mib: 1024 };
+    let leases = [lease(sandbox_id)];
+    let observation = admission
+        .observe_active_leases(&leases, &sources)
+        .await
+        .unwrap();
+
+    let admittable = admission.admittable_new_sandboxes(8320, &observation, 64);
+
+    assert_eq!(admittable, 9);
+    admission
+        .check_new_allocation_at_commit(8320 * 9, &observation, &leases)
+        .unwrap();
+    admission
+        .check_new_allocation_at_commit(8320 * 10, &observation, &leases)
+        .unwrap_err();
+}
+
+#[tokio::test]
+async fn admittable_count_is_bounded_by_the_slot_limit() {
+    let (_root, sources) = sources(1_000_000, 1_000_000);
+    let admission = MemoryAdmissionConfig { reserve_mib: 1024 };
+    let observation = admission
+        .observe_active_leases(&[], &sources)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        admission.admittable_new_sandboxes(8320, &observation, 64),
+        64
+    );
+    assert_eq!(admission.admittable_new_sandboxes(8320, &observation, 0), 0);
+}
+
+#[tokio::test]
+async fn full_node_admits_no_new_sandbox() {
+    // 90_000 MiB used plus 9_000 MiB growth reserve: an 8320 MiB sandbox
+    // needs 108_344 MiB of 100_000.
+    let (_root, sources) = sources(100_000, 10_000);
+    let admission = MemoryAdmissionConfig { reserve_mib: 1024 };
+    let mut observation = admission
+        .observe_active_leases(&[], &sources)
+        .await
+        .unwrap();
+    observation.existing_growth_reserve_mib = 9_000;
+
+    assert_eq!(
+        admission.admittable_new_sandboxes(8320, &observation, 64),
+        0
+    );
+}

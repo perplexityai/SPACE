@@ -1265,7 +1265,7 @@ impl SandboxManagerService {
         node_client: &mut NodeManagerGrpcClient,
     ) -> Result<(), Status> {
         let status = node_client
-            .get_network_pool_status(NetworkPoolStatusRequest {})
+            .get_network_pool_status(NetworkPoolStatusRequest::default())
             .await
             .map_err(|error| {
                 Status::new(

@@ -827,7 +827,7 @@ impl SandboxManagerService {
         node_client: &mut NodeManagerGrpcClient,
     ) -> Result<NodeSandboxMemoryPolicy, Status> {
         let response = node_client
-            .get_network_pool_status(NetworkPoolStatusRequest {})
+            .get_network_pool_status(NetworkPoolStatusRequest::default())
             .await
             .map_err(memory_policy_lookup_error)?
             .into_inner();
@@ -922,7 +922,7 @@ impl SandboxManagerService {
                 let mut client = node_manager.clone();
                 async move {
                     client
-                        .get_network_pool_status(NetworkPoolStatusRequest {})
+                        .get_network_pool_status(NetworkPoolStatusRequest::default())
                         .await
                 }
             },
