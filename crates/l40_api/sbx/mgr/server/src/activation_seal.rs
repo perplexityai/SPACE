@@ -153,7 +153,7 @@ impl ActivationSeal {
             in_flight: Arc::new(InFlightRegistry::default()),
         };
         let state = seal.lock_state();
-        pplx_space_metrics::sandbox::admission::node_activation_seal_sealed(
+        pplx_space_sandbox_metrics::admission::node_activation_seal_sealed(
             state.record.is_err() || state.sealed().is_some(),
         );
         if let Some(sealed) = state.sealed() {
@@ -260,7 +260,7 @@ impl ActivationSeal {
         state.record = Ok(Some(record));
         // Under the state lock, so gauges from racing seals and unseals land
         // in the order the state changed.
-        pplx_space_metrics::sandbox::admission::node_activation_seal_sealed(true);
+        pplx_space_sandbox_metrics::admission::node_activation_seal_sealed(true);
         drop(state);
         tracing::info!(
             epoch,
@@ -299,7 +299,7 @@ impl ActivationSeal {
         };
         persist(db, record)?;
         state.record = Ok(Some(record));
-        pplx_space_metrics::sandbox::admission::node_activation_seal_sealed(false);
+        pplx_space_sandbox_metrics::admission::node_activation_seal_sealed(false);
         drop(state);
         tracing::info!(epoch, "unsealed sandbox-manager VM activations");
         Ok(())
@@ -492,7 +492,7 @@ impl InFlightRegistry {
 
 fn emit_in_flight(entries: &BTreeMap<u64, InFlightEntry>, kind: InFlightActivationKind) {
     let count = entries.values().filter(|entry| entry.kind == kind).count();
-    pplx_space_metrics::sandbox::admission::node_activation_seal_in_flight(kind.as_str(), count);
+    pplx_space_sandbox_metrics::admission::node_activation_seal_in_flight(kind.as_str(), count);
 }
 
 /// Counts one piece of activation work as in flight until dropped, on
