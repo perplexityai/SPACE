@@ -35,6 +35,7 @@ pplx-space-pii = { workspace = true }
 pplx-space-rpc-contracts = { workspace = true }
 pplx-space-semver = { workspace = true }
 pplx-space-sql-locator = { workspace = true }
+pplx-space-test-hooks = { workspace = true }
 serde = { workspace = true, features = ["derive"], optional = true }
 serde_json = { workspace = true, optional = true }
 sqlx = { workspace = true, features = ["postgres", "uuid"], optional = true }
@@ -73,10 +74,3 @@ sqlx = [
     "pplx-space-k8s-ids/sqlx",
     "pplx-space-accounts/sqlx",
 ]
-# Compiles in the test-only environment overrides (see `env::test_hook`). Only
-# kind and smoke images and test builds enable it; release binaries cannot read
-# these variables, so they are not part of the public configuration surface.
-# Enable it only from `[features]` or `[dev-dependencies]`: a workspace member
-# that enables it in its normal dependencies reaches the release builds, which
-# ci/scripts/check-release-build-features.sh fails.
-test-hooks = []

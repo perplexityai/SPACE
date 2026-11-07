@@ -344,11 +344,11 @@ fn pool_pod_config_from_env() -> Result<SandboxPodConfigValues, WarmPoolError> {
 }
 
 fn sandbox_namespace_from_env() -> String {
-    sandbox_namespace_from_environment(&pplx_space_common_core::env::ProcessEnvironment)
+    sandbox_namespace_from_environment(&pplx_space_env_vars::ProcessEnvironment)
 }
 
 pub(crate) fn sandbox_namespace_from_environment(
-    env: &dyn pplx_space_common_core::env::Environment,
+    env: &dyn pplx_space_env_vars::Environment,
 ) -> String {
     env.var(SANDBOX_NAMESPACE_ENV)
         .or_else(|_| env.var(POD_NAMESPACE_ENV))

@@ -1,6 +1,6 @@
 struct OneVar;
 
-impl super::Environment for OneVar {
+impl pplx_space_env_vars::Environment for OneVar {
     fn var_os(&self, name: &str) -> Option<std::ffi::OsString> {
         (name == "SPACE_TEST_HOOK_PROBE").then(|| "7".into())
     }

@@ -113,7 +113,7 @@ pub struct GcConfig {
 impl GcConfig {
     const ENV_ENABLED: &'static str = "SPACE_SBX_GC_ENABLED";
     const ENV_ENGAGE_FRACTION: &'static str = "SPACE_SBX_GC_ENGAGE_FRACTION";
-    /// Test hooks (`pplx_space_common_core::env::test_hook`): compiled in only
+    /// Test hooks (`pplx_space_test_hooks::test_hook`): compiled in only
     /// with the `test-hooks` feature, so release binaries cannot shrink these
     /// timers. Smoke benches use them to make the loop observable.
     const ENV_TARGET_FRACTION: &'static str = "SPACE_SBX_GC_TARGET_FRACTION";
@@ -143,7 +143,7 @@ impl GcConfig {
             .ok()
             .and_then(|s| s.parse::<f64>().ok())
             .unwrap_or(Self::DEFAULT_ENGAGE_FRACTION);
-        let target = pplx_space_common_core::env::test_hook_var(Self::ENV_TARGET_FRACTION)
+        let target = pplx_space_test_hooks::test_hook_var(Self::ENV_TARGET_FRACTION)
             .and_then(|s| s.parse::<f64>().ok())
             .unwrap_or(Self::DEFAULT_TARGET_FRACTION);
         let (engage_fraction, target_fraction) = crate::disk_usage::validate_fraction_pair(
@@ -153,14 +153,14 @@ impl GcConfig {
             Self::ENV_ENGAGE_FRACTION,
             Self::ENV_TARGET_FRACTION,
         );
-        let interval_secs = pplx_space_common_core::env::test_hook_var(Self::ENV_INTERVAL_SECS)
+        let interval_secs = pplx_space_test_hooks::test_hook_var(Self::ENV_INTERVAL_SECS)
             .and_then(|s| s.parse::<u64>().ok())
             .filter(|n| *n > 0)
             .unwrap_or(Self::DEFAULT_INTERVAL_SECS);
-        let grace_secs = pplx_space_common_core::env::test_hook_var(Self::ENV_GRACE_SECS)
+        let grace_secs = pplx_space_test_hooks::test_hook_var(Self::ENV_GRACE_SECS)
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(Self::DEFAULT_GRACE_SECS);
-        let idle_secs = pplx_space_common_core::env::test_hook_var(Self::ENV_IDLE_SECS)
+        let idle_secs = pplx_space_test_hooks::test_hook_var(Self::ENV_IDLE_SECS)
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(Self::DEFAULT_IDLE_SECS);
         if enabled && grace_secs < Self::SAFETY_GRACE_FLOOR_SECS {

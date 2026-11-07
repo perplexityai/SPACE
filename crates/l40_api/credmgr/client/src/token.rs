@@ -46,7 +46,7 @@ pub enum BearerTokenError {
     InvalidMetadata(#[from] tonic::metadata::errors::InvalidMetadataValue),
 }
 
-fn token_path(env: &dyn pplx_space_common_core::env::Environment) -> (PathBuf, bool) {
+fn token_path(env: &dyn pplx_space_env_vars::Environment) -> (PathBuf, bool) {
     match env
         .var(SPACE_CREDMGR_TOKEN_PATH_ENV)
         .ok()
@@ -63,11 +63,11 @@ fn token_path(env: &dyn pplx_space_common_core::env::Environment) -> (PathBuf, b
 /// Resolve the current bearer token: projected token file first, static env
 /// secret as fallback (only when the path was not explicitly configured).
 pub fn bearer_token() -> Result<String, BearerTokenError> {
-    bearer_token_from_environment(&pplx_space_common_core::env::ProcessEnvironment)
+    bearer_token_from_environment(&pplx_space_env_vars::ProcessEnvironment)
 }
 
 fn bearer_token_from_environment(
-    env: &dyn pplx_space_common_core::env::Environment,
+    env: &dyn pplx_space_env_vars::Environment,
 ) -> Result<String, BearerTokenError> {
     let (path, explicit_path) = token_path(env);
     match read_token_file(&path) {

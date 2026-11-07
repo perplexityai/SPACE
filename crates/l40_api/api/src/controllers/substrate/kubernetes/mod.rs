@@ -470,7 +470,7 @@ pub enum KubernetesStateInitError {
 
 impl KubernetesState {
     pub async fn try_from_env() -> Result<Option<Self>, KubernetesStateInitError> {
-        if !pplx_space_common_core::env::env_flag_var("SPACE_K8S_CONTROL_PLANE", false) {
+        if !pplx_space_env_vars::env_flag_var("SPACE_K8S_CONTROL_PLANE", false) {
             return Ok(None);
         }
 
@@ -513,7 +513,7 @@ impl KubernetesState {
                 super::runtime_upgrade::RuntimeUpgradeAtActivation::from_env(),
             environment_placement:
                 super::environment_placement::EnvironmentPlacementGate::from_environment(
-                    &pplx_space_common_core::env::ProcessEnvironment,
+                    &pplx_space_env_vars::ProcessEnvironment,
                 )?,
             activation_client_attribution: super::ActivationClientAttribution::from_env(),
             sandbox_proxy_port: DEFAULT_SANDBOX_PROXY_PORT,

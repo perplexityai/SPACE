@@ -248,7 +248,7 @@ impl ActivationClientAttribution {
     }
 
     pub fn from_env() -> Self {
-        Self::from_enabled(pplx_space_common_core::env::env_flag_var(Self::ENV, false))
+        Self::from_enabled(pplx_space_env_vars::env_flag_var(Self::ENV, false))
     }
 
     pub fn is_enabled(self) -> bool {
@@ -1917,7 +1917,7 @@ impl Substrate {
         // wherever it's set; Kubernetes reads it again for its pods.
         let environment_placement =
             environment_placement::EnvironmentPlacementGate::from_environment(
-                &pplx_space_common_core::env::ProcessEnvironment,
+                &pplx_space_env_vars::ProcessEnvironment,
             )
             .map_err(|error| SubstrateError::Failed {
                 message: error.to_string(),

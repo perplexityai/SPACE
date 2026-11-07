@@ -401,7 +401,7 @@ async fn org_encryption_flag(pool: &PgPool, org_id: OrgId) -> Result<Option<bool
 /// create: the flag stamped on the row is immutable, so toggling this never
 /// changes how an existing sandbox starts, suspends, or restores.
 fn byok_volume_encryption_engaged() -> bool {
-    pplx_space_common_core::env::env_flag_var("SPACE_BYOK_VOLUME_ENCRYPTION", false)
+    pplx_space_env_vars::env_flag_var("SPACE_BYOK_VOLUME_ENCRYPTION", false)
 }
 
 #[derive(Debug, thiserror::Error)]

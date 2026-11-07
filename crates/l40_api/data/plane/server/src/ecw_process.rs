@@ -828,14 +828,11 @@ fn client_bound_process_start_key(
 }
 
 fn ecw_default_workdir(template_id: Option<&str>) -> Option<String> {
-    ecw_default_workdir_from_environment(
-        template_id,
-        &pplx_space_common_core::env::ProcessEnvironment,
-    )
+    ecw_default_workdir_from_environment(template_id, &pplx_space_env_vars::ProcessEnvironment)
 }
 fn ecw_default_workdir_from_environment(
     template_id: Option<&str>,
-    env: &dyn pplx_space_common_core::env::Environment,
+    env: &dyn pplx_space_env_vars::Environment,
 ) -> Option<String> {
     let template_id = template_id.filter(|name| !name.is_empty())?;
     let templates = env

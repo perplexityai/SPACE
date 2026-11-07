@@ -163,9 +163,7 @@ pub(super) struct ParsedPortExposureApplyState {
 /// than rolling the 347-node node-ctl DaemonSet. Fail-safe: unset means
 /// enabled; any set value other than an explicit truthy disables.
 pub(super) fn deleted_partition_enabled() -> bool {
-    pplx_space_common_core::env::env_destructive_gate_var(
-        "SPACE_INTERNAL_API_DELETED_PARTITION_ENABLED",
-    )
+    pplx_space_env_vars::env_destructive_gate_var("SPACE_INTERNAL_API_DELETED_PARTITION_ENABLED")
 }
 
 /// Plausibility ceiling for the desired-state deleted partition.

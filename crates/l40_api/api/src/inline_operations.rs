@@ -125,7 +125,7 @@ impl Default for InlineOperationsConfig {
 
 impl InlineOperationsConfig {
     pub fn from_env() -> Self {
-        Self::from_environment(&pplx_space_common_core::env::ProcessEnvironment)
+        Self::from_environment(&pplx_space_env_vars::ProcessEnvironment)
     }
 
     /// A kind outside [`INLINE_CAPABLE_KINDS`], or not a kind at all, is
@@ -133,7 +133,7 @@ impl InlineOperationsConfig {
     /// above 1024 is capped. A malformed organization limit sets none, with
     /// a warning. The test hold is capped at 600 s; `0` or a malformed value
     /// sets none.
-    pub fn from_environment(env: &dyn pplx_space_common_core::env::Environment) -> Self {
+    pub fn from_environment(env: &dyn pplx_space_env_vars::Environment) -> Self {
         let default = Self::default();
         let mut kinds = Vec::new();
         for name in env
@@ -156,7 +156,7 @@ impl InlineOperationsConfig {
             }
         }
         Self {
-            enabled: pplx_space_common_core::env::env_flag(
+            enabled: pplx_space_env_vars::env_flag(
                 env.var(INLINE_OPERATIONS_ENABLED_ENV).ok().as_deref(),
                 default.enabled,
             ),
@@ -184,16 +184,13 @@ impl InlineOperationsConfig {
                     }
                 }
             }),
-            test_hold: pplx_space_common_core::env::test_hook(env, INLINE_TEST_HOLD_SECS_ENV)
+            test_hold: pplx_space_test_hooks::test_hook(env, INLINE_TEST_HOLD_SECS_ENV)
                 .and_then(|raw| raw.trim().parse::<u64>().ok())
                 .filter(|secs| *secs > 0)
                 .map(|secs| Duration::from_secs(secs).min(MAX_INLINE_TEST_HOLD)),
-            test_release_file: pplx_space_common_core::env::test_hook(
-                env,
-                INLINE_TEST_RELEASE_FILE_ENV,
-            )
-            .filter(|path| !path.is_empty())
-            .map(PathBuf::from),
+            test_release_file: pplx_space_test_hooks::test_hook(env, INLINE_TEST_RELEASE_FILE_ENV)
+                .filter(|path| !path.is_empty())
+                .map(PathBuf::from),
         }
     }
 }

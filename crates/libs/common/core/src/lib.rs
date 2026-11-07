@@ -24,7 +24,6 @@ pub mod types;
 #[cfg(feature = "archive")]
 pub mod archive;
 
-pub mod env;
 pub mod guest;
 pub mod host;
 pub use pplx_space_rpc_contracts::{

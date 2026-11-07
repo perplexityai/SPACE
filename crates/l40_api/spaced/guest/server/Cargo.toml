@@ -34,7 +34,7 @@ service-entrypoint = [
     "pplx-space-spaced-guest-execution/telemetry",
 ]
 # Compiles in the test-only environment hooks; never enabled for release builds.
-test-hooks = ["pplx-space-common-core/test-hooks", "pplx-space-spaced-guest-execution/test-hooks"]
+test-hooks = ["pplx-space-test-hooks/test-hooks", "pplx-space-spaced-guest-execution/test-hooks"]
 # Forwards to `service-host`'s telemetry pipeline. The entry point is where
 # this crate initializes telemetry, so the gate has to reach it rather than the
 # binary, and it implies the entry point it configures.
@@ -82,19 +82,20 @@ pplx-space-observability = { workspace = true }
 pplx-space-spaced-common = { workspace = true }
 pplx-space-spaced-update = { workspace = true }
 pplx-space-spaced-guest-update = { workspace = true }
+pplx-space-test-hooks = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
 
 [target.'cfg(unix)'.dev-dependencies]
 serde_json = { workspace = true }
-pplx-space-common-core = { workspace = true, features = ["test-hooks"] }
 opentelemetry-proto = { workspace = true, features = ["gen-tonic", "metrics"] }
 pplx-space-spaced-guest-client = { workspace = true }
 pplx-space-observability = { workspace = true, features = ["test-capture"] }
 h2 = { workspace = true }
 prost = { workspace = true }
 pplx-space-test-env = { workspace = true }
+pplx-space-test-hooks = { workspace = true, features = ["test-hooks"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 # `test-util` enables `#[tokio::test(start_paused = true)]` so the
