@@ -94,8 +94,12 @@ def drain_restore_operation_lands_in_its_target(test: smoke.KindEcw) -> None:
             "superseded_by_pause", target="started", snapshot_id=snapshot, due_in_seconds=NOT_DUE_SECONDS
         )
         answer = drain.ecw_request("pause")
+        # A pause of an already suspended sandbox finds no pod to suspend on
+        # Kubernetes and answers 503 with or without a drain restore waiting;
+        # what this phase checks is that the call still cancels the restore.
         test.verify(
-            answer.status in (200, 204, 409),
+            answer.status in (200, 204, 409)
+            or (answer.status == 503 and "not assigned to a pod" in answer.detail),
             "an ECW pause of the suspended sandbox failed instead of answering",
             ecw_status=answer.status,
             ecw_detail=answer.detail,
