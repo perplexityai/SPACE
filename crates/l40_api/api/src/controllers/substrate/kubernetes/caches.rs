@@ -33,12 +33,21 @@ pub struct K8sCaches {
     /// `nodes.state().is_empty()` collapses those two, so a total node outage
     /// would read as "unknown" and fail open forever.
     nodes_ready: super::pod_reflector::ReflectorReady,
+    /// Node admission rejections of sandbox pods, from kubelet
+    /// `FailedCreatePodSandBox` Events; lets a create fail fast instead of
+    /// waiting out its ready budget on a node that refused the pod.
+    pub sandbox_create_rejections: super::sandbox_create_rejections::SandboxCreateRejections,
 }
 
 impl K8sCaches {
     /// Spawn the reflector tasks. Does not block on first-list — call
     /// [`K8sCaches::wait_until_ready`] if the caller wants to wait.
-    pub fn spawn(client: Client, node_api_namespace: &str) -> Self {
+    pub fn spawn(client: Client, node_api_namespace: &str, sandbox_namespace: &str) -> Self {
+        let sandbox_create_rejections =
+            super::sandbox_create_rejections::SandboxCreateRejections::spawn(
+                client.clone(),
+                sandbox_namespace,
+            );
         let pod_api: Api<Pod> = Api::namespaced(client.clone(), node_api_namespace);
         let pod_config = watcher::Config::default().labels(NODE_API_COMPONENT_LABEL);
         let (pod_store, pod_writer) = reflector::store::<Pod>();
@@ -91,6 +100,7 @@ impl K8sCaches {
             node_api_pods: pod_store,
             nodes: node_store,
             nodes_ready,
+            sandbox_create_rejections,
         }
     }
 
@@ -117,6 +127,8 @@ impl K8sCaches {
             node_api_pods,
             nodes,
             nodes_ready: ready,
+            sandbox_create_rejections:
+                super::sandbox_create_rejections::SandboxCreateRejections::empty(),
         }
     }
 

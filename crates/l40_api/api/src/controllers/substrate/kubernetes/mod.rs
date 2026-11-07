@@ -50,6 +50,7 @@ mod cancel_rate_tracker;
 mod pod_reflector;
 mod pod_worker_channels;
 mod restore_waiters;
+mod sandbox_create_rejections;
 mod sandbox_pod_view;
 mod store;
 
@@ -464,7 +465,11 @@ impl KubernetesState {
             .or_else(|_| std::env::var("POD_NAMESPACE"))
             .unwrap_or_else(|_| sandbox_namespace.clone());
 
-        let caches = Arc::new(K8sCaches::spawn(client.clone(), &node_api_namespace));
+        let caches = Arc::new(K8sCaches::spawn(
+            client.clone(),
+            &node_api_namespace,
+            &sandbox_namespace,
+        ));
         // Wait briefly for first list, but don't fail startup on a slow/unhealthy
         // API server — the stores will backfill once the watch reconnects.
         if let Err(err) = caches.wait_until_ready().await {

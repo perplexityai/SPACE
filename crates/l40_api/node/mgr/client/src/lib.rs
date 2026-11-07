@@ -2,6 +2,12 @@
 /// plus staging overhead. Expiry does not cancel node-owned capture work.
 pub const MEMORY_CAPTURE_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(960);
 
+/// Prefix of node-mgr's `ResourceExhausted` message when memory admission
+/// refuses a new sandbox. It survives the shim's CRI error wrapping, so the
+/// API can tell this refusal from transient backpressure that also maps to
+/// `ResourceExhausted`.
+pub const MEMORY_ADMISSION_REFUSED: &str = "node memory admission refused";
+
 pub use pplx_space_node_mgr_protocol::proto;
 
 pub mod environment_selection;

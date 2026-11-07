@@ -66,6 +66,8 @@ fn caches_with_pods(pods: Vec<Pod>) -> K8sCaches {
         node_api_pods: pod_store,
         nodes: node_store,
         nodes_ready: super::super::pod_reflector::ReflectorReady::always_ready(),
+        sandbox_create_rejections:
+            super::super::sandbox_create_rejections::SandboxCreateRejections::empty(),
     }
 }
 
@@ -90,6 +92,8 @@ async fn startup_wait_does_not_lose_node_readiness_notification() {
         node_api_pods: pod_store,
         nodes: node_store,
         nodes_ready,
+        sandbox_create_rejections:
+            super::super::sandbox_create_rejections::SandboxCreateRejections::empty(),
     };
     let mut startup_wait = std::pin::pin!(caches.wait_until_ready());
     assert!(matches!(poll!(startup_wait.as_mut()), Poll::Pending));
@@ -130,6 +134,8 @@ async fn startup_wait_returns_known_node_writer_failure_without_timing_out() {
         node_api_pods: pod_store,
         nodes: node_store,
         nodes_ready,
+        sandbox_create_rejections:
+            super::super::sandbox_create_rejections::SandboxCreateRejections::empty(),
     };
     let result = tokio::time::timeout(Duration::from_millis(100), caches.wait_until_ready())
         .await
@@ -149,6 +155,8 @@ async fn startup_wait_reports_node_writer_failure_while_pods_are_pending() {
         node_api_pods: pod_store,
         nodes: node_store,
         nodes_ready,
+        sandbox_create_rejections:
+            super::super::sandbox_create_rejections::SandboxCreateRejections::empty(),
     };
     let result = tokio::time::timeout(Duration::from_millis(100), caches.wait_until_ready())
         .await
