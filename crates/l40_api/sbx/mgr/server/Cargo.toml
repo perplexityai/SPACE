@@ -79,6 +79,7 @@ pplx-space-lru-reaper = { workspace = true }
 pplx-space-env-vars = { workspace = true }
 pplx-space-content-digest = { workspace = true, features = ["serde"] }
 pplx-space-cpu-arch = { workspace = true, features = ["serde"] }
+pplx-space-linux-ids = { workspace = true, features = ["serde"] }
 pplx-space-network-roles = { workspace = true, features = ["serde"] }
 pplx-space-sandbox-grpc = { workspace = true }
 pplx-space-credential-injection = { workspace = true }

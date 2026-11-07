@@ -978,7 +978,7 @@ pub(super) fn validate_config(config: &NetworkPoolConfig) -> Result<(), String> 
     if config.max_slots == 0 {
         return Err("max_slots must be non-zero".to_string());
     }
-    if config.max_slots > pplx_space_common_core::types::MAX_LINUX_NETWORK_SLOT + 1 {
+    if config.max_slots > pplx_space_linux_ids::MAX_LINUX_NETWORK_SLOT + 1 {
         return Err("max_slots exceeds the six-digit slot namespace".to_string());
     }
     if config.max_slots > net::MAX_IPV4_NETWORK_SLOTS {

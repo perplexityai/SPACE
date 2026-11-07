@@ -34,7 +34,6 @@ pub mod environment;
 pub use pplx_space_execution_spec::execution;
 pub use pplx_space_execution_spec::guest_image;
 pub use pplx_space_execution_spec::host_cpu;
-pub mod host_linux;
 pub mod kek;
 pub mod label;
 pub mod node;
@@ -54,7 +53,6 @@ pub mod snapshot;
 pub mod subject;
 pub mod template;
 pub mod time;
-pub mod transport_vsock;
 
 #[cfg(feature = "serde")]
 pub use admin::*;
@@ -67,7 +65,6 @@ pub use env::*;
 pub use environment::*;
 pub use execution::*;
 pub use host_cpu::*;
-pub use host_linux::*;
 pub use kek::*;
 pub use label::*;
 pub use node::*;
@@ -100,4 +97,3 @@ pub use template::{
     TemplateVisibilityParseError,
 };
 pub use time::*;
-pub use transport_vsock::*;

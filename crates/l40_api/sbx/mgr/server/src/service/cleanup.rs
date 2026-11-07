@@ -1,5 +1,6 @@
 use pplx_space_accounts::JobId;
-use pplx_space_common_core::types::{LinuxPid, LocalArtifactId};
+use pplx_space_common_core::types::LocalArtifactId;
+use pplx_space_linux_ids::LinuxPid;
 
 use super::cleanup_executor::CleanupWait;
 use super::cleanup_support::{

@@ -62,6 +62,7 @@ pplx-space-content-digest = { workspace = true }
 pplx-space-cpu-arch = { workspace = true }
 pplx-space-grpc-rate-limiter = { workspace = true }
 pplx-space-grpc-server = { workspace = true }
+pplx-space-linux-ids = { workspace = true }
 pplx-space-local-health = { workspace = true }
 pplx-space-service-lifecycle = { workspace = true }
 pplx-space-service-mutex = { workspace = true }
