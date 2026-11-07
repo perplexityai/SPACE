@@ -13,11 +13,11 @@
 "pplx-space-btrfs" = { to = "crates/l10_foundation/btrfs" }
 "pplx-space-byte-size" = { to = "crates/l10_foundation/byte/size" }
 "pplx-space-common-cli" = { to = "crates/l10_foundation/common/cli" }
-"pplx-space-common-connection-admission" = { to = "crates/l10_foundation/common/connection/admission" }
 "pplx-space-common-grpc" = { to = "crates/l10_foundation/common/grpc/transport" }  # leaf
 "pplx-space-common-io" = { to = "crates/l10_foundation/common/io" }
 "pplx-space-common-jobs" = { to = "crates/l10_foundation/common/jobs" }
 "pplx-space-common-proto-build" = { to = "crates/l10_foundation/common/proto/build" }
+"pplx-space-common-connection-admission" = { to = "crates/l10_foundation/connection/admission", rename = "pplx-space-connection-admission" }  # renamed
 "pplx-space-content-digest" = { to = "crates/l10_foundation/content/digest" }
 "pplx-space-cpu-arch" = { to = "crates/l10_foundation/cpu/arch" }
 "pplx-space-dependency-drain" = { to = "crates/l10_foundation/dependency/drain" }

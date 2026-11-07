@@ -21,7 +21,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Semaphore;
 
-use pplx_space_common_connection_admission::{
+use pplx_space_connection_admission::{
     ConnectionAdmissionConfig, ConnectionAdmissionFailure, ConnectionAdmissionObservation,
     admit_connections,
 };
