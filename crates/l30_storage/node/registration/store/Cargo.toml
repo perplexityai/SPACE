@@ -20,3 +20,7 @@ thiserror = { workspace = true }
 # internal
 pplx-space-common-core = { workspace = true, features = ["sqlx"] }
 pplx-space-sql-locator = { workspace = true }
+
+[dev-dependencies]
+pplx-space-db-test-fixtures = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }

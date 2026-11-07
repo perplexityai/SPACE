@@ -70,6 +70,9 @@ pub(super) struct PodNodePlacement<'a> {
     pub node_id: NodeId,
     pub role: NodeRole,
     pub address: Option<&'a str>,
+    /// The EC2 instance the Node's `providerID` names; `None` leaves a
+    /// recorded instance alone.
+    pub instance_id: Option<&'a str>,
 }
 
 /// What a caller's retry of the *whole operation* would do, for statements that
@@ -292,6 +295,7 @@ struct K8sNodeRoleUpsert<'a> {
     role: NodeRole,
     address: Option<&'a str>,
     state: NodeStateWrite,
+    instance_id: Option<&'a str>,
 }
 
 #[derive(sqlx::FromRow)]

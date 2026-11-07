@@ -18,10 +18,11 @@ use std::collections::{BTreeMap, HashSet};
 use std::time::Duration;
 
 use pplx_space_common_core::types::NodeRole;
-use pplx_space_k8s_node_id::space_k8s_node_id;
+use pplx_space_k8s_node_id::{Ec2InstanceId, space_k8s_node_id};
 
 use super::{
-    KubernetesSubstrate, NodeLifecycleState, NodeStateWrite, support::k8s_node_internal_ip,
+    KubernetesSubstrate, NodeLifecycleState, NodeStateWrite,
+    support::{k8s_node_instance_id, k8s_node_internal_ip},
 };
 
 /// Label key that identifies a SPACE node role. Presence is optional; the
@@ -104,10 +105,19 @@ pub(super) async fn sync_labeled_nodes_to_db(
         // `kube_node_sync` is the lifecycle owner: it derives state from
         // Kubernetes Node readiness and manages it on every tick.
         let state = NodeStateWrite::Manage(NodeLifecycleState::from_ready(ready));
+        let instance_id = k8s_node_instance_id(&node);
 
         let inventory_changed = match substrate
             .store
-            .persist_k8s_node_inventory(name, uid, node_id, role, Some(address.as_str()), state)
+            .persist_k8s_node_inventory(
+                name,
+                uid,
+                node_id,
+                role,
+                Some(address.as_str()),
+                state,
+                instance_id.as_ref().map(Ec2InstanceId::as_str),
+            )
             .await
         {
             Ok(changed) => changed,

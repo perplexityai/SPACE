@@ -8,6 +8,9 @@ use pplx_space_node_registration_store::{
 };
 
 impl K8sStore {
+    /// `instance_id` is the EC2 instance the Node's `providerID` names;
+    /// `None` leaves a recorded instance alone.
+    #[allow(clippy::too_many_arguments)]
     pub(in crate::controllers::substrate::kubernetes) async fn persist_k8s_node_inventory(
         &self,
         node_name: &str,
@@ -16,6 +19,7 @@ impl K8sStore {
         role: NodeRole,
         address: Option<&str>,
         state: NodeStateWrite,
+        instance_id: Option<&str>,
     ) -> Result<bool, SubstrateError> {
         let mut tx = self
             .pool
@@ -33,6 +37,7 @@ impl K8sStore {
                     role,
                     address,
                     state,
+                    instance_id,
                 },
             )
             .await?;
@@ -116,6 +121,7 @@ impl K8sStore {
             role,
             address,
             state,
+            instance_id,
         } = upsert;
 
         // `manage_state` decides whether a conflict-update writes `state`.
@@ -137,6 +143,7 @@ impl K8sStore {
                 address,
                 state,
                 manage_state,
+                instance_id,
             },
             || {
                 tracing::warn!(
@@ -180,6 +187,9 @@ impl K8sStore {
                     }
                     K8sNodeRegistrationStep::ClearDrain => {
                         "failed to clear drain state on UID change"
+                    }
+                    K8sNodeRegistrationStep::RecordInstance => {
+                        "failed to record Kubernetes node instance"
                     }
                     K8sNodeRegistrationStep::UpsertNodeK8s => {
                         "failed to upsert Kubernetes node metadata"

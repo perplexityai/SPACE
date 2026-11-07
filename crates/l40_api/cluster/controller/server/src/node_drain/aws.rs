@@ -1,4 +1,5 @@
 use pplx_space_common_core::types::NodeId;
+use pplx_space_k8s_node_id::Ec2InstanceId;
 
 use pplx_space_common_core::sql;
 use std::future::Future;
@@ -92,18 +93,6 @@ pub struct Ec2InstanceTerminator<C: AsgTerminateClient = pplx_space_aws_client::
     autoscaling: C,
 }
 
-/// Parse `aws:///<az>/<instance-id>` -> `<instance-id>`. AWS-formatted
-/// `providerID` is the canonical pointer from a Kubernetes Node back
-/// to its underlying EC2 instance; everything before the final `/`
-/// is bookkeeping for the cloud-provider layer. Free function so callers
-/// don't have to name the [`Ec2InstanceTerminator`] generic parameter.
-pub(crate) fn parse_instance_id(provider_id: &str) -> Option<&str> {
-    provider_id
-        .strip_prefix("aws:///")
-        .and_then(|rest| rest.rsplit('/').next())
-        .filter(|id| id.starts_with("i-"))
-}
-
 impl<C: AsgTerminateClient> Ec2InstanceTerminator<C> {
     pub fn new(pool: PgPool, kube_client: kube::Client, autoscaling: C) -> Self {
         Self {
@@ -191,7 +180,7 @@ impl<C: AsgTerminateClient> InstanceTerminator for Ec2InstanceTerminator<C> {
             .ok_or_else(|| {
                 TerminateError::ProviderId(format!("kube Node {node_name} has no spec.providerID"))
             })?;
-        let instance_id = parse_instance_id(provider_id).ok_or_else(|| {
+        let instance_id = Ec2InstanceId::from_provider_id(provider_id).ok_or_else(|| {
             TerminateError::ProviderId(format!(
                 "kube Node {node_name} providerID {provider_id} is not an AWS instance id"
             ))

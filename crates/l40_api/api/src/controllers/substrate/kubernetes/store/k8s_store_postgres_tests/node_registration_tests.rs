@@ -40,6 +40,7 @@ impl RegistrationCaller {
                 NodeRole::Worker,
                 address,
                 state,
+                None,
             )
         };
         match self {
@@ -60,6 +61,7 @@ impl RegistrationCaller {
                         node_id,
                         NodeRole::Worker,
                         address,
+                        None,
                     )
                     .await
             }
@@ -167,6 +169,7 @@ async fn only_a_managed_state_write_overwrites_an_existing_node_state() -> TestR
                     NodeRole::Worker,
                     Some(address),
                     state,
+                    None,
                 )
             };
             if let Some(existing) = existing {
@@ -201,6 +204,7 @@ async fn only_a_managed_state_write_overwrites_an_existing_node_state() -> TestR
                         NodeRole::Worker,
                         Some(address),
                         state,
+                        None,
                     )
                 };
                 persist("10.0.0.71", NodeStateWrite::Manage(existing)).await?;

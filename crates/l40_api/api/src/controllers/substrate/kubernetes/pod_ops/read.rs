@@ -177,6 +177,7 @@ impl KubernetesSubstrate {
             })?;
         let role = SpaceNodeRole::Worker;
         let node_id = space_k8s_node_id(node_name, role.as_str());
+        let instance_id = k8s_node_instance_id(&node);
         let address = k8s_node_internal_ip(&node).ok_or_else(|| SubstrateError::Unavailable {
             message: format!(
                 "Kubernetes node {node_name} has no InternalIP; cannot authenticate node-local reconciliation"
@@ -192,6 +193,7 @@ impl KubernetesSubstrate {
                     node_id,
                     role,
                     address: Some(address.as_str()),
+                    instance_id: instance_id.as_ref().map(Ec2InstanceId::as_str),
                 },
                 retry,
             )

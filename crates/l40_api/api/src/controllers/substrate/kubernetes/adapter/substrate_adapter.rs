@@ -2931,6 +2931,7 @@ impl SubstrateAdapter for KubernetesSubstrate {
             // to `registered`. The returned entry still reports the observed
             // pod-readiness state.
             let observed_state = NodeLifecycleState::from_ready(caches::pod_is_ready(&pod));
+            let instance_id = k8s_node_instance_id(&k8s_node);
             match self
                 .store
                 .persist_k8s_node_inventory(
@@ -2940,6 +2941,7 @@ impl SubstrateAdapter for KubernetesSubstrate {
                     role,
                     Some(raw_address.as_str()),
                     NodeStateWrite::InsertOnly(observed_state),
+                    instance_id.as_ref().map(Ec2InstanceId::as_str),
                 )
                 .await
             {

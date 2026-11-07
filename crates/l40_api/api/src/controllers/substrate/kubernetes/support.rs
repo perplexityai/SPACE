@@ -304,6 +304,15 @@ pub(super) fn activation_wake_action(
     })
 }
 
+/// The EC2 instance a Node's AWS `providerID` names. Kind's `kind://…` and
+/// other providers name none.
+pub(super) fn k8s_node_instance_id(node: &Node) -> Option<Ec2InstanceId> {
+    node.spec
+        .as_ref()
+        .and_then(|spec| spec.provider_id.as_deref())
+        .and_then(Ec2InstanceId::from_provider_id)
+}
+
 pub(super) fn k8s_node_internal_ip(node: &Node) -> Option<String> {
     node.status
         .as_ref()
