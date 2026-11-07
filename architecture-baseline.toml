@@ -82,9 +82,6 @@ pplx-space-snapshot-retention = [
 ]
 
 [layers.dev_direction]
-pplx-space-sbx-mgr-store = [
-  "pplx-space-node-runtime-core",
-]
 
 [layers.direction]
 
@@ -92,18 +89,12 @@ pplx-space-sbx-mgr-store = [
 pplx-space-common-core = [
   "k8s-openapi",
 ]
-pplx-space-net-common = [
-  "tokio",
-]
 pplx-space-spaced-common = [
   "hyper-util",
   "tokio",
   "tokio-stream",
   "tokio-util",
   "tokio-vsock",
-]
-pplx-space-spaced-guest-protocol = [
-  "tokio",
 ]
 
 [layers.model_protocol]

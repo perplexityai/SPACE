@@ -12,16 +12,11 @@ workspace = true
 
 [features]
 default = []
-host-sockets = ["dep:libc", "dep:nix", "dep:socket2", "dep:tokio"]
 serde = ["dep:serde", "dep:serde_json", "uuid/serde"]
 
 [dependencies]
 http = { workspace = true }
 hex = { workspace = true }
-libc = { workspace = true, optional = true }
-nix = { workspace = true, features = ["net", "uio"], optional = true }
-socket2 = { workspace = true, optional = true }
-tokio = { workspace = true, features = ["net"], optional = true }
 prost = { workspace = true }
 serde = { workspace = true, features = ["derive"], optional = true }
 serde_json = { workspace = true, optional = true }

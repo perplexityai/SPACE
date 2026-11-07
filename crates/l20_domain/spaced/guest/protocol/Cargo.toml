@@ -16,7 +16,6 @@ pplx-space-guest-process = { workspace = true }
 pplx-space-pii = { workspace = true }
 prost = { workspace = true }
 prost-types = { workspace = true }
-tokio = { workspace = true, features = ["time"] }
 tonic = { workspace = true }
 tonic-prost = { workspace = true }
 tracing = { workspace = true }

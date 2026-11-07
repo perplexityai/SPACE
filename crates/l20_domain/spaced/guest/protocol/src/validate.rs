@@ -55,7 +55,7 @@ pub fn validate_optional_timeout(
 
 fn validate_timeout_value(timeout: prost_types::Duration) -> Result<ReadyTimeout, Status> {
     let duration = validate_duration_value("timeout", timeout)?;
-    if tokio::time::Instant::now().checked_add(duration).is_none() {
+    if std::time::Instant::now().checked_add(duration).is_none() {
         return Err(Status::invalid_argument(
             "timeout is too large for the runtime clock",
         ));
