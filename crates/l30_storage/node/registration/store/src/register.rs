@@ -211,13 +211,17 @@ pub async fn register_k8s_node(
     // set is worse than meaningless: the admin listing and `space-admin-cli get-node`
     // read the column independently of the phase, so a surviving mode makes
     // a node that is not draining report `drain_phase: null` next to
-    // `drain_mode: gentle`.
+    // `drain_mode: gentle`. A v2 drain's engine and status go with them for
+    // the same reason: its epoch, report and termination record are the
+    // replaced machine's.
     let drain_cleared = sqlx::query(sql!(
         "UPDATE nodes
              SET drain_phase = NULL,
                  drain_mode = NULL,
                  drain_started_at = NULL,
-                 drain_last_error = NULL
+                 drain_last_error = NULL,
+                 drain_engine = NULL,
+                 drain_status = NULL
              WHERE id = $1
                AND EXISTS (
                  SELECT 1 FROM node_k8s

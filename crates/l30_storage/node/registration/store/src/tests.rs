@@ -202,7 +202,8 @@ async fn a_tombstoned_node_refuses_without_recording_an_instance() -> TestDbResu
     Ok(())
 }
 
-/// A UID change clears drain state and an instance change alone does not.
+/// A UID change clears drain state, a v2 drain's engine and status with it,
+/// and an instance change alone does not.
 #[tokio::test]
 async fn an_instance_change_alone_keeps_drain_state() -> TestDbResult<()> {
     let db = db().await?;
@@ -217,8 +218,9 @@ async fn an_instance_change_alone_keeps_drain_state() -> TestDbResult<()> {
         registered(&db.pool, registration(node_id, "uid-1", Some("i-0a"))).await?;
         sqlx::query(sql!(
             "UPDATE nodes
-             SET drain_phase = 'draining', drain_mode = 'gentle',
-                 drain_started_at = NOW(), drain_last_error = 'seeded'
+             SET drain_phase = 'draining', drain_mode = 'forced',
+                 drain_started_at = NOW(), drain_last_error = 'seeded',
+                 drain_engine = 'v2', drain_status = '{\"epoch\": 7}'::JSONB
              WHERE id = $1"
         ))
         .bind(node_id)
@@ -235,8 +237,14 @@ async fn an_instance_change_alone_keeps_drain_state() -> TestDbResult<()> {
         .await?;
         tx.commit().await?;
 
-        let drain: (Option<String>, Option<String>) = sqlx::query_as(sql!(
-            "SELECT drain_phase, drain_mode FROM nodes WHERE id = $1"
+        let drain: (
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ) = sqlx::query_as(sql!(
+            "SELECT drain_phase, drain_mode, drain_engine, drain_status::TEXT
+                   FROM nodes WHERE id = $1"
         ))
         .bind(node_id)
         .fetch_one(&mut *conn)
@@ -246,9 +254,14 @@ async fn an_instance_change_alone_keeps_drain_state() -> TestDbResult<()> {
         assert_eq!(
             drain,
             if uid_changed {
-                (None, None)
+                (None, None, None, None)
             } else {
-                (Some("draining".to_string()), Some("gentle".to_string()))
+                (
+                    Some("draining".to_string()),
+                    Some("forced".to_string()),
+                    Some("v2".to_string()),
+                    Some(r#"{"epoch": 7}"#.to_string()),
+                )
             },
             "{uid} {instance_id}"
         );
