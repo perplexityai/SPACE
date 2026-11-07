@@ -13,9 +13,10 @@ HOLD_SECONDS = 30
 # `native.v2_drain_evacuates_every_resident` is the drain with no user in the
 # way. Here the drain restore operation's hold (`SPACE_DRAIN_RESTORE_TEST_HOLD_SECS`
 # on the controller) keeps each claimed restore open, so a call can meet one:
-# a delete before the node evacuates its sandbox, a wake while its restore
-# holds the sandbox (which joins the restore), and an ECW pause and a wake
-# after the restore landed.
+# a delete as the drain begins, a wake while its restore holds the sandbox
+# (which queues behind the restore and finds it started), and a suspend (what
+# an ECW pause maps to) and a wake after the restore landed. The ECW pause and
+# resume during a claim are `local.drain_restore_operation_lands_in_its_target`.
 @smoke.scenario(
     "native.v2_drain_meets_user_calls",
     api_surfaces=("native",),

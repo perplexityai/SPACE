@@ -17,6 +17,9 @@ PATH = "/tmp/space-smoke-v2-drain.txt"
 # is the seam on real workers: a sealed worker's own suspend, upload and disk
 # publication, the controller recording each report, and each restore landing
 # the sandbox, with its file, in the lifecycle it had, on the other worker.
+# Its residents are started, paused and stopped. A suspended resident whose
+# upload is still pending and a warm-pool member are planner rows only: Kind's
+# uploads land before a drain can see one pending, and it runs no warm pool.
 #
 # On Kind, `:terminate` is `kube-delete`: the worker keeps running, but its
 # Node is deleted and its row tombstoned. The run puts it back (drops the
