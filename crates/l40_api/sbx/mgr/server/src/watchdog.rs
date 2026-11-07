@@ -915,7 +915,6 @@ impl SandboxWatchdog {
                 auto_lifecycle: auto_lifecycle.clone(),
                 health_lifecycle: lifecycle_epochs.clone(),
                 node_manager: node_manager.clone(),
-                activation_seal: Arc::new(crate::activation_seal::ActivationSeal::unsealed()),
             },
         )));
         Self::new(
