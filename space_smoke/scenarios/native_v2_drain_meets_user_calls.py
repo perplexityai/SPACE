@@ -78,7 +78,7 @@ def v2_drain_meets_user_calls(test: smoke.CommandSandboxFixture) -> None:
     with test.phase("after: the restored sandbox suspends and wakes"):
         kept.suspend()
         kept.wake()
-        observed = kept.run_command_when_ready("true")
+        observed = drain.run_on(kept, "true")
         test.verify(observed.exit_code == 0, "the restored sandbox did not run after a suspend and wake")
 
     with test.phase("undrain"):

@@ -39,7 +39,7 @@ def v2_undrain_unseals_the_worker(test: smoke.CommandSandboxFixture) -> None:
     with test.phase("activations are accepted again"):
         resident.suspend()
         resident.wake()
-        observed = resident.run_command_when_ready("true")
+        observed = drain.run_on(resident, "true")
         test.verify(observed.exit_code == 0, "the unsealed worker did not run a restored sandbox")
 
     with test.phase("a seal under the cancelled epoch is refused"):

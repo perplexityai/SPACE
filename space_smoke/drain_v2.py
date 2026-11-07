@@ -120,6 +120,24 @@ class DrainV2Assertions:
         )
         return sandbox
 
+    def run_on(self, sandbox: DurableLifecycleSandbox, command: str, *, timeout: float = 180) -> Any:
+        """Run `command` in a run-owned sandbox, retrying while its data plane comes up."""
+
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                result = sandbox.run(command, timeout=60)
+            except Exception as error:  # noqa: BLE001 - retried until the deadline
+                self._fixture.verify(
+                    time.monotonic() < deadline,
+                    "a run-owned sandbox never answered a command",
+                    sandbox_id=sandbox.sandbox_id,
+                    error=repr(error)[:500],
+                )
+                self._fixture.wait(3)
+                continue
+            return result
+
     def release_other_worker(self) -> None:
         """Uncordon the other worker, so the restores have somewhere to land."""
 

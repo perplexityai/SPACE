@@ -45,7 +45,7 @@ def v2_drain_evacuates_every_resident(test: smoke.CommandSandboxFixture) -> None
         residents = {"started": drain.create_resident(), "paused": drain.create_resident(),
                      "stopped": drain.create_resident()}
         for lifecycle, sandbox in residents.items():
-            written = sandbox.run_command_when_ready(
+            written = drain.run_on(sandbox, 
                 f"printf %s {shlex.quote(sandbox.sandbox_id)} > {shlex.quote(PATH)}"
             )
             test.verify(written.exit_code == 0, f"failed to write the {lifecycle} resident's file")
@@ -74,7 +74,7 @@ def v2_drain_evacuates_every_resident(test: smoke.CommandSandboxFixture) -> None
         cast(ResidentLifecycleSandbox, residents["paused"]).wake()
         cast(StoppableLifecycleSandbox, residents["stopped"]).start()
         for sandbox in residents.values():
-            observed = sandbox.run_command_when_ready(f"cat {shlex.quote(PATH)}")
+            observed = drain.run_on(sandbox, f"cat {shlex.quote(PATH)}")
             test.verify(
                 observed.exit_code == 0 and observed.stdout == sandbox.sandbox_id,
                 "a sandbox's file did not survive the v2 drain",

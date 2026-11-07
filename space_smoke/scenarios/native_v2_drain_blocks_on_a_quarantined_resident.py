@@ -67,5 +67,5 @@ def v2_drain_blocks_on_a_quarantined_resident(test: smoke.CommandSandboxFixture)
     with test.phase("undrain: the epoch is cancelled and the resident still runs"):
         control.mark_drain_test_quarantined(node, [])
         drain.undrain_and_expect_cancelled()
-        observed = resident.run_command_when_ready("true")
+        observed = drain.run_on(resident, "true")
         test.verify(observed.exit_code == 0, "the blocked resident stopped running")
