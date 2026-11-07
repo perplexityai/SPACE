@@ -724,6 +724,7 @@ where
                     }
                     None => retry_hint,
                 };
+                let attempt_message = last_progress_message.clone();
                 let released = store
                     .release_claimed_operation(ReleaseClaimedPublicOperation {
                         claim_token,
@@ -781,6 +782,7 @@ where
                         tracing::info!(
                             operation_id = %operation_id,
                             superseding_operation_id = %by,
+                            attempt = %attempt_message,
                             "drain restore canceled instead of retried: a later user request \
                              supersedes it"
                         );
