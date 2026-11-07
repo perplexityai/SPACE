@@ -53,5 +53,34 @@ pub(crate) async fn release_build_shape(
     Ok(row.and_then(|(vcpu, memory_mib)| TemplateBuildShape::from_inventory(vcpu, memory_mib)))
 }
 
+/// The execution environment every node holding `content_hash` of
+/// `template` with a binding reports it bound to, unparsed. `None` when no
+/// node reports one, or when nodes report different ones: one hash can be
+/// cached bound to several environments, and then no single binding is the
+/// build's. A row without a binding doesn't count either way. A legacy
+/// unprefixed hash matches its `sha256:` spelling, as the template release
+/// lookups match it.
+pub(crate) async fn agreed_build_environment(
+    executor: impl PgExecutor<'_>,
+    template: &str,
+    content_hash: &str,
+) -> Result<Option<String>, sqlx::Error> {
+    sqlx::query_scalar::<_, Option<String>>(sql!(
+        "SELECT CASE WHEN COUNT(DISTINCT bindings.environment) = 1
+                     THEN MIN(bindings.environment) END
+         FROM (
+             SELECT nti.execution_metadata->>'environment' AS environment
+             FROM node_template_inventory nti
+             WHERE nti.template_name = $1
+               AND nti.content_hash IN ($2, replace($2, 'sha256:', ''))
+               AND nti.execution_metadata->>'environment' IS NOT NULL
+         ) bindings"
+    ))
+    .bind(template)
+    .bind(content_hash)
+    .fetch_one(executor)
+    .await
+}
+
 #[cfg(test)]
 mod tests;

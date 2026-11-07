@@ -1318,6 +1318,38 @@ The census is independent of the loops that act on such rows. It runs on
 both substrates whether or not the transient-lifecycle sweeper or node-drain
 is enabled, and it counts `deleting`, which the sweeper never ages out.
 
+## Environment placement shadow
+
+While `SPACE_ENVIRONMENT_PLACEMENT_GATE` is `shadow`, Direct placement counts
+what `on` would refuse (see "Placing work by environment" in
+[execution-environments.md](execution-environments.md)). Nothing is emitted
+while it's `off`.
+
+| Metric | Tags | Value |
+| --- | --- | --- |
+| `environment_placement.would_refuse` | `path`, `reason` | One per candidate node a placement statement returned that `on` would leave out |
+
+`path` names the statement (`cached_create`, `last_known_create`,
+`pull_create`, `pool_adoption`, `restore_source` or `restore_remote`) and
+`reason` is `no_evidence`, `incomplete`, `stale` or
+`environment_not_usable`, except that a restore candidate whose evidence
+doesn't list the checkpoint's environment counts as
+`restore_not_cold_bootable`: a node lists an environment as usable when it
+can cold boot it, which a restore doesn't need, so that count is the restores
+`on` would hold back that the node might have loaded. Each statement adds the
+number of candidates the gate would refuse for each reason, so the counter
+measures refused candidates, not refused requests. Each statement also logs
+`environment placement gate would refuse these candidates` at `info`, once
+per reason, with the count and the nodes.
+
+The counter covers only the candidates `on` would take away, not the ones it
+would add: those the environment match admits in place of a legacy check, and
+the last-known and pull-on-create candidates a create reaches once `on`
+refuses every ready holder. When shadow
+can't read a build's environment binding it logs `environment placement gate
+couldn't read the build's environment` at `warn` and places the work as
+unbound, as `off` does, so that work counts nothing.
+
 ## Reserved DNS upstream connections
 
 The net-gateway resolves guest queries to the reserved resolver addresses over

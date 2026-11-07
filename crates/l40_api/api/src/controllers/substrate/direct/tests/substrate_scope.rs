@@ -70,7 +70,7 @@ async fn worker_selection_reads_only_direct_nodes() -> TestResult {
 
     let pull_on_create = fixture
         .substrate
-        .pull_on_create_worker_candidates("fc")
+        .pull_on_create_worker_candidates("seed", Some("hash-seed"), "fc")
         .await?;
     assert_eq!(
         node_ids(&pull_on_create),
