@@ -23,5 +23,5 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 
 # internal
-pplx-space-spaced-common = { workspace = true }
+pplx-space-spaced-guest-protocol = { workspace = true }
 pplx-space-spaced-guest-server = { workspace = true, features = ["loopback-diagnostic"] }

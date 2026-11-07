@@ -39,7 +39,7 @@ a separate crate-level policy.
 
 The host supports stable `spaced` guest versions **>=0.1.0 and <0.9.0**.
 Prereleases are not admitted. Build metadata does not change compatibility.
-The supported range is declared in `pplx-space-spaced-common`; changing the host
+The supported range is declared in `pplx-space-spaced-protocol`; changing the host
 release number does not change that range implicitly.
 
 From 0.8.1, guests report their OS and supported operations in the readiness

@@ -1883,7 +1883,7 @@ async fn current_guest_runtime_metadata(
 ) -> Result<GuestRuntimeMetadata, BuildError> {
     let spaced_version = guest_binary_version(binaries).await?;
     let spaced_compatibility_family =
-        pplx_space_spaced_common::spaced_compatibility_family_for_version(&spaced_version)
+        pplx_space_spaced_guest_protocol::spaced_compatibility_family_for_version(&spaced_version)
             .map_err(|source| BuildError::InvalidSpacedVersion {
                 version: spaced_version.clone(),
                 source,

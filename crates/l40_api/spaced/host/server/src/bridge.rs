@@ -8,8 +8,8 @@ use pplx_space_common_core::{
 use pplx_space_connection_admission::{
     ConnectionAdmissionConfig, ConnectionAdmissionObservation, admit_connections,
 };
-use pplx_space_spaced_common::lazy_client::FailedGeneration;
-use pplx_space_spaced_common::status_is_request_deadline_exceeded;
+use pplx_space_spaced_client::lazy_client::FailedGeneration;
+use pplx_space_spaced_client::status_is_request_deadline_exceeded;
 const READY_WAIT_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(5);
 // One caller drives readiness for all concurrent waiters. Keep each guest
 // long-poll finite so a guest that accepts but never responds cannot monopolize
@@ -325,7 +325,7 @@ async fn serve_until_shutdown(
 }
 
 /// A bridge guest channel or client and, for vsock, the connection it is pinned to.
-type WithPinnedConnection<T> = (T, Option<pplx_space_spaced_common::PinnedConnection>);
+type WithPinnedConnection<T> = (T, Option<pplx_space_spaced_client::PinnedConnection>);
 
 /// Stamps out a `call_bridge_guest_{meta,filesystem,process}` wrapper.
 ///
@@ -352,7 +352,7 @@ macro_rules! define_bridge_call {
             let failed_generation = FailedGeneration::default();
             let timeout = budget.timeout();
             let started_at = Instant::now();
-            let result = pplx_space_spaced_common::retry_status_with_context_and_retry_hook(
+            let result = pplx_space_spaced_client::retry_status_with_context_and_retry_hook(
                 "spaced bridge guest",
                 command,
                 self.inner.bridge_retry_policy,
@@ -391,7 +391,7 @@ macro_rules! define_bridge_call {
             .and_then(std::convert::identity);
             if !$replay
                 && result.as_ref().is_err_and(|status| {
-                    pplx_space_spaced_common::status_is_retryable(status)
+                    pplx_space_spaced_client::status_is_retryable(status)
                         || status.code() == tonic::Code::Cancelled
                 })
             {
@@ -509,7 +509,7 @@ impl SpacedHostService {
                 })?;
                 client
                     .max_decoding_message_size(
-                        pplx_space_spaced_common::BRIDGE_GUEST_PING_MAX_DECODE_BYTES,
+                        pplx_space_spaced_client::BRIDGE_GUEST_PING_MAX_DECODE_BYTES,
                     )
                     .ping(BridgeGuestPingRequest::default())
                     .await
@@ -570,7 +570,7 @@ impl SpacedHostService {
                 let response = match client
                     .wait_ready(BridgeGuestWaitReadyRequest {
                         host_contract_revision:
-                            pplx_space_spaced_common::platform::HOST_CONTRACT_REVISION,
+                            pplx_space_spaced_guest_protocol::platform::HOST_CONTRACT_REVISION,
                         timeout: Some(duration_to_proto(timeout)?),
                     })
                     .await
@@ -715,7 +715,7 @@ impl SpacedHostService {
                 Ok(None) => {}
                 Err(error)
                     if !self.inner.shutdown.is_cancelled()
-                        && (pplx_space_spaced_common::status_is_retryable(&error)
+                        && (pplx_space_spaced_client::status_is_retryable(&error)
                             || error.code() == tonic::Code::Cancelled) =>
                 {
                     tracing::trace!(%error, "cached guest readiness probe interrupted; continuing wait");
@@ -786,10 +786,10 @@ impl SpacedHostService {
                 host_control_client: LazyClient::new(),
                 bridge_retry_policy: DEFAULT_COMMAND_RETRY_POLICY,
                 process_admission: crate::payload_admission(
-                    pplx_space_spaced_common::process_limits::PAYLOAD_SLOTS,
+                    pplx_space_spaced_guest_protocol::process_limits::PAYLOAD_SLOTS,
                 ),
                 filesystem_admission: crate::payload_admission(
-                    pplx_space_spaced_common::filesystem_limits::PAYLOAD_SLOTS,
+                    pplx_space_spaced_guest_protocol::filesystem_limits::PAYLOAD_SLOTS,
                 ),
                 guest_readiness: GuestReadinessCoordinator::new(),
                 guest_signal_rate: std::sync::Mutex::new(GuestSignalRateState::default()),
@@ -844,7 +844,7 @@ impl SpacedHostService {
 
     pub(super) async fn run_host_server(self) -> Result<(), RunSpacedHostServerError> {
         let socket_path = self.inner.socket_path.clone();
-        let incoming = pplx_space_spaced_common::bind_uds_with_mode(&socket_path, Some(0o770))?;
+        let incoming = pplx_space_spaced_client::bind_uds_with_mode(&socket_path, Some(0o770))?;
         let incoming = tokio_stream::StreamExt::map(incoming, |io| {
             io.map(|io| pplx_space_common_grpc::PrefaceDeadline::new(io, Duration::from_secs(5)))
         });
@@ -880,7 +880,7 @@ impl SpacedHostService {
 
     pub(super) async fn run_bridge_host_server(self) -> Result<(), RunSpacedHostServerError> {
         let socket_path = self.inner.bridge_host_socket_path.clone();
-        let incoming = pplx_space_spaced_common::bind_uds(&socket_path)?;
+        let incoming = pplx_space_spaced_client::bind_uds(&socket_path)?;
         let incoming = tokio_stream::StreamExt::map(incoming, |io| {
             io.map(|io| pplx_space_common_grpc::PrefaceDeadline::new(io, Duration::from_secs(5)))
         });
@@ -922,7 +922,7 @@ impl SpacedHostService {
         match &self.inner.bridge_guest_connector {
             BridgeGuestConnector::Uds(path) => {
                 let (channel, connection) =
-                    pplx_space_spaced_common::uds::connect_uds_channel_pinned(
+                    pplx_space_spaced_client::uds::connect_uds_channel_pinned(
                         "spaced bridge guest",
                         path,
                     )
@@ -934,7 +934,7 @@ impl SpacedHostService {
                 port,
                 expected_peer,
             } => Ok(
-                pplx_space_spaced_common::connect_firecracker_vsock_channel_with_expected_peer(
+                pplx_space_spaced_client::connect_firecracker_vsock_channel_with_expected_peer(
                     "spaced bridge guest",
                     vsock_uds_path,
                     *port,
@@ -1015,9 +1015,9 @@ impl SpacedHostService {
         &self,
     ) -> Result<
         HostControlClient<tonic::transport::Channel>,
-        pplx_space_spaced_common::UdsConnectError,
+        pplx_space_spaced_client::UdsConnectError,
     > {
-        let channel = pplx_space_spaced_common::connect_uds_channel(
+        let channel = pplx_space_spaced_client::connect_uds_channel(
             "sandbox host control",
             &self.inner.host_control_socket_path,
         )
@@ -1027,9 +1027,10 @@ impl SpacedHostService {
 
     pub async fn notify_resume(
         &self,
-        reason: pplx_space_spaced_common::proto::bridge_guest::ResumeReason,
+        reason: pplx_space_spaced_guest_protocol::proto::bridge_guest::ResumeReason,
     ) -> Result<(), Status> {
-        let now = pplx_space_spaced_common::system_time_to_proto(std::time::SystemTime::now())?;
+        let now =
+            pplx_space_spaced_guest_protocol::system_time_to_proto(std::time::SystemTime::now())?;
         let response = self
             .call_bridge_guest_once(
                 "bridge_guest_notify_resume",
@@ -1051,13 +1052,17 @@ impl SpacedHostService {
             "spaced guest resume notification succeeded"
         );
         match response.clock_sync_status() {
-            pplx_space_spaced_common::proto::bridge_guest::ClockSyncStatus::Synced => Ok(()),
-            pplx_space_spaced_common::proto::bridge_guest::ClockSyncStatus::Failed => {
+            pplx_space_spaced_guest_protocol::proto::bridge_guest::ClockSyncStatus::Synced => {
+                Ok(())
+            }
+            pplx_space_spaced_guest_protocol::proto::bridge_guest::ClockSyncStatus::Failed => {
                 Err(Status::failed_precondition("guest clock sync failed"))
             }
-            pplx_space_spaced_common::proto::bridge_guest::ClockSyncStatus::Unspecified => Err(
-                Status::internal("bridge guest returned unspecified clock sync status"),
-            ),
+            pplx_space_spaced_guest_protocol::proto::bridge_guest::ClockSyncStatus::Unspecified => {
+                Err(Status::internal(
+                    "bridge guest returned unspecified clock sync status",
+                ))
+            }
         }
     }
 
@@ -1069,7 +1074,7 @@ impl SpacedHostService {
             |client| async move {
                 client
                     .max_decoding_message_size(
-                        pplx_space_spaced_common::BRIDGE_GUEST_PING_MAX_DECODE_BYTES,
+                        pplx_space_spaced_client::BRIDGE_GUEST_PING_MAX_DECODE_BYTES,
                     )
                     .ping(BridgeGuestPingRequest::default())
                     .await
@@ -1090,7 +1095,7 @@ impl SpacedHostService {
     pub(super) async fn host_control_client(
         &self,
     ) -> Result<
-        pplx_space_spaced_common::LazyClientLease<HostControlClient<tonic::transport::Channel>>,
+        pplx_space_spaced_client::LazyClientLease<HostControlClient<tonic::transport::Channel>>,
         Status,
     > {
         self.inner
@@ -1110,7 +1115,7 @@ impl SpacedHostService {
         Fut: std::future::Future<Output = Result<Response<T>, Status>>,
     {
         let failed_generation = FailedGeneration::default();
-        pplx_space_spaced_common::retry_status_with_context_and_retry_hook(
+        pplx_space_spaced_client::retry_status_with_context_and_retry_hook(
             "sandbox host control",
             command,
             RetryPolicy::none(),
@@ -1145,8 +1150,10 @@ impl SpacedHostService {
     pub(super) async fn call_bridge_guest_read(
         &self,
         request: ReadRequest,
-    ) -> Result<tonic::Streaming<pplx_space_spaced_common::proto::bridge_guest::FileChunk>, Status>
-    {
+    ) -> Result<
+        tonic::Streaming<pplx_space_spaced_guest_protocol::proto::bridge_guest::FileChunk>,
+        Status,
+    > {
         let path = GuestPath::parse(request.path).map_err(invalid_argument_status)?;
         let offset = request.offset;
         let length = request.length;
@@ -1180,7 +1187,7 @@ impl SpacedHostService {
     pub(super) async fn bridge_guest_filesystem_client(
         &self,
     ) -> Result<
-        pplx_space_spaced_common::LazyClientLease<
+        pplx_space_spaced_client::LazyClientLease<
             OperationClient<BridgeGuestFilesystemClient<tonic::transport::Channel>>,
         >,
         Status,
@@ -1227,7 +1234,7 @@ impl SpacedHostService {
             },
         )
         .await
-        .map(|_: pplx_space_spaced_common::proto::bridge_guest::MkdirResponse| ())
+        .map(|_: pplx_space_spaced_guest_protocol::proto::bridge_guest::MkdirResponse| ())
     }
 
     pub(super) async fn call_bridge_guest_remove(
@@ -1262,7 +1269,7 @@ impl SpacedHostService {
             },
         )
         .await
-        .map(|_: pplx_space_spaced_common::proto::bridge_guest::RemoveResponse| ())
+        .map(|_: pplx_space_spaced_guest_protocol::proto::bridge_guest::RemoveResponse| ())
     }
 
     pub(super) async fn call_bridge_guest_rename(
@@ -1305,7 +1312,7 @@ impl SpacedHostService {
             },
         )
         .await
-        .map(|_: pplx_space_spaced_common::proto::bridge_guest::RenameResponse| ())
+        .map(|_: pplx_space_spaced_guest_protocol::proto::bridge_guest::RenameResponse| ())
     }
 
     define_bridge_call!(
@@ -1370,7 +1377,7 @@ impl SpacedHostService {
     pub(super) async fn bridge_guest_client(
         &self,
     ) -> Result<
-        pplx_space_spaced_common::LazyClientLease<
+        pplx_space_spaced_client::LazyClientLease<
             OperationClient<BridgeGuestClient<tonic::transport::Channel>>,
         >,
         Status,
@@ -1397,7 +1404,7 @@ impl SpacedHostService {
     pub(super) async fn bridge_guest_process_client(
         &self,
     ) -> Result<
-        pplx_space_spaced_common::LazyClientLease<
+        pplx_space_spaced_client::LazyClientLease<
             OperationClient<BridgeGuestProcessClient<tonic::transport::Channel>>,
         >,
         Status,
@@ -1415,7 +1422,7 @@ impl SpacedHostService {
     pub(super) async fn bridge_guest_networking_client(
         &self,
     ) -> Result<
-        pplx_space_spaced_common::LazyClientLease<
+        pplx_space_spaced_client::LazyClientLease<
             OperationClient<BridgeGuestNetworkingClient<tonic::transport::Channel>>,
         >,
         Status,

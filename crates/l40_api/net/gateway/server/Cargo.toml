@@ -70,7 +70,8 @@ pplx-space-metrics-emit = { workspace = true }
 pplx-space-sandbox-metrics = { workspace = true }
 pplx-space-observability = { workspace = true, default-features = false }
 pplx-space-net-gateway-client = { workspace = true }
-pplx-space-spaced-common = { workspace = true }
+pplx-space-spaced-protocol = { workspace = true }
+pplx-space-spaced-client = { workspace = true }
 pplx-space-uds-peer-auth = { workspace = true }
 pplx-space-unix-socket-bind = { workspace = true }
 

@@ -253,7 +253,7 @@ pub(super) fn reject_incompatible_template_spaced_compatibility(
     template_version: Option<&str>,
     template_compatibility_family: Option<&str>,
 ) -> Result<(), tonic::Status> {
-    pplx_space_spaced_common::validate_spaced_guest_compatibility(
+    pplx_space_spaced_protocol::validate_spaced_guest_compatibility(
         template_version,
         template_compatibility_family,
     )

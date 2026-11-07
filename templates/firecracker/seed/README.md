@@ -432,7 +432,7 @@ binaries it packages, and the `spaced_compatibility_family` derived from it. For
 SemVer, `1.x.y` belongs to family `1`, `0.x.y` to `0.x`, and `0.0.y` to `0.0.y`.
 
 `space-sbxmgr-svc` admits guests whose version is in `SUPPORTED_SPACED_GUEST_VERSIONS`
-(`crates/l20_domain/spaced/common/src/compatibility.rs`) and whose family agrees with that
+(`crates/l20_domain/spaced/protocol/src/compatibility.rs`) and whose family agrees with that
 version. The host's and the guest's compatibility families do not have to match. The
 [guest compatibility](../../../docs/versioning.md#guest-compatibility-in-08) section of
 the versioning policy is the full rule.

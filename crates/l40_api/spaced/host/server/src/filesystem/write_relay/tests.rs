@@ -61,7 +61,7 @@ async fn cancellation_drops_input_and_downstream() {
 
 #[tokio::test]
 async fn large_messages_are_rechunked_without_reading_ahead_of_a_stalled_consumer() {
-    use pplx_space_spaced_common::proto::operations::write_request::Message;
+    use pplx_space_spaced_guest_protocol::proto::operations::write_request::Message;
     use std::sync::atomic::AtomicUsize;
 
     let polled = Arc::new(AtomicUsize::new(0));

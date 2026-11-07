@@ -3,14 +3,14 @@
 The spaced crates share one wire contract, `proto/spaced`. A guest from an
 older release keeps running against newer hosts; the guest-compatibility
 section of `docs/versioning.md` is the policy, and
-`crates/l20_domain/spaced/common/AGENTS.md` says how to change the supported-guest
+`crates/l20_domain/spaced/protocol/AGENTS.md` says how to change the supported-guest
 floor.
 
 ## Changes
 
 - Host changes must keep accepting every guest in
   `SUPPORTED_SPACED_GUEST_VERSIONS`
-  (`crates/l20_domain/spaced/common/src/compatibility.rs`), including guests in
+  (`crates/l20_domain/spaced/protocol/src/compatibility.rs`), including guests in
   templates and dormant snapshots.
 - Change `proto/spaced` additively. Keep field numbers, types and RPCs until
   every version that uses them is retired. A guest-side legacy endpoint also

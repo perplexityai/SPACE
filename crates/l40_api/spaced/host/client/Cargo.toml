@@ -24,7 +24,9 @@ uuid = { workspace = true, features = ["v7"] }
 # internal
 pplx-space-common-core = { workspace = true }
 pplx-space-host-layout = { workspace = true }
-pplx-space-spaced-common = { workspace = true }
+pplx-space-spaced-guest-protocol = { workspace = true }
+pplx-space-spaced-protocol = { workspace = true }
+pplx-space-spaced-client = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

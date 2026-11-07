@@ -1,0 +1,31 @@
+[package]
+name = "pplx-space-spaced-protocol"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+pplx-space-spaced-guest-protocol = { workspace = true }
+pplx-space-common-core = { workspace = true }
+pplx-space-credential-injection = { workspace = true }
+pplx-space-net-common = { workspace = true }
+prost = { workspace = true }
+prost-types = { workspace = true }
+semver = { workspace = true }
+thiserror = { workspace = true }
+tonic = { workspace = true }
+tonic-prost = { workspace = true }
+
+
+[build-dependencies]
+pplx-space-spaced-build = { workspace = true }
+anyhow = { workspace = true }
+pplx-space-common-proto-build = { workspace = true }
+tonic-prost-build = { workspace = true }
+

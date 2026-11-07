@@ -506,7 +506,7 @@ pub(super) async fn refresh_network_policy(
     expected_policy_ref: Option<&EffectiveNetworkPolicyRef>,
     reason: &'static str,
 ) -> Result<(), NetworkPolicyRefreshError> {
-    let client = pplx_space_spaced_common::LazyClient::new();
+    let client = pplx_space_spaced_client::LazyClient::new();
     let interception_readiness = refresh_network_policy_with_request(
         db,
         sandbox_id,

@@ -73,7 +73,9 @@ pplx-space-common-core = { workspace = true }
 pplx-space-common-grpc = { workspace = true }
 pplx-space-grpc-metrics = { workspace = true }
 pplx-space-observability = { workspace = true }
-pplx-space-spaced-common = { workspace = true }
+pplx-space-spaced-guest-protocol = { workspace = true }
+pplx-space-spaced-protocol = { workspace = true }
+pplx-space-spaced-client = { workspace = true }
 pplx-space-test-hooks = { workspace = true }
 prost-types = { workspace = true }
 

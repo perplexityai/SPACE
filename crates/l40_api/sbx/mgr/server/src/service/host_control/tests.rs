@@ -5,7 +5,7 @@ use pplx_space_credmgr_client::proto::{
     ResolveNetworkCredentialsRequest as NetworkResolveRequest,
     ResolveNetworkCredentialsResponse as NetworkResolveResponse,
 };
-use pplx_space_spaced_common::proto::host_control::{
+use pplx_space_spaced_protocol::proto::host_control::{
     GetNetworkPolicyRequest, host_control_client::HostControlClient,
     host_control_server::HostControlServer,
 };

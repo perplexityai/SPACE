@@ -24,7 +24,7 @@ use pplx_space_net_common::{
 use pplx_space_net_gateway_client::proto::{
     self, net_gateway_control_client::NetGatewayControlClient,
 };
-use pplx_space_spaced_common::proto::{activity, host_control};
+use pplx_space_spaced_protocol::proto::{activity, host_control};
 use serde::Deserialize;
 use tokio::net::UnixListener;
 use tokio_stream::wrappers::UnixListenerStream;
@@ -350,7 +350,7 @@ impl host_control::host_control_server::HostControl for HostControl {
 async fn client(
     socket: &Path,
 ) -> anyhow::Result<NetGatewayControlClient<tonic::transport::Channel>> {
-    let channel = pplx_space_spaced_common::connect_uds_channel("gateway-traffic", socket).await?;
+    let channel = pplx_space_spaced_client::connect_uds_channel("gateway-traffic", socket).await?;
     Ok(NetGatewayControlClient::new(channel))
 }
 

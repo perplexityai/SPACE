@@ -23,15 +23,15 @@ impl SpacedHostService {
         &self,
         command: &'static str,
     ) -> Result<
-        pplx_space_spaced_common::LazyClientLease<
+        pplx_space_spaced_client::LazyClientLease<
             OperationClient<BridgeGuestFilesystemClient<tonic::transport::Channel>>,
         >,
         Status,
     > {
-        let failed = pplx_space_spaced_common::lazy_client::FailedGeneration::default();
+        let failed = pplx_space_spaced_client::lazy_client::FailedGeneration::default();
         let timeout = BridgeGuestOperationBudget::FilesystemTransfer.timeout();
         let started_at = Instant::now();
-        let result = pplx_space_spaced_common::retry_status_with_context_and_retry_hook(
+        let result = pplx_space_spaced_client::retry_status_with_context_and_retry_hook(
             "spaced bridge guest",
             command,
             self.inner.bridge_retry_policy,
@@ -56,7 +56,7 @@ impl SpacedHostService {
         )
         .await;
         if result.as_ref().is_err_and(|status| {
-            pplx_space_spaced_common::status_is_retryable(status)
+            pplx_space_spaced_client::status_is_retryable(status)
                 || status.code() == tonic::Code::Cancelled
         }) {
             failed
@@ -79,7 +79,7 @@ impl SpacedHostService {
     ) -> pplx_space_common_grpc::RequestAdmission<
         pplx_space_common_grpc::PreserveInputErrors<FilesystemServer<Self>>,
     > {
-        use pplx_space_spaced_common::filesystem_limits;
+        use pplx_space_spaced_guest_protocol::filesystem_limits;
         pplx_space_common_grpc::RequestAdmission::new(
             pplx_space_common_grpc::PreserveInputErrors::new(
                 FilesystemServer::new(self.clone())
@@ -92,7 +92,7 @@ impl SpacedHostService {
 }
 
 fn host_file_event(
-    event: pplx_space_spaced_common::proto::bridge_guest::FileEvent,
+    event: pplx_space_spaced_guest_protocol::proto::bridge_guest::FileEvent,
 ) -> Result<FileEvent, Status> {
     let path = RelativeGuestPath::parse(event.path).map_err(invalid_argument_status)?;
     Ok(FileEvent {
@@ -131,7 +131,7 @@ fn file_info_metadata_bytes(info: &FileInfo) -> Option<usize> {
 }
 
 fn host_modified_file(
-    file: pplx_space_spaced_common::proto::bridge_guest::ModifiedFile,
+    file: pplx_space_spaced_guest_protocol::proto::bridge_guest::ModifiedFile,
 ) -> Result<proto::ModifiedFile, Status> {
     if !file.root.is_empty() {
         pplx_space_common_core::types::GuestPath::parse(&file.root)

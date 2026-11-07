@@ -1,11 +1,13 @@
 use crate::time::timestamp_from_millis;
 use futures_util::StreamExt;
-use pplx_space_spaced_common::proto::bridge_guest::filesystem_server::{
+use pplx_space_spaced_guest_protocol::proto::bridge_guest::filesystem_server::{
     Filesystem, FilesystemServer,
 };
-use pplx_space_spaced_common::proto::bridge_guest::meta_server::{Meta, MetaServer};
-use pplx_space_spaced_common::proto::bridge_guest::process_server::{Process, ProcessServer};
-use pplx_space_spaced_common::proto::bridge_guest::{
+use pplx_space_spaced_guest_protocol::proto::bridge_guest::meta_server::{Meta, MetaServer};
+use pplx_space_spaced_guest_protocol::proto::bridge_guest::process_server::{
+    Process, ProcessServer,
+};
+use pplx_space_spaced_guest_protocol::proto::bridge_guest::{
     CloseStdinRequest, CloseStdinResponse, ConfigureProcessEnvRequest, ConfigureProcessEnvResponse,
     ConnectProcessRequest, CreateWatcherRequest, CreateWatcherResponse, DisableFileChangesRequest,
     DisableFileChangesResponse, EnableFileChangesRequest, EnableFileChangesResponse, FileChunk,
@@ -31,7 +33,8 @@ use tonic::{Request, Response, Status};
 
 #[derive(Clone)]
 pub(crate) struct MockBridgeGuest {
-    pub(crate) platform: Option<pplx_space_spaced_common::proto::platform::GuestPlatformDescriptor>,
+    pub(crate) platform:
+        Option<pplx_space_spaced_guest_protocol::proto::platform::GuestPlatformDescriptor>,
     pub(crate) platform_withdrawn: Option<Arc<std::sync::atomic::AtomicBool>>,
     pub(crate) version: &'static str,
     pub(crate) ready: bool,
@@ -91,25 +94,31 @@ impl Filesystem for MockBridgeGuest {
     type ListInfoStream = std::pin::Pin<
         Box<
             dyn futures_util::Stream<
-                    Item = Result<pplx_space_spaced_common::proto::operations::FileInfo, Status>,
+                    Item = Result<
+                        pplx_space_spaced_guest_protocol::proto::operations::FileInfo,
+                        Status,
+                    >,
                 > + Send,
         >,
     >;
     async fn stat_info(
         &self,
         request: Request<StatRequest>,
-    ) -> Result<Response<pplx_space_spaced_common::proto::operations::StatResponse>, Status> {
+    ) -> Result<Response<pplx_space_spaced_guest_protocol::proto::operations::StatResponse>, Status>
+    {
         if let Some(code) = self.metadata_open_error {
             return Err(Status::new(code, "StatInfo rejected"));
         }
         Ok(Response::new(
-            pplx_space_spaced_common::proto::operations::StatResponse {
-                info: Some(pplx_space_spaced_common::proto::operations::FileInfo {
-                    path: request.into_inner().path,
-                    file_type: FileType::File.into(),
-                    size_bytes: 321,
-                    ..Default::default()
-                }),
+            pplx_space_spaced_guest_protocol::proto::operations::StatResponse {
+                info: Some(
+                    pplx_space_spaced_guest_protocol::proto::operations::FileInfo {
+                        path: request.into_inner().path,
+                        file_type: FileType::File.into(),
+                        size_bytes: 321,
+                        ..Default::default()
+                    },
+                ),
             },
         ))
     }
@@ -120,12 +129,14 @@ impl Filesystem for MockBridgeGuest {
         if let Some(code) = self.metadata_open_error {
             return Err(Status::new(code, "ListInfo rejected"));
         }
-        let mut entries = vec![Ok(pplx_space_spaced_common::proto::operations::FileInfo {
-            path: "/tmp/test-dir/canonical.txt".into(),
-            name: Some("canonical.txt".into()),
-            file_type: FileType::File.into(),
-            ..Default::default()
-        })];
+        let mut entries = vec![Ok(
+            pplx_space_spaced_guest_protocol::proto::operations::FileInfo {
+                path: "/tmp/test-dir/canonical.txt".into(),
+                name: Some("canonical.txt".into()),
+                file_type: FileType::File.into(),
+                ..Default::default()
+            },
+        )];
         if self.list_body_error {
             entries.push(Err(Status::unimplemented("failure after stream opened")));
         }
@@ -259,7 +270,9 @@ impl Filesystem for MockBridgeGuest {
             .message
             .expect("open payload");
         match open {
-            pplx_space_spaced_common::proto::bridge_guest::write_request::Message::Open(open) => {
+            pplx_space_spaced_guest_protocol::proto::bridge_guest::write_request::Message::Open(
+                open,
+            ) => {
                 assert_eq!(open.path, "/tmp/test-file");
                 assert!(!open.append);
             }
@@ -268,7 +281,7 @@ impl Filesystem for MockBridgeGuest {
         let mut data = Vec::new();
         while let Some(message) = stream.message().await? {
             match message.message.expect("data payload") {
-                pplx_space_spaced_common::proto::bridge_guest::write_request::Message::Data(
+                pplx_space_spaced_guest_protocol::proto::bridge_guest::write_request::Message::Data(
                     chunk,
                 ) => {
                     data.extend_from_slice(&chunk);
@@ -294,7 +307,8 @@ impl Filesystem for MockBridgeGuest {
         assert_eq!(request.into_inner().path, "/tmp/test-dir");
         let events = vec![Ok(FileEvent {
             path: "created.txt".into(),
-            kind: pplx_space_spaced_common::proto::bridge_guest::FileEventKind::Created.into(),
+            kind: pplx_space_spaced_guest_protocol::proto::bridge_guest::FileEventKind::Created
+                .into(),
             observed_at: Some(timestamp_from_millis(1)),
         })];
         Ok(Response::new(
@@ -402,8 +416,8 @@ impl Process for MockBridgeGuest {
                 process_id: assigned_process_id.clone(),
                 pid: Some(123),
                 event: Some(
-                    pplx_space_spaced_common::proto::bridge_guest::process_event::Event::Started(
-                        pplx_space_spaced_common::proto::bridge_guest::ProcessStarted {
+                    pplx_space_spaced_guest_protocol::proto::bridge_guest::process_event::Event::Started(
+                        pplx_space_spaced_guest_protocol::proto::bridge_guest::ProcessStarted {
                             start_time: Some(timestamp_from_millis(1_000)),
                         },
                     ),
@@ -413,8 +427,8 @@ impl Process for MockBridgeGuest {
                 process_id: assigned_process_id.clone(),
                 pid: Some(123),
                 event: Some(
-                    pplx_space_spaced_common::proto::bridge_guest::process_event::Event::Stdout(
-                        pplx_space_spaced_common::proto::bridge_guest::ProcessOutput {
+                    pplx_space_spaced_guest_protocol::proto::bridge_guest::process_event::Event::Stdout(
+                        pplx_space_spaced_guest_protocol::proto::bridge_guest::ProcessOutput {
                             data: b"hello\n".to_vec(),
                         },
                     ),
@@ -424,11 +438,11 @@ impl Process for MockBridgeGuest {
                 process_id: assigned_process_id.clone(),
                 pid: Some(123),
                 event: Some(
-                    pplx_space_spaced_common::proto::bridge_guest::process_event::Event::Exit(
-                        pplx_space_spaced_common::proto::bridge_guest::ProcessExit {
+                    pplx_space_spaced_guest_protocol::proto::bridge_guest::process_event::Event::Exit(
+                        pplx_space_spaced_guest_protocol::proto::bridge_guest::ProcessExit {
                             outcome: Some(
-                                pplx_space_spaced_common::proto::bridge_guest::process_exit::Outcome::Exited(
-                                    pplx_space_spaced_common::proto::bridge_guest::ProcessExited {
+                                pplx_space_spaced_guest_protocol::proto::bridge_guest::process_exit::Outcome::Exited(
+                                    pplx_space_spaced_guest_protocol::proto::bridge_guest::ProcessExited {
                                         exit_code: 0,
                                     },
                                 ),
@@ -452,8 +466,8 @@ impl Process for MockBridgeGuest {
             process_id: "proc-1".into(),
             pid: Some(123),
             event: Some(
-                pplx_space_spaced_common::proto::bridge_guest::process_event::Event::Connected(
-                    pplx_space_spaced_common::proto::bridge_guest::ProcessConnected {
+                pplx_space_spaced_guest_protocol::proto::bridge_guest::process_event::Event::Connected(
+                    pplx_space_spaced_guest_protocol::proto::bridge_guest::ProcessConnected {
                         output_cursor: None,
                     },
                 ),
@@ -570,8 +584,10 @@ impl Meta for MockBridgeGuest {
             }),
             version: self.version.to_string(),
             compatibility_family:
-                pplx_space_spaced_common::spaced_compatibility_family_for_version(self.version)
-                    .expect("test version is valid SemVer"),
+                pplx_space_spaced_guest_protocol::spaced_compatibility_family_for_version(
+                    self.version,
+                )
+                .expect("test version is valid SemVer"),
             mem_total_bytes: None,
             vcpu_count: None,
         }))
@@ -595,7 +611,8 @@ impl Meta for MockBridgeGuest {
     ) -> Result<Response<NotifyResumeResponse>, Status> {
         Ok(Response::new(NotifyResumeResponse {
             clock_sync_status:
-                pplx_space_spaced_common::proto::bridge_guest::ClockSyncStatus::Synced.into(),
+                pplx_space_spaced_guest_protocol::proto::bridge_guest::ClockSyncStatus::Synced
+                    .into(),
             ready: true,
         }))
     }

@@ -47,8 +47,9 @@ impl Meta for SpacedHostService {
             ready: status.is_some(),
             guest_uptime: status.as_ref().and_then(|status| status.guest_uptime),
             host_version: Some(proto::VersionInfo {
-                version: pplx_space_spaced_common::spaced_version().to_string(),
-                compatibility_family: pplx_space_spaced_common::spaced_compatibility_family(),
+                version: pplx_space_spaced_protocol::spaced_version().to_string(),
+                compatibility_family: pplx_space_spaced_guest_protocol::spaced_compatibility_family(
+                ),
             }),
             guest_version: status.map(|status| proto::VersionInfo {
                 version: status.version,
@@ -120,7 +121,7 @@ impl Meta for SpacedHostService {
             )
             .await?;
         let clock_sync_status =
-            pplx_space_spaced_common::proto::bridge_guest::ClockSyncStatus::try_from(
+            pplx_space_spaced_guest_protocol::proto::bridge_guest::ClockSyncStatus::try_from(
                 response.clock_sync_status,
             )
             .map_err(|error| {
@@ -129,11 +130,11 @@ impl Meta for SpacedHostService {
                 ))
             })?;
         match clock_sync_status {
-            pplx_space_spaced_common::proto::bridge_guest::ClockSyncStatus::Synced => {}
-            pplx_space_spaced_common::proto::bridge_guest::ClockSyncStatus::Failed => {
+            pplx_space_spaced_guest_protocol::proto::bridge_guest::ClockSyncStatus::Synced => {}
+            pplx_space_spaced_guest_protocol::proto::bridge_guest::ClockSyncStatus::Failed => {
                 return Err(Status::failed_precondition("guest clock sync failed"));
             }
-            pplx_space_spaced_common::proto::bridge_guest::ClockSyncStatus::Unspecified => {
+            pplx_space_spaced_guest_protocol::proto::bridge_guest::ClockSyncStatus::Unspecified => {
                 return Err(Status::internal(
                     "bridge guest returned unspecified clock sync status",
                 ));
@@ -244,7 +245,9 @@ impl BridgeHostMeta for SpacedHostService {
             .call_host_control("host_control_request_active_for", |mut client| async move {
                 client
                     .request_active_for(HostControlRequestActiveForRequest {
-                        hold_for: Some(pplx_space_spaced_common::duration_to_proto(hold_for)?),
+                        hold_for: Some(pplx_space_spaced_guest_protocol::duration_to_proto(
+                            hold_for,
+                        )?),
                     })
                     .await
             })

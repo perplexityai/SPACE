@@ -300,7 +300,8 @@ async fn readiness_only_guest_cannot_gain_operations_from_its_version() {
         let temp_dir = tempfile::tempdir().unwrap();
         let socket = temp_dir.path().join("bridge.sock");
         let calls = Arc::new(AtomicUsize::new(0));
-        let mut platform = pplx_space_spaced_common::platform::GuestPlatform::linux().wire();
+        let mut platform =
+            pplx_space_spaced_guest_protocol::platform::GuestPlatform::linux().wire();
         platform.operations.clear();
         let task = start_mock_bridge_guest_with_service(
             socket.clone(),
@@ -345,7 +346,9 @@ async fn operation_connection_does_not_inherit_readiness_capabilities() {
     let task = start_mock_bridge_guest_with_service(
         socket.clone(),
         MockBridgeGuest {
-            platform: Some(pplx_space_spaced_common::platform::GuestPlatform::linux().wire()),
+            platform: Some(
+                pplx_space_spaced_guest_protocol::platform::GuestPlatform::linux().wire(),
+            ),
             platform_withdrawn: Some(withdrawn.clone()),
             interactive_process_control_calls: Some(calls.clone()),
             ..Default::default()

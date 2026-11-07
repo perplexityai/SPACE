@@ -8,7 +8,7 @@ use bridge_guest::process_server::Process;
 use futures_util::StreamExt;
 use nix::unistd::{Uid, User};
 use pplx_space_common_core::types::DEFAULT_GUEST_USER;
-use pplx_space_spaced_common::proto::bridge_guest;
+use pplx_space_spaced_guest_protocol::proto::bridge_guest;
 use pplx_space_spaced_guest_server::SpacedGuestServiceConfig;
 
 #[test]

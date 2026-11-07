@@ -104,11 +104,13 @@ impl SpacedGuestService {
     fn current_wait_ready_response(&self) -> BridgeGuestWaitReadyResponse {
         let ready = *self.inner.ready.borrow();
         BridgeGuestWaitReadyResponse {
-            platform: Some(pplx_space_spaced_common::platform::GuestPlatform::for_target().wire()),
+            platform: Some(
+                pplx_space_spaced_guest_protocol::platform::GuestPlatform::for_target().wire(),
+            ),
             ready,
             guest_uptime: ready.then(|| (self.inner.guest_uptime_source)()).flatten(),
-            version: pplx_space_spaced_common::spaced_version().to_string(),
-            compatibility_family: pplx_space_spaced_common::spaced_compatibility_family(),
+            version: pplx_space_spaced_protocol::spaced_version().to_string(),
+            compatibility_family: pplx_space_spaced_guest_protocol::spaced_compatibility_family(),
             mem_total_bytes: ready.then(guest_mem_total_bytes).flatten(),
             vcpu_count: ready.then(guest_vcpu_count).flatten(),
         }
@@ -242,8 +244,8 @@ impl BridgeGuestMeta for SpacedGuestService {
         request: Request<BridgeGuestWaitReadyRequest>,
     ) -> Result<Response<BridgeGuestWaitReadyResponse>, Status> {
         let request = request.into_inner();
-        pplx_space_spaced_common::platform::require_host_contract(
-            pplx_space_spaced_common::platform::target_os(),
+        pplx_space_spaced_guest_protocol::platform::require_host_contract(
+            pplx_space_spaced_guest_protocol::platform::target_os(),
             request.host_contract_revision,
         )?;
         let timeout = validate_timeout(request.timeout)?;
@@ -280,15 +282,20 @@ impl BridgeGuestMeta for SpacedGuestService {
         request: Request<NotifyResumeRequest>,
     ) -> Result<Response<NotifyResumeResponse>, Status> {
         let request = request.into_inner();
-        let reason =
-            pplx_space_spaced_common::proto::bridge_guest::ResumeReason::try_from(request.reason)
-                .map_err(|_| Status::invalid_argument("unknown resume_reason"))?;
-        if reason == pplx_space_spaced_common::proto::bridge_guest::ResumeReason::Unspecified {
+        let reason = pplx_space_spaced_guest_protocol::proto::bridge_guest::ResumeReason::try_from(
+            request.reason,
+        )
+        .map_err(|_| Status::invalid_argument("unknown resume_reason"))?;
+        if reason
+            == pplx_space_spaced_guest_protocol::proto::bridge_guest::ResumeReason::Unspecified
+        {
             return Err(Status::invalid_argument("resume_reason is required"));
         }
         // A restored guest's diagnostics record came with the snapshot: they
         // happened in the sandbox it was taken from.
-        if reason == pplx_space_spaced_common::proto::bridge_guest::ResumeReason::SnapshotRestore {
+        if reason
+            == pplx_space_spaced_guest_protocol::proto::bridge_guest::ResumeReason::SnapshotRestore
+        {
             pplx_space_observability::warning_tap::discard();
         }
         let clock_sync_status = sync_guest_clock(request.host_time)?;
@@ -319,7 +326,7 @@ impl BridgeGuestMeta for SpacedGuestService {
     }
 }
 
-use pplx_space_spaced_common::{validate_optional_reason, validate_timeout};
+use pplx_space_spaced_guest_protocol::{validate_optional_reason, validate_timeout};
 
 #[cfg(test)]
 mod tests;
