@@ -157,6 +157,7 @@ pub mod scan {
     mod eviction_candidates;
     mod list_page;
     mod local_artifacts;
+    mod local_only_artifacts;
     mod node_dirty_batch;
     mod pending_backups;
     mod pool_donor;
@@ -173,6 +174,7 @@ pub mod scan {
     pub use eviction_candidates::*;
     pub use list_page::*;
     pub use local_artifacts::*;
+    pub use local_only_artifacts::*;
     pub use node_dirty_batch::*;
     pub use pending_backups::*;
     pub use pool_donor::*;

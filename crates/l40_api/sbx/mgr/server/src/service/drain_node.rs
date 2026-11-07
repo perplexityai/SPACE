@@ -98,6 +98,18 @@ impl DrainActions {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(sandbox_id);
     }
+
+    /// Wait, at most ten seconds, until no drain action is running.
+    #[cfg(test)]
+    pub(super) async fn wait_idle(&self) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !self.running().is_empty() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("drain actions finish within ten seconds");
+    }
 }
 
 /// One row as the planner reads it.
@@ -152,17 +164,35 @@ pub(super) const fn may_hold_vm(state: SandboxState) -> bool {
     )
 }
 
+/// A sandbox's artifacts without a durable copy, by sandbox, from the
+/// artifact registry: named snapshots and superseded lifecycle artifacts as
+/// well as the current pin.
+pub(super) type LocalOnlyArtifacts =
+    BTreeMap<String, Vec<(String, pplx_space_common_core::types::ArtifactKind)>>;
+
 /// Decide what the drain does for every row. `pending_backups` maps a
-/// sandbox to the pinned artifacts still without a durable copy;
-/// `evacuations` are the recorded drain suspends by sandbox; `running` is
-/// the drain's work in flight in this process.
+/// sandbox to the pinned artifacts still without a durable copy, including
+/// a pin that names no artifact row; `local_only` is every artifact without
+/// one; `evacuations` are the recorded drain suspends by sandbox; `running`
+/// is the drain's work in flight in this process.
 pub(super) fn plan(
     rows: &[DrainRow],
     pending_backups: &BTreeMap<String, BTreeSet<String>>,
+    local_only: &LocalOnlyArtifacts,
     evacuations: &BTreeMap<String, DrainEvacuation>,
     running: &BTreeMap<String, DrainAction>,
 ) -> DrainPlan {
     let mut plan = DrainPlan::default();
+    for (sandbox_id, artifacts) in local_only {
+        if !rows.iter().any(|row| row.sandbox_id == *sandbox_id) {
+            for (artifact, _) in artifacts {
+                plan.blocked.push((
+                    Some(sandbox_id.clone()),
+                    format!("local-only artifact {artifact} has no sandbox row"),
+                ));
+            }
+        }
+    }
     for row in rows {
         let id = &row.sandbox_id;
         let evacuation = evacuations.get(id);
@@ -278,6 +308,26 @@ pub(super) fn plan(
                 );
                 plan.pending.push((id.clone(), action));
             }
+        }
+        // Every other artifact the sandbox keeps without a durable copy, a
+        // named snapshot or one its pin moved on from, is finished the same
+        // way. The arm above owns the pin, and a row being deleted takes its
+        // artifacts with it.
+        if row.lifecycle == SandboxState::Deleting {
+            continue;
+        }
+        let pin = row.pin.as_ref().map(|(artifact, _)| artifact);
+        for (artifact, kind) in local_only.get(id).into_iter().flatten() {
+            if Some(artifact) == pin {
+                continue;
+            }
+            plan.pending
+                .push((id.clone(), DrainAction::Upload.as_str().into()));
+            plan.actions.push(PlannedAction::Upload {
+                sandbox_id: id.clone(),
+                artifact_id: artifact.clone(),
+                kind: *kind,
+            });
         }
     }
     plan
@@ -481,20 +531,30 @@ impl SandboxManagerService {
         findings
     }
 
-    /// Read every row, the pending backups and the evacuation record, and
-    /// plan, with the ids of the rows read. An error is the scan that failed,
-    /// which blocks the drain.
+    /// Read every row, the artifacts without a durable copy and the
+    /// evacuation record, and plan, with the ids of the rows read. An error
+    /// is the scan that failed, which blocks the drain.
     fn read_drain_plan(&self) -> Result<(DrainPlan, BTreeSet<String>), String> {
-        let (sandboxes, evacuations) = {
+        let (sandboxes, local_only_rows, evacuations) = {
             let conn = self
                 .db_conn()
                 .map_err(|status| status.message().to_owned())?;
+            // One lock, so no row or artifact lands between the reads.
             let sandboxes = crate::db::scan::all_sandboxes(&conn, crate::db::scan::StrictRows)
                 .map_err(|error| format!("sandbox scan failed: {error}"))?;
+            let local_only = crate::db::scan::local_only_artifacts(&conn)
+                .map_err(|error| format!("local artifact scan failed: {error}"))?;
             let evacuations = crate::db::read::drain_evacuations(&conn)
                 .map_err(|error| format!("evacuation record unreadable: {error}"))?;
-            (sandboxes, evacuations)
+            (sandboxes, local_only, evacuations)
         };
+        let mut local_only = LocalOnlyArtifacts::new();
+        for artifact in local_only_rows {
+            local_only.entry(artifact.sandbox_id).or_default().push((
+                artifact.local_artifact_id.to_string(),
+                artifact.artifact_kind,
+            ));
+        }
         let mut pending_backups: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
         for pending in self
             .local_artifacts()
@@ -534,6 +594,7 @@ impl SandboxManagerService {
             plan(
                 &rows,
                 &pending_backups,
+                &local_only,
                 &evacuations,
                 &self.drain_actions.running(),
             ),
