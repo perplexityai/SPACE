@@ -14,9 +14,10 @@ struct Environments {
 /// upgrade's target.
 fn environments() -> Environments {
     use pplx_space_common_core::types::{
-        Arch, ArtifactComponentKind, ArtifactComponentMetadata, ArtifactFormat, ArtifactVersion,
+        ArtifactComponentKind, ArtifactComponentMetadata, ArtifactFormat, ArtifactVersion,
         GuestOperatingSystem, GuestPlatform, RuntimeIdentity, RuntimeKind, StateFormatIdentity,
     };
+    use pplx_space_cpu_arch::Arch;
     let bound = |hex: &str, runtime: &str, state_format: &str, kernel: &str, kernel_hex: &str| {
         let reference: EnvironmentReference = format!("sha256:{}", hex.repeat(64)).parse().unwrap();
         let execution = ExecutionMetadata::new(

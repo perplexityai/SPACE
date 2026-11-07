@@ -1,8 +1,9 @@
 //! Guest boot configuration belongs to runtime adapters. Lifecycle callers
 //! provide resources and policy, not a provider's JSON keys or device model.
 use pplx_space_common_core::types::{
-    Arch, BalloonConfig, GuestOperatingSystem, GuestPlatform, RateLimiter, RuntimeKind, VcpuCount,
+    BalloonConfig, GuestOperatingSystem, GuestPlatform, RateLimiter, RuntimeKind, VcpuCount,
 };
+use pplx_space_cpu_arch::Arch;
 use std::num::{NonZeroU32, NonZeroU64};
 
 mod cloud_hypervisor;

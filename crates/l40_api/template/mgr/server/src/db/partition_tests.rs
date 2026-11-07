@@ -2,9 +2,10 @@
 //! rows, snapshots and tag pins.
 
 use pplx_space_common_core::types::{
-    Arch, ArtifactComponentKind, ArtifactComponentMetadata, ArtifactFormat, ArtifactVersion,
-    Digest, EnvironmentReference, ExecutionMetadata,
+    ArtifactComponentKind, ArtifactComponentMetadata, ArtifactFormat, ArtifactVersion, Digest,
+    EnvironmentReference, ExecutionMetadata,
 };
+use pplx_space_cpu_arch::Arch;
 use pplx_space_template_manifest::TemplateManifest;
 use rusqlite::Connection;
 

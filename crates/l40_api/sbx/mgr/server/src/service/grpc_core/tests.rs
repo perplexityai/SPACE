@@ -1287,7 +1287,7 @@ fn template_catalog_reads_an_adopted_build_s_metadata_from_its_legacy_dir(
     )
     .unwrap();
     let e1 = pplx_space_execution_catalog::catalog::CompiledEnvironment::for_architecture(
-        pplx_space_common_core::types::Arch::X86_64,
+        pplx_space_cpu_arch::Arch::X86_64,
     )
     .unwrap()
     .iter()

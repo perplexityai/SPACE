@@ -8,8 +8,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use futures_util::StreamExt as _;
 use md5::{Digest as _, Md5};
 use pplx_space_common_core::types::{
-    Arch, Digest, RuntimeIdentity, RuntimeKind, RuntimeVersion, StorageUri,
+    Digest, RuntimeIdentity, RuntimeKind, RuntimeVersion, StorageUri,
 };
+use pplx_space_cpu_arch::Arch;
 use sha2::Sha256;
 
 use std::os::unix::fs::MetadataExt as _;

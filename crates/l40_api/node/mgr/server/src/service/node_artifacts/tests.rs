@@ -524,7 +524,7 @@ async fn legacy_custom_inputs_survive_unless_legacy_permission_is_removed() {
                 Some("e0"),
                 None,
                 &pplx_space_node_runtime_core::catalog::CompiledEnvironment::for_architecture(
-                    pplx_space_common_core::types::Arch::X86_64,
+                    pplx_space_cpu_arch::Arch::X86_64,
                 )
                 .unwrap(),
             )

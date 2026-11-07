@@ -271,7 +271,7 @@ fn rejects_traversal_and_degenerate_components() {
 
 #[test]
 fn snapshot_dispatch_uses_the_recorded_boot_contract() {
-    use pplx_space_common_core::types::Arch;
+    use pplx_space_cpu_arch::Arch;
     use pplx_space_node_runtime_core::{boot::BootSource, catalog::CompiledEnvironment};
     let catalog = CompiledEnvironment::for_architecture(Arch::X86_64).unwrap();
     for (name, expected) in [

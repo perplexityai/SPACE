@@ -83,6 +83,7 @@ pplx-space-bearer-token = { workspace = true }
 pplx-space-build-mgr = { workspace = true }
 pplx-space-build-mgr-client = { workspace = true }
 pplx-space-env-vars = { workspace = true }
+pplx-space-cpu-arch = { workspace = true, features = ["serde"] }
 pplx-space-execution-catalog = { workspace = true }
 pplx-space-credmgr-client = { workspace = true }
 pplx-space-credential-injection = { workspace = true }

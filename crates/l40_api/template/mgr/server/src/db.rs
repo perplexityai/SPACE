@@ -303,7 +303,7 @@ pub fn upsert_build(conn: &Connection, b: &BuildUpsert<'_>) -> Result<()> {
             .is_ok_and(|runtime| runtime == execution.runtime().kind);
         let arch_matches = b
             .arch
-            .parse::<pplx_space_common_core::types::Arch>()
+            .parse::<pplx_space_cpu_arch::Arch>()
             .is_ok_and(|arch| arch == execution.guest().architecture);
         if !runtime_matches || !arch_matches {
             return Err(invalid_build_upsert(

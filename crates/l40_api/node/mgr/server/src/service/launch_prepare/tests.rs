@@ -1,6 +1,7 @@
 use pplx_space_common_core::types::SandboxId;
 
-use pplx_space_common_core::types::{Arch, ExecutionMetadata, RuntimeKind};
+use pplx_space_common_core::types::{ExecutionMetadata, RuntimeKind};
+use pplx_space_cpu_arch::Arch;
 
 use super::{parse_runtime_request, prepare_sandbox_cache_paths, prepare_sandbox_owned_paths};
 

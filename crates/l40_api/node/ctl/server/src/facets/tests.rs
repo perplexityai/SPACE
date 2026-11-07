@@ -1149,7 +1149,7 @@ fn sandbox_policy_apply_filter_applies_on_stale_gateway_state() {
 fn published_sandbox_state_uses_batched_enrichment() {
     let execution: pplx_space_execution_common::proto::ExecutionMetadata =
         (&pplx_space_common_core::types::ExecutionMetadata::initial_firecracker(
-            pplx_space_common_core::types::Arch::Aarch64,
+            pplx_space_cpu_arch::Arch::Aarch64,
             vec![],
         ))
             .into();

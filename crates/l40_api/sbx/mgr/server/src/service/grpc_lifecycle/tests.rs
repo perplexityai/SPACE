@@ -870,8 +870,9 @@ fn only_a_captured_suspend_records_this_hosts_cpu() {
 #[test]
 fn artifact_backup_execution_keeps_a_capture_cpu_only_for_full_artifacts() {
     use pplx_space_common_core::types::{
-        Arch, ArtifactKind, ExecutionMetadata, SnapshotExecutionMetadata,
+        ArtifactKind, ExecutionMetadata, SnapshotExecutionMetadata,
     };
+    use pplx_space_cpu_arch::Arch;
 
     let host_cpu = HostCpu::parse("genuineintel-6-85-7").unwrap();
     let execution = SnapshotExecutionMetadata::new(ExecutionMetadata::initial_firecracker(
@@ -2983,7 +2984,7 @@ async fn teardown_suspend_waits_while_a_stay_stopped_upgrade_runs() {
     use crate::service::tests::service_tests::insert_test_sandbox;
     use pplx_space_common_core::types::ExecutionGeneration;
     let execution = pplx_space_node_runtime_core::catalog::CompiledEnvironment::for_architecture(
-        pplx_space_common_core::types::Arch::X86_64,
+        pplx_space_cpu_arch::Arch::X86_64,
     )
     .unwrap()
     .first()

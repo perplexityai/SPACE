@@ -316,7 +316,7 @@ async fn agentless_memory_lifecycle_refuses_before_changing_state_or_contacting_
         let id = SandboxId::new().to_string();
         insert_firmware_sandbox(&conn, &id, state, image());
         let catalog = pplx_space_execution_catalog::catalog::CompiledEnvironment::for_architecture(
-            pplx_space_common_core::types::Arch::X86_64,
+            pplx_space_cpu_arch::Arch::X86_64,
         )
         .unwrap();
         let execution = catalog
@@ -389,7 +389,7 @@ async fn windows_environment_update_refuses_before_persistence_but_allows_cleari
     .unwrap();
     insert_firmware_sandbox(&conn, &id, SandboxState::Started, image);
     let catalog = pplx_space_execution_catalog::catalog::CompiledEnvironment::for_architecture(
-        pplx_space_common_core::types::Arch::X86_64,
+        pplx_space_cpu_arch::Arch::X86_64,
     )
     .unwrap();
     let execution = catalog
@@ -440,7 +440,7 @@ async fn windows_environment_update_refuses_before_persistence_but_allows_cleari
 #[tokio::test]
 async fn restored_windows_registration_preserves_guest_identity_and_native_app_readiness() {
     use crate::service::activation_support::internal_request;
-    use pplx_space_common_core::types::Arch;
+    use pplx_space_cpu_arch::Arch;
     let native = GuestImageContract::new(
         GuestDiskLayout::OpaqueRawDisk,
         GuestReadiness::Agent,

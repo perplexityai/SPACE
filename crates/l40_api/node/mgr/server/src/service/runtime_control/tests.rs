@@ -1,5 +1,6 @@
 use super::*;
-use pplx_space_common_core::types::{Arch, RuntimeKind, SandboxId, TemplateName};
+use pplx_space_common_core::types::{RuntimeKind, SandboxId, TemplateName};
+use pplx_space_cpu_arch::Arch;
 
 #[test]
 fn runtime_dispatch_preserves_absence_and_refuses_corrupt_or_foreign_metadata() {

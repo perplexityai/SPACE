@@ -17,7 +17,6 @@ pplx-space-auto-lifecycle = { workspace = true }
 pplx-space-byte-size = { workspace = true }
 pplx-space-cluster-id = { workspace = true }
 pplx-space-content-digest = { workspace = true }
-pplx-space-cpu-arch = { workspace = true }
 pplx-space-durations = { workspace = true }
 pplx-space-env-vars = { workspace = true }
 pplx-space-execution-spec = { workspace = true }
@@ -39,6 +38,7 @@ tracing = { workspace = true }
 uuid = { workspace = true, features = ["v5", "v7"] }
 
 [dev-dependencies]
+pplx-space-cpu-arch = { workspace = true }
 serde_json = { workspace = true }
 
 [features]
@@ -52,7 +52,6 @@ serde = [
     "pplx-space-durations/serde",
     "uuid/serde",
     "pplx-space-semver/serde",
-    "pplx-space-cpu-arch/serde",
     "pplx-space-k8s-ids/serde",
     "pplx-space-cluster-id/serde",
     "pplx-space-guest-process/serde",

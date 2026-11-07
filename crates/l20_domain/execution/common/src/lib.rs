@@ -1,11 +1,12 @@
 //! Shared protobuf conversions for portable execution metadata.
 
 use pplx_space_common_core::types::{
-    Arch, ArtifactComponentKind, ArtifactComponentMetadata, ArtifactComponentRole, ArtifactFormat,
+    ArtifactComponentKind, ArtifactComponentMetadata, ArtifactComponentRole, ArtifactFormat,
     ArtifactVersion, Digest, ExecutionMetadata, GuestOperatingSystem, GuestPlatform,
     RuntimeIdentity, RuntimeKind, RuntimeVersion, StateFormatIdentity, StateFormatName,
     StateFormatVersion,
 };
+use pplx_space_cpu_arch::Arch;
 
 pub mod environment;
 pub mod policy;

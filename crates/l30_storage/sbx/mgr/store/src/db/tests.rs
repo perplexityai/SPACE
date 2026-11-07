@@ -139,11 +139,12 @@ fn node_execution_cleanup_acknowledgements_are_retryable_and_fenced() {
 }
 use pplx_space_accounts::UserId;
 use pplx_space_common_core::types::{
-    Arch, ArtifactComponentKind, ArtifactComponentMetadata, ArtifactFormat, ArtifactVersion,
+    ArtifactComponentKind, ArtifactComponentMetadata, ArtifactFormat, ArtifactVersion,
     AutoLifecycleConditionSet, AutoLifecycleConditionSetId, AutoLifecycleIdleAction,
     AutoLifecycleStage, Digest, ExecutionMetadata, LinuxPid, LinuxUid, SandboxActivationAttemptId,
     SandboxId, VsockCid,
 };
+use pplx_space_cpu_arch::Arch;
 use uuid::Uuid;
 
 #[test]

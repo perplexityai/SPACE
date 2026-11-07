@@ -2,10 +2,8 @@
 
 use pplx_space_accounts::NodeId;
 use pplx_space_common_core::types::{LocalArtifactId, SandboxId, SnapshotId};
-use pplx_space_common_core::{
-    sql,
-    types::{Arch, ExecutionMetadata},
-};
+use pplx_space_common_core::{sql, types::ExecutionMetadata};
+use pplx_space_cpu_arch::Arch;
 use pplx_space_node_api_client::proto::PublishedSandboxState;
 use pplx_space_test_env::TestResult;
 use sqlx::PgPool;

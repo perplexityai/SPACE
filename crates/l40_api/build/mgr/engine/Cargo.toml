@@ -45,6 +45,7 @@ pplx-space-accounts = { workspace = true, features = ["serde"] }
 pplx-space-build-mgr-client = { workspace = true }
 pplx-space-common-core = { workspace = true, features = ["serde"] }
 pplx-space-template-runtime = { workspace = true }
+pplx-space-cpu-arch = { workspace = true, features = ["serde"] }
 pplx-space-credmgr-client = { workspace = true }
 pplx-space-execution-common = { workspace = true }
 pplx-space-host-layout = { workspace = true }

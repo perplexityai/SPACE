@@ -1,5 +1,6 @@
 use super::*;
-use pplx_space_common_core::types::{Arch, ExecutionMetadata};
+use pplx_space_common_core::types::ExecutionMetadata;
+use pplx_space_cpu_arch::Arch;
 use pplx_space_template_manifest::{
     TEMPLATE_MANIFEST_SCHEMA_VERSION, TEMPLATE_METADATA_SCHEMA_VERSION,
 };

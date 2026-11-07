@@ -134,7 +134,7 @@ pub enum SelectionConfigurationError {
     #[error("cannot load execution catalog: {0}")]
     Catalog(#[from] pplx_space_node_runtime_core::catalog::CatalogError),
     #[error("unsupported host architecture: {0}")]
-    Architecture(#[from] pplx_space_common_core::types::ArchParseError),
+    Architecture(#[from] pplx_space_cpu_arch::ArchParseError),
 }
 
 fn execution_policy_from_env()
@@ -159,7 +159,7 @@ fn execution_policy_from_env()
 fn execution_policy_with_catalog(
     allowed: Option<&str>,
     default: Option<&str>,
-    architecture: pplx_space_common_core::types::Arch,
+    architecture: pplx_space_cpu_arch::Arch,
     catalog: Result<
         Vec<pplx_space_node_runtime_core::catalog::CompiledEnvironment>,
         pplx_space_node_runtime_core::catalog::CatalogError,

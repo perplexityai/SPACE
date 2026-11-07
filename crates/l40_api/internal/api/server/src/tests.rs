@@ -1234,7 +1234,8 @@ async fn register_template_release_allows_no_storage_locations() -> TestResult {
 /// metadata is backfilled by a later registration that has it.
 #[tokio::test(flavor = "current_thread")]
 async fn register_template_release_persists_execution_metadata_write_once() -> TestResult {
-    use pplx_space_common_core::types::{Arch, Digest, EnvironmentReference, ExecutionMetadata};
+    use pplx_space_common_core::types::{Digest, EnvironmentReference, ExecutionMetadata};
+    use pplx_space_cpu_arch::Arch;
 
     let Some(fixture) = cluster_fixture().await? else {
         return Ok(());
@@ -1334,7 +1335,8 @@ async fn register_template_release_persists_execution_metadata_write_once() -> T
 /// as they were, including a `NULL` metadata column.
 #[tokio::test(flavor = "current_thread")]
 async fn tags_only_republication_leaves_locations_and_metadata_unchanged() -> TestResult {
-    use pplx_space_common_core::types::{Arch, ExecutionMetadata};
+    use pplx_space_common_core::types::ExecutionMetadata;
+    use pplx_space_cpu_arch::Arch;
 
     let Some(fixture) = cluster_fixture().await? else {
         return Ok(());
@@ -4727,7 +4729,7 @@ fn test_storage_uri(sandbox_id: SandboxId, snapshot_id: SnapshotId) -> String {
 }
 
 fn test_snapshot_execution_for_arch(
-    arch: pplx_space_common_core::types::Arch,
+    arch: pplx_space_cpu_arch::Arch,
 ) -> pplx_space_execution_common::proto::ExecutionMetadata {
     let execution = pplx_space_common_core::types::ExecutionMetadata::initial_firecracker(
         arch,
@@ -4751,7 +4753,7 @@ fn test_snapshot_execution_for_arch(
 }
 
 fn test_snapshot_execution() -> pplx_space_execution_common::proto::ExecutionMetadata {
-    test_snapshot_execution_for_arch(pplx_space_common_core::types::Arch::Aarch64)
+    test_snapshot_execution_for_arch(pplx_space_cpu_arch::Arch::Aarch64)
 }
 
 /// Seed a `creating` suspend snapshot without artifact identity: the row
@@ -4913,7 +4915,7 @@ async fn suspend_snapshot_rejects_reused_id_with_different_identity() -> TestRes
         (
             "different execution",
             sandbox_id,
-            test_snapshot_execution_for_arch(pplx_space_common_core::types::Arch::X86_64),
+            test_snapshot_execution_for_arch(pplx_space_cpu_arch::Arch::X86_64),
         ),
     ] {
         let error = seed_suspend_snapshot_with_identity(

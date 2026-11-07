@@ -62,6 +62,7 @@ pplx-space-auto-lifecycle-receipt = { workspace = true }
 pplx-space-common-core = { workspace = true, features = ["serde"] }
 pplx-space-host-layout = { workspace = true }
 pplx-space-common-jobs = { workspace = true }
+pplx-space-cpu-arch = { workspace = true, features = ["serde"] }
 pplx-space-sqlite = { workspace = true }
 pplx-space-events = { workspace = true }
 pplx-space-metrics-emit = { workspace = true }

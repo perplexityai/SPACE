@@ -5856,7 +5856,7 @@ pub(crate) mod service_tests {
         );
         assert_eq!(
             execution.guest().architecture,
-            pplx_space_common_core::types::Arch::X86_64
+            pplx_space_cpu_arch::Arch::X86_64
         );
     }
 
@@ -5880,7 +5880,7 @@ pub(crate) mod service_tests {
         assert_eq!(execution.state_format().unwrap().version.as_str(), "9.0.0");
         assert_eq!(
             execution.guest().architecture,
-            pplx_space_common_core::types::Arch::Aarch64
+            pplx_space_cpu_arch::Arch::Aarch64
         );
     }
 
@@ -6485,7 +6485,7 @@ pub(crate) mod service_tests {
         let local_artifact_id = LocalArtifactId::new().to_string();
         let credential_marker = "runtime-restore-secret";
         let execution = pplx_space_common_core::types::ExecutionMetadata::initial_firecracker(
-            pplx_space_common_core::types::Arch::Aarch64,
+            pplx_space_cpu_arch::Arch::Aarch64,
             vec![],
         );
 
@@ -7716,7 +7716,7 @@ pub(crate) mod service_tests {
                 _ => {
                     let compiled =
                         pplx_space_node_runtime_core::catalog::CompiledEnvironment::for_architecture(
-                            pplx_space_common_core::types::Arch::X86_64,
+                            pplx_space_cpu_arch::Arch::X86_64,
                         )
                         .unwrap();
                     crate::db::upsert_sandbox_execution_metadata(
@@ -18776,7 +18776,7 @@ pub(crate) mod service_tests {
     -> (SandboxManagerService, String, AutoLifecycleRuntimeState) {
         let execution =
             pplx_space_node_runtime_core::catalog::CompiledEnvironment::for_architecture(
-                pplx_space_common_core::types::Arch::X86_64,
+                pplx_space_cpu_arch::Arch::X86_64,
             )
             .unwrap()
             .first()

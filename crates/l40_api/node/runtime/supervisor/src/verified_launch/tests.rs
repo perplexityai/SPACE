@@ -1,5 +1,5 @@
 use super::*;
-use pplx_space_common_core::types::Arch;
+use pplx_space_cpu_arch::Arch;
 use pplx_space_node_runtime_core::artifact_store::managed_release_directory;
 
 #[test]

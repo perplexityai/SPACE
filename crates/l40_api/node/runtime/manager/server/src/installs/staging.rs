@@ -11,7 +11,8 @@ use std::os::unix::fs::{
 use std::path::{Path, PathBuf};
 
 use md5::Md5;
-use pplx_space_common_core::types::{Arch, ArtifactVersion, Digest};
+use pplx_space_common_core::types::{ArtifactVersion, Digest};
+use pplx_space_cpu_arch::Arch;
 use pplx_space_node_runtime_core::runtime_inventory::diagnostic::{self, ElfProbe};
 use pplx_space_node_runtime_core::runtime_inventory::kernel_release::KernelReleaseScanner;
 use sha2::{Digest as _, Sha256};
