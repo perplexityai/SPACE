@@ -114,6 +114,7 @@ pub mod create;
 pub mod delete;
 pub mod direct;
 pub mod drain;
+pub mod drain_restore;
 pub mod fork_source_lifecycle;
 pub mod ingest;
 pub mod intent;

@@ -1231,8 +1231,10 @@ pub async fn abandon_stale_resident_sandboxes(
 ///   re-drives it onto a healthy cohort node (its crash-recovery arm selects
 ///   `restoring` + marker rows), so failing it would lose a recoverable
 ///   sandbox. A `restoring` row with a `restore_episode_target` is spared
-///   too, although nothing re-drives it yet except a user's restore on Direct,
-///   whose claim ignores the target.
+///   too: the drain restore operation re-drives one toward `started` or
+///   `paused` ([`crate::drain_restore`]), and nothing re-drives a `stopped`
+///   one yet except a user's restore on Direct, whose claim ignores the
+///   target.
 /// - A **marked `suspending`** row whose current cycle still has recoverable
 ///   evidence ([`recoverable_suspend_snapshot_exists`]) is spared. Within
 ///   this sweep's `active_node_id = $1` scope only the legacy
