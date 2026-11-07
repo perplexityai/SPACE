@@ -44,17 +44,25 @@ pub enum PublishKnownError {
 /// publications acquire neither the admission lock nor row update locks.
 /// The transaction must use READ COMMITTED so admission sees commits from
 /// earlier holders of the admission lock.
+/// Reports are processed in at most five SQL commands, independent of their
+/// length; a full catalog does not cause per-rejected-entry database calls.
 pub async fn publish_known<'a>(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     environments: impl IntoIterator<Item = &'a KnownEnvironment>,
     capacity: usize,
 ) -> Result<usize, PublishKnownError> {
-    let mut environments = environments.into_iter().collect::<Vec<_>>();
-    environments.sort_unstable_by_key(|environment| environment.reference());
-    let references = environments
-        .iter()
-        .map(|environment| environment.reference().to_string())
+    let publications = environments
+        .into_iter()
+        .map(CatalogPublication::from)
         .collect::<Vec<_>>();
+    if publications.is_empty() {
+        return Ok(0);
+    }
+    let references = publications
+        .iter()
+        .map(|publication| publication.environment_ref.clone())
+        .collect::<Vec<_>>();
+    let report = sqlx::types::Json(&publications);
     let has_new: bool = sqlx::query_scalar(sql!(
         "SELECT EXISTS (
              SELECT 1 FROM unnest($1::text[]) AS reported(reference)
@@ -76,107 +84,144 @@ pub async fn publish_known<'a>(
         ))
         .execute(&mut **tx)
         .await?;
+        sqlx::query(sql!(
+            "INSERT INTO runtime_environments (
+                 environment_ref, runtime, runtime_version, version_sort_key,
+                 kernel_version, state_format_name, state_format_version,
+                 upgrade_edges, memory_edges
+             )
+             SELECT reported.environment_ref, reported.runtime, reported.runtime_version,
+                    reported.version_sort_key, reported.kernel_version,
+                    reported.state_format_name, reported.state_format_version,
+                    reported.upgrade_edges, reported.memory_edges
+             FROM jsonb_to_recordset($1) AS reported(
+                 environment_ref text, runtime text, runtime_version text,
+                 version_sort_key integer[], kernel_version text,
+                 state_format_name text, state_format_version text,
+                 upgrade_edges text[], memory_edges text[]
+             )
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM runtime_environments
+                 WHERE environment_ref = reported.environment_ref
+             )
+             ORDER BY reported.environment_ref
+             LIMIT GREATEST($2 - (
+                 SELECT count(*) FROM runtime_environments WHERE retired_at IS NULL
+             ), 0)
+             ON CONFLICT (environment_ref) DO NOTHING"
+        ))
+        .bind(report)
+        .bind(i64::try_from(capacity).unwrap_or(i64::MAX))
+        .execute(&mut **tx)
+        .await?;
     }
-    let mut deferred = 0;
-    for environment in environments {
-        if !publish_one(tx, environment, capacity).await? {
-            deferred += 1;
-        }
-    }
-    Ok(deferred)
-}
-
-async fn publish_one(
-    connection: &mut sqlx::PgConnection,
-    environment: &KnownEnvironment,
-    capacity: usize,
-) -> Result<bool, PublishKnownError> {
-    let spec = environment.definition().descriptor().spec();
-    let RuntimeBinding::ManagedRelease(release) = &spec.runtime;
-    let sort_key = environment.runtime_version_sort_key().map(|key| {
-        key.components()
-            .iter()
-            // VersionSortKey validates the Postgres INT range at construction.
-            .map(|component| i32::try_from(*component).expect("validated version sort key"))
-            .collect::<Vec<_>>()
-    });
-    let kernel = spec
-        .boot
-        .components()
-        .find(|(_, component, _)| component.kind == ArtifactComponentKind::Kernel)
-        .map(|(_, component, _)| component.version.to_string());
-    let state_format = spec.compatibility.state_format();
-    let upgrade_edges = environment
-        .upgrade_edges()
-        .iter()
-        .map(ToString::to_string)
-        .collect::<Vec<_>>();
-    let memory_edges = environment
-        .memory_edges()
-        .iter()
-        .map(ToString::to_string)
-        .collect::<Vec<_>>();
+    // The materialized changed set makes row-lock ordering explicit without
+    // duplicating the change predicate or locking unchanged replays. Keeping
+    // insertion separate also observes a conflicting insert after it commits.
     sqlx::query(sql!(
-        "INSERT INTO runtime_environments (
-             environment_ref, runtime, runtime_version, version_sort_key,
-             kernel_version, state_format_name, state_format_version,
-             upgrade_edges, memory_edges
-         ) SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9
-         WHERE (SELECT count(*) FROM runtime_environments WHERE retired_at IS NULL) < $10
-         ON CONFLICT (environment_ref) DO NOTHING"
-    ))
-    .bind(environment.reference().to_string())
-    .bind(release.runtime.kind.as_str())
-    .bind(release.runtime.version.as_str())
-    .bind(&sort_key)
-    .bind(kernel)
-    .bind(state_format.map(|format| format.format.as_str()))
-    .bind(state_format.map(|format| format.version.as_str()))
-    .bind(&upgrade_edges)
-    .bind(&memory_edges)
-    .bind(i64::try_from(capacity).unwrap_or(i64::MAX))
-    .execute(&mut *connection)
-    .await?;
-    // A separate statement sees a concurrent insert after ON CONFLICT waits.
-    // Unlike an upsert, UPDATE's predicate takes no tuple lock on a replay.
-    sqlx::query(sql!(
-        "UPDATE runtime_environments SET
+        "WITH changed AS MATERIALIZED (
+             SELECT catalog.environment_ref, reported.version_sort_key,
+                    reported.upgrade_edges, reported.memory_edges
+             FROM runtime_environments AS catalog
+             JOIN jsonb_to_recordset($1) AS reported(
+                 environment_ref text, version_sort_key integer[],
+                 upgrade_edges text[], memory_edges text[]
+             ) ON catalog.environment_ref = reported.environment_ref
+             WHERE NOT catalog.upgrade_edges <@ reported.upgrade_edges
+                OR NOT catalog.memory_edges <@ reported.memory_edges
+                OR (catalog.version_sort_key IS NOT NULL
+                    AND catalog.version_sort_key IS DISTINCT FROM reported.version_sort_key)
+             ORDER BY catalog.environment_ref
+             FOR UPDATE OF catalog
+         )
+         UPDATE runtime_environments AS catalog SET
              version_sort_key = CASE
-                 WHEN version_sort_key = $2
-                 THEN runtime_environments.version_sort_key
+                 WHEN catalog.version_sort_key = changed.version_sort_key
+                 THEN catalog.version_sort_key
                  ELSE NULL
              END,
              upgrade_edges = ARRAY(
-                 SELECT target FROM unnest(runtime_environments.upgrade_edges) AS old(target)
+                 SELECT target FROM unnest(catalog.upgrade_edges) AS old(target)
                  INTERSECT
-                 SELECT target FROM unnest($3::text[]) AS new(target)
+                 SELECT target FROM unnest(changed.upgrade_edges) AS new(target)
                  ORDER BY target
              ),
              memory_edges = ARRAY(
-                 SELECT target FROM unnest(runtime_environments.memory_edges) AS old(target)
+                 SELECT target FROM unnest(catalog.memory_edges) AS old(target)
                  INTERSECT
-                 SELECT target FROM unnest($4::text[]) AS new(target)
+                 SELECT target FROM unnest(changed.memory_edges) AS new(target)
                  ORDER BY target
              ),
              updated_at = now()
-         WHERE environment_ref = $1 AND (
-                NOT runtime_environments.upgrade_edges <@ $3::text[]
-            OR NOT runtime_environments.memory_edges <@ $4::text[]
-            OR (runtime_environments.version_sort_key IS NOT NULL
-                AND runtime_environments.version_sort_key IS DISTINCT FROM $2::integer[]))"
+         FROM changed
+         WHERE catalog.environment_ref = changed.environment_ref"
     ))
-    .bind(environment.reference().to_string())
-    .bind(sort_key)
-    .bind(upgrade_edges)
-    .bind(memory_edges)
-    .execute(&mut *connection)
+    .bind(report)
+    .execute(&mut **tx)
     .await?;
-    Ok(sqlx::query_scalar(sql!(
-        "SELECT EXISTS (SELECT 1 FROM runtime_environments WHERE environment_ref = $1)"
+    if !has_new {
+        return Ok(0);
+    }
+    let deferred: i64 = sqlx::query_scalar(sql!(
+        "SELECT count(*) FROM unnest($1::text[]) AS reported(reference)
+         WHERE NOT EXISTS (
+             SELECT 1 FROM runtime_environments WHERE environment_ref = reported.reference
+         )"
     ))
-    .bind(environment.reference().to_string())
-    .fetch_one(&mut *connection)
-    .await?)
+    .bind(&references)
+    .fetch_one(&mut **tx)
+    .await?;
+    Ok(usize::try_from(deferred).expect("deferred count cannot exceed input length"))
+}
+
+#[derive(serde::Serialize)]
+struct CatalogPublication {
+    environment_ref: String,
+    runtime: String,
+    runtime_version: String,
+    version_sort_key: Option<Vec<i32>>,
+    kernel_version: Option<String>,
+    state_format_name: Option<String>,
+    state_format_version: Option<String>,
+    upgrade_edges: Vec<String>,
+    memory_edges: Vec<String>,
+}
+
+impl From<&KnownEnvironment> for CatalogPublication {
+    fn from(environment: &KnownEnvironment) -> Self {
+        let spec = environment.definition().descriptor().spec();
+        let RuntimeBinding::ManagedRelease(release) = &spec.runtime;
+        let state_format = spec.compatibility.state_format();
+        Self {
+            environment_ref: environment.reference().to_string(),
+            runtime: release.runtime.kind.to_string(),
+            runtime_version: release.runtime.version.to_string(),
+            version_sort_key: environment.runtime_version_sort_key().map(|key| {
+                key.components()
+                    .iter()
+                    // VersionSortKey validates the Postgres INT range.
+                    .map(|component| i32::try_from(*component).expect("validated version sort key"))
+                    .collect()
+            }),
+            kernel_version: spec
+                .boot
+                .components()
+                .find(|(_, component, _)| component.kind == ArtifactComponentKind::Kernel)
+                .map(|(_, component, _)| component.version.to_string()),
+            state_format_name: state_format.map(|format| format.format.to_string()),
+            state_format_version: state_format.map(|format| format.version.to_string()),
+            upgrade_edges: environment
+                .upgrade_edges()
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+            memory_edges: environment
+                .memory_edges()
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+        }
+    }
 }
 
 /// Reading the catalog failed. Every variant fails closed: the caller gets no

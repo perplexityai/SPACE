@@ -26,6 +26,19 @@ fn certification(
     KnownEnvironment::new(definition(), sort_key, upgrade_edges, memory_edges).unwrap()
 }
 
+fn known_version(version: &str) -> KnownEnvironment {
+    let mut spec = definition().descriptor().spec().clone();
+    let RuntimeBinding::ManagedRelease(release) = &mut spec.runtime;
+    release.runtime.version = version.parse().unwrap();
+    KnownEnvironment::new(
+        EnvironmentDefinition::new(spec.try_into().unwrap()),
+        Some(VersionSortKey::new(vec![1]).unwrap()),
+        [],
+        [],
+    )
+    .unwrap()
+}
+
 async fn publish_known(pool: &PgPool, environment: &KnownEnvironment) -> TestResult {
     let mut tx = pool.begin().await?;
     assert_eq!(super::publish_known(&mut tx, [environment], 32).await?, 0);
@@ -186,18 +199,6 @@ async fn admission_is_bounded_across_concurrent_reports_and_preserves_existing_u
     let Some(db) = try_pg_test_db().await? else {
         return Ok(());
     };
-    let make_known = |version: &str| -> KnownEnvironment {
-        let mut spec = definition().descriptor().spec().clone();
-        let RuntimeBinding::ManagedRelease(release) = &mut spec.runtime;
-        release.runtime.version = version.parse().unwrap();
-        KnownEnvironment::new(
-            EnvironmentDefinition::new(spec.try_into().unwrap()),
-            Some(VersionSortKey::new(vec![1]).unwrap()),
-            [],
-            [],
-        )
-        .unwrap()
-    };
     let publish = |known: KnownEnvironment| {
         let pool = db.pool.clone();
         async move {
@@ -208,18 +209,18 @@ async fn admission_is_bounded_across_concurrent_reports_and_preserves_existing_u
         }
     };
     let (a, b, c) = tokio::join!(
-        publish(make_known("1.0.0")),
-        publish(make_known("2.0.0")),
-        publish(make_known("3.0.0")),
+        publish(known_version("1.0.0")),
+        publish(known_version("2.0.0")),
+        publish(known_version("3.0.0")),
     );
     assert_eq!(a? + b? + c?, 1);
     assert_eq!(list_unretired(&db.pool).await?.len(), 2);
     // Repeated distinct reports cannot grow the persisted catalog.
-    assert_eq!(publish(make_known("4.0.0")).await?, 1);
+    assert_eq!(publish(known_version("4.0.0")).await?, 1);
     let admitted = list_unretired(&db.pool).await?;
     let existing = ["1.0.0", "2.0.0", "3.0.0"]
         .into_iter()
-        .map(make_known)
+        .map(known_version)
         .find(|known| known.reference() == admitted[0])
         .unwrap();
     let reduced = KnownEnvironment::new(existing.definition().clone(), None, [], [])?;
@@ -239,8 +240,78 @@ async fn admission_is_bounded_across_concurrent_reports_and_preserves_existing_u
     .bind(reduced.reference().to_string())
     .execute(&db.pool)
     .await?;
-    assert_eq!(publish(make_known("4.0.0")).await?, 0);
+    assert_eq!(publish(known_version("4.0.0")).await?, 0);
     assert_eq!(list_unretired(&db.pool).await?.len(), 2);
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn large_reports_obey_a_fixed_write_budget_and_update_existing_at_capacity() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let existing = known_version("1.0.0");
+    let retired = known_version("2.0.0");
+    publish_known(&db.pool, &existing).await?;
+    publish_known(&db.pool, &retired).await?;
+    sqlx::query(sql!(
+        "UPDATE runtime_environments SET retired_at = now() WHERE environment_ref = $1"
+    ))
+    .bind(retired.reference().to_string())
+    .execute(&db.pool)
+    .await?;
+    // Enforce a generous fixed write budget at the database, rather than a
+    // timing threshold dependent on host load. It must not scale with report
+    // length, including when every new entry is deferred.
+    sqlx::query(sql!(
+        "CREATE FUNCTION enforce_publication_write_budget() RETURNS trigger AS $$
+         DECLARE remaining integer :=
+             NULLIF(current_setting('space_test.catalog_write_budget', true), '')::integer;
+         BEGIN
+             IF remaining IS NOT NULL THEN
+                 IF remaining <= 0 THEN
+                     RAISE EXCEPTION 'publication catalog write budget exceeded';
+                 END IF;
+                 PERFORM set_config('space_test.catalog_write_budget', (remaining - 1)::text, true);
+             END IF;
+             RETURN NULL;
+         END;
+         $$ LANGUAGE plpgsql"
+    ))
+    .execute(&db.pool)
+    .await?;
+    sqlx::query(sql!(
+        "CREATE TRIGGER publication_write_budget
+         BEFORE INSERT OR UPDATE ON runtime_environments
+         FOR EACH STATEMENT EXECUTE FUNCTION enforce_publication_write_budget()"
+    ))
+    .execute(&db.pool)
+    .await?;
+    let mut report = (3..67)
+        .map(|version| known_version(&format!("{version}.0.0")))
+        .collect::<Vec<_>>();
+    for known in [&existing, &retired] {
+        report.push(KnownEnvironment::new(
+            known.definition().clone(),
+            None,
+            [],
+            [],
+        )?);
+    }
+    let mut tx = db.pool.begin().await?;
+    sqlx::query(sql!("SET LOCAL space_test.catalog_write_budget = '8'"))
+        .execute(&mut *tx)
+        .await?;
+    assert_eq!(super::publish_known(&mut tx, &report, 1).await?, 64);
+    tx.commit().await?;
+    assert_eq!(list_unretired(&db.pool).await?, vec![existing.reference()]);
+    let rows: Vec<(Option<Vec<i32>>, bool)> = sqlx::query_as(sql!(
+        "SELECT version_sort_key, retired_at IS NOT NULL
+         FROM runtime_environments ORDER BY retired_at NULLS FIRST"
+    ))
+    .fetch_all(&db.pool)
+    .await?;
+    assert_eq!(rows, vec![(None, false), (None, true)]);
     Ok(())
 }
 
