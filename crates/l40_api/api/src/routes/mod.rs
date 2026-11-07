@@ -75,6 +75,8 @@ pub struct AppState {
     /// Whether `:drain` may start a v2 drain (`SPACE_DRAIN_V2_ENABLED`, read
     /// once at startup).
     pub drain_v2_enabled: bool,
+    /// The fresh `DrainNode` call `:terminate` makes of a v2 node.
+    pub v2_drain_probe: std::sync::Arc<dyn admin::nodes::V2DrainProbe>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -256,6 +258,9 @@ impl AppState {
         let ecw_credential_keyring =
             std::sync::Arc::new(pplx_space_ecw_credential::EcwCredentialKeyring::load_from_env()?);
 
+        let drain_v2_enabled =
+            pplx_space_common_core::env::env_flag_var(admin::nodes::DRAIN_V2_ENABLED_ENV, false);
+        crate::drain_restore_operations::set_drain_v2_enabled(drain_v2_enabled);
         Ok(Self {
             pool,
             credentials_pool,
@@ -276,10 +281,8 @@ impl AppState {
             feature_flags,
             native_hidden_operations,
             ecw_credential_keyring,
-            drain_v2_enabled: pplx_space_common_core::env::env_flag_var(
-                admin::nodes::DRAIN_V2_ENABLED_ENV,
-                false,
-            ),
+            drain_v2_enabled,
+            v2_drain_probe: std::sync::Arc::new(admin::nodes::NodeApiV2DrainProbe),
         })
     }
 

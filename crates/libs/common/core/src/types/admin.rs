@@ -51,6 +51,18 @@ pub struct AdminNodeResponse {
     pub drain_mode: Option<NodeDrainMode>,
     pub drain_started_at: Option<String>,
     pub drain_last_error: Option<String>,
+    /// `v2` for a drain the node runs itself (`:drain {engine: v2}`), until
+    /// it ends; absent for a v1 drain or none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drain_engine: Option<String>,
+    /// A v2 drain's epoch and the node's last report: what it evacuated, what
+    /// is still pending, and what blocks it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drain_status: Option<serde_json::Value>,
+    /// The dead-node verb's last result for the node: its verdict and the
+    /// outcome of each row it holds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dead_node_status: Option<serde_json::Value>,
     /// Value the cluster controller passes to AWS Auto Scaling's
     /// `should_decrement_desired_capacity` when terminating this node. `false`
     /// is the single-node-drain default (the ASG auto-replaces the terminated

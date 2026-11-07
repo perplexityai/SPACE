@@ -179,15 +179,6 @@ fn admin_openapi_value() -> Value {
                     }
                 }
             },
-            "/dead-node-status": {
-                "get": {
-                    "summary": "List the cluster controller's last dead-node result for each node it judged",
-                    "description": "One entry per node, by node_id, written while SPACE_DEAD_NODE_MODE is dry-run or live and deleted with the node; empty until then. mode is the mode that wrote it. verdict is lost or unknown and reason names the condition it rests on, for unknown the first that failed; lost means no live machine holds the node id. instances maps each EC2 instance asked about (the node's recorded one while its heartbeat is stale, and each other instance its rows' latest executions were stamped with) to dead, live, or unknown:<reason>. A row is selected when its latest execution's instance is dead, or, with no stamped execution, when the node is lost; counts maps each outcome to its number of sandbox rows, unselected included, leaving out outcomes with none, and samples maps it to its first rows as {sandbox_id, lifecycle}. applied maps each outcome to the rows whose write committed, and is empty in a dry run. rows_truncated means the controller's per-node row cap cut the read short, so counts are a lower bound. A dry run changes nothing but these entries. Live mode deletes a lost node's row once nothing pins it, and its entry with it. An entry stays until its node is deleted: a node that is no longer judged keeps its last entry and observed_at, and GET /nodes has its current heartbeat and drain phase.",
-                    "responses": {
-                        "200": { "description": "{nodes: [{node_id, observed_at, mode, verdict, reason, rows_truncated, instances, counts, applied, samples}]}" }
-                    }
-                }
-            },
             "/operations": {
                 "get": {
                     "summary": "List public operations across tenants for operator diagnostics",

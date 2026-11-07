@@ -68,6 +68,9 @@ pub(super) struct AdminNodeRow {
     pub(super) drain_mode: Option<String>,
     pub(super) drain_started_at: Option<OffsetDateTime>,
     pub(super) drain_last_error: Option<String>,
+    pub(super) drain_engine: Option<String>,
+    pub(super) drain_status: Option<sqlx::types::Json<serde_json::Value>>,
+    pub(super) dead_node_status: Option<sqlx::types::Json<serde_json::Value>>,
     pub(super) terminate_decrement_capacity: bool,
     pub(super) node_group_id: Option<NodeGroupId>,
     pub(super) metadata: Option<sqlx::types::Json<serde_json::Value>>,
@@ -368,6 +371,9 @@ const ADMIN_NODE_SELECT: &str = "SELECT n.id,
        n.drain_mode,
        n.drain_started_at,
        n.drain_last_error,
+       n.drain_engine,
+       n.drain_status,
+       n.dead_node_status,
        n.terminate_decrement_capacity,
        n.node_group_id,
        nd.metadata,
@@ -1392,6 +1398,36 @@ pub(super) struct DrainV2Columns {
     pub(super) status: Option<serde_json::Value>,
 }
 
+/// What resolves the node's node-api: its role, substrate and Kubernetes
+/// name. `None` when the row is gone.
+pub(super) async fn node_api_target(
+    pool: &sqlx::PgPool,
+    node_id: NodeId,
+) -> Result<Option<crate::controllers::substrate::OwnedNodeApiTarget>, sqlx::Error> {
+    type Row = (
+        pplx_space_common_core::types::NodeRole,
+        pplx_space_common_core::types::NodeManagedBy,
+        Option<String>,
+    );
+    let row: Option<Row> = sqlx::query_as(sql!(
+        "SELECT n.role, n.managed_by, nk.k8s_node_name
+           FROM nodes n
+           LEFT JOIN node_k8s nk ON nk.node_id = n.id
+          WHERE n.id = $1"
+    ))
+    .bind(node_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|(role, managed_by, substrate_node_id)| {
+        crate::controllers::substrate::OwnedNodeApiTarget {
+            managed_by,
+            role,
+            direct_endpoint: None,
+            substrate_node_id,
+        }
+    }))
+}
+
 pub(super) async fn drain_v2_columns(
     tx: &mut Transaction<'_, Postgres>,
     node_id: NodeId,
@@ -1423,31 +1459,6 @@ pub(super) async fn start_v2_drain(
                     'epoch', (EXTRACT(EPOCH FROM drain_started_at) * 1000000)::BIGINT
                 )
           WHERE id = $1 AND drain_phase = 'draining' AND drain_started_at IS NOT NULL"
-    ))
-    .bind(node_id)
-    .execute(&mut **tx)
-    .await?;
-    Ok(())
-}
-
-/// Record that `:terminate` let a v2 node go: the epoch whose `done` report
-/// the gate read, on a node this transaction has just moved to `terminating`.
-/// The dead-node verb takes the node as dead by this record once the
-/// controller has terminated it, so it is written only with that report.
-pub(super) async fn record_v2_terminate(
-    tx: &mut Transaction<'_, Postgres>,
-    node_id: NodeId,
-) -> Result<(), sqlx::Error> {
-    sqlx::query(sql!(
-        "UPDATE nodes
-            SET drain_status = drain_status
-                || jsonb_build_object('terminate', jsonb_build_object('epoch', drain_status->'epoch'))
-          WHERE id = $1
-            AND drain_engine = 'v2'
-            AND drain_phase = 'terminating'
-            AND (drain_status->'report'->>'sealed_epoch')::BIGINT
-                = (drain_status->>'epoch')::BIGINT
-            AND COALESCE((drain_status->'report'->>'done')::BOOLEAN, FALSE)"
     ))
     .bind(node_id)
     .execute(&mut **tx)
