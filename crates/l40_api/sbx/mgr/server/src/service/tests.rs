@@ -2397,148 +2397,151 @@ pub(crate) mod service_tests {
         assert_eq!(error.code(), tonic::Code::Aborted);
     }
 
+    #[rstest::rstest]
+    #[case::volatile_operation(false, false)]
+    #[case::persisted_operation(true, false)]
+    #[case::volatile_operation_allocated(false, true)]
+    #[case::persisted_operation_allocated(true, true)]
     #[tokio::test]
-    async fn split_operation_wake_join_restart_receipt_proof() {
+    async fn split_operation_wake_join_restart_receipt_proof(
+        #[case] persist_operation: bool,
+        #[case] allocated: bool,
+    ) {
         use crate::db::SandboxStatePublicationMetadata;
         use crate::service::recovery::CleanupRecoveryAuthority;
         use pplx_space_common_core::types::SandboxTransitionReceiptKind;
         // Exercise the real Wake join before dropping all request/service state.
         // The NULL injection models carrying B only in volatile request memory.
-        for (persist_operation, allocated) in
-            [(false, false), (true, false), (false, true), (true, true)]
-        {
-            let dir = tempfile::tempdir().unwrap();
-            let path = dir.path().join("manager.sqlite");
-            let mut conn = crate::db::Connection::open_at(&path).unwrap();
-            crate::db::create_test_schema(&mut conn);
-            let sandbox_id = SandboxId::new();
-            let id = sandbox_id.to_string();
-            insert_test_sandbox(&conn, &id, SandboxState::Stopped);
-            let generation = ExecutionGeneration::new(7).unwrap();
-            let route_attempt = SandboxActivationAttemptId::new();
-            let operation = SandboxActivationAttemptId::new_after(route_attempt).unwrap();
-            let route = SpaceApiRouteIdentity {
-                sandbox_id: Some(sandbox_id),
-                route_generation: Some(RouteGeneration::new(7).unwrap()),
-                execution_generation: Some(generation),
-                current_node_id: Some(NodeId::new()),
-                substrate_kind: Some(NodeManagedBy::Kubernetes),
-                activation_attempt_id: Some(route_attempt),
-                pod_uid: Some("pod-proof".parse().unwrap()),
-            };
-            let provenance =
-                crate::auto_lifecycle_delete_receipts::RouteIdentityProvenance::ClusterFenced;
-            let open_claim = crate::db::route_activation_claims::OpenRouteActivationClaim::for_cluster_fenced_identity(&route, provenance).unwrap();
-            let episode = crate::db::begin_activation_with_route_evidence(
-                &conn,
-                &id,
-                SandboxState::Stopped,
-                crate::db::ActivationKind::ColdStart,
-                Some(generation),
-                Some(route_attempt),
-                crate::db::ActivationRouteAdmission {
-                    evidence: crate::auto_lifecycle_delete_receipts::RouteEvidence::from_identity(
-                        &route, provenance,
-                    ),
-                    open_claim: Some(&open_claim),
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("manager.sqlite");
+        let mut conn = crate::db::Connection::open_at(&path).unwrap();
+        crate::db::create_test_schema(&mut conn);
+        let sandbox_id = SandboxId::new();
+        let id = sandbox_id.to_string();
+        insert_test_sandbox(&conn, &id, SandboxState::Stopped);
+        let generation = ExecutionGeneration::new(7).unwrap();
+        let route_attempt = SandboxActivationAttemptId::new();
+        let operation = SandboxActivationAttemptId::new_after(route_attempt).unwrap();
+        let route = SpaceApiRouteIdentity {
+            sandbox_id: Some(sandbox_id),
+            route_generation: Some(RouteGeneration::new(7).unwrap()),
+            execution_generation: Some(generation),
+            current_node_id: Some(NodeId::new()),
+            substrate_kind: Some(NodeManagedBy::Kubernetes),
+            activation_attempt_id: Some(route_attempt),
+            pod_uid: Some("pod-proof".parse().unwrap()),
+        };
+        let provenance =
+            crate::auto_lifecycle_delete_receipts::RouteIdentityProvenance::ClusterFenced;
+        let open_claim = crate::db::route_activation_claims::OpenRouteActivationClaim::for_cluster_fenced_identity(&route, provenance).unwrap();
+        let episode = crate::db::begin_activation_with_route_evidence(
+            &conn,
+            &id,
+            SandboxState::Stopped,
+            crate::db::ActivationKind::ColdStart,
+            Some(generation),
+            Some(route_attempt),
+            crate::db::ActivationRouteAdmission {
+                evidence: crate::auto_lifecycle_delete_receipts::RouteEvidence::from_identity(
+                    &route, provenance,
+                ),
+                open_claim: Some(&open_claim),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .unwrap();
+        let service = service_for_teardown_test(conn);
+        let result = service
+            .wake_with_start_config(
+                id.clone(),
+                Some(Duration::ZERO),
+                WakeStartConfig {
+                    operation_activation_attempt_id: Some(operation),
+                    space_api_route_identity: route,
                     ..Default::default()
                 },
+                true,
+                None,
             )
-            .unwrap()
-            .unwrap();
-            let service = service_for_teardown_test(conn);
-            let result = service
-                .wake_with_start_config(
-                    id.clone(),
-                    Some(Duration::ZERO),
-                    WakeStartConfig {
-                        operation_activation_attempt_id: Some(operation),
-                        space_api_route_identity: route,
-                        ..Default::default()
-                    },
-                    true,
-                    None,
-                )
-                .await;
-            assert!(result.is_err(), "request abandons its in-progress join");
-            {
-                let db = service.db.lock().unwrap();
-                let joined = crate::db::cleanup_episode(&db, &id).unwrap().unwrap();
-                assert_eq!(joined.id, episode.id);
-                assert_eq!(joined.activation_attempt_id, Some(route_attempt));
-                assert_eq!(joined.operation_activation_attempt_id, Some(operation));
-                if !persist_operation {
-                    db.execute("UPDATE sandbox_cleanup_episodes SET operation_activation_attempt_id = NULL WHERE sandbox_id = ?1", [&id]).unwrap();
-                }
+            .await;
+        assert!(result.is_err(), "request abandons its in-progress join");
+        {
+            let db = service.db.lock().unwrap();
+            let joined = crate::db::cleanup_episode(&db, &id).unwrap().unwrap();
+            assert_eq!(joined.id, episode.id);
+            assert_eq!(joined.activation_attempt_id, Some(route_attempt));
+            assert_eq!(joined.operation_activation_attempt_id, Some(operation));
+            if !persist_operation {
+                db.execute("UPDATE sandbox_cleanup_episodes SET operation_activation_attempt_id = NULL WHERE sandbox_id = ?1", [&id]).unwrap();
             }
-            // A launch acquired a runtime allocation before the process stopped.
-            // No actual VM exists; only external teardown is substituted below.
-            if allocated {
-                service
-                    .db
-                    .lock()
-                    .unwrap()
-                    .execute("UPDATE sandboxes SET uid = 1000 WHERE id = ?1", [&id])
-                    .unwrap();
-            }
-            drop(service);
-            let recovered =
-                service_for_teardown_test(crate::db::Connection::open_at(&path).unwrap());
-            recovered
-                .recover_interrupted_startup_states()
-                .await
+        }
+        // A launch acquired a runtime allocation before the process stopped.
+        // No actual VM exists; only external teardown is substituted below.
+        if allocated {
+            service
+                .db
+                .lock()
+                .unwrap()
+                .execute("UPDATE sandboxes SET uid = 1000 WHERE id = ?1", [&id])
                 .unwrap();
-            let targets = SandboxManagerService::recover_required_cleanup_targets(
-                &recovered.db,
-                CleanupRecoveryAuthority::Startup,
-            )
-            .unwrap();
-            assert_eq!(targets.len(), 1, "startup owns the abandoned activation");
-            assert_eq!(targets[0].cleanup_id, Some(episode.id));
-            *recovered.cleanup_executor.dispatch.lock().unwrap() =
-                Some(Arc::new(|_, _| Box::pin(async { Ok(()) })));
-            recovered.schedule_cleanup_recovery_targets(targets);
-            tokio::time::timeout(Duration::from_secs(5), async {
-                loop {
-                    if crate::db::cleanup_episode(&recovered.db.lock().unwrap(), &id)
-                        .unwrap()
-                        .is_none()
-                    {
-                        break;
-                    }
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                }
-            })
+        }
+        drop(service);
+        let recovered = service_for_teardown_test(crate::db::Connection::open_at(&path).unwrap());
+        recovered
+            .recover_interrupted_startup_states()
             .await
             .unwrap();
-            recovered.shutdown_token.cancel();
-            recovered.task_tracker.close();
-            recovered.task_tracker.wait().await;
-            let db = recovered.db.lock().unwrap();
-            let metadata =
-                crate::db::sandbox_state_publication_metadata(&db, std::slice::from_ref(&id))
+        let targets = SandboxManagerService::recover_required_cleanup_targets(
+            &recovered.db,
+            CleanupRecoveryAuthority::Startup,
+        )
+        .unwrap();
+        assert_eq!(targets.len(), 1, "startup owns the abandoned activation");
+        assert_eq!(targets[0].cleanup_id, Some(episode.id));
+        *recovered.cleanup_executor.dispatch.lock().unwrap() =
+            Some(Arc::new(|_, _| Box::pin(async { Ok(()) })));
+        recovered.schedule_cleanup_recovery_targets(targets);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if crate::db::cleanup_episode(&recovered.db.lock().unwrap(), &id)
                     .unwrap()
-                    .remove(&id)
-                    .unwrap()
-                    .unwrap()
-                    .decode(SandboxState::Stopped)
-                    .unwrap();
-            assert!(
-                matches!(metadata, SandboxStatePublicationMetadata::TransitionReceipt(receipt)
-                if receipt.kind() == SandboxTransitionReceiptKind::ActivationRollback
-                    && receipt.activation_attempt_id() == Some(if persist_operation { operation } else { route_attempt }))
-            );
-            assert!(crate::db::route_activation_claims::claim_exists(&db, &id).unwrap());
-            assert!(
-                crate::route_activation_claims::validate_cluster_fenced_activation(
-                    &db,
-                    &id,
-                    &open_claim
-                )
-                .is_ok(),
-                "rollback deliberately retains the continuation claim: a later user retry is still an owner, but does not run automatically"
-            );
-        }
+                    .is_none()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        recovered.shutdown_token.cancel();
+        recovered.task_tracker.close();
+        recovered.task_tracker.wait().await;
+        let db = recovered.db.lock().unwrap();
+        let metadata =
+            crate::db::sandbox_state_publication_metadata(&db, std::slice::from_ref(&id))
+                .unwrap()
+                .remove(&id)
+                .unwrap()
+                .unwrap()
+                .decode(SandboxState::Stopped)
+                .unwrap();
+        assert!(
+            matches!(metadata, SandboxStatePublicationMetadata::TransitionReceipt(receipt)
+            if receipt.kind() == SandboxTransitionReceiptKind::ActivationRollback
+                && receipt.activation_attempt_id() == Some(if persist_operation { operation } else { route_attempt }))
+        );
+        assert!(crate::db::route_activation_claims::claim_exists(&db, &id).unwrap());
+        assert!(
+            crate::route_activation_claims::validate_cluster_fenced_activation(
+                &db,
+                &id,
+                &open_claim
+            )
+            .is_ok(),
+            "rollback deliberately retains the continuation claim: a later user retry is still an owner, but does not run automatically"
+        );
     }
 
     #[tokio::test]
