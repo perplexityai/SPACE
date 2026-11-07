@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::disk_admission::cache_handle::CacheDiskAdmissionHandle;
-use pplx_space_common_core::host::disk_admission::{
+use pplx_space_node_disk_admission::{
     CacheDiskAdmissionConfig, CacheDiskAdmissionDecision, CacheDiskAdmissionReason,
     CacheDiskAdmissionState as CoreCacheDiskAdmissionState, CacheDiskRefreshKind,
 };

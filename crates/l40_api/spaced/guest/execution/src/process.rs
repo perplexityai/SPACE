@@ -1064,7 +1064,7 @@ impl ProcessSignalHandle {
     fn signal(&self, signal: ProcessSignal) -> Result<(), Status> {
         #[cfg(target_os = "linux")]
         {
-            match pplx_space_common_core::host::linux::signal_pidfd(&self.pidfd, signal) {
+            match pplx_space_host_linux::signal_pidfd(&self.pidfd, signal.as_i32()) {
                 Ok(()) => Ok(()),
                 Err(error) if error.raw_os_error() == Some(libc::ESRCH) => {
                     Err(Status::not_found("process not found"))

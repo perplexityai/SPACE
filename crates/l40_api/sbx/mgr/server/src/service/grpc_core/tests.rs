@@ -1,6 +1,6 @@
 use super::*;
 use crate::service::tests::service_tests::insert_test_sandbox;
-use pplx_space_common_core::host::linux::identities::users;
+use pplx_space_host_layout::identities::users;
 use pplx_space_template_mgr_client::proto::TemplateFullInfo;
 use pplx_space_uds_peer_auth::PeerIdentity;
 
@@ -16,7 +16,7 @@ fn root_peer() -> PeerIdentity {
     PeerIdentity::new(0, 0, None)
 }
 
-fn service_peer(user: &pplx_space_common_core::host::linux::identities::LinuxUser) -> PeerIdentity {
+fn service_peer(user: &pplx_space_host_layout::identities::LinuxUser) -> PeerIdentity {
     PeerIdentity::new(user.uid, user.primary_group.gid, None)
 }
 

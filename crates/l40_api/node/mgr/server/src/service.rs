@@ -6,10 +6,7 @@ use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwapOption;
 use pplx_space_common_core::types::SandboxId;
-use pplx_space_common_core::{
-    host::linux::identities::gids, host::linux::identities::group_names,
-    host::linux::identities::user_names,
-};
+use pplx_space_host_layout::{identities::gids, identities::group_names, identities::user_names};
 use pplx_space_node_runtime_core::runtime_inventory::{RuntimeInventory, RuntimeInventoryError};
 use pplx_space_uds_peer_auth::{LocalRole, UdsPeerAccount, UdsPeerAuthorizer, UdsPeerPrincipal};
 use tonic::{Request, Response, Status};
@@ -74,10 +71,10 @@ const FIRECRACKER_API_SOCKET_TIMEOUT: Duration = Duration::from_secs(5);
 const FIRECRACKER_VM_STATE_TIMEOUT: Duration = Duration::from_millis(250);
 const FIRECRACKER_VSOCK_POLL: Duration = Duration::from_millis(50);
 const FIRECRACKER_VSOCK_TIMEOUT: Duration = Duration::from_secs(1);
-const RUN_DIR: &str = pplx_space_common_core::host::linux::paths::SANDBOX_RUN_DIR;
-const CACHE_DIR: &str = pplx_space_common_core::host::linux::paths::SANDBOX_CACHE_DIR;
-const TEMPLATE_DIR: &str = pplx_space_common_core::host::linux::paths::TEMPLATE_DIR;
-const JAIL_DIR: &str = pplx_space_common_core::host::linux::paths::FIRECRACKER_JAIL_DIR;
+const RUN_DIR: &str = pplx_space_host_layout::paths::SANDBOX_RUN_DIR;
+const CACHE_DIR: &str = pplx_space_host_layout::paths::SANDBOX_CACHE_DIR;
+const TEMPLATE_DIR: &str = pplx_space_host_layout::paths::TEMPLATE_DIR;
+const JAIL_DIR: &str = pplx_space_host_layout::paths::FIRECRACKER_JAIL_DIR;
 
 const ALLOW_NODE_STATUS: &[UdsPeerPrincipal] = &[
     UdsPeerPrincipal::Root,

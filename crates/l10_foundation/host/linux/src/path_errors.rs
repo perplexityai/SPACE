@@ -1,11 +1,9 @@
 //! Permanence of filesystem errors against host paths.
 //!
-//! Node-side code that resolves a host path — a runtime installation root, a
-//! kernel image, a template directory — has to answer one question before it
-//! can pick a gRPC code: will reading this path fail the same way next time?
-//! A permanent answer belongs in `FailedPrecondition`, which the activation
-//! path propagates as a terminal sandbox-create failure; a transient one
-//! belongs in `Internal`, which stays retryable.
+//! Code that resolves a host path — an installation root, a kernel image, a
+//! cache directory — has to answer one question before it reports the
+//! failure: will reading this path fail the same way next time? A permanent
+//! answer fails the operation for good; a transient one leaves it retryable.
 //!
 //! Getting that backwards is expensive in both directions, which is why the
 //! decision lives in one place instead of at each `map_err`.
@@ -25,16 +23,14 @@
 /// writing.
 ///
 /// **The default is deliberately transient.** Misjudging a permanent error as
-/// transient costs a bounded retry loop that the stuck-pod sweeper eventually
-/// reaps and that shows up loudly in logs. Misjudging a transient error as
-/// permanent fails a user's sandbox create that a retry would have satisfied.
-/// The second is worse, so unrecognized kinds retry.
+/// transient costs a bounded retry loop that shows up loudly in logs.
+/// Misjudging a transient error as permanent fails an operation that a retry
+/// would have satisfied. The second is worse, so unrecognized kinds retry.
 ///
 /// One consequence worth knowing: `io::ErrorKind` does not name every errno on
 /// stable Rust. A symlink loop (`ELOOP`) has no matchable kind today, so it
-/// lands in the transient set despite being permanent. Taking a node with that
-/// shape out of rotation is the node-readiness gate's job, not this
-/// predicate's.
+/// lands in the transient set despite being permanent. Catching that shape is
+/// the caller's job, not this predicate's.
 pub fn host_path_io_error_is_transient(error: &std::io::Error) -> bool {
     !matches!(
         error.kind(),

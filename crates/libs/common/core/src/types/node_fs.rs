@@ -22,41 +22,7 @@ use std::path::{Component, Path, PathBuf};
 use super::sandbox::SandboxId;
 use super::snapshot::SnapshotName;
 use super::template::TemplateBuildId;
-
-/// Default root for runtime state on a node.
-pub const SPACE_RUN_DIR: &str = "/space/run";
-/// Prefix used when validating paths that must live below `/space/run`.
-pub const SPACE_RUN_PREFIX: &str = "/space/run/";
-/// Default root for cached node artifacts.
-pub const SPACE_CACHE_DIR: &str = "/space/cache";
-/// Firecracker runtime state root.
-pub const FIRECRACKER_RUN_DIR: &str = "/space/run/firecracker";
-/// Firecracker cache root.
-pub const FIRECRACKER_CACHE_DIR: &str = "/space/cache/firecracker";
-/// Prefix used when validating paths that must live below the Firecracker cache.
-pub const FIRECRACKER_CACHE_PREFIX: &str = "/space/cache/firecracker/";
-/// Per-sandbox Firecracker runtime directory root.
-pub const SANDBOX_RUN_DIR: &str = "/space/run/firecracker/sandboxes";
-/// Per-sandbox Firecracker cache directory root.
-pub const SANDBOX_CACHE_DIR: &str = "/space/cache/firecracker/sandboxes";
-/// Reserved staging directory for cross-sandbox durable artifact copies.
-pub const FORK_COPY_STAGING_DIR_NAME: &str = ".fork-copies";
-/// Firecracker jail directory root.
-pub const FIRECRACKER_JAIL_DIR: &str = "/space/cache/firecracker/jails";
-/// Firecracker's log file, in its jail root.
-pub const FIRECRACKER_LOG_FILE: &str = "fc.log";
-/// The FIFO Firecracker writes its metrics flushes to, in its jail root.
-pub const FIRECRACKER_METRICS_FIFO: &str = "fc-metrics.fifo";
-
-/// A sandbox's jail root, the chroot the jailer builds under
-/// [`FIRECRACKER_JAIL_DIR`] as `<chroot base>/<exec file name>/<id>/root`.
-pub fn jail_root(sandbox_id: &str) -> PathBuf {
-    PathBuf::from(format!(
-        "{FIRECRACKER_JAIL_DIR}/firecracker/{sandbox_id}/root"
-    ))
-}
-/// Template artifact directory root.
-pub const TEMPLATE_DIR: &str = "/space/cache/firecracker/templates";
+use pplx_space_host_layout::paths::{SANDBOX_CACHE_DIR, SANDBOX_RUN_DIR, TEMPLATE_DIR};
 
 /// Directory name used under a sandbox cache directory for snapshots.
 pub const SNAPSHOT_DIR_NAME: &str = "snapshots";
@@ -68,6 +34,28 @@ pub const TEMPLATE_ROOTFS_ZSTD_FILE: &str = "rootfs.ext4.zst";
 pub const TEMPLATE_ROOTFS_ZSTD_CODEC: &str = "zstd";
 /// Compression level used for `rootfs.ext4.zst` template transfer artifacts.
 pub const TEMPLATE_ROOTFS_ZSTD_LEVEL: i32 = 3;
+
+/// Returns the build artifact directory for a template build.
+pub fn template_build_dir(
+    template: &str,
+    content_hash: &str,
+    partition: crate::types::TemplateCachePartition,
+) -> String {
+    let build = partition.build_dir_name(content_hash);
+    format!("{TEMPLATE_DIR}/{template}/{build}")
+}
+
+/// Returns the snapshot directory for a template build and compute shape.
+pub fn template_snapshot_dir(
+    template: &str,
+    content_hash: &str,
+    partition: crate::types::TemplateCachePartition,
+    vcpu: u32,
+    memory_mib: u32,
+) -> String {
+    let build = partition.build_dir_name(content_hash);
+    format!("{TEMPLATE_DIR}/{template}/snapshots/{build}/{vcpu}vcpu-{memory_mib}mib")
+}
 
 /// Error returned when a node path is not safe for deriving SPACE paths.
 ///

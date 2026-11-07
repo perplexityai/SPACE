@@ -9,10 +9,10 @@
 //! names an artifact by what it is, never by a path. A catalog that cannot
 //! be loaded safely refuses the request, not node-manager's startup.
 
-use pplx_space_common_core::host::linux::identities::user_names;
 use pplx_space_common_core::types::{
     Arch, ArtifactVersion, ComponentIdentity, RuntimeIdentity, RuntimeVersion,
 };
+use pplx_space_host_layout::identities::user_names;
 use pplx_space_node_runtime_core::artifact_store::{
     ArtifactStore, Publication, PublishError, PublishOutcome, RemoveError, RemoveOutcome,
     StagedName,
@@ -588,9 +588,8 @@ fn execution_roots_overlap(
             Err(error) => Err(error),
         }
     }
-    let vendor_kernels = std::path::Path::new(
-        pplx_space_common_core::host::linux::paths::FIRECRACKER_KERNEL_VENDOR_DIR,
-    );
+    let vendor_kernels =
+        std::path::Path::new(pplx_space_host_layout::paths::FIRECRACKER_KERNEL_VENDOR_DIR);
     for managed in [
         root,
         paths.store.kernels.as_path(),

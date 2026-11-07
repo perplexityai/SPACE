@@ -368,7 +368,7 @@ impl RuntimeInventoryError {
     /// The exceptions are the variants that report a *read* failing rather than
     /// an inventory verdict, and then only when the read itself is the kind a
     /// later attempt can win — see
-    /// [`host_path_io_error_is_transient`](pplx_space_common_core::host::path_errors::host_path_io_error_is_transient).
+    /// [`host_path_io_error_is_transient`](pplx_space_host_linux::path_errors::host_path_io_error_is_transient).
     ///
     /// This distinction is load-bearing in two directions. A non-transient
     /// error becomes a terminal `FailedPrecondition`, which sandbox-manager
@@ -391,7 +391,7 @@ impl RuntimeInventoryError {
             Self::ReadDir { source, .. }
             | Self::InspectKernel { source, .. }
             | Self::ProbeInventoryPath { source, .. } => {
-                pplx_space_common_core::host::path_errors::host_path_io_error_is_transient(source)
+                pplx_space_host_linux::path_errors::host_path_io_error_is_transient(source)
             }
             // A short read of a kernel image carries no error kind to judge.
             // It is most often a file the prefetch is still writing, so it
@@ -488,9 +488,7 @@ fn canonicalize_inventory_path(path: &Path) -> Result<Option<PathBuf>, RuntimeIn
     match std::fs::canonicalize(path) {
         Ok(resolved) => Ok(Some(resolved)),
         Err(source)
-            if pplx_space_common_core::host::path_errors::host_path_io_error_is_transient(
-                &source,
-            ) =>
+            if pplx_space_host_linux::path_errors::host_path_io_error_is_transient(&source) =>
         {
             Err(RuntimeInventoryError::ProbeInventoryPath {
                 path: path.to_path_buf(),
@@ -518,9 +516,7 @@ fn probe_inventory_path(path: &Path) -> Result<Option<std::fs::Metadata>, Runtim
     match std::fs::metadata(path) {
         Ok(metadata) => Ok(Some(metadata)),
         Err(source)
-            if pplx_space_common_core::host::path_errors::host_path_io_error_is_transient(
-                &source,
-            ) =>
+            if pplx_space_host_linux::path_errors::host_path_io_error_is_transient(&source) =>
         {
             Err(RuntimeInventoryError::ProbeInventoryPath {
                 path: path.to_path_buf(),

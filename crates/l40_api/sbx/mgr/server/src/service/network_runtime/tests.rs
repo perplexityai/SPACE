@@ -11,8 +11,8 @@ use super::{
 };
 use crate::db::PolicyAuthority;
 use crate::state::SandboxState;
-use pplx_space_common_core::host::linux::identities::user_names;
 use pplx_space_feature_flags::{FeatureFlagClient, SPACE_NET_GATEWAY_KNOWN_EGRESS_DOMAINS_FLAG};
+use pplx_space_host_layout::identities::user_names;
 use pplx_space_uds_peer_auth::{LocalRole, UdsPeerPrincipal};
 
 // `authority=local` pins a node-local, cluster-immune policy (network or

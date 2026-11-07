@@ -64,19 +64,19 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use pplx_space_common_core::host::linux::paths::{
-    TEMPLATE_CACHE_DIR_MODE, TEMPLATE_CACHE_FILE_MODE, normalize_template_cache_tree,
-    set_template_cache_permissions,
-};
 use pplx_space_common_core::types::{
     ContentHash, OrgId, StorageUri, SubjectId, TEMPLATE_ROOTFS_FILE, TemplateCachePartition,
     TemplateName,
 };
 use pplx_space_common_grpc::GrpcClientTrace;
+use pplx_space_host_layout::paths::{TEMPLATE_CACHE_DIR_MODE, TEMPLATE_CACHE_FILE_MODE};
 use pplx_space_node_api_client::cluster::connect_from_env as connect_cluster_api_from_env;
 use pplx_space_node_api_client::proto::{
     FindTemplateReleaseByHashRequest, FindTemplateReleaseRequest,
     ListLatestTemplateReleasesRequest, TemplateVisibility,
+};
+use pplx_space_template_cache_permissions::{
+    normalize_template_cache_tree, set_template_cache_permissions,
 };
 use pplx_space_template_manifest::ZSTD_FILENAME_SUFFIX;
 use pplx_space_volmgr_client::{
@@ -95,7 +95,7 @@ use tracing::{Instrument as _, debug, info, warn};
 /// the bare `Channel`.
 type VolmgrClient = VolumeManagerClient<GrpcClientTrace<Channel>>;
 
-const TEMPLATE_DIR: &str = pplx_space_common_core::host::linux::paths::TEMPLATE_DIR;
+const TEMPLATE_DIR: &str = pplx_space_host_layout::paths::TEMPLATE_DIR;
 
 /// Default runtime passed to `FindTemplateRelease`. The cluster API accepts
 /// both full names and aliases, but the release column currently stores the
@@ -1780,11 +1780,8 @@ async fn try_pull_from(
         manifest: probed_manifest,
         metadata: probed_metadata,
     } = probe_release_partition(&client, &subject, parts, name, content_hash, base_tags).await?;
-    let digest_dir = pplx_space_common_core::host::linux::paths::template_build_dir(
-        name,
-        content_hash,
-        partition,
-    );
+    let digest_dir =
+        pplx_space_common_core::types::template_build_dir(name, content_hash, partition);
     // A pull never writes into, or deletes, a build dir it didn't create:
     // the owner found no row for the digest, so a dir in this partition is
     // one without a row. Dirs of other partitions are left alone.
@@ -2276,20 +2273,20 @@ pub(crate) fn cleanup_digest_dir_sync(digest_dir: &Path) -> std::io::Result<()> 
     if !digest_dir.exists() {
         return Ok(());
     }
-    if pplx_space_common_core::host::btrfs::is_subvolume(digest_dir) {
+    if pplx_space_btrfs::is_subvolume(digest_dir) {
         // The RO clear is what makes both delete attempts below
         // possible on an installed (read-only) build; a refusal here
         // means the `remove_dir_all` fallthrough will EROFS, so record
         // it — otherwise that EROFS is indistinguishable from the
         // pre-subvolume-aware bug this path fixed.
-        if let Err(err) = pplx_space_common_core::host::btrfs::set_readonly(digest_dir, false) {
+        if let Err(err) = pplx_space_btrfs::set_readonly(digest_dir, false) {
             warn!(
                 dir = %digest_dir.display(),
                 %err,
                 "clearing subvolume read-only flag failed ahead of local delete"
             );
         }
-        if pplx_space_common_core::host::btrfs::delete_subvolume_if_present(digest_dir).is_ok() {
+        if pplx_space_btrfs::delete_subvolume_if_present(digest_dir).is_ok() {
             return Ok(());
         }
     }

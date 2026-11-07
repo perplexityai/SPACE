@@ -27,7 +27,6 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use futures_util::future::{BoxFuture, join_all};
-use pplx_space_common_core::host::linux::paths;
 use pplx_space_common_core::types::{
     ArtifactKind, ArtifactOrigin, ExactStorageUri, LocalArtifactId, SandboxCleanupEpisodeId,
     SandboxId, SnapshotArtifact,
@@ -35,6 +34,7 @@ use pplx_space_common_core::types::{
 use pplx_space_events::{
     SandboxEventDetails, SandboxEventSource, SandboxEventType, emit_sandbox_event,
 };
+use pplx_space_host_layout::paths;
 use pplx_space_volmgr_client::{
     EnsureFileReplicaError, EnsureFileReplicaWaitConfig, RESTORE_PRIORITY, VOLMGR_SOCKET,
     ensure_file_replica_with_config, proto::PullFileRequest, read_verified_replica_provenance,

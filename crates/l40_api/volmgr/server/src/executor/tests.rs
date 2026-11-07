@@ -3877,7 +3877,7 @@ async fn shadow_comparison_skips_when_shared_codec_capacity_is_busy() {
 
 #[test]
 fn shadow_disk_headroom_reserves_worst_case_candidate_and_node_floor() {
-    use pplx_space_common_core::host::disk::DiskStatus;
+    use pplx_space_host_linux::disk::DiskStatus;
 
     let status = DiskStatus {
         total_bytes: 800 * 1024 * 1024 * 1024,

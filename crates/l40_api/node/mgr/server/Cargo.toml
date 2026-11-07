@@ -17,7 +17,10 @@ datadog = ["otel", "pplx-space-observability/datadog"]
 # Deprecated for one release; use otel and datadog.
 datadog-otel = ["otel", "datadog"]
 # Compiles in the test-only environment hooks; never enabled for release builds.
-test-hooks = ["pplx-space-test-hooks/test-hooks"]
+test-hooks = [
+    "pplx-space-node-disk-admission/test-hooks",
+    "pplx-space-test-hooks/test-hooks",
+]
 
 [dependencies]
 arc-swap = { workspace = true }
@@ -47,6 +50,10 @@ zeroize = { workspace = true }
 
 # internal
 pplx-space-common-core = { workspace = true }
+pplx-space-btrfs = { workspace = true }
+pplx-space-host-layout = { workspace = true }
+pplx-space-host-linux = { workspace = true }
+pplx-space-node-disk-admission = { workspace = true }
 pplx-space-common-grpc = { workspace = true }
 pplx-space-env-vars = { workspace = true }
 pplx-space-file-io = { workspace = true, features = ["reflink"] }

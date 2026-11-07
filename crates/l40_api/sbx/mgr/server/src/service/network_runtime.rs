@@ -446,7 +446,7 @@ pub(super) async fn launch_net_gateway_via_node(
         .launch(LaunchRequest {
             execution_fence: Some(execution_fence.into()),
             sandbox_id: sandbox_id.to_string(),
-            program: pplx_space_common_core::host::linux::paths::NET_GATEWAY_SVC_BIN.to_string(),
+            program: pplx_space_host_layout::paths::NET_GATEWAY_SVC_BIN.to_string(),
             args,
             uid: process_uid,
             gid: process_uid,

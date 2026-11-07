@@ -21,6 +21,7 @@ comfy-table = { workspace = true }
 hyper-util = { workspace = true }
 jiff = { workspace = true }
 pplx-space-common-core = { workspace = true }
+pplx-space-host-layout = { workspace = true }
 pplx-space-node-api-client = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }

@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use pplx_space_common_core::{host::linux::identities::user_names, host::linux::identities::users};
+use pplx_space_host_layout::{identities::user_names, identities::users};
 use pplx_space_net_common::{
     EffectiveNetworkPolicyRef, EffectiveNetworkPolicyRefParseError, TlsInterception,
     proto::NetworkPolicyV1 as ProtoNetworkPolicyV1,

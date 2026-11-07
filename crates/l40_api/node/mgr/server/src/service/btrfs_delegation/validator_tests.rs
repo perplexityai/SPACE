@@ -174,7 +174,7 @@ fn legacy_template_targets_keep_their_directory_and_received_uuid() {
     );
     assert_eq!(
         target.received_uuid(),
-        pplx_space_common_core::host::btrfs::deterministic_template_received_uuid("seed", &hash)
+        pplx_space_btrfs::deterministic_template_received_uuid("seed", &hash)
     );
 }
 

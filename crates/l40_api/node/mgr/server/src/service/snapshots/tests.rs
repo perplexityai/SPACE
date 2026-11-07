@@ -215,7 +215,7 @@ fn encrypted_bind_target_is_pinned_inside_the_jail() {
 }
 
 fn cache_root() -> &'static str {
-    pplx_space_common_core::host::linux::paths::SPACE_CACHE_DIR
+    pplx_space_host_layout::paths::SPACE_CACHE_DIR
 }
 
 #[test]

@@ -654,7 +654,7 @@ async fn prepare_sandbox_refuses_invalid_requests_before_touching_the_cache() {
 #[tokio::test]
 async fn sidecar_launch_refuses_invalid_requests_before_resolving_its_identity() {
     use crate::service::tests::service_tests::{refusal_mismatch, root_request, stale_test_fence};
-    use pplx_space_common_core::host::linux::paths;
+    use pplx_space_host_layout::paths;
     use tonic::Code;
 
     let admitted = AdmittedSandbox::new().await;

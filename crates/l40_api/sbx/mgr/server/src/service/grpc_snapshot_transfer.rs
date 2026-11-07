@@ -117,10 +117,8 @@ impl SandboxManagerService {
         // Both d-* (disk) and f-* (full) snapshots are exportable.
         // d-* contains rootfs.ext4 only, f-* contains rootfs.ext4 + VM state files.
 
-        let snapshot_dir = pplx_space_common_core::host::linux::paths::sandbox_snapshot_dir(
-            &sandbox.id,
-            &snapshot_name,
-        );
+        let snapshot_dir =
+            pplx_space_host_layout::paths::sandbox_snapshot_dir(&sandbox.id, &snapshot_name);
         crate::db::transfer::validate_snapshot_binding(
             std::path::Path::new(&snapshot_dir),
             &sandbox,
@@ -372,7 +370,7 @@ impl SandboxManagerService {
                 "snapshot target identity or state does not match",
             ));
         }
-        let base = pplx_space_common_core::host::linux::paths::sandbox_snapshots_dir(&sandbox_id);
+        let base = pplx_space_host_layout::paths::sandbox_snapshots_dir(&sandbox_id);
         let final_dir = format!("{base}/{name}");
         match tokio::fs::symlink_metadata(&final_dir).await {
             Ok(metadata)
@@ -395,7 +393,7 @@ impl SandboxManagerService {
         }
         let staging = format!(
             "{}/.snapshot-import-{sandbox_id}_{}",
-            pplx_space_common_core::host::linux::paths::SANDBOX_CACHE_DIR,
+            pplx_space_host_layout::paths::SANDBOX_CACHE_DIR,
             uuid::Uuid::now_v7()
         );
         let staging_claim = staging.clone();

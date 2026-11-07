@@ -4,7 +4,7 @@ use std::{
 };
 
 use bytes::Bytes;
-use pplx_space_common_core::host::linux::paths::template_build_dir;
+use pplx_space_common_core::types::template_build_dir;
 use pplx_space_common_core::types::{
     AuthIdParseError, ContentHash, OrgId, RUNTIME_FIRECRACKER_ALIAS, StorageUri,
     SystemPublicationGrantId, TEMPLATE_ROOTFS_ZSTD_CODEC, TEMPLATE_ROOTFS_ZSTD_FILE,

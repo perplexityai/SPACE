@@ -55,9 +55,7 @@ impl NetworkPoolConfig {
             min_ready_slots: max_slots.min(32),
             pod_netns_path: None,
             service_port_ingress_isolation: ServicePortIngressIsolation::ExclusiveHost,
-            sandbox_cache_dir: PathBuf::from(
-                pplx_space_common_core::host::linux::paths::SANDBOX_CACHE_DIR,
-            ),
+            sandbox_cache_dir: PathBuf::from(pplx_space_host_layout::paths::SANDBOX_CACHE_DIR),
         }
     }
 
@@ -717,7 +715,7 @@ impl NetworkPool {
     ) -> Result<std::sync::Arc<Self>, PoolOpenError> {
         config.pod_netns_path = config.pod_netns_path.as_deref().map(normalize_netns_name);
         validate_config(&config).map_err(PoolOpenError::Configuration)?;
-        let db_path = pplx_space_common_core::host::linux::paths::NODE_MANAGER_DB;
+        let db_path = pplx_space_host_layout::paths::NODE_MANAGER_DB;
         if let Some(parent) = std::path::Path::new(db_path).parent() {
             std::fs::create_dir_all(parent).map_err(|source| PoolOpenError::Directory {
                 path: parent.to_path_buf(),

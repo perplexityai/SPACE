@@ -249,7 +249,7 @@ impl From<pplx_space_sbx_mgr_store::db::migration::MigrationTarget> for SqliteDa
 fn sqlite_template_manager() -> SqliteDatabase {
     SqliteDatabase {
         name: "template-manager",
-        default_path: pplx_space_common_core::host::linux::paths::TEMPLATE_MANAGER_DB,
+        default_path: pplx_space_host_layout::paths::TEMPLATE_MANAGER_DB,
         migrator: &TEMPLATE_MANAGER_MIGRATOR,
         common_schema: true,
     }
@@ -258,7 +258,7 @@ fn sqlite_template_manager() -> SqliteDatabase {
 fn sqlite_node_manager() -> SqliteDatabase {
     SqliteDatabase {
         name: "node-manager",
-        default_path: pplx_space_common_core::host::linux::paths::NODE_MANAGER_DB,
+        default_path: pplx_space_host_layout::paths::NODE_MANAGER_DB,
         migrator: &NODE_MANAGER_MIGRATOR,
         common_schema: false,
     }
@@ -267,7 +267,7 @@ fn sqlite_node_manager() -> SqliteDatabase {
 fn sqlite_node_ctl() -> SqliteDatabase {
     SqliteDatabase {
         name: "node-ctl",
-        default_path: pplx_space_common_core::host::linux::paths::NODE_CTL_DB,
+        default_path: pplx_space_host_layout::paths::NODE_CTL_DB,
         migrator: &NODE_CTL_MIGRATOR,
         common_schema: false,
     }
@@ -276,7 +276,7 @@ fn sqlite_node_ctl() -> SqliteDatabase {
 fn sqlite_runtime_manager() -> SqliteDatabase {
     SqliteDatabase {
         name: "runtime-manager",
-        default_path: pplx_space_common_core::host::linux::paths::RUNTIME_MANAGER_DB,
+        default_path: pplx_space_host_layout::paths::RUNTIME_MANAGER_DB,
         migrator: &RUNTIME_MANAGER_MIGRATOR,
         common_schema: true,
     }
@@ -285,7 +285,7 @@ fn sqlite_runtime_manager() -> SqliteDatabase {
 fn sqlite_volume_manager() -> SqliteDatabase {
     SqliteDatabase {
         name: "volume-manager",
-        default_path: pplx_space_common_core::host::linux::paths::VOLUME_MANAGER_DB,
+        default_path: pplx_space_host_layout::paths::VOLUME_MANAGER_DB,
         migrator: &VOLUME_MANAGER_MIGRATOR,
         common_schema: true,
     }
@@ -294,7 +294,7 @@ fn sqlite_volume_manager() -> SqliteDatabase {
 fn sqlite_build_manager() -> SqliteDatabase {
     SqliteDatabase {
         name: "build-manager",
-        default_path: pplx_space_common_core::host::linux::paths::BUILD_MANAGER_DB,
+        default_path: pplx_space_host_layout::paths::BUILD_MANAGER_DB,
         migrator: &BUILD_MANAGER_MIGRATOR,
         common_schema: true,
     }

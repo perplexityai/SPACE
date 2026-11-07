@@ -90,11 +90,7 @@ pub async fn create_template_subvolume(
             // their cleanup-on-error guard would have wiped it if
             // their install failed.
             Ok(PathBuf::from(
-                pplx_space_common_core::host::linux::paths::template_build_dir(
-                    name,
-                    content_hash,
-                    partition,
-                ),
+                pplx_space_common_core::types::template_build_dir(name, content_hash, partition),
             ))
         }
         Err(status) => Err(BtrfsViaNodemgrError::Rpc {
@@ -108,7 +104,7 @@ pub async fn create_template_subvolume(
 /// subvolume and toggle it RO. Returns the UUIDv5 nodemgr computed
 /// so the caller can log it. The UUIDv5 derivation is canonical on
 /// the nodemgr side; callers can recompute via
-/// `pplx_space_common_core::host::btrfs::deterministic_template_received_uuid`
+/// `pplx_space_btrfs::deterministic_template_received_uuid`
 /// for sanity-checking.
 pub async fn finalize_template_subvolume(
     name: &str,

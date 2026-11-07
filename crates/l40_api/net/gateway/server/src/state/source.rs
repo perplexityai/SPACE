@@ -266,9 +266,7 @@ type HostControl =
 async fn connect_host_control(
     sandbox_id: SandboxId,
 ) -> Result<HostControl, HydrateNetworkStateError> {
-    let socket = std::path::Path::new(
-        pplx_space_common_core::host::linux::paths::SANDBOX_HOST_CONTROL_SOCKET,
-    );
+    let socket = std::path::Path::new(pplx_space_host_layout::paths::SANDBOX_HOST_CONTROL_SOCKET);
     let channel = pplx_space_spaced_common::connect_uds_channel("sandbox-host-control", socket)
         .await
         .map_err(|source| HydrateNetworkStateError::ConnectHostControl { sandbox_id, source })?;

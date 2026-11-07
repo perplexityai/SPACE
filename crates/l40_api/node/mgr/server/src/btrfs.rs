@@ -4,7 +4,7 @@ use std::ffi::OsStr;
 use std::fs::File;
 use std::io;
 
-use pplx_space_common_core::host::btrfs::SubvolumeInfo;
+use pplx_space_btrfs::SubvolumeInfo;
 
 #[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
@@ -168,8 +168,7 @@ pub(crate) fn set_readonly(directory: &File, readonly: bool) -> io::Result<()> {
 pub(crate) fn stamp(directory: &File, uuid: uuid::Uuid) -> io::Result<()> {
     #[cfg(target_os = "linux")]
     {
-        pplx_space_common_core::host::btrfs::set_received_uuid_on_fd(directory, uuid)
-            .map_err(Into::into)
+        pplx_space_btrfs::set_received_uuid_on_fd(directory, uuid).map_err(Into::into)
     }
     #[cfg(not(target_os = "linux"))]
     {

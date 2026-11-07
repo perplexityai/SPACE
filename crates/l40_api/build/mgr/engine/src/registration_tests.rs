@@ -67,7 +67,7 @@ fn a_registered_build_publishes_from_its_partition_s_directory() {
     let other = EnvironmentReference::new(Digest::sha256([2; 32]));
     let legacy = std::path::PathBuf::from(format!(
         "{}/seed/{}",
-        pplx_space_common_core::host::linux::paths::TEMPLATE_DIR,
+        pplx_space_host_layout::paths::TEMPLATE_DIR,
         hash()
     ));
     for environment in [None, Some(e0)] {

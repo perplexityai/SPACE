@@ -11,13 +11,10 @@ use pplx_space_api_route::{
     ed25519::SpaceApiRouteEd25519KeyId, ed25519::SpaceApiRouteEd25519Signer,
     ed25519::SpaceApiRouteEd25519Token,
 };
-use pplx_space_common_core::{
-    host::disk_admission::CacheDiskAdmissionReason,
-    types::{
-        ClusterId, EnvMap, ExecutionGeneration, GuestPort, NodeId, OrgId, PodUid, RouteGeneration,
-        SandboxActivationAttemptId, SandboxId, SandboxRouteIdentity, SimpleDuration,
-        SpaceApiRouteIdentity,
-    },
+use pplx_space_common_core::types::{
+    ClusterId, EnvMap, ExecutionGeneration, GuestPort, NodeId, OrgId, PodUid, RouteGeneration,
+    SandboxActivationAttemptId, SandboxId, SandboxRouteIdentity, SimpleDuration,
+    SpaceApiRouteIdentity,
 };
 use pplx_space_net_gateway_client::proto::{
     ServicePortIngressFrame, ServicePortIngressStart, service_port_ingress_frame,
@@ -28,6 +25,7 @@ use pplx_space_node_api_client::proto::{
     SandboxServiceRouteTransport, SpaceApiRouteToken as ProtoSpaceApiRouteToken,
     UnstableResolveSandboxServiceRouteRequest, UnstableResolveSandboxServiceRouteResponse,
 };
+use pplx_space_node_disk_admission::CacheDiskAdmissionReason;
 use pplx_space_sbx_mgr_client::proto::{
     SpacedProcessExit, SpacedProcessExited, SpacedProcessOutput, SpacedProcessSignaled,
     SpacedProcessTimedOut, SpacedProcessUnknown, spaced_process_event, spaced_process_exit,

@@ -711,10 +711,9 @@ async fn connect_node_ctl_channel() -> Result<Channel, tonic::transport::Error> 
     );
     endpoint
         .connect_with_connector(tower::service_fn(|_| async {
-            let stream = tokio::net::UnixStream::connect(
-                pplx_space_common_core::host::linux::paths::NODE_CTL_SOCKET,
-            )
-            .await?;
+            let stream =
+                tokio::net::UnixStream::connect(pplx_space_host_layout::paths::NODE_CTL_SOCKET)
+                    .await?;
             Ok::<_, std::io::Error>(hyper_util::rt::TokioIo::new(stream))
         }))
         .await
@@ -728,7 +727,7 @@ pub async fn connect_node_ctl() -> Result<NodeCtlGrpcClient, pplx_space_common_g
     );
     let channel = pplx_space_common_grpc::connect_uds_channel_with_endpoint_with_retry(
         "node-ctl",
-        std::path::Path::new(pplx_space_common_core::host::linux::paths::NODE_CTL_SOCKET),
+        std::path::Path::new(pplx_space_host_layout::paths::NODE_CTL_SOCKET),
         endpoint,
         pplx_space_common_grpc::DEFAULT_GRPC_CONNECT_RETRY_POLICY,
     )

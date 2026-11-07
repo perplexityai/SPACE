@@ -24,7 +24,10 @@ datadog = [
 # Deprecated for one release; use otel and datadog.
 datadog-otel = ["otel", "datadog"]
 # Compiles in the test-only environment hooks; never enabled for release builds.
-test-hooks = ["pplx-space-test-hooks/test-hooks"]
+test-hooks = [
+    "pplx-space-node-disk-admission/test-hooks",
+    "pplx-space-test-hooks/test-hooks",
+]
 
 [dependencies]
 rustix = { workspace = true, features = ["fs"] }
@@ -62,6 +65,11 @@ pplx-space-api-route = { workspace = true }
 pplx-space-auto-lifecycle-receipt = { workspace = true }
 pplx-space-common-core = { workspace = true, features = ["serde"] }
 pplx-space-template-runtime = { workspace = true }
+pplx-space-btrfs = { workspace = true }
+pplx-space-host-layout = { workspace = true }
+pplx-space-host-linux = { workspace = true }
+pplx-space-node-disk-admission = { workspace = true }
+pplx-space-template-cache-permissions = { workspace = true }
 pplx-space-common-grpc = { workspace = true }
 pplx-space-file-io = { workspace = true }
 pplx-space-common-jobs = { workspace = true }

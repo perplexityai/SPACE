@@ -8,9 +8,9 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use dashmap::DashMap;
 use jiff::{SignedDuration, Timestamp};
-use pplx_space_common_core::host::linux::paths;
 use pplx_space_common_core::sandbox_storage::{RootfsSizeError, validate_rootfs_mib};
 use pplx_space_common_core::types::SandboxId;
+use pplx_space_host_layout::paths;
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;

@@ -59,7 +59,7 @@ use crate::restore_operation::{RemoteRestoreOperation, RestoreOrigin};
 use crate::state::{SandboxState, SandboxStatusEventDetails, StateTransitionError};
 use pplx_space_common_core::types::{PodUid, RouteGeneration, SpaceApiRouteIdentity};
 
-const DB_PATH: &str = pplx_space_common_core::host::linux::paths::SANDBOX_MANAGER_DB;
+const DB_PATH: &str = pplx_space_host_layout::paths::SANDBOX_MANAGER_DB;
 
 mod quarantine_scan;
 mod sandbox_row;

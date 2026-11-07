@@ -25,7 +25,7 @@ pub(super) async fn handle(
             }
 
             // Collect PIDs from the sandbox info
-            let run_dir = pplx_space_common_core::host::linux::paths::sandbox_run_dir(full_id);
+            let run_dir = pplx_space_host_layout::paths::sandbox_run_dir(full_id);
             let processes: Vec<(&str, Option<u32>)> = vec![
                 ("firecracker", sandbox.pid),
                 (

@@ -1,13 +1,13 @@
-//! Occupancy and `statvfs` probes for the `/space/cache` filesystem.
+//! Occupancy and `statvfs` probes for a filesystem.
 //!
 //! [`DiskUsage`] is a coarse legacy occupancy view derived from `f_bfree`.
 //! It is useful for gauges and broad placement bias, but it is not btrfs
 //! logical referenced data and must not be used as an allocation proof.
-//! Node-local admission uses [`DiskStatus::available_bytes`] (`f_bavail`)
-//! plus btrfs pressure checks instead.
+//! Admission uses [`DiskStatus::available_bytes`] (`f_bavail`) plus btrfs
+//! pressure checks instead.
 
 /// A coarse `statvfs` occupancy snapshot. Tests construct this directly;
-/// production reads it via [`read_cache_disk_usage`].
+/// production derives it with [`DiskStatus::usage`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DiskUsage {
     pub used_bytes: u64,
@@ -72,19 +72,6 @@ impl DiskUsage {
         let target_bytes = target_bytes_f64 as u64;
         self.used_bytes.saturating_sub(target_bytes)
     }
-}
-
-/// `statvfs` the SPACE cache filesystem. `None` when the syscall
-/// fails (cache not mounted yet, permissions) — callers treat that as
-/// "cannot evaluate the signal this tick" and skip rather than guess.
-#[cfg(unix)]
-pub fn read_cache_disk_usage() -> Option<DiskUsage> {
-    read_cache_disk_status().map(DiskStatus::usage)
-}
-
-#[cfg(unix)]
-pub fn read_cache_disk_status() -> Option<DiskStatus> {
-    statvfs_status(crate::host::linux::paths::SPACE_CACHE_DIR)
 }
 
 #[cfg(unix)]

@@ -1,6 +1,6 @@
 # Paths no Rust check (format, clippy, archcheck, isolated crates, the
 # Windows guest checks, tests, dependency checks, gateway traffic) reads.
-# Rust reads infra/space/identity/ (crates/libs/common/core/build.rs),
+# Rust reads infra/space/identity/ (crates/l20_domain/host/layout/build.rs),
 # docker/space/nftables/ (node-mgr's firewall tests), templates/, db/,
 # proto/, scripts/ and shim/testdata/, so none of them is listed; archcheck
 # reads crates' sources and manifests, db/ and the ARCHITECTURE files.

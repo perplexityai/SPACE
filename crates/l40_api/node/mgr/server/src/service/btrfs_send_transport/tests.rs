@@ -38,8 +38,7 @@ async fn durable_lease_survives_producer_removal_and_cancelled_grpc_reader() {
     let expected = vec![42; 4 * 1024 * 1024];
     std::fs::write(root.join("instance/rootfs.ext4"), &expected).unwrap();
     let sandbox = Uuid::now_v7().to_string();
-    let sandbox_path =
-        Path::new(pplx_space_common_core::host::linux::paths::SANDBOX_CACHE_DIR).join(&sandbox);
+    let sandbox_path = Path::new(pplx_space_host_layout::paths::SANDBOX_CACHE_DIR).join(&sandbox);
     std::fs::create_dir(&sandbox_path).unwrap();
     let artifact = sandbox_path.join("snapshot");
     std::fs::create_dir(&artifact).unwrap();

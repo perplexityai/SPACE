@@ -8,7 +8,8 @@
 
 use std::path::PathBuf;
 
-use pplx_space_common_core::host::{disk_admission::CacheDiskAdmissionConfig, linux::paths};
+use pplx_space_host_layout::paths;
+use pplx_space_node_disk_admission::CacheDiskAdmissionConfig;
 
 #[derive(Debug)]
 pub(crate) struct ServiceSettings {

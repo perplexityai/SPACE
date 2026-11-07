@@ -41,4 +41,5 @@ tonic-prost-build = { workspace = true }
 
 [dev-dependencies]
 anyhow = { workspace = true }
+pplx-space-host-layout = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt", "sync", "time", "test-util"] }

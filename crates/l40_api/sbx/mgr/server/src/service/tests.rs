@@ -275,7 +275,6 @@ pub(crate) mod service_tests {
         ed25519::SpaceApiRouteEd25519VerificationGeneration,
         ed25519::insert_space_api_route_ed25519_token,
     };
-    use pplx_space_common_core::host::linux::identities::{user_names, users};
     use pplx_space_common_core::types::{
         ArtifactKind, ArtifactOrigin, AutoLifecycleConditionSet, AutoLifecycleConditionSetId,
         AutoLifecycleStage, BUILDER_SANDBOX_OWNER, ClusterId, DEPLOY_SANDBOX_OWNER,
@@ -284,6 +283,7 @@ pub(crate) mod service_tests {
         SandboxQuarantineHistoryAction, SandboxQuarantineNextAction, SandboxQuarantineReasonCode,
         SandboxQuarantineSource, SandboxRouteIdentity, SpaceApiRouteIdentity,
     };
+    use pplx_space_host_layout::identities::{user_names, users};
     use pplx_space_k8s_node_id::space_k8s_node_id;
 
     use prost::Message as _;
@@ -4582,7 +4582,7 @@ pub(crate) mod service_tests {
 
     #[test]
     fn net_gateway_sidecar_pid_name_matches_launched_binary() {
-        let bin_name = Path::new(pplx_space_common_core::host::linux::paths::NET_GATEWAY_SVC_BIN)
+        let bin_name = Path::new(pplx_space_host_layout::paths::NET_GATEWAY_SVC_BIN)
             .file_name()
             .and_then(|name| name.to_str())
             .expect("net-gateway service path has a file name");

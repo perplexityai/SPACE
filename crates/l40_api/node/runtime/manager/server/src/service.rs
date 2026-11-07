@@ -8,11 +8,11 @@ use crate::installs::{
 };
 use crate::protection::{self, AuditIdentity, PathRole};
 use crate::run::SERVICE_NAME;
-use pplx_space_common_core::host::linux::identities::{user_names, users};
 use pplx_space_common_core::types::{
     ComponentIdentity, Digest, JobId, RuntimeIdentity, RuntimeKind, RuntimeVersion,
 };
 use pplx_space_execution_common::proto::{self as execution, ArtifactComponentKind};
+use pplx_space_host_layout::identities::{user_names, users};
 use pplx_space_node_runtime_core::runtime_inventory::diagnostic::{
     self, ArtifactKinds, ArtifactScan, DigestCache, ScanLimits, ScanRoots, SystemScanClock,
 };

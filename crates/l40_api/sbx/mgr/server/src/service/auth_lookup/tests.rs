@@ -13,7 +13,7 @@ async fn gateway_identity_mapping_preserves_exact_pid_and_lifecycle_authority() 
     )
     .unwrap();
     let owner = 10_042;
-    let isolated = pplx_space_common_core::host::linux::gateway::gateway_uid(
+    let isolated = pplx_space_host_layout::gateway::gateway_uid(
         pplx_space_common_core::types::LinuxUid::new(owner),
     )
     .unwrap()

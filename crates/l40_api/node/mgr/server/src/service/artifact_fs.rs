@@ -163,9 +163,7 @@ pub(super) fn snapshot(source: &Path, destination: &Path, readonly: bool) -> Res
     btrfs::snapshot(&source, &parent, name, readonly).map_err(error)
 }
 
-pub(super) fn info(
-    path: &Path,
-) -> Result<pplx_space_common_core::host::btrfs::SubvolumeInfo, Status> {
+pub(super) fn info(path: &Path) -> Result<pplx_space_btrfs::SubvolumeInfo, Status> {
     btrfs::info(&trusted_paths::open_directory(path)?)
         .map(|(_, info)| info)
         .map_err(error)

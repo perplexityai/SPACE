@@ -6,7 +6,7 @@ use clap::Parser;
 use pplx_space_build_mgr_server::{
     BuildMgrRunConfig, DEFAULT_DRAIN_TIMEOUT_SECONDS, DEFAULT_LISTEN, SERVICE_NAME,
 };
-use pplx_space_common_core::host::linux::paths::BUILD_MANAGER_DB;
+use pplx_space_host_layout::paths::BUILD_MANAGER_DB;
 
 #[derive(Parser)]
 #[command(

@@ -842,9 +842,9 @@ pub async fn prepare(params: PrepareParams<'_>) -> Result<PreparedEncryptedVolum
     // opening it. Symlink-safe descriptor-relative copy — the source is
     // caller-supplied.
     if let Some(source) = &restore_source {
-        let root = PathBuf::from(
-            pplx_space_common_core::host::linux::paths::sandbox_cache_dir(&sandbox_id.to_string()),
-        );
+        let root = PathBuf::from(pplx_space_host_layout::paths::sandbox_cache_dir(
+            &sandbox_id.to_string(),
+        ));
         let source = source.clone();
         let staged_backing = backing_path.clone();
         tokio::task::spawn_blocking(move || {

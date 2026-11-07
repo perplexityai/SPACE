@@ -35,7 +35,7 @@ use pplx_space_common_grpc::{
 use tonic::transport::{Channel, Endpoint};
 
 pub const RUNTIME_SUPERVISOR_SOCKET: &str =
-    pplx_space_common_core::host::linux::paths::RUNTIME_SUPERVISOR_SOCKET;
+    pplx_space_host_layout::paths::RUNTIME_SUPERVISOR_SOCKET;
 const LOCAL_ENDPOINT_URI: &str = "http://[::]:50051";
 
 pub type RuntimeSupervisorGrpcClient =
