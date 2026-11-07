@@ -126,8 +126,20 @@ async fn concurrent_certifications_intersect_and_replays_never_regrow_edges() ->
     publish_known(&db.pool, &left).await?;
     publish_known(&db.pool, &right).await?;
     assert_eq!(row(&db.pool).await?, intersection);
-    // A later build can refuse all edges or ordering. Replaying an earlier
-    // build is never an authorization to expand them again.
+    // Existing-row updates take no admission lock. Concurrent builds can
+    // withdraw different evidence without either update restoring the other.
+    let without_memory = certification([b], [], Some(VersionSortKey::new(vec![1, 15, 1])?));
+    let without_order = certification([b], [b], None);
+    let (left_result, right_result) = tokio::join!(
+        publish_known(&db.pool, &without_memory),
+        publish_known(&db.pool, &without_order),
+    );
+    left_result?;
+    right_result?;
+    let concurrent = row(&db.pool).await?;
+    assert_eq!(concurrent.upgrade_edges, vec![b.to_string()]);
+    assert!(concurrent.memory_edges.is_empty());
+    assert!(concurrent.version_sort_key.is_none());
     publish_known(&db.pool, &certification([], [], None)).await?;
     let refused = row(&db.pool).await?;
     assert!(refused.upgrade_edges.is_empty());
