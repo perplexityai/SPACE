@@ -179,6 +179,15 @@ fn admin_openapi_value() -> Value {
                     }
                 }
             },
+            "/dead-node-dry-runs": {
+                "get": {
+                    "summary": "List the cluster controller's last dead-node dry run for each node it judged",
+                    "description": "One entry per node, by node_id, written while SPACE_DEAD_NODE_MODE=dry-run and deleted with the node; empty until then. verdict is lost or unknown and reason names the condition it rests on, for unknown the first that failed. counts maps each outcome to its number of sandbox rows, leaving out outcomes with none, and samples maps it to its first rows as {sandbox_id, lifecycle}. rows_truncated means the controller's per-node row cap cut the read short, so counts are a lower bound. Outcomes are counted whatever the verdict; only a lost node's rows would be reconciled. A dry run changes nothing but these entries. An entry stays until its node is deleted: a node that is no longer judged (its heartbeat fresh again, in a drain phase, or the mode back to off) keeps its last entry and observed_at, and GET /nodes has its current heartbeat and drain phase.",
+                    "responses": {
+                        "200": { "description": "{dry_runs: [{node_id, observed_at, verdict, reason, rows_truncated, counts, samples}]}" }
+                    }
+                }
+            },
             "/operations": {
                 "get": {
                     "summary": "List public operations across tenants for operator diagnostics",

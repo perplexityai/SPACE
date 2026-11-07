@@ -63,6 +63,7 @@
 //! | Retire retry | Nothing retries a failed Direct retire (see below) | ac-pplx | The sweeper's failed-cleanup retry running for both substrates |
 //! | Drain and evacuation | [`SubstrateCapabilities::supports_node_drain`] is false. Admin `:drain`, `:terminate`, `:cordon`, `:uncordon` and `:force-upload-local-snapshots` return 501 before reading or writing the node. `:undrain` clears a `draining` or `drained` phase an earlier drain left, without a substrate call. The dispatcher fails a drain restore operation (`unsupported_substrate`), which nothing enqueues on Direct | ac-pplx | Core drain and evacuation for both substrates over a Direct `set_node_schedulability` |
 //! | Drain, orphan, failed-row repair and node-sync loops | Not started on Direct (below) | ac-pplx | Those loops running for both substrates through the adapter |
+//! | Dead-node verdict | The cluster controller's dead-node verb runs on Direct but judges every stale node `unknown` (`no_kube_identity`): it has no Kubernetes Node or instance authority to ask whether the machine is gone | ac-pplx | An adapter answer to "is this node still there" that the verdict reads for both substrates |
 //!
 //! # Kubernetes-only reconcilers
 //!

@@ -10,6 +10,9 @@ expression: paths_by_method
     "get",
     "patch"
   ],
+  "/dead-node-dry-runs": [
+    "get"
+  ],
   "/debug/sandbox/{sandbox_id}": [
     "get"
   ],

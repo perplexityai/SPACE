@@ -148,6 +148,7 @@ runpy.run_module("space_smoke", run_name="__main__")
                 "local.console_sandbox_lookup_accepts_every_id_form",
                 "local.console_seed_runtime_pair",
                 "local.console_turns_away_non_operators",
+                "local.dead_node_dry_run_reports_without_writing",
                 "local.deferred_btrfs_send_capture_restores_cross_node",
                 "local.drain_restore_operation_lands_in_its_target",
                 "local.ecw_template_build_from_oci_boots",
