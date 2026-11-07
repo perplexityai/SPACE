@@ -571,18 +571,25 @@ impl SandboxManagerService {
                 continue;
             }
             let service = self.clone();
-            self.task_tracker.spawn(async move {
+            let task_sandbox_id = sandbox_id.clone();
+            // A state writer, so a restart handoff waits for it rather than
+            // letting the next process start the same work beside it.
+            let spawned = self.spawn_detached_state_writer("NodeDrain", &sandbox_id, async move {
                 let result = service.run_drain_action(epoch, action).await;
-                service.drain_actions.finish(&sandbox_id);
+                service.drain_actions.finish(&task_sandbox_id);
                 if let Err(status) = result {
                     tracing::warn!(
-                        sandbox_id = %sandbox_id,
+                        sandbox_id = %task_sandbox_id,
                         action = kind.as_str(),
                         error = %status,
                         "node drain action failed; the next drain call plans it again"
                     );
                 }
             });
+            if spawned.is_err() {
+                // Draining for a restart: the next process's call starts it.
+                self.drain_actions.finish(&sandbox_id);
+            }
         }
     }
 
@@ -648,7 +655,6 @@ impl SandboxManagerService {
         {
             return Ok(());
         }
-        let _state_writer = self.state_writer_lease("NodeDrain")?;
         let artifact_lock = self.auto_lifecycle.artifact_lock(&sandbox.id);
         let artifact_guard = artifact_lock.lock_owned().await;
         let context = SuspendRequestContext::new(
