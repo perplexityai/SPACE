@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use super::{EnvMap, GuestPath, GuestUserName, ProcessCommand};
+use pplx_space_guest_process::{EnvMap, GuestPath, GuestUserName, ProcessCommand};
 
 pub const TEMPLATE_RUNTIME_BUILD_MASK: &str = "systemd.mask=space-apps.target";
 pub const MAX_TEMPLATE_RUNTIME_BYTES: usize = 256 * 1024;

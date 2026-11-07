@@ -41,7 +41,6 @@ pub use pplx_space_execution_spec::host_cpu;
 pub mod host_linux;
 pub mod kek;
 pub mod label;
-pub mod materialization;
 pub mod network;
 pub mod node;
 pub mod node_fs;
@@ -61,8 +60,6 @@ pub use pplx_space_byte_size as size;
 pub mod snapshot;
 pub mod subject;
 pub mod template;
-#[cfg(feature = "serde")]
-pub mod template_runtime;
 pub mod time;
 pub mod transport_vsock;
 pub use pplx_space_semver as version;
@@ -86,7 +83,6 @@ pub use host_cpu::*;
 pub use host_linux::*;
 pub use kek::*;
 pub use label::*;
-pub use materialization::*;
 pub use network::*;
 pub use node::*;
 pub use node_fs::*;
@@ -130,8 +126,6 @@ pub use template::{
     TemplateManifestSchemaError, TemplateMetadata, TemplateMetadataSchemaError, ZSTD_CODEC,
     ZSTD_FILENAME_SUFFIX,
 };
-#[cfg(feature = "serde")]
-pub use template_runtime::*;
 pub use time::*;
 pub use transport_vsock::*;
 pub use version::{SemVer, SemVerParseError};

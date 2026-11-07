@@ -968,7 +968,7 @@ pub struct TemplateBuildUbuntuMinimalCloudSquashfs {
 #[serde(deny_unknown_fields)]
 pub struct TemplateBuildStep {
     #[serde(default)]
-    pub set_runtime: Option<pplx_space_common_core::types::TemplateRuntime>,
+    pub set_runtime: Option<pplx_space_template_runtime::TemplateRuntime>,
     #[serde(default)]
     pub clear_runtime: Option<TemplateBuildClearRuntime>,
     #[serde(default)]

@@ -1,9 +1,10 @@
 //! Snapshot-only app observation. This never starts, stops, or resets an app.
 use super::*;
-use pplx_space_common_core::types::{
-    MAX_TEMPLATE_RUNTIME_BYTES, ProcessCommand, RuntimeStartupPolicy, TemplateRuntime,
-};
+use pplx_space_common_core::types::ProcessCommand;
 use pplx_space_spaced_host_client::{SpacedHostClient, StartProcessOptions};
+use pplx_space_template_runtime::{
+    MAX_TEMPLATE_RUNTIME_BYTES, RuntimeStartupPolicy, TemplateRuntime,
+};
 
 // One short-lived observer, rather than a process record for every poll. Both
 // the guest process timeout and host deadline bound work after cancellation.
