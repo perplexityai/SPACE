@@ -1,10 +1,12 @@
+//! Sparse materialization vocabulary for decompressed artifacts: the rollout
+//! mode a transfer requests and the layout a replica ends up with.
+
 use std::fmt;
 use std::str::FromStr;
 
 /// Rollout mode for sparse materialization of decompressed artifacts.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
-#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum MaterializationMode {
     #[default]
     Disabled,
@@ -61,9 +63,8 @@ pub struct MaterializationModeParseError {
     value: String,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
-#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum MaterializationLayout {
     Dense,
     Sparse,

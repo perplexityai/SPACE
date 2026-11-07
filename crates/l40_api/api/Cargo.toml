@@ -108,6 +108,7 @@ pplx-space-public-api-http = { workspace = true }
 pplx-space-observability = { workspace = true, default-features = false }
 pplx-space-public-api = { workspace = true, features = ["schema", "serde"] }
 pplx-space-common-core = { workspace = true, features = ["serde", "sqlx"] }
+pplx-space-template-runtime = { workspace = true }
 pplx-space-common-grpc = { workspace = true, features = ["internal-tls"] }
 pplx-space-sandbox-grpc = { workspace = true }
 pplx-space-work-coalescer = { workspace = true, optional = true }

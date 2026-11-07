@@ -4890,6 +4890,7 @@ dependencies = [
  "pplx-space-snapshot-store",
  "pplx-space-state-reconciliation",
  "pplx-space-template-mgr-client",
+ "pplx-space-template-runtime",
  "pplx-space-test-env",
  "pplx-space-work-coalescer",
  "prost",
@@ -5052,6 +5053,7 @@ dependencies = [
  "pplx-space-sbx-mgr-client",
  "pplx-space-spaced-common",
  "pplx-space-template-mgr-client",
+ "pplx-space-template-runtime",
  "pplx-space-test-env",
  "pplx-space-uds-peer-auth",
  "prost",
@@ -5104,6 +5106,7 @@ dependencies = [
  "pplx-space-common-core",
  "pplx-space-common-grpc",
  "pplx-space-common-proto-build",
+ "pplx-space-template-runtime",
  "pplx-space-test-env",
  "prost",
  "rcgen",
@@ -5365,7 +5368,6 @@ dependencies = [
  "sqlx",
  "tempfile",
  "thiserror 2.0.20",
- "toml",
  "tracing",
  "uuid",
 ]
@@ -6799,6 +6801,7 @@ dependencies = [
  "pplx-space-execution-common",
  "pplx-space-file-io",
  "pplx-space-metrics-emit",
+ "pplx-space-template-runtime",
  "pplx-space-test-env",
  "pplx-space-transparent-proxy-socket",
  "pplx-space-uds-peer-auth",
@@ -7334,6 +7337,7 @@ dependencies = [
  "pplx-space-spaced-host-client",
  "pplx-space-state-reconciliation",
  "pplx-space-template-mgr-client",
+ "pplx-space-template-runtime",
  "pplx-space-test-env",
  "pplx-space-uds-peer-auth",
  "pplx-space-unix-socket-bind",
@@ -8079,6 +8083,17 @@ dependencies = [
  "tokio",
  "tonic",
  "tracing",
+]
+
+[[package]]
+name = "pplx-space-template-runtime"
+version = "0.8.1"
+dependencies = [
+ "pplx-space-guest-process",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "toml",
 ]
 
 [[package]]

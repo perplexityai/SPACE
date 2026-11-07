@@ -92,7 +92,7 @@ fn command_line(input: &GuestBoot<'_>, devices: &str, uart: &str, console: &str)
     let build = if input.builder {
         format!(
             " {}",
-            pplx_space_common_core::types::TEMPLATE_RUNTIME_BUILD_MASK
+            pplx_space_template_runtime::TEMPLATE_RUNTIME_BUILD_MASK
         )
     } else {
         String::new()
