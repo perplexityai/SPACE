@@ -308,7 +308,16 @@ async fn the_termination_is_recorded_once_for_the_identity_and_epoch_it_let_go()
         "terminate": {"epoch": 7},
     });
     let instance = "i-0123456789abcdef0";
-    let mut cases: Vec<(&str, Option<&str>, serde_json::Value, i64, &str, bool)> = vec![
+    // (case, phase, drain_status, epoch, uid, recorded)
+    type Case<'a> = (
+        &'a str,
+        Option<&'a str>,
+        serde_json::Value,
+        i64,
+        &'a str,
+        bool,
+    );
+    let mut cases: Vec<Case> = vec![
         (
             "recorded",
             Some("terminating"),
