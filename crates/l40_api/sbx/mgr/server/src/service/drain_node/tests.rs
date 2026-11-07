@@ -37,13 +37,15 @@ fn plan_one(
 ) -> DrainPlan {
     plan(
         &[row],
-        pending_backups,
-        &LocalOnlyArtifacts::new(),
-        &evacuations.iter().cloned().collect(),
-        &running
-            .iter()
-            .map(|(id, action)| ((*id).to_owned(), *action))
-            .collect(),
+        &PlanInputs {
+            pending_backups: pending_backups.clone(),
+            evacuations: evacuations.iter().cloned().collect(),
+            running: running
+                .iter()
+                .map(|(id, action)| ((*id).to_owned(), *action))
+                .collect(),
+            ..PlanInputs::default()
+        },
     )
 }
 
@@ -74,13 +76,7 @@ fn every_lifecycle_plans_as_the_drain_table_says() {
         S::Failed,
     ] {
         let rows = [row("control", S::Started), row("subject", state)];
-        let plan = plan(
-            &rows,
-            &BTreeMap::new(),
-            &LocalOnlyArtifacts::new(),
-            &BTreeMap::new(),
-            &BTreeMap::new(),
-        );
+        let plan = plan(&rows, &PlanInputs::default());
         assert!(plan.vm, "{state}: the started control is a VM");
         assert!(
             plan.actions.contains(&PlannedAction::Suspend {
@@ -564,10 +560,10 @@ fn a_local_only_artifact_without_a_row_blocks() {
     )]);
     let plan = plan(
         &[row("control", SandboxState::Stopped)],
-        &BTreeMap::new(),
-        &local_only,
-        &BTreeMap::new(),
-        &BTreeMap::new(),
+        &PlanInputs {
+            local_only,
+            ..PlanInputs::default()
+        },
     );
     assert_eq!(
         plan.blocked,
@@ -575,5 +571,161 @@ fn a_local_only_artifact_without_a_row_blocks() {
             Some("gone".to_owned()),
             format!("local-only artifact {NAMED_ARTIFACT} has no sandbox row")
         )]
+    );
+}
+
+/// Work that has failed fewer than the bound times in a row is pending; at
+/// the bound it is blocked with the last failure, whether it is running or
+/// about to start again, and it is still retried.
+#[test]
+fn a_persistent_failure_blocks_with_its_reason_and_is_still_retried() {
+    let plan_with = |failures: u32, running: &[(&str, DrainAction)]| {
+        plan(
+            &[row("a", SandboxState::Paused)],
+            &PlanInputs {
+                failures: BTreeMap::from([("a".to_owned(), (failures, "no space".to_owned()))]),
+                running: running
+                    .iter()
+                    .map(|(id, action)| ((*id).to_owned(), *action))
+                    .collect(),
+                ..PlanInputs::default()
+            },
+        )
+    };
+    let suspend = [PlannedAction::Suspend {
+        sandbox_id: "a".into(),
+    }];
+
+    let below = plan_with(MAX_ACTION_FAILURES - 1, &[]);
+    assert_eq!(below.pending, [("a".into(), "suspend".into())]);
+    assert!(below.blocked.is_empty());
+    assert_eq!(below.actions, suspend);
+
+    let at = plan_with(MAX_ACTION_FAILURES, &[]);
+    assert!(at.pending.is_empty());
+    assert_eq!(
+        at.blocked,
+        [(
+            Some("a".into()),
+            format!("suspend failed {MAX_ACTION_FAILURES} times in a row: no space")
+        )]
+    );
+    assert_eq!(at.actions, suspend, "still retried");
+
+    let running = plan_with(MAX_ACTION_FAILURES, &[("a", DrainAction::Upload)]);
+    assert_eq!(
+        running.blocked,
+        [(
+            Some("a".into()),
+            format!("upload failed {MAX_ACTION_FAILURES} times in a row: no space")
+        )]
+    );
+    assert!(running.actions.is_empty());
+}
+
+/// A row in a transition the drain doesn't drive is pending until it has sat
+/// there past the bound, then blocked with its state.
+#[test]
+fn a_row_stuck_in_a_transition_blocks_past_the_bound() {
+    let plan_with = |unchanged: bool| {
+        plan(
+            &[row("a", SandboxState::Created)],
+            &PlanInputs {
+                unchanged: unchanged.then(|| "a".to_owned()).into_iter().collect(),
+                ..PlanInputs::default()
+            },
+        )
+    };
+    assert_eq!(
+        plan_with(false).pending,
+        [("a".into(), "settle:created".into())]
+    );
+    let stuck = plan_with(true);
+    assert!(stuck.pending.is_empty());
+    assert_eq!(
+        stuck.blocked,
+        [(
+            Some("a".into()),
+            "created for over 15 minutes, a transition the drain doesn't drive".into()
+        )]
+    );
+}
+
+/// A row counts as unchanged once it has been in one lifecycle for the
+/// bound; a change of lifecycle, or a call that doesn't see the row, starts
+/// it over.
+#[test]
+fn a_row_is_unchanged_only_after_the_bound_in_one_lifecycle() {
+    let actions = DrainActions::default();
+    let start = tokio::time::Instant::now();
+    let created = [("a".to_owned(), SandboxState::Created)];
+    let restoring = [("a".to_owned(), SandboxState::Restoring)];
+    let unchanged = |rows: &[(String, SandboxState)], at: Duration| {
+        actions.unchanged_since_bound(rows, start + at)
+    };
+    let a = BTreeSet::from(["a".to_owned()]);
+
+    assert!(unchanged(&created, Duration::ZERO).is_empty());
+    assert!(unchanged(&created, SETTLE_BOUND - Duration::from_secs(1)).is_empty());
+    assert_eq!(unchanged(&created, SETTLE_BOUND), a);
+
+    assert!(
+        unchanged(&restoring, SETTLE_BOUND).is_empty(),
+        "a new lifecycle"
+    );
+    assert_eq!(unchanged(&restoring, SETTLE_BOUND * 2), a);
+
+    assert!(unchanged(&[], SETTLE_BOUND * 2).is_empty());
+    assert!(
+        unchanged(&restoring, SETTLE_BOUND * 3 - Duration::from_secs(1)).is_empty(),
+        "a row the last call didn't see starts over"
+    );
+}
+
+/// A drain suspend that can't record the lifecycle it suspends from fails
+/// before it suspends anything, and once it has failed the bound times in a
+/// row the drain reports it blocked with why, instead of an evacuation it
+/// couldn't remember.
+#[tokio::test]
+async fn a_failed_record_write_blocks_the_suspend() {
+    let conn = crate::db::test_conn();
+    let id = pplx_space_common_core::types::SandboxId::new().to_string();
+    crate::service::tests::service_tests::insert_test_sandbox(&conn, &id, SandboxState::Started);
+    // Reads of the record still work; every write of it fails.
+    conn.execute_batch(
+        "CREATE TRIGGER refuse_drain_records BEFORE INSERT ON drain_evacuations
+         BEGIN SELECT RAISE(ABORT, 'refused by the test'); END;",
+    )
+    .unwrap();
+    let (service, first) = {
+        let service = SandboxManagerService::for_test(conn);
+        service.activation_seal.seal(&service.db, 7).unwrap();
+        let first = service.activation_seal.status();
+        (service, first)
+    };
+    for _ in 0..MAX_ACTION_FAILURES {
+        let report = service.finish_drain(7, &first, DrainScans::default());
+        assert_eq!(
+            report.pending,
+            [DrainPending {
+                sandbox_id: id.clone(),
+                action: "suspend".into(),
+            }],
+            "{report:?}"
+        );
+        service.drain_actions.wait_idle().await;
+    }
+    let report = service.finish_drain(7, &first, DrainScans::default());
+    assert!(!report.done);
+    assert_eq!(report.blocked.len(), 1, "{report:?}");
+    assert!(
+        report.blocked[0]
+            .reason
+            .contains(&format!("record the drain suspend of {id}")),
+        "{report:?}"
+    );
+    assert_eq!(
+        service.lookup_sandbox(&id).unwrap().state,
+        SandboxState::Started
     );
 }
