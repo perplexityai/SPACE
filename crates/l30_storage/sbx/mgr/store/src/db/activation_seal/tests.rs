@@ -1,42 +1,38 @@
 use super::*;
 use crate::db::test_conn;
 
-/// An evacuation keeps its prior and artifact when a later epoch records it
-/// again, moves to the later epoch only, and is forgotten with the epoch
-/// that holds it; a later epoch's row survives the cancel of an earlier one.
+fn recorded(conn: &Connection) -> Vec<(String, DrainPrior)> {
+    drain_evacuations(conn)
+        .unwrap()
+        .into_iter()
+        .map(|row| (row.sandbox_id, row.prior))
+        .collect()
+}
+
+/// A later drain suspend of the same sandbox replaces its record, a forget
+/// removes only its own, and a cancel writes the seal row and forgets every
+/// record together.
 #[test]
-fn an_evacuation_moves_forward_and_goes_with_its_cancelled_epoch() {
+fn a_record_is_replaced_and_a_cancel_forgets_every_one() {
     let conn = test_conn();
-    begin_drain_evacuation(&conn, "sbx-a", 5, DrainPrior::Paused, 1).unwrap();
-    assert!(complete_drain_evacuation(&conn, "sbx-a", "art-a").unwrap());
-    begin_drain_evacuation(&conn, "sbx-a", 9, DrainPrior::Started, 2).unwrap();
-    begin_drain_evacuation(&conn, "sbx-a", 3, DrainPrior::Started, 3).unwrap();
-    begin_drain_evacuation(&conn, "sbx-b", 5, DrainPrior::Stopped, 4).unwrap();
-    assert!(!complete_drain_evacuation(&conn, "sbx-none", "art").unwrap());
+    record_drain_suspend(&conn, "sbx-a", DrainPrior::Paused).unwrap();
+    record_drain_suspend(&conn, "sbx-a", DrainPrior::Started).unwrap();
+    record_drain_suspend(&conn, "sbx-b", DrainPrior::Paused).unwrap();
+    record_drain_suspend(&conn, "sbx-c", DrainPrior::Started).unwrap();
+    forget_drain_suspend(&conn, "sbx-c").unwrap();
     assert_eq!(
-        drain_evacuations(&conn).unwrap(),
-        vec![
-            DrainEvacuation {
-                sandbox_id: "sbx-a".into(),
-                epoch: 9,
-                prior: DrainPrior::Paused,
-                artifact_id: Some("art-a".into()),
-            },
-            DrainEvacuation {
-                sandbox_id: "sbx-b".into(),
-                epoch: 5,
-                prior: DrainPrior::Stopped,
-                artifact_id: None,
-            },
+        recorded(&conn),
+        [
+            ("sbx-a".to_owned(), DrainPrior::Started),
+            ("sbx-b".to_owned(), DrainPrior::Paused),
         ]
     );
-    assert_eq!(forget_drain_evacuations_through(&conn, 5).unwrap(), 1);
-    assert_eq!(
-        drain_evacuations(&conn)
-            .unwrap()
-            .into_iter()
-            .map(|row| row.sandbox_id)
-            .collect::<Vec<_>>(),
-        ["sbx-a"]
-    );
+
+    let cancelled = ActivationSealRecord {
+        epoch: 9,
+        sealed: false,
+    };
+    cancel_drain(&conn, cancelled).unwrap();
+    assert_eq!(recorded(&conn), []);
+    assert_eq!(activation_seal(&conn).unwrap(), Some(cancelled));
 }

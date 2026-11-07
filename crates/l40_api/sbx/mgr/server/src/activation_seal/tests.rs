@@ -105,38 +105,48 @@ fn a_cancelled_epoch_never_seals_again() {
     assert_eq!(reloaded.status().sealed_epoch, Some(13));
 }
 
-/// A cancel forgets the evacuations begun under it or earlier, and keeps a
-/// later epoch's.
+/// A drain suspend is recorded only while the node is sealed under the
+/// drain's epoch: not before the seal, not under another epoch, and not once
+/// the epoch is cancelled, whose cancel forgets what was recorded.
 #[test]
-fn a_cancel_forgets_its_evacuations() {
+fn a_drain_suspend_is_recorded_only_under_its_own_seal() {
+    use crate::db::activation_seal::DrainPrior;
     let db = crate::db::SharedConnection::new(crate::db::test_conn());
     let seal = ActivationSeal::load(&db.lock().unwrap());
-    {
-        let conn = db.lock().unwrap();
-        crate::db::activation_seal::begin_drain_evacuation(
-            &conn,
-            "sbx-a",
-            3,
-            crate::db::activation_seal::DrainPrior::Started,
-            0,
-        )
-        .unwrap();
-        crate::db::activation_seal::begin_drain_evacuation(
-            &conn,
-            "sbx-b",
-            6,
-            crate::db::activation_seal::DrainPrior::Paused,
-            0,
-        )
-        .unwrap();
-    }
-    seal.unseal(&db, 3).unwrap();
-    let left: Vec<_> = crate::db::read::drain_evacuations(&db.lock().unwrap())
-        .unwrap()
-        .into_iter()
-        .map(|row| row.sandbox_id)
-        .collect();
-    assert_eq!(left, ["sbx-b"]);
+    let recorded = || -> Vec<String> {
+        crate::db::read::drain_evacuations(&db.lock().unwrap())
+            .unwrap()
+            .into_iter()
+            .map(|row| row.sandbox_id)
+            .collect()
+    };
+
+    assert!(
+        !seal
+            .record_drain_suspend(&db, 5, "sbx-a", DrainPrior::Started)
+            .unwrap()
+    );
+    seal.seal(&db, 5).unwrap();
+    assert!(
+        !seal
+            .record_drain_suspend(&db, 4, "sbx-a", DrainPrior::Started)
+            .unwrap()
+    );
+    assert_eq!(recorded(), Vec::<String>::new());
+    assert!(
+        seal.record_drain_suspend(&db, 5, "sbx-a", DrainPrior::Started)
+            .unwrap()
+    );
+    assert_eq!(recorded(), ["sbx-a"]);
+
+    seal.unseal(&db, 5).unwrap();
+    assert_eq!(recorded(), Vec::<String>::new());
+    assert!(
+        !seal
+            .record_drain_suspend(&db, 5, "sbx-b", DrainPrior::Paused)
+            .unwrap()
+    );
+    assert_eq!(recorded(), Vec::<String>::new());
 }
 
 /// A seal row that cannot be read refuses every activation rather than

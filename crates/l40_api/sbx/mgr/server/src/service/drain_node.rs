@@ -8,9 +8,11 @@
 //! node-local durability), a stopped sandbox's disk is published through
 //! `EnqueueArtifactBackup`, and a local-only artifact's upload is finished the
 //! same way. The control plane learns of each artifact as it always does,
-//! through the backup it registers; the drain only reports the artifact once
-//! it is durable, with the lifecycle the sandbox had, which the evacuation
-//! record (`drain_evacuations`) keeps across a restart.
+//! through the backup it registers; the drain only reports the artifact, the
+//! row's durable pin, once it is durable, with the lifecycle the sandbox had.
+//! A drain suspend records that lifecycle (`drain_evacuations`) under the
+//! sandbox's wake lock, while the node is still sealed under the drain's
+//! epoch, so it survives a restart; a stopped sandbox's row keeps its own.
 //!
 //! A call never waits for that work. It plans from the rows as they are,
 //! starts what is not already running, and answers. [`DrainPlan`] is that
@@ -128,7 +130,6 @@ pub(super) struct DrainRow {
 pub(super) enum PlannedAction {
     Suspend {
         sandbox_id: String,
-        prior: DrainPrior,
     },
     PublishDisk {
         sandbox_id: String,
@@ -146,8 +147,6 @@ pub(super) struct DrainPlan {
     pub(super) evacuated: Vec<(String, DrainPrior, String)>,
     pub(super) pending: Vec<(String, String)>,
     pub(super) blocked: Vec<(Option<String>, String)>,
-    /// Evacuations whose artifact became durable in this call, to record.
-    pub(super) completed: Vec<(String, String)>,
     pub(super) actions: Vec<PlannedAction>,
     pub(super) vm: bool,
 }
@@ -165,8 +164,8 @@ pub(super) const fn may_hold_vm(state: SandboxState) -> bool {
 
 /// Decide what the drain does for every row. `pending_backups` maps a
 /// sandbox to the pinned artifacts still without a durable copy;
-/// `evacuations` are the recorded evacuations by sandbox; `running` is the
-/// drain's work in flight in this process.
+/// `evacuations` are the recorded drain suspends by sandbox; `running` is
+/// the drain's work in flight in this process.
 pub(super) fn plan(
     rows: &[DrainRow],
     pending_backups: &BTreeMap<String, BTreeSet<String>>,
@@ -195,14 +194,6 @@ pub(super) fn plan(
             plan.vm |= may_hold_vm(row.lifecycle);
             continue;
         }
-        if let Some(evacuation) = evacuation
-            && let Some(artifact) = &evacuation.artifact_id
-        {
-            plan.evacuated
-                .push((id.clone(), evacuation.prior, artifact.clone()));
-            plan.vm |= may_hold_vm(row.lifecycle);
-            continue;
-        }
         match row.lifecycle {
             SandboxState::Deleting => {
                 plan.vm = true;
@@ -223,16 +214,10 @@ pub(super) fn plan(
                 } else if let Some(refusal) = &row.suspend_refusal {
                     plan.blocked.push((Some(id.clone()), refusal.clone()));
                 } else {
-                    let prior = if row.lifecycle == SandboxState::Started {
-                        DrainPrior::Started
-                    } else {
-                        DrainPrior::Paused
-                    };
                     plan.pending
                         .push((id.clone(), DrainAction::Suspend.as_str().into()));
                     plan.actions.push(PlannedAction::Suspend {
                         sandbox_id: id.clone(),
-                        prior,
                     });
                 }
             }
@@ -247,7 +232,6 @@ pub(super) fn plan(
                 } else if let Some((artifact, pplx_space_common_core::types::ArtifactKind::Disk)) =
                     &durable_pin
                 {
-                    plan.completed.push((id.clone(), artifact.clone()));
                     plan.evacuated
                         .push((id.clone(), DrainPrior::Stopped, artifact.clone()));
                 } else if let Some((artifact, kind)) = row.pin.as_ref().filter(|_| pin_pending)
@@ -283,7 +267,6 @@ pub(super) fn plan(
                         Some((artifact, pplx_space_common_core::types::ArtifactKind::Full))
                             if row.lifecycle == SandboxState::Suspended =>
                         {
-                            plan.completed.push((id.clone(), artifact.clone()));
                             plan.evacuated
                                 .push((id.clone(), evacuation.prior, artifact.clone()));
                         }
@@ -441,7 +424,7 @@ impl SandboxManagerService {
                 BTreeSet::new(),
             ),
         };
-        self.record_and_start(epoch, &mut plan);
+        self.start_actions(epoch, &mut plan);
         let orphan_dirs = scans
             .orphan_dirs
             .into_iter()
@@ -589,48 +572,14 @@ impl SandboxManagerService {
             .map(|status| format!("can't be made durable: {}", status.message()))
     }
 
-    /// Record what the plan learned and start what it asked for. An
-    /// evacuation is recorded before its work starts, so a restart still
-    /// knows the lifecycle the sandbox had.
-    fn record_and_start(&self, epoch: u64, plan: &mut DrainPlan) {
-        let now_ms = u64::try_from(jiff::Timestamp::now().as_millisecond()).unwrap_or(0);
-        for (sandbox_id, artifact_id) in std::mem::take(&mut plan.completed) {
-            let recorded = self.db_conn().ok().and_then(|conn| {
-                crate::db::activation_seal::begin_drain_evacuation(
-                    &conn,
-                    &sandbox_id,
-                    epoch,
-                    plan.evacuated
-                        .iter()
-                        .find(|(id, _, _)| *id == sandbox_id)
-                        .map_or(DrainPrior::Stopped, |(_, prior, _)| *prior),
-                    now_ms,
-                )
-                .and_then(|()| {
-                    crate::db::activation_seal::complete_drain_evacuation(
-                        &conn,
-                        &sandbox_id,
-                        &artifact_id,
-                    )
-                })
-                .ok()
-            });
-            if recorded != Some(true) {
-                plan.evacuated.retain(|(id, _, _)| *id != sandbox_id);
-                plan.blocked
-                    .push((Some(sandbox_id), "can't record the evacuation".to_owned()));
-            }
-        }
+    /// Start what the plan asks for that isn't already running.
+    fn start_actions(&self, epoch: u64, plan: &mut DrainPlan) {
         for action in std::mem::take(&mut plan.actions) {
-            let (sandbox_id, kind, prior) = match &action {
-                PlannedAction::Suspend { sandbox_id, prior } => {
-                    (sandbox_id.clone(), DrainAction::Suspend, Some(*prior))
+            let (sandbox_id, kind) = match &action {
+                PlannedAction::Suspend { sandbox_id } => (sandbox_id.clone(), DrainAction::Suspend),
+                PlannedAction::PublishDisk { sandbox_id } => {
+                    (sandbox_id.clone(), DrainAction::PublishDisk)
                 }
-                PlannedAction::PublishDisk { sandbox_id } => (
-                    sandbox_id.clone(),
-                    DrainAction::PublishDisk,
-                    Some(DrainPrior::Stopped),
-                ),
                 PlannedAction::Upload {
                     sandbox_id,
                     artifact_id,
@@ -639,32 +588,15 @@ impl SandboxManagerService {
                     if !self.drain_actions.first_upload(artifact_id) {
                         continue;
                     }
-                    (sandbox_id.clone(), DrainAction::Upload, None)
+                    (sandbox_id.clone(), DrainAction::Upload)
                 }
             };
-            if let Some(prior) = prior {
-                let recorded = self.db_conn().ok().and_then(|conn| {
-                    crate::db::activation_seal::begin_drain_evacuation(
-                        &conn,
-                        &sandbox_id,
-                        epoch,
-                        prior,
-                        now_ms,
-                    )
-                    .ok()
-                });
-                if recorded.is_none() {
-                    plan.blocked
-                        .push((Some(sandbox_id), "can't record the evacuation".to_owned()));
-                    continue;
-                }
-            }
             if !self.drain_actions.start(&sandbox_id, kind) {
                 continue;
             }
             let service = self.clone();
             self.task_tracker.spawn(async move {
-                let result = service.run_drain_action(action).await;
+                let result = service.run_drain_action(epoch, action).await;
                 service.drain_actions.finish(&sandbox_id);
                 if let Err(status) = result {
                     tracing::warn!(
@@ -678,9 +610,15 @@ impl SandboxManagerService {
         }
     }
 
-    async fn run_drain_action(&self, action: PlannedAction) -> Result<(), Status> {
+    /// Run one action, unless the node is no longer sealed under `epoch`:
+    /// a cancel or a later drain has taken over, and a later call plans
+    /// again.
+    async fn run_drain_action(&self, epoch: u64, action: PlannedAction) -> Result<(), Status> {
+        if self.activation_seal.status().sealed_epoch != Some(epoch) {
+            return Ok(());
+        }
         match action {
-            PlannedAction::Suspend { sandbox_id, .. } => self.drain_suspend(&sandbox_id).await,
+            PlannedAction::Suspend { sandbox_id } => self.drain_suspend(epoch, &sandbox_id).await,
             PlannedAction::PublishDisk { sandbox_id } => self
                 .enqueue_artifact_backup_authorized(EnqueueArtifactBackupRequest {
                     sandbox_id,
@@ -713,13 +651,25 @@ impl SandboxManagerService {
     }
 
     /// The idle auto-suspend's suspend of a started or paused VM, for the
-    /// drain: under the wake and artifact locks, with a full snapshot
-    /// published and its upload enqueued before the runtime is torn down.
-    async fn drain_suspend(&self, sandbox_id: &str) -> Result<(), Status> {
+    /// drain under `epoch`: under the wake and artifact locks, with a full
+    /// snapshot published and its upload enqueued before the runtime is torn
+    /// down. The lifecycle it suspends from is recorded under the wake lock
+    /// first, and only while the node is still sealed under `epoch`; a row
+    /// something else moved on first keeps its own lifecycle, which the next
+    /// call plans from.
+    async fn drain_suspend(&self, epoch: u64, sandbox_id: &str) -> Result<(), Status> {
         let wake_lock = self.auto_lifecycle.wake_lock(sandbox_id);
         let wake_guard = wake_lock.lock_owned().await;
         let sandbox = self.lookup_sandbox(sandbox_id)?;
-        if !matches!(sandbox.state, SandboxState::Started | SandboxState::Paused) {
+        let prior = match sandbox.state {
+            SandboxState::Started => DrainPrior::Started,
+            SandboxState::Paused => DrainPrior::Paused,
+            _ => return Ok(()),
+        };
+        if !self
+            .activation_seal
+            .record_drain_suspend(&self.db, epoch, &sandbox.id, prior)?
+        {
             return Ok(());
         }
         let _state_writer = self.state_writer_lease("NodeDrain")?;
@@ -732,18 +682,39 @@ impl SandboxManagerService {
             true,
             Some(SandboxEventTrigger::System),
         );
-        let (_, publication) = self
-            .prepare_suspend_snapshot_publication_after_locks(
-                &context,
-                &wake_guard,
-                &artifact_guard,
-            )
-            .await?;
-        self.complete_suspend_snapshot_publication(publication)
-            .await?;
+        let suspended = async {
+            let (_, publication) = self
+                .prepare_suspend_snapshot_publication_after_locks(
+                    &context,
+                    &wake_guard,
+                    &artifact_guard,
+                )
+                .await?;
+            self.complete_suspend_snapshot_publication(publication)
+                .await
+        }
+        .await;
+        if suspended.is_err()
+            && !self
+                .lookup_sandbox(sandbox_id)
+                .is_ok_and(|row| row.state == SandboxState::Suspended)
+        {
+            // The suspend didn't land, so the record would name the lifecycle
+            // of a suspend that never happened if a user's own suspend came
+            // next. The next call records it again.
+            let forgotten = self.db_conn().ok().is_some_and(|conn| {
+                crate::db::activation_seal::forget_drain_suspend(&conn, sandbox_id).is_ok()
+            });
+            if !forgotten {
+                tracing::warn!(
+                    sandbox_id,
+                    "can't forget the record of a drain suspend that failed"
+                );
+            }
+        }
         drop(artifact_guard);
         drop(wake_guard);
-        Ok(())
+        suspended
     }
 }
 
