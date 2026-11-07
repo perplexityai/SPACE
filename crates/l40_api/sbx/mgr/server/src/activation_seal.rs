@@ -21,7 +21,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use pplx_space_common_core::activation_seal_signals::ACTIVATIONS_SEALED_MARKER;
 use tonic::Status;
 
-use crate::db::activation_seal::{ActivationSealRecord, write_activation_seal};
+use crate::db::activation_seal::{ActivationSealRecord, DrainPrior, write_activation_seal};
 
 /// The seal and the activations in flight, read together.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -153,13 +153,37 @@ impl ActivationSeal {
         Ok(())
     }
 
+    /// Record that a drain suspend of `sandbox_id` under `epoch` begins from
+    /// `prior`, if the node is still sealed under `epoch`; whether it is.
+    /// Under the state lock, which a cancel holds while it forgets every
+    /// record, so a record outlives no cancel.
+    pub(crate) fn record_drain_suspend(
+        &self,
+        db: &crate::db::SharedConnection,
+        epoch: u64,
+        sandbox_id: &str,
+        prior: DrainPrior,
+    ) -> Result<bool, Status> {
+        let state = self.lock_state();
+        if state.sealed_epoch() != Some(epoch) {
+            return Ok(false);
+        }
+        let conn = db
+            .lock()
+            .map_err(|_| Status::internal("sandbox database mutex poisoned"))?;
+        crate::db::activation_seal::record_drain_suspend(&conn, sandbox_id, prior).map_err(
+            |error| Status::internal(format!("record the drain suspend of {sandbox_id}: {error}")),
+        )?;
+        drop(conn);
+        drop(state);
+        Ok(true)
+    }
+
     /// Cancel `epoch`: clear the seal if it is under `epoch` or an earlier
     /// one, and remember `epoch` so no seal at or below it is taken again,
-    /// even one whose call arrives after this cancel. The drain evacuations
-    /// begun under it or earlier are forgotten with it, on every cancel, so a
-    /// repeated cancel also forgets what a call that outlived the first one
-    /// recorded. An epoch below the current seal's is refused and changes
-    /// nothing.
+    /// even one whose call arrives after this cancel. Every drain evacuation
+    /// is forgotten with it. An epoch below the current seal's is refused and
+    /// changes nothing.
     pub(crate) fn unseal(
         &self,
         db: &crate::db::SharedConnection,
@@ -178,7 +202,7 @@ impl ActivationSeal {
             epoch: current.map_or(epoch, |current| current.epoch.max(epoch)),
             sealed: false,
         };
-        persist_cancel(db, record, record.epoch)?;
+        persist_cancel(db, record)?;
         state.record = Ok(Some(record));
         drop(state);
         if current.is_some_and(|current| current.sealed) {
@@ -265,12 +289,11 @@ fn persist(db: &crate::db::SharedConnection, record: ActivationSealRecord) -> Re
 fn persist_cancel(
     db: &crate::db::SharedConnection,
     record: ActivationSealRecord,
-    cancelled: u64,
 ) -> Result<(), Status> {
     let conn = db
         .lock()
         .map_err(|_| Status::internal("sandbox database mutex poisoned"))?;
-    crate::db::activation_seal::cancel_drain_epoch(&conn, record, cancelled)
+    crate::db::activation_seal::cancel_drain(&conn, record)
         .map_err(|error| Status::internal(format!("persist the drain cancel: {error}")))
 }
 

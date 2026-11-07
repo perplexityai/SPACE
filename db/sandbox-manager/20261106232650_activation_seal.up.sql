@@ -13,18 +13,12 @@ CREATE TABLE activation_seal (
     sealed INTEGER NOT NULL CHECK (sealed IN (0, 1))
 );
 
--- One row per resident the node evacuated (or is evacuating) for a drain:
--- the lifecycle it had (`prior`), which the control plane restores it to,
--- and once it is durable elsewhere, the artifact that holds it. Kept until
--- the drain's epoch is cancelled, so the drain's report survives a restart
--- of sandbox-manager.
+-- The lifecycle (`started` or `paused`) each resident a drain suspended had,
+-- which the control plane restores it to once its snapshot is durable.
+-- Written under the sandbox's wake lock before the suspend, and kept until
+-- the drain is cancelled or the sandbox's row is deleted, so the drain's
+-- report survives a restart of sandbox-manager.
 CREATE TABLE drain_evacuations (
     sandbox_id TEXT PRIMARY KEY NOT NULL,
-    epoch INTEGER NOT NULL CHECK (typeof(epoch) = 'integer' AND epoch > 0),
-    prior TEXT NOT NULL CHECK (prior IN ('started', 'paused', 'stopped')),
-    -- NULL until the artifact is durable.
-    artifact_id TEXT,
-    recorded_at_ms INTEGER NOT NULL CHECK (
-        typeof(recorded_at_ms) = 'integer' AND recorded_at_ms >= 0
-    )
+    prior TEXT NOT NULL
 );

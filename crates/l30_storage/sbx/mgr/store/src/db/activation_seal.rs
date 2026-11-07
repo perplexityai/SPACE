@@ -1,6 +1,6 @@
 //! The node's persisted activation seal (`activation_seal`), which
 //! sandbox-manager reads before it serves so a seal survives a restart, and
-//! the drain's evacuation record (`drain_evacuations`).
+//! the lifecycle each resident a drain suspended had (`drain_evacuations`).
 
 use pplx_space_common_core::sql;
 use pplx_space_sqlite::SqliteU64;
@@ -51,7 +51,8 @@ pub fn write_activation_seal(conn: &Connection, record: ActivationSealRecord) ->
 }
 
 /// The lifecycle a drained resident had, which the control plane restores
-/// it to.
+/// it to. A record holds a started or paused one; a stopped resident needs
+/// none, since its row stays stopped.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DrainPrior {
     Started,
@@ -75,105 +76,68 @@ impl DrainPrior {
     }
 }
 
-/// One `drain_evacuations` row.
+/// One `drain_evacuations` row: a resident the drain suspended, and the
+/// lifecycle it had.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DrainEvacuation {
     pub sandbox_id: String,
-    /// The drain epoch the evacuation began under.
-    pub epoch: u64,
     pub prior: DrainPrior,
-    /// The durable artifact that holds the sandbox; `None` while the
-    /// evacuation is still making it.
-    pub artifact_id: Option<String>,
 }
 
-/// Record that the drain under `epoch` began evacuating `sandbox_id` from
-/// `prior`. A row the sandbox already has keeps its prior and artifact; only
-/// its epoch moves forward, so a later epoch reports it too.
-pub fn begin_drain_evacuation(
-    conn: &Connection,
-    sandbox_id: &str,
-    epoch: u64,
-    prior: DrainPrior,
-    now_ms: u64,
-) -> Result<()> {
+/// Record that a drain suspend of `sandbox_id` begins from `prior`,
+/// replacing any earlier record of it.
+pub fn record_drain_suspend(conn: &Connection, sandbox_id: &str, prior: DrainPrior) -> Result<()> {
     conn.execute(
         sql!(
-            "INSERT INTO drain_evacuations (sandbox_id, epoch, prior, artifact_id, recorded_at_ms)
-             VALUES (?1, ?2, ?3, NULL, ?4)
-             ON CONFLICT(sandbox_id) DO UPDATE SET
-                 epoch = MAX(drain_evacuations.epoch, excluded.epoch)"
+            "INSERT INTO drain_evacuations (sandbox_id, prior) VALUES (?1, ?2)
+             ON CONFLICT(sandbox_id) DO UPDATE SET prior = excluded.prior"
         ),
-        params![
-            sandbox_id,
-            SqliteU64(epoch),
-            prior.as_str(),
-            SqliteU64(now_ms)
-        ],
+        params![sandbox_id, prior.as_str()],
     )?;
     Ok(())
 }
 
-/// Record the durable artifact of `sandbox_id`'s evacuation. Returns whether
-/// a row took it.
-pub fn complete_drain_evacuation(
-    conn: &Connection,
-    sandbox_id: &str,
-    artifact_id: &str,
-) -> Result<bool> {
-    Ok(conn.execute(
-        sql!("UPDATE drain_evacuations SET artifact_id = ?2 WHERE sandbox_id = ?1"),
-        params![sandbox_id, artifact_id],
-    )? == 1)
+/// Forget `sandbox_id`'s record: its drain suspend did not happen.
+pub fn forget_drain_suspend(conn: &Connection, sandbox_id: &str) -> Result<()> {
+    conn.execute(
+        sql!("DELETE FROM drain_evacuations WHERE sandbox_id = ?1"),
+        params![sandbox_id],
+    )?;
+    Ok(())
 }
 
 /// Every evacuation, by sandbox id. A row that does not decode fails the
 /// read.
 pub(in crate::db) fn drain_evacuations(conn: &Connection) -> Result<Vec<DrainEvacuation>> {
     let mut statement = conn.prepare(sql!(
-        "SELECT sandbox_id, epoch, prior, artifact_id
-           FROM drain_evacuations ORDER BY sandbox_id"
+        "SELECT sandbox_id, prior FROM drain_evacuations ORDER BY sandbox_id"
     ))?;
     let rows = statement.query_map([], |row| {
-        let prior: String = row.get(2)?;
+        let prior: String = row.get(1)?;
         Ok(DrainEvacuation {
             sandbox_id: row.get(0)?,
-            epoch: row.get::<_, SqliteU64>(1)?.0,
             prior: DrainPrior::parse(&prior).ok_or_else(|| {
                 rusqlite::Error::FromSqlConversionFailure(
-                    2,
+                    1,
                     rusqlite::types::Type::Text,
                     format!("unknown drain prior {prior:?}").into(),
                 )
             })?,
-            artifact_id: row.get(3)?,
         })
     })?;
     rows.collect::<std::result::Result<_, _>>()
         .map_err(Into::into)
 }
 
-/// Write `record`, the seal row after a cancel of `cancelled`, and forget
-/// the evacuations that cancel ends, in one transaction.
-pub fn cancel_drain_epoch(
-    conn: &Connection,
-    record: ActivationSealRecord,
-    cancelled: u64,
-) -> Result<()> {
+/// Write `record`, the seal row after a cancel, and forget every
+/// evacuation, in one transaction: a node runs one drain at a time, and the
+/// cancel ends it.
+pub fn cancel_drain(conn: &Connection, record: ActivationSealRecord) -> Result<()> {
     let tx = crate::db::immediate_transaction(conn)?;
     write_activation_seal(&tx, record)?;
-    forget_drain_evacuations_through(&tx, cancelled)?;
+    tx.execute(sql!("DELETE FROM drain_evacuations"), [])?;
     tx.commit()?;
     Ok(())
-}
-
-/// Forget every evacuation begun under `epoch` or earlier: that drain was
-/// cancelled.
-pub fn forget_drain_evacuations_through(conn: &Connection, epoch: u64) -> Result<usize> {
-    conn.execute(
-        sql!("DELETE FROM drain_evacuations WHERE epoch <= ?1"),
-        params![SqliteU64(epoch)],
-    )
 }
 
 #[cfg(test)]

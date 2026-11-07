@@ -15,14 +15,12 @@ fn row(id: &str, lifecycle: SandboxState) -> DrainRow {
     }
 }
 
-fn evacuation(id: &str, prior: DrainPrior, artifact: Option<&str>) -> (String, DrainEvacuation) {
+fn evacuation(id: &str, prior: DrainPrior) -> (String, DrainEvacuation) {
     (
         id.to_owned(),
         DrainEvacuation {
             sandbox_id: id.to_owned(),
-            epoch: 1,
             prior,
-            artifact_id: artifact.map(str::to_owned),
         },
     )
 }
@@ -80,7 +78,6 @@ fn every_lifecycle_plans_as_the_drain_table_says() {
         assert!(
             plan.actions.contains(&PlannedAction::Suspend {
                 sandbox_id: "control".into(),
-                prior: DrainPrior::Started,
             }),
             "{state}: the control is suspended"
         );
@@ -100,7 +97,7 @@ fn every_lifecycle_plans_as_the_drain_table_says() {
             .actions
             .iter()
             .filter(|action| match action {
-                PlannedAction::Suspend { sandbox_id, .. }
+                PlannedAction::Suspend { sandbox_id }
                 | PlannedAction::PublishDisk { sandbox_id }
                 | PlannedAction::Upload { sandbox_id, .. } => sandbox_id == "subject",
             })
@@ -108,20 +105,11 @@ fn every_lifecycle_plans_as_the_drain_table_says() {
             .collect();
         let (expect_pending, expect_blocked, expect_actions): (Vec<String>, Vec<&str>, Vec<_>) =
             match state {
-                S::Started => (
+                S::Started | S::Paused => (
                     vec!["suspend".into()],
                     vec![],
                     vec![PlannedAction::Suspend {
                         sandbox_id: "subject".into(),
-                        prior: DrainPrior::Started,
-                    }],
-                ),
-                S::Paused => (
-                    vec!["suspend".into()],
-                    vec![],
-                    vec![PlannedAction::Suspend {
-                        sandbox_id: "subject".into(),
-                        prior: DrainPrior::Paused,
                     }],
                 ),
                 S::Stopped => (
@@ -188,7 +176,6 @@ fn a_stopped_sandbox_is_published_once_and_reported_with_its_disk() {
         plan_durable.evacuated,
         [("a".into(), DrainPrior::Stopped, DISK_ARTIFACT.into())]
     );
-    assert_eq!(plan_durable.completed, [("a".into(), DISK_ARTIFACT.into())]);
     assert!(plan_durable.pending.is_empty() && !plan_durable.vm);
 
     let plan_uploading = plan_one(durable, &pending("a", DISK_ARTIFACT), &[], &[]);
@@ -210,19 +197,18 @@ fn a_stopped_sandbox_is_published_once_and_reported_with_its_disk() {
 /// A sandbox the drain suspended is reported with the lifecycle it had once
 /// its snapshot is durable, and waits for the upload until then. A
 /// suspended sandbox the drain didn't suspend is already durable and is not
-/// reported; a recorded evacuation is reported whatever the row says now.
+/// reported.
 #[test]
 fn a_suspended_evacuation_reports_its_prior_once_durable() {
     let mut suspended = row("a", SandboxState::Suspended);
     suspended.pin = Some((FULL_ARTIFACT.into(), ArtifactKind::Full));
-    let record = [evacuation("a", DrainPrior::Paused, None)];
+    let record = [evacuation("a", DrainPrior::Paused)];
 
     let durable = plan_one(suspended.clone(), &BTreeMap::new(), &record, &[]);
     assert_eq!(
         durable.evacuated,
         [("a".into(), DrainPrior::Paused, FULL_ARTIFACT.into())]
     );
-    assert_eq!(durable.completed, [("a".into(), FULL_ARTIFACT.into())]);
 
     let uploading = plan_one(
         suspended.clone(),
@@ -235,19 +221,6 @@ fn a_suspended_evacuation_reports_its_prior_once_durable() {
 
     let not_ours = plan_one(suspended.clone(), &BTreeMap::new(), &[], &[]);
     assert_eq!(not_ours, DrainPlan::default());
-
-    let recorded = [evacuation("a", DrainPrior::Started, Some(FULL_ARTIFACT))];
-    let reported = plan_one(
-        row("a", SandboxState::Deleting),
-        &BTreeMap::new(),
-        &recorded,
-        &[],
-    );
-    assert_eq!(
-        reported.evacuated,
-        [("a".into(), DrainPrior::Started, FULL_ARTIFACT.into())]
-    );
-    assert!(reported.completed.is_empty());
 
     let mut lost = row("a", SandboxState::Suspended);
     lost.pin = None;
@@ -394,9 +367,9 @@ async fn done_needs_one_continuous_seal_under_the_calls_epoch() {
     assert!(service.finish_drain(8, &first, DrainScans::default()).done);
 }
 
-/// The drain records a suspended evacuation's artifact once it is durable
-/// and reports it with the prior lifecycle; the record survives a restart
-/// of the service, and the next report still carries it.
+/// A suspended sandbox the drain suspended is reported with its recorded
+/// prior lifecycle and its durable pin, and the seal and the record survive a
+/// restart of the service.
 #[tokio::test]
 async fn a_durable_evacuation_is_recorded_and_survives_a_restart() {
     let dir = tempfile::tempdir().unwrap();
@@ -422,8 +395,7 @@ async fn a_durable_evacuation_is_recorded_and_survives_a_restart() {
         crate::db::fixture::params![FULL_ARTIFACT],
     )
     .unwrap();
-    crate::db::activation_seal::begin_drain_evacuation(&conn, "sbx-a", 7, DrainPrior::Paused, 0)
-        .unwrap();
+    crate::db::activation_seal::record_drain_suspend(&conn, "sbx-a", DrainPrior::Paused).unwrap();
 
     let service = SandboxManagerService::for_test(conn);
     service.activation_seal.seal(&service.db, 7).unwrap();
@@ -479,25 +451,9 @@ async fn a_durable_evacuation_is_recorded_and_survives_a_restart() {
     );
     drop(service);
 
-    // Once the restore elsewhere has the snapshot, the node's row no longer
-    // pins it; the record still holds what the drain reported.
-    let reopened = crate::db::Connection::open_at(&path).unwrap();
-    reopened
-        .execute(
-            "UPDATE sandboxes
-                SET current_local_artifact_id = NULL, current_local_artifact_kind = NULL,
-                    current_local_artifact_origin = NULL
-              WHERE id = 'sbx-a'",
-            [],
-        )
-        .unwrap();
-    let restarted = SandboxManagerService::for_test(reopened);
-    assert_eq!(
-        restarted.activation_seal.status().sealed_epoch,
-        Some(7),
-        "the seal survives the restart"
-    );
+    let restarted = SandboxManagerService::for_test(crate::db::Connection::open_at(&path).unwrap());
     let first = restarted.activation_seal.status();
+    assert_eq!(first.sealed_epoch, Some(7), "the seal survives the restart");
     let report = restarted.finish_drain(7, &first, DrainScans::default());
     assert_eq!(evacuated(&report), expected);
 }
