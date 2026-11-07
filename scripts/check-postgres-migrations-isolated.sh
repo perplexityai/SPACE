@@ -579,6 +579,14 @@ is_allowed_with_migrations() {
     db/postgres/*.sql|db/README.md)
       return 0
       ;;
+    # Test-only schema: the test fixtures' schema variants restate migrated
+    # tables, are never applied to a real database, and must change in step
+    # with the migration that changes those tables. Only this directory's own
+    # files, not anything below it.
+    crates/test_support/db/test/fixtures/schema-variants/*.sql)
+      [[ "${file#crates/test_support/db/test/fixtures/schema-variants/}" != */* ]]
+      return
+      ;;
     crates/l30_storage/db/migrate/src/bootstrap_roles.rs)
       is_credential_tables_only_change "${file}"
       return
