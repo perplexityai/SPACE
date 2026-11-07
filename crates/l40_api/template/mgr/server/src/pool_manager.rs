@@ -115,7 +115,7 @@ pub(crate) fn pool_base_build(
         .filter_map(|build| {
             use pplx_space_common_core::types::RuntimeKind;
             let runtime = build.runtime.parse::<RuntimeKind>().ok()?;
-            let manifest: pplx_space_common_core::types::TemplateManifest =
+            let manifest: pplx_space_template_manifest::TemplateManifest =
                 serde_json::from_str(&build.manifest_json).ok()?;
             let execution = manifest.execution_metadata().ok()?;
             if let Some(execution) = execution {

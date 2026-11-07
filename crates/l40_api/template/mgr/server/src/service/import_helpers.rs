@@ -34,7 +34,7 @@ impl<'a> ImportTarget<'a> {
         content_hash: &'a str,
         header: &crate::proto::ImportTemplateHeader,
     ) -> Result<Self, Status> {
-        let metadata = serde_json::from_slice::<pplx_space_common_core::types::TemplateMetadata>(
+        let metadata = serde_json::from_slice::<pplx_space_template_manifest::TemplateMetadata>(
             &header.metadata_json,
         )
         .unwrap_or_default();
@@ -173,9 +173,9 @@ pub(super) fn validate_existing_refresh_metadata(
 pub(super) fn parse_template_manifest(
     context: &str,
     bytes: &[u8],
-) -> Result<pplx_space_common_core::types::TemplateManifest, Status> {
+) -> Result<pplx_space_template_manifest::TemplateManifest, Status> {
     if bytes.is_empty() {
-        return Ok(pplx_space_common_core::types::TemplateManifest::default());
+        return Ok(pplx_space_template_manifest::TemplateManifest::default());
     }
     let json = std::str::from_utf8(bytes).map_err(|error| {
         Status::invalid_argument(format!("{context} is not valid UTF-8: {error}"))
@@ -945,8 +945,8 @@ pub(super) fn normalize_arch(arch: &str) -> &str {
 }
 
 pub(super) fn template_arch(
-    metadata: &pplx_space_common_core::types::TemplateMetadata,
-    manifest: &pplx_space_common_core::types::TemplateManifest,
+    metadata: &pplx_space_template_manifest::TemplateMetadata,
+    manifest: &pplx_space_template_manifest::TemplateManifest,
 ) -> String {
     // Order: metadata wins (build-time fact), then manifest (artifact-side
     // label), then the host's compile-time ARCH as a last-ditch fallback —

@@ -70,7 +70,7 @@ use pplx_space_common_core::host::linux::paths::{
 };
 use pplx_space_common_core::types::{
     ContentHash, OrgId, StorageUri, SubjectId, TEMPLATE_ROOTFS_FILE, TemplateCachePartition,
-    TemplateName, ZSTD_FILENAME_SUFFIX,
+    TemplateName,
 };
 use pplx_space_common_grpc::GrpcClientTrace;
 use pplx_space_node_api_client::cluster::connect_from_env as connect_cluster_api_from_env;
@@ -78,6 +78,7 @@ use pplx_space_node_api_client::proto::{
     FindTemplateReleaseByHashRequest, FindTemplateReleaseRequest,
     ListLatestTemplateReleasesRequest, TemplateVisibility,
 };
+use pplx_space_template_manifest::ZSTD_FILENAME_SUFFIX;
 use pplx_space_volmgr_client::{
     RESTORE_PRIORITY, VOLMGR_SOCKET, VolumeManagerClient,
     proto::{ExistingFilePolicy, PullFileRequest, SnapshotArtifact},
@@ -1570,8 +1571,8 @@ async fn do_pull(
 /// Cache partition of the environment a build is bound to; see
 /// [`crate::service::effective_environment`].
 fn manifest_partition(
-    manifest: &pplx_space_common_core::types::TemplateManifest,
-    metadata: &pplx_space_common_core::types::TemplateMetadata,
+    manifest: &pplx_space_template_manifest::TemplateManifest,
+    metadata: &pplx_space_template_manifest::TemplateMetadata,
 ) -> Result<TemplateCachePartition, PullFailure> {
     let environment = crate::service::effective_environment(manifest, metadata)
         .map_err(|_| PullFailure::ExecutionMetadataInvalid)?;
@@ -1661,9 +1662,9 @@ fn release_partition(
     manifest_bytes: &[u8],
     metadata_bytes: &[u8],
 ) -> Result<TemplateCachePartition, PullFailure> {
-    let manifest: pplx_space_common_core::types::TemplateManifest =
+    let manifest: pplx_space_template_manifest::TemplateManifest =
         serde_json::from_slice(manifest_bytes).map_err(|_| PullFailure::ManifestMalformed)?;
-    let metadata: pplx_space_common_core::types::TemplateMetadata =
+    let metadata: pplx_space_template_manifest::TemplateMetadata =
         serde_json::from_slice(metadata_bytes).unwrap_or_default();
     manifest_partition(&manifest, &metadata)
 }
@@ -1896,7 +1897,7 @@ async fn try_pull_from(
     // collapsing to an empty `TemplateManifest::default()` (which would
     // then hit the `manifest_empty` branch below, masking the real
     // failure mode from logs + metrics).
-    let parsed_manifest: pplx_space_common_core::types::TemplateManifest =
+    let parsed_manifest: pplx_space_template_manifest::TemplateManifest =
         match serde_json::from_slice(&manifest_bytes) {
             Ok(m) => m,
             Err(err) => {
@@ -2698,7 +2699,7 @@ async fn pull_one(
 /// sibling) also come through unchanged; we decompress to produce the
 /// uncompressed file regardless.
 fn build_manifest_pull_plan(
-    manifest: &pplx_space_common_core::types::TemplateManifest,
+    manifest: &pplx_space_template_manifest::TemplateManifest,
     storage: &StorageUri,
     digest_dir: &str,
 ) -> Vec<ManifestPullEntry> {
@@ -2786,7 +2787,7 @@ struct DecompressTarget {
 }
 
 fn build_decompress_targets(
-    manifest: &pplx_space_common_core::types::TemplateManifest,
+    manifest: &pplx_space_template_manifest::TemplateManifest,
     digest_dir: &str,
 ) -> Vec<DecompressTarget> {
     let mut targets = Vec::new();
@@ -2845,7 +2846,7 @@ fn check_manifest_digests_for_target(
 
 #[tracing::instrument(skip_all, err)]
 async fn materialize_rootfs(
-    manifest: &pplx_space_common_core::types::TemplateManifest,
+    manifest: &pplx_space_template_manifest::TemplateManifest,
     digest_dir: &str,
     rootfs_filename: &str,
     base_tags: &[String],
@@ -3302,8 +3303,8 @@ pub(crate) async fn list_latest_releases(template_name: &str, limit: u32) -> Lat
 /// path doesn't need to reach into the service module's privacy
 /// surface, but the behavior matches.
 fn arch_from(
-    metadata: &pplx_space_common_core::types::TemplateMetadata,
-    manifest: &pplx_space_common_core::types::TemplateManifest,
+    metadata: &pplx_space_template_manifest::TemplateMetadata,
+    manifest: &pplx_space_template_manifest::TemplateManifest,
 ) -> String {
     if let Some(a) = metadata.arch.as_deref().filter(|s| !s.is_empty()) {
         return a.to_string();

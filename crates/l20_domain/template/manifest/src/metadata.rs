@@ -1,7 +1,7 @@
 //! Typed `metadata.json` shape for template builds.
 //!
 //! The metadata document is the "blueprint" companion to
-//! [`super::TemplateManifest`]'s "table of contents". Where the
+//! [`crate::TemplateManifest`]'s "table of contents". Where the
 //! manifest describes *what's in this build* (artifact digests, sizes,
 //! compression, bootable file), the metadata describes *how the build
 //! was constructed* — its base image, recipe, sizing defaults, the
@@ -68,9 +68,8 @@
 //!   them). They skip when `None`. The recipe-build writer always
 //!   wraps `Some(...)`, so wire output is unchanged.
 //! - `balloon` is optional and skips when `None`; see
-//!   [`crate::types::BalloonConfig`] for its strictly validated shape.
+//!   [`pplx_space_execution_spec::BalloonConfig`] for its strictly validated shape.
 
-#[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
 /// Unbound template `metadata.json` schema version.
@@ -109,40 +108,30 @@ pub enum TemplateMetadataSchemaError {
 ///
 /// Consumers should treat any field they need as potentially absent —
 /// see [`TemplateMetadata::runtime_defaults`] for the canonical pattern.
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
 pub struct TemplateMetadata {
     /// Absent for the legacy version-1 shape.
-    #[cfg_attr(
-        feature = "serde",
-        serde(default, skip_serializing_if = "Option::is_none")
-    )]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schema_version: Option<u32>,
 
     /// Exact execution environment selected for this template build.
-    #[cfg_attr(
-        feature = "serde",
-        serde(default, skip_serializing_if = "Option::is_none")
-    )]
-    pub execution: Option<crate::types::ExecutionMetadata>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution: Option<pplx_space_execution_spec::ExecutionMetadata>,
 
     /// Omitted for legacy Linux images. Version 4 prevents old readers from
     /// applying ext4 tools or waiting for an absent guest agent.
-    #[cfg_attr(
-        feature = "serde",
-        serde(default, skip_serializing_if = "Option::is_none")
-    )]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub guest_image: Option<pplx_space_execution_spec::guest_image::GuestImageContract>,
 
     /// Logical template identifier (matches the directory under
     /// `/space/cache/templates/`).
-    #[cfg_attr(feature = "serde", serde(default))]
+    #[serde(default)]
     pub id: String,
 
     /// Human-facing template name. Often equal to `id` in current
     /// build flows; kept separate so a future rename doesn't churn
     /// the durable id.
-    #[cfg_attr(feature = "serde", serde(default))]
+    #[serde(default)]
     pub name: String,
 
     /// Optional operator-facing description from the recipe.
@@ -152,52 +141,43 @@ pub struct TemplateMetadata {
     /// `null`, and downstream JSON consumers such as
     /// `grpc_core::v["description"].as_str().unwrap_or("")` read
     /// `null` and absent identically. Preserved for wire parity.
-    #[cfg_attr(feature = "serde", serde(default))]
+    #[serde(default)]
     pub description: Option<String>,
 
     /// Base template reference *as written in the recipe*
     /// (e.g. `"base:latest"`). Not necessarily the resolved digest —
     /// see [`Self::base_resolved`] for that.
-    #[cfg_attr(feature = "serde", serde(default))]
+    #[serde(default)]
     pub base: String,
 
     /// Resolved digest of the base template at build time
     /// (e.g. `"sha256:..."`), recorded so a future rebuild can verify
     /// it descended from the same parent.
-    #[cfg_attr(
-        feature = "serde",
-        serde(default, skip_serializing_if = "Option::is_none")
-    )]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_resolved: Option<String>,
 
     /// Build completion timestamp (ISO-8601 UTC). Propagated into the
     /// manifest's `build_date` and the DB row's `build_date` column.
-    #[cfg_attr(feature = "serde", serde(default))]
+    #[serde(default)]
     pub built_at: String,
 
     /// Version of `spaced` that produced this build (e.g. crate
     /// version). Used by compatibility checks at restore time.
-    #[cfg_attr(
-        feature = "serde",
-        serde(default, skip_serializing_if = "Option::is_none")
-    )]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spaced_version: Option<String>,
 
     /// Compatibility family (e.g. `"0.1"`) — coarser than
     /// `spaced_version`, lets restore accept patch-level differences.
-    #[cfg_attr(
-        feature = "serde",
-        serde(default, skip_serializing_if = "Option::is_none")
-    )]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spaced_compatibility_family: Option<String>,
 
     /// Recipe identifier that produced this build (for builder-flow
     /// builds; empty for seed/imported templates).
-    #[cfg_attr(feature = "serde", serde(default))]
+    #[serde(default)]
     pub recipe: String,
 
     /// Number of recipe steps executed. Zero for non-recipe builds.
-    #[cfg_attr(feature = "serde", serde(default))]
+    #[serde(default)]
     pub steps_count: usize,
 
     /// CPU architecture identifier (`"aarch64"`, `"x86_64"`). Seed
@@ -205,35 +185,23 @@ pub struct TemplateMetadata {
     /// to the manifest's `arch` and ultimately to `"aarch64"`. New
     /// field in the typed view — build-mgr never wrote it, so
     /// `skip_serializing_if` keeps recipe-build output unchanged.
-    #[cfg_attr(
-        feature = "serde",
-        serde(default, skip_serializing_if = "Option::is_none")
-    )]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub arch: Option<String>,
 
     /// Default vCPU count for sandboxes created from this template.
     /// `None` (or `Some(0)`) is treated as "no default" by readers.
-    #[cfg_attr(
-        feature = "serde",
-        serde(default, skip_serializing_if = "Option::is_none")
-    )]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vcpu: Option<u8>,
 
     /// Default memory (MiB). `None` / `Some(0)` is treated as
     /// "no default".
-    #[cfg_attr(
-        feature = "serde",
-        serde(default, skip_serializing_if = "Option::is_none")
-    )]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_mib: Option<u32>,
 
     /// Sized rootfs disk capacity (MiB). Recipe builds use this to
     /// expand the rootfs to a sandbox-runtime size; seed templates
     /// may omit it. `None` / `Some(0)` is treated as "no default".
-    #[cfg_attr(
-        feature = "serde",
-        serde(default, skip_serializing_if = "Option::is_none")
-    )]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disk_size_mb: Option<u32>,
 
     /// Opt-in virtio balloon device for VMs that cold boot from this
@@ -241,15 +209,15 @@ pub struct TemplateMetadata {
     /// they were taken with, so a change applies after the template's base
     /// snapshot is rebuilt. Skips when `None` so existing documents are
     /// unchanged.
-    #[cfg_attr(
-        feature = "serde",
-        serde(default, skip_serializing_if = "Option::is_none")
-    )]
-    pub balloon: Option<crate::types::BalloonConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub balloon: Option<pplx_space_execution_spec::BalloonConfig>,
 }
 
 impl TemplateMetadata {
-    pub fn set_execution_metadata(&mut self, execution: crate::types::ExecutionMetadata) {
+    pub fn set_execution_metadata(
+        &mut self,
+        execution: pplx_space_execution_spec::ExecutionMetadata,
+    ) {
         self.execution = Some(execution);
         self.refresh_schema_version();
     }
@@ -276,7 +244,8 @@ impl TemplateMetadata {
 
     pub fn execution_metadata(
         &self,
-    ) -> Result<Option<&crate::types::ExecutionMetadata>, TemplateMetadataSchemaError> {
+    ) -> Result<Option<&pplx_space_execution_spec::ExecutionMetadata>, TemplateMetadataSchemaError>
+    {
         if self.guest_image.is_some()
             != (self.schema_version == Some(GUEST_TEMPLATE_METADATA_SCHEMA_VERSION))
         {
@@ -314,7 +283,8 @@ impl TemplateMetadata {
     /// `None` for unbound documents.
     pub fn environment(
         &self,
-    ) -> Result<Option<crate::types::EnvironmentReference>, TemplateMetadataSchemaError> {
+    ) -> Result<Option<pplx_space_execution_spec::EnvironmentReference>, TemplateMetadataSchemaError>
+    {
         Ok(self
             .execution_metadata()?
             .and_then(|execution| execution.environment()))
@@ -334,5 +304,5 @@ impl TemplateMetadata {
     }
 }
 
-#[cfg(all(test, feature = "serde"))]
+#[cfg(test)]
 mod tests;

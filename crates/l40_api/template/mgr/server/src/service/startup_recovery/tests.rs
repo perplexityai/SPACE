@@ -1,5 +1,5 @@
 use super::*;
-use pplx_space_common_core::types::{
+use pplx_space_template_manifest::{
     TemplateManifest, TemplateManifestCompression, TemplateManifestFile,
 };
 use sha2::{Digest as _, Sha256};
