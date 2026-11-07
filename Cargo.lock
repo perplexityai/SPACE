@@ -4790,7 +4790,6 @@ name = "pplx-space-accounts"
 version = "0.8.1"
 dependencies = [
  "pplx-space-job-id",
- "rusqlite",
  "serde",
  "sqlx",
  "thiserror 2.0.20",
@@ -5374,7 +5373,6 @@ dependencies = [
  "pplx-space-rpc-contracts",
  "pplx-space-semver",
  "pplx-space-sql-locator",
- "rusqlite",
  "serde",
  "serde_json",
  "sha2 0.11.0",

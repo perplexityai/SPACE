@@ -58,8 +58,6 @@ pub mod sandbox;
 pub mod sandbox_artifact;
 pub use pplx_space_byte_size as size;
 pub mod snapshot;
-#[cfg(feature = "rusqlite")]
-mod sqlite;
 pub mod subject;
 pub mod template;
 #[cfg(feature = "serde")]
