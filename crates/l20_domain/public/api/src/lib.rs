@@ -1689,7 +1689,9 @@ pub struct CreateCommandRequest {
     /// `Accept: text/event-stream`, even one that never reads input, and
     /// `/sessions/{session_id}/events` refuses to start it. Only a WebSocket
     /// attach can start it; after the WebSocket detaches, `/events` can
-    /// reconnect and read its output.
+    /// reconnect and read its output. It starts with `TERM=xterm-256color`
+    /// and `LANG=C.UTF-8` unless the sandbox's environment or `env` sets
+    /// them; sandboxes from older templates set neither.
     pub pty: Option<TerminalSize>,
     /// Keeps standard input open for a WebSocket attach to write. Server-sent
     /// events carry no input, so when `/sessions/{session_id}/events` starts
