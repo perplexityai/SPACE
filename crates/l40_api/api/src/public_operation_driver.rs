@@ -508,7 +508,7 @@ where
                 .await?;
             if updated {
                 report.canceled += 1;
-                pplx_space_metrics::operations::completed_by(
+                crate::metrics::operations::completed_by(
                     api_product_label,
                     kind.as_str(),
                     OperationState::Canceled.as_str(),
@@ -772,7 +772,7 @@ where
                     }
                     ReleasedClaim::DrainRestoreSuperseded { by } => {
                         report.canceled += 1;
-                        pplx_space_metrics::operations::completed_by(
+                        crate::metrics::operations::completed_by(
                             api_product_label,
                             kind.as_str(),
                             OperationState::Canceled.as_str(),

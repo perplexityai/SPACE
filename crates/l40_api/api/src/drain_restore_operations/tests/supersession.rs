@@ -4,9 +4,9 @@
 
 use std::time::Duration;
 
+use crate::metrics::sandbox::api::SandboxApiMetricIdentity;
 use pplx_space_common_core::sql;
 use pplx_space_common_core::types::{OrgId, SandboxId};
-use pplx_space_metrics::sandbox::api::SandboxApiMetricIdentity;
 use pplx_space_sandbox_store::drain_restore::DrainRestoreTarget;
 use uuid::Uuid;
 

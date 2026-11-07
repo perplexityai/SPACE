@@ -858,7 +858,7 @@ async fn adopting_a_restoring_rows_live_record_clears_its_episode_target() -> Te
         .expect("sandbox row");
 
     Box::pin(fixture.substrate.wake_execution(
-        pplx_space_metrics::sandbox::api::SandboxApiMetricIdentity::native("wake"),
+        crate::metrics::sandbox::api::SandboxApiMetricIdentity::native("wake"),
         &sandbox,
         Duration::from_secs(5),
         None,

@@ -721,7 +721,7 @@ async fn hand_back_busy_key(
             );
         }
         Ok(ReleasedClaim::DrainRestoreSuperseded { by }) => {
-            pplx_space_metrics::operations::completed(
+            pplx_space_api::metrics::operations::completed(
                 operation.api_product.as_str(),
                 operation.kind.as_str(),
                 OperationState::Canceled.as_str(),

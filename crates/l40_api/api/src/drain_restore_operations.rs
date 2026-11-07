@@ -322,7 +322,7 @@ impl DrainRestoreOperationExecutor {
         };
         let outcome = kubernetes
             .restore_drained_execution(
-                pplx_space_metrics::sandbox::api::SandboxApiMetricIdentity::native("drain_restore"),
+                crate::metrics::sandbox::api::SandboxApiMetricIdentity::native("drain_restore"),
                 request.sandbox_id,
                 crate::controllers::substrate::ActivationOptions {
                     blocking: true,

@@ -1249,7 +1249,7 @@ impl KubernetesSubstrate {
     /// it. A claim it cannot take fails with `EvacuationClaimLost`.
     pub async fn restore_drained_execution(
         &self,
-        metric_identity: pplx_space_metrics::sandbox::api::SandboxApiMetricIdentity,
+        metric_identity: crate::metrics::sandbox::api::SandboxApiMetricIdentity,
         sandbox_id: SandboxId,
         options: ActivationOptions,
         placement: Option<&EvacuationPlacement>,
