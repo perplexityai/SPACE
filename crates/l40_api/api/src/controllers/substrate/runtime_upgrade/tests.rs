@@ -145,6 +145,24 @@ fn an_unbound_record_counts_only_as_an_exact_match() {
             None
         );
     }
+    for kind in RuntimeKind::all() {
+        let mut catalog = self::catalog();
+        catalog[0].runtime = kind.as_str().into();
+        let mut recorded = unbound(Some("1.15.1"), Some("6.1.155"), Some("9.0.0"));
+        recorded.runtime = Some(kind.alias().into());
+        assert_eq!(attribute(&recorded, &catalog, LEGACY_DISABLED), Some(e0()));
+    }
+    for (stored, recorded, expected) in [
+        ("custom-runtime", "custom-runtime", Some(e0())),
+        ("custom-runtime", "other-runtime", None),
+        ("firecracker", "custom-runtime", None),
+    ] {
+        let mut catalog = self::catalog();
+        catalog[0].runtime = stored.into();
+        let mut execution = unbound(Some("1.15.1"), Some("6.1.155"), Some("9.0.0"));
+        execution.runtime = Some(recorded.into());
+        assert_eq!(attribute(&execution, &catalog, LEGACY_DISABLED), expected);
+    }
 }
 
 #[test]
@@ -161,6 +179,11 @@ fn a_record_from_before_execution_metadata_is_e0_only_without_legacy_work() {
         attribute(&pre_metadata, &catalog(), LEGACY_DISABLED),
         Some(e0())
     );
+    let alias = RecordedExecution {
+        runtime: Some("fc".into()),
+        ..RecordedExecution::default()
+    };
+    assert_eq!(attribute(&alias, &catalog(), LEGACY_DISABLED), Some(e0()));
     assert_eq!(
         attribute(&pre_metadata, &catalog()[1..], LEGACY_DISABLED),
         None

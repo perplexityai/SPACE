@@ -38,7 +38,7 @@ use std::time::Duration;
 
 use pplx_space_common_core::types::{
     EnvironmentReference, INITIAL_FIRECRACKER_RUNTIME_VERSION,
-    INITIAL_FIRECRACKER_STATE_FORMAT_VERSION, LocalArtifactId, SandboxId,
+    INITIAL_FIRECRACKER_STATE_FORMAT_VERSION, LocalArtifactId, RuntimeKind, SandboxId,
 };
 use pplx_space_runtime_environment_policy_store::{
     RuntimeEnvironmentPolicy, RuntimeEnvironmentState,
@@ -172,7 +172,7 @@ pub fn attribute(
         &recorded.state_format_version,
     ) {
         return only_match(catalog, |environment| {
-            &environment.runtime == runtime
+            same_runtime(&environment.runtime, runtime)
                 && &environment.runtime_version == runtime_version
                 && &environment.kernel_version == kernel_version
                 && &environment.state_format_name == state_format_name
@@ -189,7 +189,10 @@ pub fn attribute(
     only_match(catalog, |environment| {
         environment.runtime_version == INITIAL_FIRECRACKER_RUNTIME_VERSION
             && environment.state_format_version == INITIAL_FIRECRACKER_STATE_FORMAT_VERSION
-            && agrees(recorded.runtime.as_deref(), &environment.runtime)
+            && recorded
+                .runtime
+                .as_deref()
+                .is_none_or(|runtime| same_runtime(runtime, &environment.runtime))
             && agrees(
                 recorded.kernel_version.as_deref(),
                 &environment.kernel_version,
@@ -199,6 +202,11 @@ pub fn attribute(
                 &environment.state_format_name,
             )
     })
+}
+
+fn same_runtime(left: &str, right: &str) -> bool {
+    left == right
+        || RuntimeKind::parse(left).is_ok_and(|kind| RuntimeKind::parse(right) == Ok(kind))
 }
 
 /// The one catalog environment `matches` accepts, if exactly one does.
