@@ -6436,3 +6436,141 @@ async fn timeout_observes_existing_activation_without_retargeting_or_restarting(
     }
     Ok(())
 }
+
+/// The seeded organization and its user, as the ECW auth layers present them.
+async fn seed_ecw_caller(pool: &PgPool) -> TestResult<(Organization, crate::models::User)> {
+    let org = sqlx::query_as::<_, Organization>(sql!(
+        "SELECT id, name, slug, parent_id, theme_primary, theme_secondary, logo_url,
+                byok_enabled, snapshot_base_object_storage_uri, created_at, updated_at
+         FROM organizations WHERE id = $1"
+    ))
+    .bind(SEED_ORG_ID)
+    .fetch_one(pool)
+    .await?;
+    let actor = sqlx::query_as::<_, crate::models::User>(sql!(
+        "SELECT id, email, password_hash, display_name, org_id, role, owner_source,
+                created_at, updated_at FROM users WHERE id = $1"
+    ))
+    .bind(SEED_USER_ID)
+    .fetch_one(pool)
+    .await?;
+    Ok((org, actor))
+}
+
+/// A cold ECW create is admitted once, for the ID it answers with.
+#[cfg(feature = "kubernetes")]
+#[rstest]
+#[tokio::test(flavor = "current_thread")]
+async fn ecw_create_is_admitted_for_the_sandbox_it_creates(
+    #[future] kubernetes_app_state_fixture: TestResult<KubernetesAppStateFixture>,
+) -> TestResult {
+    use crate::controllers::sandbox::lifecycle::user_admission::{
+        UserLifecycleRequest, recorded::admitted,
+    };
+    if !crate::test_support::enter_sim_worker_process() {
+        return Ok(());
+    }
+    let fixture = kubernetes_app_state_fixture.await?;
+    sqlx::query(sql!(
+        "INSERT INTO templates (id, name, visibility) VALUES ($1, 'seed', 'generic')"
+    ))
+    .bind(Uuid::now_v7())
+    .execute(&fixture.pool)
+    .await?;
+    let release_id = Uuid::now_v7();
+    sqlx::query(sql!(
+        "INSERT INTO template_releases (id, template_name, type, hash)
+         VALUES ($1, 'seed', 'fc', 'sha256:ecw-create-admission')"
+    ))
+    .bind(release_id)
+    .execute(&fixture.pool)
+    .await?;
+    sqlx::query(sql!(
+        "INSERT INTO template_release_tags (template_release_id, template_name, tag)
+         VALUES ($1, 'seed', 'latest')"
+    ))
+    .bind(release_id)
+    .execute(&fixture.pool)
+    .await?;
+    let (_, actor) = seed_ecw_caller(&fixture.pool).await?;
+
+    let response = e2b_api_routes()
+        .layer(Extension(AuthEcwActor(Some(actor))))
+        .layer(Extension(test_ecw_host_config()))
+        .with_state(fixture.state.clone())
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/sandboxes")
+                .header(header::HOST, TEST_ECW_API_HOST)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"templateID":"seed"}"#))?,
+        )
+        .await?;
+
+    let status = response.status();
+    let body: serde_json::Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await?)?;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let sandbox_id: SandboxId = body["sandboxID"].as_str().ok_or("sandboxID")?.parse()?;
+    assert_eq!(admitted(sandbox_id), [UserLifecycleRequest::Create]);
+    Ok(())
+}
+
+/// An ECW fork is admitted once, for its source, before it is recorded. The
+/// route then waits for an outcome no executor here produces, so the test
+/// stops it once the fork is recorded.
+#[tokio::test(flavor = "current_thread")]
+async fn ecw_fork_is_admitted_for_its_source_before_it_is_recorded() -> TestResult {
+    use crate::controllers::sandbox::lifecycle::user_admission::{
+        UserLifecycleRequest, recorded::admitted,
+    };
+    let db = pg_test_db().await?;
+    let (org, actor) = seed_ecw_caller(&db.pool).await?;
+    let source = SandboxId::new();
+    sqlx::query(sql!(
+        "INSERT INTO sandboxes (id, user_id, org_id, managed_by, lifecycle, placement,
+                                template_id, content_hash, network_policy_generation)
+         VALUES ($1, $2, $3, 'space', 'started', 'unplaced', 'seed', 'hash-seed', 1)"
+    ))
+    .bind(source)
+    .bind(SEED_USER_ID)
+    .bind(SEED_ORG_ID)
+    .execute(&db.pool)
+    .await?;
+    let state = AppState::from_pool(db.pool.clone()).await?;
+    let fork = e2b_api_routes()
+        .layer(Extension(AuthEcwActor(Some(actor))))
+        .layer(Extension(AuthOrg(org)))
+        .layer(Extension(test_ecw_host_config()))
+        .with_state(state)
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/sandboxes/{source}/fork"))
+                .header(header::HOST, TEST_ECW_API_HOST)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("idempotency-key", "ecw-fork-admission")
+                .body(Body::from("{}"))?,
+        );
+    let recorded = async {
+        loop {
+            let operations: i64 = sqlx::query_scalar(sql!(
+                "SELECT COUNT(*) FROM public_operations WHERE kind = 'fork_sandbox'"
+            ))
+            .fetch_one(&db.pool)
+            .await?;
+            if operations > 0 {
+                return TestResult::Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    };
+
+    tokio::select! {
+        answered = fork => panic!("the fork answered before an outcome exists: {:?}", answered?.status()),
+        recorded = tokio::time::timeout(Duration::from_secs(30), recorded) => recorded??,
+    }
+    assert_eq!(admitted(source), [UserLifecycleRequest::Fork]);
+    Ok(())
+}

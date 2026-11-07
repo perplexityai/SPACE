@@ -75,6 +75,10 @@ impl SandboxController {
                     .parse::<SubstrateKind>()
                     .is_ok_and(SubstrateKind::wakes_after_failed_control_connect) =>
             {
+                super::lifecycle::user_admission::admit_user_lifecycle(
+                    sandbox.id,
+                    super::lifecycle::user_admission::UserLifecycleRequest::ControlWake(action),
+                );
                 // Fallback wake for a dormant sandbox (the non-recovering
                 // `runtime_client` path errored). `wake_execution` spends a real
                 // node slot for a suspended (Restore) or created (Cold) sandbox.
@@ -635,6 +639,14 @@ pub(crate) async fn connect_spaced_runtime_client(
     metric_identity: SandboxApiMetricIdentity,
     activity: Option<ExecutionActivityKind>,
 ) -> Result<RuntimeClient, ControllerError> {
+    if let Some(activity) = activity {
+        super::lifecycle::user_admission::admit_user_lifecycle(
+            sandbox.id,
+            super::lifecycle::user_admission::UserLifecycleRequest::Action(
+                super::lifecycle::SandboxAction::ImplicitWake(activity),
+            ),
+        );
+    }
     // Both branches go through code paths that can re-place a sandbox on a
     // draining node: `access_runtime_client` runs `ensure_pod_exists` for
     // dormant + recoverable-live lifecycles, and the plain `runtime_client`

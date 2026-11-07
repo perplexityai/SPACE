@@ -1629,3 +1629,64 @@ mod response_tests {
         };
     }
 }
+
+/// Opening a port that is not yet applied on a suspended sandbox's node
+/// admits the access wake that reaching its runtime implies, once. Without a
+/// node there is no runtime to reach, and nothing is admitted.
+#[tokio::test(flavor = "current_thread")]
+async fn opening_a_port_on_a_suspended_sandbox_admits_its_access_wake()
+-> pplx_space_test_env::TestResult {
+    use super::lifecycle::user_admission::{UserLifecycleRequest, recorded::admitted};
+    let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+    let controller = SandboxController::new(crate::controllers::substrate::Substrate::from_direct(
+        crate::controllers::substrate::direct::DirectSubstrate::new(db.pool.clone()),
+    ));
+    let node = NodeId::new();
+    sqlx::query(sql!(
+        "INSERT INTO nodes (id, address, role, managed_by, state)
+         VALUES ($1, '127.0.0.1', 'worker', 'space', 'ready')"
+    ))
+    .bind(node)
+    .execute(&db.pool)
+    .await?;
+    for (active_node, expected) in [
+        (
+            Some(node),
+            vec![UserLifecycleRequest::Action(
+                super::lifecycle::SandboxAction::ImplicitWake(ExecutionActivityKind::Access),
+            )],
+        ),
+        (None, vec![]),
+    ] {
+        let id = SandboxId::new();
+        sqlx::query(sql!(
+            "INSERT INTO sandboxes (id, user_id, org_id, managed_by, lifecycle, placement,
+                                    active_node_id, template_id, content_hash,
+                                    network_policy_generation)
+             VALUES ($1, '00000000-0000-0000-0000-000000000010',
+                     '00000000-0000-0000-0000-000000000001', 'space', 'suspended', $2, $3,
+                     'seed', 'hash-seed', 1)"
+        ))
+        .bind(id)
+        .bind(if active_node.is_some() {
+            "on_node"
+        } else {
+            "unplaced"
+        })
+        .bind(active_node)
+        .execute(&db.pool)
+        .await?;
+        let sandbox = fetch_sandbox(&db.pool, id).await?.ok_or("seeded sandbox")?;
+
+        let opened = controller
+            .ensure_sandbox_port_exposure_applied(&db.pool, &sandbox, 3000, "native")
+            .await;
+
+        assert!(
+            opened.is_err(),
+            "{active_node:?}: no runtime can be reached"
+        );
+        assert_eq!(admitted(id), expected, "{active_node:?}");
+    }
+    Ok(())
+}

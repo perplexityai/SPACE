@@ -108,6 +108,7 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 pub mod action_stamp;
+pub mod admin_occupancy;
 pub mod artifact_marker;
 pub mod create;
 pub mod delete;
@@ -124,6 +125,7 @@ pub mod quarantine;
 pub mod repair;
 pub mod restore_lease;
 pub mod restore_source;
+pub mod runtime_population;
 pub mod stuck;
 pub mod suspend;
 pub mod sweeper;

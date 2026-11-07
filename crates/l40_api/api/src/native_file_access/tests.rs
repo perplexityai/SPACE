@@ -482,3 +482,42 @@ async fn a_request_is_bound_before_any_grant() -> TestDbResult<()> {
     assert_eq!(error.code(), tonic::Code::InvalidArgument);
     Ok(())
 }
+
+/// Preparing a call reaches for the sandbox's runtime and admits the access
+/// wake that implies, once; authorizing the same request does not reach for
+/// it and admits nothing.
+#[tokio::test]
+async fn preparing_a_call_admits_the_access_wake_it_implies() -> TestDbResult<()> {
+    use crate::controllers::sandbox::lifecycle::{
+        SandboxAction,
+        user_admission::{UserLifecycleRequest, recorded::admitted},
+    };
+    use crate::controllers::substrate::ExecutionActivityKind;
+    let fixture = fixture().await?;
+    let sandbox_id = seed_sandbox(&fixture, SEED_ORG_ID).await?;
+    let credential = format!("Bearer {KEY}");
+    let stat = || {
+        request(
+            NativeFileOperation::Stat,
+            &sandbox_id,
+            &[("authorization", credential.as_str())],
+        )
+    };
+
+    let authorized = authorize(&fixture, stat()).await;
+    assert!(
+        matches!(authorized, Authorized::Authorized(_)),
+        "{authorized:?}"
+    );
+    assert_eq!(admitted(sandbox_id.into()), []);
+
+    let outcome = prepare(&fixture.service, stat(), &fingerprint(b"unused")).await;
+    assert!(matches!(outcome, Prepared::Refused(_)), "{outcome:?}");
+    assert_eq!(
+        admitted(sandbox_id.into()),
+        [UserLifecycleRequest::Action(SandboxAction::ImplicitWake(
+            ExecutionActivityKind::Access
+        ))]
+    );
+    Ok(())
+}

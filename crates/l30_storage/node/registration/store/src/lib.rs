@@ -1,11 +1,16 @@
-//! Postgres registration reads for Kubernetes nodes.
+//! Postgres registration of Kubernetes nodes.
 //!
-//! The registration check on `node_k8s`: whether a Kubernetes node name and
-//! UID map to a SPACE node. Other `node_k8s` reads and its writers stay with
-//! their callers.
+//! Registering a Kubernetes node ([`register_k8s_node`]), and the
+//! registration check on `node_k8s`: whether a Kubernetes node name and UID
+//! map to a SPACE node. Other `node_k8s` reads stay with their callers.
 
 use pplx_space_common_core::types::{K8sNodeName, K8sNodeUid, NodeId};
 use pplx_space_sql_locator::sql;
+
+mod register;
+pub use register::{
+    K8sNodeRegistration, K8sNodeRegistrationError, K8sNodeRegistrationStep, register_k8s_node,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum NodeRegistrationError {

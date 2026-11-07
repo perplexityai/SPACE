@@ -3970,8 +3970,8 @@ impl<S: NodeDrainSink, T: InstanceTerminator> Reconciler<S, T> {
             Err(CordonError::StaleIdentity) => {
                 // Same-name kube Node replacement detected. The
                 // inventory reflector will reset `drain_phase` on its
-                // next tick (see `upsert_k8s_node_role` in
-                // `crates/l40_api/api/src/controllers/substrate/kubernetes/store/node_inventory.rs`).
+                // next tick (see `register_k8s_node` in
+                // `crates/l30_storage/node/registration/store/src/register.rs`).
                 // Skip this tick silently — no `drain_last_error`
                 // write, because the row is about to lose its drain
                 // state anyway and a stale error would survive past

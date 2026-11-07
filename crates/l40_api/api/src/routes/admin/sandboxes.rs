@@ -316,6 +316,7 @@ async fn create_sandbox_for_org(
     }
     .into_json();
 
+    admit_user_lifecycle(sandbox_id.into(), UserLifecycleRequest::Create);
     let store = PublicOperationStore::new(pool.clone());
     let result = store
         .create_operation(CreatePublicOperation {

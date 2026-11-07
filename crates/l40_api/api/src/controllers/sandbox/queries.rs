@@ -926,13 +926,18 @@ impl SandboxController {
         metric_identity: SandboxApiMetricIdentity,
         federated: FederatedSandboxCreateContext<'_>,
     ) -> Result<SandboxResponse, ControllerError> {
+        let sandbox_id = SandboxId::new();
+        super::lifecycle::user_admission::admit_user_lifecycle(
+            sandbox_id,
+            super::lifecycle::user_admission::UserLifecycleRequest::Create,
+        );
         self.create_with_sandbox_id_inner(
             pool,
             actor,
             req,
             metric_identity,
             SandboxCreateExecutionMode {
-                sandbox_id: SandboxId::new(),
+                sandbox_id,
                 sandbox_id_pinned: false,
                 admitted_pool_claim: None,
                 federated,

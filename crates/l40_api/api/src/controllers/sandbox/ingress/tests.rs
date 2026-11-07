@@ -415,3 +415,50 @@ async fn a_queued_implicit_wake_is_judged_for_the_activity_the_resolver_names() 
         ]
     );
 }
+
+/// Ingress access to a suspended sandbox that may wake on access admits that
+/// access wake once, before it reaches for the runtime; one whose policy
+/// refuses the wake is refused before that and admits nothing.
+#[tokio::test(flavor = "current_thread")]
+async fn stored_ingress_access_to_a_suspended_sandbox_admits_its_access_wake()
+-> pplx_space_test_env::TestResult {
+    use crate::controllers::sandbox::lifecycle::user_admission::{
+        UserLifecycleRequest, recorded::admitted,
+    };
+    use pplx_space_common_core::types::AutoLifecycleWakeSource;
+    let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+    let backend = StoredAccess {
+        pool: db.pool.clone(),
+        controller: SandboxController::new(Substrate::from_direct(
+            crate::controllers::substrate::direct::DirectSubstrate::new(db.pool.clone()),
+        )),
+        inline: None,
+    };
+    for (wake_enabled, expected) in [
+        (
+            true,
+            vec![UserLifecycleRequest::Action(
+                super::lifecycle::SandboxAction::ImplicitWake(ExecutionActivityKind::Access),
+            )],
+        ),
+        (false, vec![]),
+    ] {
+        let id = SandboxId::new();
+        let mut policy = AutoLifecyclePolicy::disabled();
+        if wake_enabled {
+            policy.wake.on.push(AutoLifecycleWakeSource::Access);
+        }
+        sqlx::query(sql!("INSERT INTO sandboxes (id, user_id, org_id, managed_by, lifecycle, placement, template_id, content_hash, auto_lifecycle_json, network_policy_generation)
+            VALUES ($1, '00000000-0000-0000-0000-000000000010', '00000000-0000-0000-0000-000000000001', 'space', 'suspended', 'unplaced', 'seed', 'hash-seed', $2, 1)"))
+            .bind(id.as_uuid()).bind(sqlx::types::Json(&policy)).execute(&db.pool).await?;
+
+        let outcome = backend.access(id).await;
+
+        assert!(
+            outcome.is_err(),
+            "{wake_enabled}: no runtime can be reached"
+        );
+        assert_eq!(admitted(id), expected, "{wake_enabled}");
+    }
+    Ok(())
+}

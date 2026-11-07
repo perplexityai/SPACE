@@ -2477,3 +2477,31 @@ async fn sandbox_list_budget_ignores_env() -> TestDbResult<()> {
     assert!(page.next_cursor.is_none());
     Ok(())
 }
+
+/// A native create is admitted once, for the ID it records.
+#[tokio::test]
+async fn native_create_is_admitted_for_the_sandbox_it_records() -> TestDbResult<()> {
+    use crate::controllers::sandbox::lifecycle::user_admission::{
+        UserLifecycleRequest, recorded::admitted,
+    };
+    let db = pg_test_db().await?;
+    let created = create_native_sandbox_operation(
+        &db.pool,
+        OrgId::from_uuid(SEED_ORG_ID),
+        UserId::from_uuid(SEED_USER_ID),
+        &IdempotencyKey::parse("native-create-admission")?,
+        create_request_with_auto_lifecycle(None),
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("native create should be admitted");
+
+    assert_eq!(
+        admitted(created.sandbox_id.into()),
+        [UserLifecycleRequest::Create]
+    );
+    Ok(())
+}

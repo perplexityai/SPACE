@@ -263,8 +263,11 @@ pub(crate) async fn create_native_sandbox_operation(
         request_fingerprint: &fingerprint,
     };
     let fresh_sandbox_id = PublicSandboxId::new();
+    // Every create this route records is built here, just before the store
+    // call that records it, so each is admitted for the ID it carries.
     let create =
         |sandbox_id: PublicSandboxId, sandbox_id_string, pool_claim: Option<AdmissionPoolClaim>| {
+            admit_user_lifecycle(sandbox_id.into(), UserLifecycleRequest::Create);
             CreatePublicOperation {
                 org_id,
                 actor_user_id: Some(actor_user_id),

@@ -181,3 +181,65 @@ async fn builder_lookup_reads_only_kubernetes_nodes() -> TestResult {
     }
     Ok(())
 }
+
+/// An Update that cannot reach a dormant `'k8s'` sandbox's runtime admits the
+/// wake its fallback runs, once, named by the Update, before the activation
+/// charge refuses it. A `'space'` row takes no fallback wake and admits nothing.
+#[tokio::test(flavor = "current_thread")]
+async fn control_runtime_client_admits_the_fallback_wake_it_runs() -> TestResult {
+    use crate::controllers::sandbox::lifecycle::{
+        SandboxAction,
+        user_admission::{UserLifecycleRequest, recorded::admitted},
+    };
+    for (managed_by, expected) in [
+        (
+            "k8s",
+            vec![UserLifecycleRequest::ControlWake(SandboxAction::Update)],
+        ),
+        ("space", vec![]),
+    ] {
+        let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+        let pool = db.pool.clone();
+        let sandbox_id = SandboxId::new();
+        insert_test_sandbox_row(&pool, sandbox_id, "suspended").await?;
+        sqlx::query(pplx_space_common_core::sql!(
+            "UPDATE sandboxes SET managed_by = $2 WHERE id = $1"
+        ))
+        .bind(sandbox_id)
+        .bind(managed_by)
+        .execute(&pool)
+        .await?;
+        let sandbox = crate::controllers::sandbox::fetch_sandbox(&pool, sandbox_id)
+            .await?
+            .expect("sandbox row");
+        let substrate = Substrate::from_kubernetes(substrate_with_store_and_client(
+            pool.clone(),
+            mock_kubernetes_client(Arc::new(Mutex::new(Vec::new()))),
+        ));
+        // Zero eligible nodes, so the fallback's activation charge refuses
+        // before any pod is created.
+        let admission = crate::cluster_admission::ClusterSandboxAdmission::with_config(
+            Substrate::from_direct(crate::controllers::substrate::direct::DirectSubstrate::new(
+                pool.clone(),
+            )),
+            crate::cluster_admission::ClusterSandboxAdmissionConfig {
+                enabled: true,
+                refill_rps: 6.0,
+                burst: 60.0,
+                redis_url: None,
+            },
+            pplx_space_feature_flags::FeatureFlagClient::disabled(),
+        );
+        let controller = crate::controllers::sandbox::SandboxController::with_cluster_admission(
+            substrate, admission,
+        );
+
+        let connected = controller
+            .control_runtime_client(&pool, &sandbox, SandboxAction::Update)
+            .await;
+
+        assert!(connected.is_err(), "{managed_by}: no runtime to reach");
+        assert_eq!(admitted(sandbox_id), expected, "{managed_by}");
+    }
+    Ok(())
+}

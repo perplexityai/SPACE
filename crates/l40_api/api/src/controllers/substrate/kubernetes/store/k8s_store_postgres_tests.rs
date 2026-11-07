@@ -9446,9 +9446,9 @@ async fn azrebalance_variant_uid_change_does_not_leak_stale_drain_state_or_drain
     Ok(())
 }
 
-/// The bootstrap gate alone is not enough: `kube_node_sync`, the admin
-/// inventory listing, and the late-pod-placement path also reach the upsert
-/// and would otherwise re-create the row under the same deterministic id.
+/// `kube_node_sync`, the admin inventory listing, and the late-pod-placement
+/// path all reach the upsert and would otherwise re-create the row under the
+/// same deterministic id.
 /// Asserts that each refuses when a tombstone exists and writes nothing.
 async fn node_registration_refuses_when_tombstoned(fixture: &PostgresStore) -> TestResult {
     for caller in RegistrationCaller::ALL {

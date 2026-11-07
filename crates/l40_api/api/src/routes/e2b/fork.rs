@@ -14,6 +14,9 @@ use pplx_space_events::{
 use pplx_space_public_api::PublicErrorCode;
 
 use super::{AppState, E2bApiError, MatchedEcwHost, acquire_client_slot, request_client_id};
+use crate::controllers::sandbox::lifecycle::user_admission::{
+    UserLifecycleRequest, admit_user_lifecycle,
+};
 use crate::e2b::schema::SandboxForkRequestE2b;
 use crate::fork_operations::{
     AdmitForkOperation, AdmitForkOperationError, ForkAvailabilityConfig, ForkRequest,
@@ -218,6 +221,7 @@ pub(super) async fn fork_sandbox(
                         return Err(fork_idempotency_conflict());
                     }
                     ObservePublicOperationIdempotency::Missing => {
+                        admit_user_lifecycle(source_sandbox_id, UserLifecycleRequest::Fork);
                         match admit_locked_fork_operation(
                             admission,
                             AdmitForkOperation {

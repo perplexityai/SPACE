@@ -213,9 +213,7 @@ async fn sync_binds_a_registered_builder_to_its_node_uid() -> pplx_space_test_en
         nodes,
     );
 
-    // Mirrors the rows internal-api's registration writes
-    // (bootstrap_k8s_origin_node): the node row, and its node_k8s row with a
-    // NULL UID.
+    // A registered builder: its node row, and its node_k8s row with no UID yet.
     let builder_id = space_k8s_node_id("builder-a", NodeRole::Builder.as_str());
     sqlx::query(sql!(
         "INSERT INTO nodes (id, address, role, managed_by, state, last_heartbeat)
