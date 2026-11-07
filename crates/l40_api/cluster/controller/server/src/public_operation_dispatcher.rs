@@ -230,7 +230,7 @@ impl NativePublicOperationExecutor {
         pool: PgPool,
         substrate: Substrate,
         feature_flags: FeatureFlagClient,
-        grant_audience: pplx_space_common_core::types::FederatedGrantAudience,
+        grant_audience: pplx_space_accounts::FederatedGrantAudience,
         tls_interception_exemptions: Option<TlsInterceptionExemptions>,
         egress_profiles: EgressProfiles,
     ) -> Result<Self, pplx_space_api_route::ed25519::SpaceApiRouteEd25519Error> {
@@ -257,7 +257,7 @@ impl NativePublicOperationExecutor {
         substrate: Substrate,
         cluster_admission: ClusterSandboxAdmission,
         route_ed25519_authority: Arc<pplx_space_api_route::ed25519::SpaceApiRouteEd25519Authority>,
-        grant_audience: pplx_space_common_core::types::FederatedGrantAudience,
+        grant_audience: pplx_space_accounts::FederatedGrantAudience,
         tls_interception_exemptions: Option<TlsInterceptionExemptions>,
         egress_profiles: EgressProfiles,
     ) -> Self {

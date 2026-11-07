@@ -23,9 +23,9 @@ use uuid::Uuid;
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
-use super::auth::NodeId;
 use super::host_linux::{LINUX_NETWORK_SLOT_LABEL_WIDTH, MAX_LINUX_NETWORK_SLOT};
 use super::node::{NodeManagedBy, PodUid};
+use pplx_space_accounts::NodeId;
 
 const SANDBOX_LABEL_HEX_LEN: usize = 8;
 const SANDBOX_RUNTIME_LABEL_MAX_LEN: usize =

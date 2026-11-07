@@ -1,4 +1,5 @@
-use pplx_space_common_core::types::{LocalArtifactId, NodeId, SandboxId};
+use pplx_space_accounts::NodeId;
+use pplx_space_common_core::types::{LocalArtifactId, SandboxId};
 
 use super::support::*;
 use super::*;
@@ -12,9 +13,10 @@ use crate::node_group_placement::{
     PlacementSubject, ResolvePath as NodeGroupResolvePath, ResolvedPlacement, RestoreSourceNode,
     check_local_restore_source,
 };
+use pplx_space_accounts::SandboxOwner;
 use pplx_space_common_core::types::{
     ExecutionGeneration, NodeRole as SpaceNodeRole, PodUid, SandboxActivationAttemptId,
-    SandboxLifecycle, SandboxOwner, SandboxTransitionTargetState,
+    SandboxLifecycle, SandboxTransitionTargetState,
 };
 use pplx_space_events::{
     SandboxEvent, SandboxEventBoolField, SandboxEventDetails, SandboxEventSource, SandboxEventType,

@@ -1,4 +1,4 @@
-use pplx_space_common_core::types::JobId;
+use pplx_space_accounts::JobId;
 
 pub mod proto {
     tonic::include_proto!("space.volume.manager.v1");
@@ -246,7 +246,7 @@ pub struct EnsureFileReplicaOutput {
 #[derive(Debug, thiserror::Error)]
 pub enum EnsureFileReplicaError {
     #[error("invalid job identity in volume-manager response: {0}")]
-    InvalidJobId(#[from] pplx_space_common_core::types::AuthIdParseError),
+    InvalidJobId(#[from] pplx_space_accounts::AuthIdParseError),
     #[error("submit ensure-file-replica job: {0}")]
     Submit(#[source] tonic::Status),
     #[error("wait for ensure-file-replica job: {0}")]
@@ -327,7 +327,7 @@ pub fn ensure_file_replica_with_config(
 #[derive(Debug, thiserror::Error)]
 pub enum CancelTransferScopeError {
     #[error("invalid job identity in volume-manager response: {0}")]
-    InvalidJobId(#[from] pplx_space_common_core::types::AuthIdParseError),
+    InvalidJobId(#[from] pplx_space_accounts::AuthIdParseError),
     #[error("cancel transfer scope RPC failed: {0}")]
     Rpc(#[from] tonic::Status),
     #[error("transfer job {job_id} remained non-terminal with status {status}")]

@@ -1,5 +1,6 @@
 use crate::routes::public::error::database_error;
-use pplx_space_common_core::types::{OrgId, SandboxId, SnapshotId};
+use pplx_space_accounts::OrgId;
+use pplx_space_common_core::types::{SandboxId, SnapshotId};
 
 use pplx_space_common_core::sql;
 use std::str::FromStr;

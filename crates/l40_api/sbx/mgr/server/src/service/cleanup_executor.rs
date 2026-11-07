@@ -1,4 +1,4 @@
-use pplx_space_common_core::types::JobId;
+use pplx_space_accounts::JobId;
 
 use super::cleanup::{AsyncCleanupRequest, CleanupAdmission, SynchronousCleanupRequest};
 use super::cleanup_support::{

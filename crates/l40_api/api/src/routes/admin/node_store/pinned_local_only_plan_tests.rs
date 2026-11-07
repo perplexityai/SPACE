@@ -66,8 +66,9 @@
 //! set, so a re-invocation picks up the `deferred[]` tail the previous call
 //! published, and a non-suspended row pinned to the node is never an answer.
 
+use pplx_space_accounts::NodeId;
 use pplx_space_common_core::sql;
-use pplx_space_common_core::types::{NodeId, SandboxId};
+use pplx_space_common_core::types::SandboxId;
 use pplx_space_db_test_fixtures::try_pg_test_db;
 use sqlx::PgPool;
 use std::num::NonZeroUsize;

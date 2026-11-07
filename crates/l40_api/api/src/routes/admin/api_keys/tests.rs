@@ -1,6 +1,7 @@
 use super::*;
 use axum::http::Method;
-use pplx_space_common_core::{sql, types::OrgId};
+use pplx_space_accounts::OrgId;
+use pplx_space_common_core::sql;
 use serde_json::{Value, json};
 
 use crate::routes::admin::test_fixtures::{TestResult, admin_router_harness};

@@ -4805,6 +4805,7 @@ dependencies = [
  "comfy-table",
  "insta",
  "nix 0.31.3",
+ "pplx-space-accounts",
  "pplx-space-common-cli",
  "pplx-space-common-core",
  "reqwest 0.13.5",
@@ -4839,6 +4840,7 @@ dependencies = [
  "log",
  "oci-spec",
  "percent-encoding",
+ "pplx-space-accounts",
  "pplx-space-api-route",
  "pplx-space-bearer-token",
  "pplx-space-build-mgr",
@@ -4935,6 +4937,7 @@ dependencies = [
  "aws-lc-rs",
  "base64 0.23.1",
  "jiff",
+ "pplx-space-accounts",
  "pplx-space-common-core",
  "pplx-space-env-vars",
  "serde",
@@ -5040,6 +5043,7 @@ dependencies = [
  "libc",
  "object",
  "oci-spec",
+ "pplx-space-accounts",
  "pplx-space-build-mgr-client",
  "pplx-space-common-core",
  "pplx-space-credmgr",
@@ -5205,6 +5209,7 @@ dependencies = [
  "jiff",
  "k8s-openapi",
  "kube",
+ "pplx-space-accounts",
  "pplx-space-api",
  "pplx-space-api-route",
  "pplx-space-aws-client",
@@ -5288,6 +5293,7 @@ dependencies = [
 name = "pplx-space-cluster-pool"
 version = "0.8.1"
 dependencies = [
+ "pplx-space-accounts",
  "pplx-space-common-core",
  "pplx-space-db-test-fixtures",
  "serde",
@@ -5303,6 +5309,7 @@ name = "pplx-space-cluster-reconciler"
 version = "0.8.1"
 dependencies = [
  "futures-util",
+ "pplx-space-accounts",
  "pplx-space-cluster-trigger-queue",
  "pplx-space-common-core",
  "pplx-space-common-grpc",
@@ -5326,6 +5333,7 @@ dependencies = [
 name = "pplx-space-cluster-trigger-queue"
 version = "0.8.1"
 dependencies = [
+ "pplx-space-accounts",
  "pplx-space-common-core",
  "pplx-space-db-test-fixtures",
  "pplx-space-metrics-emit",
@@ -5491,6 +5499,7 @@ dependencies = [
 name = "pplx-space-credential-injection-store"
 version = "0.8.1"
 dependencies = [
+ "pplx-space-accounts",
  "pplx-space-common-core",
  "pplx-space-credential-injection",
  "pplx-space-db-test-fixtures",
@@ -5560,6 +5569,7 @@ dependencies = [
  "kube",
  "lru 0.18.4",
  "nix 0.31.3",
+ "pplx-space-accounts",
  "pplx-space-common-core",
  "pplx-space-common-grpc",
  "pplx-space-credential-injection",
@@ -5671,6 +5681,7 @@ dependencies = [
  "hyper-util",
  "insta",
  "multer",
+ "pplx-space-accounts",
  "pplx-space-api-route",
  "pplx-space-bearer-token",
  "pplx-space-common-core",
@@ -5738,7 +5749,7 @@ version = "0.8.1"
 dependencies = [
  "bcrypt",
  "clap",
- "pplx-space-common-core",
+ "pplx-space-accounts",
  "pplx-space-common-jobs",
  "pplx-space-db-test-fixtures",
  "pplx-space-host-layout",
@@ -5773,6 +5784,7 @@ dependencies = [
 name = "pplx-space-db-test-fixtures"
 version = "0.8.1"
 dependencies = [
+ "pplx-space-accounts",
  "pplx-space-common-core",
  "pplx-space-env-vars",
  "pplx-space-test-env",
@@ -5899,6 +5911,7 @@ dependencies = [
 name = "pplx-space-federated-grant-store"
 version = "0.8.1"
 dependencies = [
+ "pplx-space-accounts",
  "pplx-space-common-core",
  "sqlx",
  "thiserror 2.0.20",
@@ -5910,7 +5923,7 @@ dependencies = [
 name = "pplx-space-federated-identity"
 version = "0.8.1"
 dependencies = [
- "pplx-space-common-core",
+ "pplx-space-accounts",
  "serde_json",
  "thiserror 2.0.20",
 ]
@@ -6066,6 +6079,7 @@ dependencies = [
  "insta",
  "k8s-openapi",
  "kube",
+ "pplx-space-accounts",
  "pplx-space-api-route",
  "pplx-space-auto-lifecycle-receipt",
  "pplx-space-cluster-pool",
@@ -6161,6 +6175,7 @@ dependencies = [
 name = "pplx-space-k8s-node-id"
 version = "0.8.1"
 dependencies = [
+ "pplx-space-accounts",
  "pplx-space-common-core",
  "uuid",
 ]
@@ -6324,6 +6339,7 @@ dependencies = [
  "metrics",
  "nix 0.31.3",
  "parking_lot",
+ "pplx-space-accounts",
  "pplx-space-api-route",
  "pplx-space-common-core",
  "pplx-space-common-grpc",
@@ -6504,6 +6520,7 @@ dependencies = [
  "http-body 1.1.0",
  "hyper-util",
  "kube",
+ "pplx-space-accounts",
  "pplx-space-api-route",
  "pplx-space-bearer-token",
  "pplx-space-build-mgr-client",
@@ -6638,6 +6655,7 @@ dependencies = [
  "insta",
  "k8s-openapi",
  "kube",
+ "pplx-space-accounts",
  "pplx-space-bearer-token",
  "pplx-space-common-core",
  "pplx-space-common-grpc",
@@ -6729,6 +6747,7 @@ dependencies = [
  "jiff",
  "libc",
  "nix 0.31.3",
+ "pplx-space-accounts",
  "pplx-space-btrfs",
  "pplx-space-common-core",
  "pplx-space-common-grpc",
@@ -6842,6 +6861,7 @@ dependencies = [
 name = "pplx-space-node-registration-store"
 version = "0.8.1"
 dependencies = [
+ "pplx-space-accounts",
  "pplx-space-common-core",
  "pplx-space-sql-locator",
  "sqlx",
@@ -6905,6 +6925,7 @@ dependencies = [
  "libc",
  "md-5 0.11.0",
  "nix 0.31.3",
+ "pplx-space-accounts",
  "pplx-space-common-core",
  "pplx-space-common-jobs",
  "pplx-space-execution-common",
@@ -6942,6 +6963,7 @@ version = "0.8.1"
 dependencies = [
  "clap",
  "comfy-table",
+ "pplx-space-accounts",
  "pplx-space-common-cli",
  "pplx-space-common-core",
  "pplx-space-node-runtime-manager-client",
@@ -7233,6 +7255,7 @@ dependencies = [
 name = "pplx-space-runtime-environment-catalog-store"
 version = "0.8.1"
 dependencies = [
+ "pplx-space-accounts",
  "pplx-space-common-core",
  "pplx-space-db-test-fixtures",
  "pplx-space-test-env",
@@ -7246,6 +7269,7 @@ dependencies = [
 name = "pplx-space-runtime-environment-policy-store"
 version = "0.8.1"
 dependencies = [
+ "pplx-space-accounts",
  "pplx-space-common-core",
  "pplx-space-db-test-fixtures",
  "pplx-space-test-env",
@@ -7277,6 +7301,7 @@ dependencies = [
 name = "pplx-space-sandbox-grpc"
 version = "0.8.1"
 dependencies = [
+ "pplx-space-accounts",
  "pplx-space-common-core",
  "pplx-space-common-grpc",
  "pplx-space-observability",
@@ -7300,6 +7325,7 @@ dependencies = [
  "base64 0.23.1",
  "insta",
  "k8s-openapi",
+ "pplx-space-accounts",
  "pplx-space-common-core",
  "pplx-space-env-vars",
  "pplx-space-net-common",
@@ -7316,6 +7342,7 @@ dependencies = [
 name = "pplx-space-sandbox-portability"
 version = "0.8.1"
 dependencies = [
+ "pplx-space-accounts",
  "pplx-space-common-core",
  "pplx-space-db-test-fixtures",
  "sqlx",
@@ -7327,6 +7354,7 @@ dependencies = [
 name = "pplx-space-sandbox-quarantine-store"
 version = "0.8.1"
 dependencies = [
+ "pplx-space-accounts",
  "pplx-space-common-core",
  "pplx-space-db-test-fixtures",
  "pplx-space-test-env",
@@ -7351,6 +7379,7 @@ version = "0.8.1"
 name = "pplx-space-sandbox-store"
 version = "0.8.1"
 dependencies = [
+ "pplx-space-accounts",
  "pplx-space-cluster-pool",
  "pplx-space-common-core",
  "pplx-space-db-test-fixtures",
@@ -7398,6 +7427,7 @@ dependencies = [
  "libc",
  "nix 0.31.3",
  "opentelemetry-proto",
+ "pplx-space-accounts",
  "pplx-space-api-route",
  "pplx-space-auto-lifecycle-receipt",
  "pplx-space-bearer-token",
@@ -7487,6 +7517,7 @@ dependencies = [
  "comfy-table",
  "jiff",
  "nix 0.31.3",
+ "pplx-space-accounts",
  "pplx-space-common-cli",
  "pplx-space-common-core",
  "pplx-space-host-layout",
@@ -7549,6 +7580,7 @@ dependencies = [
  "dashmap",
  "futures-util",
  "jiff",
+ "pplx-space-accounts",
  "pplx-space-auto-lifecycle-receipt",
  "pplx-space-common-core",
  "pplx-space-common-jobs",
@@ -7686,6 +7718,7 @@ name = "pplx-space-snapshot-store"
 version = "0.8.1"
 dependencies = [
  "jiff",
+ "pplx-space-accounts",
  "pplx-space-common-core",
  "pplx-space-db-test-fixtures",
  "pplx-space-sandbox-portability",
@@ -8115,6 +8148,7 @@ dependencies = [
  "hex",
  "jiff",
  "nix 0.31.3",
+ "pplx-space-accounts",
  "pplx-space-btrfs",
  "pplx-space-common-core",
  "pplx-space-common-grpc",
@@ -8363,6 +8397,7 @@ dependencies = [
  "futures-util",
  "insta",
  "nix 0.31.3",
+ "pplx-space-accounts",
  "pplx-space-common-core",
  "pplx-space-common-grpc",
  "pplx-space-common-jobs",
@@ -8426,6 +8461,7 @@ dependencies = [
  "hex",
  "hyper-util",
  "insta",
+ "pplx-space-accounts",
  "pplx-space-common-core",
  "pplx-space-common-grpc",
  "pplx-space-common-proto-build",

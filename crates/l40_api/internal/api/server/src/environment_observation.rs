@@ -11,7 +11,8 @@
 //! or legacy report says nothing about environments and leaves both alone;
 //! the arrays then age out by their own receipt.
 
-use pplx_space_common_core::types::{ArtifactComponentKind, NodeId};
+use pplx_space_accounts::NodeId;
+use pplx_space_common_core::types::ArtifactComponentKind;
 use pplx_space_execution_common::environment::{EnvironmentObservation, KnownEnvironment};
 use pplx_space_execution_common::proto::NodeExecutionInventory;
 use pplx_space_runtime_environment_catalog_store::{

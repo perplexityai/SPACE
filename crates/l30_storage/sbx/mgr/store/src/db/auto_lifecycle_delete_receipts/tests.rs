@@ -1,12 +1,13 @@
 use std::collections::BTreeMap;
 
 use crate::db::{Connection, OptionalExtension};
+use pplx_space_accounts::SandboxOwner;
 use pplx_space_auto_lifecycle_receipt::AutoLifecyclePolicyFingerprint;
 use pplx_space_common_core::types::{
     AutoLifecycleConditionSet, AutoLifecycleConditionSetId, AutoLifecycleDeleteReceiptId,
     AutoLifecycleIdleAction, AutoLifecyclePolicy, AutoLifecycleStage, AutoLifecycleWakePolicy,
     ExecutionGeneration, NodeManagedBy, NodeRole, RuntimeKind, SandboxActivationAttemptId,
-    SandboxId, SandboxOwner, SandboxRuntimeLabel, SpaceApiRouteIdentity,
+    SandboxId, SandboxRuntimeLabel, SpaceApiRouteIdentity,
 };
 use pplx_space_policy_authority::PolicyAuthority;
 

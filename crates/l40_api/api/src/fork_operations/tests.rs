@@ -1,5 +1,6 @@
-use pplx_space_common_core::types::OrgId;
-use pplx_space_common_core::types::{SnapshotId, UserId};
+use pplx_space_accounts::OrgId;
+use pplx_space_accounts::UserId;
+use pplx_space_common_core::types::SnapshotId;
 
 use pplx_space_db_test_fixtures::try_pg_test_db;
 use sqlx::types::Json;

@@ -16,8 +16,9 @@
 
 use std::collections::BTreeSet;
 
+use pplx_space_accounts::NodeId;
 use pplx_space_common_core::sql;
-use pplx_space_common_core::types::{DigestParseError, EnvironmentReference, NodeId};
+use pplx_space_common_core::types::{DigestParseError, EnvironmentReference};
 
 mod certifications;
 pub use certifications::{

@@ -32,7 +32,7 @@
 //!
 //! Every step is idempotent so re-runs after a retry / restart are safe.
 
-use pplx_space_common_core::types::JobId;
+use pplx_space_accounts::JobId;
 
 use std::time::{Duration, Instant};
 

@@ -11,5 +11,6 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+pplx-space-accounts = { workspace = true }
 pplx-space-common-core = { workspace = true }
 uuid = { workspace = true, features = ["v5"] }

@@ -1,7 +1,8 @@
 use super::{NetworkPolicyV1, TemplateRow};
+use pplx_space_accounts::OrgId;
 use pplx_space_common_core::{
     sql,
-    types::{OrgId, TemplateDesiredState, TemplateId, TemplateVisibility},
+    types::{TemplateDesiredState, TemplateId, TemplateVisibility},
 };
 use sqlx::{PgExecutor, types::Json};
 

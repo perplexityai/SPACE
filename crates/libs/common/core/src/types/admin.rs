@@ -16,7 +16,8 @@
 
 #![cfg(feature = "serde")]
 
-use super::{NodeAddress, NodeDrainMode, NodeId, NodeManagedBy, NodeRole};
+use super::{NodeAddress, NodeDrainMode, NodeManagedBy, NodeRole};
+use pplx_space_accounts::NodeId;
 use serde::{Deserialize, Serialize};
 
 use crate::types::node_group::{NodeGroupName, NodeGroupTemplatePolicy};
@@ -613,7 +614,7 @@ impl DrainRequest {
 ///   for the reconciler's per-tick promotion to pick them up.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ForceUploadLocalSnapshotsResponse {
-    pub node_id: crate::types::NodeId,
+    pub node_id: pplx_space_accounts::NodeId,
     pub reuploaded: Vec<crate::types::SandboxId>,
     pub failed: Vec<ForceUploadFailure>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -690,7 +691,7 @@ pub struct AdminNodeGroupResponse {
     pub id: crate::types::NodeGroupId,
     pub name: NodeGroupName,
     /// `None` ⇒ generic (shared) group; `Some` ⇒ dedicated group for that org.
-    pub org_id: Option<crate::types::OrgId>,
+    pub org_id: Option<pplx_space_accounts::OrgId>,
     pub template_policy: NodeGroupTemplatePolicy,
     pub is_default: bool,
     pub created_at: String,
@@ -721,7 +722,7 @@ pub struct CreateNodeGroupRequest {
     /// Omit (or `null`) to create a generic group; set to create a group
     /// dedicated to that org.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub org_id: Option<crate::types::OrgId>,
+    pub org_id: Option<pplx_space_accounts::OrgId>,
     /// Defaults to `default`. `restricted` is only legal for org-owned
     /// groups.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -742,7 +743,7 @@ pub struct CreateNodeGroupRequest {
 #[serde(deny_unknown_fields)]
 pub struct AssignOrgRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub org_id: Option<crate::types::OrgId>,
+    pub org_id: Option<pplx_space_accounts::OrgId>,
 }
 
 /// JSON body for `PUT /admin/api/v1/node-groups/{id}/template-policy`.
@@ -772,7 +773,7 @@ pub struct SetCompatRequest {
 pub struct SetTemplateVisibilityRequest {
     pub visibility: TemplateVisibility,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub org_id: Option<crate::types::OrgId>,
+    pub org_id: Option<pplx_space_accounts::OrgId>,
 }
 
 /// Response shape for `PUT /admin/api/v1/templates/{name}:visibility`.
@@ -780,7 +781,7 @@ pub struct SetTemplateVisibilityRequest {
 pub struct AdminTemplateVisibilityResponse {
     pub name: String,
     pub visibility: TemplateVisibility,
-    pub org_id: Option<crate::types::OrgId>,
+    pub org_id: Option<pplx_space_accounts::OrgId>,
     /// Compat allowlist rows removed by a narrowing flip: rows that listed
     /// this template in groups not owned by the new owning org became
     /// illegal (the hard cross-org rule) and were pruned in the same

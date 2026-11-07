@@ -1,6 +1,7 @@
 //! API-key authorization for the ECW data-plane resolver.
 
-use pplx_space_common_core::{sql, types::OrgId};
+use pplx_space_accounts::OrgId;
+use pplx_space_common_core::sql;
 
 pub(super) async fn authorizes_ecw_sandbox(
     executor: impl sqlx::PgExecutor<'_>,

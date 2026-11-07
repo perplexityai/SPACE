@@ -1,10 +1,8 @@
 //! System publication grants are matched to the authorization carried by one
 //! build, never selected from other submissions for the same template.
 
-use pplx_space_common_core::{
-    sql,
-    types::{SystemPublicationGrantId, TemplateName},
-};
+use pplx_space_accounts::SystemPublicationGrantId;
+use pplx_space_common_core::{sql, types::TemplateName};
 use sqlx::PgExecutor;
 
 #[derive(Debug, thiserror::Error)]

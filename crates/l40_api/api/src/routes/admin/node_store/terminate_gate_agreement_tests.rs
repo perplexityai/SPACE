@@ -15,8 +15,8 @@
 //! the pre-change predicate disagreed. Without the second half these would
 //! pass just as well against the statement they replaced.
 
+use pplx_space_accounts::NodeId;
 use pplx_space_common_core::sql;
-use pplx_space_common_core::types::NodeId;
 use pplx_space_db_test_fixtures::try_pg_test_db;
 use pplx_space_sandbox_portability::{
     drain_gate_blockers_for_node, inflight_suspend_upload_from_node_exists,

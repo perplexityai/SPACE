@@ -9,7 +9,7 @@
 //! [`super::KubeAnnotationLookup`]; the wiring only constructs it on the
 //! `SPACE_NODE_DRAIN_TERMINATOR_KIND=aws` deploy.
 
-use pplx_space_common_core::types::NodeId;
+use pplx_space_accounts::NodeId;
 
 use pplx_space_common_core::sql;
 use std::future::Future;

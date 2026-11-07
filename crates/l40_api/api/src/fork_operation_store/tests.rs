@@ -1,4 +1,5 @@
-use pplx_space_common_core::types::{LocalArtifactId, OrgId, SandboxId, SnapshotId, UserId};
+use pplx_space_accounts::{OrgId, UserId};
+use pplx_space_common_core::types::{LocalArtifactId, SandboxId, SnapshotId};
 
 use super::*;
 use crate::fork_operations::{ForkRequest, ForkTargetConfig};

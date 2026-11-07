@@ -5,9 +5,8 @@ use crate::service::recovery_cross_node::{
     insert_restoring_sandbox_row_from_snapshot, transition_restored_sandbox_to_suspended,
 };
 
-use pplx_space_common_core::types::{
-    DEFAULT_GUEST_USER, SandboxOwner, SandboxOwnerKind, TEMPLATE_MANAGER_SANDBOX_OWNER,
-};
+use pplx_space_accounts::{SandboxOwner, SandboxOwnerKind, TEMPLATE_MANAGER_SANDBOX_OWNER};
+use pplx_space_common_core::types::DEFAULT_GUEST_USER;
 
 fn snapshot_meta_with_sandbox(
     sandbox: Option<crate::snapshot_upload::SnapshotSandbox>,
@@ -3369,7 +3368,7 @@ fn insert_quarantined_orphan(conn: &crate::db::Connection, sandbox_id: &str) {
          pool_template = NULL, process_env_json = '{}' WHERE id = ?3",
         crate::db::fixture::params![
             pplx_space_common_core::types::ORPHANED_SANDBOX_TEMPLATE,
-            pplx_space_common_core::types::ORPHANED_SANDBOX_OWNER.as_str(),
+            pplx_space_accounts::ORPHANED_SANDBOX_OWNER.as_str(),
             sandbox_id
         ],
     )

@@ -22,7 +22,8 @@
 //! and DELETE, kube node-sync upserts the row and bumps the UID. The DELETE
 //! refuses to act if the UID has moved.
 
-use pplx_space_common_core::types::{NodeId, SubstrateKind};
+use pplx_space_accounts::NodeId;
+use pplx_space_common_core::types::SubstrateKind;
 
 use pplx_space_common_core::sql;
 use sqlx::PgPool;

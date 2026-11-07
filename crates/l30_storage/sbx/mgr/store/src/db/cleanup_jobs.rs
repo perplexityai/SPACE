@@ -1,5 +1,5 @@
 //! Scheduling references existing cleanup authority and commits with its claim.
-use pplx_space_common_core::types::JobId;
+use pplx_space_accounts::JobId;
 
 use super::*;
 use pplx_space_common_jobs::{JobPriority, JobStatus, db as jobs};

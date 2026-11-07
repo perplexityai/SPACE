@@ -16,9 +16,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use pplx_space_common_core::types::{
-    MemorySize, NodePoolName, ROOT_SANDBOX_OWNER, SandboxOwner, TemplateReference, VcpuCount,
-};
+use pplx_space_accounts::{ROOT_SANDBOX_OWNER, SandboxOwner};
+use pplx_space_common_core::types::{MemorySize, NodePoolName, TemplateReference, VcpuCount};
 use pplx_space_policy_authority::PolicyAuthority;
 
 pub mod placement;
@@ -505,8 +504,8 @@ pub struct SandboxPodCommon<'a> {
 #[derive(Debug, Clone, Copy)]
 pub struct SandboxRuntimePodMetadata<'a> {
     pub sandbox_owner: &'a SandboxOwner,
-    pub user_id: pplx_space_common_core::types::UserId,
-    pub org_id: pplx_space_common_core::types::OrgId,
+    pub user_id: pplx_space_accounts::UserId,
+    pub org_id: pplx_space_accounts::OrgId,
     pub auto_lifecycle_json: &'a str,
     pub auto_lifecycle_authority: PolicyAuthority,
     pub network_policy_json: &'a str,

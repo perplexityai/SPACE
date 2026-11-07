@@ -1,8 +1,9 @@
 use std::collections::BTreeMap;
 
+use pplx_space_accounts::{NodeId, OrgId, UserId};
 use pplx_space_common_core::{
     sql,
-    types::{AutoLifecyclePolicy, DiskIoLimits, NodeId, OrgId, SandboxId, UserId},
+    types::{AutoLifecyclePolicy, DiskIoLimits, SandboxId},
 };
 use sqlx::types::JsonValue;
 use uuid::Uuid;

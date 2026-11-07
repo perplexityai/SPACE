@@ -32,7 +32,8 @@
 //! - R10 `r10_newer_non_suspend_snapshot_blocks_marker_clear`
 //! - R11 `r11_direct_rows_do_not_bound_the_sweep_or_get_listed`
 
-use pplx_space_common_core::types::{NodeId, SandboxId};
+use pplx_space_accounts::NodeId;
+use pplx_space_common_core::types::SandboxId;
 
 use std::collections::BTreeMap;
 use std::sync::Mutex as StdMutex;
@@ -573,7 +574,8 @@ mod postgres_backed {
 
     use super::*;
     use crate::suspended_execution_reaper::store::ExecutionDbStore;
-    use pplx_space_common_core::types::{LocalArtifactId, NodeId, SandboxId, SnapshotId};
+    use pplx_space_accounts::NodeId;
+    use pplx_space_common_core::types::{LocalArtifactId, SandboxId, SnapshotId};
     use pplx_space_db_test_fixtures::{SEED_ORG_ID, SEED_USER_ID, try_pg_test_db};
     use sqlx::PgPool;
 

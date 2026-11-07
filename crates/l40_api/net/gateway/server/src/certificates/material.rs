@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use http::{HeaderName, HeaderValue};
 use jiff::Timestamp;
-use pplx_space_common_core::types::CredentialReferenceId;
+use pplx_space_accounts::CredentialReferenceId;
 use pplx_space_net_common::{DomainName, NetworkCredentialHttpMethodV1, NetworkPolicyV1};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::sign::CertifiedKey;

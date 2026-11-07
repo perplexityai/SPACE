@@ -782,10 +782,10 @@ pub(super) fn build_detail_sandbox(
 
     Ok(SandboxDetailE2b {
         ownership: match sandbox.owner_source {
-            pplx_space_common_core::types::SandboxOwnerSource::Local => {
+            pplx_space_accounts::SandboxOwnerSource::Local => {
                 crate::e2b::schema::SandboxOwnershipE2b::Local
             }
-            pplx_space_common_core::types::SandboxOwnerSource::FederatedIdentity => {
+            pplx_space_accounts::SandboxOwnerSource::FederatedIdentity => {
                 let invalid = || E2bApiError::internal("Invalid sandbox ownership");
                 crate::e2b::schema::SandboxOwnershipE2b::FederatedIdentity {
                     issuer: sandbox

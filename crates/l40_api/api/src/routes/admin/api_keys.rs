@@ -4,7 +4,7 @@ use axum::{
     http::{StatusCode, header},
     response::{IntoResponse, Response},
 };
-use pplx_space_common_core::types::{ApiKeyId, OrgId, UserId};
+use pplx_space_accounts::{ApiKeyId, OrgId, UserId};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 

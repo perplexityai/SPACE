@@ -84,9 +84,10 @@ use pplx_space_common_core::sql;
 use pplx_space_postgres_pool::contention;
 use std::{fmt, time::Duration};
 
+use pplx_space_accounts::NodeId;
 use pplx_space_common_core::types::{
     ArtifactOrigin, AutoLifecyclePolicy, ExecutionGeneration, ExecutionGenerationParseError,
-    NodeId, NodeManagedBy, NodeRole as SpaceNodeRole, PodUid, PodUidParseError, RouteGeneration,
+    NodeManagedBy, NodeRole as SpaceNodeRole, PodUid, PodUidParseError, RouteGeneration,
     RouteGenerationParseError, SandboxActivationAttemptId, SandboxId, SandboxLifecycle,
     SandboxRouteIdentity, SandboxRouteIdentityInvariantError, SubstrateKind,
 };
@@ -394,7 +395,7 @@ enum DirectRouteIdentityReceiptError {
     #[error("node-api returned invalid direct route identity: missing current_node_id")]
     MissingCurrentNodeId,
     #[error("node-api returned invalid direct route identity: invalid current_node_id: {0}")]
-    InvalidCurrentNodeId(#[source] pplx_space_common_core::types::AuthIdParseError),
+    InvalidCurrentNodeId(#[source] pplx_space_accounts::AuthIdParseError),
     #[error("node-api returned invalid direct route identity: missing execution_generation")]
     MissingExecutionGeneration,
     #[error("node-api returned invalid direct route identity: {0}")]

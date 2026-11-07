@@ -8,8 +8,9 @@ use pplx_space_common_core::sql;
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
 
+use pplx_space_accounts::NodeId;
 use pplx_space_common_core::types::{
-    NodeAddress, NodeDrainMode, NodeDrainPhase, NodeDrainState, NodeGroupId, NodeId, NodeManagedBy,
+    NodeAddress, NodeDrainMode, NodeDrainPhase, NodeDrainState, NodeGroupId, NodeManagedBy,
     NodeRole, SandboxId,
     admin::{AdminNodeCtlStatus, AdminNodeServiceHealth, ListAdminNodesFilters},
 };

@@ -1,7 +1,8 @@
 //! Direct Postgres reads for sandbox-owner resolution. Runs as the read-only
 //! `space_credmgr` role.
 
-use pplx_space_common_core::types::{OrgId, SandboxId, UserId};
+use pplx_space_accounts::{OrgId, UserId};
+use pplx_space_common_core::types::SandboxId;
 
 use pplx_space_sql_locator::sql;
 

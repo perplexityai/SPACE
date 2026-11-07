@@ -293,7 +293,10 @@ const VOLUME_WRAP_AAD_PREFIX: &[u8] = b"space-rootfs-vol/v1";
 /// (vol-mgr, today) and the consumer (node-mgr, which opens the dm-crypt
 /// volumes) derive the identical AAD without persisting it. This is the single
 /// source of truth for that AAD across services; do not re-derive it locally.
-pub fn volume_wrap_aad(org_id: super::OrgId, sandbox_id: &super::SandboxId) -> Vec<u8> {
+pub fn volume_wrap_aad(
+    org_id: pplx_space_accounts::OrgId,
+    sandbox_id: &super::SandboxId,
+) -> Vec<u8> {
     let mut out = Vec::with_capacity(VOLUME_WRAP_AAD_PREFIX.len() + 1 + 16 + 16);
     out.extend_from_slice(VOLUME_WRAP_AAD_PREFIX);
     out.push(0);

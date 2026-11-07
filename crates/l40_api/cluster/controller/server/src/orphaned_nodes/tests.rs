@@ -25,7 +25,7 @@
 //! - `placement_gate_blocks_on_each_pinning_column_independently`
 //! - `direct_nodes_are_neither_candidates_nor_deleted`
 
-use pplx_space_common_core::types::NodeId;
+use pplx_space_accounts::NodeId;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};

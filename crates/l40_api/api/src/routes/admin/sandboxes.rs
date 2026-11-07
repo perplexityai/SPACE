@@ -8,7 +8,8 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
 };
-use pplx_space_common_core::types::{IdempotencyKey, NodePoolName, OrgId, SandboxId, UserId};
+use pplx_space_accounts::{OrgId, UserId};
+use pplx_space_common_core::types::{IdempotencyKey, NodePoolName, SandboxId};
 use pplx_space_env_vars::env_flag_var;
 use pplx_space_public_api::{
     CreateSandboxRequest as PublicCreateSandboxRequest, OperationId, OperationKind,

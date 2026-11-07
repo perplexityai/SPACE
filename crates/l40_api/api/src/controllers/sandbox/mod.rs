@@ -3,13 +3,14 @@ use crate::metrics::sandbox::api::{
     ReconnectTerminalPhase, SandboxApiMetricIdentity, SandboxApiSurface,
 };
 use futures_core::Stream;
+use pplx_space_accounts::{Email, NodeId, OrgId};
 use pplx_space_common_core::sql;
 #[cfg(test)]
 use pplx_space_common_core::types::AutoLifecycleRuntimeState;
 use pplx_space_common_core::types::{
-    AutoLifecyclePolicy, DEFAULT_TEMPLATE_TAG, Email, EnvMap, EnvSanitizationIssue, NodeId, OrgId,
-    RuntimeKind, SandboxAutoLifecyclePatch, SandboxId, SandboxLifecycle, SemVer,
-    TemplateDesiredState, TemplateName, TemplateReference, TemplateTag, TemplateVisibility,
+    AutoLifecyclePolicy, DEFAULT_TEMPLATE_TAG, EnvMap, EnvSanitizationIssue, RuntimeKind,
+    SandboxAutoLifecyclePatch, SandboxId, SandboxLifecycle, SemVer, TemplateDesiredState,
+    TemplateName, TemplateReference, TemplateTag, TemplateVisibility,
 };
 use pplx_space_net_common::{NetworkPolicy, NetworkPolicyV1, proto::NetworkPolicySource};
 use pplx_space_node_mgr_client::proto::{AllowPortRequest, ExposePortRequest, NetworkProtocol};
@@ -1067,7 +1068,7 @@ pub struct SandboxController {
     pub(crate) egress_profiles: crate::egress_profiles::EgressProfiles,
     tls_interception_exemptions:
         Option<crate::tls_interception_exemptions::TlsInterceptionExemptions>,
-    federated_grant_audience: pplx_space_common_core::types::FederatedGrantAudience,
+    federated_grant_audience: pplx_space_accounts::FederatedGrantAudience,
     substrate: Substrate,
     feature_flags: pplx_space_feature_flags::FeatureFlagClient,
     cluster_admission: Option<std::sync::Arc<crate::cluster_admission::ClusterSandboxAdmission>>,
@@ -1113,7 +1114,7 @@ impl SandboxController {
 
     pub fn with_federated_grant_audience(
         mut self,
-        audience: pplx_space_common_core::types::FederatedGrantAudience,
+        audience: pplx_space_accounts::FederatedGrantAudience,
     ) -> Self {
         self.federated_grant_audience = audience;
         self

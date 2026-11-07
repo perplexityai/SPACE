@@ -1402,7 +1402,7 @@ async fn a_database_holding_a_recorded_capture_reopens_at_startup() {
         crate::db::fixture::params![artifact_dir.to_str().unwrap(), staged.to_string()],
     )
     .unwrap();
-    let upload: pplx_space_common_core::types::JobId =
+    let upload: pplx_space_accounts::JobId =
         "019d84bd-280d-7331-99c6-000000000003".parse().unwrap();
     jobs::insert_job(
         conn.raw(),

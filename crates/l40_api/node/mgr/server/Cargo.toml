@@ -49,6 +49,7 @@ futures-util = { workspace = true }
 zeroize = { workspace = true }
 
 # internal
+pplx-space-accounts = { workspace = true }
 pplx-space-common-core = { workspace = true }
 pplx-space-btrfs = { workspace = true }
 pplx-space-host-layout = { workspace = true }

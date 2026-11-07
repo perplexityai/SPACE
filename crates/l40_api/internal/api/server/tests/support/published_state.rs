@@ -1,6 +1,7 @@
 //! Fixtures shared by public publication behavior tests and private unit tests.
 
-use pplx_space_common_core::types::{LocalArtifactId, NodeId, SandboxId, SnapshotId};
+use pplx_space_accounts::NodeId;
+use pplx_space_common_core::types::{LocalArtifactId, SandboxId, SnapshotId};
 use pplx_space_common_core::{
     sql,
     types::{Arch, ExecutionMetadata},

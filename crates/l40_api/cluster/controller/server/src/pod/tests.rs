@@ -1,5 +1,6 @@
-use pplx_space_common_core::types::UserId;
-use pplx_space_common_core::types::{OrgId, SandboxId};
+use pplx_space_accounts::OrgId;
+use pplx_space_accounts::UserId;
+use pplx_space_common_core::types::SandboxId;
 use uuid::Uuid;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -7,10 +8,11 @@ use std::str::FromStr;
 
 use k8s_openapi::api::core::v1::{NodeSelectorRequirement, PodCondition, PodSpec, PodStatus};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
+use pplx_space_accounts::SandboxOwner;
 use pplx_space_cluster_pool::{PoolSlot, PoolSlotState};
 use pplx_space_common_core::types::{
     ContentHash, Digest, MemorySize, NodeGroup, NodeGroupId, NodeGroupName, NodeGroupPolicy,
-    SandboxOwner, TemplateCompatSpec, TemplateName, TemplateVisibility, VcpuCount,
+    TemplateCompatSpec, TemplateName, TemplateVisibility, VcpuCount,
 };
 use pplx_space_policy_authority::PolicyAuthority;
 use pplx_space_sandbox_pod::{

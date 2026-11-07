@@ -4,7 +4,7 @@ use std::str::FromStr;
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
-use crate::types::auth::OrgId;
+use pplx_space_accounts::OrgId;
 
 /// Wire spelling for [`TemplateVisibility::Generic`].
 const TEMPLATE_VISIBILITY_GENERIC: &str = "generic";
@@ -102,7 +102,8 @@ impl TemplateVisibility {
     /// # Examples
     ///
     /// ```rust
-    /// # use pplx_space_common_core::types::{OrgId, TemplateVisibility};
+    /// # use pplx_space_accounts::OrgId;
+    /// # use pplx_space_common_core::types::TemplateVisibility;
     /// let owner = OrgId::new();
     /// let stranger = OrgId::new();
     /// assert!(TemplateVisibility::Generic.permits(None, stranger));

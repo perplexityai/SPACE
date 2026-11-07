@@ -1,4 +1,4 @@
-use pplx_space_common_core::types::JobId;
+use pplx_space_accounts::JobId;
 use pplx_space_common_core::types::LocalArtifactId;
 
 use super::*;

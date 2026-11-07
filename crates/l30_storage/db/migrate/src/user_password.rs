@@ -1,5 +1,5 @@
 use clap::Parser;
-use pplx_space_common_core::types::Email;
+use pplx_space_accounts::Email;
 use pplx_space_sql_locator::sql;
 use sqlx::{PgPool, postgres::PgPoolOptions};
 

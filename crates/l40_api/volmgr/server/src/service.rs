@@ -1,4 +1,4 @@
-use pplx_space_common_core::types::JobId;
+use pplx_space_accounts::JobId;
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -8,10 +8,11 @@ use std::time::Duration;
 use crate::artifact::{ArtifactEntryRole, ArtifactId};
 use crate::crypto::wrap_aad;
 use crate::materialization::MaterializationMode;
+use pplx_space_accounts::OrgId;
+use pplx_space_common_core::types::{KekProvider, MasterKeyIdentifier};
 use pplx_space_common_core::types::{
     SnapshotArtifact, StorageUri, SubjectId, TransferScopeId, parse_snapshot_object_key,
 };
-use pplx_space_common_core::{types::KekProvider, types::MasterKeyIdentifier, types::OrgId};
 use pplx_space_common_jobs::{
     BackgroundWorker, JobExecutor, JobFailure, JobFailureReason, JobPriority, PriorityBand,
     WorkerConfig,

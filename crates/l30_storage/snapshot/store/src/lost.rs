@@ -1,7 +1,8 @@
 //! Guarded snapshot writes for sandboxes given up as lost because the node
 //! holding their only copy is gone.
 
-use pplx_space_common_core::types::{NodeId, SandboxId};
+use pplx_space_accounts::NodeId;
+use pplx_space_common_core::types::SandboxId;
 
 use std::time::Duration;
 

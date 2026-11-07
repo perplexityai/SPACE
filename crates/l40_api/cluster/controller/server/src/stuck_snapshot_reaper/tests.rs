@@ -17,7 +17,8 @@
 //! - R5 `r5_recent_attempt_heartbeat_protects_old_row`
 //! - R6 `r6_stale_attempt_heartbeat_reaped`
 
-use pplx_space_common_core::types::{NodeId, SandboxId, SnapshotId};
+use pplx_space_accounts::NodeId;
+use pplx_space_common_core::types::{SandboxId, SnapshotId};
 
 use std::sync::Mutex as StdMutex;
 use std::time::Duration;

@@ -1,4 +1,4 @@
-use pplx_space_common_core::types::NodeId;
+use pplx_space_accounts::NodeId;
 
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};

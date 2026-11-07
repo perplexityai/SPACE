@@ -19,9 +19,8 @@
 //! store and the filesystem layer respectively, not folded into a
 //! single "encryption" type here.
 
-use pplx_space_common_core::types::{
-    KekProvider, MasterKeyIdentifier, OrgId, StorageUri, SubjectId,
-};
+use pplx_space_accounts::OrgId;
+use pplx_space_common_core::types::{KekProvider, MasterKeyIdentifier, StorageUri, SubjectId};
 use pplx_space_credmgr_client::{
     AWS_CREDENTIALS_TOKEN_TYPE, STORAGE_READ_SCOPE, STORAGE_SESSION_TTL_SECONDS,
     STORAGE_TOKEN_AUDIENCE, STORAGE_WRITE_SCOPE, SUBJECT_ID_TOKEN_TYPE, TOKEN_EXCHANGE_GRANT_TYPE,

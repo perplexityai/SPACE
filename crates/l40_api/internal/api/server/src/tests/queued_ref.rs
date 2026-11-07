@@ -1,7 +1,8 @@
 //! A queued `node_reconcile_queue` ref that a reconciler claimed after two
 //! failures, for the tests that pin what each internal-api enqueue does to it.
 
-use pplx_space_common_core::{sql, types::NodeId};
+use pplx_space_accounts::NodeId;
+use pplx_space_common_core::sql;
 use pplx_space_test_env::TestResult;
 
 /// The synthetic caller context the enqueues under test run in.

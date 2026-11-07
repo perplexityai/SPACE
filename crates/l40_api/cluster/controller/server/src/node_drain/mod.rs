@@ -175,7 +175,7 @@
 //! `SandboxState` respectively, validated at the proto boundary, no
 //! new 2-variant enums introduced.
 
-use pplx_space_common_core::types::NodeId;
+use pplx_space_accounts::NodeId;
 use pplx_space_common_core::types::SandboxId;
 
 use std::collections::{HashMap, HashSet};

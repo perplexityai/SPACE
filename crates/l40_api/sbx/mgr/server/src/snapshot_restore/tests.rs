@@ -31,7 +31,7 @@ fn btrfs_disk_restore_stages_only_the_rootfs_diff() {
 fn quarantine_recovery_plan_request_names_the_node_from_the_node_id_file() {
     let dir = tempfile::tempdir().unwrap();
     let node_id_path = dir.path().join("node-id");
-    let node_id = pplx_space_common_core::types::NodeId::new().to_string();
+    let node_id = pplx_space_accounts::NodeId::new().to_string();
     std::fs::write(&node_id_path, format!("{node_id}\n")).unwrap();
 
     let request = quarantine_recovery_plan_request(
