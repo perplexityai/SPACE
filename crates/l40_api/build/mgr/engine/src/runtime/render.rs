@@ -1,5 +1,5 @@
 //! Compile restricted app data into systemd syntax; no tenant text is shell code.
-use pplx_space_common_core::types::{RuntimeReadiness, TemplateRuntime};
+use pplx_space_template_runtime::{RuntimeReadiness, TemplateRuntime};
 use std::collections::BTreeMap;
 use std::io::{self, Read};
 

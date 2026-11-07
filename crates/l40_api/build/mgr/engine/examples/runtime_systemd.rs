@@ -2,7 +2,7 @@
 //! Run the emitted test.sh only in a container with private cgroups and no host mounts.
 #[path = "../src/runtime/render.rs"]
 mod render;
-use pplx_space_common_core::types::TemplateRuntime;
+use pplx_space_template_runtime::TemplateRuntime;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let directory = std::path::PathBuf::from(

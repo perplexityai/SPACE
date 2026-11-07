@@ -139,7 +139,7 @@ fn firecracker_retains_balloon_network_and_console_configuration() {
         let args = config["boot-source"]["boot_args"].as_str().unwrap();
         assert!(args.contains("8250.nr_uarts=1 console=ttyS0"));
         assert!(args.contains("clocksource=kvm-clock"));
-        assert!(args.contains(pplx_space_common_core::types::TEMPLATE_RUNTIME_BUILD_MASK));
+        assert!(args.contains(pplx_space_template_runtime::TEMPLATE_RUNTIME_BUILD_MASK));
         assert_eq!(config["machine-config"]["huge_pages"], "2M");
         assert_eq!(
             config["balloon"]["free_page_hinting"],
