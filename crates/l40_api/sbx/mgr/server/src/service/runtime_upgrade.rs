@@ -24,6 +24,22 @@
 //! Every phase is persisted, so a retry of the same operation, or the recovery
 //! loop after a restart, resumes from the row: an interrupted upgrade rolls
 //! back, and a verified one finishes its retirement.
+//!
+//! On Kubernetes the request comes from a pod's shim, whose start names the
+//! pod (`route_identity.pod_uid`), and a failed create leaves the pod
+//! pending while kubelet retries it under the same pod UID. So a rollback,
+//! or a refusal before anything was fenced that no retry can change, is
+//! final for the pod it was recorded for: a retry from the same pod UID gets
+//! the recorded failure back and never fences or boots again, even after a
+//! later pod's outcome replaces it as the operation's reported one, and only
+//! a retry from a new pod, or from a caller that names none, starts over. A
+//! transient refusal (the node busy or failing) is left unrecorded, so
+//! kubelet's retry from the same pod tries again. The control plane settles on
+//! such an outcome only when it names the pod it's waiting on, then deletes
+//! that pod, so its own retry gets a new one. An upgraded or already-on-target
+//! outcome is answered for any pod as before, but a started target's create
+//! that fails after it is recorded as refused for that pod, final for it the
+//! same way (see `rpc`).
 
 use std::time::Duration;
 
@@ -69,6 +85,20 @@ pub(super) fn refuse_runtime_upgrade_fence_in(
         )),
         None => Ok(()),
     }
+}
+
+/// The unretired runtime upgrade of `sandbox_id` that must leave it
+/// `stopped`, if one exists. Between its verified boot and its retirement the
+/// sandbox runs, unfenced, while the upgrade waits to stop it; a suspend in
+/// that window would leave it `suspended`, which the upgrade never reports
+/// and the stopped disk backup that follows it refuses.
+pub(super) fn unretired_stay_stopped_upgrade(
+    db: &crate::db::Connection,
+    sandbox_id: &str,
+) -> Result<Option<RuntimeUpgradeOperationId>, Status> {
+    let read_failed =
+        |error: crate::db::Error| Status::unavailable(format!("read runtime upgrade: {error}"));
+    crate::db::read::unretired_stay_stopped_runtime_upgrade(db, sandbox_id).map_err(read_failed)
 }
 
 /// The status an activation returns when it can't claim the sandbox.
@@ -161,6 +191,16 @@ impl RuntimeUpgradeRequest {
         }
     }
 
+    /// The pod the request's start names, if any: the pod UID a pod's shim
+    /// sends in its route identity.
+    fn pod_uid(&self) -> Option<&str> {
+        self.start
+            .route_identity
+            .as_ref()
+            .and_then(|identity| identity.pod_uid.as_deref())
+            .filter(|uid| !uid.is_empty())
+    }
+
     fn names_another(&self) -> Status {
         Status::invalid_argument(format!(
             "runtime upgrade {} names a different sandbox, target or authorization",
@@ -198,6 +238,28 @@ pub(super) fn require_decided_checkpoint(
         )));
     }
     Ok(())
+}
+
+/// Whether a refusal before the fence answers every retry of the same
+/// request the same way, so it may be final for the pod that sent it: the
+/// request contradicts what the node recorded or holds (FAILED_PRECONDITION:
+/// the checkpoint, the edge, the authorization, its local disk), or is
+/// malformed (INVALID_ARGUMENT). Every other code says the node was busy or
+/// failed, or the sandbox was in a state it may yet leave (ABORTED for one
+/// an upgrade can't start from), and a retry may succeed.
+fn refusal_is_final(refusal: &Status) -> bool {
+    matches!(
+        refusal.code(),
+        tonic::Code::FailedPrecondition | tonic::Code::InvalidArgument
+    )
+}
+
+/// What [`RuntimeUpgrader::fence`] decided.
+enum Fence {
+    /// The sandbox is fenced for the boot, with what its disk recorded.
+    Fenced(Box<(RuntimeUpgradeRecord, LocalDisk)>),
+    /// The sandbox is already on the target; nothing was fenced.
+    AlreadyOnTarget,
 }
 
 /// How [`RuntimeUpgrader::settle`] left an upgrade.
@@ -416,11 +478,107 @@ impl<E: RuntimeUpgradeEffects> RuntimeUpgrader<E> {
             // have moved on since, and a replay must not move it back.
             match self.settle(&record, true).await? {
                 Settled::Retired => return Ok(RuntimeUpgradeOutcome::Replayed),
-                // An interrupted attempt is back on its old pair; start over.
+                // An interrupted attempt is back on its old pair. A retry
+                // from the pod it ran for gets its rollback back below; any
+                // other starts over.
                 Settled::RolledBack => {}
             }
         }
+        self.refuse_settled_for_pod(&request)?;
+        let (record, disk) = match self.fence(&request).await {
+            Ok(Fence::Fenced(fenced)) => *fenced,
+            Ok(Fence::AlreadyOnTarget) => return Ok(RuntimeUpgradeOutcome::AlreadyOnTarget),
+            Err(refusal) => {
+                self.record_refusal(&request, &refusal);
+                return Err(refusal);
+            }
+        };
+        self.run(&record, &disk, request.start).await?;
+        Ok(RuntimeUpgradeOutcome::Upgraded)
+    }
 
+    /// Answer a retry from a pod an operation's rollback or refusal was
+    /// recorded for with that outcome, rather than fencing or booting again:
+    /// the control plane may already have settled on it and released its
+    /// execution. The pod's own history decides, not the operation's latest
+    /// outcome, which a later pod's attempt replaces. A request that names no
+    /// pod, or one with no such outcome, starts over.
+    pub(super) fn refuse_settled_for_pod(
+        &self,
+        request: &RuntimeUpgradeRequest,
+    ) -> Result<(), Status> {
+        let Some(pod_uid) = request.pod_uid() else {
+            return Ok(());
+        };
+        let Some(settled) = crate::db::read::runtime_upgrade_pod_outcome(
+            &*self.db()?,
+            request.operation_id,
+            pod_uid,
+        )
+        .map_err(|error| Status::internal(format!("read runtime upgrade outcome: {error}")))?
+        else {
+            return Ok(());
+        };
+        let what = match settled.outcome {
+            crate::db::RecordedRuntimeUpgradeOutcome::RolledBack => "rolled back",
+            crate::db::RecordedRuntimeUpgradeOutcome::Refused => "was refused",
+            // Never recorded for a pod; an operation that found its target
+            // never fences again anyway.
+            crate::db::RecordedRuntimeUpgradeOutcome::AlreadyOnTarget => return Ok(()),
+        };
+        let failure = settled.failure;
+        Err(Status::failed_precondition(format!(
+            "runtime upgrade {} {what} for pod {pod_uid}: {}; only a new pod retries it",
+            request.operation_id,
+            failure.as_deref().unwrap_or("no reason recorded")
+        )))
+    }
+
+    /// Record a refusal that came before anything was fenced for the pod the
+    /// request names, so it's final for that pod as a rollback is, but only
+    /// one a retry can't change ([`refusal_is_final`]). A transient one
+    /// (cleanup owns the sandbox, another operation fences it, the sandbox
+    /// changed while it was inspected or is in a state an upgrade can't start
+    /// from, a node-manager or staging failure)
+    /// stays unrecorded, so kubelet's retry from the same pod tries again.
+    /// Best effort: an unrecorded refusal leaves the pod's report as it was,
+    /// which the control plane doesn't settle on.
+    pub(super) fn record_refusal(&self, request: &RuntimeUpgradeRequest, refusal: &Status) {
+        let Some(pod_uid) = request.pod_uid() else {
+            return;
+        };
+        if !refusal_is_final(refusal) {
+            return;
+        }
+        let recorded = self.db().and_then(|db| {
+            crate::db::record_runtime_upgrade_refusal(
+                &db,
+                &request.identity(),
+                pod_uid,
+                refusal.message(),
+            )
+            .map_err(|error| Status::internal(error.to_string()))
+        });
+        match recorded {
+            Ok(true) => {}
+            Ok(false) => tracing::debug!(
+                sandbox_id = %request.sandbox_id,
+                operation_id = %request.operation_id,
+                "runtime upgrade refusal not recorded: the operation's record keeps its outcome"
+            ),
+            Err(error) => tracing::warn!(
+                sandbox_id = %request.sandbox_id,
+                operation_id = %request.operation_id,
+                %error,
+                "could not record the runtime upgrade's refusal"
+            ),
+        }
+    }
+
+    /// Everything before the boot: decide whether the sandbox is already on
+    /// the target, check the edge, and fence it. Every error here leaves
+    /// nothing fenced for this operation.
+    async fn fence(&self, request: &RuntimeUpgradeRequest) -> Result<Fence, Status> {
         // Snapshot rollback checks the fence under the same exclusion before
         // it rewrites the instance, so it either finishes before the fence or
         // sees it.
@@ -444,7 +602,9 @@ impl<E: RuntimeUpgradeEffects> RuntimeUpgrader<E> {
         if sandbox.state != SandboxState::Suspended
             && saved_environment(&sandbox) == Some(request.target)
         {
-            return self.already_on_target(&request);
+            return self
+                .already_on_target(request)
+                .map(|()| Fence::AlreadyOnTarget);
         }
         let disk = self.effects.inspect_local_disk(&sandbox).await?;
         if sandbox.state == SandboxState::Suspended
@@ -454,7 +614,9 @@ impl<E: RuntimeUpgradeEffects> RuntimeUpgrader<E> {
                 .and_then(ExecutionMetadata::environment)
                 == Some(request.target)
         {
-            return self.already_on_target(&request);
+            return self
+                .already_on_target(request)
+                .map(|()| Fence::AlreadyOnTarget);
         }
         // An operation that already found its sandbox on the target never
         // boots: a replay after the sandbox moved to another environment
@@ -500,6 +662,7 @@ impl<E: RuntimeUpgradeEffects> RuntimeUpgrader<E> {
                     .execution_metadata
                     .as_ref()
                     .unwrap_or(&disk.execution),
+                pod_uid: request.pod_uid(),
             },
         )
         .map_err(|error| Status::internal(format!("fence runtime upgrade: {error}")))?;
@@ -509,9 +672,12 @@ impl<E: RuntimeUpgradeEffects> RuntimeUpgrader<E> {
             BeginRuntimeUpgrade::SandboxMissing => {
                 return Err(sandbox_not_found(&request.sandbox_id));
             }
+            // The sandbox may still settle into a state an upgrade starts
+            // from, so a retry may succeed and the refusal isn't final.
             BeginRuntimeUpgrade::UnsupportedState(state) => {
-                return Err(Status::failed_precondition(format!(
-                    "a runtime upgrade needs a stopped or suspended sandbox, not {state}"
+                return Err(Status::aborted(format!(
+                    "a runtime upgrade needs a stopped or suspended sandbox, not {state}; retry \
+                     once it is"
                 )));
             }
             BeginRuntimeUpgrade::CleanupActive => {
@@ -542,27 +708,24 @@ impl<E: RuntimeUpgradeEffects> RuntimeUpgrader<E> {
                 ));
             }
         };
-        self.run(&record, &disk, request.start).await?;
-        Ok(RuntimeUpgradeOutcome::Upgraded)
+        Ok(Fence::Fenced(Box::new((record, disk))))
     }
 
     /// Record that the upgrade fenced nothing, so a caller that lost this
     /// answer reads it from `GetRuntimeUpgrade`.
-    fn already_on_target(
-        &self,
-        request: &RuntimeUpgradeRequest,
-    ) -> Result<RuntimeUpgradeOutcome, Status> {
+    fn already_on_target(&self, request: &RuntimeUpgradeRequest) -> Result<(), Status> {
         // Recorded only if no other request reused the operation id first;
         // the per-sandbox upgrade lock doesn't serialize two sandboxes.
-        let recorded =
-            crate::db::record_runtime_upgrade_already_on_target(&*self.db()?, &request.identity())
-                .map_err(|error| {
-                    Status::internal(format!("record runtime upgrade outcome: {error}"))
-                })?;
+        let recorded = crate::db::record_runtime_upgrade_already_on_target(
+            &*self.db()?,
+            &request.identity(),
+            request.pod_uid(),
+        )
+        .map_err(|error| Status::internal(format!("record runtime upgrade outcome: {error}")))?;
         if !recorded {
             return Err(request.names_another());
         }
-        Ok(RuntimeUpgradeOutcome::AlreadyOnTarget)
+        Ok(())
     }
 
     async fn run(

@@ -612,6 +612,9 @@ impl SandboxManagerService {
                         StatePageError::PinnedArtifactCreatedAt(error) => Status::internal(
                             format!("load pinned artifact capture times: {error}"),
                         ),
+                        StatePageError::RuntimeUpgrades(error) => {
+                            Status::internal(format!("load runtime upgrade fences: {error}"))
+                        }
                         StatePageError::RecoveryObservations(error) => {
                             tracing::warn!(%error, "failed to load quarantine recovery observations");
                             Status::internal(format!("load quarantine recovery observations: {error}"))

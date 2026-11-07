@@ -1026,3 +1026,30 @@ fn the_node_answer_is_never_a_false_all_clear() {
          the one shape an evacuation may open on"
     );
 }
+
+/// Sandbox-manager answers `Aborted` for a sandbox not yet stopped or
+/// suspended, which it once answered as `FailedPrecondition`. The callers
+/// that don't read the status themselves (the retire's backup, the admin
+/// upload, the drain's promotion and stopped evacuation) key on `Conflict`
+/// to keep a sandbox for a retry, so both mappings must answer it the same.
+#[test]
+fn a_not_yet_stopped_backup_refusal_is_the_conflict_it_was() {
+    let sandbox_id = SandboxId::new();
+    for (code, conflict) in [
+        (tonic::Code::FailedPrecondition, true),
+        (tonic::Code::Aborted, true),
+        (tonic::Code::Internal, false),
+    ] {
+        let status = tonic::Status::new(code, "sandbox is started");
+        for error in [
+            artifact_backup_refusal(&status, sandbox_id, "node-a"),
+            node_api_artifact_backup_refusal(&status, sandbox_id, "node-a"),
+        ] {
+            assert_eq!(
+                matches!(&error, SubstrateError::Conflict { message } if message.contains("sandbox is started")),
+                conflict,
+                "{code:?}: {error:?}"
+            );
+        }
+    }
+}

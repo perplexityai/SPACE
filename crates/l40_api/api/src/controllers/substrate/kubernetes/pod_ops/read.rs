@@ -47,6 +47,20 @@ impl KubernetesSubstrate {
         self.pod_store.get(&key)
     }
 
+    /// The cached view of `pod_name`, or, when the reflector has none, an
+    /// uncached read: a pod created moments ago may not have reached the
+    /// cache yet. A cached entry is taken as it is, settled or not; see
+    /// [`Self::read_sandbox_pod`] for a read that waits for a settled one.
+    pub(in crate::controllers::substrate::kubernetes) async fn lookup_or_fetch_sandbox_pod(
+        &self,
+        pod_name: &str,
+    ) -> Result<Option<Arc<SandboxPodView>>, KubeError> {
+        match self.lookup_sandbox_pod(pod_name) {
+            Some(pod) => Ok(Some(pod)),
+            None => fetch_sandbox_pod_uncached(&self.k8s, pod_name).await,
+        }
+    }
+
     /// Read a sandbox pod directly from the apiserver, bypassing the
     /// reflector cache. Use on paths that must verify cached terminal state
     /// before deleting a carrier pod.

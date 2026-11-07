@@ -38,7 +38,7 @@ use std::time::Duration;
 
 use pplx_space_common_core::types::{
     EnvironmentReference, INITIAL_FIRECRACKER_RUNTIME_VERSION,
-    INITIAL_FIRECRACKER_STATE_FORMAT_VERSION, LocalArtifactId, SandboxId,
+    INITIAL_FIRECRACKER_STATE_FORMAT_VERSION, RuntimeKind, SandboxId,
 };
 use pplx_space_runtime_environment_policy_store::{
     RuntimeEnvironmentPolicy, RuntimeEnvironmentState,
@@ -101,12 +101,25 @@ impl UpgradeActivation {
     }
 }
 
+/// The one spelling a runtime name has inside the decision: its
+/// [`RuntimeKind`] identifier (`firecracker`), which execution metadata and
+/// the catalog use. The legacy identity columns a node publishes
+/// (`sandbox_observed_states.runtime`, `snapshots.runtime`) hold the kind's
+/// alias (`fc`) instead, so comparing them as written never matches. Every
+/// runtime name read into a [`RecordedExecution`] or a [`CatalogEnvironment`]
+/// passes through here. A name no [`RuntimeKind`] knows is kept as written,
+/// so it matches only the same spelling.
+pub fn canonical_runtime(name: String) -> String {
+    RuntimeKind::parse(&name).map_or(name, |kind| kind.as_str().to_owned())
+}
+
 /// An execution as the control plane recorded it: the binding, when the
 /// record has one, and the legacy identity columns otherwise.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct RecordedExecution {
     /// `execution_metadata.environment`, unparsed.
     pub environment: Option<String>,
+    /// In its [`canonical_runtime`] spelling.
     pub runtime: Option<String>,
     pub runtime_version: Option<String>,
     /// The version of the record's kernel component.
@@ -119,6 +132,7 @@ pub struct RecordedExecution {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CatalogEnvironment {
     pub reference: EnvironmentReference,
+    /// In its [`canonical_runtime`] spelling.
     pub runtime: String,
     pub runtime_version: String,
     pub kernel_version: String,
@@ -357,48 +371,45 @@ impl EnvironmentMove {
 
     /// The operation id for upgrading `sandbox_id` at `activation`, where
     /// `subject` identifies what is booted: the checkpoint for a restore,
-    /// the recorded execution for a start.
+    /// the recorded execution for a start. The upgrade leaves the sandbox
+    /// started; [`Self::stay_stopped_operation_id`] names one that leaves it
+    /// stopped.
     pub fn operation_id(
         &self,
         sandbox_id: SandboxId,
         activation: UpgradeActivation,
         subject: &str,
     ) -> uuid::Uuid {
+        self.named_operation(sandbox_id, activation.as_str(), subject)
+    }
+
+    /// The operation id for upgrading stopped `sandbox_id` and leaving it
+    /// stopped, where `subject` identifies the recorded execution, as for a
+    /// start. A node keeps every operation's outcome and refuses to reuse an
+    /// id for another target state, so this names a different operation
+    /// than the start of the same sandbox from the same execution: a start
+    /// after a stopped upgrade rolled back runs its own upgrade instead of
+    /// being refused.
+    pub fn stay_stopped_operation_id(&self, sandbox_id: SandboxId, subject: &str) -> uuid::Uuid {
+        self.named_operation(sandbox_id, STAY_STOPPED_LABEL, subject)
+    }
+
+    fn named_operation(&self, sandbox_id: SandboxId, label: &str, subject: &str) -> uuid::Uuid {
         uuid::Uuid::new_v5(
             &OPERATION_NAMESPACE,
             // The cause names the authorization, which a retry must repeat.
             format!(
-                "{sandbox_id}/{}/{}/{}/{}/{subject}",
-                activation.as_str(),
-                self.cause,
-                self.from,
-                self.to
+                "{sandbox_id}/{label}/{}/{}/{}/{subject}",
+                self.cause, self.from, self.to
             )
             .as_bytes(),
         )
     }
-
-    /// The `WakeRequest.runtime_upgrade` that asks the node for this move.
-    /// `checkpoint` is the local artifact of the checkpoint a restore was
-    /// decided from, which the node must find pinned to boot it; a restore
-    /// always names one.
-    pub fn wake_upgrade(
-        &self,
-        sandbox_id: SandboxId,
-        activation: UpgradeActivation,
-        subject: &str,
-        checkpoint: Option<LocalArtifactId>,
-    ) -> pplx_space_sbx_mgr_client::proto::WakeRuntimeUpgrade {
-        pplx_space_sbx_mgr_client::proto::WakeRuntimeUpgrade {
-            operation_id: self
-                .operation_id(sandbox_id, activation, subject)
-                .to_string(),
-            target_environment: self.to.to_string(),
-            authorization: Some(self.authorization(activation)),
-            checkpoint_local_artifact_id: checkpoint.map(|checkpoint| checkpoint.to_string()),
-        }
-    }
 }
+
+/// The activation label of an upgrade that leaves a stopped sandbox stopped.
+/// Distinct from every [`UpgradeActivation::as_str`].
+const STAY_STOPPED_LABEL: &str = "start-stay-stopped";
 
 /// The refusal for a stranded sandbox. Not retryable: it holds until an
 /// operator allows the environment, certifies an edge or changes the
@@ -412,6 +423,23 @@ pub fn stranded_error(sandbox_id: SandboxId, stranded: EnvironmentMove) -> super
             stranded.from, stranded.cause, stranded.to
         ),
     }
+}
+
+/// What [`super::SubstrateAdapter::upgrade_stopped_runtime`] did to a stopped
+/// sandbox, which it leaves stopped either way.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StoppedRuntimeUpgrade {
+    /// The decision keeps the sandbox on the environment it last ran under:
+    /// nothing was placed or booted.
+    AsRecorded,
+    /// The node booted the sandbox's disk under the cluster default and
+    /// stopped it again, or found it already there. The sandbox then records
+    /// that environment, so a retry decides to keep it and answers
+    /// [`Self::AsRecorded`], placing nothing.
+    Upgraded {
+        target: EnvironmentReference,
+        operation_id: uuid::Uuid,
+    },
 }
 
 /// How long a policy read is reused. Activations read the policy on every

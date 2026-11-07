@@ -189,9 +189,17 @@ type SandboxManagerClient interface {
 	// the old checkpoint. Files survive; memory and processes don't. A failed
 	// boot restores the old pair and releases the fence. Idempotent per
 	// `operation_id`: a retry resumes or settles the same upgrade. A rolled-back
-	// upgrade keeps only its outcome, so a retry after it starts over. A
-	// sandbox already on the target is activated in place for a STARTED
-	// target, and a suspended one absent from the node may be staged first;
+	// upgrade keeps only its outcome, recorded for the pod its `start` named
+	// (`route_identity.pod_uid`), and so does a request refused before it
+	// fenced anything with FAILED_PRECONDITION or INVALID_ARGUMENT, which a
+	// retry can't change. Either is final for that pod, even after a later
+	// pod's outcome replaces it in `GetRuntimeUpgrade`: a retry from the same
+	// pod UID gets the recorded failure back with FAILED_PRECONDITION and never
+	// fences or boots again. Any other refusal is left unrecorded, so a retry
+	// from the same pod tries again. A retry from a new pod, or one naming no
+	// pod, starts over. A sandbox already on the target is activated in place
+	// for a STARTED target, and a suspended one absent from the node may be
+	// staged first;
 	// see `UpgradeRuntimeRequest.target_state` and `stage_from`, and
 	// `GetRuntimeUpgrade` for what the node records.
 	UpgradeRuntime(ctx context.Context, in *UpgradeRuntimeRequest, opts ...grpc.CallOption) (*UpgradeRuntimeResponse, error)
@@ -1307,9 +1315,17 @@ type SandboxManagerServer interface {
 	// the old checkpoint. Files survive; memory and processes don't. A failed
 	// boot restores the old pair and releases the fence. Idempotent per
 	// `operation_id`: a retry resumes or settles the same upgrade. A rolled-back
-	// upgrade keeps only its outcome, so a retry after it starts over. A
-	// sandbox already on the target is activated in place for a STARTED
-	// target, and a suspended one absent from the node may be staged first;
+	// upgrade keeps only its outcome, recorded for the pod its `start` named
+	// (`route_identity.pod_uid`), and so does a request refused before it
+	// fenced anything with FAILED_PRECONDITION or INVALID_ARGUMENT, which a
+	// retry can't change. Either is final for that pod, even after a later
+	// pod's outcome replaces it in `GetRuntimeUpgrade`: a retry from the same
+	// pod UID gets the recorded failure back with FAILED_PRECONDITION and never
+	// fences or boots again. Any other refusal is left unrecorded, so a retry
+	// from the same pod tries again. A retry from a new pod, or one naming no
+	// pod, starts over. A sandbox already on the target is activated in place
+	// for a STARTED target, and a suspended one absent from the node may be
+	// staged first;
 	// see `UpgradeRuntimeRequest.target_state` and `stage_from`, and
 	// `GetRuntimeUpgrade` for what the node records.
 	UpgradeRuntime(context.Context, *UpgradeRuntimeRequest) (*UpgradeRuntimeResponse, error)

@@ -674,7 +674,7 @@ impl K8sStore {
         }
 
         let claim = self
-            .ensure_active_execution_claim_in(&mut tx, sandbox_id, None)
+            .ensure_active_execution_claim_in(&mut tx, sandbox_id, None, None, None)
             .await?;
 
         tx.commit()
@@ -715,6 +715,8 @@ impl K8sStore {
             pplx_space_common_core::types::SandboxActivationAttemptId,
             SandboxTransitionTargetState,
         )>,
+        stopped_upgrade: Option<&StoppedUpgradeRecord>,
+        owed_backup_enqueued: Option<Uuid>,
     ) -> Result<SandboxExecutionClaim, SubstrateError> {
         let mut tx = self
             .pool
@@ -753,7 +755,13 @@ impl K8sStore {
             }
         }
         let claim = self
-            .ensure_active_execution_claim_in(&mut tx, sandbox_id, activation_attempt)
+            .ensure_active_execution_claim_in(
+                &mut tx,
+                sandbox_id,
+                activation_attempt,
+                stopped_upgrade,
+                owed_backup_enqueued,
+            )
             .await?;
 
         tx.commit()
@@ -765,6 +773,14 @@ impl K8sStore {
         Ok(claim)
     }
 
+    /// Claim the sandbox's active execution in `tx`, minting one if none is
+    /// active, and assign it `activation_attempt`. `stopped_upgrade`, a
+    /// stopped sandbox's runtime upgrade, is recorded on the claim in the
+    /// same transaction ([`Self::record_stopped_runtime_upgrade_in`]), which
+    /// needs an activation attempt. `owed_backup_enqueued` names the stopped
+    /// upgrade whose owed disk backup the caller enqueued, which lets the
+    /// assignment clear that upgrade's record
+    /// ([`Self::assign_activation_attempt_in`]).
     pub(super) async fn ensure_active_execution_claim_in(
         &self,
         tx: &mut Transaction<'_, Postgres>,
@@ -773,6 +789,8 @@ impl K8sStore {
             pplx_space_common_core::types::SandboxActivationAttemptId,
             SandboxTransitionTargetState,
         )>,
+        stopped_upgrade: Option<&StoppedUpgradeRecord>,
+        owed_backup_enqueued: Option<Uuid>,
     ) -> Result<SandboxExecutionClaim, SubstrateError> {
         let sandbox_uuid = sandbox_id;
         let mut claim = match self.active_execution_row(&mut *tx, sandbox_uuid).await? {
@@ -797,6 +815,7 @@ impl K8sStore {
                 activation_attempt_id,
                 target_state,
                 route_publication,
+                owed_backup_enqueued,
             )
             .await?;
             claim.row.activation_attempt_id = Some(activation_attempt_id);
@@ -804,6 +823,24 @@ impl K8sStore {
                 claim.row.route_activation_id = Some(activation_attempt_id);
             }
             claim.route_publication = Some(route_publication);
+        }
+        if let Some(upgrade) = stopped_upgrade {
+            let attempt_id = activation_attempt
+                .and(claim.row.activation_attempt_id)
+                .ok_or_else(|| SubstrateError::Failed {
+                    message: format!(
+                        "stopped sandbox {sandbox_id}'s runtime upgrade was claimed without an \
+                         activation attempt"
+                    ),
+                })?;
+            Self::record_stopped_runtime_upgrade_in(
+                tx,
+                sandbox_id,
+                claim.row.generation,
+                attempt_id,
+                upgrade,
+            )
+            .await?;
         }
 
         Ok(claim)
@@ -815,6 +852,7 @@ impl K8sStore {
         generation: i64,
         state: &str,
         activation_attempt: Option<(SandboxActivationAttemptId, SandboxTransitionTargetState)>,
+        stopped_upgrade: Option<&StoppedUpgradeRecord>,
     ) -> Result<Option<SandboxExecutionClaim>, SubstrateError> {
         let sandbox_uuid = sandbox_id;
         let mut tx = self
@@ -855,8 +893,16 @@ impl K8sStore {
             return Ok(None);
         }
 
+        // A new generation carries no upgrade record, so its claim clears
+        // none.
         let mut claim = self
-            .ensure_active_execution_claim_in(&mut tx, sandbox_id, activation_attempt)
+            .ensure_active_execution_claim_in(
+                &mut tx,
+                sandbox_id,
+                activation_attempt,
+                stopped_upgrade,
+                None,
+            )
             .await?;
         if recovery_in_flight {
             let marked = sqlx::query(sql!(

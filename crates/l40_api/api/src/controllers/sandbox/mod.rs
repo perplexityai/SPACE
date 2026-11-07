@@ -1175,6 +1175,21 @@ impl SandboxController {
         self.substrate.capabilities()
     }
 
+    /// See [`super::substrate::SubstrateAdapter::upgrade_stopped_runtime`].
+    pub async fn upgrade_stopped_runtime(
+        &self,
+        sandbox_id: SandboxId,
+        timeout: Duration,
+    ) -> Result<
+        super::substrate::runtime_upgrade::StoppedRuntimeUpgrade,
+        super::substrate::SubstrateError,
+    > {
+        use super::substrate::SubstrateAdapter;
+        self.substrate
+            .upgrade_stopped_runtime(sandbox_id, timeout)
+            .await
+    }
+
     pub async fn set_node_schedulability(
         &self,
         request: super::substrate::NodeSchedulabilityRequest<'_>,

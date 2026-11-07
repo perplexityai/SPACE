@@ -111,7 +111,7 @@ impl K8sStore {
         }
 
         let claim = self
-            .ensure_active_execution_claim_in(&mut tx, sandbox_id, None)
+            .ensure_active_execution_claim_in(&mut tx, sandbox_id, None, None, None)
             .await?;
         let generation = sqlx::query_scalar::<_, i64>(sql!(
             "UPDATE sandbox_k8s_executions

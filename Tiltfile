@@ -756,11 +756,26 @@ local_resource(
 # registers the seed release against it. It does not wait for the console
 # login: nothing it runs, and none of its callers (the seed publish Job
 # presents a projected ServiceAccount token), signs in as root@local.
+# The chart's runtimeDesiredState values, from Tilt's environment: unset renders
+# nothing and both settings stay off. A runtime-upgrade bench sets
+# SPACE_KIND_RUNTIME_DESIRED_STATE_ENABLED=true (serve the execution policy),
+# SPACE_KIND_RUNTIME_PROVISIONING_RECIPE_ENABLED=true and
+# SPACE_KIND_RUNTIME_PROVISIONING_PERCENT=100 (install the catalog's
+# environments on every node); see "Runtime-upgrade bench" in
+# infra/space/kind/README.md.
+RUNTIME_DESIRED_STATE_SET = []
+for variable, key in [
+    ("SPACE_KIND_RUNTIME_DESIRED_STATE_ENABLED", "executionPolicyEnabled"),
+    ("SPACE_KIND_RUNTIME_PROVISIONING_RECIPE_ENABLED", "provisioningRecipeEnabled"),
+    ("SPACE_KIND_RUNTIME_PROVISIONING_PERCENT", "provisioningPercent"),
+]:
+    if os.getenv(variable, ""):
+        RUNTIME_DESIRED_STATE_SET.append("runtimeDesiredState.{}={}".format(key, os.getenv(variable)))
 deploy_yaml(helm(
     "infra/space/kind/charts/space-internal-api-local",
     name = "space",
     namespace = NAMESPACE,
-    set = TELEMETRY_SET + ["rustBuild=" + RUST_BUILD],
+    set = TELEMETRY_SET + ["rustBuild=" + RUST_BUILD] + RUNTIME_DESIRED_STATE_SET,
 ))
 k8s_resource(
     "space-internal-api",
@@ -922,6 +937,11 @@ k8s_resource(
 # that. Inherited from the environment so `SPACE_LOOP_DEVICE_TARGET=128 tilt up`
 # reaches the pod; unset renders nothing and the default applies.
 LOOP_DEVICE_TARGET = os.getenv("SPACE_LOOP_DEVICE_TARGET", "")
+# node-manager's startup execution policy, inherited the same way; unset leaves
+# the binary's defaults. Helm splits --set values on commas, so the list's are
+# escaped.
+ALLOWED_EXECUTION_ENVIRONMENTS = os.getenv("SPACE_KIND_ALLOWED_EXECUTION_ENVIRONMENTS", "")
+DEFAULT_EXECUTION_ENVIRONMENT = os.getenv("SPACE_KIND_DEFAULT_EXECUTION_ENVIRONMENT", "")
 # The release list is shared with the bring-up's DaemonSet waits.
 NODE_RELEASES = str(local(["bash", "infra/space/kind/lib/node-services.sh", "releases"], quiet = True)).strip().split("\n")
 watch_file("infra/space/kind/lib/node-services.sh")
@@ -935,6 +955,10 @@ for line in NODE_RELEASES:
     node_set = CHART_SET + ["node.role={}".format(role), "node.substrate=" + SUBSTRATE]
     if service == "node-manager" and LOOP_DEVICE_TARGET:
         node_set.append("loopDeviceTarget={}".format(LOOP_DEVICE_TARGET))
+    if service == "node-manager" and ALLOWED_EXECUTION_ENVIRONMENTS:
+        node_set.append("allowedExecutionEnvironments={}".format(ALLOWED_EXECUTION_ENVIRONMENTS.replace(",", "\\,")))
+    if service == "node-manager" and DEFAULT_EXECUTION_ENVIRONMENT:
+        node_set.append("defaultExecutionEnvironment={}".format(DEFAULT_EXECUTION_ENVIRONMENT))
     deploy_yaml(helm(chart, name = release, namespace = NAMESPACE, values = values, set = node_set))
     k8s_resource(
         "{}-{}".format(release, service),

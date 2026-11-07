@@ -135,6 +135,10 @@ pub(super) fn classify_precondition_reread(
 /// when present, the restore lease. A dropped leader can outlive its lease and
 /// execution generations are reused by retries; either fence changing makes
 /// the delayed cleanup a no-op before it can retire the successor's claim.
+///
+/// A successor that renders a runtime upgrade disarms the guard before its
+/// create is sent: that pod's shim may boot the upgrade, so it and its claim
+/// stay for the operation's retry.
 struct RedriveClaimGuard {
     handles: Option<(K8sStore, KubernetesState)>,
     span: tracing::Span,
@@ -296,7 +300,7 @@ impl KubernetesSubstrate {
     /// through here so the counter sees every attempt, including the ones
     /// that return before any placement sample is emitted.
     #[allow(clippy::too_many_arguments)]
-    pub(super) async fn redrive_unschedulable_restore_cross_node_recorded(
+    pub(in crate::controllers::substrate::kubernetes) async fn redrive_unschedulable_restore_cross_node_recorded(
         &self,
         path: crate::metrics::sandbox::restore::RedrivePath,
         sandbox: &Sandbox,
@@ -305,6 +309,7 @@ impl KubernetesSubstrate {
         caller_source_node: Option<&str>,
         suspend_restore_storage_uri: Option<&str>,
         restore_lease_token: Option<Uuid>,
+        runtime_upgrade: Option<&super::super::pod_runtime_upgrade::PodUpgrade>,
     ) -> Result<RedriveOutcome, SubstrateError> {
         let mut metric = RedriveMetricGuard {
             path,
@@ -318,6 +323,7 @@ impl KubernetesSubstrate {
                 caller_source_node,
                 suspend_restore_storage_uri,
                 restore_lease_token,
+                runtime_upgrade,
             )
             .await;
         metric.outcome = Some(redrive_metric_outcome(&result));
@@ -355,6 +361,7 @@ impl KubernetesSubstrate {
     ///
     /// The blocking delete confirms absence before the same-name re-POST so it
     /// can't 409.
+    #[allow(clippy::too_many_arguments)]
     async fn redrive_unschedulable_restore_cross_node(
         &self,
         sandbox: &Sandbox,
@@ -363,6 +370,7 @@ impl KubernetesSubstrate {
         caller_source_node: Option<&str>,
         suspend_restore_storage_uri: Option<&str>,
         restore_lease_token: Option<Uuid>,
+        runtime_upgrade: Option<&super::super::pod_runtime_upgrade::PodUpgrade>,
     ) -> Result<RedriveOutcome, SubstrateError> {
         let pod_name = &claim.row.pod_name;
         let activation_attempt_id = claim.row.activation_attempt_id;
@@ -604,6 +612,19 @@ impl KubernetesSubstrate {
             restore_lease_token,
             activation_attempt_id,
         );
+        // Set once a create rendering a runtime upgrade is sent: its pod may
+        // exist and its shim may be booting the upgrade or rolling it back,
+        // so from then on no failure or cancellation deletes the pod or
+        // retires its claim. The claim stays `creating`, and a retry of the
+        // operation hydrates the pod it finds at the claim's name, or creates
+        // it when none is there, and reads the upgrade's outcome, as after the
+        // fresh create's persistence failure. One exception: a persist that
+        // finds this materialization's ownership revoked (`Ok(None)` below)
+        // still deletes the pod and forgets its tracking. That's safe because
+        // another activation owns the execution, so nothing of this attempt
+        // waits on the pod, and the node's settle rolls back a boot the
+        // delete interrupts.
+        let mut upgrade_pod_sent = false;
         let redrive_result: Result<RedriveOutcome, SubstrateError> = async {
             // Build the successor context directly: keep the portable S3
             // snapshot and the source-node annotation (provenance for later
@@ -620,6 +641,9 @@ impl KubernetesSubstrate {
                 suspend_restore_source_node: source_node_annotation.as_deref(),
                 direct_node_name: None,
                 preferred_node_name: None,
+                // The successor boots the same upgrade its pinned
+                // predecessor carried.
+                runtime_upgrade,
             });
             let auto_lifecycle = self
                 .store
@@ -643,6 +667,10 @@ impl KubernetesSubstrate {
                 .resolve_node_group_placement(sandbox, &cross_node_context)
                 .await?;
 
+            if runtime_upgrade.is_some() {
+                upgrade_pod_sent = true;
+                claim_guard.disarm();
+            }
             let cross_node_pod = match create_sandbox_pod(
                 &self.k8s,
                 self.sandbox_pod_request(
@@ -674,6 +702,13 @@ impl KubernetesSubstrate {
                     );
                     return Ok(RedriveOutcome::PodRetained { cross_node: true });
                 }
+                Err(err) if upgrade_pod_sent => {
+                    return Err(SubstrateError::restore_in_flight(format!(
+                        "failed to re-create restore pod cross-node: {err}; Kubernetes may have \
+                         committed pod {pod_name}, which carries the runtime upgrade, so it and \
+                         its execution are kept for a retry"
+                    )));
+                }
                 Err(err) => {
                     return Err(SubstrateError::Failed {
                         message: format!("failed to re-create restore pod cross-node: {err}"),
@@ -696,7 +731,9 @@ impl KubernetesSubstrate {
                 Ok(None) => {
                     // Materialization ownership was revoked between the two
                     // creates; drop the cross-node pod we just made and let the
-                    // winner drive.
+                    // winner drive. Also for a pod carrying a runtime upgrade:
+                    // the winner owns the execution, and the node's settle
+                    // rolls back a boot this delete interrupts.
                     self.delete_pod_and_forget_tracking(
                         sandbox.id,
                         pod_name,
@@ -706,6 +743,10 @@ impl KubernetesSubstrate {
                     .await?;
                     Ok(RedriveOutcome::OwnershipLost)
                 }
+                Err(error) if upgrade_pod_sent => Err(SubstrateError::restore_in_flight(format!(
+                    "{error}; cross-node restore pod {pod_name} carries the runtime upgrade \
+                         and may be running it, so it and its execution are kept for a retry"
+                ))),
                 Err(error) => {
                     // Mirror the fresh-create path: never leave an untracked
                     // pod behind a failed persist.
@@ -731,10 +772,12 @@ impl KubernetesSubstrate {
         }
         .await;
         // Reached only when the block ran to completion; a drop mid-block
-        // leaves the guard armed and its `Drop` retires the claim.
+        // leaves the guard armed, unless an upgrade's create was sent, and
+        // its `Drop` retires the claim.
         claim_guard.disarm();
 
         match redrive_result {
+            Err(err) if upgrade_pod_sent => Err(err),
             Ok(outcome) => {
                 if matches!(outcome, RedriveOutcome::Redriven(_)) {
                     tracing::info!(

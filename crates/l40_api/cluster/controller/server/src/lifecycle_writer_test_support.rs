@@ -174,6 +174,160 @@ pub(crate) async fn insert_execution(
     Ok(())
 }
 
+/// Whether the pod of the execution [`insert_unsettled_stopped_runtime_upgrade`]
+/// seeds was created.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UnsettledUpgradePod {
+    /// The upgrade's wait for the node ran out, or its node's result wasn't
+    /// published yet: the pod runs on the node holding the disk, its UID,
+    /// address and node recorded.
+    Running,
+    /// The attempt failed between recording the upgrade and creating the pod.
+    NeverCreated,
+}
+
+/// Seed what an unsettled runtime upgrade of a stopped Kubernetes sandbox
+/// leaves for its retry: a `stopped` row still placed on a registered node,
+/// and an active generation-2 execution whose activation attempt targets
+/// `stopped` and has already expired, and which carries the recorded upgrade
+/// the retry places again. With [`UnsettledUpgradePod::Running`] the
+/// execution is `running` with the pod [`pod_name`] and [`pod_uid`] derive,
+/// its address and node; with [`UnsettledUpgradePod::NeverCreated`] it's
+/// `creating` with no pod. The execution it was claimed after, generation 1,
+/// is retired. Everything is an hour old, past every loop's age threshold.
+pub(crate) async fn insert_unsettled_stopped_runtime_upgrade(
+    pool: &PgPool,
+    pod: UnsettledUpgradePod,
+) -> TestResult<SandboxId> {
+    let sandbox_id = SandboxId::new();
+    let node_id = insert_node(pool, None, None).await?;
+    let mut seed = SandboxSeed::new("stopped", "k8s");
+    seed.active_node_id = Some(node_id);
+    insert_sandbox(pool, sandbox_id, &seed).await?;
+    let retired = ExecutionSeed {
+        generation: 1,
+        state: "stopped",
+        active: false,
+    };
+    insert_execution(pool, sandbox_id, retired).await?;
+    let running = pod == UnsettledUpgradePod::Running;
+    sqlx::query(sql!(
+        "INSERT INTO sandbox_k8s_executions
+            (sandbox_id, generation, pod_name, pod_namespace, state, active,
+             pod_uid, pod_ip, k8s_node_name, pod_materialized_at,
+             activation_attempt_id, route_activation_id,
+             activation_attempt_expires_at, activation_attempt_target_state,
+             runtime_upgrade_operation_id, runtime_upgrade_target_environment_ref,
+             runtime_upgrade_authorization_id, created_at, updated_at)
+         SELECT $1, 2, $2, $3,
+                CASE WHEN $7 THEN 'running' ELSE 'creating' END, TRUE,
+                CASE WHEN $7 THEN $8 END,
+                CASE WHEN $7 THEN '10.0.0.2'::inet END,
+                CASE WHEN $7 THEN 'node-a' END,
+                CASE WHEN $7 THEN attempt.at END,
+                attempt.id, attempt.id,
+                attempt.at, 'stopped', $4, $5, $6, attempt.at, attempt.at
+           FROM (SELECT space_uuid_v7() AS id, NOW() - INTERVAL '1 hour' AS at) attempt"
+    ))
+    .bind(sandbox_id)
+    .bind(pod_name(sandbox_id, 2))
+    .bind(KUBERNETES_NAMESPACE)
+    .bind(Uuid::now_v7())
+    .bind(format!("sha256:{}", "1".repeat(64)))
+    .bind(format!(
+        "runtime-environment-default:sha256:{}",
+        "0".repeat(64)
+    ))
+    .bind(running)
+    .bind(pod_uid(sandbox_id, 2))
+    .execute(pool)
+    .await?;
+    Ok(sandbox_id)
+}
+
+/// Everything a loop must leave alone on a row seeded by
+/// [`insert_unsettled_stopped_runtime_upgrade`] for the upgrade's retry to
+/// reuse it. `None` when the sandbox row is gone.
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub(crate) struct UnsettledUpgradeRow {
+    pub(crate) lifecycle: String,
+    pub(crate) lifecycle_changed_at: String,
+    pub(crate) placement: String,
+    pub(crate) active_node_id: Option<NodeId>,
+    pub(crate) target_node_id: Option<NodeId>,
+    pub(crate) command_ready_pending: bool,
+    pub(crate) quarantined: bool,
+    pub(crate) executions: i64,
+    pub(crate) generation: Option<i64>,
+    pub(crate) state: Option<String>,
+    pub(crate) pod_uid: Option<String>,
+    pub(crate) terminated: Option<bool>,
+    pub(crate) execution_updated_at: Option<String>,
+    pub(crate) activation_attempt_id: Option<Uuid>,
+    pub(crate) route_activation_id: Option<Uuid>,
+    pub(crate) activation_attempt_expires_at: Option<String>,
+    pub(crate) activation_attempt_target_state: Option<String>,
+    pub(crate) runtime_upgrade_operation_id: Option<Uuid>,
+    pub(crate) runtime_upgrade_target_environment_ref: Option<String>,
+    pub(crate) runtime_upgrade_authorization_id: Option<String>,
+}
+
+pub(crate) async fn unsettled_upgrade_row(
+    pool: &PgPool,
+    sandbox_id: SandboxId,
+) -> TestResult<Option<UnsettledUpgradeRow>> {
+    Ok(sqlx::query_as::<_, UnsettledUpgradeRow>(sql!(
+        "SELECT s.lifecycle, s.lifecycle_changed_at::text, s.placement,
+                s.active_node_id, s.target_node_id, s.command_ready_pending,
+                EXISTS (SELECT 1 FROM sandbox_quarantine_state q
+                         WHERE q.sandbox_id = s.id) AS quarantined,
+                (SELECT COUNT(*) FROM sandbox_k8s_executions x
+                  WHERE x.sandbox_id = s.id) AS executions,
+                e.generation, e.state, e.pod_uid,
+                e.terminated_at IS NOT NULL AS terminated,
+                e.updated_at::text AS execution_updated_at,
+                e.activation_attempt_id, e.route_activation_id,
+                e.activation_attempt_expires_at::text,
+                e.activation_attempt_target_state,
+                e.runtime_upgrade_operation_id,
+                e.runtime_upgrade_target_environment_ref,
+                e.runtime_upgrade_authorization_id
+           FROM sandboxes s
+           LEFT JOIN sandbox_k8s_executions e ON e.sandbox_id = s.id AND e.active
+          WHERE s.id = $1"
+    ))
+    .bind(sandbox_id)
+    .fetch_optional(pool)
+    .await?)
+}
+
+/// Assert `after` is the row [`insert_unsettled_stopped_runtime_upgrade`]
+/// seeded, unchanged from `before`: still there, still `stopped` and placed,
+/// its active execution, with its pod if it had one, still claimed for
+/// `stopped` with the recorded upgrade.
+pub(crate) fn assert_left_for_retry(
+    before: &UnsettledUpgradeRow,
+    after: Option<&UnsettledUpgradeRow>,
+    context: &str,
+) {
+    assert_eq!(after, Some(before), "{context}");
+    assert_eq!(before.lifecycle, "stopped", "{context}");
+    assert_eq!(before.placement, "on_node", "{context}");
+    assert!(before.active_node_id.is_some(), "{context}");
+    assert_eq!(before.generation, Some(2), "{context}");
+    assert_eq!(
+        before.activation_attempt_target_state.as_deref(),
+        Some("stopped"),
+        "{context}"
+    );
+    assert!(
+        before.runtime_upgrade_operation_id.is_some()
+            && before.runtime_upgrade_target_environment_ref.is_some()
+            && before.runtime_upgrade_authorization_id.is_some(),
+        "{context}: {before:?}"
+    );
+}
+
 /// Register a full snapshot in `state`, taken `offset_secs` after the row's
 /// last lifecycle change (negative: before it); a `ready` snapshot gets a
 /// durable storage location.

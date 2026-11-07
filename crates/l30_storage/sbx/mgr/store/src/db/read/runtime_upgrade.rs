@@ -2,8 +2,8 @@
 //! sandbox.
 
 use crate::db::{
-    Connection, Result, RuntimeUpgradeOperationId, RuntimeUpgradeRecord, RuntimeUpgradeReport,
-    RuntimeUpgradeRequestIdentity,
+    Connection, Result, RuntimeUpgradeOperationId, RuntimeUpgradePodOutcome, RuntimeUpgradeRecord,
+    RuntimeUpgradeRefusedPod, RuntimeUpgradeReport, RuntimeUpgradeRequestIdentity,
 };
 
 /// The upgrade row, `None` without one; a row that does not decode fails the
@@ -21,7 +21,20 @@ pub fn unretired_runtime_upgrade(
     conn: &Connection,
     sandbox_id: &str,
 ) -> Result<Option<RuntimeUpgradeOperationId>> {
-    crate::db::unretired_runtime_upgrade(conn, sandbox_id)
+    crate::db::unretired_runtime_upgrade(conn, sandbox_id, None)
+}
+
+/// The unretired upgrade of `sandbox_id` that must leave it `stopped`, if
+/// one exists, whatever other upgrades of it are still unretired.
+pub fn unretired_stay_stopped_runtime_upgrade(
+    conn: &Connection,
+    sandbox_id: &str,
+) -> Result<Option<RuntimeUpgradeOperationId>> {
+    crate::db::unretired_runtime_upgrade(
+        conn,
+        sandbox_id,
+        Some(crate::db::RuntimeUpgradeTargetState::Stopped),
+    )
 }
 
 /// The upgrade that refuses other activations of `sandbox_id`, if one does.
@@ -48,4 +61,25 @@ pub fn recorded_runtime_upgrade_request(
     operation_id: RuntimeUpgradeOperationId,
 ) -> Result<Option<RuntimeUpgradeRequestIdentity>> {
     crate::db::recorded_runtime_upgrade_request(conn, operation_id)
+}
+
+/// The pod `pod_uid`'s create the operation refused after reaching its
+/// target, `None` when it refused no such create.
+pub fn runtime_upgrade_refused_pod(
+    conn: &Connection,
+    operation_id: RuntimeUpgradeOperationId,
+    pod_uid: &str,
+) -> Result<Option<RuntimeUpgradeRefusedPod>> {
+    crate::db::runtime_upgrade_refused_pod(conn, operation_id, pod_uid)
+}
+
+/// The rollback or refusal final for the pod `pod_uid` under
+/// `operation_id`, whatever later pods' attempts recorded since; `None`
+/// without one.
+pub fn runtime_upgrade_pod_outcome(
+    conn: &Connection,
+    operation_id: RuntimeUpgradeOperationId,
+    pod_uid: &str,
+) -> Result<Option<RuntimeUpgradePodOutcome>> {
+    crate::db::runtime_upgrade_pod_outcome(conn, operation_id, pod_uid)
 }

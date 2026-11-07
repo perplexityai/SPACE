@@ -37,7 +37,7 @@ whose update failed. It restarts Tilt when Tilt was started with other values of
 the settings Tilt reads from its environment once, at start: the list is
 `TILT_SETTINGS` in `up.sh` (the telemetry, Datadog and storage credentials
 modes, the prune and parallel-update switches, `SPACE_LOOP_DEVICE_TARGET`,
-`SPACE_SEED_OUTPUT_DIR`, the Rust artifact mode and profile,
+the [runtime-upgrade bench](#runtime-upgrade-bench) settings, `SPACE_SEED_OUTPUT_DIR`, the Rust artifact mode and profile,
 `SPACE_KIND_RUST_BUILD` and `SPACE_KIND_SUBSTRATE`), each compared with its default, plus the optional
 AWS credentials when storage credentials are `static`. Nothing else restarts
 it, so a refreshed AWS session token in the default mode keeps the running
@@ -537,6 +537,55 @@ SPACE_SMOKE_SUBSTRATE=direct SKIP_BOOTSTRAP=1 \
 
 Leave out `SPACE_SMOKE_KNOWN_FAILURES` to see every listed scenario fail as it
 does on its own. Each scenario that did not pass prints a `rerun:` command.
+
+## Runtime-upgrade bench
+
+`native.runtime_upgrade_stopped_and_start` moves sandboxes from E0 to
+Firecracker 1.17.0 / Linux 6.1.155 (`fc-1.17.0-linux-6.1.155`), so every worker
+must allow that environment, install it and apply the cluster policy that makes
+it the default. A stock bench does none of these. Five settings, all unset by
+default and read by Tilt once at start (`TILT_SETTINGS` in `up.sh`), turn them
+on:
+
+| Setting | Renders | Effect |
+| --- | --- | --- |
+| `SPACE_KIND_ALLOWED_EXECUTION_ENVIRONMENTS` | node-manager `SPACE_ALLOWED_EXECUTION_ENVIRONMENTS` | the node's startup allowlist |
+| `SPACE_KIND_DEFAULT_EXECUTION_ENVIRONMENT` | node-manager `SPACE_DEFAULT_EXECUTION_ENVIRONMENT` | the node's startup default; leave it unset to keep E0 |
+| `SPACE_KIND_RUNTIME_DESIRED_STATE_ENABLED` | internal API `SPACE_INTERNAL_API_RUNTIME_DESIRED_STATE_ENABLED` | serve the cluster execution policy to nodes |
+| `SPACE_KIND_RUNTIME_PROVISIONING_RECIPE_ENABLED` | internal API `SPACE_INTERNAL_API_RUNTIME_PROVISIONING_RECIPE_ENABLED` | serve the provisioning recipe |
+| `SPACE_KIND_RUNTIME_PROVISIONING_PERCENT` | internal API `SPACE_INTERNAL_API_RUNTIME_PROVISIONING_PERCENT` | the share of nodes in the recipe's cohort |
+
+Firecracker 1.17.0 is installed through the provisioning recipe ("Node runtime
+provisioning" in [execution-environments.md](../../../docs/execution-environments.md)).
+The recipe lists every unretired row of `runtime_environments`, which the
+scenario seeds with E0 and the target, and each node's node-ctl asks its
+runtime manager to install the target's Firecracker release and kernel from
+the compiled sources over the pod network. The scenario then waits for every
+worker to enforce the target as its default (`GET
+/admin/api/v1/runtime-environments/nodes`).
+
+```bash
+export SPACE_KIND_ALLOWED_EXECUTION_ENVIRONMENTS=e0,legacy,fc-1.17.0-linux-6.1.155
+export SPACE_KIND_RUNTIME_DESIRED_STATE_ENABLED=true
+export SPACE_KIND_RUNTIME_PROVISIONING_RECIPE_ENABLED=true
+export SPACE_KIND_RUNTIME_PROVISIONING_PERCENT=100
+bash infra/space/kind/scripts/up.sh
+SKIP_BOOTSTRAP=1 SPACE_SMOKE_BACKEND=kind SPACE_SMOKE_API_SURFACE=native \
+  SPACE_DATA_PLANE_URL=http://127.0.0.1:8090 \
+  SPACE_API_TOKEN="$(curl -fsS -X POST http://localhost:8080/auth/v1/sessions \
+    -H 'content-type: application/json' \
+    -d '{"email":"root@local","password":"password"}' | jq -r .token)" \
+  uv run --frozen --python 3.11 -m space_smoke run native.runtime_upgrade_stopped_and_start
+```
+
+The scenario runs only when named, as above: `--all` and `--category native`
+list it as `IGNORED` and skip it, since a stock bench lacks these settings and
+its workers would never enforce the target. On the deployed backend it ends
+with a configuration error before it changes anything. It changes the cluster
+policy for every sandbox while it runs and puts it back afterwards, so run it
+on a bench with nothing else on it. Unset
+the settings and rerun `up.sh` to return to a stock bench; the runtime manager
+leaves the installed release in the node's artifact store.
 
 ## Bring it up
 

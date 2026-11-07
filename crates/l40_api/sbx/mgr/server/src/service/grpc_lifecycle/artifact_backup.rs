@@ -194,9 +194,22 @@ pub(super) fn current_instance_backup_precondition(
                 pplx_space_common_core::artifact_backup_signals::CURRENT_INSTANCE_BACKUP_SANDBOX_FAILED_MARKER
             )));
         }
-        other => {
+        // Being deleted, or quarantined, which only deletion leaves: no
+        // retry backs either up.
+        other @ (SandboxState::Deleting | SandboxState::Quarantined) => {
             return Err(Status::failed_precondition(format!(
                 "cannot back up current instance: sandbox is {other}, must be stopped or suspended"
+            )));
+        }
+        // Any other state may still reach `stopped` or `suspended` on its
+        // own: a lifecycle operation in flight, a running sandbox (a runtime
+        // upgrade's boot kubelet retried, say) or a cleanup that ends
+        // `stopped`. So it's `Aborted`, which a caller may retry, not
+        // `FailedPrecondition`, which callers take as no retry changing it.
+        other => {
+            return Err(Status::aborted(format!(
+                "cannot back up current instance: sandbox is {other}, not yet stopped or \
+                 suspended; retry"
             )));
         }
     };
@@ -792,9 +805,7 @@ impl SandboxManagerService {
                                 },
                             )
                             .await
-                            .map_err(|error| {
-                                Status::internal(format!("adopt stopped disk artifact: {error}"))
-                            })?;
+                            .map_err(stopped_disk_adoption_status)?;
                         let local_path =
                             pplx_space_common_core::host::linux::paths::sandbox_snapshot_dir(
                                 &sandbox.id,
@@ -1317,6 +1328,27 @@ fn capture_generation_from_record(
             "read the capture record in {artifact_dir}: {error}"
         ))
     })
+}
+
+/// The status a failed `CreateBtrfsSnapshot` of a stopped sandbox's disk
+/// answers `EnqueueArtifactBackup` with. node-manager refuses the snapshot
+/// with `Unavailable` while another host mutation holds the sandbox, such as
+/// the network-slot reset that follows its cleanup, so that refusal passes
+/// through for the caller to retry: node-manager answered, so it took no
+/// snapshot. A transport failure also reads `Unavailable`, but it carries the
+/// transport error as its source and may have cut off a snapshot node-manager
+/// took, named for an artifact id this attempt never records; nothing
+/// collects such a `d-stop-*` snapshot, and a caller retrying at once would
+/// leave one per try. So it's internal, like anything else.
+fn stopped_disk_adoption_status(error: Status) -> Status {
+    let message = format!("adopt stopped disk artifact: {error}");
+    let node_manager_refused =
+        error.code() == tonic::Code::Unavailable && std::error::Error::source(&error).is_none();
+    if node_manager_refused {
+        Status::unavailable(message)
+    } else {
+        Status::internal(message)
+    }
 }
 
 /// The status an `EnqueueArtifactBackup` submission failure answers with. A

@@ -2,6 +2,9 @@
 //! helpers.
 
 use super::*;
+use crate::controllers::substrate::kubernetes::pod_runtime_upgrade::PodUpgrade;
+use crate::controllers::substrate::kubernetes::store::StoppedUpgradeRecord;
+use pplx_space_common_core::kubernetes::PodRuntimeUpgradeTargetState;
 
 /// Derive the per-restore placement decision a [`PodCreateContext`] renders,
 /// for the `sandbox.restore.placement` metric. `None` for non-restore creates
@@ -48,6 +51,68 @@ pub(super) fn restore_placement_sample(
     }
 }
 
+/// Record on `assignment` that a pod carrying `upgrade` may exist, so the
+/// materialization's caller treats any error it ends with as node work that
+/// may still run ([`ActivationAttemptAssignment::upgrade_pod_may_run`]):
+/// `pod`, kept for the execution, carries the operation, or, with no pod, a
+/// create rendering it is about to be sent and may commit whatever it answers.
+fn note_upgrade_pod(
+    assignment: Option<&ActivationAttemptAssignment>,
+    upgrade: Option<&PodUpgrade>,
+    pod: Option<&SandboxPodView>,
+) {
+    let (Some(assignment), Some(upgrade)) = (assignment, upgrade) else {
+        return;
+    };
+    if pod.is_none_or(|pod| pod.carries_runtime_upgrade(upgrade.operation_id)) {
+        assignment.set_upgrade_pod_may_run(true);
+    }
+}
+
+/// Why `pod` may not serve a materialization rendering `upgrade` of a sandbox
+/// in `lifecycle` on runtime upgrade grounds alone, or `None`.
+///
+/// A pod serves a runtime upgrade only when it carries that operation: its
+/// shim boots what the pod renders, and the node's report for the operation
+/// is the outcome only of the pod that started it. Any other pod, a crashed
+/// start's included, is replaced under a new generation. A stopped sandbox's
+/// upgrade leaves its pod as a placeholder: the shim stopped the sandbox
+/// again and runs no microVM, and a Wake through the pod carries no network
+/// namespace to launch one. Only that upgrade's own retry, which renders the
+/// same operation, may reuse it; a start that found it left behind replaces
+/// it.
+///
+/// A start or resume upgrade's pod stays the sandbox's running pod, and the
+/// materializations that find it there later render no upgrade (an access, a
+/// start of the started sandbox), so it's stale to one that renders none only
+/// while the sandbox is still `stopped`: there it's an earlier start's, which
+/// ended before the sandbox left `stopped`, and a start that decided against
+/// that upgrade would otherwise boot under its target anyway. A start that
+/// decided the same upgrade renders the same operation and reuses it; one
+/// deciding after the node published the sandbox under the target decides
+/// afresh, and replaces the pod if its decision differs (no Wake was
+/// acknowledged on it, so nothing a client saw is lost).
+fn runtime_upgrade_stale_reason(
+    pod: &SandboxPodView,
+    upgrade: Option<&PodUpgrade>,
+    lifecycle: &str,
+) -> Option<StalePodReason> {
+    let wanted = upgrade.map(|upgrade| upgrade.operation_id.to_string());
+    if pod.annotation(SandboxPodKey::RuntimeUpgradeOperationId) == wanted.as_deref() {
+        return None;
+    }
+    if wanted.is_some() {
+        return Some(StalePodReason::RuntimeUpgradeNotCarried);
+    }
+    if pod.annotation(SandboxPodKey::RuntimeUpgradeTargetState)
+        == Some(PodRuntimeUpgradeTargetState::Stopped.as_str())
+    {
+        return Some(StalePodReason::StoppedRuntimeUpgradePlaceholder);
+    }
+    (normalize_lifecycle(lifecycle) == SandboxLifecycle::Stopped.as_str())
+        .then_some(StalePodReason::RuntimeUpgradeNotRendered)
+}
+
 impl KubernetesSubstrate {
     pub(in crate::controllers::substrate::kubernetes) async fn require_observed_create_claim_in_flight(
         &self,
@@ -79,13 +144,62 @@ impl KubernetesSubstrate {
         })
     }
 
+    /// Adopt `existing` as `claim`'s pod: an earlier attempt created it and
+    /// ended before persisting it. Records the node it's placed on, then its
+    /// UID and address on the execution, which moves the row out of
+    /// `creating`. A persist that finds the execution retired or replaced
+    /// meanwhile is logged, not an error: the claim's new owner decides.
+    async fn hydrate_execution_pod(
+        &self,
+        sandbox_id: SandboxId,
+        claim: &SandboxExecutionClaim,
+        activation_attempt: Option<&ActivationAttemptAssignment>,
+        upgrade: Option<&PodUpgrade>,
+        existing: &SandboxPodView,
+    ) -> Result<(), SubstrateError> {
+        note_upgrade_pod(activation_attempt, upgrade, Some(existing));
+        self.remember_pod_node_placement(
+            sandbox_id,
+            existing,
+            PlacementRetryDisposition::RetryConverges,
+        )
+        .await?;
+        let pod_ip = assigned_pod_ip(existing)?.map(|ip| ip.to_string());
+        if self
+            .store
+            .persist_pod_metadata(
+                sandbox_id,
+                claim.row.generation,
+                existing.uid(),
+                pod_ip.as_deref(),
+            )
+            .await?
+            .is_none()
+        {
+            tracing::warn!(
+                sandbox_id = %sandbox_id,
+                generation = claim.row.generation,
+                "pod hydration no-oped: the claimed execution was retired or replaced \
+                 mid-flight"
+            );
+        }
+        Ok(())
+    }
+
+    /// Why `pod`, at `claim`'s name, may not serve this materialization, or
+    /// `None` to reuse it. `upgrade` is the runtime upgrade the
+    /// materialization renders.
     async fn stale_pod_reason_for_execution(
         &self,
         sandbox: &Sandbox,
         claim: &SandboxExecutionClaim,
         pod: &SandboxPodView,
         suspend_restore_storage_uri: Option<&str>,
+        upgrade: Option<&PodUpgrade>,
     ) -> Result<Option<StalePodReason>, SubstrateError> {
+        if let Some(reason) = runtime_upgrade_stale_reason(pod, upgrade, &sandbox.lifecycle) {
+            return Ok(Some(reason));
+        }
         // Pod phase and restore annotations do not identify a STOP episode.
         // A Running successor may have booted successfully before its owner
         // lost the lease or response; retain it so START can finish publication.
@@ -110,9 +224,16 @@ impl KubernetesSubstrate {
         claim: &SandboxExecutionClaim,
         existing: &SandboxPodView,
         suspend_restore_storage_uri: Option<&str>,
+        upgrade: Option<&PodUpgrade>,
     ) -> Result<bool, SubstrateError> {
         let Some(reason) = self
-            .stale_pod_reason_for_execution(sandbox, claim, existing, suspend_restore_storage_uri)
+            .stale_pod_reason_for_execution(
+                sandbox,
+                claim,
+                existing,
+                suspend_restore_storage_uri,
+                upgrade,
+            )
             .await?
         else {
             return Ok(false);
@@ -179,6 +300,7 @@ impl KubernetesSubstrate {
             restore_lease_token,
             activation_attempt,
             stopped_materialization_artifact_id,
+            runtime_upgrade,
         } = ownership;
         let started_recovery_owner_generation =
             started_recovery.map(StartedRecoveryOwnership::generation);
@@ -255,6 +377,47 @@ impl KubernetesSubstrate {
             self.sweep_lingering_prior_generation_pods(sandbox_id, generation)
                 .await?;
         }
+        // A stopped sandbox's upgrade (target state `stopped`) is recorded on
+        // every execution claimed for it, in the claim's own transaction and
+        // before any pod is created or reused for it: the pod carries this
+        // upgrade, so a retry that finds the execution must render exactly it
+        // again. Its pod is pinned to the disk node the caller checked, which
+        // the claim checks again under the sandbox's lock.
+        let stopped_upgrade_record = match runtime_upgrade.as_ref() {
+            Some(upgrade) if upgrade.target_state == PodRuntimeUpgradeTargetState::Stopped => {
+                let Some(disk_node) = suspend_restore_source_node else {
+                    return Err(SubstrateError::Failed {
+                        message: format!(
+                            "stopped sandbox {sandbox_id}'s runtime upgrade names no disk node to \
+                             pin its pod to"
+                        ),
+                    });
+                };
+                Some(StoppedUpgradeRecord {
+                    upgrade: upgrade.recorded(),
+                    disk_node: disk_node.to_string(),
+                })
+            }
+            _ => None,
+        };
+        // Any other activation of a stopped sandbox, or a drain's
+        // re-placement of one, may be about to take over an execution a
+        // stopped sandbox's runtime upgrade left after reaching its target:
+        // its claim clears the upgrade's record, so the disk backup the
+        // upgrade may still owe is enqueued first. The claim checks again
+        // under the sandbox's lock and refuses retryably if the upgrade still
+        // owes it, with none enqueued here (a lease that ended after this
+        // read).
+        let owed_backup_enqueued = if stopped_upgrade_record.is_none()
+            && matches!(
+                materialization_lifecycle,
+                SandboxLifecycle::Stopped | SandboxLifecycle::Restoring
+            ) {
+            self.enqueue_backup_owed_by_stopped_upgrade(sandbox_id)
+                .await?
+        } else {
+            None
+        };
         let mut claim = self
             .store
             .ensure_active_execution_claim_for_lifecycle(
@@ -264,12 +427,18 @@ impl KubernetesSubstrate {
                 activation_attempt
                     .as_ref()
                     .map(ActivationAttemptAssignment::request),
+                stopped_upgrade_record.as_ref(),
+                owed_backup_enqueued,
             )
             .await?;
         if let Some(activation_attempt) = activation_attempt.as_ref()
             && let Some(assigned_id) = claim.row.activation_attempt_id
         {
-            activation_attempt.record_assigned(assigned_id, claim.row.generation);
+            activation_attempt.record_assigned(
+                assigned_id,
+                claim.row.generation,
+                &claim.row.pod_name,
+            );
         }
         let owns_started_recovery = started_recovery_owner_generation
             .is_some_and(|generation| claim.row.generation >= generation);
@@ -462,10 +631,20 @@ impl KubernetesSubstrate {
             // exactly what unlocks the cache-hit stale-pod classification
             // (`LocalOnlyRestoreNowPortable` -> replace) on the next attempt;
             // skipping it would strand that pod behind the create-in-flight
-            // return for the full stale-create age instead.
+            // return for the full stale-create age instead. A pod the runtime
+            // upgrade rules reject isn't hydrated: the create-in-flight check
+            // below replaces it.
             if let Some(existing) = existing_pod
                 .as_ref()
                 .filter(|existing| !existing.has_required_source_pin())
+                .filter(|existing| {
+                    runtime_upgrade_stale_reason(
+                        existing,
+                        runtime_upgrade.as_ref(),
+                        &sandbox.lifecycle,
+                    )
+                    .is_none()
+                })
                 .filter(|existing| {
                     execution_pod_create_in_flight(claim.row.state)
                         && pod_matches_execution_generation(
@@ -475,31 +654,14 @@ impl KubernetesSubstrate {
                         )
                 })
             {
-                self.remember_pod_node_placement(
+                self.hydrate_execution_pod(
                     sandbox.id,
+                    &claim,
+                    activation_attempt.as_ref(),
+                    runtime_upgrade.as_ref(),
                     existing,
-                    PlacementRetryDisposition::RetryConverges,
                 )
                 .await?;
-                let pod_ip = assigned_pod_ip(existing)?.map(|ip| ip.to_string());
-                if self
-                    .store
-                    .persist_pod_metadata(
-                        sandbox.id,
-                        claim.row.generation,
-                        existing.uid(),
-                        pod_ip.as_deref(),
-                    )
-                    .await?
-                    .is_none()
-                {
-                    tracing::warn!(
-                        sandbox_id = %sandbox.id,
-                        generation = claim.row.generation,
-                        "successor hydration no-oped: the claimed execution was retired \
-                         or replaced mid-flight"
-                    );
-                }
                 return Ok(());
             }
             let pin_state = existing_pod.as_ref().and_then(|existing| {
@@ -527,7 +689,8 @@ impl KubernetesSubstrate {
                     // Boxed so this already-huge async fn's stack frame embeds
                     // only a pointer, not the re-drive sub-future. The re-drive
                     // itself re-verifies the pod with an authoritative GET
-                    // before any teardown.
+                    // before any teardown. Its successor renders the upgrade.
+                    note_upgrade_pod(activation_attempt.as_ref(), runtime_upgrade.as_ref(), None);
                     match Box::pin(self.redrive_unschedulable_restore_cross_node_recorded(
                         crate::metrics::sandbox::restore::RedrivePath::Retry,
                         &sandbox,
@@ -536,6 +699,7 @@ impl KubernetesSubstrate {
                         suspend_restore_source_node,
                         suspend_restore_storage_uri,
                         restore_lease_token,
+                        runtime_upgrade.as_ref(),
                     ))
                     .await?
                     {
@@ -581,12 +745,99 @@ impl KubernetesSubstrate {
                 // normal existing-pod handling below.
             }
         }
-        if !claim.created && execution_pod_create_in_flight(claim.row.state) {
-            if !stale_restore_execution_create(
-                &sandbox.lifecycle,
-                claim.row.state,
-                claim.row.create_age_expired,
-            ) {
+        // Whether this call creates the pod of a `creating` execution it
+        // didn't mint: one rendering a runtime upgrade, under a claim its own
+        // attempt holds, whose pod is confirmed missing.
+        let mut create_missing_upgrade_pod = false;
+        if !claim.created
+            && execution_pod_create_in_flight(claim.row.state)
+            && let Some(upgrade) = runtime_upgrade.as_ref()
+        {
+            // A pod at the claim's name carrying the runtime upgrade this
+            // materialization renders is this execution's: an earlier attempt
+            // of the same operation created it and ended between its POST and
+            // its persist. Hydrate it rather than answering create-in-flight.
+            // A stopped sandbox's upgrade has no restore source for the
+            // hydration above to run on, and a `stopped` claim never ages into
+            // a stale create, so without this its placement, which the stop's
+            // teardown cleared, would never come back, and the node's
+            // publication, accepted only from the node the sandbox is placed
+            // on, would never land. The reflector may not have seen a pod an
+            // attempt on another replica created, so a cache miss is
+            // confirmed with one GET.
+            //
+            // With no pod there, the attempt that claimed the execution ended
+            // before its create was sent, and a create still in flight is
+            // only one this call's claim superseded: every claim, takeover,
+            // expiry and record refreshes the execution, so it never ages
+            // into a stale create while an upgrade's retries keep coming, and
+            // answering create-in-flight would leave each retry without a pod
+            // to read. So the attempt holding the claim creates it, at the
+            // claim's name: a superseded create that lands first conflicts,
+            // and the conflict path reads the pod it left.
+            // The claim's pod name fixes its generation.
+            let existing = self
+                .lookup_or_fetch_sandbox_pod(&pod_name)
+                .await
+                .map_err(|err| {
+                    kube_error_for_substrate("failed to read the runtime upgrade's pod", err)
+                })?;
+            match existing {
+                Some(existing) if existing.carries_runtime_upgrade(upgrade.operation_id) => {
+                    self.hydrate_execution_pod(
+                        sandbox.id,
+                        &claim,
+                        activation_attempt.as_ref(),
+                        runtime_upgrade.as_ref(),
+                        &existing,
+                    )
+                    .await?;
+                    return Ok(());
+                }
+                Some(_) => {}
+                // No pod at the claim's name: this attempt holds the claim
+                // (assigned under the claim's row lock, refused while another
+                // lease runs), so it creates the pod rather than waiting on a
+                // create no attempt is making. This covers a start's or
+                // resume's upgrade as well as the stopped upgrade's. A create
+                // still in flight lands at the same name and meets the
+                // conflict path, which reuses the pod carrying the operation.
+                None => {
+                    create_missing_upgrade_pod = activation_attempt
+                        .as_ref()
+                        .and_then(ActivationAttemptAssignment::assigned_id)
+                        .is_some();
+                }
+            }
+        }
+        if !create_missing_upgrade_pod
+            && !claim.created
+            && execution_pod_create_in_flight(claim.row.state)
+        {
+            // A cached pod at the claim's name that the runtime upgrade rules
+            // reject isn't a create still in flight for this materialization:
+            // an activation that ended before persisting its pod left it, and
+            // the claim moved on. Reusing it would Wake an upgrade's
+            // placeholder, or read a start's pod as an upgrade's outcome, so
+            // it's confirmed and replaced below like a stale create. A cache
+            // miss keeps the in-flight answer; a call once the reflector has
+            // the pod replaces it.
+            let runtime_upgrade_rejects_cached_pod =
+                self.lookup_sandbox_pod(&pod_name).is_some_and(|cached| {
+                    runtime_upgrade_stale_reason(
+                        &cached,
+                        runtime_upgrade.as_ref(),
+                        &sandbox.lifecycle,
+                    )
+                    .is_some()
+                });
+            if !runtime_upgrade_rejects_cached_pod
+                && !stale_restore_execution_create(
+                    &sandbox.lifecycle,
+                    claim.row.state,
+                    claim.row.create_age_expired,
+                )
+            {
                 let pod_create_context = self
                     .pod_create_context_for_claim(
                         &sandbox,
@@ -617,6 +868,7 @@ impl KubernetesSubstrate {
                         &claim,
                         existing,
                         suspend_restore_storage_uri,
+                        runtime_upgrade.as_ref(),
                     )
                     .await?
                 {
@@ -642,31 +894,14 @@ impl KubernetesSubstrate {
                     }
                     reason.to_string()
                 } else {
-                    self.remember_pod_node_placement(
+                    self.hydrate_execution_pod(
                         sandbox.id,
+                        &claim,
+                        activation_attempt.as_ref(),
+                        runtime_upgrade.as_ref(),
                         existing,
-                        PlacementRetryDisposition::RetryConverges,
                     )
                     .await?;
-                    let pod_ip = assigned_pod_ip(existing)?.map(|ip| ip.to_string());
-                    if self
-                        .store
-                        .persist_pod_metadata(
-                            sandbox.id,
-                            claim.row.generation,
-                            existing.uid(),
-                            pod_ip.as_deref(),
-                        )
-                        .await?
-                        .is_none()
-                    {
-                        tracing::warn!(
-                            sandbox_id = %sandbox.id,
-                            generation = claim.row.generation,
-                            "pod metadata write no-oped: the claimed execution was retired \
-                             or replaced mid-flight"
-                        );
-                    }
                     return Ok(());
                 }
             } else {
@@ -690,6 +925,7 @@ impl KubernetesSubstrate {
                     activation_attempt
                         .as_ref()
                         .map(ActivationAttemptAssignment::request),
+                    stopped_upgrade_record.as_ref(),
                 )
                 .await?
             else {
@@ -712,7 +948,11 @@ impl KubernetesSubstrate {
             if let Some(activation_attempt) = activation_attempt.as_ref()
                 && let Some(assigned_id) = claim.row.activation_attempt_id
             {
-                activation_attempt.record_assigned(assigned_id, claim.row.generation);
+                activation_attempt.record_assigned(
+                    assigned_id,
+                    claim.row.generation,
+                    &claim.row.pod_name,
+                );
             }
             pod_name = claim.row.pod_name.clone();
         }
@@ -744,6 +984,7 @@ impl KubernetesSubstrate {
                         &claim,
                         &existing,
                         suspend_restore_storage_uri,
+                        runtime_upgrade.as_ref(),
                     )
                     .await?
                 {
@@ -818,6 +1059,7 @@ impl KubernetesSubstrate {
                                 activation_attempt
                                     .as_ref()
                                     .map(ActivationAttemptAssignment::request),
+                                stopped_upgrade_record.as_ref(),
                             )
                             .await?
                         else {
@@ -844,10 +1086,19 @@ impl KubernetesSubstrate {
                         if let Some(activation_attempt) = activation_attempt.as_ref()
                             && let Some(assigned_id) = claim.row.activation_attempt_id
                         {
-                            activation_attempt.record_assigned(assigned_id, claim.row.generation);
+                            activation_attempt.record_assigned(
+                                assigned_id,
+                                claim.row.generation,
+                                &claim.row.pod_name,
+                            );
                         }
                     }
                 } else {
+                    note_upgrade_pod(
+                        activation_attempt.as_ref(),
+                        runtime_upgrade.as_ref(),
+                        Some(&*existing),
+                    );
                     let _ = self
                         .remember_pod_node_placement(
                             sandbox.id,
@@ -912,7 +1163,10 @@ impl KubernetesSubstrate {
                 }
             };
 
-        if !claim.created && execution_pod_create_in_flight(claim.row.state) {
+        if !create_missing_upgrade_pod
+            && !claim.created
+            && execution_pod_create_in_flight(claim.row.state)
+        {
             self.require_observed_create_claim_in_flight(&sandbox, &claim)
                 .await?;
             return Ok(());
@@ -939,7 +1193,8 @@ impl KubernetesSubstrate {
                 suspend_restore_source_node,
                 suspend_restore_storage_uri,
             )
-            .await?;
+            .await?
+            .upgrading_runtime(runtime_upgrade.as_ref());
         // Snapshot the placement decision before the context is consumed by
         // `sandbox_pod_request`; emitted once below on a confirmed fresh create,
         // after any in-request cross-node re-drive so it reflects the landing site.
@@ -1042,6 +1297,7 @@ impl KubernetesSubstrate {
             return Ok(());
         }
 
+        note_upgrade_pod(activation_attempt.as_ref(), runtime_upgrade.as_ref(), None);
         let pod_result = create_sandbox_pod(
             &self.k8s,
             self.sandbox_pod_request(
@@ -1081,37 +1337,63 @@ impl KubernetesSubstrate {
                         )));
                     }
                 };
+                // This create didn't commit; only the pod found in its place
+                // may carry the upgrade.
+                if let Some(activation_attempt) = activation_attempt.as_ref() {
+                    activation_attempt.set_upgrade_pod_may_run(false);
+                }
                 if self
                     .cleanup_stale_existing_pod_after_create_error(
                         &sandbox,
                         &claim,
                         &existing,
                         suspend_restore_storage_uri,
+                        runtime_upgrade.as_ref(),
                     )
                     .await?
                 {
                     return Ok(());
                 }
+                note_upgrade_pod(
+                    activation_attempt.as_ref(),
+                    runtime_upgrade.as_ref(),
+                    Some(&*existing),
+                );
                 (existing, false)
             }
             Err(err) => {
                 let create_error = format!("failed to create sandbox pod: {err}");
                 match fetch_sandbox_pod_uncached(&self.k8s, &claim.row.pod_name).await {
                     Ok(Some(existing)) => {
+                        // Whether or not this create committed, the pod at
+                        // the name is the one that may carry the upgrade.
+                        if let Some(activation_attempt) = activation_attempt.as_ref() {
+                            activation_attempt.set_upgrade_pod_may_run(false);
+                        }
                         if self
                             .cleanup_stale_existing_pod_after_create_error(
                                 &sandbox,
                                 &claim,
                                 &existing,
                                 suspend_restore_storage_uri,
+                                runtime_upgrade.as_ref(),
                             )
                             .await?
                         {
                             return Ok(());
                         }
+                        note_upgrade_pod(
+                            activation_attempt.as_ref(),
+                            runtime_upgrade.as_ref(),
+                            Some(&*existing),
+                        );
                         (existing, false)
                     }
                     Ok(None) => {
+                        // Confirmed absent: no shim runs the upgrade.
+                        if let Some(activation_attempt) = activation_attempt.as_ref() {
+                            activation_attempt.set_upgrade_pod_may_run(false);
+                        }
                         let _ = self
                             .store
                             .abandon_created_unmaterialized_create_claim(sandbox.id, &claim)
@@ -1151,6 +1433,11 @@ impl KubernetesSubstrate {
         {
             Ok(Some(_)) => {}
             Ok(None) => {
+                // Deleted even when the pod carries a runtime upgrade, the one
+                // failure after an upgrade's create that removes its pod and
+                // tracking. That's safe: another activation owns the
+                // execution, so nothing of this attempt waits on the pod, and
+                // the node's settle rolls back a boot the delete interrupts.
                 if created {
                     tracing::info!(
                         sandbox_id = %sandbox.id,
@@ -1169,7 +1456,13 @@ impl KubernetesSubstrate {
                 return Ok(());
             }
             Err(error) => {
-                if !created {
+                // A created pod carrying a runtime upgrade may already be
+                // booting it or rolling it back, and this attempt still owns
+                // its execution (unlike the revoked case above): deleting it
+                // would interrupt that and lose the execution a retry
+                // replays. Keep both; a retry hydrates the pod's metadata and
+                // reads the outcome.
+                if !created || runtime_upgrade.is_some() {
                     return Err(SubstrateError::restore_in_flight(format!(
                         "{error}; existing Kubernetes pod {} may still be live because its \
                          materialization metadata was not persisted",
@@ -1277,6 +1570,7 @@ impl KubernetesSubstrate {
                         suspend_restore_source_node,
                         suspend_restore_storage_uri,
                         restore_lease_token,
+                        runtime_upgrade.as_ref(),
                     ))
                     .await?
                     {

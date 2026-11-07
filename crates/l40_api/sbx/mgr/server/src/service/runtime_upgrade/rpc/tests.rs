@@ -195,7 +195,9 @@ fn node_reaching_the_boot(
 /// the upgrade reaches its boot. This harness can't launch a microVM, so the
 /// boot fails and the upgrade rolls back from its boot phase (restoring the
 /// preserved disk), leaving the old pair and the rollback as the operation's
-/// recorded outcome.
+/// recorded outcome, for the pod that ran it. The pod's create failed, so
+/// kubelet retries it under the same pod UID: that retry gets the rollback
+/// back and never fences or touches the disk again.
 #[tokio::test]
 async fn a_pods_upgrade_boots_in_the_pods_namespace_under_the_target() {
     let calls = Arc::new(Mutex::new(Vec::new()));
@@ -254,6 +256,24 @@ async fn a_pods_upgrade_boots_in_the_pods_namespace_under_the_target() {
             .is_some_and(|failure| failure.contains("cold boot failed")),
         "{reported:?}"
     );
+    assert_eq!(reported.pod_uid.as_deref(), Some(POD_UID));
+
+    let disk_calls = calls.lock().unwrap().len();
+    let retry = upgrade(
+        &f.service,
+        pod_upgrade(
+            &f.sandbox_id,
+            &target,
+            operation_id,
+            WakeTargetState::Stopped,
+        ),
+    )
+    .await
+    .expect_err("a retry from the same pod gets its rollback back");
+    assert_eq!(retry.code(), tonic::Code::FailedPrecondition, "{retry}");
+    assert!(retry.message().contains("cold boot failed"), "{retry}");
+    assert_eq!(calls.lock().unwrap().len(), disk_calls, "{:?}", calls);
+    assert_eq!(report(&f.service, &f.sandbox_id, operation_id), reported);
 }
 
 /// A sandbox already on the target fences nothing, records that, and leaves a
@@ -341,8 +361,20 @@ async fn a_started_target_already_reached_is_activated_in_place() {
     assert_eq!(activated.message(), plain.message());
     // The start was claimed before it ran. This harness refuses it before
     // the activation begins, so the sandbox is still at rest on the execution
-    // it had, and a retry of the operation may try it again.
-    let retried = upgrade(
+    // it had, and a retry of the operation from a new pod may try it again.
+    // The refused pod's own retry gets its refusal back.
+    let mut from_new_pod = pod_upgrade(
+        &f.sandbox_id,
+        &target,
+        operation_id,
+        WakeTargetState::Started,
+    );
+    from_new_pod.start.as_mut().unwrap().route_identity =
+        Some(pod_identity(&f.sandbox_id, OTHER_POD_UID, 4));
+    let retried = upgrade(&f.service, from_new_pod).await.unwrap_err();
+    assert_eq!(retried.code(), plain.code(), "{retried} / {plain}");
+    assert_eq!(retried.message(), plain.message());
+    let same_pod = upgrade(
         &f.service,
         pod_upgrade(
             &f.sandbox_id,
@@ -353,8 +385,12 @@ async fn a_started_target_already_reached_is_activated_in_place() {
     )
     .await
     .unwrap_err();
-    assert_eq!(retried.code(), plain.code(), "{retried} / {plain}");
-    assert_eq!(retried.message(), plain.message());
+    assert_eq!(same_pod.code(), tonic::Code::FailedPrecondition);
+    assert!(
+        same_pod.message().contains("only a new pod retries it")
+            && same_pod.message().contains(plain.message()),
+        "{same_pod}"
+    );
     // The control plane reads that the operation claimed its start.
     let reported = report(&f.service, &f.sandbox_id, operation_id);
     assert_eq!(
@@ -436,6 +472,7 @@ fn retire(
             },
             checkpoint_dir_identity: None,
             previous_execution: &f.source,
+            pod_uid: None,
         },
     )
     .unwrap();
@@ -1091,6 +1128,7 @@ async fn an_activated_upgrade_never_starts_its_sandbox_again() {
                         target_state: crate::db::RuntimeUpgradeTargetState::Started,
                         authorization_id: authorization().authorization_id,
                     },
+                    None,
                 )
                 .unwrap()
             );
@@ -1650,4 +1688,183 @@ async fn an_activation_in_place_answers_only_a_sandbox_still_running_the_pods_ex
         .answer_after_activation(operation(), &start)
         .unwrap_err();
     assert_eq!(gone.code(), tonic::Code::FailedPrecondition, "{gone}");
+}
+
+/// How a started target reached its target before refusing the pod's create.
+#[derive(Clone, Copy, Debug)]
+enum Reached {
+    /// The node upgraded the sandbox (the operation retired).
+    Upgraded,
+    /// The node found the sandbox on the target already.
+    AlreadyOnTarget,
+}
+
+/// A started target's operation that reached its target, upgraded or found
+/// there, but refused the pod's create (here, the sandbox runs another
+/// pod's execution) leaves that pod pending in its create, which kubelet
+/// retries under the same pod UID. The node records the refusal for that pod
+/// and reports it, so the control plane can settle on it, and the refusal is
+/// final for the pod: its retry gets it back even once the sandbox would run
+/// for it, while a retry from a new pod is answered afresh. A request that
+/// names no pod, or a stopped target's, records nothing.
+#[tokio::test]
+async fn a_started_targets_refused_create_is_recorded_and_final_for_its_pod() {
+    const NEW_POD_UID: &str = "1b7e4c2a-3f5d-4e6a-9c8b-7d6e5f4a3b20";
+    for reached in [Reached::Upgraded, Reached::AlreadyOnTarget] {
+        let f = fixture(SandboxState::Stopped, false, FakeNodeManager::default());
+        let target = certified_target(&f.source);
+        let operation_id = operation();
+        let expected_status = match reached {
+            Reached::Upgraded => {
+                retire(
+                    &f,
+                    &target,
+                    operation_id,
+                    crate::db::RuntimeUpgradeTargetState::Started,
+                );
+                RuntimeUpgradeStatus::Upgraded
+            }
+            Reached::AlreadyOnTarget => {
+                f.put_on(&target);
+                RuntimeUpgradeStatus::AlreadyOnTarget
+            }
+        };
+        run_as(&f, &pod_identity(&f.sandbox_id, OTHER_POD_UID, 4));
+        let service = f.live_service();
+        let request = |pod_uid: &str| {
+            let mut request = pod_upgrade(
+                &f.sandbox_id,
+                &target,
+                operation_id,
+                WakeTargetState::Started,
+            );
+            request.start.as_mut().unwrap().route_identity =
+                Some(pod_identity(&f.sandbox_id, pod_uid, 4));
+            request
+        };
+
+        let refused = upgrade(&service, request(POD_UID)).await.unwrap_err();
+
+        assert_eq!(refused.code(), tonic::Code::FailedPrecondition, "{refused}");
+        let reported = report(&f.service, &f.sandbox_id, operation_id);
+        assert_eq!(reported.status, expected_status as i32, "{reached:?}");
+        assert_eq!(reported.refused_pod_uid.as_deref(), Some(POD_UID));
+        assert_eq!(
+            reported.refused_pod_failure.as_deref(),
+            Some(refused.message()),
+            "{reached:?}"
+        );
+
+        // Final for that pod: once the sandbox runs its execution, a fresh
+        // answer would hand it over, but the retry gets the refusal back.
+        run_as(&f, &pod_identity(&f.sandbox_id, POD_UID, 4));
+        let retried = upgrade(&service, request(POD_UID)).await.unwrap_err();
+        assert_eq!(retried.code(), tonic::Code::FailedPrecondition, "{retried}");
+        assert!(
+            retried.message().contains("only a new pod retries it")
+                && retried.message().contains(refused.message()),
+            "{reached:?}: {retried}"
+        );
+        assert_eq!(f.row().state, SandboxState::Started);
+
+        // A new pod is answered afresh, and its refusal is the one reported.
+        let fresh = upgrade(&service, request(NEW_POD_UID)).await.unwrap_err();
+        assert!(
+            !fresh.message().contains("only a new pod retries it"),
+            "{reached:?}: {fresh}"
+        );
+        let reported = report(&f.service, &f.sandbox_id, operation_id);
+        assert_eq!(reported.refused_pod_uid.as_deref(), Some(NEW_POD_UID));
+        f.assert_no_node_calls();
+    }
+
+    // A started target's request that names no pod, and a stopped target's
+    // that does, record no pod's refusal.
+    for (pod_uid, target_state) in [
+        (None, WakeTargetState::Started),
+        (Some(POD_UID), WakeTargetState::Stopped),
+    ] {
+        let f = fixture(SandboxState::Stopped, false, FakeNodeManager::default());
+        let target = certified_target(&f.source);
+        f.put_on(&target);
+        run_as(&f, &pod_identity(&f.sandbox_id, OTHER_POD_UID, 4));
+        let operation_id = operation();
+        let mut request = pod_upgrade(&f.sandbox_id, &target, operation_id, target_state);
+        let identity = request
+            .start
+            .as_mut()
+            .unwrap()
+            .route_identity
+            .as_mut()
+            .unwrap();
+        if pod_uid.is_none() {
+            identity.pod_uid = None;
+            identity.substrate_kind = SandboxSubstrateKind::Direct as i32;
+        }
+
+        // Its runtime isn't live, so not even a caller that names no pod
+        // gets it.
+        upgrade(&f.service, request).await.unwrap_err();
+
+        let reported = report(&f.service, &f.sandbox_id, operation_id);
+        assert_eq!(
+            reported.status,
+            RuntimeUpgradeStatus::AlreadyOnTarget as i32
+        );
+        assert_eq!(reported.refused_pod_uid, None, "{target_state:?}");
+    }
+}
+
+/// An error for a pod whose execution the sandbox does run (a start that
+/// failed after its guest was ready, say), started or paused since, records
+/// no refusal: kubelet's retry of the pod's create is answered with that
+/// execution.
+#[tokio::test]
+async fn an_error_for_the_pod_the_sandbox_runs_records_no_refusal() {
+    for (runner, state, recorded) in [
+        (POD_UID, "started", false),
+        (POD_UID, "paused", false),
+        (OTHER_POD_UID, "started", true),
+        (OTHER_POD_UID, "paused", true),
+    ] {
+        let f = fixture(SandboxState::Stopped, false, FakeNodeManager::default());
+        let target = certified_target(&f.source);
+        let operation_id = operation();
+        retire(
+            &f,
+            &target,
+            operation_id,
+            crate::db::RuntimeUpgradeTargetState::Started,
+        );
+        run_as(&f, &pod_identity(&f.sandbox_id, runner, 4));
+        f.service
+            .db
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE sandboxes SET state = ?2 WHERE id = ?1",
+                crate::db::fixture::params![f.sandbox_id, state],
+            )
+            .unwrap();
+        let request = pod_upgrade(
+            &f.sandbox_id,
+            &target,
+            operation_id,
+            WakeTargetState::Started,
+        );
+
+        f.service.record_refused_pod(
+            operation_id,
+            POD_UID,
+            request.start.as_ref().unwrap(),
+            &Status::internal("the gateway push failed after readiness"),
+        );
+
+        let reported = report(&f.service, &f.sandbox_id, operation_id);
+        assert_eq!(
+            reported.refused_pod_uid.is_some(),
+            recorded,
+            "{runner} {state}: {reported:?}"
+        );
+    }
 }

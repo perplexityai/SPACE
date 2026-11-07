@@ -115,9 +115,17 @@ service SandboxManager {
   // the old checkpoint. Files survive; memory and processes don't. A failed
   // boot restores the old pair and releases the fence. Idempotent per
   // `operation_id`: a retry resumes or settles the same upgrade. A rolled-back
-  // upgrade keeps only its outcome, so a retry after it starts over. A
-  // sandbox already on the target is activated in place for a STARTED
-  // target, and a suspended one absent from the node may be staged first;
+  // upgrade keeps only its outcome, recorded for the pod its `start` named
+  // (`route_identity.pod_uid`), and so does a request refused before it
+  // fenced anything with FAILED_PRECONDITION or INVALID_ARGUMENT, which a
+  // retry can't change. Either is final for that pod, even after a later
+  // pod's outcome replaces it in `GetRuntimeUpgrade`: a retry from the same
+  // pod UID gets the recorded failure back with FAILED_PRECONDITION and never
+  // fences or boots again. Any other refusal is left unrecorded, so a retry
+  // from the same pod tries again. A retry from a new pod, or one naming no
+  // pod, starts over. A sandbox already on the target is activated in place
+  // for a STARTED target, and a suspended one absent from the node may be
+  // staged first;
   // see `UpgradeRuntimeRequest.target_state` and `stage_from`, and
   // `GetRuntimeUpgrade` for what the node records.
   rpc UpgradeRuntime(UpgradeRuntimeRequest) returns (UpgradeRuntimeResponse);
@@ -1292,19 +1300,32 @@ message GetRuntimeUpgradeRequest {
 
 enum RuntimeUpgradeStatus {
   RUNTIME_UPGRADE_STATUS_UNSPECIFIED = 0;
-  // The node holds no record of the operation: it never reached this node,
-  // it was refused before fencing anything, or the sandbox was deleted from
-  // this node since, with its upgrade records.
+  // The node holds no record of the operation: it never reached this node;
+  // every request for it was refused before fencing anything with no
+  // refusal recorded (one refused before the node read it, as malformed, as
+  // unauthorized, or before it could take the sandbox's upgrade lock; one
+  // that named no pod; one for a sandbox absent from the node; one a retry
+  // may not repeat, which is anything but FAILED_PRECONDITION or
+  // INVALID_ARGUMENT; or one whose refusal the node failed to write); or the
+  // sandbox was deleted from this node since, with its upgrade records.
   RUNTIME_UPGRADE_STATUS_ABSENT = 1;
   // The upgrade fences the sandbox, or its verified boot hasn't retired the
   // old checkpoint yet. `phase` says which.
   RUNTIME_UPGRADE_STATUS_IN_PROGRESS = 2;
   // The sandbox booted under the target and its old checkpoint is retired.
   RUNTIME_UPGRADE_STATUS_UPGRADED = 3;
-  // The old disk/checkpoint pair is back; `failure` says why.
+  // The old disk/checkpoint pair is back; `failure` says why. Final for the
+  // pod `pod_uid` names; see `UpgradeRuntime`.
   RUNTIME_UPGRADE_STATUS_ROLLED_BACK = 4;
   // The sandbox was already on the target; nothing was fenced or booted.
   RUNTIME_UPGRADE_STATUS_ALREADY_ON_TARGET = 5;
+  // The request from the pod `pod_uid` names was refused before it fenced
+  // anything, with FAILED_PRECONDITION or INVALID_ARGUMENT; `failure` says
+  // why. Final for that pod, as a rollback is. Recorded only for a request
+  // that named its pod, on a node holding the sandbox; it replaces an earlier
+  // pod's rollback or refusal as the reported outcome (each stays final for
+  // its own pod), never an ALREADY_ON_TARGET outcome.
+  RUNTIME_UPGRADE_STATUS_REFUSED = 6;
 }
 
 // The phase of an upgrade that's IN_PROGRESS.
@@ -1326,7 +1347,7 @@ message GetRuntimeUpgradeResponse {
   RuntimeUpgradeStatus status = 1;
   // Set with IN_PROGRESS.
   RuntimeUpgradePhase phase = 2;
-  // Set with ROLLED_BACK when the node recorded a reason.
+  // Set with ROLLED_BACK or REFUSED when the node recorded a reason.
   optional string failure = 3;
   // With ALREADY_ON_TARGET: the operation's `UpgradeRuntime` claimed its
   // activation for a STARTED target, either by claiming the start of the
@@ -1340,6 +1361,27 @@ message GetRuntimeUpgradeResponse {
   // operation id; a start refused before its activation claimed the sandbox
   // may be retried under the same one.
   bool activation_claimed = 4;
+  // The pod the reported attempt ran for: the pod UID the `start` of the
+  // `UpgradeRuntime` request that began it, or that was refused or found the
+  // target, named. Unset for a request that named no pod and for anything
+  // recorded by a node that predates this field, which proves nothing about
+  // any pod. A ROLLED_BACK or REFUSED report is final for the pod it names
+  // only: a caller waiting on a pod settles on one only when it names that
+  // pod, since until a retry from a new pod reaches the node, the report is
+  // the earlier pod's.
+  optional string pod_uid = 5;
+  // With UPGRADED or ALREADY_ON_TARGET: the latest pod whose `UpgradeRuntime`
+  // for a STARTED target the node answered with an error after the operation
+  // reached that status, so the sandbox doesn't run for that pod (its create
+  // failed and the pod stays pending while kubelet retries it). Final for that
+  // pod, as a rollback is: its retries get the recorded error back and never
+  // activate the sandbox, while a retry from a new pod tries again. A caller
+  // waiting on a pod settles on it only when it names that pod. Unset when no
+  // pod's create was refused that way, and from a node that predates the
+  // field.
+  optional string refused_pod_uid = 6;
+  // With `refused_pod_uid`: the error that pod's create got, when recorded.
+  optional string refused_pod_failure = 7;
 }
 
 message EnableSnapshotsRequest { string sandbox_id = 1; }

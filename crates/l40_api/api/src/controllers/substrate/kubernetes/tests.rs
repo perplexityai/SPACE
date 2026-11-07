@@ -16,14 +16,17 @@ pub(crate) use kubernetes_tests::{
     insert_test_sandbox_row, mock_kubernetes_client, node_api_pod_on_node, node_with_network_slots,
     paused_restore_test_subject, running_pod_kubernetes_client,
     running_pod_kubernetes_client_with_create_barrier, sandbox_pod_on_node,
-    start_sequenced_wake_worker, substrate_with_inventory_caches_and_pool, substrate_with_store,
+    substrate_with_inventory_caches_and_pool, substrate_with_store,
     substrate_with_store_and_client, substrate_with_store_client_pods_and_nodes,
     substrate_with_store_client_proxy_port_and_pod,
-    substrate_with_store_client_proxy_port_and_pods, substrate_with_unreachable_store,
+    substrate_with_store_client_proxy_port_and_pods,
+    substrate_with_store_client_proxy_port_pods_and_nodes, substrate_with_unreachable_store,
 };
 
+mod leftover_upgrade_pod;
 mod native_pod_failover;
 mod runtime_upgrade_dispatch;
+pub(super) mod stopped_runtime_upgrade;
 mod substrate_scope;
 
 mod kubernetes_tests {
@@ -741,10 +744,10 @@ mod kubernetes_tests {
             nodes,
         );
 
-        assert!(substrate.started_recovery_source_node_available("healthy"));
+        assert!(substrate.local_source_node_available("healthy"));
         for unavailable in ["blocked", "wrong-selector", "full"] {
             assert!(
-                !substrate.started_recovery_source_node_available(unavailable),
+                !substrate.local_source_node_available(unavailable),
                 "{unavailable} must not receive a direct nodeName restore"
             );
         }
@@ -1915,7 +1918,7 @@ mod kubernetes_tests {
         )
     }
 
-    fn substrate_with_store_client_proxy_port_pods_and_nodes(
+    pub(crate) fn substrate_with_store_client_proxy_port_pods_and_nodes(
         pool: PgPool,
         client: Client,
         sandbox_proxy_port: u16,
@@ -7525,6 +7528,7 @@ mod kubernetes_tests {
                 suspend_restore_source_node: Some("source-node"),
                 direct_node_name: Some("source-node"),
                 preferred_node_name: None,
+                runtime_upgrade: None,
             }),
             PodCreateContext::Restore(RestoreContext::Evacuation {
                 stopped_materialization: None,
@@ -9582,6 +9586,7 @@ mod kubernetes_tests {
             suspend_restore_source_node: Some("source-node"),
             direct_node_name: Some("source-node"),
             preferred_node_name: None,
+            runtime_upgrade: None,
         });
 
         let error = substrate
@@ -10874,6 +10879,7 @@ mod kubernetes_tests {
                     suspend_restore_source_node: Some("source-node"),
                     direct_node_name: None,
                     preferred_node_name: Some("source-node"),
+                    runtime_upgrade: None,
                 }))
             ),
             "a durable disk artifact must downgrade the stopped restart's node pin to a \
@@ -10958,6 +10964,7 @@ mod kubernetes_tests {
                 suspend_restore_source_node: None,
                 direct_node_name: None,
                 preferred_node_name: None,
+                runtime_upgrade: None,
             }))
         ));
     }

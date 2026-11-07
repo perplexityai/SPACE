@@ -63,6 +63,7 @@
 //! | Retire retry | Nothing retries a failed Direct retire (see below) | ac-pplx | The sweeper's failed-cleanup retry running for both substrates |
 //! | Drain and evacuation | [`SubstrateCapabilities::supports_node_drain`] is false. Admin `:drain`, `:terminate`, `:cordon`, `:uncordon` and `:force-upload-local-snapshots` return 501 before reading or writing the node. `:undrain` clears a `draining` or `drained` phase an earlier drain left, without a substrate call | ac-pplx | Core drain and evacuation for both substrates over a Direct `set_node_schedulability` |
 //! | Drain, orphan, failed-row repair and node-sync loops | Not started on Direct (below) | ac-pplx | Those loops running for both substrates through the adapter |
+//! | Runtime upgrade of a stopped sandbox without starting it (`upgrade_stopped_runtime`) | `Unsupported`. Direct decides no runtime upgrades at all: its starts and restores run as recorded | the-gigi-pplx | The runtime-upgrade decision running for Direct, and a boot of the upgrade on the node holding the disk |
 //!
 //! # Kubernetes-only reconcilers
 //!
@@ -4543,6 +4544,18 @@ impl SubstrateAdapter for DirectSubstrate {
         self.clear_direct_route_identity(sandbox_id).await?;
 
         Ok(RetireExecutionOutcome::Retired)
+    }
+
+    async fn upgrade_stopped_runtime(
+        &self,
+        _sandbox_id: SandboxId,
+        _timeout: std::time::Duration,
+    ) -> Result<super::runtime_upgrade::StoppedRuntimeUpgrade, SubstrateError> {
+        Err(SubstrateError::Unsupported {
+            message: "upgrading a stopped sandbox's runtime without starting it isn't supported \
+                      on the Direct substrate"
+                .to_string(),
+        })
     }
 
     async fn start_execution(

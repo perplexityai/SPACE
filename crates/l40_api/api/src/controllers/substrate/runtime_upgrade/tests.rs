@@ -417,23 +417,23 @@ fn a_retry_names_the_same_operation_and_a_new_subject_a_new_one() {
     ] {
         assert_ne!(operation, other);
     }
-    // The authorization names the environment's state, not a policy
-    // generation, so a retry after an unrelated policy write names the same
-    // upgrade under the same authorization.
-    let checkpoint = pplx_space_common_core::types::LocalArtifactId::new();
-    let upgrade = to_default.wake_upgrade(
-        sandbox,
-        UpgradeActivation::Restore,
-        "snapshot-a",
-        Some(checkpoint),
-    );
+    // Leaving the sandbox stopped is another operation than starting it from
+    // the same execution: a node refuses an id reused for another target
+    // state, so a start after a stopped upgrade rolled back would otherwise
+    // be refused for good. It is just as stable across retries.
+    let stay_stopped = to_default.stay_stopped_operation_id(sandbox, "execution-a");
     assert_eq!(
-        upgrade.checkpoint_local_artifact_id,
-        Some(checkpoint.to_string())
+        stay_stopped,
+        to_default.stay_stopped_operation_id(sandbox, "execution-a")
     );
-    assert_eq!(upgrade.operation_id, operation.to_string());
-    assert_eq!(upgrade.target_environment, e1().to_string());
-    assert!(upgrade.authorization.unwrap().memory_loss);
+    for other in [
+        to_default.operation_id(sandbox, UpgradeActivation::Start, "execution-a"),
+        to_default.operation_id(sandbox, UpgradeActivation::Restore, "execution-a"),
+        to_default.stay_stopped_operation_id(sandbox, "execution-b"),
+        to_default.stay_stopped_operation_id(SandboxId::new(), "execution-a"),
+    ] {
+        assert_ne!(stay_stopped, other);
+    }
 }
 
 #[test]

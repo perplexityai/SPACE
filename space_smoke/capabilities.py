@@ -1787,6 +1787,99 @@ class ExecutionRow:
 
 
 @dataclass(frozen=True)
+class PublishedExecution:
+    """What the node last published for a sandbox (`sandbox_observed_states`):
+    its status and the execution environment its execution records."""
+
+    status: str | None
+    environment: str | None
+
+
+@dataclass(frozen=True)
+class CatalogRowSnapshot:
+    """A catalog row's reference and the columns a seed's upsert overwrites:
+    its upgrade edges, its memory edges (a subset of the upgrade edges) and
+    its retirement time (epoch seconds, None when it isn't retired)."""
+
+    environment_ref: str
+    upgrade_edges: tuple[str, ...]
+    memory_edges: tuple[str, ...]
+    retired_at_epoch: str | None
+
+
+@dataclass(frozen=True)
+class RuntimeEnvironmentSnapshot:
+    """The execution environment catalog and cluster policy as captured before a
+    scenario changed them: the catalog rows that already existed, the policy
+    row's default, legacy permission and generation, and every environment
+    state."""
+
+    catalog: tuple[CatalogRowSnapshot, ...]
+    default_environment_ref: str | None
+    legacy_unbound_allowed: bool | None
+    generation: int
+    states: tuple[tuple[str, str], ...]
+
+
+class RuntimeUpgradeControl(StoppedReplacementControl, Protocol):
+    """Kind-only operations for the pod runtime-upgrade scenario.
+
+    The stopped-resident reads and pod watch from [`StoppedReplacementControl`],
+    plus: a scoped override of the runtime-upgrade settings on the API and
+    controller Deployments (closed key lists, under the public-API and
+    controller mutation Leases); the execution environment catalog and policy,
+    seeded and restored; what each node reports enforcing; what a node
+    published for a sandbox; and the admin test trigger of a stopped
+    sandbox's runtime upgrade.
+    """
+
+    def acquire_public_api_mutation(self) -> Callable[[], None]: ...
+
+    def runtime_upgrade_env(self) -> tuple[dict[str, str | None], dict[str, str | None]]:
+        """The literal value of each key on the API and on the controller Deployment."""
+        ...
+
+    def set_runtime_upgrade_env(
+        self, api: Mapping[str, str], controller: Mapping[str, str]
+    ) -> None:
+        """Apply the overrides and await both rollouts; refuses keys off the lists."""
+        ...
+
+    def restore_runtime_upgrade_env(
+        self, api: Mapping[str, str | None], controller: Mapping[str, str | None]
+    ) -> None: ...
+
+    def runtime_environment_snapshot(self) -> RuntimeEnvironmentSnapshot: ...
+
+    def seed_runtime_environments(
+        self,
+        rows: Sequence[tuple[str, str, str, str]],
+        *,
+        upgrade_edges: Mapping[str, Sequence[str]],
+    ) -> None:
+        """Upsert `(reference, firecracker version, kernel, state format)` rows with the given edges."""
+        ...
+
+    def restore_runtime_environments(self, snapshot: RuntimeEnvironmentSnapshot) -> None:
+        """Delete the rows the scenario added and put the captured policy back."""
+        ...
+
+    def set_runtime_environment_policy(self, *, default: str, states: Mapping[str, str]) -> None:
+        """Through the admin API: set the default, then each state."""
+        ...
+
+    def runtime_policy_nodes(self) -> list[dict[str, Any]]:
+        """`GET /runtime-environments/nodes`: what each node reports enforcing."""
+        ...
+
+    def published_execution(self, sandbox_id: str) -> PublishedExecution: ...
+
+    def upgrade_stopped_runtime(self, sandbox_id: str) -> tuple[int, dict[str, Any]]:
+        """The admin test trigger's status and body."""
+        ...
+
+
+@dataclass(frozen=True)
 class SandboxPodView:
     """One sandbox execution pod as the apiserver shows it."""
 
