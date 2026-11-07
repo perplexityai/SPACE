@@ -108,9 +108,7 @@ impl FakeTerminator {
 impl InstanceTerminator for FakeTerminator {
     async fn terminate(&self, node_id: NodeId) -> Result<(), TerminateError> {
         self.calls.lock().unwrap().push(node_id);
-        self.result
-            .clone()
-            .map_err(|message| TerminateError::Provider(message))
+        self.result.clone().map_err(TerminateError::Provider)
     }
 }
 

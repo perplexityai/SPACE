@@ -184,10 +184,10 @@ pub fn cancel_drain_epoch(
 /// Forget every evacuation begun under `epoch` or earlier: that drain was
 /// cancelled.
 pub fn forget_drain_evacuations_through(conn: &Connection, epoch: u64) -> Result<usize> {
-    Ok(conn.execute(
+    conn.execute(
         sql!("DELETE FROM drain_evacuations WHERE epoch <= ?1"),
         params![SqliteU64(epoch)],
-    )?)
+    )
 }
 
 #[cfg(test)]

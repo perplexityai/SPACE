@@ -203,7 +203,7 @@ pub(crate) async fn record_v2_evacuation(
             ));
         }
         (DrainRestoreTarget::Stopped, "stopped") if marker.is_none() => {
-            let pinned = sqlx::query(sql!(
+            sqlx::query(sql!(
                 "UPDATE sandboxes
                     SET current_local_artifact_id = $2,
                         current_local_artifact_kind = 'disk',
@@ -219,8 +219,7 @@ pub(crate) async fn record_v2_evacuation(
             .await
             .map_err(sql_error)?
             .rows_affected()
-                == 1;
-            pinned
+                == 1
         }
         _ => false,
     };

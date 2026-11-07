@@ -278,7 +278,7 @@ enum RestoreActivation {
     /// The restore joined another caller's, which finishes it.
     Joined,
     /// This caller's restore, with its binding and the attempt it ran under.
-    Owned(ExecutionActivation),
+    Owned(Box<ExecutionActivation>),
 }
 
 impl KubernetesSubstrate {
@@ -1587,7 +1587,7 @@ impl KubernetesSubstrate {
                 RestoreClaimHandling::preclaimed_with_cleanup(restore_claim),
             )
             .await?;
-        Ok(RestoreActivation::Owned(activation))
+        Ok(RestoreActivation::Owned(Box::new(activation)))
     }
 
     pub(super) async fn wake_execution_with_metric_identity(
