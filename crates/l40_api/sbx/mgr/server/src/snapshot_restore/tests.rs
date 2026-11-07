@@ -1786,7 +1786,7 @@ async fn restore_template_lookup_uses_validated_owner(
     #[case] local: bool,
     #[values(false, true)] receipt: bool,
 ) {
-    use pplx_space_rpc_auth::template_lookup::TemplateLookupScope;
+    use pplx_space_template_mgr_client::lookup_scope::TemplateLookupScope;
     use pplx_space_template_mgr_client::proto::GetTemplateResponse;
     let id = pplx_space_common_core::types::SandboxId::new();
     let expected = if local {

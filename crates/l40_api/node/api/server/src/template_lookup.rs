@@ -1,5 +1,5 @@
-use pplx_space_rpc_auth::template_lookup::TemplateLookupScope;
 use pplx_space_rpc_auth::{NodeApiAuthenticatedCaller, TemplateReleaseReadAuthority};
+use pplx_space_template_mgr_client::lookup_scope::TemplateLookupScope;
 use tonic::{Request, Status};
 
 pub(crate) fn bind_caller_scope<T>(

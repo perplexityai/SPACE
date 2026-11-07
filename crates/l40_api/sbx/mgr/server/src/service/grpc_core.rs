@@ -252,7 +252,7 @@ impl SandboxManagerService {
             let template = &req.template;
             let runtime = &req.runtime;
 
-            use pplx_space_rpc_auth::template_lookup::TemplateLookupScope;
+            use pplx_space_template_mgr_client::lookup_scope::TemplateLookupScope;
             let mut scope = template_lookup_scope(&sandbox_owner, req.sandbox_id.as_deref())?;
             if peer.principal() == UdsPeerPrincipal::Service(user_names::SPACE_NODEAPI) {
                 scope = match (scope, TemplateLookupScope::from_request(&request)?) {
@@ -261,7 +261,7 @@ impl SandboxManagerService {
                     (scope @ TemplateLookupScope::Sandbox { .. }, Some(TemplateLookupScope::Cluster)) => scope,
                     (_, Some(scope @ (TemplateLookupScope::Node(_) | TemplateLookupScope::Cluster))) => scope,
                     (scope, None) => {
-                        pplx_space_rpc_auth::template_lookup::metrics::template_lookup_compatibility("missing_scope");
+                        pplx_space_template_mgr_client::lookup_scope::metrics::template_lookup_compatibility("missing_scope");
                         scope
                     }
                     _ => return Err(Status::permission_denied("invalid remote template caller scope")),

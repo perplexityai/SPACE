@@ -1,6 +1,6 @@
 //! Authentication for SPACE's internal RPC surfaces: the node-api and build
-//! auth layers, Kubernetes TokenReview verification behind the `k8s` feature,
-//! and template lookup scope propagation.
+//! auth layers and Kubernetes TokenReview verification behind the `k8s`
+//! feature.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -19,7 +19,6 @@ pub mod build;
 pub mod metrics;
 mod node_identity;
 pub mod template;
-pub mod template_lookup;
 pub mod template_transfer;
 pub use node_identity::{AuthenticatedKubernetesNode, AuthenticatedNodeIdentity};
 

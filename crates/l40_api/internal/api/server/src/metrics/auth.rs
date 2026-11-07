@@ -1,7 +1,8 @@
 //! The template node binding internal-api records for template-catalog reads.
 //! The other authentication families live with their recorders: the shared
-//! service-auth ones in `pplx-space-rpc-auth` (`metrics`,
-//! `template_lookup::metrics`), UDS peer checks in `pplx-space-uds-peer-auth`,
+//! service-auth ones in `pplx-space-rpc-auth` (`metrics`), the template lookup
+//! scope compatibility counter in `pplx-space-template-mgr-client`
+//! (`lookup_scope::metrics`), UDS peer checks in `pplx-space-uds-peer-auth`,
 //! node-api's wait-ready policy in node-api-server and the external console
 //! families in the API crate (each in its `metrics`).
 

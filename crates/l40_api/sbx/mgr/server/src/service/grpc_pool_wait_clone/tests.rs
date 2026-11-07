@@ -69,7 +69,7 @@ async fn cloning_preserves_guest_contract_and_requires_current_checkpoint() {
         CloneCapabilitiesResponse, CloneSandboxRequest, CloneSandboxResponse,
         ResolveExecutionEnvironmentRequest, ResolveExecutionEnvironmentResponse,
     };
-    use pplx_space_rpc_auth::template_lookup::TemplateLookupScope;
+    use pplx_space_template_mgr_client::lookup_scope::TemplateLookupScope;
     use pplx_space_template_mgr_client::proto::{GetTemplateResponse, TemplateRef};
 
     let native = serde_json::from_value(serde_json::json!({

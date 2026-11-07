@@ -497,7 +497,7 @@ async fn import_identity_normalization_and_existing_owner_detection_agree() {
 #[tokio::test]
 async fn a_delta_base_is_the_catalog_s_verified_build_or_none() {
     use crate::template_resolver::fake::FakeTemplateResolver;
-    use pplx_space_rpc_auth::template_lookup::TemplateLookupScope;
+    use pplx_space_template_mgr_client::lookup_scope::TemplateLookupScope;
     use pplx_space_template_mgr_client::proto::{GetTemplateResponse, TemplateRef};
 
     let hash = format!("sha256:{}", "a".repeat(64));

@@ -225,7 +225,7 @@ async fn policy_rpc_authentication_reaches_handlers() {
                         .map(|_| ()),
                 };
                 if matches!(rpc, Rpc::Create) && result.is_ok() {
-                    use pplx_space_rpc_auth::template_lookup::TemplateLookupScope;
+                    use pplx_space_template_mgr_client::lookup_scope::TemplateLookupScope;
                     let expected = if trusted {
                         TemplateLookupScope::Cluster
                     } else {
