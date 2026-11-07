@@ -5885,7 +5885,7 @@ pub(crate) mod service_tests {
     fn template_spaced_compatibility_uses_supported_guest_versions() {
         // A release bump must preserve legacy templates without accepting a
         // future breaking guest or trusting inconsistent provenance.
-        // Detailed range and provenance cases are owned by spaced-common.
+        // Detailed range and provenance cases are owned by spaced-protocol.
         for (version, family, supported) in [
             (Some("0.1.0"), Some("0.1"), true),
             (Some("0.8.0"), Some("0.8"), true),
@@ -17464,7 +17464,7 @@ pub(crate) mod service_tests {
         let mut request = internal_request(SpacedConnectProcessRequest {
             sandbox_id: sandbox_id.to_string(),
             operation: Some(
-                pplx_space_spaced_common::proto::operations::ConnectProcessRequest {
+                pplx_space_spaced_guest_protocol::proto::operations::ConnectProcessRequest {
                     process_id: "process".to_string(),
                     timeout: None,
                     output_cursor: Some(7),
@@ -17614,10 +17614,12 @@ pub(crate) mod service_tests {
             }
             let mut request = internal_request(SpacedReadRequest {
                 sandbox_id: id.to_string(),
-                operation: Some(pplx_space_spaced_common::proto::operations::ReadRequest {
-                    path: "/marker".to_string(),
-                    ..Default::default()
-                }),
+                operation: Some(
+                    pplx_space_spaced_guest_protocol::proto::operations::ReadRequest {
+                        path: "/marker".to_string(),
+                        ..Default::default()
+                    },
+                ),
             });
             insert_space_api_route_ed25519_token(request.metadata_mut(), &token).unwrap();
             let error = service
@@ -17892,10 +17894,12 @@ pub(crate) mod service_tests {
             }
             let mut request = internal_request(SpacedReadRequest {
                 sandbox_id: id.to_string(),
-                operation: Some(pplx_space_spaced_common::proto::operations::ReadRequest {
-                    path: "/marker".to_string(),
-                    ..Default::default()
-                }),
+                operation: Some(
+                    pplx_space_spaced_guest_protocol::proto::operations::ReadRequest {
+                        path: "/marker".to_string(),
+                        ..Default::default()
+                    },
+                ),
             });
             insert_space_api_route_ed25519_token(request.metadata_mut(), &token).unwrap();
             let error = service.spaced_read(request).await.err().expect("refused");

@@ -1,6 +1,6 @@
 //! Operation-owned host admission and pre-readiness maintenance transport.
 use super::*;
-use pplx_space_spaced_common::proto::{
+use pplx_space_spaced_guest_protocol::proto::{
     bridge_guest::guest_update_client::GuestUpdateClient, update as wire,
 };
 use proto::guest_update_server::GuestUpdate;
@@ -8,7 +8,7 @@ use std::sync::Mutex;
 use tokio::sync::{Notify, Semaphore, watch};
 use tokio::time::Instant as Deadline;
 
-use pplx_space_spaced_common::update::ACTIVATION_BUDGET as ADMISSION_WAIT_BUDGET;
+use pplx_space_spaced_guest_protocol::update::ACTIVATION_BUDGET as ADMISSION_WAIT_BUDGET;
 
 // Created only when dispatch actually waits; Drop includes cancellation and
 // refusal paths as well as successful admission in the existing request span.
@@ -62,7 +62,7 @@ async fn forward_stage(
     Ok(())
 }
 
-use pplx_space_spaced_common::update::HoldOwner as Owner;
+use pplx_space_spaced_guest_protocol::update::HoldOwner as Owner;
 
 #[derive(Default)]
 struct Admission {
@@ -450,7 +450,7 @@ impl SpacedHostService {
     ) -> Result<
         (
             GuestUpdateClient<tonic::transport::Channel>,
-            Option<pplx_space_spaced_common::PinnedConnection>,
+            Option<pplx_space_spaced_client::PinnedConnection>,
         ),
         Status,
     > {
@@ -620,7 +620,7 @@ impl GuestUpdate for SpacedHostService {
         // Guest header + streaming allow 130s; leave verification/flush margin.
         // Slow local I/O can still finish after this deadline: reconcile status.
         tokio::time::timeout(
-            pplx_space_spaced_common::update::STAGE_HOST_BUDGET,
+            pplx_space_spaced_guest_protocol::update::STAGE_HOST_BUDGET,
             transfer,
         )
         .await

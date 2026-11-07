@@ -8,11 +8,11 @@ async fn process_payload_overload_is_rejected_before_decode_or_bridge_lookup() {
     let _occupied = service
         .inner
         .process_admission
-        .acquire(pplx_space_spaced_common::process_limits::PAYLOAD_SLOTS as u32)
+        .acquire(pplx_space_spaced_guest_protocol::process_limits::PAYLOAD_SLOTS as u32)
         .await
         .unwrap();
     let mut grpc = service.process_grpc_service();
-    for (method, _) in pplx_space_spaced_common::process_limits::PAYLOAD_METHODS {
+    for (method, _) in pplx_space_spaced_guest_protocol::process_limits::PAYLOAD_METHODS {
         let request = http::Request::builder()
             .uri(format!(
                 "/{}/{method}",

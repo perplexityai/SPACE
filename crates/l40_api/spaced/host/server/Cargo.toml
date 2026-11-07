@@ -43,7 +43,9 @@ pplx-space-common-grpc = { workspace = true }
 pplx-space-grpc-metrics = { workspace = true }
 pplx-space-metrics-emit = { workspace = true }
 pplx-space-observability = { workspace = true }
-pplx-space-spaced-common = { workspace = true }
+pplx-space-spaced-guest-protocol = { workspace = true }
+pplx-space-spaced-protocol = { workspace = true }
+pplx-space-spaced-client = { workspace = true }
 pplx-space-uds-peer-auth = { workspace = true }
 prost-types = { workspace = true }
 

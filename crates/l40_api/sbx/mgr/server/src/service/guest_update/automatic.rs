@@ -303,11 +303,11 @@ fn automatic_target(policy: &policy::Policy, guest: &wire::Status) -> bool {
     };
     promotion.intent == model::policy::SelectionIntent::Upgrade
         && promotion.maximum_guest == promotion.target_version
-        && pplx_space_spaced_common::spaced_compatibility_family_for_version(
+        && pplx_space_spaced_guest_protocol::spaced_compatibility_family_for_version(
             &guest.committed_version,
         )
         .ok()
-            == pplx_space_spaced_common::spaced_compatibility_family_for_version(
+            == pplx_space_spaced_guest_protocol::spaced_compatibility_family_for_version(
                 &promotion.target_version.to_string(),
             )
             .ok()

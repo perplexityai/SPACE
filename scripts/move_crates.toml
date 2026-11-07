@@ -57,7 +57,7 @@
 "pplx-space-unix-socket-path" = { to = "crates/l10_foundation/unix/socket/path" }
 "pplx-space-valkey" = { to = "crates/l10_foundation/valkey" }
 "pplx-space-common-work-coalescer" = { to = "crates/l10_foundation/work/coalescer", rename = "pplx-space-work-coalescer" }  # renamed
-# l20_domain (25)
+# l20_domain (24)
 "pplx-space-accounts" = { to = "crates/l20_domain/accounts" }
 "pplx-space-api-route" = { to = "crates/l20_domain/api/route" }
 "pplx-space-auto-lifecycle" = { to = "crates/l20_domain/auto/lifecycle/policy" }  # leaf: pplx-space-auto-lifecycle-receipt nest in l20_domain/auto/lifecycle
@@ -80,7 +80,6 @@
 "pplx-space-public-api" = { to = "crates/l20_domain/public/api" }
 "pplx-space-rpc-contracts" = { to = "crates/l20_domain/rpc/contracts" }
 "pplx-space-sbx-mgr-protocol" = { to = "crates/l20_domain/sbx/mgr/protocol" }
-"pplx-space-spaced-common" = { to = "crates/l20_domain/spaced/common" }
 "pplx-space-spaced-guest-protocol" = { to = "crates/l20_domain/spaced/guest/protocol" }
 "pplx-space-state-reconciliation" = { to = "crates/l20_domain/state/reconciliation" }
 # l30_storage (17)

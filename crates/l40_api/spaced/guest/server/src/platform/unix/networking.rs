@@ -3,7 +3,7 @@
 
 use std::time::Duration;
 
-use pplx_space_spaced_common::proto::bridge_guest::{
+use pplx_space_spaced_guest_protocol::proto::bridge_guest::{
     CloseLoopbackBridgeRequest, CloseLoopbackBridgeResponse, OpenLoopbackBridgeRequest,
     OpenLoopbackBridgeResponse, networking_server::Networking as BridgeGuestNetworking,
 };

@@ -3,18 +3,18 @@ use crate::guest_service::{
     connect_uds, create_guest_service, create_ready_guest_service, create_ready_guest_service_with,
     start_mock_bridge_host,
 };
-#[cfg(target_os = "linux")]
-use pplx_space_spaced_common::proto::bridge_guest::WaitReadyRequest as BridgeGuestWaitReadyRequest;
-use pplx_space_spaced_common::proto::bridge_guest::filesystem_client::FilesystemClient as BridgeGuestFilesystemClient;
-use pplx_space_spaced_common::proto::bridge_guest::meta_client::MetaClient as BridgeGuestClient;
-use pplx_space_spaced_common::proto::bridge_guest::{
-    PingRequest as BridgeGuestPingRequest, StatRequest,
-};
 use pplx_space_spaced_guest_client::proto::{
     ActivityState, PingRequest as LocalPingRequest,
     RequestActiveForRequest as LocalRequestActiveForRequest,
     RequestShutdownRequest as LocalShutdownRequest,
     SetActivityStateRequest as LocalSetActivityStateRequest,
+};
+#[cfg(target_os = "linux")]
+use pplx_space_spaced_guest_protocol::proto::bridge_guest::WaitReadyRequest as BridgeGuestWaitReadyRequest;
+use pplx_space_spaced_guest_protocol::proto::bridge_guest::filesystem_client::FilesystemClient as BridgeGuestFilesystemClient;
+use pplx_space_spaced_guest_protocol::proto::bridge_guest::meta_client::MetaClient as BridgeGuestClient;
+use pplx_space_spaced_guest_protocol::proto::bridge_guest::{
+    PingRequest as BridgeGuestPingRequest, StatRequest,
 };
 use std::os::unix::fs::PermissionsExt as _;
 
@@ -117,7 +117,7 @@ async fn local_guest_socket_allows_guest_user_clients() {
 #[tokio::test]
 async fn local_activity_calls_relay_requests_and_preserve_opaque_responses() {
     use crate::guest_service::BridgeHostCall;
-    use pplx_space_spaced_common::proto::bridge_host;
+    use pplx_space_spaced_protocol::proto::bridge_host;
     let temp_dir = tempfile::tempdir().expect("temp dir created");
     let bridge_host_socket = temp_dir.path().join("spaced-bridge-host.sock");
     let local_socket = temp_dir.path().join("spaced.sock");
@@ -213,7 +213,7 @@ async fn bridge_guest_data_plane_accepts_after_bridge_listener_is_ready() {
         .expect("file info");
     assert_eq!(
         response.file_type(),
-        pplx_space_spaced_common::proto::bridge_guest::FileType::Directory
+        pplx_space_spaced_guest_protocol::proto::bridge_guest::FileType::Directory
     );
 
     shutdown.cancel();
@@ -248,9 +248,9 @@ async fn bridge_guest_notify_resume_rejects_invalid_host_time() {
     ] {
         let error = client
             .notify_resume(
-                pplx_space_spaced_common::proto::bridge_guest::NotifyResumeRequest {
+                pplx_space_spaced_guest_protocol::proto::bridge_guest::NotifyResumeRequest {
                     reason:
-                        pplx_space_spaced_common::proto::bridge_guest::ResumeReason::SnapshotRestore
+                        pplx_space_spaced_guest_protocol::proto::bridge_guest::ResumeReason::SnapshotRestore
                             .into(),
                     host_time,
                 },
@@ -351,7 +351,9 @@ async fn bridge_guest_recycles_incomplete_http2_connections() {
 /// the same sandbox keeps them.
 #[tokio::test]
 async fn bridge_guest_snapshot_restore_discards_recorded_diagnostics() {
-    use pplx_space_spaced_common::proto::bridge_guest::{NotifyResumeRequest, ResumeReason};
+    use pplx_space_spaced_guest_protocol::proto::bridge_guest::{
+        NotifyResumeRequest, ResumeReason,
+    };
     use tracing_subscriber::layer::SubscriberExt as _;
 
     let _subscriber = tracing::subscriber::set_default(

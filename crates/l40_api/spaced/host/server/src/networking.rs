@@ -3,7 +3,7 @@
 //! call this service to install / tear down loopback bridges for ports
 //! that node-mgr has just exposed at the host firewall layer.
 
-use pplx_space_spaced_common::proto::bridge_guest::{
+use pplx_space_spaced_guest_protocol::proto::bridge_guest::{
     CloseLoopbackBridgeRequest as BridgeGuestCloseLoopbackBridgeRequest,
     LoopbackBridgeStatus as BridgeGuestLoopbackBridgeStatus,
     OpenLoopbackBridgeRequest as BridgeGuestOpenLoopbackBridgeRequest,

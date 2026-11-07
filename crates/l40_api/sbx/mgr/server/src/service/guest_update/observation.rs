@@ -96,7 +96,7 @@ impl SandboxManagerService {
                     if crate::db::read::active_guest_update(&*self.db_conn()?, id).map_err(internal)?.is_some() { continue; }
                     // Stable identity across manager restarts lets the next
                     // observer recover an acknowledgement interrupted by one.
-                    let owner = pplx_space_spaced_common::update::HoldOwner::configuration(uuid(&execution.to_string())?);
+                    let owner = pplx_space_spaced_guest_protocol::update::HoldOwner::configuration(uuid(&execution.to_string())?);
                     client.hold(request(owner.clone())).await?;
                     client.configure(request(wire::ConfigureRequest { attempt: None, owner: Some(owner.clone()),
                         environment: current.process_env.into_iter().collect(), forward_ports: seen.forward_ports,

@@ -1681,7 +1681,7 @@ fn start_process_options(
             .map(pplx_space_common_core::types::GuestPath::parse)
             .transpose()
             .map_err(|error| invalid(format_args!("{error}")))?,
-        env: pplx_space_spaced_common::parse_env(operation.env.clone()),
+        env: pplx_space_spaced_guest_protocol::parse_env(operation.env.clone()),
         user: operation
             .user
             .clone()

@@ -1064,7 +1064,7 @@ where
             status.guest_version.as_ref()
         }
     };
-    pplx_space_spaced_common::validate_spaced_guest_compatibility(
+    pplx_space_spaced_protocol::validate_spaced_guest_compatibility(
         guest.map(|guest| guest.version.as_str()),
         guest.map(|guest| guest.compatibility_family.as_str()),
     )

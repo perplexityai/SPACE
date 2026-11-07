@@ -594,7 +594,7 @@ async fn connect_spaced_host_live(
         .with_socket_path(socket_path);
     match pplx_space_spaced_host_client::SpacedHostClient::new_with_config_and_expected_peer(
         config,
-        pplx_space_spaced_common::ExpectedUdsPeer::new(
+        pplx_space_spaced_client::ExpectedUdsPeer::new(
             i32::try_from(spaced_host_pid)
                 .map_err(|_| Status::failed_precondition("spaced-host pid is invalid"))?,
             uid,

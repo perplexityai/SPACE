@@ -496,7 +496,7 @@ legacy = ["pplx-space-common-core"]
 # lists it; every other one is a model, which never depends on a protocol.
 # These five are protocols without such a name. The mixed crates, which hold
 # model and wire code until they are split, count as models: api-route,
-# credential-injection, net-common and spaced-common.
+# credential-injection and net-common.
 protocols = [
   "pplx-space-auto-lifecycle-receipt",
   "pplx-space-events",
@@ -649,8 +649,7 @@ mode = "required"
 mode = "required"
 
 # No model depends on a protocol. Today's exceptions are baselined in
-# [layers.model_protocol]: common-core, which is legacy, and spaced-common, a
-# mixed crate, until they are deleted and split.
+# [layers.model_protocol]: common-core, which is legacy, until it is deleted.
 [rules.layers.model_protocol.no_crossing]
 mode = "required"
 

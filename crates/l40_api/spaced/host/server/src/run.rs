@@ -6,7 +6,7 @@
 
 use std::path::PathBuf;
 
-use pplx_space_spaced_common::proto::bridge_guest::ResumeReason;
+use pplx_space_spaced_guest_protocol::proto::bridge_guest::ResumeReason;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
@@ -152,14 +152,14 @@ fn resolve_service_config(
             .firecracker_uid
             .ok_or(RunSpacedHostError::MissingFirecrackerUid)?;
         service_config.bridge_host_socket_path =
-            pplx_space_spaced_common::firecracker_vsock_port_path(
+            pplx_space_spaced_client::firecracker_vsock_port_path(
                 &vsock_uds_path,
-                pplx_space_spaced_common::BRIDGE_HOST_VSOCK_PORT,
+                pplx_space_spaced_guest_protocol::BRIDGE_HOST_VSOCK_PORT,
             );
         service_config.bridge_guest_connector = BridgeGuestConnector::FirecrackerVsock {
             vsock_uds_path,
-            port: pplx_space_spaced_common::BRIDGE_GUEST_VSOCK_PORT,
-            expected_peer: pplx_space_spaced_common::ExpectedUdsPeer::new(
+            port: pplx_space_spaced_guest_protocol::BRIDGE_GUEST_VSOCK_PORT,
+            expected_peer: pplx_space_spaced_client::ExpectedUdsPeer::new(
                 i32::try_from(firecracker_pid)
                     .map_err(|_| RunSpacedHostError::FirecrackerPidOutOfRange)?,
                 firecracker_uid,
@@ -197,7 +197,7 @@ async fn notify_resume_until_success(
             Ok(()) => return,
             Err(error) => {
                 let Some(delay) =
-                    pplx_space_spaced_common::DEFAULT_CONNECT_RETRY_POLICY.delay(retry)
+                    pplx_space_spaced_client::DEFAULT_CONNECT_RETRY_POLICY.delay(retry)
                 else {
                     tracing::warn!(
                         %error,
@@ -225,7 +225,7 @@ async fn notify_resume_until_success(
 /// Serve spaced-host until `shutdown` is cancelled or the gRPC server fails.
 ///
 /// On a resume boot the guest is notified in the background, retried under
-/// [`pplx_space_spaced_common::DEFAULT_CONNECT_RETRY_POLICY`], so serving is
+/// [`pplx_space_spaced_client::DEFAULT_CONNECT_RETRY_POLICY`], so serving is
 /// never blocked on a guest that is still coming up.
 pub async fn run(
     config: SpacedHostRunConfig,

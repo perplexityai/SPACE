@@ -1,9 +1,9 @@
 //! Explicitly targeted native Windows component qualification (synthetic data).
 use anyhow::{Context, ensure};
-use pplx_space_spaced_common::{
-    BRIDGE_GUEST_VSOCK_PORT, ExpectedUdsPeer, connect_firecracker_vsock_channel_with_expected_peer,
-    proto::bridge_guest::*,
+use pplx_space_spaced_client::{
+    ExpectedUdsPeer, connect_firecracker_vsock_channel_with_expected_peer,
 };
+use pplx_space_spaced_guest_protocol::{BRIDGE_GUEST_VSOCK_PORT, proto::bridge_guest::*};
 use std::time::Duration;
 use tonic::transport::Channel;
 async fn output(
@@ -39,13 +39,13 @@ fn start(script: &str) -> StartRequest {
 }
 enum Files {
     Guest(filesystem_client::FilesystemClient<Channel>),
-    Host(pplx_space_spaced_common::proto::host::filesystem_client::FilesystemClient<Channel>),
+    Host(pplx_space_spaced_protocol::proto::host::filesystem_client::FilesystemClient<Channel>),
 }
 impl Files {
     fn new(channel: Channel, host: bool) -> Self {
         if host {
             Self::Host(
-                pplx_space_spaced_common::proto::host::filesystem_client::FilesystemClient::new(
+                pplx_space_spaced_protocol::proto::host::filesystem_client::FilesystemClient::new(
                     channel,
                 ),
             )
@@ -119,13 +119,15 @@ impl Files {
 }
 enum Processes {
     Guest(process_client::ProcessClient<Channel>),
-    Host(pplx_space_spaced_common::proto::host::process_client::ProcessClient<Channel>),
+    Host(pplx_space_spaced_protocol::proto::host::process_client::ProcessClient<Channel>),
 }
 impl Processes {
     fn new(channel: Channel, host: bool) -> Self {
         if host {
             Self::Host(
-                pplx_space_spaced_common::proto::host::process_client::ProcessClient::new(channel),
+                pplx_space_spaced_protocol::proto::host::process_client::ProcessClient::new(
+                    channel,
+                ),
             )
         } else {
             Self::Guest(process_client::ProcessClient::new(channel))
@@ -181,8 +183,8 @@ async fn run(channel: Channel, host: bool) -> anyhow::Result<()> {
         ensure!(ready.ready, "not ready");
     } else {
         let mut meta =
-            pplx_space_spaced_common::proto::host::meta_client::MetaClient::new(channel.clone());
-        meta.wait_ready(pplx_space_spaced_common::proto::host::WaitReadyRequest {
+            pplx_space_spaced_protocol::proto::host::meta_client::MetaClient::new(channel.clone());
+        meta.wait_ready(pplx_space_spaced_protocol::proto::host::WaitReadyRequest {
             timeout: Some(prost_types::Duration {
                 seconds: 30,
                 nanos: 0,
@@ -437,7 +439,7 @@ async fn main() -> anyhow::Result<()> {
     ensure!(args.next().is_none(), "unexpected arguments");
     tokio::time::timeout(Duration::from_secs(120), async {
         let channel = if host {
-            pplx_space_spaced_common::connect_uds_channel(
+            pplx_space_spaced_client::connect_uds_channel(
                 "Windows host operations probe",
                 std::path::Path::new(&path),
             )

@@ -34,7 +34,7 @@ fn main() {}
 #[cfg(target_os = "linux")]
 async fn run() {
     use pplx_space_common_core::types::GuestUserName;
-    use pplx_space_spaced_common::proto::bridge_guest::{
+    use pplx_space_spaced_guest_protocol::proto::bridge_guest::{
         StatRequest, WriteOpen, WriteRequest, filesystem_client::FilesystemClient,
         write_request::Message,
     };
@@ -120,9 +120,11 @@ async fn run() {
         .expect("start worker");
     let original_worker = children().await;
     {
-        use pplx_space_spaced_common::proto::bridge_guest::{WriteBatchEntry, WriteBatchRequest};
+        use pplx_space_spaced_guest_protocol::proto::bridge_guest::{
+            WriteBatchEntry, WriteBatchRequest,
+        };
         use prost::Message as _;
-        let limit = pplx_space_spaced_common::filesystem_limits::MAX_MESSAGE_BYTES;
+        let limit = pplx_space_spaced_guest_protocol::filesystem_limits::MAX_MESSAGE_BYTES;
         for keyed in [false, true] {
             let path = directory.path().join(format!("maximum-batch-{keyed}"));
             let mut batch = WriteBatchRequest {
@@ -180,7 +182,9 @@ async fn run() {
     // ENOSPC shares the admission status code, but can follow partial effects.
     // Its same-key retry must replay failure without appending a second time.
     {
-        use pplx_space_spaced_common::proto::bridge_guest::{WriteBatchEntry, WriteBatchRequest};
+        use pplx_space_spaced_guest_protocol::proto::bridge_guest::{
+            WriteBatchEntry, WriteBatchRequest,
+        };
         let path = directory.path().join("partial-enospc");
         let batch = WriteBatchRequest {
             entries: vec![
@@ -305,7 +309,7 @@ async fn run() {
     }
     // A batch can have durable partial effects before blocking on its next
     // entry. Killing that worker must not permit replay of the first append.
-    use pplx_space_spaced_common::proto::bridge_guest::{
+    use pplx_space_spaced_guest_protocol::proto::bridge_guest::{
         RenameRequest, WriteBatchEntry, WriteBatchRequest,
     };
     for kill_worker in [true, false] {

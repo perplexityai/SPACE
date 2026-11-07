@@ -1,5 +1,5 @@
 use super::*;
-use pplx_space_spaced_common::proto::bridge_guest as guest_protocol;
+use pplx_space_spaced_guest_protocol::proto::bridge_guest as guest_protocol;
 
 #[derive(Clone)]
 struct CloseGuest {
@@ -33,7 +33,7 @@ impl guest_protocol::networking_server::Networking for CloseGuest {
 #[tokio::test(start_paused = true)]
 async fn close_retries_connection_establishment_but_never_a_dispatched_rpc() {
     use crate::proto::networking_server::Networking;
-    use pplx_space_spaced_common::proto::bridge_guest::networking_server::NetworkingServer;
+    use pplx_space_spaced_guest_protocol::proto::bridge_guest::networking_server::NetworkingServer;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     for reply_error in [None, Some(tonic::Code::Unavailable)] {
@@ -119,7 +119,7 @@ async fn listener_failure_preserves_sibling_drain_and_error_through_deadline() {
                         tokio::task::yield_now().await;
                     }
                     Err(RunSpacedHostServerError::Bind(
-                        pplx_space_spaced_common::BindUdsError::Bind {
+                        pplx_space_spaced_client::BindUdsError::Bind {
                             path: PathBuf::from("failed.sock"),
                             source: std::io::Error::from(std::io::ErrorKind::BrokenPipe),
                         },

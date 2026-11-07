@@ -14,7 +14,7 @@ impl SpacedHostService {
     pub(super) fn process_grpc_service(
         &self,
     ) -> pplx_space_common_grpc::RequestAdmission<ProcessServer<Self>> {
-        use pplx_space_spaced_common::process_limits;
+        use pplx_space_spaced_guest_protocol::process_limits;
         pplx_space_common_grpc::RequestAdmission::new(
             ProcessServer::new(self.clone())
                 .max_decoding_message_size(process_limits::MAX_MESSAGE_BYTES),
@@ -121,7 +121,7 @@ impl Process for SpacedHostService {
                     async move {
                         client
                             .list_processes(
-                                pplx_space_spaced_common::proto::bridge_guest::ListProcessesRequest {
+                                pplx_space_spaced_guest_protocol::proto::bridge_guest::ListProcessesRequest {
                                     include_exited,
                                     process_id,
                                 },

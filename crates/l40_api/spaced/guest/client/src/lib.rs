@@ -12,14 +12,14 @@ use tonic::Response;
 
 mod config;
 
-pub use pplx_space_spaced_common::proto::guest as proto;
+pub use pplx_space_spaced_protocol::proto::guest as proto;
 
 pub use config::SpacedGuestClientConfig;
-pub use pplx_space_spaced_common::ConnectError;
+pub use pplx_space_spaced_client::ConnectError;
 
 pub type RawSpacedGuestClient = proto::meta_client::MetaClient<tonic::transport::Channel>;
 
-pub use pplx_space_spaced_common::{
+pub use pplx_space_spaced_client::{
     DEFAULT_COMMAND_RETRY_POLICY, DEFAULT_CONNECT_RETRY_POLICY, RetryPolicy,
 };
 
@@ -29,7 +29,7 @@ pub fn default_guest_uds_path() -> std::path::PathBuf {
     )
 }
 
-use pplx_space_spaced_common::validate_optional_reason;
+use pplx_space_spaced_guest_protocol::validate_optional_reason;
 
 #[derive(Clone, Debug)]
 pub struct SpacedGuestClient {
@@ -43,7 +43,7 @@ impl SpacedGuestClient {
     }
 
     pub async fn new_with_config(config: SpacedGuestClientConfig) -> Result<Self, ConnectError> {
-        let channel = pplx_space_spaced_common::connect_uds_channel_with_retry(
+        let channel = pplx_space_spaced_client::connect_uds_channel_with_retry(
             "spaced guest service",
             &config.socket_path,
             config.connect_retry_policy,
@@ -91,7 +91,9 @@ impl SpacedGuestClient {
         self.call("request_active_for", |mut client| async move {
             client
                 .request_active_for(RequestActiveForRequest {
-                    hold_for: Some(pplx_space_spaced_common::duration_to_proto(hold_for)?),
+                    hold_for: Some(pplx_space_spaced_guest_protocol::duration_to_proto(
+                        hold_for,
+                    )?),
                 })
                 .await
         })
@@ -129,7 +131,7 @@ impl SpacedGuestClient {
         F: FnMut(RawSpacedGuestClient) -> Fut,
         Fut: std::future::Future<Output = Result<Response<T>, tonic::Status>>,
     {
-        pplx_space_spaced_common::retry_status(
+        pplx_space_spaced_client::retry_status(
             "spaced guest",
             command,
             self.config.command_retry_policy,

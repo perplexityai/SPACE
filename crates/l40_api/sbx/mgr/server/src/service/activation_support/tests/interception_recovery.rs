@@ -22,7 +22,7 @@ use pplx_space_net_gateway::state::{
     GatewayNetworkState, NetworkCredentialSnapshot, PolicyLoader, PolicyNotReady,
     PulledNetworkPolicy, TrafficPolicy,
 };
-use pplx_space_spaced_common::proto::host_control::host_control_server::HostControlServer;
+use pplx_space_spaced_protocol::proto::host_control::host_control_server::HostControlServer;
 
 use rcgen::{
     BasicConstraints, CertificateParams, CertificateSigningRequestParams, IsCa, KeyPair,

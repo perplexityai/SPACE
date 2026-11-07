@@ -914,8 +914,12 @@ impl SandboxManagerService {
                 pplx_space_spaced_host_client::WatchOptions {
                     recursive: operation.recursive,
                     include_metadata_events: operation.include_metadata_events,
-                    include_globs: pplx_space_spaced_common::parse_globs(operation.include_globs)?,
-                    exclude_globs: pplx_space_spaced_common::parse_globs(operation.exclude_globs)?,
+                    include_globs: pplx_space_spaced_guest_protocol::parse_globs(
+                        operation.include_globs,
+                    )?,
+                    exclude_globs: pplx_space_spaced_guest_protocol::parse_globs(
+                        operation.exclude_globs,
+                    )?,
                     use_default_excludes: operation.use_default_excludes,
                     user: parse_operation_user(operation.user)?,
                 },
@@ -958,8 +962,12 @@ impl SandboxManagerService {
                 pplx_space_spaced_host_client::WatchOptions {
                     recursive: operation.recursive,
                     include_metadata_events: operation.include_metadata_events,
-                    include_globs: pplx_space_spaced_common::parse_globs(operation.include_globs)?,
-                    exclude_globs: pplx_space_spaced_common::parse_globs(operation.exclude_globs)?,
+                    include_globs: pplx_space_spaced_guest_protocol::parse_globs(
+                        operation.include_globs,
+                    )?,
+                    exclude_globs: pplx_space_spaced_guest_protocol::parse_globs(
+                        operation.exclude_globs,
+                    )?,
                     use_default_excludes: operation.use_default_excludes,
                     user: parse_operation_user(operation.user)?,
                 },
@@ -1101,8 +1109,8 @@ impl SandboxManagerService {
         let response = client
             .enable_file_changes_with_options_as_user(
                 operation.roots,
-                pplx_space_spaced_common::parse_globs(operation.include_globs)?,
-                pplx_space_spaced_common::parse_globs(operation.exclude_globs)?,
+                pplx_space_spaced_guest_protocol::parse_globs(operation.include_globs)?,
+                pplx_space_spaced_guest_protocol::parse_globs(operation.exclude_globs)?,
                 operation.use_default_excludes,
                 parse_operation_user(operation.user)?,
             )

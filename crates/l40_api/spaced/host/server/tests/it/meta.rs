@@ -2,10 +2,10 @@ use crate::bridge_host::{BridgeHostFixture, connect_bridge_host};
 use crate::duration::duration_from_millis;
 use crate::fixture::HostFixture;
 use crate::mock_bridge_guest::start_mock_bridge_guest;
-use pplx_space_spaced_common::proto::bridge_guest::meta_server::{
+use pplx_space_spaced_guest_protocol::proto::bridge_guest::meta_server::{
     Meta as BridgeGuestMeta, MetaServer as BridgeGuestMetaServer,
 };
-use pplx_space_spaced_common::proto::bridge_guest::{
+use pplx_space_spaced_guest_protocol::proto::bridge_guest::{
     ConfigureProcessEnvRequest as BridgeGuestConfigureProcessEnvRequest,
     ConfigureProcessEnvResponse as BridgeGuestConfigureProcessEnvResponse,
     FlushFilesystemsRequest as BridgeGuestFlushFilesystemsRequest,
@@ -15,7 +15,7 @@ use pplx_space_spaced_common::proto::bridge_guest::{
     PingResponse as BridgeGuestPingResponse, WaitReadyRequest as BridgeGuestWaitReadyRequest,
     WaitReadyResponse as BridgeGuestWaitReadyResponse,
 };
-use pplx_space_spaced_common::proto::bridge_host::{
+use pplx_space_spaced_protocol::proto::bridge_host::{
     ActivityState, RequestActiveForRequest as BridgeHostRequestActiveForRequest,
     RequestShutdownRequest as BridgeHostShutdownRequest,
     SetActivityStateRequest as BridgeHostSetActivityStateRequest,
@@ -112,7 +112,7 @@ impl BridgeGuestMeta for ReadyWaitGuest {
         request: Request<BridgeGuestFlushFilesystemsRequest>,
     ) -> Result<Response<BridgeGuestFlushFilesystemsResponse>, Status> {
         if let Some(deadlines) = &self.flush_deadlines {
-            let remaining = pplx_space_spaced_common::RetryContext::none()
+            let remaining = pplx_space_spaced_client::RetryContext::none()
                 .with_grpc_timeout_metadata(request.metadata())
                 .remaining()
                 .ok_or_else(|| Status::invalid_argument("missing flush deadline"))?;
@@ -174,7 +174,7 @@ async fn bridge_host_request_shutdown_is_ignored_by_default() {
 #[tokio::test]
 async fn bridge_host_rejects_a_connection_from_outside_the_expected_runtime() {
     let fixture = BridgeHostFixture::start_with_expected_peer(
-        pplx_space_spaced_common::ExpectedUdsPeer::new(i32::MAX, u32::MAX),
+        pplx_space_spaced_client::ExpectedUdsPeer::new(i32::MAX, u32::MAX),
     )
     .await;
     let mut client = connect_bridge_host(fixture.bridge_host_socket_path.clone()).await;
@@ -193,7 +193,7 @@ async fn bridge_host_rejects_a_connection_from_outside_the_expected_runtime() {
 #[tokio::test]
 async fn bridge_host_activity_calls_relay_requests_and_hide_downstream_outcomes() {
     use crate::bridge_host::HostControlCall;
-    use pplx_space_spaced_common::proto::host_control;
+    use pplx_space_spaced_protocol::proto::host_control;
     for fail in [false, true] {
         let fixture = if fail {
             BridgeHostFixture::start_with_failing_host_control().await
@@ -547,7 +547,7 @@ async fn slow_ready_guest_returns_identity_without_a_second_probe() {
     let identity = ready
         .guest_version
         .expect("readiness must include guest identity");
-    pplx_space_spaced_common::validate_spaced_guest_compatibility(
+    pplx_space_spaced_protocol::validate_spaced_guest_compatibility(
         Some(&identity.version),
         Some(&identity.compatibility_family),
     )
@@ -769,7 +769,7 @@ async fn readiness_transport_failures_recover_within_the_original_deadline() {
                 // Observe one server-side readiness budget, without client retries.
                 let config = pplx_space_spaced_host_client::SpacedHostClientConfig::new()
                     .with_socket_path(fixture.socket_path.clone())
-                    .with_command_retry_policy(pplx_space_spaced_common::RetryPolicy::none());
+                    .with_command_retry_policy(pplx_space_spaced_client::RetryPolicy::none());
                 let _connected = fixture.client().await;
                 let client =
                     pplx_space_spaced_host_client::SpacedHostClient::new_with_config(config)
