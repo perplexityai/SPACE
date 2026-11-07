@@ -216,8 +216,9 @@ restart_rpcs! {
     SandboxListAutoLifecycleDeleteReceipts => ("/space.sandbox.manager.v1.SandboxManager/ListAutoLifecycleDeleteReceipts", ReadOnlyWithNarrowStateWrites),
     SandboxAcknowledgeAutoLifecycleDeleteReceipts => ("/space.sandbox.manager.v1.SandboxManager/AcknowledgeAutoLifecycleDeleteReceipts", StateWriter),
     SandboxListPendingLocalBackups => ("/space.sandbox.manager.v1.SandboxManager/ListPendingLocalBackups", ReadOnly),
-    // The call itself writes only the seal row. Each suspend, disk
-    // publication or upload it starts runs as a detached state writer.
+    // The call itself writes only the seal row, and a cancel also forgets
+    // the drain's evacuation records. Each suspend, disk publication or
+    // upload it starts runs as a detached state writer.
     SandboxDrainNode => ("/space.sandbox.manager.v1.SandboxManager/DrainNode", ReadOnlyWithNarrowStateWrites),
     SandboxState => ("/space.sandbox.manager.v1.SandboxManager/State", ReadOnly),
     SandboxGetHealth => ("/space.sandbox.manager.v1.SandboxManager/GetSandboxHealth", ReadOnly),

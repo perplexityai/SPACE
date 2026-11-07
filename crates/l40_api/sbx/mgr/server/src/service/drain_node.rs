@@ -45,10 +45,14 @@ use pplx_space_events::SandboxEventTrigger;
 /// a slow node-manager answers `blocked` rather than an error. The drain's
 /// work goes on between calls.
 pub(super) const ORPHAN_INVENTORY_DEADLINE: Duration = Duration::from_secs(20);
+/// How long a call waits before asking a busy orphan inventory again.
+const ORPHAN_INVENTORY_BUSY_RETRY: Duration = Duration::from_millis(200);
 
-/// How many times in a row the drain's work on a sandbox may fail before
-/// the drain reports it `blocked` with the last failure. It still retries
-/// on every call.
+/// How many times one kind of the drain's work on a sandbox may fail, under
+/// one epoch, before the drain reports it `blocked` with the last failure.
+/// A success doesn't reset the count: an upload's cycle alternates a failed
+/// re-enqueue with a join of the pending job, which would never reach the
+/// bound. It still retries on every call.
 pub(super) const MAX_ACTION_FAILURES: u32 = 3;
 /// How long a row may sit in a transition the drain doesn't drive before the
 /// drain reports it `blocked`: a start the seal refused leaves a row
@@ -77,14 +81,18 @@ impl DrainAction {
     }
 }
 
+/// The failures of each kind of the drain's work on each sandbox, with the
+/// last one's reason.
+pub(super) type DrainFailures = BTreeMap<(String, DrainAction), (u32, String)>;
+
 /// The drain's work in flight in this process, by sandbox, and what it
 /// remembers between calls.
 #[derive(Default)]
 pub(super) struct DrainActions {
     running: Mutex<BTreeMap<String, DrainAction>>,
-    /// The consecutive failures of the drain's work on each sandbox, with the
-    /// last one's reason.
-    failures: Mutex<BTreeMap<String, (u32, String)>>,
+    /// The failures counted under the epoch they were counted under; a call
+    /// under another epoch starts the count again.
+    failures: Mutex<(Option<u64>, DrainFailures)>,
     /// Each row's lifecycle as the drain last saw it, and since when.
     seen: Mutex<BTreeMap<String, (SandboxState, tokio::time::Instant)>>,
 }
@@ -105,26 +113,37 @@ impl DrainActions {
         true
     }
 
-    /// End `sandbox_id`'s running action, counting `failure` if it failed.
-    fn finish(&self, sandbox_id: &str, failure: Option<String>) {
-        if let Some(reason) = failure {
+    /// End `sandbox_id`'s running action, started under `epoch`, counting
+    /// `failure` if it failed and the counts are still that epoch's.
+    fn finish(&self, epoch: u64, sandbox_id: &str, failure: Option<String>) {
+        let action = lock(&self.running).remove(sandbox_id);
+        if let (Some(reason), Some(action)) = (failure, action) {
             let mut failures = lock(&self.failures);
-            let entry = failures
-                .entry(sandbox_id.to_owned())
-                .or_insert((0, String::new()));
-            entry.0 = entry.0.saturating_add(1);
-            entry.1 = reason;
+            if failures.0 == Some(epoch) {
+                let entry = failures
+                    .1
+                    .entry((sandbox_id.to_owned(), action))
+                    .or_insert((0, String::new()));
+                entry.0 = entry.0.saturating_add(1);
+                entry.1 = reason;
+            }
         }
-        lock(&self.running).remove(sandbox_id);
     }
 
-    fn failures(&self) -> BTreeMap<String, (u32, String)> {
-        lock(&self.failures).clone()
+    /// The counts under `epoch`; another epoch's are forgotten first.
+    fn failures(&self, epoch: u64) -> DrainFailures {
+        let mut failures = lock(&self.failures);
+        if failures.0 != Some(epoch) {
+            *failures = (Some(epoch), DrainFailures::new());
+        }
+        failures.1.clone()
     }
 
     /// Forget the failures of every sandbox the drain no longer works on.
     fn keep_failures_of(&self, working: &BTreeSet<String>) {
-        lock(&self.failures).retain(|sandbox_id, _| working.contains(sandbox_id));
+        lock(&self.failures)
+            .1
+            .retain(|(sandbox_id, _), _| working.contains(sandbox_id));
     }
 
     /// Note each row's lifecycle at `now`, and answer the rows that have
@@ -207,7 +226,6 @@ pub(super) struct DrainPlan {
     pub(super) pending: Vec<(String, String)>,
     pub(super) blocked: Vec<(Option<String>, String)>,
     pub(super) actions: Vec<PlannedAction>,
-    pub(super) vm: bool,
 }
 
 /// Whether a row in `state` may hold a VM.
@@ -239,26 +257,26 @@ pub(super) struct PlanInputs {
     pub(super) evacuations: BTreeMap<String, DrainEvacuation>,
     /// The drain's work in flight in this process.
     pub(super) running: BTreeMap<String, DrainAction>,
-    /// The consecutive failures of the drain's work, by sandbox.
-    pub(super) failures: BTreeMap<String, (u32, String)>,
+    /// The failures of the drain's work under this call's epoch.
+    pub(super) failures: DrainFailures,
     /// The rows in the same lifecycle for [`SETTLE_BOUND`] or longer.
     pub(super) unchanged: BTreeSet<String>,
 }
 
 impl DrainPlan {
     /// Wait for `action` on `sandbox_id`, or report it `blocked` once it has
-    /// failed [`MAX_ACTION_FAILURES`] times in a row.
-    fn wait_for(&mut self, inputs: &PlanInputs, sandbox_id: &str, action: &str) {
-        match inputs.failures.get(sandbox_id) {
+    /// failed [`MAX_ACTION_FAILURES`] times under this epoch.
+    fn wait_for(&mut self, inputs: &PlanInputs, sandbox_id: &str, action: DrainAction) {
+        match inputs.failures.get(&(sandbox_id.to_owned(), action)) {
             Some((failures, reason)) if *failures >= MAX_ACTION_FAILURES => {
                 self.blocked.push((
                     Some(sandbox_id.to_owned()),
-                    format!("{action} failed {failures} times in a row: {reason}"),
+                    format!("{} failed {failures} times: {reason}", action.as_str()),
                 ));
             }
             _ => self
                 .pending
-                .push((sandbox_id.to_owned(), action.to_owned())),
+                .push((sandbox_id.to_owned(), action.as_str().to_owned())),
         }
     }
 
@@ -268,9 +286,9 @@ impl DrainPlan {
         let (sandbox_id, kind) = action.target();
         let sandbox_id = sandbox_id.to_owned();
         match inputs.running.get(&sandbox_id) {
-            Some(running) => self.wait_for(inputs, &sandbox_id, running.as_str()),
+            Some(running) => self.wait_for(inputs, &sandbox_id, *running),
             None => {
-                self.wait_for(inputs, &sandbox_id, kind.as_str());
+                self.wait_for(inputs, &sandbox_id, kind);
                 self.actions.push(action);
             }
         }
@@ -305,8 +323,23 @@ pub(super) fn plan(rows: &[DrainRow], inputs: &PlanInputs) -> DrainPlan {
         let id = &row.sandbox_id;
         if row.pool_member {
             // Not a resident: the warm-pool reconciler evicts slots on a
-            // cordoned node, and until it has, the VM keeps `done` false.
-            plan.vm |= may_hold_vm(row.lifecycle);
+            // cordoned node, and until it has, the VM keeps `done` false,
+            // and pages once it has waited too long, as an undriven
+            // transition does.
+            if may_hold_vm(row.lifecycle) {
+                if inputs.unchanged.contains(id) {
+                    plan.blocked.push((
+                        Some(id.clone()),
+                        format!(
+                            "a warm-pool VM not evicted for over {} minutes",
+                            SETTLE_BOUND.as_secs() / 60
+                        ),
+                    ));
+                } else {
+                    plan.pending
+                        .push((id.clone(), "warm_pool_eviction".to_owned()));
+                }
+            }
             continue;
         }
         let running = inputs.running.contains_key(id);
@@ -324,27 +357,23 @@ pub(super) fn plan(rows: &[DrainRow], inputs: &PlanInputs) -> DrainPlan {
         };
         match row.lifecycle {
             SandboxState::Quarantined => {
-                plan.vm = true;
                 plan.blocked.push((Some(id.clone()), "quarantined".into()));
             }
             SandboxState::CleanupFailed => {
                 plan.blocked
                     .push((Some(id.clone()), "cleanup failed".into()));
             }
-            SandboxState::Started | SandboxState::Paused => {
-                plan.vm = true;
-                match &row.suspend_refusal {
-                    Some(refusal) if !running => {
-                        plan.blocked.push((Some(id.clone()), refusal.clone()));
-                    }
-                    _ => plan.drive(
-                        inputs,
-                        PlannedAction::Suspend {
-                            sandbox_id: id.clone(),
-                        },
-                    ),
+            SandboxState::Started | SandboxState::Paused => match &row.suspend_refusal {
+                Some(refusal) if !running => {
+                    plan.blocked.push((Some(id.clone()), refusal.clone()));
                 }
-            }
+                _ => plan.drive(
+                    inputs,
+                    PlannedAction::Suspend {
+                        sandbox_id: id.clone(),
+                    },
+                ),
+            },
             SandboxState::Stopped => match (&durable_pin, pending_pin) {
                 _ if row.volume_encryption && !running => {
                     plan.blocked.push((
@@ -390,9 +419,8 @@ pub(super) fn plan(rows: &[DrainRow], inputs: &PlanInputs) -> DrainPlan {
             other => {
                 // A transition the drain doesn't drive: wait for it to settle,
                 // and page once it has sat there too long.
-                plan.vm |= may_hold_vm(other);
                 if let Some(action) = inputs.running.get(id) {
-                    plan.wait_for(inputs, id, action.as_str());
+                    plan.wait_for(inputs, id, *action);
                 } else if inputs.unchanged.contains(id) {
                     plan.blocked.push((
                         Some(id.clone()),
@@ -449,59 +477,13 @@ fn dir_sandbox(dir: &str) -> String {
     )
 }
 
-/// A scanner of node-manager's orphan inventory, as its failure warnings
-/// name it (`<scanner>: <error>`).
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum OrphanScanner {
-    Namespaces,
-    Cgroups,
-    RunDirs,
-    GatewayRunDirs,
-    CacheDirs,
-    Processes,
-    Nft,
-}
-
-impl OrphanScanner {
-    const ALL: [Self; 7] = [
-        Self::Namespaces,
-        Self::Cgroups,
-        Self::RunDirs,
-        Self::GatewayRunDirs,
-        Self::CacheDirs,
-        Self::Processes,
-        Self::Nft,
-    ];
-
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::Namespaces => "Namespaces",
-            Self::Cgroups => "Cgroups",
-            Self::RunDirs => "RunDirs",
-            Self::GatewayRunDirs => "GatewayRunDirs",
-            Self::CacheDirs => "CacheDirs",
-            Self::Processes => "Processes",
-            Self::Nft => "Nft",
-        }
-    }
-
-    fn parse(value: &str) -> Option<Self> {
-        Self::ALL
-            .into_iter()
-            .find(|scanner| scanner.as_str() == value)
-    }
-
-    /// Whether what this scanner finds can be a resident or an artifact: an
-    /// untracked runtime process, or a sandbox cache or run directory. The
-    /// others find network namespaces, cgroups, nft rules and gateway run
-    /// directories, which hold neither.
-    const fn can_hide_a_resident(self) -> bool {
-        match self {
-            Self::RunDirs | Self::CacheDirs | Self::Processes => true,
-            Self::Namespaces | Self::Cgroups | Self::GatewayRunDirs | Self::Nft => false,
-        }
-    }
-}
+/// The scanners of node-manager's orphan inventory, as its failure warnings
+/// name them (`<scanner>: <error>`), whose findings can hold neither a
+/// resident nor an artifact: network namespaces, cgroups, gateway run
+/// directories and nft rules. A failure of any other scanner (run and cache
+/// directories, processes, or one this build doesn't know) may have hidden
+/// a resident.
+const HARMLESS_ORPHAN_SCANNERS: [&str; 4] = ["Namespaces", "Cgroups", "GatewayRunDirs", "Nft"];
 
 /// Fold one inventory page into `findings`.
 pub(super) fn classify_orphan_page(
@@ -531,8 +513,7 @@ pub(super) fn classify_orphan_page(
         // name, may have hidden a resident.
         let harmless = warning
             .split_once(':')
-            .and_then(|(scanner, _)| OrphanScanner::parse(scanner))
-            .is_some_and(|scanner| !scanner.can_hide_a_resident());
+            .is_some_and(|(scanner, _)| HARMLESS_ORPHAN_SCANNERS.contains(&scanner));
         if !harmless {
             findings
                 .blocked
@@ -586,12 +567,11 @@ impl SandboxManagerService {
         first: &ActivationSealStatus,
         scans: DrainScans,
     ) -> DrainNodeResponse {
-        let (mut plan, rows) = match self.read_drain_plan() {
+        let (mut plan, rows) = match self.read_drain_plan(epoch) {
             Ok(read) => read,
             Err(reason) => (
                 DrainPlan {
                     blocked: vec![(None, reason)],
-                    vm: true,
                     ..DrainPlan::default()
                 },
                 BTreeSet::new(),
@@ -619,7 +599,9 @@ impl SandboxManagerService {
         // A cancelled epoch is never sealed again, so the same epoch at both
         // reads is one continuous seal.
         let continuous = first.sealed_epoch == Some(epoch) && last.sealed_epoch == Some(epoch);
-        let done = continuous && !plan.vm && plan.pending.is_empty() && plan.blocked.is_empty();
+        // Every row that may hold a VM is pending or blocked, so a node with
+        // nothing pending or blocked holds none.
+        let done = continuous && plan.pending.is_empty() && plan.blocked.is_empty();
         report(first, plan, done)
     }
 
@@ -635,15 +617,24 @@ impl SandboxManagerService {
                 })?;
             let mut page_token = String::new();
             loop {
-                let page = client
+                let page = match client
                     .list_orphan_candidates(
                         pplx_space_node_mgr_client::proto::ListOrphanCandidatesRequest {
                             page_token: page_token.clone(),
                         },
                     )
                     .await
-                    .map_err(|status| format!("orphan inventory failed: {status}"))?
-                    .into_inner();
+                {
+                    Ok(page) => page.into_inner(),
+                    // Node-manager serves one inventory at a time and answers
+                    // another caller (an overlapping `:terminate` probe, or
+                    // node-ctl) busy: ask again within the deadline.
+                    Err(status) if status.code() == tonic::Code::ResourceExhausted => {
+                        tokio::time::sleep(ORPHAN_INVENTORY_BUSY_RETRY).await;
+                        continue;
+                    }
+                    Err(status) => return Err(format!("orphan inventory failed: {status}")),
+                };
                 classify_orphan_page(&page, gateway_run_root, &mut findings);
                 if page.next_page_token.is_empty() {
                     return Ok(());
@@ -666,8 +657,8 @@ impl SandboxManagerService {
     /// Read every row, the artifacts without a durable copy and the
     /// evacuation record, and plan, with the ids of the rows read. An error
     /// is the scan that failed, which blocks the drain.
-    fn read_drain_plan(&self) -> Result<(DrainPlan, BTreeSet<String>), String> {
-        let (sandboxes, local_only_rows, evacuations) = {
+    fn read_drain_plan(&self, epoch: u64) -> Result<(DrainPlan, BTreeSet<String>), String> {
+        let (sandboxes, local_only_rows, evacuations, pending_rows) = {
             let conn = self
                 .db_conn()
                 .map_err(|status| status.message().to_owned())?;
@@ -678,7 +669,9 @@ impl SandboxManagerService {
                 .map_err(|error| format!("local artifact scan failed: {error}"))?;
             let evacuations = crate::db::read::drain_evacuations(&conn)
                 .map_err(|error| format!("evacuation record unreadable: {error}"))?;
-            (sandboxes, local_only, evacuations)
+            let pending = crate::db::scan::pending_backups(&conn)
+                .map_err(|error| format!("pending backup scan failed: {error}"))?;
+            (sandboxes, local_only, evacuations, pending)
         };
         let mut local_only = LocalOnlyArtifacts::new();
         for artifact in local_only_rows {
@@ -688,11 +681,7 @@ impl SandboxManagerService {
             ));
         }
         let mut pending_backups: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-        for pending in self
-            .local_artifacts()
-            .list_pending_backups()
-            .map_err(|error| format!("pending backup scan failed: {error}"))?
-        {
+        for pending in pending_rows {
             pending_backups
                 .entry(pending.sandbox_id)
                 .or_default()
@@ -731,7 +720,7 @@ impl SandboxManagerService {
             local_only,
             evacuations,
             running: self.drain_actions.running(),
-            failures: self.drain_actions.failures(),
+            failures: self.drain_actions.failures(epoch),
             unchanged: self
                 .drain_actions
                 .unchanged_since_bound(&lifecycles, tokio::time::Instant::now()),
@@ -784,13 +773,14 @@ impl SandboxManagerService {
                     );
                 }
                 service.drain_actions.finish(
+                    epoch,
                     &task_sandbox_id,
                     result.err().map(|status| status.message().to_owned()),
                 );
             });
             if spawned.is_err() {
                 // Draining for a restart: the next process's call starts it.
-                self.drain_actions.finish(&sandbox_id, None);
+                self.drain_actions.finish(epoch, &sandbox_id, None);
             }
         }
     }
@@ -881,12 +871,12 @@ impl SandboxManagerService {
             SandboxState::Paused => DrainPrior::Paused,
             _ => return Ok(()),
         };
-        if !self
-            .activation_seal
-            .record_drain_suspend(&self.db, epoch, &sandbox.id, prior)?
-        {
+        let Some(recorded) =
+            self.activation_seal
+                .record_drain_suspend(&self.db, epoch, &sandbox.id, prior)?
+        else {
             return Ok(());
-        }
+        };
         let artifact_lock = self.auto_lifecycle.artifact_lock(&sandbox.id);
         let artifact_guard = artifact_lock.lock_owned().await;
         let context = SuspendRequestContext::new(
@@ -908,14 +898,21 @@ impl SandboxManagerService {
                 .await
         }
         .await;
+        let recorded_state = match recorded {
+            DrainPrior::Started => SandboxState::Started,
+            DrainPrior::Paused => SandboxState::Paused,
+            DrainPrior::Stopped => SandboxState::Stopped,
+        };
         if suspended.is_err()
-            && !self
+            && self
                 .lookup_sandbox(sandbox_id)
-                .is_ok_and(|row| row.state == SandboxState::Suspended)
+                .is_ok_and(|row| row.state == recorded_state)
         {
-            // The suspend didn't land, so the record would name the lifecycle
-            // of a suspend that never happened if a user's own suspend came
-            // next. The next call records it again.
+            // The suspend didn't land and the row is back in the lifecycle it
+            // recorded, so the record would name the lifecycle of a suspend
+            // that never happened if a user's own suspend came next. The next
+            // call records it again. A row it left elsewhere, `paused` after
+            // its pause, keeps the record: that is the lifecycle to restore.
             let forgotten = self.db_conn().ok().is_some_and(|conn| {
                 crate::db::activation_seal::forget_drain_suspend(&conn, sandbox_id).is_ok()
             });

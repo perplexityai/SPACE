@@ -120,29 +120,30 @@ fn a_drain_suspend_is_recorded_only_under_its_own_seal() {
     };
 
     assert!(
-        !seal
-            .record_drain_suspend(&db, 5, "sbx-a", DrainPrior::Started)
+        seal.record_drain_suspend(&db, 5, "sbx-a", DrainPrior::Started)
             .unwrap()
+            .is_none()
     );
     seal.seal(&db, 5).unwrap();
     assert!(
-        !seal
-            .record_drain_suspend(&db, 4, "sbx-a", DrainPrior::Started)
+        seal.record_drain_suspend(&db, 4, "sbx-a", DrainPrior::Started)
             .unwrap()
+            .is_none()
     );
     assert_eq!(recorded(), Vec::<String>::new());
-    assert!(
+    assert_eq!(
         seal.record_drain_suspend(&db, 5, "sbx-a", DrainPrior::Started)
-            .unwrap()
+            .unwrap(),
+        Some(DrainPrior::Started)
     );
     assert_eq!(recorded(), ["sbx-a"]);
 
     seal.unseal(&db, 5).unwrap();
     assert_eq!(recorded(), Vec::<String>::new());
     assert!(
-        !seal
-            .record_drain_suspend(&db, 5, "sbx-b", DrainPrior::Paused)
+        seal.record_drain_suspend(&db, 5, "sbx-b", DrainPrior::Paused)
             .unwrap()
+            .is_none()
     );
     assert_eq!(recorded(), Vec::<String>::new());
 }

@@ -84,17 +84,32 @@ pub struct DrainEvacuation {
     pub prior: DrainPrior,
 }
 
-/// Record that a drain suspend of `sandbox_id` begins from `prior`,
-/// replacing any earlier record of it.
-pub fn record_drain_suspend(conn: &Connection, sandbox_id: &str, prior: DrainPrior) -> Result<()> {
-    conn.execute(
+/// Record that a drain suspend of `sandbox_id` begins from `prior`, unless
+/// an earlier attempt's record stands: a suspend that failed after its
+/// pause leaves the row `paused`, and the lifecycle to restore is still the
+/// one first recorded. Returns the prior the record holds.
+pub fn record_drain_suspend(
+    conn: &Connection,
+    sandbox_id: &str,
+    prior: DrainPrior,
+) -> Result<DrainPrior> {
+    let recorded: String = conn.query_row(
         sql!(
             "INSERT INTO drain_evacuations (sandbox_id, prior) VALUES (?1, ?2)
-             ON CONFLICT(sandbox_id) DO UPDATE SET prior = excluded.prior"
+             ON CONFLICT(sandbox_id) DO UPDATE SET prior = drain_evacuations.prior
+             RETURNING prior"
         ),
         params![sandbox_id, prior.as_str()],
+        |row| row.get(0),
     )?;
-    Ok(())
+    DrainPrior::parse(&recorded).ok_or_else(|| {
+        rusqlite::Error::FromSqlConversionFailure(
+            0,
+            rusqlite::types::Type::Text,
+            format!("unknown drain prior {recorded:?}").into(),
+        )
+        .into()
+    })
 }
 
 /// Forget `sandbox_id`'s record: its drain suspend did not happen.

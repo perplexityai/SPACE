@@ -1,5 +1,5 @@
-//! The node's activation seal, and the VM activations in flight that a
-//! drain waits for.
+//! The node's activation seal, and the VM activations in flight, which a
+//! drain reports as pending.
 //!
 //! While sealed under an epoch, [`ActivationSeal::admit`] refuses every VM
 //! activation: the cold boot of a sandbox, the restore of one from a snapshot
@@ -159,7 +159,9 @@ impl ActivationSeal {
     }
 
     /// Record that a drain suspend of `sandbox_id` under `epoch` begins from
-    /// `prior`, if the node is still sealed under `epoch`; whether it is.
+    /// `prior`, if the node is still sealed under `epoch`, keeping an earlier
+    /// attempt's record; the prior the record holds, or `None` when the node
+    /// is not sealed under `epoch`.
     /// Under the state lock, which a cancel holds while it forgets every
     /// record, so a record outlives no cancel.
     pub(crate) fn record_drain_suspend(
@@ -168,20 +170,21 @@ impl ActivationSeal {
         epoch: u64,
         sandbox_id: &str,
         prior: DrainPrior,
-    ) -> Result<bool, Status> {
+    ) -> Result<Option<DrainPrior>, Status> {
         let state = self.lock_state();
         if state.sealed_epoch() != Some(epoch) {
-            return Ok(false);
+            return Ok(None);
         }
         let conn = db
             .lock()
             .map_err(|_| Status::internal("sandbox database mutex poisoned"))?;
-        crate::db::activation_seal::record_drain_suspend(&conn, sandbox_id, prior).map_err(
-            |error| Status::internal(format!("record the drain suspend of {sandbox_id}: {error}")),
-        )?;
+        let recorded = crate::db::activation_seal::record_drain_suspend(&conn, sandbox_id, prior)
+            .map_err(|error| {
+            Status::internal(format!("record the drain suspend of {sandbox_id}: {error}"))
+        })?;
         drop(conn);
         drop(state);
-        Ok(true)
+        Ok(Some(recorded))
     }
 
     /// Cancel `epoch`: clear the seal if it is under `epoch` or an earlier

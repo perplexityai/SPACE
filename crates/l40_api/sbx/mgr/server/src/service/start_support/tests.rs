@@ -423,8 +423,8 @@ fn assert_sealed_refusal(status: &Status, epoch: u64) {
 
 /// While sealed, every activation kind is refused, whether or not it runs
 /// under a caller's state-writer lease, without taking limiter capacity or
-/// advancing the admitted count. After the unseal each is admitted, counted,
-/// and listed in flight under its own kind until its admission is dropped.
+/// being tracked in flight. After the unseal each is admitted and tracked in
+/// flight until its admission is dropped.
 #[tokio::test]
 async fn sealed_admission_refuses_every_kind_and_unseal_admits_each_again() {
     use futures_util::FutureExt;

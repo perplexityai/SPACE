@@ -77,7 +77,6 @@ fn every_lifecycle_plans_as_the_drain_table_says() {
     ] {
         let rows = [row("control", S::Started), row("subject", state)];
         let plan = plan(&rows, &PlanInputs::default());
-        assert!(plan.vm, "{state}: the started control is a VM");
         assert!(
             plan.actions.contains(&PlannedAction::Suspend {
                 sandbox_id: "control".into(),
@@ -146,7 +145,6 @@ fn a_vm_waits_for_its_suspend_or_blocks_with_why_it_cant() {
     );
     assert_eq!(running.pending, [("a".into(), "suspend".into())]);
     assert!(running.actions.is_empty());
-    assert!(running.vm);
 
     let mut refused = row("a", SandboxState::Started);
     refused.suspend_refusal = Some("can't be made durable: no memory snapshots".into());
@@ -158,7 +156,7 @@ fn a_vm_waits_for_its_suspend_or_blocks_with_why_it_cant() {
             "can't be made durable: no memory snapshots".into()
         )]
     );
-    assert!(blocked.actions.is_empty() && blocked.pending.is_empty() && blocked.vm);
+    assert!(blocked.actions.is_empty() && blocked.pending.is_empty());
 }
 
 /// A stopped sandbox: an encrypted disk blocks; a durable pinned disk is
@@ -179,7 +177,7 @@ fn a_stopped_sandbox_is_published_once_and_reported_with_its_disk() {
         plan_durable.evacuated,
         [("a".into(), DrainPrior::Stopped, DISK_ARTIFACT.into())]
     );
-    assert!(plan_durable.pending.is_empty() && !plan_durable.vm);
+    assert!(plan_durable.pending.is_empty() && plan_durable.blocked.is_empty());
 
     let plan_uploading = plan_one(durable, &pending("a", DISK_ARTIFACT), &[], &[]);
     assert_eq!(plan_uploading.pending, [("a".into(), "upload".into())]);
@@ -236,14 +234,30 @@ fn a_suspended_evacuation_reports_its_prior_once_durable() {
 }
 
 /// An unclaimed warm-pool member is not a resident: nothing is started for
-/// it, but its VM keeps the drain from being done.
+/// it, but its VM keeps the drain from being done, as a pending eviction
+/// that blocks once it has waited past the settle bound; one with no VM
+/// holds nothing.
 #[test]
-fn a_pool_member_is_left_to_the_pool() {
+fn a_pool_member_is_left_to_the_pool_and_says_so() {
     let mut member = row("a", SandboxState::Started);
     member.pool_member = true;
-    let plan_member = plan_one(member, &BTreeMap::new(), &[], &[]);
-    assert!(plan_member.actions.is_empty() && plan_member.pending.is_empty());
-    assert!(plan_member.vm);
+    let waiting = plan(std::slice::from_ref(&member), &PlanInputs::default());
+    assert!(waiting.actions.is_empty() && waiting.blocked.is_empty());
+    assert_eq!(waiting.pending, [("a".into(), "warm_pool_eviction".into())]);
+
+    let stuck = plan(
+        std::slice::from_ref(&member),
+        &PlanInputs {
+            unchanged: BTreeSet::from(["a".to_owned()]),
+            ..PlanInputs::default()
+        },
+    );
+    assert!(stuck.pending.is_empty());
+    assert_eq!(stuck.blocked.len(), 1, "{stuck:?}");
+
+    member.lifecycle = SandboxState::Stopped;
+    let idle = plan(&[member], &PlanInputs::default());
+    assert!(idle.pending.is_empty() && idle.blocked.is_empty());
 }
 
 /// The inventory's process, cache and run directory findings, and those
@@ -574,16 +588,25 @@ fn a_local_only_artifact_without_a_row_blocks() {
     );
 }
 
-/// Work that has failed fewer than the bound times in a row is pending; at
-/// the bound it is blocked with the last failure, whether it is running or
-/// about to start again, and it is still retried.
+/// Work that has failed fewer than the bound times is pending; at the bound
+/// it is blocked with the last failure, whether it is running or about to
+/// start again, and it is still retried. The count is per kind of work: a
+/// suspend's failures don't block the sandbox's upload.
 #[test]
 fn a_persistent_failure_blocks_with_its_reason_and_is_still_retried() {
     let plan_with = |failures: u32, running: &[(&str, DrainAction)]| {
         plan(
             &[row("a", SandboxState::Paused)],
             &PlanInputs {
-                failures: BTreeMap::from([("a".to_owned(), (failures, "no space".to_owned()))]),
+                failures: [DrainAction::Suspend, DrainAction::Upload]
+                    .into_iter()
+                    .map(|action| {
+                        (
+                            ("a".to_owned(), action),
+                            (failures, format!("no space for {}", action.as_str())),
+                        )
+                    })
+                    .collect(),
                 running: running
                     .iter()
                     .map(|(id, action)| ((*id).to_owned(), *action))
@@ -607,7 +630,7 @@ fn a_persistent_failure_blocks_with_its_reason_and_is_still_retried() {
         at.blocked,
         [(
             Some("a".into()),
-            format!("suspend failed {MAX_ACTION_FAILURES} times in a row: no space")
+            format!("suspend failed {MAX_ACTION_FAILURES} times: no space for suspend")
         )]
     );
     assert_eq!(at.actions, suspend, "still retried");
@@ -617,10 +640,55 @@ fn a_persistent_failure_blocks_with_its_reason_and_is_still_retried() {
         running.blocked,
         [(
             Some("a".into()),
-            format!("upload failed {MAX_ACTION_FAILURES} times in a row: no space")
+            format!("upload failed {MAX_ACTION_FAILURES} times: no space for upload")
         )]
     );
     assert!(running.actions.is_empty());
+
+    // Only the suspend failed: the upload running now is pending.
+    let other_kind = plan(
+        &[row("a", SandboxState::Paused)],
+        &PlanInputs {
+            failures: BTreeMap::from([(
+                ("a".to_owned(), DrainAction::Suspend),
+                (MAX_ACTION_FAILURES, "no space".to_owned()),
+            )]),
+            running: BTreeMap::from([("a".to_owned(), DrainAction::Upload)]),
+            ..PlanInputs::default()
+        },
+    );
+    assert_eq!(other_kind.pending, [("a".into(), "upload".into())]);
+    assert!(other_kind.blocked.is_empty());
+}
+
+/// Failures are counted under the epoch they happened in: a later drain
+/// starts from none, and a failure of an action an earlier epoch started
+/// doesn't count toward the new one.
+#[test]
+fn a_new_epoch_starts_the_failure_count_again() {
+    let actions = DrainActions::default();
+    assert!(actions.failures(7).is_empty());
+    for _ in 0..MAX_ACTION_FAILURES {
+        assert!(actions.start("a", DrainAction::Upload));
+        actions.finish(7, "a", Some("no space".into()));
+    }
+    assert_eq!(
+        actions.failures(7),
+        BTreeMap::from([(
+            ("a".to_owned(), DrainAction::Upload),
+            (MAX_ACTION_FAILURES, "no space".to_owned())
+        )])
+    );
+    assert!(actions.start("a", DrainAction::Upload));
+    assert!(
+        actions.failures(8).is_empty(),
+        "a new epoch forgets the old count"
+    );
+    actions.finish(7, "a", Some("late".into()));
+    assert!(
+        actions.failures(8).is_empty(),
+        "the old epoch's action doesn't count"
+    );
 }
 
 /// A row in a transition the drain doesn't drive is pending until it has sat
@@ -993,6 +1061,33 @@ async fn a_drain_suspend_acts_only_on_its_own_resident_under_its_own_seal() {
     );
 }
 
+/// A drain suspend that failed after its pause leaves the row `paused`: the
+/// record keeps the `started` it first recorded, through that failure and
+/// the next attempt's, so the sandbox comes back started, not frozen.
+#[tokio::test]
+async fn a_drain_suspend_that_failed_after_its_pause_keeps_the_started_record() {
+    let node_manager = crate::node_manager_transport::fake::FakeNodeManager::default().serve();
+    let conn = crate::db::test_conn();
+    let id = pplx_space_common_core::types::SandboxId::new().to_string();
+    crate::service::tests::service_tests::insert_test_sandbox(&conn, &id, SandboxState::Paused);
+    // What the first attempt left: its record, from the started VM it paused.
+    crate::db::activation_seal::record_drain_suspend(&conn, &id, DrainPrior::Started).unwrap();
+    let service = service_with_node_manager(conn, &node_manager);
+    service.activation_seal.seal(&service.db, 7).unwrap();
+    service.drain_suspend(7, &id).await.unwrap_err();
+    assert_ne!(
+        service.lookup_sandbox(&id).unwrap().state,
+        SandboxState::Suspended
+    );
+    assert_eq!(
+        crate::db::read::drain_evacuations(&service.db.lock().unwrap()).unwrap(),
+        [DrainEvacuation {
+            sandbox_id: id,
+            prior: DrainPrior::Started,
+        }]
+    );
+}
+
 /// A drain action doesn't run once the node is no longer sealed under its
 /// epoch: a stopped sandbox's disk isn't published for a drain a cancel
 /// ended.
@@ -1059,4 +1154,33 @@ async fn a_pending_upload_becomes_an_evacuation() {
         }]
     );
     assert!(report.done, "{report:?}");
+}
+
+/// An inventory busy with another caller is asked again within the
+/// deadline: the call that met it still reports `done`.
+#[tokio::test]
+async fn a_busy_inventory_is_asked_again() {
+    let asked = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let busy_once = crate::node_manager_transport::fake::FakeNodeManager::default()
+        .unary("ListOrphanCandidates", {
+            let asked = std::sync::Arc::clone(&asked);
+            move |_: pplx_space_node_mgr_client::proto::ListOrphanCandidatesRequest| {
+                if asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                    Err(tonic::Status::resource_exhausted(
+                        "orphan inventory is busy; retry",
+                    ))
+                } else {
+                    Ok(pplx_space_node_mgr_client::proto::ListOrphanCandidatesResponse::default())
+                }
+            }
+        })
+        .serve();
+    let service = service_with_node_manager(crate::db::test_conn(), &busy_once);
+    let report = service
+        .drain_node(drain_request(7, false))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(report.done, "{report:?}");
+    assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 2);
 }

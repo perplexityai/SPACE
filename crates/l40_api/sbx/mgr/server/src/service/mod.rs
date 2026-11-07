@@ -400,8 +400,8 @@ pub struct SandboxManagerService {
     /// Node-wide admission for Firecracker process launches. Cold starts and
     /// restores share one capacity bucket.
     activation_admission_limiter: Arc<ActivationAdmissionLimiter>,
-    /// Refuses every VM activation while the node is sealed, and counts the
-    /// activation work in flight a seal waits for.
+    /// Refuses every VM activation while the node is sealed, and tracks the
+    /// activation work in flight, which a drain reports as pending.
     activation_seal: Arc<crate::activation_seal::ActivationSeal>,
     /// The node drain's work in flight in this process.
     drain_actions: Arc<drain_node::DrainActions>,
