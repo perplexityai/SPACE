@@ -372,3 +372,58 @@ async fn a_terminating_node_is_terminated_then_recorded_once() {
     assert!(terminator.calls.lock().unwrap().is_empty());
     assert!(report.terminated.is_empty() && sink.calls().is_empty());
 }
+
+/// With new v2 drains not admitted, the loop still owns the persisted ones:
+/// it drains a draining node to `drained` and cancels an undrained one, and
+/// refuses to terminate, leaving the node `terminating` with its error.
+#[tokio::test]
+async fn the_loop_owns_persisted_drains_without_terminating() {
+    let draining = node(Some("draining"), Some(5), false);
+    let undrained = node(None, Some(5), true);
+    let terminating = node(Some("terminating"), Some(5), false);
+    let sink = FakeSink {
+        nodes: vec![draining.clone(), undrained.clone(), terminating.clone()],
+        responses: HashMap::from([
+            ((draining.id, false), Ok(response(Some(5), true, &[]))),
+            ((undrained.id, true), Ok(response(None, false, &[]))),
+        ]),
+        ..FakeSink::default()
+    };
+    let report = tick(&sink, &V2Terminator::Refuse).await;
+    assert_eq!(report.drained, [draining.id]);
+    assert_eq!(report.cancelled, [undrained.id]);
+    assert!(report.terminated.is_empty());
+    let calls = sink.calls();
+    assert!(
+        calls
+            .iter()
+            .any(|call| call.starts_with(&format!("error {}", terminating.id))),
+        "{calls:?}"
+    );
+}
+
+/// A draining node that doesn't answer its `DrainNode` call reads 1 on the
+/// unanswered gauge, so a dead node pages as a blocked one does; one that
+/// answers reads 0.
+#[tokio::test(flavor = "current_thread")]
+async fn a_node_that_does_not_answer_shows_on_the_unanswered_gauge() {
+    for (case, answer, unanswered) in [
+        ("dead", Err("unreachable".into()), 1.0),
+        ("answering", Ok(response(Some(5), false, &[])), 0.0),
+    ] {
+        let draining = node(Some("draining"), Some(5), false);
+        let sink = FakeSink {
+            nodes: vec![draining.clone()],
+            responses: HashMap::from([((draining.id, false), answer)]),
+            ..FakeSink::default()
+        };
+        let capture = pplx_space_metrics_emit::test_capture::capture_values_guard();
+        tick(&sink, &FakeTerminator::ok()).await;
+        let values = capture.finish();
+        let gauge = values
+            .iter()
+            .find(|value| value.name == "node_drain.v2.unanswered")
+            .map(|value| value.value);
+        assert_eq!(gauge, Some(unanswered), "{case}: {values:?}");
+    }
+}

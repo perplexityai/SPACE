@@ -11,8 +11,10 @@ use pplx_space_metrics_emit::{counter, elapsed_ms, gauge, tag, timing_ms};
 /// What a v2 drain's node reported on the loop's last call: residents it
 /// can't make durable (`blocked`, which keeps the drain from ending and is
 /// what to page on) and work still under way (`pending`, evacuations not yet
-/// recorded included).
+/// recorded included). `unanswered` is 1 while the node didn't answer, which
+/// keeps the drain from ending just as `blocked` does.
 pub fn v2_report(node_id: &str, blocked: u64, pending: u64) {
+    gauge("node_drain.v2.unanswered", 0.0, &[tag("node", node_id)]);
     gauge(
         "node_drain.v2.blocked",
         blocked as f64,
@@ -23,6 +25,12 @@ pub fn v2_report(node_id: &str, blocked: u64, pending: u64) {
         pending as f64,
         &[tag("node", node_id)],
     );
+}
+
+/// A v2 drain's node didn't answer the loop's `DrainNode` call: dead,
+/// unreachable or failing. See [`v2_report`].
+pub fn v2_unanswered(node_id: &str) {
+    gauge("node_drain.v2.unanswered", 1.0, &[tag("node", node_id)]);
 }
 
 /// Transition between two `nodes.drain_phase` values (driven by the reconciler).

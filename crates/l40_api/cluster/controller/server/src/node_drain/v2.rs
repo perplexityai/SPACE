@@ -9,9 +9,10 @@
 //!
 //! - **`draining` and `drained`**: reconcile the cordon, call `DrainNode`
 //!   under the epoch, and for each sandbox the node reports evacuated,
-//!   enqueue the drain restore operation that brings it back to its prior
-//!   lifecycle elsewhere (with the stop pin, for a stopped one), in one
-//!   transaction and at most once per snapshot. The report is stored in
+//!   enqueue the drain restore operation that brings a suspended one back to
+//!   its prior lifecycle elsewhere, in one transaction and at most once per
+//!   snapshot, or release a stopped one from the node with its disk pinned,
+//!   for its next start or wake to materialize on any node. The report is stored in
 //!   `drain_status`. A `draining` node moves to `drained` once the report is
 //!   `done` under the row's own epoch and every evacuation is recorded.
 //! - **`terminating`**: `:terminate` moved it here, gated on a fresh `done`
@@ -34,7 +35,27 @@ use pplx_space_common_core::types::NodeId;
 use pplx_space_sbx_mgr_client::proto::{DrainEvacuated, DrainNodeResponse, DrainPrior};
 use tokio_util::sync::CancellationToken;
 
-use super::{InstanceTerminator, TerminateError};
+use super::{Ec2InstanceTerminator, InstanceTerminator, TerminateError};
+
+/// The v2 loop's terminator: EC2, where a terminated node's row has an
+/// owner, or a refusal that leaves the node `terminating`.
+pub enum V2Terminator {
+    Ec2(Ec2InstanceTerminator),
+    Refuse,
+}
+
+impl InstanceTerminator for V2Terminator {
+    async fn terminate(&self, node_id: NodeId) -> Result<(), TerminateError> {
+        match self {
+            Self::Ec2(terminator) => terminator.terminate(node_id).await,
+            Self::Refuse => Err(TerminateError::Provider(
+                "a v2 node is terminated only through the aws terminator with the dead-node \
+                 verb live, which deletes its row"
+                    .to_owned(),
+            )),
+        }
+    }
+}
 
 /// A v2 drain's node, as the loop reads it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -248,6 +269,7 @@ async fn drain<S: DrainV2Sink>(sink: &S, node: &V2Node, epoch: u64) -> bool {
     let response = match sink.drain_node(node.id, epoch, false).await {
         Ok(response) => response,
         Err(error) => {
+            crate::metrics::node_drain::v2_unanswered(&node.id.to_string());
             sink.record_error(node.id, &format!("DrainNode failed: {error}"))
                 .await;
             return false;

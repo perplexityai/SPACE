@@ -1,6 +1,6 @@
 use super::{
     ReconcilerRuntimeError, Supervision, TerminatorKind, build_if_enabled,
-    dead_node_replaces_the_gone_node_loops, drain_v2_enabled, supervise_reconcilers,
+    dead_node_replaces_the_gone_node_loops, drain_v2_enabled, supervise_reconcilers, v2_terminates,
 };
 use crate::dead_node::{self, AuthorityKind};
 use std::future::Future;
@@ -154,16 +154,17 @@ fn the_dead_node_verb_replaces_the_gone_node_loops_only_live_with_ec2() {
     }
 }
 
-/// The drain's v2 starts only with the dead-node verb replacing the gone-node
-/// loops; off, it starts whatever the verb does.
+/// New v2 drains are admitted only with the node drain running and the
+/// dead-node verb replacing the gone-node loops; off, nothing is refused.
 #[test]
-fn the_drain_v2_runs_only_with_the_dead_node_verb_live() {
+fn the_drain_v2_runs_only_with_the_node_drain_and_the_dead_node_verb_live() {
     let mut env = pplx_space_test_env::TestEnv::default();
-    for (flag, dead_node_live, expected) in [
-        (None, false, Some(false)),
-        (Some("false"), false, Some(false)),
-        (Some("true"), false, None),
-        (Some("true"), true, Some(true)),
+    for (flag, dead_node_live, node_drain, expected) in [
+        (None, false, false, Some(false)),
+        (Some("false"), false, false, Some(false)),
+        (Some("true"), false, true, None),
+        (Some("true"), true, false, None),
+        (Some("true"), true, true, Some(true)),
     ] {
         match flag {
             Some(flag) => env.set(
@@ -172,13 +173,28 @@ fn the_drain_v2_runs_only_with_the_dead_node_verb_live() {
             ),
             None => env.remove(pplx_space_api::routes::admin::nodes::DRAIN_V2_ENABLED_ENV),
         }
-        let got = drain_v2_enabled(&env, dead_node_live);
+        let got = drain_v2_enabled(&env, dead_node_live, node_drain);
+        let case = format!("{flag:?} live={dead_node_live} node_drain={node_drain}");
         match expected {
-            Some(enabled) => assert_eq!(got.ok(), Some(enabled), "{flag:?} {dead_node_live}"),
+            Some(enabled) => assert_eq!(got.ok(), Some(enabled), "{case}"),
             None => assert!(
                 matches!(got, Err(ReconcilerRuntimeError::DrainV2NeedsDeadNodeLive)),
-                "{flag:?} {dead_node_live}"
+                "{case}"
             ),
         }
+    }
+}
+
+/// The v2 loop terminates a node only through EC2 with the dead-node verb
+/// live, which then deletes its row.
+#[test]
+fn the_v2_loop_terminates_only_through_ec2_with_the_verb_live() {
+    for (kind, live, terminates) in [
+        (TerminatorKind::Aws, true, true),
+        (TerminatorKind::Aws, false, false),
+        (TerminatorKind::KubeDelete, true, false),
+        (TerminatorKind::Noop, true, false),
+    ] {
+        assert_eq!(v2_terminates(kind, live), terminates, "{kind:?} {live}");
     }
 }

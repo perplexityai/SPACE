@@ -77,12 +77,14 @@ pub enum ReconcilerRuntimeError {
     InvalidTerminatorKind(String),
     #[error("invalid or missing SPACE API route signing configuration: {0}")]
     RouteSigningConfiguration(#[from] pplx_space_api_route::ed25519::SpaceApiRouteEd25519Error),
-    /// The drain's v2 leaves a terminated node's row to the dead-node verb,
-    /// which only `live` mode with EC2 as its authority deletes.
+    /// The drain's v2 runs in the node drain, and leaves a terminated
+    /// node's row to the dead-node verb, which only `live` mode with EC2 as
+    /// its authority deletes.
     #[error(
-        "SPACE_DRAIN_V2_ENABLED needs SPACE_DEAD_NODE_MODE=live and the aws terminator \
-         (SPACE_NODE_DRAIN_TERMINATOR_KIND=aws): the dead-node verb deletes a v2-terminated \
-         node's row, and only EC2 can say the node is dead"
+        "SPACE_DRAIN_V2_ENABLED needs SPACE_NODE_DRAIN_ENABLED, SPACE_DEAD_NODE_MODE=live and \
+         the aws terminator (SPACE_NODE_DRAIN_TERMINATOR_KIND=aws): the node drain runs the v2 \
+         loop, the dead-node verb deletes a v2-terminated node's row, and only EC2 can say the \
+         node is dead"
     )]
     DrainV2NeedsDeadNodeLive,
 }
@@ -166,7 +168,9 @@ fn dead_node_authority_kind(terminator: Option<TerminatorKind>) -> dead_node::Au
 /// Whether the dead-node verb takes over from `orphaned_nodes` and
 /// `lost_started_sandboxes`: only `live`, and only where it has EC2 to judge
 /// by. Without an authority it judges every node unknown, so those loops,
-/// which ask EC2 whatever the terminator, keep running.
+/// which ask EC2 whatever the terminator, keep running. Even where it takes
+/// over, they keep the nodes with no recorded instance, which the verb can
+/// only judge unknown.
 fn dead_node_replaces_the_gone_node_loops(
     config: Option<&dead_node::ReconcilerConfig>,
     authority: dead_node::AuthorityKind,
@@ -175,12 +179,15 @@ fn dead_node_replaces_the_gone_node_loops(
         && authority == dead_node::AuthorityKind::Ec2
 }
 
-/// Whether the drain's v2 runs: `SPACE_DRAIN_V2_ENABLED`, refused unless
-/// the dead-node verb replaces the gone-node loops, which is what deletes a
-/// node a v2 drain terminated.
+/// Whether new v2 drains are admitted: `SPACE_DRAIN_V2_ENABLED`, refused
+/// unless the node drain runs (its v2 loop drives them) and the dead-node
+/// verb replaces the gone-node loops (it deletes a node a v2 drain
+/// terminated). The loop itself runs wherever the node drain does, flag or
+/// not, so a v2 drain already persisted still has an owner.
 fn drain_v2_enabled(
     env: &dyn pplx_space_common_core::env::Environment,
     dead_node_live: bool,
+    node_drain_enabled: bool,
 ) -> Result<bool, ReconcilerRuntimeError> {
     let enabled = pplx_space_common_core::env::env_flag(
         env.var(pplx_space_api::routes::admin::nodes::DRAIN_V2_ENABLED_ENV)
@@ -188,10 +195,17 @@ fn drain_v2_enabled(
             .as_deref(),
         false,
     );
-    if enabled && !dead_node_live {
+    if enabled && !(dead_node_live && node_drain_enabled) {
         return Err(ReconcilerRuntimeError::DrainV2NeedsDeadNodeLive);
     }
     Ok(enabled)
+}
+
+/// Whether the v2 loop terminates a node `:terminate` moved to
+/// `terminating`: only through EC2, and only where the dead-node verb then
+/// deletes the node's row. Elsewhere it refuses, and the node waits.
+fn v2_terminates(kind: TerminatorKind, dead_node_live: bool) -> bool {
+    kind == TerminatorKind::Aws && dead_node_live
 }
 
 #[derive(Clone)]
@@ -499,6 +513,7 @@ pub async fn run_reconcilers(
             let drain_v2_enabled = drain_v2_enabled(
                 &pplx_space_common_core::env::ProcessEnvironment,
                 dead_node_live,
+                node_drain::ReconcilerConfig::from_env().enabled,
             )?;
             pplx_space_api::drain_restore_operations::set_drain_v2_enabled(drain_v2_enabled);
             let warm_pool_token = shutdown_token.child_token();
@@ -750,28 +765,40 @@ pub async fn run_reconcilers(
                     node_drain_config.replace_stopped_evacuations,
                 );
                 let v2_tick = node_drain_config.tick;
+                // The v2 drain's loop, beside v1's: it acts only on the rows
+                // `:drain {engine: v2}` marked, which v1's writers skip. It
+                // runs whether or not new v2 drains are admitted, so a
+                // persisted one is still drained or cancelled; it terminates
+                // a node only where the row then has an owner
+                // ([`v2_terminates`]).
+                let spawn_v2 = |handles: &mut Vec<_>, terminator: node_drain::v2::V2Terminator| {
+                    handles.push(tokio::spawn(node_drain::v2::run(
+                        node_drain::SubstrateSink::v2(pool.clone(), kube.clone()),
+                        terminator,
+                        v2_tick,
+                        shutdown_token.child_token(),
+                    )));
+                };
                 match kind {
                     TerminatorKind::Aws => {
                         let aws_config =
                             aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
                         let autoscaling_client =
                             pplx_space_aws_client::autoscaling::Client::from_config(&aws_config);
-                        // The v2 drain's loop, beside v1's, where it is on
-                        // (which the check above confines to this terminator):
-                        // it acts only on the rows `:drain {engine: v2}`
-                        // marked, which v1's writers skip.
-                        if drain_v2_enabled {
-                            handles.push(tokio::spawn(node_drain::v2::run(
-                                node_drain::SubstrateSink::v2(pool.clone(), kube.clone()),
-                                node_drain::Ec2InstanceTerminator::new(
-                                    pool.clone(),
-                                    kube.k8s.client.clone(),
-                                    autoscaling_client.clone(),
-                                ),
-                                v2_tick,
-                                shutdown_token.child_token(),
-                            )));
-                        }
+                        spawn_v2(
+                            &mut handles,
+                            if v2_terminates(kind, dead_node_live) {
+                                node_drain::v2::V2Terminator::Ec2(
+                                    node_drain::Ec2InstanceTerminator::new(
+                                        pool.clone(),
+                                        kube.k8s.client.clone(),
+                                        autoscaling_client.clone(),
+                                    ),
+                                )
+                            } else {
+                                node_drain::v2::V2Terminator::Refuse
+                            },
+                        );
                         let terminator = node_drain::Ec2InstanceTerminator::new(
                             pool.clone(),
                             kube.k8s.client.clone(),
@@ -800,6 +827,7 @@ pub async fn run_reconcilers(
                         )));
                     }
                     TerminatorKind::KubeDelete => {
+                        spawn_v2(&mut handles, node_drain::v2::V2Terminator::Refuse);
                         let terminator = node_drain::KubeNodeDeleteTerminator::new(
                             pool.clone(),
                             kube.k8s.client.clone(),
@@ -813,6 +841,7 @@ pub async fn run_reconcilers(
                         )));
                     }
                     TerminatorKind::Noop => {
+                        spawn_v2(&mut handles, node_drain::v2::V2Terminator::Refuse);
                         let terminator = node_drain::NoopInstanceTerminator::new();
                         handles.push(tokio::spawn(node_drain::run(
                             node_drain_config,
@@ -865,18 +894,25 @@ pub async fn run_reconcilers(
             // startup or surface confusing errors in environments that
             // don't intend to use this path.
             let orphaned_nodes_config = orphaned_nodes::ReconcilerConfig::from_env();
-            if orphaned_nodes_config.enabled && dead_node_live {
-                tracing::info!(
-                    variable = dead_node::MODE_ENV,
-                    "orphaned-nodes reconciler is enabled but the dead-node verb runs live \
-                     and deletes dead nodes' rows; not starting it"
-                );
-            } else if orphaned_nodes_config.enabled {
+            if orphaned_nodes_config.enabled {
+                if dead_node_live {
+                    tracing::info!(
+                        variable = dead_node::MODE_ENV,
+                        "the dead-node verb runs live and deletes the rows of dead nodes it \
+                         has an instance for; the orphaned-nodes reconciler keeps only nodes \
+                         with no recorded instance"
+                    );
+                }
                 let aws_config =
                     aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
                 let ec2_client = pplx_space_aws_client::ec2::Client::from_config(&aws_config);
                 let lookup = orphaned_nodes::Ec2InstanceLookup::new(Arc::new(ec2_client));
                 let sink = orphaned_nodes::NodeDbStore::new(pool.clone());
+                let sink = if dead_node_live {
+                    sink.only_unrecorded_instance()
+                } else {
+                    sink
+                };
                 handles.push(tokio::spawn(orphaned_nodes::run(
                     orphaned_nodes_config,
                     sink,
@@ -896,18 +932,25 @@ pub async fn run_reconcilers(
             // Kubernetes with no live EC2 instance). Opt-in; the AWS SDK is
             // only initialized when it's enabled, like `orphaned_nodes`.
             let lost_started_config = lost_started_sandboxes::ReconcilerConfig::from_env();
-            if lost_started_config.enabled && dead_node_live {
-                tracing::info!(
-                    variable = dead_node::MODE_ENV,
-                    "lost_started_sandboxes is enabled but the dead-node verb runs live \
-                     and writes off dead machines' rows; not starting it"
-                );
-            } else if lost_started_config.enabled {
+            if lost_started_config.enabled {
+                if dead_node_live {
+                    tracing::info!(
+                        variable = dead_node::MODE_ENV,
+                        "the dead-node verb runs live and writes off the rows of dead nodes it \
+                         has an instance for; lost_started_sandboxes keeps only rows of nodes \
+                         with no recorded instance"
+                    );
+                }
                 let aws_config =
                     aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
                 let ec2_client = pplx_space_aws_client::ec2::Client::from_config(&aws_config);
                 let lookup = orphaned_nodes::Ec2InstanceLookup::new(Arc::new(ec2_client));
                 let sink = lost_started_sandboxes::LostStartedDbStore::new(pool.clone());
+                let sink = if dead_node_live {
+                    sink.only_unrecorded_instance()
+                } else {
+                    sink
+                };
                 let presence = reconcile_queue_gc::SubstrateKubeNodePresence::new(kube.clone());
                 handles.push(tokio::spawn(lost_started_sandboxes::run(
                     lost_started_config,
