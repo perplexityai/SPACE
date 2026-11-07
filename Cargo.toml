@@ -120,7 +120,7 @@ members = [
     "crates/l10_foundation/common/jobs",
     "crates/l10_foundation/common/lru/reaper",
     "crates/l10_foundation/common/proto/build",
-    "crates/l10_foundation/common/work/coalescer",
+    "crates/l10_foundation/work/coalescer",
     "crates/l40_api/rpc/auth",
     "crates/l40_api/grpc/server",
     "crates/l40_api/local/health",
@@ -380,7 +380,7 @@ pplx-space-common-io = { path = "crates/l10_foundation/common/io" }
 pplx-space-common-jobs = { path = "crates/l10_foundation/common/jobs" }
 pplx-space-common-lru-reaper = { path = "crates/l10_foundation/common/lru/reaper" }
 pplx-space-common-proto-build = { path = "crates/l10_foundation/common/proto/build" }
-pplx-space-common-work-coalescer = { path = "crates/l10_foundation/common/work/coalescer" }
+pplx-space-work-coalescer = { path = "crates/l10_foundation/work/coalescer" }
 pplx-space-content-digest = { path = "crates/l10_foundation/content/digest" }
 pplx-space-cpu-arch = { path = "crates/l10_foundation/cpu/arch" }
 pplx-space-data-plane-server = { path = "crates/l40_api/data/plane/server" }

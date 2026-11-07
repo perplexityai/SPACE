@@ -4883,7 +4883,6 @@ dependencies = [
  "pplx-space-cluster-trigger-queue",
  "pplx-space-common-core",
  "pplx-space-common-grpc",
- "pplx-space-common-work-coalescer",
  "pplx-space-credential-injection-core",
  "pplx-space-credential-injection-store",
  "pplx-space-credmgr-client",
@@ -4929,6 +4928,7 @@ dependencies = [
  "pplx-space-state-reconciliation",
  "pplx-space-template-mgr-client",
  "pplx-space-test-env",
+ "pplx-space-work-coalescer",
  "prost",
  "prost-types",
  "rand 0.10.2",
@@ -5505,18 +5505,6 @@ dependencies = [
  "prost-types",
  "thiserror 2.0.20",
  "tonic-prost-build",
-]
-
-[[package]]
-name = "pplx-space-common-work-coalescer"
-version = "0.8.2"
-dependencies = [
- "dashmap",
- "thiserror 2.0.20",
- "tokio",
- "tokio-util",
- "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
@@ -8353,6 +8341,18 @@ dependencies = [
  "tonic",
  "tower",
  "uuid",
+]
+
+[[package]]
+name = "pplx-space-work-coalescer"
+version = "0.8.2"
+dependencies = [
+ "dashmap",
+ "thiserror 2.0.20",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

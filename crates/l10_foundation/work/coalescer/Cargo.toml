@@ -1,5 +1,5 @@
 [package]
-name = "pplx-space-common-work-coalescer"
+name = "pplx-space-work-coalescer"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
