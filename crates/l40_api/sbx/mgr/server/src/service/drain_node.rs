@@ -37,11 +37,11 @@ use crate::proto::{
 };
 use pplx_space_events::SandboxEventTrigger;
 
-/// How long one page of node-manager's orphan inventory may take.
-const ORPHAN_PAGE_TIMEOUT: Duration = Duration::from_secs(10);
-/// The most inventory pages one call reads before it reports the scan as
-/// incomplete.
-const MAX_ORPHAN_PAGES: usize = 64;
+/// How long one call may spend reading node-manager's whole orphan
+/// inventory: well under the control plane's own timeout for the call, so
+/// a slow node-manager answers `blocked` rather than an error. The drain's
+/// work goes on between calls.
+pub(super) const ORPHAN_INVENTORY_DEADLINE: Duration = Duration::from_secs(20);
 
 /// What the drain is doing for a sandbox.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
@@ -533,54 +533,43 @@ impl SandboxManagerService {
         report(first, plan, done)
     }
 
-    /// Read node-manager's whole orphan inventory, one page at a time.
+    /// Read node-manager's whole orphan inventory, one page at a time,
+    /// within [`ORPHAN_INVENTORY_DEADLINE`].
     async fn read_orphan_inventory(&self) -> OrphanFindings {
         let mut findings = OrphanFindings::default();
         let gateway_run_root = pplx_space_common_core::host::linux::paths::NET_GATEWAY_RUN_DIR;
-        let mut client = match self.node_manager.connect().await {
-            Ok(client) => client,
-            Err(error) => {
-                findings.blocked.push(format!(
-                    "can't reach node-manager's orphan inventory: {error}"
-                ));
-                return findings;
+        let read = async {
+            let mut client =
+                self.node_manager.connect().await.map_err(|error| {
+                    format!("can't reach node-manager's orphan inventory: {error}")
+                })?;
+            let mut page_token = String::new();
+            loop {
+                let page = client
+                    .list_orphan_candidates(
+                        pplx_space_node_mgr_client::proto::ListOrphanCandidatesRequest {
+                            page_token: page_token.clone(),
+                        },
+                    )
+                    .await
+                    .map_err(|status| format!("orphan inventory failed: {status}"))?
+                    .into_inner();
+                classify_orphan_page(&page, gateway_run_root, &mut findings);
+                if page.next_page_token.is_empty() {
+                    return Ok(());
+                }
+                page_token = page.next_page_token;
             }
         };
-        let mut page_token = String::new();
-        for _ in 0..MAX_ORPHAN_PAGES {
-            let page = tokio::time::timeout(
-                ORPHAN_PAGE_TIMEOUT,
-                client.list_orphan_candidates(
-                    pplx_space_node_mgr_client::proto::ListOrphanCandidatesRequest {
-                        page_token: page_token.clone(),
-                    },
-                ),
-            )
-            .await;
-            let page = match page {
-                Ok(Ok(page)) => page.into_inner(),
-                Ok(Err(status)) => {
-                    findings
-                        .blocked
-                        .push(format!("orphan inventory failed: {status}"));
-                    return findings;
-                }
-                Err(_) => {
-                    findings
-                        .blocked
-                        .push("orphan inventory timed out".to_owned());
-                    return findings;
-                }
-            };
-            classify_orphan_page(&page, gateway_run_root, &mut findings);
-            if page.next_page_token.is_empty() {
-                return findings;
-            }
-            page_token = page.next_page_token;
-        }
-        findings.blocked.push(format!(
-            "orphan inventory ran past {MAX_ORPHAN_PAGES} pages"
-        ));
+        let failure = match tokio::time::timeout(ORPHAN_INVENTORY_DEADLINE, read).await {
+            Ok(Ok(())) => None,
+            Ok(Err(failure)) => Some(failure),
+            Err(_) => Some(format!(
+                "orphan inventory didn't finish within {}s",
+                ORPHAN_INVENTORY_DEADLINE.as_secs()
+            )),
+        };
+        findings.blocked.extend(failure);
         findings
     }
 
