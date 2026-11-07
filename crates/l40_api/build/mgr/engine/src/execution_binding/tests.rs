@@ -1,5 +1,8 @@
 use super::*;
 use pplx_space_common_core::types::*;
+use pplx_space_template_manifest::{
+    BOUND_TEMPLATE_METADATA_SCHEMA_VERSION, TEMPLATE_METADATA_SCHEMA_VERSION,
+};
 
 fn fixture() -> ResolveExecutionEnvironmentResponse {
     let definition = EnvironmentDefinition::from_document(include_str!(concat!(

@@ -5089,6 +5089,7 @@ dependencies = [
  "pplx-space-rpc-auth",
  "pplx-space-sbx-mgr-client",
  "pplx-space-spaced-common",
+ "pplx-space-template-manifest",
  "pplx-space-template-mgr-client",
  "pplx-space-template-runtime",
  "pplx-space-test-env",
@@ -7389,6 +7390,7 @@ dependencies = [
  "pplx-space-spaced-host-client",
  "pplx-space-spaced-update",
  "pplx-space-state-reconciliation",
+ "pplx-space-template-manifest",
  "pplx-space-template-mgr-client",
  "pplx-space-template-runtime",
  "pplx-space-test-env",
@@ -8025,6 +8027,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "pplx-space-template-manifest"
+version = "0.8.2"
+dependencies = [
+ "pplx-space-content-digest",
+ "pplx-space-cpu-arch",
+ "pplx-space-execution-spec",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "pplx-space-template-mgr"
 version = "0.8.2"
 dependencies = [
@@ -8063,6 +8077,7 @@ dependencies = [
  "pplx-space-sqlite",
  "pplx-space-state-reconciliation",
  "pplx-space-stopwatch",
+ "pplx-space-template-manifest",
  "pplx-space-template-mgr-client",
  "pplx-space-test-env",
  "pplx-space-uds-peer-auth",
@@ -8163,6 +8178,7 @@ dependencies = [
  "pplx-space-execution-common",
  "pplx-space-node-api-client",
  "pplx-space-object-store",
+ "pplx-space-template-manifest",
  "serde_json",
  "thiserror 2.0.20",
  "tokio",

@@ -121,7 +121,7 @@ pub enum PublishError {
     ManifestExecutionMetadata {
         path: PathBuf,
         #[source]
-        source: pplx_space_common_core::types::TemplateManifestSchemaError,
+        source: pplx_space_template_manifest::TemplateManifestSchemaError,
     },
     #[error(
         "manifest {path} carries no execution metadata; registering would create a \
@@ -726,13 +726,11 @@ async fn load_build_execution_metadata(
                 path: manifest_path.clone(),
                 source,
             })?;
-    let manifest = serde_json::from_slice::<pplx_space_common_core::types::TemplateManifest>(
-        &bytes,
-    )
-    .map_err(|source| PublishError::InvalidArtifact {
-        path: manifest_path.clone(),
-        source,
-    })?;
+    let manifest = serde_json::from_slice::<pplx_space_template_manifest::TemplateManifest>(&bytes)
+        .map_err(|source| PublishError::InvalidArtifact {
+            path: manifest_path.clone(),
+            source,
+        })?;
     let execution = manifest.execution_metadata().map_err(|source| {
         PublishError::ManifestExecutionMetadata {
             path: manifest_path.clone(),

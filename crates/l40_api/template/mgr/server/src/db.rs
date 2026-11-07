@@ -292,7 +292,7 @@ fn invalid_build_upsert(message: &'static str) -> rusqlite::Error {
 }
 
 pub fn upsert_build(conn: &Connection, b: &BuildUpsert<'_>) -> Result<()> {
-    let manifest: pplx_space_common_core::types::TemplateManifest =
+    let manifest: pplx_space_template_manifest::TemplateManifest =
         serde_json::from_str(b.manifest_json)
             .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
     let execution = manifest

@@ -3,9 +3,10 @@ use super::{
     GuestRuntimeMetadata, build_vm_create_request, build_vm_rootfs_size_mb, build_vm_start_request,
     oci_source_message, template_guest_runtime_metadata,
 };
-use pplx_space_common_core::types::{ContentHash, TemplateBuildId, TemplateMetadata, TemplateName};
+use pplx_space_common_core::types::{ContentHash, TemplateBuildId, TemplateName};
 use pplx_space_net_common::proto::NetworkPolicyV1 as NetworkPolicyV1Proto;
 use pplx_space_net_common::{EgressDestinationV1, NetworkPolicyV1};
+use pplx_space_template_manifest::TemplateMetadata;
 use rstest::{fixture, rstest};
 
 const HASH: &str = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";

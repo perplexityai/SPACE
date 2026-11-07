@@ -100,6 +100,7 @@ pplx-space-spaced-host-client = { workspace = true }
 pplx-space-observability = { workspace = true, default-features = false }
 pplx-space-sbx-mgr-client = { workspace = true }
 pplx-space-sbx-mgr-store = { workspace = true }
+pplx-space-template-manifest = { workspace = true }
 pplx-space-template-mgr-client = { workspace = true }
 
 [dev-dependencies]

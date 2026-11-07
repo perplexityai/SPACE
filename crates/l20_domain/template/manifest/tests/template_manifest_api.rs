@@ -1,5 +1,5 @@
 //! Integration tests for the public API surface of
-//! [`pplx_space_common_core::types::TemplateManifest`] — the typed
+//! [`pplx_space_template_manifest::TemplateManifest`] — the typed
 //! accessors and the filesystem-safety validator that template-manager
 //! depends on at the manifest parse boundary.
 //!
@@ -8,9 +8,7 @@
 //! the test file itself acts as a guard against accidentally relying
 //! on a private helper.
 
-#![cfg(feature = "serde")]
-
-use pplx_space_common_core::types::{
+use pplx_space_template_manifest::{
     TemplateManifest, TemplateManifestCompression, TemplateManifestFile, ZSTD_CODEC,
 };
 

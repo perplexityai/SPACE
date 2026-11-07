@@ -84,7 +84,7 @@ const BUNDLED_BUILD_SEED_SCRIPT: &str = include_str!("../scripts/build-seed.sh")
 const BUNDLED_ROOTFS_BUILDER_SCRIPT: &str =
     include_str!("../../../../../../templates/firecracker/seed/rootfs-builder.sh");
 
-use pplx_space_common_core::types::TemplateMetadata;
+use pplx_space_template_manifest::TemplateMetadata;
 
 pub struct TemplateBuilder {
     caller_org: Option<OrgId>,

@@ -761,7 +761,7 @@ pub(super) async fn resolve_template_paths(
     let guest_image = if inner.manifest_json.is_empty() {
         Default::default()
     } else {
-        let manifest: pplx_space_common_core::types::TemplateManifest =
+        let manifest: pplx_space_template_manifest::TemplateManifest =
             serde_json::from_str(&inner.manifest_json).map_err(|error| {
                 Status::failed_precondition(format!("invalid template manifest: {error}"))
             })?;
