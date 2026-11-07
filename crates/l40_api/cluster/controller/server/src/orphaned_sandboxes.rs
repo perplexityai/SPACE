@@ -205,7 +205,7 @@ pub struct ReconcilerConfig {
     pub max_quarantine_percentage: u32,
     pub dry_run: bool,
     /// The dead-node verb runs live, so rows on a node whose heartbeat is
-    /// stale or which the verb judged lost are its to reconcile, and this
+    /// stale and which records an instance are its to reconcile, and this
     /// loop leaves them alone. Set by the reconciler set, not the
     /// environment.
     pub leave_dead_node_rows: bool,
@@ -1751,11 +1751,14 @@ static LIST_CANDIDATES_AFTER: std::sync::LazyLock<String> = std::sync::LazyLock:
                     )
               )
               -- Where the dead-node verb runs live ($10), a row on a node
-              -- whose heartbeat is stale is the verb's to reconcile.
+              -- whose heartbeat is stale is the verb's to reconcile, if the
+              -- node has a recorded instance the verb can judge it by.
               AND NOT ($10 AND EXISTS (
                   SELECT 1
                   FROM nodes dn
+                  JOIN node_k8s dk ON dk.node_id = dn.id
                   WHERE (dn.id = s.active_node_id OR dn.id = s.target_node_id)
+                    AND dk.instance_id IS NOT NULL
                     AND NOT {fresh}
               ))
               AND ($2::uuid IS NULL OR s.id > $2)

@@ -1121,4 +1121,48 @@ mod postgres_backed {
         assert_eq!(listed(&store).await?.len(), 1);
         Ok(())
     }
+
+    /// Scoped to nodes with no recorded instance, as it runs beside the live
+    /// dead-node verb, the store lists a row whose node records none, or
+    /// whose node row is gone, and leaves one whose node the verb can judge.
+    #[tokio::test(flavor = "current_thread")]
+    async fn scoped_to_unrecorded_instances_it_leaves_the_verbs_rows() -> TestResult {
+        let Some(db) = try_pg_test_db().await? else {
+            return Ok(());
+        };
+        let judged = seed_stuck(&db.pool, true).await?;
+        sqlx::query(sql!(
+            "UPDATE node_k8s SET instance_id = 'i-0a1b2c3d' WHERE node_id = $1"
+        ))
+        .bind(judged.node_id)
+        .execute(&db.pool)
+        .await?;
+        let unrecorded = seed_stuck(&db.pool, true).await?;
+        let node_gone = seed_stuck(&db.pool, false).await?;
+        let ids = |candidates: Vec<LostCandidate>| {
+            let mut ids: Vec<SandboxId> = candidates.iter().map(|c| c.sandbox_id).collect();
+            ids.sort();
+            ids
+        };
+        let mut all = vec![
+            judged.sandbox_id,
+            unrecorded.sandbox_id,
+            node_gone.sandbox_id,
+        ];
+        all.sort();
+        assert_eq!(
+            ids(listed(&LostStartedDbStore::new(db.pool.clone())).await?),
+            all
+        );
+        let mut scoped = vec![unrecorded.sandbox_id, node_gone.sandbox_id];
+        scoped.sort();
+        assert_eq!(
+            ids(
+                listed(&LostStartedDbStore::new(db.pool.clone()).only_unrecorded_instance())
+                    .await?
+            ),
+            scoped
+        );
+        Ok(())
+    }
 }

@@ -634,10 +634,12 @@ async fn candidate_scan_lists_missing_pod_without_node_observation() -> TestResu
 }
 
 /// Where the dead-node verb runs live, a row on a node with a stale heartbeat
-/// is left to it; a row on a fresh node is still listed, whatever verdict a
-/// node with that id once had: a `lost` status left from before a same-IP
-/// replacement registered doesn't hide the replacement's rows. Without the
-/// verb live every row is listed.
+/// and a recorded instance is left to it; a row on a stale node with no
+/// recorded instance, which the verb can only judge unknown, is still
+/// listed, as is a row on a fresh node, whatever verdict a node with that id
+/// once had: a `lost` status left from before a same-IP replacement
+/// registered doesn't hide the replacement's rows. Without the verb live
+/// every row is listed.
 #[tokio::test(flavor = "current_thread")]
 async fn candidate_scan_leaves_dead_node_rows_to_the_live_verb() -> TestResult {
     let Some(db) = try_pg_test_db().await? else {
@@ -646,15 +648,24 @@ async fn candidate_scan_leaves_dead_node_rows_to_the_live_verb() -> TestResult {
     let pool = &db.pool;
     let mut expected_left_out = Vec::new();
     let mut expected_listed = Vec::new();
-    for (heartbeat_fresh, verdict, left_out) in [
-        (false, None, true),
-        (true, Some("lost"), false),
-        (true, None, false),
-        (true, Some("unknown"), false),
+    for (heartbeat_fresh, instance, verdict, left_out) in [
+        (false, Some("i-0a1b2c3d"), None, true),
+        (false, None, None, false),
+        (true, Some("i-0a1b2c3d"), Some("lost"), false),
+        (true, None, None, false),
+        (true, None, Some("unknown"), false),
     ] {
         let node_id = NodeId::new();
         let sandbox_id = SandboxId::new();
         insert_node(pool, node_id).await?;
+        sqlx::query(sql!(
+            "INSERT INTO node_k8s (node_id, k8s_node_name, instance_id) VALUES ($1, $2, $3)"
+        ))
+        .bind(node_id)
+        .bind(format!("worker-{node_id}"))
+        .bind(instance)
+        .execute(pool)
+        .await?;
         insert_started_sandbox_with_active_execution(pool, sandbox_id, node_id).await?;
         if heartbeat_fresh {
             sqlx::query(sql!(

@@ -55,6 +55,7 @@ static LIST_CANDIDATES: LazyLock<String> = LazyLock::new(|| {
                 AND s.lifecycle = 'started'
                 AND s.active_node_id IS NOT NULL
                 AND (n.id IS NULL OR (n.managed_by = $1 AND n.drain_phase IS NULL))
+                AND (NOT $5 OR n.id IS NULL OR nk.instance_id IS NULL)
                 AND ($2::UUID IS NULL OR s.id > $2)
                 AND {no_restore_source}
               ORDER BY s.id
@@ -66,11 +67,23 @@ static LIST_CANDIDATES: LazyLock<String> = LazyLock::new(|| {
 
 pub struct LostStartedDbStore {
     pool: PgPool,
+    only_unrecorded_instance: bool,
 }
 
 impl LostStartedDbStore {
     pub fn new(pool: PgPool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            only_unrecorded_instance: false,
+        }
+    }
+
+    /// Scope the store to rows whose source node has no recorded instance,
+    /// or no row at all: where the dead-node verb runs live, it owns the
+    /// rows of every node it has EC2 evidence for.
+    pub fn only_unrecorded_instance(mut self) -> Self {
+        self.only_unrecorded_instance = true;
+        self
     }
 }
 
@@ -85,6 +98,7 @@ impl LostStartedSink for LostStartedDbStore {
             .bind(after)
             .bind(i64::from(limit))
             .bind(DEAD_UPLOAD_SETTLE.as_secs().cast_signed())
+            .bind(self.only_unrecorded_instance)
             .fetch_all(&self.pool)
             .await?;
         Ok(rows

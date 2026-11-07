@@ -39,11 +39,25 @@ const TERMINAL_PLACEMENT_LIFECYCLES: &str = "('failed', 'deleted')";
 
 pub struct NodeDbStore {
     pool: PgPool,
+    only_unrecorded_instance: bool,
 }
 
 impl NodeDbStore {
     pub fn new(pool: PgPool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            only_unrecorded_instance: false,
+        }
+    }
+
+    /// Scope the store to nodes with no recorded instance
+    /// (`node_k8s.instance_id` NULL): where the dead-node verb runs live, it
+    /// owns every node it has EC2 evidence for, and these are the ones it
+    /// can only judge unknown, such as nodes that died before instances were
+    /// recorded.
+    pub fn only_unrecorded_instance(mut self) -> Self {
+        self.only_unrecorded_instance = true;
+        self
     }
 }
 
@@ -83,6 +97,7 @@ impl OrphanedNodesSink for NodeDbStore {
                AND n.drain_phase IS NULL
                AND k.k8s_node_name IS NOT NULL
                AND ($1::UUID IS NULL OR n.id > $1)
+               AND (NOT $4 OR k.instance_id IS NULL)
                AND NOT EXISTS (
                    SELECT 1 FROM sandboxes
                     WHERE active_node_id = n.id
@@ -99,6 +114,7 @@ impl OrphanedNodesSink for NodeDbStore {
             .bind(after)
             .bind(limit)
             .bind(SubstrateKind::Kubernetes)
+            .bind(self.only_unrecorded_instance)
             .fetch_all(&self.pool)
             .await?;
         Ok(rows
@@ -130,6 +146,7 @@ impl OrphanedNodesSink for NodeDbStore {
                    (SELECT k8s_node_uid FROM node_k8s WHERE node_id = $1),
                    ''
                ) = COALESCE($2, '')
+               AND (NOT $4 OR (SELECT instance_id FROM node_k8s WHERE node_id = $1) IS NULL)
                AND NOT EXISTS (
                    SELECT 1 FROM sandboxes
                     WHERE active_node_id = $1
@@ -144,6 +161,7 @@ impl OrphanedNodesSink for NodeDbStore {
         .bind(node_id)
         .bind(expected_uid)
         .bind(SubstrateKind::Kubernetes)
+        .bind(self.only_unrecorded_instance)
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected() > 0)

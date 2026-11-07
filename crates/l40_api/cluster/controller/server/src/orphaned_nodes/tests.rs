@@ -598,3 +598,50 @@ async fn direct_nodes_are_neither_candidates_nor_deleted() -> TestResult {
     assert!(store.delete_node_if_orphan(k8s_node, None).await?);
     Ok(())
 }
+
+/// Scoped to nodes with no recorded instance, as it runs beside the live
+/// dead-node verb, the store lists and deletes only those: a node with a
+/// recorded instance is the verb's. Unscoped, it takes both.
+#[tokio::test(flavor = "current_thread")]
+async fn scoped_to_unrecorded_instances_it_leaves_the_verbs_nodes() -> TestResult {
+    let Some(db) = pplx_space_db_test_fixtures::try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let recorded = NodeId::new();
+    let unrecorded = NodeId::new();
+    for (node_id, instance) in [(recorded, Some("i-0a1b2c3d")), (unrecorded, None)] {
+        sqlx::query(sql!(
+            "INSERT INTO nodes (id, address, role, managed_by)
+             VALUES ($1, '10.0.0.1'::INET, 'worker', 'k8s')"
+        ))
+        .bind(node_id)
+        .execute(&db.pool)
+        .await?;
+        sqlx::query(sql!(
+            "INSERT INTO node_k8s (node_id, k8s_node_name, instance_id) VALUES ($1, $2, $3)"
+        ))
+        .bind(node_id)
+        .bind(format!("orphan-{node_id}"))
+        .bind(instance)
+        .execute(&db.pool)
+        .await?;
+    }
+    let ids = |candidates: Vec<OrphanCandidate>| {
+        let mut ids: Vec<NodeId> = candidates.iter().map(|c| c.node_id).collect();
+        ids.sort();
+        ids
+    };
+    let mut both = vec![recorded, unrecorded];
+    both.sort();
+    assert_eq!(
+        ids(NodeDbStore::new(db.pool.clone())
+            .list_candidates(100, None)
+            .await?),
+        both
+    );
+    let scoped = NodeDbStore::new(db.pool.clone()).only_unrecorded_instance();
+    assert_eq!(ids(scoped.list_candidates(100, None).await?), [unrecorded]);
+    assert!(!scoped.delete_node_if_orphan(recorded, None).await?);
+    assert!(scoped.delete_node_if_orphan(unrecorded, None).await?);
+    Ok(())
+}
