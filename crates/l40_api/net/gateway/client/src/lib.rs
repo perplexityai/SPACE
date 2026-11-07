@@ -1,4 +1,5 @@
-pub use pplx_space_net_common::{orig_dst, proxy::*};
+pub use pplx_space_net_common::proxy::*;
+pub use pplx_space_transparent_proxy_socket as orig_dst;
 
 pub use pplx_space_net_gateway_protocol::proto;
 

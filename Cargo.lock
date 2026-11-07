@@ -6268,16 +6268,12 @@ dependencies = [
  "anyhow",
  "hex",
  "http 1.5.0",
- "libc",
- "nix 0.31.3",
  "pplx-space-common-proto-build",
  "prost",
  "serde",
  "serde_json",
  "sha2 0.11.0",
- "socket2",
  "thiserror 2.0.20",
- "tokio",
  "tonic-prost-build",
  "uuid",
 ]
@@ -6384,6 +6380,7 @@ dependencies = [
  "pplx-space-net-common",
  "pplx-space-net-gateway-protocol",
  "pplx-space-test-env",
+ "pplx-space-transparent-proxy-socket",
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
@@ -6814,8 +6811,8 @@ dependencies = [
  "pplx-space-execution-catalog",
  "pplx-space-execution-common",
  "pplx-space-metrics-emit",
- "pplx-space-net-common",
  "pplx-space-test-env",
+ "pplx-space-transparent-proxy-socket",
  "pplx-space-uds-peer-auth",
  "prost",
  "rustix",
@@ -7451,7 +7448,6 @@ dependencies = [
  "pplx-space-metrics-emit",
  "pplx-space-net-common",
  "pplx-space-node-mgr-protocol",
- "pplx-space-node-runtime-core",
  "pplx-space-observability",
  "pplx-space-sbx-mgr-migrations",
  "pplx-space-sbx-mgr-protocol",
@@ -7699,7 +7695,6 @@ dependencies = [
  "prost",
  "prost-types",
  "semver",
- "tokio",
  "tonic",
  "tonic-prost",
  "tonic-prost-build",
@@ -8115,6 +8110,16 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "pplx-space-transparent-proxy-socket"
+version = "0.8.1"
+dependencies = [
+ "libc",
+ "nix 0.31.3",
+ "socket2",
+ "tokio",
 ]
 
 [[package]]

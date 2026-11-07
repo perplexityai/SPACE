@@ -8,22 +8,47 @@ struct Environments {
     target_reference: EnvironmentReference,
 }
 
+/// Two Firecracker bindings shaped like a catalog upgrade edge: the target
+/// has a newer runtime, state format and kernel, and its own environment
+/// reference, which is what bind_runtime_upgrade_consumer checks against the
+/// upgrade's target.
 fn environments() -> Environments {
-    let compiled = pplx_space_node_runtime_core::catalog::CompiledEnvironment::for_architecture(
-        pplx_space_common_core::types::Arch::X86_64,
-    )
-    .unwrap();
-    let source = compiled[0].definition().execution_requirements().unwrap();
-    let target_definition = compiled
-        .iter()
-        .map(|environment| environment.definition())
-        .find(|definition| definition.reference() != compiled[0].definition().reference())
-        .unwrap();
-    let target = target_definition.execution_requirements().unwrap();
-    assert_eq!(target.environment(), Some(target_definition.reference()));
+    use pplx_space_common_core::types::{
+        Arch, ArtifactComponentKind, ArtifactComponentMetadata, ArtifactFormat, ArtifactVersion,
+        GuestOperatingSystem, GuestPlatform, RuntimeIdentity, RuntimeKind, StateFormatIdentity,
+    };
+    let bound = |hex: &str, runtime: &str, state_format: &str, kernel: &str, kernel_hex: &str| {
+        let reference: EnvironmentReference = format!("sha256:{}", hex.repeat(64)).parse().unwrap();
+        let execution = ExecutionMetadata::new(
+            RuntimeIdentity {
+                kind: RuntimeKind::Firecracker,
+                version: runtime.parse().unwrap(),
+            },
+            GuestPlatform {
+                os: GuestOperatingSystem::Linux,
+                architecture: Arch::X86_64,
+            },
+            Some(StateFormatIdentity {
+                format: "firecracker-snapshot".parse().unwrap(),
+                version: state_format.parse().unwrap(),
+            }),
+            vec![ArtifactComponentMetadata {
+                kind: ArtifactComponentKind::Kernel,
+                role: Some("boot".parse().unwrap()),
+                version: Some(ArtifactVersion::parse(kernel).unwrap()),
+                digest: Some(format!("sha256:{}", kernel_hex.repeat(64)).parse().unwrap()),
+                format: Some(ArtifactFormat::parse("vmlinux").unwrap()),
+            }],
+        )
+        .unwrap()
+        .with_environment(reference);
+        (execution, reference)
+    };
+    let (source, _) = bound("a", "1.15.1", "9.0.0", "6.1.155", "c");
+    let (target, target_reference) = bound("b", "1.17.0", "12.0.0", "6.18.44", "d");
     Environments {
         source,
-        target_reference: target_definition.reference(),
+        target_reference,
         target,
     }
 }
