@@ -1659,13 +1659,10 @@ impl SandboxManagerService {
                 crate::transfer_directory::prepare(&artifact_dir).map_err(|error| {
                     Status::internal(format!("prepare encrypted disk artifact: {error}"))
                 })?;
-                pplx_space_common_io::reflink::reflink_file(
-                    &capture,
-                    &artifact_dir.join("cow.luks"),
-                )
-                .map_err(|error| {
-                    Status::internal(format!("copy encrypted disk artifact: {error}"))
-                })?;
+                pplx_space_file_io::reflink::reflink_file(&capture, &artifact_dir.join("cow.luks"))
+                    .map_err(|error| {
+                        Status::internal(format!("copy encrypted disk artifact: {error}"))
+                    })?;
                 let cow = artifact_dir.join("cow.luks");
                 std::fs::set_permissions(&cow, std::fs::Permissions::from_mode(0o660))
                     .map_err(|error| Status::internal(error.to_string()))?;

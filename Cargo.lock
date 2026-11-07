@@ -5443,22 +5443,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "pplx-space-common-io"
-version = "0.8.2"
-dependencies = [
- "aead-stream",
- "aes-gcm",
- "libc",
- "pplx-space-stopwatch",
- "rand 0.10.2",
- "rustix",
- "tempfile",
- "thiserror 2.0.20",
- "tracing",
- "zstd",
-]
-
-[[package]]
 name = "pplx-space-common-jobs"
 version = "0.8.2"
 dependencies = [
@@ -5951,6 +5935,22 @@ dependencies = [
  "pplx-space-common-core",
  "serde_json",
  "thiserror 2.0.20",
+]
+
+[[package]]
+name = "pplx-space-file-io"
+version = "0.8.2"
+dependencies = [
+ "aead-stream",
+ "aes-gcm",
+ "libc",
+ "pplx-space-stopwatch",
+ "rand 0.10.2",
+ "rustix",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tracing",
+ "zstd",
 ]
 
 [[package]]
@@ -6711,10 +6711,10 @@ dependencies = [
  "nix 0.31.3",
  "pplx-space-common-core",
  "pplx-space-common-grpc",
- "pplx-space-common-io",
  "pplx-space-credmgr-client",
  "pplx-space-events",
  "pplx-space-execution-common",
+ "pplx-space-file-io",
  "pplx-space-grpc-metrics",
  "pplx-space-grpc-rate-limiter",
  "pplx-space-grpc-server",
@@ -6834,10 +6834,10 @@ dependencies = [
  "nix 0.31.3",
  "pplx-space-common-core",
  "pplx-space-common-grpc",
- "pplx-space-common-io",
  "pplx-space-common-proto-build",
  "pplx-space-execution-catalog",
  "pplx-space-execution-common",
+ "pplx-space-file-io",
  "pplx-space-metrics-emit",
  "pplx-space-test-env",
  "pplx-space-transparent-proxy-socket",
@@ -7350,7 +7350,6 @@ dependencies = [
  "pplx-space-bearer-token",
  "pplx-space-common-core",
  "pplx-space-common-grpc",
- "pplx-space-common-io",
  "pplx-space-common-jobs",
  "pplx-space-credential-injection-core",
  "pplx-space-credmgr",
@@ -7360,6 +7359,7 @@ dependencies = [
  "pplx-space-execution-catalog",
  "pplx-space-execution-common",
  "pplx-space-feature-flags",
+ "pplx-space-file-io",
  "pplx-space-grpc-metrics",
  "pplx-space-grpc-rate-limiter",
  "pplx-space-grpc-server",
@@ -8032,12 +8032,12 @@ dependencies = [
  "nix 0.31.3",
  "pplx-space-common-core",
  "pplx-space-common-grpc",
- "pplx-space-common-io",
  "pplx-space-common-jobs",
  "pplx-space-db-test-fixtures",
  "pplx-space-execution-catalog",
  "pplx-space-execution-common",
  "pplx-space-feature-flags",
+ "pplx-space-file-io",
  "pplx-space-grpc-rate-limiter",
  "pplx-space-grpc-server",
  "pplx-space-internal-api-server",
@@ -8252,9 +8252,9 @@ dependencies = [
  "nix 0.31.3",
  "pplx-space-common-core",
  "pplx-space-common-grpc",
- "pplx-space-common-io",
  "pplx-space-common-jobs",
  "pplx-space-credmgr-client",
+ "pplx-space-file-io",
  "pplx-space-grpc-rate-limiter",
  "pplx-space-grpc-server",
  "pplx-space-local-health",

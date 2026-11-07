@@ -10,7 +10,7 @@ use pplx_space_common_core::types::{
     Digest, DigestParseError, HashAlg, TEMPLATE_ROOTFS_FILE, TEMPLATE_ROOTFS_ZSTD_FILE,
     TEMPLATE_ROOTFS_ZSTD_LEVEL,
 };
-use pplx_space_common_io::sparse::SparseFileWriter;
+use pplx_space_file_io::sparse::SparseFileWriter;
 use pplx_space_page_cache as page_cache;
 use sha2::{Digest as _, Sha256};
 

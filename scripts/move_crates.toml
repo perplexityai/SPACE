@@ -14,7 +14,6 @@
 "pplx-space-byte-size" = { to = "crates/l10_foundation/byte/size" }
 "pplx-space-common-cli" = { to = "crates/l10_foundation/common/cli" }
 "pplx-space-common-grpc" = { to = "crates/l10_foundation/common/grpc/transport" }  # leaf
-"pplx-space-common-io" = { to = "crates/l10_foundation/common/io" }
 "pplx-space-common-jobs" = { to = "crates/l10_foundation/common/jobs" }
 "pplx-space-common-proto-build" = { to = "crates/l10_foundation/common/proto/build" }
 "pplx-space-common-connection-admission" = { to = "crates/l10_foundation/connection/admission", rename = "pplx-space-connection-admission" }  # renamed
@@ -24,6 +23,7 @@
 "pplx-space-durations" = { to = "crates/l10_foundation/durations" }
 "pplx-space-env-vars" = { to = "crates/l10_foundation/env/vars" }
 "pplx-space-feature-flags" = { to = "crates/l10_foundation/feature/flags" }
+"pplx-space-common-io" = { to = "crates/l10_foundation/file/io", rename = "pplx-space-file-io" }  # renamed
 "pplx-space-common-grpc-lb" = { to = "crates/l10_foundation/grpc/lb", rename = "pplx-space-grpc-lb" }  # renamed
 "pplx-space-grpc-metrics" = { to = "crates/l10_foundation/grpc/metrics" }
 "pplx-space-grpc-rate-limiter" = { to = "crates/l10_foundation/grpc/rate/limiter" }
