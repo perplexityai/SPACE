@@ -5,8 +5,9 @@ use pplx_space_common_core::types::SnapshotId;
 use std::str::FromStr;
 
 use pplx_space_accounts::OrgId;
-use pplx_space_common_core::types::{K8sNodeName, K8sNodeUid, SandboxId, StorageUri, TemplateName};
+use pplx_space_common_core::types::{SandboxId, StorageUri, TemplateName};
 use pplx_space_content_digest::ContentHash;
+use pplx_space_k8s_ids::{K8sNodeName, K8sNodeUid};
 use pplx_space_sql_locator::sql;
 
 #[derive(Debug, Clone, PartialEq, Eq)]

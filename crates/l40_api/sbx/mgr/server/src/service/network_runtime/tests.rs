@@ -499,9 +499,8 @@ async fn refresh_abandons_schedule_when_sandbox_row_is_gone() {
 }
 
 use pplx_space_accounts::NodeId;
-use pplx_space_common_core::types::{
-    ExecutionGeneration, PodUid, RouteGeneration, SpaceApiRouteIdentity,
-};
+use pplx_space_common_core::types::{ExecutionGeneration, RouteGeneration, SpaceApiRouteIdentity};
+use pplx_space_k8s_ids::PodUid;
 
 fn has_flag(args: &[String], flag: &str) -> bool {
     args.iter().any(|arg| arg == flag)

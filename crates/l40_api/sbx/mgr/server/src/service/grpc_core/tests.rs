@@ -909,7 +909,7 @@ async fn auto_lifecycle_delete_requires_one_canonical_id_and_the_expected_policy
                     pplx_space_common_core::types::SandboxActivationAttemptId::new(),
                 ),
                 substrate_kind: Some(NodeManagedBy::Kubernetes),
-                pod_uid: Some(pplx_space_common_core::types::PodUid::parse("pod-uid-7").unwrap()),
+                pod_uid: Some(pplx_space_k8s_ids::PodUid::parse("pod-uid-7").unwrap()),
                 ..Default::default()
             },
             crate::auto_lifecycle_delete_receipts::RouteIdentityProvenance::ClusterFenced,

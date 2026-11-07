@@ -3,8 +3,7 @@
 //! Kubernetes' own naming rules; no SPACE node-model types or logic.
 //!
 //! They are their own crate so that code can name them without depending on
-//! `pplx-space-common-core`. `pplx-space-common-core` re-exports the
-//! identifiers from `types::node` and the label value from `types::label`.
+//! `pplx-space-common-core`: import them from here.
 
 mod label;
 

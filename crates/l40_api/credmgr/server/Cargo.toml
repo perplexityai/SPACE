@@ -28,6 +28,7 @@ aws-credential-types = { workspace = true, features = ["hardcoded-credentials"] 
 aws-sdk-acmpca = { workspace = true, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
 aws-sdk-secretsmanager = { workspace = true, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
 pplx-space-content-digest = { workspace = true, features = ["serde"] }
+pplx-space-k8s-ids = { workspace = true, features = ["serde"] }
 # Classifies AssumeRole failures by the SDK error type and its throttling
 # vocabulary.
 aws-runtime = { workspace = true }

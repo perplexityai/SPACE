@@ -8,7 +8,8 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 use pplx_space_accounts::NodeId;
-use pplx_space_common_core::types::{NodeAddress, NodeManagedBy, NodeRole, PodUid};
+use pplx_space_common_core::types::{NodeAddress, NodeManagedBy, NodeRole};
+use pplx_space_k8s_ids::PodUid;
 
 #[derive(Debug, Serialize)]
 #[serde(untagged)]

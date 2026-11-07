@@ -9,9 +9,9 @@
 //! caller's transaction when there is one.
 
 use pplx_space_common_core::types::{
-    ArtifactKind, ArtifactOrigin, ExecutionGeneration, LocalArtifactId, PodUid, SandboxId,
-    SandboxLifecycle,
+    ArtifactKind, ArtifactOrigin, ExecutionGeneration, LocalArtifactId, SandboxId, SandboxLifecycle,
 };
+use pplx_space_k8s_ids::PodUid;
 
 use pplx_space_common_core::sql;
 

@@ -5,11 +5,6 @@ use std::{fmt, net::IpAddr, str::FromStr};
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
-pub use pplx_space_k8s_ids::{
-    K8sNodeName, K8sNodeNameParseError, K8sNodeUid, K8sNodeUidParseError, PodName,
-    PodNameParseError, PodResourceVersion, PodResourceVersionParseError, PodUid, PodUidParseError,
-};
-
 pub const NODE_ROLE_WORKER: &str = "worker";
 pub const NODE_ROLE_BUILDER: &str = "builder";
 pub const NODE_ROLE_CLUSTER: &str = "cluster";
@@ -105,12 +100,12 @@ pub enum NodePoolNameParseError {
     Empty,
     /// The value was not a valid Kubernetes label value.
     #[error(transparent)]
-    InvalidLabelValue(#[from] crate::types::LabelValueParseError),
+    InvalidLabelValue(#[from] pplx_space_k8s_ids::LabelValueParseError),
 }
 
 /// Validated node pool name, used to pin a sandbox to an isolation node pool.
 ///
-/// A non-empty Kubernetes label value (see [`crate::types::LabelValue`]) — the
+/// A non-empty Kubernetes label value (see [`pplx_space_k8s_ids::LabelValue`]) — the
 /// grammar is not re-implemented here. It is rendered as the value of the pool
 /// discriminator label (see `SANDBOX_PLACEMENT_POOL_LABEL_KEY`), so it must be
 /// a legal label value. The matching isolation-taint toleration uses
@@ -118,7 +113,7 @@ pub enum NodePoolNameParseError {
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[cfg_attr(feature = "serde", serde(try_from = "String", into = "String"))]
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
-pub struct NodePoolName(crate::types::LabelValue);
+pub struct NodePoolName(pplx_space_k8s_ids::LabelValue);
 
 impl NodePoolName {
     /// Parses and validates a node pool name (a non-empty label value).
@@ -127,7 +122,7 @@ impl NodePoolName {
         if value.is_empty() {
             return Err(NodePoolNameParseError::Empty);
         }
-        Ok(Self(crate::types::LabelValue::parse(value)?))
+        Ok(Self(pplx_space_k8s_ids::LabelValue::parse(value)?))
     }
 
     /// Returns the validated node pool name.

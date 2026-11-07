@@ -38,9 +38,8 @@ use std::fmt;
 use std::str::FromStr;
 
 use pplx_space_common_core::sql;
-use pplx_space_common_core::types::{
-    PodUid, SandboxActivationAttemptId, SandboxLifecycleParseError,
-};
+use pplx_space_common_core::types::{SandboxActivationAttemptId, SandboxLifecycleParseError};
+use pplx_space_k8s_ids::PodUid;
 use pplx_space_sandbox_portability::{
     fresh_ready_snapshot_exists, inflight_suspend_upload_exists,
     recoverable_suspend_snapshot_exists, restore_retry_source_snapshot_exists,

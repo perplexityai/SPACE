@@ -61,7 +61,8 @@ use crate::state::{
     CleanupState, SandboxState, SandboxStatus, SandboxStatusEventDetails, StateTransitionError,
     Teardown,
 };
-use pplx_space_common_core::types::{PodUid, RouteGeneration, SpaceApiRouteIdentity};
+use pplx_space_common_core::types::{RouteGeneration, SpaceApiRouteIdentity};
+use pplx_space_k8s_ids::PodUid;
 
 const DB_PATH: &str = pplx_space_host_layout::paths::SANDBOX_MANAGER_DB;
 

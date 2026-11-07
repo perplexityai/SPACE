@@ -27,13 +27,13 @@ use pplx_space_common_core::{
     sql,
     types::{
         ArtifactKind, AutoLifecyclePolicy, BackupSource, ExecutionGeneration, NodeAddress,
-        NodeManagedBy as SpaceNodeManagedBy, PodUid, SandboxLifecycle,
-        SandboxTransitionTargetState,
+        NodeManagedBy as SpaceNodeManagedBy, SandboxLifecycle, SandboxTransitionTargetState,
     },
 };
 use pplx_space_events::{
     SandboxEvent, SandboxEventBoolField, SandboxEventDetails, SandboxEventSource, SandboxEventType,
 };
+use pplx_space_k8s_ids::PodUid;
 use pplx_space_policy_authority::PolicyAuthority;
 use rand::RngExt;
 use sqlx::{Postgres, Transaction};

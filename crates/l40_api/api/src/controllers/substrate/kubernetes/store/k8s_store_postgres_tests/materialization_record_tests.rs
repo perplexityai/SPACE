@@ -3,7 +3,7 @@
 //! clear a `pod_uid`. Once a writer has recorded a pod, no supported write
 //! path can forget it.
 
-use pplx_space_common_core::types::PodName;
+use pplx_space_k8s_ids::PodName;
 
 use super::*;
 use crate::controllers::substrate::{ObservedPod, RecordedExecution};

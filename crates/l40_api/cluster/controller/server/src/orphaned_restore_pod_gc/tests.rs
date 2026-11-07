@@ -6,7 +6,8 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use pplx_space_common_core::types::{PodUid, PositiveDuration, SandboxId, SandboxLifecycle};
+use pplx_space_common_core::types::{PositiveDuration, SandboxId, SandboxLifecycle};
+use pplx_space_k8s_ids::PodUid;
 use uuid::Uuid;
 
 use super::*;

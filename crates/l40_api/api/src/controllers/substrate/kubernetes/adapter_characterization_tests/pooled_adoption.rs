@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use axum::http::StatusCode;
-use pplx_space_common_core::types::PodUid;
+use pplx_space_k8s_ids::PodUid;
 use pplx_space_sbx_mgr_client::proto as sbx;
 use prost::Message as _;
 

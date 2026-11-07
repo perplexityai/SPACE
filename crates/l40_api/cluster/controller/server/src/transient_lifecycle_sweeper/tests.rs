@@ -104,9 +104,8 @@ use std::time::Duration;
 use pplx_space_api::controllers::substrate::{
     CommandReadyProbe, ObservedPodIdentity, PodIdentityFence,
 };
-use pplx_space_common_core::types::{
-    PodName, PodResourceVersion, PodUid, PositiveDuration, SandboxId, SandboxLifecycle,
-};
+use pplx_space_common_core::types::{PositiveDuration, SandboxId, SandboxLifecycle};
+use pplx_space_k8s_ids::{PodName, PodResourceVersion, PodUid};
 use uuid::Uuid;
 
 use pplx_space_api::controllers::substrate::TeardownProgress;

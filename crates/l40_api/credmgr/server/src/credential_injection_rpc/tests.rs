@@ -1,4 +1,5 @@
-use pplx_space_common_core::{types::K8sNodeUid, types::NodeRole};
+use pplx_space_common_core::types::NodeRole;
+use pplx_space_k8s_ids::K8sNodeUid;
 
 use super::*;
 use crate::auth::{ClientService, K8sIdentity};
