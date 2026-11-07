@@ -1788,6 +1788,12 @@ fn inventory_test_actor(org_id: OrgId) -> User {
     }
 }
 
+fn node_sandboxes_uri(query: &str) -> axum::http::Uri {
+    format!("/nodes/n/sandboxes?{query}")
+        .parse()
+        .expect("valid URI")
+}
+
 #[tokio::test]
 async fn node_sandbox_pages_are_scoped_deduplicated_and_complete() -> TestResult<()> {
     let Some(db) = try_pg_test_db().await? else {
@@ -1813,14 +1819,15 @@ async fn node_sandbox_pages_are_scoped_deduplicated_and_complete() -> TestResult
     .bind(other_node)
     .execute(&db.pool)
     .await?;
-    let mut after = None;
+    let mut after: Option<SandboxId> = None;
     let mut ids = Vec::new();
     for expected_len in [100, 100, 5] {
+        let query = after.map(|after| format!("after={after}"));
         let response = list_node_sandboxes(
             State(state.clone()),
             Extension(AuthUser(actor.clone())),
             Path(node_id),
-            Query(NodeSandboxesQuery { after }),
+            node_sandboxes_uri(query.as_deref().unwrap_or("")),
         )
         .await;
         assert_eq!(response.status(), StatusCode::OK);
@@ -1844,7 +1851,7 @@ async fn node_sandbox_pages_are_scoped_deduplicated_and_complete() -> TestResult
         State(state.clone()),
         Extension(AuthUser(actor.clone())),
         Path(NodeId::new()),
-        Query(NodeSandboxesQuery { after: None }),
+        node_sandboxes_uri(""),
     )
     .await;
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
@@ -1854,10 +1861,398 @@ async fn node_sandbox_pages_are_scoped_deduplicated_and_complete() -> TestResult
         State(state),
         Extension(AuthUser(member)),
         Path(node_id),
-        Query(NodeSandboxesQuery { after: None }),
+        node_sandboxes_uri(""),
     )
     .await;
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    Ok(())
+}
+
+async fn node_sandboxes_body(
+    state: &AppState,
+    actor: &User,
+    node_id: NodeId,
+    query: &str,
+) -> TestResult<(StatusCode, Vec<u8>)> {
+    let response = list_node_sandboxes(
+        State(state.clone()),
+        Extension(AuthUser(actor.clone())),
+        Path(node_id),
+        node_sandboxes_uri(query),
+    )
+    .await;
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), 1_000_000).await?;
+    Ok((status, body.to_vec()))
+}
+
+/// `count` rows on `node`, all changed at `changed_at`.
+async fn insert_history_rows(
+    pool: &sqlx::PgPool,
+    node_id: NodeId,
+    lifecycle: &str,
+    active: bool,
+    changed_at: &str,
+    count: i32,
+) -> TestResult {
+    sqlx::query(sql!(
+        "INSERT INTO sandboxes (id, user_id, org_id, lifecycle, placement, managed_by,
+            active_node_id, target_node_id, lifecycle_changed_at, network_policy_generation)
+         SELECT space_uuid_v7(), '00000000-0000-0000-0000-000000000010',
+            '00000000-0000-0000-0000-000000000001', $2, 'placed', 'k8s',
+            CASE WHEN $3 THEN $1::UUID END, CASE WHEN $3 THEN NULL ELSE $1::UUID END,
+            $4::TIMESTAMPTZ, 1
+         FROM generate_series(1, $5) n"
+    ))
+    .bind(node_id)
+    .bind(lifecycle)
+    .bind(active)
+    .bind(changed_at)
+    .bind(count)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// The history parameters filter, order newest change first and page across
+/// rows that share a timestamp; with none of them the body is what it was.
+#[tokio::test]
+async fn node_sandbox_history_filters_orders_and_pages_by_change() -> TestResult<()> {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let state = AppState::from_pool(db.pool.clone()).await?;
+    let actor =
+        inventory_test_actor(crate::routes::authz::cluster_managing_org_id(&db.pool).await?);
+    let node_id = NodeId::new();
+    let other_node = NodeId::new();
+    sqlx::query(sql!("INSERT INTO nodes (id, address, role) VALUES ($1, '127.0.0.3', 'worker'), ($2, '127.0.0.4', 'worker')"))
+        .bind(node_id).bind(other_node).execute(&db.pool).await?;
+    let drain_started = "2026-01-01T00:00:00.123456Z";
+    // 120 failures in one microsecond, so a page boundary falls inside a tie.
+    insert_history_rows(&db.pool, node_id, "failed", true, drain_started, 70).await?;
+    insert_history_rows(&db.pool, node_id, "failed", false, drain_started, 50).await?;
+    insert_history_rows(&db.pool, node_id, "failed", true, "2025-12-31T23:00:00Z", 5).await?;
+    insert_history_rows(
+        &db.pool,
+        node_id,
+        "started",
+        true,
+        "2026-01-01T01:00:00Z",
+        3,
+    )
+    .await?;
+    insert_history_rows(
+        &db.pool,
+        node_id,
+        "deleted",
+        false,
+        "2026-01-01T02:00:00Z",
+        2,
+    )
+    .await?;
+    insert_history_rows(&db.pool, other_node, "failed", true, drain_started, 4).await?;
+
+    // Failed during the drain, newest change first, across two pages.
+    let mut seen = Vec::new();
+    let mut cursor: Option<String> = None;
+    for expected in [100, 20] {
+        let mut query =
+            format!("order=lifecycle_changed_desc&lifecycle=failed&changed_since={drain_started}");
+        if let Some(cursor) = &cursor {
+            query.push_str(&format!("&cursor={cursor}"));
+        }
+        let (status, body) = node_sandboxes_body(&state, &actor, node_id, &query).await?;
+        assert_eq!(status, StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_slice(&body)?;
+        let rows = body["sandboxes"].as_array().expect("rows");
+        assert_eq!(rows.len(), expected);
+        for row in rows {
+            assert_eq!(row["lifecycle"], "failed");
+            assert_eq!(row["lifecycle_changed_at"], drain_started);
+            seen.push(row["id"].as_str().expect("id").to_string());
+        }
+        assert!(body.get("next_after").is_none());
+        cursor = body["next_cursor"].as_str().map(str::to_string);
+        assert_eq!(cursor.is_some(), expected == 100);
+    }
+    assert_eq!(seen.len(), 120);
+    assert!(
+        seen.windows(2).all(|pair| pair[0] > pair[1]),
+        "ids descend within the tie"
+    );
+
+    // Newest change first across lifecycles; a repeated and a comma list agree.
+    let (_, body) = node_sandboxes_body(
+        &state,
+        &actor,
+        node_id,
+        "order=lifecycle_changed_desc&lifecycle=started&lifecycle=deleted",
+    )
+    .await?;
+    let (_, comma) = node_sandboxes_body(
+        &state,
+        &actor,
+        node_id,
+        "order=lifecycle_changed_desc&lifecycle=deleted,started",
+    )
+    .await?;
+    assert_eq!(body, comma);
+    let body: serde_json::Value = serde_json::from_slice(&body)?;
+    let lifecycles: Vec<&str> = body["sandboxes"]
+        .as_array()
+        .expect("rows")
+        .iter()
+        .map(|row| row["lifecycle"].as_str().expect("lifecycle"))
+        .collect();
+    assert_eq!(
+        lifecycles,
+        ["deleted", "deleted", "started", "started", "started"]
+    );
+
+    // A filter in id order keeps the id order and its cursor.
+    let (_, body) = node_sandboxes_body(&state, &actor, node_id, "lifecycle=failed").await?;
+    let body: serde_json::Value = serde_json::from_slice(&body)?;
+    let ids: Vec<&str> = body["sandboxes"]
+        .as_array()
+        .expect("rows")
+        .iter()
+        .map(|row| row["id"].as_str().expect("id"))
+        .collect();
+    assert_eq!(ids.len(), 100);
+    assert!(ids.windows(2).all(|pair| pair[0] < pair[1]));
+    assert!(body["next_after"].is_string());
+    assert!(body["sandboxes"][0].get("lifecycle_changed_at").is_none());
+    // The last page holds the rest of the failures and none of the rows
+    // inserted after them in another lifecycle.
+    let after = body["next_after"].as_str().expect("next_after");
+    let (_, body) = node_sandboxes_body(
+        &state,
+        &actor,
+        node_id,
+        &format!("lifecycle=failed&after={after}"),
+    )
+    .await?;
+    let body: serde_json::Value = serde_json::from_slice(&body)?;
+    let rows = body["sandboxes"].as_array().expect("rows");
+    assert_eq!(rows.len(), 25);
+    assert!(rows.iter().all(|row| row["lifecycle"] == "failed"));
+    assert!(body["next_after"].is_null());
+
+    for refused in [
+        "lifecycle=running",
+        "changed_since=yesterday",
+        "order=newest",
+        "cursor=abc",
+        &format!("order=lifecycle_changed_desc&after={}", Uuid::now_v7()),
+        "order=lifecycle_changed_desc&cursor=not-a-cursor",
+    ] {
+        let (status, _) = node_sandboxes_body(&state, &actor, node_id, refused).await?;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}");
+    }
+
+    // Empty history parameters are unset: the request takes the default path.
+    let (status, empty) = node_sandboxes_body(
+        &state,
+        &actor,
+        node_id,
+        "lifecycle=&changed_since=&order=&cursor=",
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK);
+    let (_, unset) = node_sandboxes_body(&state, &actor, node_id, "").await?;
+    assert_eq!(empty, unset);
+
+    // No new parameter: the body is the list's original shape, field for
+    // field, and the bytes the original statement and serialization give.
+    // Key order depends on serde_json's `preserve_order`, which feature
+    // unification decides per build, so the bytes are compared with that
+    // serialization rather than a literal.
+    let small = NodeId::new();
+    sqlx::query(sql!(
+        "INSERT INTO nodes (id, address, role) VALUES ($1, '127.0.0.5', 'worker')"
+    ))
+    .bind(small)
+    .execute(&db.pool)
+    .await?;
+    insert_history_rows(&db.pool, small, "failed", true, drain_started, 1).await?;
+    let id: Uuid = sqlx::query_scalar(sql!("SELECT id FROM sandboxes WHERE active_node_id = $1"))
+        .bind(small)
+        .fetch_one(&db.pool)
+        .await?;
+    let (status, body) = node_sandboxes_body(&state, &actor, small, "").await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&body)?,
+        serde_json::json!({
+            "sandboxes": [{
+                "id": id.to_string(),
+                "lifecycle": "failed",
+                "active_node_id": small.to_string(),
+                "target_node_id": null
+            }],
+            "next_after": null
+        })
+    );
+    let rows = AdminNodeStore::new(db.pool.clone())
+        .list_sandboxes(small, None, 101)
+        .await?;
+    assert_eq!(
+        body,
+        serde_json::to_vec(&serde_json::json!({ "sandboxes": rows, "next_after": null }))?
+    );
+    Ok(())
+}
+
+/// The store recognizes a lifecycle only in the exact form the filter
+/// compares; another case, surrounding whitespace or a non-ASCII letter is
+/// listed as stored and matched by no lifecycle filter, in both orders.
+#[tokio::test]
+async fn node_placements_list_only_the_exact_stored_form_as_recognized() -> TestResult<()> {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let node_id = NodeId::new();
+    sqlx::query(sql!(
+        "INSERT INTO nodes (id, address, role) VALUES ($1, '127.0.0.6', 'worker')"
+    ))
+    .bind(node_id)
+    .execute(&db.pool)
+    .await?;
+    insert_history_rows(
+        &db.pool,
+        node_id,
+        "started",
+        true,
+        "2026-01-01T00:00:00Z",
+        1,
+    )
+    .await?;
+    insert_history_rows(
+        &db.pool,
+        node_id,
+        " Started ",
+        true,
+        "2026-01-01T01:00:00Z",
+        1,
+    )
+    .await?;
+    // A capital I with a dot (U+0130), which a collation-aware `lower` folds
+    // to an ASCII `i`.
+    insert_history_rows(
+        &db.pool,
+        node_id,
+        "FA\u{130}LED",
+        true,
+        "2026-01-01T02:00:00Z",
+        1,
+    )
+    .await?;
+    let started =
+        StoredSandboxLifecycle::Live(pplx_space_common_core::types::SandboxLifecycle::Started);
+    let failed =
+        StoredSandboxLifecycle::Live(pplx_space_common_core::types::SandboxLifecycle::Failed);
+    let exact = node_placements::NodePlacementLifecycle::Stored(started);
+    let spaced = node_placements::NodePlacementLifecycle::Unrecognized(" Started ".to_string());
+    let dotted = node_placements::NodePlacementLifecycle::Unrecognized("FA\u{130}LED".to_string());
+
+    let (by_id, by_change) =
+        placement_lifecycles(&db.pool, node_id, NodePlacementFilter::default()).await?;
+    assert_eq!(by_id, [exact.clone(), spaced.clone(), dotted.clone()]);
+    assert_eq!(by_change, [dotted, spaced, exact.clone()]);
+    assert_eq!(
+        by_id
+            .iter()
+            .map(|lifecycle| lifecycle.as_str())
+            .collect::<Vec<_>>(),
+        ["started", " Started ", "FA\u{130}LED"]
+    );
+
+    let only = |lifecycle| NodePlacementFilter {
+        lifecycles: Some(vec![lifecycle]),
+        ..NodePlacementFilter::default()
+    };
+    let (by_id, by_change) = placement_lifecycles(&db.pool, node_id, only(started)).await?;
+    assert_eq!((by_id, by_change), (vec![exact.clone()], vec![exact]));
+    let (by_id, by_change) = placement_lifecycles(&db.pool, node_id, only(failed)).await?;
+    assert_eq!((by_id, by_change), (Vec::new(), Vec::new()));
+    Ok(())
+}
+
+/// The node's placement lifecycles through `filter`, by id and by change.
+async fn placement_lifecycles(
+    pool: &sqlx::PgPool,
+    node_id: NodeId,
+    filter: NodePlacementFilter,
+) -> TestResult<(
+    Vec<node_placements::NodePlacementLifecycle>,
+    Vec<node_placements::NodePlacementLifecycle>,
+)> {
+    let by_id = node_placements::list_by_id(pool, node_id, &filter, None, 10)
+        .await?
+        .into_iter()
+        .map(|row| row.lifecycle)
+        .collect();
+    let by_change = node_placements::list_by_change(pool, node_id, &filter, None, 10)
+        .await?
+        .into_iter()
+        .map(|row| row.lifecycle)
+        .collect();
+    Ok((by_id, by_change))
+}
+
+/// A lifecycle the store doesn't recognize is listed as stored, and the rows
+/// around it on the page are still returned, in both orders.
+#[tokio::test]
+async fn node_placements_list_an_unrecognized_lifecycle_as_stored() -> TestResult<()> {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let node_id = NodeId::new();
+    sqlx::query(sql!(
+        "INSERT INTO nodes (id, address, role) VALUES ($1, '127.0.0.7', 'worker')"
+    ))
+    .bind(node_id)
+    .execute(&db.pool)
+    .await?;
+    insert_history_rows(&db.pool, node_id, "failed", true, "2026-01-01T00:00:00Z", 2).await?;
+    insert_history_rows(
+        &db.pool,
+        node_id,
+        "not-a-lifecycle",
+        false,
+        "2026-01-01T01:00:00Z",
+        1,
+    )
+    .await?;
+    insert_history_rows(&db.pool, node_id, "failed", true, "2026-01-01T02:00:00Z", 2).await?;
+    let unrecognized =
+        node_placements::NodePlacementLifecycle::Unrecognized("not-a-lifecycle".to_string());
+    let failed = node_placements::NodePlacementLifecycle::Stored(StoredSandboxLifecycle::Live(
+        pplx_space_common_core::types::SandboxLifecycle::Failed,
+    ));
+    let filter = NodePlacementFilter::default();
+
+    let by_id: Vec<_> = node_placements::list_by_id(&db.pool, node_id, &filter, None, 10)
+        .await?
+        .into_iter()
+        .map(|row| row.lifecycle)
+        .collect();
+    let by_change: Vec<_> = node_placements::list_by_change(&db.pool, node_id, &filter, None, 10)
+        .await?
+        .into_iter()
+        .map(|row| row.lifecycle)
+        .collect();
+    let expected = [
+        failed.clone(),
+        failed.clone(),
+        unrecognized,
+        failed.clone(),
+        failed,
+    ];
+    assert_eq!(by_id, expected);
+    assert_eq!(by_change, expected);
+    assert_eq!(by_id[2].as_str(), "not-a-lifecycle");
     Ok(())
 }
 
@@ -2570,5 +2965,103 @@ async fn node_reads_survive_a_failed_read_state_read() -> TestResult {
         assert!(node.reconcile_trigger.is_some());
         assert_eq!(node.runtime_installations, Some(Vec::new()));
     }
+    Ok(())
+}
+
+/// The holds route's wire shape for one phantom row, and its refusals. The
+/// rows and terms are the store's and its agreement test's; this pins what
+/// the console reads. The process leaves the residency switch unset, so the
+/// response reports the default evidence mode.
+#[tokio::test]
+async fn node_holds_reports_each_row_with_its_gates_and_refuses_as_its_siblings() -> TestResult<()>
+{
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let state = AppState::from_pool(db.pool.clone()).await?;
+    let actor =
+        inventory_test_actor(crate::routes::authz::cluster_managing_org_id(&db.pool).await?);
+    let node_id = NodeId::new();
+    sqlx::query(sql!(
+        "INSERT INTO nodes (id, address, role) VALUES ($1, '127.0.0.6', 'worker')"
+    ))
+    .bind(node_id)
+    .execute(&db.pool)
+    .await?;
+    sqlx::query(sql!(
+        "INSERT INTO node_status_snapshots (
+             node_id, observed_at, stale_after, reachable, services,
+             sandbox_inventory_pruned_at, updated_at
+         ) VALUES ($1, NOW(), NOW() + INTERVAL '1 hour', TRUE, '[]'::JSONB, NOW(), NOW())"
+    ))
+    .bind(node_id)
+    .execute(&db.pool)
+    .await?;
+    let sandbox: Uuid = sqlx::query_scalar(sql!(
+        "INSERT INTO sandboxes (id, user_id, org_id, lifecycle, placement, managed_by,
+            active_node_id, placement_changed_at, lifecycle_changed_at, network_policy_generation)
+         VALUES (space_uuid_v7(), '00000000-0000-0000-0000-000000000010',
+            '00000000-0000-0000-0000-000000000001', 'started', 'placed', 'k8s', $1,
+            NOW() - INTERVAL '2 hours', '2026-01-01T00:00:00Z', 1)
+         RETURNING id"
+    ))
+    .bind(node_id)
+    .fetch_one(&db.pool)
+    .await?;
+
+    let holds = |actor: User, node_id: NodeId| {
+        list_node_holds(
+            State(state.clone()),
+            Extension(AuthUser(actor)),
+            Path(node_id),
+        )
+    };
+    let response = holds(actor.clone(), node_id).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value =
+        serde_json::from_slice(&axum::body::to_bytes(response.into_body(), 100_000).await?)?;
+    assert_eq!(
+        body,
+        serde_json::json!({
+            "node_id": node_id.to_string(),
+            "residency_evidence": "lifecycle_only",
+            "stuck_transient_after_secs": 600,
+            "total": 1,
+            "truncated": false,
+            "reason_counts": {
+                "census_absent": 1, "evacuating": 0, "local_only_snapshot": 0,
+                "resident": 0, "stuck_transient": 0, "termination_blocking": 0,
+                "transient": 0, "upload_in_flight": 0
+            },
+            "term_counts": { "resident": 1, "drain_blocker": 0, "active_resident": 1 },
+            "holds": [{
+                "sandbox_id": sandbox.to_string(),
+                "lifecycle": "started",
+                "lifecycle_changed_at": "2026-01-01T00:00:00Z",
+                "placement": "active",
+                "reason": "census_absent",
+                "counted_by": {
+                    "terminate": true,
+                    "drain": true,
+                    "drain_with_termination_blocking_gate": true
+                },
+                "terms": { "resident": true, "drain_blocker": false, "active_resident": true },
+                "facts": {
+                    "census_absent": true, "durable_snapshot": false,
+                    "upload_in_flight": false, "upload_started_at": null,
+                    "evacuation_restore_target": null, "restore_attempt_count": null,
+                    "next_restore_attempt_at": null, "past_stuck_threshold": true
+                }
+            }]
+        })
+    );
+
+    assert_eq!(
+        holds(actor.clone(), NodeId::new()).await.status(),
+        StatusCode::NOT_FOUND
+    );
+    let mut member = actor;
+    member.role = UserRole::Member;
+    assert_eq!(holds(member, node_id).await.status(), StatusCode::FORBIDDEN);
     Ok(())
 }

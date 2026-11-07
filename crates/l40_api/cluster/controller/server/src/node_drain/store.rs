@@ -5327,6 +5327,12 @@ mod residency_tests;
 #[cfg(test)]
 mod termination_gate_tests;
 
+/// Postgres-backed agreement between the admin holds read's gate terms and
+/// the counts node-drain's own resident, blocker and termination-blocking
+/// statements return, so a drift in either side fails a test.
+#[cfg(test)]
+mod node_holds_agreement_tests;
+
 /// Postgres-backed coverage for evacuating a `stopped` resident: the claim the
 /// marker-clearing trigger must not eat, the durability gate that authorizes
 /// destroying the user's rootfs, and the re-placement sweep's second arm.
