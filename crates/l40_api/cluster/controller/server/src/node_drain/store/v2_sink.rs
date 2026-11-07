@@ -203,23 +203,11 @@ pub(crate) async fn record_v2_evacuation(
             ));
         }
         (DrainRestoreTarget::Stopped, "stopped") if marker.is_none() => {
-            sqlx::query(sql!(
-                "UPDATE sandboxes
-                    SET current_local_artifact_id = $2,
-                        current_local_artifact_kind = 'disk',
-                        current_local_artifact_origin = 'stop'
-                  WHERE id = $1
-                    AND lifecycle = 'stopped'
-                    AND evacuation_restore_target IS NULL
-                    AND (current_local_artifact_id IS NULL OR current_local_artifact_id = $2)"
-            ))
-            .bind(sandbox_id)
-            .bind(artifact)
-            .execute(&mut *tx)
+            pplx_space_sandbox_store::drain_restore::record_v2_stop_pin(
+                &mut tx, sandbox_id, artifact,
+            )
             .await
             .map_err(sql_error)?
-            .rows_affected()
-                == 1
         }
         _ => false,
     };

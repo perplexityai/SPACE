@@ -382,6 +382,36 @@ pub async fn revert_stopped_drain_restore(
         == 1)
 }
 
+/// Record `artifact`, the disk a v2 drain's node published for stopped
+/// sandbox `sandbox_id`, as the row's stop pin: the identity the stopped
+/// re-placement loads. Writes an **observed projection** (the node's
+/// published disk), keyed on the drain restore the caller enqueues in the
+/// same transaction rather than on v1's marker. Returns whether the row took
+/// it: a row no longer `stopped`, carrying the v1 marker, or pinning another
+/// artifact matches nothing.
+pub async fn record_v2_stop_pin(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    sandbox_id: SandboxId,
+    artifact: Uuid,
+) -> Result<bool, sqlx::Error> {
+    Ok(sqlx::query(sql!(
+        "UPDATE sandboxes
+            SET current_local_artifact_id = $2,
+                current_local_artifact_kind = 'disk',
+                current_local_artifact_origin = 'stop'
+          WHERE id = $1
+            AND lifecycle = 'stopped'
+            AND evacuation_restore_target IS NULL
+            AND (current_local_artifact_id IS NULL OR current_local_artifact_id = $2)"
+    ))
+    .bind(sandbox_id)
+    .bind(artifact)
+    .execute(&mut **tx)
+    .await?
+    .rows_affected()
+        == 1)
+}
+
 /// What [`read_drain_restore_gate`] reads of a sandbox and the snapshot a
 /// drain restore names.
 #[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
