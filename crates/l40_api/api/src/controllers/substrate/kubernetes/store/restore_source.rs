@@ -2,6 +2,7 @@
 //! artifact storage URI a restore reads.
 
 use super::*;
+use pplx_space_sandbox_store::restore_source;
 
 /// Which suspend snapshot a restore selects when no existing restore pod
 /// already names one, and whether its source node's local copy counts.
@@ -65,26 +66,12 @@ impl K8sStore {
     ///
     /// ## What the evacuation half means
     ///
-    /// Only `'stopped'` counts as the marker. The other two values belong to
-    /// the suspend → restore pipeline, which parks its rows in `suspended` and
-    /// resolves them through the storage-URI path; reading them here would
-    /// refuse restores that path already handles.
-    ///
-    /// When it holds, the drain has released the node holding the copy, so the
-    /// node name beside it is not a restore source at all —
-    /// `KubernetesSubstrate::stopped_restore_plan` refuses the `start`.
-    ///
-    /// **`active_node_id IS NULL` is the load-bearing half, not a
-    /// belt-and-braces extra.** The marker alone says an evacuation was
-    /// *claimed*, which is not the same as finished, and a claim can outlive
-    /// the drain that made it: an operator's `:undrain` between the claim and
-    /// the teardown leaves the row `stopped`, marked, and still holding its
-    /// rootfs — and **nothing clears that marker**. Every writer that clears it
-    /// requires a lifecycle change or a lifecycle this row does not have
-    /// (`suspending`, `suspended`, `restoring`), and the drain reconciler never
-    /// visits an undrained node again. Refusing on the marker alone would
-    /// therefore make `start` a permanent 503 for a sandbox whose disk is
-    /// sitting intact on a healthy node, with delete as the owner's only exit.
+    /// Only `'stopped'` counts as the marker, and only once `active_node_id`
+    /// is clear: `pplx_space_sandbox_store::restore_source::restore_source_plan`
+    /// says why both halves are needed. When it holds, the drain has released
+    /// the node holding the copy, so the node name beside it is not a restore
+    /// source at all — `KubernetesSubstrate::stopped_restore_plan` refuses the
+    /// `start`.
     ///
     /// ## Why one statement
     ///
@@ -117,40 +104,14 @@ impl K8sStore {
         // pre-`COALESCE`d, and the placement's node id comes back with them, so
         // the missing-mapping WARN [`Self::restore_source_node_name`] emits can
         // be emitted here too without a second round trip.
-        type RestoreSourceRow = (Option<String>, Option<String>, Option<NodeId>, bool);
-        let row: Option<RestoreSourceRow> = sqlx::query_as(sql!(
-            "SELECT (
-                 SELECT nk.k8s_node_name
-                   FROM node_k8s nk
-                  WHERE nk.node_id = COALESCE(s.target_node_id, s.active_node_id)
-             ) AS mapped_name,
-             (
-                 SELECT ske.k8s_node_name
-                   FROM sandbox_k8s_executions ske
-                  WHERE ske.sandbox_id = s.id
-                    AND ske.k8s_node_name IS NOT NULL
-                  ORDER BY ske.generation DESC
-                  LIMIT 1
-             ) AS execution_name,
-             COALESCE(s.target_node_id, s.active_node_id) AS placement_node_id,
-             -- `active_node_id` alone, deliberately, and *not* the
-             -- `COALESCE` above: a re-placement with a target chosen and
-             -- nothing active yet still has no local copy anywhere. Pinned by
-             -- the mid-re-placement phase of
-             -- `a_stopped_evacuation_counts_as_unplaced_only_once_its_local_copy_is_gone`.
-             COALESCE(
-                 s.evacuation_restore_target = 'stopped' AND s.active_node_id IS NULL,
-                 FALSE
-             ) AS stopped_evacuation_unplaced
-             FROM sandboxes s
-             WHERE s.id = $1"
-        ))
-        .bind(sandbox_id)
-        .fetch_optional(&self.pool)
-        .await
-        .db_context("failed to query Kubernetes restore node preference")?;
-        let Some((mapped_name, execution_name, placement_node_id, stopped_evacuation_unplaced)) =
-            row
+        let Some(restore_source::RestoreSourcePlanRow {
+            mapped_name,
+            execution_name,
+            placement_node_id,
+            stopped_evacuation_unplaced,
+        }) = restore_source::restore_source_plan(&self.pool, sandbox_id)
+            .await
+            .db_context("failed to query Kubernetes restore node preference")?
         else {
             return Ok(UnplacedRestoreSource::default());
         };
@@ -405,47 +366,20 @@ impl K8sStore {
     /// excludes it, and [`Self::selected_suspend_restore_storage_uri`] requires
     /// a `full` snapshot, which a stopped sandbox never has.
     ///
-    /// `evacuation_restore_target = 'stopped'` is what scopes this to the
-    /// stopped evacuation. A suspended evacuation's `restoring` row carries
-    /// `'started'` or `'paused'`, and a user restore clears the marker when it
-    /// claims, so neither can select a disk artifact here.
-    ///
-    /// The pin is required, for the reason the stopped selector gives: it is
-    /// the only thing that ties the URI to the bytes the drain published. The
-    /// drain wrote it (`record_stopped_evacuation_artifact`, which refuses to
-    /// replace a pin with a different id) before releasing the node, and the
-    /// claim leaves it alone. The id returned is the row's pin, not the
-    /// snapshot's: the shared fragment makes them equal, and the pin is the
-    /// value sandbox-manager's own row carries.
-    ///
-    /// Newest-first with the `sn.id` tiebreak, for the reason the stopped
-    /// selector's comment gives.
+    /// `pplx_space_sandbox_store::restore_source::stopped_evacuation_restore_source`
+    /// selects it: its docs say what scopes it to the stopped evacuation, why
+    /// the pin is required, and why it orders newest first.
     pub(in crate::controllers::substrate::kubernetes) async fn selected_stopped_evacuation_restore_source(
         &self,
         sandbox_id: SandboxId,
     ) -> Result<Option<StoppedEvacuationRestoreSource>, SubstrateError> {
-        let pinned = snapshot_is_current_local_artifact("s", "sn");
-        let query = sql!(format!(
-            "SELECT ssl.storage_connection_string, s.current_local_artifact_id
-               FROM sandboxes s
-               JOIN snapshots sn ON sn.sandbox_id = s.id
-               JOIN snapshot_storage_locations ssl ON ssl.snapshot_id = sn.id
-              WHERE s.id = $1
-                AND s.lifecycle = 'restoring'
-                AND s.evacuation_restore_target = 'stopped'
-                AND ssl.orphaned_at IS NULL
-                AND sn.type = 'disk'
-                AND sn.state = 'ready'
-                AND {pinned}
-              ORDER BY sn.timestamp DESC, sn.id DESC
-              LIMIT 1"
-        ));
-        let row: Option<(String, LocalArtifactId)> = sqlx::query_as(sqlx::AssertSqlSafe(query))
-            .bind(sandbox_id)
-            .fetch_optional(&self.pool)
+        let Some(restore_source::StoppedEvacuationRestoreSourceRow {
+            storage_connection_string: storage_uri,
+            current_local_artifact_id: local_artifact_id,
+        }) = restore_source::stopped_evacuation_restore_source(&self.pool, sandbox_id)
             .await
-            .db_context("failed to select Kubernetes stopped evacuation restore source")?;
-        let Some((storage_uri, local_artifact_id)) = row else {
+            .db_context("failed to select Kubernetes stopped evacuation restore source")?
+        else {
             return Ok(None);
         };
         StorageUri::parse(&storage_uri).map_err(|err| SubstrateError::Failed {

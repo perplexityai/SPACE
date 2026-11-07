@@ -12,36 +12,16 @@ impl K8sStore {
         &self,
         sandbox_id: SandboxId,
     ) -> Result<(SandboxLifecycle, Option<String>, f64), SubstrateError> {
-        let (lifecycle, marker, lease_remaining_secs, execution_remaining_secs): (
-            String,
-            Option<String>,
-            f64,
-            f64,
-        ) = sqlx::query_as(sql!(
-            "SELECT lifecycle,
-                    evacuation_restore_target,
-                    GREATEST(
-                        EXTRACT(EPOCH FROM (restore_lease_expires_at - NOW())),
-                        0.0
-                    )::float8,
-                    GREATEST(
-                        CASE
-                          WHEN e.state IN ('creating', 'created', 'recovering', 'running')
-                          THEN EXTRACT(EPOCH FROM (
-                              e.updated_at + make_interval(secs => $2) - NOW()
-                          ))
-                          ELSE 0.0
-                        END,
-                        0.0
-                    )::float8
-               FROM sandboxes s
-               LEFT JOIN sandbox_k8s_executions e
-                 ON e.sandbox_id = s.id AND e.active
-              WHERE s.id = $1"
-        ))
-        .bind(sandbox_id.as_uuid())
-        .bind(super::super::RESTORE_EXECUTION_OWNERSHIP_TTL_SECS)
-        .fetch_optional(&self.pool)
+        let restore_lease::RestoreOwnershipSnapshot {
+            lifecycle,
+            evacuation_restore_target: marker,
+            lease_remaining_secs,
+            execution_remaining_secs,
+        } = restore_lease::restore_ownership_snapshot(
+            &self.pool,
+            sandbox_id,
+            super::super::RESTORE_EXECUTION_OWNERSHIP_TTL_SECS,
+        )
         .await
         .db_context("failed to query sandbox restore ownership")?
         .ok_or_else(|| SubstrateError::NotFound {
@@ -101,66 +81,27 @@ impl K8sStore {
             return Ok(HashMap::new());
         }
 
-        type Row = (
-            Uuid,
-            String,
-            Option<String>,
-            f64,
-            f64,
-            Option<i64>,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-        );
-        let row = sqlx::query_as::<_, Row>(sql!(
-            "SELECT s.id,
-                    s.lifecycle,
-                    s.evacuation_restore_target,
-                    GREATEST(EXTRACT(EPOCH FROM (s.restore_lease_expires_at - NOW())), 0.0)::float8,
-                    GREATEST(
-                        CASE
-                          WHEN e.state IN ('creating', 'created', 'recovering', 'running')
-                          THEN EXTRACT(EPOCH FROM (
-                              e.updated_at + make_interval(secs => $2) - NOW()
-                          ))
-                          ELSE 0.0
-                        END,
-                        0.0
-                    )::float8,
-                    e.generation,
-                    e.state,
-                    e.pod_name,
-                    host(e.pod_ip)
-               FROM sandboxes s
-               LEFT JOIN sandbox_k8s_executions e
-                 ON e.sandbox_id = s.id AND e.active
-              WHERE s.id = ANY($1)"
-        ))
-        .bind(
-            sandbox_ids
-                .iter()
-                .map(|sandbox_id| sandbox_id.as_uuid())
-                .collect::<Vec<_>>(),
+        let row = restore_lease::observe_user_restores(
+            &self.pool,
+            sandbox_ids,
+            super::super::RESTORE_EXECUTION_OWNERSHIP_TTL_SECS,
         )
-        .bind(super::super::RESTORE_EXECUTION_OWNERSHIP_TTL_SECS)
-        .fetch_all(&self.pool)
         .await
         .db_context("failed to batch-observe user restores")?;
 
         row.into_iter()
             .map(
-                |(
-                    sandbox_id,
-                    lifecycle,
-                    marker,
-                    lease_remaining_secs,
-                    execution_remaining_secs,
-                    generation,
-                    state,
-                    pod_name,
-                    pod_ip,
-                )| {
-                    let sandbox_id = SandboxId::from_uuid(sandbox_id);
+                |restore_lease::UserRestoreObservationRow {
+                     sandbox_id,
+                     lifecycle,
+                     evacuation_restore_target: marker,
+                     lease_remaining_secs,
+                     execution_remaining_secs,
+                     generation,
+                     execution_state: state,
+                     pod_name,
+                     pod_ip,
+                 }| {
                     let lifecycle = lifecycle.parse::<SandboxLifecycle>().map_err(|err| {
                         SubstrateError::Failed {
                             message: format!(

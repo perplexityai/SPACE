@@ -119,37 +119,9 @@ impl K8sStore {
         if !Self::lock_sandbox_for_execution_mutation_in(&mut tx, sandbox_id).await? {
             return Ok(false);
         }
-        let refuse: bool = sqlx::query_scalar(sql!(
-            "SELECT EXISTS (
-                        SELECT 1
-                          FROM sandbox_k8s_executions execution
-                          JOIN sandboxes sandbox ON sandbox.id = execution.sandbox_id
-                         WHERE execution.sandbox_id = $1
-                           AND execution.active
-                           AND NOT (
-                               sandbox.lifecycle = 'stopped'
-                               AND execution.created_at <= sandbox.lifecycle_changed_at
-                           )
-                    )
-                 OR EXISTS (
-                        SELECT 1
-                          FROM sandbox_k8s_executions execution
-                         WHERE execution.sandbox_id = $1
-                           AND execution.active
-                           AND execution.activation_attempt_id IS NOT NULL
-                           AND COALESCE(execution.activation_attempt_expires_at > NOW(), TRUE)
-                    )
-                 OR NOT EXISTS (
-                        SELECT 1
-                          FROM sandboxes
-                         WHERE id = $1
-                           AND evacuation_restore_target = 'stopped'
-                    )"
-        ))
-        .bind(sandbox_id)
-        .fetch_one(&mut *tx)
-        .await
-        .db_context("failed to check for an execution newer than the stop")?;
+        let refuse = pod_tracking::stopped_execution_retirement_refused(&mut tx, sandbox_id)
+            .await
+            .db_context("failed to check for an execution newer than the stop")?;
         if refuse {
             return Ok(false);
         }

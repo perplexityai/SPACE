@@ -18,8 +18,8 @@ use pplx_space_sandbox_metrics::publication::{
 use pplx_space_sandbox_portability::{
     current_suspend_origin_marker_snapshot_ready, exact_marker_snapshot_backup_current,
     node_published_suspend_evidence, pre_quarantine_suspend_snapshot_current,
-    quarantine_recovery_suspend_snapshot_current, restore_retry_suspended_revert_snapshot_exists,
-    started_suspend_revert_eligibility, suspended_projection_lifecycle_eligible_with_node_evidence,
+    quarantine_recovery_suspend_snapshot_current, started_suspend_revert_eligibility,
+    suspended_projection_lifecycle_eligible_with_node_evidence,
 };
 use pplx_space_sandbox_store::ingest::TRANSITION_RECEIPT_RECORD_COLUMNS;
 use sqlx::types::Json;
@@ -501,12 +501,15 @@ pub(super) async fn apply_activation_rollback_candidates(
         let retires_restore = restore
             && retirement.is_enabled()
             && candidate.prior_lifecycle == SandboxLifecycle::Restoring
-            && rollback_restore_retirable(
-                conn,
+            && pplx_space_sandbox_store::quarantine::rollback_restore_retirable(
+                &mut *conn,
                 candidate.sandbox_id,
                 candidate.execution_generation,
             )
-            .await?;
+            .await
+            .map_err(|error| {
+                Status::internal(format!("read activation rollback restore source: {error}"))
+            })?;
         let execution_state = if restore && !retires_restore {
             "suspended"
         } else {
@@ -569,48 +572,6 @@ pub(super) async fn apply_activation_rollback_candidates(
         applied.push(candidate);
     }
     Ok(applied)
-}
-
-/// Whether a rollback of a `restoring` row to `suspended` may retire
-/// `generation`'s execution as `replaced`: not an evacuation restore, the
-/// restore created the execution, and the suspended-revert proof holds. Read
-/// before the rollback converges the lifecycle, so `lifecycle_changed_at`
-/// still names the transition into the restore the node rolled back. The
-/// candidate select already holds the sandbox row `FOR UPDATE`, and this
-/// separate statement reads the snapshots and executions as of after that
-/// lock.
-async fn rollback_restore_retirable(
-    conn: &mut sqlx::PgConnection,
-    sandbox_id: SandboxId,
-    generation: i64,
-) -> Result<bool, Status> {
-    static QUERY: LazyLock<String> = LazyLock::new(|| {
-        let proof = restore_retry_suspended_revert_snapshot_exists("s");
-        sql!(
-            format!(
-                "SELECT s.evacuation_restore_target IS NULL
-                    AND EXISTS (
-                        SELECT 1
-                          FROM sandbox_k8s_executions e
-                         WHERE e.sandbox_id = s.id
-                           AND e.generation = $2
-                           AND e.created_at >= s.lifecycle_changed_at
-                    )
-                    AND {proof}
-               FROM sandboxes s
-              WHERE s.id = $1"
-            )
-            .as_str()
-        )
-    });
-    sqlx::query_scalar(sqlx::AssertSqlSafe(QUERY.as_str()))
-        .bind(sandbox_id)
-        .bind(generation)
-        .fetch_one(&mut *conn)
-        .await
-        .map_err(|error| {
-            Status::internal(format!("read activation rollback restore source: {error}"))
-        })
 }
 
 /// Clear an sbx-manager-authored pause failure after the same node publishes a

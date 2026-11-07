@@ -123,6 +123,7 @@ pub mod pod_tracking;
 pub mod quarantine;
 pub mod repair;
 pub mod restore_lease;
+pub mod restore_source;
 pub mod stuck;
 pub mod suspend;
 pub mod sweeper;

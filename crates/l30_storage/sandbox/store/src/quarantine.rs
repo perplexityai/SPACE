@@ -1,11 +1,15 @@
 //! Writes of `sandboxes` from the activation-rollback receipts a
 //! `PublishNodeState` publication consumes, after its activation-completion
-//! receipts: the rollback convergence. The caller owns the transaction, the
-//! locking reads that select candidates, the executions it retires, and the
-//! events it emits.
+//! receipts: the rollback convergence, and the read that decides whether a
+//! restore's rollback retires its execution. The caller owns the transaction,
+//! the locking reads that select candidates, the executions it retires, and
+//! the events it emits.
+
+use std::sync::LazyLock;
 
 use pplx_space_common_core::sql;
 use pplx_space_common_core::types::{NodeId, SandboxId, SandboxTransitionTargetState};
+use pplx_space_sandbox_portability::restore_retry_suspended_revert_snapshot_exists;
 
 /// Converge a sandbox whose node rolled back an activation to the receipt's
 /// `target_state`, unplaced, keeping the node as its `target_node_id` when it
@@ -47,4 +51,45 @@ pub async fn converge_activation_rollback(
     .execute(executor)
     .await?;
     Ok(converged.rows_affected() == 1)
+}
+
+/// Whether a rollback of a `restoring` row to `suspended` may retire
+/// `generation`'s execution as `replaced`: not an evacuation restore, the
+/// restore created the execution, and the suspended-revert proof
+/// ([`restore_retry_suspended_revert_snapshot_exists`]) holds. Reads only.
+///
+/// Read before the rollback converges the lifecycle, so `lifecycle_changed_at`
+/// still names the transition into the restore the node rolled back. The
+/// caller's candidate select already holds the sandbox row `FOR UPDATE`, and
+/// this separate statement reads the snapshots and executions as of after
+/// that lock.
+pub async fn rollback_restore_retirable(
+    executor: impl sqlx::PgExecutor<'_>,
+    sandbox_id: SandboxId,
+    generation: i64,
+) -> Result<bool, sqlx::Error> {
+    static QUERY: LazyLock<String> = LazyLock::new(|| {
+        let proof = restore_retry_suspended_revert_snapshot_exists("s");
+        sql!(
+            format!(
+                "SELECT s.evacuation_restore_target IS NULL
+                    AND EXISTS (
+                        SELECT 1
+                          FROM sandbox_k8s_executions e
+                         WHERE e.sandbox_id = s.id
+                           AND e.generation = $2
+                           AND e.created_at >= s.lifecycle_changed_at
+                    )
+                    AND {proof}
+               FROM sandboxes s
+              WHERE s.id = $1"
+            )
+            .as_str()
+        )
+    });
+    sqlx::query_scalar(sqlx::AssertSqlSafe(QUERY.as_str()))
+        .bind(sandbox_id)
+        .bind(generation)
+        .fetch_one(executor)
+        .await
 }
