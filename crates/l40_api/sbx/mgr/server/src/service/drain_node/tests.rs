@@ -38,6 +38,7 @@ fn plan_one(
     plan(
         &[row],
         pending_backups,
+        &LocalOnlyArtifacts::new(),
         &evacuations.iter().cloned().collect(),
         &running
             .iter()
@@ -73,7 +74,13 @@ fn every_lifecycle_plans_as_the_drain_table_says() {
         S::Failed,
     ] {
         let rows = [row("control", S::Started), row("subject", state)];
-        let plan = plan(&rows, &BTreeMap::new(), &BTreeMap::new(), &BTreeMap::new());
+        let plan = plan(
+            &rows,
+            &BTreeMap::new(),
+            &LocalOnlyArtifacts::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        );
         assert!(plan.vm, "{state}: the started control is a VM");
         assert!(
             plan.actions.contains(&PlannedAction::Suspend {
@@ -447,4 +454,121 @@ async fn a_durable_evacuation_is_recorded_and_survives_a_restart() {
     assert_eq!(first.sealed_epoch, Some(7), "the seal survives the restart");
     let report = restarted.finish_drain(7, &first, DrainScans::default());
     assert_eq!(evacuated(&report), expected);
+}
+
+const NAMED_ARTIFACT: &str = "01939e3e-9003-7000-8000-000000000001";
+
+fn insert_artifact(
+    conn: &crate::db::Connection,
+    artifact: &str,
+    origin_and_name: (&str, Option<&str>),
+    backed_up: bool,
+    state: &str,
+) {
+    let (origin, name) = origin_and_name;
+    conn.execute(
+        "INSERT INTO local_artifacts (
+             local_artifact_id, sandbox_id, artifact_kind, artifact_origin,
+             snapshot_name, local_path, created_at, backup_completed_at, state
+         ) VALUES (?1, 'sbx-a', 'full', ?2, ?3, '/tmp/a', '0', ?4, ?5)",
+        crate::db::fixture::params![artifact, origin, name, backed_up.then_some("1"), state],
+    )
+    .unwrap();
+}
+
+/// A suspended sandbox whose current snapshot is durable still holds the
+/// drain open while it keeps a named snapshot without a durable copy: the
+/// drain finishes that upload and is done once it is durable. A named
+/// snapshot already durable, or one a delete has reserved, holds nothing.
+#[tokio::test]
+async fn a_local_only_named_snapshot_holds_done_until_it_is_durable() {
+    let conn = crate::db::test_conn();
+    conn.execute(
+        "INSERT INTO sandboxes (
+             id, uuid8, state, template, user, runtime, created_at, updated_at,
+             process_env_json, auto_lifecycle_json, auto_lifecycle_state_json,
+             current_local_artifact_id, current_local_artifact_kind,
+             current_local_artifact_origin
+         ) VALUES ('sbx-a', 'uuid8', 'suspended', 'seed', 'u', 'fc', '0', '0',
+                   '{}', '{}', '{}', ?1, 'full', 'suspend')",
+        crate::db::fixture::params![FULL_ARTIFACT],
+    )
+    .unwrap();
+    insert_artifact(&conn, FULL_ARTIFACT, ("suspend", None), true, "ready");
+    insert_artifact(
+        &conn,
+        NAMED_ARTIFACT,
+        ("snapshot", Some("kept")),
+        false,
+        "ready",
+    );
+    insert_artifact(
+        &conn,
+        "01939e3e-9004-7000-8000-000000000001",
+        ("snapshot", Some("durable")),
+        true,
+        "ready",
+    );
+    insert_artifact(
+        &conn,
+        "01939e3e-9005-7000-8000-000000000001",
+        ("snapshot", Some("going")),
+        false,
+        "deleting",
+    );
+    crate::db::activation_seal::record_drain_suspend(&conn, "sbx-a", DrainPrior::Started).unwrap();
+    let (service, first) = {
+        let service = SandboxManagerService::for_test(conn);
+        service.activation_seal.seal(&service.db, 7).unwrap();
+        let first = service.activation_seal.status();
+        (service, first)
+    };
+
+    let report = service.finish_drain(7, &first, DrainScans::default());
+    assert!(!report.done, "{report:?}");
+    assert_eq!(
+        report.pending,
+        [DrainPending {
+            sandbox_id: "sbx-a".into(),
+            action: "upload".into(),
+        }]
+    );
+    assert_eq!(report.evacuated.len(), 1, "{report:?}");
+
+    service
+        .db
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE local_artifacts SET backup_completed_at = '2' WHERE local_artifact_id = ?1",
+            [NAMED_ARTIFACT],
+        )
+        .unwrap();
+    service.drain_actions.wait_idle().await;
+    let report = service.finish_drain(7, &first, DrainScans::default());
+    assert!(report.done, "{report:?}");
+}
+
+/// A local-only artifact whose sandbox has no row blocks: nothing can
+/// enqueue its upload.
+#[test]
+fn a_local_only_artifact_without_a_row_blocks() {
+    let local_only = LocalOnlyArtifacts::from([(
+        "gone".to_owned(),
+        vec![(NAMED_ARTIFACT.to_owned(), ArtifactKind::Disk)],
+    )]);
+    let plan = plan(
+        &[row("control", SandboxState::Stopped)],
+        &BTreeMap::new(),
+        &local_only,
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+    );
+    assert_eq!(
+        plan.blocked,
+        [(
+            Some("gone".to_owned()),
+            format!("local-only artifact {NAMED_ARTIFACT} has no sandbox row")
+        )]
+    );
 }
