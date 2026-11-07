@@ -3,7 +3,9 @@
 import { type ReactNode, useEffect, useRef, useState } from 'react';
 import Link from 'next/link';
 import { adminApi } from '@/lib/api';
-import { DRAIN_TERMINATES } from '@/lib/node-actions';
+import { nodeActions, type NodeAction } from '@/lib/node-actions';
+import { confirmationPhrase, formatDuration, heartbeat as nodeHeartbeat, terminateRefusal } from '@/lib/node-drain';
+import { TypedConfirmModal } from '@/components/typed-confirm-modal';
 import { useAuth } from '@/lib/auth';
 import { publicSandboxIdFromAny } from '@/lib/sandbox-id';
 import {
@@ -37,7 +39,9 @@ import {
   App,
   Tooltip,
 } from 'antd';
-import { DeleteOutlined, PauseCircleOutlined, PlayCircleOutlined, PlusOutlined, ReloadOutlined, SyncOutlined } from '@ant-design/icons';
+import {
+  DeleteOutlined, PauseCircleOutlined, PlayCircleOutlined, PlusOutlined, PoweroffOutlined, ReloadOutlined, SyncOutlined, ThunderboltOutlined,
+} from '@ant-design/icons';
 import { runtimeInstallationLines } from '@/lib/node-state';
 import type { ColumnsType } from 'antd/es/table';
 
@@ -63,7 +67,6 @@ interface NodeOccupancy {
   sandboxes_active: number | null;
   sandboxes_local_snapshots: number | null;
 }
-const DEFAULT_RECONCILIATION_PERIOD_SECS = 60;
 const RECONCILER_STALE_GRACE_SECS = 30;
 const REFRESH_CLICK_COOLDOWN_MS = 3000;
 
@@ -177,23 +180,9 @@ function heartbeatValue(node: NodeView) {
   return latestIsoTimestamp([node.status?.observed_at, node.last_heartbeat]);
 }
 
-function reconciliationPeriodSecs(node: NodeView) {
-  const intervals = node.status?.health?.node_ctl?.reconciliations
-    .map((status) => status.poll_interval_secs)
-    .filter((value) => Number.isFinite(value) && value > 0) ?? [];
-  return intervals.length > 0 ? Math.max(...intervals) : DEFAULT_RECONCILIATION_PERIOD_SECS;
-}
-
-function isNodeHeartbeatStale(node: NodeView, nowMs = Date.now()) {
-  const value = heartbeatValue(node);
-  if (!value) {
-    return true;
-  }
-  const heartbeatMs = new Date(value).getTime();
-  if (!Number.isFinite(heartbeatMs)) {
-    return true;
-  }
-  return nowMs - heartbeatMs > reconciliationPeriodSecs(node) * 2 * 1000;
+// Stale is the API's own `status.stale` rule: past the node's status `stale_after` (see `heartbeat` in `lib/node-drain.ts`).
+function isNodeHeartbeatStale(node: NodeView, nowMs: number) {
+  return nodeHeartbeat(node, nowMs).state !== 'fresh';
 }
 
 function reconcileUnavailableReason(node: NodeView) {
@@ -241,20 +230,22 @@ function renderNodeStatus(node: NodeView, nowMs: number) {
   }
   const heartbeat = heartbeatValue(node);
   const seen = formatIsoAge(heartbeat, nowMs);
-  const periodSecs = reconciliationPeriodSecs(node);
-  const stale = isNodeHeartbeatStale(node, nowMs);
+  const beat = nodeHeartbeat(node, nowMs);
+  const stale = beat.state !== 'fresh';
   const scheduling = node.status?.scheduling;
   const reachable = node.status?.reachable ?? false;
-  const current = stale
-    ? 'stale'
-    : !node.status
-      ? 'unknown'
+  const current = beat.state === 'no-status'
+    ? 'no status'
+    : stale
+      ? 'stale'
       : !reachable
         ? 'unreachable'
         : 'ok';
   const tooltip = [
     `heartbeat: ${heartbeat ? new Date(heartbeat).toLocaleString() : 'never'}`,
-    `stale threshold: ${periodSecs * 2}s without heartbeat`,
+    node.status
+      ? `stale after: ${new Date(node.status.stale_after).toLocaleString()}${beat.windowMs !== null ? ` (the node's ${formatDuration(beat.windowMs)} window)` : ''}`
+      : 'no status snapshot received',
     node.status ? `node-api: ${reachable ? 'reachable' : 'unreachable'}` : 'node-api: not loaded',
     node.status?.error,
     scheduling ? `scheduling: ${scheduling.status}` : 'scheduling: unknown',
@@ -266,7 +257,7 @@ function renderNodeStatus(node: NodeView, nowMs: number) {
     .filter(Boolean)
     .join('\n');
   const failed = stale || (node.status ? !reachable : false);
-  const color = failed ? 'red' : current === 'unknown' ? 'default' : 'green';
+  const color = failed ? 'red' : 'green';
   return (
     <Tooltip title={<span style={{ whiteSpace: 'pre-line' }}>{tooltip}</span>}>
       <Tag color={color}>
@@ -368,7 +359,7 @@ function renderReconciler(node: NodeView, nowMs: number) {
 }
 
 export default function NodesPage() {
-  const { message } = App.useApp();
+  const { message, modal } = App.useApp();
   const { substrate } = useAuth();
   const [selectedNode, setSelectedNode] = useState<NodeView | null>(null);
   const [sandboxPage, setSandboxPage] = useState<NodeSandboxPage | null>(null);
@@ -415,6 +406,11 @@ export default function NodesPage() {
   const refreshCooldownRef = useRef(false);
   const refreshCooldownTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [roleFilter, setRoleFilter] = useState<NodeRole | 'all'>('all');
+  // Applied to the loaded rows; cluster nodes have no heartbeat and are left
+  // out of either filter.
+  const [heartbeatFilter, setHeartbeatFilter] = useState<'all' | 'stale' | 'fresh'>('all');
+  // A forced drain or terminate waiting on its typed confirmation.
+  const [typedAction, setTypedAction] = useState<{ node: NodeView; item: NodeAction } | null>(null);
   const [nodeAgeReferenceMs, setNodeAgeReferenceMs] = useState(() => Date.now());
   const [form] = Form.useForm();
   const selectedRole = Form.useWatch('role', form) as NodeRole | undefined;
@@ -665,6 +661,37 @@ export default function NodesPage() {
     }
   };
 
+  // Forced drain and terminate, once typed. A refused terminate lists its
+  // reasons rather than the API's JSON.
+  const handleTypedAction = async (node: NodeView, item: NodeAction) => {
+    try {
+      await adminApi.post(`/v1/nodes/${node.id}:${item.action}`, item.body);
+      message.success(`${item.label} requested`);
+    } catch (err: any) {
+      const refused = item.action === 'terminate' ? terminateRefusal(err) : null;
+      if (refused) {
+        modal.error({
+          title: refused.title,
+          width: 560,
+          content: (
+            <ul style={{ margin: 0, paddingInlineStart: 20 }}>
+              {refused.reasons.map((reason) => <li key={reason}>{reason}</li>)}
+            </ul>
+          ),
+        });
+      } else {
+        message.error(err?.message || `${item.label} failed`);
+      }
+    } finally {
+      void loadNodes({ showLoading: false }).catch(() => {});
+      void loadOccupancy();
+    }
+  };
+
+  const visibleNodes = heartbeatFilter === 'all'
+    ? nodes
+    : nodes.filter((node) => node.role !== 'cluster' && isNodeHeartbeatStale(node, nodeAgeReferenceMs) === (heartbeatFilter === 'stale'));
+
   const nodeColumns: ColumnsType<NodeView> = [
     {
       title: 'Name',
@@ -833,18 +860,16 @@ export default function NodesPage() {
     },
     {
       title: 'Actions',
-      width: 120,
+      width: 170,
       render: (_, record) => {
-        const drainPhase = record.drain_phase;
-        // The direct/self-managed substrate refuses node drain with 501;
-        // undrain stays available there to clear a phase an earlier drain left.
-        const canDrain =
-          substrate !== 'space' &&
-          (record.role === 'worker' || record.role === 'builder') &&
-          drainPhase === null;
-        const canUndrain =
-          (record.role === 'worker' || record.role === 'builder') &&
-          (drainPhase === 'draining' || drainPhase === 'drained');
+        // The node page's rules (`nodeActions`), so the Direct substrate's
+        // 501 and the phases each action is accepted from live in one place.
+        const offered = nodeActions(record, substrate);
+        const gentleDrain = offered.find((a) => a.label === 'Drain');
+        const forcedDrain = offered.find((a) => a.label === 'Forced drain');
+        const terminate = offered.find((a) => a.action === 'terminate');
+        const canDrain = !!gentleDrain;
+        const canUndrain = offered.some((a) => a.action === 'undrain');
         return (
           <Space size={4}>
             {(record.role === 'worker' || record.role === 'builder') && (
@@ -862,16 +887,14 @@ export default function NodesPage() {
               </Tooltip>
             )}
             {canDrain && (
-              // Gentle only, deliberately. A destructive action must never sit
-              // on a confirm dialog's cancel slot — that slot universally means
+              // Gentle only here. A destructive action must never sit on a
+              // confirm dialog's cancel slot — that slot universally means
               // "back out", so the click a user reaches for to abort would
               // instead suspend and migrate every sandbox on the node. Forced
-              // drain is therefore a CLI action (`space-admin-cli drain-node --forced`),
-              // which is where the rollout runbooks already point, and not a
-              // dashboard button one misclick away from evacuating a node.
+              // drain has its own button and a typed confirmation.
               <Popconfirm
                 title="Drain this node?"
-                description={`Cordons the node and waits for its sandboxes to leave on their own. ${DRAIN_TERMINATES} Use \`space-admin-cli drain-node --forced\` to evacuate them immediately instead.`}
+                description={gentleDrain!.confirm}
                 okText="Drain"
                 placement="topRight"
                 styles={{ root: { maxWidth: 420 } }}
@@ -889,6 +912,19 @@ export default function NodesPage() {
                 </Tooltip>
               </Popconfirm>
             )}
+            {forcedDrain && (
+              <Tooltip title={record.drain_phase === 'draining' ? 'Switch to a forced drain' : 'Forced drain'}>
+                <Button
+                  type="text"
+                  size="small"
+                  className="icon-action-btn"
+                  danger
+                  icon={<ThunderboltOutlined />}
+                  aria-label="Forced drain"
+                  onClick={() => setTypedAction({ node: record, item: forcedDrain })}
+                />
+              </Tooltip>
+            )}
             {canUndrain && (
               <Tooltip title="Undrain">
                 <Button
@@ -899,6 +935,19 @@ export default function NodesPage() {
                   aria-label="Undrain"
                   loading={undrainingNodeId === record.id}
                   onClick={() => handleUndrain(record.id)}
+                />
+              </Tooltip>
+            )}
+            {terminate && (
+              <Tooltip title="Terminate">
+                <Button
+                  type="text"
+                  size="small"
+                  className="icon-action-btn"
+                  danger
+                  icon={<PoweroffOutlined />}
+                  aria-label="Terminate"
+                  onClick={() => setTypedAction({ node: record, item: terminate })}
                 />
               </Tooltip>
             )}
@@ -1017,15 +1066,42 @@ export default function NodesPage() {
           style={{ width: 140 }}
           options={[{ label: 'All roles', value: 'all' }, ...roleOptions]}
         />
+        <Select
+          aria-label="Heartbeat"
+          value={heartbeatFilter}
+          onChange={setHeartbeatFilter}
+          style={{ width: 170 }}
+          options={[
+            { label: 'Any heartbeat', value: 'all' },
+            { label: 'Stale or no heartbeat', value: 'stale' },
+            { label: 'Fresh heartbeat', value: 'fresh' },
+          ]}
+        />
+        {heartbeatFilter !== 'all' ? (
+          <Text type="secondary">{visibleNodes.length} of {nodes.length} nodes</Text>
+        ) : null}
       </Space>
       <Table
         columns={nodeColumns}
-        dataSource={nodes}
+        dataSource={visibleNodes}
         rowKey="id"
         loading={loadingNodes}
         size="small"
         pagination={tablePagination('nodes')}
         style={{ marginBottom: 24 }}
+      />
+      <TypedConfirmModal
+        open={typedAction !== null}
+        title={typedAction ? `${typedAction.item.label} ${typedAction.node.name ?? typedAction.node.id}?` : ''}
+        explanation={typedAction?.item.confirm ?? ''}
+        phrase={typedAction ? confirmationPhrase(typedAction.node) : ''}
+        okText={typedAction?.item.label ?? 'OK'}
+        onCancel={() => setTypedAction(null)}
+        onConfirm={async () => {
+          if (!typedAction) return;
+          await handleTypedAction(typedAction.node, typedAction.item);
+          setTypedAction(null);
+        }}
       />
     </div>
   );

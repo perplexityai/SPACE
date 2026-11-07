@@ -8,12 +8,13 @@ import type { Page, Request, Response, Route } from 'playwright';
 
 import {
   SECRET_PLACEHOLDER, adminFetch, carriesSecret, confirmPopover, content, fetchWithoutRedirect, pickSelect, settle, shortLabel,
-  signIn, text, visit, waitForStatus, withoutSecret, type Ctx,
+  signIn, takeToasts, text, visit, waitForStatus, withoutSecret, type Ctx,
 } from './browser.ts';
 import { TERMINAL_OPERATION_STATES } from './api.ts';
 import { verifyFixtures } from './fixtures.ts';
 import { SYNTHETIC_HEADER } from './recorder.ts';
 import { orgDisplayName, recordCreated } from './seed.ts';
+import { DRAIN_KEEP_ANNOTATION, KindNodes, drainCandidate, type AdminNode } from './nodes.ts';
 
 export interface Step {
   name: string;
@@ -1279,6 +1280,363 @@ step('nodes', ['nodes'], async (c) => {
   await visit(c, '/dashboard/nodes', 4000);
   c.rec.check(/worker/i.test(await text(c.page)), 'the nodes page lists worker nodes');
 });
+
+// ------------------------------------------------------------- node drain
+// The node page's Drain section and the drain actions. The flows drain an
+// empty Kind worker only (see `drainCandidate`), under the drain-keep override
+// the Kind terminator honours, and undrain it again; `npm run clean` does not
+// know about drains, so each flow undoes its own in `finally`.
+
+const drainCard = (page: Page) => page.locator('.ant-card', { has: page.locator('.ant-card-head-title', { hasText: /^Drain$/ }) });
+const typedModal = (page: Page) => page.locator('.ant-modal:visible', { has: page.getByLabel('Type the node name to confirm') });
+// A dialog is captured in the viewport once its opening animation ends: a
+// full-page capture can drop a dialog that is still animating.
+const shot = async (c: Ctx, name: string, { dialog = false }: { dialog?: boolean } = {}) => {
+  if (dialog) await c.page.waitForTimeout(500);
+  await c.page.screenshot({ path: `${c.rec.outDir}/${c.rec.stepName()}-${name}.png`, fullPage: !dialog });
+};
+
+async function adminNodes(c: Ctx): Promise<AdminNode[]> {
+  const res = await adminFetch(c.page, 'GET', '/admin/api/v1/nodes?include_occupancy=true', undefined, { timeoutMs: 30_000 });
+  if (res.status !== 200 || !Array.isArray(res.json)) throw new Error(`listing nodes answered ${res.status}`);
+  return res.json as AdminNode[];
+}
+
+async function adminNode(c: Ctx, id: string): Promise<AdminNode | null> {
+  const res = await adminFetch(c.page, 'GET', `/admin/api/v1/nodes/${id}?include_occupancy=false`, undefined, { timeoutMs: 15_000 });
+  return res.status === 200 ? (res.json as AdminNode) : null;
+}
+
+// Waits until the node's drain phase is one of `want` (null: no drain).
+async function waitForPhase(c: Ctx, id: string, want: (string | null)[], timeoutMs: number): Promise<string | null | undefined> {
+  const deadline = Date.now() + timeoutMs;
+  let phase: string | null | undefined;
+  while (Date.now() < deadline) {
+    phase = (await adminNode(c, id))?.drain_phase;
+    if (phase !== undefined && want.includes(phase)) return phase;
+    await c.page.waitForTimeout(1500);
+  }
+  return phase;
+}
+
+// The page also announces a refused terminate in an error toast, which the
+// runner would count as a failed check; a refusal is what these steps expect,
+// so its toast is checked and noted here instead.
+async function expectRefusalToast(c: Ctx, title: string): Promise<void> {
+  const toasts = await takeToasts(c.page);
+  for (const toast of toasts) {
+    if (toast.type === 'error' && toast.text === title) c.rec.note(`expected toast error: ${toast.text}`);
+    else c.rec.check(toast.type !== 'error' && toast.type !== 'warning', `toast ${toast.type}: ${toast.text}`);
+  }
+  c.rec.check(toasts.some((t) => t.type === 'error' && t.text === title), `the refusal is announced: ${title}`);
+}
+
+// Waits until the Drain section shows `pattern`, as the page's own poll
+// brings it in.
+async function waitForSection(c: Ctx, pattern: RegExp, timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (pattern.test(await drainCard(c.page).innerText().catch(() => ''))) return true;
+    await c.page.waitForTimeout(1000);
+  }
+  return false;
+}
+
+// Waits until the Kubernetes Node's `spec.unschedulable` reads `want`.
+async function waitForUnschedulable(c: Ctx, kube: KindNodes, name: string, want: boolean, timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (kube.unschedulable(name) === want) return true;
+    await c.page.waitForTimeout(1000);
+  }
+  return kube.unschedulable(name) === want;
+}
+
+// Cordons and uncordons the worker through the API and checks that the
+// cordon shows up on the Node the kube context reads, which shows the context
+// and the API are one cluster. The uncordon is sent on every path once the
+// cordon has been; if it is refused or does not reach the Node, the step fails
+// and the worker may stay cordoned.
+async function cordonReachesNode(c: Ctx, node: AdminNode, kube: KindNodes): Promise<boolean> {
+  const name = node.k8s_node_name!;
+  if (node.cordoned === true || kube.unschedulable(name)) {
+    c.rec.check(false, 'the worker is already cordoned');
+    return false;
+  }
+  let reached = false;
+  try {
+    const cordon = await adminFetch(c.page, 'POST', `/admin/api/v1/nodes/${node.id}:cordon`);
+    c.rec.note(`probe cordon answered ${cordon.status}`);
+    reached = await waitForUnschedulable(c, kube, name, true, 15_000);
+  } finally {
+    const uncordon = await adminFetch(c.page, 'POST', `/admin/api/v1/nodes/${node.id}:uncordon`);
+    c.rec.note(`probe uncordon answered ${uncordon.status}`);
+  }
+  c.rec.check(reached, "the API's cordon reached the worker's Node through the kube context");
+  if (!reached) return false;
+  const released = await waitForUnschedulable(c, kube, name, false, 15_000);
+  c.rec.check(released, "the API's uncordon reached the worker's Node");
+  return released;
+}
+
+// Picks a worker, proves the kube context reads the API's cluster, claims the
+// drain-keep override with a token of its own, refusing a worker that already
+// has one, runs `body`, then cleans up with `releaseDrainableWorker`.
+// Records why when there is no worker it may drain; that is not a pass.
+async function withDrainableWorker(c: Ctx, body: (node: AdminNode, kube: KindNodes) => Promise<void>): Promise<void> {
+  const picked = drainCandidate(await adminNodes(c));
+  if (!('node' in picked)) {
+    c.rec.check(false, `a Kind worker this step may drain exists: ${picked.reason}`);
+    return;
+  }
+  const node = picked.node;
+  const name = node.k8s_node_name!;
+  const kube = new KindNodes(c.config.kubeContext);
+  kube.requireLocalNode(name);
+  if (!(await cordonReachesNode(c, node, kube))) return;
+  const claim = kube.claimDrainKeep(name);
+  if ('held' in claim) {
+    c.rec.check(false, `${name} already carries ${DRAIN_KEEP_ANNOTATION}=${claim.held}; it is left as it is and nothing is drained`);
+    return;
+  }
+  c.rec.note(`draining worker ${name} (${node.id}), which holds no sandboxes, under ${DRAIN_KEEP_ANNOTATION}=${claim.token}`);
+  try {
+    await body(node, kube);
+  } finally {
+    await releaseDrainableWorker(c, node, kube, claim.token);
+  }
+}
+
+// Undrains the worker unless the API shows it with no drain phase, then
+// removes the override once it does. It runs however the body ended, so it
+// records each error as a failed check and goes on where that is safe, and
+// never throws: the body's own error stays the step's error.
+async function releaseDrainableWorker(c: Ctx, node: AdminNode, kube: KindNodes, token: string): Promise<void> {
+  const name = node.k8s_node_name!;
+  const failed = (what: string, error: unknown) =>
+    c.rec.check(false, `cleanup: ${what} failed: ${error instanceof Error ? error.message.split('\n')[0] : String(error)}`);
+  let phase: string | null | undefined;
+  try {
+    phase = (await adminNode(c, node.id))?.drain_phase;
+  } catch (error) {
+    failed('reading the node', error);
+  }
+  // A phase that could not be read may still be a drain.
+  if (phase === undefined || phase === 'draining' || phase === 'drained') {
+    try {
+      const undrain = await adminFetch(c.page, 'POST', `/admin/api/v1/nodes/${node.id}:undrain`);
+      c.rec.note(`cleanup undrain answered ${undrain.status}`);
+    } catch (error) {
+      failed('the undrain', error);
+    }
+  }
+  let left: string | null | undefined;
+  try {
+    left = await waitForPhase(c, node.id, [null], 30_000);
+  } catch (error) {
+    failed('reading the drain phase', error);
+  }
+  c.rec.check(left === null, 'the worker is left with no drain phase');
+  if (left !== null) {
+    c.rec.note(`the drain-keep override ${token} stays on ${name} because ${left === undefined ? 'the API did not report the node' : `the node is still ${left}`}`);
+    return;
+  }
+  try {
+    c.rec.check(kube.releaseDrainKeep(name, token), `the drain-keep override on ${name} still carried this claim's token and was removed`);
+  } catch (error) {
+    failed('removing the drain-keep override', error);
+  }
+}
+
+step('nodes-heartbeat', ['nodes'], async (c) => {
+  await visit(c, '/dashboard/nodes', 4000);
+  const tags = content(c.page).locator('td .ant-tag', { hasText: / · seen / });
+  const shown = await tags.count();
+  c.rec.check(shown > 0, 'the Status column shows a heartbeat tag for each worker and builder');
+  const notFresh = await content(c.page).locator('td .ant-tag', { hasText: /^(stale|no status) · seen / }).count();
+  c.rec.note(`${notFresh} of ${shown} nodes read stale or without a status snapshot`);
+  await tags.first().hover();
+  c.rec.check(/stale after: |no status snapshot received/.test(await c.page.locator('.ant-tooltip:visible').innerText().catch(() => '')), "the heartbeat tooltip names the node's stale_after");
+  const filter = content(c.page).locator('.ant-select', { has: c.page.getByLabel('Heartbeat') });
+  c.rec.check(await filter.count() === 1, 'the list has a heartbeat filter');
+  await pickSelect(c.page, filter, 'Stale or no heartbeat');
+  await settle(c.page, 800);
+  const filtered = await content(c.page).locator('td .ant-tag', { hasText: / · seen / }).count();
+  const filteredStale = await content(c.page).locator('td .ant-tag', { hasText: /^(stale|no status) · seen / }).count();
+  c.rec.check(filtered === filteredStale && filtered === notFresh, `the stale filter keeps exactly the stale nodes (${filtered} of ${notFresh})`);
+  await shot(c, 'stale-filter');
+  await pickSelect(c.page, filter, 'Fresh heartbeat');
+  await settle(c.page, 800);
+  c.rec.check(await content(c.page).locator('td .ant-tag', { hasText: /^(stale|no status) · seen / }).count() === 0, 'the fresh filter shows no stale node');
+  await pickSelect(c.page, filter, 'Any heartbeat');
+  await settle(c.page, 800);
+});
+
+step('node-drain-section', ['nodes'], async (c) => {
+  const workers = (await adminNodes(c)).filter((n) => n.role === 'worker');
+  if (!workers.length) return c.rec.check(false, 'a worker node exists');
+  const node = workers.sort((a, b) => (b.sandboxes_active ?? 0) - (a.sandboxes_active ?? 0))[0];
+  await visit(c, `/dashboard/nodes/${node.id}`, 4000);
+  const card = drainCard(c.page);
+  c.rec.check(await card.count() === 1, "the node page has a Drain section");
+  const t = (await card.innerText()).replace(/\s+/g, ' ');
+  for (const label of ['Phase', 'Mode', 'Started', 'Last error', 'Heartbeat', 'Kubernetes Node', 'Sandboxes on the node', 'History']) {
+    c.rec.check(t.includes(label), `the Drain section shows ${label}`);
+  }
+  c.rec.check(/\d+(s|m \d+s|h \d+m|d \d+h) ago|never/.test(t), 'the heartbeat age is shown');
+  c.rec.check(/present|not reported/.test(t), 'whether the Kubernetes Node is present is shown');
+  c.rec.check(/admin audit log/.test(t), 'the history says where it comes from and what it leaves out');
+  c.rec.check(/updated \S+/.test(t), 'the section says when it was last read');
+});
+
+step('node-remaining-sandboxes', ['nodes'], async (c) => {
+  const nodes = await adminNodes(c);
+  const node = nodes.filter((n) => n.role === 'worker').sort((a, b) => (b.sandboxes_active ?? 0) - (a.sandboxes_active ?? 0))[0];
+  if (!node) return c.rec.check(false, 'a worker node exists');
+  await visit(c, `/dashboard/nodes/${node.id}`, 4000);
+  const summary = (await drainCard(c.page).innerText()).replace(/\s+/g, ' ');
+  const listed = c.page.locator('#node-sandboxes a[href^="/dashboard/sandboxes/"]');
+  const count = await listed.count();
+  if ((node.sandboxes_active ?? 0) > 0) {
+    c.rec.check(count > 0, `the node's sandboxes are listed (${count})`);
+    c.rec.check(/listed below/.test(summary), 'the Drain section counts them by lifecycle');
+    const first = await listed.first().getAttribute('href');
+    await listed.first().click();
+    await c.page.waitForURL(/\/dashboard\/sandboxes\//, { timeout: 15_000 }).catch(() => {});
+    c.rec.check(c.page.url().endsWith(first ?? '-'), "a listed sandbox links to the sandbox's page");
+  } else {
+    c.rec.check(/none placed on this node/.test(summary) || count > 0, 'an empty node says so');
+  }
+});
+
+step('node-forced-drain-undrain', ['nodes', 'flows'], async (c) => {
+  await withDrainableWorker(c, async (node, kube) => {
+    await visit(c, `/dashboard/nodes/${node.id}`, 3000);
+    const phrase = node.name ?? node.id;
+    await content(c.page).getByRole('button', { name: 'Forced drain' }).click();
+    const dialog = typedModal(c.page);
+    await dialog.waitFor({ timeout: 5000 });
+    const ok = dialog.getByRole('button', { name: 'Forced drain' });
+    c.rec.check(/evacuates its sandboxes now/.test(await dialog.innerText()), 'the confirmation says the drain evacuates sandboxes now');
+    c.rec.check(await ok.isDisabled(), 'Forced drain is disabled before the name is typed');
+    await dialog.getByLabel('Type the node name to confirm').fill(phrase.slice(0, -1));
+    c.rec.check(await ok.isDisabled(), 'a partial name does not enable Forced drain');
+    await dialog.getByLabel('Type the node name to confirm').fill(phrase);
+    c.rec.check(await ok.isEnabled(), 'the exact name enables Forced drain');
+    await shot(c, 'confirmation', { dialog: true });
+    const sent = nextPost(c.page, (p) => p.endsWith(`/nodes/${node.id}:drain`));
+    await ok.click();
+    const answer = await sent;
+    c.rec.check(answer?.status() === 200, `the forced drain is accepted (${answer?.status()})`);
+    c.rec.check(JSON.stringify(answer?.request().postDataJSON()) === '{"mode":"forced"}', 'the request asks for mode forced');
+    // An empty worker can pass through draining faster than the page's poll.
+    c.rec.check(await waitForSection(c, /Phase\s+(draining|drained)/, 15_000), 'the Drain section shows the drain (draining, or drained already)');
+    c.rec.check(/Mode forced/.test((await drainCard(c.page).innerText()).replace(/\s+/g, ' ')), 'the Drain section shows mode forced');
+    c.rec.check(kube.unschedulable(node.k8s_node_name!), 'the Kubernetes Node is cordoned');
+    await shot(c, 'draining');
+    c.rec.check(await waitForPhase(c, node.id, ['drained'], 120_000) === 'drained', 'the empty worker reaches drained');
+    c.rec.check(await waitForSection(c, /Phase\s+drained/, 15_000), "the page's poll shows drained without a reload");
+    c.rec.check(/drain/.test(await drainCard(c.page).locator('.ant-table-tbody').innerText()), 'the history lists the drain');
+    await shot(c, 'drained');
+    await content(c.page).getByRole('button', { name: 'Undrain' }).click();
+    const confirm = c.page.locator('.ant-modal-confirm:visible');
+    await confirm.waitFor({ timeout: 5000 });
+    const undrain = nextPost(c.page, (p) => p.endsWith(`/nodes/${node.id}:undrain`));
+    await confirm.getByRole('button', { name: 'Undrain' }).click();
+    c.rec.check((await undrain)?.status() === 200, 'the undrain is accepted');
+    c.rec.check(await waitForSection(c, /Phase\s+not draining/, 15_000), 'the Drain section shows not draining');
+    c.rec.check(!kube.unschedulable(node.k8s_node_name!), 'the Kubernetes Node is schedulable again');
+    await waitForSection(c, /undrain/, 20_000);
+    c.rec.check(/undrain/.test(await drainCard(c.page).locator('.ant-table-tbody').innerText()), 'the history lists the undrain');
+  });
+}, true);
+
+step('node-terminate-refused', ['nodes', 'flows'], async (c) => {
+  await withDrainableWorker(c, async (node) => {
+    const phrase = node.name ?? node.id;
+    const drained = await adminFetch(c.page, 'POST', `/admin/api/v1/nodes/${node.id}:drain`, { mode: 'forced' });
+    c.rec.check(drained.status === 200, `the worker is drained through the API (${drained.status})`);
+    if (await waitForPhase(c, node.id, ['drained'], 120_000) !== 'drained') return c.rec.check(false, 'the worker reaches drained');
+    await visit(c, `/dashboard/nodes/${node.id}`, 3000);
+    const terminateUrl = (url: URL) => url.pathname.endsWith(`/nodes/${node.id}:terminate`);
+
+    // 1. The occupancy refusal, answered by the step: nothing is sent. The
+    // body has the keys `terminate_conflict_body` emits.
+    const synthetic = async (route: Route) => route.fulfill({
+      status: 409,
+      contentType: 'application/json',
+      headers: { [SYNTHETIC_HEADER]: '1' },
+      body: JSON.stringify({
+        error: 'node still holds sandboxes; terminating would destroy resident sandboxes or strand local-disk snapshots',
+        sandboxes_active: 2, sandboxes_drain_blockers: 1, sandboxes_local_snapshots: 1,
+      }),
+    });
+    await c.page.route(terminateUrl, synthetic);
+    try {
+      await content(c.page).getByRole('button', { name: 'Terminate' }).click();
+      const dialog = typedModal(c.page);
+      await dialog.waitFor({ timeout: 5000 });
+      c.rec.check(/cannot be undrained/.test(await dialog.innerText()), 'the confirmation says a terminating node cannot be undrained');
+      c.rec.check(await dialog.getByRole('button', { name: 'Terminate' }).isDisabled(), 'Terminate is disabled before the name is typed');
+      await dialog.getByLabel('Type the node name to confirm').fill(phrase);
+      await shot(c, 'confirmation', { dialog: true });
+      await dialog.getByRole('button', { name: 'Terminate' }).click();
+      const alert = drainCard(c.page).locator('.ant-alert-error');
+      await alert.waitFor({ timeout: 10_000 });
+      const reasons = await alert.locator('li').allInnerTexts();
+      c.rec.note('SYNTHETIC: the occupancy refusal is a 409 the step answers itself, with the keys the API emits; no terminate request was sent');
+      c.rec.check(reasons.length === 2 && /2 sandboxes still occupy/.test(reasons[0]) && /1 sandbox is held/.test(reasons[1]), 'an occupancy refusal is listed as readable reasons');
+      c.rec.check(!/[{}"]/.test(await alert.innerText()), 'the refusal shows no raw JSON');
+      await expectRefusalToast(c, 'Terminate refused: the node still holds sandboxes');
+      // The confirmation closes once the page has reloaded the node.
+      await typedModal(c.page).waitFor({ state: 'hidden', timeout: 15_000 }).catch(() => {});
+      await shot(c, 'occupancy-refusal');
+    } finally {
+      await c.page.unroute(terminateUrl, synthetic);
+    }
+
+    // 2. The phase gate, from the API: the node is undrained while the
+    // confirmation is open, so the terminate the page then sends is refused.
+    // A guard aborts the request unless the API reports the node undrained
+    // just before the request is forwarded. The API's answer is handed to the
+    // page as it came, marked so the recorder does not count the 409 this
+    // step expects; the step checks its status.
+    let refusedStatus: number | null = null;
+    const guard = async (route: Route) => {
+      const phase = (await adminNode(c, node.id))?.drain_phase;
+      if (phase !== null) {
+        c.rec.check(false, `the terminate was not sent: the node is still ${phase}`);
+        return route.abort();
+      }
+      const res = await fetchWithoutRedirect(route);
+      if (!res) return;
+      refusedStatus = res.status();
+      return route.fulfill({ response: res, headers: { ...res.headers(), [SYNTHETIC_HEADER]: '1' } });
+    };
+    await c.page.route(terminateUrl, guard);
+    try {
+      await content(c.page).getByRole('button', { name: 'Terminate' }).click();
+      const dialog = typedModal(c.page);
+      await dialog.waitFor({ timeout: 5000 });
+      const undrained = await adminFetch(c.page, 'POST', `/admin/api/v1/nodes/${node.id}:undrain`);
+      c.rec.check(undrained.status === 200, 'the node is undrained while the confirmation is open');
+      if (await waitForPhase(c, node.id, [null], 30_000) !== null) return c.rec.check(false, 'the undrain cleared the phase');
+      await dialog.getByLabel('Type the node name to confirm').fill(phrase);
+      await dialog.getByRole('button', { name: 'Terminate' }).click();
+      const alert = drainCard(c.page).locator('.ant-alert-error', { hasText: 'not drained' });
+      await alert.waitFor({ timeout: 15_000 });
+      c.rec.check(refusedStatus === 409, `the API refuses the terminate (${refusedStatus})`);
+      const reasons = await alert.locator('li').allInnerTexts();
+      c.rec.check(reasons.includes('The node is not draining.') && reasons.some((r) => /accepted only from: drained/.test(r)), 'the phase refusal is listed as readable reasons');
+      await expectRefusalToast(c, 'Terminate refused: the node is not drained');
+      // The confirmation closes once the page has reloaded the node.
+      await typedModal(c.page).waitFor({ state: 'hidden', timeout: 15_000 }).catch(() => {});
+      await shot(c, 'phase-refusal');
+    } finally {
+      await c.page.unroute(terminateUrl, guard);
+    }
+  });
+}, true);
 
 // ------------------------------------------------------------ other roles
 for (const [local, label] of [['acme-admin', 'a tenant organization admin'], ['ops-viewer', 'a member of the managing organization']] as const) {

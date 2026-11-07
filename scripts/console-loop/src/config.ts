@@ -32,6 +32,9 @@ export interface Config {
   datadogLogsConfigured: boolean;
   // Set by --allow-remote: act on a stack that is not on this host.
   allowRemote: boolean;
+  // The Kind cluster's kube context, for the node drain steps' drain-keep
+  // override (see nodes.ts).
+  kubeContext: string;
 }
 
 // A prefix names seeded objects and the seed state file, so it is kept to
@@ -53,6 +56,7 @@ export function loadConfig(args: string[]): Config {
     prefix,
     datadogLogsConfigured: (env.SPACE_UI_DATADOG_LOGS_URL ?? '').trim() !== '',
     allowRemote: flag(args, 'allow-remote'),
+    kubeContext: option(args, 'kube-context', env.CONSOLE_LOOP_KUBE_CONTEXT ?? 'kind-space-local')!,
   };
 }
 
