@@ -188,9 +188,6 @@ impl K8sStore {
                     K8sNodeRegistrationStep::ClearDrain => {
                         "failed to clear drain state on UID change"
                     }
-                    K8sNodeRegistrationStep::RecordInstance => {
-                        "failed to record Kubernetes node instance"
-                    }
                     K8sNodeRegistrationStep::UpsertNodeK8s => {
                         "failed to upsert Kubernetes node metadata"
                     }

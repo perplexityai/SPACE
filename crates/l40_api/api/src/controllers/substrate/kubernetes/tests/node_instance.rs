@@ -1,7 +1,7 @@
 //! The admin inventory listing and pod placement register a Kubernetes node
 //! with the EC2 instance its Node's `providerID` names, as node sync does: a
-//! Node under a new UID on another instance keeps the old instance with the
-//! old UID, and a Node that names no instance leaves the recorded one alone.
+//! Node under a new UID on another instance replaces the recorded instance,
+//! and a Node that names no instance leaves the recorded one alone.
 
 use k8s_openapi::api::core::v1::{
     Node, NodeAddress as K8sNodeAddress, NodeSpec as K8sNodeSpec, NodeStatus as K8sNodeStatus, Pod,
@@ -69,40 +69,20 @@ async fn seed(pool: &PgPool) -> TestResult<NodeId> {
     Ok(node_id)
 }
 
-type Recorded = (
-    (Option<String>, Option<String>),
-    Vec<(String, Option<String>)>,
-);
+type Recorded = (Option<String>, Option<String>);
 
-/// The row's `(k8s_node_uid, instance_id)` and every superseded
-/// `(instance_id, k8s_node_uid)`, oldest first.
+/// The row's `(k8s_node_uid, instance_id)`.
 async fn recorded(pool: &PgPool, node_id: NodeId) -> TestResult<Recorded> {
-    let row = sqlx::query_as(sql!(
+    Ok(sqlx::query_as(sql!(
         "SELECT k8s_node_uid, instance_id FROM node_k8s WHERE node_id = $1"
     ))
     .bind(node_id)
     .fetch_one(pool)
-    .await?;
-    let superseded = sqlx::query_as(sql!(
-        "SELECT instance_id, k8s_node_uid FROM node_k8s_superseded_instances
-         WHERE node_id = $1 ORDER BY superseded_at, id"
-    ))
-    .bind(node_id)
-    .fetch_all(pool)
-    .await?;
-    Ok((row, superseded))
+    .await?)
 }
 
 fn expected(instance_id: &str) -> Recorded {
-    let superseded = if instance_id == "i-0a" {
-        vec![]
-    } else {
-        vec![("i-0a".to_string(), Some("uid-1".to_string()))]
-    };
-    (
-        (Some("uid-2".to_string()), Some(instance_id.to_string())),
-        superseded,
-    )
+    (Some("uid-2".to_string()), Some(instance_id.to_string()))
 }
 
 #[tokio::test(flavor = "current_thread")]
