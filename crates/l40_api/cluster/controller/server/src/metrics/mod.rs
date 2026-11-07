@@ -10,6 +10,7 @@ pub mod node_group_mirror;
 pub mod node_service_readiness;
 pub mod operations;
 pub mod reconcile;
+pub mod runtime_upgrade;
 pub mod sandbox;
 pub mod snapshot_storage_sweeper;
 pub mod tombstone;

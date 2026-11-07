@@ -60,6 +60,7 @@ pub enum Loop {
     WarmPoolOrphanGc,
     OrphanedRestorePodGc,
     LostStartedSandboxes,
+    RuntimeUpgrade,
 }
 
 impl Loop {
@@ -73,6 +74,7 @@ impl Loop {
             Self::WarmPoolOrphanGc => "warm_pool_orphan_gc",
             Self::OrphanedRestorePodGc => "orphaned_restore_pod_gc",
             Self::LostStartedSandboxes => "lost_started_sandboxes",
+            Self::RuntimeUpgrade => "runtime_upgrade",
         }
     }
 }

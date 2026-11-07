@@ -54,6 +54,13 @@ Exemplar: `crates/l30_storage/sandbox/store` (`pplx-space-sandbox-store`, the
   sets: a drain gate and the drained-node terminator that disagree park a node
   in `drained`. Build the statement once, bind every value, and keep the rest
   of the statement whole at its query site.
+- Another is `pplx_space_node_status_store::environment_evidence`, the single
+  definition of whether a node status snapshot is evidence of the node's
+  published environments now. Interpolate it as built rather than re-spelling
+  its freshness rule, and add the caller's own `reachable IS TRUE` beside it:
+  two readers that judge a node's environments differently act on nodes the
+  other wouldn't. Build the statement once, bind every value, and keep the
+  rest of the statement whole at its query site.
 - The last is the column list of one row type read from one table: a shared
   constant of that table's bare column names, with no expressions, aliases, or
   joined columns, matching one `FromRow` struct field for field. Interpolate it
