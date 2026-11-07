@@ -12,9 +12,10 @@ use pplx_space_accounts::{NodeId, SandboxOwnerSource};
 use pplx_space_common_core::types::{
     ArtifactVersion, AutoLifecyclePolicy, AutoLifecycleRuntimeState, AutoLifecycleStatus, Digest,
     EcwCredentialEpoch, NodeAddress, NodeManagedBy, NodePoolName, NodeRole, PodUid,
-    SandboxActivationAttemptId, SandboxAutoLifecyclePatch, SemVer, TemplateReference,
+    SandboxActivationAttemptId, SandboxAutoLifecyclePatch, TemplateReference,
 };
 use pplx_space_net_common::{NetworkPolicy, NetworkPolicyV1};
+use pplx_space_semver::SemVer;
 
 use crate::user_role::UserRole;
 use pplx_space_cluster_pool::PoolConfigOwner;

@@ -126,6 +126,7 @@ pplx-space-sandbox-residency = { workspace = true }
 pplx-space-sandbox-store = { workspace = true }
 pplx-space-sandbox-teardown = { workspace = true }
 pplx-space-sbx-mgr-client = { workspace = true }
+pplx-space-semver = { workspace = true, features = ["serde"] }
 pplx-space-service-lifecycle = { workspace = true }
 pplx-space-snapshot-store = { workspace = true }
 pplx-space-state-reconciliation = { workspace = true }

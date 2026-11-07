@@ -3,8 +3,8 @@
 //!
 //! It wraps the `semver` crate's `Version`; its serde form and its Postgres
 //! (sqlx) value are the version's text. Nothing in it is specific to SPACE's
-//! domain model, so it lives apart from `pplx-space-common-core`, which
-//! re-exports it as `types::version` and `types::{SemVer, SemVerParseError}`.
+//! domain model, so it lives in its own crate: import [`SemVer`] and
+//! [`SemVerParseError`] from here.
 
 use std::fmt;
 use std::str::FromStr;
