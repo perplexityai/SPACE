@@ -485,16 +485,73 @@ fn initial_environment_reference(
     }
 }
 
+/// Template cache partition of the build a sandbox with this binding was
+/// created from. A sandbox boots its template's binding, so the two agree
+/// until a runtime upgrade rebinds the sandbox; callers whose guess then
+/// misses fall back through their existing lineage checks.
+pub(crate) fn sandbox_template_partition(
+    execution: Option<&pplx_space_common_core::types::ExecutionMetadata>,
+) -> pplx_space_common_core::types::TemplateCachePartition {
+    pplx_space_node_runtime_core::catalog::template_cache_partition(
+        execution.and_then(|execution| execution.environment()),
+    )
+}
+
+/// Where a capture sandbox's base snapshot is published: under the cache
+/// partition of the environment it booted, so a twin's capture never
+/// overwrites its legacy sibling's snapshot.
+pub(crate) fn template_base_snapshot_dir(
+    template: &str,
+    content_hash: &str,
+    partition: pplx_space_common_core::types::TemplateCachePartition,
+    vcpu: u32,
+    memory_mib: u32,
+) -> String {
+    pplx_space_common_core::host::linux::paths::template_snapshot_dir(
+        template,
+        content_hash,
+        partition,
+        vcpu,
+        memory_mib,
+    )
+}
+
+/// The cache partition a template base snapshot is published under: the one
+/// template-manager names for the build the capture booted, else the legacy
+/// one. A legacy-layout build bound to another environment is adopted in the
+/// legacy partition, so the legacy partition is accepted whatever the
+/// capture's binding; any other partition must be the binding's own, so a
+/// snapshot is never filed under an environment it wasn't captured in.
+pub(crate) fn template_snapshot_partition(
+    requested: Option<&str>,
+    execution: Option<&pplx_space_common_core::types::ExecutionMetadata>,
+) -> Result<pplx_space_common_core::types::TemplateCachePartition, tonic::Status> {
+    use pplx_space_common_core::types::TemplateCachePartition;
+    let Some(requested) = requested else {
+        return Ok(TemplateCachePartition::Legacy);
+    };
+    let partition = TemplateCachePartition::from_key(requested).map_err(|error| {
+        tonic::Status::invalid_argument(format!(
+            "invalid template snapshot cache_partition {requested:?}: {error}"
+        ))
+    })?;
+    if partition != TemplateCachePartition::Legacy
+        && partition != sandbox_template_partition(execution)
+    {
+        return Err(tonic::Status::failed_precondition(format!(
+            "template snapshot cache_partition {partition} isn't the capture sandbox's"
+        )));
+    }
+    Ok(partition)
+}
+
 /// Fleet placement and pool identity must understand a complete binding before
 /// a non-default template can use those paths, independently of snapshot support.
 pub(super) fn is_non_default_execution(
     execution: &pplx_space_common_core::types::ExecutionMetadata,
 ) -> bool {
-    // Only the x86-64 initial binding is the default, on every architecture.
-    execution.environment().is_some_and(|reference| {
-        Some(reference)
-            != initial_environment_reference(pplx_space_common_core::types::Arch::X86_64)
-    })
+    sandbox_template_partition(Some(execution))
+        != pplx_space_common_core::types::TemplateCachePartition::Legacy
 }
 
 /// Bound environments require qualified memory-state support before any

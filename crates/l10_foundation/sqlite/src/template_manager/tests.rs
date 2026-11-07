@@ -2,7 +2,20 @@ use std::sync::LazyLock;
 
 use super::*;
 
-static BUNDLED: Migrator = sqlx::migrate!("../../../db/template-manager");
+/// This tree's catalog, which bundles the partition migration again.
+static CATALOG: Migrator = sqlx::migrate!("../../../db/template-manager");
+/// The catalog of a release that doesn't bundle the partition migration, as
+/// the releases these reversals serve don't.
+static BUNDLED: LazyLock<Migrator> = LazyLock::new(|| {
+    Migrator::with_migrations(
+        CATALOG
+            .migrations
+            .iter()
+            .filter(|migration| migration.version != VERSION)
+            .cloned()
+            .collect(),
+    )
+});
 static COMMON: Migrator = sqlx::migrate!("../../../db/common");
 /// The catalog of a release that bundles the retired migration.
 static PARTITIONED: LazyLock<Migrator> = LazyLock::new(|| {
@@ -147,7 +160,7 @@ async fn a_legacy_only_partitioned_database_reverses_and_reapplies() {
     // Rolling back, forward again, then back once more is image-only each way.
     for (service, expected, versions) in [
         (
-            &BUNDLED,
+            &*BUNDLED,
             &bundled,
             vec![crate::baselines::PUBLIC_SQLITE_BASELINE],
         ),
@@ -157,7 +170,7 @@ async fn a_legacy_only_partitioned_database_reverses_and_reapplies() {
             vec![crate::baselines::PUBLIC_SQLITE_BASELINE, VERSION],
         ),
         (
-            &BUNDLED,
+            &*BUNDLED,
             &bundled,
             vec![crate::baselines::PUBLIC_SQLITE_BASELINE],
         ),
@@ -304,7 +317,7 @@ fn dirty_ref_revisions_is_the_migration_the_next_release_records() {
 #[test]
 fn every_listed_migration_matches_the_catalog_that_bundles_it() {
     for unbundled in UNBUNDLED {
-        if let Some(bundled) = BUNDLED.iter().find(|migration| {
+        if let Some(bundled) = CATALOG.iter().find(|migration| {
             migration.version == unbundled.version && migration.migration_type.is_up_migration()
         }) {
             assert_eq!(

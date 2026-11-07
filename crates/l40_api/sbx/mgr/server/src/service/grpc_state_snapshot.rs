@@ -1698,6 +1698,15 @@ impl SandboxManagerService {
                     &sandbox_id,
                     &initial_sandbox.template,
                     content_hash,
+                    // The parent's partition follows the sandbox's binding, as
+                    // the snapshot sidecar records it, else as the row does;
+                    // node-manager falls back to the legacy build when the
+                    // sandbox descends from it.
+                    super::tail_support::codec_environment(
+                        &sandbox_id,
+                        super::tail_support::sandbox_snapshot_execution_metadata(initial_sandbox),
+                        initial_sandbox.execution_metadata.as_ref(),
+                    ),
                     snapshot_name.as_str(),
                     &paths.artifact,
                     &self.node_manager,
@@ -1895,7 +1904,7 @@ impl SandboxManagerService {
         let wake_lock = self.auto_lifecycle.wake_lock(&sandbox_id);
         let _guard = wake_lock.lock().await;
 
-        let (sandbox, content_hash) = {
+        let (sandbox, content_hash, partition) = {
             let db = self.db_conn()?;
             let sandbox = crate::db::read::sandbox(&db, &sandbox_id)
                 .map_err(|e| Status::internal(format!("db error: {e}")))?
@@ -1917,12 +1926,17 @@ impl SandboxManagerService {
             })?;
             validate_path_component("template", &sandbox.template)?;
             validate_path_component("content_hash", &content_hash)?;
+            // Before checkpointing: a refused partition costs no capture.
+            let partition = super::validation::template_snapshot_partition(
+                req.cache_partition.as_deref(),
+                sandbox.execution_metadata.as_ref(),
+            )?;
             sandbox
                 .state
                 .transition(SandboxState::Checkpointing)
                 .map_err(Status::from)?;
             begin_template_base_snapshot_state(&db, &sandbox.id)?;
-            (sandbox, content_hash)
+            (sandbox, content_hash, partition)
         };
 
         let staging_dir = format!(
@@ -2003,10 +2017,10 @@ impl SandboxManagerService {
 
             let snapshot_memory_mib =
                 snapshot_file_memory_mib(&staging_dir_path.join("snapshot.base"))?;
-            let snapshot_dir = pplx_space_common_core::host::linux::paths::template_snapshot_dir(
+            let snapshot_dir = super::validation::template_base_snapshot_dir(
                 &sandbox.template,
                 &content_hash,
-                pplx_space_common_core::types::TemplateCachePartition::Legacy,
+                partition,
                 req.vcpu,
                 snapshot_memory_mib,
             );

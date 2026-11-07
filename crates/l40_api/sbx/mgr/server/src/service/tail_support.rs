@@ -102,6 +102,32 @@ pub(super) fn sandbox_snapshot_execution_metadata_in(
     Ok(snapshot)
 }
 
+/// Environment whose template build is the parent of a parent-relative
+/// rootfs stream: the snapshot sidecar's binding when it reads, else the
+/// sandbox row's durable binding. Dropping to `None` on an unreadable sidecar
+/// would name the legacy build, the wrong parent for a sandbox bound to
+/// another environment.
+pub(super) fn codec_environment(
+    sandbox_id: &str,
+    sidecar: Result<
+        pplx_space_common_core::types::SnapshotExecutionMetadata,
+        RuntimeArtifactReadError,
+    >,
+    row: Option<&pplx_space_common_core::types::ExecutionMetadata>,
+) -> Option<pplx_space_common_core::types::EnvironmentReference> {
+    match sidecar {
+        Ok(snapshot) => snapshot.execution().environment(),
+        Err(error) => {
+            tracing::warn!(
+                sandbox_id,
+                %error,
+                "snapshot execution metadata is unreadable; taking the parent build's environment from the sandbox row"
+            );
+            row.and_then(|execution| execution.environment())
+        }
+    }
+}
+
 pub(super) fn activation_metadata_json(
     sandbox: &crate::db::SandboxRow,
     cpu_budget: Option<pplx_space_common_core::types::VcpuCount>,

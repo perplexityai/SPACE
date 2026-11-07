@@ -196,10 +196,11 @@ pub fn gc_deleted(template: &str) {
 }
 
 /// One per eviction candidate that was skipped at execute time. The
-/// `reason` is one of the five labels the execute-time checks in
+/// `reason` is one of the six labels the execute-time checks in
 /// `eviction.rs` record:
-/// `pinned_at_execute|active_at_execute|warm_pool_at_execute|row_missing|error`.
-/// `error` is the disk-or-DB failure path; the candidate stays on disk for
+/// `pinned_at_execute|active_at_execute|warm_pool_at_execute|row_missing|claimed|error`.
+/// `claimed` is a candidate whose digest a pull, registration or delete
+/// held; the next tick retries it. `error` is the disk-or-DB failure path; the candidate stays on disk for
 /// the next tick to retry.
 pub fn gc_skipped(reason: &str) {
     counter("template.gc.skipped", 1, &[tag("reason", reason)]);

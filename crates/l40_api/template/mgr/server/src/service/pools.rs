@@ -23,7 +23,13 @@ impl TemplateManagerService {
                 let build = crate::pool_manager::pool_build(&conn, &template)?;
                 let runtime_defaults = build
                     .as_ref()
-                    .map(|build| template_runtime_defaults(&template, &build.content_hash))
+                    .map(|build| {
+                        template_runtime_defaults(
+                            &template,
+                            &build.content_hash,
+                            build.cache_partition,
+                        )
+                    })
                     .unwrap_or_default();
                 Ok::<_, crate::pool_manager::PoolError>((
                     existing_pool,
@@ -94,8 +100,17 @@ impl TemplateManagerService {
                 let Some(build) = build else {
                     return Ok::<_, Status>(None);
                 };
-                crate::db::get_snapshot(&conn, &t, &build.content_hash, vcpu, memory_mib)
-                    .map_err(|e| Status::internal(format!("db get_snapshot: {e}")))
+                crate::db::get_snapshot(
+                    &conn,
+                    crate::db::SnapshotKey {
+                        name: &t,
+                        content_hash: &build.content_hash,
+                        cache_partition: build.cache_partition,
+                        vcpu,
+                        memory_mib,
+                    },
+                )
+                .map_err(|e| Status::internal(format!("db get_snapshot: {e}")))
             })
             .await
             .map_err(|e| Status::internal(format!("spawn_blocking: {e}")))??;

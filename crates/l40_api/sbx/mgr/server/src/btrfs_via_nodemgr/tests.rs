@@ -162,3 +162,31 @@ async fn a_sandbox_instance_is_created_as_a_subvolume_or_reported_unsupported() 
         "a refusal must fail the restore"
     );
 }
+
+/// A sandbox bound to an environment outside the legacy layout names its
+/// parent's partition in codec requests; one bound to the initial environment,
+/// or to none, names the legacy build only, as before partitions.
+#[test]
+fn codec_requests_name_the_partition_of_a_bound_sandbox_s_parent() {
+    let hash = format!("sha256:{}", "c".repeat(64));
+    let bound = pplx_space_common_core::types::EnvironmentReference::new(
+        pplx_space_common_core::types::Digest::sha256([2; 32]),
+    );
+    assert_eq!(
+        super::codec_environment_build(&hash, Some(bound)),
+        Some(
+            pplx_space_node_mgr_client::proto::EnvironmentTemplateBuild {
+                content_hash: hash.clone(),
+                environment: bound.to_string(),
+            }
+        )
+    );
+    let initial = pplx_space_node_runtime_core::catalog::initial_environment_reference();
+    for environment in [None, Some(initial)] {
+        assert_eq!(
+            super::codec_environment_build(&hash, environment),
+            None,
+            "{environment:?}"
+        );
+    }
+}

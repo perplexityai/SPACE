@@ -66,6 +66,12 @@ enum DigestDirRejection {
     },
     #[error("manifest content_hash {found:?} does not match digest dir name {expected:?}")]
     ContentHashDisagreesWithDirName { found: String, expected: String },
+    #[error("manifest binds the {found} cache partition but the digest dir holds {expected}")]
+    PartitionDisagreesWithDirName { found: String, expected: String },
+    /// `transient` when the schema is one this release doesn't support yet,
+    /// which a later release may read; otherwise the binding is invalid.
+    #[error("manifest execution metadata is invalid: {reason}")]
+    ExecutionMetadataInvalid { reason: String, transient: bool },
     #[error("manifest does not declare a bootable_artifact")]
     BootableArtifactNotDeclared,
     #[error("manifest.files map has no entry for bootable artifact {0:?}")]
@@ -97,7 +103,7 @@ enum DigestDirRejection {
 impl DigestDirRejection {
     /// Whether reading the dir failed in a way that can clear without any
     /// change to it. Deleting such a dir would lose an installed build a
-    /// later startup could verify.
+    /// later startup could verify, and a twin can't be pulled back.
     fn is_transient(&self) -> bool {
         matches!(
             self,
@@ -111,6 +117,9 @@ impl DigestDirRejection {
                 transient: true,
                 ..
             } | Self::BootableArtifactUnreadable {
+                transient: true,
+                ..
+            } | Self::ExecutionMetadataInvalid {
                 transient: true,
                 ..
             }
@@ -233,6 +242,64 @@ fn validate_manifest_self_consistency(
     Ok(())
 }
 
+/// Checks a build dir against the partition its binding selects.
+///
+/// A legacy-layout `{hash}` dir is adopted in place whatever environment it
+/// names: nodes that ran another environment before partitions existed hold
+/// such builds, often under running and suspended sandboxes. Dropping one
+/// would delete a restore parent and force a re-pull, and moving it would
+/// change its received UUID and hide it from an older release after a
+/// rollback. So it stays filed in the legacy partition at its path, an
+/// environment's lookup still finds it there through its legacy fallback,
+/// and a rollback serves it unchanged. Only a `{hash}@{env}` dir, which this
+/// release created, must name its own partition. A binding under a schema
+/// this release doesn't support yet is a transient rejection: the dir is kept
+/// and reported, so a later release can read it. Any other invalid binding is
+/// a permanent rejection, removed only when no sandbox depends on the digest.
+fn validate_partition_binding(
+    partition: crate::db::TemplateCachePartition,
+    manifest: &TemplateManifest,
+    metadata: &TemplateMetadata,
+) -> Result<(), DigestDirRejection> {
+    if partition == crate::db::TemplateCachePartition::Legacy {
+        return Ok(());
+    }
+    let environment = binding_environment(manifest, metadata)?;
+    let bound = pplx_space_node_runtime_core::catalog::template_cache_partition(environment);
+    if bound != partition {
+        return Err(DigestDirRejection::PartitionDisagreesWithDirName {
+            found: bound.to_string(),
+            expected: partition.to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// The environment a build dir's manifest binds, else its metadata's, as
+/// [`crate::service::effective_environment`] reads it, with an unsupported
+/// schema told apart from an invalid binding.
+fn binding_environment(
+    manifest: &TemplateManifest,
+    metadata: &TemplateMetadata,
+) -> Result<Option<pplx_space_common_core::types::EnvironmentReference>, DigestDirRejection> {
+    use pplx_space_common_core::types::{TemplateManifestSchemaError, TemplateMetadataSchemaError};
+    let invalid = |reason: String, transient: bool| DigestDirRejection::ExecutionMetadataInvalid {
+        reason,
+        transient,
+    };
+    match manifest.execution_metadata() {
+        Ok(Some(execution)) => Ok(execution.environment()),
+        Ok(None) => metadata.environment().map_err(|error| {
+            let transient = matches!(error, TemplateMetadataSchemaError::UnsupportedVersion(_));
+            invalid(error.to_string(), transient)
+        }),
+        Err(error) => {
+            let transient = matches!(error, TemplateManifestSchemaError::UnsupportedVersion(_));
+            Err(invalid(error.to_string(), transient))
+        }
+    }
+}
+
 /// Verify that every locally-required file the manifest declares is on
 /// disk at the recorded size. Manifest entries with a compression
 /// descriptor live in object storage only and are skipped here — that's
@@ -319,13 +386,14 @@ async fn lookup_build_row(
     db: &Arc<Mutex<rusqlite::Connection>>,
     name: &str,
     content_hash: &str,
+    partition: crate::db::TemplateCachePartition,
 ) -> Result<Option<crate::db::BuildRow>, String> {
     let db = Arc::clone(db);
     let n = name.to_string();
     let h = content_hash.to_string();
     tokio::task::spawn_blocking(move || {
         let conn = lock_recovery_db(&db)?;
-        crate::db::get_build(&conn, &n, &h).map_err(|error| error.to_string())
+        crate::db::get_build(&conn, &n, &h, partition).map_err(|error| error.to_string())
     })
     .await
     .map_err(|error| format!("spawn_blocking: {error}"))?
@@ -335,6 +403,7 @@ async fn lookup_build_row(
 struct ValidatedBuildRow {
     name: String,
     content_hash: String,
+    partition: crate::db::TemplateCachePartition,
     manifest_json: String,
     build_date: String,
     runtime: String,
@@ -354,6 +423,7 @@ async fn insert_validated_build_row(
             &crate::db::BuildUpsert {
                 name: &row.name,
                 content_hash: &row.content_hash,
+                cache_partition: row.partition,
                 build_date: &row.build_date,
                 manifest_json: &row.manifest_json,
                 runtime: &row.runtime,
@@ -373,13 +443,14 @@ async fn delete_stale_build_row(
     db: &Arc<Mutex<rusqlite::Connection>>,
     name: &str,
     content_hash: &str,
+    partition: crate::db::TemplateCachePartition,
 ) -> Result<(), String> {
     let db = Arc::clone(db);
     let n = name.to_string();
     let h = content_hash.to_string();
     tokio::task::spawn_blocking(move || {
         let conn = lock_recovery_db(&db)?;
-        crate::db::delete_build(&conn, &n, &h).map_err(|error| error.to_string())
+        crate::db::delete_build(&conn, &n, &h, partition).map_err(|error| error.to_string())
     })
     .await
     .map_err(|error| format!("spawn_blocking: {error}"))?
@@ -392,16 +463,17 @@ async fn delete_stale_build_row(
 /// survives both stays without a row, and the next GC tick rejects it and
 /// tries again.
 ///
-/// Node-manager resolves `(name, hash)` under `TEMPLATE_DIR`, so the RPC is
-/// sent only when that's the root being recovered; under any other root it
-/// would delete the canonical cache's build of the same name and hash, and
-/// only the local cleanup runs.
-async fn remove_digest_dir_from_disk(
-    template_root: &Path,
-    name: &str,
-    hash_name: &str,
-    digest_dir: &Path,
-) {
+/// Node-manager resolves `(name, hash, partition)` under `TEMPLATE_DIR`, so
+/// the RPC is sent only when that's the root being recovered; under any
+/// other root it would delete the canonical cache's build of the same name,
+/// hash and partition, and only the local cleanup runs.
+async fn remove_digest_dir_from_disk(template_root: &Path, build: DigestDirBuild<'_>) {
+    let DigestDirBuild {
+        name,
+        hash_name,
+        partition,
+        digest_dir,
+    } = build;
     let canonical_root = template_root == Path::new(TEMPLATE_DIR);
     let dir = digest_dir.to_path_buf();
     let take_rpc_leg = canonical_root
@@ -411,7 +483,8 @@ async fn remove_digest_dir_from_disk(
         .await
         .unwrap_or(false);
     if take_rpc_leg {
-        match crate::btrfs_via_nodemgr::delete_template_subvolume(name, hash_name).await {
+        match crate::btrfs_via_nodemgr::delete_template_subvolume(name, hash_name, partition).await
+        {
             Ok(()) => return,
             Err(error) => tracing::warn!(
                 dir = %digest_dir.display(),
@@ -434,13 +507,81 @@ async fn remove_digest_dir_from_disk(
     }
 }
 
+/// One build dir recovery is reconciling.
+#[derive(Clone, Copy)]
+struct DigestDirBuild<'a> {
+    name: &'a str,
+    hash_name: &'a str,
+    partition: crate::db::TemplateCachePartition,
+    digest_dir: &'a Path,
+}
+
+/// How long recovery waits for sandbox-manager's list of dependent sandboxes
+/// before keeping an invalid build for a later check.
+const DEPENDENT_SANDBOX_CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Sandbox-manager's answer on which `(template, hash)` builds sandboxes
+/// depend on, asked at most once per startup recovery scan or GC tick and
+/// shared by every dir that scan or tick finds invalid. An answer it couldn't
+/// get, or didn't get within [`DEPENDENT_SANDBOX_CHECK_TIMEOUT`], stands for
+/// the rest of the scan or tick too, so a sandbox-manager that's down or hung
+/// costs it one wait rather than one per dir, each under its digest's claim.
+/// A dir held during the startup scan gets its own answer once its holder
+/// lets go, since that wait has no bound and a sandbox may pull the build
+/// meanwhile; only such a dir found invalid asks.
+#[derive(Clone)]
+pub(super) struct DependentSandboxCheck {
+    fetch: crate::eviction::FetchActiveFn,
+    answer: Arc<tokio::sync::OnceCell<DependentSandboxAnswer>>,
+}
+
+/// The `(template, hash)` builds sandboxes depend on, or why sandbox-manager
+/// couldn't say.
+type DependentSandboxAnswer = Result<HashSet<(String, String)>, String>;
+
+impl DependentSandboxCheck {
+    pub(super) fn new(fetch: crate::eviction::FetchActiveFn) -> Self {
+        Self {
+            fetch,
+            answer: Arc::default(),
+        }
+    }
+
+    /// Why an invalid build of `(name, content_hash)` must stay, or `None`
+    /// when nothing depends on it.
+    async fn keeps(&self, name: &str, content_hash: &str) -> Option<String> {
+        let answer = self
+            .answer
+            .get_or_init(|| async {
+                match tokio::time::timeout(DEPENDENT_SANDBOX_CHECK_TIMEOUT, (self.fetch)()).await {
+                    Ok(Ok(builds)) => Ok(builds),
+                    Ok(Err(error)) => {
+                        Err(format!("could not check for dependent sandboxes: {error}"))
+                    }
+                    Err(_) => Err("timed out checking for dependent sandboxes".to_string()),
+                }
+            })
+            .await;
+        match answer {
+            Ok(builds) if !builds.contains(&(name.to_string(), content_hash.to_string())) => None,
+            Ok(_) => Some("a sandbox still depends on its build".to_string()),
+            Err(reason) => Some(reason.clone()),
+        }
+    }
+}
+
 async fn drop_invalid_digest_dir(
     service: &TemplateManagerService,
-    name: &str,
-    hash_name: &str,
-    digest_dir: &Path,
+    build: DigestDirBuild<'_>,
     rejection: &DigestDirRejection,
+    dependents: &DependentSandboxCheck,
 ) {
+    let DigestDirBuild {
+        name,
+        hash_name,
+        partition,
+        digest_dir,
+    } = build;
     let db = &service.db;
     if rejection.is_transient() {
         // Never delete an installed build over a read that can clear. Its
@@ -451,11 +592,12 @@ async fn drop_invalid_digest_dir(
         tracing::warn!(
             template = %name,
             content_hash = %hash_name,
+            cache_partition = %partition,
             dir = %digest_dir.display(),
             reason = %rejection,
             "could not verify digest dir; dropping its row and keeping it for the next GC tick"
         );
-        if let Err(error) = delete_stale_build_row(db, name, hash_name).await {
+        if let Err(error) = delete_stale_build_row(db, name, hash_name, partition).await {
             tracing::warn!(
                 template = %name,
                 content_hash = %hash_name,
@@ -471,10 +613,41 @@ async fn drop_invalid_digest_dir(
     tracing::warn!(
         template = %name,
         content_hash = %hash_name,
+        cache_partition = %partition,
         dir = %digest_dir.display(),
         reason = %rejection,
         "dropping invalid digest dir during startup recovery"
     );
+    // Not while a sandbox depends on the build, as eviction and
+    // DeleteTemplateBuild won't remove one either: a suspended sandbox's
+    // restore can use it as its parent. That covers a partition mismatch
+    // too, such as a legacy-layout dir bound to another environment, which
+    // a sandbox suspended before partitions still names. Nor when
+    // sandbox-manager can't say. Its answer names `(template, hash)`, so a
+    // dependent covers every partition of the digest. The row of this dir's
+    // partition still goes, so the invalid build isn't served, and the dir,
+    // now without a row, is the GC tick's to check again. The answer is
+    // asked once per pass; see `DependentSandboxCheck`.
+    if let Some(reason) = dependents.keeps(name, hash_name).await {
+        tracing::warn!(
+            template = %name,
+            content_hash = %hash_name,
+            cache_partition = %partition,
+            dir = %digest_dir.display(),
+            %reason,
+            "keeping invalid digest dir; dropping its row and leaving it for the next GC tick"
+        );
+        if let Err(error) = delete_stale_build_row(db, name, hash_name, partition).await {
+            tracing::warn!(
+                template = %name,
+                content_hash = %hash_name,
+                %error,
+                "could not drop the row of an invalid digest dir"
+            );
+        }
+        crate::node_state_sync::mark_template_dirty(db, name);
+        return;
+    }
     // Its base snapshots go first: left behind, they'd be registered as the
     // snapshots of the next build installed under the same hash. If they
     // can't be removed, the dir stays too, so the next pass retries both
@@ -487,7 +660,7 @@ async fn drop_invalid_digest_dir(
         hash_name.to_string(),
     );
     match off_runtime(name, hash_name, move || {
-        store.remove_snapshot_artifacts(&n, &h)
+        store.remove_snapshot_artifacts(&n, &h, partition)
     })
     .await
     {
@@ -501,7 +674,7 @@ async fn drop_invalid_digest_dir(
                     "could not remove base snapshots of an invalid digest dir; dropping its row and keeping it for the next GC tick"
                 );
             }
-            if let Err(error) = delete_stale_build_row(db, name, hash_name).await {
+            if let Err(error) = delete_stale_build_row(db, name, hash_name, partition).await {
                 tracing::warn!(
                     template = %name,
                     content_hash = %hash_name,
@@ -513,8 +686,8 @@ async fn drop_invalid_digest_dir(
             return;
         }
     }
-    remove_digest_dir_from_disk(&service.artifact_store.root, name, hash_name, digest_dir).await;
-    if let Err(error) = delete_stale_build_row(db, name, hash_name).await {
+    remove_digest_dir_from_disk(&service.artifact_store.root, build).await;
+    if let Err(error) = delete_stale_build_row(db, name, hash_name, partition).await {
         tracing::warn!(
             template = %name,
             content_hash = %hash_name,
@@ -558,10 +731,15 @@ async fn off_runtime<T: Send + 'static>(
 ///   removed and no row to be written.
 async fn reconcile_digest_dir_against_db(
     service: &TemplateManagerService,
-    name: &str,
-    hash_name: &str,
-    digest_dir: &Path,
+    build: DigestDirBuild<'_>,
+    dependents: &DependentSandboxCheck,
 ) {
+    let DigestDirBuild {
+        name,
+        hash_name,
+        partition,
+        digest_dir,
+    } = build;
     let dir = digest_dir.to_path_buf();
     let Some(parsed) = off_runtime(name, hash_name, move || {
         parse_manifest_from_digest_dir(&dir)
@@ -573,13 +751,13 @@ async fn reconcile_digest_dir_against_db(
     let (manifest, manifest_json) = match parsed {
         Ok(parsed) => parsed,
         Err(rejection) => {
-            drop_invalid_digest_dir(service, name, hash_name, digest_dir, &rejection).await;
+            drop_invalid_digest_dir(service, build, &rejection, dependents).await;
             return;
         }
     };
 
     if let Err(rejection) = validate_manifest_self_consistency(hash_name, &manifest) {
-        drop_invalid_digest_dir(service, name, hash_name, digest_dir, &rejection).await;
+        drop_invalid_digest_dir(service, build, &rejection, dependents).await;
         return;
     }
 
@@ -592,11 +770,11 @@ async fn reconcile_digest_dir_against_db(
         return;
     };
     if let Err(rejection) = local_files {
-        drop_invalid_digest_dir(service, name, hash_name, digest_dir, &rejection).await;
+        drop_invalid_digest_dir(service, build, &rejection, dependents).await;
         return;
     }
 
-    let existing_row = match lookup_build_row(&service.db, name, hash_name).await {
+    let existing_row = match lookup_build_row(&service.db, name, hash_name, partition).await {
         Ok(row) => row,
         Err(error) => {
             tracing::warn!(
@@ -610,6 +788,17 @@ async fn reconcile_digest_dir_against_db(
     };
 
     if existing_row.is_some() {
+        // A row keeps its build whatever metadata.json holds, so only a
+        // binding the manifest carries itself is checked against the dir's
+        // partition here. Registration and pulls write that binding into
+        // the manifest before the row.
+        if manifest.execution.is_some()
+            && let Err(rejection) =
+                validate_partition_binding(partition, &manifest, &TemplateMetadata::default())
+        {
+            drop_invalid_digest_dir(service, build, &rejection, dependents).await;
+            return;
+        }
         tracing::info!(
             template = %name,
             content_hash = %hash_name,
@@ -631,10 +820,14 @@ async fn reconcile_digest_dir_against_db(
     let metadata = match metadata {
         Ok(metadata) => metadata,
         Err(rejection) => {
-            drop_invalid_digest_dir(service, name, hash_name, digest_dir, &rejection).await;
+            drop_invalid_digest_dir(service, build, &rejection, dependents).await;
             return;
         }
     };
+    if let Err(rejection) = validate_partition_binding(partition, &manifest, &metadata) {
+        drop_invalid_digest_dir(service, build, &rejection, dependents).await;
+        return;
+    }
 
     if let Err(rejection) = verify_bootable_artifact_hash(
         digest_dir,
@@ -644,7 +837,7 @@ async fn reconcile_digest_dir_against_db(
     )
     .await
     {
-        drop_invalid_digest_dir(service, name, hash_name, digest_dir, &rejection).await;
+        drop_invalid_digest_dir(service, build, &rejection, dependents).await;
         return;
     }
 
@@ -665,11 +858,13 @@ async fn reconcile_digest_dir_against_db(
     }
 
     let build_date = manifest.build_date.clone();
-    let runtime = if manifest.runtime.is_empty() {
-        RUNTIME_FIRECRACKER_ALIAS.to_string()
-    } else {
-        manifest.runtime.clone()
-    };
+    // A pull interrupted before normalizing leaves a manifest without the
+    // binding its metadata carries; the row stores it the way registration
+    // would, so the store files it under the partition validated above.
+    let BuildRowManifest {
+        json: manifest_json,
+        runtime,
+    } = build_row_manifest(&manifest, manifest_json, &metadata);
     let arch = template_arch(&metadata, &manifest);
     let Some(bootable_size) = manifest
         .files
@@ -681,13 +876,14 @@ async fn reconcile_digest_dir_against_db(
         let rejection = DigestDirRejection::FileSizeNotDeclared {
             filename: manifest.bootable_artifact.clone(),
         };
-        drop_invalid_digest_dir(service, name, hash_name, digest_dir, &rejection).await;
+        drop_invalid_digest_dir(service, build, &rejection, dependents).await;
         return;
     };
 
     let row = ValidatedBuildRow {
         name: name.to_string(),
         content_hash: hash_name.to_string(),
+        partition,
         manifest_json,
         build_date,
         runtime,
@@ -819,91 +1015,203 @@ pub(super) fn build_staging_dir_is_stale(path: &Path) -> bool {
         .is_some_and(|age| age > BUILD_STAGING_DIR_MAX_AGE)
 }
 
+/// Register the base snapshots of every build of a template. Returns the
+/// `(content_hash, partition)` builds whose snapshots didn't all register,
+/// for the GC tick to retry.
 async fn reconcile_base_snapshots_for_template(
     db: &Arc<Mutex<rusqlite::Connection>>,
     name: &str,
     name_dir: &Path,
-) {
+) -> Vec<(String, crate::db::TemplateCachePartition)> {
+    let mut failed = Vec::new();
     let snapshots_dir = name_dir.join("snapshots");
     if !snapshots_dir.is_dir() {
-        return;
+        return failed;
     }
     let Ok(snap_hash_entries) = std::fs::read_dir(&snapshots_dir) else {
-        return;
+        return failed;
     };
     for snap_hash_entry in snap_hash_entries.flatten() {
-        let snap_hash = snap_hash_entry.file_name().to_string_lossy().to_string();
+        let build_dir_name = snap_hash_entry.file_name().to_string_lossy().to_string();
+        let Some((snap_hash, partition)) =
+            crate::db::TemplateCachePartition::parse_build_dir_name(&build_dir_name)
+        else {
+            continue;
+        };
         if !snap_hash.starts_with("sha256:") || !snap_hash_entry.path().is_dir() {
             continue;
         }
-        reconcile_base_snapshots_for_build(db, name, &snap_hash, &snap_hash_entry.path()).await;
+        if let (_, Some(error)) = reconcile_base_snapshots_for_build(
+            db,
+            name,
+            snap_hash,
+            partition,
+            &snap_hash_entry.path(),
+        )
+        .await
+        {
+            tracing::warn!(
+                template = %name,
+                content_hash = %snap_hash,
+                cache_partition = %partition,
+                %error,
+                "could not register base snapshots during startup recovery"
+            );
+            failed.push((snap_hash.to_string(), partition));
+        }
     }
+    failed
 }
 
 /// Register the base snapshots under one build's snapshot dir
-/// `{name}/snapshots/{snap_hash}`. A snapshot row needs its build's row, so
-/// this registers nothing for a build without one.
+/// `{name}/snapshots/{build_dir_name}`. A snapshot row needs its build's row,
+/// so this registers nothing for a build without one. Returns how many it
+/// registered and the first error, if any snapshot failed to read or record.
 async fn reconcile_base_snapshots_for_build(
     db: &Arc<Mutex<rusqlite::Connection>>,
     name: &str,
     snap_hash: &str,
+    partition: crate::db::TemplateCachePartition,
     snap_hash_dir: &Path,
-) {
+) -> (usize, Option<String>) {
     let dir = snap_hash_dir.to_path_buf();
-    let Some(snapshots) = off_runtime(name, snap_hash, move || {
-        let Ok(config_entries) = std::fs::read_dir(&dir) else {
-            return Vec::new();
-        };
-        config_entries
-            .flatten()
-            .filter_map(|config_entry| {
-                let config_name = config_entry.file_name().to_string_lossy().to_string();
-                let (vcpu, memory_mib) = parse_snapshot_config_dir(&config_name)?;
-                let config_dir = config_entry.path();
-                (config_dir.join("snapshot.base").exists()
-                    && config_dir.join("vmstate.base").exists())
-                .then(|| {
-                    let snap_hash_val = std::fs::read_to_string(config_dir.join("snapshot_hash"))
-                        .unwrap_or_default();
-                    (vcpu, memory_mib, snap_hash_val)
-                })
-            })
-            .collect::<Vec<_>>()
-    })
-    .await
+    let Some((snapshots, read_error)) =
+        off_runtime(name, snap_hash, move || read_base_snapshot_dirs(&dir)).await
     else {
-        return;
+        return (0, Some("base snapshot read task failed".to_string()));
     };
+    let mut first_error = read_error;
+    let mut registered = 0;
     for (vcpu, memory_mib, snap_hash_val) in snapshots {
         let db = Arc::clone(db);
         let n = name.to_string();
         let h = snap_hash.to_string();
-        match tokio::task::spawn_blocking(move || {
+        let config_dir = snap_hash_dir.join(format!("{vcpu}vcpu-{memory_mib}mib"));
+        let upserted = tokio::task::spawn_blocking(move || {
             let conn = lock_recovery_db(&db)?;
-            crate::db::upsert_snapshot(&conn, &n, &h, vcpu, memory_mib, &snap_hash_val)
-                .map_err(|error| error.to_string())
+            upsert_snapshot_if_present(
+                &conn,
+                crate::db::SnapshotKey {
+                    name: &n,
+                    content_hash: &h,
+                    cache_partition: partition,
+                    vcpu,
+                    memory_mib,
+                },
+                &snap_hash_val,
+                &config_dir,
+            )
         })
         .await
-        {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => {
-                tracing::warn!(
-                    template = %name,
-                    content_hash = %snap_hash,
-                    %error,
-                    "failed to upsert base snapshot during startup recovery"
-                );
-            }
+        .map_err(|error| format!("base snapshot upsert task failed: {error}"))
+        .flatten();
+        match upserted {
             Err(error) => {
                 tracing::warn!(
                     template = %name,
                     content_hash = %snap_hash,
+                    cache_partition = %partition,
+                    vcpu,
+                    memory_mib,
                     %error,
-                    "base snapshot upsert task failed during startup recovery"
+                    "failed to register base snapshot"
                 );
+                first_error.get_or_insert(error);
+            }
+            Ok(true) => registered += 1,
+            Ok(false) => {}
+        }
+    }
+    (registered, first_error)
+}
+
+/// Record a base snapshot read from `config_dir`, if its build has a row in
+/// its partition and its files are still there, and say whether it did. The
+/// runtime connection doesn't enforce foreign keys, so the build row is
+/// checked here: a snapshot dir of a build without one, such as a dir
+/// startup recovery left for a later check, gets no row until its build does.
+/// Pruning removes a snapshot's dir before its row and takes no digest claim,
+/// so a dir read before a prune may be gone by now; checking under the DB
+/// lock keeps a row from coming back over files that went.
+fn upsert_snapshot_if_present(
+    conn: &rusqlite::Connection,
+    key: crate::db::SnapshotKey<'_>,
+    snapshot_hash: &str,
+    config_dir: &Path,
+) -> Result<bool, String> {
+    let build = crate::db::get_build(conn, key.name, key.content_hash, key.cache_partition)
+        .map_err(|error| error.to_string())?;
+    if build.is_none() {
+        return Ok(false);
+    }
+    let present = ["snapshot.base", "vmstate.base"]
+        .iter()
+        .all(|file| config_dir.join(file).exists());
+    if !present {
+        return Ok(false);
+    }
+    crate::db::upsert_snapshot(conn, key, snapshot_hash)
+        .map(|()| true)
+        .map_err(|error| error.to_string())
+}
+
+/// The finished base snapshots under `{name}/snapshots/{build_dir_name}` that
+/// read, as `(vcpu, memory_mib, snapshot_hash)`, and the first read error, if
+/// any. A dir that's missing has none; a `snapshot_hash` that's missing is
+/// empty, as startup recovery has always read it. A config that fails to read
+/// is left out and its error returned, so the caller retries it, while the
+/// configs that read are still registered.
+fn read_base_snapshot_dirs(dir: &Path) -> (Vec<(u32, u32, String)>, Option<String>) {
+    let read_error =
+        |path: &Path, error: std::io::Error| format!("read {}: {error}", path.display());
+    let config_entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return (Vec::new(), None),
+        Err(error) => return (Vec::new(), Some(read_error(dir, error))),
+    };
+    let mut snapshots = Vec::new();
+    let mut first_error = None;
+    for config_entry in config_entries {
+        let config_entry = match config_entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                first_error.get_or_insert(read_error(dir, error));
+                continue;
+            }
+        };
+        let config_name = config_entry.file_name().to_string_lossy().to_string();
+        let Some((vcpu, memory_mib)) = parse_snapshot_config_dir(&config_name) else {
+            continue;
+        };
+        let config_dir = config_entry.path();
+        let read_config = || -> Result<Option<String>, String> {
+            for file in ["snapshot.base", "vmstate.base"] {
+                let path = config_dir.join(file);
+                if !path
+                    .try_exists()
+                    .map_err(|error| read_error(&path, error))?
+                {
+                    return Ok(None);
+                }
+            }
+            let hash_path = config_dir.join("snapshot_hash");
+            match std::fs::read_to_string(&hash_path) {
+                Ok(value) => Ok(Some(value)),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    Ok(Some(String::new()))
+                }
+                Err(error) => Err(read_error(&hash_path, error)),
+            }
+        };
+        match read_config() {
+            Ok(Some(snap_hash_val)) => snapshots.push((vcpu, memory_mib, snap_hash_val)),
+            Ok(None) => {}
+            Err(error) => {
+                first_error.get_or_insert(error);
             }
         }
     }
+    (snapshots, first_error)
 }
 
 async fn prune_catalog_rows_missing_on_disk(
@@ -914,9 +1222,7 @@ async fn prune_catalog_rows_missing_on_disk(
     let artifact_store = artifact_store.clone();
     match tokio::task::spawn_blocking(move || {
         let Ok(conn) = db.lock() else {
-            tracing::warn!(
-                "template DB mutex poisoned while pruning stale startup recovery rows"
-            );
+            tracing::warn!("template DB mutex poisoned while pruning stale startup recovery rows");
             return;
         };
 
@@ -933,31 +1239,19 @@ async fn prune_catalog_rows_missing_on_disk(
         //   - artifacts missing → delete the row outright; a partial
         //     dir left on disk has no row, so the GC tick's rowless
         //     check removes it.
-        let stuck: Vec<(String, String)> = match conn.prepare(
-            "SELECT name, content_hash FROM template_builds WHERE state = 'deleting'",
-        ) {
-            Ok(mut stmt) => match stmt.query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            }) {
-                Ok(rows) => rows.filter_map(Result::ok).collect(),
-                Err(error) => {
-                    tracing::warn!(%error, "failed to enumerate stuck 'deleting' template builds");
-                    Vec::new()
-                }
-            },
-            Err(error) => {
-                tracing::warn!(%error, "failed to prepare query for stuck 'deleting' template builds");
-                Vec::new()
-            }
-        };
-        for (name, content_hash) in &stuck {
-            if artifact_store.build_artifacts_missing(name, content_hash) {
+        let stuck = crate::db::list_deleting_builds(&conn).unwrap_or_else(|error| {
+            tracing::warn!(%error, "failed to enumerate stuck 'deleting' template builds");
+            Vec::new()
+        });
+        for (name, content_hash, partition) in &stuck {
+            if artifact_store.build_artifacts_missing(name, content_hash, *partition) {
                 tracing::info!(
                     template = %name,
                     content_hash = %content_hash,
+                    cache_partition = %partition,
                     "stuck 'deleting' template build: artifacts missing, dropping row"
                 );
-                let _ = crate::db::delete_build(&conn, name, content_hash);
+                let _ = crate::db::delete_build(&conn, name, content_hash, *partition);
             } else {
                 tracing::info!(
                     template = %name,
@@ -966,32 +1260,49 @@ async fn prune_catalog_rows_missing_on_disk(
                 );
                 let _ = conn.execute(
                     "UPDATE template_builds SET state = 'ready'
-                     WHERE name = ?1 AND content_hash = ?2 AND state = 'deleting'",
-                    rusqlite::params![name, content_hash],
+                     WHERE name = ?1 AND content_hash = ?2 AND cache_partition = ?3
+                       AND state = 'deleting'",
+                    rusqlite::params![name, content_hash, partition.key()],
                 );
             }
         }
 
         let builds = crate::db::list_builds(&conn).unwrap_or_default();
         for build in &builds {
-            if artifact_store.build_artifacts_missing(&build.name, &build.content_hash) {
+            if artifact_store.build_artifacts_missing(
+                &build.name,
+                &build.content_hash,
+                build.cache_partition,
+            ) {
                 tracing::warn!(
                     template = %build.name,
                     content_hash = %build.content_hash,
+                    cache_partition = %build.cache_partition,
                     "pruning catalog build row whose artifacts are missing on disk"
                 );
-                let _ = crate::db::delete_build(&conn, &build.name, &build.content_hash);
+                let _ = crate::db::delete_build(
+                    &conn,
+                    &build.name,
+                    &build.content_hash,
+                    build.cache_partition,
+                );
             }
         }
 
         let remaining_builds = crate::db::list_builds(&conn).unwrap_or_default();
         for build in &remaining_builds {
-            let snaps = crate::db::list_snapshots(&conn, &build.name, &build.content_hash)
-                .unwrap_or_default();
+            let snaps = crate::db::list_snapshots(
+                &conn,
+                &build.name,
+                &build.content_hash,
+                build.cache_partition,
+            )
+            .unwrap_or_default();
             for snap in &snaps {
                 if artifact_store.snapshot_artifacts_missing(
                     &snap.name,
                     &snap.content_hash,
+                    snap.cache_partition,
                     snap.vcpu,
                     snap.memory_mib,
                 ) {
@@ -1002,9 +1313,15 @@ async fn prune_catalog_rows_missing_on_disk(
                         memory_mib = snap.memory_mib,
                         "pruning catalog snapshot row whose artifacts are missing on disk"
                     );
-                    let _ = conn.execute(
-                        "DELETE FROM template_snapshots WHERE name = ?1 AND content_hash = ?2 AND vcpu = ?3 AND memory_mib = ?4",
-                        rusqlite::params![snap.name, snap.content_hash, snap.vcpu, snap.memory_mib],
+                    let _ = crate::db::delete_snapshot(
+                        &conn,
+                        crate::db::SnapshotKey {
+                            name: &snap.name,
+                            content_hash: &snap.content_hash,
+                            cache_partition: snap.cache_partition,
+                            vcpu: snap.vcpu,
+                            memory_mib: snap.memory_mib,
+                        },
                     );
                 }
             }
@@ -1016,10 +1333,7 @@ async fn prune_catalog_rows_missing_on_disk(
         {
             Ok(pruned) if pruned > 0 => {
                 crate::metrics::digest_pins_pruned(pruned as u64);
-                tracing::info!(
-                    pruned,
-                    "pruned template digest pins without local builds"
-                );
+                tracing::info!(pruned, "pruned template digest pins without local builds");
             }
             Ok(_) => {}
             Err(error) => {
@@ -1048,19 +1362,24 @@ fn is_template_name_dir(name: &str) -> bool {
     !(name.starts_with('.') || name.ends_with(".old") || name.ends_with(".importing"))
 }
 
-/// Whether a dir name under a template's dir names a build, not import or
-/// republish staging or an interrupted replacement.
-fn is_build_dir_name(hash_name: &str) -> bool {
-    !is_import_staging_dir(hash_name)
-        && !is_republish_staging_dir(hash_name)
-        && replaced_digest_base(hash_name).is_none()
-        && hash_name.parse::<Digest>().is_ok()
+/// The content hash and cache partition of a build dir under a template's
+/// dir, `{hash}` or `{hash}@{environment}`; `None` for import or republish
+/// staging, an interrupted replacement, or anything else.
+fn parse_build_dir_name(dir_name: &str) -> Option<(&str, crate::db::TemplateCachePartition)> {
+    if is_import_staging_dir(dir_name)
+        || is_republish_staging_dir(dir_name)
+        || replaced_digest_base(dir_name).is_some()
+    {
+        return None;
+    }
+    crate::db::TemplateCachePartition::parse_build_dir_name(dir_name)
 }
 
-/// Build dirs `{template}/{hash}` under `root` that have no row and no claim,
-/// as `(template, hash, dir)` in name order. The scan reads the disk without
-/// the DB lock, then filters under it. A row lookup that fails counts as a
-/// row, so the dir waits for a later tick.
+/// Build dirs `{template}/{build dir}` under `root` that have no row in their
+/// partition and no claim of their digest, as `(template, build dir name,
+/// dir)` in name order. The scan reads the disk without the DB lock, then
+/// filters under it. A row lookup that fails counts as a row, so the dir
+/// waits for a later tick.
 fn rowless_build_dirs(
     root: &Path,
     db: &Mutex<rusqlite::Connection>,
@@ -1095,9 +1414,9 @@ fn rowless_build_dirs(
             }
         };
         for entry in entries.flatten() {
-            let hash = entry.file_name().to_string_lossy().to_string();
-            if is_build_dir_name(&hash) && entry.path().is_dir() {
-                dirs.push((name.clone(), hash, entry.path()));
+            let dir_name = entry.file_name().to_string_lossy().to_string();
+            if parse_build_dir_name(&dir_name).is_some() && entry.path().is_dir() {
+                dirs.push((name.clone(), dir_name, entry.path()));
             }
         }
     }
@@ -1107,9 +1426,12 @@ fn rowless_build_dirs(
         return Vec::new();
     };
     dirs.into_iter()
-        .filter(|(name, hash, _)| {
-            !puller.is_claimed(name, hash)
-                && crate::db::get_build(&conn, name, hash).is_ok_and(|row| row.is_none())
+        .filter(|(name, dir_name, _)| {
+            parse_build_dir_name(dir_name).is_some_and(|(hash, partition)| {
+                !puller.is_claimed(name, hash)
+                    && crate::db::get_build(&conn, name, hash, partition)
+                        .is_ok_and(|row| row.is_none())
+            })
         })
         .collect()
 }
@@ -1138,8 +1460,10 @@ impl TemplateManagerService {
     /// The dirs are taken in `(template, build dir)` order from just after
     /// the last one the previous tick examined, wrapping around, so every one
     /// is reached within `ceil(N / limit)` ticks however many keep failing,
-    /// as long as checks finish within `wait`; while checks parked past their
-    /// tick hold every permit, no tick starts another. Returns how many
+    /// as long as checks and snapshot repairs finish within `wait`; the
+    /// repairs share the checks' permits and run first, and while checks or
+    /// repairs parked past their tick hold every permit, no tick starts a
+    /// check. Returns how many
     /// checks it started that verified their dir or were left running past
     /// `wait`; one that found the digest claimed, its row back or the dir
     /// gone, or whose task failed, isn't counted.
@@ -1155,6 +1479,7 @@ impl TemplateManagerService {
         limit: usize,
         wait: std::time::Duration,
     ) -> usize {
+        self.retry_snapshot_repairs(limit, wait).await;
         let root = self.artifact_store.root.clone();
         let cursor = self
             .rowless_cursor
@@ -1169,7 +1494,7 @@ impl TemplateManagerService {
             let start = cursor.as_ref().map_or(0, |cursor| {
                 rowless
                     .iter()
-                    .position(|(name, hash, _)| (name, hash) > (&cursor.0, &cursor.1))
+                    .position(|(name, dir_name, _)| (name, dir_name) > (&cursor.0, &cursor.1))
                     .unwrap_or(0)
             });
             rowless
@@ -1186,7 +1511,13 @@ impl TemplateManagerService {
         });
 
         let mut checked = 0;
-        for (name, content_hash, digest_dir) in candidates {
+        let dependents = self.dependent_sandbox_check();
+        for (name, dir_name, digest_dir) in candidates {
+            let Some((content_hash, partition)) = parse_build_dir_name(&dir_name)
+                .map(|(content_hash, partition)| (content_hash.to_string(), partition))
+            else {
+                continue;
+            };
             // A check that outlives its tick keeps its permit, so checks
             // parked on a hung disk can't pile up across ticks: while they
             // hold every permit, no tick starts another.
@@ -1200,16 +1531,22 @@ impl TemplateManagerService {
             // The cursor passes only dirs a check started on, so one skipped
             // for want of a permit comes first next tick.
             if let Ok(mut cursor) = self.rowless_cursor.lock() {
-                *cursor = Some((name.clone(), content_hash.clone()));
+                *cursor = Some((name.clone(), dir_name.clone()));
             }
             // Its own task, so a tick that shutdown cancels can't drop the
             // digest claim while a blocking removal or catalog write it
             // guards keeps running; the task lets go once those finish.
-            let service = self.clone();
+            let (service, dependents) = (self.clone(), dependents.clone());
             let verify = tokio::spawn(async move {
                 let _permit = permit;
                 service
-                    .verify_rowless_build_dir(&name, &content_hash, &digest_dir)
+                    .verify_rowless_build_dir(
+                        &name,
+                        &content_hash,
+                        partition,
+                        &digest_dir,
+                        &dependents,
+                    )
                     .await
             });
             match tokio::time::timeout(wait, verify).await {
@@ -1240,15 +1577,128 @@ impl TemplateManagerService {
         &self,
         name: &str,
         content_hash: &str,
+        partition: crate::db::TemplateCachePartition,
         digest_dir: &Path,
+        dependents: &DependentSandboxCheck,
     ) -> bool {
         // Held for the whole check, so no pull, import, registration or
-        // DeleteTemplateBuild of the digest runs alongside it.
+        // DeleteTemplateBuild of the digest, in any partition, runs
+        // alongside it.
         let Some(_claim) = self.volume_puller.try_claim_digest(name, content_hash) else {
             return false;
         };
-        self.verify_claimed_rowless_build_dir(name, content_hash, digest_dir)
+        self.verify_claimed_rowless_build_dir(name, content_hash, partition, digest_dir, dependents)
             .await
+    }
+
+    /// Register the base snapshots of a build whose row the GC tick
+    /// restored, read from `{name}/snapshots/{build_dir_name}` of its
+    /// partition. On failure the build stays served, without those
+    /// snapshots, and goes on the pending list each tick retries. Returns how
+    /// many snapshots it registered.
+    async fn register_restored_base_snapshots(
+        &self,
+        name: &str,
+        content_hash: &str,
+        partition: crate::db::TemplateCachePartition,
+    ) -> usize {
+        let dir =
+            build_snapshots_artifacts_dir(&self.artifact_store.root, name, content_hash, partition);
+        let (registered, error) =
+            reconcile_base_snapshots_for_build(&self.db, name, content_hash, partition, &dir).await;
+        let Ok(mut pending) = self.snapshot_repairs.lock() else {
+            return registered;
+        };
+        let key = (name.to_string(), content_hash.to_string(), partition);
+        if let Some(error) = error {
+            tracing::warn!(
+                template = %name,
+                content_hash = %content_hash,
+                cache_partition = %partition,
+                %error,
+                "could not register the base snapshots of a restored build; retrying next tick"
+            );
+            pending.insert(key);
+        } else {
+            pending.remove(&key);
+        }
+        registered
+    }
+
+    /// Retry registering the base snapshots of restored builds whose earlier
+    /// attempt failed, up to `limit` a tick, taken in order from just after
+    /// the last one tried so one that keeps failing doesn't hold the rest
+    /// back, and waiting up to `wait` for each. A build whose row in its
+    /// partition has gone since leaves the list; one whose digest someone
+    /// else holds waits for a later tick.
+    async fn retry_snapshot_repairs(&self, limit: usize, wait: std::time::Duration) {
+        let all: Vec<_> = self
+            .snapshot_repairs
+            .lock()
+            .map(|pending| pending.iter().cloned().collect())
+            .unwrap_or_default();
+        let cursor = self
+            .snapshot_repair_cursor
+            .lock()
+            .map(|cursor| cursor.clone())
+            .unwrap_or_default();
+        let start = cursor.as_ref().map_or(0, |cursor| {
+            all.iter().position(|key| key > cursor).unwrap_or(0)
+        });
+        let pending: Vec<_> = all
+            .iter()
+            .cycle()
+            .skip(start)
+            .take(limit.min(all.len()))
+            .cloned()
+            .collect();
+        for (name, content_hash, partition) in pending {
+            // Like a check, a repair runs in its own task holding a permit
+            // and the digest's claim until it ends, so a repair parked on a
+            // hung disk outlives its tick without piling up behind it.
+            let Ok(permit) = Arc::clone(&self.rowless_checks).try_acquire_owned() else {
+                return;
+            };
+            if let Ok(mut cursor) = self.snapshot_repair_cursor.lock() {
+                *cursor = Some((name.clone(), content_hash.clone(), partition));
+            }
+            let Some(claim) = self.volume_puller.try_claim_digest(&name, &content_hash) else {
+                continue;
+            };
+            let service = self.clone();
+            let (task_name, task_hash) = (name.clone(), content_hash.clone());
+            let repair = tokio::spawn(async move {
+                let (_permit, _claim) = (permit, claim);
+                match lookup_build_row(&service.db, &task_name, &task_hash, partition).await {
+                    Ok(Some(_)) => {}
+                    Ok(None) => {
+                        if let Ok(mut pending) = service.snapshot_repairs.lock() {
+                            pending.remove(&(task_name, task_hash, partition));
+                        }
+                        return;
+                    }
+                    Err(_) => return,
+                }
+                if service
+                    .register_restored_base_snapshots(&task_name, &task_hash, partition)
+                    .await
+                    > 0
+                {
+                    // The node can now serve the build from those snapshots,
+                    // even if others still fail; the cluster hears of it now.
+                    crate::node_state_sync::mark_template_dirty(&service.db, &task_name);
+                }
+            });
+            if tokio::time::timeout(wait, repair).await.is_err() {
+                tracing::warn!(
+                    template = %name,
+                    content_hash = %content_hash,
+                    cache_partition = %partition,
+                    ?wait,
+                    "base snapshot repair still running; it finishes under its claim"
+                );
+            }
+        }
     }
 
     /// [`Self::verify_rowless_build_dir`] once the claim is held.
@@ -1256,9 +1706,11 @@ impl TemplateManagerService {
         &self,
         name: &str,
         content_hash: &str,
+        partition: crate::db::TemplateCachePartition,
         digest_dir: &Path,
+        dependents: &DependentSandboxCheck,
     ) -> bool {
-        if !lookup_build_row(&self.db, name, content_hash)
+        if !lookup_build_row(&self.db, name, content_hash, partition)
             .await
             .is_ok_and(|row| row.is_none())
         {
@@ -1275,24 +1727,32 @@ impl TemplateManagerService {
         tracing::info!(
             template = %name,
             content_hash = %content_hash,
+            cache_partition = %partition,
             dir = %digest_dir.display(),
             "verifying a build dir without a row"
         );
-        reconcile_digest_dir_against_db(self, name, content_hash, digest_dir).await;
+        reconcile_digest_dir_against_db(
+            self,
+            DigestDirBuild {
+                name,
+                hash_name: content_hash,
+                partition,
+                digest_dir,
+            },
+            dependents,
+        )
+        .await;
         // Dropping the row dropped its base-snapshot rows too, and they
         // can't come back without it; startup recovery only registers
-        // snapshot dirs once. Register them with the restored row.
-        if lookup_build_row(&self.db, name, content_hash)
+        // snapshot dirs once. Register them with the restored row; a read or
+        // write that fails is retried on later ticks, since the build, now
+        // with a row, no longer comes up as rowless.
+        if lookup_build_row(&self.db, name, content_hash, partition)
             .await
             .is_ok_and(|row| row.is_some())
         {
-            reconcile_base_snapshots_for_build(
-                &self.db,
-                name,
-                content_hash,
-                &build_snapshots_artifacts_dir(&self.artifact_store.root, name, content_hash),
-            )
-            .await;
+            self.register_restored_base_snapshots(name, content_hash, partition)
+                .await;
         }
         // A restored row, or a removed dir, changes what the node can
         // serve; the cluster hears of it now rather than at the next
@@ -1334,11 +1794,11 @@ impl TemplateManagerService {
     }
 
     /// Reap the transient dirs a previous process left: `.old` template
-    /// dirs, import and republish staging, stale build staging, and
-    /// interrupted replacements. Call before the socket binds, while no
-    /// pull, import or registration can own one; a live import's staging
-    /// dir carries the same names, so reaping them once requests flow
-    /// would race it.
+    /// dirs, import, partition-probe and republish staging, stale build
+    /// staging, and interrupted replacements. Call before the socket binds,
+    /// while no pull, import or registration can own one; a live pull's
+    /// probe or import's staging dir carries the same names, so reaping them
+    /// once requests flow would race it.
     pub fn clean_transient_dirs_before_serving(&self) {
         cleanup_transient_template_name_dirs(&self.artifact_store.root);
         cleanup_transient_digest_staging_dirs(&self.artifact_store.root);
@@ -1349,6 +1809,7 @@ impl TemplateManagerService {
     /// [`Self::clean_transient_dirs_before_serving`] reaped the stale ones.
     pub async fn run_startup_recovery(&self) {
         let mut held_at_scan = Vec::new();
+        let dependents = self.dependent_sandbox_check();
         if let Ok(entries) = std::fs::read_dir(&self.artifact_store.root) {
             for entry in entries.flatten() {
                 if !entry.path().is_dir() {
@@ -1374,24 +1835,52 @@ impl TemplateManagerService {
                             let _ = std::fs::remove_dir_all(digest_entry.path());
                             continue;
                         }
-                        if !is_build_dir_name(&hash_name) || !digest_entry.path().is_dir() {
+                        let Some((content_hash, partition)) = parse_build_dir_name(&hash_name)
+                        else {
+                            continue;
+                        };
+                        if !digest_entry.path().is_dir() {
                             continue;
                         }
+                        let content_hash = content_hash.to_string();
                         // Requests flow by now: a digest a pull, import,
                         // registration or delete holds isn't verified
                         // alongside them. It's checked once they let go,
                         // after the scan.
                         let digest_dir = digest_entry.path();
-                        let Some(_claim) = self.volume_puller.try_claim_digest(&name, &hash_name)
+                        let Some(_claim) =
+                            self.volume_puller.try_claim_digest(&name, &content_hash)
                         else {
-                            held_at_scan.push((name.clone(), hash_name, digest_dir));
+                            held_at_scan.push((name.clone(), content_hash, partition, digest_dir));
                             continue;
                         };
-                        reconcile_digest_dir_against_db(self, &name, &hash_name, &digest_dir).await;
+                        reconcile_digest_dir_against_db(
+                            self,
+                            DigestDirBuild {
+                                name: &name,
+                                hash_name: &content_hash,
+                                partition,
+                                digest_dir: &digest_dir,
+                            },
+                            &dependents,
+                        )
+                        .await;
                     }
                 }
 
-                reconcile_base_snapshots_for_template(&self.db, &name, &name_dir).await;
+                let failed =
+                    reconcile_base_snapshots_for_template(&self.db, &name, &name_dir).await;
+                // The GC tick retries them; one whose build has no row drops
+                // off its list.
+                if !failed.is_empty()
+                    && let Ok(mut pending) = self.snapshot_repairs.lock()
+                {
+                    pending.extend(
+                        failed
+                            .into_iter()
+                            .map(|(hash, partition)| (name.clone(), hash, partition)),
+                    );
+                }
             }
         }
 
@@ -1414,12 +1903,41 @@ impl TemplateManagerService {
         // A pull refuses a dir without a row while holding its digest, so a
         // dir held during the scan may be one only this pass can verify:
         // wait for each holder, then check the dir if it's still there.
-        for (name, hash_name, digest_dir) in held_at_scan {
+        for (name, hash_name, partition, digest_dir) in held_at_scan {
             let _claim = self.volume_puller.claim_digest(&name, &hash_name).await;
             if digest_dir.is_dir() {
-                reconcile_digest_dir_against_db(self, &name, &hash_name, &digest_dir).await;
+                // The wait has no bound, so the scan's answer may predate a
+                // sandbox that pulled the build meanwhile: ask again under
+                // the claim, which only a dir found invalid spends.
+                let dependents = self.dependent_sandbox_check();
+                reconcile_digest_dir_against_db(
+                    self,
+                    DigestDirBuild {
+                        name: &name,
+                        hash_name: &hash_name,
+                        partition,
+                        digest_dir: &digest_dir,
+                    },
+                    &dependents,
+                )
+                .await;
+                // The scan registered no snapshots for a build that had no
+                // row then; register them now that it has one, as the GC
+                // tick does for a build it restores.
+                if lookup_build_row(&self.db, &name, &hash_name, partition)
+                    .await
+                    .is_ok_and(|row| row.is_some())
+                {
+                    self.register_restored_base_snapshots(&name, &hash_name, partition)
+                        .await;
+                }
             }
         }
+    }
+
+    /// A fresh [`DependentSandboxCheck`], for one recovery pass or GC tick.
+    pub(super) fn dependent_sandbox_check(&self) -> DependentSandboxCheck {
+        DependentSandboxCheck::new(Arc::clone(&self.dependent_sandboxes))
     }
 }
 

@@ -36,13 +36,19 @@ type PoolResult<T> = Result<T, PoolError>;
 /// and the rootfs sandbox-manager resolves come from the same row. `None` when
 /// no ready build is cached: sandbox-manager's lookup then pulls the latest
 /// release. A refill uses the build, as the lookup it replaces recorded, so it
-/// advances the build's LRU; a failed touch only costs LRU accuracy.
+/// advances the build's LRU in its own partition; a failed touch only costs
+/// LRU accuracy.
 pub(crate) fn pool_refill_build(
     conn: &rusqlite::Connection,
     template: &str,
 ) -> PoolResult<Option<crate::db::BuildRow>> {
     if let Some(build) = pool_build(conn, template)? {
-        if let Err(error) = crate::db::touch_build(conn, &build.name, &build.content_hash) {
+        if let Err(error) = crate::db::touch_build(
+            conn,
+            &build.name,
+            &build.content_hash,
+            build.cache_partition,
+        ) {
             eprintln!("[pool-manager] {template}: could not touch pool build LRU: {error}");
         }
         return Ok(Some(build));
@@ -59,7 +65,7 @@ pub(crate) fn pool_build(
     if let Some(build) = pool_base_build(conn, template)? {
         return Ok(Some(build));
     }
-    if crate::db::list_builds_by_name(conn, template)?.is_empty() {
+    if crate::db::list_build_partitions(conn, template)?.is_empty() {
         return Ok(None);
     }
     // Cached builds must support memory pools. An unavailable
@@ -67,15 +73,45 @@ pub(crate) fn pool_build(
     Err(PoolError::NoPoolBuild)
 }
 
-/// Prefer Firecracker when a template has builds for several runtimes;
-/// otherwise select its newest pool-capable build. Defaults, snapshot checks,
-/// and refills must all select the same immutable build and runtime.
+/// The build a template's pool boots, over every cache partition: a
+/// Firecracker build first, then a legacy-partition build, then the newest.
+/// Defaults, snapshot checks, and refills must all select the same immutable
+/// build and runtime.
+///
+/// Pool creates and clones reach sandbox-manager without an environment, and
+/// its lookup of a digest (`find_ready_build` with no preference) returns the
+/// row with the lowest partition key, legacy first. So of each digest's rows
+/// only that one is a candidate, and every lookup resolves exactly the build
+/// chosen here. A legacy row is one whatever its binding, since startup
+/// recovery adopts legacy-layout builds bound to another environment in
+/// place; an environment partition's row bound to something else is never one.
 pub(crate) fn pool_base_build(
     conn: &rusqlite::Connection,
     template: &str,
 ) -> rusqlite::Result<Option<crate::db::BuildRow>> {
-    Ok(crate::db::list_builds_by_name(conn, template)?
+    use crate::db::TemplateCachePartition;
+    let builds = crate::db::list_builds_by_name(conn, template)?;
+    let mut resolved: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for build in &builds {
+        let key = build.cache_partition.key();
+        resolved
+            .entry(build.content_hash.clone())
+            .and_modify(|lowest| {
+                if key < *lowest {
+                    lowest.clone_from(&key);
+                }
+            })
+            .or_insert(key);
+    }
+    Ok(builds
         .into_iter()
+        .filter(|build| {
+            (build.cache_partition == TemplateCachePartition::Legacy
+                || pplx_space_node_runtime_core::catalog::template_cache_partition(
+                    build.environment(),
+                ) == build.cache_partition)
+                && resolved.get(&build.content_hash) == Some(&build.cache_partition.key())
+        })
         .filter_map(|build| {
             use pplx_space_common_core::types::RuntimeKind;
             let runtime = build.runtime.parse::<RuntimeKind>().ok()?;
@@ -109,11 +145,15 @@ pub(crate) fn pool_base_build(
                 .then_some((runtime == RuntimeKind::Firecracker, build))
         })
         .max_by(|left, right| {
-            (left.0, &left.1.build_date, &left.1.content_hash).cmp(&(
-                right.0,
-                &right.1.build_date,
-                &right.1.content_hash,
-            ))
+            let key = |(firecracker, build): &(bool, crate::db::BuildRow)| {
+                (
+                    *firecracker,
+                    build.cache_partition == TemplateCachePartition::Legacy,
+                    build.build_date.clone(),
+                    build.content_hash.clone(),
+                )
+            };
+            key(left).cmp(&key(right))
         })
         .map(|(_, build)| build))
 }
@@ -355,7 +395,7 @@ async fn pool_tick(db: &Arc<Mutex<rusqlite::Connection>>) -> PoolResult<PoolTick
 }
 
 /// Create a pool sandbox from base snapshot (slow path). Returns sandbox_id on success.
-async fn create_from_base(
+pub(crate) async fn create_from_base(
     db: Arc<Mutex<rusqlite::Connection>>,
     template: String,
     from_snapshot: bool,

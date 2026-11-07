@@ -363,5 +363,71 @@ fn stream_from(
     }
 }
 
+/// `BTRFS_SEND_C_SUBVOL`: a full stream's first command.
+const SUBVOL_COMMAND: u16 = 1;
+/// `BTRFS_SEND_C_SNAPSHOT`: an incremental stream's first command.
+const SNAPSHOT_COMMAND: u16 = 2;
+/// `BTRFS_SEND_A_CLONE_UUID`: on `SNAPSHOT`, the parent's received UUID, or
+/// its own UUID when it has none.
+const CLONE_UUID_ATTR: u16 = 20;
+/// A command header: length, command and CRC.
+const COMMAND_HEADER: usize = 10;
+
+/// The UUID an incremental stream at the start of `file` needs its parent to
+/// carry as its received UUID: the `CLONE_UUID` of its first command,
+/// `SNAPSHOT`. `None` for a full stream, whose first command is `SUBVOL`.
+///
+/// Only the first stream is read. Every stream in a restore's snapshot file
+/// comes from an encode of the same instance, which names the build the
+/// instance descends from as its parent, so a restarted send's later streams
+/// name the same one.
+pub(in crate::service) fn incremental_parent_uuid(
+    file: &std::fs::File,
+) -> std::io::Result<Option<uuid::Uuid>> {
+    use std::os::unix::fs::FileExt;
+    let invalid =
+        |message: &str| std::io::Error::new(std::io::ErrorKind::InvalidData, message.to_string());
+    let mut head = [0u8; STREAM_HEADER + COMMAND_HEADER];
+    file.read_exact_at(&mut head, 0)?;
+    let (stream, command) = head.split_at(STREAM_HEADER);
+    if !is_stream_header(stream) {
+        return Err(invalid("not a btrfs send stream"));
+    }
+    let [l0, l1, l2, l3, c0, c1, ..] = <[u8; COMMAND_HEADER]>::try_from(command)
+        .map_err(|_| invalid("send stream's first command header is short"))?;
+    let len = u32::from_le_bytes([l0, l1, l2, l3]);
+    let cmd = u16::from_le_bytes([c0, c1]);
+    if cmd == SUBVOL_COMMAND {
+        return Ok(None);
+    }
+    if cmd != SNAPSHOT_COMMAND {
+        return Err(invalid(
+            "send stream starts with neither SUBVOL nor SNAPSHOT",
+        ));
+    }
+    if len > MAX_COMMAND_LEN {
+        return Err(invalid("send stream's first command is too long"));
+    }
+    let mut payload = vec![0u8; len as usize];
+    file.read_exact_at(&mut payload, (STREAM_HEADER + COMMAND_HEADER) as u64)?;
+    let mut rest = payload.as_slice();
+    while let [t0, t1, l0, l1, tail @ ..] = rest {
+        let attr = u16::from_le_bytes([*t0, *t1]);
+        let attr_len = usize::from(u16::from_le_bytes([*l0, *l1]));
+        let Some((value, after)) = tail.split_at_checked(attr_len) else {
+            break;
+        };
+        if attr == CLONE_UUID_ATTR {
+            return uuid::Uuid::from_slice(value)
+                .map(Some)
+                .map_err(|_| invalid("send stream's CLONE_UUID isn't 16 bytes"));
+        }
+        rest = after;
+    }
+    Err(invalid(
+        "send stream's SNAPSHOT command carries no CLONE_UUID",
+    ))
+}
+
 #[cfg(test)]
 mod tests;

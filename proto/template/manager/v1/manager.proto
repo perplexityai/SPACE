@@ -29,7 +29,8 @@ service TemplateManager {
   // template's local pool and its members first, even when it then keeps the
   // template, since pool refills keep its builds in use. Fails with FAILED_PRECONDITION while
   // a build is that recent, pinned, used by a local sandbox or targeted by a
-  // warm pool, ABORTED while the cache GC or another eviction is running, and
+  // warm pool, ABORTED while the cache GC or another eviction is running or a
+  // pull, import, registration or delete holds one of its builds, and
   // NOT_FOUND when no build is cached.
   rpc DeleteIdleTemplate(DeleteIdleTemplateRequest) returns (DeleteIdleTemplateResponse);
 
@@ -154,6 +155,13 @@ message TemplateFullInfo {
   space.net.policy.v1.PolicyAuthority network_policy_authority = 22;
   space.net.policy.v1.PolicyAuthority auto_lifecycle_authority = 23;
   optional space.execution.v1.ExecutionMetadata execution = 24;
+  // The cache partition of this build's row: empty for the legacy partition,
+  // else its environment reference. A build's directory is named by it, not
+  // by its binding: a legacy-partition build can be bound to another
+  // environment, which startup recovery adopts in place. Absent from a
+  // template-manager without partitions, whose builds are all in the legacy
+  // layout.
+  optional string cache_partition = 25;
 }
 
 // ── Template versioning messages ───────────────────────────────────────────
@@ -165,13 +173,17 @@ message TemplateRef {
   string name = 1;
   optional string content_hash = 2;     // exact build hash
   optional string tag = 3;              // build alias
-  // Reserved for template caches keyed by execution environment, where one
-  // rootfs can be cached once per environment it's bound to: in requests, the
-  // environment whose build a lookup prefers; in responses, the resolved
-  // build's binding. Template-manager doesn't key its cache by environment
-  // yet. It keeps every build in one shared layout, ignores the field in
-  // requests, including DeleteTemplateBuild's, and never sets it in
-  // responses; callers read an unset value as that shared build.
+  // One rootfs can be cached once per environment it's bound to. In requests,
+  // an environment reference prefers the build bound to that environment,
+  // then the build unbound and initial-environment builds share, then any
+  // other; absent prefers the shared one. A latest-build lookup returns the
+  // newest build, same-date builds going to the larger content hash and
+  // builds of one digest to that order. A cache miss pulls the release, whose
+  // manifest, or failing that its metadata, decides where it's cached. Callers
+  // check that the build they get is a compatible cold-boot source for the
+  // environment they run it under. In responses: the resolved build's
+  // environment binding, absent for unbound builds. DeleteTemplateBuild
+  // rejects it and removes every cached build of the hash.
   optional string environment = 4;
 }
 

@@ -1227,6 +1227,122 @@ fn template_catalog_preserves_owner_identity_with_corrupt_supplemental_metadata(
     assert!(templates[0].spaced_version.is_empty());
 }
 
+/// A build cached for another environment reads its metadata from its own
+/// cache partition's dir.
+#[test]
+fn template_catalog_reads_a_twin_s_metadata_from_its_partition() {
+    use pplx_space_common_core::types::{Digest, EnvironmentReference, TemplateCachePartition};
+    let cache = tempfile::tempdir().unwrap();
+    let hash = format!("sha256:{}", "a".repeat(64));
+    let twin = EnvironmentReference::new(Digest::sha256([2; 32]));
+    let directory = cache
+        .path()
+        .join("seed")
+        .join(TemplateCachePartition::Environment(twin).build_dir_name(&hash));
+    std::fs::create_dir_all(&directory).unwrap();
+    std::fs::write(
+        directory.join("metadata.json"),
+        br#"{"description":"twin"}"#,
+    )
+    .unwrap();
+    let templates = project_template_catalog(
+        vec![TemplateFullInfo {
+            name: "seed".into(),
+            content_hash: Some(hash),
+            built_at: Some("2026-09-18".into()),
+            execution: Some(pplx_space_execution_common::proto::ExecutionMetadata {
+                environment: Some(twin.to_string()),
+                ..Default::default()
+            }),
+            cache_partition: Some(TemplateCachePartition::Environment(twin).key()),
+            ..Default::default()
+        }],
+        cache.path(),
+    )
+    .unwrap();
+    assert_eq!(templates[0].description, "twin");
+}
+
+/// Startup recovery adopts a legacy-layout build bound to another environment
+/// in place, so its metadata stays in the legacy dir its row's partition names,
+/// whatever its binding. A template-manager without partitions sends no
+/// partition, and all its builds are legacy.
+#[rstest::rstest]
+#[case::legacy_partition(Some(String::new()))]
+#[case::no_partitions(None)]
+fn template_catalog_reads_an_adopted_build_s_metadata_from_its_legacy_dir(
+    #[case] cache_partition: Option<String>,
+) {
+    let cache = tempfile::tempdir().unwrap();
+    let hash = format!("sha256:{}", "a".repeat(64));
+    let directory = cache.path().join("seed").join(&hash);
+    std::fs::create_dir_all(&directory).unwrap();
+    std::fs::write(
+        directory.join("metadata.json"),
+        br#"{"description":"adopted"}"#,
+    )
+    .unwrap();
+    let e1 = pplx_space_execution_catalog::catalog::CompiledEnvironment::for_architecture(
+        pplx_space_common_core::types::Arch::X86_64,
+    )
+    .unwrap()
+    .iter()
+    .find(|entry| entry.name() == "fc-1.17.0-linux-6.1.155")
+    .unwrap()
+    .definition()
+    .execution_requirements()
+    .unwrap()
+    .environment()
+    .unwrap();
+    assert_ne!(
+        e1,
+        pplx_space_node_runtime_core::catalog::initial_environment_reference()
+    );
+    let templates = project_template_catalog(
+        vec![TemplateFullInfo {
+            name: "seed".into(),
+            content_hash: Some(hash),
+            built_at: Some("2026-09-18".into()),
+            execution: Some(pplx_space_execution_common::proto::ExecutionMetadata {
+                environment: Some(e1.to_string()),
+                ..Default::default()
+            }),
+            cache_partition,
+            ..Default::default()
+        }],
+        cache.path(),
+    )
+    .unwrap();
+    assert_eq!(templates[0].description, "adopted");
+}
+
+/// A build whose recorded cache partition doesn't parse still lists, reading
+/// its metadata from the legacy dir, rather than failing the whole catalog.
+#[test]
+fn template_catalog_lists_a_build_with_an_unreadable_cache_partition_from_its_legacy_dir() {
+    let cache = tempfile::tempdir().unwrap();
+    let hash = format!("sha256:{}", "a".repeat(64));
+    let directory = cache.path().join("seed").join(&hash);
+    std::fs::create_dir_all(&directory).unwrap();
+    std::fs::write(
+        directory.join("metadata.json"),
+        br#"{"description":"legacy"}"#,
+    )
+    .unwrap();
+    let templates = project_template_catalog(
+        vec![TemplateFullInfo {
+            name: "seed".into(),
+            content_hash: Some(hash),
+            built_at: Some("2026-09-18".into()),
+            cache_partition: Some("not-a-partition".into()),
+            ..Default::default()
+        }],
+        cache.path(),
+    )
+    .unwrap();
+    assert_eq!(templates[0].description, "legacy");
+}
+
 #[test]
 fn template_catalog_selects_latest_owned_build_independent_of_cache_or_input_order() {
     let cache = tempfile::tempdir().unwrap();

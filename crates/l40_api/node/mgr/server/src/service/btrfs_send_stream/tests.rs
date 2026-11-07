@@ -243,3 +243,56 @@ fn a_stopped_search_salvages_nothing() {
     };
     assert_eq!(salvage_until(&restarted, &stop_after_first_read), None);
 }
+
+/// A stream whose first command is `cmd` with the given attributes, as
+/// `incremental_parent_uuid` reads it (the CRC isn't checked there).
+fn stream_starting_with(cmd: u16, attrs: &[(u16, &[u8])]) -> tempfile::NamedTempFile {
+    let mut payload = Vec::new();
+    for (attr, value) in attrs {
+        payload.extend_from_slice(&attr.to_le_bytes());
+        payload.extend_from_slice(&u16::try_from(value.len()).unwrap().to_le_bytes());
+        payload.extend_from_slice(value);
+    }
+    let mut bytes = MAGIC.to_vec();
+    bytes.extend_from_slice(&1u32.to_le_bytes());
+    bytes.extend_from_slice(&u32::try_from(payload.len()).unwrap().to_le_bytes());
+    bytes.extend_from_slice(&cmd.to_le_bytes());
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    bytes.extend_from_slice(&payload);
+    let file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(file.path(), bytes).unwrap();
+    file
+}
+
+/// An incremental stream names its parent by the `CLONE_UUID` of its first
+/// command, `SNAPSHOT`; a full stream, which starts with `SUBVOL`, has none.
+#[test]
+fn an_incremental_stream_names_its_parent_s_received_uuid() {
+    let full = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(full.path(), STREAM).unwrap();
+    assert_eq!(
+        incremental_parent_uuid(&std::fs::File::open(full.path()).unwrap()).unwrap(),
+        None
+    );
+
+    let parent = uuid::Uuid::from_bytes([7; 16]);
+    let incremental = stream_starting_with(
+        SNAPSHOT_COMMAND,
+        &[
+            (15, b"instance"),
+            (1, &[1; 16]),
+            (2, &5u64.to_le_bytes()),
+            (CLONE_UUID_ATTR, parent.as_bytes()),
+            (21, &3u64.to_le_bytes()),
+        ],
+    );
+    assert_eq!(
+        incremental_parent_uuid(&std::fs::File::open(incremental.path()).unwrap()).unwrap(),
+        Some(parent)
+    );
+
+    let unnamed = stream_starting_with(SNAPSHOT_COMMAND, &[(15, b"instance"), (1, &[1; 16])]);
+    incremental_parent_uuid(&std::fs::File::open(unnamed.path()).unwrap()).unwrap_err();
+    let other = stream_starting_with(3, &[(15, b"file")]);
+    incremental_parent_uuid(&std::fs::File::open(other.path()).unwrap()).unwrap_err();
+}

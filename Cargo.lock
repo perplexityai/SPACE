@@ -7981,6 +7981,7 @@ dependencies = [
  "pplx-space-net-common",
  "pplx-space-node-api-client",
  "pplx-space-node-mgr-client",
+ "pplx-space-node-runtime-core",
  "pplx-space-observability",
  "pplx-space-page-cache",
  "pplx-space-reconcile-metrics",

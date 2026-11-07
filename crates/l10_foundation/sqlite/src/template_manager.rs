@@ -1,5 +1,6 @@
-//! Template-manager's cache-partition migration (20261026220935) was retired
-//! after some databases had applied it. A rollout can migrate a node's
+//! Template-manager's cache-partition migration (20261026220935) has an entry
+//! here for releases that don't bundle it. This release bundles it, so the
+//! runner skips that entry. A rollout can migrate a node's
 //! database from an init container while the previous template-manager still
 //! serves, so a schema change must be readable by the release before it, and a
 //! rollback must not need anything beyond the image.
@@ -43,10 +44,10 @@ const RETIRED_PARTITIONS: Unbundled = Unbundled {
     version: VERSION,
     description: "template_cache_partitions",
     up_sql: include_str!(
-        "../../../../db/template-manager/history/20261026220935_template_cache_partitions.up.sql"
+        "../../../../db/template-manager/20261026220935_template_cache_partitions.up.sql"
     ),
     down_sql: include_str!(
-        "../../../../db/template-manager/history/20261026220935_template_cache_partitions.down.sql"
+        "../../../../db/template-manager/20261026220935_template_cache_partitions.down.sql"
     ),
     label: "retired",
     lossless: legacy_partition_only,

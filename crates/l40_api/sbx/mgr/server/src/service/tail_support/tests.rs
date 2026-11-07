@@ -162,3 +162,60 @@ fn snapshot_identity_uses_durable_binding_when_artifact_metadata_is_missing_or_s
         RuntimeKind::Firecracker
     );
 }
+
+/// A btrfs-send stream's parent build follows the sidecar's binding when it
+/// reads and the row's durable binding when it doesn't: an unreadable sidecar
+/// on a sandbox bound to a non-initial environment still names that
+/// environment's build, not the legacy one.
+#[test]
+fn codec_environment_falls_back_to_the_row_binding_when_the_sidecar_is_unreadable() {
+    use pplx_space_common_core::types::{Arch, SnapshotExecutionMetadata};
+    let catalog =
+        pplx_space_execution_catalog::catalog::CompiledEnvironment::for_architecture(Arch::X86_64)
+            .unwrap();
+    let execution = |name: &str| {
+        catalog
+            .iter()
+            .find(|entry| entry.name() == name)
+            .unwrap()
+            .definition()
+            .execution_requirements()
+            .unwrap()
+    };
+    let e1 = execution("fc-1.17.0-linux-6.1.155");
+    let other = execution("fc-1.17.0-linux-6.18.44");
+    assert!(e1.environment().is_some());
+    assert_ne!(e1.environment(), other.environment());
+
+    let conn = crate::db::test_conn();
+    let id = SandboxId::new().to_string();
+    crate::service::tests::service_tests::insert_test_sandbox(&conn, &id, SandboxState::Paused);
+    let mut row = crate::db::get_sandbox(&conn, &id).unwrap().unwrap();
+    row.execution_metadata = Some(e1.clone());
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join(&id)).unwrap();
+    std::fs::write(root.path().join(&id).join("metadata.json"), b"{not json").unwrap();
+    let unreadable = sandbox_snapshot_execution_metadata_in(root.path(), &row);
+    assert!(matches!(
+        unreadable,
+        Err(RuntimeArtifactReadError::Parse { .. })
+    ));
+
+    assert_eq!(
+        codec_environment(&id, unreadable, row.execution_metadata.as_ref()),
+        e1.environment()
+    );
+    assert_eq!(
+        codec_environment(
+            &id,
+            Ok(SnapshotExecutionMetadata::new(other.clone()).unwrap()),
+            Some(&e1),
+        ),
+        other.environment(),
+        "a readable sidecar wins"
+    );
+    assert_eq!(
+        codec_environment(&id, Err(RuntimeArtifactReadError::MissingBinding), None),
+        None
+    );
+}

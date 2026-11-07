@@ -489,8 +489,9 @@ async fn import_identity_normalization_and_existing_owner_detection_agree() {
 /// answers for, never a build dir that merely exists: the lookup is
 /// `cached_only`, carries no caller org, and its answer must carry its scope's
 /// receipt or none, and say it made the `cached_only` checks, which a
-/// template-manager that predates them doesn't. With no verified build there's
-/// no base, and a delta
+/// template-manager that predates them doesn't. Here a rowless partial legacy
+/// dir sits next to the verified twin the lookup returns. With no verified
+/// build there's no base, and a delta
 /// import is refused: only an absent build is told to pull the template, a
 /// build that can't serve isn't, and a template-manager that couldn't say is
 /// a retryable `UNAVAILABLE`.
@@ -502,9 +503,18 @@ async fn a_delta_base_is_the_catalog_s_verified_build_or_none() {
 
     let hash = format!("sha256:{}", "a".repeat(64));
     let root = tempfile::tempdir().unwrap();
-    let verified_dir = root.path().join("seed").join(&hash);
-    std::fs::create_dir_all(&verified_dir).unwrap();
-    std::fs::write(verified_dir.join("rootfs.ext4"), b"verified").unwrap();
+    let legacy_dir = root.path().join("seed").join(&hash);
+    let verified_dir = root
+        .path()
+        .join("seed")
+        .join(format!("{hash}@sha256:{}", "b".repeat(64)));
+    for (dir, bytes) in [
+        (&legacy_dir, &b"partial"[..]),
+        (&verified_dir, &b"verified"[..]),
+    ] {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join("rootfs.ext4"), bytes).unwrap();
+    }
     let answering_with =
         |dir: &std::path::Path, receipt: Option<TemplateLookupScope>, cached_only: bool| {
             let answer_dir = dir.to_string_lossy().into_owned();

@@ -1338,10 +1338,19 @@ impl SandboxManagerService {
             )
         })?;
 
+        // The parent's partition follows the sandbox's binding, read as the
+        // snapshot sidecar records it, else as the row does. Node-manager
+        // falls back to the legacy build when the sandbox descends from it.
+        let environment = super::super::tail_support::codec_environment(
+            &sandbox.id,
+            super::super::tail_support::sandbox_snapshot_execution_metadata(sandbox),
+            sandbox.execution_metadata.as_ref(),
+        );
         let captured = crate::btrfs_via_nodemgr::encode_rootfs_send(
             &sandbox.id,
             &sandbox.template,
             content_hash,
+            environment,
             snapshot_dir,
             sandbox
                 .node_execution_fence()
