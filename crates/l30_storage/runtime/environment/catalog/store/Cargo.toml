@@ -14,8 +14,7 @@ postgres = ["runtime_environments"]
 workspace = true
 
 [dependencies]
-serde = { workspace = true, features = ["derive"] }
-sqlx = { workspace = true, features = ["derive", "json", "postgres", "runtime-tokio", "tls-rustls-aws-lc-rs"] }
+sqlx = { workspace = true, features = ["derive", "postgres", "runtime-tokio", "tls-rustls-aws-lc-rs"] }
 thiserror = { workspace = true }
 
 # internal

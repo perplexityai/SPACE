@@ -1510,16 +1510,10 @@ one by setting `retired_at`. Authenticated node publications validate and record
 `environments.known` in the inventory transaction, even before any environment is
 usable. Missing or unavailable observations do not erase the catalog.
 
-Compatibility edges intersect across accepted historical reports: older reports
-cannot restore removed edges, and conflicting version ordering becomes unknown.
-Identical reports neither rewrite nor update-lock catalog rows; operator
-retirement is never changed. Admission serializes only reports containing new
-references and bounds the persisted unretired catalog by the recipe limit.
-At capacity, new references are deferred without rejecting inventory; existing
-certifications still intersect. An operator must retire entries to free space.
-This bounds automatic growth; it does not replace trust in registered nodes or
-reserve capacity for future releases. Expanding certifications requires separate
-reviewed work.
+Registration is insert-only: `ON CONFLICT DO NOTHING` leaves existing metadata,
+compatibility edges, and operator retirement untouched. Node reports do not
+revise catalog certifications. The existing recipe-size guard still applies;
+operators retire old entries to keep the active catalog within that limit.
 
 Deploy the optional kernel/state-format metadata migration before this publisher.
 The legacy activation catalog reader ignores profiles lacking kernel or

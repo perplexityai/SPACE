@@ -132,20 +132,16 @@ pub(super) async fn publish(
             .map_err(|error| Status::invalid_argument(error.to_string()))?;
         publish_inventory(tx, node_id, inventory).await?;
         if let Some(environments) = environments {
-            // The enclosing registered-node publication owns the transaction.
-            // Admit new rows before taking any per-environment update locks.
-            let deferred = pplx_space_runtime_environment_catalog_store::publish_known(
-                    tx,
-                    environments.known(),
-                    pplx_space_node_api_client::MAX_RECIPE_ENVIRONMENTS,
+            for environment in environments.known() {
+                pplx_space_runtime_environment_catalog_store::register_known(
+                    &mut **tx,
+                    environment,
                 )
                 .await
                 .map_err(|error| {
-                    tracing::error!(%error, %node_id, "failed to publish certified runtime environment");
-                    Status::internal("failed to publish certified runtime environment")
+                    tracing::error!(%error, %node_id, "failed to register runtime environment");
+                    Status::internal("failed to register runtime environment")
                 })?;
-            if deferred != 0 {
-                tracing::warn!(%node_id, deferred, "runtime catalog full; new environments deferred until operator retirement");
             }
         }
     }
