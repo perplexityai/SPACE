@@ -31,6 +31,7 @@ use super::outcome::RowOutcome;
 use super::verdict::Heartbeat;
 use super::{CandidateNode, DeadNodeSink, ReferenceNode, RowWrite, WriteBasis, WriteResult};
 use crate::gone_node_write_off::node_identity_holds;
+use crate::node_drain::store::v2_sink::v2_terminated_record;
 
 pub struct DeadNodeDbStore {
     pool: PgPool,
@@ -50,19 +51,24 @@ impl DeadNodeDbStore {
 /// node's Kubernetes name stamped with an instance other than the node's
 /// recorded one: the rows a same-name replacement's predecessor left. The
 /// freshness fragment is per row here rather than on a bound id;
-/// `node_status_snapshots` holds one row per node.
+/// `node_status_snapshots` holds one row per node. Also every v2 drain's
+/// node the controller terminated, by the drain's record
+/// ([`v2_terminated_record`]), with the drain's epoch.
 static CANDIDATE_NODES: LazyLock<String> = LazyLock::new(|| {
     let fresh = node_heartbeat_fresh("n.id");
+    let drain_terminated = v2_terminated_record("n");
     sql!(
         format!(
             "SELECT n.id, k.k8s_node_name, k.k8s_node_uid, k.instance_id,
-                    {fresh} AS heartbeat_fresh
+                    {fresh} AS heartbeat_fresh,
+                    CASE WHEN {drain_terminated}
+                         THEN (n.drain_status->>'epoch')::BIGINT
+                    END AS drain_terminated_epoch
                FROM nodes n
                LEFT JOIN node_k8s k ON k.node_id = n.id
               WHERE n.managed_by = $1
-                AND n.drain_phase IS NULL
                 AND ($2::UUID IS NULL OR n.id > $2)
-                AND (
+                AND ({drain_terminated} OR n.drain_phase IS NULL AND (
                     NOT {fresh}
                     OR EXISTS (
                         SELECT 1
@@ -84,7 +90,7 @@ static CANDIDATE_NODES: LazyLock<String> = LazyLock::new(|| {
                            AND latest.node_instance_id IS NOT NULL
                            AND latest.node_instance_id IS DISTINCT FROM k.instance_id
                     )
-                )
+                ))
               ORDER BY n.id
               LIMIT $3"
         )
@@ -122,19 +128,25 @@ static HEARTBEAT_FRESH: LazyLock<String> = LazyLock::new(|| {
     sql!(format!("SELECT {fresh}").as_str())
 });
 
-/// `$1` = node id, `$2` = substrate, `$3` = the node's Kubernetes name. The
+/// `$1` = node id, `$2` = substrate, `$3` = the node's Kubernetes name, `$4`
+/// = the epoch of the v2 drain whose record selected the node, or NULL. The
 /// lost node's delete, run with the node row locked and its `node_k8s` row
-/// re-checked: still outside any drain, its heartbeat still stale, and no
-/// non-terminal row pinning it and no active execution on its name left, as
-/// `orphaned_nodes` requires.
+/// re-checked: still outside any drain (or, with `$4`, still that epoch's
+/// drain-terminated node by the drain's record), its heartbeat still stale,
+/// and no non-terminal row pinning it and no active execution on its name
+/// left, as `orphaned_nodes` requires.
 static DELETE_NODE: LazyLock<String> = LazyLock::new(|| {
     let fresh = node_heartbeat_fresh("$1");
+    let drain_terminated = v2_terminated_record("n");
     sql!(
         format!(
             "DELETE FROM nodes n
               WHERE n.id = $1
                 AND n.managed_by = $2
-                AND n.drain_phase IS NULL
+                AND CASE WHEN $4::BIGINT IS NULL THEN n.drain_phase IS NULL
+                         ELSE {drain_terminated}
+                              AND (n.drain_status->>'epoch')::BIGINT = $4
+                    END
                 AND NOT {fresh}
                 AND NOT EXISTS (
                     SELECT 1 FROM sandboxes
@@ -182,16 +194,51 @@ async fn recorded_instance_holds(
     Ok(recorded.flatten().as_deref() == instance_id)
 }
 
+/// `$1` = node id, `$2` = the drain's epoch. Whether the node is still that
+/// epoch's drain-terminated node by the drain's record, read `FOR SHARE`.
+static DRAIN_TERMINATED_HOLDS: LazyLock<String> = LazyLock::new(|| {
+    let drain_terminated = v2_terminated_record("n");
+    sql!(
+        format!(
+            "SELECT 1 FROM nodes n
+              WHERE n.id = $1
+                AND {drain_terminated}
+                AND (n.drain_status->>'epoch')::BIGINT = $2
+              FOR SHARE"
+        )
+        .as_str()
+    )
+});
+
 /// The node checks every row write rests on, under the node rows' shared
-/// locks: still outside any drain with the uid and instance the tick read,
-/// and, for a row the node's verdict selected, still without a fresh
-/// heartbeat.
+/// locks: still outside any drain (or still the drain-terminated node of the
+/// same epoch by the drain's record) with the uid and instance the tick read,
+/// and, for a row the node's verdict selected or any row of a
+/// drain-terminated node, still without a fresh heartbeat.
 async fn node_holds(
     tx: &mut Transaction<'_, Postgres>,
     node: &CandidateNode,
     basis: WriteBasis,
 ) -> Result<bool, sqlx::Error> {
-    if node.managed_by == SubstrateKind::Kubernetes {
+    if let Some(epoch) = node.drain_terminated_epoch {
+        let held: Option<i32> =
+            sqlx::query_scalar(sqlx::AssertSqlSafe(DRAIN_TERMINATED_HOLDS.as_str()))
+                .bind(node.node_id)
+                .bind(epoch)
+                .fetch_optional(&mut **tx)
+                .await?;
+        if held.is_none()
+            || !node_identity_holds(
+                tx,
+                node.node_id,
+                Some("terminating"),
+                node.k8s_node_uid.as_deref(),
+            )
+            .await?
+        {
+            return Ok(false);
+        }
+    } else if node.managed_by == SubstrateKind::Kubernetes {
         if !node_identity_holds(tx, node.node_id, None, node.k8s_node_uid.as_deref()).await? {
             return Ok(false);
         }
@@ -213,8 +260,8 @@ async fn node_holds(
         return Ok(false);
     }
     match basis {
-        WriteBasis::InstanceDead => Ok(true),
-        WriteBasis::NodeLost => {
+        WriteBasis::InstanceDead if node.drain_terminated_epoch.is_none() => Ok(true),
+        WriteBasis::InstanceDead | WriteBasis::NodeLost => {
             let fresh: bool = sqlx::query_scalar(sqlx::AssertSqlSafe(HEARTBEAT_FRESH.as_str()))
                 .bind(node.node_id)
                 .fetch_one(&mut **tx)
@@ -292,7 +339,14 @@ impl DeadNodeSink for DeadNodeDbStore {
         after: Option<NodeId>,
         limit: u32,
     ) -> Result<Vec<CandidateNode>, sqlx::Error> {
-        type Row = (NodeId, Option<String>, Option<String>, Option<String>, bool);
+        type Row = (
+            NodeId,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            bool,
+            Option<i64>,
+        );
         let rows: Vec<Row> = sqlx::query_as(sqlx::AssertSqlSafe(CANDIDATE_NODES.as_str()))
             .bind(managed_by)
             .bind(after)
@@ -302,17 +356,20 @@ impl DeadNodeSink for DeadNodeDbStore {
         Ok(rows
             .into_iter()
             .map(
-                |(node_id, k8s_node_name, k8s_node_uid, instance_id, fresh)| CandidateNode {
-                    node_id,
-                    managed_by,
-                    k8s_node_name,
-                    k8s_node_uid,
-                    instance_id,
-                    heartbeat: if fresh {
-                        Heartbeat::Fresh
-                    } else {
-                        Heartbeat::Stale
-                    },
+                |(node_id, k8s_node_name, k8s_node_uid, instance_id, fresh, drain_epoch)| {
+                    CandidateNode {
+                        node_id,
+                        managed_by,
+                        k8s_node_name,
+                        k8s_node_uid,
+                        instance_id,
+                        heartbeat: if fresh {
+                            Heartbeat::Fresh
+                        } else {
+                            Heartbeat::Stale
+                        },
+                        drain_terminated_epoch: drain_epoch,
+                    }
                 },
             )
             .collect())
@@ -432,6 +489,7 @@ impl DeadNodeSink for DeadNodeDbStore {
             .bind(node.node_id)
             .bind(node.managed_by)
             .bind(node.k8s_node_name.as_deref())
+            .bind(node.drain_terminated_epoch)
             .execute(&mut *tx)
             .await?
             .rows_affected();

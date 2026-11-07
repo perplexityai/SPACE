@@ -561,3 +561,298 @@ async fn a_row_write_refuses_when_the_node_moved() -> TestResult {
     }
     Ok(())
 }
+
+/// The drain's epoch in the drain-terminated nodes these tests insert.
+const EPOCH: i64 = 1_794_000_000_000_000;
+
+/// A Kubernetes node a v2 drain let go and the controller terminated under
+/// [`EPOCH`], recorded against its uid and [`OWN`]; `edit` changes the
+/// record before it is written.
+async fn drain_terminated_node(
+    pool: &PgPool,
+    status: Status,
+    edit: impl FnOnce(&mut serde_json::Value),
+) -> TestResult<NodeId> {
+    let node_id = insert_node(
+        pool,
+        SubstrateKind::Kubernetes,
+        None,
+        status,
+        Some("uid"),
+        Some(OWN),
+    )
+    .await?;
+    let mut record = serde_json::json!({
+        "epoch": EPOCH,
+        "report": {"sealed_epoch": EPOCH, "done": true},
+        "terminate": {"epoch": EPOCH},
+        "terminated": {"epoch": EPOCH, "k8s_node_uid": "uid", "instance_id": OWN, "at_ms": 1},
+    });
+    edit(&mut record);
+    sqlx::query(sql!(
+        "UPDATE nodes
+            SET drain_phase = 'terminating', drain_mode = 'forced', drain_started_at = NOW(),
+                drain_engine = 'v2', drain_status = $2
+          WHERE id = $1"
+    ))
+    .bind(node_id)
+    .bind(record)
+    .execute(pool)
+    .await?;
+    Ok(node_id)
+}
+
+/// A v2 drain's node is judged by the drain's record, with its epoch,
+/// whatever its heartbeat: every piece of the record must be there, under
+/// the drain's epoch, and the termination recorded against the uid and
+/// instance `node_k8s` still holds. Missing or moved, the node stays out, as
+/// any node in a drain phase does.
+#[tokio::test(flavor = "current_thread")]
+async fn a_drain_terminated_node_is_judged_by_the_drains_record() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let pool = &db.pool;
+    type Edit = fn(&mut serde_json::Value);
+    let cases: [(&str, Edit, bool); 11] = [
+        ("the whole record", |_| {}, true),
+        (
+            "no :terminate record",
+            |r| {
+                r.as_object_mut().unwrap().remove("terminate");
+            },
+            false,
+        ),
+        (
+            "let go under another epoch",
+            |r| r["terminate"]["epoch"] = (EPOCH - 1).into(),
+            false,
+        ),
+        (
+            "report not done",
+            |r| r["report"]["done"] = false.into(),
+            false,
+        ),
+        (
+            "report under another epoch",
+            |r| r["report"]["sealed_epoch"] = (EPOCH - 1).into(),
+            false,
+        ),
+        (
+            "not terminated",
+            |r| {
+                r.as_object_mut().unwrap().remove("terminated");
+            },
+            false,
+        ),
+        (
+            "terminated under another epoch",
+            |r| r["terminated"]["epoch"] = (EPOCH - 1).into(),
+            false,
+        ),
+        (
+            "terminated another uid",
+            |r| r["terminated"]["k8s_node_uid"] = "uid-old".into(),
+            false,
+        ),
+        (
+            "terminated another instance",
+            |r| r["terminated"]["instance_id"] = OTHER.into(),
+            false,
+        ),
+        (
+            "terminated no instance",
+            |r| r["terminated"]["instance_id"] = serde_json::Value::Null,
+            false,
+        ),
+        (
+            "the drain moved on",
+            |r| r["epoch"] = (EPOCH + 1).into(),
+            false,
+        ),
+    ];
+    let store = DeadNodeDbStore::new(pool.clone());
+    for (case, edit, judged) in cases {
+        let node_id = drain_terminated_node(pool, Status::Fresh, edit).await?;
+        let found = store
+            .candidate_nodes(SubstrateKind::Kubernetes, None, 1000)
+            .await?
+            .into_iter()
+            .find(|node| node.node_id == node_id);
+        assert_eq!(
+            found.as_ref().map(|node| node.drain_terminated_epoch),
+            judged.then_some(Some(EPOCH)),
+            "{case}"
+        );
+    }
+    // Recorded as a v1 node's row would never be: the engine is the drain's.
+    let v1 = drain_terminated_node(pool, Status::Missing, |_| {}).await?;
+    sqlx::query(sql!("UPDATE nodes SET drain_engine = NULL WHERE id = $1"))
+        .bind(v1)
+        .execute(pool)
+        .await?;
+    let listed = store
+        .candidate_nodes(SubstrateKind::Kubernetes, None, 1000)
+        .await?;
+    assert!(
+        listed.iter().all(|node| node.node_id != v1),
+        "a v1 terminating node"
+    );
+    // A node outside any drain is judged as before, with no drain epoch.
+    let plain = insert_node(
+        pool,
+        SubstrateKind::Kubernetes,
+        None,
+        Status::Missing,
+        Some("uid"),
+        Some(OWN),
+    )
+    .await?;
+    assert_eq!(candidate(pool, plain).await?.drain_terminated_epoch, None);
+    Ok(())
+}
+
+/// Live mode deletes a drain-terminated node's row by the drain's record,
+/// with no tombstone, once its heartbeat is stale; a fresh heartbeat, a
+/// record that moved, a new drain's epoch or a live row pinning it refuses.
+#[tokio::test(flavor = "current_thread")]
+async fn a_drain_terminated_nodes_delete_rests_on_the_drains_record() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let pool = &db.pool;
+    let store = DeadNodeDbStore::new(pool.clone());
+    for case in [
+        "nothing moved",
+        "heartbeat back",
+        "termination record moved",
+        "a new drain's epoch",
+        "live row pinned",
+    ] {
+        let node_id = drain_terminated_node(pool, Status::Missing, |_| {}).await?;
+        let node = candidate(pool, node_id).await?;
+        assert_eq!(node.drain_terminated_epoch, Some(EPOCH), "{case}");
+        match case {
+            "heartbeat back" => set_status(pool, node_id, Status::Fresh).await?,
+            "termination record moved" => {
+                sqlx::query(sql!(
+                    "UPDATE nodes SET drain_status = drain_status - 'terminated' WHERE id = $1"
+                ))
+                .bind(node_id)
+                .execute(pool)
+                .await?;
+            }
+            "a new drain's epoch" => {
+                sqlx::query(sql!(
+                    "UPDATE nodes
+                        SET drain_status = jsonb_set(drain_status, '{epoch}', to_jsonb($2::BIGINT))
+                      WHERE id = $1"
+                ))
+                .bind(node_id)
+                .bind(EPOCH + 1)
+                .execute(pool)
+                .await?;
+            }
+            "live row pinned" => {
+                insert_row(
+                    pool,
+                    "suspended",
+                    SubstrateKind::Kubernetes,
+                    None,
+                    Some(node_id),
+                )
+                .await?;
+            }
+            _ => {}
+        }
+        let deletes = case == "nothing moved";
+        assert_eq!(store.delete_node(&node).await?, deletes, "{case}");
+        assert_eq!(node_exists(pool, node_id).await?, !deletes, "{case}");
+        let tombstone: Option<i32> =
+            sqlx::query_scalar(sql!("SELECT 1 FROM node_k8s_tombstones WHERE node_id = $1"))
+                .bind(node_id)
+                .fetch_optional(pool)
+                .await?;
+        assert_eq!(tombstone, None, "{case}");
+    }
+    // The same node read as outside any drain is refused: the record is what
+    // lets a node in `terminating` go.
+    let node_id = drain_terminated_node(pool, Status::Missing, |_| {}).await?;
+    let node = CandidateNode {
+        drain_terminated_epoch: None,
+        ..candidate(pool, node_id).await?
+    };
+    assert!(!store.delete_node(&node).await?);
+    assert!(node_exists(pool, node_id).await?);
+    Ok(())
+}
+
+/// A drain-terminated node's row writes rest on the drain's record and a
+/// stale heartbeat whatever their basis: a row stamped with the node's
+/// instance is refused once the heartbeat is back, where a node outside any
+/// drain would let it through.
+#[tokio::test(flavor = "current_thread")]
+async fn a_drain_terminated_nodes_row_write_rests_on_the_record_and_a_stale_heartbeat() -> TestResult
+{
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let pool = &db.pool;
+    let store = DeadNodeDbStore::new(pool.clone());
+    for (case, basis, applied) in [
+        ("nothing moved", WriteBasis::NodeLost, true),
+        ("nothing moved, stamped", WriteBasis::InstanceDead, true),
+        ("heartbeat back, stamped", WriteBasis::InstanceDead, false),
+        ("termination record moved", WriteBasis::InstanceDead, false),
+    ] {
+        let node_id = drain_terminated_node(pool, Status::Missing, |_| {}).await?;
+        let stamp = (basis == WriteBasis::InstanceDead).then_some(OWN);
+        let sandbox_id = pinned_with_stamps(pool, node_id, "started", &[stamp]).await?;
+        let node = candidate(pool, node_id).await?;
+        match case {
+            "heartbeat back, stamped" => set_status(pool, node_id, Status::Fresh).await?,
+            "termination record moved" => {
+                sqlx::query(sql!(
+                    "UPDATE nodes SET drain_status = drain_status - 'terminated' WHERE id = $1"
+                ))
+                .bind(node_id)
+                .execute(pool)
+                .await?;
+            }
+            _ => {}
+        }
+        let decide = |row: &DeadNodeRow| super::super::outcome::row_outcome(row);
+        let source = sqlx::query_scalar(sql!(
+            "SELECT id FROM sandbox_k8s_executions WHERE sandbox_id = $1"
+        ))
+        .bind(sandbox_id)
+        .fetch_one(pool)
+        .await?;
+        let write = RowWrite {
+            sandbox_id,
+            outcome: RowOutcome::Lost,
+            source_execution: Some(source),
+            basis,
+            decide: &decide,
+        };
+        let expected = if applied {
+            WriteResult::Applied
+        } else {
+            WriteResult::NodeChanged
+        };
+        assert_eq!(
+            store
+                .write_row(&node, &write, std::time::Duration::from_secs(600))
+                .await?,
+            expected,
+            "{case}"
+        );
+        let lifecycle: String =
+            sqlx::query_scalar(sql!("SELECT lifecycle FROM sandboxes WHERE id = $1"))
+                .bind(sandbox_id)
+                .fetch_one(pool)
+                .await?;
+        assert_eq!(lifecycle == "failed", applied, "{case}");
+    }
+    Ok(())
+}

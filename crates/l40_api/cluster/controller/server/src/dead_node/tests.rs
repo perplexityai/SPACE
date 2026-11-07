@@ -255,6 +255,7 @@ fn dead_node(uid: &str) -> CandidateNode {
         k8s_node_uid: Some(uid.to_owned()),
         instance_id: Some(DEAD_INSTANCE.to_owned()),
         heartbeat: Heartbeat::Stale,
+        drain_terminated_epoch: None,
     }
 }
 
@@ -951,4 +952,113 @@ async fn nodes_past_the_cap_wait_for_the_next_tick() {
     let judged: Vec<NodeId> = next.nodes.iter().map(|node| node.node_id).collect();
     assert_eq!(judged, vec![ninth]);
     assert_eq!(reconciler.scan_after, None);
+}
+
+/// A node its v2 drain let go is lost by the drain's record once its
+/// heartbeat is stale, with no EC2 call and no Kubernetes evidence read:
+/// here the reflector still lists its Node and EC2 would call its instance
+/// running. Its rows follow the same rules, by the recorded instance's death
+/// or the node's: a row a drain restore owns stays with it, and a row stamped
+/// with another instance is not asked about. With a fresh heartbeat it waits
+/// and nothing is written.
+#[tokio::test(start_paused = true)]
+async fn a_drain_terminated_node_is_lost_by_the_drains_record_without_asking_ec2() {
+    let node = CandidateNode {
+        drain_terminated_epoch: Some(7),
+        ..dead_node(DEAD_UID)
+    };
+    let stamped = started(Some(DEAD_INSTANCE));
+    let unstamped = row(SandboxLifecycle::Started, None);
+    let restore_owned = DeadNodeRow {
+        restore_owned: true,
+        ..row(SandboxLifecycle::Suspended, Some(Some(DEAD_INSTANCE)))
+    };
+    let predecessor = started(Some(OLDER_INSTANCE));
+    for (heartbeat, lost) in [(Heartbeat::Stale, true), (Heartbeat::Fresh, false)] {
+        let sink = Arc::new(FakeSink {
+            rows: vec![
+                stamped.clone(),
+                unstamped.clone(),
+                restore_owned.clone(),
+                predecessor.clone(),
+            ],
+            ..FakeSink::with_node(CandidateNode {
+                heartbeat,
+                ..node.clone()
+            })
+        });
+        let membership = FakeMembership::dead_node_gone();
+        membership.set_uids(Some(&[DEAD_UID, REFERENCE_UID]));
+        membership.set_exists(DEAD_NAME, Ok(true));
+        let ec2 = FakeEc2::dead_instances();
+        ec2.list(DEAD_INSTANCE, &["running"]);
+        let mut reconciler = reconciler(
+            Mode::Live,
+            &sink,
+            membership,
+            InstanceAuthority::Ec2(ec2.clone()),
+        );
+        let report = reconciler.tick().await;
+        assert!(ec2.calls().is_empty(), "{heartbeat:?}: asked EC2");
+        let judged = &report.nodes[0];
+        let instances: Vec<(&str, InstanceVerdict)> = judged
+            .instances
+            .iter()
+            .map(|(id, verdict)| (id.as_str(), *verdict))
+            .collect();
+        if lost {
+            assert_eq!(judged.verdict, Verdict::Lost(LostReason::DrainTerminated));
+            assert_eq!(
+                instances,
+                [
+                    (
+                        OLDER_INSTANCE,
+                        InstanceVerdict::Unknown(UnknownReason::InstanceNotAsked)
+                    ),
+                    (
+                        DEAD_INSTANCE,
+                        InstanceVerdict::Dead(DeadReason::DrainTerminated)
+                    ),
+                ]
+            );
+            assert_eq!(
+                sink.writes(),
+                [
+                    RecordedWrite {
+                        sandbox_id: stamped.sandbox_id,
+                        outcome: RowOutcome::Lost,
+                        basis: WriteBasis::InstanceDead,
+                    },
+                    RecordedWrite {
+                        sandbox_id: unstamped.sandbox_id,
+                        outcome: RowOutcome::Lost,
+                        basis: WriteBasis::NodeLost,
+                    },
+                ]
+            );
+            assert_eq!(judged.counts.get(&RowOutcome::HeldByRestore), Some(&1));
+            assert_eq!(judged.counts.get(&RowOutcome::Unselected), Some(&1));
+            assert!(judged.deleted);
+            assert_eq!(*sink.deletes.lock().unwrap(), [node.node_id]);
+        } else {
+            assert_eq!(
+                judged.verdict,
+                Verdict::Unknown(UnknownReason::HeartbeatFresh)
+            );
+            assert_eq!(
+                judged.instances.get(DEAD_INSTANCE),
+                Some(&InstanceVerdict::Live)
+            );
+            assert!(sink.writes().is_empty());
+            assert!(sink.deletes.lock().unwrap().is_empty());
+            assert_eq!(
+                *sink.statuses.lock().unwrap(),
+                [(
+                    "live".to_owned(),
+                    "unknown".to_owned(),
+                    "heartbeat_fresh".to_owned()
+                )]
+            );
+        }
+    }
 }
