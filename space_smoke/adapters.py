@@ -33,6 +33,7 @@ from urllib.parse import parse_qs, quote, urlencode, urlsplit
 from urllib.request import Request, urlopen
 
 from space_smoke.capabilities import (
+    ActivationSealReport,
     ControllerLease,
     ControllerPod,
     NodeContainer,
@@ -132,6 +133,7 @@ from space_smoke.drain_restore import (
     validate_drain_restore_hold_keys,
     validate_drain_restore_hold_overrides,
 )
+from space_smoke.activation_seal import parse_activation_seal_report
 from space_smoke.stopped_replacement import (
     STOPPED_REPLACEMENT_ENV_KEYS,
     parse_doctor_lifecycle,
@@ -601,6 +603,10 @@ CONTAINERD_BUILDS_NAMESPACE = "space-builds"
 # holder can uncordon it if that holder never did. Nothing in SPACE itself ever
 # uncordons.
 CORDONED_NODE_ANNOTATION = "space.pplx.net/smoke-cordoned-node"
+# Likewise the worker whose sandbox-manager activations its holder sealed, as
+# `<node> <epoch>`: the next holder unseals it under that epoch before it
+# uncordons, since nothing in SPACE ever unseals either.
+SEALED_ACTIVATIONS_ANNOTATION = "space.pplx.net/smoke-sealed-activations"
 # The public-API mutation Lease records what the rate-limiter scenario is about
 # to change before it changes it: the limiter env the public API Deployment
 # held (JSON, null for unset) and the Redis replica count it scales down from.
@@ -2175,6 +2181,28 @@ ON CONFLICT (key_hash) DO NOTHING;
                 if isinstance(annotations, dict)
                 else None
             )
+            sealed = (
+                annotations.get(SEALED_ACTIVATIONS_ANNOTATION)
+                if isinstance(annotations, dict)
+                else None
+            )
+            if isinstance(sealed, str) and sealed:
+                sealed_node, _, sealed_epoch = sealed.partition(" ")
+                if not sealed_node or not sealed_epoch.isdigit():
+                    raise SmokeConfigurationError(
+                        f"unrecognized activation seal recorded on Lease {name}: {sealed!r}"
+                    )
+                self._assert_lease_owned(ownership, "an orphaned-seal repair")
+                _require_ok(
+                    self._node_shell_exec(
+                        sealed_node,
+                        f"/space/bin/space-sbxmgr unseal-activations --epoch {int(sealed_epoch)}",
+                        timeout=60,
+                    ),
+                    f"unseal sandbox-manager activations on {sealed_node} "
+                    "orphaned by an expired smoke Lease",
+                )
+                self._annotate_lease(name, SEALED_ACTIVATIONS_ANNOTATION, None)
             if isinstance(recorded, str) and recorded:
                 self._assert_lease_owned(ownership, "an orphaned-cordon repair")
                 _require_ok(
@@ -5902,6 +5930,54 @@ ON CONFLICT (key_hash) DO NOTHING;
         )
         output = _require_ok(result, f"read sandbox-manager state of {canonical} on {node_name}")
         return parse_doctor_lifecycle(output)
+
+    # --- sandbox-manager activation seal ----------------------------------
+
+    def seal_activations(
+        self, node_name: str, epoch: int, *, wait_seconds: int
+    ) -> ActivationSealReport:
+        ownership = self._cordon_lease_ownership
+        if ownership is None:
+            raise SmokeConfigurationError(
+                "refusing an activation seal without the caller's live worker-cordon Lease"
+            )
+        self._assert_lease_owned(ownership, f"sealing activations on {node_name}")
+        # Record first, as for a cordon: a run killed after this unseals on
+        # the next holder's repair, which an unsealed worker answers unchanged.
+        self._annotate_lease(
+            ownership.name, SEALED_ACTIVATIONS_ANNOTATION, f"{node_name} {int(epoch)}"
+        )
+        result = self._node_shell_exec(
+            node_name,
+            "/space/bin/space-sbxmgr seal-activations "
+            f"--epoch {int(epoch)} --wait-secs {int(wait_seconds)}",
+            timeout=wait_seconds + 60,
+        )
+        return parse_activation_seal_report(
+            _require_ok(result, f"seal sandbox-manager activations on {node_name}")
+        )
+
+    def unseal_activations(self, node_name: str, epoch: int) -> ActivationSealReport:
+        result = self._node_shell_exec(
+            node_name,
+            f"/space/bin/space-sbxmgr unseal-activations --epoch {int(epoch)}",
+            timeout=60,
+        )
+        report = parse_activation_seal_report(
+            _require_ok(result, f"unseal sandbox-manager activations on {node_name}")
+        )
+        ownership = self._cordon_lease_ownership
+        if ownership is not None:
+            self._annotate_lease(ownership.name, SEALED_ACTIVATIONS_ANNOTATION, None)
+        return report
+
+    def activation_seal_state(self, node_name: str) -> ActivationSealReport:
+        result = self._node_shell_exec(
+            node_name, "/space/bin/space-sbxmgr activation-seal", timeout=60
+        )
+        return parse_activation_seal_report(
+            _require_ok(result, f"read the sandbox-manager activation seal on {node_name}")
+        )
 
     # --- template-manager startup recovery -------------------------------
 

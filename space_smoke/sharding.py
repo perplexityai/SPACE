@@ -140,6 +140,9 @@ _DURATION_SECONDS = {
         "native.m1_generated_sdk_conformance": 18,
         "native.network_policy_live_update": 7,
         "native.resident_pause": 5,
+        # Not in the measured runs; an estimate: two durable suspends, three
+        # refused activations and three that succeed.
+        "native.sealed_worker_refuses_activations": 90,
         "native.stopped_restart_preserves_rootfs": 75,
         "native_concurrency.command_idempotency": 3,
         "native_concurrency.create_idempotency": 3,
