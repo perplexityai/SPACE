@@ -617,6 +617,12 @@ pub enum SubstrateError {
     /// treating it as an in-flight suspend that will converge unaided.
     #[error("{message}")]
     RetainedFilesystemOnlyCopy { message: String },
+    /// The node had not yet admitted a node-local delete when the teardown
+    /// stopped waiting for it, or could not say whether it had, so the
+    /// delete's refusals have not run. Cluster deletion must preserve its row
+    /// and retry the delete, within the operation's retry budget.
+    #[error("{message}")]
+    NodeDeleteNotAdmitted { message: String },
     /// Another request owns the bounded activation lease for this execution.
     /// Same-target callers may join its result; different-target callers must
     /// retry after the lease lapses.
@@ -922,6 +928,9 @@ impl From<SubstrateError> for ControllerError {
             }
             SubstrateError::RetainedFilesystemOnlyCopy { message } => {
                 ControllerError::new(axum::http::StatusCode::CONFLICT, message)
+            }
+            SubstrateError::NodeDeleteNotAdmitted { message } => {
+                ControllerError::service_unavailable(message).with_retry_after(GATEWAY_RETRY_AFTER)
             }
             SubstrateError::ActivationInFlight {
                 message,
