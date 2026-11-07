@@ -1,3 +1,13 @@
+//! The Kubernetes substrate: a pod per sandbox execution, placed by
+//! kube-scheduler. The rules for changing it are in the parent directory's
+//! `AGENTS.md`.
+//!
+//! # Gaps
+//!
+//! | Refused or missing | Effect today | Owner | Removed by |
+//! |---|---|---|---|
+//! | Environment placement gate (`SPACE_ENVIRONMENT_PLACEMENT_GATE`) | `on` fails startup with `SubstrateError::Unsupported`: pods carry no environment label requirement. `shadow` places as `off`, counts nothing, and logs a warning at startup | the-gigi-pplx | node-ctl labeling its Node with its usable environments, and bound pods requiring their environment's label |
+
 use std::{
     fmt,
     net::{IpAddr, SocketAddr},

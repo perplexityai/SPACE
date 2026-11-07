@@ -1,4 +1,5 @@
 pub mod direct;
+pub mod environment_placement;
 #[cfg(feature = "kubernetes")]
 pub mod kubernetes;
 mod runtime_rpc;
@@ -1810,12 +1811,25 @@ impl Substrate {
         shutdown_token: CancellationToken,
         task_tracker: TaskTracker,
     ) -> Result<Self, SubstrateError> {
+        // Parsed on both substrates, so a typo fails startup wherever it's
+        // set; only Direct places under it so far, and Kubernetes refuses
+        // `on`.
+        let environment_placement =
+            environment_placement::EnvironmentPlacementGate::from_environment(
+                &pplx_space_common_core::env::ProcessEnvironment,
+            )
+            .map_err(|error| SubstrateError::Failed {
+                message: error.to_string(),
+            })?;
         #[cfg(feature = "kubernetes")]
         {
             match kubernetes::KubernetesSubstrate::try_from_env(pool, shutdown_token, task_tracker)
                 .await
             {
-                Ok(Some(substrate)) => return Ok(Self::from_kubernetes(substrate)),
+                Ok(Some(substrate)) => {
+                    environment_placement.check_kubernetes_support()?;
+                    return Ok(Self::from_kubernetes(substrate));
+                }
                 Ok(None) => {}
                 Err(err) => return Err(err),
             }
@@ -1823,9 +1837,10 @@ impl Substrate {
         #[cfg(not(feature = "kubernetes"))]
         drop((shutdown_token, task_tracker));
 
-        Ok(Self::from_direct(direct::DirectSubstrate::new(
-            pool.clone(),
-        )))
+        Ok(Self::from_direct(
+            direct::DirectSubstrate::new(pool.clone())
+                .with_environment_placement_gate(environment_placement),
+        ))
     }
 
     pub(crate) async fn reserve_rollback_route_identity(

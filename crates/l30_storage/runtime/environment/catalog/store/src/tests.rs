@@ -557,3 +557,91 @@ async fn a_recompute_while_a_publication_holds_the_aggregate_is_deferred() -> Te
     );
     Ok(())
 }
+
+async fn certifies_upgrade(
+    pool: &PgPool,
+    node_id: NodeId,
+    source: EnvironmentReference,
+    target: EnvironmentReference,
+) -> TestResult<bool> {
+    let statement = sql!(format!(
+        "SELECT {}",
+        node_certifies_upgrade("$1::UUID", "$2::TEXT", "$3::TEXT")
+    ));
+    Ok(
+        sqlx::query_scalar::<_, bool>(sqlx::AssertSqlSafe(statement))
+            .bind(node_id)
+            .bind(source.to_string())
+            .bind(target.to_string())
+            .fetch_one(pool)
+            .await?,
+    )
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_catalog_edge_counts_on_a_node_only_when_its_own_build_certifies_it() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let (e0, e1, e2) = (environment(0), environment(1), environment(2));
+    let (certifying, abstaining, unreported) = (
+        node(&db.pool).await?,
+        node(&db.pool).await?,
+        node(&db.pool).await?,
+    );
+    record(
+        &db.pool,
+        certifying,
+        &[certified(e0, &[e1], &[]), certified(e1, &[], &[])],
+    )
+    .await?;
+    // This build doesn't know E1, so it abstains on E0 to E1 and the catalog
+    // keeps the edge.
+    record(
+        &db.pool,
+        abstaining,
+        &[certified(e0, &[e2], &[]), certified(e2, &[], &[])],
+    )
+    .await?;
+    assert!(edges(&db.pool, e0).await?.0.contains(&e1));
+
+    assert!(certifies_upgrade(&db.pool, certifying, e0, e1).await?);
+    assert!(
+        !certifies_upgrade(&db.pool, abstaining, e0, e1).await?,
+        "the catalog edge doesn't stand for a build that abstained on it"
+    );
+    assert!(certifies_upgrade(&db.pool, abstaining, e0, e2).await?);
+    assert!(
+        !certifies_upgrade(&db.pool, certifying, e1, e0).await?,
+        "an edge has a direction"
+    );
+    assert!(
+        !certifies_upgrade(&db.pool, certifying, e2, e1).await?,
+        "the edge must start at the source, not at another environment the node certifies"
+    );
+    assert!(
+        !certifies_upgrade(&db.pool, unreported, e0, e1).await?,
+        "a node with no certifications certifies nothing"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn the_upgrade_predicate_is_never_null_so_it_negates_safely() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let node_id = node(&db.pool).await?;
+    record(&db.pool, node_id, &[certified(environment(0), &[], &[])]).await?;
+    let statement = sql!(format!(
+        "SELECT NOT {}",
+        node_certifies_upgrade("$1::UUID", "$2::TEXT", "NULL::TEXT")
+    ));
+    let negated = sqlx::query_scalar::<_, Option<bool>>(sqlx::AssertSqlSafe(statement))
+        .bind(node_id)
+        .bind(environment(0).to_string())
+        .fetch_one(&db.pool)
+        .await?;
+    assert_eq!(negated, Some(true));
+    Ok(())
+}

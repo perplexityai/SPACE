@@ -249,8 +249,9 @@ projection, together with other writes in that request.
 sampling timestamp or an environment readiness attestation. Inventory receipt
 does not establish host prerequisites, operation compatibility, or freshness of
 particular bytes.
-Placement remains unchanged until environment observations, freshness rules and
-the separately activated enforcement gate are implemented. Deploy the migration
+Placement acts on these columns only while the environment placement gate is
+`on`; `shadow` only counts by them (see "Placing work by environment"
+below). Deploy the migration
 and cluster readers before node publishers; older readers ignore the new field.
 During a mixed cluster-reader rollout, old readers can update artifact rows
 without updating observation receipts. Neither strict rejection nor an
@@ -1025,6 +1026,116 @@ Cluster-api replicas built before this writer serve the whole unretired
 catalog, every architecture and build included, to every node in the cohort.
 Keep `SPACE_INTERNAL_API_RUNTIME_PROVISIONING_RECIPE_ENABLED` off until every
 replica runs this build.
+
+### Placing work by environment
+
+`SPACE_ENVIRONMENT_PLACEMENT_GATE` (`off`, `shadow` or `on`; `off` by default)
+decides whether Direct placement reads what nodes publish. Work is bound when
+its record names an environment in `execution_metadata.environment`. For a
+create or a warm-pool adoption that's the binding of the build each
+candidate holds, from its own inventory row, or the template release's when
+the row names none. One content hash can be cached bound to several
+environments (see "Template caches per environment"). Node-ctl publishes one
+build per template, its legacy-partition build when it has one, and Direct's
+create names no environment, so a node whose legacy-partition build is the
+digest runs the build its row reports. A node whose published build of the
+template is another one keeps no row for the digest once its next full
+inventory publish prunes it; one holding the digest
+only in two or more other partitions, and no other build of the template,
+publishes one of them, which needn't be the one its create resolves.
+
+A pull-on-create candidate that holds the digest is gated the same way, by
+its own row's binding, else the release's; a row that names a binding wins
+over one that doesn't, then the exact spelling of the digest. A candidate
+that holds nothing takes the release's binding, else the one every holder
+whose row names a binding reports, and none when they disagree. For a
+restore it's the checkpoint's.
+Unbound work keeps today's placement in every mode.
+
+A node's published environments are evidence only while all of these hold,
+as `pplx_space_node_status_store::environment_evidence` defines them:
+
+- its latest execution inventory report is `complete`;
+- its snapshot is fresh by `stale_after`;
+- its environment arrays were received within the node's freshness window,
+  `stale_after - observed_at`.
+
+For each candidate node and bound piece of work, the gate asks
+`environment_refusal` (in the same store, built from the same conditions)
+whether the node's snapshot is evidence listing the work's environment in
+`usable_environment_refs`, and if not, why not:
+
+| Reason | The node's snapshot |
+|---|---|
+| `no_evidence` | is missing, has no inventory report, or comes from a build that publishes no environments |
+| `incomplete` | has a latest inventory report that isn't `complete` |
+| `stale` | is past `stale_after`, or has arrays older than the freshness window |
+| `environment_not_usable` | is evidence that doesn't list the environment |
+
+- `off` places as before: the mode is a bound parameter, and with it off
+  each clause the gate adds to a candidate statement is either TRUE or
+  reduces to the check it extends.
+- `shadow` places exactly as `off`, and reports what `on` would refuse (see
+  "Environment placement shadow" in [observability.md](observability.md)).
+- `on` places bound work only on a node whose snapshot it doesn't refuse,
+  E0 work included, so a node without evidence takes no bound work. The
+  environment match replaces the state-format major-version comparison for a
+  base-snapshot create or a restore, so a format 12 environment can place on
+  nodes whose legacy inventory lists only format 9. It also replaces the
+  legacy runtime and guest projections (`node_runtime_installations`,
+  `node_runtime_guests`), and for a create or a warm-pool adoption the
+  legacy kernel check, since a node publishes a managed environment's kernel
+  only in its evidence, not in `node_artifact_components`. Every other
+  component the build records is still checked. The last-known create
+  fallback, which tolerates a missing or stale snapshot, places bound work
+  only on a node with evidence. When it refuses every node holding the
+  template, a create that names a build and needs neither a base snapshot
+  nor a pool goes on to the pull-on-create candidates, which a node with
+  evidence can take. A create no holder was refused for fails as it does
+  `off`.
+
+Run a cluster in `shadow` until its would-refuse count stays at zero, then
+switch to `on`. A non-zero count names the nodes and reasons `on` would turn
+away; nodes on a build that publishes no environments count as `no_evidence`
+until they're upgraded. The count covers only what `on` takes away. It can't
+show the nodes `on` adds: one with evidence for the work's environment but
+no matching state format, runtime installation, guest or kernel row, where
+the environment match replaces that legacy check, and, when `on` refuses
+every ready holder, a holder only the last-known fallback returns or a node
+the create then pulls onto.
+
+`node_certifies_upgrade` in `pplx-space-runtime-environment-catalog-store` is
+the companion check for upgrades, which no placement path calls yet: a
+catalog edge `A -> B` can stand while a node's build abstained on it because
+it doesn't know `B`, so a caller choosing a node to run that upgrade on has
+to require the node's own certification row for `A` to list `B`.
+
+The gate doesn't yet:
+
+- apply to Kubernetes, whose pods carry no environment affinity. There, `on`
+  fails startup and `shadow` places as `off` and counts nothing;
+- read the cluster's execution policy or exclude a node lagging a narrowing
+  policy change;
+- admit a restore whose checkpoint loads under another environment through a
+  memory edge. It requires the producer to be usable, which is all a restore
+  can use until a memory edge is certified.
+- distinguish restore readiness from cold-boot usability. A node lists an
+  environment as usable when it can cold boot it, which a restore doesn't
+  need: per "Restore inputs" above, a node whose local kernel image is
+  missing or damaged can still load a checkpoint. With the gate on, such a
+  node takes no bound restore; the checkpoint restores on another node with
+  evidence from durable storage, or, if it's held only on that node, waits
+  until the kernel is repaired. Shadow counts these candidates under their
+  own reason, `restore_not_cold_bootable`, so a soak shows how often `on`
+  would hold one back. The remote restore statement returns a random sample
+  of its candidates, which is what shadow counts, while `on` refuses before
+  sampling.
+- impose a binding on a pull to a node that holds nothing when the release
+  records none and the holders that report one disagree. Such a pull places
+  as `off` would, and shadow can't count it.
+
+Node admission rechecks every placement, since published evidence isn't a
+reservation.
 
 ### Cluster desired policy
 
