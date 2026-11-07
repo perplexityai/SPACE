@@ -226,8 +226,9 @@ impl ActivationSeal {
     }
 
     /// Seal under `epoch`, persisted before the seal takes effect. The same
-    /// epoch again changes nothing; another epoch replaces the current one
-    /// and starts a new seal.
+    /// epoch again changes nothing; a later epoch replaces the current one
+    /// and starts a new seal. Epochs only move forward: an epoch below the
+    /// current one, or at or below the last cancelled one, is refused.
     pub(crate) fn seal(
         &self,
         db: &crate::db::SharedConnection,
@@ -239,10 +240,24 @@ impl ActivationSeal {
             .record
             .as_ref()
             .map_err(|error| Status::internal(format!("activation seal unreadable: {error}")))?;
-        if let Some(sealed) = state.sealed()
-            && sealed.epoch == epoch
+        if let Some(sealed) = state.sealed() {
+            if sealed.epoch == epoch {
+                return Ok(sealed);
+            }
+            if epoch < sealed.epoch {
+                return Err(Status::failed_precondition(format!(
+                    "activations are sealed under epoch {}, later than {epoch}",
+                    sealed.epoch
+                )));
+            }
+        }
+        let last_cancelled_epoch = current.and_then(|record| record.last_cancelled_epoch);
+        if let Some(cancelled) = last_cancelled_epoch
+            && epoch <= cancelled
         {
-            return Ok(sealed);
+            return Err(Status::failed_precondition(format!(
+                "epoch {epoch} is not after the cancelled epoch {cancelled}"
+            )));
         }
         let now_ms = u64::try_from(jiff::Timestamp::now().as_millisecond()).unwrap_or(0);
         // Strictly after the last seal's start, so `(epoch, since)` names one
@@ -254,6 +269,7 @@ impl ActivationSeal {
         let record = ActivationSealRecord {
             sealed_epoch: Some(epoch),
             sealed_since_ms: since_ms,
+            last_cancelled_epoch,
         };
         persist(db, record)?;
         let replaced_epoch = current.and_then(|record| record.sealed_epoch);
@@ -271,8 +287,11 @@ impl ActivationSeal {
         Ok(Sealed { epoch, since_ms })
     }
 
-    /// Clear the seal if it is under `epoch`; an unsealed node stays
-    /// unsealed.
+    /// Cancel `epoch`: clear the seal if it is under `epoch` or an earlier
+    /// one, and remember `epoch` so no seal at or below it is taken again,
+    /// even one whose call arrives after this cancel. The drain evacuations
+    /// begun under it or earlier are forgotten with it. An epoch below the
+    /// current seal's is refused and changes nothing.
     pub(crate) fn unseal(
         &self,
         db: &crate::db::SharedConnection,
@@ -280,29 +299,48 @@ impl ActivationSeal {
     ) -> Result<(), Status> {
         validate_epoch(epoch)?;
         let mut state = self.lock_state();
-        state
+        let current = *state
             .record
             .as_ref()
             .map_err(|error| Status::internal(format!("activation seal unreadable: {error}")))?;
-        let Some(sealed) = state.sealed() else {
-            return Ok(());
-        };
-        if sealed.epoch != epoch {
+        let sealed = state.sealed();
+        if let Some(sealed) = sealed
+            && epoch < sealed.epoch
+        {
             return Err(Status::failed_precondition(format!(
-                "activations are sealed under epoch {}, not {epoch}",
+                "activations are sealed under epoch {}, later than {epoch}",
                 sealed.epoch
             )));
         }
+        let cancelled = current
+            .and_then(|record| record.last_cancelled_epoch)
+            .map_or(epoch, |last| last.max(epoch));
         let record = ActivationSealRecord {
             sealed_epoch: None,
-            sealed_since_ms: sealed.since_ms,
+            sealed_since_ms: current.map_or(0, |record| record.sealed_since_ms),
+            last_cancelled_epoch: Some(cancelled),
         };
-        persist(db, record)?;
-        state.record = Ok(Some(record));
+        if current != Some(record) {
+            persist_cancel(db, record, cancelled)?;
+            state.record = Ok(Some(record));
+        }
         pplx_space_sandbox_metrics::admission::node_activation_seal_sealed(false);
         drop(state);
-        tracing::info!(epoch, "unsealed sandbox-manager VM activations");
+        if sealed.is_some() {
+            tracing::info!(epoch, "unsealed sandbox-manager VM activations");
+        }
         Ok(())
+    }
+
+    /// The highest epoch cancelled on this node, if any.
+    pub(crate) fn last_cancelled_epoch(&self) -> Option<u64> {
+        self.lock_state()
+            .record
+            .as_ref()
+            .ok()
+            .copied()
+            .flatten()
+            .and_then(|record| record.last_cancelled_epoch)
     }
 
     pub(crate) fn status(&self) -> ActivationSealStatus {
@@ -409,6 +447,20 @@ fn persist(db: &crate::db::SharedConnection, record: ActivationSealRecord) -> Re
         .map_err(|_| Status::internal("sandbox database mutex poisoned"))?;
     write_activation_seal(&conn, record)
         .map_err(|error| Status::internal(format!("persist the activation seal: {error}")))
+}
+
+/// Persist a cancel and forget the drain evacuations it ends, in one
+/// transaction.
+fn persist_cancel(
+    db: &crate::db::SharedConnection,
+    record: ActivationSealRecord,
+    cancelled: u64,
+) -> Result<(), Status> {
+    let conn = db
+        .lock()
+        .map_err(|_| Status::internal("sandbox database mutex poisoned"))?;
+    crate::db::activation_seal::cancel_drain_epoch(&conn, record, cancelled)
+        .map_err(|error| Status::internal(format!("persist the drain cancel: {error}")))
 }
 
 struct InFlightEntry {

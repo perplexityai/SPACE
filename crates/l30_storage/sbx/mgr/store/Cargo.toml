@@ -11,6 +11,7 @@ publish.workspace = true
 sqlite.sandbox-manager = [
   "activation_seal",
   "auto_lifecycle_delete_outbox",
+  "drain_evacuations",
   "jobs",
   "local_artifacts",
   "node_dirty_ref_revision",

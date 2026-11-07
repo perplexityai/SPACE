@@ -522,6 +522,10 @@ fn delete_sandbox_child_rows(tx: &Connection, id: &str) -> Result<()> {
         params![id],
     )?;
     tx.execute(
+        "DELETE FROM drain_evacuations WHERE sandbox_id = ?1",
+        params![id],
+    )?;
+    tx.execute(
         "DELETE FROM sandbox_quarantine_history WHERE sandbox_id = ?1",
         params![id],
     )?;

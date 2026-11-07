@@ -4,12 +4,12 @@ use pplx_space_common_core::activation_seal_signals::ACTIVATIONS_SEALED_MARKER;
 
 const SANDBOX: &str = "sandbox-1";
 
-/// Sealing again under the current epoch changes nothing; another epoch
-/// replaces it with a later seal; an unseal under any other epoch is refused
-/// and leaves the seal as it was; an unseal of an unsealed node changes
-/// nothing; a zero or unstorable epoch is refused.
+/// Sealing again under the current epoch changes nothing; a later epoch
+/// replaces it with a later seal; an earlier epoch is refused, to seal or to
+/// cancel, and leaves the seal as it was; a zero or unstorable epoch is
+/// refused.
 #[test]
-fn seal_epochs_replace_and_unseal_only_under_the_current_epoch() {
+fn seal_epochs_only_move_forward() {
     let db = crate::db::SharedConnection::new(crate::db::test_conn());
     let seal = ActivationSeal::load(&db.lock().unwrap());
 
@@ -26,27 +26,27 @@ fn seal_epochs_replace_and_unseal_only_under_the_current_epoch() {
         "a replacing epoch starts a new seal: {replaced:?} after {first:?}"
     );
 
-    let refused = seal.unseal(&db, 7).unwrap_err();
-    assert_eq!(
-        refused.code(),
-        tonic::Code::FailedPrecondition,
-        "{refused:?}"
-    );
-    assert_eq!(seal.status().sealed, Some(replaced));
-    assert_eq!(
-        crate::db::read::activation_seal(&db.lock().unwrap()).unwrap(),
-        Some(ActivationSealRecord {
-            sealed_epoch: Some(8),
-            sealed_since_ms: replaced.since_ms,
-        }),
-        "a refused unseal writes nothing"
-    );
-
-    seal.unseal(&db, 8).unwrap();
-    assert_eq!(seal.status().sealed, None);
-    seal.unseal(&db, 8).unwrap();
-    seal.unseal(&db, 9).unwrap();
-    assert_eq!(seal.status().sealed, None);
+    let written = Some(ActivationSealRecord {
+        sealed_epoch: Some(8),
+        sealed_since_ms: replaced.since_ms,
+        last_cancelled_epoch: None,
+    });
+    for refused in [
+        seal.seal(&db, 7).unwrap_err(),
+        seal.unseal(&db, 7).unwrap_err(),
+    ] {
+        assert_eq!(
+            refused.code(),
+            tonic::Code::FailedPrecondition,
+            "{refused:?}"
+        );
+        assert_eq!(seal.status().sealed, Some(replaced));
+        assert_eq!(
+            crate::db::read::activation_seal(&db.lock().unwrap()).unwrap(),
+            written,
+            "a refused call writes nothing"
+        );
+    }
 
     for epoch in [0, u64::MAX] {
         assert_eq!(
@@ -58,7 +58,88 @@ fn seal_epochs_replace_and_unseal_only_under_the_current_epoch() {
             tonic::Code::InvalidArgument
         );
     }
+    assert_eq!(seal.status().sealed, Some(replaced));
+}
+
+/// A cancel of the current epoch unseals and is remembered: no seal at or
+/// below it is taken again, while a later epoch seals. A cancel that arrives
+/// before its seal (an undrain racing the drain's first call) still refuses
+/// that seal, and a later cancel unseals an earlier seal.
+#[test]
+fn a_cancelled_epoch_never_seals_again() {
+    let db = crate::db::SharedConnection::new(crate::db::test_conn());
+    let seal = ActivationSeal::load(&db.lock().unwrap());
+
+    seal.seal(&db, 5).unwrap();
+    seal.unseal(&db, 5).unwrap();
     assert_eq!(seal.status().sealed, None);
+    assert_eq!(seal.last_cancelled_epoch(), Some(5));
+    seal.unseal(&db, 5).unwrap();
+    for stale in [4, 5] {
+        assert_eq!(
+            seal.seal(&db, stale).unwrap_err().code(),
+            tonic::Code::FailedPrecondition,
+            "{stale}"
+        );
+    }
+    assert_eq!(seal.status().sealed, None);
+
+    seal.unseal(&db, 9).unwrap();
+    assert_eq!(
+        seal.seal(&db, 9).unwrap_err().code(),
+        tonic::Code::FailedPrecondition
+    );
+    assert_eq!(seal.status().sealed, None);
+
+    assert_eq!(seal.seal(&db, 10).unwrap().epoch, 10);
+    seal.unseal(&db, 12).unwrap();
+    assert_eq!(seal.status().sealed, None);
+    assert_eq!(seal.last_cancelled_epoch(), Some(12));
+
+    let reloaded = ActivationSeal::load(&db.lock().unwrap());
+    assert_eq!(
+        reloaded.last_cancelled_epoch(),
+        Some(12),
+        "a restart keeps the cancel"
+    );
+    assert_eq!(
+        reloaded.seal(&db, 11).unwrap_err().code(),
+        tonic::Code::FailedPrecondition
+    );
+}
+
+/// A cancel forgets the evacuations begun under it or earlier, and keeps a
+/// later epoch's.
+#[test]
+fn a_cancel_forgets_its_evacuations() {
+    let db = crate::db::SharedConnection::new(crate::db::test_conn());
+    let seal = ActivationSeal::load(&db.lock().unwrap());
+    {
+        let conn = db.lock().unwrap();
+        crate::db::activation_seal::begin_drain_evacuation(
+            &conn,
+            "sbx-a",
+            3,
+            crate::db::activation_seal::DrainPrior::Started,
+            0,
+        )
+        .unwrap();
+        crate::db::activation_seal::begin_drain_evacuation(
+            &conn,
+            "sbx-b",
+            6,
+            crate::db::activation_seal::DrainPrior::Paused,
+            0,
+        )
+        .unwrap();
+    }
+    seal.unseal(&db, 3).unwrap();
+    let left: Vec<_> = crate::db::read::drain_evacuations(&db.lock().unwrap())
+        .unwrap()
+        .into_iter()
+        .map(|row| row.sandbox_id)
+        .collect();
+    assert_eq!(left, ["sbx-b"]);
 }
 
 /// Each seal that begins gets a start later than every earlier one, even when
@@ -74,15 +155,16 @@ fn a_new_seal_always_starts_after_the_last_one() {
         ActivationSealRecord {
             sealed_epoch: Some(3),
             sealed_since_ms: future_ms,
+            last_cancelled_epoch: None,
         },
     )
     .unwrap();
     let seal = ActivationSeal::load(&db.lock().unwrap());
     seal.unseal(&db, 3).unwrap();
 
-    let resealed = seal.seal(&db, 3).unwrap();
+    let resealed = seal.seal(&db, 4).unwrap();
     assert_eq!(resealed.since_ms, future_ms + 1);
-    let replaced = seal.seal(&db, 4).unwrap();
+    let replaced = seal.seal(&db, 5).unwrap();
     assert_eq!(replaced.since_ms, future_ms + 2);
 }
 
