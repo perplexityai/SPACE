@@ -4102,7 +4102,7 @@ impl SubstrateAdapter for DirectSubstrate {
 
     async fn prepare_pooled_execution(
         &self,
-        _metric_identity: pplx_space_metrics::sandbox::api::SandboxApiMetricIdentity,
+        _metric_identity: crate::metrics::sandbox::api::SandboxApiMetricIdentity,
         _request: &PooledExecutionClaimRequest<'_>,
         claim: &PooledExecutionClaim,
         policy: &AutoLifecyclePolicy,
@@ -4547,7 +4547,7 @@ impl SubstrateAdapter for DirectSubstrate {
 
     async fn start_execution(
         &self,
-        _metric_identity: pplx_space_metrics::sandbox::api::SandboxApiMetricIdentity,
+        _metric_identity: crate::metrics::sandbox::api::SandboxApiMetricIdentity,
         sandbox_id: SandboxId,
         options: ActivationOptions,
         charge: crate::controllers::substrate::RecoveryCharge,
@@ -4604,7 +4604,7 @@ impl SubstrateAdapter for DirectSubstrate {
 
     async fn restore_execution(
         &self,
-        _metric_identity: pplx_space_metrics::sandbox::api::SandboxApiMetricIdentity,
+        _metric_identity: crate::metrics::sandbox::api::SandboxApiMetricIdentity,
         sandbox_id: SandboxId,
         options: ActivationOptions,
         charge: crate::controllers::substrate::RecoveryCharge,
@@ -4650,7 +4650,7 @@ impl SubstrateAdapter for DirectSubstrate {
 
     async fn wake_execution(
         &self,
-        _metric_identity: pplx_space_metrics::sandbox::api::SandboxApiMetricIdentity,
+        _metric_identity: crate::metrics::sandbox::api::SandboxApiMetricIdentity,
         sandbox: &Sandbox,
         timeout: Duration,
         wake_activity: Option<ExecutionActivityKind>,
@@ -4879,7 +4879,7 @@ impl SubstrateAdapter for DirectSubstrate {
 
     async fn access_runtime_client(
         &self,
-        metric_identity: pplx_space_metrics::sandbox::api::SandboxApiMetricIdentity,
+        metric_identity: crate::metrics::sandbox::api::SandboxApiMetricIdentity,
         sandbox: &Sandbox,
         activity: ExecutionActivityKind,
         timeout: Duration,

@@ -6,6 +6,7 @@ use super::wait_ready::CommandReadyPod;
 use super::*;
 use crate::controllers::substrate::runtime_upgrade::UpgradeActivation;
 use crate::controllers::substrate::{ActivationOptions, RecoveryCharge};
+use crate::metrics::sandbox::api::{RestoreClaimLap, WakeCoalesceOutcome};
 use pplx_space_common_core::kubernetes::EvacuationPlacement;
 use pplx_space_common_core::types::{
     SandboxActivationAttemptId, SandboxLifecycle, SandboxTransitionTargetState,
@@ -16,7 +17,6 @@ use pplx_space_common_work_coalescer::{
 use pplx_space_events::{
     SandboxEvent, SandboxEventBoolField, SandboxEventDetails, SandboxEventSource, SandboxEventType,
 };
-use pplx_space_metrics::sandbox::api::{RestoreClaimLap, WakeCoalesceOutcome};
 use std::{
     future::Future,
     pin::Pin,
@@ -250,7 +250,7 @@ impl WakeTarget {
 struct PreparedWakeDrive {
     prepared: PreparedWakeSandbox,
     timeout: Duration,
-    metric_identity: pplx_space_metrics::sandbox::api::SandboxApiMetricIdentity,
+    metric_identity: crate::metrics::sandbox::api::SandboxApiMetricIdentity,
     intent: RestoreIntent,
     cleanup_on_failure: bool,
     join_deadline: Instant,
@@ -434,7 +434,7 @@ impl KubernetesSubstrate {
                 return;
             }
         };
-        pplx_space_metrics::sandbox::restore::claim_reverted(outcome.metric_outcome());
+        crate::metrics::sandbox::restore::claim_reverted(outcome.metric_outcome());
         match outcome {
             RestoreClaimRevert::ExecutionRetired { pod_name } => {
                 // A retired generation is never reused, so the name can't
@@ -636,7 +636,7 @@ impl KubernetesSubstrate {
         sandbox: &'a Sandbox,
         retired_generation: Option<i64>,
         join_deadline: Instant,
-        metric_identity: pplx_space_metrics::sandbox::api::SandboxApiMetricIdentity,
+        metric_identity: crate::metrics::sandbox::api::SandboxApiMetricIdentity,
         charge: RecoveryCharge,
         wake_activity: Option<ExecutionActivityKind>,
     ) -> Pin<Box<dyn Future<Output = Result<ExecutionActivation, SubstrateError>> + Send + 'a>>
@@ -678,7 +678,7 @@ impl KubernetesSubstrate {
         sandbox: &Sandbox,
         retired_generation: Option<i64>,
         join_deadline: Instant,
-        metric_identity: pplx_space_metrics::sandbox::api::SandboxApiMetricIdentity,
+        metric_identity: crate::metrics::sandbox::api::SandboxApiMetricIdentity,
         charge: RecoveryCharge,
     ) -> Result<ExecutionBinding, ControllerError> {
         self.redrive_started_recovery_after_suspend(
@@ -789,7 +789,7 @@ impl KubernetesSubstrate {
     pub(super) async fn join_restore_before_dial(
         &self,
         sandbox_id: SandboxId,
-        metric_identity: pplx_space_metrics::sandbox::api::SandboxApiMetricIdentity,
+        metric_identity: crate::metrics::sandbox::api::SandboxApiMetricIdentity,
         timeout: Duration,
         charge: RecoveryCharge,
     ) -> Result<crate::controllers::substrate::RuntimeClient, ControllerError> {
@@ -836,7 +836,7 @@ impl KubernetesSubstrate {
         &self,
         sandbox_id: SandboxId,
         join_deadline: Instant,
-        metric_identity: pplx_space_metrics::sandbox::api::SandboxApiMetricIdentity,
+        metric_identity: crate::metrics::sandbox::api::SandboxApiMetricIdentity,
         charge: RecoveryCharge,
     ) -> Result<LapsedRestoreReclaim, ControllerError> {
         if remaining_ready_window(join_deadline) < MIN_RESTORE_RECLAIM_WINDOW {
@@ -897,7 +897,7 @@ impl KubernetesSubstrate {
         &self,
         sandbox: &Sandbox,
         timeout: Duration,
-        metric_identity: pplx_space_metrics::sandbox::api::SandboxApiMetricIdentity,
+        metric_identity: crate::metrics::sandbox::api::SandboxApiMetricIdentity,
         charge: RecoveryCharge,
     ) -> Result<crate::controllers::substrate::RuntimeClient, ControllerError> {
         let (_, join_deadline) = ready_wait_bounds(timeout);
@@ -996,7 +996,7 @@ impl KubernetesSubstrate {
     pub(super) async fn ensure_execution_ready_for_access(
         &self,
         sandbox: &Sandbox,
-        metric_identity: pplx_space_metrics::sandbox::api::SandboxApiMetricIdentity,
+        metric_identity: crate::metrics::sandbox::api::SandboxApiMetricIdentity,
         timeout: Duration,
         charge: RecoveryCharge,
         suspend_restore_storage_uri: Option<&str>,
@@ -1225,7 +1225,7 @@ impl KubernetesSubstrate {
     /// pin with no extra cohort placement.
     pub async fn restore_evacuated_execution(
         &self,
-        metric_identity: pplx_space_metrics::sandbox::api::SandboxApiMetricIdentity,
+        metric_identity: crate::metrics::sandbox::api::SandboxApiMetricIdentity,
         sandbox_id: SandboxId,
         options: ActivationOptions,
         placement: Option<&EvacuationPlacement>,
@@ -1250,7 +1250,7 @@ impl KubernetesSubstrate {
     /// drift the next time the lifecycle bookkeeping changes.
     pub(super) async fn restore_execution_inner(
         &self,
-        metric_identity: pplx_space_metrics::sandbox::api::SandboxApiMetricIdentity,
+        metric_identity: crate::metrics::sandbox::api::SandboxApiMetricIdentity,
         sandbox_id: SandboxId,
         options: ActivationOptions,
         intent: RestoreIntent,
@@ -1324,7 +1324,7 @@ impl KubernetesSubstrate {
                             return Ok(ActivationCompletion::Joined);
                         }
                         UserRestoreJoin::Claimable => {
-                            pplx_space_metrics::sandbox::api::restore_claim_lap(
+                            crate::metrics::sandbox::api::restore_claim_lap(
                                 metric_identity,
                                 RestoreClaimLap::ClaimableRejoin,
                             );
@@ -1368,7 +1368,7 @@ impl KubernetesSubstrate {
         &self,
         sandbox: &Sandbox,
         timeout: Duration,
-        metric_identity: pplx_space_metrics::sandbox::api::SandboxApiMetricIdentity,
+        metric_identity: crate::metrics::sandbox::api::SandboxApiMetricIdentity,
         charge: RecoveryCharge,
     ) -> Result<ExecutionActivation, SubstrateError> {
         self.wake_execution_with_metric_identity_and_activity(
@@ -1385,7 +1385,7 @@ impl KubernetesSubstrate {
         &self,
         sandbox: &Sandbox,
         timeout: Duration,
-        metric_identity: pplx_space_metrics::sandbox::api::SandboxApiMetricIdentity,
+        metric_identity: crate::metrics::sandbox::api::SandboxApiMetricIdentity,
         charge: RecoveryCharge,
         wake_activity: Option<ExecutionActivityKind>,
     ) -> Result<ExecutionActivation, SubstrateError> {
@@ -1415,7 +1415,7 @@ impl KubernetesSubstrate {
         &self,
         sandbox: &Sandbox,
         timeout: Duration,
-        metric_identity: pplx_space_metrics::sandbox::api::SandboxApiMetricIdentity,
+        metric_identity: crate::metrics::sandbox::api::SandboxApiMetricIdentity,
         intent: &RestoreIntent,
         restore_claim_handling: RestoreClaimHandling,
     ) -> Result<ExecutionActivation, SubstrateError> {
@@ -1492,14 +1492,14 @@ impl KubernetesSubstrate {
                 Ok(WorkOutcome::Owned(activation)) => {
                     // The run's own completion is authoritative: the pod
                     // leader may itself have joined a cross-pod restore.
-                    pplx_space_metrics::sandbox::api::wake_coalesce_outcome(
+                    crate::metrics::sandbox::api::wake_coalesce_outcome(
                         metric_identity,
                         WakeCoalesceOutcome::Owned,
                     );
                     return Ok(activation);
                 }
                 Ok(WorkOutcome::Joined(activation)) => {
-                    pplx_space_metrics::sandbox::api::wake_coalesce_outcome(
+                    crate::metrics::sandbox::api::wake_coalesce_outcome(
                         metric_identity,
                         WakeCoalesceOutcome::Joined,
                     );
@@ -1509,7 +1509,7 @@ impl KubernetesSubstrate {
                     role: CoalesceRole::Owner,
                     error,
                 }) => {
-                    pplx_space_metrics::sandbox::api::wake_coalesce_outcome(
+                    crate::metrics::sandbox::api::wake_coalesce_outcome(
                         metric_identity,
                         WakeCoalesceOutcome::OwnerFailed,
                     );
@@ -1530,10 +1530,7 @@ impl KubernetesSubstrate {
                     } else {
                         WakeCoalesceOutcome::JoinerReraced
                     };
-                    pplx_space_metrics::sandbox::api::wake_coalesce_outcome(
-                        metric_identity,
-                        outcome,
-                    );
+                    crate::metrics::sandbox::api::wake_coalesce_outcome(metric_identity, outcome);
                     if tokio::time::timeout_at(
                         join_deadline,
                         tokio::time::sleep(rerace_backoff.next_delay()),
@@ -1551,7 +1548,7 @@ impl KubernetesSubstrate {
                     wake_sandbox = refreshed;
                 }
                 Err(CoalesceJoinError::DeadlineElapsed) => {
-                    pplx_space_metrics::sandbox::api::wake_coalesce_outcome(
+                    crate::metrics::sandbox::api::wake_coalesce_outcome(
                         metric_identity,
                         WakeCoalesceOutcome::DeadlineElapsed,
                     );
@@ -1584,7 +1581,7 @@ impl KubernetesSubstrate {
         &self,
         sandbox: &Sandbox,
         timeout: Duration,
-        metric_identity: pplx_space_metrics::sandbox::api::SandboxApiMetricIdentity,
+        metric_identity: crate::metrics::sandbox::api::SandboxApiMetricIdentity,
         intent: &RestoreIntent,
         restore_claim_handling: RestoreClaimHandling,
     ) -> Result<ExecutionActivation, SubstrateError> {
@@ -1709,7 +1706,7 @@ impl KubernetesSubstrate {
                 }
                 Err(err) => return Err(err),
             };
-            pplx_space_metrics::sandbox::api::restore_claim_lap(metric_identity, lap);
+            crate::metrics::sandbox::api::restore_claim_lap(metric_identity, lap);
         };
         // The claim-winner pays the deferred activation charge; a rejection
         // releases the claim it just won so another caller can take over.

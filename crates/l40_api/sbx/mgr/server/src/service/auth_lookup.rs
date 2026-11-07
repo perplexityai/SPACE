@@ -23,8 +23,8 @@ use pplx_space_api_route::{
     ed25519::SpaceApiRouteEd25519Verifier, ed25519::space_api_route_ed25519_token_from_metadata,
 };
 use pplx_space_common_core::types::{GuestPort, SandboxId, SpaceApiRouteIdentity};
-use pplx_space_metrics::sandbox::admission::AdmissionPermitOutcome;
 use pplx_space_net_common::{EffectiveNetworkPolicyRef, NetworkPolicy};
+use pplx_space_sandbox_metrics::admission::AdmissionPermitOutcome;
 use tonic::metadata::MetadataMap;
 
 mod resume_begin;

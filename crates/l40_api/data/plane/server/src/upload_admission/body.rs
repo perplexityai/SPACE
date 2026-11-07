@@ -177,7 +177,7 @@ impl GovernedBody {
     fn report_throttle(&mut self) {
         let throttled_for = std::mem::take(&mut self.throttled_for);
         if !throttled_for.is_zero() {
-            pplx_space_metrics::data_plane::upload_throttled(throttled_for);
+            crate::metrics::upload_throttled(throttled_for);
         }
     }
 }
@@ -235,7 +235,7 @@ impl HttpBody for GovernedBody {
                         return Poll::Pending;
                     }
                 }
-                pplx_space_metrics::data_plane::upload_body_timed_out();
+                crate::metrics::upload_body_timed_out();
                 return Poll::Ready(Some(Err(this.ended.end(BodyEnded::TimedOut))));
             }
             return Poll::Pending;
@@ -257,7 +257,7 @@ impl HttpBody for GovernedBody {
             .is_some_and(|deadline| now >= deadline.deadline())
             && !inner_complete(&this.inner)
         {
-            pplx_space_metrics::data_plane::upload_body_timed_out();
+            crate::metrics::upload_body_timed_out();
             return Poll::Ready(Some(Err(this.ended.end(BodyEnded::TimedOut))));
         }
         let len = frame.data_ref().map_or(0, Bytes::len);
@@ -285,7 +285,7 @@ impl HttpBody for GovernedBody {
                 if inner_complete(&this.inner) {
                     return Poll::Ready(Some(Ok(frame)));
                 }
-                pplx_space_metrics::data_plane::upload_body_over_rate();
+                crate::metrics::upload_body_over_rate();
                 let excess = debt.saturating_sub(this.admitted_debt);
                 return Poll::Ready(Some(Err(this.ended.end(BodyEnded::OverRate { excess }))));
             }
@@ -494,7 +494,7 @@ impl MinBodyRate {
 
     fn close_window(&mut self) -> Result<(), axum::Error> {
         if self.received < self.min_bytes_per_window {
-            pplx_space_metrics::data_plane::upload_body_stalled();
+            crate::metrics::upload_body_stalled();
             return Err(self.ended.end(BodyEnded::Stalled));
         }
         self.waited = Duration::ZERO;

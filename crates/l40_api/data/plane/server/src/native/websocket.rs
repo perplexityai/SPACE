@@ -38,7 +38,7 @@ pub(crate) async fn handle_socket(
 ) {
     let attach_deadline = tokio::time::Instant::now() + state.attach_deadline;
     let Ok(_guard) = state.unauthenticated.try_register(source_ip) else {
-        pplx_space_metrics::data_plane::attach(
+        crate::metrics::attach(
             session_id.kind().as_str(),
             "too_many_unauthenticated_sockets",
         );
@@ -72,7 +72,7 @@ pub(crate) async fn handle_socket(
         }
     };
     let Some(attached) = attached.filter(|_| !state.drain_started.is_cancelled()) else {
-        pplx_space_metrics::data_plane::attach(session_id.kind().as_str(), "draining");
+        crate::metrics::attach(session_id.kind().as_str(), "draining");
         state.revocation_cache.forget(session_id);
         send_restart_close(&mut socket, DRAINING_CLOSE_REASON).await;
         return;
@@ -80,10 +80,7 @@ pub(crate) async fn handle_socket(
     let native_session_permit = match state.native_sessions.try_acquire(session_id, attached.kind) {
         Ok(permit) => permit,
         Err(()) => {
-            pplx_space_metrics::data_plane::attach(
-                session_id.kind().as_str(),
-                "session_already_attached",
-            );
+            crate::metrics::attach(session_id.kind().as_str(), "session_already_attached");
             let _ = socket
                 .send(Message::Text(
                     error_json(DataPlaneErrorCode::SessionAlreadyAttached).into(),
@@ -96,10 +93,7 @@ pub(crate) async fn handle_socket(
     let stream_permit = match state.attached_streams.try_acquire_attached(&attached) {
         Ok(permit) => permit,
         Err(limit) => {
-            pplx_space_metrics::data_plane::attach(
-                session_id.kind().as_str(),
-                limit.metric_label(),
-            );
+            crate::metrics::attach(session_id.kind().as_str(), limit.metric_label());
             let _ = socket
                 .send(Message::Text(
                     error_json(DataPlaneErrorCode::TooManyAttachedStreams).into(),
@@ -114,7 +108,7 @@ pub(crate) async fn handle_socket(
     let _ = socket
         .send(Message::Text(attached_json(&attached).into()))
         .await;
-    pplx_space_metrics::data_plane::attach(session_id.kind().as_str(), "ok");
+    crate::metrics::attach(session_id.kind().as_str(), "ok");
     let _stream_permit = stream_permit;
     let _native_session_permit = native_session_permit;
     let revocation_cache = Arc::clone(&state.revocation_cache);
@@ -140,14 +134,11 @@ pub(super) async fn authenticate_native_socket(
     let frame = match attached {
         Ok(attached) => return Some(attached),
         Err(AttachRefused::Token(error)) => {
-            pplx_space_metrics::data_plane::attach(session_id.kind().as_str(), error.as_str());
+            crate::metrics::attach(session_id.kind().as_str(), error.as_str());
             error_json(error)
         }
         Err(AttachRefused::Route(error)) => {
-            pplx_space_metrics::data_plane::attach(
-                session_id.kind().as_str(),
-                error.metric_label(),
-            );
+            crate::metrics::attach(session_id.kind().as_str(), error.metric_label());
             route_resolution_error_json(error)
         }
     };
@@ -199,10 +190,10 @@ pub(crate) async fn bridge_attached_session(
         SessionKind::Terminal | SessionKind::Process => {
             let kind = attached.kind.as_str();
             match bridge_process_session(state, session_id, attached, socket).await {
-                Ok(end) => pplx_space_metrics::data_plane::stream_closed(kind, end.result_label()),
+                Ok(end) => crate::metrics::stream_closed(kind, end.result_label()),
                 Err(error) => {
                     let result = stream_bridge_error_label(&error);
-                    pplx_space_metrics::data_plane::stream_closed(kind, result);
+                    crate::metrics::stream_closed(kind, result);
                     tracing::warn!(%error, "data-plane process bridge failed");
                 }
             }
@@ -210,10 +201,10 @@ pub(crate) async fn bridge_attached_session(
         SessionKind::FileWatch => {
             let kind = attached.kind.as_str();
             match bridge_file_watch_session(state, session_id, attached, socket).await {
-                Ok(end) => pplx_space_metrics::data_plane::stream_closed(kind, end.result_label()),
+                Ok(end) => crate::metrics::stream_closed(kind, end.result_label()),
                 Err(error) => {
                     let result = stream_bridge_error_label(&error);
-                    pplx_space_metrics::data_plane::stream_closed(kind, result);
+                    crate::metrics::stream_closed(kind, result);
                     tracing::warn!(%error, "data-plane file watch bridge failed");
                 }
             }
@@ -221,19 +212,16 @@ pub(crate) async fn bridge_attached_session(
         SessionKind::Port if attached.target_protocol == Some(SessionTargetProtocol::Tcp) => {
             let kind = attached.kind.as_str();
             match bridge_raw_service_session(state, attached, socket).await {
-                Ok(end) => pplx_space_metrics::data_plane::stream_closed(kind, end.result_label()),
+                Ok(end) => crate::metrics::stream_closed(kind, end.result_label()),
                 Err(error) => {
                     let result = stream_bridge_error_label(&error);
-                    pplx_space_metrics::data_plane::stream_closed(kind, result);
+                    crate::metrics::stream_closed(kind, result);
                     tracing::warn!(%error, "data-plane raw service bridge failed");
                 }
             }
         }
         SessionKind::Port | SessionKind::Protocol => {
-            pplx_space_metrics::data_plane::stream_closed(
-                attached.kind.as_str(),
-                "unsupported_session_kind",
-            );
+            crate::metrics::stream_closed(attached.kind.as_str(), "unsupported_session_kind");
             close_with_error(socket, DataPlaneErrorCode::UnsupportedSessionKind, false).await;
         }
     }
@@ -340,7 +328,7 @@ pub(super) async fn native_service_io(
     state: &DataPlaneState,
     attached: &mut AttachedSession,
 ) -> Result<Box<dyn AsyncReadWrite>, StreamBridgeError> {
-    pplx_space_metrics::data_plane::service_route_transport(
+    crate::metrics::service_route_transport(
         ServiceRouteSurface::Native,
         ServiceRouteTransport::ServicePortIngress,
     );
@@ -1107,7 +1095,7 @@ where
                 |mut client, request| async move { client.spaced_send_input(request).await },
             )
             .await?;
-            pplx_space_metrics::data_plane::stream_bytes_in(attached.kind.as_str(), bytes);
+            crate::metrics::stream_bytes_in(attached.kind.as_str(), bytes);
             send_server_frame(sink, &DataPlaneServerFrame::InputAccepted { seq })
                 .await
                 .map_err(|_| StreamBridgeError::ClientClosed)?;

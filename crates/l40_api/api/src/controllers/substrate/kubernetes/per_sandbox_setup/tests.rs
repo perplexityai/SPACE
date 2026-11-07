@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
+use crate::metrics::sandbox::api::SandboxApiMetricIdentity;
 use pplx_space_common_core::types::{AutoLifecyclePolicy, Email, OrgId, TemplateName, UserId};
-use pplx_space_metrics::sandbox::api::SandboxApiMetricIdentity;
 use pplx_space_net_common::NetworkPolicyV1;
 use uuid::Uuid;
 

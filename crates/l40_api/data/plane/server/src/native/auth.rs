@@ -369,12 +369,7 @@ pub(crate) fn observe_data_plane_http_error(
     origin: ResponseOrigin,
     kind: ResponseKind,
 ) {
-    pplx_space_metrics::data_plane::response(
-        ResponseSurface::Native,
-        origin,
-        kind,
-        status.as_u16(),
-    );
+    crate::metrics::response(ResponseSurface::Native, origin, kind, status.as_u16());
     tracing::Span::current().record("space.response_origin", origin.as_str());
     tracing::Span::current().record("space.response_kind", kind.as_str());
 }

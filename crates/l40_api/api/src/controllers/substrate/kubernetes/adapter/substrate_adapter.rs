@@ -29,7 +29,7 @@ impl SubstrateAdapter for KubernetesSubstrate {
             // Rejection is recorded as a tagged `sandbox.api.create.error`
             // with `reason:rejected_cancel_storm` — alerts can filter on
             // the tag without us also emitting a parallel counter.
-            pplx_space_metrics::sandbox::api::create_step_error(
+            crate::metrics::sandbox::api::create_step_error(
                 sandbox_uuid,
                 request.metric_identity,
                 "fc",
@@ -62,7 +62,7 @@ impl SubstrateAdapter for KubernetesSubstrate {
                 );
             }
             NetworkSlotCapacityPreflight::Full => {
-                pplx_space_metrics::sandbox::api::create_step_error(
+                crate::metrics::sandbox::api::create_step_error(
                     sandbox_uuid,
                     request.metric_identity,
                     "fc",
@@ -352,7 +352,7 @@ impl SubstrateAdapter for KubernetesSubstrate {
                 pod
             }
             Err(err) => {
-                pplx_space_metrics::sandbox::api::create_step_error(
+                crate::metrics::sandbox::api::create_step_error(
                     sandbox_uuid,
                     request.metric_identity,
                     "fc",
@@ -388,9 +388,9 @@ impl SubstrateAdapter for KubernetesSubstrate {
             }
         };
 
-        pplx_space_metrics::sandbox::api::create_step_latency(
+        crate::metrics::sandbox::api::create_step_latency(
             sandbox_uuid,
-            pplx_space_metrics::sandbox::api::CreateStep {
+            crate::metrics::sandbox::api::CreateStep {
                 identity: request.metric_identity,
                 backend: "fc",
                 template: Some(request.template_ref.template.as_str()),
@@ -886,7 +886,7 @@ impl SubstrateAdapter for KubernetesSubstrate {
 
     async fn start_execution(
         &self,
-        metric_identity: pplx_space_metrics::sandbox::api::SandboxApiMetricIdentity,
+        metric_identity: crate::metrics::sandbox::api::SandboxApiMetricIdentity,
         sandbox_id: SandboxId,
         options: ActivationOptions,
         charge: crate::controllers::substrate::RecoveryCharge,
@@ -1222,7 +1222,7 @@ impl SubstrateAdapter for KubernetesSubstrate {
 
     async fn restore_execution(
         &self,
-        metric_identity: pplx_space_metrics::sandbox::api::SandboxApiMetricIdentity,
+        metric_identity: crate::metrics::sandbox::api::SandboxApiMetricIdentity,
         sandbox_id: SandboxId,
         options: ActivationOptions,
         charge: crate::controllers::substrate::RecoveryCharge,
@@ -1485,7 +1485,7 @@ impl SubstrateAdapter for KubernetesSubstrate {
 
     async fn wake_execution(
         &self,
-        metric_identity: pplx_space_metrics::sandbox::api::SandboxApiMetricIdentity,
+        metric_identity: crate::metrics::sandbox::api::SandboxApiMetricIdentity,
         sandbox: &Sandbox,
         timeout: Duration,
         wake_activity: Option<ExecutionActivityKind>,
@@ -1520,7 +1520,7 @@ impl SubstrateAdapter for KubernetesSubstrate {
                 return self
                     .join_restore_before_dial(
                         sandbox_id,
-                        pplx_space_metrics::sandbox::api::SandboxApiMetricIdentity::native(
+                        crate::metrics::sandbox::api::SandboxApiMetricIdentity::native(
                             "runtime_client",
                         ),
                         Duration::from_secs(120),
@@ -1542,7 +1542,7 @@ impl SubstrateAdapter for KubernetesSubstrate {
             return self
                 .join_restore_before_dial(
                     sandbox_id,
-                    pplx_space_metrics::sandbox::api::SandboxApiMetricIdentity::native(
+                    crate::metrics::sandbox::api::SandboxApiMetricIdentity::native(
                         "runtime_client",
                     ),
                     Duration::from_secs(120),
@@ -1557,7 +1557,7 @@ impl SubstrateAdapter for KubernetesSubstrate {
                 .wake_and_dial_once_started(
                     &sandbox,
                     Duration::from_secs(120),
-                    pplx_space_metrics::sandbox::api::SandboxApiMetricIdentity::native(
+                    crate::metrics::sandbox::api::SandboxApiMetricIdentity::native(
                         "runtime_client",
                     ),
                     charge,
@@ -1570,7 +1570,7 @@ impl SubstrateAdapter for KubernetesSubstrate {
             let binding = self
                 .ensure_execution_ready_for_access(
                     &sandbox,
-                    pplx_space_metrics::sandbox::api::SandboxApiMetricIdentity::native(
+                    crate::metrics::sandbox::api::SandboxApiMetricIdentity::native(
                         "runtime_client",
                     ),
                     Duration::from_secs(120),
@@ -1630,7 +1630,7 @@ impl SubstrateAdapter for KubernetesSubstrate {
 
     async fn access_runtime_client(
         &self,
-        metric_identity: pplx_space_metrics::sandbox::api::SandboxApiMetricIdentity,
+        metric_identity: crate::metrics::sandbox::api::SandboxApiMetricIdentity,
         sandbox: &Sandbox,
         activity: ExecutionActivityKind,
         timeout: Duration,
@@ -1977,8 +1977,8 @@ impl SubstrateAdapter for KubernetesSubstrate {
                                 NodeGroupPlacementResolveError::Catalog(_) => None,
                             };
                             if dead_config {
-                                pplx_space_metrics::node_group_placement::pool_claim_admission(
-                                    pplx_space_metrics::node_group_placement::PoolClaimAdmission::OrgSpecificTemplate,
+                                crate::metrics::node_group_placement::pool_claim_admission(
+                                    crate::metrics::node_group_placement::PoolClaimAdmission::OrgSpecificTemplate,
                                 );
                                 tracing::info!(
                                     claim_id = %claim.claim_id,
@@ -1990,8 +1990,8 @@ impl SubstrateAdapter for KubernetesSubstrate {
                                 pool::invalidate_claimed_pool_slot(self.store.pool(), &claim)
                                     .await?;
                             } else {
-                                pplx_space_metrics::node_group_placement::pool_claim_admission(
-                                    pplx_space_metrics::node_group_placement::PoolClaimAdmission::Unresolved,
+                                crate::metrics::node_group_placement::pool_claim_admission(
+                                    crate::metrics::node_group_placement::PoolClaimAdmission::Unresolved,
                                 );
                                 tracing::info!(
                                     claim_id = %claim.claim_id,
@@ -2055,8 +2055,8 @@ impl SubstrateAdapter for KubernetesSubstrate {
                         // changes.
                         match pooled_pod_node_group(&self.k8s.caches, pod.as_deref()) {
                             PooledPodNodeGroup::Labeled(group) => {
-                                pplx_space_metrics::node_group_placement::pool_claim_admission(
-                                    pplx_space_metrics::node_group_placement::PoolClaimAdmission::UnprovisionedLabeledNode,
+                                crate::metrics::node_group_placement::pool_claim_admission(
+                                    crate::metrics::node_group_placement::PoolClaimAdmission::UnprovisionedLabeledNode,
                                 );
                                 tracing::warn!(
                                     claim_id = %claim.claim_id,
@@ -2080,8 +2080,8 @@ impl SubstrateAdapter for KubernetesSubstrate {
                             // pod that may be sitting on another org's
                             // dedicated hardware.
                             PooledPodNodeGroup::Unreadable => {
-                                pplx_space_metrics::node_group_placement::pool_claim_admission(
-                                    pplx_space_metrics::node_group_placement::PoolClaimAdmission::Unknown,
+                                crate::metrics::node_group_placement::pool_claim_admission(
+                                    crate::metrics::node_group_placement::PoolClaimAdmission::Unknown,
                                 );
                                 tracing::info!(
                                     claim_id = %claim.claim_id,
@@ -2100,8 +2100,8 @@ impl SubstrateAdapter for KubernetesSubstrate {
                             // enforce and nothing to be outside of.
                             PooledPodNodeGroup::Unlabeled => {}
                         }
-                        pplx_space_metrics::node_group_placement::pool_claim_admission(
-                            pplx_space_metrics::node_group_placement::PoolClaimAdmission::Unconstrained,
+                        crate::metrics::node_group_placement::pool_claim_admission(
+                            crate::metrics::node_group_placement::PoolClaimAdmission::Unconstrained,
                         );
                     }
                     return Ok(PooledExecutionClaimAttempt {
@@ -2206,7 +2206,7 @@ impl SubstrateAdapter for KubernetesSubstrate {
                             // fate is the same; no cause, because none was
                             // established for *this* create.
                             Ok(ResolvedPlacement::Unprovisioned) => (
-                                pplx_space_metrics::node_group_placement::PoolClaimAdmission::CallerDedicatedOnly,
+                                crate::metrics::node_group_placement::PoolClaimAdmission::CallerDedicatedOnly,
                                 Some(
                                     "this cluster has no shared node group it may use, so only \
                                      capacity dedicated to this organization is eligible",
@@ -2214,14 +2214,14 @@ impl SubstrateAdapter for KubernetesSubstrate {
                                 false,
                             ),
                             Ok(ResolvedPlacement::Disabled | ResolvedPlacement::Placed(_)) => (
-                                pplx_space_metrics::node_group_placement::PoolClaimAdmission::CallerDedicatedOnly,
+                                crate::metrics::node_group_placement::PoolClaimAdmission::CallerDedicatedOnly,
                                 None,
                                 false,
                             ),
                             Err(NodeGroupPlacementResolveError::NoCompatibleNodeGroup {
                                 ..
                             }) => (
-                                pplx_space_metrics::node_group_placement::PoolClaimAdmission::OrgSpecificTemplate,
+                                crate::metrics::node_group_placement::PoolClaimAdmission::OrgSpecificTemplate,
                                 Some(
                                     "the template may run only on node groups dedicated to its \
                                      organization",
@@ -2229,7 +2229,7 @@ impl SubstrateAdapter for KubernetesSubstrate {
                                 true,
                             ),
                             Err(_) => (
-                                pplx_space_metrics::node_group_placement::PoolClaimAdmission::Unresolved,
+                                crate::metrics::node_group_placement::PoolClaimAdmission::Unresolved,
                                 None,
                                 false,
                             ),
@@ -2238,7 +2238,7 @@ impl SubstrateAdapter for KubernetesSubstrate {
                             Some(cause) => format!("{base}: {cause}"),
                             None => base,
                         };
-                        pplx_space_metrics::node_group_placement::pool_claim_admission(verdict);
+                        crate::metrics::node_group_placement::pool_claim_admission(verdict);
                         if invalidate {
                             tracing::info!(
                                 claim_id = %claim.claim_id,
@@ -2265,7 +2265,9 @@ impl SubstrateAdapter for KubernetesSubstrate {
                     }
                     match pooled_pod_node_admission(&self.k8s.caches, placement, pod.as_deref()) {
                         PooledPodAdmission::Admitted => {
-                            pplx_space_metrics::node_group_placement::pool_claim_admission(pplx_space_metrics::node_group_placement::PoolClaimAdmission::Admitted);
+                            crate::metrics::node_group_placement::pool_claim_admission(
+                                crate::metrics::node_group_placement::PoolClaimAdmission::Admitted,
+                            );
                             return Ok(PooledExecutionClaimAttempt {
                                 claim: Some(claim),
                                 pool_shape: claim_attempt.pool_shape,
@@ -2283,7 +2285,7 @@ impl SubstrateAdapter for KubernetesSubstrate {
                         // and also stops a warm pod squatting on hardware that
                         // now belongs to one org.
                         PooledPodAdmission::OutsideSet => {
-                            pplx_space_metrics::node_group_placement::pool_claim_admission(pplx_space_metrics::node_group_placement::PoolClaimAdmission::OutsideSet);
+                            crate::metrics::node_group_placement::pool_claim_admission(crate::metrics::node_group_placement::PoolClaimAdmission::OutsideSet);
                             tracing::info!(
                                 claim_id = %claim.claim_id,
                                 sandbox_id = %claim.sandbox_id,
@@ -2305,8 +2307,8 @@ impl SubstrateAdapter for KubernetesSubstrate {
                         // bounded by that tick, and every isolation guarantee
                         // still holds because the sandbox builds cold.
                         PooledPodAdmission::LabelAbsent => {
-                            pplx_space_metrics::node_group_placement::pool_claim_admission(
-                                pplx_space_metrics::node_group_placement::PoolClaimAdmission::LabelAbsent,
+                            crate::metrics::node_group_placement::pool_claim_admission(
+                                crate::metrics::node_group_placement::PoolClaimAdmission::LabelAbsent,
                             );
                             tracing::info!(
                                 claim_id = %claim.claim_id,
@@ -2333,7 +2335,9 @@ impl SubstrateAdapter for KubernetesSubstrate {
                             // pod, and a gate-off adoption all pass through
                             // without a verdict, because none of them is a
                             // placement decision.
-                            pplx_space_metrics::node_group_placement::pool_claim_admission(pplx_space_metrics::node_group_placement::PoolClaimAdmission::Unknown);
+                            crate::metrics::node_group_placement::pool_claim_admission(
+                                crate::metrics::node_group_placement::PoolClaimAdmission::Unknown,
+                            );
                             pool::release_claimed_pool_slot(self.store.pool(), &claim).await?;
                             tracing::info!(
                                 claim_id = %claim.claim_id,
@@ -2486,7 +2490,7 @@ impl SubstrateAdapter for KubernetesSubstrate {
 
     async fn prepare_pooled_execution(
         &self,
-        metric_identity: pplx_space_metrics::sandbox::api::SandboxApiMetricIdentity,
+        metric_identity: crate::metrics::sandbox::api::SandboxApiMetricIdentity,
         request: &PooledExecutionClaimRequest<'_>,
         claim: &PooledExecutionClaim,
         policy: &AutoLifecyclePolicy,

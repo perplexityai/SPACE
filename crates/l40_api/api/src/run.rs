@@ -263,9 +263,7 @@ pub async fn run_with(
             crate::limiter_liveness::HEARTBEAT_INTERVAL,
             shutdown_token.child_token(),
             move || {
-                pplx_space_metrics::auth::external_console_password_session_accounts(
-                    listed_accounts,
-                );
+                crate::metrics::auth::external_console_password_session_accounts(listed_accounts);
             },
         ));
         if !password_session_emails.is_empty() {

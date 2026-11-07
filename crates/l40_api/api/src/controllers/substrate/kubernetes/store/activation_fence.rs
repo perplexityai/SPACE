@@ -73,12 +73,12 @@ impl K8sStore {
             .db_context("failed to commit activation-attempt transaction")?;
         match route_publication {
             ActivationRoutePublication::InitializeFirst => {
-                pplx_space_metrics::sandbox::api::route_identity_decision(
+                crate::metrics::sandbox::api::route_identity_decision(
                     RouteIdentityDecisionReason::FirstIdentityInitialized,
                 );
             }
             ActivationRoutePublication::AdoptLegacyResident => {
-                pplx_space_metrics::sandbox::api::route_identity_decision(
+                crate::metrics::sandbox::api::route_identity_decision(
                     RouteIdentityDecisionReason::ExistingExecutionTransition,
                 );
             }
@@ -406,7 +406,7 @@ impl K8sStore {
         if route_publication == ActivationRoutePublication::PreserveExisting
             && route_owner.is_none()
         {
-            pplx_space_metrics::sandbox::api::route_identity_decision(
+            crate::metrics::sandbox::api::route_identity_decision(
                 RouteIdentityDecisionReason::RotationRequiredUnclassified,
             );
             return Err(SubstrateError::Conflict {
@@ -610,7 +610,7 @@ impl K8sStore {
             } else {
                 RouteIdentityDecisionReason::ExistingExecutionTransition
             };
-            pplx_space_metrics::sandbox::api::route_identity_decision(reason);
+            crate::metrics::sandbox::api::route_identity_decision(reason);
         }
         Ok(ReconciledActivationFence {
             execution,

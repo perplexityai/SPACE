@@ -286,7 +286,7 @@ impl KubernetesSubstrate {
 
     async fn wait_for_pod_ip_assignment(
         &self,
-        metric_identity: pplx_space_metrics::sandbox::api::SandboxApiMetricIdentity,
+        metric_identity: crate::metrics::sandbox::api::SandboxApiMetricIdentity,
         sandbox_id: SandboxId,
         generation: i64,
         pod_name: &str,
@@ -331,7 +331,7 @@ impl KubernetesSubstrate {
                 Ok(pod_ip)
             }
             Ok(Err(err)) => {
-                pplx_space_metrics::sandbox::api::create_step_error(
+                crate::metrics::sandbox::api::create_step_error(
                     sandbox_id,
                     metric_identity,
                     "fc",
@@ -371,7 +371,7 @@ impl KubernetesSubstrate {
 
     pub(super) async fn wait_for_pod_proxy_reachable(
         &self,
-        metric_identity: pplx_space_metrics::sandbox::api::SandboxApiMetricIdentity,
+        metric_identity: crate::metrics::sandbox::api::SandboxApiMetricIdentity,
         sandbox_id: SandboxId,
         target: PodProxyWaitTarget<'_>,
         phase: &'static str,
@@ -481,7 +481,7 @@ impl KubernetesSubstrate {
     pub(super) async fn poll_until_command_ready(
         &self,
         sandbox_id: SandboxId,
-        metric_identity: pplx_space_metrics::sandbox::api::SandboxApiMetricIdentity,
+        metric_identity: crate::metrics::sandbox::api::SandboxApiMetricIdentity,
         ready_timeout: Duration,
         pod: CommandReadyPod<'_>,
         // Sandbox template, threaded through only so the
@@ -720,7 +720,7 @@ impl KubernetesSubstrate {
 
             if Instant::now() >= deadline {
                 if metric_identity.op == "create" {
-                    pplx_space_metrics::sandbox::api::create_command_ready_timeout(
+                    crate::metrics::sandbox::api::create_command_ready_timeout(
                         sandbox_id, template,
                     );
                 }
@@ -762,7 +762,7 @@ impl KubernetesSubstrate {
         &self,
         client: &mut NodeApiClient,
         sandbox_id: SandboxId,
-        metric_identity: pplx_space_metrics::sandbox::api::SandboxApiMetricIdentity,
+        metric_identity: crate::metrics::sandbox::api::SandboxApiMetricIdentity,
         ready_timeout: Duration,
         binding: ExecutionBinding,
         template: Option<&str>,
@@ -779,7 +779,7 @@ impl KubernetesSubstrate {
             ConnectedCommandReadiness::TimedOut(probes) => probes,
         };
         if metric_identity.op == "create" {
-            pplx_space_metrics::sandbox::api::create_command_ready_timeout(sandbox_id, template);
+            crate::metrics::sandbox::api::create_command_ready_timeout(sandbox_id, template);
         }
         // The caller reached the node for the adoption's setup and Wake, so
         // the timeout names the guest's phase. A probe that could not reach
@@ -806,7 +806,7 @@ impl KubernetesSubstrate {
     pub(super) async fn probe_connected_client_until_command_ready(
         client: &mut NodeApiClient,
         sandbox_id: SandboxId,
-        metric_identity: pplx_space_metrics::sandbox::api::SandboxApiMetricIdentity,
+        metric_identity: crate::metrics::sandbox::api::SandboxApiMetricIdentity,
         ready_timeout: Duration,
     ) -> Result<ConnectedCommandReadiness, SubstrateError> {
         let started_at = Instant::now();
@@ -923,7 +923,7 @@ impl KubernetesSubstrate {
 
     pub(super) async fn ensure_active_execution_pod_proxy_reachable(
         &self,
-        metric_identity: pplx_space_metrics::sandbox::api::SandboxApiMetricIdentity,
+        metric_identity: crate::metrics::sandbox::api::SandboxApiMetricIdentity,
         sandbox_id: SandboxId,
         // Forwarded to `wait_for_pod_proxy_reachable`; see its doc.
         phase_deadline: Instant,

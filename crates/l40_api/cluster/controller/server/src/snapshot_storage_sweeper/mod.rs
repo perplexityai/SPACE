@@ -66,9 +66,9 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::metrics::snapshot_storage_sweeper as sweeper_metrics;
 use futures_util::stream::{self, StreamExt};
 use pplx_space_common_core::types::StorageUri;
-use pplx_space_metrics::snapshot_storage_sweeper as sweeper_metrics;
 #[cfg(test)]
 use pplx_space_snapshot_storage::DeletePrefixError;
 use pplx_space_snapshot_storage::{DeletePrefixOutcome, StorageBackend};

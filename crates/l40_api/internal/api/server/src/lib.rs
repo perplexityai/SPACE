@@ -15,6 +15,7 @@ pub use pplx_space_node_api_client::proto;
 pub use pplx_space_rpc_auth as auth;
 
 mod api_key_store;
+pub mod metrics;
 pub mod node_info;
 pub use node_info::ClusterNodeInfoService;
 
@@ -858,8 +859,8 @@ impl ClusterApiService {
             .map_err(|e| Status::internal(format!("commit finalize snapshot tx: {e}")))?;
 
         if cleared_pending_backup {
-            pplx_space_metrics::internal_api::local_backup_queue_removed(
-                pplx_space_metrics::internal_api::LocalBackupQueueRemoval::Finalized,
+            crate::metrics::internal_api::local_backup_queue_removed(
+                crate::metrics::internal_api::LocalBackupQueueRemoval::Finalized,
                 1,
             );
         }

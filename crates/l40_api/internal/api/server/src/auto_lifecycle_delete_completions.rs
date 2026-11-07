@@ -18,10 +18,10 @@ use pplx_space_common_core::{
         SandboxQuarantineSource,
     },
 };
-use pplx_space_metrics::sandbox::publication::{
+use pplx_space_postgres_pool::contention::{self, is_lock_not_available};
+use pplx_space_sandbox_metrics::publication::{
     AutoLifecycleDeleteCompletionDisposition, AutoLifecycleDeleteCompletionReason,
 };
-use pplx_space_postgres_pool::contention::{self, is_lock_not_available};
 use pplx_space_sandbox_store::StoredSandboxLifecycle;
 use pplx_space_sandbox_store::delete::delete_with_dependents;
 use sqlx::{Acquire as _, FromRow, Postgres, Transaction, types::Json};
@@ -151,7 +151,7 @@ impl AutoLifecycleDeleteConsumption {
             *count = count.saturating_add(1);
         }
         for ((disposition, reason), count) in aggregated {
-            pplx_space_metrics::sandbox::publication::auto_lifecycle_delete_completion(
+            pplx_space_sandbox_metrics::publication::auto_lifecycle_delete_completion(
                 disposition,
                 reason,
                 count,
@@ -168,7 +168,7 @@ impl AutoLifecycleDeleteConsumption {
             ),
         ] {
             if deferred > 0 {
-                pplx_space_metrics::sandbox::publication::auto_lifecycle_delete_completion(
+                pplx_space_sandbox_metrics::publication::auto_lifecycle_delete_completion(
                     AutoLifecycleDeleteCompletionDisposition::Deferred,
                     reason,
                     u64::try_from(deferred).unwrap_or(u64::MAX),

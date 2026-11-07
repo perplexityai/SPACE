@@ -1,17 +1,17 @@
 //! Maps create, activation and resume outcomes onto the requested vCPU and
-//! memory distributions (`pplx_space_metrics::sandbox::api::requested_size`).
+//! memory distributions (`crate::metrics::sandbox::api::requested_size`).
 //! The emit sites stay one call each; what counts and how it is tagged is
 //! decided here.
 
 use pplx_space_events::CreateShapeSource;
-use pplx_space_metrics::sandbox::admission::AdmissionDecision;
-use pplx_space_metrics::sandbox::api::{
-    RequestedKind, RequestedSize, SandboxApiSurface, requested_size,
-};
+use pplx_space_sandbox_metrics::admission::AdmissionDecision;
 
 use super::ControllerError;
 use super::queries::stored_resource;
 use crate::controllers::substrate::SandboxResources;
+use crate::metrics::sandbox::api::{
+    RequestedKind, RequestedSize, SandboxApiSurface, requested_size,
+};
 use crate::models::Sandbox;
 
 /// The template tag for a sandbox row that names none.

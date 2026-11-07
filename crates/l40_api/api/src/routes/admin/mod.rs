@@ -454,7 +454,7 @@ async fn require_admin_auth(
         .await
     {
         let mode = "fail_closed";
-        pplx_space_metrics::admin::audit_persist_failed(method.as_str(), mode);
+        crate::metrics::admin::audit_persist_failed(method.as_str(), mode);
         tracing::warn!(%error, method = method.as_str(), path, status_code, mode, "failed to persist admin audit event");
         return audit_failure_response(response.status());
     }

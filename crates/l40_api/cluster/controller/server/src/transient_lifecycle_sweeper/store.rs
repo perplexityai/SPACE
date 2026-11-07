@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::metrics::cluster_reconciler::{HydrationOutcome, OutcomeEvent};
 use pplx_space_api::controllers::substrate::{
     CommandReadyProbe, ExecutionRoutabilityCheck, NodeApiTarget, ObservedPodIdentity,
     PodFenceMismatch, PodIdentityFence, RecordedExecution, RetireExecutionOutcome,
@@ -16,7 +17,6 @@ use pplx_space_common_core::types::{
     NodeManagedBy, NodeRole, PodName, PodUid, PositiveDuration, SandboxActivationAttemptId,
     SandboxId, SandboxLifecycle, SubstrateKind,
 };
-use pplx_space_metrics::cluster_reconciler::{HydrationOutcome, OutcomeEvent};
 use pplx_space_sandbox_store::sweeper::{self, unrestorable_restoring_guards};
 use sqlx::PgPool;
 

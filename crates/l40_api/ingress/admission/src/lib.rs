@@ -33,7 +33,7 @@ impl IngressPreparationPermit {
             || sandbox
                 .is_some_and(|id| state.sandboxes.get(&id).copied().unwrap_or(0) >= SANDBOX_LIMIT)
         {
-            pplx_space_metrics::data_plane::ingress_waiter_rejected();
+            crate::metrics::ingress_waiter_rejected();
             return Err(Status::resource_exhausted(
                 "ingress preparation capacity exhausted",
             ));
@@ -56,7 +56,7 @@ impl IngressPreparationPermit {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let count = state.sandboxes.entry(id).or_default();
         if *count >= SANDBOX_LIMIT {
-            pplx_space_metrics::data_plane::ingress_waiter_rejected();
+            crate::metrics::ingress_waiter_rejected();
             return Err(Status::resource_exhausted(
                 "sandbox ingress preparation capacity exhausted",
             ));
@@ -90,6 +90,8 @@ const PREPARATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 pub fn preparation_timeout() -> std::time::Duration {
     PREPARATION_TIMEOUT
 }
+
+pub mod metrics;
 
 #[cfg(test)]
 mod tests;

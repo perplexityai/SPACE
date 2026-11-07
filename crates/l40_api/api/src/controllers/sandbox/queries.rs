@@ -101,31 +101,31 @@ struct PooledCreateInput<'a> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PoolCreateObservation {
-    outcome: pplx_space_metrics::warm_pool::CreatePathOutcome,
+    outcome: crate::metrics::warm_pool::CreatePathOutcome,
 }
 
 impl PoolCreateObservation {
     const fn cold_direct() -> Self {
         Self {
-            outcome: pplx_space_metrics::warm_pool::CreatePathOutcome::ColdDirect,
+            outcome: crate::metrics::warm_pool::CreatePathOutcome::ColdDirect,
         }
     }
 
     const fn error() -> Self {
         Self {
-            outcome: pplx_space_metrics::warm_pool::CreatePathOutcome::Error,
+            outcome: crate::metrics::warm_pool::CreatePathOutcome::Error,
         }
     }
 
     const fn after_pool_miss() -> Self {
         Self {
-            outcome: pplx_space_metrics::warm_pool::CreatePathOutcome::OrdinaryMiss,
+            outcome: crate::metrics::warm_pool::CreatePathOutcome::OrdinaryMiss,
         }
     }
 
     const fn after_pool_recovery_failure() -> Self {
         Self {
-            outcome: pplx_space_metrics::warm_pool::CreatePathOutcome::ColdFallback,
+            outcome: crate::metrics::warm_pool::CreatePathOutcome::ColdFallback,
         }
     }
 }
@@ -154,7 +154,7 @@ struct CreatePathEmitter<'a> {
 
 impl CreatePathEmitter<'_> {
     fn set_observation(&mut self, observation: PoolCreateObservation) {
-        if self.observation.outcome != pplx_space_metrics::warm_pool::CreatePathOutcome::Error {
+        if self.observation.outcome != crate::metrics::warm_pool::CreatePathOutcome::Error {
             return;
         }
         self.observation = observation;
@@ -170,9 +170,9 @@ impl Drop for CreatePathEmitter<'_> {
         let outcome = if self.request_succeeded {
             self.observation.outcome
         } else {
-            pplx_space_metrics::warm_pool::CreatePathOutcome::Error
+            crate::metrics::warm_pool::CreatePathOutcome::Error
         };
-        pplx_space_metrics::warm_pool::create_path(pplx_space_metrics::warm_pool::CreatePath {
+        crate::metrics::warm_pool::create_path(crate::metrics::warm_pool::CreatePath {
             template: self.template,
             content_hash: self.content_hash,
             surface: self.surface,
@@ -226,7 +226,7 @@ pub(super) fn stored_resource(
 impl PoolCreateResult {
     fn warm(
         response: SandboxResponse,
-        outcome: pplx_space_metrics::warm_pool::CreatePathOutcome,
+        outcome: crate::metrics::warm_pool::CreatePathOutcome,
     ) -> Self {
         Self {
             response: Some(response),
@@ -534,7 +534,7 @@ fn with_shape_source(
     let Some(source) = source else {
         return details;
     };
-    pplx_space_metrics::sandbox::api::create_shape_source(source.as_str(), runtime, template);
+    crate::metrics::sandbox::api::create_shape_source(source.as_str(), runtime, template);
     details.shape_source(source)
 }
 
@@ -1316,7 +1316,7 @@ impl SandboxController {
             create_path.set_observation(observation);
             if let Some(response) = response {
                 create_path.mark_request_succeeded();
-                pplx_space_metrics::sandbox::api::sandbox_created(tls_interception_on);
+                crate::metrics::sandbox::api::sandbox_created(tls_interception_on);
                 return Ok(response);
             }
             skip_pool_reserved_generation = true;
@@ -1334,7 +1334,7 @@ impl SandboxController {
             create_path.set_observation(observation);
             if let Some(response) = response {
                 create_path.mark_request_succeeded();
-                pplx_space_metrics::sandbox::api::sandbox_created(tls_interception_on);
+                crate::metrics::sandbox::api::sandbox_created(tls_interception_on);
                 return Ok(response);
             }
         }
@@ -1520,7 +1520,7 @@ impl SandboxController {
         {
             Ok(outcome) => outcome,
             Err(err) => {
-                pplx_space_metrics::sandbox::api::lifecycle_error(
+                crate::metrics::sandbox::api::lifecycle_error(
                     sandbox_uuid,
                     metric_identity,
                     "substrate",
@@ -1799,7 +1799,7 @@ impl SandboxController {
         emit_create_sandbox_event(sandbox.id, create_event, details);
 
         create_path.mark_request_succeeded();
-        pplx_space_metrics::sandbox::api::sandbox_created(tls_interception_on);
+        crate::metrics::sandbox::api::sandbox_created(tls_interception_on);
         Ok(sandbox_to_response(&sandbox, None))
     }
 
@@ -1921,12 +1921,12 @@ impl SandboxController {
                 Ok(claim_attempt) => claim_attempt,
                 Err(error) => {
                     claim_span.record("result", "error");
-                    pplx_space_metrics::warm_pool::acquire_duration(
+                    crate::metrics::warm_pool::acquire_duration(
                         input.template,
-                        pplx_space_metrics::warm_pool::AcquireOutcome::Error,
+                        crate::metrics::warm_pool::AcquireOutcome::Error,
                         claim_started_at,
                     );
-                    pplx_space_metrics::sandbox::api::create_step_error(
+                    crate::metrics::sandbox::api::create_step_error(
                         SandboxId::from_uuid(Uuid::nil()),
                         input.metric_identity,
                         "fc",
@@ -1943,9 +1943,9 @@ impl SandboxController {
                     claim_span.record("result", "claimed");
                     claim_span.record("claim_id", tracing::field::display(claim.claim_id));
                     claim_span.record("sandbox_id", tracing::field::display(claim.sandbox_id));
-                    pplx_space_metrics::sandbox::api::create_step_latency(
+                    crate::metrics::sandbox::api::create_step_latency(
                         claim.sandbox_id,
-                        pplx_space_metrics::sandbox::api::CreateStep {
+                        crate::metrics::sandbox::api::CreateStep {
                             identity: input.metric_identity,
                             backend: "fc",
                             template: Some(input.template),
@@ -1963,14 +1963,14 @@ impl SandboxController {
                         "sandbox_id",
                         tracing::field::display(input.planned_sandbox_id),
                     );
-                    pplx_space_metrics::warm_pool::acquire_duration(
+                    crate::metrics::warm_pool::acquire_duration(
                         input.template,
-                        pplx_space_metrics::warm_pool::AcquireOutcome::Miss,
+                        crate::metrics::warm_pool::AcquireOutcome::Miss,
                         claim_started_at,
                     );
-                    pplx_space_metrics::sandbox::api::create_step_latency(
+                    crate::metrics::sandbox::api::create_step_latency(
                         SandboxId::from_uuid(Uuid::nil()),
-                        pplx_space_metrics::sandbox::api::CreateStep {
+                        crate::metrics::sandbox::api::CreateStep {
                             identity: input.metric_identity,
                             backend: "fc",
                             template: Some(input.template),
@@ -2122,7 +2122,7 @@ impl SandboxController {
                     let error = error.without_retry_after();
                     let reason = pooled_prepare_failure_reason(&error);
                     let num_retries = in_place_prepare_attempts.saturating_sub(1);
-                    pplx_space_metrics::sandbox::api::create_step_error(
+                    crate::metrics::sandbox::api::create_step_error(
                         claim.sandbox_id,
                         input.metric_identity,
                         "fc",
@@ -2307,16 +2307,16 @@ impl SandboxController {
             // adopted sandbox is being returned. Emitting it at the claim above
             // counted reclaimed and failed handoffs as hits. The sample keeps
             // the claim clock so hit, miss, and error stay comparable.
-            pplx_space_metrics::warm_pool::acquire_duration(
+            crate::metrics::warm_pool::acquire_duration(
                 input.template,
-                pplx_space_metrics::warm_pool::AcquireOutcome::Hit,
+                crate::metrics::warm_pool::AcquireOutcome::Hit,
                 claim_started_at,
             );
 
             let outcome = match (prepare_attempt, in_place_prepare_attempts) {
-                (1, 1) => pplx_space_metrics::warm_pool::CreatePathOutcome::WarmHit,
-                (1, _) => pplx_space_metrics::warm_pool::CreatePathOutcome::SameClaimRetry,
-                (_, _) => pplx_space_metrics::warm_pool::CreatePathOutcome::LaterWarmRecovery,
+                (1, 1) => crate::metrics::warm_pool::CreatePathOutcome::WarmHit,
+                (1, _) => crate::metrics::warm_pool::CreatePathOutcome::SameClaimRetry,
+                (_, _) => crate::metrics::warm_pool::CreatePathOutcome::LaterWarmRecovery,
             };
             return Ok(PoolCreateResult::warm(
                 sandbox_to_response(&sandbox, None),
@@ -2499,7 +2499,7 @@ impl SandboxController {
             Ok(attempts) => attempts,
             Err(PooledPrepareAttemptError { error, attempts }) => {
                 let error = error.without_retry_after();
-                pplx_space_metrics::sandbox::api::create_step_error(
+                crate::metrics::sandbox::api::create_step_error(
                     claim.sandbox_id,
                     input.metric_identity,
                     "fc",
@@ -2558,15 +2558,15 @@ impl SandboxController {
             input.template,
             &sandbox,
         );
-        pplx_space_metrics::warm_pool::acquire_duration(
+        crate::metrics::warm_pool::acquire_duration(
             input.template,
-            pplx_space_metrics::warm_pool::AcquireOutcome::Hit,
+            crate::metrics::warm_pool::AcquireOutcome::Hit,
             claim_started_at,
         );
         let outcome = if in_place_prepare_attempts == 1 {
-            pplx_space_metrics::warm_pool::CreatePathOutcome::WarmHit
+            crate::metrics::warm_pool::CreatePathOutcome::WarmHit
         } else {
-            pplx_space_metrics::warm_pool::CreatePathOutcome::SameClaimRetry
+            crate::metrics::warm_pool::CreatePathOutcome::SameClaimRetry
         };
         Ok(PoolCreateResult::warm(
             sandbox_to_response(&sandbox, None),

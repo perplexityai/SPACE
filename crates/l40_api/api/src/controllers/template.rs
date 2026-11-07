@@ -546,7 +546,7 @@ impl TemplateController {
         })?;
         let builder_node_id = if response.builder_node_id.is_empty() {
             if grants.tenant_publication.is_none() {
-                pplx_space_metrics::template::build_routing_fallback_missing_identity();
+                crate::metrics::template::build_routing_fallback_missing_identity();
                 tracing::warn!(
                     %job_id,
                     %template_name,

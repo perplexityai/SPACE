@@ -28,8 +28,8 @@ pub(in crate::controllers::substrate::kubernetes) enum RedriveOutcome {
 /// `sandbox.restore.redrive`.
 fn redrive_metric_outcome(
     result: &Result<RedriveOutcome, SubstrateError>,
-) -> pplx_space_metrics::sandbox::restore::RedriveOutcome {
-    use pplx_space_metrics::sandbox::restore::RedriveOutcome as Metric;
+) -> crate::metrics::sandbox::restore::RedriveOutcome {
+    use crate::metrics::sandbox::restore::RedriveOutcome as Metric;
     match result {
         Ok(RedriveOutcome::Redriven(_)) => Metric::Redriven,
         Ok(RedriveOutcome::PodRetained { .. }) => Metric::Retained,
@@ -42,16 +42,16 @@ fn redrive_metric_outcome(
 /// the recorded outcome when the attempt finishes, `dropped` when its future
 /// is dropped (or unwinds) first.
 struct RedriveMetricGuard {
-    path: pplx_space_metrics::sandbox::restore::RedrivePath,
-    outcome: Option<pplx_space_metrics::sandbox::restore::RedriveOutcome>,
+    path: crate::metrics::sandbox::restore::RedrivePath,
+    outcome: Option<crate::metrics::sandbox::restore::RedriveOutcome>,
 }
 
 impl Drop for RedriveMetricGuard {
     fn drop(&mut self) {
-        pplx_space_metrics::sandbox::restore::cross_node_redrive(
+        crate::metrics::sandbox::restore::cross_node_redrive(
             self.path,
             self.outcome
-                .unwrap_or(pplx_space_metrics::sandbox::restore::RedriveOutcome::Dropped),
+                .unwrap_or(crate::metrics::sandbox::restore::RedriveOutcome::Dropped),
         );
     }
 }
@@ -298,7 +298,7 @@ impl KubernetesSubstrate {
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn redrive_unschedulable_restore_cross_node_recorded(
         &self,
-        path: pplx_space_metrics::sandbox::restore::RedrivePath,
+        path: crate::metrics::sandbox::restore::RedrivePath,
         sandbox: &Sandbox,
         claim: &SandboxExecutionClaim,
         claim_lifecycle: SandboxLifecycle,

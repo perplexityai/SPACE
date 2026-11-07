@@ -240,7 +240,7 @@ fn classify_precondition_reread_covers_all_post_conflict_shapes() {
 
 #[test]
 fn restore_placement_sample_reflects_pin_shape() {
-    use pplx_space_metrics::sandbox::restore::{RestorePlacement, SourcePin};
+    use crate::metrics::sandbox::restore::{RestorePlacement, SourcePin};
 
     // On-demand carries no placement decision.
     assert!(restore_placement_sample(&PodCreateContext::OnDemand, true).is_none());
@@ -1402,7 +1402,7 @@ mod stopped_restore_plan_tests {
 
         let result = substrate
             .start_execution(
-                pplx_space_metrics::sandbox::api::SandboxApiMetricIdentity::native("start"),
+                crate::metrics::sandbox::api::SandboxApiMetricIdentity::native("start"),
                 sandbox_id,
                 BLOCKING_START,
                 crate::controllers::substrate::RecoveryCharge::Exempt,
@@ -1468,7 +1468,7 @@ mod stopped_restore_plan_tests {
         // matters is that it got past the claim and planned the pod.
         let result = substrate
             .restore_evacuated_execution(
-                pplx_space_metrics::sandbox::api::SandboxApiMetricIdentity::ecw("evacuation"),
+                crate::metrics::sandbox::api::SandboxApiMetricIdentity::ecw("evacuation"),
                 sandbox_id,
                 BLOCKING_START,
                 Some(&cohort),

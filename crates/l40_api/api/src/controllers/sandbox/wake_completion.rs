@@ -37,12 +37,12 @@ use pplx_space_common_core::sql;
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
+use crate::metrics::sandbox::api::{WakeCompletionAction, WakeCompletionRedriveOutcome};
 use futures_util::future::BoxFuture;
 use pplx_space_common_core::types::{SandboxId, SandboxLifecycle};
 use pplx_space_events::{
     SandboxEvent, SandboxEventDetails, SandboxEventSource, SandboxEventTrigger, SandboxEventType,
 };
-use pplx_space_metrics::sandbox::api::{WakeCompletionAction, WakeCompletionRedriveOutcome};
 use pplx_space_sandbox_store as sandbox_store;
 use sqlx::PgPool;
 use tokio::sync::Semaphore;
@@ -166,12 +166,12 @@ impl Drop for WakeCompletionGuard {
         let Some(completion) = self.completion.take() else {
             return;
         };
-        pplx_space_metrics::sandbox::api::wake_completion_cancelled(self.action);
+        crate::metrics::sandbox::api::wake_completion_cancelled(self.action);
         // Drop must never panic: without a Tokio runtime (teardown paths,
         // non-async test code) there is nowhere to run the redrive — shed
         // and let the sweeper backstop the row.
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
-            pplx_space_metrics::sandbox::api::wake_completion_redrive(
+            crate::metrics::sandbox::api::wake_completion_redrive(
                 WakeCompletionRedriveOutcome::Shed,
             );
             tracing::warn!(
@@ -189,7 +189,7 @@ impl Drop for WakeCompletionGuard {
                 // Cancel storm: every slot is already redriving. Shed rather
                 // than amplify — the sweeper backstops this row exactly as it
                 // did before the shield existed.
-                pplx_space_metrics::sandbox::api::wake_completion_redrive(
+                crate::metrics::sandbox::api::wake_completion_redrive(
                     WakeCompletionRedriveOutcome::Shed,
                 );
                 tracing::warn!(
@@ -255,7 +255,7 @@ pub(super) fn wake_completion_redrive(
             hydrate,
         )
         .await;
-        pplx_space_metrics::sandbox::api::wake_completion_redrive(outcome);
+        crate::metrics::sandbox::api::wake_completion_redrive(outcome);
         match outcome {
             WakeCompletionRedriveOutcome::Completed => tracing::warn!(
                 sandbox_id = %sandbox_id,

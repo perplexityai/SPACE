@@ -180,7 +180,7 @@ async fn wake_completion_redrive_on_kubernetes_hydrates_before_completing() -> T
     use crate::controllers::substrate::kubernetes::tests::{
         insert_k8s_execution, substrate_with_store_and_client,
     };
-    use pplx_space_metrics::sandbox::api::WakeCompletionAction;
+    use crate::metrics::sandbox::api::WakeCompletionAction;
 
     let db = pg_test_db().await?;
     let pool = &db.pool;

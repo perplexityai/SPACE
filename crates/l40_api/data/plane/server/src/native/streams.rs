@@ -460,7 +460,7 @@ pub(crate) async fn record_session_reconnect(
         .await
         .map_err(StreamBridgeError::ClusterStatus)?
         .into_inner();
-    pplx_space_metrics::data_plane::session_reconnect(session_id.kind().as_str(), reason.as_str());
+    crate::metrics::session_reconnect(session_id.kind().as_str(), reason.as_str());
     Ok(response.reconnect_count)
 }
 
@@ -483,8 +483,8 @@ pub(crate) fn attached_process_route_changed(
 }
 
 pub(crate) fn record_backend_channel_reset(kind: &str, reason: &ReconnectReason) {
-    pplx_space_metrics::data_plane::backend_channel_reset(kind, reason.as_str());
-    pplx_space_metrics::data_plane::backend_affected_streams(kind, 1);
+    crate::metrics::backend_channel_reset(kind, reason.as_str());
+    crate::metrics::backend_affected_streams(kind, 1);
 }
 
 pub(crate) fn proto_reconnect_reason(reason: &ReconnectReason) -> DataPlaneReconnectReason {

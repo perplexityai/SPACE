@@ -15,4 +15,4 @@ tonic = { workspace = true }
 
 # internal
 pplx-space-common-core = { workspace = true }
-pplx-space-metrics = { workspace = true }
+pplx-space-metrics-emit = { workspace = true }

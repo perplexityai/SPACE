@@ -186,7 +186,6 @@
 "pplx-space-spaced-loopback-test" = { to = "crates/tools/spaced/loopback/test" }
 # stay (2)
 "pplx-space-common-core" = "stay"
-"pplx-space-metrics" = "stay"
 
 # Tracked files below crates/apps and crates/libs outside a crate, moving
 # with the layer most of their family's crates go to.

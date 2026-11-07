@@ -392,7 +392,7 @@ pub fn sandbox_attached_anywhere(sandbox_alias: &str) -> String {
 /// its bytes are not state anyone can lose — and releasing on it does clear
 /// the noise where an ordinary space-managed delete otherwise leaves a row
 /// counted into
-/// `pplx_space_metrics::internal_api::local_backup_queue_absent_not_durable`
+/// `pplx_space_internal_api_server::metrics::internal_api::local_backup_queue_absent_not_durable`
 /// until tombstone retention hard-deletes the `sandboxes` row and the foreign
 /// key cascades.
 ///

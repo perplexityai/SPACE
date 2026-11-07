@@ -4866,7 +4866,6 @@ dependencies = [
  "pplx-space-internal-api-server",
  "pplx-space-k8s-node-id",
  "pplx-space-kube-client",
- "pplx-space-metrics",
  "pplx-space-metrics-emit",
  "pplx-space-native-files",
  "pplx-space-net-common",
@@ -4882,6 +4881,7 @@ dependencies = [
  "pplx-space-runtime-environment-policy-store",
  "pplx-space-rustls-provider",
  "pplx-space-sandbox-grpc",
+ "pplx-space-sandbox-metrics",
  "pplx-space-sandbox-portability",
  "pplx-space-sandbox-quarantine-store",
  "pplx-space-sandbox-residency",
@@ -5208,7 +5208,6 @@ dependencies = [
  "pplx-space-grpc-server",
  "pplx-space-k8s-node-id",
  "pplx-space-kube-client",
- "pplx-space-metrics",
  "pplx-space-metrics-emit",
  "pplx-space-node-api-client",
  "pplx-space-node-api-sim",
@@ -5292,7 +5291,6 @@ dependencies = [
  "pplx-space-common-core",
  "pplx-space-common-grpc",
  "pplx-space-db-test-fixtures",
- "pplx-space-metrics",
  "pplx-space-metrics-emit",
  "pplx-space-node-api-client",
  "pplx-space-reconcile-metrics",
@@ -5721,7 +5719,6 @@ dependencies = [
  "pplx-space-guest-process",
  "pplx-space-http-server",
  "pplx-space-ingress-admission",
- "pplx-space-metrics",
  "pplx-space-metrics-emit",
  "pplx-space-native-files",
  "pplx-space-net-gateway-client",
@@ -6040,7 +6037,7 @@ name = "pplx-space-ingress-admission"
 version = "0.8.1"
 dependencies = [
  "pplx-space-common-core",
- "pplx-space-metrics",
+ "pplx-space-metrics-emit",
  "tonic",
 ]
 
@@ -6066,7 +6063,6 @@ dependencies = [
  "pplx-space-execution-common",
  "pplx-space-grpc-server",
  "pplx-space-ingress-admission",
- "pplx-space-metrics",
  "pplx-space-metrics-emit",
  "pplx-space-net-common",
  "pplx-space-node-api-client",
@@ -6080,6 +6076,7 @@ dependencies = [
  "pplx-space-runtime-environment-catalog-store",
  "pplx-space-runtime-environment-policy-store",
  "pplx-space-sandbox-grpc",
+ "pplx-space-sandbox-metrics",
  "pplx-space-sandbox-portability",
  "pplx-space-sandbox-quarantine-store",
  "pplx-space-sandbox-residency",
@@ -6196,19 +6193,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "pplx-space-metrics"
-version = "0.8.1"
-dependencies = [
- "pplx-space-common-core",
- "pplx-space-metrics-emit",
- "pplx-space-observability",
- "thiserror 2.0.20",
- "tokio",
- "tracing",
- "uuid",
-]
-
-[[package]]
 name = "pplx-space-metrics-emit"
 version = "0.8.1"
 dependencies = [
@@ -6219,10 +6203,11 @@ dependencies = [
 name = "pplx-space-metrics-workload"
 version = "0.8.1"
 dependencies = [
+ "pplx-space-api",
  "pplx-space-common-core",
- "pplx-space-metrics",
  "pplx-space-node-mgr",
  "pplx-space-observability",
+ "pplx-space-sandbox-metrics",
  "pplx-space-sbx-mgr",
  "tokio",
  "tracing",
@@ -6267,7 +6252,6 @@ dependencies = [
  "pplx-space-common-core",
  "pplx-space-common-grpc",
  "pplx-space-guest-process",
- "pplx-space-metrics",
  "pplx-space-public-api",
  "pplx-space-public-api-http",
  "pplx-space-sbx-mgr-protocol",
@@ -7109,7 +7093,7 @@ version = "0.8.1"
 dependencies = [
  "axum",
  "http-body-util",
- "pplx-space-metrics",
+ "pplx-space-metrics-emit",
  "pplx-space-public-api",
  "pplx-space-request-id",
  "serde",
@@ -7347,7 +7331,6 @@ dependencies = [
  "pplx-space-ingress-admission",
  "pplx-space-k8s-node-id",
  "pplx-space-local-health",
- "pplx-space-metrics",
  "pplx-space-metrics-emit",
  "pplx-space-net-common",
  "pplx-space-net-gateway",

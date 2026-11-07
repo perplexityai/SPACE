@@ -343,7 +343,7 @@ impl KubernetesSubstrate {
             .as_ref()
             .map(|outcome| outcome.as_str())
             .unwrap_or_else(K8sBlockingDeleteError::result_tag);
-        pplx_space_metrics::sandbox::api::k8s_blocking_delete_latency(
+        crate::metrics::sandbox::api::k8s_blocking_delete_latency(
             "pod",
             metric_operation,
             result_tag,

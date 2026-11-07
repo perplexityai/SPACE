@@ -19,7 +19,7 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use pplx_space_metrics::template::VisibilityLookupDegradation;
+use crate::metrics::template::VisibilityLookupDegradation;
 use tokio_util::sync::CancellationToken;
 
 /// Trailing window each sample covers.
@@ -140,7 +140,7 @@ pub(crate) async fn emit(observations: Arc<Observations>, shutdown: Cancellation
             _ = interval.tick() => {}
         }
         for (reason, count) in observations.trailing_counts(Instant::now()) {
-            pplx_space_metrics::template::visibility_lookup_alertable_last_hour(reason, count);
+            crate::metrics::template::visibility_lookup_alertable_last_hour(reason, count);
         }
     }
 }

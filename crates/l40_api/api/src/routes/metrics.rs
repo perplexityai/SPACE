@@ -1,12 +1,12 @@
 use std::time::Instant;
 
+use crate::metrics::sandbox::api::{SandboxApiMetricIdentity, scope_request_client_id};
 use axum::{
     extract::{Request, State},
     http::Method,
     middleware::Next,
     response::Response,
 };
-use pplx_space_metrics::sandbox::api::{SandboxApiMetricIdentity, scope_request_client_id};
 use pplx_space_public_api::SandboxLifecycleAction;
 
 use super::AppState;
@@ -42,7 +42,7 @@ pub async fn record_sandbox_route_metrics(
             .extensions()
             .get::<RouteTemplateName>()
             .map(|name| name.0.clone());
-        pplx_space_metrics::sandbox::api::route_outcome(
+        crate::metrics::sandbox::api::route_outcome(
             identity,
             response.status().as_u16(),
             started_at,

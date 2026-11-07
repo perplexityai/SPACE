@@ -12,6 +12,7 @@ use std::{collections::HashMap, time::Duration};
 
 use super::PodIp;
 use crate::controllers::substrate::ExecutionIdentity;
+use crate::metrics::sandbox::api::RouteIdentityDecisionReason;
 use pplx_space_cluster_pool::WarmPoolStore;
 use pplx_space_common_core::sql;
 use pplx_space_common_core::types::{
@@ -22,7 +23,6 @@ use pplx_space_common_core::types::{
 use pplx_space_events::{
     SandboxEvent, SandboxEventDetails, SandboxEventSource, SandboxEventTrigger, SandboxEventType,
 };
-use pplx_space_metrics::sandbox::api::RouteIdentityDecisionReason;
 use pplx_space_net_common::NetworkPolicyV1;
 use pplx_space_sandbox_portability::{
     fresh_ready_snapshot_exists, missing_suspending_pod_revert_eligibility, no_newer_full_snapshot,
@@ -394,7 +394,7 @@ pub(super) fn classify_activation_route_publication(
     // The Started access-recovery owner must first claim Recovering; do not
     // send a pod-less row to the resident adoption UPDATE's pod-UID guard.
     // Centralize this counter here so both allocation entry points emit once.
-    pplx_space_metrics::sandbox::api::route_identity_decision(
+    crate::metrics::sandbox::api::route_identity_decision(
         RouteIdentityDecisionReason::RotationRequiredUnclassified,
     );
     Err(SubstrateError::Unavailable {
@@ -431,7 +431,7 @@ fn record_route_identity_decision(claim: &SandboxExecutionClaim, replaced: bool)
         }
     };
     if let Some(reason) = reason {
-        pplx_space_metrics::sandbox::api::route_identity_decision(reason);
+        crate::metrics::sandbox::api::route_identity_decision(reason);
     }
 }
 
@@ -691,10 +691,8 @@ pub(super) enum RestoreClaimRevert {
 }
 
 impl RestoreClaimRevert {
-    pub(super) const fn metric_outcome(
-        &self,
-    ) -> pplx_space_metrics::sandbox::restore::RevertOutcome {
-        use pplx_space_metrics::sandbox::restore::RevertOutcome;
+    pub(super) const fn metric_outcome(&self) -> crate::metrics::sandbox::restore::RevertOutcome {
+        use crate::metrics::sandbox::restore::RevertOutcome;
         match self {
             Self::ExecutionRetired { .. } => RevertOutcome::ExecutionRetired,
             Self::LifecycleOnly => RevertOutcome::LifecycleOnly,

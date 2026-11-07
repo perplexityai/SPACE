@@ -931,8 +931,8 @@ where
                             "won cluster-controller leadership lease"
                         );
                         marker.set(true);
-                        pplx_space_metrics::leader_election::acquired(&config.identity);
-                        pplx_space_metrics::leader_election::is_leader(&config.identity, true);
+                        crate::metrics::leader_election::acquired(&config.identity);
+                        crate::metrics::leader_election::is_leader(&config.identity, true);
                         return Campaign::Elected(Leadership::spawn(
                             store,
                             config,
@@ -946,7 +946,7 @@ where
                         // the lease path proves we can participate, so we're a
                         // healthy standby — signal readiness.
                         marker.set(true);
-                        pplx_space_metrics::leader_election::is_leader(&config.identity, false);
+                        crate::metrics::leader_election::is_leader(&config.identity, false);
                         None
                     }
                     Ok(Err(err)) => Some(err.classify()),
@@ -965,10 +965,10 @@ where
                     continue;
                 };
                 marker.set(false);
-                pplx_space_metrics::leader_election::acquire_failed(failure.as_str());
+                crate::metrics::leader_election::acquire_failed(failure.as_str());
                 // Still campaigning, so certainly not the leader: say so, or a
                 // contender refused from its first attempt never has a series.
-                pplx_space_metrics::leader_election::is_leader(&config.identity, false);
+                crate::metrics::leader_election::is_leader(&config.identity, false);
                 // A failure only a human can clear is reported the first time
                 // it's seen, not after the grace window: for the categories that
                 // don't spend the budget there is no later escalation, and
@@ -1031,7 +1031,7 @@ where
                          its whole liveness budget; exiting non-zero so Kubernetes restarts \
                          this replica"
                     );
-                    pplx_space_metrics::leader_election::lease_unreachable(
+                    crate::metrics::leader_election::lease_unreachable(
                         &config.identity,
                         failure.as_str(),
                     );
@@ -1389,7 +1389,7 @@ impl<S: LeaseStore + Send + Sync + 'static> Leadership<S> {
                 "releasing leadership lease timed out; a standby will take over at TTL"
             ),
         }
-        pplx_space_metrics::leader_election::is_leader(&self.identity, false);
+        crate::metrics::leader_election::is_leader(&self.identity, false);
     }
 
     /// Stop renewing but do **not** release the lease. Use this when the
@@ -1408,7 +1408,7 @@ impl<S: LeaseStore + Send + Sync + 'static> Leadership<S> {
             "abandoning cluster-controller leadership lease without release; \
              it will expire at its TTL after this process exits"
         );
-        pplx_space_metrics::leader_election::is_leader(&self.identity, false);
+        crate::metrics::leader_election::is_leader(&self.identity, false);
     }
 }
 
@@ -1496,7 +1496,7 @@ async fn renew_loop<S>(
                         // instant (conservative vs. the lease's `renewTime`).
                         deadline = issued_at + config.renew_deadline;
                         marker.set(true);
-                        pplx_space_metrics::leader_election::is_leader(&config.identity, true);
+                        crate::metrics::leader_election::is_leader(&config.identity, true);
                     }
                     Ok(false) => {
                         resign_lost(
@@ -1518,7 +1518,7 @@ async fn renew_loop<S>(
                         // and the counter and the log line must not.
                         let reason = err.classify().as_str();
                         marker.set(false);
-                        pplx_space_metrics::leader_election::renew_failed(reason);
+                        crate::metrics::leader_election::renew_failed(reason);
                         tracing::warn!(
                             error = %err,
                             reason,
@@ -1554,7 +1554,7 @@ fn resign_lost(
     marker.set(false);
     leadership_change_span(identity, "lost", reason);
     tracing::error!(%identity, reason, "resigning cluster-controller leadership");
-    pplx_space_metrics::leader_election::lease_lost(identity);
+    crate::metrics::leader_election::lease_lost(identity);
     leader_token.cancel();
 }
 

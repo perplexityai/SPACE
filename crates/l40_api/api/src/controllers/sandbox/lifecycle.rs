@@ -1,8 +1,8 @@
 use pplx_space_common_core::types::SandboxId;
-use pplx_space_metrics::sandbox::api::RequestedKind;
 
 use super::*;
 use crate::controllers::db_contention_error;
+use crate::metrics::sandbox::api::RequestedKind;
 use pplx_space_common_core::sql;
 use pplx_space_common_core::types::{NodeDrainPhase, NodeDrainState, NodeManagedBy, NodeRole};
 use pplx_space_events::{
@@ -69,16 +69,16 @@ fn record_dormant_activation_if_needed(
     let (idle_since, age_source) = match sandbox.last_used_at {
         Some(last_used_at) => (
             last_used_at,
-            pplx_space_metrics::sandbox::api::DormantActivationAgeSource::LastUsedAt,
+            crate::metrics::sandbox::api::DormantActivationAgeSource::LastUsedAt,
         ),
         None => (
             sandbox.updated_at,
-            pplx_space_metrics::sandbox::api::DormantActivationAgeSource::UpdatedAt,
+            crate::metrics::sandbox::api::DormantActivationAgeSource::UpdatedAt,
         ),
     };
 
-    pplx_space_metrics::sandbox::api::dormant_activation(
-        pplx_space_metrics::sandbox::api::DormantActivation {
+    crate::metrics::sandbox::api::dormant_activation(
+        crate::metrics::sandbox::api::DormantActivation {
             identity: metric_identity,
             action: action.as_str(),
             from_lifecycle: sandbox.lifecycle.as_str(),
@@ -1605,7 +1605,7 @@ impl SandboxController {
                     {
                         Ok(execution) => execution,
                         Err(err) => {
-                            pplx_space_metrics::sandbox::api::lifecycle_error(
+                            crate::metrics::sandbox::api::lifecycle_error(
                                 id,
                                 metric_identity,
                                 "substrate",
@@ -1648,7 +1648,7 @@ impl SandboxController {
                     // and runs a routability-fenced completion CAS.
                     let mut completion_guard = wake_completion::WakeCompletionGuard::unarmed(
                         id,
-                        pplx_space_metrics::sandbox::api::WakeCompletionAction::Wake,
+                        crate::metrics::sandbox::api::WakeCompletionAction::Wake,
                     );
                     if sandbox
                         .lifecycle
@@ -1661,7 +1661,7 @@ impl SandboxController {
                             pool.clone(),
                             self.substrate.clone(),
                             id,
-                            pplx_space_metrics::sandbox::api::WakeCompletionAction::Wake,
+                            crate::metrics::sandbox::api::WakeCompletionAction::Wake,
                             wake_completion::redrive_budget(),
                         ));
                     }
@@ -1691,7 +1691,7 @@ impl SandboxController {
                                 &err,
                                 reconnect_started_at,
                             );
-                            pplx_space_metrics::sandbox::api::lifecycle_error(
+                            crate::metrics::sandbox::api::lifecycle_error(
                                 id,
                                 metric_identity,
                                 "substrate",
@@ -1762,7 +1762,7 @@ impl SandboxController {
                             ReconnectReason::PostWakeCasLost,
                             reconnect_started_at,
                         );
-                        pplx_space_metrics::sandbox::api::lifecycle_error(
+                        crate::metrics::sandbox::api::lifecycle_error(
                             id,
                             metric_identity,
                             "post_wake_cas_lost",
@@ -1818,7 +1818,7 @@ impl SandboxController {
                     // future while the node finishes the restore anyway.
                     let mut completion_guard = wake_completion::WakeCompletionGuard::unarmed(
                         id,
-                        pplx_space_metrics::sandbox::api::WakeCompletionAction::Restore,
+                        crate::metrics::sandbox::api::WakeCompletionAction::Restore,
                     );
                     if sandbox
                         .lifecycle
@@ -1831,7 +1831,7 @@ impl SandboxController {
                             pool.clone(),
                             self.substrate.clone(),
                             id,
-                            pplx_space_metrics::sandbox::api::WakeCompletionAction::Restore,
+                            crate::metrics::sandbox::api::WakeCompletionAction::Restore,
                             wake_completion::redrive_budget(),
                         ));
                     }
@@ -1851,7 +1851,7 @@ impl SandboxController {
                         Ok(completion) => completion,
                         Err(err) => {
                             completion_guard.defuse();
-                            pplx_space_metrics::sandbox::api::lifecycle_error(
+                            crate::metrics::sandbox::api::lifecycle_error(
                                 id,
                                 metric_identity,
                                 "substrate",
@@ -1913,7 +1913,7 @@ impl SandboxController {
                         return Ok(body);
                     }
                     if completion == WakeLifecycleCompletion::Lost {
-                        pplx_space_metrics::sandbox::api::lifecycle_error(
+                        crate::metrics::sandbox::api::lifecycle_error(
                             id,
                             metric_identity,
                             "post_restore_cas_lost",
@@ -1957,7 +1957,7 @@ impl SandboxController {
                     match self.substrate.suspend_execution(typed_id).await {
                         Ok(_) => {}
                         Err(err) => {
-                            pplx_space_metrics::sandbox::api::lifecycle_error(
+                            crate::metrics::sandbox::api::lifecycle_error(
                                 id,
                                 metric_identity,
                                 "substrate",

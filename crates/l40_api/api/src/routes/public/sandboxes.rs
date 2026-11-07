@@ -4,6 +4,9 @@ use pplx_space_common_core::types::{NodeId, OrgId, SandboxId, UserId};
 use pplx_space_common_core::sql;
 use std::{convert::Infallible, str::FromStr, time::Duration};
 
+use crate::metrics::operations::InlineAdmissionPath;
+use crate::metrics::sandbox::api::{ClientIdTag, request_client_id};
+use crate::metrics::warm_pool::AdmissionClaimOutcome;
 use axum::{
     Extension, Json,
     body::Bytes,
@@ -17,9 +20,6 @@ use axum::{
 use pplx_space_common_core::types::{
     AutoLifecyclePolicy, IdempotencyKey, SandboxLifecycle, SubstrateKind,
 };
-use pplx_space_metrics::operations::InlineAdmissionPath;
-use pplx_space_metrics::sandbox::api::{ClientIdTag, request_client_id};
-use pplx_space_metrics::warm_pool::AdmissionClaimOutcome;
 use pplx_space_public_api::{
     ConditionStatus, CreateSandboxRequest, OperationId, OperationKind, OperationState,
     OperationTargetType, PageCursor, PublicErrorCode, PublicOperationRecord, PublicPage,
@@ -431,7 +431,7 @@ pub(crate) async fn create_native_sandbox_operation(
 
     let mut response = match result {
         CreatePublicOperationResult::Created(operation_id) => {
-            pplx_space_metrics::warm_pool::admission_claim(outcome);
+            crate::metrics::warm_pool::admission_claim(outcome);
             // The path names no sandbox yet; the request span learns it here.
             pplx_space_sandbox_grpc::record_sandbox_id(
                 &tracing::Span::current(),

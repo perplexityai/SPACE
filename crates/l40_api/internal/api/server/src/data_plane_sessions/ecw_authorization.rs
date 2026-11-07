@@ -106,7 +106,7 @@ pub(super) fn token_matches_ecw_credential(
     let result = keyring
         .match_sha256(sandbox_id, credential_epoch, kind, candidate_sha256)
         .map_err(|error| {
-            pplx_space_metrics::internal_api::ecw_credential_verification(
+            crate::metrics::internal_api::ecw_credential_verification(
                 kind.as_str(),
                 EcwCredentialVerificationResult::ConfigurationError,
             );
@@ -117,6 +117,6 @@ pub(super) fn token_matches_ecw_credential(
         EcwCredentialMatch::V2Previous => EcwCredentialVerificationResult::V2Previous,
         EcwCredentialMatch::NoMatch => EcwCredentialVerificationResult::Invalid,
     };
-    pplx_space_metrics::internal_api::ecw_credential_verification(kind.as_str(), metric_result);
+    crate::metrics::internal_api::ecw_credential_verification(kind.as_str(), metric_result);
     Ok(result != EcwCredentialMatch::NoMatch)
 }

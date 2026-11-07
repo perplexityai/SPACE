@@ -10,7 +10,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 
-use pplx_space_metrics::sandbox::api::client_limit::ClientScope;
+use crate::metrics::sandbox::api::client_limit::ClientScope;
 
 use crate::middleware::auth::EcwCallerIdentity;
 

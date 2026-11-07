@@ -72,7 +72,7 @@ use crate::{
     routes::AppState,
 };
 
-use pplx_space_metrics::sandbox::api::{TemplateSelectorKind, TemplateTagShape};
+use crate::metrics::sandbox::api::{TemplateSelectorKind, TemplateTagShape};
 
 const TEST_ECW_API_HOST: &str = "api.e2b.example.test";
 const TEST_ECW_HOST: &str = "e2b.example.test";
@@ -5327,7 +5327,7 @@ fn test_ecw_host_config() -> EcwHostConfig {
 /// `Cluster`/`BackendStatus` with the suite green.
 #[tokio::test(flavor = "current_thread")]
 async fn ecw_contention_keeps_its_own_attribution() -> pplx_space_test_env::TestResult {
-    use pplx_space_metrics::response::{ResponseKind, ResponseOrigin};
+    use pplx_space_public_api_http::metrics::{ResponseKind, ResponseOrigin};
 
     let Some(db) = pplx_space_db_test_fixtures::try_pg_test_db().await? else {
         return Ok(());

@@ -1,6 +1,6 @@
 //! The Native public error each file request failure answers with.
 
-use pplx_space_metrics::response::{ResponseKind, ResponseOrigin};
+use pplx_space_public_api_http::metrics::{ResponseKind, ResponseOrigin};
 use pplx_space_public_api_http::{PublicApiError, with_retry_after_hint};
 
 use crate::{FileCallError, FileCallErrorKind, FileRequestError, FingerprintError};

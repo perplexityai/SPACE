@@ -89,7 +89,7 @@ impl ClusterApiService {
         request: &Request<T>,
     ) -> Result<super::template_releases_store::TemplateReadScope, Status> {
         use super::template_releases_store::TemplateReadScope;
-        use pplx_space_metrics::auth::{TemplateNodeBinding, template_node_binding};
+        use crate::metrics::auth::{TemplateNodeBinding, template_node_binding};
         use pplx_space_rpc_auth::{
             AuthenticatedNodeIdentity, NodeApiAuthenticatedCaller, TemplateReleaseReadAuthority,
         };
@@ -1330,7 +1330,7 @@ impl ClusterApi for ClusterApiService {
         let suppress_threshold = deleted_partition_suppress_threshold(requested_count);
         let deleted_count = deleted_sandbox_ids.len();
         let should_suppress = deleted_partition_should_suppress(deleted_count, requested_count);
-        pplx_space_metrics::reconcile::sandbox_desired_state_deleted_reported(
+        crate::metrics::reconcile::sandbox_desired_state_deleted_reported(
             &origin.display_id,
             deleted_count as u64,
         );
@@ -1346,7 +1346,7 @@ impl ClusterApi for ClusterApiService {
                  deleted partition — investigate database staleness or misrouting before \
                  re-enabling cluster-deleted eviction"
             );
-            pplx_space_metrics::reconcile::sandbox_desired_state_deleted_suppressed();
+            crate::metrics::reconcile::sandbox_desired_state_deleted_suppressed();
             deleted_sandbox_ids.clear();
         } else if !deleted_sandbox_ids.is_empty() {
             let sample_sandbox_ids = deleted_sandbox_ids

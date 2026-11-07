@@ -2,8 +2,8 @@ use super::metadata::*;
 use super::status::*;
 use super::*;
 use crate::auto_lifecycle_delete_completions::consume_auto_lifecycle_delete_completions;
+use crate::metrics::internal_api::{LocalBackupQueueOutcome, local_backup_queue_reconcile};
 use crate::node_local_backup_pending::{self, PendingLocalBackupCensus};
-use pplx_space_metrics::internal_api::{LocalBackupQueueOutcome, local_backup_queue_reconcile};
 use pplx_space_node_api_client::node_status_freshness::reported_freshness;
 use pplx_space_sandbox_store::StoredSandboxLifecycle;
 
@@ -213,7 +213,7 @@ impl ClusterApiService {
                 .as_seconds_f64()
                 .max(0.0)
                 * 1_000.0;
-            pplx_space_metrics::sandbox::publication::state_convergence_duration_ms(
+            pplx_space_sandbox_metrics::publication::state_convergence_duration_ms(
                 &sample.state,
                 duration_ms,
             );

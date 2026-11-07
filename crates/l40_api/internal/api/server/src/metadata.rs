@@ -2,11 +2,11 @@ use pplx_space_common_core::types::{NodeId, OrgId, SandboxId};
 
 use std::time::Instant;
 
-use pplx_space_common_core::types::TemplateVisibility as CoreTemplateVisibility;
-use pplx_space_metrics::template::{
+use crate::metrics::template::{
     VisibilityLookupCacheOutcome, VisibilityLookupDegradation, visibility_lookup_cache,
     visibility_lookup_degraded,
 };
+use pplx_space_common_core::types::TemplateVisibility as CoreTemplateVisibility;
 
 use crate::template_visibility_cache::TemplateVisibilityCache;
 

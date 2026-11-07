@@ -6,9 +6,9 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::metrics::cluster_reconciler as metrics;
 use pplx_space_api::controllers::substrate::kubernetes::KubernetesSubstrate;
 use pplx_space_common_core::types::{PodUid, SandboxId};
-use pplx_space_metrics::cluster_reconciler as metrics;
 use tokio_util::sync::CancellationToken;
 
 use super::backend::{DeleteOutcome, GcBackend, KubernetesGcBackend};

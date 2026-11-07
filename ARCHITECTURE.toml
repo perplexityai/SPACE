@@ -359,7 +359,6 @@ mode = "advisory"
 # (Layers).
 [rules.layers.unmoved]
 l10_foundation = [
-  "pplx-space-metrics",
 ]
 l20_domain = [
   "pplx-space-common-core",
@@ -488,7 +487,7 @@ helpers = [
 # The crates being dissolved: they predate the layers and mix SPACE-specific
 # code in until they are split up. Every check covers them, with today's edges
 # baselined.
-legacy = ["pplx-space-common-core", "pplx-space-metrics"]
+legacy = ["pplx-space-common-core"]
 
 # An l20_domain crate is a protocol (wire schemas and the conversions between
 # them and the models) if its name ends in -protocol or -proto, or `protocols`

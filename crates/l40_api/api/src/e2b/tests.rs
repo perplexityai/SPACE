@@ -6,7 +6,7 @@ use super::{
 };
 use axum::http::{StatusCode, header};
 use axum::response::IntoResponse;
-use pplx_space_metrics::response::{ResponseKind, ResponseOrigin};
+use pplx_space_public_api_http::metrics::{ResponseKind, ResponseOrigin};
 
 #[test]
 fn fork_request_accepts_the_sdk_defaults_shape() {

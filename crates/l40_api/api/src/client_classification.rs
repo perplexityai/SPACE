@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use pplx_space_metrics::sandbox::api::ClientClass;
+use crate::metrics::sandbox::api::ClientClass;
 use serde::de::{Error, MapAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 

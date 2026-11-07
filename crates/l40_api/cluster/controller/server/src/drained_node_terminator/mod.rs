@@ -33,7 +33,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use pplx_space_metrics::node_drain as node_drain_metrics;
+use crate::metrics::node_drain as node_drain_metrics;
 use tokio_util::sync::CancellationToken;
 
 use crate::env_config;

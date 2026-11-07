@@ -72,7 +72,7 @@ struct AcceptedSandboxPublishRow {
 #[derive(Debug, thiserror::Error)]
 #[error("invalid {field}: {message}")]
 struct PublishedTransitionReceiptError {
-    field: pplx_space_metrics::sandbox::publication::StatePublicationField,
+    field: pplx_space_sandbox_metrics::publication::StatePublicationField,
     message: String,
 }
 
@@ -83,7 +83,7 @@ fn parse_published_transition_receipt(
     Option<SandboxTransitionReceipt<SandboxQuarantineReasonCode>>,
     PublishedTransitionReceiptError,
 > {
-    use pplx_space_metrics::sandbox::publication::StatePublicationField as Field;
+    use pplx_space_sandbox_metrics::publication::StatePublicationField as Field;
 
     let Some(receipt) = state.transition_receipt.as_ref() else {
         return Ok(None);
@@ -159,9 +159,9 @@ fn parse_published_transition_receipt(
                                 });
                             }
                         };
-                        let disposition = pplx_space_metrics::sandbox::publication::StatePublicationDisposition::FallbackTransitionReason;
-                        pplx_space_metrics::sandbox::publication::degraded(
-                            pplx_space_metrics::sandbox::publication::StatePublicationComponent::Api,
+                        let disposition = pplx_space_sandbox_metrics::publication::StatePublicationDisposition::FallbackTransitionReason;
+                        pplx_space_sandbox_metrics::publication::degraded(
+                            pplx_space_sandbox_metrics::publication::StatePublicationComponent::Api,
                             Field::TransitionReceiptReasonCode,
                             disposition,
                         );
@@ -1461,10 +1461,10 @@ pub async fn publish_sandbox_states_with_retirement(
         let sandbox_id = match parse_sandbox_id(&state.sandbox_id) {
             Ok(sandbox_id) => sandbox_id,
             Err(error) => {
-                let disposition = pplx_space_metrics::sandbox::publication::StatePublicationDisposition::OmitSandbox;
-                pplx_space_metrics::sandbox::publication::degraded(
-                    pplx_space_metrics::sandbox::publication::StatePublicationComponent::Api,
-                    pplx_space_metrics::sandbox::publication::StatePublicationField::CoreRow,
+                let disposition = pplx_space_sandbox_metrics::publication::StatePublicationDisposition::OmitSandbox;
+                pplx_space_sandbox_metrics::publication::degraded(
+                    pplx_space_sandbox_metrics::publication::StatePublicationComponent::Api,
+                    pplx_space_sandbox_metrics::publication::StatePublicationField::CoreRow,
                     disposition,
                 );
                 tracing::warn!(
@@ -1530,9 +1530,9 @@ pub async fn publish_sandbox_states_with_retirement(
         let transition_receipt = match parse_published_transition_receipt(state, status) {
             Ok(receipt) => receipt,
             Err(error) => {
-                let disposition = pplx_space_metrics::sandbox::publication::StatePublicationDisposition::OmitTransitionReceipt;
-                pplx_space_metrics::sandbox::publication::degraded(
-                    pplx_space_metrics::sandbox::publication::StatePublicationComponent::Api,
+                let disposition = pplx_space_sandbox_metrics::publication::StatePublicationDisposition::OmitTransitionReceipt;
+                pplx_space_sandbox_metrics::publication::degraded(
+                    pplx_space_sandbox_metrics::publication::StatePublicationComponent::Api,
                     error.field,
                     disposition,
                 );
@@ -1555,10 +1555,10 @@ pub async fn publish_sandbox_states_with_retirement(
                     (Some(observation), false)
                 }
                 Err(error) => {
-                    let disposition = pplx_space_metrics::sandbox::publication::StatePublicationDisposition::OmitQuarantineRecoveryObservation;
-                    pplx_space_metrics::sandbox::publication::degraded(
-                    pplx_space_metrics::sandbox::publication::StatePublicationComponent::Api,
-                    pplx_space_metrics::sandbox::publication::StatePublicationField::QuarantineRecoveryObservation,
+                    let disposition = pplx_space_sandbox_metrics::publication::StatePublicationDisposition::OmitQuarantineRecoveryObservation;
+                    pplx_space_sandbox_metrics::publication::degraded(
+                    pplx_space_sandbox_metrics::publication::StatePublicationComponent::Api,
+                    pplx_space_sandbox_metrics::publication::StatePublicationField::QuarantineRecoveryObservation,
                     disposition,
                 );
                     tracing::warn!(
@@ -1829,10 +1829,10 @@ pub async fn publish_sandbox_states_with_retirement(
             snapshot_rows.truncate(snapshot_count);
             quarantine_inputs.truncate(quarantine_count);
             let disposition =
-                pplx_space_metrics::sandbox::publication::StatePublicationDisposition::StateOnly;
-            pplx_space_metrics::sandbox::publication::degraded(
-                pplx_space_metrics::sandbox::publication::StatePublicationComponent::Api,
-                pplx_space_metrics::sandbox::publication::StatePublicationField::CoreRow,
+                pplx_space_sandbox_metrics::publication::StatePublicationDisposition::StateOnly;
+            pplx_space_sandbox_metrics::publication::degraded(
+                pplx_space_sandbox_metrics::publication::StatePublicationComponent::Api,
+                pplx_space_sandbox_metrics::publication::StatePublicationField::CoreRow,
                 disposition,
             );
             tracing::warn!(

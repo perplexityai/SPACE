@@ -116,7 +116,7 @@ async fn live_cpu_update_preserves_allocation_across_cold_restart() -> TestResul
             controller
                 .substrate
                 .start_execution(
-                    pplx_space_metrics::sandbox::api::SandboxApiMetricIdentity::native("start"),
+                    crate::metrics::sandbox::api::SandboxApiMetricIdentity::native("start"),
                     sandbox_id,
                     ActivationOptions {
                         blocking: true,

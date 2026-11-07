@@ -20,7 +20,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
-use pplx_space_metrics::reconcile::QueueGcDetector;
+use crate::metrics::reconcile::QueueGcDetector;
 use tokio::time::{Instant, timeout};
 
 use super::GoneCandidate;

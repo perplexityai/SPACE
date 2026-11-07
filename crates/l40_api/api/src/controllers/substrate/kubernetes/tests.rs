@@ -47,6 +47,7 @@ mod kubernetes_tests {
         NodeApiTarget, PooledExecutionClaim, PublishedLocalArtifact, RecordedExecution, Substrate,
         SubstrateAdapter, TeardownProgress,
     };
+    use crate::metrics::sandbox::api::SandboxApiMetricIdentity;
     use axum::http::{Method, Request, Response, StatusCode};
     use http_body_util::BodyExt;
     use k8s_openapi::api::core::v1::{
@@ -78,7 +79,6 @@ mod kubernetes_tests {
         TemplateName, TemplateVisibility,
     };
     use pplx_space_internal_api_server::publish_sandbox_states;
-    use pplx_space_metrics::sandbox::api::SandboxApiMetricIdentity;
     use pplx_space_node_api_client::proto::PublishedSandboxState;
     use pplx_space_node_api_client::proto::worker_api_internal_server::{
         WorkerApiInternal, WorkerApiInternalServer,
@@ -12108,11 +12108,11 @@ mod kubernetes_tests {
     impl PoolClaimFixture {
         fn request(&self) -> crate::controllers::substrate::PooledExecutionClaimRequest<'_> {
             crate::controllers::substrate::PooledExecutionClaimRequest {
-                metric_identity: pplx_space_metrics::sandbox::api::SandboxApiMetricIdentity {
+                metric_identity: crate::metrics::sandbox::api::SandboxApiMetricIdentity {
                     op: "create",
-                    surface: pplx_space_metrics::sandbox::api::SandboxApiSurface::Native,
-                    client_class: pplx_space_metrics::sandbox::api::ClientClass::Other,
-                    client_id: pplx_space_metrics::sandbox::api::ClientIdTag::UNKNOWN,
+                    surface: crate::metrics::sandbox::api::SandboxApiSurface::Native,
+                    client_class: crate::metrics::sandbox::api::ClientClass::Other,
+                    client_id: crate::metrics::sandbox::api::ClientIdTag::UNKNOWN,
                 },
                 actor: &self.actor,
                 template: "seed",

@@ -1274,7 +1274,7 @@ pub(super) async fn e2b_watch_dir(
         Some(Err(error)) => return error.into_response(),
         None => {
             // The permit above already counted the attach as `ok`.
-            pplx_space_metrics::data_plane::stream_closed(ECW_FILE_WATCH_STREAM_KIND, "shutdown");
+            crate::metrics::stream_closed(ECW_FILE_WATCH_STREAM_KIND, "shutdown");
             return EcwProxyError::draining().into_response();
         }
     };
@@ -1333,17 +1333,14 @@ impl<S> E2bWatchConnectStream<S> {
             return;
         }
         self.close_recorded = true;
-        pplx_space_metrics::data_plane::stream_closed(ECW_FILE_WATCH_STREAM_KIND, result);
+        crate::metrics::stream_closed(ECW_FILE_WATCH_STREAM_KIND, result);
     }
 }
 
 impl<S> Drop for E2bWatchConnectStream<S> {
     fn drop(&mut self) {
         if !self.close_recorded {
-            pplx_space_metrics::data_plane::stream_closed(
-                ECW_FILE_WATCH_STREAM_KIND,
-                "client_closed",
-            );
+            crate::metrics::stream_closed(ECW_FILE_WATCH_STREAM_KIND, "client_closed");
         }
     }
 }
@@ -1414,10 +1411,7 @@ where
 }
 
 fn record_ecw_watch_stream_bytes(bytes: &Bytes) {
-    pplx_space_metrics::data_plane::stream_bytes_out(
-        ECW_FILE_WATCH_STREAM_KIND,
-        bytes.len() as u64,
-    );
+    crate::metrics::stream_bytes_out(ECW_FILE_WATCH_STREAM_KIND, bytes.len() as u64);
 }
 
 async fn decode_watch_dir_request(

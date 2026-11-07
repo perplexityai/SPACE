@@ -1,6 +1,6 @@
 //! gRPC client and server metrics, in their own crate so that the generic gRPC
-//! infrastructure crates can emit them without depending on
-//! `pplx-space-metrics`.
+//! infrastructure crates and every service that records them can depend on
+//! it.
 //!
 //! The per-measurement `service` tag names the peer for client metrics and
 //! the served interface for rate-limit metrics. OTLP exports it as

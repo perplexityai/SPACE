@@ -143,10 +143,10 @@ impl AppState {
             return Ok(Some((user, organization)));
         }
         if self.password_session_allowed(&user.email) {
-            pplx_space_metrics::auth::external_console_password_session("session_accepted");
+            crate::metrics::auth::external_console_password_session("session_accepted");
             Ok(Some((user, organization)))
         } else {
-            pplx_space_metrics::auth::external_console_password_session("session_refused");
+            crate::metrics::auth::external_console_password_session("session_refused");
             Ok(None)
         }
     }

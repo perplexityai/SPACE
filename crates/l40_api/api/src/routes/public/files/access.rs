@@ -4,6 +4,7 @@
 //! route's own handler, and stops where that handler would send the sandbox
 //! its call.
 
+use crate::metrics::sandbox::api::SandboxApiMetricIdentity;
 use axum::{
     Extension,
     extract::{Path, State},
@@ -11,7 +12,6 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use pplx_space_common_core::types::{IdempotencyKey, NodeId, OrgId, SandboxId, UserId};
-use pplx_space_metrics::sandbox::api::SandboxApiMetricIdentity;
 use pplx_space_native_files::{FileOperation, guest_key};
 use pplx_space_public_api::RequestFingerprint;
 

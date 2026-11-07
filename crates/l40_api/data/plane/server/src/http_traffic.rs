@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{Context, Poll};
 use std::time::Instant;
 
+use crate::metrics::{HttpBodyDirection, HttpRouteClass, TooManyRequestsReason};
 use axum::body::{Body, Bytes};
 use axum::extract::State;
 use axum::http::{HeaderMap, Request, StatusCode};
@@ -19,7 +20,6 @@ use axum::middleware::Next;
 use axum::response::Response;
 use http_body::{Frame, SizeHint};
 use pplx_space_common_core::types::{OrgId, SandboxId};
-use pplx_space_metrics::data_plane::{HttpBodyDirection, HttpRouteClass, TooManyRequestsReason};
 
 use super::{EcwHostConfig, should_proxy_ecw_service_port_request};
 
@@ -84,7 +84,7 @@ pub(super) async fn observe_http_traffic(
             .get::<TooManyRequestsReason>()
             .copied()
             .unwrap_or(TooManyRequestsReason::Unclassified);
-        pplx_space_metrics::data_plane::http_too_many_requests(route_class, reason);
+        crate::metrics::http_too_many_requests(route_class, reason);
     }
     let (parts, body) = response.into_parts();
     Response::from_parts(
@@ -131,7 +131,7 @@ impl ByteTally {
     }
 
     fn flush(&mut self) {
-        pplx_space_metrics::data_plane::http_bytes(
+        crate::metrics::http_bytes(
             self.direction,
             self.route_class,
             std::mem::take(&mut self.pending),
@@ -231,7 +231,7 @@ impl UploadTracker {
     fn update(&self, change: impl FnOnce(&mut UploadTotals)) {
         let mut totals = self.totals.lock().unwrap_or_else(PoisonError::into_inner);
         change(&mut totals);
-        pplx_space_metrics::data_plane::upload_in_flight(totals.count, totals.reserved_bytes);
+        crate::metrics::upload_in_flight(totals.count, totals.reserved_bytes);
     }
 
     #[cfg(test)]

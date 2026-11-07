@@ -114,7 +114,7 @@ where
             .gc_expired_sessions(self.config.grace, self.config.max_records_per_tick)
             .await?;
         if report.sessions_deleted > 0 {
-            pplx_space_metrics::data_plane::session_retention_deleted(report.sessions_deleted);
+            crate::metrics::data_plane::session_retention_deleted(report.sessions_deleted);
             tracing::info!(
                 sessions_deleted = report.sessions_deleted,
                 "data-plane session retention pruned expired records"

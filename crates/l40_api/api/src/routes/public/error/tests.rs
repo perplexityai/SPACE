@@ -1,7 +1,7 @@
 use axum::http::StatusCode;
 use http_body_util::BodyExt;
-use pplx_space_metrics::response::{ResponseKind, ResponseOrigin};
 use pplx_space_public_api::{PublicErrorCode, PublicErrorEnvelope};
+use pplx_space_public_api_http::metrics::{ResponseKind, ResponseOrigin};
 
 use super::{PublicApiError, database_error};
 

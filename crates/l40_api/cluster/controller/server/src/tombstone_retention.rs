@@ -234,16 +234,16 @@ where
             .sink
             .prune_tombstones(self.config.retention, self.config.max_records_per_tick)
             .await?;
-        pplx_space_metrics::tombstone::retained_rows("direct_node", report.direct_node_tombstones);
-        pplx_space_metrics::tombstone::retained_rows("template", report.template_tombstones);
-        pplx_space_metrics::tombstone::retained_rows("sandbox", report.deleted_sandbox_rows);
+        crate::metrics::tombstone::retained_rows("direct_node", report.direct_node_tombstones);
+        crate::metrics::tombstone::retained_rows("template", report.template_tombstones);
+        crate::metrics::tombstone::retained_rows("sandbox", report.deleted_sandbox_rows);
         if report.total() > 0 {
-            pplx_space_metrics::tombstone::retention_deleted(
+            crate::metrics::tombstone::retention_deleted(
                 "direct_node",
                 report.direct_nodes_deleted,
             );
-            pplx_space_metrics::tombstone::retention_deleted("template", report.templates_deleted);
-            pplx_space_metrics::tombstone::retention_deleted(
+            crate::metrics::tombstone::retention_deleted("template", report.templates_deleted);
+            crate::metrics::tombstone::retention_deleted(
                 "sandbox",
                 report.deleted_sandboxes_deleted,
             );

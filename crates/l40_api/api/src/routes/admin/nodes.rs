@@ -2117,10 +2117,7 @@ async fn apply_force_upload_local_snapshots(
         match outcome {
             Ok(()) => {
                 response.reuploaded.push(sandbox_id);
-                pplx_space_metrics::node_drain::local_snapshot_promotion(
-                    &node_id_str,
-                    "reuploaded",
-                );
+                crate::metrics::node_drain::local_snapshot_promotion(&node_id_str, "reuploaded");
             }
             Err(err) => {
                 // Both markers carry the same terminal classification —
@@ -2140,7 +2137,7 @@ async fn apply_force_upload_local_snapshots(
                 } else {
                     "failed"
                 };
-                pplx_space_metrics::node_drain::local_snapshot_promotion(&node_id_str, outcome_tag);
+                crate::metrics::node_drain::local_snapshot_promotion(&node_id_str, outcome_tag);
                 response.failed.push(ForceUploadFailure {
                     sandbox_id,
                     error: err,

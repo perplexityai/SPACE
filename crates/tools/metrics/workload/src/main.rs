@@ -2,8 +2,9 @@
 //! No custom recorder/exporter; see scripts/tests/observability/metrics/README.md.
 use std::time::Duration;
 
-use pplx_space_metrics::sandbox;
+use pplx_space_api::metrics::sandbox::api;
 use pplx_space_node_mgr::metrics::node_manager;
+use pplx_space_sandbox_metrics::publication;
 use pplx_space_sbx_mgr::metrics::sandbox::worker;
 
 #[tokio::main]
@@ -29,9 +30,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
         if increment != 0 {
             node_manager::loop_devices_created(increment, increment * 2);
-            sandbox::api::sandbox_created(false);
+            api::sandbox_created(false);
             for value in [1.0, 2.0, 4.0, 8.0] {
-                sandbox::publication::state_convergence_duration_ms("started", value);
+                publication::state_convergence_duration_ms("started", value);
             }
             for value in [2, 4, 8] {
                 worker::guest_observed_specs("oss-synthetic", None, Some(value));

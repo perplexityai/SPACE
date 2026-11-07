@@ -182,10 +182,10 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::metrics::node_drain as node_drain_metrics;
 use pplx_space_api::controllers::substrate::NODE_RPC_BLOCKING_BUDGET;
 use pplx_space_common_core::kubernetes::EvacuationPlacement;
 use pplx_space_common_core::types::{NodeDrainMode, PositiveDuration, SandboxLifecycle};
-use pplx_space_metrics::node_drain as node_drain_metrics;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
@@ -3079,7 +3079,10 @@ impl<S: NodeDrainSink, T: InstanceTerminator> Reconciler<S, T> {
         for (sandbox_id, outcome) in outcomes {
             match outcome {
                 Ok(Ok(())) => {
-                    node_drain_metrics::local_snapshot_promotion(&node_label, "backup_enqueued");
+                    pplx_space_api::metrics::node_drain::local_snapshot_promotion(
+                        &node_label,
+                        "backup_enqueued",
+                    );
                     tracing::info!(
                         node_id = %node_id,
                         sandbox_id = %sandbox_id,
@@ -3094,7 +3097,7 @@ impl<S: NodeDrainSink, T: InstanceTerminator> Reconciler<S, T> {
                     // customer's next wake/restore call gets a clean
                     // lifecycle error rather than a confusing
                     // snapshot-not-found.
-                    node_drain_metrics::local_snapshot_promotion(
+                    pplx_space_api::metrics::node_drain::local_snapshot_promotion(
                         &node_label,
                         "failed_artifact_missing",
                     );
@@ -3196,12 +3199,18 @@ impl<S: NodeDrainSink, T: InstanceTerminator> Reconciler<S, T> {
                             }
                         }
                     };
-                    node_drain_metrics::local_snapshot_promotion(&node_label, outcome);
+                    pplx_space_api::metrics::node_drain::local_snapshot_promotion(
+                        &node_label,
+                        outcome,
+                    );
                 }
                 Ok(Err(PromoteError::UnnamedWithheld(detail))) => {
                     // Nothing went to the node, so this isn't a failure of it;
                     // the next tick re-reads the marker.
-                    node_drain_metrics::local_snapshot_promotion(&node_label, "unnamed_withheld");
+                    pplx_space_api::metrics::node_drain::local_snapshot_promotion(
+                        &node_label,
+                        "unnamed_withheld",
+                    );
                     tracing::debug!(
                         node_id = %node_id,
                         sandbox_id = %sandbox_id,
@@ -3210,7 +3219,10 @@ impl<S: NodeDrainSink, T: InstanceTerminator> Reconciler<S, T> {
                     );
                 }
                 Ok(Err(err)) => {
-                    node_drain_metrics::local_snapshot_promotion(&node_label, "failed");
+                    pplx_space_api::metrics::node_drain::local_snapshot_promotion(
+                        &node_label,
+                        "failed",
+                    );
                     tracing::warn!(
                         node_id = %node_id,
                         sandbox_id = %sandbox_id,
@@ -3219,7 +3231,10 @@ impl<S: NodeDrainSink, T: InstanceTerminator> Reconciler<S, T> {
                     );
                 }
                 Err(_) => {
-                    node_drain_metrics::local_snapshot_promotion(&node_label, "failed");
+                    pplx_space_api::metrics::node_drain::local_snapshot_promotion(
+                        &node_label,
+                        "failed",
+                    );
                     tracing::warn!(
                         node_id = %node_id,
                         sandbox_id = %sandbox_id,
@@ -3368,7 +3383,7 @@ impl<S: NodeDrainSink, T: InstanceTerminator> Reconciler<S, T> {
                     "node_gone_retry"
                 }
             };
-            node_drain_metrics::local_snapshot_promotion(&node_label, outcome);
+            pplx_space_api::metrics::node_drain::local_snapshot_promotion(&node_label, outcome);
         }
     }
 

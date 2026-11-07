@@ -36,12 +36,10 @@ use std::num::{NonZeroU64, NonZeroUsize};
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::metrics::{TooManyRequestsReason, UploadAdmissionScope, UploadRejectReason};
 use axum::body::Body;
 use axum::http::Version;
 use pplx_space_common_core::types::{OrgId, SandboxId};
-use pplx_space_metrics::data_plane::{
-    TooManyRequestsReason, UploadAdmissionScope, UploadRejectReason,
-};
 use rand::RngExt as _;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::Instant;
@@ -571,10 +569,7 @@ fn transfer_rate_exceeded(debt: Duration) -> EcwProxyError {
 
 /// An upload refused at admission over its org's transfer rate.
 fn upload_over_rate(debt: Duration) -> EcwProxyError {
-    pplx_space_metrics::data_plane::upload_rejected(
-        UploadAdmissionScope::Org,
-        UploadRejectReason::TransferRate,
-    );
+    crate::metrics::upload_rejected(UploadAdmissionScope::Org, UploadRejectReason::TransferRate);
     upload_rate_error(debt)
 }
 
@@ -588,7 +583,7 @@ fn upload_rate_error(debt: Duration) -> EcwProxyError {
 /// An upload refused for a budget's slots or bytes. Rate refusals go
 /// through [`upload_over_rate`], which knows the debt.
 fn upload_rejected(scope: UploadAdmissionScope, reason: UploadRejectReason) -> EcwProxyError {
-    pplx_space_metrics::data_plane::upload_rejected(scope, reason);
+    crate::metrics::upload_rejected(scope, reason);
     let error = EcwProxyError::too_many_uploads(jittered_retry_after());
     error.with_too_many_requests_reason(match (scope, reason) {
         (UploadAdmissionScope::Pod, UploadRejectReason::Concurrency) => {

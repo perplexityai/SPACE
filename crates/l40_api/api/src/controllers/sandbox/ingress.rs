@@ -1,7 +1,7 @@
 //! Bounded ingress waiting over independently owned access activation.
 use super::*;
+use crate::metrics::sandbox::api::SandboxApiMetricIdentity;
 use pplx_space_common_core::types::{SandboxId, SandboxLifecycle};
-use pplx_space_metrics::sandbox::api::SandboxApiMetricIdentity;
 use pplx_space_node_api_client::activation::IngressActivation;
 use pplx_space_node_api_client::proto::ImplicitWakeActivity;
 use sqlx::PgPool;
@@ -303,7 +303,7 @@ impl IngressActivation for Activator {
                 }
                 if state.restore_owned {
                     if !observing {
-                        pplx_space_metrics::internal_api::ingress_preparation_path(true);
+                        crate::metrics::internal_api::ingress_preparation_path(true);
                     }
                     observing = true;
                 } else if observing {
@@ -316,11 +316,11 @@ impl IngressActivation for Activator {
                     {
                         return Ok(());
                     }
-                    pplx_space_metrics::internal_api::ingress_preparation_path(false);
+                    crate::metrics::internal_api::ingress_preparation_path(false);
                     match self.owners.access(self.backend.clone(), id).await? {
                         AccessOutcome::Ready => return Ok(()),
                         AccessOutcome::RestoreOwned => {
-                            pplx_space_metrics::internal_api::ingress_preparation_path(true);
+                            crate::metrics::internal_api::ingress_preparation_path(true);
                             observing = true;
                         }
                     }

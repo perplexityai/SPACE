@@ -122,10 +122,10 @@ async fn sample_recipe(
                 Status::internal(format!("release recipe sample savepoint: {error}"))
             })?;
             let scope = match known {
-                Some(_) => pplx_space_metrics::internal_api::RecipeCatalogScope::Known,
-                None => pplx_space_metrics::internal_api::RecipeCatalogScope::Full,
+                Some(_) => crate::metrics::internal_api::RecipeCatalogScope::Known,
+                None => crate::metrics::internal_api::RecipeCatalogScope::Full,
             };
-            pplx_space_metrics::internal_api::runtime_provisioning_recipe_environments(
+            crate::metrics::internal_api::runtime_provisioning_recipe_environments(
                 recipe.len(),
                 scope,
             );

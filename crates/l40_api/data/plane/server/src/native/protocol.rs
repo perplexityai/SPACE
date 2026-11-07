@@ -162,7 +162,7 @@ pub(crate) fn process_event_frames(event: ProcessEvent, output_seq: &mut u64) ->
 }
 
 pub(crate) fn record_process_output_bytes(kind: &str, batch: &ProcessFrameBatch) {
-    pplx_space_metrics::data_plane::stream_bytes_out(kind, batch.output_bytes);
+    crate::metrics::stream_bytes_out(kind, batch.output_bytes);
 }
 
 pub(crate) fn process_frame_advances_backend_cursor(frame: &DataPlaneServerFrame) -> bool {

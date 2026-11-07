@@ -1,6 +1,6 @@
 //! Reports how many sandboxes sit in each transient lifecycle, and for how
 //! long, as the `sandbox.transient_lifecycle.*` gauges
-//! (`pplx_space_metrics::sandbox::transient_lifecycle`).
+//! (`crate::metrics::sandbox::transient_lifecycle`).
 //!
 //! Read-only, and independent of every loop that acts on such rows: it runs
 //! whether or not the transient-lifecycle sweeper or node-drain is enabled,
@@ -12,7 +12,7 @@
 
 use std::time::{Duration, Instant};
 
-use pplx_space_metrics::sandbox::transient_lifecycle::{self as metrics, LifecycleAge};
+use crate::metrics::sandbox::transient_lifecycle::{self as metrics, LifecycleAge};
 use pplx_space_sandbox_store::stuck::{
     StuckSandboxesError, TransientLifecycleAges, transient_lifecycle_ages,
 };

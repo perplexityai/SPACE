@@ -696,7 +696,7 @@ impl SandboxController {
         deadline: tokio::time::Instant,
         expected_policy: Option<&AutoLifecyclePolicy>,
     ) -> Result<AccessIdleTimeoutOutcome, ControllerError> {
-        use pplx_space_metrics::sandbox::api::TimeoutUpdateLockDecision as Decision;
+        use crate::metrics::sandbox::api::TimeoutUpdateLockDecision as Decision;
         tokio::time::timeout_at(deadline, async {
             let (decision, unlocked) = if self.feature_flags.bool_value(
                 pplx_space_feature_flags::SPACE_API_TIMEOUT_LOCK_BYPASS_FLAG,
@@ -727,7 +727,7 @@ impl SandboxController {
             } else {
                 (Decision::LockedFlagOff, None)
             };
-            pplx_space_metrics::sandbox::api::timeout_update_lock_decision(decision);
+            crate::metrics::sandbox::api::timeout_update_lock_decision(decision);
             let (execution, intent, presence) = if let Some(unlocked) = unlocked {
                 unlocked
             } else {

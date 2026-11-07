@@ -180,6 +180,17 @@ def test_an_unmapped_binary_reaching_the_constructor_fails_closed(
         guard._renderer_deployments()
 
 
+def test_a_tools_binary_reaching_the_constructor_is_no_renderer(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _stage_real_shape(tmp_path, monkeypatch)
+    _crate(
+        tmp_path, "crates/tools/metrics/workload", "pplx-tool",
+        depends_on=("pplx-space-api",), binary=True,
+    )
+    assert sorted(guard._renderer_deployments()) == ["space-api", "space-cluster-controller"]
+
+
 def test_a_test_module_call_site_does_not_widen_the_set(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

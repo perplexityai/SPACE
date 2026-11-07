@@ -57,7 +57,7 @@ pub fn defer_retry_wait(site: &str) -> bool {
         return false;
     };
     deferral.deferred.store(true, Ordering::Release);
-    pplx_space_metrics::operations::retry_wait_deferred(site);
+    crate::metrics::operations::retry_wait_deferred(site);
     true
 }
 

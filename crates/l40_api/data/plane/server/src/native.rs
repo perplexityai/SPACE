@@ -1,9 +1,9 @@
 use super::*;
-use crate::runtime_route::{is_refreshable_route_identity_rejection, refresh_dimension_label};
-use pplx_space_metrics::data_plane::{
+use crate::metrics::{
     RouteIdentityRefreshOutcome, RouteIdentityRefreshProtocol, ServiceRouteSurface,
     ServiceRouteTransport,
 };
+use crate::runtime_route::{is_refreshable_route_identity_rejection, refresh_dimension_label};
 
 mod auth;
 mod protocol;
@@ -96,7 +96,7 @@ async fn resolve_session_route_with_cache(
     let cache_key = native_route_cache_key(session_id, &token_sha256, &required_scope);
     let kind = session_id.kind().as_str();
     let cache_lookup = state.route_cache.lookup_native(&cache_key);
-    pplx_space_metrics::data_plane::route_cache_lookup("native", kind, cache_lookup.result_label());
+    crate::metrics::route_cache_lookup("native", kind, cache_lookup.result_label());
     if let RouteCacheLookup::Hit(attached) = cache_lookup
         && use_cache
         && !space_api_route_token_needs_refresh(&attached.space_api_route_token)
@@ -246,12 +246,12 @@ fn sweep_expired_native_routes(state: &DataPlaneState) {
         )
         .is_some()
     {
-        pplx_space_metrics::data_plane::route_cache_entries(
-            pplx_space_metrics::data_plane::RouteCacheKind::Native,
+        crate::metrics::route_cache_entries(
+            crate::metrics::RouteCacheKind::Native,
             state.route_cache.native_len(),
         );
-        pplx_space_metrics::data_plane::route_cache_entries(
-            pplx_space_metrics::data_plane::RouteCacheKind::NativeLatest,
+        crate::metrics::route_cache_entries(
+            crate::metrics::RouteCacheKind::NativeLatest,
             state.route_cache.native_latest_len(),
         );
     }
@@ -290,7 +290,7 @@ where
         match call(attached.clone()).await {
             Ok(value) => {
                 if let Some(dimension) = refresh_dimension {
-                    pplx_space_metrics::data_plane::route_identity_refresh(
+                    crate::metrics::route_identity_refresh(
                         RouteIdentityRefreshProtocol::Native,
                         dimension,
                         RouteIdentityRefreshOutcome::Succeeded,
@@ -309,7 +309,7 @@ where
                         refresh_dimension = Some(dimension);
                     }
                     Err(error) => {
-                        pplx_space_metrics::data_plane::route_identity_refresh(
+                        crate::metrics::route_identity_refresh(
                             RouteIdentityRefreshProtocol::Native,
                             dimension,
                             RouteIdentityRefreshOutcome::ResolveFailed,
@@ -320,7 +320,7 @@ where
             }
             Err(error) => {
                 if let Some(dimension) = refresh_dimension {
-                    pplx_space_metrics::data_plane::route_identity_refresh(
+                    crate::metrics::route_identity_refresh(
                         RouteIdentityRefreshProtocol::Native,
                         dimension,
                         RouteIdentityRefreshOutcome::RetryFailed,
@@ -343,7 +343,7 @@ async fn refresh_native_stream_route(
         Ok(refreshed) => Ok((refreshed, dimension)),
         Err(error) => {
             if let Some(dimension) = dimension {
-                pplx_space_metrics::data_plane::route_identity_refresh(
+                crate::metrics::route_identity_refresh(
                     RouteIdentityRefreshProtocol::Native,
                     dimension,
                     RouteIdentityRefreshOutcome::ResolveFailed,
@@ -361,7 +361,7 @@ fn finish_native_stream_refresh<T>(
     match result {
         Ok(value) => {
             if let Some(dimension) = dimension {
-                pplx_space_metrics::data_plane::route_identity_refresh(
+                crate::metrics::route_identity_refresh(
                     RouteIdentityRefreshProtocol::Native,
                     dimension,
                     RouteIdentityRefreshOutcome::Succeeded,
@@ -378,7 +378,7 @@ fn native_stream_refresh_failed(
     error: StreamBridgeError,
 ) -> StreamBridgeError {
     if let Some(dimension) = dimension {
-        pplx_space_metrics::data_plane::route_identity_refresh(
+        crate::metrics::route_identity_refresh(
             RouteIdentityRefreshProtocol::Native,
             dimension,
             RouteIdentityRefreshOutcome::RetryFailed,
@@ -569,7 +569,7 @@ pub(super) async fn proxy_session(
     if is_upgrade_request(request.headers()) && state.drain_started.is_cancelled() {
         return Ok(native_draining_response(session_id.kind().as_str()));
     }
-    let mut preparation = pplx_space_metrics::data_plane::IngressPreparationObservation::default();
+    let mut preparation = crate::metrics::IngressPreparationObservation::default();
     let mut waiter = pplx_space_ingress_admission::IngressPreparationPermit::acquire(None)
         .map_err(|_| ProxyError::Upstream("ingress preparation capacity exhausted"))?;
     let deadline =
@@ -602,7 +602,7 @@ pub(super) async fn proxy_session(
         match state.attached_streams.try_acquire_attached(&attached) {
             Ok(permit) => Some(permit),
             Err(limit) => {
-                pplx_space_metrics::data_plane::attach(kind, limit.metric_label());
+                crate::metrics::attach(kind, limit.metric_label());
                 return Ok(too_many_attached_streams_response(limit));
             }
         }
@@ -616,7 +616,7 @@ pub(super) async fn proxy_session(
         None
     };
 
-    pplx_space_metrics::data_plane::service_route_transport(
+    crate::metrics::service_route_transport(
         ServiceRouteSurface::Native,
         ServiceRouteTransport::ServicePortIngress,
     );
@@ -738,11 +738,9 @@ pub(super) async fn proxy_session(
             )
             .await
             {
-                Ok(close) => {
-                    pplx_space_metrics::data_plane::stream_closed(kind, close.result_label())
-                }
+                Ok(close) => crate::metrics::stream_closed(kind, close.result_label()),
                 Err(error) => {
-                    pplx_space_metrics::data_plane::stream_closed(kind, "proxy_error");
+                    crate::metrics::stream_closed(kind, "proxy_error");
                     tracing::debug!(%error, "public port session upgrade proxy ended with error");
                 }
             }
@@ -753,7 +751,7 @@ pub(super) async fn proxy_session(
 }
 
 pub(super) fn record_native_proxied_response(status: StatusCode) {
-    pplx_space_metrics::data_plane::response(
+    crate::metrics::response(
         ResponseSurface::Native,
         ResponseOrigin::SandboxTraffic,
         ResponseKind::ProxiedStatus,
@@ -840,7 +838,7 @@ pub(super) fn resync_required_frame(
     kind: &str,
     reason: DataPlaneResyncReason,
 ) -> DataPlaneServerFrame {
-    pplx_space_metrics::data_plane::replay_miss(kind, reason.as_str());
+    crate::metrics::replay_miss(kind, reason.as_str());
     DataPlaneServerFrame::ResyncRequired { reason }
 }
 
@@ -890,14 +888,14 @@ pub(super) async fn session_is_revoked(
     )
     .await
     .unwrap_or_else(|_| {
-        pplx_space_metrics::data_plane::revocation_check(kind, "timeout");
+        crate::metrics::revocation_check(kind, "timeout");
         Err(StreamBridgeError::RevocationStatus(
             revocation_check_timed_out(),
         ))
     });
     match checked {
         Err(error) if keeps_last_verdict(state, session_id, &error) => {
-            pplx_space_metrics::data_plane::revocation_check(kind, "kept_last_verdict");
+            crate::metrics::revocation_check(kind, "kept_last_verdict");
             tracing::warn!(%error, "revocation check failed; keeping the last confirmed verdict");
             Ok(false)
         }
@@ -981,73 +979,64 @@ async fn check_session_revocation(
         .probe(session_id, revocation_tolerance(state))
     {
         RevocationProbe::Fresh(active) => {
-            pplx_space_metrics::data_plane::revocation_cache_probe(kind, "fresh");
+            crate::metrics::revocation_cache_probe(kind, "fresh");
             Ok(!active)
         }
         RevocationProbe::RefreshInFlight(active) => {
-            pplx_space_metrics::data_plane::revocation_cache_probe(kind, "refresh_in_flight");
+            crate::metrics::revocation_cache_probe(kind, "refresh_in_flight");
             Ok(!active)
         }
         RevocationProbe::RefreshSession => {
-            pplx_space_metrics::data_plane::revocation_cache_probe(kind, "refresh");
+            crate::metrics::revocation_cache_probe(kind, "refresh");
             let read = start_revocation_read(state);
             let Some((org_id, revocation)) = fetch_session_revocation_state(state, session_id)
                 .await
                 .inspect_err(|error| {
-                    pplx_space_metrics::data_plane::revocation_check(
-                        kind,
-                        revocation_check_error_label(error),
-                    );
+                    crate::metrics::revocation_check(kind, revocation_check_error_label(error));
                 })?
             else {
-                pplx_space_metrics::data_plane::revocation_check(kind, "not_found");
+                crate::metrics::revocation_check(kind, "not_found");
                 return Ok(true);
             };
             let active = revocation_state_is_active(&revocation);
             let result = if active { "active" } else { "revoked" };
-            pplx_space_metrics::data_plane::revocation_check(kind, result);
+            crate::metrics::revocation_check(kind, result);
             state
                 .revocation_cache
                 .remember(session_id, org_id, &revocation, read);
             Ok(!active)
         }
         RevocationProbe::RefreshOrg(refresh) => {
-            pplx_space_metrics::data_plane::revocation_cache_probe(kind, "refresh");
+            crate::metrics::revocation_cache_probe(kind, "refresh");
             let read = start_revocation_read(state);
             let org_epoch = fetch_org_revocation_epoch(state, refresh.org_id)
                 .await
                 .inspect_err(|error| {
-                    pplx_space_metrics::data_plane::revocation_check(
-                        kind,
-                        revocation_check_error_label(error),
-                    );
+                    crate::metrics::revocation_check(kind, revocation_check_error_label(error));
                 })?;
             state
                 .revocation_cache
                 .remember_org_epoch(refresh.org_id, org_epoch, read);
             if org_epoch <= refresh.cached_org_epoch {
-                pplx_space_metrics::data_plane::revocation_check(kind, "org_epoch_unchanged");
+                crate::metrics::revocation_check(kind, "org_epoch_unchanged");
                 drop(refresh.guard);
                 return Ok(!refresh.active);
             }
-            pplx_space_metrics::data_plane::revocation_check(kind, "org_epoch_changed");
+            crate::metrics::revocation_check(kind, "org_epoch_changed");
             drop(refresh.guard);
             let read = start_revocation_read(state);
             let Some((org_id, revocation)) = fetch_session_revocation_state(state, session_id)
                 .await
                 .inspect_err(|error| {
-                    pplx_space_metrics::data_plane::revocation_check(
-                        kind,
-                        revocation_check_error_label(error),
-                    );
+                    crate::metrics::revocation_check(kind, revocation_check_error_label(error));
                 })?
             else {
-                pplx_space_metrics::data_plane::revocation_check(kind, "not_found");
+                crate::metrics::revocation_check(kind, "not_found");
                 return Ok(true);
             };
             let active = revocation_state_is_active(&revocation);
             let result = if active { "active" } else { "revoked" };
-            pplx_space_metrics::data_plane::revocation_check(kind, result);
+            crate::metrics::revocation_check(kind, result);
             state
                 .revocation_cache
                 .remember(session_id, org_id, &revocation, read);

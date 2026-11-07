@@ -62,7 +62,7 @@ pplx-space-feature-flags = { workspace = true }
 pplx-space-guest-process = { workspace = true }
 pplx-space-http-server = { workspace = true }
 pplx-space-ingress-admission = { workspace = true }
-pplx-space-metrics = { workspace = true }
+pplx-space-metrics-emit = { workspace = true }
 pplx-space-native-files = { workspace = true }
 pplx-space-net-gateway-client = { workspace = true }
 pplx-space-node-api-client = { workspace = true }

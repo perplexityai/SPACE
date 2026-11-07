@@ -290,7 +290,7 @@ fn node_services_signal_usable(eligible: &[std::sync::Arc<Node>]) -> bool {
             .iter()
             .filter(|node| adapter::node_services_not_ready(node))
             .count();
-        pplx_space_metrics::node_service_readiness::placement_signal_suppressed();
+        crate::metrics::node_service_readiness::placement_signal_suppressed();
         tracing::warn!(
             not_ready,
             eligible = eligible.len(),
@@ -1111,7 +1111,7 @@ impl KubernetesSubstrate {
         // nothing to tell them apart — and the second is normal while the first
         // is a provisioning gap.
         if node_group_placement.is_some() && in_set.is_empty() && !eligible.is_empty() {
-            pplx_space_metrics::node_group_placement::restore_shortlist_emptied();
+            crate::metrics::node_group_placement::restore_shortlist_emptied();
             tracing::warn!(
                 sandbox_id = %sandbox_id,
                 eligible = eligible.len(),

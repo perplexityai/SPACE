@@ -143,7 +143,7 @@ async fn wake_restores_an_idle_suspended_sandbox_on_its_artifact_node(
     assert_eq!(sandbox.active_node_id, Some(node_id));
 
     Box::pin(fixture.substrate.wake_execution(
-        pplx_space_metrics::sandbox::api::SandboxApiMetricIdentity::native("wake"),
+        crate::metrics::sandbox::api::SandboxApiMetricIdentity::native("wake"),
         &sandbox,
         Duration::from_secs(5),
         wake_activity,
@@ -230,7 +230,7 @@ async fn implicit_wake_of_an_idle_suspended_sandbox_honors_the_local_override() 
             .expect("sandbox row");
 
         let result = Box::pin(fixture.substrate.wake_execution(
-            pplx_space_metrics::sandbox::api::SandboxApiMetricIdentity::native("wake"),
+            crate::metrics::sandbox::api::SandboxApiMetricIdentity::native("wake"),
             &sandbox,
             Duration::from_secs(5),
             Some(ExecutionActivityKind::Command),
@@ -345,7 +345,7 @@ async fn implicit_access_wake_of_a_target_only_row_honors_the_local_override() -
         assert_eq!(sandbox.active_node_id, None, "{label}");
 
         let result = Box::pin(fixture.substrate.access_runtime_client(
-            pplx_space_metrics::sandbox::api::SandboxApiMetricIdentity::native("ingress"),
+            crate::metrics::sandbox::api::SandboxApiMetricIdentity::native("ingress"),
             &sandbox,
             ExecutionActivityKind::Access,
             Duration::from_secs(5),
@@ -686,7 +686,7 @@ async fn wake_adopts_a_live_record_on_its_artifact_node(#[case] case: Case) -> T
     }
 
     let result = Box::pin(fixture.substrate.wake_execution(
-        pplx_space_metrics::sandbox::api::SandboxApiMetricIdentity::native("wake"),
+        crate::metrics::sandbox::api::SandboxApiMetricIdentity::native("wake"),
         &sandbox,
         Duration::from_secs(5),
         None,
@@ -883,7 +883,7 @@ async fn wake_adopts_a_started_record_only_at_its_route_identity() -> TestResult
             async move {
                 match entry {
                     Entry::Wake => Box::pin(substrate.wake_execution(
-                        pplx_space_metrics::sandbox::api::SandboxApiMetricIdentity::native("wake"),
+                        crate::metrics::sandbox::api::SandboxApiMetricIdentity::native("wake"),
                         &sandbox,
                         Duration::from_secs(5),
                         None,
@@ -893,9 +893,7 @@ async fn wake_adopts_a_started_record_only_at_its_route_identity() -> TestResult
                     .map(drop)
                     .map_err(|error| format!("{error:?}")),
                     Entry::Access => Box::pin(substrate.access_runtime_client(
-                        pplx_space_metrics::sandbox::api::SandboxApiMetricIdentity::native(
-                            "ingress",
-                        ),
+                        crate::metrics::sandbox::api::SandboxApiMetricIdentity::native("ingress"),
                         &sandbox,
                         ExecutionActivityKind::Access,
                         Duration::from_secs(5),
@@ -1087,7 +1085,7 @@ async fn wake_of_a_placed_suspended_sandbox_still_asks_its_worker() -> TestResul
         .expect("sandbox row");
 
     Box::pin(fixture.substrate.wake_execution(
-        pplx_space_metrics::sandbox::api::SandboxApiMetricIdentity::native("wake"),
+        crate::metrics::sandbox::api::SandboxApiMetricIdentity::native("wake"),
         &sandbox,
         Duration::from_secs(5),
         None,

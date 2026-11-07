@@ -381,8 +381,8 @@ where
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "read length exceeds u64"))?;
         total = total.saturating_add(bytes);
         match direction {
-            ProxyDirection::In => pplx_space_metrics::data_plane::stream_bytes_in(kind, bytes),
-            ProxyDirection::Out => pplx_space_metrics::data_plane::stream_bytes_out(kind, bytes),
+            ProxyDirection::In => crate::metrics::stream_bytes_in(kind, bytes),
+            ProxyDirection::Out => crate::metrics::stream_bytes_out(kind, bytes),
         }
     }
 }

@@ -59,12 +59,12 @@ use pplx_space_common_core::types::SandboxId;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use crate::metrics::node_group_placement as metrics;
 use k8s_openapi::api::core::v1::Node;
 use pplx_space_common_core::kubernetes::{
     NodeGroupPlacement, NodeGroupPlacementError, SANDBOX_NODE_GROUP_PLACEMENT_ENV, node_group_label,
 };
 use pplx_space_common_core::types::{NodeGroup, OrgId, TemplateVisibility};
-use pplx_space_metrics::node_group_placement as metrics;
 use sqlx::PgPool;
 
 mod store;
@@ -76,8 +76,8 @@ mod store;
 pub use store::NodeGroupCatalogError;
 use store::{NodeGroupCatalog, catalog_for_template};
 
-use pplx_space_metrics::node_group_placement::LocalRestorePreflight;
-pub use pplx_space_metrics::node_group_placement::ResolvePath;
+use crate::metrics::node_group_placement::LocalRestorePreflight;
+pub use crate::metrics::node_group_placement::ResolvePath;
 
 /// Who the candidate set is being resolved for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
