@@ -373,9 +373,9 @@ async fn resident_resume_is_admitted_before_the_vm_resumes(
         let refused = result.expect_err("a sealed node refuses the resume");
         assert_eq!(refused.code(), Code::FailedPrecondition, "{refused:?}");
         assert!(
-            refused.message().contains(
-                pplx_space_common_core::activation_seal_signals::ACTIVATIONS_SEALED_MARKER
-            ),
+            refused
+                .message()
+                .contains(crate::activation_seal::ACTIVATIONS_SEALED_MARKER),
             "{refused:?}"
         );
         assert_eq!(*admitted_at_resume.lock().unwrap(), None);

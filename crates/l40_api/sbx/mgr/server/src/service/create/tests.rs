@@ -667,9 +667,9 @@ async fn suspend_restore_is_admitted_before_the_vm_launches(#[values(false, true
     if sealed {
         assert_eq!(error.code(), tonic::Code::FailedPrecondition, "{error:?}");
         assert!(
-            error.message().contains(
-                pplx_space_common_core::activation_seal_signals::ACTIVATIONS_SEALED_MARKER
-            ),
+            error
+                .message()
+                .contains(crate::activation_seal::ACTIVATIONS_SEALED_MARKER),
             "{error:?}"
         );
         assert_eq!(

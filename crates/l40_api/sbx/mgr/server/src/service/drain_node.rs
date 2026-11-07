@@ -68,9 +68,6 @@ impl DrainAction {
 #[derive(Default)]
 pub(super) struct DrainActions {
     running: Mutex<BTreeMap<String, DrainAction>>,
-    /// Artifacts this process already asked to upload; the backup worker
-    /// retries them on its own.
-    enqueued_uploads: Mutex<BTreeSet<String>>,
 }
 
 impl DrainActions {
@@ -100,13 +97,6 @@ impl DrainActions {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(sandbox_id);
-    }
-
-    fn first_upload(&self, artifact_id: &str) -> bool {
-        self.enqueued_uploads
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(artifact_id.to_owned())
     }
 }
 
@@ -173,9 +163,7 @@ pub(super) fn plan(
     running: &BTreeMap<String, DrainAction>,
 ) -> DrainPlan {
     let mut plan = DrainPlan::default();
-    let mut seen = BTreeSet::new();
     for row in rows {
-        seen.insert(row.sandbox_id.clone());
         let id = &row.sandbox_id;
         let evacuation = evacuations.get(id);
         let pin_pending = row.pin.as_ref().is_some_and(|(artifact, _)| {
@@ -290,14 +278,6 @@ pub(super) fn plan(
                 );
                 plan.pending.push((id.clone(), action));
             }
-        }
-    }
-    // A pending backup whose sandbox has no row is still a local-only
-    // artifact.
-    for (sandbox_id, artifacts) in pending_backups {
-        if !seen.contains(sandbox_id) && !artifacts.is_empty() {
-            plan.pending
-                .push((sandbox_id.clone(), DrainAction::Upload.as_str().into()));
         }
     }
     plan
@@ -564,8 +544,9 @@ impl SandboxManagerService {
     /// Why the Suspend RPC would refuse to suspend `row`, as the drain
     /// reports it.
     fn drain_suspend_refusal(&self, row: &crate::db::SandboxRow) -> Option<String> {
+        // Pool members never reach here: the planner leaves them to the
+        // warm-pool reconciler.
         self.ensure_memory_state_supported(row, "suspend")
-            .and_then(|()| self.ensure_not_pool_sandbox_for_snapshots(row, "suspend"))
             .and_then(|()| self.ensure_no_plaintext_pool_cow_for_snapshots(row, "suspend"))
             .and_then(|()| self.ensure_snapshot_restore_supported("suspend"))
             .err()
@@ -580,14 +561,9 @@ impl SandboxManagerService {
                 PlannedAction::PublishDisk { sandbox_id } => {
                     (sandbox_id.clone(), DrainAction::PublishDisk)
                 }
-                PlannedAction::Upload {
-                    sandbox_id,
-                    artifact_id,
-                    ..
-                } => {
-                    if !self.drain_actions.first_upload(artifact_id) {
-                        continue;
-                    }
+                // The backup's own job dedup joins an upload already under
+                // way.
+                PlannedAction::Upload { sandbox_id, .. } => {
                     (sandbox_id.clone(), DrainAction::Upload)
                 }
             };

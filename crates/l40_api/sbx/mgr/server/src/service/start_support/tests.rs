@@ -415,7 +415,7 @@ fn assert_sealed_refusal(status: &Status, epoch: u64) {
     assert!(
         status
             .message()
-            .contains(pplx_space_common_core::activation_seal_signals::ACTIVATIONS_SEALED_MARKER)
+            .contains(crate::activation_seal::ACTIVATIONS_SEALED_MARKER)
             && status.message().contains(&format!("epoch {epoch}")),
         "{status:?}"
     );

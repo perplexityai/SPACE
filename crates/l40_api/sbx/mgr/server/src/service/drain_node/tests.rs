@@ -233,23 +233,14 @@ fn a_suspended_evacuation_reports_its_prior_once_durable() {
 }
 
 /// An unclaimed warm-pool member is not a resident: nothing is started for
-/// it, but its VM keeps the drain from being done. A pending backup whose
-/// sandbox has no row is still local-only.
+/// it, but its VM keeps the drain from being done.
 #[test]
-fn a_pool_member_and_a_rowless_backup() {
+fn a_pool_member_is_left_to_the_pool() {
     let mut member = row("a", SandboxState::Started);
     member.pool_member = true;
     let plan_member = plan_one(member, &BTreeMap::new(), &[], &[]);
     assert!(plan_member.actions.is_empty() && plan_member.pending.is_empty());
     assert!(plan_member.vm);
-
-    let rowless = plan(
-        &[],
-        &pending("gone", FULL_ARTIFACT),
-        &BTreeMap::new(),
-        &BTreeMap::new(),
-    );
-    assert_eq!(rowless.pending, [("gone".into(), "upload".into())]);
 }
 
 /// The inventory's process, cache and run directory findings, and those

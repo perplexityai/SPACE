@@ -1843,7 +1843,7 @@ async fn cold_boot_is_admitted_as_a_cold_activation() {
     assert!(
         sealed
             .message()
-            .contains(pplx_space_common_core::activation_seal_signals::ACTIVATIONS_SEALED_MARKER),
+            .contains(crate::activation_seal::ACTIVATIONS_SEALED_MARKER),
         "{sealed:?}"
     );
     assert_eq!(
