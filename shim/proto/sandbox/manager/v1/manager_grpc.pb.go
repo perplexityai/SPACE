@@ -60,6 +60,9 @@ const (
 	SandboxManager_ListAutoLifecycleDeleteReceipts_FullMethodName        = "/space.sandbox.manager.v1.SandboxManager/ListAutoLifecycleDeleteReceipts"
 	SandboxManager_AcknowledgeAutoLifecycleDeleteReceipts_FullMethodName = "/space.sandbox.manager.v1.SandboxManager/AcknowledgeAutoLifecycleDeleteReceipts"
 	SandboxManager_ListPendingLocalBackups_FullMethodName                = "/space.sandbox.manager.v1.SandboxManager/ListPendingLocalBackups"
+	SandboxManager_SealActivations_FullMethodName                        = "/space.sandbox.manager.v1.SandboxManager/SealActivations"
+	SandboxManager_UnsealActivations_FullMethodName                      = "/space.sandbox.manager.v1.SandboxManager/UnsealActivations"
+	SandboxManager_ActivationSealState_FullMethodName                    = "/space.sandbox.manager.v1.SandboxManager/ActivationSealState"
 	SandboxManager_GetNetworkPolicy_FullMethodName                       = "/space.sandbox.manager.v1.SandboxManager/GetNetworkPolicy"
 	SandboxManager_SetNetworkPolicy_FullMethodName                       = "/space.sandbox.manager.v1.SandboxManager/SetNetworkPolicy"
 	SandboxManager_TemplateNetworkPolicyUpdated_FullMethodName           = "/space.sandbox.manager.v1.SandboxManager/TemplateNetworkPolicyUpdated"
@@ -251,6 +254,19 @@ type SandboxManagerClient interface {
 	// the call rather than silently shrinking the set, because a caller
 	// cannot distinguish a short answer from a complete one.
 	ListPendingLocalBackups(ctx context.Context, in *ListPendingLocalBackupsRequest, opts ...grpc.CallOption) (*ListPendingLocalBackupsResponse, error)
+	// Seal under `epoch`, then wait up to `wait_timeout` for the activation work
+	// already in flight to finish. Sealing again under the current epoch changes
+	// nothing and only waits; sealing under another epoch while sealed replaces
+	// the epoch and starts a new seal. A restart of sandbox-manager ends the wait
+	// early; the seal stays in place, and the caller reads the state again from
+	// the new process.
+	SealActivations(ctx context.Context, in *SealActivationsRequest, opts ...grpc.CallOption) (*SealActivationsResponse, error)
+	// Clear the seal if it is under `epoch`. A different epoch is refused with
+	// `FailedPrecondition` and leaves the seal in place; an unsealed node
+	// answers its state unchanged.
+	UnsealActivations(ctx context.Context, in *UnsealActivationsRequest, opts ...grpc.CallOption) (*UnsealActivationsResponse, error)
+	// Read the seal and the activation work in flight without changing them.
+	ActivationSealState(ctx context.Context, in *ActivationSealStateRequest, opts ...grpc.CallOption) (*ActivationSealStateResponse, error)
 	// Get the resolved effective network policy for a sandbox.
 	GetNetworkPolicy(ctx context.Context, in *GetNetworkPolicyRequest, opts ...grpc.CallOption) (*GetNetworkPolicyResponse, error)
 	// Apply a sandbox's desired network policy on the node.
@@ -721,6 +737,36 @@ func (c *sandboxManagerClient) ListPendingLocalBackups(ctx context.Context, in *
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(ListPendingLocalBackupsResponse)
 	err := c.cc.Invoke(ctx, SandboxManager_ListPendingLocalBackups_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *sandboxManagerClient) SealActivations(ctx context.Context, in *SealActivationsRequest, opts ...grpc.CallOption) (*SealActivationsResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(SealActivationsResponse)
+	err := c.cc.Invoke(ctx, SandboxManager_SealActivations_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *sandboxManagerClient) UnsealActivations(ctx context.Context, in *UnsealActivationsRequest, opts ...grpc.CallOption) (*UnsealActivationsResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(UnsealActivationsResponse)
+	err := c.cc.Invoke(ctx, SandboxManager_UnsealActivations_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *sandboxManagerClient) ActivationSealState(ctx context.Context, in *ActivationSealStateRequest, opts ...grpc.CallOption) (*ActivationSealStateResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ActivationSealStateResponse)
+	err := c.cc.Invoke(ctx, SandboxManager_ActivationSealState_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -1369,6 +1415,19 @@ type SandboxManagerServer interface {
 	// the call rather than silently shrinking the set, because a caller
 	// cannot distinguish a short answer from a complete one.
 	ListPendingLocalBackups(context.Context, *ListPendingLocalBackupsRequest) (*ListPendingLocalBackupsResponse, error)
+	// Seal under `epoch`, then wait up to `wait_timeout` for the activation work
+	// already in flight to finish. Sealing again under the current epoch changes
+	// nothing and only waits; sealing under another epoch while sealed replaces
+	// the epoch and starts a new seal. A restart of sandbox-manager ends the wait
+	// early; the seal stays in place, and the caller reads the state again from
+	// the new process.
+	SealActivations(context.Context, *SealActivationsRequest) (*SealActivationsResponse, error)
+	// Clear the seal if it is under `epoch`. A different epoch is refused with
+	// `FailedPrecondition` and leaves the seal in place; an unsealed node
+	// answers its state unchanged.
+	UnsealActivations(context.Context, *UnsealActivationsRequest) (*UnsealActivationsResponse, error)
+	// Read the seal and the activation work in flight without changing them.
+	ActivationSealState(context.Context, *ActivationSealStateRequest) (*ActivationSealStateResponse, error)
 	// Get the resolved effective network policy for a sandbox.
 	GetNetworkPolicy(context.Context, *GetNetworkPolicyRequest) (*GetNetworkPolicyResponse, error)
 	// Apply a sandbox's desired network policy on the node.
@@ -1562,6 +1621,15 @@ func (UnimplementedSandboxManagerServer) AcknowledgeAutoLifecycleDeleteReceipts(
 }
 func (UnimplementedSandboxManagerServer) ListPendingLocalBackups(context.Context, *ListPendingLocalBackupsRequest) (*ListPendingLocalBackupsResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ListPendingLocalBackups not implemented")
+}
+func (UnimplementedSandboxManagerServer) SealActivations(context.Context, *SealActivationsRequest) (*SealActivationsResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method SealActivations not implemented")
+}
+func (UnimplementedSandboxManagerServer) UnsealActivations(context.Context, *UnsealActivationsRequest) (*UnsealActivationsResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method UnsealActivations not implemented")
+}
+func (UnimplementedSandboxManagerServer) ActivationSealState(context.Context, *ActivationSealStateRequest) (*ActivationSealStateResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ActivationSealState not implemented")
 }
 func (UnimplementedSandboxManagerServer) GetNetworkPolicy(context.Context, *GetNetworkPolicyRequest) (*GetNetworkPolicyResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetNetworkPolicy not implemented")
@@ -2405,6 +2473,60 @@ func _SandboxManager_ListPendingLocalBackups_Handler(srv interface{}, ctx contex
 	return interceptor(ctx, in, info, handler)
 }
 
+func _SandboxManager_SealActivations_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SealActivationsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SandboxManagerServer).SealActivations(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SandboxManager_SealActivations_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SandboxManagerServer).SealActivations(ctx, req.(*SealActivationsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _SandboxManager_UnsealActivations_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(UnsealActivationsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SandboxManagerServer).UnsealActivations(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SandboxManager_UnsealActivations_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SandboxManagerServer).UnsealActivations(ctx, req.(*UnsealActivationsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _SandboxManager_ActivationSealState_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ActivationSealStateRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SandboxManagerServer).ActivationSealState(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SandboxManager_ActivationSealState_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SandboxManagerServer).ActivationSealState(ctx, req.(*ActivationSealStateRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _SandboxManager_GetNetworkPolicy_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(GetNetworkPolicyRequest)
 	if err := dec(in); err != nil {
@@ -3226,6 +3348,18 @@ var SandboxManager_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ListPendingLocalBackups",
 			Handler:    _SandboxManager_ListPendingLocalBackups_Handler,
+		},
+		{
+			MethodName: "SealActivations",
+			Handler:    _SandboxManager_SealActivations_Handler,
+		},
+		{
+			MethodName: "UnsealActivations",
+			Handler:    _SandboxManager_UnsealActivations_Handler,
+		},
+		{
+			MethodName: "ActivationSealState",
+			Handler:    _SandboxManager_ActivationSealState_Handler,
 		},
 		{
 			MethodName: "GetNetworkPolicy",

@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use super::*;
+use crate::activation_seal::{ActivationInFlightToken, InFlightActivationKind};
 use pplx_space_common_core::env::valid_positive_f64;
 use pplx_space_sandbox_metrics::admission::{
     AdmissionDecision, AdmissionOperationClass, AdmissionPermitOutcome, AdmissionQueueOutcome,
@@ -33,6 +34,10 @@ pub(super) struct ActivationCleanupGuard {
     runtime_label: SandboxRuntimeLabel,
     cleanup: Option<ActivationCleanup>,
     permit: Option<ActivationAdmissionPermit>,
+    /// Held until the guard is consumed or dropped, which is when the
+    /// activation's last step, its detached finalizer included, has finished
+    /// or handed its failure to cleanup.
+    in_flight: Option<ActivationInFlightToken>,
     interrupted_reason_code: SandboxQuarantineReasonCode,
     interrupted_reason: &'static str,
     failure_reason: Option<String>,
@@ -55,6 +60,7 @@ impl ActivationCleanupGuard {
             runtime_label,
             cleanup: Some(Box::new(cleanup)),
             permit: None,
+            in_flight: None,
             interrupted_reason_code,
             interrupted_reason,
             failure_reason: None,
@@ -65,8 +71,15 @@ impl ActivationCleanupGuard {
         self.runtime_label = runtime_label;
     }
 
+    #[cfg(test)]
     pub(super) fn admit(&mut self, permit: ActivationAdmissionPermit) {
         self.permit = Some(permit);
+    }
+
+    pub(super) fn admit_activation(&mut self, admission: VmActivationAdmission) {
+        let (permit, in_flight) = admission.into_parts();
+        self.permit = Some(permit);
+        self.in_flight = Some(in_flight);
     }
 
     pub(super) fn cleanup(mut self) {
@@ -269,6 +282,17 @@ pub(super) enum ActivationAdmissionKind {
 }
 
 impl ActivationAdmissionKind {
+    #[cfg(test)]
+    pub(super) const ALL: [Self; 3] = [Self::Cold, Self::Restore, Self::ResidentResume];
+
+    pub(super) const fn in_flight_kind(self) -> InFlightActivationKind {
+        match self {
+            Self::Cold => InFlightActivationKind::Cold,
+            Self::Restore => InFlightActivationKind::Restore,
+            Self::ResidentResume => InFlightActivationKind::ResidentResume,
+        }
+    }
+
     /// The limiter class that meters this kind, if one does.
     const fn limited(self) -> Option<LimitedActivationKind> {
         match self {
@@ -325,26 +349,81 @@ impl SandboxManagerService {
     /// the VM. Two resumes do not pass here: a checkpoint's resume of the VM it
     /// paused, and a stop's resume of a paused VM so its guest can flush.
     ///
+    /// Each holds a [`crate::activation_seal::ActivationSeal::continuation`]
+    /// token instead.
+    ///
     /// Cold boots and restores wait for [`ActivationAdmissionLimiter`]
     /// capacity and are refused when it stays exhausted. A resident resume
     /// takes an [`ActivationAdmissionPermit::Unlimited`] permit at once.
+    ///
+    /// While the node's activations are sealed, every kind is refused with the
+    /// seal's marker. The seal decides here rather than when a request takes
+    /// its state-writer lease, so a request that got past its lease or the wake
+    /// lock before the seal landed is still refused, and so is nested work
+    /// running under a caller's lease. A restore takes the activation lock
+    /// before it gets here, so one waiting on that lock is refused too. A cold
+    /// boot is admitted before it takes the activation lock, so one waiting
+    /// there was already admitted and counts as in flight. The seal decides
+    /// again after any limiter wait, so an activation queued for capacity when
+    /// the seal lands is refused too.
     pub(super) async fn admit_vm_activation(
         &self,
         kind: ActivationAdmissionKind,
         sandbox_id: &str,
-    ) -> Result<ActivationAdmissionPermit, Status> {
+    ) -> Result<VmActivationAdmission, Status> {
         #[cfg(test)]
         if let Ok(admitted) = REQUESTED_VM_ACTIVATIONS.try_with(Arc::clone) {
             admitted.lock().unwrap().push(kind);
         }
-        match kind.limited() {
+        // Refuse before any limiter wait, which a sealed node has no use for.
+        self.activation_seal
+            .check(kind.in_flight_kind(), sandbox_id)?;
+        let permit = match kind.limited() {
             Some(limited) => {
                 self.activation_admission_limiter
                     .acquire(limited, sandbox_id)
-                    .await
+                    .await?
             }
-            None => Ok(ActivationAdmissionPermit::Unlimited),
+            None => ActivationAdmissionPermit::Unlimited,
+        };
+        match self
+            .activation_seal
+            .admit(kind.in_flight_kind(), sandbox_id)
+        {
+            Ok(in_flight) => Ok(VmActivationAdmission { permit, in_flight }),
+            Err(refusal) => {
+                permit.finish(AdmissionPermitOutcome::Cancelled);
+                Err(refusal)
+            }
         }
+    }
+}
+
+/// What [`SandboxManagerService::admit_vm_activation`] admits an activation
+/// with: the limiter's permit, held across the node-manager request that
+/// launches or resumes the VM, and the in-flight token, held until the
+/// activation's last step finishes or fails.
+#[derive(Debug)]
+#[must_use = "dropping the admission ends the activation's permit and in-flight count"]
+pub(super) struct VmActivationAdmission {
+    permit: ActivationAdmissionPermit,
+    in_flight: ActivationInFlightToken,
+}
+
+impl VmActivationAdmission {
+    #[cfg(test)]
+    pub(super) fn permit(&self) -> &ActivationAdmissionPermit {
+        &self.permit
+    }
+
+    /// End an activation that stops before it launches anything: the permit
+    /// with `outcome`, and the in-flight token with it.
+    pub(super) fn finish(self, outcome: AdmissionPermitOutcome) {
+        self.permit.finish(outcome);
+    }
+
+    pub(super) fn into_parts(self) -> (ActivationAdmissionPermit, ActivationInFlightToken) {
+        (self.permit, self.in_flight)
     }
 }
 

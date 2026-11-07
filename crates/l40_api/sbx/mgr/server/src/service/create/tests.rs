@@ -498,9 +498,11 @@ fn restore_guest_memory_uses_capture_shape_or_legacy_payload_and_rejects_conflic
 /// A restore of a suspended sandbox from its local snapshot passes the VM
 /// launch-time admission as a restore activation before it asks node-manager
 /// to launch Firecracker. Node-manager refuses the launch, so the restore
-/// stops there.
+/// stops there. While the node is sealed the admission refuses the restore
+/// instead, and node-manager is never asked to launch.
+#[rstest::rstest]
 #[tokio::test]
-async fn suspend_restore_is_admitted_before_the_vm_launches() {
+async fn suspend_restore_is_admitted_before_the_vm_launches(#[values(false, true)] sealed: bool) {
     use crate::node_manager_transport::fake::FakeNodeManager;
     use crate::service::start_support::{ActivationAdmissionKind, REQUESTED_VM_ACTIVATIONS};
     use pplx_space_common_core::types::{
@@ -578,6 +580,10 @@ async fn suspend_restore_is_admitted_before_the_vm_launches() {
 
     let admitted = Arc::new(std::sync::Mutex::new(Vec::new()));
     let admitted_at_launch = Arc::new(std::sync::Mutex::new(None));
+    let in_flight_at_launch = Arc::new(std::sync::Mutex::new(None));
+    let seal_slot = Arc::new(std::sync::Mutex::new(
+        None::<Arc<crate::activation_seal::ActivationSeal>>,
+    ));
     let selected = producer.clone();
     let node = FakeNodeManager::default()
         .unary("GetNetworkPoolStatus", |_: NetworkPoolStatusRequest| {
@@ -613,8 +619,18 @@ async fn suspend_restore_is_admitted_before_the_vm_launches() {
         .unary("LaunchSandbox", {
             let admitted = Arc::clone(&admitted);
             let admitted_at_launch = Arc::clone(&admitted_at_launch);
+            let in_flight_at_launch = Arc::clone(&in_flight_at_launch);
+            let seal_slot = Arc::clone(&seal_slot);
             move |_: LaunchSandboxRequest| -> Result<LaunchSandboxResponse, Status> {
                 *admitted_at_launch.lock().unwrap() = Some(admitted.lock().unwrap().clone());
+                let seal = seal_slot.lock().unwrap().clone().unwrap();
+                *in_flight_at_launch.lock().unwrap() = Some(
+                    seal.status()
+                        .in_flight
+                        .into_iter()
+                        .map(|in_flight| (in_flight.kind, in_flight.sandbox_id))
+                        .collect::<Vec<_>>(),
+                );
                 Err(Status::unavailable(
                     "firecracker launch refused by the test",
                 ))
@@ -630,6 +646,10 @@ async fn suspend_restore_is_admitted_before_the_vm_launches() {
         },
     );
 
+    *seal_slot.lock().unwrap() = Some(Arc::clone(&service.activation_seal));
+    if sealed {
+        service.activation_seal.seal(&service.db, 2).unwrap();
+    }
     let result = tokio::time::timeout(
         Duration::from_secs(30),
         REQUESTED_VM_ACTIVATIONS.scope(
@@ -650,15 +670,39 @@ async fn suspend_restore_is_admitted_before_the_vm_launches() {
     .expect("the restore finishes within 30 seconds");
 
     let error = result.expect_err("node-manager refuses the launch");
-    assert_eq!(
-        *admitted_at_launch.lock().unwrap(),
-        Some(vec![ActivationAdmissionKind::Restore]),
-        "node-manager was asked to launch the VM only after it requested admission: {error}"
-    );
+    if sealed {
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition, "{error:?}");
+        assert!(
+            error.message().contains(
+                pplx_space_common_core::activation_seal_signals::ACTIVATIONS_SEALED_MARKER
+            ),
+            "{error:?}"
+        );
+        assert_eq!(
+            *admitted_at_launch.lock().unwrap(),
+            None,
+            "a sealed node never asks node-manager to launch the VM"
+        );
+    } else {
+        assert_eq!(
+            *admitted_at_launch.lock().unwrap(),
+            Some(vec![ActivationAdmissionKind::Restore]),
+            "node-manager was asked to launch the VM only after it requested admission: {error}"
+        );
+        assert_eq!(
+            *in_flight_at_launch.lock().unwrap(),
+            Some(vec![(
+                crate::activation_seal::InFlightActivationKind::Restore,
+                id.clone()
+            )]),
+            "the restore is in flight while it launches the VM"
+        );
+    }
     assert_eq!(
         *admitted.lock().unwrap(),
         vec![ActivationAdmissionKind::Restore]
     );
+    service.activation_seal.assert_quiesced();
     service.shutdown_token.cancel();
     service.task_tracker.close();
     tokio::time::timeout(Duration::from_secs(30), service.task_tracker.wait())

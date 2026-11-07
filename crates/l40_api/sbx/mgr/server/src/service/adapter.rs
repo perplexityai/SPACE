@@ -83,6 +83,27 @@ impl SandboxManager for SandboxManagerService {
         SandboxManagerService::list_pending_local_backups(self, request).await
     }
 
+    async fn seal_activations(
+        &self,
+        request: Request<crate::proto::SealActivationsRequest>,
+    ) -> Result<Response<crate::proto::SealActivationsResponse>, Status> {
+        SandboxManagerService::seal_activations(self, request).await
+    }
+
+    async fn unseal_activations(
+        &self,
+        request: Request<crate::proto::UnsealActivationsRequest>,
+    ) -> Result<Response<crate::proto::UnsealActivationsResponse>, Status> {
+        SandboxManagerService::unseal_activations(self, request).await
+    }
+
+    async fn activation_seal_state(
+        &self,
+        request: Request<crate::proto::ActivationSealStateRequest>,
+    ) -> Result<Response<crate::proto::ActivationSealStateResponse>, Status> {
+        SandboxManagerService::activation_seal_state(self, request).await
+    }
+
     async fn list(&self, request: Request<ListRequest>) -> Result<Response<ListResponse>, Status> {
         SandboxManagerService::list(self, request).await
     }

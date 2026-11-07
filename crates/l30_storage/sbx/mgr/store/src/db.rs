@@ -38,6 +38,7 @@ pub use handle::OptionalExtension;
 use handle::db_private_outside_tests;
 pub use handle::{Connection, ConnectionGuard, Error, Result, SharedConnection, Transaction};
 
+pub mod activation_seal;
 pub mod auto_lifecycle_delete_receipts;
 pub mod cleanup_jobs;
 pub mod cleanup_target_scan;
@@ -126,6 +127,7 @@ pub use pplx_space_common_core::types::QuarantineRecoveryNoProgressReason;
 /// the node-wide counts. Each keeps the decoder, missing-row rule and
 /// tolerance of the reader it consolidates.
 pub mod read {
+    mod activation_seal;
     mod cleanup_job;
     mod counts;
     mod local_artifact;
@@ -133,6 +135,7 @@ pub mod read {
     mod sandbox;
     mod sandbox_view;
     mod state_page;
+    pub use activation_seal::*;
     pub use cleanup_job::*;
     pub use counts::*;
     pub use local_artifact::*;

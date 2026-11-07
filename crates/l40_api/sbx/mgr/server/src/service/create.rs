@@ -1155,8 +1155,8 @@ impl SandboxManagerService {
             .admit_vm_activation(ActivationAdmissionKind::Restore, id)
             .await
         {
-            Ok(permit) => {
-                activation_cleanup.admit(permit);
+            Ok(admission) => {
+                activation_cleanup.admit_activation(admission);
             }
             Err(status) => {
                 activation_cleanup.cleanup();

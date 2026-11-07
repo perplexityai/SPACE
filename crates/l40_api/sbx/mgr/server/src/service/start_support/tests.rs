@@ -343,7 +343,10 @@ async fn admit_vm_activation_meters_cold_and_restore_but_not_a_resident_resume()
         .admit_vm_activation(ActivationAdmissionKind::Cold, "sandbox-cold")
         .await
         .expect("a free slot admits a cold boot");
-    assert!(matches!(cold, ActivationAdmissionPermit::Limited(_)));
+    assert!(matches!(
+        cold.permit(),
+        ActivationAdmissionPermit::Limited(_)
+    ));
     assert_eq!(limiter.in_flight_for(LimitedActivationKind::Cold), 1);
     assert_eq!(limiter.in_flight_for(LimitedActivationKind::Restore), 0);
 
@@ -351,7 +354,10 @@ async fn admit_vm_activation_meters_cold_and_restore_but_not_a_resident_resume()
         .admit_vm_activation(ActivationAdmissionKind::Restore, "sandbox-restore")
         .await
         .expect("a free slot admits a restore");
-    assert!(matches!(restore, ActivationAdmissionPermit::Limited(_)));
+    assert!(matches!(
+        restore.permit(),
+        ActivationAdmissionPermit::Limited(_)
+    ));
     assert_eq!(limiter.in_flight_for(LimitedActivationKind::Restore), 1);
     assert_eq!(limiter.in_flight(), 2);
 
@@ -362,7 +368,10 @@ async fn admit_vm_activation_meters_cold_and_restore_but_not_a_resident_resume()
         .now_or_never()
         .expect("a resident resume is admitted on its first poll")
         .expect("a resident resume is never refused");
-    assert!(matches!(resume, ActivationAdmissionPermit::Unlimited));
+    assert!(matches!(
+        resume.permit(),
+        ActivationAdmissionPermit::Unlimited
+    ));
     assert_eq!(limiter.in_flight(), 2);
 
     drop(resume);
@@ -376,4 +385,214 @@ async fn admit_vm_activation_meters_cold_and_restore_but_not_a_resident_resume()
     tokio::time::timeout(Duration::from_secs(30), service.task_tracker.wait())
         .await
         .expect("service tasks stop within 30 seconds of shutdown");
+}
+
+fn seal_test_service(scratch: &std::path::Path) -> crate::service::SandboxManagerService {
+    let mut service = crate::service::SandboxManagerService::new_with_options(
+        crate::db::test_conn(),
+        crate::service::SandboxManagerServiceOptions::for_test_in(scratch),
+    );
+    service.activation_admission_limiter = Arc::new(ActivationAdmissionLimiter::with_config(
+        ActivationAdmissionConfig {
+            max_concurrent_activations: 1,
+            refill_rps: 1_000.0,
+            burst: 1_000.0,
+        },
+    ));
+    service
+}
+
+async fn shut_down(service: crate::service::SandboxManagerService) {
+    service.shutdown_token.cancel();
+    service.task_tracker.close();
+    tokio::time::timeout(Duration::from_secs(30), service.task_tracker.wait())
+        .await
+        .expect("service tasks stop within 30 seconds of shutdown");
+}
+
+fn assert_sealed_refusal(status: &Status, epoch: u64) {
+    assert_eq!(status.code(), tonic::Code::FailedPrecondition, "{status:?}");
+    assert!(
+        status
+            .message()
+            .contains(pplx_space_common_core::activation_seal_signals::ACTIVATIONS_SEALED_MARKER)
+            && status.message().contains(&format!("epoch {epoch}")),
+        "{status:?}"
+    );
+}
+
+/// While sealed, every activation kind is refused, whether or not it runs
+/// under a caller's state-writer lease, without taking limiter capacity or
+/// advancing the admitted count. After the unseal each is admitted, counted,
+/// and listed in flight under its own kind until its admission is dropped.
+#[tokio::test]
+async fn sealed_admission_refuses_every_kind_and_unseal_admits_each_again() {
+    use futures_util::FutureExt;
+
+    for kind in ActivationAdmissionKind::ALL {
+        // A new kind fails to compile until it gets a match arm here, and
+        // must also be added to `ALL`.
+        match kind {
+            ActivationAdmissionKind::Cold
+            | ActivationAdmissionKind::Restore
+            | ActivationAdmissionKind::ResidentResume => {}
+        }
+    }
+    let scratch = tempfile::tempdir().unwrap();
+    let service = seal_test_service(scratch.path());
+    service.activation_seal.seal(&service.db, 3).unwrap();
+    // The limiter's only slot, held outside the seal's count: an admission
+    // that waited for capacity would not resolve on its first poll.
+    let holder = service
+        .activation_admission_limiter
+        .acquire(LimitedActivationKind::Cold, "holder")
+        .await
+        .unwrap();
+
+    for kind in ActivationAdmissionKind::ALL {
+        let refused = service
+            .admit_vm_activation(kind, "sandbox-sealed")
+            .now_or_never()
+            .expect("a sealed node refuses before any limiter wait")
+            .expect_err("a sealed node admits nothing");
+        assert_sealed_refusal(&refused, 3);
+        let lease = service.state_writer_lease("SealTestCaller").unwrap();
+        let nested = crate::service::drain::with_state_writer(
+            lease,
+            service.admit_vm_activation(kind, "sandbox-nested"),
+        )
+        .now_or_never()
+        .expect("a sealed node refuses before any limiter wait")
+        .expect_err("work under an inherited lease is refused too");
+        assert_sealed_refusal(&nested, 3);
+    }
+    drop(holder);
+    assert_eq!(service.activation_admission_limiter.in_flight(), 0);
+    let status = service.activation_seal.status();
+    assert_eq!(status.activations_admitted, 0);
+    assert!(status.in_flight.is_empty());
+
+    service.activation_seal.unseal(&service.db, 3).unwrap();
+    let mut admitted = Vec::new();
+    for kind in ActivationAdmissionKind::ALL {
+        admitted.push(
+            service
+                .admit_vm_activation(kind, "sandbox-unsealed")
+                .await
+                .unwrap_or_else(|status| panic!("{kind:?} after the unseal: {status:?}"))
+                .into_parts()
+                .1,
+        );
+    }
+    let status = service.activation_seal.status();
+    assert_eq!(status.activations_admitted, 3);
+    assert_eq!(
+        status
+            .in_flight
+            .iter()
+            .map(|in_flight| in_flight.kind)
+            .collect::<Vec<_>>(),
+        ActivationAdmissionKind::ALL.map(ActivationAdmissionKind::in_flight_kind)
+    );
+    drop(admitted);
+    service.activation_seal.assert_quiesced();
+    shut_down(service).await;
+}
+
+/// A cold boot waiting for limiter capacity when the seal lands is refused
+/// once the capacity frees, rather than launching under the seal.
+#[tokio::test]
+async fn an_activation_queued_for_capacity_when_the_seal_lands_is_refused() {
+    let scratch = tempfile::tempdir().unwrap();
+    let service = seal_test_service(scratch.path());
+    let held = service
+        .admit_vm_activation(ActivationAdmissionKind::Restore, "sandbox-held")
+        .await
+        .unwrap();
+    let requested = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let queued = tokio::spawn(REQUESTED_VM_ACTIVATIONS.scope(Arc::clone(&requested), {
+        let service = service.clone();
+        async move {
+            service
+                .admit_vm_activation(ActivationAdmissionKind::Cold, "sandbox-queued")
+                .await
+                .map(drop)
+        }
+    }));
+    // On this single-threaded runtime the request runs from its entry through
+    // the seal's first check to the limiter's retry sleep in one poll.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while requested.lock().unwrap().is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the cold boot reaches admission");
+    assert!(!queued.is_finished(), "the cold boot waits for capacity");
+
+    service.activation_seal.seal(&service.db, 4).unwrap();
+    drop(held);
+    let refused = tokio::time::timeout(Duration::from_secs(30), queued)
+        .await
+        .expect("the queued cold boot answers once capacity frees")
+        .unwrap()
+        .expect_err("the seal landed while it was queued");
+    assert_sealed_refusal(&refused, 4);
+    assert_eq!(service.activation_seal.status().activations_admitted, 1);
+    service.activation_seal.assert_quiesced();
+    shut_down(service).await;
+}
+
+/// An admitted activation stays in flight for as long as its cleanup guard
+/// lives, which is how it outlives its request in a detached finalizer: after
+/// the permit is released, and until the finalizer succeeds, hands its failure
+/// to cleanup, or is dropped.
+#[tokio::test]
+async fn an_admitted_activation_stays_in_flight_until_its_guard_ends() {
+    let scratch = tempfile::tempdir().unwrap();
+    let service = seal_test_service(scratch.path());
+    let guard = || {
+        ActivationCleanupGuard::with_interruption_reason(
+            SandboxRuntimeLabel::parse("runtime1").unwrap(),
+            SandboxQuarantineReasonCode::Unspecified,
+            "activation did not complete",
+            |_, _, _, _| {},
+        )
+    };
+    type End = (&'static str, fn(ActivationCleanupGuard));
+    let ends: [End; 4] = [
+        ("success", ActivationCleanupGuard::complete_success),
+        (
+            "handled failure",
+            ActivationCleanupGuard::complete_handled_failure,
+        ),
+        ("cleanup", ActivationCleanupGuard::cleanup),
+        ("drop", drop),
+    ];
+    for (end, finish) in ends {
+        let mut cleanup_guard = guard();
+        cleanup_guard.admit_activation(
+            service
+                .admit_vm_activation(ActivationAdmissionKind::Restore, "sandbox-finalized")
+                .await
+                .unwrap(),
+        );
+        cleanup_guard.finish_admission(AdmissionPermitOutcome::Succeeded);
+        assert_eq!(service.activation_admission_limiter.in_flight(), 0, "{end}");
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let finalizer = tokio::spawn(async move {
+            let _ = release_rx.await;
+            finish(cleanup_guard);
+        });
+        tokio::task::yield_now().await;
+        assert_eq!(
+            service.activation_seal.status().in_flight.len(),
+            1,
+            "{end}: the detached finalizer still holds the activation"
+        );
+        release_tx.send(()).unwrap();
+        finalizer.await.unwrap();
+        service.activation_seal.assert_quiesced();
+    }
+    shut_down(service).await;
 }

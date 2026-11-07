@@ -1340,6 +1340,23 @@ impl SandboxManagerService {
         if is_full {
             self.ensure_snapshot_restore_supported("rollback_full_snapshot")?;
         }
+        // An auto-restart activates the sandbox again after the stop and the
+        // disk rollback below, and a sealed node refuses that activation.
+        // Refuse the rollback before it stops anything, rather than leave
+        // the sandbox stopped and rolled back for a restart that failed.
+        // Admission at the restart stays the enforcement point: a seal that
+        // lands between this read and that admission still refuses the
+        // restart after the stop and the disk rollback.
+        if auto_restart {
+            self.activation_seal.check(
+                if is_full {
+                    crate::activation_seal::InFlightActivationKind::Restore
+                } else {
+                    crate::activation_seal::InFlightActivationKind::Cold
+                },
+                &id,
+            )?;
+        }
         let (artifact_guard, snapshot_lease) = self
             .blocking_artifact_io(move |_| {
                 let ownership = (artifact_guard, snapshot_lease);
