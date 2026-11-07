@@ -43,6 +43,16 @@ use pplx_space_events::SandboxEventTrigger;
 /// work goes on between calls.
 pub(super) const ORPHAN_INVENTORY_DEADLINE: Duration = Duration::from_secs(20);
 
+/// How many times in a row the drain's work on a sandbox may fail before
+/// the drain reports it `blocked` with the last failure. It still retries
+/// on every call.
+pub(super) const MAX_ACTION_FAILURES: u32 = 3;
+/// How long a row may sit in a transition the drain doesn't drive before the
+/// drain reports it `blocked`: a start the seal refused leaves a row
+/// `created`, and a failed restore's row stays `restoring`, with nothing
+/// moving them on.
+pub(super) const SETTLE_BOUND: Duration = Duration::from_secs(15 * 60);
+
 /// What the drain is doing for a sandbox.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub(super) enum DrainAction {
@@ -64,27 +74,27 @@ impl DrainAction {
     }
 }
 
-/// The drain's work in flight in this process, by sandbox.
+/// The drain's work in flight in this process, by sandbox, and what it
+/// remembers between calls.
 #[derive(Default)]
 pub(super) struct DrainActions {
     running: Mutex<BTreeMap<String, DrainAction>>,
+    /// The consecutive failures of the drain's work on each sandbox, with the
+    /// last one's reason.
+    failures: Mutex<BTreeMap<String, (u32, String)>>,
+    /// Each row's lifecycle as the drain last saw it, and since when.
+    seen: Mutex<BTreeMap<String, (SandboxState, tokio::time::Instant)>>,
 }
 
 impl DrainActions {
     fn running(&self) -> BTreeMap<String, DrainAction> {
-        self.running
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
+        lock(&self.running).clone()
     }
 
     /// Mark `action` running for `sandbox_id`; false when something already
     /// is.
     fn start(&self, sandbox_id: &str, action: DrainAction) -> bool {
-        let mut running = self
-            .running
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut running = lock(&self.running);
         if running.contains_key(sandbox_id) {
             return false;
         }
@@ -92,11 +102,48 @@ impl DrainActions {
         true
     }
 
-    fn finish(&self, sandbox_id: &str) {
-        self.running
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(sandbox_id);
+    /// End `sandbox_id`'s running action, counting `failure` if it failed.
+    fn finish(&self, sandbox_id: &str, failure: Option<String>) {
+        if let Some(reason) = failure {
+            let mut failures = lock(&self.failures);
+            let entry = failures
+                .entry(sandbox_id.to_owned())
+                .or_insert((0, String::new()));
+            entry.0 = entry.0.saturating_add(1);
+            entry.1 = reason;
+        }
+        lock(&self.running).remove(sandbox_id);
+    }
+
+    fn failures(&self) -> BTreeMap<String, (u32, String)> {
+        lock(&self.failures).clone()
+    }
+
+    /// Forget the failures of every sandbox the drain no longer works on.
+    fn keep_failures_of(&self, working: &BTreeSet<String>) {
+        lock(&self.failures).retain(|sandbox_id, _| working.contains(sandbox_id));
+    }
+
+    /// Note each row's lifecycle at `now`, and answer the rows that have
+    /// been in the same one for [`SETTLE_BOUND`] or longer.
+    fn unchanged_since_bound(
+        &self,
+        rows: &[(String, SandboxState)],
+        now: tokio::time::Instant,
+    ) -> BTreeSet<String> {
+        let mut seen = lock(&self.seen);
+        seen.retain(|sandbox_id, _| rows.iter().any(|(id, _)| id == sandbox_id));
+        let mut unchanged = BTreeSet::new();
+        for (sandbox_id, state) in rows {
+            let entry = seen.entry(sandbox_id.clone()).or_insert((*state, now));
+            if entry.0 != *state {
+                *entry = (*state, now);
+            }
+            if now.saturating_duration_since(entry.1) >= SETTLE_BOUND {
+                unchanged.insert(sandbox_id.clone());
+            }
+        }
+        unchanged
     }
 
     /// Wait, at most ten seconds, until no drain action is running.
@@ -110,6 +157,13 @@ impl DrainActions {
         .await
         .expect("drain actions finish within ten seconds");
     }
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    // Every critical section leaves its map whole before it can panic.
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// One row as the planner reads it.
@@ -170,20 +224,71 @@ pub(super) const fn may_hold_vm(state: SandboxState) -> bool {
 pub(super) type LocalOnlyArtifacts =
     BTreeMap<String, Vec<(String, pplx_space_common_core::types::ArtifactKind)>>;
 
-/// Decide what the drain does for every row. `pending_backups` maps a
-/// sandbox to the pinned artifacts still without a durable copy, including
-/// a pin that names no artifact row; `local_only` is every artifact without
-/// one; `evacuations` are the recorded drain suspends by sandbox; `running`
-/// is the drain's work in flight in this process.
-pub(super) fn plan(
-    rows: &[DrainRow],
-    pending_backups: &BTreeMap<String, BTreeSet<String>>,
-    local_only: &LocalOnlyArtifacts,
-    evacuations: &BTreeMap<String, DrainEvacuation>,
-    running: &BTreeMap<String, DrainAction>,
-) -> DrainPlan {
+/// Everything the planner reads besides the rows.
+#[derive(Clone, Debug, Default)]
+pub(super) struct PlanInputs {
+    /// The pinned artifacts still without a durable copy, by sandbox,
+    /// including a pin that names no artifact row.
+    pub(super) pending_backups: BTreeMap<String, BTreeSet<String>>,
+    /// Every artifact without a durable copy.
+    pub(super) local_only: LocalOnlyArtifacts,
+    /// The recorded drain suspends, by sandbox.
+    pub(super) evacuations: BTreeMap<String, DrainEvacuation>,
+    /// The drain's work in flight in this process.
+    pub(super) running: BTreeMap<String, DrainAction>,
+    /// The consecutive failures of the drain's work, by sandbox.
+    pub(super) failures: BTreeMap<String, (u32, String)>,
+    /// The rows in the same lifecycle for [`SETTLE_BOUND`] or longer.
+    pub(super) unchanged: BTreeSet<String>,
+}
+
+impl DrainPlan {
+    /// Wait for `action` on `sandbox_id`, or report it `blocked` once it has
+    /// failed [`MAX_ACTION_FAILURES`] times in a row.
+    fn wait_for(&mut self, inputs: &PlanInputs, sandbox_id: &str, action: &str) {
+        match inputs.failures.get(sandbox_id) {
+            Some((failures, reason)) if *failures >= MAX_ACTION_FAILURES => {
+                self.blocked.push((
+                    Some(sandbox_id.to_owned()),
+                    format!("{action} failed {failures} times in a row: {reason}"),
+                ));
+            }
+            _ => self
+                .pending
+                .push((sandbox_id.to_owned(), action.to_owned())),
+        }
+    }
+
+    /// Start `action` unless something is already running for its sandbox,
+    /// and wait for whichever it is.
+    fn drive(&mut self, inputs: &PlanInputs, action: PlannedAction) {
+        let (sandbox_id, kind) = action.target();
+        let sandbox_id = sandbox_id.to_owned();
+        match inputs.running.get(&sandbox_id) {
+            Some(running) => self.wait_for(inputs, &sandbox_id, running.as_str()),
+            None => {
+                self.wait_for(inputs, &sandbox_id, kind.as_str());
+                self.actions.push(action);
+            }
+        }
+    }
+}
+
+impl PlannedAction {
+    fn target(&self) -> (&str, DrainAction) {
+        match self {
+            Self::Suspend { sandbox_id } => (sandbox_id, DrainAction::Suspend),
+            Self::PublishDisk { sandbox_id } => (sandbox_id, DrainAction::PublishDisk),
+            Self::Upload { sandbox_id, .. } => (sandbox_id, DrainAction::Upload),
+        }
+    }
+}
+
+/// Decide what the drain does for every row.
+pub(super) fn plan(rows: &[DrainRow], inputs: &PlanInputs) -> DrainPlan {
+    use pplx_space_common_core::types::ArtifactKind;
     let mut plan = DrainPlan::default();
-    for (sandbox_id, artifacts) in local_only {
+    for (sandbox_id, artifacts) in &inputs.local_only {
         if !rows.iter().any(|row| row.sandbox_id == *sandbox_id) {
             for (artifact, _) in artifacts {
                 plan.blocked.push((
@@ -195,28 +300,26 @@ pub(super) fn plan(
     }
     for row in rows {
         let id = &row.sandbox_id;
-        let evacuation = evacuations.get(id);
-        let pin_pending = row.pin.as_ref().is_some_and(|(artifact, _)| {
-            pending_backups
-                .get(id)
-                .is_some_and(|pending| pending.contains(artifact))
-        });
-        let durable_pin = row
-            .pin
-            .as_ref()
-            .filter(|_| !pin_pending)
-            .map(|(artifact, kind)| (artifact.clone(), *kind));
         if row.pool_member {
             // Not a resident: the warm-pool reconciler evicts slots on a
             // cordoned node, and until it has, the VM keeps `done` false.
             plan.vm |= may_hold_vm(row.lifecycle);
             continue;
         }
+        let running = inputs.running.contains_key(id);
+        let pending_pin = row.pin.clone().filter(|(artifact, _)| {
+            inputs
+                .pending_backups
+                .get(id)
+                .is_some_and(|pending| pending.contains(artifact))
+        });
+        let durable_pin = row.pin.clone().filter(|_| pending_pin.is_none());
+        let upload = |(artifact_id, kind): (String, ArtifactKind)| PlannedAction::Upload {
+            sandbox_id: id.clone(),
+            artifact_id,
+            kind,
+        };
         match row.lifecycle {
-            SandboxState::Deleting => {
-                plan.vm = true;
-                plan.pending.push((id.clone(), "settle:deleting".into()));
-            }
             SandboxState::Quarantined => {
                 plan.vm = true;
                 plan.blocked.push((Some(id.clone()), "quarantined".into()));
@@ -227,62 +330,44 @@ pub(super) fn plan(
             }
             SandboxState::Started | SandboxState::Paused => {
                 plan.vm = true;
-                if let Some(action) = running.get(id) {
-                    plan.pending.push((id.clone(), action.as_str().into()));
-                } else if let Some(refusal) = &row.suspend_refusal {
-                    plan.blocked.push((Some(id.clone()), refusal.clone()));
-                } else {
-                    plan.pending
-                        .push((id.clone(), DrainAction::Suspend.as_str().into()));
-                    plan.actions.push(PlannedAction::Suspend {
-                        sandbox_id: id.clone(),
-                    });
+                match &row.suspend_refusal {
+                    Some(refusal) if !running => {
+                        plan.blocked.push((Some(id.clone()), refusal.clone()));
+                    }
+                    _ => plan.drive(
+                        inputs,
+                        PlannedAction::Suspend {
+                            sandbox_id: id.clone(),
+                        },
+                    ),
                 }
             }
-            SandboxState::Stopped => {
-                if let Some(action) = running.get(id) {
-                    plan.pending.push((id.clone(), action.as_str().into()));
-                } else if row.volume_encryption {
+            SandboxState::Stopped => match (&durable_pin, pending_pin) {
+                _ if row.volume_encryption && !running => {
                     plan.blocked.push((
                         Some(id.clone()),
                         "an encrypted stopped sandbox's disk can't be published".into(),
                     ));
-                } else if let Some((artifact, pplx_space_common_core::types::ArtifactKind::Disk)) =
-                    &durable_pin
-                {
+                }
+                (Some((artifact, ArtifactKind::Disk)), _) if !running => {
                     plan.evacuated
                         .push((id.clone(), DrainPrior::Stopped, artifact.clone()));
-                } else if let Some((artifact, kind)) = row.pin.as_ref().filter(|_| pin_pending)
-                    && *kind == pplx_space_common_core::types::ArtifactKind::Disk
-                {
-                    plan.pending
-                        .push((id.clone(), DrainAction::Upload.as_str().into()));
-                    plan.actions.push(PlannedAction::Upload {
-                        sandbox_id: id.clone(),
-                        artifact_id: artifact.clone(),
-                        kind: *kind,
-                    });
-                } else {
-                    plan.pending
-                        .push((id.clone(), DrainAction::PublishDisk.as_str().into()));
-                    plan.actions.push(PlannedAction::PublishDisk {
-                        sandbox_id: id.clone(),
-                    });
                 }
-            }
-            SandboxState::Suspended | SandboxState::Failed => {
-                if let Some((artifact, kind)) = row.pin.as_ref().filter(|_| pin_pending) {
-                    plan.pending
-                        .push((id.clone(), DrainAction::Upload.as_str().into()));
-                    plan.actions.push(PlannedAction::Upload {
+                (_, Some(pin @ (_, ArtifactKind::Disk))) => plan.drive(inputs, upload(pin)),
+                _ => plan.drive(
+                    inputs,
+                    PlannedAction::PublishDisk {
                         sandbox_id: id.clone(),
-                        artifact_id: artifact.clone(),
-                        kind: *kind,
-                    });
-                } else if let Some(evacuation) = evacuation {
+                    },
+                ),
+            },
+            SandboxState::Suspended | SandboxState::Failed => {
+                if let Some(pin) = pending_pin {
+                    plan.drive(inputs, upload(pin));
+                } else if let Some(evacuation) = inputs.evacuations.get(id) {
                     // The drain suspended it; its artifact is durable now.
                     match &durable_pin {
-                        Some((artifact, pplx_space_common_core::types::ArtifactKind::Full))
+                        Some((artifact, ArtifactKind::Full))
                             if row.lifecycle == SandboxState::Suspended =>
                         {
                             plan.evacuated
@@ -300,13 +385,22 @@ pub(super) fn plan(
                 }
             }
             other => {
-                // A transition the drain doesn't drive: wait for it to settle.
+                // A transition the drain doesn't drive: wait for it to settle,
+                // and page once it has sat there too long.
                 plan.vm |= may_hold_vm(other);
-                let action = running.get(id).map_or_else(
-                    || format!("settle:{other}"),
-                    |action| action.as_str().into(),
-                );
-                plan.pending.push((id.clone(), action));
+                if let Some(action) = inputs.running.get(id) {
+                    plan.wait_for(inputs, id, action.as_str());
+                } else if inputs.unchanged.contains(id) {
+                    plan.blocked.push((
+                        Some(id.clone()),
+                        format!(
+                            "{other} for over {} minutes, a transition the drain doesn't drive",
+                            SETTLE_BOUND.as_secs() / 60
+                        ),
+                    ));
+                } else {
+                    plan.pending.push((id.clone(), format!("settle:{other}")));
+                }
             }
         }
         // Every other artifact the sandbox keeps without a durable copy, a
@@ -317,17 +411,10 @@ pub(super) fn plan(
             continue;
         }
         let pin = row.pin.as_ref().map(|(artifact, _)| artifact);
-        for (artifact, kind) in local_only.get(id).into_iter().flatten() {
-            if Some(artifact) == pin {
-                continue;
+        for artifact in inputs.local_only.get(id).into_iter().flatten() {
+            if Some(&artifact.0) != pin {
+                plan.drive(inputs, upload(artifact.clone()));
             }
-            plan.pending
-                .push((id.clone(), DrainAction::Upload.as_str().into()));
-            plan.actions.push(PlannedAction::Upload {
-                sandbox_id: id.clone(),
-                artifact_id: artifact.clone(),
-                kind: *kind,
-            });
         }
     }
     plan
@@ -632,16 +719,31 @@ impl SandboxManagerService {
             .map(|evacuation| (evacuation.sandbox_id.clone(), evacuation))
             .collect();
         let ids = rows.iter().map(|row| row.sandbox_id.clone()).collect();
-        Ok((
-            plan(
-                &rows,
-                &pending_backups,
-                &local_only,
-                &evacuations,
-                &self.drain_actions.running(),
-            ),
-            ids,
-        ))
+        let lifecycles: Vec<_> = rows
+            .iter()
+            .map(|row| (row.sandbox_id.clone(), row.lifecycle))
+            .collect();
+        let inputs = PlanInputs {
+            pending_backups,
+            local_only,
+            evacuations,
+            running: self.drain_actions.running(),
+            failures: self.drain_actions.failures(),
+            unchanged: self
+                .drain_actions
+                .unchanged_since_bound(&lifecycles, tokio::time::Instant::now()),
+        };
+        let plan = plan(&rows, &inputs);
+        // A failure counts toward the bound only while the drain still works
+        // on its sandbox; one that succeeded, or moved on, starts over.
+        let working = plan
+            .actions
+            .iter()
+            .map(|action| action.target().0.to_owned())
+            .chain(inputs.running.keys().cloned())
+            .collect();
+        self.drain_actions.keep_failures_of(&working);
+        Ok((plan, ids))
     }
 
     /// Why the Suspend RPC would refuse to suspend `row`, as the drain
@@ -659,17 +761,8 @@ impl SandboxManagerService {
     /// Start what the plan asks for that isn't already running.
     fn start_actions(&self, epoch: u64, plan: &mut DrainPlan) {
         for action in std::mem::take(&mut plan.actions) {
-            let (sandbox_id, kind) = match &action {
-                PlannedAction::Suspend { sandbox_id } => (sandbox_id.clone(), DrainAction::Suspend),
-                PlannedAction::PublishDisk { sandbox_id } => {
-                    (sandbox_id.clone(), DrainAction::PublishDisk)
-                }
-                // The backup's own job dedup joins an upload already under
-                // way.
-                PlannedAction::Upload { sandbox_id, .. } => {
-                    (sandbox_id.clone(), DrainAction::Upload)
-                }
-            };
+            let (sandbox_id, kind) = action.target();
+            let sandbox_id = sandbox_id.to_owned();
             if !self.drain_actions.start(&sandbox_id, kind) {
                 continue;
             }
@@ -679,8 +772,7 @@ impl SandboxManagerService {
             // letting the next process start the same work beside it.
             let spawned = self.spawn_detached_state_writer("NodeDrain", &sandbox_id, async move {
                 let result = service.run_drain_action(epoch, action).await;
-                service.drain_actions.finish(&task_sandbox_id);
-                if let Err(status) = result {
+                if let Err(status) = &result {
                     tracing::warn!(
                         sandbox_id = %task_sandbox_id,
                         action = kind.as_str(),
@@ -688,10 +780,14 @@ impl SandboxManagerService {
                         "node drain action failed; the next drain call plans it again"
                     );
                 }
+                service.drain_actions.finish(
+                    &task_sandbox_id,
+                    result.err().map(|status| status.message().to_owned()),
+                );
             });
             if spawned.is_err() {
                 // Draining for a restart: the next process's call starts it.
-                self.drain_actions.finish(&sandbox_id);
+                self.drain_actions.finish(&sandbox_id, None);
             }
         }
     }
@@ -721,8 +817,12 @@ impl SandboxManagerService {
                 sandbox_id,
                 artifact_id,
                 kind,
-            } => self
-                .enqueue_artifact_backup_authorized(EnqueueArtifactBackupRequest {
+            } => {
+                // The backup worker retries an upload itself; one it gave up on
+                // counts as one failure of the drain's, and the enqueue below
+                // starts it again.
+                let gave_up = self.failed_upload(&artifact_id)?;
+                self.enqueue_artifact_backup_authorized(EnqueueArtifactBackupRequest {
                     sandbox_id,
                     expected_artifact_kind: crate::proto::ArtifactKind::from(kind) as i32,
                     source: Some(
@@ -731,9 +831,35 @@ impl SandboxManagerService {
                         ),
                     ),
                 })
-                .await
-                .map(|_| ()),
+                .await?;
+                match gave_up {
+                    Some(error) => Err(Status::unavailable(format!(
+                        "the last upload failed: {error}"
+                    ))),
+                    None => Ok(()),
+                }
+            }
         }
+    }
+
+    /// Why the latest upload of `artifact_id` failed, if the backup worker
+    /// gave up on it.
+    fn failed_upload(&self, artifact_id: &str) -> Result<Option<String>, Status> {
+        let artifact = artifact_id
+            .parse::<pplx_space_common_core::types::LocalArtifactId>()
+            .map_err(|error| {
+                Status::internal(format!("invalid local artifact id {artifact_id}: {error}"))
+            })?;
+        let job = self.snapshot_upload_worker.find_job_by_dedup_key(
+            crate::snapshot_upload_jobs::SNAPSHOT_UPLOAD_JOB_KIND,
+            &crate::snapshot_upload_jobs::artifact_backup_dedup_key(artifact),
+        )?;
+        Ok(job
+            .filter(|job| job.status == pplx_space_common_jobs::JobStatus::Failed.as_str())
+            .map(|job| {
+                job.error
+                    .unwrap_or_else(|| "the backup worker gave up on it".to_owned())
+            }))
     }
 
     /// The idle auto-suspend's suspend of a started or paused VM, for the
