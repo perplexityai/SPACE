@@ -21,7 +21,7 @@ test-hooks = ["pplx-space-common-core/test-hooks"]
 kubernetes = [
     "dep:kube",
     "dep:k8s-openapi",
-    "dep:pplx-space-common-work-coalescer",
+    "dep:pplx-space-work-coalescer",
     "pplx-space-common-core/kubernetes",
     "dep:pplx-space-kube-client",
     "pplx-space-rpc-auth/k8s",
@@ -110,7 +110,7 @@ pplx-space-public-api = { workspace = true, features = ["schema", "serde"] }
 pplx-space-common-core = { workspace = true, features = ["serde", "sqlx"] }
 pplx-space-common-grpc = { workspace = true, features = ["internal-tls"] }
 pplx-space-sandbox-grpc = { workspace = true }
-pplx-space-common-work-coalescer = { workspace = true, optional = true }
+pplx-space-work-coalescer = { workspace = true, optional = true }
 pplx-space-cluster-pool = { workspace = true }
 pplx-space-net-common = { workspace = true, features = ["serde"] }
 pplx-space-rpc-auth = { workspace = true }
