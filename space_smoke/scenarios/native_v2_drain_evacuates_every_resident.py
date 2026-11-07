@@ -47,7 +47,11 @@ def v2_drain_evacuates_every_resident(test: smoke.CommandSandboxFixture) -> None
 
     with drain.v2_controller():
         with test.phase("pin a started, a paused and a stopped resident to one worker"):
+            # A v2 drain needs the node's instance recorded; re-registering
+            # under a fake one deletes the pods there, so the fixture's
+            # worker is left alone.
             drain.pin_to_resident_worker(away_from_fixture=True)
+            drain.give_fake_instance()
             residents = {
                 "started": drain.create_resident(),
                 "paused": drain.create_resident(),

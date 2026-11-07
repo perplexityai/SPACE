@@ -16,9 +16,11 @@ The controller runs the v2 loop only with the dead-node verb `live` and the
 restore hold (`SPACE_DRAIN_RESTORE_TEST_HOLD_SECS`). On Kind's fake EC2 the
 verb judges only workers re-registered under fake AWS providerIDs.
 
-A terminate runs as production's does: the run gives the worker a fake AWS
-providerID first, so the `aws` terminator asks Kind's fake EC2 to terminate
-the instance behind it. The fake only marks it; once the controller flags the
+A v2 drain needs the node's EC2 instance recorded (the dead-node verb owns a
+v2 node that dies, and judges it by that instance), so every run gives the
+drained worker a fake AWS providerID first, before any resident lands on it.
+A terminate then runs as production's does: the `aws` terminator asks Kind's
+fake EC2 to terminate the instance behind it. The fake only marks it; once the controller flags the
 termination, the harness plays the cloud's part, stopping the worker's
 container and deleting its Node. The verb then judges the node lost by its
 instance, as it judges any dead node, and deletes its row, with no

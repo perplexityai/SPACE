@@ -33,7 +33,11 @@ def v2_drain_meets_user_calls(test: smoke.CommandSandboxFixture) -> None:
 
     with drain.v2_controller(hold_seconds=HOLD_SECONDS):
         with test.phase("pin two residents to one worker"):
-            drain.pin_to_resident_worker()
+            # A v2 drain needs the node's instance recorded; re-registering
+            # under a fake one deletes the pods there, so the fixture's
+            # worker is left alone.
+            drain.pin_to_resident_worker(away_from_fixture=True)
+            drain.give_fake_instance()
             kept = drain.create_resident()
             deleted = drain.create_resident()
             test.sandbox.suspend()

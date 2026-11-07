@@ -22,7 +22,11 @@ def v2_undrain_unseals_the_worker(test: smoke.CommandSandboxFixture) -> None:
 
     with drain.v2_controller():
         with test.phase("pin a resident to one worker"):
-            drain.pin_to_resident_worker()
+            # A v2 drain needs the node's instance recorded; re-registering
+            # under a fake one deletes the pods there, so the fixture's
+            # worker is left alone.
+            drain.pin_to_resident_worker(away_from_fixture=True)
+            drain.give_fake_instance()
             resident = drain.create_resident()
             drain.release_other_worker()
 

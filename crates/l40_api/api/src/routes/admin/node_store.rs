@@ -1396,6 +1396,8 @@ mod terminate_gate_agreement_tests;
 pub(super) struct DrainV2Columns {
     pub(super) engine: pplx_space_common_core::types::NodeDrainEngine,
     pub(super) status: Option<serde_json::Value>,
+    /// Whether `node_k8s` records the node's EC2 instance.
+    pub(super) recorded_instance: bool,
 }
 
 /// What resolves the node's node-api: its role, substrate and Kubernetes
@@ -1428,20 +1430,27 @@ pub(super) async fn node_api_target(
     }))
 }
 
+/// The node's v2 drain columns; `None` when there is no such node.
 pub(super) async fn drain_v2_columns(
     executor: impl sqlx::PgExecutor<'_>,
     node_id: NodeId,
-) -> Result<DrainV2Columns, sqlx::Error> {
-    let (engine, status): (Option<String>, Option<serde_json::Value>) = sqlx::query_as(sql!(
-        "SELECT drain_engine, drain_status FROM nodes WHERE id = $1"
+) -> Result<Option<DrainV2Columns>, sqlx::Error> {
+    let row: Option<(Option<String>, Option<serde_json::Value>, bool)> = sqlx::query_as(sql!(
+        "SELECT n.drain_engine, n.drain_status, k.instance_id IS NOT NULL
+           FROM nodes n
+           LEFT JOIN node_k8s k ON k.node_id = n.id
+          WHERE n.id = $1"
     ))
     .bind(node_id)
-    .fetch_one(executor)
+    .fetch_optional(executor)
     .await?;
-    Ok(DrainV2Columns {
-        engine: pplx_space_common_core::types::NodeDrainEngine::from_column(engine.as_deref()),
-        status,
-    })
+    Ok(
+        row.map(|(engine, status, recorded_instance)| DrainV2Columns {
+            engine: pplx_space_common_core::types::NodeDrainEngine::from_column(engine.as_deref()),
+            status,
+            recorded_instance,
+        }),
+    )
 }
 
 /// Start a v2 drain on a node `update_drain_phase` has just moved to

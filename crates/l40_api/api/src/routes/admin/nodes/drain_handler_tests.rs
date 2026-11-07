@@ -768,7 +768,7 @@ async fn insert_k8s_node(
     .execute(pool)
     .await?;
     sqlx::query(sql!(
-        "INSERT INTO node_k8s (node_id, k8s_node_name) VALUES ($1, $2)"
+        "INSERT INTO node_k8s (node_id, k8s_node_name, instance_id) VALUES ($1, $2, 'i-0a1b2c3d')"
     ))
     .bind(node_id)
     .bind(format!("ip-10-0-0-46-{node_id}"))
@@ -856,8 +856,8 @@ async fn a_v2_drain_records_its_epoch_with_the_phase() -> TestResult {
 }
 
 /// A v2 `:drain` is refused, writing nothing, without the flag, on a Direct
-/// node, as a gentle drain, and against a v1 drain in flight; the control,
-/// a v1 drain, still starts.
+/// node, as a gentle drain, against a v1 drain in flight, and on a node
+/// with no recorded instance; the control, a v1 drain, still starts.
 #[tokio::test(flavor = "current_thread")]
 async fn a_v2_drain_it_cant_run_is_refused_and_writes_nothing() -> TestResult {
     if !enter_direct_test_process() {
@@ -900,6 +900,22 @@ async fn a_v2_drain_it_cant_run_is_refused_and_writes_nothing() -> TestResult {
             "v1 in flight",
             &enabled,
             insert_k8s_node(&db.pool, Some("draining"), None, None).await?,
+            NodeDrainMode::Forced,
+            StatusCode::CONFLICT,
+        ),
+        (
+            "no recorded instance",
+            &enabled,
+            {
+                let node_id = insert_k8s_node(&db.pool, None, None, None).await?;
+                sqlx::query(sql!(
+                    "UPDATE node_k8s SET instance_id = NULL WHERE node_id = $1"
+                ))
+                .bind(node_id)
+                .execute(&db.pool)
+                .await?;
+                node_id
+            },
             NodeDrainMode::Forced,
             StatusCode::CONFLICT,
         ),
@@ -1222,5 +1238,29 @@ async fn terminate_asks_the_node_before_it_locks_the_row() -> TestResult {
         Some("terminating"),
         "{answer}"
     );
+    Ok(())
+}
+
+/// `:terminate` of a node that doesn't exist answers 404, as every other
+/// action does.
+#[tokio::test(flavor = "current_thread")]
+async fn terminate_of_an_unknown_node_is_not_found() -> TestResult {
+    if !enter_direct_test_process() {
+        return Ok(());
+    }
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let state = kubernetes_state(&db.pool).await?;
+    let actor = managing_org_admin(&db.pool).await?;
+    let answer = post_drain(
+        &state,
+        &actor,
+        NodeId::new(),
+        DrainAction::Terminate,
+        DrainRequest::default(),
+    )
+    .await;
+    assert_eq!(answer, StatusCode::NOT_FOUND);
     Ok(())
 }

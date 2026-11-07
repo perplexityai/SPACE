@@ -1405,7 +1405,10 @@ async fn apply_drain_action(
     // that long. Under the lock below, the row must still carry that report.
     let v2_probe = if matches!(action, DrainAction::Terminate) {
         match node_store::drain_v2_columns(&state.pool, node_id).await {
-            Ok(columns) if columns.engine == NodeDrainEngine::V2 => {
+            Ok(None) => {
+                return api_error(StatusCode::NOT_FOUND, "Node not found").into_response();
+            }
+            Ok(Some(columns)) if columns.engine == NodeDrainEngine::V2 => {
                 match drain_v2_terminable(columns.status.as_ref()) {
                     Some(epoch) => Some((
                         epoch,
@@ -1586,7 +1589,9 @@ async fn apply_drain_action(
     // The drain v2 engine: refuse what it can't run, and decide its write,
     // under the same lock as the phase write.
     let v2_columns = match node_store::drain_v2_columns(&mut *tx, node_id).await {
-        Ok(columns) => columns,
+        Ok(Some(columns)) => columns,
+        // The row is locked above, so it can't be gone here.
+        Ok(None) => return api_error(StatusCode::NOT_FOUND, "Node not found").into_response(),
         Err(err) => return db_error(err).into_response(),
     };
     let v2_write = match drain_v2_write(
@@ -1597,6 +1602,7 @@ async fn apply_drain_action(
         requested_mode,
         current.managed_by,
         v2_columns.engine,
+        v2_columns.recorded_instance,
         transition_starts_a_drain(&transition),
         state.drain_v2_enabled,
     ) {
@@ -2319,13 +2325,19 @@ enum DrainV2Write {
 
 /// Decide a request's drain v2 write, or refuse it. `starts_a_drain` is
 /// whether the transition starts a drain; `node_engine` is the engine the
-/// node's drain runs under.
+/// node's drain runs under; `recorded_instance` is whether the node's EC2
+/// instance is recorded.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each is one fact of the request or the locked row the decision reads"
+)]
 fn drain_v2_write(
     action: DrainAction,
     requested: Option<NodeDrainEngine>,
     mode: Option<NodeDrainMode>,
     managed_by: NodeManagedBy,
     node_engine: NodeDrainEngine,
+    recorded_instance: bool,
     starts_a_drain: bool,
     enabled: bool,
 ) -> Result<DrainV2Write, (StatusCode, &'static str)> {
@@ -2348,6 +2360,15 @@ fn drain_v2_write(
                     return Err((
                         StatusCode::BAD_REQUEST,
                         "drain engine v2 runs forced drains only; a gentle drain is :cordon",
+                    ));
+                }
+                if starts_a_drain && !recorded_instance {
+                    // A v2 drain's node that dies is the dead-node verb's,
+                    // which judges a node only by its recorded instance.
+                    return Err((
+                        StatusCode::CONFLICT,
+                        "drain engine v2 needs the node's EC2 instance recorded: the dead-node \
+                         verb owns a v2 node that dies, and judges it by that instance",
                     ));
                 }
                 if starts_a_drain {
