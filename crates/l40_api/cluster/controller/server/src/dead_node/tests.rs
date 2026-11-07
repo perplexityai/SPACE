@@ -261,7 +261,7 @@ fn dead_node(uid: &str) -> CandidateNode {
         k8s_node_uid: Some(uid.to_owned()),
         instance_id: Some(DEAD_INSTANCE.to_owned()),
         heartbeat: Heartbeat::Stale,
-        v2_terminating: false,
+        v2_drain_phase: None,
     }
 }
 

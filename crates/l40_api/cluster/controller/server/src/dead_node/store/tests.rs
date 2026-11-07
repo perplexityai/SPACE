@@ -350,6 +350,67 @@ async fn the_node_delete_refuses_when_anything_it_rests_on_moved() -> TestResult
     Ok(())
 }
 
+/// A v2 drain's node is judged in every phase, with the phase it was read
+/// in, so a node that died mid-drain has an owner; a v1 drain's node is
+/// not. Its delete holds that phase: one the v2 loop moved since is kept.
+#[tokio::test(flavor = "current_thread")]
+async fn a_v2_drains_node_is_judged_in_every_phase() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let pool = &db.pool;
+    let k8s = SubstrateKind::Kubernetes;
+    let store = DeadNodeDbStore::new(pool.clone());
+    let v1 = insert_node(
+        pool,
+        k8s,
+        Some("draining"),
+        Status::Missing,
+        Some("uid"),
+        Some(OWN),
+    )
+    .await?;
+    for phase in ["draining", "drained", "terminating"] {
+        let node_id = insert_node(
+            pool,
+            k8s,
+            Some(phase),
+            Status::Missing,
+            Some("uid"),
+            Some(OWN),
+        )
+        .await?;
+        sqlx::query(sql!("UPDATE nodes SET drain_engine = 'v2' WHERE id = $1"))
+            .bind(node_id)
+            .execute(pool)
+            .await?;
+        let node = candidate(pool, node_id).await?;
+        assert_eq!(node.v2_drain_phase.as_deref(), Some(phase));
+        if phase == "draining" {
+            sqlx::query(sql!(
+                "UPDATE nodes SET drain_phase = 'drained' WHERE id = $1"
+            ))
+            .bind(node_id)
+            .execute(pool)
+            .await?;
+            assert!(!store.delete_node(&node).await?, "the phase moved");
+            assert!(node_exists(pool, node_id).await?);
+        } else {
+            assert!(store.delete_node(&node).await?, "{phase}");
+            assert!(!node_exists(pool, node_id).await?, "{phase}");
+        }
+    }
+    assert!(
+        !store
+            .candidate_nodes(k8s, None, 1000)
+            .await?
+            .iter()
+            .any(|node| node.node_id == v1),
+        "a v1 drain's node is its own"
+    );
+    Ok(())
+}
+
 async fn candidate(pool: &PgPool, node_id: NodeId) -> TestResult<CandidateNode> {
     let store = DeadNodeDbStore::new(pool.clone());
     Ok(store
