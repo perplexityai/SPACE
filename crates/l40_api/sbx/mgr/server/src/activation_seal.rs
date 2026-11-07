@@ -48,14 +48,6 @@ impl std::fmt::Display for InFlightActivationKind {
     }
 }
 
-/// The seal a node is under.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct Sealed {
-    pub(crate) epoch: u64,
-    /// Wall-clock Unix milliseconds at which this seal began.
-    pub(crate) since_ms: u64,
-}
-
 /// One piece of activation work in flight.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct InFlightActivation {
@@ -67,7 +59,8 @@ pub(crate) struct InFlightActivation {
 /// The seal and the work in flight, read together.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ActivationSealStatus {
-    pub(crate) sealed: Option<Sealed>,
+    /// The epoch the node is sealed under.
+    pub(crate) sealed_epoch: Option<u64>,
     /// Oldest first.
     pub(crate) in_flight: Vec<InFlightActivation>,
 }
@@ -85,12 +78,22 @@ struct SealState {
 }
 
 impl SealState {
-    fn sealed(&self) -> Option<Sealed> {
-        let record = self.record.as_ref().ok().copied().flatten()?;
-        Some(Sealed {
-            epoch: record.sealed_epoch?,
-            since_ms: record.sealed_since_ms,
-        })
+    fn sealed_epoch(&self) -> Option<u64> {
+        self.record
+            .as_ref()
+            .ok()
+            .copied()
+            .flatten()
+            .filter(|record| record.sealed)
+            .map(|record| record.epoch)
+    }
+
+    /// The readable row, `None` on a node never sealed or cancelled.
+    fn current(&self) -> Result<Option<ActivationSealRecord>, Status> {
+        self.record
+            .as_ref()
+            .copied()
+            .map_err(|error| Status::internal(format!("activation seal unreadable: {error}")))
     }
 }
 
@@ -108,14 +111,10 @@ impl ActivationSeal {
         };
         let state = seal.lock_state();
         pplx_space_sandbox_metrics::admission::node_activation_seal_sealed(
-            state.record.is_err() || state.sealed().is_some(),
+            state.record.is_err() || state.sealed_epoch().is_some(),
         );
-        if let Some(sealed) = state.sealed() {
-            tracing::info!(
-                epoch = sealed.epoch,
-                sealed_since_ms = sealed.since_ms,
-                "sandbox-manager starts with VM activations sealed"
-            );
+        if let Some(epoch) = state.sealed_epoch() {
+            tracing::info!(epoch, "sandbox-manager starts with VM activations sealed");
         }
         drop(state);
         seal
@@ -159,53 +158,26 @@ impl ActivationSeal {
     }
 
     /// Seal under `epoch`, persisted before the seal takes effect. The same
-    /// epoch again changes nothing; a later epoch replaces the current one
-    /// and starts a new seal. Epochs only move forward: an epoch below the
-    /// current one, or at or below the last cancelled one, is refused.
-    pub(crate) fn seal(
-        &self,
-        db: &crate::db::SharedConnection,
-        epoch: u64,
-    ) -> Result<Sealed, Status> {
+    /// epoch again changes nothing; a later epoch replaces the current one.
+    /// Epochs only move forward: an epoch below the current one, or a
+    /// cancelled one, is refused.
+    pub(crate) fn seal(&self, db: &crate::db::SharedConnection, epoch: u64) -> Result<(), Status> {
         validate_epoch(epoch)?;
         let mut state = self.lock_state();
-        let current = *state
-            .record
-            .as_ref()
-            .map_err(|error| Status::internal(format!("activation seal unreadable: {error}")))?;
-        if let Some(sealed) = state.sealed() {
-            if sealed.epoch == epoch {
-                return Ok(sealed);
+        let current = state.current()?;
+        if let Some(current) = current {
+            if current.sealed && current.epoch == epoch {
+                return Ok(());
             }
-            if epoch < sealed.epoch {
-                return Err(Status::failed_precondition(format!(
-                    "activations are sealed under epoch {}, later than {epoch}",
-                    sealed.epoch
-                )));
+            if epoch <= current.epoch {
+                return Err(refuse_stale_epoch(current, epoch));
             }
         }
-        let last_cancelled_epoch = current.and_then(|record| record.last_cancelled_epoch);
-        if let Some(cancelled) = last_cancelled_epoch
-            && epoch <= cancelled
-        {
-            return Err(Status::failed_precondition(format!(
-                "epoch {epoch} is not after the cancelled epoch {cancelled}"
-            )));
-        }
-        let now_ms = u64::try_from(jiff::Timestamp::now().as_millisecond()).unwrap_or(0);
-        // Strictly after the last seal's start, so `(epoch, since)` names one
-        // continuous seal even when a clock steps back or the same epoch is
-        // sealed again within a millisecond of an unseal.
-        let since_ms = current.map_or(now_ms, |record| {
-            now_ms.max(record.sealed_since_ms.saturating_add(1))
-        });
         let record = ActivationSealRecord {
-            sealed_epoch: Some(epoch),
-            sealed_since_ms: since_ms,
-            last_cancelled_epoch,
+            epoch,
+            sealed: true,
         };
         persist(db, record)?;
-        let replaced_epoch = current.and_then(|record| record.sealed_epoch);
         state.record = Ok(Some(record));
         // Under the state lock, so gauges from racing seals and unseals land
         // in the order the state changed.
@@ -213,18 +185,21 @@ impl ActivationSeal {
         drop(state);
         tracing::info!(
             epoch,
-            replaced_epoch,
-            sealed_since_ms = since_ms,
+            replaced_epoch = current
+                .filter(|record| record.sealed)
+                .map(|record| record.epoch),
             "sealed sandbox-manager VM activations"
         );
-        Ok(Sealed { epoch, since_ms })
+        Ok(())
     }
 
     /// Cancel `epoch`: clear the seal if it is under `epoch` or an earlier
     /// one, and remember `epoch` so no seal at or below it is taken again,
     /// even one whose call arrives after this cancel. The drain evacuations
-    /// begun under it or earlier are forgotten with it. An epoch below the
-    /// current seal's is refused and changes nothing.
+    /// begun under it or earlier are forgotten with it, on every cancel, so a
+    /// repeated cancel also forgets what a call that outlived the first one
+    /// recorded. An epoch below the current seal's is refused and changes
+    /// nothing.
     pub(crate) fn unseal(
         &self,
         db: &crate::db::SharedConnection,
@@ -232,43 +207,31 @@ impl ActivationSeal {
     ) -> Result<(), Status> {
         validate_epoch(epoch)?;
         let mut state = self.lock_state();
-        let current = *state
-            .record
-            .as_ref()
-            .map_err(|error| Status::internal(format!("activation seal unreadable: {error}")))?;
-        let sealed = state.sealed();
-        if let Some(sealed) = sealed
-            && epoch < sealed.epoch
+        let current = state.current()?;
+        if let Some(current) = current
+            && current.sealed
+            && epoch < current.epoch
         {
-            return Err(Status::failed_precondition(format!(
-                "activations are sealed under epoch {}, later than {epoch}",
-                sealed.epoch
-            )));
+            return Err(refuse_stale_epoch(current, epoch));
         }
-        let cancelled = current
-            .and_then(|record| record.last_cancelled_epoch)
-            .map_or(epoch, |last| last.max(epoch));
         let record = ActivationSealRecord {
-            sealed_epoch: None,
-            sealed_since_ms: current.map_or(0, |record| record.sealed_since_ms),
-            last_cancelled_epoch: Some(cancelled),
+            epoch: current.map_or(epoch, |current| current.epoch.max(epoch)),
+            sealed: false,
         };
-        if current != Some(record) {
-            persist_cancel(db, record, cancelled)?;
-            state.record = Ok(Some(record));
-        }
+        persist_cancel(db, record, record.epoch)?;
+        state.record = Ok(Some(record));
         pplx_space_sandbox_metrics::admission::node_activation_seal_sealed(false);
         drop(state);
-        if sealed.is_some() {
+        if current.is_some_and(|current| current.sealed) {
             tracing::info!(epoch, "unsealed sandbox-manager VM activations");
         }
         Ok(())
     }
 
     pub(crate) fn status(&self) -> ActivationSealStatus {
-        let sealed = self.lock_state().sealed();
+        let sealed_epoch = self.lock_state().sealed_epoch();
         ActivationSealStatus {
-            sealed,
+            sealed_epoch,
             in_flight: self.in_flight.list(),
         }
     }
@@ -296,15 +259,29 @@ fn refuse_while_sealed(
     kind: InFlightActivationKind,
     sandbox_id: &str,
 ) -> Result<(), Status> {
-    let seal = match (&state.record, state.sealed()) {
+    let seal = match (&state.record, state.sealed_epoch()) {
         (Err(_), _) => "the seal state is unreadable".to_string(),
-        (Ok(_), Some(sealed)) => format!("epoch {}", sealed.epoch),
+        (Ok(_), Some(epoch)) => format!("epoch {epoch}"),
         (Ok(_), None) => return Ok(()),
     };
     Err(Status::failed_precondition(format!(
         "{ACTIVATIONS_SEALED_MARKER} ({seal}); refusing the {kind} activation of sandbox \
          {sandbox_id}"
     )))
+}
+
+fn refuse_stale_epoch(current: ActivationSealRecord, epoch: u64) -> Status {
+    Status::failed_precondition(if current.sealed {
+        format!(
+            "activations are sealed under epoch {}, later than {epoch}",
+            current.epoch
+        )
+    } else {
+        format!(
+            "epoch {epoch} is not after the cancelled epoch {}",
+            current.epoch
+        )
+    })
 }
 
 fn validate_epoch(epoch: u64) -> Result<(), Status> {

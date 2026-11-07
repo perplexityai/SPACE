@@ -11,55 +11,41 @@ use crate::db::{Connection, OptionalExtension as _, Result};
 /// The one `activation_seal` row.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ActivationSealRecord {
-    /// The epoch the node is sealed under; `None` once it is unsealed.
-    pub sealed_epoch: Option<u64>,
-    /// Wall-clock Unix milliseconds at which the current seal, or the last
-    /// one once unsealed, began. Zero on a node never sealed whose row only
-    /// records a cancel.
-    pub sealed_since_ms: u64,
-    /// The highest epoch a drain has cancelled; no seal at or below it is
-    /// taken again.
-    pub last_cancelled_epoch: Option<u64>,
+    /// The epoch of the last seal or cancel; only moves forward.
+    pub epoch: u64,
+    /// Sealed under `epoch`. Once false, `epoch` was cancelled, and no seal
+    /// at or below it is taken again.
+    pub sealed: bool,
 }
 
 /// The row, `None` on a node that was never sealed; a row that does not
 /// decode fails the read.
 pub(in crate::db) fn activation_seal(conn: &Connection) -> Result<Option<ActivationSealRecord>> {
     conn.query_row(
-        sql!(
-            "SELECT sealed_epoch, sealed_since_ms, last_cancelled_epoch
-               FROM activation_seal WHERE singleton = 1"
-        ),
+        sql!("SELECT epoch, sealed FROM activation_seal WHERE singleton = 1"),
         [],
         |row| {
             Ok(ActivationSealRecord {
-                sealed_epoch: row.get::<_, Option<SqliteU64>>(0)?.map(|epoch| epoch.0),
-                sealed_since_ms: row.get::<_, SqliteU64>(1)?.0,
-                last_cancelled_epoch: row.get::<_, Option<SqliteU64>>(2)?.map(|epoch| epoch.0),
+                epoch: row.get::<_, SqliteU64>(0)?.0,
+                sealed: row.get(1)?,
             })
         },
     )
     .optional()
 }
 
-/// Replace the row with `record`. A zero epoch, or an epoch or time above
-/// `i64::MAX`, fails without writing.
+/// Replace the row with `record`. A zero epoch, or one above `i64::MAX`,
+/// fails without writing.
 pub fn write_activation_seal(conn: &Connection, record: ActivationSealRecord) -> Result<()> {
     conn.execute(
         sql!(
-            "INSERT INTO activation_seal
-                 (singleton, sealed_epoch, sealed_since_ms, last_cancelled_epoch)
-             VALUES (1, ?1, ?2, ?3)
+            "INSERT INTO activation_seal (singleton, epoch, sealed)
+             VALUES (1, ?1, ?2)
              ON CONFLICT(singleton) DO UPDATE SET
-                 sealed_epoch = excluded.sealed_epoch,
-                 sealed_since_ms = excluded.sealed_since_ms,
-                 last_cancelled_epoch = excluded.last_cancelled_epoch"
+                 epoch = excluded.epoch,
+                 sealed = excluded.sealed"
         ),
-        params![
-            record.sealed_epoch.map(SqliteU64),
-            SqliteU64(record.sealed_since_ms),
-            record.last_cancelled_epoch.map(SqliteU64)
-        ],
+        params![SqliteU64(record.epoch), record.sealed],
     )?;
     Ok(())
 }
