@@ -13,24 +13,92 @@ use uuid::Uuid;
 
 use crate::StoredSandboxLifecycle;
 
+/// A placement row's `sandboxes.lifecycle`. A value
+/// [`StoredSandboxLifecycle`] doesn't recognize is still listed, as stored,
+/// because this history is how an operator finds a row the code can't
+/// classify.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NodePlacementLifecycle {
+    Stored(StoredSandboxLifecycle),
+    Unrecognized(String),
+}
+
+impl NodePlacementLifecycle {
+    /// The canonical stored form of a recognized value; an unrecognized one
+    /// as stored.
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Stored(lifecycle) => lifecycle.as_str(),
+            Self::Unrecognized(raw) => raw,
+        }
+    }
+
+    fn from_stored(raw: String) -> Self {
+        raw.parse()
+            .map_or_else(|_| Self::Unrecognized(raw), Self::Stored)
+    }
+}
+
 /// One placement row naming the node.
-#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NodePlacementRow {
     pub id: SandboxId,
-    pub lifecycle: String,
+    pub lifecycle: NodePlacementLifecycle,
     pub active_node_id: Option<NodeId>,
     pub target_node_id: Option<NodeId>,
 }
 
 /// A [`NodePlacementRow`] with the time its lifecycle last changed, for the
 /// newest-change-first order.
-#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NodePlacementChangeRow {
     pub id: SandboxId,
-    pub lifecycle: String,
+    pub lifecycle: NodePlacementLifecycle,
     pub active_node_id: Option<NodeId>,
     pub target_node_id: Option<NodeId>,
     pub lifecycle_changed_at: OffsetDateTime,
+}
+
+/// A [`NodePlacementRow`] as read, its lifecycle the column's text.
+#[derive(sqlx::FromRow)]
+struct PlacementRecord {
+    id: SandboxId,
+    lifecycle: String,
+    active_node_id: Option<NodeId>,
+    target_node_id: Option<NodeId>,
+}
+
+impl From<PlacementRecord> for NodePlacementRow {
+    fn from(record: PlacementRecord) -> Self {
+        Self {
+            id: record.id,
+            lifecycle: NodePlacementLifecycle::from_stored(record.lifecycle),
+            active_node_id: record.active_node_id,
+            target_node_id: record.target_node_id,
+        }
+    }
+}
+
+/// A [`NodePlacementChangeRow`] as read, its lifecycle the column's text.
+#[derive(sqlx::FromRow)]
+struct PlacementChangeRecord {
+    id: SandboxId,
+    lifecycle: String,
+    active_node_id: Option<NodeId>,
+    target_node_id: Option<NodeId>,
+    lifecycle_changed_at: OffsetDateTime,
+}
+
+impl From<PlacementChangeRecord> for NodePlacementChangeRow {
+    fn from(record: PlacementChangeRecord) -> Self {
+        Self {
+            id: record.id,
+            lifecycle: NodePlacementLifecycle::from_stored(record.lifecycle),
+            active_node_id: record.active_node_id,
+            target_node_id: record.target_node_id,
+            lifecycle_changed_at: record.lifecycle_changed_at,
+        }
+    }
 }
 
 /// What a node's placement history narrows to. An unset field matches every
@@ -74,7 +142,7 @@ pub async fn list_by_id(
     after: Option<SandboxId>,
     limit: i64,
 ) -> Result<Vec<NodePlacementRow>, sqlx::Error> {
-    sqlx::query_as(sql!(
+    let records: Vec<PlacementRecord> = sqlx::query_as(sql!(
         "SELECT id, lifecycle, active_node_id, target_node_id FROM (
             (SELECT id, lifecycle, active_node_id, target_node_id
              FROM sandboxes
@@ -97,7 +165,8 @@ pub async fn list_by_id(
     .bind(filter.lifecycle_binds())
     .bind(filter.changed_since)
     .fetch_all(executor)
-    .await
+    .await?;
+    Ok(records.into_iter().map(Into::into).collect())
 }
 
 /// The node's placement rows narrowed by `filter`, newest lifecycle change
@@ -111,7 +180,7 @@ pub async fn list_by_change(
     cursor: Option<NodePlacementChangeCursor>,
     limit: i64,
 ) -> Result<Vec<NodePlacementChangeRow>, sqlx::Error> {
-    sqlx::query_as(sql!(
+    let records: Vec<PlacementChangeRecord> = sqlx::query_as(sql!(
         "SELECT id, lifecycle, active_node_id, target_node_id, lifecycle_changed_at FROM (
             (SELECT id, lifecycle, active_node_id, target_node_id, lifecycle_changed_at
              FROM sandboxes
@@ -139,5 +208,6 @@ pub async fn list_by_change(
     .bind(filter.lifecycle_binds())
     .bind(filter.changed_since)
     .fetch_all(executor)
-    .await
+    .await?;
+    Ok(records.into_iter().map(Into::into).collect())
 }

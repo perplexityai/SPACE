@@ -2104,6 +2104,103 @@ async fn node_sandbox_history_filters_orders_and_pages_by_change() -> TestResult
     Ok(())
 }
 
+/// The store lists a lifecycle stored in another case or with surrounding
+/// whitespace in its canonical form, in both orders.
+#[tokio::test]
+async fn node_placements_list_a_stored_lifecycle_in_canonical_form() -> TestResult<()> {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let node_id = NodeId::new();
+    sqlx::query(sql!(
+        "INSERT INTO nodes (id, address, role) VALUES ($1, '127.0.0.6', 'worker')"
+    ))
+    .bind(node_id)
+    .execute(&db.pool)
+    .await?;
+    insert_history_rows(
+        &db.pool,
+        node_id,
+        " Started ",
+        true,
+        "2026-01-01T00:00:00Z",
+        1,
+    )
+    .await?;
+    let started = node_placements::NodePlacementLifecycle::Stored(StoredSandboxLifecycle::Live(
+        pplx_space_common_core::types::SandboxLifecycle::Started,
+    ));
+    let filter = NodePlacementFilter::default();
+
+    let by_id = node_placements::list_by_id(&db.pool, node_id, &filter, None, 10).await?;
+    let by_change = node_placements::list_by_change(&db.pool, node_id, &filter, None, 10).await?;
+    for lifecycle in by_id
+        .iter()
+        .map(|row| &row.lifecycle)
+        .chain(by_change.iter().map(|row| &row.lifecycle))
+    {
+        assert_eq!(lifecycle, &started);
+        assert_eq!(lifecycle.as_str(), "started");
+    }
+    assert_eq!((by_id.len(), by_change.len()), (1, 1));
+    Ok(())
+}
+
+/// A lifecycle the store doesn't recognize is listed as stored, and the rows
+/// around it on the page are still returned, in both orders.
+#[tokio::test]
+async fn node_placements_list_an_unrecognized_lifecycle_as_stored() -> TestResult<()> {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let node_id = NodeId::new();
+    sqlx::query(sql!(
+        "INSERT INTO nodes (id, address, role) VALUES ($1, '127.0.0.7', 'worker')"
+    ))
+    .bind(node_id)
+    .execute(&db.pool)
+    .await?;
+    insert_history_rows(&db.pool, node_id, "failed", true, "2026-01-01T00:00:00Z", 2).await?;
+    insert_history_rows(
+        &db.pool,
+        node_id,
+        "not-a-lifecycle",
+        false,
+        "2026-01-01T01:00:00Z",
+        1,
+    )
+    .await?;
+    insert_history_rows(&db.pool, node_id, "failed", true, "2026-01-01T02:00:00Z", 2).await?;
+    let unrecognized =
+        node_placements::NodePlacementLifecycle::Unrecognized("not-a-lifecycle".to_string());
+    let failed = node_placements::NodePlacementLifecycle::Stored(StoredSandboxLifecycle::Live(
+        pplx_space_common_core::types::SandboxLifecycle::Failed,
+    ));
+    let filter = NodePlacementFilter::default();
+
+    let by_id: Vec<_> = node_placements::list_by_id(&db.pool, node_id, &filter, None, 10)
+        .await?
+        .into_iter()
+        .map(|row| row.lifecycle)
+        .collect();
+    let by_change: Vec<_> = node_placements::list_by_change(&db.pool, node_id, &filter, None, 10)
+        .await?
+        .into_iter()
+        .map(|row| row.lifecycle)
+        .collect();
+    let expected = [
+        failed.clone(),
+        failed.clone(),
+        unrecognized,
+        failed.clone(),
+        failed,
+    ];
+    assert_eq!(by_id, expected);
+    assert_eq!(by_change, expected);
+    assert_eq!(by_id[2].as_str(), "not-a-lifecycle");
+    Ok(())
+}
+
 /// `AppState::from_pool` picks its substrate from the process environment, so
 /// the schedulability tests pin it to Direct and swap a Kubernetes substrate
 /// in where they need one. Returns false in the parent process.

@@ -1027,7 +1027,7 @@ pub(super) async fn list_node_sandboxes(
                         .into_iter()
                         .map(|row| node_store::NodeSandboxRow {
                             id: row.id,
-                            lifecycle: row.lifecycle,
+                            lifecycle: row.lifecycle.as_str().to_owned(),
                             active_node_id: row.active_node_id,
                             target_node_id: row.target_node_id,
                         })
@@ -1066,7 +1066,7 @@ pub(super) async fn list_node_sandboxes(
                 .into_iter()
                 .map(|row| NodeSandboxChangeEntry {
                     id: row.id,
-                    lifecycle: row.lifecycle,
+                    lifecycle: row.lifecycle.as_str().to_owned(),
                     active_node_id: row.active_node_id,
                     target_node_id: row.target_node_id,
                     lifecycle_changed_at: format_time(row.lifecycle_changed_at),
