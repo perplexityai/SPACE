@@ -1,4 +1,4 @@
-use pplx_space_common_core::types::{OrgId, SandboxOwnerSource, UserId};
+use pplx_space_accounts::{OrgId, SandboxOwnerSource, UserId};
 
 use axum::{
     Extension, Json,

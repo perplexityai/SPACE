@@ -376,7 +376,8 @@ fn reconcile_entry_skips_states_that_cannot_authorize_a_gateway() {
 }
 #[tokio::test]
 async fn activation_reconcile_hydrates_policy_before_runtime_identity_publication() {
-    use pplx_space_common_core::types::{NodeId, RouteGeneration, SandboxActivationAttemptId};
+    use pplx_space_accounts::NodeId;
+    use pplx_space_common_core::types::{RouteGeneration, SandboxActivationAttemptId};
     use tonic::Code;
 
     // Full suspend retains execution metadata, but clears the live route.

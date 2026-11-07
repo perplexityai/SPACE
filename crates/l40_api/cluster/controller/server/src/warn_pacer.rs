@@ -30,7 +30,7 @@
 //! reconciler already performed bounds the map by live cardinality, so it is
 //! part of this type's contract rather than each caller's habit.
 
-use pplx_space_common_core::types::NodeId;
+use pplx_space_accounts::NodeId;
 
 use std::time::Duration;
 

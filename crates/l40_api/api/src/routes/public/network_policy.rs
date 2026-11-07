@@ -6,7 +6,7 @@
 //! write contract.
 
 use crate::routes::public::error::database_error;
-use pplx_space_common_core::types::OrgId;
+use pplx_space_accounts::OrgId;
 
 use pplx_space_common_core::sql;
 

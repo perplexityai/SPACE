@@ -1,4 +1,5 @@
-use pplx_space_common_core::types::{NodeId, SandboxId, SnapshotId, SnapshotKind, SnapshotState};
+use pplx_space_accounts::NodeId;
+use pplx_space_common_core::types::{SandboxId, SnapshotId, SnapshotKind, SnapshotState};
 
 use std::time::Duration;
 

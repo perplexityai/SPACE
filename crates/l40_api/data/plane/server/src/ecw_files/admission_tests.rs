@@ -8,7 +8,8 @@ use crate::upload_admission::{
 };
 use crate::{ECW_ENVD_PORT, EcwHostConfig};
 use axum::http::Request;
-use pplx_space_common_core::types::{OrgId, SandboxId};
+use pplx_space_accounts::OrgId;
+use pplx_space_common_core::types::SandboxId;
 use std::{
     convert::Infallible,
     num::{NonZeroU64, NonZeroUsize},

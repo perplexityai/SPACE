@@ -25,8 +25,9 @@
 //!   `managed_by = 'space'` is not listed and its apply refuses.
 //! - T2 `t2_live_tick_repairs`
 
+use pplx_space_accounts::NodeId;
 use pplx_space_common_core::types::LocalArtifactId;
-use pplx_space_common_core::types::{NodeId, SandboxId, SnapshotId};
+use pplx_space_common_core::types::{SandboxId, SnapshotId};
 
 use std::time::Duration;
 

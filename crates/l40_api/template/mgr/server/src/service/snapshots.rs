@@ -1,6 +1,6 @@
 use super::*;
 mod retry_backoff;
-use pplx_space_common_core::types::TEMPLATE_MANAGER_SANDBOX_OWNER;
+use pplx_space_accounts::TEMPLATE_MANAGER_SANDBOX_OWNER;
 pub(super) use retry_backoff::RetryBackoff;
 
 pub(super) struct BuildBaseSnapshotArgs<'a> {

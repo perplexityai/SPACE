@@ -1,7 +1,8 @@
 //! Postgres behaviors for the evidence the resume- and start-time runtime
 //! upgrade is decided from (`store/runtime_upgrade.rs`).
 
-use pplx_space_common_core::types::{LocalArtifactId, NodeId, SandboxId, SnapshotId};
+use pplx_space_accounts::NodeId;
+use pplx_space_common_core::types::{LocalArtifactId, SandboxId, SnapshotId};
 
 use super::*;
 use pplx_space_db_test_fixtures::SEED_ORG_ID;

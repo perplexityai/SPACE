@@ -17,7 +17,8 @@ pub use pplx_space_file_io::fs::{
     decrypted_sibling, encrypt_file_blocking, encrypt_stream_blocking, encrypted_sibling,
 };
 
-use pplx_space_common_core::types::{OrgId, SandboxId};
+use pplx_space_accounts::OrgId;
+use pplx_space_common_core::types::SandboxId;
 
 use crate::artifact::ArtifactEntryRole;
 

@@ -30,9 +30,10 @@
 //! (`*_query`) are public only because the drain's Postgres tests run them
 //! directly. Production code calls the function here that binds each one.
 
+use pplx_space_accounts::NodeId;
 use pplx_space_common_core::types::{
-    ArtifactKind, ArtifactOrigin, LocalArtifactId, NodeDrainMode, NodeDrainPhase, NodeId,
-    PositiveDuration, SandboxId, SandboxLifecycle,
+    ArtifactKind, ArtifactOrigin, LocalArtifactId, NodeDrainMode, NodeDrainPhase, PositiveDuration,
+    SandboxId, SandboxLifecycle,
 };
 
 use std::sync::LazyLock;

@@ -7,8 +7,9 @@
 
 use std::sync::LazyLock;
 
+use pplx_space_accounts::NodeId;
 use pplx_space_common_core::sql;
-use pplx_space_common_core::types::{NodeId, SandboxId, SandboxTransitionTargetState};
+use pplx_space_common_core::types::{SandboxId, SandboxTransitionTargetState};
 use pplx_space_sandbox_portability::restore_retry_suspended_revert_snapshot_exists;
 
 /// Converge a sandbox whose node rolled back an activation to the receipt's

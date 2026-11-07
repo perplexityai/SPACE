@@ -1,4 +1,5 @@
-use pplx_space_common_core::types::{NodeId, SandboxId};
+use pplx_space_accounts::NodeId;
+use pplx_space_common_core::types::SandboxId;
 
 use std::collections::{BTreeMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -774,7 +775,7 @@ async fn disabled_loop_never_touches_the_sink() {
 
 mod postgres {
 
-    use pplx_space_common_core::types::NodeId;
+    use pplx_space_accounts::NodeId;
     use pplx_space_db_test_fixtures::{
         SEED_ORG_ID as SEEDED_ORG_ID, SEED_USER_ID as SEEDED_USER_ID, try_pg_test_db,
     };

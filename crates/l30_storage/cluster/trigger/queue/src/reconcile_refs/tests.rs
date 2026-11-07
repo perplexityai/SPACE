@@ -1,4 +1,5 @@
-use pplx_space_common_core::{sql, types::NodeId};
+use pplx_space_accounts::NodeId;
+use pplx_space_common_core::sql;
 use pplx_space_db_test_fixtures::{insert_ready_worker_node, pg_test_db};
 use sqlx::PgPool;
 use uuid::Uuid;

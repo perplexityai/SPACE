@@ -2,7 +2,7 @@ use super::*;
 use crate::{
     builder::BuilderApiService, proto::worker_api_server::WorkerApi, worker::WorkerApiService,
 };
-use pplx_space_common_core::types::NodeId;
+use pplx_space_accounts::NodeId;
 use pplx_space_common_grpc::trace_grpc_client_transport as wrap_grpc_client_channel;
 use std::{
     marker::PhantomData,

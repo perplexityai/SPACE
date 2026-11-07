@@ -1,4 +1,5 @@
-use pplx_space_common_core::types::{NodeId, NodeRole};
+use pplx_space_accounts::NodeId;
+use pplx_space_common_core::types::NodeRole;
 
 use super::{space_k8s_node_id, space_node_id};
 

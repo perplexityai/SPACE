@@ -3,10 +3,11 @@ use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
 
+use pplx_space_accounts::SandboxOwner;
 use pplx_space_common_core::port_exposure_signals::{
     EXPOSE_TERMINAL_REASON_METADATA_KEY, EXPOSE_TERMINAL_REASON_STALE_POD_NETNS,
 };
-use pplx_space_common_core::types::{SandboxId, SandboxOwner, SemVer};
+use pplx_space_common_core::types::{SandboxId, SemVer};
 use pplx_space_net_common::proto::{
     NetworkPolicyApplyDecision, NetworkPolicySource, NetworkPolicyV1 as ProtoNetworkPolicyV1,
 };

@@ -44,8 +44,9 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::str::FromStr;
 
+use pplx_space_accounts::UserId;
 use pplx_space_common_core::sql;
-use pplx_space_common_core::types::{DigestParseError, EnvironmentReference, UserId};
+use pplx_space_common_core::types::{DigestParseError, EnvironmentReference};
 
 mod write;
 

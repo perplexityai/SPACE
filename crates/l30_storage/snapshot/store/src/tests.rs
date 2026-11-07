@@ -5,10 +5,11 @@ use super::{
     record_artifact_digests,
 };
 use jiff::Timestamp;
+use pplx_space_accounts::{NodeId, OrgId};
 use pplx_space_common_core::sql;
 use pplx_space_common_core::types::{
     Arch, ArtifactKind, ArtifactOrigin, Digest, ExactStorageUri, ExecutionGeneration,
-    ExecutionMetadata, HostCpu, LocalArtifactId, NodeId, OrgId, SandboxId,
+    ExecutionMetadata, HostCpu, LocalArtifactId, SandboxId,
     SnapshotArtifact as SnapshotArtifactFile, SnapshotContentHash, SnapshotExecutionMetadata,
     SnapshotId, SnapshotKind, SnapshotName, SnapshotState, TemplateArtifactDigest, TemplateName,
 };

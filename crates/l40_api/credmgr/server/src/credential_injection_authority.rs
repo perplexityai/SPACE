@@ -16,10 +16,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use pplx_space_common_core::{
-    types::CredentialReferenceId, types::ExecutionGeneration, types::K8sNodeUid, types::NodeId,
-    types::SandboxId,
-};
+use pplx_space_accounts::{CredentialReferenceId, NodeId};
+use pplx_space_common_core::types::{ExecutionGeneration, K8sNodeUid, SandboxId};
 use pplx_space_credential_injection::proto::ResolvedNetworkCredential;
 use pplx_space_credential_injection_store::references::ReferenceState;
 use pplx_space_net_common::EffectiveNetworkPolicyRef;

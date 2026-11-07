@@ -11,7 +11,7 @@
 
 use crate::credential_provider::{DestinationMatcher, ResolutionError};
 use futures_util::future::try_join_all;
-use pplx_space_common_core::types::CredentialReferenceId;
+use pplx_space_accounts::CredentialReferenceId;
 use pplx_space_credential_injection::proto::ResolvedNetworkCredential;
 use pplx_space_credential_injection::validation::ValidatedCredentialReference;
 use uuid::Uuid;

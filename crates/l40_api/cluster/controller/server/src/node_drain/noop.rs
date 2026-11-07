@@ -13,7 +13,7 @@
 //! those side effects is the operator's (or test harness's)
 //! responsibility — typically a `kubectl uncordon` after the test.
 
-use pplx_space_common_core::types::NodeId;
+use pplx_space_accounts::NodeId;
 
 use super::{InstanceTerminator, TerminateError};
 

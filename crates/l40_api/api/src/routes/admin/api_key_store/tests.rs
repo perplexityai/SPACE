@@ -1,6 +1,6 @@
 use super::*;
 use crate::auth::hash_token;
-use pplx_space_common_core::types::{OrgId, UserId};
+use pplx_space_accounts::{OrgId, UserId};
 
 use crate::routes::admin::test_fixtures::{TestResult, postgres_fixture};
 

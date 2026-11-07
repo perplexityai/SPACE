@@ -15,7 +15,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use pplx_space_common_core::types::NodeId;
+use pplx_space_accounts::NodeId;
 
 use super::{SandboxManagerService, SandboxManagerServiceOptions};
 

@@ -1,7 +1,8 @@
 use super::store::{ActivationFenceOwnership, ActiveExecutionStatusRow};
 use super::*;
 use crate::controllers::substrate::PooledExecutionClaim;
-use pplx_space_common_core::types::{NodeId, PodUid, SandboxActivationAttemptId, SandboxLifecycle};
+use pplx_space_accounts::NodeId;
+use pplx_space_common_core::types::{PodUid, SandboxActivationAttemptId, SandboxLifecycle};
 use uuid::Uuid;
 
 pub(super) fn k8s_execution_route_identity(

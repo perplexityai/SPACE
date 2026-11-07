@@ -6,8 +6,7 @@
 //! the ID parse error from `pplx-space-job-id`.
 //!
 //! They are their own crate so that code can name them without depending on
-//! `pplx-space-common-core`. `pplx-space-common-core` re-exports them from
-//! `types::auth` and `types::federated_identity`.
+//! `pplx-space-common-core`.
 
 pub mod auth;
 pub mod federated_identity;

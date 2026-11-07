@@ -192,7 +192,7 @@ impl SandboxManagerService {
     pub(super) async fn stop_firmware_guest(
         &self,
         id: &str,
-        job_id: Option<&pplx_space_common_core::types::JobId>,
+        job_id: Option<&pplx_space_accounts::JobId>,
         force: bool,
     ) -> Result<ShutdownOutcome, Status> {
         if force {

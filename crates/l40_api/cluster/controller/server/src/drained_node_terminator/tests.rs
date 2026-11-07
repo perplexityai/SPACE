@@ -47,7 +47,7 @@
 //! - W1 `w1_refusal_warn_rate_limited_per_node`
 //! - W2 `w2_refusal_warn_state_pruned_when_node_leaves_drained_list`
 
-use pplx_space_common_core::types::NodeId;
+use pplx_space_accounts::NodeId;
 use pplx_space_common_core::types::SandboxId;
 
 use std::collections::HashMap;

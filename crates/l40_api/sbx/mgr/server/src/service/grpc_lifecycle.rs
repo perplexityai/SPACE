@@ -1,4 +1,5 @@
-use pplx_space_common_core::types::{JobId, LocalArtifactId};
+use pplx_space_accounts::JobId;
+use pplx_space_common_core::types::LocalArtifactId;
 
 use super::activation_support::{
     GuestActivityKind, IdentityFreeDirectActivationAuthority, WakeNetworkContext, WakeStartConfig,

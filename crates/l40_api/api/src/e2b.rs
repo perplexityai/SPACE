@@ -318,9 +318,9 @@ pub mod schema {
     pub enum SandboxOwnershipE2b {
         Local,
         FederatedIdentity {
-            issuer: pplx_space_common_core::types::UpstreamIssuer,
+            issuer: pplx_space_accounts::UpstreamIssuer,
             #[serde(rename = "orgID")]
-            org_id: pplx_space_common_core::types::UpstreamOrgId,
+            org_id: pplx_space_accounts::UpstreamOrgId,
         },
     }
 

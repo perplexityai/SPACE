@@ -26,7 +26,7 @@
 //! (`cleanup_runtime_artifacts`), which sweeps the `sbxroot-*` /
 //! `sbxvol-*` dm devices without needing a caller.
 
-use pplx_space_common_core::types::OrgId;
+use pplx_space_accounts::OrgId;
 
 use std::path::{Component, Path, PathBuf};
 

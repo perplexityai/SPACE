@@ -17,7 +17,7 @@
 //!   and which heartbeat can't reliably detect (many live k8s nodes carry a
 //!   `NULL` heartbeat).
 
-use pplx_space_common_core::types::NodeId;
+use pplx_space_accounts::NodeId;
 
 use std::sync::Arc;
 use std::time::Duration;

@@ -1,4 +1,4 @@
-use pplx_space_common_core::types::{OrgId, UserId};
+use pplx_space_accounts::{OrgId, UserId};
 
 use crate::metrics::operations::InlineAdmissionPath;
 use axum::{

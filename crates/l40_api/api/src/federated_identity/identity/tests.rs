@@ -1,8 +1,6 @@
 use super::*;
-use pplx_space_common_core::{
-    sql,
-    types::{UpstreamIssuer, UpstreamOrgId, UpstreamSubjectId},
-};
+use pplx_space_accounts::{UpstreamIssuer, UpstreamOrgId, UpstreamSubjectId};
+use pplx_space_common_core::sql;
 use pplx_space_db_test_fixtures::pg_test_db;
 use pplx_space_test_env::TestResult;
 

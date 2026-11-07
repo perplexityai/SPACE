@@ -61,7 +61,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::metrics::node_group_placement as metrics;
 use k8s_openapi::api::core::v1::Node;
-use pplx_space_common_core::types::{NodeGroup, OrgId, TemplateVisibility};
+use pplx_space_accounts::OrgId;
+use pplx_space_common_core::types::{NodeGroup, TemplateVisibility};
 use pplx_space_sandbox_pod::{
     NodeGroupPlacement, NodeGroupPlacementError, SANDBOX_NODE_GROUP_PLACEMENT_ENV, node_group_label,
 };

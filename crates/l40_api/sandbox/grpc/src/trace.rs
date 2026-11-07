@@ -1,6 +1,5 @@
-use pplx_space_common_core::types::{
-    ExecutionGeneration, GuestPort, NodeId, RouteGeneration, SandboxId,
-};
+use pplx_space_accounts::NodeId;
+use pplx_space_common_core::types::{ExecutionGeneration, GuestPort, RouteGeneration, SandboxId};
 use pplx_space_common_grpc::{ClientSpanFields, RecordClientSpan};
 
 /// Parsed request/runtime identity for independently exported RPC spans.

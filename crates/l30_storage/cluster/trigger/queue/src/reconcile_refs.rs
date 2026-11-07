@@ -2,7 +2,8 @@
 //! after the trigger for that node fires, each with the trace context of the
 //! writer that asked for it.
 
-use pplx_space_common_core::{sql, types::NodeId};
+use pplx_space_accounts::NodeId;
+use pplx_space_common_core::sql;
 
 /// What an enqueue does to a ref that is already queued on the node.
 ///

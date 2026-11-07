@@ -1,4 +1,4 @@
-use pplx_space_common_core::types::{NodeId, OrgId};
+use pplx_space_accounts::{NodeId, OrgId};
 
 use pplx_space_common_core::sql;
 use std::collections::HashMap;

@@ -9,8 +9,9 @@
 //! the same names belong to `pplx-space-sbx-mgr-store`, not here. The fragments
 //! stay here until store functions for these tables replace them.
 
+use pplx_space_accounts::NodeId;
 use pplx_space_common_core::sql;
-use pplx_space_common_core::types::{NodeId, SandboxId};
+use pplx_space_common_core::types::SandboxId;
 use sqlx::FromRow;
 use time::OffsetDateTime;
 use uuid::Uuid;

@@ -21,6 +21,7 @@ tracing = { workspace = true }
 uuid = { workspace = true, features = ["serde"] }
 
 # internal
+pplx-space-accounts = { workspace = true, features = ["serde"] }
 pplx-space-common-core = { workspace = true, features = ["serde"] }
 pplx-space-env-vars = { workspace = true }
 pplx-space-policy-authority = { workspace = true }

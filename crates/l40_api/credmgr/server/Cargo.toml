@@ -19,6 +19,7 @@ datadog = ["otel", "pplx-space-observability/datadog"]
 datadog-otel = ["otel", "datadog"]
 
 [dependencies]
+pplx-space-accounts = { workspace = true, features = ["serde"] }
 pplx-space-common-core = { workspace = true, features = ["serde", "sqlx"] }
 aes-gcm = { workspace = true }
 async-trait = { workspace = true }

@@ -15,7 +15,8 @@
 //! that true, and running both statements over one fixture is what proves the
 //! sharing is real rather than two agreeing restatements.
 
-use pplx_space_common_core::types::{NodeId, SandboxId};
+use pplx_space_accounts::NodeId;
+use pplx_space_common_core::types::SandboxId;
 
 use pplx_space_sandbox_residency::CENSUS_PLACEMENT_SETTLE;
 use pplx_space_sandbox_store::StoredSandboxLifecycle;

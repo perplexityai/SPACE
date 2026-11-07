@@ -39,8 +39,9 @@
 use std::{collections::BTreeMap, str::FromStr};
 
 use oci_spec::distribution::Reference as OciReference;
+use pplx_space_accounts::OrgId;
 use pplx_space_build_mgr_client::proto as build_proto;
-use pplx_space_common_core::types::{OrgId, TemplateName, TemplateReference, TemplateSelector};
+use pplx_space_common_core::types::{TemplateName, TemplateReference, TemplateSelector};
 
 use super::state::TemplateBuildState;
 use super::wire::{TemplateBuildStartV2, TemplateStep};

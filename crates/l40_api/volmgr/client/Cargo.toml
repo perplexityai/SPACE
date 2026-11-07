@@ -22,6 +22,7 @@ tonic-prost = { workspace = true }
 tower = { workspace = true }
 
 # internal
+pplx-space-accounts = { workspace = true, features = ["serde"] }
 pplx-space-common-core = { workspace = true, features = ["serde"] }
 pplx-space-common-grpc = { workspace = true }
 pplx-space-host-layout = { workspace = true }

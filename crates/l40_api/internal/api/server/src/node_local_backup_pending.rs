@@ -158,11 +158,11 @@ use crate::metrics::internal_api::{
     local_backup_queue_depth, local_backup_queue_reconcile, local_backup_queue_removed,
     local_backup_queue_unknown_sandbox,
 };
+use pplx_space_accounts::NodeId;
 use pplx_space_common_core::{
     sql,
     types::{
-        ArtifactKind, LocalArtifactId, LocalArtifactIdParseError, NodeId, SandboxId,
-        SandboxIdParseError,
+        ArtifactKind, LocalArtifactId, LocalArtifactIdParseError, SandboxId, SandboxIdParseError,
     },
 };
 use pplx_space_sandbox_portability::{

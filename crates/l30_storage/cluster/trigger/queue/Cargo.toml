@@ -19,6 +19,7 @@ time = { workspace = true }
 uuid = { workspace = true, features = ["v7"] }
 
 # internal
+pplx-space-accounts = { workspace = true, features = ["sqlx"] }
 pplx-space-common-core = { workspace = true, features = ["sqlx"] }
 pplx-space-metrics-emit = { workspace = true }
 pplx-space-observability = { workspace = true, default-features = false }

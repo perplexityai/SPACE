@@ -4,8 +4,9 @@ use clap::{Parser, Subcommand, ValueEnum};
 use std::fmt::Write as _;
 
 use comfy_table::{Table, presets::NOTHING};
+use pplx_space_accounts::JobId;
 use pplx_space_common_core::types::{
-    ArtifactComponentKind as ComponentKind, ArtifactVersion, Digest, JobId, RuntimeKind as Runtime,
+    ArtifactComponentKind as ComponentKind, ArtifactVersion, Digest, RuntimeKind as Runtime,
     RuntimeVersion,
 };
 use pplx_space_node_runtime_manager_client::execution::{ArtifactComponentKind, RuntimeKind};

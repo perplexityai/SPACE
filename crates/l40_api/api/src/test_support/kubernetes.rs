@@ -12,8 +12,9 @@ use std::sync::{Arc, Mutex};
 
 use axum::http::{Method, StatusCode};
 use k8s_openapi::api::core::v1::Pod;
+use pplx_space_accounts::NodeId;
 use pplx_space_common_core::sql;
-use pplx_space_common_core::types::{NodeId, NodeManagedBy, SandboxId};
+use pplx_space_common_core::types::{NodeManagedBy, SandboxId};
 use pplx_space_node_api_sim::{SandboxRecord, SimState, SimWorkerHarness};
 use pplx_space_test_env::TestResult;
 use sqlx::PgPool;

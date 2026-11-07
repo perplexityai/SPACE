@@ -1,5 +1,5 @@
+use pplx_space_accounts::{OrgId, UserId};
 use pplx_space_common_core::types::NodeGroupId;
-use pplx_space_common_core::types::{OrgId, UserId};
 
 use pplx_space_observability::test_capture::{CapturedEvent, CapturedEventsLayer, field_value};
 use tracing_subscriber::layer::SubscriberExt;
@@ -47,7 +47,7 @@ fn system_node_group_entry_matches_the_operator_field_shape() {
         display_name: "operator".to_string(),
         org_id: OrgId::new(),
         role: UserRole::OrganizationAdmin,
-        owner_source: pplx_space_common_core::types::SandboxOwnerSource::Local,
+        owner_source: pplx_space_accounts::SandboxOwnerSource::Local,
         created_at: OffsetDateTime::UNIX_EPOCH,
         updated_at: OffsetDateTime::UNIX_EPOCH,
     };

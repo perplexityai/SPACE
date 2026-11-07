@@ -7,8 +7,9 @@
 
 use std::time::Duration;
 
+use pplx_space_accounts::NodeId;
 use pplx_space_common_core::sql;
-use pplx_space_common_core::types::{NodeId, SandboxId};
+use pplx_space_common_core::types::SandboxId;
 use pplx_space_db_test_fixtures::{insert_ready_worker_node, pg_test_db_with_max_connections};
 use pplx_space_test_env::TestResult;
 use sqlx::types::Json;

@@ -2,7 +2,7 @@
 //! through each production caller: who owns `nodes.state`, and how a
 //! tombstone that commits mid-upsert rolls back every caller's transaction.
 
-use pplx_space_common_core::types::NodeId;
+use pplx_space_accounts::NodeId;
 use tokio_util::task::AbortOnDropHandle;
 
 use super::*;

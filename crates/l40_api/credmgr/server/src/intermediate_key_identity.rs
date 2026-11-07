@@ -14,7 +14,8 @@
 //! choose the freshest live grant directly. An org with no live grant sends
 //! none — the provider decides whether that is fatal.
 
-use pplx_space_common_core::{types::FederatedGrantAudience, types::OrgId, types::SandboxId};
+use pplx_space_accounts::{FederatedGrantAudience, OrgId};
+use pplx_space_common_core::types::SandboxId;
 use pplx_space_federated_grant_store::{
     FreshestLiveFederatedGrant, FreshestLiveFederatedGrantError, freshest_live_federated_grant,
     live_federated_grant_prefer_sandbox,

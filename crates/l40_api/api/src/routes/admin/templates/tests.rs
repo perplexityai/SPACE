@@ -1,5 +1,6 @@
-use pplx_space_common_core::types::{BuildRunId, NodeId};
-use pplx_space_common_core::types::{OrgId, UserId};
+use pplx_space_accounts::NodeId;
+use pplx_space_accounts::{OrgId, UserId};
+use pplx_space_common_core::types::BuildRunId;
 
 use super::*;
 use crate::public_template_operations::tests::{
@@ -200,7 +201,7 @@ async fn named_release_tag_moves_existing_release_into_warm_retention() -> TestR
         display_name: actor_display_name,
         org_id: OrgId::from_uuid(managing_org_id),
         role: crate::user_role::UserRole::OrganizationAdmin,
-        owner_source: pplx_space_common_core::types::SandboxOwnerSource::Local,
+        owner_source: pplx_space_accounts::SandboxOwnerSource::Local,
         created_at: time::OffsetDateTime::UNIX_EPOCH,
         updated_at: time::OffsetDateTime::UNIX_EPOCH,
     };
@@ -792,7 +793,7 @@ async fn a_fieldless_template_update_reaches_the_fanout_without_writing()
         display_name: "fieldless update probe".to_string(),
         org_id: OrgId::from_uuid(SEED_ORG_ID),
         role: crate::user_role::UserRole::OrganizationAdmin,
-        owner_source: pplx_space_common_core::types::SandboxOwnerSource::Local,
+        owner_source: pplx_space_accounts::SandboxOwnerSource::Local,
         created_at: OffsetDateTime::now_utc(),
         updated_at: OffsetDateTime::now_utc(),
     };
@@ -959,7 +960,7 @@ async fn a_contended_base_snapshot_reconcile_read_is_retryable()
         display_name: "reconcile read probe".to_string(),
         org_id: OrgId::from_uuid(SEED_ORG_ID),
         role: crate::user_role::UserRole::OrganizationAdmin,
-        owner_source: pplx_space_common_core::types::SandboxOwnerSource::Local,
+        owner_source: pplx_space_accounts::SandboxOwnerSource::Local,
         created_at: OffsetDateTime::now_utc(),
         updated_at: OffsetDateTime::now_utc(),
     };
@@ -1053,7 +1054,7 @@ async fn a_delete_after_a_failed_delete_operation_starts_a_replacement()
         display_name: "failed delete retry probe".to_string(),
         org_id: OrgId::from_uuid(SEED_ORG_ID),
         role: crate::user_role::UserRole::OrganizationAdmin,
-        owner_source: pplx_space_common_core::types::SandboxOwnerSource::Local,
+        owner_source: pplx_space_accounts::SandboxOwnerSource::Local,
         created_at: OffsetDateTime::now_utc(),
         updated_at: OffsetDateTime::now_utc(),
     };
@@ -1489,7 +1490,7 @@ fn template_admin() -> User {
         display_name: "template admin".to_string(),
         org_id: OrgId::from_uuid(SEED_ORG_ID),
         role: crate::user_role::UserRole::OrganizationAdmin,
-        owner_source: pplx_space_common_core::types::SandboxOwnerSource::Local,
+        owner_source: pplx_space_accounts::SandboxOwnerSource::Local,
         created_at: OffsetDateTime::now_utc(),
         updated_at: OffsetDateTime::now_utc(),
     }
@@ -1717,7 +1718,7 @@ async fn template_builds_list_reports_each_jobs_builder_status() -> TestResult {
         display_name: "Builds test".into(),
         org_id: managing_org_id,
         role: crate::user_role::UserRole::OrganizationAdmin,
-        owner_source: pplx_space_common_core::types::SandboxOwnerSource::Local,
+        owner_source: pplx_space_accounts::SandboxOwnerSource::Local,
         created_at: time::OffsetDateTime::UNIX_EPOCH,
         updated_at: time::OffsetDateTime::UNIX_EPOCH,
     };

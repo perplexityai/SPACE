@@ -6,10 +6,8 @@ use super::{
 };
 use crate::models::{Organization, User};
 use crate::user_role::UserRole;
-use pplx_space_common_core::{
-    sql,
-    types::{OrgId, SandboxOwnerSource, UserId},
-};
+use pplx_space_accounts::{OrgId, SandboxOwnerSource, UserId};
+use pplx_space_common_core::sql;
 use sqlx::PgPool;
 use time::OffsetDateTime;
 use uuid::Uuid;

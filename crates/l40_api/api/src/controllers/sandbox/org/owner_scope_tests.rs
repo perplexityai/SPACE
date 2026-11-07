@@ -1,6 +1,7 @@
-use pplx_space_common_core::types::{OrgId, SandboxId, UserId};
+use pplx_space_accounts::{OrgId, UserId};
+use pplx_space_common_core::types::SandboxId;
 
-use pplx_space_common_core::types::{UpstreamIssuer, UpstreamOrgId, UpstreamSubjectId};
+use pplx_space_accounts::{UpstreamIssuer, UpstreamOrgId, UpstreamSubjectId};
 use pplx_space_db_test_fixtures::{
     SEED_ORG_ID as LOCAL_ORG_ID, SEED_USER_ID as LOCAL_USER_ID, TestDb, pg_test_db,
 };
