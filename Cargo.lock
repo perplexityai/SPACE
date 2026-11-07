@@ -5419,24 +5419,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "pplx-space-common-grpc-lb"
-version = "0.8.1"
-dependencies = [
- "futures-util",
- "http 1.5.0",
- "k8s-openapi",
- "kube",
- "pplx-space-grpc-metrics",
- "pplx-space-observability",
- "thiserror 2.0.20",
- "tokio",
- "tokio-stream",
- "tonic",
- "tower",
- "tracing",
-]
-
-[[package]]
 name = "pplx-space-common-io"
 version = "0.8.1"
 dependencies = [
@@ -5948,6 +5930,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "pplx-space-grpc-lb"
+version = "0.8.1"
+dependencies = [
+ "futures-util",
+ "http 1.5.0",
+ "k8s-openapi",
+ "kube",
+ "pplx-space-grpc-metrics",
+ "pplx-space-observability",
+ "thiserror 2.0.20",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tower",
+ "tracing",
+]
+
+[[package]]
 name = "pplx-space-grpc-metrics"
 version = "0.8.1"
 dependencies = [
@@ -6435,9 +6435,9 @@ dependencies = [
  "pplx-space-build-mgr-client",
  "pplx-space-common-core",
  "pplx-space-common-grpc",
- "pplx-space-common-grpc-lb",
  "pplx-space-common-proto-build",
  "pplx-space-execution-common",
+ "pplx-space-grpc-lb",
  "pplx-space-net-common",
  "pplx-space-net-gateway-client",
  "pplx-space-node-mgr-client",

@@ -1,5 +1,5 @@
 [package]
-name = "pplx-space-common-grpc-lb"
+name = "pplx-space-grpc-lb"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
