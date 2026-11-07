@@ -8,7 +8,7 @@ license.workspace = true
 publish.workspace = true
 
 [package.metadata.space.state]
-postgres = ["sandboxes"]
+postgres = ["dead_node_dry_runs", "sandboxes"]
 
 [lints]
 workspace = true
