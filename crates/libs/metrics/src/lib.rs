@@ -22,6 +22,7 @@ pub mod cluster_reconciler;
 pub mod credmgr;
 pub mod data_plane;
 pub mod db;
+pub mod dead_node;
 pub mod feature_flags;
 pub mod gateway;
 pub use pplx_space_grpc_metrics as grpc;

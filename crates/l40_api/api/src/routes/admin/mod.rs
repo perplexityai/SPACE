@@ -36,6 +36,7 @@ use crate::{
 mod api_key_store;
 mod api_keys;
 pub mod audit;
+mod dead_node_dry_runs;
 mod docs;
 mod identity;
 mod node_group_store;
@@ -153,6 +154,10 @@ pub fn v1_router(state: AppState) -> Router<AppState> {
         .route(
             "/nodes/{node_id}/templates/{template_name}",
             axum::routing::delete(node_maintenance::delete_node_template),
+        )
+        .route(
+            "/dead-node-dry-runs",
+            get(dead_node_dry_runs::list_dead_node_dry_runs),
         )
         .route("/operations", get(operations::list_admin_operations))
         .route(

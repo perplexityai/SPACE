@@ -1602,6 +1602,138 @@ class NodeDrainControl(NodeFaultControl, Protocol):
 
 
 @dataclass(frozen=True)
+class DeadNodeDryRun:
+    """One node's entry in `GET /admin/api/v1/dead-node-dry-runs`.
+
+    `observed_at` is when the controller wrote the entry, by the database
+    clock. `counts` maps each outcome to its row count; `samples` maps it to
+    the sandbox ids the route lists for it.
+    """
+
+    node_id: str
+    observed_at: datetime
+    verdict: str
+    reason: str
+    rows_truncated: bool
+    counts: Mapping[str, int]
+    samples: Mapping[str, tuple[str, ...]]
+
+
+@dataclass(frozen=True)
+class SandboxRowState:
+    """The `sandboxes` columns a dead-node write would change, and `updated_at`.
+
+    `updated_at` is trigger-maintained: an update that changes any column
+    other than `last_used_at`, `last_access_at` and `last_command_at` moves it.
+    """
+
+    sandbox_id: str
+    lifecycle: str
+    placement: str
+    active_node_id: str | None
+    target_node_id: str | None
+    updated_at: str
+
+
+class DeadNodeControl(NodeDrainControl, Protocol):
+    """Kind-only operations for the dead-node dry-run scenario.
+
+    The verb ships off and reads its config at startup, so the scenario
+    overrides the cluster-controller Deployment's `SPACE_DEAD_NODE_*` env
+    (closed key list, closed value vocabulary) under the controller-mutation
+    Lease, and puts the captured standing values back. The node fault is
+    named: stop one Kind worker's container and delete its Kubernetes Node,
+    then start the container again, which re-registers the Node. The
+    observables are the admin dry-run route and the sandbox rows.
+    """
+
+    def acquire_controller_mutation(self) -> Callable[[], None]:
+        """Take the cluster-visible controller-deployment Lease; returns its release."""
+        ...
+
+    def dead_node_env(self) -> dict[str, str | None]:
+        """The literal value of every dead-node env key on the controller Deployment."""
+        ...
+
+    def set_dead_node_env(self, overrides: Mapping[str, str]) -> None:
+        """Apply smoke overrides and await the controller rollout; refuses keys or values off the lists."""
+        ...
+
+    def restore_dead_node_env(self, standing: Mapping[str, str | None]) -> None:
+        """Put the captured literals back (None unsets) and await the controller rollout."""
+        ...
+
+    def dead_node_dry_runs(self) -> list[DeadNodeDryRun]:
+        """`GET /admin/api/v1/dead-node-dry-runs`."""
+        ...
+
+    def database_now(self) -> datetime:
+        """The stack's Postgres `NOW()`, the clock `observed_at` is stamped with."""
+        ...
+
+    def sandbox_worker_nodes(self) -> list[str]:
+        """The kube nodes of the sandbox worker pool."""
+        ...
+
+    def node_stack_pods(self, node_name: str) -> list[str]:
+        """`namespace/name` of every SPACE pod on the kube node that no DaemonSet
+        owns and that is not a sandbox pod: what stopping the node would take
+        down. Kubernetes' own replicated system pods are rescheduled once the
+        Node is deleted, so they are not listed."""
+        ...
+
+    def kind_node_labels(self, node_name: str) -> dict[str, str]:
+        """The Kind worker's Node labels, which deleting the Node discards."""
+        ...
+
+    def stop_kind_worker(self, node_name: str) -> None:
+        """Stop the Kind worker's container, then delete its Kubernetes Node."""
+        ...
+
+    def start_kind_worker(
+        self, node_name: str, labels: Mapping[str, str], *, timeout: float
+    ) -> None:
+        """Start the Kind worker's container, put back the `labels` its
+        re-registered Node lacks as soon as it exists, then wait, each with
+        the whole `timeout`, for the Node and the node services on it to be
+        Ready."""
+        ...
+
+    def native_sandbox_action(self, sandbox_id: str, action: str) -> str:
+        """`POST /v1/sandboxes/{id}:{action}` for `suspend`, `pause` or `stop`; the operation id."""
+        ...
+
+    def operation_state(self, operation_id: str) -> str: ...
+
+    def native_delete_sandbox(self, sandbox_id: str) -> None:
+        """`DELETE /v1/sandboxes/{id}`; an absent sandbox is success."""
+        ...
+
+    def restore_portable(self, sandbox_id: str) -> bool:
+        """The API's suspend-restore portability predicate for the sandbox."""
+        ...
+
+    def object_store_replicas(self) -> int: ...
+
+    def scale_object_store(self, replicas: int) -> int: ...
+
+    def wait_object_store_gone(self, *, timeout: float) -> None: ...
+
+    def wait_object_store_rollout(self, *, timeout: float) -> None: ...
+
+    def sandbox_row_states(self, sandbox_ids: Sequence[str]) -> list[SandboxRowState]: ...
+
+    def snapshot_states(self, sandbox_id: str) -> list[str]:
+        """The sandbox's full snapshots' states, oldest first."""
+        ...
+
+    def other_live_rows_on_node(self, node_id: str, sandbox_ids: Sequence[str]) -> list[str]:
+        """Ids of rows pinned to the node, outside `sandbox_ids`, that are not
+        `failed` or `deleted`."""
+        ...
+
+
+@dataclass(frozen=True)
 class StoppedResidency:
     """The `sandboxes` columns a stopped-resident evacuation moves.
 

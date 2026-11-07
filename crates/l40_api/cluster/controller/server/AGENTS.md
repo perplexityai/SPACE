@@ -17,8 +17,10 @@ Every table named here is in the control-plane Postgres store.
 - A new store that joins a credential-fenced `*_encrypted_fields` sidecar
   runs on the credentials pool, as the two snapshot sweepers do.
 - In dry-run, a loop classifies and reports through logs and dry-run-tagged
-  metrics only: no writes and no `space.sandbox` events. Existing exception:
-  `suspended_execution_reaper` emits its retire event tagged `dry_run`.
+  metrics only: no writes and no `space.sandbox` events. Existing exceptions:
+  `suspended_execution_reaper` emits its retire event tagged `dry_run`, and
+  `dead_node` keeps its last result per node in `dead_node_dry_runs` for the
+  admin API, which runs in another process.
 - Read a knob a deployment must change with a production `EnvConfig` reader
   (`src/env_config.rs`); its `test_*` readers return the default unless
   `test-hooks` is compiled in.

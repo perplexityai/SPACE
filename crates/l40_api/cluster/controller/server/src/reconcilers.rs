@@ -19,11 +19,13 @@ use pplx_space_cluster_pool::WarmPoolStore;
 use pplx_space_cluster_reconciler::{
     TriggerEndpointResolver, TriggerFanoutConfig, TriggerNodeApiTarget, metrics, trigger_fanout,
 };
+use pplx_space_common_core::types::SubstrateKind;
 use sqlx::PgPool;
 use tokio_util::sync::CancellationToken;
 
 use crate::admin_audit_retention;
 use crate::data_plane_session_retention;
+use crate::dead_node;
 use crate::drained_node_terminator;
 use crate::environment_edge_recompute;
 use crate::failed_restorable_repair;
@@ -137,6 +139,21 @@ impl TerminatorKind {
             Self::KubeDelete => "kube-delete",
             Self::Noop => "noop",
         }
+    }
+}
+
+/// The dead-node verb's instance authority for the cluster's terminator kind,
+/// `None` being a kind that did not parse: only `aws` asks EC2, unless the
+/// smoke-only test hook forces it, and a kind that names no authority judges
+/// every node unknown.
+fn dead_node_authority_kind(
+    terminator: Option<TerminatorKind>,
+    force_ec2: bool,
+) -> dead_node::AuthorityKind {
+    match (terminator, force_ec2) {
+        (_, true) | (Some(TerminatorKind::Aws), false) => dead_node::AuthorityKind::Ec2,
+        (Some(TerminatorKind::KubeDelete), false) => dead_node::AuthorityKind::KubeDelete,
+        (Some(TerminatorKind::Noop) | None, false) => dead_node::AuthorityKind::None,
     }
 }
 
@@ -403,6 +420,23 @@ pub async fn run_reconcilers(
     match substrate.as_kubernetes() {
         None => {
             tracing::info!("skipping Kubernetes-only reconcilers on direct substrate");
+            // Direct nodes have no Kubernetes Node or instance authority, so
+            // the dead-node verb judges every one of them unknown.
+            if let Some(dead_node_config) = dead_node::ReconcilerConfig::from_env() {
+                handles.push(tokio::spawn(dead_node::run(
+                    dead_node_config,
+                    dead_node::DeadNodeDbStore::new(pool.clone()),
+                    dead_node::NoNodeMembership,
+                    dead_node::InstanceAuthority::None,
+                    SubstrateKind::Space,
+                    shutdown_token.child_token(),
+                )));
+            } else {
+                tracing::info!(
+                    variable = dead_node::MODE_ENV,
+                    "dead-node verb is off; not starting it"
+                );
+            }
         }
         Some(kube) => {
             let kube = Arc::new(kube.clone());
@@ -793,6 +827,51 @@ pub async fn run_reconcilers(
                 tracing::info!(
                     "lost_started_sandboxes is disabled \
                      (SPACE_LOST_STARTED_SANDBOXES_ENABLED unset); skipping AWS SDK init"
+                );
+            }
+
+            // The dead-node verb reads the terminator kind only when it is on,
+            // so its default leaves startup exactly as it was; and a kind that
+            // does not parse judges every node unknown instead of failing it.
+            if let Some(dead_node_config) = dead_node::ReconcilerConfig::from_env() {
+                let terminator = match TerminatorKind::from_env() {
+                    Ok(kind) => Some(kind),
+                    Err(err) => {
+                        tracing::warn!(
+                            error = %err,
+                            "dead-node verb: SPACE_NODE_DRAIN_TERMINATOR_KIND is not recognized; \
+                             judging every node unknown"
+                        );
+                        None
+                    }
+                };
+                let authority =
+                    match dead_node_authority_kind(terminator, dead_node_config.force_ec2) {
+                        dead_node::AuthorityKind::Ec2 => {
+                            let aws_config =
+                                aws_config::load_defaults(aws_config::BehaviorVersion::latest())
+                                    .await;
+                            dead_node::InstanceAuthority::Ec2(Arc::new(
+                                pplx_space_aws_client::ec2::Client::from_config(&aws_config),
+                            ))
+                        }
+                        dead_node::AuthorityKind::KubeDelete => {
+                            dead_node::InstanceAuthority::KubeDelete
+                        }
+                        dead_node::AuthorityKind::None => dead_node::InstanceAuthority::None,
+                    };
+                handles.push(tokio::spawn(dead_node::run(
+                    dead_node_config,
+                    dead_node::DeadNodeDbStore::new(pool.clone()),
+                    dead_node::KubeNodeMembership::new(kube.clone()),
+                    authority,
+                    SubstrateKind::Kubernetes,
+                    shutdown_token.child_token(),
+                )));
+            } else {
+                tracing::info!(
+                    variable = dead_node::MODE_ENV,
+                    "dead-node verb is off; not starting it"
                 );
             }
 
