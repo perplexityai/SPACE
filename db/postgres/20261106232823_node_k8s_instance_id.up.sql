@@ -7,7 +7,8 @@ SET LOCAL statement_timeout = '5s';
 -- region, account or name, and a same-IP replacement reuses the node id; an
 -- instance ID names exactly one instance. NULL means no report: providers
 -- other than AWS have no AWS providerID, and older writers don't send one. A
--- writer with no instance ID leaves a recorded one alone.
+-- writer with no instance ID leaves a recorded one alone, unless the Node's
+-- UID changed: a new Node names a new machine.
 --
 -- Adding a nullable column without a default changes the catalog only; no row
 -- is rewritten.

@@ -8,8 +8,8 @@ SET LOCAL statement_timeout = '5s';
 -- record: the epoch the node is sealed under, written in the transaction that
 -- starts the drain, and the node's last `DrainNode` report.
 --
--- Nullable with no default, backfill or index: nothing writes either column
--- yet, so every row stays NULL and every reader behaves as before. The CHECKs
+-- Nullable with no default, backfill or index: a row stays NULL until a v2
+-- drain starts on its node, so every existing reader behaves as before. The CHECKs
 -- are NOT VALID so adding them doesn't scan `nodes`; every existing row has
 -- both columns NULL, which satisfies them, and new writes are checked either
 -- way.
