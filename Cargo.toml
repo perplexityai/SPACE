@@ -92,6 +92,7 @@ members = [
     "crates/l30_storage/node/status/store",
     "crates/l30_storage/runtime/environment/policy/store",
     "crates/l20_domain/net/common",
+    "crates/l10_foundation/transparent/proxy/socket",
     "crates/l40_api/net/gateway/client",
     "crates/l20_domain/net/gateway/protocol",
     "crates/l40_api/net/gateway/server",
@@ -424,6 +425,7 @@ pplx-space-node-runtime-manager = { path = "crates/l40_api/node/runtime/manager/
 pplx-space-node-runtime-manager-client = { path = "crates/l40_api/node/runtime/manager/client" }
 pplx-space-node-runtime-supervisor = { path = "crates/l40_api/node/runtime/supervisor" }
 pplx-space-net-common = { path = "crates/l20_domain/net/common" }
+pplx-space-transparent-proxy-socket = { path = "crates/l10_foundation/transparent/proxy/socket" }
 pplx-space-object-store = { path = "crates/l10_foundation/object/store" }
 pplx-space-page-cache = { path = "crates/l10_foundation/page/cache" }
 pplx-space-postgres-contention = { path = "crates/l10_foundation/postgres/contention" }

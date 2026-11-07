@@ -13,8 +13,6 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::str::FromStr;
 use std::sync::OnceLock;
 
-#[cfg(feature = "host-sockets")]
-pub mod orig_dst;
 const DEFAULT_NETWORK_CREDENTIAL_PORT: u16 = 443;
 const MAX_NETWORK_CREDENTIAL_PATH_PREFIX_BYTES: usize = 2048;
 

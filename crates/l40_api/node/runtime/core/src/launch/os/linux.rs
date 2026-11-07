@@ -500,11 +500,11 @@ fn configure_pre_exec_socket(
     cfg: &PreExecSocket,
 ) -> Result<(), String> {
     if cfg.transparent {
-        pplx_space_net_common::orig_dst::set_ip_transparent(socket)
+        pplx_space_transparent_proxy_socket::set_ip_transparent(socket)
             .map_err(|e| format!("IP_TRANSPARENT: {e}"))?;
     }
     if cfg.recvorigdstaddr {
-        pplx_space_net_common::orig_dst::set_recvorigdstaddr(socket)
+        pplx_space_transparent_proxy_socket::set_recvorigdstaddr(socket)
             .map_err(|e| format!("IP_RECVORIGDSTADDR: {e}"))?;
     }
     clear_cloexec(socket)
