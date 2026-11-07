@@ -210,6 +210,7 @@ pub mod kube_delete;
 pub mod noop;
 #[cfg(feature = "kubernetes")]
 pub mod store;
+pub mod v2;
 
 #[cfg(test)]
 mod tests;

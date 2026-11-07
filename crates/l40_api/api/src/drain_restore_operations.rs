@@ -45,9 +45,11 @@ use crate::public_sandbox_projection::public_lifecycle_state;
 #[serde(deny_unknown_fields)]
 pub struct DrainRestoreOperationPayload {
     pub sandbox_id: PublicSandboxId,
-    /// The lifecycle to land the sandbox in, `started` or `paused`.
+    /// The lifecycle to land the sandbox in, `started`, `paused` or
+    /// `stopped`.
     pub target: String,
-    /// S, the suspend snapshot the drain left.
+    /// S, the suspend snapshot (or, toward `stopped`, the published disk) the
+    /// drain left.
     pub snapshot_id: Uuid,
 }
 
@@ -65,9 +67,69 @@ impl DrainRestoreOperationPayload {
     }
 }
 
-/// Enqueue a drain restore of `payload`'s sandbox, which `org_id` owns. Nothing
-/// in production enqueues one yet; tests do, through the same insert every
-/// operation in a sandbox's queue takes.
+/// Enqueue the drain restore of `payload`'s sandbox, which `org_id` owns, in
+/// the caller's transaction, unless one for the same sandbox and snapshot
+/// exists already, in any state: the drain's v2 loop calls this for every
+/// evacuation the node reports, on every tick and after a restart, and one
+/// restore per snapshot is all it means. The caller holds the sandbox's row
+/// lock, which orders two of these calls. Returns the operation and whether
+/// this call created it.
+pub async fn enqueue_drain_restore_once(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    org_id: pplx_space_common_core::types::OrgId,
+    payload: DrainRestoreOperationPayload,
+) -> Result<
+    (pplx_space_public_api::OperationId, bool),
+    crate::public_operations::PublicOperationStoreError,
+> {
+    use crate::public_operations::{
+        ApiProduct, CreatePublicOperation, CreatePublicOperationResult, create_operation_tx,
+    };
+    let target_id = payload.sandbox_id.to_string();
+    let existing: Option<Uuid> = sqlx::query_scalar(pplx_space_common_core::sql!(
+        "SELECT operation_id
+           FROM public_operations
+          WHERE kind = $1
+            AND target_id = $2
+            AND payload_json->>'snapshot_id' = $3
+          ORDER BY created_at
+          LIMIT 1"
+    ))
+    .bind(StoredOperationKind::DrainRestoreSandbox.as_str())
+    .bind(&target_id)
+    .bind(payload.snapshot_id.to_string())
+    .fetch_optional(&mut **tx)
+    .await?;
+    if let Some(operation_id) = existing {
+        return Ok((
+            pplx_space_public_api::OperationId::from_uuid(operation_id),
+            false,
+        ));
+    }
+    let (created, _) = create_operation_tx(
+        tx,
+        CreatePublicOperation {
+            org_id,
+            actor_user_id: None,
+            api_product: ApiProduct::Native,
+            kind: StoredOperationKind::DrainRestoreSandbox,
+            target_type: Some(pplx_space_public_api::OperationTargetType::Sandbox),
+            target_id: Some(&target_id),
+            payload_json: payload.into_json(),
+            idempotency: None,
+            traceparent: None,
+        },
+    )
+    .await?;
+    match created {
+        CreatePublicOperationResult::Created(operation_id) => Ok((operation_id, true)),
+        other => unreachable!("an insert without idempotency creates: {other:?}"),
+    }
+}
+
+/// Enqueue a drain restore of `payload`'s sandbox, which `org_id` owns, as
+/// tests do, through the same insert every operation in a sandbox's queue
+/// takes.
 #[cfg(any(test, feature = "test-hooks"))]
 pub async fn enqueue_drain_restore(
     pool: &PgPool,

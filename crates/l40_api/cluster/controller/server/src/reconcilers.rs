@@ -693,12 +693,35 @@ pub async fn run_reconcilers(
                     evacuates_stopped_residents,
                     node_drain_config.replace_stopped_evacuations,
                 );
+                // The v2 drain's loop, beside v1's: it acts only on the rows
+                // `:drain {engine: v2}` marked, which v1's writers skip, so
+                // with none it reads one empty list per tick.
+                let v2_sink = node_drain::SubstrateSink::new(
+                    pool.clone(),
+                    kube.clone(),
+                    residency_evidence,
+                    node_drain_config.termination_blocking_gate,
+                    evacuates_stopped_residents,
+                    node_drain_config.replace_stopped_evacuations,
+                );
+                let v2_tick = node_drain_config.tick;
+                let v2_token = shutdown_token.child_token();
                 match kind {
                     TerminatorKind::Aws => {
                         let aws_config =
                             aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
                         let autoscaling_client =
                             pplx_space_aws_client::autoscaling::Client::from_config(&aws_config);
+                        handles.push(tokio::spawn(node_drain::v2::run(
+                            v2_sink,
+                            node_drain::Ec2InstanceTerminator::new(
+                                pool.clone(),
+                                kube.k8s.client.clone(),
+                                autoscaling_client.clone(),
+                            ),
+                            v2_tick,
+                            v2_token,
+                        )));
                         let terminator = node_drain::Ec2InstanceTerminator::new(
                             pool.clone(),
                             kube.k8s.client.clone(),
@@ -727,6 +750,15 @@ pub async fn run_reconcilers(
                         )));
                     }
                     TerminatorKind::KubeDelete => {
+                        handles.push(tokio::spawn(node_drain::v2::run(
+                            v2_sink,
+                            node_drain::KubeNodeDeleteTerminator::new(
+                                pool.clone(),
+                                kube.k8s.client.clone(),
+                            ),
+                            v2_tick,
+                            v2_token,
+                        )));
                         let terminator = node_drain::KubeNodeDeleteTerminator::new(
                             pool.clone(),
                             kube.k8s.client.clone(),
@@ -740,6 +772,12 @@ pub async fn run_reconcilers(
                         )));
                     }
                     TerminatorKind::Noop => {
+                        handles.push(tokio::spawn(node_drain::v2::run(
+                            v2_sink,
+                            node_drain::NoopInstanceTerminator::new(),
+                            v2_tick,
+                            v2_token,
+                        )));
                         let terminator = node_drain::NoopInstanceTerminator::new();
                         handles.push(tokio::spawn(node_drain::run(
                             node_drain_config,
