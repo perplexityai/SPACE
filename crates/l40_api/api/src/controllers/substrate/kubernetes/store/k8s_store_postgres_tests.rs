@@ -9813,3 +9813,66 @@ async fn retired_pool_reserved_generation_moves_cold_create_past_the_pool_pod() 
     );
     Ok(())
 }
+
+/// The cancel-cleanup retirement probe reads only the execution that names the
+/// pod at its generation, and only an inactive one counts as retired. An active
+/// row (a newer activation attempt owns it), a different pod name, or a missing
+/// generation all read as not retired, so the cleanup leaves those pods alone.
+#[tokio::test]
+async fn execution_generation_retired_reads_only_an_inactive_row_naming_the_pod() -> TestResult {
+    let fixture = postgres_store().await?;
+    let sandbox_id = SandboxId::new();
+    insert_sandbox(&fixture.pool, sandbox_id, "creating").await?;
+    let pod_name = K8sStore::execution_pod_name(sandbox_id, 1);
+    sqlx::query(sql!(
+        "INSERT INTO sandbox_k8s_executions
+             (sandbox_id, generation, pod_name, pod_namespace, state, active)
+         VALUES ($1, 1, $2, 'space', 'creating', TRUE)"
+    ))
+    .bind(sandbox_id)
+    .bind(&pod_name)
+    .execute(&fixture.pool)
+    .await?;
+
+    assert!(
+        !fixture
+            .store
+            .execution_generation_retired(sandbox_id, 1, &pod_name)
+            .await?,
+        "an active execution is not retired"
+    );
+
+    // The control plane's activation-rollback receipt retires the row as
+    // `replaced` without touching the pod.
+    sqlx::query(sql!(
+        "UPDATE sandbox_k8s_executions
+            SET active = FALSE, state = 'replaced'
+          WHERE sandbox_id = $1 AND generation = 1"
+    ))
+    .bind(sandbox_id)
+    .execute(&fixture.pool)
+    .await?;
+
+    assert!(
+        fixture
+            .store
+            .execution_generation_retired(sandbox_id, 1, &pod_name)
+            .await?,
+        "a retired execution naming the pod reads retired"
+    );
+    assert!(
+        !fixture
+            .store
+            .execution_generation_retired(sandbox_id, 1, "some-other-pod")
+            .await?,
+        "a retired row that names a different pod does not vouch for this one"
+    );
+    assert!(
+        !fixture
+            .store
+            .execution_generation_retired(sandbox_id, 2, &pod_name)
+            .await?,
+        "a generation with no execution row is not retired"
+    );
+    Ok(())
+}

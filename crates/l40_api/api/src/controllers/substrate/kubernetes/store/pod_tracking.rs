@@ -411,6 +411,38 @@ impl K8sStore {
         .await
     }
 
+    /// Whether the execution that names `pod_name` at `generation` is already
+    /// retired (`active = FALSE`). A retired execution generation is final:
+    /// every activation assignment requires `active`, generations are
+    /// per-sandbox monotonic, and sandbox-manager refuses to start a retired
+    /// generation's runtime. So a pod whose execution row reads retired
+    /// belongs to no current or future runtime and is safe to delete under a
+    /// UID precondition. Returns `false` when no such row exists, so a pod the
+    /// store has no record of is never treated as retired.
+    pub(in crate::controllers::substrate::kubernetes) async fn execution_generation_retired(
+        &self,
+        sandbox_id: SandboxId,
+        generation: i64,
+        pod_name: &str,
+    ) -> Result<bool, SubstrateError> {
+        sqlx::query_scalar::<_, bool>(sql!(
+            "SELECT EXISTS (
+                 SELECT 1
+                   FROM sandbox_k8s_executions
+                  WHERE sandbox_id = $1
+                    AND generation = $2
+                    AND pod_name = $3
+                    AND NOT active
+             )"
+        ))
+        .bind(sandbox_id)
+        .bind(generation)
+        .bind(pod_name)
+        .fetch_one(&self.pool)
+        .await
+        .db_context("failed to read execution retirement")
+    }
+
     pub(in crate::controllers::substrate::kubernetes) async fn cleanup_replaced_pod_tracking_if_generation(
         &self,
         sandbox_id: SandboxId,
