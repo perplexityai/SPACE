@@ -1479,6 +1479,14 @@ type RecordedWake = (
 impl pplx_space_node_api_client::proto::worker_api_internal_server::WorkerApiInternal
     for RecordingInternalWorker
 {
+    async fn drain_node(
+        &self,
+        _request: tonic::Request<pplx_space_sbx_mgr_client::proto::DrainNodeRequest>,
+    ) -> Result<tonic::Response<pplx_space_sbx_mgr_client::proto::DrainNodeResponse>, tonic::Status>
+    {
+        Err(tonic::Status::unimplemented("not used by this test"))
+    }
+
     async fn get_runtime_upgrade(
         &self,
         _request: tonic::Request<pplx_space_sbx_mgr_client::proto::GetRuntimeUpgradeRequest>,

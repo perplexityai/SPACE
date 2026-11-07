@@ -104,6 +104,13 @@ impl SandboxManager for SandboxManagerService {
         SandboxManagerService::activation_seal_state(self, request).await
     }
 
+    async fn drain_node(
+        &self,
+        request: Request<crate::proto::DrainNodeRequest>,
+    ) -> Result<Response<crate::proto::DrainNodeResponse>, Status> {
+        SandboxManagerService::drain_node(self, request).await
+    }
+
     async fn list(&self, request: Request<ListRequest>) -> Result<Response<ListResponse>, Status> {
         SandboxManagerService::list(self, request).await
     }

@@ -122,4 +122,7 @@ service WorkerApiInternal {
   rpc AdoptPoolSandbox(space.sandbox.manager.v1.AdoptPoolSandboxRequest) returns (space.sandbox.manager.v1.AdoptPoolSandboxResponse);
   rpc WakeSandbox(space.sandbox.manager.v1.WakeRequest) returns (space.sandbox.manager.v1.WakeResponse);
   rpc GetRuntimeUpgrade(space.sandbox.manager.v1.GetRuntimeUpgradeRequest) returns (space.sandbox.manager.v1.GetRuntimeUpgradeResponse);
+  // Relays sandbox-manager's `DrainNode`, for the cluster controller's node
+  // drain.
+  rpc DrainNode(space.sandbox.manager.v1.DrainNodeRequest) returns (space.sandbox.manager.v1.DrainNodeResponse);
 }

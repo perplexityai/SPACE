@@ -1312,6 +1312,24 @@ impl WorkerApiInternal for WorkerApiService {
         require_policy_mutation_authority(&r)?;
         fwd_sbx!(self, "GetRuntimeUpgrade", get_runtime_upgrade, r)
     }
+
+    async fn drain_node(
+        &self,
+        r: Request<pplx_space_sbx_mgr_client::proto::DrainNodeRequest>,
+    ) -> Result<Response<pplx_space_sbx_mgr_client::proto::DrainNodeResponse>, Status> {
+        // Seals the node and evacuates it: only the control plane drains.
+        require_policy_mutation_authority(&r)?;
+        // Node-wide, so it takes no sandbox's permit; it changes the node's
+        // seal, so it is replayed only with proof it never reached
+        // sandbox-manager.
+        self.sbx_unary_with_handoff(
+            "DrainNode",
+            RpcReplaySafety::RequiresProof,
+            r,
+            |mut client, request| async move { client.drain_node(request).await },
+        )
+        .await
+    }
 }
 
 #[cfg(test)]

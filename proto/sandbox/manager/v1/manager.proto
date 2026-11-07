@@ -228,19 +228,40 @@ service SandboxManager {
 
   // Seal under `epoch`, then wait up to `wait_timeout` for the activation work
   // already in flight to finish. Sealing again under the current epoch changes
-  // nothing and only waits; sealing under another epoch while sealed replaces
-  // the epoch and starts a new seal. A restart of sandbox-manager ends the wait
+  // nothing and only waits; sealing under a later epoch while sealed replaces
+  // the epoch and starts a new seal. Epochs only move forward: an epoch below
+  // the current one, or at or below the last cancelled one, is refused with
+  // `FailedPrecondition`. A restart of sandbox-manager ends the wait
   // early; the seal stays in place, and the caller reads the state again from
   // the new process.
   rpc SealActivations(SealActivationsRequest) returns (SealActivationsResponse);
 
-  // Clear the seal if it is under `epoch`. A different epoch is refused with
-  // `FailedPrecondition` and leaves the seal in place; an unsealed node
-  // answers its state unchanged.
+  // Cancel `epoch`: clear the seal if it is under `epoch` or an earlier one,
+  // and remember `epoch`, so no seal at or below it is taken again, even one
+  // whose call arrives after this cancel. The drain evacuations recorded
+  // under it or earlier are forgotten. An epoch below the current seal's is
+  // refused with `FailedPrecondition` and leaves the seal in place.
   rpc UnsealActivations(UnsealActivationsRequest) returns (UnsealActivationsResponse);
 
   // Read the seal and the activation work in flight without changing them.
   rpc ActivationSealState(ActivationSealStateRequest) returns (ActivationSealStateResponse);
+
+  // Drain this node under `epoch`: seal it, then make every resident durable
+  // elsewhere and report. Each call seals (as `SealActivations` with no wait),
+  // recovers orphan artifacts as rows, and walks every row: a started or
+  // paused VM is suspended with a full snapshot and uploaded, a stopped
+  // sandbox's disk is published, and a local-only artifact's upload is
+  // finished. The work runs after the call answers; a later call reports it.
+  // Idempotent: a call repeats nothing in progress or done. With `cancel`,
+  // cancels `epoch` instead (as `UnsealActivations`) and reports the state.
+  //
+  // `done` means the node may be terminated: sealed under `epoch` since before
+  // this call's walk began and still at its end, no activation work in flight
+  // at the walk's first read, no VM, nothing pending or blocked, and every
+  // scan that can reveal a resident or an artifact (sandbox-manager's rows,
+  // cache and run directories, node-manager's untracked processes, cache
+  // and run directories) succeeded.
+  rpc DrainNode(DrainNodeRequest) returns (DrainNodeResponse);
 
   // Get the resolved effective network policy for a sandbox.
   rpc GetNetworkPolicy(GetNetworkPolicyRequest) returns (GetNetworkPolicyResponse);
@@ -2146,6 +2167,64 @@ message ActivationSealStateRequest {}
 
 message ActivationSealStateResponse {
   ActivationSealStatus status = 1;
+}
+
+message DrainNodeRequest {
+  // Nonzero, at most 2^63 - 1. Only moves forward (see `SealActivations`).
+  uint64 epoch = 1;
+  // Cancel `epoch` instead of draining.
+  bool cancel = 2;
+}
+
+// The lifecycle a drained resident had, which the control plane restores it
+// to.
+enum DrainPrior {
+  DRAIN_PRIOR_UNSPECIFIED = 0;
+  DRAIN_PRIOR_STARTED = 1;
+  DRAIN_PRIOR_PAUSED = 2;
+  DRAIN_PRIOR_STOPPED = 3;
+}
+
+// A resident the drain made durable elsewhere.
+message DrainEvacuated {
+  string sandbox_id = 1;
+  DrainPrior prior = 2;
+  // The local artifact id of the durable full snapshot (started, paused) or
+  // disk (stopped) that holds it.
+  string artifact_id = 3;
+}
+
+// Work the drain is still doing or waiting for.
+message DrainPending {
+  string sandbox_id = 1;
+  // What it waits for: `suspend`, `publish_disk`, `upload`, or `settle:<state>`
+  // for a row in a transition the drain does not drive.
+  string action = 2;
+}
+
+// Something the drain cannot make durable, or could not inspect. Blocks
+// `done` until it is gone.
+message DrainBlocked {
+  // Unset for a node-level cause, such as a scan that failed.
+  optional string sandbox_id = 1;
+  string reason = 2;
+}
+
+message DrainNodeResponse {
+  // The epoch the node is sealed under after this call; unset once
+  // cancelled.
+  optional uint64 sealed_epoch = 1;
+  google.protobuf.Timestamp sealed_since = 2;
+  // Activation work in flight at the walk's first read.
+  repeated InFlightActivation in_flight = 3;
+  repeated DrainEvacuated evacuated = 4;
+  repeated DrainPending pending = 5;
+  repeated DrainBlocked blocked = 6;
+  // Leftovers that hold no resident or artifact (network namespaces,
+  // cgroups, nft rules, gateway run directories), and the failures of the
+  // scans that look for them. Reported, never blocking.
+  repeated string debris = 7;
+  bool done = 8;
 }
 
 // Node-local facts about the current legacy quarantine-recovery episode.

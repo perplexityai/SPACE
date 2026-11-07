@@ -63,6 +63,7 @@ const (
 	SandboxManager_SealActivations_FullMethodName                        = "/space.sandbox.manager.v1.SandboxManager/SealActivations"
 	SandboxManager_UnsealActivations_FullMethodName                      = "/space.sandbox.manager.v1.SandboxManager/UnsealActivations"
 	SandboxManager_ActivationSealState_FullMethodName                    = "/space.sandbox.manager.v1.SandboxManager/ActivationSealState"
+	SandboxManager_DrainNode_FullMethodName                              = "/space.sandbox.manager.v1.SandboxManager/DrainNode"
 	SandboxManager_GetNetworkPolicy_FullMethodName                       = "/space.sandbox.manager.v1.SandboxManager/GetNetworkPolicy"
 	SandboxManager_SetNetworkPolicy_FullMethodName                       = "/space.sandbox.manager.v1.SandboxManager/SetNetworkPolicy"
 	SandboxManager_TemplateNetworkPolicyUpdated_FullMethodName           = "/space.sandbox.manager.v1.SandboxManager/TemplateNetworkPolicyUpdated"
@@ -256,17 +257,37 @@ type SandboxManagerClient interface {
 	ListPendingLocalBackups(ctx context.Context, in *ListPendingLocalBackupsRequest, opts ...grpc.CallOption) (*ListPendingLocalBackupsResponse, error)
 	// Seal under `epoch`, then wait up to `wait_timeout` for the activation work
 	// already in flight to finish. Sealing again under the current epoch changes
-	// nothing and only waits; sealing under another epoch while sealed replaces
-	// the epoch and starts a new seal. A restart of sandbox-manager ends the wait
+	// nothing and only waits; sealing under a later epoch while sealed replaces
+	// the epoch and starts a new seal. Epochs only move forward: an epoch below
+	// the current one, or at or below the last cancelled one, is refused with
+	// `FailedPrecondition`. A restart of sandbox-manager ends the wait
 	// early; the seal stays in place, and the caller reads the state again from
 	// the new process.
 	SealActivations(ctx context.Context, in *SealActivationsRequest, opts ...grpc.CallOption) (*SealActivationsResponse, error)
-	// Clear the seal if it is under `epoch`. A different epoch is refused with
-	// `FailedPrecondition` and leaves the seal in place; an unsealed node
-	// answers its state unchanged.
+	// Cancel `epoch`: clear the seal if it is under `epoch` or an earlier one,
+	// and remember `epoch`, so no seal at or below it is taken again, even one
+	// whose call arrives after this cancel. The drain evacuations recorded
+	// under it or earlier are forgotten. An epoch below the current seal's is
+	// refused with `FailedPrecondition` and leaves the seal in place.
 	UnsealActivations(ctx context.Context, in *UnsealActivationsRequest, opts ...grpc.CallOption) (*UnsealActivationsResponse, error)
 	// Read the seal and the activation work in flight without changing them.
 	ActivationSealState(ctx context.Context, in *ActivationSealStateRequest, opts ...grpc.CallOption) (*ActivationSealStateResponse, error)
+	// Drain this node under `epoch`: seal it, then make every resident durable
+	// elsewhere and report. Each call seals (as `SealActivations` with no wait),
+	// recovers orphan artifacts as rows, and walks every row: a started or
+	// paused VM is suspended with a full snapshot and uploaded, a stopped
+	// sandbox's disk is published, and a local-only artifact's upload is
+	// finished. The work runs after the call answers; a later call reports it.
+	// Idempotent: a call repeats nothing in progress or done. With `cancel`,
+	// cancels `epoch` instead (as `UnsealActivations`) and reports the state.
+	//
+	// `done` means the node may be terminated: sealed under `epoch` since before
+	// this call's walk began and still at its end, no activation work in flight
+	// at the walk's first read, no VM, nothing pending or blocked, and every
+	// scan that can reveal a resident or an artifact (sandbox-manager's rows,
+	// cache and run directories, node-manager's untracked processes, cache
+	// and run directories) succeeded.
+	DrainNode(ctx context.Context, in *DrainNodeRequest, opts ...grpc.CallOption) (*DrainNodeResponse, error)
 	// Get the resolved effective network policy for a sandbox.
 	GetNetworkPolicy(ctx context.Context, in *GetNetworkPolicyRequest, opts ...grpc.CallOption) (*GetNetworkPolicyResponse, error)
 	// Apply a sandbox's desired network policy on the node.
@@ -767,6 +788,16 @@ func (c *sandboxManagerClient) ActivationSealState(ctx context.Context, in *Acti
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(ActivationSealStateResponse)
 	err := c.cc.Invoke(ctx, SandboxManager_ActivationSealState_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *sandboxManagerClient) DrainNode(ctx context.Context, in *DrainNodeRequest, opts ...grpc.CallOption) (*DrainNodeResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(DrainNodeResponse)
+	err := c.cc.Invoke(ctx, SandboxManager_DrainNode_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -1417,17 +1448,37 @@ type SandboxManagerServer interface {
 	ListPendingLocalBackups(context.Context, *ListPendingLocalBackupsRequest) (*ListPendingLocalBackupsResponse, error)
 	// Seal under `epoch`, then wait up to `wait_timeout` for the activation work
 	// already in flight to finish. Sealing again under the current epoch changes
-	// nothing and only waits; sealing under another epoch while sealed replaces
-	// the epoch and starts a new seal. A restart of sandbox-manager ends the wait
+	// nothing and only waits; sealing under a later epoch while sealed replaces
+	// the epoch and starts a new seal. Epochs only move forward: an epoch below
+	// the current one, or at or below the last cancelled one, is refused with
+	// `FailedPrecondition`. A restart of sandbox-manager ends the wait
 	// early; the seal stays in place, and the caller reads the state again from
 	// the new process.
 	SealActivations(context.Context, *SealActivationsRequest) (*SealActivationsResponse, error)
-	// Clear the seal if it is under `epoch`. A different epoch is refused with
-	// `FailedPrecondition` and leaves the seal in place; an unsealed node
-	// answers its state unchanged.
+	// Cancel `epoch`: clear the seal if it is under `epoch` or an earlier one,
+	// and remember `epoch`, so no seal at or below it is taken again, even one
+	// whose call arrives after this cancel. The drain evacuations recorded
+	// under it or earlier are forgotten. An epoch below the current seal's is
+	// refused with `FailedPrecondition` and leaves the seal in place.
 	UnsealActivations(context.Context, *UnsealActivationsRequest) (*UnsealActivationsResponse, error)
 	// Read the seal and the activation work in flight without changing them.
 	ActivationSealState(context.Context, *ActivationSealStateRequest) (*ActivationSealStateResponse, error)
+	// Drain this node under `epoch`: seal it, then make every resident durable
+	// elsewhere and report. Each call seals (as `SealActivations` with no wait),
+	// recovers orphan artifacts as rows, and walks every row: a started or
+	// paused VM is suspended with a full snapshot and uploaded, a stopped
+	// sandbox's disk is published, and a local-only artifact's upload is
+	// finished. The work runs after the call answers; a later call reports it.
+	// Idempotent: a call repeats nothing in progress or done. With `cancel`,
+	// cancels `epoch` instead (as `UnsealActivations`) and reports the state.
+	//
+	// `done` means the node may be terminated: sealed under `epoch` since before
+	// this call's walk began and still at its end, no activation work in flight
+	// at the walk's first read, no VM, nothing pending or blocked, and every
+	// scan that can reveal a resident or an artifact (sandbox-manager's rows,
+	// cache and run directories, node-manager's untracked processes, cache
+	// and run directories) succeeded.
+	DrainNode(context.Context, *DrainNodeRequest) (*DrainNodeResponse, error)
 	// Get the resolved effective network policy for a sandbox.
 	GetNetworkPolicy(context.Context, *GetNetworkPolicyRequest) (*GetNetworkPolicyResponse, error)
 	// Apply a sandbox's desired network policy on the node.
@@ -1630,6 +1681,9 @@ func (UnimplementedSandboxManagerServer) UnsealActivations(context.Context, *Uns
 }
 func (UnimplementedSandboxManagerServer) ActivationSealState(context.Context, *ActivationSealStateRequest) (*ActivationSealStateResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ActivationSealState not implemented")
+}
+func (UnimplementedSandboxManagerServer) DrainNode(context.Context, *DrainNodeRequest) (*DrainNodeResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method DrainNode not implemented")
 }
 func (UnimplementedSandboxManagerServer) GetNetworkPolicy(context.Context, *GetNetworkPolicyRequest) (*GetNetworkPolicyResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetNetworkPolicy not implemented")
@@ -2527,6 +2581,24 @@ func _SandboxManager_ActivationSealState_Handler(srv interface{}, ctx context.Co
 	return interceptor(ctx, in, info, handler)
 }
 
+func _SandboxManager_DrainNode_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DrainNodeRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SandboxManagerServer).DrainNode(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SandboxManager_DrainNode_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SandboxManagerServer).DrainNode(ctx, req.(*DrainNodeRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _SandboxManager_GetNetworkPolicy_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(GetNetworkPolicyRequest)
 	if err := dec(in); err != nil {
@@ -3360,6 +3432,10 @@ var SandboxManager_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ActivationSealState",
 			Handler:    _SandboxManager_ActivationSealState_Handler,
+		},
+		{
+			MethodName: "DrainNode",
+			Handler:    _SandboxManager_DrainNode_Handler,
 		},
 		{
 			MethodName: "GetNetworkPolicy",

@@ -333,6 +333,7 @@ impl ActivationSeal {
     }
 
     /// The highest epoch cancelled on this node, if any.
+    #[cfg(test)]
     pub(crate) fn last_cancelled_epoch(&self) -> Option<u64> {
         self.lock_state()
             .record

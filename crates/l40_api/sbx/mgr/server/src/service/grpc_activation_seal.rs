@@ -87,7 +87,7 @@ impl SandboxManagerService {
     }
 }
 
-fn status_to_wire(status: ActivationSealStatus) -> crate::proto::ActivationSealStatus {
+pub(super) fn status_to_wire(status: ActivationSealStatus) -> crate::proto::ActivationSealStatus {
     crate::proto::ActivationSealStatus {
         sealed_epoch: status.sealed.map(|sealed| sealed.epoch),
         sealed_since: status.sealed.map(sealed_since_to_wire),

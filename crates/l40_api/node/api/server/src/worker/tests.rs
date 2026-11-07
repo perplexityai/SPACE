@@ -310,6 +310,35 @@ async fn the_internal_wake_forwards_a_runtime_upgrade_only_for_the_control_plane
     assert_eq!(forwarded.code(), tonic::Code::Unimplemented, "{forwarded}");
 }
 
+/// A drain seals the node and evacuates it, so node-api relays one only for
+/// the control plane.
+#[tokio::test]
+async fn the_internal_drain_is_forwarded_only_for_the_control_plane() {
+    use pplx_space_node_api_client::proto::worker_api_internal_server::WorkerApiInternal;
+    let service =
+        service_with_limiter(UdsPerSandboxLimiter::for_tests_with_reserved(1, 1, 8)).await;
+    let drain = || {
+        Request::new(proto::DrainNodeRequest {
+            epoch: 7,
+            cancel: false,
+        })
+    };
+
+    let mut unprivileged = drain();
+    unprivileged
+        .extensions_mut()
+        .insert(pplx_space_rpc_auth::NodeApiAuthenticatedCaller::unprivileged_workload_for_test());
+    let denied = WorkerApiInternal::drain_node(&service, unprivileged)
+        .await
+        .unwrap_err();
+    assert_eq!(denied.code(), tonic::Code::PermissionDenied, "{denied}");
+
+    let forwarded = WorkerApiInternal::drain_node(&service, drain())
+        .await
+        .unwrap_err();
+    assert_eq!(forwarded.code(), tonic::Code::Unimplemented, "{forwarded}");
+}
+
 /// The outcome of a runtime upgrade a pod's shim ran is the control plane's
 /// to read, as the upgrade was its to request.
 #[tokio::test]

@@ -617,7 +617,17 @@ impl SandboxManagerService {
         request: Request<EnqueueArtifactBackupRequest>,
     ) -> Result<Response<EnqueueArtifactBackupResponse>, Status> {
         self.authorize_peer(&request, "EnqueueArtifactBackup", ALLOW_SANDBOX_OPERATOR)?;
-        let req = request.into_inner();
+        self.enqueue_artifact_backup_authorized(request.into_inner())
+            .await
+    }
+
+    /// [`Self::enqueue_artifact_backup`] for a caller this process already
+    /// trusts: the node drain, which publishes a stopped sandbox's disk and
+    /// finishes a local-only artifact's upload through it.
+    pub(in crate::service) async fn enqueue_artifact_backup_authorized(
+        &self,
+        req: EnqueueArtifactBackupRequest,
+    ) -> Result<Response<EnqueueArtifactBackupResponse>, Status> {
         let sandbox_id = req.sandbox_id.trim();
         if sandbox_id.is_empty() {
             return Err(Status::invalid_argument("sandbox_id is required"));

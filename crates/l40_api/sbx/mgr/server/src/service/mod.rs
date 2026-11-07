@@ -297,6 +297,14 @@ const ALLOW_ACTIVATION_SEAL_OPERATOR: &[UdsPeerPrincipal] = &[
     UdsPeerPrincipal::Root,
     UdsPeerPrincipal::Role(LocalRole::Admin),
 ];
+// A drain seals the node and evacuates every resident. node-api relays it
+// for the control plane and authorizes that caller first; root and the
+// local admin role may drive it by hand.
+const ALLOW_NODE_DRAIN: &[UdsPeerPrincipal] = &[
+    UdsPeerPrincipal::Root,
+    UdsPeerPrincipal::Role(LocalRole::Admin),
+    UdsPeerPrincipal::Service(user_names::SPACE_NODEAPI),
+];
 const ALLOW_SANDBOX_ADMIN_OR_TMPLMGR: &[UdsPeerPrincipal] = &[
     UdsPeerPrincipal::Root,
     UdsPeerPrincipal::Role(LocalRole::Admin),
@@ -403,6 +411,8 @@ pub struct SandboxManagerService {
     /// Refuses every VM activation while the node is sealed, and counts the
     /// activation work in flight a seal waits for.
     activation_seal: Arc<crate::activation_seal::ActivationSeal>,
+    /// The node drain's work in flight in this process.
+    drain_actions: Arc<drain_node::DrainActions>,
     /// At most one in-process driver may advance a persisted teardown suspend
     /// for a sandbox. The durable operation itself lives in SQLite; this map
     /// only bounds concurrent reattachment attempts from shim polling.
@@ -1828,6 +1838,7 @@ impl SandboxManagerService {
             )),
             activation_admission_limiter: Arc::new(ActivationAdmissionLimiter::from_env()),
             activation_seal,
+            drain_actions: Arc::default(),
             teardown_suspend_drivers: Arc::new(dashmap::DashMap::new()),
             teardown_suspend_driver_sem: Arc::new(tokio::sync::Semaphore::new(
                 teardown_suspend_driver_concurrency,
@@ -2096,6 +2107,7 @@ pub(crate) mod drain;
 mod eviction;
 pub(crate) mod snapshot_capture;
 pub(crate) use eviction::EvictionClaim;
+mod drain_node;
 mod grpc_activation_seal;
 mod grpc_auto_lifecycle_delete_receipts;
 mod grpc_core;
