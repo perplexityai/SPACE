@@ -191,7 +191,6 @@ runpy.run_module("space_smoke", run_name="__main__")
                 "native.m1_generated_sdk_conformance",
                 "native.network_policy_live_update",
                 "native.resident_pause",
-                "native.sealed_worker_refuses_activations",
                 "native.stopped_restart_preserves_rootfs",
                 "native.v2_drain_blocks_on_a_quarantined_resident",
                 "native.v2_drain_evacuates_every_resident",

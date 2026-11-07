@@ -290,13 +290,6 @@ const ALLOW_LOCAL_BACKUP_INVENTORY: &[UdsPeerPrincipal] = &[
     UdsPeerPrincipal::Root,
     UdsPeerPrincipal::Service(user_names::SPACE_NODECTL),
 ];
-// Sealing refuses every activation on the node, so only root and the local
-// admin role may set or clear it until a node service is given the drain
-// that drives it.
-const ALLOW_ACTIVATION_SEAL_OPERATOR: &[UdsPeerPrincipal] = &[
-    UdsPeerPrincipal::Root,
-    UdsPeerPrincipal::Role(LocalRole::Admin),
-];
 // A drain seals the node and evacuates every resident. node-api relays it
 // for the control plane and authorizes that caller first; root and the
 // local admin role may drive it by hand.
@@ -2108,7 +2101,6 @@ mod eviction;
 pub(crate) mod snapshot_capture;
 pub(crate) use eviction::EvictionClaim;
 mod drain_node;
-mod grpc_activation_seal;
 mod grpc_auto_lifecycle_delete_receipts;
 mod grpc_core;
 mod grpc_lifecycle;

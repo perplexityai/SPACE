@@ -424,24 +424,16 @@ class DrainV2Assertions:
         restart.release()
         self._instance = replacement
         self._await_recorded_instance(replacement, timeout=timeout)
-        seal_on_return = self._seal_state()
-        self._control.unseal_activations(node_name, self.epoch)
         self._fixture.record(
             "after_terminate",
             {
                 "node_row_deleted_without_tombstone": True,
                 "replacement_instance": replacement,
-                "seal_on_return": seal_on_return,
-                "seal": self._seal_state(),
+                "sealed_epoch_after_unseal": self._control.unseal_activations(
+                    node_name, self.epoch
+                ),
             },
         )
-
-    def _seal_state(self) -> dict[str, Any] | None:
-        try:
-            report = self._control.activation_seal_state(self.node_name)
-        except Exception as error:  # noqa: BLE001 - recorded as evidence only
-            return {"error": repr(error)[:300]}
-        return {"sealed_epoch": report.sealed_epoch, "in_flight": len(report.in_flight)}
 
     def undrain_and_expect_cancelled(self, *, timeout: float = 120) -> None:
         """`:undrain` returns the node to no phase, and the controller cancels the epoch on it."""
@@ -460,25 +452,17 @@ class DrainV2Assertions:
                 status=None if status is None else (status.engine, status.status),
             )
             self._fixture.wait(2)
-        seal = self._control.activation_seal_state(self.node_name)
-        self._fixture.verify(
-            seal.sealed_epoch is None,
-            "the undrained worker is still sealed",
-            sealed_epoch=seal.sealed_epoch,
-        )
+        # The controller clears the columns only once its cancel answered the
+        # node unsealed; the scenario then proves it by activating again.
 
     def expect_stale_epoch_refused(self) -> None:
-        """A seal under the cancelled epoch is refused: epochs only move forward."""
+        """A drain under the cancelled epoch is refused before it seals anything:
+        epochs only move forward."""
 
         try:
-            self._control.seal_activations(self.node_name, self.epoch, wait_seconds=0)
+            self._control.seal_activations(self.node_name, self.epoch)
         except Exception as error:  # noqa: BLE001 - the refusal is the expected outcome
             self._fixture.record("stale_epoch_refusal", repr(error)[:300])
         else:
             self._control.unseal_activations(self.node_name, self.epoch)
-            self._fixture.verify(False, "a seal under the cancelled epoch was accepted")
-        seal = self._control.activation_seal_state(self.node_name)
-        self._fixture.verify(
-            seal.sealed_epoch is None, "the refused stale seal left the worker sealed",
-            sealed_epoch=seal.sealed_epoch,
-        )
+            self._fixture.verify(False, "a drain under the cancelled epoch was accepted")

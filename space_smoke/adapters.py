@@ -33,7 +33,6 @@ from urllib.parse import parse_qs, quote, urlencode, urlsplit
 from urllib.request import Request, urlopen
 
 from space_smoke.capabilities import (
-    ActivationSealReport,
     DrainV2Status,
     ControllerLease,
     ControllerPod,
@@ -144,7 +143,6 @@ from space_smoke.drain_restore import (
     validate_drain_restore_hold_keys,
     validate_drain_restore_hold_overrides,
 )
-from space_smoke.activation_seal import parse_activation_seal_report
 from space_smoke.stopped_replacement import (
     STOPPED_REPLACEMENT_ENV_KEYS,
     parse_doctor_lifecycle,
@@ -194,6 +192,16 @@ def _require_ok(result: CommandResult, action: str) -> str:
             f"{action} failed ({result.returncode}): {result.detail() or '<no output>'}"
         )
     return result.stdout
+
+
+def parse_drain_node_sealed_epoch(output: str) -> int | None:
+    """The `sealed_epoch=` line of a `space-sbxmgr drain-node` answer; refuses an answer without one."""
+
+    for raw in output.splitlines():
+        key, separator, value = raw.strip().partition("=")
+        if separator and key == "sealed_epoch":
+            return None if value == "none" else int(value)
+    raise ValueError(f"drain-node output lacks sealed_epoch: {output[:400]!r}")
 
 
 def _env_literals(
@@ -2222,7 +2230,7 @@ ON CONFLICT (key_hash) DO NOTHING;
                 _require_ok(
                     self._node_shell_exec(
                         sealed_node,
-                        f"/space/bin/space-sbxmgr unseal-activations --epoch {int(sealed_epoch)}",
+                        f"/space/bin/space-sbxmgr drain-node --cancel --epoch {int(sealed_epoch)}",
                         timeout=60,
                     ),
                     f"unseal sandbox-manager activations on {sealed_node} "
@@ -6399,9 +6407,7 @@ ON CONFLICT (key_hash) DO NOTHING;
 
     # --- sandbox-manager activation seal ----------------------------------
 
-    def seal_activations(
-        self, node_name: str, epoch: int, *, wait_seconds: int
-    ) -> ActivationSealReport:
+    def seal_activations(self, node_name: str, epoch: int) -> int | None:
         ownership = self._cordon_lease_ownership
         if ownership is None:
             raise SmokeConfigurationError(
@@ -6414,36 +6420,25 @@ ON CONFLICT (key_hash) DO NOTHING;
             ownership.name, SEALED_ACTIVATIONS_ANNOTATION, f"{node_name} {int(epoch)}"
         )
         result = self._node_shell_exec(
-            node_name,
-            "/space/bin/space-sbxmgr seal-activations "
-            f"--epoch {int(epoch)} --wait-secs {int(wait_seconds)}",
-            timeout=wait_seconds + 60,
+            node_name, f"/space/bin/space-sbxmgr drain-node --epoch {int(epoch)}", timeout=90
         )
-        return parse_activation_seal_report(
+        return parse_drain_node_sealed_epoch(
             _require_ok(result, f"seal sandbox-manager activations on {node_name}")
         )
 
-    def unseal_activations(self, node_name: str, epoch: int) -> ActivationSealReport:
+    def unseal_activations(self, node_name: str, epoch: int) -> int | None:
         result = self._node_shell_exec(
             node_name,
-            f"/space/bin/space-sbxmgr unseal-activations --epoch {int(epoch)}",
+            f"/space/bin/space-sbxmgr drain-node --cancel --epoch {int(epoch)}",
             timeout=60,
         )
-        report = parse_activation_seal_report(
+        sealed_epoch = parse_drain_node_sealed_epoch(
             _require_ok(result, f"unseal sandbox-manager activations on {node_name}")
         )
         ownership = self._cordon_lease_ownership
         if ownership is not None:
             self._annotate_lease(ownership.name, SEALED_ACTIVATIONS_ANNOTATION, None)
-        return report
-
-    def activation_seal_state(self, node_name: str) -> ActivationSealReport:
-        result = self._node_shell_exec(
-            node_name, "/space/bin/space-sbxmgr activation-seal", timeout=60
-        )
-        return parse_activation_seal_report(
-            _require_ok(result, f"read the sandbox-manager activation seal on {node_name}")
-        )
+        return sealed_epoch
 
     # --- template-manager startup recovery -------------------------------
 

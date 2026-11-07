@@ -523,7 +523,49 @@ pub(super) async fn handle(
                 println!("Released {} entries.", resp.cleaned_ids.len());
             }
         }
+        Commands::DrainNode { epoch, cancel } => {
+            let report = client
+                .drain_node(pplx_space_sbx_mgr_client::proto::DrainNodeRequest { epoch, cancel })
+                .await
+                .unwrap_or_else(|e| exit_error(e))
+                .into_inner();
+            print_drain_report(&report);
+        }
         _ => unreachable!("command routed to wrong dispatch group"),
+    }
+}
+
+/// `sealed_epoch` and `done`, then one `evacuated=<id> <prior> <artifact>`,
+/// `pending=<id> <action>` or `blocked=<id or -> <reason>` line per entry,
+/// so scripts can read it.
+fn print_drain_report(report: &pplx_space_sbx_mgr_client::proto::DrainNodeResponse) {
+    use pplx_space_sbx_mgr_client::proto::DrainPrior;
+    match report.sealed_epoch {
+        Some(epoch) => println!("sealed_epoch={epoch}"),
+        None => println!("sealed_epoch=none"),
+    }
+    println!("done={}", report.done);
+    for entry in &report.evacuated {
+        let prior = match DrainPrior::try_from(entry.prior) {
+            Ok(DrainPrior::Started) => "started",
+            Ok(DrainPrior::Paused) => "paused",
+            Ok(DrainPrior::Stopped) => "stopped",
+            Ok(DrainPrior::Unspecified) | Err(_) => "unknown",
+        };
+        println!(
+            "evacuated={} {prior} {}",
+            entry.sandbox_id, entry.artifact_id
+        );
+    }
+    for entry in &report.pending {
+        println!("pending={} {}", entry.sandbox_id, entry.action);
+    }
+    for entry in &report.blocked {
+        println!(
+            "blocked={} {}",
+            entry.sandbox_id.as_deref().unwrap_or("-"),
+            entry.reason
+        );
     }
 }
 

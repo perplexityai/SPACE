@@ -191,76 +191,39 @@ service SandboxManager {
   // cannot distinguish a short answer from a complete one.
   rpc ListPendingLocalBackups(ListPendingLocalBackupsRequest) returns (ListPendingLocalBackupsResponse);
 
-  // ── Activation seal (node-local) ──────────────────────────────────────────
+  // ── Node drain (node-local) ───────────────────────────────────────────────
   //
-  // A seal makes this node refuse every new VM activation: the cold boot of a
-  // sandbox, the restore of one from a snapshot, and the resume of a paused VM
-  // held in memory. Teardown and durability work stay allowed (suspend, stop,
-  // delete, kill, artifact backup and publication), and so do two resumes that
-  // are part of that work: a checkpoint's resume of the running VM it paused,
-  // after the capture or after a failed one, and a stop's resume of a paused VM
-  // so its guest can flush before the stop ends it. Each counts as in flight
-  // while it runs, and either can begin after the seal, so a `quiesced` answer
-  // holds only when it is given. The seal refuses at this node only; it does
-  // not stop placement. On the Kubernetes substrate a create or a restore
-  // starts its VM inside the pod's sandbox creation, so the refusal goes to the
-  // kubelet, which retries the pod, and the public operation fails without the
-  // marker. Stop placement on the node before sealing it.
-  //
-  // An epoch names one seal. The caller picks it, typically one per drain
-  // attempt, so that a report it reads back can be tied to the seal it set.
-  // The seal is persisted before it is answered and survives a restart of
+  // Drain this node under `epoch`. Each call first seals the node's VM
+  // activations under `epoch`: a sealed node refuses every new VM activation
+  // (the cold boot of a sandbox, the restore of one from a snapshot, and the
+  // resume of a paused VM held in memory) and keeps teardown and durability
+  // work running. The seal refuses at this node only; it does not stop
+  // placement. On the Kubernetes substrate a create or a restore starts its VM
+  // inside the pod's sandbox creation, so the refusal goes to the kubelet,
+  // which retries the pod. Stop placement on the node before draining it. The
+  // seal is persisted before the call answers and survives a restart of
   // sandbox-manager.
   //
-  // Continuity rule: a report about this node may claim `sealed(E)` only if the
-  // seal under epoch E has been continuously in place since before the report's
-  // walk began. A caller establishes that by reading `ActivationSealState` (or
-  // the `SealActivations` answer) before the walk and again after it: the same
-  // `sealed_epoch` and the same `sealed_since` mean one continuous seal, and a
-  // sealed node admits no activation, so none was admitted in that window.
-  // Every seal that begins, including a re-seal after an unseal and the
-  // replacement of one epoch by another, gets a `sealed_since` later than any
-  // earlier one. `sealed(E)` does not cover activations admitted before the
-  // seal: each stays in `in_flight` until it settles and can still launch or
-  // resume a VM during the walk, so a report that needs no activation running
-  // must also find no `COLD`, `RESTORE` or `RESIDENT_RESUME` entry in
-  // `in_flight` at its first read.
-
-  // Seal under `epoch`, then wait up to `wait_timeout` for the activation work
-  // already in flight to finish. Sealing again under the current epoch changes
-  // nothing and only waits; sealing under a later epoch while sealed replaces
-  // the epoch and starts a new seal. Epochs only move forward: an epoch below
-  // the current one, or at or below the last cancelled one, is refused with
-  // `FailedPrecondition`. A restart of sandbox-manager ends the wait
-  // early; the seal stays in place, and the caller reads the state again from
-  // the new process.
-  rpc SealActivations(SealActivationsRequest) returns (SealActivationsResponse);
-
-  // Cancel `epoch`: clear the seal if it is under `epoch` or an earlier one,
-  // and remember `epoch`, so no seal at or below it is taken again, even one
-  // whose call arrives after this cancel. The drain evacuations recorded
-  // under it or earlier are forgotten. An epoch below the current seal's is
-  // refused with `FailedPrecondition` and leaves the seal in place.
-  rpc UnsealActivations(UnsealActivationsRequest) returns (UnsealActivationsResponse);
-
-  // Read the seal and the activation work in flight without changing them.
-  rpc ActivationSealState(ActivationSealStateRequest) returns (ActivationSealStateResponse);
-
-  // Drain this node under `epoch`: seal it, then make every resident durable
-  // elsewhere and report. Each call seals (as `SealActivations` with no wait),
-  // recovers orphan artifacts as rows, and walks every row: a started or
-  // paused VM is suspended with a full snapshot and uploaded, a stopped
-  // sandbox's disk is published, and a local-only artifact's upload is
-  // finished. The work runs after the call answers; a later call reports it.
-  // Idempotent: a call repeats nothing in progress or done. With `cancel`,
-  // cancels `epoch` instead (as `UnsealActivations`) and reports the state.
+  // The call then walks every row: a started or paused VM is suspended with a
+  // full snapshot and uploaded, a stopped sandbox's disk is published, and a
+  // local-only artifact's upload is finished. That work runs after the call
+  // answers; a later call reports it. Idempotent: a call repeats nothing in
+  // progress or done.
   //
-  // `done` means the node may be terminated: sealed under `epoch` since before
-  // this call's walk began and still at its end, no activation work in flight
-  // at the walk's first read, no VM, nothing pending or blocked, and every
-  // scan that can reveal a resident or an artifact (sandbox-manager's rows,
-  // cache and run directories, node-manager's untracked processes, cache
-  // and run directories) succeeded.
+  // Epochs only move forward: an epoch below the current one is refused with
+  // `FailedPrecondition`, and so is the epoch of a cancelled drain. With
+  // `cancel`, the call cancels `epoch` instead: it clears the seal if it is
+  // under `epoch` or an earlier one, forgets the drain's evacuations, and
+  // remembers `epoch`, so no seal at or below it is taken again, even by a
+  // call that arrives after the cancel. A cancel below the current seal's
+  // epoch is refused with `FailedPrecondition`.
+  //
+  // `done` means the node may be terminated: sealed under `epoch` from before
+  // this call's walk to its end, no activation in flight at the walk's first
+  // read, no VM, nothing pending or blocked, and every scan that can reveal a
+  // resident or an artifact (sandbox-manager's rows, cache and run
+  // directories, node-manager's untracked processes, cache and run
+  // directories) succeeded.
   rpc DrainNode(DrainNodeRequest) returns (DrainNodeResponse);
 
   // Get the resolved effective network policy for a sandbox.
@@ -2121,56 +2084,8 @@ message InFlightActivation {
   google.protobuf.Duration age = 3;
 }
 
-message ActivationSealStatus {
-  // The epoch the node is sealed under; unset while unsealed.
-  optional uint64 sealed_epoch = 1;
-  // When the current seal began, on the wall clock at millisecond precision.
-  // Persisted with the seal, so a restart does not move it. Unset while
-  // unsealed.
-  google.protobuf.Timestamp sealed_since = 2;
-  // VM activations this sandbox-manager process has admitted since it
-  // started. It never advances while sealed, and restarts from zero with the
-  // process.
-  uint64 activations_admitted = 3;
-  // Activation work in flight, oldest first.
-  repeated InFlightActivation in_flight = 4;
-}
-
-message SealActivationsRequest {
-  // Nonzero, at most 2^63 - 1.
-  uint64 epoch = 1;
-  // How long to wait for in-flight work to finish, at most five minutes.
-  // Unset or zero answers at once.
-  google.protobuf.Duration wait_timeout = 2;
-}
-
-message SealActivationsResponse {
-  // The seal and the work in flight as the wait ended. Another call can
-  // replace or clear the seal during the wait, so compare
-  // `status.sealed_epoch` with the request's epoch before relying on
-  // `quiesced`.
-  ActivationSealStatus status = 1;
-  // No activation work was in flight when the call answered.
-  bool quiesced = 2;
-}
-
-message UnsealActivationsRequest {
-  // Nonzero.
-  uint64 epoch = 1;
-}
-
-message UnsealActivationsResponse {
-  ActivationSealStatus status = 1;
-}
-
-message ActivationSealStateRequest {}
-
-message ActivationSealStateResponse {
-  ActivationSealStatus status = 1;
-}
-
 message DrainNodeRequest {
-  // Nonzero, at most 2^63 - 1. Only moves forward (see `SealActivations`).
+  // Nonzero, at most 2^63 - 1. Only moves forward (see `DrainNode`).
   uint64 epoch = 1;
   // Cancel `epoch` instead of draining.
   bool cancel = 2;

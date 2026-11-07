@@ -469,7 +469,6 @@ async fn sealed_admission_refuses_every_kind_and_unseal_admits_each_again() {
     drop(holder);
     assert_eq!(service.activation_admission_limiter.in_flight(), 0);
     let status = service.activation_seal.status();
-    assert_eq!(status.activations_admitted, 0);
     assert!(status.in_flight.is_empty());
 
     service.activation_seal.unseal(&service.db, 3).unwrap();
@@ -485,7 +484,6 @@ async fn sealed_admission_refuses_every_kind_and_unseal_admits_each_again() {
         );
     }
     let status = service.activation_seal.status();
-    assert_eq!(status.activations_admitted, 3);
     assert_eq!(
         status
             .in_flight
@@ -538,7 +536,6 @@ async fn an_activation_queued_for_capacity_when_the_seal_lands_is_refused() {
         .unwrap()
         .expect_err("the seal landed while it was queued");
     assert_sealed_refusal(&refused, 4);
-    assert_eq!(service.activation_seal.status().activations_admitted, 1);
     service.activation_seal.assert_quiesced();
     shut_down(service).await;
 }
