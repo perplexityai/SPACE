@@ -78,6 +78,53 @@ fn drain_restore(target: DrainRestoreTarget, s: Uuid) -> DrainRestore {
     }
 }
 
+/// Put `sandbox_id`'s VM on the scripted node in `status`, as the restore
+/// pod's sandbox creation leaves it: running, whatever the target.
+async fn node_vm(
+    worker: &kubernetes_tests::SequencedWakeWorkerHandle,
+    sandbox_id: SandboxId,
+    status: &str,
+) -> Result<(), BoxError> {
+    let mut record = pplx_space_node_api_sim::state::SandboxRecord::new_creating(
+        sandbox_id.to_string(),
+        "base".to_owned(),
+        "fc".to_owned(),
+        "root".to_owned(),
+        None,
+        false,
+    );
+    record.status = status.to_owned();
+    worker.sim_state.insert_new(record).await?;
+    Ok(())
+}
+
+/// The node's view of `sandbox_id`'s VM, `None` when it has none.
+async fn node_vm_status(
+    worker: &kubernetes_tests::SequencedWakeWorkerHandle,
+    sandbox_id: SandboxId,
+) -> Option<String> {
+    worker
+        .sim_state
+        .get(&sandbox_id.to_string())
+        .await
+        .ok()
+        .map(|record| record.status)
+}
+
+/// The activation attempt the active execution still holds.
+async fn held_attempt(
+    pool: &sqlx::PgPool,
+    sandbox_id: SandboxId,
+) -> Result<Option<Uuid>, BoxError> {
+    Ok(sqlx::query_scalar(sql!(
+        "SELECT activation_attempt_id FROM sandbox_k8s_executions
+          WHERE sandbox_id = $1 AND active"
+    ))
+    .bind(sandbox_id)
+    .fetch_one(pool)
+    .await?)
+}
+
 /// The row's episode columns and its active executions.
 async fn landing(
     pool: &sqlx::PgPool,
@@ -96,7 +143,9 @@ async fn landing(
 }
 
 /// Each target lands in its own lifecycle, on its node, with the episode
-/// over: one Wake, one active execution, and the old pod kept.
+/// over: one Wake, one active execution, the old pod kept, and the attempt
+/// the restore ran under released. The node restored the VM running; a
+/// `paused` target leaves it paused, a `started` one running.
 #[rstest::rstest]
 #[case(DrainRestoreTarget::Started)]
 #[case(DrainRestoreTarget::Paused)]
@@ -110,6 +159,7 @@ async fn each_target_lands_with_one_execution(
     let db = pplx_space_db_test_fixtures::pg_test_db().await?;
     let sandbox_id = SandboxId::new();
     let (substrate, wake_attempts, worker, s) = drained_subject(&db.pool, sandbox_id).await?;
+    node_vm(&worker, sandbox_id, "running").await?;
 
     let landed = substrate
         .restore_drained_execution(
@@ -122,6 +172,16 @@ async fn each_target_lands_with_one_execution(
         .await?;
 
     assert!(landed, "{target}: the commit found nothing to land");
+    let expected_vm = match target {
+        DrainRestoreTarget::Started => "running",
+        DrainRestoreTarget::Paused => "paused",
+    };
+    assert_eq!(
+        node_vm_status(&worker, sandbox_id).await.as_deref(),
+        Some(expected_vm),
+        "{target}"
+    );
+    assert_eq!(held_attempt(&db.pool, sandbox_id).await?, None, "{target}");
     assert_eq!(
         landing(&db.pool, sandbox_id).await?,
         (
@@ -139,6 +199,76 @@ async fn each_target_lands_with_one_execution(
         received.iter().all(|wake| wake.runtime_upgrade.is_none()),
         "a drain restore keeps the sandbox's environment: {received:?}"
     );
+    Ok(())
+}
+
+/// A `paused` target whose VM an earlier attempt already paused lands
+/// without pausing it again, which the node would refuse.
+#[tokio::test(flavor = "current_thread")]
+async fn a_vm_already_paused_is_not_paused_again() -> Result<(), BoxError> {
+    if !crate::test_support::enter_sim_worker_process() {
+        return Ok(());
+    }
+    let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+    let sandbox_id = SandboxId::new();
+    let (substrate, _wake_attempts, worker, s) = drained_subject(&db.pool, sandbox_id).await?;
+    node_vm(&worker, sandbox_id, "paused").await?;
+
+    let landed = substrate
+        .restore_drained_execution(
+            SandboxApiMetricIdentity::native("drain_restore"),
+            sandbox_id,
+            options(),
+            None,
+            drain_restore(DrainRestoreTarget::Paused, s),
+        )
+        .await?;
+
+    assert!(landed);
+    assert_eq!(landing(&db.pool, sandbox_id).await?.0, "paused");
+    assert_eq!(
+        node_vm_status(&worker, sandbox_id).await.as_deref(),
+        Some("paused")
+    );
+    Ok(())
+}
+
+/// A `paused` target whose VM can't be paused (here the node has none) fails
+/// the attempt: the episode is reverted to `suspended` rather than committed
+/// over a running VM, and the attempt the restore ran under is released.
+#[tokio::test(flavor = "current_thread")]
+async fn a_pause_that_fails_reverts_the_episode_and_releases_the_attempt() -> Result<(), BoxError> {
+    if !crate::test_support::enter_sim_worker_process() {
+        return Ok(());
+    }
+    let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+    let sandbox_id = SandboxId::new();
+    let (substrate, _wake_attempts, _worker, s) = drained_subject(&db.pool, sandbox_id).await?;
+
+    let error = substrate
+        .restore_drained_execution(
+            SandboxApiMetricIdentity::native("drain_restore"),
+            sandbox_id,
+            options(),
+            None,
+            drain_restore(DrainRestoreTarget::Paused, s),
+        )
+        .await
+        .expect_err("no VM to pause");
+
+    assert!(matches!(error, SubstrateError::Failed { .. }), "{error:?}");
+    let (lifecycle, _, target, lease, _) = landing(&db.pool, sandbox_id).await?;
+    assert_eq!(
+        (lifecycle.as_str(), target, lease),
+        ("suspended", None, None)
+    );
+    let held: Vec<Option<Uuid>> = sqlx::query_scalar(sql!(
+        "SELECT activation_attempt_id FROM sandbox_k8s_executions WHERE sandbox_id = $1"
+    ))
+    .bind(sandbox_id)
+    .fetch_all(&db.pool)
+    .await?;
+    assert!(held.iter().all(Option::is_none), "{held:?}");
     Ok(())
 }
 

@@ -11,8 +11,8 @@ use pplx_space_db_test_fixtures::try_pg_test_db_with_max_connections;
 use super::*;
 use crate::delete::mark_deleting;
 use crate::drain_restore::{
-    DrainRestoreGateRow, DrainRestoreTarget, claim_drain_restore, complete_drain_restore,
-    drain_restore_episode_open, read_drain_restore_gate,
+    DrainRestoreCommit, DrainRestoreGateRow, DrainRestoreTarget, claim_drain_restore,
+    complete_drain_restore, drain_restore_episode_open, read_drain_restore_gate,
 };
 use crate::restore_lease::RestoreClaimRow;
 
@@ -496,8 +496,111 @@ async fn the_redrive_arm_takes_back_its_episode_after_the_lease_lapses() -> Test
     Ok(())
 }
 
-/// The commit lands the claim's target only under the claim's token and
-/// target, on its node, and ends the episode: the target and the lease clear.
+/// An active execution of `id` at `generation` in `state`, running under
+/// activation attempt `attempt` toward `attempt_target` when given, routed on
+/// a pod IP so a completion receipt can release it.
+async fn execution(
+    pool: &PgPool,
+    id: SandboxId,
+    generation: i64,
+    state: &str,
+    attempt: Option<(Uuid, &str)>,
+) -> TestResult {
+    sqlx::query(sql!(
+        "UPDATE sandbox_k8s_executions SET active = FALSE WHERE sandbox_id = $1"
+    ))
+    .bind(id)
+    .execute(pool)
+    .await?;
+    sqlx::query(sql!(
+        "INSERT INTO sandbox_k8s_executions
+             (sandbox_id, generation, pod_name, pod_namespace, state, pod_ip,
+              activation_attempt_id, activation_attempt_target_state, route_activation_id)
+         VALUES ($1, $2, $3, 'space', $4, '10.0.0.1', $5, $6, $5)"
+    ))
+    .bind(id)
+    .bind(generation)
+    .bind(format!("pod-{id}-g{generation}"))
+    .bind(state)
+    .bind(attempt.map(|(attempt, _)| attempt))
+    .bind(attempt.map(|(_, target)| target))
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// The active execution's attempt, as `(attempt, target state)`.
+async fn active_attempt(
+    pool: &PgPool,
+    id: SandboxId,
+) -> TestResult<(Option<Uuid>, Option<String>)> {
+    Ok(sqlx::query_as(sql!(
+        "SELECT activation_attempt_id, activation_attempt_target_state
+           FROM sandbox_k8s_executions
+          WHERE sandbox_id = $1 AND active"
+    ))
+    .bind(id)
+    .fetch_one(pool)
+    .await?)
+}
+
+/// Every execution of `id` as JSON text, beside [`row_image`].
+async fn executions_image(pool: &PgPool, id: SandboxId) -> TestResult<String> {
+    Ok(sqlx::query_scalar(sql!(
+        "SELECT COALESCE(jsonb_agg(to_jsonb(e) ORDER BY e.generation)::TEXT, '[]')
+           FROM sandbox_k8s_executions e
+          WHERE e.sandbox_id = $1"
+    ))
+    .bind(id)
+    .fetch_one(pool)
+    .await?)
+}
+
+/// The node's activation receipt for `attempt` on generation 1 of `id`,
+/// toward `target`, through the ingest path that projects it.
+async fn receipt(
+    executor: impl sqlx::PgExecutor<'_>,
+    node: NodeId,
+    id: SandboxId,
+    attempt: Uuid,
+    target: DrainRestoreTarget,
+) -> TestResult<Vec<SandboxId>> {
+    let rows = sqlx::types::Json(serde_json::json!([{
+        "sandbox_id": id,
+        "published_lifecycle": target.as_str(),
+        "transition_receipt_kind": pplx_space_common_core::types::SandboxTransitionReceiptKind::ActivationCompleted.as_str(),
+        "transition_receipt_target_state": target.as_str(),
+        "transition_receipt_execution_generation": 1,
+        "transition_receipt_activation_attempt_id": attempt,
+    }]));
+    Ok(crate::ingest::release_completed_activations(executor, node, rows).await?)
+}
+
+/// A drained row claimed toward `target` under `token`, on `node`, restored
+/// onto generation 1 under activation attempt `attempt`.
+async fn restored(
+    pool: &PgPool,
+    node: NodeId,
+    target: DrainRestoreTarget,
+    token: Uuid,
+    attempt: Uuid,
+) -> TestResult<SandboxId> {
+    let (id, s, _) = drained(pool, "suspended", Artifact::Marked).await?;
+    claim(pool, id, s, target, token).await?.expect("claimed");
+    sqlx::query(sql!(
+        "UPDATE sandboxes SET active_node_id = $2, target_node_id = $2 WHERE id = $1"
+    ))
+    .bind(id)
+    .bind(node)
+    .execute(pool)
+    .await?;
+    execution(pool, id, 1, "running", Some((attempt, target.as_str()))).await?;
+    Ok(id)
+}
+
+/// The commit lands the claim's target only under the claim's token, target
+/// and execution, on its node, ends the episode (the target and the lease
+/// clear) and releases the restore's attempt.
 #[tokio::test(flavor = "current_thread")]
 async fn the_commit_lands_its_own_target_and_ends_the_episode() -> TestResult {
     let Some(db) = try_pg_test_db().await? else {
@@ -505,19 +608,41 @@ async fn the_commit_lands_its_own_target_and_ends_the_episode() -> TestResult {
     };
     let pool = &db.pool;
     for target in DrainRestoreTarget::ALL {
-        let (id, s, _) = drained(pool, "suspended", Artifact::Marked).await?;
         let token = Uuid::now_v7();
-        claim(pool, id, s, target, token).await?.expect("claimed");
+        let attempt = Uuid::now_v7();
+        let id = restored(pool, NodeId::new(), target, token, attempt).await?;
         let other_target = DrainRestoreTarget::ALL
             .into_iter()
             .find(|other| *other != target)
             .expect("two targets");
-        let before = row_image(pool, id).await?;
-        assert!(!complete_drain_restore(pool, id, Uuid::now_v7(), target).await?);
-        assert!(!complete_drain_restore(pool, id, token, other_target).await?);
-        assert_eq!(row_image(pool, id).await?, before, "{target}: a miss wrote");
+        let before = (
+            row_image(pool, id).await?,
+            executions_image(pool, id).await?,
+        );
+        for (case, token, target, generation) in [
+            ("another lease", Uuid::now_v7(), target, 1),
+            ("the other target", token, other_target, 1),
+            ("another execution", token, target, 2),
+        ] {
+            assert_eq!(
+                complete_drain_restore(pool, id, token, target, generation, Some(attempt)).await?,
+                DrainRestoreCommit::Lost,
+                "{target}: {case}"
+            );
+            assert_eq!(
+                (
+                    row_image(pool, id).await?,
+                    executions_image(pool, id).await?
+                ),
+                before,
+                "{target}: {case} wrote"
+            );
+        }
 
-        assert!(complete_drain_restore(pool, id, token, target).await?);
+        assert_eq!(
+            complete_drain_restore(pool, id, token, target, 1, Some(attempt)).await?,
+            DrainRestoreCommit::Landed
+        );
         let landed: (String, String, Option<String>, Option<Uuid>, bool) = sqlx::query_as(sql!(
             "SELECT lifecycle, placement, restore_episode_target, restore_lease_token,
                         restore_lease_expires_at IS NULL
@@ -538,9 +663,190 @@ async fn the_commit_lands_its_own_target_and_ends_the_episode() -> TestResult {
             ),
             "{target}"
         );
-        // A second commit finds the episode over.
-        assert!(!complete_drain_restore(pool, id, token, target).await?);
+        assert_eq!(active_attempt(pool, id).await?, (None, None), "{target}");
     }
+    Ok(())
+}
+
+/// The node's activation receipt can land the row before the restore's own
+/// commit runs. The commit then reads the row in its target on the
+/// episode's execution as landed, and releases nothing it does not own.
+#[tokio::test(flavor = "current_thread")]
+async fn a_receipt_that_landed_first_commits_as_already_landed() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let pool = &db.pool;
+    let target = DrainRestoreTarget::Started;
+    let node = NodeId::new();
+    let token = Uuid::now_v7();
+    let attempt = Uuid::now_v7();
+    let id = restored(pool, node, target, token, attempt).await?;
+
+    assert_eq!(receipt(pool, node, id, attempt, target).await?, [id]);
+    let landed_by_receipt = row_image(pool, id).await?;
+    assert_eq!(
+        complete_drain_restore(pool, id, token, target, 1, Some(attempt)).await?,
+        DrainRestoreCommit::AlreadyLanded
+    );
+    assert_eq!(
+        row_image(pool, id).await?,
+        landed_by_receipt,
+        "the commit wrote the row"
+    );
+    assert_eq!(active_attempt(pool, id).await?, (None, None));
+    Ok(())
+}
+
+/// The same race with the receipt's transaction still open when the commit
+/// arrives: the commit waits on the row lock, then reads the receipt's
+/// landing, not the `restoring` row it would have seen without the lock.
+#[tokio::test(flavor = "current_thread")]
+async fn a_receipt_committing_while_the_commit_waits_reads_as_already_landed() -> TestResult {
+    // The receipt's transaction, the waiting commit and the lock probe each
+    // hold a connection.
+    let Some(db) = try_pg_test_db_with_max_connections(3).await? else {
+        return Ok(());
+    };
+    let pool = db.pool.clone();
+    let target = DrainRestoreTarget::Started;
+    let node = NodeId::new();
+    let token = Uuid::now_v7();
+    let attempt = Uuid::now_v7();
+    let id = restored(&pool, node, target, token, attempt).await?;
+
+    let mut receipt_tx = pool.begin().await?;
+    assert_eq!(
+        receipt(&mut *receipt_tx, node, id, attempt, target).await?,
+        [id]
+    );
+    let commit = tokio::spawn({
+        let pool = pool.clone();
+        async move { complete_drain_restore(&pool, id, token, target, 1, Some(attempt)).await }
+    });
+    wait_for_lock_waiter(&pool).await?;
+    receipt_tx.commit().await?;
+    assert_eq!(commit.await??, DrainRestoreCommit::AlreadyLanded);
+    Ok(())
+}
+
+/// A row in the target that isn't this restore's landing is lost and left
+/// exactly as it was: a user restore on a new execution, a user's pause, an
+/// execution that stopped running, the v1 marker, a row still in another
+/// lease's episode. The control row, landed by the receipt, reads as landed.
+#[tokio::test(flavor = "current_thread")]
+async fn a_row_moved_on_is_lost_unchanged() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let pool = &db.pool;
+    let target = DrainRestoreTarget::Started;
+    for case in [
+        "control",
+        "user restore on a new execution",
+        "user pause",
+        "execution not running",
+        "v1 marker",
+        "another lease's episode",
+    ] {
+        let node = NodeId::new();
+        let token = Uuid::now_v7();
+        let attempt = Uuid::now_v7();
+        let id = restored(pool, node, target, token, attempt).await?;
+        assert_eq!(
+            receipt(pool, node, id, attempt, target).await?,
+            [id],
+            "{case}"
+        );
+        match case {
+            "control" => {}
+            "user restore on a new execution" => {
+                execution(pool, id, 2, "running", None).await?;
+            }
+            "user pause" => {
+                sqlx::query(sql!(
+                    "UPDATE sandboxes SET lifecycle = 'paused' WHERE id = $1"
+                ))
+                .bind(id)
+                .execute(pool)
+                .await?;
+            }
+            "execution not running" => {
+                sqlx::query(sql!(
+                    "UPDATE sandbox_k8s_executions SET state = 'terminating'
+                      WHERE sandbox_id = $1 AND active"
+                ))
+                .bind(id)
+                .execute(pool)
+                .await?;
+            }
+            "v1 marker" => {
+                sqlx::query(sql!(
+                    "UPDATE sandboxes SET evacuation_restore_target = 'started' WHERE id = $1"
+                ))
+                .bind(id)
+                .execute(pool)
+                .await?;
+            }
+            "another lease's episode" => {
+                sqlx::query(sql!(
+                    "UPDATE sandboxes
+                        SET lifecycle = 'restoring',
+                            restore_episode_target = 'started',
+                            restore_lease_token = $2,
+                            restore_lease_expires_at = NOW() + INTERVAL '1 minute'
+                      WHERE id = $1"
+                ))
+                .bind(id)
+                .bind(Uuid::now_v7())
+                .execute(pool)
+                .await?;
+            }
+            other => unreachable!("{other}"),
+        }
+        let before = (
+            row_image(pool, id).await?,
+            executions_image(pool, id).await?,
+        );
+        let commit = complete_drain_restore(pool, id, token, target, 1, Some(attempt)).await?;
+        if case == "control" {
+            assert_eq!(commit, DrainRestoreCommit::AlreadyLanded, "{case}");
+        } else {
+            assert_eq!(commit, DrainRestoreCommit::Lost, "{case}");
+            assert_eq!(
+                (
+                    row_image(pool, id).await?,
+                    executions_image(pool, id).await?
+                ),
+                before,
+                "{case}: wrote"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// The commit releases the restore's attempt only with a landed row: a lost
+/// commit leaves it, so the attempt still fences the execution the
+/// operation will retry.
+#[tokio::test(flavor = "current_thread")]
+async fn a_lost_commit_keeps_the_attempt() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let pool = &db.pool;
+    let target = DrainRestoreTarget::Paused;
+    let token = Uuid::now_v7();
+    let attempt = Uuid::now_v7();
+    let id = restored(pool, NodeId::new(), target, token, attempt).await?;
+    assert_eq!(
+        complete_drain_restore(pool, id, Uuid::now_v7(), target, 1, Some(attempt)).await?,
+        DrainRestoreCommit::Lost
+    );
+    assert_eq!(
+        active_attempt(pool, id).await?,
+        (Some(attempt), Some("paused".to_owned()))
+    );
     Ok(())
 }
 
@@ -624,7 +930,10 @@ async fn a_delete_during_the_episode_ends_it() -> TestResult {
     mark_deleting(&mut tx, id).await?;
     tx.commit().await?;
 
-    assert!(!complete_drain_restore(pool, id, token, DrainRestoreTarget::Started).await?);
+    assert_eq!(
+        complete_drain_restore(pool, id, token, DrainRestoreTarget::Started, 1, None).await?,
+        DrainRestoreCommit::Lost
+    );
     assert!(
         claim(pool, id, s, DrainRestoreTarget::Started, Uuid::now_v7())
             .await?

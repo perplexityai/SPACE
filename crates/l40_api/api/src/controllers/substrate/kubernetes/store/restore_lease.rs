@@ -429,18 +429,23 @@ impl K8sStore {
     }
 
     /// Land a drain restore whose lease `restore_lease_token` holds in its
-    /// target ([`pplx_space_sandbox_store::drain_restore::complete_drain_restore`]).
-    /// Returns whether the row moved.
+    /// target from execution `generation`, releasing the activation attempt
+    /// it ran under
+    /// ([`pplx_space_sandbox_store::drain_restore::complete_drain_restore`]).
     pub(in crate::controllers::substrate::kubernetes) async fn complete_drain_restore(
         &self,
         sandbox_id: SandboxId,
         restore: crate::controllers::substrate::kubernetes::DrainRestore,
-    ) -> Result<bool, SubstrateError> {
+        generation: i64,
+        activation_attempt_id: Option<SandboxActivationAttemptId>,
+    ) -> Result<pplx_space_sandbox_store::drain_restore::DrainRestoreCommit, SubstrateError> {
         pplx_space_sandbox_store::drain_restore::complete_drain_restore(
             &self.pool,
             sandbox_id,
             restore.restore_lease_token,
             restore.target,
+            generation,
+            activation_attempt_id.map(|id| id.as_uuid()),
         )
         .await
         .db_context("failed to complete sandbox drain restore")

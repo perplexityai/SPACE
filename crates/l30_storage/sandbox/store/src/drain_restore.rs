@@ -199,39 +199,125 @@ pub async fn claim_drain_restore(
         .await
 }
 
+/// How [`complete_drain_restore`] found the row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DrainRestoreCommit {
+    /// The row was `restoring` in this episode under the lease, and moved to
+    /// the target.
+    Landed,
+    /// The row was already in the target on the episode's own execution: the
+    /// node's activation receipt
+    /// ([`release_completed_activations`](crate::ingest::release_completed_activations))
+    /// landed it first, which also ends the episode.
+    AlreadyLanded,
+    /// Neither: a revert, a delete, a user's call or another execution has
+    /// moved the row on. Nothing was written.
+    Lost,
+}
+
+impl DrainRestoreCommit {
+    /// Whether the restore is in its target.
+    pub const fn landed(self) -> bool {
+        matches!(self, Self::Landed | Self::AlreadyLanded)
+    }
+}
+
 /// Land the drain restore whose lease `restore_lease_token` holds in
-/// `target`, on its node, and end the episode. Writes an **operation step**
-/// (the claim's completion). Returns whether the row moved.
+/// `target`, on its node, ending the episode, and release the activation
+/// attempt `activation_attempt_id` the restore ran under on execution
+/// `generation`. Writes an **operation step** (the claim's completion).
 ///
-/// The row must still be `restoring` under that token with `target` as its
-/// episode target. A row a revert, a delete or a user takeover has moved on
-/// matches nothing, and leaving `restoring` clears the lease through the
-/// `sandboxes_clear_restore_lease` trigger.
-pub async fn complete_drain_restore(
-    executor: impl PgExecutor<'_>,
+/// Lands a row still `restoring` under that token with `target` as its
+/// episode target and `generation` as its active execution; leaving
+/// `restoring` clears the lease through the `sandboxes_clear_restore_lease`
+/// trigger. Reports [`DrainRestoreCommit::AlreadyLanded`] for a row already
+/// in `target` with no episode or v1 marker whose active execution is still
+/// `generation` and running. Every other row is [`DrainRestoreCommit::Lost`]:
+/// a user's restore runs on a new generation, and a user's pause, resume or
+/// suspend moves the lifecycle.
+///
+/// The attempt is released only with a landed row, so a connect never meets
+/// the restore's attempt on a row it may use, nor a released attempt on a
+/// row the operation will still retry. The row lock comes first, in its own
+/// statement: a receipt that lands the row concurrently has committed by the
+/// time the commit's own statement takes its snapshot.
+pub async fn complete_drain_restore<'c>(
+    conn: impl sqlx::Acquire<'c, Database = sqlx::Postgres>,
     sandbox_id: SandboxId,
     restore_lease_token: Uuid,
     target: DrainRestoreTarget,
-) -> Result<bool, sqlx::Error> {
+    generation: i64,
+    activation_attempt_id: Option<Uuid>,
+) -> Result<DrainRestoreCommit, sqlx::Error> {
+    let mut tx = conn.begin().await?;
+    sqlx::query(sql!("SELECT 1 FROM sandboxes WHERE id = $1 FOR UPDATE"))
+        .bind(sandbox_id)
+        .execute(&mut *tx)
+        .await?;
     // `$3` is both the lifecycle the row lands in and the episode target it
     // must hold: the two spell each target the same way.
-    let completed = sqlx::query(sql!(
-        "UPDATE sandboxes
-            SET lifecycle = $3,
-                placement = 'on_node',
-                restore_episode_target = NULL
-          WHERE id = $1
-            AND lifecycle = 'restoring'
-            AND restore_lease_token = $2
-            AND restore_episode_target = $3"
+    let (landed, already): (bool, bool) = sqlx::query_as(sql!(
+        "WITH landed AS (
+             UPDATE sandboxes s
+                SET lifecycle = $3,
+                    placement = 'on_node',
+                    restore_episode_target = NULL
+              WHERE s.id = $1
+                AND s.lifecycle = 'restoring'
+                AND s.restore_lease_token = $2
+                AND s.restore_episode_target = $3
+                AND EXISTS (
+                  SELECT 1
+                    FROM sandbox_k8s_executions e
+                   WHERE e.sandbox_id = s.id AND e.active AND e.generation = $4
+                )
+              RETURNING s.id
+         ), already AS (
+             SELECT s.id
+               FROM sandboxes s
+              WHERE s.id = $1
+                AND s.lifecycle = $3
+                AND s.restore_episode_target IS NULL
+                AND s.evacuation_restore_target IS NULL
+                AND EXISTS (
+                  SELECT 1
+                    FROM sandbox_k8s_executions e
+                   WHERE e.sandbox_id = s.id
+                     AND e.active
+                     AND e.generation = $4
+                     AND e.state = 'running'
+                )
+         ), released AS (
+             UPDATE sandbox_k8s_executions e
+                SET activation_attempt_id = NULL,
+                    activation_attempt_expires_at = NULL,
+                    activation_attempt_target_state = NULL
+              WHERE e.sandbox_id = $1
+                AND e.active
+                AND e.generation = $4
+                AND e.activation_attempt_id = $5
+                AND (EXISTS (SELECT 1 FROM landed) OR EXISTS (SELECT 1 FROM already))
+              RETURNING e.id
+         )
+         SELECT EXISTS (SELECT 1 FROM landed),
+                EXISTS (SELECT 1 FROM already)
+           FROM (SELECT COUNT(*) FROM released) AS released_count"
     ))
     .bind(sandbox_id)
     .bind(restore_lease_token)
     .bind(target.as_str())
-    .execute(executor)
-    .await?
-    .rows_affected();
-    Ok(completed == 1)
+    .bind(generation)
+    .bind(activation_attempt_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(if landed {
+        DrainRestoreCommit::Landed
+    } else if already {
+        DrainRestoreCommit::AlreadyLanded
+    } else {
+        DrainRestoreCommit::Lost
+    })
 }
 
 /// What [`read_drain_restore_gate`] reads of a sandbox and the snapshot a

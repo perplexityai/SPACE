@@ -273,6 +273,14 @@ impl RestoreClaimHandling {
     }
 }
 
+/// What [`KubernetesSubstrate::restore_execution_activation`] produced.
+enum RestoreActivation {
+    /// The restore joined another caller's, which finishes it.
+    Joined,
+    /// This caller's restore, with its binding and the attempt it ran under.
+    Owned(ExecutionActivation),
+}
+
 impl KubernetesSubstrate {
     async fn publish_started_recovery_completion(
         &self,
@@ -1247,6 +1255,18 @@ impl KubernetesSubstrate {
     /// target, it lands the row there under the claim's lease
     /// ([`K8sStore::complete_drain_restore`]) and returns whether that moved
     /// it. A claim it cannot take fails with `EvacuationClaimLost`.
+    ///
+    /// A restore pod's VM always comes up running: the node restores it in
+    /// the pod's sandbox creation, before the Wake that names the target, and
+    /// a Wake toward `paused` leaves a running VM running. So a `paused`
+    /// target pauses the VM through the node's `PauseSandbox`, as a user's
+    /// pause does, before the commit. A pause that fails reverts the episode
+    /// and fails the attempt.
+    ///
+    /// The commit also accepts a row the node's activation receipt already
+    /// landed in the target on this restore's own execution. Every exit
+    /// releases the activation attempt the restore ran under: the commit
+    /// releases it with a landed row, and a failed pause after its revert.
     pub async fn restore_drained_execution(
         &self,
         metric_identity: crate::metrics::sandbox::api::SandboxApiMetricIdentity,
@@ -1255,14 +1275,108 @@ impl KubernetesSubstrate {
         placement: Option<&EvacuationPlacement>,
         restore: DrainRestore,
     ) -> Result<bool, SubstrateError> {
-        self.restore_execution_inner(
-            metric_identity,
-            sandbox_id,
-            options,
-            RestoreIntent::drain_operation(placement.cloned(), restore),
+        let activation = match self
+            .restore_execution_activation(
+                metric_identity,
+                sandbox_id,
+                options,
+                RestoreIntent::drain_operation(placement.cloned(), restore),
+            )
+            .await?
+        {
+            RestoreActivation::Owned(activation) => activation,
+            // A drain restore's claim neither joins an in-flight restore nor
+            // a completed one.
+            RestoreActivation::Joined => {
+                return Err(SubstrateError::Failed {
+                    message: format!("drain restore of sandbox {sandbox_id} joined a restore"),
+                });
+            }
+        };
+        let generation = i64::try_from(activation.binding.execution_generation).map_err(|_| {
+            SubstrateError::Failed {
+                message: format!(
+                    "drain restore of sandbox {sandbox_id} ran on execution generation {}, \
+                     above i64::MAX",
+                    activation.binding.execution_generation
+                ),
+            }
+        })?;
+        let attempt = activation
+            .lease_completion
+            .filter(|completion| completion.generation == generation)
+            .map(|completion| completion.attempt_id);
+        if restore.target == pplx_space_sandbox_store::drain_restore::DrainRestoreTarget::Paused
+            && let Err(error) = self
+                .pause_drain_restored_execution(sandbox_id, &activation.binding)
+                .await
+        {
+            self.revert_drain_restore_episode(sandbox_id, restore).await;
+            if let Some(attempt) = attempt {
+                self.store
+                    .release_finished_activation_attempt_best_effort(
+                        sandbox_id, generation, attempt,
+                    )
+                    .await;
+            }
+            return Err(error);
+        }
+        Ok(self
+            .store
+            .complete_drain_restore(sandbox_id, restore, generation, attempt)
+            .await?
+            .landed())
+    }
+
+    /// Pause the running VM a drain restore toward `paused` brought up, on
+    /// the execution `binding` names. A VM already paused, by an earlier
+    /// attempt of the same episode, is left as it is.
+    async fn pause_drain_restored_execution(
+        &self,
+        sandbox_id: SandboxId,
+        binding: &ExecutionBinding,
+    ) -> Result<(), SubstrateError> {
+        use pplx_space_sbx_mgr_client::proto::SandboxLifecycleState as NodeLifecycle;
+
+        let unavailable = |what: &str, error: &dyn std::fmt::Display| SubstrateError::Unavailable {
+            message: format!("drain restore of sandbox {sandbox_id}: {what}: {error}"),
+        };
+        let mut client = crate::controllers::substrate::node_api_client::connect_worker(
+            binding.runtime_endpoint.clone(),
         )
-        .await?;
-        self.store.complete_drain_restore(sandbox_id, restore).await
+        .await
+        .map_err(|error| unavailable("connect to its node", &error))?;
+        let id = sandbox_id.to_string();
+        let state = client
+            .sandbox_state(pplx_space_sbx_mgr_client::proto::StateRequest {
+                sandbox_ids: vec![id.clone()],
+            })
+            .await
+            .map_err(|status| unavailable("read its node state", &status))?
+            .into_inner();
+        let lifecycle = state
+            .sandboxes
+            .iter()
+            .find(|info| info.sandbox_id == id)
+            .and_then(|info| info.lifecycle)
+            .and_then(|value| NodeLifecycle::try_from(value).ok());
+        match lifecycle {
+            Some(NodeLifecycle::Paused) => return Ok(()),
+            Some(NodeLifecycle::Started) => {}
+            other => {
+                return Err(SubstrateError::Failed {
+                    message: format!(
+                        "drain restore of sandbox {sandbox_id} toward paused found its VM {}",
+                        other.map_or("absent", |lifecycle| lifecycle.as_str_name())
+                    ),
+                });
+            }
+        }
+        client
+            .pause_sandbox(pplx_space_sbx_mgr_client::proto::PauseRequest { sandbox_id: id })
+            .await
+            .map_err(|status| unavailable("pause its VM", &status))?;
+        Ok(())
     }
 
     /// End an episode a drain restore operation left open under its lease, as
@@ -1295,6 +1409,26 @@ impl KubernetesSubstrate {
         options: ActivationOptions,
         intent: RestoreIntent,
     ) -> Result<ActivationCompletion, SubstrateError> {
+        Ok(
+            match self
+                .restore_execution_activation(metric_identity, sandbox_id, options, intent)
+                .await?
+            {
+                RestoreActivation::Joined => ActivationCompletion::Joined,
+                RestoreActivation::Owned(activation) => activation.completion,
+            },
+        )
+    }
+
+    /// [`Self::restore_execution_inner`], keeping the activation an owned
+    /// restore produced: its binding and the attempt it ran under.
+    async fn restore_execution_activation(
+        &self,
+        metric_identity: crate::metrics::sandbox::api::SandboxApiMetricIdentity,
+        sandbox_id: SandboxId,
+        options: ActivationOptions,
+        intent: RestoreIntent,
+    ) -> Result<RestoreActivation, SubstrateError> {
         let target_state = intent.target.state();
         if !options.blocking {
             return Err(SubstrateError::Conflict {
@@ -1366,7 +1500,7 @@ impl KubernetesSubstrate {
                         .await?
                     {
                         UserRestoreJoin::Completed(_) => {
-                            return Ok(ActivationCompletion::Joined);
+                            return Ok(RestoreActivation::Joined);
                         }
                         UserRestoreJoin::Claimable => {
                             crate::metrics::sandbox::api::restore_claim_lap(
@@ -1384,7 +1518,7 @@ impl KubernetesSubstrate {
                         .await?
                         .is_some()
                     {
-                        return Ok(ActivationCompletion::Joined);
+                        return Ok(RestoreActivation::Joined);
                     }
                     return Err(err);
                 }
@@ -1416,7 +1550,7 @@ impl KubernetesSubstrate {
                 RestoreClaimHandling::preclaimed_with_cleanup(restore_claim),
             )
             .await?;
-        Ok(activation.completion)
+        Ok(RestoreActivation::Owned(activation))
     }
 
     pub(super) async fn wake_execution_with_metric_identity(
@@ -2438,7 +2572,19 @@ impl KubernetesSubstrate {
                 ),
             }
         }
-        result.map(|(binding, _)| ExecutionActivation::owned(binding))
+        // The attempt this wake owned, for a caller that commits the
+        // lifecycle itself and releases it then (the drain restore
+        // operation). Every other caller ignores it.
+        result.map(|(binding, owned_attempt)| {
+            let mut activation = ExecutionActivation::owned(binding);
+            activation.lease_completion = owned_attempt.map(|(attempt_id, generation)| {
+                crate::controllers::substrate::ActivationLeaseCompletion {
+                    generation,
+                    attempt_id,
+                }
+            });
+            activation
+        })
     }
 }
 

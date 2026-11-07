@@ -2043,6 +2043,9 @@ mod kubernetes_tests {
     // `SimWorkerHarness`.
     pub(crate) struct SequencedWakeWorkerHandle {
         pub(crate) port: u16,
+        /// The simulator behind the worker's public RPCs (`PauseSandbox`,
+        /// `SandboxState`), which a test seeds with the VM it expects.
+        pub(crate) sim_state: SimState,
         pub(crate) received:
             Arc<std::sync::Mutex<Vec<pplx_space_sbx_mgr_client::proto::WakeRequest>>>,
         health_reporter: tonic_health::server::HealthReporter,
@@ -2088,7 +2091,7 @@ mod kubernetes_tests {
             dir.path().join("sandboxes"),
             "node-a".to_string(),
         );
-        let worker_service = SimWorkerApiService::new(sim_state);
+        let worker_service = SimWorkerApiService::new(sim_state.clone());
         let received = Arc::default();
         let service = SequencedWakeWorker {
             wake_attempts,
@@ -2127,6 +2130,7 @@ mod kubernetes_tests {
         });
         Ok(SequencedWakeWorkerHandle {
             port,
+            sim_state,
             received,
             health_reporter,
             shutdown,
