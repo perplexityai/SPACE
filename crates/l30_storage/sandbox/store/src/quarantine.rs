@@ -39,7 +39,8 @@ pub async fn converge_activation_rollback(
                     active_node_id = NULL,
                     command_ready_pending = FALSE,
                     lifecycle_changed_at = NOW(),
-                    placement_changed_at = CASE WHEN $4 THEN NULL ELSE placement_changed_at END
+                    placement_changed_at = CASE WHEN $4 THEN NULL ELSE placement_changed_at END,
+                    restore_episode_target = NULL
               WHERE id = $1
                 AND active_node_id = $2
                 AND lifecycle NOT IN ('quarantined', 'deleted', 'deleting')"
@@ -57,6 +58,9 @@ pub async fn converge_activation_rollback(
 /// `generation`'s execution as `replaced`: not an evacuation restore, the
 /// restore created the execution, and the suspended-revert proof
 /// ([`restore_retry_suspended_revert_snapshot_exists`]) holds. Reads only.
+/// A restore episode target doesn't stop the retirement: the rollback clears
+/// it ([`converge_activation_rollback`]), so the row it leaves is a markerless
+/// `suspended` row.
 ///
 /// Read before the rollback converges the lifecycle, so `lifecycle_changed_at`
 /// still names the transition into the restore the node rolled back. The

@@ -256,7 +256,8 @@ pub(super) async fn group_occupancy_in_tx(
                          AND (
                              lifecycle = 'suspending'
                              OR (lifecycle = 'restoring'
-                                 AND evacuation_restore_target IS NULL)
+                                 AND evacuation_restore_target IS NULL
+                                 AND restore_episode_target IS NULL)
                          )
                        )
              )::BIGINT AS active,

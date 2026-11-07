@@ -1564,7 +1564,7 @@ impl KubernetesSubstrate {
                         .fetch_restore_ownership_snapshot(sandbox_id)
                         .await
                         .ok()
-                        .map(|(_, _, remaining_secs)| remaining_secs)
+                        .map(|(_, _, _, remaining_secs)| remaining_secs)
                         .filter(|remaining_secs| *remaining_secs > 0.0)
                         .map(Duration::from_secs_f64);
                     return Err(SubstrateError::RestoreInFlight {

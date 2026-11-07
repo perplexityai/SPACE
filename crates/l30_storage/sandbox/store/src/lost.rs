@@ -54,7 +54,8 @@ pub async fn mark_started_lost(
         sql!(
             format!(
                 "UPDATE sandboxes s
-                    SET lifecycle = 'failed'
+                    SET lifecycle = 'failed',
+                        restore_episode_target = NULL
                   WHERE s.id = $1
                     AND s.managed_by = $5
                     AND s.lifecycle = 'started'
@@ -216,7 +217,8 @@ pub fn mark_unrecoverable_sandboxes_lost_query() -> String {
         inflight_suspend_upload_from_other_node_exists("sandboxes", "$1");
     format!(
         "UPDATE sandboxes
-            SET lifecycle = 'failed'
+            SET lifecycle = 'failed',
+                restore_episode_target = NULL
           WHERE lifecycle = 'suspended'
             AND target_node_id = $1
             -- Settle guard on same-node creating uploads ($4 = quiet

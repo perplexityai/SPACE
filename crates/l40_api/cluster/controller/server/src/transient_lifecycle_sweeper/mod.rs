@@ -233,9 +233,11 @@ pub use store::SubstrateSweepSink;
 /// `failed` would be a regression rather than an unblock.
 ///
 /// Independently of this set, the production [`SubstrateSweepSink`] exempts
-/// evacuation-marked **`restoring`** rows (non-NULL
-/// `evacuation_restore_target`) from age-out — node-drain owns re-driving
-/// those, so the backstop must not race them to `failed`. Marked
+/// **`restoring`** rows that carry `evacuation_restore_target` or
+/// `restore_episode_target` from age-out. Node-drain owns re-driving rows with
+/// the marker, so the backstop must not race them to `failed`; nothing
+/// re-drives a row with a restore episode target yet except a user's restore
+/// on Direct, whose claim ignores the target. Marked
 /// `suspending` rows are deliberately **not** exempt: nothing else recovers a
 /// crashed/hung evacuation suspend, so the backstop is its only age-out path.
 pub(crate) const SWEEPABLE_LIFECYCLES: &[SandboxLifecycle] = &[

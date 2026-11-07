@@ -1601,7 +1601,8 @@ pub fn recoverable_suspend_snapshot_exists(sandbox_alias: &str) -> String {
 /// `drained_node_terminator` `drained → terminating` guard) stay in lockstep
 /// with the cohort-restore predicate:
 ///
-/// * **Evacuation-marked** (`evacuation_restore_target IS NOT NULL`): the
+/// * **Evacuation-marked** (`evacuation_restore_target IS NOT NULL`, or a
+///   system restore episode's `restore_episode_target IS NOT NULL`): the
 ///   *newest* full snapshot must be `ready` ([`latest_full_snapshot_ready`]) —
 ///   the exact condition the cohort restore waits on. Releasing the source on
 ///   the older [`fresh_ready_snapshot_exists`] instead would let the node
@@ -1635,9 +1636,12 @@ pub fn snapshot_durable_for_source_release(sandbox_alias: &str) -> String {
                     OR (
                         {sandbox_alias}.current_local_artifact_id IS NULL
                         AND (
-                            ({sandbox_alias}.evacuation_restore_target IS NOT NULL AND {no_newer})
+                            (({sandbox_alias}.evacuation_restore_target IS NOT NULL
+                              OR {sandbox_alias}.restore_episode_target IS NOT NULL)
+                             AND {no_newer})
                             OR (
                                 {sandbox_alias}.evacuation_restore_target IS NULL
+                                AND {sandbox_alias}.restore_episode_target IS NULL
                                 AND (
                                     {sandbox_alias}.placement_changed_at IS NULL
                                     OR sn.timestamp >= {sandbox_alias}.placement_changed_at
@@ -2176,10 +2180,11 @@ pub fn portable_for_restore_affinity(sandbox_alias: &str) -> String {
 /// - `suspending` — the suspend RPC is mid-flight, so the local artifact is not
 ///   yet published.
 /// - `restoring` **only for non-evacuation restores**
-///   (`evacuation_restore_target IS NULL`). An evacuation restore reads from the
-///   durable S3 backup and briefly sits in `restoring` with `target_node_id`
-///   still equal to the source, so counting it would re-couple the source drain
-///   to restore completion.
+///   (`evacuation_restore_target IS NULL` and `restore_episode_target IS
+///   NULL`). An evacuation restore, or a system restore episode carrying
+///   `restore_episode_target`, reads from the durable S3 backup and briefly
+///   sits in `restoring` with `target_node_id` still equal to the source, so
+///   counting it would re-couple the source drain to restore completion.
 /// - `suspended` whose newest full snapshot is not yet durably restorable, via
 ///   the marker-aware [`snapshot_durable_for_source_release`] — the same
 ///   predicate the cohort restore waits on, so the source cannot terminate
@@ -2246,7 +2251,8 @@ fn drain_gate_target_pinned_blocks(sandbox_alias: &str, node_expr: &str) -> Stri
              AND (\n\
                  {sandbox_alias}.lifecycle = 'suspending'\n\
                  OR ({sandbox_alias}.lifecycle = 'restoring'\n\
-                     AND {sandbox_alias}.evacuation_restore_target IS NULL)\n\
+                     AND {sandbox_alias}.evacuation_restore_target IS NULL\n\
+                     AND {sandbox_alias}.restore_episode_target IS NULL)\n\
                  OR ({sandbox_alias}.lifecycle = 'suspended' AND NOT {durable})\n\
              )\n\
          )"

@@ -78,11 +78,12 @@ pub async fn unplace_after_pod_teardown_preserving_placement_clock(
 /// Writes an **inference** (the control plane concluding the restore is
 /// abandoned).
 ///
-/// Guarded on `restoring`, no evacuation marker, no active execution, and
-/// [`restore_retry_suspended_revert_snapshot_exists`]. The caller holds the
-/// sandbox row lock, which execution creation also takes, so no successor
-/// execution can appear between this proof and commit. Callers retire the
-/// execution, or confirm that none is active, earlier in this transaction.
+/// Guarded on `restoring`, no evacuation marker or restore episode target, no
+/// active execution, and [`restore_retry_suspended_revert_snapshot_exists`].
+/// The caller holds the sandbox row lock, which execution creation also
+/// takes, so no successor execution can appear between this proof and commit.
+/// Callers retire the execution, or confirm that none is active, earlier in
+/// this transaction.
 pub async fn recover_markerless_restoring_after_execution_cleanup(
     tx: &mut Transaction<'_, Postgres>,
     sandbox_id: SandboxId,
@@ -104,6 +105,7 @@ pub async fn recover_markerless_restoring_after_execution_cleanup(
               WHERE s.id = $1
                 AND s.lifecycle = 'restoring'
                 AND s.evacuation_restore_target IS NULL
+                AND s.restore_episode_target IS NULL
                 AND NOT EXISTS (
                     SELECT 1
                       FROM sandbox_k8s_executions e

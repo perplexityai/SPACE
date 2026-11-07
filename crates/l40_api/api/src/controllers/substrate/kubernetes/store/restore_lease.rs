@@ -3,18 +3,37 @@
 
 use super::*;
 use pplx_space_sandbox_store::restore_lease;
+use pplx_space_sandbox_store::sweeper::{
+    EvacuationRestoreTarget, EvacuationRestoreTargetParseError,
+};
+
+/// A stored `restore_episode_target`, parsed; an `Err` is a value the
+/// column's CHECK rules out.
+type StoredEpisodeTarget = Result<EvacuationRestoreTarget, EvacuationRestoreTargetParseError>;
 
 impl K8sStore {
     /// Post-CAS-loss snapshot of the restore gate. Fresh execution work keeps
     /// ownership live after the original lease deadline so an already-issued
     /// Kubernetes or worker request cannot overlap a replacement owner.
+    ///
+    /// Returns the lifecycle, the evacuation marker, the restore episode
+    /// target, and the ownership window left.
     pub(in crate::controllers::substrate::kubernetes) async fn fetch_restore_ownership_snapshot(
         &self,
         sandbox_id: SandboxId,
-    ) -> Result<(SandboxLifecycle, Option<String>, f64), SubstrateError> {
+    ) -> Result<
+        (
+            SandboxLifecycle,
+            Option<String>,
+            Option<StoredEpisodeTarget>,
+            f64,
+        ),
+        SubstrateError,
+    > {
         let restore_lease::RestoreOwnershipSnapshot {
             lifecycle,
             evacuation_restore_target: marker,
+            restore_episode_target,
             lease_remaining_secs,
             execution_remaining_secs,
         } = restore_lease::restore_ownership_snapshot(
@@ -38,7 +57,12 @@ impl K8sStore {
         } else {
             lease_remaining_secs
         };
-        Ok((lifecycle, marker, ownership_remaining_secs))
+        Ok((
+            lifecycle,
+            marker,
+            restore_episode_target,
+            ownership_remaining_secs,
+        ))
     }
 
     pub(super) fn restore_ownership_collision(
@@ -95,6 +119,7 @@ impl K8sStore {
                      sandbox_id,
                      lifecycle,
                      evacuation_restore_target: marker,
+                     restore_episode_target,
                      lease_remaining_secs,
                      execution_remaining_secs,
                      generation,
@@ -138,6 +163,7 @@ impl K8sStore {
                         lifecycle,
                         SandboxLifecycle::Suspended | SandboxLifecycle::Restoring
                     ) && marker.is_none()
+                        && restore_episode_target.is_none()
                         && ownership_remaining_secs > 0.0
                     {
                         UserRestoreObservation::InFlight {
@@ -383,10 +409,12 @@ impl K8sStore {
         // lease means a prior user attempt timed out and retry may re-drive,
         // while an unexpired lease means a restore is still active and must be
         // reported as retryable rather than driven twice. A `restoring` row
-        // that still carries the marker is a drain restore in flight, and the
-        // user path must NOT grab it. (A `suspended` row with a marker is still
-        // a clean user takeover: the user wins `suspended → restoring`, clears
-        // the marker, and the drain's marker-required claim then loses.)
+        // that still carries the marker, or a restore episode target, is a
+        // system restore in flight, and the user path must NOT grab it, nor
+        // report it as a user restore's lease. (A `suspended` row with a
+        // marker is still a clean user takeover: the user wins `suspended →
+        // restoring`, clears the marker, and the drain's marker-required claim
+        // then loses.)
         //
         // The evacuation claim also takes a released stopped evacuation:
         // marker `'stopped'` and no `active_node_id`, for a `Stopped` target
@@ -417,7 +445,7 @@ impl K8sStore {
         .db_context("failed to begin sandbox restore")?;
 
         let Some(restore_claim) = restore_claim else {
-            let (lifecycle, marker, ownership_remaining_secs) =
+            let (lifecycle, marker, episode_target, ownership_remaining_secs) =
                 self.fetch_restore_ownership_snapshot(sandbox_id).await?;
             // When the marker was required and the row is still in the
             // suspend/restore window, the CAS lost to a concurrent user
@@ -461,6 +489,7 @@ impl K8sStore {
             }
             if !require_evacuation_marker
                 && marker.is_none()
+                && episode_target.is_none()
                 && ownership_remaining_secs > 0.0
                 && matches!(
                     lifecycle,
@@ -518,20 +547,20 @@ impl K8sStore {
             };
         }
 
-        let (lifecycle, marker, ownership_remaining_secs) =
+        let (lifecycle, marker, episode_target, ownership_remaining_secs) =
             self.fetch_restore_ownership_snapshot(sandbox_id).await?;
+        // A restore episode target marks the row the system's, as the marker
+        // does.
+        let marked = marker.is_some() || episode_target.is_some();
 
-        if lifecycle == SandboxLifecycle::Restoring
-            && marker.is_none()
-            && ownership_remaining_secs > 0.0
-        {
+        if lifecycle == SandboxLifecycle::Restoring && !marked && ownership_remaining_secs > 0.0 {
             return Err(Self::restore_ownership_collision(
                 sandbox_id,
                 ownership_remaining_secs,
             ));
         }
 
-        if lifecycle == SandboxLifecycle::Restoring && marker.is_some() {
+        if lifecycle == SandboxLifecycle::Restoring && marked {
             return Ok(None);
         }
 
@@ -650,16 +679,20 @@ impl K8sStore {
     /// pre-bound there. The row stays `restoring` with the marker until the
     /// drain settles it, including the whole backoff after a failed attempt.
     ///
-    /// Only the `'stopped'` marker refuses. A `restoring` row with another
-    /// marker is a suspended evacuation, whose snapshot a user wake can
-    /// restore from, and it keeps its takeover path. The marker comes from the
-    /// row, not the caller's `Sandbox`, which may predate the missed claim.
+    /// Only the `'stopped'` marker refuses, and a `stopped` restore episode
+    /// target refuses as it does. A `restoring` row with another marker is a
+    /// suspended evacuation, whose snapshot a user wake can restore from, and
+    /// it keeps its takeover path. The marker comes from the row, not the
+    /// caller's `Sandbox`, which may predate the missed claim.
     async fn refuse_user_wake_of_stopped_re_placement(
         &self,
         sandbox_id: SandboxId,
     ) -> Result<(), SubstrateError> {
-        let (_, marker, _) = self.fetch_restore_ownership_snapshot(sandbox_id).await?;
-        if marker.as_deref() == Some("stopped") {
+        let (_, marker, episode_target, _) =
+            self.fetch_restore_ownership_snapshot(sandbox_id).await?;
+        if marker.as_deref() == Some("stopped")
+            || matches!(episode_target, Some(Ok(EvacuationRestoreTarget::Stopped)))
+        {
             return Err(super::stopped_evacuation_pending());
         }
         Ok(())

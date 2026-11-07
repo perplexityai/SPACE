@@ -59,7 +59,8 @@ pub(super) fn query(ranked: bool, residency: ResidencyEvidence) -> String {
                   lifecycle = 'suspended'
                   OR ({ranked} AND (
                       lifecycle = 'suspending'
-                      OR (lifecycle = 'restoring' AND evacuation_restore_target IS NULL)
+                      OR (lifecycle = 'restoring' AND evacuation_restore_target IS NULL
+                          AND restore_episode_target IS NULL)
                   ))
               )
              UNION
@@ -68,6 +69,7 @@ pub(super) fn query(ranked: bool, residency: ResidencyEvidence) -> String {
              SELECT s.active_node_id = $1::UUID AND {active} AS active,
                     s.target_node_id = $1::UUID AS targeted,
                     s.lifecycle, s.lifecycle_changed_at, s.evacuation_restore_target,
+                    s.restore_episode_target,
                     CASE WHEN s.active_node_id = $1::UUID AND {active}
                          THEN {present} ELSE FALSE END AS present,
                     COALESCE(u.legacy_upload, FALSE) AS legacy_upload,
@@ -80,7 +82,7 @@ pub(super) fn query(ranked: bool, residency: ResidencyEvidence) -> String {
                    SELECT id, active_node_id, target_node_id, lifecycle,
                           lifecycle_changed_at, placement_changed_at,
                           current_local_artifact_id, current_local_artifact_kind,
-                          evacuation_restore_target
+                          evacuation_restore_target, restore_episode_target
                      FROM sandboxes WHERE id = c.id OFFSET 0
                ) s
                LEFT JOIN uploading u ON u.sandbox_id = s.id
@@ -103,7 +105,8 @@ pub(super) fn query(ranked: bool, residency: ResidencyEvidence) -> String {
                     WHERE {ranked} AND (
                         (targeted AND (
                             lifecycle = 'suspending'
-                            OR (lifecycle = 'restoring' AND evacuation_restore_target IS NULL)
+                            OR (lifecycle = 'restoring' AND evacuation_restore_target IS NULL
+                                AND restore_episode_target IS NULL)
                             OR (lifecycle = 'suspended' AND NOT durable)
                         )) OR (current_upload AND NOT durable)
                     )

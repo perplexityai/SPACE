@@ -27,14 +27,16 @@ pub struct RestoreSourcePlanRow {
     pub execution_name: Option<String>,
     /// `COALESCE(target_node_id, active_node_id)`.
     pub placement_node_id: Option<NodeId>,
-    /// The marker is `'stopped'` and `active_node_id` is NULL.
+    /// The marker or the restore episode target is `'stopped'` and
+    /// `active_node_id` is NULL.
     pub stopped_evacuation_unplaced: bool,
 }
 
 /// Read the restore source of a `stopped` sandbox's row, for a restart that
 /// may have to pin its pod to a node. `None` when no row exists.
 ///
-/// Only `'stopped'` counts as the marker. The other two values belong to the
+/// Only `'stopped'` counts as the marker, and a `restore_episode_target` of
+/// `'stopped'` counts as it does. The other two values belong to the
 /// suspend → restore pipeline, which parks its rows in `suspended` and
 /// resolves them through the storage-URI path; reading them here would refuse
 /// restores that path already handles.
@@ -81,7 +83,9 @@ pub async fn restore_source_plan(
              -- the mid-re-placement phase of
              -- `a_stopped_evacuation_counts_as_unplaced_only_once_its_local_copy_is_gone`.
              COALESCE(
-                 s.evacuation_restore_target = 'stopped' AND s.active_node_id IS NULL,
+                 (s.evacuation_restore_target = 'stopped'
+                  OR s.restore_episode_target = 'stopped')
+                 AND s.active_node_id IS NULL,
                  FALSE
              ) AS stopped_evacuation_unplaced
              FROM sandboxes s
@@ -115,8 +119,8 @@ pub struct StoppedEvacuationRestoreSourceRow {
 /// `stopped` sandbox from, once the evacuation claim has moved the row to
 /// `restoring`. `None` when nothing matches.
 ///
-/// `evacuation_restore_target = 'stopped'` is what scopes this to the stopped
-/// evacuation. A suspended evacuation's `restoring` row carries `'started'` or
+/// `evacuation_restore_target = 'stopped'`, or a `restore_episode_target` of
+/// `'stopped'`, is what scopes this to the stopped evacuation or episode. A suspended evacuation's `restoring` row carries `'started'` or
 /// `'paused'`, and a user restore clears the marker when it claims, so neither
 /// can select a disk artifact here.
 ///
@@ -143,7 +147,8 @@ pub async fn stopped_evacuation_restore_source(
                JOIN snapshot_storage_locations ssl ON ssl.snapshot_id = sn.id
               WHERE s.id = $1
                 AND s.lifecycle = 'restoring'
-                AND s.evacuation_restore_target = 'stopped'
+                AND (s.evacuation_restore_target = 'stopped'
+                     OR s.restore_episode_target = 'stopped')
                 AND ssl.orphaned_at IS NULL
                 AND sn.type = 'disk'
                 AND sn.state = 'ready'
