@@ -16,6 +16,7 @@ use super::{
 use super::sweeper::{EvacuationRestoreTarget, EvacuationRestoreTargetParseError};
 
 mod create_finish_tests;
+mod drain_restore_tests;
 mod insert_unplaced_tests;
 mod restore_episode_target_tests;
 

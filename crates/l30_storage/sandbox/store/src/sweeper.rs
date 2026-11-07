@@ -271,9 +271,11 @@ pub const fn is_activation_owned(lifecycle: SandboxLifecycle) -> bool {
 ///    same order of magnitude as this sweep's default age) and has its own
 ///    re-drive path (`restore_pending_evacuations_query` + `restore_in_flight`),
 ///    so the backstop must not race it. A `restoring` row with a
-///    `restore_episode_target` is exempt the same way, although nothing
-///    re-drives it yet except a user's restore on Direct, whose claim ignores
-///    the target. The clear-trigger only keeps the marker
+///    `restore_episode_target` is exempt the same way: the drain restore
+///    operation re-drives one toward `started` or `paused`
+///    ([`crate::drain_restore`]), and this sweep's fail would drop the state
+///    it restores. Nothing re-drives a `stopped` one yet except a user's
+///    restore on Direct, whose claim ignores the target. The clear-trigger only keeps the marker
 ///    on `suspending`/`suspended`/`restoring`, and `suspended` isn't sweepable,
 ///    so `restoring` is the only lifecycle this exemption actually spares. A
 ///    marked `suspending` row is deliberately *not* spared by this clause —
@@ -334,7 +336,8 @@ pub fn evacuation_guards(
 ///
 /// It is also the type of `sandboxes.restore_episode_target`, the landing
 /// lifecycle of a restore episode that isn't the default, whose CHECK admits
-/// the same three values. Nothing writes that column yet. Readers that ask
+/// the same three values. The drain restore operation's claim writes it
+/// ([`crate::drain_restore`]). Readers that ask
 /// whether a restore is the system's, or where it lands, read it as they read
 /// the marker, and the two are never both set. Unlike the marker, no trigger
 /// clears it. It belongs to one restore episode: only the claim that moves a
