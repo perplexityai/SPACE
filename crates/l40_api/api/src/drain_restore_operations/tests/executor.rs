@@ -214,7 +214,7 @@ async fn each_gate_ends_the_attempt_as_it_says() -> Result<(), BoxError> {
         let body = if case.valid_payload {
             payload(id, s)
         } else {
-            serde_json::json!({ "sandbox_id": target_id, "target": "stopped", "snapshot_id": s })
+            serde_json::json!({ "sandbox_id": target_id, "target": "suspended", "snapshot_id": s })
         };
         let operation = claimed(pool, body, &target_id, 0).await?;
         let before = row_image(pool, id).await?;

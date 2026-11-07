@@ -17,6 +17,9 @@ use crate::drain_restore::{
 use crate::restore_lease::RestoreClaimRow;
 
 const LEASE_TTL_SECS: i64 = 60;
+/// The targets restored from a suspend snapshot.
+const VM_TARGETS: [DrainRestoreTarget; 2] =
+    [DrainRestoreTarget::Started, DrainRestoreTarget::Paused];
 const EXECUTION_OWNERSHIP_TTL_SECS: i64 = 300;
 
 /// When S, the drain's suspend snapshot, was taken in these fixtures.
@@ -173,7 +176,7 @@ async fn a_suspended_row_whose_selector_loads_s_is_claimed() -> TestResult {
     };
     let pool = &db.pool;
     for artifact in [Artifact::Marked, Artifact::Legacy] {
-        for target in DrainRestoreTarget::ALL {
+        for target in VM_TARGETS {
             let (id, s, _) = drained(pool, "suspended", artifact).await?;
             // An older ready snapshot the selector passes over.
             snapshot(pool, id, None, "ready", OLDER, false).await?;
@@ -607,11 +610,11 @@ async fn the_commit_lands_its_own_target_and_ends_the_episode() -> TestResult {
         return Ok(());
     };
     let pool = &db.pool;
-    for target in DrainRestoreTarget::ALL {
+    for target in VM_TARGETS {
         let token = Uuid::now_v7();
         let attempt = Uuid::now_v7();
         let id = restored(pool, NodeId::new(), target, token, attempt).await?;
-        let other_target = DrainRestoreTarget::ALL
+        let other_target = VM_TARGETS
             .into_iter()
             .find(|other| *other != target)
             .expect("two targets");
@@ -976,5 +979,115 @@ async fn an_episode_is_open_only_while_restoring_toward_a_drain_target() -> Test
         );
     }
     assert!(!drain_restore_episode_open(pool, SandboxId::new()).await?);
+    Ok(())
+}
+
+/// A stopped row whose published disk is S, pinned: the drain's disk
+/// snapshot, as `record_v2_stop_pin` leaves it.
+async fn stopped_with_disk(pool: &PgPool, disk_state: &str) -> TestResult<(SandboxId, Uuid)> {
+    let (id, s, artifact) = drained(pool, "stopped", Artifact::Legacy).await?;
+    sqlx::query(sql!(
+        "UPDATE snapshots
+            SET type = 'disk', artifact_kind = 'disk', artifact_origin = 'stop', state = $2
+          WHERE id = $1"
+    ))
+    .bind(s)
+    .bind(disk_state)
+    .execute(pool)
+    .await?;
+    sqlx::query(sql!(
+        "UPDATE sandboxes
+            SET current_local_artifact_id = $2,
+                current_local_artifact_kind = 'disk',
+                current_local_artifact_origin = 'stop'
+          WHERE id = $1"
+    ))
+    .bind(id)
+    .bind(artifact)
+    .execute(pool)
+    .await?;
+    Ok((id, s))
+}
+
+/// A stopped row whose pinned, ready, stored disk is S is claimed toward
+/// `stopped`, opening a `stopped` episode. Refused, the row unchanged: the
+/// same row toward a VM target, a disk still uploading, a disk the row no
+/// longer pins, and a suspended row toward `stopped`.
+#[tokio::test(flavor = "current_thread")]
+async fn a_stopped_row_whose_pinned_disk_is_s_is_claimed_toward_stopped() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let pool = &db.pool;
+    let (id, s) = stopped_with_disk(pool, "ready").await?;
+    let token = Uuid::now_v7();
+    let claimed = claim(pool, id, s, DrainRestoreTarget::Stopped, token)
+        .await?
+        .expect("claimed");
+    assert_eq!(claimed.lifecycle, "stopped");
+    assert_eq!(
+        episode(pool, id).await?,
+        (
+            "restoring".into(),
+            Some("stopped".into()),
+            Some(token),
+            true
+        )
+    );
+
+    let refusals: Vec<(&str, SandboxId, Uuid, DrainRestoreTarget)> = vec![
+        {
+            let (id, s) = stopped_with_disk(pool, "ready").await?;
+            ("a VM target", id, s, DrainRestoreTarget::Started)
+        },
+        {
+            let (id, s) = stopped_with_disk(pool, "creating").await?;
+            ("a disk still uploading", id, s, DrainRestoreTarget::Stopped)
+        },
+        {
+            let (id, s) = stopped_with_disk(pool, "ready").await?;
+            mark_artifact(pool, id, Uuid::now_v7()).await?;
+            (
+                "a disk no longer pinned",
+                id,
+                s,
+                DrainRestoreTarget::Stopped,
+            )
+        },
+        {
+            let (id, s, _) = drained(pool, "suspended", Artifact::Marked).await?;
+            ("a suspended row", id, s, DrainRestoreTarget::Stopped)
+        },
+    ];
+    for (case, id, s, target) in refusals {
+        let before = row_image(pool, id).await?;
+        assert!(
+            claim(pool, id, s, target, Uuid::now_v7()).await?.is_none(),
+            "{case}"
+        );
+        assert_eq!(row_image(pool, id).await?, before, "{case}: wrote");
+    }
+    Ok(())
+}
+
+/// A stopped episode's revert returns the row to `stopped` under its own
+/// lease only, ending the episode; another lease's revert changes nothing.
+#[tokio::test(flavor = "current_thread")]
+async fn a_stopped_episode_reverts_to_stopped_under_its_lease() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let pool = &db.pool;
+    let (id, s) = stopped_with_disk(pool, "ready").await?;
+    let token = Uuid::now_v7();
+    claim(pool, id, s, DrainRestoreTarget::Stopped, token)
+        .await?
+        .expect("claimed");
+    let before = row_image(pool, id).await?;
+    assert!(!crate::drain_restore::revert_stopped_drain_restore(pool, id, Uuid::now_v7()).await?);
+    assert_eq!(row_image(pool, id).await?, before);
+    assert!(crate::drain_restore::revert_stopped_drain_restore(pool, id, token).await?);
+    let (lifecycle, target, lease, _) = episode(pool, id).await?;
+    assert_eq!((lifecycle.as_str(), target, lease), ("stopped", None, None));
     Ok(())
 }

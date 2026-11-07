@@ -34,17 +34,19 @@ use uuid::Uuid;
 use crate::restore_lease::RestoreClaimRow;
 use crate::sweeper::EvacuationRestoreTarget;
 
-/// The lifecycle a drain restore lands a suspended sandbox in: the one it had
-/// before the drain suspended it. A drained `stopped` sandbox comes back
-/// through a stopped start from its stop artifact, not through this restore.
+/// The lifecycle a drain restore lands a drained sandbox in: the one it had
+/// before the drain. A `started` or `paused` one comes back from the suspend
+/// snapshot the drain took; a `stopped` one is re-placed from the disk the
+/// drain published, as v1's stopped re-placement does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum DrainRestoreTarget {
     Started,
     Paused,
+    Stopped,
 }
 
 impl DrainRestoreTarget {
-    pub const ALL: [Self; 2] = [Self::Started, Self::Paused];
+    pub const ALL: [Self; 3] = [Self::Started, Self::Paused, Self::Stopped];
 
     /// The stored string, which [`FromStr`] accepts back. It is both the
     /// `restore_episode_target` the claim writes and the lifecycle the
@@ -53,6 +55,7 @@ impl DrainRestoreTarget {
         match self {
             Self::Started => "started",
             Self::Paused => "paused",
+            Self::Stopped => "stopped",
         }
     }
 
@@ -60,6 +63,7 @@ impl DrainRestoreTarget {
         match self {
             Self::Started => SandboxLifecycle::Started,
             Self::Paused => SandboxLifecycle::Paused,
+            Self::Stopped => SandboxLifecycle::Stopped,
         }
     }
 
@@ -69,6 +73,7 @@ impl DrainRestoreTarget {
         match self {
             Self::Started => EvacuationRestoreTarget::Started,
             Self::Paused => EvacuationRestoreTarget::Paused,
+            Self::Stopped => EvacuationRestoreTarget::Stopped,
         }
     }
 }
@@ -96,6 +101,7 @@ impl FromStr for DrainRestoreTarget {
         match value.parse::<SandboxLifecycle>()? {
             SandboxLifecycle::Started => Ok(Self::Started),
             SandboxLifecycle::Paused => Ok(Self::Paused),
+            SandboxLifecycle::Stopped => Ok(Self::Stopped),
             other => Err(DrainRestoreTargetParseError::NotATarget(other)),
         }
     }
@@ -146,36 +152,65 @@ pub async fn claim_drain_restore(
                   WHERE s.id = $1
                     AND s.evacuation_restore_target IS NULL
                     AND (
-                      (s.lifecycle = 'suspended' AND s.restore_episode_target IS NULL)
-                      OR (s.lifecycle = 'restoring' AND s.restore_episode_target = $3)
-                    )
-                    AND (
                       s.restore_lease_expires_at IS NULL
                       OR s.restore_lease_expires_at <= NOW()
                     )
-                    AND NOT EXISTS (
-                      SELECT 1
-                        FROM sandbox_k8s_executions e
-                       WHERE e.sandbox_id = s.id
-                         AND e.active
-                         AND e.state IN ('creating', 'created', 'recovering', 'running')
-                         AND e.updated_at > NOW() - make_interval(secs => $6)
-                    )
                     AND (
-                      SELECT sn.id
-                        FROM snapshots sn
-                        JOIN snapshot_storage_locations ssl ON ssl.snapshot_id = sn.id
-                       WHERE sn.sandbox_id = s.id
-                         AND ssl.orphaned_at IS NULL
-                         AND sn.type = 'full'
-                         AND sn.state = 'ready'
-                         AND (
-                           {current_artifact}
-                           OR (s.current_local_artifact_id IS NULL AND {no_newer})
-                         )
-                       ORDER BY sn.timestamp DESC
-                       LIMIT 1
-                    ) = $2
+                      (
+                        $3 <> 'stopped'
+                        AND (
+                          (s.lifecycle = 'suspended' AND s.restore_episode_target IS NULL)
+                          OR (s.lifecycle = 'restoring' AND s.restore_episode_target = $3)
+                        )
+                        AND NOT EXISTS (
+                          SELECT 1
+                            FROM sandbox_k8s_executions e
+                           WHERE e.sandbox_id = s.id
+                             AND e.active
+                             AND e.state IN ('creating', 'created', 'recovering', 'running')
+                             AND e.updated_at > NOW() - make_interval(secs => $6)
+                        )
+                        AND (
+                          SELECT sn.id
+                            FROM snapshots sn
+                            JOIN snapshot_storage_locations ssl ON ssl.snapshot_id = sn.id
+                           WHERE sn.sandbox_id = s.id
+                             AND ssl.orphaned_at IS NULL
+                             AND sn.type = 'full'
+                             AND sn.state = 'ready'
+                             AND (
+                               {current_artifact}
+                               OR (s.current_local_artifact_id IS NULL AND {no_newer})
+                             )
+                           ORDER BY sn.timestamp DESC
+                           LIMIT 1
+                        ) = $2
+                      )
+                      OR (
+                        -- A stopped sandbox, re-placed from its published disk:
+                        -- S must be its pinned, ready and stored disk, which is
+                        -- what the stopped re-placement loads. Its pre-stop
+                        -- execution is active by design; the release that
+                        -- follows the claim retires it, fenced against a start.
+                        $3 = 'stopped'
+                        AND (
+                          (s.lifecycle = 'stopped' AND s.restore_episode_target IS NULL)
+                          OR (s.lifecycle = 'restoring' AND s.restore_episode_target = 'stopped')
+                        )
+                        AND (
+                          SELECT sn.id
+                            FROM snapshots sn
+                            JOIN snapshot_storage_locations ssl ON ssl.snapshot_id = sn.id
+                           WHERE sn.sandbox_id = s.id
+                             AND ssl.orphaned_at IS NULL
+                             AND sn.type = 'disk'
+                             AND sn.state = 'ready'
+                             AND {current_artifact}
+                           ORDER BY sn.timestamp DESC
+                           LIMIT 1
+                        ) = $2
+                      )
+                    )
                   FOR UPDATE OF s
              )
              UPDATE sandboxes s
@@ -318,6 +353,33 @@ pub async fn complete_drain_restore<'c>(
     } else {
         DrainRestoreCommit::Lost
     })
+}
+
+/// End the `stopped` drain restore episode whose lease `restore_lease_token`
+/// holds without landing it: back to `stopped`, which a later start re-places
+/// from the published disk the row still pins. Writes an **operation step**
+/// (the claim's revert). Returns whether the row moved; a row a delete or a
+/// start has moved on, or another lease's, matches nothing.
+pub async fn revert_stopped_drain_restore(
+    executor: impl PgExecutor<'_>,
+    sandbox_id: SandboxId,
+    restore_lease_token: Uuid,
+) -> Result<bool, sqlx::Error> {
+    Ok(sqlx::query(sql!(
+        "UPDATE sandboxes
+            SET lifecycle = 'stopped',
+                restore_episode_target = NULL
+          WHERE id = $1
+            AND lifecycle = 'restoring'
+            AND restore_episode_target = 'stopped'
+            AND restore_lease_token = $2"
+    ))
+    .bind(sandbox_id)
+    .bind(restore_lease_token)
+    .execute(executor)
+    .await?
+    .rows_affected()
+        == 1)
 }
 
 /// What [`read_drain_restore_gate`] reads of a sandbox and the snapshot a

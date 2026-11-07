@@ -164,3 +164,97 @@ fn failed_attempts_back_off_to_the_cap() {
         .collect::<Vec<_>>();
     assert_eq!(waits, [60, 120, 240, 480, 960, 1800, 1800]);
 }
+
+/// A restore toward `stopped` waits on a `stopped` row (or re-drives its own
+/// `stopped` episode) and loads the row's pinned disk: S claimable while it
+/// is that disk, ready and stored; pending while it uploads; superseded once
+/// the row pins another artifact; lost otherwise. A `suspended` row is
+/// another restore's, and a `stopped` row toward a VM target has left the
+/// lifecycle that target waits on.
+#[test]
+fn a_stopped_target_waits_on_a_stopped_row_and_its_pinned_disk() {
+    let stopped = || DrainRestoreGateRow {
+        lifecycle: "stopped".into(),
+        // The full-snapshot selector reads nothing for a disk.
+        selected_snapshot: None,
+        ..claimable()
+    };
+    let cases: [(
+        &str,
+        DrainRestoreGateRow,
+        DrainRestoreTarget,
+        DrainRestoreGate,
+    ); 8] = [
+        (
+            "control",
+            stopped(),
+            DrainRestoreTarget::Stopped,
+            DrainRestoreGate::Claimable,
+        ),
+        (
+            "its own episode",
+            DrainRestoreGateRow {
+                lifecycle: "restoring".into(),
+                restore_episode_target: Some("stopped".into()),
+                ..stopped()
+            },
+            DrainRestoreTarget::Stopped,
+            DrainRestoreGate::Claimable,
+        ),
+        (
+            "the disk uploading",
+            DrainRestoreGateRow {
+                source_state: Some("creating".into()),
+                ..stopped()
+            },
+            DrainRestoreTarget::Stopped,
+            DrainRestoreGate::SourcePending,
+        ),
+        (
+            "another artifact pinned",
+            DrainRestoreGateRow {
+                source_is_current_artifact: false,
+                ..stopped()
+            },
+            DrainRestoreTarget::Stopped,
+            DrainRestoreGate::Superseded(DrainRestoreSuperseded::NewerSnapshot),
+        ),
+        (
+            "the disk stored nowhere",
+            DrainRestoreGateRow {
+                source_located: false,
+                ..stopped()
+            },
+            DrainRestoreTarget::Stopped,
+            DrainRestoreGate::SourceLost,
+        ),
+        (
+            "a suspended row",
+            claimable(),
+            DrainRestoreTarget::Stopped,
+            DrainRestoreGate::Superseded(DrainRestoreSuperseded::OtherRestore),
+        ),
+        (
+            "a stopped row toward started",
+            stopped(),
+            DrainRestoreTarget::Started,
+            DrainRestoreGate::Superseded(DrainRestoreSuperseded::Lifecycle),
+        ),
+        (
+            "a started row",
+            DrainRestoreGateRow {
+                lifecycle: "started".into(),
+                ..stopped()
+            },
+            DrainRestoreTarget::Stopped,
+            DrainRestoreGate::Superseded(DrainRestoreSuperseded::Lifecycle),
+        ),
+    ];
+    for (case, row, target, expected) in cases {
+        assert_eq!(
+            DrainRestoreGate::decide(Some(&row), S, target).expect("the lifecycle parses"),
+            expected,
+            "{case}"
+        );
+    }
+}

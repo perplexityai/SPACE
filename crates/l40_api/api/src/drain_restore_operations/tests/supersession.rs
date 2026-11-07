@@ -53,9 +53,18 @@ async fn a_superseding_call_on_a_suspended_sandbox_cancels_its_restore() -> Resu
             SandboxAction::Checkpoint,
             false,
         ),
+        // A stopped sandbox's drain restore (toward `stopped`) waits on the
+        // stopped row, so a call on it supersedes the restore too.
         (
             "ECW pause, stopped",
             "stopped",
+            SandboxAction::Suspend,
+            true,
+        ),
+        // A restore never waits on a running sandbox: the call leaves it.
+        (
+            "ECW pause, started",
+            "started",
             SandboxAction::Suspend,
             false,
         ),

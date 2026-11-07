@@ -167,12 +167,27 @@ impl DrainRestoreGate {
         }
         let episode = row.restore_episode_target.as_deref();
         match lifecycle {
-            SandboxLifecycle::Suspended if episode.is_none() => {}
+            SandboxLifecycle::Suspended
+                if episode.is_none() && target != DrainRestoreTarget::Stopped => {}
+            SandboxLifecycle::Stopped
+                if episode.is_none() && target == DrainRestoreTarget::Stopped => {}
             SandboxLifecycle::Restoring if episode == Some(target.as_str()) => {}
             SandboxLifecycle::Suspended | SandboxLifecycle::Restoring => {
                 return Ok(Self::Superseded(DrainRestoreSuperseded::OtherRestore));
             }
             _ => return Ok(Self::Superseded(DrainRestoreSuperseded::Lifecycle)),
+        }
+        if target == DrainRestoreTarget::Stopped {
+            // The stopped re-placement loads the row's pinned disk: S must
+            // still be it, ready and stored.
+            return Ok(match row.source_state.as_deref() {
+                _ if !row.source_is_current_artifact => {
+                    Self::Superseded(DrainRestoreSuperseded::NewerSnapshot)
+                }
+                Some("ready") if row.source_located => Self::Claimable,
+                Some("creating") => Self::SourcePending,
+                _ => Self::SourceLost,
+            });
         }
         if row.selected_snapshot == Some(snapshot_id) {
             return Ok(Self::Claimable);

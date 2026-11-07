@@ -1385,6 +1385,22 @@ impl KubernetesSubstrate {
     /// still proves the revert safe. A row another writer moved on, or one
     /// under another lease, is left alone.
     pub async fn revert_drain_restore_episode(&self, sandbox_id: SandboxId, restore: DrainRestore) {
+        if restore.target == pplx_space_sandbox_store::drain_restore::DrainRestoreTarget::Stopped {
+            // Back to `stopped`, from its published disk: unplaced once the
+            // release ran, which a later start re-places from the pin.
+            if let Err(error) = self
+                .store
+                .revert_stopped_drain_restore(sandbox_id, restore)
+                .await
+            {
+                tracing::warn!(
+                    sandbox_id = %sandbox_id,
+                    %error,
+                    "failed to revert a stopped drain restore episode"
+                );
+            }
+            return;
+        }
         self.revert_failed_restore_claim(
             sandbox_id,
             RestoreClaim::FreshFromSuspended {
@@ -1444,7 +1460,10 @@ impl KubernetesSubstrate {
         // reads the evacuation's disk artifact and the claim it needs is the
         // evacuation claim. A user restore asking for it is a caller bug.
         if target_state == SandboxLifecycle::Stopped
-            && intent.claim != RestoreClaimMode::EvacuationMarker
+            && !matches!(
+                intent.claim,
+                RestoreClaimMode::EvacuationMarker | RestoreClaimMode::DrainOperation(_)
+            )
         {
             return Err(SubstrateError::Conflict {
                 message: "a stopped restore target is only valid for an evacuation restore"
@@ -1539,6 +1558,24 @@ impl KubernetesSubstrate {
                     .and_then(|secs| secs.parse::<u64>().ok())
         {
             tokio::time::sleep(Duration::from_secs(hold)).await;
+        }
+        // A drain restore toward `stopped` re-places the sandbox, so its claim
+        // releases the drained node first, as v1's stopped evacuation does
+        // before its re-placement: the pre-stop execution is retired and its
+        // pod deleted, fenced against a start, and the row unplaced.
+        if matches!(intent.claim, RestoreClaimMode::DrainOperation(_))
+            && target_state == SandboxLifecycle::Stopped
+            && !self
+                .delete_execution_retired_by_current_stop(sandbox_id)
+                .await?
+        {
+            self.release_rejected_restore_claim(sandbox_id, restore_claim)
+                .await;
+            return Err(SubstrateError::EvacuationClaimLost {
+                message: format!(
+                    "a start holds stopped sandbox {sandbox_id}; its drain restore leaves it"
+                ),
+            });
         }
         let sandbox = self.store.require_sandbox(sandbox_id).await?;
         let activation = self

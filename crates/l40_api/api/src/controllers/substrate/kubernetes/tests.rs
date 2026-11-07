@@ -14889,6 +14889,61 @@ mod kubernetes_tests {
         Ok(())
     }
 
+    /// The drain v2's claim of a stopped sandbox (`restoring` in a `stopped`
+    /// restore episode, no v1 marker) lets the teardown retire the execution
+    /// the stop left active, as v1's marker does. The same row with no claim,
+    /// or in an episode toward another target, still refuses.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_stopped_drain_restore_episode_lets_the_teardown_retire_the_pre_stop_execution()
+    -> Result<(), BoxError> {
+        let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+        let pool = db.pool.clone();
+        let substrate = substrate_with_store_client_proxy_port_and_pod(
+            pool.clone(),
+            delete_capturing_kubernetes_client(Arc::new(Mutex::new(Vec::new())), None),
+            DEFAULT_SANDBOX_PROXY_PORT,
+            None,
+        );
+        for (case, episode, retired) in [
+            ("a stopped episode", Some(("restoring", "stopped")), true),
+            ("no claim", None, false),
+            ("a started episode", Some(("restoring", "started")), false),
+        ] {
+            let id = SandboxId::new();
+            let pod = format!("space-sbx-{}-g1", id.as_uuid().simple());
+            insert_test_sandbox_row(&pool, id, "started").await?;
+            place_on_fresh_node(&pool, id).await?;
+            insert_k8s_execution(&pool, id, 1, &pod, "uid-pre-stop", None, true).await?;
+            sqlx::query("UPDATE sandboxes SET lifecycle = 'stopped' WHERE id = $1")
+                .bind(id)
+                .execute(&pool)
+                .await?;
+            if let Some((lifecycle, target)) = episode {
+                sqlx::query(
+                    "UPDATE sandboxes SET lifecycle = $2, restore_episode_target = $3 WHERE id = $1",
+                )
+                .bind(id)
+                .bind(lifecycle)
+                .bind(target)
+                .execute(&pool)
+                .await?;
+            }
+            assert_eq!(
+                substrate
+                    .delete_execution_retired_by_current_stop(id)
+                    .await?,
+                retired,
+                "{case}"
+            );
+            assert_eq!(
+                active_execution_generations(&pool, id).await.is_empty(),
+                retired,
+                "{case}"
+            );
+        }
+        Ok(())
+    }
+
     /// A `start` that finds no pod under the pre-stop execution's name reuses
     /// that execution and creates the pod under the same name, so the stop
     /// boundary still reads it as pre-stop and the row stays `stopped` with

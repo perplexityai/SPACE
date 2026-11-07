@@ -451,6 +451,23 @@ impl K8sStore {
         .db_context("failed to complete sandbox drain restore")
     }
 
+    /// End a `stopped` drain restore episode its operation leaves:
+    /// back to `stopped`
+    /// ([`pplx_space_sandbox_store::drain_restore::revert_stopped_drain_restore`]).
+    pub(in crate::controllers::substrate::kubernetes) async fn revert_stopped_drain_restore(
+        &self,
+        sandbox_id: SandboxId,
+        restore: crate::controllers::substrate::kubernetes::DrainRestore,
+    ) -> Result<bool, SubstrateError> {
+        pplx_space_sandbox_store::drain_restore::revert_stopped_drain_restore(
+            &self.pool,
+            sandbox_id,
+            restore.restore_lease_token,
+        )
+        .await
+        .db_context("failed to revert a stopped drain restore")
+    }
+
     async fn begin_restore_lifecycle_for(
         &self,
         sandbox_id: SandboxId,

@@ -175,6 +175,7 @@ async fn each_target_lands_with_one_execution(
     let expected_vm = match target {
         DrainRestoreTarget::Started => "running",
         DrainRestoreTarget::Paused => "paused",
+        DrainRestoreTarget::Stopped => unreachable!("a stopped target isn't restored from a VM"),
     };
     assert_eq!(
         node_vm_status(&worker, sandbox_id).await.as_deref(),

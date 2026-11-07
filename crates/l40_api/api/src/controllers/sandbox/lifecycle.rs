@@ -1466,11 +1466,14 @@ impl SandboxController {
                 .untracked_action(id, metric_identity, action, activation)
                 .await;
         };
-        // A drain restore waits only while the row is `suspended`; once it
-        // holds the row, the call meets its restore instead.
+        // A drain restore waits only while the row is `suspended`, or
+        // `stopped` for one toward `stopped`; once it holds the row, the call
+        // meets its restore instead.
         if action_supersedes_drain_restore(action)
-            && sandbox.lifecycle.parse::<SandboxLifecycle>().ok()
-                == Some(SandboxLifecycle::Suspended)
+            && matches!(
+                sandbox.lifecycle.parse::<SandboxLifecycle>().ok(),
+                Some(SandboxLifecycle::Suspended | SandboxLifecycle::Stopped)
+            )
         {
             crate::public_operations::PublicOperationStore::new(pool.clone())
                 .cancel_drain_restores_for_action(sandbox.org_id, id, action.as_str())
