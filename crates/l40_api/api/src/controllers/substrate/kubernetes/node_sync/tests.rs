@@ -267,7 +267,7 @@ async fn sync_records_the_instance_an_aws_provider_id_names() -> pplx_space_test
         node
     };
     let items = vec![
-        with_provider_id("worker-aws", Some("aws:///us-west-2a/i-0aws")),
+        with_provider_id("worker-aws", Some("aws:///us-west-2a/i-0a1b2c3d")),
         with_provider_id("worker-kind", Some("kind://docker/space/worker-kind")),
         with_provider_id("worker-none", None),
         with_provider_id("worker-kept", None),
@@ -319,7 +319,7 @@ async fn sync_records_the_instance_an_aws_provider_id_names() -> pplx_space_test
         .await?;
 
     for (name, expected) in [
-        ("worker-aws", Some("i-0aws")),
+        ("worker-aws", Some("i-0a1b2c3d")),
         ("worker-kind", None),
         ("worker-none", None),
         ("worker-kept", Some("i-0kept")),

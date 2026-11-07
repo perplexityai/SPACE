@@ -34,9 +34,10 @@ pub fn space_node_id(value: &str, role: NodeRole) -> Result<NodeId, K8sNodeNameP
     Ok(space_k8s_node_id(node_name.as_str(), role.as_str()))
 }
 
-/// The EC2 instance ID a Kubernetes Node's AWS `providerID` names: an `i-`
-/// prefix and no `/`. Not further validated; it is what the Node says, and
-/// EC2 is the authority on whether such an instance exists.
+/// An EC2 instance ID: `i-` and 8 or 17 lowercase hex digits, the form EC2
+/// issues. Whether such an instance exists is EC2's to say; an ID in any
+/// other form is never asked about, since EC2 would answer as for an
+/// instance that is gone.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Ec2InstanceId(String);
 
@@ -53,9 +54,14 @@ impl Ec2InstanceId {
             .and_then(Self::parse)
     }
 
-    /// The last segment of an AWS `providerID`, when it is an instance ID.
-    fn parse(value: &str) -> Option<Self> {
-        value.starts_with("i-").then(|| Self(value.to_owned()))
+    /// `value`, when it is an instance ID.
+    pub fn parse(value: &str) -> Option<Self> {
+        let hex = value.strip_prefix("i-")?;
+        (matches!(hex.len(), 8 | 17)
+            && hex
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)))
+        .then(|| Self(value.to_owned()))
     }
 
     pub fn as_str(&self) -> &str {

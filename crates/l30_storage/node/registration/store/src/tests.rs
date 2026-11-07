@@ -116,8 +116,8 @@ async fn a_first_instance_is_recorded() -> TestDbResult<()> {
 }
 
 /// The recorded instance again, or no instance (a caller that has none),
-/// writes nothing, and no instance keeps the recorded one through a UID
-/// change.
+/// writes nothing; but a UID change with no instance drops the recorded one:
+/// a new Node may be a replacement on another machine.
 #[tokio::test]
 async fn the_same_instance_or_none_writes_nothing() -> TestDbResult<()> {
     let db = db().await?;
@@ -141,7 +141,7 @@ async fn the_same_instance_or_none_writes_nothing() -> TestDbResult<()> {
     registered(&db.pool, registration(node_id, "uid-2", None)).await?;
     let after = node_k8s(&mut conn, node_id).await?.unwrap();
     assert_eq!(after.k8s_node_uid.as_deref(), Some("uid-2"));
-    assert_eq!(after.instance_id.as_deref(), Some("i-0a"));
+    assert_eq!(after.instance_id.as_deref(), None);
     Ok(())
 }
 
@@ -203,16 +203,21 @@ async fn a_tombstoned_node_refuses_without_recording_an_instance() -> TestDbResu
 }
 
 /// A UID change clears drain state, a v2 drain's engine and status with it,
-/// and an instance change alone does not.
+/// and an instance change alone does not. A v2 drain survives a UID change
+/// on the same instance: the same machine, still sealed; any other instance,
+/// or none reported, is a replacement. A v1 drain clears on any UID change.
 #[tokio::test]
 async fn an_instance_change_alone_keeps_drain_state() -> TestDbResult<()> {
     let db = db().await?;
     let mut conn = db.pool.acquire().await?;
-    for (uid, instance_id) in [
-        ("uid-1", "i-0a"),
-        ("uid-2", "i-0a"),
-        ("uid-1", "i-0b"),
-        ("uid-2", "i-0b"),
+    for (engine, uid, instance_id, cleared_expected) in [
+        (Some("v2"), "uid-1", Some("i-0a"), false),
+        (Some("v2"), "uid-2", Some("i-0a"), false),
+        (Some("v2"), "uid-1", Some("i-0b"), false),
+        (Some("v2"), "uid-2", Some("i-0b"), true),
+        (Some("v2"), "uid-2", None, true),
+        (None, "uid-2", Some("i-0a"), true),
+        (None, "uid-1", Some("i-0b"), false),
     ] {
         let node_id = NodeId::new();
         registered(&db.pool, registration(node_id, "uid-1", Some("i-0a"))).await?;
@@ -220,20 +225,21 @@ async fn an_instance_change_alone_keeps_drain_state() -> TestDbResult<()> {
             "UPDATE nodes
              SET drain_phase = 'draining', drain_mode = 'forced',
                  drain_started_at = NOW(), drain_last_error = 'seeded',
-                 drain_engine = 'v2', drain_status = '{\"epoch\": 7}'::JSONB
+                 drain_engine = $2,
+                 drain_status = CASE WHEN $2::TEXT IS NULL THEN NULL
+                                     ELSE '{\"epoch\": 7}'::JSONB END
              WHERE id = $1"
         ))
         .bind(node_id)
+        .bind(engine)
         .execute(&mut *conn)
         .await?;
 
         let mut cleared = false;
         let mut tx = db.pool.begin().await?;
-        register_k8s_node(
-            &mut tx,
-            registration(node_id, uid, Some(instance_id)),
-            || cleared = true,
-        )
+        register_k8s_node(&mut tx, registration(node_id, uid, instance_id), || {
+            cleared = true
+        })
         .await?;
         tx.commit().await?;
 
@@ -249,21 +255,21 @@ async fn an_instance_change_alone_keeps_drain_state() -> TestDbResult<()> {
         .bind(node_id)
         .fetch_one(&mut *conn)
         .await?;
-        let uid_changed = uid != "uid-1";
-        assert_eq!(cleared, uid_changed, "{uid} {instance_id}");
+        let case = format!("{engine:?} {uid} {instance_id:?}");
+        assert_eq!(cleared, cleared_expected, "{case}");
         assert_eq!(
             drain,
-            if uid_changed {
+            if cleared_expected {
                 (None, None, None, None)
             } else {
                 (
                     Some("draining".to_string()),
                     Some("forced".to_string()),
-                    Some("v2".to_string()),
-                    Some(r#"{"epoch": 7}"#.to_string()),
+                    engine.map(str::to_owned),
+                    engine.map(|_| r#"{"epoch": 7}"#.to_string()),
                 )
             },
-            "{uid} {instance_id}"
+            "{case}"
         );
         assert_eq!(
             node_k8s(&mut conn, node_id)
@@ -271,8 +277,13 @@ async fn an_instance_change_alone_keeps_drain_state() -> TestDbResult<()> {
                 .unwrap()
                 .instance_id
                 .as_deref(),
-            Some(instance_id),
-            "{uid} {instance_id}"
+            // A new Node takes the instance it reports, none included; the
+            // same Node keeps the recorded one when it reports none.
+            match (uid, instance_id) {
+                ("uid-1", None) => Some("i-0a"),
+                (_, reported) => reported,
+            },
+            "{case}"
         );
     }
     Ok(())

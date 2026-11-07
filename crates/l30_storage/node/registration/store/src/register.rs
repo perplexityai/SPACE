@@ -212,24 +212,34 @@ pub async fn register_k8s_node(
     // read the column independently of the phase, so a surviving mode makes
     // a node that is not draining report `drain_phase: null` next to
     // `drain_mode: gentle`. A v2 drain's engine and status go with them for
-    // the same reason: its epoch, report and termination record are the
-    // replaced machine's.
+    // the same reason: its epoch and report are the replaced machine's.
+    //
+    // A v2 drain is the exception when the instance is unchanged: the same
+    // machine re-created its Node (a `kubectl delete node`, a kubelet
+    // restart), and its sandbox-manager is still sealed under the drain's
+    // epoch, which only that drain's undrain or terminate settles. Both
+    // instances must be known and equal; an unreported one counts as a
+    // replacement.
     let drain_cleared = sqlx::query(sql!(
-        "UPDATE nodes
+        "UPDATE nodes n
              SET drain_phase = NULL,
                  drain_mode = NULL,
                  drain_started_at = NULL,
                  drain_last_error = NULL,
                  drain_engine = NULL,
                  drain_status = NULL
-             WHERE id = $1
-               AND EXISTS (
-                 SELECT 1 FROM node_k8s
-                 WHERE node_id = $1 AND k8s_node_uid IS DISTINCT FROM $2
+             FROM node_k8s k
+             WHERE n.id = $1
+               AND k.node_id = n.id
+               AND k.k8s_node_uid IS DISTINCT FROM $2
+               AND NOT COALESCE(
+                 n.drain_engine = 'v2' AND k.instance_id = $3::TEXT,
+                 FALSE
                )"
     ))
     .bind(node_id)
     .bind(node_uid)
+    .bind(instance_id)
     .execute(&mut *conn)
     .await
     .step(K8sNodeRegistrationStep::ClearDrain)?
@@ -238,8 +248,10 @@ pub async fn register_k8s_node(
         on_drain_cleared();
     }
 
-    // A registration with no instance keeps the recorded one, and an instance
-    // alone doesn't date the row: `updated_at` dates its Kubernetes metadata,
+    // A registration with no instance keeps the recorded one, unless the
+    // Node's uid changed: a new Node may be a replacement on another machine,
+    // so it takes no instance until one is reported. An instance alone
+    // doesn't date the row: `updated_at` dates its Kubernetes metadata,
     // which absence demotion reads. The `nodes` upsert above locked the
     // node's row, so concurrent registrations of this node id apply in turn.
     let node_k8s_changed = sqlx::query(sql!(
@@ -248,7 +260,11 @@ pub async fn register_k8s_node(
              ON CONFLICT (node_id) DO UPDATE
              SET k8s_node_name = EXCLUDED.k8s_node_name,
                  k8s_node_uid = EXCLUDED.k8s_node_uid,
-                 instance_id = COALESCE(EXCLUDED.instance_id, node_k8s.instance_id),
+                 instance_id = CASE
+                     WHEN node_k8s.k8s_node_uid IS DISTINCT FROM EXCLUDED.k8s_node_uid
+                     THEN EXCLUDED.instance_id
+                     ELSE COALESCE(EXCLUDED.instance_id, node_k8s.instance_id)
+                 END,
                  updated_at = CASE
                      WHEN node_k8s.k8s_node_name IS DISTINCT FROM EXCLUDED.k8s_node_name
                        OR node_k8s.k8s_node_uid IS DISTINCT FROM EXCLUDED.k8s_node_uid

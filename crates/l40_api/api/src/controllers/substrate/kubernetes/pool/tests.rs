@@ -473,8 +473,8 @@ async fn postgres_pool_bind_records_the_instance_of_the_reflected_node() -> Test
     };
     let cases = [
         (
-            vec![reflected("aws:///us-west-2a/i-0pool")],
-            Some("i-0pool"),
+            vec![reflected("aws:///us-west-2a/i-0b2c3d4e")],
+            Some("i-0b2c3d4e"),
         ),
         (vec![reflected("kind://docker/space/pool-node-1")], None),
         (Vec::new(), None),

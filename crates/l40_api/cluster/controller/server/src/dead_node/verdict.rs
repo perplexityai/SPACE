@@ -12,12 +12,6 @@
 //! replacement's. The node is lost ([`node_verdict`]) when no live machine
 //! holds its id: its heartbeat is stale, its recorded Node is gone, and its
 //! recorded instance is dead.
-//!
-//! A node a v2 drain let go has a second path ([`drain_terminated_verdict`]):
-//! the controller terminated it after the node reported, under its drain's
-//! epoch, that everything on it is durable elsewhere, and recorded that. It
-//! is lost by that record once its heartbeat is stale, with no instance
-//! authority asked.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -98,9 +92,6 @@ pub enum DeadReason {
     /// EC2 doesn't list the instance while listing the reference: it
     /// terminated long enough ago to be forgotten.
     Absent,
-    /// The node's recorded instance, which the controller terminated after
-    /// the node's v2 drain reported it done.
-    DrainTerminated,
 }
 
 /// Everything [`node_verdict`] reads.
@@ -126,9 +117,6 @@ pub enum LostReason {
     /// The recorded instance is dead, the Node is gone and the heartbeat is
     /// stale.
     InstanceAndNodeGone,
-    /// The node's v2 drain reported it done and the controller terminated
-    /// it, and its heartbeat is stale.
-    DrainTerminated,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -148,9 +136,6 @@ pub enum UnknownReason {
     ReferenceUnavailable,
     ReferenceMissing,
     ReferenceTerminated,
-    /// A drain-terminated node's row stamped with an instance other than the
-    /// one the termination recorded: no authority is asked about it.
-    InstanceNotAsked,
 }
 
 impl Verdict {
@@ -183,7 +168,6 @@ impl LostReason {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::InstanceAndNodeGone => "instance_and_node_gone",
-            Self::DrainTerminated => "drain_terminated",
         }
     }
 }
@@ -206,7 +190,6 @@ impl UnknownReason {
             Self::ReferenceUnavailable => "reference_unavailable",
             Self::ReferenceMissing => "reference_missing",
             Self::ReferenceTerminated => "reference_terminated",
-            Self::InstanceNotAsked => "instance_not_asked",
         }
     }
 }
@@ -217,16 +200,12 @@ impl fmt::Display for Verdict {
     }
 }
 
-/// Whether `instance_id` is an EC2 instance ID: `i-` and 8 or 17 lowercase
-/// hex digits. Anything else is not asked about: an ID EC2 would not
-/// recognize is absent from any answer, which would read dead.
+/// Whether `instance_id` is an EC2 instance ID
+/// ([`pplx_space_k8s_node_id::Ec2InstanceId`]). Anything else is not asked
+/// about: an ID EC2 would not recognize is absent from any answer, which
+/// would read dead.
 pub fn well_formed_instance_id(instance_id: &str) -> bool {
-    instance_id.strip_prefix("i-").is_some_and(|hex| {
-        matches!(hex.len(), 8 | 17)
-            && hex
-                .bytes()
-                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-    })
+    pplx_space_k8s_node_id::Ec2InstanceId::parse(instance_id).is_some()
 }
 
 /// Whether `instance_id` is dead by `evidence`. Dead only when EC2 answered,
@@ -286,35 +265,6 @@ pub fn node_verdict(inputs: &NodeVerdictInputs) -> Verdict {
         Some(InstanceVerdict::Dead(_)) => Verdict::Lost(LostReason::InstanceAndNodeGone),
         Some(InstanceVerdict::Live) => Verdict::Unknown(U::InstanceLive),
         Some(InstanceVerdict::Unknown(reason)) => Verdict::Unknown(reason),
-    }
-}
-
-/// Whether a node its v2 drain let go is lost, by the record the drain left
-/// (`node_drain::v2`): the controller terminated it after it reported, under
-/// its drain's epoch, that everything on it is durable elsewhere. Lost once
-/// its heartbeat is stale; a fresh one means a machine still answers for the
-/// node id, so it waits.
-pub const fn drain_terminated_verdict(heartbeat: Heartbeat) -> Verdict {
-    match heartbeat {
-        Heartbeat::Stale => Verdict::Lost(LostReason::DrainTerminated),
-        Heartbeat::Fresh => Verdict::Unknown(UnknownReason::HeartbeatFresh),
-    }
-}
-
-/// The verdict on an instance a drain-terminated node's rows or record
-/// name: its recorded instance is dead once the heartbeat is stale, live
-/// while it is fresh; any other is not asked about.
-pub fn drain_terminated_instance_verdict(
-    instance_id: &str,
-    recorded: Option<&str>,
-    heartbeat: Heartbeat,
-) -> InstanceVerdict {
-    if recorded != Some(instance_id) {
-        return InstanceVerdict::Unknown(UnknownReason::InstanceNotAsked);
-    }
-    match heartbeat {
-        Heartbeat::Stale => InstanceVerdict::Dead(DeadReason::DrainTerminated),
-        Heartbeat::Fresh => InstanceVerdict::Live,
     }
 }
 

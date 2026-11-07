@@ -18,11 +18,12 @@ use crate::controllers::substrate::kubernetes::store::PlacementRetryDisposition;
 const NODE_NAME: &str = "space-test-instance-node";
 
 /// The `providerID` each case gives the Node, and the instance its row must
-/// name afterwards. Only an AWS `providerID` replaces the recorded `i-0a`.
-const CASES: [(Option<&str>, &str); 3] = [
-    (Some("aws:///us-west-2a/i-0b"), "i-0b"),
-    (None, "i-0a"),
-    (Some("kind://docker/space/space-test-instance-node"), "i-0a"),
+/// name afterwards. The Node's new UID is a new machine: an AWS `providerID`
+/// names its instance, and any other leaves none, never the recorded `i-0a`.
+const CASES: [(Option<&str>, Option<&str>); 3] = [
+    (Some("aws:///us-west-2a/i-0c3d4e5f"), Some("i-0c3d4e5f")),
+    (None, None),
+    (Some("kind://docker/space/space-test-instance-node"), None),
 ];
 
 /// The Node as registration now sees it: UID `uid-2`, and `provider_id`.
@@ -81,38 +82,8 @@ async fn recorded(pool: &PgPool, node_id: NodeId) -> TestResult<Recorded> {
     .await?)
 }
 
-fn expected(instance_id: &str) -> Recorded {
-    (Some("uid-2".to_string()), Some(instance_id.to_string()))
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn inventory_listing_records_the_instance_its_node_names() -> TestResult {
-    for (provider_id, instance_id) in CASES {
-        let db = pplx_space_db_test_fixtures::pg_test_db().await?;
-        let node_id = seed(&db.pool).await?;
-        let substrate = substrate_with_inventory_caches_and_pool(
-            vec![node_api_pod_on_node("space-worker-instance-pod", NODE_NAME)],
-            vec![node(provider_id)],
-            db.pool.clone(),
-        );
-
-        let entries = substrate
-            .list_inventory_nodes(Some(NodeRole::Worker.as_str()))
-            .await?
-            .expect("kubernetes substrate supplies inventory");
-
-        assert_eq!(
-            entries.iter().map(|entry| entry.id).collect::<Vec<_>>(),
-            [node_id],
-            "{provider_id:?}"
-        );
-        assert_eq!(
-            recorded(&db.pool, node_id).await?,
-            expected(instance_id),
-            "{provider_id:?}"
-        );
-    }
-    Ok(())
+fn expected(instance_id: Option<&str>) -> Recorded {
+    (Some("uid-2".to_string()), instance_id.map(str::to_string))
 }
 
 #[tokio::test(flavor = "current_thread")]
