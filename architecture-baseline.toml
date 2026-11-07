@@ -212,7 +212,6 @@ postgres = [
   "node_facet_observed_status",
   "node_group_template_compat",
   "node_groups",
-  "node_k8s",
   "node_k8s_tombstones",
   "node_local_backup_pending",
   "node_reconcile_queue",
@@ -231,7 +230,6 @@ postgres = [
   "public_idempotency_records",
   "public_operation_events",
   "public_operations",
-  "runtime_environments",
   "runtime_upgrade_campaigns",
   "runtime_upgrade_items",
   "sandbox_archives",
@@ -264,7 +262,6 @@ postgres = [
   "templates",
   "user_credentials",
   "users",
-  "warm_pool_policies",
 ]
 "sqlite.build-manager" = [
   "build_job_results",

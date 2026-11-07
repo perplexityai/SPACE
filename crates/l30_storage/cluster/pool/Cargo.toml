@@ -8,7 +8,11 @@ license.workspace = true
 publish.workspace = true
 
 [package.metadata.space.state]
-postgres = ["kubernetes_pool_configs", "kubernetes_pool_slots"]
+postgres = [
+  "kubernetes_pool_configs",
+  "kubernetes_pool_slots",
+  "warm_pool_policies",
+]
 
 [lints]
 workspace = true
