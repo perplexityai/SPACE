@@ -289,7 +289,6 @@ postgres = [
 # request that adds one is reported, and fails the check.
 [crate_names]
 pplx-space-common-cli = "crates/l10_foundation/common/cli"
-pplx-space-common-connection-admission = "crates/l10_foundation/common/connection/admission"
 pplx-space-common-core = "crates/libs/common/core"
 pplx-space-common-grpc = "crates/l10_foundation/common/grpc/transport"
 pplx-space-common-io = "crates/l10_foundation/common/io"

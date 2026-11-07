@@ -5366,20 +5366,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "pplx-space-common-connection-admission"
-version = "0.8.2"
-dependencies = [
- "libc",
- "thiserror 2.0.20",
- "tokio",
- "tokio-stream",
- "tokio-util",
- "tonic",
- "tonic-health",
- "tracing",
-]
-
-[[package]]
 name = "pplx-space-common-core"
 version = "0.8.2"
 dependencies = [
@@ -5501,6 +5487,20 @@ dependencies = [
  "prost-types",
  "thiserror 2.0.20",
  "tonic-prost-build",
+]
+
+[[package]]
+name = "pplx-space-connection-admission"
+version = "0.8.2"
+dependencies = [
+ "libc",
+ "thiserror 2.0.20",
+ "tokio",
+ "tokio-stream",
+ "tokio-util",
+ "tonic",
+ "tonic-health",
+ "tracing",
 ]
 
 [[package]]
@@ -6329,9 +6329,9 @@ dependencies = [
  "nix 0.31.3",
  "parking_lot",
  "pplx-space-api-route",
- "pplx-space-common-connection-admission",
  "pplx-space-common-core",
  "pplx-space-common-grpc",
+ "pplx-space-connection-admission",
  "pplx-space-credential-injection-core",
  "pplx-space-credmgr-client",
  "pplx-space-events",
@@ -7766,9 +7766,9 @@ dependencies = [
  "libc",
  "nix 0.31.3",
  "opentelemetry-proto",
- "pplx-space-common-connection-admission",
  "pplx-space-common-core",
  "pplx-space-common-grpc",
+ "pplx-space-connection-admission",
  "pplx-space-grpc-metrics",
  "pplx-space-guest-capability",
  "pplx-space-guest-process",
@@ -7896,9 +7896,9 @@ dependencies = [
  "anyhow",
  "futures-util",
  "http-body 1.1.0",
- "pplx-space-common-connection-admission",
  "pplx-space-common-core",
  "pplx-space-common-grpc",
+ "pplx-space-connection-admission",
  "pplx-space-grpc-metrics",
  "pplx-space-grpc-rate-limiter",
  "pplx-space-grpc-server",

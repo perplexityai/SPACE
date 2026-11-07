@@ -113,7 +113,7 @@ members = [
     "crates/l10_foundation/durations",
     "crates/l10_foundation/stopwatch",
     "crates/l10_foundation/common/cli",
-    "crates/l10_foundation/common/connection/admission",
+    "crates/l10_foundation/connection/admission",
     "crates/l10_foundation/common/grpc/transport",
     "crates/l10_foundation/grpc/lb",
     "crates/l10_foundation/common/io",
@@ -373,7 +373,7 @@ pplx-space-common-core = { path = "crates/libs/common/core" }
 pplx-space-durations = { path = "crates/l10_foundation/durations" }
 pplx-space-stopwatch = { path = "crates/l10_foundation/stopwatch" }
 pplx-space-common-cli = { path = "crates/l10_foundation/common/cli" }
-pplx-space-common-connection-admission = { path = "crates/l10_foundation/common/connection/admission" }
+pplx-space-connection-admission = { path = "crates/l10_foundation/connection/admission" }
 pplx-space-common-grpc = { path = "crates/l10_foundation/common/grpc/transport" }
 pplx-space-grpc-lb = { path = "crates/l10_foundation/grpc/lb" }
 pplx-space-common-io = { path = "crates/l10_foundation/common/io" }

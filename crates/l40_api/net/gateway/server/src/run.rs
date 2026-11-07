@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use pplx_space_common_connection_admission::{
+use pplx_space_connection_admission::{
     AdmittedConnections, ConnectionAdmissionConfig, ConnectionAdmissionEvent,
     ConnectionAdmissionFailure, admit_connections,
 };
