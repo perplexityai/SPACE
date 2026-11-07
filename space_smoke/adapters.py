@@ -34,6 +34,7 @@ from urllib.request import Request, urlopen
 
 from space_smoke.capabilities import (
     ActivationSealReport,
+    DrainV2Status,
     ControllerLease,
     ControllerPod,
     NodeContainer,
@@ -5237,6 +5238,51 @@ ON CONFLICT (key_hash) DO NOTHING;
 
     def undrain_node(self, node_id: str) -> None:
         self._admin("POST", f"nodes/{quote(_sql_uuid(node_id), safe='')}:undrain", expect=(200, 202))
+
+    def drain_node_v2(self, node_id: str) -> None:
+        self._admin(
+            "POST",
+            f"nodes/{quote(_sql_uuid(node_id), safe='')}:drain",
+            expect=(200, 202),
+            body={"mode": "forced", "engine": "v2"},
+        )
+
+    def drain_v2_status(self, node_id: str) -> DrainV2Status | None:
+        row = self._psql(
+            "SELECT COALESCE(drain_engine, ''), COALESCE(drain_status::TEXT, '') "
+            f"FROM nodes WHERE id = '{_sql_uuid(node_id)}'",
+            action="read the node's v2 drain columns",
+        )
+        if not row:
+            return None
+        engine, _, status = row.partition("|")
+        return DrainV2Status(
+            engine=engine.strip() or None,
+            status=json.loads(status) if status.strip() else None,
+        )
+
+    def terminate_node(self, node_id: str) -> int:
+        self._require_isolated_kind("admin node operations")
+        request = Request(
+            self.config.api_url.rstrip("/")
+            + f"/admin/api/v1/nodes/{quote(_sql_uuid(node_id), safe='')}:terminate",
+            method="POST",
+            headers={"Authorization": "Bearer " + self._admin_token()},
+        )
+        try:
+            with urlopen(request, timeout=20) as response:
+                return int(response.status)
+        except HTTPError as error:
+            return int(error.code)
+
+    def mark_drain_test_quarantined(self, node_name: str, sandbox_ids: Sequence[str]) -> None:
+        ids = "\n".join(_sql_uuid(sandbox_id) for sandbox_id in sandbox_ids)
+        path = "/space/etc/drain-node-test-quarantined"
+        script = f"rm -f {path}" if not ids else f"printf '%s\\n' {shlex.quote(ids)} > {path}"
+        _require_ok(
+            self._node_shell_exec(node_name, script, timeout=30),
+            f"mark the drain's test-quarantined sandboxes on {node_name}",
+        )
 
     def set_drain_keep(self, node_name: str, value: str) -> None:
         self._require_isolated_kind("drain-keep override")

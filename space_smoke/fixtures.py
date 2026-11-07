@@ -20,6 +20,7 @@ from urllib.request import Request, urlopen
 
 from space_smoke.capabilities import (
     ActivationSealControl,
+    DrainV2Control,
     ConcurrentRestoreControl,
     ConsoleControl,
     DrainRestoreControl,
@@ -104,6 +105,7 @@ from space_smoke.adapters import (
     template_received_uuid,
 )
 from space_smoke.activation_seal import ActivationSealAssertions
+from space_smoke.drain_v2 import DrainV2Assertions
 from space_smoke.concurrent_restore import ConcurrentRestoreAssertions
 from space_smoke.drain_restore import DrainRestoreAssertions
 from space_smoke.node_drain import NodeDrainAssertions
@@ -895,6 +897,7 @@ class CommandSandboxFixture:
     _encrypted_resuspend_control: EncryptedResuspendControl | None = None
     _stopped_replacement_control: StoppedReplacementControl | None = None
     _activation_seal_control: ActivationSealControl | None = None
+    _drain_v2_control: DrainV2Control | None = None
     _create_sandbox: Callable[[], DurableLifecycleSandbox] | None = None
     _processes: ProcessSandbox | None = None
 
@@ -957,6 +960,23 @@ class CommandSandboxFixture:
             )
         return ActivationSealAssertions(
             self, self._activation_seal_control, self._create_sandbox, self._context.scope
+        )
+
+    @property
+    def drain_v2(self) -> DrainV2Assertions:
+        """Drain the sandbox's worker with the v2 engine and judge what follows.
+
+        Each access builds fresh assertions that own the scenario's cordon,
+        drain and unseal compensations, so a scenario takes it once.
+        """
+
+        if self._drain_v2_control is None or self._create_sandbox is None:
+            raise SmokeConfigurationError(
+                "drain v2 control is only available on the kind backend "
+                "with a native sandbox collection"
+            )
+        return DrainV2Assertions(
+            self, self._drain_v2_control, self._create_sandbox, self._context.scope
         )
 
     def phase(self, name: str) -> AbstractContextManager[None]:

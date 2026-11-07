@@ -1602,6 +1602,34 @@ class NodeDrainControl(NodeFaultControl, Protocol):
 
 
 @dataclass(frozen=True)
+class DrainV2Status:
+    """`nodes.drain_engine` and `nodes.drain_status` of one node; `status` is the JSON object."""
+
+    engine: str | None
+    status: dict[str, Any] | None
+
+
+class DrainV2Control(NodeDrainControl, Protocol):
+    """Kind-only operations for the drain v2 scenarios."""
+
+    def drain_node_v2(self, node_id: str) -> None:
+        """`POST :drain` with `mode: forced` and `engine: v2`."""
+        ...
+
+    def drain_v2_status(self, node_id: str) -> DrainV2Status | None:
+        """The node's v2 drain columns; `None` once its row is gone."""
+        ...
+
+    def terminate_node(self, node_id: str) -> int:
+        """`POST :terminate`; the HTTP status it answered."""
+        ...
+
+    def mark_drain_test_quarantined(self, node_name: str, sandbox_ids: Sequence[str]) -> None:
+        """Have the worker's drain read `sandbox_ids` as quarantined (a test-hooks file)."""
+        ...
+
+
+@dataclass(frozen=True)
 class DeadNodeDryRun:
     """One node's entry in `GET /admin/api/v1/dead-node-dry-runs`.
 

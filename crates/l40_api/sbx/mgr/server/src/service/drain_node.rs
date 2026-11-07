@@ -545,11 +545,16 @@ impl SandboxManagerService {
                 .or_default()
                 .insert(pending.local_artifact_id.to_string());
         }
+        let test_quarantined = test_quarantined_sandboxes();
         let rows: Vec<DrainRow> = sandboxes
             .iter()
             .map(|row| DrainRow {
                 sandbox_id: row.id.clone(),
-                lifecycle: row.lifecycle,
+                lifecycle: if test_quarantined.contains(&row.id) {
+                    SandboxState::Quarantined
+                } else {
+                    row.lifecycle
+                },
                 pool_member: row.pool_template.is_some(),
                 volume_encryption: row.volume_encryption,
                 pin: row
@@ -743,6 +748,28 @@ impl SandboxManagerService {
         drop(wake_guard);
         Ok(())
     }
+}
+
+/// Under `test-hooks`, the sandboxes the file `SPACE_DRAIN_NODE_TEST_QUARANTINED_FILE`
+/// names, one id a line, which the drain reads as `quarantined`: a Kind
+/// scenario's way to put a resident the node can't make durable on a worker,
+/// which has no other means to quarantine one. Empty in a release build.
+fn test_quarantined_sandboxes() -> BTreeSet<String> {
+    #[cfg(feature = "test-hooks")]
+    if let Some(path) =
+        pplx_space_common_core::env::test_hook_var("SPACE_DRAIN_NODE_TEST_QUARANTINED_FILE")
+    {
+        return std::fs::read_to_string(path)
+            .map(|ids| {
+                ids.lines()
+                    .map(str::trim)
+                    .filter(|id| !id.is_empty())
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default();
+    }
+    BTreeSet::new()
 }
 
 fn report(

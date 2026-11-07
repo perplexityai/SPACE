@@ -184,7 +184,9 @@ class ActivationSealAssertions:
         """
 
         node = self.node
-        epoch = time.time_ns() // 1_000_000
+        # Microseconds, the unit the node drain's epochs use: epochs only move
+        # forward past the last cancelled one on the worker.
+        epoch = time.time_ns() // 1_000
         self._epoch = epoch
 
         def unseal() -> None:
