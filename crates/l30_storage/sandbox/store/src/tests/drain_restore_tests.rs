@@ -161,7 +161,16 @@ async fn episode(
 }
 
 async fn gate(pool: &PgPool, id: SandboxId, snapshot: Uuid) -> TestResult<DrainRestoreGateRow> {
-    Ok(read_drain_restore_gate(pool, id, snapshot)
+    gate_toward(pool, id, snapshot, DrainRestoreTarget::Started).await
+}
+
+async fn gate_toward(
+    pool: &PgPool,
+    id: SandboxId,
+    snapshot: Uuid,
+    target: DrainRestoreTarget,
+) -> TestResult<DrainRestoreGateRow> {
+    Ok(read_drain_restore_gate(pool, id, snapshot, target)
         .await?
         .expect("the row exists"))
 }
@@ -907,7 +916,7 @@ async fn the_gate_reads_the_named_snapshot() -> TestResult {
     let (_, foreign, _) = drained(pool, "suspended", Artifact::Marked).await?;
     assert_eq!(gate(pool, id, foreign).await?.source_state, None);
     assert!(
-        read_drain_restore_gate(pool, SandboxId::new(), s)
+        read_drain_restore_gate(pool, SandboxId::new(), s, DrainRestoreTarget::Started)
             .await?
             .is_none()
     );
@@ -1020,6 +1029,18 @@ async fn a_stopped_row_whose_pinned_disk_is_s_is_claimed_toward_stopped() -> Tes
     };
     let pool = &db.pool;
     let (id, s) = stopped_with_disk(pool, "ready").await?;
+    // The gate reads the disk toward `stopped`, and no full snapshot toward
+    // a VM target.
+    let read = gate_toward(pool, id, s, DrainRestoreTarget::Stopped).await?;
+    assert_eq!(
+        (
+            read.source_state.as_deref(),
+            read.source_located,
+            read.source_is_current_artifact
+        ),
+        (Some("ready"), true, true)
+    );
+    assert_eq!(gate(pool, id, s).await?.source_state, None);
     let token = Uuid::now_v7();
     let claimed = claim(pool, id, s, DrainRestoreTarget::Stopped, token)
         .await?

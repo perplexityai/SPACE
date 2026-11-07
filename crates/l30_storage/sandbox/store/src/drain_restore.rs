@@ -423,8 +423,8 @@ pub struct DrainRestoreGateRow {
     /// The snapshot the drain's restore selector would load now, as the
     /// claim reads it.
     pub selected_snapshot: Option<Uuid>,
-    /// The named snapshot's state, when it is a full snapshot of this
-    /// sandbox.
+    /// The named snapshot's state, when it is a snapshot of this sandbox of
+    /// the kind the target loads.
     pub source_state: Option<String>,
     /// Whether the named snapshot has a storage location that isn't
     /// orphaned.
@@ -437,14 +437,16 @@ pub struct DrainRestoreGateRow {
     pub source_is_current_artifact: bool,
 }
 
-/// Read what decides whether a drain restore of `sandbox_id` from
-/// `snapshot_id` may try its claim, and if not, why. A plain
-/// read: it takes no lock, and the claim re-checks everything it needs.
-/// `None` when no row exists.
+/// Read what decides whether a drain restore of `sandbox_id` toward `target`
+/// from `snapshot_id` may try its claim, and if not, why. The named snapshot
+/// is the kind `target` loads: a full snapshot, or for `stopped` the
+/// published disk. A plain read: it takes no lock, and the claim re-checks
+/// everything it needs. `None` when no row exists.
 pub async fn read_drain_restore_gate(
     executor: impl PgExecutor<'_>,
     sandbox_id: SandboxId,
     snapshot_id: Uuid,
+    target: DrainRestoreTarget,
 ) -> Result<Option<DrainRestoreGateRow>, sqlx::Error> {
     /// Built once: every input is a literal or a bind placeholder.
     static GATE: LazyLock<String> = LazyLock::new(|| {
@@ -494,13 +496,18 @@ pub async fn read_drain_restore_gate(
                LEFT JOIN snapshots src
                  ON src.id = $2
                 AND src.sandbox_id = s.id
-                AND src.type = 'full'
+                AND src.type = $3
               WHERE s.id = $1"
         ))
     });
+    let source_type = match target {
+        DrainRestoreTarget::Stopped => "disk",
+        DrainRestoreTarget::Started | DrainRestoreTarget::Paused => "full",
+    };
     sqlx::query_as::<_, DrainRestoreGateRow>(sqlx::AssertSqlSafe(GATE.as_str()))
         .bind(sandbox_id)
         .bind(snapshot_id)
+        .bind(source_type)
         .fetch_optional(executor)
         .await
 }

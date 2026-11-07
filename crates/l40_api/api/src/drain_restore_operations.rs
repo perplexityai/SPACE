@@ -345,6 +345,7 @@ impl DrainRestoreOperationExecutor {
             &self.pool,
             request.sandbox_id,
             request.snapshot_id,
+            request.target,
         )
         .await
         {
