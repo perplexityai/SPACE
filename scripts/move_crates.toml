@@ -17,7 +17,6 @@
 "pplx-space-common-grpc" = { to = "crates/l10_foundation/common/grpc/transport" }  # leaf
 "pplx-space-common-io" = { to = "crates/l10_foundation/common/io" }
 "pplx-space-common-jobs" = { to = "crates/l10_foundation/common/jobs" }
-"pplx-space-common-lru-reaper" = { to = "crates/l10_foundation/common/lru/reaper" }
 "pplx-space-common-proto-build" = { to = "crates/l10_foundation/common/proto/build" }
 "pplx-space-content-digest" = { to = "crates/l10_foundation/content/digest" }
 "pplx-space-cpu-arch" = { to = "crates/l10_foundation/cpu/arch" }
@@ -33,6 +32,7 @@
 "pplx-space-k8s-ids" = { to = "crates/l10_foundation/k8s/ids" }
 "pplx-space-kube-client" = { to = "crates/l10_foundation/kube/client" }
 "pplx-space-linux-ids" = { to = "crates/l10_foundation/linux/ids" }
+"pplx-space-common-lru-reaper" = { to = "crates/l10_foundation/lru/reaper", rename = "pplx-space-lru-reaper" }  # renamed
 "pplx-space-metrics-emit" = { to = "crates/l10_foundation/metrics/emit" }
 "pplx-space-migration-checksums" = { to = "crates/l10_foundation/migration/checksums" }
 "pplx-space-object-store" = { to = "crates/l10_foundation/object/store" }
