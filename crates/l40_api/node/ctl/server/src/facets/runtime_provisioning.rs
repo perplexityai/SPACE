@@ -6,8 +6,9 @@ use std::{collections::BTreeSet, future::Future, time::Duration};
 
 use futures_util::{StreamExt, stream};
 use pplx_space_common_core::types::{
-    Arch, DigestParseError, EnvironmentReference, HostPlatform, RuntimeBinding,
+    DigestParseError, EnvironmentReference, HostPlatform, RuntimeBinding,
 };
+use pplx_space_cpu_arch::Arch;
 use pplx_space_node_api_client::proto::{
     GetNodeRuntimeDesiredStateRequest, GetNodeRuntimeDesiredStateResponse, NodeRole,
     RuntimeEnvironmentDesiredPolicy, RuntimeProvisioningRecipe,

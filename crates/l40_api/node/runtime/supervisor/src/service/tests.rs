@@ -694,7 +694,8 @@ async fn cpu_updates_require_execution_launch_evidence() {
 
 #[tokio::test]
 async fn authentication_failure_preserves_status_and_existing_cpu_budget() {
-    use pplx_space_common_core::types::{Arch, SandboxActivationAttemptId, VcpuCount};
+    use pplx_space_common_core::types::{SandboxActivationAttemptId, VcpuCount};
+    use pplx_space_cpu_arch::Arch;
     use pplx_space_node_runtime_core::{
         artifact_store::managed_release_directory, catalog::CompiledEnvironment,
     };
@@ -816,7 +817,7 @@ async fn verified_launch_rejects_ambiguous_and_unsupported_inputs_before_executi
             Invalid::Layout => {
                 input.environment_reference =
                     pplx_space_node_runtime_core::catalog::CompiledEnvironment::for_architecture(
-                        pplx_space_common_core::types::Arch::X86_64,
+                        pplx_space_cpu_arch::Arch::X86_64,
                     )
                     .unwrap()[0]
                         .definition()

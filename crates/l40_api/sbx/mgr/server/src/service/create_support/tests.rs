@@ -5,9 +5,8 @@ use crate::service::activation_support::internal_request;
 
 #[test]
 fn base_snapshot_staging_preserves_cpu_evidence_without_inventing_it() {
-    use pplx_space_common_core::types::{
-        Arch, ExecutionMetadata, SnapshotExecutionMetadata, VcpuCount,
-    };
+    use pplx_space_common_core::types::{ExecutionMetadata, SnapshotExecutionMetadata, VcpuCount};
+    use pplx_space_cpu_arch::Arch;
 
     let cpu = |count| VcpuCount::try_from_u32(count).unwrap();
     for (sidecar, selected_cpu, expected_cpu) in [
@@ -355,7 +354,7 @@ async fn create_intent_preserves_immutables_independently_of_pool_occupancy() {
         let service = SandboxManagerService::for_test(conn);
         let legacy_execution =
             pplx_space_common_core::types::ExecutionMetadata::initial_firecracker(
-                pplx_space_common_core::types::Arch::X86_64,
+                pplx_space_cpu_arch::Arch::X86_64,
                 vec![],
             );
         for has_snapshot in [false, true] {
@@ -488,7 +487,8 @@ fn restore_provenance_classifies_legacy_remote_metadata() {
 /// preference.
 #[tokio::test]
 async fn sandbox_starts_prefer_the_build_of_their_saved_environment() {
-    use pplx_space_common_core::types::{Arch, Digest, EnvironmentReference, ExecutionMetadata};
+    use pplx_space_common_core::types::{Digest, EnvironmentReference, ExecutionMetadata};
+    use pplx_space_cpu_arch::Arch;
     let cache = tempfile::tempdir().unwrap();
     let conn = crate::db::test_conn();
     let id = SandboxId::new().to_string();
@@ -653,7 +653,8 @@ async fn retained_rootfs_inspection_errors_defer_recovery_without_selecting_temp
 async fn retained_instance_permission_recovery_and_repair_preserve_disk() {
     use crate::node_manager_transport::fake::FakeNodeManager;
     use crate::template_resolver::fake::FakeTemplateResolver;
-    use pplx_space_common_core::types::{Arch, SandboxArtifactMetadata};
+    use pplx_space_common_core::types::SandboxArtifactMetadata;
+    use pplx_space_cpu_arch::Arch;
     use pplx_space_node_mgr_client::proto::{
         PrepareSandboxArtifactDirRequest, PrepareSandboxArtifactDirResponse,
     };
@@ -814,7 +815,7 @@ async fn retained_instance_permission_recovery_and_repair_preserve_disk() {
 
 #[test]
 fn template_provenance_does_not_overwrite_a_selected_cold_boot_consumer() {
-    use pplx_space_common_core::types::Arch;
+    use pplx_space_cpu_arch::Arch;
     use pplx_space_node_runtime_core::catalog::CompiledEnvironment;
     let catalog = CompiledEnvironment::for_architecture(Arch::X86_64).unwrap();
     let source = catalog[0].definition().execution_requirements().unwrap();

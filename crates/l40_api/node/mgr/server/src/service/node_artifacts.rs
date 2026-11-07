@@ -10,8 +10,9 @@
 //! be loaded safely refuses the request, not node-manager's startup.
 
 use pplx_space_common_core::types::{
-    Arch, ArtifactVersion, ComponentIdentity, RuntimeIdentity, RuntimeVersion,
+    ArtifactVersion, ComponentIdentity, RuntimeIdentity, RuntimeVersion,
 };
+use pplx_space_cpu_arch::Arch;
 use pplx_space_host_layout::identities::user_names;
 use pplx_space_node_runtime_core::artifact_store::{
     ArtifactStore, Publication, PublishError, PublishOutcome, RemoveError, RemoveOutcome,

@@ -136,8 +136,9 @@ async fn candidate_snapshot_admission_uses_durable_execution_before_checkpointin
     use crate::service::tests::service_tests::insert_test_sandbox;
     use pplx_space_accounts::SandboxOwnerKind;
     use pplx_space_common_core::types::{
-        Arch, Digest, EnvironmentReference, ExecutionMetadata, RuntimeIdentity, RuntimeKind,
+        Digest, EnvironmentReference, ExecutionMetadata, RuntimeIdentity, RuntimeKind,
     };
+    use pplx_space_cpu_arch::Arch;
     let conn = crate::db::test_conn();
     let id = SandboxId::new().to_string();
     insert_test_sandbox(&conn, &id, SandboxState::Paused);
@@ -192,7 +193,8 @@ async fn candidate_snapshot_admission_uses_durable_execution_before_checkpointin
 async fn template_snapshot_refuses_its_partition_before_checkpointing() {
     use crate::service::tests::service_tests::insert_test_sandbox;
     use pplx_space_accounts::SandboxOwnerKind;
-    use pplx_space_common_core::types::{Arch, ExecutionMetadata, RuntimeIdentity, RuntimeKind};
+    use pplx_space_common_core::types::{ExecutionMetadata, RuntimeIdentity, RuntimeKind};
+    use pplx_space_cpu_arch::Arch;
     let conn = crate::db::test_conn();
     let id = SandboxId::new().to_string();
     insert_test_sandbox(&conn, &id, SandboxState::Paused);

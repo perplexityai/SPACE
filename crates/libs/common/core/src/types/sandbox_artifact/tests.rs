@@ -1,7 +1,7 @@
 use std::str::FromStr;
 
 use super::*;
-use crate::types::Arch;
+use pplx_space_cpu_arch::Arch;
 
 #[test]
 fn execution_identity_is_nested_in_sandbox_metadata() {

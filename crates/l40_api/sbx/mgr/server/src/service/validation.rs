@@ -106,7 +106,8 @@ pub(super) fn template_execution_metadata(
     template_dir: &str,
     fallback_arch: &str,
 ) -> Result<pplx_space_common_core::types::ExecutionMetadata, Status> {
-    use pplx_space_common_core::types::{Arch, ExecutionMetadata};
+    use pplx_space_common_core::types::ExecutionMetadata;
+    use pplx_space_cpu_arch::Arch;
     use pplx_space_template_manifest::TemplateMetadata;
 
     let metadata_path = std::path::Path::new(template_dir).join("metadata.json");
@@ -476,13 +477,13 @@ pub(super) fn normalize_environment_input(
 /// one; the execution catalog computes it once, and is the one place that
 /// decides which environment is the initial one.
 fn initial_environment_reference(
-    arch: pplx_space_common_core::types::Arch,
+    arch: pplx_space_cpu_arch::Arch,
 ) -> Option<pplx_space_common_core::types::EnvironmentReference> {
     match arch {
-        pplx_space_common_core::types::Arch::X86_64 => {
+        pplx_space_cpu_arch::Arch::X86_64 => {
             Some(pplx_space_node_runtime_core::catalog::initial_environment_reference())
         }
-        pplx_space_common_core::types::Arch::Aarch64 => None,
+        pplx_space_cpu_arch::Arch::Aarch64 => None,
     }
 }
 

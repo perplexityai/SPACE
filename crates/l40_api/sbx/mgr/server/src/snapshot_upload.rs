@@ -193,7 +193,7 @@ pub const SNAPSHOT_METADATA_VERSION: u32 = 2;
 impl SnapshotMeta {
     pub fn execution_metadata(
         &self,
-        legacy_architecture: pplx_space_common_core::types::Arch,
+        legacy_architecture: pplx_space_cpu_arch::Arch,
     ) -> Result<
         pplx_space_common_core::types::SnapshotExecutionMetadata,
         SnapshotRuntimeMetadataError,
@@ -330,7 +330,7 @@ pub struct SnapshotSource {
 impl SnapshotSource {
     pub fn legacy_execution_metadata(
         &self,
-        architecture: pplx_space_common_core::types::Arch,
+        architecture: pplx_space_cpu_arch::Arch,
     ) -> Result<pplx_space_common_core::types::ExecutionMetadata, SnapshotRuntimeMetadataError>
     {
         use pplx_space_common_core::types::{

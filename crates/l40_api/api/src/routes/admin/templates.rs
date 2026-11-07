@@ -1644,7 +1644,7 @@ pub async fn list_system_template_environments(
     if let Err(error) = require_template_admin(&state.pool, &actor).await {
         return error.into_response();
     }
-    use pplx_space_common_core::types::Arch;
+    use pplx_space_cpu_arch::Arch;
     use pplx_space_execution_catalog::catalog::CompiledEnvironment;
     let mut environments = Vec::new();
     for architecture in [Arch::X86_64, Arch::Aarch64] {

@@ -1,5 +1,6 @@
 use super::{BootConfigError, BootSource, GuestBoot, object};
-use pplx_space_common_core::types::{Arch, RuntimeKind};
+use pplx_space_common_core::types::RuntimeKind;
+use pplx_space_cpu_arch::Arch;
 use serde_json::{Value, json};
 
 pub(super) fn configuration(input: &GuestBoot<'_>) -> Result<Value, BootConfigError> {

@@ -815,7 +815,7 @@ pub(super) fn read_base_snapshot_execution_metadata(
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             let architecture = std::env::consts::ARCH.parse().map_err(
-                |error: pplx_space_common_core::types::ArchParseError| {
+                |error: pplx_space_cpu_arch::ArchParseError| {
                     Status::failed_precondition(error.to_string())
                 },
             )?;

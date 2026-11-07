@@ -1,4 +1,5 @@
-use pplx_space_common_core::types::{Arch, RuntimeKind, StorageUri};
+use pplx_space_common_core::types::{RuntimeKind, StorageUri};
+use pplx_space_cpu_arch::Arch;
 
 use super::*;
 use crate::installs::source::FIRECRACKER_CI_KERNEL_SOURCE;

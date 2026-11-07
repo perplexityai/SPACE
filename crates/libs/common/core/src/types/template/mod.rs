@@ -48,8 +48,8 @@ mod visibility;
 use pplx_space_content_digest as hash;
 
 pub use build::{
-    Arch, ArchParseError, BuildRunId, BuildRunIdParseError, OwnerType, TemplateBuildId,
-    TemplateBuildJobState, TemplateBuildJobStateParseError, TemplateBuildState,
+    BuildRunId, BuildRunIdParseError, OwnerType, TemplateBuildId, TemplateBuildJobState,
+    TemplateBuildJobStateParseError, TemplateBuildState,
 };
 pub use cache_partition::TemplateCachePartition;
 pub use desired_state::{TemplateDesiredState, TemplateDesiredStateParseError};

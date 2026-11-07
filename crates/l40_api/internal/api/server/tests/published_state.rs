@@ -9,13 +9,14 @@ use pplx_space_common_core::types::{LocalArtifactId, SnapshotId};
 use pplx_space_common_core::{
     sql,
     types::{
-        AbandonedRestoreRetirement, Arch, AutoLifecycleConditionSet, AutoLifecycleConditionSetId,
+        AbandonedRestoreRetirement, AutoLifecycleConditionSet, AutoLifecycleConditionSetId,
         AutoLifecycleDeleteReceiptId, AutoLifecycleIdleAction, AutoLifecyclePolicy,
         AutoLifecycleStage, ExecutionMetadata, SandboxActivationAttemptId, SandboxId,
         SandboxLifecycle, SandboxQuarantineHistoryAction, SandboxQuarantineNextAction,
         SandboxQuarantineReasonCode, SandboxQuarantineSource,
     },
 };
+use pplx_space_cpu_arch::Arch;
 use pplx_space_db_test_fixtures::{
     insert_pool_slot_receipt, insert_ready_worker_node, pg_test_db, pool_slot_receipt_state,
     publish_ready_disk_artifact, try_pg_test_db, try_pg_test_db_with_max_connections,

@@ -10,8 +10,6 @@ use super::digest::TemplateArtifactDigest;
 use super::hash::ContentHash;
 use super::identity::TemplateName;
 
-pub use pplx_space_cpu_arch::{Arch, ArchParseError};
-
 /// Error returned when a build run UUID cannot be parsed.
 ///
 /// # Examples

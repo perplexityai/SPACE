@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use oci_spec::distribution::Reference as OciReference;
-use pplx_space_common_core::types::{Arch, Digest, DigestParseError};
+use pplx_space_common_core::types::{Digest, DigestParseError};
+use pplx_space_cpu_arch::Arch;
 use reqwest::StatusCode;
 
 mod client;

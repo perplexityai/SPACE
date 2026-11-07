@@ -477,9 +477,10 @@ async fn a_retry_waiting_on_a_rollback_cleanup_sees_its_receipt() {
     use crate::node_manager_transport::fake::FakeNodeManager;
     use pplx_space_accounts::SandboxOwner;
     use pplx_space_common_core::types::{
-        Arch, AutoLifecyclePolicy, ContentHash, RuntimeKind, SandboxArtifactMetadata,
+        AutoLifecyclePolicy, ContentHash, RuntimeKind, SandboxArtifactMetadata,
         SandboxRuntimeLabel, SnapshotExecutionMetadata,
     };
+    use pplx_space_cpu_arch::Arch;
     use pplx_space_node_mgr_client::proto::{
         AllocateRequest, AllocateResponse, ExecutionEnvironmentSelection, NetworkPoolStatusRequest,
         NetworkPoolStatusResponse, ResolveExecutionEnvironmentRequest,

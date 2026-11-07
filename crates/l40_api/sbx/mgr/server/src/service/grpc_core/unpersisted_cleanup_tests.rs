@@ -254,7 +254,7 @@ async fn unpersisted_admission_preserves_flush_qualification_after_row_loss() {
         if bound {
             let environments =
                 pplx_space_execution_catalog::catalog::CompiledEnvironment::for_architecture(
-                    pplx_space_common_core::types::Arch::X86_64,
+                    pplx_space_cpu_arch::Arch::X86_64,
                 )
                 .unwrap();
             let execution = environments

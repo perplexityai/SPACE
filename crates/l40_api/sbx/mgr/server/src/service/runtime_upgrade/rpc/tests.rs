@@ -146,7 +146,7 @@ fn node_reaching_the_boot(
 ) -> FakeNodeManager {
     use pplx_space_node_runtime_core::catalog::CompiledEnvironment;
     let compiled =
-        CompiledEnvironment::for_architecture(pplx_space_common_core::types::Arch::X86_64).unwrap();
+        CompiledEnvironment::for_architecture(pplx_space_cpu_arch::Arch::X86_64).unwrap();
     let definition = compiled
         .iter()
         .find(|environment| Some(environment.definition().reference()) == target.environment())

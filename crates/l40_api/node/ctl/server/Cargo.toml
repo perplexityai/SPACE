@@ -27,6 +27,7 @@ kubernetes = [
     "dep:k8s-openapi",
     "dep:kube",
     "dep:pplx-space-sandbox-pod",
+    "pplx-space-cpu-arch/serde",
     "pplx-space-semver/serde",
     "dep:pplx-space-kube-client",
 ]
@@ -41,6 +42,7 @@ pplx-space-bearer-token = { workspace = true }
 pplx-space-common-core = { workspace = true }
 pplx-space-host-layout = { workspace = true }
 pplx-space-common-grpc = { workspace = true, features = ["internal-tls"] }
+pplx-space-cpu-arch = { workspace = true }
 pplx-space-grpc-rate-limiter = { workspace = true }
 pplx-space-grpc-server = { workspace = true }
 pplx-space-kube-client = { workspace = true, optional = true }

@@ -951,9 +951,10 @@ fn normalize_patches_explicit_null_config_to_empty_object() {
 #[test]
 fn normalize_rejects_conflicting_execution_metadata() {
     use pplx_space_common_core::types::{
-        Arch, ExecutionMetadata, GuestOperatingSystem, GuestPlatform, RuntimeIdentity, RuntimeKind,
+        ExecutionMetadata, GuestOperatingSystem, GuestPlatform, RuntimeIdentity, RuntimeKind,
         RuntimeVersion,
     };
+    use pplx_space_cpu_arch::Arch;
 
     let metadata_execution = ExecutionMetadata::initial_firecracker(Arch::Aarch64, vec![]);
     let manifest_execution = ExecutionMetadata::new(
@@ -1073,7 +1074,8 @@ async fn assert_untouched(dir: &Path) {
 /// The manifest of a release bound to `partition`'s environment, or an
 /// unbound one for the legacy partition, as the partition probe reads it.
 fn probed_manifest(partition: &TemplateCachePartition) -> Vec<u8> {
-    use pplx_space_common_core::types::{Arch, ExecutionMetadata};
+    use pplx_space_common_core::types::ExecutionMetadata;
+    use pplx_space_cpu_arch::Arch;
     use pplx_space_template_manifest::TemplateManifest;
     let mut manifest = TemplateManifest::default();
     if let Some(environment) = partition.environment() {
@@ -1407,7 +1409,8 @@ fn partition_probe_dirs_are_reaped_staging_dirs_not_builds() {
 /// one its metadata carries, as registration does.
 #[test]
 fn release_partition_reads_the_manifest_then_the_metadata_binding() {
-    use pplx_space_common_core::types::{Arch, Digest, EnvironmentReference, ExecutionMetadata};
+    use pplx_space_common_core::types::{Digest, EnvironmentReference, ExecutionMetadata};
+    use pplx_space_cpu_arch::Arch;
     use pplx_space_template_manifest::{TemplateManifest, TemplateMetadata};
     let environment = EnvironmentReference::new(Digest::sha256([2; 32]));
     let twin = TemplateCachePartition::Environment(environment);

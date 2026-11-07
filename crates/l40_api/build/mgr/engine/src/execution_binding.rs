@@ -16,7 +16,7 @@ use pplx_space_template_manifest::TemplateMetadata;
 #[derive(Debug, thiserror::Error)]
 pub enum BuildExecutionBindingError {
     #[error(transparent)]
-    Architecture(#[from] pplx_space_common_core::types::ArchParseError),
+    Architecture(#[from] pplx_space_cpu_arch::ArchParseError),
     #[error("cannot connect to environment resolver: {0}")]
     Connect(#[from] pplx_space_node_mgr_client::ConnectError),
     #[error("environment resolution failed: {0}")]
@@ -41,7 +41,7 @@ pub enum BuildExecutionBindingError {
         "scratch build requires a supported Linux/{architecture} boot adapter, got {runtime:?}/{guest:?}"
     )]
     ScratchRequirements {
-        architecture: pplx_space_common_core::types::Arch,
+        architecture: pplx_space_cpu_arch::Arch,
         runtime: pplx_space_common_core::types::RuntimeKind,
         guest: pplx_space_common_core::types::GuestPlatform,
     },
@@ -101,12 +101,12 @@ impl BuildExecutionBinding {
     pub(super) async fn for_scratch(
         reference: Option<EnvironmentReference>,
         pin: Option<&super::GuestKernelPin>,
-        architecture: pplx_space_common_core::types::Arch,
+        architecture: pplx_space_cpu_arch::Arch,
     ) -> Result<Option<Self>, BuildExecutionBindingError> {
         // A custom recipe pin or an unqualified host retains the legacy seed
         // contract. This is chosen before resolution, never on resolver failure.
         if reference.is_none()
-            && (pin.is_some() || architecture != pplx_space_common_core::types::Arch::X86_64)
+            && (pin.is_some() || architecture != pplx_space_cpu_arch::Arch::X86_64)
         {
             return Ok(None);
         }
@@ -117,7 +117,7 @@ impl BuildExecutionBinding {
 
     fn check_scratch_requirements(
         &self,
-        architecture: pplx_space_common_core::types::Arch,
+        architecture: pplx_space_cpu_arch::Arch,
     ) -> Result<(), BuildExecutionBindingError> {
         use pplx_space_common_core::types::{GuestOperatingSystem, GuestPlatform, RuntimeKind};
         let guest = GuestPlatform {

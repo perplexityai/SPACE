@@ -15,7 +15,8 @@
 //! - The staging root is created private to its account, and anything else at its path is
 //!   replaced (`the_staging_root_is_created_private_and_anything_else_there_replaced`).
 
-use pplx_space_common_core::types::{Arch, RuntimeVersion};
+use pplx_space_common_core::types::RuntimeVersion;
+use pplx_space_cpu_arch::Arch;
 
 use super::*;
 

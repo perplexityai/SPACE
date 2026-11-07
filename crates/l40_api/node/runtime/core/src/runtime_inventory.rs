@@ -6,11 +6,12 @@ use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 
 use pplx_space_common_core::types::{
-    Arch, ArtifactComponentKind, ArtifactComponentMetadata, ArtifactComponentRole, ArtifactFormat,
+    ArtifactComponentKind, ArtifactComponentMetadata, ArtifactComponentRole, ArtifactFormat,
     ArtifactVersion, Digest, EnvironmentReference, ExecutionMetadata, ExecutionMetadataError,
     FIRECRACKER_STATE_FORMAT, GuestOperatingSystem, GuestPlatform, RuntimeIdentity, RuntimeKind,
     RuntimeVersion, StateFormatIdentity, StateFormatName, StateFormatVersion, VersionSortKey,
 };
+use pplx_space_cpu_arch::Arch;
 use sha2::{Digest as _, Sha256};
 
 mod cloud_hypervisor;

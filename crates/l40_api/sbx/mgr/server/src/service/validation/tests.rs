@@ -2,7 +2,8 @@ use super::normalize_environment_input;
 use super::require_environment_acknowledgement;
 use super::template_base_snapshot_dir;
 use super::template_snapshot_partition;
-use pplx_space_common_core::types::{Arch, EnvironmentReference, ExecutionMetadata};
+use pplx_space_common_core::types::{EnvironmentReference, ExecutionMetadata};
+use pplx_space_cpu_arch::Arch;
 
 #[test]
 fn bound_execution_requires_positive_peer_acknowledgement() {
@@ -522,7 +523,7 @@ fn automatic_lifecycle_admission_respects_runtime_capabilities() {
         super::validate_runtime_lifecycle_policy(RuntimeKind::Firecracker, &policy).unwrap();
         super::validate_runtime_lifecycle_policy(RuntimeKind::CloudHypervisor, &policy).unwrap();
         for entry in pplx_space_node_runtime_core::catalog::CompiledEnvironment::for_architecture(
-            pplx_space_common_core::types::Arch::X86_64,
+            pplx_space_cpu_arch::Arch::X86_64,
         )
         .unwrap()
         {

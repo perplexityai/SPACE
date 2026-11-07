@@ -1189,8 +1189,9 @@ fn ready_backup_returns_before_the_retained_source_is_inspected() {
 #[test]
 fn begin_request_carries_the_recorded_capture_host_cpu() {
     use pplx_space_common_core::types::{
-        Arch, ArtifactKind, ArtifactOrigin, ExecutionMetadata, HostCpu, SnapshotExecutionMetadata,
+        ArtifactKind, ArtifactOrigin, ExecutionMetadata, HostCpu, SnapshotExecutionMetadata,
     };
+    use pplx_space_cpu_arch::Arch;
 
     let execution = SnapshotExecutionMetadata::new(ExecutionMetadata::initial_firecracker(
         Arch::X86_64,
@@ -1223,8 +1224,9 @@ fn begin_request_carries_the_recorded_capture_host_cpu() {
 #[test]
 fn verdict_only_begin_is_requested_and_its_echo_read() {
     use pplx_space_common_core::types::{
-        Arch, ArtifactKind, ArtifactOrigin, ExecutionMetadata, SnapshotExecutionMetadata,
+        ArtifactKind, ArtifactOrigin, ExecutionMetadata, SnapshotExecutionMetadata,
     };
+    use pplx_space_cpu_arch::Arch;
 
     let execution = SnapshotExecutionMetadata::new(ExecutionMetadata::initial_firecracker(
         Arch::X86_64,

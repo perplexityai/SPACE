@@ -29,13 +29,12 @@ pub enum RuntimeArtifactReadError {
     Execution(#[from] pplx_space_common_core::types::ExecutionMetadataError),
 }
 
-pub(super) fn host_architecture()
--> Result<pplx_space_common_core::types::Arch, RuntimeArtifactReadError> {
-    std::env::consts::ARCH.parse().map_err(
-        |error: pplx_space_common_core::types::ArchParseError| {
+pub(super) fn host_architecture() -> Result<pplx_space_cpu_arch::Arch, RuntimeArtifactReadError> {
+    std::env::consts::ARCH
+        .parse()
+        .map_err(|error: pplx_space_cpu_arch::ArchParseError| {
             RuntimeArtifactReadError::Architecture(error.to_string())
-        },
-    )
+        })
 }
 
 fn sandbox_artifact_metadata_in(

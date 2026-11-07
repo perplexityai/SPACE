@@ -14,13 +14,14 @@ use pplx_space_cluster_trigger_queue::{
     QueuedRefConflict, enqueue_triggers_conn, queue_node_reconcile_refs,
 };
 use pplx_space_common_core::types::{
-    Arch, ArtifactKind, ArtifactOrigin, AutoLifecyclePolicy, ExecutionGeneration,
-    ExecutionMetadata, LocalArtifactId, NodeRole, PodUid, RuntimeKind, SandboxActivationAttemptId,
-    SandboxId, SandboxLifecycle, SandboxQuarantineHistoryAction, SandboxQuarantineNextAction,
+    ArtifactKind, ArtifactOrigin, AutoLifecyclePolicy, ExecutionGeneration, ExecutionMetadata,
+    LocalArtifactId, NodeRole, PodUid, RuntimeKind, SandboxActivationAttemptId, SandboxId,
+    SandboxLifecycle, SandboxQuarantineHistoryAction, SandboxQuarantineNextAction,
     SandboxQuarantineReasonCode, SandboxQuarantineSource, SandboxTransitionReceipt,
     SandboxTransitionReceiptInvariantError, SandboxTransitionReceiptKind,
     SandboxTransitionTargetState,
 };
+use pplx_space_cpu_arch::Arch;
 use pplx_space_events::{
     SandboxEvent, SandboxEventDetails, SandboxEventSource, SandboxEventTrigger, SandboxEventType,
 };

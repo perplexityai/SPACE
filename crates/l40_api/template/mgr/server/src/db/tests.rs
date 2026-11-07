@@ -1,7 +1,8 @@
 use pplx_space_common_core::types::{
-    Arch, ArtifactComponentKind, ArtifactComponentMetadata, ArtifactFormat, ArtifactVersion,
+    ArtifactComponentKind, ArtifactComponentMetadata, ArtifactFormat, ArtifactVersion,
     AutoLifecycleWakePolicy, AutoLifecycleWakeSource, Digest, ExecutionMetadata,
 };
+use pplx_space_cpu_arch::Arch;
 use pplx_space_template_manifest::TemplateManifest;
 
 use super::*;

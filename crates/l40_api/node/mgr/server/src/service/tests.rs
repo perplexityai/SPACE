@@ -750,7 +750,7 @@ pub(super) mod service_tests {
                         None,
                         None,
                         &pplx_space_node_runtime_core::catalog::CompiledEnvironment::for_architecture(
-                            pplx_space_common_core::types::Arch::X86_64,
+                            pplx_space_cpu_arch::Arch::X86_64,
                         )
                         .unwrap(),
                     )

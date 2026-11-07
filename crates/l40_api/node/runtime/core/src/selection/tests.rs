@@ -1,5 +1,6 @@
 use super::*;
 use crate::catalog::CompiledEnvironment;
+use pplx_space_cpu_arch::Arch;
 
 #[test]
 fn policy_defaults_to_initial_and_rejects_ambiguous_configuration() {

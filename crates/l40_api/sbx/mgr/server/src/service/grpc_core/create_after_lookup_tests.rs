@@ -672,7 +672,8 @@ async fn requested_id_create_reuses_only_a_compatible_settled_row() {
 }
 
 fn protocol_test_environment() -> pplx_space_execution_common::environment::EnvironmentDefinition {
-    use pplx_space_common_core::types::{Arch, EnvironmentDescriptor, RuntimeBinding};
+    use pplx_space_common_core::types::{EnvironmentDescriptor, RuntimeBinding};
+    use pplx_space_cpu_arch::Arch;
     use pplx_space_execution_common::environment::EnvironmentDefinition;
     let initial =
         pplx_space_node_runtime_core::catalog::InitialEnvironment::for_architecture(Arch::X86_64)
@@ -830,7 +831,7 @@ async fn selected_create_persists_the_binding_used_by_first_start() {
         return;
     }
     for environment in pplx_space_node_runtime_core::catalog::CompiledEnvironment::for_architecture(
-        pplx_space_common_core::types::Arch::X86_64,
+        pplx_space_cpu_arch::Arch::X86_64,
     )
     .unwrap()
     {
