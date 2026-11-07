@@ -1,4 +1,4 @@
-//! The node's activation seal, and the activation work in flight that a
+//! The node's activation seal, and the VM activations in flight that a
 //! drain waits for.
 //!
 //! While sealed under an epoch, [`ActivationSeal::admit`] refuses every VM
@@ -17,52 +17,19 @@
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::Duration;
 
 use pplx_space_common_core::activation_seal_signals::ACTIVATIONS_SEALED_MARKER;
 use tonic::Status;
 
 use crate::db::activation_seal::{ActivationSealRecord, write_activation_seal};
 
-/// What a VM activation in flight is.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
-pub(crate) enum InFlightActivationKind {
-    Cold,
-    Restore,
-    ResidentResume,
-}
-
-impl InFlightActivationKind {
-    pub(crate) const fn as_str(self) -> &'static str {
-        match self {
-            Self::Cold => "cold",
-            Self::Restore => "restore",
-            Self::ResidentResume => "resident_resume",
-        }
-    }
-}
-
-impl std::fmt::Display for InFlightActivationKind {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(self.as_str())
-    }
-}
-
-/// One piece of activation work in flight.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct InFlightActivation {
-    pub(crate) kind: InFlightActivationKind,
-    pub(crate) sandbox_id: String,
-    pub(crate) age: Duration,
-}
-
-/// The seal and the work in flight, read together.
+/// The seal and the activations in flight, read together.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ActivationSealStatus {
     /// The epoch the node is sealed under.
     pub(crate) sealed_epoch: Option<u64>,
-    /// Oldest first.
-    pub(crate) in_flight: Vec<InFlightActivation>,
+    /// The sandbox of each activation in flight, oldest first.
+    pub(crate) in_flight: Vec<String>,
 }
 
 pub(crate) struct ActivationSeal {
@@ -105,19 +72,18 @@ impl ActivationSeal {
             tracing::error!(%error, "cannot read the activation seal; refusing every VM activation");
             error.to_string()
         });
-        let seal = Self {
+        if let Ok(Some(current)) = record
+            && current.sealed
+        {
+            tracing::info!(
+                epoch = current.epoch,
+                "sandbox-manager starts with VM activations sealed"
+            );
+        }
+        Self {
             state: Mutex::new(SealState { record }),
             in_flight: Arc::new(InFlightRegistry::default()),
-        };
-        let state = seal.lock_state();
-        pplx_space_sandbox_metrics::admission::node_activation_seal_sealed(
-            state.record.is_err() || state.sealed_epoch().is_some(),
-        );
-        if let Some(epoch) = state.sealed_epoch() {
-            tracing::info!(epoch, "sandbox-manager starts with VM activations sealed");
         }
-        drop(state);
-        seal
     }
 
     /// A never-sealed seal for code under test that has no service database.
@@ -134,27 +100,24 @@ impl ActivationSeal {
         self.lock_state().record.as_ref().err().cloned()
     }
 
-    /// Refuse an activation while sealed, without admitting it.
-    pub(crate) fn check(
-        &self,
-        kind: InFlightActivationKind,
-        sandbox_id: &str,
-    ) -> Result<(), Status> {
-        refuse_while_sealed(&self.lock_state(), kind, sandbox_id)
+    /// Refuse an activation while sealed, without admitting it. `activation`
+    /// names its kind in the refusal.
+    pub(crate) fn check(&self, activation: &str, sandbox_id: &str) -> Result<(), Status> {
+        refuse_while_sealed(&self.lock_state(), activation, sandbox_id)
     }
 
     /// Admit one VM activation, or refuse it while sealed. The token counts
     /// the activation as in flight until it is dropped.
     pub(crate) fn admit(
         &self,
-        kind: InFlightActivationKind,
+        activation: &str,
         sandbox_id: &str,
     ) -> Result<ActivationInFlightToken, Status> {
         let state = self.lock_state();
-        refuse_while_sealed(&state, kind, sandbox_id)?;
+        refuse_while_sealed(&state, activation, sandbox_id)?;
         // Registered before the state lock is released, so a seal that
         // lands next finds it in flight.
-        Ok(self.in_flight.register(kind, sandbox_id))
+        Ok(self.in_flight.register(sandbox_id))
     }
 
     /// Seal under `epoch`, persisted before the seal takes effect. The same
@@ -179,9 +142,6 @@ impl ActivationSeal {
         };
         persist(db, record)?;
         state.record = Ok(Some(record));
-        // Under the state lock, so gauges from racing seals and unseals land
-        // in the order the state changed.
-        pplx_space_sandbox_metrics::admission::node_activation_seal_sealed(true);
         drop(state);
         tracing::info!(
             epoch,
@@ -220,7 +180,6 @@ impl ActivationSeal {
         };
         persist_cancel(db, record, record.epoch)?;
         state.record = Ok(Some(record));
-        pplx_space_sandbox_metrics::admission::node_activation_seal_sealed(false);
         drop(state);
         if current.is_some_and(|current| current.sealed) {
             tracing::info!(epoch, "unsealed sandbox-manager VM activations");
@@ -236,15 +195,15 @@ impl ActivationSeal {
         }
     }
 
-    /// The service tests' leak check: fails while any activation work is
-    /// still counted in flight.
+    /// The service tests' leak check: fails while any activation is still
+    /// counted in flight.
     #[cfg(test)]
     #[track_caller]
     pub(crate) fn assert_quiesced(&self) {
         let in_flight = self.in_flight.list();
         assert!(
             in_flight.is_empty(),
-            "activation work still in flight: {in_flight:?}"
+            "activations still in flight: {in_flight:?}"
         );
     }
 
@@ -256,7 +215,7 @@ impl ActivationSeal {
 
 fn refuse_while_sealed(
     state: &SealState,
-    kind: InFlightActivationKind,
+    activation: &str,
     sandbox_id: &str,
 ) -> Result<(), Status> {
     let seal = match (&state.record, state.sealed_epoch()) {
@@ -265,8 +224,8 @@ fn refuse_while_sealed(
         (Ok(_), None) => return Ok(()),
     };
     Err(Status::failed_precondition(format!(
-        "{ACTIVATIONS_SEALED_MARKER} ({seal}); refusing the {kind} activation of sandbox \
-         {sandbox_id}"
+        "{ACTIVATIONS_SEALED_MARKER} ({seal}); refusing the {activation} activation of \
+         sandbox {sandbox_id}"
     )))
 }
 
@@ -315,36 +274,17 @@ fn persist_cancel(
         .map_err(|error| Status::internal(format!("persist the drain cancel: {error}")))
 }
 
-struct InFlightEntry {
-    kind: InFlightActivationKind,
-    sandbox_id: String,
-    started_at: tokio::time::Instant,
-}
-
+/// The sandbox of each activation in flight, by a token id issued in order.
 #[derive(Default)]
 struct InFlightRegistry {
-    entries: Mutex<BTreeMap<u64, InFlightEntry>>,
+    entries: Mutex<BTreeMap<u64, String>>,
     next_id: AtomicU64,
 }
 
 impl InFlightRegistry {
-    fn register(
-        self: &Arc<Self>,
-        kind: InFlightActivationKind,
-        sandbox_id: &str,
-    ) -> ActivationInFlightToken {
+    fn register(self: &Arc<Self>, sandbox_id: &str) -> ActivationInFlightToken {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let mut entries = self.lock_entries();
-        entries.insert(
-            id,
-            InFlightEntry {
-                kind,
-                sandbox_id: sandbox_id.to_owned(),
-                started_at: tokio::time::Instant::now(),
-            },
-        );
-        emit_in_flight(&entries, kind);
-        drop(entries);
+        self.lock_entries().insert(id, sandbox_id.to_owned());
         ActivationInFlightToken {
             registry: Arc::clone(self),
             id,
@@ -352,37 +292,20 @@ impl InFlightRegistry {
     }
 
     fn release(&self, id: u64) {
-        let mut entries = self.lock_entries();
-        if let Some(entry) = entries.remove(&id) {
-            emit_in_flight(&entries, entry.kind);
-        }
+        self.lock_entries().remove(&id);
     }
 
-    fn list(&self) -> Vec<InFlightActivation> {
-        let now = tokio::time::Instant::now();
-        // Ids are issued in order, so the map is oldest first.
-        self.lock_entries()
-            .values()
-            .map(|entry| InFlightActivation {
-                kind: entry.kind,
-                sandbox_id: entry.sandbox_id.clone(),
-                age: now.saturating_duration_since(entry.started_at),
-            })
-            .collect()
+    fn list(&self) -> Vec<String> {
+        self.lock_entries().values().cloned().collect()
     }
 
-    fn lock_entries(&self) -> MutexGuard<'_, BTreeMap<u64, InFlightEntry>> {
+    fn lock_entries(&self) -> MutexGuard<'_, BTreeMap<u64, String>> {
         // A token dropped while unwinding must still release its entry.
         self.entries.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 
-fn emit_in_flight(entries: &BTreeMap<u64, InFlightEntry>, kind: InFlightActivationKind) {
-    let count = entries.values().filter(|entry| entry.kind == kind).count();
-    pplx_space_sandbox_metrics::admission::node_activation_seal_in_flight(kind.as_str(), count);
-}
-
-/// Counts one piece of activation work as in flight until dropped, on
+/// Counts one VM activation as in flight until dropped, on
 /// success, error, cancellation or unwinding alike. Separate from the
 /// activation limiter's permit, which an activation gives back as soon as
 /// node-manager answers its launch or resume.

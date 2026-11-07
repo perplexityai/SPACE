@@ -150,7 +150,6 @@ pub fn report_json(
     serde_json::json!({
         "sealed_epoch": response.sealed_epoch,
         "done": response.done,
-        "in_flight": response.in_flight.len(),
         "evacuated": response.evacuated.iter().map(|entry| serde_json::json!({
             "sandbox_id": entry.sandbox_id,
             "prior": prior(entry.prior),
@@ -164,7 +163,6 @@ pub fn report_json(
             "sandbox_id": entry.sandbox_id,
             "reason": entry.reason,
         })).collect::<Vec<_>>(),
-        "debris": response.debris,
         "unrecorded": records.iter().filter_map(|(sandbox_id, record)| match record {
             EvacuationRecord::NotYet(reason) => Some(serde_json::json!({
                 "sandbox_id": sandbox_id,

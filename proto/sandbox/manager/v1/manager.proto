@@ -2058,32 +2058,6 @@ message ListPendingLocalBackupsResponse {
   repeated PendingLocalBackup pending = 1;
 }
 
-// What a piece of in-flight activation work is. The first three are activations
-// the seal refuses once in place; the last two are a checkpoint's and a stop's
-// own resumes, which run whether or not the node is sealed.
-enum InFlightActivationKind {
-  IN_FLIGHT_ACTIVATION_KIND_UNSPECIFIED = 0;
-  // A cold boot, from admission until its readiness finalizer settles.
-  IN_FLIGHT_ACTIVATION_KIND_COLD = 1;
-  // A snapshot restore, from admission until its finalizer settles.
-  IN_FLIGHT_ACTIVATION_KIND_RESTORE = 2;
-  // The resume of a paused VM held in memory.
-  IN_FLIGHT_ACTIVATION_KIND_RESIDENT_RESUME = 3;
-  // A full checkpoint of a running VM, from its pause until it has resumed
-  // the VM or given up.
-  IN_FLIGHT_ACTIVATION_KIND_CHECKPOINT = 4;
-  // A stop's resume of a paused VM so its guest can flush, until the stop's
-  // cleanup of the VM returns.
-  IN_FLIGHT_ACTIVATION_KIND_STOP_FLUSH = 5;
-}
-
-message InFlightActivation {
-  InFlightActivationKind kind = 1;
-  string sandbox_id = 2;
-  // How long the work has been in flight, on sandbox-manager's monotonic clock.
-  google.protobuf.Duration age = 3;
-}
-
 message DrainNodeRequest {
   // Nonzero, at most 2^63 - 1. Only moves forward (see `DrainNode`).
   uint64 epoch = 1;
@@ -2112,8 +2086,9 @@ message DrainEvacuated {
 // Work the drain is still doing or waiting for.
 message DrainPending {
   string sandbox_id = 1;
-  // What it waits for: `suspend`, `publish_disk`, `upload`, or `settle:<state>`
-  // for a row in a transition the drain does not drive.
+  // What it waits for: `suspend`, `publish_disk`, `upload`, `activation` for
+  // an activation admitted before the seal that is still in flight, or
+  // `settle:<state>` for a row in a transition the drain does not drive.
   string action = 2;
 }
 
@@ -2129,16 +2104,10 @@ message DrainNodeResponse {
   // The epoch the node is sealed under after this call; unset once
   // cancelled.
   optional uint64 sealed_epoch = 1;
-  // Activation work in flight at the walk's first read.
-  repeated InFlightActivation in_flight = 3;
-  repeated DrainEvacuated evacuated = 4;
-  repeated DrainPending pending = 5;
-  repeated DrainBlocked blocked = 6;
-  // Leftovers that hold no resident or artifact (network namespaces,
-  // cgroups, nft rules, gateway run directories), and the failures of the
-  // scans that look for them. Reported, never blocking.
-  repeated string debris = 7;
-  bool done = 8;
+  repeated DrainEvacuated evacuated = 2;
+  repeated DrainPending pending = 3;
+  repeated DrainBlocked blocked = 4;
+  bool done = 5;
 }
 
 // Node-local facts about the current legacy quarantine-recovery episode.

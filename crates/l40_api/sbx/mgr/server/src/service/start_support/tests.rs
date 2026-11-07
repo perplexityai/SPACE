@@ -476,7 +476,7 @@ async fn sealed_admission_refuses_every_kind_and_unseal_admits_each_again() {
     for kind in ActivationAdmissionKind::ALL {
         admitted.push(
             service
-                .admit_vm_activation(kind, "sandbox-unsealed")
+                .admit_vm_activation(kind, kind.as_str())
                 .await
                 .unwrap_or_else(|status| panic!("{kind:?} after the unseal: {status:?}"))
                 .into_parts()
@@ -485,12 +485,8 @@ async fn sealed_admission_refuses_every_kind_and_unseal_admits_each_again() {
     }
     let status = service.activation_seal.status();
     assert_eq!(
-        status
-            .in_flight
-            .iter()
-            .map(|in_flight| in_flight.kind)
-            .collect::<Vec<_>>(),
-        ActivationAdmissionKind::ALL.map(ActivationAdmissionKind::in_flight_kind)
+        status.in_flight,
+        ActivationAdmissionKind::ALL.map(ActivationAdmissionKind::as_str)
     );
     drop(admitted);
     service.activation_seal.assert_quiesced();

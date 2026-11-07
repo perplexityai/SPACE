@@ -624,13 +624,7 @@ async fn suspend_restore_is_admitted_before_the_vm_launches(#[values(false, true
             move |_: LaunchSandboxRequest| -> Result<LaunchSandboxResponse, Status> {
                 *admitted_at_launch.lock().unwrap() = Some(admitted.lock().unwrap().clone());
                 let seal = seal_slot.lock().unwrap().clone().unwrap();
-                *in_flight_at_launch.lock().unwrap() = Some(
-                    seal.status()
-                        .in_flight
-                        .into_iter()
-                        .map(|in_flight| (in_flight.kind, in_flight.sandbox_id))
-                        .collect::<Vec<_>>(),
-                );
+                *in_flight_at_launch.lock().unwrap() = Some(seal.status().in_flight);
                 Err(Status::unavailable(
                     "firecracker launch refused by the test",
                 ))
@@ -691,10 +685,7 @@ async fn suspend_restore_is_admitted_before_the_vm_launches(#[values(false, true
         );
         assert_eq!(
             *in_flight_at_launch.lock().unwrap(),
-            Some(vec![(
-                crate::activation_seal::InFlightActivationKind::Restore,
-                id.clone()
-            )]),
+            Some(vec![id.clone()]),
             "the restore is in flight while it launches the VM"
         );
     }
