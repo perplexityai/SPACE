@@ -1,10 +1,10 @@
 use pplx_space_auto_lifecycle::{AutoLifecycleWakePolicy, AutoLifecycleWakeSource};
-use pplx_space_common_core::types::{
-    ArtifactComponentKind, ArtifactComponentMetadata, ArtifactFormat, ArtifactVersion,
-    ExecutionMetadata,
-};
 use pplx_space_content_digest::Digest;
 use pplx_space_cpu_arch::Arch;
+use pplx_space_execution_spec::{
+    ArtifactComponentKind, ArtifactComponentMetadata, ExecutionMetadata,
+};
+use pplx_space_execution_spec::{ArtifactFormat, ArtifactVersion};
 use pplx_space_template_manifest::TemplateManifest;
 
 use super::*;
@@ -278,7 +278,7 @@ fn upsert_build_projects_execution_metadata_and_unspecified_role() {
             }],
         );
         let execution = if bound {
-            execution.with_environment(pplx_space_common_core::types::EnvironmentReference::new(
+            execution.with_environment(pplx_space_execution_spec::EnvironmentReference::new(
                 Digest::sha256([1; 32]),
             ))
         } else {
@@ -776,7 +776,7 @@ fn ready_build(name: &str, content_hash: &str, size: u64) -> BuildUpsert<'static
 #[rstest::rstest]
 #[case::legacy(crate::db::TemplateCachePartition::Legacy)]
 #[case::environment(crate::db::TemplateCachePartition::Environment(
-    pplx_space_common_core::types::EnvironmentReference::new(Digest::sha256([2; 32]))
+    pplx_space_execution_spec::EnvironmentReference::new(Digest::sha256([2; 32]))
 ))]
 fn same_key_upserts_replace_in_place_in_each_partition(
     #[case] partition: crate::db::TemplateCachePartition,
@@ -784,7 +784,7 @@ fn same_key_upserts_replace_in_place_in_each_partition(
     use crate::db::TemplateCachePartition;
     let sibling = match partition {
         TemplateCachePartition::Legacy => TemplateCachePartition::Environment(
-            pplx_space_common_core::types::EnvironmentReference::new(Digest::sha256([3; 32])),
+            pplx_space_execution_spec::EnvironmentReference::new(Digest::sha256([3; 32])),
         ),
         TemplateCachePartition::Environment(_) => TemplateCachePartition::Legacy,
     };
@@ -1176,7 +1176,7 @@ fn partition_of(manifest_json: &str) -> TemplateCachePartition {
 #[test]
 fn pool_refills_prefer_firecracker_and_admit_cloud_hypervisor() {
     let conn = test_conn();
-    use pplx_space_common_core::types::guest_image::{
+    use pplx_space_execution_spec::guest_image::{
         GuestAgent, GuestDiskLayout, GuestImageContract, GuestNetwork, GuestReadiness,
     };
     let catalog =
@@ -1251,7 +1251,7 @@ fn pool_refills_prefer_firecracker_and_admit_cloud_hypervisor() {
         crate::pool_manager::pool_refill_build(&conn, "agentless"),
         Err(crate::pool_manager::PoolError::NoPoolBuild)
     ));
-    let cloud_hypervisor = pplx_space_common_core::types::RuntimeKind::CloudHypervisor.alias();
+    let cloud_hypervisor = pplx_space_execution_spec::RuntimeKind::CloudHypervisor.alias();
     let linux = catalog
         .iter()
         .find(|entry| entry.name() == "ch-54.0-linux-7.2.8")

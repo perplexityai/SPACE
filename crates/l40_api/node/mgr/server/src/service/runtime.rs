@@ -516,7 +516,7 @@ impl NodeManagerService {
                         ExpectedSpacedHostPeer::new(
                             pid,
                             sandbox_uid,
-                            pplx_space_common_core::types::guest_image::QualifiedGuestAgent::Absent,
+                            pplx_space_execution_spec::guest_image::QualifiedGuestAgent::Absent,
                         )
                     })
                 })
@@ -537,10 +537,9 @@ impl NodeManagerService {
                 let runtime = self
                     .recorded_execution(req.sandbox_id.clone())
                     .await?
-                    .map_or(
-                        pplx_space_common_core::types::RuntimeKind::Firecracker,
-                        |e| e.runtime().kind,
-                    );
+                    .map_or(pplx_space_execution_spec::RuntimeKind::Firecracker, |e| {
+                        e.runtime().kind
+                    });
                 let guest_agent = self
                     .recorded_guest_profile(req.sandbox_id.clone())
                     .await
@@ -549,7 +548,7 @@ impl NodeManagerService {
                     })?
                     .map_or(
                         // Missing records belong to pre-contract Linux sandboxes.
-                        pplx_space_common_core::types::guest_image::QualifiedGuestAgent::LinuxV1,
+                        pplx_space_execution_spec::guest_image::QualifiedGuestAgent::LinuxV1,
                         |profile| profile.agent_protocol(),
                     );
                 Some(peer.for_runtime(runtime).for_guest_agent(guest_agent))
@@ -645,7 +644,7 @@ impl NodeManagerService {
             )
             .emit_with(details());
             let dhcp = self.recorded_guest_network(req.sandbox_id.clone()).await?
-                == pplx_space_common_core::types::guest_image::GuestNetwork::SlotDhcpV1;
+                == pplx_space_execution_spec::guest_image::GuestNetwork::SlotDhcpV1;
             net::setup_tproxy(&ns_name, process_uid, &vpeer, dhcp).map_err(|e| {
                 let status = Status::internal(format!("setup tproxy failed: {e}"));
                 SandboxEvent::new(

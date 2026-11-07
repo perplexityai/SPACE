@@ -9,10 +9,9 @@
 //! names an artifact by what it is, never by a path. A catalog that cannot
 //! be loaded safely refuses the request, not node-manager's startup.
 
-use pplx_space_common_core::types::{
-    ArtifactVersion, ComponentIdentity, RuntimeIdentity, RuntimeVersion,
-};
 use pplx_space_cpu_arch::Arch;
+use pplx_space_execution_spec::{ArtifactVersion, RuntimeVersion};
+use pplx_space_execution_spec::{ComponentIdentity, RuntimeIdentity};
 use pplx_space_host_layout::identities::user_names;
 use pplx_space_node_runtime_core::artifact_store::{
     ArtifactStore, Publication, PublishError, PublishOutcome, RemoveError, RemoveOutcome,
@@ -40,7 +39,7 @@ impl NodeManagerService {
     #[cfg(test)]
     pub(super) fn allowed_definition(
         &self,
-        reference: Option<pplx_space_common_core::types::EnvironmentReference>,
+        reference: Option<pplx_space_execution_spec::EnvironmentReference>,
         mode: ExecutionSelectionMode,
     ) -> Result<pplx_space_execution_common::environment::EnvironmentDefinition, Status> {
         self.allowed_definition_in(PolicyScope::Effective, reference, mode)
@@ -49,7 +48,7 @@ impl NodeManagerService {
     pub(super) fn allowed_definition_in(
         &self,
         scope: PolicyScope,
-        reference: Option<pplx_space_common_core::types::EnvironmentReference>,
+        reference: Option<pplx_space_execution_spec::EnvironmentReference>,
         mode: ExecutionSelectionMode,
     ) -> Result<pplx_space_execution_common::environment::EnvironmentDefinition, Status> {
         select_definition(&self.execution_policy_in(scope), reference, mode)
@@ -67,7 +66,7 @@ impl NodeManagerService {
 
     pub(super) async fn require_verified_environment_layout(
         &self,
-        runtime: pplx_space_common_core::types::RuntimeKind,
+        runtime: pplx_space_execution_spec::RuntimeKind,
     ) -> Result<(), Status> {
         if !cfg!(target_os = "linux") {
             return Err(Status::failed_precondition(
@@ -141,11 +140,11 @@ impl NodeManagerService {
     pub(super) async fn resolve_new_cold_boot(
         &self,
         policy: &pplx_space_node_runtime_core::selection::ExecutionPolicy,
-        reference: Option<pplx_space_common_core::types::EnvironmentReference>,
+        reference: Option<pplx_space_execution_spec::EnvironmentReference>,
     ) -> Result<
         (
             pplx_space_execution_common::environment::EnvironmentDefinition,
-            pplx_space_common_core::types::ExecutionMetadata,
+            pplx_space_execution_spec::ExecutionMetadata,
         ),
         Status,
     > {
@@ -174,8 +173,8 @@ impl NodeManagerService {
 
     pub(super) async fn resolve_bound_execution(
         &self,
-        requested: Option<&pplx_space_common_core::types::ExecutionMetadata>,
-        runtime: pplx_space_common_core::types::RuntimeKind,
+        requested: Option<&pplx_space_execution_spec::ExecutionMetadata>,
+        runtime: pplx_space_execution_spec::RuntimeKind,
         mode: ExecutionSelectionMode,
     ) -> Result<ResolvedExecutionEnvironment, Status> {
         self.resolve_bound_execution_in(PolicyScope::Effective, requested, runtime, mode)
@@ -185,8 +184,8 @@ impl NodeManagerService {
     pub(super) async fn resolve_bound_execution_in(
         &self,
         scope: PolicyScope,
-        requested: Option<&pplx_space_common_core::types::ExecutionMetadata>,
-        runtime: pplx_space_common_core::types::RuntimeKind,
+        requested: Option<&pplx_space_execution_spec::ExecutionMetadata>,
+        runtime: pplx_space_execution_spec::RuntimeKind,
         mode: ExecutionSelectionMode,
     ) -> Result<ResolvedExecutionEnvironment, Status> {
         let policy = self.execution_policy_in(scope);
@@ -264,7 +263,7 @@ pub(super) enum PolicyScope {
 
 fn select_definition(
     policy: &pplx_space_node_runtime_core::selection::ExecutionPolicy,
-    reference: Option<pplx_space_common_core::types::EnvironmentReference>,
+    reference: Option<pplx_space_execution_spec::EnvironmentReference>,
     mode: ExecutionSelectionMode,
 ) -> Result<pplx_space_execution_common::environment::EnvironmentDefinition, Status> {
     if policy.cluster_policy_unreadable() {
@@ -366,7 +365,7 @@ impl Artifact {
                 let named =
                     pplx_space_execution_common::proto::RuntimeKind::try_from(release.runtime_kind)
                         .map_err(|_| Status::invalid_argument("unknown runtime kind"))?;
-                let kind = pplx_space_common_core::types::RuntimeKind::try_from(named)
+                let kind = pplx_space_execution_spec::RuntimeKind::try_from(named)
                     .map_err(|error| Status::invalid_argument(error.to_string()))?;
                 let version = RuntimeVersion::parse(&release.version)
                     .map_err(|error| Status::invalid_argument(error.to_string()))?;
@@ -397,9 +396,9 @@ impl Artifact {
                     .digest
                     .parse()
                     .map_err(|_| Status::invalid_argument("invalid component digest"))?;
-                let kind = pplx_space_common_core::types::ArtifactComponentKind::try_from(named)
+                let kind = pplx_space_execution_spec::ArtifactComponentKind::try_from(named)
                     .map_err(|error| Status::invalid_argument(error.to_string()))?;
-                if kind == pplx_space_common_core::types::ArtifactComponentKind::Kernel {
+                if kind == pplx_space_execution_spec::ArtifactComponentKind::Kernel {
                     Ok(Self::Kernel(version, digest))
                 } else {
                     Ok(Self::Boot(ComponentIdentity {
@@ -423,7 +422,7 @@ pub(super) fn execution_inventory(
 ) -> Result<super::RuntimeInventory, Status> {
     let store = artifact_store(
         &paths.store,
-        pplx_space_common_core::types::RuntimeKind::Firecracker,
+        pplx_space_execution_spec::RuntimeKind::Firecracker,
     )?;
     if execution_roots_overlap(paths, store.releases_root())
         .map_err(|error| Status::failed_precondition(describe(&error)))?
@@ -434,7 +433,7 @@ pub(super) fn execution_inventory(
         return super::RuntimeInventory::discover(
             [
                 pplx_space_node_runtime_core::runtime_inventory::RuntimeInstallationRoot::new(
-                    pplx_space_common_core::types::RuntimeKind::Firecracker,
+                    pplx_space_execution_spec::RuntimeKind::Firecracker,
                     &paths.vendor,
                 ),
             ],
@@ -612,18 +611,18 @@ fn execution_roots_overlap(
     Ok(false)
 }
 
-fn artifact_runtime(artifact: &Artifact) -> pplx_space_common_core::types::RuntimeKind {
+fn artifact_runtime(artifact: &Artifact) -> pplx_space_execution_spec::RuntimeKind {
     match artifact {
         Artifact::Release(release, _) => release.kind,
         Artifact::Kernel(..) | Artifact::Boot(..) => {
-            pplx_space_common_core::types::RuntimeKind::Firecracker
+            pplx_space_execution_spec::RuntimeKind::Firecracker
         }
     }
 }
 
 fn artifact_store(
     paths: &crate::config::ArtifactStorePaths,
-    runtime: pplx_space_common_core::types::RuntimeKind,
+    runtime: pplx_space_execution_spec::RuntimeKind,
 ) -> Result<ArtifactStore, Status> {
     let root = paths.releases.get(&runtime).ok_or_else(|| {
         Status::failed_precondition(format!("no managed release store configured for {runtime}"))

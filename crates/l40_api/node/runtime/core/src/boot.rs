@@ -1,9 +1,9 @@
 //! Guest boot configuration belongs to runtime adapters. Lifecycle callers
 //! provide resources and policy, not a provider's JSON keys or device model.
-use pplx_space_common_core::types::{
+use pplx_space_cpu_arch::Arch;
+use pplx_space_execution_spec::{
     BalloonConfig, GuestOperatingSystem, GuestPlatform, RateLimiter, RuntimeKind, VcpuCount,
 };
-use pplx_space_cpu_arch::Arch;
 use std::num::{NonZeroU32, NonZeroU64};
 
 mod cloud_hypervisor;
@@ -119,7 +119,7 @@ pub(crate) mod tests;
 // The two REST protocols use the same token-bucket schema and millisecond units.
 // Queue topology remains an adapter policy, not part of this encoding.
 pub(crate) fn token_buckets(limiter: &RateLimiter) -> serde_json::Value {
-    use pplx_space_common_core::types::TokenBucket;
+    use pplx_space_execution_spec::TokenBucket;
     let bucket = |bucket: TokenBucket| serde_json::json!({ "size": bucket.size, "refill_time": bucket.refill_time_ms });
     serde_json::json!({ "bandwidth": bucket(limiter.bandwidth), "ops": bucket(limiter.operations) })
 }

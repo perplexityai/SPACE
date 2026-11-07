@@ -5,16 +5,16 @@ use super::*;
 
 fn import_header_execution_metadata(
     header: &crate::proto::ImportSandboxHeader,
-) -> Result<pplx_space_common_core::types::ExecutionMetadata, Status> {
+) -> Result<pplx_space_execution_spec::ExecutionMetadata, Status> {
     let runtime_kind = header
         .runtime
-        .parse::<pplx_space_common_core::types::RuntimeKind>()
+        .parse::<pplx_space_execution_spec::RuntimeKind>()
         .map_err(|error| Status::invalid_argument(error.to_string()))?;
     let execution = match header.execution.as_ref() {
-        Some(execution) => pplx_space_common_core::types::ExecutionMetadata::try_from(execution)
+        Some(execution) => pplx_space_execution_spec::ExecutionMetadata::try_from(execution)
             .map_err(|error| Status::invalid_argument(error.to_string())),
-        None if runtime_kind == pplx_space_common_core::types::RuntimeKind::Firecracker => Ok(
-            pplx_space_common_core::types::ExecutionMetadata::initial_firecracker(
+        None if runtime_kind == pplx_space_execution_spec::RuntimeKind::Firecracker => Ok(
+            pplx_space_execution_spec::ExecutionMetadata::initial_firecracker(
                 host_architecture().map_err(|error| Status::invalid_argument(error.to_string()))?,
                 vec![],
             ),
@@ -42,7 +42,7 @@ struct ValidatedSandboxImport {
     network_policy_authority: crate::db::PolicyAuthority,
     auto_lifecycle_authority: crate::db::PolicyAuthority,
     process_env: BTreeMap<String, String>,
-    execution: pplx_space_common_core::types::ExecutionMetadata,
+    execution: pplx_space_execution_spec::ExecutionMetadata,
 }
 
 struct SandboxImportPaths {
@@ -674,7 +674,7 @@ async fn publish_imported_snapshot(
 async fn write_imported_sandbox_metadata(
     sandbox_id: &str,
     header: &crate::proto::ImportSandboxHeader,
-    execution: pplx_space_common_core::types::ExecutionMetadata,
+    execution: pplx_space_execution_spec::ExecutionMetadata,
 ) -> Result<pplx_space_common_core::types::SandboxArtifactMetadata, Status> {
     let parsed_sandbox_id = sandbox_id
         .parse::<SandboxId>()
@@ -1033,7 +1033,7 @@ impl SandboxManagerService {
                     runtime: &header.runtime,
                     snapshots_enabled: header.snapshots_enabled,
                     rootfs_size_mb: header.rootfs_size_mb,
-                    disk_io_limits: pplx_space_common_core::types::DiskIoLimits::try_from_optional(
+                    disk_io_limits: pplx_space_execution_spec::DiskIoLimits::try_from_optional(
                         header.disk_io_max_operations_per_sec,
                         header.disk_io_max_bandwidth_mib_per_sec,
                     )

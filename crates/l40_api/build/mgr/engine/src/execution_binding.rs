@@ -3,11 +3,11 @@
 use pplx_space_execution_common::environment::RUNTIME_NEUTRAL_ENVIRONMENT_SCHEMA_VERSION as DEFINITION_SCHEMA;
 use std::path::Path;
 
-use pplx_space_common_core::types::{EnvironmentReference, ExecutionMetadata};
 use pplx_space_execution_common::{
     ExecutionProtoError,
     environment::{EnvironmentBindingError, EnvironmentDecodeError, EnvironmentDefinition},
 };
+use pplx_space_execution_spec::{EnvironmentReference, ExecutionMetadata};
 use pplx_space_node_mgr_client::proto::{
     ResolveExecutionEnvironmentRequest, ResolveExecutionEnvironmentResponse,
 };
@@ -42,8 +42,8 @@ pub enum BuildExecutionBindingError {
     )]
     ScratchRequirements {
         architecture: pplx_space_cpu_arch::Arch,
-        runtime: pplx_space_common_core::types::RuntimeKind,
-        guest: pplx_space_common_core::types::GuestPlatform,
+        runtime: pplx_space_execution_spec::RuntimeKind,
+        guest: pplx_space_execution_spec::GuestPlatform,
     },
     #[error("recipe kernel pin differs from the resolved environment")]
     KernelPin,
@@ -66,7 +66,7 @@ pub(super) struct BuildExecutionBinding {
 }
 
 impl BuildExecutionBinding {
-    pub(super) fn runtime_kind(&self) -> pplx_space_common_core::types::RuntimeKind {
+    pub(super) fn runtime_kind(&self) -> pplx_space_execution_spec::RuntimeKind {
         self.execution.runtime().kind
     }
 
@@ -119,7 +119,7 @@ impl BuildExecutionBinding {
         &self,
         architecture: pplx_space_cpu_arch::Arch,
     ) -> Result<(), BuildExecutionBindingError> {
-        use pplx_space_common_core::types::{GuestOperatingSystem, GuestPlatform, RuntimeKind};
+        use pplx_space_execution_spec::{GuestOperatingSystem, GuestPlatform, RuntimeKind};
         let guest = GuestPlatform {
             os: GuestOperatingSystem::Linux,
             architecture,
@@ -242,10 +242,10 @@ impl BuildExecutionBinding {
         command: &mut tokio::process::Command,
         pin: Option<&super::GuestKernelPin>,
     ) -> Result<(), BuildExecutionBindingError> {
-        use pplx_space_common_core::types::{BootProfile, ExecutionCompatibilityProfile};
         use pplx_space_execution_common::environment::{
             FIRECRACKER_BOOT_CONTRACT, FIRECRACKER_MACHINE_CONTRACT,
         };
+        use pplx_space_execution_spec::{BootProfile, ExecutionCompatibilityProfile};
         let spec = self.definition.descriptor().spec();
         let BootProfile::ArtifactsV1 {
             contract,
@@ -266,7 +266,7 @@ impl BuildExecutionBinding {
         };
         let (expected_boot, expected_machine, expected_format) = match self.execution.runtime().kind
         {
-            pplx_space_common_core::types::RuntimeKind::Firecracker => {
+            pplx_space_execution_spec::RuntimeKind::Firecracker => {
                 self.definition
                     .firecracker_linux_contract()
                     .ok_or(BuildExecutionBindingError::ScratchProfile)?;
@@ -276,7 +276,7 @@ impl BuildExecutionBinding {
                     BootProfile::LINUX_DIRECT_FORMAT,
                 )
             }
-            pplx_space_common_core::types::RuntimeKind::CloudHypervisor => (
+            pplx_space_execution_spec::RuntimeKind::CloudHypervisor => (
                 pplx_space_execution_common::environment::CLOUD_HYPERVISOR_BOOT_CONTRACT,
                 pplx_space_execution_common::environment::CLOUD_HYPERVISOR_MACHINE_CONTRACT,
                 pplx_space_execution_common::environment::cloud_hypervisor_linux_format(
@@ -289,7 +289,7 @@ impl BuildExecutionBinding {
             || machine.as_str() != expected_machine
             || boot.role().as_str() != BootProfile::LINUX_DIRECT_ROLE
             || boot.format().as_str() != expected_format
-            || boot.component().kind != pplx_space_common_core::types::ArtifactComponentKind::Kernel
+            || boot.component().kind != pplx_space_execution_spec::ArtifactComponentKind::Kernel
         {
             return Err(BuildExecutionBindingError::ScratchProfile);
         }
@@ -358,7 +358,7 @@ pub(super) fn configure_legacy_scratch(
     command: &mut tokio::process::Command,
     pin: Option<&super::GuestKernelPin>,
 ) {
-    use pplx_space_common_core::types::{
+    use pplx_space_execution_spec::{
         INITIAL_FIRECRACKER_RUNTIME_VERSION, INITIAL_FIRECRACKER_STATE_FORMAT_VERSION,
     };
     command.env("SPACE_SEED_RUNTIME", "firecracker");

@@ -5,7 +5,7 @@ use axum::{
     response::IntoResponse,
 };
 use pplx_space_common_core::sql;
-use pplx_space_common_core::types::DiskIoLimits;
+use pplx_space_execution_spec::DiskIoLimits;
 use serde::Serialize;
 use sqlx::FromRow;
 use uuid::Uuid;

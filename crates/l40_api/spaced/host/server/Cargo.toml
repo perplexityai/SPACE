@@ -39,6 +39,7 @@ pplx-space-connection-admission = { workspace = true }
 pplx-space-common-core = { workspace = true }
 pplx-space-host-layout = { workspace = true }
 pplx-space-common-grpc = { workspace = true }
+pplx-space-execution-spec = { workspace = true }
 pplx-space-grpc-metrics = { workspace = true }
 pplx-space-metrics-emit = { workspace = true }
 pplx-space-observability = { workspace = true }

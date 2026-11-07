@@ -1,5 +1,8 @@
 //! Translate transport representations without changing persisted identities.
 use super::*;
+use pplx_space_execution_spec::{
+    ArtifactComponentKind, BootArtifact, ComponentIdentity, StateFormatIdentity,
+};
 
 pub const FIRECRACKER_BOOT_CONTRACT: &str = "firecracker-linux-direct-v1";
 pub const FIRECRACKER_MACHINE_CONTRACT: &str = "firecracker-machine-v1";

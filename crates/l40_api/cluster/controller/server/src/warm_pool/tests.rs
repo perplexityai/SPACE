@@ -24,9 +24,10 @@ use kube::{
 };
 use pplx_space_api::controllers::substrate::direct::DirectSubstrate;
 use pplx_space_byte_size::MemorySize;
-use pplx_space_common_core::types::{TemplateName, VcpuCount};
+use pplx_space_common_core::types::TemplateName;
 use pplx_space_content_digest::{ContentHash, Digest};
 use pplx_space_db_test_fixtures::{TestDb, pg_test_db};
+use pplx_space_execution_spec::VcpuCount;
 use pplx_space_sandbox_pod::{
     DEFAULT_SANDBOX_INTERNAL_CONTROL_TOKEN_KEY, DEFAULT_SANDBOX_INTERNAL_SECRET_NAME,
     DEFAULT_SANDBOX_INTERNAL_TOKEN_KEY, DEFAULT_SANDBOX_NODE_SELECTOR_KEY,
@@ -714,7 +715,7 @@ fn slot_matches_config_requires_cached_policy_and_namespace() {
 
     assert!(matches);
 
-    slot.disk_io_limits = pplx_space_common_core::types::DiskIoLimits::try_new(
+    slot.disk_io_limits = pplx_space_execution_spec::DiskIoLimits::try_new(
         5_000,
         slot.disk_io_limits.max_bandwidth_mib_per_sec(),
     )

@@ -5,7 +5,8 @@ use pplx_space_cluster_pool::{
     ReservedPoolSlot, WarmPoolStore,
 };
 use pplx_space_common_core::sql;
-use pplx_space_common_core::types::{SandboxId, VcpuCount};
+use pplx_space_common_core::types::SandboxId;
+use pplx_space_execution_spec::VcpuCount;
 use pplx_space_k8s_ids::PodUid;
 use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;

@@ -105,9 +105,9 @@ pub(super) fn template_metadata_arch(template_dir: &str) -> Option<String> {
 pub(super) fn template_execution_metadata(
     template_dir: &str,
     fallback_arch: &str,
-) -> Result<pplx_space_common_core::types::ExecutionMetadata, Status> {
-    use pplx_space_common_core::types::ExecutionMetadata;
+) -> Result<pplx_space_execution_spec::ExecutionMetadata, Status> {
     use pplx_space_cpu_arch::Arch;
+    use pplx_space_execution_spec::ExecutionMetadata;
     use pplx_space_template_manifest::TemplateMetadata;
 
     let metadata_path = std::path::Path::new(template_dir).join("metadata.json");
@@ -156,7 +156,7 @@ pub(super) struct TemplateRuntimeDefaults {
 pub(super) enum TemplateBalloon {
     #[default]
     Absent,
-    Configured(pplx_space_common_core::types::BalloonConfig),
+    Configured(pplx_space_execution_spec::BalloonConfig),
     Invalid(String),
 }
 
@@ -175,7 +175,7 @@ impl TemplateBalloon {
     pub(super) fn for_memory_mib(
         &self,
         memory_mib: u32,
-    ) -> Result<Option<pplx_space_common_core::types::BalloonConfig>, Status> {
+    ) -> Result<Option<pplx_space_execution_spec::BalloonConfig>, Status> {
         match self {
             Self::Absent => Ok(None),
             Self::Configured(config) => config
@@ -274,8 +274,8 @@ pub(super) fn reject_incompatible_template_spaced_compatibility(
 /// A bound request must be positively acknowledged before its response is
 /// persisted or used to launch. Older node-managers discard the optional field.
 pub(super) fn require_environment_acknowledgement(
-    requested: &pplx_space_common_core::types::ExecutionMetadata,
-    resolved: &pplx_space_common_core::types::ExecutionMetadata,
+    requested: &pplx_space_execution_spec::ExecutionMetadata,
+    resolved: &pplx_space_execution_spec::ExecutionMetadata,
 ) -> Result<(), Status> {
     if let Some(expected) = requested.environment()
         && resolved.environment() != Some(expected)
@@ -294,8 +294,8 @@ pub(super) fn require_environment_acknowledgement(
 /// environment's qualified memory-state support.
 pub(super) fn validate_environment_create(
     request: &crate::proto::CreateRequest,
-    environment: Option<pplx_space_common_core::types::EnvironmentReference>,
-    execution: &pplx_space_common_core::types::ExecutionMetadata,
+    environment: Option<pplx_space_execution_spec::EnvironmentReference>,
+    execution: &pplx_space_execution_spec::ExecutionMetadata,
 ) -> Result<bool, tonic::Status> {
     if environment.is_some() && environment != execution.environment() {
         return Err(tonic::Status::failed_precondition(
@@ -303,7 +303,7 @@ pub(super) fn validate_environment_create(
         ));
     }
     let runtime = execution.runtime().kind;
-    if runtime == pplx_space_common_core::types::RuntimeKind::CloudHypervisor
+    if runtime == pplx_space_execution_spec::RuntimeKind::CloudHypervisor
         && (request
             .sandbox_id
             .as_deref()
@@ -331,7 +331,7 @@ pub(super) fn validate_environment_create(
             "runtime supports cold creation only",
         ));
     }
-    if execution.runtime().kind == pplx_space_common_core::types::RuntimeKind::CloudHypervisor
+    if execution.runtime().kind == pplx_space_execution_spec::RuntimeKind::CloudHypervisor
         && execution.environment().is_none()
     {
         return Err(Status::failed_precondition(
@@ -340,7 +340,7 @@ pub(super) fn validate_environment_create(
     }
     let requested_runtime = request
         .runtime
-        .parse::<pplx_space_common_core::types::RuntimeKind>()
+        .parse::<pplx_space_execution_spec::RuntimeKind>()
         .map_err(|error| Status::invalid_argument(error.to_string()))?;
     if requested_runtime != execution.runtime().kind {
         return Err(Status::failed_precondition(
@@ -411,7 +411,7 @@ pub(super) fn allows_node_local_environment_selection(
 /// under a non-default environment.
 pub(super) fn base_snapshot_matches_execution(
     snapshot_dir: &str,
-    execution: &pplx_space_common_core::types::ExecutionMetadata,
+    execution: &pplx_space_execution_spec::ExecutionMetadata,
 ) -> bool {
     let producer = super::create_support::read_base_snapshot_execution_metadata(
         std::path::Path::new(snapshot_dir),
@@ -457,7 +457,7 @@ pub(super) fn base_snapshot_matches_execution(
 /// be absent so an old server cannot ignore selection and execute default work.
 pub(super) fn normalize_environment_input(
     request: &mut crate::proto::CreateRequest,
-) -> Result<Option<pplx_space_common_core::types::EnvironmentReference>, Status> {
+) -> Result<Option<pplx_space_execution_spec::EnvironmentReference>, Status> {
     let Some(input) = request.environment.take() else {
         return Ok(None);
     };
@@ -480,7 +480,7 @@ pub(super) fn normalize_environment_input(
 /// decides which environment is the initial one.
 fn initial_environment_reference(
     arch: pplx_space_cpu_arch::Arch,
-) -> Option<pplx_space_common_core::types::EnvironmentReference> {
+) -> Option<pplx_space_execution_spec::EnvironmentReference> {
     match arch {
         pplx_space_cpu_arch::Arch::X86_64 => {
             Some(pplx_space_node_runtime_core::catalog::initial_environment_reference())
@@ -494,7 +494,7 @@ fn initial_environment_reference(
 /// until a runtime upgrade rebinds the sandbox; callers whose guess then
 /// misses fall back through their existing lineage checks.
 pub(crate) fn sandbox_template_partition(
-    execution: Option<&pplx_space_common_core::types::ExecutionMetadata>,
+    execution: Option<&pplx_space_execution_spec::ExecutionMetadata>,
 ) -> pplx_space_common_core::types::TemplateCachePartition {
     pplx_space_node_runtime_core::catalog::template_cache_partition(
         execution.and_then(|execution| execution.environment()),
@@ -528,7 +528,7 @@ pub(crate) fn template_base_snapshot_dir(
 /// snapshot is never filed under an environment it wasn't captured in.
 pub(crate) fn template_snapshot_partition(
     requested: Option<&str>,
-    execution: Option<&pplx_space_common_core::types::ExecutionMetadata>,
+    execution: Option<&pplx_space_execution_spec::ExecutionMetadata>,
 ) -> Result<pplx_space_common_core::types::TemplateCachePartition, tonic::Status> {
     use pplx_space_common_core::types::TemplateCachePartition;
     let Some(requested) = requested else {
@@ -552,7 +552,7 @@ pub(crate) fn template_snapshot_partition(
 /// Fleet placement and pool identity must understand a complete binding before
 /// a non-default template can use those paths, independently of snapshot support.
 pub(super) fn is_non_default_execution(
-    execution: &pplx_space_common_core::types::ExecutionMetadata,
+    execution: &pplx_space_execution_spec::ExecutionMetadata,
 ) -> bool {
     sandbox_template_partition(Some(execution))
         != pplx_space_common_core::types::TemplateCachePartition::Legacy
@@ -561,7 +561,7 @@ pub(super) fn is_non_default_execution(
 /// Bound environments require qualified memory-state support before any
 /// capture or warm creation. Legacy records retain their existing contract.
 pub(super) fn requires_cold_creation(
-    execution: &pplx_space_common_core::types::ExecutionMetadata,
+    execution: &pplx_space_execution_spec::ExecutionMetadata,
 ) -> bool {
     let Some(reference) = execution.environment() else {
         return false;
@@ -584,7 +584,7 @@ mod tests;
 /// Reject timer-driven operations at policy admission, before a sandbox can
 /// become resident with a policy its adapter will never execute.
 pub(super) fn validate_runtime_lifecycle_policy(
-    runtime: pplx_space_common_core::types::RuntimeKind,
+    runtime: pplx_space_execution_spec::RuntimeKind,
     policy: &pplx_space_auto_lifecycle::AutoLifecyclePolicy,
 ) -> Result<(), Status> {
     let capabilities = runtime.baseline_capabilities();
@@ -608,7 +608,7 @@ pub(super) fn validate_runtime_lifecycle_policy(
 /// Runtime support does not qualify every installed environment for persisted
 /// state. In particular, historical cold-only CH identities remain cold-only.
 pub(super) fn validate_execution_lifecycle_policy(
-    execution: Option<&pplx_space_common_core::types::ExecutionMetadata>,
+    execution: Option<&pplx_space_execution_spec::ExecutionMetadata>,
     policy: &pplx_space_auto_lifecycle::AutoLifecyclePolicy,
 ) -> Result<(), Status> {
     if execution.is_some_and(requires_cold_creation)

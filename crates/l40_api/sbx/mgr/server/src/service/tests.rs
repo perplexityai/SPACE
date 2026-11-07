@@ -5860,11 +5860,11 @@ pub(crate) mod service_tests {
 
         assert_eq!(
             execution.runtime().kind,
-            pplx_space_common_core::types::RuntimeKind::CloudHypervisor
+            pplx_space_execution_spec::RuntimeKind::CloudHypervisor
         );
         assert_eq!(
             execution.guest().os,
-            pplx_space_common_core::types::GuestOperatingSystem::Windows
+            pplx_space_execution_spec::GuestOperatingSystem::Windows
         );
         assert_eq!(
             execution.guest().architecture,
@@ -5886,7 +5886,7 @@ pub(crate) mod service_tests {
 
         assert_eq!(
             execution.runtime().kind,
-            pplx_space_common_core::types::RuntimeKind::Firecracker
+            pplx_space_execution_spec::RuntimeKind::Firecracker
         );
         assert_eq!(execution.runtime().version.as_str(), "1.15.1");
         assert_eq!(execution.state_format().unwrap().version.as_str(), "9.0.0");
@@ -6490,7 +6490,7 @@ pub(crate) mod service_tests {
         let sandbox_id = SandboxId::new().to_string();
         let local_artifact_id = LocalArtifactId::new().to_string();
         let credential_marker = "runtime-restore-secret";
-        let execution = pplx_space_common_core::types::ExecutionMetadata::initial_firecracker(
+        let execution = pplx_space_execution_spec::ExecutionMetadata::initial_firecracker(
             pplx_space_cpu_arch::Arch::Aarch64,
             vec![],
         );

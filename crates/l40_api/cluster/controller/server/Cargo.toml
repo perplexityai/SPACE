@@ -107,6 +107,7 @@ pplx-space-common-core = { workspace = true, features = ["sqlx"] }
 pplx-space-auto-lifecycle = { workspace = true }
 pplx-space-byte-size = { workspace = true }
 pplx-space-content-digest = { workspace = true }
+pplx-space-execution-spec = { workspace = true }
 pplx-space-guest-process = { workspace = true }
 pplx-space-metrics-emit = { workspace = true, features = ["test-capture"] }
 pplx-space-observability = { workspace = true, features = ["test-capture"] }

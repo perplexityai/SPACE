@@ -113,7 +113,7 @@ pub(crate) fn pool_base_build(
                 && resolved.get(&build.content_hash) == Some(&build.cache_partition.key())
         })
         .filter_map(|build| {
-            use pplx_space_common_core::types::RuntimeKind;
+            use pplx_space_execution_spec::RuntimeKind;
             let runtime = build.runtime.parse::<RuntimeKind>().ok()?;
             let manifest: pplx_space_template_manifest::TemplateManifest =
                 serde_json::from_str(&build.manifest_json).ok()?;
@@ -417,14 +417,11 @@ pub(crate) async fn create_from_base(
         Some(build) => {
             let runtime = build
                 .runtime
-                .parse::<pplx_space_common_core::types::RuntimeKind>()
+                .parse::<pplx_space_execution_spec::RuntimeKind>()
                 .map_err(|error| tonic::Status::failed_precondition(error.to_string()))?;
             (Some(build.content_hash), runtime)
         }
-        None => (
-            None,
-            pplx_space_common_core::types::RuntimeKind::Firecracker,
-        ),
+        None => (None, pplx_space_execution_spec::RuntimeKind::Firecracker),
     };
     match do_create_from_base(
         &template,
@@ -450,7 +447,7 @@ pub(crate) async fn create_from_base(
 async fn do_create_from_base(
     template: &str,
     content_hash: Option<String>,
-    runtime: pplx_space_common_core::types::RuntimeKind,
+    runtime: pplx_space_execution_spec::RuntimeKind,
     from_snapshot: bool,
     vcpu: u32,
     memory_mib: u32,

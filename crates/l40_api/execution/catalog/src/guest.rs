@@ -1,4 +1,4 @@
-use pplx_space_common_core::types::{ExecutionMetadata, GuestOperatingSystem, RuntimeKind};
+use pplx_space_execution_spec::{ExecutionMetadata, GuestOperatingSystem, RuntimeKind};
 
 /// The launch boundary derives this from verified execution metadata, not from
 /// caller-provided runtime JSON.
@@ -23,16 +23,16 @@ impl BootSource {
             && execution.runtime().kind == RuntimeKind::Firecracker
             && execution.guest().os == GuestOperatingSystem::Linux
             && execution.components().iter().all(|component| {
-                component.kind == pplx_space_common_core::types::ArtifactComponentKind::Kernel
+                component.kind == pplx_space_execution_spec::ArtifactComponentKind::Kernel
             })
         {
             return Ok((Self::LinuxDirect, None));
         }
-        use pplx_space_common_core::types::BootProfile;
         use pplx_space_execution_common::environment::{
             CLOUD_HYPERVISOR_BOOT_CONTRACT, CLOUD_HYPERVISOR_UEFI_BOOT_CONTRACT,
             FIRECRACKER_BOOT_CONTRACT,
         };
+        use pplx_space_execution_spec::BootProfile;
         let catalog = crate::catalog::CompiledEnvironment::cached_for_architecture(
             execution.guest().architecture,
         )
@@ -69,18 +69,18 @@ pub enum GuestShutdown {
 #[derive(Clone, Copy, Debug)]
 pub struct GuestProfile {
     shutdown: GuestShutdown,
-    image: pplx_space_common_core::types::guest_image::GuestImageContract,
+    image: pplx_space_execution_spec::guest_image::GuestImageContract,
     agent_protocol: QualifiedGuestAgent,
 }
 
-pub use pplx_space_common_core::types::guest_image::QualifiedGuestAgent;
+pub use pplx_space_execution_spec::guest_image::QualifiedGuestAgent;
 impl GuestProfile {
     /// Recover established image semantics without re-admitting an execution.
     /// Historical Linux images remain manageable after catalog retirement;
     /// launch and restore must continue to use `resolve`.
     pub fn for_existing(
         execution: Option<&ExecutionMetadata>,
-        image: pplx_space_common_core::types::guest_image::GuestImageContract,
+        image: pplx_space_execution_spec::guest_image::GuestImageContract,
     ) -> Result<Self, GuestProfileError> {
         image
             .validate()
@@ -102,7 +102,7 @@ impl GuestProfile {
 
     pub fn resolve_optional(
         execution: Option<&ExecutionMetadata>,
-        image: pplx_space_common_core::types::guest_image::GuestImageContract,
+        image: pplx_space_execution_spec::guest_image::GuestImageContract,
     ) -> Result<Self, GuestProfileError> {
         match execution {
             Some(execution) => Self::resolve(execution, image),
@@ -119,7 +119,7 @@ impl GuestProfile {
 
     pub fn resolve(
         execution: &ExecutionMetadata,
-        image: pplx_space_common_core::types::guest_image::GuestImageContract,
+        image: pplx_space_execution_spec::guest_image::GuestImageContract,
     ) -> Result<Self, GuestProfileError> {
         image
             .validate()
@@ -169,7 +169,7 @@ impl GuestProfile {
     }
 
     pub fn uses_dhcp(self) -> bool {
-        self.image.network() == pplx_space_common_core::types::guest_image::GuestNetwork::SlotDhcpV1
+        self.image.network() == pplx_space_execution_spec::guest_image::GuestNetwork::SlotDhcpV1
     }
 }
 

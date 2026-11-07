@@ -1,4 +1,7 @@
-use pplx_space_common_core::types::*;
+use pplx_space_execution_spec::{
+    FIRECRACKER_STATE_FORMAT, RuntimeKind, RuntimeVersion, StateFormatIdentity, StateFormatName,
+    StateFormatVersion,
+};
 
 pub struct FirecrackerStateFormatRelease {
     pub runtime_version: &'static str,

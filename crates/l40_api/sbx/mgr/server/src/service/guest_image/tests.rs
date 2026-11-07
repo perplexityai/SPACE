@@ -2,7 +2,7 @@ use super::*;
 use crate::node_manager_transport::fake::FakeNodeManager;
 use pplx_space_accounts::SandboxOwner;
 use pplx_space_common_core::types::SandboxRuntimeLabel;
-use pplx_space_common_core::types::guest_image::{GuestDiskLayout, GuestNetwork, GuestReadiness};
+use pplx_space_execution_spec::guest_image::{GuestDiskLayout, GuestNetwork, GuestReadiness};
 use pplx_space_node_mgr_client::proto::{ProbeGuestServiceRequest, ProbeGuestServiceResponse};
 use pplx_space_policy_authority::PolicyAuthority;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -14,7 +14,7 @@ fn image() -> GuestImageContract {
             port: std::num::NonZeroU16::new(3389).unwrap(),
         },
         GuestNetwork::SlotDhcpV1,
-        pplx_space_common_core::types::guest_image::GuestAgent::Absent,
+        pplx_space_execution_spec::guest_image::GuestAgent::Absent,
     )
     .unwrap()
 }
@@ -374,7 +374,7 @@ async fn agentless_memory_lifecycle_refuses_before_changing_state_or_contacting_
 
 #[tokio::test]
 async fn windows_environment_update_refuses_before_persistence_but_allows_clearing() {
-    use pplx_space_common_core::types::guest_image::GuestAgent;
+    use pplx_space_execution_spec::guest_image::GuestAgent;
     let conn = crate::db::test_conn();
     let id = SandboxId::new().to_string();
     let image = GuestImageContract::new(
@@ -442,7 +442,7 @@ async fn restored_windows_registration_preserves_guest_identity_and_native_app_r
         GuestDiskLayout::OpaqueRawDisk,
         GuestReadiness::Agent,
         GuestNetwork::SlotDhcpV1,
-        pplx_space_common_core::types::guest_image::GuestAgent::Spaced,
+        pplx_space_execution_spec::guest_image::GuestAgent::Spaced,
     )
     .unwrap();
     let catalog =
@@ -474,7 +474,7 @@ async fn restored_windows_registration_preserves_guest_identity_and_native_app_r
     let row = service.lookup_sandbox(&id).unwrap();
     assert_eq!(
         profile_for_sandbox(&row).unwrap().agent_protocol(),
-        pplx_space_common_core::types::guest_image::QualifiedGuestAgent::WindowsV1
+        pplx_space_execution_spec::guest_image::QualifiedGuestAgent::WindowsV1
     );
     let response = service
         .wait_template_apps(internal_request(crate::proto::WaitTemplateAppsRequest {

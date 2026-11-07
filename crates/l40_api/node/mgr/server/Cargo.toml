@@ -60,6 +60,7 @@ pplx-space-env-vars = { workspace = true }
 pplx-space-file-io = { workspace = true, features = ["reflink"] }
 pplx-space-content-digest = { workspace = true }
 pplx-space-cpu-arch = { workspace = true }
+pplx-space-execution-spec = { workspace = true }
 pplx-space-grpc-rate-limiter = { workspace = true }
 pplx-space-grpc-server = { workspace = true }
 pplx-space-linux-ids = { workspace = true }

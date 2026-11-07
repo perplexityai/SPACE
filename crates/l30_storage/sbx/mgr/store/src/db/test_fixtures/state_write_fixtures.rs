@@ -12,10 +12,11 @@ use crate::db::Connection;
 use pplx_space_accounts::SandboxOwner;
 use pplx_space_auto_lifecycle::AutoLifecyclePolicy;
 use pplx_space_common_core::types::{
-    ExecutionGeneration, LocalArtifactId, RuntimeKind, SandboxActivationAttemptId,
-    SandboxCleanupEpisodeId, SandboxId, SandboxQuarantineReasonCode, SandboxRuntimeLabel,
+    ExecutionGeneration, LocalArtifactId, SandboxActivationAttemptId, SandboxCleanupEpisodeId,
+    SandboxId, SandboxQuarantineReasonCode, SandboxRuntimeLabel,
 };
 use pplx_space_cpu_arch::Arch;
+use pplx_space_execution_spec::RuntimeKind;
 use pplx_space_linux_ids::{LinuxPid, LinuxUid, VsockCid};
 use rusqlite::params;
 use rusqlite::types::Value;

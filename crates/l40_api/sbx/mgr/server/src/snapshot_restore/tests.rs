@@ -1809,7 +1809,7 @@ async fn restore_template_lookup_uses_validated_owner(
     });
 
     // The snapshot's binding is the lookup's partition preference.
-    let bound = pplx_space_common_core::types::EnvironmentReference::new(
+    let bound = pplx_space_execution_spec::EnvironmentReference::new(
         pplx_space_content_digest::Digest::sha256([2; 32]),
     );
     let path = ensure_local_template(

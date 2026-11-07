@@ -7,9 +7,8 @@ use std::path::PathBuf;
 use crate::node_manager_transport::fake::{FakeNodeManager, ServedNodeManager};
 use crate::service::SandboxManagerServiceOptions;
 use pplx_space_common_core::types::{LocalArtifactId, SandboxActivationAttemptId};
-use pplx_space_common_core::types::{
-    SandboxArtifactMetadata, SandboxId, SnapshotExecutionMetadata,
-};
+use pplx_space_common_core::types::{SandboxArtifactMetadata, SandboxId};
+use pplx_space_execution_spec::SnapshotExecutionMetadata;
 use pplx_space_node_mgr_client::proto::{
     CreateBtrfsSnapshotResponse, DeleteBtrfsSnapshotResponse, RestoreInstanceSnapshotResponse,
 };

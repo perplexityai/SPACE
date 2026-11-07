@@ -198,7 +198,7 @@ impl SandboxManagerService {
     /// Resolve and verify the exact environment within 30 seconds, including connect.
     async fn resolve_create_environment(
         &self,
-        reference: pplx_space_common_core::types::EnvironmentReference,
+        reference: pplx_space_execution_spec::EnvironmentReference,
     ) -> Result<pplx_space_node_mgr_client::environment_selection::SelectedEnvironment, Status>
     {
         tokio::time::timeout(std::time::Duration::from_secs(30), async {
@@ -244,7 +244,7 @@ impl SandboxManagerService {
             }
             let verified = if let Some(reference) = environment {
                 let selected = self.resolve_create_environment(reference).await?;
-                let pplx_space_common_core::types::RuntimeBinding::ManagedRelease(release) = &selected.definition.descriptor().spec().runtime;
+                let pplx_space_execution_spec::RuntimeBinding::ManagedRelease(release) = &selected.definition.descriptor().spec().runtime;
                 request.get_mut().runtime = release.runtime.kind.alias().to_owned();
                 Some(selected)
             } else { None };

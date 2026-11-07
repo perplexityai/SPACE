@@ -8,9 +8,10 @@ use pplx_space_auto_lifecycle::{
 };
 use pplx_space_auto_lifecycle_receipt::AutoLifecyclePolicyFingerprint;
 use pplx_space_common_core::types::{
-    AutoLifecycleDeleteReceiptId, ExecutionGeneration, NodeManagedBy, NodeRole, RuntimeKind,
+    AutoLifecycleDeleteReceiptId, ExecutionGeneration, NodeManagedBy, NodeRole,
     SandboxActivationAttemptId, SandboxId, SandboxRuntimeLabel, SpaceApiRouteIdentity,
 };
+use pplx_space_execution_spec::RuntimeKind;
 use pplx_space_policy_authority::PolicyAuthority;
 
 use super::*;

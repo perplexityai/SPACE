@@ -1,7 +1,7 @@
 use super::*;
 use crate::catalog::PinnedFile;
-use pplx_space_common_core::types::RuntimeVersion;
 use pplx_space_cpu_arch::Arch;
+use pplx_space_execution_spec::RuntimeVersion;
 
 pub(crate) struct Fixture {
     pub(crate) _dir: tempfile::TempDir,

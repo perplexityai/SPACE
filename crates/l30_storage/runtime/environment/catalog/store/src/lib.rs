@@ -18,8 +18,8 @@ use std::collections::BTreeSet;
 
 use pplx_space_accounts::NodeId;
 use pplx_space_common_core::sql;
-use pplx_space_common_core::types::EnvironmentReference;
 use pplx_space_content_digest::DigestParseError;
+use pplx_space_execution_spec::EnvironmentReference;
 
 mod certifications;
 pub use certifications::{

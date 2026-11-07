@@ -108,7 +108,7 @@ impl AdminNodeRow {
     pub(super) fn execution_policy(
         &self,
     ) -> Option<(
-        pplx_space_common_core::types::ExecutionPolicyObservation,
+        pplx_space_execution_spec::ExecutionPolicyObservation,
         Option<OffsetDateTime>,
     )> {
         let value = self.execution_policy.as_ref()?;

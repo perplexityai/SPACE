@@ -1366,7 +1366,7 @@ pub(super) async fn wait_ready_and_mark_started(
     };
     let guest = async {
         match image_and_fence.0.readiness() {
-            pplx_space_common_core::types::guest_image::GuestReadiness::Agent => {
+            pplx_space_execution_spec::guest_image::GuestReadiness::Agent => {
                 wait_ready_via_spaced_host(
                     sandbox_id,
                     Duration::from_secs(ready_timeout_secs.into()),
@@ -1375,7 +1375,7 @@ pub(super) async fn wait_ready_and_mark_started(
                 .await
                 .map(GuestReadyEvidence::Agent)
             }
-            pplx_space_common_core::types::guest_image::GuestReadiness::TcpService { port } => {
+            pplx_space_execution_spec::guest_image::GuestReadiness::TcpService { port } => {
                 let execution = image_and_fence.1.ok_or_else(|| {
                     Status::failed_precondition(
                         "guest service readiness requires an execution identity",

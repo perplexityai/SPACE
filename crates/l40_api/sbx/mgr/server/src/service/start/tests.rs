@@ -19,7 +19,7 @@ async fn rootfs_rate_limiter_uses_the_assignment_and_configured_burst() {
             ..Default::default()
         },
     );
-    let limits = pplx_space_common_core::types::DiskIoLimits::try_new(5_000, 200).unwrap();
+    let limits = pplx_space_execution_spec::DiskIoLimits::try_new(5_000, 200).unwrap();
     let limiter = service
         .rootfs_rate_limiter(false, limits)
         .expect("sandbox is limited");
@@ -89,7 +89,7 @@ fn restore_artifact_as_new_parses_target_disk_io_assignment() {
             .restore_artifact_as_new
             .unwrap()
             .target_disk_io_limits,
-        Some(pplx_space_common_core::types::DiskIoLimits::try_new(5_000, 200).unwrap())
+        Some(pplx_space_execution_spec::DiskIoLimits::try_new(5_000, 200).unwrap())
     );
 }
 

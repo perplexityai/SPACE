@@ -4,8 +4,8 @@ use super::release_source::ReleasePayload;
 
 use std::time::Duration;
 
-use pplx_space_common_core::types::{RuntimeIdentity, RuntimeKind};
 use pplx_space_cpu_arch::Arch;
+use pplx_space_execution_spec::{RuntimeIdentity, RuntimeKind};
 
 use super::release_source::{ReleaseChunks, ReleaseSource, ReleaseSourceError, ReleaseUrl};
 

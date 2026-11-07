@@ -24,10 +24,11 @@ use pplx_space_auto_lifecycle::{
 };
 use pplx_space_common_core::types::{
     ExecutionGeneration, IncompleteSandboxRouteIdentityError, NodeManagedBy, NodeRole,
-    ORPHANED_SANDBOX_TEMPLATE, RuntimeKind, SandboxCleanupEpisodeId, SandboxId,
-    SandboxQuarantineReasonCode, SandboxRouteIdentity, SandboxRuntimeLabel, SpaceApiRouteIdentity,
+    ORPHANED_SANDBOX_TEMPLATE, SandboxCleanupEpisodeId, SandboxId, SandboxQuarantineReasonCode,
+    SandboxRouteIdentity, SandboxRuntimeLabel, SpaceApiRouteIdentity,
 };
 use pplx_space_durations::parse_grpc_timeout;
+use pplx_space_execution_spec::RuntimeKind;
 use pplx_space_guest_process::GuestUserName;
 use pplx_space_host_layout::identities::user_names;
 use pplx_space_host_layout::paths::TEMPLATE_CACHE_DIR_MODE;

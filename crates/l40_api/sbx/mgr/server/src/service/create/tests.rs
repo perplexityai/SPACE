@@ -108,9 +108,9 @@ async fn create_refusals_before_insert_persist_nothing() {
 /// qualifies for memory state.
 #[tokio::test]
 async fn restore_persists_consumer_before_allocation_and_reselects_from_checkpoint() {
-    use pplx_space_common_core::types::{EnvironmentDescriptor, RuntimeBinding};
     use pplx_space_cpu_arch::Arch;
     use pplx_space_execution_common::environment::EnvironmentDefinition;
+    use pplx_space_execution_spec::{EnvironmentDescriptor, RuntimeBinding};
     if !crate::service::tests::enter_route_test_process(&[
         ("EPPO_SDK_KEY", None),
         ("SPACE_FLAGD_ENABLED", None),
@@ -145,14 +145,13 @@ async fn restore_persists_consumer_before_allocation_and_reselects_from_checkpoi
 }
 
 async fn restore_selects_its_consumer_from_the_checkpoint(
-    producer: pplx_space_common_core::types::ExecutionMetadata,
+    producer: pplx_space_execution_spec::ExecutionMetadata,
     consumer_definition: pplx_space_execution_common::environment::EnvironmentDefinition,
 ) {
     use crate::node_manager_transport::fake::FakeNodeManager;
-    use pplx_space_common_core::types::{
-        RuntimeKind, SandboxArtifactMetadata, SandboxRuntimeLabel, SnapshotExecutionMetadata,
-    };
+    use pplx_space_common_core::types::{SandboxArtifactMetadata, SandboxRuntimeLabel};
     use pplx_space_content_digest::ContentHash;
+    use pplx_space_execution_spec::{RuntimeKind, SnapshotExecutionMetadata};
     use pplx_space_node_mgr_client::proto::{
         AllocateResponse, ExecutionEnvironmentSelection, NetworkPoolStatusResponse,
         ReleaseResponse, ResolveExecutionEnvironmentRequest, ResolveExecutionEnvironmentResponse,
@@ -233,7 +232,7 @@ async fn restore_selects_its_consumer_from_the_checkpoint(
                     panic!("restore must use its operation-specific resolver");
                 };
                 assert_eq!(
-                    pplx_space_common_core::types::ExecutionMetadata::try_from(&source).unwrap(),
+                    pplx_space_execution_spec::ExecutionMetadata::try_from(&source).unwrap(),
                     expected_producer
                 );
                 Ok(ResolveExecutionEnvironmentResponse {
@@ -324,11 +323,10 @@ async fn restore_selects_its_consumer_from_the_checkpoint(
 #[tokio::test]
 async fn a_runtime_upgrade_fence_refuses_a_concurrent_restore_before_allocation() {
     use crate::node_manager_transport::fake::FakeNodeManager;
-    use pplx_space_common_core::types::{
-        RuntimeKind, SandboxArtifactMetadata, SandboxRuntimeLabel, SnapshotExecutionMetadata,
-    };
+    use pplx_space_common_core::types::{SandboxArtifactMetadata, SandboxRuntimeLabel};
     use pplx_space_content_digest::ContentHash;
     use pplx_space_cpu_arch::Arch;
+    use pplx_space_execution_spec::{RuntimeKind, SnapshotExecutionMetadata};
     use pplx_space_node_mgr_client::proto::{
         AllocateResponse, ExecutionEnvironmentSelection, NetworkPoolStatusResponse,
         ResolveExecutionEnvironmentRequest, ResolveExecutionEnvironmentResponse,
@@ -507,11 +505,10 @@ async fn suspend_restore_is_admitted_before_the_vm_launches() {
     use crate::node_manager_transport::fake::FakeNodeManager;
     use crate::service::start_support::{ActivationAdmissionKind, REQUESTED_VM_ACTIVATIONS};
     use pplx_space_auto_lifecycle::AutoLifecyclePolicy;
-    use pplx_space_common_core::types::{
-        RuntimeKind, SandboxArtifactMetadata, SandboxRuntimeLabel, SnapshotExecutionMetadata,
-    };
+    use pplx_space_common_core::types::{SandboxArtifactMetadata, SandboxRuntimeLabel};
     use pplx_space_content_digest::ContentHash;
     use pplx_space_cpu_arch::Arch;
+    use pplx_space_execution_spec::{RuntimeKind, SnapshotExecutionMetadata};
     use pplx_space_node_mgr_client::proto::{
         AllocateRequest, AllocateResponse, ExecutionEnvironmentSelection, LaunchSandboxResponse,
         NetworkPoolStatusRequest, NetworkPoolStatusResponse, PrepareSandboxResponse,

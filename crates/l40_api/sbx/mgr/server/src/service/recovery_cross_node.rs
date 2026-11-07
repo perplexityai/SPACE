@@ -19,7 +19,7 @@ pub(super) struct RestoreArtifactAsNewContext {
     pub(super) artifact_snapshot_id: SnapshotId,
     pub(super) target_owner: SandboxOwner,
     pub(super) artifact_kind: ArtifactKind,
-    pub(super) target_disk_io_limits: Option<pplx_space_common_core::types::DiskIoLimits>,
+    pub(super) target_disk_io_limits: Option<pplx_space_execution_spec::DiskIoLimits>,
     pub(super) volume_encryption: bool,
 }
 
@@ -60,7 +60,7 @@ impl RestoreArtifactAsNewContext {
             || context.disk_io_max_bandwidth_mib_per_sec.is_some()
         {
             Some(
-                pplx_space_common_core::types::DiskIoLimits::try_from_optional(
+                pplx_space_execution_spec::DiskIoLimits::try_from_optional(
                     context.disk_io_max_operations_per_sec,
                     context.disk_io_max_bandwidth_mib_per_sec,
                 )
@@ -654,14 +654,14 @@ fn validate_quarantine_recovery_artifact_identity(
 struct RestoringRowInput<'a> {
     meta: &'a crate::snapshot_upload::SnapshotMeta,
     restore_source: &'a pplx_space_common_core::types::ExactStorageUri,
-    disk_io_limits_override: Option<pplx_space_common_core::types::DiskIoLimits>,
+    disk_io_limits_override: Option<pplx_space_execution_spec::DiskIoLimits>,
 }
 
 impl<'a> RestoringRowInput<'a> {
     fn new(
         meta: &'a crate::snapshot_upload::SnapshotMeta,
         restore_source: &'a pplx_space_common_core::types::ExactStorageUri,
-        disk_io_limits_override: Option<pplx_space_common_core::types::DiskIoLimits>,
+        disk_io_limits_override: Option<pplx_space_execution_spec::DiskIoLimits>,
     ) -> Self {
         Self {
             meta,
@@ -805,7 +805,7 @@ pub(super) fn insert_restoring_sandbox_row_from_snapshot(
     canonical_id: &str,
     meta: &crate::snapshot_upload::SnapshotMeta,
     restore_source: &pplx_space_common_core::types::ExactStorageUri,
-    disk_io_limits_override: Option<pplx_space_common_core::types::DiskIoLimits>,
+    disk_io_limits_override: Option<pplx_space_execution_spec::DiskIoLimits>,
 ) -> Result<(), crate::snapshot_restore::RestoreError> {
     let sandbox_id = SandboxId::from_str(canonical_id).map_err(|source| {
         crate::snapshot_restore::RestoreError::InvalidSandboxId {

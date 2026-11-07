@@ -305,8 +305,8 @@ async fn the_catalog_lists_unretired_environments_with_their_edges() -> TestResu
         .await?;
     }
     let catalog = fixture.store.unretired_runtime_environments().await?;
-    let e0: pplx_space_common_core::types::EnvironmentReference = E0.parse().unwrap();
-    let e1: pplx_space_common_core::types::EnvironmentReference = E1.parse().unwrap();
+    let e0: pplx_space_execution_spec::EnvironmentReference = E0.parse().unwrap();
+    let e1: pplx_space_execution_spec::EnvironmentReference = E1.parse().unwrap();
     assert_eq!(
         catalog
             .iter()

@@ -4,8 +4,8 @@ use super::*;
 fn an_artifact_travels_by_what_it_is() {
     let release = node_artifact(&NodeArtifactRef::Release(
         RuntimeIdentity {
-            kind: pplx_space_common_core::types::RuntimeKind::Firecracker,
-            version: pplx_space_common_core::types::RuntimeVersion::parse("1.16.2").unwrap(),
+            kind: pplx_space_execution_spec::RuntimeKind::Firecracker,
+            version: pplx_space_execution_spec::RuntimeVersion::parse("1.16.2").unwrap(),
         },
         Digest::sha256([7; 32]),
     ));

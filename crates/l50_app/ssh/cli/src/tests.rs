@@ -4,7 +4,8 @@ use super::openssh_set_env_value;
 fn native_ssh_uses_operator_credentials_and_a_sandbox_fenced_proxy() {
     use super::{Cli, native_ssh_command};
     use clap::Parser;
-    use pplx_space_common_core::types::{GuestOperatingSystem, SandboxId};
+    use pplx_space_common_core::types::SandboxId;
+    use pplx_space_execution_spec::GuestOperatingSystem;
     use std::ffi::OsString;
 
     let id: SandboxId = "00000000-0000-7000-8000-000000000001".parse().unwrap();

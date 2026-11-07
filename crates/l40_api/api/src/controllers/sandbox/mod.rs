@@ -9,9 +9,10 @@ use pplx_space_auto_lifecycle::AutoLifecycleRuntimeState;
 use pplx_space_auto_lifecycle::{AutoLifecyclePolicy, SandboxAutoLifecyclePatch};
 use pplx_space_common_core::sql;
 use pplx_space_common_core::types::{
-    DEFAULT_TEMPLATE_TAG, RuntimeKind, SandboxId, SandboxLifecycle, TemplateDesiredState,
-    TemplateName, TemplateReference, TemplateTag, TemplateVisibility,
+    DEFAULT_TEMPLATE_TAG, SandboxId, SandboxLifecycle, TemplateDesiredState, TemplateName,
+    TemplateReference, TemplateTag, TemplateVisibility,
 };
+use pplx_space_execution_spec::RuntimeKind;
 use pplx_space_guest_process::{EnvMap, EnvSanitizationIssue};
 use pplx_space_net_common::{NetworkPolicy, NetworkPolicyV1, proto::NetworkPolicySource};
 use pplx_space_node_mgr_client::proto::{AllowPortRequest, ExposePortRequest, NetworkProtocol};

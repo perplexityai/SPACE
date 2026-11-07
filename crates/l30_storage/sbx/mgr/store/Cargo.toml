@@ -63,6 +63,7 @@ pplx-space-host-layout = { workspace = true }
 pplx-space-common-jobs = { workspace = true }
 pplx-space-cpu-arch = { workspace = true, features = ["serde"] }
 pplx-space-durations = { workspace = true, features = ["serde"] }
+pplx-space-execution-spec = { workspace = true, features = ["serde"] }
 pplx-space-k8s-ids = { workspace = true, features = ["serde"] }
 pplx-space-linux-ids = { workspace = true, features = ["serde"] }
 pplx-space-sqlite = { workspace = true }

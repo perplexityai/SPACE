@@ -26,7 +26,7 @@ pub enum RuntimeArtifactReadError {
     #[error("unsupported host architecture: {0}")]
     Architecture(String),
     #[error(transparent)]
-    Execution(#[from] pplx_space_common_core::types::ExecutionMetadataError),
+    Execution(#[from] pplx_space_execution_spec::ExecutionMetadataError),
 }
 
 pub(super) fn host_architecture() -> Result<pplx_space_cpu_arch::Arch, RuntimeArtifactReadError> {
@@ -54,14 +54,14 @@ fn sandbox_artifact_metadata_in(
 
 pub(super) fn sandbox_execution_metadata(
     sandbox_id: &str,
-) -> Result<pplx_space_common_core::types::ExecutionMetadata, RuntimeArtifactReadError> {
+) -> Result<pplx_space_execution_spec::ExecutionMetadata, RuntimeArtifactReadError> {
     sandbox_execution_metadata_in(std::path::Path::new(CACHE_DIR), sandbox_id)
 }
 
 pub(super) fn sandbox_execution_metadata_in(
     cache_dir: &std::path::Path,
     sandbox_id: &str,
-) -> Result<pplx_space_common_core::types::ExecutionMetadata, RuntimeArtifactReadError> {
+) -> Result<pplx_space_execution_spec::ExecutionMetadata, RuntimeArtifactReadError> {
     match sandbox_artifact_metadata_in(cache_dir, sandbox_id)? {
         Some(metadata) => Ok(metadata.execution),
         None => initial_firecracker_execution_metadata(),
@@ -70,15 +70,15 @@ pub(super) fn sandbox_execution_metadata_in(
 
 pub(super) fn sandbox_snapshot_execution_metadata(
     sandbox: &crate::db::SandboxRow,
-) -> Result<pplx_space_common_core::types::SnapshotExecutionMetadata, RuntimeArtifactReadError> {
+) -> Result<pplx_space_execution_spec::SnapshotExecutionMetadata, RuntimeArtifactReadError> {
     sandbox_snapshot_execution_metadata_in(std::path::Path::new(CACHE_DIR), sandbox)
 }
 
 pub(super) fn sandbox_snapshot_execution_metadata_in(
     cache_dir: &std::path::Path,
     sandbox: &crate::db::SandboxRow,
-) -> Result<pplx_space_common_core::types::SnapshotExecutionMetadata, RuntimeArtifactReadError> {
-    use pplx_space_common_core::types::{RuntimeKind, SnapshotExecutionMetadata};
+) -> Result<pplx_space_execution_spec::SnapshotExecutionMetadata, RuntimeArtifactReadError> {
+    use pplx_space_execution_spec::{RuntimeKind, SnapshotExecutionMetadata};
     let metadata = sandbox_artifact_metadata_in(cache_dir, &sandbox.id)?;
     // The durable execution is authoritative; the artifact supplies allocation
     // evidence. Only historical unbound Firecracker may use the E0 fallback.
@@ -108,12 +108,9 @@ pub(super) fn sandbox_snapshot_execution_metadata_in(
 /// another environment.
 pub(super) fn codec_environment(
     sandbox_id: &str,
-    sidecar: Result<
-        pplx_space_common_core::types::SnapshotExecutionMetadata,
-        RuntimeArtifactReadError,
-    >,
-    row: Option<&pplx_space_common_core::types::ExecutionMetadata>,
-) -> Option<pplx_space_common_core::types::EnvironmentReference> {
+    sidecar: Result<pplx_space_execution_spec::SnapshotExecutionMetadata, RuntimeArtifactReadError>,
+    row: Option<&pplx_space_execution_spec::ExecutionMetadata>,
+) -> Option<pplx_space_execution_spec::EnvironmentReference> {
     match sidecar {
         Ok(snapshot) => snapshot.execution().environment(),
         Err(error) => {
@@ -129,7 +126,7 @@ pub(super) fn codec_environment(
 
 pub(super) fn activation_metadata_json(
     sandbox: &crate::db::SandboxRow,
-    cpu_budget: Option<pplx_space_common_core::types::VcpuCount>,
+    cpu_budget: Option<pplx_space_execution_spec::VcpuCount>,
     guest_memory: Option<pplx_space_byte_size::MemorySize>,
 ) -> Result<String, Status> {
     use pplx_space_common_core::types::SandboxArtifactMetadata;
@@ -167,9 +164,9 @@ pub(super) fn activation_metadata_json(
 }
 
 fn initial_firecracker_execution_metadata()
--> Result<pplx_space_common_core::types::ExecutionMetadata, RuntimeArtifactReadError> {
+-> Result<pplx_space_execution_spec::ExecutionMetadata, RuntimeArtifactReadError> {
     Ok(
-        pplx_space_common_core::types::ExecutionMetadata::initial_firecracker(
+        pplx_space_execution_spec::ExecutionMetadata::initial_firecracker(
             host_architecture()?,
             vec![],
         ),
@@ -177,23 +174,21 @@ fn initial_firecracker_execution_metadata()
 }
 
 fn legacy_snapshot_execution_metadata()
--> Result<pplx_space_common_core::types::SnapshotExecutionMetadata, RuntimeArtifactReadError> {
-    Ok(
-        pplx_space_common_core::types::SnapshotExecutionMetadata::new(
-            initial_firecracker_execution_metadata()?,
-        )?,
-    )
+-> Result<pplx_space_execution_spec::SnapshotExecutionMetadata, RuntimeArtifactReadError> {
+    Ok(pplx_space_execution_spec::SnapshotExecutionMetadata::new(
+        initial_firecracker_execution_metadata()?,
+    )?)
 }
 
 pub(super) fn checkpoint_execution_metadata(
     snapshot_dir: &str,
-) -> Result<pplx_space_common_core::types::SnapshotExecutionMetadata, RuntimeArtifactReadError> {
+) -> Result<pplx_space_execution_spec::SnapshotExecutionMetadata, RuntimeArtifactReadError> {
     let runtime_path = std::path::PathBuf::from(snapshot_dir).join("runtime.json");
     match std::fs::read(&runtime_path) {
         Ok(bytes) => {
-            return serde_json::from_slice::<
-                pplx_space_common_core::types::SnapshotExecutionMetadata,
-            >(&bytes)
+            return serde_json::from_slice::<pplx_space_execution_spec::SnapshotExecutionMetadata>(
+                &bytes,
+            )
             .map_err(|source| RuntimeArtifactReadError::Parse {
                 path: runtime_path,
                 source,

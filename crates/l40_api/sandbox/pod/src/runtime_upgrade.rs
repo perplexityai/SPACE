@@ -50,7 +50,7 @@ pub const SANDBOX_RUNTIME_UPGRADE_CHECKPOINT_LOCAL_ARTIFACT_ID_ANNOTATION: &str 
 #[derive(Debug, Clone, Copy)]
 pub struct PodRuntimeUpgrade<'a> {
     pub operation_id: uuid::Uuid,
-    pub target_environment: pplx_space_common_core::types::EnvironmentReference,
+    pub target_environment: pplx_space_execution_spec::EnvironmentReference,
     pub authorization_id: &'a str,
     pub authorization_reason: &'a str,
     pub memory_loss: bool,

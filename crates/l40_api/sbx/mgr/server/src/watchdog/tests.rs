@@ -1390,7 +1390,7 @@ fn inapplicable_guest_components_do_not_block_composed_health() {
 
 #[test]
 fn spaced_host_restart_args_preserve_control_socket_and_only_notify_qualified_guests() {
-    use pplx_space_common_core::types::guest_image::QualifiedGuestAgent;
+    use pplx_space_execution_spec::guest_image::QualifiedGuestAgent;
     let sandbox_id = "sbx-123";
     let vsock_uds_path = format!("{RUN_DIR}/{sandbox_id}/root/v.sock");
 

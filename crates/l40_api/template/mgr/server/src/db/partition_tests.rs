@@ -1,12 +1,12 @@
 //! One rootfs bound to two environments: each build keeps its own catalog
 //! rows, snapshots and tag pins.
 
-use pplx_space_common_core::types::{
-    ArtifactComponentKind, ArtifactComponentMetadata, ArtifactFormat, ArtifactVersion,
-    EnvironmentReference, ExecutionMetadata,
-};
 use pplx_space_content_digest::Digest;
 use pplx_space_cpu_arch::Arch;
+use pplx_space_execution_spec::{
+    ArtifactComponentKind, ArtifactComponentMetadata, EnvironmentReference, ExecutionMetadata,
+};
+use pplx_space_execution_spec::{ArtifactFormat, ArtifactVersion};
 use pplx_space_template_manifest::TemplateManifest;
 use rusqlite::Connection;
 

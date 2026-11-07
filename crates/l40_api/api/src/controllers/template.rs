@@ -6,9 +6,8 @@ use pplx_space_build_mgr_client::proto::{
     GetBuildStatusResponse, StartBuildRequest, StartBuildResponse, UploadBlobChunk,
     UploadBlobResponse,
 };
-use pplx_space_common_core::types::{
-    BuildRunId, EnvironmentReference, SystemTemplate, TemplateName, TemplateReference,
-};
+use pplx_space_common_core::types::{BuildRunId, SystemTemplate, TemplateName, TemplateReference};
+use pplx_space_execution_spec::EnvironmentReference;
 use pplx_space_node_api_client::proto::BuildTemplateResponse;
 
 use super::{

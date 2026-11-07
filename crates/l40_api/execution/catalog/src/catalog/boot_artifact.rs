@@ -2,8 +2,8 @@
 //! environment; installing a pinned file does not approve it for execution.
 pub const BOOT_ARTIFACT_IMAGE: &str = "image";
 
-use pplx_space_common_core::types::{ArtifactComponentKind, ComponentIdentity};
 use pplx_space_cpu_arch::Arch;
+use pplx_space_execution_spec::{ArtifactComponentKind, ComponentIdentity};
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(try_from = "BootArtifactPin", into = "BootArtifactPin")]

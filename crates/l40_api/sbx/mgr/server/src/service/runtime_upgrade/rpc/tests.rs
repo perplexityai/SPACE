@@ -4,7 +4,8 @@
 
 use std::sync::{Arc, Mutex};
 
-use pplx_space_common_core::types::{ExecutionMetadata, LocalArtifactId, SandboxId};
+use pplx_space_common_core::types::{LocalArtifactId, SandboxId};
+use pplx_space_execution_spec::ExecutionMetadata;
 use pplx_space_node_mgr_client::proto::{
     CreateBtrfsSnapshotRequest, CreateBtrfsSnapshotResponse, DeleteBtrfsSnapshotRequest,
     DeleteBtrfsSnapshotResponse, ResolveExecutionEnvironmentRequest,
@@ -684,7 +685,7 @@ async fn a_suspended_sandbox_already_on_its_target_is_restored_in_place() {
     std::fs::write(
         f.checkpoint().join("runtime.json"),
         serde_json::to_vec(
-            &pplx_space_common_core::types::SnapshotExecutionMetadata::new(target.clone()).unwrap(),
+            &pplx_space_execution_spec::SnapshotExecutionMetadata::new(target.clone()).unwrap(),
         )
         .unwrap(),
     )

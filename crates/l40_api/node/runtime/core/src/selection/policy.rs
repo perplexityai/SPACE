@@ -2,7 +2,7 @@
 //! startup settings, optionally narrowed by the cluster's desired policy.
 use crate::catalog::CompiledEnvironment;
 use crate::runtime_inventory::ExecutionSelectionMode;
-use pplx_space_common_core::types::*;
+use pplx_space_execution_spec::{EnvironmentReference, ExecutionMetadata, RuntimeBinding};
 use std::collections::BTreeSet;
 
 pub const ALLOWED_ENVIRONMENTS: &str = "SPACE_ALLOWED_EXECUTION_ENVIRONMENTS";

@@ -64,7 +64,7 @@ pub struct StampPayload {
     /// Environment of the build's cache partition. Absent for the legacy
     /// partition, including every job enqueued before partitions existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub partition_environment: Option<pplx_space_common_core::types::EnvironmentReference>,
+    pub partition_environment: Option<pplx_space_execution_spec::EnvironmentReference>,
 }
 
 impl StampPayload {

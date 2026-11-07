@@ -2150,9 +2150,9 @@ async fn refresh_register_existing_expanded_build_preserves_rootfs_bytes(
 
 #[tokio::test]
 async fn register_refresh_cannot_add_remove_or_replace_a_retained_binding() {
-    use pplx_space_common_core::types::{EnvironmentReference, ExecutionMetadata};
     use pplx_space_content_digest::Digest;
     use pplx_space_cpu_arch::Arch;
+    use pplx_space_execution_spec::{EnvironmentReference, ExecutionMetadata};
     use pplx_space_template_manifest::{TemplateManifest, TemplateMetadata};
     let first = EnvironmentReference::new(Digest::sha256([1; 32]));
     let second = EnvironmentReference::new(Digest::sha256([2; 32]));

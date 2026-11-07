@@ -1106,7 +1106,7 @@ type = "launch"
 
 #[test]
 fn balloon_round_trips_from_toml_through_the_wire() {
-    use pplx_space_common_core::types::BalloonMode;
+    use pplx_space_execution_spec::BalloonMode;
 
     let parse = |balloon: &str| {
         toml::from_str::<TomlRecipe>(&format!(

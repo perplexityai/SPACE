@@ -944,8 +944,8 @@ async fn only_a_certified_upgrade_edge_is_followed() {
     // A historical contract no compiled environment describes has no edges.
     let h = harness(SandboxState::Stopped);
     let custom = ExecutionMetadata::new(
-        pplx_space_common_core::types::RuntimeIdentity {
-            kind: pplx_space_common_core::types::RuntimeKind::Firecracker,
+        pplx_space_execution_spec::RuntimeIdentity {
+            kind: pplx_space_execution_spec::RuntimeKind::Firecracker,
             version: "1.14.0".parse().unwrap(),
         },
         h.envs.source.guest(),

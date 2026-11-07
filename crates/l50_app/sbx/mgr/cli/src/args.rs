@@ -233,7 +233,7 @@ pub(super) enum Commands {
         content_hash: Option<pplx_space_content_digest::ContentHash>,
         /// Exact environment; must match the template's immutable binding.
         #[arg(long)]
-        environment: Option<pplx_space_common_core::types::EnvironmentReference>,
+        environment: Option<pplx_space_execution_spec::EnvironmentReference>,
         /// Legacy runtime selector; an environment determines its own runtime.
         #[arg(
             long,

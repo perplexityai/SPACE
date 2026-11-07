@@ -1292,7 +1292,7 @@ pub(crate) struct BeginArtifactBackup<'a> {
     pub(crate) snapshot_name: Option<&'a str>,
     pub(crate) backup_attempt_id: &'a str,
     pub(crate) storage_uri: &'a str,
-    pub(crate) execution: &'a pplx_space_common_core::types::SnapshotExecutionMetadata,
+    pub(crate) execution: &'a pplx_space_execution_spec::SnapshotExecutionMetadata,
     pub(crate) execution_generation: Option<pplx_space_common_core::types::ExecutionGeneration>,
     /// Ask for the registration's verdict without persisting the attempt.
     pub(crate) fence_verdict_only: bool,

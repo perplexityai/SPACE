@@ -12,7 +12,7 @@ workspace = true
 
 [dependencies]
 pplx-space-spaced-guest-protocol = { workspace = true }
-pplx-space-common-core = { workspace = true }
+pplx-space-execution-spec = { workspace = true }
 pplx-space-credential-injection = { workspace = true }
 pplx-space-net-common = { workspace = true }
 prost = { workspace = true }

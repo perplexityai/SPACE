@@ -2,9 +2,15 @@
 //! allowlist: consumers must resolve the reference against their approved catalog.
 
 use aws_lc_rs::digest::{SHA256, digest};
-use pplx_space_common_core::types::*;
 use pplx_space_content_digest::{Digest, DigestParseError};
 use pplx_space_cpu_arch::Arch;
+use pplx_space_execution_spec::{
+    ArtifactComponentRoleParseError, ArtifactFormatParseError, BootProfile, EnvironmentDescriptor,
+    EnvironmentDescriptorError, EnvironmentReference, EnvironmentSpec,
+    ExecutionCompatibilityProfile, ExecutionContractIdParseError, HostOperatingSystem,
+    HostPlatform, HypervisorBackend, IsolationClass, ManagedRuntimeRelease, RuntimeBinding,
+    RuntimePayloadLayout,
+};
 
 use crate::{ExecutionProtoError, proto};
 

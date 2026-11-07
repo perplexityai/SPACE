@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 use std::time::Duration;
 
-use pplx_space_common_core::types::{RuntimeKind, RuntimeVersion};
+use pplx_space_execution_spec::{RuntimeKind, RuntimeVersion};
 use tokio_util::sync::CancellationToken;
 
 use crate::db::{SandboxLifecycleCount, SandboxStatusCount};

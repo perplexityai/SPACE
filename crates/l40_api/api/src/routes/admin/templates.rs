@@ -1763,7 +1763,7 @@ const _: () =
 
 /// A validated system template build request.
 struct SystemTemplateBuild {
-    environment: Option<pplx_space_common_core::types::EnvironmentReference>,
+    environment: Option<pplx_space_execution_spec::EnvironmentReference>,
     managing_org_id: OrgId,
     template: SystemTemplate,
     base: Option<String>,
@@ -2017,7 +2017,7 @@ fn system_template_build_fingerprint(
     base: Option<&str>,
     force: bool,
     publish_tags: &[String],
-    environment: Option<pplx_space_common_core::types::EnvironmentReference>,
+    environment: Option<pplx_space_execution_spec::EnvironmentReference>,
 ) -> Result<RequestFingerprint, ApiErrorResponse> {
     let mut body = serde_json::Map::from_iter([
         (
@@ -2111,7 +2111,7 @@ async fn submit_admin_template_build(
     force: bool,
     publish_tags: Vec<String>,
     client: Option<TemplateBuildClientContext>,
-    environment: Option<pplx_space_common_core::types::EnvironmentReference>,
+    environment: Option<pplx_space_execution_spec::EnvironmentReference>,
 ) -> axum::response::Response {
     let managing_org_id = match managing_org_id(
         &state.pool,

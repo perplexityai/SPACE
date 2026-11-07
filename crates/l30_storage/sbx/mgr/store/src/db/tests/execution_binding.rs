@@ -25,7 +25,7 @@ fn selected_create_and_cleanup_intent_commit_or_roll_back_together() {
         .with_environment(format!("sha256:{}", "a".repeat(64)).parse().unwrap());
         let execution = if matches!(fault, Fault::RuntimeMismatch) {
             ExecutionMetadata::new(
-                pplx_space_common_core::types::RuntimeIdentity {
+                pplx_space_execution_spec::RuntimeIdentity {
                     kind: RuntimeKind::CloudHypervisor,
                     version: "1.0.0".parse().unwrap(),
                 },

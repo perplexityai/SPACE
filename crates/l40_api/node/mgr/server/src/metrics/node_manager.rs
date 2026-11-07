@@ -226,7 +226,7 @@ pub fn balloon_snapshot_probe_failed(probe: BalloonSnapshotProbe) {
 /// `node_mgr.balloon.guest_free_mib` the guest's free memory, when the guest
 /// has reported it.
 pub fn balloon_snapshot_statistics(
-    mode: pplx_space_common_core::types::BalloonMode,
+    mode: pplx_space_execution_spec::BalloonMode,
     actual_mib: u64,
     guest_free_mib: Option<u64>,
 ) {

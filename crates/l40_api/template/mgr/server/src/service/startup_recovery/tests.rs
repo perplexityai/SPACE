@@ -1657,14 +1657,14 @@ async fn a_dir_skipped_for_want_of_a_permit_comes_first_next_tick() {
 
 fn twin_partition() -> crate::db::TemplateCachePartition {
     crate::db::TemplateCachePartition::Environment(
-        pplx_space_common_core::types::EnvironmentReference::new(
+        pplx_space_execution_spec::EnvironmentReference::new(
             pplx_space_content_digest::Digest::sha256([2; 32]),
         ),
     )
 }
 
 fn bind_manifest(manifest: &mut TemplateManifest, partition: crate::db::TemplateCachePartition) {
-    let execution = pplx_space_common_core::types::ExecutionMetadata::initial_firecracker(
+    let execution = pplx_space_execution_spec::ExecutionMetadata::initial_firecracker(
         pplx_space_cpu_arch::Arch::X86_64,
         vec![],
     );
@@ -1708,7 +1708,7 @@ fn partition_binding_rejects_a_dir_bound_elsewhere() {
     assert!(unbound.execution.is_none());
     let mut metadata = TemplateMetadata::default();
     metadata.set_execution_metadata(
-        pplx_space_common_core::types::ExecutionMetadata::initial_firecracker(
+        pplx_space_execution_spec::ExecutionMetadata::initial_firecracker(
             pplx_space_cpu_arch::Arch::X86_64,
             vec![],
         )
@@ -2604,7 +2604,7 @@ async fn a_held_invalid_build_is_checked_against_a_fresh_dependent_answer() {
 
 /// A real non-initial catalog environment: Firecracker 1.17.0 / Linux
 /// 6.1.155, the one nodes ran before partitions existed.
-fn e1_execution() -> pplx_space_common_core::types::ExecutionMetadata {
+fn e1_execution() -> pplx_space_execution_spec::ExecutionMetadata {
     pplx_space_execution_catalog::catalog::CompiledEnvironment::for_architecture(
         pplx_space_cpu_arch::Arch::X86_64,
     )

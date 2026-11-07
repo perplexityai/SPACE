@@ -12,17 +12,19 @@ use std::time::Duration;
 use pplx_space_accounts::{ORPHANED_SANDBOX_OWNER, SandboxOwner};
 use pplx_space_auto_lifecycle::{AutoLifecyclePolicy, AutoLifecycleRuntimeState};
 use pplx_space_common_core::types::{
-    ArtifactKind, ArtifactOrigin, ExecutionGeneration, ExecutionMetadata, LocalArtifactId,
-    NodeManagedBy, ORPHANED_SANDBOX_TEMPLATE, RuntimeIdentity, RuntimeKind, RuntimeVersion,
-    SandboxActivationAttemptId, SandboxCleanupEpisodeId, SandboxId, SandboxQuarantineHistoryAction,
-    SandboxQuarantineNextAction, SandboxQuarantineReasonCode, SandboxQuarantineSource,
-    SandboxRuntimeLabel, SandboxTransitionReceipt, SandboxTransitionReceiptInvariantError,
-    SandboxTransitionReceiptKind, SandboxTransitionTargetState, SnapshotName,
+    ArtifactKind, ArtifactOrigin, ExecutionGeneration, LocalArtifactId, NodeManagedBy,
+    ORPHANED_SANDBOX_TEMPLATE, SandboxActivationAttemptId, SandboxCleanupEpisodeId, SandboxId,
+    SandboxQuarantineHistoryAction, SandboxQuarantineNextAction, SandboxQuarantineReasonCode,
+    SandboxQuarantineSource, SandboxRuntimeLabel, SandboxTransitionReceipt,
+    SandboxTransitionReceiptInvariantError, SandboxTransitionReceiptKind,
+    SandboxTransitionTargetState, SnapshotName,
 };
 use pplx_space_events::{
     SandboxEventDetails, SandboxEventSource, SandboxEventTrigger, SandboxEventType,
     emit_sandbox_event,
 };
+use pplx_space_execution_spec::RuntimeVersion;
+use pplx_space_execution_spec::{ExecutionMetadata, RuntimeIdentity, RuntimeKind};
 #[cfg(test)]
 use pplx_space_net_common::NetworkPolicyV1;
 use pplx_space_net_common::{NetworkPolicy, proto::NetworkPolicySource};
