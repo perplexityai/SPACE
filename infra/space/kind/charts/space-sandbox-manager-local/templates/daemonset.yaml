@@ -148,7 +148,7 @@ spec:
             # (`native.v2_drain_blocks_on_a_quarantined_resident`); read only
             # by a test-hooks build.
             - name: SPACE_DRAIN_NODE_TEST_QUARANTINED_FILE
-              value: /space/etc/drain-node-test-quarantined
+              value: /space/cache/drain-node-test-quarantined
             {{- end }}
             {{- if .Values.eppo.secretName }}
             - name: EPPO_SDK_KEY
