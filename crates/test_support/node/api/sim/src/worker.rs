@@ -1643,8 +1643,7 @@ async fn sim_install_activation_policy(
 ) -> Result<(), Status> {
     use prost::Message;
     if let Some(policy) = policy {
-        pplx_space_common_core::types::AutoLifecyclePolicy::try_from(policy)
-            .map_err(Status::from)?;
+        pplx_space_auto_lifecycle::AutoLifecyclePolicy::try_from(policy).map_err(Status::from)?;
         let encoded = policy.encode_to_vec();
         let record = state.get(sandbox_id).await.map_err(map_state_error)?;
         if record.auto_lifecycle_authority != pplx_space_policy_authority::PolicyAuthority::Local

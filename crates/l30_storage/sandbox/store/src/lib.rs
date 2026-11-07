@@ -634,7 +634,7 @@ pub struct SandboxActivationObservation {
     /// restore or wake) is queued or running for it.
     pub activation_pending: bool,
     /// The sandbox's stored lifecycle policy, read with the lifecycle.
-    pub auto_lifecycle: sqlx::types::Json<pplx_space_common_core::types::AutoLifecyclePolicy>,
+    pub auto_lifecycle: sqlx::types::Json<pplx_space_auto_lifecycle::AutoLifecyclePolicy>,
 }
 
 /// Observe the org's sandbox's lifecycle, policy and pending activation, the
@@ -675,7 +675,7 @@ pub async fn activation_observation(
 pub async fn set_auto_lifecycle_policy(
     executor: impl sqlx::PgExecutor<'_>,
     id: SandboxId,
-    policy: &pplx_space_common_core::types::AutoLifecyclePolicy,
+    policy: &pplx_space_auto_lifecycle::AutoLifecyclePolicy,
 ) -> Result<bool, SandboxStoreError> {
     Ok(sqlx::query(sql!(
         "UPDATE sandboxes SET auto_lifecycle_json = $1,
@@ -695,16 +695,14 @@ pub async fn set_auto_lifecycle_policy(
 pub async fn auto_lifecycle_policy(
     executor: impl sqlx::PgExecutor<'_>,
     id: SandboxId,
-) -> Result<Option<pplx_space_common_core::types::AutoLifecyclePolicy>, SandboxStoreError> {
-    let policy = sqlx::query_scalar::<
-        _,
-        sqlx::types::Json<pplx_space_common_core::types::AutoLifecyclePolicy>,
-    >(sql!(
-        "SELECT auto_lifecycle_json FROM sandboxes WHERE id = $1"
-    ))
-    .bind(id)
-    .fetch_optional(executor)
-    .await?;
+) -> Result<Option<pplx_space_auto_lifecycle::AutoLifecyclePolicy>, SandboxStoreError> {
+    let policy =
+        sqlx::query_scalar::<_, sqlx::types::Json<pplx_space_auto_lifecycle::AutoLifecyclePolicy>>(
+            sql!("SELECT auto_lifecycle_json FROM sandboxes WHERE id = $1"),
+        )
+        .bind(id)
+        .fetch_optional(executor)
+        .await?;
     Ok(policy.map(|policy| policy.0))
 }
 
@@ -725,7 +723,7 @@ pub struct AutoLifecycleExecution {
     pub execution_generation: Option<i64>,
     pub has_direct_route: bool,
     pub has_activation_lease: bool,
-    pub policy: sqlx::types::Json<pplx_space_common_core::types::AutoLifecyclePolicy>,
+    pub policy: sqlx::types::Json<pplx_space_auto_lifecycle::AutoLifecyclePolicy>,
 }
 
 impl AutoLifecycleExecution {

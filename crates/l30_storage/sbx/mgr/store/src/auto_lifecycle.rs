@@ -3,12 +3,13 @@ use std::{
     sync::{Arc, Mutex, Weak},
 };
 
-use pplx_space_common_core::types::{
-    ArtifactKind, AutoLifecycleActivitySource, AutoLifecycleConditionKind,
-    AutoLifecycleConditionRuntimeState, AutoLifecycleConditionSet, AutoLifecycleConditionSetId,
-    AutoLifecycleIdleAction, AutoLifecyclePolicy, AutoLifecycleRuntimeState, AutoLifecycleStatus,
-    AutoLifecycleTransition, AutoLifecycleWakeSource,
+use pplx_space_auto_lifecycle::{
+    AutoLifecycleActivitySource, AutoLifecycleConditionKind, AutoLifecycleConditionRuntimeState,
+    AutoLifecycleConditionSet, AutoLifecycleConditionSetId, AutoLifecycleIdleAction,
+    AutoLifecyclePolicy, AutoLifecycleRuntimeState, AutoLifecycleStatus, AutoLifecycleTransition,
+    AutoLifecycleWakeSource,
 };
+use pplx_space_common_core::types::ArtifactKind;
 use tonic::Status;
 
 use pplx_space_sbx_mgr_protocol::proto;

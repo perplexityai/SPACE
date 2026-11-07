@@ -204,7 +204,7 @@ mod policy_tests {
     use pplx_space_common_core::types::SandboxId;
     use std::collections::BTreeMap;
 
-    use pplx_space_common_core::types::{
+    use pplx_space_auto_lifecycle::{
         AutoLifecycleConditionKind, AutoLifecycleConditionSet, AutoLifecycleConditionSetId,
         AutoLifecycleWakePolicy, AutoLifecycleWakeSource,
     };

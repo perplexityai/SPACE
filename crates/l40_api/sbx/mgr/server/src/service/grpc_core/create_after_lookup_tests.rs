@@ -135,7 +135,7 @@ impl TemplateBuild {
 /// The template's default auto-lifecycle policy, distinct from the disabled
 /// policy test rows start with.
 fn access_idle_suspend_policy() -> AutoLifecyclePolicy {
-    use pplx_space_common_core::types::{
+    use pplx_space_auto_lifecycle::{
         AutoLifecycleConditionSet, AutoLifecycleConditionSetId, AutoLifecycleStage,
     };
     AutoLifecyclePolicy {

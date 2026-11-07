@@ -6,11 +6,12 @@ use std::{
     sync::{Arc, Mutex, MutexGuard, OnceLock},
 };
 
+use pplx_space_auto_lifecycle::AutoLifecyclePolicy;
 use pplx_space_common_core::types::{
-    AutoLifecyclePolicy, DEFAULT_BASE_SNAPSHOT_MEMORY_MIB, DEFAULT_BASE_SNAPSHOT_VCPU,
-    MIN_BASE_SNAPSHOT_MEMORY_MIB, MIN_BASE_SNAPSHOT_VCPU, RUNTIME_FIRECRACKER_ALIAS,
-    TEMPLATE_ROOTFS_FILE, TEMPLATE_ROOTFS_ZSTD_CODEC, TEMPLATE_ROOTFS_ZSTD_FILE,
-    TEMPLATE_ROOTFS_ZSTD_LEVEL, TemplateCachePartition,
+    DEFAULT_BASE_SNAPSHOT_MEMORY_MIB, DEFAULT_BASE_SNAPSHOT_VCPU, MIN_BASE_SNAPSHOT_MEMORY_MIB,
+    MIN_BASE_SNAPSHOT_VCPU, RUNTIME_FIRECRACKER_ALIAS, TEMPLATE_ROOTFS_FILE,
+    TEMPLATE_ROOTFS_ZSTD_CODEC, TEMPLATE_ROOTFS_ZSTD_FILE, TEMPLATE_ROOTFS_ZSTD_LEVEL,
+    TemplateCachePartition,
 };
 use pplx_space_content_digest::{Digest, HashAlg};
 use pplx_space_feature_flags::FeatureFlagClient;

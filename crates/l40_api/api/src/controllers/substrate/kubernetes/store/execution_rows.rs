@@ -491,7 +491,7 @@ impl K8sStore {
     pub(in crate::controllers::substrate::kubernetes) async fn auto_lifecycle_policy_after_claim(
         &self,
         sandbox_id: SandboxId,
-    ) -> Result<pplx_space_common_core::types::AutoLifecyclePolicy, SubstrateError> {
+    ) -> Result<pplx_space_auto_lifecycle::AutoLifecyclePolicy, SubstrateError> {
         pplx_space_sandbox_store::auto_lifecycle_policy(&self.pool, sandbox_id)
             .await
             .map_err(sqlx::Error::from)

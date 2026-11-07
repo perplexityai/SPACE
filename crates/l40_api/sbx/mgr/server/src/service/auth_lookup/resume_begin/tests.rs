@@ -15,9 +15,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use pplx_space_accounts::SandboxOwner;
+use pplx_space_auto_lifecycle::AutoLifecyclePolicy;
 use pplx_space_common_core::types::{
-    AutoLifecyclePolicy, ExecutionGeneration, RouteGeneration, SandboxId, SandboxRuntimeLabel,
-    SpaceApiRouteIdentity,
+    ExecutionGeneration, RouteGeneration, SandboxId, SandboxRuntimeLabel, SpaceApiRouteIdentity,
 };
 use pplx_space_node_mgr_client::proto::{ResumeSandboxRequest, ResumeSandboxResponse};
 use tonic::{Code, Status};

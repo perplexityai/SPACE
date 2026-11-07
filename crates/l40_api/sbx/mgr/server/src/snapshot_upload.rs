@@ -275,7 +275,7 @@ pub struct SnapshotSandbox {
     #[serde(default)]
     pub process_env: std::collections::BTreeMap<String, String>,
     /// Auto-suspend / auto-stop policy.
-    pub auto_lifecycle: pplx_space_common_core::types::AutoLifecyclePolicy,
+    pub auto_lifecycle: pplx_space_auto_lifecycle::AutoLifecyclePolicy,
 }
 
 /// Capture-time description of what a snapshot was taken from. Stored inline

@@ -2,12 +2,14 @@ use std::collections::BTreeMap;
 
 use crate::db::{Connection, OptionalExtension};
 use pplx_space_accounts::SandboxOwner;
+use pplx_space_auto_lifecycle::{
+    AutoLifecycleConditionSet, AutoLifecycleConditionSetId, AutoLifecycleIdleAction,
+    AutoLifecyclePolicy, AutoLifecycleStage, AutoLifecycleWakePolicy,
+};
 use pplx_space_auto_lifecycle_receipt::AutoLifecyclePolicyFingerprint;
 use pplx_space_common_core::types::{
-    AutoLifecycleConditionSet, AutoLifecycleConditionSetId, AutoLifecycleDeleteReceiptId,
-    AutoLifecycleIdleAction, AutoLifecyclePolicy, AutoLifecycleStage, AutoLifecycleWakePolicy,
-    ExecutionGeneration, NodeManagedBy, NodeRole, RuntimeKind, SandboxActivationAttemptId,
-    SandboxId, SandboxRuntimeLabel, SpaceApiRouteIdentity,
+    AutoLifecycleDeleteReceiptId, ExecutionGeneration, NodeManagedBy, NodeRole, RuntimeKind,
+    SandboxActivationAttemptId, SandboxId, SandboxRuntimeLabel, SpaceApiRouteIdentity,
 };
 use pplx_space_policy_authority::PolicyAuthority;
 
@@ -436,7 +438,7 @@ fn strict_admission_requires_complete_current_cluster_fencing() {
     assert_eq!(reason.as_deref(), Some("missing_substrate"));
     assert!(blocked_at.is_some());
     assert!(next_auto_event_at.unwrap() > crate::db::now_epoch_i64().unwrap());
-    let runtime_state: pplx_space_common_core::types::AutoLifecycleRuntimeState =
+    let runtime_state: pplx_space_auto_lifecycle::AutoLifecycleRuntimeState =
         serde_json::from_str(&runtime_state_json).unwrap();
     assert!(
         runtime_state
@@ -463,7 +465,7 @@ fn strict_admission_requires_complete_current_cluster_fencing() {
         )
         .unwrap();
     assert_eq!((reason, blocked_at), (None, None));
-    let runtime_state: pplx_space_common_core::types::AutoLifecycleRuntimeState =
+    let runtime_state: pplx_space_auto_lifecycle::AutoLifecycleRuntimeState =
         serde_json::from_str(&runtime_state_json).unwrap();
     assert_eq!(runtime_state.last_auto_error, None);
 }
@@ -1875,7 +1877,7 @@ fn receipt_conflict_uses_bounded_retry_without_claiming_a_durable_block() {
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .unwrap();
-    let runtime_state: pplx_space_common_core::types::AutoLifecycleRuntimeState =
+    let runtime_state: pplx_space_auto_lifecycle::AutoLifecycleRuntimeState =
         serde_json::from_str(&runtime_state_json).unwrap();
     assert!(block_reason.is_none());
     assert!(retry_at > crate::db::now_epoch_i64().unwrap());

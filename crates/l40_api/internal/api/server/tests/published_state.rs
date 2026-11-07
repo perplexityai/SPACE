@@ -4,16 +4,18 @@
 #![cfg(test)]
 
 use pplx_space_accounts::NodeId;
+use pplx_space_auto_lifecycle::{
+    AutoLifecycleConditionSet, AutoLifecycleConditionSetId, AutoLifecycleIdleAction,
+    AutoLifecyclePolicy, AutoLifecycleStage,
+};
 use pplx_space_auto_lifecycle_receipt::AutoLifecyclePolicyFingerprint;
 use pplx_space_common_core::types::{LocalArtifactId, SnapshotId};
 use pplx_space_common_core::{
     sql,
     types::{
-        AbandonedRestoreRetirement, AutoLifecycleConditionSet, AutoLifecycleConditionSetId,
-        AutoLifecycleDeleteReceiptId, AutoLifecycleIdleAction, AutoLifecyclePolicy,
-        AutoLifecycleStage, ExecutionMetadata, SandboxActivationAttemptId, SandboxId,
-        SandboxLifecycle, SandboxQuarantineHistoryAction, SandboxQuarantineNextAction,
-        SandboxQuarantineReasonCode, SandboxQuarantineSource,
+        AbandonedRestoreRetirement, AutoLifecycleDeleteReceiptId, ExecutionMetadata,
+        SandboxActivationAttemptId, SandboxId, SandboxLifecycle, SandboxQuarantineHistoryAction,
+        SandboxQuarantineNextAction, SandboxQuarantineReasonCode, SandboxQuarantineSource,
     },
 };
 use pplx_space_cpu_arch::Arch;

@@ -138,10 +138,13 @@ fn node_execution_cleanup_acknowledgements_are_retryable_and_fenced() {
     );
 }
 use pplx_space_accounts::UserId;
+use pplx_space_auto_lifecycle::{
+    AutoLifecycleConditionSet, AutoLifecycleConditionSetId, AutoLifecycleIdleAction,
+    AutoLifecycleStage,
+};
 use pplx_space_common_core::types::{
     ArtifactComponentKind, ArtifactComponentMetadata, ArtifactFormat, ArtifactVersion,
-    AutoLifecycleConditionSet, AutoLifecycleConditionSetId, AutoLifecycleIdleAction,
-    AutoLifecycleStage, ExecutionMetadata, SandboxActivationAttemptId, SandboxId,
+    ExecutionMetadata, SandboxActivationAttemptId, SandboxId,
 };
 use pplx_space_content_digest::Digest;
 use pplx_space_cpu_arch::Arch;

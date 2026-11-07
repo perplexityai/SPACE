@@ -279,7 +279,7 @@ fn target_config() -> ForkTargetConfig {
         vcpu: None,
         memory_mib: None,
         disk_mib: None,
-        auto_lifecycle: pplx_space_common_core::types::AutoLifecyclePolicy::disabled(),
+        auto_lifecycle: pplx_space_auto_lifecycle::AutoLifecyclePolicy::disabled(),
         network_policy: None,
     }
 }

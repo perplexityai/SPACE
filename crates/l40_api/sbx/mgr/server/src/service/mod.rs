@@ -18,12 +18,15 @@ use pplx_space_api_route::{
     ed25519::SpaceApiRouteEd25519VerificationBundleUpdate,
     ed25519::SpaceApiRouteEd25519VerificationBundleUpdateError,
 };
-use pplx_space_common_core::types::{
+use pplx_space_auto_lifecycle::{
     AutoLifecycleActivitySource, AutoLifecycleIdleAction, AutoLifecyclePolicy,
-    AutoLifecycleRuntimeState, AutoLifecycleTransition, ExecutionGeneration, GuestUserName,
-    IncompleteSandboxRouteIdentityError, NodeManagedBy, NodeRole, ORPHANED_SANDBOX_TEMPLATE,
-    RuntimeKind, SandboxCleanupEpisodeId, SandboxId, SandboxQuarantineReasonCode,
-    SandboxRouteIdentity, SandboxRuntimeLabel, SpaceApiRouteIdentity, parse_grpc_timeout,
+    AutoLifecycleRuntimeState, AutoLifecycleTransition,
+};
+use pplx_space_common_core::types::{
+    ExecutionGeneration, GuestUserName, IncompleteSandboxRouteIdentityError, NodeManagedBy,
+    NodeRole, ORPHANED_SANDBOX_TEMPLATE, RuntimeKind, SandboxCleanupEpisodeId, SandboxId,
+    SandboxQuarantineReasonCode, SandboxRouteIdentity, SandboxRuntimeLabel, SpaceApiRouteIdentity,
+    parse_grpc_timeout,
 };
 use pplx_space_host_layout::identities::user_names;
 use pplx_space_host_layout::paths::TEMPLATE_CACHE_DIR_MODE;

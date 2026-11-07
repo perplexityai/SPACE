@@ -1,9 +1,10 @@
-use pplx_space_common_core::types::{
+use pplx_space_auto_lifecycle::{
     AutoLifecycleActivitySource, AutoLifecycleConditionRuntimeState, AutoLifecycleConditionSet,
     AutoLifecycleConditionSetId, AutoLifecycleConditionStatus, AutoLifecycleIdleAction,
     AutoLifecyclePolicy, AutoLifecycleRuntimeState, AutoLifecycleStage, AutoLifecycleStatus,
-    AutoLifecycleTransition, AutoLifecycleWakePolicy, AutoLifecycleWakeSource, SimpleDuration,
+    AutoLifecycleTransition, AutoLifecycleWakePolicy, AutoLifecycleWakeSource,
 };
+use pplx_space_common_core::types::SimpleDuration;
 use prost_types::{Duration as ProtoDuration, Timestamp as ProtoTimestamp};
 
 use crate::proto;
@@ -197,10 +198,10 @@ impl TryFrom<&proto::AutoLifecyclePolicy> for AutoLifecyclePolicy {
                 .unwrap_or(proto::AutoLifecycleConditionKind::Unspecified)
             {
                 proto::AutoLifecycleConditionKind::Inactivity => {
-                    pplx_space_common_core::types::AutoLifecycleConditionKind::Inactivity
+                    pplx_space_auto_lifecycle::AutoLifecycleConditionKind::Inactivity
                 }
                 proto::AutoLifecycleConditionKind::GuestActivity => {
-                    pplx_space_common_core::types::AutoLifecycleConditionKind::GuestActivity
+                    pplx_space_auto_lifecycle::AutoLifecycleConditionKind::GuestActivity
                 }
                 proto::AutoLifecycleConditionKind::Unspecified => {
                     return Err(AutoLifecycleProtoError::new(format!(
@@ -332,10 +333,10 @@ impl From<&AutoLifecyclePolicy> for proto::AutoLifecyclePolicy {
                 .map(|(id, condition)| proto::AutoLifecycleConditionSet {
                     id: condition_set_id_to_proto(*id),
                     kind: match condition.kind {
-                        pplx_space_common_core::types::AutoLifecycleConditionKind::Inactivity => {
+                        pplx_space_auto_lifecycle::AutoLifecycleConditionKind::Inactivity => {
                             proto::AutoLifecycleConditionKind::Inactivity as i32
                         }
-                        pplx_space_common_core::types::AutoLifecycleConditionKind::GuestActivity => {
+                        pplx_space_auto_lifecycle::AutoLifecycleConditionKind::GuestActivity => {
                             proto::AutoLifecycleConditionKind::GuestActivity as i32
                         }
                     },
@@ -359,14 +360,18 @@ impl From<&AutoLifecyclePolicy> for proto::AutoLifecyclePolicy {
                     condition_set: condition_set_id_to_proto(stage.condition_set),
                     at: Some(whole_seconds_to_proto(stage.at)),
                     action: match stage.action {
-                        AutoLifecycleIdleAction::None => proto::AutoLifecycleIdleAction::None as i32,
+                        AutoLifecycleIdleAction::None => {
+                            proto::AutoLifecycleIdleAction::None as i32
+                        }
                         AutoLifecycleIdleAction::Pause => {
                             proto::AutoLifecycleIdleAction::Pause as i32
                         }
                         AutoLifecycleIdleAction::Suspend => {
                             proto::AutoLifecycleIdleAction::Suspend as i32
                         }
-                        AutoLifecycleIdleAction::Stop => proto::AutoLifecycleIdleAction::Stop as i32,
+                        AutoLifecycleIdleAction::Stop => {
+                            proto::AutoLifecycleIdleAction::Stop as i32
+                        }
                         AutoLifecycleIdleAction::Delete => {
                             proto::AutoLifecycleIdleAction::Delete as i32
                         }

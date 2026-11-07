@@ -7,8 +7,9 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
+use pplx_space_auto_lifecycle::AutoLifecyclePolicy;
 use pplx_space_common_core::types::{
-    AutoLifecyclePolicy, GuestUserName, IdempotencyKey, ProcessCommand, SandboxLifecycle,
+    GuestUserName, IdempotencyKey, ProcessCommand, SandboxLifecycle,
     validate_linux_guest_path_input,
 };
 use pplx_space_public_api::{

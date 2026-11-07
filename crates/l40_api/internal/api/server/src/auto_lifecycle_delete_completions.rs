@@ -4,6 +4,7 @@ use std::{
 };
 
 use pplx_space_accounts::NodeId;
+use pplx_space_auto_lifecycle::{AutoLifecycleIdleAction, AutoLifecyclePolicy};
 use pplx_space_auto_lifecycle_receipt::{
     AUTO_LIFECYCLE_DELETE_COMPLETION_BATCH_SIZE, AUTO_LIFECYCLE_DELETE_COMPLETION_LOCK_TIMEOUT,
     AUTO_LIFECYCLE_DELETE_COMPLETION_OWNERSHIP_GRACE,
@@ -13,10 +14,9 @@ use pplx_space_auto_lifecycle_receipt::{
 use pplx_space_common_core::{
     sql,
     types::{
-        AutoLifecycleDeleteReceiptId, AutoLifecycleIdleAction, AutoLifecyclePolicy,
-        ExecutionGeneration, ExecutionGenerationParseError, SandboxActivationAttemptId, SandboxId,
-        SandboxIdParseError, SandboxLifecycle, SandboxQuarantineReasonCode,
-        SandboxQuarantineSource,
+        AutoLifecycleDeleteReceiptId, ExecutionGeneration, ExecutionGenerationParseError,
+        SandboxActivationAttemptId, SandboxId, SandboxIdParseError, SandboxLifecycle,
+        SandboxQuarantineReasonCode, SandboxQuarantineSource,
     },
 };
 use pplx_space_postgres_pool::contention::{self, is_lock_not_available};

@@ -271,7 +271,8 @@ async fn lifecycle_change_during_probe_enters_the_cancellation_independent_owner
 #[tokio::test(flavor = "current_thread")]
 async fn stored_ingress_access_resumes_paused_execution_before_reporting_ready()
 -> pplx_space_test_env::TestResult {
-    use pplx_space_common_core::types::{AutoLifecycleWakeSource, NodeManagedBy};
+    use pplx_space_auto_lifecycle::AutoLifecycleWakeSource;
+    use pplx_space_common_core::types::NodeManagedBy;
     use pplx_space_db_test_fixtures::try_pg_test_db;
     use pplx_space_node_api_sim::{SandboxRecord, SimWorkerHarness};
     use prost::Message;
@@ -425,7 +426,7 @@ async fn stored_ingress_access_to_a_suspended_sandbox_admits_its_access_wake()
     use crate::controllers::sandbox::lifecycle::user_admission::{
         UserLifecycleRequest, recorded::admitted,
     };
-    use pplx_space_common_core::types::AutoLifecycleWakeSource;
+    use pplx_space_auto_lifecycle::AutoLifecycleWakeSource;
     let db = pplx_space_db_test_fixtures::pg_test_db().await?;
     let backend = StoredAccess {
         pool: db.pool.clone(),

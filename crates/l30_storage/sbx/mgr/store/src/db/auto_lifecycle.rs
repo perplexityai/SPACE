@@ -71,10 +71,10 @@ pub fn defer_auto_lifecycle_deadline(conn: &Connection, id: &str, until_secs: u6
 /// follows the state machine's force-delete contract and acts wherever
 /// `Deleting` is reachable. `None` is a no-op that may always be recorded.
 pub fn auto_lifecycle_action_can_act(
-    action: pplx_space_common_core::types::AutoLifecycleIdleAction,
+    action: pplx_space_auto_lifecycle::AutoLifecycleIdleAction,
     state: impl Into<SandboxStatus>,
 ) -> bool {
-    use pplx_space_common_core::types::AutoLifecycleIdleAction as Action;
+    use pplx_space_auto_lifecycle::AutoLifecycleIdleAction as Action;
     let state = state.into();
     match action {
         Action::None => true,

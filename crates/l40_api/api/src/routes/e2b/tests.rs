@@ -29,12 +29,12 @@ use tracing_subscriber::{Layer, layer::Context, prelude::*};
 use uuid::Uuid;
 
 use pplx_space_accounts::SandboxOwnerSource;
+use pplx_space_auto_lifecycle::{
+    AutoLifecycleIdleAction, AutoLifecyclePolicy, AutoLifecycleRuntimeState,
+};
 #[cfg(feature = "kubernetes")]
 use pplx_space_common_core::types::SnapshotId;
-use pplx_space_common_core::types::{
-    AutoLifecycleIdleAction, AutoLifecyclePolicy, AutoLifecycleRuntimeState, DEFAULT_TEMPLATE_TAG,
-    SandboxLifecycle, TemplateVisibility,
-};
+use pplx_space_common_core::types::{DEFAULT_TEMPLATE_TAG, SandboxLifecycle, TemplateVisibility};
 use pplx_space_ecw_credential::EcwCredentialKeyring;
 #[cfg(feature = "kubernetes")]
 use pplx_space_sandbox_pod::SANDBOX_SUSPEND_RESTORE_STORAGE_URI_ANNOTATION;
@@ -2890,7 +2890,7 @@ fn create_translation_maps_pause_and_resume_policy() {
     assert!(translation.native.wait_until_ready);
     assert_eq!(
         stage.action,
-        pplx_space_common_core::types::AutoLifecycleIdleAction::Suspend
+        pplx_space_auto_lifecycle::AutoLifecycleIdleAction::Suspend
     );
 }
 

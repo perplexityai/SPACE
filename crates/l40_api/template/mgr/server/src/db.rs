@@ -3,8 +3,8 @@ use std::path::Path;
 
 use rusqlite::{Connection, Result, params, types::Type};
 
+use pplx_space_auto_lifecycle::AutoLifecyclePolicy;
 use pplx_space_common_core::sql;
-use pplx_space_common_core::types::AutoLifecyclePolicy;
 use pplx_space_net_common::NetworkPolicyV1;
 pub use pplx_space_policy_authority::PolicyAuthority;
 

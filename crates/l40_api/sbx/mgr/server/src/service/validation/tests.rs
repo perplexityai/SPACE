@@ -503,9 +503,10 @@ fn a_capture_publishes_under_the_partition_template_manager_names() {
 
 #[test]
 fn automatic_lifecycle_admission_respects_runtime_capabilities() {
-    use pplx_space_common_core::types::{
-        AutoLifecycleIdleAction, AutoLifecyclePolicy, AutoLifecycleStage, RuntimeKind,
+    use pplx_space_auto_lifecycle::{
+        AutoLifecycleIdleAction, AutoLifecyclePolicy, AutoLifecycleStage,
     };
+    use pplx_space_common_core::types::RuntimeKind;
     for action in [
         AutoLifecycleIdleAction::None,
         AutoLifecycleIdleAction::Pause,
@@ -515,8 +516,7 @@ fn automatic_lifecycle_admission_respects_runtime_capabilities() {
     ] {
         let policy = AutoLifecyclePolicy {
             stages: vec![AutoLifecycleStage {
-                condition_set:
-                    pplx_space_common_core::types::AutoLifecycleConditionSetId::AccessIdle,
+                condition_set: pplx_space_auto_lifecycle::AutoLifecycleConditionSetId::AccessIdle,
                 at: 60,
                 action,
             }],

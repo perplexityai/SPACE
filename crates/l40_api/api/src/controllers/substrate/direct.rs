@@ -118,9 +118,10 @@ use pplx_space_postgres_pool::contention;
 use std::{fmt, sync::LazyLock, time::Duration};
 
 use pplx_space_accounts::NodeId;
+use pplx_space_auto_lifecycle::AutoLifecyclePolicy;
 use pplx_space_common_core::types::{
-    ArtifactOrigin, AutoLifecyclePolicy, ExecutionGeneration, ExecutionGenerationParseError,
-    NodeManagedBy, NodeRole as SpaceNodeRole, RouteGeneration, RouteGenerationParseError,
+    ArtifactOrigin, ExecutionGeneration, ExecutionGenerationParseError, NodeManagedBy,
+    NodeRole as SpaceNodeRole, RouteGeneration, RouteGenerationParseError,
     SandboxActivationAttemptId, SandboxId, SandboxLifecycle, SandboxRouteIdentity,
     SandboxRouteIdentityInvariantError, SubstrateKind,
 };

@@ -8,9 +8,9 @@ use pplx_space_common_core::types::SnapshotId;
 
 use std::{collections::BTreeMap, fmt, str::FromStr};
 
+use pplx_space_auto_lifecycle::{AutoLifecyclePolicy, SandboxAutoLifecyclePatch};
 use pplx_space_common_core::types::{
-    AutoLifecyclePolicy, EnvMap, RuntimeKind, SandboxAutoLifecyclePatch, SandboxId,
-    SandboxLifecycle, SimpleDuration, TemplateReference,
+    EnvMap, RuntimeKind, SandboxId, SandboxLifecycle, SimpleDuration, TemplateReference,
 };
 pub use pplx_space_common_core::types::{IdempotencyKey, ProcessId};
 use pplx_space_net_common::NetworkPolicyV1;

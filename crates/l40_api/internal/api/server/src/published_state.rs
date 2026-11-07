@@ -10,16 +10,16 @@ use tonic::Status;
 use uuid::Uuid;
 
 use crate::metadata::artifact_kind_from_proto;
+use pplx_space_auto_lifecycle::AutoLifecyclePolicy;
 use pplx_space_cluster_trigger_queue::{
     QueuedRefConflict, enqueue_triggers_conn, queue_node_reconcile_refs,
 };
 use pplx_space_common_core::types::{
-    ArtifactKind, ArtifactOrigin, AutoLifecyclePolicy, ExecutionGeneration, ExecutionMetadata,
-    LocalArtifactId, NodeRole, RuntimeKind, SandboxActivationAttemptId, SandboxId,
-    SandboxLifecycle, SandboxQuarantineHistoryAction, SandboxQuarantineNextAction,
-    SandboxQuarantineReasonCode, SandboxQuarantineSource, SandboxTransitionReceipt,
-    SandboxTransitionReceiptInvariantError, SandboxTransitionReceiptKind,
-    SandboxTransitionTargetState,
+    ArtifactKind, ArtifactOrigin, ExecutionGeneration, ExecutionMetadata, LocalArtifactId,
+    NodeRole, RuntimeKind, SandboxActivationAttemptId, SandboxId, SandboxLifecycle,
+    SandboxQuarantineHistoryAction, SandboxQuarantineNextAction, SandboxQuarantineReasonCode,
+    SandboxQuarantineSource, SandboxTransitionReceipt, SandboxTransitionReceiptInvariantError,
+    SandboxTransitionReceiptKind, SandboxTransitionTargetState,
 };
 use pplx_space_cpu_arch::Arch;
 use pplx_space_events::{

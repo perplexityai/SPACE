@@ -48,6 +48,7 @@ uuid = { workspace = true, features = ["v7"] }
 zstd = { workspace = true }
 
 # internal
+pplx-space-auto-lifecycle = { workspace = true, features = ["serde"] }
 pplx-space-common-core = { workspace = true, features = ["serde"] }
 pplx-space-btrfs = { workspace = true }
 pplx-space-host-layout = { workspace = true }
