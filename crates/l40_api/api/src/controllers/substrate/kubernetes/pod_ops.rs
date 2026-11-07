@@ -12,7 +12,6 @@ use crate::node_group_placement::{
     PlacementSubject, ResolvePath as NodeGroupResolvePath, ResolvedPlacement, RestoreSourceNode,
     check_local_restore_source,
 };
-use pplx_space_common_core::kubernetes::{EvacuationPlacement, NodeGroupPlacement, PodToleration};
 use pplx_space_common_core::types::{
     ExecutionGeneration, NodeRole as SpaceNodeRole, PodUid, SandboxActivationAttemptId,
     SandboxLifecycle, SandboxOwner, SandboxTransitionTargetState,
@@ -22,6 +21,7 @@ use pplx_space_events::{
     SandboxRestoreProvenance,
 };
 use pplx_space_policy_authority::PolicyAuthority;
+use pplx_space_sandbox_pod::{EvacuationPlacement, NodeGroupPlacement, PodToleration};
 use rand::RngExt;
 
 mod create_request;
@@ -306,7 +306,7 @@ mod tests;
 /// So a caller that can resolve both should pass both: the pair is what
 /// selects the third shape, and suppressing either one collapses it to a
 /// strictly worse placement. `SandboxPodRequest::Restore`'s field docs in
-/// `pplx_space_common_core::k8s` carry the rendering details.
+/// `pplx_space_sandbox_pod` carry the rendering details.
 pub(super) fn parse_pod_create_context<'a>(
     sandbox_id: SandboxId,
     generation: i64,

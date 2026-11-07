@@ -131,7 +131,7 @@ use super::store::PodLessHold;
 use super::*;
 use crate::drained_node_terminator::InstanceLookupError;
 use pplx_space_api::controllers::substrate::WaitReadyTimeoutPhase;
-use pplx_space_common_core::kubernetes::EvacuationPlacement;
+use pplx_space_sandbox_pod::EvacuationPlacement;
 
 use std::collections::VecDeque;
 use std::sync::Mutex as StdMutex;

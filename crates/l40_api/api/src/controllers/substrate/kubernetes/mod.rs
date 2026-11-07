@@ -14,24 +14,22 @@ use kube::{
     api::{DeleteParams, PostParams, WatchEvent, WatchParams},
     runtime::reflector::{ObjectRef, Store},
 };
-use pplx_space_common_core::{
-    kubernetes::{
-        DEFAULT_SANDBOX_PROXY_PORT, ForkDiskRestorePodContext,
-        MAX_SANDBOX_NETWORK_POLICY_ANNOTATION_BYTES, NodeGroupPlacement,
-        NodeSelectorLabelsParseError, SANDBOX_NETWORK_POLICY_ANNOTATION,
-        SANDBOX_NETWORK_POLICY_AUTHORITY_ANNOTATION, SANDBOX_NETWORK_POLICY_GENERATION_ANNOTATION,
-        SandboxPodCommon, SandboxPodConfig, SandboxPodConfigValues, SandboxPodRequest,
-        SandboxRuntimePodMetadata, StoppedMaterialization, build_sandbox_pod, node_group_label,
-    },
-    types::{
-        NodeRole as SpaceNodeRole, PodName, PodResourceVersion, PodUid, SandboxId, StorageUri,
-    },
+use pplx_space_common_core::types::{
+    NodeRole as SpaceNodeRole, PodName, PodResourceVersion, PodUid, SandboxId, StorageUri,
 };
 use pplx_space_k8s_node_id::space_k8s_node_id;
 use pplx_space_node_api_client::{
     NodeApiClient, WorkerApiClient as RetryingWorkerApiClient,
     WorkerApiInternalClient as RetryingWorkerApiInternalClient,
     proto::worker_api_internal_client::WorkerApiInternalClient,
+};
+use pplx_space_sandbox_pod::{
+    DEFAULT_SANDBOX_PROXY_PORT, ForkDiskRestorePodContext,
+    MAX_SANDBOX_NETWORK_POLICY_ANNOTATION_BYTES, NodeGroupPlacement, NodeSelectorLabelsParseError,
+    SANDBOX_NETWORK_POLICY_ANNOTATION, SANDBOX_NETWORK_POLICY_AUTHORITY_ANNOTATION,
+    SANDBOX_NETWORK_POLICY_GENERATION_ANNOTATION, SandboxPodCommon, SandboxPodConfig,
+    SandboxPodConfigValues, SandboxPodRequest, SandboxRuntimePodMetadata, StoppedMaterialization,
+    build_sandbox_pod, node_group_label,
 };
 use pplx_space_sbx_mgr_client::proto::SpacedWaitReadyRequest;
 use sqlx::PgPool;

@@ -12,11 +12,11 @@ use std::collections::BTreeSet;
 
 use k8s_openapi::api::core::v1::Node;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
-use pplx_space_common_core::kubernetes::SANDBOX_NODE_GROUP_LABEL;
 use pplx_space_common_core::types::{
     NodeGroupId, NodeGroupName, NodeGroupPolicy, NodeGroupTemplatePolicy, TemplateCompatSpec,
     TemplateName,
 };
+use pplx_space_sandbox_pod::SANDBOX_NODE_GROUP_LABEL;
 use sqlx::PgPool;
 use uuid::Uuid;
 

@@ -11,7 +11,7 @@
 //! other placement labels, is one of the daemons that goes away. So this loop
 //! watches the node-local DaemonSet pods cluster-wide and publishes the verdict
 //! onto each worker Node as
-//! [`NODE_SERVICES_READY_LABEL`](pplx_space_common_core::kubernetes::NODE_SERVICES_READY_LABEL).
+//! [`NODE_SERVICES_READY_LABEL`](pplx_space_sandbox_pod::NODE_SERVICES_READY_LABEL).
 //! The sandbox pod builder turns that label into a soft weighted preference and
 //! the API drops not-ready nodes from the restore fallback shortlist, so new
 //! sandboxes drain off a rolling node and return to it once it is serviced.
@@ -159,8 +159,8 @@ pub enum NodeServicesReady {
 impl NodeServicesReady {
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::Ready => pplx_space_common_core::kubernetes::NODE_SERVICES_READY_VALUE,
-            Self::NotReady => pplx_space_common_core::kubernetes::NODE_SERVICES_NOT_READY_VALUE,
+            Self::Ready => pplx_space_sandbox_pod::NODE_SERVICES_READY_VALUE,
+            Self::NotReady => pplx_space_sandbox_pod::NODE_SERVICES_NOT_READY_VALUE,
         }
     }
 }
@@ -698,7 +698,7 @@ async fn apply_one_label<B: ReadinessBackend>(
 /// exactly this key, so it never fights node-ctl's placement labels.
 fn node_label_apply(node_name: &str, desired: NodeServicesReady) -> serde_json::Value {
     let labels: BTreeMap<&str, &str> = BTreeMap::from([(
-        pplx_space_common_core::kubernetes::NODE_SERVICES_READY_LABEL,
+        pplx_space_sandbox_pod::NODE_SERVICES_READY_LABEL,
         desired.as_str(),
     )]);
     serde_json::json!({

@@ -30,7 +30,7 @@ use tonic::transport::Server;
 use tonic::transport::server::TcpIncoming;
 use uuid::Uuid;
 
-use pplx_space_common_core::kubernetes::{
+use pplx_space_sandbox_pod::{
     SANDBOX_CHECKPOINT_ANNOTATION, SANDBOX_STOPPED_MATERIALIZATION_ARTIFACT_ID_ANNOTATION,
     SANDBOX_SUSPEND_RESTORE_STORAGE_URI_ANNOTATION, STOPPED_MATERIALIZATION_CHECKPOINT,
 };

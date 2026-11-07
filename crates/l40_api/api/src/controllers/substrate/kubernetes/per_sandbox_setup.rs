@@ -30,10 +30,10 @@
 //!
 use pplx_space_common_core::types::{OrgId, UserId};
 
-use pplx_space_common_core::kubernetes::SandboxRuntimePodMetadata;
 use pplx_space_common_core::types::{AutoLifecyclePolicy, DiskIoLimits, EnvMap, SandboxOwner};
 use pplx_space_net_common::NetworkPolicyV1;
 use pplx_space_policy_authority::PolicyAuthority;
+use pplx_space_sandbox_pod::SandboxRuntimePodMetadata;
 
 use super::SubstrateError;
 use super::ensure_network_policy_annotation_size;

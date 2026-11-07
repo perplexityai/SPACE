@@ -25,7 +25,7 @@ use std::{
 use k8s_openapi::api::core::v1::{ContainerStatus, Pod, PodCondition};
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use kube::runtime::{reflector, watcher};
-use pplx_space_common_core::kubernetes::{
+use pplx_space_sandbox_pod::{
     NODE_NAME_MATCH_FIELD, SANDBOX_CHECKPOINT_ANNOTATION, SANDBOX_EXECUTION_GENERATION_ANNOTATION,
     SANDBOX_ID_ANNOTATION, SANDBOX_MANAGED_BY_LABEL, SANDBOX_NETWORK_SLOTS_RESOURCE,
     SANDBOX_POOL_CONFIG_ID_KEY, SANDBOX_POOL_ROLE_KEY, SANDBOX_POOL_SLOT_ID_KEY,

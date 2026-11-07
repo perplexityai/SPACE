@@ -16,7 +16,6 @@ use pplx_space_api::controllers::substrate::{
     enqueue_artifact_backup_with_node_api, sandbox_state_with_node_api,
 };
 use pplx_space_api::reconcile_queue::{ReconcileRef, enqueue_sandbox_reconcile};
-use pplx_space_common_core::kubernetes::EvacuationPlacement;
 use pplx_space_common_core::node_drain_signals::{
     EVACUATION_RESTORE_READY_CHANNEL, REUPLOAD_ARTIFACT_MISSING_MARKER,
     REUPLOAD_SANDBOX_RESTORING_MARKER, REUPLOAD_SANDBOX_UNKNOWN_MARKER,
@@ -29,6 +28,7 @@ use pplx_space_common_core::types::{
 use pplx_space_events::{
     SandboxEvent, SandboxEventDetails, SandboxEventSource, SandboxEventTrigger, SandboxEventType,
 };
+use pplx_space_sandbox_pod::EvacuationPlacement;
 use pplx_space_sandbox_portability::{
     current_disk_artifact_backup_ready, drain_gate_blockers_for_node,
     inflight_suspend_upload_exists, latest_full_snapshot_ready,

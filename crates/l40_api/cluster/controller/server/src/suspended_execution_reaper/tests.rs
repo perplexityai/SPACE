@@ -47,7 +47,7 @@ use pplx_space_common_core::types::PositiveDuration;
 use uuid::Uuid;
 
 use super::*;
-use pplx_space_common_core::kubernetes::{
+use pplx_space_sandbox_pod::{
     SANDBOX_EXECUTION_GENERATION_ANNOTATION, SANDBOX_ID_ANNOTATION, SANDBOX_MANAGED_BY_LABEL,
 };
 

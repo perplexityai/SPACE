@@ -11,8 +11,8 @@
 //! age with an in-memory observation clock instead.
 
 use pplx_space_api::controllers::substrate::kubernetes::{SandboxPodKey, SandboxPodView};
-use pplx_space_common_core::kubernetes::SANDBOX_POOL_ROLE_WARM;
 use pplx_space_common_core::types::{PodUid, SandboxId};
+use pplx_space_sandbox_pod::SANDBOX_POOL_ROLE_WARM;
 use uuid::Uuid;
 
 /// kubelet's `waiting.reason` while the container runtime is creating the

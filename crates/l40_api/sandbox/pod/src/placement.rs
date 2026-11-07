@@ -14,7 +14,9 @@ use k8s_openapi::api::core::v1::{
 };
 
 use super::PodToleration;
-use crate::types::{NodeGroup, NodeGroupName, OrgId, TemplateCompatSpec, TemplateName};
+use pplx_space_common_core::types::{
+    NodeGroup, NodeGroupName, OrgId, TemplateCompatSpec, TemplateName,
+};
 
 /// Node label naming the node group a worker node belongs to.
 ///
@@ -464,7 +466,4 @@ impl NodeGroupPlacement {
 }
 
 #[cfg(test)]
-// Explicit because this module is itself reached through `#[path]`, so rustc
-// would resolve a bare `mod tests;` in this file's own directory.
-#[path = "placement/tests.rs"]
 mod tests;

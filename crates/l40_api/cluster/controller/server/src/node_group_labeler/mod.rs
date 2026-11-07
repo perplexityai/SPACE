@@ -111,7 +111,7 @@ pub use tick::Reconciler;
 /// nodeAffinity over this same key, so the writer and the reader must be the
 /// same string by construction rather than by two constants agreeing.
 #[cfg(feature = "kubernetes")]
-pub use pplx_space_common_core::kubernetes::SANDBOX_NODE_GROUP_LABEL as NODE_GROUP_LABEL;
+pub use pplx_space_sandbox_pod::SANDBOX_NODE_GROUP_LABEL as NODE_GROUP_LABEL;
 
 /// Taint key carried by dedicated (org-owned) node-group nodes, re-exported
 /// from `common-core`'s placement module. The value is the owning org's UUID.
@@ -126,7 +126,7 @@ pub use pplx_space_common_core::kubernetes::SANDBOX_NODE_GROUP_LABEL as NODE_GRO
 /// leaving an untainted, label-less window. The `non_default_group_count` gate is
 /// the safety property, not this check.
 #[cfg(feature = "kubernetes")]
-pub use pplx_space_common_core::kubernetes::DEDICATED_NODE_TAINT_KEY as DEDICATED_TAINT_KEY;
+pub use pplx_space_sandbox_pod::DEDICATED_NODE_TAINT_KEY as DEDICATED_TAINT_KEY;
 
 pub(crate) const DEFAULT_TICK: Duration = Duration::from_secs(30);
 /// Label patches in flight at once. Independent single-object writes, which the

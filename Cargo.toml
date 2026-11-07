@@ -157,6 +157,7 @@ members = [
     "crates/l10_foundation/guest/status",
     "crates/l10_foundation/job/id",
     "crates/l40_api/sandbox/grpc",
+    "crates/l40_api/sandbox/pod",
     "crates/l10_foundation/request/id",
     "crates/l20_domain/execution/spec",
     "crates/l20_domain/template/runtime",
@@ -448,6 +449,7 @@ pplx-space-guest-capability = { path = "crates/l10_foundation/guest/capability" 
 pplx-space-guest-status = { path = "crates/l10_foundation/guest/status" }
 pplx-space-job-id = { path = "crates/l10_foundation/job/id" }
 pplx-space-sandbox-grpc = { path = "crates/l40_api/sandbox/grpc" }
+pplx-space-sandbox-pod = { path = "crates/l40_api/sandbox/pod" }
 pplx-space-request-id = { path = "crates/l10_foundation/request/id" }
 pplx-space-execution-spec = { path = "crates/l20_domain/execution/spec" }
 pplx-space-template-runtime = { path = "crates/l20_domain/template/runtime" }

@@ -176,9 +176,7 @@ async fn cold_create_seeds_the_network_policy_generation_on_the_sandbox_lineage(
         .as_ref()
         .and_then(|pod| pod.pointer("/metadata/annotations"))
         .and_then(|annotations| {
-            annotations.get(
-                pplx_space_common_core::kubernetes::SANDBOX_NETWORK_POLICY_GENERATION_ANNOTATION,
-            )
+            annotations.get(pplx_space_sandbox_pod::SANDBOX_NETWORK_POLICY_GENERATION_ANNOTATION)
         })
         .and_then(serde_json::Value::as_str);
     assert_eq!(annotation, Some(seeded_generation));

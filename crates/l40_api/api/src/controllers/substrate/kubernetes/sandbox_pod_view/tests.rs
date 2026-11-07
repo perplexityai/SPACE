@@ -1,5 +1,5 @@
 use kube::runtime::reflector::ObjectRef;
-use pplx_space_common_core::kubernetes::SANDBOX_PROCESS_ENV_ANNOTATION;
+use pplx_space_sandbox_pod::SANDBOX_PROCESS_ENV_ANNOTATION;
 
 use super::*;
 

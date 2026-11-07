@@ -34,7 +34,7 @@ use kube::Api;
 use kube::api::{Patch, PatchParams};
 use kube::runtime::reflector::ObjectRef;
 use pplx_space_api::controllers::substrate::kubernetes::K8sCaches;
-use pplx_space_common_core::kubernetes::{SandboxNodeSelector, SandboxPodConfigValues};
+use pplx_space_sandbox_pod::{SandboxNodeSelector, SandboxPodConfigValues};
 
 use super::{
     DEDICATED_TAINT_KEY, NODE_GROUP_LABEL, WorkerNode, WorkerNodeLabels, WorkerNodeLabelsError,

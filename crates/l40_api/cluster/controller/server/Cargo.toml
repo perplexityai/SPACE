@@ -35,7 +35,7 @@ kubernetes = [
     "dep:k8s-openapi",
     "dep:kube",
     "pplx-space-api/kubernetes",
-    "pplx-space-common-core/kubernetes",
+    "dep:pplx-space-sandbox-pod",
     "dep:pplx-space-kube-client",
 ]
 test-hooks = ["pplx-space-common-core/test-hooks"]
@@ -74,6 +74,7 @@ pplx-space-federated-identity = { workspace = true }
 pplx-space-grpc-server = { workspace = true }
 pplx-space-k8s-node-id = { workspace = true }
 pplx-space-kube-client = { workspace = true, optional = true }
+pplx-space-sandbox-pod = { workspace = true, optional = true }
 pplx-space-postgres-pool = { workspace = true }
 pplx-space-sandbox-quarantine-store = { workspace = true }
 pplx-space-sandbox-residency = { workspace = true }
