@@ -1506,9 +1506,32 @@ environment in the `runtime_environments` catalog that isn't retired, read
 through the catalog store in
 `crates/l30_storage/runtime/environment/catalog/store`. Each row is an
 environment a node build has published as certified, and an operator retires
-one by setting `retired_at`. Nothing records node publishes in the catalog yet,
-so until that writer lands an enabled cohort receives an empty recipe and
-installs nothing. The recipe ignores execution policy: an environment
+one by setting `retired_at`. Authenticated node publications validate and record
+`environments.known` in the inventory transaction, even before any environment is
+usable. Missing or unavailable observations do not erase the catalog.
+
+Registration is insert-only: `ON CONFLICT DO NOTHING` leaves existing metadata,
+compatibility edges, and operator retirement untouched. Node reports do not
+revise catalog certifications. The existing recipe-size guard still applies;
+operators retire old entries to keep the active catalog within that limit.
+
+Deploy the optional kernel/state-format metadata migration before this publisher.
+The legacy activation catalog reader ignores profiles lacking kernel or
+snapshot-format metadata, rather than failing unrelated activations. Before
+rolling this publisher into a cluster with runtime upgrades enabled, set
+`SPACE_RUNTIME_UPGRADE_AT_ACTIVATION_ENABLED=false` on all API/controller replicas and
+verify the old replicas have exited. Deploy the null-safe reader everywhere,
+then deploy the publisher; only then re-enable runtime upgrades. Rolling back
+to an old reader also requires disabling upgrades first: stopping publication
+does not remove durable nullable rows.
+
+An already-enabled provisioning cohort receives a populated recipe once at
+least one non-retired known environment has been successfully published.
+An empty catalog stays empty when nodes report no `environments.known`.
+Installation remains asynchronous; publication does not grant execution
+permission or establish scheduler readiness. No cohort gate is changed.
+
+The recipe ignores execution policy: an environment
 with no state, or a blocked one, stays installed, so a later policy change finds
 it already in place. That's what lets a 0-day on an already-certified
 environment be answered with a policy change rather than a download. An empty

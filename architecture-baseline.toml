@@ -263,7 +263,6 @@ postgres = [
   "public_idempotency_records",
   "public_operation_events",
   "public_operations",
-  "runtime_environments",
   "runtime_upgrade_campaigns",
   "runtime_upgrade_items",
   "sandbox_archives",

@@ -675,6 +675,111 @@ fn current_readers_accept_observations_and_old_nodes_without_them() {
 }
 
 #[tokio::test]
+async fn published_known_environment_reaches_the_runtime_recipe_catalog() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let node_id = NodeId::new();
+    insert_ready_worker_node(&db.pool, node_id).await?;
+    let mut inventory = with_observation(NodeExecutionInventory::default());
+    let environments = inventory.environments.as_mut().unwrap();
+    let reference = environments.known[0]
+        .definition
+        .as_ref()
+        .unwrap()
+        .reference
+        .clone();
+    // On a fresh host, known compiled definitions are published before any
+    // bytes are installed. Installation must not depend on usable evidence.
+    environments.usable_environments.clear();
+    assert!(
+        pplx_space_runtime_environment_catalog_store::list_unretired(&db.pool)
+            .await?
+            .is_empty(),
+        "the disposable catalog must start empty"
+    );
+    commit_inventory(&db.pool, node_id, inventory).await?;
+    let catalog = pplx_space_runtime_environment_catalog_store::list_unretired(&db.pool).await?;
+    assert!(
+        catalog.iter().any(|entry| entry.to_string() == reference),
+        "a complete node publication must make its certified environment available \
+         to recipe construction; missing {reference}, observed {catalog:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn malformed_environment_publications_never_partially_write_the_catalog() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let node_id = NodeId::new();
+    insert_ready_worker_node(&db.pool, node_id).await?;
+    for change in 0..4 {
+        let mut inventory = with_observation(populated_inventory());
+        let observation = inventory.environments.as_mut().unwrap();
+        match change {
+            0 => observation.schema_version = 99,
+            1 => {
+                observation.known[0].definition.as_mut().unwrap().reference = "not-a-digest".into()
+            }
+            2 => observation.known[0].upgrade_edges = vec![format!("sha256:{}", "42".repeat(32))],
+            3 => {
+                observation.known[0].definition.as_mut().unwrap().reference =
+                    format!("sha256:{}", "42".repeat(32))
+            }
+            _ => unreachable!(),
+        }
+        let error = commit_inventory(&db.pool, node_id, inventory)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<Status>().map(Status::code),
+            Some(tonic::Code::InvalidArgument),
+            "case {change} must be rejected as malformed input"
+        );
+        assert!(projection_rows(&db.pool, node_id).await?.is_empty());
+        assert!(
+            pplx_space_runtime_environment_catalog_store::list_unretired(&db.pool)
+                .await?
+                .is_empty()
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn legacy_missing_and_unavailable_observations_never_erase_known_environments() -> TestResult
+{
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let node_id = NodeId::new();
+    insert_ready_worker_node(&db.pool, node_id).await?;
+    commit_inventory(&db.pool, node_id, with_observation(populated_inventory())).await?;
+    let known = pplx_space_runtime_environment_catalog_store::list_unretired(&db.pool).await?;
+    assert_eq!(known.len(), 1);
+    let legacy = installed();
+    let empty = complete(NodeExecutionInventory::default());
+    let unavailable = unavailable();
+    for (observation, inventory) in [
+        (None, Some(&legacy)),
+        (Some(&empty), None),
+        (Some(&unavailable), None),
+        (None, None),
+    ] {
+        let mut tx = db.pool.begin().await?;
+        publish_with_status(&mut tx, node_id, observation, inventory).await?;
+        tx.commit().await?;
+        assert_eq!(
+            pplx_space_runtime_environment_catalog_store::list_unretired(&db.pool).await?,
+            known
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn observations_leave_the_inventory_projection_unchanged() -> TestResult {
     let Some(db) = try_pg_test_db().await? else {
         return Ok(());

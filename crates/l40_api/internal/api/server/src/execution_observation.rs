@@ -122,7 +122,28 @@ pub(super) async fn publish(
         Report::Unavailable => (InventoryStatus::Unavailable, None),
     };
     if let Some(inventory) = inventory {
+        // Decode the complete graph before any catalog write. In particular,
+        // usable is not an install catalog and a malformed reference/edge must
+        // never become provisioning intent.
+        let environments =
+            pplx_space_execution_common::environment::EnvironmentObservation::from_inventory(
+                inventory,
+            )
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
         publish_inventory(tx, node_id, inventory).await?;
+        if let Some(environments) = environments {
+            for environment in environments.known() {
+                pplx_space_runtime_environment_catalog_store::register_known(
+                    &mut **tx,
+                    environment,
+                )
+                .await
+                .map_err(|error| {
+                    tracing::error!(%error, %node_id, "failed to register runtime environment");
+                    Status::internal("failed to register runtime environment")
+                })?;
+            }
+        }
     }
     let policy = inventory
         .and_then(|inventory| inventory.policy.as_ref())

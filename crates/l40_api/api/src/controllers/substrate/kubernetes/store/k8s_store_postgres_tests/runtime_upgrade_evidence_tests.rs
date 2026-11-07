@@ -303,6 +303,26 @@ async fn the_catalog_lists_unretired_environments_with_their_edges() -> TestResu
         .execute(&fixture.pool)
         .await?;
     }
+    // A runtime-neutral profile without Linux/snapshot metadata must not
+    // poison legacy attribution for unrelated environments.
+    for (byte, kernel, format, version) in [
+        (3, None, Some("snapshot"), Some("1")),
+        (4, Some("6.1"), None, None),
+        (5, None, None, None),
+    ] {
+        sqlx::query(sql!(
+            "INSERT INTO runtime_environments
+                 (environment_ref, runtime, runtime_version,
+                  kernel_version, state_format_name, state_format_version)
+             VALUES ($1, 'cloud-hypervisor', '49.0.0', $2, $3, $4)"
+        ))
+        .bind(format!("sha256:{}", format!("{byte:02x}").repeat(32)))
+        .bind(kernel)
+        .bind(format)
+        .bind(version)
+        .execute(&fixture.pool)
+        .await?;
+    }
     let catalog = fixture.store.unretired_runtime_environments().await?;
     let e0: pplx_space_common_core::types::EnvironmentReference = E0.parse().unwrap();
     let e1: pplx_space_common_core::types::EnvironmentReference = E1.parse().unwrap();

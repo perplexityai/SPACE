@@ -5,6 +5,7 @@
 use super::*;
 use crate::controllers::substrate::runtime_upgrade::{CatalogEnvironment, RecordedExecution};
 use pplx_space_common_core::types::{ArtifactComponentKind, EnvironmentReference, LocalArtifactId};
+use pplx_space_runtime_environment_catalog_store::ListLegacyUpgradeCandidatesError;
 
 /// An execution the control plane recorded, with the identity of what it
 /// records: the checkpoint's snapshot for a restore, the published execution
@@ -65,18 +66,6 @@ impl From<RecordedExecutionRow> for RecordedActivation {
             },
         }
     }
-}
-
-#[derive(sqlx::FromRow)]
-struct CatalogRow {
-    environment_ref: String,
-    runtime: String,
-    runtime_version: String,
-    kernel_version: String,
-    state_format_name: String,
-    state_format_version: String,
-    upgrade_edges: Vec<String>,
-    memory_edges: Vec<String>,
 }
 
 fn catalog_reference(value: &str) -> Result<EnvironmentReference, SubstrateError> {
@@ -154,19 +143,15 @@ impl K8sStore {
         Ok(row.map(Into::into))
     }
 
-    /// Every environment in the catalog that isn't retired, with its edges.
+    /// Unretired environments supported by the legacy attribution planner.
     pub(in crate::controllers::substrate::kubernetes) async fn unretired_runtime_environments(
         &self,
     ) -> Result<Vec<CatalogEnvironment>, SubstrateError> {
-        let rows: Vec<CatalogRow> = sqlx::query_as(sql!(
-            "SELECT environment_ref, runtime, runtime_version, kernel_version,
-                    state_format_name, state_format_version, upgrade_edges, memory_edges
-               FROM runtime_environments
-              WHERE retired_at IS NULL
-              ORDER BY environment_ref"
-        ))
-        .fetch_all(&self.pool)
+        let rows = pplx_space_runtime_environment_catalog_store::list_legacy_upgrade_candidates(
+            &self.pool,
+        )
         .await
+        .map_err(|ListLegacyUpgradeCandidatesError::Database(error)| error)
         .db_context("failed to read the runtime environment catalog")?;
         rows.into_iter()
             .map(|row| {

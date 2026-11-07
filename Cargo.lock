@@ -4865,6 +4865,7 @@ dependencies = [
  "pplx-space-placement",
  "pplx-space-public-api",
  "pplx-space-public-api-http",
+ "pplx-space-runtime-environment-catalog-store",
  "pplx-space-runtime-environment-policy-store",
  "pplx-space-sandbox-portability",
  "pplx-space-sandbox-store",
@@ -7010,6 +7011,7 @@ version = "0.8.1"
 dependencies = [
  "pplx-space-common-core",
  "pplx-space-db-test-fixtures",
+ "pplx-space-execution-common",
  "pplx-space-test-env",
  "sqlx",
  "thiserror 2.0.20",
