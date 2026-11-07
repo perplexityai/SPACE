@@ -39,8 +39,7 @@ pub async fn complete_wake(
 ) -> Result<bool, sqlx::Error> {
     let completed = sqlx::query_scalar::<_, bool>(sql!(
         "UPDATE sandboxes
-            SET lifecycle = 'started', placement = 'on_node',
-                restore_episode_target = NULL
+            SET lifecycle = 'started', placement = 'on_node'
           WHERE id = $1
             AND LOWER(TRIM(lifecycle)) NOT IN (
                 'failed',
@@ -82,8 +81,7 @@ fn fenced_completion_cas() -> String {
     let routable = routable_execution_or_non_k8s("sandboxes", "$2");
     format!(
         "UPDATE sandboxes
-            SET lifecycle = 'started', placement = 'on_node',
-                restore_episode_target = NULL
+            SET lifecycle = 'started', placement = 'on_node'
           WHERE id = $1
             AND lifecycle = 'restoring'
             AND (restore_lease_expires_at IS NULL OR restore_lease_expires_at <= NOW())

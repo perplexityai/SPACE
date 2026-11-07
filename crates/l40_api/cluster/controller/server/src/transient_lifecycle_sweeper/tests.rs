@@ -4043,36 +4043,6 @@ mod postgres_backed {
         Ok(())
     }
 
-    /// R23b: a `suspending` candidate carries a restore episode target as it
-    /// carries the marker; no sweep decision reads it there.
-    #[tokio::test(flavor = "current_thread")]
-    async fn r23b_a_candidate_reads_the_episode_target_as_the_marker() -> TestResult {
-        use super::super::lifecycle_writer_tests::{age, direct_sink};
-        use pplx_space_sandbox_store::test_support::restore_target::{
-            assert_episode_target_reads_as_marker, hold_restore_target,
-        };
-
-        let Some(db) = try_pg_test_db().await? else {
-            return Ok(());
-        };
-        let pool = &db.pool;
-        assert_episode_target_reads_as_marker(
-            "SubstrateSweepSink::list_aged_transient",
-            async |held| -> TestResult<_> {
-                let id = SandboxId::new();
-                insert_sandbox_with_lifecycle(pool, id, SandboxLifecycle::Suspending, 300).await?;
-                hold_restore_target(pool, id, held).await?;
-                Ok(direct_sink(pool)
-                    .list_aged_transient(SandboxLifecycle::Suspending, age())
-                    .await?
-                    .into_iter()
-                    .find(|candidate| candidate.sandbox_id == id)
-                    .map(|candidate| candidate.evacuation_restore_target))
-            },
-        )
-        .await
-    }
-
     /// R7: the `suspending` candidate select must not list an
     /// **evacuation-marked** row while its current suspend snapshot is still
     /// recoverable — either `state='creating'` (upload in flight) or

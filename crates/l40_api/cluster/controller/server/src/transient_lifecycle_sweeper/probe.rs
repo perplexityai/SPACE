@@ -35,9 +35,9 @@ pub struct SweepCandidate {
     pub lifecycle: SandboxLifecycle,
     /// How long the row has sat in `lifecycle` (from `lifecycle_changed_at`).
     pub age: Duration,
-    /// Node-drain's persisted wake target, or the restore episode target,
-    /// when set. Candidates carry it only via the `suspending` exemption path
-    /// — marked `restoring` rows are exempt from the sweep entirely.
+    /// Node-drain's persisted wake target, when set. Candidates carry it only
+    /// via the `suspending` exemption path — marked `restoring` rows are
+    /// exempt from the sweep entirely.
     pub evacuation_restore_target: Option<SandboxLifecycle>,
     /// Whether a `state='ready'` durable snapshot exists for the row, under
     /// per-lifecycle semantics (sandbox-store's

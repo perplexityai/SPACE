@@ -3,7 +3,7 @@
 //! abandoned restore, repairing a stale `failed` row, and the compensations
 //! that put a sweep's own write back. Also its aged-transient candidate
 //! select ([`list_aged_transient`]), which reads the node drain's
-//! [`EvacuationRestoreTarget`] marker and the restore episode target.
+//! [`EvacuationRestoreTarget`] marker.
 //!
 //! The sweeper keeps everything around them: its other candidate selects, the
 //! sandbox and execution row locks (`SELECT ... FOR UPDATE`), the
@@ -264,18 +264,12 @@ pub const fn is_activation_owned(lifecycle: SandboxLifecycle) -> bool {
 /// select) and [`fail_candidate_query`] (the per-row fail CAS), so
 /// a row can never be failed under a guard the select did not apply:
 ///
-/// 1. `((evacuation_restore_target IS NULL AND restore_episode_target IS NULL)
-///    OR lifecycle = 'suspending')` exempts node-drain's in-flight evacuation
-///    **restore** — a marked `restoring` row
+/// 1. `(evacuation_restore_target IS NULL OR lifecycle = 'suspending')` exempts
+///    node-drain's in-flight evacuation **restore** — a marked `restoring` row
 ///    legitimately polls the rebuilt pod for up to the evacuate-timeout (the
 ///    same order of magnitude as this sweep's default age) and has its own
 ///    re-drive path (`restore_pending_evacuations_query` + `restore_in_flight`),
-///    so the backstop must not race it. A `restoring` row with a
-///    `restore_episode_target` is exempt the same way: the drain restore
-///    operation re-drives one toward `started` or `paused`
-///    ([`crate::drain_restore`]), and this sweep's fail would drop the state
-///    it restores. Nothing re-drives a `stopped` one yet except a user's
-///    restore on Direct, whose claim ignores the target. The clear-trigger only keeps the marker
+///    so the backstop must not race it. The clear-trigger only keeps the marker
 ///    on `suspending`/`suspended`/`restoring`, and `suspended` isn't sweepable,
 ///    so `restoring` is the only lifecycle this exemption actually spares. A
 ///    marked `suspending` row is deliberately *not* spared by this clause —
@@ -321,9 +315,7 @@ pub fn evacuation_guards(
         String::new()
     };
     format!(
-        "AND ((sandboxes.evacuation_restore_target IS NULL
-                 AND sandboxes.restore_episode_target IS NULL)
-                OR sandboxes.lifecycle = 'suspending')
+        "AND (sandboxes.evacuation_restore_target IS NULL OR sandboxes.lifecycle = 'suspending')
             AND sandboxes.lifecycle_changed_at < NOW() - make_interval(secs => $3::BIGINT){recoverable_snapshot_guard}{ownership_guards}"
     )
 }
@@ -333,19 +325,8 @@ pub fn evacuation_guards(
 /// A suspend evacuation records the pre-evacuation lifecycle, `started` or
 /// `paused`, and a stopped resident's re-placement records `stopped`
 /// ([`crate::drain`]). These are the values the column's CHECK admits.
-///
-/// It is also the type of `sandboxes.restore_episode_target`, the landing
-/// lifecycle of a restore episode that isn't the default, whose CHECK admits
-/// the same three values. The drain restore operation's claim writes it
-/// ([`crate::drain_restore`]). Readers that ask
-/// whether a restore is the system's, or where it lands, read it as they read
-/// the marker, and the two are never both set. Unlike the marker, no trigger
-/// clears it. It belongs to one restore episode: only the claim that moves a
-/// row into `restoring` may set it, and every statement that ends the episode,
-/// a revert included, clears it in its own `SET`. A target left behind on
-/// another lifecycle would make the v1 drain's marker writes on that row fail
-/// the exclusive CHECK.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum EvacuationRestoreTarget {
     Started,
     Paused,
@@ -443,7 +424,7 @@ fn ready_snapshot_predicate(lifecycle: SandboxLifecycle) -> String {
 /// reports `episode_overdue` when those would have spared it.
 ///
 /// Carries everything classification needs: the row's actual age, the
-/// evacuation wake target and restore episode target, the per-lifecycle ready-snapshot fact
+/// evacuation wake target, the per-lifecycle ready-snapshot fact
 /// (`ready_snapshot_predicate` — both branches keep the artifact-identity
 /// guard for rows that carry `current_local_artifact_id`, so only an
 /// exact-artifact backup counts), and the node from the row's **active
@@ -486,7 +467,6 @@ pub fn list_aged_transient_query(lifecycle: SandboxLifecycle) -> String {
         "SELECT sandboxes.id,
                 EXTRACT(EPOCH FROM (NOW() - sandboxes.lifecycle_changed_at))::BIGINT AS age_secs,
                 sandboxes.evacuation_restore_target,
-                sandboxes.restore_episode_target,
                 ({ready_snapshot}) AS ready_snapshot,
                 sandboxes.preserve_local_artifact_on_restore_failure AS fork_restore,
                 e.k8s_node_name,
@@ -523,10 +503,6 @@ pub struct AgedTransientRow {
     /// neither the row nor the select, and the caller decides what it means.
     pub evacuation_restore_target:
         Option<Result<EvacuationRestoreTarget, EvacuationRestoreTargetParseError>>,
-    /// The row's `restore_episode_target`, decoded as the marker is. The
-    /// column's CHECKs admit the marker's values and never both at once.
-    pub restore_episode_target:
-        Option<Result<EvacuationRestoreTarget, EvacuationRestoreTargetParseError>>,
     pub ready_snapshot: bool,
     pub fork_restore: bool,
     pub k8s_node_name: Option<String>,
@@ -540,28 +516,14 @@ pub struct AgedTransientRow {
     pub route_activation_id: Option<SandboxActivationAttemptId>,
 }
 
-impl AgedTransientRow {
-    /// The restore's landing lifecycle: the marker's, or the restore episode
-    /// target's. The two are never both set.
-    pub fn restore_target(
-        &self,
-    ) -> Option<Result<EvacuationRestoreTarget, EvacuationRestoreTargetParseError>> {
-        self.evacuation_restore_target
-            .clone()
-            .or_else(|| self.restore_episode_target.clone())
-    }
-}
-
 impl<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> for AgedTransientRow {
     fn from_row(row: &'r sqlx::postgres::PgRow) -> Result<Self, sqlx::Error> {
         use sqlx::Row;
         let evacuation_restore_target: Option<String> = row.try_get("evacuation_restore_target")?;
-        let restore_episode_target: Option<String> = row.try_get("restore_episode_target")?;
         Ok(Self {
             id: row.try_get("id")?,
             age_secs: row.try_get("age_secs")?,
             evacuation_restore_target: evacuation_restore_target.map(|raw| raw.parse()),
-            restore_episode_target: restore_episode_target.map(|raw| raw.parse()),
             ready_snapshot: row.try_get("ready_snapshot")?,
             fork_restore: row.try_get("fork_restore")?,
             k8s_node_name: row.try_get("k8s_node_name")?,
@@ -760,8 +722,7 @@ pub fn fail_candidate_query(lifecycle: SandboxLifecycle, guard: FailGuard) -> St
     };
     format!(
         "UPDATE sandboxes
-            SET lifecycle = 'failed',
-                restore_episode_target = NULL
+            SET lifecycle = 'failed'
           WHERE managed_by = $1
             AND lifecycle = $2
             {guards}{routable_guard}
@@ -776,8 +737,8 @@ pub fn fail_candidate_query(lifecycle: SandboxLifecycle, guard: FailGuard) -> St
 /// between the select and this CAS.
 ///
 /// Writes an **inference**: the sweeper's age limit concluding that the
-/// transition is wedged, and clears `restore_episode_target`. It re-checks
-/// every guard the candidate select applied and the age window itself. For an activation-owned `lifecycle`
+/// transition is wedged. It re-checks every guard the candidate select applied
+/// and the age window itself. For an activation-owned `lifecycle`
 /// ([`is_activation_owned`]) the caller runs it in a transaction that already
 /// holds the sandbox row lock, so the owner guard sees any attempt claimed
 /// while it waited; for the others it runs on the pool.
@@ -857,8 +818,7 @@ pub async fn undo_fail_aged_candidate(
 /// quiet for the complete age threshold before convergence. The
 /// `sandboxes_clear_restore_lease` and
 /// `sandboxes_clear_evacuation_restore_target` triggers clear the lease and
-/// marker on the resulting transition out of `restoring`, and the statement
-/// clears `restore_episode_target` itself.
+/// marker on the resulting transition out of `restoring`.
 ///
 /// The routability predicate is re-checked **inside** the CAS, not only in
 /// the act phase, because the act-phase proof (candidate-select fact or
@@ -882,8 +842,7 @@ pub fn converge_restoring_query() -> String {
     let owner_guard = activation_owner_guard("$2");
     format!(
         "UPDATE sandboxes
-        SET lifecycle = $4,
-            restore_episode_target = NULL
+        SET lifecycle = $4
       WHERE managed_by = $1
         AND lifecycle = 'restoring'
         AND lifecycle_changed_at < NOW() - make_interval(secs => $2::BIGINT)
@@ -949,7 +908,7 @@ pub async fn converge_restoring(
 ///   suspended restore selects.
 ///
 /// It also clears `placement_changed_at` (see the sweeper's
-/// `SweepSink::revert_to_suspended`) and `restore_episode_target`, and repeats the select's
+/// `SweepSink::revert_to_suspended`), and repeats the select's
 /// [`activation_owner_guard`], for the same reason as
 /// [`converge_restoring_query`]: a row whose restore lease was cleared may
 /// still have a live wake's activation attempt. An overdue episode
@@ -962,8 +921,7 @@ pub fn revert_to_suspended_query() -> String {
     format!(
         "UPDATE sandboxes
             SET lifecycle = 'suspended',
-                placement_changed_at = NULL,
-                restore_episode_target = NULL
+                placement_changed_at = NULL
           WHERE managed_by = $1
             AND lifecycle = $2
             AND lifecycle = 'restoring'
@@ -975,8 +933,7 @@ pub fn revert_to_suspended_query() -> String {
 }
 
 /// [`revert_to_suspended_query`] with abandoned-restore retirement disabled:
-/// the same guards, moving only the lifecycle (and clearing
-/// `restore_episode_target`). The execution, placement and
+/// the same guards, moving only the lifecycle. The execution, placement and
 /// placement clock stay, and the cleanup that follows retires the execution
 /// under the candidate's fence, refusing a pod that came up since.
 fn revert_to_suspended_lifecycle_only_query() -> String {
@@ -984,8 +941,7 @@ fn revert_to_suspended_lifecycle_only_query() -> String {
     let ownership_guards = restoring_ownership_guards("$3", Some(REVERT_EPISODE_DEADLINE));
     format!(
         "UPDATE sandboxes
-            SET lifecycle = 'suspended',
-                restore_episode_target = NULL
+            SET lifecycle = 'suspended'
           WHERE managed_by = $1
             AND lifecycle = $2
             AND lifecycle = 'restoring'
@@ -1166,8 +1122,7 @@ pub async fn undo_revert_to_suspended(
 /// * no in-flight suspend upload (`inflight_suspend_upload_exists`) — the
 ///   race guard `mark_sandbox_lost` uses: a `creating` snapshot may finalize
 ///   `ready` moments later and make the row restorable;
-/// * evacuation-markerless, with no restore episode target — node-drain
-///   re-drives marked rows, and an episode with a target is the system's too.
+/// * evacuation-markerless — node-drain re-drives marked rows.
 ///
 /// **Age clock: `placement_changed_at`, never `lifecycle_changed_at`.** Legacy
 /// retries may already have reset `lifecycle_changed_at`, while
@@ -1200,7 +1155,6 @@ pub fn unrestorable_restoring_guards() -> String {
     format!(
         "AND sandboxes.lifecycle = 'restoring'
             AND sandboxes.evacuation_restore_target IS NULL
-            AND sandboxes.restore_episode_target IS NULL
             AND sandboxes.active_node_id IS NULL
             AND sandboxes.target_node_id IS NULL
             AND NOT EXISTS (

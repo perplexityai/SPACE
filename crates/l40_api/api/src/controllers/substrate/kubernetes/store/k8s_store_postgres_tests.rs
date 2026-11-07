@@ -19,7 +19,6 @@ mod lifecycle_writer_tests;
 mod materialization_record_tests;
 mod node_registration_tests;
 mod owned_restore_completion_tests;
-mod restore_episode_target_tests;
 mod restore_revert_tests;
 mod runtime_upgrade_evidence_tests;
 mod started_recovery_observation_tests;

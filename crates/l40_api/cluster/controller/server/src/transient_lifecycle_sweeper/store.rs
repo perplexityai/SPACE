@@ -595,13 +595,10 @@ impl SweepSink for SubstrateSweepSink {
     /// when `lifecycle` changes, regardless of which SQL call site issued
     /// the UPDATE.
     ///
-    /// `restoring` rows with a non-NULL `evacuation_restore_target` or
-    /// `restore_episode_target` are exempt. Node-drain's restore sweep owns
-    /// re-driving rows with the marker, which legitimately run for the
-    /// evacuate-timeout window; the drain restore operation re-drives a row
-    /// with a `started` or `paused` restore episode target, and nothing
-    /// re-drives a `stopped` one yet except a user's restore on Direct, whose
-    /// claim ignores the target. A marked `suspending` row is exempt only while its current
+    /// Evacuation-marked `restoring` rows (a non-NULL
+    /// `evacuation_restore_target`) are exempt — node-drain's restore sweep
+    /// owns re-driving them and they legitimately run for the evacuate-timeout
+    /// window. A marked `suspending` row is exempt only while its current
     /// suspend snapshot is still recoverable (`creating` or `ready`); once
     /// that snapshot terminalizes `failed` (or never existed) the backstop
     /// lists it, because nothing else recovers a crashed/hung suspend with no
@@ -645,22 +642,23 @@ impl SweepSink for SubstrateSweepSink {
             .into_iter()
             .map(|row| {
                 let evacuation_restore_target =
-                    row.restore_target().and_then(|parsed| match parsed {
-                        Ok(target) => Some(target.lifecycle()),
-                        Err(err) => {
-                            // Both columns' CHECKs pin values to
-                            // 'started'/'paused'/'stopped'; reaching this
-                            // means schema/enum drift. Treat as unset (the
-                            // converge target then defaults to started).
-                            tracing::warn!(
-                                sandbox_id = %row.id,
-                                error = %err,
-                                "transient_lifecycle_sweeper: unparseable \
-                                 restore target; treating as unset"
-                            );
-                            None
-                        }
-                    });
+                    row.evacuation_restore_target
+                        .and_then(|parsed| match parsed {
+                            Ok(target) => Some(target.lifecycle()),
+                            Err(err) => {
+                                // The column CHECK pins values to
+                                // 'started'/'paused'/'stopped'; reaching this
+                                // means schema/enum drift. Treat as unset (the
+                                // converge target then defaults to started).
+                                tracing::warn!(
+                                    sandbox_id = %row.id,
+                                    error = %err,
+                                    "transient_lifecycle_sweeper: unparseable \
+                                     evacuation_restore_target; treating as unset"
+                                );
+                                None
+                            }
+                        });
                 let activation_attempt_held = row.activation_attempt_id.is_some();
                 let pod_fence = candidate_pod_fence_with_observation(
                     row.id,

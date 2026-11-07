@@ -21,8 +21,6 @@ use pplx_space_common_core::types::{SandboxId, SandboxLifecycle, SubstrateKind};
 
 use pplx_space_common_core::sql;
 use pplx_space_sandbox_routability::routable_execution_or_non_k8s;
-
-use crate::sweeper::{EvacuationRestoreTarget, EvacuationRestoreTargetParseError};
 use sqlx::{PgExecutor, Postgres, Transaction};
 use uuid::Uuid;
 
@@ -109,10 +107,10 @@ pub async fn claim_evacuation_restore(
 /// In both cases the row must hold no live restore lease, and no active
 /// execution in `creating`/`created`/`recovering`/`running` may have been
 /// updated within `execution_ownership_ttl_secs`. A `restoring` row that
-/// still carries the `evacuation_restore_target` marker, or a
-/// `restore_episode_target`, is a system restore in flight and matches
-/// nothing. The claim clears both, so on a marked `suspended` row it is a user
-/// takeover: the drain's marker-required claim then loses.
+/// still carries the `evacuation_restore_target` marker is a drain restore in
+/// flight and matches nothing. The claim clears that marker, so on a marked
+/// `suspended` row it is a user takeover: the drain's marker-required claim
+/// then loses.
 ///
 /// The claim preserves `lifecycle_changed_at` across
 /// `restoring -> restoring` re-drives: restore selection uses it as the
@@ -144,7 +142,6 @@ pub async fn claim_user_restore(
                           OR (
                             LOWER(TRIM(lifecycle)) = 'restoring'
                             AND evacuation_restore_target IS NULL
-                            AND restore_episode_target IS NULL
                             AND (
                               restore_lease_expires_at IS NULL
                               OR restore_lease_expires_at <= NOW()
@@ -170,7 +167,6 @@ pub async fn claim_user_restore(
                      UPDATE sandboxes s
                         SET lifecycle = 'restoring',
                             evacuation_restore_target = NULL,
-                            restore_episode_target = NULL,
                             restore_lease_expires_at = NOW() + ($2::bigint * INTERVAL '1 second'),
                             restore_lease_token = $3
                        FROM candidate c
@@ -192,8 +188,7 @@ pub async fn claim_user_restore(
 /// lifecycle, so a retry may re-drive it. Writes an **operation step** (the
 /// lease claim). Returns the claimed row, or `None` when the row isn't a
 /// markerless `restoring` row, its lease is still live, or an active
-/// execution did work within `execution_ownership_ttl_secs`. A row with a
-/// `restore_episode_target` counts as marked.
+/// execution did work within `execution_ownership_ttl_secs`.
 pub async fn claim_markerless_restoring_lease(
     executor: impl PgExecutor<'_>,
     sandbox_id: SandboxId,
@@ -208,7 +203,6 @@ pub async fn claim_markerless_restoring_lease(
                   WHERE id = $1
                     AND LOWER(TRIM(lifecycle)) = 'restoring'
                     AND evacuation_restore_target IS NULL
-                    AND restore_episode_target IS NULL
                     AND (
                       restore_lease_expires_at IS NULL
                       OR restore_lease_expires_at <= NOW()
@@ -249,8 +243,7 @@ pub async fn claim_markerless_restoring_lease(
 /// active execution behind it, or a `managed_by` other than Kubernetes
 /// ([`routable_execution_or_non_k8s`]).
 /// A row a rollback, the sweeper, a suspend or a delete has moved on matches
-/// nothing. It ends the restore episode, so it clears
-/// `restore_episode_target`.
+/// nothing.
 pub async fn complete_owned_user_restore(
     executor: impl PgExecutor<'_>,
     sandbox_id: SandboxId,
@@ -259,8 +252,7 @@ pub async fn complete_owned_user_restore(
     let routable = routable_execution_or_non_k8s("sandboxes", "$3");
     let query = format!(
         "UPDATE sandboxes
-                SET lifecycle = 'started', placement = 'on_node',
-                    restore_episode_target = NULL
+                SET lifecycle = 'started', placement = 'on_node'
               WHERE id = $1
                 AND lifecycle = 'restoring'
                 AND restore_lease_token = $2
@@ -303,8 +295,7 @@ pub async fn release_user_restore_lease(
 /// Revert an abandoned restore claim to `suspended` whose execution the
 /// caller retired in this transaction: unplace the row and clear
 /// `placement_changed_at`. Writes an **operation step** (the claim's
-/// compensation). It ends the restore episode, so it clears
-/// `restore_episode_target`.
+/// compensation).
 ///
 /// No lifecycle or lease predicate of its own; it relies on the caller's row
 /// lock, taken on `restoring` (and, when the claim wrote a lease token, on
@@ -318,8 +309,7 @@ pub async fn revert_restore_claim_retiring_placement(
                         SET lifecycle = 'suspended',
                             placement = 'unplaced',
                             active_node_id = NULL,
-                            placement_changed_at = NULL,
-                            restore_episode_target = NULL
+                            placement_changed_at = NULL
                       WHERE id = $1"
     ))
     .bind(sandbox_id)
@@ -342,8 +332,7 @@ pub async fn revert_restore_claim_clearing_placement_clock(
     sqlx::query(sql!(
         "UPDATE sandboxes
                         SET lifecycle = 'suspended',
-                            placement_changed_at = NULL,
-                            restore_episode_target = NULL
+                            placement_changed_at = NULL
                       WHERE id = $1"
     ))
     .bind(sandbox_id)
@@ -363,10 +352,7 @@ pub async fn revert_restore_claim_lifecycle(
     sandbox_id: SandboxId,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(sql!(
-        "UPDATE sandboxes
-            SET lifecycle = 'suspended',
-                restore_episode_target = NULL
-          WHERE id = $1"
+        "UPDATE sandboxes SET lifecycle = 'suspended' WHERE id = $1"
     ))
     .bind(sandbox_id)
     .execute(&mut **tx)
@@ -374,18 +360,13 @@ pub async fn revert_restore_claim_lifecycle(
     Ok(())
 }
 
-/// What [`restore_ownership_snapshot`] reads of one row: its lifecycle,
-/// evacuation marker and restore episode target, and the seconds left on its
-/// restore lease and on its active execution's ownership window, each floored
-/// at zero.
+/// What [`restore_ownership_snapshot`] reads of one row: its lifecycle and
+/// evacuation marker, and the seconds left on its restore lease and on its
+/// active execution's ownership window, each floored at zero.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RestoreOwnershipSnapshot {
     pub lifecycle: String,
     pub evacuation_restore_target: Option<String>,
-    /// `None` when the row carries none; an `Err` is a stored value that
-    /// doesn't parse, which the column's CHECK rules out.
-    pub restore_episode_target:
-        Option<Result<EvacuationRestoreTarget, EvacuationRestoreTargetParseError>>,
     pub lease_remaining_secs: f64,
     pub execution_remaining_secs: f64,
 }
@@ -402,11 +383,9 @@ pub async fn restore_ownership_snapshot(
     sandbox_id: SandboxId,
     execution_ownership_ttl_secs: i64,
 ) -> Result<Option<RestoreOwnershipSnapshot>, sqlx::Error> {
-    type Row = (String, Option<String>, Option<String>, f64, f64);
-    let row: Option<Row> = sqlx::query_as(sql!(
+    let row: Option<(String, Option<String>, f64, f64)> = sqlx::query_as(sql!(
         "SELECT lifecycle,
                     evacuation_restore_target,
-                    restore_episode_target,
                     GREATEST(
                         EXTRACT(EPOCH FROM (restore_lease_expires_at - NOW())),
                         0.0
@@ -431,17 +410,10 @@ pub async fn restore_ownership_snapshot(
     .fetch_optional(executor)
     .await?;
     Ok(row.map(
-        |(
-            lifecycle,
-            evacuation_restore_target,
-            restore_episode_target,
-            lease_remaining_secs,
-            execution_remaining_secs,
-        )| {
+        |(lifecycle, evacuation_restore_target, lease_remaining_secs, execution_remaining_secs)| {
             RestoreOwnershipSnapshot {
                 lifecycle,
                 evacuation_restore_target,
-                restore_episode_target: restore_episode_target.map(|raw| raw.parse()),
                 lease_remaining_secs,
                 execution_remaining_secs,
             }
@@ -458,8 +430,6 @@ pub struct UserRestoreObservationRow {
     pub sandbox_id: SandboxId,
     pub lifecycle: String,
     pub evacuation_restore_target: Option<String>,
-    pub restore_episode_target:
-        Option<Result<EvacuationRestoreTarget, EvacuationRestoreTargetParseError>>,
     pub lease_remaining_secs: f64,
     pub execution_remaining_secs: f64,
     pub generation: Option<i64>,
@@ -469,8 +439,8 @@ pub struct UserRestoreObservationRow {
 }
 
 /// Read the restore gate and active execution of every row in `sandbox_ids`,
-/// in one statement, so each row's lifecycle, lease, marker, restore episode
-/// target and execution are read together. Rows that don't exist are missing from the result.
+/// in one statement, so each row's lifecycle, lease, marker and execution
+/// are read together. Rows that don't exist are missing from the result.
 ///
 /// The remainders are as [`restore_ownership_snapshot`] computes them. A
 /// plain read: it takes no lock.
@@ -483,7 +453,6 @@ pub async fn observe_user_restores(
         Uuid,
         String,
         Option<String>,
-        Option<String>,
         f64,
         f64,
         Option<i64>,
@@ -495,7 +464,6 @@ pub async fn observe_user_restores(
         "SELECT s.id,
                     s.lifecycle,
                     s.evacuation_restore_target,
-                    s.restore_episode_target,
                     GREATEST(EXTRACT(EPOCH FROM (s.restore_lease_expires_at - NOW())), 0.0)::float8,
                     GREATEST(
                         CASE
@@ -532,7 +500,6 @@ pub async fn observe_user_restores(
                 sandbox_id,
                 lifecycle,
                 evacuation_restore_target,
-                restore_episode_target,
                 lease_remaining_secs,
                 execution_remaining_secs,
                 generation,
@@ -543,7 +510,6 @@ pub async fn observe_user_restores(
                 sandbox_id: SandboxId::from_uuid(sandbox_id),
                 lifecycle,
                 evacuation_restore_target,
-                restore_episode_target: restore_episode_target.map(|raw| raw.parse()),
                 lease_remaining_secs,
                 execution_remaining_secs,
                 generation,

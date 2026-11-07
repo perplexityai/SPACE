@@ -81,8 +81,7 @@ pub async fn mark_published_quarantined(
 ) -> Result<Vec<SandboxId>, sqlx::Error> {
     sqlx::query_scalar::<_, SandboxId>(sql!(
         "UPDATE sandboxes s
-                 SET lifecycle = 'quarantined',
-                     restore_episode_target = NULL
+                 SET lifecycle = 'quarantined'
                  FROM jsonb_to_recordset($1::jsonb) AS input(
                      sandbox_id UUID,
                      from_lifecycle TEXT
@@ -138,8 +137,7 @@ pub async fn mark_published_failed(
              FOR NO KEY UPDATE OF s
          )
          UPDATE sandboxes s
-         SET lifecycle = 'failed',
-             restore_episode_target = NULL
+         SET lifecycle = 'failed'
          FROM claimed
          WHERE s.id = claimed.id
          RETURNING s.id, claimed.lifecycle"
@@ -327,7 +325,6 @@ pub async fn finalize_suspended(
                     placement = 'unplaced',
                     active_node_id = NULL,
                     command_ready_pending = FALSE,
-                    restore_episode_target = NULL,
                     target_node_id = COALESCE(s.target_node_id, s.active_node_id),
                     current_local_artifact_id = CASE
              WHEN candidate.published_artifact_id IS NOT NULL THEN candidate.published_artifact_id
@@ -371,8 +368,7 @@ pub async fn finalize_suspended(
 /// The write re-checks that the row is on `node_id` and still `restoring`, and
 /// leaves alone a row whose publication carries an activation-completed
 /// receipt (the receipt path owns it), a row marked for the node-drain
-/// redrive (`evacuation_restore_target`) or carrying a
-/// `restore_episode_target`, and a Kubernetes row with no
+/// redrive (`evacuation_restore_target`), and a Kubernetes row with no
 /// routable execution
 /// ([`pplx_space_sandbox_routability::routable_execution_or_non_k8s`]), which
 /// stays `restoring` so the next connect can hydrate the in-flight pod.
@@ -406,7 +402,6 @@ pub async fn converge_published_restoring_to_started(
          WHERE s.id = input.sandbox_id
            AND s.active_node_id = $1
            AND s.evacuation_restore_target IS NULL
-           AND s.restore_episode_target IS NULL
            AND input.published_lifecycle = 'started'
            AND input.transition_receipt_kind IS DISTINCT FROM $3
            AND LOWER(TRIM(s.lifecycle)) = 'restoring'
@@ -537,8 +532,7 @@ pub async fn advance_published_activity(
 /// [`converge_published_restoring_to_started`], which exempts every row marked
 /// for the node-drain redrive (`evacuation_restore_target`), it exempts only a
 /// `restoring` row marked for a stopped re-placement, the drain's restore in
-/// flight, or whose `restore_episode_target` is `stopped`; the statement's
-/// comment says why. It clears `restore_episode_target` on the rows it moves.
+/// flight; the statement's comment says why.
 pub async fn converge_published_stopped(
     executor: impl sqlx::PgExecutor<'_>,
     node_id: NodeId,
@@ -553,8 +547,7 @@ pub async fn converge_published_stopped(
              )
          )
          UPDATE sandboxes s
-         SET lifecycle = 'stopped',
-             restore_episode_target = NULL
+         SET lifecycle = 'stopped'
          FROM input
          WHERE s.id = input.sandbox_id
            AND s.active_node_id = $1
@@ -578,8 +571,7 @@ pub async fn converge_published_stopped(
            -- ended in a stopped VM, which the drain's re-drive can't recover.
            AND NOT (
                LOWER(TRIM(s.lifecycle)) = 'restoring'
-               AND (s.evacuation_restore_target IS NOT DISTINCT FROM 'stopped'
-                    OR s.restore_episode_target IS NOT DISTINCT FROM 'stopped')
+               AND s.evacuation_restore_target IS NOT DISTINCT FROM 'stopped'
            )
          RETURNING s.id"
     ))
@@ -647,7 +639,6 @@ pub async fn release_completed_activations(
          )
          UPDATE sandboxes sandbox
             SET lifecycle = released.transition_receipt_target_state,
-                restore_episode_target = NULL,
                 placement = CASE
                     WHEN released.transition_receipt_target_state IN ('started', 'paused')
                     THEN 'on_node'
@@ -819,8 +810,7 @@ static PRUNE_ABSENT_NODE_SANDBOXES_QUERY: LazyLock<String> = LazyLock::new(|| {
                  updated_at = NOW(),
                  command_ready_pending = FALSE,
                  restore_lease_expires_at = NULL,
-                 restore_lease_token = NULL,
-                 restore_episode_target = NULL
+                 restore_lease_token = NULL
              WHERE s.active_node_id = $1
                AND s.managed_by = $4
                AND s.lifecycle NOT IN ('deleted', 'deleting')

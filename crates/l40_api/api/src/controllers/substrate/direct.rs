@@ -3383,10 +3383,6 @@ impl DirectSubstrate {
                     lifecycle = CASE
                         WHEN $5 AND route.execution_generation = $4 THEN 'started'
                         ELSE s.lifecycle
-                    END,
-                    restore_episode_target = CASE
-                        WHEN $5 AND route.execution_generation = $4 THEN NULL
-                        ELSE s.restore_episode_target
                     END
                FROM sandbox_direct_route_identities route,
                     sandbox_direct_route_provenance provenance

@@ -97,6 +97,7 @@ pub async fn claim_evacuation_suspend(
                  WHERE n.id = $3
                    AND n.drain_phase = $4
                    AND n.drain_mode = $5
+                   AND n.drain_engine IS NULL
             )"
     ))
     .bind(sandbox_id)
@@ -373,6 +374,7 @@ pub async fn claim_stopped_evacuation(
                  WHERE n.id = $2
                    AND n.drain_phase = $3
                    AND n.drain_mode = $4
+                   AND n.drain_engine IS NULL
             )
       RETURNING prior.evacuation_restore_target IS NULL"
     );
@@ -496,6 +498,7 @@ pub async fn record_stopped_evacuation_artifact(
                  WHERE n.id = $2
                    AND n.drain_phase = $8
                    AND n.drain_mode = $9
+                   AND n.drain_engine IS NULL
             )"
     ))
     .bind(sandbox_id)
@@ -571,7 +574,7 @@ pub async fn commit_evacuation_suspend(
 }
 
 /// Finish an evacuation restore: lifecycle to `target_lifecycle`, placement to
-/// `on_node`, and the evacuation marker and restore episode target cleared, so the sandbox stops blocking
+/// `on_node`, and the evacuation marker cleared, so the sandbox stops blocking
 /// the source node's drain and leaves the restore-pending scan. Returns
 /// whether the row moved; `false` means something moved it out of
 /// `restoring` after the restore returned.
@@ -587,8 +590,7 @@ pub async fn finalize_evacuation_restore(
         "UPDATE sandboxes
                 SET lifecycle = $2,
                     placement = 'on_node',
-                    evacuation_restore_target = NULL,
-                    restore_episode_target = NULL
+                    evacuation_restore_target = NULL
               WHERE id = $1 AND lifecycle = 'restoring'"
     ))
     .bind(sandbox_id)
@@ -722,8 +724,7 @@ pub fn mark_sandbox_lost_query() -> String {
     let inflight_upload = inflight_suspend_upload_exists("sandboxes");
     format!(
         "UPDATE sandboxes
-            SET lifecycle = 'failed',
-                restore_episode_target = NULL
+            SET lifecycle = 'failed'
           WHERE id = $1
             AND lifecycle = 'suspended'
             AND target_node_id = $2
@@ -783,8 +784,7 @@ pub fn mark_sandbox_lost_on_gone_node_query() -> String {
     let identity_guards = gone_node_identity_guards("$2", "$3");
     format!(
         "UPDATE sandboxes
-            SET lifecycle = 'failed',
-                restore_episode_target = NULL
+            SET lifecycle = 'failed'
           WHERE id = $1
             AND lifecycle = 'suspended'
             AND target_node_id = $2
@@ -968,8 +968,7 @@ pub fn mark_sandbox_failed_on_node_query() -> &'static str {
      )
      UPDATE sandboxes s
         SET lifecycle = 'failed',
-            evacuation_restore_target = NULL,
-            restore_episode_target = NULL
+            evacuation_restore_target = NULL
        FROM claimed c
       WHERE s.id = c.id
       RETURNING c.lifecycle"
@@ -1125,11 +1124,10 @@ pub async fn adopt_remote_snapshot_for_drain(
 /// so an `active_node_id`-only match would leave it inflating `blocking_count`
 /// and wedge the drain despite the age-out policy.
 ///
-/// `((evacuation_restore_target IS NULL AND restore_episode_target IS NULL)
-/// OR lifecycle = 'suspending')` mirrors the cluster-wide transient sweeper:
-/// the drain's own evacuation **restore** (a marked `restoring` row, re-driven
-/// by the cluster-wide restore sweep), and a restore episode with a target,
-/// are exempt, but a marked `suspending` row is generally not — nothing else
+/// `(evacuation_restore_target IS NULL OR lifecycle = 'suspending')` mirrors
+/// the cluster-wide transient sweeper: the drain's own evacuation **restore**
+/// (a marked `restoring` row, re-driven by the cluster-wide restore sweep) is
+/// exempt, but a marked `suspending` row is generally not — nothing else
 /// recovers a crashed/hung evacuation suspend, so leaving it exempt would let it
 /// block the drain forever (`suspending` always counts toward `blocking_count`,
 /// unlike a marked `restoring`).
@@ -1165,8 +1163,7 @@ pub fn abandon_stale_resident_sandboxes_query() -> String {
            FROM sandboxes
           WHERE (active_node_id = $1 OR target_node_id = $1)
             AND lifecycle = ANY($3)
-            AND ((evacuation_restore_target IS NULL AND restore_episode_target IS NULL)
-                 OR lifecycle = 'suspending')
+            AND (evacuation_restore_target IS NULL OR lifecycle = 'suspending')
             AND NOT (
                 lifecycle = 'suspending'
                 AND evacuation_restore_target IS NOT NULL
@@ -1181,8 +1178,7 @@ pub fn abandon_stale_resident_sandboxes_query() -> String {
           FOR UPDATE SKIP LOCKED
      )
      UPDATE sandboxes s
-        SET lifecycle = 'failed',
-            restore_episode_target = NULL
+        SET lifecycle = 'failed'
        FROM claimed c
       WHERE s.id = c.id
       RETURNING s.id, c.lifecycle"
@@ -1230,11 +1226,7 @@ pub async fn abandon_stale_resident_sandboxes(
 ///   reads from the durable S3 snapshot; the cluster-wide restore sweep
 ///   re-drives it onto a healthy cohort node (its crash-recovery arm selects
 ///   `restoring` + marker rows), so failing it would lose a recoverable
-///   sandbox. A `restoring` row with a `restore_episode_target` is spared
-///   too: the drain restore operation re-drives one toward `started` or
-///   `paused` ([`crate::drain_restore`]), and nothing re-drives a `stopped`
-///   one yet except a user's restore on Direct, whose claim ignores the
-///   target.
+///   sandbox.
 /// - A **marked `suspending`** row whose current cycle still has recoverable
 ///   evidence ([`recoverable_suspend_snapshot_exists`]) is spared. Within
 ///   this sweep's `active_node_id = $1` scope only the legacy
@@ -1283,8 +1275,7 @@ pub fn fail_resident_sandboxes_on_gone_node_query() -> String {
            FROM sandboxes
           WHERE active_node_id = $1
             AND lifecycle = ANY($2)
-            AND ((evacuation_restore_target IS NULL AND restore_episode_target IS NULL)
-                 OR lifecycle = 'suspending')
+            AND (evacuation_restore_target IS NULL OR lifecycle = 'suspending')
             AND NOT (
                 lifecycle = 'suspending'
                 AND evacuation_restore_target IS NOT NULL
@@ -1304,8 +1295,7 @@ pub fn fail_resident_sandboxes_on_gone_node_query() -> String {
      )
      UPDATE sandboxes s
         SET lifecycle = 'failed',
-            evacuation_restore_target = NULL,
-            restore_episode_target = NULL
+            evacuation_restore_target = NULL
        FROM claimed c
       WHERE s.id = c.id
       RETURNING s.id, c.lifecycle"

@@ -99,10 +99,6 @@ pub async fn release_restore_lease<'e>(
     let released = sqlx::query(sql!(
         "UPDATE sandboxes
                 SET lifecycle = CASE WHEN $3 THEN lifecycle ELSE 'suspended' END,
-                    restore_episode_target = CASE
-                        WHEN $3 THEN restore_episode_target
-                        ELSE NULL
-                    END,
                     restore_lease_expires_at = CASE
                         WHEN $3 THEN restore_lease_expires_at
                         ELSE NULL
@@ -163,8 +159,7 @@ pub async fn complete_restore_lease<'e>(
     let completed = sqlx::query(sql!(
         "UPDATE sandboxes
                 SET lifecycle = 'started',
-                    placement = 'on_node',
-                    restore_episode_target = NULL
+                    placement = 'on_node'
               WHERE id = $1
                 AND restore_lease_token = $2"
     ))

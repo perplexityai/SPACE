@@ -78,12 +78,11 @@ pub async fn unplace_after_pod_teardown_preserving_placement_clock(
 /// Writes an **inference** (the control plane concluding the restore is
 /// abandoned).
 ///
-/// Guarded on `restoring`, no evacuation marker or restore episode target, no
-/// active execution, and [`restore_retry_suspended_revert_snapshot_exists`].
-/// The caller holds the sandbox row lock, which execution creation also
-/// takes, so no successor execution can appear between this proof and commit.
-/// Callers retire the execution, or confirm that none is active, earlier in
-/// this transaction.
+/// Guarded on `restoring`, no evacuation marker, no active execution, and
+/// [`restore_retry_suspended_revert_snapshot_exists`]. The caller holds the
+/// sandbox row lock, which execution creation also takes, so no successor
+/// execution can appear between this proof and commit. Callers retire the
+/// execution, or confirm that none is active, earlier in this transaction.
 pub async fn recover_markerless_restoring_after_execution_cleanup(
     tx: &mut Transaction<'_, Postgres>,
     sandbox_id: SandboxId,
@@ -105,7 +104,6 @@ pub async fn recover_markerless_restoring_after_execution_cleanup(
               WHERE s.id = $1
                 AND s.lifecycle = 'restoring'
                 AND s.evacuation_restore_target IS NULL
-                AND s.restore_episode_target IS NULL
                 AND NOT EXISTS (
                     SELECT 1
                       FROM sandbox_k8s_executions e
@@ -290,13 +288,11 @@ async fn recover_started_with_current_suspend_snapshot(
 /// It refuses when any of these holds:
 ///
 /// * an active execution that doesn't predate the row's current stop: the row
-///   is no longer `stopped` (or, for the drain's v2, `restoring` in a
-///   `stopped` restore episode, which its claim opened from `stopped`), or the
-///   execution was created after its `lifecycle_changed_at`;
+///   is no longer `stopped`, or the execution was created after its
+///   `lifecycle_changed_at`;
 /// * an active execution holding an activation attempt that hasn't expired,
 ///   or that has no expiry;
-/// * no row carries the `'stopped'` evacuation marker or a `stopped` restore
-///   episode. A start moves the
+/// * no row carries the `'stopped'` evacuation marker. A start moves the
 ///   lifecycle, and `sandboxes_clear_evacuation_restore_target` clears the
 ///   marker on any lifecycle change to a value other than `suspending`,
 ///   `suspended` or `restoring`, so a start→stop cycle since the drain's last
@@ -316,13 +312,7 @@ pub async fn stopped_execution_retirement_refused(
                          WHERE execution.sandbox_id = $1
                            AND execution.active
                            AND NOT (
-                               (
-                                   sandbox.lifecycle = 'stopped'
-                                   OR (
-                                       sandbox.lifecycle = 'restoring'
-                                       AND sandbox.restore_episode_target = 'stopped'
-                                   )
-                               )
+                               sandbox.lifecycle = 'stopped'
                                AND execution.created_at <= sandbox.lifecycle_changed_at
                            )
                     )
@@ -338,13 +328,7 @@ pub async fn stopped_execution_retirement_refused(
                         SELECT 1
                           FROM sandboxes
                          WHERE id = $1
-                           AND (
-                               evacuation_restore_target = 'stopped'
-                               OR (
-                                   lifecycle = 'restoring'
-                                   AND restore_episode_target = 'stopped'
-                               )
-                           )
+                           AND evacuation_restore_target = 'stopped'
                     )"
     ))
     .bind(sandbox_id)

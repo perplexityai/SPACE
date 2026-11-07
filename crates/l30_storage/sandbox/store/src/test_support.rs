@@ -197,7 +197,5 @@ pub fn known_defects<W, const N: usize>(matrix: &[(&str, [(W, Expect); N])]) -> 
         .count()
 }
 
-pub mod restore_target;
-
 #[cfg(test)]
 mod tests;

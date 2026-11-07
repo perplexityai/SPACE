@@ -36,8 +36,7 @@ pub async fn mark_deleting(
 ) -> Result<(), sqlx::Error> {
     sqlx::query(sql!(
         "UPDATE sandboxes
-         SET lifecycle = 'deleting',
-             restore_episode_target = NULL
+         SET lifecycle = 'deleting'
          WHERE id = $1"
     ))
     .bind(sandbox_id)
