@@ -4,13 +4,13 @@ use crate::metrics::sandbox::api::{
 };
 use futures_core::Stream;
 use pplx_space_accounts::{Email, NodeId, OrgId};
-use pplx_space_common_core::sql;
 #[cfg(test)]
-use pplx_space_common_core::types::AutoLifecycleRuntimeState;
+use pplx_space_auto_lifecycle::AutoLifecycleRuntimeState;
+use pplx_space_auto_lifecycle::{AutoLifecyclePolicy, SandboxAutoLifecyclePatch};
+use pplx_space_common_core::sql;
 use pplx_space_common_core::types::{
-    AutoLifecyclePolicy, DEFAULT_TEMPLATE_TAG, EnvMap, EnvSanitizationIssue, RuntimeKind,
-    SandboxAutoLifecyclePatch, SandboxId, SandboxLifecycle, TemplateDesiredState, TemplateName,
-    TemplateReference, TemplateTag, TemplateVisibility,
+    DEFAULT_TEMPLATE_TAG, EnvMap, EnvSanitizationIssue, RuntimeKind, SandboxId, SandboxLifecycle,
+    TemplateDesiredState, TemplateName, TemplateReference, TemplateTag, TemplateVisibility,
 };
 use pplx_space_net_common::{NetworkPolicy, NetworkPolicyV1, proto::NetworkPolicySource};
 use pplx_space_node_mgr_client::proto::{AllowPortRequest, ExposePortRequest, NetworkProtocol};

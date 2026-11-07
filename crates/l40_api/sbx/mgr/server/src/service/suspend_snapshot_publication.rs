@@ -201,7 +201,7 @@ pub(super) struct RecoveredSandboxRowFields {
     // The artifact marker carries the immutable encryption setting across nodes.
     pub(super) volume_encryption: bool,
     pub(super) process_env: std::collections::BTreeMap<String, String>,
-    pub(super) auto_lifecycle: pplx_space_common_core::types::AutoLifecyclePolicy,
+    pub(super) auto_lifecycle: pplx_space_auto_lifecycle::AutoLifecyclePolicy,
 }
 
 impl RecoveredSandboxRowFields {
@@ -544,7 +544,7 @@ pub(super) fn recovered_sandbox_row_fields(
             SandboxOwner::parse(DEFAULT_GUEST_USER)?,
             true,
             std::collections::BTreeMap::new(),
-            pplx_space_common_core::types::AutoLifecyclePolicy::disabled(),
+            pplx_space_auto_lifecycle::AutoLifecyclePolicy::disabled(),
         ),
     };
     Ok(RecoveredSandboxRowFields {

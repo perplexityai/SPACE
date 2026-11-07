@@ -1,9 +1,10 @@
 use super::*;
 use pplx_space_accounts::NodeId;
+use pplx_space_auto_lifecycle::AutoLifecyclePolicy;
 use pplx_space_common_core::types::{
-    AutoLifecyclePolicy, ExecutionGeneration, RouteGeneration, SandboxId,
-    SandboxQuarantineNextAction, SandboxQuarantineReasonCode, SandboxQuarantineSource,
-    SandboxRuntimeLabel, SpaceApiRouteIdentity,
+    ExecutionGeneration, RouteGeneration, SandboxId, SandboxQuarantineNextAction,
+    SandboxQuarantineReasonCode, SandboxQuarantineSource, SandboxRuntimeLabel,
+    SpaceApiRouteIdentity,
 };
 use pplx_space_k8s_ids::PodUid;
 

@@ -11,6 +11,7 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+pplx-space-auto-lifecycle = { workspace = true }
 pplx-space-common-core = { workspace = true }
 pplx-space-content-digest = { workspace = true }
 pplx-space-net-common = { workspace = true }
@@ -27,4 +28,4 @@ uuid = { workspace = true, features = ["v7"] }
 [features]
 default = []
 schema = ["dep:regex", "dep:schemars", "serde"]
-serde = ["dep:serde", "pplx-space-common-core/serde", "pplx-space-content-digest/serde", "pplx-space-net-common/serde"]
+serde = ["dep:serde", "pplx-space-common-core/serde", "pplx-space-content-digest/serde", "pplx-space-auto-lifecycle/serde", "pplx-space-net-common/serde"]

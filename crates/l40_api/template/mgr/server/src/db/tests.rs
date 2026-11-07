@@ -1,6 +1,7 @@
+use pplx_space_auto_lifecycle::{AutoLifecycleWakePolicy, AutoLifecycleWakeSource};
 use pplx_space_common_core::types::{
     ArtifactComponentKind, ArtifactComponentMetadata, ArtifactFormat, ArtifactVersion,
-    AutoLifecycleWakePolicy, AutoLifecycleWakeSource, ExecutionMetadata,
+    ExecutionMetadata,
 };
 use pplx_space_content_digest::Digest;
 use pplx_space_cpu_arch::Arch;

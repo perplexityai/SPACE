@@ -1,8 +1,8 @@
-use pplx_space_common_core::types::{
+use pplx_space_auto_lifecycle::{
     AutoLifecycleConditionSet, AutoLifecycleConditionSetId, AutoLifecycleIdleAction,
     AutoLifecyclePolicy, AutoLifecycleStage, AutoLifecycleWakePolicy, AutoLifecycleWakeSource,
-    SimpleDuration,
 };
+use pplx_space_common_core::types::SimpleDuration;
 
 use super::*;
 

@@ -6,8 +6,9 @@ use std::{collections::BTreeMap, str::FromStr, time::Duration};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 
 use pplx_space_accounts::{UpstreamIssuer, UpstreamOrgId, UpstreamSubjectId};
+use pplx_space_auto_lifecycle::AutoLifecyclePolicy;
 use pplx_space_common_core::types::{
-    AutoLifecyclePolicy, BackupAttemptId, EcwCredentialEpoch, IdempotencyKey, LocalArtifactId,
+    BackupAttemptId, EcwCredentialEpoch, IdempotencyKey, LocalArtifactId,
     SANDBOX_FORK_SNAPSHOT_RETENTION_DEFAULT_GRACE_SECONDS,
     SNAPSHOT_STORAGE_SWEEPER_DEFAULT_MIN_AGE_SECONDS, SandboxId, SandboxLifecycle,
     SandboxLifecycleParseError, TemplateReference,

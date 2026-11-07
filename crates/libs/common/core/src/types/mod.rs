@@ -24,7 +24,6 @@
 //! ```
 
 pub mod admin;
-pub mod auto_lifecycle;
 pub mod balloon;
 pub mod cluster;
 pub mod compute;
@@ -55,7 +54,6 @@ pub mod time;
 
 #[cfg(feature = "serde")]
 pub use admin::*;
-pub use auto_lifecycle::*;
 pub use balloon::*;
 pub use cluster::*;
 pub use compute::*;

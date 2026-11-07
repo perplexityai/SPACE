@@ -5,7 +5,8 @@ use super::{
 };
 use crate::user_role::UserRole;
 use pplx_space_accounts::{OrgId, SandboxOwnerSource, UserId};
-use pplx_space_common_core::types::{SandboxAutoLifecyclePatch, SandboxId};
+use pplx_space_auto_lifecycle::SandboxAutoLifecyclePatch;
+use pplx_space_common_core::types::SandboxId;
 use time::OffsetDateTime;
 
 #[test]

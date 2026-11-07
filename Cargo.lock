@@ -4843,6 +4843,7 @@ dependencies = [
  "percent-encoding",
  "pplx-space-accounts",
  "pplx-space-api-route",
+ "pplx-space-auto-lifecycle",
  "pplx-space-bearer-token",
  "pplx-space-build-mgr",
  "pplx-space-build-mgr-client",
@@ -4994,6 +4995,7 @@ dependencies = [
 name = "pplx-space-auto-lifecycle-receipt"
 version = "0.8.1"
 dependencies = [
+ "pplx-space-auto-lifecycle",
  "pplx-space-common-core",
  "pplx-space-content-digest",
  "serde_json",
@@ -5224,6 +5226,7 @@ dependencies = [
  "pplx-space-accounts",
  "pplx-space-api",
  "pplx-space-api-route",
+ "pplx-space-auto-lifecycle",
  "pplx-space-aws-client",
  "pplx-space-bearer-token",
  "pplx-space-byte-size",
@@ -5376,7 +5379,6 @@ version = "0.8.1"
 dependencies = [
  "aws-lc-rs",
  "pplx-space-accounts",
- "pplx-space-auto-lifecycle",
  "pplx-space-byte-size",
  "pplx-space-cluster-id",
  "pplx-space-content-digest",
@@ -6106,6 +6108,7 @@ dependencies = [
  "kube",
  "pplx-space-accounts",
  "pplx-space-api-route",
+ "pplx-space-auto-lifecycle",
  "pplx-space-auto-lifecycle-receipt",
  "pplx-space-cluster-pool",
  "pplx-space-cluster-trigger-queue",
@@ -6606,6 +6609,7 @@ dependencies = [
  "async-trait",
  "jiff",
  "pplx-space-api-route",
+ "pplx-space-auto-lifecycle",
  "pplx-space-common-core",
  "pplx-space-grpc-server",
  "pplx-space-k8s-node-id",
@@ -7217,6 +7221,7 @@ dependencies = [
 name = "pplx-space-public-api"
 version = "0.8.1"
 dependencies = [
+ "pplx-space-auto-lifecycle",
  "pplx-space-common-core",
  "pplx-space-content-digest",
  "pplx-space-net-common",
@@ -7384,6 +7389,7 @@ dependencies = [
  "insta",
  "k8s-openapi",
  "pplx-space-accounts",
+ "pplx-space-auto-lifecycle",
  "pplx-space-byte-size",
  "pplx-space-common-core",
  "pplx-space-content-digest",
@@ -7440,6 +7446,7 @@ name = "pplx-space-sandbox-store"
 version = "0.8.1"
 dependencies = [
  "pplx-space-accounts",
+ "pplx-space-auto-lifecycle",
  "pplx-space-cluster-pool",
  "pplx-space-common-core",
  "pplx-space-db-test-fixtures",
@@ -7490,6 +7497,7 @@ dependencies = [
  "opentelemetry-proto",
  "pplx-space-accounts",
  "pplx-space-api-route",
+ "pplx-space-auto-lifecycle",
  "pplx-space-auto-lifecycle-receipt",
  "pplx-space-bearer-token",
  "pplx-space-btrfs",
@@ -7586,6 +7594,7 @@ dependencies = [
  "jiff",
  "nix 0.31.3",
  "pplx-space-accounts",
+ "pplx-space-auto-lifecycle",
  "pplx-space-common-cli",
  "pplx-space-common-core",
  "pplx-space-content-digest",
@@ -7626,6 +7635,7 @@ name = "pplx-space-sbx-mgr-protocol"
 version = "0.8.1"
 dependencies = [
  "anyhow",
+ "pplx-space-auto-lifecycle",
  "pplx-space-common-core",
  "pplx-space-common-proto-build",
  "pplx-space-execution-common",
@@ -7650,6 +7660,7 @@ dependencies = [
  "futures-util",
  "jiff",
  "pplx-space-accounts",
+ "pplx-space-auto-lifecycle",
  "pplx-space-auto-lifecycle-receipt",
  "pplx-space-common-core",
  "pplx-space-common-jobs",
@@ -8227,6 +8238,7 @@ dependencies = [
  "jiff",
  "nix 0.31.3",
  "pplx-space-accounts",
+ "pplx-space-auto-lifecycle",
  "pplx-space-btrfs",
  "pplx-space-common-core",
  "pplx-space-common-grpc",

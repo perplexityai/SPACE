@@ -442,7 +442,7 @@ fn disk_artifact_meta() -> (
                 owner: "user:019f8000-0000-7000-8000-000000000003".to_string(),
                 snapshots_enabled: true,
                 process_env: std::collections::BTreeMap::new(),
-                auto_lifecycle: pplx_space_common_core::types::AutoLifecyclePolicy::disabled(),
+                auto_lifecycle: pplx_space_auto_lifecycle::AutoLifecyclePolicy::disabled(),
             }),
             rootfs_diff_format: None,
             rootfs_send_source_id: None,

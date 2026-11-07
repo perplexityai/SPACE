@@ -7,8 +7,7 @@
 //! and fired stages, and the public status derived from it.
 //!
 //! It is its own crate so that code can name these types without depending on
-//! `pplx-space-common-core`. `pplx-space-common-core` re-exports it from
-//! `types::auto_lifecycle`.
+//! `pplx-space-common-core`: import them from here.
 
 use std::{collections::BTreeMap, fmt, str::FromStr};
 

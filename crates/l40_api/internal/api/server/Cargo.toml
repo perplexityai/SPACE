@@ -45,6 +45,7 @@ uuid = { workspace = true, features = ["v7"] }
 # internal
 pplx-space-accounts = { workspace = true, features = ["serde"] }
 pplx-space-api-route = { workspace = true }
+pplx-space-auto-lifecycle = { workspace = true, features = ["serde"] }
 pplx-space-auto-lifecycle-receipt = { workspace = true }
 pplx-space-cluster-pool = { workspace = true }
 pplx-space-cluster-trigger-queue = { workspace = true }

@@ -10,10 +10,10 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use pplx_space_accounts::{ORPHANED_SANDBOX_OWNER, SandboxOwner};
+use pplx_space_auto_lifecycle::{AutoLifecyclePolicy, AutoLifecycleRuntimeState};
 use pplx_space_common_core::types::{
-    ArtifactKind, ArtifactOrigin, AutoLifecyclePolicy, AutoLifecycleRuntimeState,
-    ExecutionGeneration, ExecutionMetadata, LocalArtifactId, NodeManagedBy,
-    ORPHANED_SANDBOX_TEMPLATE, RuntimeIdentity, RuntimeKind, RuntimeVersion,
+    ArtifactKind, ArtifactOrigin, ExecutionGeneration, ExecutionMetadata, LocalArtifactId,
+    NodeManagedBy, ORPHANED_SANDBOX_TEMPLATE, RuntimeIdentity, RuntimeKind, RuntimeVersion,
     SandboxActivationAttemptId, SandboxCleanupEpisodeId, SandboxId, SandboxQuarantineHistoryAction,
     SandboxQuarantineNextAction, SandboxQuarantineReasonCode, SandboxQuarantineSource,
     SandboxRuntimeLabel, SandboxTransitionReceipt, SandboxTransitionReceiptInvariantError,
@@ -728,7 +728,8 @@ pub mod fixture {
     use std::str::FromStr;
 
     use pplx_space_accounts::SandboxOwner;
-    use pplx_space_common_core::types::{AutoLifecyclePolicy, SandboxId, SandboxRuntimeLabel};
+    use pplx_space_auto_lifecycle::AutoLifecyclePolicy;
+    use pplx_space_common_core::types::{SandboxId, SandboxRuntimeLabel};
 
     use crate::state::SandboxState;
 

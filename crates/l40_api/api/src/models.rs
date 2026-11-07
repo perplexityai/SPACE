@@ -9,10 +9,12 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 use pplx_space_accounts::{NodeId, SandboxOwnerSource};
+use pplx_space_auto_lifecycle::{
+    AutoLifecyclePolicy, AutoLifecycleRuntimeState, AutoLifecycleStatus, SandboxAutoLifecyclePatch,
+};
 use pplx_space_common_core::types::{
-    ArtifactVersion, AutoLifecyclePolicy, AutoLifecycleRuntimeState, AutoLifecycleStatus,
-    EcwCredentialEpoch, NodeAddress, NodeManagedBy, NodePoolName, NodeRole,
-    SandboxActivationAttemptId, SandboxAutoLifecyclePatch, TemplateReference,
+    ArtifactVersion, EcwCredentialEpoch, NodeAddress, NodeManagedBy, NodePoolName, NodeRole,
+    SandboxActivationAttemptId, TemplateReference,
 };
 use pplx_space_content_digest::Digest;
 use pplx_space_k8s_ids::PodUid;

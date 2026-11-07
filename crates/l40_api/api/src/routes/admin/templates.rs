@@ -99,7 +99,7 @@ struct TemplateRow {
     vcpu: Option<i32>,
     memory_mib: Option<i32>,
     disk_size_mb: Option<i32>,
-    default_auto_lifecycle: Option<SqlxJson<pplx_space_common_core::types::AutoLifecyclePolicy>>,
+    default_auto_lifecycle: Option<SqlxJson<pplx_space_auto_lifecycle::AutoLifecyclePolicy>>,
     network_policy: SqlxJson<NetworkPolicyV1>,
     observed_network_policy_generation: Option<i64>,
     observed_network_policy_authority: Option<String>,

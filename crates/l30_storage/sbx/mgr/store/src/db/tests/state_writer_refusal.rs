@@ -12,10 +12,11 @@ use super::database_rows;
 
 use crate::db::Connection;
 use pplx_space_accounts::SandboxOwner;
+use pplx_space_auto_lifecycle::AutoLifecyclePolicy;
 use pplx_space_common_core::types::{
-    ArtifactKind, ArtifactOrigin, AutoLifecyclePolicy, ExactStorageUri, ExecutionGeneration,
-    LocalArtifactId, SandboxCleanupEpisodeId, SandboxId, SandboxQuarantineNextAction,
-    SandboxQuarantineReasonCode, SandboxQuarantineSource, SandboxRuntimeLabel, TransferScopeId,
+    ArtifactKind, ArtifactOrigin, ExactStorageUri, ExecutionGeneration, LocalArtifactId,
+    SandboxCleanupEpisodeId, SandboxId, SandboxQuarantineNextAction, SandboxQuarantineReasonCode,
+    SandboxQuarantineSource, SandboxRuntimeLabel, TransferScopeId,
 };
 use rusqlite::params;
 

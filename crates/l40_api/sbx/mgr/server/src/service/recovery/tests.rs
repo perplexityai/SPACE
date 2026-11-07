@@ -50,7 +50,7 @@ fn restore_meta_with_process_env(
         owner: "user".to_string(),
         snapshots_enabled: true,
         process_env,
-        auto_lifecycle: pplx_space_common_core::types::AutoLifecyclePolicy::disabled(),
+        auto_lifecycle: pplx_space_auto_lifecycle::AutoLifecyclePolicy::disabled(),
     }))
 }
 
@@ -84,7 +84,7 @@ pub(in crate::service) fn insert_suspended_test_sandbox(conn: &crate::db::Connec
             pool_template: Some("pool-template"),
             volume_encryption: false,
             process_env: &process_env,
-            auto_lifecycle: &pplx_space_common_core::types::AutoLifecyclePolicy::disabled(),
+            auto_lifecycle: &pplx_space_auto_lifecycle::AutoLifecyclePolicy::disabled(),
             network_policy_override: None,
             network_policy_generation: 0,
             network_policy_authority: crate::db::PolicyAuthority::Cluster,
@@ -102,7 +102,7 @@ fn recovered_sandbox_row_fields_defaults_missing_owner_block_to_legacy_guest_use
     assert!(missing.process_env.is_empty());
     assert_eq!(
         missing.auto_lifecycle,
-        pplx_space_common_core::types::AutoLifecyclePolicy::disabled()
+        pplx_space_auto_lifecycle::AutoLifecyclePolicy::disabled()
     );
 }
 
@@ -113,7 +113,7 @@ fn recovered_sandbox_row_fields_rejects_invalid_owner() {
             owner: String::new(),
             snapshots_enabled: true,
             process_env: std::collections::BTreeMap::new(),
-            auto_lifecycle: pplx_space_common_core::types::AutoLifecyclePolicy::disabled(),
+            auto_lifecycle: pplx_space_auto_lifecycle::AutoLifecyclePolicy::disabled(),
         },
     ))) {
         Ok(_) => panic!("empty sandbox owner must reject"),
@@ -133,7 +133,7 @@ fn recovered_sandbox_row_fields_preserves_template_manager_owner() {
             owner: TEMPLATE_MANAGER_SANDBOX_OWNER.to_string(),
             snapshots_enabled: true,
             process_env: std::collections::BTreeMap::new(),
-            auto_lifecycle: pplx_space_common_core::types::AutoLifecyclePolicy::disabled(),
+            auto_lifecycle: pplx_space_auto_lifecycle::AutoLifecyclePolicy::disabled(),
         },
     )))
     .unwrap();

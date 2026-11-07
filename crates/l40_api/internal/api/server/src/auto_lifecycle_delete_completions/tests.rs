@@ -1,11 +1,11 @@
+use pplx_space_auto_lifecycle::{
+    AutoLifecycleConditionSet, AutoLifecycleConditionSetId, AutoLifecycleIdleAction,
+    AutoLifecyclePolicy, AutoLifecycleStage, AutoLifecycleWakePolicy, AutoLifecycleWakeSource,
+};
 use pplx_space_auto_lifecycle_receipt::AutoLifecyclePolicyFingerprint;
 use pplx_space_common_core::{
     sql,
-    types::{
-        AutoLifecycleConditionSet, AutoLifecycleConditionSetId, AutoLifecycleIdleAction,
-        AutoLifecyclePolicy, AutoLifecycleStage, AutoLifecycleWakePolicy, AutoLifecycleWakeSource,
-        SandboxActivationAttemptId, SandboxQuarantineSource,
-    },
+    types::{SandboxActivationAttemptId, SandboxQuarantineSource},
 };
 use pplx_space_db_test_fixtures::{insert_ready_worker_node, pg_test_db, try_pg_test_db};
 use pplx_space_sandbox_store::test_support::stored_lifecycle_matrix;

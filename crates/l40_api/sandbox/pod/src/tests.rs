@@ -76,10 +76,11 @@ use std::collections::BTreeMap;
 
 use super::*;
 use pplx_space_accounts::OrgId;
-use pplx_space_common_core::types::{
+use pplx_space_auto_lifecycle::{
     AutoLifecycleConditionSet, AutoLifecycleConditionSetId, AutoLifecycleIdleAction,
-    AutoLifecyclePolicy, AutoLifecycleStage, NodeGroupName,
+    AutoLifecyclePolicy, AutoLifecycleStage,
 };
+use pplx_space_common_core::types::NodeGroupName;
 
 const TEST_SANDBOX_ID: pplx_space_common_core::types::SandboxId =
     pplx_space_common_core::types::SandboxId::from_uuid(Uuid::from_u128(

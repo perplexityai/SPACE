@@ -13,7 +13,6 @@ workspace = true
 [dependencies]
 aws-lc-rs = { workspace = true, optional = true }
 pplx-space-accounts = { workspace = true }
-pplx-space-auto-lifecycle = { workspace = true }
 pplx-space-byte-size = { workspace = true }
 pplx-space-cluster-id = { workspace = true }
 pplx-space-content-digest = { workspace = true }
@@ -57,7 +56,6 @@ serde = [
     "pplx-space-accounts/serde",
     "pplx-space-execution-spec/serde",
     "pplx-space-linux-ids/serde",
-    "pplx-space-auto-lifecycle/serde",
 ]
 sqlx = [
     "dep:sqlx",

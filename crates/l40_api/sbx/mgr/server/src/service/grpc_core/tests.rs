@@ -814,7 +814,7 @@ fn auto_lifecycle_expectation(
 }
 
 fn access_idle_delete_policy(at: u64) -> AutoLifecyclePolicy {
-    use pplx_space_common_core::types::{
+    use pplx_space_auto_lifecycle::{
         AutoLifecycleConditionSet, AutoLifecycleConditionSetId, AutoLifecycleStage,
     };
     AutoLifecyclePolicy {

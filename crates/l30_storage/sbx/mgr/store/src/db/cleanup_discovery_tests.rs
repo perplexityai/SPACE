@@ -145,7 +145,7 @@ fn deadline_lane_alone_skips_deleting_rows() {
 
 #[test]
 fn auto_lifecycle_action_gate_is_exhaustive_over_states() {
-    use pplx_space_common_core::types::AutoLifecycleIdleAction as Action;
+    use pplx_space_auto_lifecycle::AutoLifecycleIdleAction as Action;
     let transient = [
         SandboxState::Creating,
         SandboxState::Starting,

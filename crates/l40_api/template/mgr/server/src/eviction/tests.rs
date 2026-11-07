@@ -1753,7 +1753,7 @@ async fn idle_template_eviction_takes_every_build_only_when_none_is_protected() 
         crate::db::upsert_template_settings(
             &conn,
             "doomed",
-            &pplx_space_common_core::types::AutoLifecyclePolicy::disabled(),
+            &pplx_space_auto_lifecycle::AutoLifecyclePolicy::disabled(),
         )
         .unwrap();
         let db = Arc::new(Mutex::new(conn));
@@ -1895,7 +1895,7 @@ async fn idle_template_eviction_rechecks_what_changes_during_a_delete() {
         crate::db::upsert_template_settings(
             &conn,
             "doomed",
-            &pplx_space_common_core::types::AutoLifecyclePolicy::disabled(),
+            &pplx_space_auto_lifecycle::AutoLifecyclePolicy::disabled(),
         )
         .unwrap();
         let db = Arc::new(Mutex::new(conn));

@@ -585,18 +585,18 @@ mod tests;
 /// become resident with a policy its adapter will never execute.
 pub(super) fn validate_runtime_lifecycle_policy(
     runtime: pplx_space_common_core::types::RuntimeKind,
-    policy: &pplx_space_common_core::types::AutoLifecyclePolicy,
+    policy: &pplx_space_auto_lifecycle::AutoLifecyclePolicy,
 ) -> Result<(), Status> {
     let capabilities = runtime.baseline_capabilities();
     if !capabilities.pause_resume
-        && policy.contains_action(pplx_space_common_core::types::AutoLifecycleIdleAction::Pause)
+        && policy.contains_action(pplx_space_auto_lifecycle::AutoLifecycleIdleAction::Pause)
     {
         return Err(Status::failed_precondition(
             "runtime does not support automatic pause",
         ));
     }
     if !capabilities.snapshot
-        && policy.contains_action(pplx_space_common_core::types::AutoLifecycleIdleAction::Suspend)
+        && policy.contains_action(pplx_space_auto_lifecycle::AutoLifecycleIdleAction::Suspend)
     {
         return Err(Status::failed_precondition(
             "runtime does not support automatic suspend",
@@ -609,10 +609,10 @@ pub(super) fn validate_runtime_lifecycle_policy(
 /// state. In particular, historical cold-only CH identities remain cold-only.
 pub(super) fn validate_execution_lifecycle_policy(
     execution: Option<&pplx_space_common_core::types::ExecutionMetadata>,
-    policy: &pplx_space_common_core::types::AutoLifecyclePolicy,
+    policy: &pplx_space_auto_lifecycle::AutoLifecyclePolicy,
 ) -> Result<(), Status> {
     if execution.is_some_and(requires_cold_creation)
-        && policy.contains_action(pplx_space_common_core::types::AutoLifecycleIdleAction::Suspend)
+        && policy.contains_action(pplx_space_auto_lifecycle::AutoLifecycleIdleAction::Suspend)
     {
         return Err(Status::failed_precondition(
             "execution environment does not support automatic suspend",

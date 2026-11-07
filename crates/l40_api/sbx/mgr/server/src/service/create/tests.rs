@@ -506,9 +506,9 @@ fn restore_guest_memory_uses_capture_shape_or_legacy_payload_and_rejects_conflic
 async fn suspend_restore_is_admitted_before_the_vm_launches() {
     use crate::node_manager_transport::fake::FakeNodeManager;
     use crate::service::start_support::{ActivationAdmissionKind, REQUESTED_VM_ACTIVATIONS};
+    use pplx_space_auto_lifecycle::AutoLifecyclePolicy;
     use pplx_space_common_core::types::{
-        AutoLifecyclePolicy, RuntimeKind, SandboxArtifactMetadata, SandboxRuntimeLabel,
-        SnapshotExecutionMetadata,
+        RuntimeKind, SandboxArtifactMetadata, SandboxRuntimeLabel, SnapshotExecutionMetadata,
     };
     use pplx_space_content_digest::ContentHash;
     use pplx_space_cpu_arch::Arch;

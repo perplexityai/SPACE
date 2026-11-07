@@ -94,7 +94,7 @@ fn resolve_missing_checkpoint_restore_route_identity(
 }
 
 struct StartSandboxContext {
-    activation_auto_lifecycle: Option<pplx_space_common_core::types::AutoLifecyclePolicy>,
+    activation_auto_lifecycle: Option<pplx_space_auto_lifecycle::AutoLifecyclePolicy>,
     operation_activation_attempt_id:
         Option<pplx_space_common_core::types::SandboxActivationAttemptId>,
     checkpoint: String,
