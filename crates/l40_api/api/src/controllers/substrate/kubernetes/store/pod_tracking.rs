@@ -302,6 +302,7 @@ impl K8sStore {
              SET pod_uid = NULL,
                  pod_ip = NULL,
                  k8s_node_name = NULL,
+                 node_instance_id = NULL,
                  pod_materialized_at = COALESCE(
                      pod_materialized_at,
                      CASE WHEN NULLIF(BTRIM(pod_uid), '') IS NOT NULL THEN NOW() END

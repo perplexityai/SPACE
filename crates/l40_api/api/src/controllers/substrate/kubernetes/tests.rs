@@ -24,6 +24,7 @@ pub(crate) use kubernetes_tests::{
 };
 
 mod drain_restore;
+mod execution_node_instance;
 mod native_pod_failover;
 mod node_instance;
 mod runtime_upgrade_dispatch;
