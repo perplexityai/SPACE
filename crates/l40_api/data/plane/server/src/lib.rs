@@ -67,16 +67,16 @@ use pplx_space_public_api::{
     routes::{self as native_routes, NativeHttpMethod},
 };
 use pplx_space_sbx_mgr_client::operations::{
-    CloseLoopbackBridgeRequest, CloseStdinRequest, ConnectProcessRequest, PtyConfig, PtySize,
-    ResizePtyRequest, SendInputRequest, SendSignalRequest, StartRequest,
+    CloseLoopbackBridgeRequest, CloseStdinRequest, ConnectProcessRequest, ListProcessesRequest,
+    PtyConfig, PtySize, ResizePtyRequest, SendInputRequest, SendSignalRequest, StartRequest,
     WatchRequest as WatchOperation,
 };
 use pplx_space_sbx_mgr_client::proto::{
     SpacedCloseLoopbackBridgeRequest, SpacedCloseStdinRequest, SpacedConnectProcessRequest,
-    SpacedFileEvent as FileEvent, SpacedFileEventKind, SpacedProcessEvent as ProcessEvent,
-    SpacedProcessExit as ProcessExit, SpacedResizePtyRequest, SpacedSendInputRequest,
-    SpacedSendSignalRequest, SpacedStartProcessRequest, SpacedWatchRequest, spaced_process_event,
-    spaced_process_exit,
+    SpacedFileEvent as FileEvent, SpacedFileEventKind, SpacedListProcessesRequest,
+    SpacedProcessEvent as ProcessEvent, SpacedProcessExit as ProcessExit, SpacedResizePtyRequest,
+    SpacedSendInputRequest, SpacedSendSignalRequest, SpacedStartProcessRequest, SpacedWatchRequest,
+    spaced_process_event, spaced_process_exit,
 };
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
