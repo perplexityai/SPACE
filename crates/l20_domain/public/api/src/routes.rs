@@ -171,6 +171,12 @@ impl NativeOperation {
 /// it rather than letting an arbitrary route be excluded.
 pub const PROXY_SESSION_SUBPATH_MOUNT: &str = "/v1/sessions/{session_id}/proxy/{*path}";
 
+/// The proxied service's root, `/proxy/`, which [`PROXY_SESSION_SUBPATH_MOUNT`]
+/// does not match: its wildcard needs a non-empty tail. Browsers and relative
+/// links address an application's `/` with the trailing slash, so it is
+/// mounted on its own and forwarded as `/`, as the bare entry point is.
+pub const PROXY_SESSION_ROOT_MOUNT: &str = "/v1/sessions/{session_id}/proxy/";
+
 const SANDBOX_ACTION_RUNTIME_PATH: &str = "/v1/sandboxes/{sandbox_id}";
 const PROCESS_ACTION_RUNTIME_PATH: &str = "/v1/sandboxes/{sandbox_id}/processes/{process_id}";
 

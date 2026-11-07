@@ -688,6 +688,7 @@ fn router(state: DataPlaneState) -> Router {
             native_routes::PROXY_SESSION.runtime_path(),
             any(proxy_session),
         )
+        .route(native_routes::PROXY_SESSION_ROOT_MOUNT, any(proxy_session))
         .route(
             native_routes::PROXY_SESSION_SUBPATH_MOUNT,
             any(proxy_session),
