@@ -659,6 +659,49 @@ async fn a_stopped_evacuation_is_re_placed_only_after_its_local_copy_is_gone() -
     Ok(())
 }
 
+/// A stopped re-placement whose execution holds a live activation attempt
+/// (a start materializing it in the API) is left to its driver; once the
+/// attempt expires, the sweep re-drives it.
+#[tokio::test(flavor = "current_thread")]
+async fn a_stopped_re_placement_with_a_live_attempt_is_left_to_its_driver() -> TestResult {
+    let Some(db) = pplx_space_db_test_fixtures::try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let node_id = forced_draining_node(&db.pool).await?;
+    let pin = LocalArtifactId::new();
+    let evacuated = insert_sandbox(&db.pool, Some(node_id), "stopped").await?;
+    claim_and_publish(&db.pool, evacuated, node_id, pin, "ready").await?;
+    clear_placement(&db.pool, evacuated).await?;
+    sqlx::query(sql!(
+        "INSERT INTO sandbox_k8s_executions (
+             sandbox_id, generation, pod_name, pod_namespace, state, active,
+             activation_attempt_id, activation_attempt_expires_at,
+             activation_attempt_target_state
+         )
+         VALUES ($1, 9, 'pod-materializing', 'space', 'creating', TRUE,
+                 gen_random_uuid(), NOW() + INTERVAL '1 minute', 'stopped')"
+    ))
+    .bind(evacuated)
+    .execute(&db.pool)
+    .await?;
+    assert!(
+        restore_pending(&db.pool).await?.is_empty(),
+        "left to its driver"
+    );
+    sqlx::query(sql!(
+        "UPDATE sandbox_k8s_executions SET activation_attempt_expires_at = NOW() - INTERVAL '1 second'
+          WHERE sandbox_id = $1"
+    ))
+    .bind(evacuated)
+    .execute(&db.pool)
+    .await?;
+    assert_eq!(
+        restore_pending(&db.pool).await?,
+        vec![(evacuated, "stopped".to_string())]
+    );
+    Ok(())
+}
+
 /// What the drain's teardown does to the cluster row, applied directly: the
 /// placement clear that `forget_pod_tracking` performs.
 async fn clear_placement(pool: &PgPool, sandbox_id: SandboxId) -> TestResult {

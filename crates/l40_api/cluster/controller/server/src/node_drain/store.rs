@@ -681,6 +681,18 @@ pub(crate) fn restore_pending_evacuations_query(honor_backoff_windows: bool) -> 
                         OR s.lifecycle = 'restoring'
                     )
                     AND {disk_backup_ready}
+                    -- A re-placement something is driving now (a start's
+                    -- lazy materialization in the API) holds its execution's
+                    -- activation attempt; the sweep re-drives it only once
+                    -- that attempt has expired.
+                    AND NOT EXISTS (
+                        SELECT 1
+                          FROM sandbox_k8s_executions ae
+                         WHERE ae.sandbox_id = s.id
+                           AND ae.active
+                           AND ae.activation_attempt_id IS NOT NULL
+                           AND ae.activation_attempt_expires_at > NOW()
+                    )
                 )
             )
           ORDER BY {attempt_tier_key}
