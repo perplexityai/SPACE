@@ -26,9 +26,10 @@ use pplx_space_api_route::{
 use pplx_space_common_core::types::{
     AutoLifecycleConditionSet, AutoLifecycleConditionSetId, AutoLifecycleIdleAction,
     AutoLifecyclePolicy, AutoLifecycleStage, CLUSTER_ID_ENV, ClusterId, ExecutionGeneration,
-    NodeManagedBy, PodUid, RouteGeneration, SandboxActivationAttemptId, SandboxId,
-    SandboxRouteIdentity, SandboxRuntimeLabel, SpaceApiRouteIdentity,
+    NodeManagedBy, RouteGeneration, SandboxActivationAttemptId, SandboxId, SandboxRouteIdentity,
+    SandboxRuntimeLabel, SpaceApiRouteIdentity,
 };
+use pplx_space_k8s_ids::PodUid;
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::path::PathBuf;

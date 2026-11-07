@@ -78,6 +78,7 @@ pplx-space-service-lifecycle = { workspace = true }
 
 [dev-dependencies]
 pplx-space-grpc-server = { workspace = true }
+pplx-space-k8s-ids = { workspace = true }
 pplx-space-metrics-emit = { workspace = true, features = ["test-capture"] }
 tokio = { workspace = true, features = ["test-util"] }
 pplx-space-test-env = { workspace = true }

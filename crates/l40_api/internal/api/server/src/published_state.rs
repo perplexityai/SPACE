@@ -15,7 +15,7 @@ use pplx_space_cluster_trigger_queue::{
 };
 use pplx_space_common_core::types::{
     ArtifactKind, ArtifactOrigin, AutoLifecyclePolicy, ExecutionGeneration, ExecutionMetadata,
-    LocalArtifactId, NodeRole, PodUid, RuntimeKind, SandboxActivationAttemptId, SandboxId,
+    LocalArtifactId, NodeRole, RuntimeKind, SandboxActivationAttemptId, SandboxId,
     SandboxLifecycle, SandboxQuarantineHistoryAction, SandboxQuarantineNextAction,
     SandboxQuarantineReasonCode, SandboxQuarantineSource, SandboxTransitionReceipt,
     SandboxTransitionReceiptInvariantError, SandboxTransitionReceiptKind,
@@ -25,6 +25,7 @@ use pplx_space_cpu_arch::Arch;
 use pplx_space_events::{
     SandboxEvent, SandboxEventDetails, SandboxEventSource, SandboxEventTrigger, SandboxEventType,
 };
+use pplx_space_k8s_ids::PodUid;
 use pplx_space_net_common::proto::NetworkPolicySource;
 use pplx_space_policy_authority::PolicyAuthority;
 use pplx_space_sandbox_portability::{

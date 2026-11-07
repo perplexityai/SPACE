@@ -9,7 +9,8 @@
 //! timestamp — see the reconciler's `first_seen_orphan` doc.
 
 use pplx_space_api::controllers::substrate::kubernetes::{SandboxPodKey, SandboxPodView};
-use pplx_space_common_core::types::{PodUid, SandboxId, SandboxLifecycle};
+use pplx_space_common_core::types::{SandboxId, SandboxLifecycle};
+use pplx_space_k8s_ids::PodUid;
 use pplx_space_sandbox_portability::execution_supersession::{
     ExecutionSupersessionRow, execution_generation_superseded,
 };

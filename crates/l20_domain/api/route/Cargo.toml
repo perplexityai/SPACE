@@ -32,3 +32,4 @@ pplx-space-network-roles = { workspace = true, features = ["serde"] }
 
 [dev-dependencies]
 pplx-space-accounts = { workspace = true, features = ["serde"] }
+pplx-space-k8s-ids = { workspace = true, features = ["serde"] }

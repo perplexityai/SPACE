@@ -1,9 +1,9 @@
 use aws_lc_rs::rand::SystemRandom;
 use pplx_space_accounts::NodeId;
 use pplx_space_common_core::types::{
-    ExecutionGeneration, NodeManagedBy, PodUid, RouteGeneration, SandboxActivationAttemptId,
-    SandboxId,
+    ExecutionGeneration, NodeManagedBy, RouteGeneration, SandboxActivationAttemptId, SandboxId,
 };
+use pplx_space_k8s_ids::PodUid;
 
 use super::*;
 

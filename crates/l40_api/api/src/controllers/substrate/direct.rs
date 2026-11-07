@@ -87,10 +87,11 @@ use std::{fmt, time::Duration};
 use pplx_space_accounts::NodeId;
 use pplx_space_common_core::types::{
     ArtifactOrigin, AutoLifecyclePolicy, ExecutionGeneration, ExecutionGenerationParseError,
-    NodeManagedBy, NodeRole as SpaceNodeRole, PodUid, PodUidParseError, RouteGeneration,
-    RouteGenerationParseError, SandboxActivationAttemptId, SandboxId, SandboxLifecycle,
-    SandboxRouteIdentity, SandboxRouteIdentityInvariantError, SubstrateKind,
+    NodeManagedBy, NodeRole as SpaceNodeRole, RouteGeneration, RouteGenerationParseError,
+    SandboxActivationAttemptId, SandboxId, SandboxLifecycle, SandboxRouteIdentity,
+    SandboxRouteIdentityInvariantError, SubstrateKind,
 };
+use pplx_space_k8s_ids::{PodUid, PodUidParseError};
 use pplx_space_net_common::{NetworkPolicyV1, proto::NetworkPolicyV1 as NetworkPolicyProto};
 use pplx_space_policy_authority::PolicyAuthority;
 use pplx_space_sandbox_portability::{

@@ -69,11 +69,12 @@ mod kubernetes_tests {
     use pplx_space_common_core::sql;
     use pplx_space_common_core::types::{
         ArtifactKind, ArtifactOrigin, ExecutionGeneration, NodeAddress, NodeGroup, NodeGroupName,
-        NodeGroupPolicy, NodeManagedBy as SpaceNodeManagedBy, NodeRole as SpaceNodeRole, PodName,
-        PodResourceVersion, PodUid, SandboxActivationAttemptId, SandboxLifecycle,
-        SandboxTransitionTargetState, TemplateCompatSpec, TemplateName, TemplateVisibility,
+        NodeGroupPolicy, NodeManagedBy as SpaceNodeManagedBy, NodeRole as SpaceNodeRole,
+        SandboxActivationAttemptId, SandboxLifecycle, SandboxTransitionTargetState,
+        TemplateCompatSpec, TemplateName, TemplateVisibility,
     };
     use pplx_space_internal_api_server::publish_sandbox_states;
+    use pplx_space_k8s_ids::{PodName, PodResourceVersion, PodUid};
     use pplx_space_node_api_client::proto::PublishedSandboxState;
     use pplx_space_node_api_client::proto::worker_api_internal_server::{
         WorkerApiInternal, WorkerApiInternalServer,

@@ -97,6 +97,7 @@ pplx-space-federated-identity = { workspace = true }
 pplx-space-grpc-server = { workspace = true }
 pplx-space-http-server = { workspace = true }
 pplx-space-ingress-admission = { workspace = true }
+pplx-space-k8s-ids = { workspace = true, features = ["serde"] }
 pplx-space-k8s-node-id = { workspace = true }
 pplx-space-kube-client = { workspace = true, optional = true }
 pplx-space-sandbox-pod = { workspace = true, optional = true }

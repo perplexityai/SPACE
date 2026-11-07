@@ -9,7 +9,7 @@ use crate::federated_identity::{
     DEFAULT_FEDERATED_GRANT_AUDIENCE, FEDERATED_OWNER_GRANT_PURPOSE, FederatedOwner,
     FederatedServiceGrant,
 };
-use pplx_space_common_core::types::PodUid;
+use pplx_space_k8s_ids::PodUid;
 
 #[cfg(feature = "kubernetes")]
 mod kubernetes;

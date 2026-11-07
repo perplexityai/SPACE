@@ -11,10 +11,11 @@ use uuid::Uuid;
 use pplx_space_accounts::{NodeId, SandboxOwnerSource};
 use pplx_space_common_core::types::{
     ArtifactVersion, AutoLifecyclePolicy, AutoLifecycleRuntimeState, AutoLifecycleStatus,
-    EcwCredentialEpoch, NodeAddress, NodeManagedBy, NodePoolName, NodeRole, PodUid,
+    EcwCredentialEpoch, NodeAddress, NodeManagedBy, NodePoolName, NodeRole,
     SandboxActivationAttemptId, SandboxAutoLifecyclePatch, TemplateReference,
 };
 use pplx_space_content_digest::Digest;
+use pplx_space_k8s_ids::PodUid;
 use pplx_space_net_common::{NetworkPolicy, NetworkPolicyV1};
 use pplx_space_semver::SemVer;
 

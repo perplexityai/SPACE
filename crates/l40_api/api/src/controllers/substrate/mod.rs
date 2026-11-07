@@ -44,13 +44,13 @@ use pplx_space_api_route::wait_ready_lifecycle_request;
 use pplx_space_bearer_token::SpaceBearerToken;
 use pplx_space_common_core::types::{
     ArtifactKind, ArtifactOrigin, AutoLifecyclePolicy, BackupAttemptId, BackupSource,
-    LocalArtifactId, NodeAddress, NodeManagedBy, NodePoolName, NodeRole, PodName,
-    PodResourceVersion, PodUid, SandboxActivationAttemptId, SandboxId, SandboxLifecycle,
-    SandboxRouteIdentity, TemplateName,
+    LocalArtifactId, NodeAddress, NodeManagedBy, NodePoolName, NodeRole,
+    SandboxActivationAttemptId, SandboxId, SandboxLifecycle, SandboxRouteIdentity, TemplateName,
 };
 use pplx_space_common_grpc::{
     GrpcClientTrace, trace_grpc_client_transport as wrap_grpc_client_channel,
 };
+use pplx_space_k8s_ids::{PodName, PodResourceVersion, PodUid};
 use pplx_space_net_common::NetworkPolicyV1;
 use pplx_space_net_common::proto::NetworkPolicyV1 as NetworkPolicyProto;
 use pplx_space_rpc_auth::SpaceBearerInterceptor;

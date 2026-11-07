@@ -281,12 +281,13 @@ pub(crate) mod service_tests {
     };
     use pplx_space_common_core::types::{
         ArtifactKind, ArtifactOrigin, AutoLifecycleConditionSet, AutoLifecycleConditionSetId,
-        AutoLifecycleStage, ClusterId, ExecutionGeneration, LocalArtifactId, NodeManagedBy, PodUid,
+        AutoLifecycleStage, ClusterId, ExecutionGeneration, LocalArtifactId, NodeManagedBy,
         RouteGeneration, SandboxActivationAttemptId, SandboxQuarantineHistoryAction,
         SandboxQuarantineNextAction, SandboxQuarantineReasonCode, SandboxQuarantineSource,
         SandboxRouteIdentity, SpaceApiRouteIdentity,
     };
     use pplx_space_host_layout::identities::{user_names, users};
+    use pplx_space_k8s_ids::PodUid;
     use pplx_space_k8s_node_id::space_k8s_node_id;
 
     use prost::Message as _;
@@ -2701,7 +2702,7 @@ pub(crate) mod service_tests {
         let service = service_for_teardown_test(conn);
 
         let node_id = NodeId::new();
-        let pod_uid: pplx_space_common_core::types::PodUid =
+        let pod_uid: pplx_space_k8s_ids::PodUid =
             "019f8000-0000-7000-8000-0000000000bb".parse().unwrap();
         // A pooled pod boots with no activation-attempt annotation, so the
         // runtime published a locally minted placeholder the control plane
@@ -2725,7 +2726,7 @@ pub(crate) mod service_tests {
         // Claiming the pod mints an attempt and wakes an already-Started VM.
         let claimed_attempt = SandboxActivationAttemptId::new();
         let stale_node_id = NodeId::new();
-        let stale_pod_uid: pplx_space_common_core::types::PodUid =
+        let stale_pod_uid: pplx_space_k8s_ids::PodUid =
             "019f8000-0000-7000-8000-0000000000cc".parse().unwrap();
         assert_ne!(claimed_attempt, placeholder_attempt);
         let start = WakeStartConfig {

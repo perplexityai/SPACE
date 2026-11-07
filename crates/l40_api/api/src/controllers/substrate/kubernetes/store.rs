@@ -18,12 +18,13 @@ use pplx_space_cluster_pool::WarmPoolStore;
 use pplx_space_common_core::sql;
 use pplx_space_common_core::types::{
     ArtifactKind, ArtifactOrigin, ExactStorageUri, ExecutionGeneration, LocalArtifactId, NodeRole,
-    PodUid, SandboxActivationAttemptId, SandboxId, SandboxLifecycle, SandboxTransitionTargetState,
+    SandboxActivationAttemptId, SandboxId, SandboxLifecycle, SandboxTransitionTargetState,
     SnapshotState, StorageUri,
 };
 use pplx_space_events::{
     SandboxEvent, SandboxEventDetails, SandboxEventSource, SandboxEventTrigger, SandboxEventType,
 };
+use pplx_space_k8s_ids::PodUid;
 use pplx_space_net_common::NetworkPolicyV1;
 use pplx_space_sandbox_portability::{
     fresh_ready_snapshot_exists, missing_suspending_pod_revert_eligibility, no_newer_full_snapshot,
