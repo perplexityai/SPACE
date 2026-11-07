@@ -27,7 +27,7 @@ use pplx_space_api_route::{
 };
 use pplx_space_common_core::{
     sql,
-    types::{EcwCredentialEpoch, ExecutionGeneration, GuestPort, SandboxId},
+    types::{EcwCredentialEpoch, ExecutionGeneration, SandboxId},
 };
 use pplx_space_common_grpc::SandboxServiceRouteNotReady;
 use pplx_space_db_test_fixtures::{
@@ -35,6 +35,7 @@ use pplx_space_db_test_fixtures::{
     try_pg_test_db_with_max_connections,
 };
 use pplx_space_ecw_credential::{EcwCredentialKeyring, EcwCredentialKind};
+use pplx_space_network_roles::GuestPort;
 use pplx_space_node_api_sim::SimWorkerHarness;
 use sha2::{Digest, Sha256};
 use tonic::Code;

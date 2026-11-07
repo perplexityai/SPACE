@@ -28,6 +28,7 @@ tonic = { workspace = true, default-features = false }
 # internal
 pplx-space-common-core = { workspace = true, features = ["serde"] }
 pplx-space-env-vars = { workspace = true }
+pplx-space-network-roles = { workspace = true, features = ["serde"] }
 
 [dev-dependencies]
 pplx-space-accounts = { workspace = true, features = ["serde"] }

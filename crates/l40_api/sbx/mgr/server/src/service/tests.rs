@@ -16901,7 +16901,7 @@ pub(crate) mod service_tests {
     fn route_authorized_service_for_port(
         conn: crate::db::Connection,
         sandbox_id: SandboxId,
-        port: Option<pplx_space_common_core::types::GuestPort>,
+        port: Option<pplx_space_network_roles::GuestPort>,
     ) -> (SandboxManagerService, SpaceApiRouteEd25519Token) {
         let identity = SandboxRouteIdentity::try_new(
             sandbox_id,
@@ -20335,7 +20335,7 @@ pub(crate) mod service_tests {
         let conn = crate::db::test_conn();
         let id = SandboxId::new();
         let key = id.to_string();
-        let port = pplx_space_common_core::types::GuestPort::try_from_u16(8080).unwrap();
+        let port = pplx_space_network_roles::GuestPort::try_from_u16(8080).unwrap();
         seed_due_access_idle_sandbox(&conn, &key, 120, 300);
         let (service, token) = route_authorized_service_for_port(conn, id, Some(port));
         let before = access_idle_last_touched(&service, &key);

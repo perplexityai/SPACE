@@ -146,7 +146,7 @@ enum ImageType {
 struct Net {
     id: String,
     tap: pplx_space_common_core::types::LinuxInterfaceName,
-    mac: pplx_space_common_core::types::MacAddress,
+    mac: pplx_space_network_roles::MacAddress,
     num_queues: u16,
     #[serde(skip_serializing_if = "Option::is_none")]
     rate_limiter_config: Option<Limiter>,

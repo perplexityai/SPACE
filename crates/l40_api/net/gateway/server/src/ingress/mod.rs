@@ -16,14 +16,15 @@ use pplx_space_api_route::{
 };
 use pplx_space_common_core::guest::linux::network::IPV4_ADDR as GUEST_IPV4_ADDR;
 use pplx_space_common_core::types::{
-    ExecutionGeneration, GuestPort, NodeManagedBy, PodUid, RouteGeneration,
-    SandboxActivationAttemptId, SandboxId, SpaceApiRouteIdentity,
+    ExecutionGeneration, NodeManagedBy, PodUid, RouteGeneration, SandboxActivationAttemptId,
+    SandboxId, SpaceApiRouteIdentity,
 };
 use pplx_space_net_gateway_client::SERVICE_PORT_INGRESS_START_TIMEOUT;
 use pplx_space_net_gateway_client::proto::{
     NetworkState, SandboxSubstrateKind, ServicePortIngressFrame, ServicePortIngressStart,
     SpaceApiRouteIdentity as ProtoSpaceApiRouteIdentity, service_port_ingress_frame,
 };
+use pplx_space_network_roles::GuestPort;
 use pplx_space_sandbox_grpc::SandboxTraceContext;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;

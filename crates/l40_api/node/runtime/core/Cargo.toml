@@ -53,6 +53,7 @@ pplx-space-cpu-arch = { workspace = true, features = ["serde"] }
 pplx-space-execution-common = { workspace = true }
 pplx-space-metrics-emit = { workspace = true, optional = true }
 pplx-space-transparent-proxy-socket = { workspace = true, optional = true }
+pplx-space-network-roles = { workspace = true, features = ["serde"] }
 pplx-space-uds-peer-auth = { workspace = true, optional = true }
 
 [build-dependencies]
