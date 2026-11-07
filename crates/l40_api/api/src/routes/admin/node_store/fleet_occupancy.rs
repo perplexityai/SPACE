@@ -27,7 +27,8 @@ pub(super) fn query(ranked: bool, residency: ResidencyEvidence) -> String {
         ("COUNT(*)".to_string(), format!("WHERE {local}"))
     };
     let targeted_lifecycle = format!("(s.lifecycle = 'suspended' OR ({ranked} AND (
-        s.lifecycle = 'suspending' OR (s.lifecycle = 'restoring' AND s.evacuation_restore_target IS NULL))))");
+        s.lifecycle = 'suspending' OR (s.lifecycle = 'restoring' AND s.evacuation_restore_target IS NULL
+            AND s.restore_episode_target IS NULL))))");
     let heartbeat = node_heartbeat_fresh("scope.node_id");
     let active_materialization = super::row_cte_materialization(ranked, residency);
 
@@ -81,7 +82,7 @@ pub(super) fn query(ranked: bool, residency: ResidencyEvidence) -> String {
          ), candidates AS (
              SELECT s.target_node_id AS node_id, s.id, s.lifecycle, s.placement_changed_at,
                     s.current_local_artifact_id, s.current_local_artifact_kind,
-                    s.evacuation_restore_target, TRUE AS targeted,
+                    s.evacuation_restore_target, s.restore_episode_target, TRUE AS targeted,
                     COALESCE(u.legacy_upload, FALSE) AS legacy_upload,
                     COALESCE(u.current_upload, FALSE) AS current_upload
                FROM sandboxes s
@@ -92,13 +93,13 @@ pub(super) fn query(ranked: bool, residency: ResidencyEvidence) -> String {
              -- Other sources must retain their own (node, sandbox) count.
              SELECT u.node_id, s.id, s.lifecycle, s.placement_changed_at,
                     s.current_local_artifact_id, s.current_local_artifact_kind,
-                    s.evacuation_restore_target, FALSE AS targeted,
+                    s.evacuation_restore_target, s.restore_episode_target, FALSE AS targeted,
                     u.legacy_upload, u.current_upload
                FROM uploading u
                CROSS JOIN LATERAL (
                    SELECT id, target_node_id, lifecycle, placement_changed_at,
                           current_local_artifact_id, current_local_artifact_kind,
-                          evacuation_restore_target
+                          evacuation_restore_target, restore_episode_target
                      FROM sandboxes WHERE id = u.sandbox_id OFFSET 0
                ) s
               WHERE s.target_node_id IS DISTINCT FROM u.node_id OR NOT {targeted_lifecycle}
@@ -115,7 +116,8 @@ pub(super) fn query(ranked: bool, residency: ResidencyEvidence) -> String {
                         WHERE {ranked} AND (
                             (targeted AND (
                                 lifecycle = 'suspending'
-                                OR (lifecycle = 'restoring' AND evacuation_restore_target IS NULL)
+                                OR (lifecycle = 'restoring' AND evacuation_restore_target IS NULL
+                                    AND restore_episode_target IS NULL)
                                 OR (lifecycle = 'suspended' AND NOT durable)
                             )) OR (current_upload AND NOT durable)
                         )

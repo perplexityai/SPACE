@@ -231,7 +231,8 @@ pub async fn stamp_action_lifecycle(
 ) -> Result<bool, sqlx::Error> {
     let result = sqlx::query(sql!(
         "UPDATE sandboxes
-            SET lifecycle = $1
+            SET lifecycle = $1,
+                restore_episode_target = NULL
           WHERE id = $2
             AND LOWER(TRIM(lifecycle)) = ANY($3::TEXT[])"
     ))
@@ -258,6 +259,7 @@ pub async fn stamp_started_after_start(
         "UPDATE sandboxes
             SET lifecycle = 'started',
                 placement = 'on_node',
+                restore_episode_target = NULL,
                 current_local_artifact_id = CASE
                     WHEN current_local_artifact_kind = 'disk' THEN NULL
                     ELSE current_local_artifact_id

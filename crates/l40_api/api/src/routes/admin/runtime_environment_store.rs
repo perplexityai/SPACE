@@ -47,7 +47,8 @@ pub(super) struct SandboxPopulationRow {
 /// definitions of a sandbox's current local artifact, of a restore retry's
 /// source and of an evacuation's newest snapshot rather than re-spelling
 /// them. It approximates the restore selectors' modes from row state: a
-/// Kubernetes evacuation is read off `evacuation_restore_target`, and a
+/// Kubernetes evacuation is read off `evacuation_restore_target` or
+/// `restore_episode_target`, and a
 /// storage location already recorded on a pod isn't visible here. `$1` and
 /// `$2` are the Direct and Kubernetes `managed_by` values.
 static SANDBOX_POPULATION_QUERY: LazyLock<String> = LazyLock::new(|| {
@@ -114,11 +115,13 @@ static SANDBOX_POPULATION_QUERY: LazyLock<String> = LazyLock::new(|| {
                                 WHERE ssl.snapshot_id = sn.id AND ssl.orphaned_at IS NULL
                             )
                             AND (
-                                (sb.evacuation_restore_target IS NOT NULL AND (
+                                ((sb.evacuation_restore_target IS NOT NULL
+                                  OR sb.restore_episode_target IS NOT NULL) AND (
                                     {marked}
                                     OR (sb.current_local_artifact_id IS NULL AND {newest_full})
                                 ))
                                 OR (sb.evacuation_restore_target IS NULL
+                                    AND sb.restore_episode_target IS NULL
                                     AND sb.lifecycle = 'suspended'
                                     AND (
                                         {marked}
@@ -129,6 +132,7 @@ static SANDBOX_POPULATION_QUERY: LazyLock<String> = LazyLock::new(|| {
                                         )
                                     ))
                                 OR (sb.evacuation_restore_target IS NULL
+                                    AND sb.restore_episode_target IS NULL
                                     AND sb.lifecycle = 'restoring'
                                     AND {retry_source})
                             ))
