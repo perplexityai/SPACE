@@ -1,7 +1,5 @@
 use super::*;
 
-use pplx_space_common_core::activation_seal_signals::ACTIVATIONS_SEALED_MARKER;
-
 const SANDBOX: &str = "sandbox-1";
 
 fn record(db: &crate::db::SharedConnection) -> Option<ActivationSealRecord> {

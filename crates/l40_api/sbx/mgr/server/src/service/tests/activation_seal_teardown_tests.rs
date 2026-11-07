@@ -247,9 +247,7 @@ async fn teardown_and_durability_work_answers_the_same_on_a_sealed_node() {
         }
         let sealed = run(teardown, &id, true).await;
         let refused_by_seal = sealed.0.as_ref().is_err_and(|(_, message)| {
-            message.contains(
-                pplx_space_common_core::activation_seal_signals::ACTIVATIONS_SEALED_MARKER,
-            )
+            message.contains(crate::activation_seal::ACTIVATIONS_SEALED_MARKER)
         });
         if sealed != unsealed || sealed.1 || refused_by_seal {
             mismatches.push(format!(

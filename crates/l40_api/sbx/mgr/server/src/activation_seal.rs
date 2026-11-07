@@ -18,10 +18,15 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use pplx_space_common_core::activation_seal_signals::ACTIVATIONS_SEALED_MARKER;
 use tonic::Status;
 
 use crate::db::activation_seal::{ActivationSealRecord, DrainPrior, write_activation_seal};
+
+/// The marker in the `FailedPrecondition` status a sealed node refuses a VM
+/// activation with. The node refuses the same activation until it is
+/// unsealed, so a caller places the work on another node or waits for the
+/// unseal rather than retrying here.
+pub(crate) const ACTIVATIONS_SEALED_MARKER: &str = "node activations are sealed";
 
 /// The seal and the activations in flight, read together.
 #[derive(Clone, Debug, Eq, PartialEq)]
