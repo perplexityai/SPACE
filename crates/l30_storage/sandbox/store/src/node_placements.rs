@@ -13,10 +13,11 @@ use uuid::Uuid;
 
 use crate::StoredSandboxLifecycle;
 
-/// A placement row's `sandboxes.lifecycle`. A value
-/// [`StoredSandboxLifecycle`] doesn't recognize is still listed, as stored,
-/// because this history is how an operator finds a row the code can't
-/// classify.
+/// A placement row's `sandboxes.lifecycle`. A value is recognized only in
+/// the exact form the writers store and the lifecycle filter compares. Any
+/// other text, another case or surrounding whitespace included, is listed as
+/// stored, so a malformed row stands out instead of being normalized away,
+/// and a lifecycle filter never matches it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NodePlacementLifecycle {
     Stored(StoredSandboxLifecycle),
@@ -24,8 +25,8 @@ pub enum NodePlacementLifecycle {
 }
 
 impl NodePlacementLifecycle {
-    /// The canonical stored form of a recognized value; an unrecognized one
-    /// as stored.
+    /// The column's text: a recognized value's stored form, which is the
+    /// text it was read from, or an unrecognized value as stored.
     pub fn as_str(&self) -> &str {
         match self {
             Self::Stored(lifecycle) => lifecycle.as_str(),
@@ -34,8 +35,10 @@ impl NodePlacementLifecycle {
     }
 
     fn from_stored(raw: String) -> Self {
-        raw.parse()
-            .map_or_else(|_| Self::Unrecognized(raw), Self::Stored)
+        match raw.parse::<StoredSandboxLifecycle>() {
+            Ok(lifecycle) if lifecycle.as_str() == raw => Self::Stored(lifecycle),
+            _ => Self::Unrecognized(raw),
+        }
     }
 }
 

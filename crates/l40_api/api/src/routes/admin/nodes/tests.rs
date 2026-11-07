@@ -2104,10 +2104,11 @@ async fn node_sandbox_history_filters_orders_and_pages_by_change() -> TestResult
     Ok(())
 }
 
-/// The store lists a lifecycle stored in another case or with surrounding
-/// whitespace in its canonical form, in both orders.
+/// The store recognizes a lifecycle only in the exact form the filter
+/// compares; another case, surrounding whitespace or a non-ASCII letter is
+/// listed as stored and matched by no lifecycle filter, in both orders.
 #[tokio::test]
-async fn node_placements_list_a_stored_lifecycle_in_canonical_form() -> TestResult<()> {
+async fn node_placements_list_only_the_exact_stored_form_as_recognized() -> TestResult<()> {
     let Some(db) = try_pg_test_db().await? else {
         return Ok(());
     };
@@ -2121,29 +2122,83 @@ async fn node_placements_list_a_stored_lifecycle_in_canonical_form() -> TestResu
     insert_history_rows(
         &db.pool,
         node_id,
-        " Started ",
+        "started",
         true,
         "2026-01-01T00:00:00Z",
         1,
     )
     .await?;
-    let started = node_placements::NodePlacementLifecycle::Stored(StoredSandboxLifecycle::Live(
-        pplx_space_common_core::types::SandboxLifecycle::Started,
-    ));
-    let filter = NodePlacementFilter::default();
+    insert_history_rows(
+        &db.pool,
+        node_id,
+        " Started ",
+        true,
+        "2026-01-01T01:00:00Z",
+        1,
+    )
+    .await?;
+    // A capital I with a dot (U+0130), which a collation-aware `lower` folds
+    // to an ASCII `i`.
+    insert_history_rows(
+        &db.pool,
+        node_id,
+        "FA\u{130}LED",
+        true,
+        "2026-01-01T02:00:00Z",
+        1,
+    )
+    .await?;
+    let started =
+        StoredSandboxLifecycle::Live(pplx_space_common_core::types::SandboxLifecycle::Started);
+    let failed =
+        StoredSandboxLifecycle::Live(pplx_space_common_core::types::SandboxLifecycle::Failed);
+    let exact = node_placements::NodePlacementLifecycle::Stored(started);
+    let spaced = node_placements::NodePlacementLifecycle::Unrecognized(" Started ".to_string());
+    let dotted = node_placements::NodePlacementLifecycle::Unrecognized("FA\u{130}LED".to_string());
 
-    let by_id = node_placements::list_by_id(&db.pool, node_id, &filter, None, 10).await?;
-    let by_change = node_placements::list_by_change(&db.pool, node_id, &filter, None, 10).await?;
-    for lifecycle in by_id
-        .iter()
-        .map(|row| &row.lifecycle)
-        .chain(by_change.iter().map(|row| &row.lifecycle))
-    {
-        assert_eq!(lifecycle, &started);
-        assert_eq!(lifecycle.as_str(), "started");
-    }
-    assert_eq!((by_id.len(), by_change.len()), (1, 1));
+    let (by_id, by_change) =
+        placement_lifecycles(&db.pool, node_id, NodePlacementFilter::default()).await?;
+    assert_eq!(by_id, [exact.clone(), spaced.clone(), dotted.clone()]);
+    assert_eq!(by_change, [dotted, spaced, exact.clone()]);
+    assert_eq!(
+        by_id
+            .iter()
+            .map(|lifecycle| lifecycle.as_str())
+            .collect::<Vec<_>>(),
+        ["started", " Started ", "FA\u{130}LED"]
+    );
+
+    let only = |lifecycle| NodePlacementFilter {
+        lifecycles: Some(vec![lifecycle]),
+        ..NodePlacementFilter::default()
+    };
+    let (by_id, by_change) = placement_lifecycles(&db.pool, node_id, only(started)).await?;
+    assert_eq!((by_id, by_change), (vec![exact.clone()], vec![exact]));
+    let (by_id, by_change) = placement_lifecycles(&db.pool, node_id, only(failed)).await?;
+    assert_eq!((by_id, by_change), (Vec::new(), Vec::new()));
     Ok(())
+}
+
+/// The node's placement lifecycles through `filter`, by id and by change.
+async fn placement_lifecycles(
+    pool: &sqlx::PgPool,
+    node_id: NodeId,
+    filter: NodePlacementFilter,
+) -> TestResult<(
+    Vec<node_placements::NodePlacementLifecycle>,
+    Vec<node_placements::NodePlacementLifecycle>,
+)> {
+    let by_id = node_placements::list_by_id(pool, node_id, &filter, None, 10)
+        .await?
+        .into_iter()
+        .map(|row| row.lifecycle)
+        .collect();
+    let by_change = node_placements::list_by_change(pool, node_id, &filter, None, 10)
+        .await?
+        .into_iter()
+        .map(|row| row.lifecycle)
+        .collect();
+    Ok((by_id, by_change))
 }
 
 /// A lifecycle the store doesn't recognize is listed as stored, and the rows
