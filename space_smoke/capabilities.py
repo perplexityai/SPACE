@@ -1628,6 +1628,16 @@ class DrainV2Control(NodeDrainControl, Protocol):
         """Have the worker's drain read `sandbox_ids` as quarantined (a test-hooks file)."""
         ...
 
+    def restore_terminated_worker(self, node_name: str, node_id: str) -> None:
+        """Bring a Kind worker `:terminate` removed back as a SPACE node.
+
+        `kube-delete` deletes the Node and the controller tombstones the row,
+        which keeps the worker out for good: drop that tombstone, restart the
+        worker's kubelet so it registers the Node again, and wait for the row
+        and the worker's operator shell. Idempotent.
+        """
+        ...
+
 
 @dataclass(frozen=True)
 class DeadNodeDryRun:

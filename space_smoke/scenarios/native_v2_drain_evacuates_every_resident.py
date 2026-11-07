@@ -18,9 +18,10 @@ PATH = "/tmp/space-smoke-v2-drain.txt"
 # publication, the controller recording each report, and each restore landing
 # the sandbox, with its file, in the lifecycle it had, on the other worker.
 #
-# On Kind, `:terminate` is `kube-delete`: the worker keeps running, its Node
-# registers again and its sandbox-manager keeps the seal, which the run's
-# cleanup lifts. What re-registers is recorded as `after_terminate`.
+# On Kind, `:terminate` is `kube-delete`: the worker keeps running, but its
+# Node is deleted and its row tombstoned. The run puts it back (drops the
+# tombstone, restarts its kubelet) and unseals it in cleanup; what it found is
+# recorded as `after_terminate`.
 @smoke.scenario(
     "native.v2_drain_evacuates_every_resident",
     api_surfaces=("native",),

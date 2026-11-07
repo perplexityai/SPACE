@@ -5284,6 +5284,36 @@ ON CONFLICT (key_hash) DO NOTHING;
             f"mark the drain's test-quarantined sandboxes on {node_name}",
         )
 
+    def restore_terminated_worker(self, node_name: str, node_id: str) -> None:
+        self._require_isolated_kind("restoring a terminated worker")
+        node = _kube_node_name(node_name)
+        self._psql(
+            "DELETE FROM node_k8s_tombstones"
+            f" WHERE node_id = '{_sql_uuid(node_id)}' AND k8s_node_name = '{node}'"
+            " AND reason = 'admin-terminate';\n",
+            action="drop the terminated worker's tombstone",
+        )
+        if not self.kube_node_exists(node):
+            _require_ok(
+                self._docker_exec(node, "systemctl", "restart", "kubelet", timeout=60),
+                f"restart kubelet on {node}",
+            )
+        deadline = time.monotonic() + 300
+        while True:
+            registered = self.kube_node_exists(node) and any(
+                n.k8s_node_name == node for n in self.admin_nodes()
+            )
+            if registered:
+                try:
+                    self._node_shell_pod(node)
+                    if self._node_shell_exec(node, "true", timeout=30).returncode == 0:
+                        return
+                except SmokeConfigurationError:
+                    pass
+            if time.monotonic() >= deadline:
+                raise RuntimeError(f"terminated worker {node} never registered again")
+            time.sleep(3)
+
     def set_drain_keep(self, node_name: str, value: str) -> None:
         self._require_isolated_kind("drain-keep override")
         if not re.fullmatch(r"[A-Za-z0-9._-]{1,63}", value):

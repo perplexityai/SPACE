@@ -5,9 +5,11 @@ durable elsewhere (`DrainNode`); the cluster controller records what the node
 reports and restores each sandbox to its prior lifecycle through a drain
 restore operation. The scenarios here pin residents to one worker by cordoning
 the other, uncordon it, and drain the first with `engine: v2`. Every run arms,
-before the drain, the undrain, the uncordon and an unseal of the worker: a
-worker a run terminated with `kube-delete` comes back with its sealed
-sandbox-manager database, and only the unseal opens it again.
+before the drain, the undrain, the uncordon and an unseal of the worker, and
+before a `:terminate`, the worker's return: a worker terminated with
+`kube-delete` comes back only once the harness drops its tombstone and
+restarts its kubelet, with its sealed sandbox-manager database, and only the
+unseal opens it again.
 """
 
 from __future__ import annotations
@@ -263,31 +265,38 @@ class DrainV2Assertions:
             self._fixture.wait(3)
 
     def terminate(self, *, timeout: float = 180) -> None:
-        """`:terminate` is accepted and the node's row goes; report what re-registers."""
+        """`:terminate` is accepted and the node's row goes; then the worker is put back.
 
-        status = self._control.terminate_node(self.node_id)
+        `kube-delete` deletes the Kind worker's Node and the controller
+        tombstones its row, so nothing brings the worker back by itself. The
+        restore is armed before the call, so a run that stops anywhere after it
+        still leaves the cluster with every worker.
+        """
+
+        node_name, node_id = self.node_name, self.node_id
+        self._scope.defer(
+            f"restore terminated worker {node_name}",
+            lambda: self._control.restore_terminated_worker(node_name, node_id),
+            critical=True,
+        )
+        status = self._control.terminate_node(node_id)
         self._fixture.verify(status in (200, 202), ":terminate of a drained v2 node was refused", status=status)
         deadline = time.monotonic() + timeout
-        while self._control.drain_v2_status(self.node_id) is not None:
+        while self._control.drain_v2_status(node_id) is not None:
             self._fixture.verify(
                 time.monotonic() < deadline, "the terminated node's row was never deleted"
             )
             self._fixture.wait(2)
-        # `kube-delete` leaves the Kind worker running: its kubelet registers
-        # the Node again, which a later inventory sync records as a new row.
-        deadline = time.monotonic() + timeout
-        while not self._control.kube_node_exists(self.node_name) and time.monotonic() < deadline:
-            self._fixture.wait(3)
-        reregistered = next(
-            (n for n in self._control.admin_nodes() if n.k8s_node_name == self.node_name), None
-        )
+        kube_node_deleted = not self._control.kube_node_exists(node_name)
+        self._control.restore_terminated_worker(node_name, node_id)
+        # The worker comes back sealed under the drain's epoch: its seal lives
+        # in its sandbox-manager database. The unseal armed with the drain
+        # opens it again.
         self._fixture.record(
             "after_terminate",
             {
-                "kube_node_present": self._control.kube_node_exists(self.node_name),
-                "new_node_id": None if reregistered is None else reregistered.id,
-                "new_node_drain_phase": None if reregistered is None else reregistered.drain_phase,
-                "seal": self._seal_state(),
+                "kube_node_deleted": kube_node_deleted,
+                "seal_on_return": self._seal_state(),
             },
         )
 
