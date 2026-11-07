@@ -68,7 +68,8 @@ CREATE VIEW node_k8s WITH (security_invoker = true) AS
 SELECT node_id,
        name AS k8s_node_name,
        incarnation_uid AS k8s_node_uid,
-       updated_at
+       updated_at,
+       instance_id
 FROM node_identities
 WHERE managed_by = 'k8s'
 WITH CASCADED CHECK OPTION;
@@ -92,4 +93,4 @@ GRANT SELECT (
 ) ON sandbox_execution_records TO space_credmgr;
 GRANT SELECT (node_id, k8s_node_name, k8s_node_uid)
     ON node_k8s TO space_credmgr;
-GRANT SELECT (updated_at, managed_by) ON node_identities TO space_credmgr;
+GRANT SELECT (updated_at, instance_id, managed_by) ON node_identities TO space_credmgr;
