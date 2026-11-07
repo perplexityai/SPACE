@@ -13,6 +13,7 @@
 //!
 //! ```rust
 //! # use pplx_space_common_core::types::*;
+//! # use pplx_space_byte_size::MemorySize;
 //! let sandbox_id = SandboxId::new();
 //! let template = TemplateName::parse("seed").unwrap();
 //! let memory = MemorySize::gib(4).unwrap();
@@ -51,7 +52,6 @@ pub mod runtime;
 pub mod sandbox;
 #[cfg(feature = "serde")]
 pub mod sandbox_artifact;
-pub use pplx_space_byte_size as size;
 pub mod snapshot;
 pub mod subject;
 pub mod template;
@@ -90,7 +90,6 @@ pub use runtime::{
 pub use sandbox::*;
 #[cfg(feature = "serde")]
 pub use sandbox_artifact::*;
-pub use size::*;
 pub use snapshot::*;
 pub use subject::{SubjectId, SubjectIdParseError, SubjectKind};
 pub use template::{

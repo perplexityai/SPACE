@@ -64,6 +64,7 @@ uuid = { workspace = true, features = ["v5", "v7"] }
 pplx-space-accounts = { workspace = true, features = ["serde"] }
 pplx-space-api-route = { workspace = true }
 pplx-space-auto-lifecycle-receipt = { workspace = true }
+pplx-space-byte-size = { workspace = true, features = ["serde"] }
 pplx-space-common-core = { workspace = true, features = ["serde"] }
 pplx-space-template-runtime = { workspace = true }
 pplx-space-btrfs = { workspace = true }

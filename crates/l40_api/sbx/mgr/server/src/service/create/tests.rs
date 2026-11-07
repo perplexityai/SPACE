@@ -487,7 +487,7 @@ async fn a_runtime_upgrade_fence_refuses_a_concurrent_restore_before_allocation(
 
 #[test]
 fn restore_guest_memory_uses_capture_shape_or_legacy_payload_and_rejects_conflict() {
-    use pplx_space_common_core::types::MemorySize;
+    use pplx_space_byte_size::MemorySize;
     for (captured, file, expected) in [
         (None, None, Ok(None)),
         (None, Some(2048), Ok(Some(2048))),

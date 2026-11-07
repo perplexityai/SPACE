@@ -1,6 +1,7 @@
 //! Durable metadata stored beside a sandbox's node-local files.
 
-use super::{ExecutionMetadata, MemorySize, SandboxId, TemplateName, VcpuCount};
+use super::{ExecutionMetadata, SandboxId, TemplateName, VcpuCount};
+use pplx_space_byte_size::MemorySize;
 use pplx_space_content_digest::ContentHash;
 use pplx_space_execution_spec::guest_image::GuestImageContract;
 use serde::{Deserialize, Deserializer, Serialize, de};

@@ -12201,8 +12201,9 @@ mod kubernetes_tests {
         pod: PooledSlotPod<'_>,
         node_labels: &[(String, String)],
     ) -> Result<PoolClaimFixture, BoxError> {
+        use pplx_space_byte_size::MemorySize;
         use pplx_space_cluster_pool::{NewPoolSlot, WarmPoolStore};
-        use pplx_space_common_core::types::{MemorySize, VcpuCount};
+        use pplx_space_common_core::types::VcpuCount;
         use pplx_space_content_digest::{ContentHash, Digest};
 
         use crate::controllers::substrate::ActorRef;

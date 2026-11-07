@@ -1,8 +1,9 @@
 //! Template releases as worker nodes report them in their inventory.
 
+use pplx_space_byte_size::MemorySize;
 use pplx_space_common_core::{
     sql,
-    types::{MemorySize, RuntimeKind, TemplateName, VcpuCount},
+    types::{RuntimeKind, TemplateName, VcpuCount},
 };
 use sqlx::PgExecutor;
 

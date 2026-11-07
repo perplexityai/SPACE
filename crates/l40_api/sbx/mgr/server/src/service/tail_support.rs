@@ -130,7 +130,7 @@ pub(super) fn codec_environment(
 pub(super) fn activation_metadata_json(
     sandbox: &crate::db::SandboxRow,
     cpu_budget: Option<pplx_space_common_core::types::VcpuCount>,
-    guest_memory: Option<pplx_space_common_core::types::MemorySize>,
+    guest_memory: Option<pplx_space_byte_size::MemorySize>,
 ) -> Result<String, Status> {
     use pplx_space_common_core::types::SandboxArtifactMetadata;
     let invalid = |error: String| Status::failed_precondition(error);

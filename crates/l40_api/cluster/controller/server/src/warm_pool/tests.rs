@@ -23,7 +23,8 @@ use kube::{
     runtime::{reflector, watcher::Event},
 };
 use pplx_space_api::controllers::substrate::direct::DirectSubstrate;
-use pplx_space_common_core::types::{MemorySize, TemplateName, VcpuCount};
+use pplx_space_byte_size::MemorySize;
+use pplx_space_common_core::types::{TemplateName, VcpuCount};
 use pplx_space_content_digest::{ContentHash, Digest};
 use pplx_space_db_test_fixtures::{TestDb, pg_test_db};
 use pplx_space_sandbox_pod::{

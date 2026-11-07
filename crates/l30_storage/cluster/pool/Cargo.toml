@@ -20,6 +20,7 @@ workspace = true
 [features]
 default = ["kubernetes"]
 kubernetes = [
+    "dep:pplx-space-byte-size",
     "dep:pplx-space-common-core",
     "dep:pplx-space-content-digest",
     "dep:serde",
@@ -30,6 +31,7 @@ kubernetes = [
 ]
 
 [dependencies]
+pplx-space-byte-size = { workspace = true, features = ["serde"], optional = true }
 pplx-space-common-core = { workspace = true, features = ["serde", "sqlx"], optional = true }
 pplx-space-content-digest = { workspace = true, features = ["serde"], optional = true }
 serde = { workspace = true, features = ["derive"], optional = true }
