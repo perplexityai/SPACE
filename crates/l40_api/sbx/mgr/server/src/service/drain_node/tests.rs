@@ -307,13 +307,10 @@ fn the_orphan_inventory_blocks_only_on_what_can_hold_a_resident() {
     assert_eq!(
         findings.dirs,
         [
-            (
-                "z".to_owned(),
-                "orphan cache directory /cache/z recovery can't adopt".to_owned()
-            ),
+            ("z".to_owned(), "orphan cache directory /cache/z".to_owned()),
             (
                 "x".to_owned(),
-                "orphan run directory /run/sandboxes/x recovery can't adopt".to_owned()
+                "orphan run directory /run/sandboxes/x".to_owned()
             ),
         ]
     );

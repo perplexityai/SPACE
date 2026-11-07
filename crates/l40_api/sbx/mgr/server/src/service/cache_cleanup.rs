@@ -22,9 +22,6 @@ pub(super) enum ReconcileSource {
     Startup,
     Cleanup,
     Periodic,
-    /// A node drain's walk, which adopts recoverable orphans before it
-    /// reports.
-    Drain,
     #[cfg(test)]
     Test,
 }
@@ -35,7 +32,6 @@ impl ReconcileSource {
             Self::Startup => "startup",
             Self::Cleanup => "cleanup",
             Self::Periodic => "periodic",
-            Self::Drain => "drain",
             #[cfg(test)]
             Self::Test => "reconcile-test",
         }

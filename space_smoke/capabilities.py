@@ -1815,10 +1815,6 @@ class DrainV2Control(DeadNodeControl, Protocol):
         unsealed."""
         ...
 
-    def mark_drain_test_quarantined(self, node_name: str, sandbox_ids: Sequence[str]) -> None:
-        """Have the worker's drain read `sandbox_ids` as quarantined (a test-hooks file)."""
-        ...
-
     def drain_restore_states(self, sandbox_id: str) -> list[str]:
         """The state of each `drain_restore_sandbox` operation of the sandbox, oldest first."""
         ...
