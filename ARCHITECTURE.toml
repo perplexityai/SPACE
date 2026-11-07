@@ -383,6 +383,7 @@ pplx-space-cluster-trigger-queue = [
 pplx-space-credential-injection-store = ["pplx-space-api", "pplx-space-credmgr"]
 pplx-space-federated-grant-store = ["pplx-space-api", "pplx-space-credmgr"]
 pplx-space-node-registration-store = ["pplx-space-api", "pplx-space-credmgr"]
+pplx-space-node-status-store = ["pplx-space-api"]
 pplx-space-postgres-pool = [
   "pplx-space-api",
   "pplx-space-cluster-controller-server",

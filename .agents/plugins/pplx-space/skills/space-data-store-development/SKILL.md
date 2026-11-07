@@ -54,6 +54,17 @@ Exemplar: `crates/l30_storage/sandbox/store` (`pplx-space-sandbox-store`, the
   sets: a drain gate and the drained-node terminator that disagree park a node
   in `drained`. Build the statement once, bind every value, and keep the rest
   of the statement whole at its query site.
+- Another is a whole expression about node environment evidence:
+  `pplx_space_node_status_store`'s `environment_evidence` and
+  `environment_refusal`, the single definition of whether a node's published
+  environments count as evidence, and
+  `pplx_space_runtime_environment_catalog_store::node_certifies_upgrade`,
+  whether a node's own build certifies an upgrade edge, for the upgrade path
+  that will call it. Interpolate them
+  rather than re-spelling the freshness or certification rules: placement
+  and the upgrade decision have to agree on which nodes can run what. Build
+  the statement once, bind every value, and keep the rest of the statement
+  whole at its query site.
 - The last is the column list of one row type read from one table: a shared
   constant of that table's bare column names, with no expressions, aliases, or
   joined columns, matching one `FromRow` struct field for field. Interpolate it
