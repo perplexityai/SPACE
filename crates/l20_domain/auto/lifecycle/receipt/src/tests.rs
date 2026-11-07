@@ -2,7 +2,7 @@ use pplx_space_auto_lifecycle::{
     AutoLifecycleConditionSet, AutoLifecycleConditionSetId, AutoLifecycleIdleAction,
     AutoLifecyclePolicy, AutoLifecycleStage, AutoLifecycleWakePolicy, AutoLifecycleWakeSource,
 };
-use pplx_space_common_core::types::SimpleDuration;
+use pplx_space_durations::SimpleDuration;
 
 use super::*;
 

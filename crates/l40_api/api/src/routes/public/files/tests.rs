@@ -1,5 +1,6 @@
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
-use pplx_space_common_core::types::{GuestUserName, SandboxId};
+use pplx_space_common_core::types::SandboxId;
+use pplx_space_guest_process::GuestUserName;
 use pplx_space_native_files::limits::{
     FILE_WRITE_CHUNK_BYTES, MAX_FILE_READ_BYTES, MAX_FILE_WRITE_BYTES,
 };

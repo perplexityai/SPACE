@@ -6,7 +6,9 @@ use pplx_space_auto_lifecycle::{
 };
 use pplx_space_common_cli::{exit_error, exit_message, unwrap_or_exit};
 use pplx_space_common_core::ids::sandbox_label_or_id as sandbox_label;
-use pplx_space_common_core::types::{GuestUserName, SandboxId, SandboxSelector, SimpleDuration};
+use pplx_space_common_core::types::{SandboxId, SandboxSelector};
+use pplx_space_durations::SimpleDuration;
+use pplx_space_guest_process::GuestUserName;
 use pplx_space_policy_authority::PolicyAuthority;
 use prost_types::Timestamp;
 use std::collections::{BTreeMap, HashMap};

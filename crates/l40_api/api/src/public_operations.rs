@@ -7,7 +7,8 @@ use std::sync::LazyLock;
 use std::time::Duration;
 
 use crate::metrics::operations::ClaimAttempt;
-use pplx_space_common_core::types::{IdempotencyKey, SandboxId, SandboxLifecycle};
+use pplx_space_common_core::types::{SandboxId, SandboxLifecycle};
+use pplx_space_guest_process::IdempotencyKey;
 use pplx_space_public_api::{
     OperationId, OperationKind, OperationState, OperationTargetType, PublicErrorCode,
     PublicOperationEvent, PublicOperationEventType, PublicOperationRecord, PublicOperationResult,

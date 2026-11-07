@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use pplx_space_common_core::types::{GuestPath, RelativeGuestPath};
+use pplx_space_guest_process::{GuestPath, RelativeGuestPath};
 use pplx_space_pii::Pii;
 use pplx_space_spaced_guest_protocol::proto::bridge_guest::{FileEvent, FileEventKind};
 

@@ -590,7 +590,7 @@ fn runtime_translation_owns_intent_only_and_validates_readiness() {
         runtime.readiness(),
         pplx_space_template_runtime::RuntimeReadiness::Exec(_)
     ));
-    let key = pplx_space_common_core::types::EnvKey::parse("APP_MODE").unwrap();
+    let key = pplx_space_guest_process::EnvKey::parse("APP_MODE").unwrap();
     assert_eq!(
         runtime.env().as_map().get(&key).unwrap().expose(),
         "template"

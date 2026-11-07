@@ -1,5 +1,5 @@
 use clap::{ArgAction, Parser};
-use pplx_space_common_core::types::SimpleDuration;
+use pplx_space_durations::SimpleDuration;
 use pplx_space_spaced_guest_client::proto::{
     RequestActiveForResponse, RequestShutdownResponse, SetActivityStateResponse,
     request_active_for_response::Outcome as ActiveForOutcome,

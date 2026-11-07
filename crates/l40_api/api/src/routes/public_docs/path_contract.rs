@@ -519,7 +519,7 @@ fn path_parameter_schema(name: &str) -> Value {
             json!({ "type": "string", "pattern": format!("^({prefixes})_{UUID_PATTERN}$") })
         }
         "process_id" => {
-            let max_bytes = pplx_space_common_core::types::MAX_PROCESS_ID_BYTES;
+            let max_bytes = pplx_space_guest_process::MAX_PROCESS_ID_BYTES;
             json!({
                 "type": "string",
                 "minLength": 1,

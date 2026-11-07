@@ -7,10 +7,11 @@ use axum::{
     extract::{Path, State},
     http::{HeaderMap, StatusCode},
 };
-use pplx_space_common_core::types::{IdempotencyKey, SandboxId};
+use pplx_space_common_core::types::SandboxId;
 use pplx_space_events::{
     SandboxEventDetails, SandboxEventSource, SandboxEventType, emit_sandbox_event,
 };
+use pplx_space_guest_process::IdempotencyKey;
 use pplx_space_public_api::PublicErrorCode;
 
 use super::{AppState, E2bApiError, MatchedEcwHost, acquire_client_slot, request_client_id};

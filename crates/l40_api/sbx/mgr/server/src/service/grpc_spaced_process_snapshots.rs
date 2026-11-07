@@ -1616,12 +1616,12 @@ fn start_process_options(
 ) -> Result<pplx_space_spaced_host_client::StartProcessOptions, Status> {
     let invalid = |error: std::fmt::Arguments<'_>| Status::invalid_argument(error.to_string());
     Ok(pplx_space_spaced_host_client::StartProcessOptions {
-        command: pplx_space_common_core::types::ProcessCommand::new(operation.command.clone())
+        command: pplx_space_guest_process::ProcessCommand::new(operation.command.clone())
             .map_err(|error| invalid(format_args!("{error}")))?,
         cwd: operation
             .cwd
             .clone()
-            .map(pplx_space_common_core::types::GuestPath::parse)
+            .map(pplx_space_guest_process::GuestPath::parse)
             .transpose()
             .map_err(|error| invalid(format_args!("{error}")))?,
         env: pplx_space_spaced_guest_protocol::parse_env(operation.env.clone()),
@@ -1636,7 +1636,7 @@ fn start_process_options(
         idempotency_key: operation
             .idempotency_key
             .clone()
-            .map(pplx_space_common_core::types::IdempotencyKey::parse)
+            .map(pplx_space_guest_process::IdempotencyKey::parse)
             .transpose()
             .map_err(|error| invalid(format_args!("{error}")))?,
         tag: operation.tag.clone(),
@@ -1646,7 +1646,7 @@ fn start_process_options(
         process_id: operation
             .process_id
             .clone()
-            .map(pplx_space_common_core::types::ProcessId::parse)
+            .map(pplx_space_guest_process::ProcessId::parse)
             .transpose()
             .map_err(|error| invalid(format_args!("{error}")))?,
     })

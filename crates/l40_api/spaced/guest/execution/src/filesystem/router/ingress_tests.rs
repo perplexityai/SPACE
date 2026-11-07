@@ -1,5 +1,5 @@
 use super::*;
-use pplx_space_common_core::types::IdempotencyKey;
+use pplx_space_guest_process::IdempotencyKey;
 use pplx_space_spaced_guest_protocol::proto::bridge_guest::{
     WriteBatchEntry, filesystem_client::FilesystemClient,
 };

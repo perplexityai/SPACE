@@ -51,6 +51,7 @@ pplx-space-file-io = { workspace = true, features = ["reflink"] }
 pplx-space-content-digest = { workspace = true, features = ["serde"] }
 pplx-space-cpu-arch = { workspace = true, features = ["serde"] }
 pplx-space-execution-common = { workspace = true }
+pplx-space-guest-process = { workspace = true, features = ["serde"] }
 pplx-space-linux-ids = { workspace = true, features = ["serde"] }
 pplx-space-metrics-emit = { workspace = true, optional = true }
 pplx-space-transparent-proxy-socket = { workspace = true, optional = true }

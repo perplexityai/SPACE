@@ -1,5 +1,5 @@
 use nix::unistd::{Uid, User};
-use pplx_space_common_core::types::GuestUserName;
+use pplx_space_guest_process::GuestUserName;
 use pplx_space_spaced_guest_server::{
     FilesystemExecutionMode, HostConnectorType, SpacedGuestService, SpacedGuestServiceConfig,
 };

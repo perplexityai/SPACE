@@ -33,6 +33,7 @@ pplx-space-accounts = { workspace = true, features = ["sqlx", "serde"] }
 pplx-space-auto-lifecycle = { workspace = true, features = ["serde"] }
 pplx-space-cluster-pool = { workspace = true }
 pplx-space-common-core = { workspace = true, features = ["sqlx", "serde"] }
+pplx-space-durations = { workspace = true, features = ["serde"] }
 pplx-space-k8s-ids = { workspace = true, features = ["serde"] }
 pplx-space-sandbox-portability = { workspace = true }
 pplx-space-sandbox-residency = { workspace = true }

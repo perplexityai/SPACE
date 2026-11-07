@@ -60,6 +60,7 @@ pplx-space-content-digest = { workspace = true, features = ["serde"] }
 pplx-space-cpu-arch = { workspace = true, features = ["serde"] }
 pplx-space-grpc-rate-limiter = { workspace = true }
 pplx-space-grpc-server = { workspace = true }
+pplx-space-guest-process = { workspace = true, features = ["serde"] }
 pplx-space-local-health = { workspace = true }
 pplx-space-page-cache = { workspace = true }
 pplx-space-rpc-auth = { workspace = true }

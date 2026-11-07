@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use futures_util::{Stream, StreamExt};
-use pplx_space_common_core::types::GuestUserName;
+use pplx_space_guest_process::GuestUserName;
 use pplx_space_spaced_guest_protocol::invalid_argument_status;
 use pplx_space_spaced_guest_protocol::proto::bridge_guest::filesystem_server::Filesystem;
 use pplx_space_spaced_guest_protocol::proto::bridge_guest::{
@@ -330,7 +330,7 @@ impl FilesystemHandle {
     async fn mutate(
         &self,
         user: GuestUserName,
-        key: Option<pplx_space_common_core::types::IdempotencyKey>,
+        key: Option<pplx_space_guest_process::IdempotencyKey>,
         kind: Kind,
         command: Command,
         admission: RequestPermit,

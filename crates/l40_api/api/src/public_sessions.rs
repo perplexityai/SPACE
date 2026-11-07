@@ -4,7 +4,7 @@ use pplx_space_common_core::types::SandboxId;
 use pplx_space_common_core::sql;
 use std::time::Duration;
 
-use pplx_space_common_core::types::IdempotencyKey;
+use pplx_space_guest_process::IdempotencyKey;
 use pplx_space_public_api::{
     DataPlaneAttachInfo, DataPlaneScope, DataPlaneSessionId, DataPlaneTokenTransport,
     OperationKind, OperationState, OperationTargetType, PublicOperationEventType,

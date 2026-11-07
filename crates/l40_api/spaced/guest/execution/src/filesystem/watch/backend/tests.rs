@@ -3,7 +3,7 @@ use notify::event::{ModifyKind, RemoveKind, RenameMode};
 use std::time::Duration;
 
 use super::*;
-use pplx_space_common_core::types::GuestPath;
+use pplx_space_guest_process::GuestPath;
 
 #[cfg(unix)]
 #[tokio::test]
@@ -12,7 +12,7 @@ async fn path_loss_is_scoped_to_matching_consumers_and_monitoring_continues() {
 
     use super::super::WatchManager;
     use futures_util::StreamExt;
-    use pplx_space_common_core::types::{MAX_GUEST_PATH_BYTES, RelativeGlobPattern};
+    use pplx_space_guest_process::{MAX_GUEST_PATH_BYTES, RelativeGlobPattern};
     use pplx_space_spaced_guest_protocol::proto::bridge_guest::GetModifiedFilesRequest;
 
     for (name, loses_identity, displayed) in [
@@ -188,7 +188,7 @@ fn non_utf8_events_are_reported_unless_intentionally_excluded() {
     use std::os::unix::ffi::OsStringExt;
 
     use super::super::filter::WatchFilterConfig;
-    use pplx_space_common_core::types::RelativeGlobPattern;
+    use pplx_space_guest_process::RelativeGlobPattern;
 
     let root = Path::new("/watched");
     let invalid_name = std::ffi::OsString::from_vec(vec![0xff]);
@@ -247,7 +247,7 @@ fn non_utf8_events_are_reported_unless_intentionally_excluded() {
 async fn nested_watchers_keep_their_own_relative_paths_and_excludes() {
     use super::super::WatchManager;
     use futures_util::StreamExt;
-    use pplx_space_common_core::types::RelativeGlobPattern;
+    use pplx_space_guest_process::RelativeGlobPattern;
     for exclude in [None, Some("child/**")] {
         let directory = tempfile::tempdir().expect("directory");
         let child = directory.path().join("child");

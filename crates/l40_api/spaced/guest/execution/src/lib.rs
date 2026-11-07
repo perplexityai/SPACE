@@ -4,7 +4,7 @@
 //! predecode protection, readiness, worker entrypoint dispatch, and shutdown orchestration.
 //! See the crate README for the guest process assumptions.
 
-use pplx_space_common_core::types::{DEFAULT_GUEST_USER, EnvMap, GuestUserName};
+use pplx_space_guest_process::{DEFAULT_GUEST_USER, EnvMap, GuestUserName};
 use pplx_space_spaced_guest_protocol::proto::bridge_guest::process_server::{
     Process, ProcessServer,
 };

@@ -1,6 +1,6 @@
 use super::*;
 use futures_util::StreamExt;
-use pplx_space_common_core::types::GuestUserName;
+use pplx_space_guest_process::GuestUserName;
 use pplx_space_spaced_guest_protocol::proto::bridge_guest::StartRequest;
 use pplx_space_spaced_guest_protocol::proto::bridge_guest::process_server::Process;
 
@@ -1382,7 +1382,7 @@ fn a_stalled_spawn_does_not_hold_up_other_starts() {
 #[tokio::test]
 async fn a_reconnect_before_its_process_is_published_waits_or_retries() {
     let (service, placement) = stalled_placement_service();
-    let process_id = pplx_space_common_core::types::ProcessId::new();
+    let process_id = pplx_space_guest_process::ProcessId::new();
     let request = |key: &str| {
         Request::new(StartRequest {
             command: vec!["/bin/sh".into(), "-c".into(), "exit 0".into()],

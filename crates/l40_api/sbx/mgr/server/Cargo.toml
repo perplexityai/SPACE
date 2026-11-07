@@ -80,6 +80,8 @@ pplx-space-lru-reaper = { workspace = true }
 pplx-space-env-vars = { workspace = true }
 pplx-space-content-digest = { workspace = true, features = ["serde"] }
 pplx-space-cpu-arch = { workspace = true, features = ["serde"] }
+pplx-space-durations = { workspace = true, features = ["serde"] }
+pplx-space-guest-process = { workspace = true, features = ["serde"] }
 pplx-space-k8s-ids = { workspace = true, features = ["serde"] }
 pplx-space-linux-ids = { workspace = true, features = ["serde"] }
 pplx-space-network-roles = { workspace = true, features = ["serde"] }

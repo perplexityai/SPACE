@@ -28,7 +28,6 @@ pub mod balloon;
 pub mod cluster;
 pub mod compute;
 pub mod disk_io;
-pub mod env;
 pub mod environment;
 pub use pplx_space_execution_spec::execution;
 pub use pplx_space_execution_spec::guest_image;
@@ -38,10 +37,8 @@ pub mod node;
 pub mod node_fs;
 pub mod node_group;
 pub mod object_store;
-pub mod path;
 #[cfg(feature = "sqlx")]
 mod postgres;
-pub mod process;
 pub mod restore_retirement;
 pub mod runtime;
 pub mod sandbox;
@@ -50,7 +47,6 @@ pub mod sandbox_artifact;
 pub mod snapshot;
 pub mod subject;
 pub mod template;
-pub mod time;
 
 #[cfg(feature = "serde")]
 pub use admin::*;
@@ -58,7 +54,6 @@ pub use balloon::*;
 pub use cluster::*;
 pub use compute::*;
 pub use disk_io::*;
-pub use env::*;
 pub use environment::*;
 pub use execution::*;
 pub use host_cpu::*;
@@ -67,8 +62,6 @@ pub use node::*;
 pub use node_fs::*;
 pub use node_group::*;
 pub use object_store::*;
-pub use path::*;
-pub use process::*;
 pub use restore_retirement::*;
 pub use runtime::{
     EffectiveStartup, RUNTIME_CLOUD_HYPERVISOR, RUNTIME_CLOUD_HYPERVISOR_ALIAS,
@@ -92,4 +85,3 @@ pub use template::{
     TemplateSelector, TemplateTag, TemplateTagParseError, TemplateVisibility,
     TemplateVisibilityParseError,
 };
-pub use time::*;

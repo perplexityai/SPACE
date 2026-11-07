@@ -184,7 +184,8 @@ use std::time::{Duration, Instant};
 
 use crate::metrics::node_drain as node_drain_metrics;
 use pplx_space_api::controllers::substrate::NODE_RPC_BLOCKING_BUDGET;
-use pplx_space_common_core::types::{NodeDrainMode, PositiveDuration, SandboxLifecycle};
+use pplx_space_common_core::types::{NodeDrainMode, SandboxLifecycle};
+use pplx_space_durations::PositiveDuration;
 use pplx_space_sandbox_pod::EvacuationPlacement;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;

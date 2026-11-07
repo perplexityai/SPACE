@@ -22,8 +22,8 @@ tracing = { workspace = true }
 uuid = { workspace = true, features = ["v7"] }
 
 # internal
-pplx-space-common-core = { workspace = true }
 pplx-space-host-layout = { workspace = true }
+pplx-space-guest-process = { workspace = true }
 pplx-space-pii = { workspace = true }
 pplx-space-spaced-guest-protocol = { workspace = true }
 pplx-space-spaced-protocol = { workspace = true }

@@ -87,7 +87,8 @@ use crate::metrics::cluster_reconciler::{self as metrics, Loop, Mode, OutcomeEve
 use pplx_space_api::controllers::substrate::kubernetes::{
     K8sBlockingDeleteOutcome, KubernetesSubstrate, SandboxPodKey, SandboxPodView,
 };
-use pplx_space_common_core::types::{PositiveDuration, SandboxId};
+use pplx_space_common_core::types::SandboxId;
+use pplx_space_durations::PositiveDuration;
 use pplx_space_events::{
     SandboxEvent, SandboxEventDetails, SandboxEventSource, SandboxEventTrigger, SandboxEventType,
 };

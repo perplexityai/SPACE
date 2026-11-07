@@ -60,6 +60,7 @@ pplx-space-common-core = { workspace = true }
 pplx-space-node-disk-admission = { workspace = true }
 pplx-space-common-grpc = { workspace = true, features = ["internal-tls"] }
 pplx-space-env-vars = { workspace = true }
+pplx-space-durations = { workspace = true }
 pplx-space-network-roles = { workspace = true }
 pplx-space-sandbox-grpc = { workspace = true }
 pplx-space-feature-flags = { workspace = true }

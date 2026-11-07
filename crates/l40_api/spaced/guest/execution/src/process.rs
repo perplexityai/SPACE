@@ -6,7 +6,7 @@ use crate::idempotency::{
 };
 use crate::identity::GuestAccount;
 use dashmap::DashMap;
-use pplx_space_common_core::types::{GuestUserName, ProcessCommand, ProcessId, ProcessSignal};
+use pplx_space_guest_process::{GuestUserName, ProcessCommand, ProcessId, ProcessSignal};
 use pplx_space_pii::Pii;
 use std::os::fd::{AsFd, AsRawFd, OwnedFd, RawFd};
 use std::sync::Weak;
@@ -114,7 +114,7 @@ struct ProcessSupervision {
     child: tokio::process::Child,
     exit_observer: ExitObserver,
     output_tasks: VecDeque<ProcessOutputTask>,
-    timeout: Option<pplx_space_common_core::types::ReadyTimeout>,
+    timeout: Option<pplx_space_guest_process::ReadyTimeout>,
     shutdown: tokio_util::sync::CancellationToken,
     record: Arc<ProcessRecord>,
     process_id: ProcessId,
@@ -240,7 +240,7 @@ struct ProcessLaunch {
     stdin_enabled: bool,
     /// What `list` reports; the pid is filled in once the child exists.
     info: ProcessInfo,
-    timeout: Option<pplx_space_common_core::types::ReadyTimeout>,
+    timeout: Option<pplx_space_guest_process::ReadyTimeout>,
     process_id: ProcessId,
     spawn_thread: SpawnThread,
     claim: ProcessIdClaim,

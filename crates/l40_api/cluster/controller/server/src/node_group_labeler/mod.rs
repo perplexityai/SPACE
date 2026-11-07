@@ -86,8 +86,9 @@ use pplx_space_api::routes::admin::audit::{
 };
 use pplx_space_api::routes::admin::node_groups::group_state_summary;
 use pplx_space_common_core::types::{
-    NodeGroupName, NodeGroupNameParseError, NodeGroupTemplatePolicy, PositiveDuration,
+    NodeGroupName, NodeGroupNameParseError, NodeGroupTemplatePolicy,
 };
+use pplx_space_durations::PositiveDuration;
 
 use crate::env_config;
 

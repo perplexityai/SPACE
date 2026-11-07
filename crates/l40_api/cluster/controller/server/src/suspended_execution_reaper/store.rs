@@ -5,7 +5,7 @@ use pplx_space_common_core::types::SandboxId;
 use pplx_space_common_core::types::{LocalArtifactId, SubstrateKind};
 
 use pplx_space_common_core::sql;
-use pplx_space_common_core::types::PositiveDuration;
+use pplx_space_durations::PositiveDuration;
 use pplx_space_sandbox_portability::newest_suspend_snapshot_current;
 use pplx_space_sandbox_store::repair::unplace_suspended_after_execution_retired;
 use sqlx::PgPool;
