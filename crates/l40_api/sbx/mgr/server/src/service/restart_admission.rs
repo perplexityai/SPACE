@@ -221,6 +221,9 @@ restart_rpcs! {
     SandboxSealActivations => ("/space.sandbox.manager.v1.SandboxManager/SealActivations", ReadOnlyWithNarrowStateWrites),
     SandboxUnsealActivations => ("/space.sandbox.manager.v1.SandboxManager/UnsealActivations", ReadOnlyWithNarrowStateWrites),
     SandboxActivationSealState => ("/space.sandbox.manager.v1.SandboxManager/ActivationSealState", ReadOnly),
+    // The drain's own writes are the seal row and its evacuation record; each
+    // suspend or upload it starts takes its own state-writer lease.
+    SandboxDrainNode => ("/space.sandbox.manager.v1.SandboxManager/DrainNode", ReadOnlyWithNarrowStateWrites),
     SandboxState => ("/space.sandbox.manager.v1.SandboxManager/State", ReadOnly),
     SandboxGetHealth => ("/space.sandbox.manager.v1.SandboxManager/GetSandboxHealth", ReadOnly),
     SandboxGetEnv => ("/space.sandbox.manager.v1.SandboxManager/GetEnv", ReadOnly),
