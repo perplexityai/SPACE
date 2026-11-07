@@ -360,15 +360,19 @@ pub enum V2StoppedEvacuation {
 /// published disk) and an **operation step** (the release), in the caller's
 /// transaction.
 ///
-/// Fenced on the row's home and its stop: the row must be `stopped` with no
-/// v1 marker and `active_node_id = node_id`; its active execution must be on
+/// Fenced on the row's home and its stop: the row must be `stopped` with
+/// `active_node_id = node_id` (a v1 stopped marker an undrain left on it is
+/// taken over and cleared); its active execution must be on
 /// `k8s_node_name` and predate the stop (`created_at <= lifecycle_changed_at`)
 /// with no live activation attempt; and the disk must be a ready, stored
-/// `disk` snapshot of `artifact` taken since the stop
-/// (`timestamp >= lifecycle_changed_at`). A report from an earlier stop, or
-/// replayed after a start, finds another stop or another home and changes
-/// nothing. The pin must be unset or already `artifact`: a row pinning
-/// another disk is refused, never settled. Then, in one statement each, the
+/// `disk` snapshot of `artifact`, taken since the stop
+/// (`timestamp >= lifecycle_changed_at`) when the row pins no disk yet. A
+/// report from an earlier stop, or replayed after a start, finds another
+/// stop or another home and changes nothing. The pin must be unset or
+/// already `artifact`: a row pinning another disk is refused, never settled.
+/// A row already pinning `artifact` (a stopped re-placement onto the node
+/// landed it, after the disk's publication) is released on the disk's
+/// durability alone. Then, in one statement each, the
 /// row takes the pin and is unplaced, and the pre-stop execution is retired;
 /// its next start materializes the disk on any node.
 pub async fn evacuate_v2_stopped(
@@ -401,7 +405,13 @@ pub async fn evacuate_v2_stopped(
                      AND sn.local_artifact_id = $2
                      AND sn.type = 'disk'
                      AND sn.state = 'ready'
-                     AND sn.timestamp >= s.lifecycle_changed_at
+                     -- A row already pinning the disk took it at its stop,
+                     -- or at a re-placement onto this node, whose landing
+                     -- moved `lifecycle_changed_at` past the disk's
+                     -- publication. Only an unpinned row's disk must be
+                     -- this stop's, from its time.
+                     AND (s.current_local_artifact_id IS NOT NULL
+                          OR sn.timestamp >= s.lifecycle_changed_at)
                      AND EXISTS (
                        SELECT 1 FROM snapshot_storage_locations ssl
                         WHERE ssl.snapshot_id = sn.id AND ssl.orphaned_at IS NULL
@@ -451,11 +461,9 @@ pub async fn evacuate_v2_stopped(
         Some(home) if home == node_id => {}
         _ => return Ok(V2StoppedEvacuation::MovedOn),
     }
-    if marked {
-        return Ok(V2StoppedEvacuation::Refused(
-            "the row carries the v1 drain's evacuation marker",
-        ));
-    }
+    // A v1 stopped evacuation's marker on a row still stopped at home is one
+    // an undrain abandoned before v1 claimed the row (its claim moves the row
+    // to `restoring`): the release below takes it over and clears it.
     if pin.is_some() && !pinned_here {
         return Ok(V2StoppedEvacuation::Refused(
             "the row pins another artifact than the disk the node published",
@@ -481,7 +489,8 @@ pub async fn evacuate_v2_stopped(
                 target_node_id = NULL,
                 placement = 'unplaced',
                 command_ready_pending = FALSE,
-                placement_changed_at = NULL
+                placement_changed_at = NULL,
+                evacuation_restore_target = NULL
           WHERE id = $1"
     ))
     .bind(sandbox_id)

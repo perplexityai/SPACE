@@ -821,6 +821,7 @@ async fn evacuate(
 /// disk and released from its home, once, and answers released again after.
 /// A report it can't take, from another stop or with another pin, changes
 /// nothing and is refused, never settled; a row that left the node moved on.
+/// A v1 marker an undrain abandoned is taken over.
 #[tokio::test(flavor = "current_thread")]
 async fn a_stopped_sandbox_is_released_only_on_its_homes_report_of_this_stops_disk() -> TestResult {
     let Some(db) = try_pg_test_db().await? else {
@@ -871,7 +872,7 @@ async fn a_stopped_sandbox_is_released_only_on_its_homes_report_of_this_stops_di
     assert_eq!(row_image(pool, id).await?, after, "released twice");
 
     type Setup = fn(SandboxId, NodeId) -> String;
-    let cases: [(&str, &str, Setup, bool); 8] = [
+    let cases: [(&str, &str, Setup, bool); 7] = [
         (
             "disk from before the stop",
             OLDER,
@@ -884,16 +885,6 @@ async fn a_stopped_sandbox_is_released_only_on_its_homes_report_of_this_stops_di
             |id, _| {
                 format!(
                     "UPDATE sandboxes SET current_local_artifact_id = gen_random_uuid(), current_local_artifact_kind = 'disk', current_local_artifact_origin = 'stop' WHERE id = '{id}'"
-                )
-            },
-            true,
-        ),
-        (
-            "v1 marker",
-            NEWER,
-            |id, _| {
-                format!(
-                    "UPDATE sandboxes SET evacuation_restore_target = 'stopped' WHERE id = '{id}'"
                 )
             },
             true,
@@ -975,6 +966,68 @@ async fn a_stopped_sandbox_is_released_only_on_its_homes_report_of_this_stops_di
         evacuate(pool, SandboxId::new(), node, artifact).await?,
         V2StoppedEvacuation::MovedOn
     );
+
+    // A v1 stopped evacuation an undrain abandoned before its claim is taken
+    // over: released, its marker cleared.
+    let abandoned = stopped_at_home(pool, node, artifact, NEWER).await?;
+    sqlx::query(sql!(
+        "UPDATE sandboxes SET evacuation_restore_target = 'stopped' WHERE id = $1"
+    ))
+    .bind(abandoned)
+    .execute(pool)
+    .await?;
+    assert_eq!(
+        evacuate(pool, abandoned, node, artifact).await?,
+        V2StoppedEvacuation::Released
+    );
+    let marker: Option<String> = sqlx::query_scalar(sql!(
+        "SELECT evacuation_restore_target FROM sandboxes WHERE id = $1"
+    ))
+    .bind(abandoned)
+    .fetch_one(pool)
+    .await?;
+    assert_eq!(marker, None);
+    Ok(())
+}
+
+/// A stopped sandbox a re-placement landed on the node, still pinning the
+/// disk it was materialized from, is released on that disk's durability,
+/// though the disk was published before the landing; unpinned, the same
+/// disk is refused as another stop's.
+#[tokio::test(flavor = "current_thread")]
+async fn a_re_placed_stopped_sandbox_is_released_on_its_pinned_disk() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let pool = &db.pool;
+    let node = NodeId::new();
+    let artifact = Uuid::now_v7();
+    for (pinned, expected) in [
+        (true, V2StoppedEvacuation::Released),
+        (
+            false,
+            V2StoppedEvacuation::Refused("the disk isn't a ready, stored disk of this stop"),
+        ),
+    ] {
+        let id = stopped_at_home(pool, node, artifact, OLDER).await?;
+        if pinned {
+            sqlx::query(sql!(
+                "UPDATE sandboxes
+                    SET current_local_artifact_id = $2, current_local_artifact_kind = 'disk',
+                        current_local_artifact_origin = 'stop'
+                  WHERE id = $1"
+            ))
+            .bind(id)
+            .bind(artifact)
+            .execute(pool)
+            .await?;
+        }
+        assert_eq!(
+            evacuate(pool, id, node, artifact).await?,
+            expected,
+            "pinned={pinned}"
+        );
+    }
     Ok(())
 }
 
