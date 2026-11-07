@@ -2,9 +2,8 @@ use pplx_space_accounts::{OrgId, UserId};
 
 use std::time::Duration;
 
-use pplx_space_common_core::types::{
-    MemorySize, SandboxId, SandboxLifecycle, TemplateName, VcpuCount,
-};
+use pplx_space_byte_size::MemorySize;
+use pplx_space_common_core::types::{SandboxId, SandboxLifecycle, TemplateName, VcpuCount};
 use pplx_space_content_digest::{ContentHash, Digest};
 use pplx_space_db_test_fixtures::{TestDb, pg_test_db};
 use sqlx::PgPool;

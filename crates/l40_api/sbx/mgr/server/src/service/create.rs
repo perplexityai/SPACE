@@ -142,7 +142,7 @@ fn snapshot_memory_file_mib(snapshot_dir: &str) -> Result<Option<u64>, Status> {
 }
 
 fn restored_guest_memory_mib(
-    captured: Option<pplx_space_common_core::types::MemorySize>,
+    captured: Option<pplx_space_byte_size::MemorySize>,
     file_mib: Option<u64>,
 ) -> Result<Option<u64>, Status> {
     let captured = captured.map(|size| size.as_mib_ceil());

@@ -512,9 +512,7 @@ fn checkpoint_sidecar_execution_metadata_records_the_capturing_host_cpu() {
         TemplateName::parse("seed").unwrap(),
         None,
     )
-    .with_guest_memory(Some(
-        pplx_space_common_core::types::MemorySize::mib(2048).unwrap(),
-    ));
+    .with_guest_memory(Some(pplx_space_byte_size::MemorySize::mib(2048).unwrap()));
     let execution = checkpoint_sidecar_execution_metadata(metadata).unwrap();
 
     assert_eq!(execution.host_cpu(), HostCpu::current());

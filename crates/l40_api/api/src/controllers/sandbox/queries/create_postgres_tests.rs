@@ -1827,7 +1827,7 @@ async fn postgres_template_build_shape_prefers_the_builder_inventory() -> TestRe
         load("sha256:shape").await?,
         Some(TemplateBuildShape {
             vcpu: pplx_space_common_core::types::VcpuCount::try_from_u32(4).unwrap(),
-            memory: pplx_space_common_core::types::MemorySize::mib(4096).unwrap(),
+            memory: pplx_space_byte_size::MemorySize::mib(4096).unwrap(),
         })
     );
     assert_eq!(load("sha256:partial").await?, None);

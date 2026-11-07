@@ -2518,7 +2518,7 @@ impl SandboxManagerService {
                                 .map_err(|error| Status::invalid_argument(error.to_string()))?,
                         ),
                         Some(
-                            pplx_space_common_core::types::MemorySize::mib(u64::from(mem_mib))
+                            pplx_space_byte_size::MemorySize::mib(u64::from(mem_mib))
                                 .map_err(|error| Status::invalid_argument(error.to_string()))?,
                         ),
                     )?,

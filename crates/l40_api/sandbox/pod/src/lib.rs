@@ -17,7 +17,8 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use pplx_space_accounts::{ROOT_SANDBOX_OWNER, SandboxOwner};
-use pplx_space_common_core::types::{MemorySize, NodePoolName, TemplateReference, VcpuCount};
+use pplx_space_byte_size::MemorySize;
+use pplx_space_common_core::types::{NodePoolName, TemplateReference, VcpuCount};
 use pplx_space_policy_authority::PolicyAuthority;
 
 pub mod placement;

@@ -225,7 +225,8 @@ fn readback_requires_complete_exact_revision_bytes() {
 #[cfg(feature = "serde")]
 #[test]
 fn reconstruction_codec_consumes_verified_bytes_and_preserves_configuration() {
-    use crate::types::{EnvMap, MemorySize, VcpuCount};
+    use crate::types::{EnvMap, VcpuCount};
+    use pplx_space_byte_size::MemorySize;
     use std::collections::BTreeMap;
 
     // Representative subset only; it deliberately assigns no production schema.
