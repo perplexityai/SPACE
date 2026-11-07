@@ -37,8 +37,11 @@ table (`node_direct`, `sandbox_direct_route_*`), read the
   lifecycle and are fenced by the execution attempt they release
   (generation, attempt, `active`); delete receipts for stopped or suspended
   rows with no `active_node_id` are fenced by the latest execution.
-- New restoring-to-target convergence leaves rows with
-  `evacuation_restore_target` set to the node-drain redrive.
+- New restoring-to-target convergence leaves alone rows with
+  `evacuation_restore_target` set, which the node-drain redrive owns, and rows
+  with `restore_episode_target` set, which nothing re-drives yet except a
+  user's restore on Direct. It clears
+  `restore_episode_target` on the rows it moves.
 - New certification columns advance only on the server's own verdict.
   `node_status_snapshots.local_backup_inventory_reported_at` is also
   withdrawn on the node's claim.

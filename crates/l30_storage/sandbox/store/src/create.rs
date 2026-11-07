@@ -210,7 +210,8 @@ pub async fn finalize_created(
              preserve_local_artifact_on_restore_failure = CASE
                  WHEN lifecycle = 'restoring' AND $1 IN ('started', 'failed') THEN FALSE
                  ELSE preserve_local_artifact_on_restore_failure
-             END
+             END,
+             restore_episode_target = NULL
          WHERE id = $4
            AND (
                ($6::uuid IS NULL AND lifecycle = 'creating')

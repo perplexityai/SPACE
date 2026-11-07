@@ -16,7 +16,7 @@
 //! pass just as well against the statement they replaced.
 
 use pplx_space_common_core::sql;
-use pplx_space_common_core::types::NodeId;
+use pplx_space_common_core::types::{NodeId, SandboxId};
 use pplx_space_db_test_fixtures::try_pg_test_db;
 use pplx_space_sandbox_portability::{
     drain_gate_blockers_for_node, inflight_suspend_upload_from_node_exists,
@@ -206,5 +206,92 @@ async fn a_non_evacuation_restoring_row_blocks_but_an_evacuation_restore_does_no
         "the guard must inherit that exemption rather than re-deriving it — \
          two definitions is how this diverged in the first place"
     );
+    Ok(())
+}
+
+/// A ready full snapshot of `sandbox` from before its last placement, with a
+/// live storage location: durable only by an evacuation's newest-snapshot
+/// rule, not by placement freshness.
+async fn insert_pre_placement_snapshot(pool: &PgPool, sandbox: Uuid) -> TestResult {
+    let snapshot = Uuid::now_v7();
+    sqlx::query(sql!(
+        "INSERT INTO snapshots (id, sandbox_id, type, state, timestamp)
+         VALUES ($1, $2, 'full', 'ready', NOW() - INTERVAL '2 hours')"
+    ))
+    .bind(snapshot)
+    .bind(sandbox)
+    .execute(pool)
+    .await?;
+    sqlx::query(sql!(
+        "INSERT INTO snapshot_storage_locations (snapshot_id, storage_connection_string)
+         VALUES ($1, 's3://synthetic-bucket/snapshot')"
+    ))
+    .bind(snapshot)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// A restore episode target is read as the marker by the gate, the
+/// `:terminate` guard and both forms of the node listing's occupancy: a
+/// `restoring` row with either doesn't block the node it is pinned to, and a
+/// `suspended` row with either is durable on its newest ready snapshot.
+#[tokio::test(flavor = "current_thread")]
+async fn an_episode_target_is_read_as_the_marker_by_every_drain_count() -> TestResult {
+    use pplx_space_sandbox_store::test_support::restore_target::{
+        assert_episode_target_reads_as_marker, hold_restore_target,
+    };
+    use std::time::Duration;
+
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let pool = &db.pool;
+    let store = super::AdminNodeStore::new(pool.clone());
+    let ranked = Some(Duration::from_secs(60 * 60));
+    for residency in [
+        ResidencyEvidence::LifecycleOnly,
+        ResidencyEvidence::NodeCensusAware,
+    ] {
+        for lifecycle in ["restoring", "suspended"] {
+            assert_episode_target_reads_as_marker(
+                &format!("admin drain counts ({lifecycle}, {residency:?})"),
+                async |held| -> TestResult<_> {
+                    let node = insert_node(pool).await?;
+                    let other = insert_node(pool).await?;
+                    let sandbox = insert_target_pinned(pool, node, lifecycle, None).await?;
+                    insert_pre_placement_snapshot(pool, sandbox).await?;
+                    hold_restore_target(pool, SandboxId::from_uuid(sandbox), held).await?;
+                    let node_id = NodeId::from_uuid(node);
+                    let single = store
+                        .occupancy_for_nodes(&[node_id], ranked, residency)
+                        .await?;
+                    let fleet = store
+                        .occupancy_for_nodes(
+                            &[node_id, NodeId::from_uuid(other)],
+                            ranked,
+                            residency,
+                        )
+                        .await?;
+                    let counts =
+                        |occupancy: &std::collections::HashMap<NodeId, super::NodeOccupancy>| {
+                            occupancy.get(&node_id).map(|counts| {
+                                (
+                                    counts.live.map(|live| live.drain_blockers),
+                                    counts.occupancy.local_snapshots,
+                                )
+                            })
+                        };
+                    Ok((
+                        reconciler_gate(pool, node).await?,
+                        terminate_guard(pool, node).await?,
+                        counts(&single),
+                        counts(&fleet),
+                    ))
+                },
+            )
+            .await?;
+        }
+    }
     Ok(())
 }

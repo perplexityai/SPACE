@@ -91,7 +91,8 @@ static NODE_OCCUPANCY: LazyLock<String> = LazyLock::new(|| {
                   lifecycle = 'suspended'
                   OR (false AND (
                       lifecycle = 'suspending'
-                      OR (lifecycle = 'restoring' AND evacuation_restore_target IS NULL)
+                      OR (lifecycle = 'restoring' AND evacuation_restore_target IS NULL
+                          AND restore_episode_target IS NULL)
                   ))
               )
              UNION
@@ -100,6 +101,7 @@ static NODE_OCCUPANCY: LazyLock<String> = LazyLock::new(|| {
              SELECT s.active_node_id = $1::UUID AND ({active}) AS active,
                     s.target_node_id = $1::UUID AS targeted,
                     s.lifecycle, s.lifecycle_changed_at, s.evacuation_restore_target,
+                    s.restore_episode_target,
                     CASE WHEN s.active_node_id = $1::UUID AND ({active})
                          THEN FALSE ELSE FALSE END AS present,
                     COALESCE(u.legacy_upload, FALSE) AS legacy_upload,
@@ -112,7 +114,7 @@ static NODE_OCCUPANCY: LazyLock<String> = LazyLock::new(|| {
                    SELECT id, active_node_id, target_node_id, lifecycle,
                           lifecycle_changed_at, placement_changed_at,
                           current_local_artifact_id, current_local_artifact_kind,
-                          evacuation_restore_target
+                          evacuation_restore_target, restore_episode_target
                      FROM sandboxes WHERE id = c.id OFFSET 0
                ) s
                LEFT JOIN uploading u ON u.sandbox_id = s.id
@@ -135,7 +137,8 @@ static NODE_OCCUPANCY: LazyLock<String> = LazyLock::new(|| {
                     WHERE false AND (
                         (targeted AND (
                             lifecycle = 'suspending'
-                            OR (lifecycle = 'restoring' AND evacuation_restore_target IS NULL)
+                            OR (lifecycle = 'restoring' AND evacuation_restore_target IS NULL
+                                AND restore_episode_target IS NULL)
                             OR (lifecycle = 'suspended' AND NOT durable)
                         )) OR (current_upload AND NOT durable)
                     )
@@ -184,7 +187,8 @@ fn ranked_node_occupancy(residency: ResidencyEvidence) -> String {
                   lifecycle = 'suspended'
                   OR (true AND (
                       lifecycle = 'suspending'
-                      OR (lifecycle = 'restoring' AND evacuation_restore_target IS NULL)
+                      OR (lifecycle = 'restoring' AND evacuation_restore_target IS NULL
+                          AND restore_episode_target IS NULL)
                   ))
               )
              UNION
@@ -193,6 +197,7 @@ fn ranked_node_occupancy(residency: ResidencyEvidence) -> String {
              SELECT s.active_node_id = $1::UUID AND ({active}) AS active,
                     s.target_node_id = $1::UUID AS targeted,
                     s.lifecycle, s.lifecycle_changed_at, s.evacuation_restore_target,
+                    s.restore_episode_target,
                     CASE WHEN s.active_node_id = $1::UUID AND ({active})
                          THEN {present} ELSE FALSE END AS present,
                     COALESCE(u.legacy_upload, FALSE) AS legacy_upload,
@@ -205,7 +210,7 @@ fn ranked_node_occupancy(residency: ResidencyEvidence) -> String {
                    SELECT id, active_node_id, target_node_id, lifecycle,
                           lifecycle_changed_at, placement_changed_at,
                           current_local_artifact_id, current_local_artifact_kind,
-                          evacuation_restore_target
+                          evacuation_restore_target, restore_episode_target
                      FROM sandboxes WHERE id = c.id OFFSET 0
                ) s
                LEFT JOIN uploading u ON u.sandbox_id = s.id
@@ -228,7 +233,8 @@ fn ranked_node_occupancy(residency: ResidencyEvidence) -> String {
                     WHERE true AND (
                         (targeted AND (
                             lifecycle = 'suspending'
-                            OR (lifecycle = 'restoring' AND evacuation_restore_target IS NULL)
+                            OR (lifecycle = 'restoring' AND evacuation_restore_target IS NULL
+                                AND restore_episode_target IS NULL)
                             OR (lifecycle = 'suspended' AND NOT durable)
                         )) OR (current_upload AND NOT durable)
                     )
@@ -301,29 +307,31 @@ static FLEET_OCCUPANCY: LazyLock<String> = LazyLock::new(|| {
          ), candidates AS (
              SELECT s.target_node_id AS node_id, s.id, s.lifecycle, s.placement_changed_at,
                     s.current_local_artifact_id, s.current_local_artifact_kind,
-                    s.evacuation_restore_target, TRUE AS targeted,
+                    s.evacuation_restore_target, s.restore_episode_target, TRUE AS targeted,
                     COALESCE(u.legacy_upload, FALSE) AS legacy_upload,
                     COALESCE(u.current_upload, FALSE) AS current_upload
                FROM sandboxes s
                LEFT JOIN uploading u ON u.node_id = s.target_node_id AND u.sandbox_id = s.id
               WHERE s.target_node_id = ANY($1::UUID[]) AND (s.lifecycle = 'suspended' OR (false AND (
-        s.lifecycle = 'suspending' OR (s.lifecycle = 'restoring' AND s.evacuation_restore_target IS NULL))))
+        s.lifecycle = 'suspending' OR (s.lifecycle = 'restoring' AND s.evacuation_restore_target IS NULL
+            AND s.restore_episode_target IS NULL))))
              UNION ALL
              -- Uploads on a candidate's target are already represented above.
              -- Other sources must retain their own (node, sandbox) count.
              SELECT u.node_id, s.id, s.lifecycle, s.placement_changed_at,
                     s.current_local_artifact_id, s.current_local_artifact_kind,
-                    s.evacuation_restore_target, FALSE AS targeted,
+                    s.evacuation_restore_target, s.restore_episode_target, FALSE AS targeted,
                     u.legacy_upload, u.current_upload
                FROM uploading u
                CROSS JOIN LATERAL (
                    SELECT id, target_node_id, lifecycle, placement_changed_at,
                           current_local_artifact_id, current_local_artifact_kind,
-                          evacuation_restore_target
+                          evacuation_restore_target, restore_episode_target
                      FROM sandboxes WHERE id = u.sandbox_id OFFSET 0
                ) s
               WHERE s.target_node_id IS DISTINCT FROM u.node_id OR NOT (s.lifecycle = 'suspended' OR (false AND (
-        s.lifecycle = 'suspending' OR (s.lifecycle = 'restoring' AND s.evacuation_restore_target IS NULL))))
+        s.lifecycle = 'suspending' OR (s.lifecycle = 'restoring' AND s.evacuation_restore_target IS NULL
+            AND s.restore_episode_target IS NULL))))
          ), facts AS (
              SELECT c.*,
                     CASE WHEN (targeted AND lifecycle = 'suspended')
@@ -337,7 +345,8 @@ static FLEET_OCCUPANCY: LazyLock<String> = LazyLock::new(|| {
                         WHERE false AND (
                             (targeted AND (
                                 lifecycle = 'suspending'
-                                OR (lifecycle = 'restoring' AND evacuation_restore_target IS NULL)
+                                OR (lifecycle = 'restoring' AND evacuation_restore_target IS NULL
+                                    AND restore_episode_target IS NULL)
                                 OR (lifecycle = 'suspended' AND NOT durable)
                             )) OR (current_upload AND NOT durable)
                         )
@@ -415,29 +424,31 @@ static RANKED_FLEET_OCCUPANCY: LazyLock<String> = LazyLock::new(|| {
          ), candidates AS (
              SELECT s.target_node_id AS node_id, s.id, s.lifecycle, s.placement_changed_at,
                     s.current_local_artifact_id, s.current_local_artifact_kind,
-                    s.evacuation_restore_target, TRUE AS targeted,
+                    s.evacuation_restore_target, s.restore_episode_target, TRUE AS targeted,
                     COALESCE(u.legacy_upload, FALSE) AS legacy_upload,
                     COALESCE(u.current_upload, FALSE) AS current_upload
                FROM sandboxes s
                LEFT JOIN uploading u ON u.node_id = s.target_node_id AND u.sandbox_id = s.id
               WHERE s.target_node_id = ANY($1::UUID[]) AND (s.lifecycle = 'suspended' OR (true AND (
-        s.lifecycle = 'suspending' OR (s.lifecycle = 'restoring' AND s.evacuation_restore_target IS NULL))))
+        s.lifecycle = 'suspending' OR (s.lifecycle = 'restoring' AND s.evacuation_restore_target IS NULL
+            AND s.restore_episode_target IS NULL))))
              UNION ALL
              -- Uploads on a candidate's target are already represented above.
              -- Other sources must retain their own (node, sandbox) count.
              SELECT u.node_id, s.id, s.lifecycle, s.placement_changed_at,
                     s.current_local_artifact_id, s.current_local_artifact_kind,
-                    s.evacuation_restore_target, FALSE AS targeted,
+                    s.evacuation_restore_target, s.restore_episode_target, FALSE AS targeted,
                     u.legacy_upload, u.current_upload
                FROM uploading u
                CROSS JOIN LATERAL (
                    SELECT id, target_node_id, lifecycle, placement_changed_at,
                           current_local_artifact_id, current_local_artifact_kind,
-                          evacuation_restore_target
+                          evacuation_restore_target, restore_episode_target
                      FROM sandboxes WHERE id = u.sandbox_id OFFSET 0
                ) s
               WHERE s.target_node_id IS DISTINCT FROM u.node_id OR NOT (s.lifecycle = 'suspended' OR (true AND (
-        s.lifecycle = 'suspending' OR (s.lifecycle = 'restoring' AND s.evacuation_restore_target IS NULL))))
+        s.lifecycle = 'suspending' OR (s.lifecycle = 'restoring' AND s.evacuation_restore_target IS NULL
+            AND s.restore_episode_target IS NULL))))
          ), facts AS MATERIALIZED (
              SELECT c.*,
                     CASE WHEN (targeted AND lifecycle = 'suspended')
@@ -451,7 +462,8 @@ static RANKED_FLEET_OCCUPANCY: LazyLock<String> = LazyLock::new(|| {
                         WHERE true AND (
                             (targeted AND (
                                 lifecycle = 'suspending'
-                                OR (lifecycle = 'restoring' AND evacuation_restore_target IS NULL)
+                                OR (lifecycle = 'restoring' AND evacuation_restore_target IS NULL
+                                    AND restore_episode_target IS NULL)
                                 OR (lifecycle = 'suspended' AND NOT durable)
                             )) OR (current_upload AND NOT durable)
                         )
@@ -532,29 +544,31 @@ static RANKED_FLEET_OCCUPANCY_CENSUS_AWARE: LazyLock<String> = LazyLock::new(|| 
          ), candidates AS (
              SELECT s.target_node_id AS node_id, s.id, s.lifecycle, s.placement_changed_at,
                     s.current_local_artifact_id, s.current_local_artifact_kind,
-                    s.evacuation_restore_target, TRUE AS targeted,
+                    s.evacuation_restore_target, s.restore_episode_target, TRUE AS targeted,
                     COALESCE(u.legacy_upload, FALSE) AS legacy_upload,
                     COALESCE(u.current_upload, FALSE) AS current_upload
                FROM sandboxes s
                LEFT JOIN uploading u ON u.node_id = s.target_node_id AND u.sandbox_id = s.id
               WHERE s.target_node_id = ANY($1::UUID[]) AND (s.lifecycle = 'suspended' OR (true AND (
-        s.lifecycle = 'suspending' OR (s.lifecycle = 'restoring' AND s.evacuation_restore_target IS NULL))))
+        s.lifecycle = 'suspending' OR (s.lifecycle = 'restoring' AND s.evacuation_restore_target IS NULL
+            AND s.restore_episode_target IS NULL))))
              UNION ALL
              -- Uploads on a candidate's target are already represented above.
              -- Other sources must retain their own (node, sandbox) count.
              SELECT u.node_id, s.id, s.lifecycle, s.placement_changed_at,
                     s.current_local_artifact_id, s.current_local_artifact_kind,
-                    s.evacuation_restore_target, FALSE AS targeted,
+                    s.evacuation_restore_target, s.restore_episode_target, FALSE AS targeted,
                     u.legacy_upload, u.current_upload
                FROM uploading u
                CROSS JOIN LATERAL (
                    SELECT id, target_node_id, lifecycle, placement_changed_at,
                           current_local_artifact_id, current_local_artifact_kind,
-                          evacuation_restore_target
+                          evacuation_restore_target, restore_episode_target
                      FROM sandboxes WHERE id = u.sandbox_id OFFSET 0
                ) s
               WHERE s.target_node_id IS DISTINCT FROM u.node_id OR NOT (s.lifecycle = 'suspended' OR (true AND (
-        s.lifecycle = 'suspending' OR (s.lifecycle = 'restoring' AND s.evacuation_restore_target IS NULL))))
+        s.lifecycle = 'suspending' OR (s.lifecycle = 'restoring' AND s.evacuation_restore_target IS NULL
+            AND s.restore_episode_target IS NULL))))
          ), facts AS MATERIALIZED (
              SELECT c.*,
                     CASE WHEN (targeted AND lifecycle = 'suspended')
@@ -568,7 +582,8 @@ static RANKED_FLEET_OCCUPANCY_CENSUS_AWARE: LazyLock<String> = LazyLock::new(|| 
                         WHERE true AND (
                             (targeted AND (
                                 lifecycle = 'suspending'
-                                OR (lifecycle = 'restoring' AND evacuation_restore_target IS NULL)
+                                OR (lifecycle = 'restoring' AND evacuation_restore_target IS NULL
+                                    AND restore_episode_target IS NULL)
                                 OR (lifecycle = 'suspended' AND NOT durable)
                             )) OR (current_upload AND NOT durable)
                         )
@@ -615,7 +630,8 @@ static GROUP_OCCUPANCY: LazyLock<String> = LazyLock::new(|| {
                          AND (
                              lifecycle = 'suspending'
                              OR (lifecycle = 'restoring'
-                                 AND evacuation_restore_target IS NULL)
+                                 AND evacuation_restore_target IS NULL
+                                 AND restore_episode_target IS NULL)
                          )
                        )
              )::BIGINT AS active,
