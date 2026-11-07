@@ -8,7 +8,9 @@ metadata:
     app.kubernetes.io/name: {{ $name }}
     app.kubernetes.io/instance: {{ .Release.Name }}
 ---
-# Each answer reads the Node the request names, and nothing else.
+# A private-dns-name answer reads the Node the request names; an instance-id
+# answer, TerminateInstances and the instance memory list every Node, whose
+# AWS providerID names its instance. Nodes are read, never written.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -19,7 +21,7 @@ metadata:
 rules:
   - apiGroups: [""]
     resources: ["nodes"]
-    verbs: ["get"]
+    verbs: ["get", "list"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
