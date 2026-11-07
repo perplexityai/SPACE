@@ -678,13 +678,15 @@ fn insert_template_admin_paths(paths: &mut Map<String, Value>) {
             },
             "post": {
                 "summary": "Start a template build through the selected builder node",
+                "description": "The body's optional org_id names the organization the build runs as and the template is registered under; omitted, it is the cluster's managing organization.",
                 "parameters": [
                     { "name": "template_name", "in": "path", "required": true, "schema": { "type": "string" } }
                 ],
                 "responses": {
                     "202": { "description": "Build job accepted" },
                     "400": { "description": "Invalid build recipe" },
-                    "409": { "description": "Template is deleting or deleted" },
+                    "404": { "description": "Named organization not found" },
+                    "409": { "description": "Template is deleting or deleted, or belongs to another organization" },
                     "503": { "description": "Builder unavailable" }
                 }
             }
