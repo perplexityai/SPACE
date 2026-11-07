@@ -331,10 +331,5 @@ async fn sync_records_the_instance_an_aws_provider_id_names() -> pplx_space_test
                 .await?;
         assert_eq!(instance_id.as_deref(), expected, "{name}");
     }
-    let superseded: i64 =
-        sqlx::query_scalar(sql!("SELECT COUNT(*) FROM node_k8s_superseded_instances"))
-            .fetch_one(&db.pool)
-            .await?;
-    assert_eq!(superseded, 0);
     Ok(())
 }
