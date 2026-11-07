@@ -191,7 +191,7 @@ pub(crate) fn start_dirty_outbox_worker(
             match mark_dirty_once(refs.clone()).await {
                 Ok(()) => {
                     for &facet in &facets {
-                        pplx_space_metrics::reconcile::dirty_mark(facet, "ok");
+                        pplx_space_reconcile_metrics::dirty_mark(facet, "ok");
                     }
                     let Ok(db) = connection_or_signal_failure(&db) else {
                         return;
@@ -203,7 +203,7 @@ pub(crate) fn start_dirty_outbox_worker(
                 }
                 Err(error) => {
                     for &facet in &facets {
-                        pplx_space_metrics::reconcile::dirty_mark(facet, "error");
+                        pplx_space_reconcile_metrics::dirty_mark(facet, "error");
                     }
                     delay = next_dirty_mark_delay(delay);
                     tracing::warn!(

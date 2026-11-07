@@ -138,7 +138,7 @@ fn eppo_client_observes_each_unassigned_evaluation_and_diagnoses_once() {
     let client = FeatureFlagClient::from_provider(EppoProvider::unconfigured());
     const FLAG: BoolFlag = BoolFlag::new("space-test-flag", false);
 
-    let capture = pplx_space_metrics::test_capture::capture_counters_guard();
+    let capture = pplx_space_metrics_emit::test_capture::capture_counters_guard();
     assert!(!client.bool_value(FLAG, "subject-1"));
     assert!(!client.bool_value(FLAG, "subject-2"));
     let metrics = capture.finish();
@@ -182,7 +182,7 @@ fn the_unassigned_diagnostic_is_capped_but_the_evaluation_counter_is_not() {
         .map(|index| BoolFlag::new(String::leak(format!("space-capped-flag-{index}")), false))
         .collect();
 
-    let capture = pplx_space_metrics::test_capture::capture_counters_guard();
+    let capture = pplx_space_metrics_emit::test_capture::capture_counters_guard();
     for flag in flags {
         assert!(!client.bool_value(flag, "subject"));
     }
@@ -653,7 +653,7 @@ fn a_latched_provider_answers_no_assignment_without_a_further_sdk_call() {
 fn eppo_provider_uses_typed_sdk_assignments_and_preserves_metrics() {
     let client = FeatureFlagClient::from_provider(configured_eppo_provider());
 
-    let capture = pplx_space_metrics::test_capture::capture_counters_guard();
+    let capture = pplx_space_metrics_emit::test_capture::capture_counters_guard();
     assert!(client.bool_value(BoolFlag::new("bool", false), "subject"));
     assert_eq!(
         client.integer_value(IntegerFlag::new("integer", -1), "subject"),

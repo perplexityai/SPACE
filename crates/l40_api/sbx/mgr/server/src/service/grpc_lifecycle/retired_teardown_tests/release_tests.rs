@@ -15,7 +15,7 @@ async fn backup_refused_for_the_retired_generation_releases_the_teardown() {
         let sandbox_id_string = refused.sandbox_id.to_string();
 
         let capture = crate::service::tests::service_tests::SandboxEventCapture::default();
-        let counters = pplx_space_metrics::test_capture::capture_counters_guard();
+        let counters = pplx_space_metrics_emit::test_capture::capture_counters_guard();
         {
             use tracing_subscriber::layer::SubscriberExt;
             let _subscriber = tracing::subscriber::set_default(
@@ -135,7 +135,7 @@ async fn release_for_a_row_that_moved_on_records_the_drive_failure() {
         )
         .unwrap();
 
-    let counters = pplx_space_metrics::test_capture::capture_counters_guard();
+    let counters = pplx_space_metrics_emit::test_capture::capture_counters_guard();
     let result = service
         .settle_teardown_suspend_driver_failure(
             refused.sandbox_id,
@@ -179,7 +179,7 @@ async fn held_release_counts_a_skip() {
         let service = &refused.service;
         let named = insert_unstamped_checkpoint(service, refused.sandbox_id);
 
-        let counters = pplx_space_metrics::test_capture::capture_counters_guard();
+        let counters = pplx_space_metrics_emit::test_capture::capture_counters_guard();
         let result = service
             .settle_teardown_suspend_driver_failure(
                 refused.sandbox_id,
@@ -275,7 +275,7 @@ async fn release_proves_an_unstamped_artifact_backed() {
         let sandbox_id_string = refused.sandbox_id.to_string();
         insert_unstamped_checkpoint(service, refused.sandbox_id);
 
-        let counters = pplx_space_metrics::test_capture::capture_counters_guard();
+        let counters = pplx_space_metrics_emit::test_capture::capture_counters_guard();
         tokio::time::timeout(
             Duration::from_secs(5),
             service.settle_teardown_suspend_driver_failure(
@@ -323,7 +323,7 @@ async fn release_without_a_backed_copy_is_held() {
             .await;
             let service = &refused.service;
             let sandbox_id_string = refused.sandbox_id.to_string();
-            let counters = pplx_space_metrics::test_capture::capture_counters_guard();
+            let counters = pplx_space_metrics_emit::test_capture::capture_counters_guard();
             let result = service
                 .settle_teardown_suspend_drive(
                     refused.sandbox_id,

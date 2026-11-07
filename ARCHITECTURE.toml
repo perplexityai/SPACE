@@ -518,7 +518,7 @@ protocols = [
 # into every tonic user's build regardless. Features are not followed, so observability, which brings
 # tokio in only behind its otel feature, is listed; feature-flags, whose
 # openfeature feature does too, is fenced already by its required dependency
-# on metrics.
+# on metrics-emit.
 [rules.layers.domain_fences]
 runtime = [
   "async-std",

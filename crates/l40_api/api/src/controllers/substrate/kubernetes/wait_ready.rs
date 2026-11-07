@@ -89,7 +89,7 @@ impl KubernetesSubstrate {
         let current = match self.resolve_pod_instance(sandbox_id).await {
             Ok(Some(current)) => current,
             Ok(None) => {
-                pplx_space_metrics::grpc::client_channel_cache("worker-node-api", "pod_gone");
+                pplx_space_grpc_metrics::client_channel_cache("worker-node-api", "pod_gone");
                 return Err(first_error);
             }
             Err(_) => return Err(first_error),
@@ -100,7 +100,7 @@ impl KubernetesSubstrate {
             return Err(first_error);
         }
         if !current.same_instance(pod) {
-            pplx_space_metrics::grpc::client_channel_cache("worker-node-api", "pod_moved");
+            pplx_space_grpc_metrics::client_channel_cache("worker-node-api", "pod_moved");
         }
         self.kept_worker_client_reported(&current, None).await
     }

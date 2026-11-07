@@ -116,7 +116,7 @@ fn observe_connection_admission(
         return;
     }
     let event = observation.event();
-    pplx_space_metrics::grpc::server_connection_admission(
+    pplx_space_grpc_metrics::server_connection_admission(
         listener,
         event.as_str(),
         event.reason().map_or("none", |reason| reason.as_str()),

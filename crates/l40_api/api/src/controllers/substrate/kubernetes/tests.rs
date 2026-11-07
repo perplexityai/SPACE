@@ -12564,7 +12564,7 @@ mod kubernetes_tests {
         // The guard is held across the await deliberately: capture storage is
         // thread-local and this is a `current_thread` runtime, so the emission
         // inside `claim_pooled_execution` lands in this buffer.
-        let capture = pplx_space_metrics::test_capture::capture_counters_guard();
+        let capture = pplx_space_metrics_emit::test_capture::capture_counters_guard();
         let attempt = fixture
             .substrate
             .claim_pooled_execution(&fixture.request())
@@ -13858,7 +13858,8 @@ mod kubernetes_tests {
             for materialized in [false, true] {
                 for initialized in [false, true] {
                     for created in [false, true] {
-                        let capture = pplx_space_metrics::test_capture::capture_counters_guard();
+                        let capture =
+                            pplx_space_metrics_emit::test_capture::capture_counters_guard();
                         let result = classify_activation_route_publication(
                             &row(state, materialized, initialized),
                             created,

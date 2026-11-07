@@ -786,7 +786,7 @@ async fn unavailable_interception_dependencies_still_converge_the_start_gate() {
     .parse::<pplx_space_net_common::EffectiveNetworkPolicyRef>()
     .unwrap();
 
-    let counters = pplx_space_metrics::test_capture::capture_counters_guard();
+    let counters = pplx_space_metrics_emit::test_capture::capture_counters_guard();
     let started = tokio::time::Instant::now();
     let result = super::refresh_network_policy_with_request(
         &db,
@@ -816,7 +816,7 @@ async fn unavailable_interception_dependencies_still_converge_the_start_gate() {
     assert!(
         counters
             .finish()
-            .contains(&pplx_space_metrics::test_capture::CapturedCounter {
+            .contains(&pplx_space_metrics_emit::test_capture::CapturedCounter {
                 name: "reconcile.network_policy.interception_not_ready".to_string(),
                 value: 1,
                 tags: vec!["reason:start".to_string()],

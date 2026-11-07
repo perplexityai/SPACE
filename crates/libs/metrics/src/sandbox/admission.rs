@@ -264,31 +264,3 @@ pub fn cluster_eligible_nodes(value: u64) {
         &[tag("bucket", "sandbox_activation")],
     );
 }
-
-metric_vocabulary! {
-    /// Result of operator egress profile selection or saved-selection resolution.
-    EgressProfileOutcome {
-        Ready => "ready",
-        InvalidRequest => "invalid_request",
-        Unconfigured => "unconfigured",
-    }
-}
-
-pub fn egress_profile(profile: &str, outcome: EgressProfileOutcome) {
-    counter(
-        "space.sandbox.egress_profile_admission",
-        1,
-        &[
-            tag(
-                "outcome",
-                if outcome == EgressProfileOutcome::Ready {
-                    "ok"
-                } else {
-                    "failed"
-                },
-            ),
-            tag("reason", outcome),
-            tag("profile", profile),
-        ],
-    );
-}

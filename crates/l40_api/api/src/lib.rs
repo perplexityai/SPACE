@@ -23,6 +23,7 @@ mod fork_operation_store;
 pub mod fork_operations;
 pub mod inline_operations;
 pub(crate) mod limiter_liveness;
+pub mod metrics;
 pub mod middleware;
 pub mod models;
 pub mod native_sandbox_limits;

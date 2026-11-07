@@ -535,7 +535,7 @@ fn record_rate_limiter_decision(
     decision: &'static str,
     reason: &'static str,
 ) {
-    pplx_space_metrics::grpc::server_rate_limiter_request(
+    pplx_space_grpc_metrics::server_rate_limiter_request(
         config.service_name.as_ref(),
         bucket.as_str(),
         config.metric_grpc_method(method),
@@ -545,7 +545,7 @@ fn record_rate_limiter_decision(
 }
 
 fn emit_in_flight_gauge(service_name: &str, bucket: GrpcRateLimitBucket, value: usize) {
-    pplx_space_metrics::grpc::server_rate_limiter_in_flight(
+    pplx_space_grpc_metrics::server_rate_limiter_in_flight(
         service_name,
         bucket.as_str(),
         value as f64,

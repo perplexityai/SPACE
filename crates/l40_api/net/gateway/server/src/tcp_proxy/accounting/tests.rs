@@ -2,7 +2,7 @@ use super::{Attempt, Outcome};
 
 #[test]
 fn attempt_emits_only_its_first_terminal_outcome() {
-    let capture = pplx_space_metrics::test_capture::capture_counters_guard();
+    let capture = pplx_space_metrics_emit::test_capture::capture_counters_guard();
     let mut attempt = Attempt::forwarding("http2", "request");
 
     attempt.finish(Outcome::Success, "response_headers");
@@ -26,7 +26,7 @@ fn attempt_emits_only_its_first_terminal_outcome() {
 
 #[test]
 fn dropped_attempt_is_a_terminal_cancellation() {
-    let capture = pplx_space_metrics::test_capture::capture_counters_guard();
+    let capture = pplx_space_metrics_emit::test_capture::capture_counters_guard();
 
     drop(Attempt::origin_tcp());
 

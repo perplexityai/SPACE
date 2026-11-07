@@ -122,7 +122,7 @@ fn quarantine_recovery_plan_request(
 }
 
 fn assert_quarantine_recovery_rejection_cause(
-    captured: Vec<pplx_space_metrics::test_capture::CapturedCounter>,
+    captured: Vec<pplx_space_metrics_emit::test_capture::CapturedCounter>,
     expected: &str,
 ) {
     let rejected = captured
@@ -3137,7 +3137,7 @@ async fn recovery_plan_preserves_known_rejection_distinctions() -> TestResult {
     pin_suspend_snapshot_artifact(&db.pool, sandbox_id, snapshot_id).await?;
     let service = ClusterApiService::new(db.pool.clone());
 
-    let counters = pplx_space_metrics::test_capture::capture_counters_guard();
+    let counters = pplx_space_metrics_emit::test_capture::capture_counters_guard();
     let no_quarantine = service
         .get_quarantine_recovery_plan(quarantine_recovery_plan_request(node_id, sandbox_id))
         .await
@@ -3160,7 +3160,7 @@ async fn recovery_plan_preserves_known_rejection_distinctions() -> TestResult {
         .bind(sandbox_id)
         .execute(&db.pool)
         .await?;
-    let counters = pplx_space_metrics::test_capture::capture_counters_guard();
+    let counters = pplx_space_metrics_emit::test_capture::capture_counters_guard();
     let no_active_node = service
         .get_quarantine_recovery_plan(quarantine_recovery_plan_request(node_id, sandbox_id))
         .await
@@ -3179,7 +3179,7 @@ async fn recovery_plan_preserves_known_rejection_distinctions() -> TestResult {
         .execute(&db.pool)
         .await?;
 
-    let counters = pplx_space_metrics::test_capture::capture_counters_guard();
+    let counters = pplx_space_metrics_emit::test_capture::capture_counters_guard();
     let wrong_node = service
         .get_quarantine_recovery_plan(quarantine_recovery_plan_request(other_node_id, sandbox_id))
         .await
@@ -3198,7 +3198,7 @@ async fn recovery_plan_preserves_known_rejection_distinctions() -> TestResult {
         .bind(sandbox_id)
         .execute(&db.pool)
         .await?;
-    let counters = pplx_space_metrics::test_capture::capture_counters_guard();
+    let counters = pplx_space_metrics_emit::test_capture::capture_counters_guard();
     let no_execution = service
         .get_quarantine_recovery_plan(quarantine_recovery_plan_request(node_id, sandbox_id))
         .await
@@ -3211,7 +3211,7 @@ async fn recovery_plan_preserves_known_rejection_distinctions() -> TestResult {
     // the ownership check may carry its own message, and that is only safe because
     // ownership is checked first — so a foreign node must still see the uniform
     // message here, not learn that this sandbox exists and lost its execution.
-    let counters = pplx_space_metrics::test_capture::capture_counters_guard();
+    let counters = pplx_space_metrics_emit::test_capture::capture_counters_guard();
     let wrong_node_without_execution = service
         .get_quarantine_recovery_plan(quarantine_recovery_plan_request(other_node_id, sandbox_id))
         .await
@@ -3234,7 +3234,7 @@ async fn recovery_plan_preserves_known_rejection_distinctions() -> TestResult {
     .bind(sandbox_id)
     .execute(&db.pool)
     .await?;
-    let counters = pplx_space_metrics::test_capture::capture_counters_guard();
+    let counters = pplx_space_metrics_emit::test_capture::capture_counters_guard();
     let unsupported_reason = service
         .get_quarantine_recovery_plan(quarantine_recovery_plan_request(node_id, sandbox_id))
         .await
@@ -3247,7 +3247,7 @@ async fn recovery_plan_preserves_known_rejection_distinctions() -> TestResult {
         .bind(sandbox_id)
         .execute(&db.pool)
         .await?;
-    let counters = pplx_space_metrics::test_capture::capture_counters_guard();
+    let counters = pplx_space_metrics_emit::test_capture::capture_counters_guard();
     let not_recoverable = service
         .get_quarantine_recovery_plan(quarantine_recovery_plan_request(node_id, sandbox_id))
         .await
@@ -3270,7 +3270,7 @@ async fn recovery_plan_preserves_known_rejection_distinctions() -> TestResult {
     .bind(sandbox_id)
     .execute(&db.pool)
     .await?;
-    let counters = pplx_space_metrics::test_capture::capture_counters_guard();
+    let counters = pplx_space_metrics_emit::test_capture::capture_counters_guard();
     let no_exact_artifact = service
         .get_quarantine_recovery_plan(quarantine_recovery_plan_request(node_id, sandbox_id))
         .await
@@ -3288,7 +3288,7 @@ async fn recovery_plan_preserves_known_rejection_distinctions() -> TestResult {
         .bind(snapshot_id)
         .execute(&db.pool)
         .await?;
-    let counters = pplx_space_metrics::test_capture::capture_counters_guard();
+    let counters = pplx_space_metrics_emit::test_capture::capture_counters_guard();
     let no_snapshot = service
         .get_quarantine_recovery_plan(quarantine_recovery_plan_request(node_id, sandbox_id))
         .await

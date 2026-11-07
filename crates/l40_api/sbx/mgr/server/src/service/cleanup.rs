@@ -1320,9 +1320,9 @@ impl SandboxManagerService {
             {
                 Ok(admission) => admission,
                 Err(error @ crate::db::auto_lifecycle_delete_receipts::AutoLifecycleDeleteEvidenceError::PolicyChanged) => {
-                    pplx_space_metrics::sandbox::worker::auto_lifecycle_delete_admission(
-                        pplx_space_metrics::sandbox::worker::AutoLifecycleDeleteAdmissionDisposition::Failed,
-                        pplx_space_metrics::sandbox::worker::AutoLifecycleDeleteAdmissionReason::PolicyChanged,
+                    crate::metrics::sandbox::worker::auto_lifecycle_delete_admission(
+                        crate::metrics::sandbox::worker::AutoLifecycleDeleteAdmissionDisposition::Failed,
+                        pplx_space_sbx_mgr_store::metrics::AutoLifecycleDeleteAdmissionReason::PolicyChanged,
                     );
                     emit_sandbox_event(
                         &sandbox_id_string,
@@ -1340,9 +1340,9 @@ impl SandboxManagerService {
                     });
                 }
                 Err(error @ crate::db::auto_lifecycle_delete_receipts::AutoLifecycleDeleteEvidenceError::AuthorityChanged { .. }) => {
-                    pplx_space_metrics::sandbox::worker::auto_lifecycle_delete_admission(
-                        pplx_space_metrics::sandbox::worker::AutoLifecycleDeleteAdmissionDisposition::Failed,
-                        pplx_space_metrics::sandbox::worker::AutoLifecycleDeleteAdmissionReason::AuthorityChanged,
+                    crate::metrics::sandbox::worker::auto_lifecycle_delete_admission(
+                        crate::metrics::sandbox::worker::AutoLifecycleDeleteAdmissionDisposition::Failed,
+                        pplx_space_sbx_mgr_store::metrics::AutoLifecycleDeleteAdmissionReason::AuthorityChanged,
                     );
                     emit_sandbox_event(
                         &sandbox_id_string,
@@ -1386,8 +1386,8 @@ impl SandboxManagerService {
                             .error("auto-lifecycle delete lacks durable publication authority"),
                     );
                 }
-                pplx_space_metrics::sandbox::worker::auto_lifecycle_delete_admission(
-                    pplx_space_metrics::sandbox::worker::AutoLifecycleDeleteAdmissionDisposition::Blocked,
+                crate::metrics::sandbox::worker::auto_lifecycle_delete_admission(
+                    crate::metrics::sandbox::worker::AutoLifecycleDeleteAdmissionDisposition::Blocked,
                     reason.metric_reason(),
                 );
                 return Err(CleanupAdmissionError::AutoLifecycleDeleteBlocked {
@@ -1516,9 +1516,9 @@ impl SandboxManagerService {
                         ) {
                             Ok(receipt) => receipt,
                             Err(crate::db::auto_lifecycle_delete_receipts::InsertPendingReceiptError::Conflict(error)) => {
-                                pplx_space_metrics::sandbox::worker::auto_lifecycle_delete_admission(
-                                    pplx_space_metrics::sandbox::worker::AutoLifecycleDeleteAdmissionDisposition::Failed,
-                                    pplx_space_metrics::sandbox::worker::AutoLifecycleDeleteAdmissionReason::ReceiptConflict,
+                                crate::metrics::sandbox::worker::auto_lifecycle_delete_admission(
+                                    crate::metrics::sandbox::worker::AutoLifecycleDeleteAdmissionDisposition::Failed,
+                                    pplx_space_sbx_mgr_store::metrics::AutoLifecycleDeleteAdmissionReason::ReceiptConflict,
                                 );
                                 tracing::debug!(sandbox_id = %sandbox_id, %error, "auto-lifecycle delete receipt evidence conflicts with the current claim");
                                 return Err(CleanupAdmissionError::AutoLifecycleDeleteReceiptConflict {
@@ -1535,8 +1535,8 @@ impl SandboxManagerService {
                     (
                     Some(receipt),
                     Some((
-                        pplx_space_metrics::sandbox::worker::AutoLifecycleDeleteAdmissionDisposition::ReceiptClaimed,
-                        pplx_space_metrics::sandbox::worker::AutoLifecycleDeleteAdmissionReason::ClusterFenced,
+                        crate::metrics::sandbox::worker::AutoLifecycleDeleteAdmissionDisposition::ReceiptClaimed,
+                        pplx_space_sbx_mgr_store::metrics::AutoLifecycleDeleteAdmissionReason::ClusterFenced,
                     )),
                 )
                 }
@@ -1553,7 +1553,7 @@ impl SandboxManagerService {
                     (
                     None,
                     Some((
-                        pplx_space_metrics::sandbox::worker::AutoLifecycleDeleteAdmissionDisposition::Receiptless,
+                        crate::metrics::sandbox::worker::AutoLifecycleDeleteAdmissionDisposition::Receiptless,
                         reason.metric_reason(),
                     )),
                 )
@@ -1620,10 +1620,7 @@ impl SandboxManagerService {
             ));
         }
         if let Some((disposition, reason)) = admission_metric {
-            pplx_space_metrics::sandbox::worker::auto_lifecycle_delete_admission(
-                disposition,
-                reason,
-            );
+            crate::metrics::sandbox::worker::auto_lifecycle_delete_admission(disposition, reason);
         }
         Ok(CleanupAdmission::persisted(
             sandbox_id,

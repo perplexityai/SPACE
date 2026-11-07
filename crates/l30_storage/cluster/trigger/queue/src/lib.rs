@@ -10,6 +10,7 @@ use pplx_space_state_reconciliation::{
 use sqlx::{FromRow, PgPool};
 use time::OffsetDateTime;
 
+pub mod metrics;
 mod reconcile_refs;
 pub use reconcile_refs::{QueuedReconcileRefs, QueuedRefConflict, queue_node_reconcile_refs};
 
@@ -367,7 +368,7 @@ pub async fn complete_claim(
     release_refreshed_trigger_claims(&mut tx, &release_node_ids, claim_token).await?;
     tx.commit().await?;
     for _ in 0..u64::try_from(dead_lettered).unwrap_or(0) {
-        pplx_space_metrics::reconcile::trigger_dead_letter();
+        metrics::trigger_dead_letter();
     }
     Ok(())
 }
@@ -420,7 +421,7 @@ pub async fn dead_letter_claim(
     .await?;
 
     for _ in 0..u64::try_from(dead_lettered).unwrap_or(0) {
-        pplx_space_metrics::reconcile::trigger_dead_letter();
+        metrics::trigger_dead_letter();
     }
     Ok(())
 }

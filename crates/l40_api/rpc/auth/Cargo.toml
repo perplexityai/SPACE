@@ -46,7 +46,7 @@ pplx-space-api-route = { workspace = true }
 pplx-space-bearer-token = { workspace = true }
 pplx-space-common-core = { workspace = true }
 pplx-space-kube-client = { workspace = true, optional = true }
-pplx-space-metrics = { workspace = true }
+pplx-space-metrics-emit = { workspace = true }
 pplx-space-uds-peer-auth = { workspace = true }
 
 [dev-dependencies]

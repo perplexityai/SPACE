@@ -122,8 +122,8 @@
 //! Metrics are *not* behind the feature. An SDK-free deployment is the one with
 //! no vendor console to look at, so it is the one that most needs
 //! `feature_flags.evaluation{outcome:no_provider}` to show that its flags are
-//! inert on purpose rather than broken. That is paid for: `pplx-space-metrics`
-//! brings `pplx-space-common-core` and `pplx-space-observability` into the
+//! inert on purpose rather than broken. That is paid for:
+//! `pplx-space-metrics-emit` brings `pplx-space-observability` into the
 //! SDK-free graph, so it is no longer `serde_json` plus `tracing` and nothing
 //! else. Every one of those is a SPACE crate that any binary linking this one
 //! already has, which is why the trade went this way — the SDK is a vendor
@@ -156,6 +156,7 @@
 
 mod client;
 pub mod flag;
+pub mod metrics;
 pub mod policy;
 mod provider;
 

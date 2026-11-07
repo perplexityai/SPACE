@@ -166,7 +166,7 @@ async fn timeout_update_under_row_lock(
         .fetch_one(&mut *holder)
         .await?;
     let mut observer = pool.acquire().await?;
-    let capture = pplx_space_metrics::test_capture::capture_counters_guard();
+    let capture = pplx_space_metrics_emit::test_capture::capture_counters_guard();
     let deadline = tokio::time::Instant::now() + budget;
     let finished = std::sync::atomic::AtomicBool::new(false);
     let (result, waited) = tokio::join!(

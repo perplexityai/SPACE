@@ -88,7 +88,7 @@ impl UnaryListUsage {
                     max_raw_bytes = MAX_RAW_BYTES,
                     "unary sandbox list exceeds its inventory budget; serving the complete list"
                 );
-                pplx_space_metrics::sandbox::worker::unary_list_budget_exceeded(rpc, limit);
+                crate::metrics::unary_list_budget_exceeded(rpc, limit);
             }
         }
     }

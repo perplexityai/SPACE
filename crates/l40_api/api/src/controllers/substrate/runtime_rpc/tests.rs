@@ -17,7 +17,7 @@ async fn fixture() -> (RuntimeClient, Substrate) {
 
 /// The `grpc.client.replay` counters `capture` saw, by their tags.
 fn replay_counts(
-    counters: &[pplx_space_metrics::test_capture::CapturedCounter],
+    counters: &[pplx_space_metrics_emit::test_capture::CapturedCounter],
 ) -> Vec<(u64, Vec<String>)> {
     counters
         .iter()
@@ -44,7 +44,7 @@ async fn peer_errors_are_returned_without_replaying_the_request() {
         status
             .metadata_mut()
             .insert("retry-after", "1".parse().unwrap());
-        let capture = pplx_space_metrics::test_capture::capture_counters_guard();
+        let capture = pplx_space_metrics_emit::test_capture::capture_counters_guard();
 
         let result: Result<(), _> = client
             .call(
@@ -120,7 +120,7 @@ async fn a_never_sent_rpc_without_a_fresh_client_counts_its_replay_decision() {
     .expect_err("nothing listens on a released port");
     let (mut client, substrate) = fixture().await;
     let mut attempts = 0;
-    let capture = pplx_space_metrics::test_capture::capture_counters_guard();
+    let capture = pplx_space_metrics_emit::test_capture::capture_counters_guard();
 
     let result: Result<(), _> = client
         .call(

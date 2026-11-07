@@ -37,7 +37,7 @@ uuid = { workspace = true, features = ["v7"] }
 # internal
 pplx-space-common-core = { workspace = true }
 pplx-space-common-grpc = { workspace = true }
-pplx-space-metrics = { workspace = true }
+pplx-space-grpc-metrics = { workspace = true }
 pplx-space-observability = { workspace = true, optional = true }
 pplx-space-service-host = { workspace = true, optional = true }
 pplx-space-spaced-guest-protocol = { workspace = true }

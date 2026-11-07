@@ -49,9 +49,10 @@ const SQLX_QUERY_TARGET: &str = "sqlx::query";
 
 /// Canonical metric name for successful SQLx pool-acquire duration.
 ///
-/// The tracing event bridge must emit this below `pplx-space-metrics` because
-/// that facade depends on this crate. `pplx_space_metrics::db::pool` re-exports
-/// the name so all pool telemetry remains discoverable from the pool module.
+/// The tracing event bridge must emit this below the metric definitions
+/// because they depend on this crate. `pplx_space_postgres_pool::metrics`
+/// re-exports the name so all pool telemetry remains discoverable from the pool
+/// module.
 pub const DB_POOL_ACQUIRE_TOTAL_MS_METRIC: &str = "db.pool.acquire_total_ms";
 
 static METRICS: OnceLock<Box<dyn sink::MetricSink>> = OnceLock::new();

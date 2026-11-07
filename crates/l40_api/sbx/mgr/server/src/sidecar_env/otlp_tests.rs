@@ -54,7 +54,7 @@ fn cleared_sidecar_environment_preserves_otlp_producer_identity() {
                     "space-spaced-host",
                     pplx_space_observability::LogContext::default(),
                 ).unwrap();
-                pplx_space_metrics::grpc::server_active_requests(1);
+                pplx_space_grpc_metrics::server_active_requests(1);
                 tokio::task::spawn_blocking(move || drop(guard))
                     .await
                     .unwrap();

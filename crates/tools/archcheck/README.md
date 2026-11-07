@@ -562,7 +562,7 @@ behaviours above and a table keyed by package:
   crate turns on, so a crate that does I/O only behind a feature is listed,
   such as `pplx-space-observability` under `runtime`, whose `otel` feature
   brings tokio in, unless a required dependency fences it already, as
-  `pplx-space-metrics` fences `pplx-space-feature-flags`. A listed package
+  `pplx-space-metrics-emit` fences `pplx-space-feature-flags`. A listed package
   that is a driver or a storage helper is left to `storage_access`, which
   reports it from Domain already, and is a `stale_entries` finding, as is a
   listed Foundation crate that its own dependencies fence already. The

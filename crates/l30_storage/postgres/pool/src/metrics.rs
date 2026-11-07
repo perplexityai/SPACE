@@ -6,11 +6,10 @@
 //! Re-exporting its canonical name here keeps that metric discoverable with the
 //! rest of the pool telemetry without introducing a dependency cycle.
 
-use pplx_space_common_core::types::DatabaseIdentity;
+use pplx_space_db_identity::DatabaseIdentity;
+use pplx_space_metrics_emit::{distribution, tag};
 
 pub use pplx_space_observability::DB_POOL_ACQUIRE_TOTAL_MS_METRIC;
-
-use crate::emit::distribution;
 
 /// In-use fraction of the pool's `max_connections` cap, 0.0–1.0, tagged by
 /// the Postgres login backing the pool.
@@ -22,7 +21,7 @@ pub fn utilization_for_identity(ratio: f64, identity: DatabaseIdentity) {
     distribution(
         "db.pool.utilization",
         ratio,
-        &[crate::emit::tag("database_identity", identity.as_str())],
+        &[tag("database_identity", identity.as_str())],
     );
 }
 
@@ -31,7 +30,7 @@ pub fn connections_in_use_for_identity(in_use: u32, identity: DatabaseIdentity) 
     distribution(
         "db.pool.connections_in_use",
         f64::from(in_use),
-        &[crate::emit::tag("database_identity", identity.as_str())],
+        &[tag("database_identity", identity.as_str())],
     );
 }
 
@@ -40,6 +39,6 @@ pub fn connections_idle_for_identity(idle: usize, identity: DatabaseIdentity) {
     distribution(
         "db.pool.connections_idle",
         idle as f64,
-        &[crate::emit::tag("database_identity", identity.as_str())],
+        &[tag("database_identity", identity.as_str())],
     );
 }

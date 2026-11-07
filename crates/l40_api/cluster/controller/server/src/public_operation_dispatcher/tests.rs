@@ -1024,7 +1024,7 @@ async fn assert_deadline_failure(
         ..single_claim_config()
     };
 
-    let metrics = pplx_space_metrics::test_capture::capture_counters_guard();
+    let metrics = pplx_space_metrics_emit::test_capture::capture_counters_guard();
     let report = tick(
         &config,
         &store,
@@ -1164,7 +1164,7 @@ async fn claim_records_how_long_the_operation_waited_in_the_queue() -> TestResul
     .execute(&db.pool)
     .await?;
 
-    let values = pplx_space_metrics::test_capture::capture_values_guard();
+    let values = pplx_space_metrics_emit::test_capture::capture_values_guard();
     tick(&single_claim_config(), &store, &AlwaysSuccessExecutor).await?;
     let queue_wait = values
         .finish()

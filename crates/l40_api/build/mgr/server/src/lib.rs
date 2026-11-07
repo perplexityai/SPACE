@@ -22,10 +22,10 @@ use pplx_space_build_mgr_client::proto::{
     BuildState, GetBuildStatusRequest, GetBuildStatusResponse, StartBuildRequest,
     StartBuildResponse, UploadBlobChunk, UploadBlobPhase, UploadBlobResponse,
 };
+use pplx_space_common_jobs::metrics::JobCompletedResult;
 use pplx_space_common_jobs::{
     BackgroundWorker, Job, JobError, JobExecutor, LeaseConfig, WorkerConfig,
 };
-use pplx_space_metrics::jobs::JobCompletedResult;
 use rusqlite::{Connection, params};
 use tokio_util::sync::CancellationToken;
 use tonic::{Request, Response, Status};
@@ -225,7 +225,7 @@ impl BuildManagerDaemonService {
 
         loop {
             let active = self.local_running_build_count();
-            pplx_space_metrics::jobs::drain_outstanding(active as u64);
+            pplx_space_common_jobs::metrics::drain_outstanding(active as u64);
 
             if active == 0 {
                 return;

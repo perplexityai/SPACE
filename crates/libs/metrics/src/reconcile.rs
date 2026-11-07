@@ -20,14 +20,6 @@ pub fn claimed(count: u64) {
     counter("reconcile.queue.claimed", count, &[]);
 }
 
-pub fn queue_depth(facet: &str, state: &str, count: u64) {
-    gauge(
-        "reconcile.queue.depth",
-        count as f64,
-        &[tag("facet", facet), tag("state", state)],
-    );
-}
-
 pub fn queue_stale_claims(facet: &str, count: u64) {
     gauge(
         "reconcile.queue.stale_claims",
@@ -36,20 +28,12 @@ pub fn queue_stale_claims(facet: &str, count: u64) {
     );
 }
 
-pub fn queue_dead_letter(facet: &str) {
-    counter("reconcile.queue.dead_letter", 1, &[tag("facet", facet)]);
-}
-
 pub fn trigger_depth(state: &str, count: u64) {
     gauge(
         "reconcile.trigger.depth",
         count as f64,
         &[tag("state", state)],
     );
-}
-
-pub fn trigger_dead_letter() {
-    counter("reconcile.trigger.dead_letter", 1, &[]);
 }
 
 pub fn trigger_fanout(result: &str, error_class: &str) {
@@ -324,43 +308,6 @@ pub fn queue_gc_tick(result: QueueGcResult, detector: QueueGcDetector) {
         &[
             tag("result", result.as_str()),
             tag("detector", detector.as_str()),
-        ],
-    );
-}
-
-pub fn dirty_mark(facet: &str, result: &str) {
-    counter(
-        "reconcile.dirty.mark",
-        1,
-        &[tag("facet", facet), tag("result", result)],
-    );
-}
-
-pub fn run_duration(
-    facet: &str,
-    direction: &str,
-    result: &str,
-    trigger: &str,
-    started_at: Instant,
-) {
-    let tags = [
-        tag("facet", facet),
-        tag("direction", direction),
-        tag("result", result),
-        tag("trigger", trigger),
-    ];
-    counter("reconcile.run", 1, &tags);
-    timing_ms("reconcile.run.duration_ms", elapsed_ms(started_at), &tags);
-}
-
-pub fn run_items(facet: &str, direction: &str, result: &str, count: u64) {
-    counter(
-        "reconcile.run.items",
-        count,
-        &[
-            tag("facet", facet),
-            tag("direction", direction),
-            tag("result", result),
         ],
     );
 }

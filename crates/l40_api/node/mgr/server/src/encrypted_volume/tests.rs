@@ -286,7 +286,7 @@ async fn close_retries_only_busy_refusals_and_records_first_and_last() {
         let calls = std::cell::Cell::new(0usize);
         let recorded = std::cell::RefCell::new(Vec::new());
         let started = tokio::time::Instant::now();
-        let capture = pplx_space_metrics::test_capture::capture_counters_guard();
+        let capture = pplx_space_metrics_emit::test_capture::capture_counters_guard();
         let result = close_with_busy_retry(
             || {
                 let outcome = case.refusals[calls.get()].map(refusal);

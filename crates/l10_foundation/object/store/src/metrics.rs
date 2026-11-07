@@ -1,4 +1,4 @@
-use crate::emit::{counter, tag};
+use pplx_space_metrics_emit::{counter, metric_vocabulary, tag};
 
 /// One S3 SDK error observed by the shared object-store client.
 ///

@@ -8,11 +8,22 @@ description: Develop or review SPACE metrics, traces, sandbox events, Datadog da
 ## Rust telemetry
 
 - Keep `pplx-space-observability` limited to telemetry transport and plumbing.
-  Product metric names and helpers belong in `pplx-space-metrics`.
-- Product crates emit through `pplx-space-metrics`, not the low-level
-  observability `counter`, `gauge`, `timing_ms`, or `tag` functions.
-- Keep the owning module's documentation in `crates/libs/metrics/src/` current
-  when adding, renaming, removing, or retagging product metrics.
+  Define a product metric family, with its tag vocabulary, in a `metrics`
+  module of the crate that records it, built on `pplx-space-metrics-emit`.
+  When several crates record a family, define it in the recorder the others
+  depend on, or else in a crate they all depend on that is not one of the
+  `legacy` crates in `ARCHITECTURE.toml`, such as `pplx-space-grpc-metrics`;
+  if there is none, add a `*-metrics` crate in the lowest layer whose rules
+  allow its names, as `pplx-space-reconcile-metrics` (l10_foundation) was
+  added. A vocabulary whose values a lower crate computes lives in that
+  crate, as the auto-lifecycle delete admission reason lives in
+  `pplx-space-sbx-mgr-store`. `pplx-space-metrics` is being split up into
+  those owners; add no family to it.
+- Product code emits through a metrics module's named functions, not the
+  low-level `counter`, `gauge`, `timing_ms`, or `tag` functions of
+  `pplx-space-observability` or `pplx-space-metrics-emit`.
+- Keep the owning metrics module's documentation current when adding,
+  renaming, removing, or retagging product metrics.
 - External calls that can block or conceal endpoint latency require
   OpenTelemetry-shaped client spans. Reuse shared SQLx, Kubernetes, and gRPC
   wrappers. Wrap each Redis command or pipeline in a `redis.client` span;

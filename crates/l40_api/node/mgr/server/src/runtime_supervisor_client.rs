@@ -260,7 +260,7 @@ impl RuntimeSupervisorLazyClient {
                 return Err(status);
             }
             retry_index += 1;
-            pplx_space_metrics::grpc::client_retry(
+            pplx_space_grpc_metrics::client_retry(
                 "runtime-supervisor",
                 command,
                 "rpc",

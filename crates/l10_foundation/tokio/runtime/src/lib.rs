@@ -1,5 +1,5 @@
 //! Builds the services' multi-thread Tokio runtime from the `WORKER_THREADS`
-//! setting and samples the runtime's health into `pplx-space-metrics`.
+//! setting and samples the runtime's health into its [`metrics`].
 //!
 //! It is its own crate so a binary can build its runtime without depending
 //! on the service host.
@@ -9,9 +9,12 @@ use std::num::{NonZeroUsize, ParseIntError};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use pplx_space_metrics::tokio_runtime::RuntimeHealth;
 use thiserror::Error;
 use tokio::runtime::{Builder, Handle, Runtime, RuntimeMetrics};
+
+use crate::metrics::RuntimeHealth;
+
+pub mod metrics;
 
 const WORKER_THREADS_ENV: &str = "WORKER_THREADS";
 const MIN_WORKER_THREADS: usize = 4;
@@ -172,7 +175,7 @@ fn sample_metrics_forever(handle: Handle) {
 
         let current = RuntimeSnapshot::capture(&metrics);
         let interval = interval_health(&previous, &current);
-        pplx_space_metrics::tokio_runtime::health(RuntimeHealth {
+        crate::metrics::health(RuntimeHealth {
             num_workers: current.workers.len(),
             num_alive_tasks: current.num_alive_tasks,
             global_queue_depth: current.global_queue_depth,
@@ -182,7 +185,7 @@ fn sample_metrics_forever(handle: Handle) {
         previous = current;
 
         let scheduling_delay = measure_scheduling_delay(&handle, SCHEDULING_DELAY_TIMEOUT);
-        pplx_space_metrics::tokio_runtime::scheduling_delay(scheduling_delay);
+        crate::metrics::scheduling_delay(scheduling_delay);
 
         next_sample_at = (next_sample_at + METRICS_SAMPLE_INTERVAL).max(Instant::now());
     }

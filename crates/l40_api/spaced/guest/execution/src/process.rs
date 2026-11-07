@@ -528,7 +528,7 @@ impl ExecutionService {
             pplx_space_common_grpc::QueuedSlots::new(self.inner.process_payload_slots.clone()),
             process_limits::PAYLOAD_METHODS,
         )
-        .with_observation(pplx_space_metrics::payload::Budget::GuestProcess)
+        .with_observation(pplx_space_grpc_metrics::payload::Budget::GuestProcess)
     }
 }
 
@@ -541,7 +541,7 @@ async fn resolve_process_account(
     let admission = crate::payload::acquire(
         &slots,
         pplx_space_spaced_guest_protocol::process_limits::START_PAYLOAD_SLOTS,
-        pplx_space_metrics::payload::Budget::GuestProcess,
+        pplx_space_grpc_metrics::payload::Budget::GuestProcess,
         ingress,
     )?;
     // NSS may block on external account providers. Keep the existing Start
@@ -2632,7 +2632,7 @@ impl Process for ExecutionService {
             &mut request,
             &self.inner.process_payload_slots,
             1,
-            pplx_space_metrics::payload::Budget::GuestProcess,
+            pplx_space_grpc_metrics::payload::Budget::GuestProcess,
             pplx_space_spaced_guest_protocol::process_limits::MAX_MESSAGE_BYTES,
         )?;
         let mut request = request.into_inner();

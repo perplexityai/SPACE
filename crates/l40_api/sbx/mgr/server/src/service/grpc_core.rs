@@ -261,7 +261,7 @@ impl SandboxManagerService {
                     (scope @ TemplateLookupScope::Sandbox { .. }, Some(TemplateLookupScope::Cluster)) => scope,
                     (_, Some(scope @ (TemplateLookupScope::Node(_) | TemplateLookupScope::Cluster))) => scope,
                     (scope, None) => {
-                        pplx_space_metrics::auth::template_lookup_compatibility("missing_scope");
+                        pplx_space_rpc_auth::template_lookup::metrics::template_lookup_compatibility("missing_scope");
                         scope
                     }
                     _ => return Err(Status::permission_denied("invalid remote template caller scope")),

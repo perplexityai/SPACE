@@ -1055,6 +1055,25 @@ fn otlp_names_stay_unique_across_the_catalog() {
     use std::collections::BTreeMap;
     use std::path::Path;
 
+    /// The catalog's sources: each crate's `metrics` module (a `metrics.rs`
+    /// or a `metrics/` directory) and the metric crates themselves, whose
+    /// paths have a `metrics` directory too.
+    fn catalog_in(dir: &Path, into: &mut Vec<String>) {
+        for entry in std::fs::read_dir(dir).expect("crates directory") {
+            let path = entry.expect("crates entry").path();
+            let name = path.file_name().and_then(|name| name.to_str());
+            if path.is_dir() {
+                match name {
+                    Some("target") => {}
+                    Some("metrics") => names_in(&path, into),
+                    _ => catalog_in(&path, into),
+                }
+            } else if name == Some("metrics.rs") {
+                names_in_file(&path, into);
+            }
+        }
+    }
+
     /// Any dotted lowercase literal in these crates is a metric name: the
     /// catalog declares them inline at the emit call, as `pub const`, or in a
     /// `(name, value)` table.
@@ -1065,31 +1084,35 @@ fn otlp_names_stay_unique_across_the_catalog() {
                 names_in(&path, into);
                 continue;
             }
-            let Some(file) = path.file_name().and_then(|name| name.to_str()) else {
-                continue;
-            };
-            // Test fixtures invent names that no service emits.
-            if !file.ends_with(".rs") || file.contains("test") {
-                continue;
-            }
-            let source = std::fs::read_to_string(&path).expect("catalog source");
-            for literal in source.split('"').skip(1).step_by(2) {
-                let dotted = literal.contains('.')
-                    && literal.starts_with(|c: char| c.is_ascii_lowercase())
-                    && literal.chars().all(|c| {
-                        c.is_ascii_lowercase() || c.is_ascii_digit() || c == '.' || c == '_'
-                    })
-                    && !literal.ends_with('.');
-                if dotted {
-                    into.push(literal.to_string());
-                }
+            names_in_file(&path, into);
+        }
+    }
+
+    fn names_in_file(path: &Path, into: &mut Vec<String>) {
+        let Some(file) = path.file_name().and_then(|name| name.to_str()) else {
+            return;
+        };
+        // Test fixtures invent names that no service emits.
+        if !file.ends_with(".rs") || file.contains("test") {
+            return;
+        }
+        let source = std::fs::read_to_string(path).expect("catalog source");
+        for literal in source.split('"').skip(1).step_by(2) {
+            let dotted = literal.contains('.')
+                && literal.starts_with(|c: char| c.is_ascii_lowercase())
+                && literal
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '.' || c == '_')
+                && !literal.ends_with('.');
+            if dotted {
+                into.push(literal.to_string());
             }
         }
     }
 
     let mut names = Vec::new();
-    names_in(
-        &Path::new(env!("CARGO_MANIFEST_DIR")).join("../../libs/metrics/src"),
+    catalog_in(
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("../.."),
         &mut names,
     );
     names_in(

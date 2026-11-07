@@ -2,7 +2,7 @@
 use std::sync::Arc;
 
 use pplx_space_common_grpc::RequestPermit;
-use pplx_space_metrics::payload::Budget;
+use pplx_space_grpc_metrics::payload::Budget;
 use tokio::sync::Semaphore;
 use tonic::{Request, Status};
 
