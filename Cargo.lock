@@ -5494,10 +5494,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "pplx-space-common-lru-reaper"
-version = "0.8.2"
-
-[[package]]
 name = "pplx-space-common-proto-build"
 version = "0.8.2"
 dependencies = [
@@ -6217,6 +6213,10 @@ dependencies = [
  "tonic-health",
  "tracing",
 ]
+
+[[package]]
+name = "pplx-space-lru-reaper"
+version = "0.8.2"
 
 [[package]]
 name = "pplx-space-metrics-emit"
@@ -7352,7 +7352,6 @@ dependencies = [
  "pplx-space-common-grpc",
  "pplx-space-common-io",
  "pplx-space-common-jobs",
- "pplx-space-common-lru-reaper",
  "pplx-space-credential-injection-core",
  "pplx-space-credmgr",
  "pplx-space-credmgr-client",
@@ -7367,6 +7366,7 @@ dependencies = [
  "pplx-space-ingress-admission",
  "pplx-space-k8s-node-id",
  "pplx-space-local-health",
+ "pplx-space-lru-reaper",
  "pplx-space-metrics-emit",
  "pplx-space-net-common",
  "pplx-space-net-gateway",
@@ -8034,7 +8034,6 @@ dependencies = [
  "pplx-space-common-grpc",
  "pplx-space-common-io",
  "pplx-space-common-jobs",
- "pplx-space-common-lru-reaper",
  "pplx-space-db-test-fixtures",
  "pplx-space-execution-catalog",
  "pplx-space-execution-common",
@@ -8043,6 +8042,7 @@ dependencies = [
  "pplx-space-grpc-server",
  "pplx-space-internal-api-server",
  "pplx-space-local-health",
+ "pplx-space-lru-reaper",
  "pplx-space-metrics-emit",
  "pplx-space-net-common",
  "pplx-space-node-api-client",
