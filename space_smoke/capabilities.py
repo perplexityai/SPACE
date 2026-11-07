@@ -1897,6 +1897,104 @@ class ConcurrentRestoreControl(Protocol):
         ...
 
 
+class EcwLifecycleProbe(Protocol):
+    """One raw ECW `pause` or `resume` call, without the SDK's own handling.
+
+    The scenario judges the answer itself (a refusal is the expected outcome
+    while a restore holds the row), so it is returned rather than raised:
+    `status` is the HTTP status, 0 for a transport failure.
+    """
+
+    def lifecycle_request(self, action: str, *, timeout: float) -> RestoreCallerOutcome:
+        """`POST /sandboxes/{id}/<action>` with no body; `action` is `pause` or `resume`."""
+        ...
+
+
+@dataclass(frozen=True)
+class DrainRestoreObservation:
+    """One read of a drain restore operation and its sandbox, in one statement.
+
+    `operation_state` is None when no such operation row exists, and
+    `lifecycle` None when the sandbox row is gone. `restore_episode_target`
+    reads None on a schema without the column, so the read also serves a
+    base build as control evidence. `active_executions` counts the sandbox's
+    `sandbox_k8s_executions` rows with `active` set.
+    """
+
+    operation_state: str | None
+    attempts: int
+    terminal_error_code: str | None
+    progress_message: str
+    lifecycle: str | None
+    restore_episode_target: str | None
+    evacuation_restore_target: str | None
+    active_executions: int
+
+    def evidence(self) -> dict[str, object]:
+        return {
+            "operation_state": self.operation_state,
+            "operation_attempts": self.attempts,
+            "operation_terminal_error_code": self.terminal_error_code,
+            "operation_progress_message": self.progress_message,
+            "sandbox_lifecycle": self.lifecycle,
+            "restore_episode_target": self.restore_episode_target,
+            "evacuation_restore_target": self.evacuation_restore_target,
+            "active_executions": self.active_executions,
+        }
+
+
+class DrainRestoreControl(Protocol):
+    """Kind-only operations for the drain restore operation scenario.
+
+    Nothing in production enqueues a `drain_restore_sandbox` operation yet,
+    so the one enqueue is a named insert that mirrors the API's own
+    (`enqueue_drain_restore`: the sandbox queue's advisory lock, then the row
+    and its `operation.created` event). The reads are the operation row, the
+    sandbox row's lifecycle and episode target, and its active executions.
+    The test hold is a scoped override of one cluster-controller env key
+    (closed key list, bounded integer seconds), under the controller-mutation
+    Lease the retention, GC and stopped-replacement scenarios share.
+    """
+
+    def acquire_controller_mutation(self) -> Callable[[], None]:
+        """Take the cluster-visible controller-deployment Lease; returns its release."""
+        ...
+
+    def drain_restore_hold_env(self) -> dict[str, str | None]:
+        """The hold's literal on the controller Deployment, None if unset."""
+        ...
+
+    def running_controller_drain_restore_hold_envs(self) -> list[dict[str, str | None]]:
+        """The same literal on every running, not-terminating controller pod."""
+        ...
+
+    def set_drain_restore_hold_env(self, overrides: Mapping[str, str]) -> None:
+        """Apply the hold and await the controller rollout; refuses keys or values off the lists."""
+        ...
+
+    def restore_drain_restore_hold_env(self, standing: Mapping[str, str | None]) -> None:
+        """Put the captured literal back (None unsets) and await the controller rollout."""
+        ...
+
+    def drain_restore_source_snapshot(self, sandbox_id: str) -> str | None:
+        """The sandbox's newest `ready` full snapshot with a live storage location, or None."""
+        ...
+
+    def enqueue_drain_restore(
+        self, sandbox_id: str, *, target: str, snapshot_id: str, due_in_seconds: int
+    ) -> str:
+        """Queue a drain restore of the sandbox toward `target` from `snapshot_id`; returns its id.
+
+        `due_in_seconds` sets `next_attempt_at` that far past the insert, so
+        a positive value keeps the dispatcher from claiming it meanwhile.
+        """
+        ...
+
+    def drain_restore_observation(
+        self, operation_id: str, sandbox_id: str
+    ) -> DrainRestoreObservation: ...
+
+
 @dataclass(frozen=True)
 class TemplateCacheGcConfig:
     """template-manager's LRU eviction knobs as rendered on the worker DaemonSet.
