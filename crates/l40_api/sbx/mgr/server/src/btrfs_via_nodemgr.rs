@@ -127,6 +127,26 @@ impl CapturedRootfs {
     }
 }
 
+/// The parent build's partition for a sandbox codec request: set for a
+/// sandbox bound to an environment outside the legacy layout, whose template
+/// build lives in that environment's partition; `None` for a legacy build.
+/// The request keeps `content_hash` too, so an older node-manager still
+/// resolves the legacy build.
+pub(crate) fn codec_environment_build(
+    content_hash: &str,
+    environment: Option<pplx_space_common_core::types::EnvironmentReference>,
+) -> Option<pplx_space_node_mgr_client::proto::EnvironmentTemplateBuild> {
+    let environment = environment?;
+    (pplx_space_node_runtime_core::catalog::template_cache_partition(Some(environment))
+        != pplx_space_common_core::types::TemplateCachePartition::Legacy)
+        .then(
+            || pplx_space_node_mgr_client::proto::EnvironmentTemplateBuild {
+                content_hash: content_hash.to_string(),
+                environment: environment.to_string(),
+            },
+        )
+}
+
 /// Encode a sandbox's rootfs as a `btrfs send -p` stream via
 /// node-manager. The output stream lands in `snapshot_dir`; nodemgr also
 /// cleans up the intermediate `instance.ro` subvolume on success.
@@ -134,6 +154,7 @@ pub(crate) async fn encode_rootfs_send(
     sandbox_id: &str,
     template_name: &str,
     content_hash: &str,
+    environment: Option<pplx_space_common_core::types::EnvironmentReference>,
     snapshot_dir: &str,
     execution_fence: ExecutionFence,
     node_manager: &NodeManagerConnector,
@@ -153,7 +174,7 @@ pub(crate) async fn encode_rootfs_send(
             execution_fence: Some(execution_fence.into()),
             retain_source: retain_send_sources(),
             defer_send: defer,
-            environment_build: None,
+            environment_build: codec_environment_build(content_hash, environment),
         })
         .await
         .map_err(|status| BtrfsViaNodemgrError::Rpc { rpc: RPC, status })?
@@ -176,6 +197,7 @@ pub(crate) async fn encode_snapshot_rootfs_send(
     sandbox_id: &str,
     template_name: &str,
     content_hash: &str,
+    environment: Option<pplx_space_common_core::types::EnvironmentReference>,
     snapshot_name: &str,
     dest_dir: &str,
     node_manager: &NodeManagerConnector,
@@ -193,7 +215,7 @@ pub(crate) async fn encode_snapshot_rootfs_send(
             dest_dir: dest_dir.to_string(),
             retain_source: false,
             defer_send: false,
-            environment_build: None,
+            environment_build: codec_environment_build(content_hash, environment),
         })
         .await
         .map_err(|status| BtrfsViaNodemgrError::Rpc {
@@ -214,6 +236,7 @@ pub(crate) async fn receive_instance(
     sandbox_id: &str,
     template_name: &str,
     content_hash: &str,
+    environment: Option<pplx_space_common_core::types::EnvironmentReference>,
     target: InstanceTarget,
     node_manager: &NodeManagerConnector,
 ) -> Result<(), BtrfsViaNodemgrError> {
@@ -227,7 +250,7 @@ pub(crate) async fn receive_instance(
             template_name: template_name.to_string(),
             content_hash: content_hash.to_string(),
             target: Some(target.into()),
-            environment_build: None,
+            environment_build: codec_environment_build(content_hash, environment),
         })
         .await
         .map_err(|status| BtrfsViaNodemgrError::Rpc {

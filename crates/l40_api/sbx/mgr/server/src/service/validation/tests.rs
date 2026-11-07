@@ -1,5 +1,7 @@
 use super::normalize_environment_input;
 use super::require_environment_acknowledgement;
+use super::template_base_snapshot_dir;
+use super::template_snapshot_partition;
 use pplx_space_common_core::types::{Arch, EnvironmentReference, ExecutionMetadata};
 
 #[test]
@@ -432,6 +434,68 @@ fn memory_state_support_follows_complete_environment_identity() {
     ] {
         assert_eq!(super::requires_cold_creation(&execution), cold_only);
     }
+}
+
+/// A capture publishes under the partition template-manager names for the
+/// build it booted: the legacy one when it names none or names it, whatever
+/// the binding (an adopted legacy-layout build is bound to another
+/// environment), and otherwise only the binding's own partition.
+#[test]
+fn a_capture_publishes_under_the_partition_template_manager_names() {
+    use pplx_space_common_core::types::TemplateCachePartition;
+    let hash = format!("sha256:{}", "a".repeat(64));
+    let initial = pplx_space_node_runtime_core::catalog::initial_environment_reference();
+    let twin = EnvironmentReference::new(pplx_space_common_core::types::Digest::sha256([2; 32]));
+    let other = EnvironmentReference::new(pplx_space_common_core::types::Digest::sha256([3; 32]));
+    let bound = |environment| {
+        ExecutionMetadata::initial_firecracker(Arch::X86_64, vec![]).with_environment(environment)
+    };
+    let twin_execution = bound(twin);
+    let partition = |requested: Option<&str>, execution: Option<&ExecutionMetadata>| {
+        template_snapshot_partition(requested, execution)
+    };
+
+    assert_eq!(
+        partition(None, Some(&twin_execution)).unwrap(),
+        TemplateCachePartition::Legacy
+    );
+    assert_eq!(
+        partition(Some(""), Some(&twin_execution)).unwrap(),
+        TemplateCachePartition::Legacy
+    );
+    assert_eq!(
+        partition(Some(&twin.to_string()), Some(&twin_execution)).unwrap(),
+        TemplateCachePartition::Environment(twin)
+    );
+    assert_eq!(
+        partition(Some(&other.to_string()), Some(&twin_execution))
+            .unwrap_err()
+            .code(),
+        tonic::Code::FailedPrecondition
+    );
+    assert_eq!(
+        partition(Some("not-a-partition"), Some(&bound(initial)))
+            .unwrap_err()
+            .code(),
+        tonic::Code::InvalidArgument
+    );
+
+    let legacy = template_base_snapshot_dir("seed", &hash, TemplateCachePartition::Legacy, 2, 1024);
+    assert!(
+        legacy.contains(&format!("/seed/snapshots/{hash}/")),
+        "{legacy}"
+    );
+    let twin_dir = template_base_snapshot_dir(
+        "seed",
+        &hash,
+        TemplateCachePartition::Environment(twin),
+        2,
+        1024,
+    );
+    assert!(
+        twin_dir.contains(&format!("/seed/snapshots/{hash}@{twin}/")),
+        "{twin_dir}"
+    );
 }
 
 #[test]

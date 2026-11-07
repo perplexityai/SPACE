@@ -184,6 +184,28 @@ fn checked_parent_candidates<V>(
     Ok(passing)
 }
 
+/// The candidate a receive uses: the one whose expected received UUID is the
+/// stream's parent, when the stream names one, else the first that passed.
+/// `FailedPrecondition` when the stream names a parent no candidate is.
+fn choose_stream_parent(
+    passing: Vec<(TemplateBuildTarget, ())>,
+    stream_parent: Option<uuid::Uuid>,
+) -> Result<TemplateBuildTarget, Status> {
+    let mut passing = passing.into_iter().map(|(candidate, ())| candidate);
+    match stream_parent {
+        Some(parent) => passing
+            .find(|candidate| candidate.received_uuid() == parent)
+            .ok_or_else(|| {
+                Status::failed_precondition(format!(
+                    "no cached build on this node is the stream's parent (received_uuid={parent})"
+                ))
+            }),
+        None => passing
+            .next()
+            .ok_or_else(|| Status::internal("sandbox codec request names no parent")),
+    }
+}
+
 /// The first of `passing` that `accepts`, else the first.
 fn choose_parent_candidate<V>(
     passing: Vec<(TemplateBuildTarget, V)>,
@@ -202,8 +224,11 @@ fn choose_parent_candidate<V>(
 /// `candidates` followed by the digest's other partitions that have a build
 /// directory under the template directory, in directory-name order, when the
 /// first candidate names a partition; unchanged when it's the legacy build.
-/// A sandbox bound to another environment can descend from a partition its
-/// binding doesn't name. The handlers' lineage checks still choose among them.
+/// Only receive uses them: a stream encoded before this release, or on a node
+/// that held another partition, may name one, and receive matches the
+/// stream's parent by its received UUID. Encodes never take them, so no new
+/// stream names a parent outside the requested partition and the legacy
+/// build.
 fn with_cached_partitions(candidates: Vec<TemplateBuildTarget>) -> Vec<TemplateBuildTarget> {
     if names_legacy_build(&candidates) {
         return candidates;
@@ -910,7 +935,10 @@ impl NodeManagerService {
                 })?;
                 // The parent is the build the instance descends from; the
                 // lineage check below reports a mismatch.
-                let candidates = with_cached_partitions(candidates);
+                // An encode takes the requested partition's build or the legacy one,
+                // never another partition's: a restoring node holds one of those two,
+                // but may not hold a third. A sandbox that descends from neither
+                // fails the lineage check, so a suspend encodes Full.
                 let instance_parent = artifact_fs::info(&instance_path)
                     .ok()
                     .and_then(|info| info.parent_uuid);
@@ -1073,7 +1101,10 @@ impl NodeManagerService {
             let source = source.clone();
             let instance_path = instance_dir(&req.sandbox_id);
             self.off_runtime("validate named-snapshot send lineage", move || {
-                let candidates = with_cached_partitions(candidates);
+                // An encode takes the requested partition's build or the legacy one,
+                // never another partition's: a restoring node holds one of those two,
+                // but may not hold a third. A sandbox that descends from neither
+                // fails the lineage check, so a suspend encodes Full.
                 if !artifact_fs::is_subvolume(&source)? {
                     return Err(lineage_precondition(
                         LineageFallbackCause::SnapshotNotSubvolume,
@@ -1240,37 +1271,44 @@ impl NodeManagerService {
                 // `FailedPrecondition` so the caller can detect "this codec
                 // can't proceed against this node's template" on the wire and
                 // fall back to the Full codec — distinct from `Internal`,
-                // which the caller treats as a real codec failure. The first
-                // candidate that passes is used; `btrfs receive` then finds
-                // the stream's parent by its received UUID.
+                // which the caller treats as a real codec failure. Of the
+                // candidates that pass, the one whose received UUID is the
+                // stream's parent is used: `btrfs receive` finds the parent by
+                // that UUID, so any other candidate would fail it. With no such
+                // candidate the restore can't proceed on this node, which is a
+                // precondition failure too. A full stream, or one that can't be
+                // read here, takes the first candidate, as before.
                 let candidates = with_cached_partitions(candidates);
-                let (template, ()) = first_parent_candidate(
-                    candidates,
-                    |template| {
-                        let template_dir = template.digest_dir();
-                        let template_path = template_dir.as_path();
-                        let template_info = artifact_fs::info(template_path).map_err(|e| {
-                            Status::failed_precondition(format!(
-                                "btrfs-send restore needs template {} as a btrfs subvolume on \
+                let passing = checked_parent_candidates(candidates, |template| {
+                    let template_dir = template.digest_dir();
+                    let template_path = template_dir.as_path();
+                    let template_info = artifact_fs::info(template_path).map_err(|e| {
+                        Status::failed_precondition(format!(
+                            "btrfs-send restore needs template {} as a btrfs subvolume on \
                                  this node; read_subvolume_info({}) failed: {e}",
-                                template,
-                                template_path.display(),
-                            ))
-                        })?;
-                        let expected_received = template.received_uuid();
-                        if template_info.received_uuid != Some(expected_received) {
-                            return Err(Status::failed_precondition(format!(
-                                "btrfs-send restore needs template {} \
+                            template,
+                            template_path.display(),
+                        ))
+                    })?;
+                    let expected_received = template.received_uuid();
+                    if template_info.received_uuid != Some(expected_received) {
+                        return Err(Status::failed_precondition(format!(
+                            "btrfs-send restore needs template {} \
                                  received_uuid={expected_received} on this node; got {:?}. The \
                                  template was installed before the stamp landed; force a \
                                  re-install via tmplmgr to recover.",
-                                template, template_info.received_uuid,
-                            )));
-                        }
-                        Ok(())
-                    },
-                    |()| true,
-                )?;
+                            template, template_info.received_uuid,
+                        )));
+                    }
+                    Ok(())
+                })?;
+                let stream_parent = std::fs::File::open(&stream_path)
+                    .ok()
+                    .and_then(|stream| {
+                        super::btrfs_send_stream::incremental_parent_uuid(&stream).ok()
+                    })
+                    .flatten();
+                let template = choose_stream_parent(passing, stream_parent)?;
                 Ok((
                     template,
                     std::fs::metadata(&stream_path)

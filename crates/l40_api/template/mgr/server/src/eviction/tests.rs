@@ -4,6 +4,7 @@ fn build(name: &str, hash: &str, size: u64, created: u64, used: u64) -> BuildSna
     BuildSnapshot {
         name: name.to_string(),
         content_hash: hash.to_string(),
+        cache_partition: crate::db::TemplateCachePartition::Legacy,
         size_bytes: size,
         created_at_secs: created,
         last_used_at_secs: used,
@@ -15,6 +16,27 @@ fn keys(pairs: &[(&str, &str)]) -> HashSet<(String, String)> {
         .iter()
         .map(|(n, h)| ((*n).to_string(), (*h).to_string()))
         .collect()
+}
+
+/// A component row for a build. Leaves foreign keys unenforced, as on
+/// template-manager's runtime connection, so nothing cascades to it.
+fn seed_component(conn: &Connection, name: &str, hash: &str) {
+    conn.execute_batch("PRAGMA foreign_keys = OFF").unwrap();
+    conn.execute(
+        "INSERT INTO template_build_components (name, content_hash, cache_partition, kind, role_key)
+         VALUES (?1, ?2, '', 'kernel', '')",
+        params![name, hash],
+    )
+    .unwrap();
+}
+
+fn components(conn: &Connection, hash: &str) -> i64 {
+    conn.query_row(
+        "SELECT COUNT(*) FROM template_build_components WHERE content_hash = ?1",
+        [hash],
+        |row| row.get(0),
+    )
+    .unwrap()
 }
 
 fn cfg(budget: u64, headroom: f64, grace_secs: u64, now: u64) -> EvictionConfig {
@@ -72,6 +94,7 @@ fn seed_build(conn: &Connection, name: &str, content_hash: &str, size: u64) {
     let upsert = BuildUpsert {
         name,
         content_hash,
+        cache_partition: crate::db::TemplateCachePartition::Legacy,
         build_date: "2026-01-01T00:00:00Z",
         manifest_json: "{}",
         runtime: "fc",
@@ -105,7 +128,7 @@ fn plan_from_db_returns_empty_when_under_budget() {
         &HashSet::new(),
         &HashSet::new(),
         &cfg(1_000, 0.9, 60, 10_000),
-        |_, _, s, _| s,
+        |_, _, _, s, _| s,
     )
     .unwrap();
     assert!(plan.candidates.is_empty());
@@ -133,7 +156,7 @@ fn plan_from_db_respects_pinned_rows() {
         // budget 500 -> over budget, need to free; grace=0 so
         // both are eligible by age.
         &cfg(500, 0.9, 0, 10_000),
-        |_, _, s, _| s,
+        |_, _, _, s, _| s,
     )
     .unwrap();
     assert_eq!(plan.candidates.len(), 1);
@@ -153,10 +176,11 @@ fn execute_one_deletes_when_no_race() {
     let cand = EvictionCandidate {
         name: "seed".to_string(),
         content_hash: "h1".to_string(),
+        cache_partition: crate::db::TemplateCachePartition::Legacy,
         size_bytes: 1_000,
     };
     let observed = std::cell::RefCell::new(None);
-    let outcome = execute_one(&conn, &HashSet::new(), &HashSet::new(), &cand, |n, h| {
+    let outcome = execute_one(&conn, &HashSet::new(), &HashSet::new(), &cand, |n, h, _| {
         *observed.borrow_mut() = Some((n.to_string(), h.to_string()));
         Ok(())
     })
@@ -189,10 +213,11 @@ fn execute_one_skips_pin_added_between_plan_and_execute() {
     let cand = EvictionCandidate {
         name: "seed".to_string(),
         content_hash: "h1".to_string(),
+        cache_partition: crate::db::TemplateCachePartition::Legacy,
         size_bytes: 1_000,
     };
     let disk_called = std::cell::Cell::new(false);
-    let outcome = execute_one(&conn, &HashSet::new(), &HashSet::new(), &cand, |_, _| {
+    let outcome = execute_one(&conn, &HashSet::new(), &HashSet::new(), &cand, |_, _, _| {
         disk_called.set(true);
         Ok(())
     })
@@ -222,11 +247,12 @@ fn execute_one_skips_active_added_between_plan_and_execute() {
     let cand = EvictionCandidate {
         name: "seed".to_string(),
         content_hash: "h1".to_string(),
+        cache_partition: crate::db::TemplateCachePartition::Legacy,
         size_bytes: 1_000,
     };
     let active = keys(&[("seed", "h1")]);
     let disk_called = std::cell::Cell::new(false);
-    let outcome = execute_one(&conn, &active, &HashSet::new(), &cand, |_, _| {
+    let outcome = execute_one(&conn, &active, &HashSet::new(), &cand, |_, _, _| {
         disk_called.set(true);
         Ok(())
     })
@@ -252,9 +278,10 @@ fn execute_one_keeps_db_row_when_disk_delete_fails() {
     let cand = EvictionCandidate {
         name: "seed".to_string(),
         content_hash: "h1".to_string(),
+        cache_partition: crate::db::TemplateCachePartition::Legacy,
         size_bytes: 1_000,
     };
-    let outcome = execute_one(&conn, &HashSet::new(), &HashSet::new(), &cand, |_, _| {
+    let outcome = execute_one(&conn, &HashSet::new(), &HashSet::new(), &cand, |_, _, _| {
         // Surface a synthetic SQLite error to model an I/O failure
         // bubbling through the disk-delete closure.
         Err(rusqlite::Error::ExecuteReturnedResults)
@@ -289,6 +316,8 @@ async fn gc_tick_evicts_oldest_candidate_end_to_end() {
     let raw = crate::db::test_conn();
     seed_build(&raw, "seed", "old", 1_000);
     seed_build(&raw, "seed", "new", 500);
+    seed_component(&raw, "seed", "old");
+    seed_component(&raw, "seed", "new");
     // Plant LRU timestamps so "old" is clearly the LRU pick. Use
     // 1 second to keep grace math obvious.
     crate::db::set_last_used_at_for_test(&raw, "seed", "old", 1).unwrap();
@@ -305,7 +334,7 @@ async fn gc_tick_evicts_oldest_candidate_end_to_end() {
 
     let deleted = Arc::new(Mutex::new(Vec::<(String, String)>::new()));
     let deleted_capture = Arc::clone(&deleted);
-    let delete_disk: DeleteDiskFn = Arc::new(move |n, h| {
+    let delete_disk: DeleteDiskFn = Arc::new(move |n, h, _| {
         let captured = Arc::clone(&deleted_capture);
         let name = n.to_string();
         let hash = h.to_string();
@@ -316,7 +345,7 @@ async fn gc_tick_evicts_oldest_candidate_end_to_end() {
     });
     // Identity disk-size: the planner is given the artifact_size
     // stored in the DB.
-    let disk_size: DiskSizeFn = Arc::new(|_, _, fallback, _| fallback);
+    let disk_size: DiskSizeFn = Arc::new(|_, _, _, fallback, _| fallback);
 
     let report = gc_tick(
         Arc::clone(&db),
@@ -326,6 +355,7 @@ async fn gc_tick_evicts_oldest_candidate_end_to_end() {
         disk_size,
         delete_disk,
         noop_reaper_probe(),
+        &grant_every_claim(),
     )
     .await
     .unwrap();
@@ -351,6 +381,244 @@ async fn gc_tick_evicts_oldest_candidate_end_to_end() {
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
     assert_eq!(remaining, vec!["new"]);
+    assert_eq!((components(&conn, "old"), components(&conn, "new")), (0, 1));
+}
+
+/// A claim fake that refuses the digests in `held` and grants the rest.
+fn claims_except(held: Arc<Mutex<HashSet<(String, String)>>>) -> ClaimDigestFn {
+    Arc::new(move |name, hash| {
+        if held
+            .lock()
+            .unwrap()
+            .contains(&(name.to_string(), hash.to_string()))
+        {
+            None
+        } else {
+            Some(Box::new(()))
+        }
+    })
+}
+
+/// A claim fake that tracks which digests are held: a claim is granted when
+/// its digest isn't taken, and gives the digest back when dropped.
+fn tracking_claims(taken: Arc<Mutex<HashSet<(String, String)>>>) -> ClaimDigestFn {
+    struct Taken(Arc<Mutex<HashSet<(String, String)>>>, (String, String));
+    impl Drop for Taken {
+        fn drop(&mut self) {
+            self.0.lock().unwrap().remove(&self.1);
+        }
+    }
+    Arc::new(move |name, hash| {
+        let key = (name.to_string(), hash.to_string());
+        if !taken.lock().unwrap().insert(key.clone()) {
+            return None;
+        }
+        Some(Box::new(Taken(Arc::clone(&taken), key)))
+    })
+}
+
+/// A tick cancelled mid-eviction, as at shutdown, doesn't release the
+/// digest's claim while the disk delete still runs: the eviction holds it
+/// until the delete and finalize finish, so a registration can't publish
+/// the digest while its files are being removed.
+#[tokio::test]
+async fn a_cancelled_tick_keeps_the_claim_until_its_eviction_finishes() {
+    let raw = crate::db::test_conn();
+    seed_build(&raw, "seed", "old", 1_000);
+    seed_build(&raw, "seed", "new", 500);
+    crate::db::set_last_used_at_for_test(&raw, "seed", "old", 1).unwrap();
+    crate::db::set_last_used_at_for_test(&raw, "seed", "new", 100).unwrap();
+    let db = Arc::new(Mutex::new(raw));
+    let cfg = GcConfig {
+        enabled: true,
+        budget_bytes: 800,
+        headroom_fraction: 0.9,
+        interval: Duration::from_secs(60),
+        grace: Duration::from_secs(0),
+    };
+    let started = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let delete_disk: DeleteDiskFn = {
+        let (started, release) = (Arc::clone(&started), Arc::clone(&release));
+        Arc::new(move |_, _, _| {
+            let (started, release) = (Arc::clone(&started), Arc::clone(&release));
+            Box::pin(async move {
+                started.notify_one();
+                release.notified().await;
+                Ok(())
+            })
+        })
+    };
+    let disk_size: DiskSizeFn = Arc::new(|_, _, _, fallback, _| fallback);
+    let taken = Arc::new(Mutex::new(HashSet::new()));
+    let claim = tracking_claims(Arc::clone(&taken));
+    let key = ("seed".to_string(), "old".to_string());
+
+    let tick = tokio::spawn({
+        let db = Arc::clone(&db);
+        async move {
+            gc_tick(
+                db,
+                &cfg,
+                HashSet::new(),
+                HashSet::new(),
+                disk_size,
+                delete_disk,
+                noop_reaper_probe(),
+                &claim,
+            )
+            .await
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(5), started.notified())
+        .await
+        .expect("the eviction reaches its disk delete");
+    tick.abort();
+    let _ = tick.await;
+    assert!(
+        taken.lock().unwrap().contains(&key),
+        "the claim is held while the delete runs"
+    );
+
+    release.notify_one();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while taken.lock().unwrap().contains(&key) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the claim goes once the eviction finishes");
+}
+
+/// A candidate whose digest a registration, pull or delete holds is left
+/// alone: no `deleting` swap, no disk delete. Once the holder lets go, the
+/// next tick evicts it.
+#[tokio::test]
+async fn eviction_skips_a_digest_someone_holds() {
+    let raw = crate::db::test_conn();
+    seed_build(&raw, "seed", "old", 1_000);
+    seed_build(&raw, "seed", "new", 500);
+    crate::db::set_last_used_at_for_test(&raw, "seed", "old", 1).unwrap();
+    crate::db::set_last_used_at_for_test(&raw, "seed", "new", 100).unwrap();
+    let db = Arc::new(Mutex::new(raw));
+    let cfg = GcConfig {
+        enabled: true,
+        budget_bytes: 800,
+        headroom_fraction: 0.9,
+        interval: Duration::from_secs(60),
+        grace: Duration::from_secs(0),
+    };
+    let deleted = Arc::new(Mutex::new(Vec::<String>::new()));
+    let delete_disk: DeleteDiskFn = {
+        let deleted = Arc::clone(&deleted);
+        Arc::new(move |_, h, _| {
+            deleted.lock().unwrap().push(h.to_string());
+            Box::pin(async { Ok(()) })
+        })
+    };
+    let disk_size: DiskSizeFn = Arc::new(|_, _, _, fallback, _| fallback);
+    let held = Arc::new(Mutex::new(keys(&[("seed", "old")])));
+    let claim = claims_except(Arc::clone(&held));
+    let state = |hash: &str| {
+        crate::db::get_build(
+            &db.lock().unwrap(),
+            "seed",
+            hash,
+            crate::db::TemplateCachePartition::Legacy,
+        )
+        .unwrap()
+        .map(|row| row.state)
+    };
+
+    let held_tick = gc_tick(
+        Arc::clone(&db),
+        &cfg,
+        HashSet::new(),
+        HashSet::new(),
+        Arc::clone(&disk_size),
+        Arc::clone(&delete_disk),
+        noop_reaper_probe(),
+        &claim,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        (
+            held_tick.candidates_planned,
+            held_tick.skipped_claimed,
+            held_tick.deleted
+        ),
+        (1, 1, 0)
+    );
+    assert_eq!(
+        state("old").as_deref(),
+        Some("ready"),
+        "never marked deleting"
+    );
+    assert!(
+        deleted.lock().unwrap().is_empty(),
+        "nothing deleted from disk"
+    );
+
+    held.lock().unwrap().clear();
+    let released_tick = gc_tick(
+        Arc::clone(&db),
+        &cfg,
+        HashSet::new(),
+        HashSet::new(),
+        disk_size,
+        delete_disk,
+        noop_reaper_probe(),
+        &claim,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        (released_tick.skipped_claimed, released_tick.deleted),
+        (0, 1)
+    );
+    assert_eq!(state("old"), None);
+    assert_eq!(*deleted.lock().unwrap(), ["old"]);
+}
+
+/// `DeleteIdleTemplate` doesn't evict a build whose digest someone holds
+/// either; it keeps the template and says why.
+#[tokio::test]
+async fn idle_template_eviction_skips_a_digest_someone_holds() {
+    let conn = crate::db::test_conn();
+    seed_build_touched_at(&conn, "doomed", "h1", 1);
+    let db = Arc::new(Mutex::new(conn));
+    let outcome = evict_idle_template(
+        Arc::clone(&db),
+        &EvictionGate::default(),
+        "doomed",
+        1_000,
+        HashSet::new(),
+        HashSet::new(),
+        EvictionDisk {
+            delete: Arc::new(|_, _, _| panic!("a held digest must not be deleted")),
+            probe: noop_reaper_probe(),
+            claim: claims_except(Arc::new(Mutex::new(keys(&[("doomed", "h1")])))),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        outcome,
+        IdleTemplateEviction::Kept {
+            evicted: 0,
+            reason: IdleTemplateKept::Claimed,
+        }
+    );
+    let row = crate::db::get_build(
+        &db.lock().unwrap(),
+        "doomed",
+        "h1",
+        crate::db::TemplateCachePartition::Legacy,
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(row.state, "ready");
 }
 
 /// `run_loop` exits promptly when `shutdown.cancel()` fires. We
@@ -375,8 +643,8 @@ async fn run_loop_exits_cooperatively_on_shutdown() {
 
     let shutdown = CancellationToken::new();
     let fetch_active: FetchActiveFn = Arc::new(|| Box::pin(async { Ok(HashSet::new()) }));
-    let disk_size: DiskSizeFn = Arc::new(|_, _, fallback, _| fallback);
-    let delete_disk: DeleteDiskFn = Arc::new(|_, _| Box::pin(async { Ok(()) }));
+    let disk_size: DiskSizeFn = Arc::new(|_, _, _, fallback, _| fallback);
+    let delete_disk: DeleteDiskFn = Arc::new(|_, _, _| Box::pin(async { Ok(()) }));
 
     let loop_handle = tokio::spawn(run_loop(
         Arc::clone(&db),
@@ -389,6 +657,7 @@ async fn run_loop_exits_cooperatively_on_shutdown() {
             delete_disk_for: delete_disk,
             reaper_probe: noop_reaper_probe(),
             reconcile_rowless: noop_reconcile_rowless(),
+            claim_digest: grant_every_claim(),
         },
         EvictionGate::default(),
     ));
@@ -410,7 +679,7 @@ async fn run_loop_exits_cooperatively_on_shutdown() {
 /// the disk delete. Before the 3-phase restructure the IMMEDIATE
 /// txn + `Arc<Mutex<Connection>>` lock were both held for the
 /// duration of the disk delete, blocking every other DB
-/// consumer (prefetch writes, `resolve_template` on the sandbox-
+/// consumer (prefetch writes, `resolve_template_build` on the sandbox-
 /// create hot path) for seconds on a multi-GB rootfs delete.
 ///
 /// Test shape: model a slow disk delete (sleep 500ms inside the
@@ -428,12 +697,13 @@ async fn execute_one_async_releases_db_lock_during_disk_delete() {
     let cand = EvictionCandidate {
         name: "seed".to_string(),
         content_hash: "h1".to_string(),
+        cache_partition: crate::db::TemplateCachePartition::Legacy,
         size_bytes: 1_000,
     };
 
     // Disk delete sleeps for 500ms — simulates a multi-GB
     // rootfs+zstd removal on slow storage.
-    let delete_disk: DeleteDiskFn = Arc::new(|_, _| {
+    let delete_disk: DeleteDiskFn = Arc::new(|_, _, _| {
         Box::pin(async move {
             tokio::time::sleep(Duration::from_millis(500)).await;
             Ok(())
@@ -492,7 +762,7 @@ async fn execute_one_async_releases_db_lock_during_disk_delete() {
 /// a build that's about to vanish. The fix is in
 /// `execute_precheck`: it atomically flips the row to
 /// `state='deleting'` inside the IMMEDIATE txn, and
-/// `resolve_template` filters on `state='ready'`. This test
+/// `resolve_template_build` filters on `state='ready'`. This test
 /// gates the disk delete on a manual signal so it can observe
 /// the row state DURING Phase 2 (after Phase 1 committed
 /// 'deleting', before Phase 3 deletes the row).
@@ -508,6 +778,7 @@ async fn execute_one_async_marks_deleting_before_disk_delete() {
     let cand = EvictionCandidate {
         name: "seed".to_string(),
         content_hash: "h1".to_string(),
+        cache_partition: crate::db::TemplateCachePartition::Legacy,
         size_bytes: 1_000,
     };
 
@@ -517,7 +788,7 @@ async fn execute_one_async_marks_deleting_before_disk_delete() {
     // sandbox-create would arrive.
     let (release_tx, release_rx) = oneshot::channel::<()>();
     let release_rx = Arc::new(Mutex::new(Some(release_rx)));
-    let delete_disk: DeleteDiskFn = Arc::new(move |_, _| {
+    let delete_disk: DeleteDiskFn = Arc::new(move |_, _, _| {
         let rx_slot = Arc::clone(&release_rx);
         Box::pin(async move {
             let rx = rx_slot.lock().unwrap().take();
@@ -598,11 +869,12 @@ async fn execute_one_async_second_eviction_skips_deleting_row() {
     let cand = EvictionCandidate {
         name: "seed".to_string(),
         content_hash: "h1".to_string(),
+        cache_partition: crate::db::TemplateCachePartition::Legacy,
         size_bytes: 1_000,
     };
     let disk_called = Arc::new(Mutex::new(false));
     let disk_called_capture = Arc::clone(&disk_called);
-    let delete_disk: DeleteDiskFn = Arc::new(move |_, _| {
+    let delete_disk: DeleteDiskFn = Arc::new(move |_, _, _| {
         let c = Arc::clone(&disk_called_capture);
         Box::pin(async move {
             *c.lock().unwrap() = true;
@@ -658,12 +930,16 @@ async fn gc_tick_does_not_deadlock_when_disk_size_fn_relocks_db() {
     // already holds db.lock(), so this inner lock() deadlocks.
     let db_for_closure = Arc::clone(&db);
     let disk_size: DiskSizeFn = Arc::new(
-        move |_n: &str, _h: &str, fallback: u64, _dims: &[(u32, u32)]| {
+        move |_n: &str,
+              _h: &str,
+              _partition: crate::db::TemplateCachePartition,
+              fallback: u64,
+              _dims: &[(u32, u32)]| {
             let _guard = db_for_closure.lock().unwrap();
             fallback
         },
     );
-    let delete_disk: DeleteDiskFn = Arc::new(|_, _| Box::pin(async { Ok(()) }));
+    let delete_disk: DeleteDiskFn = Arc::new(|_, _, _| Box::pin(async { Ok(()) }));
 
     let result = tokio::time::timeout(
         Duration::from_secs(2),
@@ -675,6 +951,7 @@ async fn gc_tick_does_not_deadlock_when_disk_size_fn_relocks_db() {
             disk_size,
             delete_disk,
             noop_reaper_probe(),
+            &grant_every_claim(),
         ),
     )
     .await;
@@ -714,8 +991,8 @@ async fn run_loop_exits_when_active_fetch_is_stuck() {
             std::future::pending::<Result<HashSet<(String, String)>, String>>().await
         })
     });
-    let disk_size: DiskSizeFn = Arc::new(|_, _, fallback, _| fallback);
-    let delete_disk: DeleteDiskFn = Arc::new(|_, _| Box::pin(async { Ok(()) }));
+    let disk_size: DiskSizeFn = Arc::new(|_, _, _, fallback, _| fallback);
+    let delete_disk: DeleteDiskFn = Arc::new(|_, _, _| Box::pin(async { Ok(()) }));
 
     let shutdown = CancellationToken::new();
     let loop_handle = tokio::spawn(run_loop(
@@ -729,6 +1006,7 @@ async fn run_loop_exits_when_active_fetch_is_stuck() {
             delete_disk_for: delete_disk,
             reaper_probe: noop_reaper_probe(),
             reconcile_rowless: noop_reconcile_rowless(),
+            claim_digest: grant_every_claim(),
         },
         EvictionGate::default(),
     ));
@@ -773,10 +1051,11 @@ async fn run_loop_with_eviction_disabled_never_evicts_and_stops_on_shutdown() {
         GcHooks {
             fetch_active: Arc::new(|| Box::pin(async { Ok(HashSet::new()) })),
             fetch_warm_pool: empty_warm_pool_fetch(),
-            disk_size_for: Arc::new(|_, _, fallback, _| fallback),
-            delete_disk_for: Arc::new(|_, _| panic!("eviction is disabled")),
+            disk_size_for: Arc::new(|_, _, _, fallback, _| fallback),
+            delete_disk_for: Arc::new(|_, _, _| panic!("eviction is disabled")),
             reaper_probe: noop_reaper_probe(),
             reconcile_rowless: noop_reconcile_rowless(),
+            claim_digest: grant_every_claim(),
         },
         EvictionGate::default(),
     ));
@@ -818,14 +1097,14 @@ async fn gc_tick_skips_active_builds_passed_in_by_caller() {
 
     let disk_called = Arc::new(Mutex::new(false));
     let disk_called_capture = Arc::clone(&disk_called);
-    let delete_disk: DeleteDiskFn = Arc::new(move |_, _| {
+    let delete_disk: DeleteDiskFn = Arc::new(move |_, _, _| {
         let captured = Arc::clone(&disk_called_capture);
         Box::pin(async move {
             *captured.lock().unwrap() = true;
             Ok(())
         })
     });
-    let disk_size: DiskSizeFn = Arc::new(|_, _, fallback, _| fallback);
+    let disk_size: DiskSizeFn = Arc::new(|_, _, _, fallback, _| fallback);
 
     let active = keys(&[("seed", "h1")]);
     let report = gc_tick(
@@ -836,6 +1115,7 @@ async fn gc_tick_skips_active_builds_passed_in_by_caller() {
         disk_size,
         delete_disk,
         noop_reaper_probe(),
+        &grant_every_claim(),
     )
     .await
     .unwrap();
@@ -879,14 +1159,14 @@ async fn gc_tick_skips_warm_pool_protected_builds() {
 
     let disk_called = Arc::new(Mutex::new(false));
     let disk_called_capture = Arc::clone(&disk_called);
-    let delete_disk: DeleteDiskFn = Arc::new(move |_, _| {
+    let delete_disk: DeleteDiskFn = Arc::new(move |_, _, _| {
         let captured = Arc::clone(&disk_called_capture);
         Box::pin(async move {
             *captured.lock().unwrap() = true;
             Ok(())
         })
     });
-    let disk_size: DiskSizeFn = Arc::new(|_, _, fallback, _| fallback);
+    let disk_size: DiskSizeFn = Arc::new(|_, _, _, fallback, _| fallback);
 
     let warm_pool = keys(&[("web-runtime", "sha256:pool")]);
     let report = gc_tick(
@@ -897,6 +1177,7 @@ async fn gc_tick_skips_warm_pool_protected_builds() {
         disk_size,
         delete_disk,
         noop_reaper_probe(),
+        &grant_every_claim(),
     )
     .await
     .unwrap();
@@ -924,11 +1205,12 @@ fn execute_one_skips_warm_pool_added_between_plan_and_execute() {
     let cand = EvictionCandidate {
         name: "web-runtime".into(),
         content_hash: "sha256:pool".into(),
+        cache_partition: crate::db::TemplateCachePartition::Legacy,
         size_bytes: 500,
     };
     let warm_pool = keys(&[("web-runtime", "sha256:pool")]);
     let disk_called = std::cell::Cell::new(false);
-    let outcome = execute_one(&conn, &HashSet::new(), &warm_pool, &cand, |_, _| {
+    let outcome = execute_one(&conn, &HashSet::new(), &warm_pool, &cand, |_, _, _| {
         disk_called.set(true);
         Ok(())
     })
@@ -1005,10 +1287,11 @@ fn execute_one_skips_when_row_missing() {
     let cand = EvictionCandidate {
         name: "seed".to_string(),
         content_hash: "h1".to_string(),
+        cache_partition: crate::db::TemplateCachePartition::Legacy,
         size_bytes: 1_000,
     };
     let disk_called = std::cell::Cell::new(false);
-    let outcome = execute_one(&conn, &HashSet::new(), &HashSet::new(), &cand, |_, _| {
+    let outcome = execute_one(&conn, &HashSet::new(), &HashSet::new(), &cand, |_, _, _| {
         disk_called.set(true);
         Ok(())
     })
@@ -1067,7 +1350,7 @@ fn pin_key_is_template_plus_hash_not_just_hash() {
 // 2. Slow EBS delete that exceeds the gRPC deadline: nodemgr
 //    returns DeadlineExceeded; same closure-Err shape.
 //
-// Both cases leave the build invisible to `resolve_template`
+// Both cases leave the build invisible to `resolve_template_build`
 // (state filter) and unupsertable by a concurrent `do_pull` (ON
 // CONFLICT guard). Startup recovery only resolves this on daemon restart,
 // so it cannot bound recovery time by itself.
@@ -1096,9 +1379,10 @@ async fn execute_one_async_leaves_row_in_deleting_after_phase2_error() {
     let cand = EvictionCandidate {
         name: "seed".to_string(),
         content_hash: "h1".to_string(),
+        cache_partition: crate::db::TemplateCachePartition::Legacy,
         size_bytes: 1_000,
     };
-    let delete_disk: DeleteDiskFn = Arc::new(|_, _| {
+    let delete_disk: DeleteDiskFn = Arc::new(|_, _, _| {
         Box::pin(async move {
             Err(rusqlite::Error::SqliteFailure(
                 rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_IOERR),
@@ -1167,7 +1451,7 @@ async fn gc_tick_recovers_stuck_deleting_row_when_disk_intact() {
 
     let deleted = Arc::new(Mutex::new(Vec::<(String, String)>::new()));
     let deleted_capture = Arc::clone(&deleted);
-    let delete_disk: DeleteDiskFn = Arc::new(move |n, h| {
+    let delete_disk: DeleteDiskFn = Arc::new(move |n, h, _| {
         let captured = Arc::clone(&deleted_capture);
         let name = n.to_string();
         let hash = h.to_string();
@@ -1176,13 +1460,13 @@ async fn gc_tick_recovers_stuck_deleting_row_when_disk_intact() {
             Ok(())
         })
     });
-    let disk_size: DiskSizeFn = Arc::new(|_, _, fallback, _| fallback);
+    let disk_size: DiskSizeFn = Arc::new(|_, _, _, fallback, _| fallback);
 
     // The reaper reports "Intact" for the stuck row so the tick
     // resets it to 'ready' and the planner re-evicts it in this
     // same call.
     let reaper_probe: ReaperDiskProbeFn =
-        Arc::new(|_, _| Box::pin(async { ReaperDiskState::Intact }));
+        Arc::new(|_, _, _| Box::pin(async { ReaperDiskState::Intact }));
 
     let report = gc_tick(
         Arc::clone(&db),
@@ -1192,6 +1476,7 @@ async fn gc_tick_recovers_stuck_deleting_row_when_disk_intact() {
         disk_size,
         delete_disk,
         reaper_probe,
+        &grant_every_claim(),
     )
     .await
     .unwrap();
@@ -1232,6 +1517,7 @@ async fn gc_tick_recovers_stuck_deleting_row_when_disk_missing_by_dropping_row()
     use std::sync::Mutex;
     let raw = crate::db::test_conn();
     seed_build(&raw, "seed", "h1", 1_000);
+    seed_component(&raw, "seed", "h1");
     raw.execute(
         "UPDATE template_builds SET state = 'deleting' WHERE name = ?1 AND content_hash = ?2",
         params!["seed", "h1"],
@@ -1251,20 +1537,20 @@ async fn gc_tick_recovers_stuck_deleting_row_when_disk_missing_by_dropping_row()
     // the row before the planner can pick it up.
     let disk_called = Arc::new(Mutex::new(false));
     let disk_called_capture = Arc::clone(&disk_called);
-    let delete_disk: DeleteDiskFn = Arc::new(move |_, _| {
+    let delete_disk: DeleteDiskFn = Arc::new(move |_, _, _| {
         let captured = Arc::clone(&disk_called_capture);
         Box::pin(async move {
             *captured.lock().unwrap() = true;
             Ok(())
         })
     });
-    let disk_size: DiskSizeFn = Arc::new(|_, _, fallback, _| fallback);
+    let disk_size: DiskSizeFn = Arc::new(|_, _, _, fallback, _| fallback);
 
     // Reaper closure: report "missing" for our test build so the
     // reaper drops the row. Production wires this to a real disk
     // probe (rootfs.ext4 presence check).
     let reaper_probe: ReaperDiskProbeFn =
-        Arc::new(|_, _| Box::pin(async { ReaperDiskState::Missing }));
+        Arc::new(|_, _, _| Box::pin(async { ReaperDiskState::Missing }));
 
     let _ = gc_tick(
         Arc::clone(&db),
@@ -1274,6 +1560,7 @@ async fn gc_tick_recovers_stuck_deleting_row_when_disk_missing_by_dropping_row()
         disk_size,
         delete_disk,
         reaper_probe,
+        &grant_every_claim(),
     )
     .await
     .unwrap();
@@ -1291,6 +1578,7 @@ async fn gc_tick_recovers_stuck_deleting_row_when_disk_missing_by_dropping_row()
         remaining, 0,
         "row must be dropped when on-disk state is missing"
     );
+    assert_eq!(components(&db.lock().unwrap(), "h1"), 0);
 }
 
 /// A pin appearing while the row is stuck in `'deleting'` must
@@ -1324,13 +1612,13 @@ async fn gc_tick_releases_stuck_deleting_row_when_pin_lands() {
         grace: Duration::from_secs(0),
     };
 
-    let delete_disk: DeleteDiskFn = Arc::new(|_, _| Box::pin(async { Ok(()) }));
-    let disk_size: DiskSizeFn = Arc::new(|_, _, fallback, _| fallback);
+    let delete_disk: DeleteDiskFn = Arc::new(|_, _, _| Box::pin(async { Ok(()) }));
+    let disk_size: DiskSizeFn = Arc::new(|_, _, _, fallback, _| fallback);
 
     // Reaper reports "Intact" — bytes are still on disk in this
     // scenario (the prior tick's Phase 2 errored cleanly).
     let reaper_probe: ReaperDiskProbeFn =
-        Arc::new(|_, _| Box::pin(async { ReaperDiskState::Intact }));
+        Arc::new(|_, _, _| Box::pin(async { ReaperDiskState::Intact }));
 
     let _ = gc_tick(
         Arc::clone(&db),
@@ -1340,6 +1628,7 @@ async fn gc_tick_releases_stuck_deleting_row_when_pin_lands() {
         disk_size,
         delete_disk,
         reaper_probe,
+        &grant_every_claim(),
     )
     .await
     .unwrap();
@@ -1471,7 +1760,7 @@ async fn idle_template_eviction_takes_every_build_only_when_none_is_protected() 
         let deleted = Arc::new(Mutex::new(Vec::new()));
         let delete_disk: DeleteDiskFn = {
             let deleted = Arc::clone(&deleted);
-            Arc::new(move |name, hash| {
+            Arc::new(move |name, hash, _partition| {
                 deleted.lock().unwrap().push(format!("{name}@{hash}"));
                 Box::pin(async { Ok(()) })
             })
@@ -1493,6 +1782,7 @@ async fn idle_template_eviction_takes_every_build_only_when_none_is_protected() 
             EvictionDisk {
                 delete: delete_disk,
                 probe: noop_reaper_probe(),
+                claim: grant_every_claim(),
             },
         )
         .await
@@ -1520,6 +1810,66 @@ async fn idle_template_eviction_takes_every_build_only_when_none_is_protected() 
             1,
             "{case}: other templates are untouched"
         );
+    }
+}
+
+/// An idle template's twins are evicted one partition at a time: each
+/// build's disk delete names its own partition, and no row of either is left.
+#[tokio::test]
+async fn idle_template_eviction_takes_each_partition_of_a_digest() {
+    let conn = crate::db::test_conn();
+    seed_build_touched_at(&conn, "doomed", "h1", 500);
+    let twin = twin_build("h1", 0, 0).cache_partition;
+    conn.execute(
+        "INSERT INTO template_builds (name, content_hash, cache_partition, build_date, manifest_json, runtime, arch, created_at, last_used_at)
+         VALUES ('doomed', 'h1', ?1, 'd', '{}', 'fc', 'x86_64', '500', '500')",
+        [twin.key()],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO template_snapshots (name, content_hash, cache_partition, vcpu, memory_mib, snapshot_hash, built_at)
+         VALUES ('doomed', 'h1', ?1, 2, 1024, 'twin', '0')",
+        [twin.key()],
+    )
+    .unwrap();
+    let db = Arc::new(Mutex::new(conn));
+    let deleted = Arc::new(Mutex::new(Vec::new()));
+    let delete_disk: DeleteDiskFn = {
+        let deleted = Arc::clone(&deleted);
+        Arc::new(move |_, _, partition| {
+            deleted.lock().unwrap().push(partition);
+            Box::pin(async { Ok(()) })
+        })
+    };
+
+    let outcome = evict_idle_template(
+        Arc::clone(&db),
+        &EvictionGate::default(),
+        "doomed",
+        1_000,
+        keys(&[]),
+        keys(&[]),
+        EvictionDisk {
+            delete: delete_disk,
+            probe: noop_reaper_probe(),
+            claim: grant_every_claim(),
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(outcome, IdleTemplateEviction::Evicted);
+    let mut deleted = deleted.lock().unwrap().clone();
+    deleted.sort();
+    let mut expected = vec![crate::db::TemplateCachePartition::Legacy, twin];
+    expected.sort();
+    assert_eq!(deleted, expected);
+    let conn = db.lock().unwrap();
+    for table in ["template_builds", "template_snapshots"] {
+        let left: i64 = conn
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(left, 0, "{table}");
     }
 }
 
@@ -1552,7 +1902,7 @@ async fn idle_template_eviction_rechecks_what_changes_during_a_delete() {
         let first = Arc::new(std::sync::atomic::AtomicBool::new(true));
         let delete_disk: DeleteDiskFn = {
             let db = Arc::clone(&db);
-            Arc::new(move |name, hash| {
+            Arc::new(move |name, hash, _partition| {
                 let first = first.swap(false, std::sync::atomic::Ordering::SeqCst);
                 let fail = first && matches!(during, During::DiskDeleteFails);
                 if first {
@@ -1560,7 +1910,13 @@ async fn idle_template_eviction_rechecks_what_changes_during_a_delete() {
                     match during {
                         During::OtherBuildUsed => {
                             let other = if hash == "h1" { "h2" } else { "h1" };
-                            crate::db::touch_build(&conn, name, other).unwrap();
+                            crate::db::touch_build(
+                                &conn,
+                                name,
+                                other,
+                                TemplateCachePartition::Legacy,
+                            )
+                            .unwrap();
                         }
                         During::NewBuildPulled => seed_build(&conn, name, "h3", 100),
                         During::DiskDeleteFails => {}
@@ -1576,7 +1932,7 @@ async fn idle_template_eviction_rechecks_what_changes_during_a_delete() {
             })
         };
         let intact: ReaperDiskProbeFn =
-            Arc::new(|_, _| Box::pin(async { ReaperDiskState::Intact }));
+            Arc::new(|_, _, _| Box::pin(async { ReaperDiskState::Intact }));
 
         let outcome = evict_idle_template(
             Arc::clone(&db),
@@ -1588,6 +1944,7 @@ async fn idle_template_eviction_rechecks_what_changes_during_a_delete() {
             EvictionDisk {
                 delete: delete_disk,
                 probe: intact,
+                claim: grant_every_claim(),
             },
         )
         .await;
@@ -1654,7 +2011,7 @@ async fn gc_repair_waits_for_a_live_idle_eviction() {
     let release = Arc::new(tokio::sync::Notify::new());
     let delete_disk: DeleteDiskFn = {
         let (entered, release) = (Arc::clone(&entered), Arc::clone(&release));
-        Arc::new(move |_, _| {
+        Arc::new(move |_, _, _| {
             let (entered, release) = (Arc::clone(&entered), Arc::clone(&release));
             Box::pin(async move {
                 entered.notify_one();
@@ -1676,6 +2033,7 @@ async fn gc_repair_waits_for_a_live_idle_eviction() {
                 EvictionDisk {
                     delete: delete_disk,
                     probe: noop_reaper_probe(),
+                    claim: grant_every_claim(),
                 },
             )
             .await
@@ -1691,8 +2049,9 @@ async fn gc_repair_waits_for_a_live_idle_eviction() {
             keys(&[]),
             keys(&[]),
             EvictionDisk {
-                delete: Arc::new(|_, _| panic!("a second eviction must not start")),
+                delete: Arc::new(|_, _, _| panic!("a second eviction must not start")),
                 probe: noop_reaper_probe(),
+                claim: grant_every_claim(),
             },
         )
         .await
@@ -1704,7 +2063,7 @@ async fn gc_repair_waits_for_a_live_idle_eviction() {
     let reaped = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let reaper_probe: ReaperDiskProbeFn = {
         let reaped = Arc::clone(&reaped);
-        Arc::new(move |_, _| {
+        Arc::new(move |_, _, _| {
             reaped.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Box::pin(async { ReaperDiskState::Intact })
         })
@@ -1723,10 +2082,11 @@ async fn gc_repair_waits_for_a_live_idle_eviction() {
         GcHooks {
             fetch_active: Arc::new(|| Box::pin(async { Ok(HashSet::new()) })),
             fetch_warm_pool: empty_warm_pool_fetch(),
-            disk_size_for: Arc::new(|_, _, fallback, _| fallback),
-            delete_disk_for: Arc::new(|_, _| Box::pin(async { Ok(()) })),
+            disk_size_for: Arc::new(|_, _, _, fallback, _| fallback),
+            delete_disk_for: Arc::new(|_, _, _| Box::pin(async { Ok(()) })),
             reaper_probe,
             reconcile_rowless: noop_reconcile_rowless(),
+            claim_digest: grant_every_claim(),
         },
         gate,
     ));
@@ -1780,8 +2140,8 @@ async fn gc_loop_checks_rowless_dirs_on_every_tick(#[case] enabled: bool) {
         GcHooks {
             fetch_active: Arc::new(|| Box::pin(async { Err("sandbox-manager down".to_string()) })),
             fetch_warm_pool: empty_warm_pool_fetch(),
-            disk_size_for: Arc::new(|_, _, fallback, _| fallback),
-            delete_disk_for: Arc::new(|_, _| Box::pin(async { Ok(()) })),
+            disk_size_for: Arc::new(|_, _, _, fallback, _| fallback),
+            delete_disk_for: Arc::new(|_, _, _| Box::pin(async { Ok(()) })),
             reaper_probe: noop_reaper_probe(),
             reconcile_rowless: {
                 let checks = Arc::clone(&checks);
@@ -1790,6 +2150,7 @@ async fn gc_loop_checks_rowless_dirs_on_every_tick(#[case] enabled: bool) {
                     Box::pin(async {})
                 })
             },
+            claim_digest: grant_every_claim(),
         },
         EvictionGate::default(),
     ));
@@ -1828,17 +2189,21 @@ async fn gc_loop_checks_rowless_dirs_without_holding_the_eviction_gate(#[case] e
         GcHooks {
             fetch_active: Arc::new(|| Box::pin(async { Ok(HashSet::new()) })),
             fetch_warm_pool: empty_warm_pool_fetch(),
-            disk_size_for: Arc::new(|_, _, fallback, _| fallback),
-            delete_disk_for: Arc::new(|_, _| Box::pin(async { Ok(()) })),
+            disk_size_for: Arc::new(|_, _, _, fallback, _| fallback),
+            delete_disk_for: Arc::new(|_, _, _| Box::pin(async { Ok(()) })),
             reaper_probe: noop_reaper_probe(),
             reconcile_rowless: {
                 let gate = gate.clone();
                 let free = Arc::clone(&free);
                 Arc::new(move || {
-                    free.lock().unwrap().push(gate.try_hold().is_some());
-                    Box::pin(async {})
+                    let (gate, free) = (gate.clone(), Arc::clone(&free));
+                    // Sampled while the check runs, not when it's created.
+                    Box::pin(async move {
+                        free.lock().unwrap().push(gate.try_hold().is_some());
+                    })
                 })
             },
+            claim_digest: grant_every_claim(),
         },
         gate.clone(),
     ));
@@ -1853,4 +2218,124 @@ async fn gc_loop_checks_rowless_dirs_without_holding_the_eviction_gate(#[case] e
     gc.await.unwrap();
     let free = free.lock().unwrap();
     assert!(free.iter().all(|free| *free), "{free:?}");
+}
+
+fn twin_build(hash: &str, size: u64, used: u64) -> BuildSnapshot {
+    BuildSnapshot {
+        cache_partition: crate::db::TemplateCachePartition::Environment(
+            pplx_space_common_core::types::EnvironmentReference::new(
+                pplx_space_common_core::types::Digest::sha256([2; 32]),
+            ),
+        ),
+        ..build("seed", hash, size, 0, used)
+    }
+}
+
+/// Twins of one rootfs are separate builds: each is evicted on its own
+/// LRU position, and a protected digest keeps every cached partition.
+#[test]
+fn twins_evict_independently_and_share_digest_protection() {
+    let now = 10_000u64;
+    let builds = || {
+        vec![
+            build("seed", "shared", 500, 0, now - 1000),
+            twin_build("shared", 500, now - 5000),
+        ]
+    };
+    // Need to free 460 of 1000: only the older twin goes.
+    let plan = plan_evictions(
+        builds(),
+        &keys(&[]),
+        &keys(&[]),
+        &keys(&[]),
+        &cfg(600, 0.9, 60, now),
+    );
+    assert_eq!(plan.len(), 1);
+    assert_eq!(
+        plan[0].cache_partition,
+        twin_build("shared", 0, 0).cache_partition
+    );
+
+    for (pinned, active, warm_pool) in [
+        (keys(&[("seed", "shared")]), keys(&[]), keys(&[])),
+        (keys(&[]), keys(&[("seed", "shared")]), keys(&[])),
+        (keys(&[]), keys(&[]), keys(&[("seed", "shared")])),
+    ] {
+        let plan = plan_evictions(
+            builds(),
+            &pinned,
+            &active,
+            &warm_pool,
+            &cfg(600, 0.9, 60, now),
+        );
+        assert!(plan.is_empty(), "{plan:?}");
+    }
+}
+
+/// Evicting a twin flips, deletes and finalizes only its own partition's
+/// rows; the legacy build of the same digest stays ready.
+#[test]
+fn execute_one_on_a_twin_leaves_its_legacy_sibling() {
+    let conn = crate::db::test_conn();
+    seed_build(&conn, "seed", "h1", 1_000);
+    seed_component(&conn, "seed", "h1");
+    conn.execute(
+        "INSERT INTO template_snapshots (name, content_hash, vcpu, memory_mib, snapshot_hash, built_at)
+         VALUES ('seed', 'h1', 2, 1024, 'legacy', '0')",
+        [],
+    )
+    .unwrap();
+    let partition = twin_build("h1", 0, 0).cache_partition;
+    conn.execute(
+        "INSERT INTO template_builds (name, content_hash, cache_partition, build_date, manifest_json, runtime, arch, created_at)
+         VALUES ('seed', 'h1', ?1, 'd', '{}', 'fc', 'x86_64', '0')",
+        [partition.key()],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO template_snapshots (name, content_hash, cache_partition, vcpu, memory_mib, snapshot_hash, built_at)
+         VALUES ('seed', 'h1', ?1, 2, 1024, 'twin', '0')",
+        [partition.key()],
+    )
+    .unwrap();
+
+    let cand = EvictionCandidate {
+        name: "seed".to_string(),
+        content_hash: "h1".to_string(),
+        cache_partition: partition,
+        size_bytes: 1_000,
+    };
+    let observed = std::cell::Cell::new(None);
+    let outcome = execute_one(&conn, &HashSet::new(), &HashSet::new(), &cand, |_, _, p| {
+        observed.set(Some(p));
+        Ok(())
+    })
+    .unwrap();
+
+    assert_eq!(outcome, EvictionOutcome::Deleted);
+    assert_eq!(observed.get(), Some(partition));
+    let rows: Vec<(String, String)> = conn
+        .prepare("SELECT cache_partition, state FROM template_builds")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(rows, [(String::new(), "ready".to_string())]);
+    let snapshots: Vec<String> = conn
+        .prepare("SELECT snapshot_hash FROM template_snapshots")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(snapshots, ["legacy"]);
+    let components: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM template_build_components WHERE cache_partition = ''",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(components, 1);
 }

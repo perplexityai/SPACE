@@ -270,8 +270,9 @@ impl SandboxManagerService {
 
             // Resolve template to content-addressed paths via template-manager.
             // If caller pinned a content_hash, use it; otherwise resolve newest.
-            // A selected environment states a preference for its own build of
-            // the rootfs; whatever build comes back is checked below.
+            // A selected environment prefers its own build of the rootfs, so a
+            // twin bound to it boots instead of its sibling; otherwise any
+            // compatible build of the digest is checked below.
             let mut resolved_template = resolve_template_paths(
                 self.template_resolver.as_ref(),
                 pplx_space_template_mgr_client::proto::TemplateRef {
@@ -1294,6 +1295,8 @@ fn project_template_catalog(
             })?;
         // Match the owner's latest-build ordering. A digest breaks equal-date
         // ties deterministically instead of depending on filesystem iteration.
+        // Builds of one digest in several environments' cache partitions are
+        // listed legacy first, so the first stays.
         let replace = latest.get(&build.name).is_none_or(|current| {
             (&build.built_at, &build.content_hash) > (&current.built_at, &current.content_hash)
         });
@@ -1304,10 +1307,29 @@ fn project_template_catalog(
     latest
         .into_values()
         .map(|build| {
+            // A build's dir is named by its row's partition, not its binding:
+            // startup recovery adopts a legacy-layout build bound to another
+            // environment in place. A template-manager without partitions
+            // sends none, and all its builds are legacy. The partition only
+            // locates supplemental metadata, so an unreadable one reads the
+            // legacy dir rather than failing the whole listing.
+            use pplx_space_common_core::types::TemplateCachePartition;
+            let partition = match build.cache_partition.as_deref() {
+                None => TemplateCachePartition::Legacy,
+                Some(key) => TemplateCachePartition::from_key(key).unwrap_or_else(|error| {
+                    tracing::warn!(
+                        template = %build.name,
+                        cache_partition = key,
+                        %error,
+                        "invalid template catalog cache partition; reading its legacy build dir"
+                    );
+                    TemplateCachePartition::Legacy
+                }),
+            };
             let hash = build.content_hash.unwrap_or_default();
             let path = template_dir
                 .join(&build.name)
-                .join(&hash)
+                .join(partition.build_dir_name(&hash))
                 .join("metadata.json");
             let metadata: serde_json::Value = match std::fs::read(&path) {
                 Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|error| {

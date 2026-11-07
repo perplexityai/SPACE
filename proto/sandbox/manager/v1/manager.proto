@@ -1095,6 +1095,14 @@ message CreateTemplateBaseSnapshotRequest {
   string sandbox_id = 1;
   uint32 vcpu = 2;
   uint32 memory_mib = 3;
+  // The template-manager cache partition the snapshot is published under:
+  // empty for the legacy partition, else an environment reference. It names
+  // the partition of the build row the capture booted, which can differ from
+  // the capture sandbox's binding: a legacy-layout build bound to another
+  // environment is adopted in the legacy partition. Sandbox-manager accepts
+  // the legacy partition or its binding's own, and refuses any other. Absent
+  // from a template-manager without partitions, which reads the legacy one.
+  optional string cache_partition = 4;
 }
 message CreateTemplateBaseSnapshotResponse {
   string snapshot_hash = 1;

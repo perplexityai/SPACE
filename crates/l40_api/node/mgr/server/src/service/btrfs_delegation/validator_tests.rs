@@ -511,3 +511,34 @@ fn the_first_accepted_parent_candidate_wins() {
     .unwrap_err();
     assert_eq!(error.message(), "twin");
 }
+
+/// A receive uses the candidate the stream's parent is, by its received
+/// UUID, even when it isn't the binding's partition; a stream whose parent no
+/// candidate is fails as a precondition rather than reaching `btrfs receive`
+/// with the wrong parent; a full stream takes the first candidate.
+#[test]
+fn a_receive_uses_the_candidate_the_stream_descends_from() {
+    let hash = fixture_hash();
+    let twin = TemplateBuildTarget::parse(
+        "seed",
+        "",
+        Some(&EnvironmentTemplateBuild {
+            content_hash: hash.clone(),
+            environment: other_environment().to_string(),
+        }),
+    )
+    .unwrap();
+    let legacy = TemplateBuildTarget::parse("seed", &hash, None).unwrap();
+    let passing = || vec![(twin.clone(), ()), (legacy.clone(), ())];
+
+    let chosen = choose_stream_parent(passing(), Some(legacy.received_uuid())).unwrap();
+    assert_eq!(chosen.digest_dir(), legacy.digest_dir());
+    let chosen = choose_stream_parent(passing(), Some(twin.received_uuid())).unwrap();
+    assert_eq!(chosen.digest_dir(), twin.digest_dir());
+
+    let error = choose_stream_parent(passing(), Some(uuid::Uuid::from_bytes([9; 16]))).unwrap_err();
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition, "{error}");
+
+    let chosen = choose_stream_parent(passing(), None).unwrap();
+    assert_eq!(chosen.digest_dir(), twin.digest_dir());
+}

@@ -214,6 +214,7 @@ async fn do_pull_aborts_early_when_build_is_marked_deleting() {
         &crate::db::BuildUpsert {
             name: "seed",
             content_hash: hash,
+            cache_partition: crate::db::TemplateCachePartition::Legacy,
             build_date: "2026-01-01T00:00:00Z",
             manifest_json: "{}",
             runtime: "fc",
@@ -1046,38 +1047,99 @@ async fn a_failed_location_s_cleanup_finishes_before_the_next_attempt() {
     slot.finish().await;
 }
 
-/// A pull that finds a build dir on disk without a catalog row refuses
-/// retryably and leaves the dir as it found it: it neither adopts the dir
-/// nor downloads into it.
-#[tokio::test]
-async fn a_pull_refuses_a_rowless_build_dir_and_deletes_nothing() {
-    let root = tempfile::tempdir().unwrap();
-    let content_hash = format!("sha256:{}", "c".repeat(64));
-    let dir = root.path().join("seed").join(&content_hash);
+/// A build dir on disk without a catalog row, laid out under `root` in
+/// `partition` as recovery keeps one.
+async fn place_rowless_build_dir(
+    root: &Path,
+    content_hash: &str,
+    partition: &TemplateCachePartition,
+) -> PathBuf {
+    let dir = root
+        .join("seed")
+        .join(partition.build_dir_name(content_hash));
     tokio::fs::create_dir_all(&dir).await.unwrap();
     for file in ["manifest.json", "metadata.json", TEMPLATE_ROOTFS_FILE] {
         tokio::fs::write(dir.join(file), b"kept").await.unwrap();
     }
+    dir
+}
 
-    let (outcome, _) = pull_resolved_owner(
-        root.path(),
-        Arc::new(Mutex::new(crate::db::test_conn())),
-        "seed",
-        &content_hash,
-        &[],
-        &[],
-        None,
-        RootfsBackingPolicy::Inherit,
-    )
-    .await;
-
-    assert!(
-        matches!(&outcome, PullOutcome::Retryable(status) if status.code() == tonic::Code::Unavailable),
-        "{outcome:?}"
-    );
+async fn assert_untouched(dir: &Path) {
     for file in ["manifest.json", "metadata.json", TEMPLATE_ROOTFS_FILE] {
         assert_eq!(tokio::fs::read(dir.join(file)).await.unwrap(), b"kept");
     }
+}
+
+/// The manifest of a release bound to `partition`'s environment, or an
+/// unbound one for the legacy partition, as the partition probe reads it.
+fn probed_manifest(partition: &TemplateCachePartition) -> Vec<u8> {
+    use pplx_space_common_core::types::{Arch, ExecutionMetadata, TemplateManifest};
+    let mut manifest = TemplateManifest::default();
+    if let Some(environment) = partition.environment() {
+        manifest.set_execution_metadata(
+            ExecutionMetadata::initial_firecracker(Arch::X86_64, vec![])
+                .with_environment(environment),
+        );
+    }
+    serde_json::to_vec(&manifest).unwrap()
+}
+
+/// A pull whose release probes to the partition of a build dir that's on
+/// disk without a catalog row refuses retryably and leaves the dir as it
+/// found it: it neither adopts the dir nor downloads into it, whichever
+/// partition that is.
+#[rstest::rstest]
+#[case::legacy(false)]
+#[case::twin(true)]
+#[tokio::test]
+async fn a_pull_refuses_a_rowless_build_dir_and_deletes_nothing(#[case] twin: bool) {
+    use pplx_space_common_core::types::{Digest, EnvironmentReference};
+    let root = tempfile::tempdir().unwrap();
+    let content_hash = format!("sha256:{}", "c".repeat(64));
+    let partition = if twin {
+        TemplateCachePartition::Environment(EnvironmentReference::new(Digest::sha256([2; 32])))
+    } else {
+        TemplateCachePartition::Legacy
+    };
+    let dir = place_rowless_build_dir(root.path(), &content_hash, &partition).await;
+
+    let probed = release_partition(&probed_manifest(&partition), b"{}").unwrap();
+    assert_eq!(probed, partition);
+    let refusal = probed_partition_refusal(root.path(), "seed", &content_hash, probed)
+        .expect("the pull refuses its own partition's rowless dir");
+
+    assert_eq!(
+        refusal,
+        rowless_build_dir_refusal("seed", &content_hash, partition)
+    );
+    assert_untouched(&dir).await;
+}
+
+/// The probe-time refusal is scoped to the probed partition: a build dir
+/// without a row in another partition of the digest, such as a twin recovery
+/// keeps rowless because it can't read its manifest, doesn't refuse a pull
+/// that probes to the legacy partition. Driving the whole pull past that check
+/// needs a volume manager, which these tests don't serve.
+#[tokio::test]
+async fn a_rowless_dir_in_another_partition_does_not_block_a_pull() {
+    use pplx_space_common_core::types::{Digest, EnvironmentReference};
+    let root = tempfile::tempdir().unwrap();
+    let content_hash = format!("sha256:{}", "d".repeat(64));
+    let twin =
+        TemplateCachePartition::Environment(EnvironmentReference::new(Digest::sha256([2; 32])));
+    place_rowless_build_dir(root.path(), &content_hash, &twin).await;
+
+    let probed =
+        release_partition(&probed_manifest(&TemplateCachePartition::Legacy), b"{}").unwrap();
+    assert_eq!(probed, TemplateCachePartition::Legacy);
+    assert_eq!(
+        probed_partition_refusal(root.path(), "seed", &content_hash, probed),
+        None
+    );
+    assert_eq!(
+        probed_partition_refusal(root.path(), "seed", &content_hash, twin),
+        Some(rowless_build_dir_refusal("seed", &content_hash, twin))
+    );
 }
 
 /// A credential that can write the artifact prefix can replace the compressed
@@ -1302,4 +1364,124 @@ async fn a_template_claim_holds_every_digest_of_the_template() {
     assert!(puller.is_claimed("seed", &hash));
     drop(claim);
     assert!(puller.try_claim_template("seed").is_some());
+}
+
+#[test]
+fn digest_dir_partition_reads_build_dirs_only() {
+    let hash = format!("sha256:{}", "7".repeat(64));
+    let twin = TemplateCachePartition::Environment(
+        pplx_space_common_core::types::EnvironmentReference::new(
+            pplx_space_common_core::types::Digest::sha256([2; 32]),
+        ),
+    );
+    assert_eq!(
+        digest_dir_partition(&Path::new("/t/seed").join(&hash)),
+        Some(TemplateCachePartition::Legacy)
+    );
+    assert_eq!(
+        digest_dir_partition(&Path::new("/t/seed").join(twin.build_dir_name(&hash))),
+        Some(twin)
+    );
+    // Transient siblings aren't builds; their delete must not target one.
+    assert_eq!(
+        digest_dir_partition(&Path::new("/t/seed").join(format!("{hash}.importing.x"))),
+        None
+    );
+}
+
+/// A partition probe dir is a transient sibling the pre-serving cleanup reaps, never
+/// a build dir a lookup or recovery could adopt.
+#[test]
+fn partition_probe_dirs_are_reaped_staging_dirs_not_builds() {
+    let hash = format!("sha256:{}", "a".repeat(64));
+    let probe = partition_probe_dir_name(&hash, uuid::Uuid::now_v7());
+    assert!(crate::service::is_import_staging_dir(&probe), "{probe}");
+    assert!(
+        TemplateCachePartition::parse_build_dir_name(&probe).is_none(),
+        "{probe}"
+    );
+}
+
+/// A pull files a release under the binding its manifest carries, else the
+/// one its metadata carries, as registration does.
+#[test]
+fn release_partition_reads_the_manifest_then_the_metadata_binding() {
+    use pplx_space_common_core::types::{
+        Arch, Digest, EnvironmentReference, ExecutionMetadata, TemplateManifest, TemplateMetadata,
+    };
+    let environment = EnvironmentReference::new(Digest::sha256([2; 32]));
+    let twin = TemplateCachePartition::Environment(environment);
+    let bound =
+        ExecutionMetadata::initial_firecracker(Arch::X86_64, vec![]).with_environment(environment);
+    let mut bound_manifest = TemplateManifest::default();
+    bound_manifest.set_execution_metadata(bound.clone());
+    let mut bound_metadata = TemplateMetadata::default();
+    bound_metadata.set_execution_metadata(bound);
+
+    let unbound_manifest = serde_json::to_vec(&TemplateManifest::default()).unwrap();
+    let bound_manifest = serde_json::to_vec(&bound_manifest).unwrap();
+    let bound_metadata = serde_json::to_vec(&bound_metadata).unwrap();
+    assert_eq!(release_partition(&bound_manifest, b"{}"), Ok(twin));
+    assert_eq!(
+        release_partition(&unbound_manifest, &bound_metadata),
+        Ok(twin)
+    );
+    assert_eq!(
+        release_partition(&unbound_manifest, b"not json"),
+        Ok(TemplateCachePartition::Legacy)
+    );
+    assert_eq!(
+        release_partition(b"not json", &bound_metadata),
+        Err(PullFailure::ManifestMalformed)
+    );
+}
+
+/// A digest mid-eviction refuses the pull before the DB fast path, which
+/// would otherwise count the doomed row as present and report a pull that
+/// left nothing to serve.
+#[tokio::test]
+async fn pull_refuses_retryably_before_counting_a_row_mid_eviction() {
+    use std::sync::Mutex;
+
+    let conn = crate::db::test_conn();
+    let hash = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    crate::db::upsert_build(
+        &conn,
+        &crate::db::BuildUpsert {
+            name: "seed",
+            content_hash: hash,
+            cache_partition: crate::db::TemplateCachePartition::Legacy,
+            build_date: "2026-01-01T00:00:00Z",
+            manifest_json: "{}",
+            runtime: "fc",
+            arch: "aarch64",
+            artifact_size_bytes: 100,
+            state: "ready",
+        },
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE template_builds SET state = 'deleting' WHERE name = ?1 AND content_hash = ?2",
+        rusqlite::params!["seed", hash],
+    )
+    .unwrap();
+
+    let (outcome, _) = pull_resolved_owner(
+        Arc::new(Mutex::new(conn)),
+        "seed",
+        hash,
+        &[],
+        &[],
+        None,
+        RootfsBackingPolicy::Inherit,
+    )
+    .await;
+
+    assert!(
+        matches!(
+            outcome,
+            PullOutcome::ClassifiedFailure(PullFailure::EvictionInProgress)
+        ),
+        "{outcome:?}"
+    );
 }

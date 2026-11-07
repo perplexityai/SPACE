@@ -8,11 +8,13 @@
 //!    over TCP with SPACE internal bearer auth) for the release
 //!    matching the requested full digest or tag (default `latest`). Tenant
 //!    requests require an org authorization acknowledgement from ClusterApi.
-//! 2. Refusing a build dir that's already on disk without a DB row, such
-//!    as one startup recovery dropped the row of over a read that can
-//!    clear, or one a pull stopped before registering. The pull neither
-//!    adopts nor writes into it: it fails retryably, and the GC tick's
-//!    rowless check or the next startup verifies the dir from scratch.
+//! 2. Refusing a build dir that's already on disk without a DB row in the
+//!    partition the release lands in, which the pull learns from the
+//!    release's manifest first: one startup recovery dropped the row of over
+//!    a read that can clear, or one a pull stopped before registering. The
+//!    pull neither adopts nor writes into it: it fails retryably, and the GC
+//!    tick's rowless check or the next startup verifies the dir from
+//!    scratch. A dir without a row in another partition doesn't block it.
 //! 3. Issuing three synchronous `PullFile` RPCs against the on-node
 //!    `space-volume-manager` daemon — one each for `metadata.json`,
 //!    `manifest.json`, and `rootfs.ext4.zst`. Volume-manager handles
@@ -67,8 +69,8 @@ use pplx_space_common_core::host::linux::paths::{
     set_template_cache_permissions,
 };
 use pplx_space_common_core::types::{
-    ContentHash, OrgId, StorageUri, SubjectId, TEMPLATE_ROOTFS_FILE, TemplateName,
-    ZSTD_FILENAME_SUFFIX,
+    ContentHash, OrgId, StorageUri, SubjectId, TEMPLATE_ROOTFS_FILE, TemplateCachePartition,
+    TemplateName, ZSTD_FILENAME_SUFFIX,
 };
 use pplx_space_common_grpc::GrpcClientTrace;
 use pplx_space_node_api_client::cluster::connect_from_env as connect_cluster_api_from_env;
@@ -525,7 +527,6 @@ impl VolumePuller {
                 tokio::spawn(
                     async move {
                         let (outcome, path_taken) = pull_resolved_owner(
-                            Path::new(TEMPLATE_DIR),
                             db,
                             &name,
                             &resolved_hash,
@@ -992,21 +993,90 @@ fn record_phase(base_tags: &[String], phase: &'static str, result: &'static str,
 }
 
 /// Why a pull refuses a build dir that's on disk without a catalog row.
-fn rowless_build_dir_refusal(name: &str, content_hash: &str) -> String {
+fn rowless_build_dir_refusal(
+    name: &str,
+    content_hash: &str,
+    partition: TemplateCachePartition,
+) -> String {
     format!(
-        "template {name} build {content_hash} is on disk without a catalog row; \
-         retry after template-manager verifies it"
+        "template {name} build {content_hash} is on disk without a catalog row \
+         in cache partition {partition}; retry after template-manager verifies it"
     )
 }
 
-/// The owner's work for one resolved digest, under `template_root`
-/// (`TEMPLATE_DIR` in production).
-#[expect(
-    clippy::too_many_arguments,
-    reason = "the pull's inputs plus the template root tests point elsewhere"
-)]
-async fn pull_resolved_owner(
+/// Why a pull refuses to write the build of `content_hash` in `partition`
+/// under `template_root`: its build dir exists already, or whether it does
+/// can't be told. Called once the pull has probed the release's partition,
+/// so a dir of the digest in any other partition, such as a twin recovery
+/// keeps without a row, neither blocks the pull nor is touched by it.
+///
+/// A dir on disk without a row isn't this pull's: startup recovery may have
+/// dropped its row over a read that can clear, or a pull may have stopped
+/// before writing its row. Adopting it would serve bytes nobody verified,
+/// and pulling into it would delete an installed build when the write fails.
+/// The GC tick's rowless check, or the next startup, verifies it from
+/// scratch; the pull refuses retryably until then.
+fn probed_partition_refusal(
     template_root: &Path,
+    name: &str,
+    content_hash: &str,
+    partition: TemplateCachePartition,
+) -> Option<String> {
+    let dir = template_root
+        .join(name)
+        .join(partition.build_dir_name(content_hash));
+    match dir.try_exists() {
+        Ok(false) => None,
+        Ok(true) => Some(rowless_build_dir_refusal(name, content_hash, partition)),
+        Err(error) => Some(format!(
+            "could not check build dir {} of template {name}: {error}",
+            dir.display()
+        )),
+    }
+}
+
+/// Refuses a pull, retryably, while a build of the digest is mid-eviction
+/// (`state='deleting'`): its row still counts as present and its dir is the
+/// one being deleted.
+async fn refuse_pull_during_eviction(
+    db: &Arc<std::sync::Mutex<rusqlite::Connection>>,
+    name: &str,
+    content_hash: &str,
+) -> Result<(), PullError> {
+    let n = name.to_string();
+    let h = content_hash.to_string();
+    let db_for_check = Arc::clone(db);
+    let is_deleting = tokio::task::spawn_blocking(move || {
+        let conn = db_for_check.lock().map_err(|_| {
+            rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_IOERR),
+                Some("template DB mutex poisoned".to_string()),
+            )
+        })?;
+        crate::db::is_build_marked_deleting(&conn, &n, &h)
+    })
+    .await
+    .map_err(|err| {
+        warn!(error = %err, "is_build_marked_deleting spawn_blocking panicked");
+        PullError::Failure(PullFailure::LocalDatabaseUnavailable)
+    })?
+    .map_err(|err| {
+        warn!(error = %err, "is_build_marked_deleting failed");
+        PullError::Failure(PullFailure::LocalDatabaseUnavailable)
+    })?;
+    if is_deleting {
+        info!(
+            template = name,
+            content_hash,
+            "refusing pull: build is in state='deleting' (mid-eviction); retry after eviction completes"
+        );
+        return Err(PullError::Failure(PullFailure::EvictionInProgress));
+    }
+    Ok(())
+}
+
+/// The owner's work for one resolved digest.
+async fn pull_resolved_owner(
     db: Arc<std::sync::Mutex<rusqlite::Connection>>,
     name: &str,
     resolved_hash: &str,
@@ -1019,6 +1089,16 @@ async fn pull_resolved_owner(
     >,
     backing_policy: RootfsBackingPolicy,
 ) -> (PullOutcome, PullPath) {
+    // A build of this digest mid-eviction refuses the pull, retryably,
+    // before the fast path: its row still counts as present, and its dir is
+    // the one being deleted. `do_pull` checks again for an eviction that
+    // starts in between.
+    if let Err(PullError::Failure(failure)) =
+        refuse_pull_during_eviction(&db, name, resolved_hash).await
+    {
+        return (PullOutcome::ClassifiedFailure(failure), PullPath::FreshPull);
+    }
+
     // DB fast-path: a prior call (or startup recovery) already committed
     // this build. This check intentionally runs inside the owner task too:
     // a caller may have won the flight after another caller finished between
@@ -1032,36 +1112,9 @@ async fn pull_resolved_owner(
         return (PullOutcome::Materialized, PullPath::DbHit);
     }
 
-    // A build dir on disk without a row isn't this pull's: startup recovery
-    // may have dropped its row over a read that can clear, or a pull may
-    // have stopped before writing its row. Adopting it would serve bytes
-    // nobody verified, and pulling into it would delete an installed build
-    // when the write fails. Leave it to the GC tick's rowless check, or the
-    // next startup, which verify it from scratch, and refuse retryably
-    // until then.
-    // A dir whose existence can't be checked may be one; refuse the same way.
-    let build_dir = template_root.join(name).join(resolved_hash);
-    let refusal = match tokio::fs::try_exists(&build_dir).await {
-        Ok(false) => None,
-        Ok(true) => Some(rowless_build_dir_refusal(name, resolved_hash)),
-        Err(error) => Some(format!(
-            "could not check for a build dir of template {name} build {resolved_hash}: {error}"
-        )),
-    };
-    if let Some(refusal) = refusal {
-        warn!(
-            template = name,
-            content_hash = resolved_hash,
-            dir = %build_dir.display(),
-            %refusal,
-            "refusing the pull until template-manager verifies the build dir"
-        );
-        return (
-            PullOutcome::Retryable(Status::unavailable(refusal)),
-            PullPath::FreshPull,
-        );
-    }
-
+    // A build dir on disk without a row refuses the pull only in the
+    // partition the release lands in, which the pull learns from its
+    // manifest; `try_pull_from` checks once it has probed it.
     // Fresh pull. Vol-mgr deduplicates concurrent PullFile calls server-side.
     let outcome = match do_pull(
         db,
@@ -1427,36 +1480,8 @@ async fn do_pull(
     //
     // The caller's `GetTemplate` handler surfaces this as retryable
     // `Unavailable`. Retrying after eviction completes succeeds: the row is
-    // gone, `resolve_template` misses, and the next pull starts cleanly.
-    let n = name.to_string();
-    let h = content_hash.to_string();
-    let db_for_check = Arc::clone(&db);
-    let is_deleting = tokio::task::spawn_blocking(move || {
-        let conn = db_for_check.lock().map_err(|_| {
-            rusqlite::Error::SqliteFailure(
-                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_IOERR),
-                Some("template DB mutex poisoned".to_string()),
-            )
-        })?;
-        crate::db::is_build_marked_deleting(&conn, &n, &h)
-    })
-    .await
-    .map_err(|err| {
-        warn!(error = %err, "is_build_marked_deleting spawn_blocking panicked");
-        PullError::Failure(PullFailure::LocalDatabaseUnavailable)
-    })?
-    .map_err(|err| {
-        warn!(error = %err, "is_build_marked_deleting failed");
-        PullError::Failure(PullFailure::LocalDatabaseUnavailable)
-    })?;
-    if is_deleting {
-        info!(
-            template = name,
-            content_hash,
-            "refusing pull: build is in state='deleting' (mid-eviction); retry after eviction completes"
-        );
-        return Err(PullError::Failure(PullFailure::EvictionInProgress));
-    }
+    // gone, `resolve_template_build` misses, and the next pull starts cleanly.
+    refuse_pull_during_eviction(&db, name, content_hash).await?;
 
     if storage_uris.is_empty() {
         debug!(
@@ -1542,6 +1567,142 @@ async fn do_pull(
     result
 }
 
+/// Cache partition of the environment a build is bound to; see
+/// [`crate::service::effective_environment`].
+fn manifest_partition(
+    manifest: &pplx_space_common_core::types::TemplateManifest,
+    metadata: &pplx_space_common_core::types::TemplateMetadata,
+) -> Result<TemplateCachePartition, PullFailure> {
+    let environment = crate::service::effective_environment(manifest, metadata)
+        .map_err(|_| PullFailure::ExecutionMetadataInvalid)?;
+    Ok(pplx_space_node_runtime_core::catalog::template_cache_partition(environment))
+}
+
+/// Learn the cache partition of a release by reading its manifest into a
+/// transient sibling dir before any build dir exists. Startup recovery reaps
+/// the sibling if this process dies first. The binding can come from
+/// metadata.json, so both are read; their bytes are returned so the pull
+/// doesn't fetch them again.
+async fn probe_release_partition(
+    client: &VolmgrClient,
+    subject: &SubjectId,
+    parts: &StorageUri,
+    name: &str,
+    content_hash: &str,
+    base_tags: &[String],
+) -> Result<ProbedRelease, PullError> {
+    let probe_dir = PathBuf::from(format!(
+        "{TEMPLATE_DIR}/{name}/{}",
+        partition_probe_dir_name(content_hash, uuid::Uuid::now_v7())
+    ));
+    let _probe_guard = ProbeDirGuard(probe_dir.clone());
+    if let Err(err) = tokio::fs::create_dir(&probe_dir).await {
+        warn!(error = %err, template = name, content_hash, dir = %probe_dir.display(), "create partition probe dir failed");
+        return Err(PullError::Failure(PullFailure::LocalStorageUnavailable));
+    }
+    if let Err(err) = set_template_cache_permissions(&probe_dir, TEMPLATE_CACHE_DIR_MODE) {
+        warn!(error = %err, template = name, content_hash, dir = %probe_dir.display(), "set partition probe dir permissions failed");
+        return Err(PullError::Failure(PullFailure::LocalStorageUnavailable));
+    }
+    let manifest_path = probe_dir.join("manifest.json");
+    let metadata_path = probe_dir.join("metadata.json");
+    // Await both even when one fails: volume-manager keeps a started job
+    // running after its waiter drops, and one still writing when the probe
+    // guard removes the dir would leave it behind. A job that outlives its
+    // own failed RPC can still do that; startup reaps the probe dir.
+    let (pulled_manifest, pulled_metadata) = tokio::join!(
+        pull_one(
+            client.clone(),
+            subject,
+            build_object_uri(parts, "manifest.json"),
+            manifest_path.display().to_string(),
+            PullOptions::control("manifest"),
+            base_tags,
+        ),
+        pull_one(
+            client.clone(),
+            subject,
+            build_object_uri(parts, "metadata.json"),
+            metadata_path.display().to_string(),
+            PullOptions::control("metadata"),
+            base_tags,
+        ),
+    );
+    for pulled in [pulled_manifest?, pulled_metadata?] {
+        crate::metrics::pull_s3_bytes(base_tags, Some(&parts.region), pulled);
+    }
+    let read = async |path: &Path| {
+        tokio::fs::read(path).await.map_err(|err| {
+            warn!(error = %err, template = name, content_hash, path = %path.display(), "read partition probe file failed");
+            PullError::Failure(PullFailure::LocalStorageUnavailable)
+        })
+    };
+    let manifest_bytes = read(&manifest_path).await?;
+    let metadata_bytes = read(&metadata_path).await?;
+    let partition = release_partition(&manifest_bytes, &metadata_bytes).map_err(|failure| {
+        warn!(
+            template = name,
+            content_hash,
+            reason = failure.metric_reason(),
+            "partition probe could not read the release binding"
+        );
+        PullError::Failure(failure)
+    })?;
+    Ok(ProbedRelease {
+        partition,
+        manifest: manifest_bytes,
+        metadata: metadata_bytes,
+    })
+}
+
+/// Cache partition of a release from its manifest and metadata bytes. The
+/// pull itself reads metadata leniently, so this does too.
+fn release_partition(
+    manifest_bytes: &[u8],
+    metadata_bytes: &[u8],
+) -> Result<TemplateCachePartition, PullFailure> {
+    let manifest: pplx_space_common_core::types::TemplateManifest =
+        serde_json::from_slice(manifest_bytes).map_err(|_| PullFailure::ManifestMalformed)?;
+    let metadata: pplx_space_common_core::types::TemplateMetadata =
+        serde_json::from_slice(metadata_bytes).unwrap_or_default();
+    manifest_partition(&manifest, &metadata)
+}
+
+/// What [`probe_release_partition`] learned about a release.
+struct ProbedRelease {
+    partition: TemplateCachePartition,
+    manifest: Vec<u8>,
+    metadata: Vec<u8>,
+}
+
+/// A probe dir's name: a transient sibling, never a build dir
+/// (`is_import_staging_dir`). One a crashed process left is reaped before the
+/// socket binds (`clean_transient_dirs_before_serving`), never while a pull
+/// can own it.
+fn partition_probe_dir_name(content_hash: &str, id: uuid::Uuid) -> String {
+    format!("{content_hash}.importing.partition-probe.{id}")
+}
+
+/// Removes a partition probe dir however the probe ends.
+struct ProbeDirGuard(PathBuf);
+
+impl Drop for ProbeDirGuard {
+    fn drop(&mut self) {
+        // `create_dir` can fail before the dir exists, so a missing dir is
+        // the normal case. Any other failure leaves it until startup's
+        // transient sweep reaps it.
+        match std::fs::remove_dir_all(&self.0) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => warn!(
+                dir = %self.0.display(),
+                %error,
+                "could not remove a partition probe dir; startup removes it"
+            ),
+        }
+    }
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "one storage location's attempt: the pull's inputs plus its cleanup slot"
@@ -1595,34 +1756,64 @@ async fn try_pull_from(
         warn!(error = %err, template = name, content_hash, dir = %name_dir, "set name dir permissions failed; falling through");
         return Err(PullError::Failure(PullFailure::LocalStorageUnavailable));
     }
-    let digest_dir = format!("{TEMPLATE_DIR}/{name}/{content_hash}");
+    // Connect to volume-manager once; clone the client per parallel pull.
+    // Tonic's generated client requires &mut self for each call, so a clone
+    // per concurrent call is the cheapest way to fan out three RPCs.
+    let client = pplx_space_volmgr_client::connect(VOLMGR_SOCKET)
+        .await
+        .map_err(|err| {
+            warn!(
+                error = %err,
+                template = name,
+                content_hash,
+                socket = %VOLMGR_SOCKET,
+                "vol-mgr connect failed; volume pull skipped"
+            );
+            PullError::Failure(PullFailure::VolumeManagerUnavailable)
+        })?;
+
+    // The build lands in the partition of the environment the release's
+    // manifest binds; read it before choosing the build dir.
+    let ProbedRelease {
+        partition,
+        manifest: probed_manifest,
+        metadata: probed_metadata,
+    } = probe_release_partition(&client, &subject, parts, name, content_hash, base_tags).await?;
+    let digest_dir = pplx_space_common_core::host::linux::paths::template_build_dir(
+        name,
+        content_hash,
+        partition,
+    );
     // A pull never writes into, or deletes, a build dir it didn't create:
-    // the owner refused a rowless dir already, so one here appeared since.
-    if Path::new(&digest_dir).exists() {
+    // the owner found no row for the digest, so a dir in this partition is
+    // one without a row. Dirs of other partitions are left alone.
+    if let Some(refusal) =
+        probed_partition_refusal(Path::new(TEMPLATE_DIR), name, content_hash, partition)
+    {
         warn!(
             template = name,
             content_hash,
+            cache_partition = %partition,
             dir = %digest_dir,
-            "build dir appeared before the pull created it; leaving it alone"
+            %refusal,
+            "refusing the pull until template-manager verifies the build dir"
         );
-        return Err(PullError::Retryable(Status::unavailable(
-            rowless_build_dir_refusal(name, content_hash),
-        )));
+        return Err(PullError::Retryable(Status::unavailable(refusal)));
     }
     // Arm the cleanup guard before any subvolume create / file write
     // touches the digest dir. Any error path below — including the
-    // create_subvolume fallback's plain-dir path, vol-mgr connect
-    // failure, manifest parse failure, hash mismatch, and atomic write
-    // failure — drops the guard, which wipes the dir this pull created so
-    // a later pull starts clean. Disarmed below right before the final
-    // `Ok(())` once the sqlite upsert has committed.
+    // create_subvolume fallback's plain-dir path, manifest parse failure,
+    // hash mismatch, and atomic write failure — drops the guard, which
+    // wipes the dir this pull created so a later pull starts clean.
+    // Disarmed below right before the final `Ok(())` once the sqlite upsert
+    // has committed.
     let cleanup_guard = PullCleanupGuard::new(name, content_hash, &digest_dir, cleanup);
     // Create the digest dir as a btrfs subvolume via node-manager.
     // The ioctl requires CAP_SYS_ADMIN, so delegate to privileged
     // node-manager. An unprivileged direct call would return EPERM and
     // fall back to a plain directory, breaking btrfs-send's subvolume
     // precondition. Non-btrfs hosts still fall back to plain mkdir.
-    match crate::btrfs_via_nodemgr::create_template_subvolume(name, content_hash).await {
+    match crate::btrfs_via_nodemgr::create_template_subvolume(name, content_hash, partition).await {
         Ok(_path) => {
             tracing::debug!(
                 template = name,
@@ -1652,54 +1843,22 @@ async fn try_pull_from(
         return Err(PullError::Failure(PullFailure::LocalStorageUnavailable));
     }
 
-    // Connect to volume-manager once; clone the client per parallel pull.
-    // Tonic's generated client requires &mut self for each call, so a clone
-    // per concurrent call is the cheapest way to fan out three RPCs.
-    let client = pplx_space_volmgr_client::connect(VOLMGR_SOCKET)
-        .await
-        .map_err(|err| {
-            warn!(
-                error = %err,
-                template = name,
-                content_hash,
-                socket = %VOLMGR_SOCKET,
-                "vol-mgr connect failed; volume pull skipped"
-            );
-            PullError::Failure(PullFailure::VolumeManagerUnavailable)
-        })?;
-
     let metadata_path = format!("{digest_dir}/metadata.json");
     let manifest_path = format!("{digest_dir}/manifest.json");
 
-    // 1. Pull metadata.json + manifest.json in parallel. These are tiny
-    //    (sub-kB) and unconditional — every build has both, and they're
-    //    not listed in `manifest.files` (the manifest can't list itself).
-    let metadata_fut = pull_one(
-        client.clone(),
-        &subject,
-        build_object_uri(parts, "metadata.json"),
-        metadata_path.clone(),
-        PullOptions::control("metadata"),
-        base_tags,
-    );
-    let manifest_fut = pull_one(
-        client.clone(),
-        &subject,
-        build_object_uri(parts, "manifest.json"),
-        manifest_path.clone(),
-        PullOptions::control("manifest"),
-        base_tags,
-    );
-    // Await both even when one fails: volume-manager keeps a started job
-    // running after its waiter drops, and one that wrote after the cleanup
-    // guard removed the dir would leave a dir without a row that later
-    // pulls refuse. A job that outlives its own failed RPC (a deadline, or
-    // a volume-manager restart) can still do that; startup recovery then
-    // verifies or removes the dir.
-    let (meta_bytes, man_bytes) = tokio::join!(metadata_fut, manifest_fut);
-    let (meta_bytes, man_bytes) = (meta_bytes?, man_bytes?);
-    crate::metrics::pull_s3_bytes(base_tags, Some(&parts.region), meta_bytes);
-    crate::metrics::pull_s3_bytes(base_tags, Some(&parts.region), man_bytes);
+    // 1. Write metadata.json + manifest.json. These are tiny (sub-kB) and
+    //    unconditional — every build has both, and they're not listed in
+    //    `manifest.files` (the manifest can't list itself). The partition
+    //    probe already fetched both, so the pull reuses its bytes.
+    for (path, bytes) in [
+        (&metadata_path, &probed_metadata),
+        (&manifest_path, &probed_manifest),
+    ] {
+        write_file_atomic(Path::new(path), bytes).await.map_err(|err| {
+            warn!(error = %err, template = name, content_hash, path = %path, "write probed release file failed");
+            PullError::Failure(PullFailure::LocalStorageUnavailable)
+        })?;
+    }
 
     // 2. Read + parse the manifest from disk so the rest of `do_pull`
     //    decides what to pull based on what the manifest actually
@@ -1964,7 +2123,8 @@ async fn try_pull_from(
     // portability. Any other status surfaces as a warn — the
     // template lands as state=ready regardless (the codec is
     // best-effort).
-    match crate::btrfs_via_nodemgr::finalize_template_subvolume(name, content_hash).await {
+    match crate::btrfs_via_nodemgr::finalize_template_subvolume(name, content_hash, partition).await
+    {
         Ok(received_uuid) => tracing::debug!(
             template = name,
             content_hash,
@@ -1997,18 +2157,16 @@ async fn try_pull_from(
             // `FailedPrecondition` from a future attempt resolves as
             // permanent (digest dir is genuinely not a subvolume),
             // anything else stays retriable. Idempotent: dedup_key is
-            // `{name}@{content_hash}`, so concurrent pulls of the
+            // `{name}@{build_dir_name}`, so concurrent pulls of the
             // same build coalesce to one in-flight job. Best-effort
             // submission — if the worker isn't wired (tests) or
             // submit fails, we still commit state='ready' so the Full
             // codec is unblocked.
             if let Some(worker) = background_worker {
-                let payload = crate::background_jobs::StampPayload {
-                    name: name.to_string(),
-                    content_hash: content_hash.to_string(),
-                };
-                let subject = format!("template:{name}@{content_hash}");
+                let payload =
+                    crate::background_jobs::StampPayload::new(name, content_hash, partition);
                 let dedup = payload.dedup_key();
+                let subject = format!("template:{dedup}");
                 match worker.submit_json(
                     crate::background_jobs::STAMP_JOB_KIND,
                     &payload,
@@ -2051,6 +2209,7 @@ async fn try_pull_from(
             &crate::db::BuildUpsert {
                 name: &n,
                 content_hash: &h,
+                cache_partition: partition,
                 build_date: &build_date,
                 manifest_json: &manifest_json,
                 runtime: &runtime,
@@ -2150,6 +2309,26 @@ async fn cleanup_digest_dir_after_hash_mismatch(name: &str, content_hash: &str, 
     remove_build_dir(name, content_hash, digest_dir, "hash_mismatch").await;
 }
 
+/// Cache partition of a build dir, read from its name.
+fn digest_dir_partition(digest_dir: &Path) -> Option<TemplateCachePartition> {
+    let name = digest_dir.file_name()?.to_str()?;
+    TemplateCachePartition::parse_build_dir_name(name).map(|(_, partition)| partition)
+}
+
+/// Delete a build dir through node-manager. The partition comes from the dir
+/// name so callers can't send the delete to a sibling partition's build.
+async fn delete_digest_dir_via_nodemgr(
+    name: &str,
+    content_hash: &str,
+    digest_dir: &Path,
+) -> Result<(), String> {
+    let partition = digest_dir_partition(digest_dir)
+        .ok_or_else(|| format!("{} is not a build dir", digest_dir.display()))?;
+    crate::btrfs_via_nodemgr::delete_template_subvolume(name, content_hash, partition)
+        .await
+        .map_err(|err| err.to_string())
+}
+
 /// Remove a build dir this pull created: through node-manager, the
 /// privileged delete path, falling back to a local delete when the RPC
 /// fails. Even when the subvolume delete EPERMs (production tmplmgr is
@@ -2157,7 +2336,7 @@ async fn cleanup_digest_dir_after_hash_mismatch(name: &str, content_hash: &str, 
 /// A subvolume root it can't remove stays without a row, and pulls refuse
 /// it until the GC tick's rowless check removes it.
 async fn remove_build_dir(name: &str, content_hash: &str, dir: &Path, reason: &'static str) {
-    match crate::btrfs_via_nodemgr::delete_template_subvolume(name, content_hash).await {
+    match delete_digest_dir_via_nodemgr(name, content_hash, dir).await {
         Ok(()) => {
             info!(dir = %dir.display(), reason, "removed digest dir (via nodemgr)");
             return;
@@ -2236,8 +2415,13 @@ impl PullCleanupSlot {
     /// Wait for the cleanup a failed attempt spawned, if any.
     async fn finish(&self) {
         let pending = lock_or_recover(&self.0, "pull cleanup slot").take();
-        if let Some(pending) = pending {
-            let _ = pending.await;
+        if let Some(pending) = pending
+            && let Err(error) = pending.await
+        {
+            // The cleanup's own failures are logged where they happen; a
+            // panicked task reports nothing else, and its rowless dir keeps
+            // refusing pulls until the GC tick verifies it.
+            warn!(%error, "pull cleanup task failed");
         }
     }
 }
@@ -2917,6 +3101,7 @@ fn decompress_phase(target: &DecompressTarget, rootfs_filename: &str) -> &'stati
     }
 }
 
+/// Whether a build row exists for the digest in any cache partition.
 pub(crate) fn local_build_exists(
     db: &Arc<std::sync::Mutex<rusqlite::Connection>>,
     name: &str,
@@ -2929,7 +3114,7 @@ pub(crate) fn local_build_exists(
         );
         return false;
     };
-    matches!(crate::db::get_build(&conn, name, content_hash), Ok(Some(_)))
+    crate::db::build_exists(&conn, name, content_hash).unwrap_or(false)
 }
 
 /// Resolution outcome for a single `(template_name, tag)` lookup used

@@ -2742,6 +2742,12 @@ async fn stage_btrfs_send_restore(
              cannot identify the parent template subvolume"
         ))
     })?;
+    // The stream's parent is the build the snapshot's binding names: the
+    // lookup prefers its partition, and receive resolves the parent there.
+    let environment = sidecar
+        .execution
+        .as_ref()
+        .and_then(|execution| execution.execution().environment());
 
     // Template and rootfs availability gate receive; runtime-state downloads
     // are independent. Keep them running while node-manager reconstructs the
@@ -2776,9 +2782,16 @@ async fn stage_btrfs_send_restore(
     }
     run_btrfs_staging(
         Box::pin(async {
-            ensure_local_template(templates, sandbox_id, owner, template_name, content_hash)
-                .await
-                .map(drop)
+            ensure_local_template(
+                templates,
+                sandbox_id,
+                owner,
+                template_name,
+                content_hash,
+                environment,
+            )
+            .await
+            .map(drop)
         }),
         rootfs_pulls,
         runtime_pulls,
@@ -2788,6 +2801,7 @@ async fn stage_btrfs_send_restore(
                 sandbox_id,
                 template_name,
                 content_hash,
+                environment,
                 target,
                 node_manager,
             )
@@ -2867,6 +2881,7 @@ async fn ensure_local_template(
     owner: &pplx_space_common_core::types::SandboxOwner,
     template_name: &str,
     content_hash: &str,
+    environment: Option<pplx_space_common_core::types::EnvironmentReference>,
 ) -> Result<String, RestoreError> {
     use crate::template_resolver::TemplateLookupError;
     async {
@@ -2878,7 +2893,7 @@ async fn ensure_local_template(
                     name: template_name.to_string(),
                     content_hash: Some(content_hash.to_string()),
                     tag: None,
-                    environment: None,
+                    environment: environment.map(|environment| environment.to_string()),
                 }),
                 vcpu: None,
                 memory_mib: None,

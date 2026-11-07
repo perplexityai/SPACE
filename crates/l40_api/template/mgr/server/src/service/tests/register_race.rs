@@ -36,9 +36,14 @@ fn register(
 }
 
 fn registered(service: &TemplateManagerService, name: &str, content_hash: &str) -> bool {
-    crate::db::get_build(&service.db.lock().unwrap(), name, content_hash)
-        .unwrap()
-        .is_some()
+    crate::db::get_build(
+        &service.db.lock().unwrap(),
+        name,
+        content_hash,
+        crate::db::TemplateCachePartition::Legacy,
+    )
+    .unwrap()
+    .is_some()
 }
 
 async fn wait_for_compression(published: &Path) {

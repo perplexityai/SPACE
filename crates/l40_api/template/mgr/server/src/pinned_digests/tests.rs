@@ -34,7 +34,14 @@ fn upsert_release_replaces_metadata_on_conflict() {
 fn list_pinned_hashes_unions_tag_and_release_pins() {
     let store = store_with_in_memory_db();
 
-    store.upsert_tag("seed", "latest", "sha256:aa").unwrap();
+    store
+        .upsert_tag(
+            "seed",
+            "latest",
+            crate::db::TemplateCachePartition::Legacy,
+            "sha256:aa",
+        )
+        .unwrap();
     store
         .upsert_release("seed", "sha256:aa", "rel-1", "2026-01-01T00:00:00Z")
         .unwrap();
@@ -60,6 +67,7 @@ fn prune_without_local_builds_drops_phantom_pins_only() {
             &crate::db::BuildUpsert {
                 name: "seed",
                 content_hash: "sha256:aa",
+                cache_partition: crate::db::TemplateCachePartition::Legacy,
                 build_date: "2026-01-01T00:00:00Z",
                 manifest_json: "{}",
                 runtime: "fc",
@@ -70,12 +78,24 @@ fn prune_without_local_builds_drops_phantom_pins_only() {
         )
         .unwrap();
     }
-    store.upsert_tag("seed", "latest", "sha256:aa").unwrap();
+    store
+        .upsert_tag(
+            "seed",
+            "latest",
+            crate::db::TemplateCachePartition::Legacy,
+            "sha256:aa",
+        )
+        .unwrap();
     store
         .upsert_release("seed", "sha256:aa", "rel-1", "2026-01-01T00:00:00Z")
         .unwrap();
     store
-        .upsert_tag("app-runtime", "latest", "sha256:missing")
+        .upsert_tag(
+            "app-runtime",
+            "latest",
+            crate::db::TemplateCachePartition::Legacy,
+            "sha256:missing",
+        )
         .unwrap();
     store
         .upsert_release(
@@ -245,11 +265,30 @@ fn prune_releases_outside_preserves_prior_pin_when_keep_set_includes_it() {
 fn prune_tags_outside_drops_only_removed_tuples() {
     let store = store_with_in_memory_db();
 
-    store.upsert_tag("seed", "latest", "sha256:aa").unwrap();
     store
-        .upsert_tag("code-runtime", "latest", "sha256:bb")
+        .upsert_tag(
+            "seed",
+            "latest",
+            crate::db::TemplateCachePartition::Legacy,
+            "sha256:aa",
+        )
         .unwrap();
-    store.upsert_tag("seed", "stable", "sha256:cc").unwrap();
+    store
+        .upsert_tag(
+            "code-runtime",
+            "latest",
+            crate::db::TemplateCachePartition::Legacy,
+            "sha256:bb",
+        )
+        .unwrap();
+    store
+        .upsert_tag(
+            "seed",
+            "stable",
+            crate::db::TemplateCachePartition::Legacy,
+            "sha256:cc",
+        )
+        .unwrap();
 
     store
         .prune_tags_outside(&[

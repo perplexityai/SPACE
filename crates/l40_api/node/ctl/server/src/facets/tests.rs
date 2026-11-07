@@ -1767,3 +1767,109 @@ async fn publish_statuses_from_a_real_channel_retry_only_transport_failures() {
     }
     assert!(misclassified.is_empty(), "{misclassified:#?}");
 }
+
+#[test]
+fn template_publication_prefers_each_name_s_legacy_build() {
+    use pplx_space_common_core::types::{Digest, EnvironmentReference};
+    let initial =
+        || Some(pplx_space_node_runtime_core::catalog::initial_environment_reference().to_string());
+    let other = || Some(EnvironmentReference::new(Digest::sha256([2; 32])).to_string());
+    // Each build carries the partition its row is in: another environment's
+    // build is in that environment's partition, the rest in the legacy one.
+    let listed = |name: &str, hash: u8, environment: Option<String>| {
+        let cache_partition = if environment == other() {
+            other()
+        } else {
+            Some(String::new())
+        };
+        pplx_space_template_mgr_client::proto::TemplateFullInfo {
+            name: name.into(),
+            content_hash: Some(Digest::blake3([hash; 32]).to_string()),
+            execution: Some(pplx_space_execution_common::proto::ExecutionMetadata {
+                environment,
+                ..Default::default()
+            }),
+            cache_partition,
+            ..Default::default()
+        }
+    };
+    let published = |templates| {
+        local_state::published_template_builds(templates)
+            .into_iter()
+            .map(|(name, template)| (name, (template.content_hash.unwrap(), template.execution)))
+            .collect::<Vec<_>>()
+    };
+    let unbound = pplx_space_template_mgr_client::proto::TemplateFullInfo {
+        execution: None,
+        ..listed("unbound", 4, None)
+    };
+
+    assert_eq!(
+        published(vec![
+            // A twin listed either side of its legacy sibling loses.
+            listed("twins", 1, other()),
+            listed("twins", 1, initial()),
+            listed("twins", 1, other()),
+            // Only another environment's build: publish it.
+            listed("bound", 3, other()),
+            unbound.clone(),
+            // The last listed legacy build wins, as before partitions.
+            listed("latest", 5, None),
+            listed("latest", 6, None),
+            // An adopted build is bound to another environment but filed in
+            // the legacy partition: it beats a twin listed after it.
+            pplx_space_template_mgr_client::proto::TemplateFullInfo {
+                cache_partition: Some(String::new()),
+                ..listed("adopted", 7, other())
+            },
+            listed("adopted", 7, other()),
+            // A template-manager without partitions names none: legacy.
+            pplx_space_template_mgr_client::proto::TemplateFullInfo {
+                cache_partition: None,
+                ..listed("older", 8, other())
+            },
+            listed("older", 8, other()),
+        ]),
+        vec![
+            (
+                "adopted".into(),
+                (
+                    Digest::blake3([7; 32]).to_string(),
+                    listed("", 0, other()).execution
+                )
+            ),
+            (
+                "bound".into(),
+                (
+                    Digest::blake3([3; 32]).to_string(),
+                    listed("", 0, other()).execution
+                )
+            ),
+            (
+                "latest".into(),
+                (
+                    Digest::blake3([6; 32]).to_string(),
+                    listed("", 0, None).execution
+                )
+            ),
+            (
+                "older".into(),
+                (
+                    Digest::blake3([8; 32]).to_string(),
+                    listed("", 0, other()).execution
+                )
+            ),
+            (
+                "twins".into(),
+                (
+                    Digest::blake3([1; 32]).to_string(),
+                    listed("", 0, initial()).execution
+                )
+            ),
+            (
+                "unbound".into(),
+                (Digest::blake3([4; 32]).to_string(), None)
+            ),
+        ]
+    );
+}

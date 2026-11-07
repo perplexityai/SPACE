@@ -17,7 +17,12 @@ fn export_fixture() -> (tempfile::TempDir, TemplateManagerService, String) {
         [&digest],
     )
     .unwrap();
-    let dir = build_artifacts_dir(root.path(), TEMPLATE, &digest);
+    let dir = build_artifacts_dir(
+        root.path(),
+        TEMPLATE,
+        &digest,
+        crate::db::TemplateCachePartition::Legacy,
+    );
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(
         dir.join(TEMPLATE_ROOTFS_ZSTD_FILE),
@@ -177,7 +182,12 @@ async fn export_refuses_unsupported_or_corrupt_documents_before_streaming() {
         ),
     ] {
         let (root, service, digest) = export_fixture();
-        let dir = build_artifacts_dir(root.path(), TEMPLATE, &digest);
+        let dir = build_artifacts_dir(
+            root.path(),
+            TEMPLATE,
+            &digest,
+            crate::db::TemplateCachePartition::Legacy,
+        );
         std::fs::write(dir.join(file), bytes).unwrap();
         let result = service
             .export_template(internal_request(ExportTemplateRequest {

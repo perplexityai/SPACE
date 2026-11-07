@@ -196,11 +196,13 @@ fn unanswered(code: tonic::Code) -> bool {
 }
 
 /// The rootfs of a ready build of `template@content_hash` on this node, the
-/// only safe base for a rootfs delta. A build dir alone says nothing: one can
-/// exist without a catalog row, as a transient recovery failure or an
-/// interrupted pull leaves it. So the base comes from a `cached_only` lookup,
-/// which answers from a ready row whose rootfs passes template-manager's
-/// checks and never pulls, bounded by [`DELTA_BASE_LOOKUP_TIMEOUT`].
+/// only safe base for a rootfs delta. Every cache partition of one digest
+/// holds the same rootfs bytes, but only template-manager's catalog says a
+/// build dir holds them in full: one can exist without a catalog row, as a
+/// transient recovery failure or an interrupted pull leaves it. So the base
+/// comes from a `cached_only` lookup, which answers from a ready row whose
+/// rootfs passes template-manager's checks and never pulls, bounded by
+/// [`DELTA_BASE_LOOKUP_TIMEOUT`].
 pub(super) async fn verify_delta_base(
     templates: &dyn crate::template_resolver::TemplateResolver,
     template: &str,

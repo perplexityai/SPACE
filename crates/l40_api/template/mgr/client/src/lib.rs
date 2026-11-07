@@ -62,6 +62,24 @@ impl TryFrom<&TemplateReference> for proto::TemplateRef {
     }
 }
 
+impl proto::TemplateFullInfo {
+    /// Environment the listed build is bound to; `None` for unbound builds.
+    /// Template-manager caches a rootfs once per environment it's bound to,
+    /// so one digest can be listed more than once.
+    pub fn environment(
+        &self,
+    ) -> Result<
+        Option<pplx_space_common_core::types::EnvironmentReference>,
+        pplx_space_common_core::types::DigestParseError,
+    > {
+        self.execution
+            .as_ref()
+            .and_then(|execution| execution.environment.as_deref())
+            .map(str::parse)
+            .transpose()
+    }
+}
+
 fn endpoint() -> Result<Endpoint, tonic::transport::Error> {
     Endpoint::try_from(LOCAL_ENDPOINT_URI)
 }

@@ -1808,18 +1808,27 @@ async fn restore_template_lookup_uses_validated_owner(
         Ok(response)
     });
 
+    // The snapshot's binding is the lookup's partition preference.
+    let bound = pplx_space_common_core::types::EnvironmentReference::new(
+        pplx_space_common_core::types::Digest::sha256([2; 32]),
+    );
     let path = ensure_local_template(
         &templates,
         &id.to_string(),
         &owner.parse().unwrap(),
         "base",
         "sha256:cached",
+        Some(bound),
     )
     .await
     .unwrap();
 
     assert_eq!(path, "/synthetic/cached-base");
     let lookup = templates.lookups().pop().unwrap();
+    assert_eq!(
+        lookup.request.template.as_ref().unwrap().environment,
+        Some(bound.to_string())
+    );
     let mut request = tonic::Request::new(lookup.request);
     *request.metadata_mut() = lookup.metadata;
     assert_eq!(

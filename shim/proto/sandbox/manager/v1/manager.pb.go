@@ -5992,12 +5992,20 @@ func (x *PublishedDurableArtifact) GetBytesPublished() uint64 {
 }
 
 type CreateTemplateBaseSnapshotRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	SandboxId     string                 `protobuf:"bytes,1,opt,name=sandbox_id,json=sandboxId,proto3" json:"sandbox_id,omitempty"`
-	Vcpu          uint32                 `protobuf:"varint,2,opt,name=vcpu,proto3" json:"vcpu,omitempty"`
-	MemoryMib     uint32                 `protobuf:"varint,3,opt,name=memory_mib,json=memoryMib,proto3" json:"memory_mib,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state     protoimpl.MessageState `protogen:"open.v1"`
+	SandboxId string                 `protobuf:"bytes,1,opt,name=sandbox_id,json=sandboxId,proto3" json:"sandbox_id,omitempty"`
+	Vcpu      uint32                 `protobuf:"varint,2,opt,name=vcpu,proto3" json:"vcpu,omitempty"`
+	MemoryMib uint32                 `protobuf:"varint,3,opt,name=memory_mib,json=memoryMib,proto3" json:"memory_mib,omitempty"`
+	// The template-manager cache partition the snapshot is published under:
+	// empty for the legacy partition, else an environment reference. It names
+	// the partition of the build row the capture booted, which can differ from
+	// the capture sandbox's binding: a legacy-layout build bound to another
+	// environment is adopted in the legacy partition. Sandbox-manager accepts
+	// the legacy partition or its binding's own, and refuses any other. Absent
+	// from a template-manager without partitions, which reads the legacy one.
+	CachePartition *string `protobuf:"bytes,4,opt,name=cache_partition,json=cachePartition,proto3,oneof" json:"cache_partition,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *CreateTemplateBaseSnapshotRequest) Reset() {
@@ -6049,6 +6057,13 @@ func (x *CreateTemplateBaseSnapshotRequest) GetMemoryMib() uint32 {
 		return x.MemoryMib
 	}
 	return 0
+}
+
+func (x *CreateTemplateBaseSnapshotRequest) GetCachePartition() string {
+	if x != nil && x.CachePartition != nil {
+		return *x.CachePartition
+	}
+	return ""
 }
 
 type CreateTemplateBaseSnapshotResponse struct {
@@ -14190,13 +14205,15 @@ const file_sandbox_manager_v1_manager_proto_rawDesc = "" +
 	"\x18PublishedDurableArtifact\x12\x1f\n" +
 	"\vstorage_uri\x18\x01 \x01(\tR\n" +
 	"storageUri\x12'\n" +
-	"\x0fbytes_published\x18\x02 \x01(\x04R\x0ebytesPublished\"u\n" +
+	"\x0fbytes_published\x18\x02 \x01(\x04R\x0ebytesPublished\"\xb7\x01\n" +
 	"!CreateTemplateBaseSnapshotRequest\x12\x1d\n" +
 	"\n" +
 	"sandbox_id\x18\x01 \x01(\tR\tsandboxId\x12\x12\n" +
 	"\x04vcpu\x18\x02 \x01(\rR\x04vcpu\x12\x1d\n" +
 	"\n" +
-	"memory_mib\x18\x03 \x01(\rR\tmemoryMib\"h\n" +
+	"memory_mib\x18\x03 \x01(\rR\tmemoryMib\x12,\n" +
+	"\x0fcache_partition\x18\x04 \x01(\tH\x00R\x0ecachePartition\x88\x01\x01B\x12\n" +
+	"\x10_cache_partition\"h\n" +
 	"\"CreateTemplateBaseSnapshotResponse\x12#\n" +
 	"\rsnapshot_hash\x18\x01 \x01(\tR\fsnapshotHash\x12\x1d\n" +
 	"\n" +
@@ -15836,6 +15853,7 @@ func file_sandbox_manager_v1_manager_proto_init() {
 		(*CreateSnapshotSource_CurrentSandbox)(nil),
 		(*CreateSnapshotSource_DurableArtifact)(nil),
 	}
+	file_sandbox_manager_v1_manager_proto_msgTypes[58].OneofWrappers = []any{}
 	file_sandbox_manager_v1_manager_proto_msgTypes[61].OneofWrappers = []any{}
 	file_sandbox_manager_v1_manager_proto_msgTypes[62].OneofWrappers = []any{}
 	file_sandbox_manager_v1_manager_proto_msgTypes[64].OneofWrappers = []any{

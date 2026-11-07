@@ -401,6 +401,8 @@ sandbox metadata. No table migration or backfill is required. The reference is
 not a substitute for binary verification or an arbitrary execution permission.
 A same-rootfs registration cannot add, remove or replace the retained manifest's
 binding by refreshing metadata; it fails before changing the existing release.
+A template-manager registration bound to another environment's cache partition
+is a separate node-local build instead (see "Template caches per environment").
 Control-plane registration likewise rejects contradictory execution metadata
 before changing tags or storage locations. Identical retries and metadata-free
 tag updates preserve the original evidence; a NULL record may be filled once.
@@ -1735,39 +1737,308 @@ never grants deletion authority.
 
 A template-manager build directory `{name}/{content_hash}` without a catalog row
 isn't served: a pull doesn't adopt or write into it, and fails retryably
-instead. Such a directory is left when a read during startup recovery fails
+instead. A pull reads the release's binding before it picks a directory, so
+it refuses only when the directory of that binding's partition exists or
+can't be checked. A directory without a row in another partition of the
+digest, such as a twin recovery keeps, doesn't block it, and the pull leaves
+that directory alone. Such a directory is left when a read during startup recovery fails
 in a way that can clear, when a permanently invalid build's base snapshots
 or build directory can't be removed (its row goes, what's left stays), when
 a stuck
 eviction's repair or an eviction that couldn't remove its whole directory
 drops the row over what's left, or when a pull stops before registering. Pulls, imports,
-registration, background compression, `DeleteTemplateBuild`, startup
-recovery's per-directory check and the GC tick's check below each hold the
-digest's one claim while they write or remove its directories and rows, and
-`DeleteTemplate` holds one for the whole template, so no two of them hold the
-same digest at once. A registration copies and hashes its rootfs in staging
-before it claims, so it can overlap `DeleteTemplate`, and then fails. Eviction
-takes no claim: it acts only on builds that have a row, and the GC tick's
-check only on directories that don't. Startup recovery skips a digest someone
-holds during its scan, then waits for each one and checks it if the directory
-is still there.
+registration, background compression, `DeleteTemplateBuild`, eviction (the GC
+tick's and `DeleteIdleTemplate`'s), the publish step of a base-snapshot
+capture, startup recovery's per-directory check and the GC tick's check below
+each hold the digest's one claim while they write or remove its directories
+and rows, and `DeleteTemplate` holds one for the whole template, so no two of
+them hold the same digest at once. A registration copies and hashes its rootfs
+in staging before it claims, so it can overlap `DeleteTemplate`, and then
+fails. An eviction holds the claim from before it marks a build `deleting`
+until its row is gone, and doesn't wait for it: the GC tick leaves a build
+whose digest someone holds for a later tick, and `DeleteIdleTemplate` keeps the
+template and refuses with a retryable `ABORTED`. A base-snapshot capture runs
+without the claim, since it takes minutes, then waits for it to publish: if
+the build's row in its partition went meanwhile, or is still `deleting`, it
+records no snapshot and removes the captured files. The publish runs in its
+own task, so it finishes even when the capture's own timeout fires while it
+waits. Startup recovery skips a
+digest someone holds during its scan, then waits for each one and checks it if
+the directory is still there.
 
 Each template-cache GC tick runs startup recovery's check on a few build
-directories without a row: a valid one gets its row back, a permanently
-invalid one is removed, and one whose read still fails waits for a later tick.
-Each tick takes up to two directories, in name order from just after the last one
-it examined, so with a stable set of N such directories every one is examined
-within `ceil(N / 2)` ticks, however many keep failing, as long as each check
-finishes within its wait. A check still running past its tick keeps one of
-two slots shared across ticks, and a tick starts a check only while a slot
-is free. A create from such a
-build fails until a check restores its row or removes it, or until
-`DeleteTemplateBuild`, which also accepts a digest whose only trace is such a
-directory or a leftover base-snapshot directory, removes it. As with a build
-that has a row, `DeleteTemplateBuild` refuses while a pool references the
-template. The check runs on the GC interval even with template-cache
-eviction disabled.
+directories without a row: a valid one gets its row back, a permanently invalid
+one is removed, and one whose read still fails waits for a later tick. An
+invalid build a sandbox still depends on isn't removed, as eviction and
+`DeleteTemplateBuild` don't remove one either: the row of its partition goes
+and its directories wait for a later check, as they do when sandbox-manager
+can't be asked. Each startup recovery pass and each GC tick asks
+sandbox-manager at most once, waiting up to 5 seconds, and applies that
+answer, or its absence, to every directory it checks. Sandbox-manager names a build by template and content hash, so
+a sandbox that depends on a digest keeps every partition's build of it.
+Startup recovery's check follows the same rule, for every rejection, including
+a directory whose binding disagrees with its partition. A restored build's base
+snapshots are registered with its row, from its partition's snapshot directory
+and in its partition; if they can't be read or recorded, the build is served
+without them and each tick retries them until they register. Each tick takes up
+to two directories, in name order from just after the last one it examined, so
+with a stable set of N such directories every one is examined within `ceil(N /
+2)` ticks, however many keep failing, as long as each check and each retry of
+snapshot registration finishes within its wait. A check or retry still running
+past its tick keeps one of two slots shared across ticks, and a tick starts a
+check only while a slot is free; retries of snapshot registration, up to two a
+tick, take those slots first. While checks and retries left running hold both
+slots, no tick starts a check. With two checks and two
+retries each waited on for up to 10 minutes, a tick on a slow disk can start its
+eviction pass up to 40 minutes late. A create from such a build fails until a
+check restores its row or removes it, or until `DeleteTemplateBuild`, which also
+accepts a digest whose only trace is such a directory or a leftover
+base-snapshot directory, removes it. As with a build that has a row,
+`DeleteTemplateBuild` refuses while a pool references the template. The check
+runs on the GC interval even with template-cache eviction disabled.
 
+
+### Template caches per environment
+
+A content hash names rootfs bytes, not an environment, so template-manager
+caches one rootfs once per environment it's bound to. Each such build has its
+own manifest, base snapshots, btrfs subvolume and `received_uuid`, and its own
+rows in the build, component, base-snapshot and tag-pin tables, keyed by a
+cache partition:
+
+| Build | Partition key | Build directory |
+|---|---|---|
+| Unbound, or bound to the Linux/x86_64 initial environment (E0) | empty | `{name}/{content_hash}` |
+| Bound to any other environment | its reference | `{name}/{content_hash}@{environment}` |
+
+Base snapshots live under `{name}/snapshots/<build directory>/`. E0 shares the
+legacy partition because it was the only environment nodes executed before
+partitions existed: existing rows, directories and stamped `received_uuid`
+values keep their identity, and the migration rebuilds the tables without moving
+data. A build's binding is its manifest's execution metadata, else its
+metadata's, which registration copies into the manifest. Registration, import
+and pull file a build under the partition of that binding, and `upsert_build`
+refuses a row whose partition disagrees with its binding, with one exception:
+the legacy partition. A node that admitted another environment before
+partitions existed holds that environment's builds in the legacy layout, often
+under running and suspended sandboxes, and startup recovery adopts each one in
+place. It stays at `{name}/{content_hash}`, filed in the legacy partition with
+its row, base snapshots and stamped `received_uuid`, so a restore whose stream
+names it as its parent finds it, and a rollback to a release without
+partitions serves it unchanged. Its environment's lookups resolve it through
+the legacy fallback, so nothing is pulled again. Recovery drops a
+`{content_hash}@{environment}` directory, which only a release with partitions
+creates, when its binding names another partition or is invalid for its
+schema, and keeps one bound under a schema this release doesn't support yet,
+as a transient rejection: its row goes and the directory stays for a release
+that can read it.
+If a build's base snapshots or directory can't be removed, its row goes and
+what's left waits for the GC tick's check. While a sandbox depends on a digest
+recovery would remove, such as a suspended sandbox whose restore names it as
+its parent, or while sandbox-manager can't be asked, only its row goes: the
+directory stays, without a row, until a GC tick's check finds nothing depends
+on it.
+Startup recovery never deletes an installed build over a read that can clear:
+when reading its manifest or `metadata.json`, stating its files or hashing its
+bootable artifact fails with such an I/O error, it drops the build's row, keeps
+its directory, and logs a warning naming the build and the error. A missing file, invalid UTF-8 and a path of the
+wrong type, a loop or an invalid name don't clear. A build without
+`metadata.json`, or with an empty one, has no metadata, as registration
+installs it; one that reads but doesn't parse can't prove its binding and is
+removed, as a manifest that doesn't parse is. A permission error counts as
+one that can clear: a deploy that can't read the cache would otherwise delete
+every node's builds, including twins, which can't be pulled back. A pull
+doesn't adopt or write into a build directory that has no row in the
+partition its release lands in: it fails retryably and leaves the directory
+alone. A directory without a row in another partition doesn't block it. Pulls, imports, registration,
+`DeleteTemplateBuild` and the GC tick's check below all hold the digest's one
+claim while they write or remove its directories and rows, so none of them
+overlaps another; startup recovery skips a digest someone holds during its
+scan, then waits for each holder and checks the dir if it's still there.
+Leftover import, partition-probe and republish staging
+directories are removed before template-manager's socket binds, while nothing
+can own one, never once requests flow. Each template-cache GC tick runs
+startup recovery's check on a few build directories without a row, whether
+recovery dropped the row, a stuck eviction's repair did, or a pull stopped
+before registering: a valid one gets its row back, a permanently invalid one
+is removed, and one whose read still fails waits for a later tick. Each tick
+takes two directories, in name order from just after the last one it examined,
+so with N such directories every one is checked within `ceil(N / 2)` ticks,
+however many keep failing, as long as each check and each retry of snapshot
+registration finishes within its wait. A create from such a build fails until then, or
+until `DeleteTemplateBuild`, which also accepts a digest whose only trace is
+such a directory, removes it. The check runs on the GC interval even with
+template-cache eviction disabled.
+
+`TemplateRef.environment` is a preference: a lookup returns the build in
+the selected environment's partition, else the legacy build, else any other
+build of the digest. Absent, it prefers the legacy build, so
+environment-unaware callers keep their behavior; E0 selects the legacy
+partition. A lookup of a template's latest build returns the newest build of
+any partition, as before partitions existed. New tie-breaks send same-date
+builds to the larger content hash, and builds of one digest to the preferred
+partition, then the legacy one. The caller checks the build it gets as a
+compatible cold-boot source for the environment it runs under, which keeps
+compatible selection working when the selected environment has no build of
+its own. Sandbox-manager starts a sandbox preferring the build of its saved
+binding's environment, and checks the disk and boot inputs against that
+binding. A cache miss pulls the
+release without a selector: the pull reads the release manifest and metadata
+before choosing a directory and reuses those bytes. Responses echo the resolved
+build's environment. `ListTemplates` reports each build's partition key in
+`TemplateFullInfo.cache_partition`, and sandbox-manager's template catalog
+reads a build's supplemental `metadata.json` from the directory that key names,
+not its binding's, so an adopted build's metadata comes from its legacy
+directory. A template-manager without partitions leaves it unset, and the
+catalog reads the legacy directory.
+Every partition of one digest holds the same rootfs bytes, but only a row says
+a build directory holds them in full. Sandbox-manager's rootfs deltas, for
+sandbox and snapshot export and import, take their base from a
+`GetTemplate` lookup with `cached_only` set, which answers from a ready row
+and never pulls; with no such build, an export sends the full rootfs and a
+delta import is refused.
+Node-manager's template subvolume RPCs carry a partitioned build in
+`EnvironmentTemplateBuild` and leave the legacy `content_hash` empty, so an
+older node-manager rejects them rather than acting on the legacy build.
+`DeleteTemplateBuild` removes every partition of a cached hash that has a row,
+a build directory or a base-snapshot directory, and rejects a selector. It
+takes the digest's claim before touching anything: it refuses with a retryable
+`ABORTED` while a pull, import, registration, eviction or GC check of the
+digest holds it. While it runs, an import, registration or pull of the digest waits for it
+to finish, so a
+registration racing a delete either lands its build after the delete or holds
+the delete off. The delete never reports success while the build is still
+cached. It removes artifacts before rows, so one that fails between the two
+leaves rows without their directories; a retry finishes it, and startup
+recovery prunes rows whose artifacts are missing. Tag and release pins protect a digest in every partition, and a pull
+is refused with a retryable error while any partition of its digest is being
+evicted.
+
+Base-snapshot reconciliation runs per partition: each partition's newest build
+of a template gets its own snapshot. The legacy partition's newest build can be
+an adopted one bound to another environment; another environment's partition
+skips a row whose binding names a different partition. A build outside the legacy partition is
+captured through sandbox-manager's environment create path, so it cold-boots
+under its own environment, and a node that doesn't admit that environment
+refuses the capture. A rebuilt legacy snapshot invalidates the template's pool
+sandboxes, as before partitions. Another partition's snapshot invalidates only
+the pool sandboxes that booted that partition's build, as each one's execution
+reports it, and any whose partition can't be read.
+
+Pool selection, described below for Cloud Hypervisor, looks at every partition.
+Of the eligible builds it takes a Firecracker build first, then one in the
+legacy partition, then the newest, so a template with an E0 Firecracker build
+keeps booting it. Pool creates and clones reach sandbox-manager without an
+environment, and its lookup of a digest returns the row with the lowest
+partition key, legacy first. So of each digest's rows only that one can be a
+pool's build, which keeps every lookup on the build the pool chose. A legacy
+row can be one whatever its binding, since startup recovery adopts
+legacy-layout builds in place; a row in another environment's partition whose
+binding names a different partition never is. A refill records the use
+on the chosen build in its own partition. With nothing cached, a refill names
+no build, so sandbox-manager resolves and pulls the template's latest release
+for the first member.
+
+Deploy sandbox-manager, build-manager and node-ctl no later than
+template-manager. A sandbox-manager that predates partitions reads and writes
+only legacy directories: it publishes the base snapshot of any build bound to
+another environment into the legacy snapshot directory, which for a twin
+overwrites the legacy build's snapshot and otherwise leaves the capture
+unrecorded, and its rootfs deltas and transfers miss builds outside the legacy
+partition. A template-manager that predates `cached_only` ignores it and
+answers without the `cached_only` mark, so until it upgrades a newer
+sandbox-manager's delta-base lookup of an uncached digest pulls it, and no
+answer yields a delta base, cached build or not: sandbox and snapshot exports
+send the full rootfs, and delta imports fail with `FAILED_PRECONDITION`, so
+transfers into that node must be full. The other way round, a new sandbox-manager publishes a capture under the
+partition template-manager names, and under the legacy one when an older
+template-manager names none, which is where that template-manager looks.
+Node-manager can deploy in either order: an older one refuses partitioned
+subvolume requests, and a pull into another environment's partition lands in a
+plain directory, as on a host without btrfs. Sandbox-manager names a bound
+sandbox's parent partition in the btrfs codec requests beside the legacy
+`content_hash`, which an older node-manager resolves instead; for a sandbox
+booted from another partition, its suspend then falls back to the Full codec
+and its disk snapshots fail until node-manager upgrades and that build is a
+subvolume (a build pulled while node-manager couldn't create subvolumes stays
+a plain directory until it's re-pulled). A new node-manager's encodes take the
+named partition's build or the legacy one, whichever the sandbox descends
+from, and never another partition's: a restoring node holds one of those two
+but may not hold a third, so a sandbox that booted any other build suspends
+with the Full codec. Its receive also considers the digest's other cached
+partitions, since an older stream may name one, and takes the candidate whose
+stamped received UUID is the stream's parent, read from the stream's first
+command; with none, the restore fails as a precondition instead of reaching
+`btrfs receive` with the wrong parent. An older build-manager publishes
+a build bound to another environment from the legacy directory, which no longer
+holds it. An older node-ctl publishes a template's last listed build, which can
+be a twin.
+
+Roll back in the reverse order, template-manager before or together with the
+others. A template-manager released while this migration was withdrawn
+reverses it at startup when every build, tag pin and unfinished stamp job is in
+the legacy partition, so rolling back to one needs no database step;
+`db/README.md` describes the check and a read-only query that runs it. Remove
+the directories listed in step 3 first: the check counts rows, not
+directories. A database with environment-partition rows, or a rollback to a
+release that predates the migration, needs the procedure below: such a
+template-manager refuses the migrated database, and its migrator doesn't
+bundle the migration.
+
+1. Stop template-manager on the node and keep the new version from restarting:
+   at startup it re-applies the migration. Stop sandbox-manager too, and keep a
+   new sandbox-manager stopped until the older template-manager is running:
+   one can publish a `snapshots/{hash}@{environment}` directory after step 3,
+   which the older template-manager's first startup would register under an
+   invalid hash. Template-manager still rolls back before or with the others.
+2. While it's stopped, copy the template-manager database with its `-wal` and
+   `-shm` files. If the rollback fails, restore all three together and
+   redeploy the new template-manager. The directories removed in step 3 aren't
+   restored; their builds re-pull on demand, and twins of published releases
+   must be rebuilt. A btrfs-send suspend or disk snapshot encoded against a
+   `{hash}@{environment}` parent can't be restored once step 3 removes it: an
+   older release never stamps that parent's received UUID, so rolling back
+   loses such snapshots. Before removing anything, check the database's own history, since the
+   migrator's `status` lists only migrations its catalog bundles and would
+   omit a newer applied one:
+   `sqlite3 -readonly <db> "SELECT max(version) FROM _sqlx_migrations"` must
+   print `20261026220935`, and
+   `sqlite3 -readonly <db> "SELECT version FROM _space_common_schema_migrations WHERE version > 20260930000000"`
+   must print nothing. If either check fails, stop: this procedure doesn't
+   cover that database, and no directory has been removed yet.
+3. Under the template cache root (`TEMPLATE_DIR`), remove each
+   `{name}/snapshots/{hash}@{environment}` directory, which the older
+   template-manager would register as snapshot rows of an invalid hash, and
+   delete each `{name}/{hash}@{environment}` build directory and each
+   `{name}/{hash}@{environment}.replaced.{uuid}` directory a replaced build
+   left behind; the older template-manager never sees or evicts them. On a
+   btrfs host most are read-only subvolumes: delete a directory for which
+   `btrfs subvolume show <dir>` succeeds with `btrfs subvolume delete <dir>`,
+   and remove any other, a plain directory left on a host without btrfs or by a
+   pull whose subvolume request failed, with `rm -rf <dir>`.
+4. Run a migrator that bundles this migration, last: once it commits, an older
+   template-manager can open the database. Run
+   `space-db-migrator template-manager --database-path <db> down` once. It
+   drops the rows of every environment partition and removes the migration's
+   history row. A second run reaches the baseline, which is a rollback floor:
+   it fails and changes nothing.
+5. Start the older template-manager, then the older sandbox-manager.
+
+Known limits until the cluster side carries partitions:
+
+- Release identity is `(template_name, hash)` in the control plane, its object
+  store layout and its node inventory, so a twin of a published release can't
+  be registered or published yet. Node-ctl publishes a template's
+  legacy-partition build, and another partition's only when it has none.
+- A restore of a btrfs-send stream needs the build its stream descends from.
+  Its lookup prefers the snapshot's binding but falls back to another
+  partition of the digest without pulling, so a node holding only another
+  partition's build of that digest can't restore a stream whose parent it
+  lacks, and nothing pulls that build for it: the restore keeps failing. Twins
+  exist only where a node admits an environment besides the initial one.
+- Prefetch names no environment: it pulls without a selector, counts a build
+  in any partition of a digest as cached, and its tag pins use the legacy
+  partition key.
 
 ## Runtime control transport
 
@@ -1922,9 +2193,23 @@ cold-only. Windows image distribution and managed-tenant admission remain
 separate limitations; see [Windows image preparation](../templates/cloud-hypervisor/windows/README.md).
 
 Pool admission, shape defaults, snapshot checks and refill select the same
-eligible build: prefer Firecracker, otherwise use the newest pool-capable build,
-including CH. CH requires a current, bound, memory-capable environment and a
+build from the template's ready builds across every template-cache partition.
+Pool creates and clones reach sandbox-manager without an environment, and its
+lookup of a content hash returns the row with the lowest partition key, so
+only that row of each content hash is a candidate: a legacy-partition row
+before any environment-partition twin. A legacy row is a candidate whatever
+its binding, including a legacy-layout build that startup recovery adopted
+from another environment; an environment-partition row is one only when it's
+bound to that partition's environment. A content hash whose selected row
+isn't pool-capable offers no build, even if a twin in another partition is.
+A pool-capable build's runtime supports prewarmed pools and its guest profile
+supports memory lifecycle; a bound build needs a catalog environment that
+supports memory state. CH requires a current, bound, memory-capable environment and a
 qualified guest agent; an unbound or agentless CH build is not a donor candidate.
+Among the candidates, selection prefers a Firecracker build over any CH build,
+then a legacy-partition build over an environment-partition one, even a newer
+build of another content hash, then the latest recorded build date, then the
+greatest content hash.
 An existing pool can therefore continue using an older eligible build after an
 agentless build is published. Name-only sandbox creation still resolves the
 latest template build; pin the eligible content hash to claim that build's pool.

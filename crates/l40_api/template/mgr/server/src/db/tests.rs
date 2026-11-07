@@ -198,7 +198,23 @@ fn local_generation_triggers_cover_old_writers_without_recursion_or_cluster_rewr
 }
 
 fn upsert_test_build_with_execution(conn: &Connection, name: &str, content_hash: &str) {
-    let execution = ExecutionMetadata::initial_firecracker(
+    upsert_test_build_with_execution_in(
+        conn,
+        name,
+        content_hash,
+        crate::db::TemplateCachePartition::Legacy,
+    );
+}
+
+/// A build with one kernel component in `partition`, bound to the partition's
+/// environment when it has one.
+fn upsert_test_build_with_execution_in(
+    conn: &Connection,
+    name: &str,
+    content_hash: &str,
+    partition: crate::db::TemplateCachePartition,
+) {
+    let mut execution = ExecutionMetadata::initial_firecracker(
         Arch::Aarch64,
         vec![ArtifactComponentMetadata {
             kind: ArtifactComponentKind::Kernel,
@@ -212,6 +228,9 @@ fn upsert_test_build_with_execution(conn: &Connection, name: &str, content_hash:
             format: Some(ArtifactFormat::parse("vmlinux").unwrap()),
         }],
     );
+    if let crate::db::TemplateCachePartition::Environment(environment) = partition {
+        execution = execution.with_environment(environment);
+    }
     let mut manifest = TemplateManifest {
         runtime: "fc".to_string(),
         arch: "aarch64".to_string(),
@@ -224,6 +243,7 @@ fn upsert_test_build_with_execution(conn: &Connection, name: &str, content_hash:
         &BuildUpsert {
             name,
             content_hash,
+            cache_partition: partition,
             build_date: "2026-06-12T00:00:00Z",
             manifest_json: &manifest_json,
             runtime: "fc",
@@ -273,6 +293,9 @@ fn upsert_build_projects_execution_metadata_and_unspecified_role() {
             &BuildUpsert {
                 name: "seed",
                 content_hash: "sha256:build",
+                cache_partition: pplx_space_node_runtime_core::catalog::template_cache_partition(
+                    execution.environment(),
+                ),
                 build_date: "2026-06-12T00:00:00Z",
                 manifest_json: &manifest_json,
                 runtime: "fc",
@@ -357,7 +380,13 @@ fn delete_build_removes_execution_component_rows() {
     conn.pragma_update(None, "foreign_keys", false).unwrap();
     upsert_test_build_with_execution(&conn, "base", "sha256:build");
 
-    delete_build(&conn, "base", "sha256:build").unwrap();
+    delete_build(
+        &conn,
+        "base",
+        "sha256:build",
+        crate::db::TemplateCachePartition::Legacy,
+    )
+    .unwrap();
 
     let component_count: u32 = conn
         .query_row(
@@ -726,6 +755,7 @@ fn ready_build(name: &str, content_hash: &str, size: u64) -> BuildUpsert<'static
     BuildUpsert {
         name: n,
         content_hash: h,
+        cache_partition: crate::db::TemplateCachePartition::Legacy,
         build_date: "2026-01-01T00:00:00Z",
         manifest_json: "{}",
         runtime: "fc",
@@ -735,17 +765,145 @@ fn ready_build(name: &str, content_hash: &str, size: u64) -> BuildUpsert<'static
     }
 }
 
+/// Repeated upserts under one key replace the row in place, in either
+/// partition: a build's size and components, a snapshot's hash and a tag's
+/// pin, with the eviction guard still holding a `deleting` build. The other
+/// partition's rows for the same name and digest stay as they were.
+#[rstest::rstest]
+#[case::legacy(crate::db::TemplateCachePartition::Legacy)]
+#[case::environment(crate::db::TemplateCachePartition::Environment(
+    pplx_space_common_core::types::EnvironmentReference::new(Digest::sha256([2; 32]))
+))]
+fn same_key_upserts_replace_in_place_in_each_partition(
+    #[case] partition: crate::db::TemplateCachePartition,
+) {
+    use crate::db::TemplateCachePartition;
+    let sibling = match partition {
+        TemplateCachePartition::Legacy => TemplateCachePartition::Environment(
+            pplx_space_common_core::types::EnvironmentReference::new(Digest::sha256([3; 32])),
+        ),
+        TemplateCachePartition::Environment(_) => TemplateCachePartition::Legacy,
+    };
+    let snapshot_key = |cache_partition| SnapshotKey {
+        name: "seed",
+        content_hash: "sha256:build",
+        cache_partition,
+        vcpu: 2,
+        memory_mib: 2048,
+    };
+    let conn = test_conn();
+    upsert_test_build_with_execution_in(&conn, "seed", "sha256:build", sibling);
+    upsert_snapshot(&conn, snapshot_key(sibling), "sha256:sibling").unwrap();
+    let build = |conn: &Connection, cache_partition: TemplateCachePartition| -> (u64, i64) {
+        let size = get_build(conn, "seed", "sha256:build", cache_partition)
+            .unwrap()
+            .unwrap()
+            .artifact_size_bytes;
+        let components = conn
+            .query_row(
+                "SELECT COUNT(*) FROM template_build_components
+                 WHERE name = 'seed' AND cache_partition = ?1",
+                [cache_partition.key()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        (size, components)
+    };
+    // The replacement drops the component; an environment partition's row
+    // still carries its binding.
+    let replacement_manifest = match partition {
+        TemplateCachePartition::Legacy => "{}".to_string(),
+        TemplateCachePartition::Environment(environment) => {
+            let mut manifest = TemplateManifest {
+                runtime: "fc".to_string(),
+                arch: "aarch64".to_string(),
+                ..Default::default()
+            };
+            manifest.set_execution_metadata(
+                ExecutionMetadata::initial_firecracker(Arch::Aarch64, vec![])
+                    .with_environment(environment),
+            );
+            serde_json::to_string(&manifest).unwrap()
+        }
+    };
+    let replace = |size| BuildUpsert {
+        cache_partition: partition,
+        manifest_json: &replacement_manifest,
+        ..ready_build("seed", "sha256:build", size)
+    };
+    let set_state = |conn: &Connection, state: &str| {
+        conn.execute(
+            "UPDATE template_builds SET state = ?1 WHERE name = 'seed' AND cache_partition = ?2",
+            [state, &partition.key()],
+        )
+        .unwrap();
+    };
+
+    upsert_test_build_with_execution_in(&conn, "seed", "sha256:build", partition);
+    assert_eq!(build(&conn, partition), (1, 1));
+    upsert_build(&conn, &replace(200)).unwrap();
+    assert_eq!(build(&conn, partition), (200, 0));
+    upsert_test_build_with_execution_in(&conn, "seed", "sha256:build", partition);
+    assert_eq!(build(&conn, partition), (1, 1));
+    set_state(&conn, "deleting");
+    upsert_build(&conn, &replace(300)).unwrap();
+    assert_eq!(build(&conn, partition), (1, 1));
+    set_state(&conn, "ready");
+    assert_eq!(build(&conn, sibling), (1, 1));
+
+    upsert_snapshot(&conn, snapshot_key(partition), "sha256:first").unwrap();
+    upsert_snapshot(&conn, snapshot_key(partition), "sha256:second").unwrap();
+    let snapshots = |conn: &Connection, cache_partition| {
+        list_snapshots(conn, "seed", "sha256:build", cache_partition)
+            .unwrap()
+            .into_iter()
+            .map(|snapshot| snapshot.snapshot_hash)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(snapshots(&conn, partition), ["sha256:second"]);
+    assert_eq!(snapshots(&conn, sibling), ["sha256:sibling"]);
+
+    let store = crate::pinned_digests::PinnedDigestsStore::new(std::sync::Arc::new(
+        std::sync::Mutex::new(conn),
+    ));
+    store
+        .upsert_tag("seed", "latest", sibling, "sha256:sibling")
+        .unwrap();
+    store
+        .upsert_tag("seed", "latest", partition, "sha256:first")
+        .unwrap();
+    store
+        .upsert_tag("seed", "latest", partition, "sha256:build")
+        .unwrap();
+    let conn = store.conn();
+    let conn = conn.lock().unwrap();
+    let pins = |cache_partition: TemplateCachePartition| -> Vec<String> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT content_hash FROM template_pinned_tags
+                 WHERE name = 'seed' AND tag = 'latest' AND cache_partition = ?1",
+            )
+            .unwrap();
+        stmt.query_map([cache_partition.key()], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    };
+    assert_eq!(pins(partition), ["sha256:build"]);
+    assert_eq!(pins(sibling), ["sha256:sibling"]);
+}
+
 /// Regression test: `upsert_build`'s ON CONFLICT path must NOT clobber
 /// a `state='deleting'` row back to `'ready'`. That window
 /// opens when eviction Phase 1 marks deleting, a concurrent
-/// on-demand pull races in (since `resolve_template` now
+/// on-demand pull races in (since `resolve_template_build` now
 /// returns NotFound and the `GetTemplate` handler falls
 /// through to a fresh pull), and the pull's final upsert
 /// would resurrect the doomed row. Eviction's Phase 3 then
 /// DELETEs it, and the on-disk state is indeterminate.
 ///
 /// With the WHERE guard, the upsert is a no-op when state is
-/// 'deleting'. The caller's `resolve_template` then still
+/// 'deleting'. The caller's `resolve_template_build` then still
 /// sees `state='deleting'` → NotFound, no resurrection.
 #[test]
 fn upsert_build_refuses_to_clobber_deleting_state() {
@@ -793,17 +951,17 @@ fn is_build_marked_deleting_matches_state() {
     let conn = test_conn();
     upsert_build(&conn, &ready_build("seed", "sha256:aa", 100)).unwrap();
 
-    assert!(!is_build_marked_deleting(&conn, "seed", "sha256:aa").unwrap());
+    assert!(!is_build_marked_deleting(&conn, "seed", "sha256:aa",).unwrap());
 
     conn.execute(
         "UPDATE template_builds SET state = 'deleting' WHERE name = ?1 AND content_hash = ?2",
         params!["seed", "sha256:aa"],
     )
     .unwrap();
-    assert!(is_build_marked_deleting(&conn, "seed", "sha256:aa").unwrap());
+    assert!(is_build_marked_deleting(&conn, "seed", "sha256:aa",).unwrap());
 
     // Missing row → false (not an error).
-    assert!(!is_build_marked_deleting(&conn, "seed", "sha256:does-not-exist").unwrap());
+    assert!(!is_build_marked_deleting(&conn, "seed", "sha256:does-not-exist",).unwrap());
 }
 
 /// `upsert_build` must seed `last_used_at = created_at` so a
@@ -848,7 +1006,13 @@ fn touch_build_updates_last_used_at() {
         .unwrap();
     assert_eq!(before, "1000");
 
-    touch_build(&conn, "seed", "sha256:aa").unwrap();
+    touch_build(
+        &conn,
+        "seed",
+        "sha256:aa",
+        crate::db::TemplateCachePartition::Legacy,
+    )
+    .unwrap();
 
     let after: String = conn
         .query_row(
@@ -872,7 +1036,13 @@ fn touch_build_updates_last_used_at() {
 fn touch_build_is_no_op_for_missing_row() {
     let conn = test_conn();
 
-    touch_build(&conn, "seed", "sha256:does-not-exist").unwrap();
+    touch_build(
+        &conn,
+        "seed",
+        "sha256:does-not-exist",
+        crate::db::TemplateCachePartition::Legacy,
+    )
+    .unwrap();
 }
 
 /// `list_eviction_candidates` returns timestamps as parsed u64
@@ -989,98 +1159,16 @@ fn list_template_snapshot_policies_only_returns_explicit_policy() {
     assert!(rows[0].base_snapshot_policy_set_at.is_some());
 }
 
-/// The cache-partition schema of the retired migration 20261026220935.
-const PARTITIONED_SCHEMA_SQL: &str = include_str!(
-    "../../../../../../../db/template-manager/history/20261026220935_template_cache_partitions.up.sql"
-);
-
-/// A migrator that bundles the partition migration can apply it under this
-/// release's serving pod, so each upsert inserts and updates on either schema.
-#[test]
-fn upserts_insert_and_update_on_the_bundled_and_partitioned_schemas() {
-    for partitioned in [false, true] {
-        let conn = test_conn();
-        if partitioned {
-            conn.execute_batch(PARTITIONED_SCHEMA_SQL).unwrap();
-        }
-        let build = |conn: &Connection| -> (u64, i64) {
-            let size = get_build(conn, "seed", "sha256:build")
-                .unwrap()
-                .unwrap()
-                .artifact_size_bytes;
-            let components = conn
-                .query_row(
-                    "SELECT COUNT(*) FROM template_build_components WHERE name = 'seed'",
-                    [],
-                    |row| row.get(0),
-                )
-                .unwrap();
-            (size, components)
-        };
-
-        upsert_test_build_with_execution(&conn, "seed", "sha256:build");
-        assert_eq!(build(&conn), (1, 1), "partitioned={partitioned}");
-        upsert_build(&conn, &ready_build("seed", "sha256:build", 200)).unwrap();
-        assert_eq!(build(&conn), (200, 0), "partitioned={partitioned}");
-        upsert_test_build_with_execution(&conn, "seed", "sha256:build");
-        assert_eq!(build(&conn), (1, 1), "partitioned={partitioned}");
-        // The eviction guard still applies to the conflicting row.
-        conn.execute(
-            "UPDATE template_builds SET state = 'deleting' WHERE name = 'seed'",
-            [],
-        )
-        .unwrap();
-        upsert_build(&conn, &ready_build("seed", "sha256:build", 300)).unwrap();
-        assert_eq!(build(&conn), (1, 1), "partitioned={partitioned}");
-        conn.execute(
-            "UPDATE template_builds SET state = 'ready' WHERE name = 'seed'",
-            [],
-        )
-        .unwrap();
-
-        upsert_snapshot(&conn, "seed", "sha256:build", 2, 2048, "sha256:first").unwrap();
-        upsert_snapshot(&conn, "seed", "sha256:build", 2, 2048, "sha256:second").unwrap();
-        assert_eq!(
-            list_snapshots(&conn, "seed", "sha256:build")
-                .unwrap()
-                .into_iter()
-                .map(|snapshot| snapshot.snapshot_hash)
-                .collect::<Vec<_>>(),
-            ["sha256:second"],
-            "partitioned={partitioned}"
-        );
-
-        let store = crate::pinned_digests::PinnedDigestsStore::new(std::sync::Arc::new(
-            std::sync::Mutex::new(conn),
-        ));
-        store.upsert_tag("seed", "latest", "sha256:first").unwrap();
-        store.upsert_tag("seed", "latest", "sha256:build").unwrap();
-        assert_eq!(
-            store.list_pinned_hashes_for_template("seed").unwrap(),
-            ["sha256:build"],
-            "partitioned={partitioned}"
-        );
-
-        if partitioned {
-            let conn = store.conn();
-            let conn = conn.lock().unwrap();
-            let partitions: i64 = conn
-                .query_row(
-                    "SELECT (SELECT COUNT(*) FROM template_builds WHERE cache_partition != '')
-                          + (SELECT COUNT(*) FROM template_build_components WHERE cache_partition != '')
-                          + (SELECT COUNT(*) FROM template_snapshots WHERE cache_partition != '')
-                          + (SELECT COUNT(*) FROM template_pinned_tags WHERE cache_partition != '')",
-                    [],
-                    |row| row.get(0),
-                )
-                .unwrap();
-            assert_eq!(partitions, 0, "every write lands in the legacy partition");
-        }
-    }
+/// The cache partition a manifest's binding files its build in.
+fn partition_of(manifest_json: &str) -> TemplateCachePartition {
+    let manifest: TemplateManifest = serde_json::from_str(manifest_json).unwrap();
+    pplx_space_node_runtime_core::catalog::template_cache_partition(manifest.environment().unwrap())
 }
 
 /// A refill preserves Firecracker preference for mixed-runtime templates,
 /// otherwise uses a pool-capable runtime, and records only the selected build.
+/// Environment-bound Cloud Hypervisor builds sit in their environment's cache
+/// partition and still fill pools.
 #[test]
 fn pool_refills_prefer_firecracker_and_admit_cloud_hypervisor() {
     let conn = test_conn();
@@ -1138,6 +1226,7 @@ fn pool_refills_prefer_firecracker_and_admit_cloud_hypervisor() {
         upsert_build(
             &conn,
             &BuildUpsert {
+                cache_partition: partition_of(&manifest_json),
                 manifest_json: &manifest_json,
                 runtime: "ch",
                 arch: "x86_64",
@@ -1170,6 +1259,7 @@ fn pool_refills_prefer_firecracker_and_admit_cloud_hypervisor() {
         upsert_build(
             &conn,
             &BuildUpsert {
+                cache_partition: partition_of(manifest_json),
                 build_date,
                 runtime,
                 manifest_json,
@@ -1206,13 +1296,11 @@ fn pool_refills_prefer_firecracker_and_admit_cloud_hypervisor() {
         cloud_hypervisor,
         &ch_manifest,
     );
-    assert_eq!(
-        crate::pool_manager::pool_refill_build(&conn, "seed")
-            .unwrap()
-            .unwrap()
-            .content_hash,
-        "sha256:ch"
-    );
+    let ch = crate::pool_manager::pool_refill_build(&conn, "seed")
+        .unwrap()
+        .unwrap();
+    assert_eq!(ch.content_hash, "sha256:ch");
+    assert_ne!(ch.cache_partition, TemplateCachePartition::Legacy);
     set_last_used_at_for_test(&conn, "seed", "sha256:ch", 0).unwrap();
     upsert("sha256:old", "2026-01-01T00:00:00Z", "fc", "{}");
     upsert("sha256:new", "2026-02-01T00:00:00Z", "fc", "{}");
@@ -1233,28 +1321,4 @@ fn pool_refills_prefer_firecracker_and_admit_cloud_hypervisor() {
     assert_ne!(last_used("sha256:new"), "0");
     assert_eq!(last_used("sha256:old"), "0");
     assert_eq!(last_used("sha256:ch"), "0");
-}
-
-/// Builds with the same date resolve to the larger digest, and a row that
-/// can't be decoded is an error, not a missing build.
-#[test]
-fn latest_build_breaks_date_ties_by_digest_and_reports_bad_rows() {
-    let conn = test_conn();
-    for content_hash in ["sha256:aa", "sha256:bb"] {
-        upsert_build(&conn, &ready_build("seed", content_hash, 1)).unwrap();
-    }
-    assert_eq!(
-        get_latest_build(&conn, "seed")
-            .unwrap()
-            .unwrap()
-            .content_hash,
-        "sha256:bb"
-    );
-
-    conn.execute(
-        "UPDATE template_builds SET artifact_size_bytes = -1 WHERE content_hash = 'sha256:bb'",
-        [],
-    )
-    .unwrap();
-    assert!(get_latest_build(&conn, "seed").is_err());
 }
