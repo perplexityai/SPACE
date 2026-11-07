@@ -510,7 +510,16 @@ impl SandboxManagerService {
             SpacedRpc::WaitReady,
             &peer,
         )?;
-        let sandbox = self.lookup_started_sandbox(&req.sandbox_id)?;
+        let timeout = proto_duration_to_std(req.timeout)
+            .unwrap_or_else(|| Duration::from_secs(DEFAULT_BLOCKING_READY_TIMEOUT_SECS as u64));
+        let started_at = tokio::time::Instant::now();
+        // A sandbox still being created or started is waited for, for up to
+        // half the timeout: the caller learns it is ready when it is, rather
+        // than on its next poll, and a start that takes longer is still
+        // refused in time for the caller to try again.
+        let sandbox = self
+            .lookup_started_sandbox_after_start(&req.sandbox_id, started_at + timeout / 2)
+            .await?;
         if let Some(route_auth) = &route_auth {
             route_auth.authorize_sandbox(&sandbox)?;
         }
@@ -519,12 +528,12 @@ impl SandboxManagerService {
         } else {
             SpacedEndpointProofPolicy::Required
         };
-        let timeout = proto_duration_to_std(req.timeout)
-            .unwrap_or_else(|| Duration::from_secs(DEFAULT_BLOCKING_READY_TIMEOUT_SECS as u64));
         let client = self
             .connect_spaced_host_with_policy(&sandbox, endpoint_proof_policy)
             .await?;
-        let response = client.wait_ready(timeout).await?;
+        let response = client
+            .wait_ready(timeout.saturating_sub(started_at.elapsed()))
+            .await?;
         Ok(Response::new(SpacedWaitReadyResponse {
             guest_uptime: response.guest_uptime,
         }))

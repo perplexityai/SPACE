@@ -101,7 +101,7 @@ The separate command-stream path is **Application → Data plane ↔ Guest proce
 - **Execute:** The API creates a command session. The client attaches to the returned events endpoint, starting the guest process and receiving output.
 - **Finish:** The client checks the process exit result, then keeps the sandbox for another command or deletes it. A completed command does not itself delete the sandbox.
 
-An operation's `state` describes the lifecycle request; the sandbox's `state` describes the environment. Neither is the exit status of a command.
+An operation's `state` describes the lifecycle request; the sandbox's `state` describes the environment. Neither is the exit status of a command. A create, or a wake or start that leaves the sandbox `running`, succeeds once the sandbox's guest agent answers, so a command or file call sent after it does not wait for the guest to boot. On Kubernetes, a create whose guest does not answer within its readiness budget can still succeed with the sandbox `running`; the first call then waits for the guest.
 
 Native create, pause, suspend, wake, and delete operations have a 30-minute deadline from when they were requested. One that has started and is still retrying when it passes fails with `operation_failed` and the reason `operation_deadline_exceeded`. A create, pause, suspend, or wake that has not started by then, because it waited behind earlier work on its sandbox, for a free execution slot, or for the cluster controller to come back, ends `expired` with the same code and reason instead of starting late. Inspect the sandbox before requesting it again. A delete still runs however late it starts: expiring it would leave running a sandbox its owner asked to remove.
 

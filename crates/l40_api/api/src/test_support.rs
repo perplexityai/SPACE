@@ -15,7 +15,12 @@ const SIM_WORKER_CONTROL_TOKEN: &str = "sim-worker-test-control-token";
 
 /// Enter before awaiting fixtures: authenticated clients need process credentials.
 pub(crate) fn enter_sim_worker_process() -> bool {
-    enter_sim_worker_process_with_token_paths(None, None)
+    enter_sim_worker_process_with_token_paths(None, None, &[])
+}
+
+/// [`enter_sim_worker_process`], with `extra` set in the child as well.
+pub(crate) fn enter_sim_worker_process_with(extra: &[(&str, Option<&std::ffi::OsStr>)]) -> bool {
+    enter_sim_worker_process_with_token_paths(None, None, extra)
 }
 
 /// [`enter_sim_worker_process`], but the node-api token paths name files this
@@ -35,14 +40,16 @@ pub(crate) fn enter_sim_worker_process_with_owned_token_files() -> bool {
     enter_sim_worker_process_with_token_paths(
         Some(node_api.as_os_str()),
         Some(node_api_internal.as_os_str()),
+        &[],
     )
 }
 
 fn enter_sim_worker_process_with_token_paths(
     node_api: Option<&std::ffi::OsStr>,
     node_api_internal: Option<&std::ffi::OsStr>,
+    extra: &[(&str, Option<&std::ffi::OsStr>)],
 ) -> bool {
-    pplx_space_test_env::enter_test_process(&[
+    let mut vars = vec![
         (
             "SPACE_INTERNAL_RPC_INSECURE_DEV",
             Some(std::ffi::OsStr::new("true")),
@@ -57,7 +64,9 @@ fn enter_sim_worker_process_with_token_paths(
         ),
         (SPACE_NODE_API_TOKEN_PATH_ENV, node_api),
         (SPACE_NODE_API_INTERNAL_TOKEN_PATH_ENV, node_api_internal),
-    ])
+    ];
+    vars.extend_from_slice(extra);
+    pplx_space_test_env::enter_test_process(&vars)
 }
 
 /// A Direct substrate over the test database; it needs no apiserver.

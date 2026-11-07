@@ -3028,10 +3028,9 @@ async fn two_call_direct_create_boots_a_custom_shape_on_the_worker() -> TestResu
         return Ok(());
     };
     // The shape the native create operation sends (`controller_create_request`):
-    // no boot mode and no readiness wait, so the create and start are two calls.
+    // no boot mode and a custom shape, so the create and start are two calls.
     let mut request = one_shot_create_request()?;
     request.boot_mode = None;
-    request.wait_until_ready = false;
     request.vcpu = Some(4);
     request.memory_mib = Some(2048);
 
