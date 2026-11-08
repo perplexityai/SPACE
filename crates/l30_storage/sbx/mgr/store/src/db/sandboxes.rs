@@ -21,13 +21,17 @@ pub struct RawSandboxLifecycle {
 db_private_outside_tests! {
     fn raw_sandbox_lifecycle(conn: &Connection, id: &str) -> Result<Option<RawSandboxLifecycle>> {
         conn.query_row(
-            "SELECT legacy_state, state_changed_at, cleanup_completion, state
+            "SELECT state, state_changed_at, cleanup_completion, cleanup_state
              FROM sandboxes WHERE id = ?1",
             [id],
             |row| {
+                let lifecycle: String = row.get(0)?;
                 Ok(RawSandboxLifecycle {
-                    state: row.get(0)?,
-                    lifecycle: row.get(3)?,
+                    state: SandboxState::label_from_columns(
+                        lifecycle.clone(),
+                        row.get::<_, Option<String>>(3)?.as_deref(),
+                    ),
+                    lifecycle,
                     state_changed_at: timestamps::diagnostic_column(row, 1)?,
                     cleanup_completion: row
                         .get::<_, Option<String>>(2)
@@ -139,21 +143,24 @@ db_private_outside_tests! {
             },
         )?;
         let mut statement = conn.prepare(sql!(
-            "SELECT legacy_state, runtime,
+            "SELECT state, runtime,
                     sandbox_execution_runtime(execution_metadata_json) AS execution_runtime,
-                    COUNT(*)
+                    COUNT(*), cleanup_state
              FROM sandboxes
-             GROUP BY legacy_state, runtime, execution_runtime"
+             GROUP BY state, cleanup_state, runtime, execution_runtime"
         ))?;
         let rows = statement.query_map([], |row| {
             let state_label: String = row.get(0)?;
-            let state = state_label.parse::<SandboxState>().map_err(|_| {
-                rusqlite::Error::FromSqlConversionFailure(
-                    0,
-                    Type::Text,
-                    format!("unknown sandbox state '{state_label}'").into(),
-                )
-            })?;
+            let cleanup_label: Option<String> = row.get(4)?;
+            let state = SandboxState::from_columns(&state_label, cleanup_label.as_deref())
+                .ok_or_else(|| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        Type::Text,
+                        format!("unknown sandbox state '{state_label}', cleanup {cleanup_label:?}")
+                            .into(),
+                    )
+                })?;
             let runtime_label: String = row.get(1)?;
             let execution_runtime: Option<String> = row.get(2)?;
             let identity = execution_runtime
@@ -243,9 +250,14 @@ db_private_outside_tests! {
 db_private_outside_tests! {
     fn current_state_label(conn: &Connection, id: &str) -> Result<Option<String>> {
         conn.query_row(
-            "SELECT legacy_state FROM sandboxes WHERE id = ?1",
+            "SELECT state, cleanup_state FROM sandboxes WHERE id = ?1",
             params![id],
-            |row| row.get(0),
+            |row| {
+                Ok(SandboxState::label_from_columns(
+                    row.get(0)?,
+                    row.get::<_, Option<String>>(1)?.as_deref(),
+                ))
+            },
         )
         .optional()
     }
@@ -1051,7 +1063,8 @@ pub(super) fn update_runtime_fields_with_activation_owner(
            AND (
                (
                    ?19 IS NULL
-                   AND legacy_state NOT IN ('deleting', 'cleanup_failed')
+                   AND unowned_state IS NOT 'deleting'
+                   AND cleanup_state IS NOT 'failed'
                    AND cleanup_completion IS NULL
                    AND cleanup_keep_filesystem IS NULL
                    AND NOT EXISTS (
@@ -1065,7 +1078,7 @@ pub(super) fn update_runtime_fields_with_activation_owner(
                     WHERE episode.sandbox_id = ?18
                       AND episode.cleanup_id = ?19
                       AND episode.phase = 'armed'
-                      AND episode.activation_state = sandboxes.legacy_state
+                      AND episode.activation_state = sandboxes.unowned_state
                       AND episode.completion = sandboxes.cleanup_completion
                       AND episode.keep_filesystem = sandboxes.cleanup_keep_filesystem
                )
@@ -1324,7 +1337,7 @@ db_private_outside_tests! {
 }
 
 pub(super) const GET_SANDBOX_SQL: &str =
-        "SELECT id, uuid8, state, legacy_state, template, template_hash, user, runtime, uid, slot, guest_cid, pid,
+        "SELECT id, uuid8, state, cleanup_state, template, template_hash, user, runtime, uid, slot, guest_cid, pid,
          spaced_host_pid, netgtw_pid, vsock_uds_path, api_socket_path, created_at, updated_at, snapshots_enabled, rootfs_size_mb, pool_template, guest_uptime_secs, process_env_json, auto_lifecycle_json, auto_lifecycle_state_json, next_auto_event_at, failure_reason, cleanup_completion, cleanup_keep_filesystem, network_policy_override_json, network_tx_bytes, network_rx_bytes, network_policy_generation, applied_network_policy_generation, applied_network_policy_source, network_policy_authority, auto_lifecycle_authority, current_local_artifact_id, current_local_artifact_kind, current_local_artifact_origin, execution_metadata_json, volume_encryption, space_api_route_generation, space_api_route_node_id, space_api_route_execution_generation, space_api_route_pod_uid, restore_origin, restore_phase, restore_storage_uri, space_api_route_substrate_kind, space_api_route_activation_attempt_id, spaced_endpoint_proof_json, disk_io_max_operations_per_sec, disk_io_max_bandwidth_mib_per_sec, node_execution_id, guest_image_contract_json
          FROM sandboxes WHERE id = ?1";
 
@@ -1360,7 +1373,7 @@ db_private_outside_tests! {
 }
 
 const LIST_SANDBOXES_SQL: &str =
-    "SELECT id, uuid8, state, legacy_state, template, template_hash, user, runtime, uid, slot, guest_cid, pid,
+    "SELECT id, uuid8, state, cleanup_state, template, template_hash, user, runtime, uid, slot, guest_cid, pid,
          spaced_host_pid, netgtw_pid, vsock_uds_path, api_socket_path, created_at, updated_at, snapshots_enabled, rootfs_size_mb, pool_template, guest_uptime_secs, process_env_json, auto_lifecycle_json, auto_lifecycle_state_json, next_auto_event_at, failure_reason, cleanup_completion, cleanup_keep_filesystem, network_policy_override_json, network_tx_bytes, network_rx_bytes, network_policy_generation, applied_network_policy_generation, applied_network_policy_source, network_policy_authority, auto_lifecycle_authority, current_local_artifact_id, current_local_artifact_kind, current_local_artifact_origin, execution_metadata_json, volume_encryption, space_api_route_generation, space_api_route_node_id, space_api_route_execution_generation, space_api_route_pod_uid, restore_origin, restore_phase, restore_storage_uri, space_api_route_substrate_kind, space_api_route_activation_attempt_id, spaced_endpoint_proof_json, disk_io_max_operations_per_sec, disk_io_max_bandwidth_mib_per_sec, node_execution_id, guest_image_contract_json
          FROM sandboxes ORDER BY created_at";
 
@@ -1450,7 +1463,7 @@ db_private_outside_tests! {
             return Ok(Vec::new());
         };
         let mut statement = conn.prepare(sql!(
-            "SELECT rowid, id, legacy_state, current_local_artifact_id FROM sandboxes
+            "SELECT rowid, id, state, current_local_artifact_id, cleanup_state FROM sandboxes
          WHERE rowid >= ?1 AND rowid <= ?2 ORDER BY rowid LIMIT 128"
         ))?;
         let mut rows = statement.query([scan.next, through])?;
@@ -1467,9 +1480,15 @@ db_private_outside_tests! {
                 // The upper witness is greater, so this cannot overflow.
                 scan.next = rowid + 1;
             }
-            let (id, state) = match (row.get::<_, String>(1), row.get::<_, String>(2)) {
-                (Ok(id), Ok(state)) => (id, state),
-                (Err(error), _) | (_, Err(error)) => {
+            let (id, state) = match (
+                row.get::<_, String>(1),
+                row.get::<_, String>(2),
+                row.get::<_, Option<String>>(4),
+            ) {
+                (Ok(id), Ok(state), Ok(cleanup)) => {
+                    (id, SandboxState::label_from_columns(state, cleanup.as_deref()))
+                }
+                (Err(error), _, _) | (_, Err(error), _) | (_, _, Err(error)) => {
                     tracing::warn!(
                         rowid,
                         error = %describe_raw_error(&error),
@@ -1523,12 +1542,12 @@ db_private_outside_tests! {
         uid: u32,
     ) -> Result<Vec<SandboxRow>> {
         let mut stmt = conn.prepare(
-            "SELECT id, uuid8, state, legacy_state, template, template_hash, user, runtime, uid, slot, guest_cid, pid,
+            "SELECT id, uuid8, state, cleanup_state, template, template_hash, user, runtime, uid, slot, guest_cid, pid,
          spaced_host_pid, netgtw_pid, vsock_uds_path, api_socket_path, created_at, updated_at, snapshots_enabled, rootfs_size_mb, pool_template, guest_uptime_secs, process_env_json, auto_lifecycle_json, auto_lifecycle_state_json, next_auto_event_at, failure_reason, cleanup_completion, cleanup_keep_filesystem, network_policy_override_json, network_tx_bytes, network_rx_bytes, network_policy_generation, applied_network_policy_generation, applied_network_policy_source, network_policy_authority, auto_lifecycle_authority, current_local_artifact_id, current_local_artifact_kind, current_local_artifact_origin, execution_metadata_json, volume_encryption, space_api_route_generation, space_api_route_node_id, space_api_route_execution_generation, space_api_route_pod_uid, restore_origin, restore_phase, restore_storage_uri, space_api_route_substrate_kind, space_api_route_activation_attempt_id, spaced_endpoint_proof_json, disk_io_max_operations_per_sec, disk_io_max_bandwidth_mib_per_sec, node_execution_id, guest_image_contract_json
          FROM sandboxes
          WHERE netgtw_pid = ?1 AND uid = ?2
-           AND legacy_state IN ('starting', 'started', 'stopping', 'pausing', 'paused',
-                                'resuming', 'checkpointing', 'suspending', 'restoring')
+           AND unowned_state IN ('starting', 'started', 'stopping', 'pausing', 'paused',
+                                 'resuming', 'checkpointing', 'suspending', 'restoring')
          LIMIT 2",
         )?;
         let rows = stmt.query_map(params![netgtw_pid, uid], row_to_sandbox)?;

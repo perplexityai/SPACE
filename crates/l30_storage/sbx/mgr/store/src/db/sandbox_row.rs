@@ -18,7 +18,7 @@ use rusqlite::types::Type;
 use super::{CleanupCompletion, NetworkPolicyAppliedSource, parse_policy_authority};
 use crate::endpoint_proof::SpacedEndpointProof;
 use crate::restore_operation::RestoreOperation;
-use crate::state::SandboxState;
+use crate::state::{CleanupState, SandboxState};
 
 #[derive(Clone)]
 pub struct SandboxRow {
@@ -128,20 +128,30 @@ pub(super) fn row_to_list_sandbox(row: &rusqlite::Row) -> rusqlite::Result<Sandb
     })
 }
 
-/// The row's combined status, which a row select reads as `legacy_state`.
-fn state_column(row: &rusqlite::Row<'_>) -> rusqlite::Result<SandboxState> {
-    let state_str: String = row.get("legacy_state")?;
-    state_str.parse::<SandboxState>().map_err(|_| {
-        column_error(
-            row,
-            "legacy_state",
-            Type::Text,
-            Box::new(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("unknown sandbox state {state_str:?}"),
-            )),
-        )
-    })
+/// The row's combined status, from the `state` and `cleanup_state` a row
+/// select reads.
+pub(super) fn state_column(row: &rusqlite::Row<'_>) -> rusqlite::Result<SandboxState> {
+    Ok(lifecycle_column(row)?.with_cleanup(cleanup_state_column(row)?))
+}
+
+/// The cleanup that owns the row, which a row select reads as
+/// `cleanup_state`.
+fn cleanup_state_column(row: &rusqlite::Row<'_>) -> rusqlite::Result<Option<CleanupState>> {
+    row.get::<_, Option<String>>("cleanup_state")?
+        .map(|value| {
+            CleanupState::from_column(&value).ok_or_else(|| {
+                column_error(
+                    row,
+                    "cleanup_state",
+                    Type::Text,
+                    Box::new(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("unknown sandbox cleanup state {value:?}"),
+                    )),
+                )
+            })
+        })
+        .transpose()
 }
 
 /// The row's stored lifecycle, which a row select reads as `state`.

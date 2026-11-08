@@ -1,14 +1,19 @@
 //! Cleanup ownership is stored apart from the lifecycle: `state` keeps the
 //! lifecycle and `cleanup_state` the cleanup that owns the row. These pin the
 //! stored columns the cleanup writers leave; the other suites pin the combined
-//! status, which every read decodes from `legacy_state`.
+//! status every read decodes from the two.
 
 use super::*;
 
-/// `(state, cleanup_state, legacy_state)` as stored.
+/// `(state, cleanup_state)` as stored, and the combined status they decode to.
 fn stored(conn: &Connection, id: &str) -> (String, Option<String>, String) {
     conn.query_row(
-        "SELECT state, cleanup_state, legacy_state FROM sandboxes WHERE id = ?1",
+        &format!(
+            "SELECT state, cleanup_state,
+                {}
+           FROM sandboxes WHERE id = ?1",
+            crate::db::fixture::STATUS_LABEL_SQL
+        ),
         params![id],
         |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
     )
@@ -179,6 +184,13 @@ const MIGRATION_UP: &str = include_str!(
 const MIGRATION_DOWN: &str = include_str!(
     "../../../../../../../../db/sandbox-manager/20261105142930_sandbox_cleanup_state.down.sql"
 );
+/// The migration after it adds `unowned_state`, which reads `cleanup_state`.
+const UNOWNED_UP: &str = include_str!(
+    "../../../../../../../../db/sandbox-manager/20261108130000_sandbox_unowned_state.up.sql"
+);
+const UNOWNED_DOWN: &str = include_str!(
+    "../../../../../../../../db/sandbox-manager/20261108130000_sandbox_unowned_state.down.sql"
+);
 
 /// Insert a row in the split form, keeping the filesystem for every
 /// completion that keeps the row.
@@ -269,6 +281,36 @@ fn the_cleanup_triggers_admit_only_a_teardown_transition_its_intent_allows() {
     assert_eq!(stored(&conn, "update").0, "deleting");
 }
 
+/// `unowned_state` is the lifecycle while no cleanup owns the row and NULL
+/// while one does, so a predicate on it never matches a cleanup.
+#[test]
+fn unowned_state_is_the_lifecycle_only_while_no_cleanup_owns_the_row() {
+    let conn = test_conn();
+    for (id, state, cleanup_state, completion, expected) in [
+        ("a", "stopping", None, None, Some("stopping")),
+        ("b", "stopping", Some("required"), None, None),
+        ("c", "deleting", Some("failed"), Some("delete_row"), None),
+        (
+            "d",
+            "suspending",
+            Some("required"),
+            Some("mark_suspended"),
+            None,
+        ),
+        ("e", "started", None, None, Some("started")),
+    ] {
+        insert_split(&conn, id, state, cleanup_state, completion).unwrap();
+        let unowned: Option<String> = conn
+            .query_row(
+                "SELECT unowned_state FROM sandboxes WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(unowned.as_deref(), expected, "{id}");
+    }
+}
+
 #[test]
 fn the_migration_round_trips_every_cleanup_shape_and_keeps_historical_labels() {
     let conn = test_conn();
@@ -300,6 +342,7 @@ fn the_migration_round_trips_every_cleanup_shape_and_keeps_historical_labels() {
             .collect()
     };
 
+    conn.execute_batch(UNOWNED_DOWN).unwrap();
     conn.execute_batch(MIGRATION_DOWN).unwrap();
     assert_eq!(
         labels(&conn),
@@ -315,6 +358,7 @@ fn the_migration_round_trips_every_cleanup_shape_and_keeps_historical_labels() {
     );
 
     conn.execute_batch(MIGRATION_UP).unwrap();
+    conn.execute_batch(UNOWNED_UP).unwrap();
     // A migration can't tell a handed-off suspend from a restore rollback, so
     // `c` comes back `stopping`; its combined status is unchanged.
     for (id, expected) in [

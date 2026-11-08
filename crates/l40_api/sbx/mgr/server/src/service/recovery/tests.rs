@@ -1751,7 +1751,10 @@ async fn a_validated_artifact_is_adopted_into_durable_cleanup() {
         let db = service.db.lock().unwrap();
         let state: String = db
             .query_row(
-                "SELECT legacy_state FROM sandboxes WHERE id = ?1",
+                &format!(
+                    "SELECT {} FROM sandboxes WHERE id = ?1",
+                    crate::db::fixture::STATUS_LABEL_SQL
+                ),
                 crate::db::fixture::params![sandbox_id.to_string()],
                 |row| row.get(0),
             )
@@ -2505,7 +2508,10 @@ async fn no_interleaving_in_any_named_window_lets_the_pass_write_under_a_moved_f
                 let db = service.db.lock().expect("mutex poisoned");
                 let state: String = db
                     .query_row(
-                        "SELECT legacy_state FROM sandboxes WHERE id = ?1",
+                        &format!(
+                            "SELECT {} FROM sandboxes WHERE id = ?1",
+                            crate::db::fixture::STATUS_LABEL_SQL
+                        ),
                         crate::db::fixture::params![sandbox_id.to_string()],
                         |row| row.get(0),
                     )
@@ -2660,8 +2666,11 @@ struct SandboxSideRow {
 
 fn sandbox_side_row(conn: &crate::db::Connection, sandbox_id: SandboxId) -> Option<SandboxSideRow> {
     conn.query_row(
-        "SELECT legacy_state, space_api_route_execution_generation, failure_reason
+        &format!(
+            "SELECT {}, space_api_route_execution_generation, failure_reason
            FROM sandboxes WHERE id = ?1",
+            crate::db::fixture::STATUS_LABEL_SQL
+        ),
         crate::db::fixture::params![sandbox_id.to_string()],
         |row| {
             Ok(SandboxSideRow {
@@ -2712,7 +2721,10 @@ async fn the_interleaving_matrix_fixture_adopts_when_nobody_interferes() {
     let db = service.db.lock().expect("mutex poisoned");
     let state: String = db
         .query_row(
-            "SELECT legacy_state FROM sandboxes WHERE id = ?1",
+            &format!(
+                "SELECT {} FROM sandboxes WHERE id = ?1",
+                crate::db::fixture::STATUS_LABEL_SQL
+            ),
             crate::db::fixture::params![sandbox_id.to_string()],
             |row| row.get(0),
         )
@@ -3149,7 +3161,10 @@ async fn two_actors_in_two_windows_still_leave_every_fenced_write_missing() {
             );
             let state: String = db
                 .query_row(
-                    "SELECT legacy_state FROM sandboxes WHERE id = ?1",
+                    &format!(
+                        "SELECT {} FROM sandboxes WHERE id = ?1",
+                        crate::db::fixture::STATUS_LABEL_SQL
+                    ),
                     crate::db::fixture::params![sandbox_id.to_string()],
                     |row| row.get(0),
                 )

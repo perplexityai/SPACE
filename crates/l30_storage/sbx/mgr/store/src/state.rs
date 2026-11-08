@@ -3,7 +3,7 @@ use std::fmt;
 /// A sandbox row's combined status: its lifecycle, or `CleanupRequired` /
 /// `CleanupFailed` while a cleanup owns it. The row stores the two apart, the
 /// lifecycle in `sandboxes.state` and cleanup ownership in `cleanup_state`;
-/// reads decode this status from the generated `legacy_state`.
+/// reads decode this status from both ([`SandboxState::with_cleanup`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SandboxState {
     Creating,
@@ -47,6 +47,15 @@ impl CleanupState {
         match self {
             Self::Required => SandboxState::CleanupRequired,
             Self::Failed => SandboxState::CleanupFailed,
+        }
+    }
+
+    /// The cleanup a `sandboxes.cleanup_state` value names.
+    pub(crate) fn from_column(value: &str) -> Option<Self> {
+        match value {
+            "required" => Some(Self::Required),
+            "failed" => Some(Self::Failed),
+            _ => None,
         }
     }
 }
@@ -376,9 +385,33 @@ impl SandboxState {
         }
     }
 
+    /// The combined status of a row that stores this lifecycle in `state` and
+    /// `cleanup` in `cleanup_state`.
+    pub(crate) fn with_cleanup(self, cleanup: Option<CleanupState>) -> Self {
+        cleanup.map_or(self, CleanupState::legacy_status)
+    }
+
+    /// The combined status label of a row whose `state` and `cleanup_state`
+    /// hold these values, keeping `state`'s text when the two name no status,
+    /// so a diagnostic still shows what the row holds.
+    pub(crate) fn label_from_columns(state: String, cleanup_state: Option<&str>) -> String {
+        Self::from_columns(&state, cleanup_state).map_or(state, |status| status.as_str().to_owned())
+    }
+
+    /// The combined status of a row whose `state` and `cleanup_state` hold
+    /// these values, or `None` when either names nothing.
+    pub(crate) fn from_columns(state: &str, cleanup_state: Option<&str>) -> Option<Self> {
+        let lifecycle = state.parse::<Self>().ok()?;
+        match cleanup_state {
+            None => Some(lifecycle),
+            Some(value) => CleanupState::from_column(value)
+                .map(|cleanup| lifecycle.with_cleanup(Some(cleanup))),
+        }
+    }
+
     /// The `sandboxes.cleanup_state` this status is stored with. A row stores
     /// its lifecycle in `state` and, apart from it, whether a cleanup owns the
-    /// row; `legacy_state` rebuilds this combined status from the two.
+    /// row.
     pub(crate) fn cleanup_label(self) -> Option<&'static str> {
         match self {
             Self::CleanupRequired => Some("required"),

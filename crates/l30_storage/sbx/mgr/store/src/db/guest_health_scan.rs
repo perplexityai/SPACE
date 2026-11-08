@@ -22,16 +22,23 @@ struct SandboxStateParseError {
 
 db_private_outside_tests! {
     fn list_guest_health_rows(conn: &Connection) -> Result<Vec<SandboxGuestHealthRow>> {
-        let mut stmt = conn.prepare(sql!("SELECT id, legacy_state, template_hash FROM sandboxes"))?;
+        let mut stmt = conn.prepare(sql!(
+            "SELECT id, state, template_hash, cleanup_state FROM sandboxes"
+        ))?;
         let rows = stmt.query_map([], |row| {
             let state_value = row.get::<_, String>(1)?;
-            let state = state_value
-                .parse::<crate::state::SandboxState>()
-                .map_err(|_| {
+            let cleanup_value = row.get::<_, Option<String>>(3)?;
+            let state = crate::state::SandboxState::from_columns(&state_value, cleanup_value.as_deref())
+                .ok_or_else(|| {
                     rusqlite::Error::FromSqlConversionFailure(
                         1,
                         Type::Text,
-                        Box::new(SandboxStateParseError { value: state_value }),
+                        Box::new(SandboxStateParseError {
+                            value: crate::state::SandboxState::label_from_columns(
+                                state_value,
+                                cleanup_value.as_deref(),
+                            ),
+                        }),
                     )
                 })?;
             Ok(SandboxGuestHealthRow {
@@ -55,12 +62,18 @@ db_private_outside_tests! {
         conn: &Connection,
         sandbox_ids: &'a [String],
     ) -> Result<Vec<(&'a String, StateLabelRead)>> {
-        let mut statement = conn.prepare("SELECT legacy_state FROM sandboxes WHERE id = ?1")?;
+        let mut statement =
+            conn.prepare("SELECT state, cleanup_state FROM sandboxes WHERE id = ?1")?;
         Ok(sandbox_ids
             .iter()
             .map(|sandbox_id| {
                 let label = statement
-                    .query_row([sandbox_id], |row| row.get::<_, String>(0))
+                    .query_row([sandbox_id], |row| {
+                        Ok(crate::state::SandboxState::label_from_columns(
+                            row.get(0)?,
+                            row.get::<_, Option<String>>(1)?.as_deref(),
+                        ))
+                    })
                     .optional()
                     .map_err(Error::from);
                 (sandbox_id, label)

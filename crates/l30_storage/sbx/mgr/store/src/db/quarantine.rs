@@ -725,7 +725,7 @@ db_private_outside_tests! {
         sandbox_ids: &[String],
     ) -> Result<BTreeMap<String, RawSandboxStatePublicationMetadataRead>> {
         let mut statement = conn.prepare_cached(
-            "SELECT s.id, s.legacy_state, qs.reason_code,
+            "SELECT s.id, s.state, qs.reason_code,
                 s.transition_receipt_id,
                 s.transition_receipt_kind,
                 s.transition_receipt_target_state,
@@ -842,9 +842,12 @@ fn mark_quarantined_inner(
              transition_receipt_execution_generation = NULL,
              transition_receipt_activation_attempt_id = NULL,
              transition_receipt_reason_code = NULL,
-             state_changed_at = CASE WHEN legacy_state != 'quarantined' THEN ?2 ELSE state_changed_at END,
+             state_changed_at = CASE WHEN state != 'quarantined' THEN ?2 ELSE state_changed_at END,
              updated_at = ?2
-         WHERE id = ?3 AND (?4 IS NULL OR legacy_state = ?4)",
+         WHERE id = ?3
+           AND (?4 IS NULL
+                OR unowned_state = ?4
+                OR ?4 = 'cleanup_' || cleanup_state)",
         params![reason_message, ts, id, previous_state.as_deref()],
     )?;
     if changed == 0 {

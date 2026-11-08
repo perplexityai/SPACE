@@ -90,7 +90,7 @@ impl PeriodicQuarantineRecoveryScan {
             return Ok(batch);
         };
         let mut statement = conn.prepare_cached(
-            "SELECT s.id, qs.quarantine_id, qs.entered_at, s.legacy_state, qs.reason_code,
+            "SELECT s.id, qs.quarantine_id, qs.entered_at, s.state, qs.reason_code,
                     s.current_local_artifact_id, s.current_local_artifact_kind,
                     s.current_local_artifact_origin, qs.attempt_count,
                     qs.next_action_after, qs.claim_token, qs.claim_expires_at,

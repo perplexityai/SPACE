@@ -41,7 +41,7 @@ pub struct DueAutoLifecycleSandbox {
 /// applies the same rule in Rust inside `eligible`
 /// (`state == SandboxState::Deleting`); the two lane tests in
 /// `cleanup_discovery_tests` hold the two encodings to the same answer.
-const AUTO_LIFECYCLE_NEVER_ACTIONABLE_STATES_SQL: &str = "('deleting')";
+const AUTO_LIFECYCLE_NEVER_ACTIONABLE_STATES_SQL: &str = "(unowned_state IS 'deleting')";
 
 /// Push a row's scan deadline out without touching anything else, so a row
 /// whose due stage cannot act right now (mid-transition; see
@@ -134,13 +134,13 @@ db_private_outside_tests! {
             // A state that does not decode is skipped like a malformed id above;
             // a statement-level failure propagates. An unknown-but-decodable
             // state string is left to the transition's own lookup error.
-            let state = match row.get::<_, String>(3) {
-                Ok(state) => state,
-                Err(error) if is_row_decode_error(&error) => {
+            let state = match (row.get::<_, String>(3), row.get::<_, Option<String>>(4)) {
+                (Ok(state), Ok(cleanup)) => SandboxState::label_from_columns(state, cleanup.as_deref()),
+                (Err(error), _) | (_, Err(error)) if is_row_decode_error(&error) => {
                     tracing::warn!(rowid = row.get::<_, i64>(0)?, error = %describe_raw_error(&error), "skipping malformed auto lifecycle discovery row");
                     return Ok(None);
                 }
-                Err(error) => return Err(Error::from(error)),
+                (Err(error), _) | (_, Err(error)) => return Err(Error::from(error)),
             };
             if state.parse::<SandboxState>().ok() == Some(SandboxState::Deleting) {
                 return Ok(None);
@@ -159,10 +159,10 @@ db_private_outside_tests! {
         // LIMIT applies to raw index entries, before identity/metadata eligibility.
         if fresh_slots > 0 {
             let mut statement = conn.prepare(&sql!(format!(
-                "SELECT rowid, id, next_auto_event_at, legacy_state
+                "SELECT rowid, id, next_auto_event_at, state, cleanup_state
              FROM sandboxes INDEXED BY idx_sandboxes_next_auto_event_at
              WHERE next_auto_event_at <= ?1
-               AND legacy_state NOT IN {AUTO_LIFECYCLE_NEVER_ACTIONABLE_STATES_SQL}
+               AND NOT {AUTO_LIFECYCLE_NEVER_ACTIONABLE_STATES_SQL}
              ORDER BY next_auto_event_at DESC, created_at DESC LIMIT 32"
             )))?;
             let mut rows = statement.query([now])?;
@@ -179,7 +179,7 @@ db_private_outside_tests! {
         // position, not a work list), so they stay in the result set of this
         // statement and are filtered by `eligible`, not by SQL.
         let mut statement = conn.prepare(sql!(
-            "SELECT rowid, id, next_auto_event_at, legacy_state
+            "SELECT rowid, id, next_auto_event_at, state, cleanup_state
          FROM sandboxes WHERE rowid > ?1 ORDER BY rowid LIMIT 128"
         ))?;
         let mut rows = statement.query([cursor.after])?;

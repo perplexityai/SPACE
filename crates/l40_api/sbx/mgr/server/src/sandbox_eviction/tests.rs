@@ -1322,7 +1322,10 @@ fn claim_cas_binds_to_the_checked_updated_at() {
     );
     let state: String = conn
         .query_row(
-            "SELECT legacy_state FROM sandboxes WHERE id = 'sbx-version'",
+            &format!(
+                "SELECT {} FROM sandboxes WHERE id = 'sbx-version'",
+                crate::db::fixture::STATUS_LABEL_SQL
+            ),
             [],
             |r| r.get(0),
         )
@@ -1348,7 +1351,10 @@ fn claim_cas_rejects_non_suspended_rows() {
     );
     let state: String = conn
         .query_row(
-            "SELECT legacy_state FROM sandboxes WHERE id = 'sbx-claim'",
+            &format!(
+                "SELECT {} FROM sandboxes WHERE id = 'sbx-claim'",
+                crate::db::fixture::STATUS_LABEL_SQL
+            ),
             [],
             |r| r.get(0),
         )
@@ -1378,7 +1384,10 @@ fn claim_cas_binds_the_proven_pin() {
     );
     let state: String = conn
         .query_row(
-            "SELECT legacy_state FROM sandboxes WHERE id = 'sbx-bind'",
+            &format!(
+                "SELECT {} FROM sandboxes WHERE id = 'sbx-bind'",
+                crate::db::fixture::STATUS_LABEL_SQL
+            ),
             [],
             |r| r.get(0),
         )
