@@ -571,7 +571,11 @@ async fn assert_held_and_unregistered(drive: RedrivenRefusal) {
             "the teardown keeps running, so the pod stays held"
         );
         let row = crate::db::get_sandbox(&db, &id).unwrap().unwrap();
-        assert_eq!(row.state, SandboxState::Suspended, "the row is kept");
+        assert_eq!(
+            row.state,
+            crate::state::SandboxStatus::from(SandboxState::Suspended),
+            "the row is kept"
+        );
         assert_eq!(
             row.current_local_artifact_id,
             Some(drive.staged),

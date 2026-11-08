@@ -2,6 +2,7 @@ use pplx_space_common_core::types::{LocalArtifactId, SandboxId, SnapshotId};
 
 use super::*;
 use crate::service::tests::service_tests::service_with_runtime_probe;
+use crate::state::SandboxStatus;
 
 /// The reclamation fences wait rather than discarding a finished transfer.
 ///
@@ -1952,9 +1953,9 @@ async fn cross_node_restore_declines_an_existing_row_that_is_not_an_interrupted_
     let mut cases = Vec::new();
     // `Restoring` is excluded: whether it is declined depends on the row's restore
     // fields, which the table below varies one condition at a time.
-    for state in SandboxState::all()
+    for state in SandboxStatus::sweep()
         .into_iter()
-        .filter(|state| *state != SandboxState::Restoring)
+        .filter(|state| !state.is_unowned(SandboxState::Restoring))
     {
         let conn = crate::db::test_conn();
         let sandbox_id = SandboxId::new().to_string();
@@ -2000,7 +2001,11 @@ async fn cross_node_restore_declines_an_existing_row_that_is_not_an_interrupted_
         let (sandbox_id, _) = insert_interrupted_remote_restore(&conn);
         assert_eq!(conn.execute(update, [&sandbox_id]).unwrap(), 1, "{name}");
         let row = crate::db::get_sandbox(&conn, &sandbox_id).unwrap().unwrap();
-        assert_eq!(row.state, SandboxState::Restoring, "{name}");
+        assert_eq!(
+            row.state,
+            SandboxStatus::from(SandboxState::Restoring),
+            "{name}"
+        );
         assert!(
             !crate::db::sandbox_is_retryable_interrupted_restore(&row),
             "{name}: fixture must not be a retryable interrupted restore"
@@ -2170,7 +2175,7 @@ async fn retryable_scope_takeover_requires_a_current_or_newer_attempt() {
                 .unwrap()
                 .unwrap()
                 .state,
-            SandboxState::Restoring,
+            SandboxStatus::from(SandboxState::Restoring),
             "{name}"
         );
     }

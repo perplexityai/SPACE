@@ -217,7 +217,7 @@ impl RecoveredSandboxRowFields {
             guest_image: Default::default(),
             id,
             uuid8,
-            state,
+            state: state.into(),
             template: self.template.as_str(),
             template_hash: template_hash.as_deref(),
             user: &self.user,

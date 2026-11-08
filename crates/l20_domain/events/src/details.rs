@@ -24,9 +24,10 @@ pub struct SandboxEventDetails {
     pub to_state: Option<String>,
     /// The cleanup that owned the sandbox before and after the transition
     /// (`none`, `required`, `failed`, or `unknown` when the emitter could not
-    /// read it). Sandbox-manager sets these next to `from_state`/`to_state`,
-    /// which still fold an owning cleanup into `cleanup_required` or
-    /// `cleanup_failed`.
+    /// read it). Sandbox-manager sets these next to the underlying lifecycle
+    /// in `from_state`/`to_state`. Older releases folded cleanup into
+    /// `cleanup_required`/`cleanup_failed` in those state fields; consumers
+    /// should use the cleanup fields to identify cleanup ownership.
     pub from_cleanup_state: Option<String>,
     pub to_cleanup_state: Option<String>,
     pub target_state: Option<String>,

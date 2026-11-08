@@ -170,7 +170,7 @@ async fn restore_selects_its_consumer_from_the_checkpoint(
             guest_image: Default::default(),
             id: &id.to_string(),
             uuid8: &SandboxRuntimeLabel::from_sandbox_id(id),
-            state: SandboxState::Suspended,
+            state: SandboxState::Suspended.into(),
             template: "active-template",
             template_hash: Some(&template_hash.to_string()),
             user: &SandboxOwner::parse("user").unwrap(),
@@ -246,7 +246,7 @@ async fn restore_selects_its_consumer_from_the_checkpoint(
             let row = crate::db::get_sandbox(&db, &request.sandbox_id)
                 .unwrap()
                 .unwrap();
-            assert_eq!(row.state, SandboxState::Restoring);
+            assert_eq!(row.state, SandboxStatus::from(SandboxState::Restoring));
             assert_eq!(row.execution_metadata, Some(expected_consumer.clone()));
             observed_allocations.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(AllocateResponse {
@@ -269,7 +269,7 @@ async fn restore_selects_its_consumer_from_the_checkpoint(
     );
     for attempt in 1..=2 {
         let row = service.lookup_sandbox(&id.to_string()).unwrap();
-        assert_eq!(row.state, SandboxState::Suspended);
+        assert_eq!(row.state, SandboxStatus::from(SandboxState::Suspended));
         let error = tokio::time::timeout(
             Duration::from_secs(20),
             service.start_from_checkpoint(StartFromCheckpointLaunch {
@@ -355,7 +355,7 @@ async fn a_runtime_upgrade_fence_refuses_a_concurrent_restore_before_allocation(
             guest_image: Default::default(),
             id: &id.to_string(),
             uuid8: &SandboxRuntimeLabel::from_sandbox_id(id),
-            state: SandboxState::Suspended,
+            state: SandboxState::Suspended.into(),
             template: "active-template",
             template_hash: Some(&template_hash.to_string()),
             user: &SandboxOwner::parse("user").unwrap(),
@@ -467,7 +467,7 @@ async fn a_runtime_upgrade_fence_refuses_a_concurrent_restore_before_allocation(
     );
     assert_eq!(allocations.load(std::sync::atomic::Ordering::SeqCst), 0);
     let after = service.lookup_sandbox(&id.to_string()).unwrap();
-    assert_eq!(after.state, SandboxState::Suspended);
+    assert_eq!(after.state, SandboxStatus::from(SandboxState::Suspended));
     assert_eq!(after.execution_metadata, Some(producer));
     assert_eq!(after.cleanup_completion, None);
     service.shutdown_token.cancel();
@@ -529,7 +529,7 @@ async fn suspend_restore_is_admitted_before_the_vm_launches() {
         crate::db::InsertSandboxParams {
             id: &id,
             uuid8: &SandboxRuntimeLabel::from_sandbox_id(sandbox_id),
-            state: SandboxState::Suspended,
+            state: SandboxState::Suspended.into(),
             template: "active-template",
             template_hash: Some(&template_hash.to_string()),
             user: &SandboxOwner::parse("user").unwrap(),

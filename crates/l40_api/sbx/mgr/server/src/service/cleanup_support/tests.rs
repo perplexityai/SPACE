@@ -17,10 +17,10 @@ use super::{
     StateWriteRejected, require_state_write_from, state_write_result, update_state_from_best_effort,
 };
 use crate::db::test_fixtures::state_write_fixtures::{assert_unchanged, snapshot};
-use crate::db::{Edge, StateSet, StateWriteGuard, StateWriteOutcome, StateWriteRefusal, edges};
+use crate::db::{Edge, StateWriteGuard, StateWriteOutcome, StateWriteRefusal, edges};
 use crate::service::drain::{CriticalTaskGuard, DrainState};
 use crate::service::tests::service_tests::insert_test_sandbox;
-use crate::state::SandboxState;
+use crate::state::{SandboxState, SandboxStatus};
 
 const CONTEXT: &str = "complete synthetic transition";
 
@@ -51,7 +51,7 @@ const MISSING: &str = "complete synthetic transition: sandbox state write was no
 
 fn outcomes() -> Vec<StateWriteOutcome> {
     let mut outcomes = vec![StateWriteOutcome::Missing];
-    for state in SandboxState::all() {
+    for state in SandboxStatus::sweep() {
         outcomes.push(StateWriteOutcome::Applied { from: state });
         for refusal in refusals() {
             outcomes.push(StateWriteOutcome::Refused {
@@ -63,7 +63,7 @@ fn outcomes() -> Vec<StateWriteOutcome> {
     outcomes
 }
 
-fn expected_rejection(outcome: StateWriteOutcome) -> Result<SandboxState, StateWriteRejected> {
+fn expected_rejection(outcome: StateWriteOutcome) -> Result<SandboxStatus, StateWriteRejected> {
     match outcome {
         StateWriteOutcome::Applied { from } => Ok(from),
         StateWriteOutcome::Refused { found, refusal } => Err(match refusal {
@@ -149,7 +149,7 @@ struct GuardedRow {
     name: &'static str,
     seed: fn(&crate::db::Connection, &str),
     target: SandboxState,
-    rejected: fn(SandboxState) -> StateWriteRejected,
+    rejected: fn(SandboxStatus) -> StateWriteRejected,
     message: &'static str,
 }
 
@@ -225,12 +225,16 @@ fn guard_refusals_and_a_missing_row_keep_their_statuses() {
         let found = crate::db::get_sandbox(&conn, &id)
             .unwrap()
             .map(|sandbox| sandbox.state);
-        let expected = found.unwrap_or(SandboxState::Started);
+        let expected = found.unwrap_or(SandboxState::Started.into());
         let before = snapshot(&conn);
 
-        let outcome =
-            crate::db::update_state_from_states(&conn, &id, StateSet::of(&[expected]), row.target)
-                .unwrap();
+        let outcome = crate::db::update_state_from_states(
+            &conn,
+            &id,
+            crate::db::EdgeSources::of_status(expected),
+            row.target,
+        )
+        .unwrap();
         assert_eq!(
             state_write_result(outcome),
             Err((row.rejected)(expected)),
@@ -266,13 +270,13 @@ fn best_effort_write_applies_and_marks_only_that_sandbox_dirty() {
     assert_eq!(
         update_state_from_best_effort(&db, &id, &edges::PAUSE_ROLLBACK),
         Some(StateWriteOutcome::Applied {
-            from: SandboxState::Pausing
+            from: SandboxState::Pausing.into()
         })
     );
     let conn = db.lock().unwrap();
     assert_eq!(
         crate::db::get_sandbox(&conn, &id).unwrap().unwrap().state,
-        SandboxState::Started
+        SandboxStatus::from(SandboxState::Started)
     );
     assert!(!before.contains(&id));
     assert_eq!(dirty_sandboxes(&conn), [before, vec![id]].concat());
@@ -287,7 +291,7 @@ fn best_effort_refusals_change_nothing() {
             "row outside the source states",
             Some(SandboxState::Stopped),
             StateWriteOutcome::Refused {
-                found: SandboxState::Stopped,
+                found: SandboxState::Stopped.into(),
                 refusal: StateWriteRefusal::FromState,
             },
         ),
@@ -295,7 +299,7 @@ fn best_effort_refusals_change_nothing() {
             "cleanup-owned row",
             Some(SandboxState::Stopping),
             StateWriteOutcome::Refused {
-                found: SandboxState::Stopping,
+                found: SandboxState::Stopping.into(),
                 refusal: StateWriteRefusal::Guard(StateWriteGuard::CleanupOwned),
             },
         ),

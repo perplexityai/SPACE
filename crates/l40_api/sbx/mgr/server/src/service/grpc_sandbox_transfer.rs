@@ -739,11 +739,13 @@ impl SandboxManagerService {
         }
         // Reject export of a running sandbox — rootfs is being mutated
         if !matches!(
-            sandbox.state,
-            SandboxState::Stopped
-                | SandboxState::Suspended
-                | SandboxState::Created
-                | SandboxState::Paused
+            sandbox.state.unowned(),
+            Some(
+                SandboxState::Stopped
+                    | SandboxState::Suspended
+                    | SandboxState::Created
+                    | SandboxState::Paused
+            )
         ) {
             return Err(Status::failed_precondition(
                 "sandbox export requires a stopped, suspended, or created sandbox",
@@ -781,7 +783,7 @@ impl SandboxManagerService {
         let process_env = sandbox.process_env.clone();
         let rootfs_size_mb = sandbox.rootfs_size_mb;
         let delta_base = EarlyDeltaBase::for_pinned(early_base, &template, &template_hash);
-        let include_snapshot = sandbox.state == SandboxState::Suspended;
+        let include_snapshot = sandbox.state.is_unowned(SandboxState::Suspended);
         let writer = self.state_writer_lease("ExportSandbox")?;
         let lease = sandbox
             .current_local_artifact_id
@@ -1032,7 +1034,7 @@ impl SandboxManagerService {
                     guest_image: Default::default(),
                     id: sandbox_id,
                     uuid8: &uuid8,
-                    state: SandboxState::Creating,
+                    state: SandboxState::Creating.into(),
                     template: &header.template_id,
                     template_hash: Some(&header.content_hash),
                     user: sandbox_owner,

@@ -28,7 +28,7 @@ fn insert_firmware_sandbox(
         crate::db::InsertSandboxParams {
             id,
             uuid8: &SandboxRuntimeLabel::parse("01234567").unwrap(),
-            state,
+            state: state.into(),
             template: "firmware-test",
             template_hash: None,
             user: &SandboxOwner::parse("test-owner").unwrap(),
@@ -97,7 +97,7 @@ async fn agentless_activity_and_environment_updates_refuse_without_waking_or_per
             .unwrap_err();
         assert_eq!(error.code(), tonic::Code::Unimplemented);
         let retained = service.lookup_sandbox(&id).unwrap();
-        assert_eq!(retained.state, state);
+        assert_eq!(retained.state, SandboxStatus::from(state));
         assert_eq!(retained.guest_image, image);
         assert!(retained.process_env.is_empty());
         assert_eq!(retained.node_execution_id, previous_execution);
@@ -365,7 +365,10 @@ async fn agentless_memory_lifecycle_refuses_before_changing_state_or_contacting_
         };
         assert_eq!(error.code(), tonic::Code::FailedPrecondition);
         assert!(pplx_space_common_grpc::GuestCapabilityUnsupported::from_status(&error).is_some());
-        assert_eq!(service.lookup_sandbox(&id).unwrap().state, state);
+        assert_eq!(
+            service.lookup_sandbox(&id).unwrap().state,
+            SandboxStatus::from(state)
+        );
         assert!(node.calls().is_empty());
     }
 }

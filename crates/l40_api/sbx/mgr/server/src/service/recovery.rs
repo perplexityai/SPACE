@@ -345,7 +345,7 @@ impl SandboxManagerService {
         };
         for row in started
             .into_iter()
-            .filter(|row| row.state == SandboxState::Started)
+            .filter(|row| row.state.is_unowned(SandboxState::Started))
         {
             if row.pool_template.is_some() && row.snapshots_enabled {
                 tracing::warn!(
@@ -413,7 +413,7 @@ impl SandboxManagerService {
         let failed = AtomicBool::new(false);
         stream::iter(
             rows.into_iter()
-                .filter(|row| row.state == SandboxState::Pausing),
+                .filter(|row| row.state.is_unowned(SandboxState::Pausing)),
         )
         .take_while(|_| std::future::ready(!failed.load(Ordering::Relaxed)))
         .map(|row| {
@@ -601,7 +601,7 @@ impl SandboxManagerService {
     ) -> crate::retained_source::RetainedSourceVerdicts {
         let sandbox_dirs: Vec<_> = rows
             .iter()
-            .filter(|row| row.state == SandboxState::Suspending)
+            .filter(|row| row.state.is_unowned(SandboxState::Suspending))
             .map(|row| cache_dir.join(&row.id))
             .collect();
         if sandbox_dirs.is_empty() {
@@ -678,14 +678,14 @@ impl SandboxManagerService {
     ) -> Result<Vec<crate::db::StartupRecoveryRecord>, StartupRecoveryError> {
         let mut records = Vec::new();
         for row in rows {
-            match row.state {
-                SandboxState::Creating => {
+            match row.state.unowned() {
+                Some(SandboxState::Creating) => {
                     records.push(self.recover_interrupted_create(cache_dir, row)?);
                 }
-                SandboxState::Starting if !row.has_runtime_fields() => {
+                Some(SandboxState::Starting) if !row.has_runtime_fields() => {
                     records.push(self.recover_unlaunched_start(cache_dir, row)?);
                 }
-                SandboxState::Suspending => {
+                Some(SandboxState::Suspending) => {
                     let id = row.id.clone();
                     let previous_state = row.state;
                     match self.recover_interrupted_suspend_snapshot_publication(
@@ -1196,7 +1196,11 @@ impl SandboxManagerService {
                 .trigger(SandboxEventTrigger::System)
                 .reason(origin.event_reason())
                 .with_from_status(row.state)
-                .with_to_status(SandboxState::CleanupRequired)
+                // The hand-off keeps the row `suspending`, owned by the cleanup.
+                .with_to_status(SandboxStatus::owned(
+                    crate::state::Teardown::Suspending,
+                    CleanupState::Required,
+                ))
                 .local_artifact_id(local_artifact_id.to_string())
                 .artifact_kind("full")
                 .artifact_origin("suspend")
@@ -2210,7 +2214,7 @@ impl SandboxManagerService {
     ) -> Result<Vec<CleanupRecoveryTarget>, StartupRecoveryError> {
         let mut targets = Vec::new();
         for row in rows {
-            if row.state == SandboxState::Failed {
+            if row.state.is_unowned(SandboxState::Failed) {
                 continue;
             }
             let cleanup_episode = {
@@ -2234,7 +2238,7 @@ impl SandboxManagerService {
             };
             if let Some(episode) = cleanup_episode {
                 if episode.completion == CleanupCompletion::DeletePoolClone
-                    && row.state == SandboxState::Quarantined
+                    && row.state.is_unowned(SandboxState::Quarantined)
                 {
                     continue; // The operator hold retains disposal authority across restart.
                 }
@@ -2247,7 +2251,7 @@ impl SandboxManagerService {
                         );
                         continue;
                     }
-                    if row.state != episode.activation_state {
+                    if !row.state.is_unowned(episode.activation_state) {
                         let retired = {
                             let db = db
                                 .lock()
@@ -2329,7 +2333,8 @@ impl SandboxManagerService {
                     // is taken. It's taken for every `suspending` row, since
                     // ownership is only known under the lock, and read only
                     // for one an active teardown owns.
-                    let live = row.state == SandboxState::Suspending && runtime_live(&row.id);
+                    let live =
+                        row.state.is_unowned(SandboxState::Suspending) && runtime_live(&row.id);
                     let intent = {
                         let db = db
                             .lock()
@@ -2357,17 +2362,17 @@ impl SandboxManagerService {
                         {
                             Some((keep_filesystem, completion))
                         }
-                        (None, None) if row.state == SandboxState::Stopping => {
+                        (None, None) if row.state.is_unowned(SandboxState::Stopping) => {
                             Some((true, CleanupCompletion::MarkStopped))
                         }
-                        (None, None) if row.state == SandboxState::Deleting => {
+                        (None, None) if row.state.is_unowned(SandboxState::Deleting) => {
                             Some((false, CleanupCompletion::DeleteRow))
                         }
-                        (None, None) if row.state == SandboxState::CleanupRequired => {
+                        (None, None) if row.state.cleanup() == Some(CleanupState::Required) => {
                             Some((true, CleanupCompletion::Quarantine))
                         }
                         (None, None)
-                            if matches!(row.state, SandboxState::CleanupFailed)
+                            if row.state.cleanup() == Some(CleanupState::Failed)
                                 && row.has_runtime_fields() =>
                         {
                             Some((true, CleanupCompletion::Quarantine))
@@ -2386,7 +2391,7 @@ impl SandboxManagerService {
             // the periodic reconciler, not only by the next startup.
             let must_persist_intent = !completion.owns_row_intent(&row)
                 || (authority == CleanupRecoveryAuthority::Startup
-                    && row.state == SandboxState::Suspending);
+                    && row.state.is_unowned(SandboxState::Suspending));
             if must_persist_intent {
                 let db = db
                     .lock()
@@ -2396,7 +2401,7 @@ impl SandboxManagerService {
                 // teardown backup's marker, which isn't why.
                 let startup_reason;
                 let reason = if authority == CleanupRecoveryAuthority::Startup
-                    && row.state == SandboxState::Suspending
+                    && row.state.is_unowned(SandboxState::Suspending)
                 {
                     startup_reason = crate::db::startup_transient_cleanup_reason(row.state);
                     startup_reason.as_str()
@@ -2542,7 +2547,7 @@ impl SandboxManagerService {
                 }
             }
             let (publications, residents) = candidates.into_iter()
-                .partition(|row| row.state == SandboxState::Suspending);
+                .partition(|row| row.state.is_unowned(SandboxState::Suspending));
             service.recover_periodic_resident_operations(residents, &shutdown_token).await;
             // Each batch is inspected and then validated as one unit, so
             // synchronous validation never waits on node-manager and every
@@ -2637,7 +2642,7 @@ impl SandboxManagerService {
 }
 
 fn unowned_publication(row: &crate::db::SandboxRow) -> bool {
-    row.state == SandboxState::Suspending && row.current_local_artifact_id.is_none()
+    row.state.is_unowned(SandboxState::Suspending) && row.current_local_artifact_id.is_none()
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

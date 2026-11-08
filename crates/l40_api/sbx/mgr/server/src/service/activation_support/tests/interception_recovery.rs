@@ -422,7 +422,7 @@ fn assert_same_execution(
 ) {
     let db = service.db.lock().unwrap();
     let row = crate::db::get_sandbox(&db, id).unwrap().unwrap();
-    assert_eq!(row.state, SandboxState::Started);
+    assert_eq!(row.state, SandboxStatus::from(SandboxState::Started));
     assert_eq!(&row.space_api_route_identity, identity);
     assert_eq!(row.netgtw_pid, Some(gateway_pid));
     assert_eq!(row.pid, Some(4242));

@@ -79,7 +79,7 @@ impl FromStr for TeardownSuspendOperationStatus {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TeardownSuspendStatus {
-    pub state: SandboxState,
+    pub state: SandboxStatus,
     pub operation: Option<TeardownSuspendOperation>,
     pub artifact: Option<LocalArtifactRow>,
     pub backup_completed: bool,
@@ -87,7 +87,9 @@ pub struct TeardownSuspendStatus {
 
 impl TeardownSuspendStatus {
     fn is_ready(&self) -> bool {
-        self.state == SandboxState::Suspended && self.artifact.is_some() && self.backup_completed
+        self.state.is_unowned(SandboxState::Suspended)
+            && self.artifact.is_some()
+            && self.backup_completed
     }
 
     pub fn is_ready_for(&self, execution_generation: ExecutionGeneration) -> bool {
@@ -390,7 +392,7 @@ fn teardown_job_owns_row(
 /// owns its completion (see [`teardown_job_owns_row`]). More than one active
 /// job, or one that doesn't decode, fails the read.
 pub(super) fn teardown_owns_suspending_row(conn: &Connection, row: &SandboxRow) -> Result<bool> {
-    if row.state != SandboxState::Suspending {
+    if !row.state.is_unowned(SandboxState::Suspending) {
         return Ok(false);
     }
     Ok(
@@ -537,7 +539,10 @@ db_private_outside_tests! {
         let activation_rolled_back = match &suspend {
             Some(status)
                 if runtime_generation.is_none()
-                    && matches!(status.state, SandboxState::Created | SandboxState::Stopped)
+                    && matches!(
+                        status.state.unowned(),
+                        Some(SandboxState::Created | SandboxState::Stopped)
+                    )
                     && status.operation.as_ref().is_none_or(|operation| {
                         operation.status == TeardownSuspendOperationStatus::Completed
                     }) =>
@@ -564,7 +569,7 @@ db_private_outside_tests! {
 fn completed_activation_rollback_covers(
     conn: &Connection,
     sandbox_id: &str,
-    state: SandboxState,
+    state: SandboxStatus,
     execution_generation: ExecutionGeneration,
 ) -> Result<bool> {
     let receipt = conn.query_row(
@@ -631,7 +636,7 @@ db_private_outside_tests! {
                 |row| {
                     let state_text = row.get::<_, String>(0)?;
                     let cleanup_text = row.get::<_, Option<String>>(6)?;
-                    let state = SandboxState::from_columns(&state_text, cleanup_text.as_deref())
+                    let state = SandboxStatus::from_columns(&state_text, cleanup_text.as_deref())
                         .ok_or_else(|| {
                             rusqlite::Error::FromSqlConversionFailure(
                                 0,

@@ -24,16 +24,13 @@ fn lifecycle_validation_accepts_retained_labels_and_rejects_unknown_writes() {
     let conn = test_conn();
     for state in SandboxState::all() {
         let label = state.as_str();
-        if state.cleanup_label().is_some() {
-            // Cleanup ownership lives in `cleanup_state`, never in `state`.
-            assert_lifecycle_rejected(insert(&conn, label, &Value::Text(label.into())));
-            continue;
-        }
         insert(&conn, label, &Value::Text(label.into())).unwrap();
         conn.execute("UPDATE sandboxes SET state = ?1 WHERE id = ?1", [label])
             .unwrap();
     }
+    // Cleanup ownership lives in `cleanup_state`, never in `state`.
     for label in ["cleanup_required", "cleanup_failed"] {
+        assert_lifecycle_rejected(insert(&conn, label, &Value::Text(label.into())));
         assert_lifecycle_rejected(conn.execute(
             "UPDATE sandboxes SET state = ?1 WHERE id = 'started'",
             [label],

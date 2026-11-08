@@ -933,8 +933,9 @@ pub(super) fn sandbox_event_trigger<T>(
 
 pub(super) fn remaining_wake_budget(
     deadline: Option<tokio::time::Instant>,
-    state: SandboxState,
+    state: impl Into<SandboxStatus>,
 ) -> Result<Option<Duration>, Status> {
+    let state = state.into();
     let Some(deadline) = deadline else {
         return Ok(None);
     };
@@ -950,8 +951,9 @@ pub(super) fn remaining_wake_budget(
 pub(super) fn wake_ready_timeout_secs(
     deadline: Option<tokio::time::Instant>,
     default_secs: u32,
-    state: SandboxState,
+    state: impl Into<SandboxStatus>,
 ) -> Result<u32, Status> {
+    let state = state.into();
     let Some(remaining) = remaining_wake_budget(deadline, state)? else {
         return Ok(default_secs);
     };
@@ -1128,8 +1130,8 @@ fn activation_env_matches(
     process_env: &BTreeMap<String, String>,
 ) -> bool {
     matches!(
-        current.state,
-        SandboxState::Starting | SandboxState::Restoring | SandboxState::Resuming
+        current.state.unowned(),
+        Some(SandboxState::Starting | SandboxState::Restoring | SandboxState::Resuming)
     ) && current.state == initial.state
         && current.node_execution_id == initial.node_execution_id
         && current.space_api_route_identity == initial.space_api_route_identity
@@ -1208,8 +1210,21 @@ pub(super) fn wait_ready_guest_uptime_ms(
         .unwrap_or_default()
 }
 
-pub(super) fn wake_transition_for_state(state: SandboxState) -> Result<WakeTransition, Status> {
-    match state {
+pub(super) fn wake_transition_for_state(
+    state: impl Into<SandboxStatus>,
+) -> Result<WakeTransition, Status> {
+    let state = state.into();
+    // A failed cleanup can't be woken; a required one is waited out.
+    match state.cleanup() {
+        Some(CleanupState::Failed) => {
+            return Err(Status::failed_precondition(format!(
+                "sandbox is {state}, cannot wake"
+            )));
+        }
+        Some(CleanupState::Required) => return Ok(WakeTransition::Wait),
+        None => {}
+    }
+    match state.lifecycle() {
         SandboxState::Started => Ok(WakeTransition::Noop),
         SandboxState::Paused => Ok(WakeTransition::Resume),
         SandboxState::Suspended => Ok(WakeTransition::Restore),
@@ -1221,14 +1236,10 @@ pub(super) fn wake_transition_for_state(state: SandboxState) -> Result<WakeTrans
         | SandboxState::Checkpointing
         | SandboxState::Suspending
         | SandboxState::Restoring
-        | SandboxState::Stopping
-        | SandboxState::CleanupRequired => Ok(WakeTransition::Wait),
-        SandboxState::Deleting
-        | SandboxState::CleanupFailed
-        | SandboxState::Quarantined
-        | SandboxState::Failed => Err(Status::failed_precondition(format!(
-            "sandbox is {state}, cannot wake"
-        ))),
+        | SandboxState::Stopping => Ok(WakeTransition::Wait),
+        SandboxState::Deleting | SandboxState::Quarantined | SandboxState::Failed => Err(
+            Status::failed_precondition(format!("sandbox is {state}, cannot wake")),
+        ),
     }
 }
 
@@ -1279,7 +1290,10 @@ fn activation_failure_status_if_current(
                         .map_err(|error| Status::internal(format!("db error: {error}")))
                 })
                 .transpose()?;
-            Ok(row.is_some_and(|row| row.state == activation_state) && episode.unwrap_or(true))
+            Ok(
+                row.is_some_and(|row| row.state.is_unowned(activation_state))
+                    && episode.unwrap_or(true),
+            )
         });
     match current {
         Ok(true) => status,

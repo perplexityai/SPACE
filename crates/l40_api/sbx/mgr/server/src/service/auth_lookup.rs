@@ -107,8 +107,9 @@ impl SpaceApiBridgeRouteAuthorization {
     pub(super) fn authorize_local_identity(
         &self,
         local_identity: &SpaceApiRouteIdentity,
-        state: SandboxState,
+        state: impl Into<SandboxStatus>,
     ) -> Result<(), Status> {
+        let state = state.into();
         self.check_present_identity(local_identity)?;
         local_identity.clone().try_into_complete().map_err(|_| {
             record_space_api_route_token_authorization(
@@ -119,14 +120,20 @@ impl SpaceApiBridgeRouteAuthorization {
             // matching capability still cannot access an inactive guest, but
             // that is an activation precondition, not invalid credentials.
             // Mismatched dimensions above remain permission failures.
-            if matches!(state, SandboxState::Suspended | SandboxState::Stopped) {
+            if matches!(
+                state.unowned(),
+                Some(SandboxState::Suspended | SandboxState::Stopped)
+            ) {
                 let refusal = Status::failed_precondition(format!(
                     "sandbox is not running ({state}); reconnect before guest access"
                 ));
                 // Only a start returns a stopped sandbox to running; a
                 // suspended one may still be restored through a fresh route.
-                return if state == SandboxState::Stopped {
-                    pplx_space_common_grpc::mark_sandbox_not_running(refusal, state.as_str())
+                return if state.is_unowned(SandboxState::Stopped) {
+                    pplx_space_common_grpc::mark_sandbox_not_running(
+                        refusal,
+                        state.lifecycle().as_str(),
+                    )
                 } else {
                     refusal
                 };
@@ -585,7 +592,7 @@ impl SandboxManagerService {
         sandbox_id: &str,
     ) -> Result<crate::db::SandboxRow, Status> {
         let sandbox = self.lookup_sandbox(sandbox_id)?;
-        if sandbox.state != SandboxState::Started {
+        if !sandbox.state.is_unowned(SandboxState::Started) {
             return Err(Status::failed_precondition(format!(
                 "sandbox is {}, not started",
                 sandbox.state
@@ -646,14 +653,16 @@ impl SandboxManagerService {
         state
     }
 
-    pub(super) fn stable_policy_update_state(state: SandboxState) -> bool {
+    pub(super) fn stable_policy_update_state(state: impl Into<SandboxStatus>) -> bool {
         matches!(
-            state,
-            SandboxState::Created
-                | SandboxState::Started
-                | SandboxState::Paused
-                | SandboxState::Suspended
-                | SandboxState::Stopped
+            state.into().unowned(),
+            Some(
+                SandboxState::Created
+                    | SandboxState::Started
+                    | SandboxState::Paused
+                    | SandboxState::Suspended
+                    | SandboxState::Stopped
+            )
         )
     }
 
@@ -693,7 +702,7 @@ impl SandboxManagerService {
 
         if !sandbox.auto_lifecycle.is_disabled()
             && state.conditions.is_empty()
-            && sandbox.state == SandboxState::Started
+            && sandbox.state.is_unowned(SandboxState::Started)
         {
             let initialized = initial_runtime_state(&sandbox.auto_lifecycle, now);
             state.conditions = initialized.conditions;
@@ -750,7 +759,7 @@ impl SandboxManagerService {
             return Ok(StreamPresenceTouch::SkippedLockContended);
         };
         let sandbox = self.lookup_sandbox(sandbox_id)?;
-        if sandbox.state != SandboxState::Started {
+        if !sandbox.state.is_unowned(SandboxState::Started) {
             return Ok(StreamPresenceTouch::SkippedNotStarted);
         }
         self.touch_runtime_state_for_guest_activity(&sandbox, activity)?;
@@ -996,8 +1005,8 @@ impl SandboxManagerService {
             // A transient state (`Starting`/`Resuming`/`Suspending`/… — the
             // `is_transient` set) settles into a stable state where the same
             // update succeeds, so the node-ctl reconcile ref must keep
-            // retrying. A stuck state (`Failed`/`CleanupRequired`/
-            // `CleanupFailed`/`Quarantined`)
+            // retrying. A stuck state (`Failed`, `Quarantined` or a cleanup
+            // that owns the row)
             // never settles on its own: mark it terminal so the ref completes
             // until a lifecycle/cluster repair changes the state, instead of
             // poisoning the queue at the backoff cap.
@@ -1045,7 +1054,7 @@ impl SandboxManagerService {
 
         let mut runtime_state = if sandbox.auto_lifecycle == policy {
             sandbox.auto_lifecycle_state.clone()
-        } else if sandbox.state == SandboxState::Started {
+        } else if sandbox.state.is_unowned(SandboxState::Started) {
             initial_runtime_state(&policy, now_secs())
         } else {
             AutoLifecycleRuntimeState::default()

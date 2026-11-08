@@ -803,7 +803,7 @@ impl SandboxManagerService {
         }
 
         // If sandbox is running, start scheduling immediately
-        if sandbox.state == SandboxState::Started {
+        if sandbox.state.is_unowned(SandboxState::Started) {
             self.snapshot_scheduler
                 .add_sandbox(sandbox.id.clone(), sandbox.template.clone())
                 .await;
@@ -1277,12 +1277,12 @@ impl SandboxManagerService {
         // stopped row's pin is dropped before the disk is rewritten.
         let pins_suspend_artifact = sandbox.current_local_artifact_origin
             == Some(pplx_space_common_core::types::ArtifactOrigin::Suspend);
-        if sandbox.state == SandboxState::Suspended
+        if sandbox.state.is_unowned(SandboxState::Suspended)
             || sandbox.cleanup_completion == Some(CleanupCompletion::MarkSuspended)
             || (pins_suspend_artifact
                 && !matches!(
-                    sandbox.state,
-                    SandboxState::Started | SandboxState::Paused | SandboxState::Stopped
+                    sandbox.state.unowned(),
+                    Some(SandboxState::Started | SandboxState::Paused | SandboxState::Stopped)
                 ))
         {
             return Err(Status::failed_precondition(
@@ -1392,7 +1392,9 @@ impl SandboxManagerService {
         }
 
         // If sandbox is running or paused, stop it first
-        if sandbox.state == SandboxState::Started || sandbox.state == SandboxState::Paused {
+        if sandbox.state.is_unowned(SandboxState::Started)
+            || sandbox.state.is_unowned(SandboxState::Paused)
+        {
             let typed_id = SandboxId::from_str(&id)
                 .map_err(|error| Status::internal(format!("invalid sandbox id: {error}")))?;
             let completion = CleanupCompletion::MarkStopped;
@@ -1469,7 +1471,10 @@ impl SandboxManagerService {
                 Status::internal(format!("complete snapshot rollback cleanup: {error}"))
             })?;
             if completion_disposition == CleanupCompletionDisposition::Superseded
-                || self.lookup_sandbox(&id)?.state != SandboxState::Stopped
+                || !self
+                    .lookup_sandbox(&id)?
+                    .state
+                    .is_unowned(SandboxState::Stopped)
             {
                 return Err(Status::aborted(
                     "snapshot rollback cleanup completion was superseded",

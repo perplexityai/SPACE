@@ -26,7 +26,7 @@ use pplx_space_node_mgr_protocol::execution_fence::ExecutionFence;
 use rusqlite::params;
 
 use crate::auto_lifecycle_delete_receipts::AutoLifecycleDeleteReceipt;
-use crate::db::guest_health_scan::StateLabelRead;
+use crate::db::guest_health_scan::StatusRead;
 use crate::db::inventory_read::InventoryReadError;
 use crate::db::local_artifact_leases::NamedArtifactPublication;
 use crate::db::route_activation_claims::OpenRouteActivationClaim;
@@ -106,10 +106,10 @@ impl SandboxView<'_> {
         }
     }
 
-    /// The `state` label as stored, `None` without a row. The label is not
-    /// parsed, so a state this binary does not know is still returned.
-    pub fn current_state_label(&self) -> Result<Option<String>> {
-        crate::db::current_state_label(self.conn, self.id)
+    /// The status, or the stored text when it names none this binary knows;
+    /// `None` without a row.
+    pub fn current_status(&self) -> Result<Option<crate::db::ReadStatus>> {
+        crate::db::current_status_or_text(self.conn, self.id)
     }
 
     /// The route's execution generation, `None` without a row or without a
@@ -486,10 +486,10 @@ pub struct SandboxViews<'c> {
 }
 
 impl<'c> SandboxViews<'c> {
-    /// Each sandbox's `state` label as stored, `None` without a row, through
-    /// one prepared statement. Only preparing it fails the whole read; each
-    /// id's read fails on its own.
-    pub fn state_labels(self) -> Result<Vec<(&'c String, StateLabelRead)>> {
-        crate::db::guest_health_scan::state_labels_for_ids(self.conn, self.ids)
+    /// Each sandbox's status, `None` without a row, through one prepared
+    /// statement. Only preparing it fails the whole read; each id's read fails
+    /// on its own.
+    pub fn statuses(self) -> Result<Vec<(&'c String, StatusRead)>> {
+        crate::db::guest_health_scan::statuses_for_ids(self.conn, self.ids)
     }
 }

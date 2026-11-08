@@ -274,7 +274,7 @@ impl SandboxManagerService {
 
         let local_generation = match evidence.runtime_generation {
             Some(generation) => generation,
-            None if status.state == SandboxState::Suspended => execution_generation,
+            None if status.state.is_unowned(SandboxState::Suspended) => execution_generation,
             None => {
                 if let Some(response) = self
                     .close_terminal_teardown_suspend(&sandbox_id_string, execution_generation)?
@@ -314,7 +314,7 @@ impl SandboxManagerService {
         // A completed STOP has already released this execution's runtime;
         // retain its disk and let containerd discard only the obsolete task.
         // Cleanup preserves the retired generation as the release witness.
-        if status.state == SandboxState::Stopped {
+        if status.state.is_unowned(SandboxState::Stopped) {
             return Ok(teardown_suspend_prepare_response(
                 TeardownSuspendOutcome::Superseded,
                 Some("a generation-fenced stop retired this execution".to_string()),
@@ -341,7 +341,10 @@ impl SandboxManagerService {
             return Ok(response);
         }
         if action == TeardownSuspendAction::BeginOrJoin
-            && matches!(status.state, SandboxState::Started | SandboxState::Paused)
+            && matches!(
+                status.state.unowned(),
+                Some(SandboxState::Started | SandboxState::Paused)
+            )
         {
             let db = self.db_conn()?;
             match crate::db::begin_teardown_suspend_operation(
@@ -376,7 +379,7 @@ impl SandboxManagerService {
             .is_none_or(|operation| operation.execution_generation <= execution_generation);
         let mut bound_existing_suspend = false;
         if action == TeardownSuspendAction::BeginOrJoin
-            && status.state == SandboxState::Suspended
+            && status.state.is_unowned(SandboxState::Suspended)
             && !has_exact_operation
             && can_bind_execution
         {
@@ -443,7 +446,10 @@ impl SandboxManagerService {
                 && operation.execution_generation == execution_generation
         });
         let begin_new = action == TeardownSuspendAction::BeginOrJoin
-            && matches!(state, SandboxState::Started | SandboxState::Paused);
+            && matches!(
+                state.unowned(),
+                Some(SandboxState::Started | SandboxState::Paused)
+            );
         if begin_new || resume_persisted {
             self.spawn_teardown_suspend_driver(sandbox_id, execution_generation, event_trigger);
             return Ok(teardown_suspend_prepare_response(
@@ -492,9 +498,12 @@ impl SandboxManagerService {
         let exact = operation
             .as_ref()
             .filter(|operation| operation.execution_generation == generation);
-        let reason = match state {
-            Some(SandboxState::Quarantined) => Some(crate::db::TeardownSuspendFailure::Quarantined),
-            Some(SandboxState::Deleting) => Some(crate::db::TeardownSuspendFailure::Deleting),
+        // `None` is a missing row; a cleanup-owned one is `Some(None)`.
+        let reason = match state.map(SandboxStatus::unowned) {
+            Some(Some(SandboxState::Quarantined)) => {
+                Some(crate::db::TeardownSuspendFailure::Quarantined)
+            }
+            Some(Some(SandboxState::Deleting)) => Some(crate::db::TeardownSuspendFailure::Deleting),
             None if crate::db::now_epoch_i64()
                 .and_then(|now| {
                     crate::db::read::sandbox_view(&db, sandbox_id)
@@ -917,10 +926,10 @@ impl SandboxManagerService {
             .map_err(|error| Status::internal(format!("db error: {error}")))?;
         let reason = match local {
             None => Some(crate::db::TeardownSuspendFailure::Missing),
-            Some(row) if row.state == SandboxState::Quarantined => {
+            Some(row) if row.state.is_unowned(SandboxState::Quarantined) => {
                 Some(crate::db::TeardownSuspendFailure::Quarantined)
             }
-            Some(row) if row.state == SandboxState::Deleting => {
+            Some(row) if row.state.is_unowned(SandboxState::Deleting) => {
                 Some(crate::db::TeardownSuspendFailure::Deleting)
             }
             _ => None,
@@ -996,7 +1005,7 @@ impl SandboxManagerService {
         // artifact under this generation. The artifact arm below then backs
         // it up and finalizes the runtime.
         let (wake_guard, artifact_guard, status) =
-            if status.state == SandboxState::Suspending && status.artifact.is_none() {
+            if status.state.is_unowned(SandboxState::Suspending) && status.artifact.is_none() {
                 let (wake_guard, artifact_guard) = self
                     .recover_teardown_suspend_publication(
                         &sandbox_id_string,
@@ -1012,7 +1021,7 @@ impl SandboxManagerService {
                         .map_err(|error| Status::internal(format!("db error: {error}")))?
                         .ok_or_else(|| Status::not_found("sandbox record no longer exists"))?
                 };
-                if status.state == SandboxState::Suspending && status.artifact.is_none() {
+                if status.state.is_unowned(SandboxState::Suspending) && status.artifact.is_none() {
                     return Err(Status::unavailable(
                         "teardown suspend publication is still pending",
                     ));
@@ -1022,8 +1031,10 @@ impl SandboxManagerService {
                 (wake_guard, artifact_guard, status)
             };
         let active_generation = Some(execution_generation);
-        let result: Result<(), Status> = match (status.state, status.artifact) {
-            (SandboxState::Started | SandboxState::Paused, _) => {
+        // A cleanup that owns the row (`None` here) pins its artifact as a
+        // suspending row does.
+        let result: Result<(), Status> = match (status.state.unowned(), status.artifact) {
+            (Some(SandboxState::Started | SandboxState::Paused), _) => {
                 let context = SuspendRequestContext::for_teardown(
                     sandbox_id_string.clone(),
                     execution_generation,
@@ -1038,12 +1049,9 @@ impl SandboxManagerService {
                 self.complete_suspend_snapshot_publication(publication)
                     .await
             }
-            (
-                SandboxState::Suspending
-                | SandboxState::CleanupRequired
-                | SandboxState::CleanupFailed,
-                Some(artifact),
-            ) if active_generation == Some(execution_generation) => {
+            (Some(SandboxState::Suspending) | None, Some(artifact))
+                if active_generation == Some(execution_generation) =>
+            {
                 let sandbox = self.lookup_sandbox(&sandbox_id_string)?;
                 let format = reupload_format_from_sidecar(&artifact.local_path)?;
                 self.ensure_teardown_suspend_backup(
@@ -1068,7 +1076,7 @@ impl SandboxManagerService {
                 mark_sandbox_dirty(&self.db, &sandbox_id_string);
                 Ok(())
             }
-            (SandboxState::Suspended, Some(artifact))
+            (Some(SandboxState::Suspended), Some(artifact))
                 if active_generation == Some(execution_generation) =>
             {
                 let sandbox = self.lookup_sandbox(&sandbox_id_string)?;
@@ -1084,9 +1092,9 @@ impl SandboxManagerService {
                 )
                 .await
             }
-            (state, _) => Err(Status::failed_precondition(format!(
+            _ => Err(Status::failed_precondition(format!(
                 "cannot continue teardown suspend from {}",
-                state
+                status.state
             ))),
         };
         result?;

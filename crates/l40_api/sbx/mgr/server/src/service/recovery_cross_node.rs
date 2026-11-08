@@ -717,26 +717,29 @@ fn adopt_restoring_row_under_recovery_claim(
     // cannot independently prove the prior row was still eligible for recovery.
     if recovery.is_some() {
         let existing_state = crate::db::read::sandbox_view(&tx, canonical_id)
-            .current_state_label()
+            .current_status()
             .map_err(
                 |source| crate::snapshot_restore::RestoreError::AdvanceRestorePhase { source },
             )?;
         // An absent row is the orphan case this path exists for; the upsert
         // inserts it. Only an existing row in an unexpected state is a refusal.
         //
-        // Parsed into `SandboxState` rather than compared as text: the set is
-        // closed, and an unparseable value has to be refused too — matching raw
-        // literals would silently treat a corrupt state as "not quarantined or
-        // restoring" for the right reason and a garbage state as the same thing
-        // for the wrong one, with no way to tell them apart in the log.
+        // Decoded rather than compared as text: the set is closed, and an
+        // undecodable value has to be refused too — matching raw literals would
+        // silently treat a corrupt state as "not quarantined or restoring" for
+        // the right reason and a garbage state as the same thing for the wrong
+        // one, with no way to tell them apart in the log.
         if let Some(state) = existing_state
-            && !state.parse::<SandboxState>().is_ok_and(|state| {
-                matches!(state, SandboxState::Quarantined | SandboxState::Restoring)
+            && !state.as_ref().is_ok_and(|state| {
+                matches!(
+                    state.unowned(),
+                    Some(SandboxState::Quarantined | SandboxState::Restoring)
+                )
             })
         {
             tracing::info!(
                 %sandbox_id,
-                state,
+                state = ?state,
                 "refusing quarantine recovery adoption: the sandbox left an \
                  activatable state after the claim was taken"
             );
@@ -1412,8 +1415,9 @@ impl SandboxManagerService {
                 if recovery.plan.reason_code
                     != pplx_space_common_core::types::SandboxQuarantineReasonCode::OrphanedSandboxRowMissing
                     || !matches!(
-                        row.state,
-                        SandboxState::Quarantined | SandboxState::Restoring
+                        row.state.unowned(),
+                        Some(SandboxState::Quarantined | SandboxState::Restoring)
+
                     )
                 {
                     return Ok(None);
@@ -1424,7 +1428,7 @@ impl SandboxManagerService {
                     })?;
                     crate::db::read::sandbox_view(&db, &canonical_id)
                         .quarantine()
-                        .is_orphan_recovery_state(row.state)
+                        .is_orphan_recovery_state(row.state.lifecycle())
                         .map_err(|source| RestoreError::ReadSandboxRow { source })?
                 };
                 if !eligible {

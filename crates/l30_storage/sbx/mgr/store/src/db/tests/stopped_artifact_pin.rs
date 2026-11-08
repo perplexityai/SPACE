@@ -20,7 +20,7 @@ use crate::db::{
     request_cleanup_episode, restage_for_warm_start, rollback_starting_episode,
     stop_suspended_for_auto_lifecycle, test_conn,
 };
-use crate::state::SandboxState;
+use crate::state::{SandboxState, SandboxStatus};
 
 /// A `stopped` row pinning a published stop-time disk artifact, as the first
 /// disk backup of a stopped sandbox leaves it.
@@ -79,7 +79,7 @@ fn assert_suspend_pinned(conn: &Connection, id: &str, artifact: LocalArtifactId)
 /// unpinned artifact is still catalogued: dropping the pin deletes nothing.
 fn assert_stopped_unpinned(conn: &Connection, id: &str, dropped: LocalArtifactId) {
     let row = get_sandbox(conn, id).unwrap().unwrap();
-    assert_eq!(row.state, SandboxState::Stopped);
+    assert_eq!(row.state, SandboxStatus::from(SandboxState::Stopped));
     assert_eq!(row.current_local_artifact_id, None);
     assert_eq!(row.current_local_artifact_kind, None);
     assert_eq!(row.current_local_artifact_origin, None);
@@ -140,7 +140,7 @@ fn a_start_refused_before_launch_keeps_its_disk_pin() {
 
     assert_eq!(
         get_sandbox(&conn, &id).unwrap().unwrap().state,
-        SandboxState::Stopped
+        SandboxStatus::from(SandboxState::Stopped)
     );
     assert_disk_pinned(&conn, &id, artifact);
 }
@@ -205,10 +205,7 @@ fn a_refused_auto_lifecycle_stop_keeps_a_stopped_disk_pin() {
     assert!(
         matches!(
             outcome,
-            StateWriteOutcome::Refused {
-                found: SandboxState::Stopped,
-                ..
-            }
+            StateWriteOutcome::Refused { found, .. } if found.is_unowned(SandboxState::Stopped)
         ),
         "{outcome:?}"
     );
@@ -320,10 +317,7 @@ fn a_refused_warm_restage_keeps_a_suspend_pin() {
     assert!(
         matches!(
             outcome,
-            StateWriteOutcome::Refused {
-                found: SandboxState::Suspended,
-                ..
-            }
+            StateWriteOutcome::Refused { found, .. } if found.is_unowned(SandboxState::Suspended)
         ),
         "{outcome:?}"
     );

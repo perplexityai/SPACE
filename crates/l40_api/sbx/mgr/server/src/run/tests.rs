@@ -1427,7 +1427,10 @@ async fn a_database_holding_a_recorded_capture_reopens_at_startup() {
     let row = crate::db::get_sandbox(&conn, &sandbox_id.to_string())
         .unwrap()
         .unwrap();
-    assert_eq!(row.state, crate::state::SandboxState::Suspending);
+    assert_eq!(
+        row.state,
+        crate::state::SandboxStatus::from(crate::state::SandboxState::Suspending)
+    );
     assert_eq!(row.current_local_artifact_id, Some(staged));
     assert_eq!(
         crate::db::latest_teardown_suspend_operation(&conn, &sandbox_id.to_string())

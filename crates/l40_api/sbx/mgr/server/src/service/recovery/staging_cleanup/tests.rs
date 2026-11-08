@@ -41,11 +41,15 @@ async fn staging_cleanup_requires_stable_unowned_lifecycle() {
         Suspending,
         Suspended,
         Restoring,
-        CleanupRequired,
-        CleanupFailed,
         Quarantined,
         Failed,
-    ] {
+    ]
+    .into_iter()
+    .map(SandboxStatus::from)
+    .chain([
+        SandboxStatus::CLEANUP_REQUIRED,
+        SandboxStatus::CLEANUP_FAILED,
+    ]) {
         let id = SandboxId::new().to_string();
         insert_test_sandbox(&conn, &id, state);
         let artifact_id = LocalArtifactId::new();
@@ -57,15 +61,17 @@ async fn staging_cleanup_requires_stable_unowned_lifecycle() {
         let retired = path.with_file_name(format!("{RETIRED_PREFIX}{artifact_id}"));
         // These are recovery evidence, not safe garbage, in transitional or
         // quarantined states even when their lifecycle locks are currently free.
-        match state {
-            Started | Paused | Stopped | Suspended => {
+        match state.unowned() {
+            Some(Started | Paused | Stopped | Suspended) => {
                 expected.insert(retired.clone());
             }
-            Creating | Created | Starting | Stopping | Deleting | Pausing | Resuming
-            | Checkpointing | Suspending | Restoring | CleanupRequired | CleanupFailed
-            | Quarantined | Failed => {}
+            Some(
+                Creating | Created | Starting | Stopping | Deleting | Pausing | Resuming
+                | Checkpointing | Suspending | Restoring | Quarantined | Failed,
+            )
+            | None => {}
         }
-        if state == Paused {
+        if state.is_unowned(Paused) {
             paused = Some((id, retired));
         }
     }

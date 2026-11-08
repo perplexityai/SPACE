@@ -4,6 +4,7 @@ use super::retention::{
 use pplx_space_common_core::types::SandboxId;
 
 use super::*;
+use crate::state::SandboxStatus;
 
 #[tokio::test]
 async fn checkpoint_retries_preserve_disk_cadence_and_replacement_registration() {
@@ -134,7 +135,7 @@ fn snapshot_names_use_utc_calendar_time() {
     }
 }
 
-fn checkpoint_context(state: SandboxState) -> (CheckpointContext, String) {
+fn checkpoint_context(state: impl Into<SandboxStatus>) -> (CheckpointContext, String) {
     let conn = crate::db::test_conn();
     let sandbox_id = SandboxId::new().to_string();
     let (lifecycle, cleanup_state) =
@@ -162,31 +163,30 @@ fn checkpoint_context(state: SandboxState) -> (CheckpointContext, String) {
 /// Every other row keeps every table unchanged and reports why.
 #[test]
 fn checkpoint_admission_writes_only_over_a_started_or_paused_row() {
-    for state in SandboxState::all() {
-        let expected_error = match state {
-            SandboxState::Started | SandboxState::Paused => None,
+    for state in SandboxStatus::sweep() {
+        let expected_error = match state.unowned() {
+            Some(SandboxState::Started | SandboxState::Paused) => None,
             // The generic guards: a stopping or cleanup row is never revived,
             // and a deleting row owns its `delete_row` cleanup.
-            SandboxState::Stopping
-            | SandboxState::Deleting
-            | SandboxState::CleanupRequired
-            | SandboxState::CleanupFailed => Some(
+            Some(SandboxState::Stopping | SandboxState::Deleting) | None => Some(
                 "sandbox state write was not applied: superseded_by_cleanup_episode".to_string(),
             ),
-            SandboxState::Quarantined => {
+            Some(SandboxState::Quarantined) => {
                 Some("sandbox state write was not applied: blocked_by_quarantine".to_string())
             }
-            SandboxState::Creating
-            | SandboxState::Created
-            | SandboxState::Starting
-            | SandboxState::Stopped
-            | SandboxState::Pausing
-            | SandboxState::Resuming
-            | SandboxState::Checkpointing
-            | SandboxState::Suspending
-            | SandboxState::Suspended
-            | SandboxState::Restoring
-            | SandboxState::Failed => Some(format!(
+            Some(
+                SandboxState::Creating
+                | SandboxState::Created
+                | SandboxState::Starting
+                | SandboxState::Stopped
+                | SandboxState::Pausing
+                | SandboxState::Resuming
+                | SandboxState::Checkpointing
+                | SandboxState::Suspending
+                | SandboxState::Suspended
+                | SandboxState::Restoring
+                | SandboxState::Failed,
+            ) => Some(format!(
                 "sandbox state write was superseded: sandbox is {state}"
             )),
         };
@@ -200,7 +200,11 @@ fn checkpoint_admission_writes_only_over_a_started_or_paused_row() {
             None => {
                 result.unwrap();
                 let row = crate::db::get_sandbox(&db, &sandbox_id).unwrap().unwrap();
-                assert_eq!(row.state, SandboxState::Checkpointing, "{state}");
+                assert_eq!(
+                    row.state,
+                    SandboxStatus::from(SandboxState::Checkpointing),
+                    "{state}"
+                );
             }
             Some(message) => {
                 assert_eq!(result.unwrap_err(), message, "{state}");
@@ -229,11 +233,19 @@ fn checkpoint_admission_of_a_missing_row_reports_it() {
 
 #[tokio::test]
 async fn skipped_checkpoint_never_publishes_an_artifact() {
-    let cases = SandboxState::all()
+    let cases = SandboxStatus::sweep()
         .into_iter()
-        .filter(|state| !matches!(state, SandboxState::Started | SandboxState::Paused))
+        .filter(|state| {
+            !matches!(
+                state.unowned(),
+                Some(SandboxState::Started | SandboxState::Paused)
+            )
+        })
         .map(|state| (state, false))
-        .chain([(SandboxState::Started, true), (SandboxState::Paused, true)]);
+        .chain([
+            (SandboxState::Started.into(), true),
+            (SandboxState::Paused.into(), true),
+        ]);
     for (state, pool_member) in cases {
         let (ctx, sandbox_id) = checkpoint_context(state);
         if pool_member {
@@ -276,7 +288,7 @@ fn checkpoint_failure_restores_the_previous_stable_state() {
 
         let db = ctx.db.lock().unwrap();
         let row = crate::db::get_sandbox(&db, &sandbox_id).unwrap().unwrap();
-        assert_eq!(row.state, stable_state);
+        assert_eq!(row.state, SandboxStatus::from(stable_state));
         assert!(row.failure_reason.is_none());
     }
 
@@ -287,7 +299,7 @@ fn checkpoint_failure_restores_the_previous_stable_state() {
             .unwrap()
             .unwrap()
             .state,
-        SandboxState::Deleting
+        SandboxStatus::from(SandboxState::Deleting)
     );
 }
 
@@ -310,7 +322,7 @@ fn checkpoint_resume_ambiguity_quarantines_and_queues_publication() {
 
     let db = ctx.db.lock().unwrap();
     let row = crate::db::get_sandbox(&db, &sandbox_id).unwrap().unwrap();
-    assert_eq!(row.state, SandboxState::Quarantined);
+    assert_eq!(row.state, SandboxStatus::from(SandboxState::Quarantined));
     assert_eq!(row.failure_reason.as_deref(), Some(reason));
     assert_eq!(
         crate::db::current_quarantine_reason_wire_value(&db, &sandbox_id)
@@ -338,7 +350,7 @@ fn checkpoint_pause_error_restores_started_only_after_resume_succeeds() {
     let row = crate::db::get_sandbox(&ctx.db.lock().unwrap(), &sandbox_id)
         .unwrap()
         .unwrap();
-    assert_eq!(row.state, SandboxState::Started);
+    assert_eq!(row.state, SandboxStatus::from(SandboxState::Started));
 
     let (ctx, sandbox_id) = checkpoint_context(SandboxState::Checkpointing);
     let reason = finish_checkpoint_rollback(
@@ -359,7 +371,7 @@ fn checkpoint_pause_error_restores_started_only_after_resume_succeeds() {
             .unwrap()
             .unwrap()
             .state,
-        SandboxState::Quarantined
+        SandboxStatus::from(SandboxState::Quarantined)
     );
     assert_eq!(
         crate::db::current_quarantine_reason_wire_value(&db, &sandbox_id)
@@ -383,7 +395,7 @@ fn checkpoint_pause_error_restores_started_only_after_resume_succeeds() {
             .unwrap()
             .unwrap()
             .state,
-        SandboxState::Paused
+        SandboxStatus::from(SandboxState::Paused)
     );
     assert!(
         crate::db::current_quarantine_reason_wire_value(&db, &sandbox_id)
@@ -407,7 +419,7 @@ fn completed_checkpoint_remains_publishable_when_state_restore_is_superseded() {
             .unwrap()
             .unwrap()
             .state,
-        SandboxState::Deleting,
+        SandboxStatus::from(SandboxState::Deleting),
         "checkpoint completion must not overwrite the newer lifecycle state"
     );
 }
@@ -427,7 +439,7 @@ fn completed_checkpoint_only_succeeds_when_started_state_is_restored() {
             .unwrap()
             .unwrap()
             .state,
-        SandboxState::Started
+        SandboxStatus::from(SandboxState::Started)
     );
 
     let (ctx, sandbox_id) = checkpoint_context(SandboxState::Checkpointing);
@@ -443,7 +455,7 @@ fn completed_checkpoint_only_succeeds_when_started_state_is_restored() {
             .unwrap()
             .unwrap()
             .state,
-        SandboxState::Paused,
+        SandboxStatus::from(SandboxState::Paused),
         "a determinate Paused VM remains healthy but checkpoint completion is partial"
     );
 }

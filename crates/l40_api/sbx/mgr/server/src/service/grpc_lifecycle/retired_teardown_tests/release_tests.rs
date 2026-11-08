@@ -112,7 +112,10 @@ async fn backup_refusal_without_a_release_verdict_releases_nothing() {
             .unwrap()
             .unwrap()
     };
-    assert_eq!(row.state, SandboxState::Suspending);
+    assert_eq!(
+        row.state,
+        crate::state::SandboxStatus::from(SandboxState::Suspending)
+    );
     drain(service).await;
 }
 
@@ -358,7 +361,10 @@ async fn release_without_a_backed_copy_is_held() {
                 let row = crate::db::get_sandbox(&db, &sandbox_id_string)
                     .unwrap()
                     .unwrap();
-                assert_eq!(row.state, SandboxState::Suspending);
+                assert_eq!(
+                    row.state,
+                    crate::state::SandboxStatus::from(SandboxState::Suspending)
+                );
                 assert_eq!(row.current_local_artifact_id, Some(refused.staged));
                 assert!(
                     crate::db::get_local_artifact(&db, refused.staged)
@@ -449,7 +455,10 @@ fn release_claim_refuses_a_row_that_moved_on() {
         let row = crate::db::get_sandbox(&conn, &sandbox_id_string)
             .unwrap()
             .unwrap();
-        assert_eq!(row.state, SandboxState::Suspending);
+        assert_eq!(
+            row.state,
+            crate::state::SandboxStatus::from(SandboxState::Suspending)
+        );
         assert_eq!(
             crate::db::latest_teardown_suspend_operation(&conn, &sandbox_id_string)
                 .unwrap()
@@ -471,7 +480,10 @@ fn release_claim_refuses_a_row_that_moved_on() {
     let row = crate::db::get_sandbox(&conn, &sandbox_id_string)
         .unwrap()
         .unwrap();
-    assert_eq!(row.state, SandboxState::Deleting);
+    assert_eq!(
+        row.state,
+        crate::state::SandboxStatus::from(SandboxState::Deleting)
+    );
     assert_ne!(
         crate::db::latest_teardown_suspend_operation(&conn, &sandbox_id_string)
             .unwrap()
@@ -597,7 +609,10 @@ fn release_claim_waits_for_other_local_artifacts_to_back_up() {
     let row = crate::db::get_sandbox(&conn, &sandbox_id_string)
         .unwrap()
         .unwrap();
-    assert_eq!(row.state, SandboxState::Suspending);
+    assert_eq!(
+        row.state,
+        crate::state::SandboxStatus::from(SandboxState::Suspending)
+    );
 
     crate::db::mark_local_artifact_backup_completed(&conn, &named.to_string()).unwrap();
     assert!(

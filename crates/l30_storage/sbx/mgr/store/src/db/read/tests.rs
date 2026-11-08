@@ -424,8 +424,7 @@ impl Seeded {
     }
 }
 
-type Labels<'a> =
-    crate::db::Result<Vec<(&'a String, crate::db::guest_health_scan::StateLabelRead)>>;
+type Labels<'a> = crate::db::Result<Vec<(&'a String, crate::db::guest_health_scan::StatusRead)>>;
 
 /// The old batch reader keyed one id; the view's answer for that id.
 fn first_label(result: Labels<'_>) -> Answer {
@@ -441,9 +440,9 @@ fn first_label(result: Labels<'_>) -> Answer {
 fn cases() -> Vec<Case> {
     vec![
         Case {
-            accessor: "current_state_label",
-            view: |s| opt(s.main().current_state_label()),
-            old: |s| opt(crate::db::current_state_label(&s.conn, s.main_text())),
+            accessor: "current_status",
+            view: |s| opt(s.main().current_status()),
+            old: |s| opt(crate::db::current_status_or_text(&s.conn, s.main_text())),
             expected: [S, S, N, S],
         },
         Case {
@@ -548,10 +547,10 @@ fn cases() -> Vec<Case> {
             expected: [T, T, F, T],
         },
         Case {
-            accessor: "state_labels",
-            view: |s| first_label(sandbox_views(&s.conn, &s.main_ids).state_labels()),
+            accessor: "statuses",
+            view: |s| first_label(sandbox_views(&s.conn, &s.main_ids).statuses()),
             old: |s| {
-                first_label(crate::db::guest_health_scan::state_labels_for_ids(
+                first_label(crate::db::guest_health_scan::statuses_for_ids(
                     &s.conn,
                     &s.main_ids,
                 ))

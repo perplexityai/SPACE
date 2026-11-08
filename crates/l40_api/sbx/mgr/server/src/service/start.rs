@@ -55,7 +55,7 @@ use super::{
 use crate::{
     db::CleanupCompletion,
     proto::{StartRequest, StartResponse},
-    state::{SandboxState, SandboxStatusEventDetails},
+    state::{SandboxState, SandboxStatus, SandboxStatusEventDetails},
 };
 use pplx_space_common_core::types::{
     SandboxCleanupEpisodeId, SandboxId, SandboxOwnerKind, SandboxQuarantineReasonCode,
@@ -215,7 +215,7 @@ fn verify_stopped_materialization(
     sandbox: &crate::db::SandboxRow,
     expected: pplx_space_common_core::types::LocalArtifactId,
 ) -> Result<(), Status> {
-    if sandbox.state != SandboxState::Stopped {
+    if !sandbox.state.is_unowned(SandboxState::Stopped) {
         return Err(Status::failed_precondition(format!(
             "cannot materialize sandbox {} as stopped while local state is {}",
             sandbox.id, sandbox.state
@@ -253,14 +253,17 @@ fn verify_stopped_materialization(
 
 fn interrupted_restore_action(
     checkpoint: &str,
-    state: SandboxState,
+    state: impl Into<SandboxStatus>,
     cleanup_completion: Option<crate::db::CleanupCompletion>,
     restore_artifact_as_new: bool,
 ) -> InterruptedRestoreAction {
+    let state = state.into();
     let suspend_restore = checkpoint == SUSPEND_CHECKPOINT
-        && (matches!(state, SandboxState::Suspended | SandboxState::Restoring)
-            || cleanup_completion == Some(crate::db::CleanupCompletion::MarkSuspended));
-    if restore_artifact_as_new && state == SandboxState::Restoring {
+        && (matches!(
+            state.unowned(),
+            Some(SandboxState::Suspended | SandboxState::Restoring)
+        ) || cleanup_completion == Some(crate::db::CleanupCompletion::MarkSuspended));
+    if restore_artifact_as_new && state.is_unowned(SandboxState::Restoring) {
         InterruptedRestoreAction::RematerializeArtifact
     } else if suspend_restore {
         InterruptedRestoreAction::ResumeSuspendCheckpoint
@@ -976,10 +979,7 @@ impl SandboxManagerService {
         &self,
         sandbox: &crate::db::SandboxRow,
     ) -> Result<Option<SandboxCleanupEpisodeId>, Status> {
-        if !matches!(
-            sandbox.state,
-            SandboxState::CleanupRequired | SandboxState::CleanupFailed
-        ) {
+        if !sandbox.state.is_cleanup_owned() {
             return Ok(None);
         }
         let db = self
@@ -1277,7 +1277,7 @@ impl SandboxManagerService {
             // A stage interrupted after adopting the row: finish it, as a
             // restore's retry would, and still launch nothing.
             StartSandboxTarget::Local(lookup)
-                if lookup.sandbox.state == SandboxState::Restoring =>
+                if lookup.sandbox.state.is_unowned(SandboxState::Restoring) =>
             {
                 let sandbox_id = lookup.sandbox.id.clone();
                 let artifact_lock = self.auto_lifecycle.artifact_lock(&sandbox_id);
@@ -1294,7 +1294,7 @@ impl SandboxManagerService {
                 // A stage or restore finished while this waited for the
                 // artifact lock; the upgrade decides what the row it left
                 // means.
-                if sandbox.state != SandboxState::Restoring {
+                if !sandbox.state.is_unowned(SandboxState::Restoring) {
                     return Ok(());
                 }
                 let runtime_live = (self.sandbox_runtime_live)(&sandbox.id);
@@ -1421,7 +1421,7 @@ impl SandboxManagerService {
         let mut sandbox = self.lookup_sandbox(&sandbox.id)?;
         let mut remote_stage_completed = false;
 
-        if sandbox.state == SandboxState::Restoring {
+        if sandbox.state.is_unowned(SandboxState::Restoring) {
             let staging_lock = self.auto_lifecycle.staging_lock(&sandbox.id);
             if staging_lock.try_lock().is_err() {
                 return Err(Status::unavailable(format!(
@@ -1483,10 +1483,7 @@ impl SandboxManagerService {
         }
 
         if sandbox.cleanup_completion == Some(crate::db::CleanupCompletion::MarkSuspended) {
-            if !matches!(
-                sandbox.state,
-                SandboxState::CleanupRequired | SandboxState::CleanupFailed
-            ) {
+            if !sandbox.state.is_cleanup_owned() {
                 let cleanup_reason = sandbox.failure_reason.clone().unwrap_or_else(|| {
                     "restore requires completion of pending runtime retirement".to_string()
                 });
@@ -1563,7 +1560,7 @@ impl SandboxManagerService {
             return self.materialized_stopped_response(&sandbox, expected);
         }
 
-        if sandbox.state != SandboxState::Suspended {
+        if !sandbox.state.is_unowned(SandboxState::Suspended) {
             return Err(Status::failed_precondition(format!(
                 "cannot restore sandbox {} while local state is {}; expected suspended",
                 sandbox.id, sandbox.state
@@ -1842,7 +1839,7 @@ impl SandboxManagerService {
             .map_err(|e| Status::internal(format!("reflink snapshot.base: {e}")))?;
         }
 
-        if sandbox.state != SandboxState::Suspended {
+        if !sandbox.state.is_unowned(SandboxState::Suspended) {
             let db = self.db_conn()?;
             write_warm_start_restaged(&db, &sandbox.id)?;
         }
@@ -2043,7 +2040,7 @@ impl SandboxManagerService {
         // from the second boundary rather than launching — refusing here
         // instead would strand the row, because nothing else drives it.
         if let CrossNodeRestoreTarget::StoppedDiskArtifact { expected } = start_ctx.restore_target
-            && sandbox.state != SandboxState::Restoring
+            && !sandbox.state.is_unowned(SandboxState::Restoring)
         {
             // The same route-identity resolution every restore path applies
             // before it acts — the requested node and activation-claim checks —
@@ -2117,7 +2114,7 @@ impl SandboxManagerService {
             )));
         }
 
-        if sandbox.state == SandboxState::Failed {
+        if sandbox.state.is_unowned(SandboxState::Failed) {
             return Err(Status::failed_precondition(
                 "Failed sandbox requires explicit deletion before cold start",
             ));
@@ -2223,7 +2220,7 @@ impl SandboxManagerService {
             crate::db::begin_activation_with_route_evidence(
                 &db,
                 id,
-                sandbox.state,
+                sandbox.state.lifecycle(),
                 crate::db::ActivationKind::ColdStart,
                 start_ctx.execution_generation,
                 start_ctx.space_api_route_identity.activation_attempt_id,
@@ -2400,19 +2397,23 @@ impl SandboxManagerService {
                 })
                 .await;
             let db = self.db_conn()?;
-            let restored_state =
-                match crate::db::rollback_starting_episode(&db, id, sandbox.state, cleanup_id) {
-                    Ok(restored_state) => restored_state,
-                    Err(error) => {
-                        tracing::warn!(
-                            sandbox_id = %id,
-                            state = ?sandbox.state,
-                            %error,
-                            "failed to restore sandbox state after invalid sandbox uid"
-                        );
-                        false
-                    }
-                };
+            let restored_state = match crate::db::rollback_starting_episode(
+                &db,
+                id,
+                sandbox.state.lifecycle(),
+                cleanup_id,
+            ) {
+                Ok(restored_state) => restored_state,
+                Err(error) => {
+                    tracing::warn!(
+                        sandbox_id = %id,
+                        state = ?sandbox.state,
+                        %error,
+                        "failed to restore sandbox state after invalid sandbox uid"
+                    );
+                    false
+                }
+            };
             if release_result.is_ok() && restored_state {
                 activation_cleanup.complete_handled_failure();
             } else {

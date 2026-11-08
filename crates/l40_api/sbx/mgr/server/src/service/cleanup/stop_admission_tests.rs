@@ -33,7 +33,7 @@ use super::{
 use crate::db::CleanupCompletion;
 use crate::db::test_fixtures::state_write_fixtures::{assert_unchanged, snapshot};
 use crate::service::tests::service_tests::insert_test_sandbox;
-use crate::state::SandboxState;
+use crate::state::{CleanupState, SandboxState, SandboxStatus};
 
 const WAIT: Duration = Duration::from_secs(30);
 
@@ -69,11 +69,53 @@ async fn shutdown(service: SandboxManagerService) {
 }
 
 /// A row in `state`, with a local restore's columns when it is `restoring`.
-fn insert_row(conn: &crate::db::Connection, state: SandboxState) -> SandboxId {
+/// Cleanup over deleting or suspending carries the corresponding intent;
+/// cleanup over stopping retains the intent-less recovery case.
+fn insert_row(conn: &crate::db::Connection, state: impl Into<SandboxStatus>) -> SandboxId {
+    let state = state.into();
     let sandbox_id = SandboxId::new();
     let id = sandbox_id.to_string();
-    insert_test_sandbox(conn, &id, state);
-    if state == SandboxState::Restoring {
+    let intent = match (state.lifecycle(), state.cleanup()) {
+        (SandboxState::Deleting, Some(_)) => Some(CleanupCompletion::DeleteRow),
+        (SandboxState::Suspending, Some(_)) => Some(CleanupCompletion::MarkSuspended),
+        _ => None,
+    };
+    insert_test_sandbox(
+        conn,
+        &id,
+        if intent.is_some() {
+            state.lifecycle().into()
+        } else {
+            state
+        },
+    );
+    if let Some(completion) = intent {
+        let keep_filesystem = completion == CleanupCompletion::MarkSuspended;
+        match state.cleanup().unwrap() {
+            CleanupState::Required => crate::db::mark_cleanup_required(
+                conn,
+                &id,
+                keep_filesystem,
+                completion,
+                "cleanup admission fixture",
+            )
+            .unwrap(),
+            CleanupState::Failed => assert!(
+                crate::db::mark_cleanup_failed(
+                    conn,
+                    &id,
+                    keep_filesystem,
+                    completion,
+                    "cleanup admission fixture",
+                )
+                .unwrap()
+            ),
+        }
+        let row = crate::db::get_sandbox(conn, &id).unwrap().unwrap();
+        assert_eq!(row.state, state);
+        assert_eq!(row.cleanup_completion, Some(completion));
+    }
+    if state.is_unowned(SandboxState::Restoring) {
         conn.execute(
             "UPDATE sandboxes SET restore_origin = 'local', restore_phase = 'activation'
               WHERE id = ?1",
@@ -98,8 +140,12 @@ enum Admission {
 
 /// What Stop admission answers for a plain row in `state`. Wildcard-free, so
 /// a new lifecycle state does not compile until it is placed.
-fn admission(state: SandboxState) -> Admission {
-    match state {
+fn admission(state: SandboxStatus) -> Admission {
+    // Stop takes over teardown, but not the fixture's current delete intent.
+    if state.is_cleanup_owned() && state.lifecycle() != SandboxState::Deleting {
+        return Admission::Admitted;
+    }
+    match state.lifecycle() {
         SandboxState::Starting
         | SandboxState::Started
         | SandboxState::Stopping
@@ -109,8 +155,6 @@ fn admission(state: SandboxState) -> Admission {
         | SandboxState::Checkpointing
         | SandboxState::Suspending
         | SandboxState::Restoring
-        | SandboxState::CleanupRequired
-        | SandboxState::CleanupFailed
         | SandboxState::Failed => Admission::Admitted,
         SandboxState::Creating
         | SandboxState::Created
@@ -131,8 +175,12 @@ fn admission(state: SandboxState) -> Admission {
 
 /// What Delete admission answers for a plain row in `state`. Wildcard-free,
 /// so a new lifecycle state does not compile until it is placed.
-fn delete_admission(state: SandboxState) -> Admission {
-    match state {
+fn delete_admission(state: SandboxStatus) -> Admission {
+    // The suspending cleanup fixture still owns a pending suspend publication.
+    if state.is_cleanup_owned() && state.lifecycle() != SandboxState::Suspending {
+        return Admission::Admitted;
+    }
+    match state.lifecycle() {
         SandboxState::Creating
         | SandboxState::Created
         | SandboxState::Starting
@@ -146,8 +194,6 @@ fn delete_admission(state: SandboxState) -> Admission {
         | SandboxState::Checkpointing
         | SandboxState::Suspended
         | SandboxState::Restoring
-        | SandboxState::CleanupRequired
-        | SandboxState::CleanupFailed
         | SandboxState::Quarantined
         | SandboxState::Failed => Admission::Admitted,
         // Its suspend state has not reached the cluster yet.
@@ -184,7 +230,7 @@ impl Cleanup {
         }
     }
 
-    fn admission(self, state: SandboxState) -> Admission {
+    fn admission(self, state: SandboxStatus) -> Admission {
         match self {
             Self::Stop => admission(state),
             Self::Delete => delete_admission(state),
@@ -195,7 +241,7 @@ impl Cleanup {
     /// Stop, with exactly `message`.
     fn refused(
         self,
-        state: SandboxState,
+        state: SandboxStatus,
         message: Option<&str>,
         result: Result<CleanupAdmission, CleanupAdmissionError>,
     ) -> bool {
@@ -213,8 +259,8 @@ impl Cleanup {
     }
 }
 
-/// Admit `cleanup` over a plain row in every source state, with and without
-/// a persisted intent. An admitted cleanup leaves the row in its target state
+/// Admit `cleanup` over every source status, with and without persisting the
+/// new intent. An admitted cleanup leaves the row in its target state
 /// with its intent and cleanup job; a refused one changes nothing.
 ///
 /// Admission never consults the shutdown token, but the cleanup executor it
@@ -226,7 +272,7 @@ impl Cleanup {
 /// checks that.
 async fn sweep_every_source_state(cleanup: Cleanup) {
     for persist_intent in [true, false] {
-        for state in SandboxState::all() {
+        for state in SandboxStatus::all() {
             let case = format!(
                 "{cleanup:?} of {state} ({:?}), persist intent {persist_intent}",
                 cleanup.admission(state)
@@ -234,6 +280,11 @@ async fn sweep_every_source_state(cleanup: Cleanup) {
             let conn = crate::db::test_conn();
             let sandbox_id = insert_row(&conn, state);
             let id = sandbox_id.to_string();
+            let original = crate::db::get_sandbox(&conn, &id).unwrap().unwrap();
+            let original_intent = (
+                original.cleanup_completion,
+                original.cleanup_keep_filesystem,
+            );
             let scratch = tempfile::tempdir().unwrap();
             let service = isolated_service(conn, scratch.path());
             // The service's own background tasks exit on cancellation; once
@@ -280,13 +331,13 @@ async fn sweep_every_source_state(cleanup: Cleanup) {
                         "{case}: expected a persisted admission"
                     );
                     let row = crate::db::get_sandbox(&db, &id).unwrap().unwrap();
-                    assert_eq!(row.state, cleanup.target(), "{case}");
+                    assert_eq!(row.state, SandboxStatus::from(cleanup.target()), "{case}");
                     assert_eq!(
                         (row.cleanup_completion, row.cleanup_keep_filesystem),
                         if persist_intent {
                             (Some(cleanup.completion()), Some(cleanup.keep_filesystem()))
                         } else {
-                            (None, None)
+                            original_intent
                         },
                         "{case}"
                     );
@@ -381,7 +432,7 @@ async fn stop_rpc_admits_nothing_without_a_live_runtime() {
         return;
     }
     for blocking in [true, false] {
-        for state in SandboxState::all() {
+        for state in SandboxStatus::all() {
             let case = format!("{state}, blocking {blocking}");
             let conn = crate::db::test_conn();
             let sandbox_id = insert_row(&conn, state);
@@ -491,11 +542,11 @@ async fn exited_runtime_recovery_requires_death_and_the_current_execution() {
         assert_eq!(admission.is_some(), exited && !stale && !busy);
         assert_eq!(
             service.lookup_sandbox(&id.to_string()).unwrap().state,
-            if exited && !stale && !busy {
+            SandboxStatus::from(if exited && !stale && !busy {
                 SandboxState::Stopping
             } else {
                 SandboxState::Started
-            }
+            })
         );
         drop(admission);
         if !exited {

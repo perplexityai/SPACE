@@ -4,6 +4,7 @@ use super::*;
 use crate::db::CleanupCompletion;
 use crate::service::recovery::tests::{insert_suspended_test_sandbox, recovery_test_service};
 use crate::service::suspend_snapshot_publication::LOCAL_SNAPSHOT_DIR;
+use crate::state::SandboxStatus;
 use pplx_space_common_core::types::ExecutionGeneration;
 
 // A cold boot and a snapshot load give a sandbox the same rootfs limiter,
@@ -679,7 +680,7 @@ async fn restore_releases_artifact_lock_while_waiting_for_cleanup_completion() {
     let conn = crate::db::test_conn();
     let id = SandboxId::new().to_string();
     let cleanup_id = SandboxCleanupEpisodeId::new();
-    insert_test_sandbox(&conn, &id, SandboxState::CleanupRequired);
+    insert_test_sandbox(&conn, &id, SandboxStatus::CLEANUP_REQUIRED);
     crate::db::set_cleanup_intent(&conn, &id, true, CleanupCompletion::MarkSuspended).unwrap();
     conn.execute("INSERT INTO sandbox_cleanup_episodes
         (sandbox_id, cleanup_id, completion, keep_filesystem, phase, activation_state, created_at, requested_at, quarantine_reason_code)
@@ -709,7 +710,7 @@ async fn restore_releases_artifact_lock_while_waiting_for_cleanup_completion() {
     result.expect_err("missing suspend evidence must prevent restore after cleanup");
     assert_eq!(
         service.lookup_sandbox(&id).unwrap().state,
-        SandboxState::Quarantined
+        SandboxStatus::from(SandboxState::Quarantined)
     );
     service.shutdown_token.cancel();
     service.task_tracker.close();
@@ -866,7 +867,7 @@ async fn start_refusals_before_activation_leave_the_row_state_unchanged() {
         );
         assert_eq!(
             service.lookup_sandbox(&id).unwrap().state,
-            case.state,
+            SandboxStatus::from(case.state),
             "{}",
             case.name
         );
@@ -1356,7 +1357,7 @@ async fn a_resumed_stopped_materialization_is_answered_before_the_launch() {
     // what the row looks like afterwards.
     assert_eq!(response.sandbox_id, sandbox_id);
     let row = service.lookup_sandbox(&sandbox_id).unwrap();
-    assert_eq!(row.state, SandboxState::Stopped);
+    assert_eq!(row.state, SandboxStatus::from(SandboxState::Stopped));
     assert_eq!(
         row.current_local_artifact_id,
         Some(pin),
@@ -1550,7 +1551,7 @@ async fn a_stopped_target_refuses_a_suspended_row_after_the_cleanup() {
         "the stopped boundary must refuse it, not the launch backstop: {error}"
     );
     let row = service.lookup_sandbox(&sandbox_id).unwrap();
-    assert_eq!(row.state, SandboxState::Suspended);
+    assert_eq!(row.state, SandboxStatus::from(SandboxState::Suspended));
 }
 
 /// The stopped boundary vouches for an inert disk, not just a row: a `Stopped`
@@ -1848,6 +1849,6 @@ async fn cold_boot_is_admitted_as_a_cold_activation() {
     );
     assert_eq!(
         service.lookup_sandbox(&sandbox_id).unwrap().state,
-        SandboxState::Created
+        SandboxStatus::from(SandboxState::Created)
     );
 }

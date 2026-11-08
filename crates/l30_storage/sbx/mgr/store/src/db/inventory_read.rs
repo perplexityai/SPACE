@@ -123,10 +123,11 @@ pub enum ListPageRow {
     Decoded(super::SandboxListRow),
     Undecodable {
         id: String,
-        /// The combined status label, when it reads as text.
-        state: Option<String>,
-        /// The stored lifecycle label, without the cleanup `state` folds in.
+        /// The stored lifecycle label, when it reads as text.
         lifecycle: Option<String>,
+        /// The label of the cleanup that owns the row; `Ok(None)` when none
+        /// does, `Err` when it doesn't read as text.
+        cleanup_state: std::result::Result<Option<String>, ()>,
         error: Error,
     },
 }
@@ -231,16 +232,8 @@ db_private_outside_tests! {
                 Ok(row) => ListPageRow::Decoded(row),
                 Err(error) => ListPageRow::Undecodable {
                     id: row.get("id")?,
-                    state: match (
-                        row.get::<_, String>("state"),
-                        row.get::<_, Option<String>>("cleanup_state"),
-                    ) {
-                        (Ok(state), Ok(cleanup)) => Some(
-                            crate::state::SandboxState::label_from_columns(state, cleanup.as_deref()),
-                        ),
-                        _ => None,
-                    },
                     lifecycle: row.get::<_, String>("state").ok(),
+                    cleanup_state: row.get::<_, Option<String>>("cleanup_state").map_err(|_| ()),
                     error: error.into(),
                 },
             });

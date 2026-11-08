@@ -654,8 +654,8 @@ fn current_net_gateway_pid(db: &crate::db::SharedConnection, sandbox_id: &str) -
         .filter(|sandbox| {
             sandbox.state.can_authorize_net_gateway()
                 && !matches!(
-                    sandbox.state,
-                    SandboxState::Stopping | SandboxState::Suspending
+                    sandbox.state.unowned(),
+                    Some(SandboxState::Stopping | SandboxState::Suspending)
                 )
         })
         .and_then(|sandbox| sandbox.netgtw_pid)
@@ -845,7 +845,7 @@ pub(super) enum RefreshAbandonReason {
     /// live, policy-pulling net-gateway can exist
     /// ([`SandboxState::can_authorize_net_gateway`]).
     #[error("refresh abandoned: sandbox state {0} cannot have a live net-gateway")]
-    StateCannotAuthorizeGateway(SandboxState),
+    StateCannotAuthorizeGateway(SandboxStatus),
 }
 
 /// The reason a policy refresh should stop retrying, or `None` to keep going.

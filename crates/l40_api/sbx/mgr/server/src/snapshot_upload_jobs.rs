@@ -1424,24 +1424,31 @@ fn suspend_uncommitted(
         .lock()
         .map_err(|_| JobError::retriable("snapshot-upload database mutex poisoned"))?;
     let view = crate::db::read::sandbox_view(&conn, sandbox_id);
-    let Some(label) = view.current_state_label().map_err(read_failed)? else {
+    let Some(status) = view.current_status().map_err(read_failed)? else {
         return Ok(false);
     };
-    Ok(match label.parse::<SandboxState>() {
+    Ok(match status {
         Err(_) => true,
         // A legacy payload names no artifact; it keeps the projection.
-        Ok(SandboxState::Suspending | SandboxState::Suspended) => match meta.local_artifact_id {
-            Some(artifact) => {
-                let pin = view
-                    .pinned_artifact()
-                    .pin_and_updated_at()
-                    .map_err(read_failed)?
-                    .and_then(|(pin, _)| pin);
-                pin.as_deref() != Some(artifact.to_string().as_str())
+        Ok(status)
+            if matches!(
+                status.unowned(),
+                Some(SandboxState::Suspending | SandboxState::Suspended)
+            ) =>
+        {
+            match meta.local_artifact_id {
+                Some(artifact) => {
+                    let pin = view
+                        .pinned_artifact()
+                        .pin_and_updated_at()
+                        .map_err(read_failed)?
+                        .and_then(|(pin, _)| pin);
+                    pin.as_deref() != Some(artifact.to_string().as_str())
+                }
+                None => false,
             }
-            None => false,
-        },
-        Ok(state) => state.holds_runtime_outside_suspend(),
+        }
+        Ok(status) => status.holds_runtime_outside_suspend(),
     })
 }
 

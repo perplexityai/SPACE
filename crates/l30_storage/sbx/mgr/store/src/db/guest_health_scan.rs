@@ -10,7 +10,7 @@ use pplx_space_common_core::sql;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SandboxGuestHealthRow {
     pub id: String,
-    pub state: crate::state::SandboxState,
+    pub state: crate::state::SandboxStatus,
     pub template_content_hash: Option<String>,
 }
 
@@ -28,19 +28,7 @@ db_private_outside_tests! {
         let rows = stmt.query_map([], |row| {
             let state_value = row.get::<_, String>(1)?;
             let cleanup_value = row.get::<_, Option<String>>(3)?;
-            let state = crate::state::SandboxState::from_columns(&state_value, cleanup_value.as_deref())
-                .ok_or_else(|| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        1,
-                        Type::Text,
-                        Box::new(SandboxStateParseError {
-                            value: crate::state::SandboxState::label_from_columns(
-                                state_value,
-                                cleanup_value.as_deref(),
-                            ),
-                        }),
-                    )
-                })?;
+            let state = status_from_columns(1, state_value, cleanup_value)?;
             Ok(SandboxGuestHealthRow {
                 id: row.get(0)?,
                 state,
@@ -51,17 +39,36 @@ db_private_outside_tests! {
     }
 }
 
-/// One sandbox's `state` label, `None` without a row.
-pub(crate) type StateLabelRead = Result<Option<String>>;
+/// The status the `state` and `cleanup_state` text names, or a conversion
+/// error that quotes both.
+fn status_from_columns(
+    column: usize,
+    state: String,
+    cleanup: Option<String>,
+) -> rusqlite::Result<crate::state::SandboxStatus> {
+    crate::state::SandboxStatus::from_columns(&state, cleanup.as_deref()).ok_or_else(|| {
+        rusqlite::Error::FromSqlConversionFailure(
+            column,
+            Type::Text,
+            Box::new(SandboxStateParseError {
+                value: format!("{state}, cleanup {cleanup:?}"),
+            }),
+        )
+    })
+}
+
+/// One sandbox's status, `None` without a row.
+pub(crate) type StatusRead = Result<Option<crate::state::SandboxStatus>>;
 
 db_private_outside_tests! {
-    /// The `state` label of each of `sandbox_ids` through one prepared
-    /// statement, `None` for a sandbox without a row. Only preparing the
-    /// statement fails the whole lookup; each id's read fails on its own.
-    fn state_labels_for_ids<'a>(
+    /// The status of each of `sandbox_ids` through one prepared statement,
+    /// `None` for a sandbox without a row. Only preparing the statement fails
+    /// the whole lookup; each id's read fails on its own, as does a row whose
+    /// columns name no status.
+    fn statuses_for_ids<'a>(
         conn: &Connection,
         sandbox_ids: &'a [String],
-    ) -> Result<Vec<(&'a String, StateLabelRead)>> {
+    ) -> Result<Vec<(&'a String, StatusRead)>> {
         let mut statement =
             conn.prepare("SELECT state, cleanup_state FROM sandboxes WHERE id = ?1")?;
         Ok(sandbox_ids
@@ -69,10 +76,7 @@ db_private_outside_tests! {
             .map(|sandbox_id| {
                 let label = statement
                     .query_row([sandbox_id], |row| {
-                        Ok(crate::state::SandboxState::label_from_columns(
-                            row.get(0)?,
-                            row.get::<_, Option<String>>(1)?.as_deref(),
-                        ))
+                        status_from_columns(0, row.get(0)?, row.get(1)?)
                     })
                     .optional()
                     .map_err(Error::from);

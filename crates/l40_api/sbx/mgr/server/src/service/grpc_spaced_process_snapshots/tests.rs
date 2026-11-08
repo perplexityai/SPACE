@@ -345,7 +345,7 @@ fn rollback_replaces_optional_sidecars_or_reports_unremovable_stale_evidence() {
     }
 }
 
-fn sandbox_state(conn: &crate::db::Connection, id: &str) -> SandboxState {
+fn sandbox_state(conn: &crate::db::Connection, id: &str) -> SandboxStatus {
     crate::db::get_sandbox(conn, id).unwrap().unwrap().state
 }
 
@@ -365,7 +365,10 @@ fn full_rollback_restage_leaves_a_stop_admitted_after_its_own_stop() {
     // The rollback's own stop.
     admit_stop(&conn, &id);
     complete_stop(&conn, &id);
-    assert_eq!(sandbox_state(&conn, &id), SandboxState::Stopped);
+    assert_eq!(
+        sandbox_state(&conn, &id),
+        SandboxStatus::from(SandboxState::Stopped)
+    );
     admit_stop(&conn, &id);
     let before = crate::db::test_fixtures::database_rows(&conn);
 
@@ -380,7 +383,7 @@ fn full_rollback_restage_leaves_a_stop_admitted_after_its_own_stop() {
     assert_eq!(crate::db::test_fixtures::database_rows(&conn), before);
     complete_stop(&conn, &id);
     let row = crate::db::get_sandbox(&conn, &id).unwrap().unwrap();
-    assert_eq!(row.state, SandboxState::Stopped);
+    assert_eq!(row.state, SandboxStatus::from(SandboxState::Stopped));
     assert_eq!(row.cleanup_completion, None);
 }
 
@@ -396,35 +399,41 @@ fn full_rollback_restage_writes_only_over_a_stopped_row() {
         AlreadySuspended,
         Refused(String),
     }
-    for state in SandboxState::all() {
-        let expected = match state {
-            SandboxState::Stopped => Expected::Restaged,
-            SandboxState::Suspended => Expected::AlreadySuspended,
+    for state in SandboxStatus::all() {
+        let expected = match state.unowned() {
+            Some(SandboxState::Stopped) => Expected::Restaged,
+            Some(SandboxState::Suspended) => Expected::AlreadySuspended,
             // The generic guard: a deleting row owns its `delete_row` cleanup.
-            SandboxState::Deleting => Expected::Refused(
+            Some(SandboxState::Deleting) => Expected::Refused(
                 "complete process snapshot suspension: sandbox state write was not applied: \
                  superseded_by_cleanup_episode"
                     .to_string(),
             ),
-            SandboxState::Quarantined => Expected::Refused(
+            None if state.lifecycle() == SandboxState::Deleting => Expected::Refused(
+                "complete process snapshot suspension: sandbox state write was not applied: \
+                 superseded_by_cleanup_episode"
+                    .to_string(),
+            ),
+            Some(SandboxState::Quarantined) => Expected::Refused(
                 "complete process snapshot suspension: sandbox state write was not applied: \
                  blocked_by_quarantine"
                     .to_string(),
             ),
-            SandboxState::Creating
-            | SandboxState::Created
-            | SandboxState::Starting
-            | SandboxState::Started
-            | SandboxState::Stopping
-            | SandboxState::Pausing
-            | SandboxState::Paused
-            | SandboxState::Resuming
-            | SandboxState::Checkpointing
-            | SandboxState::Suspending
-            | SandboxState::Restoring
-            | SandboxState::CleanupRequired
-            | SandboxState::CleanupFailed
-            | SandboxState::Failed => Expected::Refused(format!(
+            Some(
+                SandboxState::Creating
+                | SandboxState::Created
+                | SandboxState::Starting
+                | SandboxState::Started
+                | SandboxState::Stopping
+                | SandboxState::Pausing
+                | SandboxState::Paused
+                | SandboxState::Resuming
+                | SandboxState::Checkpointing
+                | SandboxState::Suspending
+                | SandboxState::Restoring
+                | SandboxState::Failed,
+            )
+            | None => Expected::Refused(format!(
                 "complete process snapshot suspension: sandbox state write was superseded: \
                  sandbox is {state}"
             )),
@@ -432,6 +441,10 @@ fn full_rollback_restage_writes_only_over_a_stopped_row() {
         let conn = crate::db::test_conn();
         let id = SandboxId::new().to_string();
         crate::service::tests::service_tests::insert_test_sandbox_with_runtime(&conn, &id, state);
+        assert_eq!(
+            crate::db::get_sandbox(&conn, &id).unwrap().unwrap().state,
+            state
+        );
         crate::db::test_fixtures::state_write_fixtures::decorate(&conn, &id, SandboxState::Started);
         let before = crate::db::test_fixtures::database_rows(&conn);
 
@@ -440,7 +453,10 @@ fn full_rollback_restage_writes_only_over_a_stopped_row() {
         match expected {
             Expected::Restaged => {
                 result.unwrap();
-                assert_eq!(sandbox_state(&conn, &id), SandboxState::Suspended);
+                assert_eq!(
+                    sandbox_state(&conn, &id),
+                    SandboxStatus::from(SandboxState::Suspended)
+                );
             }
             Expected::AlreadySuspended => {
                 result.unwrap();

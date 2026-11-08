@@ -39,7 +39,7 @@ fn insert_test_sandbox(conn: &crate::db::Connection, id: &str, state: crate::sta
             guest_image: Default::default(),
             id,
             uuid8: &uuid8,
-            state,
+            state: state.into(),
             template: "seed",
             template_hash: Some("hash"),
             user: &user,
@@ -808,6 +808,23 @@ fn gateway_inventory_counts_every_live_process_with_explicit_unknowns() {
     let mut off_empty_row = health_row("off-empty", crate::state::SandboxState::Paused);
     off_empty_row.template_content_hash = Some(String::new());
 
+    // Required cleanups over different teardown transitions emit one tag, so
+    // they count in one bucket.
+    let stop_cleanup_row = health_row(
+        "stop-cleanup",
+        crate::state::SandboxStatus::owned(
+            crate::state::Teardown::Stopping,
+            crate::state::CleanupState::Required,
+        ),
+    );
+    let delete_cleanup_row = health_row(
+        "delete-cleanup",
+        crate::state::SandboxStatus::owned(
+            crate::state::Teardown::Deleting,
+            crate::state::CleanupState::Required,
+        ),
+    );
+
     let mut unknown = test_health();
     unknown.netgtw_alive = true;
     let mut dead = test_health();
@@ -818,6 +835,8 @@ fn gateway_inventory_counts_every_live_process_with_explicit_unknowns() {
             (&on, Some(&on_row)),
             (&off, Some(&off_missing_row)),
             (&off, Some(&off_empty_row)),
+            (&off, Some(&stop_cleanup_row)),
+            (&off, Some(&delete_cleanup_row)),
             (&unknown, None),
             (&dead, Some(&on_row)),
         ]
@@ -835,14 +854,23 @@ fn gateway_inventory_counts_every_live_process_with_explicit_unknowns() {
                 .copied()
         };
 
-    assert_eq!(counts.values().sum::<usize>(), 4);
-    assert_eq!(counts.len(), 3);
+    assert_eq!(counts.values().sum::<usize>(), 6);
+    assert_eq!(counts.len(), 4);
+    assert_eq!(
+        count(
+            NetGatewayTlsInterceptionMode::Off,
+            "unknown",
+            "hash",
+            NetGatewayLifecycle::Known("cleanup_required"),
+        ),
+        Some(2)
+    );
     assert_eq!(
         count(
             NetGatewayTlsInterceptionMode::On,
             "gateway-a",
             "sha256:template-a",
-            NetGatewayLifecycle::Known(crate::state::SandboxState::Started),
+            NetGatewayLifecycle::of(crate::state::SandboxState::Started.into()),
         ),
         Some(1)
     );
@@ -851,7 +879,7 @@ fn gateway_inventory_counts_every_live_process_with_explicit_unknowns() {
             NetGatewayTlsInterceptionMode::Off,
             "unknown",
             "unknown",
-            NetGatewayLifecycle::Known(crate::state::SandboxState::Paused),
+            NetGatewayLifecycle::of(crate::state::SandboxState::Paused.into()),
         ),
         Some(2)
     );
@@ -866,10 +894,10 @@ fn gateway_inventory_counts_every_live_process_with_explicit_unknowns() {
     );
 }
 
-fn health_row(id: &str, state: crate::state::SandboxState) -> SandboxGuestHealthRow {
+fn health_row(id: &str, state: impl Into<crate::state::SandboxStatus>) -> SandboxGuestHealthRow {
     SandboxGuestHealthRow {
         id: id.to_string(),
-        state,
+        state: state.into(),
         template_content_hash: Some("hash".to_string()),
     }
 }
@@ -1152,7 +1180,7 @@ async fn pause_failed_recovery_applies_node_side_effects() {
                 .expect("sandbox state must be readable")
                 .expect("sandbox must exist")
                 .state,
-            crate::state::SandboxState::Paused
+            crate::state::SandboxStatus::from(crate::state::SandboxState::Paused)
         );
     }
     assert!(!snapshot_scheduler.is_active(&sandbox_id).await);
@@ -1206,7 +1234,7 @@ async fn pause_failed_recovery_revalidates_epoch_after_artifact_lock() {
                 .expect("sandbox state must be readable")
                 .expect("sandbox must exist")
                 .state,
-            crate::state::SandboxState::Quarantined
+            crate::state::SandboxStatus::from(crate::state::SandboxState::Quarantined)
         );
     }
     assert!(snapshot_scheduler.is_active(&sandbox_id_string).await);
@@ -1466,7 +1494,10 @@ async fn successful_health_probes_leave_failed_lifecycle_unchanged() {
     let row = crate::db::get_sandbox(&db.lock().unwrap(), &sandbox_id)
         .unwrap()
         .unwrap();
-    assert_eq!(row.state, crate::state::SandboxState::Failed);
+    assert_eq!(
+        row.state,
+        crate::state::SandboxStatus::from(crate::state::SandboxState::Failed)
+    );
     assert!(row.failure_reason.is_some());
 }
 

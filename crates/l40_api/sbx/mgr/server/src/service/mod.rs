@@ -153,7 +153,7 @@ use crate::proto::{
     WaitRequest, WaitResponse, WakeRequest, WakeResponse, WakeTransition, spaced_write_request,
 };
 use crate::runtime_reconciliation::{mark_quarantined_best_effort, observe_vm_state};
-use crate::state::{SandboxState, SandboxStatusEventDetails};
+use crate::state::{CleanupState, SandboxState, SandboxStatus, SandboxStatusEventDetails};
 use pplx_space_node_runtime_core::vm_state::VmState;
 
 type BoxedStatusStream<T> = Pin<Box<dyn tokio_stream::Stream<Item = Result<T, Status>> + Send>>;
@@ -538,7 +538,9 @@ fn validate_cold_start_provenance(
     incoming: &RouteStreamEpochIdentity,
 ) -> Result<(), Status> {
     let retained = &sandbox.space_api_route_identity;
-    if sandbox.state == crate::state::SandboxState::Starting
+    if sandbox
+        .state
+        .is_unowned(crate::state::SandboxState::Starting)
         && execution_only_provenance(retained)
         && incoming.execution_generation() <= retained.execution_generation
     {
@@ -565,8 +567,8 @@ fn persisted_route_stream_epoch(
     // That exact partial shape is not an attachable route epoch; a subsequent
     // complete activation identity must be allowed to replace it.
     let is_suspend_publication_provenance = matches!(
-        sandbox.state,
-        crate::state::SandboxState::Suspended | crate::state::SandboxState::Restoring
+        sandbox.state.unowned(),
+        Some(crate::state::SandboxState::Suspended | crate::state::SandboxState::Restoring)
     ) && has_suspend_artifact
         && identity.route_generation.is_none()
         && identity.current_node_id.is_none()
@@ -584,7 +586,9 @@ fn persisted_route_stream_epoch(
     // attachable strict route epoch and must not fence out its owned replacement.
     let is_owned_legacy_restore_provenance = activation_replacement_authority
         == ActivationRouteReplacementAuthority::PersistedOwner
-        && sandbox.state == crate::state::SandboxState::Restoring
+        && sandbox
+            .state
+            .is_unowned(crate::state::SandboxState::Restoring)
         && identity.route_generation.is_none()
         && identity.execution_generation.is_some()
         && identity.substrate_kind
@@ -599,7 +603,9 @@ fn persisted_route_stream_epoch(
     // producing execution generation, so this does not admit an older restore.
     let is_owned_recovered_execution_provenance = activation_replacement_authority
         == ActivationRouteReplacementAuthority::PersistedOwner
-        && sandbox.state == crate::state::SandboxState::Restoring
+        && sandbox
+            .state
+            .is_unowned(crate::state::SandboxState::Restoring)
         && has_suspend_artifact
         && execution_only_provenance(identity);
     if is_owned_recovered_execution_provenance {
@@ -611,7 +617,9 @@ fn persisted_route_stream_epoch(
     // execution, independently of the process-local route cache.
     let is_owned_cold_start_provenance = activation_replacement_authority
         == ActivationRouteReplacementAuthority::PersistedOwner
-        && sandbox.state == crate::state::SandboxState::Starting
+        && sandbox
+            .state
+            .is_unowned(crate::state::SandboxState::Starting)
         && execution_only_provenance(identity);
     if is_owned_cold_start_provenance {
         return Ok(None);
@@ -963,7 +971,7 @@ fn persisted_activation_owns_route_identity(
         && episode.requested_at.is_none()
         && episode.execution_generation == incoming.execution_generation
         && episode.activation_attempt_id == incoming.activation_attempt_id
-        && episode.activation_state == sandbox.state
+        && sandbox.state.is_unowned(episode.activation_state)
         && sandbox.cleanup_completion == Some(episode.completion)
         && sandbox.cleanup_keep_filesystem == Some(episode.keep_filesystem))
 }

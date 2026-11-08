@@ -1,18 +1,18 @@
 use super::*;
-use crate::state::SandboxState;
+use crate::state::{SandboxState, SandboxStatus};
 
 #[test]
 fn disappeared_lifecycle_buckets_are_zeroed_once() {
     let mut sampler = LifecycleGaugeSampler::default();
     let initial = [
         SandboxLifecycleCount {
-            state: SandboxState::CleanupFailed,
+            state: SandboxStatus::CLEANUP_FAILED,
             runtime: None,
             runtime_version: None,
             count: 2,
         },
         SandboxLifecycleCount {
-            state: SandboxState::Started,
+            state: SandboxState::Started.into(),
             runtime: None,
             runtime_version: None,
             count: 4,

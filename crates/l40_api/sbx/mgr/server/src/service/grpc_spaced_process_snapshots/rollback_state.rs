@@ -21,7 +21,7 @@ pub(super) fn restage_rolled_back_full_snapshot(
         .map_err(|error| Status::internal(format!("{CONTEXT}: {error}")))?;
     match state_write_result(outcome) {
         Ok(_) => Ok(()),
-        Err(StateWriteRejected::FromState { found }) if found == edge.to() => Ok(()),
+        Err(StateWriteRejected::FromState { found }) if found.is_unowned(edge.to()) => Ok(()),
         Err(rejected) => Err(rejected.into_status(CONTEXT)),
     }
 }

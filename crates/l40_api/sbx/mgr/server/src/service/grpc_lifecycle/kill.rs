@@ -25,7 +25,10 @@ impl SandboxManagerService {
         }
 
         // Must be running or paused to receive a signal
-        if !matches!(sandbox.state, SandboxState::Started | SandboxState::Paused) {
+        if !matches!(
+            sandbox.state.unowned(),
+            Some(SandboxState::Started | SandboxState::Paused)
+        ) {
             return Err(Status::failed_precondition(format!(
                 "cannot kill: sandbox is {}, not started or paused",
                 sandbox.state

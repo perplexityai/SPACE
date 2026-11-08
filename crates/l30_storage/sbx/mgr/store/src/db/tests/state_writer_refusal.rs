@@ -11,6 +11,7 @@ use std::collections::BTreeMap;
 use super::database_rows;
 
 use crate::db::Connection;
+use crate::state::{CleanupState, SandboxStatus, Teardown};
 use pplx_space_common_core::types::{
     ArtifactKind, ArtifactOrigin, AutoLifecyclePolicy, ExactStorageUri, ExecutionGeneration,
     LocalArtifactId, SandboxCleanupEpisodeId, SandboxId, SandboxOwner, SandboxQuarantineNextAction,
@@ -58,12 +59,14 @@ fn assert_no_rows(result: crate::db::Result<()>, case: &str) {
     );
 }
 
-/// Every lifecycle state except the ones a writer accepts, so a refusal sweep
-/// also covers states added to the enum later.
-fn states_except(accepted: &[SandboxState]) -> impl Iterator<Item = SandboxState> + '_ {
-    SandboxState::all()
-        .into_iter()
-        .filter(move |state| !accepted.contains(state))
+/// Every lifecycle or cleanup-owned status except the unowned lifecycles a
+/// writer accepts, so refusal sweeps retain cleanup coverage.
+fn states_except(accepted: &[SandboxState]) -> impl Iterator<Item = SandboxStatus> + '_ {
+    SandboxStatus::sweep().into_iter().filter(move |state| {
+        !state
+            .unowned()
+            .is_some_and(|lifecycle| accepted.contains(&lifecycle))
+    })
 }
 
 fn row(conn: &Connection, id: &str) -> SandboxRow {
@@ -79,7 +82,7 @@ fn snapshot_path(id: &str) -> String {
 }
 
 fn with_insert_params<T>(
-    state: SandboxState,
+    state: impl Into<SandboxStatus>,
     insert: impl FnOnce(InsertSandboxParams<'_>) -> T,
 ) -> (String, T) {
     let sandbox_id = SandboxId::new();
@@ -92,7 +95,10 @@ fn with_insert_params<T>(
         guest_image: Default::default(),
         id: &id,
         uuid8: &uuid8,
-        state,
+        state: crate::db::InsertedStatus::try_from(state.into()).expect(
+            "an insert stores a cleanup only over stopping; record a delete or suspend \
+             cleanup with its writer",
+        ),
         template: "seed",
         template_hash: Some("hash"),
         user: &user,
@@ -112,7 +118,7 @@ fn with_insert_params<T>(
     (id, inserted)
 }
 
-fn insert_row(conn: &Connection, state: SandboxState) -> String {
+fn insert_row(conn: &Connection, state: impl Into<SandboxStatus>) -> String {
     let (id, inserted) = with_insert_params(state, |params| insert_sandbox(conn, params));
     inserted.unwrap();
     id
@@ -123,9 +129,16 @@ fn insert_row(conn: &Connection, state: SandboxState) -> String {
 /// inserted as a create's and other states are reached by moving it afterwards.
 fn insert_with_episode(
     conn: &Connection,
-    state: SandboxState,
+    state: impl Into<SandboxStatus>,
     completion: CleanupCompletion,
 ) -> (String, SandboxCleanupEpisodeId) {
+    let state = state.into();
+    let state = match (state.cleanup(), completion) {
+        (Some(cleanup), CleanupCompletion::DeleteRow | CleanupCompletion::DeletePoolClone) => {
+            SandboxStatus::owned(Teardown::Deleting, cleanup)
+        }
+        _ => state,
+    };
     let cleanup_id = SandboxCleanupEpisodeId::new();
     let (id, inserted) = with_insert_params(SandboxState::Creating, |params| {
         insert_sandbox_with_cleanup_episode_and_route_evidence(
@@ -181,7 +194,10 @@ fn insert_local_restore(conn: &Connection) -> (String, LocalArtifactId, CleanupE
     .unwrap()
     .unwrap();
     let restoring = row(conn, &id);
-    assert_eq!(restoring.state, SandboxState::Restoring);
+    assert_eq!(
+        restoring.state,
+        SandboxStatus::from(SandboxState::Restoring)
+    );
     assert_eq!(restoring.current_local_artifact_id, Some(artifact));
     (id, artifact, episode)
 }
@@ -198,7 +214,10 @@ fn insert_remote_restore(conn: &Connection) -> String {
     });
     inserted.unwrap();
     let restoring = row(conn, &id);
-    assert_eq!(restoring.state, SandboxState::Restoring);
+    assert_eq!(
+        restoring.state,
+        SandboxStatus::from(SandboxState::Restoring)
+    );
     assert_eq!(restoring.current_local_artifact_id, None);
     assert_eq!(
         restoring.restore_operation,
@@ -219,7 +238,10 @@ fn insert_cold_start(conn: &Connection) -> (String, CleanupEpisode) {
     )
     .unwrap()
     .unwrap();
-    assert_eq!(row(conn, &id).state, SandboxState::Starting);
+    assert_eq!(
+        row(conn, &id).state,
+        SandboxStatus::from(SandboxState::Starting)
+    );
     (id, episode)
 }
 
@@ -277,7 +299,7 @@ fn interrupted_pause_recovery_settles_only_a_pausing_row() {
         .unwrap();
         assert!(recover_interrupted_pause_state(&conn, &id, target).unwrap());
         let recovered = row(&conn, &id);
-        assert_eq!(recovered.state, target.sandbox_state());
+        assert_eq!(recovered.state, SandboxStatus::from(target.sandbox_state()));
         assert_eq!(recovered.failure_reason, None);
     }
 
@@ -288,7 +310,7 @@ fn interrupted_pause_recovery_settles_only_a_pausing_row() {
             !recover_interrupted_pause_state(&conn, &id, PauseFailedRecoveryTarget::Started)
                 .unwrap()
         );
-        assert_unchanged(&conn, &before, state.as_str());
+        assert_unchanged(&conn, &before, state.legacy_label());
     }
     let before = database_rows(&conn);
     assert!(
@@ -313,7 +335,7 @@ fn prepared_clone_disposal_rearms_only_its_own_quarantined_pool_clone_episode() 
             !rearm_prepared_clone_disposal(&conn, &id, cleanup_id).unwrap(),
             "{state}"
         );
-        assert_unchanged(&conn, &before, state.as_str());
+        assert_unchanged(&conn, &before, state.legacy_label());
     }
     let quarantine_create = |id: &str| {
         assert!(
@@ -353,7 +375,10 @@ fn prepared_clone_disposal_rearms_only_its_own_quarantined_pool_clone_episode() 
         record_cleanup_episode_failure(&conn, &exhausted, exhausted_cleanup, "clone delete failed")
             .unwrap()
     );
-    assert_eq!(row(&conn, &exhausted).state, SandboxState::CleanupFailed);
+    assert_eq!(
+        row(&conn, &exhausted).state,
+        SandboxStatus::owned(Teardown::Deleting, CleanupState::Failed)
+    );
     let before = database_rows(&conn);
     assert!(!rearm_prepared_clone_disposal(&conn, &exhausted, exhausted_cleanup).unwrap());
     assert_unchanged(&conn, &before, "requested disposal is not quarantined");
@@ -361,7 +386,10 @@ fn prepared_clone_disposal_rearms_only_its_own_quarantined_pool_clone_episode() 
         quarantine_cleanup_episode(&conn, &exhausted, exhausted_cleanup, "clone root busy")
             .unwrap()
     );
-    assert_eq!(row(&conn, &exhausted).state, SandboxState::Quarantined);
+    assert_eq!(
+        row(&conn, &exhausted).state,
+        SandboxStatus::from(SandboxState::Quarantined)
+    );
     let held = episode(&conn, &exhausted).unwrap();
     assert_eq!(held.attempt_count, 1);
     assert_eq!(
@@ -400,7 +428,11 @@ fn prepared_clone_disposal_rearms_only_its_own_quarantined_pool_clone_episode() 
             "{case}"
         );
         let rearmed = row(&conn, id);
-        assert_eq!(rearmed.state, SandboxState::CleanupRequired, "{case}");
+        assert_eq!(
+            rearmed.state,
+            SandboxStatus::owned(Teardown::Deleting, CleanupState::Required),
+            "{case}"
+        );
         assert_eq!(
             rearmed.cleanup_completion,
             Some(CleanupCompletion::DeletePoolClone),
@@ -436,15 +468,18 @@ fn teardown_suspend_begins_only_from_paused_and_a_refusal_enqueues_nothing() {
         let before = database_rows(&conn);
         assert_no_rows(
             begin_teardown_suspend(&conn, &id, generation).map(|_| ()),
-            state.as_str(),
+            state.legacy_label(),
         );
-        assert_unchanged(&conn, &before, state.as_str());
+        assert_unchanged(&conn, &before, state.legacy_label());
     }
 
     let id = insert_row(&conn, SandboxState::Paused);
     let before = database_rows(&conn);
     begin_teardown_suspend(&conn, &id, generation).unwrap();
-    assert_eq!(row(&conn, &id).state, SandboxState::Suspending);
+    assert_eq!(
+        row(&conn, &id).state,
+        SandboxStatus::from(SandboxState::Suspending)
+    );
     assert!(database_rows(&conn) != before);
 
     let before = database_rows(&conn);
@@ -466,7 +501,7 @@ fn suspend_rollback_returns_only_a_suspending_row_to_paused() {
         assert_eq!(row(&conn, id).current_local_artifact_id, None);
         assert!(rollback_suspending_to_paused(&conn, id).unwrap());
         let paused = row(&conn, id);
-        assert_eq!(paused.state, SandboxState::Paused);
+        assert_eq!(paused.state, SandboxStatus::from(SandboxState::Paused));
         assert_eq!(paused.current_local_artifact_id, restored);
         assert_eq!(
             paused.current_local_artifact_kind,
@@ -483,7 +518,7 @@ fn suspend_rollback_returns_only_a_suspending_row_to_paused() {
 
     let (suspended, _) = insert_suspended_with_artifact(&conn);
     let refused = states_except(&[SandboxState::Suspending])
-        .map(|state| (state.as_str(), insert_row(&conn, state)))
+        .map(|state| (state.legacy_label(), insert_row(&conn, state)))
         .chain([
             ("already paused", resuspend),
             ("suspended with its artifact", suspended),
@@ -592,7 +627,7 @@ fn activation_episode_rollback_requires_the_activation_state_and_its_armed_episo
             .unwrap()
     );
     let stopped = row(&conn, &starting);
-    assert_eq!(stopped.state, SandboxState::Stopped);
+    assert_eq!(stopped.state, SandboxStatus::from(SandboxState::Stopped));
     assert_eq!(stopped.cleanup_completion, None);
     assert_eq!(stopped.cleanup_keep_filesystem, None);
     assert_eq!(stopped.failure_reason, None);
@@ -608,7 +643,10 @@ fn activation_episode_rollback_requires_the_activation_state_and_its_armed_episo
         .unwrap()
     );
     let suspended = row(&conn, &restoring);
-    assert_eq!(suspended.state, SandboxState::Suspended);
+    assert_eq!(
+        suspended.state,
+        SandboxStatus::from(SandboxState::Suspended)
+    );
     assert_eq!(suspended.restore_operation, None);
     assert_eq!(suspended.cleanup_completion, None);
     assert_eq!(suspended.cleanup_keep_filesystem, None);
@@ -644,13 +682,16 @@ fn resident_resume_rollback_settles_only_a_resuming_row() {
         .unwrap();
         assert!(restore_resident_resume_state(&conn, &id, target).unwrap());
         let restored = row(&conn, &id);
-        assert_eq!(restored.state, target);
+        assert_eq!(restored.state, SandboxStatus::from(target));
         assert_eq!(restored.failure_reason, None);
     }
 
     let resuming = insert_row(&conn, SandboxState::Resuming);
     let before = database_rows(&conn);
-    for target in states_except(&[SandboxState::Started, SandboxState::Paused]) {
+    for target in SandboxState::all()
+        .into_iter()
+        .filter(|state| !matches!(state, SandboxState::Started | SandboxState::Paused))
+    {
         assert!(
             matches!(
                 restore_resident_resume_state(&conn, &resuming, target),
@@ -668,7 +709,7 @@ fn resident_resume_rollback_settles_only_a_resuming_row() {
             !restore_resident_resume_state(&conn, &id, SandboxState::Started).unwrap(),
             "{state}"
         );
-        assert_unchanged(&conn, &before, state.as_str());
+        assert_unchanged(&conn, &before, state.legacy_label());
     }
 }
 
@@ -677,7 +718,7 @@ fn suspended_cleanup_pin_requires_a_suspending_row_and_a_refusal_keeps_prior_art
     let conn = test_conn();
     let (suspended, prior) = insert_suspended_with_artifact(&conn);
     let refused = states_except(&[SandboxState::Suspending])
-        .map(|state| (state.as_str(), insert_row(&conn, state)))
+        .map(|state| (state.legacy_label(), insert_row(&conn, state)))
         .chain([("suspended with its artifact", suspended)])
         .collect::<Vec<_>>();
     for (case, id) in &refused {
@@ -697,7 +738,10 @@ fn suspended_cleanup_pin_requires_a_suspending_row_and_a_refusal_keeps_prior_art
     let artifact = LocalArtifactId::new();
     pin_suspended_artifact_for_cleanup(&conn, &id, artifact, &snapshot_path(&id)).unwrap();
     let pinned = row(&conn, &id);
-    assert_eq!(pinned.state, SandboxState::CleanupRequired);
+    assert_eq!(
+        pinned.state,
+        SandboxStatus::owned(Teardown::Suspending, CleanupState::Required)
+    );
     assert_eq!(pinned.current_local_artifact_id, Some(artifact));
     assert_eq!(pinned.current_local_artifact_kind, Some(ArtifactKind::Full));
     assert_eq!(
@@ -750,7 +794,7 @@ fn restored_suspended_publication_requires_an_unpinned_restoring_row() {
         let (suspended, prior) = insert_suspended_with_artifact(&conn);
         let (pinned_restore, _, _) = insert_local_restore(&conn);
         let refused = states_except(&[SandboxState::Restoring])
-            .map(|state| (state.as_str(), insert_row(&conn, state)))
+            .map(|state| (state.legacy_label(), insert_row(&conn, state)))
             .chain([
                 ("suspended with its artifact", suspended),
                 ("restoring with a pinned artifact", pinned_restore),
@@ -771,7 +815,11 @@ fn restored_suspended_publication_requires_an_unpinned_restoring_row() {
         let artifact = LocalArtifactId::new();
         publication.publish(&conn, &id, artifact).unwrap();
         let published = row(&conn, &id);
-        assert_eq!(published.state, SandboxState::Suspended, "{publication:?}");
+        assert_eq!(
+            published.state,
+            SandboxStatus::from(SandboxState::Suspended),
+            "{publication:?}"
+        );
         assert_eq!(published.restore_operation, None, "{publication:?}");
         let expected = match publication {
             RestoredSuspendedPublication::WithArtifact => Some(artifact),
@@ -802,8 +850,11 @@ fn restored_disk_as_new_publication_requires_a_restoring_row() {
         set_runtime_pid(&conn, &id);
         add_transfer_scope(&conn, &id);
         let before = database_rows(&conn);
-        assert_no_rows(publish_restored_disk_as_new(&conn, &id), state.as_str());
-        assert_unchanged(&conn, &before, state.as_str());
+        assert_no_rows(
+            publish_restored_disk_as_new(&conn, &id),
+            state.legacy_label(),
+        );
+        assert_unchanged(&conn, &before, state.legacy_label());
     }
 
     // `restored_disk_as_new_becomes_a_stopped_sandbox_without_donor_runtime_identity`
@@ -817,19 +868,29 @@ fn restored_disk_as_new_publication_requires_a_restoring_row() {
 #[test]
 fn stopped_artifact_publication_accepts_only_stop_completions_and_unpinned_stopped_rows() {
     let conn = test_conn();
-    let cleanup = |state: SandboxState, completion: CleanupCompletion| {
+    let cleanup = |state: SandboxStatus, completion: CleanupCompletion| {
         let id = insert_row(&conn, SandboxState::Stopping);
         match state {
-            SandboxState::CleanupRequired => {
+            SandboxStatus::CLEANUP_REQUIRED => {
                 mark_cleanup_required(&conn, &id, true, completion, "stop cleanup").unwrap();
             }
-            SandboxState::CleanupFailed => {
+            SandboxStatus::CLEANUP_FAILED => {
                 assert!(mark_cleanup_failed(&conn, &id, true, completion, "stop cleanup").unwrap());
             }
             _ => unreachable!(),
         }
         let staged = row(&conn, &id);
-        assert_eq!(staged.state, state);
+        let lifecycle = match completion {
+            CleanupCompletion::DeleteRow | CleanupCompletion::DeletePoolClone => {
+                SandboxState::Deleting
+            }
+            _ => SandboxState::Stopping,
+        };
+        let expected = match state.cleanup() {
+            Some(cleanup) => SandboxStatus::owned(Teardown::of(lifecycle).unwrap(), cleanup),
+            None => lifecycle.into(),
+        };
+        assert_eq!(staged.state, expected);
         assert_eq!(staged.cleanup_completion, Some(completion));
         id
     };
@@ -841,13 +902,16 @@ fn stopped_artifact_publication_accepts_only_stop_completions_and_unpinned_stopp
         (
             "cleanup_required to stopped",
             cleanup(
-                SandboxState::CleanupRequired,
+                SandboxStatus::CLEANUP_REQUIRED,
                 CleanupCompletion::MarkStopped,
             ),
         ),
         (
             "cleanup_failed to stopped",
-            cleanup(SandboxState::CleanupFailed, CleanupCompletion::MarkStopped),
+            cleanup(
+                SandboxStatus::CLEANUP_FAILED,
+                CleanupCompletion::MarkStopped,
+            ),
         ),
         ("unpinned stopped", insert_row(&conn, SandboxState::Stopped)),
     ];
@@ -863,7 +927,11 @@ fn stopped_artifact_publication_accepts_only_stop_completions_and_unpinned_stopp
         )
         .unwrap();
         let published = row(&conn, id);
-        assert_eq!(published.state, SandboxState::Stopped, "{case}");
+        assert_eq!(
+            published.state,
+            SandboxStatus::from(SandboxState::Stopped),
+            "{case}"
+        );
         assert_eq!(
             published.current_local_artifact_id,
             Some(artifact),
@@ -874,31 +942,29 @@ fn stopped_artifact_publication_accepts_only_stop_completions_and_unpinned_stopp
         assert_eq!(published.cleanup_keep_filesystem, None, "{case}");
     }
 
-    // `cleanup_required` and `cleanup_failed` are refused through the
-    // completions below; a bare row in either state is not a production shape.
-    let swept = states_except(&[
-        SandboxState::Stopping,
-        SandboxState::Stopped,
-        SandboxState::CleanupRequired,
-        SandboxState::CleanupFailed,
-    ])
-    .map(|state| {
-        let id = insert_row(&conn, state);
-        set_runtime_pid(&conn, &id);
-        (state.as_str(), id)
-    })
-    .collect::<Vec<_>>();
+    // A required and a failed cleanup are refused through the completions
+    // below; a bare row a cleanup owns is not a production shape.
+    let swept = states_except(&[SandboxState::Stopping, SandboxState::Stopped])
+        .map(|state| {
+            let id = insert_row(&conn, state);
+            set_runtime_pid(&conn, &id);
+            (state.legacy_label(), id)
+        })
+        .collect::<Vec<_>>();
     let (suspended, _) = insert_suspended_with_artifact(&conn);
     let refused = swept.into_iter().chain([
         ("suspended with its artifact", suspended),
         (
             "cleanup_required to delete",
-            cleanup(SandboxState::CleanupRequired, CleanupCompletion::DeleteRow),
+            cleanup(
+                SandboxStatus::CLEANUP_REQUIRED,
+                CleanupCompletion::DeleteRow,
+            ),
         ),
         (
             "cleanup_failed to suspended",
             cleanup(
-                SandboxState::CleanupFailed,
+                SandboxStatus::CLEANUP_FAILED,
                 CleanupCompletion::MarkSuspended,
             ),
         ),
@@ -930,7 +996,7 @@ fn stopped_eviction_claim_binds_the_state_and_the_observed_version() {
         .map(|state| {
             let other = insert_row(&conn, state);
             let version = row(&conn, &other).updated_at;
-            (state.as_str(), other, version)
+            (state.legacy_label(), other, version)
         })
         .chain([("stale version", id.clone(), stale_version(&observed))])
         .collect::<Vec<_>>();
@@ -944,7 +1010,10 @@ fn stopped_eviction_claim_binds_the_state_and_the_observed_version() {
     }
 
     assert!(claim_stopped_sandbox_for_eviction(&conn, &id, &observed.updated_at).unwrap());
-    assert_eq!(row(&conn, &id).state, SandboxState::Deleting);
+    assert_eq!(
+        row(&conn, &id).state,
+        SandboxStatus::from(SandboxState::Deleting)
+    );
 
     let before = database_rows(&conn);
     assert!(!claim_stopped_sandbox_for_eviction(&conn, &id, &observed.updated_at).unwrap());
@@ -964,7 +1033,7 @@ fn pinned_suspended_eviction_claim_with_a_version_requires_state_pin_and_version
             let other = insert_row(&conn, state);
             let other_pin = set_suspend_pin(&conn, &other).to_string();
             let version = row(&conn, &other).updated_at;
-            (state.as_str(), other, other_pin, version)
+            (state.legacy_label(), other, other_pin, version)
         })
         .chain([
             (
@@ -1001,7 +1070,10 @@ fn pinned_suspended_eviction_claim_with_a_version_requires_state_pin_and_version
         claim_suspended_sandbox_for_eviction(&conn, &id, Some(&pin), Some(&observed.updated_at))
             .unwrap()
     );
-    assert_eq!(row(&conn, &id).state, SandboxState::Deleting);
+    assert_eq!(
+        row(&conn, &id).state,
+        SandboxStatus::from(SandboxState::Deleting)
+    );
 
     let before = database_rows(&conn);
     assert!(

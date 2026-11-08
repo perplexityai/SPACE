@@ -361,11 +361,13 @@ impl SandboxManagerService {
             || sandbox.template_hash.as_deref() != Some(header.content_hash.as_str())
             || sandbox.volume_encryption
             || matches!(
-                sandbox.state,
-                SandboxState::Creating
-                    | SandboxState::Deleting
-                    | SandboxState::Stopping
-                    | SandboxState::Quarantined
+                sandbox.state.unowned(),
+                Some(
+                    SandboxState::Creating
+                        | SandboxState::Deleting
+                        | SandboxState::Stopping
+                        | SandboxState::Quarantined
+                )
             )
         {
             return Err(Status::failed_precondition(

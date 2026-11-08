@@ -86,7 +86,7 @@ fn connection_failure_rolls_back_only_the_admitted_resume() {
         };
         assert_eq!(
             crate::db::get_sandbox(&conn, &id).unwrap().unwrap().state,
-            expected
+            SandboxStatus::from(expected)
         );
         assert_eq!(
             error.code(),

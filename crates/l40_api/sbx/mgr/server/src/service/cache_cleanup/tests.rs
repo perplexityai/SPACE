@@ -81,7 +81,10 @@ fn orphan_materialization_requires_observed_authority_without_overwriting_a_new_
         let row = crate::db::get_sandbox(&conn, &id.to_string()).unwrap();
         if row_appears {
             assert!(report.changed_ids().is_empty());
-            assert_eq!(row.unwrap().state, SandboxState::Created);
+            assert_eq!(
+                row.unwrap().state,
+                SandboxStatus::from(SandboxState::Created)
+            );
             assert_eq!(
                 crate::db::node_execution_fence(&conn, &id.to_string()).unwrap(),
                 appeared.get()
@@ -94,7 +97,10 @@ fn orphan_materialization_requires_observed_authority_without_overwriting_a_new_
             assert!(report.changed_ids().is_empty());
         } else {
             assert_eq!(report.changed_ids(), vec![id]);
-            assert_eq!(row.unwrap().state, SandboxState::Quarantined);
+            assert_eq!(
+                row.unwrap().state,
+                SandboxStatus::from(SandboxState::Quarantined)
+            );
             let fence = crate::db::node_execution_fence(&conn, &id.to_string())
                 .unwrap()
                 .unwrap();
@@ -574,7 +580,7 @@ fn inventory_does_not_delete_starting_activation_episode_before_runtime_appears(
     let row = crate::db::get_sandbox(&conn, &sandbox_id_string)
         .expect("read sandbox")
         .expect("inventory must preserve the activation-owned row");
-    assert_eq!(row.state, SandboxState::Starting);
+    assert_eq!(row.state, SandboxStatus::from(SandboxState::Starting));
     let current_episode = crate::db::cleanup_episode(&conn, &sandbox_id_string)
         .expect("read cleanup episode")
         .expect("inventory must preserve the activation episode");
@@ -841,14 +847,14 @@ fn inventory_preserves_unfinished_teardown_without_a_live_lock() {
             .expect("read sandbox")
             .expect("deleting row is durable lifecycle ownership")
             .state,
-        SandboxState::Deleting
+        SandboxStatus::from(SandboxState::Deleting)
     );
     assert_eq!(
         crate::db::get_sandbox(&conn, &stopping_id_string)
             .expect("read sandbox")
             .expect("stopping row is durable lifecycle ownership")
             .state,
-        SandboxState::Stopping
+        SandboxStatus::from(SandboxState::Stopping)
     );
     assert!(
         crate::db::get_sandbox(&conn, &persisted_intent_id_string)
@@ -941,7 +947,7 @@ fn rowless_restore_scope_defers_materialization_until_retired() {
             .expect("read materialized sandbox")
             .expect("orphan must be classified after ownership retires")
             .state,
-        SandboxState::Quarantined
+        SandboxStatus::from(SandboxState::Quarantined)
     );
 }
 
@@ -958,7 +964,7 @@ fn inventory_keeps_a_quarantined_row_without_local_evidence() {
     let row = crate::db::get_sandbox(&conn, &sandbox_id_string)
         .expect("read sandbox")
         .expect("quarantined row");
-    assert_eq!(row.state, SandboxState::Quarantined);
+    assert_eq!(row.state, SandboxStatus::from(SandboxState::Quarantined));
     assert!(row.current_local_artifact_id.is_some());
     assert_eq!(
         crate::db::current_quarantine_reason_wire_value(&conn, &sandbox_id_string)

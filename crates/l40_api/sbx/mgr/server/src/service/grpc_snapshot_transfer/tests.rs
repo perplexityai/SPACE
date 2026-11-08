@@ -7,6 +7,7 @@ use crate::db::transfer::{
     ReserveImportError, SnapshotPublication, TransferBinding, publish_snapshot,
 };
 use crate::local_artifacts::ArtifactState;
+use crate::state::SandboxStatus;
 
 use super::*;
 
@@ -157,13 +158,21 @@ fn snapshot_publication_rechecks_identity_and_never_replaces() {
     ];
     // Stopped with the seed identity is the accepting control for the
     // identity-mismatch rows.
-    let cases = SandboxState::all()
+    let cases = SandboxStatus::sweep()
         .into_iter()
-        .map(|state| (state, Identity::Seed, !REFUSED.contains(&state)))
+        .map(|state| {
+            (
+                state,
+                Identity::Seed,
+                !state
+                    .unowned()
+                    .is_some_and(|lifecycle| REFUSED.contains(&lifecycle)),
+            )
+        })
         .chain([
-            (SandboxState::Stopped, Identity::Encrypted, false),
-            (SandboxState::Stopped, Identity::OtherTemplate, false),
-            (SandboxState::Stopped, Identity::OtherHash, false),
+            (SandboxState::Stopped.into(), Identity::Encrypted, false),
+            (SandboxState::Stopped.into(), Identity::OtherTemplate, false),
+            (SandboxState::Stopped.into(), Identity::OtherHash, false),
         ]);
     for (state, identity, admitted) in cases {
         let case = format!("{state:?} {identity:?}");
@@ -390,7 +399,7 @@ const STAGED_ROOTFS: &[u8] = b"complete";
 
 /// A sandbox in `state` with the seed identity and a fully staged import of
 /// `d-imported`.
-fn import_fixture(state: SandboxState) -> ImportFixture {
+fn import_fixture(state: impl Into<SandboxStatus>) -> ImportFixture {
     let root = tempfile::TempDir::new().unwrap();
     let db = crate::db::test_conn();
     let id = uuid::Uuid::now_v7().to_string();

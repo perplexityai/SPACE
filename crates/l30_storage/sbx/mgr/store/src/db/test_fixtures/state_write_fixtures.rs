@@ -27,7 +27,7 @@ use crate::db::{
     insert_sandbox_with_cleanup_episode_and_route_evidence, set_cleanup_intent, update_state_from,
     update_state_superseding_activation_in_transaction,
 };
-use crate::state::SandboxState;
+use crate::state::{CleanupState, SandboxState, SandboxStatus};
 
 pub type Row = BTreeMap<String, Value>;
 
@@ -358,7 +358,7 @@ pub fn assert_unchanged(case: &str, before: &Snapshot, conn: &Connection) {
 }
 
 /// Insert a plain sandbox row in `state`.
-pub fn insert_row(conn: &Connection, state: SandboxState) -> String {
+pub fn insert_row(conn: &Connection, state: impl Into<SandboxStatus>) -> String {
     let sandbox_id = SandboxId::new();
     let id = sandbox_id.to_string();
     insert_test_sandbox(
@@ -376,8 +376,9 @@ pub fn insert_row(conn: &Connection, state: SandboxState) -> String {
 /// `restoring` row carries a remote restore's three restore columns, which the
 /// table's `CHECK` ties to that state. A cleanup status is stored as its
 /// cleanup state over the teardown transition the row's intent names.
-pub fn force_state(conn: &Connection, id: &str, state: SandboxState) {
-    let restoring = state == SandboxState::Restoring;
+pub fn force_state(conn: &Connection, id: &str, state: impl Into<SandboxStatus>) {
+    let state = state.into();
+    let restoring = state.is_unowned(SandboxState::Restoring);
     conn.execute(
         "UPDATE sandboxes
             SET state = CASE
@@ -393,11 +394,11 @@ pub fn force_state(conn: &Connection, id: &str, state: SandboxState) {
                 restore_storage_uri = CASE WHEN ?2 THEN ?4 END
           WHERE id = ?3",
         params![
-            state.as_str(),
+            state.lifecycle().as_str(),
             restoring,
             id,
             RESTORE_STORAGE_URI,
-            state.cleanup_label()
+            state.cleanup().map(CleanupState::as_str)
         ],
     )
     .unwrap();
@@ -405,14 +406,19 @@ pub fn force_state(conn: &Connection, id: &str, state: SandboxState) {
 
 /// The `(state, cleanup_state)` columns a row inserted with `status` stores,
 /// for fixtures that insert rows with their own SQL.
-pub fn stored_columns(status: SandboxState) -> (&'static str, Option<&'static str>) {
-    (status.inserted_lifecycle(), status.cleanup_label())
+pub fn stored_columns(status: impl Into<SandboxStatus>) -> (&'static str, Option<&'static str>) {
+    let status = status.into();
+    (
+        status.lifecycle().as_str(),
+        status.cleanup().map(CleanupState::as_str),
+    )
 }
 
 /// Store `state` on a seeded row without any writer's side effects: a
 /// lifecycle state as itself, a cleanup status as its cleanup state over the
 /// teardown transition the row's intent names.
-pub fn write_status(conn: &Connection, id: &str, state: SandboxState) {
+pub fn write_status(conn: &Connection, id: &str, state: impl Into<SandboxStatus>) {
+    let state = state.into();
     let changed = conn
         .execute(
             "UPDATE sandboxes
@@ -426,7 +432,11 @@ pub fn write_status(conn: &Connection, id: &str, state: SandboxState) {
                     END,
                     cleanup_state = ?2
               WHERE id = ?3",
-            params![state.as_str(), state.cleanup_label(), id],
+            params![
+                state.lifecycle().as_str(),
+                state.cleanup().map(CleanupState::as_str),
+                id
+            ],
         )
         .unwrap();
     assert_eq!(changed, 1, "{id}");
@@ -769,7 +779,7 @@ pub fn decorate(conn: &Connection, id: &str, receipt: SandboxState) {
 /// `customize` adjust them, and pass them to `insert`.
 pub fn with_sandbox_params<T>(
     id: &str,
-    state: SandboxState,
+    state: impl Into<SandboxStatus>,
     customize: impl FnOnce(&mut InsertSandboxParams<'_>),
     insert: impl FnOnce(InsertSandboxParams<'_>) -> T,
 ) -> T {
@@ -781,7 +791,10 @@ pub fn with_sandbox_params<T>(
         guest_image: Default::default(),
         id,
         uuid8: &uuid8,
-        state,
+        state: crate::db::InsertedStatus::try_from(state.into()).expect(
+            "an insert stores a cleanup only over stopping; record a delete or suspend \
+             cleanup with its writer",
+        ),
         template: "seed",
         template_hash: Some("hash"),
         user: &user,

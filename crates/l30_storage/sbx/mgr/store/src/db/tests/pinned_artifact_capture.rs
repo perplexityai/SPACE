@@ -262,7 +262,7 @@ fn a_same_second_failed_launched_start_leaves_no_pin_to_accept() {
         .unwrap();
 
     let row = get_sandbox(&conn, &id).unwrap().unwrap();
-    assert_eq!(row.state, SandboxState::Stopped);
+    assert_eq!(row.state, SandboxStatus::from(SandboxState::Stopped));
     assert_eq!(row.current_local_artifact_id, None);
     assert!(
         pinned_local_artifact_created_at(&conn, std::slice::from_ref(&id))

@@ -141,9 +141,14 @@ context. Keep event names domain-level: prefer `pause_requested` or
   `installed_network_policy_ref`, `network_state`, and errors when available.
 - Sandbox-manager transitions carry `from_cleanup_state` and
   `to_cleanup_state` (`none`, `required`, `failed`, or `unknown`) next to
-  `from_state`/`to_state`. A node-local cleanup is not a lifecycle state;
-  `from_state`/`to_state` still report it as `cleanup_required` or
-  `cleanup_failed`, so read the cleanup fields to tell the two apart.
+  `from_state`/`to_state`, which carry the underlying lifecycle. For example,
+  a failed delete cleanup has `to_state = deleting` and
+  `to_cleanup_state = failed`. Query cleanup ownership through the cleanup
+  fields; query cleanup-failure events with `event_type = cleanup_failed`,
+  not `to_state = cleanup_failed`. Older sandbox-manager releases folded
+  cleanup into `cleanup_required`/`cleanup_failed` in the state fields, so
+  queries spanning those releases must accept both representations. The
+  event type names are unchanged.
 - Add new event types only when they describe a domain transition or durable
   handoff that helps reconstruct sandbox state. Put implementation details in
   `source`, `reason`, or other detail fields.

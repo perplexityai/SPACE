@@ -27,7 +27,7 @@ async fn cancelled_local_eviction_retains_writer_until_cleanup_persistence_finis
     assert!(eviction.as_mut().poll(&mut context).is_pending());
     assert_eq!(
         service.lookup_sandbox(ID).unwrap().state,
-        crate::state::SandboxState::Deleting,
+        crate::state::SandboxStatus::from(crate::state::SandboxState::Deleting),
     );
     let drain_pending = {
         let db = service.db.lock().unwrap();

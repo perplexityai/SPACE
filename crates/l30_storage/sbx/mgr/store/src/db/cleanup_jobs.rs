@@ -77,7 +77,7 @@ pub(crate) fn finish_in_transaction(
 /// delete receipt can establish prior application by a different binary.
 pub fn eligibility(conn: &Connection, work: &CleanupWork) -> crate::db::Result<CleanupEligibility> {
     let id = work.sandbox_id.to_string();
-    let state = current_state_label(conn, &id)?;
+    let state = current_status_or_text(conn, &id)?;
     if state.is_none()
         && work.completion == CleanupCompletion::DeleteRow
         && let Some(generation) = work.execution_generation
@@ -88,7 +88,7 @@ pub fn eligibility(conn: &Connection, work: &CleanupWork) -> crate::db::Result<C
     let Some(state) = state else {
         return Ok(CleanupEligibility::Finished(CleanupOutcome::Superseded));
     };
-    let Ok(state) = state.parse::<SandboxState>() else {
+    let Ok(state) = state else {
         return Ok(CleanupEligibility::Finished(CleanupOutcome::Blocked(
             "cleanup encountered an unknown lifecycle state; operator repair required".to_owned(),
         )));
@@ -96,7 +96,7 @@ pub fn eligibility(conn: &Connection, work: &CleanupWork) -> crate::db::Result<C
     if runtime_execution_generation(conn, &id)? != work.execution_generation {
         return Ok(CleanupEligibility::Finished(CleanupOutcome::Superseded));
     }
-    if state == SandboxState::Quarantined {
+    if state.is_unowned(SandboxState::Quarantined) {
         return Ok(CleanupEligibility::Finished(CleanupOutcome::Quarantined(
             "sandbox is quarantined; operator repair required".to_owned(),
         )));
@@ -134,8 +134,8 @@ impl GuestFlush {
     /// pause flushes before it freezes the VM, and a write in progress then
     /// can complete after that flush, so cleanup resumes a paused VM to
     /// flush it.
-    pub fn for_superseded_state(self, state: Option<SandboxState>) -> Self {
-        match (self, state) {
+    pub fn for_superseded_state(self, state: Option<impl Into<SandboxStatus>>) -> Self {
+        match (self, state.map(Into::into).and_then(SandboxStatus::unowned)) {
             (
                 Self::BeforeTermination,
                 Some(

@@ -218,7 +218,7 @@ pub(super) async fn pause_with_reconciliation(
             })
             .map(|row| row.state);
         if let Some(found) = found
-            && found != SandboxState::Pausing
+            && !found.is_unowned(SandboxState::Pausing)
         {
             return Err(StateWriteRejected::FromState { found });
         }

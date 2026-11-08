@@ -25,7 +25,7 @@ impl SandboxManagerService {
                 "app snapshot checks require a template-owned sandbox",
             ));
         }
-        if sandbox.pool_template.is_some() || sandbox.state != SandboxState::Started {
+        if sandbox.pool_template.is_some() || !sandbox.state.is_unowned(SandboxState::Started) {
             return Err(Status::failed_precondition(
                 "app snapshot checks require a running, non-pool template sandbox",
             ));

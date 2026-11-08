@@ -146,7 +146,11 @@ fn list_page_keeps_the_identity_of_an_undecodable_row() {
     assert_eq!(page_ids(&page), ids);
     assert!(matches!(
         &page.rows[0],
-        ListPageRow::Undecodable { state: Some(state), .. } if state == "started"
+        ListPageRow::Undecodable {
+            lifecycle: Some(lifecycle),
+            cleanup_state: Ok(None),
+            ..
+        } if lifecycle == "started"
     ));
     assert!(matches!(page.rows[1], ListPageRow::Decoded(_)));
 }

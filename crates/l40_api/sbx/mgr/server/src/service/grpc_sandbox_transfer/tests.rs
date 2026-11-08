@@ -290,7 +290,7 @@ async fn import_reservation_preserves_existing_files_and_fences_completion() {
             result.unwrap();
             assert_eq!(
                 crate::db::get_sandbox(&db, &id).unwrap().unwrap().state,
-                SandboxState::Creating
+                SandboxStatus::from(SandboxState::Creating)
             );
             assert!(crate::db::has_cleanup_episode(&db, &id).unwrap());
             assert!(
@@ -305,7 +305,7 @@ async fn import_reservation_preserves_existing_files_and_fences_completion() {
             assert!(crate::db::transfer::complete_import(&db, &id, cleanup_id, false).unwrap());
             assert_eq!(
                 crate::db::get_sandbox(&db, &id).unwrap().unwrap().state,
-                SandboxState::Stopped
+                SandboxStatus::from(SandboxState::Stopped)
             );
             assert!(!crate::db::has_cleanup_episode(&db, &id).unwrap());
             assert!(!crate::db::transfer::complete_import(&db, &id, cleanup_id, true).unwrap());

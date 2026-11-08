@@ -14,7 +14,7 @@ use crate::service::SandboxManagerService;
 use crate::service::activation_support::internal_request;
 use crate::service::network_policy::EffectiveNetworkPolicy;
 use crate::service::tests::service_tests::insert_test_sandbox;
-use crate::state::SandboxState;
+use crate::state::{SandboxState, SandboxStatus};
 use pplx_space_common_core::node_drain_signals::{
     REUPLOAD_ARTIFACT_MISSING_MARKER, REUPLOAD_SANDBOX_UNKNOWN_MARKER,
 };
@@ -1158,7 +1158,7 @@ async fn kill_refuses_signals_it_cannot_deliver_before_cleanup_admission() {
             "{case}"
         );
     };
-    let service_with = |state: Option<SandboxState>| {
+    let service_with = |state: Option<SandboxStatus>| {
         let conn = crate::db::test_conn();
         let id = SandboxId::new().to_string();
         if let Some(state) = state {
@@ -1169,8 +1169,11 @@ async fn kill_refuses_signals_it_cannot_deliver_before_cleanup_admission() {
         (service, id)
     };
 
-    for state in SandboxState::all() {
-        let deliverable = matches!(state, SandboxState::Started | SandboxState::Paused);
+    for state in SandboxStatus::sweep() {
+        let deliverable = matches!(
+            state.unowned(),
+            Some(SandboxState::Started | SandboxState::Paused)
+        );
         for signal in [9, 15] {
             let (service, id) = service_with(Some(state));
             let case = format!("{state} signal {signal}");
@@ -1243,13 +1246,13 @@ async fn kill_refuses_signals_it_cannot_deliver_before_cleanup_admission() {
             tonic::Code::NotFound,
         ),
     ] {
-        let (service, id) = service_with(state);
+        let (service, id) = service_with(state.map(SandboxStatus::from));
         if closed {
             service.shutdown_token.cancel();
         }
         let error = kill(&service, &id, signal, case, barrier).await;
         assert_eq!(error.code(), expected, "{case}: {error}");
-        cleanup_untouched(&service, &id, state, case);
+        cleanup_untouched(&service, &id, state.map(SandboxStatus::from), case);
     }
 }
 

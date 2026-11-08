@@ -101,7 +101,12 @@ async fn fatal_kill_signal_failure_still_schedules_admitted_cleanup() {
     // The cleanup admitted before the signal still runs: node-manager stops
     // the same execution, keeping its filesystem, and the row ends stopped.
     tokio::time::timeout(Duration::from_secs(5), async {
-        while service.lookup_sandbox(&sandbox_id_string).unwrap().state != SandboxState::Stopped {
+        while !service
+            .lookup_sandbox(&sandbox_id_string)
+            .unwrap()
+            .state
+            .is_unowned(SandboxState::Stopped)
+        {
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
     })
@@ -250,7 +255,7 @@ async fn unsealed_encrypted_capture_survives_restart_and_publishes_once_sealed()
     );
     recover_batch(&service, cache.path(), &id).await;
     let row = service.lookup_sandbox(&id).unwrap();
-    assert_eq!(row.state, SandboxState::Suspending);
+    assert_eq!(row.state, SandboxStatus::from(SandboxState::Suspending));
     assert!(staging.join(publication::ENCRYPTED_CAPTURE_RECORD).exists());
 
     // Once the holder exits, the next pass seals it. That pass's own
@@ -269,7 +274,10 @@ async fn unsealed_encrypted_capture_survives_restart_and_publishes_once_sealed()
         ["ReleaseEncryptedVolume", "ReleaseEncryptedVolume"]
     );
     let row = service.lookup_sandbox(&id).unwrap();
-    assert_eq!(row.state, SandboxState::CleanupRequired);
+    assert_eq!(
+        row.state,
+        SandboxStatus::owned(crate::state::Teardown::Suspending, CleanupState::Required)
+    );
     assert_eq!(row.current_local_artifact_id, Some(capture));
     let published = publication::canonical_suspend_snapshot_dir(&cache.path().join(&id));
     assert!(
@@ -309,7 +317,7 @@ async fn expired_encrypted_capture_is_quarantined_without_a_seal_attempt() {
         "an expired capture must not be sealed"
     );
     let row = service.lookup_sandbox(&id).unwrap();
-    assert_eq!(row.state, SandboxState::Quarantined);
+    assert_eq!(row.state, SandboxStatus::from(SandboxState::Quarantined));
     // This reason is what makes deletion keep the only copy.
     assert_eq!(
         row.failure_reason.as_deref(),
@@ -342,7 +350,10 @@ async fn complete_staged_capture_publishes_past_an_older_unsealed_record() {
         "a complete capture needs no seal"
     );
     let row = service.lookup_sandbox(&id).unwrap();
-    assert_eq!(row.state, SandboxState::CleanupRequired);
+    assert_eq!(
+        row.state,
+        SandboxStatus::owned(crate::state::Teardown::Suspending, CleanupState::Required)
+    );
     assert_eq!(row.current_local_artifact_id, Some(newer));
 }
 
@@ -364,7 +375,7 @@ async fn uncommitted_encrypted_capture_record_is_never_sealed() {
         "an unfinished capture must not be sealed"
     );
     let row = service.lookup_sandbox(&id).unwrap();
-    assert_eq!(row.state, SandboxState::Quarantined);
+    assert_eq!(row.state, SandboxStatus::from(SandboxState::Quarantined));
     assert_eq!(
         row.failure_reason.as_deref(),
         Some(crate::db::SUSPEND_PUBLISH_FAILED_NO_ARTIFACT_RUNTIME_GONE)

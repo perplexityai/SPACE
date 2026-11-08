@@ -39,7 +39,7 @@ fn insert_sandbox(conn: &Connection, sandbox_id: SandboxId) -> AutoLifecycleDele
             guest_image: Default::default(),
             id: &sandbox_id.to_string(),
             uuid8: &runtime_label,
-            state: crate::state::SandboxState::Started,
+            state: crate::state::SandboxState::Started.into(),
             template: "seed",
             template_hash: Some("hash"),
             user: &owner,
@@ -1450,7 +1450,7 @@ fn beginning_an_execution_cannot_supersede_a_current_pending_receipt() {
             .unwrap()
             .unwrap()
             .state,
-        crate::state::SandboxState::Created
+        crate::state::SandboxStatus::from(crate::state::SandboxState::Created)
     );
     assert_eq!(
         pending_receipt_for_sandbox(&conn, sandbox_id).unwrap(),

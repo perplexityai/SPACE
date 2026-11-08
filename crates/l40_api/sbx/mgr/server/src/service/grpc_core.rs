@@ -31,9 +31,7 @@ fn sandbox_list_element(row: &crate::db::SandboxListRow) -> SandboxListElement {
     SandboxListElement {
         sandbox_id: row.id.clone(),
         template: Some(row.template.clone()),
-        lifecycle: Some(crate::proto::SandboxLifecycleState::from(
-            super::grpc_state_snapshot::published_lifecycle(row.state, row.lifecycle),
-        ) as i32),
+        lifecycle: Some(crate::proto::SandboxLifecycleState::from(row.state.lifecycle()) as i32),
         image_hash: row.template_hash.clone(),
         pool_template: row.pool_template.clone(),
         runtime: Some(row.runtime.clone()),
@@ -89,8 +87,8 @@ fn list_page_response(
             }
             ListPageRow::Undecodable {
                 id,
-                state,
                 lifecycle,
+                cleanup_state,
                 error,
             } => {
                 tracing::warn!(
@@ -98,25 +96,16 @@ fn list_page_response(
                     error = %crate::db::describe_error(error),
                     "listing sandbox identity after a row decode failure"
                 );
-                // The status and stored lifecycle read apart from the fields
-                // that failed, so they publish as a decoded row's would; only
-                // the cleanup's completion is unknown.
-                let status = state
-                    .as_deref()
-                    .and_then(|state| state.parse::<SandboxState>().ok());
-                let stored = lifecycle
-                    .as_deref()
-                    .and_then(|lifecycle| lifecycle.parse::<SandboxState>().ok());
-                let published = status.and_then(|status| match stored {
-                    Some(stored) => Some(super::grpc_state_snapshot::published_lifecycle(
-                        status, stored,
-                    )),
-                    // Without the stored lifecycle, the one under a cleanup
-                    // is unknown.
-                    None => (super::grpc_state_snapshot::cleanup_owner(status)
-                        == crate::proto::SandboxCleanupState::Unspecified)
-                        .then_some(status),
-                });
+                // The lifecycle and cleanup read apart from the fields that
+                // failed, so they publish as a decoded row's would; only the
+                // cleanup's completion is unknown.
+                let status = match (lifecycle.as_deref(), cleanup_state.as_ref()) {
+                    (Some(lifecycle), Ok(cleanup)) => {
+                        SandboxStatus::from_columns(lifecycle, cleanup.as_deref())
+                    }
+                    _ => None,
+                };
+                let published = status.map(|status| status.lifecycle());
                 SandboxListElement {
                     sandbox_id: id.clone(),
                     lifecycle: Some(published.map_or(
@@ -447,10 +436,7 @@ impl SandboxManagerService {
                         )));
                     }
 
-                    if matches!(
-                        existing.state,
-                        SandboxState::CleanupRequired | SandboxState::CleanupFailed
-                    ) {
+                    if existing.state.is_cleanup_owned() {
                         return Err(Status::unavailable(format!(
                             "requested sandbox {} is still completing activation cleanup; retry",
                             existing.id
@@ -485,10 +471,7 @@ impl SandboxManagerService {
                                     mismatches.join(", ")
                                 )));
                             }
-                            if matches!(
-                                existing.state,
-                                SandboxState::CleanupRequired | SandboxState::CleanupFailed
-                            ) {
+                            if existing.state.is_cleanup_owned() {
                                 return Err(Status::unavailable(format!(
                                     "requested sandbox {} is still completing activation cleanup; retry",
                                     existing.id
@@ -899,10 +882,10 @@ impl SandboxManagerService {
                     .filter(|episode| episode.completion == CleanupCompletion::DeletePoolClone);
                 let quarantined = episode.is_some()
                     && crate::db::read::sandbox_view(&db, id)
-                        .current_state_label()
+                        .current_status()
                         .map_err(|e| Status::internal(format!("read clone disposal state: {e}")))?
-                        .as_deref()
-                        == Some(SandboxState::Quarantined.as_str());
+                        .and_then(Result::ok)
+                        .is_some_and(|status| status.is_unowned(SandboxState::Quarantined));
                 (episode, quarantined)
             };
             if let Some(episode) = clone_disposal {

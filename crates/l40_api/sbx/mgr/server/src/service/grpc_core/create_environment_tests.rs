@@ -226,7 +226,11 @@ async fn create_on_every_path(
             assert_eq!(&response.sandbox_id, requested, "{name}");
         }
         let row = created.fixture.row(&response.sandbox_id).unwrap();
-        assert_eq!(row.state, SandboxState::Created, "{name}");
+        assert_eq!(
+            row.state,
+            SandboxStatus::from(SandboxState::Created),
+            "{name}"
+        );
         assert_eq!(row.execution_metadata.as_ref(), Some(template), "{name}");
         assert_eq!(row.pool_template, request.pool_template, "{name}");
         assert_eq!(row.snapshots_enabled, request.snapshots_enabled, "{name}");
@@ -438,7 +442,7 @@ async fn an_upgrade_template_adopts_its_pool_donor_but_explicit_selection_does_n
             assert_eq!(row.execution_metadata, Some(execution.clone()));
             assert_eq!(
                 created.fixture.row(&donor).unwrap().state,
-                SandboxState::Paused
+                SandboxStatus::from(SandboxState::Paused)
             );
         } else {
             assert_eq!(response.sandbox_id, donor);
@@ -823,7 +827,7 @@ async fn warm_start_refuses_a_base_snapshot_captured_under_another_environment()
         if refused {
             assert_eq!(
                 fixture.row(&id).unwrap().state,
-                SandboxState::Stopped,
+                SandboxStatus::from(SandboxState::Stopped),
                 "{snapshot:?}"
             );
         }

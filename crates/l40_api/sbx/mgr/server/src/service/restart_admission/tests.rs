@@ -443,7 +443,10 @@ async fn cancelled_activation_retries_release_admission_without_releasing_the_lo
                 .expect_err("cancelling a waiter must not release its owner");
             match state {
                 Some(state) => {
-                    assert_eq!(manager.lookup_sandbox(&sandbox_id).unwrap().state, state)
+                    assert_eq!(
+                        manager.lookup_sandbox(&sandbox_id).unwrap().state,
+                        crate::state::SandboxStatus::from(state)
+                    )
                 }
                 None => assert_eq!(
                     manager.lookup_sandbox(&sandbox_id).err().unwrap().code(),
@@ -529,7 +532,7 @@ async fn blocking_wake_without_client_deadline_has_bounded_passive_wait() {
     assert_eq!(result.unwrap_err().code(), tonic::Code::DeadlineExceeded);
     assert_eq!(
         manager.lookup_sandbox(&sandbox_id).unwrap().state,
-        SandboxState::Starting
+        crate::state::SandboxStatus::from(SandboxState::Starting)
     );
     drop(
         manager

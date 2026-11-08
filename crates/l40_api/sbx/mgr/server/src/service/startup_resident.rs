@@ -23,8 +23,8 @@ impl SandboxManagerService {
         let failed = AtomicBool::new(false);
         stream::iter(rows.into_iter().filter(|row| {
             matches!(
-                row.state,
-                SandboxState::Paused | SandboxState::Resuming | SandboxState::Checkpointing
+                row.state.unowned(),
+                Some(SandboxState::Paused | SandboxState::Resuming | SandboxState::Checkpointing)
             )
         }))
         .take_while(|_| std::future::ready(!failed.load(Ordering::Relaxed)))
@@ -65,7 +65,7 @@ impl SandboxManagerService {
     ) -> Result<(), Status> {
         prepare_resident_peer(
             &row.id,
-            row.state,
+            row.state.lifecycle(),
             target,
             &row.process_env,
             self.connect_spaced_host_with_policy(row, SpacedEndpointProofPolicy::ValidateOnly),
@@ -84,7 +84,7 @@ impl SandboxManagerService {
             if shutdown.is_cancelled() {
                 return;
             }
-            if row.state == SandboxState::Started {
+            if row.state.is_unowned(SandboxState::Started) {
                 // Both adapters use fenced execution identities. Do not run
                 // process-exit recovery on development hosts without pidfds.
                 if !cfg!(target_os = "linux") { return; }
@@ -151,10 +151,12 @@ impl SandboxManagerService {
         Prepare: FnOnce(SandboxState) -> PrepareFuture,
         PrepareFuture: std::future::Future<Output = Result<(), Status>>,
     {
-        let reason_code = match row.state {
-            SandboxState::Paused => SandboxQuarantineReasonCode::RuntimeProbeInconsistent,
-            SandboxState::Resuming => SandboxQuarantineReasonCode::ResidentResumeFailed,
-            SandboxState::Checkpointing => SandboxQuarantineReasonCode::CheckpointResumeFailed,
+        let reason_code = match row.state.unowned() {
+            Some(SandboxState::Paused) => SandboxQuarantineReasonCode::RuntimeProbeInconsistent,
+            Some(SandboxState::Resuming) => SandboxQuarantineReasonCode::ResidentResumeFailed,
+            Some(SandboxState::Checkpointing) => {
+                SandboxQuarantineReasonCode::CheckpointResumeFailed
+            }
             _ => return Err(crate::db::Error::invalid_query().into()),
         };
         // Resume uses the wake lock; teardown/activation uses the cleanup
@@ -200,18 +202,18 @@ impl SandboxManagerService {
                 match observe_stable_resident_state(id, probe).await {
                     // A stable pause needs no replay. Failure to reach the node
                     // is not proof of lost memory while its PID witness exists.
-                    Ok(VmState::Paused) if row.state == SandboxState::Paused => {
+                    Ok(VmState::Paused) if row.state.is_unowned(SandboxState::Paused) => {
                         return Ok(StartupRecoveryRecord {
                             id: row.id,
                             previous_state: row.state,
                             outcome: StartupRecoveryOutcome::Deferred,
                         });
                     }
-                    Ok(VmState::Running) if row.state == SandboxState::Paused => {
+                    Ok(VmState::Running) if row.state.is_unowned(SandboxState::Paused) => {
                         detail = "paused lifecycle contradicts the running resident VM".into();
                     }
                     Ok(VmState::Running) => target = SandboxState::Started,
-                    Ok(VmState::Paused) if row.state != SandboxState::Checkpointing => {
+                    Ok(VmState::Paused) if !row.state.is_unowned(SandboxState::Checkpointing) => {
                         target = SandboxState::Paused
                     }
                     Ok(VmState::Paused) => {
@@ -221,7 +223,7 @@ impl SandboxManagerService {
                         detail = "runtime reported not started or shut down; resident memory is unavailable"
                             .into();
                     }
-                    Err(error) if row.state == SandboxState::Paused => {
+                    Err(error) if row.state.is_unowned(SandboxState::Paused) => {
                         if !matches!(
                             tokio::fs::try_exists(run_dir.join(&row.id).join("fc.pid")).await,
                             Ok(false)

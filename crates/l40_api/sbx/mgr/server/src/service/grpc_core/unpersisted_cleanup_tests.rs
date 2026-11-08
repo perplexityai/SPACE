@@ -188,7 +188,11 @@ async fn unpersisted_stop_and_delete_clean_up_through_node_manager_and_report_th
                 );
                 let db = service.db_conn().unwrap();
                 let row = crate::db::get_sandbox(&db, &id).unwrap().unwrap();
-                assert_eq!(row.state, SandboxState::Started, "{context}");
+                assert_eq!(
+                    row.state,
+                    SandboxStatus::from(SandboxState::Started),
+                    "{context}"
+                );
                 assert_eq!(row.cleanup_completion, None, "{context}");
                 assert!(
                     crate::db::cleanup_episode(&db, &id).unwrap().is_none(),

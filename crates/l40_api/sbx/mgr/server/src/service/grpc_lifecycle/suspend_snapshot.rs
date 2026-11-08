@@ -309,7 +309,7 @@ impl SandboxManagerService {
                 return SuspendSnapshotStagingDisposition::Preserve;
             };
             match crate::db::read::sandbox(&db, sandbox_id) {
-                Ok(Some(row)) if row.state == SandboxState::Suspending => row,
+                Ok(Some(row)) if row.state.is_unowned(SandboxState::Suspending) => row,
                 Ok(Some(row)) => {
                     tracing::warn!(
                         sandbox_id,

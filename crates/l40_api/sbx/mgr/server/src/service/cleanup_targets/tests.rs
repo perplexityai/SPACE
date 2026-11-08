@@ -127,10 +127,8 @@ async fn selected_cleanup_rechecks_template_and_owner_after_acquiring_admission_
             {
                 let db = service.db_conn().unwrap();
                 assert_eq!(
-                    crate::db::current_state_label(&db, &id.to_string())
-                        .unwrap()
-                        .as_deref(),
-                    (change != "absent").then_some("started")
+                    crate::db::current_status(&db, &id.to_string()).unwrap(),
+                    (change != "absent").then_some(SandboxStatus::from(SandboxState::Started))
                 );
                 assert!(
                     crate::db::cleanup_episode(&db, &id.to_string())
@@ -346,7 +344,10 @@ async fn normalized_selectors_reach_fenced_stop_and_delete_completion() {
                 .unwrap();
             let row = crate::db::get_sandbox(&service.db.lock().unwrap(), canonical).unwrap();
             if stop {
-                assert_eq!(row.unwrap().state, SandboxState::Stopped);
+                assert_eq!(
+                    row.unwrap().state,
+                    SandboxStatus::from(SandboxState::Stopped)
+                );
             } else {
                 assert!(row.is_none());
             }

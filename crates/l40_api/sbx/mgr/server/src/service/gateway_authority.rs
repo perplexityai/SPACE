@@ -69,8 +69,12 @@ impl GatewayAuthority {
     }
 }
 
-fn can_issue_authority(state: SandboxState) -> bool {
-    match state {
+fn can_issue_authority(state: impl Into<SandboxStatus>) -> bool {
+    let state = state.into();
+    if state.is_cleanup_owned() {
+        return false;
+    }
+    match state.lifecycle() {
         SandboxState::Starting
         | SandboxState::Restoring
         | SandboxState::Started
@@ -85,21 +89,20 @@ fn can_issue_authority(state: SandboxState) -> bool {
         | SandboxState::Deleting
         | SandboxState::Suspending
         | SandboxState::Suspended
-        | SandboxState::CleanupRequired
-        | SandboxState::CleanupFailed
         | SandboxState::Quarantined
         | SandboxState::Failed => false,
     }
 }
 
-fn retry_incomplete_identity(state: SandboxState) -> bool {
+fn retry_incomplete_identity(state: impl Into<SandboxStatus>) -> bool {
     matches!(
-        state,
-        SandboxState::Starting | SandboxState::Restoring | SandboxState::Resuming
+        state.into().unowned(),
+        Some(SandboxState::Starting | SandboxState::Restoring | SandboxState::Resuming)
     )
 }
 
-fn incomplete_identity_status(state: SandboxState) -> Status {
+fn incomplete_identity_status(state: impl Into<SandboxStatus>) -> Status {
+    let state = state.into();
     if retry_incomplete_identity(state) {
         // The activation publishes the identity shortly; the gateway asks
         // again and installs its CA then. UNAVAILABLE keeps that retry and
