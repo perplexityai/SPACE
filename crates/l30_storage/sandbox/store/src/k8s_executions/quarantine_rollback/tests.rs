@@ -170,6 +170,7 @@ async fn lock_activation_rollback_candidates_locks_the_sandbox_and_its_fenced_ex
         node_id,
         Json(rows.clone()),
         SandboxTransitionReceiptKind::ActivationRollback,
+        "stopped",
     )
     .await?;
     assert_eq!(
@@ -183,6 +184,7 @@ async fn lock_activation_rollback_candidates_locks_the_sandbox_and_its_fenced_ex
             reason_code: "activation_failed".to_string(),
             prior_lifecycle: "starting".to_string(),
             failure_message: Some("boot failed".to_string()),
+            stay_stopped_upgrade: false,
         }]
     );
     // `FOR UPDATE OF s, execution`: both rows, so that even a key-share lock
@@ -213,11 +215,81 @@ async fn lock_activation_rollback_candidates_locks_the_sandbox_and_its_fenced_ex
             SandboxTransitionReceiptKind::ActivationRollback,
         ),
     ] {
-        let candidates =
-            lock_activation_rollback_candidates(&mut *tx, node, Json(rows.clone()), kind).await?;
+        let candidates = lock_activation_rollback_candidates(
+            &mut *tx,
+            node,
+            Json(rows.clone()),
+            kind,
+            "stopped",
+        )
+        .await?;
         assert!(candidates.is_empty());
     }
     tx.rollback().await?;
+    Ok(())
+}
+
+/// A candidate is a stay-stopped upgrade's only when its execution records a
+/// runtime upgrade and its claim targets the state the caller names: a
+/// recorded upgrade under another target, or that target with nothing
+/// recorded, isn't one.
+#[tokio::test(flavor = "current_thread")]
+async fn a_candidate_is_a_stay_stopped_upgrade_only_with_its_record_and_target() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let pool = &db.pool;
+    let node_id = insert_node(pool).await?;
+    let mut rows = Vec::new();
+    let mut expected = Vec::new();
+    for (recorded, claim_target, stay_stopped) in [
+        (true, "stopped", true),
+        (true, "started", false),
+        (false, "stopped", false),
+    ] {
+        let (sandbox_id, execution, attempt) = seed(pool, node_id, "stopped").await?;
+        sqlx::query(sql!(
+            "UPDATE sandbox_k8s_executions
+                SET activation_attempt_target_state = $2,
+                    runtime_upgrade_operation_id = CASE WHEN $3 THEN $4 END,
+                    runtime_upgrade_target_environment_ref = CASE WHEN $3 THEN $5 END,
+                    runtime_upgrade_authorization_id = CASE WHEN $3 THEN $6 END
+              WHERE id = $1"
+        ))
+        .bind(execution.id)
+        .bind(claim_target)
+        .bind(recorded)
+        .bind(Uuid::now_v7())
+        .bind(format!("sha256:{}", "a".repeat(64)))
+        .bind("runtime-environment-test:e1")
+        .execute(pool)
+        .await?;
+        rows.push(receipt(
+            sandbox_id,
+            SandboxCleanupEpisodeId::new(),
+            4,
+            attempt,
+        ));
+        expected.push((sandbox_id, stay_stopped));
+    }
+
+    let mut tx = pool.begin().await?;
+    let candidates = lock_activation_rollback_candidates(
+        &mut *tx,
+        node_id,
+        Json(serde_json::Value::Array(rows)),
+        SandboxTransitionReceiptKind::ActivationRollback,
+        "stopped",
+    )
+    .await?;
+    tx.rollback().await?;
+    let mut flagged: Vec<_> = candidates
+        .iter()
+        .map(|candidate| (candidate.sandbox_id, candidate.stay_stopped_upgrade))
+        .collect();
+    flagged.sort_by_key(|(sandbox_id, _)| sandbox_id.as_uuid());
+    expected.sort_by_key(|(sandbox_id, _)| sandbox_id.as_uuid());
+    assert_eq!(flagged, expected);
     Ok(())
 }
 

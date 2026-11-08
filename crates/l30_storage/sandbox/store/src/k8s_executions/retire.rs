@@ -153,8 +153,12 @@ pub async fn finish_generation_attempt(
 /// Retire `sandbox_id`'s active execution at `generation` as `replaced`
 /// while it is still an unmaterialized `creating` claim (no pod UID or IP)
 /// held by `activation_attempt_id` (`None` matches an execution holding
-/// none). Its pod IP is already `NULL`, so it is left as it is. `false` when
-/// no execution matches, such as one a concurrent attempt materialized.
+/// none) that records no stay-stopped runtime upgrade. Its pod IP is already
+/// `NULL`, so it is left as it is. `false` when no execution matches, such as
+/// one a concurrent attempt materialized, or one that records an upgrade:
+/// that record is the only trace of the disk backup the upgrade may owe, so
+/// such a claim keeps its execution and only its lease ends
+/// ([`super::stopped_runtime_upgrade::end_recorded_create_claim_lease`]).
 pub async fn abandon_unmaterialized_create_claim(
     executor: impl Executor<'_>,
     sandbox_id: SandboxId,
@@ -173,7 +177,8 @@ pub async fn abandon_unmaterialized_create_claim(
                AND activation_attempt_id IS NOT DISTINCT FROM $3
                AND state = 'creating'
                AND pod_uid IS NULL
-               AND pod_ip IS NULL"
+               AND pod_ip IS NULL
+               AND runtime_upgrade_operation_id IS NULL"
     ))
     .bind(sandbox_id)
     .bind(generation)

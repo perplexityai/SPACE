@@ -74,3 +74,44 @@ async fn clear_failed_observation_keeps_a_live_record() -> TestResult {
     );
     Ok(())
 }
+
+/// Only a publish whose status reads `stopped` (trimmed, any case) and whose
+/// execution metadata names the environment counts; another status, another
+/// environment, no metadata or no publish at all doesn't.
+#[tokio::test(flavor = "current_thread")]
+async fn published_stopped_under_matches_only_a_stopped_publish_under_the_environment() -> TestResult
+{
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let node_id = insert_node(&db.pool).await?;
+    const E1: &str = "sha256:1111111111111111111111111111111111111111111111111111111111111111";
+    const E2: &str = "sha256:2222222222222222222222222222222222222222222222222222222222222222";
+    for (status, environment, published) in [
+        (" Stopped", Some(E1), true),
+        ("running", Some(E1), false),
+        ("stopped", Some(E2), false),
+        ("stopped", None, false),
+    ] {
+        let sandbox_id = SandboxId::new();
+        sqlx::query(sql!(
+            "INSERT INTO sandbox_observed_states (sandbox_id, node_id, status, execution_metadata)
+             VALUES ($1, $2, $3,
+                     CASE WHEN $4::TEXT IS NULL THEN NULL
+                          ELSE jsonb_build_object('environment', $4::TEXT) END)"
+        ))
+        .bind(sandbox_id)
+        .bind(node_id)
+        .bind(status)
+        .bind(environment)
+        .execute(&db.pool)
+        .await?;
+        assert_eq!(
+            super::published_stopped_under(&db.pool, sandbox_id, E1).await?,
+            published,
+            "{status:?} under {environment:?}"
+        );
+    }
+    assert!(!super::published_stopped_under(&db.pool, SandboxId::new(), E1).await?);
+    Ok(())
+}

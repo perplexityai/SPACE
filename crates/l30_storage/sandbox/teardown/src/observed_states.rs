@@ -301,5 +301,29 @@ pub async fn last_published_execution(
     .await?)
 }
 
+/// Whether `sandbox_id`'s node published it `stopped` (its status trimmed and
+/// lower-cased) under `environment`, the reference in its execution
+/// metadata's `environment` field. `false` when nothing is published, or the
+/// publish names another status or environment.
+pub async fn published_stopped_under(
+    executor: impl Executor<'_>,
+    sandbox_id: SandboxId,
+    environment: &str,
+) -> Result<bool, DbError> {
+    Ok(sqlx::query_scalar(sql!(
+        "SELECT EXISTS (
+                 SELECT 1
+                   FROM sandbox_observed_states
+                  WHERE sandbox_id = $1
+                    AND LOWER(TRIM(status)) = 'stopped'
+                    AND execution_metadata->>'environment' = $2
+             )"
+    ))
+    .bind(sandbox_id)
+    .bind(environment)
+    .fetch_one(executor.into_sqlx())
+    .await?)
+}
+
 #[cfg(test)]
 mod tests;

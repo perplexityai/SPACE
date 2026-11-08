@@ -61,6 +61,9 @@ pub(super) struct ActivationRollbackCandidate {
     pub(super) reason_code: SandboxQuarantineReasonCode,
     pub(super) prior_lifecycle: SandboxLifecycle,
     pub(super) failure_message: Option<String>,
+    /// The receipt's execution is a stay-stopped runtime upgrade's: it
+    /// records an upgrade and its claim targets `stopped`.
+    pub(super) stay_stopped_upgrade: bool,
 }
 
 #[derive(Debug)]
@@ -264,6 +267,7 @@ pub(super) async fn select_activation_rollback_candidates(
         node_id,
         rows_json,
         SandboxTransitionReceiptKind::ActivationRollback,
+        SandboxTransitionTargetState::Stopped.as_str(),
     )
     .await
     .map_err(|error| Status::internal(format!("select activation rollback receipts: {error}")))?;
@@ -278,6 +282,7 @@ pub(super) async fn select_activation_rollback_candidates(
         reason_code,
         prior_lifecycle,
         failure_message,
+        stay_stopped_upgrade,
     } in rows
     {
         // The stored column has no CHECK, so it can hold text no lifecycle
@@ -308,6 +313,7 @@ pub(super) async fn select_activation_rollback_candidates(
             })?,
             prior_lifecycle,
             failure_message,
+            stay_stopped_upgrade,
         });
     }
     Ok(candidates)
@@ -414,6 +420,18 @@ pub(super) async fn apply_activation_rollback_candidates(
         )
         .await
         .map_err(|error| Status::internal(format!("invalidate rollback port state: {error}")))?;
+        // A stay-stopped runtime upgrade's boot ran on the disk where it
+        // already lies, and its rollback leaves the sandbox `stopped` there.
+        // Unplacing it would leave a `stopped` row no node is recorded as
+        // holding, which node drain neither evacuates nor waits for, so
+        // only the execution retires, as the upgrade's own retire does.
+        if candidate.stay_stopped_upgrade
+            && candidate.target_state == SandboxTransitionTargetState::Stopped
+            && candidate.prior_lifecycle == SandboxLifecycle::Stopped
+        {
+            applied.push(candidate);
+            continue;
+        }
         let converged = pplx_space_sandbox_store::quarantine::converge_activation_rollback(
             &mut *conn,
             node_id,
