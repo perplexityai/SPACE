@@ -211,7 +211,7 @@ UNREAD_BY_LINT = (
     "architecture-baseline.toml",
     "ARCHITECTURE.toml",
     ".config/nextest.toml",
-    ".coderabbit.yaml",
+    ".coderabbit.config.ts",
     ".gitleaks.toml",
     "lefthook.yaml",
     "Tiltfile",
