@@ -94,7 +94,7 @@ impl UnaryListUsage {
     }
 }
 
-const LIST_COLUMNS: &str = "id, state, legacy_state, template, template_hash, user, runtime, created_at, pool_template, \
+const LIST_COLUMNS: &str = "id, state, cleanup_state, template, template_hash, user, runtime, created_at, pool_template, \
      cleanup_completion";
 
 db_private_outside_tests! {
@@ -231,7 +231,15 @@ db_private_outside_tests! {
                 Ok(row) => ListPageRow::Decoded(row),
                 Err(error) => ListPageRow::Undecodable {
                     id: row.get("id")?,
-                    state: row.get::<_, String>("legacy_state").ok(),
+                    state: match (
+                        row.get::<_, String>("state"),
+                        row.get::<_, Option<String>>("cleanup_state"),
+                    ) {
+                        (Ok(state), Ok(cleanup)) => Some(
+                            crate::state::SandboxState::label_from_columns(state, cleanup.as_deref()),
+                        ),
+                        _ => None,
+                    },
                     lifecycle: row.get::<_, String>("state").ok(),
                     error: error.into(),
                 },
@@ -305,7 +313,7 @@ db_private_outside_tests! {
         budget: &mut InventoryBudget,
     ) -> Result<(), InventoryReadError> {
         let mut stmt = conn.prepare_cached(
-            "SELECT s.id, s.legacy_state, s.state_changed_at, s.transition_receipt_id,
+            "SELECT s.id, s.state, s.state_changed_at, s.transition_receipt_id,
                 s.transition_receipt_kind, s.transition_receipt_target_state,
                 s.transition_receipt_execution_generation, s.transition_receipt_reason_code,
                 s.transition_receipt_activation_attempt_id, s.space_api_route_generation,

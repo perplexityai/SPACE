@@ -424,9 +424,12 @@ fn every_allowed_state_transition_tracks_the_change_time() {
             // Assert
             let (state, state_changed_at, updated_at): (String, String, String) = conn
                 .query_row(
-                    "SELECT legacy_state, state_changed_at, updated_at
+                    &format!(
+                        "SELECT {}, state_changed_at, updated_at
                      FROM sandboxes
                      WHERE id = ?1",
+                        crate::db::fixture::STATUS_LABEL_SQL
+                    ),
                     params![sandbox_id],
                     |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
                 )
@@ -485,9 +488,12 @@ fn specialized_state_writers_track_the_change_time() {
     ] {
         let (state, state_changed_at, updated_at): (String, String, String) = conn
             .query_row(
-                "SELECT legacy_state, state_changed_at, updated_at
+                &format!(
+                    "SELECT {}, state_changed_at, updated_at
                  FROM sandboxes
                  WHERE id = ?1",
+                    crate::db::fixture::STATUS_LABEL_SQL
+                ),
                 params![id],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
@@ -2526,9 +2532,12 @@ fn materializing_a_stopped_sandbox_keeps_the_artifact_pin_it_was_evacuated_with(
 
     let (state, pin, kind, origin): (String, Option<String>, Option<String>, Option<String>) = conn
         .query_row(
-            "SELECT legacy_state, current_local_artifact_id, current_local_artifact_kind,
+            &format!(
+                "SELECT {}, current_local_artifact_id, current_local_artifact_kind,
                     current_local_artifact_origin
              FROM sandboxes WHERE id = 'sandbox-1'",
+                crate::db::fixture::STATUS_LABEL_SQL
+            ),
             [],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
@@ -2812,7 +2821,10 @@ fn materializing_a_stopped_sandbox_replaces_a_row_already_holding_that_artifact(
     assert_eq!(row.local_path, stop_path);
     assert_eq!(
         conn.query_row(
-            "SELECT legacy_state FROM sandboxes WHERE id = 'sandbox-1'",
+            &format!(
+                "SELECT {} FROM sandboxes WHERE id = 'sandbox-1'",
+                crate::db::fixture::STATUS_LABEL_SQL
+            ),
             [],
             |row| row.get::<_, String>(0),
         )
@@ -2878,7 +2890,10 @@ fn materializing_a_stopped_sandbox_refuses_a_row_that_left_restoring() {
     assert!(error.is_no_rows(), "{error:?}");
     let state: String = conn
         .query_row(
-            "SELECT legacy_state FROM sandboxes WHERE id = 'sandbox-1'",
+            &format!(
+                "SELECT {} FROM sandboxes WHERE id = 'sandbox-1'",
+                crate::db::fixture::STATUS_LABEL_SQL
+            ),
             [],
             |row| row.get(0),
         )
@@ -2979,8 +2994,11 @@ fn restored_disk_as_new_becomes_a_stopped_sandbox_without_donor_runtime_identity
         Option<String>,
     ) = conn
         .query_row(
-            "SELECT legacy_state, pid, space_api_route_generation, restore_storage_uri
+            &format!(
+                "SELECT {}, pid, space_api_route_generation, restore_storage_uri
              FROM sandboxes WHERE id = 'sandbox-1'",
+                crate::db::fixture::STATUS_LABEL_SQL
+            ),
             [],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
@@ -4705,7 +4723,10 @@ fn a_publishing_orphan_restore_never_becomes_an_adoption_candidate() {
     );
     let state: String = conn
         .query_row(
-            "SELECT legacy_state FROM sandboxes WHERE id = ?1",
+            &format!(
+                "SELECT {} FROM sandboxes WHERE id = ?1",
+                crate::db::fixture::STATUS_LABEL_SQL
+            ),
             params![sandbox_id.to_string()],
             |row| row.get(0),
         )
@@ -6102,7 +6123,10 @@ fn orphan_quarantine_recovery_clears_staging_failure() {
     );
     let (state, failure_reason): (String, Option<String>) = conn
         .query_row(
-            "SELECT legacy_state, failure_reason FROM sandboxes WHERE id = ?1",
+            &format!(
+                "SELECT {}, failure_reason FROM sandboxes WHERE id = ?1",
+                crate::db::fixture::STATUS_LABEL_SQL
+            ),
             params![sandbox_id_string],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
@@ -7242,7 +7266,7 @@ fn pause_failed_quarantine_recovers_to_definitive_runtime_state() {
         assert!(recover_pause_failed_quarantine(&conn, &sandbox_id, target).unwrap());
         let recovered: (String, Option<String>, Option<String>, Option<String>, bool) = conn
             .query_row(
-                "SELECT s.legacy_state,
+                "SELECT CASE WHEN s.cleanup_state IS NULL THEN s.state ELSE 'cleanup_' || s.cleanup_state END,
                         s.failure_reason,
                         history.action,
                         history.next_action,
@@ -8323,7 +8347,10 @@ fn publishing_a_recovered_orphan_leaves_no_quarantine_row() {
     // sandbox as quarantined.
     let state: String = conn
         .query_row(
-            "SELECT legacy_state FROM sandboxes WHERE id = ?1",
+            &format!(
+                "SELECT {} FROM sandboxes WHERE id = ?1",
+                crate::db::fixture::STATUS_LABEL_SQL
+            ),
             params![sandbox_id.to_string()],
             |row| row.get(0),
         )

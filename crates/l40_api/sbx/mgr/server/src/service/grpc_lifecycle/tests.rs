@@ -2809,7 +2809,10 @@ async fn suspend_publication_failure_after_staging_preserves_only_owned_evidence
                 .lock()
                 .unwrap()
                 .query_row(
-                    "SELECT legacy_state FROM sandboxes WHERE id = ?1",
+                    &format!(
+                        "SELECT {} FROM sandboxes WHERE id = ?1",
+                        crate::db::fixture::STATUS_LABEL_SQL
+                    ),
                     [&id],
                     |row| row.get(0),
                 )

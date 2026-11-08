@@ -723,6 +723,12 @@ pub fn seed_historical_lifecycle_rows<T>(
 #[cfg(any(test, feature = "test-support"))]
 #[allow(clippy::unwrap_used)]
 pub mod fixture {
+    /// The combined status label a row's `state` and `cleanup_state` name:
+    /// `cleanup_required` or `cleanup_failed` for a cleanup-owned row,
+    /// otherwise the lifecycle. Tests that read raw rows select it.
+    pub const STATUS_LABEL_SQL: &str =
+        "CASE WHEN cleanup_state IS NULL THEN state ELSE 'cleanup_' || cleanup_state END";
+
     use std::collections::BTreeMap;
     use std::str::FromStr;
 

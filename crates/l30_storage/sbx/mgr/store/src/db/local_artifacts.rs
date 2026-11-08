@@ -81,12 +81,12 @@ pub fn pin_suspended_artifact_for_cleanup(
              cleanup_keep_filesystem = TRUE,
              failure_reason = NULL,
              state_changed_at = CASE
-                 WHEN legacy_state != 'cleanup_required' THEN ?5
+                 WHEN cleanup_state IS NOT 'required' THEN ?5
                  ELSE state_changed_at
              END,
              updated_at = ?5
          WHERE id = ?6
-           AND legacy_state = 'suspending'",
+           AND unowned_state = 'suspending'",
         params![
             local_artifact_id.to_string(),
             ArtifactKind::Full.as_str(),
@@ -620,13 +620,13 @@ pub fn publish_stopped_artifact(
              cleanup_completion = NULL,
              cleanup_keep_filesystem = NULL,
              failure_reason = NULL,
-             state_changed_at = CASE WHEN legacy_state != 'stopped' THEN ?4 ELSE state_changed_at END,
+             state_changed_at = CASE WHEN state != 'stopped' THEN ?4 ELSE state_changed_at END,
              updated_at = ?4
          WHERE id = ?5
            AND (
-               legacy_state = 'stopping'
+               unowned_state = 'stopping'
                OR (
-                   legacy_state IN ('cleanup_required', 'cleanup_failed')
+                   cleanup_state IS NOT NULL
                    AND cleanup_completion = 'mark_stopped'
                )
                OR (

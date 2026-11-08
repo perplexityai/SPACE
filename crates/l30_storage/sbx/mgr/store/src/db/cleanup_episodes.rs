@@ -196,7 +196,7 @@ pub fn charge_prepared_clone_disposal_attempt(
         "UPDATE sandbox_cleanup_episodes SET attempt_count = attempt_count + 1
          WHERE sandbox_id = ?1 AND cleanup_id = ?2 AND completion = 'delete_pool_clone'
            AND phase = 'requested' AND attempt_count < 8
-           AND EXISTS (SELECT 1 FROM sandboxes WHERE id = ?1 AND legacy_state IN ('cleanup_required', 'cleanup_failed')
+           AND EXISTS (SELECT 1 FROM sandboxes WHERE id = ?1 AND cleanup_state IS NOT NULL
                AND cleanup_completion = 'delete_pool_clone')",
         params![id, cleanup_id.to_string()],
     )? == 1)
@@ -438,7 +438,7 @@ pub fn retire_stale_armed_cleanup_episode(
                     cleanup_keep_filesystem = NULL,
                     state = CASE WHEN cleanup_state IS NULL THEN state ELSE 'stopping' END
               WHERE id = ?1
-                AND legacy_state = ?2
+                AND (unowned_state = ?2 OR ?2 = 'cleanup_' || cleanup_state)
                 AND cleanup_completion = ?3
                 AND cleanup_keep_filesystem = ?4",
             params![
@@ -493,12 +493,12 @@ pub fn request_cleanup_episode(
                 restore_phase = NULL,
                 restore_storage_uri = NULL,
                 state_changed_at = CASE
-                    WHEN legacy_state != 'cleanup_required' THEN ?2
+                    WHEN cleanup_state IS NOT 'required' THEN ?2
                     ELSE state_changed_at
                 END,
                 updated_at = ?2
           WHERE id = ?3
-            AND legacy_state NOT IN ('deleting', 'quarantined')
+            AND unowned_state IS NOT 'deleting' AND state IS NOT 'quarantined'
             AND cleanup_completion = ?4
             AND cleanup_keep_filesystem = ?5",
         params![
@@ -576,12 +576,12 @@ pub fn record_cleanup_episode_failure(
             "UPDATE sandboxes
                 SET cleanup_state = 'failed',
                     state_changed_at = CASE
-                        WHEN legacy_state != 'cleanup_failed' THEN ?1
+                        WHEN cleanup_state IS NOT 'failed' THEN ?1
                         ELSE state_changed_at
                     END,
                     updated_at = ?1
               WHERE id = ?2
-                AND legacy_state IN ('cleanup_required', 'cleanup_failed')
+                AND cleanup_state IS NOT NULL
                 AND cleanup_completion = (
                     SELECT completion FROM sandbox_cleanup_episodes
                      WHERE sandbox_id = ?2 AND cleanup_id = ?3
@@ -618,7 +618,7 @@ db_private_outside_tests! {
               WHERE episode.sandbox_id = ?1
                 AND episode.cleanup_id = ?2
                 AND episode.phase = 'requested'
-                AND sandbox.legacy_state IN ('cleanup_required', 'cleanup_failed')
+                AND sandbox.cleanup_state IS NOT NULL
                 AND sandbox.cleanup_completion = episode.completion
                 AND sandbox.cleanup_keep_filesystem = episode.keep_filesystem
          )",
@@ -685,7 +685,7 @@ fn match_quarantine_recovery(
               WHERE qs.sandbox_id = ?1
                 AND qs.source = ?2
                 AND qs.reason_code = ?3
-                AND s.legacy_state IN ('cleanup_required', 'cleanup_failed')
+                AND s.cleanup_state IS NOT NULL
                 AND s.current_local_artifact_id = ?4
                 AND s.current_local_artifact_kind = 'full'
                 AND s.current_local_artifact_origin = 'suspend'
@@ -884,7 +884,10 @@ fn apply_cleanup_state(
                     ELSE current_local_artifact_origin
                 END,
                 suspend_predecessor_artifact_id = NULL,
-                state_changed_at = CASE WHEN legacy_state IS NOT ?1 THEN ?2 ELSE state_changed_at END,
+                state_changed_at = CASE
+                    WHEN unowned_state IS NOT ?1 THEN ?2
+                    ELSE state_changed_at
+                END,
                 updated_at = ?2
           WHERE id = ?3",
         params![
@@ -1484,12 +1487,12 @@ pub fn quarantine_cleanup_episode_for_job(
                 restore_phase = NULL,
                 restore_storage_uri = NULL,
                 state_changed_at = CASE
-                    WHEN legacy_state != 'quarantined' THEN ?2
+                    WHEN state != 'quarantined' THEN ?2
                     ELSE state_changed_at
                 END,
                 updated_at = ?2
           WHERE id = ?3
-            AND legacy_state = ?4
+            AND (unowned_state = ?4 OR ?4 = 'cleanup_' || cleanup_state)
             AND cleanup_completion = ?5
             AND cleanup_keep_filesystem = ?6",
         params![
@@ -1576,12 +1579,12 @@ pub fn mark_cleanup_required(
              restore_phase = NULL,
              restore_storage_uri = NULL,
              state_changed_at = CASE
-                 WHEN legacy_state != 'cleanup_required' THEN ?4
+                 WHEN cleanup_state IS NOT 'required' THEN ?4
                  ELSE state_changed_at
              END,
              updated_at = ?4
          WHERE id = ?5
-           AND legacy_state != 'quarantined'",
+           AND state != 'quarantined'",
         params![reason, completion.as_str(), keep_filesystem, now()?, id],
     )?;
     Ok(())
@@ -1655,15 +1658,17 @@ fn mark_cleanup_required_if_no_intent_inner(
              restore_phase = NULL,
              restore_storage_uri = NULL,
              state_changed_at = CASE
-                 WHEN legacy_state != 'cleanup_required' THEN ?4
+                 WHEN cleanup_state IS NOT 'required' THEN ?4
                  ELSE state_changed_at
              END,
              updated_at = ?4
          WHERE id = ?5
-           AND legacy_state != 'quarantined'
+           AND state != 'quarantined'
            AND cleanup_completion IS NULL
            AND cleanup_keep_filesystem IS NULL
-           AND (?6 IS NULL OR legacy_state = ?6)",
+           AND (?6 IS NULL
+                OR unowned_state = ?6
+                OR ?6 = 'cleanup_' || cleanup_state)",
         params![
             reason,
             completion.as_str(),
@@ -1745,12 +1750,12 @@ pub fn mark_cleanup_failed(
              cleanup_completion = ?2,
              cleanup_keep_filesystem = ?3,
              state_changed_at = CASE
-                 WHEN legacy_state != 'cleanup_failed' THEN ?4
+                 WHEN cleanup_state IS NOT 'failed' THEN ?4
                  ELSE state_changed_at
              END,
              updated_at = ?4
          WHERE id = ?5
-           AND legacy_state != 'quarantined'",
+           AND state != 'quarantined'",
         params![reason, completion.as_str(), keep_filesystem, now()?, id],
     )?;
     if changed != 0 && previous_state_value != Some(SandboxState::CleanupFailed) {
@@ -1833,9 +1838,17 @@ db_private_outside_tests! {
     ) -> Result<bool> {
         let intent = conn
             .query_row(
-                sql!("SELECT legacy_state, cleanup_completion FROM sandboxes WHERE id = ?1"),
+                sql!("SELECT state, cleanup_completion, cleanup_state FROM sandboxes WHERE id = ?1"),
                 [id],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+                |row| {
+                    Ok((
+                        SandboxState::label_from_columns(
+                            row.get(0)?,
+                            row.get::<_, Option<String>>(2)?.as_deref(),
+                        ),
+                        row.get::<_, Option<String>>(1)?,
+                    ))
+                },
             )
             .optional()?;
         let Some((state, intent)) = intent else {
@@ -1876,9 +1889,10 @@ pub fn list_requested_cleanup_recovery_candidate_ids(conn: &Connection) -> Resul
                          sandbox.cleanup_completion IS NULL
                          AND sandbox.cleanup_keep_filesystem IS NULL
                          AND (
-                              sandbox.legacy_state IN ('stopping', 'deleting', 'cleanup_required')
+                              sandbox.unowned_state IN ('stopping', 'deleting')
+                              OR sandbox.cleanup_state = 'required'
                               OR (
-                                   sandbox.legacy_state = 'cleanup_failed'
+                                   sandbox.cleanup_state = 'failed'
                                    AND (
                                         sandbox.uid IS NOT NULL
                                         OR sandbox.slot IS NOT NULL
@@ -1965,9 +1979,10 @@ db_private_outside_tests! {
                          sandbox.cleanup_completion IS NULL
                          AND sandbox.cleanup_keep_filesystem IS NULL
                          AND (
-                              sandbox.legacy_state IN ('stopping', 'deleting', 'cleanup_required')
+                              sandbox.unowned_state IN ('stopping', 'deleting')
+                              OR sandbox.cleanup_state = 'required'
                               OR (
-                                   sandbox.legacy_state = 'cleanup_failed'
+                                   sandbox.cleanup_state = 'failed'
                                    AND (
                                         sandbox.uid IS NOT NULL
                                         OR sandbox.slot IS NOT NULL

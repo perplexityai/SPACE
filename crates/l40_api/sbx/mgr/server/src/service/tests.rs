@@ -11268,7 +11268,10 @@ pub(crate) mod service_tests {
             .lock()
             .expect("mutex poisoned")
             .query_row(
-                "SELECT legacy_state FROM sandboxes WHERE id = ?1",
+                &format!(
+                    "SELECT {} FROM sandboxes WHERE id = ?1",
+                    crate::db::fixture::STATUS_LABEL_SQL
+                ),
                 [&sandbox_id_string],
                 |row| row.get::<_, String>(0),
             )

@@ -35,12 +35,18 @@ there, but not a build or dev dependency, nor `libsqlite3-sys`.
   refused write must leave every row unchanged.
 - `sandboxes.state` holds lifecycle states only; `cleanup_state` (`required`,
   `failed`) records a cleanup that owns the row, over the teardown transition
-  its intent names. Decide from the combined status by reading the generated
-  `legacy_state`, except where an index needs `state` and the triggers make
-  the two equal. A write of a lifecycle state clears `cleanup_state`, and a
-  cleanup write sets both in one statement; the triggers in
-  `db/sandbox-manager/20261105142930_sandbox_cleanup_state.up.sql` reject
-  any other shape.
+  its intent names. The triggers allow a cleanup only over `stopping`,
+  `deleting` or `suspending`. Decide a lifecycle predicate with the generated
+  `unowned_state`, which is `NULL` while a cleanup owns the row, so a cleanup
+  never matches it. `state` also holds a cleanup's teardown transition: read
+  it to name the stored lifecycle, or in a predicate on a lifecycle no cleanup
+  can be over, as the indexed `suspended` scans do. Compare `unowned_state`
+  and `cleanup_state` with `IS` or `IS NOT` where a `NULL` must not turn the
+  result unknown, as under `NOT`. A write of a lifecycle state clears
+  `cleanup_state`, and a cleanup write sets both in one statement; the
+  triggers in `db/sandbox-manager/20261105142930_sandbox_cleanup_state.up.sql`
+  reject any other shape. The generated `legacy_state` stays only until the
+  next release drops it, so a rollback still finds it; don't read it.
 - Only some child tables declare `ON DELETE CASCADE`: register a new sandbox
   child table in `delete_sandbox_child_rows` (`src/db.rs`).
 - Fixtures that sbx-mgr's other test suites share live in `db::fixture` and

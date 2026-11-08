@@ -198,8 +198,8 @@ impl EdgeSources {
         self.legacy().is_empty()
     }
 
-    /// The sources as the combined statuses `legacy_state` reads, which the
-    /// generic writer's predicate compares.
+    /// The sources as combined statuses, which the generic writer's predicate
+    /// compares.
     pub(super) const fn legacy(self) -> StateSet {
         let mut set = self.lifecycle;
         if self.required {
@@ -828,17 +828,34 @@ fn write_state_from_in_transaction(
             refusal: StateWriteRefusal::Guard(guard),
         });
     }
-    let from_labels =
-        serde_json::to_string(&from.iter().map(|state| state.as_str()).collect::<Vec<_>>())
-            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+    // The source set names lifecycles a row holds without a cleanup, and
+    // cleanups whatever lifecycle they are over.
+    let json_labels = |labels: Vec<&str>| {
+        serde_json::to_string(&labels)
+            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
+    };
+    let from_lifecycles = json_labels(
+        from.iter()
+            .filter(|state| state.cleanup_label().is_none())
+            .map(|state| state.as_str())
+            .collect(),
+    )?;
+    let from_cleanups = json_labels(
+        from.iter()
+            .filter_map(SandboxState::cleanup_label)
+            .collect(),
+    )?;
     // The generic writer only writes lifecycle states, so it also clears a
-    // cleanup state the row held. `legacy_state` is the combined status the
-    // source set and the timestamp compare, as before the split.
+    // cleanup state the row held; leaving a cleanup changes the status even
+    // when the lifecycle under it is the target.
     let changed = conn.execute(
         "UPDATE sandboxes
          SET state = ?1,
              cleanup_state = NULL,
-             state_changed_at = CASE WHEN legacy_state IS NOT ?1 THEN ?2 ELSE state_changed_at END,
+             state_changed_at = CASE
+                 WHEN unowned_state IS NOT ?1 THEN ?2
+                 ELSE state_changed_at
+             END,
              failure_reason = NULL,
              restore_origin = CASE WHEN ?1 = 'restoring' THEN restore_origin ELSE NULL END,
              restore_phase = CASE WHEN ?1 = 'restoring' THEN restore_phase ELSE NULL END,
@@ -869,8 +886,11 @@ fn write_state_from_in_transaction(
              END,
              updated_at = ?2
          WHERE id = ?3
-           AND legacy_state IN (SELECT value FROM json_each(?4))",
-        params![to.as_str(), now()?, id, from_labels],
+           AND (
+               unowned_state IN (SELECT value FROM json_each(?4))
+               OR cleanup_state IN (SELECT value FROM json_each(?5))
+           )",
+        params![to.as_str(), now()?, id, from_lifecycles, from_cleanups],
     )?;
     if changed == 0 {
         // The row was read as `found` in this transaction, so only a source
