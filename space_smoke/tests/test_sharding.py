@@ -28,7 +28,7 @@ def _inventory(surface):
 _EMPTY_PASS_COUNT = min(len(_inventory(surface)) for surface in ("ecw", "native")) + 1
 
 
-@pytest.mark.parametrize("count", [4, 8, 12, _EMPTY_PASS_COUNT])
+@pytest.mark.parametrize("count", [4, 8, 12, 14, _EMPTY_PASS_COUNT])
 def test_shards_run_every_eligible_scenario_once_and_propagate_failures(count):
     """Each (surface, scenario) pair of a sharded run runs on exactly one shard."""
 
