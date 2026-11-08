@@ -138,18 +138,20 @@ because disabling it by mistake would leave every create queued forever.
 
 A node-local cleanup that owns a sandbox is not a lifecycle state. Sandbox
 manager publishes it as `cleanup.state` (`REQUIRED` or `FAILED`) on `State`,
-`List` and `ListBuildReferencingSandboxes`, and by default also folds it into
-the lifecycle as `CLEANUP_REQUIRED` or `CLEANUP_FAILED`. `Wait` answers only
+`Wait`, `List` and `ListBuildReferencingSandboxes`, beside the lifecycle the
+cleanup is over (`STOPPING`, `DELETING` or `SUSPENDING`). `Wait` answers only
 once the wait completes, which a cleanup does only when it has failed, so it
-reports `FAILED` and never `REQUIRED`. `publish_native_lifecycle = true` in
-the node's `/space/etc/sandbox.toml` publishes the lifecycle the cleanup is
-over instead (`STOPPING`, `DELETING` or `SUSPENDING`) on all four RPCs.
-`SPACE_SBXMGR_PUBLISH_NATIVE_LIFECYCLE`, set to a flag value, overrides the
-file; the sandbox-manager chart sets it to `true` when
-`nativeLifecyclePublication.enabled` is on. Sandbox manager reads both at
-startup, so a change takes effect when it restarts on that node. Turn it on
-only once every reader of those RPCs decides from `cleanup.state`; turning it
-off again, and restarting, restores the folded lifecycle.
+reports `FAILED` and never `REQUIRED`.
+
+Earlier sandbox managers fold the cleanup into the lifecycle as
+`CLEANUP_REQUIRED` or `CLEANUP_FAILED`, and a reader that predates
+`cleanup.state` takes a `STOPPING` row with a failed cleanup for a live stop.
+Upgrade every reader of these RPCs, including the shim, to a release that reads
+`cleanup.state`, and let shim processes started before it exit, before
+upgrading sandbox manager past the fold. Those readers accept both shapes, so
+rolling sandbox manager back is safe for them whichever one the restored
+release publishes: the folded lifecycle by default, or the native one where
+its `publish_native_lifecycle` was on.
 
 ## API, admission and limits
 

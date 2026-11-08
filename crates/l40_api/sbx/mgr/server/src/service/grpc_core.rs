@@ -27,13 +27,12 @@ use pplx_space_node_mgr_client::proto::{
 /// Project an on-node sandbox row onto the cheap wire inventory shape shared by
 /// `list` and `list_build_referencing_sandboxes`. Keeping one projection means
 /// a new `SandboxListElement` field is wired in both RPCs at once.
-/// `native` is `publish_native_lifecycle`.
-fn sandbox_list_element(row: &crate::db::SandboxListRow, native: bool) -> SandboxListElement {
+fn sandbox_list_element(row: &crate::db::SandboxListRow) -> SandboxListElement {
     SandboxListElement {
         sandbox_id: row.id.clone(),
         template: Some(row.template.clone()),
         lifecycle: Some(crate::proto::SandboxLifecycleState::from(
-            super::grpc_state_snapshot::published_lifecycle(native, row.state, row.lifecycle),
+            super::grpc_state_snapshot::published_lifecycle(row.state, row.lifecycle),
         ) as i32),
         image_hash: row.template_hash.clone(),
         pool_template: row.pool_template.clone(),
@@ -61,7 +60,6 @@ const DEFAULT_LIST_PAGE_SIZE: usize = pplx_space_common_core::inventory::READ_BA
 fn list_page_response(
     page: crate::db::inventory_read::ListPage,
     template_manager_peer: bool,
-    native: bool,
 ) -> Result<Response<ListResponse>, Status> {
     use crate::db::inventory_read::ListPageRow;
     use pplx_space_common_core::inventory::{InventoryLimitExceeded, MAX_ENCODED_BYTES};
@@ -79,7 +77,7 @@ fn list_page_response(
                     cursor = Some(&row.id);
                     continue;
                 }
-                sandbox_list_element(row, native)
+                sandbox_list_element(row)
             }
             // Owner filtering must not treat an undecodable row as another
             // owner's; other observers see its identity instead.
@@ -111,13 +109,12 @@ fn list_page_response(
                     .and_then(|lifecycle| lifecycle.parse::<SandboxState>().ok());
                 let published = status.and_then(|status| match stored {
                     Some(stored) => Some(super::grpc_state_snapshot::published_lifecycle(
-                        native, status, stored,
+                        status, stored,
                     )),
                     // Without the stored lifecycle, the one under a cleanup
-                    // is unknown once native publication is on.
-                    None => (!native
-                        || super::grpc_state_snapshot::cleanup_owner(status)
-                            == crate::proto::SandboxCleanupState::Unspecified)
+                    // is unknown.
+                    None => (super::grpc_state_snapshot::cleanup_owner(status)
+                        == crate::proto::SandboxCleanupState::Unspecified)
                         .then_some(status),
                 });
                 SandboxListElement {
@@ -1084,11 +1081,7 @@ impl SandboxManagerService {
                     .map_err(|error| error.into_status())
             })
             .await?;
-        list_page_response(
-            page,
-            template_manager_peer,
-            self.config.publish_native_lifecycle,
-        )
+        list_page_response(page, template_manager_peer)
     }
 
     pub(super) async fn list_build_referencing_sandboxes(
@@ -1119,7 +1112,7 @@ impl SandboxManagerService {
         let sandboxes = db_rows
             .iter()
             .filter(|row| row.state.holds_parent_referencing_instance_subvolume())
-            .map(|row| sandbox_list_element(row, self.config.publish_native_lifecycle))
+            .map(sandbox_list_element)
             .collect();
 
         Ok(crate::inventory_budget::unary_list_response(

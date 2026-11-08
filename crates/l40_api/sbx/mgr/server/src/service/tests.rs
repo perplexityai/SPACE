@@ -4410,39 +4410,27 @@ pub(crate) mod service_tests {
     #[tokio::test]
     async fn an_undecodable_list_row_keeps_its_cleanup_and_lifecycle() {
         use crate::proto::{SandboxCleanupState as Owner, SandboxLifecycleState as Lifecycle};
-        for (native, expected) in [
-            (false, Lifecycle::CleanupFailed),
-            (true, Lifecycle::Deleting),
-        ] {
-            let conn = crate::db::test_conn();
-            let id = SandboxId::new().to_string();
-            insert_test_sandbox(&conn, &id, SandboxState::CleanupFailed);
-            crate::db::set_cleanup_intent(
-                &conn,
-                &id,
-                false,
-                crate::db::CleanupCompletion::DeleteRow,
-            )
+        let conn = crate::db::test_conn();
+        let id = SandboxId::new().to_string();
+        insert_test_sandbox(&conn, &id, SandboxState::CleanupFailed);
+        crate::db::set_cleanup_intent(&conn, &id, false, crate::db::CleanupCompletion::DeleteRow)
             .unwrap();
-            conn.execute("UPDATE sandboxes SET user = '' WHERE id = ?1", [&id])
-                .unwrap();
-            let mut service = service_for_teardown_test(conn);
-            service.config.publish_native_lifecycle = native;
+        conn.execute("UPDATE sandboxes SET user = '' WHERE id = ?1", [&id])
+            .unwrap();
+        let service = service_for_teardown_test(conn);
 
-            let pages = list_all_pages(&service, false, 128).await;
-            let degraded = &pages[0][0];
-            assert_eq!(degraded.sandbox_id, id);
-            assert_eq!(degraded.owner, None, "the owner did not decode");
-            assert_eq!(degraded.lifecycle, Some(expected as i32), "native {native}");
-            assert_eq!(
-                degraded.cleanup.as_ref().map(|cleanup| cleanup.state),
-                Some(Owner::Failed as i32),
-                "native {native}"
-            );
-            service.shutdown_token.cancel();
-            service.task_tracker.close();
-            service.task_tracker.wait().await;
-        }
+        let pages = list_all_pages(&service, false, 128).await;
+        let degraded = &pages[0][0];
+        assert_eq!(degraded.sandbox_id, id);
+        assert_eq!(degraded.owner, None, "the owner did not decode");
+        assert_eq!(degraded.lifecycle, Some(Lifecycle::Deleting as i32));
+        assert_eq!(
+            degraded.cleanup.as_ref().map(|cleanup| cleanup.state),
+            Some(Owner::Failed as i32)
+        );
+        service.shutdown_token.cancel();
+        service.task_tracker.close();
+        service.task_tracker.wait().await;
     }
 
     #[tokio::test]
@@ -7250,8 +7238,8 @@ pub(crate) mod service_tests {
         }
     }
 
-    /// Wait and List publish the cleanup that owns a row beside its
-    /// lifecycle, from the same read: a failed delete with its completion, an
+    /// Wait and List publish the cleanup that owns a row beside the lifecycle
+    /// it is over, from the same read: a failed delete with its completion, an
     /// intent-less required cleanup with none, and nothing for a plain row.
     #[tokio::test(start_paused = true)]
     async fn wait_and_list_publish_the_row_s_cleanup_beside_its_lifecycle() {
@@ -7282,7 +7270,7 @@ pub(crate) mod service_tests {
         for (id, lifecycle, cleanup) in [
             (
                 &failed_delete,
-                Lifecycle::CleanupFailed,
+                Lifecycle::Deleting,
                 Some((Completion::DeleteRow, Owner::Failed)),
             ),
             (&stopped, Lifecycle::Stopped, None),
@@ -7327,12 +7315,12 @@ pub(crate) mod service_tests {
         for (id, lifecycle, cleanup) in [
             (
                 &failed_delete,
-                Lifecycle::CleanupFailed,
+                Lifecycle::Deleting,
                 Some((Completion::DeleteRow, Owner::Failed)),
             ),
             (
                 &required,
-                Lifecycle::CleanupRequired,
+                Lifecycle::Stopping,
                 Some((Completion::Unspecified, Owner::Required)),
             ),
             (&stopped, Lifecycle::Stopped, None),
@@ -16194,171 +16182,132 @@ pub(crate) mod service_tests {
         }
     }
 
-    /// The switch reaches every List-shaped RPC and Wait: a stop whose cleanup
-    /// failed reads CLEANUP_FAILED off and STOPPING on, with cleanup FAILED
-    /// either way.
+    /// Every List-shaped RPC and Wait publish a stop whose cleanup failed as
+    /// STOPPING, with cleanup FAILED.
     #[tokio::test(start_paused = true)]
-    async fn native_publication_reaches_wait_list_and_build_references() {
+    async fn wait_list_and_build_references_publish_the_lifecycle_under_a_cleanup() {
         use crate::proto::{SandboxCleanupState as Owner, SandboxLifecycleState as Lifecycle};
-        for (native, expected) in [
-            (false, Lifecycle::CleanupFailed),
-            (true, Lifecycle::Stopping),
-        ] {
-            let conn = crate::db::test_conn();
-            let id = SandboxId::new().to_string();
-            insert_test_sandbox(&conn, &id, SandboxState::CleanupFailed);
-            crate::db::set_cleanup_intent(
-                &conn,
-                &id,
-                true,
-                crate::db::CleanupCompletion::MarkStopped,
-            )
+        let conn = crate::db::test_conn();
+        let id = SandboxId::new().to_string();
+        insert_test_sandbox(&conn, &id, SandboxState::CleanupFailed);
+        crate::db::set_cleanup_intent(&conn, &id, true, crate::db::CleanupCompletion::MarkStopped)
             .unwrap();
-            let mut service = service_for_teardown_test(conn);
-            service.config.publish_native_lifecycle = native;
+        let service = service_for_teardown_test(conn);
 
-            let wait = tokio::time::timeout(
-                Duration::from_secs(2),
-                service.wait(internal_request(WaitRequest {
-                    sandbox_id: id.clone(),
-                    timeout_secs: None,
-                })),
-            )
+        let wait = tokio::time::timeout(
+            Duration::from_secs(2),
+            service.wait(internal_request(WaitRequest {
+                sandbox_id: id.clone(),
+                timeout_secs: None,
+            })),
+        )
+        .await
+        .expect("Wait completes for a failed cleanup")
+        .unwrap()
+        .into_inner();
+        let listed = list_all_pages(&service, false, 128)
             .await
-            .expect("Wait completes for a failed cleanup")
+            .into_iter()
+            .flatten()
+            .find(|element| element.sandbox_id == id)
+            .expect("List names the row");
+        let referencing = service
+            .list_build_referencing_sandboxes(tmplmgr_request(
+                ListBuildReferencingSandboxesRequest {},
+            ))
+            .await
             .unwrap()
-            .into_inner();
-            let listed = list_all_pages(&service, false, 128)
-                .await
-                .into_iter()
-                .flatten()
-                .find(|element| element.sandbox_id == id)
-                .expect("List names the row");
-            let referencing = service
-                .list_build_referencing_sandboxes(tmplmgr_request(
-                    ListBuildReferencingSandboxesRequest {},
-                ))
-                .await
-                .unwrap()
-                .into_inner()
-                .sandboxes
-                .into_iter()
-                .find(|element| element.sandbox_id == id)
-                .expect("a stop's failed cleanup still pins its build");
-            for (surface, lifecycle, cleanup) in [
-                ("Wait", wait.lifecycle, wait.cleanup),
-                ("List", listed.lifecycle, listed.cleanup),
-                (
-                    "ListBuildReferencingSandboxes",
-                    referencing.lifecycle,
-                    referencing.cleanup,
-                ),
-            ] {
-                assert_eq!(
-                    lifecycle,
-                    Some(expected as i32),
-                    "{surface} native={native}"
-                );
-                assert_eq!(
-                    cleanup.map(|cleanup| cleanup.state),
-                    Some(Owner::Failed as i32),
-                    "{surface} native={native}"
-                );
-            }
-        }
-    }
-
-    /// A State row whose other fields don't decode still publishes its
-    /// cleanup, and with the switch on, the lifecycle under it.
-    #[tokio::test]
-    async fn degraded_state_publishes_the_lifecycle_under_a_cleanup_by_the_switch() {
-        use crate::proto::{
-            SandboxCleanupCompletion as Completion, SandboxCleanupState as Owner,
-            SandboxLifecycleState as Lifecycle,
-        };
-        for (native, expected) in [
-            (false, Lifecycle::CleanupFailed),
-            (true, Lifecycle::Deleting),
+            .into_inner()
+            .sandboxes
+            .into_iter()
+            .find(|element| element.sandbox_id == id)
+            .expect("a stop's failed cleanup still pins its build");
+        for (surface, lifecycle, cleanup) in [
+            ("Wait", wait.lifecycle, wait.cleanup),
+            ("List", listed.lifecycle, listed.cleanup),
+            (
+                "ListBuildReferencingSandboxes",
+                referencing.lifecycle,
+                referencing.cleanup,
+            ),
         ] {
-            let conn = crate::db::test_conn();
-            let id = SandboxId::new().to_string();
-            insert_test_sandbox(&conn, &id, SandboxState::CleanupFailed);
-            crate::db::set_cleanup_intent(
-                &conn,
-                &id,
-                false,
-                crate::db::CleanupCompletion::DeleteRow,
-            )
-            .unwrap();
-            conn.execute("UPDATE sandboxes SET user = '' WHERE id = ?1", [&id])
-                .unwrap();
-            let mut service = service_for_teardown_test(conn);
-            service.config.publish_native_lifecycle = native;
-
-            let response =
-                <SandboxManagerService as crate::proto::sandbox_manager_server::SandboxManager>::state(
-                    &service,
-                    internal_request(StateRequest {
-                        sandbox_ids: vec![id.clone()],
-                    }),
-                )
-                .await
-                .unwrap()
-                .into_inner();
-            let info = response
-                .sandboxes
-                .iter()
-                .find(|sandbox| sandbox.sandbox_id == id)
-                .expect("a degraded row is still published");
-            assert!(info.state_degraded, "native={native}");
-            assert_eq!(info.lifecycle, Some(expected as i32), "native={native}");
+            assert_eq!(lifecycle, Some(Lifecycle::Stopping as i32), "{surface}");
             assert_eq!(
-                info.cleanup
-                    .map(|cleanup| (cleanup.completion, cleanup.state)),
-                Some((Completion::DeleteRow as i32, Owner::Failed as i32)),
-                "native={native}"
+                cleanup.map(|cleanup| cleanup.state),
+                Some(Owner::Failed as i32),
+                "{surface}"
             );
         }
     }
 
+    /// A State row whose other fields don't decode still publishes its
+    /// cleanup and the lifecycle under it.
     #[tokio::test]
-    async fn native_lifecycle_publication_reports_the_lifecycle_under_a_cleanup() {
+    async fn degraded_state_publishes_the_lifecycle_under_a_cleanup() {
+        use crate::proto::{
+            SandboxCleanupCompletion as Completion, SandboxCleanupState as Owner,
+            SandboxLifecycleState as Lifecycle,
+        };
+        let conn = crate::db::test_conn();
+        let id = SandboxId::new().to_string();
+        insert_test_sandbox(&conn, &id, SandboxState::CleanupFailed);
+        crate::db::set_cleanup_intent(&conn, &id, false, crate::db::CleanupCompletion::DeleteRow)
+            .unwrap();
+        conn.execute("UPDATE sandboxes SET user = '' WHERE id = ?1", [&id])
+            .unwrap();
+        let service = service_for_teardown_test(conn);
+
+        let response =
+            <SandboxManagerService as crate::proto::sandbox_manager_server::SandboxManager>::state(
+                &service,
+                internal_request(StateRequest {
+                    sandbox_ids: vec![id.clone()],
+                }),
+            )
+            .await
+            .unwrap()
+            .into_inner();
+        let info = response
+            .sandboxes
+            .iter()
+            .find(|sandbox| sandbox.sandbox_id == id)
+            .expect("a degraded row is still published");
+        assert!(info.state_degraded);
+        assert_eq!(info.lifecycle, Some(Lifecycle::Deleting as i32));
+        assert_eq!(
+            info.cleanup
+                .map(|cleanup| (cleanup.completion, cleanup.state)),
+            Some((Completion::DeleteRow as i32, Owner::Failed as i32))
+        );
+    }
+
+    #[tokio::test]
+    async fn state_publishes_the_lifecycle_under_a_cleanup() {
         use crate::proto::{SandboxCleanupState as Owner, SandboxLifecycleState as Lifecycle};
         let conn = crate::db::test_conn();
         let sandbox_id = SandboxId::new().to_string();
         insert_test_sandbox(&conn, &sandbox_id, SandboxState::Stopped);
-        let mut service = service_with_runtime_probe(conn, false);
-        for (native, status, lifecycle, expected, owner) in [
+        let service = service_with_runtime_probe(conn, false);
+        for (status, lifecycle, expected, owner) in [
             (
-                false,
-                SandboxState::CleanupFailed,
-                SandboxState::Deleting,
-                Lifecycle::CleanupFailed,
-                Some(Owner::Failed),
-            ),
-            (
-                true,
                 SandboxState::CleanupFailed,
                 SandboxState::Deleting,
                 Lifecycle::Deleting,
                 Some(Owner::Failed),
             ),
             (
-                true,
                 SandboxState::CleanupRequired,
                 SandboxState::Suspending,
                 Lifecycle::Suspending,
                 Some(Owner::Required),
             ),
             (
-                true,
                 SandboxState::Stopped,
                 SandboxState::Stopped,
                 Lifecycle::Stopped,
                 None,
             ),
         ] {
-            service.config.publish_native_lifecycle = native;
             let mut sandbox = service.lookup_sandbox(&sandbox_id).unwrap();
             sandbox.state = status;
             sandbox.lifecycle = lifecycle;
@@ -16369,12 +16318,11 @@ pub(crate) mod service_tests {
                 .await
                 .unwrap();
 
-            assert_eq!(info.lifecycle, Some(expected as i32), "{native} {status}");
-            // The cleanup is published apart from the lifecycle either way.
+            assert_eq!(info.lifecycle, Some(expected as i32), "{status}");
             assert_eq!(
                 info.cleanup.map(|cleanup| cleanup.state),
                 owner.map(|owner| owner as i32),
-                "{native} {status}"
+                "{status}"
             );
         }
     }

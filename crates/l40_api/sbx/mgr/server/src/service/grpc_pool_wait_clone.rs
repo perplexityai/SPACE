@@ -744,11 +744,7 @@ impl SandboxManagerService {
                     return Ok(Response::new(WaitResponse {
                         sandbox_id: id,
                         lifecycle: Some(crate::proto::SandboxLifecycleState::from(
-                            super::grpc_state_snapshot::published_lifecycle(
-                                self.config.publish_native_lifecycle,
-                                state,
-                                lifecycle,
-                            ),
+                            super::grpc_state_snapshot::published_lifecycle(state, lifecycle),
                         ) as i32),
                         cleanup: super::grpc_state_snapshot::cleanup_observation(
                             super::grpc_state_snapshot::cleanup_owner(state),
@@ -762,11 +758,8 @@ impl SandboxManagerService {
                     && start.elapsed() >= timeout
                 {
                     // Name the status as the response would have published it.
-                    let published = super::grpc_state_snapshot::published_lifecycle(
-                        self.config.publish_native_lifecycle,
-                        state,
-                        lifecycle,
-                    );
+                    let published =
+                        super::grpc_state_snapshot::published_lifecycle(state, lifecycle);
                     let current = if published == state {
                         state.as_str().to_owned()
                     } else {

@@ -602,8 +602,8 @@ message CleanupTargetBatch {
   repeated CleanupTargetObservation targets = 1;
 }
 
-// Node-local lifecycle, including cleanup states that are not control-plane
-// desired lifecycles. Unknown observations are never evidence of a safe state.
+// Node-local lifecycle. Unknown observations are never evidence of a safe
+// state.
 enum SandboxLifecycleState {
   SANDBOX_LIFECYCLE_STATE_UNSPECIFIED = 0;
   SANDBOX_LIFECYCLE_STATE_CREATING = 1;
@@ -620,6 +620,9 @@ enum SandboxLifecycleState {
   SANDBOX_LIFECYCLE_STATE_SUSPENDING = 12;
   SANDBOX_LIFECYCLE_STATE_SUSPENDED = 13;
   SANDBOX_LIFECYCLE_STATE_RESTORING = 14;
+  // Published only by an older node, for a row a cleanup owns, with or without
+  // `SandboxCleanup.state`. A current node publishes the lifecycle the cleanup
+  // is over and names the cleanup in `SandboxCleanup.state`.
   SANDBOX_LIFECYCLE_STATE_CLEANUP_REQUIRED = 15;
   SANDBOX_LIFECYCLE_STATE_CLEANUP_FAILED = 16;
   SANDBOX_LIFECYCLE_STATE_QUARANTINED = 17;
@@ -744,20 +747,18 @@ message SandboxCleanup {
   // it. An armed activation, whose rollback target is recorded in
   // `completion` while the start still runs, is UNSPECIFIED, so read this
   // field, not the presence of this message, to tell a cleanup-owned row. A
-  // row can be REQUIRED or FAILED with no completion recorded. An older node
-  // never sets this field: honor CLEANUP_REQUIRED and CLEANUP_FAILED
-  // lifecycles too. Nodes publish these rows with those lifecycles by
-  // default; one configured to publish the native lifecycle reports the
-  // teardown transition the cleanup is over (STOPPING, DELETING or
-  // SUSPENDING) instead.
+  // row can be REQUIRED or FAILED with no completion recorded. A node publishes
+  // such a row with the teardown transition the cleanup is over (STOPPING,
+  // DELETING or SUSPENDING). An older node may instead publish the
+  // CLEANUP_REQUIRED or CLEANUP_FAILED lifecycle, with or without this field
+  // set: honor those too.
   SandboxCleanupState state = 2;
 }
 
 // What an admitted node-local cleanup does to the row when it finishes. For a
-// CLEANUP_REQUIRED or CLEANUP_FAILED row, the shim's legacy pod teardown stops
-// the sandbox on Kill and deletes it on Delete for any value it doesn't
-// recognize, so a new value that keeps the rootfs needs a shim that releases
-// it to deploy first.
+// row a cleanup owns, the shim's legacy pod teardown stops the sandbox on Kill
+// and deletes it on Delete for any value it doesn't recognize, so a new value
+// that keeps the rootfs needs a shim that releases it to deploy first.
 enum SandboxCleanupCompletion {
   SANDBOX_CLEANUP_COMPLETION_UNSPECIFIED = 0;
   // Marks the row CREATED.
@@ -779,12 +780,11 @@ enum SandboxCleanupCompletion {
 enum SandboxCleanupState {
   // No cleanup owns the row.
   SANDBOX_CLEANUP_STATE_UNSPECIFIED = 0;
-  // A forced teardown owns the row and is owed. Published as the
-  // CLEANUP_REQUIRED lifecycle unless the node publishes the native one.
+  // A forced teardown owns the row and is owed. An older node may also publish
+  // it as the CLEANUP_REQUIRED lifecycle.
   SANDBOX_CLEANUP_STATE_REQUIRED = 1;
-  // A teardown owns the row and its last attempt failed; it is retried.
-  // Published as the CLEANUP_FAILED lifecycle unless the node publishes the
-  // native one.
+  // A teardown owns the row and its last attempt failed; it is retried. An
+  // older node may also publish it as the CLEANUP_FAILED lifecycle.
   SANDBOX_CLEANUP_STATE_FAILED = 2;
 }
 

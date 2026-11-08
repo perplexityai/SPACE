@@ -8,7 +8,6 @@ fn only_an_absent_config_uses_defaults() {
     assert_eq!(defaults.max_memory_mib, None);
     assert!(!defaults.hugepages);
     assert_eq!(defaults.balloon_hint_timeout_ms, None);
-    assert!(!defaults.publish_native_lifecycle);
     assert_eq!(
         defaults.disk_io_burst_secs(),
         pplx_space_common_core::types::DEFAULT_DISK_IO_BURST_SECS
@@ -88,22 +87,4 @@ fn balloon_hint_timeout_is_bounded() {
         load_from(&path),
         Err(ConfigLoadError::InvalidBalloonHintTimeout { .. })
     ));
-}
-
-#[test]
-fn the_environment_overrides_native_lifecycle_publication_only_with_a_flag() {
-    for (env, file, expected) in [
-        (None, false, false),
-        (None, true, true),
-        (Some("true"), false, true),
-        (Some("0"), true, false),
-        (Some(""), true, true),
-        (Some("sometimes"), false, false),
-    ] {
-        assert_eq!(
-            native_lifecycle_override(env, file),
-            expected,
-            "{env:?} over {file}"
-        );
-    }
 }

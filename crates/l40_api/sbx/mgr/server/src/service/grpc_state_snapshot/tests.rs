@@ -445,16 +445,11 @@ fn template_base_snapshot_admission_writes_only_over_a_paused_row() {
 }
 
 #[test]
-fn only_native_publication_reports_a_cleanup_row_by_its_stored_lifecycle() {
+fn a_cleanup_row_publishes_its_stored_lifecycle() {
     for status in SandboxState::all() {
         let owned = cleanup_owner(status) != crate::proto::SandboxCleanupState::Unspecified;
         assert_eq!(
-            published_lifecycle(false, status, SandboxState::Deleting),
-            status,
-            "{status}"
-        );
-        assert_eq!(
-            published_lifecycle(true, status, SandboxState::Deleting),
+            published_lifecycle(status, SandboxState::Deleting),
             if owned {
                 SandboxState::Deleting
             } else {

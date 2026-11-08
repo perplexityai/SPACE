@@ -546,6 +546,19 @@ async fn sweep_releases_holds_once_a_canonical_snapshot_exists() {
     assert_eq!(contents, vec![b"a".to_vec(), b"b".to_vec()]);
 }
 
+/// Serializes the tests that hold every immediate-reclaim slot: the slots are
+/// process-wide, so two such tests sharing a process, as `cargo test`'s
+/// threads do, would each find the other's.
+static IMMEDIATE_RECLAIM_TESTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Every immediate-reclaim slot, waiting out a reclaim another test started.
+async fn hold_every_immediate_reclaim_slot() -> tokio::sync::SemaphorePermit<'static> {
+    IMMEDIATE_RECLAIM_SLOTS
+        .acquire_many(u32::try_from(IMMEDIATE_RECLAIM_CONCURRENCY).unwrap())
+        .await
+        .unwrap()
+}
+
 /// An ordinary retired snapshot is gone as soon as its publication commits,
 /// as before the lane existed. One this service cannot delete stays in the
 /// lane for node-manager and the sweep; it never lingers under another name.
@@ -581,9 +594,8 @@ async fn immediate_reclaim_removes_ordinary_entries_and_leaves_the_rest_in_the_l
             dir
         })
         .collect();
-    let held: Vec<_> = (0..IMMEDIATE_RECLAIM_CONCURRENCY)
-        .map(|_| IMMEDIATE_RECLAIM_SLOTS.try_acquire().unwrap())
-        .collect();
+    let _exclusive = IMMEDIATE_RECLAIM_TESTS.lock().await;
+    let held = hold_every_immediate_reclaim_slot().await;
     for dir in &backlog {
         assert!(
             reclaim_garbage_now("sandbox".into(), dir.clone(), node_manager.connector()).is_none()
@@ -659,9 +671,8 @@ async fn immediate_reclaim_backlog_uses_each_entrys_own_node_manager() {
     let deletes = [(); 3].map(|()| Arc::new(Mutex::new(Vec::new())));
     let node_managers = deletes.each_ref().map(recording_node_manager);
 
-    let held: Vec<_> = (0..IMMEDIATE_RECLAIM_CONCURRENCY)
-        .map(|_| IMMEDIATE_RECLAIM_SLOTS.try_acquire().unwrap())
-        .collect();
+    let _exclusive = IMMEDIATE_RECLAIM_TESTS.lock().await;
+    let held = hold_every_immediate_reclaim_slot().await;
     for (path, node_manager) in [(&first, &node_managers[0]), (&second, &node_managers[1])] {
         assert!(
             reclaim_garbage_now("sandbox".into(), path.clone(), node_manager.connector()).is_none(),
