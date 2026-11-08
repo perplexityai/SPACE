@@ -671,36 +671,16 @@ async fn requested_id_create_reuses_only_a_compatible_settled_row() {
     }
 }
 
+/// E0 as compiled, on every test host: the node-manager is a fake, so the
+/// host's architecture doesn't matter. A copy rebuilt for another
+/// architecture would get a new reference no compiled catalog qualifies.
 fn protocol_test_environment() -> pplx_space_execution_common::environment::EnvironmentDefinition {
-    use pplx_space_common_core::types::{Arch, EnvironmentDescriptor, RuntimeBinding};
-    use pplx_space_execution_common::environment::EnvironmentDefinition;
-    let initial =
-        pplx_space_node_runtime_core::catalog::InitialEnvironment::for_architecture(Arch::X86_64)
-            .unwrap()
-            .definition()
-            .unwrap();
-    let architecture = std::env::consts::ARCH.parse().unwrap();
-    if architecture == Arch::X86_64 {
-        // Keep E0's historical identity. Reconstructing its normalized descriptor
-        // would assign a new schema-2 reference with no catalog qualification.
-        return initial;
-    }
-    let mut spec = initial.descriptor().spec().clone();
-    spec.host.architecture = architecture;
-    spec.guest.architecture = architecture;
-    let RuntimeBinding::ManagedRelease(release) = &mut spec.runtime;
-    release.target.architecture = architecture;
-    EnvironmentDefinition::new(EnvironmentDescriptor::try_from(spec).unwrap())
-}
-
-fn qualified_test_policy(request: &mut CreateRequest) {
-    // These fake-node tests exercise selection on any test host. Only x86-64
-    // has a compiled bound environment qualified for automatic suspend.
-    // Keep the default suspend policy there to check admission after selection.
-    if std::env::consts::ARCH != "x86_64" {
-        request.auto_lifecycle = Some((&AutoLifecyclePolicy::disabled()).into());
-        request.auto_lifecycle_authority = crate::db::PolicyAuthority::Local.as_proto_i32();
-    }
+    pplx_space_node_runtime_core::catalog::InitialEnvironment::for_architecture(
+        pplx_space_common_core::types::Arch::X86_64,
+    )
+    .unwrap()
+    .definition()
+    .unwrap()
 }
 
 #[tokio::test]
@@ -795,7 +775,6 @@ async fn explicit_selection_checks_legacy_base_evidence_before_create() {
         let fixture = Fixture::new(crate::db::test_conn(), build.resolver(BUILD), node);
         let mut request = create_request();
         request.boot_mode = BootMode::Cold as i32;
-        qualified_test_policy(&mut request);
         pplx_space_sbx_mgr_client::environment::bind(&mut request, definition.reference());
         let error = fixture.create(request).await.unwrap_err();
         if matches {
@@ -818,9 +797,8 @@ async fn explicit_selection_checks_legacy_base_evidence_before_create() {
 }
 
 /// Exercise logical Create and the persisted input used by Start, without a VM
-/// or host-owned cache. Bound execution is qualified only for x86-64; changing
-/// a descriptor's architecture also changes its identity and is not qualification.
-#[cfg(target_arch = "x86_64")]
+/// or host-owned cache, with each compiled x86-64 environment. The node is a
+/// fake, so the test host's architecture doesn't matter.
 #[tokio::test]
 async fn selected_create_persists_the_binding_used_by_first_start() {
     use pplx_space_node_mgr_client::proto::{
@@ -1113,7 +1091,6 @@ async fn unpinned_create_selects_before_admitting_a_non_default_source() {
     fixture.service.create_cache_dir = Some(cache.path().to_owned());
     let mut request = create_request();
     request.boot_mode = BootMode::Cold as i32;
-    qualified_test_policy(&mut request);
     let created = fixture.create(request).await.unwrap();
     let reopened = crate::db::Connection::open_at(&db_path).unwrap();
     let row = crate::db::get_sandbox(&reopened, &created.sandbox_id)

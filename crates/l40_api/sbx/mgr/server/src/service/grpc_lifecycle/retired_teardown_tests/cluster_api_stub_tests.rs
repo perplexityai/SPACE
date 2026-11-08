@@ -50,6 +50,11 @@ impl CrossProcessLog {
     }
 }
 
+/// Held by each [`with_cluster_api`], whose logs point the process-wide
+/// [`CrossProcessLog`]s at its own files: tests that share a process, as
+/// `cargo test`'s threads do, would otherwise record into each other's.
+static CLUSTER_API_STUBS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// The local artifact id of each registration the stub admitted.
 static ADMITTED_REGISTRATIONS: CrossProcessLog =
     CrossProcessLog::new("SPACE_TEST_ADMITTED_ARTIFACT_BACKUPS");
@@ -322,6 +327,7 @@ pub(in crate::service::grpc_lifecycle) async fn with_cluster_api<S>(
 {
     use std::ffi::OsStr;
 
+    let _serial = CLUSTER_API_STUBS.lock().await;
     // The parent serves while the isolated child exercises environment-based
     // client wiring. A second runtime thread keeps the server making progress.
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
