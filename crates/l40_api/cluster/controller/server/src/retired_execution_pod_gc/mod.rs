@@ -39,9 +39,10 @@
 //! - **Never started** (`ReplacedNeverStarted`): the row was retired as
 //!   `replaced`, the pod is still `Pending` with no pod IP, kubelet reports
 //!   `PodReadyToStartContainers=False`, and it is not a restore pod. The SPACE
-//!   shim boots the VM in `RunPodSandbox`; kubelet flips that condition to
-//!   `True` once `RunPodSandbox` succeeds, so `False` means no VM. A pod
-//!   without the condition is skipped.
+//!   shim boots the VM in `RunPodSandbox`, and kubelet flips that condition to
+//!   `True` once the call succeeds. `False` alone also covers a boot still in
+//!   flight; staying `False` for the whole observation threshold rules that
+//!   out. A pod without the condition is skipped.
 //!   A `replaced` generation's capture is also refused by the backup fence.
 //!   Non-terminal restore pods are left to `orphaned_restore_pod_gc`, which
 //!   applies the restore-specific supersession rules.

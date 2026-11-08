@@ -50,7 +50,8 @@ pub struct PodSnapshot {
     /// `RunPodSandbox`.
     pub has_pod_ip: bool,
     /// Kubelet reports `PodReadyToStartContainers=False`: `RunPodSandbox`
-    /// has not succeeded, so the shim has no VM for this pod.
+    /// has not succeeded. It is also `False` while that call is still booting
+    /// the VM; the observation threshold covers an in-flight boot.
     pub sandbox_not_ready: bool,
     pub phase: PodPhase,
     /// Every app, init and ephemeral container has terminated, and there is at
@@ -118,8 +119,9 @@ pub enum ReapReason {
     TerminalRetired,
     /// The execution was retired as `replaced` and its fresh-create pod is
     /// still `Pending` with no pod IP and kubelet reporting
-    /// `PodReadyToStartContainers=False`: its sandbox never came up, and
-    /// sandbox-manager refuses to start it. The node-published
+    /// `PodReadyToStartContainers=False` for the whole observation
+    /// threshold: its sandbox never came up, and sandbox-manager refuses to
+    /// start it. The node-published
     /// activation-rollback shape.
     ReplacedNeverStarted,
 }
