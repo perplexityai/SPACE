@@ -34,14 +34,6 @@ snapshotStreamBtrfsSend: true
 networkCredentials:
   enabled: true
 
-# Publishes a cleanup-owned sandbox's stored lifecycle (STOPPING, DELETING or
-# SUSPENDING) instead of CLEANUP_REQUIRED/CLEANUP_FAILED on State, Wait, List
-# and ListBuildReferencingSandboxes (`publish_native_lifecycle`,
-# docs/configuration.md). Enable only once every reader decides from
-# `cleanup.state`. Off leaves the node's sandbox.toml in charge.
-nativeLifecyclePublication:
-  enabled: false
-
 # Dynamic feature-flag provider. Empty is the supported provider-free
 # deployment, not a missing setting: with no secret named, `knownEgress` below
 # is the only control over the one flag this binary reads. That flag is

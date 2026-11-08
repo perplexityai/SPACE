@@ -509,26 +509,29 @@ func (WakeTransition) EnumDescriptor() ([]byte, []int) {
 	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{8}
 }
 
-// Node-local lifecycle, including cleanup states that are not control-plane
-// desired lifecycles. Unknown observations are never evidence of a safe state.
+// Node-local lifecycle. Unknown observations are never evidence of a safe
+// state.
 type SandboxLifecycleState int32
 
 const (
-	SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_UNSPECIFIED      SandboxLifecycleState = 0
-	SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_CREATING         SandboxLifecycleState = 1
-	SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_CREATED          SandboxLifecycleState = 2
-	SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_STARTING         SandboxLifecycleState = 3
-	SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_STARTED          SandboxLifecycleState = 4
-	SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_STOPPING         SandboxLifecycleState = 5
-	SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_STOPPED          SandboxLifecycleState = 6
-	SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_DELETING         SandboxLifecycleState = 7
-	SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_PAUSING          SandboxLifecycleState = 8
-	SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_PAUSED           SandboxLifecycleState = 9
-	SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_RESUMING         SandboxLifecycleState = 10
-	SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_CHECKPOINTING    SandboxLifecycleState = 11
-	SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_SUSPENDING       SandboxLifecycleState = 12
-	SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_SUSPENDED        SandboxLifecycleState = 13
-	SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_RESTORING        SandboxLifecycleState = 14
+	SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_UNSPECIFIED   SandboxLifecycleState = 0
+	SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_CREATING      SandboxLifecycleState = 1
+	SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_CREATED       SandboxLifecycleState = 2
+	SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_STARTING      SandboxLifecycleState = 3
+	SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_STARTED       SandboxLifecycleState = 4
+	SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_STOPPING      SandboxLifecycleState = 5
+	SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_STOPPED       SandboxLifecycleState = 6
+	SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_DELETING      SandboxLifecycleState = 7
+	SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_PAUSING       SandboxLifecycleState = 8
+	SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_PAUSED        SandboxLifecycleState = 9
+	SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_RESUMING      SandboxLifecycleState = 10
+	SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_CHECKPOINTING SandboxLifecycleState = 11
+	SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_SUSPENDING    SandboxLifecycleState = 12
+	SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_SUSPENDED     SandboxLifecycleState = 13
+	SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_RESTORING     SandboxLifecycleState = 14
+	// Published only by an older node, for a row a cleanup owns, with or without
+	// `SandboxCleanup.state`. A current node publishes the lifecycle the cleanup
+	// is over and names the cleanup in `SandboxCleanup.state`.
 	SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_CLEANUP_REQUIRED SandboxLifecycleState = 15
 	SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_CLEANUP_FAILED   SandboxLifecycleState = 16
 	SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_QUARANTINED      SandboxLifecycleState = 17
@@ -609,10 +612,9 @@ func (SandboxLifecycleState) EnumDescriptor() ([]byte, []int) {
 }
 
 // What an admitted node-local cleanup does to the row when it finishes. For a
-// CLEANUP_REQUIRED or CLEANUP_FAILED row, the shim's legacy pod teardown stops
-// the sandbox on Kill and deletes it on Delete for any value it doesn't
-// recognize, so a new value that keeps the rootfs needs a shim that releases
-// it to deploy first.
+// row a cleanup owns, the shim's legacy pod teardown stops the sandbox on Kill
+// and deletes it on Delete for any value it doesn't recognize, so a new value
+// that keeps the rootfs needs a shim that releases it to deploy first.
 type SandboxCleanupCompletion int32
 
 const (
@@ -687,12 +689,11 @@ type SandboxCleanupState int32
 const (
 	// No cleanup owns the row.
 	SandboxCleanupState_SANDBOX_CLEANUP_STATE_UNSPECIFIED SandboxCleanupState = 0
-	// A forced teardown owns the row and is owed. Published as the
-	// CLEANUP_REQUIRED lifecycle unless the node publishes the native one.
+	// A forced teardown owns the row and is owed. An older node may also publish
+	// it as the CLEANUP_REQUIRED lifecycle.
 	SandboxCleanupState_SANDBOX_CLEANUP_STATE_REQUIRED SandboxCleanupState = 1
-	// A teardown owns the row and its last attempt failed; it is retried.
-	// Published as the CLEANUP_FAILED lifecycle unless the node publishes the
-	// native one.
+	// A teardown owns the row and its last attempt failed; it is retried. An
+	// older node may also publish it as the CLEANUP_FAILED lifecycle.
 	SandboxCleanupState_SANDBOX_CLEANUP_STATE_FAILED SandboxCleanupState = 2
 )
 
@@ -3935,12 +3936,11 @@ type SandboxCleanup struct {
 	// it. An armed activation, whose rollback target is recorded in
 	// `completion` while the start still runs, is UNSPECIFIED, so read this
 	// field, not the presence of this message, to tell a cleanup-owned row. A
-	// row can be REQUIRED or FAILED with no completion recorded. An older node
-	// never sets this field: honor CLEANUP_REQUIRED and CLEANUP_FAILED
-	// lifecycles too. Nodes publish these rows with those lifecycles by
-	// default; one configured to publish the native lifecycle reports the
-	// teardown transition the cleanup is over (STOPPING, DELETING or
-	// SUSPENDING) instead.
+	// row can be REQUIRED or FAILED with no completion recorded. A node publishes
+	// such a row with the teardown transition the cleanup is over (STOPPING,
+	// DELETING or SUSPENDING). An older node may instead publish the
+	// CLEANUP_REQUIRED or CLEANUP_FAILED lifecycle, with or without this field
+	// set: honor those too.
 	State         SandboxCleanupState `protobuf:"varint,2,opt,name=state,proto3,enum=space.sandbox.manager.v1.SandboxCleanupState" json:"state,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache

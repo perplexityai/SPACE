@@ -1668,6 +1668,9 @@ fn bind_manifest(manifest: &mut TemplateManifest, partition: crate::db::Template
         pplx_space_common_core::types::Arch::X86_64,
         vec![],
     );
+    // Name the architecture the binding is for, or registration takes the
+    // test host's.
+    manifest.arch = "x86_64".into();
     manifest.set_execution_metadata(match partition.environment() {
         Some(environment) => execution.with_environment(environment),
         None => execution,
@@ -1789,6 +1792,7 @@ fn write_twin_metadata_binding(dir: &std::path::Path, manifest: &TemplateManifes
     bind_manifest(&mut bound, twin_partition());
     let mut metadata = TemplateMetadata::default();
     metadata.set_execution_metadata(bound.execution.unwrap());
+    metadata.arch = Some(bound.arch);
     std::fs::write(
         dir.join("metadata.json"),
         serde_json::to_vec(&metadata).unwrap(),
@@ -2633,6 +2637,7 @@ fn place_legacy_e1_builds(
                 write_digest_fixture(format!("legacy-e1-rootfs-{index}").as_bytes(), b"zst-bytes");
             let mut manifest = canonical_manifest(&fixture);
             manifest.set_execution_metadata(execution.clone());
+            manifest.arch = "x86_64".into();
             write_manifest_json(fixture.dir.path(), &manifest);
             let dir = root.join("seed").join(&fixture.rootfs_hash);
             std::fs::create_dir_all(dir.parent().unwrap()).unwrap();

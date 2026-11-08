@@ -25,14 +25,6 @@ pub struct SandboxConfig {
     /// At most [`MAX_BALLOON_HINT_TIMEOUT_MS`]. Default: unset, which makes
     /// no balloon calls at suspend.
     pub balloon_hint_timeout_ms: Option<NonZeroU32>,
-    /// Publish a cleanup-owned row's stored lifecycle (`STOPPING`, `DELETING`
-    /// or `SUSPENDING`) on State, Wait, List and ListBuildReferencingSandboxes,
-    /// with `cleanup.state` naming the cleanup, instead of `CLEANUP_REQUIRED`
-    /// or `CLEANUP_FAILED`. Turn it on only once every reader of those RPCs
-    /// decides from `cleanup.state`. Read at startup, like the rest of this
-    /// file; [`PUBLISH_NATIVE_LIFECYCLE_ENV`] overrides it. Default: false.
-    #[serde(default)]
-    pub publish_native_lifecycle: bool,
 }
 
 /// Upper bound on `balloon_hint_timeout_ms`: a suspend holds the sandbox's
@@ -74,23 +66,8 @@ pub enum ConfigLoadError {
     InvalidBalloonHintTimeout { path: PathBuf },
 }
 
-/// Overrides `publish_native_lifecycle` when set to a flag value, so a
-/// deployment can switch it without rebuilding the node image that writes
-/// this file.
-pub const PUBLISH_NATIVE_LIFECYCLE_ENV: &str = "SPACE_SBXMGR_PUBLISH_NATIVE_LIFECYCLE";
-
 pub fn load() -> Result<SandboxConfig, ConfigLoadError> {
-    let mut config = load_from(Path::new(CONFIG_PATH))?;
-    config.publish_native_lifecycle = native_lifecycle_override(
-        std::env::var(PUBLISH_NATIVE_LIFECYCLE_ENV).ok().as_deref(),
-        config.publish_native_lifecycle,
-    );
-    Ok(config)
-}
-
-/// The environment's value when it is a flag, otherwise the file's.
-fn native_lifecycle_override(env: Option<&str>, file: bool) -> bool {
-    pplx_space_common_core::env::env_flag(env, file)
+    load_from(Path::new(CONFIG_PATH))
 }
 
 fn load_from(path: &Path) -> Result<SandboxConfig, ConfigLoadError> {
