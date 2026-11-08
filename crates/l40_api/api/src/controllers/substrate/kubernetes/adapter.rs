@@ -38,6 +38,9 @@ use sqlx::{Postgres, Transaction};
 
 mod node_eligibility;
 mod pooled;
+mod stopped_runtime_upgrade;
+#[cfg(test)]
+pub(super) use stopped_runtime_upgrade::{BootedPod, unretired_settled_failure};
 mod substrate_adapter;
 mod suspend;
 mod teardown;

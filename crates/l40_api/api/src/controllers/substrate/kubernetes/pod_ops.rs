@@ -54,6 +54,7 @@ pub(super) use restore::ExecutionHydrationOutcome;
 pub(super) use restore::pod_matches_execution_generation;
 #[cfg(test)]
 use restore::restored_pod_routability;
+pub(super) use started_recovery::LocalSourceNodeRefusal;
 use started_recovery::started_recovery_replacement_event_details;
 pub(super) use wake::{ActivationWakeFailure, WakeDispatchStatus};
 
@@ -345,7 +346,11 @@ pub(super) struct PodMaterializationOwnership {
     /// different artifacts. `None` for every other materialization.
     stopped_materialization_artifact_id: Option<LocalArtifactId>,
     /// The runtime upgrade a user restore's pod boots the sandbox through,
-    /// when it creates one; see [`super::pod_runtime_upgrade`].
+    /// when it creates one; see [`super::pod_runtime_upgrade`]. A `stopped`
+    /// target's upgrade is recorded on every execution claimed for it, in the
+    /// claim's transaction and before any pod, so a retry repeats it
+    /// (`adapter/stopped_runtime_upgrade.rs`); that needs an activation
+    /// attempt.
     runtime_upgrade: Option<super::pod_runtime_upgrade::PodUpgrade>,
     /// `runtime_upgrade` is the one a kept pod carries, not one this
     /// activation decided: a resume taking over a restore whose own decision

@@ -51,9 +51,14 @@ mod runtime_attribution;
 pub(super) use runtime_attribution::attribution_update;
 mod runtime_upgrade;
 mod started_recovery;
+mod stopped_evacuation;
 mod suspend;
 
+pub(super) use activation_fence::{
+    RecordedRuntimeUpgrade, StoppedRuntimeUpgradeClaim, StoppedUpgradeRecord,
+};
 pub(super) use restore_source::RestoreSnapshotChoice;
+pub use stopped_evacuation::{LeftoverStoppedUpgrade, StoppedEvacuationOpening};
 
 #[derive(Clone)]
 pub(super) struct K8sStore {

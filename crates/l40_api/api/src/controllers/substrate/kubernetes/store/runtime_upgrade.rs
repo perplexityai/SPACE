@@ -158,6 +158,31 @@ impl K8sStore {
         Ok(row.map(Into::into))
     }
 
+    /// Whether the node last published `sandbox_id` stopped and bound to
+    /// `environment`: a stopped sandbox's runtime upgrade to it has finished
+    /// and its result is recorded. A boot publishes the sandbox started, and
+    /// a rollback keeps the environment it left.
+    pub(in crate::controllers::substrate::kubernetes) async fn published_stopped_under(
+        &self,
+        sandbox_id: SandboxId,
+        environment: EnvironmentReference,
+    ) -> Result<bool, SubstrateError> {
+        sqlx::query_scalar(sql!(
+            "SELECT EXISTS (
+                 SELECT 1
+                   FROM sandbox_observed_states
+                  WHERE sandbox_id = $1
+                    AND LOWER(TRIM(status)) = 'stopped'
+                    AND execution_metadata->>'environment' = $2
+             )"
+        ))
+        .bind(sandbox_id)
+        .bind(environment.to_string())
+        .fetch_one(&self.pool)
+        .await
+        .db_context("failed to read the sandbox's published environment")
+    }
+
     /// Every environment in the catalog that isn't retired, with its edges.
     pub(in crate::controllers::substrate::kubernetes) async fn unretired_runtime_environments(
         &self,

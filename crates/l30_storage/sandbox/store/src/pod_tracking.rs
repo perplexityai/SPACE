@@ -289,7 +289,15 @@ async fn recover_started_with_current_suspend_snapshot(
 ///
 /// * an active execution that doesn't predate the row's current stop: the row
 ///   is no longer `stopped`, or the execution was created after its
-///   `lifecycle_changed_at`;
+///   `lifecycle_changed_at`. One execution newer than the stop is retired all
+///   the same: the one a stay-stopped runtime upgrade claimed and recorded
+///   and didn't finish (its upgrade recorded, its claim targeting `stopped`),
+///   once its lease has ended (a live one refuses, below). The row stays
+///   `stopped` throughout such an upgrade, so its execution postdates the
+///   stop, and refusing it would hold the evacuation, and the drain, forever.
+///   The evacuation took it over when it opened and deleted the upgrade's pod,
+///   and saw it gone, before it minted the backup the teardown requires
+///   durable; that backup stands in for the one the upgrade may still owe;
 /// * an active execution holding an activation attempt that hasn't expired,
 ///   or that has no expiry;
 /// * no row carries the `'stopped'` evacuation marker. A start moves the
@@ -313,7 +321,13 @@ pub async fn stopped_execution_retirement_refused(
                            AND execution.active
                            AND NOT (
                                sandbox.lifecycle = 'stopped'
-                               AND execution.created_at <= sandbox.lifecycle_changed_at
+                               AND (
+                                   execution.created_at <= sandbox.lifecycle_changed_at
+                                   OR (
+                                       execution.runtime_upgrade_operation_id IS NOT NULL
+                                       AND execution.activation_attempt_target_state = 'stopped'
+                                   )
+                               )
                            )
                     )
                  OR EXISTS (

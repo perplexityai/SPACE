@@ -849,6 +849,15 @@ impl SubstrateAdapter for RetryingPoolSubstrate {
         panic!("unused")
     }
 
+    async fn upgrade_stopped_runtime(
+        &self,
+        _sandbox_id: SandboxId,
+        _timeout: std::time::Duration,
+    ) -> Result<crate::controllers::substrate::runtime_upgrade::StoppedRuntimeUpgrade, SubstrateError>
+    {
+        panic!("unused")
+    }
+
     async fn start_execution(
         &self,
         _metric_identity: SandboxApiMetricIdentity,
@@ -1190,6 +1199,15 @@ impl SubstrateAdapter for NodeRpcStubbedKubernetes {
         &self,
         _request: crate::controllers::substrate::RetireExecutionRequest,
     ) -> Result<crate::controllers::substrate::RetireExecutionOutcome, SubstrateError> {
+        panic!("unused")
+    }
+
+    async fn upgrade_stopped_runtime(
+        &self,
+        _sandbox_id: SandboxId,
+        _timeout: std::time::Duration,
+    ) -> Result<crate::controllers::substrate::runtime_upgrade::StoppedRuntimeUpgrade, SubstrateError>
+    {
         panic!("unused")
     }
 
