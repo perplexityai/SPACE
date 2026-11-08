@@ -45,7 +45,7 @@ impl NetworkPolicyReconcileError {
 }
 
 async fn reconcile_policy_and_route_security<I, P, R, F>(
-    state: SandboxState,
+    state: impl Into<SandboxStatus>,
     identity: &SpaceApiRouteIdentity,
     route_identity_push: I,
     policy_reconcile: P,
@@ -57,7 +57,11 @@ where
     R: FnOnce(Option<u32>) -> F,
     F: std::future::Future<Output = Result<(), Status>>,
 {
-    if matches!(state, SandboxState::Starting | SandboxState::Restoring) {
+    let state = state.into();
+    if matches!(
+        state.unowned(),
+        Some(SandboxState::Starting | SandboxState::Restoring)
+    ) {
         use IncompleteSandboxRouteIdentityError::*;
         use SandboxRouteIdentityInvariantError::*;
 
@@ -459,7 +463,7 @@ impl SandboxManagerService {
         let transition = match action {
             AutoLifecycleIdleAction::None => AutoLifecycleTransition::Noop,
             AutoLifecycleIdleAction::Pause => {
-                if sandbox.state == SandboxState::Started {
+                if sandbox.state.is_unowned(SandboxState::Started) {
                     self.pause(auto_lifecycle_request(PauseRequest {
                         sandbox_id: sandbox.id.clone(),
                     }))
@@ -468,7 +472,10 @@ impl SandboxManagerService {
                 AutoLifecycleTransition::Pause
             }
             AutoLifecycleIdleAction::Suspend => {
-                if matches!(sandbox.state, SandboxState::Started | SandboxState::Paused) {
+                if matches!(
+                    sandbox.state.unowned(),
+                    Some(SandboxState::Started | SandboxState::Paused)
+                ) {
                     let artifact_lock = self.auto_lifecycle.artifact_lock(&sandbox.id);
                     let artifact_guard = artifact_lock.lock_owned().await;
                     let context = SuspendRequestContext::new(
@@ -492,8 +499,8 @@ impl SandboxManagerService {
                 AutoLifecycleTransition::Suspend
             }
             AutoLifecycleIdleAction::Stop => {
-                match sandbox.state {
-                    SandboxState::Started | SandboxState::Paused => {
+                match sandbox.state.unowned() {
+                    Some(SandboxState::Started | SandboxState::Paused) => {
                         self.stop(auto_lifecycle_request(StopRequest {
                             sandbox_id: sandbox.id.clone(),
                             template_filter: None,
@@ -502,7 +509,7 @@ impl SandboxManagerService {
                         }))
                         .await?;
                     }
-                    SandboxState::Suspended => {
+                    Some(SandboxState::Suspended) => {
                         let stopped = self.stop_suspended_for_auto_lifecycle(&sandbox.id).await?;
                         if !stopped {
                             return Ok(());
@@ -1093,8 +1100,10 @@ impl SandboxManagerService {
 /// control RPC: pushes at such gateways can never converge (the policy
 /// refresh abandons for the same states), and each sweep otherwise emits
 /// warn logs and error client spans against them forever.
-fn network_policy_reconcile_entry_decision(state: SandboxState) -> Option<ApplyDecisionKind> {
-    (!state.can_authorize_net_gateway()).then_some(ApplyDecisionKind::Skip)
+fn network_policy_reconcile_entry_decision(
+    state: impl Into<SandboxStatus>,
+) -> Option<ApplyDecisionKind> {
+    (!state.into().can_authorize_net_gateway()).then_some(ApplyDecisionKind::Skip)
 }
 
 #[cfg(test)]

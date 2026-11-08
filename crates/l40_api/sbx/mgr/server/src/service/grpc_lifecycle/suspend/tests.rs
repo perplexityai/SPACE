@@ -95,32 +95,33 @@ enum Expected {
 
 /// The generic guard that refuses a `pausing`, `started` or `paused` write
 /// over `found`, as the generic guards' message names it, or `None` when
-/// only the from-set refuses. Written out per state from #372's `PLAIN` grid for a
-/// row with no cleanup intent or episode, not derived from the writer.
-fn guard_refusal(found: SandboxState) -> Option<&'static str> {
-    match found {
-        SandboxState::Stopping
-        | SandboxState::Deleting
-        | SandboxState::CleanupRequired
-        | SandboxState::CleanupFailed => Some("superseded_by_cleanup_episode"),
-        SandboxState::Quarantined => Some("blocked_by_quarantine"),
-        SandboxState::Creating
-        | SandboxState::Created
-        | SandboxState::Starting
-        | SandboxState::Started
-        | SandboxState::Stopped
-        | SandboxState::Pausing
-        | SandboxState::Paused
-        | SandboxState::Resuming
-        | SandboxState::Checkpointing
-        | SandboxState::Suspending
-        | SandboxState::Suspended
-        | SandboxState::Restoring
-        | SandboxState::Failed => None,
+/// only the from-set refuses. Written out per status for a row with no cleanup
+/// intent or episode, not derived from the writer.
+fn guard_refusal(found: SandboxStatus) -> Option<&'static str> {
+    match found.unowned() {
+        Some(SandboxState::Stopping | SandboxState::Deleting) | None => {
+            Some("superseded_by_cleanup_episode")
+        }
+        Some(SandboxState::Quarantined) => Some("blocked_by_quarantine"),
+        Some(
+            SandboxState::Creating
+            | SandboxState::Created
+            | SandboxState::Starting
+            | SandboxState::Started
+            | SandboxState::Stopped
+            | SandboxState::Pausing
+            | SandboxState::Paused
+            | SandboxState::Resuming
+            | SandboxState::Checkpointing
+            | SandboxState::Suspending
+            | SandboxState::Suspended
+            | SandboxState::Restoring
+            | SandboxState::Failed,
+        ) => None,
     }
 }
 
-fn rejected(context: &str, found: SandboxState) -> Expected {
+fn rejected(context: &str, found: SandboxStatus) -> Expected {
     Expected::Rejected(match guard_refusal(found) {
         Some(outcome) => format!("{context}: sandbox state write was not applied: {outcome}"),
         None => format!("{context}: sandbox state write was superseded: sandbox is {found}"),
@@ -130,25 +131,30 @@ fn rejected(context: &str, found: SandboxState) -> Expected {
 /// Suspend's answer when the exit's write finds the row in `found`. Only the
 /// state the auto-pause expects there is written: `started` at the begin, and
 /// its own `pausing` after it.
-fn expected(exit: Exit, found: SandboxState) -> Expected {
+fn expected(exit: Exit, found: SandboxStatus) -> Expected {
     match exit {
-        Exit::Begin if found == SandboxState::Started => Expected::RolledBack,
+        Exit::Begin if found.is_unowned(SandboxState::Started) => Expected::RolledBack,
         Exit::Begin => rejected("begin checkpoint pause", found),
-        Exit::Rollback if found == SandboxState::Pausing => Expected::RolledBack,
+        Exit::Rollback if found.is_unowned(SandboxState::Pausing) => Expected::RolledBack,
         Exit::Rollback => Expected::PreparationFailed,
-        Exit::Complete if found == SandboxState::Pausing => Expected::Paused,
+        Exit::Complete if found.is_unowned(SandboxState::Pausing) => Expected::Paused,
         Exit::Complete => rejected("complete checkpoint pause", found),
     }
 }
 
 /// Move the row to `state` with no other column changed, and install the
 /// tripwire. The state the auto-pause left at the exit is left as it is.
-fn interleave(conn: &crate::db::Connection, id: &str, exit: Exit, state: SandboxState) -> Snapshot {
+fn interleave(
+    conn: &crate::db::Connection,
+    id: &str,
+    exit: Exit,
+    state: SandboxStatus,
+) -> Snapshot {
     let left = match exit {
         Exit::Begin => SandboxState::Started,
         Exit::Rollback | Exit::Complete => SandboxState::Pausing,
     };
-    if state != left {
+    if !state.is_unowned(left) {
         force_state(conn, id, state);
     }
     conn.execute_batch(&format!(
@@ -162,7 +168,7 @@ fn interleave(conn: &crate::db::Connection, id: &str, exit: Exit, state: Sandbox
 
 /// Suspend a `started` sandbox, moving its row to `state` at the exit's
 /// interleaving, and check the answer and the database.
-async fn check_suspend(exit: Exit, state: SandboxState) {
+async fn check_suspend(exit: Exit, state: SandboxStatus) {
     let case = format!("{exit:?}, {state:?}");
     let scratch = tempfile::tempdir().unwrap();
     let conn = crate::db::test_conn();
@@ -269,7 +275,11 @@ async fn check_suspend(exit: Exit, state: SandboxState) {
         let status = result.expect_err(&case);
         match expected {
             Expected::RolledBack => {
-                assert_eq!(row.state, SandboxState::Started, "{case}");
+                assert_eq!(
+                    row.state,
+                    SandboxStatus::from(SandboxState::Started),
+                    "{case}"
+                );
                 assert_eq!(status.code(), tonic::Code::Internal, "{case}: {status:?}");
                 assert!(
                     status
@@ -289,7 +299,11 @@ async fn check_suspend(exit: Exit, state: SandboxState) {
                 );
             }
             Expected::Paused => {
-                assert_eq!(row.state, SandboxState::Paused, "{case}");
+                assert_eq!(
+                    row.state,
+                    SandboxStatus::from(SandboxState::Paused),
+                    "{case}"
+                );
                 assert_eq!(status.code(), tonic::Code::Internal, "{case}: {status:?}");
                 assert_eq!(status.message(), format!("db error: {TRIPWIRE}"), "{case}");
             }
@@ -322,7 +336,7 @@ async fn check_suspend(exit: Exit, state: SandboxState) {
 async fn suspend_auto_pause_writes_only_over_the_state_it_expects(
     #[values(Exit::Begin, Exit::Rollback, Exit::Complete)] exit: Exit,
 ) {
-    for state in SandboxState::all() {
+    for state in SandboxStatus::sweep() {
         check_suspend(exit, state).await;
     }
 }

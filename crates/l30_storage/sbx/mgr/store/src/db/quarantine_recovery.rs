@@ -1387,7 +1387,7 @@ pub fn publish_orphan_quarantine_recovered_artifact(
     emit_sandbox_state_event(
         &sandbox_id_string,
         SandboxEventType::QuarantineRecovered,
-        Some(SandboxState::Quarantined.as_str()),
+        Some(Ok(SandboxState::Quarantined.into())),
         reason_code.as_str(),
         "publish_orphan_quarantine_recovered_artifact",
         SandboxState::Suspended,
@@ -1564,10 +1564,10 @@ pub fn adopt_quarantine_cleanup_episode(
     emit_sandbox_state_event(
         &sandbox_id,
         SandboxEventType::CleanupRequested,
-        Some(SandboxState::Quarantined.as_str()),
+        Some(Ok(SandboxState::Quarantined.into())),
         candidate.reason_code.as_str(),
         "adopt_quarantine_cleanup_episode",
-        SandboxState::CleanupRequired,
+        SandboxStatus::owned(Teardown::Stopping, CleanupState::Required),
         Some(message),
     );
     Ok(QuarantineAdoptionOutcome::Adopted)

@@ -25,7 +25,7 @@ use crate::proto::{
 };
 use crate::service::SandboxManagerService;
 use crate::service::activation_support::internal_request;
-use crate::state::SandboxState;
+use crate::state::{SandboxState, SandboxStatus};
 
 const POD_NETNS: &str = "/var/run/netns/cni-runtime-upgrade";
 const POD_UID: &str = "4f6b0d4e-6a59-4b5c-9e43-3a1d0d6f2a10";
@@ -238,7 +238,7 @@ async fn a_pods_upgrade_boots_in_the_pods_namespace_under_the_target() {
         calls.lock().unwrap()
     );
     let row = f.row();
-    assert_eq!(row.state, SandboxState::Stopped);
+    assert_eq!(row.state, SandboxStatus::from(SandboxState::Stopped));
     assert_eq!(
         row.execution_metadata
             .as_ref()
@@ -293,7 +293,7 @@ async fn an_upgrade_already_on_its_target_is_recorded_and_replays_the_same() {
         );
     }
     f.assert_no_node_calls();
-    assert_eq!(f.row().state, SandboxState::Stopped);
+    assert_eq!(f.row().state, SandboxStatus::from(SandboxState::Stopped));
     // An operation names one sandbox.
     let other = SandboxId::new().to_string();
     let refused = f
@@ -612,7 +612,7 @@ async fn a_started_sandbox_already_on_its_target_answers_only_its_own_pod() {
                 "{error}"
             );
         }
-        assert_eq!(f.row().state, SandboxState::Started);
+        assert_eq!(f.row().state, SandboxStatus::from(SandboxState::Started));
         let reported = report(&f.service, &f.sandbox_id, operation_id);
         assert_eq!(
             reported.status,
@@ -670,7 +670,7 @@ async fn an_operation_answered_with_a_running_execution_never_starts_it_after_a_
 
     assert_eq!(error.code(), tonic::Code::FailedPrecondition, "{error}");
     assert!(error.message().contains("already activated"), "{error}");
-    assert_eq!(f.row().state, SandboxState::Stopped);
+    assert_eq!(f.row().state, SandboxStatus::from(SandboxState::Stopped));
     f.assert_no_node_calls();
 }
 
@@ -774,7 +774,7 @@ async fn a_pods_upgrade_of_a_suspended_sandbox_needs_the_decided_checkpoint() {
 
         assert_eq!(error.code(), tonic::Code::FailedPrecondition, "{error}");
         assert!(error.message().contains("decided from"), "{error}");
-        assert_eq!(f.row().state, SandboxState::Suspended);
+        assert_eq!(f.row().state, SandboxStatus::from(SandboxState::Suspended));
         f.assert_no_node_calls();
     }
 
@@ -884,7 +884,7 @@ async fn a_kubernetes_wake_refuses_a_runtime_upgrade() {
 
         assert_eq!(error.code(), tonic::Code::FailedPrecondition, "{error}");
         assert!(error.message().contains("never from a Wake"), "{error}");
-        assert_eq!(f.row().state, SandboxState::Stopped);
+        assert_eq!(f.row().state, SandboxStatus::from(SandboxState::Stopped));
         f.assert_no_node_calls();
         assert_eq!(
             crate::db::read::runtime_upgrade_fence(&f.service.db.lock().unwrap(), &f.sandbox_id)
@@ -974,7 +974,7 @@ async fn an_old_shims_runtime_upgrade_start_is_refused_on_a_stopped_suspended_or
             "{state}: {error}"
         );
         let after = f.row();
-        assert_eq!(after.state, state);
+        assert_eq!(after.state, SandboxStatus::from(state));
         assert_eq!(after.pid, None, "nothing may have launched");
         assert_eq!(
             after.current_local_artifact_id,
@@ -1061,7 +1061,7 @@ async fn an_interrupted_stage_is_resumed_before_the_upgrade() {
             .contains("resume interrupted cross-node restore staging"),
         "{error}"
     );
-    assert_eq!(f.row().state, SandboxState::Restoring);
+    assert_eq!(f.row().state, SandboxStatus::from(SandboxState::Restoring));
     assert_eq!(
         crate::db::read::runtime_upgrade_fence(&f.service.db.lock().unwrap(), &f.sandbox_id)
             .unwrap(),
@@ -1134,7 +1134,7 @@ async fn an_activated_upgrade_never_starts_its_sandbox_again() {
             let error = outcome.unwrap_err();
             assert_eq!(error.code(), tonic::Code::FailedPrecondition, "{error}");
             assert!(error.message().contains("already activated"), "{error}");
-            assert_eq!(f.row().state, SandboxState::Stopped);
+            assert_eq!(f.row().state, SandboxStatus::from(SandboxState::Stopped));
         }
         f.assert_no_node_calls();
     }
@@ -1181,7 +1181,7 @@ async fn a_wake_replay_of_a_retired_upgrade_never_restores_a_newer_checkpoint() 
 
     assert_eq!(error.code(), tonic::Code::FailedPrecondition, "{error}");
     assert!(error.message().contains("decided from"), "{error}");
-    assert_eq!(f.row().state, SandboxState::Suspended);
+    assert_eq!(f.row().state, SandboxStatus::from(SandboxState::Suspended));
     f.assert_no_node_calls();
 }
 
@@ -1223,7 +1223,7 @@ async fn a_recorded_operation_cant_be_retried_as_another() {
     .unwrap_err();
 
     assert_eq!(started.code(), tonic::Code::InvalidArgument, "{started}");
-    assert_eq!(f.row().state, SandboxState::Stopped);
+    assert_eq!(f.row().state, SandboxStatus::from(SandboxState::Stopped));
     f.assert_no_node_calls();
 }
 
@@ -1256,7 +1256,7 @@ async fn a_stopped_target_replay_ignores_a_newer_checkpoint() {
 
     assert_eq!(response.outcome, RuntimeUpgradeOutcome::Upgraded as i32);
     assert_eq!(response.start, None);
-    assert_eq!(f.row().state, SandboxState::Suspended);
+    assert_eq!(f.row().state, SandboxStatus::from(SandboxState::Suspended));
     f.assert_no_node_calls();
 }
 
@@ -1371,7 +1371,7 @@ async fn a_stopped_target_never_answers_for_a_running_sandbox() {
 
     assert_eq!(error.code(), tonic::Code::FailedPrecondition, "{error}");
     assert!(error.message().contains("not stopped"), "{error}");
-    assert_eq!(f.row().state, SandboxState::Started);
+    assert_eq!(f.row().state, SandboxStatus::from(SandboxState::Started));
     f.assert_no_node_calls();
 }
 
@@ -1404,7 +1404,7 @@ async fn a_stopped_target_replay_never_answers_for_a_running_sandbox() {
 
     assert_eq!(error.code(), tonic::Code::FailedPrecondition, "{error}");
     assert!(error.message().contains("not stopped"), "{error}");
-    assert_eq!(f.row().state, SandboxState::Started);
+    assert_eq!(f.row().state, SandboxStatus::from(SandboxState::Started));
     f.assert_no_node_calls();
 }
 
@@ -1520,7 +1520,7 @@ async fn an_activation_meeting_a_moving_sandbox_is_retryable() {
     .unwrap_err();
 
     assert_eq!(error.code(), tonic::Code::Unavailable, "{error}");
-    assert_eq!(f.row().state, SandboxState::Starting);
+    assert_eq!(f.row().state, SandboxStatus::from(SandboxState::Starting));
     f.assert_no_node_calls();
 }
 
@@ -1529,12 +1529,27 @@ async fn an_activation_meeting_a_moving_sandbox_is_retryable() {
 /// still driving, is refused as retryable, not as a sandbox that runs.
 #[tokio::test]
 async fn a_stopped_target_meeting_a_moving_sandbox_is_retryable() {
-    for state in [
-        SandboxState::Stopping,
-        SandboxState::CleanupRequired,
-        SandboxState::CleanupFailed,
+    for (mut state, delete_row) in [
+        (SandboxState::Stopping.into(), false),
+        (SandboxStatus::CLEANUP_REQUIRED, false),
+        (SandboxStatus::CLEANUP_FAILED, false),
+        (SandboxStatus::CLEANUP_REQUIRED, true),
+        (SandboxStatus::CLEANUP_FAILED, true),
     ] {
         let f = fixture(state, false, FakeNodeManager::default());
+        if delete_row {
+            assert!(
+                crate::db::set_cleanup_intent(
+                    &f.service.db.lock().unwrap(),
+                    &f.sandbox_id,
+                    false,
+                    crate::db::CleanupCompletion::DeleteRow,
+                )
+                .unwrap()
+            );
+            state =
+                SandboxStatus::owned(crate::state::Teardown::Deleting, state.cleanup().unwrap());
+        }
         let target = certified_target(&f.source);
         f.put_on(&target);
 

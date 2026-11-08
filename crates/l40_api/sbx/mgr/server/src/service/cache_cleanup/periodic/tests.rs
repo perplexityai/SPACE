@@ -40,7 +40,7 @@ async fn periodic_inventory_progresses_in_pages_without_treating_other_pages_as_
                 .unwrap()
                 .unwrap()
                 .state,
-            SandboxState::Stopped
+            SandboxStatus::from(SandboxState::Stopped)
         );
         assert!(cache.path().join(id.to_string()).is_dir());
     }
@@ -176,7 +176,7 @@ async fn orphan_quarantine_survives_inventory_once_its_runtime_is_gone() {
     let held = crate::db::get_sandbox(&conn, &id.to_string())
         .unwrap()
         .unwrap();
-    assert_eq!(held.state, SandboxState::Quarantined);
+    assert_eq!(held.state, SandboxStatus::from(SandboxState::Quarantined));
     assert!(held.cleanup_completion.is_none());
     assert!(
         crate::db::cleanup_episode(&conn, &id.to_string())
@@ -212,30 +212,33 @@ async fn orphan_quarantine_survives_inventory_once_its_runtime_is_gone() {
 
 /// Whether a row with no cache root, runtime directory or durable cleanup
 /// owner survives an inventory pass.
-fn kept_without_local_evidence(state: SandboxState) -> bool {
-    match state {
+fn kept_without_local_evidence(state: SandboxStatus) -> bool {
+    match state.unowned() {
         // These states may legitimately exist before, or after, the cache root.
-        SandboxState::Creating
-        | SandboxState::Created
-        | SandboxState::Suspended
-        | SandboxState::Restoring
-        | SandboxState::CleanupRequired
-        | SandboxState::CleanupFailed => true,
+        Some(
+            SandboxState::Creating
+            | SandboxState::Created
+            | SandboxState::Suspended
+            | SandboxState::Restoring,
+        )
+        | None => true,
         // An in-flight stop or delete owns the row's removal.
-        SandboxState::Stopping | SandboxState::Deleting => true,
+        Some(SandboxState::Stopping | SandboxState::Deleting) => true,
         // Only an explicit disposition (cluster-deleted eviction, on-node
         // Delete, or quarantine recovery) releases a quarantine hold.
-        SandboxState::Quarantined => true,
+        Some(SandboxState::Quarantined) => true,
         // Every other state requires local evidence: the row is stale.
-        SandboxState::Starting
-        | SandboxState::Started
-        | SandboxState::Stopped
-        | SandboxState::Pausing
-        | SandboxState::Paused
-        | SandboxState::Resuming
-        | SandboxState::Checkpointing
-        | SandboxState::Suspending
-        | SandboxState::Failed => false,
+        Some(
+            SandboxState::Starting
+            | SandboxState::Started
+            | SandboxState::Stopped
+            | SandboxState::Pausing
+            | SandboxState::Paused
+            | SandboxState::Resuming
+            | SandboxState::Checkpointing
+            | SandboxState::Suspending
+            | SandboxState::Failed,
+        ) => false,
     }
 }
 
@@ -246,7 +249,7 @@ async fn startup_and_periodic_inventory_remove_only_rows_whose_state_requires_lo
     let paths = SandboxInventoryPaths::new(cache.path(), runtime.path());
     for periodic in [false, true] {
         let conn = crate::db::test_conn();
-        let rows = SandboxState::all()
+        let rows = SandboxStatus::sweep()
             .into_iter()
             .map(|state| {
                 let id = SandboxId::new();
@@ -263,7 +266,7 @@ async fn startup_and_periodic_inventory_remove_only_rows_whose_state_requires_lo
         let expected_removed = rows
             .iter()
             .filter(|(state, _)| !kept_without_local_evidence(*state))
-            .map(|(state, _)| state.as_str())
+            .map(|(state, _)| state.legacy_label())
             .collect::<BTreeSet<_>>();
         assert!(!expected_removed.is_empty());
 
@@ -293,7 +296,7 @@ async fn startup_and_periodic_inventory_remove_only_rows_whose_state_requires_lo
         let removed_or_published = rows
             .iter()
             .filter(|(_, id)| removed_or_published.contains(id))
-            .map(|(state, _)| state.as_str())
+            .map(|(state, _)| state.legacy_label())
             .collect::<BTreeSet<_>>();
         assert_eq!(removed_or_published, expected_removed, "{entry} pass");
         let conn = service.db_conn().unwrap();

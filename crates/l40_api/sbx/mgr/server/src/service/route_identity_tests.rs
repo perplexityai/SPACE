@@ -11,6 +11,7 @@ use super::{
     SandboxManagerServiceOptions, SandboxState, SpacedRpc,
 };
 use crate::auto_lifecycle_delete_receipts::RouteIdentityProvenance;
+use crate::state::{CleanupState, SandboxStatus};
 use aws_lc_rs::rand::SystemRandom;
 use aws_lc_rs::signature::Ed25519KeyPair;
 use base64::Engine as _;
@@ -115,7 +116,7 @@ fn insert_sandbox(
             guest_image: Default::default(),
             id: &sandbox_id.to_string(),
             uuid8: &SandboxRuntimeLabel::from_sandbox_id(sandbox_id),
-            state,
+            state: state.into(),
             template: "seed",
             template_hash: Some("hash"),
             user: &SandboxOwner::parse("user").unwrap(),
@@ -352,7 +353,7 @@ async fn identity_equal_adoption_does_not_overwrite_an_owned_execution() {
         );
         let row = service.lookup_sandbox(&id).unwrap();
         assert_eq!(row.space_api_route_identity, identity, "{owner:?}");
-        assert_eq!(row.state, expected_state, "{owner:?}");
+        assert_eq!(row.state, SandboxStatus::from(expected_state), "{owner:?}");
         service.shut_down().await;
     }
 }
@@ -558,9 +559,24 @@ async fn route_verification_bundle_refresh_installs_only_forward_updates() {
 /// execution differs from the one the request names. Callers forward the
 /// message (Direct implicit wake turns `FailedPrecondition` into an HTTP 409
 /// body), so it is pinned with the code.
-fn expected_resume_refusal(state: SandboxState) -> (Code, &'static str) {
+fn expected_resume_refusal(state: SandboxStatus) -> (Code, &'static str) {
     use SandboxState::*;
-    match state {
+    match state.cleanup() {
+        Some(CleanupState::Required) => {
+            return (
+                Code::FailedPrecondition,
+                "cannot resume: sandbox is stopping, cleanup required, not paused",
+            );
+        }
+        Some(CleanupState::Failed) => {
+            return (
+                Code::FailedPrecondition,
+                "cannot resume: sandbox is stopping, cleanup failed, not paused",
+            );
+        }
+        None => {}
+    }
+    match state.lifecycle() {
         Paused => (
             Code::FailedPrecondition,
             "resident execution changed before resume",
@@ -580,14 +596,6 @@ fn expected_resume_refusal(state: SandboxState) -> (Code, &'static str) {
         Suspended => (
             Code::FailedPrecondition,
             "cannot resume: sandbox is suspended, not paused",
-        ),
-        CleanupRequired => (
-            Code::FailedPrecondition,
-            "cannot resume: sandbox is cleanup_required, not paused",
-        ),
-        CleanupFailed => (
-            Code::FailedPrecondition,
-            "cannot resume: sandbox is cleanup_failed, not paused",
         ),
         Quarantined => (
             Code::FailedPrecondition,
@@ -660,7 +668,14 @@ async fn resident_resume_refusal_status_for_every_state() {
     assert_eq!(error.message(), format!("sandbox not found: {missing}"));
     service.shut_down().await;
 
-    for state in SandboxState::all() {
+    for state in SandboxState::all()
+        .into_iter()
+        .map(SandboxStatus::from)
+        .chain([
+            SandboxStatus::CLEANUP_REQUIRED,
+            SandboxStatus::CLEANUP_FAILED,
+        ])
+    {
         let conn = crate::db::test_conn();
         let sandbox_id = SandboxId::new();
         // A warm-pool member has no network identity, so the pre-wake policy

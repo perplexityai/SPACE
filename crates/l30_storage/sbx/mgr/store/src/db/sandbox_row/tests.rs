@@ -24,7 +24,7 @@ fn projection_order_does_not_change_values_or_corrupt_column_diagnostics() {
             guest_image: image,
             id: &id,
             uuid8: &runtime_label,
-            state: SandboxState::Stopped,
+            state: SandboxState::Stopped.into(),
             template: "row-template",
             template_hash: Some("row-template-hash"),
             user: &owner,
@@ -73,7 +73,7 @@ fn projection_order_does_not_change_values_or_corrupt_column_diagnostics() {
     assert_eq!(row.guest_image, image);
     assert_eq!(row.id, id);
     assert_eq!(row.uuid8, runtime_label);
-    assert_eq!(row.state, SandboxState::Stopped);
+    assert_eq!(row.state, SandboxStatus::from(SandboxState::Stopped));
     assert_eq!(row.user, owner);
     assert_eq!(row.template, "row-template");
     assert_eq!(row.template_hash.as_deref(), Some("row-template-hash"));
@@ -111,7 +111,7 @@ fn absent_or_malformed_counters_fail_closed_instead_of_decoding_zero() {
             guest_image: Default::default(),
             id: &id,
             uuid8: &SandboxRuntimeLabel::parse("abcdef12").unwrap(),
-            state: SandboxState::Stopped,
+            state: SandboxState::Stopped.into(),
             template: "row-template",
             template_hash: None,
             user: &SandboxOwner::parse("row-owner").unwrap(),

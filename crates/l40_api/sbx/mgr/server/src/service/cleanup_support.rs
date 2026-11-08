@@ -250,20 +250,20 @@ pub(super) fn require_state_write_from(
 pub(super) enum StateWriteRejected {
     /// Another transition moved the row outside the edge's source states.
     FromState {
-        found: SandboxState,
+        found: SandboxStatus,
     },
     /// A generic guard refused. The guards answer first, so `found` may also
     /// be outside the edge's source states.
     Guard {
         refusal: crate::db::StateWriteGuard,
-        found: SandboxState,
+        found: SandboxStatus,
     },
     Missing,
 }
 
 pub(super) fn state_write_result(
     outcome: crate::db::StateWriteOutcome,
-) -> Result<SandboxState, StateWriteRejected> {
+) -> Result<SandboxStatus, StateWriteRejected> {
     use crate::db::{StateWriteOutcome, StateWriteRefusal};
     match outcome {
         StateWriteOutcome::Applied { from } => Ok(from),

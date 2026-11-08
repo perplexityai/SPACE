@@ -74,7 +74,7 @@ pub(in crate::service) fn insert_suspended_test_sandbox(conn: &crate::db::Connec
             guest_image: Default::default(),
             id,
             uuid8: &uuid8,
-            state: SandboxState::Suspended,
+            state: SandboxState::Suspended.into(),
             template: "active-template",
             template_hash: Some("active-hash"),
             user: &user,
@@ -174,7 +174,7 @@ fn cross_node_restore_row_lifecycle_stays_restoring_until_rootfs_stage_succeeds(
     );
 
     let row = crate::db::get_sandbox(&conn, sandbox_id).unwrap().unwrap();
-    assert_eq!(row.state, SandboxState::Restoring);
+    assert_eq!(row.state, SandboxStatus::from(SandboxState::Restoring));
     let persisted_storage_uri = conn
         .query_row(
             "SELECT restore_storage_uri FROM sandboxes WHERE id = ?1",
@@ -210,7 +210,7 @@ fn cross_node_restore_row_lifecycle_stays_restoring_until_rootfs_stage_succeeds(
     transition_restored_sandbox_to_suspended(&conn, sandbox_id, &meta).unwrap();
 
     let row = crate::db::get_sandbox(&conn, sandbox_id).unwrap().unwrap();
-    assert_eq!(row.state, SandboxState::Suspended);
+    assert_eq!(row.state, SandboxStatus::from(SandboxState::Suspended));
     assert!(row.restore_operation.is_none());
     assert_eq!(row.current_local_artifact_id, Some(local_artifact_id));
     assert_eq!(
@@ -244,7 +244,7 @@ fn cross_node_restore_adopts_quarantined_synthetic_orphan_row() {
     .unwrap();
 
     let row = crate::db::get_sandbox(&conn, sandbox_id).unwrap().unwrap();
-    assert_eq!(row.state, SandboxState::Restoring);
+    assert_eq!(row.state, SandboxStatus::from(SandboxState::Restoring));
     assert_eq!(row.template, meta.source.template_id);
     assert_eq!(row.template_hash, meta.source.content_hash);
     assert_eq!(row.runtime, meta.source.runtime);
@@ -257,7 +257,7 @@ fn cross_node_restore_adopts_quarantined_synthetic_orphan_row() {
     transition_restored_sandbox_to_suspended(&conn, sandbox_id, &meta).unwrap();
 
     let row = crate::db::get_sandbox(&conn, sandbox_id).unwrap().unwrap();
-    assert_eq!(row.state, SandboxState::Suspended);
+    assert_eq!(row.state, SandboxStatus::from(SandboxState::Suspended));
 }
 
 #[test]
@@ -339,7 +339,7 @@ fn cross_node_restore_rejects_existing_non_orphan_row_without_overwrite() {
             .contains("is not a recoverable synthetic orphan")
     );
     let after = crate::db::get_sandbox(&conn, sandbox_id).unwrap().unwrap();
-    assert_eq!(after.state, SandboxState::Suspended);
+    assert_eq!(after.state, SandboxStatus::from(SandboxState::Suspended));
     assert_eq!(after.template, before.template);
     assert_eq!(after.template_hash, before.template_hash);
     assert_eq!(after.runtime, before.runtime);
@@ -3423,7 +3423,7 @@ fn cross_node_restore_leaves_failed_synthetic_orphan_untouched() {
         .is_err()
     );
     let after = crate::db::get_sandbox(&conn, &sandbox_id).unwrap().unwrap();
-    assert_eq!(after.state, SandboxState::Failed);
+    assert_eq!(after.state, SandboxStatus::from(SandboxState::Failed));
     assert_eq!(after.updated_at, before.updated_at);
     assert_eq!(after.template, before.template);
     assert!(after.restore_operation.is_none());
@@ -3485,7 +3485,7 @@ fn startup_requests_interrupted_activation_cleanup_with_the_activation_reason() 
         );
         assert_eq!(
             crate::db::get_sandbox(&db, &id).unwrap().unwrap().state,
-            SandboxState::CleanupRequired,
+            SandboxStatus::CLEANUP_REQUIRED,
             "{kind:?}"
         );
     }
@@ -3521,7 +3521,7 @@ fn startup_retires_an_armed_cleanup_whose_row_left_the_activation_state() {
     let db = db.lock().unwrap();
     assert!(crate::db::cleanup_episode(&db, &id).unwrap().is_none());
     let row = crate::db::get_sandbox(&db, &id).unwrap().unwrap();
-    assert_eq!(row.state, SandboxState::Stopped);
+    assert_eq!(row.state, SandboxStatus::from(SandboxState::Stopped));
     assert_eq!(row.cleanup_completion, None);
     assert_eq!(row.cleanup_keep_filesystem, None);
 }
@@ -3553,7 +3553,7 @@ fn startup_persists_the_inferred_cleanup_intent_of_an_interrupted_start() {
     let row = crate::db::get_sandbox(&db.lock().unwrap(), &id)
         .unwrap()
         .unwrap();
-    assert_eq!(row.state, SandboxState::CleanupRequired);
+    assert_eq!(row.state, SandboxStatus::CLEANUP_REQUIRED);
     assert_eq!(row.cleanup_completion, Some(CleanupCompletion::MarkStopped));
     assert_eq!(row.cleanup_keep_filesystem, Some(true));
     assert_eq!(
@@ -3577,7 +3577,7 @@ fn requested_cleanup_discovery_yields_to_an_intent_recorded_after_listing() {
     super::super::tests::service_tests::insert_test_sandbox(
         &conn,
         &id,
-        SandboxState::CleanupFailed,
+        SandboxStatus::CLEANUP_FAILED,
     );
     conn.execute(
         "UPDATE sandboxes SET uid = 10000, slot = 0 WHERE id = ?1",
@@ -3600,7 +3600,7 @@ fn requested_cleanup_discovery_yields_to_an_intent_recorded_after_listing() {
     let row = crate::db::get_sandbox(&db.lock().unwrap(), &id)
         .unwrap()
         .unwrap();
-    assert_eq!(row.state, SandboxState::CleanupFailed);
+    assert_eq!(row.state, SandboxStatus::CLEANUP_FAILED);
     assert_eq!(row.cleanup_completion, Some(CleanupCompletion::MarkStopped));
     assert_eq!(row.cleanup_keep_filesystem, Some(true));
 }
@@ -3680,7 +3680,7 @@ async fn a_held_cleanup_fence_defers_adoption_and_charges_the_attempt() {
             .unwrap()
             .unwrap()
             .state,
-        SandboxState::Quarantined
+        SandboxStatus::from(SandboxState::Quarantined)
     );
     assert!(
         crate::db::cleanup_episode(&db, &sandbox_id.to_string())
@@ -3792,7 +3792,7 @@ async fn plan_rejections_stop_recovery_at_the_bound_and_later_passes_never_look_
             .lookup_sandbox(&sandbox_id.to_string())
             .unwrap()
             .state,
-        SandboxState::Quarantined,
+        SandboxStatus::from(SandboxState::Quarantined),
         "stopping recovery hands the hold over; it does not release it"
     );
 }

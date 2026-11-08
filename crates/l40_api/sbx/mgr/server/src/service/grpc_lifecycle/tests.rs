@@ -18,7 +18,7 @@ use crate::guest_filesystem_flush::GuestSnapshotPreparationBudget;
 use crate::service::SandboxManagerService;
 use crate::service::suspend_snapshot_publication::publish_suspend_snapshot_dir;
 use crate::service::suspend_snapshot_publication::write_full_suspend_artifact;
-use crate::state::SandboxState;
+use crate::state::{SandboxState, SandboxStatus};
 use pplx_space_common_core::types::{
     AutoLifecyclePolicy, HostCpu, LocalArtifactId, SandboxId, SandboxOwner, SandboxRuntimeLabel,
 };
@@ -223,7 +223,7 @@ async fn artifact_alias_waits_on_canonical_lock_and_rereads_after_admission() {
     drop(lock);
     let (row, guard) = pending.await.unwrap();
     assert_eq!(row.id, id);
-    assert_eq!(row.state, SandboxState::Stopped);
+    assert_eq!(row.state, SandboxStatus::from(SandboxState::Stopped));
     service
         .auto_lifecycle
         .artifact_lock(id)
@@ -426,12 +426,12 @@ fn current_instance_backup_preserves_scoped_drain_signals() {
     };
     use pplx_space_common_core::types::ArtifactKind;
     for kind in [ArtifactKind::Disk, ArtifactKind::Full] {
-        for state in SandboxState::all() {
+        for state in SandboxStatus::sweep() {
             let result = current_instance_backup_precondition(state, kind);
             let valid = matches!(
-                (state, kind),
-                (SandboxState::Stopped, ArtifactKind::Disk)
-                    | (SandboxState::Suspended, ArtifactKind::Full)
+                (state.unowned(), kind),
+                (Some(SandboxState::Stopped), ArtifactKind::Disk)
+                    | (Some(SandboxState::Suspended), ArtifactKind::Full)
             );
             assert_eq!(result.is_ok(), valid, "{state:?}/{kind:?}");
             if let Err(error) = result {
@@ -439,15 +439,15 @@ fn current_instance_backup_preserves_scoped_drain_signals() {
                 for (marker, expected) in [
                     (
                         REUPLOAD_SANDBOX_RESTORING_MARKER,
-                        state == SandboxState::Restoring && kind == ArtifactKind::Full,
+                        state.is_unowned(SandboxState::Restoring) && kind == ArtifactKind::Full,
                     ),
                     (
                         CURRENT_INSTANCE_BACKUP_SANDBOX_FAILED_MARKER,
-                        state == SandboxState::Failed,
+                        state.is_unowned(SandboxState::Failed),
                     ),
                     (
                         CURRENT_INSTANCE_BACKUP_PUBLISHES_FULL_MARKER,
-                        state == SandboxState::Suspended && kind == ArtifactKind::Disk,
+                        state.is_unowned(SandboxState::Suspended) && kind == ArtifactKind::Disk,
                     ),
                 ] {
                     assert_eq!(
@@ -765,7 +765,7 @@ fn insert_suspended_test_sandbox(conn: &crate::db::Connection, sandbox_id: &str)
             guest_image: Default::default(),
             id: sandbox_id,
             uuid8: &uuid8,
-            state: SandboxState::Suspended,
+            state: SandboxState::Suspended.into(),
             template: "seed",
             template_hash: Some("hash"),
             user: &owner,
@@ -1385,7 +1385,7 @@ async fn permanently_refused_teardown_backup_marks_the_suspending_row_terminal()
                 .unwrap()
                 .unwrap()
         };
-        assert_eq!(marked.state, SandboxState::Suspending);
+        assert_eq!(marked.state, SandboxStatus::from(SandboxState::Suspending));
         assert_eq!(
             marked.failure_reason.as_deref(),
             expected_marker,
@@ -1695,7 +1695,10 @@ async fn teardown_suspend_terminal_decision_releases_a_delete_committed_after_th
         // The handler's first snapshot: the row is deleting and no receipt
         // covers the execution, so it goes on to the terminal decision.
         let evidence = crate::db::teardown_release_evidence(&db, &id, generation).unwrap();
-        assert_eq!(evidence.suspend.unwrap().state, SandboxState::Deleting);
+        assert_eq!(
+            evidence.suspend.unwrap().state,
+            SandboxStatus::from(SandboxState::Deleting)
+        );
         assert!(!evidence.deleted);
         // The delete commits before the terminal decision's snapshot. The
         // failed job stays behind as history for the missing row.
@@ -2105,7 +2108,11 @@ fn stored_sandbox(service: &SandboxManagerService, id: &str) -> Option<crate::db
 
 /// Suspend admission skips its plaintext-COW probe, which inspects the host
 /// cache directory, for a sandbox with an encrypted volume.
-fn insert_encrypted_test_sandbox(conn: &crate::db::Connection, id: &str, state: SandboxState) {
+fn insert_encrypted_test_sandbox(
+    conn: &crate::db::Connection,
+    id: &str,
+    state: impl Into<SandboxStatus>,
+) {
     crate::service::tests::service_tests::insert_test_sandbox(conn, id, state);
     conn.execute(
         "UPDATE sandboxes SET volume_encryption = 1 WHERE id = ?1",
@@ -2252,9 +2259,9 @@ async fn pause_refuses_rows_that_cannot_enter_pausing_before_writing_state() {
     use crate::service::tests::service_tests::insert_test_sandbox;
 
     let sockets = tempfile::tempdir().unwrap();
-    for state in SandboxState::all()
+    for state in SandboxStatus::sweep()
         .into_iter()
-        .filter(|state| *state != SandboxState::Started)
+        .filter(|state| !state.is_unowned(SandboxState::Started))
     {
         let conn = crate::db::test_conn();
         let id = SandboxId::new().to_string();
@@ -2272,16 +2279,18 @@ async fn pause_refuses_rows_that_cannot_enter_pausing_before_writing_state() {
 
         // A transient state is another operation in flight: retryable.
         let in_flight = matches!(
-            state,
-            SandboxState::Creating
-                | SandboxState::Starting
-                | SandboxState::Stopping
-                | SandboxState::Deleting
-                | SandboxState::Pausing
-                | SandboxState::Resuming
-                | SandboxState::Checkpointing
-                | SandboxState::Suspending
-                | SandboxState::Restoring
+            state.unowned(),
+            Some(
+                SandboxState::Creating
+                    | SandboxState::Starting
+                    | SandboxState::Stopping
+                    | SandboxState::Deleting
+                    | SandboxState::Pausing
+                    | SandboxState::Resuming
+                    | SandboxState::Checkpointing
+                    | SandboxState::Suspending
+                    | SandboxState::Restoring
+            )
         );
         let expected = if in_flight {
             tonic::Code::Unavailable
@@ -2304,10 +2313,12 @@ async fn suspend_refuses_rows_that_are_neither_started_nor_paused() {
     use pplx_space_common_core::node_drain_signals::SUSPEND_SANDBOX_FAILED_MARKER;
 
     let sockets = tempfile::tempdir().unwrap();
-    for state in SandboxState::all()
-        .into_iter()
-        .filter(|state| !matches!(state, SandboxState::Started | SandboxState::Paused))
-    {
+    for state in SandboxStatus::sweep().into_iter().filter(|state| {
+        !matches!(
+            state.unowned(),
+            Some(SandboxState::Started | SandboxState::Paused)
+        )
+    }) {
         let conn = crate::db::test_conn();
         let id = SandboxId::new().to_string();
         insert_encrypted_test_sandbox(&conn, &id, state);
@@ -2328,7 +2339,7 @@ async fn suspend_refuses_rows_that_are_neither_started_nor_paused() {
         // Node drain gives up on a failed sandbox only when it sees this marker.
         assert_eq!(
             error.message().contains(SUSPEND_SANDBOX_FAILED_MARKER),
-            state == SandboxState::Failed,
+            state.is_unowned(SandboxState::Failed),
             "{state:?}: {}",
             error.message()
         );
@@ -2411,7 +2422,11 @@ async fn paused_suspend_admission_requires_a_free_row_and_the_owning_generation(
             Ok((local_artifact_id, publication)) => {
                 assert!(admitted, "{case}");
                 local_artifact_id.parse::<LocalArtifactId>().unwrap();
-                assert_eq!(row.state, SandboxState::Suspending, "{case}");
+                assert_eq!(
+                    row.state,
+                    SandboxStatus::from(SandboxState::Suspending),
+                    "{case}"
+                );
                 let operation = {
                     let db = service.db.lock().unwrap();
                     crate::db::latest_teardown_suspend_operation(&db, &id)
@@ -2429,7 +2444,11 @@ async fn paused_suspend_admission_requires_a_free_row_and_the_owning_generation(
             Err(error) => {
                 assert!(!admitted, "{case}: {error:?}");
                 assert_eq!(error.code(), tonic::Code::Aborted, "{case}");
-                assert_eq!(row.state, SandboxState::Paused, "{case}");
+                assert_eq!(
+                    row.state,
+                    SandboxStatus::from(SandboxState::Paused),
+                    "{case}"
+                );
                 assert_eq!(
                     row.cleanup_completion,
                     cleanup_intent.then_some(crate::db::CleanupCompletion::DeleteRow),
@@ -2633,7 +2652,7 @@ async fn suspend_publication_failure_persists_only_against_the_suspending_row() 
             let db = service.db.lock().unwrap();
             crate::db::current_quarantine_reason_wire_value(&db, &id).unwrap()
         };
-        assert_eq!(row.state, expected_state, "{case}");
+        assert_eq!(row.state, SandboxStatus::from(expected_state), "{case}");
         if expected_state == SandboxState::Quarantined {
             assert_eq!(
                 row.failure_reason.as_deref(),
@@ -2821,7 +2840,7 @@ async fn suspend_publication_failure_after_staging_preserves_only_owned_evidence
         } else {
             assert_eq!(
                 stored_sandbox(&service, &id).map(|row| row.state),
-                final_state,
+                final_state.map(SandboxStatus::from),
                 "{case}"
             );
         }
@@ -2890,7 +2909,11 @@ async fn teardown_suspend_driver_completes_a_generation_whose_artifact_is_alread
             "{pass}"
         );
         let row = stored_sandbox(&service, &id).unwrap();
-        assert_eq!(row.state, SandboxState::Suspended, "{pass}");
+        assert_eq!(
+            row.state,
+            SandboxStatus::from(SandboxState::Suspended),
+            "{pass}"
+        );
         assert_eq!(row.current_local_artifact_id, Some(local_artifact_id));
     }
     drain_service_tasks(&service).await;
@@ -2923,7 +2946,7 @@ async fn teardown_suspend_without_a_capture_quarantines_as_an_only_copy() {
     let row = crate::db::get_sandbox(&db, &sandbox_id.to_string())
         .unwrap()
         .unwrap();
-    assert_eq!(row.state, SandboxState::Quarantined);
+    assert_eq!(row.state, SandboxStatus::from(SandboxState::Quarantined));
     assert_eq!(
         row.failure_reason.as_deref(),
         Some(crate::db::SUSPEND_PUBLISH_FAILED_NO_ARTIFACT_RUNTIME_GONE)

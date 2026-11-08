@@ -1,16 +1,134 @@
 //! The persisted-edge table of the node-local SQLite `sandboxes.state` against
-//! `SandboxState::can_transition_to`, the RPC-admission machine. A cleanup edge
-//! is compared as the combined status its rows read as, `cleanup_required` or
-//! `cleanup_failed`.
+//! `SandboxStatus::can_transition_to`, the RPC-admission machine. The table
+//! names a row by [`Node`]: a lifecycle no cleanup owns, or a cleanup whatever
+//! lifecycle it is over, which is all an edge's sources tell apart.
 //!
 //! Every pair on which the two disagree is listed in [`ALLOWLIST`] with a
 //! reason, so a new writer edge, a changed from-set, or a changed state
 //! machine fails here until the disagreement is recorded.
 
 use std::collections::BTreeMap;
+use std::fmt;
 
 use crate::db::{CLEANUP_EDGES, EDGES, EdgeKind};
-use crate::state::SandboxState::{self, *};
+use crate::state::{CleanupState, SandboxState, SandboxStatus, Teardown};
+
+/// A row as the table names it: each lifecycle no cleanup owns, then each
+/// cleanup.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Node {
+    Creating,
+    Created,
+    Starting,
+    Started,
+    Stopping,
+    Stopped,
+    Deleting,
+    Pausing,
+    Paused,
+    Resuming,
+    Checkpointing,
+    Suspending,
+    Suspended,
+    Restoring,
+    CleanupRequired,
+    CleanupFailed,
+    Quarantined,
+    Failed,
+}
+
+use Node::*;
+
+impl Node {
+    const ALL: [Self; 18] = [
+        Creating,
+        Created,
+        Starting,
+        Started,
+        Stopping,
+        Stopped,
+        Deleting,
+        Pausing,
+        Paused,
+        Resuming,
+        Checkpointing,
+        Suspending,
+        Suspended,
+        Restoring,
+        CleanupRequired,
+        CleanupFailed,
+        Quarantined,
+        Failed,
+    ];
+
+    fn of_lifecycle(lifecycle: SandboxState) -> Self {
+        Self::ALL
+            .into_iter()
+            .find(|node| node.lifecycle() == Some(lifecycle))
+            .unwrap()
+    }
+
+    const fn of_cleanup(cleanup: CleanupState) -> Self {
+        match cleanup {
+            CleanupState::Required => CleanupRequired,
+            CleanupState::Failed => CleanupFailed,
+        }
+    }
+
+    const fn cleanup(self) -> Option<CleanupState> {
+        match self {
+            CleanupRequired => Some(CleanupState::Required),
+            CleanupFailed => Some(CleanupState::Failed),
+            _ => None,
+        }
+    }
+
+    const fn lifecycle(self) -> Option<SandboxState> {
+        Some(match self {
+            Creating => SandboxState::Creating,
+            Created => SandboxState::Created,
+            Starting => SandboxState::Starting,
+            Started => SandboxState::Started,
+            Stopping => SandboxState::Stopping,
+            Stopped => SandboxState::Stopped,
+            Deleting => SandboxState::Deleting,
+            Pausing => SandboxState::Pausing,
+            Paused => SandboxState::Paused,
+            Resuming => SandboxState::Resuming,
+            Checkpointing => SandboxState::Checkpointing,
+            Suspending => SandboxState::Suspending,
+            Suspended => SandboxState::Suspended,
+            Restoring => SandboxState::Restoring,
+            Quarantined => SandboxState::Quarantined,
+            Failed => SandboxState::Failed,
+            CleanupRequired | CleanupFailed => return None,
+        })
+    }
+
+    /// A row this node names. An edge's sources tell a cleanup apart only by
+    /// its state, so any teardown transition the cleanup may be over stands
+    /// for it.
+    fn status(self) -> SandboxStatus {
+        match (self.lifecycle(), self.cleanup()) {
+            (Some(lifecycle), _) => lifecycle.into(),
+            (None, Some(cleanup)) => SandboxStatus::owned(Teardown::Stopping, cleanup),
+            (None, None) => unreachable!("every node is a lifecycle or a cleanup"),
+        }
+    }
+
+    /// The admission machine has no cleanup target: only the cleanup writers
+    /// record one.
+    fn can_transition_to(self, to: Self) -> bool {
+        to.lifecycle()
+            .is_some_and(|target| self.status().can_transition_to(target))
+    }
+}
+
+impl fmt::Display for Node {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(self, f)
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 enum Disagreement {
@@ -42,7 +160,7 @@ const NO_QUARANTINE_WRITER: &str = "no production writer quarantines a row in th
 const CLEANUP_SETTLES_INTENT: &str = "cleanup completion settles the persisted intent's target";
 
 #[rustfmt::skip]
-const ALLOWLIST: &[(SandboxState, SandboxState, Disagreement, &str)] = &[
+const ALLOWLIST: &[(Node, Node, Disagreement, &str)] = &[
     (Creating,        Created,         AllowedNotRequested, COMPLETION_ONLY),
     (Creating,        Stopped,         WriteForbidden,      "import completion of a stopped export"),
     (Creating,        Deleting,        RequestForbidden,    "Delete admission supersedes the create episode"),
@@ -121,21 +239,21 @@ const ALLOWLIST: &[(SandboxState, SandboxState, Disagreement, &str)] = &[
     (Failed,          Stopping,        RequestForbidden,    STOP_RUNTIME_OWNER),
 ];
 
-fn position(state: SandboxState) -> usize {
-    SandboxState::all()
+fn position(node: Node) -> usize {
+    Node::ALL
         .into_iter()
-        .position(|candidate| candidate == state)
+        .position(|candidate| candidate == node)
         .unwrap()
 }
 
-fn classify(from: SandboxState, to: SandboxState) -> Option<Disagreement> {
+fn classify(from: Node, to: Node) -> Option<Disagreement> {
     let lifecycle = EDGES
         .iter()
-        .filter(|edge| edge.to() == to && edge.from().contains(from))
+        .filter(|edge| to.lifecycle() == Some(edge.to()) && edge.from().contains(from.status()))
         .map(|edge| edge.kind());
     let cleanup = CLEANUP_EDGES
         .iter()
-        .filter(|edge| edge.to().legacy_status() == to && edge.from().contains(from))
+        .filter(|edge| to.cleanup() == Some(edge.to()) && edge.from().contains(from.status()))
         .map(|edge| edge.kind());
     let kinds: Vec<EdgeKind> = lifecycle.chain(cleanup).collect();
     let requested = kinds.contains(&EdgeKind::Request);
@@ -150,9 +268,14 @@ fn classify(from: SandboxState, to: SandboxState) -> Option<Disagreement> {
 
 #[test]
 fn persisted_edges_disagree_with_the_admission_machine_only_as_allowlisted() {
+    assert_eq!(
+        Node::ALL.map(Node::status),
+        SandboxStatus::sweep(),
+        "edge and indexed-writer sweeps must cover the same statuses in the same order"
+    );
     let mut actual = BTreeMap::new();
-    for from in SandboxState::all() {
-        for to in SandboxState::all() {
+    for from in Node::ALL {
+        for to in Node::ALL {
             if from == to {
                 continue;
             }
@@ -194,26 +317,26 @@ fn persisted_edges_disagree_with_the_admission_machine_only_as_allowlisted() {
 fn no_edge_lists_its_own_target_as_a_source() {
     for edge in EDGES {
         assert!(
-            !edge.from().contains(edge.to()),
+            !edge.from().contains(edge.to().into()),
             "{}: rewriting a row in its target state is not a transition",
             edge.name()
         );
     }
     for edge in CLEANUP_EDGES {
         assert!(
-            !edge.from().contains(edge.to().legacy_status()),
+            !edge.from().contains(Node::of_cleanup(edge.to()).status()),
             "{}: rewriting a row in its target state is not a transition",
             edge.name()
         );
     }
 }
 
-/// Every edge's sources and target, as the combined statuses its rows read as,
-/// in declaration order. `classify` merges edges that share a pair, so this
+/// Every edge's sources and target, as the table names them, in declaration
+/// order. `classify` merges edges that share a pair, so this
 /// pins each edge: a dropped edge, or one widened into a pair another edge
 /// already writes, fails here.
 #[rustfmt::skip]
-const EDGE_SOURCES: &[(&str, &[SandboxState], SandboxState)] = &[
+const EDGE_SOURCES: &[(&str, &[Node], Node)] = &[
     ("CREATE_INSERT", &[], Creating),
     ("CREATE_COMPLETE", &[Creating], Created),
     ("CREATE_BASE_SNAPSHOT_COMPLETE", &[Created], Suspended),
@@ -286,26 +409,26 @@ const EDGE_SOURCES: &[(&str, &[SandboxState], SandboxState)] = &[
 
 #[test]
 fn each_edge_reads_exactly_its_listed_sources() {
-    let sources = |contains: &dyn Fn(SandboxState) -> bool| -> Vec<SandboxState> {
-        SandboxState::all()
+    let sources = |contains: &dyn Fn(SandboxStatus) -> bool| -> Vec<Node> {
+        Node::ALL
             .into_iter()
-            .filter(|state| contains(*state))
+            .filter(|node| contains(node.status()))
             .collect()
     };
-    let actual: Vec<(&str, Vec<SandboxState>, SandboxState)> = EDGES
+    let actual: Vec<(&str, Vec<Node>, Node)> = EDGES
         .iter()
         .map(|edge| {
             (
                 edge.name(),
-                sources(&|state| edge.from().contains(state)),
-                edge.to(),
+                sources(&|status| edge.from().contains(status)),
+                Node::of_lifecycle(edge.to()),
             )
         })
         .chain(CLEANUP_EDGES.iter().map(|edge| {
             (
                 edge.name(),
-                sources(&|state| edge.from().contains(state)),
-                edge.to().legacy_status(),
+                sources(&|status| edge.from().contains(status)),
+                Node::of_cleanup(edge.to()),
             )
         }))
         .collect();

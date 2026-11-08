@@ -18,20 +18,20 @@ use crate::db::{
     CompleteRowIntentCleanupDisposition,
 };
 
-fn state(conn: &crate::db::Connection, id: &str) -> SandboxState {
+fn state(conn: &crate::db::Connection, id: &str) -> SandboxStatus {
     crate::db::get_sandbox(conn, id).unwrap().unwrap().state
 }
 
 type Write = fn(&crate::db::Connection, &str) -> Result<(), Status>;
 
 /// A writer's expected answer for the row with an id in each source state.
-type Outcomes = fn(&str, SandboxState) -> Expected;
+type Outcomes = fn(&str, SandboxStatus) -> Expected;
 
 const CREATE: &str = "complete sandbox create";
 const BASE_SNAPSHOT_CREATE: &str = "complete restored sandbox create";
 const WARM_START: &str = "prepare recovered sandbox restore";
 
-fn superseded(context: &str, found: SandboxState) -> String {
+fn superseded(context: &str, found: SandboxStatus) -> String {
     format!("{context}: sandbox state write was superseded: sandbox is {found}")
 }
 
@@ -81,7 +81,7 @@ fn create_completion_leaves_a_row_a_stop_admitted_to_the_stop() {
         assert_eq!(status.code(), tonic::Code::Aborted, "{}", case.name);
         assert_eq!(
             status.message(),
-            superseded(case.context, SandboxState::Stopping),
+            superseded(case.context, SandboxState::Stopping.into()),
             "{}",
             case.name
         );
@@ -120,7 +120,12 @@ fn create_completion_leaves_a_row_a_stop_admitted_to_the_stop() {
             case.name
         );
         let row = crate::db::get_sandbox(&conn, &id).unwrap().unwrap();
-        assert_eq!(row.state, SandboxState::Stopped, "{}", case.name);
+        assert_eq!(
+            row.state,
+            SandboxStatus::from(SandboxState::Stopped),
+            "{}",
+            case.name
+        );
         assert_eq!(row.cleanup_completion, None, "{}", case.name);
     }
 }
@@ -143,55 +148,61 @@ fn aborted(message: String) -> Expected {
 /// Create completion: only `creating` is written. A `deleting` row's delete
 /// owns it, so the cleanup guard answers. Wildcard-free, so a new lifecycle
 /// state does not compile until it is placed.
-fn create_completed(_: &str, state: SandboxState) -> Expected {
-    match state {
-        SandboxState::Creating => Expected::Writes(SandboxState::Created),
-        SandboxState::Quarantined => aborted(not_applied(CREATE, "blocked_by_quarantine")),
-        SandboxState::Deleting => aborted(not_applied(CREATE, "superseded_by_cleanup_episode")),
-        SandboxState::Created
-        | SandboxState::Starting
-        | SandboxState::Started
-        | SandboxState::Stopping
-        | SandboxState::Stopped
-        | SandboxState::Pausing
-        | SandboxState::Paused
-        | SandboxState::Resuming
-        | SandboxState::Checkpointing
-        | SandboxState::Suspending
-        | SandboxState::Suspended
-        | SandboxState::Restoring
-        | SandboxState::CleanupRequired
-        | SandboxState::CleanupFailed
-        | SandboxState::Failed => aborted(superseded(CREATE, state)),
+fn create_completed(_: &str, state: SandboxStatus) -> Expected {
+    match state.unowned() {
+        Some(SandboxState::Creating) => Expected::Writes(SandboxState::Created),
+        Some(SandboxState::Quarantined) => aborted(not_applied(CREATE, "blocked_by_quarantine")),
+        Some(SandboxState::Deleting) => {
+            aborted(not_applied(CREATE, "superseded_by_cleanup_episode"))
+        }
+        Some(
+            SandboxState::Created
+            | SandboxState::Starting
+            | SandboxState::Started
+            | SandboxState::Stopping
+            | SandboxState::Stopped
+            | SandboxState::Pausing
+            | SandboxState::Paused
+            | SandboxState::Resuming
+            | SandboxState::Checkpointing
+            | SandboxState::Suspending
+            | SandboxState::Suspended
+            | SandboxState::Restoring
+            | SandboxState::Failed,
+        )
+        | None => aborted(superseded(CREATE, state)),
     }
 }
 
 /// Base-snapshot create completion: only `created` is written.
-fn base_snapshot_create_completed(_: &str, state: SandboxState) -> Expected {
+fn base_snapshot_create_completed(_: &str, state: SandboxStatus) -> Expected {
     const CONTEXT: &str = BASE_SNAPSHOT_CREATE;
-    match state {
-        SandboxState::Created => Expected::Writes(SandboxState::Suspended),
-        SandboxState::Quarantined => aborted(not_applied(CONTEXT, "blocked_by_quarantine")),
-        SandboxState::Deleting => aborted(not_applied(CONTEXT, "superseded_by_cleanup_episode")),
-        SandboxState::Creating
-        | SandboxState::Starting
-        | SandboxState::Started
-        | SandboxState::Stopping
-        | SandboxState::Stopped
-        | SandboxState::Pausing
-        | SandboxState::Paused
-        | SandboxState::Resuming
-        | SandboxState::Checkpointing
-        | SandboxState::Suspending
-        | SandboxState::Suspended
-        | SandboxState::Restoring
-        | SandboxState::CleanupRequired
-        | SandboxState::CleanupFailed
-        | SandboxState::Failed => aborted(superseded(CONTEXT, state)),
+    match state.unowned() {
+        Some(SandboxState::Created) => Expected::Writes(SandboxState::Suspended),
+        Some(SandboxState::Quarantined) => aborted(not_applied(CONTEXT, "blocked_by_quarantine")),
+        Some(SandboxState::Deleting) => {
+            aborted(not_applied(CONTEXT, "superseded_by_cleanup_episode"))
+        }
+        Some(
+            SandboxState::Creating
+            | SandboxState::Starting
+            | SandboxState::Started
+            | SandboxState::Stopping
+            | SandboxState::Stopped
+            | SandboxState::Pausing
+            | SandboxState::Paused
+            | SandboxState::Resuming
+            | SandboxState::Checkpointing
+            | SandboxState::Suspending
+            | SandboxState::Suspended
+            | SandboxState::Restoring
+            | SandboxState::Failed,
+        )
+        | None => aborted(superseded(CONTEXT, state)),
     }
 }
 
-fn warm_start_refused(id: &str, found: SandboxState) -> Expected {
+fn warm_start_refused(id: &str, found: SandboxStatus) -> Expected {
     Expected::Refused(
         tonic::Code::FailedPrecondition,
         format!(
@@ -207,25 +218,32 @@ fn warm_start_refused(id: &str, found: SandboxState) -> Expected {
 /// must not restage a `started` row for a checkpoint restore. A `deleting` or
 /// quarantined row answers its generic guard. Start refuses a `failed` row
 /// before warm staging, so that row is the writer's contract only.
-fn warm_start_restaged(id: &str, state: SandboxState) -> Expected {
-    match state {
-        SandboxState::Created | SandboxState::Stopped => Expected::Writes(SandboxState::Suspended),
-        SandboxState::Suspended => Expected::AlreadyThere,
-        SandboxState::Quarantined => aborted(not_applied(WARM_START, "blocked_by_quarantine")),
-        SandboxState::Deleting => aborted(not_applied(WARM_START, "superseded_by_cleanup_episode")),
-        SandboxState::Creating
-        | SandboxState::Starting
-        | SandboxState::Started
-        | SandboxState::Stopping
-        | SandboxState::Pausing
-        | SandboxState::Paused
-        | SandboxState::Resuming
-        | SandboxState::Checkpointing
-        | SandboxState::Suspending
-        | SandboxState::Restoring
-        | SandboxState::CleanupRequired
-        | SandboxState::CleanupFailed
-        | SandboxState::Failed => warm_start_refused(id, state),
+fn warm_start_restaged(id: &str, state: SandboxStatus) -> Expected {
+    match state.unowned() {
+        Some(SandboxState::Created | SandboxState::Stopped) => {
+            Expected::Writes(SandboxState::Suspended)
+        }
+        Some(SandboxState::Suspended) => Expected::AlreadyThere,
+        Some(SandboxState::Quarantined) => {
+            aborted(not_applied(WARM_START, "blocked_by_quarantine"))
+        }
+        Some(SandboxState::Deleting) => {
+            aborted(not_applied(WARM_START, "superseded_by_cleanup_episode"))
+        }
+        Some(
+            SandboxState::Creating
+            | SandboxState::Starting
+            | SandboxState::Started
+            | SandboxState::Stopping
+            | SandboxState::Pausing
+            | SandboxState::Paused
+            | SandboxState::Resuming
+            | SandboxState::Checkpointing
+            | SandboxState::Suspending
+            | SandboxState::Restoring
+            | SandboxState::Failed,
+        )
+        | None => warm_start_refused(id, state),
     }
 }
 
@@ -235,7 +253,7 @@ fn check(case: &str, conn: &crate::db::Connection, id: &str, write: Write, expec
     match expected {
         Expected::Writes(target) => {
             result.unwrap_or_else(|status| panic!("{case}: {status:?}"));
-            assert_eq!(state(conn, id), target, "{case}");
+            assert_eq!(state(conn, id), SandboxStatus::from(target), "{case}");
         }
         Expected::AlreadyThere => {
             result.unwrap_or_else(|status| panic!("{case}: {status:?}"));
@@ -270,7 +288,7 @@ fn completion_and_warm_start_writes_answer_every_source_state() {
         ("warm start", write_warm_start_restaged, warm_start_restaged),
     ];
     for (name, write, expected) in writers {
-        for from in SandboxState::all() {
+        for from in SandboxStatus::sweep() {
             let case = format!("{name} from {from}");
             let conn = crate::db::test_conn();
             let id = insert_row(&conn, from);
@@ -350,30 +368,31 @@ fn warm_start_write_keeps_a_guard_refusal_aborted() {
 /// state: production warm Starts target `suspended` rows, and an operator's
 /// `created` or `stopped` row is restaged. Wildcard-free, so a new lifecycle
 /// state does not compile until it is placed.
-fn warm_start_admitted(state: SandboxState) -> bool {
-    match state {
-        SandboxState::Created | SandboxState::Stopped | SandboxState::Suspended => true,
-        SandboxState::Creating
-        | SandboxState::Starting
-        | SandboxState::Started
-        | SandboxState::Stopping
-        | SandboxState::Deleting
-        | SandboxState::Pausing
-        | SandboxState::Paused
-        | SandboxState::Resuming
-        | SandboxState::Checkpointing
-        | SandboxState::Suspending
-        | SandboxState::Restoring
-        | SandboxState::CleanupRequired
-        | SandboxState::CleanupFailed
-        | SandboxState::Quarantined
-        | SandboxState::Failed => false,
+fn warm_start_admitted(state: SandboxStatus) -> bool {
+    match state.unowned() {
+        Some(SandboxState::Created | SandboxState::Stopped | SandboxState::Suspended) => true,
+        Some(
+            SandboxState::Creating
+            | SandboxState::Starting
+            | SandboxState::Started
+            | SandboxState::Stopping
+            | SandboxState::Deleting
+            | SandboxState::Pausing
+            | SandboxState::Paused
+            | SandboxState::Resuming
+            | SandboxState::Checkpointing
+            | SandboxState::Suspending
+            | SandboxState::Restoring
+            | SandboxState::Quarantined
+            | SandboxState::Failed,
+        )
+        | None => false,
     }
 }
 
 #[test]
 fn warm_start_admits_only_its_sources_and_suspended_rows() {
-    for from in SandboxState::all() {
+    for from in SandboxStatus::sweep() {
         let case = format!("warm start admission of {from}");
         let conn = crate::db::test_conn();
         let id = insert_row(&conn, from);

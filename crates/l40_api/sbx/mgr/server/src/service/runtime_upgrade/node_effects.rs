@@ -220,7 +220,7 @@ impl RuntimeUpgradeEffects for NodeRuntimeUpgradeEffects {
         let checkpoint_dir_identity = directory_identity(&checkpoint).map_err(|error| {
             Status::failed_precondition(format!("inspect {}: {error}", checkpoint.display()))
         })?;
-        let checkpoint_execution = if sandbox.state == SandboxState::Suspended {
+        let checkpoint_execution = if sandbox.state.is_unowned(SandboxState::Suspended) {
             Some(
                 checkpoint_execution_metadata(&checkpoint.to_string_lossy())
                     .map_err(|error| Status::failed_precondition(error.to_string()))?

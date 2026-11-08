@@ -101,11 +101,13 @@ impl SandboxManagerService {
             let may_retire = match eligible {
                 Ok(Some(row))
                     if matches!(
-                        row.state,
-                        SandboxState::Started
-                            | SandboxState::Paused
-                            | SandboxState::Stopped
-                            | SandboxState::Suspended
+                        row.state.unowned(),
+                        Some(
+                            SandboxState::Started
+                                | SandboxState::Paused
+                                | SandboxState::Stopped
+                                | SandboxState::Suspended
+                        )
                     ) =>
                 {
                     true

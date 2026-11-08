@@ -110,11 +110,11 @@ async fn restore_completion_requires_gateway_readiness_only_when_starting() {
             .unwrap();
         assert_eq!(
             row.state,
-            if !should_succeed {
+            SandboxStatus::from(if !should_succeed {
                 SandboxState::Restoring
             } else {
                 final_state
-            }
+            })
         );
     }
 }
@@ -146,11 +146,11 @@ async fn restore_defers_guest_readiness_only_while_paused() {
             .unwrap();
         assert_eq!(
             row.state,
-            if final_state == SandboxState::Started {
+            SandboxStatus::from(if final_state == SandboxState::Started {
                 SandboxState::Restoring
             } else {
                 SandboxState::Paused
-            }
+            })
         );
     }
 }
@@ -200,7 +200,7 @@ async fn started_restore_reports_the_restored_agent_on_guest_ready() {
                 .unwrap()
                 .unwrap()
                 .state,
-            final_state
+            SandboxStatus::from(final_state)
         );
 
         let events = capture.events.lock().unwrap();
@@ -279,11 +279,11 @@ async fn start_guest_failure_preserves_terminal_status_and_activation_ownership(
             .unwrap();
         assert_eq!(
             row.state,
-            if superseded {
+            SandboxStatus::from(if superseded {
                 SandboxState::Stopped
             } else {
                 SandboxState::Starting
-            }
+            })
         );
     }
 }
@@ -328,7 +328,7 @@ async fn restore_publication_waits_for_network_readiness_and_preserves_activatio
                     .unwrap()
                     .unwrap()
                     .state,
-                SandboxState::Restoring,
+                SandboxStatus::from(SandboxState::Restoring),
                 "pending network readiness must not publish Started"
             );
             assert_eq!(
@@ -358,13 +358,13 @@ async fn restore_publication_waits_for_network_readiness_and_preserves_activatio
                 .unwrap()
                 .unwrap()
                 .state,
-            if superseded {
+            SandboxStatus::from(if superseded {
                 SandboxState::Deleting
             } else if failure.is_some() {
                 SandboxState::Restoring
             } else {
                 SandboxState::Started
-            }
+            })
         );
         if !superseded {
             assert_eq!(
@@ -1072,7 +1072,7 @@ async fn guest_activity_waiting_on_a_start_proceeds_when_the_start_commits() {
     let row = waiter
         .await
         .expect("guest activity proceeds once the start commits");
-    assert_eq!(row.state, SandboxState::Started);
+    assert_eq!(row.state, SandboxStatus::from(SandboxState::Started));
     assert_eq!(committed_at.elapsed(), Duration::ZERO);
 }
 
@@ -1125,7 +1125,7 @@ async fn another_sandboxs_start_does_not_end_a_starting_wait() {
     let row = waiter
         .await
         .expect("guest activity proceeds once its own start commits");
-    assert_eq!(row.state, SandboxState::Started);
+    assert_eq!(row.state, SandboxStatus::from(SandboxState::Started));
     assert_eq!(committed_at.elapsed(), Duration::ZERO);
 }
 
@@ -1164,6 +1164,6 @@ async fn a_start_does_not_wake_a_waiter_on_another_transition() {
     let row = waiter
         .await
         .expect("guest activity proceeds once the restore commits");
-    assert_eq!(row.state, SandboxState::Started);
+    assert_eq!(row.state, SandboxStatus::from(SandboxState::Started));
     assert_eq!(waiting_since.elapsed(), Duration::from_millis(200));
 }

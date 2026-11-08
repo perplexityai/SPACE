@@ -18,7 +18,7 @@ use rusqlite::types::Type;
 use super::{CleanupCompletion, NetworkPolicyAppliedSource, parse_policy_authority};
 use crate::endpoint_proof::SpacedEndpointProof;
 use crate::restore_operation::RestoreOperation;
-use crate::state::{CleanupState, SandboxState};
+use crate::state::{CleanupState, SandboxState, SandboxStatus};
 
 #[derive(Clone)]
 pub struct SandboxRow {
@@ -26,11 +26,8 @@ pub struct SandboxRow {
     pub node_execution_id: Option<SandboxActivationAttemptId>,
     pub id: String,
     pub uuid8: SandboxRuntimeLabel,
-    /// The combined status: the lifecycle, or `CleanupRequired` /
-    /// `CleanupFailed` while a cleanup owns the row.
-    pub state: SandboxState,
-    /// The stored lifecycle, without the cleanup `state` folds in.
-    pub lifecycle: SandboxState,
+    /// The lifecycle and the cleanup that owns the row, if one does.
+    pub state: SandboxStatus,
     pub restore_operation: Option<RestoreOperation>,
     pub failure_reason: Option<String>,
     pub template: String,
@@ -95,9 +92,8 @@ impl SandboxRow {
 /// runtime and policy document on the row.
 pub struct SandboxListRow {
     pub id: String,
-    pub state: SandboxState,
-    /// The stored lifecycle, without the cleanup `state` folds in.
-    pub lifecycle: SandboxState,
+    /// The lifecycle and the cleanup that owns the row, if one does.
+    pub state: SandboxStatus,
     pub template: String,
     pub template_hash: Option<String>,
     pub user: SandboxOwner,
@@ -111,7 +107,6 @@ pub(super) fn row_to_list_sandbox(row: &rusqlite::Row) -> rusqlite::Result<Sandb
     Ok(SandboxListRow {
         id: row.get("id")?,
         state: state_column(row)?,
-        lifecycle: lifecycle_column(row)?,
         template: row.get("template")?,
         template_hash: row
             .get::<_, Option<String>>("template_hash")?
@@ -128,10 +123,28 @@ pub(super) fn row_to_list_sandbox(row: &rusqlite::Row) -> rusqlite::Result<Sandb
     })
 }
 
-/// The row's combined status, from the `state` and `cleanup_state` a row
-/// select reads.
-pub(super) fn state_column(row: &rusqlite::Row<'_>) -> rusqlite::Result<SandboxState> {
-    Ok(lifecycle_column(row)?.with_cleanup(cleanup_state_column(row)?))
+/// The row's status, from the `state` and `cleanup_state` a row select reads.
+/// A cleanup over a lifecycle no cleanup can be over names no status.
+pub(super) fn state_column(row: &rusqlite::Row<'_>) -> rusqlite::Result<SandboxStatus> {
+    let lifecycle = lifecycle_column(row)?;
+    let Some(cleanup) = cleanup_state_column(row)? else {
+        return Ok(lifecycle.into());
+    };
+    let teardown = crate::state::Teardown::of(lifecycle).ok_or_else(|| {
+        column_error(
+            row,
+            "cleanup_state",
+            Type::Text,
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "cleanup {} over sandbox state {lifecycle}",
+                    cleanup.as_str()
+                ),
+            )),
+        )
+    })?;
+    Ok(SandboxStatus::owned(teardown, cleanup))
 }
 
 /// The cleanup that owns the row, which a row select reads as
@@ -195,7 +208,6 @@ pub(super) fn row_to_sandbox(row: &rusqlite::Row) -> rusqlite::Result<SandboxRow
     let uuid8 = SandboxRuntimeLabel::parse(row.get::<_, String>("uuid8")?)
         .map_err(|error| column_error(row, "uuid8", Type::Text, Box::new(error)))?;
     let state = state_column(row)?;
-    let lifecycle = lifecycle_column(row)?;
     let user = user_column(row)?;
     let process_env_json: String = row.get("process_env_json")?;
     let process_env = serde_json::from_str(&process_env_json)
@@ -359,7 +371,6 @@ pub(super) fn row_to_sandbox(row: &rusqlite::Row) -> rusqlite::Result<SandboxRow
         id,
         uuid8,
         state,
-        lifecycle,
         restore_operation,
         failure_reason: row.get("failure_reason")?,
         template: row.get("template")?,

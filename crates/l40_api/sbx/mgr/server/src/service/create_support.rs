@@ -354,7 +354,8 @@ pub(super) fn write_base_snapshot_create_completed(
     )
 }
 
-fn warm_start_refused(id: &str, found: SandboxState) -> Status {
+fn warm_start_refused(id: &str, found: impl Into<SandboxStatus>) -> Status {
+    let found = found.into();
     Status::failed_precondition(format!(
         "cannot start sandbox {id} from a warm snapshot while local state is {found}; \
          expected suspended, created or stopped"
@@ -367,7 +368,7 @@ fn warm_start_refused(id: &str, found: SandboxState) -> Status {
 /// which restore treats as local suspend evidence. The restage write checks
 /// again: a row can move while the snapshot is staged.
 pub(super) fn admit_warm_start(sandbox: &crate::db::SandboxRow) -> Result<(), Status> {
-    if sandbox.state == SandboxState::Suspended
+    if sandbox.state.is_unowned(SandboxState::Suspended)
         || crate::db::edges::WARM_START_RESTAGE
             .from()
             .contains(sandbox.state)
@@ -398,10 +399,12 @@ pub(super) fn write_warm_start_restaged(
     let outcome = crate::db::restage_for_warm_start(db, id)
         .map_err(|error| Status::internal(format!("{CONTEXT}: {error}")))?;
     match state_write_result(outcome) {
-        Ok(_)
-        | Err(StateWriteRejected::FromState {
-            found: SandboxState::Suspended,
-        }) => Ok(()),
+        Ok(_) => Ok(()),
+        Err(StateWriteRejected::FromState { found })
+            if found.is_unowned(SandboxState::Suspended) =>
+        {
+            Ok(())
+        }
         Err(StateWriteRejected::FromState { found }) => Err(warm_start_refused(id, found)),
         Err(rejected) => Err(rejected.into_status(CONTEXT)),
     }
@@ -459,14 +462,16 @@ pub(super) fn validate_pool_member_create_options(
     Ok(())
 }
 
-pub(super) fn requested_create_reuse_state(state: SandboxState) -> bool {
+pub(super) fn requested_create_reuse_state(state: impl Into<SandboxStatus>) -> bool {
     matches!(
-        state,
-        SandboxState::Created
-            | SandboxState::Started
-            | SandboxState::Paused
-            | SandboxState::Suspended
-            | SandboxState::Stopped
+        state.into().unowned(),
+        Some(
+            SandboxState::Created
+                | SandboxState::Started
+                | SandboxState::Paused
+                | SandboxState::Suspended
+                | SandboxState::Stopped
+        )
     )
 }
 
@@ -542,10 +547,11 @@ pub(super) fn requested_sandbox_create_auto_lifecycle_changed(
 pub(super) fn update_existing_sandbox_create_auto_lifecycle(
     conn: &crate::db::Connection,
     sandbox_id: &str,
-    state: SandboxState,
+    state: impl Into<SandboxStatus>,
     policy: &AutoLifecyclePolicy,
 ) -> Result<(), Status> {
-    let mut runtime_state = if state == SandboxState::Started {
+    let state = state.into();
+    let mut runtime_state = if state.is_unowned(SandboxState::Started) {
         initial_runtime_state(policy, now_secs())
     } else {
         AutoLifecycleRuntimeState::default()
@@ -650,8 +656,8 @@ pub(super) fn checkpoint_restore_retry_action(
     target_state: SandboxState,
     runtime_live: bool,
 ) -> CheckpointRestoreRetryAction {
-    match existing.state {
-        SandboxState::Started if target_state == SandboxState::Started => {
+    match existing.state.unowned() {
+        Some(SandboxState::Started) if target_state == SandboxState::Started => {
             checkpoint_start_response_for_live_runtime(existing, runtime_live)
                 .map(Box::new)
                 .map(CheckpointRestoreRetryAction::Reattach)
@@ -662,10 +668,12 @@ pub(super) fn checkpoint_restore_retry_action(
         // can safely reattach while no runtime, artifact pin, or cleanup intent
         // was committed. The current request supplies the desired target state
         // after staging returns the row to Suspended.
-        SandboxState::Restoring if !runtime_live && existing.is_retryable_interrupted_restore() => {
+        Some(SandboxState::Restoring)
+            if !runtime_live && existing.is_retryable_interrupted_restore() =>
+        {
             CheckpointRestoreRetryAction::ResumeRestoring
         }
-        SandboxState::Restoring => CheckpointRestoreRetryAction::CleanupRestoring,
+        Some(SandboxState::Restoring) => CheckpointRestoreRetryAction::CleanupRestoring,
         _ => CheckpointRestoreRetryAction::Reject,
     }
 }

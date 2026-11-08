@@ -1,9 +1,9 @@
 use std::fmt;
 
-/// A sandbox row's combined status: its lifecycle, or `CleanupRequired` /
-/// `CleanupFailed` while a cleanup owns it. The row stores the two apart, the
-/// lifecycle in `sandboxes.state` and cleanup ownership in `cleanup_state`;
-/// reads decode this status from both ([`SandboxState::with_cleanup`]).
+/// A sandbox row's lifecycle, stored in `sandboxes.state`. A cleanup that owns
+/// the row is not a lifecycle state: the row records it apart, as its
+/// [`CleanupState`], over the teardown transition its intent names, and
+/// [`SandboxStatus`] carries the two together.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SandboxState {
     Creating,
@@ -20,8 +20,6 @@ pub enum SandboxState {
     Suspending,
     Suspended,
     Restoring,
-    CleanupRequired,
-    CleanupFailed,
     Quarantined,
     Failed,
 }
@@ -42,14 +40,6 @@ impl CleanupState {
         }
     }
 
-    /// The combined status a row this cleanup owns reads as.
-    pub const fn legacy_status(self) -> SandboxState {
-        match self {
-            Self::Required => SandboxState::CleanupRequired,
-            Self::Failed => SandboxState::CleanupFailed,
-        }
-    }
-
     /// The cleanup a `sandboxes.cleanup_state` value names.
     pub(crate) fn from_column(value: &str) -> Option<Self> {
         match value {
@@ -66,24 +56,17 @@ impl SandboxState {
     pub const fn completes_wait(self) -> bool {
         matches!(
             self,
-            Self::Stopped
-                | Self::Failed
-                | Self::CleanupFailed
-                | Self::Suspended
-                | Self::Quarantined
+            Self::Stopped | Self::Failed | Self::Suspended | Self::Quarantined
         )
     }
 
-    /// The RPC-admission machine, over lifecycle states. A cleanup is not a
-    /// lifecycle state: a row a cleanup owns admits only Delete and
-    /// quarantine, and a cleanup moving between required and failed is a
-    /// cleanup edge (`db::edges::CLEANUP_EDGES`), not a lifecycle transition.
+    /// The RPC-admission machine, over lifecycle states. A row a cleanup owns
+    /// admits only Delete and quarantine ([`SandboxStatus::can_transition_to`]),
+    /// and a cleanup moving between required and failed is a cleanup edge
+    /// (`db::edges::CLEANUP_EDGES`), not a lifecycle transition.
     pub(crate) fn can_transition_to(&self, target: SandboxState) -> bool {
         if target == SandboxState::Quarantined {
             return *self != SandboxState::Failed;
-        }
-        if self.cleanup_label().is_some() {
-            return target == SandboxState::Deleting;
         }
 
         use SandboxState::*;
@@ -143,13 +126,13 @@ impl SandboxState {
         } else if self.is_transient() {
             Err(StateTransitionError::Transient {
                 action: target.action_name(),
-                state: self,
+                state: self.into(),
                 operation: self.operation_name(),
             })
         } else {
             Err(StateTransitionError::Invalid {
                 action: target.action_name(),
-                state: self,
+                state: self.into(),
                 required: target.required_states(),
             })
         }
@@ -174,8 +157,7 @@ impl SandboxState {
         match self {
             Starting | Started | Stopping | Pausing | Paused | Resuming | Checkpointing
             | Suspending | Restoring => true,
-            Creating | Created | Stopped | Suspended | Deleting | CleanupRequired
-            | CleanupFailed | Quarantined | Failed => false,
+            Creating | Created | Stopped | Suspended | Deleting | Quarantined | Failed => false,
         }
     }
 
@@ -194,8 +176,7 @@ impl SandboxState {
         match self {
             Starting | Started | Stopping | Pausing | Paused | Resuming | Checkpointing
             | Restoring | Quarantined => true,
-            Creating | Created | Stopped | Deleting | Suspending | Suspended | CleanupRequired
-            | CleanupFailed | Failed => false,
+            Creating | Created | Stopped | Deleting | Suspending | Suspended | Failed => false,
         }
     }
 
@@ -227,8 +208,8 @@ impl SandboxState {
         use SandboxState::*;
         match self {
             Creating | Created | Starting | Started | Stopping | Stopped | Pausing | Paused
-            | Resuming | Checkpointing | Suspending | Suspended | Restoring | CleanupRequired
-            | CleanupFailed | Quarantined | Failed => true,
+            | Resuming | Checkpointing | Suspending | Suspended | Restoring | Quarantined
+            | Failed => true,
             Deleting => false,
         }
     }
@@ -273,8 +254,7 @@ impl SandboxState {
         match self {
             Starting | Started | Resuming | Restoring => true,
             Creating | Created | Stopping | Stopped | Deleting | Pausing | Paused
-            | Checkpointing | Suspending | Suspended | CleanupRequired | CleanupFailed
-            | Quarantined | Failed => false,
+            | Checkpointing | Suspending | Suspended | Quarantined | Failed => false,
         }
     }
 
@@ -314,8 +294,6 @@ impl SandboxState {
             Suspending => "suspend",
             Suspended => "suspend",
             Restoring => "restore",
-            CleanupRequired => "cleanup",
-            CleanupFailed => "cleanup",
             Quarantined => "quarantine",
             Deleting => "delete",
             _ => "transition",
@@ -334,8 +312,6 @@ impl SandboxState {
             Checkpointing => "checkpoint",
             Suspending => "suspend",
             Restoring => "restore",
-            CleanupRequired => "cleanup",
-            CleanupFailed => "cleanup",
             Quarantined => "quarantine",
             Deleting => "deletion",
             _ => "operation",
@@ -353,7 +329,6 @@ impl SandboxState {
             Checkpointing => "started or paused",
             Suspending | Suspended => "started or paused",
             Restoring => "suspended",
-            CleanupRequired | CleanupFailed => "cleanup retry or delete",
             Deleting => {
                 "created, started, stopped, paused, suspended, failed, quarantined, cleanup failed, or any transient state"
             }
@@ -378,62 +353,8 @@ impl SandboxState {
             Suspending => "suspending",
             Suspended => "suspended",
             Restoring => "restoring",
-            CleanupRequired => "cleanup_required",
-            CleanupFailed => "cleanup_failed",
             Quarantined => "quarantined",
             Failed => "failed",
-        }
-    }
-
-    /// The combined status of a row that stores this lifecycle in `state` and
-    /// `cleanup` in `cleanup_state`.
-    pub(crate) fn with_cleanup(self, cleanup: Option<CleanupState>) -> Self {
-        cleanup.map_or(self, CleanupState::legacy_status)
-    }
-
-    /// The combined status label of a row whose `state` and `cleanup_state`
-    /// hold these values, keeping `state`'s text when the two name no status,
-    /// so a diagnostic still shows what the row holds.
-    pub(crate) fn label_from_columns(state: String, cleanup_state: Option<&str>) -> String {
-        Self::from_columns(&state, cleanup_state).map_or(state, |status| status.as_str().to_owned())
-    }
-
-    /// The combined status of a row whose `state` and `cleanup_state` hold
-    /// these values, or `None` when either names nothing.
-    pub(crate) fn from_columns(state: &str, cleanup_state: Option<&str>) -> Option<Self> {
-        let lifecycle = state.parse::<Self>().ok()?;
-        match cleanup_state {
-            None => Some(lifecycle),
-            Some(value) => CleanupState::from_column(value)
-                .map(|cleanup| lifecycle.with_cleanup(Some(cleanup))),
-        }
-    }
-
-    /// The `sandboxes.cleanup_state` this status is stored with. A row stores
-    /// its lifecycle in `state` and, apart from it, whether a cleanup owns the
-    /// row.
-    pub(crate) fn cleanup_label(self) -> Option<&'static str> {
-        match self {
-            Self::CleanupRequired => Some("required"),
-            Self::CleanupFailed => Some("failed"),
-            _ => None,
-        }
-    }
-
-    /// The cleanup this status records, as sandbox events carry it in
-    /// `from_cleanup_state`/`to_cleanup_state`.
-    pub fn event_cleanup_state(self) -> &'static str {
-        self.cleanup_label().unwrap_or("none")
-    }
-
-    /// The `sandboxes.state` a row inserted with this status stores. A
-    /// cleanup-owned row's lifecycle is the teardown transition its intent
-    /// names; an insert records no intent yet, so it starts `stopping`, and
-    /// the writer that records a row-deleting intent moves it to `deleting`.
-    pub(crate) fn inserted_lifecycle(self) -> &'static str {
-        match self {
-            Self::CleanupRequired | Self::CleanupFailed => "stopping",
-            other => other.as_str(),
         }
     }
 
@@ -441,7 +362,7 @@ impl SandboxState {
     /// must visit the whole set (SQL-filter-vs-predicate parity tests, etc.).
     /// Kept next to the enum so a newly-added variant is added here once
     /// rather than re-listed at each call site.
-    pub fn all() -> [Self; 18] {
+    pub fn all() -> [Self; 16] {
         use SandboxState::*;
         [
             Creating,
@@ -458,8 +379,6 @@ impl SandboxState {
             Suspending,
             Suspended,
             Restoring,
-            CleanupRequired,
-            CleanupFailed,
             Quarantined,
             Failed,
         ]
@@ -490,8 +409,6 @@ impl std::str::FromStr for SandboxState {
             "suspending" => Ok(Suspending),
             "suspended" => Ok(Suspended),
             "restoring" => Ok(Restoring),
-            "cleanup_required" => Ok(CleanupRequired),
-            "cleanup_failed" => Ok(CleanupFailed),
             "quarantined" => Ok(Quarantined),
             "failed" => Ok(Failed),
             _ => Err(ParseSandboxStateError),
@@ -516,8 +433,6 @@ impl From<SandboxState> for pplx_space_sbx_mgr_protocol::proto::SandboxLifecycle
             SandboxState::Suspending => Self::Suspending,
             SandboxState::Suspended => Self::Suspended,
             SandboxState::Restoring => Self::Restoring,
-            SandboxState::CleanupRequired => Self::CleanupRequired,
-            SandboxState::CleanupFailed => Self::CleanupFailed,
             SandboxState::Quarantined => Self::Quarantined,
             SandboxState::Failed => Self::Failed,
         }
@@ -529,13 +444,13 @@ pub enum StateTransitionError {
     #[error("cannot {action}: sandbox is {state} — wait for {operation} to complete")]
     Transient {
         action: &'static str,
-        state: SandboxState,
+        state: SandboxStatus,
         operation: &'static str,
     },
     #[error("cannot {action}: sandbox is {state}, not {required}")]
     Invalid {
         action: &'static str,
-        state: SandboxState,
+        state: SandboxStatus,
         required: &'static str,
     },
 }
@@ -555,23 +470,327 @@ impl fmt::Display for SandboxState {
     }
 }
 
-/// Sets a sandbox event's status label together with the cleanup state it
-/// folds in, so `from_state` and `from_cleanup_state` (or the `to_` pair)
-/// always describe one status.
+/// Sets a sandbox event's lifecycle together with the cleanup that owns the
+/// row, so `from_state` and `from_cleanup_state` (or the `to_` pair) always
+/// describe one status.
 pub trait SandboxStatusEventDetails {
-    fn with_from_status(self, status: SandboxState) -> Self;
-    fn with_to_status(self, status: SandboxState) -> Self;
+    fn with_from_status(self, status: impl Into<SandboxStatus>) -> Self;
+    fn with_to_status(self, status: impl Into<SandboxStatus>) -> Self;
 }
 
 impl SandboxStatusEventDetails for pplx_space_events::SandboxEventDetails {
-    fn with_from_status(self, status: SandboxState) -> Self {
-        self.with_from_state(status.as_str())
+    fn with_from_status(self, status: impl Into<SandboxStatus>) -> Self {
+        let status = status.into();
+        self.with_from_state(status.lifecycle().as_str())
             .from_cleanup_state(status.event_cleanup_state())
     }
 
-    fn with_to_status(self, status: SandboxState) -> Self {
-        self.with_to_state(status.as_str())
+    fn with_to_status(self, status: impl Into<SandboxStatus>) -> Self {
+        let status = status.into();
+        self.with_to_state(status.lifecycle().as_str())
             .to_cleanup_state(status.event_cleanup_state())
+    }
+}
+
+/// A teardown transition a cleanup can own a row over. The triggers allow a
+/// cleanup only over these.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Teardown {
+    Stopping,
+    Deleting,
+    Suspending,
+}
+
+impl Teardown {
+    pub const fn lifecycle(self) -> SandboxState {
+        match self {
+            Self::Stopping => SandboxState::Stopping,
+            Self::Deleting => SandboxState::Deleting,
+            Self::Suspending => SandboxState::Suspending,
+        }
+    }
+
+    /// The teardown transition `lifecycle` is, if it is one.
+    pub const fn of(lifecycle: SandboxState) -> Option<Self> {
+        match lifecycle {
+            SandboxState::Stopping => Some(Self::Stopping),
+            SandboxState::Deleting => Some(Self::Deleting),
+            SandboxState::Suspending => Some(Self::Suspending),
+            _ => None,
+        }
+    }
+}
+
+impl From<Teardown> for SandboxState {
+    fn from(teardown: Teardown) -> Self {
+        teardown.lifecycle()
+    }
+}
+
+/// A sandbox row's status: the lifecycle of a row no cleanup owns, or the
+/// cleanup that owns it and the teardown transition it is over. A row stores
+/// the lifecycle in `sandboxes.state` and the cleanup in `cleanup_state`.
+///
+/// A status is not a lifecycle and doesn't compare equal to one. Ask
+/// [`Self::is_unowned`] or [`Self::unowned`] whether a row is in a lifecycle;
+/// [`Self::lifecycle`] is the stored lifecycle, a cleanup's teardown
+/// transition included.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SandboxStatus {
+    /// No cleanup owns the row.
+    Unowned(SandboxState),
+    /// `cleanup` owns the row over `teardown`.
+    Owned {
+        teardown: Teardown,
+        cleanup: CleanupState,
+    },
+}
+
+impl From<SandboxState> for SandboxStatus {
+    fn from(lifecycle: SandboxState) -> Self {
+        Self::Unowned(lifecycle)
+    }
+}
+
+impl SandboxStatus {
+    /// A required cleanup over `stopping`, as an intent-less cleanup row is
+    /// stored.
+    #[cfg(any(test, feature = "test-support"))]
+    pub const CLEANUP_REQUIRED: Self = Self::owned(Teardown::Stopping, CleanupState::Required);
+
+    /// A failed cleanup over `stopping`, as an intent-less cleanup row is
+    /// stored.
+    #[cfg(any(test, feature = "test-support"))]
+    pub const CLEANUP_FAILED: Self = Self::owned(Teardown::Stopping, CleanupState::Failed);
+
+    /// Each lifecycle no cleanup owns and each cleanup over `stopping`, in the
+    /// order the combined status listed them before the split, so a table
+    /// keyed by position keeps its rows.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn sweep() -> [Self; 18] {
+        use SandboxState::*;
+        [
+            Creating.into(),
+            Created.into(),
+            Starting.into(),
+            Started.into(),
+            Stopping.into(),
+            Stopped.into(),
+            Deleting.into(),
+            Pausing.into(),
+            Paused.into(),
+            Resuming.into(),
+            Checkpointing.into(),
+            Suspending.into(),
+            Suspended.into(),
+            Restoring.into(),
+            Self::CLEANUP_REQUIRED,
+            Self::CLEANUP_FAILED,
+            Quarantined.into(),
+            Failed.into(),
+        ]
+    }
+
+    /// A row `cleanup` owns over `teardown`.
+    pub const fn owned(teardown: Teardown, cleanup: CleanupState) -> Self {
+        Self::Owned { teardown, cleanup }
+    }
+
+    /// The stored lifecycle: what `sandboxes.state` holds and publication
+    /// reports, which is a cleanup's teardown transition while one owns the
+    /// row. To decide whether a row is in a lifecycle, ask
+    /// [`Self::is_unowned`].
+    pub const fn lifecycle(self) -> SandboxState {
+        match self {
+            Self::Unowned(lifecycle) => lifecycle,
+            Self::Owned { teardown, .. } => teardown.lifecycle(),
+        }
+    }
+
+    /// The cleanup that owns the row, if one does.
+    pub const fn cleanup(self) -> Option<CleanupState> {
+        match self {
+            Self::Unowned(_) => None,
+            Self::Owned { cleanup, .. } => Some(cleanup),
+        }
+    }
+
+    /// The lifecycle, when no cleanup owns the row.
+    pub const fn unowned(self) -> Option<SandboxState> {
+        match self {
+            Self::Unowned(lifecycle) => Some(lifecycle),
+            Self::Owned { .. } => None,
+        }
+    }
+
+    /// Whether the row is in `lifecycle` and no cleanup owns it.
+    pub fn is_unowned(self, lifecycle: SandboxState) -> bool {
+        self.unowned() == Some(lifecycle)
+    }
+
+    /// Whether a cleanup owns the row.
+    pub const fn is_cleanup_owned(self) -> bool {
+        matches!(self, Self::Owned { .. })
+    }
+
+    /// The lifecycle a wake answers the row as: a required cleanup is waited
+    /// out like a transition, and a failed one refused like a terminal state.
+    pub const fn wake_as(self) -> SandboxState {
+        match self {
+            Self::Unowned(lifecycle) => lifecycle,
+            Self::Owned {
+                cleanup: CleanupState::Required,
+                ..
+            } => SandboxState::Stopping,
+            Self::Owned {
+                cleanup: CleanupState::Failed,
+                ..
+            } => SandboxState::Failed,
+        }
+    }
+
+    /// Wait completes for a failed cleanup, never a required one.
+    pub const fn completes_wait(self) -> bool {
+        match self {
+            Self::Unowned(lifecycle) => lifecycle.completes_wait(),
+            Self::Owned { cleanup, .. } => matches!(cleanup, CleanupState::Failed),
+        }
+    }
+
+    /// A cleanup-owned row admits only Delete and quarantine.
+    pub(crate) fn can_transition_to(self, target: SandboxState) -> bool {
+        match self {
+            Self::Unowned(lifecycle) => lifecycle.can_transition_to(target),
+            Self::Owned { .. } => {
+                matches!(target, SandboxState::Deleting | SandboxState::Quarantined)
+            }
+        }
+    }
+
+    pub fn transition(self, target: SandboxState) -> Result<SandboxState, StateTransitionError> {
+        match self {
+            Self::Unowned(lifecycle) => lifecycle.transition(target),
+            Self::Owned { .. } if self.can_transition_to(target) => Ok(target),
+            Self::Owned { .. } => Err(StateTransitionError::Invalid {
+                action: target.action_name(),
+                state: self,
+                required: target.required_states(),
+            }),
+        }
+    }
+
+    /// See [`SandboxState::can_authorize_net_gateway`]: a cleanup's gateway is
+    /// condemned.
+    pub fn can_authorize_net_gateway(self) -> bool {
+        self.unowned()
+            .is_some_and(|lifecycle| lifecycle.can_authorize_net_gateway())
+    }
+
+    /// See [`SandboxState::holds_runtime_outside_suspend`]: a cleanup holds a
+    /// runtime of its own.
+    pub fn holds_runtime_outside_suspend(self) -> bool {
+        self.unowned()
+            .is_some_and(|lifecycle| lifecycle.holds_runtime_outside_suspend())
+    }
+
+    /// See [`SandboxState::holds_parent_referencing_instance_subvolume`]: a
+    /// cleanup may still keep the instance subvolume.
+    pub fn holds_parent_referencing_instance_subvolume(self) -> bool {
+        self.unowned()
+            .is_none_or(|lifecycle| lifecycle.holds_parent_referencing_instance_subvolume())
+    }
+
+    /// See [`SandboxState::is_transient`]: a cleanup is not an operation in
+    /// progress.
+    pub fn is_transient(&self) -> bool {
+        self.unowned()
+            .is_some_and(|lifecycle| lifecycle.is_transient())
+    }
+
+    /// See [`SandboxState::guest_bridge_reachable`].
+    pub fn guest_bridge_reachable(self) -> bool {
+        self.unowned()
+            .is_some_and(|lifecycle| lifecycle.guest_bridge_reachable())
+    }
+
+    /// See [`SandboxState::can_cycle_net_gateway`].
+    pub fn can_cycle_net_gateway(self) -> bool {
+        self.unowned()
+            .is_some_and(|lifecycle| lifecycle.can_cycle_net_gateway())
+    }
+
+    /// See [`SandboxState::precedes_first_run`].
+    pub fn precedes_first_run(self) -> bool {
+        self.unowned()
+            .is_some_and(|lifecycle| lifecycle.precedes_first_run())
+    }
+
+    /// The cleanup as sandbox events carry it in
+    /// `from_cleanup_state`/`to_cleanup_state`.
+    pub fn event_cleanup_state(self) -> &'static str {
+        self.cleanup().map_or("none", CleanupState::as_str)
+    }
+
+    /// The label `sandbox.worker.lifecycle.count` groups by, which predates
+    /// the split: `cleanup_required`/`cleanup_failed` for a cleanup-owned
+    /// row, otherwise the lifecycle.
+    pub fn legacy_label(self) -> &'static str {
+        match self {
+            Self::Unowned(lifecycle) => lifecycle.as_str(),
+            Self::Owned {
+                cleanup: CleanupState::Required,
+                ..
+            } => "cleanup_required",
+            Self::Owned {
+                cleanup: CleanupState::Failed,
+                ..
+            } => "cleanup_failed",
+        }
+    }
+
+    /// The status a row whose `state` and `cleanup_state` hold these values
+    /// has, or `None` when either names nothing or the cleanup is over a
+    /// lifecycle no cleanup can be over.
+    pub fn from_columns(state: &str, cleanup_state: Option<&str>) -> Option<Self> {
+        let lifecycle = state.parse::<SandboxState>().ok()?;
+        match cleanup_state {
+            None => Some(lifecycle.into()),
+            Some(value) => Some(Self::owned(
+                Teardown::of(lifecycle)?,
+                CleanupState::from_column(value)?,
+            )),
+        }
+    }
+
+    /// Every lifecycle without a cleanup, then each cleanup over each
+    /// teardown transition.
+    pub fn all() -> [Self; 22] {
+        let mut all = [Self::from(SandboxState::Creating); 22];
+        for (slot, lifecycle) in all.iter_mut().zip(SandboxState::all()) {
+            *slot = lifecycle.into();
+        }
+        let owned = [
+            Self::owned(Teardown::Stopping, CleanupState::Required),
+            Self::owned(Teardown::Deleting, CleanupState::Required),
+            Self::owned(Teardown::Suspending, CleanupState::Required),
+            Self::owned(Teardown::Stopping, CleanupState::Failed),
+            Self::owned(Teardown::Deleting, CleanupState::Failed),
+            Self::owned(Teardown::Suspending, CleanupState::Failed),
+        ];
+        all[16..].copy_from_slice(&owned);
+        all
+    }
+}
+
+/// The lifecycle, followed by the cleanup that owns the row.
+impl fmt::Display for SandboxStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unowned(lifecycle) => f.write_str(lifecycle.as_str()),
+            Self::Owned { teardown, cleanup } => {
+                write!(f, "{}, cleanup {}", teardown.lifecycle(), cleanup.as_str())
+            }
+        }
     }
 }
 

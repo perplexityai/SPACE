@@ -64,10 +64,9 @@ fn recovery_scope_discovery_retains_bad_evidence_and_retires_valid_siblings() {
     rowless_restore_transfer_scopes(&conn).expect_err("schema failure must propagate");
 }
 
-/// One due row per `SandboxState`, all with a due deadline; returns
-/// `(state, id)` pairs (`SandboxState` is not `Ord`, so no map).
-fn one_due_row_per_state(conn: &Connection) -> Vec<(SandboxState, SandboxId)> {
-    let rows = SandboxState::all()
+/// One due row per lifecycle or cleanup owner, all with a due deadline.
+fn one_due_row_per_state(conn: &Connection) -> Vec<(SandboxStatus, SandboxId)> {
+    let rows = SandboxStatus::sweep()
         .into_iter()
         .map(|state| {
             let id = SandboxId::new();
@@ -107,7 +106,7 @@ fn rowid_lane_skips_only_deleting_rows_and_still_advances_past_them() {
         }
     }
     for (state, id) in &rows {
-        if *state == SandboxState::Deleting {
+        if state.is_unowned(SandboxState::Deleting) {
             assert!(!seen.contains(id), "deleting must never be due");
         } else {
             assert!(seen.contains(id), "{state} must stay selectable");
@@ -129,7 +128,7 @@ fn deadline_lane_alone_skips_deleting_rows() {
     let selected = due_auto_lifecycle_batch(&conn, 100, &[], 2 * rows.len(), &mut cursor).unwrap();
     let ids: std::collections::BTreeSet<_> = selected.iter().map(|d| d.sandbox_id).collect();
     for (state, id) in &rows {
-        if *state == SandboxState::Deleting {
+        if state.is_unowned(SandboxState::Deleting) {
             assert!(
                 !ids.contains(id),
                 "deleting must never be due via the deadline lane"
@@ -157,8 +156,10 @@ fn auto_lifecycle_action_gate_is_exhaustive_over_states() {
         SandboxState::Suspending,
         SandboxState::Restoring,
     ];
-    for state in SandboxState::all() {
-        let settled = !transient.contains(&state);
+    for state in SandboxStatus::sweep() {
+        let settled = !state
+            .unowned()
+            .is_some_and(|lifecycle| transient.contains(&lifecycle));
         for action in [Action::Pause, Action::Suspend, Action::Stop] {
             assert_eq!(
                 auto_lifecycle_action_can_act(action, state),

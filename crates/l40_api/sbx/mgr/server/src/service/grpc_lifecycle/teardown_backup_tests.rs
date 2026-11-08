@@ -293,13 +293,13 @@ async fn teardown_retry_seals_publishes_backs_up_and_completes_the_same_capture(
         assert_eq!(error.code(), tonic::Code::Unavailable, "{error}");
         assert_eq!(
             service.lookup_sandbox(&id).unwrap().state,
-            SandboxState::Suspending
+            SandboxStatus::from(SandboxState::Suspending)
         );
 
         // The next retry seals, publishes, backs up and completes teardown.
         drive().await.unwrap();
         let row = service.lookup_sandbox(&id).unwrap();
-        assert_eq!(row.state, SandboxState::Suspended);
+        assert_eq!(row.state, SandboxStatus::from(SandboxState::Suspended));
         assert_eq!(row.current_local_artifact_id, Some(capture));
         let db = service.db.lock().unwrap();
         assert!(
@@ -858,7 +858,7 @@ async fn captured_upload_failing_twice() {
     );
     assert_eq!(
         service.lookup_sandbox(&id).unwrap().state,
-        SandboxState::Suspending
+        SandboxStatus::from(SandboxState::Suspending)
     );
     super::retired_teardown_tests::drain(&service).await;
 }
@@ -1141,7 +1141,10 @@ async fn upload_after_refused_handoff(after: AfterRefusedHandoff) -> String {
     volume_manager.report(Transfers::Completed);
     let upload = only_upload(&service, &id);
     let completed = ended(&service, &upload.job_id, JobStatus::Completed).await;
-    assert_eq!(service.lookup_sandbox(&id).unwrap().state, expected);
+    assert_eq!(
+        service.lookup_sandbox(&id).unwrap().state,
+        SandboxStatus::from(expected)
+    );
     super::retired_teardown_tests::drain(&service).await;
     backup_attempt(&completed)
 }

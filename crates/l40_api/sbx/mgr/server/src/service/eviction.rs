@@ -228,8 +228,10 @@ impl SandboxManagerService {
                 .as_ref()
                 .is_some_and(|row| row.current_local_artifact_id == Some(staged_artifact));
             let in_state = |state| row.as_ref().is_some_and(|row| row.state == state);
-            let holds_capture = pins_capture && in_state(crate::state::SandboxState::Suspending);
-            let held_suspended = pins_capture && in_state(crate::state::SandboxState::Suspended);
+            let holds_capture = pins_capture
+                && in_state(SandboxStatus::from(crate::state::SandboxState::Suspending));
+            let held_suspended = pins_capture
+                && in_state(SandboxStatus::from(crate::state::SandboxState::Suspended));
             let awaiting_backup = if running && holds_capture {
                 crate::db::read::sandbox_view(&db, sandbox_id)
                     .artifacts()
@@ -364,7 +366,7 @@ impl SandboxManagerService {
                         && crate::db::read::sandbox(&db, sandbox_id)
                             .ok()?
                             .is_some_and(|row| {
-                                row.state == crate::state::SandboxState::Suspending
+                                row.state.is_unowned(crate::state::SandboxState::Suspending)
                                     && row.current_local_artifact_id == Some(staged_artifact)
                             });
                     let pending = !crate::db::read::sandbox_view(&db, sandbox_id)
@@ -659,13 +661,13 @@ impl SandboxManagerService {
                 .ok_or_else(|| Status::not_found(format!("sandbox {sandbox_id} not found")))?;
             (row, state_changed_at)
         };
-        let claim = match row.state {
-            crate::state::SandboxState::Stopped => EvictionClaim::Stopped,
-            crate::state::SandboxState::Quarantined => EvictionClaim::Quarantined,
-            crate::state::SandboxState::Suspended => {
+        let claim = match row.state.unowned() {
+            Some(crate::state::SandboxState::Stopped) => EvictionClaim::Stopped,
+            Some(crate::state::SandboxState::Quarantined) => EvictionClaim::Quarantined,
+            Some(crate::state::SandboxState::Suspended) => {
                 EvictionClaim::SuspendedPinned(row.current_local_artifact_id)
             }
-            crate::state::SandboxState::Restoring
+            Some(crate::state::SandboxState::Restoring)
                 if row
                     .failure_reason
                     .as_deref()
@@ -673,13 +675,13 @@ impl SandboxManagerService {
             {
                 EvictionClaim::FailedRestoring
             }
-            crate::state::SandboxState::Restoring => {
+            Some(crate::state::SandboxState::Restoring) => {
                 return Err(Status::failed_precondition(format!(
                     "sandbox {sandbox_id} is restoring with no persisted staging failure; \
                      refusing cluster-deleted eviction"
                 )));
             }
-            crate::state::SandboxState::Suspending
+            Some(crate::state::SandboxState::Suspending)
                 if row.failure_reason.as_deref()
                     == Some(
                         pplx_space_sbx_mgr_client::TEARDOWN_SUSPEND_BACKUP_PERMANENTLY_FAILED_REASON,
@@ -700,13 +702,14 @@ impl SandboxManagerService {
                     state_changed_at: state_changed_at.clone(),
                 }
             }
-            crate::state::SandboxState::Suspending => {
+            Some(crate::state::SandboxState::Suspending) => {
                 return Err(Status::failed_precondition(format!(
                     "sandbox {sandbox_id} is suspending with no permanently refused teardown \
                      backup; refusing cluster-deleted eviction"
                 )));
             }
-            state => {
+            _ => {
+                let state = row.state;
                 return Err(Status::failed_precondition(format!(
                     "sandbox {sandbox_id} is {state}, not suspended, quarantined, a failed cross-node \
                      restore, or a terminally failed teardown suspend; refusing \

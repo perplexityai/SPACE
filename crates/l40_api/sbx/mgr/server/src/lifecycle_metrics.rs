@@ -36,7 +36,9 @@ impl SampledCount for SandboxLifecycleCount {
 
     fn bucket(&self) -> LifecycleBucket {
         LifecycleBucket {
-            state: self.state.as_str().to_owned(),
+            // `sandbox.worker.lifecycle.count` keeps the label that predates
+            // the cleanup-state split.
+            state: self.state.legacy_label().to_owned(),
             runtime: self.runtime,
             runtime_version: self.runtime_version.clone(),
         }

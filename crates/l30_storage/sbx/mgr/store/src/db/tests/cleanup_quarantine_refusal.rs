@@ -20,7 +20,7 @@ struct Persisted {
 
 #[derive(Debug, PartialEq)]
 struct PersistedSandbox {
-    state: SandboxState,
+    state: SandboxStatus,
     failure_reason: Option<String>,
     cleanup_completion: Option<CleanupCompletion>,
     cleanup_keep_filesystem: Option<bool>,
@@ -113,7 +113,7 @@ fn quarantine(conn: &Connection, id: &str) {
     .unwrap();
     assert_eq!(
         get_sandbox(conn, id).unwrap().unwrap().state,
-        SandboxState::Quarantined
+        SandboxStatus::from(SandboxState::Quarantined)
     );
 }
 
@@ -146,7 +146,7 @@ fn requested_start(conn: &Connection, id: &str, label: &str) -> CleanupEpisode {
     );
     assert_eq!(
         get_sandbox(conn, id).unwrap().unwrap().state,
-        SandboxState::CleanupRequired
+        SandboxStatus::CLEANUP_REQUIRED
     );
     episode
 }
@@ -154,7 +154,7 @@ fn requested_start(conn: &Connection, id: &str, label: &str) -> CleanupEpisode {
 // The row helpers below write columns directly, so a case reaches one writer
 // predicate without another writer's side effects.
 
-fn set_state(conn: &Connection, id: &str, state: SandboxState) {
+fn set_state(conn: &Connection, id: &str, state: impl Into<SandboxStatus>) {
     crate::db::test_fixtures::state_write_fixtures::write_status(conn, id, state);
 }
 
@@ -281,9 +281,9 @@ fn cleanup_required_in_state_writes_only_a_row_in_the_expected_state() {
     const EXPECTED: SandboxState = SandboxState::Started;
     // A quarantined row is refused regardless of the expected state; see
     // `generic_cleanup_writers_refuse_quarantined_and_missing_rows`.
-    for state in SandboxState::all()
+    for state in SandboxStatus::sweep()
         .into_iter()
-        .filter(|state| *state != SandboxState::Quarantined)
+        .filter(|state| !state.is_unowned(SandboxState::Quarantined))
     {
         let conn = test_conn();
         insert_test_sandbox(&conn, TestSandboxInsert::new("sandbox", "instate1", state));
@@ -299,10 +299,10 @@ fn cleanup_required_in_state_writes_only_a_row_in_the_expected_state() {
         )
         .unwrap();
 
-        assert_eq!(wrote, state == EXPECTED, "{state:?}");
+        assert_eq!(wrote, state.is_unowned(EXPECTED), "{state:?}");
         if wrote {
             let row = get_sandbox(&conn, "sandbox").unwrap().unwrap();
-            assert_eq!(row.state, SandboxState::CleanupRequired);
+            assert_eq!(row.state, SandboxStatus::CLEANUP_REQUIRED);
             assert_eq!(row.cleanup_completion, Some(CleanupCompletion::MarkStopped));
             assert_eq!(row.cleanup_keep_filesystem, Some(true));
         } else {
@@ -399,7 +399,7 @@ fn cleanup_request_is_superseded_without_the_owned_episode_and_intent() {
 fn cleanup_request_is_superseded_once_the_row_is_deleting_or_quarantined() {
     // An eviction claim can move a row to `deleting` while its armed episode
     // and intent remain, so only the row state separates these outcomes.
-    for state in SandboxState::all() {
+    for state in SandboxStatus::sweep() {
         let conn = test_conn();
         let episode = armed_start(&conn, "sandbox", "rqstate1");
         set_state(&conn, "sandbox", state);
@@ -414,7 +414,10 @@ fn cleanup_request_is_superseded_once_the_row_is_deleting_or_quarantined() {
         )
         .unwrap();
 
-        if matches!(state, SandboxState::Deleting | SandboxState::Quarantined) {
+        if matches!(
+            state.unowned(),
+            Some(SandboxState::Deleting | SandboxState::Quarantined)
+        ) {
             assert_eq!(
                 outcome,
                 CleanupEpisodeRequestOutcome::Superseded,
@@ -430,7 +433,7 @@ fn cleanup_request_is_superseded_once_the_row_is_deleting_or_quarantined() {
             let after = persisted(&conn, "sandbox");
             assert_eq!(
                 after.sandbox.map(|row| row.state),
-                Some(SandboxState::CleanupRequired),
+                Some(SandboxStatus::CLEANUP_REQUIRED),
                 "{state:?}"
             );
             assert_eq!(
@@ -510,7 +513,7 @@ fn cleanup_failure_is_recorded_only_against_the_current_requested_episode() {
         ("no episode", |conn, id| {
             insert_test_sandbox(
                 conn,
-                TestSandboxInsert::new(id, "nocln002", SandboxState::CleanupRequired),
+                TestSandboxInsert::new(id, "nocln002", SandboxStatus::CLEANUP_REQUIRED),
             );
             SandboxCleanupEpisodeId::new()
         }),
@@ -539,16 +542,16 @@ fn cleanup_failure_is_recorded_only_against_the_current_requested_episode() {
 #[test]
 fn cleanup_failure_against_a_changed_intent_records_evidence_and_gates_state_on_completion() {
     type ChangeIntent = fn(&Connection, &str);
-    let cases: [(&str, ChangeIntent, SandboxState); 3] = [
+    let cases: [(&str, ChangeIntent, SandboxStatus); 3] = [
         (
             "intent cleared",
             |conn, id| clear_cleanup_intent(conn, id).unwrap(),
-            SandboxState::CleanupRequired,
+            SandboxStatus::CLEANUP_REQUIRED,
         ),
         (
             "completion changed",
             change_intent_completion,
-            SandboxState::CleanupRequired,
+            SandboxStatus::CLEANUP_REQUIRED,
         ),
         // Unlike `request_cleanup_episode`, `quarantine_cleanup_episode` and
         // `cleanup_episode_current`, this writer's state predicate matches the
@@ -559,7 +562,7 @@ fn cleanup_failure_against_a_changed_intent_records_evidence_and_gates_state_on_
         (
             "keep-filesystem changed",
             change_intent_keep_filesystem,
-            SandboxState::CleanupFailed,
+            SandboxStatus::CLEANUP_FAILED,
         ),
     ];
     for (case, change_intent, expected_state) in cases {
@@ -591,7 +594,7 @@ fn quarantine_cleanup_refuses_without_a_current_requested_episode() {
         ("no episode", |conn, id| {
             insert_test_sandbox(
                 conn,
-                TestSandboxInsert::new(id, "nocln003", SandboxState::CleanupRequired),
+                TestSandboxInsert::new(id, "nocln003", SandboxStatus::CLEANUP_REQUIRED),
             );
             SandboxCleanupEpisodeId::new()
         }),
@@ -613,7 +616,7 @@ fn quarantine_cleanup_refuses_without_a_current_requested_episode() {
             .unwrap();
             assert_eq!(
                 get_sandbox(conn, id).unwrap().unwrap().state,
-                SandboxState::CleanupRequired
+                SandboxStatus::CLEANUP_REQUIRED
             );
             episode.id
         }),
@@ -671,7 +674,7 @@ fn quarantine_cleanup_refuses_without_a_current_requested_episode() {
 fn quarantine_cleanup_accepts_only_a_row_in_a_cleanup_state() {
     // Each row keeps the current requested episode and its intent, so only the
     // row state decides the outcome.
-    for state in SandboxState::all() {
+    for state in SandboxStatus::sweep() {
         let conn = test_conn();
         let episode = requested_start(&conn, "sandbox", "qcstate1");
         set_state(&conn, "sandbox", state);
@@ -682,13 +685,13 @@ fn quarantine_cleanup_accepts_only_a_row_in_a_cleanup_state() {
 
         if matches!(
             state,
-            SandboxState::CleanupRequired | SandboxState::CleanupFailed
+            SandboxStatus::CLEANUP_REQUIRED | SandboxStatus::CLEANUP_FAILED
         ) {
             assert!(quarantined, "{state:?}");
             let after = persisted(&conn, "sandbox");
             assert_eq!(
                 after.sandbox.map(|row| row.state),
-                Some(SandboxState::Quarantined),
+                Some(SandboxState::Quarantined.into()),
                 "{state:?}"
             );
             assert_eq!(after.episode, None, "{state:?}");
@@ -746,7 +749,7 @@ fn stale_armed_cleanup_retires_only_after_the_row_left_its_activation_state() {
     );
     assert!(cleanup_episode(&conn, "sandbox").unwrap().is_none());
     let row = get_sandbox(&conn, "sandbox").unwrap().unwrap();
-    assert_eq!(row.state, SandboxState::Quarantined);
+    assert_eq!(row.state, SandboxStatus::from(SandboxState::Quarantined));
     assert_eq!(row.cleanup_completion, None);
     assert_eq!(row.cleanup_keep_filesystem, None);
     assert!(

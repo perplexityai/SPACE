@@ -6,6 +6,7 @@ use std::path::PathBuf;
 
 use crate::node_manager_transport::fake::{FakeNodeManager, ServedNodeManager};
 use crate::service::SandboxManagerServiceOptions;
+use crate::state::SandboxStatus;
 use pplx_space_common_core::types::{LocalArtifactId, SandboxActivationAttemptId};
 use pplx_space_common_core::types::{
     SandboxArtifactMetadata, SandboxId, SnapshotExecutionMetadata,
@@ -38,10 +39,11 @@ pub(in crate::service::runtime_upgrade) fn environments() -> (ExecutionMetadata,
 }
 
 pub(in crate::service::runtime_upgrade) fn fixture(
-    state: SandboxState,
+    state: impl Into<SandboxStatus>,
     encrypted: bool,
     node: FakeNodeManager,
 ) -> Fixture {
+    let state = state.into();
     let (source, target) = environments();
     let directory = tempfile::tempdir().unwrap();
     let cache = directory.path().join("cache");
@@ -73,7 +75,7 @@ pub(in crate::service::runtime_upgrade) fn fixture(
         .unwrap(),
     )
     .unwrap();
-    if state == SandboxState::Suspended {
+    if state.is_unowned(SandboxState::Suspended) {
         let checkpoint = sandbox_dir.join("snapshot");
         std::fs::create_dir_all(&checkpoint).unwrap();
         std::fs::write(
@@ -342,7 +344,7 @@ async fn recovery_never_starts_or_stops_a_sandbox() {
             .code(),
         tonic::Code::FailedPrecondition
     );
-    assert_eq!(f.row().state, SandboxState::Stopped);
+    assert_eq!(f.row().state, SandboxStatus::from(SandboxState::Stopped));
 }
 
 /// Suspend, then stop: the stop drops the pin but leaves the checkpoint, which
@@ -618,7 +620,7 @@ async fn the_upgrade_never_stops_an_execution_started_after_its_check() {
     effects.stop(&f.sandbox_id, boot).await.unwrap();
 
     let row = f.row();
-    assert_eq!(row.state, SandboxState::Started);
+    assert_eq!(row.state, SandboxStatus::from(SandboxState::Started));
     assert_eq!(row.node_execution_id, Some(replacement));
     assert!(
         !crate::db::read::sandbox_view(&f.service.db.lock().unwrap(), &f.sandbox_id)
@@ -646,14 +648,18 @@ async fn the_stop_is_admitted_only_for_the_boots_execution() {
             .expect("another execution's stop must be refused")
             .into_status();
         assert_eq!(refused.code(), tonic::Code::Aborted, "{state}: {refused}");
-        assert_eq!(f.row().state, state);
+        assert_eq!(f.row().state, SandboxStatus::from(state));
 
         let admitted = f
             .service
             .admit_stop_for_activation(sandbox_id, state, boot)
             .await;
         assert!(admitted.is_ok(), "{state}");
-        assert_eq!(f.row().state, SandboxState::Stopping, "{state}");
+        assert_eq!(
+            f.row().state,
+            SandboxStatus::from(SandboxState::Stopping),
+            "{state}"
+        );
     }
 }
 
@@ -684,7 +690,7 @@ async fn the_stop_leaves_the_boots_execution_alone_once_it_is_at_rest() {
                 .unwrap(),
             "{state}"
         );
-        assert_eq!(f.row().state, state);
+        assert_eq!(f.row().state, SandboxStatus::from(state));
     }
 }
 
@@ -715,7 +721,7 @@ async fn a_stop_that_cant_open_its_claim_is_refused() {
         .unwrap()
         .execute_batch("ROLLBACK")
         .unwrap();
-    assert_eq!(f.row().state, SandboxState::Started);
+    assert_eq!(f.row().state, SandboxStatus::from(SandboxState::Started));
 }
 
 /// A Wake that carries `upgrade`, shaped as the control plane sends one.
@@ -826,7 +832,11 @@ async fn a_wake_carrying_an_upgrade_runs_the_upgrade_instead_of_a_start() {
     // The failed boot left the old pair: stopped, unfenced and bound to the
     // environment it ran under.
     let row = f.row();
-    assert_eq!(row.state, SandboxState::Stopped, "{error}");
+    assert_eq!(
+        row.state,
+        SandboxStatus::from(SandboxState::Stopped),
+        "{error}"
+    );
     assert_eq!(
         row.execution_metadata
             .as_ref()
@@ -929,7 +939,7 @@ async fn a_wake_upgrade_must_be_an_internal_blocking_started_wake() {
             "{case}: {error}"
         );
     }
-    assert_eq!(f.row().state, SandboxState::Stopped);
+    assert_eq!(f.row().state, SandboxStatus::from(SandboxState::Stopped));
     assert!(f._node.calls().is_empty(), "{:?}", f._node.calls());
 }
 
@@ -944,7 +954,7 @@ async fn staging_for_an_upgrade_leaves_a_present_sandbox_alone() {
         })
         .await
         .unwrap();
-    assert_eq!(f.row().state, SandboxState::Suspended);
+    assert_eq!(f.row().state, SandboxStatus::from(SandboxState::Suspended));
     assert!(f._node.calls().is_empty(), "{:?}", f._node.calls());
 }
 
@@ -1005,7 +1015,7 @@ async fn a_wake_upgrade_never_boots_a_checkpoint_other_than_the_one_decided_on()
 
         assert_eq!(error.code(), tonic::Code::FailedPrecondition, "{error}");
         assert!(error.message().contains("decided from"), "{error}");
-        assert_eq!(f.row().state, SandboxState::Suspended);
+        assert_eq!(f.row().state, SandboxStatus::from(SandboxState::Suspended));
         assert!(f._node.calls().is_empty(), "{:?}", f._node.calls());
         assert_eq!(
             crate::db::read::runtime_upgrade_fence(&f.service.db.lock().unwrap(), &f.sandbox_id)

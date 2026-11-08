@@ -141,7 +141,10 @@ async fn node_local_suspend_of_a_superseded_execution_rolls_back() {
             .require_node_local_backup_handoff(&sandbox_id, local_artifact_id, Err(refused))
             .expect_err("a refused handoff must stop before runtime finalization");
         let row = service.lookup_sandbox(&sandbox_id).unwrap();
-        assert_eq!(row.state, SandboxState::Paused);
+        assert_eq!(
+            row.state,
+            crate::state::SandboxStatus::from(SandboxState::Paused)
+        );
         assert_eq!(row.pid, Some(std::process::id()));
         drain(&service).await;
     })

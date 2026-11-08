@@ -104,7 +104,10 @@ impl super::SandboxManagerService {
         crate::metrics::sandbox::worker::ingress_admission_wait(started);
         let sandbox = self.lookup_guest_bridge_sandbox(sandbox_id)?;
         authorize(&sandbox)?;
-        if sandbox.state != crate::state::SandboxState::Started {
+        if !sandbox
+            .state
+            .is_unowned(crate::state::SandboxState::Started)
+        {
             return Err(tonic::Status::failed_precondition(
                 "ingress execution is not started",
             ));

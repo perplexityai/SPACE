@@ -1270,7 +1270,7 @@ fn absent_volume_manager_socket() -> std::path::PathBuf {
 /// states keep the projection.
 #[test]
 fn suspend_uncommitted_follows_the_row_state_and_its_pin() {
-    use crate::state::SandboxState;
+    use crate::state::{SandboxState, SandboxStatus};
     use pplx_space_common_core::types::{ArtifactKind, ArtifactOrigin};
 
     let capture = LocalArtifactId::new();
@@ -1278,22 +1278,26 @@ fn suspend_uncommitted_follows_the_row_state_and_its_pin() {
     let other = LocalArtifactId::new().to_string();
     let cases = [
         // Rolled back to `paused`, which restores the previous pin.
-        (SandboxState::Paused, Some(other.as_str()), true),
-        (SandboxState::Started, Some(pinned.as_str()), true),
-        (SandboxState::Restoring, None, true),
+        (SandboxState::Paused.into(), Some(other.as_str()), true),
+        (SandboxState::Started.into(), Some(pinned.as_str()), true),
+        (SandboxState::Restoring.into(), None, true),
         // A node-local suspend before its cleanup completes, or one begun
         // after a rollback: neither has pinned this capture.
-        (SandboxState::Suspending, None, true),
-        (SandboxState::Suspending, Some(other.as_str()), true),
+        (SandboxState::Suspending.into(), None, true),
+        (SandboxState::Suspending.into(), Some(other.as_str()), true),
         // A teardown suspend that staged this capture.
-        (SandboxState::Suspending, Some(pinned.as_str()), false),
-        (SandboxState::Suspended, Some(pinned.as_str()), false),
+        (
+            SandboxState::Suspending.into(),
+            Some(pinned.as_str()),
+            false,
+        ),
+        (SandboxState::Suspended.into(), Some(pinned.as_str()), false),
         // A later suspend committed another capture.
-        (SandboxState::Suspended, Some(other.as_str()), true),
-        (SandboxState::CleanupRequired, Some(other.as_str()), false),
-        (SandboxState::CleanupFailed, None, false),
-        (SandboxState::Quarantined, None, true),
-        (SandboxState::Stopped, None, false),
+        (SandboxState::Suspended.into(), Some(other.as_str()), true),
+        (SandboxStatus::CLEANUP_REQUIRED, Some(other.as_str()), false),
+        (SandboxStatus::CLEANUP_FAILED, None, false),
+        (SandboxState::Quarantined.into(), None, true),
+        (SandboxState::Stopped.into(), None, false),
     ];
     let conn = crate::db::test_conn();
     for (index, (state, pin, _)) in cases.iter().enumerate() {

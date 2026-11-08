@@ -102,12 +102,13 @@ impl DecodeSandboxStatePublicationMetadataError {
 impl RawSandboxStatePublicationMetadata {
     pub fn decode(
         self,
-        state: SandboxState,
+        state: impl Into<SandboxStatus>,
     ) -> std::result::Result<
         SandboxStatePublicationMetadata,
         DecodeSandboxStatePublicationMetadataError,
     > {
-        if state == SandboxState::Quarantined {
+        let state = state.into();
+        if state.is_unowned(SandboxState::Quarantined) {
             let reason = required_trimmed(
                 self.quarantine_reason_code,
                 SandboxStatePublicationMetadataField::QuarantineReasonCode,
@@ -154,7 +155,7 @@ impl RawSandboxStatePublicationMetadata {
                 }
             },
         )?;
-        if target_state.as_str() != state.as_str() {
+        if state.unowned().map(|state| state.as_str()) != Some(target_state.as_str()) {
             return Err(DecodeSandboxStatePublicationMetadataError::Invalid {
                 field: SandboxStatePublicationMetadataField::TransitionReceiptTargetState,
                 message: format!("target {target_state} does not match row state {state}"),
@@ -262,7 +263,7 @@ pub enum MarkQuarantinedError {
     #[error("illegal transition into quarantined: {0}")]
     IllegalTransition(#[from] StateTransitionError),
     #[error("quarantined sandbox insert must use quarantined state, got {state}")]
-    NonQuarantinedInsert { state: SandboxState },
+    NonQuarantinedInsert { state: SandboxStatus },
 }
 
 pub(super) struct QuarantineEpisode<'a> {
@@ -466,9 +467,9 @@ pub fn insert_quarantined_sandbox_in_transaction(
     reason_message: &str,
     next_action: SandboxQuarantineNextAction,
 ) -> std::result::Result<(), MarkQuarantinedError> {
-    if params.state != SandboxState::Quarantined {
+    if params.state != InsertedStatus::Lifecycle(SandboxState::Quarantined) {
         return Err(MarkQuarantinedError::NonQuarantinedInsert {
-            state: params.state,
+            state: params.state.into(),
         });
     }
     let sandbox_id = params.id.to_string();
@@ -706,7 +707,7 @@ pub fn recover_pause_failed_quarantine(
     emit_sandbox_state_event(
         &sandbox_id,
         SandboxEventType::QuarantineRecovered,
-        Some(SandboxState::Quarantined.as_str()),
+        Some(Ok(SandboxState::Quarantined.into())),
         reason,
         "recover_pause_failed_quarantine",
         target_state,
@@ -782,7 +783,7 @@ pub fn mark_quarantined_from_state(
     mark_quarantined_inner(
         conn,
         id,
-        Some(expected_state),
+        Some(expected_state.into()),
         source,
         reason_code,
         reason_message,
@@ -793,7 +794,7 @@ pub fn mark_quarantined_from_state(
 fn mark_quarantined_inner(
     conn: &Connection,
     id: &str,
-    expected_state: Option<SandboxState>,
+    expected_state: Option<SandboxStatus>,
     source: SandboxQuarantineSource,
     reason_code: SandboxQuarantineReasonCode,
     reason_message: &str,
@@ -801,28 +802,28 @@ fn mark_quarantined_inner(
 ) -> std::result::Result<bool, MarkQuarantinedError> {
     let reason_message = reason_message.trim();
     let reason_message = (!reason_message.is_empty()).then_some(reason_message);
-    let previous_state = current_state_label(conn, id)?;
-    if expected_state.is_some_and(|expected| {
-        previous_state
-            .as_deref()
-            .and_then(|state| state.parse::<SandboxState>().ok())
-            != Some(expected)
-    }) {
+    // One read: the episode records the status label it entered from, the
+    // event the status or its stored text, and decisions read the status.
+    let previous_read = current_status_or_text(conn, id)?;
+    let previous_state = previous_read.as_ref().map(episode_status_label);
+    let previous_status = previous_read.clone().and_then(Result::ok);
+    if expected_state.is_some_and(|expected| previous_status != Some(expected)) {
         return Ok(false);
     }
     // A quarantined row keeps its episode. No production caller passes
     // `quarantined` as the expected state, so the check above already refuses
     // one there; only the test-only `mark_quarantined` reaches this.
-    if previous_state.as_deref() == Some(SandboxState::Quarantined.as_str()) {
+    if previous_status.is_some_and(|status| status.is_unowned(SandboxState::Quarantined)) {
         return Ok(false);
     }
-    if let Some(previous_state_label) = previous_state.as_deref() {
-        let previous_state_value = previous_state_label.parse::<SandboxState>().map_err(|_| {
-            MarkQuarantinedError::UnknownCurrentState {
-                state: previous_state_label.to_string(),
-            }
-        })?;
-        previous_state_value.transition(SandboxState::Quarantined)?;
+    if let Some(previous) = &previous_read {
+        let previous_status =
+            previous
+                .as_ref()
+                .map_err(|unknown| MarkQuarantinedError::UnknownCurrentState {
+                    state: unknown.to_string(),
+                })?;
+        previous_status.transition(SandboxState::Quarantined)?;
     }
     let ts = now()?;
 
@@ -845,10 +846,16 @@ fn mark_quarantined_inner(
              state_changed_at = CASE WHEN state != 'quarantined' THEN ?2 ELSE state_changed_at END,
              updated_at = ?2
          WHERE id = ?3
-           AND (?4 IS NULL
-                OR unowned_state = ?4
-                OR ?4 = 'cleanup_' || cleanup_state)",
-        params![reason_message, ts, id, previous_state.as_deref()],
+           AND (?4 IS NULL OR (state = ?4 AND cleanup_state IS ?5))",
+        params![
+            reason_message,
+            ts,
+            id,
+            previous_status.map(|status| status.lifecycle().as_str()),
+            previous_status
+                .and_then(|status| status.cleanup())
+                .map(CleanupState::as_str),
+        ],
     )?;
     if changed == 0 {
         tracing::warn!(
@@ -875,13 +882,7 @@ fn mark_quarantined_inner(
     tx.commit()?;
 
     if changed != 0 {
-        emit_sandbox_quarantined_event(
-            id,
-            previous_state.as_deref(),
-            reason_code,
-            "mark_quarantined",
-            None,
-        );
+        emit_sandbox_quarantined_event(id, previous_read, reason_code, "mark_quarantined", None);
     }
     Ok(changed != 0)
 }

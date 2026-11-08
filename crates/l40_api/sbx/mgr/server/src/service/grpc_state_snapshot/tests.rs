@@ -18,14 +18,17 @@ fn live_sandbox_state_includes_network_namespace() {
 
 #[test]
 fn cached_runtime_state_only_refines_resident_lifecycle() {
-    for state in SandboxState::all() {
+    for state in SandboxStatus::sweep() {
         for pid_alive in [false, true] {
-            let expected =
-                if pid_alive && matches!(state, SandboxState::Started | SandboxState::Paused) {
-                    SandboxState::Paused
-                } else {
-                    state
-                };
+            let expected = if pid_alive
+                && matches!(
+                    state.unowned(),
+                    Some(SandboxState::Started | SandboxState::Paused)
+                ) {
+                SandboxState::Paused.into()
+            } else {
+                state
+            };
             assert_eq!(
                 sandbox_status_from_runtime_observation(state, pid_alive, Some(VmState::Paused),),
                 expected,
@@ -182,7 +185,7 @@ async fn candidate_snapshot_admission_uses_durable_execution_before_checkpointin
     assert_eq!(error.code(), tonic::Code::FailedPrecondition);
     assert_eq!(
         service.lookup_sandbox(&id).unwrap().state,
-        SandboxState::Paused
+        SandboxStatus::from(SandboxState::Paused)
     );
 }
 
@@ -233,11 +236,11 @@ async fn template_snapshot_refuses_its_partition_before_checkpointing() {
     assert_eq!(error.code(), tonic::Code::InvalidArgument, "{error:?}");
     assert_eq!(
         service.lookup_sandbox(&id).unwrap().state,
-        SandboxState::Paused
+        SandboxStatus::from(SandboxState::Paused)
     );
 }
 
-fn sandbox_state(conn: &crate::db::Connection, id: &str) -> SandboxState {
+fn sandbox_state(conn: &crate::db::Connection, id: &str) -> SandboxStatus {
     crate::db::get_sandbox(conn, id).unwrap().unwrap().state
 }
 
@@ -265,9 +268,15 @@ fn template_base_snapshot_writes_leave_a_stop_that_completed_during_capture_stop
             SandboxState::Paused,
         );
         begin_template_base_snapshot_state(&conn, &id).unwrap();
-        assert_eq!(sandbox_state(&conn, &id), SandboxState::Checkpointing);
+        assert_eq!(
+            sandbox_state(&conn, &id),
+            SandboxStatus::from(SandboxState::Checkpointing)
+        );
         crate::db::test_fixtures::state_write_fixtures::stop(&conn, &id);
-        assert_eq!(sandbox_state(&conn, &id), SandboxState::Stopped);
+        assert_eq!(
+            sandbox_state(&conn, &id),
+            SandboxStatus::from(SandboxState::Stopped)
+        );
         let before = crate::db::test_fixtures::database_rows(&conn);
         let db = crate::db::SharedConnection::new(conn);
 
@@ -298,36 +307,35 @@ fn template_base_snapshot_writes_leave_a_stop_that_completed_during_capture_stop
 /// is visible in every column it touches.
 #[test]
 fn template_base_snapshot_writes_return_only_a_checkpointing_row_to_paused() {
-    for state in SandboxState::all() {
-        let expected_error = match state {
-            SandboxState::Checkpointing => None,
+    for state in SandboxStatus::all() {
+        let expected_error = match state.unowned() {
+            Some(SandboxState::Checkpointing) => None,
             // The generic guards: a stopping or cleanup row is never revived,
             // and a deleting row owns its `delete_row` cleanup.
-            SandboxState::Stopping
-            | SandboxState::Deleting
-            | SandboxState::CleanupRequired
-            | SandboxState::CleanupFailed => Some(
+            Some(SandboxState::Stopping | SandboxState::Deleting) | None => Some(
                 "complete template checkpoint: sandbox state write was not applied: \
                  superseded_by_cleanup_episode"
                     .to_string(),
             ),
-            SandboxState::Quarantined => Some(
+            Some(SandboxState::Quarantined) => Some(
                 "complete template checkpoint: sandbox state write was not applied: \
                  blocked_by_quarantine"
                     .to_string(),
             ),
-            SandboxState::Creating
-            | SandboxState::Created
-            | SandboxState::Starting
-            | SandboxState::Started
-            | SandboxState::Stopped
-            | SandboxState::Pausing
-            | SandboxState::Paused
-            | SandboxState::Resuming
-            | SandboxState::Suspending
-            | SandboxState::Suspended
-            | SandboxState::Restoring
-            | SandboxState::Failed => Some(format!(
+            Some(
+                SandboxState::Creating
+                | SandboxState::Created
+                | SandboxState::Starting
+                | SandboxState::Started
+                | SandboxState::Stopped
+                | SandboxState::Pausing
+                | SandboxState::Paused
+                | SandboxState::Resuming
+                | SandboxState::Suspending
+                | SandboxState::Suspended
+                | SandboxState::Restoring
+                | SandboxState::Failed,
+            ) => Some(format!(
                 "complete template checkpoint: sandbox state write was superseded: sandbox is {state}"
             )),
         };
@@ -336,6 +344,10 @@ fn template_base_snapshot_writes_return_only_a_checkpointing_row_to_paused() {
             let id = SandboxId::new().to_string();
             crate::service::tests::service_tests::insert_test_sandbox_with_runtime(
                 &conn, &id, state,
+            );
+            assert_eq!(
+                crate::db::get_sandbox(&conn, &id).unwrap().unwrap().state,
+                state
             );
             crate::db::test_fixtures::state_write_fixtures::decorate(
                 &conn,
@@ -356,7 +368,10 @@ fn template_base_snapshot_writes_return_only_a_checkpointing_row_to_paused() {
             match &expected_error {
                 None => {
                     result.unwrap();
-                    assert_eq!(sandbox_state(&conn, &id), SandboxState::Paused);
+                    assert_eq!(
+                        sandbox_state(&conn, &id),
+                        SandboxStatus::from(SandboxState::Paused)
+                    );
                     assert_eq!(
                         sandbox_inventory_dirty(&conn, &id),
                         !completion,
@@ -385,42 +400,45 @@ fn template_base_snapshot_writes_return_only_a_checkpointing_row_to_paused() {
 /// Every other row keeps every table unchanged and reports why.
 #[test]
 fn template_base_snapshot_admission_writes_only_over_a_paused_row() {
-    for state in SandboxState::all() {
-        let expected_error = match state {
-            SandboxState::Paused => None,
+    for state in SandboxStatus::all() {
+        let expected_error = match state.unowned() {
+            Some(SandboxState::Paused) => None,
             // The generic guards: a stopping or cleanup row is never revived,
             // and a deleting row owns its `delete_row` cleanup.
-            SandboxState::Stopping
-            | SandboxState::Deleting
-            | SandboxState::CleanupRequired
-            | SandboxState::CleanupFailed => Some(
+            Some(SandboxState::Stopping | SandboxState::Deleting) | None => Some(
                 "begin template checkpoint: sandbox state write was not applied: \
                  superseded_by_cleanup_episode"
                     .to_string(),
             ),
-            SandboxState::Quarantined => Some(
+            Some(SandboxState::Quarantined) => Some(
                 "begin template checkpoint: sandbox state write was not applied: \
                  blocked_by_quarantine"
                     .to_string(),
             ),
-            SandboxState::Creating
-            | SandboxState::Created
-            | SandboxState::Starting
-            | SandboxState::Started
-            | SandboxState::Stopped
-            | SandboxState::Pausing
-            | SandboxState::Resuming
-            | SandboxState::Checkpointing
-            | SandboxState::Suspending
-            | SandboxState::Suspended
-            | SandboxState::Restoring
-            | SandboxState::Failed => Some(format!(
+            Some(
+                SandboxState::Creating
+                | SandboxState::Created
+                | SandboxState::Starting
+                | SandboxState::Started
+                | SandboxState::Stopped
+                | SandboxState::Pausing
+                | SandboxState::Resuming
+                | SandboxState::Checkpointing
+                | SandboxState::Suspending
+                | SandboxState::Suspended
+                | SandboxState::Restoring
+                | SandboxState::Failed,
+            ) => Some(format!(
                 "begin template checkpoint: sandbox state write was superseded: sandbox is {state}"
             )),
         };
         let conn = crate::db::test_conn();
         let id = SandboxId::new().to_string();
         crate::service::tests::service_tests::insert_test_sandbox_with_runtime(&conn, &id, state);
+        assert_eq!(
+            crate::db::get_sandbox(&conn, &id).unwrap().unwrap().state,
+            state
+        );
         let before = crate::db::test_fixtures::database_rows(&conn);
 
         let result = begin_template_base_snapshot_state(&conn, &id);
@@ -428,7 +446,10 @@ fn template_base_snapshot_admission_writes_only_over_a_paused_row() {
         match expected_error {
             None => {
                 result.unwrap();
-                assert_eq!(sandbox_state(&conn, &id), SandboxState::Checkpointing);
+                assert_eq!(
+                    sandbox_state(&conn, &id),
+                    SandboxStatus::from(SandboxState::Checkpointing)
+                );
             }
             Some(message) => {
                 let error = result.expect_err("a refused admission must fail");
@@ -445,17 +466,13 @@ fn template_base_snapshot_admission_writes_only_over_a_paused_row() {
 }
 
 #[test]
-fn a_cleanup_row_publishes_its_stored_lifecycle() {
-    for status in SandboxState::all() {
-        let owned = cleanup_owner(status) != crate::proto::SandboxCleanupState::Unspecified;
-        assert_eq!(
-            published_lifecycle(status, SandboxState::Deleting),
-            if owned {
-                SandboxState::Deleting
-            } else {
-                status
-            },
-            "{status}"
-        );
+fn cleanup_owner_names_the_cleanup_and_nothing_else() {
+    for status in SandboxStatus::all() {
+        let expected = match status.cleanup() {
+            None => crate::proto::SandboxCleanupState::Unspecified,
+            Some(CleanupState::Required) => crate::proto::SandboxCleanupState::Required,
+            Some(CleanupState::Failed) => crate::proto::SandboxCleanupState::Failed,
+        };
+        assert_eq!(cleanup_owner(status), expected, "{status}");
     }
 }

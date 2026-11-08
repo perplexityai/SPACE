@@ -27,7 +27,7 @@ use super::*;
 /// the row: 200 ms, or less when the wake budget is nearly spent.
 fn transition_poll_interval(
     deadline: Option<tokio::time::Instant>,
-    state: SandboxState,
+    state: SandboxStatus,
 ) -> Result<Duration, Status> {
     Ok(remaining_wake_budget(deadline, state)?
         .map(|remaining| remaining.min(Duration::from_millis(200)))
@@ -204,7 +204,7 @@ impl SandboxManagerService {
         let _guard = wake_lock.lock().await;
 
         let sandbox = self.lookup_sandbox(sandbox_id)?;
-        if sandbox.state != SandboxState::Started {
+        if !sandbox.state.is_unowned(SandboxState::Started) {
             return Ok(false);
         }
         if !sandbox.auto_lifecycle.has_guest_activity_stages() {
@@ -245,7 +245,7 @@ impl SandboxManagerService {
         let _guard = wake_lock.lock().await;
 
         let sandbox = self.lookup_sandbox(sandbox_id)?;
-        if sandbox.state != SandboxState::Started {
+        if !sandbox.state.is_unowned(SandboxState::Started) {
             return Ok(HostControlActiveForOutcome::Denied(HostControlDenied {
                 reason: format!("sandbox is {}", sandbox.state),
             }));
@@ -326,7 +326,7 @@ impl SandboxManagerService {
             Ok(state_writer) => state_writer,
             Err(drain_error) => {
                 let sandbox = self.lookup_sandbox(sandbox_id)?;
-                if sandbox.state != SandboxState::Started {
+                if !sandbox.state.is_unowned(SandboxState::Started) {
                     return Err(match &route_auth {
                         Some(route_auth) => route_auth.refuse_sandbox(&sandbox, drain_error),
                         None => drain_error,
@@ -499,7 +499,7 @@ impl SandboxManagerService {
         // the request later fails. Legacy central publication keeps its lease
         // until route_activation_id is initialized by the post-ack CAS.
         if let Some(operation) = start.operation_activation_attempt_id
-            && adopted.state == start.target_state
+            && adopted.state.is_unowned(start.target_state)
         {
             // Wake(Paused) on Started deliberately remains Started. Preserve
             // that no-op contract without certifying an unmet Paused target.
@@ -631,11 +631,13 @@ impl SandboxManagerService {
             // bind an operation, but surviving identity mismatches still fence.
             if implicit
                 && matches!(
-                    sandbox.state,
-                    SandboxState::Created
-                        | SandboxState::Stopped
-                        | SandboxState::Paused
-                        | SandboxState::Suspended
+                    sandbox.state.unowned(),
+                    Some(
+                        SandboxState::Created
+                            | SandboxState::Stopped
+                            | SandboxState::Paused
+                            | SandboxState::Suspended
+                    )
                 )
                 && !activity.is_some_and(|activity| activity.allows_implicit_wake(wake_policy))
             {
@@ -644,7 +646,7 @@ impl SandboxManagerService {
                         "sandbox is {}, not started",
                         sandbox.state
                     )),
-                    sandbox.state.as_str(),
+                    sandbox.state.legacy_label(),
                 );
                 return Err(match route_auth {
                     Some(route_auth) => route_auth.refuse_sandbox(&sandbox, refusal),
@@ -666,7 +668,7 @@ impl SandboxManagerService {
                 )
                 .map_err(map_activation_operation_error)?;
             }
-            match sandbox.state {
+            match sandbox.state.wake_as() {
                 SandboxState::Started => {
                     // Asymmetry note: wake with `target_state = Paused`
                     // against an already-Started sandbox does not pause
@@ -807,8 +809,10 @@ impl SandboxManagerService {
                             super::activation_support::start_succeeded_notify(),
                             poll_interval,
                             || {
-                                Ok(self.lookup_sandbox(&sandbox.id)?.state
-                                    == SandboxState::Starting)
+                                Ok(self
+                                    .lookup_sandbox(&sandbox.id)?
+                                    .state
+                                    .is_unowned(SandboxState::Starting))
                             },
                         ),
                     )
@@ -820,22 +824,18 @@ impl SandboxManagerService {
                 | SandboxState::Checkpointing
                 | SandboxState::Suspending
                 | SandboxState::Restoring
-                | SandboxState::Stopping
-                | SandboxState::CleanupRequired => {
+                | SandboxState::Stopping => {
                     let sleep_for = transition_poll_interval(wait_deadline, sandbox.state)?;
                     wait_for_activation_admission(&sandbox.id, tokio::time::sleep(sleep_for))
                         .await?;
                 }
-                SandboxState::Deleting
-                | SandboxState::CleanupFailed
-                | SandboxState::Quarantined
-                | SandboxState::Failed => {
+                SandboxState::Deleting | SandboxState::Quarantined | SandboxState::Failed => {
                     return Err(pplx_space_common_grpc::mark_sandbox_not_running(
                         Status::failed_precondition(format!(
                             "sandbox is {}, cannot wake",
                             sandbox.state
                         )),
-                        sandbox.state.as_str(),
+                        sandbox.state.legacy_label(),
                     ));
                 }
             }
@@ -901,7 +901,8 @@ impl SandboxManagerService {
             )
             .map_err(map_activation_operation_error)?;
         }
-        match sandbox.state {
+        // A failed cleanup was refused above.
+        match sandbox.state.wake_as() {
             SandboxState::Started => {
                 self.finish_resident_wake(&sandbox.id, &start, None).await?;
                 return Ok(transition);
@@ -947,12 +948,8 @@ impl SandboxManagerService {
             | SandboxState::Checkpointing
             | SandboxState::Suspending
             | SandboxState::Restoring
-            | SandboxState::Stopping
-            | SandboxState::CleanupRequired => {}
-            SandboxState::Deleting
-            | SandboxState::CleanupFailed
-            | SandboxState::Quarantined
-            | SandboxState::Failed => {
+            | SandboxState::Stopping => {}
+            SandboxState::Deleting | SandboxState::Quarantined | SandboxState::Failed => {
                 unreachable!("wake_transition_for_state rejects terminal states")
             }
         }

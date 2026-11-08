@@ -205,7 +205,7 @@ pub struct NewRuntimeUpgrade<'a> {
 
 #[derive(Clone, Copy, Debug)]
 pub struct ObservedSandbox<'a> {
-    pub state: SandboxState,
+    pub state: SandboxStatus,
     pub current_local_artifact_id: Option<LocalArtifactId>,
     pub execution: Option<&'a ExecutionMetadata>,
 }
@@ -225,7 +225,7 @@ pub enum BeginRuntimeUpgrade {
     Fenced(Box<RuntimeUpgradeRecord>),
     SandboxMissing,
     /// Only a stopped or suspended sandbox has a disk/checkpoint pair to keep.
-    UnsupportedState(SandboxState),
+    UnsupportedState(SandboxStatus),
     /// A cleanup episode owns the sandbox.
     CleanupActive,
     /// Another upgrade fences the sandbox.
@@ -473,8 +473,8 @@ pub fn begin_runtime_upgrade(
         return Ok(BeginRuntimeUpgrade::SandboxMissing);
     };
     if !matches!(
-        sandbox.state,
-        SandboxState::Stopped | SandboxState::Suspended
+        sandbox.state.unowned(),
+        Some(SandboxState::Stopped | SandboxState::Suspended)
     ) {
         return Ok(BeginRuntimeUpgrade::UnsupportedState(sandbox.state));
     }
@@ -484,7 +484,7 @@ pub fn begin_runtime_upgrade(
     {
         return Ok(BeginRuntimeUpgrade::SandboxChanged);
     }
-    if sandbox.state == SandboxState::Suspended && !new.authorization.memory_loss {
+    if sandbox.state.is_unowned(SandboxState::Suspended) && !new.authorization.memory_loss {
         return Ok(BeginRuntimeUpgrade::MemoryLossUnauthorized);
     }
     if sandbox.cleanup_completion.is_some() || cleanup_episode(&tx, new.sandbox_id)?.is_some() {
@@ -493,7 +493,7 @@ pub fn begin_runtime_upgrade(
     if let Some((other, _)) = fencing_runtime_upgrade(&tx, new.sandbox_id)? {
         return Ok(BeginRuntimeUpgrade::OtherOperation(other));
     }
-    let checkpoint_artifact_id = (sandbox.state == SandboxState::Suspended
+    let checkpoint_artifact_id = (sandbox.state.is_unowned(SandboxState::Suspended)
         && sandbox.current_local_artifact_kind == Some(ArtifactKind::Full)
         && sandbox.current_local_artifact_origin == Some(ArtifactOrigin::Suspend))
     .then_some(sandbox.current_local_artifact_id)
@@ -516,7 +516,7 @@ pub fn begin_runtime_upgrade(
             new.authorization.id,
             new.authorization.reason,
             new.authorization.memory_loss,
-            sandbox.state.as_str(),
+            sandbox.state.lifecycle().as_str(),
             previous_execution,
             checkpoint_artifact_id.map(|id| id.to_string()),
             new.checkpoint_dir_identity,

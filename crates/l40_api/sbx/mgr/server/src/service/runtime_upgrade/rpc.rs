@@ -168,8 +168,8 @@ impl crate::service::SandboxManagerService {
                 let sandbox = self.lookup_sandbox(&start.sandbox_id)?;
                 refuse_moving(&sandbox)?;
                 if !matches!(
-                    sandbox.state,
-                    SandboxState::Stopped | SandboxState::Suspended
+                    sandbox.state.unowned(),
+                    Some(SandboxState::Stopped | SandboxState::Suspended)
                 ) {
                     return Err(Status::failed_precondition(format!(
                         "sandbox {} is on the runtime upgrade's target but is {}, not stopped",
@@ -249,8 +249,8 @@ impl crate::service::SandboxManagerService {
         // sandbox may have suspended since, to one the upgrade didn't decide.
         super::require_decided_checkpoint(&sandbox, decided_checkpoint)?;
         let at_rest = matches!(
-            sandbox.state,
-            SandboxState::Stopped | SandboxState::Suspended
+            sandbox.state.unowned(),
+            Some(SandboxState::Stopped | SandboxState::Suspended)
         );
         // A claimed start that never began leaves the sandbox at rest on the
         // execution it had when claimed, as a start refused before its
@@ -306,7 +306,7 @@ impl crate::service::SandboxManagerService {
             metadata,
             extensions,
             start.clone(),
-            sandbox.state,
+            sandbox.state.lifecycle(),
             from_execution,
         )
         .await?;
@@ -390,7 +390,7 @@ impl crate::service::SandboxManagerService {
         start: &StartRequest,
         refusal: impl FnOnce() -> String,
     ) -> Result<StartResponse, Status> {
-        if sandbox.state != SandboxState::Started || !runs_for_caller(sandbox, start) {
+        if !sandbox.state.is_unowned(SandboxState::Started) || !runs_for_caller(sandbox, start) {
             return Err(Status::failed_precondition(refusal()));
         }
         crate::service::create_support::checkpoint_start_response_for_live_runtime(
@@ -459,19 +459,19 @@ impl crate::service::SandboxManagerService {
 /// one whose pending cleanup recovery is still driving back to rest: a retry
 /// finds where it lands.
 fn refuse_moving(sandbox: &SandboxRow) -> Result<(), Status> {
-    if matches!(
-        sandbox.state,
-        SandboxState::CleanupRequired
-            | SandboxState::CleanupFailed
-            | SandboxState::Creating
-            | SandboxState::Starting
-            | SandboxState::Pausing
-            | SandboxState::Resuming
-            | SandboxState::Checkpointing
-            | SandboxState::Suspending
-            | SandboxState::Restoring
-            | SandboxState::Stopping
-    ) {
+    if sandbox.state.is_cleanup_owned()
+        || matches!(
+            sandbox.state.lifecycle(),
+            SandboxState::Creating
+                | SandboxState::Starting
+                | SandboxState::Pausing
+                | SandboxState::Resuming
+                | SandboxState::Checkpointing
+                | SandboxState::Suspending
+                | SandboxState::Restoring
+                | SandboxState::Stopping
+        )
+    {
         return Err(Status::unavailable(format!(
             "sandbox {} is {}; retry",
             sandbox.id, sandbox.state

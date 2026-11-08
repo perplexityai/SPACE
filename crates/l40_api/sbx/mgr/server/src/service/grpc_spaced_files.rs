@@ -324,7 +324,9 @@ impl SandboxManagerService {
             super::guest_image::require_agent(&sandbox)?;
         }
 
-        if sandbox.state != SandboxState::Started && sandbox.state != SandboxState::Paused {
+        if !sandbox.state.is_unowned(SandboxState::Started)
+            && !sandbox.state.is_unowned(SandboxState::Paused)
+        {
             return Err(Status::failed_precondition(format!(
                 "cannot update: sandbox is {}, not started or paused",
                 sandbox.state
@@ -409,7 +411,7 @@ impl SandboxManagerService {
                     .map_err(|e| Status::internal(format!("db update_process_env: {e}")))?;
             }
             mark_sandbox_dirty(&self.db, &sandbox.id);
-            if sandbox.state == SandboxState::Started && supports_process_env {
+            if sandbox.state.is_unowned(SandboxState::Started) && supports_process_env {
                 configure_process_env_via_spaced_host(&sandbox.id, &process_env)
                     .await
                     .map_err(|error| {

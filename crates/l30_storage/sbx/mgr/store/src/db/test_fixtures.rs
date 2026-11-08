@@ -230,7 +230,7 @@ pub fn database_rows(conn: &Connection) -> std::collections::BTreeMap<String, Ve
 pub struct TestSandboxInsert {
     pub(crate) id: String,
     pub(crate) uuid8: String,
-    pub(crate) state: SandboxState,
+    pub(crate) state: crate::state::SandboxStatus,
     pub(crate) user: String,
     pub(crate) rootfs_size_mb: Option<u32>,
     pub(crate) disk_io_limits: pplx_space_common_core::types::DiskIoLimits,
@@ -248,12 +248,12 @@ impl TestSandboxInsert {
     pub(crate) fn new(
         id: impl Into<String>,
         uuid8: impl Into<String>,
-        state: SandboxState,
+        state: impl Into<crate::state::SandboxStatus>,
     ) -> Self {
         Self {
             id: id.into(),
             uuid8: uuid8.into(),
-            state,
+            state: state.into(),
             user: "user".to_string(),
             rootfs_size_mb: None,
             disk_io_limits: Default::default(),
@@ -277,7 +277,10 @@ impl TestSandboxInsert {
             guest_image: Default::default(),
             id: &self.id,
             uuid8,
-            state: self.state,
+            state: crate::db::InsertedStatus::try_from(self.state).expect(
+                "an insert stores a cleanup only over stopping; record a delete or suspend \
+             cleanup with its writer",
+            ),
             template: "seed",
             template_hash: Some("hash"),
             user,

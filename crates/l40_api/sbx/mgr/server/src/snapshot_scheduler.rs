@@ -872,13 +872,16 @@ pub async fn do_checkpoint(
         }
 
         // Only checkpoint if Started or Paused (skip silently for transient states)
-        if sandbox.state != SandboxState::Started && sandbox.state != SandboxState::Paused {
+        if !sandbox.state.is_unowned(SandboxState::Started)
+            && !sandbox.state.is_unowned(SandboxState::Paused)
+        {
             return Ok(CheckpointCompletion::SkippedNoCapture(
                 "sandbox is not started or paused",
             ));
         }
 
-        let previous_state = sandbox.state;
+        // The check above admits only an unowned started or paused row.
+        let previous_state = sandbox.state.lifecycle();
 
         // Transition to Checkpointing while still holding the lock
         begin_checkpoint_state(&db, sandbox_id)?;

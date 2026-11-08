@@ -38,7 +38,7 @@ use crate::db::{
     RuntimeUpgradeTargetState, SandboxRow,
 };
 use crate::proto::{StartRequest, StartResponse};
-use crate::state::SandboxState;
+use crate::state::{SandboxState, SandboxStatus};
 
 mod node_effects;
 mod rpc;
@@ -188,7 +188,7 @@ pub(super) fn require_decided_checkpoint(
     sandbox: &SandboxRow,
     decided: Option<LocalArtifactId>,
 ) -> Result<(), Status> {
-    if sandbox.state == SandboxState::Suspended
+    if sandbox.state.is_unowned(SandboxState::Suspended)
         && (decided.is_none() || sandbox.current_local_artifact_id != decided)
     {
         return Err(Status::failed_precondition(format!(
@@ -246,19 +246,25 @@ enum BootActivity {
     Done,
     /// Between states on the boot's execution, such as checkpointing, pausing
     /// or quarantined; it may come back running, so the stop waits for a retry.
-    Changing(SandboxState),
+    Changing(SandboxStatus),
 }
 
 fn boot_activity(
-    state: SandboxState,
+    state: impl Into<SandboxStatus>,
     current: Option<SandboxActivationAttemptId>,
     boot: SandboxActivationAttemptId,
 ) -> BootActivity {
+    let state = state.into();
     // Quarantine completes a wait but can recover to started on the same
     // execution.
-    if current != Some(boot) || (state.completes_wait() && state != SandboxState::Quarantined) {
+    if current != Some(boot)
+        || (state.completes_wait() && !state.is_unowned(SandboxState::Quarantined))
+    {
         BootActivity::Done
-    } else if matches!(state, SandboxState::Started | SandboxState::Paused) {
+    } else if matches!(
+        state.unowned(),
+        Some(SandboxState::Started | SandboxState::Paused)
+    ) {
         BootActivity::Running
     } else {
         BootActivity::Changing(state)
@@ -269,7 +275,7 @@ fn boot_activity(
 /// another one runs, the upgrade has nothing to stop (`Ok(false)`). Otherwise
 /// the boot's own execution is still the upgrade's to stop on a retry.
 fn moved_on_or_retry(
-    state: SandboxState,
+    state: impl Into<SandboxStatus>,
     current: Option<SandboxActivationAttemptId>,
     execution: SandboxActivationAttemptId,
     refusal: &Status,
@@ -441,13 +447,13 @@ impl<E: RuntimeUpgradeEffects> RuntimeUpgrader<E> {
         }
         let sandbox = self.existing_sandbox(&request.sandbox_id)?;
         require_decided_checkpoint(&sandbox, request.checkpoint_local_artifact_id)?;
-        if sandbox.state != SandboxState::Suspended
+        if !sandbox.state.is_unowned(SandboxState::Suspended)
             && saved_environment(&sandbox) == Some(request.target)
         {
             return self.already_on_target(&request);
         }
         let disk = self.effects.inspect_local_disk(&sandbox).await?;
-        if sandbox.state == SandboxState::Suspended
+        if sandbox.state.is_unowned(SandboxState::Suspended)
             && disk
                 .checkpoint_execution
                 .as_ref()
@@ -479,8 +485,8 @@ impl<E: RuntimeUpgradeEffects> RuntimeUpgrader<E> {
         }
         // What the sandbox ran under last: its checkpoint's producer when
         // suspended, otherwise its saved consumer or, unbound, its disk's.
-        let source = match sandbox.state {
-            SandboxState::Suspended => disk.checkpoint_execution.as_ref(),
+        let source = match sandbox.state.unowned() {
+            Some(SandboxState::Suspended) => disk.checkpoint_execution.as_ref(),
             _ => sandbox.execution_metadata.as_ref(),
         }
         .unwrap_or(&disk.execution);
@@ -748,9 +754,9 @@ impl<E: RuntimeUpgradeEffects> RuntimeUpgrader<E> {
             };
             // Auto-lifecycle may stop a suspended sandbox meanwhile: stopped
             // keeps only the disk, which the rollback restores too.
-            let settled = sandbox.state == record.source_state
+            let settled = sandbox.state.is_unowned(record.source_state)
                 || (record.source_state == SandboxState::Suspended
-                    && sandbox.state == SandboxState::Stopped);
+                    && sandbox.state.is_unowned(SandboxState::Stopped));
             if settled && !cleaning {
                 return Ok(());
             }
@@ -873,7 +879,7 @@ impl<E: RuntimeUpgradeEffects> RuntimeUpgrader<E> {
             }
             RuntimeUpgradePhase::Booting => {
                 let booted = self.sandbox(&record.sandbox_id)?.is_some_and(|sandbox| {
-                    sandbox.state == SandboxState::Started
+                    sandbox.state.is_unowned(SandboxState::Started)
                         && saved_environment(&sandbox) == Some(record.target_environment)
                 });
                 if booted {

@@ -25,7 +25,6 @@
 //! - Writers with only test callers are excluded.
 
 use super::*;
-use crate::state::CleanupState;
 
 /// A set of lifecycle states, as a bitset in `SandboxState::all()` order.
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -33,7 +32,7 @@ pub struct StateSet(u32);
 
 impl StateSet {
     pub(super) const EMPTY: Self = Self(0);
-    pub(super) const ALL: Self = Self((1 << 18) - 1);
+    pub(super) const ALL: Self = Self((1 << 16) - 1);
 
     pub const fn of(states: &[SandboxState]) -> Self {
         let mut set = Self::EMPTY;
@@ -95,10 +94,8 @@ const fn bit(state: SandboxState) -> u32 {
         SandboxState::Suspending => 11,
         SandboxState::Suspended => 12,
         SandboxState::Restoring => 13,
-        SandboxState::CleanupRequired => 14,
-        SandboxState::CleanupFailed => 15,
-        SandboxState::Quarantined => 16,
-        SandboxState::Failed => 17,
+        SandboxState::Quarantined => 14,
+        SandboxState::Failed => 15,
     }
 }
 
@@ -135,42 +132,52 @@ impl EdgeSources {
 
     /// Every row: each lifecycle state, and rows any cleanup owns.
     pub(super) const ALL: Self = Self {
-        lifecycle: StateSet::ALL
-            .without(SandboxState::CleanupRequired)
-            .without(SandboxState::CleanupFailed),
+        lifecycle: StateSet::ALL,
         required: true,
         failed: true,
     };
 
-    /// These sources without rows read as the combined status `status`.
-    pub(super) const fn without(self, status: SandboxState) -> Self {
-        match status {
-            SandboxState::CleanupRequired => Self {
-                required: false,
-                ..self
-            },
-            SandboxState::CleanupFailed => Self {
-                failed: false,
-                ..self
-            },
-            _ => Self {
-                lifecycle: self.lifecycle.without(status),
-                ..self
-            },
+    /// These sources without rows in `lifecycle` that no cleanup owns.
+    pub(super) const fn without(self, lifecycle: SandboxState) -> Self {
+        Self {
+            lifecycle: self.lifecycle.without(lifecycle),
+            ..self
         }
     }
 
     /// Rows in the lifecycle `states` that no cleanup owns.
     pub(super) const fn of(states: &[SandboxState]) -> Self {
-        let lifecycle = StateSet::of(states);
-        assert!(
-            !lifecycle.contains(SandboxState::CleanupRequired)
-                && !lifecycle.contains(SandboxState::CleanupFailed),
-            "a cleanup is not a lifecycle source: use `or_owned_by`"
-        );
         Self {
-            lifecycle,
+            lifecycle: StateSet::of(states),
             ..Self::EMPTY
+        }
+    }
+
+    /// These sources without the rows `cleanup` owns.
+    #[cfg(test)]
+    pub(super) const fn without_owned_by(self, cleanup: CleanupState) -> Self {
+        match cleanup {
+            CleanupState::Required => Self {
+                required: false,
+                ..self
+            },
+            CleanupState::Failed => Self {
+                failed: false,
+                ..self
+            },
+        }
+    }
+
+    /// Exactly the rows with `status`: its lifecycle when no cleanup owns the
+    /// row, otherwise rows its cleanup owns over any lifecycle.
+    #[cfg(any(test, feature = "test-support"))]
+    pub const fn of_status(status: SandboxStatus) -> Self {
+        match status.cleanup() {
+            None => Self {
+                lifecycle: StateSet::EMPTY.with(status.lifecycle()),
+                ..Self::EMPTY
+            },
+            Some(cleanup) => Self::EMPTY.or_owned_by(cleanup),
         }
     }
 
@@ -188,33 +195,53 @@ impl EdgeSources {
         }
     }
 
-    /// Whether a row read as the combined status `status` is a source.
-    pub const fn contains(self, status: SandboxState) -> bool {
-        self.legacy().contains(status)
+    /// Whether a row with `status` is a source.
+    pub const fn contains(self, status: SandboxStatus) -> bool {
+        match status.cleanup() {
+            None => self.lifecycle.contains(status.lifecycle()),
+            Some(CleanupState::Required) => self.required,
+            Some(CleanupState::Failed) => self.failed,
+        }
     }
 
     /// Empty for an insert.
     pub(super) const fn is_empty(self) -> bool {
-        self.legacy().is_empty()
+        self.lifecycle.is_empty() && !self.required && !self.failed
     }
 
-    /// The sources as combined statuses, which the generic writer's predicate
-    /// compares.
-    pub(super) const fn legacy(self) -> StateSet {
-        let mut set = self.lifecycle;
-        if self.required {
-            set = set.with(SandboxState::CleanupRequired);
+    /// The cleanups whose rows are sources, as `sandboxes.cleanup_state`
+    /// labels.
+    fn cleanup_labels(self) -> Vec<&'static str> {
+        [
+            (self.required, CleanupState::Required),
+            (self.failed, CleanupState::Failed),
+        ]
+        .into_iter()
+        .filter_map(|(listed, cleanup)| listed.then_some(cleanup.as_str()))
+        .collect()
+    }
+}
+
+/// Lifecycle sources no cleanup owns.
+impl From<StateSet> for EdgeSources {
+    fn from(lifecycle: StateSet) -> Self {
+        Self {
+            lifecycle,
+            ..Self::EMPTY
         }
-        if self.failed {
-            set = set.with(SandboxState::CleanupFailed);
-        }
-        set
     }
 }
 
 impl fmt::Debug for EdgeSources {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Debug::fmt(&self.legacy(), f)
+        f.debug_set()
+            .entries(self.lifecycle.iter().map(|state| state.as_str().to_owned()))
+            .entries(
+                self.cleanup_labels()
+                    .into_iter()
+                    .map(|cleanup| format!("cleanup {cleanup}")),
+            )
+            .finish()
     }
 }
 
@@ -230,13 +257,6 @@ pub struct Edge {
 
 impl Edge {
     const fn new(name: &'static str, from: EdgeSources, to: SandboxState, kind: EdgeKind) -> Self {
-        assert!(
-            !matches!(
-                to,
-                SandboxState::CleanupRequired | SandboxState::CleanupFailed
-            ),
-            "a cleanup is not a lifecycle target: declare a cleanup edge"
-        );
         Self {
             name,
             from,
@@ -655,7 +675,7 @@ fn guard_label(guard: &StateWriteGuard) -> &'static str {
 pub(super) fn generic_state_write_refusal(
     conn: &Connection,
     id: &str,
-    previous: Option<SandboxState>,
+    previous: Option<SandboxStatus>,
     target: SandboxState,
 ) -> Result<Option<StateWriteGuard>> {
     if generic_writer_transition_blocked(previous, target) {
@@ -663,23 +683,13 @@ pub(super) fn generic_state_write_refusal(
     }
     let cleanup_owned = cleanup_episode(conn, id)?
         .is_some_and(|episode| !episode.completion.deletes_row() || episode.requested_at.is_some())
-        || (matches!(
-            previous,
-            Some(
-                SandboxState::Deleting
-                    | SandboxState::CleanupRequired
-                    | SandboxState::CleanupFailed
-            )
-        ) && target != SandboxState::Deleting
+        || (previous.is_some_and(|previous| {
+            previous.is_unowned(SandboxState::Deleting) || previous.is_cleanup_owned()
+        }) && target != SandboxState::Deleting
             && cleanup_intent_current(conn, id, CleanupCompletion::DeleteRow)?)
-        || (matches!(
-            previous,
-            Some(
-                SandboxState::Stopping
-                    | SandboxState::CleanupRequired
-                    | SandboxState::CleanupFailed
-            )
-        ) && matches!(
+        || (previous.is_some_and(|previous| {
+            previous.is_unowned(SandboxState::Stopping) || previous.is_cleanup_owned()
+        }) && matches!(
             target,
             SandboxState::Started
                 | SandboxState::Paused
@@ -694,10 +704,10 @@ pub(super) fn generic_state_write_refusal(
 #[must_use = "callers must distinguish an applied state write from a refused one"]
 pub enum StateWriteOutcome {
     Applied {
-        from: SandboxState,
+        from: SandboxStatus,
     },
     Refused {
-        found: SandboxState,
+        found: SandboxStatus,
         refusal: StateWriteRefusal,
     },
     Missing,
@@ -716,8 +726,7 @@ pub enum StateWriteOutcome {
 /// `IMMEDIATE` transaction, so the guard reads, the write and the job failure
 /// commit together; it never nests one.
 ///
-/// Inserts and `quarantined`, `failed`, `cleanup_required` or
-/// `cleanup_failed` targets are `InvalidQuery`. A write
+/// Inserts and `quarantined` or `failed` targets are `InvalidQuery`. A write
 /// that matches no row although the row was read in a source state is
 /// `StatementChangedRows(0)`.
 pub fn update_state_from(
@@ -728,7 +737,7 @@ pub fn update_state_from(
     if edge.from.is_empty() {
         return Err(Error::invalid_query());
     }
-    write_state_from(conn, id, edge.from.legacy(), edge.to)
+    write_state_from(conn, id, edge.from, edge.to)
 }
 
 /// [`update_state_from`] over an arbitrary from-set, for tests that sweep
@@ -737,10 +746,10 @@ pub fn update_state_from(
 pub fn update_state_from_states(
     conn: &Connection,
     id: &str,
-    from: StateSet,
+    from: impl Into<EdgeSources>,
     to: SandboxState,
 ) -> Result<StateWriteOutcome> {
-    write_state_from(conn, id, from, to)
+    write_state_from(conn, id, from.into(), to)
 }
 
 /// Stop and Delete admission's write, for
@@ -759,7 +768,7 @@ pub(super) fn write_cleanup_admission_state(
     if !matches!(target, SandboxState::Stopping | SandboxState::Deleting) {
         return Err(Error::invalid_query());
     }
-    match write_state_from(conn, id, StateSet::ALL, target)? {
+    match write_state_from(conn, id, EdgeSources::ALL, target)? {
         StateWriteOutcome::Applied { .. } => Ok(Ok(())),
         StateWriteOutcome::Refused {
             refusal: StateWriteRefusal::Guard(guard),
@@ -792,13 +801,10 @@ pub(super) fn write_cleanup_admission_state(
 fn write_state_from(
     conn: &Connection,
     id: &str,
-    from: StateSet,
+    from: EdgeSources,
     to: SandboxState,
 ) -> Result<StateWriteOutcome> {
-    // A cleanup is not a lifecycle state: only the cleanup writers record one.
-    if matches!(to, SandboxState::Quarantined | SandboxState::Failed)
-        || to.cleanup_label().is_some()
-    {
+    if matches!(to, SandboxState::Quarantined | SandboxState::Failed) {
         return Err(Error::invalid_query());
     }
     if conn.is_autocommit() {
@@ -813,15 +819,12 @@ fn write_state_from(
 fn write_state_from_in_transaction(
     conn: &Connection,
     id: &str,
-    from: StateSet,
+    from: EdgeSources,
     to: SandboxState,
 ) -> Result<StateWriteOutcome> {
-    let Some(found) = current_state_label(conn, id)? else {
+    let Some(found) = current_status(conn, id)? else {
         return Ok(StateWriteOutcome::Missing);
     };
-    let found = found.parse::<SandboxState>().map_err(|error| {
-        rusqlite::Error::FromSqlConversionFailure(0, Type::Text, Box::new(error))
-    })?;
     if let Some(guard) = generic_state_write_refusal(conn, id, Some(found), to)? {
         return Ok(StateWriteOutcome::Refused {
             found,
@@ -834,17 +837,8 @@ fn write_state_from_in_transaction(
         serde_json::to_string(&labels)
             .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
     };
-    let from_lifecycles = json_labels(
-        from.iter()
-            .filter(|state| state.cleanup_label().is_none())
-            .map(|state| state.as_str())
-            .collect(),
-    )?;
-    let from_cleanups = json_labels(
-        from.iter()
-            .filter_map(SandboxState::cleanup_label)
-            .collect(),
-    )?;
+    let from_lifecycles = json_labels(from.lifecycle.iter().map(|state| state.as_str()).collect())?;
+    let from_cleanups = json_labels(from.cleanup_labels())?;
     // The generic writer only writes lifecycle states, so it also clears a
     // cleanup state the row held; leaving a cleanup changes the status even
     // when the lifecycle under it is the target.

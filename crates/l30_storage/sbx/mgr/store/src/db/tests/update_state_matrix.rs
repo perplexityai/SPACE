@@ -20,36 +20,22 @@ use super::state_write_fixtures::{
     test_start, text,
 };
 use crate::db::{
-    CleanupCompletion, CleanupEpisodeRequestOutcome, CleanupEpisodeSpec, StateSet, StateWriteGuard,
-    StateWriteOutcome, StateWriteRefusal, begin_teardown_suspend, insert_cleanup_episode,
-    mark_suspending_quarantined, request_cleanup_episode, set_cleanup_intent, test_conn,
-    update_state_from_states,
+    CleanupCompletion, CleanupEpisodeRequestOutcome, CleanupEpisodeSpec, EdgeSources,
+    StateWriteGuard, StateWriteOutcome, StateWriteRefusal, begin_teardown_suspend,
+    insert_cleanup_episode, mark_suspending_quarantined, request_cleanup_episode,
+    set_cleanup_intent, test_conn, update_state_from_states,
 };
-use crate::state::SandboxState;
+use crate::state::{SandboxState, SandboxStatus, Teardown};
 
-/// The grids' row and column order. Wildcard-free, so a new lifecycle state
-/// does not compile until every grid has a row and a column for it.
-pub(super) const fn index(state: SandboxState) -> usize {
-    match state {
-        SandboxState::Creating => 0,
-        SandboxState::Created => 1,
-        SandboxState::Starting => 2,
-        SandboxState::Started => 3,
-        SandboxState::Stopping => 4,
-        SandboxState::Stopped => 5,
-        SandboxState::Deleting => 6,
-        SandboxState::Pausing => 7,
-        SandboxState::Paused => 8,
-        SandboxState::Resuming => 9,
-        SandboxState::Checkpointing => 10,
-        SandboxState::Suspending => 11,
-        SandboxState::Suspended => 12,
-        SandboxState::Restoring => 13,
-        SandboxState::CleanupRequired => 14,
-        SandboxState::CleanupFailed => 15,
-        SandboxState::Quarantined => 16,
-        SandboxState::Failed => 17,
-    }
+/// The grids' row and column order: [`SandboxStatus::sweep`], each lifecycle
+/// no cleanup owns and each cleanup. A cleanup is never a generic write's
+/// target, so its columns are only ever rejected.
+pub(super) fn index(state: impl Into<SandboxStatus>) -> usize {
+    let state = state.into();
+    SandboxStatus::sweep()
+        .into_iter()
+        .position(|candidate| candidate == state)
+        .unwrap()
 }
 
 /// `A` applied, `Q` blocked by quarantine, `S` superseded by cleanup
@@ -269,8 +255,6 @@ impl Receipt {
             | SandboxState::Checkpointing
             | SandboxState::Suspending
             | SandboxState::Restoring
-            | SandboxState::CleanupRequired
-            | SandboxState::CleanupFailed
             | SandboxState::Quarantined
             | SandboxState::Failed => false,
         };
@@ -291,7 +275,7 @@ impl Receipt {
 pub(super) fn seed(
     conn: &Connection,
     shape: Shape,
-    from: SandboxState,
+    from: impl Into<SandboxStatus>,
     receipt: SandboxState,
 ) -> String {
     let id = insert_row(conn, SandboxState::Paused);
@@ -309,17 +293,17 @@ pub(super) fn seed(
 /// effect; every other change is to the sandbox row.
 pub(super) fn applied_diff(
     id: &str,
-    from: SandboxState,
+    from: SandboxStatus,
     to: SandboxState,
     receipt: SandboxState,
 ) -> ExpectedDiff {
     let mut cells: Vec<(&'static str, Cell)> =
         vec![("updated_at", Cell::NowText), ("failure_reason", NULL)];
-    if from != to {
+    if !from.is_unowned(to) {
         cells.push(("state", text(to.as_str())));
         cells.push(("state_changed_at", Cell::NowText));
     }
-    if from == SandboxState::Restoring && to != SandboxState::Restoring {
+    if from.is_unowned(SandboxState::Restoring) && to != SandboxState::Restoring {
         cells.push(("restore_origin", NULL));
         cells.push(("restore_phase", NULL));
         cells.push(("restore_storage_uri", NULL));
@@ -359,11 +343,11 @@ impl Writer {
         case: &str,
         conn: &Connection,
         id: &str,
-        seeded: Option<SandboxState>,
+        seeded: Option<SandboxStatus>,
         to: SandboxState,
     ) -> Expected {
         let (observed, expected) =
-            match write_from(conn, id, StateSet::ALL, to, self.in_transaction) {
+            match write_from(conn, id, EdgeSources::ALL, to, self.in_transaction) {
                 Ok(StateWriteOutcome::Applied { from }) => (Some(from), Expected::Applied),
                 Ok(StateWriteOutcome::Refused {
                     found,
@@ -391,7 +375,7 @@ impl Writer {
 pub(super) fn write_from(
     conn: &Connection,
     id: &str,
-    from: StateSet,
+    from: EdgeSources,
     to: SandboxState,
     in_transaction: bool,
 ) -> crate::db::Result<StateWriteOutcome> {
@@ -411,7 +395,7 @@ fn check(
     case: &str,
     conn: &Connection,
     id: &str,
-    (seeded, to): (Option<SandboxState>, SandboxState),
+    (seeded, to): (Option<SandboxStatus>, SandboxState),
     expected: Expected,
     applied: ExpectedDiff,
 ) {
@@ -428,11 +412,11 @@ fn check(
 }
 
 /// Every receipt and target over a row in `from` with `shape`; callers sweep
-/// `SandboxState::all()` and `Shape::ALL` as separate tests so the cases run
-/// in parallel.
+/// `SandboxStatus::sweep()` and `Shape::ALL` as separate tests so the cases
+/// run in parallel.
 pub(super) fn sweep_lifecycle_pairs_and_cleanup_shapes(
     writer: Writer,
-    from: SandboxState,
+    from: SandboxStatus,
     shape: Shape,
 ) {
     for receipt_kind in Receipt::ALL {
@@ -441,6 +425,15 @@ pub(super) fn sweep_lifecycle_pairs_and_cleanup_shapes(
             let case = format!("{shape:?}, {receipt} receipt: {from} -> {to}");
             let conn = test_conn();
             let id = seed(&conn, shape, from, receipt);
+            let seeded = match (from.cleanup(), shape) {
+                (
+                    Some(cleanup),
+                    Shape::DeleteRowIntent
+                    | Shape::ArmedCreateEpisode
+                    | Shape::RequestedCreateEpisode,
+                ) => SandboxStatus::owned(Teardown::Deleting, cleanup),
+                _ => from,
+            };
             let expected = cell(shape.grid()[index(from)], to);
             let applied = applied_diff(&id, from, to, receipt);
             check(
@@ -448,7 +441,7 @@ pub(super) fn sweep_lifecycle_pairs_and_cleanup_shapes(
                 &case,
                 &conn,
                 &id,
-                (Some(from), to),
+                (Some(seeded), to),
                 expected,
                 applied,
             );
@@ -480,7 +473,7 @@ pub(super) fn sweep_quarantine_episode_and_missing_row(writer: Writer) {
             &case,
             &conn,
             &id,
-            (Some(SandboxState::Quarantined), to),
+            (Some(SandboxState::Quarantined.into()), to),
             cell(QUARANTINE_EPISODE, to),
             applied,
         );
@@ -503,7 +496,7 @@ pub(super) fn sweep_quarantine_episode_and_missing_row(writer: Writer) {
 #[test]
 fn every_lifecycle_state_has_one_grid_position() {
     let mut seen = [false; 18];
-    for state in SandboxState::all() {
+    for state in SandboxStatus::sweep() {
         assert!(!seen[index(state)], "{state} shares a grid position");
         seen[index(state)] = true;
     }

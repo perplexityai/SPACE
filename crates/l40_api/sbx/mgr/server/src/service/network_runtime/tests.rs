@@ -62,7 +62,8 @@ fn refresh_abandon_reason_display_is_stable() {
         "refresh abandoned: sandbox row no longer exists"
     );
     assert_eq!(
-        RefreshAbandonReason::StateCannotAuthorizeGateway(SandboxState::Deleting).to_string(),
+        RefreshAbandonReason::StateCannotAuthorizeGateway(SandboxState::Deleting.into())
+            .to_string(),
         "refresh abandoned: sandbox state deleting cannot have a live net-gateway"
     );
 }
@@ -918,7 +919,7 @@ async fn interception_recheck_answers_for_the_registered_gateway_only() {
                                 SandboxState::Stopping,
                             )
                             .unwrap(),
-                            crate::db::StateWriteOutcome::Applied { from: state }
+                            crate::db::StateWriteOutcome::Applied { from: state.into() }
                         );
                     }
                 }

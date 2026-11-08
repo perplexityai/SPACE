@@ -92,7 +92,7 @@ async fn blocking_stop_follows_a_retryable_attempt_to_durable_completion() {
             .unwrap()
             .unwrap()
             .state,
-        SandboxState::Stopped
+        SandboxStatus::from(SandboxState::Stopped)
     );
     service.shutdown_token.cancel();
     service.task_tracker.close();
@@ -343,12 +343,13 @@ async fn restarted_claim_retries_without_blocking_other_completions() {
 // nextest runs them in parallel; the test name is what identifies a failing
 // case. `rstest` is not a dependency of this crate and this split adds none.
 async fn lifecycle_and_job_completion_commit_together_and_recover(
-    initial: SandboxState,
+    initial: impl Into<SandboxStatus>,
     completion: CleanupCompletion,
     activation: Option<crate::db::ActivationKind>,
     artifact: bool,
     target: Option<SandboxState>,
 ) {
+    let initial = initial.into();
     use crate::db::ActivationKind::Restore;
     use crate::service::tests::service_tests::register_full_suspend_artifact;
     use CleanupCompletion::Quarantine;
@@ -360,7 +361,7 @@ async fn lifecycle_and_job_completion_commit_together_and_recover(
         &conn,
         &subject,
         if artifact {
-            SandboxState::Suspended
+            SandboxState::Suspended.into()
         } else {
             initial
         },
@@ -369,7 +370,13 @@ async fn lifecycle_and_job_completion_commit_together_and_recover(
         register_full_suspend_artifact(&conn, &subject);
         conn.execute(
             "UPDATE sandboxes SET state = ?1 WHERE id = ?2",
-            [initial.as_str(), &subject],
+            [
+                initial
+                    .unowned()
+                    .expect("artifact fixture has no cleanup owner")
+                    .as_str(),
+                &subject,
+            ],
         )
         .unwrap();
     }
@@ -377,7 +384,9 @@ async fn lifecycle_and_job_completion_commit_together_and_recover(
         let episode = crate::db::begin_activation(
             &conn,
             &subject,
-            initial,
+            initial
+                .unowned()
+                .expect("activation starts without a cleanup owner"),
             kind,
             Some(ExecutionGeneration::new(1).unwrap()),
             Some(SandboxActivationAttemptId::new()),
@@ -555,7 +564,7 @@ async fn lifecycle_and_job_completion_commit_together_and_recover(
         crate::db::get_sandbox(&service.db.lock().unwrap(), &subject)
             .unwrap()
             .map(|row| row.state),
-        target
+        target.map(SandboxStatus::from)
     );
     assert!(
         crate::db::cleanup_episode(&service.db.lock().unwrap(), &subject)
@@ -697,7 +706,7 @@ async fn lifecycle_commit_and_recovery_interrupted_cold_start_from_stopped() {
 #[tokio::test]
 async fn lifecycle_commit_and_recovery_cleanup_required_quarantine() {
     lifecycle_and_job_completion_commit_together_and_recover(
-        SandboxState::CleanupRequired,
+        SandboxStatus::CLEANUP_REQUIRED,
         CleanupCompletion::Quarantine,
         None,
         false,
@@ -757,7 +766,7 @@ async fn failed_job_admission_rolls_back_claim_and_preserves_emergency_teardown(
             .lookup_sandbox(&sandbox_id.to_string())
             .unwrap()
             .state,
-        SandboxState::Started
+        SandboxStatus::from(SandboxState::Started)
     );
     assert!(
         jobs::find_active_job(

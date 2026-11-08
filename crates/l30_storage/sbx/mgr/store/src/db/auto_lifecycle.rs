@@ -72,9 +72,10 @@ pub fn defer_auto_lifecycle_deadline(conn: &Connection, id: &str, until_secs: u6
 /// `Deleting` is reachable. `None` is a no-op that may always be recorded.
 pub fn auto_lifecycle_action_can_act(
     action: pplx_space_common_core::types::AutoLifecycleIdleAction,
-    state: SandboxState,
+    state: impl Into<SandboxStatus>,
 ) -> bool {
     use pplx_space_common_core::types::AutoLifecycleIdleAction as Action;
+    let state = state.into();
     match action {
         Action::None => true,
         Action::Delete => state.can_transition_to(SandboxState::Deleting),
@@ -88,10 +89,10 @@ pub fn auto_lifecycle_action_can_act(
 /// failed cross-node restore retains — every write bumps `updated_at`, the
 /// quiescence clock the cluster-deleted eviction of that row waits on,
 /// and the in-flight transition owns the row anyway.
-pub fn auto_lifecycle_state_is_settled(state: SandboxState) -> bool {
+pub fn auto_lifecycle_state_is_settled(state: impl Into<SandboxStatus>) -> bool {
     // The state machine owns the transient set; a state added there is
     // non-settled here without a second list to update.
-    !state.is_transient()
+    !state.into().is_transient()
 }
 
 db_private_outside_tests! {
@@ -135,14 +136,14 @@ db_private_outside_tests! {
             // a statement-level failure propagates. An unknown-but-decodable
             // state string is left to the transition's own lookup error.
             let state = match (row.get::<_, String>(3), row.get::<_, Option<String>>(4)) {
-                (Ok(state), Ok(cleanup)) => SandboxState::label_from_columns(state, cleanup.as_deref()),
+                (Ok(state), Ok(cleanup)) => SandboxStatus::from_columns(&state, cleanup.as_deref()),
                 (Err(error), _) | (_, Err(error)) if is_row_decode_error(&error) => {
                     tracing::warn!(rowid = row.get::<_, i64>(0)?, error = %describe_raw_error(&error), "skipping malformed auto lifecycle discovery row");
                     return Ok(None);
                 }
                 (Err(error), _) | (_, Err(error)) => return Err(Error::from(error)),
             };
-            if state.parse::<SandboxState>().ok() == Some(SandboxState::Deleting) {
+            if state.is_some_and(|state| state.is_unowned(SandboxState::Deleting)) {
                 return Ok(None);
             }
             if !(0..=now).contains(&deadline)

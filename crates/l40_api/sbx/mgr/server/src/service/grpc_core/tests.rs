@@ -73,7 +73,7 @@ async fn legacy_delete_after_durable_delete_does_not_dispatch_node_cleanup() {
     // The shim observed a live sandbox before durable deletion completed.
     assert_eq!(
         service.lookup_sandbox(&id).unwrap().state,
-        SandboxState::Started
+        SandboxStatus::from(SandboxState::Started)
     );
     {
         let db = service.db.lock().unwrap();
@@ -348,7 +348,7 @@ impl CleanupFixture {
         std::os::unix::fs::symlink(self.run_dir.path(), sandbox_dir.join("fc.pid")).unwrap();
     }
 
-    fn state(&self, id: &str) -> Option<SandboxState> {
+    fn state(&self, id: &str) -> Option<SandboxStatus> {
         crate::db::get_sandbox(&self.service.db_conn().unwrap(), id)
             .unwrap()
             .map(|row| row.state)
@@ -373,7 +373,7 @@ impl CleanupFixture {
 
     /// The sandbox kept `state` and gained no cleanup work or publication.
     fn assert_untouched(&self, id: &str, state: SandboxState, context: &str) {
-        assert_eq!(self.state(id), Some(state), "{context}");
+        assert_eq!(self.state(id), Some(state.into()), "{context}");
         assert!(
             crate::db::cleanup_episode(&self.service.db_conn().unwrap(), id)
                 .unwrap()
@@ -439,9 +439,9 @@ impl CleanupRpc {
     }
 
     /// Where a completed cleanup leaves the row.
-    fn completed_state(self) -> Option<SandboxState> {
+    fn completed_state(self) -> Option<SandboxStatus> {
         match self {
-            Self::Stop => Some(SandboxState::Stopped),
+            Self::Stop => Some(SandboxState::Stopped.into()),
             Self::Delete => None,
         }
     }
@@ -463,7 +463,7 @@ fn insert_owned_sandbox(conn: &crate::db::Connection, id: &str, owner: &str) {
             guest_image: Default::default(),
             id,
             uuid8: &SandboxRuntimeLabel::from_sandbox_id(sandbox_id),
-            state: SandboxState::Started,
+            state: SandboxState::Started.into(),
             template: "seed",
             template_hash: Some("hash"),
             user: &SandboxOwner::parse(owner.to_owned()).unwrap(),
@@ -708,7 +708,11 @@ async fn nonblocking_cleanup_returns_once_admitted_and_honors_skip_node_publish(
             let ids = within_cleanup_wait(&context, call).await;
 
             assert_eq!(ids, vec![id.clone()], "{context}");
-            assert_eq!(fixture.state(&id), Some(rpc.admitted_state()), "{context}");
+            assert_eq!(
+                fixture.state(&id),
+                Some(rpc.admitted_state().into()),
+                "{context}"
+            );
             let job = fixture
                 .active_cleanup_job(&id)
                 .unwrap_or_else(|| panic!("{context}: admitted cleanup is durable"));
@@ -986,7 +990,7 @@ fn insert_armed_pool_clone(
             guest_image: Default::default(),
             id: &id.to_string(),
             uuid8: &SandboxRuntimeLabel::from_sandbox_id(id),
-            state: SandboxState::Creating,
+            state: SandboxState::Creating.into(),
             template: "seed",
             template_hash: Some("sha256:test"),
             user: &SandboxOwner::parse(owner.to_owned()).unwrap(),
@@ -1173,7 +1177,7 @@ async fn delete_of_a_pool_clone_disposal_requires_an_operator_after_quarantine()
                 let error = result.unwrap_err();
                 assert_eq!(error.code(), code, "{}: {error}", case.name);
                 assert!(error.message().contains(message), "{}: {error}", case.name);
-                assert_eq!(fixture.state(&id), Some(held_state), "{}", case.name);
+                assert_eq!(fixture.state(&id), Some(held_state.into()), "{}", case.name);
                 assert_eq!(episode.requested_at, None, "{}", case.name);
                 assert!(fixture.active_cleanup_job(&id).is_none(), "{}", case.name);
             }

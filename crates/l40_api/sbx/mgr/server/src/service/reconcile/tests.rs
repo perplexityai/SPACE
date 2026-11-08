@@ -125,7 +125,7 @@ async fn wait_for_state(
             .lookup_sandbox(&sandbox_id.to_string())
             .expect("scheduler test sandbox exists")
             .state
-            == expected
+            .is_unowned(expected)
     })
     .await;
     assert!(reached, "sandbox {sandbox_id} did not reach {expected}");
@@ -186,7 +186,7 @@ async fn auto_lifecycle_scheduler_refreshes_due_work_before_backlog_drains() {
                 .lookup_sandbox(&sandbox_id.to_string())
                 .expect("old scheduler test sandbox exists")
                 .state
-                == SandboxState::Suspended
+                .is_unowned(SandboxState::Suspended)
         }),
         "new work must run before the old backlog drains"
     );
@@ -230,7 +230,11 @@ async fn auto_lifecycle_scheduler_preserves_storage_keys_and_drains_admitted_wor
         scheduler.await.unwrap();
         let db = service.db.lock().unwrap();
         let row = crate::db::get_sandbox(&db, &storage_id).unwrap().unwrap();
-        assert_eq!(row.state, SandboxState::Stopped, "{storage_id}");
+        assert_eq!(
+            row.state,
+            SandboxStatus::from(SandboxState::Stopped),
+            "{storage_id}"
+        );
         assert_eq!(row.auto_lifecycle_state.next_auto_event_at, None);
         if storage_id != id {
             assert!(!crate::db::sandbox_exists(&db, &id).unwrap());
@@ -338,15 +342,15 @@ async fn auto_lifecycle_error_after_row_removal_does_not_scan_inventory() {
 #[test]
 fn reconcile_entry_skips_states_that_cannot_authorize_a_gateway() {
     for state in [
-        SandboxState::Creating,
-        SandboxState::Created,
-        SandboxState::Stopped,
-        SandboxState::Suspended,
-        SandboxState::Deleting,
-        SandboxState::CleanupRequired,
-        SandboxState::CleanupFailed,
-        SandboxState::Quarantined,
-        SandboxState::Failed,
+        SandboxStatus::from(SandboxState::Creating),
+        SandboxStatus::from(SandboxState::Created),
+        SandboxStatus::from(SandboxState::Stopped),
+        SandboxStatus::from(SandboxState::Suspended),
+        SandboxState::Deleting.into(),
+        SandboxStatus::CLEANUP_REQUIRED,
+        SandboxStatus::CLEANUP_FAILED,
+        SandboxStatus::from(SandboxState::Quarantined),
+        SandboxStatus::from(SandboxState::Failed),
     ] {
         assert_eq!(
             network_policy_reconcile_entry_decision(state),
@@ -854,28 +858,29 @@ fn isolated_service(scratch: &std::path::Path) -> SandboxManagerService {
 /// transition is neither recorded nor reported as an error.
 #[tokio::test]
 async fn auto_lifecycle_stop_writes_only_over_a_still_suspended_row() {
-    for moved_to in SandboxState::all() {
+    for moved_to in SandboxStatus::sweep() {
         // Wildcard-free, so a new lifecycle state does not compile until it
         // is placed.
-        let stops = match moved_to {
-            SandboxState::Suspended => true,
-            SandboxState::Creating
-            | SandboxState::Created
-            | SandboxState::Starting
-            | SandboxState::Started
-            | SandboxState::Stopping
-            | SandboxState::Stopped
-            | SandboxState::Deleting
-            | SandboxState::Pausing
-            | SandboxState::Paused
-            | SandboxState::Resuming
-            | SandboxState::Checkpointing
-            | SandboxState::Suspending
-            | SandboxState::Restoring
-            | SandboxState::CleanupRequired
-            | SandboxState::CleanupFailed
-            | SandboxState::Quarantined
-            | SandboxState::Failed => false,
+        let stops = match moved_to.unowned() {
+            Some(SandboxState::Suspended) => true,
+            Some(
+                SandboxState::Creating
+                | SandboxState::Created
+                | SandboxState::Starting
+                | SandboxState::Started
+                | SandboxState::Stopping
+                | SandboxState::Stopped
+                | SandboxState::Deleting
+                | SandboxState::Pausing
+                | SandboxState::Paused
+                | SandboxState::Resuming
+                | SandboxState::Checkpointing
+                | SandboxState::Suspending
+                | SandboxState::Restoring
+                | SandboxState::Quarantined
+                | SandboxState::Failed,
+            )
+            | None => false,
         };
         let case = format!("moved to {moved_to}");
         let scratch = tempfile::tempdir().unwrap();
@@ -892,7 +897,11 @@ async fn auto_lifecycle_stop_writes_only_over_a_still_suspended_row() {
         let db = service.db.lock().unwrap();
         if stops {
             let row = crate::db::get_sandbox(&db, &id).unwrap().unwrap();
-            assert_eq!(row.state, SandboxState::Stopped, "{case}");
+            assert_eq!(
+                row.state,
+                SandboxStatus::from(SandboxState::Stopped),
+                "{case}"
+            );
             assert_eq!(
                 row.auto_lifecycle_state.next_auto_event_at, None,
                 "{case}: the Stop stage is recorded as fired"
@@ -948,7 +957,7 @@ async fn stop_admitted_during_auto_lifecycle_stop_keeps_its_completion() {
     )
     .unwrap();
     let row = crate::db::get_sandbox(&db, &id).unwrap().unwrap();
-    assert_eq!(row.state, SandboxState::Stopped);
+    assert_eq!(row.state, SandboxStatus::from(SandboxState::Stopped));
     assert_eq!(
         row.pid, None,
         "the Stop's completion clears the runtime it stopped"
@@ -999,7 +1008,7 @@ async fn delete_admitted_during_auto_lifecycle_stop_keeps_its_row() {
     assert_eq!(
         (row.state, row.cleanup_completion),
         (
-            SandboxState::Deleting,
+            SandboxStatus::from(SandboxState::Deleting),
             Some(crate::db::CleanupCompletion::DeleteRow)
         )
     );

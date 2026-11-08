@@ -93,7 +93,7 @@ pub(super) enum CleanupAdmissionError {
     },
     SuspendPublicationPending {
         sandbox_id: SandboxId,
-        state: SandboxState,
+        state: SandboxStatus,
     },
     AutoLifecycleDeleteBlocked {
         sandbox_id: SandboxId,
@@ -422,7 +422,7 @@ pub(super) enum CleanupDispatchDisposition {
 }
 
 pub(super) struct ObservedCleanupClaim {
-    pub(super) observed_state: SandboxState,
+    pub(super) observed_state: SandboxStatus,
     pub(super) target_state: SandboxState,
     pub(super) keep_filesystem: bool,
     pub(super) completion: CleanupCompletion,
@@ -447,7 +447,7 @@ struct CleanupAdmissionSpec {
 enum CleanupAdmissionMode {
     Unfenced,
     ObservedState {
-        state: SandboxState,
+        state: SandboxStatus,
         execution_generation: Option<Option<pplx_space_common_core::types::ExecutionGeneration>>,
     },
     ObservedExecution {
@@ -465,11 +465,10 @@ enum CleanupAdmissionMode {
 }
 
 impl CleanupAdmissionMode {
-    const fn observed_state(self) -> Option<SandboxState> {
+    const fn observed_state(self) -> Option<SandboxStatus> {
         match self {
-            Self::ObservedState { state, .. } | Self::ObservedActivation { state, .. } => {
-                Some(state)
-            }
+            Self::ObservedState { state, .. } => Some(state),
+            Self::ObservedActivation { state, .. } => Some(SandboxStatus::Unowned(state)),
             Self::Unfenced | Self::ObservedExecution { .. } | Self::AutoLifecycleDelete { .. } => {
                 None
             }
@@ -838,7 +837,7 @@ impl SandboxManagerService {
             };
             let _writer = service.state_writer_lease("RuntimeExitRecovery")?;
             let current = service.lookup_sandbox(&observed.id)?;
-            if current.state != SandboxState::Started || current.node_execution_id.is_none()
+            if !current.state.is_unowned(SandboxState::Started) || current.node_execution_id.is_none()
                 || current.node_execution_id != observed.node_execution_id
                 || current.pid != observed.pid {
                 return Ok(None);
@@ -846,7 +845,7 @@ impl SandboxManagerService {
             if !exited()? { return Ok(None); }
             let admission = service.admit_lifecycle_cleanup_fenced(sandbox_id, CleanupAdmissionSpec {
                 mode: CleanupAdmissionMode::ObservedState {
-                    state: SandboxState::Started,
+                    state: SandboxState::Started.into(),
                     execution_generation: Some(current.space_api_route_identity.execution_generation),
                 },
                 template_filter: None,
@@ -895,17 +894,20 @@ impl SandboxManagerService {
     pub(super) async fn admit_stop_for_activation(
         &self,
         sandbox_id: SandboxId,
-        state: SandboxState,
+        state: impl Into<SandboxStatus>,
         execution: pplx_space_common_core::types::SandboxActivationAttemptId,
     ) -> Result<CleanupAdmission, CleanupAdmissionError> {
         // The claim checks that the sandbox is still in `state`, so admitting
         // only a running state leaves an execution already at rest, such as
         // one the user suspended, alone.
-        if !matches!(state, SandboxState::Started | SandboxState::Paused) {
+        let observed = state.into();
+        let Some(state @ (SandboxState::Started | SandboxState::Paused)) = observed.unowned()
+        else {
+            let state = observed;
             return Err(
                 Status::aborted(format!("the execution to stop is {state}, not running")).into(),
             );
-        }
+        };
         self.admit_lifecycle_cleanup_inner(
             sandbox_id,
             CleanupAdmissionSpec {
@@ -1401,10 +1403,10 @@ impl SandboxManagerService {
         };
         let guest_flush = guest_flush.for_superseded_state(
             crate::db::read::sandbox_view(&transaction, &sandbox_id_string)
-                .current_state_label()
+                .current_status()
                 .ok()
                 .flatten()
-                .and_then(|state| state.parse().ok()),
+                .and_then(Result::ok),
         );
         match crate::db::update_state_superseding_activation_in_transaction(
             &transaction,
@@ -2838,7 +2840,7 @@ impl SandboxManagerService {
                 })?;
             request.completion == CleanupCompletion::DeleteRow
                 && crate::db::read::sandbox_view(&db, sandbox_id)
-                    .current_state_label()
+                    .current_status()
                     .map_err(|error| {
                         Status::unavailable(format!(
                             "inspect sandbox after unpersisted delete: {error}"

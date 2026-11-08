@@ -104,17 +104,17 @@ pub(super) fn ensure_sandbox_cache_root_in(
 /// runtime directory. `Quarantined` is a hold whose local evidence may be
 /// gone; skipping it here also keeps every pass from taking its cleanup fence
 /// and a write transaction. The guarded delete refuses it independently.
-pub(super) fn sandbox_state_may_lack_cache_root(state: SandboxState) -> bool {
-    matches!(
-        state,
-        SandboxState::Creating
-            | SandboxState::Created
-            | SandboxState::Suspended
-            | SandboxState::Restoring
-            | SandboxState::CleanupRequired
-            | SandboxState::CleanupFailed
-            | SandboxState::Quarantined
-    )
+pub(super) fn sandbox_state_may_lack_cache_root(state: impl Into<SandboxStatus>) -> bool {
+    let state = state.into();
+    state.is_cleanup_owned()
+        || matches!(
+            state.lifecycle(),
+            SandboxState::Creating
+                | SandboxState::Created
+                | SandboxState::Suspended
+                | SandboxState::Restoring
+                | SandboxState::Quarantined
+        )
 }
 
 fn sandbox_ids_to_strings(ids: impl IntoIterator<Item = SandboxId>) -> Vec<String> {
@@ -579,7 +579,7 @@ fn insert_orphaned_sandbox_row_in_transaction(
                         guest_image: Default::default(),
                         id: &sandbox_id_string,
                         uuid8: &uuid8,
-                        state: SandboxState::Quarantined,
+                        state: SandboxState::Quarantined.into(),
                         template: ORPHANED_SANDBOX_TEMPLATE,
                         template_hash: None,
                         user: &ORPHANED_SANDBOX_OWNER,
@@ -617,7 +617,7 @@ fn insert_orphaned_sandbox_row_in_transaction(
             guest_image: Default::default(),
             id: &sandbox_id_string,
             uuid8: &uuid8,
-            state: SandboxState::CleanupRequired,
+            state: crate::db::InsertedStatus::StoppingCleanup(CleanupState::Required),
             template: ORPHANED_SANDBOX_TEMPLATE,
             template_hash: None,
             user: &ORPHANED_SANDBOX_OWNER,

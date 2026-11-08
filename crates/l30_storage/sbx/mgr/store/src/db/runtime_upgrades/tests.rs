@@ -57,7 +57,7 @@ fn begin(
     let row = get_sandbox(conn, sandbox_id).unwrap();
     let observed = row.as_ref().map_or(
         ObservedSandbox {
-            state: SandboxState::Stopped,
+            state: SandboxState::Stopped.into(),
             current_local_artifact_id: None,
             execution: None,
         },
@@ -140,7 +140,7 @@ fn begin_fences_a_suspended_sandbox_and_records_the_pair_it_keeps() {
     );
     // Fencing changes nothing on the sandbox itself.
     let row = get_sandbox(&conn, &id).unwrap().unwrap();
-    assert_eq!(row.state, SandboxState::Suspended);
+    assert_eq!(row.state, SandboxStatus::from(SandboxState::Suspended));
     assert_eq!(row.execution_metadata, Some(envs.source));
     assert_eq!(row.current_local_artifact_id, Some(artifact));
 }
@@ -174,7 +174,7 @@ fn begin_refuses_everything_that_already_owns_the_sandbox() {
         let id = sandbox(&conn, state, &envs.source);
         assert_eq!(
             begin(&conn, operation(), &id, envs.target_reference, true),
-            BeginRuntimeUpgrade::UnsupportedState(state),
+            BeginRuntimeUpgrade::UnsupportedState(state.into()),
             "{state}"
         );
         assert_eq!(unsettled_runtime_upgrades(&conn).unwrap(), vec![]);
@@ -261,7 +261,7 @@ fn the_fence_refuses_a_concurrent_resume_and_cold_start_without_touching_the_row
             );
         }
         let after = get_sandbox(&conn, &id).unwrap().unwrap();
-        assert_eq!(after.state, SandboxState::Suspended);
+        assert_eq!(after.state, SandboxStatus::from(SandboxState::Suspended));
         assert_eq!(after.cleanup_completion, None);
         assert_eq!(after.node_execution_id, before.node_execution_id);
         assert!(cleanup_episode(&conn, &id).unwrap().is_none());
@@ -331,7 +331,7 @@ fn only_the_fencing_upgrade_in_its_booting_phase_passes_its_own_fence() {
     assert_eq!(episode.completion, CleanupCompletion::MarkStopped);
     assert_eq!(
         get_sandbox(&conn, &id).unwrap().unwrap().state,
-        SandboxState::Starting
+        SandboxStatus::from(SandboxState::Starting)
     );
 }
 
@@ -359,7 +359,7 @@ fn an_upgrade_activation_without_a_fence_is_refused() {
     ));
     assert_eq!(
         get_sandbox(&conn, &id).unwrap().unwrap().state,
-        SandboxState::Stopped
+        SandboxStatus::from(SandboxState::Stopped)
     );
 }
 
@@ -1113,7 +1113,7 @@ fn an_activation_decided_on_an_execution_refuses_a_sandbox_moved_off_it() {
     );
     assert_eq!(
         get_sandbox(&conn, &id).unwrap().unwrap().state,
-        SandboxState::Stopped
+        SandboxStatus::from(SandboxState::Stopped)
     );
 
     let claimed = begin_activation_with_route_evidence(
@@ -1128,6 +1128,6 @@ fn an_activation_decided_on_an_execution_refuses_a_sandbox_moved_off_it() {
     assert!(claimed.is_ok(), "{claimed:?}");
     assert_eq!(
         get_sandbox(&conn, &id).unwrap().unwrap().state,
-        SandboxState::Starting
+        SandboxStatus::from(SandboxState::Starting)
     );
 }

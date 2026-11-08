@@ -332,7 +332,7 @@ async fn create_intent_preserves_immutables_independently_of_pool_occupancy() {
                     guest_image: Default::default(),
                     id: &donor.to_string(),
                     uuid8: &SandboxRuntimeLabel::from_sandbox_id(donor),
-                    state: SandboxState::Paused,
+                    state: SandboxState::Paused.into(),
                     template: "seed",
                     template_hash: None,
                     user: &SandboxOwner::parse("user").unwrap(),
@@ -628,7 +628,7 @@ async fn retained_rootfs_inspection_errors_defer_recovery_without_selecting_temp
             assert_eq!(record.outcome, expected, "{failure:?}");
         }
         let deferred = service.lookup_sandbox(&id).unwrap();
-        assert_eq!(deferred.state, SandboxState::Starting);
+        assert_eq!(deferred.state, SandboxStatus::from(SandboxState::Starting));
         assert_eq!(deferred.execution_metadata, row.execution_metadata);
         // Repair only the invalid fixture, then retry the same startup pass.
         std::fs::remove_file(&instance).unwrap();
@@ -755,7 +755,10 @@ async fn retained_instance_permission_recovery_and_repair_preserve_disk() {
                 assert_eq!(record.outcome, expected);
             }
             let deferred = service.lookup_sandbox(&id).unwrap();
-            assert_eq!(deferred.state, crate::state::SandboxState::Starting);
+            assert_eq!(
+                deferred.state,
+                SandboxStatus::from(crate::state::SandboxState::Starting)
+            );
             assert_eq!(deferred.execution_metadata, row.execution_metadata);
             let repair_dir = instance.clone();
             let expected_id = id.clone();

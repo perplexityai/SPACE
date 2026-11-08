@@ -136,7 +136,7 @@ impl SandboxManagerService {
                     "access deadline execution changed",
                 ));
             }
-            if sandbox.state != SandboxState::Started {
+            if !sandbox.state.is_unowned(SandboxState::Started) {
                 return Err(Status::failed_precondition(
                     "access deadline requires started execution",
                 ));
@@ -200,7 +200,7 @@ impl SandboxManagerService {
         }
         let mut runtime_state = sandbox.auto_lifecycle_state.clone();
         let mut touched = false;
-        let result = if sandbox.state != SandboxState::Started {
+        let result = if !sandbox.state.is_unowned(SandboxState::Started) {
             recompute_runtime_state(&mut runtime_state, &sandbox.auto_lifecycle);
             crate::proto::AutoLifecycleTouchResult::NotStarted
         } else if sandbox.auto_lifecycle.is_disabled() {

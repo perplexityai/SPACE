@@ -3,6 +3,7 @@
 //! own case, every refusal starting from a row the write would otherwise change.
 
 use crate::db::Connection;
+use crate::state::SandboxStatus;
 use pplx_space_common_core::types::{
     LocalArtifactId, RuntimeKind, SandboxCleanupEpisodeId, SandboxId, SandboxQuarantineNextAction,
     SandboxQuarantineReasonCode, SandboxQuarantineSource, TransferScopeId,
@@ -61,7 +62,7 @@ fn checkpoint_rollback_requires_a_checkpointing_row_and_a_resident_target() {
             );
             assert_eq!(
                 get_sandbox(&conn, &id).unwrap().unwrap().state,
-                target,
+                SandboxStatus::from(target),
                 "{case}"
             );
         } else {
@@ -73,13 +74,13 @@ fn checkpoint_rollback_requires_a_checkpointing_row_and_a_resident_target() {
             );
         }
     }
-    for state in SandboxState::all() {
-        if state == SandboxState::Checkpointing {
+    for state in SandboxStatus::sweep() {
+        if state.is_unowned(SandboxState::Checkpointing) {
             continue;
         }
         let id = insert_row(&conn, state);
         refuses(
-            state.as_str(),
+            state.legacy_label(),
             &conn,
             || restore_checkpoint_state(&conn, &id, SandboxState::Started),
             |result| matches!(result, Ok(false)),
@@ -294,7 +295,7 @@ fn activation_supersession_retires_the_episode_before_the_generic_write() {
 
 /// A resident row as startup recovery observes it: a failure reason and an
 /// activation receipt for `started`, with backdated timestamps.
-fn insert_resident(conn: &Connection, state: SandboxState) -> String {
+fn insert_resident(conn: &Connection, state: impl Into<SandboxStatus>) -> String {
     let id = insert_row(conn, state);
     decorate(conn, &id, SandboxState::Started);
     id
@@ -373,13 +374,15 @@ fn startup_resident_settlement_writes_the_observed_outcome() {
 #[test]
 fn startup_resident_settlement_refuses_any_change_to_the_observed_row() {
     let conn = test_conn();
-    for state in SandboxState::all() {
+    for state in SandboxStatus::sweep() {
         if matches!(
-            state,
-            SandboxState::Started
-                | SandboxState::Paused
-                | SandboxState::Resuming
-                | SandboxState::Checkpointing
+            state.unowned(),
+            Some(
+                SandboxState::Started
+                    | SandboxState::Paused
+                    | SandboxState::Resuming
+                    | SandboxState::Checkpointing
+            )
         ) {
             continue;
         }
@@ -583,7 +586,7 @@ fn startup_resident_settlement_refuses_any_change_to_the_observed_row() {
 fn restore_into(
     conn: &Connection,
     id: &str,
-    state: SandboxState,
+    state: impl Into<SandboxStatus>,
 ) -> Result<(), RestoreAdoptOrphanInsertError> {
     let source = restore_source();
     with_sandbox_params(
@@ -664,8 +667,8 @@ fn orphan_restore_adoption_rewrites_only_a_synthetic_orphan() {
     );
 
     let conn = test_conn();
-    for state in SandboxState::all() {
-        if state == SandboxState::Restoring {
+    for state in SandboxStatus::sweep() {
+        if state.is_unowned(SandboxState::Restoring) {
             continue;
         }
         let id = insert_synthetic_orphan(&conn);
@@ -685,17 +688,19 @@ fn orphan_restore_adoption_rewrites_only_a_synthetic_orphan() {
     let mut perturbations: Vec<(String, String)> = SandboxState::all()
         .into_iter()
         .filter(|state| !matches!(state, SandboxState::Quarantined | SandboxState::Restoring))
+        .map(SandboxStatus::from)
+        .chain([SandboxStatus::CLEANUP_REQUIRED, SandboxStatus::CLEANUP_FAILED])
         .map(|state| {
             // A cleanup-owned status is stored as its lifecycle plus the
             // cleanup over it.
             let cleanup_state = state
-                .cleanup_label()
-                .map_or_else(|| "NULL".to_owned(), |label| format!("'{label}'"));
+                .cleanup()
+                .map_or_else(|| "NULL".to_owned(), |cleanup| format!("'{}'", cleanup.as_str()));
             (
                 format!("orphan in {state}"),
                 format!(
                     "UPDATE sandboxes SET state = '{}', cleanup_state = {cleanup_state} WHERE id = ?1",
-                    state.inserted_lifecycle()
+                    state.lifecycle().as_str()
                 ),
             )
         })
@@ -938,14 +943,14 @@ fn quarantine_adoption_binds_the_quarantined_full_suspend_pin_and_generation() {
     // rest of the shape, and no restore columns, so only the state guard can
     // refuse it.
     let conn = test_conn();
-    for state in SandboxState::all() {
-        if state == SandboxState::Quarantined {
+    for state in SandboxStatus::sweep() {
+        if state.is_unowned(SandboxState::Quarantined) {
             continue;
         }
         let (id, _, claimed) = insert_claimed_adoptable(&conn);
         crate::db::test_fixtures::state_write_fixtures::write_status(&conn, &id, state);
         refuses(
-            state.as_str(),
+            state.legacy_label(),
             &conn,
             || adopt(&conn, &claimed, &id),
             |outcome| *outcome == QuarantineAdoptionOutcome::FenceChanged,

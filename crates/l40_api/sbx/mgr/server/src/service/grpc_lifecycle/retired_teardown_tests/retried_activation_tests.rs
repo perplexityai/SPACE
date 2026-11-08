@@ -157,7 +157,7 @@ fn rolled_back_restore(
         .expect("the rollback completes");
     assert_eq!(
         crate::db::get_sandbox(&conn, &id).unwrap().unwrap().state,
-        SandboxState::Suspended
+        crate::state::SandboxStatus::from(SandboxState::Suspended)
     );
     let view = crate::db::read::sandbox_view(&conn, &id);
     assert!(
@@ -296,7 +296,7 @@ async fn a_retried_checkpoint_restore_of_a_retired_execution_is_refused_before_s
         }
         assert_eq!(
             service.lookup_sandbox(&id).unwrap().state,
-            SandboxState::Suspended
+            crate::state::SandboxStatus::from(SandboxState::Suspended)
         );
         let _staging = Arc::clone(&service.auto_lifecycle.staging_lock(&id))
             .lock_owned()
@@ -508,7 +508,7 @@ async fn a_retry_waiting_on_a_rollback_cleanup_sees_its_receipt() {
             crate::db::InsertSandboxParams {
                 id: &id,
                 uuid8: &SandboxRuntimeLabel::from_sandbox_id(sandbox_id),
-                state: SandboxState::Suspended,
+                state: SandboxState::Suspended.into(),
                 template: "active-template",
                 template_hash: Some(&template_hash.to_string()),
                 user: &SandboxOwner::parse("user").unwrap(),
@@ -673,7 +673,7 @@ async fn a_retry_waiting_on_a_rollback_cleanup_sees_its_receipt() {
         );
         assert_eq!(
             service.lookup_sandbox(&id).unwrap().state,
-            SandboxState::Suspended
+            crate::state::SandboxStatus::from(SandboxState::Suspended)
         );
         service.shutdown_token.cancel();
         service.task_tracker.close();

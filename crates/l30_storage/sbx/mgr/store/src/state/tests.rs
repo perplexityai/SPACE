@@ -1,4 +1,5 @@
 use super::SandboxState::{self, *};
+use super::{CleanupState, SandboxStatus, Teardown};
 
 #[test]
 fn pause_admission_retries_in_flight_lifecycle_but_rejects_invalid_stable_states() {
@@ -93,7 +94,10 @@ fn quarantined_can_transition_only_to_itself_or_deleting() {
 /// quarantine, and required and failed are cleanup edges, not admissions.
 #[test]
 fn a_cleanup_owned_row_admits_only_delete_and_quarantine() {
-    for owned in [CleanupRequired, CleanupFailed] {
+    for owned in SandboxStatus::all()
+        .into_iter()
+        .filter(|status| status.is_cleanup_owned())
+    {
         for target in SandboxState::all() {
             assert_eq!(
                 owned.can_transition_to(target),
@@ -244,23 +248,63 @@ fn failed_is_readable_and_only_explicit_deletion_can_exit_it() {
     }
 }
 
+/// An event carries the lifecycle in `from_state`/`to_state` and the cleanup
+/// that owns the row beside it.
 #[test]
-fn status_event_details_carry_the_cleanup_each_status_folds_in() {
+fn status_event_details_carry_the_lifecycle_beside_the_cleanup() {
     use pplx_space_events::SandboxEventDetails;
 
     use super::SandboxStatusEventDetails;
 
     for (status, cleanup_state) in [
-        (SandboxState::Stopping, "none"),
-        (SandboxState::CleanupRequired, "required"),
-        (SandboxState::CleanupFailed, "failed"),
+        (SandboxStatus::from(Stopping), "none"),
+        (SandboxStatus::CLEANUP_REQUIRED, "required"),
+        (
+            SandboxStatus::owned(Teardown::Deleting, CleanupState::Failed),
+            "failed",
+        ),
     ] {
         let details = SandboxEventDetails::default()
             .with_from_status(status)
             .with_to_status(status);
-        assert_eq!(details.from_state.as_deref(), Some(status.as_str()));
-        assert_eq!(details.to_state.as_deref(), Some(status.as_str()));
+        let lifecycle = Some(status.lifecycle().as_str());
+        assert_eq!(details.from_state.as_deref(), lifecycle);
+        assert_eq!(details.to_state.as_deref(), lifecycle);
         assert_eq!(details.from_cleanup_state.as_deref(), Some(cleanup_state));
         assert_eq!(details.to_cleanup_state.as_deref(), Some(cleanup_state));
+    }
+}
+
+/// A status reads as a lifecycle only while no cleanup owns the row, and the
+/// readers that decide from a status answer a cleanup as they did the
+/// combined status.
+#[test]
+fn a_cleanup_owned_status_is_no_lifecycle() {
+    for status in SandboxStatus::all() {
+        let Some(cleanup) = status.cleanup() else {
+            assert_eq!(status, SandboxStatus::from(status.lifecycle()), "{status}");
+            assert_eq!(status.unowned(), Some(status.lifecycle()), "{status}");
+            continue;
+        };
+        assert!(!status.is_unowned(status.lifecycle()), "{status}");
+        assert_eq!(status.unowned(), None, "{status}");
+        assert_eq!(
+            status.completes_wait(),
+            cleanup == CleanupState::Failed,
+            "{status}"
+        );
+        assert!(!status.is_transient(), "{status}");
+        assert!(!status.can_authorize_net_gateway(), "{status}");
+        assert!(!status.holds_runtime_outside_suspend(), "{status}");
+        assert!(
+            status.holds_parent_referencing_instance_subvolume(),
+            "{status}"
+        );
+        assert!(!status.guest_bridge_reachable(), "{status}");
+        assert_eq!(
+            status.legacy_label(),
+            format!("cleanup_{}", cleanup.as_str()),
+            "{status}"
+        );
     }
 }

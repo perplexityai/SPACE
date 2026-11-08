@@ -9,7 +9,7 @@ fn completed_suspend_retry_response(
     blocking: bool,
     requested_format: pplx_space_sbx_mgr_client::proto::SuspendSnapshotFormat,
 ) -> Result<Option<SuspendResponse>, Status> {
-    if sandbox.state != SandboxState::Suspended
+    if !sandbox.state.is_unowned(SandboxState::Suspended)
         || sandbox.current_local_artifact_kind != Some(ArtifactKind::Full)
         || sandbox.current_local_artifact_origin != Some(ArtifactOrigin::Suspend)
     {
@@ -333,7 +333,7 @@ impl SandboxManagerService {
         );
 
         // Auto-pause if started
-        if sandbox.state == SandboxState::Started {
+        if sandbox.state.is_unowned(SandboxState::Started) {
             let pause_started_at = std::time::Instant::now();
             let mut node_client = connect_node(&self.node_manager).await.map_err(|e| {
                 crate::metrics::snapshot::create_failed(
@@ -421,13 +421,13 @@ impl SandboxManagerService {
                 self.watchdog.record_lifecycle_edge(&sandbox.id).await;
                 // Report the state the row was left in. A missing row is never
                 // a rejection here: its rollback reads as `started`.
-                let pause_state = match pause_result {
-                    Ok(state) => state,
+                let pause_state: SandboxStatus = match pause_result {
+                    Ok(state) => state.into(),
                     Err(
                         StateWriteRejected::FromState { found }
                         | StateWriteRejected::Guard { found, .. },
                     ) => found,
-                    Err(StateWriteRejected::Missing) => SandboxState::Started,
+                    Err(StateWriteRejected::Missing) => SandboxState::Started.into(),
                 };
                 let reason = format!("auto-pause failed; sandbox reconciled to {pause_state}");
                 crate::metrics::snapshot::create_failed(
@@ -466,7 +466,7 @@ impl SandboxManagerService {
                 "pause",
                 pause_started_at,
             );
-        } else if sandbox.state != SandboxState::Paused {
+        } else if !sandbox.state.is_unowned(SandboxState::Paused) {
             crate::metrics::snapshot::create_failed(
                 create_kind,
                 context.create_codec,
@@ -482,7 +482,7 @@ impl SandboxManagerService {
             // suspend forever, so the failed branch must render that exact
             // phrase. Reference the shared constant rather than re-typing the
             // literal so a reword stays in lockstep with the consumer.
-            let error = if sandbox.state == SandboxState::Failed {
+            let error = if sandbox.state.is_unowned(SandboxState::Failed) {
                 format!(
                     "cannot suspend: {}",
                     pplx_space_common_core::node_drain_signals::SUSPEND_SANDBOX_FAILED_MARKER

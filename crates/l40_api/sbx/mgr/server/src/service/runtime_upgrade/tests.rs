@@ -163,8 +163,10 @@ impl RuntimeUpgradeEffects for Arc<Fake> {
             .unwrap()
             .unwrap();
         assert!(
-            matches!(row.state, SandboxState::Stopped | SandboxState::Suspended)
-                && row.cleanup_completion.is_none(),
+            matches!(
+                row.state.unowned(),
+                Some(SandboxState::Stopped | SandboxState::Suspended)
+            ) && row.cleanup_completion.is_none(),
             "restore ran while the sandbox was {}",
             row.state
         );
@@ -218,7 +220,7 @@ impl RuntimeUpgradeEffects for Arc<Fake> {
                 Some(&*self.resolved.lock().unwrap())
             );
             // A concurrent resume can't claim the sandbox mid-move.
-            let kinds: &[ActivationKind] = if row.state == SandboxState::Suspended {
+            let kinds: &[ActivationKind] = if row.state.is_unowned(SandboxState::Suspended) {
                 &[ActivationKind::Restore, ActivationKind::ColdStart]
             } else {
                 &[ActivationKind::ColdStart]
@@ -229,7 +231,7 @@ impl RuntimeUpgradeEffects for Arc<Fake> {
                         crate::db::test_fixtures::begin_activation(
                             &db,
                             &sandbox_id,
-                            row.state,
+                            row.state.lifecycle(),
                             kind,
                             None,
                             None,
@@ -244,7 +246,7 @@ impl RuntimeUpgradeEffects for Arc<Fake> {
             let episode = crate::db::begin_activation_with_route_evidence(
                 &db,
                 &sandbox_id,
-                row.state,
+                row.state.lifecycle(),
                 ActivationKind::ColdStart,
                 None,
                 None,
@@ -255,7 +257,7 @@ impl RuntimeUpgradeEffects for Arc<Fake> {
             )
             .map_err(|error| begin_activation_status(error, "claim"))?
             .expect("the upgrade's own boot claims the sandbox");
-            (row.state, episode.id)
+            (row.state.lifecycle(), episode.id)
         };
         *self.instance.lock().unwrap() = "disk written by the new boot".into();
         match boot {
@@ -490,7 +492,7 @@ impl Harness {
         assert!(self.fake.checkpoint_present.load(Ordering::SeqCst));
         assert_eq!(*self.fake.preserved.lock().unwrap(), None);
         let row = self.row();
-        assert_eq!(row.state, state);
+        assert_eq!(row.state, SandboxStatus::from(state));
         assert_eq!(row.execution_metadata, Some(self.envs.source.clone()));
         assert_eq!(row.current_local_artifact_id, self.checkpoint_artifact);
         assert_eq!(self.fence(), None);
@@ -545,7 +547,7 @@ async fn a_suspended_sandbox_boots_on_the_target_and_retires_its_checkpoint() {
         ]
     );
     let row = h.row();
-    assert_eq!(row.state, SandboxState::Started);
+    assert_eq!(row.state, SandboxStatus::from(SandboxState::Started));
     assert_eq!(row.execution_metadata, Some(h.envs.target.clone()));
     assert!(!h.fake.checkpoint_present.load(Ordering::SeqCst));
     assert_eq!(*h.fake.preserved.lock().unwrap(), None);
@@ -580,7 +582,7 @@ async fn a_stopped_sandbox_upgrade_ends_stopped_when_asked() {
             "stop"
         ]
     );
-    assert_eq!(h.row().state, SandboxState::Stopped);
+    assert_eq!(h.row().state, SandboxStatus::from(SandboxState::Stopped));
     assert_eq!(h.row().execution_metadata, Some(h.envs.target.clone()));
 }
 
@@ -1061,7 +1063,7 @@ async fn an_upgrade_never_stops_an_execution_it_did_not_boot() {
             ["retire", "discard"],
             "{reach_target}"
         );
-        assert_eq!(h.row().state, SandboxState::Started);
+        assert_eq!(h.row().state, SandboxStatus::from(SandboxState::Started));
     }
 }
 
@@ -1194,7 +1196,7 @@ async fn a_failed_boot_auto_lifecycle_then_stops_still_rolls_back() {
     assert_eq!(h.fake.instance(), "old disk");
     assert_eq!(h.fence(), None);
     let row = h.row();
-    assert_eq!(row.state, SandboxState::Stopped);
+    assert_eq!(row.state, SandboxStatus::from(SandboxState::Stopped));
     assert_eq!(row.execution_metadata, Some(h.envs.source.clone()));
 }
 
@@ -1264,7 +1266,7 @@ async fn a_must_end_stopped_upgrade_waits_out_a_checkpoint_of_its_boot() {
         .upgrade(h.request(operation_id, RuntimeUpgradeTargetState::Stopped))
         .await
         .unwrap();
-    assert_eq!(h.row().state, SandboxState::Stopped);
+    assert_eq!(h.row().state, SandboxStatus::from(SandboxState::Stopped));
     assert!(h.fake.calls().contains(&"stop"));
 }
 
@@ -1529,7 +1531,7 @@ async fn a_replay_of_a_retired_upgrade_leaves_a_later_execution_alone() {
         .upgrade(h.request(operation_id, RuntimeUpgradeTargetState::Stopped))
         .await
         .unwrap();
-    assert_eq!(h.row().state, SandboxState::Stopped);
+    assert_eq!(h.row().state, SandboxStatus::from(SandboxState::Stopped));
     // The user starts the upgraded sandbox; then the caller replays.
     h.db.lock()
         .unwrap()
@@ -1548,7 +1550,7 @@ async fn a_replay_of_a_retired_upgrade_leaves_a_later_execution_alone() {
 
     assert!(matches!(outcome, RuntimeUpgradeOutcome::Replayed));
     assert!(h.fake.calls()[before..].is_empty());
-    assert_eq!(h.row().state, SandboxState::Started);
+    assert_eq!(h.row().state, SandboxStatus::from(SandboxState::Started));
 }
 
 #[tokio::test]
@@ -1596,7 +1598,7 @@ async fn a_verified_upgrade_that_must_end_stopped_retires_only_once_stopped() {
         h.fake.calls()[before..],
         ["retire", "discard", "retire", "discard", "stop"]
     );
-    assert_eq!(h.row().state, SandboxState::Stopped);
+    assert_eq!(h.row().state, SandboxStatus::from(SandboxState::Stopped));
 
     // Once stopped by anyone, recovery retires it.
     let h = harness(SandboxState::Stopped);
@@ -1611,7 +1613,7 @@ async fn a_verified_upgrade_that_must_end_stopped_retires_only_once_stopped() {
         h.upgrader.settle(&record, false).await.unwrap(),
         Settled::Retired
     );
-    assert_eq!(h.row().state, SandboxState::Stopped);
+    assert_eq!(h.row().state, SandboxStatus::from(SandboxState::Stopped));
 }
 
 mod service {
@@ -1733,7 +1735,11 @@ mod service {
                 "{error}"
             );
             let row = service.lookup_sandbox(&sandbox_id).unwrap();
-            assert_eq!(row.state, state, "the row must not move");
+            assert_eq!(
+                row.state,
+                SandboxStatus::from(state),
+                "the row must not move"
+            );
             assert_eq!(row.current_local_artifact_id, None);
         }
     }

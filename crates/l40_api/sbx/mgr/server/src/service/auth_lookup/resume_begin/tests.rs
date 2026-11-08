@@ -32,14 +32,14 @@ use crate::service::start_support::{
     LimitedActivationKind, REQUESTED_VM_ACTIVATIONS,
 };
 use crate::service::{SandboxManagerService, SandboxManagerServiceOptions};
-use crate::state::SandboxState;
+use crate::state::{SandboxState, SandboxStatus};
 
 const WAIT: Duration = Duration::from_secs(30);
 
 /// What the resume's write finds.
 #[derive(Clone, Copy, Debug)]
 enum Found {
-    State(SandboxState),
+    State(SandboxStatus),
     /// The row was deleted.
     Missing,
 }
@@ -67,14 +67,18 @@ fn expected(found: Found) -> Expected {
         Found::Missing => return not_applied("missing"),
         Found::State(state) => state,
     };
-    match state {
+    // The generic guards refuse a row a cleanup owns before the from-set is
+    // consulted, as they do a stop or a delete.
+    if state.is_cleanup_owned() {
+        return not_applied("superseded_by_cleanup_episode");
+    }
+    match state.lifecycle() {
         SandboxState::Paused => Expected::Resumes,
         // The generic guards refuse these before the from-set is consulted,
         // with the messages a resume reported before it had a from-set.
-        SandboxState::Stopping
-        | SandboxState::Deleting
-        | SandboxState::CleanupRequired
-        | SandboxState::CleanupFailed => not_applied("superseded_by_cleanup_episode"),
+        SandboxState::Stopping | SandboxState::Deleting => {
+            not_applied("superseded_by_cleanup_episode")
+        }
         SandboxState::Quarantined => not_applied("blocked_by_quarantine"),
         // The generic guards admit these; only the from-set refuses them.
         SandboxState::Creating
@@ -105,7 +109,7 @@ fn insert_paused_pool_member(conn: &crate::db::Connection, sandbox_id: SandboxId
             guest_image: Default::default(),
             id: &id,
             uuid8: &SandboxRuntimeLabel::from_sandbox_id(sandbox_id),
-            state: SandboxState::Paused,
+            state: SandboxState::Paused.into(),
             template: "seed",
             template_hash: Some("hash"),
             user: &SandboxOwner::parse("user").unwrap(),
@@ -162,13 +166,15 @@ fn move_row(conn: &crate::db::Connection, id: &str, found: Found) {
         }
         Found::State(state) => state,
     };
-    match state {
-        SandboxState::Paused => {}
-        SandboxState::Stopped => crate::db::test_fixtures::state_write_fixtures::stop(conn, id),
-        SandboxState::CleanupRequired | SandboxState::CleanupFailed => {
+    match state.unowned() {
+        Some(SandboxState::Paused) => {}
+        Some(SandboxState::Stopped) => {
+            crate::db::test_fixtures::state_write_fixtures::stop(conn, id)
+        }
+        None => {
             crate::db::test_fixtures::state_write_fixtures::write_status(conn, id, state);
         }
-        state => {
+        Some(state) => {
             // The schema ties the restore columns to `restoring`.
             conn.execute(
                 "UPDATE sandboxes
@@ -189,7 +195,7 @@ fn move_row(conn: &crate::db::Connection, id: &str, found: Found) {
 /// answered differently.
 #[tokio::test]
 async fn policy_free_resume_writes_resuming_only_over_paused() {
-    let cases = SandboxState::all()
+    let cases = SandboxStatus::sweep()
         .into_iter()
         .map(Found::State)
         .chain([Found::Missing]);

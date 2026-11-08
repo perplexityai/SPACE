@@ -32,7 +32,7 @@ impl StartupRecoveryOutcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StartupRecoveryRecord {
     pub id: String,
-    pub previous_state: SandboxState,
+    pub previous_state: SandboxStatus,
     pub outcome: StartupRecoveryOutcome,
 }
 
@@ -55,11 +55,13 @@ pub fn settle_startup_resident(
     settlement: StartupResidentSettlement<'_>,
 ) -> Result<bool> {
     if !matches!(
-        observed.state,
-        SandboxState::Started
-            | SandboxState::Paused
-            | SandboxState::Resuming
-            | SandboxState::Checkpointing
+        observed.state.unowned(),
+        Some(
+            SandboxState::Started
+                | SandboxState::Paused
+                | SandboxState::Resuming
+                | SandboxState::Checkpointing
+        )
     ) {
         return Err(Error::invalid_query());
     }
@@ -130,7 +132,7 @@ pub fn settle_startup_resident(
             &tx,
             &QuarantineEpisode {
                 sandbox_id: &observed.id,
-                entered_from_state: Some(observed.state.as_str()),
+                entered_from_state: Some(observed.state.legacy_label()),
                 source: SandboxQuarantineSource::SbxManager,
                 reason_code,
                 reason_message: Some(message),
@@ -144,7 +146,7 @@ pub fn settle_startup_resident(
         StartupResidentSettlement::Quarantined { reason_code, .. } => {
             emit_sandbox_quarantined_event(
                 &observed.id,
-                Some(observed.state.as_str()),
+                Some(Ok(observed.state)),
                 reason_code,
                 "startup_resident_recovery",
                 error,
@@ -154,7 +156,7 @@ pub fn settle_startup_resident(
             emit_sandbox_state_event(
                 &observed.id,
                 SandboxEventType::LifecycleConverged,
-                Some(observed.state.as_str()),
+                Some(Ok(observed.state)),
                 reason,
                 "startup_resident_recovery",
                 target,
@@ -174,7 +176,16 @@ db_private_outside_tests! {
             return Some((keep_filesystem, completion));
         }
 
-        match row.state {
+        let lifecycle = match row.state.cleanup() {
+            // A cleanup without a current intent: a required one is
+            // quarantined, and a failed one is only while it holds runtime.
+            Some(CleanupState::Required) => return Some((true, CleanupCompletion::Quarantine)),
+            Some(CleanupState::Failed) => {
+                return sandbox_has_runtime_fields(row).then_some((true, CleanupCompletion::Quarantine));
+            }
+            None => row.state.lifecycle(),
+        };
+        match lifecycle {
             // Transient cleanup states represent an unfinished lifecycle operation.
             // Finish them even if runtime fields were already cleared when the
             // target terminal state is self-contained. Suspending is stricter:
@@ -187,15 +198,11 @@ db_private_outside_tests! {
             }
             SandboxState::Suspending => None,
             SandboxState::Deleting => Some((false, CleanupCompletion::DeleteRow)),
-            SandboxState::CleanupRequired => Some((true, CleanupCompletion::Quarantine)),
             SandboxState::Starting if sandbox_has_runtime_fields(row) => {
                 Some((true, CleanupCompletion::MarkStopped))
             }
             SandboxState::Restoring if sandbox_has_runtime_fields(row) => {
                 Some((true, CleanupCompletion::MarkSuspended))
-            }
-            SandboxState::CleanupFailed if sandbox_has_runtime_fields(row) => {
-                Some((true, CleanupCompletion::Quarantine))
             }
             _ => None,
         }
@@ -204,7 +211,8 @@ db_private_outside_tests! {
 
 /// Why startup recovery marked a transient row for cleanup. Both startup
 /// passes record it, so a row reads the same whichever pass marked it.
-pub fn startup_transient_cleanup_reason(state: SandboxState) -> String {
+pub fn startup_transient_cleanup_reason(state: impl Into<SandboxStatus>) -> String {
+    let state = state.into().legacy_label();
     format!("startup recovery: sandbox was left in transient state '{state}'")
 }
 
@@ -272,12 +280,12 @@ pub fn recover_interrupted_startup_states(
                 Err(error) => return Err(error.into()),
             };
             if let Some(episode) = episode.filter(|episode| {
-                episode.requested_at.is_none() && episode.activation_state == row.state
+                episode.requested_at.is_none() && row.state.is_unowned(episode.activation_state)
             }) {
                 // Hand off the exact episode before startup can admit work.
                 // Generic lifecycle rewriting loses its receipt; merely
                 // deferring leaves no periodic owner if later recovery fails.
-                let reason = match row.state {
+                let reason = match row.state.lifecycle() {
                     SandboxState::Creating => SandboxQuarantineReasonCode::CreateInterrupted,
                     SandboxState::Starting => {
                         SandboxQuarantineReasonCode::ColdActivationInterrupted
@@ -314,7 +322,7 @@ pub fn recover_interrupted_startup_states(
                 });
                 continue;
             }
-            if row.state == SandboxState::Creating {
+            if row.state.is_unowned(SandboxState::Creating) {
                 recovered.push(StartupRecoveryRecord {
                     id: row.id,
                     previous_state: row.state,
@@ -329,9 +337,9 @@ pub fn recover_interrupted_startup_states(
             // when the runtime is gone.
             let intent = startup_cleanup_intent(conn, &row, || true)?;
             if matches!(
-                row.state,
-                SandboxState::Pausing | SandboxState::Resuming | SandboxState::Checkpointing
-            ) || (row.state == SandboxState::Suspending
+                row.state.unowned(),
+                Some(SandboxState::Pausing | SandboxState::Resuming | SandboxState::Checkpointing)
+            ) || (row.state.is_unowned(SandboxState::Suspending)
                 && !sandbox_has_full_suspend_artifact_pin(&row))
                 || sandbox_is_retryable_interrupted_restore(&row)
             {
@@ -356,7 +364,7 @@ pub fn recover_interrupted_startup_states(
                         completion,
                     },
                 });
-            } else if row.state == SandboxState::Restoring {
+            } else if row.state.is_unowned(SandboxState::Restoring) {
                 let outcome =
                     update_state_from(conn, &row.id, &edges::INTERRUPTED_RESTORE_RECOVERY)?;
                 if !matches!(outcome, StateWriteOutcome::Applied { .. }) {
@@ -382,7 +390,7 @@ pub fn recover_interrupted_startup_states(
             continue;
         }
 
-        if row.state == SandboxState::Started
+        if row.state.is_unowned(SandboxState::Started)
             && !row
                 .pid
                 .is_some_and(|pid| std::path::Path::new(&format!("/proc/{pid}")).exists())
@@ -434,7 +442,7 @@ pub enum RecoverStartupStatesError {
     #[error("startup recovery write {edge} was refused: sandbox is {found}, {}", refusal_text(.refusal))]
     StateWriteRefused {
         edge: &'static str,
-        found: SandboxState,
+        found: SandboxStatus,
         refusal: StateWriteRefusal,
     },
     #[error("startup recovery write {edge} found no sandbox row")]

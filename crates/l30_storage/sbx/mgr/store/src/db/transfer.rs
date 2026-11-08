@@ -135,11 +135,13 @@ pub fn publish_snapshot(
         || row.template_hash.as_deref() != Some(hash)
         || row.volume_encryption
         || matches!(
-            row.state,
-            SandboxState::Creating
-                | SandboxState::Deleting
-                | SandboxState::Stopping
-                | SandboxState::Quarantined
+            row.state.unowned(),
+            Some(
+                SandboxState::Creating
+                    | SandboxState::Deleting
+                    | SandboxState::Stopping
+                    | SandboxState::Quarantined
+            )
         )
     {
         return Ok(false);

@@ -81,7 +81,10 @@ fn a_cleanup_handoff_stores_the_teardown_transition_its_intent_names() {
         );
         assert_eq!(
             get_sandbox(&conn, &id).unwrap().unwrap().state,
-            SandboxState::CleanupRequired,
+            SandboxStatus::owned(
+                Teardown::of(lifecycle.parse().unwrap()).unwrap(),
+                CleanupState::Required
+            ),
             "{from} {completion}"
         );
     }
@@ -163,7 +166,7 @@ fn a_lifecycle_write_over_a_cleanup_row_clears_its_cleanup_state() {
 #[test]
 fn an_inserted_cleanup_row_starts_in_stopping() {
     let conn = test_conn();
-    let id = state_write_fixtures::insert_row(&conn, SandboxState::CleanupRequired);
+    let id = state_write_fixtures::insert_row(&conn, SandboxStatus::CLEANUP_REQUIRED);
     assert_eq!(
         stored(&conn, &id),
         (
@@ -174,7 +177,7 @@ fn an_inserted_cleanup_row_starts_in_stopping() {
     );
     assert_eq!(
         get_sandbox(&conn, &id).unwrap().unwrap().state,
-        SandboxState::CleanupRequired
+        SandboxStatus::CLEANUP_REQUIRED
     );
 }
 
@@ -400,7 +403,7 @@ fn each_cleanup_writer_stores_the_teardown_transition_its_intent_names() {
 
     // Changing a cleanup row's intent moves it to the transition the new
     // intent names, and clearing the intent leaves the cleanup over `stopping`.
-    let id = state_write_fixtures::insert_row(&conn, SandboxState::CleanupRequired);
+    let id = state_write_fixtures::insert_row(&conn, SandboxStatus::CLEANUP_REQUIRED);
     assert!(set_cleanup_intent(&conn, &id, false, CleanupCompletion::DeleteRow).unwrap());
     assert_eq!(stored(&conn, &id).0, "deleting");
     clear_cleanup_intent(&conn, &id).unwrap();
@@ -490,16 +493,13 @@ fn a_cleanup_row_decodes_its_status_and_the_lifecycle_under_it() {
             .unwrap();
         let row = get_sandbox(&conn, &id).unwrap().unwrap();
         assert_eq!(
-            (row.state, row.lifecycle),
-            (SandboxState::CleanupRequired, lifecycle),
+            row.state,
+            SandboxStatus::owned(Teardown::of(lifecycle).unwrap(), CleanupState::Required),
             "{completion}"
         );
     }
 
     let id = state_write_fixtures::insert_row(&conn, SandboxState::Started);
     let row = get_sandbox(&conn, &id).unwrap().unwrap();
-    assert_eq!(
-        (row.state, row.lifecycle),
-        (SandboxState::Started, SandboxState::Started)
-    );
+    assert_eq!(row.state, SandboxStatus::from(SandboxState::Started));
 }
