@@ -72,6 +72,15 @@ struct Claim {
 }
 
 impl Operations {
+    pub(super) fn has_live_records(&self) -> bool {
+        self.state().records.values().any(|record| {
+            record
+                .result
+                .as_ref()
+                .is_none_or(|(_, at)| at.elapsed() < RETENTION)
+        })
+    }
+
     pub(super) fn new() -> Self {
         Self {
             state: Arc::default(),

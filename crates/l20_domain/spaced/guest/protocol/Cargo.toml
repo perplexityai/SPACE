@@ -11,6 +11,8 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+pplx-space-spaced-update = { workspace = true }
+uuid = { workspace = true }
 semver = { workspace = true }
 pplx-space-guest-process = { workspace = true }
 pplx-space-pii = { workspace = true }
