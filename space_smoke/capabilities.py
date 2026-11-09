@@ -831,6 +831,56 @@ class NodeCtlFacetRun:
     last_error: str
 
 
+class NodeMemoryAdmissionControl(Protocol):
+    """Privileged kind-only knobs and reads for the node memory admission scenarios.
+
+    node-manager's memory admission reserve (a command flag), node-ctl's
+    `SPACE_NETWORK_SLOTS_MEMORY_CLAMP` and the API's
+    `SPACE_CREATE_FAIL_FAST_ON_NODE_REJECTION` are each captured before they
+    are written and put back verbatim, each under its own mutation Lease.
+    """
+
+    def acquire_public_api_mutation(self) -> Callable[[], None]: ...
+
+    def acquire_node_ctl_mutation(self) -> Callable[[], None]: ...
+
+    def acquire_node_manager_mutation(self) -> Callable[[], None]: ...
+
+    def public_api_env(self, keys: Sequence[str]) -> dict[str, str | None]: ...
+
+    def node_manager_command(self) -> tuple[str, ...]: ...
+
+    def set_node_manager_memory_admission_reserve(
+        self, standing: Sequence[str], mib: int | None, *, nodes: Sequence[str] | None = None
+    ) -> None: ...
+
+    def acquire_worker_cordon_mutation(self) -> Callable[[], None]: ...
+
+    def cordon_kube_node(self, node_name: str) -> None: ...
+
+    def uncordon_kube_node(self, node_name: str) -> None: ...
+
+    def network_slots_memory_clamp_env(self) -> str | None: ...
+
+    def set_network_slots_memory_clamp_env(self, value: str | None) -> None: ...
+
+    def create_fail_fast_env(self) -> str | None: ...
+
+    def set_create_fail_fast_env(self, value: str | None) -> None: ...
+
+    def sandbox_worker_nodes(self) -> list[str]: ...
+
+    def advertised_network_slots(self, node_name: str) -> int | None:
+        """The Node's allocatable network slots, the capacity kube-scheduler places against."""
+        ...
+
+    def bound_network_slot_requests(self, node_name: str) -> int: ...
+
+    def all_sandbox_pods(self) -> list[SandboxPodView]: ...
+
+    def sandbox_pods(self, sandbox_id: str) -> list[SandboxPodView]: ...
+
+
 class UnansweredTemplateEvictionControl(Protocol):
     """Kind-only operations for node-ctl's unanswered-template cleanup scenario.
 
@@ -1287,7 +1337,10 @@ class EcwSandboxes(Protocol):
         *,
         attempts: int = 10,
         interval_seconds: float = 1.0,
-    ) -> None: ...
+        absent_ok: bool = False,
+    ) -> None:
+        """Kill every sandbox carrying `metadata`; none appearing within the attempts raises unless `absent_ok`."""
+        ...
 
     def list_pages(
         self,
@@ -1325,7 +1378,14 @@ class EcwScenarioSandboxes(Protocol):
         *,
         allow_internet_access: bool | None = None,
         network: NetworkConfig | None = None,
-    ) -> EcwCreateAttempt: ...
+        definitive_statuses: Collection[int] = (),
+    ) -> EcwCreateAttempt:
+        """A tracked raw create. A server failure normally stays
+        commit-ambiguous, so cleanup reconciles it by run metadata and fails
+        when no sandbox ever appears; a status in `definitive_statuses` is one
+        the API answers only after removing the sandbox, so cleanup still
+        kills any match but accepts finding none."""
+        ...
 
     def delete(self, sandbox: CommandSandbox) -> int: ...
 

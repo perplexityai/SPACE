@@ -8,7 +8,7 @@ import secrets
 import shlex
 import time
 from datetime import UTC, datetime, timedelta
-from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager, contextmanager
 from dataclasses import asdict, dataclass
 from enum import StrEnum
@@ -31,6 +31,7 @@ from space_smoke.capabilities import (
     OrphanedRestorePodGcControl,
     ReconcileQueueGcControl,
     UnansweredTemplateEvictionControl,
+    NodeMemoryAdmissionControl,
     TemplateBuildControl,
     TemplateBuilder,
     RateLimiterControl,
@@ -107,6 +108,7 @@ from space_smoke.node_fence import NodeFenceAssertions
 from space_smoke.node_selector_extras import NodeSelectorExtrasAssertions
 from space_smoke.orphaned_restore_pod_gc import OrphanedRestorePodGcAssertions
 from space_smoke.unanswered_template_eviction import UnansweredTemplateEvictionAssertions
+from space_smoke.node_memory_admission import NodeMemoryAdmissionAssertions
 from space_smoke.pending_backup import PendingBackupAssertions
 from space_smoke.teardown_restart import TeardownRestartAssertions
 from space_smoke.reconcile_queue_gc import ReconcileQueueGcAssertions
@@ -854,6 +856,7 @@ class EcwSandboxCollection(SandboxCollection):
         *,
         allow_internet_access: bool | None = None,
         network: NetworkConfig | None = None,
+        definitive_statuses: Collection[int] = (),
     ) -> EcwCreateAttempt:
         """Observe a raw create using this scenario's template and timeout."""
 
@@ -861,6 +864,7 @@ class EcwSandboxCollection(SandboxCollection):
             return self._sandboxes.attempt_create(
                 allow_internet_access=allow_internet_access,
                 network=network,
+                definitive_statuses=definitive_statuses,
             )
 
     def fork(
@@ -2963,6 +2967,23 @@ class KindEcw(Ecw):
                 self, self._unanswered_template_control, self._context.scope
             )
         return self._unanswered_template_assertions
+
+    _node_memory_admission_control: NodeMemoryAdmissionControl | None = None
+    _node_memory_admission_assertions: NodeMemoryAdmissionAssertions | None = None
+
+    @property
+    def node_memory_admission(self) -> NodeMemoryAdmissionAssertions:
+        """Privileged assertions for node memory admission refusals and the slot clamp."""
+
+        if self._node_memory_admission_control is None:
+            raise SmokeConfigurationError(
+                "node memory admission control is only available on the kind backend"
+            )
+        if self._node_memory_admission_assertions is None:
+            self._node_memory_admission_assertions = NodeMemoryAdmissionAssertions(
+                self, self._node_memory_admission_control, self._context.scope
+            )
+        return self._node_memory_admission_assertions
 
     _reconcile_queue_gc_control: ReconcileQueueGcControl | None = None
     _reconcile_queue_gc_assertions: ReconcileQueueGcAssertions | None = None

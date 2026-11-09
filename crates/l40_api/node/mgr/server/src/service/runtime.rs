@@ -958,12 +958,58 @@ impl NodeManagerService {
         let counts = self.pool.counts().map_err(slot_store_status)?;
         let draining = self.pool.is_draining().map_err(slot_store_status)?;
         let config = self.pool.config();
+        let memory_admittable_sandboxes = if request.get_ref().include_memory_admission {
+            self.memory_admittable_new_sandboxes(config.max_slots).await
+        } else {
+            None
+        };
         Ok(Response::new(network_pool_status_response(
             &counts,
             draining,
             &config,
             self.sandbox_cgroup_config,
+            memory_admittable_sandboxes,
         )))
+    }
+
+    /// How many more sandboxes memory admission would accept
+    /// now (see `MemoryAdmissionConfig::admittable_new_sandboxes`), at most
+    /// `max_slots`; `None` when node memory or the lease table can't be read,
+    /// so node-ctl holds the capacity it last advertised.
+    async fn memory_admittable_new_sandboxes(&self, max_slots: u32) -> Option<u32> {
+        let active_leases = match self.pool.active_memory_reservations() {
+            Ok(leases) => leases,
+            Err(error) => {
+                tracing::warn!(%error, "memory-admittable count: active lease read failed");
+                return None;
+            }
+        };
+        let observation = match self
+            .memory_admission_config
+            .observe_active_leases(&active_leases, &self.memory_admission_sources)
+            .await
+        {
+            Ok(observation) => observation,
+            Err(error) => {
+                tracing::warn!(%error, "memory-admittable count: node memory read failed");
+                return None;
+            }
+        };
+        // Size new sandboxes like the largest one running here (at least the
+        // node default): the workload placed on a node is the best predictor
+        // of the next pod's demand, and overcounting what fits is what lets
+        // the scheduler send pods admission then refuses.
+        let reference_demand_mib = active_leases
+            .iter()
+            .map(|lease| lease.memory_reservation_mib)
+            .max()
+            .unwrap_or(0)
+            .max(self.sandbox_cgroup_config.memory_mib_or_default());
+        Some(self.memory_admission_config.admittable_new_sandboxes(
+            reference_demand_mib,
+            &observation,
+            max_slots,
+        ))
     }
 
     pub(super) async fn list_network_leases(

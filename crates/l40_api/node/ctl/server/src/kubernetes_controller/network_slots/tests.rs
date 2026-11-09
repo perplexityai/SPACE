@@ -2,19 +2,26 @@ use super::*;
 
 #[test]
 fn capacity_current_matches_exact_advertised_value() {
-    assert!(network_slot_capacity_current(Some("40"), "40"));
+    assert!(network_slot_capacity_current(Some("40"), None, "40"));
+    assert!(network_slot_capacity_current(Some("40"), Some("40"), "40"));
+}
+
+#[test]
+fn capacity_current_does_not_trust_a_cache_behind_the_last_apply() {
+    // Applied 56, then 60; the watch still shows 56 when 56 is wanted again.
+    assert!(!network_slot_capacity_current(Some("56"), Some("60"), "56"));
 }
 
 #[test]
 fn capacity_current_detects_missing_advertisement() {
-    assert!(!network_slot_capacity_current(None, "40"));
+    assert!(!network_slot_capacity_current(None, None, "40"));
 }
 
 #[test]
 fn capacity_current_detects_changed_max_slots() {
-    assert!(!network_slot_capacity_current(Some("32"), "40"));
+    assert!(!network_slot_capacity_current(Some("32"), None, "40"));
     // A shrink from 40 to 0 (drained pool) must also re-advertise.
-    assert!(!network_slot_capacity_current(Some("40"), "0"));
+    assert!(!network_slot_capacity_current(Some("40"), Some("40"), "0"));
 }
 
 #[test]
@@ -41,5 +48,52 @@ fn patch_params_force_owns_capacity_field_manager() {
     assert!(
         params.force,
         "force apply lets node-ctl reclaim the capacity field after a kubelet rewrite"
+    );
+}
+
+#[test]
+fn capacity_is_max_slots_while_memory_is_not_binding() {
+    assert_eq!(desired_network_slot_capacity(64, 10, Some(54)), 64);
+    assert_eq!(desired_network_slot_capacity(64, 10, Some(500)), 64);
+    assert_eq!(desired_network_slot_capacity(64, 10, None), 64);
+}
+
+#[test]
+fn capacity_shrinks_to_what_memory_admission_accepts() {
+    // A node whose memory admission refuses every new sandbox advertises
+    // only its leased slots, so the scheduler binds no more pods to it.
+    assert_eq!(desired_network_slot_capacity(64, 56, Some(0)), 56);
+    assert_eq!(desired_network_slot_capacity(64, 56, Some(3)), 59);
+}
+
+#[test]
+fn capacity_never_exceeds_max_slots_or_overflows() {
+    assert_eq!(
+        desired_network_slot_capacity(64, u32::MAX, Some(u32::MAX)),
+        64
+    );
+    assert_eq!(desired_network_slot_capacity(0, 0, Some(10)), 0);
+}
+
+#[test]
+fn clamped_capacity_is_held_while_memory_is_unreadable() {
+    // Clamp on, no count: keep what was advertised rather than reopen to max_slots.
+    assert_eq!(
+        held_network_slot_capacity(true, None, Some("3"), Some("64")),
+        Some("3")
+    );
+    assert_eq!(
+        held_network_slot_capacity(true, None, None, Some("3")),
+        Some("3")
+    );
+    // Nothing advertised yet, a fresh count, or the clamp off: reconcile normally.
+    assert_eq!(held_network_slot_capacity(true, None, None, None), None);
+    assert_eq!(
+        held_network_slot_capacity(true, Some(0), Some("3"), Some("3")),
+        None
+    );
+    assert_eq!(
+        held_network_slot_capacity(false, None, Some("3"), Some("3")),
+        None
     );
 }

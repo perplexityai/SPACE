@@ -140,6 +140,54 @@ impl MemoryAdmissionConfig {
         )
     }
 
+    /// How many more sandboxes of `sandbox_cgroup_memory_mib` this
+    /// observation admits, at most `limit`: the largest `n` for which
+    /// [`Self::check_new_allocation_at_commit`] accepts a demand of
+    /// `n * sandbox_cgroup_memory_mib` with no lease committed since the
+    /// observation. Calls the admission rule rather than restating it, so a
+    /// change to the rule (ceiling, existing-lease charge) moves this with it.
+    ///
+    /// Read-only: it feeds placement (the advertised network-slot capacity),
+    /// never an admission decision. Each new sandbox is charged its full
+    /// demand, as admission charges it, so the count is conservative while
+    /// the sandboxes admitted after it are still cold.
+    pub(crate) fn admittable_new_sandboxes(
+        self,
+        sandbox_cgroup_memory_mib: u64,
+        observation: &MemoryAdmissionObservation,
+        limit: u32,
+    ) -> u32 {
+        let admits = |count: u32| {
+            let Some(demand_mib) = sandbox_cgroup_memory_mib.checked_mul(u64::from(count)) else {
+                return false;
+            };
+            self.check_new_allocation_at_commit(
+                demand_mib,
+                observation,
+                &observation.observed_leases,
+            )
+            .is_ok()
+        };
+        if !admits(0) {
+            return 0;
+        }
+        if sandbox_cgroup_memory_mib == 0 {
+            return limit;
+        }
+        // Admission is monotone in demand: binary-search the largest
+        // admitted count in `[0, limit]`.
+        let (mut admitted, mut upper) = (0u32, limit);
+        while admitted < upper {
+            let mid = admitted + (upper - admitted).div_ceil(2);
+            if admits(mid) {
+                admitted = mid;
+            } else {
+                upper = mid - 1;
+            }
+        }
+        admitted
+    }
+
     fn check_measured_capacity(
         self,
         sandbox_cgroup_memory_mib: u64,
