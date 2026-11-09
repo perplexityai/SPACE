@@ -14,6 +14,35 @@ struct BundleFixture {
     cache: PathBuf,
 }
 
+#[rstest]
+fn selector_seed_refuses_missing_descriptor_without_overwriting_its_agent(
+    bundle_fixture: BundleFixture,
+) {
+    fs::create_dir_all(bundle_fixture.target.join("etc/spaced")).unwrap();
+    fs::write(
+        bundle_fixture.target.join("etc/spaced/update-contract"),
+        "linux-systemd-selector-v1\n",
+    )
+    .unwrap();
+    let executable = bundle_fixture.target.join("usr/local/bin/spaced-svc");
+    fs::create_dir_all(executable.parent().unwrap()).unwrap();
+    fs::write(&executable, "selected-seed-agent").unwrap();
+    assert!(matches!(
+        install_current_guest_with_privilege(
+            &bundle_fixture.target,
+            &bundle_fixture.guest_bins,
+            "1.2.3",
+            true,
+            false
+        ),
+        Err(GuestBundleError::MissingPath { .. })
+    ));
+    assert_eq!(
+        fs::read_to_string(executable).unwrap(),
+        "selected-seed-agent"
+    );
+}
+
 #[fixture]
 fn bundle_fixture() -> BundleFixture {
     let tempdir = tempfile::tempdir().expect("create bundle fixture");
@@ -236,10 +265,18 @@ fn bundle_injection_keeps_oci_userspace_and_replaces_the_guest_contract(
     bundle
         .extract_with_privilege(&bundle_fixture.target, false)
         .expect("inject seed bundle");
+    // A customer marker must not change the already-captured seed ABI.
+    fs::create_dir_all(bundle_fixture.target.join("etc/spaced")).unwrap();
+    fs::write(
+        bundle_fixture.target.join("etc/spaced/update-contract"),
+        "customer-marker",
+    )
+    .unwrap();
     install_current_guest_with_privilege(
         &bundle_fixture.target,
         &bundle_fixture.guest_bins,
         "1.2.3",
+        bundle.slots,
         false,
     )
     .expect("install current guest binaries");
@@ -357,6 +394,7 @@ fn bundle_injection_does_not_follow_oci_directory_symlinks(bundle_fixture: Bundl
         &bundle_fixture.target,
         &bundle_fixture.guest_bins,
         "1.2.3",
+        bundle.slots,
         false,
     )
     .expect("install current guest binaries");
@@ -450,5 +488,52 @@ fn image_working_directory_survives_bundle_install(bundle_fixture: BundleFixture
     assert_eq!(
         fs::read_to_string(bundle_fixture.target.join("etc/spaced/working-directory")).unwrap(),
         working_dir.to_str().unwrap()
+    );
+}
+
+#[rstest]
+#[case("sleep")]
+#[case("gnusleep")]
+fn bundle_carries_the_seed_selected_holder(bundle_fixture: BundleFixture, #[case] binary: &str) {
+    let holder = format!("usr/bin/{binary}");
+    fs::write(bundle_fixture.seed.join(&holder), minimal_static_elf()).unwrap();
+    let unit = "etc/systemd/system/space-workloads.service";
+    fs::write(
+        bundle_fixture.seed.join(unit),
+        format!("[Service]\nExecStart=/{holder} infinity\n"),
+    )
+    .unwrap();
+    fs::create_dir_all(bundle_fixture.seed.join("etc/spaced")).unwrap();
+    fs::write(
+        bundle_fixture.seed.join("etc/spaced/update-contract"),
+        "linux-systemd-selector-v1\n",
+    )
+    .unwrap();
+    fs::create_dir_all(bundle_fixture.seed.join("var/lib/spaced/slots/a")).unwrap();
+    fs::write(
+        bundle_fixture
+            .seed
+            .join("var/lib/spaced/slots/a/artifact.json"),
+        "fixture",
+    )
+    .unwrap();
+    fs::write(
+        bundle_fixture.seed.join("usr/bin/systemctl"),
+        minimal_static_elf(),
+    )
+    .unwrap();
+    let bundle =
+        GuestBundle::capture_with_privilege(&bundle_fixture.seed, &bundle_fixture.cache, false)
+            .unwrap();
+    bundle
+        .extract_with_privilege(&bundle_fixture.target, false)
+        .unwrap();
+    assert_eq!(
+        fs::read(bundle_fixture.target.join(holder)).unwrap(),
+        minimal_static_elf()
+    );
+    assert_eq!(
+        fs::read(bundle_fixture.target.join(unit)).unwrap(),
+        fs::read(bundle_fixture.seed.join(unit)).unwrap()
     );
 }

@@ -59,7 +59,10 @@ fn rusqlite_profile_emits_statement_without_bind_values() {
     let subscriber = tracing_subscriber::registry().with(captured);
     let secret = "secret-sandbox-value";
 
-    tracing::subscriber::with_default(subscriber, || {
+    // Migration tests also emit this callsite from worker threads. Keep the
+    // capture subscriber alive globally while those parallel tests run.
+    tracing::subscriber::set_global_default(subscriber).unwrap();
+    {
         let conn = open_rusqlite(&db_path, RusqliteOpenOptions::default()).unwrap();
         conn.execute_batch("CREATE TABLE secrets (value TEXT);")
             .unwrap();
@@ -68,7 +71,7 @@ fn rusqlite_profile_emits_statement_without_bind_values() {
             rusqlite::params![secret],
         )
         .unwrap();
-    });
+    }
 
     let statements = statements.lock().unwrap();
     let insert = statements

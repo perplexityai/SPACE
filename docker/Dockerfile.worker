@@ -113,6 +113,26 @@ RUN test "$(command -v btrfs)" = /usr/local/sbin/btrfs \
 COPY --from=aws-cli /usr/local/aws-cli /usr/local/aws-cli
 RUN ln -s /usr/local/aws-cli/v2/current/bin/aws /usr/local/bin/aws
 
+FROM runtime-deps AS guest-bundle
+RUN apt-get update && apt-get install -y --no-install-recommends python3-minimal \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=rust-build /artifacts/bin/spaced /guest/spaced
+COPY --from=rust-build /artifacts/bin/spaced-svc /guest/spaced-svc
+COPY scripts/build/agent-bundle.py /tmp/space-agent-bundle.py
+COPY ci/guest-update-required-since /tmp/guest-update-required-since
+ARG SPACE_GIT_SHA=unknown
+ARG SPACE_BUILD_TIME=""
+# Unknown or dirty local source builds remain legacy seed inputs. Release builds mint
+# this identity once, before any seed or OCI rootfs consumes the binary pair.
+RUN if printf '%s' "${SPACE_GIT_SHA}" | grep -Eq '^[0-9a-f]{40,64}$'; then \
+      python3 /tmp/space-agent-bundle.py /guest \
+        --revision "${SPACE_GIT_SHA}" \
+        --built-at "${SPACE_BUILD_TIME:?set SPACE_BUILD_TIME to the source commit timestamp}" \
+        --version "$(/guest/spaced-svc --version | awk '{print $2}')" \
+        --guest-update-required-since "$(cat /tmp/guest-update-required-since)" \
+        --arch "$(uname -m)"; \
+    fi
+
 FROM runtime-deps
 
 LABEL org.opencontainers.image.title="space-worker"
@@ -121,8 +141,7 @@ LABEL org.opencontainers.image.description="SPACE worker node services (node-man
 # SPACE binaries
 # Guest spaced artifacts are packaged for seed image injection only; they are
 # not host-facing executables and intentionally live outside /opt/space/bin.
-COPY --from=rust-build /artifacts/bin/spaced               /opt/space/data/spaced/spaced
-COPY --from=rust-build /artifacts/bin/spaced-svc           /opt/space/data/spaced/spaced-svc
+COPY --from=guest-bundle /guest/ /opt/space/data/spaced/
 COPY --from=rust-build /artifacts/bin/space-runtime-supervisor-svc /opt/space/bin/space-runtime-supervisor-svc
 COPY --from=rust-build /artifacts/etc/space-runtime-supervisor-compatibility /opt/space/etc/space-runtime-supervisor-compatibility
 COPY --from=rust-build /artifacts/bin/space-rtmgr-svc        /opt/space/bin/space-rtmgr-svc

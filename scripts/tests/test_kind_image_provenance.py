@@ -124,3 +124,20 @@ def test_creating_replica_beside_a_stale_sibling_is_still_refused(cluster, tmp_p
     code, report = check(tmp_path)
     assert code == 1
     assert [c["verdict"] for c in report["containers"]] == ["stale image", "not started"]
+
+
+def test_build_descriptor_time_is_the_source_commit_time(tmp_path, monkeypatch):
+    monkeypatch.setattr(provenance, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(provenance, "run", lambda args: "1700000000\n")
+    environments = []
+
+    def build(command, *, env):
+        environments.append(env)
+        return provenance.argparse.Namespace(returncode=0)
+
+    monkeypatch.setattr(provenance.subprocess, "run", build)
+    for _ in range(2):
+        provenance.docker_build(["docker", "build", "--build-arg", "SPACE_BUILD_TIME", "."], COMMIT, False)
+    assert [env["SPACE_BUILD_TIME"] for env in environments] == [
+        "2023-11-14T22:13:20Z", "2023-11-14T22:13:20Z"
+    ]

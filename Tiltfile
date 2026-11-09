@@ -343,7 +343,7 @@ space_image(
         # multi-platform manifest list, which `kind load docker-image` cannot
         # ingest ("content digest ... not found").
         (image_build("space-worker") + " -t $SPACE_BUILD_REF " +
-         "--build-arg SPACE_RUST_BUILD_IMAGE={} --build-arg SPACE_GIT_SHA .").format(
+         "--build-arg SPACE_RUST_BUILD_IMAGE={} --build-arg SPACE_GIT_SHA --build-arg SPACE_BUILD_TIME .").format(
             RUST_ARTIFACT_IMAGE),
     ]),
     deps = RUST_ARTIFACT_DEPS + [

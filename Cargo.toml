@@ -38,8 +38,10 @@ members = [
     "crates/l40_api/spaced/guest/execution",
     "crates/l20_domain/spaced/guest/protocol",
     "crates/l20_domain/spaced/common",
+    "crates/l20_domain/spaced/update",
     "crates/l40_api/spaced/guest/client",
     "crates/l40_api/spaced/guest/server",
+    "crates/l40_api/spaced/guest/update",
     "crates/l40_api/spaced/guest/windows",
     "crates/l40_api/spaced/host/client",
     "crates/l40_api/spaced/host/server",
@@ -307,9 +309,8 @@ regex = "1"
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
 rstest = { version = "0.27", default-features = false }
 rtnetlink = "0.23"
-# rusqlite 0.40 and sqlx-sqlite 0.9 require incompatible libsqlite3-sys
-# versions, which cannot coexist because both link the native SQLite library.
-rusqlite = { version = "0.39", features = ["bundled", "trace"] }
+# Keep the bundled SQLite above the WAL page-size memory-disclosure fix.
+rusqlite = { version = "0.41.1", features = ["bundled", "trace"] }
 rustls = { version = "0.23.46", default-features = false }
 schemars = "1"
 serde = "1"
@@ -319,7 +320,9 @@ blake3 = "1.8.7"
 sha2 = "0.11"
 subtle = "2"
 socket2 = "0.6"
-sqlx = { version = "0.9", default-features = false }
+# The published SQLx 0.9 bounds libsqlite3-sys below the patched SQLite release.
+# Pin upstream's compatibility fix until a registry release includes it.
+sqlx = { git = "https://github.com/launchbadge/sqlx", rev = "10462fa4414c6c7f1ed1d39bb31678e3b726878c", default-features = false }
 tempfile = "3"
 tar = "0.4.46"
 flate2 = "1"
@@ -489,6 +492,8 @@ pplx-space-spaced-build = { path = "crates/l10_foundation/spaced/build" }
 pplx-space-spaced-guest-protocol = { path = "crates/l20_domain/spaced/guest/protocol" }
 pplx-space-spaced-guest-execution = { path = "crates/l40_api/spaced/guest/execution" }
 pplx-space-spaced-common = { path = "crates/l20_domain/spaced/common" }
+pplx-space-spaced-update = { path = "crates/l20_domain/spaced/update" }
+pplx-space-spaced-guest-update = { path = "crates/l40_api/spaced/guest/update" }
 pplx-space-spaced-guest-client = { path = "crates/l40_api/spaced/guest/client" }
 pplx-space-spaced-guest-server = { path = "crates/l40_api/spaced/guest/server" }
 pplx-space-spaced-guest-windows = { path = "crates/l40_api/spaced/guest/windows" }

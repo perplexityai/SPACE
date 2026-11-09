@@ -297,7 +297,7 @@ fn discovery_progresses_past_blocked_work_and_idle_pages_and_prioritizes_fresh_w
 
 #[test]
 fn discovery_bounds_raw_sql_work_and_does_no_work_without_capacity() {
-    let conn = test_conn();
+    let mut conn = test_conn();
     // A large due inventory must not be counted or scanned in full for one batch.
     conn.execute_batch("WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<10000) INSERT INTO sandboxes(id, uuid8, state, template, user, created_at, updated_at, next_auto_event_at) SELECT printf('019d84bd-280d-7331-99c6-%012x', x), 'test', 'started', 'test', 'test', '0', '0', 1 FROM n").unwrap();
     use rusqlite::trace::{TraceEvent, TraceEventCodes};
@@ -310,7 +310,8 @@ fn discovery_bounds_raw_sql_work_and_does_no_work_without_capacity() {
             );
         }
     }
-    conn.trace_v2(TraceEventCodes::SQLITE_TRACE_PROFILE, Some(trace));
+    conn.trace_v2(TraceEventCodes::SQLITE_TRACE_PROFILE, Some(trace))
+        .unwrap();
     let mut cursor = AutoLifecycleScan::default();
     for _ in 0..5 {
         STEPS.store(0, std::sync::atomic::Ordering::Relaxed);
@@ -325,7 +326,7 @@ fn discovery_bounds_raw_sql_work_and_does_no_work_without_capacity() {
             "raw discovery exceeded its SQL work budget"
         );
     }
-    conn.trace_v2(TraceEventCodes::empty(), None);
+    conn.trace_v2(TraceEventCodes::empty(), None).unwrap();
     conn.execute_batch("DROP TABLE sandboxes").unwrap();
     assert!(
         due_auto_lifecycle_batch(&conn, 10, &[], 0, &mut cursor)
