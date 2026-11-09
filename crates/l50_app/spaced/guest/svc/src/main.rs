@@ -26,6 +26,16 @@ struct Cli {
     #[arg(long = "hold-cgroup", hide = true)]
     hold_cgroup: bool,
 
+    /// Select the committed or single-trial release before systemd starts us.
+    #[cfg(target_os = "linux")]
+    #[arg(long, hide = true, conflicts_with = "hold_cgroup")]
+    select: bool,
+
+    /// Initialize an offline, prepopulated slot A during image assembly.
+    #[cfg(target_os = "linux")]
+    #[arg(long, hide = true, conflicts_with_all = ["hold_cgroup", "select"])]
+    initialize_update: Option<std::path::PathBuf>,
+
     /// Run the Windows service in the foreground for diagnostics.
     #[cfg(windows)]
     #[arg(long)]
@@ -43,6 +53,14 @@ impl From<Cli> for SpacedGuestRunConfig {
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    #[cfg(target_os = "linux")]
+    if let Some(root) = &cli.initialize_update {
+        return Ok(pplx_space_spaced_guest_update::initialize_at(root)?);
+    }
+    #[cfg(target_os = "linux")]
+    if cli.select {
+        return Ok(pplx_space_spaced_guest_update::select_installed()?);
+    }
     #[cfg(unix)]
     if cli.hold_cgroup {
         // No runtime, telemetry or cgroup setup: SIGTERM from the unit's stop

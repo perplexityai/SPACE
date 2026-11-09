@@ -654,7 +654,7 @@ fn test_schema_image() -> &'static [u8] {
         }
         let mut conn = Connection::from_raw(rusqlite::Connection::open_in_memory().unwrap());
         create_test_schema(&mut conn);
-        let image = conn.raw().serialize(rusqlite::MAIN_DB).unwrap().to_vec();
+        let image = conn.serialize_main_database().unwrap();
         if let Some(cache) = &cache {
             cache.write(&image);
         }
