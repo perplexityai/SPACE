@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use k8s_openapi::api::core::v1::Node;
 use kube::api::{Patch, PatchParams};
 use kube::{Api, Client};
@@ -8,11 +10,17 @@ use super::node_watch;
 use crate::local_manager_request;
 
 const NETWORK_SLOTS_FIELD_MANAGER: &str = "space-node-ctl-network-slots";
+/// One deadline over the whole reconcile — lock wait, node-manager status, and
+/// Node patch — so a stalled node-manager or apiserver can't hold `applied`
+/// and stall the node-object pass behind it.
+const NETWORK_SLOT_CAPACITY_RECONCILE_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, thiserror::Error)]
 pub enum NetworkSlotCapacityReconcileError {
     #[error("node-manager network pool status failed: {0}")]
     NodeManager(#[source] tonic::Status),
+    #[error("network-slot capacity reconcile did not finish within {0:?}")]
+    TimedOut(Duration),
     #[error("Kubernetes Node metadata cache is not ready for {node_name}")]
     NodeCacheNotReady { node_name: String },
     #[error("failed to patch network slot capacity on node {node_name}: {source}")]
@@ -42,6 +50,24 @@ pub enum NetworkSlotCapacityReconcileError {
 /// one, and holds the value this process last applied, so a patch is not
 /// skipped on a watch cache that has not caught up with it.
 pub async fn reconcile_network_slot_capacity(
+    kube: &Client,
+    node_cache: &node_watch::NodeMetadataCache,
+    node_name: &str,
+    memory_clamp: bool,
+    applied: &AppliedNetworkSlotCapacity,
+) -> Result<(), NetworkSlotCapacityReconcileError> {
+    // A timed-out patch leaves `applied` untouched, so the next pass re-applies.
+    tokio::time::timeout(
+        NETWORK_SLOT_CAPACITY_RECONCILE_TIMEOUT,
+        reconcile_serialized(kube, node_cache, node_name, memory_clamp, applied),
+    )
+    .await
+    .map_err(|_| {
+        NetworkSlotCapacityReconcileError::TimedOut(NETWORK_SLOT_CAPACITY_RECONCILE_TIMEOUT)
+    })?
+}
+
+async fn reconcile_serialized(
     kube: &Client,
     node_cache: &node_watch::NodeMetadataCache,
     node_name: &str,
