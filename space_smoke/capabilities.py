@@ -803,6 +803,97 @@ class OrphanedRestorePodGcControl(Protocol):
 
 
 @dataclass(frozen=True)
+class SandboxPodExecution:
+    """One sandbox pod beside the execution row its name maps to: what the retired-pod GC reads."""
+
+    pod_name: str
+    uid: str
+    sandbox_id: str
+    generation: int
+    phase: str
+    all_containers_terminated: bool
+    pod_ip: str
+    sandbox_not_ready: bool
+    """`PodReadyToStartContainers=False`."""
+    is_restore: bool
+    deleting: bool
+    row_sandbox_id: str | None
+    row_generation: int | None
+    row_state: str | None
+    """None when no execution row names the pod."""
+    row_active: bool | None
+
+
+class RetiredExecutionPodGcControl(Protocol):
+    """Kind-only operations for the retired-execution-pod GC scenario.
+
+    The GC ships default-off and dry-run and reads its config once at
+    startup, so the scenario overrides the cluster-controller Deployment's
+    `SPACE_RETIRED_EXECUTION_POD_GC_*` env (closed key list, closed value
+    vocabulary) under the controller-mutation Lease, and puts the captured
+    standing values back. The faults (a sandbox-manager kill, a forced API
+    restart, a planted unschedulable pod) are Kind-only.
+    """
+
+    def acquire_controller_mutation(self) -> Callable[[], None]: ...
+
+    def acquire_public_api_mutation(self) -> Callable[[], None]: ...
+
+    def retired_execution_pod_gc_env(self) -> dict[str, str | None]:
+        """The literal value of every GC env key on the controller Deployment, None if unset."""
+        ...
+
+    def set_retired_execution_pod_gc_env(self, overrides: Mapping[str, str]) -> None:
+        """Apply smoke overrides and await the controller rollout; refuses keys or values off the lists."""
+        ...
+
+    def restore_retired_execution_pod_gc_env(self, standing: Mapping[str, str | None]) -> None:
+        """Put the captured literals back (None unsets) and await the controller rollout."""
+        ...
+
+    def retired_execution_pod_gc_counts(self, *, since_epoch: int) -> dict[str, int]:
+        """The GC's reap counter in the stack's metrics intake since `since_epoch`, keyed `mode/verdict`."""
+        ...
+
+    def run_sandbox_ids(self, sibling_sandbox_id: str) -> list[str]:
+        """Every sandbox id carrying the same smoke run marker as the sibling's row."""
+        ...
+
+    def sandbox_pod_executions(self) -> list[SandboxPodExecution]: ...
+
+    def crash_sandbox_manager_at(
+        self, node_name: str, sandbox_id: str, state: str, *, timeout: float
+    ) -> str | None:
+        """SIGKILL the node's sandbox-manager once the sandbox's node row reads `state`.
+
+        Returns the state it killed at, or None if the row never read it.
+        """
+        ...
+
+    def publish_node_ctl_facet(self, node_name: str, facet: str) -> str | None: ...
+
+    def force_restart_public_api(self, *, timeout: float) -> None:
+        """Delete every API pod with no grace period, then await a fresh rollout."""
+        ...
+
+    def restore_pod_document(self, pod_name: str) -> dict[str, Any] | None: ...
+
+    def plant_pending_pod_with_ip(self, manifest: Mapping[str, Any], *, pod_ip: str) -> str:
+        """Create an unschedulable pod and set a status pod IP and `PodReadyToStartContainers=False`; its uid."""
+        ...
+
+    def remove_planted_pods(self, token: str) -> None:
+        """Delete the pods carrying this plant token's label; absent is success."""
+        ...
+
+    def sandbox_executions(self, sandbox_id: str) -> list[ExecutionRow]: ...
+
+    def sandbox_pods(self, sandbox_id: str) -> list[SandboxPodView]: ...
+
+    def sandbox_residency(self, sandbox_id: str) -> SandboxResidency: ...
+
+
+@dataclass(frozen=True)
 class NodeTemplatePresence:
     """The `space.pplx.net/template-build-*` metadata on one Node.
 

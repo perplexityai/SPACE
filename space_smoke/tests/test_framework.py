@@ -169,6 +169,7 @@ runpy.run_module("space_smoke", run_name="__main__")
                 "local.restarted_btrfs_send_is_rejected_and_retried",
                 "local.retention_claim_finish_forward",
                 "local.retention_restore_source_guard",
+                "local.retired_execution_pod_gc_reaps_retired_pods",
                 "local.sandbox_manager_restart_leaves_teardown_suspend_to_its_teardown",
                 "local.sandbox_network_isolation_holds",
                 "local.snapshot_reaper_reclaims_backed_fork_snapshot",

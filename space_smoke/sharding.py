@@ -92,6 +92,8 @@ _DURATION_SECONDS = {
         "local.restarted_btrfs_send_is_rejected_and_retried": 30,
         "local.retention_claim_finish_forward": 66,
         "local.retention_restore_source_guard": 42,
+        # Not measured in CI yet; one local bench run took about 600 s.
+        "local.retired_execution_pod_gc_reaps_retired_pods": 600,
         "local.sandbox_manager_restart_leaves_teardown_suspend_to_its_teardown": 173,
         "local.sandbox_network_isolation_holds": 21,
         "local.snapshot_reaper_reclaims_backed_fork_snapshot": 75,
