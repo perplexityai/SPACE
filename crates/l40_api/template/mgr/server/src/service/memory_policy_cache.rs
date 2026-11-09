@@ -124,12 +124,17 @@ impl SandboxMemoryPolicyCache {
         let resolve = (self.resolve)(requested_memory_mib, retry_policy);
         let entries = Arc::clone(&self.entries);
         let task = tokio::spawn(async move {
+            // Cleared on every exit, a panic included, so the next listing
+            // can start another refresh.
+            let _clear = ClearRefresh {
+                entries: Arc::clone(&entries),
+                requested_memory_mib,
+            };
             let result = resolve.await;
             let mut entries = entries
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let entry = entries.entry(requested_memory_mib).or_default();
-            entry.refresh = None;
             match result {
                 Ok(resolved) => {
                     if resolved.effective_memory_mib < resolved.requested_memory_mib
@@ -165,5 +170,22 @@ impl SandboxMemoryPolicyCache {
         self.entries
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+struct ClearRefresh {
+    entries: Arc<Mutex<HashMap<u32, Entry>>>,
+    requested_memory_mib: u32,
+}
+
+impl Drop for ClearRefresh {
+    fn drop(&mut self) {
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(entry) = entries.get_mut(&self.requested_memory_mib) {
+            entry.refresh = None;
+        }
     }
 }
