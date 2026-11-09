@@ -36,12 +36,19 @@ pub enum NetworkSlotCapacityReconcileError {
 /// `/status` subresource via server-side apply with a dedicated field manager,
 /// so it coexists with the kubelet-owned standard resources and persists across
 /// kubelet status refreshes (which do not manage extended resources).
+///
+/// `applied` serializes the read-and-apply across callers (the fast loop and
+/// the node-object pass), so an older observation never lands after a newer
+/// one, and holds the value this process last applied, so a patch is not
+/// skipped on a watch cache that has not caught up with it.
 pub async fn reconcile_network_slot_capacity(
     kube: &Client,
     node_cache: &node_watch::NodeMetadataCache,
     node_name: &str,
     memory_clamp: bool,
+    applied: &AppliedNetworkSlotCapacity,
 ) -> Result<(), NetworkSlotCapacityReconcileError> {
+    let mut applied = applied.lock().await;
     let status = local_network_pool_status(memory_clamp).await?;
     let max_slots = status.max_slots;
     let capacity = desired_network_slot_capacity(
@@ -57,7 +64,11 @@ pub async fn reconcile_network_slot_capacity(
         }
     })?;
 
-    if network_slot_capacity_current(current_metadata.network_slots_capacity.as_deref(), &desired) {
+    if network_slot_capacity_current(
+        current_metadata.network_slots_capacity.as_deref(),
+        applied.as_deref(),
+        &desired,
+    ) {
         tracing::debug!(%node_name, max_slots, capacity, "network-slot capacity already current");
         return Ok(());
     }
@@ -74,6 +85,7 @@ pub async fn reconcile_network_slot_capacity(
             node_name: node_name.to_owned(),
             source: Box::new(source),
         })?;
+    *applied = Some(desired);
 
     tracing::info!(
         %node_name,
@@ -135,8 +147,19 @@ async fn local_network_pool_status(
     })
 }
 
-fn network_slot_capacity_current(current: Option<&str>, desired: &str) -> bool {
-    current == Some(desired)
+/// The capacity this process last applied to the Node, shared by every
+/// caller of [`reconcile_network_slot_capacity`].
+pub(super) type AppliedNetworkSlotCapacity = std::sync::Arc<tokio::sync::Mutex<Option<String>>>;
+
+/// Current when the watched Node shows `desired` and this process's last
+/// apply (if any) was `desired` too: a cache still showing an older value
+/// that happens to equal `desired` must not hide a newer apply.
+fn network_slot_capacity_current(
+    cached: Option<&str>,
+    applied: Option<&str>,
+    desired: &str,
+) -> bool {
+    cached == Some(desired) && applied.is_none_or(|applied| applied == desired)
 }
 
 fn network_slot_capacity_apply(node_name: &str, desired: &str) -> serde_json::Value {

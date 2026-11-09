@@ -2,19 +2,26 @@ use super::*;
 
 #[test]
 fn capacity_current_matches_exact_advertised_value() {
-    assert!(network_slot_capacity_current(Some("40"), "40"));
+    assert!(network_slot_capacity_current(Some("40"), None, "40"));
+    assert!(network_slot_capacity_current(Some("40"), Some("40"), "40"));
+}
+
+#[test]
+fn capacity_current_does_not_trust_a_cache_behind_the_last_apply() {
+    // Applied 56, then 60; the watch still shows 56 when 56 is wanted again.
+    assert!(!network_slot_capacity_current(Some("56"), Some("60"), "56"));
 }
 
 #[test]
 fn capacity_current_detects_missing_advertisement() {
-    assert!(!network_slot_capacity_current(None, "40"));
+    assert!(!network_slot_capacity_current(None, None, "40"));
 }
 
 #[test]
 fn capacity_current_detects_changed_max_slots() {
-    assert!(!network_slot_capacity_current(Some("32"), "40"));
+    assert!(!network_slot_capacity_current(Some("32"), None, "40"));
     // A shrink from 40 to 0 (drained pool) must also re-advertise.
-    assert!(!network_slot_capacity_current(Some("40"), "0"));
+    assert!(!network_slot_capacity_current(Some("40"), Some("40"), "0"));
 }
 
 #[test]

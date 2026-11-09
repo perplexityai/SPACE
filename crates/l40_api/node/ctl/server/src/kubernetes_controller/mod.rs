@@ -32,6 +32,7 @@ pub struct Controller {
     template_writes: template_pull_requests::TemplatePullRequestReconciler,
     resource_status_reader: NodeResourceStatusReader,
     network_slots_memory_clamp: bool,
+    network_slots_applied: network_slots::AppliedNetworkSlotCapacity,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -53,6 +54,7 @@ fn spawn_network_slot_capacity_loop(
     kube: Client,
     node_cache: node_watch::NodeMetadataCache,
     node_name: String,
+    applied: network_slots::AppliedNetworkSlotCapacity,
     shutdown: CancellationToken,
 ) {
     tokio::spawn(async move {
@@ -73,6 +75,7 @@ fn spawn_network_slot_capacity_loop(
                 &node_cache,
                 &node_name,
                 true,
+                &applied,
             );
             tokio::select! {
                 () = shutdown.cancelled() => return,
@@ -109,11 +112,13 @@ impl Controller {
             network_slots_memory_clamp,
             "space Kubernetes node-local controller starting"
         );
+        let network_slots_applied = network_slots::AppliedNetworkSlotCapacity::default();
         if network_slots_memory_clamp {
             spawn_network_slot_capacity_loop(
                 kube.clone(),
                 node_cache.clone(),
                 node_name.clone(),
+                network_slots_applied.clone(),
                 shutdown.child_token(),
             );
         }
@@ -132,6 +137,7 @@ impl Controller {
             ),
             resource_status_reader,
             network_slots_memory_clamp,
+            network_slots_applied,
         }))
     }
 
@@ -183,6 +189,7 @@ impl Controller {
             &self.node_cache,
             &self.node_name,
             self.network_slots_memory_clamp,
+            &self.network_slots_applied,
         )
         .await
     }
