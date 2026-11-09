@@ -480,12 +480,15 @@ class SmokeServices:
         context.record("sandbox_ids", sandbox_ids)
         collection = _NativeScenarioSandboxes(native, tuple(sandboxes))
 
-        def create_owned_sandbox() -> DurableLifecycleSandbox:
+        def create_owned_sandbox(*, idle_timeout: str | None = None) -> DurableLifecycleSandbox:
             # Native create deletes a sandbox whose create failed; the delete
             # of one that started is armed before it is handed out.
             created = cast(
                 DurableLifecycleSandbox,
-                native.create({**run_metadata, "space_smoke_instance": uuid.uuid4().hex}),
+                native.create(
+                    {**run_metadata, "space_smoke_instance": uuid.uuid4().hex},
+                    idle_timeout=idle_timeout,
+                ),
             )
             context.scope.defer(
                 f"delete Native sandbox {created.sandbox_id}",

@@ -893,7 +893,7 @@ class CommandSandboxFixture:
     _encrypted_resuspend_control: EncryptedResuspendControl | None = None
     _stopped_replacement_control: StoppedReplacementControl | None = None
     _drain_v2_control: DrainV2Control | None = None
-    _create_sandbox: Callable[[], DurableLifecycleSandbox] | None = None
+    _create_sandbox: Callable[..., DurableLifecycleSandbox] | None = None
     _processes: ProcessSandbox | None = None
 
     fixture_name: ClassVar[str] = "command_sandbox"

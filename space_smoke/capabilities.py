@@ -210,6 +210,22 @@ class StoppableLifecycleSandbox(CommandSandbox, Protocol):
     def start(self) -> None: ...
 
 
+class OperationLifecycleSandbox(CommandSandbox, Protocol):
+    """Command sandbox whose lifecycle calls are recorded operations a caller can follow."""
+
+    def request_lifecycle(self, verb: str) -> str:
+        """Ask for `verb` (`wake`, `resume`, ...) without waiting; the operation's id."""
+        ...
+
+    def operation(self, operation_id: str) -> dict[str, object]:
+        """The operation as `GET /v1/operations/{id}` answers it."""
+        ...
+
+    def state(self) -> str:
+        """The sandbox's state as the public API reports it."""
+        ...
+
+
 class ProcessHandle(Protocol):
     @property
     def process_id(self) -> str: ...
@@ -1889,6 +1905,10 @@ class DrainV2Control(DeadNodeControl, DrainRestoreControl, Protocol):
     def scale_controller(self, replicas: int, *, timeout: float) -> int:
         """Scale the cluster-controller Deployment (0..2) under the caller's
         controller-mutation Lease and await it; the replicas it had."""
+        ...
+
+    def sandbox_placements(self, sandbox_ids: Sequence[str]) -> dict[str, tuple[str, str | None]]:
+        """Each sandbox's lifecycle and active node id, by bare id, in one read."""
         ...
 
 
