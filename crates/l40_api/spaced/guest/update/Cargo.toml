@@ -24,3 +24,6 @@ pplx-space-test-env = { workspace = true }
 pplx-space-cpu-arch = { workspace = true }
 tempfile = { workspace = true }
 semver = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem", "Win32_System_SystemInformation", "Win32_System_Registry", "Win32_Security"] }

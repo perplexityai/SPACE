@@ -60,6 +60,13 @@ fn status(
 }
 
 fn service_main(_: Vec<OsString>) {
+    let _workload_job = match super::recovery::contain_service() {
+        Ok(job) => job,
+        Err(error) => {
+            tracing::error!(%error, "cannot contain guest service workloads");
+            return;
+        }
+    };
     let shutdown = CancellationToken::new();
     let stop = shutdown.clone();
     let handle = match service_control_handler::register(SERVICE_NAME, move |event| match event {
@@ -79,7 +86,7 @@ fn service_main(_: Vec<OsString>) {
     let result = status(handle, ServiceState::StartPending, false)
         .map_err(super::RunError::Service)
         .and_then(|()| {
-            super::serve(shutdown, || {
+            super::serve(shutdown, move || {
                 status(handle, ServiceState::Running, false).map_err(super::RunError::Service)
             })
         });

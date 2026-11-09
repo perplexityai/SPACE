@@ -176,7 +176,12 @@ impl SandboxManagerService {
             ));
         }
         qualify(&sandbox, Some(&bundle.policy), OPERATION_BUDGET)?;
-        self.probe_update_contract(&sandbox).await?;
+        let platform = self.probe_update_contract(&sandbox).await?;
+        if bundle.descriptor.recovery_platform().map_err(internal)? != platform {
+            return Err(Status::failed_precondition(
+                "target bundle does not support this guest recovery contract",
+            ));
+        }
         self.admit_guest_update(Intent {
             operation: uuid(&req.operation_id)?,
             sandbox: sandbox.id.parse().map_err(internal)?,
@@ -312,7 +317,10 @@ impl SandboxManagerService {
         Ok(Response::new(response(&record, None)))
     }
 
-    async fn probe_update_contract(&self, sandbox: &crate::db::SandboxRow) -> Result<(), Status> {
+    async fn probe_update_contract(
+        &self,
+        sandbox: &crate::db::SandboxRow,
+    ) -> Result<model::RecoveryPlatform, Status> {
         let status = self
             .connect_spaced_host(sandbox)
             .await?
@@ -320,12 +328,8 @@ impl SandboxManagerService {
             .get_status(request(wire::StatusRequest {}))
             .await?
             .into_inner();
-        if status.seed_contract != model::SEED_CONTRACT {
-            return Err(Status::failed_precondition(
-                "guest selector contract is not supported",
-            ));
-        }
-        Ok(())
+        model::RecoveryPlatform::from_contract(&status.seed_contract)
+            .ok_or_else(|| Status::failed_precondition("guest selector contract is not supported"))
     }
 
     fn update_record(&self, operation: Uuid) -> Result<Record, Status> {
@@ -450,7 +454,7 @@ impl SandboxManagerService {
             .get_status(request(wire::StatusRequest {}))
             .await?
             .into_inner();
-        if observed.seed_contract != model::SEED_CONTRACT {
+        if model::RecoveryPlatform::from_contract(&observed.seed_contract).is_none() {
             return Err(Status::failed_precondition(
                 "guest selector contract is not qualified",
             ));
@@ -524,6 +528,10 @@ impl SandboxManagerService {
                 }
             };
             if qualify(&sandbox, Some(&bundle.policy), OPERATION_BUDGET).is_err()
+                || !bundle
+                    .descriptor
+                    .seed_contracts
+                    .contains(&observed.seed_contract)
                 || (!record.intent.force && !observed.defer_reasons.is_empty())
             {
                 return self

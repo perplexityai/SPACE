@@ -2907,6 +2907,23 @@ impl SandboxManagerService {
             ) {
                 ActivationEndpointProofRequirement::DeferredUntilPoolAdoption => None,
                 ActivationEndpointProofRequirement::Required => {
+                    // CH recreates its vsock listener when the guest driver
+                    // initializes. Capturing before the first guest handshake
+                    // would persist the pre-boot inode and reject every later
+                    // attested connection. Keep the activation fence until the
+                    // agent is ready, then capture the runtime-owned endpoint.
+                    // Serving paths must never refresh a mismatched proof.
+                    if prepare_source.execution.runtime().kind
+                        == pplx_space_common_core::types::RuntimeKind::CloudHypervisor
+                    {
+                        super::activation_support::wait_ready_via_spaced_host(
+                            id,
+                            Duration::from_secs(ready_timeout_secs.into()),
+                            "cold-endpoint-attestation",
+                        )
+                        .await
+                        .map_err(|error| activation_cleanup.failure(error))?;
+                    }
                     let endpoint_runtime = match endpoint_runtime_identity_for_activation(
                         id,
                         &route_identity,

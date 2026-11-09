@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import re
 import shlex
@@ -381,11 +382,32 @@ class DirectNodeRecoveryFixture:
             self.context.wait(1)
 
     def start_agent_workload(self) -> int:
-        output = self._agent_run(["--background", "--", "/usr/bin/gnusleep", "infinity"])
+        child_file = rf"C:\Users\user\space-update-{self.marker}.child"
+        script = (
+            "$ErrorActionPreference = 'Stop'; "
+            "$child = Start-Process powershell.exe -ArgumentList "
+            "'-NoProfile -NonInteractive -Command Start-Sleep -Seconds 1200' -PassThru; "
+            f"$child.Id | Set-Content -LiteralPath '{child_file}'; Start-Sleep -Seconds 1200"
+        )
+        program = (
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-EncodedCommand",
+             base64.b64encode(script.encode("utf-16le")).decode("ascii")]
+            if self.config.firmware_lifecycle else ["/usr/bin/gnusleep", "infinity"]
+        )
+        output = self._agent_run(["--background", "--", *program])
         pid = re.search(r"\bpid=(\d+)\b", output)
         if pid is None:
             raise RuntimeError("process start did not return its guest PID")
         return int(pid[1])
+
+    def windows_workload_descendant(self) -> int:
+        path = rf"C:\Users\user\space-update-{self.marker}.child"
+        output = self.agent_command(
+            f"$until = (Get-Date).AddSeconds(10); while (!(Test-Path -LiteralPath '{path}')) {{ "
+            "if ((Get-Date) -ge $until) { throw 'Descendant did not start' }; Start-Sleep -Milliseconds 100 }; "
+            f"Get-Content -LiteralPath '{path}'"
+        )
+        return int(output)
 
     def _agent_run(self, arguments: list[str]) -> str:
         # The per-sandbox bridge socket is private to root and service users.
@@ -407,7 +429,13 @@ class DirectNodeRecoveryFixture:
                 self.context.wait(0.5)
 
     def agent_command(self, command: str) -> str:
-        output = self._agent_run(["--user", "root", "--", "/bin/sh", "-c", command])
+        if self.config.firmware_lifecycle:
+            script = "$ErrorActionPreference = 'Stop'; " + command
+            encoded = base64.b64encode(script.encode("utf-16le")).decode("ascii")
+            arguments = ["--", "powershell.exe", "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded]
+        else:
+            arguments = ["--user", "root", "--", "/bin/sh", "-c", command]
+        output = self._agent_run(arguments)
         lines = output.splitlines()
         if not lines or not lines[0].startswith("started process_id=") or lines[-1] != "exit_code=0":
             raise RuntimeError(f"agent command did not complete successfully: {output}")

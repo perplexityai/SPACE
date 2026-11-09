@@ -1,8 +1,14 @@
 # Install the native service and optionally provision a regular process/file account.
 # Memory lifecycle also requires the qualified CH environment and matching host services.
-[CmdletBinding()]
-param([Parameter(Mandatory = $true)][string]$Executable, [switch]$EnableOperations)
+[CmdletBinding(DefaultParameterSetName = 'Legacy')]
+param(
+    [Parameter(Mandatory = $true, ParameterSetName = 'Legacy')][string]$Executable,
+    [Parameter(Mandatory = $true, ParameterSetName = 'Update')][string]$Bundle,
+    [switch]$EnableOperations
+)
 $ErrorActionPreference = 'Stop'
+$update = $PSCmdlet.ParameterSetName -eq 'Update'
+if ($update) { $Executable = Join-Path $Bundle 'spaced-svc.exe' }
 $source = (Resolve-Path -LiteralPath $Executable).Path
 $directory = Join-Path $env:ProgramData 'SPACE'
 $target = Join-Path $directory 'spaced-svc.exe'
@@ -67,11 +73,64 @@ if ($EnableOperations) {
         }
     }
 }
+if ($update) {
+    if ($env:ProgramData -cne 'C:\ProgramData' -or $env:SystemRoot -cne 'C:\Windows') {
+        throw 'The qualified recovery contract requires standard C: system paths.'
+    }
+    $root = Join-Path $directory 'agent'
+    if (Test-Path -LiteralPath $root) {
+        throw 'Agent slots already exist. Use manager-owned guest update for installed images.'
+    }
+    # Image preparation only: source bytes are verified by the slot initializer.
+    $slot = Join-Path $root 'slots\a'
+    New-Item -ItemType Directory -Path $slot | Out-Null
+    New-Item -ItemType Directory -Path (Join-Path $root 'slots\b') | Out-Null
+    foreach ($name in @('spaced-svc.exe', 'spaced.exe', 'artifact.json')) {
+        Copy-Item -LiteralPath (Join-Path $Bundle $name) -Destination (Join-Path $slot $name)
+    }
+    & (Join-Path $slot 'spaced-svc.exe') --initialize-update $root
+    if ($LASTEXITCODE -ne 0) { throw 'Invalid initial agent bundle.' }
+    [IO.File]::WriteAllBytes((Join-Path $root 'recovery-lock'), [byte[]]::new(0))
+    Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'recover-spaced.ps1') -Destination (Join-Path $root 'recover-spaced.ps1')
+}
 $existing = Get-CimInstance Win32_Service -Filter "Name='spaced'"
 if ($existing -and $existing.PathName.Trim('"') -ne $target) {
     throw 'An unrelated spaced service already exists; refusing to replace it.'
 }
 if ($existing) { Stop-Service spaced }
+if ($update) {
+    $target = Join-Path $slot 'spaced-svc.exe'
+    if (-not $existing) {
+        New-Service -Name spaced -BinaryPathName ('"' + $target + '"') -StartupType Manual -DependsOn VirtioSocket | Out-Null
+    } else {
+        sc.exe config spaced binPath= ('"' + $target + '"') start= demand depend= VirtioSocket | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw 'Could not configure slotted spaced service.' }
+    }
+    $actionPath = Join-Path $root 'recover-spaced.ps1'
+    $powershell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    $settings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Seconds 60) -StartWhenAvailable -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
+    $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+    $boot = New-ScheduledTaskTrigger -AtStartup
+    $expiry = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) -RepetitionInterval (New-TimeSpan -Minutes 1)
+    foreach ($entry in @(
+        @{ Name = 'SPACE-Guest-Recovery'; Trigger = $boot; Suffix = '' },
+        @{ Name = 'SPACE-Guest-Expiry'; Trigger = $expiry; Suffix = ' -ExpiredOnly' }
+    )) {
+        $action = New-ScheduledTaskAction -Execute $powershell -Argument ('-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + $actionPath + '"' + $entry.Suffix)
+        Register-ScheduledTask -TaskName $entry.Name -Action $action -Trigger $entry.Trigger -Settings $settings -Principal $principal -Force | Out-Null
+    }
+    # No native restart action: every new generation must run the selector first.
+    $recoveryCommand = '"' + $env:SystemRoot + '\System32\schtasks.exe" /Run /TN SPACE-Guest-Recovery'
+    sc.exe failure spaced reset= 86400 actions= run/2000/run/5000/run/10000 command= $recoveryCommand | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw 'Could not configure selector failure recovery.' }
+    sc.exe failureflag spaced 1 | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw 'Could not enable selector failure recovery.' }
+    # Retire the legacy third executable after SCM has stopped using it.
+    $legacy = Join-Path $directory 'spaced-svc.exe'
+    if (Test-Path -LiteralPath $legacy) { Remove-Item -LiteralPath $legacy -Force }
+    Start-ScheduledTask -TaskName SPACE-Guest-Recovery
+    return
+}
 # Unlink an old destination instead of writing through a possible hard link.
 if (Test-Path -LiteralPath $target) { Remove-Item -LiteralPath $target -Force }
 Copy-Item -LiteralPath $source -Destination $target -Force

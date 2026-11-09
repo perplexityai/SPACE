@@ -248,6 +248,7 @@ runpy.run_module("space_smoke", run_name="__main__")
                 "node.windows_agent_operations",
                 "node.windows_agent_readiness",
                 "node.windows_base_memory",
+                "node.windows_guest_update",
                 "node.windows_memory_lifecycle",
                 "node.windows_sandbox_lifecycle",
             ],
