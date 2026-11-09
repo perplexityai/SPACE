@@ -1503,6 +1503,34 @@ async fn pause_of_a_sandbox_without_a_runtime_fails_as_a_conflict() -> TestResul
             "{state}: a refused pause leaves the sandbox as it was"
         );
     }
+
+    // A checkpoint returns the sandbox to the state it left, with its runtime,
+    // so a pause during one is not refused, though its public state reads as
+    // suspending.
+    let sandbox_id = seed_sandbox(
+        &db.pool,
+        SandboxSeed {
+            org_id,
+            user_id,
+            lifecycle: SandboxLifecycle::Checkpointing,
+            placement: SeedSandboxPlacement::Unplaced,
+        },
+    )
+    .await?;
+    let operation = ClaimedPublicOperation {
+        kind: OperationKind::PauseSandbox,
+        payload: serde_json::to_value(SandboxLifecycleOperationPayload {
+            sandbox_id: PublicSandboxId::from(sandbox_id),
+            action: SandboxLifecycleAction::Pause,
+            rollback: None,
+            wake_activity: None,
+        })?,
+        ..claimed_delete_operation(sandbox_id, org_id, Some(user_id), ApiProduct::Native)
+    };
+    let result = executor.execute(&operation).await;
+    // It goes on to dispatch, which waits for this unplaced sandbox's node.
+    assert_eq!(result.state, OperationState::Queued, "{result:?}");
+    assert_eq!(result.terminal_error_code, None, "{result:?}");
     Ok(())
 }
 

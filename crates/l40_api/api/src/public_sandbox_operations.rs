@@ -849,7 +849,9 @@ impl SandboxLifecycleOperationExecutor {
                 "sandbox lifecycle action already completed",
             ));
         }
-        if payload.action == SandboxLifecycleAction::Pause && pause_cannot_succeed(&current_state) {
+        if payload.action == SandboxLifecycleAction::Pause
+            && pause_cannot_succeed(sandbox.lifecycle.parse()?)
+        {
             return Err(SandboxLifecycleExecutionError::NotRunning {
                 sandbox_id: payload.sandbox_id,
                 action: payload.action,
@@ -1116,21 +1118,30 @@ fn completed_lifecycle_target_state(
     }
 }
 
-/// Whether a pause of a sandbox in `state` can only fail: it needs the
-/// resident runtime that these states lack or are giving up, and no retry
-/// brings it back. Other states reach the node, which pauses a running
-/// sandbox or answers why it cannot.
-fn pause_cannot_succeed(state: &SandboxLifecycleState) -> bool {
-    matches!(
-        state,
-        SandboxLifecycleState::Suspending
-            | SandboxLifecycleState::Suspended
-            | SandboxLifecycleState::Stopping
-            | SandboxLifecycleState::Stopped
-            | SandboxLifecycleState::Failed
-            | SandboxLifecycleState::Deleting
-            | SandboxLifecycleState::Deleted
-    )
+/// Whether a pause of a sandbox in `lifecycle` can only fail: it needs the
+/// resident runtime these lifecycles lack or are giving up, and no retry
+/// brings it back. A checkpoint returns the sandbox to the state it left, so
+/// it reaches the node like the other transient lifecycles, and the node
+/// pauses a running sandbox or answers why it cannot.
+fn pause_cannot_succeed(lifecycle: SandboxLifecycle) -> bool {
+    match lifecycle {
+        SandboxLifecycle::Suspending
+        | SandboxLifecycle::Suspended
+        | SandboxLifecycle::Stopping
+        | SandboxLifecycle::Stopped
+        | SandboxLifecycle::Deleting
+        | SandboxLifecycle::Failed
+        | SandboxLifecycle::Quarantined => true,
+        SandboxLifecycle::Created
+        | SandboxLifecycle::Creating
+        | SandboxLifecycle::Starting
+        | SandboxLifecycle::Started
+        | SandboxLifecycle::Restoring
+        | SandboxLifecycle::Pausing
+        | SandboxLifecycle::Paused
+        | SandboxLifecycle::Resuming
+        | SandboxLifecycle::Checkpointing => false,
+    }
 }
 
 /// A native wake operation with no actor is the system's wake for a session
