@@ -65,38 +65,6 @@ pub const TRANSITION_RECEIPT_RECORD_COLUMNS: &str = "
     pod_uid TEXT
 ";
 
-/// Key-share lock the `sandboxes` rows of the published sandboxes, in id
-/// order. A publication calls this before it writes those sandboxes'
-/// `sandbox_observed_states` rows or the `sandboxes` rows themselves.
-///
-/// Deletes lock the `sandboxes` row first (`FOR UPDATE`, or the `DELETE`
-/// itself) and its dependents after it, as
-/// [`crate::delete::delete_with_dependents`] does under a caller's row lock.
-/// A publication that wrote a dependent row first and the `sandboxes` row
-/// second waited on such a delete while the delete waited on it, and
-/// Postgres aborted one of them with `deadlock detected`. Taking this lock
-/// first makes the publication wait for the delete before it writes
-/// anything the delete needs.
-///
-/// `FOR KEY SHARE` conflicts only with `FOR UPDATE` and `DELETE`, so the
-/// publication still runs beside the `FOR NO KEY UPDATE` writers of the row.
-/// Missing ids lock nothing.
-pub async fn lock_published_sandboxes(
-    executor: impl sqlx::PgExecutor<'_>,
-    sandbox_ids: &[SandboxId],
-) -> Result<(), sqlx::Error> {
-    sqlx::query(sql!(
-        "SELECT id FROM sandboxes
-          WHERE id = ANY($1)
-          ORDER BY id
-          FOR KEY SHARE"
-    ))
-    .bind(sandbox_ids)
-    .execute(executor)
-    .await?;
-    Ok(())
-}
-
 /// Mark the publisher's claimed rows `quarantined`, returning the ids that
 /// flipped. **Observed projection**: the node reported a quarantine hold.
 ///

@@ -4807,11 +4807,11 @@ async fn only_a_pruned_inventory_stamps_the_census_timestamp() -> TestResult {
     Ok(())
 }
 
-/// A node publication and a delete that already holds the sandbox row lock
-/// (the cluster controller's orphan finalize) both write the sandbox's
-/// observed state and its `sandboxes` row. They must take those locks in the
-/// same order, or each waits on the other and Postgres aborts one with
-/// `deadlock detected`.
+/// A node publication writes a sandbox's observed state and then its
+/// `sandboxes` row. A delete that locks the `sandboxes` row (the cluster
+/// controller's orphan finalize, the API's user delete) must lock the
+/// observed state first, or each waits on the other and Postgres aborts one
+/// with `deadlock detected`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn publication_racing_a_locked_delete_does_not_deadlock() -> TestResult {
     let Some(db) = try_pg_test_db_with_max_connections(4).await? else {
@@ -4833,6 +4833,12 @@ async fn publication_racing_a_locked_delete_does_not_deadlock() -> TestResult {
     drop(conn);
 
     let mut delete = db.pool.begin().await?;
+    pplx_space_sandbox_store::delete::lock_observed_states_for_delete(
+        &mut *delete,
+        sandbox_id,
+        false,
+    )
+    .await?;
     sqlx::query(sql!("SELECT id FROM sandboxes WHERE id = $1 FOR UPDATE"))
         .bind(sandbox_id)
         .execute(&mut *delete)
@@ -4852,7 +4858,7 @@ async fn publication_racing_a_locked_delete_does_not_deadlock() -> TestResult {
         TestResult::Ok(())
     });
 
-    // Let the publication run until it waits on the delete's row lock.
+    // Let the publication run until it waits on the delete's locks.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     while sqlx::query_scalar::<_, i64>(sql!(
         "SELECT COUNT(*) FROM pg_stat_activity
@@ -4864,7 +4870,7 @@ async fn publication_racing_a_locked_delete_does_not_deadlock() -> TestResult {
     {
         assert!(
             std::time::Instant::now() < deadline,
-            "the publication never waited on the delete's row lock"
+            "the publication never waited on the delete's locks"
         );
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }

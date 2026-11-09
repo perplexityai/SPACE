@@ -1508,9 +1508,6 @@ pub async fn publish_sandbox_states_with_retirement(
     let mut post_commit_state_convergence = Vec::new();
     let mut publishes_network_policy = false;
 
-    // Locked before this publication's first write; see
-    // `lock_published_sandboxes`.
-    let published_ids = states_by_id.keys().copied().collect::<Vec<_>>();
     for (sandbox_id, state) in states_by_id {
         let sandbox_uuid = sandbox_id;
         if !state.present {
@@ -1857,10 +1854,6 @@ pub async fn publish_sandbox_states_with_retirement(
             publishes_network_policy |= row_publishes_network_policy;
         }
     }
-
-    pplx_space_sandbox_store::ingest::lock_published_sandboxes(&mut *conn, &published_ids)
-        .await
-        .map_err(|err| Status::internal(format!("lock published sandboxes: {err}")))?;
 
     let mut accepted = 0_u64;
     if !absent_ids.is_empty() {

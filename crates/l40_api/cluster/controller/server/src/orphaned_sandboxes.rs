@@ -46,7 +46,7 @@
 use pplx_space_common_core::types::NodeId;
 
 use pplx_space_common_core::sql;
-use pplx_space_sandbox_store::delete::delete_with_dependents;
+use pplx_space_sandbox_store::delete::{delete_with_dependents, lock_observed_states_for_delete};
 use pplx_space_sandbox_teardown::delete_reconcile_state_for_elements;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -1239,6 +1239,9 @@ impl OrphanActionSink for SubstrateActionSink {
             // Re-plan after cleanup so a concurrent lifecycle/execution
             // change prevents finalization rather than deleting fresh state.
             let mut finalize_tx = self.pool.begin().await?;
+            // Before the plan's sandboxes row lock; see
+            // `lock_observed_states_for_delete`.
+            lock_observed_states_for_delete(&mut *finalize_tx, sandbox_id, false).await?;
             let Some(final_plan) =
                 plan_orphan_in_tx(&mut finalize_tx, sandbox_id, &guard, true).await?
             else {

@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use sqlx::PgPool;
 
-use pplx_space_sandbox_store::delete::delete_with_dependents;
+use pplx_space_sandbox_store::delete::{delete_with_dependents, lock_observed_states_for_delete};
 use pplx_space_sandbox_store::fork_source_lifecycle::{
     active_fork_source_operation_exists, lock_fork_source_lifecycle,
 };
@@ -140,6 +140,8 @@ pub async fn finalize_sandbox_db_delete_user_initiated(
     sandbox_id: SandboxId,
 ) -> Result<(), FinalizeSandboxDbDeleteError> {
     let mut tx = pool.begin().await?;
+    // Before any sandboxes row lock; see `lock_observed_states_for_delete`.
+    lock_observed_states_for_delete(&mut *tx, sandbox_id, false).await?;
     lock_fork_source_lifecycle(&mut tx, sandbox_id).await?;
     // Lock the parent sandbox row to serialize against any
     // concurrent BeginArtifactBackup INSERT (which acquires the
