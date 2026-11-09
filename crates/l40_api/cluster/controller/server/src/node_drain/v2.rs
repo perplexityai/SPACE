@@ -7,6 +7,12 @@
 //! `DrainNode` seals it and makes every resident durable elsewhere. This loop
 //! asks it, each tick, and records what it reports:
 //!
+//! - **`draining`, waiting**: the admin route starts every v2 drain waiting
+//!   for one of the cluster's evacuation slots (`drain_status.waiting`).
+//!   At most [`DEFAULT_MAX_EVACUATING_NODES`] nodes evacuate at once (sealed
+//!   and not yet `drained`); a waiting node is admitted, oldest drain first,
+//!   once one frees. Until then it stays cordoned and gets no `DrainNode`
+//!   call, so it isn't sealed and the drain gate refuses no user call on it.
 //! - **`draining` and `drained`**: reconcile the cordon, call `DrainNode`
 //!   under the epoch, and for each sandbox the node reports evacuated,
 //!   enqueue the drain restore operation that brings a suspended one back to
@@ -68,6 +74,20 @@ pub struct V2Node {
     pub cancel: bool,
     /// `drain_status.terminated`: the terminator acted on the node.
     pub terminated: bool,
+    /// `drain_status.waiting`: a `draining` node still waiting for an
+    /// evacuation slot.
+    pub waiting: bool,
+}
+
+impl V2Node {
+    /// Sealed, or about to be, under its epoch and not yet `drained`.
+    fn evacuating(&self) -> bool {
+        self.epoch.is_some() && self.phase.as_deref() == Some("draining") && !self.waiting
+    }
+
+    fn awaiting_slot(&self) -> bool {
+        self.epoch.is_some() && self.phase.as_deref() == Some("draining") && self.waiting
+    }
 }
 
 /// What recording one reported evacuation found.
@@ -93,6 +113,13 @@ pub trait DrainV2Sink: Send + Sync + 'static {
     fn list_v2_nodes(
         &self,
     ) -> impl std::future::Future<Output = Result<Vec<V2Node>, String>> + Send;
+    /// Admit the waiting drain under `epoch` to an evacuation slot; false
+    /// when the row is no longer that epoch's waiting `draining` node.
+    fn admit_evacuation(
+        &self,
+        node_id: NodeId,
+        epoch: u64,
+    ) -> impl std::future::Future<Output = Result<bool, String>> + Send;
     /// Converge the node's cordon, as the v1 drain does.
     fn ensure_cordon(
         &self,
@@ -146,6 +173,7 @@ pub trait DrainV2Sink: Send + Sync + 'static {
 /// What one tick did, for tests and logs.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct V2TickReport {
+    pub admitted: Vec<NodeId>,
     pub drained: Vec<NodeId>,
     pub cancelled: Vec<NodeId>,
     pub terminated: Vec<NodeId>,
@@ -193,6 +221,13 @@ pub fn report_json(
 /// and a slow node must not hold up the rest.
 const NODE_CONCURRENCY: usize = 8;
 
+/// How many v2 nodes may evacuate at once by default
+/// (`SPACE_DRAIN_V2_MAX_EVACUATING_NODES`). Each node runs its own window of
+/// suspends and uploads (sandbox-manager's `SPACE_DRAIN_NODE_WINDOW`, 8), so
+/// 4 nodes put at most 32 sandboxes' suspends and uploads in flight across
+/// the cluster, half the 64 the v1 drain shared with its restores.
+pub const DEFAULT_MAX_EVACUATING_NODES: usize = 4;
+
 /// What one tick did to a node.
 enum NodeStep {
     Cancelled,
@@ -200,18 +235,24 @@ enum NodeStep {
     Terminated,
 }
 
-/// One pass over every v2 node, [`NODE_CONCURRENCY`] at a time.
-pub async fn tick<S: DrainV2Sink, T: InstanceTerminator>(sink: &S, terminator: &T) -> V2TickReport {
+/// One pass over every v2 node, [`NODE_CONCURRENCY`] at a time, with at
+/// most `max_evacuating` of them evacuating.
+pub async fn tick<S: DrainV2Sink, T: InstanceTerminator>(
+    sink: &S,
+    terminator: &T,
+    max_evacuating: usize,
+) -> V2TickReport {
     use futures_util::StreamExt as _;
 
     let mut report = V2TickReport::default();
-    let nodes = match sink.list_v2_nodes().await {
+    let mut nodes = match sink.list_v2_nodes().await {
         Ok(nodes) => nodes,
         Err(error) => {
             tracing::warn!(%error, "node_drain v2: listing v2 nodes failed");
             return report;
         }
     };
+    report.admitted = admit(sink, &mut nodes, max_evacuating).await;
     let steps: Vec<_> = futures_util::stream::iter(nodes)
         .map(|node| async move { (node.id, step(sink, terminator, &node).await) })
         .buffered(NODE_CONCURRENCY)
@@ -244,6 +285,14 @@ async fn step<S: DrainV2Sink, T: InstanceTerminator>(
             .await
             .then_some(NodeStep::Cancelled),
         None => None,
+        Some("draining") if node.waiting => {
+            // Fenced, but not sealed: it waits for a slot.
+            if let Err(error) = sink.ensure_cordon(node.id).await {
+                sink.record_error(node.id, &format!("cordon convergence failed: {error}"))
+                    .await;
+            }
+            None
+        }
         Some("draining") | Some("drained") => {
             drain(sink, node, epoch).await.then_some(NodeStep::Drained)
         }
@@ -257,6 +306,41 @@ async fn step<S: DrainV2Sink, T: InstanceTerminator>(
             None
         }
     }
+}
+
+/// Admit waiting drains, oldest first (the epoch is the drain's start),
+/// while fewer than `max_evacuating` nodes evacuate. Returns the nodes
+/// admitted; each is marked evacuating in `nodes`, so this tick seals it.
+async fn admit<S: DrainV2Sink>(
+    sink: &S,
+    nodes: &mut [V2Node],
+    max_evacuating: usize,
+) -> Vec<NodeId> {
+    let evacuating = nodes.iter().filter(|node| node.evacuating()).count();
+    let mut waiting: Vec<&mut V2Node> = nodes
+        .iter_mut()
+        .filter(|node| node.awaiting_slot())
+        .collect();
+    waiting.sort_by_key(|node| node.epoch);
+    let mut admitted = Vec::new();
+    for node in waiting
+        .into_iter()
+        .take(max_evacuating.saturating_sub(evacuating))
+    {
+        let Some(epoch) = node.epoch else { continue };
+        match sink.admit_evacuation(node.id, epoch).await {
+            Ok(true) => {
+                node.waiting = false;
+                admitted.push(node.id);
+            }
+            Ok(false) => {}
+            Err(error) => {
+                sink.record_error(node.id, &format!("admitting the drain failed: {error}"))
+                    .await;
+            }
+        }
+    }
+    admitted
 }
 
 /// Ask the node, record what it reports, and advance a `draining` node that
@@ -389,10 +473,12 @@ pub async fn run<S: DrainV2Sink, T: InstanceTerminator>(
     sink: S,
     terminator: T,
     tick_every: Duration,
+    max_evacuating: usize,
     shutdown: CancellationToken,
 ) {
     tracing::info!(
         tick_secs = tick_every.as_secs(),
+        max_evacuating,
         "starting the node drain's v2 loop"
     );
     let mut interval = tokio::time::interval(tick_every);
@@ -402,7 +488,7 @@ pub async fn run<S: DrainV2Sink, T: InstanceTerminator>(
             () = shutdown.cancelled() => break,
             _ = interval.tick() => {}
         }
-        let report = tick(&sink, &terminator).await;
+        let report = tick(&sink, &terminator, max_evacuating).await;
         if report != V2TickReport::default() {
             tracing::info!(?report, "node_drain v2: tick");
         }

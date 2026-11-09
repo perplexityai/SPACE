@@ -32,6 +32,11 @@ impl DrainV2Sink for FakeSink {
         Ok(self.nodes.clone())
     }
 
+    async fn admit_evacuation(&self, node_id: NodeId, epoch: u64) -> Result<bool, String> {
+        self.log(format!("admit {node_id} {epoch}"));
+        Ok(true)
+    }
+
     async fn ensure_cordon(&self, node_id: NodeId) -> Result<(), String> {
         self.log(format!("cordon {node_id}"));
         Ok(())
@@ -124,6 +129,7 @@ fn node(phase: Option<&str>, epoch: Option<u64>, cancel: bool) -> V2Node {
         epoch,
         cancel,
         terminated: false,
+        waiting: false,
     }
 }
 
@@ -151,8 +157,65 @@ async fn a_v2_node_without_an_epoch_gets_no_call() {
         nodes: vec![node(Some("draining"), None, false)],
         ..FakeSink::default()
     };
-    tick(&sink, &FakeTerminator::ok()).await;
+    tick(&sink, &FakeTerminator::ok(), DEFAULT_MAX_EVACUATING_NODES).await;
     assert!(sink.calls().is_empty(), "{:?}", sink.calls());
+}
+
+/// At most the cap's nodes evacuate: a waiting drain is admitted, oldest
+/// first, only to a free slot, and sealed in the tick that admits it. A
+/// drained node holds no slot. The ones still waiting are cordoned and get
+/// no `DrainNode` call, so nothing seals them.
+#[tokio::test]
+async fn waiting_drains_are_admitted_oldest_first_up_to_the_cap() {
+    let waiting = |epoch: u64| V2Node {
+        waiting: true,
+        ..node(Some("draining"), Some(epoch), false)
+    };
+    let evacuating = node(Some("draining"), Some(1), false);
+    let drained = node(Some("drained"), Some(2), false);
+    let (newest, oldest, middle) = (waiting(30), waiting(10), waiting(20));
+    let nodes = vec![
+        evacuating.clone(),
+        drained.clone(),
+        newest.clone(),
+        oldest.clone(),
+        middle.clone(),
+    ];
+    let sink = FakeSink {
+        responses: nodes
+            .iter()
+            .map(|node| ((node.id, false), Ok(response(node.epoch, false, &[]))))
+            .collect(),
+        nodes,
+        ..FakeSink::default()
+    };
+    let report = tick(&sink, &FakeTerminator::ok(), 2).await;
+    assert_eq!(report.admitted, [oldest.id]);
+    let calls = sink.calls();
+    assert!(
+        calls.contains(&format!("admit {} 10", oldest.id)),
+        "{calls:?}"
+    );
+    for sealed in [&evacuating, &drained, &oldest] {
+        assert!(
+            calls.contains(&format!(
+                "drain_node {} {} cancel=false",
+                sealed.id,
+                sealed.epoch.unwrap()
+            )),
+            "{calls:?}"
+        );
+    }
+    for held in [&newest, &middle] {
+        assert!(calls.contains(&format!("cordon {}", held.id)), "{calls:?}");
+        assert!(
+            !calls
+                .iter()
+                .any(|call| call.starts_with(&format!("drain_node {}", held.id))
+                    || call.starts_with(&format!("admit {}", held.id))),
+            "{calls:?}"
+        );
+    }
 }
 
 /// A tick calls its nodes at once: two nodes whose `DrainNode` calls each
@@ -174,7 +237,7 @@ async fn a_tick_calls_its_nodes_at_once() {
     };
     tokio::time::timeout(
         std::time::Duration::from_secs(2),
-        tick(&sink, &FakeTerminator::ok()),
+        tick(&sink, &FakeTerminator::ok(), DEFAULT_MAX_EVACUATING_NODES),
     )
     .await
     .expect("the two calls wait for each other");
@@ -218,7 +281,7 @@ async fn draining_advances_only_on_a_done_report_under_its_epoch() {
             records: HashMap::from([("a".to_owned(), record)]),
             ..FakeSink::default()
         };
-        let report = tick(&sink, &FakeTerminator::ok()).await;
+        let report = tick(&sink, &FakeTerminator::ok(), DEFAULT_MAX_EVACUATING_NODES).await;
         assert_eq!(report.drained == [draining.id], advances, "{case}");
         let calls = sink.calls();
         assert_eq!(
@@ -251,7 +314,7 @@ async fn a_drained_node_keeps_reporting_and_never_advances() {
         responses: HashMap::from([((drained.id, false), Ok(response(Some(5), true, &[])))]),
         ..FakeSink::default()
     };
-    tick(&sink, &FakeTerminator::ok()).await;
+    tick(&sink, &FakeTerminator::ok(), DEFAULT_MAX_EVACUATING_NODES).await;
     let calls = sink.calls();
     assert!(
         calls.iter().any(|call| call.starts_with("report")),
@@ -303,7 +366,7 @@ async fn an_undrained_node_is_cancelled_until_unsealed() {
             responses: HashMap::from([((undrained.id, true), answer)]),
             ..FakeSink::default()
         };
-        let report = tick(&sink, &FakeTerminator::ok()).await;
+        let report = tick(&sink, &FakeTerminator::ok(), DEFAULT_MAX_EVACUATING_NODES).await;
         assert_eq!(report.cancelled == [undrained.id], clears, "{case}");
         let calls = sink.calls();
         assert!(calls[0].ends_with(" 5 cancel=true"), "{case}: {calls:?}");
@@ -318,7 +381,7 @@ async fn an_undrained_node_is_cancelled_until_unsealed() {
         nodes: vec![idle],
         ..FakeSink::default()
     };
-    tick(&sink, &FakeTerminator::ok()).await;
+    tick(&sink, &FakeTerminator::ok(), DEFAULT_MAX_EVACUATING_NODES).await;
     assert!(sink.calls().is_empty());
 }
 
@@ -343,7 +406,7 @@ async fn a_terminating_node_is_terminated_then_recorded_once() {
             nodes: vec![terminating.clone()],
             ..FakeSink::default()
         };
-        let report = tick(&sink, &terminator).await;
+        let report = tick(&sink, &terminator, DEFAULT_MAX_EVACUATING_NODES).await;
         assert_eq!(
             *terminator.calls.lock().unwrap(),
             [terminating.id],
@@ -368,7 +431,7 @@ async fn a_terminating_node_is_terminated_then_recorded_once() {
         ..FakeSink::default()
     };
     let terminator = FakeTerminator::ok();
-    let report = tick(&sink, &terminator).await;
+    let report = tick(&sink, &terminator, DEFAULT_MAX_EVACUATING_NODES).await;
     assert!(terminator.calls.lock().unwrap().is_empty());
     assert!(report.terminated.is_empty() && sink.calls().is_empty());
 }
@@ -389,7 +452,7 @@ async fn the_loop_owns_persisted_drains_without_terminating() {
         ]),
         ..FakeSink::default()
     };
-    let report = tick(&sink, &V2Terminator::Refuse).await;
+    let report = tick(&sink, &V2Terminator::Refuse, DEFAULT_MAX_EVACUATING_NODES).await;
     assert_eq!(report.drained, [draining.id]);
     assert_eq!(report.cancelled, [undrained.id]);
     assert!(report.terminated.is_empty());
@@ -418,7 +481,7 @@ async fn a_node_that_does_not_answer_shows_on_the_unanswered_gauge() {
             ..FakeSink::default()
         };
         let capture = pplx_space_metrics_emit::test_capture::capture_values_guard();
-        tick(&sink, &FakeTerminator::ok()).await;
+        tick(&sink, &FakeTerminator::ok(), DEFAULT_MAX_EVACUATING_NODES).await;
         let values = capture.finish();
         let gauge = values
             .iter()

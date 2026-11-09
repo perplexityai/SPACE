@@ -561,6 +561,10 @@ impl<'r> sqlx::Decode<'r, sqlx::Postgres> for NodeDrainPhase {
 pub struct NodeDrainState {
     pub phase: NodeDrainPhase,
     pub mode: NodeDrainMode,
+    /// A v2 drain still waiting for one of the cluster's evacuation slots
+    /// (`drain_status.waiting`): the node is fenced, but nothing on it is
+    /// sealed or evacuated yet.
+    pub awaiting_evacuation: bool,
 }
 
 impl NodeDrainState {
@@ -570,7 +574,17 @@ impl NodeDrainState {
         phase.map(|phase| Self {
             phase,
             mode: NodeDrainMode::from_column_str(mode),
+            awaiting_evacuation: false,
         })
+    }
+
+    /// Note whether the node's v2 drain still waits for an evacuation slot,
+    /// as `COALESCE((drain_status->>'waiting')::BOOLEAN, FALSE)` reads it. A
+    /// reader that never says so keeps the gate closed for a waiting drain.
+    #[must_use]
+    pub const fn awaiting_evacuation(mut self, awaiting: bool) -> Self {
+        self.awaiting_evacuation = awaiting;
+        self
     }
 
     /// Should a placement-affecting or access call against a sandbox resolved to
@@ -601,13 +615,21 @@ impl NodeDrainState {
     /// to forced starts blocking from that moment, because the guards read the
     /// live mode rather than the mode at drain start.
     ///
+    /// A forced v2 drain waiting for an evacuation slot doesn't block either:
+    /// its node is cordoned and out of placement, but nothing seals or
+    /// evacuates it until the slot frees, so there is no pipeline to race,
+    /// exactly as under a gentle drain. It blocks from the moment the
+    /// controller admits it, before it seals the node.
+    ///
     /// The inverse reading matters too, and is why this is shared: anything whose
     /// safety depends on wakes being refused (the legacy sandbox-id-only snapshot
     /// reupload, which reads the live on-disk snapshot directory) may only run
     /// when this returns `true`.
     pub const fn blocks_placement(self) -> bool {
         match self.phase {
-            NodeDrainPhase::Draining => self.mode.blocks_user_calls_while_draining(),
+            NodeDrainPhase::Draining => {
+                !self.awaiting_evacuation && self.mode.blocks_user_calls_while_draining()
+            }
             NodeDrainPhase::Drained | NodeDrainPhase::Terminating => true,
         }
     }

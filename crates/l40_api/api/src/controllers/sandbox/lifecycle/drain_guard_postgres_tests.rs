@@ -406,6 +406,7 @@ async fn gentle_drain_does_not_block_access_or_placement_while_draining() -> Tes
         Some(NodeDrainState {
             phase: NodeDrainPhase::Draining,
             mode: NodeDrainMode::Gentle,
+            awaiting_evacuation: false,
         }),
         "the gate must read the mode off the node row, not assume forced"
     );
@@ -910,5 +911,88 @@ async fn a_released_stopped_sandbox_starts_off_its_drained_node() -> TestResult 
         .execute(&db.pool)
         .await?;
     ensure_resolved_node_not_draining(&db.pool, sandbox_id, SandboxAction::Start).await?;
+    Ok(())
+}
+
+/// Make `node_id`'s forced drain a v2 one with `status` as its
+/// `drain_status`.
+async fn set_v2_status(pool: &PgPool, node_id: NodeId, status: serde_json::Value) -> TestResult {
+    sqlx::query(sql!(
+        "UPDATE nodes SET drain_engine = 'v2', drain_status = $2 WHERE id = $1"
+    ))
+    .bind(node_id)
+    .bind(status)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// A forced v2 drain still waiting for an evacuation slot blocks no wake or
+/// access on its node, whether the gate resolves the node through the
+/// sandbox's placement or its latest execution; it blocks once the
+/// controller admits it.
+#[tokio::test(flavor = "current_thread")]
+async fn a_v2_drain_waiting_for_a_slot_blocks_nothing_until_admitted() -> TestResult {
+    let db = pg_test_db().await?;
+    let node_id = NodeId::new();
+    let placed = SandboxId::new();
+    let by_execution = SandboxId::new();
+    let k8s_node_name = format!("waiting-node-{}", placed.as_uuid().simple());
+    insert_node(&db.pool, node_id, Some("draining")).await?;
+    set_v2_status(
+        &db.pool,
+        node_id,
+        serde_json::json!({"epoch": 1, "waiting": true}),
+    )
+    .await?;
+    sqlx::query(sql!(
+        "INSERT INTO node_k8s (node_id, k8s_node_name) VALUES ($1, $2)"
+    ))
+    .bind(node_id)
+    .bind(&k8s_node_name)
+    .execute(&db.pool)
+    .await?;
+    insert_sandbox(&db.pool, placed, "started", Some(node_id), Some(node_id)).await?;
+    insert_sandbox(&db.pool, by_execution, "suspended", None, None).await?;
+    sqlx::query(sql!(
+        "INSERT INTO sandbox_k8s_executions (
+             sandbox_id, generation, pod_name, pod_namespace,
+             k8s_node_name, state, active
+         )
+         VALUES ($1, 1, 'pod-A', 'space', $2, 'terminated', false)"
+    ))
+    .bind(by_execution)
+    .bind(&k8s_node_name)
+    .execute(&db.pool)
+    .await?;
+
+    for (sandbox_id, action) in [
+        (placed, SandboxAction::Wake),
+        (placed, SandboxAction::Stats),
+        (by_execution, SandboxAction::Restore),
+    ] {
+        ensure_resolved_node_not_draining(&db.pool, sandbox_id, action).await?;
+    }
+
+    set_v2_status(
+        &db.pool,
+        node_id,
+        serde_json::json!({"epoch": 1, "waiting": false}),
+    )
+    .await?;
+    for (sandbox_id, action) in [
+        (placed, SandboxAction::Wake),
+        (placed, SandboxAction::Stats),
+        (by_execution, SandboxAction::Restore),
+    ] {
+        let err = ensure_resolved_node_not_draining(&db.pool, sandbox_id, action)
+            .await
+            .expect_err("an admitted v2 drain blocks");
+        assert_eq!(
+            err.clone().into_response().status(),
+            StatusCode::CONFLICT,
+            "{action:?}"
+        );
+    }
     Ok(())
 }

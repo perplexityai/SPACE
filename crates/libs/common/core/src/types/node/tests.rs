@@ -159,3 +159,32 @@ fn only_forced_mode_evacuates_and_blocks_user_calls() {
     assert!(!NodeDrainMode::Gentle.evacuates_residents());
     assert!(!NodeDrainMode::Gentle.blocks_user_calls_while_draining());
 }
+
+/// Which drains close the user-API gate: every phase and mode, with the
+/// v2 drain's wait for an evacuation slot on and off. A drain waiting for a
+/// slot closes it only once its node is past `draining`.
+#[test]
+fn a_drain_waiting_for_an_evacuation_slot_leaves_the_gate_open() {
+    use NodeDrainMode::{Forced, Gentle};
+    use NodeDrainPhase::{Drained, Draining, Terminating};
+    for (phase, mode, awaiting, blocks) in [
+        (Draining, Forced, false, true),
+        (Draining, Forced, true, false),
+        (Draining, Gentle, false, false),
+        (Draining, Gentle, true, false),
+        (Drained, Forced, false, true),
+        (Drained, Forced, true, true),
+        (Drained, Gentle, true, true),
+        (Terminating, Forced, true, true),
+        (Terminating, Gentle, false, true),
+    ] {
+        let state = NodeDrainState::from_columns(Some(phase), Some(mode.as_str()))
+            .expect("a phase was supplied")
+            .awaiting_evacuation(awaiting);
+        assert_eq!(
+            state.blocks_placement(),
+            blocks,
+            "{phase}/{mode} awaiting={awaiting}"
+        );
+    }
+}

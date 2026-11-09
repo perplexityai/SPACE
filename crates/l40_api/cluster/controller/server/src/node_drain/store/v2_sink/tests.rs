@@ -388,3 +388,59 @@ async fn the_termination_is_flagged_on_its_epochs_terminating_node() -> TestResu
     }
     Ok(())
 }
+
+/// A drain the admin route left waiting is listed waiting, and admitted
+/// once, under its own epoch and only while it is `draining`: the row then
+/// reads `waiting: false`. A row without the key isn't waiting.
+#[tokio::test(flavor = "current_thread")]
+async fn a_waiting_drain_is_admitted_once_under_its_epoch() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let pool = &db.pool;
+    let waiting = v2_node(
+        pool,
+        Some("draining"),
+        serde_json::json!({"epoch": 5, "waiting": true}),
+    )
+    .await?;
+    let sealed = v2_node(pool, Some("draining"), serde_json::json!({"epoch": 6})).await?;
+    let drained = v2_node(
+        pool,
+        Some("drained"),
+        serde_json::json!({"epoch": 7, "waiting": true}),
+    )
+    .await?;
+    let listed = |nodes: &[V2Node], id: NodeId| {
+        nodes
+            .iter()
+            .find(|node| node.id == id)
+            .map(|node| node.waiting)
+    };
+    let nodes = list_v2_nodes(pool).await?;
+    assert_eq!(listed(&nodes, waiting), Some(true));
+    assert_eq!(listed(&nodes, sealed), Some(false));
+    assert_eq!(listed(&nodes, drained), Some(true));
+
+    assert!(
+        !admit_v2_evacuation(pool, waiting, 4).await?,
+        "another epoch"
+    );
+    assert!(!admit_v2_evacuation(pool, sealed, 6).await?, "not waiting");
+    assert!(
+        !admit_v2_evacuation(pool, drained, 7).await?,
+        "not draining"
+    );
+    assert!(admit_v2_evacuation(pool, waiting, 5).await?);
+    assert!(!admit_v2_evacuation(pool, waiting, 5).await?, "once");
+
+    let nodes = list_v2_nodes(pool).await?;
+    assert_eq!(listed(&nodes, waiting), Some(false));
+    let status: serde_json::Value =
+        sqlx::query_scalar(sql!("SELECT drain_status FROM nodes WHERE id = $1"))
+            .bind(waiting)
+            .fetch_one(pool)
+            .await?;
+    assert_eq!(status, serde_json::json!({"epoch": 5, "waiting": false}));
+    Ok(())
+}

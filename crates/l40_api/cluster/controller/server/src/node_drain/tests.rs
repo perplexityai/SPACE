@@ -1633,6 +1633,7 @@ fn config_enabled(max_per_node: usize, max_per_cluster: usize) -> ReconcilerConf
         tick: Duration::from_millis(1),
         max_per_node,
         max_per_cluster,
+        v2_max_evacuating_nodes: super::v2::DEFAULT_MAX_EVACUATING_NODES,
         evacuate_timeout: PositiveDuration::new_panic(Duration::from_secs(1)),
         // Use the real default here so existing tests exercise the
         // abandon-stuck-transient sweep on the same code path
