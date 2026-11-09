@@ -413,18 +413,9 @@ pub(super) async fn connect_worker_watched_with(
     endpoint: Endpoint,
     retry_policy: pplx_space_common_grpc::GrpcRetryPolicy,
 ) -> Result<(Channel, pplx_space_common_grpc::ConnectionWatch), ControllerError> {
-    // A kept connection carries every call to its pod, so it needs its own
-    // liveness check: ping it while idle too, so a peer lost without a FIN is
-    // torn down before the next caller reuses it, rather than only once a
-    // call is in flight.
-    //
-    // It also carries concurrent streams that used to get a connection each,
-    // so it takes the multiplexed connection window.
-    let endpoint = endpoint
-        .keep_alive_while_idle(true)
-        .initial_connection_window_size(
-            pplx_space_node_api_client::MULTIPLEXED_CONNECTION_WINDOW_BYTES,
-        );
+    // A kept connection carries every call to its pod, including concurrent
+    // streams that used to get a connection each.
+    let endpoint = pplx_space_node_api_client::configure_kept_node_api_endpoint(endpoint);
     node_api_connect_endpoint(endpoint)
         .await?
         .connect_with_retry_watched("worker-node-api", "worker-node-api", retry_policy)

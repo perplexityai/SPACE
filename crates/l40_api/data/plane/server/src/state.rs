@@ -474,19 +474,15 @@ pub(super) async fn build_backend_channels(
     pool_size: usize,
     config: pplx_space_node_api_client::NodeApiEndpointConfig,
 ) -> Result<Vec<Channel>, pplx_space_common_grpc::internal_transport::TransportError> {
-    // Each pooled channel carries calls for many sandboxes on one connection.
-    let endpoint = pplx_space_node_api_client::configure_node_api_endpoint(
-        Endpoint::from_shared(normalize_backend_endpoint(endpoint)?)?,
-        config,
-    )
-    .initial_connection_window_size(pplx_space_node_api_client::MULTIPLEXED_CONNECTION_WINDOW_BYTES)
-    // On Kubernetes an endpoint is a sandbox pod's address, which a later pod
-    // can be given once this one is gone. Pinging an idle connection finds
-    // one whose far end went away and closes it, so the next call dials the
-    // endpoint afresh, rather than waiting out the keep-alive timeout on a
-    // connection nothing answers or failing at once on one the new pod
-    // resets.
-    .keep_alive_while_idle(true);
+    // Each pooled channel carries calls for many sandboxes on one connection,
+    // kept per endpoint. On Kubernetes an endpoint is a sandbox pod's
+    // address, which a later pod can be given once this one is gone.
+    let endpoint = pplx_space_node_api_client::configure_kept_node_api_endpoint(
+        pplx_space_node_api_client::configure_node_api_endpoint(
+            Endpoint::from_shared(normalize_backend_endpoint(endpoint)?)?,
+            config,
+        ),
+    );
     let endpoint = pplx_space_common_grpc::internal_transport::client_connect_endpoint(
         pplx_space_common_grpc::internal_transport::Service::NodeApi,
         endpoint,
