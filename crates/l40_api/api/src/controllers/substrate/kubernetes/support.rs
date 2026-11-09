@@ -1284,8 +1284,49 @@ impl Drop for CancelGuard {
                         return;
                     }
                 };
+                // The fenced retire matches nothing when another writer has
+                // already retired this execution — for example the control
+                // plane applying a node's activation-rollback receipt, which
+                // retires the row as `replaced` without deleting the pod. The
+                // pod is still this attempt's (its UID was recorded above), and
+                // a retired generation never runs again, so delete it here;
+                // otherwise kubelet retries its sandbox create against the
+                // retired execution indefinitely. When the row is still active
+                // (a newer attempt owns it), leave the pod alone.
                 if !retired {
-                    return;
+                    let already_retired = match store
+                        .execution_generation_retired(sandbox_id, generation, &pod_name)
+                        .await
+                    {
+                        Ok(already_retired) => already_retired,
+                        Err(err) => {
+                            tracing::error!(
+                                sandbox_id = %sandbox_id,
+                                pod_name = %pod_name,
+                                generation,
+                                error = %err,
+                                "cancel cleanup: failed to read execution retirement; \
+                                 leaving the pod for reconciliation"
+                            );
+                            return;
+                        }
+                    };
+                    if !already_retired {
+                        tracing::info!(
+                            sandbox_id = %sandbox_id,
+                            pod_name = %pod_name,
+                            generation,
+                            "cancel cleanup: execution is owned by a newer activation; \
+                             leaving the pod"
+                        );
+                        return;
+                    }
+                    tracing::info!(
+                        sandbox_id = %sandbox_id,
+                        pod_name = %pod_name,
+                        generation,
+                        "cancel cleanup: execution was already retired; deleting its pod"
+                    );
                 }
                 match delete_sandbox_pod_if_uid(&k8s, &pod_name, &pod_uid).await {
                     Ok(()) => {
