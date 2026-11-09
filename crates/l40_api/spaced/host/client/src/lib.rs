@@ -45,6 +45,8 @@ pub type RawSpacedHostProcessClient =
     proto::process_client::ProcessClient<tonic::transport::Channel>;
 pub type RawSpacedHostNetworkingClient =
     proto::networking_client::NetworkingClient<tonic::transport::Channel>;
+pub type RawSpacedHostGuestUpdateClient =
+    proto::guest_update_client::GuestUpdateClient<tonic::transport::Channel>;
 
 pub use pplx_space_spaced_common::{
     DEFAULT_COMMAND_RETRY_POLICY, DEFAULT_CONNECT_RETRY_POLICY, RetryPolicy,
@@ -62,6 +64,7 @@ pub struct SpacedHostClient {
     filesystem: RawSpacedHostFilesystemClient,
     process: RawSpacedHostProcessClient,
     networking: RawSpacedHostNetworkingClient,
+    guest_update: RawSpacedHostGuestUpdateClient,
     config: SpacedHostClientConfig,
 }
 
@@ -205,14 +208,24 @@ impl SpacedHostClient {
         let meta = RawSpacedHostMetaClient::new(channel.clone());
         let filesystem = RawSpacedHostFilesystemClient::new(channel.clone());
         let process = RawSpacedHostProcessClient::new(channel.clone());
-        let networking = RawSpacedHostNetworkingClient::new(channel);
+        let networking = RawSpacedHostNetworkingClient::new(channel.clone());
+        let guest_update = RawSpacedHostGuestUpdateClient::new(channel)
+            .max_decoding_message_size(128 * 1024)
+            .max_encoding_message_size(128 * 1024);
         Self {
             meta,
             filesystem,
             process,
             networking,
+            guest_update,
             config,
         }
+    }
+
+    /// Single-attempt maintenance calls over this client's already-attested
+    /// endpoint. The manager owns retry and durable operation reconciliation.
+    pub fn guest_update(&self) -> RawSpacedHostGuestUpdateClient {
+        self.guest_update.clone()
     }
 }
 

@@ -16,7 +16,9 @@ pub mod proto {
         pub use super::activity::*;
     }
 
-    pub use pplx_space_spaced_guest_protocol::proto::{bridge_guest, operations, platform, worker};
+    pub use pplx_space_spaced_guest_protocol::proto::{
+        bridge_guest, operations, platform, update, worker,
+    };
 
     pub mod activity {
         tonic::include_proto!("space.spaced.activity.v1");
