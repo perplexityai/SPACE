@@ -5,10 +5,22 @@ import "google/protobuf/duration.proto";
 import "google/protobuf/timestamp.proto";
 import "spaced/operations/v1/operations.proto";
 import "spaced/platform/v1/platform.proto";
+import "spaced/update/v1/update.proto";
 // SPACED_COMPAT_REMOVE_WHEN_MIN_GUEST_0_1_4: also requires MIN_HOST 0.1.4.
 import public "spaced/bridge/guest/v1/legacy.proto";
 
 // Host→guest bridge hosted by spaced-guest-svc.
+service GuestUpdate {
+  rpc GetStatus(space.spaced.update.v1.StatusRequest) returns (space.spaced.update.v1.Status);
+  rpc Subscribe(space.spaced.update.v1.StatusRequest) returns (stream space.spaced.update.v1.Status);
+  rpc Stage(stream space.spaced.update.v1.StageRequest) returns (space.spaced.update.v1.Status);
+  rpc Arm(space.spaced.update.v1.ArmRequest) returns (space.spaced.update.v1.Status);
+  rpc Configure(space.spaced.update.v1.ConfigureRequest) returns (space.spaced.update.v1.Status);
+  rpc Commit(space.spaced.update.v1.CommitRequest) returns (space.spaced.update.v1.Status);
+  rpc Abort(space.spaced.update.v1.AbortRequest) returns (space.spaced.update.v1.Status);
+  rpc Restart(space.spaced.update.v1.RestartRequest) returns (space.spaced.update.v1.Status);
+}
+
 service Meta {
   rpc Ping(PingRequest) returns (PingResponse);
   rpc WaitReady(WaitReadyRequest) returns (WaitReadyResponse);
