@@ -348,3 +348,38 @@ path: current guest-image admission refuses these images on control-plane-manage
 nodes. The standalone operator probe does not qualify that path. Retain it until
 a public-API scenario has passed against an authorized Windows test deployment;
 do not remove the admission restriction merely to run the scenario.
+
+
+## Guest update workstream
+
+Windows guest updates are under development. Existing images and host update
+policy still refuse this backend; publishing a descriptor does not enable it.
+The bundle publisher accepts `--platform windows --arch x86_64`, hashes
+`spaced-svc.exe` and `spaced.exe`, and records the reserved
+`windows-scm-two-slot-v1` recovery contract. Its schema-1 canonical encoding and
+logical service/CLI payload roles are unchanged. Linux remains the default.
+This packaging path requires both Windows executables; the current native
+service alone is not a complete update bundle.
+
+The implementation must retain the existing update RPC meanings, fencing,
+release versions, and host SQLite receipts. Windows paths remain local to the
+Windows backend. Current Linux selectors and host policy must continue to
+reject Windows bundles. No Windows capability is advertised until the native
+recovery path and its image have been qualified.
+
+The next implementation boundary is local recovery. Unlike the Linux
+pre-start selector, SCM start checkpoints and wait hints do not supply the
+independent bounded trial supervisor this feature requires. See Microsoft's
+[service startup contract](https://learn.microsoft.com/en-us/windows/win32/services/service-startup).
+The recovery design must kill a hung candidate, select the committed bundle
+after a crash or reboot, and release every mapped executable before reusing
+its slot. It must keep at most two agent bundles. Any separate template-owned
+bootstrap must be small, have an explicit compatibility contract, and have a
+documented replacement policy; copying an entire old agent into a permanent
+launcher would undermine the storage bound.
+
+Before enabling the backend, prove durable commit and rollback on NTFS, shared
+process/filesystem admission, Job Object descendant termination under force,
+empty-environment configuration, and boot/deadline identity across CH pause,
+restore and fork. Native Windows unit tests and cross-compilation are useful
+component checks; they do not qualify those VM lifecycle guarantees.
