@@ -648,6 +648,13 @@ pub struct CreateSandboxRequest {
     pub auto_lifecycle: Option<AutoLifecyclePolicy>,
     #[serde(default)]
     pub wait_until_ready: bool,
+    /// How long a `wait_until_ready` create on the Kubernetes substrate waits
+    /// for its guest to answer before it returns the sandbox started but not
+    /// yet command-ready, at most the substrate's own bound
+    /// (`SPACE_CREATE_COMMAND_READY_TIMEOUT_SECS`). `None` waits that bound.
+    /// Set by the caller; never read from a request body.
+    #[serde(skip)]
+    pub command_ready_wait: Option<std::time::Duration>,
     #[serde(default)]
     pub network_policy: Option<NetworkPolicyV1>,
     /// Internal-only: pin this sandbox to a named isolation node pool at create

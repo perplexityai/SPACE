@@ -927,6 +927,14 @@ impl SandboxLifecycleOperationExecutor {
     }
 }
 
+/// How long a Native create waits for its guest to answer. One that does not
+/// answer in time still succeeds with the sandbox `running`, and the first
+/// call waits for the guest, as every Native create did before it waited. A
+/// cold create holds a dispatcher execution slot while it waits, so this stays
+/// well below the 30 s an ECW create may wait.
+pub(crate) const NATIVE_CREATE_COMMAND_READY_WAIT: std::time::Duration =
+    std::time::Duration::from_secs(5);
+
 pub(crate) fn controller_create_request(
     request: pplx_space_public_api::CreateSandboxRequest,
     node_pool: Option<NodePoolName>,
@@ -950,7 +958,12 @@ pub(crate) fn controller_create_request(
         disk_mib: resources.disk_mib,
         file_changes: None,
         auto_lifecycle: request.auto_lifecycle,
-        wait_until_ready: false,
+        // The operation succeeds once the guest answers, so a client that
+        // waited for it can run a command or a file call at once, as an ECW
+        // create answers. The pinned sandbox ID keeps this from adopting a
+        // warm-pool slot, which only the admission-time claim does.
+        wait_until_ready: true,
+        command_ready_wait: Some(NATIVE_CREATE_COMMAND_READY_WAIT),
         network_policy: request.network_policy,
         // Placement pin carried from the operator (admin) create surface; the
         // public API never sets it.

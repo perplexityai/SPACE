@@ -140,6 +140,9 @@ enum ReadinessFailure {
     /// Every guest probe answers gRPC `Unavailable` until the command-ready
     /// phase times out.
     NodeMgrUnavailable,
+    /// The guest never answers, and the create asked to wait for it far less
+    /// than the substrate's own command-ready bound.
+    GuestPastItsRequestedWait,
     /// The first execution read loses a lock race: a table lock is held from
     /// the pod create until the cleanup delete arrives.
     LockContention,
@@ -261,6 +264,12 @@ impl ApiserverState {
     CleanupDelete::Accepted,
     ExpectedEnd::Deferred(ExpectedError::TimeoutWithoutPhase)
 )]
+#[case::a_create_waits_for_its_guest_only_as_long_as_it_asked(
+    ReadinessFailure::GuestPastItsRequestedWait,
+    PodAfterFailure::ScheduledReachable,
+    CleanupDelete::Accepted,
+    ExpectedEnd::PreservedOnNode
+)]
 #[case::unreachable_node_mgr_defers_cleanup_of_a_vanished_pod(
     ReadinessFailure::NodeMgrUnavailable,
     PodAfterFailure::Absent,
@@ -298,8 +307,10 @@ async fn create_readiness_failure_keeps_or_releases_only_what_its_arm_owns(
         ReadinessFailure::NodeMgrUnavailable => {
             ScriptedReply::Status(tonic::Status::unavailable("node-mgr unreachable"))
         }
-        // Readiness fails before any probe.
-        ReadinessFailure::OuterBudget | ReadinessFailure::LockContention => ScriptedReply::Hang,
+        // Readiness fails before any probe, or no probe answers.
+        ReadinessFailure::OuterBudget
+        | ReadinessFailure::LockContention
+        | ReadinessFailure::GuestPastItsRequestedWait => ScriptedReply::Hang,
     };
     let observed = Arc::clone(&state);
     let readiness_failed: CallObserver = Arc::new(move || {
@@ -404,7 +415,9 @@ async fn create_readiness_failure_keeps_or_releases_only_what_its_arm_owns(
                 .connect(&db.database_url)
                 .await?
         }
-        ReadinessFailure::OuterBudget | ReadinessFailure::NodeMgrUnavailable => db.pool.clone(),
+        ReadinessFailure::OuterBudget
+        | ReadinessFailure::NodeMgrUnavailable
+        | ReadinessFailure::GuestPastItsRequestedWait => db.pool.clone(),
     };
     let mut substrate = substrate_on(pool, client, &worker);
     match failure {
@@ -421,11 +434,20 @@ async fn create_readiness_failure_keeps_or_releases_only_what_its_arm_owns(
         ReadinessFailure::LockContention => {
             substrate.budgets = phase_ending_budgets(substrate.budgets);
         }
+        // Only the create's own, shorter wait can end it inside the test's
+        // bound.
+        ReadinessFailure::GuestPastItsRequestedWait => {
+            substrate.budgets = phase_ending_budgets(substrate.budgets);
+            substrate.k8s.create_command_ready_timeout = Duration::from_secs(60);
+        }
     }
     let inputs = CreateInputs::new();
     let template_ref = inputs.template_ref();
     let mut request = inputs.create_request(sandbox_id, &template_ref);
     request.wait_until_ready = true;
+    if let ReadinessFailure::GuestPastItsRequestedWait = failure {
+        request.command_ready_wait = Some(Duration::from_millis(200));
+    }
 
     let started = Instant::now();
     let outcome =
@@ -440,6 +462,14 @@ async fn create_readiness_failure_keeps_or_releases_only_what_its_arm_owns(
         "{failure:?}/{pod_after_failure:?}: the shortened budgets must end the create, took \
          {elapsed:?}"
     );
+    if let ReadinessFailure::GuestPastItsRequestedWait = failure {
+        // A guest probe that outlived the create's 200 ms wait would hold it
+        // for a whole probe timeout.
+        assert!(
+            elapsed < START_WAIT_COMMAND_PROBE_TIMEOUT,
+            "the create's own wait ends it: {elapsed:?}"
+        );
+    }
     assert!(
         substrate.task_tracker.is_empty(),
         "no cleanup is left running in the background"
@@ -718,6 +748,9 @@ async fn create_fails_when_its_node_refuses_the_pod_as_invalid(
 enum OwnerPod {
     /// The owner's pod is running and its proxy reachable.
     Reachable,
+    /// The owner's pod is reachable, but its guest never answers a create
+    /// that waits for it.
+    ReachableGuestSilent,
     /// The owner's pod never gets an IP.
     NeverAssigned,
 }
@@ -726,9 +759,13 @@ enum OwnerPod {
 /// than creating a pod: it returns the owner's pod once that pod is
 /// reachable, without a lease of its own, and when the owner's pod never
 /// becomes reachable it times out within the create budget, leaving the
-/// owner's execution and activation untouched.
+/// owner's execution and activation untouched. A create that waits for the
+/// guest, and whose guest does not answer in time, returns the owner's
+/// reachable pod as started but not command-ready rather than failing; its
+/// caller would delete the sandbox the owner is starting on a failure.
 #[rstest::rstest]
 #[case::returns_the_owners_reachable_pod(OwnerPod::Reachable)]
+#[case::keeps_the_owners_pod_when_its_guest_is_slow(OwnerPod::ReachableGuestSilent)]
 #[case::times_out_without_disturbing_the_owner(OwnerPod::NeverAssigned)]
 #[tokio::test(flavor = "current_thread")]
 async fn joined_create_waits_on_the_owners_pod(#[case] owner_pod: OwnerPod) -> TestResult {
@@ -738,7 +775,18 @@ async fn joined_create_waits_on_the_owners_pod(#[case] owner_pod: OwnerPod) -> T
     let db = pplx_space_db_test_fixtures::pg_test_db().await?;
     let sandbox_id = SandboxId::new();
     insert_test_sandbox_row(&db.pool, sandbox_id, "creating").await?;
-    let worker = start_scripted_worker(ScriptedWorkerConfig::new([])).await?;
+    let worker = match owner_pod {
+        OwnerPod::ReachableGuestSilent => {
+            start_scripted_worker(ScriptedWorkerConfig::new([(
+                SPACED_WAIT_READY,
+                ScriptedReply::Hang,
+            )]))
+            .await?
+        }
+        OwnerPod::Reachable | OwnerPod::NeverAssigned => {
+            start_scripted_worker(ScriptedWorkerConfig::new([])).await?
+        }
+    };
     let pod_name: Arc<Mutex<Option<String>>> = Arc::default();
     let reply_pod_name = Arc::clone(&pod_name);
     let (client, log) = scripted_kube_client_async(move |request| {
@@ -747,7 +795,7 @@ async fn joined_create_waits_on_the_owners_pod(#[case] owner_pod: OwnerPod) -> T
             match (request.method, pod_name) {
                 (Method::GET, Some(pod_name)) if request.path == pod_path(&pod_name) => {
                     match owner_pod {
-                        OwnerPod::Reachable => {
+                        OwnerPod::Reachable | OwnerPod::ReachableGuestSilent => {
                             pod_reply(&running_pod(&pod_name, sandbox_id, Some(WORKER_NODE)))
                         }
                         OwnerPod::NeverAssigned => pod_reply(&sandbox_pod(
@@ -782,7 +830,7 @@ async fn joined_create_waits_on_the_owners_pod(#[case] owner_pod: OwnerPod) -> T
         )
         .await?;
     *pod_name.lock().unwrap() = Some(owner.pod_name.clone());
-    if let OwnerPod::Reachable = owner_pod {
+    if let OwnerPod::Reachable | OwnerPod::ReachableGuestSilent = owner_pod {
         substrate
             .store
             .persist_pod_metadata(
@@ -795,14 +843,17 @@ async fn joined_create_waits_on_the_owners_pod(#[case] owner_pod: OwnerPod) -> T
     }
     let inputs = CreateInputs::new();
     let template_ref = inputs.template_ref();
+    let mut request = inputs.create_request(sandbox_id, &template_ref);
+    if let OwnerPod::ReachableGuestSilent = owner_pod {
+        request.wait_until_ready = true;
+        request.command_ready_wait = Some(Duration::from_millis(200));
+    }
 
     let started = Instant::now();
-    let outcome = tokio::time::timeout(
-        Duration::from_secs(10),
-        substrate.create_execution(inputs.create_request(sandbox_id, &template_ref)),
-    )
-    .await
-    .map_err(|_| format!("{owner_pod:?}: the joined create must end"))?;
+    let outcome =
+        tokio::time::timeout(Duration::from_secs(10), substrate.create_execution(request))
+            .await
+            .map_err(|_| format!("{owner_pod:?}: the joined create must end"))?;
 
     assert!(
         requests_matching(&log, &Method::POST).is_empty()
@@ -837,6 +888,26 @@ async fn joined_create_waits_on_the_owners_pod(#[case] owner_pod: OwnerPod) -> T
                 format!("{}-uid", owner.pod_name)
             );
             assert_eq!(binding.execution_generation, 1);
+        }
+        OwnerPod::ReachableGuestSilent => {
+            let outcome = outcome
+                .map_err(|error| format!("expected the owner's pod, not yet ready: {error:?}"))?;
+            assert!(
+                outcome.lease_completion.is_none(),
+                "the lease is the owner's"
+            );
+            assert_eq!(outcome.initial_lifecycle, "started");
+            assert_eq!(outcome.active_node_id, Some(worker_node_id()));
+            assert!(!outcome.command_ready, "the guest never answered");
+            assert!(outcome.binding.is_none());
+            assert_eq!(active_execution_count(&db.pool, sandbox_id).await?, 1);
+            // A guest probe that outlived the create's 200 ms wait would hold
+            // it for a whole probe timeout.
+            let elapsed = started.elapsed();
+            assert!(
+                elapsed < START_WAIT_COMMAND_PROBE_TIMEOUT,
+                "the create's own wait ends it: {elapsed:?}"
+            );
         }
         OwnerPod::NeverAssigned => {
             let outcome = outcome

@@ -1518,6 +1518,7 @@ impl SandboxController {
                 template_network_policy_generation,
                 restore_from,
                 wait_until_ready: req.wait_until_ready,
+                command_ready_wait: req.command_ready_wait,
                 volume_encryption,
                 node_pool: req.node_pool.as_ref(),
             })

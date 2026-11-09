@@ -710,7 +710,7 @@ impl KubernetesSubstrate {
                     let client = Self::pod_worker_client(
                         pod_ip,
                         self.k8s.sandbox_proxy_port,
-                        START_WAIT_CONNECT_TIMEOUT,
+                        START_WAIT_CONNECT_TIMEOUT.min(remaining_ready_window(deadline)),
                     )
                     .await;
                     if client.is_some() {
@@ -761,13 +761,17 @@ impl KubernetesSubstrate {
                     }
 
                     let probe_started_at = Instant::now();
+                    // No probe outlives the wait's deadline, so a short wait,
+                    // such as a Native create's, ends when it says.
+                    let probe_timeout =
+                        START_WAIT_COMMAND_PROBE_TIMEOUT.min(remaining_ready_window(deadline));
                     let probe = client.spaced_wait_ready(wait_ready_lifecycle_request(
                         SpacedWaitReadyRequest {
                             sandbox_id: sandbox_id.to_string(),
-                            timeout: Some(duration_to_proto(START_WAIT_COMMAND_PROBE_TIMEOUT)),
+                            timeout: Some(duration_to_proto(probe_timeout)),
                         },
                     ));
-                    match timeout(START_WAIT_COMMAND_PROBE_TIMEOUT, probe).await {
+                    match timeout(probe_timeout, probe).await {
                         Ok(Ok(_)) => {
                             record_api_wait_ready_latency(
                                 sandbox_id,

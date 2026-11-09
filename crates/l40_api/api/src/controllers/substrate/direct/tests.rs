@@ -989,6 +989,7 @@ async fn direct_create_rejects_node_pool_placement() -> TestResult {
             disk_io_limits: Default::default(),
             restore_from: None,
             wait_until_ready: true,
+            command_ready_wait: None,
             volume_encryption: false,
             node_pool: Some(&node_pool),
         })
@@ -2705,6 +2706,7 @@ async fn direct_create_receipt_failure_deletes_node_local_sandbox() -> TestResul
             disk_io_limits: Default::default(),
             restore_from: None,
             wait_until_ready: true,
+            command_ready_wait: None,
             volume_encryption: false,
             node_pool: None,
         })
@@ -2782,6 +2784,7 @@ async fn direct_create_identity_preparation_failure_deletes_node_local_sandbox()
             disk_io_limits: Default::default(),
             restore_from: None,
             wait_until_ready: false,
+            command_ready_wait: None,
             volume_encryption: false,
             node_pool: None,
         })
@@ -2855,6 +2858,7 @@ async fn two_step_direct_create_initializes_identity_for_initial_start() -> Test
             disk_io_limits: Default::default(),
             restore_from: None,
             wait_until_ready: false,
+            command_ready_wait: None,
             volume_encryption: false,
             node_pool: None,
         })
@@ -2944,6 +2948,7 @@ fn one_shot_create_request() -> TestResult<crate::models::CreateSandboxRequest> 
         file_changes: None,
         auto_lifecycle: None,
         wait_until_ready: true,
+        command_ready_wait: None,
         network_policy: None,
         node_pool: None,
     })
@@ -3028,10 +3033,9 @@ async fn two_call_direct_create_boots_a_custom_shape_on_the_worker() -> TestResu
         return Ok(());
     };
     // The shape the native create operation sends (`controller_create_request`):
-    // no boot mode and no readiness wait, so the create and start are two calls.
+    // no boot mode and a custom shape, so the create and start are two calls.
     let mut request = one_shot_create_request()?;
     request.boot_mode = None;
-    request.wait_until_ready = false;
     request.vcpu = Some(4);
     request.memory_mib = Some(2048);
 

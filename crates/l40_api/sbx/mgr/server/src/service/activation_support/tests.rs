@@ -1167,3 +1167,78 @@ async fn a_start_does_not_wake_a_waiter_on_another_transition() {
     assert_eq!(row.state, SandboxStatus::from(SandboxState::Started));
     assert_eq!(waiting_since.elapsed(), Duration::from_millis(200));
 }
+
+/// A `Starting` sandbox with the runtime a readiness probe connects to: a
+/// pool donor's, which the trusted probe reaches without a route identity.
+fn insert_starting_sandbox_with_runtime(conn: &crate::db::Connection, id: &str) {
+    super::super::tests::service_tests::insert_test_sandbox_with_runtime(
+        conn,
+        id,
+        SandboxState::Started,
+    );
+    conn.execute(
+        "UPDATE sandboxes SET state = ?1, pool_template = 'seed' WHERE id = ?2",
+        [SandboxState::Starting.as_str(), id],
+    )
+    .unwrap();
+}
+
+fn wait_ready_request(
+    sandbox_id: &str,
+    timeout: Duration,
+) -> tonic::Request<pplx_space_sbx_mgr_client::proto::SpacedWaitReadyRequest> {
+    super::super::tests::service_tests::node_api_trusted_lifecycle_request(
+        pplx_space_sbx_mgr_client::proto::SpacedWaitReadyRequest {
+            sandbox_id: sandbox_id.to_owned(),
+            timeout: Some(prost_types::Duration::try_from(timeout).unwrap()),
+        },
+    )
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_readiness_probe_waits_for_a_start_in_progress() {
+    if !super::super::tests::enter_route_test_process(&[]) {
+        return;
+    }
+    let conn = crate::db::test_conn();
+    let id = SandboxId::new().to_string();
+    insert_starting_sandbox_with_runtime(&conn, &id);
+    let service = SandboxManagerService::for_test(conn);
+    let probe = service.spaced_wait_ready(wait_ready_request(&id, Duration::from_secs(1)));
+    tokio::pin!(probe);
+    assert!(futures_util::poll!(&mut probe).is_pending());
+
+    let committed_at = tokio::time::Instant::now();
+    commit_start(&service, &id).await;
+    // Past the start, the probe goes on to ask the guest, which unit tests
+    // have no socket for.
+    let error = probe
+        .await
+        .expect_err("no spaced-host socket in unit tests");
+    assert_eq!(error.code(), tonic::Code::Unavailable, "{error}");
+    assert!(
+        error.message().contains("spaced-host unavailable"),
+        "{error}"
+    );
+    assert_eq!(committed_at.elapsed(), Duration::ZERO);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_readiness_probe_refuses_a_start_that_outlasts_half_its_timeout() {
+    if !super::super::tests::enter_route_test_process(&[]) {
+        return;
+    }
+    let conn = crate::db::test_conn();
+    let id = SandboxId::new().to_string();
+    insert_starting_sandbox_with_runtime(&conn, &id);
+    let service = SandboxManagerService::for_test(conn);
+    let started_at = tokio::time::Instant::now();
+    let error = service
+        .spaced_wait_ready(wait_ready_request(&id, Duration::from_secs(1)))
+        .await
+        .expect_err("the start never commits");
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition, "{error}");
+    assert!(error.message().contains("not started"), "{error}");
+    // Refused with half the timeout left, so the caller can ask again.
+    assert_eq!(started_at.elapsed(), Duration::from_millis(500));
+}
