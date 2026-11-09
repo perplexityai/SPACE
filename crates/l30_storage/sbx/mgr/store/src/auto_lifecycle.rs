@@ -136,9 +136,36 @@ pub struct AutoLifecycleCoordinator {
     /// `suspended` row, so the test can move the row in between.
     #[cfg(any(test, feature = "test-support"))]
     pub suspended_stop_barrier: Arc<std::sync::Mutex<Option<Arc<tokio::sync::Barrier>>>>,
+    /// A test's two-phase rendezvous in backup admission, with the
+    /// sandbox's artifact lock held, just before the upload job is persisted.
+    #[cfg(any(test, feature = "test-support"))]
+    pub backup_admission_barrier: Arc<std::sync::Mutex<Option<Arc<tokio::sync::Barrier>>>>,
+    /// A test's two-phase rendezvous in a suspended row's eviction, with the
+    /// sandbox's artifact lock held, just before the claim.
+    #[cfg(any(test, feature = "test-support"))]
+    pub eviction_claim_barrier: Arc<std::sync::Mutex<Option<Arc<tokio::sync::Barrier>>>>,
+    /// Notified when a backup's admission is about to wait for the
+    /// sandbox's artifact lock, so a test knows the admission reached it.
+    #[cfg(any(test, feature = "test-support"))]
+    pub artifact_lock_wait_hook: Arc<std::sync::Mutex<Option<Arc<tokio::sync::Notify>>>>,
 }
 
 impl AutoLifecycleCoordinator {
+    /// A test's two-phase rendezvous at one of the barriers above: when
+    /// `slot` holds a barrier, wait on it twice, once to tell the test the
+    /// caller arrived and once for the test to let it go on.
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn rendezvous(slot: &std::sync::Mutex<Option<Arc<tokio::sync::Barrier>>>) {
+        let barrier = slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(barrier) = barrier {
+            barrier.wait().await;
+            barrier.wait().await;
+        }
+    }
+
     pub fn wake_lock(&self, sandbox_id: &str) -> Arc<LifecycleMutex> {
         lifecycle_lock(&self.wake_locks, sandbox_id)
     }

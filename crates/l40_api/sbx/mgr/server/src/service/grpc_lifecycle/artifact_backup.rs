@@ -654,6 +654,19 @@ impl SandboxManagerService {
             .lock_artifact_for_sandbox(sandbox_id)
             .await
             .map_err(|status| artifact_backup_lookup_error(status, full_current_instance))?;
+        // An eviction claims a row under this lock, so a backup that waited
+        // for it may find the row on its way out, its artifacts about to be
+        // deleted: nothing can be backed up from it.
+        if sandbox.state.is_unowned(SandboxState::Deleting)
+            || sandbox
+                .cleanup_completion
+                .is_some_and(crate::db::CleanupCompletion::deletes_row)
+        {
+            return Err(Status::failed_precondition(format!(
+                "sandbox {} is being deleted; its artifacts can't be backed up",
+                sandbox.id
+            )));
+        }
         // A runtime upgrade's failed boot leaves its disk in the instance until
         // the rollback restores the preserved copy; it must not be captured.
         self.refuse_runtime_upgrade_fence(&sandbox.id)?;
@@ -981,6 +994,10 @@ impl SandboxManagerService {
                     format,
                     handoff: ArtifactBackupHandoff::RestoreVisible,
                     execution_generation,
+                    capture_vouched: earlier_upload_vouches(
+                        previous_job.as_ref(),
+                        execution_generation,
+                    ),
                 },
             )
             .await
@@ -1038,6 +1055,16 @@ impl SandboxManagerService {
         Status,
     > {
         let id = self.lookup_sandbox(selector)?.id;
+        #[cfg(test)]
+        if let Some(hook) = self
+            .auto_lifecycle
+            .artifact_lock_wait_hook
+            .lock()
+            .unwrap()
+            .clone()
+        {
+            hook.notify_one();
+        }
         let guard = super::restart_admission::wait_for_activation_admission(
             &id,
             self.auto_lifecycle.artifact_lock(&id).lock_owned(),
@@ -1209,6 +1236,10 @@ impl SandboxManagerService {
                     format: reupload_format,
                     handoff: ArtifactBackupHandoff::DurableWorker,
                     execution_generation,
+                    capture_vouched: earlier_upload_vouches(
+                        previous_job.as_ref(),
+                        execution_generation,
+                    ),
                 },
             )
             .await
@@ -1297,6 +1328,24 @@ impl SandboxManagerService {
             })
             .map(|operation| operation.execution_generation))
     }
+}
+
+/// Whether `previous_job`, the bytes' earlier upload, recorded `generation`
+/// as the capturing execution's, so a re-upload under it may order captures.
+pub(super) fn earlier_upload_vouches(
+    previous_job: Option<&pplx_space_common_jobs::Job>,
+    generation: Option<pplx_space_common_core::types::ExecutionGeneration>,
+) -> bool {
+    generation.is_some()
+        && previous_job
+            .and_then(|job| {
+                job.payload_as::<crate::snapshot_upload::SnapshotUploadJobs>()
+                    .ok()
+            })
+            .is_some_and(|payload| {
+                payload.execution_generation_names_capture
+                    && payload.execution_generation == generation
+            })
 }
 
 /// The execution generation the capture's record holds for the teardown

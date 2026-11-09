@@ -31,6 +31,65 @@ const CURRENT_INSTANCE_DISK_ARTIFACT_PREFIX: &str = "d-stop-";
 const OPERATION_DISK_ARTIFACT_PREFIX: &str =
     pplx_space_common_core::host::linux::paths::INTERNAL_OPERATION_SNAPSHOT_PREFIX;
 
+/// The VM state files a full snapshot can't restore without.
+const FULL_SNAPSHOT_REQUIRED_FILES: &[&str] = &["vmstate", "memory"];
+
+/// Whether every one of `required` is a non-empty regular file in `path`.
+fn snapshot_files_present(path: &std::path::Path, required: &[&str]) -> bool {
+    required.iter().all(|file| {
+        std::fs::symlink_metadata(path.join(file))
+            .is_ok_and(|metadata| metadata.is_file() && metadata.len() > 0)
+    })
+}
+
+/// Whether the full snapshot directory at `path` holds the VM state it
+/// restores from, by the test the snapshot listing reports `incomplete` by:
+/// each of [`FULL_SNAPSHOT_REQUIRED_FILES`] is a non-empty regular file. A
+/// failed capture can leave the disk without it. Unlike the listing, which
+/// shows an unreadable file as incomplete, a caller deciding whether the
+/// directory may be deleted gets any error other than `NotFound` back, so
+/// that an unreadable snapshot isn't taken for an incomplete one.
+pub(super) fn full_snapshot_complete(path: &std::path::Path) -> std::io::Result<bool> {
+    for file in FULL_SNAPSHOT_REQUIRED_FILES {
+        match snapshot_entry_metadata(&path.join(file)) {
+            Ok(metadata) if metadata.is_file() && metadata.len() > 0 => {}
+            Ok(_) => return Ok(false),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(true)
+}
+
+/// `symlink_metadata` of an entry in a sandbox's snapshot directory, which
+/// doesn't follow a symlink, as the listing's `DirEntry::file_type` doesn't.
+/// A test can make it fail for chosen paths ([`fail_snapshot_metadata`]).
+pub(super) fn snapshot_entry_metadata(
+    path: &std::path::Path,
+) -> std::io::Result<std::fs::Metadata> {
+    #[cfg(test)]
+    if SNAPSHOT_METADATA_FAULTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .any(|fault| fault == path)
+    {
+        return Err(std::io::Error::other("injected snapshot metadata error"));
+    }
+    std::fs::symlink_metadata(path)
+}
+
+/// The paths whose [`snapshot_entry_metadata`] fails in this test process.
+#[cfg(test)]
+static SNAPSHOT_METADATA_FAULTS: std::sync::Mutex<Vec<std::path::PathBuf>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Make [`snapshot_entry_metadata`] fail for `path` in this test process.
+#[cfg(test)]
+pub(crate) fn fail_snapshot_metadata(path: std::path::PathBuf) {
+    SNAPSHOT_METADATA_FAULTS.lock().unwrap().push(path);
+}
+
 /// A snapshot directory users can't list, delete, roll back to, export or
 /// back up: sbx-mgr's own disk artifacts, and GC staging (logically deleted
 /// bytes that only the orphan sweep removes).
@@ -1104,7 +1163,7 @@ fn project_snapshot_inventory(
             // survive a failed SQLite commit, which an identical retry repairs.
             // Otherwise skip_if_exists would falsely acknowledge that retry.
             let required: &[&str] = if full {
-                &["vmstate", "memory"]
+                FULL_SNAPSHOT_REQUIRED_FILES
             } else {
                 &["rootfs.ext4"]
             };
@@ -1112,13 +1171,7 @@ fn project_snapshot_inventory(
                 Some(state) if state != crate::local_artifacts::ArtifactState::Ready => {
                     state.as_str()
                 }
-                _ if !required.iter().all(|file| {
-                    std::fs::symlink_metadata(path.join(file))
-                        .is_ok_and(|metadata| metadata.is_file() && metadata.len() > 0)
-                }) =>
-                {
-                    "incomplete"
-                }
+                _ if !snapshot_files_present(&path, required) => "incomplete",
                 Some(_) => "ready",
                 None => "unknown",
             }

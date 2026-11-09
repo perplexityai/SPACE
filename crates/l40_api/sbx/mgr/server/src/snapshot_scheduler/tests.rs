@@ -1652,3 +1652,5 @@ fn gc_staging_ids_are_canonical() {
         );
     }
 }
+
+mod incomplete_checkpoint;

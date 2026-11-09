@@ -534,6 +534,7 @@ async fn durable_artifact_backup_persists_the_submitted_artifact_identity() {
                     format: SuspendSnapshotFormat::Full,
                     handoff: ArtifactBackupHandoff::DurableWorker,
                     execution_generation: None,
+                    capture_vouched: false,
                 },
             )
             .await;
@@ -625,6 +626,118 @@ async fn durable_artifact_backup_persists_the_submitted_artifact_identity() {
             case.name
         );
         assert!(payload.meta.execution.is_some(), "{}", case.name);
+    }
+}
+
+/// A durable backup intent marks its execution generation as the capture's
+/// only on evidence: the caller's, or the capturing teardown's own record
+/// naming that generation for this artifact. Recovery's record doesn't count. A generation without either fences the registration but
+/// mustn't order captures.
+#[tokio::test]
+async fn an_upload_names_its_capture_generation_only_on_evidence() {
+    let token_dir = tempfile::tempdir().unwrap();
+    let token_path = token_dir.path().join("cluster-api.token");
+    if !pplx_space_test_env::enter_test_process(&cluster_api_env(
+        LOOPBACK_ENDPOINT,
+        STATIC_TOKEN,
+        &token_path,
+    )) {
+        return;
+    }
+    let generation = |n| pplx_space_common_core::types::ExecutionGeneration::new(n).unwrap();
+    use crate::capture_record::RecordWriter::{CapturingTeardown as Teardown, Recovery};
+    // (case, generation sent, caller vouches, record's generation and writer,
+    // expected)
+    let cases = [
+        ("caller vouches", Some(7), true, None, true),
+        (
+            "record names the generation",
+            Some(7),
+            false,
+            Some((7, Teardown)),
+            true,
+        ),
+        (
+            "record names another generation",
+            Some(7),
+            false,
+            Some((6, Teardown)),
+            false,
+        ),
+        (
+            "recovery's record names the generation",
+            Some(7),
+            false,
+            Some((7, Recovery)),
+            false,
+        ),
+        ("no evidence", Some(7), false, None, false),
+        (
+            "no generation to name",
+            None,
+            true,
+            Some((7, Teardown)),
+            false,
+        ),
+    ];
+    for (name, sent, vouched, recorded, expected) in cases {
+        let conn = crate::db::test_conn();
+        let id = SandboxId::new().to_string();
+        insert_test_sandbox(&conn, &id, SandboxState::Suspended);
+        let mut service = SandboxManagerService::for_test(conn);
+        service.snapshot_upload_config = Some(Arc::new(upload_config("default-bucket")));
+        let sandbox = service.lookup_sandbox(&id).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let snapshot_dir = root.path().join("artifact");
+        write_artifact(&snapshot_dir, &id, &["vmstate", "memory", "rootfs.ext4"]);
+        let local_artifact_id = LocalArtifactId::new();
+        if let Some((recorded, writer)) = recorded {
+            crate::capture_record::write(
+                &snapshot_dir,
+                local_artifact_id,
+                generation(recorded),
+                writer,
+            )
+            .unwrap();
+        }
+
+        let outcome = service
+            .submit_artifact_backup(
+                &sandbox,
+                ArtifactBackupSubmission {
+                    local_artifact_id,
+                    artifact_kind: ArtifactKind::Full,
+                    artifact_origin: ArtifactOrigin::Suspend,
+                    snapshot_name: None,
+                    backup_attempt_id: BackupAttemptId::new(),
+                    snapshot_dir: snapshot_dir.to_str().unwrap(),
+                    request_override: None,
+                    format: SuspendSnapshotFormat::Full,
+                    handoff: ArtifactBackupHandoff::DurableWorker,
+                    execution_generation: sent.map(generation),
+                    capture_vouched: vouched,
+                },
+            )
+            .await;
+        assert!(
+            matches!(outcome, Ok(SubmitSuspendSnapshotOutcome::Enqueued { .. })),
+            "{name}: {outcome:?}"
+        );
+        let payload = service
+            .snapshot_upload_worker()
+            .find_job_by_dedup_key(
+                crate::snapshot_upload_jobs::SNAPSHOT_UPLOAD_JOB_KIND,
+                &local_artifact_id.to_string(),
+            )
+            .unwrap()
+            .expect(name)
+            .payload_as::<crate::snapshot_upload::SnapshotUploadJobs>()
+            .unwrap();
+        assert_eq!(payload.execution_generation, sent.map(generation), "{name}");
+        assert_eq!(
+            payload.execution_generation_names_capture, expected,
+            "{name}"
+        );
     }
 }
 

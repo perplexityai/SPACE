@@ -710,6 +710,63 @@ fn finish_completed_checkpoint_after_resume_error(
     lifecycle_result
 }
 
+/// How many times [`discard_incomplete_checkpoint`] asks node-manager to
+/// delete the directory, and how long it waits between asks. Node-manager
+/// refuses a delete with `Unavailable` while another operation on the
+/// sandbox, such as the guest-network reconciler, holds its mutation claim,
+/// which it does only briefly.
+const INCOMPLETE_CHECKPOINT_DELETE_ATTEMPTS: usize = 3;
+const INCOMPLETE_CHECKPOINT_DELETE_BACKOFF: Duration = Duration::from_millis(250);
+
+/// Delete the snapshot directory a checkpoint created before its VM state
+/// capture failed, returning `error` with any failure to delete appended. The
+/// directory holds the disk but no VM state, so it restores nothing, yet the
+/// listing still shows it, as incomplete, and with no row nothing removes it
+/// while the sandbox runs: retention spares a manual checkpoint's name. Only
+/// a directory this checkpoint created is deleted: a failed create may have
+/// met an existing snapshot of the same name. A delete refused as
+/// `Unavailable` is asked again, up to
+/// [`INCOMPLETE_CHECKPOINT_DELETE_ATTEMPTS`] times; the caller has already
+/// rolled the sandbox back, so the outcome changes nothing else.
+async fn discard_incomplete_checkpoint(
+    node_client: &mut pplx_space_node_mgr_client::NodeManagerGrpcClient,
+    sandbox_id: &str,
+    snapshot_name: &str,
+    error: String,
+) -> String {
+    let mut attempt = 1;
+    let status = loop {
+        match node_client
+            .delete_btrfs_snapshot(
+                pplx_space_node_mgr_client::proto::DeleteBtrfsSnapshotRequest {
+                    sandbox_id: sandbox_id.to_string(),
+                    snapshot_name: snapshot_name.to_string(),
+                },
+            )
+            .await
+        {
+            Ok(_) => return error,
+            Err(status) if status.code() == tonic::Code::NotFound => return error,
+            Err(status)
+                if status.code() == tonic::Code::Unavailable
+                    && attempt < INCOMPLETE_CHECKPOINT_DELETE_ATTEMPTS =>
+            {
+                attempt += 1;
+                tokio::time::sleep(INCOMPLETE_CHECKPOINT_DELETE_BACKOFF).await;
+            }
+            Err(status) => break status,
+        }
+    };
+    tracing::warn!(
+        sandbox_id,
+        snapshot_name,
+        attempt,
+        error = %status,
+        "failed to delete an incomplete checkpoint's snapshot directory"
+    );
+    format!("{error}; delete the incomplete checkpoint {snapshot_name}: {status}")
+}
+
 async fn rollback_checkpoint_failure(
     ctx: &CheckpointContext,
     node_client: &mut pplx_space_node_mgr_client::NodeManagerGrpcClient,
@@ -1014,13 +1071,20 @@ pub async fn do_checkpoint(
         ))
         .await
     {
-        return Err(rollback_checkpoint_failure(
+        let error = rollback_checkpoint_failure(
             ctx,
             &mut node_client,
             sandbox_id,
             execution_fence.clone(),
             previous_state,
             format!("checkpoint snapshot failed: {e}"),
+        )
+        .await;
+        return Err(discard_incomplete_checkpoint(
+            &mut node_client,
+            sandbox_id,
+            snapshot_name,
+            error,
         )
         .await);
     }

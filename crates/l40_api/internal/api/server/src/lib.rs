@@ -457,6 +457,12 @@ enum BackupReadiness {
     LatestReadySuspend(SnapshotId),
     /// The sandbox is durably restorable from a ready snapshot.
     DurablyRestorable,
+    /// The first artifact's ready backup was captured by a later execution
+    /// than the second's.
+    CapturedAfter {
+        later: (LocalArtifactId, ArtifactKind),
+        earlier: (LocalArtifactId, ArtifactKind),
+    },
 }
 
 fn parse_artifact_backup_query(
@@ -505,6 +511,19 @@ fn parse_artifact_backup_query(
             )?)
         }
         Some(Artifact::DurablyRestorable(true)) => BackupReadiness::DurablyRestorable,
+        Some(Artifact::CapturedAfter(order)) => {
+            let identity = |identity: Option<&crate::proto::LocalArtifactBackupIdentity>,
+                            field: &str| {
+                let identity = identity.ok_or_else(|| {
+                    Status::invalid_argument(format!("captured_after.{field} is required"))
+                })?;
+                parse_artifact(&identity.local_artifact_id, identity.artifact_kind)
+            };
+            BackupReadiness::CapturedAfter {
+                later: identity(order.later.as_ref(), "later")?,
+                earlier: identity(order.earlier.as_ref(), "earlier")?,
+            }
+        }
         Some(Artifact::DurablyRestorable(false)) => {
             return Err(Status::invalid_argument("durably_restorable must be true"));
         }
@@ -997,7 +1016,12 @@ impl ClusterApiService {
                 storage_uri,
             )?
             .with_artifact(artifact)
-            .with_execution_metadata(execution_metadata);
+            .with_execution_metadata(execution_metadata)
+            // Orders captures only when the node vouches that the generation
+            // is the capturing execution's; it fences either way.
+            .with_generation(
+                execution_generation.filter(|_| req.execution_generation_names_capture),
+            );
         let mut tx = self
             .pool
             .begin()
@@ -1197,6 +1221,11 @@ impl ClusterApiService {
             }
             BackupReadiness::DurablyRestorable => {
                 pplx_space_sandbox_store::durably_restorable(&self.pool, sandbox_id)
+                    .await
+                    .map_err(|e| readiness_error(&e))?
+            }
+            BackupReadiness::CapturedAfter { later, earlier } => {
+                snapshot_store::artifact_captured_after(&self.pool, sandbox_id, later, earlier)
                     .await
                     .map_err(|e| readiness_error(&e))?
             }

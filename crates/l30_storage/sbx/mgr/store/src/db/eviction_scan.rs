@@ -6,6 +6,8 @@ use crate::db::{Connection, OptionalExtension, Result};
 use pplx_space_sqlite::SqliteU64;
 use rusqlite::params;
 
+use super::runtime_upgrades::UNRETIRED_UPGRADE_PHASES_SQL;
+
 use crate::db::timestamps::EpochSeconds;
 
 const VALID_SUSPENDED_UPDATED_AT_SQL: &str =
@@ -96,6 +98,16 @@ db_private_outside_tests! {
              WHERE j.kind = 'snapshot_upload'
                AND j.subject_id = s.id
                AND j.status IN ('pending', 'running')
+           )
+           AND NOT EXISTS (
+             SELECT 1 FROM jobs j
+             WHERE j.kind = 'snapshot_upload' AND j.status = 'cancelling'
+               AND j.subject_id = s.id
+           )
+           AND NOT EXISTS (
+             SELECT 1 FROM sandbox_runtime_upgrades u
+             WHERE u.sandbox_id = s.id
+               AND u.phase IN {UNRETIRED_UPGRADE_PHASES_SQL}
            )
          ORDER BY {IDLE_WITNESS_SQL} ASC, s.id ASC
          LIMIT ?4"

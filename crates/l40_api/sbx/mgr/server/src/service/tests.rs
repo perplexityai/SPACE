@@ -7676,6 +7676,242 @@ pub(crate) mod service_tests {
         );
     }
 
+    /// A suspended row the eviction claim would refuse because an upload of
+    /// its artifacts or a runtime upgrade still holds it, or that another
+    /// operation on its artifacts holds the artifact lock of, is answered
+    /// `Aborted`, which node-ctl retries on its next sync rather than after
+    /// its back-off, and is left as it is. Once nothing holds it, the same
+    /// eviction reclaims it.
+    #[tokio::test]
+    async fn evict_cluster_deleted_suspended_sandbox_is_retried_while_held() {
+        for hold in ["upload", "upgrade", "artifact lock"] {
+            let conn = crate::db::test_conn();
+            let sandbox_id = SandboxId::new().to_string();
+            insert_platform_owned_sandbox(&conn, &sandbox_id, SandboxState::Suspended, None);
+            conn.execute(
+                "UPDATE sandboxes SET updated_at = '0' WHERE id = ?1",
+                crate::db::fixture::params![sandbox_id],
+            )
+            .unwrap();
+            let release = match hold {
+                "upload" => {
+                    conn.execute(
+                        "INSERT INTO jobs (job_id, kind, status, payload, subject_id, created_at)
+                         VALUES ('held-upload', 'snapshot_upload', 'running', '{}', ?1, '1')",
+                        crate::db::fixture::params![sandbox_id],
+                    )
+                    .unwrap();
+                    Some("UPDATE jobs SET status = 'completed' WHERE job_id = 'held-upload'")
+                }
+                // Another operation on its artifacts: a backup being
+                // admitted, a transfer, a publication.
+                "artifact lock" => None,
+                _ => {
+                    let compiled =
+                        pplx_space_node_runtime_core::catalog::CompiledEnvironment::for_architecture(
+                            pplx_space_common_core::types::Arch::X86_64,
+                        )
+                        .unwrap();
+                    crate::db::upsert_sandbox_execution_metadata(
+                        &conn,
+                        &sandbox_id,
+                        &compiled[0].definition().execution_requirements().unwrap(),
+                    )
+                    .unwrap();
+                    crate::db::test_fixtures::fence_runtime_upgrade(
+                        &conn,
+                        &sandbox_id,
+                        compiled[1].definition().reference(),
+                        None,
+                    );
+                    Some("UPDATE sandbox_runtime_upgrades SET phase = 'rolled_back'")
+                }
+            };
+            conn.execute(
+                "UPDATE sandboxes SET updated_at = '0' WHERE id = ?1",
+                crate::db::fixture::params![sandbox_id],
+            )
+            .unwrap();
+            let service = service_with_runtime_probe(conn, false);
+            let dispatched = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let observed = Arc::clone(&dispatched);
+            *service.cleanup_executor.dispatch.lock().unwrap() = Some(Arc::new(move |id, kill| {
+                observed.lock().unwrap().push((id, kill));
+                Box::pin(async { Ok(()) })
+            }));
+            let artifact_guard = (hold == "artifact lock").then(|| {
+                service
+                    .auto_lifecycle
+                    .artifact_lock(&sandbox_id)
+                    .try_lock_owned()
+                    .unwrap()
+            });
+
+            let error = service
+                .evict_cluster_deleted_sandbox(root_peer_request(&sandbox_id))
+                .await
+                .expect_err("a held row must not be evicted");
+            assert_eq!(error.code(), tonic::Code::Aborted, "{hold}: {error}");
+            assert!(error.message().contains("next sync"), "{hold}: {error}");
+            {
+                let db = service.db.lock().unwrap();
+                let row = crate::db::get_sandbox(&db, &sandbox_id).unwrap().unwrap();
+                assert_eq!(
+                    row.state,
+                    SandboxStatus::from(SandboxState::Suspended),
+                    "{hold}"
+                );
+            }
+            assert!(dispatched.lock().unwrap().is_empty(), "{hold}");
+
+            if let Some(release) = release {
+                service.db.lock().unwrap().execute(release, []).unwrap();
+            }
+            drop(artifact_guard);
+            let result = tokio::time::timeout(
+                Duration::from_secs(5),
+                service.evict_cluster_deleted_sandbox(root_peer_request(&sandbox_id)),
+            )
+            .await;
+            service.shutdown_token.cancel();
+            service.task_tracker.close();
+            tokio::time::timeout(Duration::from_secs(5), service.task_tracker.wait())
+                .await
+                .expect("eviction and cleanup tasks must drain");
+            result
+                .expect("eviction should complete")
+                .unwrap_or_else(|error| panic!("{hold}: an unheld row is reclaimed: {error}"));
+            assert_eq!(
+                *dispatched.lock().unwrap(),
+                vec![(sandbox_id.clone(), false)],
+                "{hold}"
+            );
+        }
+    }
+
+    /// A sandbox the cluster deleted is evicted with a named snapshot nothing
+    /// backed up: the cluster's snapshots of a sandbox go with its row, so
+    /// the snapshot no longer exists anywhere but this node.
+    #[tokio::test]
+    async fn evict_cluster_deleted_suspended_sandbox_takes_its_unbacked_named_snapshots() {
+        let conn = crate::db::test_conn();
+        let sandbox_id = SandboxId::new().to_string();
+        insert_platform_owned_sandbox(&conn, &sandbox_id, SandboxState::Suspended, None);
+        conn.execute(
+            "INSERT INTO local_artifacts (
+                 local_artifact_id, sandbox_id, artifact_kind, artifact_origin,
+                 snapshot_name, local_path, created_at
+             ) VALUES (?1, ?2, 'disk', 'snapshot', 'd-named', '/space/cache/named', '0')",
+            crate::db::fixture::params![LocalArtifactId::new().to_string(), sandbox_id],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE sandboxes SET updated_at = '0' WHERE id = ?1",
+            crate::db::fixture::params![sandbox_id],
+        )
+        .unwrap();
+        let service = service_with_runtime_probe(conn, false);
+        let dispatched = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed = Arc::clone(&dispatched);
+        *service.cleanup_executor.dispatch.lock().unwrap() = Some(Arc::new(move |id, kill| {
+            observed.lock().unwrap().push((id, kill));
+            Box::pin(async { Ok(()) })
+        }));
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            service.evict_cluster_deleted_sandbox(root_peer_request(&sandbox_id)),
+        )
+        .await
+        .expect("eviction should complete");
+        service.shutdown_token.cancel();
+        service.task_tracker.close();
+        tokio::time::timeout(Duration::from_secs(5), service.task_tracker.wait())
+            .await
+            .expect("tasks drain");
+
+        result.unwrap();
+        assert_eq!(*dispatched.lock().unwrap(), vec![(sandbox_id, false)]);
+    }
+
+    /// A hold that appears after the cluster-deleted eviction checked for one,
+    /// before its claim, is refused by the claim the same way: the claim's
+    /// `FailedPrecondition` is answered `Aborted`, named by the hold, so
+    /// node-ctl retries on its next sync, and the row and the cleanup are
+    /// untouched. The eviction is paused at its claim by a test barrier, with
+    /// the check behind it, while an upload of the sandbox's artifacts starts.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn evict_cluster_deleted_suspended_sandbox_held_after_its_check_is_retried() {
+        let conn = crate::db::test_conn();
+        let sandbox_id = SandboxId::new().to_string();
+        insert_platform_owned_sandbox(&conn, &sandbox_id, SandboxState::Suspended, None);
+        conn.execute(
+            "UPDATE sandboxes SET updated_at = '0' WHERE id = ?1",
+            crate::db::fixture::params![sandbox_id],
+        )
+        .unwrap();
+        let service = Arc::new(service_with_runtime_probe(conn, false));
+        let dispatched = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed = Arc::clone(&dispatched);
+        *service.cleanup_executor.dispatch.lock().unwrap() = Some(Arc::new(move |id, kill| {
+            observed.lock().unwrap().push((id, kill));
+            Box::pin(async { Ok(()) })
+        }));
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        *service
+            .auto_lifecycle
+            .eviction_claim_barrier
+            .lock()
+            .unwrap() = Some(Arc::clone(&barrier));
+        let eviction = tokio::spawn({
+            let service = Arc::clone(&service);
+            let sandbox_id = sandbox_id.clone();
+            async move {
+                service
+                    .evict_cluster_deleted_sandbox(root_peer_request(&sandbox_id))
+                    .await
+            }
+        });
+
+        // Past the check, not yet claimed.
+        tokio::time::timeout(Duration::from_secs(10), barrier.wait())
+            .await
+            .expect("the eviction reaches its claim");
+        service
+            .db
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO jobs (job_id, kind, status, payload, subject_id, created_at)
+                 VALUES ('late-upload', 'snapshot_upload', 'running', '{}', ?1, '1')",
+                crate::db::fixture::params![sandbox_id],
+            )
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), barrier.wait())
+            .await
+            .expect("the eviction resumes");
+        let error = tokio::time::timeout(Duration::from_secs(10), eviction)
+            .await
+            .expect("the eviction answers")
+            .unwrap()
+            .expect_err("a row held before its claim must not be evicted");
+
+        assert_eq!(error.code(), tonic::Code::Aborted, "{error}");
+        assert!(error.message().contains("held by"), "{error}");
+        assert!(error.message().contains("next sync"), "{error}");
+        {
+            let db = service.db.lock().unwrap();
+            let row = crate::db::get_sandbox(&db, &sandbox_id).unwrap().unwrap();
+            assert_eq!(row.state, SandboxStatus::from(SandboxState::Suspended));
+        }
+        assert!(dispatched.lock().unwrap().is_empty());
+        service.shutdown_token.cancel();
+        service.task_tracker.close();
+        tokio::time::timeout(Duration::from_secs(5), service.task_tracker.wait())
+            .await
+            .expect("tasks drain");
+    }
+
     async fn assert_evict_refused_and_row_untouched(
         service: &SandboxManagerService,
         sandbox_id: &str,
@@ -16069,10 +16305,13 @@ pub(crate) mod service_tests {
 
     /// Recovery adopts a teardown capture it finds staged or already
     /// published, pins it for backup without cleaning up, and records its
-    /// execution generation in the published capture.
+    /// execution generation in the published capture, keeping the teardown's
+    /// own record of that generation when the teardown wrote one.
     #[tokio::test]
     async fn startup_recovery_adopts_but_does_not_cleanup_an_unbacked_teardown_artifact() {
-        for staged in [true, false] {
+        for (staged, teardown_recorded) in
+            [(true, false), (false, false), (true, true), (false, true)]
+        {
             let conn = crate::db::test_conn();
             let sandbox_id = SandboxId::new().to_string();
             insert_test_sandbox(&conn, &sandbox_id, SandboxState::Paused);
@@ -16093,6 +16332,16 @@ pub(crate) mod service_tests {
                 local_artifact_id,
                 b"published-before-db-pin",
             );
+            if teardown_recorded {
+                // The teardown recorded its capture before the node went down.
+                crate::capture_record::write(
+                    &written_dir,
+                    local_artifact_id,
+                    teardown_generation(),
+                    crate::capture_record::RecordWriter::CapturingTeardown,
+                )
+                .unwrap();
+            }
 
             let service = service_with_runtime_probe(conn, false);
             let records = service
@@ -16124,6 +16373,16 @@ pub(crate) mod service_tests {
                 crate::capture_record::read(&snapshot_dir, local_artifact_id).unwrap(),
                 Some(teardown_generation()),
                 "staged: {staged}"
+            );
+            // Recovery can't tell the active teardown took this capture, so
+            // its own record fences but orders nothing; the teardown's record
+            // of the same generation, written before the node went down, is
+            // kept and still orders.
+            assert_eq!(
+                crate::capture_record::read_capture_order(&snapshot_dir, local_artifact_id)
+                    .unwrap(),
+                teardown_recorded.then(teardown_generation),
+                "staged: {staged}, teardown recorded: {teardown_recorded}"
             );
         }
     }

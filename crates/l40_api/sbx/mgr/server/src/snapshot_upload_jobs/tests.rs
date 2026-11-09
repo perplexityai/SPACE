@@ -3,7 +3,7 @@ use pplx_space_common_core::types::LocalArtifactId;
 
 use super::*;
 
-fn job_fixture(kind: &str, payload: String) -> Job {
+pub(crate) fn job_fixture(kind: &str, payload: String) -> Job {
     Job {
         job_id: JobId::new(),
         kind: kind.to_string(),
@@ -782,6 +782,7 @@ pub(crate) fn reclaim_fixture_payload(
         includes_metadata_job: true,
         deferred_metadata: false,
         execution_generation: None,
+        execution_generation_names_capture: false,
         failure_scope: Default::default(),
     }
 }
@@ -1211,9 +1212,40 @@ fn begin_request_carries_the_recorded_capture_host_cpu() {
             storage_uri: "s3://space-test/suspend-snapshots/attempt?region=us-east-1",
             execution: &execution,
             execution_generation: None,
+            execution_generation_names_capture: false,
             fence_verdict_only: false,
         });
         assert_eq!(request.capture_host_cpu.as_deref(), host_cpu);
+    }
+}
+
+/// A persisted upload's mark that its execution generation is the capture's
+/// own reaches the registration, so cluster-api records the generation only
+/// for a marked capture.
+#[test]
+fn begin_request_carries_the_capture_generation_mark() {
+    use pplx_space_common_core::types::{
+        Arch, ExecutionGeneration, ExecutionMetadata, SnapshotExecutionMetadata,
+    };
+
+    let artifact_id = "01939e3e-eeee-7000-8000-000000000051";
+    for names_capture in [false, true] {
+        let mut payload =
+            reclaim_fixture_payload(artifact_id, std::path::PathBuf::from("/space/cache/s"));
+        payload.meta.execution = Some(
+            SnapshotExecutionMetadata::new(ExecutionMetadata::initial_firecracker(
+                Arch::X86_64,
+                vec![],
+            ))
+            .unwrap(),
+        );
+        payload.execution_generation = Some(ExecutionGeneration::new(7).unwrap());
+        payload.execution_generation_names_capture = names_capture;
+
+        let request =
+            begin_artifact_backup_request(&prepared_begin(&payload, artifact_id, false).unwrap());
+        assert_eq!(request.execution_generation, Some(7));
+        assert_eq!(request.execution_generation_names_capture, names_capture);
     }
 }
 
@@ -1242,6 +1274,7 @@ fn verdict_only_begin_is_requested_and_its_echo_read() {
             storage_uri: "s3://space-test/suspend-snapshots/attempt?region=us-east-1",
             execution: &execution,
             execution_generation: None,
+            execution_generation_names_capture: false,
             fence_verdict_only,
         });
         assert_eq!(request.fence_verdict_only, fence_verdict_only);

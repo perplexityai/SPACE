@@ -598,7 +598,7 @@ fn release_claim_waits_for_other_local_artifacts_to_back_up() {
         "an unbacked named snapshot must keep the row"
     );
     assert_eq!(
-        crate::db::other_local_artifacts_awaiting_backup(&conn, &sandbox_id_string, staged)
+        crate::db::other_local_artifacts_awaiting_backup(&conn, &sandbox_id_string, Some(staged))
             .unwrap()
             .iter()
             .map(|artifact| artifact.local_artifact_id)
@@ -616,7 +616,7 @@ fn release_claim_waits_for_other_local_artifacts_to_back_up() {
 
     crate::db::mark_local_artifact_backup_completed(&conn, &named.to_string()).unwrap();
     assert!(
-        crate::db::other_local_artifacts_awaiting_backup(&conn, &sandbox_id_string, staged)
+        crate::db::other_local_artifacts_awaiting_backup(&conn, &sandbox_id_string, Some(staged))
             .unwrap()
             .is_empty()
     );

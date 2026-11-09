@@ -623,6 +623,37 @@ fn a_retained_artifact_stays_complete_across_stream_reclaim() {
     assert!(error.is_pending());
 }
 
+/// Recovery publishes a staged capture with a record naming the teardown it
+/// found active, which fences re-requests of it but doesn't order it: that
+/// teardown needn't be the one that staged the capture.
+#[test]
+fn a_recovered_publication_records_a_generation_that_fences_but_orders_nothing() {
+    let generation = ExecutionGeneration::new(7).unwrap();
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let snapshot_dir = canonical_suspend_snapshot_dir(tmp.path());
+    let local_artifact_id = LocalArtifactId::new();
+    let staging_dir = suspend_snapshot_staging_dir(tmp.path(), local_artifact_id);
+    write_full_suspend_artifact(&staging_dir, TEST_SANDBOX_ID, local_artifact_id, b"capture");
+
+    publish_recovered_suspend_snapshot_dir(
+        &staging_dir,
+        &snapshot_dir,
+        local_artifact_id,
+        Some(generation),
+        &Default::default(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        crate::capture_record::read(&snapshot_dir, local_artifact_id).unwrap(),
+        Some(generation)
+    );
+    assert_eq!(
+        crate::capture_record::read_capture_order(&snapshot_dir, local_artifact_id).unwrap(),
+        None
+    );
+}
+
 /// A teardown capture's execution record is published with its bytes, where a
 /// backup requested again by artifact id reads it; a capture with no execution
 /// publishes without one. A record that can't be written publishes nothing and
@@ -678,6 +709,12 @@ fn a_teardown_capture_publishes_only_with_its_execution_record() {
                 crate::capture_record::read(&snapshot_dir, local_artifact_id).unwrap(),
                 execution_generation,
                 "{case}"
+            );
+            assert_eq!(
+                crate::capture_record::read_capture_order(&snapshot_dir, local_artifact_id)
+                    .unwrap(),
+                execution_generation,
+                "{case}: the capturing teardown's own record orders captures"
             );
         }
     }
