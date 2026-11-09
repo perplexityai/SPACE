@@ -2617,13 +2617,11 @@ ON CONFLICT (key_hash) DO NOTHING;
         )
         return int(output.strip().splitlines()[-1])
 
-    @contextlib.contextmanager
-    def frozen_node_api(self, node_name: str) -> Iterator[None]:
-        try:
-            self._signal_node_api(node_name, "STOP")
-            yield
-        finally:
-            self._signal_node_api(node_name, "CONT")
+    def stop_node_api(self, node_name: str) -> None:
+        self._signal_node_api(node_name, "STOP")
+
+    def continue_node_api(self, node_name: str) -> None:
+        self._signal_node_api(node_name, "CONT")
 
     def _signal_node_api(self, node_name: str, signal: str) -> None:
         output = _require_ok(

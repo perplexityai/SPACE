@@ -692,7 +692,7 @@ where
         shutdown: Box::pin(lease.shutdown_token.cancelled_owned()),
         flushed_after_shutdown: None,
         delivered_any: false,
-        delivered_exit: false,
+        terminal_accounted: false,
         keepalive_interval,
         keepalive_deadline: None,
         start_wait: None,
@@ -727,8 +727,10 @@ pub(super) struct ProcessConnectJsonStream<S> {
     /// Whether any message reached the client, so a start knows whether it
     /// has reported itself yet.
     delivered_any: bool,
-    /// Whether the process's exit reached the client.
-    delivered_exit: bool,
+    /// Whether the stream's end is already accounted for: the process's exit
+    /// reached the client, or its delivery failure was counted as its own
+    /// outcome (replay miss or backpressure).
+    terminal_accounted: bool,
     // Response bytes reach HTTP intermediaries; backend keepalives do not.
     // This timer never renews the process lease or sandbox lifetime.
     keepalive_interval: Duration,
@@ -782,9 +784,12 @@ impl<S> ProcessConnectJsonStream<S> {
         }
         self.close_recorded = true;
         crate::metrics::stream_closed(ECW_PROCESS_STREAM_KIND, result);
-        // A client that left or was ended at the drain deadline reattaches
-        // itself; any other end of a start without its exit loses it.
-        if !self.connected_as_start && !self.delivered_exit && result != "shutdown" {
+        // A start that ends without its exit lost it, including a stall: the
+        // stall deadline is past the command's own, so its exit is overdue.
+        // Not counted: a client that left (its drop skips this), a stream ended
+        // at the drain deadline (the client reconnects to a live data plane),
+        // and `Process.Connect` streams, whose process its start already counts.
+        if !self.connected_as_start && !self.terminal_accounted && result != "shutdown" {
             crate::metrics::process_start_delivery(ProcessStartDeliveryOutcome::TerminalLost);
         }
     }
@@ -856,7 +861,7 @@ where
                             flushed.bytes += bytes.len();
                         }
                         this.delivered_any = true;
-                        this.delivered_exit |= exit;
+                        this.terminal_accounted |= exit;
                         if let Some(deadline) = this.keepalive_deadline.as_mut() {
                             deadline
                                 .as_mut()
@@ -868,6 +873,7 @@ where
                 }
                 Poll::Ready(Some(Err(status))) => {
                     this.ended = true;
+                    this.terminal_accounted |= process_start_delivery_failure(&status).is_some();
                     this.record_close("backend_status");
                     let bytes =
                         ecw_connect::connect_error_end_stream(status.code(), status.message());

@@ -17,7 +17,7 @@ from __future__ import annotations
 import secrets
 import time
 from collections.abc import Callable, Iterator
-from contextlib import AbstractContextManager
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -26,7 +26,7 @@ from space_smoke.capabilities import (
     EcwProcessStreamEvent,
     ExecStreamFaultControl,
 )
-from space_smoke.runtime import SmokeConfigurationError
+from space_smoke.runtime import ResourceScope, SmokeConfigurationError
 
 if TYPE_CHECKING:
     from space_smoke.fixtures import KindEcw
@@ -88,9 +88,12 @@ class OpenCommand:
 
 
 class ExecStreamFaults:
-    def __init__(self, test: KindEcw, control: ExecStreamFaultControl) -> None:
+    def __init__(
+        self, test: KindEcw, control: ExecStreamFaultControl, scope: ResourceScope
+    ) -> None:
         self._test = test
         self._control = control
+        self._scope = scope
         self.marker = f"/tmp/space-smoke-exec-{secrets.token_hex(6)}"
 
     def node(self) -> str:
@@ -127,8 +130,21 @@ class ExecStreamFaults:
         self._test.record("node_api_connections_cut", cut)
         self._test.verify(cut >= 1, "no data plane connection to node-api was open to cut")
 
-    def frozen_backend(self, node: str) -> AbstractContextManager[None]:
-        return self._control.frozen_node_api(node)
+    @contextmanager
+    def frozen_backend(self, node: str) -> Iterator[None]:
+        """node-api stopped for the block. Continuing it is armed before the
+        stop, so a failure anywhere still continues it at cleanup."""
+
+        resume = self._scope.defer(
+            f"continue node-api on {node}",
+            lambda: self._control.continue_node_api(node),
+            critical=True,
+        )
+        try:
+            self._control.stop_node_api(node)
+            yield
+        finally:
+            resume.release()
 
     def replace_backend(self, node: str, *, grace_seconds: int) -> None:
         started = time.monotonic()

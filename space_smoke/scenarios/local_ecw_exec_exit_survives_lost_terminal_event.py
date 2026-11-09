@@ -30,8 +30,16 @@ def ecw_exec_exit_survives_lost_terminal_event(test: smoke.KindEcw) -> None:
         with faults.frozen_backend(node):
             time.sleep(4)
             faults.cut_backend_streams(node)
+        continued_at = time.monotonic()
 
     with test.phase("the stream ends with the exit, no output repeated"):
         stream.read_to_end()
-        faults.expect_completed(stream, stdout="last\n", exit_code=7)
+        end = faults.expect_completed(stream, stdout="last\n", exit_code=7)
+        # The command exited while node-api was stopped and its connections
+        # were reset, so the exit can only come over a reopened stream.
+        test.verify(
+            end.at >= continued_at,
+            "the exit reached the client while node-api was stopped",
+            seconds_after_continue=round(end.at - continued_at, 2),
+        )
         faults.expect_one_run()

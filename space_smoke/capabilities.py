@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
-from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import StrEnum
@@ -2550,8 +2549,12 @@ class ExecStreamFaultControl(Protocol):
         node-api; the kernel resets each one. Returns how many were cut."""
         ...
 
-    def frozen_node_api(self, node_name: str) -> AbstractContextManager[None]:
-        """Stop the node's node-api process for the block and continue it after."""
+    def stop_node_api(self, node_name: str) -> None:
+        """SIGSTOP the node's node-api process."""
+        ...
+
+    def continue_node_api(self, node_name: str) -> None:
+        """SIGCONT the node's node-api process; harmless when it runs."""
         ...
 
     def replace_node_api(self, node_name: str, *, grace_seconds: int, timeout: float) -> str:

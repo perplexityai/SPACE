@@ -3043,7 +3043,7 @@ class KindEcw(Ecw):
 
         if self._exec_stream_fault_control is None:
             raise SmokeConfigurationError("exec stream faults are only available on the kind backend")
-        return ExecStreamFaults(self, self._exec_stream_fault_control)
+        return ExecStreamFaults(self, self._exec_stream_fault_control, self._context.scope)
 
     _sandbox_network_isolation_control: SandboxNetworkIsolationControl | None = None
     _sandbox_network_isolation_assertions: SandboxNetworkIsolationAssertions | None = None
