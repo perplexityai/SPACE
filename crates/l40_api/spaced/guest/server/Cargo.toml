@@ -48,7 +48,7 @@ datadog-otel = ["otel", "datadog"]
 # behaviour, and is deliberately not named as a test-only feature.
 loopback-diagnostic = []
 
-[dependencies]
+[target.'cfg(unix)'.dependencies]
 futures-util = { version = "0.3" }
 hyper-util = { workspace = true, features = ["tokio"] }
 nix = { workspace = true, features = ["signal", "process", "user", "net", "fs", "term", "time"] }
@@ -79,7 +79,7 @@ pplx-space-spaced-guest-update = { workspace = true }
 pplx-space-spaced-guest-protocol = { workspace = true }
 prost-types = { workspace = true }
 
-[dev-dependencies]
+[target.'cfg(unix)'.dev-dependencies]
 serde_json = { workspace = true }
 pplx-space-common-core = { workspace = true, features = ["test-hooks"] }
 opentelemetry-proto = { workspace = true, features = ["gen-tonic", "metrics"] }
@@ -94,3 +94,26 @@ tracing-subscriber = { workspace = true }
 # `test-util` enables `#[tokio::test(start_paused = true)]` so the
 # port-forward bind-retry/backoff tests run on virtual time.
 tokio = { workspace = true, features = ["test-util"] }
+
+[target.'cfg(windows)'.dependencies]
+jiff = { workspace = true }
+pplx-space-guest-capability = { workspace = true }
+pplx-space-spaced-guest-protocol = { workspace = true }
+pplx-space-guest-process = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+zeroize = { workspace = true }
+futures-util = { workspace = true }
+uuid = { workspace = true, features = ["v7"] }
+socket2 = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "io-util", "signal", "time", "net"] }
+tokio-util = { workspace = true, features = ["io-util", "rt"] }
+tokio-stream = { workspace = true }
+tonic = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+prost-types = { workspace = true }
+prost = { workspace = true }
+blake3 = { workspace = true }
+windows-sys = { version = "0.61", features = ["Win32_Networking_WinSock", "Win32_System_SystemInformation", "Win32_System_EventLog", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_WindowsProgramming", "Win32_System_Threading", "Win32_System_JobObjects", "Win32_System_Pipes", "Win32_System_Environment", "Win32_UI_Shell", "Win32_System_Registry"] }
+windows-service = "0.8"

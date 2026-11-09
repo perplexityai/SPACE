@@ -34,5 +34,5 @@ pplx-space-spaced-guest-server = { workspace = true, features = ["service-entryp
 pplx-space-spaced-guest-update = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
-pplx-space-spaced-guest-windows = { workspace = true }
+pplx-space-spaced-guest-server = { workspace = true, features = ["service-entrypoint"] }
 tracing-subscriber = { workspace = true }

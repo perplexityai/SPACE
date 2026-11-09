@@ -34,6 +34,12 @@ pub enum RunError {
     Server(#[from] tonic::transport::Error),
 }
 
+/// Read the installed service's SCM state without connecting to the host bridge.
+/// Running is the service's last reported state, not a live responsiveness probe.
+pub fn query_service_status() -> Result<windows_service::service::ServiceStatus, RunError> {
+    service::query_status().map_err(RunError::Service)
+}
+
 /// Starts only the operations implemented and declared by this native backend.
 /// The listener accepts host-CID connections; no IP interface is exposed.
 pub fn run(console: bool) -> Result<(), RunError> {
