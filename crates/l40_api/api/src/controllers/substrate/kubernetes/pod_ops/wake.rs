@@ -144,7 +144,11 @@ impl KubernetesSubstrate {
             return Ok(None);
         };
         let live_pod_ip = pod_ip.to_string();
-        if execution.pod_ip.as_deref() != Some(live_pod_ip.as_str())
+        // The refresh also promotes a `created` execution to `running`. It runs
+        // for a `created` row that already holds this IP too, so one a start
+        // left `created` before that promotion heals here.
+        if (execution.pod_ip.as_deref() != Some(live_pod_ip.as_str())
+            || execution.state == ActiveExecutionState::Created)
             && !self
                 .store
                 .persist_selected_route_pod_ip(

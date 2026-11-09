@@ -13315,6 +13315,84 @@ mod kubernetes_tests {
         Ok(())
     }
 
+    /// A start that stored its pod's IP but left the execution `created`
+    /// (as one did before the selected-route refresh promoted it) is healed
+    /// by the next selected-route resolution, though the IP is unchanged:
+    /// the execution becomes `running`, which suspend can claim.
+    #[tokio::test(flavor = "current_thread")]
+    async fn selected_wake_promotes_a_created_execution_that_already_has_the_pod_ip()
+    -> Result<(), BoxError> {
+        let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+        let pool = db.pool.clone();
+        let sandbox_id = SandboxId::new();
+        let route = SandboxActivationAttemptId::new();
+        let pod_name = "space-sbx-started-created-g7";
+        insert_test_sandbox_row(&pool, sandbox_id, "started").await?;
+        sqlx::query(
+            "INSERT INTO sandbox_k8s_executions
+                 (sandbox_id, generation, pod_name, pod_namespace, pod_uid, pod_ip,
+                  state, active, activation_attempt_id, route_activation_id)
+             VALUES ($1, 7, $2, 'space', 'started-pod-uid', '10.90.0.7',
+                     'created', TRUE, $3, $3)",
+        )
+        .bind(sandbox_id)
+        .bind(pod_name)
+        .bind(route.as_uuid())
+        .execute(&pool)
+        .await?;
+        let substrate = substrate_with_store_and_client(
+            pool.clone(),
+            kubernetes_client_returning_live_pod(Pod {
+                metadata: kube::api::ObjectMeta {
+                    name: Some(pod_name.to_string()),
+                    namespace: Some("space".to_string()),
+                    uid: Some("started-pod-uid".to_string()),
+                    ..Default::default()
+                },
+                status: Some(PodStatus {
+                    phase: Some("Running".to_string()),
+                    pod_ip: Some("10.90.0.7".to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+        );
+        let execution = substrate
+            .store
+            .active_execution_status(sandbox_id)
+            .await?
+            .expect("seeded execution");
+        let expected = k8s_execution_route_identity(&execution)?;
+
+        assert_eq!(
+            substrate
+                .selected_wake_pod_ip(sandbox_id, &expected)
+                .await?,
+            Some(PodIp::parse("10.90.0.7")?)
+        );
+        let state: String = sqlx::query_scalar(
+            "SELECT state FROM sandbox_k8s_executions WHERE sandbox_id = $1 AND active",
+        )
+        .bind(sandbox_id)
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(state, "running");
+        let claim = substrate
+            .store
+            .claim_suspend_execution(
+                sandbox_id,
+                ExecutionGeneration::new(7)?,
+                &PodUid::parse("started-pod-uid")?,
+            )
+            .await;
+        assert!(
+            matches!(claim, Ok(store::SuspendExecutionClaim::Claimed)),
+            "{claim:?}"
+        );
+
+        Ok(())
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn selected_wake_uses_authoritative_pod_uid_and_ip() -> Result<(), BoxError> {
         let db = pplx_space_db_test_fixtures::pg_test_db().await?;
