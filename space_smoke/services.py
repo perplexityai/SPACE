@@ -429,6 +429,7 @@ class SmokeServices:
             fixture._node_fence_control = cast(Any, kind)
             fixture._pending_backup_control = cast(Any, kind)
             fixture._teardown_restart_control = cast(Any, kind)
+            fixture._node_delete_stall_control = cast(Any, kind)
             fixture._orphaned_restore_pod_gc_control = cast(Any, kind)
             fixture._reconcile_queue_gc_control = cast(Any, kind)
             fixture._unanswered_template_control = cast(Any, kind)

@@ -29,6 +29,7 @@ from space_smoke.capabilities import (
     NodeSelectorExtrasControl,
     PendingBackupControl,
     TeardownRestartControl,
+    NodeDeleteStallControl,
     OrphanedRestorePodGcControl,
     ReconcileQueueGcControl,
     UnansweredTemplateEvictionControl,
@@ -110,6 +111,7 @@ from space_smoke.node_selector_extras import NodeSelectorExtrasAssertions
 from space_smoke.orphaned_restore_pod_gc import OrphanedRestorePodGcAssertions
 from space_smoke.unanswered_template_eviction import UnansweredTemplateEvictionAssertions
 from space_smoke.pending_backup import PendingBackupAssertions
+from space_smoke.node_delete_stall import NodeDeleteStallAssertions
 from space_smoke.teardown_restart import TeardownRestartAssertions
 from space_smoke.reconcile_queue_gc import ReconcileQueueGcAssertions
 from space_smoke.template_build import TemplateBuildAssertions
@@ -3088,6 +3090,23 @@ class KindEcw(Ecw, KindAdmin):
                 self, self._teardown_restart_control, self.pending_backup
             )
         return self._teardown_restart_assertions
+
+    _node_delete_stall_control: NodeDeleteStallControl | None = None
+    _node_delete_stall_assertions: NodeDeleteStallAssertions | None = None
+
+    @property
+    def node_delete_stall(self) -> NodeDeleteStallAssertions:
+        """Privileged assertions for a Delete whose node-local delete stalls."""
+
+        if self._node_delete_stall_control is None:
+            raise SmokeConfigurationError(
+                "node delete stall control is only available on the kind backend"
+            )
+        if self._node_delete_stall_assertions is None:
+            self._node_delete_stall_assertions = NodeDeleteStallAssertions(
+                self, self._node_delete_stall_control, self._context.scope
+            )
+        return self._node_delete_stall_assertions
 
     _orphaned_restore_pod_gc_control: OrphanedRestorePodGcControl | None = None
     _orphaned_restore_pod_gc_assertions: OrphanedRestorePodGcAssertions | None = None

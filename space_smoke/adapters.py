@@ -94,6 +94,7 @@ from space_smoke.capabilities import (
     RetentionSweeperConfig,
     ColdEvictionConfig,
     SnapshotReaperConfig,
+    OperationEvent,
     SandboxPodPlacement,
     SnapshotRecord,
     StorageExchangeOutcome,
@@ -4362,6 +4363,105 @@ ON CONFLICT (key_hash) DO NOTHING;
             raise RuntimeError("native :suspend returned no operation_id")
         return operation_id
 
+    # --- stalled node-local delete --------------------------------------------
+
+    def freeze_node_service(self, node_name: str, component: str) -> None:
+        """Freeze the service's container cgroup and wait until the kernel reports it frozen."""
+
+        self._require_isolated_kind("node-service freeze")
+        script = _NODE_SERVICE_CGROUP_SCRIPT.replace("__COMPONENT__", _node_service_component(component)) + (
+            'echo 1 > "$cg/cgroup.freeze"\n'
+            "for _ in $(seq 100); do\n"
+            '  grep -qx "frozen 1" "$cg/cgroup.events" && exit 0\n'
+            "  sleep 0.1\n"
+            "done\n"
+            "exit 4\n"
+        )
+        _require_ok(
+            self._docker_exec(node_name, "sh", "-c", script, timeout=30),
+            f"freeze {component} on {node_name}",
+        )
+
+    def thaw_node_service(self, node_name: str, component: str) -> None:
+        self._require_isolated_kind("node-service thaw")
+        script = _NODE_SERVICE_CGROUP_SCRIPT.replace("__COMPONENT__", _node_service_component(component)) + (
+            'echo 0 > "$cg/cgroup.freeze"\n'
+        )
+        _require_ok(
+            self._docker_exec(node_name, "sh", "-c", script, timeout=30),
+            f"thaw {component} on {node_name}",
+        )
+
+    def node_service_health_answers(
+        self, node_name: str, component: str, *, rpc_timeout: float
+    ) -> bool:
+        seconds = max(1, int(rpc_timeout))
+        script = _NODE_SERVICE_CGROUP_SCRIPT.replace("__COMPONENT__", _node_service_component(component)) + (
+            f"exec timeout {seconds + 10} \"/proc/$pid/root/opt/space/bin/grpc_health_probe\" "
+            f"\"-addr=unix:///proc/$pid/root/run/health/__COMPONENT__.sock\" -service=liveness "
+            f"-connect-timeout={seconds}s -rpc-timeout={seconds}s\n"
+        ).replace("__COMPONENT__", _node_service_component(component))
+        result = self._docker_exec(node_name, "sh", "-c", script, timeout=seconds + 30)
+        return result.returncode == 0
+
+    def node_service_restarts(self, node_name: str, component: str) -> int:
+        pod = self._node_service_pod(node_name, _node_service_component(component))
+        out = _require_ok(
+            self.kubectl(
+                "get", "pod", pod, "-o",
+                f"jsonpath={{.status.containerStatuses[?(@.name=='{component}')].restartCount}}",
+                timeout=15,
+            ),
+            f"read {component}'s restart count on {node_name}",
+        ).strip()
+        return int(out) if out.isdigit() else 0
+
+    def delete_without_waiting(self, sandbox_id: str) -> str:
+        self._require_isolated_kind("native delete")
+        public_id = f"sbx_{_sql_uuid(sandbox_id)}"
+        request = Request(
+            self.config.api_url.rstrip("/") + f"/v1/sandboxes/{quote(public_id, safe='')}",
+            method="DELETE",
+            headers={
+                "Authorization": "Bearer " + self._admin_token(),
+                "Idempotency-Key": f"space-smoke-delete-{secrets.token_hex(8)}",
+            },
+        )
+        try:
+            with urlopen(request, timeout=20) as response:
+                payload = json.load(response)
+        except HTTPError as error:
+            raise RuntimeError(f"native DELETE returned HTTP {error.code}") from None
+        except (URLError, OSError, ValueError):
+            raise RuntimeError("native DELETE failed") from None
+        operation_id = payload.get("operation_id") if isinstance(payload, dict) else None
+        if not isinstance(operation_id, str) or not operation_id:
+            raise RuntimeError("native DELETE returned no operation_id")
+        return operation_id
+
+    def operation_events(self, operation_id: str) -> list[OperationEvent]:
+        payload = self._admin_v1(
+            "GET", f"operations/{quote(operation_id, safe='')}/events?limit=100"
+        )
+        items = payload.get("data") if isinstance(payload, dict) else None
+        if not isinstance(items, list):
+            raise RuntimeError(f"operation {operation_id}'s events have no data list")
+        events = []
+        for item in items:
+            event_type = item.get("event_type")
+            created_at = item.get("created_at")
+            details = item.get("event")
+            if not isinstance(event_type, str) or not isinstance(created_at, str):
+                raise RuntimeError(f"unrecognized operation event {item!r}"[:300])
+            events.append(
+                OperationEvent(
+                    event_type=event_type.removeprefix("operation."),
+                    created_at=_rfc3339_timestamp(created_at),
+                    details=details if isinstance(details, dict) else {},
+                )
+            )
+        return events
+
     def operation_state(self, operation_id: str) -> str:
         payload = self._admin_v1("GET", f"operations/{quote(operation_id, safe='')}")
         state = payload.get("state") if isinstance(payload, dict) else None
@@ -7245,6 +7345,24 @@ exit 1
 # (the canonical id's last eight characters), or exits 3 without such a row,
 # so a failed listing (any other exit, under `set -e`) is never read as "no
 # row". The list's cells are separated by `┆`.
+# Sets `pid` to the main process and `cg` to the cgroup of the node's one
+# running __COMPONENT__ container. The component is a fixed service name.
+_NODE_SERVICE_CGROUP_SCRIPT = r"""set -eu
+id="$(crictl ps --state running --name '^__COMPONENT__$' -q)"
+[ "$(printf '%s\n' "$id" | grep -c .)" = 1 ] || { echo "expected one running __COMPONENT__ container, found: $id" >&2; exit 3; }
+pid="$(crictl inspect -o go-template --template '{{.info.pid}}' "$id")"
+cg="/sys/fs/cgroup$(sed -n 's/^0:://p' "/proc/$pid/cgroup")"
+"""
+
+_NODE_SERVICES_THAT_MAY_STALL = ("sandbox-manager", "node-manager")
+
+
+def _node_service_component(component: str) -> str:
+    if component not in _NODE_SERVICES_THAT_MAY_STALL:
+        raise ValueError(f"refusing to stall node service {component!r}")
+    return component
+
+
 _NODE_SANDBOX_STATE_SCRIPT = r"""set -eu
 sandboxes="$(/space/bin/space-sbxmgr list)"
 row="$(printf '%s\n' "$sandboxes" | grep -F '__SHORT_ID__' || true)"
@@ -9133,3 +9251,15 @@ def validate_loopback_environment(
             f"{scenario_id} is loopback-only "
             f"(set {remote_override_name}=1 to override)"
         )
+
+
+def _rfc3339_timestamp(value: str) -> float:
+    """Seconds since the epoch; fractions past microseconds are dropped."""
+
+    match = re.fullmatch(r"(.+?:\d\d)(?:\.(\d+))?(Z|[+-]\d\d:\d\d)", value)
+    if match is None:
+        raise RuntimeError(f"unrecognized RFC 3339 time {value!r}")
+    whole, fraction, zone = match.groups()
+    zone = "+00:00" if zone == "Z" else zone
+    parsed = datetime.fromisoformat(whole + zone).timestamp()
+    return parsed + (float(f"0.{fraction}") if fraction else 0.0)

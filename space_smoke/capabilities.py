@@ -684,6 +684,58 @@ class TeardownRestartControl(PendingBackupControl, Protocol):
 
 
 @dataclass(frozen=True)
+class OperationEvent:
+    """One public operation event: its type and when the API recorded it."""
+
+    event_type: str
+    created_at: float
+    details: Mapping[str, object]
+
+
+class NodeDeleteStallControl(Protocol):
+    """Kind-only operations for stalling a node-local delete.
+
+    The fault is the cgroup v2 freezer on one node service's container: a
+    frozen sandbox-manager answers nothing, so a Delete and the API's
+    `SandboxState` admission probe both hang; a frozen node-manager leaves
+    sandbox-manager serving while its admitted cleanup hangs on the
+    node-manager call. Thawing is armed before every freeze. The
+    observables are the public sandbox and its delete operation's events,
+    and the node's own sandbox row read through `space-sbxmgr list`.
+    """
+
+    def sandbox_pod_placement(self, sandbox_id: str) -> SandboxPodPlacement | None: ...
+
+    def freeze_node_service(self, node_name: str, component: str) -> None: ...
+
+    def thaw_node_service(self, node_name: str, component: str) -> None: ...
+
+    def node_service_health_answers(
+        self, node_name: str, component: str, *, rpc_timeout: float
+    ) -> bool:
+        """Whether the service's own health socket answers within `rpc_timeout`.
+
+        Probed from the node, outside the service's cgroup, so it measures the
+        service rather than a frozen exec.
+        """
+        ...
+
+    def node_service_restarts(self, node_name: str, component: str) -> int:
+        """The service container's kubelet restart count on that node."""
+        ...
+
+    def delete_without_waiting(self, sandbox_id: str) -> str:
+        """`DELETE /v1/sandboxes/{id}` as the kind admin; returns the operation id."""
+        ...
+
+    def operation_state(self, operation_id: str) -> str: ...
+
+    def operation_events(self, operation_id: str) -> list[OperationEvent]: ...
+
+    def node_sandbox_state(self, node_name: str, sandbox_id: str) -> str | None: ...
+
+
+@dataclass(frozen=True)
 class ReconcileQueueRef:
     """One `node_reconcile_queue` row: its node, facet and whether it is a dead letter."""
 
