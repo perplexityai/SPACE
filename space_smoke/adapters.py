@@ -2619,8 +2619,8 @@ ON CONFLICT (key_hash) DO NOTHING;
 
     @contextlib.contextmanager
     def frozen_node_api(self, node_name: str) -> Iterator[None]:
-        self._signal_node_api(node_name, "STOP")
         try:
+            self._signal_node_api(node_name, "STOP")
             yield
         finally:
             self._signal_node_api(node_name, "CONT")
@@ -8685,11 +8685,20 @@ class _ConnectProcessStartStream:
             )
             return
         while True:
-            prefix = self._response.read(5)
-            if len(prefix) < 5:
+            try:
+                prefix = self._response.read(5)
+                if len(prefix) < 5:
+                    return
+                length = int.from_bytes(prefix[1:], "big")
+                payload = self._response.read(length)
+                if len(payload) < length:
+                    raise ValueError(f"message cut at {len(payload)} of {length} bytes")
+                message = json.loads(payload or b"{}")
+            except (OSError, HTTPException, ValueError) as error:
+                yield EcwProcessStreamEvent(
+                    kind="error", at=time.monotonic(), error=f"{type(error).__name__}: {error}"
+                )
                 return
-            payload = self._response.read(int.from_bytes(prefix[1:], "big"))
-            message = json.loads(payload or b"{}")
             at = time.monotonic()
             if prefix[0] & 0x02:
                 error = message.get("error")

@@ -43,6 +43,8 @@ class ConnectProcessStartStreamTests(unittest.TestCase):
         error = _message({"error": {"code": "unavailable", "message": "gone"}}, flags=0x02)
         self.assertEqual(self._events(error), [("error", "unavailable: gone")])
         self.assertEqual(self._events(_message({"event": {"start": {"pid": 1}}})[:3]), [])
+        cut = self._events(_message({"event": {"start": {"pid": 1}}})[:9])
+        self.assertEqual([kind for kind, _ in cut], ["error"])
 
 
 if __name__ == "__main__":
