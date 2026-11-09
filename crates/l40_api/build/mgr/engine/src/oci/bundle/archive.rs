@@ -25,6 +25,18 @@ impl GuestBundle {
         cache_dir: &Path,
         as_root: bool,
     ) -> Result<Self, GuestBundleError> {
+        if seed_root.join("etc/spaced/update-contract").exists() {
+            for relative in [
+                "usr/bin/gnusleep",
+                "usr/bin/systemctl",
+                "var/lib/spaced/slots/a/artifact.json",
+            ] {
+                let path = seed_root.join(relative);
+                if !path.is_file() {
+                    return Err(GuestBundleError::MissingPath { path });
+                }
+            }
+        }
         for relative in REQUIRED_PATHS {
             let path = seed_root.join(relative);
             if !path.exists() && !path.is_symlink() {
