@@ -20,6 +20,10 @@ fn main() -> anyhow::Result<()> {
         proto_root.join("spaced/host_control/v1/host_control.proto"),
     ];
     let dependent_builder = tonic_prost_build::configure()
+        .extern_path(
+            ".space.spaced.update.v1",
+            "::pplx_space_spaced_guest_protocol::proto::update",
+        )
         .extern_path(".space.spaced.activity.v1", "crate::proto::activity")
         .extern_path(
             ".space.spaced.operations.v1",
