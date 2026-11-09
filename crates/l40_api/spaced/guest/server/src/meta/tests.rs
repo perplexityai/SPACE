@@ -90,3 +90,41 @@ async fn bridge_ping_reports_used_memory_without_depending_on_it() {
         );
     }
 }
+
+#[tokio::test(start_paused = true)]
+async fn memory_read_timeout_or_cancellation_keeps_admission_until_worker_finishes() {
+    for cancel in [false, true] {
+        let slots = Arc::new(Semaphore::new(1));
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let outcome = {
+            let read = read_guest_memory(slots.clone(), move || {
+                let _ = started_tx.send(());
+                release_rx.recv().unwrap();
+                Some(42)
+            });
+            tokio::pin!(read);
+            tokio::select! {
+                _ = started_rx => {}
+                _ = &mut read => panic!("reader returned before its release"),
+            }
+            if cancel {
+                None
+            } else {
+                tokio::time::advance(GUEST_MEMORY_READ_TIMEOUT).await;
+                Some(futures_util::poll!(&mut read))
+            }
+        };
+        let retry = read_guest_memory(slots.clone(), || Some(0)).await;
+        // Release before asserting so a regression cannot strand the worker.
+        release_tx.send(()).unwrap();
+        drop(slots.acquire().await.unwrap());
+        let fresh = read_guest_memory(slots, || Some(7)).await;
+
+        if let Some(outcome) = outcome {
+            assert_eq!(outcome, std::task::Poll::Ready(None));
+        }
+        assert_eq!(retry, None, "an outstanding read keeps admission");
+        assert_eq!(fresh, Some(7), "a completed read releases admission");
+    }
+}

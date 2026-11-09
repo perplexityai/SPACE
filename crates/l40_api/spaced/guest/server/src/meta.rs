@@ -1,5 +1,27 @@
 use super::*;
 
+const GUEST_MEMORY_READ_TIMEOUT: Duration = Duration::from_millis(100);
+
+/// Wait at most 100 ms for optional memory telemetry, leaving room in Ping's
+/// health-probe budget. A busy reader skips the sample without waiting.
+async fn read_guest_memory(
+    slots: Arc<Semaphore>,
+    read: impl FnOnce() -> Option<u64> + Send + 'static,
+) -> Option<u64> {
+    let permit = slots.try_acquire_owned().ok()?;
+    // Timeout or RPC cancellation cannot stop an active blocking read.
+    // Keep admission with the worker so later Pings cannot pile up readers.
+    let task = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        read()
+    });
+    tokio::time::timeout(GUEST_MEMORY_READ_TIMEOUT, task)
+        .await
+        .ok()?
+        .ok()
+        .flatten()
+}
+
 #[cfg(target_os = "linux")]
 fn flush_filesystem_at_path_with_syncfs(
     path: &str,
@@ -244,10 +266,8 @@ impl BridgeGuestMeta for SpacedGuestService {
         // Only the watchdog requests diagnostics; readiness and connection
         // checks need no memory read. Unavailable telemetry never fails Ping.
         let read_memory = self.inner.guest_memory_used_source;
-        let memory_used_bytes = tokio::task::spawn_blocking(read_memory)
-            .await
-            .ok()
-            .flatten();
+        let memory_used_bytes =
+            read_guest_memory(self.inner.guest_memory_read_slots.clone(), read_memory).await;
         let drained = pplx_space_observability::warning_tap::drain();
         Ok(Response::new(BridgeGuestPingResponse {
             memory_used_bytes,
