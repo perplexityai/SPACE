@@ -259,11 +259,12 @@ where
                     Some(Err(status)) if is_recoverable_process_start_interruption(&status) => {
                         status
                     }
-                    Some(Err(status)) => {
+                    Some(Err(mut status)) => {
                         if state.replaying
                             && let Some(outcome) = process_start_delivery_failure(&status)
                         {
                             crate::metrics::process_start_delivery(outcome);
+                            mark_delivery_failure_counted(&mut status);
                         }
                         state.ended = true;
                         return Some((Err(status), state));
@@ -514,13 +515,30 @@ pub(super) fn process_start_reopen_status(
     error: EcwProxyError,
     resume: &ProcessStartResume,
 ) -> tonic::Status {
-    let status = error.into_tonic_status();
+    let mut status = error.into_tonic_status();
     if resume.is_connect()
         && let Some(outcome) = process_start_delivery_failure(&status)
     {
         crate::metrics::process_start_delivery(outcome);
+        mark_delivery_failure_counted(&mut status);
     }
     status
+}
+
+/// Metadata on a status whose delivery failure is already counted, so the
+/// client stream does not count it again as `terminal_lost`. Only the code and
+/// message reach the client.
+const DELIVERY_FAILURE_COUNTED: &str = "x-space-delivery-failure-counted";
+
+fn mark_delivery_failure_counted(status: &mut tonic::Status) {
+    status.metadata_mut().insert(
+        DELIVERY_FAILURE_COUNTED,
+        tonic::metadata::MetadataValue::from_static("1"),
+    );
+}
+
+pub(super) fn delivery_failure_counted(status: &tonic::Status) -> bool {
+    status.metadata().contains_key(DELIVERY_FAILURE_COUNTED)
 }
 
 pub(super) fn reset_process_start_stream_channel(state: &DataPlaneState, route: &EcwResolvedRoute) {
@@ -873,7 +891,7 @@ where
                 }
                 Poll::Ready(Some(Err(status))) => {
                     this.ended = true;
-                    this.terminal_accounted |= process_start_delivery_failure(&status).is_some();
+                    this.terminal_accounted |= delivery_failure_counted(&status);
                     this.record_close("backend_status");
                     let bytes =
                         ecw_connect::connect_error_end_stream(status.code(), status.message());
