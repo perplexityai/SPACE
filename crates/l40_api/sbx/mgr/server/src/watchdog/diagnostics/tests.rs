@@ -33,6 +33,7 @@ async fn apply_guest_outcome(
                 observations,
                 guest_status: None,
                 memory_used_bytes: None,
+                cpu_reading: None,
             },
         ))),
     )

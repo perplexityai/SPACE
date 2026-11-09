@@ -85,6 +85,7 @@ pub(super) fn test_health() -> SandboxHealth {
         health_observed_at: None,
         health_components: HealthComponents::default(),
         lifecycle_epoch: 0,
+        cpu_baseline: cpu::Baseline::default(),
         next_health_probe_at: Instant::now(),
         health_probe_sequence: 0,
         last_console_tail_at: None,
@@ -1318,6 +1319,7 @@ async fn lifecycle_edge_preserves_status_and_discards_in_flight_probe() {
                 observations,
                 guest_status: None,
                 memory_used_bytes: None,
+                cpu_reading: None,
             },
         ))),
     )
@@ -1456,6 +1458,7 @@ async fn accepted_probe_yields_guest_memory_only_for_a_running_sandbox() {
                             observations,
                             guest_status: None,
                             memory_used_bytes,
+                            cpu_reading: None,
                         },
                     ))),
                 )
@@ -1499,6 +1502,7 @@ async fn guest_memory_is_not_replayed_by_a_later_probe() {
                 observations: std::array::from_fn(|_| sample(HealthProbeOutcome::Success)),
                 guest_status: None,
                 memory_used_bytes,
+                cpu_reading: None,
             },
         )))
     };
@@ -1542,6 +1546,7 @@ async fn missing_guest_uptime_preserves_last_observation() {
                     guest_version: None,
                 }),
                 memory_used_bytes: None,
+                cpu_reading: None,
             },
         ))),
     )
@@ -1671,6 +1676,7 @@ async fn successful_health_probes_leave_failed_lifecycle_unchanged() {
                         guest_version: None,
                     }),
                     memory_used_bytes: None,
+                    cpu_reading: None,
                 },
             ))),
         )
@@ -1836,6 +1842,7 @@ impl DeadGatewayFixture {
                     ],
                     guest_status: None,
                     memory_used_bytes: None,
+                    cpu_reading: None,
                 },
             ))),
         )

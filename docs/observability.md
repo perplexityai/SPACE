@@ -1270,6 +1270,55 @@ successful, and high usage changes no health status. The guest is
 tenant-controlled, so the value is whatever it reports. The count of samples
 grows with running sandboxes and time, not with distinct sandboxes.
 
+## Host CPU in use
+
+Sandbox-manager samples the VM's host cgroup on the watchdog's existing
+roughly 30-second schedule, independently of guest Ping success or agent
+availability. It records two distributions, each tagged by `template`:
+
+| Metric | Value |
+| --- | --- |
+| `sandbox.resource.cpu.used_cores` | Change in `cpu.stat` `usage_usec` divided by elapsed microseconds |
+| `sandbox.resource.cpu.used_pct_of_requested` | Used cores divided by the VM's `cpu.max` quota/period, multiplied by 100 |
+
+For example, 12 seconds of CPU time over 30 seconds of elapsed time is
+0.4 cores, or 20 percent of a two-core request. "Requested" here means the
+currently enforced VM quota, not the original API request, guest CPU topology,
+or the shared parent cgroup's ceiling. Unlimited quota permits a cores sample
+but no percentage. Neither metric is clamped at 100 percent or rounded before
+submission. Short bursts are averaged over the observation window.
+
+The cgroup is `space/{sandbox_id}`, containing the VM process and its vCPU
+threads, not the sibling `space/sbx-{sandbox_id}` containing sidecars. In a
+container, sandbox-manager uses the read-only host cgroup parent mounted at
+`/space/cgroup`; without that mount or host visibility, no readings are
+available. Host accounting includes the VM process's overhead.
+
+Only `started` sandboxes contribute, so paused, ready warm-pool members are
+excluded without a pool tag. A pool member still booting in `started` can
+contribute if it remains there long enough for two observations. Customer
+sandboxes that are running but idle contribute valid zero usage.
+
+Readings use a monotonic clock. The first reading establishes a baseline,
+and a lifecycle edge clears it, including resident pause/resume even when
+the VM process and cgroup survive. A changed process, execution identity,
+cgroup identity, observed quota change, decreasing counter, or interval
+outside 10-90 seconds establishes a new baseline without a sample. Missing,
+invalid or timed-out reads clear the baseline. Completed results from an
+older lifecycle epoch or a removed sandbox are discarded before updating it.
+
+CPU reads run on the blocking pool with eight independent permits and a
+250 ms deadline including admission. A blocked read retains its permit until
+it actually exits; CPU readers do not consume health-evidence permits.
+Missing CPU data does not change health outcomes, and old readings are never
+replayed. Samples are observations over running time, not unique sandboxes;
+long-lived sandboxes contribute more samples.
+
+Deployment dimensions come from the metrics sink. No sandbox ID, client ID,
+pool membership or host tag is added by the emitter. Configure distribution
+percentiles in the metrics backend to query p50, p90 and p99 for both metrics;
+the service sends observations, not locally computed percentiles.
+
 ## Worker-local lifecycle populations
 
 Sandbox-manager emits `sandbox.worker.lifecycle.count` every 60 seconds from

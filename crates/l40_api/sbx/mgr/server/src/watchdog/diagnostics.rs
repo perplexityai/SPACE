@@ -654,7 +654,7 @@ impl HostReads {
         }
     }
 
-    async fn blocking<T: Send + 'static>(
+    pub(super) async fn blocking<T: Send + 'static>(
         &self,
         read: impl FnOnce() -> T + Send + 'static,
     ) -> Option<T> {

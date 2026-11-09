@@ -35,6 +35,7 @@ use crate::service::network_policy::NetworkPolicyReconcileQueue;
 use crate::sidecar::{sidecar_alive, sidecar_live_pid};
 use crate::snapshot_scheduler::SnapshotScheduler;
 
+mod cpu;
 mod diagnostics;
 
 /// Health transition lines keep the watchdog's target, which log searches
@@ -546,6 +547,7 @@ pub struct SandboxHealth {
     health_observed_at: Option<SystemTime>,
     health_components: HealthComponents,
     lifecycle_epoch: u64,
+    cpu_baseline: cpu::Baseline,
     next_health_probe_at: Instant,
     health_probe_sequence: u64,
     /// When a degraded transition last carried console tails, so a flapping
@@ -724,14 +726,15 @@ struct ComposedProbeResult {
     /// The guest's used memory from its successful Ping. Telemetry beside the
     /// health observations, never part of them.
     memory_used_bytes: Option<u64>,
+    cpu_reading: Option<cpu::Reading>,
 }
 
-/// Outputs of an accepted probe. Memory is emitted by the caller,
-/// not retained in watchdog state.
+/// Outputs of an accepted probe. Resource observations never classify health.
 struct AcceptedHealthResult {
     template: String,
     transition: Option<diagnostics::HealthTransition>,
     memory_used_bytes: Option<u64>,
+    cpu_usage: Option<cpu::Usage>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -822,6 +825,7 @@ impl HealthLifecycleEpochs {
             return;
         };
         health.lifecycle_epoch = health.lifecycle_epoch.wrapping_add(1);
+        health.cpu_baseline.clear();
         health.consecutive_guest_probe_failures = 0;
         for component in HealthComponent::ALL {
             health
@@ -994,6 +998,7 @@ impl SandboxWatchdog {
             health_observed_at: None,
             health_components: HealthComponents::default(),
             lifecycle_epoch: 0,
+            cpu_baseline: cpu::Baseline::default(),
             next_health_probe_at: now + initial_health_probe_delay(&id),
             health_probe_sequence: 0,
             last_console_tail_at: None,
@@ -2484,6 +2489,7 @@ async fn composed_health_loop(
         diagnostics::admission::EVIDENCE_QUEUE_CAPACITY,
     ));
     let host_reads = diagnostics::host_reads();
+    let cpu_reader = cpu::Reader::new();
     let cgroup_parent = diagnostics::sandbox_cgroup_parent().await;
     let mut evidence_collectors = tokio::task::JoinSet::new();
     for _ in 0..diagnostics::admission::EVIDENCE_COLLECTORS {
@@ -2569,6 +2575,8 @@ async fn composed_health_loop(
             }
             let node_manager = node_manager.clone();
             let restored_guests = restored_guests.clone();
+            let cpu_reader = cpu_reader.clone();
+            let cgroup_parent = Arc::clone(&cgroup_parent);
             pending.spawn(async move {
                 let result = probe_composed_health(
                     &sandbox_id,
@@ -2576,6 +2584,8 @@ async fn composed_health_loop(
                     lifecycle,
                     &node_manager,
                     &restored_guests,
+                    &cpu_reader,
+                    &cgroup_parent,
                 )
                 .await;
                 (sandbox_id, lifecycle, lifecycle_epoch, result)
@@ -2633,6 +2643,8 @@ async fn probe_composed_health(
     lifecycle: Option<crate::state::SandboxState>,
     node_manager: &NodeManagerConnector,
     restored_guests: &crate::vm_diagnostics::RestoredGuests,
+    cpu_reader: &cpu::Reader,
+    cgroup_parent: &Path,
 ) -> ComposedProbeResult {
     let firecracker = probe_firecracker_health(sandbox_id, lifecycle, node_manager);
     let spaced_host = async {
@@ -2648,8 +2660,9 @@ async fn probe_composed_health(
     };
     let spaced_guest = probe_spaced_guest_health(info, lifecycle, restored_guests);
     let net_gateway = probe_net_gateway_health(sandbox_id);
-    let (firecracker, spaced_host, (spaced_guest, memory_used_bytes), net_gateway) =
-        tokio::join!(firecracker, spaced_host, spaced_guest, net_gateway);
+    let cpu = cpu_reader.read(cgroup_parent, info, lifecycle);
+    let (firecracker, spaced_host, (spaced_guest, memory_used_bytes), net_gateway, cpu_reading) =
+        tokio::join!(firecracker, spaced_host, spaced_guest, net_gateway, cpu);
     let guest_status = if spaced_host.outcome == HealthProbeOutcome::Success {
         read_guest_status_via_spaced_host(sandbox_id).await
     } else {
@@ -2660,6 +2673,7 @@ async fn probe_composed_health(
         observations: [firecracker, spaced_host, spaced_guest, net_gateway],
         guest_status,
         memory_used_bytes,
+        cpu_reading,
     }
 }
 
@@ -2994,6 +3008,15 @@ async fn apply_and_reconcile_composed_health_result(
     };
     let accepted = apply_composed_health_result(state, db, result).await;
     if let Some(accepted) = accepted.as_ref()
+        && let Some(usage) = accepted.cpu_usage.as_ref()
+    {
+        crate::metrics::sandbox::worker::sandbox_cpu_used(
+            &accepted.template,
+            usage.cores,
+            usage.pct_of_requested,
+        );
+    }
+    if let Some(accepted) = accepted.as_ref()
         && let Some(memory_used_bytes) = accepted.memory_used_bytes
     {
         crate::metrics::sandbox::worker::guest_memory_used(&accepted.template, memory_used_bytes);
@@ -3027,6 +3050,7 @@ async fn apply_composed_health_result(
         observations,
         guest_status,
         memory_used_bytes,
+        cpu_reading,
     } = result;
     let mut map = state.lock().await;
     let health = map.get_mut(&sandbox_id)?;
@@ -3039,6 +3063,9 @@ async fn apply_composed_health_result(
         );
         return None;
     }
+    let cpu_usage = health
+        .cpu_baseline
+        .observe(cpu_reading.filter(|_| lifecycle == Some(crate::state::SandboxState::Started)));
     let previous_status = health.health_status;
     let previous_guest_health = classify_guest_health(GuestHealthProbe::from(&*health));
     for (component, mut observation) in HealthComponent::ALL.into_iter().zip(observations) {
@@ -3118,6 +3145,7 @@ async fn apply_composed_health_result(
         transition,
         memory_used_bytes: memory_used_bytes
             .filter(|_| lifecycle == Some(crate::state::SandboxState::Started)),
+        cpu_usage,
     })
 }
 
