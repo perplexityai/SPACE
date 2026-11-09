@@ -956,6 +956,10 @@ pub enum DataPlaneServerFrame {
     InputAccepted {
         seq: u64,
     },
+    #[cfg_attr(
+        feature = "schema",
+        schemars(transform = schema::output_truncated_not_required)
+    )]
     ProcessExited {
         process_id: String,
         exit_code: i32,
