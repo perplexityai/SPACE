@@ -61,7 +61,7 @@ async fn stat(state: &DataPlaneState, request: Request<Body>) -> Result<Response
     let response = call
         .call(
             "spaced_stat",
-            Reconnect::WhenDraining,
+            Reconnect::ReadOnly,
             Some(NodeApiOperationBudget::FilesystemMetadata),
             message,
             |mut client, request| async move { client.spaced_stat(request).await },

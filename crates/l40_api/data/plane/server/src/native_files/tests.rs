@@ -5,7 +5,9 @@
 mod drain;
 mod fakes;
 mod mutations;
+mod proxy;
 mod stale_connection;
+mod transport_failure;
 mod write;
 
 use std::sync::{
@@ -63,7 +65,21 @@ impl Harness {
     /// `upload_admission`.
     async fn start_with(upload_admission: Option<crate::NativeUploadAdmissionConfig>) -> Self {
         let (worker, worker_addr) = FakeWorker::start().await;
-        let (api, api_addr) = FakeApi::start(worker_addr).await;
+        Self::build(worker, worker_addr, upload_admission).await
+    }
+
+    /// One whose API grants `runtime` as the sandbox's runtime: a proxy in
+    /// front of `worker`, or a runtime of its own that misbehaves.
+    async fn with_runtime(worker: FakeWorker, runtime: std::net::SocketAddr) -> Self {
+        Self::build(worker, runtime, None).await
+    }
+
+    async fn build(
+        worker: FakeWorker,
+        runtime: std::net::SocketAddr,
+        upload_admission: Option<crate::NativeUploadAdmissionConfig>,
+    ) -> Self {
+        let (api, api_addr) = FakeApi::start(runtime).await;
         let mut state = crate::tests::test_data_plane_state().await;
         let channel = tonic::transport::Endpoint::from_shared(format!("http://{api_addr}"))
             .unwrap()

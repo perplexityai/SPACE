@@ -5453,6 +5453,7 @@ dependencies = [
  "tower",
  "tower-http 0.7.1",
  "tracing",
+ "tracing-subscriber",
  "uuid",
 ]
 
@@ -5739,6 +5740,7 @@ dependencies = [
  "dashmap",
  "form_urlencoded",
  "futures-util",
+ "h2",
  "hex",
  "http-body 1.1.0",
  "http-body-util",
@@ -5784,6 +5786,7 @@ dependencies = [
  "tower",
  "tower-http 0.7.1",
  "tracing",
+ "tracing-subscriber",
  "uuid",
 ]
 

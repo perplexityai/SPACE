@@ -488,3 +488,65 @@ fn marked_client_span_fields_are_recorded_on_the_call_span() {
     let _span = GrpcClientMakeSpan.make_span(&unmarked);
     assert_eq!(fields.0.load(std::sync::atomic::Ordering::SeqCst), 1);
 }
+
+/// The level of each `grpc.client` event logged while `run` runs.
+fn client_log_levels(run: impl FnOnce()) -> Vec<tracing::Level> {
+    use tracing_subscriber::layer::SubscriberExt as _;
+
+    #[derive(Clone, Default)]
+    struct Levels(Arc<Mutex<Vec<tracing::Level>>>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Levels {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if event.metadata().target() == "grpc.client" {
+                self.0.lock().unwrap().push(*event.metadata().level());
+            }
+        }
+    }
+
+    let levels = Levels::default();
+    tracing::subscriber::with_default(tracing_subscriber::registry().with(levels.clone()), run);
+    levels.0.lock().unwrap().clone()
+}
+
+/// A transport failure of a call marked [`RetriedOnTransportFailure`], as
+/// its client trace sees it.
+fn fail_marked(mark: &RetriedOnTransportFailure) {
+    GrpcClientOnFailure.on_failure(
+        GrpcClientFailureClass::transport(
+            GrpcFailureClass::Error("connection reset".to_owned()),
+            false,
+            Some(mark.clone()),
+        ),
+        Duration::from_millis(1),
+        &tracing::Span::none(),
+    );
+}
+
+#[test]
+fn a_marked_transport_failure_is_logged_at_the_level_its_caller_reports() {
+    use tracing::Level;
+
+    // The trace leaves it to the caller, which sends the call again or not.
+    for (retried, level) in [(true, Level::WARN), (false, Level::ERROR)] {
+        let mark = RetriedOnTransportFailure::default();
+        assert!(client_log_levels(|| fail_marked(&mark)).is_empty());
+        assert_eq!(client_log_levels(|| mark.report(retried)), [level]);
+        assert!(client_log_levels(|| mark.report(retried)).is_empty());
+    }
+
+    // A failure after the report, as a stream's once it opened, is no call
+    // the caller sends again.
+    let mark = RetriedOnTransportFailure::default();
+    mark.report(false);
+    assert_eq!(client_log_levels(|| fail_marked(&mark)), [Level::ERROR]);
+
+    // One its caller never reported is not lost.
+    let mark = RetriedOnTransportFailure::default();
+    fail_marked(&mark);
+    assert_eq!(client_log_levels(|| drop(mark)), [Level::ERROR]);
+}

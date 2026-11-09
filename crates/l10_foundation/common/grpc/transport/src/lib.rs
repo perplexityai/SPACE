@@ -98,6 +98,6 @@ pub use status::{
 };
 pub use trace::{
     CLIENT_SERVICE_METADATA_KEY, ClientSpanFields, ExpectedGrpcStatus, GrpcClientTrace,
-    RecordClientSpan, current_service_name, is_untraced_grpc_path, set_current_service_name,
-    trace_grpc_client_transport,
+    RecordClientSpan, RetriedOnTransportFailure, current_service_name, is_untraced_grpc_path,
+    set_current_service_name, trace_grpc_client_transport,
 };
