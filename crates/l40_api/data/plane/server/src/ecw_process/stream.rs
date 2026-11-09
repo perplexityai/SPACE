@@ -692,6 +692,7 @@ where
         shutdown: Box::pin(lease.shutdown_token.cancelled_owned()),
         flushed_after_shutdown: None,
         delivered_any: false,
+        delivered_exit: false,
         keepalive_interval,
         keepalive_deadline: None,
         start_wait: None,
@@ -726,6 +727,8 @@ pub(super) struct ProcessConnectJsonStream<S> {
     /// Whether any message reached the client, so a start knows whether it
     /// has reported itself yet.
     delivered_any: bool,
+    /// Whether the process's exit reached the client.
+    delivered_exit: bool,
     // Response bytes reach HTTP intermediaries; backend keepalives do not.
     // This timer never renews the process lease or sandbox lifetime.
     keepalive_interval: Duration,
@@ -779,6 +782,11 @@ impl<S> ProcessConnectJsonStream<S> {
         }
         self.close_recorded = true;
         crate::metrics::stream_closed(ECW_PROCESS_STREAM_KIND, result);
+        // A client that left or was ended at the drain deadline reattaches
+        // itself; any other end of a start without its exit loses it.
+        if !self.connected_as_start && !self.delivered_exit && result != "shutdown" {
+            crate::metrics::process_start_delivery(ProcessStartDeliveryOutcome::TerminalLost);
+        }
     }
 }
 
@@ -820,6 +828,10 @@ where
         loop {
             match this.inner.as_mut().poll_next(cx) {
                 Poll::Ready(Some(Ok(event))) => {
+                    let exit = matches!(
+                        &event.event,
+                        Some(spaced_ops::process_event::Event::Exit(_))
+                    );
                     match &event.event {
                         Some(spaced_ops::process_event::Event::Started(_))
                         | Some(spaced_ops::process_event::Event::Connected(_)) => {
@@ -844,6 +856,7 @@ where
                             flushed.bytes += bytes.len();
                         }
                         this.delivered_any = true;
+                        this.delivered_exit |= exit;
                         if let Some(deadline) = this.keepalive_deadline.as_mut() {
                             deadline
                                 .as_mut()

@@ -1630,3 +1630,49 @@ async fn quiet_process_keepalive_does_not_extend_deadlines() {
         assert!(stream.next().await.is_none());
     }
 }
+
+async fn terminal_lost_count(backend: Vec<Result<SpacedProcessEvent, tonic::Status>>) -> usize {
+    let limiter = Arc::new(crate::state::AttachedStreamLimiter::new(4, 4, 4));
+    let permit = limiter
+        .try_acquire_label(ECW_PROCESS_STREAM_KIND)
+        .expect("stream permit");
+    let capture = pplx_space_metrics_emit::test_capture::capture_counters_guard();
+    let stream = process_connect_json_stream(
+        futures_util::stream::iter(backend),
+        &test_ecw_route(1),
+        false,
+        ecw_connect::EcwProcessStdoutStream::Stdout,
+        None,
+        ecw_connect::keepalive_interval(&HeaderMap::new()),
+        EcwProcessStreamLease {
+            permit,
+            shutdown_token: CancellationToken::new(),
+        },
+    );
+    let _: Vec<_> = stream.collect().await;
+    capture
+        .finish()
+        .into_iter()
+        .filter(|counter| {
+            counter.name == "data_plane.process_start.delivery"
+                && counter.tags == ["outcome:terminal_lost"]
+        })
+        .count()
+}
+
+#[tokio::test]
+async fn process_start_counts_a_stream_that_ends_without_its_exit() {
+    let process_id = ProcessId::new();
+    let started = || Ok(started_process_event(&process_id));
+    let output = || Ok(stdout_process_event(&process_id, b"out"));
+
+    let lost = vec![
+        started(),
+        output(),
+        Err(tonic::Status::unavailable("process stream repeatedly closed")),
+    ];
+    assert_eq!(terminal_lost_count(lost).await, 1);
+
+    let delivered = vec![started(), output(), Ok(exited_process_event(&process_id))];
+    assert_eq!(terminal_lost_count(delivered).await, 0);
+}

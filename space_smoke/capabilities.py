@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Collection, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
+from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import StrEnum
@@ -410,8 +411,53 @@ class EcwFilesystem(Protocol):
     ) -> EcwWatchHandle: ...
 
 
+@dataclass(frozen=True)
+class EcwProcessStreamEvent:
+    """One message of an ECW `Process.Start` Connect stream, as the client read it.
+
+    `kind` is `start`, `stdout`, `stderr`, `pty`, `keepalive`, `end` (the
+    process's exit), or `error` (an end-stream error). `at` is the monotonic
+    time the client read it.
+    """
+
+    kind: str
+    at: float
+    pid: int | None = None
+    data: bytes = b""
+    exit_code: int | None = None
+    status: str | None = None
+    error: str | None = None
+
+
+class EcwProcessStartStream(Protocol):
+    """An open `Process.Start` response the client reads message by message."""
+
+    @property
+    def http_status(self) -> int: ...
+
+    def events(self) -> Iterator[EcwProcessStreamEvent]:
+        """Messages until the stream ends; one iterator per stream."""
+        ...
+
+    def close(self) -> None:
+        """Drop the client connection without reading further."""
+        ...
+
+
 class EcwProtocolCompatibility(Protocol):
     """Public ECW protocol probes the high-level SDK cannot express."""
+
+    def open_process_start(
+        self,
+        command: str,
+        *,
+        timeout_ms: int,
+        idempotency_key: str | None = None,
+        request_timeout: float = 60,
+    ) -> EcwProcessStartStream:
+        """Send `Process.Start` for a shell command and return once the HTTP
+        status arrives, before any stream message is read."""
+        ...
 
     def read_with_basic_auth(
         self,
@@ -2490,6 +2536,28 @@ class PodNetwork:
     pod_name: str
     node_name: str
     pod_ip: str
+
+
+class ExecStreamFaultControl(Protocol):
+    """Kind-only faults on the transport between the data plane and a
+    worker's node-api, the hop an ECW process stream crosses after its HTTP
+    200. Every fault runs in the node's operator shell (`space-node-debug`)."""
+
+    def sandbox_pod_placement(self, sandbox_id: str) -> SandboxPodPlacement | None: ...
+
+    def cut_node_api_streams(self, node_name: str) -> int:
+        """Abort the data plane's established TCP connections to the node's
+        node-api; the kernel resets each one. Returns how many were cut."""
+        ...
+
+    def frozen_node_api(self, node_name: str) -> AbstractContextManager[None]:
+        """Stop the node's node-api process for the block and continue it after."""
+        ...
+
+    def replace_node_api(self, node_name: str, *, grace_seconds: int, timeout: float) -> str:
+        """Delete the node's node-api pod with a short termination grace and
+        wait for its replacement to be Ready. Returns the new pod's name."""
+        ...
 
 
 class SandboxNetworkIsolationControl(Protocol):

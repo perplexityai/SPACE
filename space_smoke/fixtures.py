@@ -50,6 +50,7 @@ from space_smoke.capabilities import (
     StartupRecoveryControl,
     SuspendCodecControl,
     SandboxNetworkIsolationControl,
+    ExecStreamFaultControl,
     StorageExchangeControl,
     TelemetryBackendControl,
     LeaderElectionControl,
@@ -115,6 +116,7 @@ from space_smoke.console import ConsoleAssertions
 from space_smoke.drain_gate import DrainGateAssertions
 from space_smoke.rate_limiters import RateLimiterAssertions
 from space_smoke.sandbox_network_isolation import SandboxNetworkIsolationAssertions
+from space_smoke.exec_stream_faults import ExecStreamFaults
 from space_smoke.storage_exchange import StorageExchangeScopingAssertions
 from space_smoke.stopped_replacement import StoppedReplacementAssertions
 from space_smoke.telemetry_delivery import TelemetryDeliveryAssertions
@@ -3032,6 +3034,16 @@ class KindEcw(Ecw):
                 self, self._suspend_codec_control, self._context.scope
             )
         return self._suspend_codec_assertions
+
+    _exec_stream_fault_control: ExecStreamFaultControl | None = None
+
+    @property
+    def exec_stream_faults(self) -> ExecStreamFaults:
+        """Faults on the data plane's node-api hop under an open process stream."""
+
+        if self._exec_stream_fault_control is None:
+            raise SmokeConfigurationError("exec stream faults are only available on the kind backend")
+        return ExecStreamFaults(self, self._exec_stream_fault_control)
 
     _sandbox_network_isolation_control: SandboxNetworkIsolationControl | None = None
     _sandbox_network_isolation_assertions: SandboxNetworkIsolationAssertions | None = None

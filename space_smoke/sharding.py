@@ -73,6 +73,11 @@ _DURATION_SECONDS = {
         "local.console_sandbox_lookup_accepts_every_id_form": 18,
         "local.console_turns_away_non_operators": 15,
         "local.deferred_btrfs_send_capture_restores_cross_node": 14,
+        # Estimates from the scenarios' sleeps and deadlines plus sandbox setup.
+        "local.ecw_exec_ambiguous_start_retry_runs_once": 20,
+        "local.ecw_exec_exit_survives_lost_terminal_event": 16,
+        "local.ecw_exec_stream_survives_backend_eof": 16,
+        "local.ecw_exec_stream_survives_node_api_handoff": 45,
         "local.ecw_template_build_from_oci_boots": 39,
         "local.encrypted_disk_fork": 46,
         "local.encrypted_live_disk_fork": 33,
