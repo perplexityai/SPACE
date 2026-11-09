@@ -41,6 +41,19 @@ pub(crate) enum EvictionClaim {
     /// exact pinned artifact the eviction decision proved backed, or `None`
     /// asserting the row is still unpinned.
     SuspendedPinned(Option<LocalArtifactId>),
+    /// [`Self::SuspendedPinned`] for a sandbox the cluster deleted: the
+    /// sandbox's other local artifacts don't hold it back, since the
+    /// cluster's snapshots of a sandbox go with its row.
+    DeletedSuspended(Option<LocalArtifactId>),
+    /// `suspended → deleting` for a copy a runtime upgrade replaces with the
+    /// checkpoint it was decided from: the proven pin, no upgrade owning the
+    /// row and no upload in flight, as for [`Self::SuspendedPinned`], and, in
+    /// place of a row version, the activation generations the upgrade checked
+    /// its activation against, since removing the row removes their fence.
+    StaleUpgradeCopy {
+        pin: LocalArtifactId,
+        generations: crate::db::ActivationGenerations,
+    },
     /// `restoring → deleting` for a row a failed cross-node restore retained
     /// "for retry" (`failure_reason` persisted, state left `restoring`).
     /// Only meaningful once the cluster reports the sandbox deleted — a
@@ -144,6 +157,175 @@ pub(crate) enum EvictionClaim {
     },
 }
 
+/// Marks a suspended eviction refused because another operation held the
+/// sandbox's artifact lock: the refusal keeps `FailedPrecondition`, which the
+/// disk-pressure loop skips quietly, and a caller that retries on its next
+/// sync tells it from a claim the row's state refused by this.
+const ARTIFACT_LOCK_HELD_METADATA: &str = "x-space-eviction-artifact-lock-held";
+
+/// The refusal of a suspended eviction of `sandbox_id` while another
+/// operation holds its artifact lock.
+fn artifact_lock_held_status(sandbox_id: &str) -> Status {
+    marked_refusal(
+        format!(
+            "another operation holds sandbox {sandbox_id}'s artifacts (a backup being admitted, \
+             a transfer, a publication or a cleanup); retry the eviction once it's done"
+        ),
+        ARTIFACT_LOCK_HELD_METADATA,
+    )
+}
+
+/// A suspended eviction's `FailedPrecondition` refusal carrying `marker`, so
+/// a caller can tell this refusal from the others with that code.
+fn marked_refusal(message: String, marker: &'static str) -> Status {
+    let mut status = Status::failed_precondition(message);
+    status
+        .metadata_mut()
+        .insert(marker, tonic::metadata::MetadataValue::from_static("true"));
+    status
+}
+
+/// Marks a suspended eviction refused because the sandbox's snapshot
+/// directory holds a user-named snapshot no local artifact records. It keeps
+/// `FailedPrecondition`; the disk-pressure loop counts it under its own skip
+/// reason, since unlike the other holds it doesn't end on its own.
+const UNRECORDED_SNAPSHOT_METADATA: &str = "x-space-eviction-unrecorded-snapshot";
+
+/// Whether `status` is a suspended eviction's refusal for a snapshot no local
+/// artifact records.
+pub(crate) fn is_unrecorded_snapshot_refusal(status: &Status) -> bool {
+    status.code() == tonic::Code::FailedPrecondition
+        && status.metadata().contains_key(UNRECORDED_SNAPSHOT_METADATA)
+}
+
+/// The refusal of a suspended eviction of `sandbox_id`, whose snapshot
+/// directory holds `names` that no local artifact records.
+fn unrecorded_snapshot_status(sandbox_id: &str, names: &[String]) -> Status {
+    marked_refusal(
+        format!(
+            "sandbox {sandbox_id} holds snapshots no local artifact records ({}); the eviction \
+             would delete them, so back them up or delete them first",
+            names.join(", ")
+        ),
+        UNRECORDED_SNAPSHOT_METADATA,
+    )
+}
+
+/// The entries of a sandbox's `snapshots_dir` that are user snapshots no
+/// local artifact records, sorted: see [`is_unrecorded_user_snapshot`]. A
+/// missing directory, or one replaced by a symlink, whose target the cleanup
+/// doesn't delete, holds nothing to keep. Neither does an entry whose name
+/// isn't UTF-8: snapshot RPCs carry names as strings, so none can address
+/// it. Node-manager's snapshot listing skips it, and the full-snapshot scan
+/// shows it only under a lossily decoded name, which is another path.
+pub(in crate::service) fn unrecorded_snapshots(
+    snapshots_dir: &std::path::Path,
+    recorded: &std::collections::HashSet<String>,
+) -> std::io::Result<Vec<String>> {
+    match std::fs::symlink_metadata(snapshots_dir) {
+        Ok(metadata) if metadata.file_type().is_symlink() => return Ok(Vec::new()),
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    }
+    let mut unrecorded = Vec::new();
+    for entry in std::fs::read_dir(snapshots_dir)? {
+        let Ok(name) = entry?.file_name().into_string() else {
+            continue;
+        };
+        if is_unrecorded_user_snapshot(snapshots_dir, &name, recorded)? {
+            unrecorded.push(name);
+        }
+    }
+    unrecorded.sort();
+    Ok(unrecorded)
+}
+
+/// Whether `name`, an entry of the sandbox's `snapshots_dir`, is a user
+/// snapshot that no name in `recorded` (the snapshot names of the sandbox's
+/// named local artifacts) records.
+///
+/// A publication writes a snapshot's directory before its row, so one that
+/// fails in between, or a crash, leaves the directory without a row. Listing
+/// shows it and backup adopts it, so it's the user's data, and the claim's
+/// backup clause can't see it. Every name a user snapshot can have starts with
+/// `d-` or `f-`: sandbox-manager names manual and scheduled captures itself,
+/// and an import's name must carry the prefix of its type; backup adoption
+/// accepts only those prefixes too. Of those, two kinds aren't the user's to
+/// keep:
+/// - internal names (operation captures and their encoded artifacts, a
+///   runtime upgrade's preserved disk, stopped-disk artifacts and GC
+///   staging), which users can neither list nor back up;
+/// - a full snapshot without its VM state, which a failed capture leaves and
+///   which restores nothing: the listing reports it `incomplete` by the same
+///   test. A disk snapshot has no such test, so a half-written one is kept.
+///
+/// A scheduled capture is kept like any other: retention prunes it only while
+/// the sandbox runs, and a suspended sandbox's scheduler is stopped. Only a
+/// real directory counts, not a symlink or any other file, as only those are
+/// what the snapshot listing shows: an entry nobody can see must not hold the
+/// sandbox. Everything else under the directory (suspend and
+/// encrypted-capture staging, say) has neither prefix, and only the eviction
+/// would ever remove it.
+///
+/// An entry that's gone, or a VM state file that's missing or empty, is an
+/// answer; any other error reading them is returned rather than taken for one,
+/// since the eviction deletes whatever this doesn't keep.
+pub(in crate::service) fn is_unrecorded_user_snapshot(
+    snapshots_dir: &std::path::Path,
+    name: &str,
+    recorded: &std::collections::HashSet<String>,
+) -> std::io::Result<bool> {
+    use super::grpc_spaced_process_snapshots::{full_snapshot_complete, snapshot_entry_metadata};
+    let is_disk = name.starts_with("d-");
+    if !(is_disk || name.starts_with("f-"))
+        || super::grpc_spaced_process_snapshots::is_internal_snapshot_name(name)
+        || recorded.contains(name)
+    {
+        return Ok(false);
+    }
+    let path = snapshots_dir.join(name);
+    match snapshot_entry_metadata(&path) {
+        Ok(metadata) if metadata.is_dir() => {}
+        Ok(_) => return Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    }
+    if is_disk {
+        Ok(true)
+    } else {
+        full_snapshot_complete(&path)
+    }
+}
+
+/// The refusal of a cluster-deleted eviction of `sandbox_id` while `hold`
+/// holds it: the hold ends on its own, so the caller retries on its next sync.
+fn held_status(sandbox_id: &str, hold: &str) -> Status {
+    Status::aborted(format!(
+        "sandbox {sandbox_id} is held by {hold}; retry the cluster-deleted eviction on the next \
+         sync"
+    ))
+}
+
+/// What still holds a suspended row that its eviction claim waits for: a
+/// runtime upgrade that still owns it, or an upload of its artifacts that may
+/// still read them. `None` when nothing does.
+fn suspended_eviction_hold(
+    db: &crate::db::Connection,
+    sandbox_id: &str,
+) -> Result<Option<String>, Status> {
+    let read_error = |error: crate::db::Error| Status::internal(format!("db read failed: {error}"));
+    if let Some(operation) =
+        crate::db::read::unretired_runtime_upgrade(db, sandbox_id).map_err(read_error)?
+    {
+        return Ok(Some(format!("runtime upgrade {operation}")));
+    }
+    if crate::db::read::snapshot_upload_in_flight(db, sandbox_id).map_err(read_error)? {
+        return Ok(Some("an upload of its artifacts".to_string()));
+    }
+    Ok(None)
+}
+
 impl SandboxManagerService {
     /// Remove a sandbox's entire local presence: claim the row with the
     /// CAS `claim` describes (see [`EvictionClaim`]), then run the standard `DeleteRow` cleanup to
@@ -167,7 +349,15 @@ impl SandboxManagerService {
     ///   with a persisted failure or `quarantined` at the version read, or not `suspending`
     ///   with the terminal teardown-backup marker, the same staged artifact
     ///   and the same `state_changed_at` (a concurrent resume / re-suspend /
-    ///   retry won the race); nothing was changed.
+    ///   retry won the race); a `suspended` row a runtime upgrade or an
+    ///   artifact upload still holds, or, for a stale upgrade copy, whose
+    ///   activation generations moved since they were read; or, for a
+    ///   pinned-suspended or stale-upgrade-copy claim, a user snapshot no
+    ///   local artifact records ([`is_unrecorded_snapshot_refusal`]); nothing
+    ///   was changed. A cleanup the claim handed off can fail with this code
+    ///   too, and then the row is `deleting`.
+    /// - `Unavailable` before the claim — a cleanup is already active, or the
+    ///   snapshot inventory couldn't be read; nothing was changed.
     /// - other statuses — the claim succeeded but cleanup failed; the
     ///   row stays in `deleting` and the cleanup machinery converges on
     ///   retry (the same contract a failed Delete RPC has).
@@ -412,6 +602,46 @@ impl SandboxManagerService {
         result
     }
 
+    /// Refuse a suspended eviction of `sandbox_id` while its snapshot
+    /// directory holds a user snapshot no local artifact records (see
+    /// [`unrecorded_snapshots`]). The caller holds the artifact lock.
+    ///
+    /// The listing runs inline, as the claim's SQLite write after it does, so
+    /// the claim stays in the same poll. Its size isn't fixed: retention aims
+    /// to keep 22 scheduled captures (the `KEEP_*` counts in
+    /// `snapshot_scheduler/retention.rs`) and may keep more, and manual
+    /// snapshots have no count of their own. The named-row read it starts
+    /// with refuses a sandbox past 4096 rows (`MAX_ITEMS`) or 16 MiB of row
+    /// data (`MAX_RAW_BYTES`) as `Unavailable`.
+    fn refuse_unrecorded_snapshots(&self, sandbox_id: &str) -> Result<(), Status> {
+        let recorded: std::collections::HashSet<String> = {
+            let db = self.db_conn()?;
+            crate::db::read::sandbox_view(&db, sandbox_id)
+                .artifacts()
+                .named()
+                .map_err(|error| {
+                    Status::unavailable(format!(
+                        "couldn't read sandbox {sandbox_id}'s named snapshots: {error}"
+                    ))
+                })?
+                .into_iter()
+                .map(|publication| publication.snapshot_name.to_string())
+                .collect()
+        };
+        let snapshots_dir = self.cache_root().join(sandbox_id).join("snapshots");
+        let unrecorded = unrecorded_snapshots(&snapshots_dir, &recorded).map_err(|error| {
+            Status::unavailable(format!(
+                "couldn't list {}: {error}",
+                snapshots_dir.display()
+            ))
+        })?;
+        if unrecorded.is_empty() {
+            Ok(())
+        } else {
+            Err(unrecorded_snapshot_status(sandbox_id, &unrecorded))
+        }
+    }
+
     async fn evict_local_sandbox_owned(
         &self,
         sandbox_id: &str,
@@ -458,9 +688,53 @@ impl SandboxManagerService {
                     })?,
             ),
             EvictionClaim::SuspendedPinned(_)
+            | EvictionClaim::DeletedSuspended(_)
+            | EvictionClaim::StaleUpgradeCopy { .. }
             | EvictionClaim::TeardownSuspendPermanentlyFailed { .. }
             | EvictionClaim::TeardownExecutionRetired { .. } => None,
         };
+        // A suspended row's eviction deletes every local artifact of the
+        // sandbox, and a backup being admitted (`enqueue_artifact_backup`
+        // holds the artifact lock from reading the row until its upload job
+        // is persisted) would lose its source; the claim's upload clause
+        // sees only a persisted job. So the claim is taken under the artifact
+        // lock, taken without waiting: a backup holding it refuses the
+        // eviction, which retries, and an admission that waits for it finds
+        // the row `deleting` and refuses itself. Never waiting is what keeps
+        // the lock order free of cycles, and the guard is dropped before the
+        // cleanup, whose finalization takes the same lock.
+        let artifact_guard = match claim {
+            EvictionClaim::SuspendedPinned(_)
+            | EvictionClaim::DeletedSuspended(_)
+            | EvictionClaim::StaleUpgradeCopy { .. } => Some(
+                self.auto_lifecycle
+                    .artifact_lock(sandbox_id)
+                    .try_lock_owned()
+                    .map_err(|_| artifact_lock_held_status(sandbox_id))?,
+            ),
+            EvictionClaim::Stopped
+            | EvictionClaim::FailedRestoring
+            | EvictionClaim::Quarantined
+            | EvictionClaim::TeardownSuspendPermanentlyFailed { .. }
+            | EvictionClaim::TeardownExecutionRetired { .. } => None,
+        };
+        // Under the artifact lock, which every writer of a named snapshot
+        // holds, a user snapshot without a row can't appear before the claim.
+        // A cluster-deleted sandbox's snapshots went with its cluster row, so
+        // that eviction doesn't look.
+        if matches!(
+            claim,
+            EvictionClaim::SuspendedPinned(_) | EvictionClaim::StaleUpgradeCopy { .. }
+        ) {
+            self.refuse_unrecorded_snapshots(sandbox_id)?;
+        }
+        #[cfg(test)]
+        if artifact_guard.is_some() {
+            crate::auto_lifecycle::AutoLifecycleCoordinator::rendezvous(
+                &self.auto_lifecycle.eviction_claim_barrier,
+            )
+            .await;
+        }
         let claimed = {
             let db = self.db_conn()?;
             match &claim {
@@ -471,6 +745,23 @@ impl SandboxManagerService {
                         sandbox_id,
                         pin.as_deref(),
                         expected_updated_at,
+                    )
+                }
+                EvictionClaim::DeletedSuspended(pin) => {
+                    let pin = pin.map(|id| id.to_string());
+                    crate::db::claim_deleted_suspended_sandbox_for_eviction(
+                        &db,
+                        sandbox_id,
+                        pin.as_deref(),
+                        expected_updated_at,
+                    )
+                }
+                EvictionClaim::StaleUpgradeCopy { pin, generations } => {
+                    crate::db::claim_stale_upgrade_copy_for_eviction(
+                        &db,
+                        sandbox_id,
+                        &pin.to_string(),
+                        generations,
                     )
                 }
                 EvictionClaim::Stopped => crate::db::claim_stopped_sandbox_for_eviction(
@@ -530,7 +821,19 @@ impl SandboxManagerService {
                     format!("sandbox {sandbox_id} is no longer stopped at the observed row version")
                 }
                 EvictionClaim::SuspendedPinned(_) => format!(
-                    "sandbox {sandbox_id} is no longer suspended with the proven artifact pinned"
+                    "sandbox {sandbox_id} is no longer suspended with the proven artifact \
+                     pinned, a runtime upgrade or an artifact upload still holds it, or another \
+                     of its local artifacts isn't backed up"
+                ),
+                EvictionClaim::DeletedSuspended(_) => format!(
+                    "sandbox {sandbox_id} is no longer suspended with the artifact it pinned, \
+                     or a runtime upgrade or an artifact upload still holds it"
+                ),
+                EvictionClaim::StaleUpgradeCopy { .. } => format!(
+                    "sandbox {sandbox_id} is no longer suspended with the proven artifact \
+                     pinned at the activation generations checked, a runtime upgrade or an \
+                     artifact upload still holds it, or another of its local artifacts isn't \
+                     backed up"
                 ),
                 EvictionClaim::FailedRestoring => format!(
                     "sandbox {sandbox_id} is no longer a failed cross-node restore at the \
@@ -552,9 +855,10 @@ impl SandboxManagerService {
                 ),
             }));
         }
-        // The row is `deleting` now; release the staging lock before the
-        // cleanup re-acquires it.
+        // The row is `deleting` now; release the staging and artifact locks
+        // before the cleanup re-acquires them.
         drop(staging_guard);
+        drop(artifact_guard);
 
         self.watchdog.remove_sandbox(sandbox_id).await;
         self.snapshot_scheduler.remove_sandbox(sandbox_id).await;
@@ -619,8 +923,12 @@ impl SandboxManagerService {
     ///   `suspending`, not since the backup was refused) for the terminal
     ///   teardown suspend, whose row is touched by live loops without
     ///   changing (see [`EvictionClaim::TeardownSuspendPermanentlyFailed`]);
+    /// - a `suspended` row a runtime upgrade still owns, or whose artifacts an
+    ///   upload may still read, is refused as `Aborted`, so the caller retries
+    ///   on its next sync: the hold ends on its own, by the upgrade's
+    ///   recovery or the upload's last attempt;
     /// - the teardown CAS (`suspended → deleting` with the pinned-artifact
-    ///   identity re-asserted, `restoring/quarantined → deleting` at the exact row
+    ///   identity re-asserted and no such hold, `restoring/quarantined → deleting` at the exact row
     ///   version read, or `suspending → deleting` with the marker, staged
     ///   artifact and `state_changed_at` re-asserted) closes the remaining
     ///   window.
@@ -651,7 +959,7 @@ impl SandboxManagerService {
         // Both reads come off the same connection back to back, and every
         // claim re-asserts what it decided against, so a row that moves
         // between them fails its CAS rather than being acted on.
-        let (row, state_changed_at) = {
+        let (row, state_changed_at, held) = {
             let db = self.db_conn()?;
             let row = crate::db::read::sandbox(&db, &sandbox_id)
                 .map_err(|e| Status::internal(format!("db sandbox lookup failed: {e}")))?
@@ -659,13 +967,25 @@ impl SandboxManagerService {
             let state_changed_at = crate::db::read::state_changed_at_witness(&db, &sandbox_id)
                 .map_err(|e| Status::internal(format!("db sandbox lookup failed: {e}")))?
                 .ok_or_else(|| Status::not_found(format!("sandbox {sandbox_id} not found")))?;
-            (row, state_changed_at)
+            // Only a suspended row's claim waits for a hold.
+            let held = if row.state.is_unowned(crate::state::SandboxState::Suspended) {
+                suspended_eviction_hold(&db, &sandbox_id)?
+            } else {
+                None
+            };
+            (row, state_changed_at, held)
         };
         let claim = match row.state.unowned() {
             Some(crate::state::SandboxState::Stopped) => EvictionClaim::Stopped,
             Some(crate::state::SandboxState::Quarantined) => EvictionClaim::Quarantined,
+            // The claim refuses the row while an upgrade or an upload holds it,
+            // and such a hold ends on its own, so it's answered as a pull in
+            // flight is: retry on the next sync, not after a back-off.
+            Some(crate::state::SandboxState::Suspended) if let Some(hold) = held => {
+                return Err(held_status(&sandbox_id, &hold));
+            }
             Some(crate::state::SandboxState::Suspended) => {
-                EvictionClaim::SuspendedPinned(row.current_local_artifact_id)
+                EvictionClaim::DeletedSuspended(row.current_local_artifact_id)
             }
             Some(crate::state::SandboxState::Restoring)
                 if row
@@ -750,11 +1070,14 @@ impl SandboxManagerService {
             }
             EvictionClaim::Stopped
             | EvictionClaim::SuspendedPinned(_)
+            | EvictionClaim::DeletedSuspended(_)
             | EvictionClaim::FailedRestoring
             | EvictionClaim::Quarantined => ("updated_at", row.updated_at.as_str()),
-            EvictionClaim::TeardownExecutionRetired { .. } => {
+            EvictionClaim::TeardownExecutionRetired { .. }
+            | EvictionClaim::StaleUpgradeCopy { .. } => {
                 return Err(Status::internal(
-                    "a cluster-deleted eviction never claims a retired teardown execution",
+                    "a cluster-deleted eviction never claims a retired teardown execution or a \
+                     runtime upgrade's stale copy",
                 ));
             }
         };
@@ -813,6 +1136,10 @@ impl SandboxManagerService {
         } else {
             tracing::Span::none()
         };
+        let suspended_claim = matches!(
+            claim,
+            EvictionClaim::SuspendedPinned(_) | EvictionClaim::DeletedSuspended(_)
+        );
         let teardown = async move {
             let reason = crate::sandbox_eviction::EvictReason::ClusterRowAbsent;
             // Size estimate before the directory disappears; log/event
@@ -860,6 +1187,28 @@ impl SandboxManagerService {
                     // updated_at moves without the row changing.
                     Some(&checked_updated_at),
                 ) => result,
+            };
+            // A hold that appeared after the check above refused the claim
+            // the same way; answer it as the check would have. So is another
+            // operation holding the sandbox's artifacts, which ends on its
+            // own too.
+            let result = match result {
+                Err(status) if status.metadata().contains_key(ARTIFACT_LOCK_HELD_METADATA) => Err(
+                    held_status(&sandbox_id, "another operation on its artifacts"),
+                ),
+                Err(status)
+                    if suspended_claim && status.code() == tonic::Code::FailedPrecondition =>
+                {
+                    // A read that fails names no hold, and the claim's own
+                    // refusal stands.
+                    let held = service
+                        .db_conn()
+                        .and_then(|db| suspended_eviction_hold(&db, &sandbox_id))
+                        .ok()
+                        .flatten();
+                    Err(held.map_or(status, |hold| held_status(&sandbox_id, &hold)))
+                }
+                result => result,
             };
             if result.is_ok() {
                 crate::metrics::sandbox_eviction::logical_bytes_freed(reason.as_str(), bytes);

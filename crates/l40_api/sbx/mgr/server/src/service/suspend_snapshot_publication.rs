@@ -948,6 +948,9 @@ pub(super) enum RecordedPublicationError {
 /// records the execution that took it ([`crate::capture_record`]) in its
 /// staging directory, so the record is published with the bytes and lasts as
 /// long as they do. A capture whose record can't be written isn't published.
+/// This is the capturing teardown's own publish, so the record orders
+/// captures; recovery publishes through
+/// [`publish_recovered_suspend_snapshot_dir`].
 pub(super) fn publish_recorded_suspend_snapshot_dir(
     staging_dir: &Path,
     snapshot_dir: &Path,
@@ -955,8 +958,46 @@ pub(super) fn publish_recorded_suspend_snapshot_dir(
     execution_generation: Option<ExecutionGeneration>,
     verdicts: &RetainedSourceVerdicts,
 ) -> Result<Vec<PathBuf>, RecordedPublicationError> {
+    publish_with_capture_record(
+        staging_dir,
+        snapshot_dir,
+        local_artifact_id,
+        execution_generation,
+        crate::capture_record::RecordWriter::CapturingTeardown,
+        verdicts,
+    )
+}
+
+/// [`publish_recorded_suspend_snapshot_dir`] for startup recovery, naming the
+/// teardown it found active. That teardown needn't be the one that staged the
+/// capture, so the record fences re-requests but orders nothing.
+pub(super) fn publish_recovered_suspend_snapshot_dir(
+    staging_dir: &Path,
+    snapshot_dir: &Path,
+    local_artifact_id: LocalArtifactId,
+    execution_generation: Option<ExecutionGeneration>,
+    verdicts: &RetainedSourceVerdicts,
+) -> Result<Vec<PathBuf>, RecordedPublicationError> {
+    publish_with_capture_record(
+        staging_dir,
+        snapshot_dir,
+        local_artifact_id,
+        execution_generation,
+        crate::capture_record::RecordWriter::Recovery,
+        verdicts,
+    )
+}
+
+fn publish_with_capture_record(
+    staging_dir: &Path,
+    snapshot_dir: &Path,
+    local_artifact_id: LocalArtifactId,
+    execution_generation: Option<ExecutionGeneration>,
+    writer: crate::capture_record::RecordWriter,
+    verdicts: &RetainedSourceVerdicts,
+) -> Result<Vec<PathBuf>, RecordedPublicationError> {
     if let Some(execution_generation) = execution_generation {
-        crate::capture_record::write(staging_dir, local_artifact_id, execution_generation)
+        crate::capture_record::write(staging_dir, local_artifact_id, execution_generation, writer)
             .map_err(RecordedPublicationError::Record)?;
     }
     Ok(publish_suspend_snapshot_dir(

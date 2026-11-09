@@ -5033,6 +5033,7 @@ async fn begin_artifact_backup_from_node(
                 execution: Some(test_snapshot_execution()),
                 capture_host_cpu: None,
                 execution_generation: None,
+                execution_generation_names_capture: false,
                 fence_verdict_only: false,
             },
             node_ip,
@@ -5068,6 +5069,7 @@ async fn begin_artifact_backup_with_storage_uri(
                 execution: Some(test_snapshot_execution()),
                 capture_host_cpu: None,
                 execution_generation: None,
+                execution_generation_names_capture: false,
                 fence_verdict_only: false,
             },
             TEST_WORKER_IP,
@@ -5946,6 +5948,7 @@ async fn begin_artifact_backup_rejects_missing_execution_metadata() -> TestResul
             execution: None,
             capture_host_cpu: None,
             execution_generation: None,
+            execution_generation_names_capture: false,
             fence_verdict_only: false,
         }))
         .await
@@ -5986,6 +5989,7 @@ async fn begin_artifact_backup_persists_capture_host_cpu() -> TestResult {
                 execution: Some(test_snapshot_execution()),
                 capture_host_cpu: capture_host_cpu.map(str::to_owned),
                 execution_generation: None,
+                execution_generation_names_capture: false,
                 fence_verdict_only: false,
             },
             TEST_WORKER_IP,

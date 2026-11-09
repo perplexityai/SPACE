@@ -475,7 +475,21 @@ impl ArtifactsFacet<'_> {
         self,
         staged_artifact: LocalArtifactId,
     ) -> Result<Vec<LocalArtifactRow>> {
-        crate::db::other_local_artifacts_awaiting_backup(self.0.conn, self.0.id, staged_artifact)
+        crate::db::other_local_artifacts_awaiting_backup(
+            self.0.conn,
+            self.0.id,
+            Some(staged_artifact),
+        )
+    }
+
+    /// The artifacts other than `pin`, or all of them for `None`, without a
+    /// backup-completed stamp: what a suspended eviction, which deletes every
+    /// local artifact of the sandbox, must prove before it claims the row.
+    pub fn awaiting_backup_besides(
+        self,
+        pin: Option<LocalArtifactId>,
+    ) -> Result<Vec<LocalArtifactRow>> {
+        crate::db::other_local_artifacts_awaiting_backup(self.0.conn, self.0.id, pin)
     }
 }
 

@@ -42,6 +42,7 @@ use crate::state::{SandboxState, SandboxStatus};
 
 mod node_effects;
 mod rpc;
+mod stale_copy;
 #[cfg(test)]
 mod tests;
 
@@ -67,6 +68,22 @@ pub(super) fn refuse_runtime_upgrade_fence_in(
             crate::db::RuntimeUpgradeFenceError::Fenced { operation_id }.into(),
             "runtime upgrade fence",
         )),
+        None => Ok(()),
+    }
+}
+
+/// [`super::SandboxManagerService::refuse_unretired_runtime_upgrade`] on a
+/// held connection.
+pub(super) fn refuse_unretired_runtime_upgrade_in(
+    db: &crate::db::Connection,
+    sandbox_id: &str,
+) -> Result<(), Status> {
+    match crate::db::read::unretired_runtime_upgrade(db, sandbox_id)
+        .map_err(|error| Status::unavailable(format!("read runtime upgrade: {error}")))?
+    {
+        Some(operation_id) => Err(Status::unavailable(format!(
+            "runtime upgrade {operation_id} is retiring this sandbox's old checkpoint; retry"
+        ))),
         None => Ok(()),
     }
 }
@@ -1172,14 +1189,7 @@ impl super::SandboxManagerService {
     /// retirement of the one it superseded: until then the canonical
     /// checkpoint may be the old runtime's, over a disk the new boot wrote.
     pub(super) fn refuse_unretired_runtime_upgrade(&self, sandbox_id: &str) -> Result<(), Status> {
-        match crate::db::read::unretired_runtime_upgrade(&*self.db_conn()?, sandbox_id)
-            .map_err(|error| Status::unavailable(format!("read runtime upgrade: {error}")))?
-        {
-            Some(operation_id) => Err(Status::unavailable(format!(
-                "runtime upgrade {operation_id} is retiring this sandbox's old checkpoint; retry"
-            ))),
-            None => Ok(()),
-        }
+        refuse_unretired_runtime_upgrade_in(&*self.db_conn()?, sandbox_id)
     }
 
     /// Gracefully stop `sandbox_id` and wait for it, but only while it runs the

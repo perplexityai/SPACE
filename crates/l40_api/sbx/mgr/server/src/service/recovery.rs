@@ -958,11 +958,15 @@ impl SandboxManagerService {
                     // A capture published before its record was written gets
                     // one now. Best effort: the capture is already published,
                     // and without the record a re-request falls back to the
-                    // upload job's and the running teardown's generation.
+                    // upload job's and the running teardown's generation. The
+                    // canonical capture can be an earlier execution's, left
+                    // there by a teardown that crashed before publishing its
+                    // own, so the record fences but orders nothing.
                     if let Err(error) = crate::capture_record::write(
                         &artifact.path,
                         artifact.local_artifact_id,
                         execution_generation,
+                        crate::capture_record::RecordWriter::Recovery,
                     ) {
                         tracing::warn!(
                             sandbox_id = %row.id,
@@ -993,7 +997,7 @@ impl SandboxManagerService {
                 // live path does; a record that can't be written defers the
                 // publication like a failed publish.
                 let published =
-                    suspend_snapshot_publication::publish_recorded_suspend_snapshot_dir(
+                    suspend_snapshot_publication::publish_recovered_suspend_snapshot_dir(
                         &staged.staging_dir,
                         &snapshot_dir,
                         staged.local_artifact_id,

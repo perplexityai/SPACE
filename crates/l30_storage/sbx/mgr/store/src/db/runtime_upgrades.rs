@@ -353,6 +353,12 @@ db_private_outside_tests! {
     }
 }
 
+/// The phases of an upgrade that still owns its sandbox, as an SQL list: a
+/// fencing one, or a verified one whose retirement is pending. A suspended
+/// eviction and its candidate scan hold off a sandbox in these too.
+pub(crate) const UNRETIRED_UPGRADE_PHASES_SQL: &str =
+    "('fenced', 'preserved', 'booting', 'verified')";
+
 db_private_outside_tests! {
     /// The upgrade of `sandbox_id` that hasn't retired the checkpoint it
     /// superseded yet, if any: a fencing one, or a verified one whose
@@ -363,12 +369,14 @@ db_private_outside_tests! {
     ) -> Result<Option<RuntimeUpgradeOperationId>> {
         let row: Option<String> = conn
             .query_row(
-                "SELECT operation_id
-                   FROM sandbox_runtime_upgrades
-                  WHERE sandbox_id = ?1
-                    AND phase IN ('fenced', 'preserved', 'booting', 'verified')
-                  ORDER BY created_at, operation_id
-                  LIMIT 1",
+                &format!(
+                    "SELECT operation_id
+                       FROM sandbox_runtime_upgrades
+                      WHERE sandbox_id = ?1
+                        AND phase IN {UNRETIRED_UPGRADE_PHASES_SQL}
+                      ORDER BY created_at, operation_id
+                      LIMIT 1"
+                ),
                 params![sandbox_id],
                 |row| row.get(0),
             )

@@ -481,6 +481,12 @@ pub struct SnapshotUploadJobs {
     /// to one execution, and in payloads persisted before the fence existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution_generation: Option<pplx_space_common_core::types::ExecutionGeneration>,
+    /// `execution_generation` is the capturing execution's by evidence, not
+    /// inferred, so the control plane records it to order captures (see
+    /// `BeginArtifactBackupRequest.execution_generation_names_capture`). A
+    /// payload persisted before this field existed reads as `false`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub execution_generation_names_capture: bool,
     /// What this upload's permanent failure, if it has one, failed. The
     /// worker records it beside the job's own failure, which says only whether
     /// the job retries. A payload persisted before this field existed reads as
@@ -1014,6 +1020,7 @@ pub(crate) fn prepare_suspend_snapshot(
         includes_metadata_job: true,
         deferred_metadata,
         execution_generation: None,
+        execution_generation_names_capture: false,
         failure_scope: UploadFailureScope::Attempt,
     })
 }

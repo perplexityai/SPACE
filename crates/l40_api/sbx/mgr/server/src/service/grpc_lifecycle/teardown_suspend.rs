@@ -1307,6 +1307,14 @@ impl SandboxManagerService {
         // The verdict a rejoined refusal leaves with, so the settle needn't
         // ask the cluster again.
         let mut verdict = None;
+        // Beyond the capture's record, only an earlier upload of these bytes
+        // that marked the generation as the capture's own vouches for it; one
+        // the teardown merely supplies doesn't. Read before the match below
+        // takes the job.
+        let earlier_upload_vouches = super::artifact_backup::earlier_upload_vouches(
+            persisted_job.as_ref(),
+            backup.registration_generation(),
+        );
         let joined = match persisted_job {
             Some(job) => match self.teardown_use_of_upload(&backup, &job)? {
                 KeyedUploadUse::Join => {
@@ -1363,6 +1371,7 @@ impl SandboxManagerService {
                         &backup.artifact.local_path,
                         backup.format,
                         backup.registration_generation(),
+                        earlier_upload_vouches,
                     )
                     .await
                     .map_err(|error| {

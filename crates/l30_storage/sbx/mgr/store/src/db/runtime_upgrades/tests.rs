@@ -1131,3 +1131,72 @@ fn an_activation_decided_on_an_execution_refuses_a_sandbox_moved_off_it() {
         SandboxStatus::from(SandboxState::Starting)
     );
 }
+
+/// A suspended sandbox's eviction claim waits for every upgrade that still
+/// owns its disk, fencing it or owing the old checkpoint's retirement, and
+/// leaves the row unchanged while it does. A rolled-back or retired upgrade
+/// owns nothing. The claim spells its phases out, so this also holds it to
+/// `unretired_runtime_upgrade`'s.
+#[test]
+fn a_suspended_eviction_claim_waits_for_an_unretired_upgrade() {
+    use RuntimeUpgradePhase::*;
+    for (phase, claimable) in [
+        (Fenced, false),
+        (Preserved, false),
+        (Booting, false),
+        (Verified, false),
+        (RolledBack, true),
+        (Retired, true),
+    ] {
+        let conn = test_conn();
+        let envs = environments();
+        let id = sandbox(&conn, SandboxState::Suspended, &envs.source);
+        let pin = pin_suspend_artifact(&conn, &id).to_string();
+        fenced(begin(&conn, operation(), &id, envs.target_reference, true));
+        conn.execute(
+            "UPDATE sandbox_runtime_upgrades SET phase = ?1",
+            params![phase.as_str()],
+        )
+        .unwrap();
+        let before = get_sandbox(&conn, &id).unwrap().unwrap();
+        assert_eq!(
+            claimable,
+            unretired_runtime_upgrade(&conn, &id).unwrap().is_none(),
+            "{phase}: the claim and the unretired-upgrade reader disagree"
+        );
+
+        for expected_updated_at in [None, Some(before.updated_at.as_str())] {
+            if claimable {
+                break;
+            }
+            assert!(
+                !claim_suspended_sandbox_for_eviction(&conn, &id, Some(&pin), expected_updated_at)
+                    .unwrap(),
+                "{phase}"
+            );
+        }
+        if !claimable {
+            // So does the claim of a copy a runtime upgrade replaces.
+            let generations = activation_generations(&conn, &id).unwrap().unwrap();
+            assert!(
+                !claim_stale_upgrade_copy_for_eviction(&conn, &id, &pin, &generations).unwrap(),
+                "{phase}"
+            );
+        }
+        let after = get_sandbox(&conn, &id).unwrap().unwrap();
+        assert_eq!(
+            (after.state, &after.updated_at),
+            (
+                SandboxStatus::Unowned(SandboxState::Suspended),
+                &before.updated_at
+            ),
+            "{phase}"
+        );
+        if claimable {
+            assert!(
+                claim_suspended_sandbox_for_eviction(&conn, &id, Some(&pin), None).unwrap(),
+                "{phase}"
+            );
+        }
+    }
+}

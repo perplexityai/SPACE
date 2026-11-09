@@ -726,7 +726,12 @@ async fn an_admission_clears_no_refusal_for_an_unfenced_attempt() {
                 b"refused-capture",
             );
             if readable {
-                crate::capture_record::write(&snapshot_dir, staged, generation(GENERATION - 1))
+                crate::capture_record::write(
+                    &snapshot_dir,
+                    staged,
+                    generation(GENERATION - 1),
+                    crate::capture_record::RecordWriter::CapturingTeardown,
+                )
                     .unwrap();
             } else {
                 std::fs::write(

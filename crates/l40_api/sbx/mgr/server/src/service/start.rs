@@ -1264,6 +1264,40 @@ impl SandboxManagerService {
         }
     }
 
+    /// Refuse a staging `Start` that [`Self::stage_missing_checkpoint`] would
+    /// refuse for a sandbox absent from this node: a malformed request, such
+    /// as one with a malformed storage URI, or a route identity the stage
+    /// couldn't admit without a row, bound to another sandbox, naming another
+    /// node or missing. While the row is still here, the identity must also
+    /// pass it, including its retained generation. A caller about to remove
+    /// the sandbox's row checks it first, so a stage that can't follow, or an
+    /// activation the row would refuse, removes nothing.
+    ///
+    /// Returns the open activation claim the request names against the row,
+    /// as an activation of it would build it: the evidence
+    /// [`Self::refuse_retired_activation_retry`] needs to tell a retried
+    /// activation from a first one, which removing the row erases.
+    pub(super) fn validate_staging_start(
+        &self,
+        req: &StartRequest,
+    ) -> Result<Option<crate::db::route_activation_claims::OpenRouteActivationClaim>, Status> {
+        let ctx = StartSandboxContext::from_request(req)?;
+        let requested = ctx.space_api_route_identity;
+        let against_row =
+            self.resolve_runtime_activation_identity(&req.sandbox_id, requested.clone(), false)?;
+        let identity = self.resolve_rowless_activation_identity(&req.sandbox_id, requested)?;
+        let sandbox_id = req
+            .sandbox_id
+            .parse::<SandboxId>()
+            .map_err(|error| Status::invalid_argument(format!("invalid sandbox id: {error}")))?;
+        resolve_missing_checkpoint_restore_route_identity(sandbox_id, identity)?;
+        Ok(super::activation_support::open_route_activation_claim(
+            &against_row.identity,
+            ctx.route_identity_provenance,
+            against_row.open_activation_claim_eligible,
+        ))
+    }
+
     /// Stage a sandbox absent from this node from its suspend checkpoint, and
     /// leave its row suspended without launching anything. A Wake that runs a
     /// runtime upgrade boots the staged disk by cold start instead of loading
