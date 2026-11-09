@@ -32,9 +32,20 @@ struct Cli {
     select: bool,
 
     /// Initialize an offline, prepopulated slot A during image assembly.
-    #[cfg(target_os = "linux")]
-    #[arg(long, hide = true, conflicts_with_all = ["hold_cgroup", "select"])]
+    #[cfg(any(target_os = "linux", windows))]
+    #[arg(long, hide = true)]
+    #[cfg_attr(target_os = "linux", arg(conflicts_with_all = ["hold_cgroup", "select"]))]
     initialize_update: Option<std::path::PathBuf>,
+
+    /// Settle a stopped or expired agent through SCM (fixed image recovery ABI).
+    #[cfg(windows)]
+    #[arg(long, hide = true, conflicts_with = "console")]
+    recover_update: bool,
+
+    /// Only recover durable maintenance work; preserve an ordinary service stop.
+    #[cfg(windows)]
+    #[arg(long, hide = true, requires = "recover_update")]
+    expired_only: bool,
 
     /// Run the Windows service in the foreground for diagnostics.
     #[cfg(windows)]
@@ -53,13 +64,19 @@ impl From<Cli> for SpacedGuestRunConfig {
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", windows))]
     if let Some(root) = &cli.initialize_update {
         return Ok(pplx_space_spaced_guest_update::initialize_at(root)?);
     }
     #[cfg(target_os = "linux")]
     if cli.select {
         return Ok(pplx_space_spaced_guest_update::select_installed()?);
+    }
+    #[cfg(windows)]
+    if cli.recover_update {
+        return Ok(pplx_space_spaced_guest_server::platform::windows::recover(
+            cli.expired_only,
+        )?);
     }
     #[cfg(unix)]
     if cli.hold_cgroup {

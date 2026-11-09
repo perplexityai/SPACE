@@ -11,7 +11,7 @@ in an existing sandbox. Upgrade the pair from the same verified guest release.
 | Mode | Status | Behavior |
 |---|---|---|
 | **1. Wake and upgrade** | Supported today as a manual operator procedure | Activate the sandbox through its normal lifecycle, replace and restart spaced, then persist the updated sandbox through normal snapshot publication. This is disruptive and counts as sandbox use. |
-| **2. Upgrade a running sandbox through its manager** | Experimental, explicit operator selection | Stage an authorized bundle and restart only when idle, or with explicit force. Requires a qualified two-slot Linux/systemd template; never wakes dormant sandboxes. |
+| **2. Upgrade a running sandbox through its manager** | Experimental, explicit operator selection | Stage an authorized bundle and restart only when idle, or with explicit force. Requires a qualified two-slot guest template; never wakes dormant sandboxes. |
 | **3. Upgrade outside the customer-invoked lifecycle** | Planned; not implemented | Perform maintenance without advancing customer lifecycle/activity accounting or running customer workloads. Requires an isolated maintenance mechanism and coherent snapshot publication. |
 
 Automatic fleet rollout is disabled. The manager-owned mode below is available
@@ -46,15 +46,20 @@ qualification. Unknown phases are not additive diagnostics: the old selector
 falls back to its committed link. Test interrupted commit/link repair with
 the previous committed selector, not only the new binary.
 
-This implementation is Linux/systemd-only. Cloud Hypervisor + Windows is a
-planned backend, requiring its own qualified service supervision and durable
-slot-selection contract. VMM choice does not change maintenance ownership.
-The shared RPCs describe logical payloads, slots and execution/boot fences;
-the SQLite receipts remain host-owned. A new backend must preserve those
-meanings and existing fields/tables, using additive capability changes when
-needed. Unknown installed contracts are unsupported, never a reason to try
-the Linux installer. Mixed-platform artifact selection must match the
-qualified template's OS/recovery ABI and architecture, as well as its version.
+Linux uses systemd's pre-start selector and startup timeout. The experimental
+Cloud Hypervisor + Windows backend uses SCM plus bounded Task Scheduler
+recovery in the existing agent binary; see the [Windows recovery contract](../templates/cloud-hypervisor/windows/README.md#guest-update-recovery).
+VMM choice does not change maintenance ownership. The shared RPCs describe
+logical payloads, slots and execution/boot fences; SQLite receipts remain
+host-owned. No SQL or protobuf replacement is required for Windows.
+Unknown installed contracts are unsupported. Host artifact selection matches
+the installed recovery ABI and architecture; it never tries the Linux installer
+on another OS. The policy selects one target bundle at a time, so a mixed-OS
+node must switch explicit policy authority when selecting a different platform.
+Drain that platform's unfinished receipts before switching: withdrawing policy
+cancels its in-flight work, and a consumed authorization cannot be reused. A
+single worker cannot concurrently authorize Linux and Windows target bundles.
+Use separate platform cohorts until policy supports multiple target authorities.
 
 A release bundle carries the ordinary workspace version, source revision,
 diagnostic build time, binary hashes and `guest_update_required_since`. Normal

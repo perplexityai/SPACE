@@ -176,7 +176,9 @@ mod networking;
 mod port_forward;
 #[cfg(test)]
 mod transport;
+#[path = "../../maintenance.rs"]
 mod update;
+mod update_backend;
 
 /// Internal diagnostics support; not part of the stable guest service API.
 #[cfg(feature = "loopback-diagnostic")]

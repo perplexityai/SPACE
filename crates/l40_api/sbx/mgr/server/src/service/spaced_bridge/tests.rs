@@ -666,3 +666,61 @@ async fn producer_panic_is_an_explicit_stream_error() {
     assert_eq!(error.message(), "route stream forwarding task failed");
     assert!(response.next().await.is_none());
 }
+
+#[tokio::test]
+async fn windows_start_defers_proof_and_refuses_lazy_serving_capture() {
+    use pplx_space_common_core::types::{
+        Arch,
+        guest_image::{
+            GuestAgent, GuestDiskLayout, GuestImageContract, GuestNetwork, GuestReadiness,
+        },
+    };
+    let conn = crate::db::test_conn();
+    let id = SandboxId::new().to_string();
+    crate::db::fixture::insert_test_sandbox(&conn, &id, SandboxState::Starting);
+    let mut row = crate::db::read::sandbox(&conn, &id).unwrap().unwrap();
+    assert!(!endpoint_proof_after_readiness(&row).unwrap());
+    let catalog =
+        pplx_space_execution_catalog::catalog::CompiledEnvironment::for_architecture(Arch::X86_64)
+            .unwrap();
+    row.execution_metadata = Some(
+        catalog
+            .iter()
+            .find(|entry| entry.name() == "ch-54.0-windows-uefi")
+            .unwrap()
+            .definition()
+            .execution_requirements()
+            .unwrap(),
+    );
+    row.guest_image = GuestImageContract::new(
+        GuestDiskLayout::OpaqueRawDisk,
+        GuestReadiness::Agent,
+        GuestNetwork::SlotDhcpV1,
+        GuestAgent::Spaced,
+    )
+    .unwrap();
+    assert!(endpoint_proof_after_readiness(&row).unwrap());
+    let node = crate::node_manager_transport::fake::FakeNodeManager::default().serve();
+    let service = SandboxManagerService::new_with_options(
+        conn,
+        SandboxManagerServiceOptions {
+            node_manager: node.connector(),
+            ..SandboxManagerServiceOptions::for_test()
+        },
+    );
+    for policy in [
+        SpacedEndpointProofPolicy::Required,
+        SpacedEndpointProofPolicy::ValidateOnly,
+    ] {
+        let error = service
+            .connect_spaced_host_with_policy(&row, policy)
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(error.code(), tonic::Code::Unavailable);
+    }
+    row.pool_template = Some("seed".into());
+    row.space_api_route_identity = SpaceApiRouteIdentity::default();
+    assert!(!endpoint_proof_after_readiness(&row).unwrap());
+    service.shutdown_token.cancel();
+}
