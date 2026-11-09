@@ -5669,6 +5669,8 @@ ON CONFLICT (key_hash) DO NOTHING;
             "force-delete the public API pods",
         )
         self.wait_public_api_rollout(timeout=timeout)
+        # Right after a forced delete the Deployment can still read available.
+        self.wait_public_api_ready(timeout=timeout)
 
     def plant_pending_pod_with_ip(self, manifest: Mapping[str, Any], *, pod_ip: str) -> str:
         self._require_isolated_kind("planting a pod")
