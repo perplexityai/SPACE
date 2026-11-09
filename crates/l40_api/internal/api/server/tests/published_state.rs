@@ -4833,6 +4833,9 @@ async fn publication_racing_a_locked_delete_does_not_deadlock() -> TestResult {
     drop(conn);
 
     let mut delete = db.pool.begin().await?;
+    let delete_pid: i32 = sqlx::query_scalar(sql!("SELECT pg_backend_pid()"))
+        .fetch_one(&mut *delete)
+        .await?;
     pplx_space_sandbox_store::delete::lock_observed_states_for_delete(
         &mut *delete,
         sandbox_id,
@@ -4862,8 +4865,9 @@ async fn publication_racing_a_locked_delete_does_not_deadlock() -> TestResult {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     while sqlx::query_scalar::<_, i64>(sql!(
         "SELECT COUNT(*) FROM pg_stat_activity
-          WHERE datname = current_database() AND wait_event_type = 'Lock'"
+          WHERE datname = current_database() AND $1 = ANY(pg_blocking_pids(pid))"
     ))
+    .bind(delete_pid)
     .fetch_one(&db.pool)
     .await?
         == 0
