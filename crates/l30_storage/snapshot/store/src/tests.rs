@@ -1,6 +1,6 @@
 use super::{
     GetSnapshotError, InsertOutcome, InsertSnapshotError, NewSnapshot, RecordArtifactDigestsError,
-    SnapshotArtifact, SnapshotArtifactDigest, artifact_digests,
+    SnapshotArtifact, SnapshotArtifactDigest, artifact_captured_after, artifact_digests,
     artifact_registered_by_another_attempt, delete_snapshot_catalog, get, insert,
     record_artifact_digests,
 };
@@ -196,12 +196,15 @@ async fn snapshot_catalog_store_contract() -> TestResult {
             Some(SnapshotContentHash::from(inserted_content_hash)),
         )
         .with_execution_metadata(inserted_execution_metadata.clone())
+        .with_generation(Some(ExecutionGeneration::new(7).expect("valid generation")))
     };
     let snapshot = make_snapshot(expected_uri.clone());
     let mut insert_tx = db.pool.begin().await?;
     let (inserted, outcome) = insert(&mut insert_tx, &snapshot).await?;
     assert_eq!(outcome, InsertOutcome::Created);
     assert_eq!(inserted.id(), inserted_snapshot_id);
+    // The capture's generation is recorded with the attempt.
+    assert_eq!(inserted.generation(), Some(ExecutionGeneration::new(7)?));
     assert_eq!(
         inserted
             .storage_location()
@@ -514,6 +517,74 @@ async fn another_attempts_registration_of_an_artifact_is_found() -> TestResult {
     assert!(
         !artifact_registered_by_another_attempt(&db.pool, sandbox_id, artifact, asking).await?,
         "neither the asking attempt nor another artifact's row counts"
+    );
+    Ok(())
+}
+
+/// Captures are ordered by the generation of the execution that took them,
+/// not by when their backups registered: an older capture backed up again
+/// after a newer one still orders before it. A capture whose backups record
+/// no generation, or whose only ready backup lost its location, orders against
+/// nothing.
+#[tokio::test(flavor = "current_thread")]
+async fn captures_order_by_the_generation_that_took_them() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let sandbox_id = SandboxId::new();
+    sqlx::query(sql!(
+        "INSERT INTO sandboxes (id, user_id, org_id, network_policy_generation)
+         VALUES ($1, $2::UUID, $3::UUID, 1)"
+    ))
+    .bind(sandbox_id)
+    .bind(SEEDED_USER_ID)
+    .bind(SEEDED_ORG_ID)
+    .execute(&db.pool)
+    .await?;
+    let (older, newer, unrecorded, orphaned) = (
+        LocalArtifactId::new(),
+        LocalArtifactId::new(),
+        LocalArtifactId::new(),
+        LocalArtifactId::new(),
+    );
+    // (artifact, its capture generation, minutes since its backup registered,
+    // whether its location is orphaned)
+    for (artifact, generation, minutes_ago, orphan) in [
+        (older, Some(4), 30, false),
+        (newer, Some(5), 20, false),
+        // The older capture, backed up again after the newer one.
+        (older, Some(4), 1, false),
+        (unrecorded, None, 10, false),
+        (orphaned, Some(9), 5, true),
+    ] {
+        let snapshot_id = insert_snapshot(
+            &db.pool,
+            sandbox_id,
+            "ready",
+            artifact,
+            None,
+            Some(orphan),
+            minutes_ago,
+        )
+        .await?;
+        sqlx::query(sql!("UPDATE snapshots SET generation = $2 WHERE id = $1"))
+            .bind(snapshot_id.as_uuid())
+            .bind(generation)
+            .execute(&db.pool)
+            .await?;
+    }
+    let full = |artifact| (artifact, ArtifactKind::Full);
+    let after =
+        |later, earlier| artifact_captured_after(&db.pool, sandbox_id, full(later), full(earlier));
+
+    assert!(after(newer, older).await?);
+    assert!(!after(older, newer).await?);
+    assert!(!after(older, older).await?, "a capture isn't after itself");
+    assert!(!after(unrecorded, older).await?);
+    assert!(!after(newer, unrecorded).await?);
+    assert!(
+        !after(orphaned, newer).await?,
+        "an orphaned backup orders nothing"
     );
     Ok(())
 }

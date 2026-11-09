@@ -2095,7 +2095,7 @@ pub(crate) use guest_image::profile_for_sandbox;
 pub(crate) mod drain;
 mod eviction;
 pub(crate) mod snapshot_capture;
-pub(crate) use eviction::EvictionClaim;
+pub(crate) use eviction::{EvictionClaim, is_unrecorded_snapshot_refusal};
 mod grpc_auto_lifecycle_delete_receipts;
 mod grpc_core;
 mod grpc_lifecycle;

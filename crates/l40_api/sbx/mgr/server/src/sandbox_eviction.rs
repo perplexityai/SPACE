@@ -217,10 +217,9 @@ impl EvictionConfig {
 }
 
 /// Why a candidate is evictable. Doubles as the `reason` tag on
-/// `sandbox.evict.evicted` and the sandbox event detail. There is
-/// deliberately only one reason: every eviction must carry a proof
-/// tied to the exact bytes being deleted ("a newer generation exists
-/// elsewhere" is not such a proof and was removed).
+/// `sandbox.evict.evicted` and the sandbox event detail. Each reason
+/// names a proof tied to the exact bytes being deleted ("a newer
+/// generation exists elsewhere" is not such a proof and was removed).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum EvictReason {
     /// The bytes on disk are provably backed: the pinned artifact's
@@ -241,6 +240,11 @@ pub(crate) enum EvictReason {
     /// restore can adopt, so it's discarded unpublished. Driven by the
     /// teardown driver, not by this loop.
     ExecutionRetired,
+    /// A runtime upgrade decided from another checkpoint found this suspended
+    /// copy, and the copy's pinned artifact was proven backed for its exact
+    /// id, so it makes way for the decided checkpoint's staging. Driven by the
+    /// upgrade, not by this loop.
+    StaleUpgradeCopy,
 }
 
 impl EvictReason {
@@ -249,6 +253,7 @@ impl EvictReason {
             EvictReason::LatestBackedIdle => "latest_backed_idle",
             EvictReason::ClusterRowAbsent => "cluster_row_absent",
             EvictReason::ExecutionRetired => "execution_retired",
+            EvictReason::StaleUpgradeCopy => "stale_upgrade_copy",
         }
     }
 }
@@ -272,6 +277,16 @@ pub(crate) enum SkipReason {
     GenerationUnproven,
     RetryBackoff,
     NotSuspendedAtExecute,
+    /// The sandbox was still suspended with the proven pin, but its claim was
+    /// refused because something held it: a runtime upgrade, an artifact
+    /// upload in flight, another local artifact without a backup stamp, or
+    /// another operation holding its artifact lock.
+    HeldAtExecute,
+    /// The sandbox's snapshot directory holds a user snapshot no local
+    /// artifact records, which the eviction would delete. Unlike the holds
+    /// in [`Self::HeldAtExecute`] it doesn't end on its own: someone has to
+    /// back the snapshot up or delete it, so the row is backed off.
+    UnrecordedSnapshot,
     /// The node-local SQLite read of the decision inputs failed.
     /// Distinct from [`Self::RpcError`] so a flaky cluster-api and a
     /// node-local DB problem don't share a dashboard signal.
@@ -282,9 +297,9 @@ pub(crate) enum SkipReason {
     /// The cluster dependency is unavailable for the whole scan. Retain the
     /// cursor and retry the same oldest candidate next tick.
     RpcTransportError,
-    /// A retired execution's teardown release is held because another local
-    /// artifact of the sandbox still awaits its backup; the release would
-    /// delete those bytes too. Counted by the teardown driver, not this loop.
+    /// The eviction, or a retired execution's teardown release, is held
+    /// because another local artifact of the sandbox still awaits its
+    /// backup; it would delete those bytes too.
     LocalArtifactAwaitingBackup,
     /// A retired execution's teardown release is held because the cluster
     /// proved another local artifact of the sandbox backed, but its
@@ -308,6 +323,8 @@ impl SkipReason {
             SkipReason::GenerationUnproven => "generation_unproven",
             SkipReason::RetryBackoff => "retry_backoff",
             SkipReason::NotSuspendedAtExecute => "not_suspended_at_execute",
+            SkipReason::HeldAtExecute => "held_at_execute",
+            SkipReason::UnrecordedSnapshot => "unrecorded_snapshot",
             SkipReason::LocalReadError => "local_read_error",
             SkipReason::RpcError => "rpc_error",
             SkipReason::RpcTransportError => "rpc_transport_error",
@@ -325,6 +342,7 @@ impl SkipReason {
                 | Self::UnknownLocalGeneration
                 | Self::CurrentArtifactUnproven
                 | Self::GenerationUnproven
+                | Self::UnrecordedSnapshot
                 | Self::LocalReadError
                 | Self::RpcError
         )
@@ -756,6 +774,19 @@ fn record_continuing_candidate_skip(
     debug_assert_eq!(flow, CandidateFlow::Continue);
 }
 
+/// The skip reason for an eviction the executor refused with
+/// `FailedPrecondition` or `NotFound`, `still_proven` when the row is still
+/// the suspended copy the decision proved.
+pub(crate) fn claim_refusal_skip_reason(status: &tonic::Status, still_proven: bool) -> SkipReason {
+    if crate::service::is_unrecorded_snapshot_refusal(status) {
+        SkipReason::UnrecordedSnapshot
+    } else if still_proven {
+        SkipReason::HeldAtExecute
+    } else {
+        SkipReason::NotSuspendedAtExecute
+    }
+}
+
 fn classify_rpc_failure(status: &tonic::Status) -> SkipReason {
     match status.code() {
         // Codes that mean the cluster dependency cannot serve any candidate
@@ -927,6 +958,66 @@ async fn prove_pinned_artifact(
     Ok(true)
 }
 
+/// A cluster-api client for one sandbox's backup readiness `check`; a
+/// failure to connect is [`SkipReason::RpcTransportError`], logged as the
+/// check's.
+async fn connect_cluster(
+    sandbox_id: &str,
+    check: &'static str,
+) -> Result<pplx_space_node_api_client::cluster::AuthenticatedClusterApiClient, SkipReason> {
+    pplx_space_node_api_client::cluster::connect_from_env()
+        .await
+        .map_err(|error| {
+            warn!(sandbox_id, %error, "{check} could not reach cluster-api");
+            SkipReason::RpcTransportError
+        })
+}
+
+/// Whether `pinned` is proven backed by the same evidence eviction acts on:
+/// its local `backup_completed_at` marker, or else the cluster's exact-artifact
+/// readiness check ([`prove_pinned_artifact`]). `Ok(false)` when the cluster
+/// has no ready backup of it; a failure to get an answer is its classified
+/// reason.
+pub(crate) async fn prove_pinned_backup(
+    service: &SandboxManagerService,
+    sandbox_id: &str,
+    pinned: &PinnedArtifact,
+) -> Result<bool, SkipReason> {
+    if pinned.backup_marker {
+        return Ok(true);
+    }
+    let mut cluster = connect_cluster(sandbox_id, "pinned artifact backup proof").await?;
+    prove_pinned_artifact(&mut cluster, service, sandbox_id, pinned).await
+}
+
+/// Whether the cluster shows `later`'s ready backup was captured by a later
+/// execution of `sandbox_id` than `earlier`'s: its capture generation is
+/// greater. `Ok(false)` when it isn't, or when either backup has no recorded
+/// capture generation; a failure to get an answer is its classified reason.
+pub(crate) async fn prove_captured_after(
+    sandbox_id: &str,
+    later: (LocalArtifactId, ArtifactKind),
+    earlier: (LocalArtifactId, ArtifactKind),
+) -> Result<bool, SkipReason> {
+    use pplx_space_node_api_client::proto::{
+        LocalArtifactBackupIdentity, LocalArtifactCapturedAfter, backup_readiness_query::Artifact,
+    };
+    let identity = |(id, kind): (LocalArtifactId, ArtifactKind)| LocalArtifactBackupIdentity {
+        local_artifact_id: id.to_string(),
+        artifact_kind: pplx_space_sbx_mgr_client::proto::ArtifactKind::from(kind) as i32,
+    };
+    let mut cluster = connect_cluster(sandbox_id, "checkpoint capture order check").await?;
+    backup_ready(
+        &mut cluster,
+        sandbox_id,
+        Artifact::CapturedAfter(LocalArtifactCapturedAfter {
+            later: Some(identity(later)),
+            earlier: Some(identity(earlier)),
+        }),
+    )
+    .await
+}
+
 /// Stamp `artifact_id`'s `backup_completed_at` marker after the cluster proved
 /// its backup ready. Returns whether the stamp was written; a failure is
 /// logged. Eviction needs only the proof and re-proves next tick; the
@@ -996,12 +1087,7 @@ pub(crate) async fn prove_local_artifact_backups(
     if artifacts.is_empty() {
         return Ok(true);
     }
-    let mut cluster = pplx_space_node_api_client::cluster::connect_from_env()
-        .await
-        .map_err(|error| {
-            warn!(sandbox_id, %error, "local artifact backup proof could not reach cluster-api");
-            SkipReason::RpcTransportError
-        })?;
+    let mut cluster = connect_cluster(sandbox_id, "local artifact backup proof").await?;
     for artifact in artifacts {
         if !backup_ready(
             &mut cluster,
@@ -1025,12 +1111,7 @@ pub(crate) async fn prove_local_artifact_backups(
 /// sandbox that isn't restorable.
 pub(crate) async fn sandbox_has_backed_copy(sandbox_id: &str) -> Result<bool, SkipReason> {
     use pplx_space_node_api_client::proto::backup_readiness_query::Artifact;
-    let mut cluster = pplx_space_node_api_client::cluster::connect_from_env()
-        .await
-        .map_err(|error| {
-            warn!(sandbox_id, %error, "backed-copy check could not reach cluster-api");
-            SkipReason::RpcTransportError
-        })?;
+    let mut cluster = connect_cluster(sandbox_id, "backed-copy check").await?;
     backup_ready(&mut cluster, sandbox_id, Artifact::DurablyRestorable(true)).await
 }
 
@@ -1511,6 +1592,56 @@ async fn evict_tick(
             LocalEvidence::Pinned(pinned) => Some(pinned.artifact_id),
             _ => None,
         };
+        // The eviction deletes every local artifact of the sandbox, not only
+        // the one proven: a named snapshot nothing backed up would be lost.
+        // Each other artifact the cluster shows backed is stamped, and the
+        // sandbox is left while any stays unproven; the claim refuses while
+        // one is unstamped.
+        let awaiting = service.db_conn().and_then(|db| {
+            crate::db::read::sandbox_view(&db, &sandbox_id)
+                .artifacts()
+                .awaiting_backup_besides(proven_pin)
+                .map_err(|error| tonic::Status::internal(format!("local artifact lookup: {error}")))
+        });
+        let Ok(awaiting) = awaiting else {
+            record_continuing_candidate_skip(
+                &mut report,
+                scan_state,
+                &sandbox_id,
+                cursor,
+                SkipReason::LocalReadError,
+                scan_started,
+            );
+            continue;
+        };
+        match prove_local_artifact_backups(service, &sandbox_id, &awaiting).await {
+            Ok(true) => {}
+            Ok(false) => {
+                record_continuing_candidate_skip(
+                    &mut report,
+                    scan_state,
+                    &sandbox_id,
+                    cursor,
+                    SkipReason::LocalArtifactAwaitingBackup,
+                    scan_started,
+                );
+                continue;
+            }
+            Err(reason) => {
+                let flow = record_candidate_skip(
+                    &mut report,
+                    scan_state,
+                    &sandbox_id,
+                    cursor,
+                    reason,
+                    scan_started,
+                );
+                if flow == CandidateFlow::Stop {
+                    break;
+                }
+                continue;
+            }
+        }
 
         // Size estimate before the directory disappears.
         let cache_dir = sandbox_cache_dir(&sandbox_id);
@@ -1589,13 +1720,23 @@ async fn evict_tick(
             {
                 // A resume/restore claimed the row (or a delete removed
                 // it) between planning and the eviction CAS — exactly
-                // what the claim exists for.
+                // what the claim exists for — or the row is still the
+                // suspended copy proven, and the claim found it held.
+                let still_proven = status.code() == tonic::Code::FailedPrecondition
+                    && service
+                        .db_conn()
+                        .ok()
+                        .and_then(|db| crate::db::read::sandbox(&db, &sandbox_id).ok().flatten())
+                        .is_some_and(|row| {
+                            row.state.is_unowned(crate::state::SandboxState::Suspended)
+                                && row.current_local_artifact_id == proven_pin
+                        });
                 record_continuing_candidate_skip(
                     &mut report,
                     scan_state,
                     &sandbox_id,
                     cursor,
-                    SkipReason::NotSuspendedAtExecute,
+                    claim_refusal_skip_reason(&status, still_proven),
                     scan_started,
                 );
             }
@@ -1704,6 +1845,30 @@ pub async fn run_loop(
             _ = tokio::time::sleep(cfg.interval) => {}
         }
     }
+}
+
+/// One disk-pressure tick over `service`'s candidates at 80% disk use, with
+/// no idle minimum, for a test outside this module: how many candidates it
+/// evicted and skipped.
+#[cfg(test)]
+pub(crate) async fn evict_tick_for_test(service: &SandboxManagerService) -> (usize, usize) {
+    let cfg = EvictionConfig {
+        enabled: true,
+        engage_fraction: 0.50,
+        target_fraction: 0.40,
+        min_idle: Duration::from_secs(0),
+        interval: Duration::from_secs(60),
+        max_per_tick: 10,
+        reupload_max_per_tick: 0,
+    };
+    let disk = crate::disk_usage::DiskUsage {
+        used_bytes: 80,
+        total_bytes: 100,
+    };
+    let report = evict_tick(service, cfg, Some(disk), &mut CandidateScanState::default())
+        .await
+        .unwrap();
+    (report.evicted, report.skipped)
 }
 
 #[cfg(test)]

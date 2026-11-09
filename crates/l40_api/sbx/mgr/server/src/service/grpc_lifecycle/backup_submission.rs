@@ -136,6 +136,7 @@ impl SandboxManagerService {
                     ArtifactBackupHandoff::DurableWorker
                 },
                 execution_generation: None,
+                capture_vouched: false,
             },
         )
         .await
@@ -271,6 +272,7 @@ impl SandboxManagerService {
             format,
             handoff,
             execution_generation,
+            capture_vouched,
         } = submission;
         let config: &crate::snapshot_upload::SnapshotUploadConfig = match request_override {
             Some(c) => c,
@@ -346,10 +348,28 @@ impl SandboxManagerService {
         )
         .map_err(|error| format!("prepare snapshot upload intent failed: {error}"))?;
         jobs.execution_generation = execution_generation;
+        // Ordered by only on evidence: the caller's, or the record the
+        // capturing teardown published beside the bytes, naming this
+        // generation for this artifact.
+        jobs.execution_generation_names_capture = execution_generation.is_some_and(|generation| {
+            capture_vouched
+                || crate::capture_record::read_capture_order(
+                    std::path::Path::new(snapshot_dir),
+                    local_artifact_id,
+                )
+                .ok()
+                .flatten()
+                    == Some(generation)
+        });
         let mut storage_uri = jobs.storage_uri.clone();
         let dedup_key = crate::snapshot_upload_jobs::artifact_backup_dedup_key(local_artifact_id);
         let local_artifact_id = local_artifact_id.to_string();
 
+        #[cfg(test)]
+        crate::auto_lifecycle::AutoLifecycleCoordinator::rendezvous(
+            &self.auto_lifecycle.backup_admission_barrier,
+        )
+        .await;
         let job_id = match self.snapshot_upload_worker.submit_json(
             crate::snapshot_upload_jobs::SNAPSHOT_UPLOAD_JOB_KIND,
             &jobs,
@@ -545,6 +565,8 @@ impl SandboxManagerService {
             snapshot_dir,
             format,
             node_local_registration_generation(sandbox),
+            // The current execution just took this capture.
+            true,
         )
         .await
         .map_err(|error| artifact_backup_fence_status(error.to_string()))
@@ -557,6 +579,7 @@ impl SandboxManagerService {
         snapshot_dir: &str,
         format: pplx_space_sbx_mgr_client::proto::SuspendSnapshotFormat,
         registration_generation: Option<pplx_space_common_core::types::ExecutionGeneration>,
+        capture_vouched: bool,
     ) -> Result<SubmitSuspendSnapshotOutcome, ArtifactBackupSubmissionError> {
         let request_override = match self.resolve_org_snapshot_upload_config(&sandbox.id).await {
             OrgSnapshotConfigResolution::Resolved(config) => Some(config),
@@ -584,6 +607,7 @@ impl SandboxManagerService {
                 format,
                 handoff: ArtifactBackupHandoff::TeardownFence,
                 execution_generation: registration_generation,
+                capture_vouched,
             },
         )
         .await

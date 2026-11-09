@@ -922,7 +922,7 @@ fn cases() -> Vec<Case> {
                 list(crate::db::other_local_artifacts_awaiting_backup(
                     &s.conn,
                     &s.suspended,
-                    s.pin,
+                    Some(s.pin),
                 ))
             },
             expected: [S, S, S, S],

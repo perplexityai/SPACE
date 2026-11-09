@@ -25,6 +25,7 @@ fn teardown_backup_request(
         execution: Some(test_snapshot_execution()),
         capture_host_cpu: None,
         execution_generation: Some(execution_generation),
+        execution_generation_names_capture: true,
         fence_verdict_only: false,
     }
 }
@@ -924,5 +925,169 @@ async fn a_rolled_back_restore_keeps_its_capture_with_retirement_disabled() -> T
         snapshot_state(&fixture.service.pool, relaunched_capture).await?,
         "creating"
     );
+    Ok(())
+}
+
+/// A registration records the generation of the execution that captured it,
+/// and the readiness check orders two captures by it, not by when their
+/// backups registered: the older capture, backed up again after a newer one,
+/// still orders before it.
+#[tokio::test(flavor = "current_thread")]
+async fn captures_order_by_the_generation_that_took_them() -> TestResult {
+    use crate::proto::backup_readiness_query::Artifact;
+    use crate::proto::{
+        BackupReadinessQuery, LocalArtifactBackupIdentity, LocalArtifactCapturedAfter,
+    };
+    let Some(fixture) = cluster_fixture().await? else {
+        return Ok(());
+    };
+    let pool = &fixture.service.pool;
+    let (sandbox_id, source_ip, _) = seed_sandbox_on_source_node(pool).await?;
+    insert_execution(pool, sandbox_id, 4, "running", true).await?;
+    let (older, newer) = (LocalArtifactId::new(), LocalArtifactId::new());
+    let ready = |attempt: SnapshotId| async move {
+        sqlx::query(sql!("UPDATE snapshots SET state = 'ready' WHERE id = $1"))
+            .bind(attempt)
+            .execute(pool)
+            .await
+    };
+
+    let first = SnapshotId::new();
+    begin_teardown_backup_of(&fixture.service, source_ip, sandbox_id, older, first, 4).await?;
+    ready(first).await?;
+    retire_execution(pool, sandbox_id, 4).await?;
+    insert_execution(pool, sandbox_id, 5, "running", true).await?;
+    let later = SnapshotId::new();
+    begin_teardown_backup_of(&fixture.service, source_ip, sandbox_id, newer, later, 5).await?;
+    ready(later).await?;
+    // The older capture backed up again, after the newer one registered.
+    let again = SnapshotId::new();
+    begin_teardown_backup_of(&fixture.service, source_ip, sandbox_id, older, again, 4).await?;
+    ready(again).await?;
+
+    for (attempt, generation) in [(first, 4), (later, 5), (again, 4)] {
+        let recorded: Option<i64> =
+            sqlx::query_scalar(sql!("SELECT generation FROM snapshots WHERE id = $1"))
+                .bind(attempt)
+                .fetch_one(pool)
+                .await?;
+        assert_eq!(recorded, Some(generation));
+    }
+    let full = pplx_space_sbx_mgr_client::proto::ArtifactKind::Full as i32;
+    let identity = |id: LocalArtifactId| LocalArtifactBackupIdentity {
+        local_artifact_id: id.to_string(),
+        artifact_kind: full,
+    };
+    let captured_after = |later: LocalArtifactId, earlier: LocalArtifactId| {
+        let service = &fixture.service;
+        async move {
+            service
+                .get_artifact_backup_location(request_from_node(
+                    GetArtifactBackupLocationRequest {
+                        sandbox_id: sandbox_id.to_string(),
+                        readiness: Some(BackupReadinessQuery {
+                            artifact: Some(Artifact::CapturedAfter(LocalArtifactCapturedAfter {
+                                later: Some(identity(later)),
+                                earlier: Some(identity(earlier)),
+                            })),
+                        }),
+                        ..Default::default()
+                    },
+                    source_ip,
+                ))
+                .await
+                .map(|response| response.into_inner().ready)
+        }
+    };
+    assert_eq!(captured_after(newer, older).await?, Some(true));
+    assert_eq!(captured_after(older, newer).await?, Some(false));
+    assert_eq!(
+        captured_after(LocalArtifactId::new(), older).await?,
+        Some(false)
+    );
+    Ok(())
+}
+
+/// A registration whose node doesn't vouch that the generation is the
+/// capture's own is still admitted under it, but records no capture
+/// generation, so it orders nothing: a capture registered unvouched under a
+/// later generation doesn't read as captured after one vouched for under an
+/// earlier generation.
+#[tokio::test(flavor = "current_thread")]
+async fn an_unvouched_generation_fences_but_orders_nothing() -> TestResult {
+    use crate::proto::backup_readiness_query::Artifact;
+    use crate::proto::{
+        BackupReadinessQuery, LocalArtifactBackupIdentity, LocalArtifactCapturedAfter,
+    };
+    let Some(fixture) = cluster_fixture().await? else {
+        return Ok(());
+    };
+    let pool = &fixture.service.pool;
+    let (sandbox_id, source_ip, _) = seed_sandbox_on_source_node(pool).await?;
+    insert_execution(pool, sandbox_id, 4, "running", true).await?;
+    let (older, newer) = (LocalArtifactId::new(), LocalArtifactId::new());
+    let register = |local_artifact_id: LocalArtifactId, generation: i64, names_capture: bool| {
+        let service = &fixture.service;
+        async move {
+            let attempt = SnapshotId::new();
+            service
+                .begin_artifact_backup(request_from_node(
+                    BeginArtifactBackupRequest {
+                        execution_generation_names_capture: names_capture,
+                        ..teardown_backup_request(
+                            sandbox_id,
+                            local_artifact_id,
+                            attempt,
+                            generation,
+                        )
+                    },
+                    source_ip,
+                ))
+                .await?;
+            sqlx::query(sql!("UPDATE snapshots SET state = 'ready' WHERE id = $1"))
+                .bind(attempt)
+                .execute(pool)
+                .await
+                .map_err(|error| tonic::Status::internal(error.to_string()))?;
+            Ok::<_, tonic::Status>(attempt)
+        }
+    };
+    let vouched = register(older, 4, true).await?;
+    retire_execution(pool, sandbox_id, 4).await?;
+    insert_execution(pool, sandbox_id, 5, "running", true).await?;
+    let unvouched = register(newer, 5, false).await?;
+
+    for (attempt, recorded) in [(vouched, Some(4)), (unvouched, None)] {
+        let generation: Option<i64> =
+            sqlx::query_scalar(sql!("SELECT generation FROM snapshots WHERE id = $1"))
+                .bind(attempt)
+                .fetch_one(pool)
+                .await?;
+        assert_eq!(generation, recorded);
+    }
+    let full = pplx_space_sbx_mgr_client::proto::ArtifactKind::Full as i32;
+    let identity = |id: LocalArtifactId| LocalArtifactBackupIdentity {
+        local_artifact_id: id.to_string(),
+        artifact_kind: full,
+    };
+    let ready = fixture
+        .service
+        .get_artifact_backup_location(request_from_node(
+            GetArtifactBackupLocationRequest {
+                sandbox_id: sandbox_id.to_string(),
+                readiness: Some(BackupReadinessQuery {
+                    artifact: Some(Artifact::CapturedAfter(LocalArtifactCapturedAfter {
+                        later: Some(identity(newer)),
+                        earlier: Some(identity(older)),
+                    })),
+                }),
+                ..Default::default()
+            },
+            source_ip,
+        ))
+        .await?
+        .into_inner()
+        .ready;
+    assert_eq!(ready, Some(false));
     Ok(())
 }

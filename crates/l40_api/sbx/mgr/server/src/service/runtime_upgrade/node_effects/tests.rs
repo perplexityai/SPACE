@@ -148,6 +148,15 @@ impl Fixture {
 
     pub(in crate::service::runtime_upgrade) fn adopt_checkpoint(&self) -> LocalArtifactId {
         let artifact = LocalArtifactId::new();
+        self.adopt_checkpoint_as(artifact);
+        artifact
+    }
+
+    /// Pin `artifact` as the suspended sandbox's checkpoint.
+    pub(in crate::service::runtime_upgrade) fn adopt_checkpoint_as(
+        &self,
+        artifact: LocalArtifactId,
+    ) {
         assert!(
             crate::db::adopt_suspended_local_artifact(
                 &self.service.db.lock().unwrap(),
@@ -157,7 +166,6 @@ impl Fixture {
             )
             .unwrap()
         );
-        artifact
     }
 
     fn staged(&self, id: impl std::fmt::Display) -> PathBuf {
@@ -976,7 +984,7 @@ fn every_caller_allowed_a_wake_start_context_may_also_upgrade() {
 /// A suspended Wake upgrade naming another node as the checkpoint's source
 /// and a backup to stage, as the control plane sends for a pod placed away
 /// from the checkpoint.
-fn remote_upgrade_wake(
+pub(in crate::service::runtime_upgrade) fn remote_upgrade_wake(
     f: &Fixture,
     checkpoint: Option<LocalArtifactId>,
 ) -> crate::proto::WakeRequest {

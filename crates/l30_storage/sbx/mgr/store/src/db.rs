@@ -134,6 +134,7 @@ pub mod read {
     pub use guest_update::*;
     mod cleanup_job;
     mod counts;
+    mod eviction;
     mod local_artifact;
     mod runtime_upgrade;
     mod sandbox;
@@ -141,6 +142,7 @@ pub mod read {
     mod state_page;
     pub use cleanup_job::*;
     pub use counts::*;
+    pub use eviction::*;
     pub use local_artifact::*;
     pub use runtime_upgrade::*;
     pub use sandbox::*;
