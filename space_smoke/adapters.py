@@ -5430,6 +5430,19 @@ ON CONFLICT (key_hash) DO NOTHING;
         node = _kube_node_name(node_name)
         return self.kubectl("get", "node", node, "-o", "name", timeout=15).returncode == 0
 
+    def sandbox_placements(self, sandbox_ids: Sequence[str]) -> dict[str, tuple[str, str | None]]:
+        rows = self._psql(
+            "SELECT id, lifecycle, coalesce(active_node_id::text, '') FROM sandboxes"
+            f" WHERE id IN ({_sql_uuid_list(sandbox_ids)});\n",
+            action="read the sandboxes' lifecycles and nodes",
+        )
+        placements: dict[str, tuple[str, str | None]] = {}
+        for line in rows.splitlines():
+            if line.strip():
+                sandbox_id, lifecycle, node = (part.strip() for part in line.split("|", 2))
+                placements[sandbox_id] = (lifecycle, node or None)
+        return placements
+
     def sandbox_residency(self, sandbox_id: str) -> SandboxResidency:
         row = self._psql(
             SANDBOX_RESIDENCY_SQL.format(sandbox_id=_sql_uuid(sandbox_id)),

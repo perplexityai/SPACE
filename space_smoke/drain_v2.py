@@ -47,6 +47,7 @@ from space_smoke.capabilities import (
 from space_smoke.dead_node import (
     ABSENCE_WINDOW_ENV,
     DRAIN_V2_ENABLED_ENV,
+    DRAIN_V2_MAX_EVACUATING_ENV,
     MODE_ENV,
     TERMINATOR_KIND_ENV,
     TICK_ENV,
@@ -91,7 +92,7 @@ class DrainV2Assertions:
         self,
         fixture: CommandSandboxFixture,
         control: DrainV2Control,
-        create_sandbox: Callable[[], DurableLifecycleSandbox],
+        create_sandbox: Callable[..., DurableLifecycleSandbox],
         scope: ResourceScope,
     ) -> None:
         self._fixture = fixture
@@ -205,6 +206,7 @@ class DrainV2Assertions:
         terminating: bool = False,
         hold_seconds: int | None = None,
         restore_slots: int | None = None,
+        max_evacuating_nodes: int | None = None,
     ) -> Iterator[None]:
         """Run the body with the controller's v2 loop on: the drain v2 flag,
         the dead-node verb `live` and the `aws` terminator, against Kind's
@@ -213,10 +215,13 @@ class DrainV2Assertions:
         minutes, for a dead node's quiet upload; with
         `hold_seconds`, each claimed drain restore holds that long before its
         node work; with `restore_slots`, that many drain restores run at once
-        instead of the dispatcher's default. The standing config goes back
-        when the body ends."""
+        instead of the dispatcher's default; with `max_evacuating_nodes`, at
+        most that many v2 drains evacuate at once. The standing config goes
+        back when the body ends."""
 
         env = dict(V2_CONTROLLER_ENV)
+        if max_evacuating_nodes is not None:
+            env[DRAIN_V2_MAX_EVACUATING_ENV] = str(max_evacuating_nodes)
         if terminating:
             env[TICK_ENV] = str(VERB_TICK_SECONDS)
             env[ABSENCE_WINDOW_ENV] = str(VERB_ABSENCE_WINDOW_SECONDS)
@@ -255,10 +260,11 @@ class DrainV2Assertions:
                 with self._fixture.phase("put the standing drain-restore env back"):
                     restore.release()
 
-    def create_resident(self) -> DurableLifecycleSandbox:
-        """A run-owned sandbox, running on the pinned worker."""
+    def create_resident(self, *, idle_timeout: str | None = None) -> DurableLifecycleSandbox:
+        """A run-owned sandbox, running on the pinned worker; with
+        `idle_timeout`, one the node suspends once it has been idle that long."""
 
-        sandbox = self._create_sandbox()
+        sandbox = self._create_sandbox(idle_timeout=idle_timeout)
         placement = self._control.sandbox_pod_placement(self.bare_id(sandbox.sandbox_id))
         self._fixture.verify(
             placement is not None and placement.node_name == self.node_name,
@@ -436,6 +442,42 @@ class DrainV2Assertions:
             self.expect_single_vm(sandbox_id, lifecycle)
         self._fixture.record("restores", restores)
         return restores
+
+    def companion(self) -> DrainV2Assertions:
+        """Assertions for the other worker, under this run's worker-cordon
+        Lease, so a run can drain both. Its residents land on it only while
+        this one's worker is cordoned."""
+
+        if self._other is None:
+            raise RuntimeError("pin_to_resident_worker() must run first")
+        node = next(
+            (n for n in self._control.admin_nodes() if n.k8s_node_name == self._other), None
+        )
+        self._fixture.verify(node is not None, "the other worker has no SPACE node row")
+        assert node is not None
+        other = DrainV2Assertions(self._fixture, self._control, self._create_sandbox, self._scope)
+        other._node_name = self._other
+        other._node_id = node.id
+        other._other = self.node_name
+        return other
+
+    def cordon(self) -> None:
+        """Cordon this worker, uncordoned again when the run ends."""
+
+        node_name = self.node_name
+        self._scope.defer(
+            f"uncordon {node_name}", lambda: self._control.uncordon_kube_node(node_name), critical=True
+        )
+        self._control.cordon_kube_node(node_name)
+
+    def uncordon(self) -> None:
+        self._control.uncordon_kube_node(self.node_name)
+
+    def status(self) -> dict[str, Any]:
+        """The node's `drain_status`."""
+
+        columns = self._control.drain_v2_status(self.node_id)
+        return {} if columns is None or columns.status is None else columns.status
 
     def release_other_worker(self) -> None:
         """Uncordon the other worker, so the restores have somewhere to land."""
@@ -830,6 +872,11 @@ class DrainV2Assertions:
             sandbox_id=sandbox_id,
             restores=restores,
         )
+
+    def placements(self, sandbox_ids: list[str]) -> dict[str, tuple[str, str | None]]:
+        """Each sandbox's lifecycle and active node id, by bare id."""
+
+        return self._control.sandbox_placements(sandbox_ids)
 
     def drain_restores(self, sandbox_id: str) -> list[tuple[str, int]]:
         """Each drain restore operation of the sandbox, oldest first: its state and attempts."""

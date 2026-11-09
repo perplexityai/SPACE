@@ -62,6 +62,8 @@ TERMINATOR_KIND_ENV = "SPACE_NODE_DRAIN_TERMINATOR_KIND"
 # The drain's v2, which the controller runs only with the verb `live` and the
 # `aws` terminator.
 DRAIN_V2_ENABLED_ENV = "SPACE_DRAIN_V2_ENABLED"
+# How many v2 drains may evacuate their nodes at once.
+DRAIN_V2_MAX_EVACUATING_ENV = "SPACE_DRAIN_V2_MAX_EVACUATING_NODES"
 
 # The only controller env this scenario may touch, and the closed vocabulary
 # its overrides come from.
@@ -72,11 +74,13 @@ DEAD_NODE_ENV_KEYS: tuple[str, ...] = (
     UPLOAD_SETTLE_ENV,
     TERMINATOR_KIND_ENV,
     DRAIN_V2_ENABLED_ENV,
+    DRAIN_V2_MAX_EVACUATING_ENV,
 )
 _MODE_VALUES = frozenset({"off", "dry-run", "live"})
 _TERMINATOR_VALUES = frozenset({"aws", "kube-delete"})
 _FLAG_VALUES = frozenset({"true", "false"})
 _SECONDS_VALUE = re.compile(r"[1-9][0-9]{0,3}")
+_COUNT_VALUE = re.compile(r"[1-9][0-9]{0,2}")
 
 # Sandbox actions the harness may ask the native API for.
 NATIVE_ACTIONS = frozenset({"suspend", "pause", "stop"})
@@ -220,6 +224,8 @@ def validate_dead_node_overrides(overrides: Mapping[str, str]) -> None:
             allowed = value in _FLAG_VALUES
         elif key == TERMINATOR_KIND_ENV:
             allowed = value in _TERMINATOR_VALUES
+        elif key == DRAIN_V2_MAX_EVACUATING_ENV:
+            allowed = _COUNT_VALUE.fullmatch(value) is not None
         else:
             allowed = _SECONDS_VALUE.fullmatch(value) is not None
         if not allowed:
