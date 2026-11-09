@@ -25,6 +25,10 @@ CREATE_END_SECONDS = 240
     sandbox=smoke.SandboxConfig(timeout=1800),
     # The cleanup runs right after the controller rolls back to its standing env.
     cleanup_timeout_seconds=600,
+    ignored=(
+        "opt-in: force-kills every public API replica twice and rolls the controller twice, "
+        "and its counter read is proven only against the fake intake (telemetry datadog)"
+    ),
 )
 def retired_execution_pod_gc_reaps_retired_pods(test: smoke.KindEcw) -> None:
     """A node-side idle suspend leaves a Succeeded pod, and a cold create

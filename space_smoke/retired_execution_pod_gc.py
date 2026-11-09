@@ -106,7 +106,11 @@ def smoke_gc_env(*, dry_run: bool, threshold_seconds: int, interval_seconds: int
 
 
 def would_reap(pod: SandboxPodExecution) -> str | None:
-    """The reaper's verdict on one pod and its execution row (`classify.rs`), or None to skip."""
+    """The reaper's verdict on one pod and its execution row, or None to skip.
+
+    A copy of the rules in `retired_execution_pod_gc/classify.rs`; it must
+    change with them, or the expected dry-run counts drift from the reaper's.
+    """
 
     if pod.deleting or pod.row_state is None or pod.row_active:
         return None
