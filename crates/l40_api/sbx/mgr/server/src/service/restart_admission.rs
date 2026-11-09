@@ -205,6 +205,9 @@ macro_rules! restart_rpcs {
 }
 
 restart_rpcs! {
+    SandboxGuestUpdateStatus => ("/space.sandbox.manager.v1.SandboxManager/GuestUpdateStatus", ReadOnly),
+    SandboxApplyGuestUpdate => ("/space.sandbox.manager.v1.SandboxManager/ApplyGuestUpdate", StateWriter),
+    SandboxRestartGuest => ("/space.sandbox.manager.v1.SandboxManager/RestartGuest", StateWriter),
     SandboxGetExecutionCapabilities => ("/space.sandbox.manager.v1.SandboxManager/GetExecutionCapabilities", ReadOnly),
     HealthCheck => ("/grpc.health.v1.Health/Check", ReadOnly),
     HealthWatch => ("/grpc.health.v1.Health/Watch", ReadOnly),
