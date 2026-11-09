@@ -256,23 +256,57 @@ jobs:
           package-type: container
           min-versions-to-keep: 20
 
+  # The shards' runners are requested only once the producer has one. Asked
+  # for together, the shards took the large runners already up, and
+  # the producer, the job every shard waits on, waited about a minute for a new
+  # one. The shards' own preparation still ends before the producer does. This
+  # job holds the shards for at most 75 s: when no large runner is up, the
+  # producer boots a new one either way, and the shards should not wait for
+  # that too. When the producer does not start in time, or its status cannot
+  # be read, it says so and the shards are requested
+  # (rust-artifact-handoff.py started). The shards run whatever this job's
+  # result, and setting the SPACE_KIND_PRODUCER_GATE repository variable to
+  # `off` skips it.
+  rust_artifacts_started:
+    if: github.repository == 'perplexityai/SPACE' && inputs.substrate != 'direct' && vars.SPACE_KIND_PRODUCER_GATE != 'off'
+    name: Request the shards once the Rust producer starts
+    permissions:
+      actions: read
+      contents: read
+    runs-on: ubuntu-24.04
+    timeout-minutes: 4
+    steps:
+      - name: Check out SPACE
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Wait for the Rust producer to start
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 infra/space/kind/scripts/rust-artifact-handoff.py started --timeout 75
+
   smoke:
-    if: github.repository == 'perplexityai/SPACE' && inputs.substrate != 'direct'
-    name: Kind / Firecracker smoke (${{ matrix.shard }}/12)
+    needs: rust_artifacts_started
+    # !cancelled(): the gate only orders the requests, so its failure or skip
+    # must not skip the shards.
+    if: ${{ !cancelled() && github.repository == 'perplexityai/SPACE' && inputs.substrate != 'direct' }}
+    name: Kind / Firecracker smoke (${{ matrix.shard }}/14)
     permissions:
       actions: read
       contents: read
       packages: read
     strategy:
       fail-fast: false
-      # Twelve shards, balanced across both API surfaces together
-      # (space_smoke/sharding.py). At twelve, the leader-election brownout,
-      # about 295 s with the Kind chart's 10 s reconciler ticks, is about one
-      # shard's share of the whole run, so a thirteenth shard would not lower
-      # the slowest. Keep the list, the job name and SMOKE_SHARD's count in
-      # step.
+      # Fourteen shards, balanced across both API surfaces together
+      # (space_smoke/sharding.py). The typed scenarios' medians sum to about
+      # 4060 s: twelve shards carried about 340 s each, more than the
+      # leader-election brownout's 297 s. At fourteen the brownout's shard
+      # holds it alone and is the slowest, so a fifteenth would not lower it.
+      # Keep the list, the job name and SMOKE_SHARD's count in step.
       matrix:
-        shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+        shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
     env:
       # Image builds, the charts' images and the observability backends'
       # images come from the GHCR mirror; see ci/mirrored-images.txt.
@@ -356,6 +390,14 @@ jobs:
             bash infra/space/kind/scripts/install-prereqs.sh
           echo "${HOME}/.local/bin" >>"${GITHUB_PATH}"
 
+      # The UI needs no Rust, but Tilt holds its image build until space-api
+      # and the console's provisioning are ready, and the Next.js build was
+      # then the last 100 s of the bring-up. Built here, beside the Kind
+      # preparation and the wait for the producer, it leaves Tilt's build a
+      # cache hit (infra/space/kind/scripts/prebuild-ui-image.sh).
+      - name: Start building the UI image while the Rust producer builds
+        run: bash ci/scripts/background-step.sh start ui-image bash infra/space/kind/scripts/prebuild-ui-image.sh
+
       # The BYOK scenario seals snapshots with the host kernel's device-mapper
       # crypt and snapshot targets. Kind nodes share the runner's kernel and
       # cannot load modules themselves, so load them here, where a runner that
@@ -422,6 +464,12 @@ jobs:
       - &load-rust-artifacts
         name: Load and verify the shared Rust artifact image
         run: python3 infra/space/kind/scripts/rust-artifact-handoff.py load "${RUNNER_TEMP}/kind-rust"
+
+      # A failed pre-build costs only its time: Tilt builds the UI as before.
+      - name: Finish building the UI image
+        run: |
+          bash ci/scripts/background-step.sh wait ui-image \
+            || echo "::warning::The UI image pre-build failed; Tilt builds the UI itself."
 
       # Where the bring-up after the artifact handoff spends its time, per Tilt
       # resource: scripts/benchmarks/kind-bringup-timeline.py records build
@@ -497,7 +545,7 @@ jobs:
       - name: Run this shard of the typed Kind smoke
         env:
           SKIP_BOOTSTRAP: "1"
-          SMOKE_SHARD: ${{ matrix.shard }}/12
+          SMOKE_SHARD: ${{ matrix.shard }}/14
           SPACE_M1_GENERATOR_MIRROR: ghcr.io/perplexityai/space-ci-mirror
           SPACE_SMOKE_KIND_ADMIN_TOKEN_FILE: ${{ runner.temp }}/space-smoke-admin-token
           SPACE_SMOKE_KIND_COLD_RECEIPTS: ${{ runner.temp }}/space-smoke-cold-receipts

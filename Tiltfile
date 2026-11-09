@@ -610,10 +610,15 @@ local_resource(
 # cache that never comes. Every node-service release depends on it. It also
 # refuses nodes whose vendor tree, copied from the host tree on their first boot
 # and kept since, no longer matches that tree (check-node-vendor.sh).
+# allow_parallel: the check only reads the node containers, and Tilt runs a
+# serial local resource only while nothing else is building. Serial, it waited
+# out the first image builds, about 45 s, and held up the node services' image
+# build and the seed with it.
 local_resource(
     "check-kind-node-image",
     cmd = ("SPACE_KIND_CLUSTER={0} bash infra/space/kind/scripts/check-kind-node-image.sh && " +
            "SPACE_KIND_CLUSTER={0} bash infra/space/kind/scripts/check-node-vendor.sh").format(KIND_CLUSTER),
+    allow_parallel = True,
     deps = ["infra/space/kind/scripts/check-kind-node-image.sh",
             "infra/space/kind/scripts/check-node-vendor.sh",
             "infra/space/kind/scripts/kind-node-image.sh", "infra/space/kind/node",
