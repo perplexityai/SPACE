@@ -699,6 +699,10 @@ impl Default for ProcessRegistry {
 }
 
 impl ProcessRegistry {
+    pub(super) fn has_records(&self) -> bool {
+        !self.records.is_empty()
+    }
+
     pub(super) fn new(output_budget: ProcessOutputBudget) -> Self {
         Self {
             records: Arc::new(DashMap::new()),

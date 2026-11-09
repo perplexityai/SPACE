@@ -82,6 +82,7 @@ pub(super) async fn run(
     active_connections: std::sync::Arc<Semaphore>,
     idle_timeout: Duration,
     cancel: CancellationToken,
+    execution: Option<pplx_space_spaced_guest_execution::ExecutionService>,
 ) {
     tracing::info!(%bind_addr, %dial_addr, "port-forward: listening");
     let listener = ReleasingListener(listener);
@@ -97,6 +98,13 @@ pub(super) async fn run(
             accepted = listener.accept() => {
                 match accepted {
                     Ok((client, peer)) => {
+                        let admission = match execution.as_ref().map(|execution| execution.admit_external_operation()).transpose() {
+                            Ok(admission) => admission,
+                            Err(error) => {
+                                tracing::debug!(%bind_addr, %peer, %error, "port-forward connection refused during guest maintenance");
+                                continue;
+                            },
+                        };
                         // Hold at most one accepted socket per listener while
                         // waiting for shared capacity. This applies bounded
                         // backpressure through the kernel backlog instead of
@@ -114,6 +122,7 @@ pub(super) async fn run(
                         };
                         let cancel = cancel.clone();
                         tokio::spawn(async move {
+                            let _admission = admission;
                             if let Err(error) = handle_connection(
                                 client,
                                 peer,
