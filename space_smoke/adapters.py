@@ -61,6 +61,7 @@ from space_smoke.capabilities import (
     EncryptedSnapshotObservation,
     ExecutionRow,
     RestoreCallerOutcome,
+    SandboxPodExecution,
     SandboxPodView,
     ColdCreatePod,
     ColdCreateSelection,
@@ -125,6 +126,7 @@ from space_smoke.orphaned_restore_pod_gc import (
     validate_gc_keys,
     validate_gc_overrides,
 )
+from space_smoke import retired_execution_pod_gc as retired_gc
 from space_smoke.stopped_replacement import (
     STOPPED_REPLACEMENT_ENV_KEYS,
     parse_doctor_lifecycle,
@@ -5496,6 +5498,228 @@ ON CONFLICT (key_hash) DO NOTHING;
             f"remove planted orphan pods {token}",
         )
 
+    # --- retired-execution-pod GC ---------------------------------------------
+    #
+    # Thin kubectl/psql wrappers; the key/value lists, the classifier mirror
+    # and the verdicts live in `space_smoke.retired_execution_pod_gc`.
+
+    def retired_execution_pod_gc_env(self) -> dict[str, str | None]:
+        return self._deployment_env_literals(self._controller_deployment(), retired_gc.GC_ENV_KEYS)
+
+    def set_retired_execution_pod_gc_env(self, overrides: Mapping[str, str]) -> None:
+        retired_gc.validate_gc_overrides(overrides)
+        self._apply_retired_execution_pod_gc_env(overrides)
+
+    def restore_retired_execution_pod_gc_env(self, standing: Mapping[str, str | None]) -> None:
+        retired_gc.validate_gc_keys(standing)
+        self._apply_retired_execution_pod_gc_env(standing)
+
+    def _apply_retired_execution_pod_gc_env(self, values: Mapping[str, str | None]) -> None:
+        self._require_isolated_kind("retired-execution-pod GC env override")
+        ownership = self._retention_lease_ownership
+        if ownership is None:
+            raise SmokeConfigurationError(
+                "refusing a retired-execution-pod GC controller deployment write without the "
+                "caller's live mutation Lease"
+            )
+        self._assert_lease_owned(ownership, "a retired-execution-pod GC controller deployment write")
+        self._set_deployment_env(self._controller_deployment(), values, timeout=180)
+
+    _FAKEINTAKE_PROXY = "/api/v1/namespaces/kube-system/services/datadog-fakeintake:80/proxy/fakeintake"
+
+    def reset_retired_execution_pod_gc_counts(self) -> None:
+        # The fake intake keeps every payload since the stack came up, and
+        # decoding hours of them to JSON exceeds its memory limit.
+        if self.telemetry_mode() == "datadog":
+            _require_ok(
+                self.kubectl("get", "--raw", f"{self._FAKEINTAKE_PROXY}/flushPayloads", timeout=60),
+                "empty the fake metrics intake",
+            )
+
+    def retired_execution_pod_gc_counts(self, *, since_epoch: int) -> dict[str, int]:
+        mode = self.telemetry_mode()
+        if mode == "otel":
+            return self._retired_execution_pod_gc_prometheus_counts(since_epoch)
+        if mode == "datadog":
+            return self._retired_execution_pod_gc_intake_counts(since_epoch)
+        raise SmokeConfigurationError(f"the GC's reap counter is not readable in telemetry mode {mode}")
+
+    def _retired_execution_pod_gc_prometheus_counts(self, since_epoch: int) -> dict[str, int]:
+        # Each controller process counts from zero, and the scenario's
+        # processes started after `since_epoch`: the per-process maximum over
+        # the window is what each one counted.
+        window = max(1, int(time.time()) - int(since_epoch))
+        query = (
+            "sum by (mode, verdict) (max_over_time(space_cluster_reconciler_outcome_total"
+            '{loop="retired_execution_pod_gc",outcome="reaped_retired_execution_pod"}'
+            f"[{window}s]))"
+        )
+        body = self.telemetry_query("prometheus", "/api/v1/query", {"query": query})
+        counts: dict[str, int] = {}
+        for series in (body.get("data") or {}).get("result") or []:
+            labels = series.get("metric") or {}
+            key = f"{labels.get('mode', '')}/{labels.get('verdict', '')}"
+            counts[key] = counts.get(key, 0) + int(round(float(series["value"][1])))
+        return counts
+
+    def _retired_execution_pod_gc_intake_counts(self, since_epoch: int) -> dict[str, int]:
+        # The intake has no time filter, so jq cuts it down to this loop's
+        # counter points since the config rolled.
+        path = f"{self._FAKEINTAKE_PROXY}/payloads?endpoint=/api/intake/metrics/v3/series&format=json"
+        program = (
+            "[.payloads[].data[] | select(.metric | endswith(\"cluster_reconciler.outcome\"))"
+            " | select(.tags | index(\"loop:retired_execution_pod_gc\"))"
+            # The agent ships a DogStatsD count as a rate (type 2) per interval.
+            " | (if .type == 2 then (.interval // 10) else 1 end) as $scale"
+            " | {tags, points: [.points[]? | select((.timestamp // 0) >= $since) | (.value // 0) * $scale]}]"
+        )
+        script = (
+            f"kubectl --context {shlex.quote(self.config.context)} get --raw {shlex.quote(path)}"
+            f" | jq -c --argjson since {int(since_epoch)} {shlex.quote(program)}"
+        )
+        result = subprocess.run(["bash", "-o", "pipefail", "-c", script], capture_output=True, text=True, timeout=180)
+        if result.returncode != 0:
+            raise RuntimeError(f"read the retired-pod GC counter from the metrics intake: {result.stderr[-500:]}")
+        counts: dict[str, int] = {}
+        for series in json.loads(result.stdout or "[]"):
+            tags = dict(tag.split(":", 1) for tag in series.get("tags", []) if ":" in tag)
+            if tags.get("outcome") != "reaped_retired_execution_pod":
+                continue
+            key = f"{tags.get('mode', '')}/{tags.get('verdict', '')}"
+            counts[key] = counts.get(key, 0) + int(round(sum(series.get("points") or [])))
+        return counts
+
+    def sandbox_row_exists(self, sandbox_id: str) -> bool:
+        out = self._psql(
+            f"SELECT 1 FROM sandboxes WHERE id = '{_sql_uuid(sandbox_id)}';\n", action="read the sandbox row"
+        )
+        return bool(out.strip())
+
+    def force_delete_sandbox(self, sandbox_id: str) -> None:
+        from space_smoke.console import public_sandbox_id
+
+        answer = self.console_api(
+            "POST",
+            f"/admin/api/v1/sandboxes/{public_sandbox_id(sandbox_id)}:force-delete",
+            idempotency_key=str(uuid.uuid4()),
+        )
+        if answer.status not in (200, 202, 404):
+            raise RuntimeError(f"admin force-delete of {sandbox_id} answered HTTP {answer.status}")
+
+    def run_sandbox_ids(self, sibling_sandbox_id: str) -> list[str]:
+        out = self._psql(
+            "SELECT s.id FROM sandboxes s, sandboxes sibling "
+            f"WHERE sibling.id = '{_sql_uuid(sibling_sandbox_id)}' "
+            "AND sibling.metadata->>'space_smoke_run' IS NOT NULL "
+            "AND s.metadata->>'space_smoke_run' = sibling.metadata->>'space_smoke_run' ORDER BY 1;\n",
+            action="list the run's sandboxes",
+        )
+        return [line.strip() for line in out.splitlines() if line.strip()]
+
+    def sandbox_pod_executions(self) -> list[SandboxPodExecution]:
+        listing = self.kubectl(
+            "get", "pods", "-l", "space.pplx.net/managed-by=space-api", "-o", "json", timeout=30,
+            namespace=KIND_SANDBOX_NAMESPACE,
+        )
+        pods = json.loads(_require_ok(listing, "list sandbox pods") or "{}").get("items", [])
+        names = sorted({_kube_pod_name(str((p.get("metadata") or {}).get("name", ""))) for p in pods})
+        rows: dict[str, tuple[str, int, str, bool]] = {}
+        if names:
+            quoted = ", ".join(f"'{name}'" for name in names)
+            out = self._psql(
+                "SELECT e.pod_name, e.sandbox_id, e.generation, e.state, e.active FROM sandbox_k8s_executions e "
+                "JOIN sandboxes s ON s.id = e.sandbox_id "
+                f"WHERE e.pod_name IN ({quoted}) AND e.pod_namespace = '{KIND_SANDBOX_NAMESPACE}' "
+                "AND s.managed_by = 'k8s';\n",
+                action="read the sandbox pods' execution rows",
+            )
+            for line in out.splitlines():
+                if line.strip():
+                    name, sandbox_id, generation, state, active = line.split("|")
+                    rows[name] = (sandbox_id, int(generation), state, active.strip() == "t")
+        return [_sandbox_pod_execution(pod, rows) for pod in pods]
+
+    def crash_sandbox_manager_at(
+        self, node_name: str, sandbox_id: str, state: str, *, timeout: float
+    ) -> str | None:
+        self._require_isolated_kind("sandbox-manager crash injection")
+        if state not in _SANDBOX_MANAGER_ROW_STATES:
+            raise ValueError(f"refusing unknown sandbox-manager row state {state!r}")
+        # One exec polls and kills on the node, so the kill lands inside a
+        # state that lasts a few seconds. A terminal `started` row means the
+        # window passed.
+        script = _CRASH_SANDBOX_MANAGER_SCRIPT.replace("__SHORT_ID__", _sql_uuid(sandbox_id)[-8:]).replace(
+            "__STATE__", state
+        ).replace("__DEADLINE__", str(int(timeout)))
+        result = self._node_shell_exec(node_name, script, timeout=timeout + 30)
+        if result.returncode == 4:
+            return None
+        _require_ok(result, f"crash the sandbox-manager on {node_name}")
+        return state
+
+    def force_restart_public_api(self, *, timeout: float) -> None:
+        self._require_isolated_kind("public API force restarts")
+        if self._public_api_lease_ownership is None:
+            raise SmokeConfigurationError("refusing a public API restart without the caller's mutation Lease")
+        _require_ok(
+            self.kubectl(
+                "delete", "pods", "-l", PUBLIC_API_DEPLOYMENT_SELECTOR, "--grace-period=0", "--force",
+                "--wait=false", timeout=30,
+            ),
+            "force-delete the public API pods",
+        )
+        self.wait_public_api_rollout(timeout=timeout)
+        # Right after a forced delete the Deployment can still read available.
+        self.wait_public_api_ready(timeout=timeout)
+
+    def plant_pending_pod_with_ip(self, manifest: Mapping[str, Any], *, pod_ip: str) -> str:
+        self._require_isolated_kind("planting a pod")
+        labels = (manifest.get("metadata") or {}).get("labels") or {}
+        if not re.fullmatch(r"[a-f0-9]{8}", str(labels.get(retired_gc.PLANTED_POD_LABEL, ""))):
+            raise ValueError("refusing a plant without its token label")
+        if retired_gc.UNSCHEDULABLE_SELECTOR_KEY not in ((manifest.get("spec") or {}).get("nodeSelector") or {}):
+            raise ValueError("refusing a plant a node could schedule")
+        name = _kube_pod_name(str(manifest["metadata"]["name"]))
+        created = self.kubectl(
+            "create", "-f", "-", "-o", "json", input_text=json.dumps(manifest), timeout=30,
+            namespace=KIND_SANDBOX_NAMESPACE,
+        )
+        uid = (json.loads(_require_ok(created, f"create the planted pod {name}") or "{}")
+               .get("metadata", {}).get("uid"))
+        if not isinstance(uid, str) or not uid:
+            raise RuntimeError(f"the planted pod {name} came back without a uid")
+        status = {
+            "status": {
+                "podIP": pod_ip,
+                "podIPs": [{"ip": pod_ip}],
+                "conditions": [{"type": "PodReadyToStartContainers", "status": "False"}],
+            }
+        }
+        _require_ok(
+            self.kubectl(
+                "patch", "pod", name, "--subresource=status", "--type=strategic", "-p", json.dumps(status),
+                timeout=30, namespace=KIND_SANDBOX_NAMESPACE,
+            ),
+            f"set the planted pod {name}'s status",
+        )
+        return uid
+
+    def remove_planted_pods(self, token: str) -> None:
+        self.remove_planted_restore_pods(token)
+
+    def delete_sandbox_pod_if_uid(self, pod_name: str, uid: str) -> None:
+        self._require_isolated_kind("deleting a sandbox pod")
+        name = _kube_pod_name(pod_name)
+        body = json.dumps(
+            {"kind": "DeleteOptions", "apiVersion": "v1", "gracePeriodSeconds": 0, "preconditions": {"uid": str(uuid.UUID(uid))}}
+        )
+        result = self.kubectl(
+            "delete", "--raw", f"/api/v1/namespaces/{KIND_SANDBOX_NAMESPACE}/pods/{name}", "-f", "-",
+            input_text=body, timeout=30, namespace=KIND_SANDBOX_NAMESPACE,
+        )
+        if result.returncode != 0 and "NotFound" not in (result.stderr or ""):
+            _require_ok(result, f"delete sandbox pod {name}")
+
     # --- node-ctl's unanswered-template wait ---------------------------------
     #
     # One allowlisted key on the worker node-ctl DaemonSet, under its own
@@ -7225,6 +7449,21 @@ row="$(printf '%s\n' "$sandboxes" | grep -F '__SHORT_ID__' || true)"
 printf '%s\n' "$row" | grep -oE '┆ *(__STATES__) *┆' | head -n 1 | tr -d '┆ '
 """
 
+_CRASH_SANDBOX_MANAGER_SCRIPT = r"""set -u
+end=$(( $(date +%s) + __DEADLINE__ ))
+while [ "$(date +%s)" -lt "$end" ]; do
+  row="$(/space/bin/space-sbxmgr list 2>/dev/null | grep -F '__SHORT_ID__' || true)"
+  if printf '%s' "$row" | grep -qE '┆ *__STATE__ *┆'; then
+    pkill -9 -x space-sbxmgr-sv
+    exit $?
+  fi
+  if printf '%s' "$row" | grep -qE '┆ *started *┆'; then
+    exit 4
+  fi
+done
+exit 4
+"""
+
 _SANDBOX_MANAGER_ROW_STATES = (
     "cleanup_required",
     "cleanup_failed",
@@ -7554,6 +7793,44 @@ def _controller_lease(document: Mapping[str, Any]) -> ControllerLease:
         acquire_time=_kube_epoch(spec.get("acquireTime")),
         duration_seconds=spec["leaseDurationSeconds"],
         transitions=int(spec.get("leaseTransitions") or 0),
+    )
+
+
+def _sandbox_pod_execution(
+    pod: Mapping[str, Any], rows: Mapping[str, tuple[str, int, str, bool]]
+) -> SandboxPodExecution:
+    metadata = pod.get("metadata") or {}
+    annotations = metadata.get("annotations") or {}
+    labels = metadata.get("labels") or {}
+    status = pod.get("status") or {}
+    statuses = [*(status.get("initContainerStatuses") or []), *(status.get("containerStatuses") or [])]
+    generation = str(
+        annotations.get(EXECUTION_GENERATION_ANNOTATION) or labels.get(EXECUTION_GENERATION_ANNOTATION) or "0"
+    )
+    name = str(metadata.get("name", ""))
+    row = rows.get(name)
+    return SandboxPodExecution(
+        pod_name=name,
+        uid=str(metadata.get("uid", "")),
+        sandbox_id=str(annotations.get(SANDBOX_ID_LABEL) or labels.get(SANDBOX_ID_LABEL) or ""),
+        generation=int(generation) if generation.isdigit() else 0,
+        phase=str(status.get("phase", "")),
+        all_containers_terminated=bool(status.get("containerStatuses"))
+        and all("terminated" in (s.get("state") or {}) for s in statuses),
+        pod_ip=str(status.get("podIP") or ""),
+        sandbox_not_ready=any(
+            c.get("type") == "PodReadyToStartContainers" and c.get("status") == "False"
+            for c in status.get("conditions") or []
+        ),
+        is_restore=any(
+            key in annotations
+            for key in (CHECKPOINT_ANNOTATION, RESTORE_SOURCE_NODE_ANNOTATION, RESTORE_STORAGE_URI_ANNOTATION)
+        ),
+        deleting=bool(metadata.get("deletionTimestamp")),
+        row_sandbox_id=row[0] if row else None,
+        row_generation=row[1] if row else None,
+        row_state=row[2] if row else None,
+        row_active=row[3] if row else None,
     )
 
 

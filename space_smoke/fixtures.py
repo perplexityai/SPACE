@@ -29,6 +29,7 @@ from space_smoke.capabilities import (
     PendingBackupControl,
     TeardownRestartControl,
     OrphanedRestorePodGcControl,
+    RetiredExecutionPodGcControl,
     ReconcileQueueGcControl,
     UnansweredTemplateEvictionControl,
     TemplateBuildControl,
@@ -106,6 +107,7 @@ from space_smoke.node_groups import NodeGroupAssertions
 from space_smoke.node_fence import NodeFenceAssertions
 from space_smoke.node_selector_extras import NodeSelectorExtrasAssertions
 from space_smoke.orphaned_restore_pod_gc import OrphanedRestorePodGcAssertions
+from space_smoke.retired_execution_pod_gc import RetiredExecutionPodGcAssertions
 from space_smoke.unanswered_template_eviction import UnansweredTemplateEvictionAssertions
 from space_smoke.pending_backup import PendingBackupAssertions
 from space_smoke.teardown_restart import TeardownRestartAssertions
@@ -2946,6 +2948,28 @@ class KindEcw(Ecw):
                 self, self._orphaned_restore_pod_gc_control, self._context.scope
             )
         return self._orphaned_restore_pod_gc_assertions
+
+    _retired_execution_pod_gc_control: RetiredExecutionPodGcControl | None = None
+    _retired_execution_pod_gc_assertions: RetiredExecutionPodGcAssertions | None = None
+
+    @property
+    def retired_execution_pod_gc(self) -> RetiredExecutionPodGcAssertions:
+        """Privileged assertions for the cluster-controller's retired-execution-pod GC."""
+
+        if self._retired_execution_pod_gc_control is None or self._sandboxes is None:
+            raise SmokeConfigurationError(
+                "retired-execution-pod GC control is only available on the kind backend"
+            )
+        if self._retired_execution_pod_gc_assertions is None:
+            sandboxes = self._sandboxes
+            self._retired_execution_pod_gc_assertions = RetiredExecutionPodGcAssertions(
+                self,
+                self._retired_execution_pod_gc_control,
+                self._context.scope,
+                # Off the scenario thread: the tracked raw create, without a phase.
+                lambda absent: sandboxes.attempt_create(confirmed_absent=absent),
+            )
+        return self._retired_execution_pod_gc_assertions
 
     _unanswered_template_control: UnansweredTemplateEvictionControl | None = None
     _unanswered_template_assertions: UnansweredTemplateEvictionAssertions | None = None
