@@ -148,14 +148,30 @@ class NodeMemoryAdmissionAssertions:
         self._restores.append((name, restore, restored, compensation))
 
     def restore_standing(self) -> None:
-        """Put every knob back, check each took, then release the Leases."""
+        """Put every knob back, check each took, then release the Leases.
 
-        while self._restores:
-            name, restore, restored, compensation = self._restores[-1]
-            restore()
-            self._fixture.verify(restored(), f"the standing {name} did not come back")
+        Every knob is attempted even when an earlier one fails, so one stuck
+        rollout can't leave node-manager refusing. A knob that fails keeps its
+        compensation armed and the Leases stay held for the scope to retry and
+        release, and the first failure is raised once all were tried.
+        """
+
+        failures: list[BaseException] = []
+        pending = []
+        for name, restore, restored, compensation in reversed(self._restores):
+            try:
+                restore()
+                self._fixture.verify(restored(), f"the standing {name} did not come back")
+            except Exception as error:  # noqa: BLE001 - raised below once every knob was tried
+                failures.append(error)
+                pending.append((name, restore, restored, compensation))
+                continue
             compensation.disarm()
-            self._restores.pop()
+        self._restores = list(reversed(pending))
+        if failures:
+            for later in failures[1:]:
+                failures[0].add_note(f"restoring another knob also failed: {later!r}")
+            raise failures[0]
         while self._held:
             self._held.pop().release()
 
