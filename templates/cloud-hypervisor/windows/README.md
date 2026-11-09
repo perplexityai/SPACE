@@ -183,7 +183,8 @@ Build with an explicit Cargo target and a matching cross-toolchain:
 
 ```sh
 cargo build --locked --release --target x86_64-pc-windows-gnu \
-  -p pplx-space-spaced-guest-svc --bin spaced-svc --no-default-features
+  -p pplx-space-spaced-guest-svc -p pplx-space-spaced-guest-cli \
+  --bin spaced-svc --bin spaced --no-default-features
 ```
 
 Use a MinGW-w64 linker for Windows GNU or a native Windows MSVC toolchain for
@@ -348,3 +349,41 @@ path: current guest-image admission refuses these images on control-plane-manage
 nodes. The standalone operator probe does not qualify that path. Retain it until
 a public-API scenario has passed against an authorized Windows test deployment;
 do not remove the admission restriction merely to run the scenario.
+
+
+## Guest update workstream
+
+Windows guest updates are under development. Existing images and host update
+policy still refuse this backend; publishing a descriptor does not enable it.
+The bundle publisher accepts `--platform windows --arch x86_64`, hashes
+`spaced-svc.exe` and `spaced.exe`, and records the reserved
+`windows-scm-two-slot-v1` recovery contract. Its schema-1 canonical encoding and
+logical service/CLI payload roles are unchanged. Linux remains the default.
+This packaging path requires both Windows executables from the build above.
+The native `spaced.exe --version` reports the workspace version, and
+`spaced.exe status` queries the installed service's SCM state and PID without
+requesting start/stop privileges. A Running state is not a live RPC probe.
+The Unix activity/shutdown commands are not exposed by this Windows CLI.
+
+The implementation must retain the existing update RPC meanings, fencing,
+release versions, and host SQLite receipts. Windows paths remain local to the
+Windows backend. Current Linux selectors and host policy must continue to
+reject Windows bundles. No Windows capability is advertised until the native
+recovery path and its image have been qualified.
+
+The next implementation boundary is local recovery. Unlike the Linux
+pre-start selector, SCM start checkpoints and wait hints do not supply the
+independent bounded trial supervisor this feature requires. See Microsoft's
+[service startup contract](https://learn.microsoft.com/en-us/windows/win32/services/service-startup).
+The recovery design must kill a hung candidate, select the committed bundle
+after a crash or reboot, and release every mapped executable before reusing
+its slot. It must keep at most two agent bundles. Any separate template-owned
+bootstrap must be small, have an explicit compatibility contract, and have a
+documented replacement policy; copying an entire old agent into a permanent
+launcher would undermine the storage bound.
+
+Before enabling the backend, prove durable commit and rollback on NTFS, shared
+process/filesystem admission, Job Object descendant termination under force,
+empty-environment configuration, and boot/deadline identity across CH pause,
+restore and fork. Native Windows unit tests and cross-compilation are useful
+component checks; they do not qualify those VM lifecycle guarantees.

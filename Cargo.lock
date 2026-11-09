@@ -7683,6 +7683,7 @@ dependencies = [
  "pplx-space-common-cli",
  "pplx-space-common-core",
  "pplx-space-spaced-guest-client",
+ "pplx-space-spaced-guest-windows",
  "tokio",
 ]
 

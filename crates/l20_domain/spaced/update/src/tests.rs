@@ -277,45 +277,67 @@ fn descriptor_identity_is_canonical_and_excludes_promotion() {
 
 #[test]
 fn publisher_bytes_are_the_descriptor_identity() {
-    let directory = tempfile::tempdir().unwrap();
-    for name in ["spaced", "spaced-svc"] {
-        std::fs::write(directory.path().join(name), b"synthetic agent").unwrap();
+    for (platform, suffix, contract) in [
+        ("linux", "", "linux-systemd-selector-v1"),
+        ("windows", ".exe", "windows-scm-two-slot-v1"),
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        for (name, bytes) in [
+            ("spaced", b"synthetic cli".as_slice()),
+            ("spaced-svc", b"synthetic service".as_slice()),
+        ] {
+            std::fs::write(directory.path().join(format!("{name}{suffix}")), bytes).unwrap();
+        }
+        let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../../scripts/build/agent-bundle.py");
+        let mut command = std::process::Command::new("python3");
+        command.arg(script).arg(directory.path());
+        // Existing publishers omit this flag and must retain Linux identity.
+        if platform == "windows" {
+            command.args(["--platform", platform]);
+        }
+        let output = command
+            .args([
+                "--revision",
+                &"a".repeat(40),
+                "--built-at",
+                "2026-01-01T00:00:00Z",
+                "--version",
+                "0.8.1",
+                "--guest-update-required-since",
+                "0.8.1",
+                "--arch",
+                "x86_64",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let bytes = std::fs::read(directory.path().join("artifact.json")).unwrap();
+        let descriptor = BundleDescriptor::parse(&bytes).unwrap();
+        assert_eq!(descriptor.seed_contracts, [contract]);
+        for binary in Binary::ALL {
+            assert_eq!(
+                descriptor.binary(binary).digest,
+                ArtifactDigest::of_bytes(match binary {
+                    Binary::Service => b"synthetic service",
+                    Binary::Cli => b"synthetic cli",
+                })
+            );
+        }
+        assert_eq!(
+            ArtifactDigest::of_bytes(&bytes),
+            descriptor.digest().unwrap()
+        );
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap().trim(),
+            descriptor.digest().unwrap().to_string()
+        );
+        let alternate = serde_json::to_vec_pretty(&descriptor).unwrap();
+        BundleDescriptor::parse(&alternate)
+            .expect_err("different bytes must not silently acquire a canonical digest");
     }
-    let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../../../scripts/build/agent-bundle.py");
-    let output = std::process::Command::new("python3")
-        .arg(script)
-        .arg(directory.path())
-        .args([
-            "--revision",
-            &"a".repeat(40),
-            "--built-at",
-            "2026-01-01T00:00:00Z",
-            "--version",
-            "0.8.1",
-            "--guest-update-required-since",
-            "0.8.1",
-            "--arch",
-            "x86_64",
-        ])
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let bytes = std::fs::read(directory.path().join("artifact.json")).unwrap();
-    let descriptor = BundleDescriptor::parse(&bytes).unwrap();
-    assert_eq!(
-        ArtifactDigest::of_bytes(&bytes),
-        descriptor.digest().unwrap()
-    );
-    assert_eq!(
-        String::from_utf8(output.stdout).unwrap().trim(),
-        descriptor.digest().unwrap().to_string()
-    );
-    let alternate = serde_json::to_vec_pretty(&descriptor).unwrap();
-    BundleDescriptor::parse(&alternate)
-        .expect_err("different bytes must not silently acquire a canonical digest");
 }
