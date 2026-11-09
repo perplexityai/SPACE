@@ -429,6 +429,19 @@ for git_sha_file in /space/etc/build-git-sha /etc/space/build-git-sha; do
   fi
 done
 
+# An updater-capable release supplies its immutable descriptor with the binary
+# pair. Legacy/local binary-only builds retain their existing regular-file ABI.
+if [[ -f /guest-bin/artifact.json ]]; then
+  mkdir -p "${CHROOT}/var/lib/spaced/slots/a" "${CHROOT}/var/lib/spaced/slots/b" "${CHROOT}/etc/spaced"
+  for bin in spaced-svc spaced; do
+    mv "${CHROOT}/usr/local/bin/$bin" "${CHROOT}/var/lib/spaced/slots/a/$bin"
+    ln -s "/var/lib/spaced/current/$bin" "${CHROOT}/usr/local/bin/$bin"
+  done
+  cp /guest-bin/artifact.json "${CHROOT}/var/lib/spaced/slots/a/artifact.json"
+  /guest-bin/spaced-svc --initialize-update "${CHROOT}/var/lib/spaced"
+  printf '%s\n' linux-systemd-selector-v1 > "${CHROOT}/etc/spaced/update-contract"
+fi
+
 # ── Chroot: configure seed ───────────────────────────────────────────────────
 echo "=== Configuring seed in chroot ==="
 chroot "${CHROOT}" /bin/bash -c "
@@ -457,7 +470,7 @@ rm -rf /etc/cloud /var/lib/cloud
 DEBIAN_FRONTEND=noninteractive apt-get install -y \
   -o Dpkg::Options::=--force-confdef \
   -o Dpkg::Options::=--force-confold \
-  openssh-server sudo curl ca-certificates procps iproute2 \
+  openssh-server sudo curl ca-certificates procps iproute2 gnu-coreutils \
   || dpkg --configure -a
 apt-get autoremove -y 2>/dev/null || true
 
@@ -644,6 +657,7 @@ if [ -f /usr/local/bin/spaced-svc ]; then
 Description=SPACE API workloads (started by spaced)
 DefaultDependencies=no
 PartOf=spaced.service
+StartLimitIntervalSec=0
 Before=shutdown.target
 Conflicts=shutdown.target
 
@@ -651,9 +665,9 @@ Conflicts=shutdown.target
 Slice=space.slice
 # systemd removes an empty cgroup, so a process holds this one open, in a
 # subgroup of its own: the unit's root must hold no processes for spaced to
-# enable controllers on it. spaced-svc itself is the holder: it is in every
-# guest bundle, where an OCI image may have no sleep.
-ExecStart=/usr/local/bin/spaced-svc --hold-cgroup
+# enable controllers on it. GNU sleep is shipped by the guest bundle; keeping
+# it independent of both agent slots allows either obsolete slot to be reused.
+ExecStart=/usr/bin/gnusleep infinity
 Delegate=yes
 DelegateSubgroup=holder
 Restart=always
@@ -734,6 +748,9 @@ ExecStartPre=-/bin/mknod -m 666 /dev/vsock c 10 241
 # builder kernel's /sys.
 ExecStartPre=/bin/sh -c 'test -d /sys/kernel/mm/transparent_hugepage || exit 0; echo madvise > /sys/kernel/mm/transparent_hugepage/enabled && echo never > /sys/kernel/mm/transparent_hugepage/defrag && echo 0 > /sys/kernel/mm/transparent_hugepage/khugepaged/defrag'
 ExecStart=/usr/local/bin/spaced-svc
+# A failed dependency stop can deactivate the snapshot-readiness target.
+# Queue its restoration after the daemon has reached readiness.
+ExecStartPost=/usr/bin/systemctl --no-block start space.target
 Restart=always
 RestartSec=2
 # The default KillMode (control-group) kills every process left in the unit's
@@ -747,6 +764,16 @@ StandardError=journal+console
 [Install]
 WantedBy=space.target
 SVCEOF
+  /usr/bin/gnusleep --version >/dev/null
+  if [ -f /etc/spaced/update-contract ]; then
+    mkdir -p /etc/systemd/system/spaced.service.d
+    cat > /etc/systemd/system/spaced.service.d/10-update-selector.conf <<'SELECTOREOF'
+[Service]
+# Permanent seed ABI: short selector from the last committed release. PID 1
+# reaps a failed/unready candidate before this selector chooses the fallback.
+ExecStartPre=/var/lib/spaced/committed/spaced-svc --select
+SELECTOREOF
+  fi
   systemctl enable spaced.service 2>/dev/null || true
 fi
 

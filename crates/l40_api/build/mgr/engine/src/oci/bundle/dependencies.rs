@@ -20,6 +20,7 @@ const DEPENDENCY_SCAN_ROOTS: &[&str] = &[
     "usr/local/bin",
     "usr/local/sbin",
     "usr/sbin",
+    "var/lib/spaced",
 ];
 
 pub(super) fn bundle_entries(
