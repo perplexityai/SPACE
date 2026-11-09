@@ -23,6 +23,8 @@ CREATE_END_SECONDS = 240
     # attempts), two API restarts, two controller rollouts there and back, and
     # the survival windows.
     sandbox=smoke.SandboxConfig(timeout=1800),
+    # The cleanup runs right after the controller rolls back to its standing env.
+    cleanup_timeout_seconds=600,
 )
 def retired_execution_pod_gc_reaps_retired_pods(test: smoke.KindEcw) -> None:
     """A node-side idle suspend leaves a Succeeded pod, and a cold create

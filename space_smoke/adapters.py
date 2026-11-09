@@ -5595,6 +5595,17 @@ ON CONFLICT (key_hash) DO NOTHING;
         )
         return bool(out.strip())
 
+    def force_delete_sandbox(self, sandbox_id: str) -> None:
+        from space_smoke.console import public_sandbox_id
+
+        answer = self.console_api(
+            "POST",
+            f"/admin/api/v1/sandboxes/{public_sandbox_id(sandbox_id)}:force-delete",
+            idempotency_key=str(uuid.uuid4()),
+        )
+        if answer.status not in (200, 202, 404):
+            raise RuntimeError(f"admin force-delete of {sandbox_id} answered HTTP {answer.status}")
+
     def run_sandbox_ids(self, sibling_sandbox_id: str) -> list[str]:
         out = self._psql(
             "SELECT s.id FROM sandboxes s, sandboxes sibling "

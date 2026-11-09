@@ -337,6 +337,7 @@ class RetiredExecutionPodGcAssertions:
             if outcome == "replaced":
                 return self._pod(name, REPLACED_NEVER_STARTED), work
             work.join(timeout=self.STRAND_TIMEOUT_SECONDS)
+            self._remove_sandbox(sandbox_id)
         self._fixture.verify(False, "no cold create was stranded `replaced` in its Pending pod", attempts=self.STRAND_ATTEMPTS)
         raise AssertionError("unreachable")
 
@@ -348,6 +349,15 @@ class RetiredExecutionPodGcAssertions:
             self._attempt_create(confirmed_absent)
         except Exception:  # noqa: BLE001 - the outcome is judged from state
             pass
+
+    def _remove_sandbox(self, sandbox_id: str) -> None:
+        # A create the retry won is a live sandbox; deleting it now keeps the
+        # end-of-run cleanup, which runs right after the controller rollout, light.
+        self._control.force_delete_sandbox(sandbox_id)
+        deadline = time.monotonic() + 120
+        while self._control.sandbox_row_exists(sandbox_id):
+            self._fixture.verify(time.monotonic() < deadline, "a create the retry won was not deleted", sandbox_id=sandbox_id)
+            self._fixture.wait(1)
 
     def _wait_new_run_sandbox(self, known: set[str]) -> str:
         deadline = time.monotonic() + 60

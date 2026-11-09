@@ -863,6 +863,10 @@ class RetiredExecutionPodGcControl(Protocol):
         """Whether the control plane still has the sandbox's row."""
         ...
 
+    def force_delete_sandbox(self, sandbox_id: str) -> None:
+        """Have the admin API force-delete the sandbox; returns once it accepted."""
+        ...
+
     def run_sandbox_ids(self, sibling_sandbox_id: str) -> list[str]:
         """Every sandbox id carrying the same smoke run marker as the sibling's row."""
         ...
