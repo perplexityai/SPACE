@@ -4,6 +4,22 @@ package space.spaced.host.v1;
 import "google/protobuf/duration.proto";
 import "google/protobuf/timestamp.proto";
 import "spaced/operations/v1/operations.proto";
+import "spaced/update/v1/update.proto";
+
+// Only sandbox-manager authorizes operations; this listener executes its fenced
+// instructions under the existing root/sandbox-manager UDS authorization.
+service GuestUpdate {
+  rpc GetStatus(space.spaced.update.v1.StatusRequest) returns (space.spaced.update.v1.Status);
+  rpc Subscribe(space.spaced.update.v1.StatusRequest) returns (stream space.spaced.update.v1.Status);
+  rpc Hold(space.spaced.update.v1.HoldRequest) returns (space.spaced.update.v1.Status);
+  rpc Release(space.spaced.update.v1.ReleaseRequest) returns (space.spaced.update.v1.Status);
+  rpc Stage(stream space.spaced.update.v1.StageRequest) returns (space.spaced.update.v1.Status);
+  rpc Arm(space.spaced.update.v1.ArmRequest) returns (space.spaced.update.v1.Status);
+  rpc Configure(space.spaced.update.v1.ConfigureRequest) returns (space.spaced.update.v1.Status);
+  rpc Commit(space.spaced.update.v1.CommitRequest) returns (space.spaced.update.v1.Status);
+  rpc Abort(space.spaced.update.v1.AbortRequest) returns (space.spaced.update.v1.Status);
+  rpc Restart(space.spaced.update.v1.RestartRequest) returns (space.spaced.update.v1.Status);
+}
 
 // Host-side API exposed by spaced-host-svc on a host-local UDS.
 service Meta {

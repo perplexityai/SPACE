@@ -1,0 +1,120 @@
+syntax = "proto3";
+package space.spaced.update.v1;
+
+// Maintenance messages are independent of ordinary service readiness. Missing
+// capability or Unimplemented forbids updates; it never authorizes exec fallback.
+message StatusRequest {}
+message Status {
+  string seed_contract = 1;
+  string boot_id = 2;
+  string incarnation = 3;
+  Phase phase = 4;
+  Selection committed = 5;
+  Attempt attempt = 6;
+  TrialProgress progress = 7;
+  bool customer_admission_held = 8;
+  repeated DeferReason defer_reasons = 9;
+  RestartReceipt restart = 10;
+  uint64 boot_time_ms = 11;
+  repeated uint32 forward_ports = 12;
+  // Selected executable, distinct from the committed fallback during abort.
+  Selection running = 13;
+  string committed_version = 14;
+}
+enum Phase {
+  PHASE_UNSPECIFIED = 0;
+  PHASE_STABLE = 1;
+  PHASE_STAGED = 2;
+  PHASE_ARMED = 3;
+  PHASE_TRIAL = 4;
+  PHASE_COMMITTED = 5;
+  PHASE_ROLLED_BACK = 6;
+  PHASE_RECOVERY_REQUIRED = 7;
+  PHASE_RESTARTING = 8;
+  PHASE_RESTARTED = 9;
+}
+enum Slot { SLOT_UNSPECIFIED = 0; SLOT_A = 1; SLOT_B = 2; }
+enum Binary { BINARY_UNSPECIFIED = 0; BINARY_SERVICE = 1; BINARY_CLI = 2; }
+enum TrialProgress { TRIAL_PROGRESS_UNSPECIFIED = 0; TRIAL_PROGRESS_STARTING = 1; TRIAL_PROGRESS_AWAITING_HOST = 2; }
+enum DeferReason {
+  DEFER_REASON_UNSPECIFIED = 0;
+  DEFER_REASON_OPERATIONS = 1;
+  DEFER_REASON_RETAINED_PROCESSES = 2;
+  DEFER_REASON_RETRY_RECORDS = 3;
+  DEFER_REASON_DESCENDANTS = 4;
+  DEFER_REASON_FORWARDING = 5;
+  DEFER_REASON_WATCHES = 6;
+  DEFER_REASON_LIFECYCLE = 7;
+  DEFER_REASON_COMPATIBILITY = 8;
+  DEFER_REASON_FILESYSTEM = 9;
+}
+message Selection { Slot slot = 1; string digest = 2; }
+message Attempt {
+  string operation_id = 1;
+  string execution_id = 2;
+  string boot_id = 3;
+  string incarnation = 4;
+  uint64 configuration_revision = 5;
+  Selection target = 6;
+  // Guest CLOCK_BOOTTIME, valid only for boot_id. Zero is invalid.
+  uint64 confirmation_deadline_ms = 7;
+}
+message BinaryIdentity { uint64 length = 1; string digest = 2; }
+message BundleDescriptor {
+  uint32 schema = 1;
+  string source_revision = 2;
+  string built_at = 3;
+  string version = 4;
+  string compatibility_family = 5;
+  string architecture = 6;
+  repeated string seed_contracts = 7;
+  BinaryIdentity service = 8;
+  BinaryIdentity cli = 9;
+  string guest_update_required_since = 10;
+}
+enum SelectionIntent { SELECTION_INTENT_UNSPECIFIED = 0; SELECTION_INTENT_UPGRADE = 1; SELECTION_INTENT_ROLLBACK = 2; }
+message Promotion {
+  string channel = 1;
+  reserved 2; // Unreleased promotion generation; workspace versions order releases.
+  string target_digest = 3;
+  string minimum_host = 4;
+  string maximum_guest = 5;
+  string target_version = 6;
+  string guest_update_required_since = 7;
+  SelectionIntent intent = 8;
+}
+message StageHeader { BundleDescriptor descriptor = 1; Attempt attempt = 2; }
+message Chunk { Binary binary = 1; uint64 offset = 2; bytes data = 3; }
+message StageRequest { oneof part { StageHeader header = 1; Chunk chunk = 2; } }
+message ArmRequest { Attempt attempt = 1; bool force = 2; }
+message CommitRequest { Attempt attempt = 1; }
+message AbortRequest { Attempt attempt = 1; }
+message RestartRequest {
+  string operation_id = 1;
+  string execution_id = 2;
+  string expected_boot_id = 3;
+  string expected_incarnation = 4;
+  bool force = 5;
+}
+message RestartReceipt {
+  string operation_id = 1;
+  string execution_id = 2;
+  string boot_id = 3;
+  string previous_incarnation = 4;
+}
+message ConfigureRequest {
+  Attempt attempt = 1;
+  // Empty maps replace old configuration as well.
+  map<string, string> environment = 2;
+  // Complete forwarding set, including empty. Maintenance can configure these
+  // before readiness; forwarded customer connections remain admission-gated.
+  repeated uint32 forward_ports = 3;
+  // Committed-generation configuration uses these instead of attempt. The
+  // host still owns an admission hold; ordinary guest boot never waits for it.
+  HoldRequest owner = 4;
+  string expected_incarnation = 5;
+  uint64 configuration_revision = 6;
+  string expected_boot_id = 7;
+}
+message HoldRequest { string operation_id = 1; string execution_id = 2; }
+message ReleaseRequest { HoldRequest owner = 1; string expected_incarnation = 2; uint64 configuration_revision = 3; }

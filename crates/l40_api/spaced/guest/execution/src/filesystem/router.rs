@@ -169,6 +169,23 @@ impl std::fmt::Debug for FilesystemHandle {
 }
 
 impl FilesystemHandle {
+    pub(crate) async fn has_update_obligations(&self) -> bool {
+        if self.operations.has_live_records() || !self.tasks.is_empty() {
+            return true;
+        }
+        match &self.backend {
+            // Updates are qualified only for the isolated Linux worker backend.
+            Backend::Direct(_) => true,
+            #[cfg(target_os = "linux")]
+            Backend::Workers(pool) => {
+                self.prune_watcher_routes().await;
+                !self.watcher_routes.lock().await.is_empty()
+                    || !self.ledger_evidence.lock().await.is_empty()
+                    || pool.has_update_obligations().await
+            }
+        }
+    }
+
     pub(crate) fn with_native_upload_idle_timeout(mut self, timeout: std::time::Duration) -> Self {
         self.native_upload_idle_timeout = timeout;
         self

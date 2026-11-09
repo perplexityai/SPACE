@@ -27,6 +27,7 @@ pplx-space-guest-process = { workspace = true }
 tower = { workspace = true }
 http-body = { workspace = true }
 thiserror = { workspace = true }
+uuid = { workspace = true }
 futures-util = { version = "0.3" }
 tokio = { workspace = true, features = ["fs", "macros", "net", "rt", "time"] }
 tokio-stream = { workspace = true, features = ["net"] }

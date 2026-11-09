@@ -37,6 +37,12 @@ struct RejectionDiagnostics {
 }
 
 impl IdempotencyStore {
+    pub(super) fn has_live_records(&self) -> bool {
+        let mut state = self.state();
+        state.prune(Instant::now());
+        !state.records.is_empty()
+    }
+
     pub(super) fn new(scope: &'static str) -> Self {
         Self {
             scope,
