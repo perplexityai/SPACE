@@ -87,6 +87,7 @@ pub(super) fn test_health() -> SandboxHealth {
         lifecycle_epoch: 0,
         next_health_probe_at: Instant::now(),
         health_probe_sequence: 0,
+        firecracker_timeout_streak: 0,
         last_console_tail_at: None,
         guest_unresponsive: None,
         node_lease_backoff: None,
@@ -1980,4 +1981,38 @@ async fn other_launch_failures_retry_every_sweep_without_backoff() {
 
     assert_eq!(fixture.sweep_for(6).await.len(), 6);
     assert!(fixture.backoff().await.is_none());
+}
+
+#[test]
+fn timeout_backoff_probe_delay_stays_below_stale_window() {
+    for sequence in 0..64 {
+        let delay = timeout_backoff_probe_delay("sbx", sequence);
+        assert!(delay >= HEALTH_PROBE_MIN_INTERVAL + HEALTH_PROBE_TIMEOUT_BACKOFF_EXTRA);
+        // Leave at least a few sweeps of slack before health would read stale.
+        assert!(delay + 3 * HEALTH_SCHEDULER_TICK < HEALTH_STALE_AFTER);
+    }
+}
+
+#[test]
+fn firecracker_probe_outcome_extends_next_probe_only_while_timeouts_repeat() {
+    let mut health = test_health();
+    let scheduled = Instant::now() + HEALTH_PROBE_MIN_INTERVAL;
+    health.next_health_probe_at = scheduled;
+
+    record_firecracker_probe_outcome(&mut health, "sbx", HealthProbeOutcome::Timeout);
+    assert_eq!(health.firecracker_timeout_streak, 1);
+    assert_eq!(health.next_health_probe_at, scheduled);
+
+    let before = Instant::now();
+    record_firecracker_probe_outcome(&mut health, "sbx", HealthProbeOutcome::Timeout);
+    let after = Instant::now();
+    assert_eq!(health.firecracker_timeout_streak, 2);
+    // One regular jittered interval plus the extra backoff, from the second timeout.
+    let shortest = HEALTH_PROBE_MIN_INTERVAL + HEALTH_PROBE_TIMEOUT_BACKOFF_EXTRA;
+    let longest = shortest + Duration::from_secs(HEALTH_PROBE_JITTER_RANGE_SECS);
+    assert!(health.next_health_probe_at >= before + shortest);
+    assert!(health.next_health_probe_at <= after + longest);
+
+    record_firecracker_probe_outcome(&mut health, "sbx", HealthProbeOutcome::Success);
+    assert_eq!(health.firecracker_timeout_streak, 0);
 }

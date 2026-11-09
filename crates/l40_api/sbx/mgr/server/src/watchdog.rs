@@ -57,6 +57,16 @@ const HEALTH_FAILURE_THRESHOLD: usize = 2;
 const HEALTH_SUCCESS_THRESHOLD: usize = 2;
 const GUEST_HEALTH_FAILURE_THRESHOLD: u32 = 3;
 const HEALTH_STALE_AFTER: Duration = Duration::from_secs(72);
+/// From this many consecutive Firecracker state timeouts on, the sandbox's
+/// next composed probe waits an extra [`HEALTH_PROBE_TIMEOUT_BACKOFF_EXTRA`]
+/// on top of the regular jittered interval.
+/// Node-manager answers a timed-out state read only after its own deadline,
+/// so repeating it on the regular cadence adds load to a host that is already
+/// slow. The backed-off interval leaves a wide margin below
+/// [`HEALTH_STALE_AFTER`] for a slow sweep, so backed-off health is not
+/// reported stale.
+const HEALTH_PROBE_TIMEOUT_BACKOFF_STREAK: u32 = 2;
+const HEALTH_PROBE_TIMEOUT_BACKOFF_EXTRA: Duration = Duration::from_secs(12);
 const HEALTH_PROBE_CONCURRENCY: usize = 32;
 const SPACED_HOST_HEALTH_TIMEOUT: Duration = Duration::from_millis(250);
 const SPACED_GUEST_HEALTH_TIMEOUT: Duration = Duration::from_millis(500);
@@ -546,6 +556,8 @@ pub struct SandboxHealth {
     lifecycle_epoch: u64,
     next_health_probe_at: Instant,
     health_probe_sequence: u64,
+    /// Consecutive composed probes whose Firecracker state read timed out.
+    firecracker_timeout_streak: u32,
     /// When a degraded transition last carried console tails, so a flapping
     /// sandbox cannot repeat them more often than
     /// `diagnostics::CONSOLE_TAIL_MIN_INTERVAL`.
@@ -982,6 +994,7 @@ impl SandboxWatchdog {
             lifecycle_epoch: 0,
             next_health_probe_at: now + initial_health_probe_delay(&id),
             health_probe_sequence: 0,
+            firecracker_timeout_streak: 0,
             last_console_tail_at: None,
             guest_unresponsive: None,
             node_lease_backoff: None,
@@ -2683,13 +2696,11 @@ async fn probe_firecracker_health(
         }
     };
     match crate::runtime_via_nodemgr::get_vm_state(sandbox_id, node_manager).await {
-        Err(crate::runtime_via_nodemgr::RuntimeStateReadError::Timeout { .. }) => {
-            health_observation(
-                started,
-                HealthProbeOutcome::Timeout,
-                "Firecracker state request timed out",
-            )
-        }
+        Err(error) if error.is_timeout() => health_observation(
+            started,
+            HealthProbeOutcome::Timeout,
+            "Firecracker state request timed out",
+        ),
         Err(error) => health_observation(
             started,
             HealthProbeOutcome::Unavailable,
@@ -2973,6 +2984,28 @@ async fn apply_and_reconcile_composed_health_result(
     transition
 }
 
+/// Tracks consecutive Firecracker state timeouts and pushes the sandbox's
+/// next probe out while they continue.
+fn record_firecracker_probe_outcome(
+    health: &mut SandboxHealth,
+    sandbox_id: &str,
+    outcome: HealthProbeOutcome,
+) {
+    if outcome != HealthProbeOutcome::Timeout {
+        health.firecracker_timeout_streak = 0;
+        return;
+    }
+    health.firecracker_timeout_streak = health.firecracker_timeout_streak.saturating_add(1);
+    if health.firecracker_timeout_streak >= HEALTH_PROBE_TIMEOUT_BACKOFF_STREAK {
+        let backoff = timeout_backoff_probe_delay(sandbox_id, health.health_probe_sequence);
+        health.next_health_probe_at = health.next_health_probe_at.max(Instant::now() + backoff);
+    }
+}
+
+fn timeout_backoff_probe_delay(sandbox_id: &str, sequence: u64) -> Duration {
+    HEALTH_PROBE_TIMEOUT_BACKOFF_EXTRA + next_health_probe_delay(sandbox_id, sequence)
+}
+
 async fn apply_composed_health_result(
     state: &Arc<Mutex<HashMap<String, SandboxHealth>>>,
     db: &crate::db::SharedConnection,
@@ -3009,6 +3042,9 @@ async fn apply_composed_health_result(
             ));
         }
         let outcome = observation.outcome;
+        if component == HealthComponent::Firecracker {
+            record_firecracker_probe_outcome(health, &sandbox_id, outcome);
+        }
         crate::metrics::sandbox::worker::sandbox_health_probe(
             component.as_metric(),
             outcome.as_metric(),
