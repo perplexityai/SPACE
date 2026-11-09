@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::watch;
 
 use super::*;
 use crate::state::BackendChannelPool;
@@ -20,6 +21,8 @@ struct QuietingProxy {
     /// Connections numbered below this carry nothing.
     quiet_below: Arc<AtomicU64>,
     opened: Arc<AtomicU64>,
+    /// How many connections the client has closed.
+    closed: Arc<watch::Sender<u64>>,
 }
 
 impl QuietingProxy {
@@ -29,24 +32,33 @@ impl QuietingProxy {
             addr: listener.local_addr().unwrap(),
             quiet_below: Arc::default(),
             opened: Arc::default(),
+            closed: Arc::new(watch::Sender::new(0)),
         };
-        let (quiet_below, opened) = (Arc::clone(&proxy.quiet_below), Arc::clone(&proxy.opened));
+        let (quiet_below, opened, closed) = (
+            Arc::clone(&proxy.quiet_below),
+            Arc::clone(&proxy.opened),
+            Arc::clone(&proxy.closed),
+        );
         tokio::spawn(async move {
             while let Ok((client, _)) = listener.accept().await {
                 let number = opened.fetch_add(1, Ordering::SeqCst);
                 let upstream = TcpStream::connect(target).await.unwrap();
                 let (client_read, client_write) = client.into_split();
                 let (upstream_read, upstream_write) = upstream.into_split();
-                for (from, to) in [
-                    (
-                        Box::new(client_read) as Box<dyn tokio::io::AsyncRead + Send + Unpin>,
-                        Box::new(upstream_write) as Box<dyn tokio::io::AsyncWrite + Send + Unpin>,
-                    ),
-                    (Box::new(upstream_read), Box::new(client_write)),
-                ] {
-                    let quiet_below = Arc::clone(&quiet_below);
-                    tokio::spawn(forward(from, to, number, quiet_below));
-                }
+                tokio::spawn(forward(
+                    Box::new(client_read),
+                    Box::new(upstream_write),
+                    number,
+                    Arc::clone(&quiet_below),
+                    Some(Arc::clone(&closed)),
+                ));
+                tokio::spawn(forward(
+                    Box::new(upstream_read),
+                    Box::new(client_write),
+                    number,
+                    Arc::clone(&quiet_below),
+                    None,
+                ));
             }
         });
         proxy
@@ -64,11 +76,12 @@ async fn forward(
     mut to: Box<dyn tokio::io::AsyncWrite + Send + Unpin>,
     number: u64,
     quiet_below: Arc<AtomicU64>,
+    closed: Option<Arc<watch::Sender<u64>>>,
 ) {
     let mut buffer = vec![0; 64 * 1024];
     while let Ok(read) = from.read(&mut buffer).await {
         if read == 0 {
-            return;
+            break;
         }
         if number < quiet_below.load(Ordering::SeqCst) {
             continue;
@@ -76,6 +89,10 @@ async fn forward(
         if to.write_all(&buffer[..read]).await.is_err() {
             return;
         }
+    }
+    // Only the client's side counts closes: the client closed this one.
+    if let Some(closed) = closed {
+        closed.send_modify(|count| *count += 1);
     }
 }
 
@@ -111,10 +128,19 @@ async fn a_connection_whose_far_end_went_quiet_does_not_carry_the_next_call() {
 
     assert_eq!(harness.send(stat(&harness)).await.status(), StatusCode::OK);
     proxy.quiet();
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // Its pings go unanswered, so the client closes the quiet connection
+    // within about 100 ms; the bound only stops a test that never sees it.
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        proxy.closed.subscribe().wait_for(|&closed| closed == 1),
+    )
+    .await
+    .expect("the client closes the connection that went quiet")
+    .unwrap();
 
     // The call goes over a new connection, not the quiet one.
     let (status, _, body) = read_body(harness.send(stat(&harness)).await).await;
     assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
     assert_eq!(harness.worker.calls().len(), 2);
+    assert_eq!(proxy.opened.load(Ordering::SeqCst), 2);
 }
