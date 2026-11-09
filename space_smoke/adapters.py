@@ -202,6 +202,39 @@ def parse_drain_node_sealed_epoch(output: str) -> int | None:
     raise ValueError(f"drain-node output lacks sealed_epoch: {output[:400]!r}")
 
 
+def parse_drain_node_report(output: str) -> dict[str, Any]:
+    """A `space-sbxmgr drain-node` answer in the shape the controller stores
+    as `drain_status.report`, without its `unrecorded` list."""
+
+    report: dict[str, Any] = {
+        "sealed_epoch": parse_drain_node_sealed_epoch(output),
+        "done": False,
+        "evacuated": [],
+        "pending": [],
+        "blocked": [],
+    }
+    for raw in output.splitlines():
+        key, separator, value = raw.strip().partition("=")
+        if not separator:
+            continue
+        if key == "done":
+            report["done"] = value == "true"
+        elif key == "evacuated":
+            sandbox_id, prior, artifact_id = value.split(" ", 2)
+            report["evacuated"].append(
+                {"sandbox_id": sandbox_id, "prior": prior, "artifact_id": artifact_id}
+            )
+        elif key == "pending":
+            sandbox_id, _, action = value.partition(" ")
+            report["pending"].append({"sandbox_id": sandbox_id, "action": action})
+        elif key == "blocked":
+            sandbox_id, _, reason = value.partition(" ")
+            report["blocked"].append(
+                {"sandbox_id": None if sandbox_id == "-" else sandbox_id, "reason": reason}
+            )
+    return report
+
+
 def _env_literals(
     entries: Any, keys: Sequence[str], *, owner: str, value_from_refusal: str
 ) -> dict[str, str | None]:
@@ -770,6 +803,10 @@ K8S_CONTROL_PLANE_ENV = "SPACE_K8S_CONTROL_PLANE"
 KIND_REDIS_DEPLOYMENT = "space-redis"
 KIND_OBJECT_STORE_DEPLOYMENT = "space-object-store"
 KIND_OBJECT_STORE_POD_SELECTOR = "app.kubernetes.io/name=space-object-store"
+KIND_NODE_API_PORT = 9800
+# The node-local paths `block_node_traffic` cuts.
+NODE_TRAFFIC_OBJECT_STORE = "object-store"
+NODE_TRAFFIC_NODE_API = "node-api"
 KIND_INTERNAL_API_SELECTOR = "app.kubernetes.io/name=space-internal-api"
 PENDING_BACKUP_QUEUE_SQL = """\
 SELECT artifact_id::text, artifact_kind FROM node_local_backup_pending
@@ -4442,6 +4479,112 @@ ON CONFLICT (key_hash) DO NOTHING;
             "await the object-store rollout",
         )
 
+    # --- node-local traffic faults (drain v2) -----------------------------------
+    #
+    # A REJECT or DROP rule in one Kind node's own netfilter, tagged so the
+    # unblock removes exactly what the block added: the node's pods and host
+    # processes lose the path, every other node keeps it.
+
+    def block_node_traffic(self, node_name: str, path: str) -> None:
+        self._require_isolated_kind("node traffic faults")
+        for rule in self._node_traffic_rules(node_name, path):
+            if self._docker_exec(node_name, "iptables", "-C", *rule).returncode != 0:
+                _require_ok(
+                    self._docker_exec(node_name, "iptables", "-I", *rule),
+                    f"block {path} on {node_name}",
+                )
+
+    def unblock_node_traffic(self, node_name: str, path: str) -> None:
+        self._require_isolated_kind("node traffic faults")
+        for rule in self._node_traffic_rules(node_name, path):
+            while self._docker_exec(node_name, "iptables", "-C", *rule).returncode == 0:
+                _require_ok(
+                    self._docker_exec(node_name, "iptables", "-D", *rule),
+                    f"unblock {path} on {node_name}",
+                )
+
+    def _node_traffic_rules(self, node_name: str, path: str) -> list[tuple[str, ...]]:
+        tag = ("-m", "comment", "--comment", f"space-smoke-{path}")
+        if path == NODE_TRAFFIC_OBJECT_STORE:
+            # The object store's pod, as the node's pods (FORWARD) and host
+            # processes (OUTPUT) reach it once its Service is translated.
+            listing = self.kubectl(
+                "get", "pods", "-l", KIND_OBJECT_STORE_POD_SELECTOR, "-o", "json", timeout=15
+            )
+            ips = [
+                str((item.get("status") or {}).get("podIP"))
+                for item in json.loads(_require_ok(listing, "list object-store pods") or "{}").get(
+                    "items", []
+                )
+                if (item.get("status") or {}).get("podIP")
+            ]
+            if not ips:
+                raise RuntimeError("the object store has no pod IP to block")
+            return [
+                (chain, "-d", ip, "-p", "tcp", *tag, "-j", "REJECT", "--reject-with", "tcp-reset")
+                for ip in ips
+                for chain in ("FORWARD", "OUTPUT")
+            ]
+        if path == NODE_TRAFFIC_NODE_API:
+            # node-api's host port, unanswered rather than refused: a node
+            # that is up but unreachable.
+            return [("INPUT", "-p", "tcp", "--dport", str(KIND_NODE_API_PORT), *tag, "-j", "DROP")]
+        raise ValueError(f"refusing unknown node traffic path {path!r}")
+
+    def scale_controller(self, replicas: int, *, timeout: float) -> int:
+        """Scale the cluster-controller Deployment and await it; the replicas it had."""
+
+        self._require_isolated_kind("cluster-controller scaling")
+        if not 0 <= replicas <= 2:
+            raise ValueError(f"refusing to scale the cluster-controller to {replicas} replicas")
+        ownership = self._retention_lease_ownership
+        if ownership is None:
+            raise SmokeConfigurationError(
+                "refusing a cluster-controller scale without the caller's live mutation Lease"
+            )
+        self._assert_lease_owned(ownership, "a cluster-controller scale")
+        previous = self.controller_replicas()
+        name = self._controller_deployment()
+        _require_ok(
+            self.kubectl("scale", f"deploy/{name}", f"--replicas={replicas}", timeout=30),
+            f"scale the cluster-controller to {replicas}",
+        )
+        if replicas == 0:
+            deadline = time.monotonic() + timeout
+            while self.controller_pods():
+                if time.monotonic() > deadline:
+                    raise RuntimeError(f"the cluster-controller pods outlived {timeout:.0f}s")
+                time.sleep(2)
+        else:
+            self._await_deployment_rollout(name, timeout=timeout)
+        return previous
+
+    def restart_controller(self, *, timeout: float) -> list[str]:
+        """Kill every cluster-controller pod at once and await its replacements; the killed pods' names."""
+
+        self._require_isolated_kind("cluster-controller restarts")
+        killed = [pod.name for pod in self.controller_pods() if not pod.deleting]
+        _require_ok(
+            self.kubectl(
+                "delete", "pod", "-l", KIND_CONTROLLER_SELECTOR, "--grace-period=1", "--wait=false",
+                timeout=60,
+            ),
+            "delete the cluster-controller pods",
+        )
+        replicas = self.controller_replicas()
+        deadline = time.monotonic() + timeout
+        while True:
+            pods = [pod for pod in self.controller_pods() if not pod.deleting]
+            fresh = [pod for pod in pods if pod.name not in killed and pod.ready]
+            if len(fresh) >= replicas and all(pod.name not in killed for pod in pods):
+                return killed
+            if time.monotonic() > deadline:
+                raise RuntimeError(
+                    f"the cluster-controller did not come back within {timeout:.0f}s "
+                    f"(killed {killed}, now {[(pod.name, pod.ready) for pod in pods]})"
+                )
+            time.sleep(2)
+
     def log_since_time(self) -> str:
         return (datetime.now(UTC) - timedelta(minutes=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -5174,6 +5317,11 @@ ON CONFLICT (key_hash) DO NOTHING;
                     drain_phase=phase if isinstance(phase, str) else None,
                     drain_mode=mode if isinstance(mode, str) else None,
                     sandboxes_active=active if isinstance(active, int) else None,
+                    drain_last_error=(
+                        item["drain_last_error"]
+                        if isinstance(item.get("drain_last_error"), str)
+                        else None
+                    ),
                 )
             )
         return nodes
@@ -6217,7 +6365,7 @@ ON CONFLICT (key_hash) DO NOTHING;
         self._assert_lease_owned(ownership, "a stopped-replacement controller deployment write")
         self._set_deployment_env(self._controller_deployment(), values, timeout=180)
 
-    # --- drain restore hold ----------------------------------------------------
+    # --- drain restore hold and slots -------------------------------------------
     #
     # Thin wrappers; the key list and the value bounds live in
     # `space_smoke.drain_restore`. The controller-mutation Lease is
@@ -6230,7 +6378,7 @@ ON CONFLICT (key_hash) DO NOTHING;
 
     def running_controller_drain_restore_hold_envs(self) -> list[dict[str, str | None]]:
         return self._running_controller_env_literals(
-            DRAIN_RESTORE_HOLD_ENV_KEYS, value_from_refusal="; the scenario reads only a literal hold"
+            DRAIN_RESTORE_HOLD_ENV_KEYS, value_from_refusal="; the scenario reads only literal drain-restore values"
         )
 
     def set_drain_restore_hold_env(self, overrides: Mapping[str, str]) -> None:
@@ -6238,13 +6386,13 @@ ON CONFLICT (key_hash) DO NOTHING;
         self._apply_drain_restore_hold_env(overrides)
 
     def restore_drain_restore_hold_env(self, standing: Mapping[str, str | None]) -> None:
-        # The captured literal goes back verbatim: the hook ignores a value it
-        # cannot parse, and restoring must not change what it reads.
+        # The captured literals go back verbatim: the controller ignores a
+        # value it cannot parse, and restoring must not change what it reads.
         validate_drain_restore_hold_keys(standing)
         self._apply_drain_restore_hold_env(standing)
 
     def _apply_drain_restore_hold_env(self, values: Mapping[str, str | None]) -> None:
-        self._set_controller_env(values, "a drain-restore hold controller deployment write")
+        self._set_controller_env(values, "a drain-restore controller deployment write")
 
     def stopped_residency(self, sandbox_id: str) -> StoppedResidency:
         row = self._psql(
@@ -6295,6 +6443,20 @@ ON CONFLICT (key_hash) DO NOTHING;
         )
         return parse_drain_node_sealed_epoch(
             _require_ok(result, f"seal sandbox-manager activations on {node_name}")
+        )
+
+    def node_drain_report(self, node_name: str, epoch: int) -> dict[str, Any]:
+        ownership = self._cordon_lease_ownership
+        if ownership is None:
+            raise SmokeConfigurationError(
+                "refusing a drain call without the caller's live worker-cordon Lease"
+            )
+        self._assert_lease_owned(ownership, f"asking {node_name} for its drain report")
+        result = self._node_shell_exec(
+            node_name, f"/space/bin/space-sbxmgr drain-node --epoch {int(epoch)}", timeout=90
+        )
+        return parse_drain_node_report(
+            _require_ok(result, f"ask {node_name} for its drain report")
         )
 
     def unseal_activations(self, node_name: str, epoch: int) -> int | None:

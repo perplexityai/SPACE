@@ -1553,6 +1553,7 @@ class AdminNodeView:
     drain_phase: str | None
     drain_mode: str | None
     sandboxes_active: int | None
+    drain_last_error: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1776,11 +1777,11 @@ class DeadNodeControl(NodeDrainControl, Protocol):
 
 
 class DrainRestoreControl(Protocol):
-    """The drain restore operation's test hold on Kind.
+    """The drain restore operation's test hold and slot budget on Kind.
 
-    A scoped override of one cluster-controller env key (closed key list,
-    bounded integer seconds), under the controller-mutation Lease the
-    retention, GC, dead-node and stopped-replacement scenarios share.
+    A scoped override of two cluster-controller env keys (closed key list,
+    bounded integers), under the controller-mutation Lease the retention, GC,
+    dead-node and stopped-replacement scenarios share.
     """
 
     def acquire_controller_mutation(self) -> Callable[[], None]:
@@ -1788,19 +1789,19 @@ class DrainRestoreControl(Protocol):
         ...
 
     def drain_restore_hold_env(self) -> dict[str, str | None]:
-        """The hold's literal on the controller Deployment, None if unset."""
+        """The hold's and the slots' literals on the controller Deployment, None if unset."""
         ...
 
     def running_controller_drain_restore_hold_envs(self) -> list[dict[str, str | None]]:
-        """The same literal on every running, not-terminating controller pod."""
+        """The same literals on every running, not-terminating controller pod."""
         ...
 
     def set_drain_restore_hold_env(self, overrides: Mapping[str, str]) -> None:
-        """Apply the hold and await the controller rollout; refuses keys or values off the lists."""
+        """Apply the hold or the slots and await the controller rollout; refuses keys or values off the lists."""
         ...
 
     def restore_drain_restore_hold_env(self, standing: Mapping[str, str | None]) -> None:
-        """Put the captured literal back (None unsets) and await the controller rollout."""
+        """Put the captured literals back (None unsets) and await the controller rollout."""
         ...
 
 
@@ -1839,6 +1840,12 @@ class DrainV2Control(DeadNodeControl, DrainRestoreControl, Protocol):
         """
         ...
 
+    def node_drain_report(self, node_name: str, epoch: int) -> dict[str, Any]:
+        """`space-sbxmgr drain-node --epoch` on the worker, already sealed
+        under `epoch`, under the caller's worker-cordon Lease: the node's own
+        report, in `drain_status.report`'s shape, which no controller sees."""
+        ...
+
     def unseal_activations(self, node_name: str, epoch: int) -> int | None:
         """`space-sbxmgr drain-node --cancel` on the worker; the epoch it is
         still sealed under, None once unsealed. An unsealed worker stays
@@ -1854,6 +1861,34 @@ class DrainV2Control(DeadNodeControl, DrainRestoreControl, Protocol):
 
     def node_tombstoned(self, node_id: str) -> bool:
         """Whether `node_k8s_tombstones` holds a tombstone for the node id."""
+        ...
+
+    def node_sandbox_state(self, node_name: str, sandbox_id: str) -> str | None:
+        """The sandbox's row state in that node's sandbox-manager, or None without a row."""
+        ...
+
+    def restart_node_service(self, node_name: str, component: str, *, timeout: float) -> str:
+        """Delete that node service's pod and wait for its Ready replacement on the same node."""
+        ...
+
+    def block_node_traffic(self, node_name: str, path: str) -> None:
+        """Cut one node-local path on the Kind node (`object-store`: its pods'
+        and host processes' connections to the object store are reset;
+        `node-api`: connections to its node-api go unanswered)."""
+        ...
+
+    def unblock_node_traffic(self, node_name: str, path: str) -> None:
+        """Remove exactly the rules `block_node_traffic` added for `path`."""
+        ...
+
+    def restart_controller(self, *, timeout: float) -> list[str]:
+        """Kill every cluster-controller pod at once and await Ready
+        replacements; the killed pods' names."""
+        ...
+
+    def scale_controller(self, replicas: int, *, timeout: float) -> int:
+        """Scale the cluster-controller Deployment (0..2) under the caller's
+        controller-mutation Lease and await it; the replicas it had."""
         ...
 
 
