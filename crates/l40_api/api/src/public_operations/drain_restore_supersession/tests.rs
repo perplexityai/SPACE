@@ -121,6 +121,31 @@ async fn admitting_each_kind_cancels_a_waiting_drain_restore_by_its_rule() -> Te
     Ok(())
 }
 
+/// A pause or a resume, which act on the resident VM a suspended sandbox
+/// doesn't have, leave its waiting drain restore queued; a wake, a start, a
+/// restore and a suspend cancel it.
+#[tokio::test(flavor = "current_thread")]
+async fn a_request_for_a_resident_vm_leaves_a_waiting_drain_restore() -> TestResult {
+    let db = pg_test_db().await?;
+    let pool = &db.pool;
+    for (kind, canceled) in [
+        (OperationKind::PauseSandbox, false),
+        (OperationKind::ResumeSandbox, false),
+        (OperationKind::WakeSandbox, true),
+        (OperationKind::StartSandbox, true),
+        (OperationKind::RestoreSandbox, true),
+        (OperationKind::SuspendSandbox, true),
+    ] {
+        let (_, target_id) = sandbox(pool, "suspended").await?;
+        let restore = create(pool, StoredOperationKind::DrainRestoreSandbox, &target_id).await?;
+        back_off(pool, restore).await?;
+        create(pool, StoredOperationKind::Public(kind), &target_id).await?;
+        let expected = if canceled { "canceled" } else { "queued" };
+        assert_eq!(state_of(pool, restore).await?.0, expected, "{kind}");
+    }
+    Ok(())
+}
+
 /// A drain restore a claim holds is left to its attempt, and one that ended
 /// stays as it ended.
 #[tokio::test(flavor = "current_thread")]
@@ -180,6 +205,7 @@ async fn release_cancels_a_restore_a_user_operation_queued_behind() -> TestResul
             Some(OperationKind::UpdateSandbox),
             false,
         ),
+        ("a resume queued", Some(OperationKind::ResumeSandbox), false),
     ] {
         let (_, target_id) = sandbox(pool, "suspended").await?;
         let restore = create(pool, StoredOperationKind::DrainRestoreSandbox, &target_id).await?;
