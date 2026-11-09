@@ -596,8 +596,23 @@ async fn retired_sandbox_keeps_existing_lock_owners_and_waiters_serialized() {
         let before = acquire();
         let weak = std::sync::Arc::downgrade(&before);
         let owner = before.clone().lock_owned().await;
-        let mut waiter = Box::pin(before.clone().lock_owned());
+        let mut contention = before.subscribe_capture_requests();
+        assert!(!contention.has_changed().unwrap());
+        let mut reader = Box::pin(before.clone().lock_owned());
+        assert!(futures_util::poll!(&mut reader).is_pending());
+        assert!(
+            !contention.has_changed().unwrap(),
+            "inventory reads cannot preempt maintenance"
+        );
+        drop(reader);
+        let capture_lock = before.clone();
+        let mut waiter = Box::pin(capture_lock.lock_for_capture());
         assert!(futures_util::poll!(&mut waiter).is_pending());
+        assert!(
+            contention.has_changed().unwrap(),
+            "maintenance must see queued capture"
+        );
+        contention.borrow_and_update();
         coord.remove_sandbox(sandbox_id);
         let after = acquire();
         assert!(std::sync::Arc::ptr_eq(&before, &after));
@@ -605,7 +620,7 @@ async fn retired_sandbox_keeps_existing_lock_owners_and_waiters_serialized() {
         drop(owner);
         let waiter_guard = waiter.await;
         after.try_lock().unwrap_err();
-        drop((before, after));
+        drop((before, after, capture_lock));
         assert!(
             weak.upgrade().is_some(),
             "the guard must retain lock identity"
