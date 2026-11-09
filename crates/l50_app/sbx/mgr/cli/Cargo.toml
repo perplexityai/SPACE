@@ -22,6 +22,11 @@ nix = { workspace = true, features = ["user"] }
 prost-types = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tonic = { workspace = true }
+uuid = { workspace = true, features = ["v7"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+pplx-space-spaced-update = { workspace = true }
+pplx-space-spaced-common = { workspace = true }
 
 # internal
 pplx-space-common-cli = { workspace = true }

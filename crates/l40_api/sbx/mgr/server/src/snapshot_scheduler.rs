@@ -752,14 +752,36 @@ async fn rollback_checkpoint_failure(
     } else {
         None
     };
-    finish_checkpoint_rollback(
+    let error = finish_checkpoint_rollback(
         ctx,
         sandbox_id,
         previous_state,
         checkpoint_error,
         resume_result,
         observation.as_ref().and_then(|value| value.state()),
-    )
+    );
+    reopen_checkpoint_admission(ctx, sandbox_id).await;
+    error
+}
+
+/// Successful capture, failed capture and an ambiguous resume all converge on
+/// the reconciled lifecycle state. Never reconnect into a still-paused VM.
+async fn reopen_checkpoint_admission(ctx: &CheckpointContext, sandbox_id: &str) {
+    let running = lock_db(ctx).is_ok_and(|db| {
+        crate::db::read::sandbox(&db, sandbox_id)
+            .is_ok_and(|row| row.is_some_and(|row| row.state.is_unowned(SandboxState::Started)))
+    });
+    if running
+        && let Err(error) = crate::service::notify_resume_clock_sync_best_effort(
+            sandbox_id,
+            pplx_space_spaced_host_client::proto::ResumeReason::SuspendResume,
+        )
+        .await
+    {
+        // The configuration observer retries while this execution is Started,
+        // under the artifact lock, including after a manager crash/lost reply.
+        tracing::warn!(sandbox_id, %error, "checkpoint resume notification awaits reconciliation");
+    }
 }
 
 fn finish_checkpoint_rollback(
@@ -914,6 +936,7 @@ pub async fn do_checkpoint(
         .await
     {
         restore_checkpoint_state_best_effort(ctx, sandbox_id, SandboxState::Started);
+        reopen_checkpoint_admission(ctx, sandbox_id).await;
         return Err(format!(
             "guest snapshot preparation for checkpoint failed: {e}"
         ));
@@ -1063,6 +1086,9 @@ pub async fn do_checkpoint(
     // 6. Restore state — back to Started if we resumed, back to Paused if we didn't
     if !resume_state_reconciled {
         finish_checkpoint_success(ctx, sandbox_id, previous_state)?;
+    }
+    if previous_state == SandboxState::Started {
+        reopen_checkpoint_admission(ctx, sandbox_id).await;
     }
 
     // 7. Write sidecar metadata for recovery
