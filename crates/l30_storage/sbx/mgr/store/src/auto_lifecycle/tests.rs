@@ -596,8 +596,15 @@ async fn retired_sandbox_keeps_existing_lock_owners_and_waiters_serialized() {
         let before = acquire();
         let weak = std::sync::Arc::downgrade(&before);
         let owner = before.clone().lock_owned().await;
+        let mut contention = before.subscribe_waiters();
+        assert!(!contention.has_changed().unwrap());
         let mut waiter = Box::pin(before.clone().lock_owned());
         assert!(futures_util::poll!(&mut waiter).is_pending());
+        assert!(
+            contention.has_changed().unwrap(),
+            "maintenance must see queued capture"
+        );
+        contention.borrow_and_update();
         coord.remove_sandbox(sandbox_id);
         let after = acquire();
         assert!(std::sync::Arc::ptr_eq(&before, &after));

@@ -1,5 +1,40 @@
 use super::*;
 
+#[derive(Debug, Clone, Args)]
+pub(super) struct GuestMaintenanceArgs {
+    /// Print a structured maintenance receipt.
+    #[arg(long)]
+    pub json: bool,
+    pub id: SandboxSelector,
+    /// Kill in-flight API workloads instead of waiting for complete idleness.
+    #[arg(long)]
+    pub force: bool,
+    /// Reuse this UUID to observe/retry one accepted operation.
+    #[arg(long)]
+    pub operation: Option<uuid::Uuid>,
+    /// Refuse if this node execution has been replaced.
+    #[arg(long)]
+    pub expected_execution: Option<pplx_space_common_core::types::SandboxActivationAttemptId>,
+}
+
+#[derive(Debug, Clone, clap::Subcommand)]
+pub(super) enum GuestUpdateCommand {
+    Status {
+        id: SandboxSelector,
+        #[arg(long)]
+        json: bool,
+        #[arg(long)]
+        operation: Option<uuid::Uuid>,
+    },
+    Apply {
+        #[command(flatten)]
+        args: GuestMaintenanceArgs,
+        /// Local promotion document; the manager independently verifies its authority.
+        #[arg(long, default_value = "/etc/space/guest-update/policy.json")]
+        policy: std::path::PathBuf,
+    },
+}
+
 #[derive(Parser)]
 #[command(
     name = "space-sbxmgr",
@@ -226,6 +261,16 @@ pub(super) fn print_network_policy(mode: NetworkPolicyMode, source: Option<&str>
 
 #[derive(clap::Subcommand)]
 pub(super) enum Commands {
+    /// Inspect or apply a manager-owned guest agent update; never wakes a VM.
+    GuestUpdate {
+        #[command(subcommand)]
+        command: GuestUpdateCommand,
+    },
+    /// Restart the guest agent. --force also terminates its API workloads.
+    GuestRestart {
+        #[command(flatten)]
+        args: GuestMaintenanceArgs,
+    },
     /// Create a new sandbox (copies rootfs, optionally starts it)
     Create {
         /// Exact published template content digest.

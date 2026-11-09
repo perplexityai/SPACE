@@ -13,6 +13,10 @@ fn main() -> anyhow::Result<()> {
     ];
     let builder = tonic_prost_build::configure()
         .extern_path(
+            ".space.spaced.update.v1",
+            "::pplx_space_spaced_common::proto::update",
+        )
+        .extern_path(
             ".space.spaced.operations.v1",
             "::pplx_space_spaced_common::proto::operations",
         )

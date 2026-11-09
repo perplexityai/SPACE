@@ -38,6 +38,7 @@ pub struct LifecycleMutex {
     sandbox_id: String,
     registry: Weak<LifecycleLockRegistry>,
     mutex: Arc<tokio::sync::Mutex<()>>,
+    waiters: tokio::sync::watch::Sender<()>,
 }
 
 #[derive(Debug)]
@@ -53,11 +54,19 @@ impl LifecycleMutex {
     }
 
     pub async fn lock_owned(self: Arc<Self>) -> LifecycleMutexGuard {
+        self.waiters.send_replace(());
         let guard = self.mutex.clone().lock_owned().await;
         LifecycleMutexGuard {
             _guard: guard,
             _owner: self,
         }
+    }
+
+    /// Subscribe before try_lock to observe all subsequent queued owners.
+    /// Optional maintenance can yield to capture without racing registration.
+    /// Cancellation of a waiter does not undo its request for priority.
+    pub fn subscribe_waiters(&self) -> tokio::sync::watch::Receiver<()> {
+        self.waiters.subscribe()
     }
 
     pub fn try_lock(self: &Arc<Self>) -> Result<LifecycleMutexGuard, tokio::sync::TryLockError> {
@@ -105,6 +114,7 @@ fn lifecycle_lock(registry: &Arc<LifecycleLockRegistry>, sandbox_id: &str) -> Ar
         sandbox_id: sandbox_id.to_owned(),
         registry: Arc::downgrade(registry),
         mutex: Arc::new(tokio::sync::Mutex::new(())),
+        waiters: tokio::sync::watch::channel(()).0,
     });
     locks.insert(sandbox_id.to_owned(), Arc::downgrade(&lock));
     lock
