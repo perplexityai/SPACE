@@ -42,9 +42,10 @@ class ConnectProcessStartStreamTests(unittest.TestCase):
     def test_end_stream_error_and_truncation(self) -> None:
         error = _message({"error": {"code": "unavailable", "message": "gone"}}, flags=0x02)
         self.assertEqual(self._events(error), [("error", "unavailable: gone")])
-        self.assertEqual(self._events(_message({"event": {"start": {"pid": 1}}})[:3]), [])
-        cut = self._events(_message({"event": {"start": {"pid": 1}}})[:9])
-        self.assertEqual([kind for kind, _ in cut], ["error"])
+        start = _message({"event": {"start": {"pid": 1}}})
+        exit_ = _message({"event": {"end": {"exitCode": 0, "status": "exited"}}})
+        for body in (start[:3], start[:9], start + exit_):
+            self.assertEqual(self._events(body)[-1][0], "error")
 
 
 if __name__ == "__main__":

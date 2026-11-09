@@ -8686,7 +8686,7 @@ class _ConnectProcessStartStream:
             try:
                 prefix = self._response.read(5)
                 if len(prefix) < 5:
-                    return
+                    raise ValueError("stream closed before its end-stream message")
                 length = int.from_bytes(prefix[1:], "big")
                 payload = self._response.read(length)
                 if len(payload) < length:
