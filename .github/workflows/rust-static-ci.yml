@@ -418,10 +418,10 @@ jobs:
         run: >-
           cargo clippy --locked --target x86_64-pc-windows-msvc --all-targets
           -p pplx-space-spaced-guest-server -p pplx-space-spaced-guest-svc
-          -p pplx-space-spaced-guest-cli
+          -p pplx-space-spaced-guest-cli -p pplx-space-spaced-guest-update
           -- -D warnings
       - name: Run native Windows unit tests
         if: steps.scope.outputs.needed == 'true'
         run: >-
           cargo test --locked --target x86_64-pc-windows-msvc
-          -p pplx-space-spaced-guest-server --lib
+          -p pplx-space-spaced-guest-server -p pplx-space-spaced-guest-update --lib

@@ -2,7 +2,7 @@
 //! starting any runtime, or from a tracked blocking task in the serving daemon.
 //! The lock spans journal and selector writes; systemd serializes daemon exec.
 
-#![cfg(unix)]
+#![cfg(any(unix, windows))]
 
 mod files;
 mod stage;
@@ -13,14 +13,21 @@ use pplx_space_spaced_update::{
     Selection, Slot,
 };
 use std::{
-    fs::{self, File, OpenOptions},
+    fs::{self, File},
     io::{self, Read, Write},
-    os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
 };
 use uuid::Uuid;
 
+#[cfg(unix)]
 pub const UPDATE_ROOT: &str = "/var/lib/spaced";
+#[cfg(windows)]
+pub const UPDATE_ROOT: &str = r"C:\ProgramData\SPACE\agent";
+
+#[cfg(unix)]
+use std::{fs::OpenOptions, os::unix::fs::OpenOptionsExt};
+#[cfg(windows)]
+mod windows;
 
 /// Offline image assembly only. An existing journal or selector is an error;
 /// this entry point cannot reset update history on an installed guest.
@@ -73,13 +80,7 @@ impl SlotStore {
         let lock = match files::open_regular(&root.join("update-lock")) {
             Ok(lock) => lock,
             Err(UpdateError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
-                OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .create_new(true)
-                    .mode(0o600)
-                    .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-                    .open(root.join("update-lock"))?
+                files::create(&root.join("update-lock"), false)?
             }
             Err(error) => return Err(error),
         };
@@ -126,13 +127,15 @@ impl SlotStore {
             || !descriptor
                 .seed_contracts
                 .iter()
-                .any(|v| v == pplx_space_spaced_update::SEED_CONTRACT)
+                .any(|v| v == files::seed_contract())
         {
             return Err(UpdateError::Identity);
         }
         for binary in Binary::ALL {
             files::verify_binary(
-                &self.slot_path(selection.slot).join(binary.file_name()),
+                &self
+                    .slot_path(selection.slot)
+                    .join(files::binary_name(binary)),
                 descriptor.binary(binary),
             )?;
         }
@@ -147,8 +150,8 @@ impl SlotStore {
         self.select_with_clock(|| Ok((boot, now_ms)))
     }
 
-    #[cfg(any(test, target_os = "linux"))]
-    fn select_with_clock(
+    #[cfg(any(test, target_os = "linux", windows))]
+    pub fn select_with_clock(
         &self,
         clock: impl FnOnce() -> Result<(Uuid, u64), UpdateError>,
     ) -> Result<Selection, UpdateError> {
@@ -325,6 +328,7 @@ impl SlotStore {
         self.root.join("slots").join(slot.name())
     }
 
+    #[cfg(unix)]
     fn link_slot(&self, name: &str) -> Result<Slot, UpdateError> {
         match fs::read_link(self.root.join(name))?.to_str() {
             Some("slots/a") => Ok(Slot::A),
@@ -333,6 +337,7 @@ impl SlotStore {
         }
     }
 
+    #[cfg(unix)]
     fn set_link(&self, name: &str, slot: Slot) -> Result<(), UpdateError> {
         if self.link_slot(name).is_ok_and(|existing| existing == slot) {
             return Ok(());
@@ -353,15 +358,12 @@ impl SlotStore {
         }
         let temp = self.root.join(".update-state.next");
         files::remove_file_if_present(&temp)?;
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&temp)?;
+        let mut file = files::create(&temp, false)?;
         file.write_all(&bytes)?;
         file.sync_all()?;
-        fs::rename(&temp, self.root.join("update-state"))?;
-        File::open(&self.root)?.sync_all()?;
+        drop(file);
+        files::replace(&temp, &self.root.join("update-state"))?;
+        files::sync_directory(&self.root)?;
         Ok(())
     }
 }
