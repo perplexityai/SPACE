@@ -4,7 +4,7 @@
 //! `spaced-svc` binary's `main` used to hold; the binary now only parses flags
 //! and calls [`run`].
 
-use crate::{
+use crate::platform::unix::{
     HostConnectorType, RunFilesystemWorkerError, RunGuestServerError, SpacedGuestService,
     SpacedGuestServiceConfig, filesystem_worker_requested, run_filesystem_worker_from_environment,
 };
@@ -52,7 +52,7 @@ pub enum RunSpacedGuestError {
     #[error("failed to read image working directory: {0}")]
     WorkingDirectory(#[source] std::io::Error),
     #[error(transparent)]
-    CreateService(#[from] crate::CreateSpacedGuestServiceError),
+    CreateService(#[from] crate::platform::unix::CreateSpacedGuestServiceError),
 }
 
 // With the 10s drain these bound daemon exit; `TimeoutStopSec` in the seed's
@@ -78,10 +78,10 @@ pub fn run(config: SpacedGuestRunConfig) -> Result<(), RunSpacedGuestError> {
     // Move into the supervisor cgroup before the runtime, telemetry or anything
     // else of size is allocated: memory stays charged to the cgroup it was
     // allocated in, so it would otherwise sit outside the supervisor leaf.
-    if crate::native_vsock_available() {
-        drop(crate::cgroup::GuestCgroups::initialize_for_process());
+    if crate::platform::unix::native_vsock_available() {
+        drop(crate::platform::unix::cgroup::GuestCgroups::initialize_for_process());
         #[cfg(target_os = "linux")]
-        crate::memlock::lock_text();
+        crate::platform::unix::memlock::lock_text();
     }
 
     block_on_bounded(

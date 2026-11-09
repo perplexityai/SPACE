@@ -637,6 +637,6 @@ for intervening writes.
 
 - [Execution-generation allocation](../crates/l40_api/api/src/controllers/substrate/kubernetes/store/execution_rows.rs).
 - [Activity clocks and lifecycle timers](../crates/l30_storage/sbx/mgr/store/src/auto_lifecycle.rs).
-- [Guest workload ownership on daemon restart](../crates/l40_api/spaced/guest/server/src/cgroup.rs) and [seed units](../templates/firecracker/seed/rootfs-builder.sh).
+- [Guest workload ownership on daemon restart](../crates/l40_api/spaced/guest/server/src/platform/unix/cgroup.rs) and [seed units](../templates/firecracker/seed/rootfs-builder.sh).
 - [Snapshot capture and publication](../crates/l40_api/sbx/mgr/server/src/service/suspend_snapshot_publication.rs).
 - [Snapshot metadata](../crates/l40_api/sbx/mgr/server/src/snapshot_upload.rs) and [write-once digests](../crates/l30_storage/snapshot/store/src/lib.rs).

@@ -296,7 +296,7 @@ impl SpacedGuestService {
         // The leaf excludes the holder; populated includes nested descendants.
         // An unreadable cgroup cannot establish idleness, in status or Arm.
         #[cfg(target_os = "linux")]
-        match crate::cgroup::GuestCgroups::initialize_for_process() {
+        match crate::platform::unix::cgroup::GuestCgroups::initialize_for_process() {
             Some(cgroups) => {
                 match tokio::fs::read_to_string(cgroups.workloads.join("cgroup.events")).await {
                     Ok(events) if events.lines().any(|v| v == "populated 0") => {}
