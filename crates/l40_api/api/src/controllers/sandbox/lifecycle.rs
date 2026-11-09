@@ -945,6 +945,8 @@ struct DrainGateRow {
     portable: bool,
     drain_phase: Option<NodeDrainPhase>,
     drain_mode: Option<String>,
+    /// Whether the node's v2 drain still waits for an evacuation slot.
+    drain_waiting: bool,
     /// Whether `COALESCE(target_node_id, active_node_id)` names a node row.
     primary_found: bool,
     /// Whether that node has a `node_k8s` row.
@@ -1022,6 +1024,7 @@ pub(super) async fn fetch_active_node_drain_state(
         "SELECT COALESCE(({portable_predicate}) OR {materializable}, FALSE) AS portable,
                 n.drain_phase,
                 n.drain_mode,
+                COALESCE((n.drain_status->>'waiting')::BOOLEAN, FALSE) AS drain_waiting,
                 n.id IS NOT NULL AS primary_found,
                 EXISTS (SELECT 1 FROM node_k8s nk WHERE nk.node_id = n.id) AS mapped
            FROM sandboxes s
@@ -1043,17 +1046,25 @@ pub(super) async fn fetch_active_node_drain_state(
     // columns are NULL (or name no node row), and `Some((None, _))` when the
     // node exists but is not draining — both cases fall through to the
     // executions fallback below.
-    let primary: Option<(Option<NodeDrainPhase>, Option<String>, bool)> = gate
-        .filter(|row| row.primary_found)
-        .map(|row| (row.drain_phase, row.drain_mode, row.mapped));
+    let primary: Option<(Option<NodeDrainPhase>, Option<String>, bool, bool)> =
+        gate.filter(|row| row.primary_found).map(|row| {
+            (
+                row.drain_phase,
+                row.drain_mode,
+                row.drain_waiting,
+                row.mapped,
+            )
+        });
     // `mapped` is whether the primary node has a `node_k8s` row. It decides
     // whether the executions fallback is even reachable: the substrate uses the
     // fallback only when the primary can't be resolved to a k8s node, so for a
     // mapped primary the fallback is not where placement lands and consulting it
     // would 409 on a node nothing is going to touch.
-    let primary_mapped = primary.as_ref().is_some_and(|(_, _, mapped)| *mapped);
-    let primary_state =
-        primary.and_then(|(phase, mode, _)| NodeDrainState::from_columns(phase, mode.as_deref()));
+    let primary_mapped = primary.as_ref().is_some_and(|(_, _, _, mapped)| *mapped);
+    let primary_state = primary.and_then(|(phase, mode, waiting, _)| {
+        NodeDrainState::from_columns(phase, mode.as_deref())
+            .map(|state| state.awaiting_evacuation(waiting))
+    });
     // Return early **only** when the primary actually blocks. A non-blocking
     // primary must still fall through to the executions fallback, because
     // `preferred_restore_node_name` uses that fallback when the primary has no
@@ -1104,8 +1115,9 @@ pub(super) async fn fetch_active_node_drain_state(
     // whether the gate fires. Preferring a blocking sibling happens below, in
     // Rust, so the mode policy stays where `from_column_str` is rather than
     // being restated in an `ORDER BY`.
-    let siblings: Vec<(NodeDrainPhase, Option<String>)> = sqlx::query_as(sql!(
-        "SELECT n.drain_phase, n.drain_mode
+    let siblings: Vec<(NodeDrainPhase, Option<String>, bool)> = sqlx::query_as(sql!(
+        "SELECT n.drain_phase, n.drain_mode,
+                COALESCE((n.drain_status->>'waiting')::BOOLEAN, FALSE)
            FROM node_k8s nk
            JOIN nodes n ON n.id = nk.node_id
           WHERE nk.k8s_node_name = $1
@@ -1116,7 +1128,10 @@ pub(super) async fn fetch_active_node_drain_state(
     .await?;
     let siblings: Vec<NodeDrainState> = siblings
         .into_iter()
-        .filter_map(|(phase, mode)| NodeDrainState::from_columns(Some(phase), mode.as_deref()))
+        .filter_map(|(phase, mode, waiting)| {
+            NodeDrainState::from_columns(Some(phase), mode.as_deref())
+                .map(|state| state.awaiting_evacuation(waiting))
+        })
         .collect();
     // Precedence: any blocking candidate wins, whichever side it came from; else
     // the primary if it had a phase at all (so a caller can still see "draining,

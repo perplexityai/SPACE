@@ -21,12 +21,13 @@ use crate::node_drain::v2::{DrainV2Sink, EvacuationRecord, V2Node};
 /// How long one `DrainNode` call may take; the node answers without waiting.
 const DRAIN_NODE_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// A v2 node's id, phase, epoch, cancel and terminated flags, and its stored
-/// report's unrecorded evacuations.
+/// A v2 node's id, phase, epoch, cancel, terminated and waiting flags, and
+/// its stored report's unrecorded evacuations.
 type V2NodeRow = (
     NodeId,
     Option<String>,
     Option<i64>,
+    bool,
     bool,
     bool,
     Option<serde_json::Value>,
@@ -39,6 +40,7 @@ pub(crate) async fn list_v2_nodes(pool: &PgPool) -> Result<Vec<V2Node>, sqlx::Er
                 (drain_status->>'epoch')::BIGINT,
                 COALESCE((drain_status->>'cancel')::BOOLEAN, FALSE),
                 COALESCE((drain_status->>'terminated')::BOOLEAN, FALSE),
+                COALESCE((drain_status->>'waiting')::BOOLEAN, FALSE),
                 drain_status->'report'->'unrecorded'
            FROM nodes
           WHERE drain_engine = 'v2' AND managed_by = $1
@@ -50,12 +52,13 @@ pub(crate) async fn list_v2_nodes(pool: &PgPool) -> Result<Vec<V2Node>, sqlx::Er
     Ok(rows
         .into_iter()
         .map(
-            |(id, phase, epoch, cancel, terminated, unrecorded)| V2Node {
+            |(id, phase, epoch, cancel, terminated, waiting, unrecorded)| V2Node {
                 id,
                 phase,
                 epoch: epoch.and_then(|epoch| u64::try_from(epoch).ok()),
                 cancel,
                 terminated,
+                waiting,
                 unrecorded_since: unrecorded_since(unrecorded.as_ref()),
             },
         )
@@ -79,6 +82,31 @@ fn unrecorded_since(
             ))
         })
         .collect()
+}
+
+/// Admit the waiting v2 drain under `epoch` to an evacuation slot. Returns
+/// whether it was admitted: false for a row no longer that epoch's waiting
+/// `draining` node.
+pub(crate) async fn admit_v2_evacuation(
+    pool: &PgPool,
+    node_id: NodeId,
+    epoch: i64,
+) -> Result<bool, sqlx::Error> {
+    Ok(sqlx::query(sql!(
+        "UPDATE nodes
+            SET drain_status = drain_status || jsonb_build_object('waiting', FALSE)
+          WHERE id = $1
+            AND drain_engine = 'v2'
+            AND drain_phase = 'draining'
+            AND (drain_status->>'epoch')::BIGINT = $2
+            AND COALESCE((drain_status->>'waiting')::BOOLEAN, FALSE)"
+    ))
+    .bind(node_id)
+    .bind(epoch)
+    .execute(pool)
+    .await?
+    .rows_affected()
+        == 1)
 }
 
 /// Record that the terminator acted on the terminating v2 node under
@@ -322,6 +350,12 @@ fn epoch_i64(epoch: u64) -> Result<i64, String> {
 impl DrainV2Sink for SubstrateSink {
     async fn list_v2_nodes(&self) -> Result<Vec<V2Node>, String> {
         list_v2_nodes(&self.pool)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn admit_evacuation(&self, node_id: NodeId, epoch: u64) -> Result<bool, String> {
+        admit_v2_evacuation(&self.pool, node_id, epoch_i64(epoch)?)
             .await
             .map_err(|error| error.to_string())
     }

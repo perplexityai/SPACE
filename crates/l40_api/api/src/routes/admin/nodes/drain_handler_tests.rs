@@ -807,8 +807,9 @@ fn v2_request(mode: NodeDrainMode) -> DrainRequest {
 }
 
 /// A v2 `:drain` records the engine and the epoch, the drain's start in
-/// microseconds, in the transaction that moves the phase; a repeat keeps the
-/// epoch.
+/// microseconds, in the transaction that moves the phase, and starts the
+/// drain waiting for an evacuation slot; a repeat keeps the epoch, and
+/// doesn't send a drain the controller admitted back to waiting.
 #[tokio::test(flavor = "current_thread")]
 async fn a_v2_drain_records_its_epoch_with_the_phase() -> TestResult {
     if !enter_direct_test_process() {
@@ -838,6 +839,11 @@ async fn a_v2_drain_records_its_epoch_with_the_phase() -> TestResult {
         .and_then(|status| status.get("epoch"))
         .and_then(serde_json::Value::as_i64);
     assert_eq!(epoch, started_us, "{status:?}");
+    assert_eq!(
+        status.as_ref().and_then(|status| status.get("waiting")),
+        Some(&serde_json::Value::Bool(true)),
+        "{status:?}"
+    );
 
     post_drain(
         &state,
@@ -851,6 +857,28 @@ async fn a_v2_drain_records_its_epoch_with_the_phase() -> TestResult {
         v2_columns(&db.pool, node_id).await?.2,
         status,
         "a repeat keeps the epoch"
+    );
+
+    sqlx::query(sql!(
+        "UPDATE nodes SET drain_status = drain_status || '{\"waiting\": false}'::JSONB
+          WHERE id = $1"
+    ))
+    .bind(node_id)
+    .execute(&db.pool)
+    .await?;
+    post_drain(
+        &state,
+        &actor,
+        node_id,
+        DrainAction::Drain,
+        v2_request(NodeDrainMode::Forced),
+    )
+    .await;
+    let admitted = v2_columns(&db.pool, node_id).await?.2;
+    assert_eq!(
+        admitted.as_ref().and_then(|status| status.get("waiting")),
+        Some(&serde_json::Value::Bool(false)),
+        "a repeat leaves an admitted drain admitted: {admitted:?}"
     );
     Ok(())
 }
@@ -1143,8 +1171,8 @@ async fn a_drain_over_a_pending_v2_cancel_runs_under_v2_only() -> TestResult {
     );
     assert_eq!(
         status,
-        started_us.map(|epoch| serde_json::json!({"epoch": epoch})),
-        "a new epoch, without the old cancel"
+        started_us.map(|epoch| serde_json::json!({"epoch": epoch, "waiting": true})),
+        "a new epoch, waiting for its slot, without the old cancel"
     );
     Ok(())
 }

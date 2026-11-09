@@ -766,6 +766,7 @@ pub async fn run_reconcilers(
                     node_drain_config.replace_stopped_evacuations,
                 );
                 let v2_tick = node_drain_config.tick;
+                let v2_max_evacuating = node_drain_config.v2_max_evacuating_nodes;
                 // The v2 drain's loop, beside v1's: it acts only on the rows
                 // `:drain {engine: v2}` marked, which v1's writers skip. It
                 // runs whether or not new v2 drains are admitted, so a
@@ -777,6 +778,7 @@ pub async fn run_reconcilers(
                         node_drain::SubstrateSink::v2(pool.clone(), kube.clone()),
                         terminator,
                         v2_tick,
+                        v2_max_evacuating,
                         shutdown_token.child_token(),
                     )));
                 };

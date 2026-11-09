@@ -1206,14 +1206,19 @@ pub(super) async fn is_node_wake_gate_closed(
     pool: &PgPool,
     node_id: NodeId,
 ) -> Result<bool, sqlx::Error> {
-    let row: Option<(Option<NodeDrainPhase>, Option<String>)> = sqlx::query_as(sql!(
-        "SELECT drain_phase, drain_mode FROM nodes WHERE id = $1"
+    let row: Option<(Option<NodeDrainPhase>, Option<String>, bool)> = sqlx::query_as(sql!(
+        "SELECT drain_phase, drain_mode,
+                COALESCE((drain_status->>'waiting')::BOOLEAN, FALSE)
+           FROM nodes WHERE id = $1"
     ))
     .bind(node_id)
     .fetch_optional(pool)
     .await?;
     Ok(row
-        .and_then(|(phase, mode)| NodeDrainState::from_columns(phase, mode.as_deref()))
+        .and_then(|(phase, mode, awaiting)| {
+            NodeDrainState::from_columns(phase, mode.as_deref())
+                .map(|state| state.awaiting_evacuation(awaiting))
+        })
         .is_some_and(NodeDrainState::blocks_placement))
 }
 
@@ -1456,7 +1461,10 @@ pub(super) async fn drain_v2_columns(
 /// Start a v2 drain on a node `update_drain_phase` has just moved to
 /// `draining` in this transaction: record the engine and the epoch the node
 /// is sealed under, the drain's start in microseconds. A later drain starts
-/// later, so its epoch is larger: the node takes epochs only forward.
+/// later, so its epoch is larger: the node takes epochs only forward. The
+/// drain starts waiting for one of the cluster's evacuation slots
+/// (`waiting`), which the controller's v2 loop admits it to before it seals
+/// the node; until then the drain gate leaves the node's sandboxes open.
 pub(super) async fn start_v2_drain(
     tx: &mut Transaction<'_, Postgres>,
     node_id: NodeId,
@@ -1465,7 +1473,8 @@ pub(super) async fn start_v2_drain(
         "UPDATE nodes
             SET drain_engine = 'v2',
                 drain_status = jsonb_build_object(
-                    'epoch', (EXTRACT(EPOCH FROM drain_started_at) * 1000000)::BIGINT
+                    'epoch', (EXTRACT(EPOCH FROM drain_started_at) * 1000000)::BIGINT,
+                    'waiting', TRUE
                 )
           WHERE id = $1 AND drain_phase = 'draining' AND drain_started_at IS NOT NULL"
     ))

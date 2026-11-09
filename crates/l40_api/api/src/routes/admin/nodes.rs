@@ -2075,7 +2075,15 @@ async fn apply_force_upload_local_snapshots(
         .map(NodeDrainPhase::parse)
         .transpose()
     {
-        Ok(phase) => NodeDrainState::from_columns(phase, node.drain_mode.as_deref()),
+        Ok(phase) => NodeDrainState::from_columns(phase, node.drain_mode.as_deref()).map(|state| {
+            state.awaiting_evacuation(
+                node.drain_status
+                    .as_ref()
+                    .and_then(|status| status.0.get("waiting"))
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false),
+            )
+        }),
         Err(err) => {
             return api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
