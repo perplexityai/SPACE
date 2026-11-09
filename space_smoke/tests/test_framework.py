@@ -158,6 +158,7 @@ runpy.run_module("space_smoke", run_name="__main__")
                 "local.fork_suspended_cross_node",
                 "local.gentle_drain_leaves_sandbox_resident",
                 "local.leader_election_brownout_keeps_one_leader",
+                "local.network_slots_clamp_to_node_memory",
                 "local.node_ctl_fence_refuses_and_reconciles",
                 "local.node_group_boundary_schedules",
                 "local.node_selector_extras_render_and_enforce",
