@@ -237,6 +237,7 @@ class RetiredExecutionPodGcAssertions:
                 lambda: self._control.restore_retired_execution_pod_gc_env(standing),
                 critical=True,
             )
+        self._control.reset_retired_execution_pod_gc_counts()
         started_at, started_epoch = time.monotonic(), int(time.time())
         overrides = smoke_gc_env(
             dry_run=dry_run, threshold_seconds=threshold_seconds, interval_seconds=interval_seconds
@@ -470,7 +471,7 @@ class RetiredExecutionPodGcAssertions:
             observed = {verdict: counts.get(f"{DRY_RUN}/{verdict}", 0) for verdict in VERDICTS}
             if all(observed[v] >= expected[v] for v in VERDICTS) or time.monotonic() > deadline:
                 break
-            self._fixture.wait(5)
+            self._fixture.wait(15)
         self._fixture.record("dry_run_would_reap", observed)
         self._fixture.verify(
             observed == expected and counts.get(f"{LIVE}/{TERMINAL_RETIRED}", 0) == 0
@@ -526,7 +527,7 @@ class RetiredExecutionPodGcAssertions:
             observed = {verdict: counts.get(f"{LIVE}/{verdict}", 0) for verdict in VERDICTS}
             if all(observed[v] >= expected[v] for v in VERDICTS) or time.monotonic() > deadline:
                 break
-            self._fixture.wait(5)
+            self._fixture.wait(15)
         self._fixture.record("live_reaped", observed)
         self._fixture.verify(
             all(observed[v] >= expected[v] for v in VERDICTS),

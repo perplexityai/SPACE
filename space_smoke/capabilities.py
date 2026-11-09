@@ -851,6 +851,10 @@ class RetiredExecutionPodGcControl(Protocol):
         """Put the captured literals back (None unsets) and await the controller rollout."""
         ...
 
+    def reset_retired_execution_pod_gc_counts(self) -> None:
+        """Empty a payload-keeping metrics intake so later counter reads stay small; no-op otherwise."""
+        ...
+
     def retired_execution_pod_gc_counts(self, *, since_epoch: int) -> dict[str, int]:
         """The GC's reap counter in the stack's metrics intake since `since_epoch`, keyed `mode/verdict`."""
         ...

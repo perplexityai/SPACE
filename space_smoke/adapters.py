@@ -5525,6 +5525,17 @@ ON CONFLICT (key_hash) DO NOTHING;
         self._assert_lease_owned(ownership, "a retired-execution-pod GC controller deployment write")
         self._set_deployment_env(self._controller_deployment(), values, timeout=180)
 
+    _FAKEINTAKE_PROXY = "/api/v1/namespaces/kube-system/services/datadog-fakeintake:80/proxy/fakeintake"
+
+    def reset_retired_execution_pod_gc_counts(self) -> None:
+        # The fake intake keeps every payload since the stack came up, and
+        # decoding hours of them to JSON exceeds its memory limit.
+        if self.telemetry_mode() == "datadog":
+            _require_ok(
+                self.kubectl("get", "--raw", f"{self._FAKEINTAKE_PROXY}/flushPayloads", timeout=60),
+                "empty the fake metrics intake",
+            )
+
     def retired_execution_pod_gc_counts(self, *, since_epoch: int) -> dict[str, int]:
         mode = self.telemetry_mode()
         if mode == "otel":
@@ -5552,12 +5563,9 @@ ON CONFLICT (key_hash) DO NOTHING;
         return counts
 
     def _retired_execution_pod_gc_intake_counts(self, since_epoch: int) -> dict[str, int]:
-        # The intake keeps every payload since the stack came up and has no
-        # time filter, so jq streams it down to this loop's counter points.
-        path = (
-            "/api/v1/namespaces/kube-system/services/datadog-fakeintake:80/proxy/fakeintake/payloads"
-            "?endpoint=/api/intake/metrics/v3/series&format=json"
-        )
+        # The intake has no time filter, so jq cuts it down to this loop's
+        # counter points since the config rolled.
+        path = f"{self._FAKEINTAKE_PROXY}/payloads?endpoint=/api/intake/metrics/v3/series&format=json"
         program = (
             "[.payloads[].data[] | select(.metric | endswith(\"cluster_reconciler.outcome\"))"
             " | select(.tags | index(\"loop:retired_execution_pod_gc\"))"
