@@ -175,6 +175,29 @@ pub fn metrics_tick_success(success: bool) {
     gauge("node_disk.metrics_tick_success", f64::from(success), &[]);
 }
 
+/// `/space/cache` filesystem capacity from `statvfs`, emitted every disk
+/// metrics tick: `total` size, `used` (`total - f_bfree`) and `available`
+/// (`f_bavail`, what unprivileged writers such as snapshot captures can
+/// still allocate). On btrfs these are the filesystem's own estimates, not
+/// chunk allocation; `btrfs_unallocated_bytes` tracks that.
+pub fn cache_capacity(status: pplx_space_common_core::host::disk::DiskStatus) {
+    gauge(
+        "node_disk.cache_total_bytes",
+        status.total_bytes as f64,
+        &[],
+    );
+    gauge(
+        "node_disk.cache_used_bytes",
+        status.usage().used_bytes as f64,
+        &[],
+    );
+    gauge(
+        "node_disk.cache_available_bytes",
+        status.available_bytes as f64,
+        &[],
+    );
+}
+
 /// Bytes in the `/space/cache` btrfs unallocated pool — the only space
 /// metadata chunk growth can draw from. Zero here with full metadata chunks
 /// wedges the filesystem (subvolume deletes fail `EROFS`).
