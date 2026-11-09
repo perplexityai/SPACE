@@ -64,18 +64,26 @@ impl RetentionSink for DataPlaneSessionRetentionStore {
     ) -> Result<TickReport, sqlx::Error> {
         let grace_secs = i64::try_from(grace.as_secs()).unwrap_or(i64::MAX);
         let max_records = i64::from(max_records);
+        // A row bound to a process id other than its session id comes from a
+        // guest that minted the id itself. The process routes resolve the
+        // session's process id through it for as long as the process runs,
+        // which can be long past the session, so it stays until the sandbox
+        // is deleted and takes it along. Other guests bind the session id.
         let rows = sqlx::query_scalar::<_, String>(sql!(
             "WITH candidates AS (
                  SELECT session_id
                    FROM data_plane_sessions
                   WHERE (
-                            expires_at IS NOT NULL
-                        AND expires_at < NOW() - ($1::BIGINT * INTERVAL '1 second')
+                            (
+                                expires_at IS NOT NULL
+                            AND expires_at < NOW() - ($1::BIGINT * INTERVAL '1 second')
+                            )
+                         OR (
+                                state IN ('closed', 'revoked', 'failed')
+                            AND updated_at < NOW() - ($1::BIGINT * INTERVAL '1 second')
+                            )
                         )
-                     OR (
-                            state IN ('closed', 'revoked', 'failed')
-                        AND updated_at < NOW() - ($1::BIGINT * INTERVAL '1 second')
-                        )
+                    AND (backend_process_id IS NULL OR backend_process_id = session_id)
                   ORDER BY updated_at ASC, session_id ASC
                   LIMIT $2
              )

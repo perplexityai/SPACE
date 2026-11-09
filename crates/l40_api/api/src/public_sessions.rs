@@ -394,7 +394,9 @@ impl PublicSessionStore {
     /// bound one.
     ///
     /// Expired and revoked sessions are read too: the process can outlive
-    /// its session, and the binding names it for as long as the row exists.
+    /// its session. Session retention keeps a row bound to an id other than
+    /// its session id until the sandbox is deleted, so the binding lasts as
+    /// long as the process can.
     pub async fn bound_process_id(
         &self,
         org_id: OrgId,
