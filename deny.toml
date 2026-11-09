@@ -32,6 +32,8 @@ allow = ["CDLA-Permissive-2.0"]
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+# SQLx's pinned upstream compatibility fix permits the patched SQLite bundle.
+allow-git = ["https://github.com/launchbadge/sqlx"]
 
 # RUSTSEC-2024-0449 is informational: unsafe-libyaml is unmaintained, with no
 # known vulnerability. Keep this exception to that one advisory; other

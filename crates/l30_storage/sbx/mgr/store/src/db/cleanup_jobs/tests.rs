@@ -379,16 +379,17 @@ fn retry_discovery_does_not_scan_sleeping_jobs() {
             );
         }
     }
-    let conn = test_conn();
+    let mut conn = test_conn();
     conn.execute_batch("WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<10000) INSERT INTO jobs(job_id, kind, next_attempt_at, created_at) SELECT 'sleeping-'||x, 'sandbox_cleanup', '2999-01-01', '2000-01-01' FROM n; INSERT INTO jobs(job_id, kind) VALUES ('019d84bd-280d-7331-99c6-000000000003', 'sandbox_cleanup')").unwrap();
-    conn.trace_v2(TraceEventCodes::SQLITE_TRACE_PROFILE, Some(trace));
+    conn.trace_v2(TraceEventCodes::SQLITE_TRACE_PROFILE, Some(trace))
+        .unwrap();
     assert_eq!(
         due_job_ids(&conn, JobPriority::new(0), &[], 1).unwrap(),
         ["019d84bd-280d-7331-99c6-000000000003"
             .parse::<JobId>()
             .unwrap()]
     );
-    conn.trace_v2(TraceEventCodes::empty(), None);
+    conn.trace_v2(TraceEventCodes::empty(), None).unwrap();
     assert!(
         STEPS.load(std::sync::atomic::Ordering::Relaxed) < 500,
         "sleeping jobs consumed dispatch SQL work"
