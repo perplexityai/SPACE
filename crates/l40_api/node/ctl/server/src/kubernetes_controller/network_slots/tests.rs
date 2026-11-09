@@ -74,3 +74,26 @@ fn capacity_never_exceeds_max_slots_or_overflows() {
     );
     assert_eq!(desired_network_slot_capacity(0, 0, Some(10)), 0);
 }
+
+#[test]
+fn clamped_capacity_is_held_while_memory_is_unreadable() {
+    // Clamp on, no count: keep what was advertised rather than reopen to max_slots.
+    assert_eq!(
+        held_network_slot_capacity(true, None, Some("3"), Some("64")),
+        Some("3")
+    );
+    assert_eq!(
+        held_network_slot_capacity(true, None, None, Some("3")),
+        Some("3")
+    );
+    // Nothing advertised yet, a fresh count, or the clamp off: reconcile normally.
+    assert_eq!(held_network_slot_capacity(true, None, None, None), None);
+    assert_eq!(
+        held_network_slot_capacity(true, Some(0), Some("3"), Some("3")),
+        None
+    );
+    assert_eq!(
+        held_network_slot_capacity(false, None, Some("3"), Some("3")),
+        None
+    );
+}

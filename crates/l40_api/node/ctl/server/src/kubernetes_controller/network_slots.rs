@@ -90,6 +90,21 @@ async fn reconcile_serialized(
         }
     })?;
 
+    if let Some(held) = held_network_slot_capacity(
+        memory_clamp,
+        status.memory_admittable_sandboxes,
+        applied.as_deref(),
+        current_metadata.network_slots_capacity.as_deref(),
+    ) {
+        tracing::warn!(
+            %node_name,
+            held,
+            max_slots,
+            "node memory admission count unavailable; holding the advertised network-slot capacity"
+        );
+        return Ok(());
+    }
+
     if network_slot_capacity_current(
         current_metadata.network_slots_capacity.as_deref(),
         applied.as_deref(),
@@ -132,7 +147,9 @@ async fn reconcile_serialized(
 /// Capacity can drop below the requests of pods already bound here; kubelet
 /// then fails a bound pod it has not yet admitted with
 /// an `OutOf<resource>` reason, as memory admission would have
-/// refused it. `None` (node memory unreadable) keeps the slot limit alone.
+/// refused it. `None` means no memory count: `max_slots` here, though the
+/// reconcile holds an already-advertised capacity instead (see
+/// [`held_network_slot_capacity`]).
 /// While memory is not the binding limit this returns `max_slots`, so the
 /// Node is not re-patched on every memory fluctuation.
 pub(super) fn desired_network_slot_capacity(
@@ -180,6 +197,24 @@ pub(super) type AppliedNetworkSlotCapacity = std::sync::Arc<tokio::sync::Mutex<O
 /// Current when the watched Node shows `desired` and this process's last
 /// apply (if any) was `desired` too: a cache still showing an older value
 /// that happens to equal `desired` must not hide a newer apply.
+/// With the clamp on, node-manager returns no memory-admittable count when it
+/// can't read node memory or its leases, and its allocate path then refuses
+/// new sandboxes. Falling back to `max_slots` would steer pods onto a node
+/// that refuses them, so the capacity already advertised (by this process,
+/// else on the Node) is held until a count arrives. A Node that has never
+/// advertised any still gets `max_slots`.
+fn held_network_slot_capacity<'a>(
+    memory_clamp: bool,
+    memory_admittable_sandboxes: Option<u32>,
+    applied: Option<&'a str>,
+    cached: Option<&'a str>,
+) -> Option<&'a str> {
+    if !memory_clamp || memory_admittable_sandboxes.is_some() {
+        return None;
+    }
+    applied.or(cached)
+}
+
 fn network_slot_capacity_current(
     cached: Option<&str>,
     applied: Option<&str>,

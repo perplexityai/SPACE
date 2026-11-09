@@ -975,7 +975,7 @@ impl NodeManagerService {
     /// How many more sandboxes memory admission would accept
     /// now (see `MemoryAdmissionConfig::admittable_new_sandboxes`), at most
     /// `max_slots`; `None` when node memory or the lease table can't be read,
-    /// so node-ctl keeps advertising the slot capacity unchanged.
+    /// so node-ctl holds the capacity it last advertised.
     async fn memory_admittable_new_sandboxes(&self, max_slots: u32) -> Option<u32> {
         let active_leases = match self.pool.active_memory_reservations() {
             Ok(leases) => leases,
