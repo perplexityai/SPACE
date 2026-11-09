@@ -257,6 +257,8 @@ impl SandboxManagerService {
         _artifact_guard: &crate::auto_lifecycle::LifecycleMutexGuard,
     ) -> Result<(String, SuspendSnapshotPublicationContext), Status> {
         self.ensure_snapshot_restore_supported("suspend")?;
+        self.settle_guest_update_for_lifecycle(&context.sandbox_id)
+            .await?;
         // Cleanup takes its fence before any artifact lock. Never wait for it
         // while holding the wake/artifact locks: an admitted delete must win,
         // and retrying avoids an inverted lock-order cycle.

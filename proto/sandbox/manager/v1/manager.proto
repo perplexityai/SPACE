@@ -7,8 +7,13 @@ import "execution/v1/execution.proto";
 import "net/gateway/v1/gateway.proto";
 import "net/policy/v1/policy.proto";
 import "spaced/operations/v1/operations.proto";
+import "spaced/update/v1/update.proto";
 
 service SandboxManager {
+  // Node-local operator maintenance. Never wakes a dormant sandbox.
+  rpc GuestUpdateStatus(GuestUpdateStatusRequest) returns (GuestUpdateOperation);
+  rpc ApplyGuestUpdate(ApplyGuestUpdateRequest) returns (GuestUpdateOperation);
+  rpc RestartGuest(RestartGuestRequest) returns (GuestUpdateOperation);
   // Advisory readiness only. The environment input also fails closed on old readers.
   rpc GetExecutionCapabilities(GetExecutionCapabilitiesRequest) returns (GetExecutionCapabilitiesResponse);
 
@@ -279,6 +284,40 @@ service SandboxManager {
 
   // Internal: resolve the effective sandbox memory policy for this node.
   rpc ResolveSandboxMemory(ResolveSandboxMemoryRequest) returns (ResolveSandboxMemoryResponse);
+}
+
+message GuestUpdateStatusRequest {
+  string sandbox_id = 1;
+  optional string operation_id = 2;
+}
+message ApplyGuestUpdateRequest {
+  string sandbox_id = 1;
+  string operation_id = 2;
+  string expected_execution_id = 3;
+  space.spaced.update.v1.Promotion promotion = 4;
+  bool force = 5;
+}
+message RestartGuestRequest {
+  string sandbox_id = 1;
+  string operation_id = 2;
+  string expected_execution_id = 3;
+  bool force = 4;
+}
+enum GuestUpdateOperationPhase {
+  GUEST_UPDATE_OPERATION_PHASE_UNSPECIFIED = 0;
+  GUEST_UPDATE_OPERATION_PHASE_PENDING = 1;
+  GUEST_UPDATE_OPERATION_PHASE_STAGED = 2;
+  GUEST_UPDATE_OPERATION_PHASE_ACTIVATING = 3;
+  GUEST_UPDATE_OPERATION_PHASE_SETTLING = 4;
+  GUEST_UPDATE_OPERATION_PHASE_COMPLETE = 5;
+}
+message GuestUpdateOperation {
+  string sandbox_id = 1;
+  string execution_id = 2;
+  optional string operation_id = 3;
+  GuestUpdateOperationPhase phase = 4;
+  optional string outcome = 5;
+  optional space.spaced.update.v1.Status guest = 6;
 }
 
 enum BootMode {

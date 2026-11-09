@@ -75,6 +75,7 @@ use crate::auto_lifecycle::{
 mod execution_startup;
 pub(crate) mod fork_artifact;
 mod gateway_authority;
+mod guest_update;
 pub(crate) mod network_policy;
 mod restart_admission;
 mod runtime_upgrade;
