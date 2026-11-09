@@ -12,8 +12,8 @@ The stall is the cgroup v2 freezer on one node service's container. A frozen
 sandbox-manager answers nothing, so its delete is never admitted; a frozen
 node-manager leaves sandbox-manager serving while the cleanup it admitted
 hangs on node-manager. The thaw is armed before each freeze, and each stall
-stays under the services' liveness window (three failed 20 s probes) so the
-kubelet never restarts the frozen container.
+stays under the service's liveness window; the thaw asserts the container's
+restart count is unchanged, so a kubelet restart fails the scenario.
 
 A slot is held from the operation's `claimed` event to the `requeued` or
 terminal event that ends that attempt; both are public operation events.

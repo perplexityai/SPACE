@@ -7,8 +7,8 @@ from space_smoke.node_delete_stall import (
     SANDBOX_MANAGER,
 )
 
-# Each stall stays under the frozen service's liveness window: three failed
-# probes 20 s apart restart it 40-60 s after the freeze.
+# Each stall stays under the frozen service's liveness window (checked by
+# the thaw's restart-count assert).
 NOT_ADMITTED_ATTEMPTS = 2
 
 
