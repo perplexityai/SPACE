@@ -169,7 +169,7 @@ or (package(pplx-space-credmgr) and test(=run::tests::volume_socket::real_peers_
 or (package(pplx-space-credmgr) and test(=run::volume_socket::tests::preflight_checks_real_permissions_without_replacing_live_socket))
 or binary_id(pplx-space-spaced-guest-server::worker_subprocess)
 or (package(pplx-space-spaced-guest-update) and test(streaming_stage_enforces_two_slots_and_does_not_unlink_an_open_previous_release))
-or (package(pplx-space-spaced-guest-server) and test(=update::tests::transfer_error_after_complete_payload_does_not_publish_staged_authority))
+or (package(pplx-space-spaced-guest-server) and test(=platform::unix::update::tests::transfer_error_after_complete_payload_does_not_publish_staged_authority))
 or binary_id(pplx-space-spaced-guest-worker::embedding)
 or binary_id(pplx-space-spaced-guest-server::worker_telemetry)
 or (package(pplx-space-spaced-guest-execution) and test(=filesystem::router::tests::a_read_streams_from_the_workers_descriptor_without_relaying_through_it))

@@ -44,7 +44,7 @@ fn unix_stop_signals_drain_the_service() {
             std::process::Command::new(std::env::current_exe().expect("test executable"))
                 .args([
                     "--exact",
-                    "run::tests::unix_stop_signals_drain_the_service",
+                    "platform::unix::run::tests::unix_stop_signals_drain_the_service",
                     "--nocapture",
                 ])
                 .env(CHILD, "1")

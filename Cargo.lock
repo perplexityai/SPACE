@@ -7678,12 +7678,14 @@ dependencies = [
 name = "pplx-space-spaced-guest-cli"
 version = "0.8.1"
 dependencies = [
+ "anyhow",
  "clap",
  "jiff",
  "pplx-space-common-cli",
  "pplx-space-common-core",
  "pplx-space-spaced-guest-client",
  "tokio",
+ "windows-service",
 ]
 
 [[package]]
@@ -7759,9 +7761,11 @@ dependencies = [
 name = "pplx-space-spaced-guest-server"
 version = "0.8.1"
 dependencies = [
+ "blake3",
  "futures-util",
  "h2",
  "hyper-util",
+ "jiff",
  "libc",
  "nix 0.31.3",
  "opentelemetry-proto",
@@ -7769,6 +7773,8 @@ dependencies = [
  "pplx-space-common-core",
  "pplx-space-common-grpc",
  "pplx-space-grpc-metrics",
+ "pplx-space-guest-capability",
+ "pplx-space-guest-process",
  "pplx-space-observability",
  "pplx-space-service-host",
  "pplx-space-service-lifecycle",
@@ -7782,7 +7788,9 @@ dependencies = [
  "prost",
  "prost-types",
  "rustix",
+ "serde",
  "serde_json",
+ "socket2",
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
@@ -7794,6 +7802,9 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "windows-service",
+ "windows-sys 0.61.2",
+ "zeroize",
 ]
 
 [[package]]
@@ -7804,7 +7815,6 @@ dependencies = [
  "clap",
  "pplx-space-spaced-guest-server",
  "pplx-space-spaced-guest-update",
- "pplx-space-spaced-guest-windows",
  "tracing-subscriber",
 ]
 
@@ -7823,33 +7833,6 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.20",
  "uuid",
-]
-
-[[package]]
-name = "pplx-space-spaced-guest-windows"
-version = "0.8.1"
-dependencies = [
- "blake3",
- "futures-util",
- "jiff",
- "pplx-space-guest-capability",
- "pplx-space-guest-process",
- "pplx-space-spaced-guest-protocol",
- "prost",
- "prost-types",
- "serde",
- "serde_json",
- "socket2",
- "thiserror 2.0.20",
- "tokio",
- "tokio-stream",
- "tokio-util",
- "tonic",
- "tracing",
- "uuid",
- "windows-service",
- "windows-sys 0.61.2",
- "zeroize",
 ]
 
 [[package]]

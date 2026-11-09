@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Write the digest-stable descriptor beside an already-built Linux guest pair.
+"""Write the digest-stable descriptor beside an already-built guest pair.
 
 Run once when publishing a binary bundle, before seed/OCI assembly. Deployment
 authorization deliberately lives in a separate document.
@@ -34,7 +34,13 @@ def main() -> None:
     parser.add_argument("--guest-update-required-since", required=True, help="last published workspace release requiring existing guests to update")
     parser.add_argument("--family", help="defaults to the package compatibility family")
     parser.add_argument("--arch", required=True, choices=("x86_64", "aarch64"))
+    parser.add_argument("--platform", choices=("linux", "windows"), default="linux",
+                        help="payload layout and recovery ABI; Windows packaging is experimental")
     args = parser.parse_args()
+    if args.platform == "windows" and args.arch != "x86_64":
+        parser.error("the Windows guest backend currently supports only x86_64")
+    suffix = ".exe" if args.platform == "windows" else ""
+    contract = "windows-scm-two-slot-v1" if args.platform == "windows" else "linux-systemd-selector-v1"
     stable = r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)"
     match = re.fullmatch(stable, args.version)
     marker = re.fullmatch(stable, args.guest_update_required_since)
@@ -63,9 +69,9 @@ def main() -> None:
         "guest_update_required_since": args.guest_update_required_since,
         "compatibility_family": family,
         "architecture": args.arch,
-        "seed_contracts": ["linux-systemd-selector-v1"],
-        "service": describe(args.directory / "spaced-svc"),
-        "cli": describe(args.directory / "spaced"),
+        "seed_contracts": [contract],
+        "service": describe(args.directory / ("spaced-svc" + suffix)),
+        "cli": describe(args.directory / ("spaced" + suffix)),
     }
     encoded = json.dumps(descriptor, separators=(",", ":"), ensure_ascii=False).encode()
     with (args.directory / "artifact.json").open("xb") as destination:
