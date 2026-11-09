@@ -1086,6 +1086,9 @@ impl SandboxManagerService {
             );
 
             let snapshot_dir_string = snapshot_dir.to_string_lossy().into_owned();
+            // Sized before the backup handoff: once it's queued, an uploaded
+            // rootfs stream can be reclaimed from the directory.
+            let published_bytes = published_snapshot_bytes(&snapshot_dir).await;
             if let SuspendDurability::RemoteBeforeTeardown {
                 execution_generation,
             } = durability
@@ -1200,7 +1203,7 @@ impl SandboxManagerService {
                 create_kind,
                 create_codec,
                 sandbox.volume_encryption,
-                published_snapshot_bytes(&snapshot_dir).await,
+                published_bytes,
                 create_started_at,
             );
             Ok(())
