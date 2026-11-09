@@ -37,6 +37,18 @@ pub(crate) fn optional_date_time(generator: &mut SchemaGenerator) -> Schema {
     })
 }
 
+/// `process_exited` always carries `output_truncated`, but a data plane
+/// older than the field omits it, and readers default it to `false`, so the
+/// published schema must not require it.
+pub(crate) fn output_truncated_not_required(schema: &mut Schema) {
+    if let Some(required) = schema
+        .get_mut("required")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        required.retain(|name| name != "output_truncated");
+    }
+}
+
 fn incubating(mut schema: Schema) -> Schema {
     schema.insert(
         crate::routes::M1_STATUS_EXTENSION.into(),

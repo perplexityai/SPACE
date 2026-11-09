@@ -956,10 +956,24 @@ pub enum DataPlaneServerFrame {
     InputAccepted {
         seq: u64,
     },
+    #[cfg_attr(
+        feature = "schema",
+        schemars(transform = schema::output_truncated_not_required)
+    )]
     ProcessExited {
         process_id: String,
         exit_code: i32,
         status: DataPlaneProcessExitStatus,
+        /// Whether this stream moved past output the process wrote without
+        /// sending it: after a `resync_required` with reason
+        /// `cursor_out_of_window` that continued at a later position or the
+        /// live tail, or one with reason `process_stream_reconnected`. A
+        /// `cursor_out_of_window` that replays the output from its start
+        /// repeats output and leaves this `false`. It covers only this
+        /// stream, not earlier streams of the session. The exit result alone
+        /// does not say the output is whole. Older data planes omit it.
+        #[cfg_attr(feature = "serde", serde(default))]
+        output_truncated: bool,
     },
     FileEvent {
         seq: u64,

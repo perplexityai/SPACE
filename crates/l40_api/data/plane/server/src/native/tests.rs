@@ -2768,6 +2768,130 @@ async fn evicted_process_output_continues_from_the_oldest_retained_output() {
     );
 }
 
+/// `process_exited` says whether the stream skipped output the process
+/// wrote: after a gap it reports as `cursor_out_of_window`, whether a guest
+/// that does not slow the process for its reader dropped output the stream
+/// had not read yet, or the output a reattach asked for was evicted. A replay
+/// from the start of the output after an id past it repeats output instead,
+/// and a stream that delivered everything reports none.
+#[tokio::test]
+async fn process_exit_reports_whether_the_stream_skipped_output() {
+    if !binding_fake_test_process() {
+        return;
+    }
+    let past_the_output = ProcessEventId::Position {
+        position: 10,
+        frame: 0,
+    }
+    .encode();
+    struct Case {
+        name: &'static str,
+        replies: FakeReplies,
+        last_event_id: Option<u64>,
+        resyncs: &'static [&'static str],
+        output: &'static str,
+        truncated: bool,
+    }
+    let cases = [
+        Case {
+            name: "delivered whole",
+            replies: Arc::new(|_, open| journal_replay(&JOURNAL, open)),
+            last_event_id: None,
+            resyncs: &[],
+            output: "one\ntwo\nthree\nfour\n",
+            truncated: false,
+        },
+        Case {
+            name: "fell behind a guest without backpressure",
+            replies: Arc::new(|_, open| match open {
+                FakeOpen::Connect(Some(0)) => {
+                    vec![connected(), stdout(JOURNAL[0]), untagged_lagged()]
+                }
+                FakeOpen::Connect(None) => vec![connected(), stdout(JOURNAL[3]), exited()],
+                open => panic!("unexpected open {open:?}"),
+            }),
+            last_event_id: None,
+            resyncs: &["cursor_out_of_window"],
+            output: "one\nfour\n",
+            truncated: true,
+        },
+        Case {
+            name: "reattached after eviction",
+            replies: Arc::new(|_, open| match open {
+                FakeOpen::Connect(Some(cursor)) if cursor < 2 => vec![connected(), lagged(Some(2))],
+                open => journal_replay(&JOURNAL, open),
+            }),
+            last_event_id: None,
+            resyncs: &["cursor_out_of_window"],
+            output: "three\nfour\n",
+            truncated: true,
+        },
+        Case {
+            name: "replayed from the start",
+            replies: Arc::new(|_, open| journal_replay(&JOURNAL, open)),
+            last_event_id: Some(past_the_output),
+            resyncs: &["cursor_out_of_window"],
+            output: "one\ntwo\nthree\nfour\n",
+            truncated: false,
+        },
+    ];
+    for Case {
+        name: case,
+        replies,
+        last_event_id,
+        resyncs,
+        output,
+        truncated,
+    } in cases
+    {
+        let session_id = DataPlaneSessionId::new_for_kind(SessionKind::Process);
+        let fake = spawn_journal_fake(session_id, true, replies).await;
+
+        let frames = process_events_to_close(&fake.endpoint, session_id, last_event_id).await;
+
+        assert_eq!(resync_reasons(&frames), resyncs, "{case}");
+        assert_eq!(stdout_text(&frames), output, "{case}");
+        let exits: Vec<_> = frames_of_type(&frames, "process_exited").collect();
+        assert_eq!(exits.len(), 1, "{case}: {frames:?}");
+        assert_eq!(
+            exits[0].1["output_truncated"],
+            serde_json::Value::Bool(truncated),
+            "{case}"
+        );
+    }
+}
+
+/// A WebSocket stream reopens a failed backend at the live tail, so its
+/// `process_exited` reports that output may be missing.
+#[tokio::test]
+async fn websocket_exit_after_a_live_reopen_reports_skipped_output() {
+    if !binding_fake_test_process() {
+        return;
+    }
+    let session_id = DataPlaneSessionId::new_for_kind(SessionKind::Process);
+    let fake = spawn_journal_fake(
+        session_id,
+        true,
+        Arc::new(|opened, _| match opened {
+            0 => vec![
+                connected(),
+                stdout(JOURNAL[0]),
+                FakeReply::End(tonic::Status::unavailable("worker restarted")),
+            ],
+            _ => vec![connected(), stdout(JOURNAL[3]), exited()],
+        }),
+    )
+    .await;
+
+    let mut tcp = attach_native_websocket(&fake.endpoint, session_id).await;
+    let mut seen = String::new();
+    read_websocket_until(&mut tcp, &mut seen, "process_exited").await;
+
+    assert!(seen.contains("process_stream_reconnected"), "{seen}");
+    assert!(seen.contains(r#""output_truncated":true"#), "{seen}");
+    assert_eq!(fake.opens.lock().unwrap().len(), 2);
+}
+
 /// A guest that starts a lagged connect at its oldest retained output, and
 /// says so, needs no reopen: the stream reports the gap once and continues
 /// from there, with ids that keep their positions.
@@ -2865,17 +2989,12 @@ async fn exited_output_from_a_guest_that_does_not_report_its_start_continues_the
             LINES[FIRST_RETAINED as usize..].concat()
         );
         // The exit must not call this transcript whole: cursors 0 to 4 were
-        // skipped. A data plane that reports `output_truncated` says `true`;
-        // one that predates it omits it.
+        // skipped.
         let exits: Vec<_> = frames_of_type(&frames, "process_exited").collect();
         assert_eq!(exits.len(), 1, "{frames:?}");
-        assert!(
-            matches!(
-                exits[0].1.get("output_truncated"),
-                None | Some(serde_json::Value::Bool(true))
-            ),
-            "{:?}",
-            exits[0].1
+        assert_eq!(
+            exits[0].1["output_truncated"],
+            serde_json::Value::Bool(true)
         );
         let gap = frames_of_type(&frames, "resync_required")
             .next()
