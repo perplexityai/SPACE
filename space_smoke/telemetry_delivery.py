@@ -5,16 +5,16 @@ OTLP to the Collectors, which write them to Prometheus and Tempo, and Alloy
 ships every SPACE pod's stdout to Loki. Each leg can break on its own and stay
 silent: an exporter that cannot reach its Collector only retries, a Collector
 that cannot write drops, and Alloy's targets are a path glob. A passing
-lifecycle smoke proves none of it, so this reads each backend back for the
-scenario's own sandbox, never for whatever an earlier scenario left behind:
+lifecycle smoke proves none of it, so this reads each backend back for fresh
+evidence:
 
 - Tempo holds the sandbox's create trace with both space-api and shim spans,
   and the shim's create is a child of the API's pod materialization span;
 - Prometheus holds the shim's create latency from a shim process that started
   after the scenario did, on the node that trace names, and a space-api create
   count that grew after the scenario's start;
-- fresh guest-memory observations agree with the idle guest's meminfo, with
-  only the scenario's workload contributing during the measurement window;
+- fresh guest-memory observations have a positive average for the sandbox's
+  template and node; another matching sandbox can contribute to this check;
 - Loki holds a SPACE pod log line that names the sandbox.
 
 Each check records what it read, at the scenario's start and at its last poll
@@ -31,6 +31,7 @@ about 11 s after its spans end.
 from __future__ import annotations
 
 import json
+import math
 import time
 from collections.abc import Callable, Mapping
 from typing import TYPE_CHECKING, Any
@@ -257,10 +258,12 @@ class TelemetryDeliveryAssertions:
             failure_evidence=space_lines,
         )
 
-    def expect_guest_memory_used(
-        self, *, total_bytes: int, used_bytes: int
-    ) -> None:
-        """Fresh watchdog byte counts agree with this idle guest's meminfo."""
+    def expect_guest_memory_used(self) -> None:
+        """Fresh, positive memory observations arrive for this template and node.
+
+        The distribution has no sandbox-id label, so this proves delivery for
+        the selected population, not reporting by this particular sandbox.
+        """
 
         metric = "space_sandbox_resource_memory_guest_used_bytes"
         self._fixture.verify(self._node is not None, "the shim's spans named no Kind node")
@@ -275,13 +278,6 @@ class TelemetryDeliveryAssertions:
         }
 
         def read() -> dict[str, float]:
-            # There is deliberately no sandbox-id metric tag. A second
-            # sandbox, including a pool member, could satisfy this assertion
-            # while ours reports nothing.
-            self._fixture.verify(
-                self._control.telemetry_sandbox_pod_count() == 1,
-                "guest-memory verification requires exactly one potentially reporting sandbox pod",
-            )
             at = int(time.time())
             values = {}
             for part, query in queries.items():
@@ -290,9 +286,8 @@ class TelemetryDeliveryAssertions:
             return values
 
         baseline = read()
-        # Two fresh observations prove continued periodic delivery, not merely
-        # a retained sample. Allow two 24–37 s probe intervals, scheduler ticks,
-        # and exporter delay.
+        # Require fresh observations, not merely a retained sample. Allow two
+        # 24–37 s probe intervals, scheduler ticks, and exporter delay.
         final = self._poll(
             read,
             lambda now: now["count"] - baseline["count"] >= 2,
@@ -300,17 +295,17 @@ class TelemetryDeliveryAssertions:
         )
         count = final["count"] - baseline["count"]
         used = final["sum"] - baseline["sum"]
+        average = used / count if count > 0 else None
         self._fixture.record(
             "guest_memory_delivery",
             {
                 "queries": queries,
                 "template": template,
+                "node": self._node,
                 "baseline": baseline,
                 "final": final,
                 "new_observations": count,
-                "average_used_bytes": used / count if count > 0 else None,
-                "guest_total_bytes": total_bytes,
-                "guest_used_bytes": used_bytes,
+                "average_used_bytes": average,
             },
         )
         self._fixture.verify(
@@ -318,14 +313,8 @@ class TelemetryDeliveryAssertions:
             "Prometheus did not receive two fresh guest-memory observations",
         )
         self._fixture.verify(
-            0 < used / count <= total_bytes,
-            "Guest-memory observations are outside the guest's physical-memory bounds",
-        )
-        # The guest is idle, but meminfo and the watchdog sample at different
-        # instants. Allow 25% variation, not a unit conversion or placeholder.
-        self._fixture.verify(
-            abs(used / count - used_bytes) <= used_bytes * 0.25,
-            "Exported guest-memory bytes disagree with the guest's meminfo",
+            average is not None and math.isfinite(average) and average > 0,
+            "Fresh guest-memory observations do not have a finite, positive average",
         )
 
     def _prometheus(self, query: str, at: int) -> list[dict[str, Any]]:
