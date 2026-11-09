@@ -5,6 +5,11 @@
 //! records no operation (`SandboxController::action`), and the release of a
 //! drain restore's attempt when a user's operation has queued behind it.
 //!
+//! A request that doesn't apply to a suspended sandbox, a `pause` or a
+//! `resume` of the VM it no longer has, supersedes nothing: it gets the
+//! answer it gets without a drain, or, queued as an operation, runs after
+//! the restore on the VM that brings back.
+//!
 //! None cancels a restore whose attempt holds the row: the keyed queue runs
 //! the user's operation after it. Between attempts the row is `suspended`, so
 //! a canceled restore leaves nothing behind.
@@ -22,8 +27,8 @@ use uuid::Uuid;
 use super::{PublicOperationStoreError, StoredOperationKind, append_operation_event_tx};
 
 /// Whether a user's operation of `kind` on a sandbox supersedes a drain
-/// restore of it: whether running it changes the sandbox's lifecycle or
-/// deletes it.
+/// restore of it: whether running it on the `suspended` sandbox the restore
+/// waits for changes its lifecycle or deletes it.
 pub fn supersedes_drain_restore(kind: StoredOperationKind) -> bool {
     let kind = match kind {
         StoredOperationKind::DrainRestoreSandbox => return false,
@@ -36,13 +41,15 @@ pub fn supersedes_drain_restore(kind: StoredOperationKind) -> bool {
         | OperationKind::DeleteSandbox
         | OperationKind::StartSandbox
         | OperationKind::StopSandbox
-        | OperationKind::PauseSandbox
-        | OperationKind::ResumeSandbox
         | OperationKind::SuspendSandbox
         | OperationKind::RestoreSandbox
         | OperationKind::WakeSandbox
         | OperationKind::KillSandbox
         | OperationKind::RollbackSandbox => true,
+        // Both act on a resident VM. A drain restore waits only while the
+        // sandbox is suspended, with none, so neither applies to it: each
+        // runs after the restore, on the VM it brings back.
+        OperationKind::PauseSandbox | OperationKind::ResumeSandbox => false,
         // Metadata: none of these moves the lifecycle.
         OperationKind::UpdateSandbox
         | OperationKind::EnableSandboxSnapshots

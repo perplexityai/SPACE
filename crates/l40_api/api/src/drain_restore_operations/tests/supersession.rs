@@ -25,8 +25,9 @@ const ORG: OrgId = OrgId::from_uuid(Uuid::from_u128(1));
 /// A superseding call on a `suspended` sandbox cancels its waiting drain
 /// restore, whether or not this process admits new v2 drains: a drain
 /// persisted before the flag went off still enqueues one. A call that
-/// doesn't supersede one, and any call on a sandbox that isn't `suspended`,
-/// leave it waiting. The call's own outcome doesn't matter here: the
+/// doesn't supersede one, a pause or a resume that doesn't apply to a
+/// suspended sandbox among them, and any call on a sandbox that isn't
+/// `suspended`, leave it waiting. The call's own outcome doesn't matter here: the
 /// supersession comes first.
 #[tokio::test(flavor = "current_thread")]
 async fn a_superseding_call_on_a_suspended_sandbox_cancels_its_restore() -> Result<(), BoxError> {
@@ -48,7 +49,17 @@ async fn a_superseding_call_on_a_suspended_sandbox_cancels_its_restore() -> Resu
             SandboxAction::Restore,
             true,
         ),
-        ("pause, suspended", "suspended", SandboxAction::Pause, true),
+        // A pause and a SPACE resume need the resident VM a suspended
+        // sandbox doesn't have: they get their own answer, and the restore
+        // still brings the VM back.
+        ("pause, suspended", "suspended", SandboxAction::Pause, false),
+        (
+            "resume, suspended",
+            "suspended",
+            SandboxAction::Resume,
+            false,
+        ),
+        ("wake, suspended", "suspended", SandboxAction::Wake, true),
         (
             "checkpoint, suspended",
             "suspended",
