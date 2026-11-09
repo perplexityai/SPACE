@@ -43,6 +43,7 @@ impl BridgeGuestNetworking for SpacedGuestService {
         request: Request<OpenLoopbackBridgeRequest>,
     ) -> Result<Response<OpenLoopbackBridgeResponse>, Status> {
         self.require_ready()?;
+        let _admission = self.inner.execution.admit_external_operation()?;
         let req = request.into_inner();
         let port =
             u16::try_from(req.port).map_err(|_| Status::invalid_argument("port out of range"))?;
@@ -60,6 +61,7 @@ impl BridgeGuestNetworking for SpacedGuestService {
         request: Request<CloseLoopbackBridgeRequest>,
     ) -> Result<Response<CloseLoopbackBridgeResponse>, Status> {
         self.require_ready()?;
+        let _admission = self.inner.execution.admit_external_operation()?;
         let req = request.into_inner();
         let port =
             u16::try_from(req.port).map_err(|_| Status::invalid_argument("port out of range"))?;
