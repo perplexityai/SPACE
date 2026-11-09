@@ -5,6 +5,7 @@
 mod drain;
 mod fakes;
 mod mutations;
+mod proxy;
 mod stale_connection;
 mod transport_failure;
 mod write;
