@@ -26,7 +26,10 @@
 //!    reupload of the local suspended bytes. Once that durable upload
 //!    completes, the sandbox becomes a normal pinned candidate. No
 //!    pending/running `snapshot_upload` job for the sandbox — deleting
-//!    local files mid-upload would corrupt the backup being created.
+//!    local files mid-upload would corrupt the backup being created. No
+//!    drain record (`drain_evacuations`): the eviction deletes it with the
+//!    row, and until the control plane records the evacuation it is the
+//!    only copy of the lifecycle the drain restores the sandbox to.
 //! 3. **Provably backed — proof tied to the exact bytes.** Two proof
 //!    shapes, selected by whether the sandbox pins a current artifact:
 //!

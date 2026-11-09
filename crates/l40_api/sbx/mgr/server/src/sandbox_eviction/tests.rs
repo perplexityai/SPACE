@@ -743,6 +743,34 @@ fn candidates_do_not_starve_on_legacy_rows_without_upload_generation() {
 }
 
 #[test]
+fn candidates_skip_a_row_the_drain_suspended_until_its_record_is_gone() {
+    // The drain's record is the only copy of the lifecycle to restore until
+    // the control plane has recorded the evacuation; evicting the row takes
+    // the record with it.
+    let conn = open_test_db();
+    insert_sandbox(&conn, "sbx-drained", "suspended", 1_000);
+    insert_pinned_artifact(&conn, "sbx-drained", &v7(1_000).to_string(), Some("123"));
+    insert_sandbox(&conn, "sbx-control", "suspended", 1_100);
+    insert_pinned_artifact(&conn, "sbx-control", &v7(1_100).to_string(), Some("123"));
+    crate::db::activation_seal::record_drain_suspend(
+        &conn,
+        "sbx-drained",
+        crate::db::activation_seal::DrainPrior::Started,
+    )
+    .unwrap();
+
+    let held = candidate_ids(list_candidates(&conn, 5_000, None, 10).unwrap());
+    crate::db::activation_seal::forget_drain_suspend(&conn, "sbx-drained").unwrap();
+    let released = candidate_ids(list_candidates(&conn, 5_000, None, 10).unwrap());
+
+    assert_eq!(held, vec!["sbx-control".to_string()]);
+    assert_eq!(
+        released,
+        vec!["sbx-drained".to_string(), "sbx-control".to_string()]
+    );
+}
+
+#[test]
 fn candidates_exclude_malformed_updated_at() {
     let conn = open_test_db();
     insert_sandbox(&conn, "sbx-valid", "suspended", 1_000);
