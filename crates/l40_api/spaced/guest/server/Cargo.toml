@@ -96,6 +96,8 @@ tracing-subscriber = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 
 [target.'cfg(windows)'.dependencies]
+pplx-space-spaced-guest-update = { workspace = true }
+pplx-space-spaced-update = { workspace = true }
 jiff = { workspace = true }
 pplx-space-guest-capability = { workspace = true }
 pplx-space-spaced-guest-protocol = { workspace = true }
@@ -106,7 +108,7 @@ zeroize = { workspace = true }
 futures-util = { workspace = true }
 uuid = { workspace = true, features = ["v7"] }
 socket2 = { workspace = true }
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "io-util", "signal", "time", "net"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "io-util", "signal", "time", "net", "fs", "process"] }
 tokio-util = { workspace = true, features = ["io-util", "rt"] }
 tokio-stream = { workspace = true }
 tonic = { workspace = true }
@@ -115,5 +117,5 @@ thiserror = { workspace = true }
 prost-types = { workspace = true }
 prost = { workspace = true }
 blake3 = { workspace = true }
-windows-sys = { version = "0.61", features = ["Win32_Networking_WinSock", "Win32_System_SystemInformation", "Win32_System_EventLog", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_WindowsProgramming", "Win32_System_Threading", "Win32_System_JobObjects", "Win32_System_Pipes", "Win32_System_Environment", "Win32_UI_Shell", "Win32_System_Registry"] }
+windows-sys = { version = "0.61", features = ["Win32_Networking_WinSock", "Win32_System_SystemInformation", "Win32_System_EventLog", "Win32_System_Services", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_WindowsProgramming", "Win32_System_Threading", "Win32_System_JobObjects", "Win32_System_SystemServices", "Win32_System_Pipes", "Win32_System_Environment", "Win32_UI_Shell", "Win32_System_Registry"] }
 windows-service = "0.8"

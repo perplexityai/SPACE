@@ -146,6 +146,14 @@ impl SandboxManagerService {
             return Ok(client);
         }
 
+        if sandbox.spaced_endpoint_proof.is_none()
+            && sandbox.state.is_unowned(SandboxState::Starting)
+            && endpoint_proof_after_readiness(sandbox)?
+        {
+            return Err(Status::unavailable(
+                "activation has not published its ready endpoint proof",
+            ));
+        }
         let runtime = spaced_endpoint_runtime_identity(sandbox)?;
         let mut node_client = self.node_manager.lazy();
         let proof = match sandbox.spaced_endpoint_proof.clone() {
@@ -1333,6 +1341,81 @@ where
         }
     });
     Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx))
+}
+
+/// Only the qualified Windows viosock boot replaces the initial CH listener.
+/// Other profiles retain their existing activation ordering.
+pub(super) fn endpoint_proof_after_readiness(
+    sandbox: &crate::db::SandboxRow,
+) -> Result<bool, Status> {
+    endpoint_proof_after_readiness_for(sandbox, &sandbox.space_api_route_identity)
+}
+
+pub(super) fn endpoint_proof_after_readiness_for(
+    sandbox: &crate::db::SandboxRow,
+    route_identity: &pplx_space_common_core::types::SpaceApiRouteIdentity,
+) -> Result<bool, Status> {
+    use pplx_space_common_core::types::{RuntimeKind, guest_image::QualifiedGuestAgent};
+    Ok(sandbox
+        .execution_metadata
+        .as_ref()
+        .is_some_and(|execution| execution.runtime().kind == RuntimeKind::CloudHypervisor)
+        && super::guest_image::profile_for_sandbox(sandbox)
+            .map_err(|error| Status::failed_precondition(error.to_string()))?
+            .agent_protocol()
+            == QualifiedGuestAgent::WindowsV1
+        && activation_endpoint_proof_requirement(route_identity, sandbox.pool_template.as_deref())
+            == ActivationEndpointProofRequirement::Required)
+}
+
+pub(super) async fn publish_ready_endpoint_proof(
+    db: &crate::db::SharedConnection,
+    sandbox_id: &str,
+    cleanup_id: Option<SandboxCleanupEpisodeId>,
+) -> Result<(), Status> {
+    let read = |conn: &crate::db::Connection| -> Result<crate::db::SandboxRow, Status> {
+        let row = crate::db::read::sandbox(conn, sandbox_id)
+            .map_err(|error| Status::internal(error.to_string()))?
+            .ok_or_else(|| Status::not_found("activation sandbox disappeared"))?;
+        let episode = crate::db::read::sandbox_view(conn, sandbox_id)
+            .cleanup_episode()
+            .strict()
+            .map_err(|error| Status::internal(error.to_string()))?;
+        if !row.state.is_unowned(SandboxState::Starting)
+            || !matches!((cleanup_id, episode), (Some(id), Some(episode)) if episode.id == id && episode.requested_at.is_none())
+        {
+            return Err(Status::aborted("endpoint activation ownership changed"));
+        }
+        Ok(row)
+    };
+    let initial = {
+        let conn = crate::node_state_sync::connection_or_signal_failure(db)
+            .map_err(|error| Status::internal(error.to_string()))?;
+        // Preserve ordinary and legacy activations, including test callers
+        // without an armed cleanup episode, before applying the Windows gate.
+        let row = crate::db::read::sandbox(&conn, sandbox_id)
+            .map_err(|error| Status::internal(error.to_string()))?
+            .ok_or_else(|| Status::not_found("activation sandbox disappeared"))?;
+        if !endpoint_proof_after_readiness(&row)? || row.spaced_endpoint_proof.is_some() {
+            return Ok(());
+        }
+        read(&conn)?
+    };
+    let runtime = spaced_endpoint_runtime_identity(&initial)?;
+    let mut node = crate::node_manager_transport::NodeManagerConnector::host().lazy();
+    let proof = capture_spaced_endpoint_proof_for_activation(&mut node, runtime.clone()).await?;
+    let conn = crate::node_state_sync::connection_or_signal_failure(db)
+        .map_err(|error| Status::internal(error.to_string()))?;
+    let current = read(&conn)?;
+    if current.node_execution_id != initial.node_execution_id
+        || !crate::db::persist_spaced_endpoint_proof_if_missing(&conn, &runtime, &proof)
+            .map_err(|error| Status::internal(error.to_string()))?
+    {
+        return Err(Status::aborted(
+            "endpoint activation changed during proof capture",
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
