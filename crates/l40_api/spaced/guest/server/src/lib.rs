@@ -155,6 +155,8 @@ pub enum RunBridgeGuestServerError {
 
 #[derive(Debug, thiserror::Error)]
 pub enum RunGuestServerError {
+    #[error("guest update startup failed: {0}")]
+    Update(#[source] tonic::Status),
     #[error("local guest server failed: {0}")]
     Local(#[source] RunLocalGuestServerError),
     #[error("bridge guest server failed: {0}")]
@@ -174,6 +176,7 @@ mod networking;
 mod port_forward;
 #[cfg(test)]
 mod transport;
+mod update;
 
 /// Internal diagnostics support; not part of the stable guest service API.
 #[cfg(feature = "loopback-diagnostic")]
@@ -289,6 +292,7 @@ impl std::fmt::Debug for SpacedGuestService {
 }
 
 struct SpacedGuestServiceInner {
+    update: update::UpdateRuntime,
     shutdown: CancellationToken,
     filesystem_flush_slots: Arc<Semaphore>,
     host_connector_type: HostConnectorType,
@@ -375,8 +379,10 @@ impl SpacedGuestService {
             },
             guest_cgroups.map(|cgroups| Arc::clone(&cgroups.placement)),
         )?;
+        loopback_bridge.set_execution_admission(execution.clone());
         Ok(Self {
             inner: Arc::new(SpacedGuestServiceInner {
+                update: update::UpdateRuntime::new(),
                 shutdown,
                 filesystem_flush_slots: Arc::new(Semaphore::new(1)),
                 host_connector_type: config.host_connector_type,
@@ -397,6 +403,9 @@ impl SpacedGuestService {
     }
 
     pub fn ready(&self) {
+        if self.inner.update.trial_gated() {
+            return;
+        }
         self.inner.ready.send_replace(true);
         self.emit_ready_event();
     }
@@ -484,6 +493,9 @@ impl SpacedGuestService {
     }
 
     pub async fn run(self) -> Result<(), RunGuestServerError> {
+        self.prepare_update_startup()
+            .await
+            .map_err(RunGuestServerError::Update)?;
         tracing::info!(
             guest_socket_path = ?self.inner.local_socket_path,
             bridge_guest_socket_path = ?self.inner.bridge_socket_path,
@@ -524,6 +536,7 @@ impl SpacedGuestService {
                     }
                 },
                 self.inner.loopback_bridge.shutdown(),
+                self.inner.update.drain(),
                 async {
                     if !local_done {
                         local_error = local_server.await.err();
@@ -734,6 +747,7 @@ impl SpacedGuestService {
                     .supervise(move |incoming| {
                         guest_grpc_server_builder(MAX_BRIDGE_GUEST_STREAMS)
                             .add_service(BridgeGuestMetaServer::new(self.clone()))
+                            .add_service(pplx_space_spaced_common::proto::bridge_guest::guest_update_server::GuestUpdateServer::new(self.clone()).max_decoding_message_size(128 * 1024))
                             .add_service(self.inner.execution.filesystem_grpc_service())
                             .add_service(self.inner.execution.process_grpc_service(self.clone()))
                             .add_service(BridgeGuestNetworkingServer::new(self.clone()))
@@ -770,6 +784,7 @@ impl SpacedGuestService {
                     .supervise(move |incoming| {
                         guest_grpc_server_builder(MAX_BRIDGE_GUEST_STREAMS)
                             .add_service(BridgeGuestMetaServer::new(self.clone()))
+                            .add_service(pplx_space_spaced_common::proto::bridge_guest::guest_update_server::GuestUpdateServer::new(self.clone()).max_decoding_message_size(128 * 1024))
                             .add_service(self.inner.execution.filesystem_grpc_service())
                             .add_service(self.inner.execution.process_grpc_service(self.clone()))
                             .add_service(BridgeGuestNetworkingServer::new(self.clone()))
