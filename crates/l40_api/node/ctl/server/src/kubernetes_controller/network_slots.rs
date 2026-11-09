@@ -47,8 +47,9 @@ pub enum NetworkSlotCapacityReconcileError {
 ///
 /// `applied` serializes the read-and-apply across callers (the fast loop and
 /// the node-object pass), so an older observation never lands after a newer
-/// one, and holds the value this process last applied, so a patch is not
-/// skipped on a watch cache that has not caught up with it.
+/// one, and holds the value this process last attempted, so a patch is not
+/// skipped on a watch cache that has not caught up with it, nor after an
+/// attempt whose outcome is unknown.
 pub async fn reconcile_network_slot_capacity(
     kube: &Client,
     node_cache: &node_watch::NodeMetadataCache,
@@ -114,6 +115,10 @@ async fn reconcile_serialized(
         return Ok(());
     }
 
+    // Recorded before the request: a patch that errors or times out may still
+    // land, so the skip above trusts the cache only once it matches the last
+    // value attempted, and an uncertain outcome is always re-applied.
+    *applied = Some(desired.clone());
     let nodes: Api<Node> = Api::all(kube.clone());
     nodes
         .patch_status(
@@ -126,7 +131,6 @@ async fn reconcile_serialized(
             node_name: node_name.to_owned(),
             source: Box::new(source),
         })?;
-    *applied = Some(desired);
 
     tracing::info!(
         %node_name,
