@@ -3,6 +3,7 @@ use super::*;
 mod admin;
 mod core;
 mod diagnostics;
+mod guest_update;
 mod lifecycle;
 
 pub(super) async fn dispatch(
@@ -10,6 +11,9 @@ pub(super) async fn dispatch(
     client: &mut pplx_space_sbx_mgr_client::SandboxManagerGrpcClient,
 ) {
     match command {
+        Commands::GuestUpdate { .. } | Commands::GuestRestart { .. } => {
+            guest_update::handle(command, client).await
+        }
         Commands::Create { .. }
         | Commands::Start { .. }
         | Commands::Stop { .. }
