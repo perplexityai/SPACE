@@ -142,16 +142,8 @@ async fn harness_behind_proxy() -> (
     let guard = tracing::subscriber::set_default(tracing_subscriber::registry().with(log.clone()));
     let (worker, worker_addr) = FakeWorker::start().await;
     let proxy = ResettingProxy::start(worker_addr).await;
-    let (api, api_addr) = FakeApi::start(proxy.addr).await;
-    let mut state = crate::tests::test_data_plane_state().await;
-    let channel = tonic::transport::Endpoint::from_shared(format!("http://{api_addr}"))
-        .unwrap()
-        .connect_lazy();
-    state.native_files = Some(Arc::new(NativeFiles::new(
-        NativeFileAccessClient::new(channel),
-        None,
-    )));
-    (Harness { state, api, worker }, proxy, log, guard)
+    let harness = Harness::with_runtime(worker, proxy.addr).await;
+    (harness, proxy, log, guard)
 }
 
 /// A runtime that resets every call's stream before answering it, and the
@@ -264,16 +256,7 @@ async fn a_call_whose_stream_the_runtime_reset_is_not_sent_again_and_logs_an_err
             tracing::subscriber::set_default(tracing_subscriber::registry().with(log.clone()));
         let (worker, _) = FakeWorker::start().await;
         let (runtime, calls) = start_resetting_runtime().await;
-        let (api, api_addr) = FakeApi::start(runtime).await;
-        let mut state = crate::tests::test_data_plane_state().await;
-        let channel = tonic::transport::Endpoint::from_shared(format!("http://{api_addr}"))
-            .unwrap()
-            .connect_lazy();
-        state.native_files = Some(Arc::new(NativeFiles::new(
-            NativeFileAccessClient::new(channel),
-            None,
-        )));
-        let harness = Harness { state, api, worker };
+        let harness = Harness::with_runtime(worker, runtime).await;
 
         let response = harness.send(harness.post(operation, body)).await;
         assert!(!response.status().is_success(), "{operation}");
