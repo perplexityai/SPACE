@@ -3035,6 +3035,7 @@ impl SandboxManagerService {
         if self.lookup_sandbox(sandbox_id).is_ok_and(|sandbox| {
             !guest_flush_is_qualified(sandbox.guest_image, sandbox.execution_metadata.as_ref())
         }) {
+            crate::metrics::sandbox::worker::stop_guest_flush("unsupported");
             return;
         }
         let flushed = within_stop_flush_budget(

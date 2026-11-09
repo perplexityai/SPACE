@@ -25,8 +25,10 @@ pub fn activation_env_attempt(phase: &str, first_attempt: bool, succeeded: bool)
     );
 }
 
-/// Outcome of the guest root-filesystem flush an ordinary stop attempts before
-/// terminating the VM: `flushed` or `failed`.
+/// Outcome of the guest root-filesystem flush an ordinary stop asks for before
+/// terminating the VM: `flushed` or `failed` when it was attempted, and
+/// `unsupported` when the guest's agent can't flush, so the stop skipped it.
+/// Attempted is `flushed + failed`; the failure rate is `failed / attempted`.
 pub fn stop_guest_flush(outcome: &'static str) {
     counter(
         "sandbox.worker.stop.guest_flush",
