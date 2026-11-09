@@ -3,6 +3,9 @@
 //! Host/control protocols and transport connectors belong to spaced-common.
 
 pub mod proto {
+    pub mod update {
+        tonic::include_proto!("space.spaced.update.v1");
+    }
     pub mod platform {
         tonic::include_proto!("space.spaced.platform.v1");
     }
@@ -27,6 +30,7 @@ pub const BRIDGE_GUEST_VSOCK_PORT: u32 = 5002;
 pub mod filesystem_limits;
 pub mod platform;
 pub mod process_limits;
+pub mod update;
 pub mod validate;
 pub mod wire;
 pub use validate::*;

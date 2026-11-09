@@ -55,6 +55,7 @@ impl Networking for SpacedHostService {
                 "guest loopback bridge detail is too large",
             ));
         }
+        self.inner.update.remember_port(port, true);
         Ok(Response::new(proto::OpenLoopbackBridgeResponse {
             // BridgeGuest and host enums are wire-compatible (same numeric
             // values), so the validated enum can be cast directly.
@@ -82,6 +83,7 @@ impl Networking for SpacedHostService {
                 },
             )
             .await?;
+        self.inner.update.remember_port(port, false);
         Ok(Response::new(proto::CloseLoopbackBridgeResponse {}))
     }
 }
